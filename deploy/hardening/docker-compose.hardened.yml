@@ -1,0 +1,44 @@
+# Hardened runtime for a Bloch-SIS node (Bloch-SIS-Linux L2, container tier).
+#
+#   docker compose -f deploy/hardening/docker-compose.hardened.yml up -d
+#
+# Layers on top of the image's built-in hardening (non-root user 10001,
+# core dumps disabled at entrypoint): drops all Linux capabilities, blocks
+# privilege escalation, makes the root filesystem read-only (only the data
+# volume + a /tmp tmpfs are writable), and enforces core=0 at the runtime too.
+services:
+  bloch:
+    image: bloch:local            # replace with your published image
+    command:
+      - "--rpc-bind"
+      - "0.0.0.0"
+      - "--rpc-port"
+      - "16210"
+      - "--listen"
+      - "/ip4/0.0.0.0/tcp/16110"
+      - "--data-dir"
+      - "/bloch-data"
+      - "--mine"
+    user: "10001:10001"
+    read_only: true               # immutable rootfs; node writes only to the volume
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL                        # node needs no capabilities (ports > 1024)
+    security_opt:
+      - no-new-privileges:true
+      # Docker applies its default seccomp profile automatically. To pin an
+      # explicit profile, uncomment (and test — an over-tight profile breaks
+      # rocksdb/tokio/libp2p):
+      # - seccomp=deploy/hardening/seccomp-default.json
+    ulimits:
+      core: 0                      # no core dumps (key-leak defense, THREAT_MODEL)
+    volumes:
+      - bloch_data:/bloch-data
+    ports:
+      - "16110:16110"             # P2P
+      - "16210:16210"             # RPC
+    restart: unless-stopped
+
+volumes:
+  bloch_data:

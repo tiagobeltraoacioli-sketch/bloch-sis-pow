@@ -1,0 +1,59 @@
+# Fly.io deployment for a Bloch-SIS node.
+#
+# Fly builds the repo's Dockerfile and runs it — no manual `docker push`, no
+# public registry, no bidding. Deploy from the repo root:
+#
+#   flyctl launch --copy-config --no-deploy   # first time: creates the app + a volume
+#   flyctl deploy                             # build + ship
+#
+# See deploy/fly/README.md for the full walkthrough.
+
+app = "blochv-node"
+primary_region = "gru"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  RUST_LOG = "info"
+
+# Run the node as a miner. ENTRYPOINT is `bloch`; these are its args.
+[processes]
+  app = "--rpc-bind 0.0.0.0 --rpc-port 16210 --listen /ip4/0.0.0.0/tcp/16110 --data-dir /bloch-data --mine"
+
+# Persistent chain data. Create the volume once (see README):
+#   flyctl volumes create bloch_data --size 30 --region iad
+[mounts]
+  source = "bloch_data"
+  destination = "/bloch-data"
+
+# RPC (JSON-RPC over HTTP). Reachable at https://<app>.fly.dev
+[[services]]
+  protocol = "tcp"
+  internal_port = 16210
+  processes = ["app"]
+  auto_stop_machines = false   # a miner must stay up
+  auto_start_machines = true
+  min_machines_running = 1
+  [[services.ports]]
+    port = 443
+    handlers = ["tls", "http"]
+  [[services.ports]]
+    port = 80
+    handlers = ["http"]
+
+# P2P (libp2p gossipsub + sync). Raw TCP on the app's public IP.
+[[services]]
+  protocol = "tcp"
+  internal_port = 16110
+  processes = ["app"]
+  [[services.ports]]
+    port = 16110
+
+# VM size. SIS PoW is CPU-bound — use performance CPUs for mining.
+# Fly caps a single machine at 16 performance CPUs; scale out with more
+# machines (flyctl scale count N) rather than up past 16.
+[[vm]]
+  cpu_kind = "performance"
+  cpus = 8
+  memory = "8gb"

@@ -1,0 +1,47 @@
+# cargo-deny — supply-chain policy for Bloch-SIS.
+# Run: cargo deny check   (advisories, bans, licenses, sources)
+#
+# Enforces the project's development best practices: no known-vulnerable or
+# yanked deps; permissive licenses only, with MPL-2.0 tolerated for unmodified
+# aggregation (file-level copyleft — linking unmodified MPL code does not
+# infect the work; AGPL/GPL/LGPL remain excluded, matching the "permissive
+# TEE / permissive everything" ethos); and NO external git/unknown-registry
+# deps (the pqcrypto fork is vendored + Cargo.lock committed, so the workspace
+# is self-contained).
+
+[advisories]
+version = 2
+yanked = "deny"
+# `cargo deny check advisories` pulls the RUSTSEC DB and fails on unfixed
+# vulnerabilities; add explicit `ignore = ["RUSTSEC-XXXX-YYYY"]` entries only with
+# a written rationale.
+
+[bans]
+multiple-versions = "warn"
+wildcards = "warn"          # avoid `*` version reqs
+allow-wildcard-paths = true # path deps in the workspace are fine
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+# Permissive only, plus MPL-2.0 tolerated for UNMODIFIED aggregation (its
+# copyleft is file-scoped; we do not modify MPL-licensed files). Deliberately
+# excludes AGPL/GPL/LGPL copyleft.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "CC0-1.0",
+    "0BSD",
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"   # no external git deps — the fork is vendored in crates/

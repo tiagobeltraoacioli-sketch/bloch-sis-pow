@@ -1,0 +1,184 @@
+[workspace]
+resolver = "2"
+# Bloch-SIS-PoW — the ownerless protocol / main blockchain. Node + the protocol
+# crates only. The Postern Labs products (wallets, messenger, OS, explorer, …)
+# live in their own repo and depend on this one as a git dependency.
+members = [
+    ".",                       # the bloch node (root package)
+    "crates/bloch-sis-pow", "crates/coherence-core", "crates/pqcrypto-internals",
+]
+# coherence-prover (SP1 guest/script/service) + fuzz use heavy/nightly-only
+# toolchains; keep them out of the everyday workspace build.
+exclude = ["crates/coherence-prover", "fuzz"]
+
+[package]
+name = "bloch"
+version = "0.1.0-genesis"
+edition = "2021"
+authors = ["Bloch-SIS Protocol"]
+description = "Bloch-SIS Protocol: post-quantum pure-PoW BlockDAG L1 — Module-SIS lattice PoW, hybrid Falcon+ML-DSA signatures, GhostDAG-Q"
+license = "MIT"
+repository  = "https://gitlab.com/bloch-protocol/bloch"
+
+[[bin]]
+name = "bloch"
+path = "src/main.rs"
+
+[[bin]]
+name = "bloch-wallet"
+path = "src/bin/bloch-wallet.rs"
+
+[[bin]]
+name = "bloch-cli"
+path = "src/bin/bloch-cli.rs"
+
+[[bin]]
+name = "bloch-calibrate"
+path = "src/bin/bloch-calibrate.rs"
+
+[lib]
+name = "bloch"
+path = "src/lib.rs"
+
+[features]
+# Bloch-SIS-Linux L3 attestation backends (off by default). Enabling requires
+# the matching platform/hardware; the default build stays clean + unattested.
+#   sev-snp — AMD SEV-SNP confidential VM (Linux). Wires the virtee/sev crate.
+#   mobile  — device-TEE verification (Android Key Attestation / iOS App Attest).
+default = ["node"]
+# `node` gates the heavy full-node modules (storage/consensus/mining/network/
+# rpc/…) and their exclusive deps (rocksdb, libp2p, axum, …) so the pure
+# wallet/crypto subset cross-compiles for mobile with `default-features = false`.
+node = [
+    "dep:rocksdb",
+    "dep:libp2p",
+    "dep:axum",
+    "dep:tower",
+    "dep:tower-http",
+    "dep:prometheus",
+    "dep:governor",
+    "dep:stratum-core",
+    "dep:reqwest",
+]
+sev-snp = []
+mobile  = []
+# Coherence P1: verify shielded-spend FRI proofs with SP1 (heavy sp1-sdk dep,
+# off by default). Enables ShieldedVerifier::Sp1 + BLOCH_SHIELDED_VERIFY=sp1.
+sp1-verify = ["dep:sp1-sdk"]
+
+[dependencies]
+# Optional — only pulled with the `sp1-verify` feature (see [features]).
+sp1-sdk = { version = "4", optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing = "0.1"
+blst = "0.3"
+serde-big-array = "0.5"
+tokio        = { version = "1",    features = ["full"] }
+futures      = "0.3"
+pin-project-lite = "0.2"
+serde        = { version = "1",    features = ["derive"] }
+serde_json   = "1"
+
+# FIX: bincode 1.x unmaintained → 2.x (breaking API, pinned compat feature)
+bincode      = { version = "2",    features = ["serde"] }
+
+sha2         = "0.10"
+sha2_v9      = { package = "sha2", version = "0.9", default-features = false }
+sha3         = "0.10"
+
+# FIX: pqcrypto-dilithium deprecated → pqcrypto-mldsa (official NIST name)
+pqcrypto-mldsa   = "0.1"
+# Sprint B6b: Falcon-1024 for hybrid PQ signatures (Falcon ‖ ML-DSA). Two
+# distinct lattice families (NTRU + Module-LWE/SIS) for defence in depth.
+pqcrypto-falcon  = "0.4"
+pqcrypto-traits  = "0.3"
+pqcrypto-kyber   = "0.8"
+# Sprint T.1: direct dep on pqcrypto-internals so we can call `with_seeded_rng`
+# from the pqcrypto-internals fork (see [patch.crates-io] at bottom). Upstream also
+# exposes this as `pub extern "C" fn PQCRYPTO_RUST_randombytes` — we depend on
+# the forked Rust API `with_seeded_rng` / `SeededRngGuard` which the upstream
+# crate does NOT provide. The fork is a strict superset of upstream 0.2.11.
+pqcrypto-internals = "0.2"
+hkdf             = "0.12"
+
+aes-gcm      = "0.10"
+chacha20poly1305 = "0.10"
+subtle       = "2.5"
+governor     = { version = "0.8", optional = true }
+prometheus   = { version = "0.14", optional = true }
+argon2       = "0.5"
+zeroize      = { version = "1",    features = ["derive"] }
+bip39        = "2"
+
+# FIX: rand 0.8.5 unsound → 0.9
+rand         = "0.9"
+
+rocksdb      = { version = "0.22", optional = true }
+
+# FIX: libp2p 0.53 → 0.56 (pulls ring 0.17+, fixes AES panic vulnerability)
+libp2p       = { version = "0.56", features = ["tcp", "noise", "yamux", "gossipsub", "mdns", "tokio", "dns", "websocket", "identify", "ping", "macros", "ed25519"], optional = true }
+
+# FIX: jsonrpc-http-server uses net2+instant (unmaintained) → replace with axum
+axum         = { version = "0.8", optional = true }
+tower        = { version = "0.5", optional = true }
+tower-http   = { version = "0.6", features = ["cors", "trace"], optional = true }
+
+clap         = { version = "4",    features = ["derive"] }
+rpassword    = "7"
+log          = "0.4"
+env_logger   = "0.11"
+hex          = "0.4"
+chrono       = { version = "0.4",  features = ["serde"] }
+thiserror    = "2"
+base64       = "0.22"
+async-trait  = "0.1"
+reqwest      = { version = "0.12", features = ["json", "rustls-tls"], default-features = false, optional = true }
+pbkdf2       = "0.12"
+hmac         = "0.12"
+parking_lot  = "0.12"
+bytes        = "1"
+
+# Sprint L — 256-bit arithmetic for retarget_bits consensus math.
+# Chose primitive-types (widely used in Substrate/Ethereum Rust ecosystem,
+# audited) over rolling our own [u64; 4] limb arithmetic.
+primitive-types = "0.13"
+
+# --- Stratum V2 (GIP-0003) ---
+# Umbrella crate re-exports all SRI low-level crates.
+# Solves "could not find binary_sv2 in super" compile error.
+stratum-core              = { version = "0.2", optional = true }
+
+secp256k1                 = { version = "0.29", features = ["rand-std"] }
+
+# Sprint B5: Module-SIS lattice PoW (Bloch-SIS). Vendored reference crate;
+# the pow adapter (src/pow) is the seam that migrates consensus off SHA-256d.
+bloch-sis-pow             = { path = "crates/bloch-sis-pow" }
+
+# Coherence C2: lean shielded-pool primitives (notes, commitments, nullifiers,
+# Merkle accumulator, spend statement). Shared source of truth for the node, the
+# SP1 guest prover (crates/coherence-prover), and the mobile wallet.
+coherence-core            = { path = "crates/coherence-core" }
+
+
+# Sprint B2 (no-BFT): DKG/BLS dependencies (gennaro-dkg, bls12_381, ff, group,
+# rand_chacha, rand_core) removed — FFG finality and the validator committee
+# were deleted. Bloch-SIS is pure PoW; no threshold/BLS crypto on the consensus
+# path. (Re-add only if a post-quantum finality gadget is ever introduced.)
+
+[profile.release]
+opt-level      = 3
+lto            = true
+codegen-units  = 1
+
+[dev-dependencies]
+tempfile = "3"
+
+# pqcrypto-internals fork VENDORED at crates/pqcrypto-internals (was a private
+# git dep that no clean build — Docker, Akash, CI — could fetch). It is a
+# drop-in modification of pqcrypto-internals 0.2.11 adding thread-local
+# seeded-RNG support (`with_seeded_rng`) for deterministic ML-DSA-65 / Falcon
+# keygen, enabling Wallet::from_seed(). Vendoring makes the workspace
+# self-contained and reproducible.
+[patch.crates-io]
+pqcrypto-internals = { path = "crates/pqcrypto-internals" }
+

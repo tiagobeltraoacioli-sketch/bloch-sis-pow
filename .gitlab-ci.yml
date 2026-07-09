@@ -1,0 +1,103 @@
+# Bloch-SIS Protocol — GitLab CI
+#
+# Runs on a self-hosted shell runner (tag: bloch-mac) using the host's Rust
+# toolchain + clang/cmake (rocksdb bindgen, blst, pqcrypto/PQClean build needs
+# a C toolchain). GitLab.com shared runners require identity verification, so
+# this project uses its own runner instead.
+
+stages:
+  - check
+  - test
+
+variables:
+  CARGO_TERM_COLOR: "always"
+  RUST_BACKTRACE: "1"
+
+default:
+  tags:
+    - bloch-mac
+  before_script:
+    # Non-login shell: make the user's toolchain + Homebrew tools visible.
+    - export PATH="$HOME/.cargo/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
+    - rustc --version && cargo --version && clang --version | head -1 && cmake --version | head -1
+
+# Formatting — informational (does not block; the fork is not yet rustfmt-clean).
+fmt:
+  stage: check
+  script:
+    - rustup component add rustfmt || true
+    - cargo fmt --all -- --check
+  allow_failure: true
+
+# Lint — informational.
+clippy:
+  stage: check
+  script:
+    - rustup component add clippy || true
+    - cargo clippy --all-targets
+  allow_failure: true
+
+# Supply-chain — RUSTSEC advisories, permissive-license + no-git-dep policy.
+# BLOCKING: a supply-chain violation must fail the pipeline; see deny.toml.
+supply-chain:
+  stage: check
+  script:
+    - cargo install cargo-deny --locked 2>/dev/null || true
+    - cargo deny check advisories bans licenses sources
+
+# Secret scanning — catch committed credentials (e.g. a leaked token) before they
+# reach history. Best practice given the project's own PAT-rotation lesson.
+secret-scan:
+  stage: check
+  before_script: []
+  script:
+    - command -v gitleaks >/dev/null || brew install gitleaks
+    - gitleaks detect --source . --no-banner --redact
+  allow_failure: true
+
+# Build + full test suite (the gate).
+build-and-test:
+  stage: test
+  script:
+    - cargo build --all-targets
+    - cargo test --workspace
+  # Memory-hard (Argon2) wallet tests + a testnet Module-SIS mining test.
+  timeout: 60m
+
+# Lean mobile-facing build — the crypto/address/tx/wallet subset must compile
+# WITHOUT the node's heavy deps (rocksdb/libp2p, gated by the `node` feature), so
+# the Android/iOS cross-compile stays possible.
+lean-build:
+  stage: test
+  script:
+    - cargo build --no-default-features --lib
+    - "! cargo tree --no-default-features -e no-dev -i rocksdb >/dev/null 2>&1 && echo 'ok: no rocksdb in lean graph'"
+    - "! cargo tree --no-default-features -e no-dev -i libp2p  >/dev/null 2>&1 && echo 'ok: no libp2p in lean graph'"
+
+# Postern Wallet core (separate build root) — golden byte-compat + UniFFI wrapper.
+mobile-core:
+  stage: test
+  script:
+    - cd mobile/core && cargo test --lib
+
+# PoW parameter screen (pure Python, no Sage) — trivial-regime + feasibility.
+pow-screen:
+  stage: check
+  before_script: []
+  script:
+    - python3 deploy/pow-estimator/screen.py
+  allow_failure: true
+
+# PoW hardness estimate (S1) — manual, heavy: builds the SageMath +
+# lattice-estimator container and prints the parameter hardness table.
+# See docs/specs/POW-HARDNESS.md + deploy/pow-estimator/.
+pow-estimator:
+  stage: check
+  before_script: []
+  script:
+    - docker build -t bloch-pow-estimator -f deploy/pow-estimator/Dockerfile .
+    - docker run --rm bloch-pow-estimator
+  rules:
+    - when: manual
+  allow_failure: true
+  timeout: 60m

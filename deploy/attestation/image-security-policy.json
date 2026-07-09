@@ -1,0 +1,17 @@
+{
+  "_comment": "CoCo image-rs image-security policy for Bloch-SIS (L3). Reject-by-default; admit ONLY the cosign-signed Bloch image at its exact repo digest. Deliver this policy AND the cosign public key to Trustee/KBS; image-rs fetches them via kbs:// URIs, and the hash of the initdata carrying this policy lands in SEV-SNP HOSTDATA (part of the signed attestation report) — so admitting only our reproducible digest becomes hardware-bound. Replace the registry/repo to match your published image.",
+  "default": [
+    { "type": "reject" }
+  ],
+  "transports": {
+    "docker": {
+      "docker.io/blochv/bloch": [
+        {
+          "type": "sigstoreSigned",
+          "keyPath": "kbs:///default/cosign-public-key/bloch",
+          "signedIdentity": { "type": "matchRepoDigestOrExact" }
+        }
+      ]
+    }
+  }
+}

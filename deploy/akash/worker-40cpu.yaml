@@ -1,0 +1,79 @@
+---
+# Akash SDL — Bloch-SIS 40-CPU mining WORKER (member node).
+#
+# A second-plus node that JOINS an existing network via a seed peer and mines
+# (Module-SIS PoW is CPU-bound → 40 cores). Unlike deploy.yaml (the seed), this
+# worker does NOT expose RPC publicly — only P2P is reachable, so there is no
+# public attack surface on the worker.
+#
+# 1. Get the seed's multiaddr + peer id (from the seed's logs / provider mapping):
+#        /ip4/<seed-host>/tcp/<mapped-port>/p2p/<seed-peer-id>
+#    and replace <SEED_MULTIADDR> below.
+# 2. Build + push the image (deploy/akash/README.md), set <REGISTRY> if not
+#    docker.io/blochv/bloch:0.1.
+# 3. Deploy:
+#        akash tx deployment create worker-40cpu.yaml --from <key> ...
+#    or the Akash Console → "Run your own SDL".
+
+version: "2.0"
+
+services:
+  bloch-worker:
+    image: docker.io/blochv/bloch:0.1
+    args:
+      - "--listen"
+      - "/ip4/0.0.0.0/tcp/16110"
+      - "--data-dir"
+      - "/bloch-data"
+      # Join the network from a seed peer (replace before deploying).
+      - "--peer"
+      - "<SEED_MULTIADDR>"
+      # Mining worker — SIS PoW is CPU-bound.
+      - "--mine"
+      # RPC kept LOCAL (bound to loopback, not exposed below) — a worker needs no
+      # public RPC, so it presents no RPC attack surface.
+      - "--rpc-bind"
+      - "127.0.0.1"
+    env:
+      - RUST_LOG=info
+    expose:
+      # P2P only — must be globally reachable to peer + sync.
+      - port: 16110
+        as: 16110
+        proto: tcp
+        to:
+          - global: true
+    params:
+      storage:
+        chaindata:
+          mount: /bloch-data
+          readOnly: false
+
+profiles:
+  compute:
+    bloch-worker:
+      resources:
+        cpu:
+          units: 40           # 40 cores for SIS mining (CPU-bound)
+        memory:
+          size: 16Gi          # ~40 mining threads + RocksDB headroom
+        storage:
+          - size: 8Gi          # ephemeral root
+          - name: chaindata     # persistent chain data (survives restarts)
+            size: 30Gi
+            attributes:
+              persistent: true
+              class: beta3
+  placement:
+    dcloud:
+      pricing:
+        bloch-worker:
+          denom: uakt
+          amount: 500000       # max uAKT/block; high ceiling attracts 40-CPU
+                               # bids. Actual cost is market-set (lower).
+
+deployment:
+  bloch-worker:
+    dcloud:
+      profile: bloch-worker
+      count: 1

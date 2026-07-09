@@ -1,0 +1,15 @@
+# The node image only needs src/, crates/, Cargo.toml, Cargo.lock + the
+# Dockerfile. Exclude build artifacts (target/ ~49GB) and non-node dirs so the
+# Fly/Docker build context stays small.
+target/
+**/target/
+.git/
+mobile/
+desktop/
+os/
+explorer/
+fuzz/
+deploy/
+docs/
+*.md
+flake.nix

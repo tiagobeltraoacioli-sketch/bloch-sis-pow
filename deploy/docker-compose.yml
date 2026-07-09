@@ -1,0 +1,64 @@
+version: "3.8"
+
+services:
+  node1:
+    image: bloch:latest  # build locally: docker build -t bloch . — no official registry image (the protocol is ownerless)
+    container_name: bloch-node1
+    ports:
+      - "16210:16210"
+      - "16110:16110"
+    volumes:
+      - node1-data:/bloch-data
+    environment:
+      - RUST_LOG=info
+    command: >
+      bloch
+      --rpc-bind 0.0.0.0
+      --rpc-port 16210
+      --listen /ip4/0.0.0.0/tcp/16110
+      --data-dir /bloch-data
+
+  node2:
+    image: bloch:latest  # build locally: docker build -t bloch . — no official registry image (the protocol is ownerless)
+    container_name: bloch-node2
+    ports:
+      - "16211:16210"
+      - "16111:16110"
+    volumes:
+      - node2-data:/bloch-data
+    environment:
+      - RUST_LOG=info
+    command: >
+      bloch
+      --rpc-bind 0.0.0.0
+      --rpc-port 16210
+      --listen /ip4/0.0.0.0/tcp/16110
+      --data-dir /bloch-data
+      --peer /dns4/node1/tcp/16110
+    depends_on:
+      - node1
+
+  node3:
+    image: bloch:latest  # build locally: docker build -t bloch . — no official registry image (the protocol is ownerless)
+    container_name: bloch-node3
+    ports:
+      - "16212:16210"
+      - "16112:16110"
+    volumes:
+      - node3-data:/bloch-data
+    environment:
+      - RUST_LOG=info
+    command: >
+      bloch
+      --rpc-bind 0.0.0.0
+      --rpc-port 16210
+      --listen /ip4/0.0.0.0/tcp/16110
+      --data-dir /bloch-data
+      --peer /dns4/node1/tcp/16110
+    depends_on:
+      - node1
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:

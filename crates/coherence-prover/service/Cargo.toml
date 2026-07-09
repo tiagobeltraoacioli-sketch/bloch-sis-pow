@@ -1,0 +1,23 @@
+[package]
+name = "coherence-prover-service"
+version = "0.1.0"
+edition = "2021"
+# HTTP prover service — deployed on a server (Fly.io GPU) where the SP1 toolchain
+# is installed. NOT built by the node's cargo build (not a path-dep of bloch).
+
+[dependencies]
+sp1-sdk = "4"
+coherence-core = { path = "../../coherence-core" }
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+bincode = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[features]
+# GPU proving via SP1's CUDA backend — enable in the GPU Docker build.
+# CPU proving is the default (slower; fine for a low-volume testnet).
+cuda = ["sp1-sdk/cuda"]

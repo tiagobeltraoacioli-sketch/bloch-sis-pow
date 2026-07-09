@@ -1,0 +1,80 @@
+---
+# Akash SDL — Bloch-SIS MEMBER node (joins an existing network via a seed).
+#
+# Use this for the 2nd+ node. It bootstraps from a seed peer instead of mining
+# its own isolated chain. Before deploying:
+#
+#   1. Deploy the first node (deploy-16cpu.yaml) — it becomes the seed.
+#   2. Read the seed's external P2P endpoint from Akash `lease-status`
+#      (host + the port the provider mapped for 16110) and its peer ID from the
+#      node logs ("P2P: 12D3Koo...").
+#   3. Replace <SEED_MULTIADDR> below with:
+#        /ip4/<provider-host>/tcp/<mapped-port>/p2p/<seed-peer-id>
+#      (or /dns4/<provider-host>/tcp/<mapped-port>/p2p/<seed-peer-id>)
+#
+# Keeps --mine, so this is an additional miner that also syncs. Remove --mine
+# for a plain sync/RPC/relay node.
+
+version: "2.0"
+
+services:
+  bloch-node:
+    image: docker.io/blochv/bloch:0.1
+    args:
+      - "--rpc-bind"
+      - "0.0.0.0"
+      - "--rpc-port"
+      - "16210"
+      - "--listen"
+      - "/ip4/0.0.0.0/tcp/16110"
+      - "--data-dir"
+      - "/bloch-data"
+      - "--peer"
+      - "<SEED_MULTIADDR>"
+      - "--mine"
+    env:
+      - RUST_LOG=info
+    expose:
+      - port: 16110
+        as: 16110
+        proto: tcp
+        to:
+          - global: true
+      - port: 16210
+        as: 16210
+        proto: tcp
+        to:
+          - global: true
+    params:
+      storage:
+        chaindata:
+          mount: /bloch-data
+          readOnly: false
+
+profiles:
+  compute:
+    bloch-node:
+      resources:
+        cpu:
+          units: 16
+        memory:
+          size: 8Gi
+        storage:
+          - size: 8Gi
+          - name: chaindata
+            size: 30Gi
+            attributes:
+              persistent: true
+              class: beta3
+  placement:
+    dcloud:
+      pricing:
+        bloch-node:
+          denom: uakt
+          amount: 250000
+
+deployment:
+  bloch-node:
+    dcloud:
+      profile: bloch-node
+      count: 1
