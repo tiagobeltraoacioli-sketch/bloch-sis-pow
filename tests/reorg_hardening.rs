@@ -1,11 +1,16 @@
-//! Sprint U.4 — END-TO-END reorg integration harness (deferred from U.3).
+//! Sprint U.4 — reorg HARDENING harness (complements `sprint_u4_reorg_e2e.rs`).
 //!
-//! U.3 shipped the reorg primitives (`compute_reorg_plan` / `execute_reorg` /
-//! `apply_block_utxo_mutations` / `validate_fork_block_state`) with unit tests
-//! against mock DAGs and tiny fixtures. It explicitly deferred the *end-to-end*
-//! harness — real `Storage` + `GhostDAG` + `Mempool`, a common chain to an LCA,
-//! two competing selected-parent chains, and the whole engine driven across a
-//! full A→B→A cycle — to U.4. This file is that harness.
+//! The end-to-end U.4 harness (`tests/sprint_u4_reorg_e2e.rs`) already covers
+//! the disposition-classifier contract, fork-loser no-op, tip-flip convergence,
+//! and back-and-forth stability. This file ADDS the properties that one does not
+//! assert, driving the same real `Storage` + `GhostDAG` + `Mempool` fixtures:
+//!   * audit-H1 abort-AND-restore — a fork block that double-spends, or spends a
+//!     main-only output, must leave the UTXO set BYTE-EXACTLY at the pre-attempt
+//!     state (the restore path in `execute_reorg_inner`);
+//!   * byte-exact A→B→A symmetry via a full-outpoint-universe snapshot;
+//!   * explicit mempool reinject/discard counts in `ReorgOutcome`;
+//!   * the shielded `disconnect_block_self` order-guard (identity-keyed,
+//!     `ReorgOrderMismatch` / `ReorgBeyondUndoHorizon`) and exact reversal.
 //!
 //! It is TEST-ONLY and additive: it drives the existing public API only and
 //! never touches consensus/engine logic. Fixtures reuse the exact patterns from
