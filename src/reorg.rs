@@ -464,6 +464,15 @@ fn execute_reorg_inner(
         //      shielded mempool (currently lost — liveness).
         // Mechanism + exact-reversal/order-guard tests: `coherence::ShieldedEngine`.
         // Whole path is LATENT today (RejectAll makes shielded txs never apply).
+        //
+        // DECISION (U.4 close-out): this shielded selected-chain-order wiring is
+        // DEFERRED to the SP1-verifier track, on purpose. It is only end-to-end
+        // exercisable once `RejectAll` is lifted (real shielded txs applying), so
+        // landing it now would merge consensus-path code that cannot be tested for
+        // zero present effect. It lands WITH the SP1 verifier, as one coherent,
+        // reviewable, fully-testable change. The UTXO half of U.4 (above) is
+        // complete and hardened — see tests/reorg_hardening.rs (audit-H1 restore,
+        // byte-exact A→B→A symmetry, shielded order-guard) + tests/sprint_u4_reorg_e2e.rs.
         rolled_back_blocks.push(block);
     }
 
