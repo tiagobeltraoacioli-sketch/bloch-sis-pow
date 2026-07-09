@@ -10,14 +10,14 @@
 //! This gives you: Address, Network, Transaction, TxInput, TxOutput,
 //! Block, all core errors, and wallet utilities.
 
-pub mod types;
-pub mod crypto;
-pub mod core;
-pub mod address;
+// The lean crypto/wallet/tx surface lives in the `bloch-crypto` crate now
+// (crates/bloch-crypto). Re-export its modules under the original paths so every
+// `crate::core::…` / `crate::crypto::…` reference in the node keeps resolving
+// unchanged, and so external embedders keep importing `bloch::{core,crypto,…}`.
+pub use bloch_crypto::{types, crypto, core, address, wallet, hd_wallet, util};
+
 #[cfg(feature = "node")]
 pub mod analytics;   // Sprint B      // Sprint A — new unified Address type
-pub mod wallet;
-pub mod hd_wallet;
 #[cfg(feature = "node")]
 pub mod storage;
 #[cfg(feature = "node")]
@@ -42,9 +42,6 @@ pub mod transport;
 pub mod stratum;
 #[cfg(feature = "node")]
 pub mod stratum_v2;
-
-// Sprint T.5 — Audit L-4 fix: atomic file write helper used by wallet save paths.
-pub mod util;
 
 // Sprint U.3 — Reorg detection & execution primitives (towards audit C-1).
 #[cfg(feature = "node")]

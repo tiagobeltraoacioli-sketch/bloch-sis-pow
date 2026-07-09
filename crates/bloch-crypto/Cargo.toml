@@ -1,0 +1,68 @@
+[package]
+name = "bloch-crypto"
+version = "0.1.0-genesis"
+edition = "2021"
+authors = ["Bloch-SIS Protocol"]
+description = "Bloch-SIS Protocol: lean crypto / wallet / transaction surface (post-quantum signatures, HD wallet, tx construction) — the node's non-node island extracted so downstream products can depend on it without the full node"
+license = "MIT"
+repository = "https://gitlab.com/bloch-protocol/bloch"
+
+[lib]
+name = "bloch_crypto"
+path = "src/lib.rs"
+
+[features]
+# `node` enables the networked `WalletClient` (wallet::client) which talks to a
+# Bloch-SIS node over RPC. Off by default so the pure wallet/crypto subset
+# cross-compiles for mobile. Mirrors the node's `node` feature gate.
+node = ["dep:reqwest", "dep:async-trait"]
+
+[dependencies]
+# Post-quantum signatures (hybrid Falcon-1024 ‖ ML-DSA-65) + seeded keygen.
+pqcrypto-mldsa     = "0.1"
+pqcrypto-falcon    = "0.4"
+pqcrypto-traits    = "0.3"
+pqcrypto-internals = "0.2"
+
+# Hashing / KDF / AEAD.
+sha2   = "0.10"
+sha3   = "0.10"
+hmac   = "0.12"
+pbkdf2 = "0.12"
+argon2 = "0.5"
+aes-gcm = "0.10"
+
+# Secrets / encoding.
+zeroize = { version = "1", features = ["derive"] }
+bip39   = "2"
+rand    = "0.9"
+hex     = "0.4"
+base64  = "0.22"
+
+# Serialization.
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode    = { version = "2", features = ["serde"] }
+
+# 256-bit arithmetic for consensus math in `core`.
+primitive-types = "0.13"
+
+thiserror = "2"
+chrono    = { version = "0.4", features = ["serde"] }
+log       = "0.4"
+
+# CLI wallet (wallet::cli).
+clap      = { version = "4", features = ["derive"] }
+rpassword = "7"
+
+# Protocol crates shared with the node (path deps, inherited from the workspace).
+bloch-sis-pow  = { path = "../bloch-sis-pow" }
+coherence-core = { path = "../coherence-core" }
+
+# Optional — only with the `node` feature (networked WalletClient).
+reqwest     = { version = "0.12", features = ["json", "rustls-tls"], default-features = false, optional = true }
+async-trait = { version = "0.1", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio    = { version = "1", features = ["full"] }

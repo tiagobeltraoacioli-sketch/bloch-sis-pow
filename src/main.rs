@@ -13,11 +13,14 @@
 //!   #10 Unified TX validation (single code path for block/mempool/RPC)
 //!   #11 Removed duplicated mining loop
 
-mod crypto;
-mod core;
+// The crypto/wallet/tx island moved to the `bloch-crypto` crate
+// (crates/bloch-crypto). Re-export its modules under `crate::` so every
+// `core::…` / `crate::crypto::…` path in this binary and its sibling node
+// modules keeps resolving unchanged.
+use bloch_crypto::{crypto, core, address};
+
 mod consensus;
 mod mining;
-mod wallet;
 mod storage;
 mod network;
 mod rpc;
@@ -25,9 +28,7 @@ mod metrics;
 mod pow;         // Sprint B5 — Module-SIS PoW adapter
 mod transport;
 mod mempool;
-mod address;
 mod analytics;
-mod util;
 mod reorg;
 mod attestation;  // L3 attestation (referenced by rpc)
 mod coherence;    // Coherence C2 shielded pool
