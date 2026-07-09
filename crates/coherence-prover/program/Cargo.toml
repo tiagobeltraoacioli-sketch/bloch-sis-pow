@@ -1,0 +1,11 @@
+[package]
+name = "coherence-spend-program"
+version = "0.1.0"
+edition = "2021"
+# SP1 guest — built with `cargo prove build`, NOT the node's cargo build.
+
+[dependencies]
+# Pin to the SP1 version you install with sp1up; check current SDK docs.
+sp1-zkvm = "4"
+# Lean coherence primitives (to be extracted from src/coherence — see README).
+coherence-core = { path = "../../coherence-core" }

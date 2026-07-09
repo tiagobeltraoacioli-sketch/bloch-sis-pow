@@ -1,0 +1,1776 @@
+//! Bloch-SIS Protocol Node — Minimum energy. Maximum stability.
+//!
+//! Fixes applied:
+//!   #1  Real ML-DSA-65 signatures
+//!   #2  Full IBD: PeerTip → GetHeaders → Headers → GetBlock → NewBlock response
+//!   #3  Block structural + TX signature validation before storing
+//!   #4  Persistent P2P identity
+//!   #5  Mempool with fee ordering
+//!   #6  Peer memory (known_peers.json)
+//!   #7  Difficulty retargeting every 2016 blocks (seconds, not ms)
+//!   #8  Founder/miner address uses proper 20-byte pubkey hash
+//!   #9  Intra-block double-spend prevention via spent-set tracking
+//!   #10 Unified TX validation (single code path for block/mempool/RPC)
+//!   #11 Removed duplicated mining loop
+
+mod crypto;
+mod core;
+mod consensus;
+mod mining;
+mod wallet;
+mod storage;
+mod network;
+mod rpc;
+mod metrics;
+mod pow;         // Sprint B5 — Module-SIS PoW adapter
+mod transport;
+mod mempool;
+mod address;
+mod analytics;
+mod util;
+mod reorg;
+mod attestation;  // L3 attestation (referenced by rpc)
+mod coherence;    // Coherence C2 shielded pool
+mod dandelion;    // Coherence P3 Dandelion++ tx-relay privacy
+mod stratum;  // Sprint AA.1 — stratum V1 mining server
+mod stratum_v2;   // Sprint 10-alpha — stratum V2 mining server (NOISE_NX + SV2)
+
+use clap::Parser;
+use log::{info, warn, error, debug};
+use std::sync::Arc;
+use std::collections::HashSet;
+use std::path::PathBuf;
+use parking_lot::RwLock;
+use tokio::sync::{mpsc, broadcast};
+
+#[derive(Parser)]
+#[command(name = "bloch")]
+#[command(about = "Bloch-SIS Protocol — Module-SIS PoW · Falcon‖ML-DSA · GhostDAG-Q")]
+#[command(version)]
+struct Cli {
+    #[arg(long)]                                         mine: bool,
+    #[arg(long)]                                         testnet: bool,
+    #[arg(long, default_value = "./bloch-data")]          data_dir: String,
+    /// RPC bind address. SECURITY: defaults to 127.0.0.1 (local only).
+    /// Use --rpc-public to bind 0.0.0.0, which exposes RPC to the internet.
+    #[arg(long, default_value = "127.0.0.1")]            rpc_bind: String,
+    /// Override rpc_bind to 0.0.0.0. DANGEROUS when unauthenticated.
+    #[arg(long)]                                         rpc_public: bool,
+    #[arg(long, default_value = "16210")]                rpc_port: u16,
+
+    // ── Sprint M: authentication ────────────────────────────────────
+    /// Shared-secret API key required for authenticated endpoints.
+    /// Takes precedence over --rpc-api-key-file. Passing via CLI leaks
+    /// the key into `ps aux`; prefer --rpc-api-key-file in production.
+    #[arg(long)]                                         rpc_api_key: Option<String>,
+    /// File containing the API key (first line, trimmed). Safer than --rpc-api-key.
+    /// Suggested permissions: 0600, owned by the node user.
+    #[arg(long)]                                         rpc_api_key_file: Option<std::path::PathBuf>,
+    /// When true, writes (sendrawtransaction) require X-API-Key.
+    /// Requires --rpc-api-key or --rpc-api-key-file to be set.
+    /// Reads remain public (explorers need them).
+    #[arg(long)]                                         rpc_require_auth_for_writes: bool,
+
+    // ── Sprint M: rate limiting ─────────────────────────────────────
+    /// Per-IP read-method rate limit, requests per minute. Default 60.
+    /// Localhost (127.0.0.1, ::1) is exempt.
+    #[arg(long, default_value = "60")]                   rpc_rate_limit_reads: u32,
+    /// Per-IP write-method rate limit, requests per minute. Default 5.
+    #[arg(long, default_value = "5")]                    rpc_rate_limit_writes: u32,
+
+    /// Sprint M-patch1: also trust RFC1918 (10/8, 172.16/12, 192.168/16) and
+    /// IPv6 ULA (fc00::/7) as "loopback" for auth/rate-limit bypass.
+    /// This is needed when running in Docker with default bridge networking,
+    /// where the host's 127.0.0.1 traffic appears as 172.17.0.1 inside the
+    /// container. SECURITY: only enable on trusted single-tenant hosts. On
+    /// Kubernetes, shared VLANs, or any multi-tenant network, leave this off.
+    #[arg(long)]                                         rpc_trust_private_ranges: bool,
+
+    // ── Sprint D: Prometheus metrics ─────────────────────────────────
+    /// Enable Prometheus metrics server. Off by default (opt-in).
+    /// Convention follows Geth: endpoint at /debug/metrics/prometheus.
+    #[arg(long)]                                         metrics: bool,
+    /// Metrics bind address. Default 127.0.0.1 (localhost-only).
+    #[arg(long, default_value = "127.0.0.1")]            metrics_addr: String,
+    /// Metrics port. Default 16310 (Bloch-SIS Protocol namespace).
+    #[arg(long, default_value = "16310")]                metrics_port: u16,
+    /// Shortcut: binds metrics to 0.0.0.0 (publicly reachable).
+    /// DANGER: reveals version, peer count, timing data. Use only if you
+    /// accept that the node advertises its status publicly.
+    #[arg(long)]                                         metrics_public: bool,
+    #[arg(long, default_value = "/ip4/0.0.0.0/tcp/16110")] listen: String,
+    #[arg(long)]                                         peer: Vec<String>,
+    #[arg(long)]                                         miner_address: Option<String>,
+    /// Sprint P: allow RFC1918 / loopback addresses via PEX. Dev/test only.
+    /// Production deployments should leave this off; it opens a scanning vector.
+    #[arg(long)]                                         allow_private_peers: bool,
+
+    // ── Sprint 2 (AA.1 pt 3): stratum V1 mining server ──────────────
+    /// Enable the stratum V1 mining server. Miners can connect at
+    /// stratum+tcp://<host>:<stratum_port>. See docs/operations/stratum.md.
+    #[arg(long)]                                         stratum: bool,
+    /// Bind address for the stratum server.
+    #[arg(long, default_value = "0.0.0.0:3333")]         stratum_addr: String,
+    /// Stratum operating mode: 'solo' only for now. 'pool' is Sprint AA.2.
+    #[arg(long, default_value = "solo")]                 stratum_mode: String,
+    /// Max concurrent stratum sessions.
+    #[arg(long, default_value = "256")]                  stratum_max_sessions: usize,
+    /// Coinbase tag written into mined block coinbases for attribution.
+    #[arg(long, default_value = "bloch-sis/v0.1")] stratum_coinbase_tag: String,
+
+    // ── Sprint 10-alpha: stratum V2 mining server ─────────────────────
+    /// Enable the stratum V2 mining server. Miners connect at
+    /// <host>:<sv2_port>. V2 uses NOISE_NX handshake (encrypted
+    /// from byte 0) and SV2 binary framing. Runs in parallel to
+    /// V1; both can be enabled at once on different ports.
+    #[arg(long)]                                         sv2_enable: bool,
+    /// Bind address for the stratum V2 server. Default 0.0.0.0:3334.
+    #[arg(long, default_value = "0.0.0.0:3334")]         sv2_addr: String,
+    /// Max concurrent V2 sessions.
+    #[arg(long, default_value = "500")]                  sv2_max_sessions: usize,
+    /// Path to the SV2 authority keypair JSON file. Auto-generated on
+    /// first run if absent. Default: <data_dir>/sv2-authority-keypair.json.
+    /// PROTECT THIS FILE: compromise allows any peer to impersonate
+    /// this pool. Suggested permissions: 0600, owned by the node user.
+    #[arg(long)]                                         sv2_cert_path: Option<PathBuf>,
+}
+
+// Bloch-SIS founder address. Unified with tokenomics_v2::FOUNDER_ADDRESS_HASH
+// so the genesis coinbase and the monthly vesting output pay the SAME wallet.
+// This is the founder-owned keystore (~/bloch-founder.json, password held by
+// the founder only) — NOT the old public dev seed.
+const FOUNDER_ADDRESS_HEX: &str = "bloch1qe986db5149cff7499b282a048272a09aff0af4ff84242073";
+
+/// FIX #8: Extract the 20-byte pubkey hash from a bloch1q/bloch1t address string.
+/// Address format: prefix (6 chars) + 40 hex chars (20-byte hash) + 8 hex chars (4-byte checksum)
+fn address_to_script_pubkey(addr: &str) -> Vec<u8> {
+    let stripped = addr
+        .trim_start_matches(core::MAINNET_PREFIX)
+        .trim_start_matches(core::TESTNET_PREFIX);
+    // First 40 hex chars = 20-byte pubkey hash
+    let hash_hex = &stripped[..40.min(stripped.len())];
+    hex::decode(hash_hex).unwrap_or_else(|_| addr.as_bytes().to_vec())
+}
+
+#[tokio::main]
+async fn main() {
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("info")
+    ).init();
+
+    let cli = Cli::parse();
+
+    // FIX v0.5.1 BLK-3: apply --rpc-public escape hatch.
+    let rpc_bind = if cli.rpc_public { "0.0.0.0".to_string() } else { cli.rpc_bind.clone() };
+
+    // ── Sprint M: load API key (CLI takes precedence over file) ────
+    let api_key: Option<String> = match (&cli.rpc_api_key, &cli.rpc_api_key_file) {
+        (Some(k), _) => Some(k.trim().to_string()),
+        (None, Some(path)) => {
+            match std::fs::read_to_string(path) {
+                Ok(contents) => {
+                    let k = contents.lines().next().unwrap_or("").trim().to_string();
+                    if k.is_empty() {
+                        eprintln!("⚠  --rpc-api-key-file {:?} is empty; ignoring.", path);
+                        None
+                    } else {
+                        Some(k)
+                    }
+                }
+                Err(e) => {
+                    eprintln!("⚠  failed to read --rpc-api-key-file {:?}: {}", path, e);
+                    None
+                }
+            }
+        }
+        (None, None) => None,
+    };
+
+    // Guard: --rpc-require-auth-for-writes without a key is a config error
+    if cli.rpc_require_auth_for_writes && api_key.is_none() {
+        eprintln!("❌ --rpc-require-auth-for-writes requires --rpc-api-key or --rpc-api-key-file");
+        std::process::exit(2);
+    }
+
+    // Warnings on public bind
+    if cli.rpc_trust_private_ranges {
+        eprintln!("⚠  --rpc-trust-private-ranges: RFC1918 and IPv6 ULA ranges");
+        eprintln!("   will bypass auth and rate limits. Only safe on trusted");
+        eprintln!("   single-tenant hosts. DO NOT use on Kubernetes or shared VLANs.");
+    }
+
+    // ── Sprint D: resolve metrics bind, print warnings ───────────────
+    let metrics_bind = if cli.metrics_public {
+        "0.0.0.0".to_string()
+    } else {
+        cli.metrics_addr.clone()
+    };
+    if cli.metrics && cli.metrics_public {
+        eprintln!("⚠  --metrics-public: Prometheus endpoint on 0.0.0.0:{}", cli.metrics_port);
+        eprintln!("   Reveals version, peer count, hashrate, timing data.");
+        eprintln!("   For most operators, prefer localhost + SSH tunnel or Grafana Agent push.");
+    }
+
+    if cli.rpc_public {
+        eprintln!("⚠  --rpc-public binds RPC to 0.0.0.0 (all interfaces).");
+        if api_key.is_none() {
+            eprintln!("⚠  No --rpc-api-key set. Writes are rate-limited but not authenticated.");
+            eprintln!("⚠  Recommend: --rpc-api-key-file <PATH> --rpc-require-auth-for-writes");
+        } else if !cli.rpc_require_auth_for_writes {
+            eprintln!("ℹ  API key set but --rpc-require-auth-for-writes is off.");
+            eprintln!("ℹ  Writes will still accept unauthenticated requests (rate-limited).");
+        } else {
+            eprintln!("✓  RPC public with auth required for writes.");
+        }
+    }
+
+    println!();
+    println!("  ╔══════════════════════════════════════════════════╗");
+    println!("  ║            ◆  B L O C H - S I S  ◆              ║");
+    println!("  ║  Module-SIS PoW · Falcon‖ML-DSA · GhostDAG-Q     ║");
+    println!("  ║    Fair-launch. Post-quantum. Pure PoW.  BLOCH   ║");
+    println!("  ╚══════════════════════════════════════════════════╝");
+    println!();
+
+    let data_path = PathBuf::from(&cli.data_dir);
+    std::fs::create_dir_all(&data_path).expect("create data dir");
+
+    // ── Storage ───────────────────────────────────────────────────────────────
+    let store = match storage::Storage::open(&data_path.join("db")) {
+        Ok(s)  => { info!("storage ready"); Arc::new(s) }
+        Err(e) => { error!("storage: {}", e); std::process::exit(1); }
+    };
+
+
+
+    // ── Consensus ─────────────────────────────────────────────────────────────
+    let dag = Arc::new(RwLock::new(consensus::GhostDAG::with_default_k()));
+
+    // ── Genesis + DAG reload ─────────────────────────────────────────────────
+    if store.get_meta("genesis_hash").ok().flatten().is_none() {
+        info!("MINING genesis block — this will take a few seconds...");
+        let founder_spk = address_to_script_pubkey(FOUNDER_ADDRESS_HEX);
+        // V2 (ADR-028): miner slot at genesis uses founder address (genesis
+        // bootstrapping convention). Pool addresses come from tokenomics_v2
+        // and panic before Phase 6 — deliberate fail-loud: a node configured
+        // for mainnet without these populated must not produce blocks.
+        let validator_pool_spk = core::tokenomics_v2::validator_pool_address_hash();
+        let oracle_pool_spk    = core::tokenomics_v2::oracle_pool_address_hash();
+        let genesis = core::create_genesis_block(
+            &founder_spk,
+            &validator_pool_spk,
+            &oracle_pool_spk,
+        );
+
+        // Genesis carries a mined Module-SIS PoW witness (B5e); refuse to start
+        // if it does not verify (wrong GENESIS_POW_SOLUTION / bits / address).
+        if !genesis.validate_pow() {
+            error!("Genesis Module-SIS PoW invalid — GENESIS_POW_SOLUTION does not \
+                    verify against the canonical genesis. Regenerate via B5e.");
+            std::process::exit(1);
+        }
+
+        let hash = genesis.block_hash();
+        store.put_block(&genesis).expect("store genesis");
+        store.put_meta("genesis_hash", &hash).expect("meta genesis_hash");
+        store.put_meta("tip_hash", &hash).expect("meta tip_hash");
+        // Sprint L fix: initialize current_bits meta at genesis so that accept_block's
+        // `expected_bits = get_meta("current_bits").unwrap_or(0x1d00ffff)` has a real
+        // value from block 1 onwards (not the fallback constant). Prevents a class of
+        // subtle bugs where a retarget could write a different value than accept_block
+        // reads on a fresh node.
+        store.put_meta("current_bits", &core::GENESIS_BITS.to_le_bytes())
+            .expect("meta current_bits");
+        dag.write().add_genesis(hash, genesis.header.timestamp);
+        if let Some(gdata) = dag.read().get_block_data(&hash).cloned() {
+            // Sprint Y (M-2): atomic put to CF_DAG + CF_DAG_INTEGRITY.
+            // Genesis anchors the hash-chain with an all-zero parent
+            // integrity; see `compute_integrity_hash` for the convention.
+            store.put_dag_with_integrity(&hash, &gdata)
+                .expect("persist genesis dag + integrity");
+        }
+        for tx in &genesis.transactions {
+            let txid = tx.txid();
+            store.put_tx_index(&txid, &hash, 0).expect("tx_index");
+            for (j, out) in tx.outputs.iter().enumerate() {
+                store.put_utxo(&txid, j as u32, out).expect("utxo");
+            }
+        }
+        info!("Genesis: {}", hex::encode(hash));
+        // V2 supply (ADR-028): 1B nominal = 800M mining + 30M validator/oracle
+        // pool + 170M founder vesting (12m cliff + 348m linear over 30 years).
+        info!(
+            "V2 supply (BLOCH): mining {} | validator/oracle pool {} | founder vesting {} | total {}",
+            core::tokenomics_v2::MINING_EMISSION_NOMINAL_SAT / 100_000_000,
+            core::tokenomics_v2::VALIDATOR_ORACLE_POOL_SAT / 100_000_000,
+            core::tokenomics_v2::FOUNDER_PREMINE_TOTAL_SAT / 100_000_000,
+            core::tokenomics_v2::NOMINAL_TOTAL_SUPPLY_SAT / 100_000_000,
+        );
+    } else {
+        // Full DAG reconstruction from persisted data.
+        //
+        // Sprint Y (M-2): load_persisted_validated verifies a hash-chain
+        // over GhostdagData before inserting into the in-memory DAG. If
+        // the database was written by a pre-Sprint-Y binary, the integrity
+        // CF will be empty — the loader self-heals by computing and
+        // returning a fresh map, which we persist immediately so the next
+        // boot validates strictly.
+        //
+        // Any mismatch is fatal: we log loudly and exit. The operator
+        // can then investigate disk integrity / provenance of the data
+        // directory before the node rejoins the network.
+        match store.load_all_dag_data() {
+            Ok(entries) if !entries.is_empty() => {
+                let _count = entries.len();
+                let integrity_map = store.load_all_integrity_hashes()
+                    .unwrap_or_else(|e| {
+                        warn!("failed to read CF_DAG_INTEGRITY ({}); \
+                              assuming pre-Sprint-Y DB, will self-heal", e);
+                        std::collections::HashMap::new()
+                    });
+
+                match dag.write().load_persisted_validated(entries, integrity_map) {
+                    Ok(loaded) => {
+                        if loaded.self_healed {
+                            warn!("CF_DAG_INTEGRITY was empty — self-healed \
+                                   {} integrity records. This is expected on \
+                                   first boot after Sprint Y upgrade. Subsequent \
+                                   boots will validate strictly.",
+                                  loaded.blocks_loaded);
+                            if let Some(fresh) = loaded.fresh_map {
+                                for (h, integrity) in &fresh {
+                                    if let Err(e) = store.put_integrity_hash(h, integrity) {
+                                        warn!("self-heal: failed to persist \
+                                               integrity for block {}: {}",
+                                              hex::encode(&h[..8]), e);
+                                    }
+                                }
+                            }
+                            info!("DAG loaded from disk (self-healed): {} blocks",
+                                  loaded.blocks_loaded);
+                        } else {
+                            info!("DAG loaded from disk (integrity verified): {} blocks",
+                                  loaded.blocks_loaded);
+                        }
+                    }
+                    Err(e) => {
+                        error!("GhostDAG integrity check FAILED: {}", e);
+                        error!("Refusing to continue with unverifiable DAG state.");
+                        error!("Investigate: disk corruption, targeted tampering, \
+                               or a partial restore from a mismatched backup.");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            _ => {
+                // Fallback: at least load genesis
+                let gh = store.get_meta("genesis_hash").unwrap().unwrap();
+                let gh32: [u8;32] = gh.as_slice().try_into().unwrap_or([0u8;32]);
+                if let Ok(Some(blk)) = store.get_block(&gh32) {
+                    dag.write().add_genesis(blk.block_hash(), blk.header.timestamp);
+                    info!("Genesis loaded (fallback): {}", hex::encode(&gh));
+                }
+            }
+        }
+    }
+
+    // ── Mempool + Network ─────────────────────────────────────────────────────
+    let mempool  = Arc::new(mempool::Mempool::new());
+    let net_cfg  = network::NetworkConfig {
+        listen_addr:     cli.listen.clone(),
+        bootstrap_peers: cli.peer.clone(),
+        max_peers:       50,
+        data_dir:        data_path.clone(),
+        allow_private_peers: cli.allow_private_peers,
+    };
+    let node = match network::NetworkNode::new(net_cfg) {
+        Ok(n)  => { info!("P2P: {}", n.peer_id); n }
+        Err(e) => { error!("network: {}", e); std::process::exit(1); }
+    };
+
+    let (our_score, our_count) = {
+        let d = dag.read();
+        (d.tip_blue_score(), d.block_count() as u64)
+    };
+
+    let node_state = Arc::new(RwLock::new(rpc::NodeState {
+        tip_blue_score: our_score,
+        block_count:    our_count,
+        version:        env!("CARGO_PKG_VERSION").into(),
+        ..Default::default()
+    }));
+
+    let (block_tx, mut block_rx) = mpsc::channel::<network::NetworkMessage>(1000);
+    let (outbound_tx, outbound_rx) = mpsc::channel::<network::NetworkMessage>(1000);
+
+    // ── Sprint 2.c: Tip-change broadcast channel ─────────────────────────────
+    //
+    // Fired whenever the selected DAG tip moves (Extension or Reorg disposition
+    // in accept_block, or successful add_block in the miner loop). Stratum
+    // server subscribes and re-broadcasts mining.notify with clean_jobs=true.
+    //
+    // Capacity 64: generous for burst tolerance; a lagging subscriber
+    // (Lagged error variant) triggers a warn-and-continue in the server loop.
+    //
+    // When no subscriber exists (stratum disabled), send() returns Err and
+    // all senders `let _ = ...` it. Safe no-op.
+    let (tip_tx, _) = broadcast::channel::<stratum::TipChanged>(64);
+
+    // Coherence C2: the node's shielded-pool engine (in-memory).
+    let shielded = Arc::new(RwLock::new(crate::coherence::ShieldedPool::new()));
+
+    // ── Message processor ─────────────────────────────────────────────────────
+    let store2    = store.clone();
+    let shielded2 = shielded.clone();
+    let dag2    = dag.clone();
+    let state2  = node_state.clone();
+    let mem2    = mempool.clone();
+    let otx2    = outbound_tx.clone();
+    let tip_tx2 = tip_tx.clone();
+
+    tokio::spawn(async move {
+        // Orphan pool: blocks received before their parents
+        const MAX_ORPHANS: usize = 10_000;
+        let mut orphans: std::collections::HashMap<[u8; 32], (core::Block, Vec<u8>, u64)> =
+            std::collections::HashMap::new();
+        // Reverse index: parent_hash → set of orphan hashes waiting for it
+        let mut waiting_for: std::collections::HashMap<[u8; 32], HashSet<[u8; 32]>> =
+            std::collections::HashMap::new();
+
+        while let Some(msg) = block_rx.recv().await {
+            match msg {
+
+                // IBD step 1: peer tip — if behind, request headers
+                network::NetworkMessage::PeerTip { blue_score: peer_s, ref peer_id, .. } => {
+                    let our_s = dag2.read().tip_blue_score();
+                    if peer_s > our_s {
+                        info!("Peer {} ahead ({}), requesting headers", peer_id, peer_s);
+                        state2.write().is_syncing = true;
+                        let _ = otx2.send(network::NetworkMessage::GetHeaders {
+                            from_blue_score: our_s, limit: 500
+                        }).await;
+                    }
+                }
+
+                // IBD step 2: someone asks for our headers
+                network::NetworkMessage::GetHeaders { from_blue_score, limit } => {
+                    let entries: Vec<network::SyncEntry> = {
+                        let d = dag2.read();
+                        d.ordered_hashes_from(from_blue_score, limit as usize)
+                            .iter()
+                            .filter_map(|h| d.get_node(h).map(|n| network::SyncEntry { hash: *h,
+                                blue_score: n.blue_score, height: n.height,
+                            }))
+                            .collect()
+                    };
+                    if !entries.is_empty() {
+                        let _ = otx2.send(network::NetworkMessage::Headers { entries }).await;
+                    }
+                }
+
+                // IBD step 3: received headers — request missing blocks
+                network::NetworkMessage::Headers { entries } => {
+                    let missing: Vec<_> = entries.iter()
+                        .filter(|e| !dag2.read().has_block(&e.hash))
+                        .map(|e| e.hash).collect();
+                    info!("IBD: need {}/{} blocks", missing.len(), entries.len());
+                    for hash in missing {
+                        let _ = otx2.send(network::NetworkMessage::GetBlock { block_hash: hash }).await;
+                    }
+                    if entries.is_empty() {
+                        state2.write().is_syncing = false;
+                        info!("IBD complete");
+                    }
+                }
+
+                // IBD step 4: respond to GetBlock with the actual block
+                network::NetworkMessage::GetBlock { block_hash } => {
+                    match store2.get_block(&block_hash) {
+                        Ok(Some(block)) => {
+                            // Sprint 1.c: Bitcoin-format wire.
+                            let data = block.to_bitcoin_bytes();
+                            let _ = otx2.send(network::NetworkMessage::NewBlock {
+                                block_hash,
+                                blue_score: block.blue_score,
+                                height:     block.height,
+                                block_data: data,
+                            }).await;
+                        }
+                        _ => debug!("GetBlock: not found {}", hex::encode(&block_hash[..8])),
+                    }
+                }
+
+                // Full validation before storing — with orphan pool support
+                network::NetworkMessage::NewBlock { block_data, block_hash, height, .. } => {
+                    if dag2.read().has_block(&block_hash) { continue; }
+                    // Sprint 1.c: Bitcoin-format wire. A malformed block_data
+                    // payload gets warned about and dropped; peer may re-send
+                    // or stay on a divergent chain.
+                    match core::Block::from_bitcoin_bytes(&block_data) {
+                        Err(e) => warn!("block deserialise: {}", e),
+                        Ok(block) => {
+                            // SECURITY (audit H2): bind the wire-supplied block_hash/height to
+                            // the actual block content BEFORE any dedup or DAG insertion.
+                            // Otherwise an attacker rebroadcasts a valid block under endless
+                            // random ids, each minting a distinct GhostDAG node → unbounded
+                            // memory/disk growth at zero PoW cost.
+                            let real_hash = block.block_hash();
+                            if real_hash != block_hash {
+                                warn!("block id mismatch: claimed {} but content hashes to {}; dropping",
+                                    hex::encode(&block_hash[..8]), hex::encode(&real_hash[..8]));
+                                continue;
+                            }
+                            if height != block.height {
+                                warn!("block {} height mismatch: claimed {} vs content {}; dropping",
+                                    hex::encode(&block_hash[..8]), height, block.height);
+                                continue;
+                            }
+
+                            // Structural validation (PoW, merkle, coinbase) — always do first
+                            if let Err(reason) = block.validate_structure() {
+                                warn!("block {} rejected ({})", hex::encode(&block_hash[..8]), reason);
+                                continue;
+                            }
+
+                            // Check if all parents are in the DAG
+                            let missing_parents: Vec<[u8; 32]> = block.header.parents.iter()
+                                .filter(|p| !dag2.read().has_block(p))
+                                .cloned()
+                                .collect();
+
+                            if !missing_parents.is_empty() {
+                                // Orphan: parents not yet available — buffer for later
+                                if orphans.len() >= MAX_ORPHANS {
+                                    // Evict oldest orphan (by height, lowest first)
+                                    if let Some((&evict_hash, _)) = orphans.iter()
+                                        .min_by_key(|(_, (b, _, _))| b.height)
+                                    {
+                                        let evict_parents: Vec<[u8;32]> = orphans[&evict_hash].0.header.parents.clone();
+                                        orphans.remove(&evict_hash);
+                                        for p in &evict_parents {
+                                            if let Some(set) = waiting_for.get_mut(p) {
+                                                set.remove(&evict_hash);
+                                                if set.is_empty() { waiting_for.remove(p); }
+                                            }
+                                        }
+                                    }
+                                }
+                                debug!("orphan block h={} (missing {} parents), buffered (pool={})",
+                                    height, missing_parents.len(), orphans.len() + 1);
+                                for mp in &missing_parents {
+                                    waiting_for.entry(*mp).or_default().insert(block_hash);
+                                }
+                                orphans.insert(block_hash, (block, block_data, height));
+                                continue;
+                            }
+
+                            // All parents present — try to accept
+                            let _t_validate = std::time::Instant::now();
+                            match accept_block(
+                                &block, block_hash, height,
+                                &dag2, &store2, &mem2, &state2,
+                                Some(&tip_tx2), &shielded2,
+                            ) {
+                            Err(e) => {
+                                crate::metrics::observe_block_validation(_t_validate.elapsed().as_secs_f64());
+                                crate::metrics::inc_block_rejected();
+                                warn!("block {} h={} REJECTED: {}", hex::encode(&block_hash[..8]), height, e);
+                            }
+                            Ok(accepted_hash) => {
+                                crate::metrics::observe_block_validation(_t_validate.elapsed().as_secs_f64());
+                                crate::metrics::inc_block_accepted();
+                                // Process any orphans that were waiting for this block
+                                process_orphans(
+                                    accepted_hash,
+                                    &mut orphans,
+                                    &mut waiting_for,
+                                    &dag2, &store2, &mem2, &state2,
+                                    Some(&tip_tx2), &shielded2,
+                                );
+                            }}
+                        }
+                    }
+                }
+
+                network::NetworkMessage::PeerCount { count, addresses } => {
+                    let mut s = state2.write();
+                    s.peer_count = count as u32;
+                    s.peer_addresses = addresses;
+                }
+
+                // Add validated tx to mempool
+                network::NetworkMessage::NewTransaction { tx_data, .. } => {
+                    // Sprint 1.d: Bitcoin-format tx wire.
+                    if let Ok(tx) = core::Transaction::from_stratum_bytes(&tx_data) {
+                        if !tx.is_coinbase() {
+                            match validate_tx_standalone(&tx, &store2, dag2.read().block_count() as u64) {
+                                Ok(fee) => { let _ = mem2.add(tx, fee); }
+                                Err(e)  => debug!("mempool reject: {}", e),
+                            }
+                        }
+                        state2.write().mempool_size = mem2.size();
+                    }
+                }
+
+                // Version handshake (handled at network layer)
+                network::NetworkMessage::Version { .. } | network::NetworkMessage::VersionAck | network::NetworkMessage::PeerExchange { .. } | network::NetworkMessage::PeerRequest => {}
+            }
+        }
+    });
+
+    // ── Ready ─────────────────────────────────────────────────────────────────
+    let (score, count) = { let d = dag.read(); (d.tip_blue_score(), d.block_count()) };
+    info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    info!("  P2P   {}", cli.listen);
+    info!("  RPC   {}:{}", cli.rpc_bind, cli.rpc_port);
+    info!("  Mine  {}", if cli.mine { "ON" } else { "OFF" });
+    info!("  DAG   {} blocks, score={}", count, score);
+
+    // ── UTXO Reindex DISABLED (needs topological ordering for DAG) ──
+    /*
+    {
+        let bc = dag.read().block_count() as u64;
+        if bc > 1 {
+            info!("Reindexing UTXOs from {} blocks...", bc);
+            let _ = store.clear_utxos();
+            let mut all_blocks = store.iter_all_blocks();
+            // Sort by height for correct topological processing
+            all_blocks.sort_by_key(|(_, b)| b.height);
+            let mut reindexed = 0u64;
+            for (hash, block) in &all_blocks {
+                for tx in &block.transactions {
+                    let txid = tx.txid();
+                    for (j, out) in tx.outputs.iter().enumerate() {
+                        let _ = store.put_utxo(&txid, j as u32, out);
+                    }
+                    if !tx.is_coinbase() {
+                        for inp in &tx.inputs {
+                            let _ = store.delete_utxo(&inp.prev_txid, inp.prev_index);
+                        }
+                    }
+                }
+                reindexed += 1;
+            }
+            info!("UTXO reindex complete: {} blocks processed", reindexed);
+        }
+    }*/
+
+    info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+
+    // ── Continuous Mining Loop ────────────────────────────────────────────────
+    if cli.mine {
+        let store_m  = store.clone();
+        let dag_m    = dag.clone();
+        let state_m  = node_state.clone();
+        let mem_m    = mempool.clone();
+        let otx_m    = outbound_tx.clone();
+        let tip_tx_m = tip_tx.clone();  // Sprint 2.c: tip broadcast for stratum
+        let miner_addr = cli.miner_address.clone()
+            .unwrap_or_else(|| FOUNDER_ADDRESS_HEX.to_string());
+        // FIX #8: Convert miner address to proper 20-byte script_pubkey
+        let miner_spk = address_to_script_pubkey(&miner_addr);
+
+        tokio::spawn(async move {
+            info!("⛏  Miner started → {}", miner_addr);
+            let mut mining_round: u64 = 0;
+            // Sprint GG: warn once when we first see IBD active, log
+            // transition back to ready so operators see the transition.
+            let mut was_syncing_last_tick: bool = false;
+            loop {
+                // Sprint GG fix (pre-IBD mining bug, 2026-04-22):
+                // During IBD the DAG tip reflects the local view, which
+                // lags the network by up to thousands of blocks. Mining
+                // against a stale tip produces blocks at low height
+                // which the rest of the network rejects via the finality
+                // rule (block at or below finalized_height). Pre-fix,
+                // fresh miners would burn CPU for hours producing
+                // orphan blocks that never paid out — an awful new-user
+                // experience that looked like a protocol fault.
+                //
+                // This check pauses the miner loop while is_syncing is
+                // true. The heartbeat logs the transition once in each
+                // direction so operators can see when IBD started and
+                // when mining resumed.
+                let syncing_now = state_m.read().is_syncing;
+                if syncing_now {
+                    if !was_syncing_last_tick {
+                        info!("⛏  IBD in progress — miner paused, will resume when sync completes");
+                        was_syncing_last_tick = true;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    continue;
+                }
+                if was_syncing_last_tick {
+                    info!("⛏  IBD complete — miner resumed at tip");
+                    was_syncing_last_tick = false;
+                }
+
+                let (tips, current_bits, current_height) = {
+                    let d = dag_m.read();
+                    let tips = d.tips();
+                    let h = tips.iter()
+                        .filter_map(|t| d.get_block_data(t))
+                        .map(|data| data.height)
+                        .max()
+                        .unwrap_or(0);
+                    // ASERT-Lattice difficulty anchored at genesis (B5c): bits
+                    // are computed per-block from the parent timestamp, not read
+                    // from a windowed-retarget meta key.
+                    let parent_ts = store_m.get_timestamp_at_height(h).ok().flatten()
+                        .unwrap_or(core::GENESIS_TIMESTAMP);
+                    let bits = pow::next_bits(core::GENESIS_BITS, core::GENESIS_TIMESTAMP, parent_ts, h + 1);
+                    (tips, bits, h)
+                };
+
+                // Re-broadcast mempool TXs before mining
+                {
+                    let pending = mem_m.get_for_block(100);
+                    for tx in &pending {
+                        let txid = tx.txid();
+                        // Sprint 1.d: Bitcoin-format tx wire.
+                        let data = tx.to_stratum_bytes(true);
+                        let _ = otx_m.try_send(network::NetworkMessage::NewTransaction {
+                            txid, tx_data: data,
+                        });
+                    }
+                }
+                // Re-broadcast mempool TXs every ~30s to ensure propagation
+                if mining_round % 10 == 0 {
+                    let pending = mem_m.get_for_block(100);
+                    for tx in &pending {
+                        let txid = tx.txid();
+                        let data = tx.to_stratum_bytes(true);
+                        let _ = otx_m.try_send(network::NetworkMessage::NewTransaction {
+                            txid, tx_data: data,
+                        });
+                    }
+                }
+                mining_round += 1;
+                let txs = mem_m.get_for_block(2000);
+
+                // FIX VULN-05: Compute fees and include in coinbase
+                let total_fees: u64 = txs.iter().map(|tx| {
+                    let total_in: u64 = tx.inputs.iter()
+                        .filter_map(|inp| store_m.get_utxo(&inp.prev_txid, inp.prev_index).ok().flatten())
+                        .map(|out| out.value)
+                        .sum();
+                    let total_out: u64 = tx.outputs.iter()
+                        .try_fold(0u64, |acc, o| acc.checked_add(o.value))
+                        .unwrap_or(u64::MAX); // overflow → caller will reject
+                    total_in.saturating_sub(total_out)
+                }).sum();
+
+                // V2 coinbase per TOKENOMICS_V2 §4 (ADR-028):
+                //   output[0] = miner          = 70% subsidy + total_fees
+                //   output[1] = validator_pool = 25% subsidy
+                //   output[2] = oracle_pool    =  5% subsidy
+                //   output[3] = founder        = vesting delta (if > 0)
+                //
+                // Pool addresses come from tokenomics_v2 panicking accessors
+                // — deliberate fail-loud until Phase 6 sets the constants.
+                let block_height = current_height + 1;
+                let subsidy = core::tokenomics_v2::block_subsidy_sat(block_height);
+                let founder_vesting =
+                    core::tokenomics_v2::founder_vesting_delta_sat(block_height);
+
+                // Pure PoW (B3): 100% of subsidy + fees to the miner.
+                let mut cb_outputs = vec![
+                    core::TxOutput {
+                        value:         subsidy.saturating_add(total_fees),
+                        script_pubkey: miner_spk.clone(),
+                    },
+                ];
+                if founder_vesting > 0 {
+                    cb_outputs.push(core::TxOutput {
+                        value:         founder_vesting,
+                        script_pubkey: core::tokenomics_v2::founder_address_hash().to_vec(),
+                    });
+                }
+
+                let coinbase = core::Transaction {
+                    version: 1,
+                    inputs: vec![core::TxInput {
+                        prev_txid:  [0u8; 32],
+                        prev_index: u32::MAX,
+                        script_sig: format!("height:{}", block_height).into_bytes(),
+                        sequence:   u32::MAX,
+                    }],
+                    outputs: cb_outputs,
+                    locktime: 0,
+                };
+
+                let all_txs: Vec<core::Transaction> = std::iter::once(coinbase).chain(txs).collect();
+                let merkle = core::Transaction::merkle_root(&all_txs);
+
+                let mut block = core::Block {
+                    header: core::BlockHeader {
+                        version:     1,
+                        parents:     tips.clone(),
+                        merkle_root: merkle,
+                        timestamp:   std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default().as_secs(),
+                        bits:        current_bits,
+                        nonce:       0,
+                    },
+                    transactions: all_txs,
+                    blue_score:   dag_m.read().tip_blue_score() + 1,
+                    height:       current_height + 1,
+                    pow_solution: Vec::new(),
+                    shielded_transactions: Vec::new(),                };
+
+                // Bloch-SIS PoW (B5b-2b): mine a Module-SIS solution in the
+                // relaxed testnet regime. The preimage excludes the nonce (the
+                // miner varies the nonce internally); on success we attach the
+                // solution vector as the block's PoW witness.
+                let preimage = block.header.pow_preimage();
+                let bits = block.header.bits;
+                let mined = tokio::task::spawn_blocking(move || {
+                    pow::mine_sis_pow_testnet(&preimage, bits, 0, 50_000_000)
+                }).await;
+
+                match mined {
+                    Ok(Some((nonce, solution))) => {
+                        block.header.nonce = nonce;
+                        block.pow_solution = solution.to_vec();
+                        let hash = block.block_hash();
+                        info!("⛏  Block found! h={} {}", block.height, hex::encode(&hash[..8]));
+
+                        let ts      = block.header.timestamp;
+                        let parents = block.header.parents.clone();
+                        if let Err(e) = store_m.put_block(&block) {
+                            warn!("store mined block: {}", e);
+                            continue;
+                        }
+                        store_m.put_meta("tip_hash", &hash).ok();
+
+                        // Sprint DD (PR-2 fix): capture undo data during mutation.
+                        //
+                        // The pre-DD code applied UTXO/tx_index/coinbase mutations
+                        // inline here (written before Sprint U landed) but never
+                        // recorded UndoData. Any locally-mined block was therefore
+                        // unrollback-able — a fatal problem the moment IBD arrived
+                        // from a peer with a heavier chain, because the resulting
+                        // reorg plan would fail on the first rollback_block call
+                        // with "no undo data for block ..". Observed in production
+                        // 2026-04-21: Akash worker minered h=1 locally, seed IBD
+                        // delivered multiple competing h=1 blocks, reorg aborted,
+                        // worker stuck at height=1.
+                        //
+                        // Routing through apply_block_utxo_mutations gives us the
+                        // byte-identical mutation sequence this branch had before,
+                        // plus the UndoData record required by reorg.
+                        if let Err(e) = reorg::apply_block_utxo_mutations(&store_m, &block) {
+                            warn!("DD: apply_block_utxo_mutations for mined block h={}: {}",
+                                block.height, e);
+                            // Keep going — partial mutation is still better than
+                            // erroring out of the miner loop and freezing the node.
+                        }
+
+                        let work = pow::work_from_bits(block.header.bits);
+                        // Sprint 2.c: snapshot old tip so we can detect and
+                        // broadcast when our mined block advances the chain.
+                        let old_tip_mined = { dag_m.read().selected_tip() };
+                        if let Err(e) = dag_m.write().add_block(hash, parents, ts, work) {
+                            // M-9: a locally-mined block should never hit these
+                            // preconditions — no-parents or duplicate-hash here
+                            // would indicate a miner bug, not a peer attack. Log
+                            // loud and skip this block so the miner doesn't spin.
+                            log::error!(
+                                "mining: DAG rejected our own block {}: {}. Skipping.",
+                                hex::encode(hash), e,
+                            );
+                            continue;
+                        }
+                        // Persist DAG data + integrity hash (Sprint Y, M-2)
+                        if let Some(ddata) = dag_m.read().get_block_data(&hash).cloned() {
+                            store_m.put_dag_with_integrity(&hash, &ddata).ok();
+                        }
+                        {
+                            let mut s = state_m.write();
+                            s.tip_blue_score = dag_m.read().tip_blue_score();
+                            s.block_count    = dag_m.read().block_count() as u64;
+                            s.mempool_size   = mem_m.size();
+                        }
+
+                        // Difficulty is per-block ASERT-Lattice (B5c) — no
+                        // windowed retarget / current_bits meta write.
+
+                        let confirmed: Vec<[u8;32]> = block.transactions.iter().map(|t| t.txid()).collect();
+                        mem_m.remove_confirmed(&confirmed);
+
+                        // Sprint 2.c: broadcast tip change so stratum sessions
+                        // get fresh templates. Mined blocks almost always
+                        // extend the tip, but we still guard with the
+                        // old_tip != new_tip check — during a network-driven
+                        // reorg racing our add_block, the tip may not actually
+                        // be our block.
+                        {
+                            let new_tip = { dag_m.read().selected_tip() };
+                            if new_tip != old_tip_mined {
+                                if let Some(tip_hash) = new_tip {
+                                    let d = dag_m.read();
+                                    if let Some(data) = d.get_block_data(&tip_hash).cloned() {
+                                        let tips_parents: Vec<[u8; 32]> = d.tips();
+                                        drop(d);
+                                        let bits = store_m.get_meta("current_bits").ok().flatten()
+                                            .and_then(|b| b.as_slice().try_into().ok().map(u32::from_le_bytes))
+                                            .unwrap_or(0x1d00ffff_u32);
+                                        let _ = tip_tx_m.send(stratum::TipChanged {
+                                            hash:       tip_hash,
+                                            height:     data.height,
+                                            blue_score: data.blue_score,
+                                            parents:    tips_parents,
+                                            bits,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+
+                        // Sprint 1.c: Bitcoin-format wire (replaces bincode).
+                        // Infallible — no Result to unwrap.
+                        let data = block.to_bitcoin_bytes();
+                        let _ = otx_m.send(network::NetworkMessage::NewBlock {
+                            block_hash: hash,
+                            blue_score: block.blue_score,
+                            height:     block.height,
+                            block_data: data,
+                        }).await;
+                    }
+                    _ => {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+                    }
+                }
+            }
+        });
+    }
+
+    // ── Sprint 2.a/b — Stratum V1 mining server ──────────────────────────────
+    //
+    // Opt-in via --stratum. When enabled, constructs an AcceptBlockFn closure
+    // that captures Arc clones of the DAG / store / mempool / node_state /
+    // outbound_tx, wraps the existing accept_block() function, and feeds
+    // Sprint 1.c's Bitcoin-format broadcast path on success.
+    //
+    // Tip broadcast (2.c) and per-session template generation (2.d) are
+    // wired in subsequent commits. This scaffolding brings the server
+    // online; miners can connect + subscribe + authorize but will not
+    // yet receive mining.notify until 2.d.
+    // ───────── Sprint 10-epsilon Phase 5.a: hoisted accept_block_cb ─────────
+    //
+    // Constructed once at top-level main() scope so both V1 (stratum) and V2
+    // (stratum_v2) servers can route found blocks through the same consensus
+    // pipeline. The closure captures Arcs of dag/store/mempool/etc. and is
+    // itself an Arc<AcceptBlockFn> that's cheap to clone into each config.
+    //
+    // Lock discipline: accept_block itself takes dag.write() briefly. Each
+    // caller is on its own tokio task (one per session), so serialization
+    // is the same as any other network-path accept_block caller.
+    let accept_block_cb: Arc<stratum::AcceptBlockFn> = {
+        let dag_cb        = dag.clone();
+        let store_cb      = store.clone();
+        let mempool_cb    = mempool.clone();
+        let node_state_cb = node_state.clone();
+        let shielded_cb = shielded.clone();
+        let otx_cb        = outbound_tx.clone();
+        let tip_tx_cb     = tip_tx.clone();
+
+        Arc::new(move |block: core::Block| -> Result<String, String> {
+            let block_hash = block.header.pow_hash();
+            let height     = block.height;
+            let blue_score = block.blue_score;
+
+            // Delegate all consensus validation + DAG mutation + retarget +
+            // UTXO updates + mempool cleanup to the existing accept_block path.
+            accept_block(
+                &block, block_hash, height,
+                &dag_cb, &store_cb, &mempool_cb, &node_state_cb,
+                Some(&tip_tx_cb), &shielded_cb,
+            )?;
+
+            // Refresh RPC-visible state (mirrors miner loop).
+            {
+                let mut s = node_state_cb.write();
+                s.tip_blue_score = dag_cb.read().tip_blue_score();
+                s.block_count    = dag_cb.read().block_count() as u64;
+                s.mempool_size   = mempool_cb.size();
+            }
+
+            // Broadcast to gossipsub — other peers learn about the block.
+            let data = block.to_bitcoin_bytes();
+            let msg = network::NetworkMessage::NewBlock {
+                block_hash,
+                blue_score,
+                height,
+                block_data: data,
+            };
+            let otx_clone = otx_cb.clone();
+            tokio::spawn(async move { let _ = otx_clone.send(msg).await; });
+
+            Ok(hex::encode(block_hash))
+        })
+    };
+
+        // Sprint B5f: Stratum V1/V2 are hash-PoW pool protocols — the share
+        // message (`[user, job, en2, ntime, nonce]`) has no field for the
+        // Module-SIS solution vector `s`, so a stratum-submitted block carries
+        // no PoW witness and fails validate_pow. Pool mining therefore requires
+        // a SIS-native share protocol (future work). Refuse to start the server
+        // under Module-SIS rather than silently produce rejected blocks. Solo
+        // mining (--mine) uses the node's SIS miner.
+        if cli.stratum {
+            error!("stratum mining is unsupported under Module-SIS PoW (no share \
+                    field for the lattice solution). Use solo mining (--mine). \
+                    A SIS-native pool protocol is future work (see B5f).");
+            std::process::exit(1);
+        }
+        if false {
+        // Parse + validate CLI params
+        let bind_addr: std::net::SocketAddr = match cli.stratum_addr.parse() {
+            Ok(a)  => a,
+            Err(e) => {
+                error!("invalid --stratum-addr '{}': {}", cli.stratum_addr, e);
+                std::process::exit(1);
+            }
+        };
+
+        let mode: stratum::StratumMode = match cli.stratum_mode.parse() {
+            Ok(m)  => m,
+            Err(e) => {
+                error!("invalid --stratum-mode '{}': {}", cli.stratum_mode, e);
+                std::process::exit(1);
+            }
+        };
+
+        // Build the accept_block callback. When a miner's share meets the
+        // block target, the submit path (src/stratum/submit.rs) invokes
+        // Sprint 10-epsilon Phase 5.a: accept_block_cb is now constructed
+        // at top-level scope (before `if cli.stratum`) so it can be shared
+        // with V2. See the hoisted construction above.
+
+        let stratum_config = stratum::StratumConfig {
+            bind_addr,
+            mode,
+            max_sessions: cli.stratum_max_sessions,
+            coinbase_tag: cli.stratum_coinbase_tag.clone(),
+            accept_block: Some(accept_block_cb.clone()),
+            // Sprint 2.d: bundle dag/store/mempool handles for per-session
+            // template generation in handle_authorize + tip_rx re-notify.
+            node_ctx: Some(Arc::new(stratum::TemplateContext {
+                dag:          dag.clone(),
+                store:        store.clone(),
+                mempool:      mempool.clone(),
+                coinbase_tag: cli.stratum_coinbase_tag.clone(),
+            })),
+        };
+
+        let tip_rx_for_server = tip_tx.subscribe();
+
+        info!("stratum: starting server on {} (mode={}, max_sessions={})",
+              stratum_config.bind_addr, stratum_config.mode, stratum_config.max_sessions);
+
+        tokio::spawn(async move {
+            if let Err(e) = stratum::run(stratum_config, tip_rx_for_server).await {
+                error!("stratum: server terminated: {}", e);
+            }
+        });
+    }
+
+
+
+    // --- Sprint 10-alpha: stratum V2 server ---
+    //
+    // Runs in parallel to V1. Both subscribe to the same TipChanged
+    // broadcast channel (tip_tx). Their wire protocols and session
+    // state machines are independent.
+    //
+    // V2 uses NOISE_NX handshake (encrypted from byte 0) + SV2
+    // binary framing. Default port 3334 (V1 stays on 3333).
+    //
+    // The authority keypair at --sv2-cert-path is auto-generated on
+    // first run and must be preserved across restarts -- its fingerprint
+    // is what miners pin. Losing it invalidates all miner trust.
+    if cli.sv2_enable {
+        // Sprint B5f: same as Stratum V1 — the SV2 SubmitShares message carries
+        // no Module-SIS solution vector, so it cannot produce valid Bloch-SIS
+        // blocks. Refuse to start; solo mining (--mine) uses the SIS miner.
+        error!("stratum V2 mining is unsupported under Module-SIS PoW (no share \
+                field for the lattice solution). Use solo mining (--mine). \
+                A SIS-native pool protocol is future work (see B5f).");
+        std::process::exit(1);
+    }
+    if false {
+        let sv2_bind: std::net::SocketAddr = match cli.sv2_addr.parse() {
+            Ok(a)  => a,
+            Err(e) => {
+                error!("invalid --sv2-addr '{}': {}", cli.sv2_addr, e);
+                std::process::exit(1);
+            }
+        };
+
+        let sv2_cert = cli.sv2_cert_path.clone()
+            .unwrap_or_else(|| {
+                PathBuf::from(&cli.data_dir).join("sv2-authority-keypair.json")
+            });
+
+        let mut sv2_config = match stratum_v2::Sv2Config::new(
+            sv2_bind,
+            cli.sv2_max_sessions,
+            sv2_cert,
+        ) {
+            Ok(c)  => c,
+            Err(e) => {
+                error!("invalid stratum_v2 config: {}", e);
+                std::process::exit(1);
+            }
+        };
+
+        // Sprint 10-delta-Etapa-1: share V1's TemplateContext with V2.
+        // Reuses the same DAG/store/mempool handles already built for V1.
+        sv2_config.node_ctx = Some(Arc::new(stratum::TemplateContext {
+            dag:          dag.clone(),
+            store:        store.clone(),
+            mempool:      mempool.clone(),
+            coinbase_tag: cli.stratum_coinbase_tag.clone(),
+        }));
+
+        // Sprint 10-epsilon Phase 5.a: share the hoisted accept_block_cb
+        // with V2. Both V1 and V2 route found blocks through the same
+        // consensus pipeline. CHECKME-epsilon-v2-standalone resolved.
+        sv2_config.accept_block = Some(accept_block_cb.clone());
+
+        let tip_rx_v2 = tip_tx.subscribe();
+
+        info!(
+            "stratum_v2: spawning on {} (max_sessions={})",
+            sv2_config.bind_addr, sv2_config.max_sessions
+        );
+
+        tokio::spawn(async move {
+            if let Err(e) = stratum_v2::run(sv2_config, tip_rx_v2).await {
+                error!("stratum_v2: listener terminated: {}", e);
+            }
+        });
+    }
+
+    // ── Sprint D: metrics state (shared across server + instrumented modules) ──
+    let metrics_state = std::sync::Arc::new(
+        crate::metrics::MetricsState::new(
+            env!("CARGO_PKG_VERSION"),
+            if cli.testnet { "testnet" } else { "mainnet" },
+        )
+    );
+    let metrics_config = crate::metrics::MetricsConfig {
+        enabled:      cli.metrics,
+        bind_address: metrics_bind,
+        port:         cli.metrics_port,
+    };
+    // Install as process-wide singleton so instrumentation points in other
+    // modules can increment counters via free functions without plumbing.
+    if cli.metrics {
+        crate::metrics::install(metrics_state.clone());
+    }
+
+    // Periodic sync of gauges from NodeState to Prometheus.
+    // Runs every 5s. Cheap — just atomic reads + atomic gauge sets.
+    let state_for_metrics = node_state.clone();
+    let mempool_for_metrics = mempool.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
+        loop {
+            interval.tick().await;
+            let (height, peers) = {
+                let s = state_for_metrics.read();
+                (s.block_count as i64, s.peer_count as i64)
+            };
+            crate::metrics::set_block_count(height);
+            crate::metrics::set_peer_count(peers);
+            crate::metrics::set_mempool_size(mempool_for_metrics.size() as i64);
+        }
+    });
+
+    tokio::select! {
+        _ = crate::metrics::start_metrics_server(
+                metrics_config,
+                metrics_state.clone(),
+            ) => { error!("metrics exited"); }
+        _ = rpc::start_rpc_server(
+                rpc::RpcConfig {
+                    bind_address:              rpc_bind,
+                    port:                      cli.rpc_port,
+                    api_key,
+                    require_auth_for_writes:   cli.rpc_require_auth_for_writes,
+                    rate_limit_reads_per_min:  cli.rpc_rate_limit_reads,
+                    rate_limit_writes_per_min: cli.rpc_rate_limit_writes,
+                    trust_private_ranges:      cli.rpc_trust_private_ranges,
+                },
+                node_state.clone(), store.clone(), mempool.clone(), dag.clone(), outbound_tx.clone()
+            ) => { error!("RPC exited"); }
+        _ = node.run(block_tx, outbound_rx, dag.clone()) => {
+            error!("Network exited");
+        }
+    }
+}
+
+// ── Block acceptance + Orphan processing ─────────────────────────────────────
+
+/// Validate TX contents, add block to DAG + storage, update UTXO set.
+/// Returns Ok(block_hash) on success.
+fn accept_block(
+    block:      &core::Block,
+    block_hash: [u8; 32],
+    height:     u64,
+    dag:        &Arc<RwLock<consensus::GhostDAG>>,
+    store:      &Arc<storage::Storage>,
+    mempool:    &Arc<mempool::Mempool>,
+    node_state: &Arc<RwLock<rpc::NodeState>>,
+    // Sprint 2.c: tip-change broadcast for stratum re-notify.
+    // None disables notification (tests, CLI without --stratum).
+    tip_tx:     Option<&broadcast::Sender<stratum::TipChanged>>,
+    // Coherence C2: the node's shielded-pool engine. Block's shielded txs are
+    // validated + applied here before the block is committed.
+    shielded:   &Arc<RwLock<crate::coherence::ShieldedPool>>,
+) -> Result<[u8; 32], String> {
+
+    // Sprint 2.c: snapshot selected tip BEFORE any DAG mutation so we
+    // can detect whether this block changed the chain's head. Nested
+    // {} scope ensures the lock drops immediately.
+    let old_tip = { dag.read().selected_tip() };
+
+    // ── FIX VULN-01: Validate difficulty bits match expected ──────────
+    // ASERT-Lattice (B5c): expected bits are derived per-block from the
+    // parent timestamp + genesis anchor — miner and validator agree by
+    // computing the same function (src/pow::next_bits).
+    let parent_ts = store.get_timestamp_at_height(block.height.saturating_sub(1))
+        .ok().flatten().unwrap_or(core::GENESIS_TIMESTAMP);
+    let expected_bits = pow::next_bits(
+        core::GENESIS_BITS, core::GENESIS_TIMESTAMP, parent_ts, block.height,
+    );
+    if block.header.bits != expected_bits {
+        return Err(format!(
+            "invalid difficulty: block bits 0x{:08x} != expected 0x{:08x}",
+            block.header.bits, expected_bits
+        ));
+    }
+
+    // ── FIX VULN-02: Validate height matches DAG position ────────────
+    {
+        let d = dag.read();
+        // For non-genesis: height must be parent's max height + 1
+        let expected_height = if block.header.parents.is_empty() {
+            0
+        } else {
+            let max_parent_height = block.header.parents.iter()
+                .filter_map(|p| d.get_block_data(p))
+                .map(|data| data.height)
+                .max()
+                .unwrap_or(0);
+            max_parent_height + 1
+        };
+        if block.height != expected_height {
+            return Err(format!(
+                "invalid height: block claims h={} but expected h={}",
+                block.height, expected_height
+            ));
+        }
+    }
+
+    // ── Finality checkpoint: reject deep reorgs ──────────────────────
+    {
+        let finalized_height = store.get_meta("finalized_height").ok().flatten()
+            .and_then(|b| b.as_slice().try_into().ok().map(u64::from_le_bytes))
+            .unwrap_or(0);
+        if block.height <= finalized_height {
+            return Err(format!(
+                "finality: block h={} at or below finalized height {}",
+                block.height, finalized_height
+            ));
+        }
+    }
+
+    // ── FIX VULN-04: Validate timestamp ──────────────────────────────
+    {
+        let parent_ts = block.header.parents.iter()
+            .filter_map(|p| dag.read().get_block_data(p).map(|d| d.timestamp))
+            .max()
+            .unwrap_or(0);
+        block.validate_timestamp(parent_ts)
+            .map_err(|e| format!("timestamp rejected: {}", e))?;
+    }
+
+    // ── Validate non-coinbase TXs + compute fees ─────────────────────
+    let current_height = {
+        let d = dag.read();
+        d.block_count() as u64
+    };
+    let mut spent_in_block: HashSet<([u8; 32], u32)> = HashSet::new();
+    let mut total_fees: u64 = 0;
+    for tx in block.transactions.iter().skip(1) {
+        let fee = validate_tx_in_block_with_maturity(
+            block, tx, store, &mut spent_in_block, current_height
+        )?;
+        total_fees = total_fees.saturating_add(fee);
+    }
+
+    // ── FIX VULN-05: Validate coinbase value includes fees ───────────
+    block.validate_coinbase_value(total_fees)
+        .map_err(|e| format!("coinbase rejected: {}", e))?;
+
+    // ── Difficulty: per-block ASERT-Lattice (B5c) ─────────────────────
+    // No windowed retarget: `expected_bits` above is computed from the
+    // genesis anchor + parent timestamp, so difficulty tracks the 30 s
+    // target continuously. The legacy windowed `core::retarget_bits` is no
+    // longer on the consensus path (its Sprint-L tests were removed with B5c).
+
+    // ── Add to DAG ───────────────────────────────────────────────────
+    //
+    // Sprint U.4 — capture the selected tip BEFORE add_block so we can
+    // classify what this block did to the selected chain once GhostDAG
+    // recomputes after insertion.
+    let old_selected_tip = dag.read().selected_tip();
+
+    let ts      = block.header.timestamp;
+    let parents = block.header.parents.clone();
+    let work    = pow::work_from_bits(block.header.bits);
+    // M-9: propagate consensus rejection upward instead of panicking.
+    // NoParents / DuplicateBlock here mean the caller (the sync path or
+    // gossipsub) handed us a structurally-broken block; we reject with
+    // a string error just like the other validation steps above.
+    // Coherence C2/P1: validate + apply this block's shielded transactions
+    // before committing, using the pool's configured ShieldedVerifier — RejectAll
+    // by default (safe: no unverifiable value admitted), or the SP1/FRI verifier
+    // with `BLOCH_SHIELDED_VERIFY=sp1` (feature `sp1-verify`). Transparent blocks
+    // (no shielded txs) are a no-op. NOTE: the shielded state does not yet track
+    // reorgs; that lands with the live SP1 verifier. Merkle-binding already
+    // commits the shielded txs into the PoW, so they are non-malleable.
+    shielded.write().apply_block_self(block_hash, &block.shielded_transactions)
+        .map_err(|e| format!("shielded consensus rejection: {:?}", e))?;
+
+    dag.write().add_block(block_hash, parents, ts, work)
+        .map_err(|e| format!("consensus rejection: {}", e))?;
+    if let Some(ddata) = dag.read().get_block_data(&block_hash).cloned() {
+        // Sprint Y (M-2): atomic put to CF_DAG + CF_DAG_INTEGRITY.
+        store.put_dag_with_integrity(&block_hash, &ddata).ok();
+    }
+
+    // Persist block body unconditionally — even if this block ends up in a
+    // losing fork, we keep its bytes so a future reorg can apply it without
+    // re-downloading.
+    store.put_block(block).map_err(|e| e.to_string())?;
+
+    // ── Sprint U.4: disposition-based state application (closes C-1) ──
+    //
+    // Classify how this block affected the selected chain, then apply
+    // UTXO mutations only when appropriate:
+    //
+    //   * FORK-LOSER   — the selected tip didn't move to this block.
+    //                    Persist block + DAG data only; do NOT touch
+    //                    UTXO set or mempool. The block lives in the DAG
+    //                    and may win later (triggering a reorg).
+    //
+    //   * EXTENSION    — this block IS the new selected tip, and its
+    //                    selected_parent is exactly the old tip. Apply
+    //                    forward just like the pre-U.4 path.
+    //
+    //   * REORG        — this block IS the new selected tip, but its
+    //                    selected_parent is NOT the old tip. The fork
+    //                    that contains this block has outgrown the old
+    //                    chain. Roll back old chain blocks to the LCA,
+    //                    apply new chain blocks from LCA to this block,
+    //                    reinject still-valid mempool txs.
+    //
+    // The match is exhaustive over the (old, new) tuple; unexpected
+    // transitions (e.g. add_block produced no tip) log a warning and
+    // leave state untouched so we don't corrupt anything.
+    let new_selected_tip = dag.read().selected_tip();
+
+    enum Disposition {
+        Extension,
+        ForkLoser,
+        Reorg,
+        Unexpected,
+    }
+
+    let disposition = match (old_selected_tip, new_selected_tip) {
+        (None, Some(t)) if t == block_hash => {
+            // Post-genesis first block — no prior tip. Treat as extension.
+            Disposition::Extension
+        }
+        (Some(old), Some(new)) if new == old => Disposition::ForkLoser,
+        (Some(old), Some(new)) if new == block_hash => {
+            let selected_parent = dag.read()
+                .get_block_data(&block_hash)
+                .and_then(|d| d.selected_parent);
+            if selected_parent == Some(old) {
+                Disposition::Extension
+            } else {
+                Disposition::Reorg
+            }
+        }
+        _ => Disposition::Unexpected,
+    };
+
+    match disposition {
+        Disposition::ForkLoser => {
+            info!(
+                "block h={} {} accepted into fork (not selected tip)",
+                block.height, hex::encode(&block_hash[..8])
+            );
+            // Intentional no-op on UTXO / mempool / tip_hash. The block is
+            // now reachable via CF_BLOCKS + DAG; a future reorg can bring
+            // it into the selected chain.
+        }
+
+        Disposition::Extension => {
+            // Apply this block's mutations forward. Uses the shared helper
+            // (src/reorg.rs) so extension and reorg re-apply go through
+            // identical code — they must produce byte-identical UndoData.
+            if let Err(e) = reorg::apply_block_utxo_mutations(store, block) {
+                warn!(
+                    "U.4: apply_block_utxo_mutations returned partial failure for h={}: {}",
+                    block.height, e
+                );
+            }
+
+            let confirmed: Vec<[u8; 32]> = block.transactions.iter().map(|t| t.txid()).collect();
+            mempool.remove_confirmed(&confirmed);
+            store.put_meta("tip_hash", &block_hash).ok();
+        }
+
+        Disposition::Reorg => {
+            // new_selected_tip must be Some here (we matched on it).
+            let new_tip = new_selected_tip.expect("reorg disposition implies Some(new_tip)");
+            let old_tip = old_selected_tip.expect("reorg disposition implies Some(old_tip)");
+
+            let plan = {
+                let d = dag.read();
+                reorg::compute_reorg_plan(&d, &old_tip, &new_tip)
+            }.ok_or_else(|| format!(
+                "U.4: tip changed to {} via reorg but compute_reorg_plan returned None (old={}, new={})",
+                hex::encode(&new_tip[..8]),
+                hex::encode(&old_tip[..8]),
+                hex::encode(&new_tip[..8]),
+            ))?;
+
+            info!(
+                "🔀 Reorg at h={}: rollback {} blocks, apply {} blocks (lca={})",
+                block.height,
+                plan.to_rollback.len(),
+                plan.to_apply.len(),
+                hex::encode(&plan.lca[..8]),
+            );
+
+            let outcome = reorg::execute_reorg(store, mempool, &plan)
+                .map_err(|e| format!("U.4: execute_reorg failed: {}", e))?;
+
+            info!(
+                "   reorg done: rolled_back={}, applied={}, txs_reinjected={}, txs_discarded={}",
+                outcome.rolled_back, outcome.applied,
+                outcome.txs_reinjected, outcome.txs_discarded,
+            );
+
+            // execute_reorg already applied all to_apply blocks (including
+            // the one we just accepted). Now remove those txs from mempool
+            // in case any had slipped in between rollback and apply.
+            let confirmed: Vec<[u8; 32]> = block.transactions.iter().map(|t| t.txid()).collect();
+            mempool.remove_confirmed(&confirmed);
+            store.put_meta("tip_hash", &new_tip).ok();
+        }
+
+        Disposition::Unexpected => {
+            warn!(
+                "U.4: unexpected selected-tip transition during accept of block h={} \
+                 (old={:?}, new={:?}, block={})",
+                block.height, old_selected_tip, new_selected_tip, hex::encode(&block_hash[..8])
+            );
+            // Refuse to mutate state on an unexpected transition. The
+            // block is in the DAG and persisted; a future accept with a
+            // clearer classification can bring it into the selected chain.
+        }
+    }
+
+    // ── Update node state ────────────────────────────────────────────
+    {
+        let mut s = node_state.write();
+        s.tip_blue_score = dag.read().tip_blue_score();
+        s.block_count    = dag.read().block_count() as u64;
+        s.mempool_size   = mempool.size();
+    }
+    info!("✓ block h={} accepted", height);
+
+    // ── Update finality checkpoint ───────────────────────────────────
+    // Once tip is CHECKPOINT_DEPTH ahead, finalize everything below
+    let tip_height = dag.read().tip_blue_score();
+    if tip_height > core::CHECKPOINT_DEPTH {
+        let new_finalized = tip_height - core::CHECKPOINT_DEPTH;
+        let current_finalized = store.get_meta("finalized_height").ok().flatten()
+            .and_then(|b| b.as_slice().try_into().ok().map(u64::from_le_bytes))
+            .unwrap_or(0);
+        if new_finalized > current_finalized {
+            store.put_meta("finalized_height", &new_finalized.to_le_bytes()).ok();
+        }
+    }
+
+    // ── Prune old block bodies ───────────────────────────────────────
+    // Remove full block data beyond PRUNING_DEPTH (keeps height→hash, DAG, TX index)
+    if tip_height > core::PRUNING_DEPTH {
+        let prune_below = tip_height - core::PRUNING_DEPTH;
+        let last_pruned = store.pruned_height();
+        if prune_below > last_pruned + 1000 { // batch: prune every 1000 blocks
+            match store.prune_blocks_below(prune_below) {
+                Ok(n) if n > 0 => info!("Pruned {} block bodies below h={}", n, prune_below),
+                Err(e)         => warn!("Prune failed: {}", e),
+                _ => {}
+            }
+        }
+    }
+
+    // ── Sprint 2.c: emit TipChanged if the selected tip moved ────────
+    //
+    // This hook runs regardless of how the block got here (network
+    // gossipsub, stratum submit, orphan resurrection, miner loop —
+    // miner loop has its own inline hook because it doesn't route
+    // through this function). If `tip_tx` is None (no subscriber or
+    // unit test) the work is skipped entirely.
+    //
+    // Semantics of TipChanged fields: describe the CURRENT tip
+    // (post-accept). Stratum consumers use this + dag.tips() +
+    // current_bits to build a fresh template for the NEXT block.
+    if let Some(tip_tx) = tip_tx {
+        let new_tip = { dag.read().selected_tip() };
+        if new_tip != old_tip {
+            if let Some(tip_hash) = new_tip {
+                let d = dag.read();
+                if let Some(data) = d.get_block_data(&tip_hash).cloned() {
+                    let tips_parents: Vec<[u8; 32]> = d.tips();
+                    drop(d);
+
+                    let bits = store.get_meta("current_bits").ok().flatten()
+                        .and_then(|b| b.as_slice().try_into().ok().map(u32::from_le_bytes))
+                        .unwrap_or(0x1d00ffff_u32);
+
+                    // send() returns Err(SendError) iff there are 0
+                    // receivers — we intentionally ignore that case
+                    // since stratum might not be running.
+                    let _ = tip_tx.send(stratum::TipChanged {
+                        hash:       tip_hash,
+                        height:     data.height,
+                        blue_score: data.blue_score,
+                        parents:    tips_parents,
+                        bits,
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(block_hash)
+}
+
+/// After accepting a block, check if any orphans can now be processed.
+/// Recursively processes orphans whose parents become available.
+fn process_orphans(
+    accepted_hash: [u8; 32],
+    orphans:       &mut std::collections::HashMap<[u8; 32], (core::Block, Vec<u8>, u64)>,
+    waiting_for:   &mut std::collections::HashMap<[u8; 32], HashSet<[u8; 32]>>,
+    dag:           &Arc<RwLock<consensus::GhostDAG>>,
+    store:         &Arc<storage::Storage>,
+    mempool:       &Arc<mempool::Mempool>,
+    node_state:    &Arc<RwLock<rpc::NodeState>>,
+    // Sprint 2.c: propagate tip broadcast through orphan resurrection.
+    tip_tx:        Option<&broadcast::Sender<stratum::TipChanged>>,
+    shielded:      &Arc<RwLock<crate::coherence::ShieldedPool>>,
+) {
+    // Collect orphans waiting for the accepted block
+    let candidates: Vec<[u8; 32]> = waiting_for.remove(&accepted_hash)
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+
+    for orphan_hash in candidates {
+        let all_parents_present = orphans.get(&orphan_hash)
+            .map(|(b, _, _)| b.header.parents.iter().all(|p| dag.read().has_block(p)))
+            .unwrap_or(false);
+
+        if !all_parents_present { continue; }
+
+        // Remove from orphan pool
+        if let Some((block, _block_data, height)) = orphans.remove(&orphan_hash) {
+            // Clean up waiting_for entries for this orphan
+            for p in &block.header.parents {
+                if let Some(set) = waiting_for.get_mut(p) {
+                    set.remove(&orphan_hash);
+                    if set.is_empty() { waiting_for.remove(p); }
+                }
+            }
+
+            match accept_block(&block, orphan_hash, height, dag, store, mempool, node_state, tip_tx, shielded) {
+                Ok(hash) => {
+                    info!("✓ orphan h={} accepted (pool={})", height, orphans.len());
+                    // Recursively process orphans waiting for THIS block
+                    process_orphans(hash, orphans, waiting_for, dag, store, mempool, node_state, tip_tx, shielded);
+                }
+                Err(e) => {
+                    warn!("orphan h={} rejected: {}", height, e);
+                }
+            }
+        }
+    }
+}
+
+// ── Unified TX validation ────────────────────────────────────────────────────
+// FIX #10: Single validation core used by all code paths.
+
+/// Core input validation logic shared by all TX validation paths.
+/// Resolves each input's UTXO, checks pubkey hash match, verifies ML-DSA-65
+/// signature, and accumulates total input value.
+fn validate_tx_inputs(
+    tx:           &core::Transaction,
+    utxo_lookup:  &dyn Fn(&[u8; 32], u32) -> Result<Option<core::TxOutput>, String>,
+    mut spent_set: Option<&mut HashSet<([u8; 32], u32)>>,
+) -> Result<u64, String> {
+    let mut total_in = 0u64;
+
+    for (i, inp) in tx.inputs.iter().enumerate() {
+        let outpoint = (inp.prev_txid, inp.prev_index);
+
+        // FIX #9: Check for double-spend within the same validation context
+        if let Some(spent) = spent_set.as_ref() {
+            if spent.contains(&outpoint) {
+                return Err(format!("double-spend: {}:{} already consumed",
+                    hex::encode(&inp.prev_txid[..8]), inp.prev_index));
+            }
+        }
+
+        // Resolve UTXO
+        let utxo = utxo_lookup(&inp.prev_txid, inp.prev_index)?
+            .ok_or_else(|| format!("UTXO {}:{} not found",
+                hex::encode(&inp.prev_txid[..8]), inp.prev_index))?;
+
+        total_in = total_in.checked_add(utxo.value).ok_or("input overflow")?;
+
+        // Parse and verify script_sig
+        let (sig, pk) = core::Transaction::parse_script_sig(&inp.script_sig)
+            .ok_or_else(|| format!("malformed script_sig at input {}", i))?;
+
+        // Verify pubkey hash matches UTXO script_pubkey
+        let pk_hash = {
+            use sha3::{Sha3_256, Digest};
+            Sha3_256::digest(&pk)[..20].to_vec()
+        };
+        if pk_hash != utxo.script_pubkey {
+            return Err(format!("pubkey mismatch at input {}", i));
+        }
+
+        // Verify ML-DSA-65 signature
+        let sighash = tx.sighash(i);
+        if !crypto::verify(&pk, &sighash, &sig) {
+            return Err(format!("invalid signature at input {}", i));
+        }
+
+        // Mark outpoint as spent
+        if let Some(spent) = spent_set.as_mut() {
+            spent.insert(outpoint);
+        }
+    }
+
+    let total_out: u64 = tx.outputs.iter()
+        .try_fold(0u64, |acc, o| acc.checked_add(o.value))
+        .ok_or("output sum overflow")?;
+    if total_in < total_out {
+        return Err(format!("inputs {} < outputs {}", total_in, total_out));
+    }
+    Ok(total_in - total_out)
+}
+
+/// Validate a transaction within a block context.
+/// Uses both in-block outputs and persistent UTXO set, with double-spend tracking.
+fn validate_tx_in_block(
+    block:          &core::Block,
+    tx:             &core::Transaction,
+    store:          &Arc<storage::Storage>,
+    spent_in_block: &mut HashSet<([u8; 32], u32)>,
+) -> Result<(), String> {
+    validate_tx_in_block_with_maturity(block, tx, store, spent_in_block, 0)?;
+    Ok(())
+}
+
+/// FIX VULN-03: Validate TX within a block, including coinbase maturity check.
+/// Returns the fee (total_in - total_out) for coinbase value validation.
+fn validate_tx_in_block_with_maturity(
+    block:          &core::Block,
+    tx:             &core::Transaction,
+    store:          &Arc<storage::Storage>,
+    spent_in_block: &mut HashSet<([u8; 32], u32)>,
+    current_height: u64,
+) -> Result<u64, String> {
+    // Build lookup map from block's own transaction outputs
+    let block_utxos: std::collections::HashMap<([u8; 32], u32), core::TxOutput> = block.transactions
+        .iter()
+        .flat_map(|t| {
+            let txid = t.txid();
+            t.outputs.iter().enumerate().map(move |(i, o)| ((txid, i as u32), o.clone()))
+        })
+        .collect();
+
+    // Coinbase maturity check (VULN-03). Single source of truth in
+    // core::check_coinbase_maturity; this call site is one of two.
+    core::check_coinbase_maturity(tx, current_height, |txid| {
+        store.get_coinbase_height(txid).ok().flatten()
+    })?;
+
+    let lookup = |txid: &[u8; 32], idx: u32| -> Result<Option<core::TxOutput>, String> {
+        if let Some(out) = block_utxos.get(&(*txid, idx)) {
+            return Ok(Some(out.clone()));
+        }
+        store.get_utxo(txid, idx).map_err(|e| e.to_string())
+    };
+
+    validate_tx_inputs(tx, &lookup, Some(spent_in_block))
+}
+
+/// Standalone tx validation (for mempool / sendrawtransaction).
+/// Returns the fee (total_in - total_out).
+/// Also checks coinbase maturity (VULN-03).
+fn validate_tx_standalone(
+    tx:    &core::Transaction,
+    store: &Arc<storage::Storage>,
+    current_height: u64,
+) -> Result<u64, String> {
+    // Coinbase maturity check
+    if current_height > 0 {
+        for (i, inp) in tx.inputs.iter().enumerate() {
+            if let Ok(Some(cb_height)) = store.get_coinbase_height(&inp.prev_txid) {
+                let depth = current_height.saturating_sub(cb_height);
+                if depth < core::COINBASE_MATURITY {
+                    return Err(format!(
+                        "coinbase maturity: input {} needs {} more confirmations",
+                        i, core::COINBASE_MATURITY - depth
+                    ));
+                }
+            }
+        }
+    }
+    let lookup = |txid: &[u8; 32], idx: u32| -> Result<Option<core::TxOutput>, String> {
+        store.get_utxo(txid, idx).map_err(|e| e.to_string())
+    };
+    validate_tx_inputs(tx, &lookup, None)
+}
+// v0.2.0 PoI
+// v0.2.1 reconnect
+// v0.2.2 ws+pex
+// v0.2.2 ws+pex
+// v0.2.3 block-debug
+// v0.2.4 height-fix
+// v0.2.5 tx-rebroadcast
+// v0.2.6 peer-count
+// v0.2.7 utxo-reindex
+// v0.2.8 dag-reindex
+// v0.2.9 topo-sort
+// v0.3.0 getpeers
+// v0.3.0 getpeers
+// v0.3.1 utxo-fix
+// v0.3.2 balance-fix
+// v0.3.3 recentblocks

@@ -1,0 +1,12 @@
+[package]
+name = "coherence-core"
+version = "0.1.0"
+edition = "2021"
+description = "Bloch-SIS Coherence shielded-pool primitives (notes, SHAKE-256 commitments/nullifiers/Merkle, spend statement). Lean + portable: shared by the node, the SP1 guest prover, and the mobile wallet — single source of truth."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+sha3 = "0.10"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]

@@ -1,0 +1,79 @@
+---
+# Akash SDL (Stack Definition Language) for a Bloch-SIS node.
+#
+# Deploy a censorship-resistant Bloch-SIS full node on the Akash decentralized
+# cloud. Before deploying, build + push the image (see deploy/akash/README.md)
+# and replace <REGISTRY> below with your pushed image reference.
+#
+#   akash tx deployment create deploy.yaml --from <key> ...
+# or via the Akash Console (https://console.akash.network) → "Run your own SDL".
+
+version: "2.0"
+
+services:
+  bloch-node:
+    image: docker.io/blochv/bloch:0.1
+    args:
+      - "--rpc-bind"
+      - "0.0.0.0"
+      - "--rpc-port"
+      - "16210"
+      - "--listen"
+      - "/ip4/0.0.0.0/tcp/16110"
+      - "--data-dir"
+      - "/bloch-data"
+      # SECURITY: RPC is exposed globally below. Protect writes with an API key
+      # (uncomment and set), or drop the RPC expose entry to keep it private.
+      # - "--rpc-api-key"
+      # - "CHANGE-ME-LONG-RANDOM-KEY"
+      # 40-CPU profile below is a mining node (SIS PoW is CPU-bound).
+      - "--mine"
+    env:
+      - RUST_LOG=info
+    expose:
+      # P2P — must be globally reachable for peers to connect / sync.
+      - port: 16110
+        as: 16110
+        proto: tcp
+        to:
+          - global: true
+      # RPC (JSON-RPC). Global for external queries; set --rpc-api-key above.
+      - port: 16210
+        as: 16210
+        proto: tcp
+        to:
+          - global: true
+    params:
+      storage:
+        chaindata:
+          mount: /bloch-data
+          readOnly: false
+
+profiles:
+  compute:
+    bloch-node:
+      resources:
+        cpu:
+          units: 40           # 40 cores for SIS mining (CPU-bound)
+        memory:
+          size: 16Gi          # headroom for ~40 mining threads + RocksDB
+        storage:
+          - size: 8Gi          # ephemeral root
+          - name: chaindata     # persistent chain data (survives restarts)
+            size: 30Gi
+            attributes:
+              persistent: true
+              class: beta3
+  placement:
+    dcloud:
+      pricing:
+        bloch-node:
+          denom: uakt
+          amount: 500000       # max uAKT/block; 40-CPU needs a high ceiling to
+                               # attract bids. Actual cost is market-set (lower).
+
+deployment:
+  bloch-node:
+    dcloud:
+      profile: bloch-node
+      count: 1

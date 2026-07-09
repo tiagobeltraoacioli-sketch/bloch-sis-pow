@@ -1,0 +1,67 @@
+[package]
+name        = "bloch-sis-pow"
+version     = "0.1.0"
+edition     = "2021"
+authors     = ["Bloch Protocol contributors"]
+description = "Reference implementation of Bloch-SIS-PoW: a Module-SIS lattice-based proof-of-work"
+license     = "MIT OR Apache-2.0"
+repository  = "https://github.com/bloch-protocol/bloch-sis-pow"
+readme      = "README.md"
+keywords    = ["cryptography", "post-quantum", "lattice", "proof-of-work", "blockchain"]
+categories  = ["cryptography", "no-std"]
+
+[lib]
+name = "bloch_sis_pow"
+path = "src/lib.rs"
+
+[[example]]
+name = "mine_block"
+path = "examples/mine_block.rs"
+
+[[example]]
+name = "verify_block"
+path = "examples/verify_block.rs"
+
+[dependencies]
+sha3        = { version = "0.10", default-features = false }
+serde       = { version = "1",    features = ["derive"], default-features = false, optional = true }
+zeroize     = { version = "1",    features = ["derive"], default-features = false }
+rayon       = { version = "1.10", optional = true }
+thiserror   = { version = "2",    optional = true }
+
+[dev-dependencies]
+hex         = "0.4"
+rand        = "0.9"
+criterion   = { version = "0.5", features = ["html_reports"] }
+proptest    = "1.5"
+
+[features]
+default = ["std", "serde", "parallel"]
+std      = ["sha3/std", "zeroize/std", "thiserror"]
+serde    = ["dep:serde"]
+parallel = ["dep:rayon", "std"]
+
+# When this feature is enabled, the implementation accepts deliberately weak
+# parameters for testing purposes. NEVER enable in production builds.
+test-vectors = []
+
+[[bench]]
+name    = "mining_bench"
+harness = false
+
+[[bench]]
+name    = "verify_bench"
+harness = false
+
+[profile.release]
+opt-level     = 3
+lto           = true
+codegen-units = 1
+debug         = false
+panic         = "abort"
+
+[profile.bench]
+opt-level     = 3
+lto           = true
+codegen-units = 1
+debug         = false

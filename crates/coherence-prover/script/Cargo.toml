@@ -1,0 +1,9 @@
+[package]
+name = "coherence-prover-script"
+version = "0.1.0"
+edition = "2021"
+# Host prover/verifier — run with `cargo run --release` where SP1 is installed.
+
+[dependencies]
+sp1-sdk = "4"
+coherence-core = { path = "../../coherence-core" }

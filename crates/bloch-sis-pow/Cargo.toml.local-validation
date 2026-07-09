@@ -1,0 +1,41 @@
+[package]
+name        = "bloch-sis-pow"
+version     = "0.1.0"
+edition     = "2021"
+description = "Reference implementation of Bloch-SIS-PoW (validation build)"
+license     = "MIT OR Apache-2.0"
+
+[lib]
+name = "bloch_sis_pow"
+path = "src/lib.rs"
+
+[[example]]
+name = "mine_block"
+path = "examples/mine_block.rs"
+
+[[example]]
+name = "mine_easy"
+path = "examples/mine_easy.rs"
+
+[[example]]
+name = "verify_block"
+path = "examples/verify_block.rs"
+
+[dependencies]
+sha3        = "0.10"
+zeroize     = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+hex = "0.4"
+
+[features]
+default  = ["std"]
+std      = []
+serde    = []
+parallel = []
+
+[profile.release]
+opt-level     = 3
+lto           = false
+codegen-units = 1
+debug         = false

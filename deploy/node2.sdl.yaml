@@ -1,0 +1,58 @@
+---
+version: "2.0"
+
+services:
+  node:
+    image: bloch:v0.1.0  # TODO: publish to a registry you control — no official image (the protocol is ownerless)
+    expose:
+      - port: 16210
+        as: 80
+        to:
+          - global: true
+      - port: 16110
+        as: 16110
+        to:
+          - global: true
+    env:
+      - RUST_LOG=info
+      - BLOCH_NODE_ID=node2
+    command:
+      - bloch
+      - --rpc-bind
+      - "0.0.0.0"
+      - --rpc-port
+      - "16210"
+      - --listen
+      - /ip4/0.0.0.0/tcp/16110
+      - --data-dir
+      - /bloch-data
+      - --peer
+      - REPLACE_WITH_NODE1_MULTIADDR
+
+profiles:
+  compute:
+    node:
+      resources:
+        cpu:
+          units: 0.5
+        memory:
+          size: 512Mi
+        storage:
+          - size: 5Gi
+  placement:
+    global:
+      attributes:
+        region: us-east
+      signedBy:
+        anyOf:
+          - akash1365yvmc4s7awdyj3n2sav7xfx76adc6dnmlx63
+      pricing:
+        node:
+          denom: uakt
+          amount: 1000
+
+deployment:
+  node:
+    global:
+      profile: node
+      count: 1
