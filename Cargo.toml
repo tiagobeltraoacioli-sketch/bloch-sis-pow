@@ -5,6 +5,7 @@ resolver = "2"
 # live in their own repo and depend on this one as a git dependency.
 members = [
     ".",                       # the bloch node (root package)
+    "crates/bloch-crypto",     # lean crypto/wallet/tx surface (extracted island)
     "crates/bloch-sis-pow", "crates/coherence-core", "crates/pqcrypto-internals",
 ]
 # coherence-prover (SP1 guest/script/service) + fuzz use heavy/nightly-only
@@ -59,6 +60,7 @@ node = [
     "dep:governor",
     "dep:stratum-core",
     "dep:reqwest",
+    "bloch-crypto/node",
 ]
 sev-snp = []
 mobile  = []
@@ -153,6 +155,12 @@ secp256k1                 = { version = "0.29", features = ["rand-std"] }
 # Sprint B5: Module-SIS lattice PoW (Bloch-SIS). Vendored reference crate;
 # the pow adapter (src/pow) is the seam that migrates consensus off SHA-256d.
 bloch-sis-pow             = { path = "crates/bloch-sis-pow" }
+
+# Lean crypto/wallet/tx surface extracted from this node (crates/bloch-crypto).
+# The node re-exports its modules (types/crypto/core/address/wallet/hd_wallet/
+# util) so every `crate::core::…` path keeps working; downstream products depend
+# on bloch-crypto directly WITHOUT pulling the full node.
+bloch-crypto              = { path = "crates/bloch-crypto" }
 
 # Coherence C2: lean shielded-pool primitives (notes, commitments, nullifiers,
 # Merkle accumulator, spend statement). Shared source of truth for the node, the

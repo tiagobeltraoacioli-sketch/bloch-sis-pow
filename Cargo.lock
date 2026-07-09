@@ -1408,6 +1408,7 @@ dependencies = [
  "base64",
  "bincode 2.0.1",
  "bip39",
+ "bloch-crypto",
  "bloch-sis-pow",
  "blst",
  "bytes",
@@ -1454,6 +1455,42 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
+]
+
+[[package]]
+name = "bloch-crypto"
+version = "0.1.0-genesis"
+dependencies = [
+ "aes-gcm",
+ "argon2",
+ "async-trait",
+ "base64",
+ "bincode 2.0.1",
+ "bip39",
+ "bloch-sis-pow",
+ "chrono",
+ "clap",
+ "coherence-core",
+ "hex",
+ "hmac",
+ "log",
+ "pbkdf2",
+ "pqcrypto-falcon",
+ "pqcrypto-internals",
+ "pqcrypto-mldsa",
+ "pqcrypto-traits",
+ "primitive-types 0.13.1",
+ "rand 0.9.4",
+ "reqwest",
+ "rpassword",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sha3 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
  "zeroize",
 ]
 
