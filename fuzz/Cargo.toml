@@ -12,6 +12,8 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 bloch = { path = ".." }
+bloch-sis-pow = { path = "../crates/bloch-sis-pow" }
+coherence-core = { path = "../crates/coherence-core" }
 
 # Vendored PQ fork (same as the node) — [patch] applies from the build root.
 [patch.crates-io]
@@ -26,5 +28,23 @@ doc = false
 [[bin]]
 name = "tx_parse"
 path = "fuzz_targets/tx_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "pow_decode"
+path = "fuzz_targets/pow_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "pow_verify"
+path = "fuzz_targets/pow_verify.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "merkle_path"
+path = "fuzz_targets/merkle_path.rs"
 test = false
 doc = false
