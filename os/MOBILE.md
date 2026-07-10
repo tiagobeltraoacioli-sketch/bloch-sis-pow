@@ -1,0 +1,50 @@
+# Postern OS Mobile — a phone OS, wallet-first
+
+A Postern Labs product, the mobile sibling of Postern OS: a **reproducible Linux
+phone OS** (via [Mobile NixOS](https://github.com/nix-community/mobile-nixos))
+that ships the Postern Wallet as a first-class key vault. Same NixOS flake, same reproducibility,
+same post-quantum crypto — on a phone.
+
+> **Scope: wallet only.** Phones can't mine the Bloch-SIS PoW competitively, so
+> Postern OS Mobile does **not** mine — PoW secures the chain from desktops/nodes.
+> The phone holds keys and signs (hybrid Falcon‖ML-DSA, addresses byte-identical
+> to the node). This matches the project's decision: *mobile = wallet, focus is
+> PoW*.
+
+## The Postern clients, clarified
+
+| | Runs on | What it is | Mines? |
+|---|---|---|---|
+| **Postern OS** | a computer you boot | full node OS | yes |
+| **Postern OS Mobile** | a phone you boot | wallet OS / key vault | no |
+| **Postern Desktop** | your existing OS | node-companion app | via the node |
+| **bloch-mobile** | inside another mobile app | the wallet *engine* (Rust) | no |
+
+## Devices
+
+Mobile NixOS targets Linux phones (PinePhone, Librem 5, …) and has device ports
+for many **Android** phones (mainline/downstream kernels). The flake defaults to
+`pine64-pinephone`; change `device` in `flake.nix` (`mobile-image`) to your
+handset — see the Mobile NixOS device list.
+
+## Build (on a Nix host)
+
+```bash
+# Phone image for the configured device
+nix build .#mobile-image
+
+# The output is device-specific (e.g. a flashable disk image / Android boot img);
+# follow Mobile NixOS's flashing guide for your device.
+```
+
+The image includes `bloch-wallet` (CLI) + the crypto stack. A touch wallet UI is
+the app layer on top — reuse the Postern Desktop web UI in a mobile shell, or a
+UniFFI-backed native app over `bloch-mobile`'s `WalletCore`.
+
+## Honesty
+
+- **Not built in this sandbox** (no Nix; Mobile NixOS also needs device configs).
+  Validated, idiomatic config that builds on a Nix host with the device port —
+  `nix build .#mobile-image`. Mobile NixOS APIs evolve; pin its revision.
+- Wallet-only by design — no mining, no misleading "phone mining" claims.
+- Testnet is zero-security; a phone wallet on testnet holds worthless coins.
