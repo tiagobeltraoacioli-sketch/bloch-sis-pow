@@ -13,8 +13,11 @@
 //!
 //! **These are NOT security-validated parameters.** At `β = q/16` both shipped
 //! residual regimes are insecure (see the crate header in `lib.rs` and
-//! `residual_regime_nontrivial`); the secure parameter set awaits the
-//! lattice-estimator run (`deploy/pow-estimator`) on the research track.
+//! `residual_regime_nontrivial`). Note the security model: the PoW's security
+//! is the SHAKE-256 hashcash target (cumulative work), NOT lattice hardness —
+//! no lattice bit-security number attaches to any parameter set here; the
+//! canonical gate width `k` awaits the no-shortcut analysis
+//! (`docs/research/POW-CANONICAL-frontier.md`, `deploy/pow-estimator`).
 
 /// Solution vector dimension `n`.
 ///
@@ -46,7 +49,7 @@ pub const Q_HALF: i64 = (Q_I64 - 1) / 2;
 ///
 /// `s_i ∈ {-B, …, -1, 0, 1, …, B}` with `B = 2`. Standard "short ternary
 /// extended" choice from lattice cryptography literature; small enough to
-/// preserve hardness margin, large enough to admit solutions reliably.
+/// keep the residual gate meaningful, large enough to admit solutions reliably.
 pub const B: i32 = 2;
 
 /// Bound `β` on the residual infinity-norm: `||A·s − t||_∞ < β`.
@@ -97,9 +100,10 @@ pub struct Params {
 /// The shipped Bloch-SIS-PoW parameter set (v0.1 reference).
 ///
 /// NOT security-validated: at `β = q/16` both shipped residual regimes are
-/// insecure (trivial q-ary regime at full-`M`; near-zero no-shortcut hardness
-/// at the tiny testnet `k`). The "canonical secure" parameters are the
-/// research track (`deploy/pow-estimator`), not what ships here.
+/// insecure (trivial q-ary regime at full-`M`; a ~12-bit rejection floor at
+/// the tiny testnet `k`). The canonical gate parameters are the research
+/// track (`docs/research/POW-CANONICAL-frontier.md`), not what ships here —
+/// and PoW security at any params is the hashcash target, not lattice hardness.
 pub const SHIPPED_PARAMS: Params = Params {
     n:    N,
     m:    M,

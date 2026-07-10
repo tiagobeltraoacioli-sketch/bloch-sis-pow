@@ -14,7 +14,7 @@ Two senses, deliberately fused:
 
    | Layer | Primitive | Family |
    |---|---|---|
-   | Proof-of-work | Module-SIS short-vector search | Lattice (Module-SIS) |
+   | Proof-of-work | SHAKE-256 hashcash + Module-SIS structural gate | Hash (SHAKE-256, Grover-bounded) |
    | Signatures | Falcon-1024 ‖ ML-DSA-65 (hybrid) | Lattice (NTRU + Module-LWE/SIS) |
    | Hashing / domain sep | SHAKE-256 / SHA3 | Hash (Keccak) |
    | **Privacy proofs (this doc)** | **hash-STARKs, lattice commitments** | **Hash + lattice** |

@@ -34,6 +34,19 @@ pub struct NodeState {
     pub version:        String,
 }
 
+/// Block-submission hook — the B5f pool seam.
+///
+/// Stratum V1/V2 cannot carry the Module-SIS solution vector in their share
+/// messages (see main.rs B5f), so external pools mine full SIS blocks and
+/// hand them in over RPC instead. main.rs wires this with a closure that
+/// mirrors the gossipsub NewBlock path: `Block::block_hash()` identity,
+/// `validate_structure()` (PoW witness + merkle + coinbase), then the same
+/// `accept_block` consensus pipeline, then network broadcast.
+///
+/// `None` (tests, or callers that don't wire it) makes `submitblock` return
+/// a "not wired" error instead of silently accepting.
+pub type SubmitBlockFn = dyn Fn(crate::core::Block) -> Result<String, String> + Send + Sync;
+
 #[derive(Clone, Debug)]
 pub struct RpcConfig {
     pub bind_address:              String,
@@ -78,6 +91,8 @@ struct AppState {
     require_auth_for_writes: bool,
     rate_limiter:            Arc<auth::RateLimiterSet>,
     trust_private_ranges:    bool,
+    // B5f pool seam: submitblock hook (None = method returns "not wired").
+    submit_block:            Option<Arc<SubmitBlockFn>>,
 }
 
 pub async fn start_rpc_server(
@@ -87,6 +102,8 @@ pub async fn start_rpc_server(
     mempool:     Arc<Mempool>,
     dag:         Arc<RwLock<GhostDAG>>,
     outbound_tx: mpsc::Sender<NetworkMessage>,
+    // B5f pool seam — see `SubmitBlockFn`.
+    submit_block: Option<Arc<SubmitBlockFn>>,
 ) {
     let addr = format!("{}:{}", config.bind_address, config.port);
 
@@ -105,6 +122,7 @@ pub async fn start_rpc_server(
         require_auth_for_writes: config.require_auth_for_writes,
         rate_limiter,
         trust_private_ranges:    config.trust_private_ranges,
+        submit_block,
     };
 
     let app = Router::new()
@@ -523,6 +541,113 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
         }
 
         // ── Phase 2: getdaginfo ──────────────────────────────────────
+        // ── B5f pool seam: getblocktemplate / submitblock ─────────────────
+        //
+        // Stratum V1/V2 shares cannot carry the Module-SIS solution vector
+        // (main.rs refuses to start them), so pool software mines complete
+        // SIS blocks and talks to the node over these two methods instead:
+        //
+        //   getblocktemplate  — everything needed to assemble a candidate
+        //                       block: parents, height, blue_score, the
+        //                       expected `bits` (computed EXACTLY like
+        //                       accept_block: ASERT-Lattice from the genesis
+        //                       anchor + parent timestamp), subsidy/vesting
+        //                       amounts, and mempool transactions with fees.
+        //   submitblock       — full block (Bitcoin wire format hex, i.e.
+        //                       Block::to_bitcoin_bytes) routed through the
+        //                       same validation pipeline as gossiped blocks.
+        //
+        // The reference pool consuming this lives in pool/.
+        "getblocktemplate" => {
+            // Snapshot DAG state: parents = current tips; height = max
+            // parent height + 1 (accept_block's VULN-02 rule); blue_score =
+            // tip blue score + 1 (mirrors the solo miner loop).
+            let (parents, height, blue_score) = {
+                let d = state.dag.read();
+                let tips = d.tips();
+                if tips.is_empty() {
+                    return json!({ "error": "node has no tip yet (still syncing genesis?)" });
+                }
+                let max_parent_height = tips.iter()
+                    .filter_map(|t| d.get_block_data(t))
+                    .map(|dd| dd.height)
+                    .max()
+                    .unwrap_or(0);
+                (tips, max_parent_height + 1, d.tip_blue_score() + 1)
+            };
+
+            // Expected bits — the SAME function accept_block validates with
+            // (VULN-01): ASERT-Lattice anchored at genesis, keyed on the
+            // parent timestamp.
+            let parent_ts = state.store.get_timestamp_at_height(height.saturating_sub(1))
+                .ok().flatten().unwrap_or(crate::core::GENESIS_TIMESTAMP);
+            let bits = crate::pow::next_bits(
+                crate::core::GENESIS_BITS, crate::core::GENESIS_TIMESTAMP, parent_ts, height,
+            );
+
+            // Mempool selection + per-tx fees (mirrors stratum's
+            // install_fresh_template).
+            let txs = state.mempool.get_for_block(2000);
+            let mut total_fees: u64 = 0;
+            let tx_entries: Vec<Value> = txs.iter().map(|tx| {
+                let fee = state.mempool.get_entry(&tx.txid()).map(|e| e.fee).unwrap_or(0);
+                total_fees = total_fees.saturating_add(fee);
+                json!({
+                    "txid": hex::encode(tx.txid()),
+                    "fee":  fee,
+                    "data": hex::encode(tx.to_stratum_bytes(true)),
+                })
+            }).collect();
+
+            let subsidy = crate::core::tokenomics_v2::block_subsidy_sat(height);
+            let founder_vesting = crate::core::tokenomics_v2::founder_vesting_delta_sat(height);
+
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default().as_secs();
+
+            json!({
+                "parents":              parents.iter().map(hex::encode).collect::<Vec<_>>(),
+                "height":               height,
+                "blue_score":           blue_score,
+                "bits":                 bits,
+                "cur_time":             now,
+                "parent_time":          parent_ts,
+                "subsidy_sat":          subsidy,
+                "founder_vesting_sat":  founder_vesting,
+                "founder_address_hash": hex::encode(crate::core::tokenomics_v2::founder_address_hash()),
+                "total_fees":           total_fees,
+                "transactions":         tx_entries,
+                // Honesty marker: the PoW regime this chain runs. Shares /
+                // blocks are SHAKE-256 hashcash difficulty with a small-k
+                // Module-SIS structural gate — NOT lattice bit-security.
+                // Soft fork SF-1: the width is selected by the height of the
+                // block THIS TEMPLATE mines (k = 4 below the activation
+                // height, k = 8 at/above), so pool software that honors this
+                // field mines witnesses `validate_pow` will actually accept.
+                "residual_coeffs":      crate::pow::canonical_residual_coeffs(height),
+            })
+        }
+
+        "submitblock" => {
+            let block_hex = params.and_then(|p| p.get(0)).and_then(|v| v.as_str()).unwrap_or("");
+            let bytes = match hex::decode(block_hex) {
+                Ok(b)  => b,
+                Err(_) => return json!({ "error": "invalid hex" }),
+            };
+            let block = match crate::core::Block::from_bitcoin_bytes(&bytes) {
+                Ok(b)  => b,
+                Err(e) => return json!({ "error": format!("deserialise failed: {}", e) }),
+            };
+            match &state.submit_block {
+                None => json!({ "error": "submitblock not wired on this node (started without a block-submission hook)" }),
+                Some(hook) => match hook(block) {
+                    Ok(hash_hex) => json!({ "accepted": true, "hash": hash_hex }),
+                    Err(reason)  => json!({ "error": format!("rejected: {}", reason) }),
+                },
+            }
+        }
+
         "getdaginfo" => {
             let dag = state.dag.read();
             let tips = dag.tips();

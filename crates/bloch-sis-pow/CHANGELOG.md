@@ -2,6 +2,20 @@
 
 All notable changes to `bloch-sis-pow` will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+- **Security-claim reframing (docs only).** The hardness research
+  (`docs/research/POW-CANONICAL-frontier.md` in the protocol repo) established
+  that a trapdoorless PoW cannot be both lattice-hard and mineable. The crate
+  docs now state the honest model: Bloch-SIS-PoW is a SHAKE-256 hashcash with
+  a Module-SIS *structural gate* — security is cumulative hash work, not
+  lattice hardness, and no lattice bit-security number attaches to the PoW.
+  The 0.1.0 note below ("production mining requires lattice reduction") is
+  retained as the historical belief; it is superseded — full-`M` is unmineable
+  outright, and the brute-force miner is the correct one for the small-`k`
+  design.
+
 ## [0.1.0] - 2026-05-02
 
 ### Added

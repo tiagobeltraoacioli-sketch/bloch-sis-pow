@@ -1,5 +1,21 @@
 # Module-SIS PoW — hardness analysis (S1)
 
+> **Status update (2026-07) — goal superseded.** The follow-up frontier
+> research (`docs/research/POW-CANONICAL-frontier.md`, dense estimator sweep)
+> established that the target this file works toward — a *mineable* instance
+> with a ≥2^100/2^128 lattice no-shortcut margin — **does not exist and cannot
+> exist for a trapdoorless PoW**: with no trapdoor, the core-SVP cost is both
+> the attack cost and the honest mining cost, and the sweep shows the secure
+> and mineable regimes are disjoint (every ≥100-bit point has no short `s` at
+> all; every mineable point is trivial). The viable design is the one §"First-
+> order screen" already points at — **small-`k` residual gate + a separate
+> leading-zeros hashcash knob** — whose honest security claim is **cumulative
+> SHAKE-256 hash work** (post-quantum via Grover's quadratic bound), with the
+> Module-SIS residual as a non-trivial *structural* gate, **not** a lattice
+> bit-security wall. This file remains as the S1 analysis that motivated the
+> screen and the sweep; read its "target ~2^128 margin" language as the
+> historical goal, not the current claim.
+
 Findings from a fact-checked survey (IACR ePrint, the lattice-estimator, FIPS
 204) on whether the Bloch-SIS PoW parameters are hard, and how to fix them. This
 is the **mainnet security gate**: the testnet regime is forgeable by design; the
@@ -62,7 +78,9 @@ assumed secure because it reuses B=2 and q from Dilithium.
    ever pushing β into the trivial regime.
 2. **Pick β below the trivial threshold** (`β < q/√m`) and then size `(n, m, q)`
    so the estimated blocksize gives the target ~2^128 classical no-shortcut
-   margin. Expect `n` and/or `m` to grow beyond `256/512`.
+   margin. Expect `n` and/or `m` to grow beyond `256/512`. *(Superseded: the
+   frontier sweep proved every such point is unmineable — no short `s` exists.
+   See the status banner above.)*
 3. **Keep A unstructured** (already the case): per-nonce `(A,t)` from SHAKE makes
    the PoW progress-free (hashcash-like) and blocks cross-nonce precomputation for
    random lattices — a heuristic "no known advice" argument, adequate for a PoW.

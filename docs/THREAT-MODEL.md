@@ -48,7 +48,7 @@ privacy — there is no privileged party that can deanonymize or freeze users.
 
 | Threat | Mitigation | Status / gate |
 |---|---|---|
-| **Cheap PoW forgery** (find solutions faster than intended work) | Module-SIS short-vector PoW; canonical verifier checks all M residual coeffs + norm bounds | ⚠️ **testnet regime is forgeable**; canonical param hardness = **S1** (research in flight) |
+| **Cheap PoW forgery** (find solutions faster than intended work) | SHAKE-256 hashcash target (cumulative work) + non-trivial Module-SIS structural gate (`√k·β < q`, compile-time enforced) | ⚠️ **testnet regime is forgeable**; hardness research concluded PoW security is hash work, not lattice hardness (`docs/research/POW-CANONICAL-frontier.md`) — canonical gate params + no-shortcut proof = **S1** |
 | **Signature forgery** (incl. quantum) | Hybrid **Falcon-1024 ‖ ML-DSA-65** — both must verify (two lattice families) | ✅ implemented; **S2** audit pending |
 | **Hash break** (incl. quantum) | SHAKE-256 / SHA3 throughout (Grover-resistant margins) | ✅ implemented |
 | **Double-spend / reorg theft** | GhostDAG-Q + reorg re-validation (input existence, no double-spend, value conservation, coinbase maturity) | ✅ H1 fix + tests; **S2/S3** (audit + live multi-node) |

@@ -1,7 +1,11 @@
 # Bloch-SIS Protocol — Development Plan
 
 **Bloch-SIS Protocol** is a **post-quantum, pure-Proof-of-Work Layer 1** whose
-identity is the Module-**SIS** (Short Integer Solution) lattice proof-of-work.
+identity is its proof-of-work: a SHAKE-256 hashcash with a Module-**SIS**
+(Short Integer Solution) structural gate. (Historical note: this plan's original
+framing — "Module-SIS lattice proof-of-work" as the security source — was
+corrected by the hardness research: PoW security is cumulative hash work, not
+lattice hardness; see `docs/research/POW-CANONICAL-frontier.md`.)
 Forked from the
 Bloch-SIS Protocol (BLOCH) codebase. This document is the source of truth for
 how Bloch diverges from BLOCH. BLOCH is preserved untouched (local + GitLab);
@@ -58,13 +62,16 @@ subsystems. Proposed consequences (confirm before coding):
 The reference crate is vendored at `crates/bloch-sis-pow/` (v0.1.0, 43 tests,
 0 unsafe, SHAKE-256 domain separation, q = 8 380 417 = ML-DSA-65 modulus).
 
-**Honest state:**
-- Hardness is **conjectured, not proven**; no lattice-estimator run yet;
-  parameters provisional.
-- At canonical parameters the brute-force solver **cannot mine**
-  (P ≈ (1/8)^512). Production mining **requires lattice reduction (BKZ + Babai)**
-  — not yet implemented, and its progress-freeness / ASIC dynamics are open
-  problems the report itself flags.
+**Honest state** *(historical snapshot — since superseded by the hardness
+research: PoW security is hashcash cumulative work, not lattice hardness, and
+BKZ mining is a dead end; see `docs/research/POW-CANONICAL-frontier.md`)*:
+- Hardness was **conjectured, not proven** at the time; the estimator research
+  later showed no lattice-hard mineable parameterization exists.
+- At full-`M` parameters the brute-force solver **cannot mine**
+  (P ≈ (1/8)^512). The original plan assumed production mining would
+  **require lattice reduction (BKZ + Babai)** — the frontier research proved
+  full-`M` is unmineable outright, and the canonical small-`k` design keeps
+  the brute-force/hash-grind miner as the correct one.
 - Verify is ~5–6 ms (target ≤ 1 ms via NTT). Heavier than SHA-256 → mild DoS
   surface until optimized.
 - No audit; own timeline: cryptographer paper Q1 2027, ePrint 2027, audit 2028.
@@ -127,8 +134,9 @@ provides **zero security** and is for wiring/e2e only.
     (they still emit SHA-256d work; the core node miner is already on SIS).
   Research track (lattice-estimator, BKZ solver, ePrint, audit) gates mainnet.
 
-**Status:** the core chain mines, validates, and boots on Module-SIS lattice
-PoW end-to-end (testnet regime, ZERO security). Remaining: B5f (stratum),
+**Status:** the core chain mines, validates, and boots on the Bloch-SIS PoW
+(SHAKE-256 hashcash + Module-SIS gate) end-to-end (testnet regime, ZERO
+security). Remaining: B5f (stratum),
 B6 (unify SHAKE-256 + hybrid Falcon∥ML-DSA signatures), B7 (testnet), and the
 research track before any mainnet claim.
 - **B6 — Unify crypto:** SHAKE-256 everywhere; hybrid Falcon-1024 ∥ ML-DSA-65

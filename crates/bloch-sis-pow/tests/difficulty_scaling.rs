@@ -3,10 +3,12 @@
 //!
 //! The PoW has two independent parts (the difficulty-knob split, already wired in
 //! `verify::verify_regime`):
-//!   1. a FIXED, non-trivial residual floor `β` (`√k·β < q`) — the post-quantum,
-//!      ASIC-unfriendly Module-SIS substrate; it does NOT change with difficulty;
+//!   1. a FIXED, non-trivial residual floor `β` (`√k·β < q`) — the Module-SIS
+//!      structural gate; it does NOT change with difficulty and is not the
+//!      security source;
 //!   2. a TUNABLE `aux_hash < target` filter (SHAKE-256) — the mineable difficulty,
-//!      raised/lowered by ASERT as hashrate rises/falls.
+//!      raised/lowered by ASERT as hashrate rises/falls; this cumulative hash
+//!      work is the PoW's security.
 //!
 //! This test freezes β and only moves the `aux` target: a harder target costs
 //! strictly more mining work, and an impossible target yields no block. Mining is

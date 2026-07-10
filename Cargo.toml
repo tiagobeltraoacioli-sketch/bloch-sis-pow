@@ -17,7 +17,7 @@ name = "bloch"
 version = "0.1.0-genesis"
 edition = "2021"
 authors = ["Bloch-SIS Protocol"]
-description = "Bloch-SIS Protocol: post-quantum pure-PoW BlockDAG L1 — Module-SIS lattice PoW, hybrid Falcon+ML-DSA signatures, GhostDAG-Q"
+description = "Bloch-SIS Protocol: post-quantum pure-PoW BlockDAG L1 — SHAKE-256 hashcash PoW with a Module-SIS structural gate, hybrid Falcon+ML-DSA signatures, GhostDAG-Q"
 license = "MIT"
 repository  = "https://gitlab.com/bloch-protocol/bloch"
 
@@ -152,7 +152,7 @@ stratum-core              = { version = "0.2", optional = true }
 
 secp256k1                 = { version = "0.29", features = ["rand-std"] }
 
-# Sprint B5: Module-SIS lattice PoW (Bloch-SIS). Vendored reference crate;
+# Sprint B5: Bloch-SIS PoW (SHAKE-256 hashcash + Module-SIS gate). Vendored reference crate;
 # the pow adapter (src/pow) is the seam that migrates consensus off SHA-256d.
 bloch-sis-pow             = { path = "crates/bloch-sis-pow" }
 

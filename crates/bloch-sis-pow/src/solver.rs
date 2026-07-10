@@ -23,15 +23,18 @@
 //!
 //! # Performance honesty
 //!
-//! This is **reference**, not production. Even at modest difficulty,
-//! a true miner would use:
-//! - GPU parallelism for the matrix expansion and matmul
-//! - Lattice reduction (BKZ) followed by Babai rounding to construct
-//!   candidates near the target
-//! - Sieve-style algorithms for batched candidate generation
+//! This is **reference**, not production. A production miner would use
+//! GPU parallelism for the matrix expansion, matmul, and SHAKE grinding.
+//! Lattice reduction (BKZ + Babai) is deliberately **not** implemented:
+//! for the small-`k` residual gate, solutions are abundant and
+//! brute-force sampling is the correct, near-optimal strategy — the PoW's
+//! work is the hashcash grind, not lattice reduction
+//! (`docs/research/POW-CANONICAL-frontier.md` §5.1). A BKZ miner would
+//! only be needed for the full-`M` lattice-as-work design, which that
+//! research proves is unmineable.
 //!
 //! The search strategy below is brute-force-with-rng. It is correct
-//! and pedagogically clear; production miners will replace this.
+//! and pedagogically clear; production miners will parallelize it.
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};

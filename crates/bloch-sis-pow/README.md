@@ -1,10 +1,21 @@
 # Bloch-SIS-PoW — Reference Implementation
 
-Lattice-based proof-of-work for the **Bloch Protocol**. This crate
-implements the v0.1 reference of `Bloch-SIS-PoW`, a proof-of-work
-construction whose hardness is conjectured to reduce to the
-**Module Short Integer Solution (Module-SIS)** problem on the
-algebraic structure shared with NIST FIPS 204 ML-DSA-65 signatures.
+Proof-of-work for the **Bloch Protocol**: a **SHAKE-256 (Keccak)
+hashcash** with a **Module Short Integer Solution (Module-SIS)
+structural gate** on the algebraic structure shared with NIST FIPS 204
+ML-DSA-65 signatures. This crate implements the v0.1 reference of
+`Bloch-SIS-PoW`.
+
+**Security model, stated plainly:** the PoW's security is the
+cumulative hashcash work of the aux-hash target — **not** lattice
+hardness. A trapdoorless PoW cannot be both lattice-hard and mineable
+(the honest miner and the attacker face the same instance; the
+estimator frontier shows the secure and mineable regimes are disjoint —
+see `docs/research/POW-CANONICAL-frontier.md` in the protocol repo).
+The Module-SIS residual is a non-trivial structural filter that binds
+the work to a lattice form; no lattice bit-security number attaches to
+this PoW. Its post-quantum property comes from SHAKE-256 (Grover gives
+only a quadratic speedup).
 
 > **Status: research-grade reference code.**
 > This crate is correct in structure but has **not been audited**,
@@ -27,11 +38,13 @@ t      := ExpandVector(seed)         // 512-element target mod q
                                                           // hash filter
 ```
 
-Conditions (1) and (2) are a Module-SIS instance. Condition (3) is the
-auxiliary hash threshold that allows difficulty to be regulated. All
-three must hold for the PoW to verify.
+Conditions (1) and (2) are the Module-SIS structural gate — a fixed
+rejection filter that binds the work to a lattice form. Condition (3)
+is the hashcash difficulty threshold, and it is the PoW's security
+source (cumulative SHAKE-256 work). All three must hold for the PoW to
+verify.
 
-### Canonical parameters (v0.1)
+### Shipped parameters (v0.1 reference)
 
 | Symbol | Value                              | Meaning                                   |
 |--------|------------------------------------|-------------------------------------------|
@@ -41,9 +54,10 @@ three must hold for the PoW to verify.
 | B      | 2                                  | `\|\|s\|\|_∞ ≤ B`                         |
 | β      | q / 16 = 523 776                   | `\|\|A·s − t\|\|_∞ < β`                   |
 
-These are subject to revision after concrete-security analysis using
-the lattice-estimator (planned for the cryptographer-in-residence
-research phase).
+These are subject to revision: the canonical design checks the residual
+on a small `k` of the `m` rows (a non-trivial `√k·β < q` gate) with a
+separate leading-zeros difficulty knob; the gate width awaits the
+no-shortcut analysis (`docs/research/POW-CANONICAL-frontier.md`).
 
 ## Quick start
 
@@ -137,10 +151,16 @@ final implementation, not the reference one in this crate.
 
 1. This implementation has **not been audited**. A formal audit is
    scoped for the Bloch Protocol mainnet preparation phase.
-2. The hardness of Bloch-SIS-PoW is **conjectured**, not proven. A
-   formal hardness reduction is a deliverable of the research phase.
-3. The parameters are **provisional**. Final concrete-security analysis
-   may require larger `n` or smaller `β` than the v0.1 values.
+2. The PoW's security claim is **hashcash cumulative work, not lattice
+   hardness** — the hardness research (three independent analyses,
+   culminating in `docs/research/POW-CANONICAL-frontier.md`) showed a
+   mineable trapdoorless PoW cannot be lattice-hard. The outstanding
+   research deliverable is the **no-shortcut / attacker-asymmetry
+   proof** for the small-`k` gate, not a hardness reduction to
+   Module-SIS.
+3. The parameters are **provisional**. The canonical residual-gate
+   width `k` (candidate 8) and `β` are frozen only after the
+   no-shortcut analysis and the ePrint rationale.
 4. Implementations of `Falcon-1024` (used in Bloch's hybrid signatures,
    not in this crate) require constant-time floating-point arithmetic
    and are subject to additional caveats. See the Bloch Protocol

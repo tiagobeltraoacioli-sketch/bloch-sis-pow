@@ -77,8 +77,11 @@ neutral commons; commercial value lives at the edges, in products with owners.
 
 ## 4. Post-quantum by default
 
-The PoW is a **Module-SIS lattice** problem; signatures are hybrid
-**Falcon‖ML-DSA**; hashing is SHAKE-256; the privacy layer (Coherence) uses
+The PoW is a **SHAKE-256 hashcash** (post-quantum because Grover gives only a
+quadratic speedup) with a **Module-SIS structural gate** — the gate binds the
+work to a lattice form; the security source is the cumulative hash work.
+Signatures are hybrid **Falcon‖ML-DSA** (genuinely lattice-based); hashing is
+SHAKE-256; the privacy layer (Coherence) uses
 **hash-STARK/FRI — no elliptic curves**. The security, and the privacy, are meant
 to survive a quantum computer — including "harvest-now, decrypt-later."
 
@@ -88,9 +91,9 @@ Said precisely, so no one is misled:
 
 - The **mining computation is NOT "useful work."** Making the consensus PoW
   compute something externally useful is a research graveyard (it breaks the
-  hard-to-solve / easy-to-verify / non-precomputable requirements). Module-SIS PoW
-  stays **arbitrary-but-secure** — deliberately. We do **not** claim useful-work
-  consensus.
+  hard-to-solve / easy-to-verify / non-precomputable requirements). The Bloch-SIS
+  PoW stays **arbitrary-but-secure** (cumulative hashcash work) — deliberately. We
+  do **not** claim useful-work consensus.
 - What **is** useful — and this is the real point — is the **infrastructure the
   network's participants run**: private, hardened, **attestable** nodes and
   devices. The honest, deliverable form of "useful" is a **proof of useful privacy

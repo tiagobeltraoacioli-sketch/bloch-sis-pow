@@ -1,0 +1,56 @@
+# bloch-pool — REFERENCE mining pool for Bloch-SIS-PoW.
+#
+# Deliberately a standalone workspace (not a member of the node's) so the
+# pool can be vendored / forked independently: the whole point of a
+# reference pool is that there are MANY pools, not one.
+#
+# Depends only on the two lean protocol crates (bloch-crypto for consensus
+# types + tokenomics, bloch-sis-pow for the PoW itself) — NOT on the full
+# node (no rocksdb / libp2p). Work + submission go over the node's JSON-RPC.
+
+[workspace]
+
+[package]
+name = "bloch-pool"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Reference (non-production) mining pool for Bloch-SIS-PoW: SIS-native stratum dialect, PPLNS share accounting, honest-by-design dashboard"
+
+[lib]
+name = "bloch_pool"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bloch-pool"
+path = "src/main.rs"
+
+[[bin]]
+name = "bloch-pool-miner"
+path = "src/bin/miner.rs"
+
+[[bin]]
+name = "bloch-pool-keyshard"
+path = "src/bin/keyshard.rs"
+
+[dependencies]
+bloch-crypto  = { path = "../crates/bloch-crypto" }
+bloch-sis-pow = { path = "../crates/bloch-sis-pow" }
+
+tokio        = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
+parking_lot  = "0.12"
+serde        = { version = "1", features = ["derive"] }
+serde_json   = "1"
+hex          = "0.4"
+rand         = "0.8"
+sharks       = "0.5"   # vetted Shamir secret sharing (procedural M-of-N seed recovery)
+log          = "0.4"
+env_logger   = "0.11"
+clap         = { version = "4", features = ["derive"] }
+ureq         = { version = "2", features = ["json"] }
+
+# Standalone workspaces do not inherit the node workspace's [patch] table, so
+# the vendored pqcrypto-internals fork (seeded-RNG API used by bloch-crypto)
+# must be re-declared here, path-adjusted for the pool's location.
+[patch.crates-io]
+pqcrypto-internals = { path = "../crates/pqcrypto-internals" }
