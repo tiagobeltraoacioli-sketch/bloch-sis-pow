@@ -51,7 +51,8 @@ primary_region = "gru"
     port = 16110
 
 # VM size. Matches the running machine (shared / 2 CPUs / 2 GB) — cheap, valid,
-# and enough: k=8 mining is CPU-bound but the ASERT difficulty self-adjusts, and
+# and enough: mining (relaxed k=4 regime currently — k=8 reverted, re-activating
+# with a difficulty fix) is CPU-bound but the ASERT difficulty self-adjusts, and
 # 2 GB fits the node + RocksDB for this chain.
 # NOTE: the earlier performance/8 cpus/8gb combo was INVALID — performance CPUs
 # require >=2 GB each, so 8 CPUs need >=16 GB; that mismatch was failing every

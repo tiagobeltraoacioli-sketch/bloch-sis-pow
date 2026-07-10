@@ -15,13 +15,16 @@ build products on the open protocol; Postern is one builder among many.
 
 > ## 🔴 Hard caveat — read first
 > The chain is designated **mainnet beta** — a designation, **not** a security
-> claim. The **k=8 hardening** of the PoW's Module-SIS gate is **deployed as a
-> soft fork and activates at block 213,000**; **until activation the relaxed
-> regime still applies** (residual checked on a few coefficients → work remains
-> trivially forgeable until then). The PoW's security model is **hashcash
+> claim. The **relaxed regime (k=4) currently applies** (residual checked on a
+> few coefficients → **work is trivially forgeable**). The **k=8 hardening** of
+> the PoW's Module-SIS gate was **activated at block 213,000 as a soft fork but
+> reverted**: it multiplied mining difficulty ~4096x and the current solo / low
+> hashrate could not find blocks, so the chain stalled. k=8 will **re-activate
+> together with a matched difficulty reduction** (so block time stays ~30s);
+> **until then, no security is claimed**. The PoW's security model is **hashcash
 > cumulative work, not lattice hardness** (a trapdoorless PoW cannot be
 > lattice-hard and mineable — `docs/research/POW-CANONICAL-frontier.md`); the
-> SIS gate is a structural filter (k=8 from block 213,000). The network is
+> SIS gate is a structural filter (k=4 today; k=8 on re-activation). The network is
 > **nascent: very few nodes, low hashrate → 51%-attackable**. **Unaudited** —
 > the third-party audit is contracted but **not done**; the no-shortcut proof
 > and the IACR ePrint are still outstanding. The coin is **not a security and
@@ -180,7 +183,7 @@ build products on the open protocol; Postern is one builder among many.
 
 | Track | Next |
 |---|---|
-| **Mainnet gate** | canonical small-`k` + leading-zeros gate params, no-shortcut/asymmetry proof, ePrint, third-party audit. Hardness research done (screen `deploy/pow-estimator/SCREEN-RESULTS.md` + frontier sweep `docs/research/POW-CANONICAL-frontier.md`): lattice-hard mining is structurally impossible for a trapdoorless PoW (secure and mineable regimes disjoint) — PoW security is hashcash cumulative work; the SIS gate is a non-trivial structural filter. `k` **frozen at 8** — soft-fork **deployed, activates at block 213,000** (until activation the relaxed regime still applies); the “mainnet beta” designation is **not** a security claim and does not close this track. Remaining: the no-shortcut proof, BDD cross-check, difficulty calibration, the ePrint, and the third-party audit (contracted, **not done**) |
+| **Mainnet gate** | canonical small-`k` + leading-zeros gate params, no-shortcut/asymmetry proof, ePrint, third-party audit. Hardness research done (screen `deploy/pow-estimator/SCREEN-RESULTS.md` + frontier sweep `docs/research/POW-CANONICAL-frontier.md`): lattice-hard mining is structurally impossible for a trapdoorless PoW (secure and mineable regimes disjoint) — PoW security is hashcash cumulative work; the SIS gate is a non-trivial structural filter. `k` **frozen at 8** — the soft fork **activated at block 213,000 but was reverted**: it multiplied mining difficulty ~4096x and the current solo / low hashrate could not find blocks, so the chain stalled; the **relaxed regime (k=4) currently applies** (work trivially forgeable) and k=8 will **re-activate together with a matched difficulty reduction** (so block time stays ~30s); the “mainnet beta” designation is **not** a security claim and does not close this track. Remaining: k=8 re-activation with the difficulty fix, the no-shortcut proof, BDD cross-check, difficulty calibration, the ePrint, and the third-party audit (contracted, **not done**) |
 | **Coherence** | C2 remainder (SP1 prove/verify on the toolchain; submit/gossip entry point + reorg-tracking — land with the SP1 verifier), C3/C4 review + audit |
 | **Attestation** | wire `virtee/sev` on a real SEV-SNP host; mobile Key-Attestation/App-Attest verifier; live end-to-end demo |
 | **Mobile app** | ✅ lean cross-compile + ✅ UniFFI export + ✅ Android/iOS shell skeletons → next: build the shells on real SDKs (cargo-ndk / xcframework), the Postern Container impl, `bloch-core` split only if drift-risk demands |
