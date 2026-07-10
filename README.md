@@ -19,15 +19,18 @@ tokenomics, and finality model replaced.
 
 > ## ⚠️ Status: **mainnet beta** — unaudited, low-hashrate, 51%-attackable
 > The chain is designated **mainnet beta** — a designation, **not** a security
-> claim. The **k=8 security hardening** of the PoW's Module-SIS gate is
-> **deployed as a soft fork and activates at block 213,000**; **until
-> activation the relaxed regime still applies** (the residual bound is checked
-> on a handful of coefficients → work remains trivially forgeable until then).
-> The PoW's security model is **hashcash cumulative work, not lattice
-> hardness** — estimator research showed a trapdoorless PoW cannot be both
-> lattice-hard and mineable (the regimes are disjoint; see
+> claim. The **relaxed regime (k=4) currently applies** (the residual bound is
+> checked on a handful of coefficients → **work is trivially forgeable**). The
+> **k=8 security hardening** of the PoW's Module-SIS gate was **activated at
+> block 213,000 as a soft fork but reverted**: it multiplied mining difficulty
+> ~4096x and the current solo / low hashrate could not find blocks, so the
+> chain stalled. k=8 will **re-activate together with a matched difficulty
+> reduction** (so block time stays ~30s); **until then, no security is
+> claimed**. The PoW's security model is **hashcash cumulative work, not
+> lattice hardness** — estimator research showed a trapdoorless PoW cannot be
+> both lattice-hard and mineable (the regimes are disjoint; see
 > `docs/research/POW-CANONICAL-frontier.md`); the Module-SIS gate is a
-> structural filter (k=8 from block 213,000). The network is **nascent: very
+> structural filter (k=4 today; k=8 on re-activation). The network is **nascent: very
 > few nodes, low hashrate → 51%-attackable**. **Unaudited** — a third-party
 > audit is contracted but **not done**; the no-shortcut analysis for the
 > canonical gate parameters and the IACR ePrint pre-print are still

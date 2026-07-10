@@ -138,7 +138,7 @@ pub const GENESIS_BITS:      u32   = 0x2100ffff;
 /// DO NOT set this to `u64::MAX` (never activates) and DO NOT set it at or
 /// below the current tip (historical/next blocks would fail k=8 validation
 /// → forced chain reset).
-pub const CANONICAL_K_ACTIVATION_HEIGHT: u64 = 213_000;
+pub const CANONICAL_K_ACTIVATION_HEIGHT: u64 = 1_000_000;
 
 /// Consensus selector for the PoW residual-gate width at a given BLOCK height.
 ///
