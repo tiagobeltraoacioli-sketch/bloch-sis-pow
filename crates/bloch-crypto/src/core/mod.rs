@@ -107,6 +107,56 @@ pub const GENESIS_TIMESTAMP: u64   = 1777686240;
 // ceremony (B5e). Also the ASERT-Lattice anchor (see src/pow::next_bits).
 pub const GENESIS_BITS:      u32   = 0x2100ffff;
 
+// ── Soft fork SF-1: canonical residual-gate width, k: 4 → 8 ─────────────────
+//
+// Height-activated tightening of the Bloch-SIS PoW residual gate from the
+// relaxed testnet width (TESTNET_RESIDUAL_COEFFS = 4) to the candidate
+// canonical width (CANONICAL_RESIDUAL_COEFFS = 8). Because the residual check
+// inspects the first k coefficients, every k=8-valid solution is automatically
+// k=4-valid (prefix subset) — so this is a SOFT fork: un-upgraded peers keep
+// accepting post-activation blocks, and all historical blocks (mined under
+// k=4) keep validating because they sit below the activation height.
+
+/// ⚠⚠ ACTIVATION HEIGHT — PLACEHOLDER. THE FOUNDER MUST SET THIS BEFORE THE
+/// LIVE SOFT-FORK DEPLOY. ⚠⚠
+///
+/// Blocks with `height <` this value are validated at the testnet residual
+/// width (k = 4, as today); blocks with `height >=` this value are validated
+/// at the canonical width (k = 8).
+///
+/// The current value (1_000_000) is a clearly-future placeholder chosen so an
+/// accidentally-deployed binary behaves identically to today on the existing
+/// chain (tip ≪ 1_000_000). Before the real activation the founder MUST:
+///
+///   1. Set this to `current chain tip height + a safety margin` — the margin
+///      must be generous enough for EVERY MINING NODE to upgrade to a binary
+///      carrying the final value BEFORE the chain reaches it (an un-upgraded
+///      miner producing a k=4-only block at/after H would have that block
+///      rejected by upgraded nodes).
+///   2. Ship that binary to all mining nodes before height H is reached.
+///
+/// DO NOT set this to `u64::MAX` (never activates) and DO NOT set it at or
+/// below the current tip (historical/next blocks would fail k=8 validation
+/// → forced chain reset).
+pub const CANONICAL_K_ACTIVATION_HEIGHT: u64 = 1_000_000;
+
+/// Consensus selector for the PoW residual-gate width at a given BLOCK height.
+///
+/// CONSENSUS-CRITICAL: callers must pass the height of the block whose PoW is
+/// being validated (or mined) — NOT the current tip height. `Block::height` is
+/// itself consensus-checked (wire height vs. content in the NewBlock handler,
+/// and `height == max(parent heights) + 1` in `accept_block`, VULN-02), so a
+/// block lying about its height to dodge the k=8 gate is rejected on height
+/// grounds before it can be accepted.
+#[inline]
+pub const fn canonical_residual_coeffs(height: u64) -> usize {
+    if height >= CANONICAL_K_ACTIVATION_HEIGHT {
+        bloch_sis_pow::CANONICAL_RESIDUAL_COEFFS
+    } else {
+        bloch_sis_pow::TESTNET_RESIDUAL_COEFFS
+    }
+}
+
 /// Genesis Module-SIS PoW witness (B5e). Mined in the relaxed testnet regime
 /// against the canonical genesis (coinbase to FOUNDER_ADDRESS_HEX, GENESIS_BITS,
 /// GENESIS_TIMESTAMP, nonce = GENESIS_NONCE). Makes `create_genesis_block`
@@ -1164,12 +1214,17 @@ impl Block {
     }
 
     pub fn validate_pow(&self) -> bool {
-        // Bloch-SIS PoW (B5b-2, testnet regime): the block's solution vector
-        // must satisfy the Module-SIS instance derived from the header, plus
-        // the aux-hash difficulty filter. A SECURE verify regime is gated on
-        // the research track (neither shipped width is secure — see the
-        // bloch-sis-pow crate header); testnet uses the relaxed residual width.
-        // N = 256 (asserted == bloch_sis_pow::params::N in src/pow).
+        // Bloch-SIS PoW (B5b-2): the block's solution vector must satisfy the
+        // Module-SIS instance derived from the header, plus the aux-hash
+        // difficulty filter. A SECURE verify regime is gated on the research
+        // track (neither shipped width is secure — see the bloch-sis-pow crate
+        // header). N = 256 (asserted == bloch_sis_pow::params::N in src/pow).
+        //
+        // Soft fork SF-1: the residual width is selected by THIS BLOCK's
+        // height — k = 4 below CANONICAL_K_ACTIVATION_HEIGHT (so the existing
+        // chain keeps validating), k = 8 at/above it. Height-lying is caught
+        // by accept_block's height check (VULN-02) before acceptance, and
+        // claiming a false height ≥ H only makes validation STRICTER.
         if self.pow_solution.len() != bloch_sis_pow::params::N {
             return false;
         }
@@ -1181,7 +1236,7 @@ impl Block {
             self.header.nonce,
             &s,
             &target,
-            bloch_sis_pow::TESTNET_RESIDUAL_COEFFS,
+            canonical_residual_coeffs(self.height),
         )
         .is_ok()
     }
@@ -1536,4 +1591,181 @@ fn target_to_bits(target: &[u8; 32]) -> u32 {
              | ((target.get(start + 1).copied().unwrap_or(0) as u32) << 8)
              | (target.get(start + 2).copied().unwrap_or(0) as u32);
     ((exp as u32) << 24) | (mant & 0x00ff_ffff)
+}
+
+// ── Soft fork SF-1 tests: height-gated residual width in validate_pow ────────
+#[cfg(test)]
+mod sf1_tests {
+    use super::*;
+    use bloch_sis_pow::solver::{mine, MineConfig, MineResult};
+    use bloch_sis_pow::{CANONICAL_RESIDUAL_COEFFS, TESTNET_RESIDUAL_COEFFS};
+
+    /// Fixed header for the validate_pow gating tests. `pow_preimage()` does
+    /// not include the nonce or the block height, so ONE mined solution can be
+    /// attached to blocks claiming different heights — exactly what we need to
+    /// isolate the height gate.
+    fn sf1_test_header() -> BlockHeader {
+        BlockHeader {
+            version:     1,
+            parents:     vec![],
+            merkle_root: MerkleRoot([0u8; 32]),
+            timestamp:   1_777_000_000,
+            bits:        GENESIS_BITS, // near-max aux target: mining gated by the residual only
+            nonce:       0,
+        }
+    }
+
+    fn sf1_block(header: BlockHeader, height: u64, solution: &[i32]) -> Block {
+        Block {
+            header,
+            transactions: vec![],
+            blue_score: 0,
+            height,
+            pow_solution: solution.to_vec(),
+            shielded_transactions: vec![],
+        }
+    }
+
+    /// Pre-searched start nonce whose FIRST 4096-candidate window contains a
+    /// k=8-valid solution for `sf1_test_header().pow_preimage()` at the
+    /// GENESIS_BITS target. A cold k=8 mine needs ~2^24 candidates (too slow
+    /// for a debug unit test); the solver is deterministic given
+    /// (header, start_nonce), so the window was searched offline. If solver
+    /// internals change, re-run `sf1_search_fast_k8_start_nonce_for_block`
+    /// (`cargo test --release -p bloch-crypto -- --ignored --nocapture`)
+    /// and update this constant.
+    const K8_BLOCK_START_NONCE: u64 = 6158; // found at attempt 3424 of 4096
+
+    fn mine_window(k: usize, start_nonce: u64, budget: u64) -> Result<MineResult, bloch_sis_pow::MineError> {
+        let header = sf1_test_header();
+        let target = bloch_sis_pow::bits_to_target(header.bits);
+        mine(
+            &header.pow_preimage(),
+            &target,
+            &MineConfig {
+                start_nonce,
+                candidates_per_nonce: 4096,
+                max_total_attempts: budget,
+                residual_coeffs: k,
+            },
+            None,
+        )
+    }
+
+    #[test]
+    fn canonical_residual_coeffs_selector_gates_at_activation_height() {
+        let h = CANONICAL_K_ACTIVATION_HEIGHT;
+        assert_eq!(canonical_residual_coeffs(0), TESTNET_RESIDUAL_COEFFS);
+        assert_eq!(canonical_residual_coeffs(h - 1), TESTNET_RESIDUAL_COEFFS);
+        assert_eq!(canonical_residual_coeffs(h), CANONICAL_RESIDUAL_COEFFS);
+        assert_eq!(canonical_residual_coeffs(h + 1), CANONICAL_RESIDUAL_COEFFS);
+        assert_eq!(canonical_residual_coeffs(u64::MAX), CANONICAL_RESIDUAL_COEFFS);
+        // Concrete widths, so a re-parameterization is a conscious edit here too.
+        assert_eq!(TESTNET_RESIDUAL_COEFFS, 4);
+        assert_eq!(CANONICAL_RESIDUAL_COEFFS, 8);
+    }
+
+    #[test]
+    fn validate_pow_keeps_k4_history_valid_below_activation_only() {
+        // Mine k=4 solutions (cheap, ~2^12 candidates each) until one FAILS
+        // k=8 — true for a fraction 4095/4096 of them; needing more than 8
+        // mines has probability ≈ 4096^-8, so this is deterministic in
+        // practice. That solution models every historical (pre-fork) block.
+        let header = sf1_test_header();
+        let target = bloch_sis_pow::bits_to_target(header.bits);
+        let mut historical = None;
+        for i in 0..8u64 {
+            let r = mine_window(TESTNET_RESIDUAL_COEFFS, i * 1_000_003, 500_000)
+                .expect("k=4 testnet regime must be brute-force mineable");
+            if bloch_sis_pow::verify_regime(
+                &header.pow_preimage(), r.nonce, &r.solution, &target,
+                CANONICAL_RESIDUAL_COEFFS,
+            ).is_err() {
+                historical = Some(r);
+                break;
+            }
+        }
+        let r = historical.expect("8 consecutive k=4 solutions all passed k=8 — gate broken");
+
+        let mut mined_header = header;
+        mined_header.nonce = r.nonce;
+
+        // Below the activation height the k=4 witness stays valid — the
+        // existing chain keeps syncing (the whole point of height-gating).
+        let below = sf1_block(mined_header.clone(), CANONICAL_K_ACTIVATION_HEIGHT - 1, &r.solution);
+        assert!(below.validate_pow(), "pre-fork k=4 block must remain valid below H");
+        let genesis_like = sf1_block(mined_header.clone(), 0, &r.solution);
+        assert!(genesis_like.validate_pow(), "height-0 k=4 block must remain valid");
+
+        // At/above the activation height the SAME witness is rejected: the
+        // fork actually tightens.
+        let at = sf1_block(mined_header.clone(), CANONICAL_K_ACTIVATION_HEIGHT, &r.solution);
+        assert!(!at.validate_pow(), "k=4-only witness must be rejected at H");
+        let above = sf1_block(mined_header, CANONICAL_K_ACTIVATION_HEIGHT + 1, &r.solution);
+        assert!(!above.validate_pow(), "k=4-only witness must be rejected above H");
+    }
+
+    #[test]
+    fn validate_pow_accepts_k8_witness_at_and_below_activation() {
+        // A k=8-mined witness (pinned fast window — see K8_BLOCK_START_NONCE)
+        // passes at/above H, and ALSO below H (prefix subset): un-upgraded
+        // k=4 validators accept post-fork blocks, so no partition.
+        let r = mine_window(CANONICAL_RESIDUAL_COEFFS, K8_BLOCK_START_NONCE, 4096)
+            .expect("pinned window must contain a k=8 solution — if solver \
+                     internals changed, re-run sf1_search_fast_k8_start_nonce_for_block");
+
+        let mut mined_header = sf1_test_header();
+        mined_header.nonce = r.nonce;
+
+        let at = sf1_block(mined_header.clone(), CANONICAL_K_ACTIVATION_HEIGHT, &r.solution);
+        assert!(at.validate_pow(), "k=8 witness must validate at H");
+        let above = sf1_block(mined_header.clone(), CANONICAL_K_ACTIVATION_HEIGHT + 1, &r.solution);
+        assert!(above.validate_pow(), "k=8 witness must validate above H");
+        let below = sf1_block(mined_header.clone(), CANONICAL_K_ACTIVATION_HEIGHT - 1, &r.solution);
+        assert!(below.validate_pow(), "k=8 witness must validate below H (subset property)");
+
+        // Tampered nonce breaks it at any height.
+        let mut bad_header = mined_header;
+        bad_header.nonce = r.nonce.wrapping_add(1);
+        let bad = sf1_block(bad_header, CANONICAL_K_ACTIVATION_HEIGHT, &r.solution);
+        assert!(!bad.validate_pow());
+    }
+
+    /// Offline search utility for `K8_BLOCK_START_NONCE`. Run:
+    ///
+    /// ```text
+    /// cargo test --release -p bloch-crypto -- --ignored --nocapture sf1_search
+    /// ```
+    #[test]
+    #[ignore = "offline search utility — run in --release with --nocapture to (re)pin the fast k=8 start nonce"]
+    fn sf1_search_fast_k8_start_nonce_for_block() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        let found = AtomicU64::new(u64::MAX);
+        let stop = AtomicBool::new(false);
+        let next = AtomicU64::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4) {
+                scope.spawn(|| loop {
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let n = next.fetch_add(1, Ordering::Relaxed);
+                    if mine_window(CANONICAL_RESIDUAL_COEFFS, n, 4096).is_ok() {
+                        found.fetch_min(n, Ordering::Relaxed);
+                        stop.store(true, Ordering::Relaxed);
+                        return;
+                    }
+                });
+            }
+        });
+        let n = found.load(Ordering::Relaxed);
+        assert_ne!(n, u64::MAX, "search aborted without a hit");
+        let r = mine_window(CANONICAL_RESIDUAL_COEFFS, n, 4096)
+            .expect("re-mining the found window must reproduce");
+        println!(
+            "SF-1 fast k=8 window [bloch-crypto K8_BLOCK_START_NONCE]: \
+             start_nonce = {n} (nonce = {}, found at attempt {} of 4096)",
+            r.nonce, r.attempts
+        );
+    }
 }

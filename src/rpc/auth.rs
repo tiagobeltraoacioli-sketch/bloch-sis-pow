@@ -24,9 +24,10 @@ use governor::clock::DefaultClock;
 use governor::state::{InMemoryState, NotKeyed};
 use subtle::ConstantTimeEq;
 
-/// One method we treat as a "write" (mutating, gossipped to peers).
+/// Methods we treat as "writes" (mutating, gossipped to peers).
 /// Anything else is a read-only query of chain state.
-pub const WRITE_METHODS: &[&str] = &["sendrawtransaction"];
+/// `submitblock` is the B5f pool seam (see rpc::SubmitBlockFn).
+pub const WRITE_METHODS: &[&str] = &["sendrawtransaction", "submitblock"];
 
 /// Type alias for a direct (non-keyed) in-memory rate limiter.
 type IpRateLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;

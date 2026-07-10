@@ -1,19 +1,28 @@
-//! Module-SIS Proof-of-Work adapter.
+//! Bloch-SIS Proof-of-Work adapter.
 //!
 //! This is the seam between Bloch's block layer and the `bloch-sis-pow`
-//! reference crate (Module-SIS lattice PoW, the identity of Bloch-SIS).
-//! Since B5b, **Module-SIS is the live consensus PoW**: `Block::validate_pow`
-//! verifies the block's solution vector under the relaxed testnet regime
-//! (`verify_regime` with `TESTNET_RESIDUAL_COEFFS`); SHA-256d is gone.
+//! reference crate (a SHAKE-256 hashcash PoW with a Module-SIS structural
+//! gate — the identity of Bloch-SIS). Since B5b, **Bloch-SIS is the live
+//! consensus PoW**: `Block::validate_pow` verifies the block's solution
+//! vector via `verify_regime`, with the residual width selected by the
+//! block's height (soft fork SF-1): `TESTNET_RESIDUAL_COEFFS` (= 4) below
+//! `CANONICAL_K_ACTIVATION_HEIGHT`, `CANONICAL_RESIDUAL_COEFFS` (= 8) at or
+//! above it. SHA-256d is gone.
 //!
 //! ## Honest status
-//! The reference crate is research-grade and its full-`M` regime **cannot be
-//! mined** (finding a short SIS vector needs BKZ + Babai, not yet implemented)
-//! — nor is full-`M` secure at `β = q/16` (trivial q-ary regime; see the
-//! crate header). Bloch therefore runs the relaxed testnet regime — **zero
-//! security by design** — until the research track (lattice-estimator, BKZ
-//! solver, ePrint, audit) produces a vetted secure parameter set. See
-//! `BLOCH_DEVELOPMENT_PLAN.md` §3 and `crates/bloch-sis-pow`.
+//! The reference crate is research-grade. Its full-`M` regime is **unmineable**
+//! (no short `s` exists at these dimensions) and simultaneously insecure at
+//! `β = q/16` (trivial q-ary regime) — the frontier research
+//! (`docs/research/POW-CANONICAL-frontier.md`) proved lattice-hard mining is
+//! structurally impossible for a trapdoorless PoW, so the PoW's security is
+//! **hashcash cumulative work**, with the Module-SIS residual as a structural
+//! gate. Bloch runs the relaxed testnet regime — **zero security by design** —
+//! until the canonical gate params, the no-shortcut proof, the ePrint, and the
+//! audit land. Soft fork SF-1 (k: 4 → 8 at the activation height) tightens the
+//! structural gate's rejection floor from ~2^12 to ~2^24 but does NOT change
+//! this security story: k = 8 is the *candidate* canonical width, still
+//! pending the no-shortcut proof, and the security source remains hashcash.
+//! See `BLOCH_DEVELOPMENT_PLAN.md` §3 and `crates/bloch-sis-pow`.
 
 pub use bloch_sis_pow::{bits_to_target, target_to_bits, Target, VerifyError};
 
@@ -26,8 +35,21 @@ const _: () = assert!(SOLUTION_LEN == bloch_sis_pow::params::N);
 /// (re-exported from the crate). This small width makes brute-force mining
 /// feasible but is **zero security**. (The full-`M`=512 width is NOT a secure
 /// alternative — it is unmineable AND in the trivial q-ary regime at
-/// `β = q/16`; the secure width awaits the lattice-estimator run.)
+/// `β = q/16`; the canonical gate width awaits the no-shortcut analysis,
+/// `docs/research/POW-CANONICAL-frontier.md`.)
 pub use bloch_sis_pow::TESTNET_RESIDUAL_COEFFS;
+
+/// Candidate canonical residual width (k = 8), the post-activation gate of
+/// soft fork SF-1 (re-exported from the crate — see its honesty docs: the
+/// gate is structural, ~2^24 rejection floor; security stays the hashcash
+/// target).
+pub use bloch_sis_pow::CANONICAL_RESIDUAL_COEFFS;
+
+/// Soft fork SF-1 activation height + height→k selector (re-exported from
+/// `bloch_crypto::core`, the consensus module `Block::validate_pow` lives in,
+/// so miner and validator provably share one selector). The activation height
+/// is a PLACEHOLDER the founder must set before the live deploy — see its doc.
+pub use bloch_crypto::core::{canonical_residual_coeffs, CANONICAL_K_ACTIVATION_HEIGHT};
 
 /// GhostDAG accumulated-work contribution of a block at compact difficulty
 /// `bits`, computed from the **crate's** target semantics (consistent with
@@ -67,7 +89,9 @@ pub fn next_bits(
     )
 }
 
-/// Testnet-regime verify: relaxed residual width. **Zero security** — dev only.
+/// Testnet-regime verify: relaxed residual width (k = 4), height-blind.
+/// **Zero security** — dev only. Consensus code must use the height-aware
+/// [`verify_sis_pow`] instead (this is the pre-activation regime only).
 #[inline]
 pub fn verify_sis_pow_testnet(
     pow_preimage: &[u8],
@@ -79,12 +103,80 @@ pub fn verify_sis_pow_testnet(
     bloch_sis_pow::verify_regime(pow_preimage, nonce, solution, &target, TESTNET_RESIDUAL_COEFFS)
 }
 
-/// Testnet-regime miner: brute-force search under the relaxed residual width.
-/// Returns the found `(nonce, solution)` or `None` within the attempt budget.
-/// **Zero security** — dev/testnet only.
+/// Testnet-regime miner: brute-force search under the relaxed residual width
+/// (k = 4), height-blind. Returns the found `(nonce, solution)` or `None`
+/// within the attempt budget. **Zero security** — dev/testnet only. Consensus
+/// mining must use the height-aware [`mine_sis_pow`] instead: a k=4-only
+/// block mined at/after `CANONICAL_K_ACTIVATION_HEIGHT` is rejected by
+/// upgraded validators.
 pub fn mine_sis_pow_testnet(
     pow_preimage: &[u8],
     bits: u32,
+    start_nonce: u64,
+    max_attempts: u64,
+) -> Option<(u64, [i32; SOLUTION_LEN])> {
+    mine_sis_pow_regime(pow_preimage, bits, TESTNET_RESIDUAL_COEFFS, start_nonce, max_attempts)
+}
+
+/// Height-aware consensus verify (soft fork SF-1). Verifies a Module-SIS PoW
+/// witness at compact difficulty `bits` under the residual width selected by
+/// `height` — the height OF THE BLOCK BEING VALIDATED (never the tip):
+/// k = 4 below [`CANONICAL_K_ACTIVATION_HEIGHT`], k = 8 at/above it.
+///
+/// This mirrors `Block::validate_pow` exactly (both route k through
+/// `bloch_crypto::core::canonical_residual_coeffs`).
+///
+/// `pow_preimage` is the block's canonical PoW header bytes: the crate derives
+/// the seed as `SHAKE256(DOMAIN_SEED || pow_preimage || nonce)`, so the
+/// preimage must commit to every consensus field **except** the nonce (which
+/// the crate appends). The exact preimage bytes are fixed by B5b.
+#[inline]
+pub fn verify_sis_pow(
+    pow_preimage: &[u8],
+    nonce: u64,
+    solution: &[i32; SOLUTION_LEN],
+    bits: u32,
+    height: u64,
+) -> Result<(), VerifyError> {
+    let target = bits_to_target(bits);
+    bloch_sis_pow::verify_regime(
+        pow_preimage,
+        nonce,
+        solution,
+        &target,
+        canonical_residual_coeffs(height),
+    )
+}
+
+/// Height-aware consensus miner (soft fork SF-1): brute-force search under
+/// the residual width selected by `height` — the height of the block BEING
+/// MINED (tip + 1 for a fresh template). Returns the found
+/// `(nonce, solution)` or `None` within the attempt budget.
+///
+/// Cost honesty: at k = 8 the structural rejection floor is ~2^24, so a solve
+/// needs on the order of 16M candidate vectors (vs ~2^12 at k = 4) even at
+/// the easiest aux target.
+pub fn mine_sis_pow(
+    pow_preimage: &[u8],
+    bits: u32,
+    height: u64,
+    start_nonce: u64,
+    max_attempts: u64,
+) -> Option<(u64, [i32; SOLUTION_LEN])> {
+    mine_sis_pow_regime(
+        pow_preimage,
+        bits,
+        canonical_residual_coeffs(height),
+        start_nonce,
+        max_attempts,
+    )
+}
+
+/// Shared miner body: brute-force search under an explicit residual width.
+fn mine_sis_pow_regime(
+    pow_preimage: &[u8],
+    bits: u32,
+    residual_coeffs: usize,
     start_nonce: u64,
     max_attempts: u64,
 ) -> Option<(u64, [i32; SOLUTION_LEN])> {
@@ -94,27 +186,22 @@ pub fn mine_sis_pow_testnet(
         start_nonce,
         candidates_per_nonce: 4096,
         max_total_attempts: max_attempts,
-        residual_coeffs: TESTNET_RESIDUAL_COEFFS,
+        residual_coeffs,
     };
     mine(pow_preimage, &target, &cfg, None)
         .ok()
         .map(|r| (r.nonce, r.solution))
 }
 
-/// Verify a Module-SIS PoW witness at compact difficulty `bits`.
+/// Verify a Module-SIS PoW witness at the full-`M` residual width.
 ///
-/// - `pow_preimage`: the block's canonical PoW header bytes. The crate derives
-///   the seed as `SHAKE256(DOMAIN_SEED || pow_preimage || nonce)`, so the
-///   preimage must commit to every consensus field **except** the nonce (which
-///   the crate appends). The exact preimage bytes are fixed by B5b.
-/// - `nonce`: the block nonce.
-/// - `solution`: the short vector `s ∈ {-B,…,B}^N` found by the miner.
-/// - `bits`: compact difficulty target.
-///
-/// Returns `Ok(())` iff the norm bound, SIS residual bound, and aux-hash
-/// difficulty filter all hold (see `bloch_sis_pow::verify`).
+/// NOT a consensus path and NOT a secure mode: at `β = q/16`, full-`M` is in
+/// the trivial q-ary regime (`√M·β ≥ q` — no lattice hardness) AND is
+/// infeasible to honestly mine (see the bloch-sis-pow crate header). Retained
+/// for wire-format compatibility and regime-separation testing only; the
+/// consensus verify is the height-aware [`verify_sis_pow`].
 #[inline]
-pub fn verify_sis_pow(
+pub fn verify_sis_pow_full_m(
     pow_preimage: &[u8],
     nonce: u64,
     solution: &[i32; SOLUTION_LEN],
@@ -140,7 +227,7 @@ mod tests {
         // the adapter is wired to the crate's real verification path.
         let preimage = b"bloch-pow-adapter-test-preimage";
         let s = [0i32; SOLUTION_LEN];
-        let err = verify_sis_pow(preimage, 0, &s, 0x207f_ffff).unwrap_err();
+        let err = verify_sis_pow_full_m(preimage, 0, &s, 0x207f_ffff).unwrap_err();
         assert!(matches!(err, VerifyError::ResidualTooLarge { .. }));
     }
 
@@ -160,9 +247,103 @@ mod tests {
         // Testnet verify accepts the mined solution.
         assert!(verify_sis_pow_testnet(preimage, nonce, &s, bits).is_ok());
         // Full-M verify must reject it — the relaxation is real.
-        assert!(verify_sis_pow(preimage, nonce, &s, bits).is_err());
+        assert!(verify_sis_pow_full_m(preimage, nonce, &s, bits).is_err());
         // Tampering the nonce breaks it even under the testnet regime.
         assert!(verify_sis_pow_testnet(preimage, nonce.wrapping_add(1), &s, bits).is_err());
+    }
+
+    /// Soft fork SF-1: fixed preimage for the height-aware k=8 e2e test.
+    const K8_E2E_PREIMAGE: &[u8] = b"bloch-sf1-k8-e2e-preimage";
+
+    /// Pre-searched start nonce whose FIRST 4096-candidate window contains a
+    /// k=8-valid solution for `K8_E2E_PREIMAGE` at the easiest compact-bits
+    /// target. A cold k=8 mine needs ~2^24 candidates (the gate's rejection
+    /// floor) — too slow for a debug unit test — but the solver is
+    /// deterministic given (preimage, start_nonce), so the window was searched
+    /// offline. If solver internals change, re-run the crate's search utility
+    /// (`cargo test --release -p bloch-sis-pow -- --ignored --nocapture
+    /// sf1_search`) and update this constant from the
+    /// "src/pow tests K8_E2E_START_NONCE" line.
+    const K8_E2E_START_NONCE: u64 = 4058; // found at attempt 2662 of 4096
+
+    #[test]
+    fn canonical_residual_coeffs_gates_at_activation_height() {
+        // (c) the selector: 4 below H, 8 at/above H. The selector itself lives
+        // in bloch_crypto::core (same function Block::validate_pow calls);
+        // this pins the re-export the mining/verify seam uses.
+        let h = CANONICAL_K_ACTIVATION_HEIGHT;
+        assert_eq!(canonical_residual_coeffs(0), TESTNET_RESIDUAL_COEFFS);
+        assert_eq!(canonical_residual_coeffs(h - 1), TESTNET_RESIDUAL_COEFFS);
+        assert_eq!(canonical_residual_coeffs(h), CANONICAL_RESIDUAL_COEFFS);
+        assert_eq!(canonical_residual_coeffs(h + 1), CANONICAL_RESIDUAL_COEFFS);
+        assert_eq!(TESTNET_RESIDUAL_COEFFS, 4);
+        assert_eq!(CANONICAL_RESIDUAL_COEFFS, 8);
+    }
+
+    #[test]
+    fn canonical_mine_verify_roundtrip_at_k8() {
+        // (d) height-aware mine → verify roundtrip at a post-activation
+        // height, plus the subset property through the node seam.
+        let bits = target_to_bits(&Target::MAX);
+        let h = CANONICAL_K_ACTIVATION_HEIGHT;
+
+        let (nonce, s) = mine_sis_pow(K8_E2E_PREIMAGE, bits, h, K8_E2E_START_NONCE, 4096)
+            .expect("pinned window must contain a k=8 solution — if solver \
+                     internals changed, re-run the sf1_search utility");
+
+        // Verifies at the height it was mined for (k = 8)...
+        assert!(verify_sis_pow(K8_E2E_PREIMAGE, nonce, &s, bits, h).is_ok());
+        assert!(verify_sis_pow(K8_E2E_PREIMAGE, nonce, &s, bits, h + 1).is_ok());
+        // ...and below H too (k = 4 is a prefix subset of k = 8): un-upgraded
+        // peers accept post-fork blocks — the soft-fork no-partition property.
+        assert!(verify_sis_pow(K8_E2E_PREIMAGE, nonce, &s, bits, 0).is_ok());
+        assert!(verify_sis_pow_testnet(K8_E2E_PREIMAGE, nonce, &s, bits).is_ok());
+        // Tampering the nonce breaks it at the canonical height.
+        assert!(verify_sis_pow(K8_E2E_PREIMAGE, nonce.wrapping_add(1), &s, bits, h).is_err());
+    }
+
+    #[test]
+    fn k4_mined_block_rejected_at_canonical_height() {
+        // (b) at the node seam: a k=4 (pre-fork style) witness must be
+        // rejected by the height-aware verify at/above H. A k=4 solution
+        // sneaks past k=8 with probability ≈ 1/4096, so mine until one fails
+        // (more than 8 mines has probability ≈ 4096^-8 — never).
+        let preimage = b"bloch-sf1-k4-rejected-at-h";
+        let bits = target_to_bits(&Target::MAX);
+        let h = CANONICAL_K_ACTIVATION_HEIGHT;
+
+        let mut rejected = None;
+        for i in 0..8u64 {
+            let (nonce, s) = mine_sis_pow_testnet(preimage, bits, i * 1_000_003, 500_000)
+                .expect("k=4 testnet regime must be brute-force mineable");
+            // Height-aware verify agrees with the testnet verify below H.
+            assert!(verify_sis_pow(preimage, nonce, &s, bits, h - 1).is_ok());
+            if verify_sis_pow(preimage, nonce, &s, bits, h).is_err() {
+                rejected = Some((nonce, s));
+                break;
+            }
+        }
+        let (nonce, s) = rejected
+            .expect("8 consecutive k=4 solutions all passed k=8 — gate broken");
+        assert!(matches!(
+            verify_sis_pow(preimage, nonce, &s, bits, h).unwrap_err(),
+            VerifyError::ResidualTooLarge { .. }
+        ));
+    }
+
+    #[test]
+    fn height_aware_miner_below_activation_matches_testnet_regime() {
+        // (e) below H the height-aware miner IS the testnet regime: cheap to
+        // mine, and its output verifies under both the testnet and the
+        // height-aware verify at pre-fork heights.
+        let preimage = b"bloch-sf1-below-h-equivalence";
+        let bits = target_to_bits(&Target::MAX);
+
+        let (nonce, s) = mine_sis_pow(preimage, bits, 0, 0, 20_000_000)
+            .expect("below H the height-aware miner must be k=4-cheap");
+        assert!(verify_sis_pow(preimage, nonce, &s, bits, 0).is_ok());
+        assert!(verify_sis_pow(preimage, nonce, &s, bits, CANONICAL_K_ACTIVATION_HEIGHT - 1).is_ok());
+        assert!(verify_sis_pow_testnet(preimage, nonce, &s, bits).is_ok());
     }
 
     #[test]

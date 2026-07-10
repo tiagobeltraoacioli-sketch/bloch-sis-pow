@@ -2,7 +2,7 @@
 
 **North star: maximize security and privacy.** Everything below is ordered by how
 much it moves those two axes — not by how much new surface it adds. The project
-already has broad surface (node, Module-SIS PoW, hybrid PQ signatures, attestation
+already has broad surface (node, the SIS-gated hashcash PoW, hybrid PQ signatures, attestation
 L1–L3, the Coherence privacy layer, an SP1 prover, four clients, two OSes). What
 it lacks is **depth**: proven hardness, a live network, audits, and privacy that
 actually runs. This roadmap closes that. No dates — priorities shift with audit
@@ -27,18 +27,24 @@ privacy, and put the disclosure switch in the user's hands, not the protocol's.
 
 ## 🔐 Security track
 
-### S1 — Canonical PoW hardness *(the central gate)*
+### S1 — Canonical PoW security claim *(the central gate)*
 The default runs a relaxed testnet regime; the canonical verifier already exists
-(`bloch-sis-pow::verify`). **A hardness study is done** (`docs/specs/POW-HARDNESS.md`):
-the PoW is Inhomogeneous-SIS (BDD/CVP), and **the current `β = q/16` is very
-likely broken** — with `m=512`, `√m·β ≈ 1.41q ≥ q` puts it in the estimator's
-*trivial q-ary regime* (a valid `s` is found by lattice reduction, no PoW work).
-The `256×512` dimension is also too small (ML-DSA's security is from ~1024–2048
-dim, not the ±2 bound). **Next, concrete:** (1) run the lattice-estimator (its
-∞-norm Module-SIS example is at the same q=8380417) to pick `(n, m, β)` with
-`log2(rop) ≥ 128` + a feasibility check; (2) separate difficulty (leading-zeros
-knob) from the security bound β; (3) flip the default + write the ePrint rationale.
-*Without S1, everything rides on unproven work.*
+(`bloch-sis-pow::verify`). **The hardness research is done** — three independent
+analyses (`docs/specs/POW-HARDNESS.md`, `deploy/pow-estimator/SCREEN-RESULTS.md`,
+`docs/research/POW-CANONICAL-frontier.md`) converge on one result: **a
+trapdoorless PoW cannot be both lattice-hard and mineable.** With no trapdoor,
+the core-SVP cost is simultaneously the attack cost and the honest mining cost;
+the estimator sweep shows every ≥100-bit point is unmineable (no short `s`
+exists) and every mineable point is in the trivial q-ary regime — the regimes
+are disjoint. So the honest security claim is **hashcash cumulative work on the
+aux SHAKE-256 target**, with the Module-SIS residual as a **non-trivial
+structural gate** (`√k·β < q`, enforced at compile time) — not a lattice
+bit-security number. **Next, concrete:** (1) freeze the canonical small-`k` +
+leading-zeros gate parameters (candidate `k=8`, β=q/16); (2) prove the
+no-shortcut / attacker-asymmetry bound for the chosen `k` (the gate adds a
+fixed rejection floor and no lattice shortcut); (3) calibrate leading-zeros
+difficulty, flip the default, and write the ePrint rationale stating the
+reframed claim. *Without S1, everything rides on unproven work.*
 
 ### S2 — Independent audit + fuzzing
 Third-party review of: hybrid Falcon‖ML-DSA signing, the PoW, GhostDAG-Q
@@ -62,6 +68,26 @@ quote; verify the full **L1 (image digest) → OS (dm-verity `os_roothash`) → 
 `cargo-audit`, SLSA/signed releases, the vendored-dep provenance, reorg
 observability metrics (`bloch_reorg_*`, inherited Sprint FF). Rotate the leaked
 founder PAT; move the founder wallet to offline/HSM custody.
+
+### S6 — On-chain k-of-n multisig custody (GIP-008)
+Bloch is strictly single-signature P2PKH today — no script system, and the
+~10 KB `script_sig` cap can't even hold a second ~8.5 KB hybrid co-signer — so
+treasury/enterprise **M-of-N custody has no on-chain option without a consensus
+change** (full analysis: `docs/research/MOFN-CUSTODY-DECISION.md`). Target
+end-state: a new **descriptor-hash output type** that consensus verifies as
+**k-of-n full hybrid Falcon‖ML-DSA signatures** (a 2-of-3 spend ≈ 21 KB, ~2.1%
+of a 1 MB block; uses only already-audited primitives — no new crypto). This is
+the roadmapped **M-8** treasury multisig, landed via **GIP-008** before any code.
+Until then, custody is **procedural M-of-N** — Shamir 2-of-3 seed recovery +
+dual-control disbursement, shipped in the reference mining pool. MPC **threshold**
+signing (threshold ML-DSA; threshold Falcon is only a 2026 preprint, unaudited)
+is a **2027+ drop-in** — its outputs verify as standard signatures, so it needs
+no further consensus change — adopt only with an audited implementation.
+*(Supersedes the earlier "threshold ML-DSA" framing of M-8: on-chain
+multiple-signature multisig is the nearer, buildable path; MPC threshold is the
+later upgrade.)* **Status: GIP-008 APPROVED (founder, 2026-07-10)** for the
+on-chain k-of-n hybrid-signature descriptor-hash direction; consensus code
+lands via the standard GIP activation-signaling path.
 
 ---
 

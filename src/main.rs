@@ -821,14 +821,20 @@ async fn main() {
                     pow_solution: Vec::new(),
                     shielded_transactions: Vec::new(),                };
 
-                // Bloch-SIS PoW (B5b-2b): mine a Module-SIS solution in the
-                // relaxed testnet regime. The preimage excludes the nonce (the
-                // miner varies the nonce internally); on success we attach the
-                // solution vector as the block's PoW witness.
+                // Bloch-SIS PoW (B5b-2b): mine a Module-SIS solution. The
+                // preimage excludes the nonce (the miner varies the nonce
+                // internally); on success we attach the solution vector as the
+                // block's PoW witness.
+                //
+                // Soft fork SF-1: the residual width is selected by the height
+                // of the block BEING MINED (tip + 1), matching what
+                // Block::validate_pow will check on acceptance — k = 4 below
+                // CANONICAL_K_ACTIVATION_HEIGHT, k = 8 at/above it.
                 let preimage = block.header.pow_preimage();
                 let bits = block.header.bits;
+                let mine_height = block.height;
                 let mined = tokio::task::spawn_blocking(move || {
-                    pow::mine_sis_pow_testnet(&preimage, bits, 0, 50_000_000)
+                    pow::mine_sis_pow(&preimage, bits, mine_height, 0, 50_000_000)
                 }).await;
 
                 match mined {
@@ -1005,6 +1011,68 @@ async fn main() {
                 block_hash,
                 blue_score,
                 height,
+                block_data: data,
+            };
+            let otx_clone = otx_cb.clone();
+            tokio::spawn(async move { let _ = otx_clone.send(msg).await; });
+
+            Ok(hex::encode(block_hash))
+        })
+    };
+
+    // ───────── B5f pool seam: RPC submitblock hook ─────────
+    //
+    // Stratum V1/V2 cannot carry the Module-SIS solution vector (see the
+    // refusal below), so external pool software mines COMPLETE SIS blocks
+    // and hands them in via the `submitblock` RPC method instead. This hook
+    // mirrors the gossipsub NewBlock path exactly:
+    //
+    //   1. identity  = Block::block_hash()  (SHA3, binds the SIS witness —
+    //                  NOT header.pow_hash(); same as the network path)
+    //   2. dedup     = dag.has_block
+    //   3. structure = Block::validate_structure() (PoW witness, merkle,
+    //                  coinbase format) — same call the NewBlock handler makes
+    //   4. consensus = the shared accept_block() pipeline
+    //   5. gossip    = broadcast NewBlock so peers learn about it
+    //
+    // The reference pool consuming this lives in pool/.
+    let rpc_submit_block: Arc<rpc::SubmitBlockFn> = {
+        let dag_cb        = dag.clone();
+        let store_cb      = store.clone();
+        let mempool_cb    = mempool.clone();
+        let node_state_cb = node_state.clone();
+        let shielded_cb   = shielded.clone();
+        let otx_cb        = outbound_tx.clone();
+        let tip_tx_cb     = tip_tx.clone();
+
+        Arc::new(move |block: core::Block| -> Result<String, String> {
+            let block_hash = block.block_hash();
+            if dag_cb.read().has_block(&block_hash) {
+                return Err("duplicate block".to_string());
+            }
+            block.validate_structure()
+                .map_err(|e| format!("structural validation: {}", e))?;
+
+            accept_block(
+                &block, block_hash, block.height,
+                &dag_cb, &store_cb, &mempool_cb, &node_state_cb,
+                Some(&tip_tx_cb), &shielded_cb,
+            )?;
+
+            // Refresh RPC-visible state (mirrors the miner loop).
+            {
+                let mut s = node_state_cb.write();
+                s.tip_blue_score = dag_cb.read().tip_blue_score();
+                s.block_count    = dag_cb.read().block_count() as u64;
+                s.mempool_size   = mempool_cb.size();
+            }
+
+            // Broadcast to gossipsub — other peers learn about the block.
+            let data = block.to_bitcoin_bytes();
+            let msg = network::NetworkMessage::NewBlock {
+                block_hash,
+                blue_score: block.blue_score,
+                height:     block.height,
                 block_data: data,
             };
             let otx_clone = otx_cb.clone();
@@ -1207,7 +1275,9 @@ async fn main() {
                     rate_limit_writes_per_min: cli.rpc_rate_limit_writes,
                     trust_private_ranges:      cli.rpc_trust_private_ranges,
                 },
-                node_state.clone(), store.clone(), mempool.clone(), dag.clone(), outbound_tx.clone()
+                node_state.clone(), store.clone(), mempool.clone(), dag.clone(), outbound_tx.clone(),
+                // B5f pool seam: submitblock hook (see rpc::SubmitBlockFn).
+                Some(rpc_submit_block.clone()),
             ) => { error!("RPC exited"); }
         _ = node.run(block_tx, outbound_rx, dag.clone()) => {
             error!("Network exited");
