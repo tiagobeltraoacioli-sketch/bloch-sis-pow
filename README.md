@@ -17,16 +17,24 @@ Built on a mature post-quantum BlockDAG L1 codebase; the consensus, wallet,
 transport, and RPC subsystems carry over, with the proof-of-work, signatures,
 tokenomics, and finality model replaced.
 
-> ## ⚠️ Status: research / pre-testnet — **ZERO security**
-> This build runs a **relaxed testnet regime** of the PoW's Module-SIS gate
-> (the residual bound is checked on a handful of coefficients so blocks can be
-> brute-force mined). That regime is **trivially forgeable** and provides
-> **no security whatsoever**. The PoW's security model is **hashcash
-> cumulative work, not lattice hardness** — estimator research showed a
-> trapdoorless PoW cannot be both lattice-hard and mineable (the regimes are
-> disjoint; see `docs/research/POW-CANONICAL-frontier.md`). The mainnet gate is
-> the no-shortcut analysis for the canonical gate parameters, an IACR ePrint
-> pre-print, and a third-party audit. **Do not deploy. Do not attach value.**
+> ## ⚠️ Status: **mainnet beta** — unaudited, low-hashrate, 51%-attackable
+> The chain is designated **mainnet beta** — a designation, **not** a security
+> claim. The **k=8 security hardening** of the PoW's Module-SIS gate is
+> **deployed as a soft fork and activates at block 213,000**; **until
+> activation the relaxed regime still applies** (the residual bound is checked
+> on a handful of coefficients → work remains trivially forgeable until then).
+> The PoW's security model is **hashcash cumulative work, not lattice
+> hardness** — estimator research showed a trapdoorless PoW cannot be both
+> lattice-hard and mineable (the regimes are disjoint; see
+> `docs/research/POW-CANONICAL-frontier.md`); the Module-SIS gate is a
+> structural filter (k=8 from block 213,000). The network is **nascent: very
+> few nodes, low hashrate → 51%-attackable**. **Unaudited** — a third-party
+> audit is contracted but **not done**; the no-shortcut analysis for the
+> canonical gate parameters and the IACR ePrint pre-print are still
+> outstanding. The coin is **not a security and not an asset** — no token
+> sale, no listing, no price, **no value claim**; a **17% founder premine**
+> (10-year cliff, 40-year vesting) is disclosed. **Do not attach value. Not
+> for investment. Use at your own risk.**
 
 ---
 
@@ -77,7 +85,7 @@ Binaries in `target/release/`: `bloch` (full node), `bloch-wallet`,
 `bloch-cli`, `bloch-calibrate`, `bloch-mine-genesis`,
 `bloch-migrate-addr-history`.
 
-## Run (testnet, solo mining)
+## Run (mainnet beta, solo mining)
 
 ```bash
 ./target/release/bloch --mine --data-dir ./bloch-data
