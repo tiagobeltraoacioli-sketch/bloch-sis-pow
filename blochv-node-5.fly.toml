@@ -1,0 +1,20 @@
+# Follower node #2 on the Bloch-SIS network. Same image + chain as blochv-node,
+# but NOT mining — it bootstraps to node1's public P2P (dedicated IPv6, port
+# 16110) and syncs, so the network shows real peers and we can test gossip/IBD.
+# NOTE: all nodes here are Postern-operated on Fly = ONE operator. This tests the
+# P2P layer; it does NOT decentralize the network or reduce 51% risk.
+app = "blochv-node-5"
+primary_region = "gru"
+
+[processes]
+  app = "--rpc-bind 0.0.0.0 --rpc-port 16210 --listen /ip4/0.0.0.0/tcp/16110 --data-dir /bloch-data --testnet --peer /ip6/2a09:8280:1::145:6287:0/tcp/16110 --allow-private-peers"
+
+[mounts]
+  source = "bloch_data"
+  destination = "/bloch-data"
+
+# Follower: no mining, no public services (dials out to node1, syncs). Lean VM.
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory = "1gb"

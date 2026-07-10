@@ -1,0 +1,23 @@
+# Ephemeral Nix build host on Fly (Firecracker microVM). Builds the Postern OS
+# images (desktop ISO now; aarch64 mobile via emulation later). Debian base with
+# the 60GB volume mounted at /nix so the Nix store has room; Nix is installed at
+# runtime onto the volume. Idles on `sleep infinity` so we can `fly ssh console`
+# in and drive builds. NOT a service — no public ports.
+app = "postern-os-build"
+primary_region = "gru"
+
+[build]
+  image = "debian:stable-slim"
+
+[processes]
+  app = "sleep infinity"
+
+[mounts]
+  source = "nixbuild"
+  destination = "/nix"
+
+# Beefy for image builds (performance CPUs need >=2GB each).
+[[vm]]
+  cpu_kind = "performance"
+  cpus = 4
+  memory = "8gb"

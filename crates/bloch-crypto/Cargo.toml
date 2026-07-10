@@ -11,11 +11,26 @@ repository = "https://gitlab.com/bloch-protocol/bloch"
 name = "bloch_crypto"
 path = "src/lib.rs"
 
+# Standalone offline wallet binary (postmarketOS `postern-wallet` package).
+# Thin shim over `wallet::cli::main`; gated behind `wallet-cli` so plain
+# `cargo build -p bloch-crypto` / the workspace build never compiles it.
+# Build: cargo build -p bloch-crypto --no-default-features --features wallet-cli
+[[bin]]
+name = "postern-wallet"
+path = "src/bin/postern-wallet.rs"
+required-features = ["wallet-cli"]
+
 [features]
 # `node` enables the networked `WalletClient` (wallet::client) which talks to a
 # Bloch-SIS node over RPC. Off by default so the pure wallet/crypto subset
 # cross-compiles for mobile. Mirrors the node's `node` feature gate.
 node = ["dep:reqwest", "dep:async-trait"]
+# `wallet-cli` gates the `postern-wallet` [[bin]] above. Empty marker feature:
+# everything the CLI needs (clap, rpassword, hex, serde_json + this crate's
+# lib; RPC over plain std::net::TcpStream) is already an unconditional dep of
+# this crate — no blst / secp256k1 / tokio / rocksdb / libp2p anywhere in its
+# tree. Off by default; combine with `node` only if WalletClient is wanted.
+wallet-cli = []
 
 [dependencies]
 # Post-quantum signatures (hybrid Falcon-1024 ‖ ML-DSA-65) + seeded keygen.
