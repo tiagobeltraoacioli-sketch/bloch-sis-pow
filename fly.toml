@@ -19,7 +19,7 @@ primary_region = "gru"
 
 # Run the node as a miner. ENTRYPOINT is `bloch`; these are its args.
 [processes]
-  app = "--rpc-bind 0.0.0.0 --rpc-port 16210 --listen /ip4/0.0.0.0/tcp/16110 --data-dir /bloch-data --mine"
+  app = "--rpc-bind 0.0.0.0 --rpc-port 16210 --listen /ip4/0.0.0.0/tcp/16110 --data-dir /bloch-data --testnet --mine"
 
 # Persistent chain data. Create the volume once (see README):
 #   flyctl volumes create bloch_data --size 30 --region iad
