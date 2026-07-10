@@ -50,10 +50,14 @@ primary_region = "gru"
   [[services.ports]]
     port = 16110
 
-# VM size. SIS PoW is CPU-bound — use performance CPUs for mining.
-# Fly caps a single machine at 16 performance CPUs; scale out with more
-# machines (flyctl scale count N) rather than up past 16.
+# VM size. Matches the running machine (shared / 2 CPUs / 2 GB) — cheap, valid,
+# and enough: k=8 mining is CPU-bound but the ASERT difficulty self-adjusts, and
+# 2 GB fits the node + RocksDB for this chain.
+# NOTE: the earlier performance/8 cpus/8gb combo was INVALID — performance CPUs
+# require >=2 GB each, so 8 CPUs need >=16 GB; that mismatch was failing every
+# deploy. To raise hashrate (better security, higher cost) use e.g.
+# cpu_kind="performance", cpus=8, memory="16gb" (or scale out with more machines).
 [[vm]]
-  cpu_kind = "performance"
-  cpus = 8
-  memory = "8gb"
+  cpu_kind = "shared"
+  cpus = 2
+  memory = "2gb"
