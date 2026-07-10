@@ -1,0 +1,44 @@
+# Postern-operated instance of the reference Bloch-SIS-PoW mining pool.
+# Deploy with:  fly deploy --config pool.fly.toml
+# The protocol is ownerless — this is one independent pool on it (by Postern
+# Labs), not "the" pool. Reference/non-production code; mainnet beta, unaudited.
+app = "postern-pool"
+primary_region = "gru"
+
+[build]
+  dockerfile = "pool.Dockerfile"
+
+# bloch-pool args (ENTRYPOINT is the binary). Talks to the node's public JSON-RPC
+# (getblocktemplate + submitblock). Fee 0% — no revenue line touches the token.
+# Auth-proof stays ON (miners must prove they control their payout address).
+[processes]
+  app = "--node-rpc https://blochv-node.fly.dev --pool-address bloch1t08b65e2ef3f7a8b1866d6f2a573af463db6813d92722c67d --fee-bps 0 --dashboard 0.0.0.0:8650 --listen 0.0.0.0:3335 --journal /pool-data/bloch-pool.journal"
+
+# Persist the append-only PPLNS/credit journal so a restart can't erase owed balances.
+[[mounts]]
+  source = "pool_data"
+  destination = "/pool-data"
+
+# Dashboard — the honest pool stats page (luck/variance, share-of-network, 51% warning).
+# Uses the standard http_service (handles HTTP+HTTPS with a proper edge cert +
+# force_https) so both postern-pool.fly.dev and posternpool.com serve over TLS.
+[http_service]
+  internal_port = 8650
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  processes = ["app"]
+
+# Stratum — miners connect here (SIS-native dialect).
+[[services]]
+  internal_port = 3335
+  protocol = "tcp"
+  processes = ["app"]
+  [[services.ports]]
+    port = 3335
+
+# Lightweight: the pool polls RPC + serves stratum/dashboard — no mining, no RocksDB.
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory = "512mb"

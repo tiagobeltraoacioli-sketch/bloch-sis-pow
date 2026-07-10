@@ -14,14 +14,21 @@ attestation — are **Postern Labs** (owned, rebranded off "Bloch"). Anyone may
 build products on the open protocol; Postern is one builder among many.
 
 > ## 🔴 Hard caveat — read first
-> The chain runs a **relaxed testnet regime** of the PoW's Module-SIS gate
-> (residual checked on a few coefficients) → **trivially forgeable, ZERO
-> security**. Do **not** deploy or attach value. The PoW's security model is
-> **hashcash cumulative work, not lattice hardness** (a trapdoorless PoW cannot
-> be lattice-hard and mineable — `docs/research/POW-CANONICAL-frontier.md`);
-> the canonical gate params, the no-shortcut proof, ePrint, and audit are the
-> research track that gates any mainnet claim. No privacy or attestation claim
-> is adopted until its own audit gate.
+> The chain is designated **mainnet beta** — a designation, **not** a security
+> claim. The **k=8 hardening** of the PoW's Module-SIS gate is **deployed as a
+> soft fork and activates at block 213,000**; **until activation the relaxed
+> regime still applies** (residual checked on a few coefficients → work remains
+> trivially forgeable until then). The PoW's security model is **hashcash
+> cumulative work, not lattice hardness** (a trapdoorless PoW cannot be
+> lattice-hard and mineable — `docs/research/POW-CANONICAL-frontier.md`); the
+> SIS gate is a structural filter (k=8 from block 213,000). The network is
+> **nascent: very few nodes, low hashrate → 51%-attackable**. **Unaudited** —
+> the third-party audit is contracted but **not done**; the no-shortcut proof
+> and the IACR ePrint are still outstanding. The coin is **not a security and
+> not an asset** — no sale, no listing, no price, **no value claim**; the
+> **17% founder premine** is disclosed. Do **not** attach value; use at your
+> own risk. No privacy or attestation claim is adopted until its own audit
+> gate.
 
 ## ✅ Built + verified
 
@@ -30,7 +37,7 @@ build products on the open protocol; Postern is one builder among many.
   with a Module-SIS short-vector gate, ASERT-Lattice difficulty, mined genesis.
   Pure PoW (BFT/FFG/oracles removed).
 - **k-row residual optimization** — verify/mine only the checked coefficients
-  (~M/k faster in the testnet regime), consensus-neutral (equivalence-tested).
+  (~M/k faster in the relaxed pre-activation regime), consensus-neutral (equivalence-tested).
 - **Hybrid signatures** — Falcon-1024 ‖ ML-DSA-65 (both must verify), tx + peer
   identity, seed-deterministic. SHAKE-256 hashing throughout.
 - **Tokenomics** — 21 B supply, 100 % miner emission, 17 % founder premine
@@ -164,7 +171,7 @@ build products on the open protocol; Postern is one builder among many.
   history). ENTL repo left untouched.
 - Postern Labs product site (`bloch-sis-website`) + the explorer
   (`bloch-pow-explorer`, deployed on Fly) — Postern products, framed as such
-  (ownerless protocol, two layers). A demo testnet node runs on Fly (disposable,
+  (ownerless protocol, two layers). A demo node runs on Fly (disposable,
   not official infra).
 - Ideology: `PRINCIPLES.md` (ownerless, every-node-a-seed, no-promises, not a
   security) + `docs/POSTERN-LABS.md` (products ⟂ protocol).
@@ -173,7 +180,7 @@ build products on the open protocol; Postern is one builder among many.
 
 | Track | Next |
 |---|---|
-| **Mainnet gate** | canonical small-`k` + leading-zeros gate params, no-shortcut/asymmetry proof, ePrint, third-party audit. Hardness research done (screen `deploy/pow-estimator/SCREEN-RESULTS.md` + frontier sweep `docs/research/POW-CANONICAL-frontier.md`): lattice-hard mining is structurally impossible for a trapdoorless PoW (secure and mineable regimes disjoint) — PoW security is hashcash cumulative work; the SIS gate is a non-trivial structural filter. Remaining: freeze `k` (candidate 8), the no-shortcut proof, BDD cross-check, difficulty calibration |
+| **Mainnet gate** | canonical small-`k` + leading-zeros gate params, no-shortcut/asymmetry proof, ePrint, third-party audit. Hardness research done (screen `deploy/pow-estimator/SCREEN-RESULTS.md` + frontier sweep `docs/research/POW-CANONICAL-frontier.md`): lattice-hard mining is structurally impossible for a trapdoorless PoW (secure and mineable regimes disjoint) — PoW security is hashcash cumulative work; the SIS gate is a non-trivial structural filter. `k` **frozen at 8** — soft-fork **deployed, activates at block 213,000** (until activation the relaxed regime still applies); the “mainnet beta” designation is **not** a security claim and does not close this track. Remaining: the no-shortcut proof, BDD cross-check, difficulty calibration, the ePrint, and the third-party audit (contracted, **not done**) |
 | **Coherence** | C2 remainder (SP1 prove/verify on the toolchain; submit/gossip entry point + reorg-tracking — land with the SP1 verifier), C3/C4 review + audit |
 | **Attestation** | wire `virtee/sev` on a real SEV-SNP host; mobile Key-Attestation/App-Attest verifier; live end-to-end demo |
 | **Mobile app** | ✅ lean cross-compile + ✅ UniFFI export + ✅ Android/iOS shell skeletons → next: build the shells on real SDKs (cargo-ndk / xcframework), the Postern Container impl, `bloch-core` split only if drift-risk demands |
