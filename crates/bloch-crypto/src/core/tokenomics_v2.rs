@@ -32,7 +32,7 @@
 //! - C3              — add founder vesting infrastructure
 //! - C4              — rewrite `validate_coinbase_value` for 70/25/5 + per-block vesting
 //! - C5              — regenerate genesis under V2 (3-output coinbase, no founder mint)
-//! - C6              — update tests + recalibrate PoW for 150s
+//! - C6              — update tests + recalibrate PoW for 30s
 
 // ── Total supply (Bloch-SIS, B3b) ───────────────────────────────────────────
 //
