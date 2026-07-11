@@ -17,12 +17,20 @@ use std::net::IpAddr;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 
 use governor::{Quota, RateLimiter};
 use governor::clock::DefaultClock;
 use governor::state::{InMemoryState, NotKeyed};
 use subtle::ConstantTimeEq;
+
+/// P0 (roadmap §1.6 / §4.3): drop a per-IP rate-limit entry once it has been
+/// idle this long. 24h matches the sweep the original code comment proposed.
+const RL_IDLE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// Sweep at most this often, so the eviction scan is amortized and does not run
+/// on every request (keeps `check` ~O(1) between sweeps).
+const RL_GC_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
 /// Methods we treat as "writes" (mutating, gossipped to peers).
 /// Anything else is a read-only query of chain state.
@@ -32,17 +40,31 @@ pub const WRITE_METHODS: &[&str] = &["sendrawtransaction", "submitblock"];
 /// Type alias for a direct (non-keyed) in-memory rate limiter.
 type IpRateLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
 
-/// Per-IP rate-limit state. Each IP gets two buckets: one for reads, one
-/// for writes. Limiters are lazily created on first hit. We never evict;
-/// the HashMap grows with unique IPs. For a public node we expect O(1000)
-/// distinct IPs/day which is fine.
+/// Per-IP rate-limit buckets plus a last-seen timestamp for eviction.
+struct IpEntry {
+    reads:     Arc<IpRateLimiter>,
+    writes:    Arc<IpRateLimiter>,
+    last_seen: Instant,
+}
+
+/// Guarded interior state. A single mutex covers both the map and the last-GC
+/// clock so eviction needs no second lock (no lock-ordering hazard).
+struct Inner {
+    buckets: HashMap<IpAddr, IpEntry>,
+    last_gc: Instant,
+}
+
+/// Per-IP rate-limit state. Each IP gets two buckets: one for reads, one for
+/// writes, created lazily on first hit.
 ///
-/// If memory becomes a concern, add a periodic sweep that drops entries
-/// whose last-seen is > 24h ago.
+/// P0 (roadmap §1.6 / §4.3): the map is now bounded by *time*. Previously it
+/// never evicted, so a spoofed-source-IP or many-client flood grew it forever
+/// → memory-exhaustion DoS. `check` runs an amortized sweep (at most once per
+/// `RL_GC_INTERVAL`) that drops entries idle longer than `RL_IDLE_TTL`.
 pub struct RateLimiterSet {
     reads_per_min:  u32,
     writes_per_min: u32,
-    buckets:        Mutex<HashMap<IpAddr, (Arc<IpRateLimiter>, Arc<IpRateLimiter>)>>,
+    inner:          Mutex<Inner>,
 }
 
 impl RateLimiterSet {
@@ -50,7 +72,10 @@ impl RateLimiterSet {
         Self {
             reads_per_min,
             writes_per_min,
-            buckets: Mutex::new(HashMap::new()),
+            inner: Mutex::new(Inner {
+                buckets: HashMap::new(),
+                last_gc: Instant::now(),
+            }),
         }
     }
 
@@ -63,27 +88,38 @@ impl RateLimiterSet {
             return true;
         }
 
-        let mut buckets = self.buckets.lock();
-        let entry = buckets.entry(ip).or_insert_with(|| {
+        let now = Instant::now();
+        let mut inner = self.inner.lock();
+
+        // Amortized time-based eviction (bounds the map — see struct docs).
+        if now.duration_since(inner.last_gc) >= RL_GC_INTERVAL {
+            inner.buckets.retain(|_, e| now.duration_since(e.last_seen) < RL_IDLE_TTL);
+            inner.last_gc = now;
+        }
+
+        let (reads_pm, writes_pm) = (self.reads_per_min, self.writes_per_min);
+        let entry = inner.buckets.entry(ip).or_insert_with(|| {
             let reads = Quota::per_minute(
-                NonZeroU32::new(self.reads_per_min.max(1)).unwrap()
+                NonZeroU32::new(reads_pm.max(1)).unwrap()
             );
             let writes = Quota::per_minute(
-                NonZeroU32::new(self.writes_per_min.max(1)).unwrap()
+                NonZeroU32::new(writes_pm.max(1)).unwrap()
             );
-            (
-                Arc::new(RateLimiter::direct(reads)),
-                Arc::new(RateLimiter::direct(writes)),
-            )
+            IpEntry {
+                reads:     Arc::new(RateLimiter::direct(reads)),
+                writes:    Arc::new(RateLimiter::direct(writes)),
+                last_seen: now,
+            }
         });
+        entry.last_seen = now;
 
-        let limiter = if is_write { &entry.1 } else { &entry.0 };
+        let limiter = if is_write { &entry.writes } else { &entry.reads };
         limiter.check().is_ok()
     }
 
     /// Number of distinct IPs currently tracked. For diagnostics/metrics.
     pub fn tracked_ips(&self) -> usize {
-        self.buckets.lock().len()
+        self.inner.lock().buckets.len()
     }
 }
 

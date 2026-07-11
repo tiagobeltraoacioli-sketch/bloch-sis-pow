@@ -98,21 +98,26 @@ impl Storage {
         Some(addr)
     }
 
-    /// Index one transaction's address touches.
-    /// Called during put_block for each tx. For inputs, looks up the previous
-    /// output to find which address was spent.
-    pub fn index_tx_addresses(&self, tx: &Transaction, height: u64, tx_index: u32) -> Result<(), StorageError> {
-        let cf = self.db.cf_handle(CF_ADDR_TX_HISTORY)
-            .ok_or_else(|| StorageError::CfNotFound(CF_ADDR_TX_HISTORY.into()))?;
+    /// Compute the (key, value) `CF_ADDR_TX_HISTORY` writes for one transaction
+    /// WITHOUT touching the DB. Shared by `index_tx_addresses` (direct write)
+    /// and `put_block`'s atomic `WriteBatch` path so both produce byte-identical
+    /// entries. Kept private to the crate; the keys/values are an internal index.
+    pub(crate) fn addr_index_entries(
+        &self,
+        tx: &Transaction,
+        height: u64,
+        tx_index: u32,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
         let txid = tx.txid();
+        let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
 
         // Index outputs (DIR_OUT — address RECEIVED funds)
         for (vout_idx, output) in tx.outputs.iter().enumerate() {
             if let Some(addr) = Self::script_pubkey_to_addr_hash(&output.script_pubkey) {
-                let key = make_key(&addr, height, tx_index, vout_idx as u32);
-                let val = make_value(&txid, DIR_OUT, output.value);
-                self.db.put_cf(&cf, &key, &val)
-                    .map_err(|e| StorageError::WriteFailed(e.to_string()))?;
+                entries.push((
+                    make_key(&addr, height, tx_index, vout_idx as u32),
+                    make_value(&txid, DIR_OUT, output.value),
+                ));
             }
         }
 
@@ -125,10 +130,10 @@ impl Storage {
                     if let Some(addr) = Self::script_pubkey_to_addr_hash(&prev_output.script_pubkey) {
                         // Use a high bit offset for io_index to avoid collision with vout indices
                         // (a tx cannot have 2^31 outputs, so bit 31 marks "this is an input entry")
-                        let key = make_key(&addr, height, tx_index, 0x80000000 | vin_idx as u32);
-                        let val = make_value(&txid, DIR_IN, prev_output.value);
-                        self.db.put_cf(&cf, &key, &val)
-                            .map_err(|e| StorageError::WriteFailed(e.to_string()))?;
+                        entries.push((
+                            make_key(&addr, height, tx_index, 0x80000000 | vin_idx as u32),
+                            make_value(&txid, DIR_IN, prev_output.value),
+                        ));
                     }
                 }
                 // If prev_output can't be found (shouldn't happen on valid chain),
@@ -136,6 +141,19 @@ impl Storage {
             }
         }
 
+        Ok(entries)
+    }
+
+    /// Index one transaction's address touches.
+    /// Called during put_block for each tx. For inputs, looks up the previous
+    /// output to find which address was spent.
+    pub fn index_tx_addresses(&self, tx: &Transaction, height: u64, tx_index: u32) -> Result<(), StorageError> {
+        let cf = self.db.cf_handle(CF_ADDR_TX_HISTORY)
+            .ok_or_else(|| StorageError::CfNotFound(CF_ADDR_TX_HISTORY.into()))?;
+        for (key, val) in self.addr_index_entries(tx, height, tx_index)? {
+            self.db.put_cf(&cf, &key, &val)
+                .map_err(|e| StorageError::WriteFailed(e.to_string()))?;
+        }
         Ok(())
     }
 

@@ -13,8 +13,23 @@ pub mod auth;
 use std::sync::Arc;
 use parking_lot::RwLock;
 use log::{info, error};
-use axum::{routing::post, Router, extract::State, http::StatusCode, Json};
+use axum::{routing::post, Router, extract::State, extract::DefaultBodyLimit, http::StatusCode, Json};
 use tower_http::cors::CorsLayer;
+use tower_http::timeout::TimeoutLayer;
+use tower::limit::GlobalConcurrencyLimitLayer;
+
+/// P0 RPC hardening (roadmap §1.6 / §4.3).
+/// Max request body: JSON-RPC calls are tiny; 1 MiB is generous and tighter
+/// than axum's 2 MiB default. Blocks oversized-payload memory abuse.
+const RPC_MAX_BODY_BYTES: usize = 1024 * 1024;
+/// Global cap on concurrently in-flight RPC handlers, shared across all
+/// connections (GlobalConcurrencyLimitLayer holds one Arc'd semaphore). Bounds
+/// how many expensive storage-scanning methods can pile up at once. Value is a
+/// conservative default — needs load-testing to tune (not yet done).
+const RPC_MAX_CONCURRENCY: usize = 256;
+/// Per-request wall-clock timeout (returns 408). Kills slow-loris / stuck
+/// handlers so they can't hold a concurrency slot forever.
+const RPC_REQUEST_TIMEOUT_SECS: u64 = 30;
 use serde_json::{json, Value};
 use crate::storage::Storage;
 use crate::mempool::Mempool;
@@ -125,9 +140,15 @@ pub async fn start_rpc_server(
         submit_block,
     };
 
+    // P0 RPC hardening (roadmap §1.6 / §4.3): body-size cap, global
+    // concurrency limit, and a per-request timeout on top of the existing
+    // per-IP auth/rate-limit. Auth behaviour is unchanged.
     let app = Router::new()
         .route("/", post(handle_rpc))
         .layer(CorsLayer::permissive())
+        .layer(DefaultBodyLimit::max(RPC_MAX_BODY_BYTES))
+        .layer(GlobalConcurrencyLimitLayer::new(RPC_MAX_CONCURRENCY))
+        .layer(TimeoutLayer::new(std::time::Duration::from_secs(RPC_REQUEST_TIMEOUT_SECS)))
         .with_state(app_state);
 
     info!("RPC on {} (auth={}, require_auth_writes={}, trust_private={}, limits: {}r/min, {}w/min)",
@@ -440,7 +461,17 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                     Ok(tx)  => {
                         if tx.is_coinbase() { return json!({ "error": "coinbase not accepted" }); }
                         let current_height = state.dag.read().block_count() as u64;
-                        match validate_tx_for_mempool(&tx, &state.store, current_height) {
+                        // P0 (roadmap §1.2 / §2.5 #6): PQ signature verification is
+                        // CPU-bound. Run it on the blocking pool so a flood of
+                        // valid-but-expensive txs on this RPC can't stall the async
+                        // reactor. Verification LOGIC is unchanged — only the thread
+                        // it runs on. Costs one Transaction clone per call.
+                        let store_v = state.store.clone();
+                        let tx_v = tx.clone();
+                        let verified = tokio::task::spawn_blocking(move || {
+                            validate_tx_for_mempool(&tx_v, &store_v, current_height)
+                        }).await;
+                        match verified.unwrap_or_else(|e| Err(format!("verify task failed: {}", e))) {
                             Err(e)   => json!({ "error": e }),
                             Ok(fee)  => {
                                 let txid = tx.txid();

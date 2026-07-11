@@ -144,26 +144,51 @@ impl Storage {
         &self.db
     }
 
+    /// Write a block and all of its derived index rows atomically.
+    ///
+    /// P0 crash-consistency (roadmap §3.2): previously this issued 4+ separate
+    /// `put_cf` calls (block body, height→hash, timestamp, per-tx address
+    /// index). A crash between any two left height→hash pointing at a block
+    /// body that wasn't there, or an un-indexed block. All writes now go
+    /// through a single RocksDB `WriteBatch` committed with one `db.write`, so
+    /// either the whole block lands or none of it does. Keys/values/CFs are
+    /// byte-identical to the old path — this is a durability fix only, not a
+    /// schema or wire change.
     pub fn put_block(&self, block: &Block) -> Result<(), StorageError> {
         let hash = block.block_hash();
         let cf_b = self.db.cf_handle(CF_BLOCKS).ok_or(StorageError::CfNotFound(CF_BLOCKS.into()))?;
+        let cf_h = self.db.cf_handle(CF_HEIGHT).ok_or(StorageError::CfNotFound(CF_HEIGHT.into()))?;
+        let cf_t = self.db.cf_handle(CF_TIMESTAMPS).ok_or(StorageError::CfNotFound(CF_TIMESTAMPS.into()))?;
+        let cf_ai = self.db.cf_handle(CF_ADDR_TX_HISTORY).ok_or(StorageError::CfNotFound(CF_ADDR_TX_HISTORY.into()))?;
+
+        let mut batch = rocksdb::WriteBatch::default();
+
         // Sprint 1.b: Bitcoin-format wire serialization (replaces pre-v0.6.0 bincode).
         // Block bytes on disk are now byte-identical to the canonical network
         // wire format, so a future direct-from-disk broadcast path can skip
         // re-encoding. Consensus-breaking; existing v0.5.x RocksDB data-dirs
         // are unreadable at v0.6.0+ and must be reset.
-        self.db.put_cf(&cf_b, &hash, &block.to_bitcoin_bytes()).map_err(|e| StorageError::WriteFailed(e.to_string()))?;
-        let cf_h = self.db.cf_handle(CF_HEIGHT).ok_or(StorageError::CfNotFound(CF_HEIGHT.into()))?;
-        self.db.put_cf(&cf_h, &block.height.to_be_bytes(), &hash).map_err(|e| StorageError::WriteFailed(e.to_string()))?;
-        let cf_t = self.db.cf_handle(CF_TIMESTAMPS).ok_or(StorageError::CfNotFound(CF_TIMESTAMPS.into()))?;
-        self.db.put_cf(&cf_t, &block.height.to_be_bytes(), &block.header.timestamp.to_le_bytes())
-            .map_err(|e| StorageError::WriteFailed(e.to_string()))?;
+        batch.put_cf(&cf_b, &hash, &block.to_bitcoin_bytes());
+        batch.put_cf(&cf_h, &block.height.to_be_bytes(), &hash);
+        batch.put_cf(&cf_t, &block.height.to_be_bytes(), &block.header.timestamp.to_le_bytes());
 
-        // Sprint F: index address touches for each tx in this block
+        // Sprint F: index address touches for each tx in this block. These were
+        // previously best-effort (errors ignored). Folding them into the same
+        // batch keeps the same entries but makes them crash-consistent with the
+        // block body. An entry-computation error for one tx skips only that tx's
+        // rows (matching the old best-effort semantics) rather than aborting.
         for (tx_idx, tx) in block.transactions.iter().enumerate() {
-            let _ = self.index_tx_addresses(tx, block.height, tx_idx as u32);
-            // Note: failures logged internally, don't fail block write
+            match self.addr_index_entries(tx, block.height, tx_idx as u32) {
+                Ok(entries) => {
+                    for (key, val) in entries {
+                        batch.put_cf(&cf_ai, &key, &val);
+                    }
+                }
+                Err(e) => log::warn!("addr-index skipped for tx {}: {}", tx_idx, e),
+            }
         }
+
+        self.db.write(batch).map_err(|e| StorageError::WriteFailed(e.to_string()))?;
         Ok(())
     }
 

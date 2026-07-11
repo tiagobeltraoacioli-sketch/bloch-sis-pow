@@ -122,8 +122,8 @@ libp2p       = { version = "0.56", features = ["tcp", "noise", "yamux", "gossips
 
 # FIX: jsonrpc-http-server uses net2+instant (unmaintained) → replace with axum
 axum         = { version = "0.8", optional = true }
-tower        = { version = "0.5", optional = true }
-tower-http   = { version = "0.6", features = ["cors", "trace"], optional = true }
+tower        = { version = "0.5", features = ["limit"], optional = true }
+tower-http   = { version = "0.6", features = ["cors", "trace", "timeout"], optional = true }
 
 clap         = { version = "4",    features = ["derive"] }
 rpassword    = "7"
