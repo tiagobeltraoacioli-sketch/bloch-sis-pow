@@ -6,6 +6,17 @@
 # the device module).
 { config, lib, pkgs, blochPkg, ... }:
 {
+  # OPTIONAL Android compatibility (Waydroid) — OFF by default and intentionally
+  # NOT imported. It is the less-private, NON-attestable tier: it runs a full
+  # Android userland, is not covered by the Postern Seal, and Play Integrity
+  # STRONG will fail. Opt in by uncommenting the import AND setting the gate:
+  #
+  #   imports = [ ./android-compat.nix ];
+  #   postern.android.enable = true;      # runs Android in LXC (see the header)
+  #   # postern.android.googleApps = true; # EXPLICIT opt-in to Google Play/GApps
+  #
+  # See os/android-compat.nix for the full honesty header + on-device TODOs.
+
   networking.hostName = lib.mkForce "postern-phone";
 
   # No mining node on a phone — ship the wallet + tooling instead.
