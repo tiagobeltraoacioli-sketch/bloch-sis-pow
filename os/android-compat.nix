@@ -72,6 +72,102 @@ in
         device/telemetry access. Default (false) keeps the layer Google-free.
       '';
     };
+
+    # ── The consent gateway (Postern Android) ────────────────────────────────
+    # The boundary UX + toggle-state store that fronts Waydroid. Purely a
+    # DOCUMENTED operator contract here: it records the operator's intended
+    # posture (which in-container app store, whether consent is enforced, which
+    # host<->container bridges may be opened). The on-device wrapper reads the
+    # gate's state file at:
+    #   /var/lib/postern/android-gate/state.json   (see apps/postern-android-gate)
+    # EVERYTHING below is default-safe: the gateway is OFF, consent is REQUIRED,
+    # and every bridge is DENY. Enabling nothing here changes nothing.
+    # UNBUILT/UNBOOTED: neither the gate UI nor the wrapper has run on hardware.
+    gateway = {
+      enable = lib.mkEnableOption ''
+        the Postern Android consent gateway — the visible, consenting crossing
+        into the NON-ATTESTABLE Waydroid tier (first-entry gate + per-session
+        re-consent + default-DENY privacy bridges). Inert unless BOTH this and
+        postern.android.enable are set. Off by default'';
+
+      appStore = lib.mkOption {
+        type = lib.types.enum [ "aurora" "play" "fdroid" ];
+        default = "aurora";
+        description = ''
+          Which in-container app store the gateway lands on after the crossing.
+
+            • "aurora"  (default) — Aurora Store: account-free, anonymous APK
+                        delivery from Google Play's catalogue. No Google sign-in;
+                        anonymous access is best-effort and rate-limited.
+            • "fdroid"  — F-Droid: free/open-source apps only. Most private.
+            • "play"    — the official Google Play Store. Requires a Google
+                        account and pairs with googleApps = true; the LEAST
+                        private choice. Still cannot pass Play Integrity STRONG.
+
+          Documents intent only; the actual store is provisioned inside the
+          mutable Waydroid image, not at Nix build time.
+        '';
+      };
+
+      requireConsent = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = ''
+          When true (default, and STRONGLY recommended), the wrapper refuses to
+          start the Waydroid container until the operator has passed the consent
+          gate (consent.accepted in the gate state file). Setting false bypasses
+          the human-in-the-loop crossing — an explicit, recorded operator choice
+          for e.g. kiosk/automation. The NON-ATTESTABLE tier is unchanged either
+          way; false only removes the confirmation, never the honesty label.
+        '';
+      };
+
+      bridges = {
+        clipboard = lib.mkOption {
+          type = lib.types.bool;
+          default = false;
+          description = ''
+            Permit the host<->container clipboard bridge (wl-clipboard) to be
+            offered as a toggle in the gate. DEFAULT DENY. Even when true here,
+            the bridge stays OFF until the user turns it on in the gate; this
+            option only decides whether the toggle is available at all.
+          '';
+        };
+        files = lib.mkOption {
+          type = lib.types.bool;
+          default = false;
+          description = ''
+            Permit the shared-folder passthrough (base -> Android) toggle.
+            DEFAULT DENY. Availability only; the user still opens it explicitly.
+          '';
+        };
+        mic = lib.mkOption {
+          type = lib.types.bool;
+          default = false;
+          description = ''
+            Permit the microphone passthrough (host -> Android) toggle.
+            DEFAULT DENY. Live audio into a non-attestable app; user-armed only.
+          '';
+        };
+        camera = lib.mkOption {
+          type = lib.types.bool;
+          default = false;
+          description = ''
+            Permit the camera passthrough (host -> Android) toggle.
+            DEFAULT DENY. Live video into a non-attestable app; user-armed only.
+          '';
+        };
+        location = lib.mkOption {
+          type = lib.types.bool;
+          default = false;
+          description = ''
+            Permit the location passthrough (host -> Android) toggle.
+            DEFAULT DENY. The user still chooses coarse/precise and arms it in
+            the gate; this only decides whether the toggle is offered.
+          '';
+        };
+      };
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -146,7 +242,7 @@ in
     # ── Operator-facing honesty at runtime ────────────────────────────────────
     # Anyone who logs into a device with this layer enabled sees exactly what
     # they opted into and how to finish setup on the private (default) path.
-    users.motd = lib.mkForce ''
+    users.motd = lib.mkForce ( ''
       ◆ Postern OS Mobile — wallet-first · post-quantum
         ⚠ ANDROID COMPATIBILITY LAYER ENABLED (Waydroid)
 
@@ -163,6 +259,30 @@ in
 
       Google Play (EXPLICIT opt-in, less private):
           sudo waydroid init -s GAPPS -f
-    '';
+    '' + lib.optionalString cfg.gateway.enable ''
+
+      ── Consent gateway: ENABLED (Postern Android) ──
+      Entering Android is a visible, consenting crossing — never a silent
+      slide-in. ${lib.optionalString cfg.gateway.requireConsent
+        "The container will NOT start until you pass the consent gate."}${
+        lib.optionalString (!cfg.gateway.requireConsent)
+        "requireConsent is FALSE: the gate is bypassed (your explicit choice)."}
+        App store on entry: ${cfg.gateway.appStore}.
+        Host<->Android bridges are ALL default-DENY. Offered as toggles here:
+          ${lib.concatStringsSep ", " (
+            (lib.optional cfg.gateway.bridges.clipboard "clipboard")
+            ++ (lib.optional cfg.gateway.bridges.files "files")
+            ++ (lib.optional cfg.gateway.bridges.mic "mic")
+            ++ (lib.optional cfg.gateway.bridges.camera "camera")
+            ++ (lib.optional cfg.gateway.bridges.location "location")
+            ++ (lib.optional (!(cfg.gateway.bridges.clipboard
+              || cfg.gateway.bridges.files || cfg.gateway.bridges.mic
+              || cfg.gateway.bridges.camera || cfg.gateway.bridges.location))
+              "(none)")
+          )}.
+        A bridge stays OFF until you open it in the gate; enabling it above only
+        makes the toggle available. Gate state (local, never leaves the device):
+          /var/lib/postern/android-gate/state.json
+    '' );
   };
 }
