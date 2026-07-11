@@ -18,6 +18,19 @@ use tokio::net::TcpListener;
 
 use crate::state::PoolState;
 
+/// RFC 9116 security.txt, served at /.well-known/security.txt so researchers
+/// have a clear disclosure path (Cloudflare Security Insights flagged its
+/// absence on this origin). NOTE: refresh `Expires` before it lapses; a stale
+/// Expires makes the file non-compliant. Not signed here — cross-check the
+/// contact out of band (an OpenPGP/minisign clear-sign is a follow-up).
+const SECURITY_TXT: &str = "\
+Contact: mailto:tiagobeltraoacioli@gmail.com\n\
+Expires: 2027-01-11T00:00:00.000Z\n\
+Preferred-Languages: en, pt-BR\n\
+Policy: https://posternlabs.com/SECURITY.md\n\
+Canonical: https://posternpool.com/.well-known/security.txt\n\
+";
+
 pub async fn run(pool: Arc<PoolState>) -> std::io::Result<()> {
     let listener = TcpListener::bind(&pool.cfg.dashboard).await?;
     info!("dashboard: http://{}", pool.cfg.dashboard);
@@ -43,12 +56,31 @@ pub async fn run(pool: Arc<PoolState>) -> std::io::Result<()> {
             let (status, ctype, body) = match path {
                 "/api/stats" => ("200 OK", "application/json", stats_json(&pool2).to_string()),
                 "/" | "/index.html" => ("200 OK", "text/html; charset=utf-8", html_page()),
+                "/.well-known/security.txt" =>
+                    ("200 OK", "text/plain; charset=utf-8", SECURITY_TXT.to_string()),
                 _ => ("404 Not Found", "text/plain", "not found".to_string()),
             };
 
+            // Security headers on every response. posternpool.com is served
+            // DNS-only (not behind Cloudflare's proxy), so these must live at
+            // the origin — they address the Cloudflare Security Insights
+            // findings (missing HSTS, missing security.txt) here. The app sits
+            // behind Fly's TLS-terminating edge, so HSTS rides back over HTTPS
+            // (browsers ignore it over plain HTTP). The dashboard page uses
+            // inline CSS/JS and fetches /api/stats same-origin, hence the CSP.
             let resp = format!(
-                "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                status, ctype, body.len(), body,
+                "HTTP/1.1 {status}\r\n\
+                 Content-Type: {ctype}\r\n\
+                 Content-Length: {len}\r\n\
+                 X-Content-Type-Options: nosniff\r\n\
+                 X-Frame-Options: DENY\r\n\
+                 Referrer-Policy: no-referrer\r\n\
+                 Strict-Transport-Security: max-age=31536000; includeSubDomains\r\n\
+                 Content-Security-Policy: default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'\r\n\
+                 Permissions-Policy: geolocation=(), microphone=(), camera=(), payment=(), usb=()\r\n\
+                 Connection: close\r\n\r\n\
+                 {body}",
+                status = status, ctype = ctype, len = body.len(), body = body,
             );
             let _ = socket.write_all(resp.as_bytes()).await;
             let _ = socket.shutdown().await;
