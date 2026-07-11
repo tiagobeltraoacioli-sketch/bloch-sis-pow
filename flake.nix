@@ -46,7 +46,9 @@
         # `system = "aarch64-linux"` to use upstream's pinned nixpkgs.
         mobile-image = (import mobile-nixos {
           device = "pine64-pinephone";
-          pkgs = pkgsAarch64;
+          # Use Mobile NixOS's own pinned nixpkgs — its master overlay (gui-assets
+          # needs `svgo`, etc.) drifts from our nixos-25.05, which breaks eval.
+          system = "aarch64-linux";
           configuration = {
             imports = [
               self.nixosModules.bloch
