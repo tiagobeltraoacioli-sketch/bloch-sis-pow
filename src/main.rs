@@ -430,15 +430,33 @@ async fn main() {
     let tip_tx2 = tip_tx.clone();
 
     tokio::spawn(async move {
-        // Orphan pool: blocks received before their parents
-        const MAX_ORPHANS: usize = 10_000;
-        let mut orphans: std::collections::HashMap<[u8; 32], (core::Block, Vec<u8>, u64)> =
-            std::collections::HashMap::new();
-        // Reverse index: parent_hash → set of orphan hashes waiting for it
-        let mut waiting_for: std::collections::HashMap<[u8; 32], HashSet<[u8; 32]>> =
-            std::collections::HashMap::new();
+        use futures::future::FutureExt;
+        // ── P0 supervision (roadmap §2.5, top reliability risk #1) ───────────
+        // Before this, the single message-processor task was `tokio::spawn`ed
+        // with no supervision: a panic in accept_block / block decode / orphan
+        // handling silently killed the task. The process stayed "up", RPC kept
+        // answering, but the node stopped syncing FOREVER with no error
+        // surfaced. Here we catch a panic, log it loudly + meter it
+        // (`task_panics_total`), back off, and restart the processing loop
+        // without dropping the node. The processor's BEHAVIOUR is unchanged —
+        // only its supervision is added.
+        //
+        // Orphan-pool state lives inside the restartable closure, so a panic
+        // rebuilds it empty (the in-flight orphan buffer is lost — acceptable;
+        // peers resend). A clean channel close (all senders dropped) exits.
+        let mut backoff = std::time::Duration::from_millis(100);
+        const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+        loop {
+          let processor = async {
+            // Orphan pool: blocks received before their parents
+            const MAX_ORPHANS: usize = 10_000;
+            let mut orphans: std::collections::HashMap<[u8; 32], (core::Block, Vec<u8>, u64)> =
+                std::collections::HashMap::new();
+            // Reverse index: parent_hash → set of orphan hashes waiting for it
+            let mut waiting_for: std::collections::HashMap<[u8; 32], HashSet<[u8; 32]>> =
+                std::collections::HashMap::new();
 
-        while let Some(msg) = block_rx.recv().await {
+            while let Some(msg) = block_rx.recv().await {
             match msg {
 
                 // IBD step 1: peer tip — if behind, request headers
@@ -604,9 +622,20 @@ async fn main() {
                     // Sprint 1.d: Bitcoin-format tx wire.
                     if let Ok(tx) = core::Transaction::from_stratum_bytes(&tx_data) {
                         if !tx.is_coinbase() {
-                            match validate_tx_standalone(&tx, &store2, dag2.read().block_count() as u64) {
-                                Ok(fee) => { let _ = mem2.add(tx, fee); }
-                                Err(e)  => debug!("mempool reject: {}", e),
+                            let height = dag2.read().block_count() as u64;
+                            // P0 (roadmap §1.2 / §2.5 #6): move CPU-bound PQ
+                            // signature verification off the async reactor so a
+                            // gossiped valid-tx flood can't stall this task's
+                            // worker thread. Logic unchanged — only the thread.
+                            let store_v = store2.clone();
+                            let tx_v = tx.clone();
+                            let verified = tokio::task::spawn_blocking(move || {
+                                validate_tx_standalone(&tx_v, &store_v, height)
+                            }).await;
+                            match verified {
+                                Ok(Ok(fee)) => { let _ = mem2.add(tx, fee); }
+                                Ok(Err(e))  => debug!("mempool reject: {}", e),
+                                Err(e)      => warn!("tx verify task failed: {}", e),
                             }
                         }
                         state2.write().mempool_size = mem2.size();
@@ -616,6 +645,27 @@ async fn main() {
                 // Version handshake (handled at network layer)
                 network::NetworkMessage::Version { .. } | network::NetworkMessage::VersionAck | network::NetworkMessage::PeerExchange { .. } | network::NetworkMessage::PeerRequest => {}
             }
+            }
+          };
+          // Catch a panic that escapes the processing loop, meter + log it, and
+          // restart with bounded exponential backoff. Ok(()) means the input
+          // channel closed cleanly (every sender dropped) → exit the task.
+          match std::panic::AssertUnwindSafe(processor).catch_unwind().await {
+              Ok(()) => {
+                  info!("message-processor: input channel closed; task exiting cleanly");
+                  break;
+              }
+              Err(panic) => {
+                  crate::metrics::inc_task_panic("message_processor");
+                  let detail = panic.downcast_ref::<&str>().map(|s| (*s).to_string())
+                      .or_else(|| panic.downcast_ref::<String>().cloned())
+                      .unwrap_or_else(|| "<non-string panic payload>".to_string());
+                  error!("message-processor PANICKED: {} — node stays up; restarting loop in {:?}",
+                      detail, backoff);
+                  tokio::time::sleep(backoff).await;
+                  backoff = (backoff * 2).min(MAX_BACKOFF);
+              }
+          }
         }
     });
 

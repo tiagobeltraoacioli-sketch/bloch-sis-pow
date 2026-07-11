@@ -117,6 +117,12 @@ struct BlochBehaviour {
     gossipsub: gossipsub::Behaviour,
     mdns:      mdns::tokio::Behaviour,
     identify:  identify::Behaviour,
+    // P0 (roadmap §1.3 / §4.1): swarm-level connection limits. `max_peers` was
+    // previously only an app-side counter checked in the PEX/mDNS dial paths,
+    // so inbound connection floods / eclipse setup were NOT bounded by libp2p.
+    // This behaviour rejects connections at the transport layer once the caps
+    // are hit, matching max_peers.
+    connection_limits: libp2p::connection_limits::Behaviour,
 }
 
 // ── Node ──────────────────────────────────────────────────────────────────────
@@ -251,6 +257,10 @@ impl NetworkNode {
             warn!("peer scoring disabled: {}", e);
         }
 
+        // Captured for the connection-limits behaviour below (avoids borrowing
+        // `self` inside the `with_behaviour` closure).
+        let max_peers = self.config.max_peers;
+
         let mut swarm = SwarmBuilder::with_existing_identity(self.local_key.clone())
             .with_tokio()
             .with_tcp(
@@ -277,10 +287,25 @@ impl NetworkNode {
                 let identify = identify::Behaviour::new(
                     identify::Config::new("/bloch-sis/1.0.0".into(), key.public()),
                 );
+                // Cap connections at the swarm layer to match max_peers. We
+                // allow 2× established total for churn/reconnect headroom, but
+                // hold established-INCOMING to max_peers so an attacker can't
+                // fill every slot with inbound dials (eclipse hardening — note
+                // this bounds the transport but is NOT yet adversarially
+                // tested; see roadmap §2.4/§4.1). Pending caps blunt half-open
+                // connection floods.
+                let max = max_peers as u32;
+                let limits = libp2p::connection_limits::ConnectionLimits::default()
+                    .with_max_established(Some(max.saturating_mul(2)))
+                    .with_max_established_incoming(Some(max))
+                    .with_max_pending_incoming(Some(max))
+                    .with_max_pending_outgoing(Some(max.max(1)));
+                let connection_limits = libp2p::connection_limits::Behaviour::new(limits);
                 Ok::<_, Box<dyn std::error::Error + Send + Sync>>(BlochBehaviour {
                     gossipsub: gs,
                     mdns,
                     identify,
+                    connection_limits,
                 })
             })
             .map_err(|e| NetworkError::StartFailed(e.to_string()))?

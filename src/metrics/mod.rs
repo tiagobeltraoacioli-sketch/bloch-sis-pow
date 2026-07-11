@@ -62,6 +62,10 @@ pub struct MetricsState {
     pub tx_rejected_total:               IntCounterVec,
     pub kyber_handshake_failures_total:  IntCounter,
     pub rpc_requests_total:              IntCounterVec,
+    /// P0 (roadmap §2.5): incremented whenever a supervised long-lived task
+    /// (e.g. the message-processor) panics and is restarted. A rising value
+    /// means the node caught a would-be silent desync.
+    pub task_panics_total:               IntCounterVec,
 
     // ── Reorg observability (Sprint FF) ─────────────────────────
     pub reorg_attempts_total:            IntCounter,
@@ -144,6 +148,13 @@ impl MetricsState {
             registry
         ).expect("register rpc_requests_total");
 
+        let task_panics_total = register_int_counter_vec_with_registry!(
+            opts!("bloch_task_panics_total",
+                  "Panics caught by a supervised long-lived task (by task name); each was restarted rather than silently killing the node"),
+            &["task"],
+            registry
+        ).expect("register task_panics_total");
+
         // ── Reorg observability (Sprint FF) ──────────────────────
         let reorg_attempts_total = register_int_counter_with_registry!(
             opts!("bloch_reorg_attempts_total",
@@ -198,6 +209,7 @@ impl MetricsState {
             tx_rejected_total,
             kyber_handshake_failures_total,
             rpc_requests_total,
+            task_panics_total,
             reorg_attempts_total,
             reorg_failures_total,
             fork_depth,
@@ -265,6 +277,15 @@ pub fn inc_tx_rejected(reason: &str) {
 #[inline]
 pub fn inc_kyber_handshake_failure() {
     if let Some(m) = METRICS.get() { m.kyber_handshake_failures_total.inc(); }
+}
+
+/// P0 (roadmap §2.5): record a caught-and-restarted panic in a supervised
+/// task. `task` is a short stable label, e.g. "message_processor".
+#[inline]
+pub fn inc_task_panic(task: &str) {
+    if let Some(m) = METRICS.get() {
+        m.task_panics_total.with_label_values(&[task]).inc();
+    }
 }
 
 /// Status label is "ok", "unauthorized", or "rate_limited".

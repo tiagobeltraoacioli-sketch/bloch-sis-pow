@@ -5,10 +5,18 @@
 //! Sprint N-min: per-tx size cap, intra-mempool double-spend detection.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use parking_lot::RwLock;
 use crate::core::Transaction;
 
 const MAX_MEMPOOL_SIZE: usize = 50_000;
+
+/// P0 memory bound (roadmap §3.4 / §1.4): total serialized bytes the mempool
+/// will hold. The count cap alone allowed 50_000 × 400 KiB ≈ 20 GB worst case;
+/// this caps actual memory. 300 MiB is a conservative default — it must be
+/// tuned against real block sizes and load-tested (not yet done). Eviction
+/// enforces BOTH this and MAX_MEMPOOL_SIZE.
+const MAX_MEMPOOL_BYTES: usize = 300 * 1024 * 1024;
 
 /// SECURITY (audit L2): minimum relay fee rate in satoshis per serialized byte.
 /// Rejects free / dust-rate transactions that would otherwise let an actor with
@@ -38,6 +46,11 @@ pub struct Mempool {
     /// Invariant: for every (outpoint, spender_txid) entry, txs contains
     /// an entry with key spender_txid whose inputs include outpoint.
     spent: RwLock<HashMap<([u8; 32], u32), [u8; 32]>>,
+    /// P0: running sum of `tx.actual_size()` for every entry in `txs`. Kept in
+    /// sync under the `txs` write lock (only mutated while that lock is held),
+    /// so reads are consistent with the map. Used to enforce MAX_MEMPOOL_BYTES
+    /// in O(1) without rescanning the pool for its total size.
+    total_bytes: AtomicUsize,
 }
 
 impl Mempool {
@@ -45,6 +58,7 @@ impl Mempool {
         Self {
             txs:   RwLock::new(HashMap::new()),
             spent: RwLock::new(HashMap::new()),
+            total_bytes: AtomicUsize::new(0),
         }
     }
 
@@ -113,23 +127,40 @@ impl Mempool {
             }
         }
 
-        // Evict the lowest fee-RATE tx if full (audit L2: rank by fee/byte, not
-        // absolute fee, so a single large low-rate tx can't out-rank many small
-        // higher-rate ones).
-        if pool.len() >= MAX_MEMPOOL_SIZE {
-            let new_rate = (fee as u128 * FEE_RATE_SCALE) / (size.max(1) as u128);
+        // Evict the lowest fee-RATE tx(s) until BOTH bounds admit the new tx
+        // (audit L2: rank by fee/byte, not absolute fee, so a single large
+        // low-rate tx can't out-rank many small higher-rate ones):
+        //   - count bound: pool.len() < MAX_MEMPOOL_SIZE
+        //   - byte  bound: total_bytes + size <= MAX_MEMPOOL_BYTES  (P0)
+        //
+        // NOTE (roadmap §3.4 / P1 #10): eviction still does an O(n) min-scan per
+        // evicted tx because `txs` is a HashMap with no fee-rate index. The byte
+        // bound below caps *memory*; the fee-rate-ordered BTreeMap index that
+        // makes eviction O(log n) is deferred to P1 and is NOT load-tested here.
+        // Under a small-high-rate-tx flood this loop can evict several entries
+        // per insert — bounded, but its cost needs load testing to confirm.
+        let mut cur_bytes = self.total_bytes.load(Ordering::Relaxed);
+        let new_rate = (fee as u128 * FEE_RATE_SCALE) / (size.max(1) as u128);
+        while pool.len() >= MAX_MEMPOOL_SIZE
+            || cur_bytes.saturating_add(size) > MAX_MEMPOOL_BYTES
+        {
             let lowest = pool.iter()
                 .map(|(k, e)| (*k, (e.fee as u128 * FEE_RATE_SCALE) / (e.tx.actual_size().max(1) as u128)))
                 .min_by_key(|(_, r)| *r);
-            if let Some((k, low_rate)) = lowest {
-                if new_rate > low_rate {
+            match lowest {
+                Some((k, low_rate)) if new_rate > low_rate => {
                     // Also drop its spent-set entries before eviction.
                     if let Some(evicted) = pool.remove(&k) {
+                        cur_bytes = cur_bytes.saturating_sub(evicted.tx.actual_size());
                         for inp in &evicted.tx.inputs {
                             spent.remove(&(inp.prev_txid, inp.prev_index));
                         }
                     }
-                } else {
+                }
+                // Either the pool is empty (only possible when the new tx alone
+                // exceeds the byte cap) or the new tx does not out-rank the
+                // cheapest resident: reject rather than evict a better tx.
+                _ => {
                     crate::metrics::inc_tx_rejected("full");
                     return Err(MempoolError::Full);
                 }
@@ -146,6 +177,7 @@ impl Mempool {
             spent.insert((inp.prev_txid, inp.prev_index), txid);
         }
         pool.insert(txid, MempoolEntry { tx, fee, added_at: now });
+        self.total_bytes.store(cur_bytes.saturating_add(size), Ordering::Relaxed);
         crate::metrics::inc_tx_accepted();
         Ok(txid)
     }
@@ -154,6 +186,7 @@ impl Mempool {
         let mut pool  = self.txs.write();
         let mut spent = self.spent.write();
         if let Some(entry) = pool.remove(txid) {
+            self.total_bytes.fetch_sub(entry.tx.actual_size(), Ordering::Relaxed);
             for inp in &entry.tx.inputs {
                 spent.remove(&(inp.prev_txid, inp.prev_index));
             }
@@ -207,12 +240,19 @@ impl Mempool {
         // the tx entries themselves.
         for txid in &set {
             if let Some(entry) = pool.get(txid) {
+                self.total_bytes.fetch_sub(entry.tx.actual_size(), Ordering::Relaxed);
                 for inp in &entry.tx.inputs {
                     spent.remove(&(inp.prev_txid, inp.prev_index));
                 }
             }
         }
         pool.retain(|k, _| !set.contains(k));
+    }
+
+    /// P0: total serialized bytes currently held (for the byte-cap metric /
+    /// diagnostics). O(1) — reads the running counter.
+    pub fn size_bytes(&self) -> usize {
+        self.total_bytes.load(Ordering::Relaxed)
     }
 }
 
