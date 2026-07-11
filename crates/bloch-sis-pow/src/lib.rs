@@ -80,6 +80,9 @@ pub mod verify;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod kat;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Public re-exports for the most common types and functions.
 // ─────────────────────────────────────────────────────────────────────────────
