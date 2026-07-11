@@ -25,7 +25,7 @@ pub const GHOSTDAG_K:            usize = 10;
 pub const HALVING_INTERVAL:      u64   = 210_000;
 
 pub const MAX_BLOCK_SIZE:        usize = 1_000_000;
-pub const TARGET_BLOCK_TIME:     u64   = tokenomics_v2::TARGET_BLOCK_TIME_SECS; // 150s (V2)
+pub const TARGET_BLOCK_TIME:     u64   = tokenomics_v2::TARGET_BLOCK_TIME_SECS; // 30s (V2)
 pub const PROTOCOL_VERSION:      u32   = 1;
 pub const DIFFICULTY_WINDOW:     u64   = 2_016;      // retarget every N blocks (~5.6 hours)
 pub const MAX_RETARGET_FACTOR:   u64   = 4;          // max 4x adjustment per window
@@ -84,7 +84,7 @@ pub const PRUNING_DEPTH:         u64   = 10_000;     // block bodies pruned belo
 // diverged from the actual pqcrypto-mldsa 0.1 API (PRIVKEY=4032, SIG=3309).
 // estimate_size() — used for mempool fee validation — was underestimating
 // tx size by 16 bytes per input, causing low-fee rejection. See audit H-2.
-// Hybrid Falcon-1024 ‖ ML-DSA-65 sizes (Sprint B6b). Public key = 1952 + 1793;
+// Hybrid ML-DSA-65 ‖ Falcon-1024 sizes (Sprint B6b). Public key = 1952 + 1793;
 // secret = 4032 + 2305; signature = 3309 + ~1280 (Falcon is variable, so
 // SIG_SIZE is an upper estimate used only for fee sizing — the wire format is
 // length-prefixed, see Transaction::build_script_sig).
@@ -95,7 +95,7 @@ pub const SIG_SIZE:     usize = 3309 + 1462; // 4771 (upper bound; Falcon max 14
 // Genesis block — V2 mainnet genesis re-mined 2026-05-01 (Sprint 2.1.D C8b),
 // identical on every node. Tokenomics V2 (TOKENOMICS_V2.md, ADR-028).
 // Recipients: miner / validator_pool / oracle_pool wallets generated 2026-05-01.
-// Block time calibrated for 150s (V2). Bits 0x1d024000 ≈ 15× harder than V1.
+// Block time calibrated for 30s (V2). Bits 0x1d024000 ≈ 15× harder than V1.
 // Hash: 0000000199c3d1a45be0a57ca115b7e52791eb682b1908b7963990eac5892bfb
 pub const GENESIS_NONCE:     u64   = 0;
 pub const GENESIS_TIMESTAMP: u64   = 1777686240;

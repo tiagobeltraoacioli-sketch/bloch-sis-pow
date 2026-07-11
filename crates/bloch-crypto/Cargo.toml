@@ -33,7 +33,7 @@ node = ["dep:reqwest", "dep:async-trait"]
 wallet-cli = []
 
 [dependencies]
-# Post-quantum signatures (hybrid Falcon-1024 ‖ ML-DSA-65) + seeded keygen.
+# Post-quantum signatures (hybrid ML-DSA-65 ‖ Falcon-1024) + seeded keygen.
 pqcrypto-mldsa     = "0.1"
 pqcrypto-falcon    = "0.4"
 pqcrypto-traits    = "0.3"

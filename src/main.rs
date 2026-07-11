@@ -1785,7 +1785,7 @@ fn validate_tx_inputs(
             return Err(format!("pubkey mismatch at input {}", i));
         }
 
-        // Verify ML-DSA-65 signature
+        // Verify hybrid ML-DSA-65 ‖ Falcon-1024 signature
         let sighash = tx.sighash(i);
         if !crypto::verify(&pk, &sighash, &sig) {
             return Err(format!("invalid signature at input {}", i));

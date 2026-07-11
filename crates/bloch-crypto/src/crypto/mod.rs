@@ -281,7 +281,7 @@ mod tests {
 
 // ── Falcon-1024 (Sprint B6b) ────────────────────────────────────────────────
 //
-// The second signature of the hybrid Falcon-1024 ‖ ML-DSA-65 scheme: two
+// The second signature of the hybrid ML-DSA-65 ‖ Falcon-1024 scheme: two
 // distinct lattice families (NTRU vs Module-LWE/SIS) for defence in depth — a
 // break of one assumption does not forge a signature. Falcon verification is
 // deterministic (integer), so it is consensus-safe; Falcon *signing* uses

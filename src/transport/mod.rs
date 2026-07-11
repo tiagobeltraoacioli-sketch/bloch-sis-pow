@@ -100,7 +100,7 @@ pub const KYBER768_PK_SIZE: usize = 1184;
 /// Kyber768 ciphertext size (FIPS 203).
 pub const KYBER768_CT_SIZE: usize = 1088;
 /// Peer-identity public-key size. Sprint B6b: identity signatures now use the
-/// hybrid Falcon-1024 ‖ ML-DSA-65 scheme (via `crypto::sign`/`verify`), so the
+/// hybrid ML-DSA-65 ‖ Falcon-1024 scheme (via `crypto::sign`/`verify`), so the
 /// identity pubkey is the hybrid pubkey (ML-DSA 1952 ‖ Falcon 1793 = 3745).
 pub const MLDSA65_PK_SIZE: usize = crate::core::PUBKEY_SIZE;
 /// Hybrid identity signature size (upper bound; Falcon is variable). Not
