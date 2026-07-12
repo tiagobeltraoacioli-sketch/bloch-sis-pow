@@ -53,9 +53,9 @@ fn main() -> bloch_anchoring::Result<()> {
 
     // 2. The notary accumulates off-chain state (its own data availability).
     let mut notary = Notary::new();
-    notary.notarize("deed-0001: transfer of parcel A");
-    notary.notarize("deed-0002: lien release on parcel B");
-    notary.notarize("attestation-0003: audit sign-off Q3");
+    notary.notarize("document-0001: state root for batch A");
+    notary.notarize("document-0002: state root for batch B");
+    notary.notarize("attestation-0003: checkpoint digest Q3");
 
     let commitment = notary.state_commitment();
     println!("notary state commitment : {commitment}");

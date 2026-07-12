@@ -99,7 +99,7 @@ async function callRpc(endpoint, method, params, apiKey) {
 const $ = (id) => document.getElementById(id);
 
 function esc(s) {
-  return String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+  return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
 // Integer sat -> display BLOCH string. Satoshis are the truth; this is display only.

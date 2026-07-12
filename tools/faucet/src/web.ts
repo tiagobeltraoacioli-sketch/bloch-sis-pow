@@ -73,9 +73,9 @@ export function renderForm(cfg: FaucetConfig): string {
       });
       const j = await res.json();
       if (j.ok) {
-        out.innerHTML = '✅ Sent ' + (j.amountSats/1e8) + ' test BLCH' +
+        out.textContent = '✅ Sent ' + (j.amountSats/1e8) + ' test BLCH' +
           (j.dryRun ? ' (DRY-RUN, not broadcast)' : '') +
-          '\\ntxid: ' + j.txid;
+          '\ntxid: ' + j.txid;
       } else {
         out.textContent = '❌ ' + j.error + (j.code ? ' ['+j.code+']' : '');
       }
