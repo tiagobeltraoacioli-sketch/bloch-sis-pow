@@ -1,0 +1,44 @@
+# Bloch anchoring / commitment reference framework.
+#
+# STANDALONE crate — intentionally NOT a member of the root Bloch workspace.
+# It depends on nothing from the node so an L2 / finality-gadget / RWA builder
+# can fork it in isolation. Only today's Bloch primitives are used (UTXO,
+# fixed P2PKH outputs, JSON-RPC `sendrawtransaction`) — no future data-carrier
+# output is assumed (see README, "What a data-carrier GIP would add").
+#
+# License: MIT OR Apache-2.0 (matches the protocol's permissive licensing).
+
+# Empty [workspace] table => this crate is its OWN workspace root and is NOT a
+# member of the parent Bloch workspace at ../Cargo.toml. This keeps it fully
+# standalone WITHOUT editing the root manifest.
+[workspace]
+
+[package]
+name = "bloch-anchoring"
+version = "0.0.0-scaffold"
+edition = "2021"
+description = "Reference L2/anchoring & commitment framework for Bloch — submit a compact commitment, wait for PoW confirmations, retrieve/prove it by height or txid. SCAFFOLD, unaudited, pre-production."
+license = "MIT OR Apache-2.0"
+repository = "https://gitlab.com/bloch-protocol/bloch"
+keywords = ["bloch", "anchoring", "commitment", "l2", "checkpoint"]
+categories = ["cryptography::cryptocurrencies"]
+publish = false
+
+[features]
+default = []
+# `http` wires a real blocking JSON-RPC transport over ureq. Off by default so
+# the crate builds fully offline against the trait + in-memory mock. Enable it
+# to talk to a live Bloch node: `cargo build --features http`.
+http = ["dep:ureq"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+sha3 = "0.10"
+thiserror = "2"
+ureq = { version = "2", optional = true }
+
+[[example]]
+name = "anchored_notary"
+path = "examples/anchored_notary.rs"
