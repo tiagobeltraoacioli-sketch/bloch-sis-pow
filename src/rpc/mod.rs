@@ -420,6 +420,18 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             }
         }
 
+        // ── Chain: distinct on-chain wallets (addresses with a balance) ──
+        "getaddresscount" => {
+            match state.store.count_addresses_with_balance() {
+                Ok((addrs, utxos)) => json!({
+                    "addresses_with_balance": addrs,
+                    "utxo_entries":           utxos,
+                    "note": "distinct addresses currently holding >=1 UTXO (on-chain wallets with a non-zero balance); addresses that spent to zero or never held a UTXO are not counted",
+                }),
+                Err(e) => json!({ "error": e.to_string() }),
+            }
+        }
+
         // ── Wallet: list UTXOs for address (needed by wallet CLI) ────
         "getutxos" => {
             let addr = params.and_then(|p| p.get(0)).and_then(|v| v.as_str()).unwrap_or("");
