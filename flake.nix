@@ -6,14 +6,44 @@
   # top-level default.nix ({ device, configuration, pkgs/system }); pin a
   # revision on your build host. (Canonical org is mobile-nixos, not
   # nix-community — the latter 404s.)
+  #
+  # PIN THE REV (roadmap #2 — do this on the Nix host, see REPRO.md §"#2"):
+  #   `nix flake lock` already pins mobile-nixos to a fixed rev inside flake.lock,
+  #   but the URL below still floats on the branch, so `nix flake update` can move
+  #   it silently and the pin is invisible in review. To make the rev a single
+  #   diffable line, resolve it and REPLACE the line below with the pinned form:
+  #
+  #     nix flake lock            # resolves the branch -> a fixed rev in flake.lock
+  #     nix flake metadata --json | jq -r \
+  #       '"mobile-nixos rev: " + .locks.nodes["mobile-nixos"].locked.rev'
+  #
+  #   then swap the active line for (keeping flake = false):
+  #     url = "github:mobile-nixos/mobile-nixos/<MOBILE_NIXOS_REV>";
+  #   and re-run `nix flake lock` so the lock matches the pinned input.
+  #
+  # Until pinned, the line below floats on the branch so `nix flake lock` Just
+  # Works out of the box (it still records a concrete rev in flake.lock).
   inputs.mobile-nixos = { url = "github:mobile-nixos/mobile-nixos"; flake = false; };
 
   outputs = { self, nixpkgs, mobile-nixos }:
     let
+      # ── PLATFORM CAVEAT (read before building on aarch64 hardware) ────────────
+      # The image/OS outputs `.#iso`, `.#desktop-iso`, `.#attested-image` and the
+      # NixOS configs `bloch-os`, `bloch-os-attested`, `postern-desktop` are wired
+      # to `system = "x86_64-linux"` below. On an aarch64 host they build ONLY via
+      # binfmt qemu-user emulation (SLOW) or a real x86_64 builder.
+      #
+      # What builds NATIVELY on aarch64 (no emulation), and is the honest, cheap
+      # first determinism probe (see REPRO.md §"#9"):
+      #   .#packages.aarch64-linux.bloch          — the node/wallet crate
+      #   .#packages.aarch64-linux.attested-image — the sealed image, aarch64 variant
+      #   .#mobile-image                          — the PinePhone image (aarch64)
+      # The aarch64 attested variant (bloch-os-attested-aarch64) exists precisely so
+      # the sealed image can be repro-checked on aarch64 hardware WITHOUT emulation.
       system = "x86_64-linux";
       pkgs = nixpkgs.legacyPackages.${system};
-      # The phone is aarch64; its node/wallet package must be too. Built
-      # natively-for-aarch64 (via binfmt emulation on an x86_64 host).
+      # The phone is aarch64; its node/wallet package must be too. On an aarch64
+      # host this builds natively; on an x86_64 host it goes via binfmt emulation.
       pkgsAarch64 = nixpkgs.legacyPackages.aarch64-linux;
     in
     {
@@ -63,9 +93,20 @@
       };
 
       # The same node package, built for aarch64 (consumed by mobile-image).
+      # NATIVE on aarch64 hardware — this is the cheapest determinism probe
+      # (bundled RocksDB 8.10 C++ is the #1 nondeterminism risk). See REPRO.md.
       packages.aarch64-linux = {
         bloch = pkgsAarch64.callPackage ./os/package.nix { };
         default = self.packages.aarch64-linux.bloch;
+
+        # aarch64-native sealed image — the same immutable + dm-verity-sealed
+        # profile as x86_64 `.#attested-image`, but built on the aarch64 host
+        # you actually have, so the sealed image can be `--rebuild --check`ed and
+        # two-builder compared WITHOUT binfmt emulation (report §3.4, recommendation b).
+        # The `image.repart` verity/roothash machinery in os/attested.nix is
+        # arch-agnostic; only the toplevel closure differs by platform.
+        attested-image =
+          self.nixosConfigurations.bloch-os-attested-aarch64.config.system.build.image;
       };
 
       # Reusable NixOS module — add `services.bloch.enable = true` to any host.
@@ -88,6 +129,22 @@
       nixosConfigurations.bloch-os-attested = nixpkgs.lib.nixosSystem {
         inherit system;
         specialArgs = { blochPkg = self.packages.${system}.bloch; };
+        modules = [
+          "${nixpkgs}/nixos/modules/image/repart.nix"
+          self.nixosModules.bloch
+          ./os/configuration.nix
+          ./os/attested.nix
+        ];
+      };
+
+      # aarch64-native twin of bloch-os-attested. Same modules, same seal profile
+      # (os/attested.nix), but `system = "aarch64-linux"` and the aarch64 node
+      # package — so the sealed image builds + repro-checks natively on aarch64
+      # hardware (no x86_64 emulation). Consumed by
+      # `.#packages.aarch64-linux.attested-image`. See REPRO.md §"#9".
+      nixosConfigurations.bloch-os-attested-aarch64 = nixpkgs.lib.nixosSystem {
+        system = "aarch64-linux";
+        specialArgs = { blochPkg = self.packages.aarch64-linux.bloch; };
         modules = [
           "${nixpkgs}/nixos/modules/image/repart.nix"
           self.nixosModules.bloch
