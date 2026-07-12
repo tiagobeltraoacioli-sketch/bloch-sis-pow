@@ -47,6 +47,13 @@ impl Rng {
     fn bytes(&mut self, n: usize) -> Vec<u8> {
         (0..n).map(|_| self.next() as u8).collect()
     }
+    /// `bytes(min + range(max))` in a single call so it can be used inside a
+    /// struct literal without two simultaneous `&mut self` borrows (E0499:
+    /// `r.bytes(r.range(n))` borrows `*r` mutably twice in one expression).
+    fn bytes_rand(&mut self, min: usize, max: usize) -> Vec<u8> {
+        let n = min + self.range(max);
+        self.bytes(n)
+    }
     fn arr32(&mut self) -> [u8; 32] {
         let mut a = [0u8; 32];
         for b in a.iter_mut() {
@@ -76,7 +83,7 @@ fn rand_tx(r: &mut Rng) -> Transaction {
             .map(|_| TxInput {
                 prev_txid: r.arr32(),
                 prev_index: r.next() as u32,
-                script_sig: r.bytes(r.range(40)),
+                script_sig: r.bytes_rand(0, 40),
                 sequence: r.next() as u32,
             })
             .collect(),
@@ -96,8 +103,8 @@ fn rand_shielded(r: &mut Rng) -> ShieldedTx {
         nullifiers: (0..r.range(3)).map(|_| r.arr32()).collect(),
         outputs: (0..r.range(3)).map(|_| r.arr32()).collect(),
         fee: r.next() % 1_000_000,
-        proof: r.bytes(r.range(120)),
-        binding_sig: r.bytes(r.range(64)),
+        proof: r.bytes_rand(0, 120),
+        binding_sig: r.bytes_rand(0, 64),
     }
 }
 
@@ -163,19 +170,19 @@ fn rand_netmsg(r: &mut Rng) -> Vec<u8> {
 fn rand_handshake_init(r: &mut Rng) -> Vec<u8> {
     let init = HandshakeInit {
         version: 1,
-        kyber_pk: r.bytes(r.range(64)),
-        identity_pk: r.bytes(r.range(64)),
+        kyber_pk: r.bytes_rand(0, 64),
+        identity_pk: r.bytes_rand(0, 64),
         nonce: r.arr32(),
-        signature: r.bytes(r.range(64)),
+        signature: r.bytes_rand(0, 64),
     };
     bincode::serde::encode_to_vec(&init, bincfg()).expect("encode HandshakeInit")
 }
 
 fn rand_handshake_resp(r: &mut Rng) -> Vec<u8> {
     let resp = HandshakeResp {
-        ciphertext: r.bytes(r.range(64)),
-        identity_pk: r.bytes(r.range(64)),
-        signature: r.bytes(r.range(64)),
+        ciphertext: r.bytes_rand(0, 64),
+        identity_pk: r.bytes_rand(0, 64),
+        signature: r.bytes_rand(0, 64),
     };
     bincode::serde::encode_to_vec(&resp, bincfg()).expect("encode HandshakeResp")
 }
@@ -200,7 +207,7 @@ fn rand_merkle(r: &mut Rng) -> Vec<u8> {
 /// A `mempool_ops` seed: an op-stream byte string (the target's own VM decodes
 /// it). Random bytes are a fine seed; the near-miss set below adds structure.
 fn rand_mempool_ops(r: &mut Rng) -> Vec<u8> {
-    r.bytes(1 + r.range(160))
+    r.bytes_rand(1, 160)
 }
 
 /// Truncations / bit-flips of a valid encoding — the near-miss corpus.
