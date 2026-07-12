@@ -4,9 +4,12 @@
 //! a future crate upgrade that changes sizes fails here rather than silently
 //! regressing fee estimation. Public key / secret are fixed-length; the Falcon
 //! signature is variable, so SIG_SIZE is an upper bound.
+//!
+//! Roadmap #1: every enveloped object now carries a 4-byte suite header
+//! (`crypto::SUITE_HEADER_LEN`), so the size constants are `HDR + hybrid layout`.
 
 use bloch::core::{PUBKEY_SIZE, PRIVKEY_SIZE, SIG_SIZE};
-use bloch::crypto;
+use bloch::crypto::{self, SUITE_HEADER_LEN};
 use pqcrypto_mldsa::mldsa65;
 use pqcrypto_falcon::falcon1024;
 
@@ -14,8 +17,8 @@ use pqcrypto_falcon::falcon1024;
 fn pubkey_size_is_hybrid_sum() {
     assert_eq!(
         PUBKEY_SIZE,
-        mldsa65::public_key_bytes() + falcon1024::public_key_bytes(),
-        "PUBKEY_SIZE must equal ML-DSA-65 ‖ Falcon-1024 public key lengths"
+        SUITE_HEADER_LEN + mldsa65::public_key_bytes() + falcon1024::public_key_bytes(),
+        "PUBKEY_SIZE must equal suite header + ML-DSA-65 ‖ Falcon-1024 public key lengths"
     );
 }
 
@@ -23,19 +26,19 @@ fn pubkey_size_is_hybrid_sum() {
 fn privkey_size_is_hybrid_sum() {
     assert_eq!(
         PRIVKEY_SIZE,
-        mldsa65::secret_key_bytes() + falcon1024::secret_key_bytes(),
-        "PRIVKEY_SIZE must equal ML-DSA-65 ‖ Falcon-1024 secret key lengths"
+        SUITE_HEADER_LEN + mldsa65::secret_key_bytes() + falcon1024::secret_key_bytes(),
+        "PRIVKEY_SIZE must equal suite header + ML-DSA-65 ‖ Falcon-1024 secret key lengths"
     );
 }
 
 #[test]
 fn sig_size_is_upper_bound() {
     // Falcon signatures are variable-length; SIG_SIZE is an upper estimate used
-    // only for fee sizing. It must cover ML-DSA (fixed) + the Falcon max.
+    // only for fee sizing. It must cover the header + ML-DSA (fixed) + Falcon max.
     assert!(
-        SIG_SIZE >= mldsa65::signature_bytes() + falcon1024::signature_bytes(),
-        "SIG_SIZE ({}) must be >= ML-DSA ({}) + Falcon max ({})",
-        SIG_SIZE, mldsa65::signature_bytes(), falcon1024::signature_bytes()
+        SIG_SIZE >= SUITE_HEADER_LEN + mldsa65::signature_bytes() + falcon1024::signature_bytes(),
+        "SIG_SIZE ({}) must be >= header ({}) + ML-DSA ({}) + Falcon max ({})",
+        SIG_SIZE, SUITE_HEADER_LEN, mldsa65::signature_bytes(), falcon1024::signature_bytes()
     );
 }
 

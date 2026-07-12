@@ -21,12 +21,56 @@ pub const MLDSA_PUBKEY_LEN: usize = 1952;
 pub const MLDSA_SECRET_LEN: usize = 4032;
 pub const MLDSA_SIG_LEN:    usize = 3309;
 
+// ── Crypto-agility suite-ID envelope (Roadmap #1) ────────────────────────────
+//
+// Every public key AND signature (and, for symmetry, the secret key) now carries
+// a 4-byte header so the verifier dispatches on an IN-BAND algorithm identifier
+// instead of assuming fixed offsets. This makes suites swappable (e.g. drop
+// Falcon → SUITE_MLDSA65_ONLY) without a further format break.
+//
+//   byte 0     : 0xB1  ┐ 2-byte magic "B1 0C" — an enveloped object vs. a legacy
+//   byte 1     : 0x0C  ┘ raw ML-DSA blob; a mismatch ⇒ verify returns false.
+//   bytes 2..4 : suite_id : u16 LE
+//
+// Parse failure (len<4 / bad magic / unknown suite) ⇒ verify returns false and
+// NEVER panics (consensus rule). NOT a security claim: this is unaudited.
+pub const SUITE_HEADER_LEN: usize = 4;
+const SUITE_MAGIC: [u8; 2] = [0xB1, 0x0C];
+/// Today's hybrid: ML-DSA-65 ‖ Falcon-1024.
+pub const SUITE_MLDSA65_FALCON1024: u16 = 0x0001;
+/// ML-DSA-65 only — the "Falcon removed" suite (proof that Falcon is removable).
+pub const SUITE_MLDSA65_ONLY: u16 = 0x0002;
+// 0x0000 and 0xFFFF are reserved and never valid ⇒ verify returns false.
+
+/// Parse the 4-byte suite envelope header. `None` on any malformation
+/// (len < 4 or bad magic) — the caller MUST treat `None` as invalid (`false`),
+/// never a panic. The returned body is everything after the header.
+fn parse_envelope(b: &[u8]) -> Option<(u16, &[u8])> {
+    if b.len() < SUITE_HEADER_LEN { return None; }
+    if b[0] != SUITE_MAGIC[0] || b[1] != SUITE_MAGIC[1] { return None; }
+    let suite = u16::from_le_bytes([b[2], b[3]]);
+    Some((suite, &b[SUITE_HEADER_LEN..]))
+}
+
+/// Prepend the 4-byte suite header (`magic ‖ suite_id LE`) to a body.
+fn wrap_envelope(suite: u16, body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(SUITE_HEADER_LEN + body.len());
+    out.extend_from_slice(&SUITE_MAGIC);
+    out.extend_from_slice(&suite.to_le_bytes());
+    out.extend_from_slice(body);
+    out
+}
+
 pub fn generate_keypair() -> (Vec<u8>, Vec<u8>) {
     let (mpk, msk) = mldsa65::keypair();
     let (fpk, fsk) = falcon::keypair();
     let mut pk = mpk.as_bytes().to_vec(); pk.extend_from_slice(&fpk);
     let mut sk = msk.as_bytes().to_vec(); sk.extend_from_slice(&fsk);
-    (pk, sk)
+    // Enveloped under suite 0x0001 (magic ‖ 01 00 ‖ body). The enveloped pk is
+    // THE public key everywhere (keygen, address hashing, script_sig) so
+    // addresses become suite-committing (design §2.4).
+    (wrap_envelope(SUITE_MLDSA65_FALCON1024, &pk),
+     wrap_envelope(SUITE_MLDSA65_FALCON1024, &sk))
 }
 
 /// Deterministic keypair generation from a 32-byte seed.
@@ -83,37 +127,78 @@ pub fn generate_keypair_from_seed(seed: &[u8]) -> Result<(Vec<u8>, Vec<u8>), Cry
     let (fpk, fsk) = falcon::keypair();
     let mut pk = mpk.as_bytes().to_vec(); pk.extend_from_slice(&fpk);
     let mut sk = msk.as_bytes().to_vec(); sk.extend_from_slice(&fsk);
-    Ok((pk, sk))
+    Ok((wrap_envelope(SUITE_MLDSA65_FALCON1024, &pk),
+        wrap_envelope(SUITE_MLDSA65_FALCON1024, &sk)))
 }
 
 pub fn sign(secret_key_bytes: &[u8], message: &[u8]) -> Result<Vec<u8>, CryptoError> {
-    // Hybrid: mldsa_sk(4032) ‖ falcon_sk. Produce mldsa_sig(3309) ‖ falcon_sig.
-    if secret_key_bytes.len() <= MLDSA_SECRET_LEN {
-        return Err(CryptoError::InvalidKey("hybrid secret key too short".into()));
+    // Parse the suite envelope on the secret key, then produce a signature
+    // enveloped under the SAME suite. Parse failure ⇒ Err (never a panic).
+    let (suite, sk_body) = parse_envelope(secret_key_bytes)
+        .ok_or_else(|| CryptoError::InvalidKey("secret-key envelope: too short or bad magic".into()))?;
+    match suite {
+        SUITE_MLDSA65_FALCON1024 => {
+            // Hybrid body: mldsa_sk(4032) ‖ falcon_sk. Produce mldsa_sig(3309) ‖ falcon_sig.
+            if sk_body.len() <= MLDSA_SECRET_LEN {
+                return Err(CryptoError::InvalidKey("hybrid secret key too short".into()));
+            }
+            let (msk, fsk) = sk_body.split_at(MLDSA_SECRET_LEN);
+            let sk = mldsa65::SecretKey::from_bytes(msk)
+                .map_err(|_| CryptoError::InvalidKey("bad ML-DSA secret key".into()))?;
+            let mut out = mldsa65::detached_sign(message, &sk).as_bytes().to_vec();
+            out.extend_from_slice(&falcon::sign(fsk, message)?);
+            Ok(wrap_envelope(suite, &out))
+        }
+        SUITE_MLDSA65_ONLY => {
+            if sk_body.len() != MLDSA_SECRET_LEN {
+                return Err(CryptoError::InvalidKey("ML-DSA-only secret key wrong length".into()));
+            }
+            let sk = mldsa65::SecretKey::from_bytes(sk_body)
+                .map_err(|_| CryptoError::InvalidKey("bad ML-DSA secret key".into()))?;
+            let out = mldsa65::detached_sign(message, &sk).as_bytes().to_vec();
+            Ok(wrap_envelope(suite, &out))
+        }
+        _ => Err(CryptoError::InvalidKey(format!("unknown/reserved suite {:#06x}", suite))),
     }
-    let (msk, fsk) = secret_key_bytes.split_at(MLDSA_SECRET_LEN);
-    let sk = mldsa65::SecretKey::from_bytes(msk)
-        .map_err(|_| CryptoError::InvalidKey("bad ML-DSA secret key".into()))?;
-    let mut out = mldsa65::detached_sign(message, &sk).as_bytes().to_vec();
-    out.extend_from_slice(&falcon::sign(fsk, message)?);
-    Ok(out)
 }
 
 pub fn verify(public_key_bytes: &[u8], message: &[u8], signature_bytes: &[u8]) -> bool {
-    // Audit L-1 fix: return `false` on parse failure (consensus rule — a
-    // malformed signature MUST be treated as invalid), but also log at
-    // debug! level so developers can tell the difference between
-    // "signature parsed but didn't verify" and "signature was malformed".
-    // Consensus behavior is unchanged.
-    // Hybrid: split off the fixed-length ML-DSA prefix; the remainder is
-    // Falcon. BOTH must verify (defence in depth across two lattice families).
-    if public_key_bytes.len() <= MLDSA_PUBKEY_LEN || signature_bytes.len() <= MLDSA_SIG_LEN {
-        debug!("crypto::verify: hybrid pubkey/sig too short (pk={}, sig={})",
-               public_key_bytes.len(), signature_bytes.len());
+    // Suite-ID dispatch (design §2.3). Strip the 4-byte header on BOTH the pk
+    // and the sig; a pk of one suite must not verify a sig of another. Any parse
+    // failure ⇒ false, never a panic (consensus rule). NO security is claimed.
+    let (pk_suite, pk_body) = match parse_envelope(public_key_bytes) {
+        Some(x) => x,
+        None => { debug!("crypto::verify: pubkey envelope parse failed (len={})", public_key_bytes.len()); return false; }
+    };
+    let (sig_suite, sig_body) = match parse_envelope(signature_bytes) {
+        Some(x) => x,
+        None => { debug!("crypto::verify: sig envelope parse failed (len={})", signature_bytes.len()); return false; }
+    };
+    if pk_suite != sig_suite {
+        debug!("crypto::verify: suite mismatch (pk={:#06x}, sig={:#06x})", pk_suite, sig_suite);
         return false;
     }
-    let (mpk, fpk) = public_key_bytes.split_at(MLDSA_PUBKEY_LEN);
-    let (msig, fsig) = signature_bytes.split_at(MLDSA_SIG_LEN);
+    match pk_suite {
+        SUITE_MLDSA65_FALCON1024 => verify_hybrid_mldsa_falcon(pk_body, message, sig_body),
+        SUITE_MLDSA65_ONLY       => verify_mldsa65_only(pk_body, message, sig_body),
+        other => { debug!("crypto::verify: unknown/reserved suite {:#06x}", other); false }
+    }
+}
+
+/// Suite 0x0001 verifier — the pre-envelope `verify` body verbatim, now
+/// operating on the post-header BODY slices. The `<=` length guards, the
+/// `from_bytes` parse-fail⇒false, and the ML-DSA-AND-Falcon combiner are all
+/// preserved: BOTH halves must verify (defence in depth across two lattice
+/// families). Behaviour on 0x0001 objects is byte-for-byte identical to the
+/// legacy path except for the 4-byte header strip.
+fn verify_hybrid_mldsa_falcon(pk_body: &[u8], message: &[u8], sig_body: &[u8]) -> bool {
+    if pk_body.len() <= MLDSA_PUBKEY_LEN || sig_body.len() <= MLDSA_SIG_LEN {
+        debug!("crypto::verify: hybrid pubkey/sig body too short (pk={}, sig={})",
+               pk_body.len(), sig_body.len());
+        return false;
+    }
+    let (mpk, fpk) = pk_body.split_at(MLDSA_PUBKEY_LEN);
+    let (msig, fsig) = sig_body.split_at(MLDSA_SIG_LEN);
 
     let pk = match mldsa65::PublicKey::from_bytes(mpk) {
         Ok(k) => k,
@@ -128,6 +213,25 @@ pub fn verify(public_key_bytes: &[u8], message: &[u8], signature_bytes: &[u8]) -
     }
     // Falcon half.
     falcon::verify(fpk, message, fsig)
+}
+
+/// Suite 0x0002 verifier — ML-DSA-65 only (Falcon removed). Exact-length bodies
+/// required. Provided so `SUITE_MLDSA65_ONLY` objects verify; no live output
+/// uses this suite yet (gating new 0x0002 acceptance behind a height activation
+/// is future work, design §2.5).
+fn verify_mldsa65_only(pk_body: &[u8], message: &[u8], sig_body: &[u8]) -> bool {
+    if pk_body.len() != MLDSA_PUBKEY_LEN || sig_body.len() != MLDSA_SIG_LEN {
+        debug!("crypto::verify: mldsa-only pk/sig body wrong length (pk={}, sig={})",
+               pk_body.len(), sig_body.len());
+        return false;
+    }
+    let pk = match mldsa65::PublicKey::from_bytes(pk_body) {
+        Ok(k) => k, Err(_) => return false,
+    };
+    let sig = match mldsa65::DetachedSignature::from_bytes(sig_body) {
+        Ok(s) => s, Err(_) => return false,
+    };
+    mldsa65::verify_detached_signature(&sig, message, &pk).is_ok()
 }
 
 pub fn address_from_pubkey(public_key: &[u8], testnet: bool) -> String {
@@ -363,9 +467,10 @@ mod kat {
     use super::*;
     use pqcrypto_falcon::falcon1024;
     use pqcrypto_mldsa::mldsa65;
-    use pqcrypto_traits::sign::{
-        DetachedSignature as _, PublicKey as _, SecretKey as _,
-    };
+    // NOTE: the `pqcrypto_traits::sign::{DetachedSignature, PublicKey, SecretKey}`
+    // trait imports were removed here: the suite-envelope refactor replaced the
+    // kat module's direct trait-method slicing with `parse_envelope(..)` body
+    // access, so those traits are no longer referenced in this module.
 
     // Falcon-1024 public-key length (used for the reverse-split oracle test).
     const FALCON_PUBKEY_LEN: usize = 1793;
@@ -380,6 +485,24 @@ mod kat {
         assert_eq!(mldsa65::secret_key_bytes(), MLDSA_SECRET_LEN, "ML-DSA-65 sk len");
         assert_eq!(mldsa65::signature_bytes(), MLDSA_SIG_LEN, "ML-DSA-65 sig len");
         assert_eq!(falcon1024::public_key_bytes(), FALCON_PUBKEY_LEN, "Falcon-1024 pk len");
+
+        // Enveloped objects = 4-byte suite header + the raw primitive lengths.
+        let (pk, sk) = generate_keypair();
+        let sig = sign(&sk, b"envelope-len-check").unwrap();
+        assert_eq!(pk.len(), SUITE_HEADER_LEN + MLDSA_PUBKEY_LEN + FALCON_PUBKEY_LEN,
+                   "enveloped hybrid pk = header + mldsa_pk + falcon_pk");
+        assert_eq!(sk.len(), SUITE_HEADER_LEN + MLDSA_SECRET_LEN + falcon1024::secret_key_bytes(),
+                   "enveloped hybrid sk = header + mldsa_sk + falcon_sk");
+        // Falcon signature is variable-length, so the enveloped sig is bounded
+        // above by header + mldsa_sig + Falcon MAX, and strictly larger than the
+        // header + mldsa_sig (a non-empty Falcon tail is present).
+        assert!(sig.len() > SUITE_HEADER_LEN + MLDSA_SIG_LEN,
+                   "enveloped hybrid sig must carry a Falcon tail");
+        assert!(sig.len() <= SUITE_HEADER_LEN + MLDSA_SIG_LEN + falcon1024::signature_bytes(),
+                   "enveloped hybrid sig <= header + mldsa_sig + falcon_sig(max)");
+        // The header carries the magic + suite 0x0001.
+        assert_eq!(&pk[..2], &SUITE_MAGIC, "pk magic");
+        assert_eq!(u16::from_le_bytes([pk[2], pk[3]]), SUITE_MLDSA65_FALCON1024, "pk suite id");
     }
 
     // ─── (A) Reference-equivalence: upstream-built artifact verifies via Bloch ─
@@ -393,11 +516,14 @@ mod kat {
         let (mpk, msk) = mldsa65::keypair();
         let (fpk, fsk) = falcon1024::keypair();
 
-        // pk = mldsa_pk(1952) ‖ falcon_pk ; sig = mldsa_sig(3309) ‖ falcon_sig
-        let mut pk = mpk.as_bytes().to_vec();
-        pk.extend_from_slice(fpk.as_bytes());
-        let mut sig = mldsa65::detached_sign(msg, &msk).as_bytes().to_vec();
-        sig.extend_from_slice(falcon1024::detached_sign(msg, &fsk).as_bytes());
+        // pk = mldsa_pk(1952) ‖ falcon_pk ; sig = mldsa_sig(3309) ‖ falcon_sig,
+        // each wrapped in the suite-0x0001 envelope Bloch's verify now expects.
+        let mut pk_body = mpk.as_bytes().to_vec();
+        pk_body.extend_from_slice(fpk.as_bytes());
+        let mut sig_body = mldsa65::detached_sign(msg, &msk).as_bytes().to_vec();
+        sig_body.extend_from_slice(falcon1024::detached_sign(msg, &fsk).as_bytes());
+        let pk = wrap_envelope(SUITE_MLDSA65_FALCON1024, &pk_body);
+        let sig = wrap_envelope(SUITE_MLDSA65_FALCON1024, &sig_body);
 
         assert!(
             verify(&pk, msg, &sig),
@@ -417,8 +543,11 @@ mod kat {
         let (pk, sk) = generate_keypair();
         let sig = sign(&sk, msg).unwrap();
 
-        let (mpk_b, fpk_b) = pk.split_at(MLDSA_PUBKEY_LEN);
-        let (msig_b, fsig_b) = sig.split_at(MLDSA_SIG_LEN);
+        // Strip the 4-byte suite header before splitting at the primitive offsets.
+        let (_pk_suite, pk_body)  = parse_envelope(&pk).expect("pk envelope");
+        let (_sig_suite, sig_body) = parse_envelope(&sig).expect("sig envelope");
+        let (mpk_b, fpk_b) = pk_body.split_at(MLDSA_PUBKEY_LEN);
+        let (msig_b, fsig_b) = sig_body.split_at(MLDSA_SIG_LEN);
 
         // ML-DSA half through the upstream primitive directly.
         let mpk = mldsa65::PublicKey::from_bytes(mpk_b).expect("ML-DSA pk half must parse upstream");
@@ -463,17 +592,19 @@ mod kat {
     #[test]
     fn golden_seed_to_keypair_is_byte_stable() {
         let (pk, sk) = generate_keypair_from_seed(&GOLDEN_SEED).unwrap();
-        // Full hybrid lengths.
-        assert_eq!(pk.len(), MLDSA_PUBKEY_LEN + FALCON_PUBKEY_LEN, "hybrid pk len");
-        assert_eq!(sk.len(), MLDSA_SECRET_LEN + falcon1024::secret_key_bytes(), "hybrid sk len");
-        // Pinned ML-DSA halves (platform-stable golden vector).
+        // Full ENVELOPED hybrid lengths (4-byte suite header + hybrid body).
+        assert_eq!(pk.len(), SUITE_HEADER_LEN + MLDSA_PUBKEY_LEN + FALCON_PUBKEY_LEN, "hybrid pk len");
+        assert_eq!(sk.len(), SUITE_HEADER_LEN + MLDSA_SECRET_LEN + falcon1024::secret_key_bytes(), "hybrid sk len");
+        // Pinned ML-DSA halves — the hash VALUES are unchanged from the pre-envelope
+        // goldens: the ML-DSA body bytes are identical, only shifted by the 4-byte
+        // header, so we slice pk[4..4+1952] / sk[4..4+4032] instead of pk[..1952].
         assert_eq!(
-            hex::encode(Sha3_256::digest(&pk[..MLDSA_PUBKEY_LEN])),
+            hex::encode(Sha3_256::digest(&pk[SUITE_HEADER_LEN..SUITE_HEADER_LEN + MLDSA_PUBKEY_LEN])),
             GOLDEN_MLDSA_PK_HASH,
             "ML-DSA-65 public-key half drifted from the golden vector"
         );
         assert_eq!(
-            hex::encode(Sha3_256::digest(&sk[..MLDSA_SECRET_LEN])),
+            hex::encode(Sha3_256::digest(&sk[SUITE_HEADER_LEN..SUITE_HEADER_LEN + MLDSA_SECRET_LEN])),
             GOLDEN_MLDSA_SK_HASH,
             "ML-DSA-65 secret-key half drifted from the golden vector"
         );
@@ -489,8 +620,9 @@ mod kat {
         let _guard = pqcrypto_internals::with_seeded_rng(&GOLDEN_SEED);
         let sig = sign(&sk, GOLDEN_MSG).unwrap();
         drop(_guard);
+        // Hash VALUE unchanged; slice shifts by the 4-byte header: sig[4..4+3309].
         assert_eq!(
-            hex::encode(Sha3_256::digest(&sig[..MLDSA_SIG_LEN])),
+            hex::encode(Sha3_256::digest(&sig[SUITE_HEADER_LEN..SUITE_HEADER_LEN + MLDSA_SIG_LEN])),
             GOLDEN_MLDSA_SIG_HASH,
             "deterministic ML-DSA-65 signature half drifted from the golden vector"
         );
@@ -502,14 +634,16 @@ mod kat {
         let sig = sign(&sk, GOLDEN_MSG).unwrap();
         assert!(verify(&pk, GOLDEN_MSG, &sig), "fresh hybrid signature must verify");
 
-        // Flip a byte in the ML-DSA half → must fail (AND-combiner).
+        // Flip the FIRST ML-DSA-body byte (offset shifted past the 4-byte header,
+        // sig[0]→sig[4]) → must fail (AND-combiner).
         let mut t1 = sig.clone();
-        t1[0] ^= 0x01;
+        t1[SUITE_HEADER_LEN] ^= 0x01;
         assert!(!verify(&pk, GOLDEN_MSG, &t1), "tampered ML-DSA half must fail");
 
-        // Flip a byte in the Falcon half → must fail (AND-combiner).
+        // Flip a byte in the Falcon half (MLDSA_SIG_LEN+1 → 4+MLDSA_SIG_LEN+1) →
+        // must fail (AND-combiner).
         let mut t2 = sig.clone();
-        let flip = MLDSA_SIG_LEN + 1;
+        let flip = SUITE_HEADER_LEN + MLDSA_SIG_LEN + 1;
         t2[flip] ^= 0x01;
         assert!(!verify(&pk, GOLDEN_MSG, &t2), "tampered Falcon half must fail");
 
@@ -522,13 +656,42 @@ mod kat {
         over.push(0x00);
         assert!(!verify(&pk, GOLDEN_MSG, &over), "oversized sig must fail");
 
-        // Tampered public key (each half) → false.
+        // Tampered public key: ML-DSA body byte (pk[4]) and Falcon body byte
+        // (pk[4+1952+1]) → false.
         let mut pk_m = pk.clone();
-        pk_m[0] ^= 0x01;
+        pk_m[SUITE_HEADER_LEN] ^= 0x01;
         assert!(!verify(&pk_m, GOLDEN_MSG, &sig), "tampered ML-DSA pubkey must fail");
         let mut pk_f = pk.clone();
-        pk_f[MLDSA_PUBKEY_LEN + 1] ^= 0x01;
+        pk_f[SUITE_HEADER_LEN + MLDSA_PUBKEY_LEN + 1] ^= 0x01;
         assert!(!verify(&pk_f, GOLDEN_MSG, &sig), "tampered Falcon pubkey must fail");
+
+        // ── NEW envelope negative cases (design §4.2) ─────────────────────────
+        // Bad magic on the signature → parse fail ⇒ false.
+        let mut bad_magic = sig.clone();
+        bad_magic[0] ^= 0x01;
+        assert!(!verify(&pk, GOLDEN_MSG, &bad_magic), "bad-magic sig must fail");
+        // Bad magic on the pubkey → false.
+        let mut bad_magic_pk = pk.clone();
+        bad_magic_pk[1] ^= 0x01;
+        assert!(!verify(&bad_magic_pk, GOLDEN_MSG, &sig), "bad-magic pk must fail");
+        // Unknown suite (0xFFFF) on BOTH pk and sig so the suites match but the
+        // dispatch arm is `_ => false`.
+        let mut us_pk = pk.clone();  us_pk[2] = 0xFF;  us_pk[3] = 0xFF;
+        let mut us_sig = sig.clone(); us_sig[2] = 0xFF; us_sig[3] = 0xFF;
+        assert!(!verify(&us_pk, GOLDEN_MSG, &us_sig), "unknown-suite must fail");
+        // Reserved suite 0x0000 on both → false.
+        let mut z_pk = pk.clone();  z_pk[2] = 0x00;  z_pk[3] = 0x00;
+        let mut z_sig = sig.clone(); z_sig[2] = 0x00; z_sig[3] = 0x00;
+        assert!(!verify(&z_pk, GOLDEN_MSG, &z_sig), "reserved suite 0x0000 must fail");
+        // Suite mismatch: valid 0x0001 pk vs a sig relabelled 0x0002 → false.
+        let mut mism_sig = sig.clone(); mism_sig[2] = 0x02; mism_sig[3] = 0x00;
+        assert!(!verify(&pk, GOLDEN_MSG, &mism_sig), "pk/sig suite mismatch must fail");
+        // Header-only (len == 4, empty body) on sig and on pk → false.
+        assert!(!verify(&pk, GOLDEN_MSG, &sig[..SUITE_HEADER_LEN]), "header-only sig must fail");
+        assert!(!verify(&pk[..SUITE_HEADER_LEN], GOLDEN_MSG, &sig), "header-only pk must fail");
+        // Shorter-than-header (len < 4) on both → false (parse_envelope None).
+        assert!(!verify(&pk[..2], GOLDEN_MSG, &sig), "len-2 pk must fail");
+        assert!(!verify(&pk, GOLDEN_MSG, &sig[..3]), "len-3 sig must fail");
     }
 
     // ─── (B') Hedged-signing regression (roadmap §2.2) ────────────────────────
@@ -543,6 +706,44 @@ mod kat {
         assert_ne!(s1, s2, "hybrid signing must be hedged (randomized), not deterministic");
         assert!(verify(&pk, GOLDEN_MSG, &s1));
         assert!(verify(&pk, GOLDEN_MSG, &s2));
+    }
+
+    // ─── Suite 0x0002 (ML-DSA-65 only) round-trip + suite isolation ───────────
+    // Concrete proof that Falcon is removable in principle (design §2.5): build a
+    // SUITE_MLDSA65_ONLY keypair from the upstream ML-DSA primitive, sign+verify
+    // through the enveloped path, and confirm suite isolation.
+    #[test]
+    fn suite_mldsa65_only_roundtrips_and_is_suite_isolated() {
+        let (mpk, msk) = mldsa65::keypair();
+        let pk_env = wrap_envelope(SUITE_MLDSA65_ONLY, mpk.as_bytes());
+        let sk_env = wrap_envelope(SUITE_MLDSA65_ONLY, msk.as_bytes());
+        assert_eq!(pk_env.len(), SUITE_HEADER_LEN + MLDSA_PUBKEY_LEN, "0x0002 pk len");
+
+        let msg = b"mldsa-only-suite";
+        let sig = sign(&sk_env, msg).expect("mldsa-only sign");
+        assert_eq!(sig.len(), SUITE_HEADER_LEN + MLDSA_SIG_LEN, "0x0002 sig len");
+        assert!(verify(&pk_env, msg, &sig), "mldsa-only sig must verify");
+        assert!(!verify(&pk_env, b"other", &sig), "wrong message must fail");
+
+        // A 0x0001 (hybrid) pk cannot verify a 0x0002 sig — suite mismatch ⇒ false.
+        let (hpk, _hsk) = generate_keypair();
+        assert!(!verify(&hpk, msg, &sig), "hybrid pk must reject mldsa-only sig (suite mismatch)");
+    }
+
+    // ─── Addresses commit to the suite (design §2.4) ──────────────────────────
+    // The address hashes the ENVELOPED pk, so a 0x0001 key and a 0x0002 key over
+    // the SAME ML-DSA body hash to different addresses.
+    #[test]
+    fn addresses_commit_to_suite() {
+        let (mpk, _msk) = mldsa65::keypair();
+        let (fpk, _fsk) = falcon1024::keypair();
+        let mut hybrid_body = mpk.as_bytes().to_vec();
+        hybrid_body.extend_from_slice(fpk.as_bytes());
+        let pk_0001 = wrap_envelope(SUITE_MLDSA65_FALCON1024, &hybrid_body);
+        let pk_0002 = wrap_envelope(SUITE_MLDSA65_ONLY, mpk.as_bytes());
+        let a1 = address_from_pubkey(&pk_0001, false);
+        let a2 = address_from_pubkey(&pk_0002, false);
+        assert_ne!(a1, a2, "different suites over the same ML-DSA key must hash to different addresses");
     }
 
     // ─── (C) No-panic fuzz: signature parse+verify path ───────────────────────
@@ -570,9 +771,27 @@ mod kat {
         let (good_pk, sk) = generate_keypair();
         let good_sig = sign(&sk, b"m").unwrap();
 
-        // Structured seed cases (boundary lengths around the split offsets).
+        // Structured seed cases (boundary lengths around the split offsets AND
+        // the 4-byte envelope header — design §4.3 invariant 2).
+        let hdr = |suite: u16, body_len: usize| {
+            let mut v = vec![0xB1u8, 0x0C];
+            v.extend_from_slice(&suite.to_le_bytes());
+            v.extend(std::iter::repeat(0u8).take(body_len));
+            v
+        };
         let structured: Vec<(Vec<u8>, Vec<u8>)> = vec![
             (vec![], vec![]),
+            // Envelope-length boundaries: len 0,1,2,3,4.
+            (vec![], vec![0xB1]),
+            (vec![0xB1], vec![0xB1, 0x0C]),
+            (vec![0xB1, 0x0C], vec![0xB1, 0x0C, 0x01]),
+            (vec![0xB1, 0x0C, 0x01], vec![0xB1, 0x0C, 0x01, 0x00]), // len 4 header-only
+            // Good header + garbage body, various suites incl. reserved 0x0000/0xFFFF.
+            (hdr(SUITE_MLDSA65_FALCON1024, MLDSA_PUBKEY_LEN), hdr(SUITE_MLDSA65_FALCON1024, MLDSA_SIG_LEN)),
+            (hdr(SUITE_MLDSA65_ONLY, MLDSA_PUBKEY_LEN), hdr(SUITE_MLDSA65_ONLY, MLDSA_SIG_LEN)),
+            (hdr(0x0000, MLDSA_PUBKEY_LEN), hdr(0x0000, MLDSA_SIG_LEN)),
+            (hdr(0xFFFF, MLDSA_PUBKEY_LEN), hdr(0xFFFF, MLDSA_SIG_LEN)),
+            // Legacy raw (no header) blobs — must now parse-fail ⇒ false, not panic.
             (vec![0u8; MLDSA_PUBKEY_LEN], vec![0u8; MLDSA_SIG_LEN]),
             (vec![0u8; MLDSA_PUBKEY_LEN + 1], vec![0u8; MLDSA_SIG_LEN + 1]),
             (good_pk.clone(), good_sig.clone()),
