@@ -126,7 +126,11 @@ fn falcon1024_malformed_inputs_return_false_never_panic() {
         "all-zero pk must reject"
     );
 
-    // The raw primitive's parsers must also return Err, never panic.
+    // The raw pk parser (fixed length) must Err on empty input, never panic.
     assert!(falcon1024::PublicKey::from_bytes(&[]).is_err());
-    assert!(falcon1024::DetachedSignature::from_bytes(&[]).is_err());
+    // Falcon-1024 detached signatures are VARIABLE-length, so from_bytes(&[])
+    // constructs Ok (an empty signature) rather than erroring; it just never
+    // verifies. The safety property that matters — empty sig ⇒ verify false — is
+    // asserted above (falcon::verify(&pk, msg, &[])). Either way it must not panic.
+    let _ = falcon1024::DetachedSignature::from_bytes(&[]);
 }
