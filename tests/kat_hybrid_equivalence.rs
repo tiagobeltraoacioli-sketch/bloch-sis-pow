@@ -104,13 +104,8 @@ fn frozen_tuple_is_internally_consistent_pending_dev_a() {
     let m = MAINNET_ADDRESS.strip_prefix("bloch1q").expect("mainnet prefix bloch1q");
     let t = TESTNET_ADDRESS.strip_prefix("bloch1t").expect("testnet prefix bloch1t");
     assert_eq!(m, t, "mainnet/testnet golden addresses must share the same body");
-
-    // Explicit pending marker so a green run is never misread as equivalence-done.
-    assert!(
-        cfg!(not(feature = "dev_a_frozen")),
-        "dev_a_frozen is enabled: the gated equivalence assertions below now run — \
-         if this fires, remove this marker line"
-    );
+    // (pending-Dev-A tripwire removed: the gated equivalence asserts below now
+    // run green against Dev-A's published canonical tuple, verified on-host.)
 }
 
 // ── Gated: the real assert-equal-to-Dev-A's-tuple checks. Inert until the
