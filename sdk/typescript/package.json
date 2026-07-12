@@ -1,0 +1,43 @@
+{
+  "name": "@bloch/sdk",
+  "version": "0.0.1",
+  "description": "Community TypeScript client SDK for the Bloch (Bloch-SIS-PoW) JSON-RPC surface. SCAFFOLD, pre-production, unaudited.",
+  "license": "MIT OR Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md",
+    "LICENSE-MIT",
+    "LICENSE-APACHE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "tsc -p tsconfig.test.json && node --test \"dist-test/test/**/*.test.js\"",
+    "clean": "rm -rf dist dist-test"
+  },
+  "keywords": [
+    "bloch",
+    "blockchain",
+    "json-rpc",
+    "utxo",
+    "post-quantum",
+    "sdk"
+  ],
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "typescript": "^5.4.0"
+  }
+}
