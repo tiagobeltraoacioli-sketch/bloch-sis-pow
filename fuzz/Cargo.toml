@@ -14,6 +14,10 @@ libfuzzer-sys = "0.4"
 bloch = { path = ".." }
 bloch-sis-pow = { path = "../crates/bloch-sis-pow" }
 coherence-core = { path = "../crates/coherence-core" }
+# P1 (roadmap §1b): the netmsg / handshake decode targets mirror the node's
+# gossipsub/transport ingest, which decodes with bincode 2 (serde). Match the
+# node's version so the wire format under fuzz is identical.
+bincode = { version = "2", features = ["serde"] }
 
 # Vendored PQ fork (same as the node) — [patch] applies from the build root.
 [patch.crates-io]
@@ -46,5 +50,25 @@ doc = false
 [[bin]]
 name = "merkle_path"
 path = "fuzz_targets/merkle_path.rs"
+test = false
+doc = false
+
+# ── P1 (roadmap §1b): no-panic targets on the untrusted P2P ingest paths. ──
+
+[[bin]]
+name = "netmsg_decode"
+path = "fuzz_targets/netmsg_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "handshake_decode"
+path = "fuzz_targets/handshake_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "mempool_ops"
+path = "fuzz_targets/mempool_ops.rs"
 test = false
 doc = false
