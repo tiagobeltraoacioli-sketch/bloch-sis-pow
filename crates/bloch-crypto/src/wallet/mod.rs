@@ -176,8 +176,11 @@ impl Wallet {
         let pubkey = &self.keypair.public;
         let mut signatures = Vec::with_capacity(tx.inputs.len());
 
+        // Chain-id (Roadmap #8) derived from the wallet's own network — the
+        // signer and the node validator must fold the SAME domain into the sighash.
+        let chain_id = crate::core::ChainId::for_network(self.network);
         for i in 0..tx.inputs.len() {
-            let sighash = tx.sighash(i);
+            let sighash = tx.sighash(i, chain_id);
             let sig = crypto::sign(&self.keypair.secret, &sighash)
                 .map_err(|e| WalletError::Crypto(e.to_string()))?;
             // FIX: consensus verification parses script_sig with
@@ -285,7 +288,7 @@ mod tests {
         let (sig, pk) = Transaction::parse_script_sig(&signed.inputs[0].script_sig)
             .expect("script_sig must be parseable (length-prefixed)");
         assert!(
-            crypto::verify(&pk, &signed.sighash(0), &sig),
+            crypto::verify(&pk, &signed.sighash(0, crate::core::ChainId::Testnet), &sig),
             "the signature the consensus verifier extracts must verify"
         );
     }
@@ -580,9 +583,16 @@ impl TxBuilder {
 
         let mut tx = Transaction { version: 1, inputs, outputs, locktime: 0 };
 
+        // Chain-id (Roadmap #8) from the keypair's address prefix (mainnet vs
+        // testnet) — must match the node validator's node_chain_id().
+        let chain_id = if keypair.address.starts_with(TESTNET_PREFIX) {
+            crate::core::ChainId::Testnet
+        } else {
+            crate::core::ChainId::Mainnet
+        };
         // Sign each input
         for i in 0..tx.inputs.len() {
-            let sighash = tx.sighash(i);
+            let sighash = tx.sighash(i, chain_id);
             let sig     = keypair.sign(&sighash)?;
             tx.inputs[i].script_sig = Transaction::build_script_sig(&sig, &keypair.public_key);
         }

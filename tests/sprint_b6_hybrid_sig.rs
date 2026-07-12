@@ -25,7 +25,7 @@ fn hybrid_signed_input_verifies_end_to_end() {
     let mut tx = one_input_tx();
 
     // Sign the input's sighash with the hybrid key, attach via the wire format.
-    let sighash = tx.sighash(0);
+    let sighash = tx.sighash(0, bloch::core::ChainId::Mainnet);
     let sig = crypto::sign(&sk, &sighash).expect("hybrid sign");
     tx.inputs[0].script_sig = Transaction::build_script_sig(&sig, &pk);
 

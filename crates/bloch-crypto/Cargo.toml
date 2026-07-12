@@ -31,6 +31,13 @@ node = ["dep:reqwest", "dep:async-trait"]
 # this crate — no blst / secp256k1 / tokio / rocksdb / libp2p anywhere in its
 # tree. Off by default; combine with `node` only if WalletClient is wanted.
 wallet-cli = []
+# `mainnet` is an EMPTY marker feature (like `wallet-cli`) with NO deps. It exists
+# only so the release CI guard `mainnet_release_guard::canonical_k_activation_height_is_set_for_mainnet`
+# (core/mod.rs) compiles and runs. Ordinary `--features node` builds do NOT enable
+# it, so they keep the CANONICAL_K_ACTIVATION_HEIGHT placeholder and stay green;
+# the guard bites only when a mainnet artifact is cut:
+#   cargo test -p bloch-crypto --features mainnet canonical_k_activation_height_is_set_for_mainnet
+mainnet = []
 
 [dependencies]
 # Post-quantum signatures (hybrid ML-DSA-65 ‖ Falcon-1024) + seeded keygen.
