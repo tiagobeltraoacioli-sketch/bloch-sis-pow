@@ -197,33 +197,25 @@ pub const GENESIS_BITS:      u32   = 0x2100ffff;
 /// width (k = 4, as today); blocks with `height >=` this value are validated
 /// at the canonical width (k = 8).
 ///
-/// The current value (1_000_000) is a clearly-future placeholder chosen so an
-/// accidentally-deployed binary behaves identically to today on the existing
-/// chain (tip ≪ 1_000_000). Before the real activation the founder MUST:
+/// Before mainnet the founder MUST set this to a concrete near-genesis height:
+/// `mainnet_tip_at_release + margin`, generous enough for EVERY MINING NODE to
+/// upgrade before the chain reaches it (an un-upgraded miner producing a k=4-only
+/// block at/after H has that block rejected by upgraded nodes). DO NOT set it to
+/// `u64::MAX` (never activates) and DO NOT set it at or below the tip at release
+/// (historical/next blocks would fail k=8 validation → forced chain reset).
 ///
-///   1. Set this to `current chain tip height + a safety margin` — the margin
-///      must be generous enough for EVERY MINING NODE to upgrade to a binary
-///      carrying the final value BEFORE the chain reaches it (an un-upgraded
-///      miner producing a k=4-only block at/after H would have that block
-///      rejected by upgraded nodes).
-///   2. Ship that binary to all mining nodes before height H is reached.
-///
-/// DO NOT set this to `u64::MAX` (never activates) and DO NOT set it at or
-/// below the current tip (historical/next blocks would fail k=8 validation
-/// → forced chain reset).
-///
-/// ── ADR (activation-height ceremony, design §3.1) ────────────────────────────
-/// Decision: this constant STAYS at the 1_000_000 placeholder in-tree. There is
-/// no live mainnet and therefore no real `chain tip` to add a margin to yet, so
-/// committing a "concrete" height now would be fiction. The concrete value is
-/// set at the genesis-freeze ceremony as `mainnet_tip_at_release + margin`, where
-/// at the 30 s `TARGET_BLOCK_TIME` a 7-day upgrade window ≈ 20_160 blocks and a
-/// 14-day window ≈ 40_320 blocks (e.g. `tip + 20_160`). The ceremony operator
-/// edits THIS line, records the chosen height + ceremony date here, and the
-/// `mainnet`-feature guard test below FAILS the build until it is moved off the
-/// placeholder. Status: NOT set (placeholder); ceremony date: TBD at freeze.
-/// This is a plan, not a promise — no security property is claimed (unaudited).
-pub const CANONICAL_K_ACTIVATION_HEIGHT: u64 = 1_000_000;
+/// ── ADR (activation-height, design §3.1; decided 2026-07-12, PRE-FREEZE) ──────
+/// Decision: set to 40_320. Rationale: the mainnet genesis ships this bundle, so
+/// the tip at release is 0; at the 30 s `TARGET_BLOCK_TIME`, 40_320 blocks ≈ a
+/// 14-day window (a 7-day window ≈ 20_160). Blocks 0..40_320 validate at the
+/// testnet k=4 residual width, then the canonical k=8 width activates — a
+/// generous ramp for every mining node to upgrade. This is the founder's
+/// PRE-FREEZE value; the genesis-freeze ceremony operator RE-CONFIRMS it against
+/// the real tip at release and records the ceremony date here before genesis is
+/// frozen. Ceremony date: TBD at freeze. Unaudited; the coin has no value; no
+/// security property is claimed. Off the placeholder, so `mainnet_release_guard`
+/// now passes.
+pub const CANONICAL_K_ACTIVATION_HEIGHT: u64 = 40_320;
 
 /// The clearly-future placeholder value. Kept as a named constant so the
 /// `mainnet`-feature CI guard below can assert the real height has been moved
