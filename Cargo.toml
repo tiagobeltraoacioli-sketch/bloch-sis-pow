@@ -47,6 +47,10 @@ path = "src/lib.rs"
 #   sev-snp — AMD SEV-SNP confidential VM (Linux). Wires the virtee/sev crate.
 #   mobile  — device-TEE verification (Android Key Attestation / iOS App Attest).
 default = ["node"]
+# Test-only: enables Dev-C's post-fork equivalence KAT (kat_hybrid_equivalence)
+# that asserts-equal to this bundle's published canonical (address/txid/sighash)
+# tuple. Empty marker feature; off by default.
+dev_a_frozen = []
 # `node` gates the heavy full-node modules (storage/consensus/mining/network/
 # rpc/…) and their exclusive deps (rocksdb, libp2p, axum, …) so the pure
 # wallet/crypto subset cross-compiles for mobile with `default-features = false`.
