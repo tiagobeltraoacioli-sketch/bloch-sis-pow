@@ -1307,7 +1307,7 @@ fn validate_tx_for_mempool(tx: &Transaction, store: &Arc<Storage>, current_heigh
             .ok_or_else(|| format!("malformed script_sig at input {}", i))?;
         let pk_hash = Sha3_256::digest(&pk)[..20].to_vec();
         if pk_hash != utxo.script_pubkey { return Err(format!("pubkey mismatch at input {}", i)); }
-        if !crate::crypto::verify(&pk, &tx.sighash(i), &sig) {
+        if !crate::crypto::verify(&pk, &tx.sighash(i, crate::core::node_chain_id()), &sig) {
             return Err(format!("invalid signature at input {}", i));
         }
     }

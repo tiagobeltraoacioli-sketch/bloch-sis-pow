@@ -15,6 +15,76 @@ pub mod tokenomics_v2;
 pub const MAINNET_PREFIX:        &str  = "bloch1q";
 pub const TESTNET_PREFIX:        &str  = "bloch1t";
 pub const NETWORK_MAGIC:         u32   = 0x424C5349; // "BLSI" — Bloch-SIS (own P2P network)
+
+// ── Sighash chain-ID (replay domain separation, Roadmap #8) ──────────────────
+//
+// The v1 sighash folded NO chain/network binding into the signed bytes, so a
+// signed tx was byte-for-byte replayable across any two Bloch chains whose
+// outpoints coincide (testnet↔mainnet and every fork). v2 folds a fixed domain
+// constant AND a 4-byte chain-id into the front of the signed preimage. This is
+// a HARD FORK: every prior signature becomes invalid. Safe ONLY because there is
+// no live mainnet and no value today. NO security property is claimed (unaudited).
+//
+//   preimage = SIGHASH_DOMAIN(16) ‖ [SIGHASH_VERSION](1) ‖ chain_id.to_le_bytes()(4)
+//              ‖ bincode(stripped_tx)        // 21-byte fixed prefix, then the v1 body
+//   sighash  = SHA3-256(preimage)
+pub const SIGHASH_DOMAIN:  [u8; 16] = *b"BLOCH-SIGHASH-v2";
+pub const SIGHASH_VERSION: u8       = 0x02; // bumps the implicit v1 (no-domain) scheme
+
+/// Chain-ID registry (u32, serialized LITTLE-ENDIAN). 0xB10C = "Bloch" mnemonic.
+/// An EXPLICIT consensus input derived from the node's network — NEVER from the
+/// transaction (an attacker controls the tx; they must not control the domain)
+/// and NEVER from a compile-time flag (a mis-built binary would sign for the
+/// wrong chain). Future forks allocate a NEW discriminant; never reuse one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u32)]
+pub enum ChainId {
+    Mainnet = 0xB10C_0001,
+    Testnet = 0xB10C_0002,
+}
+
+impl ChainId {
+    #[inline] pub const fn to_u32(self) -> u32 { self as u32 }
+    #[inline] pub fn to_le_bytes(self) -> [u8; 4] { (self as u32).to_le_bytes() }
+
+    /// Bridge the existing `address::Network` enum to a chain-id (design §1.4).
+    pub const fn for_network(net: crate::address::Network) -> ChainId {
+        match net {
+            crate::address::Network::Mainnet => ChainId::Mainnet,
+            crate::address::Network::Testnet => ChainId::Testnet,
+        }
+    }
+}
+
+// Node-level SINGLE SOURCE OF TRUTH for the chain-id used by consensus
+// validation. The miner and validator MUST agree (design §4.3 invariant 6), so
+// both read this one value. Set ONCE at node startup from the runtime network
+// selection (e.g. `--testnet`); it is NOT a compile-time flag and NOT derived
+// from any transaction. Defaults to Mainnet if never set.
+//
+// DEFERRED WIRING (integration owner): the node binary MUST call
+// `set_node_chain_id(ChainId::for_network(net))` at startup and assert it
+// matches the genesis being validated. Until then the node defaults to Mainnet;
+// a testnet node MUST wire this or its validators will use the wrong domain.
+static NODE_CHAIN_ID: std::sync::OnceLock<ChainId> = std::sync::OnceLock::new();
+
+/// Set the process-wide node chain-id (idempotent for the same value). Returns
+/// `Err(existing)` if already set to a DIFFERENT value — guards double-init.
+pub fn set_node_chain_id(id: ChainId) -> Result<(), ChainId> {
+    match NODE_CHAIN_ID.set(id) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            let cur = *NODE_CHAIN_ID.get().expect("OnceLock set");
+            if cur == id { Ok(()) } else { Err(cur) }
+        }
+    }
+}
+
+/// The node-level chain-id read by every consensus sighash call site. Defaults
+/// to Mainnet until `set_node_chain_id` is called at startup.
+pub fn node_chain_id() -> ChainId {
+    *NODE_CHAIN_ID.get().unwrap_or(&ChainId::Mainnet)
+}
 pub const GHOSTDAG_K:            usize = 10;
 // V2 tokenomics emission constants live in `tokenomics_v2` module:
 //   - INITIAL_BLOCK_REWARD_SAT (1905 BLOCH) — replaces V1 BLOCK_REWARD
@@ -88,9 +158,12 @@ pub const PRUNING_DEPTH:         u64   = 10_000;     // block bodies pruned belo
 // secret = 4032 + 2305; signature = 3309 + ~1280 (Falcon is variable, so
 // SIG_SIZE is an upper estimate used only for fee sizing — the wire format is
 // length-prefixed, see Transaction::build_script_sig).
-pub const PUBKEY_SIZE:  usize = 1952 + 1793; // 3745
-pub const PRIVKEY_SIZE: usize = 4032 + 2305; // 6337
-pub const SIG_SIZE:     usize = 3309 + 1462; // 4771 (upper bound; Falcon max 1462)
+// Sizes include the 4-byte crypto-agility suite header (crypto::SUITE_HEADER_LEN)
+// that now wraps every enveloped pk / sk / sig. Used for fee sizing (SIG upper
+// bound) and the transport identity-key length gate.
+pub const PUBKEY_SIZE:  usize = 4 + 1952 + 1793; // 3749 (hdr + hybrid pk)
+pub const PRIVKEY_SIZE: usize = 4 + 4032 + 2305; // 6341 (hdr + hybrid sk)
+pub const SIG_SIZE:     usize = 4 + 3309 + 1462; // 4775 (hdr + upper bound; Falcon max 1462)
 
 // Genesis block — V2 mainnet genesis re-mined 2026-05-01 (Sprint 2.1.D C8b),
 // identical on every node. Tokenomics V2 (TOKENOMICS_V2.md, ADR-028).
@@ -138,7 +211,26 @@ pub const GENESIS_BITS:      u32   = 0x2100ffff;
 /// DO NOT set this to `u64::MAX` (never activates) and DO NOT set it at or
 /// below the current tip (historical/next blocks would fail k=8 validation
 /// → forced chain reset).
+///
+/// ── ADR (activation-height ceremony, design §3.1) ────────────────────────────
+/// Decision: this constant STAYS at the 1_000_000 placeholder in-tree. There is
+/// no live mainnet and therefore no real `chain tip` to add a margin to yet, so
+/// committing a "concrete" height now would be fiction. The concrete value is
+/// set at the genesis-freeze ceremony as `mainnet_tip_at_release + margin`, where
+/// at the 30 s `TARGET_BLOCK_TIME` a 7-day upgrade window ≈ 20_160 blocks and a
+/// 14-day window ≈ 40_320 blocks (e.g. `tip + 20_160`). The ceremony operator
+/// edits THIS line, records the chosen height + ceremony date here, and the
+/// `mainnet`-feature guard test below FAILS the build until it is moved off the
+/// placeholder. Status: NOT set (placeholder); ceremony date: TBD at freeze.
+/// This is a plan, not a promise — no security property is claimed (unaudited).
 pub const CANONICAL_K_ACTIVATION_HEIGHT: u64 = 1_000_000;
+
+/// The clearly-future placeholder value. Kept as a named constant so the
+/// `mainnet`-feature CI guard below can assert the real height has been moved
+/// off it. There is NO live mainnet, so `CANONICAL_K_ACTIVATION_HEIGHT` above
+/// deliberately STAYS at this placeholder for now; the guard bites only when a
+/// mainnet artifact is cut (see the `mainnet_release_guard` test).
+pub const PLACEHOLDER_ACTIVATION_HEIGHT: u64 = 1_000_000;
 
 /// Consensus selector for the PoW residual-gate width at a given BLOCK height.
 ///
@@ -866,8 +958,15 @@ impl Transaction {
             && self.inputs[0].prev_index == u32::MAX
     }
 
-    /// Sighash for input at `index`: SHA3-256 of tx serialised without script_sigs
-    pub fn sighash(&self, input_index: usize) -> [u8; 32] {
+    /// Sighash (v2) for input at `index`, bound to `chain_id`.
+    ///
+    /// `chain_id` is an EXPLICIT consensus input threaded from the node's network
+    /// (`ChainId::for_network` / `node_chain_id()`), never a compile-time flag and
+    /// never taken from the transaction. Folding it into the preimage prevents
+    /// cross-fork / testnet↔mainnet replay: the same signature bytes verify to a
+    /// different 32-byte digest on another chain, so ML-DSA and Falcon both fail
+    /// (design §1). This changes the signed bytes of every tx — a hard fork.
+    pub fn sighash(&self, input_index: usize, chain_id: ChainId) -> [u8; 32] {
         let mut stripped = self.clone();
         for (i, inp) in stripped.inputs.iter_mut().enumerate() {
             inp.script_sig = if i == input_index {
@@ -885,9 +984,19 @@ impl Transaction {
         // make the sighash a FIXED constant (replayable signatures) — encoding an
         // owned struct into an in-memory Vec cannot fail, so fail loud if it ever
         // does rather than degrade security.
-        let d = bincode::serde::encode_to_vec(&stripped, bincode::config::standard())
+        //
+        // The v1 body (the stripped-tx bincode blob, incl. the per-input marker)
+        // is unchanged; v2 only prepends the fixed 21-byte domain+version+chain-id
+        // prefix. All prefix fields are fixed-length and only the trailing bincode
+        // blob is variable, so simple concatenation is unambiguous.
+        let body = bincode::serde::encode_to_vec(&stripped, bincode::config::standard())
             .expect("Transaction is always serializable into an in-memory buffer");
-        Sha3_256::digest(&d).into()
+        let mut h = Sha3_256::new();
+        h.update(SIGHASH_DOMAIN);           // 16 bytes (fixed)
+        h.update([SIGHASH_VERSION]);        //  1 byte  (fixed)
+        h.update(chain_id.to_le_bytes());   //  4 bytes (fixed)
+        h.update(&body);                    //  variable (v1 body, unchanged)
+        h.finalize().into()
     }
 
     pub fn merkle_root(txs: &[Transaction]) -> MerkleRoot {
@@ -1767,5 +1876,83 @@ mod sf1_tests {
              start_nonce = {n} (nonce = {}, found at attempt {} of 4096)",
             r.nonce, r.attempts
         );
+    }
+}
+
+// ── Roadmap #8 §1 — chain-id sighash replay regression ───────────────────────
+#[cfg(test)]
+mod chain_id_tests {
+    use super::*;
+
+    fn two_input_tx() -> Transaction {
+        Transaction {
+            version: 1,
+            inputs: vec![
+                TxInput { prev_txid: [3u8; 32], prev_index: 0, script_sig: vec![], sequence: 0xffff_ffff },
+                TxInput { prev_txid: [4u8; 32], prev_index: 1, script_sig: vec![], sequence: 0xffff_ffff },
+            ],
+            outputs: vec![TxOutput { value: 42, script_pubkey: vec![9u8; 20] }],
+            locktime: 0,
+        }
+    }
+
+    #[test]
+    fn chain_id_registry_values() {
+        assert_eq!(ChainId::Mainnet.to_u32(), 0xB10C_0001);
+        assert_eq!(ChainId::Testnet.to_u32(), 0xB10C_0002);
+        assert_eq!(ChainId::Mainnet.to_le_bytes(), [0x01, 0x00, 0x0C, 0xB1]);
+        assert_eq!(ChainId::for_network(crate::address::Network::Mainnet), ChainId::Mainnet);
+        assert_eq!(ChainId::for_network(crate::address::Network::Testnet), ChainId::Testnet);
+    }
+
+    #[test]
+    fn sighash_is_domain_and_chain_separated() {
+        let tx = two_input_tx();
+        // Distinct per chain-id.
+        assert_ne!(tx.sighash(0, ChainId::Mainnet), tx.sighash(0, ChainId::Testnet),
+                   "mainnet and testnet must sign different digests");
+        // Still distinct per input index (v1 property preserved).
+        assert_ne!(tx.sighash(0, ChainId::Mainnet), tx.sighash(1, ChainId::Mainnet));
+    }
+
+    /// The core invariant (design §4.3.4): a signature valid under Mainnet MUST
+    /// be rejected when verified under Testnet — cross-chain replay ⇒ false.
+    #[test]
+    fn cross_chain_id_replay_is_rejected() {
+        let tx = two_input_tx();
+        let (pk, sk) = crate::crypto::generate_keypair();
+
+        let h_main = tx.sighash(0, ChainId::Mainnet);
+        let sig = crate::crypto::sign(&sk, &h_main).unwrap();
+
+        // Same chain: accepts.
+        assert!(crate::crypto::verify(&pk, &h_main, &sig),
+                "a correctly chain-id'd signature must verify");
+        // Replay onto testnet: the verifier recomputes with the Testnet domain →
+        // a different digest → both ML-DSA and Falcon fail.
+        let h_test = tx.sighash(0, ChainId::Testnet);
+        assert!(!crate::crypto::verify(&pk, &h_test, &sig),
+                "cross-chain-id replay MUST be rejected");
+    }
+}
+
+// ── Roadmap #8 §3 — mainnet activation-height CI guard ───────────────────────
+// Only compiles under the `mainnet` marker feature (which must be declared in
+// crates/bloch-crypto/Cargo.toml — see the deferred note in the report). Default
+// `--features node` builds do NOT include this test, so they keep the placeholder
+// and stay green; the guard bites exactly when a mainnet release is cut.
+#[cfg(all(test, feature = "mainnet"))]
+mod mainnet_release_guard {
+    use super::*;
+
+    #[test]
+    fn canonical_k_activation_height_is_set_for_mainnet() {
+        assert_ne!(CANONICAL_K_ACTIVATION_HEIGHT, PLACEHOLDER_ACTIVATION_HEIGHT,
+            "P0.5: CANONICAL_K_ACTIVATION_HEIGHT is still the 1_000_000 placeholder — set it \
+             to (mainnet tip + upgrade margin) before building for mainnet");
+        assert_ne!(CANONICAL_K_ACTIVATION_HEIGHT, u64::MAX,
+            "activation height must not be u64::MAX (soft fork would never activate)");
+        assert!(CANONICAL_K_ACTIVATION_HEIGHT < 10_000_000,
+            "activation height implausibly large — likely an un-set / accidental value");
     }
 }
