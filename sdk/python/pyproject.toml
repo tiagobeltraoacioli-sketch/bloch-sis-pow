@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "blochclient"
+version = "0.6.0"
+description = "Community, generated Python client for the Bloch (bloch-sis) JSON-RPC API. SCAFFOLD / unaudited / pre-production."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT OR Apache-2.0" }
+authors = [{ name = "Bloch community contributors" }]
+keywords = ["bloch", "blockdag", "json-rpc", "blockchain", "sdk"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Typing :: Typed",
+]
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["blochclient*"]
+
+[tool.setuptools.package-data]
+blochclient = ["py.typed"]
