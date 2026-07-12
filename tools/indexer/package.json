@@ -1,0 +1,25 @@
+{
+  "name": "bloch-reorg-safe-indexer",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Reference reorg-safe address/UTXO/history indexer for Bloch. SCAFFOLD, unaudited, pre-production. Testnet-only reference.",
+  "license": "MIT OR Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "bin": {
+    "bloch-indexer": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "start": "node dist/index.js",
+    "dev": "tsc && node dist/index.js",
+    "selftest": "tsc && node dist/selftest.js"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "@types/node": "^20.11.0"
+  }
+}
