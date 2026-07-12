@@ -1,0 +1,203 @@
+<!doctype html>
+<!--
+  Bloch Tiny Block Explorer — reference app
+  =========================================
+  STATUS: reference, UNTESTED against a live node. Self-contained; no build step.
+          Open in a browser and point it at a Bloch node's JSON-RPC.
+
+  HONESTY RAILS (binding): Building on Bloch today is EXPERIMENTAL.
+    - Unaudited mainnet-beta; relaxed PoW (k=4) => work is TRIVIALLY FORGEABLE;
+      small, 51%-attackable network. No security is claimed today.
+    - Bloch is OWNERLESS / NEUTRAL / AGNOSTIC. Anyone can build. Postern Labs is
+      one builder among many, with NO special protocol access. Bloch has no
+      official explorer — this is one independent reference, the way
+      mempool.space is to Bitcoin.
+    - BLCH is neutral native gas (ETH-like at the protocol level, usable for
+      development). NEVER a value or investment claim. No price, no value claim
+      from anyone; 17% founder premine disclosed. Do NOT build here because
+      "the token will appreciate."
+    - Integer satoshis are the truth (1 BLOCH = 1e8 sat); "bloch" is display only.
+
+  LICENSE: MIT OR Apache-2.0 (permissive). Adopt freely, including commercially.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Bloch Tiny Block Explorer (reference)</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 15px/1.5 system-ui, sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.3rem; margin-bottom: .2rem; }
+  .rail { border: 1px solid #b58; background: rgba(200,80,120,.08); padding: .6rem .8rem; border-radius: 8px; font-size: .85rem; margin: .8rem 0 1.2rem; }
+  label { display: block; font-weight: 600; margin: .8rem 0 .2rem; }
+  input { width: 100%; padding: .5rem; font: inherit; box-sizing: border-box; }
+  .row { display: flex; gap: .6rem; flex-wrap: wrap; }
+  .row > * { flex: 1 1 220px; }
+  button { margin-top: .8rem; padding: .5rem 1rem; font: inherit; cursor: pointer; }
+  .card { border: 1px solid #8886; border-radius: 8px; padding: .8rem 1rem; margin-top: 1rem; }
+  .muted { opacity: .7; font-size: .85rem; }
+  table { border-collapse: collapse; width: 100%; margin-top: .5rem; font-size: .82rem; }
+  th, td { text-align: left; padding: .35rem .5rem; border-bottom: 1px solid #8883; }
+  code { font-family: ui-monospace, monospace; word-break: break-all; cursor: pointer; }
+  code.link { text-decoration: underline dotted; }
+  .err { color: #c33; font-weight: 600; }
+  .overflow { overflow-x: auto; }
+</style>
+</head>
+<body>
+  <h1>Bloch Tiny Block Explorer</h1>
+  <div class="muted">reference app — UNTESTED against a live node. No official explorer exists; this is one independent example.</div>
+
+  <div class="rail">
+    <strong>Experimental.</strong> Unaudited mainnet-beta; relaxed PoW (k=4) makes
+    work trivially forgeable; small, 51%-attackable network. Bloch is
+    ownerless/neutral/agnostic — anyone can build; Postern is one builder with no
+    privilege. <strong>BLCH is neutral native gas, never a value/investment
+    claim.</strong> Confirmations shown carry no real security today.
+  </div>
+
+  <label for="endpoint">Node JSON-RPC endpoint</label>
+  <input id="endpoint" value="http://127.0.0.1:16210/" />
+
+  <div class="row">
+    <div>
+      <label for="height">Look up block by height</label>
+      <input id="height" placeholder="e.g. 1000" inputmode="numeric" />
+    </div>
+    <div>
+      <label for="txid">…or a transaction by txid</label>
+      <input id="txid" placeholder="64-hex txid" />
+    </div>
+  </div>
+  <button id="tip">Load chain tip + recent blocks</button>
+  <button id="goBlock">Load block</button>
+  <button id="goTx">Load tx</button>
+
+  <div id="out"></div>
+
+<script>
+"use strict";
+
+// Reusable JSON-RPC caller with Bloch's result.error quirk handled.
+async function callRpc(endpoint, method, params) {
+  const res = await fetch(endpoint, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params: params || [] }),
+  });
+  let body;
+  try { body = await res.json(); }
+  catch { throw new Error("HTTP " + res.status + ": non-JSON response"); }
+  if (body.error) throw new Error("RPC error " + body.error.code + ": " + body.error.message);
+  const result = body.result;
+  if (result && typeof result === "object" && "error" in result) {
+    throw new Error("method error: " + result.error);
+  }
+  return result;
+}
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+const ep = () => $("endpoint").value.trim();
+const ts = (t) => new Date(Number(t) * 1000).toISOString().replace("T", " ").replace(".000Z", "Z");
+function fmtBloch(sat) {
+  const s = BigInt(sat), w = s / 100000000n, f = (s % 100000000n).toString().padStart(8, "0");
+  return w.toString() + "." + f;
+}
+
+async function loadTip() {
+  const out = $("out");
+  out.innerHTML = '<div class="muted">Loading…</div>';
+  try {
+    const info = await callRpc(ep(), "getnetworkinfo", []);
+    const dag = await callRpc(ep(), "getdaginfo", []);
+    const recent = await callRpc(ep(), "getrecentblocks", [15]);
+    let rows = "";
+    for (const b of recent) {
+      rows += '<tr><td><code class="link" data-h="' + esc(b.height) + '">' + esc(b.height) +
+        "</code></td><td><code>" + esc(b.hash) + "</code></td><td>" + esc(b.tx_count) +
+        "</td><td>" + esc(ts(b.timestamp)) + "</td><td>" + esc(b.size) + " B</td></tr>";
+    }
+    out.innerHTML =
+      '<div class="card"><div class="muted">Chain (' + esc(info.chain) + ')</div>' +
+      "<div>height <strong>" + esc(info.blocks) + "</strong> &middot; peers " +
+      esc(info.peers) + " &middot; mempool " + esc(info.mempool) +
+      " &middot; tips " + esc(dag.tip_count) + " &middot; GhostDAG k=" + esc(dag.k) + "</div></div>" +
+      '<div class="card"><div class="muted">Recent blocks (click a height)</div>' +
+      '<div class="overflow"><table><thead><tr><th>height</th><th>hash</th><th>txs</th>' +
+      "<th>time (UTC)</th><th>size</th></tr></thead><tbody>" + rows + "</tbody></table></div></div>";
+    out.querySelectorAll("code.link").forEach((el) =>
+      el.addEventListener("click", () => { $("height").value = el.dataset.h; loadBlock(); }));
+  } catch (e) { showErr(e); }
+}
+
+async function loadBlock() {
+  const out = $("out");
+  const h = $("height").value.trim();
+  if (h === "") return;
+  out.innerHTML = '<div class="muted">Loading block…</div>';
+  try {
+    const b = await callRpc(ep(), "getblockbyheight", [Number(h), true]);
+    let txrows = "";
+    for (const tx of (b.transactions || [])) {
+      const outSum = (tx.outputs || []).reduce((a, o) => a + BigInt(o.value), 0n);
+      txrows += '<tr><td><code class="link" data-tx="' + esc(tx.txid) + '">' + esc(tx.txid) +
+        "</code></td><td>" + (tx.coinbase ? "coinbase" : "payment") + "</td><td>" +
+        esc((tx.inputs || []).length) + "</td><td>" + esc((tx.outputs || []).length) +
+        "</td><td>" + fmtBloch(outSum) + "</td></tr>";
+    }
+    out.innerHTML =
+      '<div class="card"><div class="muted">Block at height ' + esc(b.height) + "</div>" +
+      "<div><code>" + esc(b.hash) + "</code></div>" +
+      '<div class="muted">blue_score ' + esc(b.blue_score) + " &middot; " + esc(b.tx_count) +
+      " tx &middot; " + esc(ts(b.timestamp)) + " &middot; bits " + esc(b.bits) +
+      " &middot; nonce " + esc(b.nonce) + " &middot; " + esc(b.size) + " bytes</div></div>" +
+      '<div class="card"><div class="muted">Transactions (click a txid)</div>' +
+      '<div class="overflow"><table><thead><tr><th>txid</th><th>type</th><th>in</th><th>out</th>' +
+      "<th>out total (BLOCH)</th></tr></thead><tbody>" + txrows + "</tbody></table></div></div>";
+    out.querySelectorAll("code.link").forEach((el) =>
+      el.addEventListener("click", () => { $("txid").value = el.dataset.tx; loadTx(); }));
+  } catch (e) { showErr(e); }
+}
+
+async function loadTx() {
+  const out = $("out");
+  const id = $("txid").value.trim();
+  if (id === "") return;
+  out.innerHTML = '<div class="muted">Loading tx…</div>';
+  try {
+    const t = await callRpc(ep(), "gettransaction", [id]);
+    const status = await callRpc(ep(), "gettxstatus", [id]).catch(() => null);
+    const tx = t.transaction || {};
+    let orows = "";
+    for (const o of (tx.outputs || [])) {
+      orows += "<tr><td>" + esc(o.index) + "</td><td>" + esc(o.value) + " sat</td><td>" +
+        fmtBloch(o.value) + "</td><td><code>" + esc(o.script_pubkey) + "</code></td></tr>";
+    }
+    out.innerHTML =
+      '<div class="card"><div class="muted">Transaction</div><div><code>' + esc(t.txid) +
+      "</code></div><div class=\"muted\">block " + esc(t.block_height) + " &middot; " +
+      esc(ts(t.timestamp)) + " &middot; confirmations " + esc(t.confirmations) +
+      (status ? " &middot; status " + esc(status.status) : "") +
+      " &middot; inputs " + esc((tx.inputs || []).length) + "</div>" +
+      '<div class="muted">Finality is PoW depth: 0=mempool, 1-99=confirmed, 100+=final. ' +
+      "Under k=4 this carries no real security today.</div></div>" +
+      '<div class="card"><div class="muted">Outputs (fixed P2PKH — no scripting)</div>' +
+      '<div class="overflow"><table><thead><tr><th>vout</th><th>value</th><th>BLOCH</th>' +
+      "<th>script_pubkey (20-byte hash)</th></tr></thead><tbody>" + orows + "</tbody></table></div></div>";
+  } catch (e) { showErr(e); }
+}
+
+function showErr(e) {
+  $("out").innerHTML = '<div class="card err">' + esc(e.message) + "</div>" +
+    '<div class="muted">Is a Bloch node reachable at that endpoint? Reads are public; ' +
+    "CORS must allow your origin.</div>";
+}
+
+$("tip").addEventListener("click", loadTip);
+$("goBlock").addEventListener("click", loadBlock);
+$("goTx").addEventListener("click", loadTx);
+</script>
+</body>
+</html>

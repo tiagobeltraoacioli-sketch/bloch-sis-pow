@@ -1,0 +1,158 @@
+<!doctype html>
+<!--
+  Bloch Balance + UTXO Viewer — reference app
+  ============================================
+  STATUS: reference, UNTESTED against a live node. Self-contained; no build step.
+          Open this file in a browser and point it at a Bloch node's JSON-RPC.
+
+  HONESTY RAILS (binding): Building on Bloch today is EXPERIMENTAL.
+    - Unaudited mainnet-beta; relaxed PoW (k=4) => work is TRIVIALLY FORGEABLE;
+      small, 51%-attackable network. No security is claimed today.
+    - Bloch is OWNERLESS / NEUTRAL / AGNOSTIC. Anyone can build. Postern Labs is
+      one builder among many, with NO special protocol access.
+    - BLCH is neutral native gas (usable for development, ETH-like at the
+      protocol level). This is NEVER a value or investment claim. BLCH has no
+      price and no value claim from anyone; a 17% founder premine is disclosed.
+      Do NOT build here because "the token will appreciate" — no one promises it.
+    - Integer satoshis are the truth (1 BLOCH = 1e8 sat); the "bloch" float is
+      display-only.
+
+  LICENSE: MIT OR Apache-2.0 (permissive). Adopt freely, including commercially.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Bloch Balance + UTXO Viewer (reference)</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 15px/1.5 system-ui, sans-serif; max-width: 820px; margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.3rem; margin-bottom: .2rem; }
+  .rail { border: 1px solid #b58; background: rgba(200,80,120,.08); padding: .6rem .8rem; border-radius: 8px; font-size: .85rem; margin: .8rem 0 1.2rem; }
+  label { display: block; font-weight: 600; margin: .8rem 0 .2rem; }
+  input { width: 100%; padding: .5rem; font: inherit; box-sizing: border-box; }
+  button { margin-top: .8rem; padding: .5rem 1rem; font: inherit; cursor: pointer; }
+  .card { border: 1px solid #8886; border-radius: 8px; padding: .8rem 1rem; margin-top: 1rem; }
+  .big { font-size: 1.6rem; font-weight: 700; }
+  .muted { opacity: .7; font-size: .85rem; }
+  table { border-collapse: collapse; width: 100%; margin-top: .5rem; font-size: .82rem; }
+  th, td { text-align: left; padding: .35rem .5rem; border-bottom: 1px solid #8883; }
+  code { font-family: ui-monospace, monospace; word-break: break-all; }
+  .err { color: #c33; font-weight: 600; }
+  .overflow { overflow-x: auto; }
+</style>
+</head>
+<body>
+  <h1>Bloch Balance + UTXO Viewer</h1>
+  <div class="muted">reference app — UNTESTED against a live node</div>
+
+  <div class="rail">
+    <strong>Experimental.</strong> Bloch is unaudited mainnet-beta; relaxed PoW
+    (k=4) makes work trivially forgeable; the network is small and
+    51%-attackable. Bloch is ownerless/neutral/agnostic — anyone can build;
+    Postern is one builder with no privilege. <strong>BLCH is neutral native
+    gas, never a value/investment claim.</strong> Balances shown are on-chain
+    reads only and imply no value.
+  </div>
+
+  <label for="endpoint">Node JSON-RPC endpoint</label>
+  <input id="endpoint" value="http://127.0.0.1:16210/" />
+
+  <label for="apikey">X-API-Key (optional; reads are usually public)</label>
+  <input id="apikey" placeholder="leave blank for public reads / localhost" />
+
+  <label for="addr">Address (bloch1q… mainnet / bloch1t… testnet)</label>
+  <input id="addr" placeholder="bloch1q7b003a342f1529f4943e52181c661b0e34c96d02b71f8b78" />
+
+  <button id="go">Look up</button>
+
+  <div id="out"></div>
+
+<script>
+"use strict";
+
+// Reusable JSON-RPC caller that handles Bloch's non-standard result.error quirk.
+// See docs/portal/01-build-your-first-bloch-app.md.
+async function callRpc(endpoint, method, params, apiKey) {
+  const headers = { "content-type": "application/json" };
+  if (apiKey) headers["X-API-Key"] = apiKey;
+  const res = await fetch(endpoint, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params: params || [] }),
+  });
+  let body;
+  try { body = await res.json(); }
+  catch { throw new Error("HTTP " + res.status + ": non-JSON response"); }
+  // 1) Standard transport/auth/rate-limit error.
+  if (body.error) {
+    throw new Error("RPC error " + body.error.code + ": " + body.error.message);
+  }
+  // 2) The Bloch quirk: method-level failure inside result.error (HTTP 200).
+  const result = body.result;
+  if (result && typeof result === "object" && "error" in result) {
+    throw new Error("method error: " + result.error);
+  }
+  return result;
+}
+
+const $ = (id) => document.getElementById(id);
+
+function esc(s) {
+  return String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+}
+
+// Integer sat -> display BLOCH string. Satoshis are the truth; this is display only.
+function fmtBloch(sat) {
+  const s = BigInt(sat);
+  const whole = s / 100000000n;
+  const frac = (s % 100000000n).toString().padStart(8, "0");
+  return whole.toString() + "." + frac;
+}
+
+async function run() {
+  const endpoint = $("endpoint").value.trim();
+  const apiKey = $("apikey").value.trim();
+  const addr = $("addr").value.trim();
+  const out = $("out");
+  out.innerHTML = '<div class="muted">Loading…</div>';
+
+  try {
+    // Validate first — never display or trust an unvalidated address.
+    const v = await callRpc(endpoint, "validateaddress", [addr], apiKey);
+    if (!v.isvalid) {
+      out.innerHTML = '<div class="card err">Address is NOT valid (' +
+        esc(v.network) + ', checksum ' + (v.checksum ? "ok" : "bad") + ').</div>';
+      return;
+    }
+
+    const bal = await callRpc(endpoint, "getbalance", [addr], apiKey);
+    const u = await callRpc(endpoint, "getutxos", [addr], apiKey);
+
+    let rows = "";
+    for (const o of u.utxos) {
+      rows += "<tr><td><code>" + esc(o.txid) + "</code></td><td>" + esc(o.index) +
+        "</td><td>" + esc(o.value) + " sat</td><td>" + fmtBloch(o.value) + "</td></tr>";
+    }
+
+    out.innerHTML =
+      '<div class="card"><div class="muted">Balance (' + esc(v.network) + ')</div>' +
+      '<div class="big">' + fmtBloch(bal.satoshis) + ' BLOCH</div>' +
+      '<div class="muted">' + esc(bal.satoshis) + ' sat &middot; ' +
+      esc(bal.utxo_count) + ' UTXO(s)</div></div>' +
+      '<div class="card"><div class="muted">Unspent outputs (' + esc(u.utxo_count) + ')</div>' +
+      '<div class="overflow"><table><thead><tr><th>txid</th><th>vout</th><th>value</th>' +
+      '<th>BLOCH (display)</th></tr></thead><tbody>' + rows + '</tbody></table></div></div>' +
+      '<div class="muted">Reads only. Under k=4 on a low-hashrate network these ' +
+      'balances carry no security guarantee. BLCH is not a value claim.</div>';
+  } catch (e) {
+    out.innerHTML = '<div class="card err">' + esc(e.message) + '</div>' +
+      '<div class="muted">Is a Bloch node reachable at that endpoint? Reads are ' +
+      'usually public; writes may need an X-API-Key. CORS must allow your origin.</div>';
+  }
+}
+
+$("go").addEventListener("click", run);
+</script>
+</body>
+</html>
