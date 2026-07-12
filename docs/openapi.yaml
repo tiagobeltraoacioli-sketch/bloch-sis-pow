@@ -1,130 +1,166 @@
 openapi: 3.1.0
 
 info:
-  title: Entanglement Layer (ENTL) JSON-RPC API
-  version: 0.5.9
-  summary: Post-quantum BlockDAG Layer 1 — JSON-RPC 2.0 interface
+  title: Bloch (Bloch-SIS) JSON-RPC API
+  version: 0.6.0
+  summary: Post-quantum-flavoured BlockDAG Layer 1 — JSON-RPC 2.0 interface
   description: |
-    Entanglement Layer exposes a single HTTP endpoint that speaks JSON-RPC 2.0.
-    Every method described below is invoked by POSTing a JSON-RPC envelope
-    to the root `/` path. For example:
+    Bloch exposes a single HTTP endpoint that speaks JSON-RPC 2.0. Every method
+    described below is invoked by POSTing a JSON-RPC 2.0 envelope to the root
+    `/` path. The node advertises itself as `chain: "bloch-sis"`, uses
+    `bloch1q…` (mainnet) / `bloch1t…` (testnet) addresses, and reports monetary
+    values both as integer satoshis and as display-only `bloch` / `*_bloch`
+    floats (1 BLCH = 100 000 000 satoshis).
 
     ```bash
-    curl -s -X POST http://node.example:16210/ \
+    curl -s -X POST http://127.0.0.1:16210/ \
       -H "Content-Type: application/json" \
       -d '{"jsonrpc":"2.0","method":"getblockcount","params":[],"id":1}'
     ```
 
-    ## Transport
-    - **Protocol:** HTTP/1.1 with JSON body
-    - **Content-Type:** `application/json`
-    - **Method:** POST to `/`
-    - **Default port:** 16210
-    - **Default bind:** `127.0.0.1` (localhost). Production operators use
-      `--rpc-public` to bind `0.0.0.0:16210`. Unauthenticated when public —
-      operators must firewall or reverse-proxy.
+    ## HONESTY / SECURITY DISCLOSURES (read before you rely on this)
+    - **Unaudited mainnet-beta.** This software has NOT completed an external
+      security audit. Run it expecting bugs and consensus surprises.
+    - **PoW is structurally weak.** The Module-SIS proof-of-work runs at a small
+      structural width (k = 4 below the SF-1 activation height). At k = 4 the
+      witness is **trivially forgeable** and the chain is **51%-attackable** —
+      the difficulty gate is not lattice bit-security. Do not treat confirmations
+      as economically final.
+    - **Ownerless base.** The base protocol is ownerless; there is no admin key
+      that can reverse transactions or freeze funds. Nothing here is a promise of
+      support, uptime, or recovery.
+    - **BLCH is not a security.** BLCH is a utility/experimental network token,
+      not an investment contract, share, or claim on anyone's revenue. No yield,
+      dividend, or profit expectation is offered or implied.
+    - This is the community edition of the node software. It is not, and must not
+      be described as, any branded/commercial distribution.
 
-    ## Envelope format
-    Every request is a JSON-RPC 2.0 envelope:
+    ## Transport
+    - **Protocol:** HTTP/1.1 with a JSON body.
+    - **Content-Type:** `application/json`.
+    - **HTTP method / path:** `POST /` (the ONLY route; there are no REST paths).
+    - **Default port:** 16210.
+    - **Default bind:** `127.0.0.1` (localhost). Operators exposing the node
+      publicly must firewall or reverse-proxy it — reads are unauthenticated.
+    - **Max request body:** 1 MiB (`RPC_MAX_BODY_BYTES`). Oversized bodies get
+      HTTP 413. JSON-RPC calls are tiny; this simply blocks payload-abuse DoS.
+    - **Per-request timeout:** 30 s (HTTP 408 on expiry).
+    - **Global concurrency cap:** 256 in-flight handlers across all connections.
+    - **CORS:** permissive (any origin) on this endpoint.
+
+    ## JSON-RPC 2.0 envelope
+    Request:
 
     ```json
     { "jsonrpc": "2.0", "method": "<method>", "params": [<args>], "id": 1 }
     ```
 
-    Every response is a JSON-RPC 2.0 envelope:
+    Success response:
 
     ```json
     { "jsonrpc": "2.0", "result": { ... }, "id": 1 }
     ```
 
-    ## Error handling
-    Entanglement Layer currently returns errors inside the `result` field rather
-    than using JSON-RPC's `error` object. A response with `"error"` as a
-    top-level key inside `result` indicates the method failed:
+    `params` is a positional array. `id` is echoed back verbatim (defaults to
+    `null` if omitted).
 
-    ```json
-    { "jsonrpc": "2.0", "result": { "error": "invalid hash" }, "id": 1 }
-    ```
+    ## Error handling — TWO shapes (important quirk)
+    Bloch reports failures in **two different places**, and clients must handle
+    both:
 
-    Clients should treat `result.error` as an error condition.
-    (This will be normalized to standard JSON-RPC `error` objects in a
-    future release — see `SPRINTS.md`.)
+    1. **Standard top-level `error`** — used ONLY by the transport/auth layer:
+       unauthorized (`code: -32001`, HTTP 401), rate-limited (`code: -32002`,
+       HTTP 429). Example:
 
-    ## Method categories
-    - **Chain state**: `getnetworkinfo`, `getblockcount`, `getdaginfo`,
-      `getmempoolinfo`, `getpeerinfo`, `getpeers`
-    - **Block queries**: `getblock`, `getblockbyheight`, `getblockhash`,
-      `getrecentblocks`, `gettxsbyblock`
-    - **Transaction queries**: `gettransaction`, `gettxstatus`,
-      `decoderawtransaction`, `getrawmempool`
-    - **Address queries**: `getbalance`, `getutxos`, `listtransactions`,
-      `getaddressinfo`, `getaddressbalance_at_height`, `validateaddress`,
-      `validateaddressverbose`
-    - **Broadcast**: `sendrawtransaction`
-    - **Fee estimation**: `estimatefee`, `estimatefeeadvanced`
-    - **Analytics**: `getchainstats`, `getsupplydistribution`,
-      `gethashrate`, `getdifficultyhistory`, `getblocktimepercentiles`,
-      `getmempoolstats`
-    - **Treasury**: `gettreasury`
+       ```json
+       { "jsonrpc": "2.0", "id": 1,
+         "error": { "code": -32001, "message": "unauthorized: valid X-API-Key required" } }
+       ```
 
-    ## Security notes
-    - No authentication by default (planned: Sprint M)
-    - No rate limiting by default (planned: Sprint M)
-    - `sendrawtransaction` is the only mutating method — all others are read-only
-    - All RPC output is public chain data; no private state is returned
-    - See [docs/THREAT_MODEL.md](THREAT_MODEL.md) section 4 for the RPC
-      attack surface analysis
+    2. **NON-STANDARD `result.error`** — used by MOST method-level failures. The
+       HTTP status is still 200 and the top-level `error` is absent; the failure
+       is a string under `result.error`:
+
+       ```json
+       { "jsonrpc": "2.0", "id": 1, "result": { "error": "invalid hash" } }
+       ```
+
+       Unknown methods, bad params, not-found lookups, deserialise failures, etc.
+       all surface this way. Treat any `result` object containing a string
+       `error` key as a failed call. (A future release may normalise this to the
+       standard `error` object.)
+
+    ## Authentication & rate limiting
+    - **Reads are public.** Every method except the writes below is a read and
+      needs no key by default.
+    - **Writes** are `sendrawtransaction` and `submitblock`. When the node runs
+      with `require_auth_for_writes` enabled, a write from a non-local IP must
+      present a valid API key.
+    - **API key** is presented via the `X-API-Key` header or
+      `Authorization: Bearer <key>`. Comparison is constant-time.
+    - **Localhost bypass.** Loopback (`127.0.0.1` / `::1`) bypasses auth AND rate
+      limiting entirely. With `trust_private_ranges` enabled, RFC1918 / IPv6-ULA
+      source IPs are also treated as trusted-local (for Docker bridge setups);
+      link-local and CGNAT never are.
+    - **Per-IP rate limits** (separate read / write buckets; localhost exempt).
+      Defaults: 60 reads/min, 5 writes/min. Exceeding a bucket → HTTP 429 with
+      `error.code -32002`.
+
+    ## Method categories (see `x-json-rpc-methods` for the full per-method contract)
+    - **Chain state:** getnetworkinfo, getblockcount, getmempoolinfo, getdaginfo,
+      getpeerinfo, getpeers, getchainstats, gethashrate, getsupplydistribution,
+      getdifficultyhistory, getblocktimepercentiles, getpools, getattestation
+    - **Blocks:** getblockhash, getblock, getblockbyheight, getrecentblocks,
+      gettxsbyblock
+    - **Transactions:** gettransaction, gettxstatus, decoderawtransaction,
+      getrawmempool, getmempoolstats
+    - **Addresses / wallet:** getbalance, getutxos, getaddressinfo,
+      getaddressbalance_at_height, getaddresscount, listtransactions,
+      validateaddress, validateaddressverbose
+    - **Fees:** estimatefee, estimatefeeadvanced
+    - **Writes:** sendrawtransaction
+    - **Mining (B5f pool seam):** getblocktemplate, submitblock
 
   license:
-    name: MIT
-    url: https://gitlab.com/Entanglementlayer/entanglement-layer/-/blob/main/LICENSE
+    name: MIT OR Apache-2.0
   contact:
-    name: Entanglement Layer security
-    email: security@entanglementlayer.com
-    url: https://gitlab.com/Entanglementlayer/entanglement-layer
+    name: Bloch community contributors
 
 servers:
   - url: http://127.0.0.1:16210
-    description: Local node (default)
-  - url: http://{host}:16210
-    description: Remote node (operator-configured with --rpc-public)
+    description: Default local node (loopback; bypasses auth + rate limits)
+  - url: http://{host}:{port}
+    description: Custom node endpoint
     variables:
       host:
-        default: node.example.com
-
-security:
-  - {}                # Most methods accept unauthenticated requests
-  - ApiKeyHeader: []  # Writes may require X-API-Key (Sprint M config)
-  - BearerToken: []   # Alternative: Authorization: Bearer <key>
+        default: 127.0.0.1
+      port:
+        default: "16210"
 
 tags:
-  - name: Chain state
-    description: High-level node, DAG, and network status
-  - name: Blocks
-    description: Block and block-range queries
-  - name: Transactions
-    description: Transaction lookup, decoding, mempool access
-  - name: Addresses
-    description: Balance, UTXO, and historical address queries
-  - name: Broadcast
-    description: Submit transactions to the network
-  - name: Fees
-    description: Fee estimation for new transactions
-  - name: Analytics
-    description: Chain metrics, hashrate, distribution, histograms
-  - name: Treasury
-    description: Treasury state
+  - name: JSON-RPC
+    description: The single POST / endpoint carrying all methods.
 
 paths:
   /:
     post:
-      summary: JSON-RPC endpoint
+      tags: [JSON-RPC]
+      operationId: jsonRpcCall
+      summary: JSON-RPC 2.0 endpoint (all methods)
       description: |
-        All methods are called by POSTing to this single endpoint with the
-        appropriate `method` and `params` in the JSON-RPC envelope.
-        The sections below describe each method individually via the
-        `method` discriminator.
-      operationId: rpcCall
+        The single route for the entire API. The `method` field selects the
+        operation; `params` is a positional array whose contents depend on the
+        method. See the `x-json-rpc-methods` extension on this document (and the
+        `components.schemas` result types) for each method's parameters and
+        response shape.
+
+        Remember the two error shapes: transport/auth errors use the top-level
+        `error` object (401/429); most method errors return HTTP 200 with a
+        string under `result.error`.
+      security:
+        - {}                # reads: no auth
+        - ApiKeyAuth: []    # writes when require_auth_for_writes is on
+        - BearerAuth: []
       requestBody:
         required: true
         content:
@@ -133,85 +169,82 @@ paths:
               $ref: '#/components/schemas/JsonRpcRequest'
             examples:
               getblockcount:
-                summary: Simplest call (no params)
-                value:
-                  jsonrpc: "2.0"
-                  method: getblockcount
-                  params: []
-                  id: 1
+                summary: Read the current block count
+                value: { jsonrpc: "2.0", method: "getblockcount", params: [], id: 1 }
+              getbalance:
+                summary: Balance of an address
+                value: { jsonrpc: "2.0", method: "getbalance", params: ["bloch1q…"], id: 2 }
               getblock:
-                summary: Block by hash (verbose)
-                value:
-                  jsonrpc: "2.0"
-                  method: getblock
-                  params: ["000000028f16c3710ba25825ad2cef2afcd30d806ca86b9e6a3d8ef0e95b2f67", true]
-                  id: 1
+                summary: Block by hash, verbose
+                value: { jsonrpc: "2.0", method: "getblock", params: ["<hash-hex>", true], id: 3 }
               sendrawtransaction:
-                summary: Broadcast a serialized transaction
-                value:
-                  jsonrpc: "2.0"
-                  method: sendrawtransaction
-                  params: ["0100000001..."]
-                  id: 1
+                summary: Broadcast a signed tx (write)
+                value: { jsonrpc: "2.0", method: "sendrawtransaction", params: ["<tx-hex>"], id: 4 }
       responses:
         '200':
-          description: JSON-RPC response (see per-method schemas below)
+          description: |
+            JSON-RPC response. `result` is present on success. A method-level
+            failure is ALSO HTTP 200 but carries a string `result.error`.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/JsonRpcResponse'
+              examples:
+                success:
+                  value: { jsonrpc: "2.0", id: 1, result: 12345 }
+                methodError:
+                  summary: Non-standard result.error quirk
+                  value: { jsonrpc: "2.0", id: 1, result: { error: "invalid hash" } }
         '401':
-          description: |
-            Unauthorized (Sprint M). Returned when
-            `--rpc-require-auth-for-writes` is on and the write method
-            was called without a valid key, or when the presented key is
-            invalid. Localhost requests never receive this.
+          description: Unauthorized — write requires a valid X-API-Key (code -32001).
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/JsonRpcError'
+                $ref: '#/components/schemas/JsonRpcErrorResponse'
+              example:
+                jsonrpc: "2.0"
+                id: 1
+                error: { code: -32001, message: "unauthorized: valid X-API-Key required" }
+        '408':
+          description: Request timed out (exceeded the 30 s per-request limit).
+        '413':
+          description: Payload too large (body exceeded the 1 MiB cap).
         '429':
-          description: |
-            Rate limit exceeded (Sprint M). Retry after ~60s. Localhost
-            is never rate-limited. Limits are per-IP; reads and writes
-            are tracked in separate buckets.
+          description: Too many requests — per-IP rate limit exceeded (code -32002).
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/JsonRpcError'
+                $ref: '#/components/schemas/JsonRpcErrorResponse'
+              example:
+                jsonrpc: "2.0"
+                id: 1
+                error: { code: -32002, message: "rate limit exceeded; retry after a minute" }
 
 components:
-  # Sprint M — security schemes for optional API key auth
   securitySchemes:
-    ApiKeyHeader:
+    ApiKeyAuth:
       type: apiKey
       in: header
       name: X-API-Key
-      description: |
-        Shared-secret API key as configured with `--rpc-api-key` or
-        `--rpc-api-key-file` on the node. Only required when the node
-        runs with `--rpc-require-auth-for-writes`. Localhost requests
-        (127.0.0.1, ::1) bypass authentication.
-
-    BearerToken:
+      description: Shared secret for write methods when require_auth_for_writes is enabled. Localhost is exempt.
+    BearerAuth:
       type: http
       scheme: bearer
-      bearerFormat: Opaque
-      description: |
-        Alternative to `X-API-Key`. Send as `Authorization: Bearer <key>`.
-        Same key as ApiKeyHeader.
+      description: "Alternative to X-API-Key — `Authorization: Bearer <key>`."
 
   schemas:
-    # ── Envelopes ─────────────────────────────────────────────────────
+
+    # ── JSON-RPC envelopes ────────────────────────────────────────────────
     JsonRpcRequest:
       type: object
-      required: [jsonrpc, method, id]
+      required: [jsonrpc, method]
       properties:
         jsonrpc:
           type: string
-          enum: ["2.0"]
+          const: "2.0"
         method:
           type: string
+          description: One of the supported methods (see x-json-rpc-methods).
           enum:
             - getnetworkinfo
             - getblockcount
@@ -222,17 +255,23 @@ components:
             - getrecentblocks
             - gettransaction
             - getbalance
+            - getaddresscount
             - getutxos
             - sendrawtransaction
             - validateaddress
+            - validateaddressverbose
             - estimatefee
+            - estimatefeeadvanced
             - getrawmempool
+            - getmempoolstats
             - decoderawtransaction
+            - getblocktemplate
+            - submitblock
             - getdaginfo
             - listtransactions
             - getpeerinfo
             - getpeers
-            - gettreasury
+            - getpools
             - getchainstats
             - getsupplydistribution
             - gethashrate
@@ -240,270 +279,176 @@ components:
             - getblocktimepercentiles
             - gettxstatus
             - getaddressinfo
-            - estimatefeeadvanced
-            - getmempoolstats
-            - validateaddressverbose
-            - gettxsbyblock
             - getaddressbalance_at_height
+            - gettxsbyblock
+            - getattestation
         params:
           type: array
-          description: Positional parameters (method-specific)
+          description: Positional arguments; contents depend on the method. Omit or use [] for none.
           items: {}
+          default: []
         id:
+          description: Echoed back verbatim; defaults to null if omitted.
           oneOf:
             - type: integer
             - type: string
+            - type: "null"
+      example:
+        jsonrpc: "2.0"
+        method: getblockcount
+        params: []
+        id: 1
 
     JsonRpcResponse:
       type: object
-      required: [jsonrpc, result, id]
+      required: [jsonrpc, id, result]
       properties:
         jsonrpc:
           type: string
-          enum: ["2.0"]
-        result:
-          description: Method-specific result (see per-method schemas)
+          const: "2.0"
         id:
           oneOf:
             - type: integer
             - type: string
             - type: "null"
+        result:
+          description: |
+            Method-specific result. On a method-level failure this is instead an
+            object of the form `{ "error": "<message>" }` (the non-standard
+            quirk) — see ResultError.
+      description: Success (or method-level-error) envelope. HTTP status is 200 either way.
 
-
-    JsonRpcError:
+    JsonRpcErrorResponse:
       type: object
-      description: |
-        Sprint M: standard JSON-RPC error object for auth/rate-limit
-        failures. Per-method internal errors still use the legacy
-        `result.error` shape documented in `MethodErrorResult`.
       required: [jsonrpc, id, error]
       properties:
         jsonrpc:
           type: string
-          enum: ["2.0"]
+          const: "2.0"
         id:
           oneOf:
             - type: integer
             - type: string
             - type: "null"
         error:
-          type: object
-          required: [code, message]
-          properties:
-            code:
-              type: integer
-              description: |
-                -32001 = unauthorized (HTTP 401)
-                -32002 = rate limit exceeded (HTTP 429)
-            message:
-              type: string
+          $ref: '#/components/schemas/JsonRpcError'
+      description: Transport/auth error envelope (used ONLY for 401/429).
 
-    MethodErrorResult:
+    JsonRpcError:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: integer
+          description: "-32001 = unauthorized; -32002 = rate limited."
+        message:
+          type: string
+        data:
+          description: Optional extra detail.
+      example: { code: -32001, message: "unauthorized: valid X-API-Key required" }
+
+    ResultError:
       type: object
       description: |
-        When a method fails, the `result` field contains an `error` property.
-        This is non-standard JSON-RPC; will be normalized in a future release.
+        Non-standard method-level error. Delivered inside `result` with HTTP 200
+        (NOT via the top-level `error` object). Any `result` carrying a string
+        `error` key is a failed call.
       required: [error]
       properties:
         error:
           type: string
-          description: Human-readable error message
-          examples:
-            - "invalid hash"
-            - "not found"
-            - "invalid address"
-            - "deserialise failed"
+          example: "invalid address"
 
-    # ── Domain types ──────────────────────────────────────────────────
+    # ── Shared domain types ───────────────────────────────────────────────
     Hex32:
       type: string
-      description: 32-byte value encoded as 64 lowercase hex characters
-      pattern: "^[0-9a-f]{64}$"
-      examples:
-        - "000000028f16c3710ba25825ad2cef2afcd30d806ca86b9e6a3d8ef0e95b2f67"
-
+      description: 32-byte value as 64 lowercase hex chars.
+      pattern: '^[0-9a-f]{64}$'
     Hex20:
       type: string
-      description: 20-byte value encoded as 40 lowercase hex characters
-      pattern: "^[0-9a-f]{40}$"
-
+      description: 20-byte value as 40 lowercase hex chars.
+      pattern: '^[0-9a-f]{40}$'
     Address:
       type: string
-      description: |
-        Entanglement Layer address in bech32-style format.
-        - Mainnet prefix: `ent1q`
-        - Testnet prefix: `ent1t`
-        - Followed by 40 hex chars (20-byte hash) + 8 hex chars (4-byte checksum)
-      pattern: "^ent1[qt][0-9a-f]{48}$"
-      examples:
-        - "ent1q...placeholder...address..."
-
+      description: Bloch address — `bloch1q…` (mainnet) or `bloch1t…` (testnet), checksummed.
+      example: "bloch1q…"
     Satoshis:
       type: integer
       format: int64
       minimum: 0
-      description: Value in satoshis (1 ENTL = 10^8 satoshis)
-
-    ENTL:
-      type: number
-      format: double
-      description: Value in ENTL (human-readable float)
-
-    Height:
-      type: integer
-      format: int64
-      minimum: 0
-      description: Block height (selected chain)
-
-    # ── Block/Transaction ─────────────────────────────────────────────
-    BlockSummary:
-      type: object
-      properties:
-        hash: { $ref: '#/components/schemas/Hex32' }
-        height: { $ref: '#/components/schemas/Height' }
-        tx_count: { type: integer, minimum: 1 }
-        timestamp:
-          type: integer
-          format: int64
-          description: Unix epoch seconds
-        size:
-          type: integer
-          description: Block size in bytes
-        bits:
-          type: integer
-          description: Difficulty bits (compact target encoding)
-
-    BlockHeader:
-      type: object
-      properties:
-        hash: { $ref: '#/components/schemas/Hex32' }
-        height: { $ref: '#/components/schemas/Height' }
-        blue_score:
-          type: integer
-          format: int64
-          description: GhostDAG blue score at this block
-        tx_count: { type: integer, minimum: 1 }
-        timestamp: { type: integer, format: int64 }
-        bits:
-          type: string
-          description: Difficulty bits as hex (e.g. "0x1d00ffff")
-        nonce:
-          type: integer
-          format: int64
-        parents:
-          type: array
-          items: { $ref: '#/components/schemas/Hex32' }
-          description: Hashes of parent blocks (BlockDAG — may be multiple)
-        merkle_root: { $ref: '#/components/schemas/Hex32' }
-        size: { type: integer }
+      description: Integer value in satoshis (1 BLCH = 100_000_000 sat). The authoritative amount.
 
     TxInput:
       type: object
       properties:
         prev_txid: { $ref: '#/components/schemas/Hex32' }
-        prev_index:
-          type: integer
-          description: Output index in the previous transaction
-        sequence:
-          type: integer
-          format: int64
+        prev_index: { type: integer }
+        sequence: { type: integer }
 
     TxOutput:
       type: object
       properties:
-        index:
-          type: integer
-          description: Output index within the transaction
+        index: { type: integer }
         value: { $ref: '#/components/schemas/Satoshis' }
-        entl: { $ref: '#/components/schemas/ENTL' }
-        script_pubkey:
-          type: string
-          description: Recipient script as hex
+        bloch: { type: number, description: Display-only float value in BLCH. }
+        script_pubkey: { type: string, description: Hex-encoded script pubkey (20-byte pubkey hash). }
 
     Transaction:
       type: object
+      description: Decoded transaction (format_tx). decoderawtransaction adds `size`.
       properties:
         txid: { $ref: '#/components/schemas/Hex32' }
         version: { type: integer }
-        coinbase:
-          type: boolean
-          description: True if this transaction is a coinbase
+        coinbase: { type: boolean }
         inputs:
           type: array
           items: { $ref: '#/components/schemas/TxInput' }
         outputs:
           type: array
           items: { $ref: '#/components/schemas/TxOutput' }
-        locktime:
+        locktime: { type: integer }
+        size:
           type: integer
-          format: int64
+          description: Present only in decoderawtransaction (byte length of the input hex).
 
-    # ── Method-specific response schemas ──────────────────────────────
+    # ── getnetworkinfo ────────────────────────────────────────────────────
     NetworkInfo:
       type: object
-      required: [network, version, protocol, blocks, peers, mempool, syncing, chain]
       properties:
-        network:
-          type: string
-          examples: ["mainnet", "testnet"]
+        network: { type: string, example: mainnet }
         version: { type: string }
-        protocol:
-          type: integer
-          description: Consensus protocol version
-        net_protocol:
-          type: integer
-          description: Network protocol version
-        blue_score:
-          type: integer
-          format: int64
-        blocks:
-          type: integer
-          format: int64
-          description: Block count (selected chain height)
-        peers:
-          type: integer
-          description: Connected peer count
-        mempool:
-          type: integer
-          description: Mempool size (tx count)
+        protocol: { type: integer, description: Consensus protocol version. }
+        net_protocol: { type: integer, description: P2P network protocol version. }
+        blue_score: { type: integer }
+        blocks: { type: integer }
+        peers: { type: integer }
+        mempool: { type: integer }
         syncing: { type: boolean }
-        chain:
-          type: string
-          examples: ["entl"]
-        pruned_height:
-          type: integer
-          format: int64
+        chain: { type: string, const: "bloch-sis" }
+        pruned_height: { type: integer, description: Lowest retained height (0 if unpruned). }
 
     MempoolInfo:
       type: object
       properties:
-        size:
-          type: integer
-          description: Number of transactions in mempool
+        size: { type: integer }
 
     DagInfo:
       type: object
       properties:
         tip:
           oneOf:
-            - { $ref: '#/components/schemas/Hex32' }
-            - { type: "null" }
-        tip_blue_score: { type: integer, format: int64 }
-        tip_blue_work:
-          type: string
-          description: u128 cumulative blue work (stringified)
-        tip_height: { type: integer, format: int64 }
-        block_count: { type: integer, format: int64 }
-        tip_count:
-          type: integer
-          description: Number of DAG tips (virtual block parents)
+            - $ref: '#/components/schemas/Hex32'
+            - type: "null"
+        tip_blue_score: { type: integer }
+        tip_blue_work: { type: string, description: Big integer as a decimal string. }
+        tip_height: { type: integer }
+        block_count: { type: integer }
+        tip_count: { type: integer }
         tips:
           type: array
           items: { $ref: '#/components/schemas/Hex32' }
         chain_length: { type: integer }
-        k:
-          type: integer
-          description: GhostDAG anticone parameter (10)
+        k: { type: integer, description: 'GhostDAG k parameter (a small value today — see honesty note).' }
 
     PeerInfo:
       type: object
@@ -514,16 +459,9 @@ components:
     Peer:
       type: object
       properties:
-        address:
-          type: string
-          description: Full libp2p multiaddr
-          examples: ["/ip4/1.2.3.4/tcp/16110/p2p/12D3KooW..."]
-        ip:
-          type: string
-          format: ipv4
-        peer_id:
-          type: string
-          description: libp2p PeerId (base58)
+        address: { type: string, description: Full multiaddr. }
+        ip: { type: string }
+        peer_id: { type: string }
 
     PeersList:
       type: object
@@ -533,37 +471,68 @@ components:
           type: array
           items: { $ref: '#/components/schemas/Peer' }
 
+    BlockSummary:
+      type: object
+      description: getrecentblocks list item.
+      properties:
+        hash: { $ref: '#/components/schemas/Hex32' }
+        height: { type: integer }
+        tx_count: { type: integer }
+        timestamp: { type: integer }
+        size: { type: integer }
+        bits: { type: integer }
+
     Block:
-      allOf:
-        - $ref: '#/components/schemas/BlockHeader'
-        - type: object
-          properties:
-            txids:
-              type: array
-              items: { $ref: '#/components/schemas/Hex32' }
-              description: Present when verbose=false
-            transactions:
-              type: array
-              items: { $ref: '#/components/schemas/Transaction' }
-              description: Present when verbose=true
+      type: object
+      description: Full block (getblock / getblockbyheight). `txids` when verbose=false, `transactions` when verbose=true.
+      properties:
+        hash: { $ref: '#/components/schemas/Hex32' }
+        height: { type: integer }
+        blue_score: { type: integer }
+        tx_count: { type: integer }
+        timestamp: { type: integer }
+        bits: { type: string, description: Difficulty bits as 0x-prefixed hex string. }
+        nonce: { type: integer }
+        parents:
+          type: array
+          items: { $ref: '#/components/schemas/Hex32' }
+        merkle_root: { $ref: '#/components/schemas/Hex32' }
+        size: { type: integer }
+        txids:
+          type: array
+          description: Present when verbose=false.
+          items: { $ref: '#/components/schemas/Hex32' }
+        transactions:
+          type: array
+          description: Present when verbose=true.
+          items: { $ref: '#/components/schemas/Transaction' }
 
     TransactionLookup:
       type: object
+      description: gettransaction result.
       properties:
         txid: { $ref: '#/components/schemas/Hex32' }
         block_hash: { $ref: '#/components/schemas/Hex32' }
-        block_height: { $ref: '#/components/schemas/Height' }
-        timestamp: { type: integer, format: int64 }
-        confirmations: { type: integer, format: int64 }
+        block_height: { type: integer }
+        timestamp: { type: integer }
+        confirmations: { type: integer }
         transaction: { $ref: '#/components/schemas/Transaction' }
 
     Balance:
       type: object
       properties:
         satoshis: { $ref: '#/components/schemas/Satoshis' }
-        entl: { $ref: '#/components/schemas/ENTL' }
+        bloch: { type: number, description: Display-only BLCH float. }
         utxo_count: { type: integer }
         address: { $ref: '#/components/schemas/Address' }
+
+    AddressCount:
+      type: object
+      description: getaddresscount — distinct on-chain wallets holding >= 1 UTXO.
+      properties:
+        addresses_with_balance: { type: integer }
+        utxo_entries: { type: integer }
+        note: { type: string }
 
     Utxo:
       type: object
@@ -571,7 +540,7 @@ components:
         txid: { $ref: '#/components/schemas/Hex32' }
         index: { type: integer }
         value: { $ref: '#/components/schemas/Satoshis' }
-        script_pubkey: { type: string, description: Hex-encoded script }
+        script_pubkey: { type: string }
 
     UtxoList:
       type: object
@@ -579,201 +548,226 @@ components:
         address: { $ref: '#/components/schemas/Address' }
         utxo_count: { type: integer }
         satoshis: { $ref: '#/components/schemas/Satoshis' }
-        entl: { $ref: '#/components/schemas/ENTL' }
+        bloch: { type: number }
         utxos:
           type: array
           items: { $ref: '#/components/schemas/Utxo' }
 
-    BroadcastResult:
+    AddressInfo:
       type: object
+      description: getaddressinfo result.
       properties:
-        txid: { $ref: '#/components/schemas/Hex32' }
+        address: { $ref: '#/components/schemas/Address' }
+        balance_sats: { $ref: '#/components/schemas/Satoshis' }
+        balance_bloch: { type: number }
+        utxo_count: { type: integer }
+        pending_incoming: { $ref: '#/components/schemas/Satoshis' }
+        pending_outgoing: { $ref: '#/components/schemas/Satoshis' }
+        pool_role:
+          description: Named protocol pool this address is (e.g. validator / oracle / founder), else null.
+          oneOf:
+            - type: string
+            - type: "null"
 
-    AddressValidation:
+    AddressBalanceAtHeight:
       type: object
+      description: getaddressbalance_at_height result.
       properties:
-        address: { type: string }
-        isvalid: { type: boolean }
-        network:
-          type: string
-          enum: [mainnet, testnet, unknown]
-        checksum:
-          type: boolean
-          description: Whether the checksum bytes verified correctly
-
-    AddressValidationVerbose:
-      type: object
-      properties:
-        valid: { type: boolean }
-        address: { type: string }
-        network:
-          type: string
-          enum: [mainnet, testnet]
-        hash_hex: { $ref: '#/components/schemas/Hex20' }
-        prefix:
-          type: string
-          examples: ["ent1q", "ent1t"]
-        reason:
-          type: string
-          description: Present only when valid=false
-
-    FeeEstimate:
-      type: object
-      properties:
-        feerate_sats: { type: integer, format: int64 }
-        feerate_entl: { type: number, format: double }
-        mempool_size: { type: integer }
-        note: { type: string }
-
-    FeeEstimateAdvanced:
-      type: object
-      properties:
-        next_block_sats: { type: integer, format: int64 }
-        medium_priority: { type: integer, format: int64 }
-        slow_priority: { type: integer, format: int64 }
-        mempool_median: { type: integer, format: int64 }
-        mempool_size: { type: integer }
-        recommended_entl: { type: string }
-
-    MempoolEntry:
-      type: object
-      properties:
-        txid: { $ref: '#/components/schemas/Hex32' }
-        fee: { type: integer, format: int64 }
-        fee_entl: { type: number, format: double }
-        time:
-          type: integer
-          format: int64
-          description: Unix epoch when the tx was added to mempool
-
-    RawMempool:
-      oneOf:
-        - type: object
-          required: [size, txids]
-          properties:
-            size: { type: integer }
-            txids:
-              type: array
-              items: { $ref: '#/components/schemas/Hex32' }
-        - type: object
-          required: [size, transactions]
-          properties:
-            size: { type: integer }
-            transactions:
-              type: array
-              items: { $ref: '#/components/schemas/MempoolEntry' }
+        address: { $ref: '#/components/schemas/Address' }
+        height: { type: integer }
+        balance_sats: { $ref: '#/components/schemas/Satoshis' }
+        balance_bloch: { type: number }
+        tx_count_up_to_height: { type: integer }
 
     AddressHistoryEntry:
       type: object
       properties:
         txid: { $ref: '#/components/schemas/Hex32' }
-        block_height: { $ref: '#/components/schemas/Height' }
-        timestamp: { type: integer, format: int64 }
-        confirmations: { type: integer, format: int64 }
-        direction:
-          type: string
-          enum: [incoming, outgoing, self]
+        block_height: { type: integer }
+        timestamp: { type: integer }
+        confirmations: { type: integer }
+        direction: { type: string, enum: [incoming, outgoing, self] }
         amount_sats: { $ref: '#/components/schemas/Satoshis' }
-        amount_entl: { $ref: '#/components/schemas/ENTL' }
+        amount_bloch: { type: number }
 
     ListTransactionsResult:
       type: object
+      description: listtransactions result.
       properties:
         address: { $ref: '#/components/schemas/Address' }
         count: { type: integer }
         total_available: { type: integer }
-        start_height: { type: integer, format: int64 }
-        end_height: { type: integer, format: int64 }
+        start_height: { type: integer }
+        end_height: { type: integer }
         limit: { type: integer }
         offset: { type: integer }
         transactions:
           type: array
           items: { $ref: '#/components/schemas/AddressHistoryEntry' }
 
-    AddressInfo:
+    AddressValidation:
       type: object
+      description: validateaddress result.
       properties:
-        address: { $ref: '#/components/schemas/Address' }
-        balance_sats: { $ref: '#/components/schemas/Satoshis' }
-        balance_entl: { $ref: '#/components/schemas/ENTL' }
-        utxo_count: { type: integer }
-        pending_incoming: { $ref: '#/components/schemas/Satoshis' }
-        pending_outgoing: { $ref: '#/components/schemas/Satoshis' }
-        is_treasury: { type: boolean }
+        address: { type: string }
+        isvalid: { type: boolean }
+        network: { type: string, enum: [mainnet, testnet, unknown] }
+        checksum: { type: boolean }
 
-    Treasury:
+    AddressValidationVerbose:
+      description: validateaddressverbose — one of two shapes depending on validity.
+      oneOf:
+        - type: object
+          required: [valid, address, network, hash_hex, prefix]
+          properties:
+            valid: { const: true }
+            address: { type: string }
+            network: { type: string, enum: [mainnet, testnet] }
+            hash_hex: { $ref: '#/components/schemas/Hex20' }
+            prefix: { type: string }
+        - type: object
+          required: [valid, address, reason]
+          properties:
+            valid: { const: false }
+            address: { type: string }
+            reason: { type: string }
+
+    BroadcastResult:
+      type: object
+      description: sendrawtransaction success.
+      properties:
+        txid: { $ref: '#/components/schemas/Hex32' }
+
+    FeeEstimate:
+      type: object
+      description: estimatefee — median fee of current mempool entries.
+      properties:
+        feerate_sats: { type: integer }
+        feerate_bloch: { type: number }
+        mempool_size: { type: integer }
+        note: { type: string }
+
+    FeeEstimateAdvanced:
+      type: object
+      description: estimatefeeadvanced result.
+      properties:
+        next_block_sats: { type: integer }
+        medium_priority: { type: integer }
+        slow_priority: { type: integer }
+        mempool_median: { type: integer }
+        mempool_size: { type: integer }
+        recommended_bloch: { type: string, description: Formatted BLCH string (8 decimals). }
+
+    MempoolEntry:
+      type: object
+      description: getrawmempool verbose entry.
+      properties:
+        txid: { $ref: '#/components/schemas/Hex32' }
+        fee: { type: integer }
+        fee_bloch: { type: number }
+        time: { type: integer }
+
+    RawMempool:
+      description: getrawmempool — compact (txids) or verbose (transactions) shape.
+      oneOf:
+        - type: object
+          properties:
+            size: { type: integer }
+            txids:
+              type: array
+              items: { $ref: '#/components/schemas/Hex32' }
+        - type: object
+          properties:
+            size: { type: integer }
+            transactions:
+              type: array
+              items: { $ref: '#/components/schemas/MempoolEntry' }
+
+    MempoolBucket:
       type: object
       properties:
-        address: { $ref: '#/components/schemas/Hex20' }
-        entl_address: { $ref: '#/components/schemas/Address' }
-        balance: { $ref: '#/components/schemas/Satoshis' }
-        entl: { $ref: '#/components/schemas/ENTL' }
-        utxo_count: { type: integer }
-        tax_percent: { type: integer, description: Fraction of block reward to treasury }
-        reward_per_block: { type: integer, format: int64 }
-        entl_per_block: { type: number, format: double }
-        entl_per_day: { type: number, format: double }
+        range: { type: string }
+        tx_count: { type: integer }
+
+    MempoolStats:
+      type: object
+      description: getmempoolstats result.
+      properties:
+        size: { type: integer }
+        total_fees: { type: integer }
+        min_fee: { type: integer }
+        max_fee: { type: integer }
+        median_fee: { type: integer }
+        avg_fee: { type: number }
+        buckets:
+          type: array
+          items: { $ref: '#/components/schemas/MempoolBucket' }
+
+    TxStatus:
+      type: object
+      description: gettxstatus result.
+      properties:
+        status: { type: string, enum: [unknown, pending, confirmed, final] }
+        in_mempool: { type: boolean }
+        confirmations: { type: integer }
+        block_height: { type: integer, description: Present when confirmed/final. }
+        txid: { $ref: '#/components/schemas/Hex32' }
 
     ChainStats:
       type: object
+      description: getchainstats result.
       properties:
-        total_blocks: { type: integer, format: int64 }
-        total_txs: { type: integer, format: int64 }
-        avg_txs_per_block: { type: number, format: double }
+        total_blocks: { type: integer }
+        total_txs: { type: integer }
+        avg_txs_per_block: { type: number }
         blocks_last_24h: { type: integer }
         txs_last_24h: { type: integer }
-        avg_block_time_secs: { type: number, format: double }
-        current_difficulty: { type: integer, format: int64 }
-        hashrate_hs:
-          type: number
-          format: double
-          description: Estimated hashrate in hashes per second
-        hashrate_human:
-          type: string
-          examples: ["2.26 KH/s", "1.05 MH/s"]
+        avg_block_time_secs: { type: number }
+        current_difficulty: { type: number }
+        hashrate_hs: { type: number }
+        hashrate_human: { type: string }
 
     HashrateInfo:
       type: object
+      description: gethashrate result.
       properties:
-        hashrate_hs: { type: number, format: double }
+        hashrate_hs: { type: number }
         hashrate_human: { type: string }
-        avg_block_time_secs: { type: number, format: double }
-        current_difficulty: { type: integer, format: int64 }
+        avg_block_time_secs: { type: number }
+        current_difficulty: { type: number }
 
     SupplyTier:
       type: object
       properties:
-        label:
-          type: string
-          examples: ["< 1 ENTL", "1-10 ENTL", "10-100 ENTL"]
+        label: { type: string }
         address_count: { type: integer }
         total_sats: { $ref: '#/components/schemas/Satoshis' }
-        total_entl: { $ref: '#/components/schemas/ENTL' }
-        pct_of_supply: { type: number, format: double }
+        total_bloch: { type: number }
+        pct_of_supply: { type: number }
 
     SupplyDistribution:
       type: object
+      description: getsupplydistribution result.
       properties:
         tiers:
           type: array
           items: { $ref: '#/components/schemas/SupplyTier' }
         total_addresses: { type: integer }
         total_sats: { $ref: '#/components/schemas/Satoshis' }
-        total_entl: { $ref: '#/components/schemas/ENTL' }
+        total_bloch: { type: number }
 
     DifficultyPoint:
       type: object
       properties:
-        height: { $ref: '#/components/schemas/Height' }
-        bits: { type: integer, format: int64 }
-        bits_hex:
-          type: string
-          examples: ["0x1d00ffff"]
-        timestamp: { type: integer, format: int64 }
+        height: { type: integer }
+        bits: { type: integer }
+        bits_hex: { type: string }
+        timestamp: { type: integer }
         target_hex: { type: string }
 
     DifficultyHistory:
       type: object
+      description: getdifficultyhistory result.
       properties:
         count: { type: integer }
         points:
@@ -782,59 +776,17 @@ components:
 
     BlockTimePercentiles:
       type: object
+      description: getblocktimepercentiles result.
       properties:
         sample_size: { type: integer }
         window: { type: integer }
-        min_secs: { type: number, format: double }
-        p50_secs: { type: number, format: double }
-        p90_secs: { type: number, format: double }
-        p99_secs: { type: number, format: double }
-        max_secs: { type: number, format: double }
-        avg_secs: { type: number, format: double }
-        target_secs:
-          type: integer
-          description: Target block time constant (10s)
-
-    TxStatus:
-      type: object
-      properties:
-        status:
-          type: string
-          enum: [unknown, pending, confirmed, final]
-          description: |
-            - `unknown`: tx not found
-            - `pending`: in mempool
-            - `confirmed`: in a block, < 100 confirmations
-            - `final`: >= 100 confirmations (coinbase-maturity depth)
-        in_mempool: { type: boolean }
-        confirmations: { type: integer, format: int64 }
-        block_height:
-          type: integer
-          format: int64
-          description: Present when status != unknown
-        txid: { $ref: '#/components/schemas/Hex32' }
-
-    MempoolBucket:
-      type: object
-      properties:
-        range:
-          type: string
-          description: Fee-rate bucket label
-          examples: ["0-10 sat/byte"]
-        tx_count: { type: integer }
-
-    MempoolStats:
-      type: object
-      properties:
-        size: { type: integer }
-        total_fees: { type: integer, format: int64 }
-        min_fee: { type: integer, format: int64 }
-        max_fee: { type: integer, format: int64 }
-        median_fee: { type: integer, format: int64 }
-        avg_fee: { type: number, format: double }
-        buckets:
-          type: array
-          items: { $ref: '#/components/schemas/MempoolBucket' }
+        min_secs: { type: number }
+        p50_secs: { type: number }
+        p90_secs: { type: number }
+        p99_secs: { type: number }
+        max_secs: { type: number }
+        avg_secs: { type: number }
+        target_secs: { type: number }
 
     TxInBlock:
       type: object
@@ -843,458 +795,350 @@ components:
         size_bytes: { type: integer }
         inputs_count: { type: integer }
         outputs_count: { type: integer }
-        fee_sats: { type: integer, format: int64 }
+        fee_sats: { type: integer }
         is_coinbase: { type: boolean }
 
     TxsByBlock:
       type: object
+      description: gettxsbyblock result.
       properties:
         block_hash: { $ref: '#/components/schemas/Hex32' }
-        block_height: { $ref: '#/components/schemas/Height' }
-        block_timestamp: { type: integer, format: int64 }
+        block_height: { type: integer }
+        block_timestamp: { type: integer }
         count: { type: integer }
         txs:
           type: array
           items: { $ref: '#/components/schemas/TxInBlock' }
 
-    AddressBalanceAtHeight:
+    PoolReportEntry:
+      type: object
+      description: One protocol pool in getpools. Founder entry adds vesting fields; a pool with no configured address reports status "pending_phase_6".
+      properties:
+        share_bps:
+          oneOf:
+            - type: integer
+            - type: "null"
+        subsidy_per_block_sat: { type: integer }
+        address_hash_hex:
+          oneOf:
+            - $ref: '#/components/schemas/Hex20'
+            - type: "null"
+        address:
+          oneOf:
+            - $ref: '#/components/schemas/Address'
+            - type: "null"
+        balance_sat: { type: integer }
+        balance_bloch: { type: number }
+        utxo_count: { type: integer }
+        status: { type: string, enum: [active, pending_phase_6] }
+        vesting_per_month_sat: { type: integer }
+        vesting_amount_at_next_sat: { type: integer }
+        vesting_active_at_next: { type: boolean }
+        vesting_total_sat: { type: integer }
+        vesting_months: { type: integer }
+
+    Pools:
+      type: object
+      description: getpools — next-block subsidy split plus per-pool address/balance.
+      properties:
+        current_height: { type: integer }
+        next_block_height: { type: integer }
+        subsidy_per_block_sat: { type: integer }
+        subsidy_per_block_bloch: { type: number }
+        miner_share_sat: { type: integer }
+        pools:
+          type: object
+          properties:
+            validator_pool: { $ref: '#/components/schemas/PoolReportEntry' }
+            oracle_pool: { $ref: '#/components/schemas/PoolReportEntry' }
+            founder: { $ref: '#/components/schemas/PoolReportEntry' }
+
+    BlockTemplateTx:
       type: object
       properties:
-        address: { $ref: '#/components/schemas/Address' }
-        height: { $ref: '#/components/schemas/Height' }
-        balance_sats: { $ref: '#/components/schemas/Satoshis' }
-        balance_entl: { $ref: '#/components/schemas/ENTL' }
-        tx_count_up_to_height: { type: integer }
+        txid: { $ref: '#/components/schemas/Hex32' }
+        fee: { type: integer }
+        data: { type: string, description: 'Hex-encoded transaction bytes (Bitcoin wire format, script_sig included).' }
 
-# ════════════════════════════════════════════════════════════════════
-#
-#   METHOD CATALOG
-#
-#   Each RPC method is documented below as a discrete section keyed by
-#   `x-entl-method`. Generators that understand JSON-RPC over HTTP
-#   (e.g. openapi-rpc-generator) can use these for codegen. Readers use
-#   them for reference.
-#
-# ════════════════════════════════════════════════════════════════════
+    BlockTemplate:
+      type: object
+      description: |
+        getblocktemplate — everything a SIS-aware pool needs to assemble a
+        candidate block. `bits` is computed exactly as accept_block validates
+        (ASERT-Lattice anchored at genesis, keyed on the parent timestamp).
+      properties:
+        parents:
+          type: array
+          items: { $ref: '#/components/schemas/Hex32' }
+        height: { type: integer }
+        blue_score: { type: integer }
+        bits: { type: integer }
+        cur_time: { type: integer }
+        parent_time: { type: integer }
+        subsidy_sat: { type: integer }
+        founder_vesting_sat: { type: integer }
+        founder_address_hash: { $ref: '#/components/schemas/Hex20' }
+        total_fees: { type: integer }
+        transactions:
+          type: array
+          items: { $ref: '#/components/schemas/BlockTemplateTx' }
+        residual_coeffs:
+          type: array
+          description: |
+            Canonical Module-SIS residual coefficients selected by this template's
+            height (SF-1 soft fork: k=4 below activation, k=8 at/above). A pool
+            that honors this mines witnesses validate_pow will accept.
+          items: { type: integer }
 
-x-entl-methods:
+    SubmitBlockResult:
+      description: submitblock — accepted, or a result.error on rejection / when the pool seam is not wired.
+      oneOf:
+        - type: object
+          properties:
+            accepted: { const: true }
+            hash: { type: string }
+        - $ref: '#/components/schemas/ResultError'
 
-  # ── Chain state ─────────────────────────────────────────────────────
+    AttestationReport:
+      type: object
+      description: |
+        getattestation — TEE attestation status. Reports `attested: false` when
+        no TEE provider is active (the honest default on a non-confidential
+        host). Serialized directly from the node's AttestationReport.
+      properties:
+        attested: { type: boolean }
+        tee: { type: string, description: 'Backend that produced the report (e.g. none / sev-snp / tdx).' }
+        nonce:
+          description: Echoed freshness challenge (params[0]) if supplied.
+          oneOf: [ { type: string }, { type: "null" } ]
+        measurement:
+          oneOf: [ { type: string }, { type: "null" } ]
+        hostdata:
+          oneOf: [ { type: string }, { type: "null" } ]
+        image_digest:
+          oneOf: [ { type: string }, { type: "null" } ]
+        quote_b64:
+          oneOf: [ { type: string }, { type: "null" } ]
+        os_roothash:
+          oneOf: [ { type: string }, { type: "null" } ]
+        note: { type: string }
+
+# ── Per-method contract (OpenAPI has no native JSON-RPC modelling) ──────────
+# This vendor extension documents each method's positional params and the
+# result schema returned inside the JSON-RPC `result` field. Any method can
+# instead return `{ "error": "<message>" }` (ResultError) on failure.
+x-json-rpc-methods:
+
   getnetworkinfo:
-    tags: [Chain state]
-    summary: Overall node / network status
-    description: Returns version, peer count, sync status, chain metadata.
+    category: chain-state
     params: []
     result: { $ref: '#/components/schemas/NetworkInfo' }
-    example_result:
-      network: mainnet
-      version: "0.5.9"
-      protocol: 1
-      net_protocol: 1
-      blue_score: 9
-      blocks: 9
-      peers: 19
-      mempool: 0
-      syncing: false
-      chain: entl
-      pruned_height: 0
 
   getblockcount:
-    tags: [Chain state]
-    summary: Height of the selected chain tip
+    category: chain-state
     params: []
-    result:
-      type: integer
-      format: int64
-    example_result: 9
+    result: { type: integer, description: Selected-chain block count. }
 
   getmempoolinfo:
-    tags: [Chain state]
-    summary: Current mempool size
+    category: chain-state
     params: []
     result: { $ref: '#/components/schemas/MempoolInfo' }
-    example_result: { size: 0 }
 
   getdaginfo:
-    tags: [Chain state]
-    summary: DAG structure (tips, blue score, GhostDAG parameters)
+    category: chain-state
     params: []
     result: { $ref: '#/components/schemas/DagInfo' }
 
   getpeerinfo:
-    tags: [Chain state]
-    summary: Compact peer count + sync status
+    category: chain-state
     params: []
     result: { $ref: '#/components/schemas/PeerInfo' }
 
   getpeers:
-    tags: [Chain state]
-    summary: Full list of known peers with IP and PeerId
-    description: |
-      **Known issue (v0.5.9):** includes stale peers that failed to
-      complete the Kyber handshake. `peer_count` may overstate the
-      number of peers in the transaction gossip mesh. Fix tracked in
-      SPRINTS.md.
+    category: chain-state
     params: []
     result: { $ref: '#/components/schemas/PeersList' }
 
-  # ── Block queries ───────────────────────────────────────────────────
   getblockhash:
-    tags: [Blocks]
-    summary: Get block hash at a given height
+    category: blocks
     params:
-      - name: height
-        in: params
-        required: true
-        schema: { $ref: '#/components/schemas/Height' }
-    result:
-      oneOf:
-        - $ref: '#/components/schemas/Hex32'
-        - $ref: '#/components/schemas/MethodErrorResult'
+      - { name: height, type: integer, required: true }
+    result: { $ref: '#/components/schemas/Hex32', description: 'Block hash hex, or result.error if height not found.' }
 
   getblock:
-    tags: [Blocks]
-    summary: Full block by hash
+    category: blocks
     params:
-      - name: hash
-        in: params
-        required: true
-        schema: { $ref: '#/components/schemas/Hex32' }
-      - name: verbose
-        in: params
-        required: false
-        schema:
-          type: boolean
-          default: false
-          description: If true, transactions are fully expanded
+      - { name: hash, type: string, required: true, description: Block hash (64 hex). }
+      - { name: verbose, type: boolean, required: false, default: false, description: true expands full transactions; false lists txids. }
     result: { $ref: '#/components/schemas/Block' }
 
   getblockbyheight:
-    tags: [Blocks]
-    summary: Full block by height
+    category: blocks
     params:
-      - name: height
-        in: params
-        required: true
-        schema: { $ref: '#/components/schemas/Height' }
-      - name: verbose
-        in: params
-        required: false
-        schema:
-          type: boolean
-          default: false
+      - { name: height, type: integer, required: true }
+      - { name: verbose, type: boolean, required: false, default: false }
     result: { $ref: '#/components/schemas/Block' }
 
   getrecentblocks:
-    tags: [Blocks]
-    summary: Most recent blocks (newest first)
+    category: blocks
     params:
-      - name: count
-        in: params
-        required: false
-        schema:
-          type: integer
-          default: 10
-          minimum: 1
-          maximum: 50
+      - { name: count, type: integer, required: false, default: 10, maximum: 50 }
     result:
       type: array
       items: { $ref: '#/components/schemas/BlockSummary' }
 
   gettxsbyblock:
-    tags: [Blocks]
-    summary: List transactions in a given block (with size and fees)
-    description: |
-      Accepts either a 64-hex block hash or a numeric height.
-      Returns per-transaction size, input/output counts, fee, coinbase flag.
+    category: blocks
     params:
-      - name: block_identifier
-        in: params
-        required: true
-        schema:
-          oneOf:
-            - $ref: '#/components/schemas/Hex32'
-            - type: integer
-              format: int64
+      - { name: block, required: true, description: '64-hex block hash, or a height (number or numeric string).' }
     result: { $ref: '#/components/schemas/TxsByBlock' }
 
-  # ── Transaction queries ─────────────────────────────────────────────
   gettransaction:
-    tags: [Transactions]
-    summary: Look up a transaction by txid (O(1) via tx index)
+    category: transactions
     params:
-      - name: txid
-        in: params
-        required: true
-        schema: { $ref: '#/components/schemas/Hex32' }
+      - { name: txid, type: string, required: true }
     result: { $ref: '#/components/schemas/TransactionLookup' }
 
   gettxstatus:
-    tags: [Transactions]
-    summary: Lightweight status for a transaction (mempool vs confirmed vs final)
+    category: transactions
     params:
-      - name: txid
-        in: params
-        required: true
-        schema: { $ref: '#/components/schemas/Hex32' }
+      - { name: txid, type: string, required: true }
     result: { $ref: '#/components/schemas/TxStatus' }
 
   decoderawtransaction:
-    tags: [Transactions]
-    summary: Decode a hex-encoded bincode-serialized transaction
+    category: transactions
     params:
-      - name: hex_tx
-        in: params
-        required: true
-        schema:
-          type: string
-          description: Hex of the bincode-serialized Transaction
+      - { name: hex, type: string, required: true, description: 'Bitcoin-format tx bytes, hex-encoded.' }
     result: { $ref: '#/components/schemas/Transaction' }
 
   getrawmempool:
-    tags: [Transactions]
-    summary: Transactions currently in the mempool
+    category: transactions
     params:
-      - name: verbose
-        in: params
-        required: false
-        schema:
-          type: boolean
-          default: false
+      - { name: verbose, type: boolean, required: false, default: false }
     result: { $ref: '#/components/schemas/RawMempool' }
 
-  # ── Address queries ─────────────────────────────────────────────────
+  getmempoolstats:
+    category: transactions
+    params: []
+    result: { $ref: '#/components/schemas/MempoolStats' }
+
   getbalance:
-    tags: [Addresses]
-    summary: Confirmed balance and UTXO count for an address
+    category: addresses
     params:
-      - name: address
-        in: params
-        required: true
-        schema: { $ref: '#/components/schemas/Address' }
+      - { name: address, type: string, required: true }
     result: { $ref: '#/components/schemas/Balance' }
 
   getutxos:
-    tags: [Addresses]
-    summary: All unspent outputs for an address (wallet input selection)
+    category: addresses
     params:
-      - name: address
-        in: params
-        required: true
-        schema: { $ref: '#/components/schemas/Address' }
+      - { name: address, type: string, required: true }
     result: { $ref: '#/components/schemas/UtxoList' }
 
-  listtransactions:
-    tags: [Addresses]
-    summary: Paginated tx history for an address
-    description: |
-      Returns incoming/outgoing transactions that touch the address,
-      ordered by height. Requires the address-history indexer (Sprint F).
-      **Known limitation:** the indexer does not currently roll back on
-      reorgs; rare in practice given GhostDAG's shallow reorgs but worth
-      knowing for auditors.
-    params:
-      - name: address
-        in: params
-        required: true
-        schema: { $ref: '#/components/schemas/Address' }
-      - name: limit
-        in: params
-        required: false
-        schema:
-          type: integer
-          default: 20
-          minimum: 1
-          maximum: 1000
-      - name: start_height
-        in: params
-        required: false
-        schema: { type: integer, format: int64, default: 0 }
-      - name: end_height
-        in: params
-        required: false
-        schema: { type: integer, format: int64 }
-      - name: offset
-        in: params
-        required: false
-        schema: { type: integer, default: 0 }
-    result: { $ref: '#/components/schemas/ListTransactionsResult' }
-
   getaddressinfo:
-    tags: [Addresses]
-    summary: Full snapshot of an address (balance, pending, flags)
+    category: addresses
     params:
-      - name: address
-        in: params
-        required: true
-        schema: { $ref: '#/components/schemas/Address' }
+      - { name: address, type: string, required: true }
     result: { $ref: '#/components/schemas/AddressInfo' }
 
   getaddressbalance_at_height:
-    tags: [Addresses]
-    summary: Historical balance of an address at a given height
-    description: |
-      Useful for snapshots, airdrops, taxation queries. Computes the
-      balance deterministically by replaying the address history up to
-      the given height.
+    category: addresses
     params:
-      - name: address
-        in: params
-        required: true
-        schema: { $ref: '#/components/schemas/Address' }
-      - name: height
-        in: params
-        required: true
-        schema: { $ref: '#/components/schemas/Height' }
+      - { name: address, type: string, required: true }
+      - { name: height, type: integer, required: true }
     result: { $ref: '#/components/schemas/AddressBalanceAtHeight' }
 
-  validateaddress:
-    tags: [Addresses]
-    summary: Basic address validation (format + checksum)
+  getaddresscount:
+    category: addresses
+    params: []
+    result: { $ref: '#/components/schemas/AddressCount' }
+
+  listtransactions:
+    category: addresses
     params:
-      - name: address
-        in: params
-        required: true
-        schema: { type: string }
+      - { name: address, type: string, required: true }
+      - { name: limit, type: integer, required: false, default: 20, maximum: 1000 }
+      - { name: start_height, type: integer, required: false, default: 0 }
+      - { name: end_height, type: integer, required: false, description: Defaults to current tip height. }
+      - { name: offset, type: integer, required: false, default: 0 }
+    result: { $ref: '#/components/schemas/ListTransactionsResult' }
+
+  validateaddress:
+    category: addresses
+    params:
+      - { name: address, type: string, required: true }
     result: { $ref: '#/components/schemas/AddressValidation' }
 
   validateaddressverbose:
-    tags: [Addresses]
-    summary: Address validation with parsed hash and network
+    category: addresses
     params:
-      - name: address
-        in: params
-        required: true
-        schema: { type: string }
+      - { name: address, type: string, required: true }
     result: { $ref: '#/components/schemas/AddressValidationVerbose' }
 
-  # ── Broadcast ───────────────────────────────────────────────────────
-  sendrawtransaction:
-    tags: [Broadcast]
-    summary: Submit a signed, bincode-serialized transaction to the mempool
-    x-auth-required: conditional
-    x-auth-note: |
-      Sprint M: nodes running with `--rpc-require-auth-for-writes`
-      return 401 for unauthenticated calls to this method (except from
-      localhost). All other methods are read-only and do not require
-      auth. Per-IP rate limit: 5 writes/min by default.
-    description: |
-      The only mutating RPC method. The transaction is deserialized,
-      validated for mempool acceptance, and (if valid) gossipped to
-      peers via libp2p gossipsub.
-
-      **Validation checks (mempool acceptance, not full consensus):**
-      - Not a coinbase
-      - Inputs reference existing UTXOs
-      - ML-DSA-65 signatures verify for every input
-      - No intra-mempool double-spend
-      - Fee >= min relay fee
-      - Size <= 400 KB
-
-      **Known divergence:** mempool validation is stricter than block
-      validation in some edge cases. See SPRINTS.md → Sprint N-full.
-
-      Production security note: this endpoint has no auth or rate
-      limiting by default. Operators running with `--rpc-public` should
-      reverse-proxy.
-    params:
-      - name: hex_tx
-        in: params
-        required: true
-        schema:
-          type: string
-          description: Hex of the bincode-serialized Transaction
-    result:
-      oneOf:
-        - $ref: '#/components/schemas/BroadcastResult'
-        - $ref: '#/components/schemas/MethodErrorResult'
-    errors:
-      - "invalid hex"
-      - "deserialise failed"
-      - "coinbase not accepted"
-      - "signature invalid"
-      - "double-spend in mempool"
-      - "fee below minimum"
-      - "tx too large"
-
-  # ── Fee estimation ──────────────────────────────────────────────────
   estimatefee:
-    tags: [Fees]
-    summary: Simple fee estimate (median of mempool)
+    category: fees
     params: []
     result: { $ref: '#/components/schemas/FeeEstimate' }
 
   estimatefeeadvanced:
-    tags: [Fees]
-    summary: Priority-tiered fee estimates (next-block / medium / slow)
+    category: fees
     params: []
     result: { $ref: '#/components/schemas/FeeEstimateAdvanced' }
 
-  # ── Analytics ───────────────────────────────────────────────────────
+  sendrawtransaction:
+    category: write
+    write: true
+    auth: Requires X-API-Key when require_auth_for_writes is on and the caller is non-local; localhost bypasses.
+    params:
+      - { name: hex, type: string, required: true, description: 'Signed transaction, Bitcoin-format bytes, hex-encoded. Coinbase not accepted.' }
+    result: { $ref: '#/components/schemas/BroadcastResult' }
+
   getchainstats:
-    tags: [Analytics]
-    summary: Aggregate chain metrics (blocks, txs, hashrate, etc.)
-    description: |
-      **Known issue (v0.5.9):** `avg_block_time_secs` can return
-      spurious large values when blocks have out-of-order timestamps
-      in the DAG. Uses height ordering rather than selected-chain
-      ordering. Fix tracked in SPRINTS.md.
+    category: chain-state
     params: []
     result: { $ref: '#/components/schemas/ChainStats' }
 
   gethashrate:
-    tags: [Analytics]
-    summary: Estimated network hashrate
+    category: chain-state
     params: []
     result: { $ref: '#/components/schemas/HashrateInfo' }
 
   getsupplydistribution:
-    tags: [Analytics]
-    summary: Supply breakdown by address tier (for Gini / concentration)
+    category: chain-state
     params: []
     result: { $ref: '#/components/schemas/SupplyDistribution' }
 
   getdifficultyhistory:
-    tags: [Analytics]
-    summary: Historical difficulty points at each retarget
+    category: chain-state
     params:
-      - name: limit
-        in: params
-        required: false
-        schema:
-          type: integer
-          default: 20
-          minimum: 1
-          maximum: 100
+      - { name: limit, type: integer, required: false, default: 20, maximum: 100 }
     result: { $ref: '#/components/schemas/DifficultyHistory' }
 
   getblocktimepercentiles:
-    tags: [Analytics]
-    summary: Percentiles of block times over a recent window
+    category: chain-state
     params:
-      - name: window
-        in: params
-        required: false
-        schema:
-          type: integer
-          default: 100
-          minimum: 10
-          maximum: 1000
+      - { name: window, type: integer, required: false, default: 100, minimum: 10, maximum: 1000 }
     result: { $ref: '#/components/schemas/BlockTimePercentiles' }
 
-  getmempoolstats:
-    tags: [Analytics]
-    summary: Fee-rate distribution and stats for the current mempool
+  getpools:
+    category: chain-state
     params: []
-    result: { $ref: '#/components/schemas/MempoolStats' }
+    result: { $ref: '#/components/schemas/Pools' }
 
-  # ── Treasury ────────────────────────────────────────────────────────
-  gettreasury:
-    tags: [Treasury]
-    summary: Treasury balance + tax schedule
-    description: |
-      The treasury address is deterministic (derived at genesis) and
-      receives `TREASURY_PERCENT` (2%) of each block's coinbase reward in
-      addition to the miner's share.
+  getattestation:
+    category: chain-state
+    params:
+      - { name: nonce, type: string, required: false, description: Optional freshness challenge echoed into the report. }
+    result: { $ref: '#/components/schemas/AttestationReport' }
+
+  getblocktemplate:
+    category: mining
     params: []
-    result: { $ref: '#/components/schemas/Treasury' }
+    result: { $ref: '#/components/schemas/BlockTemplate' }
+
+  submitblock:
+    category: mining
+    write: true
+    auth: Treated as a write (auth/rate-limit like sendrawtransaction). Returns result.error when the pool seam is not wired.
+    params:
+      - { name: block, type: string, required: true, description: 'Full block, Bitcoin wire format, hex-encoded.' }
+    result: { $ref: '#/components/schemas/SubmitBlockResult' }
