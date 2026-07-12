@@ -2,7 +2,11 @@
 //! it must commit to every output, every input outpoint, and the signed input's
 //! index — so signatures can't be replayed across txs or have outputs redirected.
 
-use bloch::core::{Transaction, TxInput, TxOutput};
+use bloch::core::{Transaction, TxInput, TxOutput, ChainId};
+
+// Fixed chain-id for these relative-digest comparisons (Roadmap #8 threaded the
+// chain-id explicitly into sighash; the properties under test are chain-agnostic).
+const CID: ChainId = ChainId::Mainnet;
 
 fn base() -> Transaction {
     Transaction {
@@ -19,25 +23,29 @@ fn base() -> Transaction {
 #[test]
 fn sighash_binds_index_outputs_and_inputs_but_not_script_sig() {
     let tx = base();
-    let h0 = tx.sighash(0);
+    let h0 = tx.sighash(0, CID);
 
     // Distinct per signed input.
-    assert_ne!(h0, tx.sighash(1), "each input must sign a distinct hash");
+    assert_ne!(h0, tx.sighash(1, CID), "each input must sign a distinct hash");
 
     // Commits to outputs — no value or recipient can be changed post-signing.
     let mut v = base(); v.outputs[0].value = 101;
-    assert_ne!(h0, v.sighash(0), "output value must be committed");
+    assert_ne!(h0, v.sighash(0, CID), "output value must be committed");
     let mut a = base(); a.outputs[0].script_pubkey = vec![8u8; 20];
-    assert_ne!(h0, a.sighash(0), "output recipient must be committed");
+    assert_ne!(h0, a.sighash(0, CID), "output recipient must be committed");
 
     // Commits to input outpoints — no cross-tx replay onto different UTXOs.
     let mut i = base(); i.inputs[1].prev_txid = [7u8; 32];
-    assert_ne!(h0, i.sighash(0), "input outpoints must be committed");
+    assert_ne!(h0, i.sighash(0, CID), "input outpoints must be committed");
+
+    // Cross-chain-id replay: the SAME tx signs a different digest on another
+    // chain (Roadmap #8 domain separation).
+    assert_ne!(h0, tx.sighash(0, ChainId::Testnet), "chain-id must be committed");
 
     // Does NOT commit to script_sig (you cannot sign your own signature) —
     // the sighash strips it, so a different script_sig yields the same hash.
     let mut s = base(); s.inputs[0].script_sig = vec![5, 5, 5];
-    assert_eq!(h0, s.sighash(0), "script_sig must not affect the sighash");
+    assert_eq!(h0, s.sighash(0, CID), "script_sig must not affect the sighash");
 }
 
 #[test]

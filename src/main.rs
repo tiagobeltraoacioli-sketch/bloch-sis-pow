@@ -161,6 +161,15 @@ async fn main() {
 
     let cli = Cli::parse();
 
+    // Roadmap #8: wire the node-level chain-id ONCE at startup from the runtime
+    // network selection, before any validation runs. The miner and every
+    // validator read core::node_chain_id() (design §4.3 invariant 6); without
+    // this call a testnet node would default to the Mainnet sighash domain and
+    // reject every correctly-signed testnet transaction.
+    core::set_node_chain_id(
+        if cli.testnet { core::ChainId::Testnet } else { core::ChainId::Mainnet }
+    ).expect("node chain-id must be settable exactly once at startup");
+
     // FIX v0.5.1 BLK-3: apply --rpc-public escape hatch.
     let rpc_bind = if cli.rpc_public { "0.0.0.0".to_string() } else { cli.rpc_bind.clone() };
 
@@ -1785,8 +1794,10 @@ fn validate_tx_inputs(
             return Err(format!("pubkey mismatch at input {}", i));
         }
 
-        // Verify hybrid ML-DSA-65 ‖ Falcon-1024 signature
-        let sighash = tx.sighash(i);
+        // Verify hybrid ML-DSA-65 ‖ Falcon-1024 signature. Chain-id (Roadmap #8)
+        // is the node-level single source of truth — miner and validator share it
+        // (see core::node_chain_id / set_node_chain_id).
+        let sighash = tx.sighash(i, core::node_chain_id());
         if !crypto::verify(&pk, &sighash, &sig) {
             return Err(format!("invalid signature at input {}", i));
         }

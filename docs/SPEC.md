@@ -57,28 +57,49 @@ Fixed ML-DSA-65 lengths (`crypto/mod.rs:20-22`):
 | `MLDSA_SECRET_LEN` | 4032 |
 | `MLDSA_SIG_LEN`    | 3309 |
 
-Composite objects (`crypto/mod.rs:24-30, 89-100`):
+**Suite-ID envelope (Roadmap #1 — crypto-agility, hard fork).** Every public key,
+secret key and signature is wrapped in a **4-byte suite header** so the verifier
+dispatches on an in-band algorithm identifier instead of fixed offsets:
 
 ```
-public_key = mldsa65_pk(1952)  ‖ falcon1024_pk(1793)      → 3745 bytes
-secret_key = mldsa65_sk(4032)  ‖ falcon1024_sk(2305)      → 6337 bytes
-signature  = mldsa65_sig(3309) ‖ falcon1024_sig(variable) → 3309 + Falcon tail
+byte 0     : 0xB1  ┐ 2-byte magic "B1 0C" (distinguishes an enveloped object
+byte 1     : 0x0C  ┘ from a legacy raw ML-DSA blob; a mismatch ⇒ verify false)
+bytes 2..4 : suite_id : u16 LE
+```
+
+Suite registry (`crypto/mod.rs`): `0x0000` reserved/invalid; `0x0001 =
+SUITE_MLDSA65_FALCON1024` (today's hybrid); `0x0002 = SUITE_MLDSA65_ONLY`
+(ML-DSA-65 only, the "Falcon removed" suite, present as a concrete proof Falcon is
+removable — no live output uses it yet); `0xFFFF` reserved. Unknown/reserved suite
+⇒ verify returns `false` (never panics). NOT a security claim; unaudited.
+
+Composite objects, **suite 0x0001** (`magic ‖ 01 00 ‖ body`):
+
+```
+public_key = HDR(4) ‖ mldsa65_pk(1952)  ‖ falcon1024_pk(1793)      → 3749 bytes
+secret_key = HDR(4) ‖ mldsa65_sk(4032)  ‖ falcon1024_sk(2305)      → 6341 bytes
+signature  = HDR(4) ‖ mldsa65_sig(3309) ‖ falcon1024_sig(variable) → 3313 + Falcon tail
 ```
 
 The Falcon-1024 signature is **variable length** (Falcon emits a
 compressed/variable signature). The verifier does NOT length-check the Falcon
-tail; it splits at the fixed ML-DSA offset and passes the remainder to Falcon
-verify (`crypto/mod.rs:110-131`). Size constants used only for fee/size
-estimation (not consensus) live at `core/mod.rs:91-93`: `PUBKEY_SIZE=3745`,
-`PRIVKEY_SIZE=6337`, `SIG_SIZE=4771` (Falcon max tail assumed 1462).
+tail; it strips the 4-byte header, then splits the body at the fixed ML-DSA offset
+and passes the remainder to Falcon verify. Size constants used only for fee/size
+estimation (not consensus) live at `core/mod.rs`: `PUBKEY_SIZE=3749`,
+`PRIVKEY_SIZE=6341`, `SIG_SIZE=4775` (header + hybrid; Falcon max tail 1462).
 
 ### 1.2 Verify semantics — AND-combiner, parse-failure ⇒ false
 
-`verify(pk, msg, sig)` (`crypto/mod.rs:102-131`) is a **strict AND-combiner**:
+`verify(pk_env, msg, sig_env)` first parses the 4-byte envelope on BOTH the pk
+and the sig (parse failure — len<4 or bad magic — ⇒ `false`), requires
+`pk_suite == sig_suite`, then dispatches on the suite. For **suite 0x0001** the
+body is verified by the **strict AND-combiner** below (identical to the
+pre-envelope path, now on the post-header `*_body` slices); suite 0x0002 verifies
+an ML-DSA-65-only body; any other suite ⇒ `false`:
 
-1. If `pk.len() <= 1952` **or** `sig.len() <= 3309`, return `false`
-   (`crypto/mod.rs:110-114`). Note the comparison is `<=`, so a signature with a
-   zero-length Falcon tail is rejected.
+1. If `pk_body.len() <= 1952` **or** `sig_body.len() <= 3309`, return `false`.
+   Note the comparison is `<=`, so a signature with a zero-length Falcon tail is
+   rejected.
 2. Split `pk` at 1952 → `(mpk, fpk)`; split `sig` at 3309 → `(msig, fsig)`.
 3. Parse `mpk` and `msig`; **any parse error ⇒ return `false`**
    (`crypto/mod.rs:118-125`). This is the documented "Audit L-1 fix" and is a
@@ -93,10 +114,10 @@ estimation (not consensus) live at `core/mod.rs:91-93`: `PUBKEY_SIZE=3745`,
 (`crypto/mod.rs:282-290`): a cryptanalytic break of one lattice family does not
 by itself forge a signature. Auditor note: this is EUF-CMA-robust only because
 both halves sign the **identical** `message` byte string — there is no distinct
-per-half message transform. There is no independent test asserting "valid ML-DSA
-half ‖ garbage Falcon half ⇒ false" at the hybrid boundary (only a Falcon-only
-tamper test at `crypto/mod.rs:331`); adding hybrid boundary tests is roadmap
-§2.5.
+per-half message transform. Hybrid-boundary tamper tests now exist
+(`golden_vector_verifies_and_rejects_tampering` flips each half; the envelope
+negatives cover bad-magic / unknown-suite / suite-mismatch / header-only;
+`tests/sprint_b6_hybrid_sig.rs` covers the both-halves-required property).
 
 ### 1.3 Signing
 
@@ -159,15 +180,19 @@ into the 20-byte hash or the checksum. Parsing/validation is in
 `address.rs:65-98` (prefix, exactly 48 hex chars → 24 bytes, checksum equality).
 
 The on-chain commitment is the bare 20-byte hash: `script_pubkey` is exactly
-`SHA3-256(pubkey)[0..20]` (`core/mod.rs:636-641`). **This is P2PKH-equivalent:
-one hybrid signature authorises one input. There is no script/opcode system, no
-multisig, no timelock predicate.**
+`SHA3-256(pubkey)[0..20]`, where `pubkey` is now the **enveloped** public key
+(4-byte suite header ‖ body — §1.1). **This is P2PKH-equivalent: one hybrid
+signature authorises one input. There is no script/opcode system, no multisig, no
+timelock predicate.**
 
-**Crypto-agility gap:** the address carries no algorithm-suite identifier. Its
-security is the min over any signature suite whose pubkey can hash to the same 20
-bytes. Since a spend reveals the full pubkey (and thus, implicitly, the suite via
-its fixed offsets), addresses are algorithm-agnostic by construction — but there
-is no suite-id anywhere (see §10).
+**Crypto-agility (Roadmap #1 — addresses now suite-committing).** Because the
+address hashes the enveloped pubkey (header included), a `SUITE_MLDSA65_ONLY` key
+and a `SUITE_MLDSA65_FALCON1024` key with the same ML-DSA body hash to **different**
+addresses. This closes the earlier gap where an address's security was the min over
+any suite whose pubkey could hash to the same 20 bytes: the suite is now bound by
+the address. The spend-time check (`SHA3-256(pk)[..20] == script_pubkey`) is
+unchanged and Just Works — both sides hash the same enveloped bytes. NOTE: this
+changed every pubkey, signature, and address — a hard fork bundled pre-mainnet.
 
 ### 2.2 Diversified (unlinkable) addresses
 
@@ -280,11 +305,17 @@ k·β² < q²` is asserted at **compile time** for both k=4 and k=8, and via
 gate structurally non-trivial; it is defensive engineering, not a security proof.
 
 **Activation height is a PLACEHOLDER.** `CANONICAL_K_ACTIVATION_HEIGHT =
-1_000_000` (`core/mod.rs:141`) is a clearly-future placeholder that **MUST be set
+1_000_000` (`core/mod.rs`) is a clearly-future placeholder that **MUST be set
 to `current tip + safety margin` before any live SF-1 deploy**, with every mining
-node upgraded before the chain reaches it (`core/mod.rs:120-141`). Shipping the
-placeholder to mainnet is a release-blocking error (roadmap P0.5 asks for a CI
-guard; none exists yet).
+node upgraded before the chain reaches it. There being no live mainnet, the
+constant deliberately STAYS at the placeholder; a named `PLACEHOLDER_ACTIVATION_HEIGHT`
+mirror plus a **CI guard** (`core/mod.rs`, test `mainnet_release_guard::
+canonical_k_activation_height_is_set_for_mainnet`, gated behind a `mainnet` cargo
+feature) fails a mainnet artifact whose height is still the placeholder, is
+`u64::MAX`, or is implausibly large. Default `--features node` builds do not
+compile the guard and keep the placeholder green; the guard bites only when a
+mainnet release is cut. (The compile-time `CANONICAL ≥ TESTNET` assert stays
+independent and valid.)
 
 ### 3.4 Domain separation (`shake.rs`)
 
@@ -371,47 +402,55 @@ by remaining bytes, never by the untrusted count alone ("audit M1").
   `"height:N"` encoding + extranonce make it unique). Coinbase is identified by a
   single input with `prev_txid == [0u8;32]` and `prev_index == u32::MAX`.
 
-### 4.4 Sighash — SIGHASH_ALL-style (FROZEN) — with a KNOWN GAP
+### 4.4 Sighash — SIGHASH_ALL-style, chain-id bound (v2, Roadmap #8)
 
-`Transaction::sighash(input_index)` (`core/mod.rs:869-891`):
+`Transaction::sighash(input_index, chain_id)` (`core/mod.rs`):
 
 ```
 stripped = tx.clone()
 for each input i:
     input[i].script_sig = (i == input_index) ? b"BLOCH_SIGHASH" : []
-sighash = SHA3-256( bincode::standard( stripped ) )
+body     = bincode::standard( stripped )                 // the v1 body, unchanged
+preimage = SIGHASH_DOMAIN(16) ‖ [SIGHASH_VERSION=0x02](1)
+           ‖ chain_id.to_le_bytes()(4) ‖ body            // 21-byte fixed prefix
+sighash  = SHA3-256( preimage )
 ```
+
+`SIGHASH_DOMAIN = b"BLOCH-SIGHASH-v2"` (16B). `chain_id : ChainId` is a u32 LE
+registry — `Mainnet = 0xB10C_0001`, `Testnet = 0xB10C_0002` — folded into the
+signed preimage. All prefix fields are fixed length and only the trailing bincode
+blob is variable, so the concatenation is unambiguous.
 
 It commits to `version`, `locktime`, **every** input's outpoint
 (`prev_txid`/`prev_index`/`sequence`), the signed input's index (via the
-`BLOCH_SIGHASH` marker on that input only), and **every** output. The spent
-UTXO's *value* is bound implicitly — the verifier looks it up by outpoint. The
-encoder uses `.expect` (not `unwrap_or_default`) precisely so a silent empty
-encoding cannot turn the sighash into a fixed replayable constant
-(`core/mod.rs:882-889`).
+`BLOCH_SIGHASH` marker on that input only), **every** output, AND the chain-id.
+The spent UTXO's *value* is bound implicitly — the verifier looks it up by
+outpoint. The encoder uses `.expect` (not `unwrap_or_default`) precisely so a
+silent empty encoding cannot turn the sighash into a fixed replayable constant.
 
-> **⚠ KNOWN GAP — no chain-id / network domain separation in the signed bytes.**
-> The sighash contains **no chain-id, network tag, or genesis binding**. A signed
-> transaction is therefore structurally replayable across any two Bloch chains
-> whose outpoints coincide — **testnet ↔ mainnet and any future fork replay is
-> NOT prevented at the signature level.** The `bloch1q`/`bloch1t` address prefix
-> is a display-only distinction and does not enter the signed message. Closing
-> this is roadmap P0.4 (`sighash = SHA3-256(DOMAIN ‖ chain_id ‖ …)`), a hard fork
-> that MUST be scheduled before mainnet. An auditor must treat this as an
-> intentional, documented, currently-open gap.
+**Chain-id closes the cross-fork replay gap.** A mainnet signature is over a
+preimage containing `0xB10C_0001`; presenting the same bytes on testnet makes the
+verifier recompute with `0xB10C_0002` → a different 32-byte digest → ML-DSA and
+Falcon both fail, *even when outpoints coincide*. `chain_id` is an EXPLICIT
+consensus input threaded from the node's network (`ChainId::for_network` /
+`core::node_chain_id()`), NOT taken from the transaction and NOT a compile-time
+flag. This changed the signed bytes of every tx — a hard fork bundled pre-mainnet.
+NO security property is claimed (unaudited).
 
 Also note the digest is over **bincode** here, whereas `txid` uses the stratum
 byte format — two different serializers are load-bearing in the tx path.
 
-### 4.5 Verification path (`src/main.rs:1750-1807`, mirror in `src/rpc/mod.rs:1290-1299`)
+### 4.5 Verification path (`src/main.rs`, mirror in `src/rpc/mod.rs`)
 
 Per input: parse `script_sig` → `(sig, pk)`; require
-`SHA3-256(pk)[0..20] == utxo.script_pubkey` (`main.rs:1780-1786`); then
-`crypto::verify(pk, tx.sighash(i), sig)` — the full hybrid AND-combiner
-(`main.rs:1789-1792`). Value conservation `Σ inputs ≥ Σ outputs` with checked
-arithmetic (`main.rs:1800-1806`); in-context double-spend tracking via a spent
-set (`main.rs:1760-1766`). (The inline comment "Verify ML-DSA-65 signature" is
-stale — the call is the hybrid; see §11.)
+`SHA3-256(pk)[0..20] == utxo.script_pubkey` (`pk` is the enveloped pubkey); then
+`crypto::verify(pk, tx.sighash(i, core::node_chain_id()), sig)` — the suite-ID
+dispatch over the full hybrid AND-combiner. The miner and both validators
+(block-validation in `main.rs`, mempool-admission in `rpc/mod.rs`) read the SAME
+`node_chain_id()`, so consensus is single-sourced. Value conservation
+`Σ inputs ≥ Σ outputs` with checked arithmetic; in-context double-spend tracking
+via a spent set. (The inline comment "Verify ML-DSA-65 signature" is stale — the
+call is the hybrid; see §11.)
 
 ---
 
@@ -637,7 +676,10 @@ chain): the PoW params `N/M/q/B/β` (`params.rs:5`); the three PoW domain labels
 (`lib.rs:183-194`); the mining-header 80-byte layout or `pow_hash`
 (`core/mod.rs:333-335, 456-457`); the block/header wire format
 (`core/mod.rs:456-457`); the txid/sighash algorithm; the address/checksum scheme.
-Raising `k` at the activation height is a **soft fork** (SF-1, §3.3).
+Raising `k` at the activation height is a **soft fork** (SF-1, §3.3). The
+pre-mainnet bundle #8 landed three such hard forks together: the chain-id sighash
+(§4.4), the suite-ID envelope on pk/sig (§1.1, §10), and the resulting
+suite-committing address change (§2.1).
 
 ---
 
@@ -645,10 +687,10 @@ Raising `k` at the activation height is a **soft fork** (SF-1, §3.3).
 
 | Surface | Frozen? | Where |
 |---|---|---|
-| Hybrid pk/sig byte layout (1952/3309 offsets) | **Freeze candidate** | §1.1 |
-| Address + checksum scheme | **Freeze candidate** | §2.1 |
+| Enveloped pk/sig layout (4B suite header + 1952/3309 offsets) | **Freeze candidate** | §1.1 |
+| Address + checksum scheme (hashes enveloped pk) | **Freeze candidate** | §2.1 |
 | Tx wire format + txid | **Freeze candidate** | §4.2–4.3 |
-| Tx sighash | **Freeze candidate — but see §4.4 gap; the P0.4 chain-id fix is a pending hard fork** | §4.4 |
+| Tx sighash (chain-id bound, v2) | **Freeze candidate — chain-id fix landed (§4.4)** | §4.4 |
 | Block/header wire format | **Freeze candidate** | §5 |
 | PoW structure (seed/expand/residual/aux) | **Freeze candidate** | §3 |
 | PoW canonical `(k, β)` | **NOT frozen** — research track | §3.1, §3.3 |
@@ -661,22 +703,26 @@ freeze first (roadmap P0.1).
 
 ---
 
-## 10. Crypto-agility gap (structural)
+## 10. Crypto-agility — suite-ID envelope (Roadmap #1, implemented)
 
-Algorithm identity is **implicit in fixed byte offsets** (split pk at 1952, sig at
-3309). There is **no suite-id byte** on public keys or signatures, and no
-versioned algorithm-suite registry. Consequences an auditor should record:
+Algorithm identity is now **explicit and in-band**: every pk, sk and sig carries a
+4-byte suite header (`magic B1 0C ‖ suite_id u16 LE`, §1.1) and the verifier
+dispatches on the suite id. The earlier gap (identity implicit in fixed offsets;
+no in-band version; addresses suite-agnostic) is closed:
 
-- A verifier cannot dispatch on algorithm; it *assumes* ML-DSA-65 ‖ Falcon-1024.
-- Migrating (e.g. Falcon → FIPS 206 FN-DSA, or dropping a broken half, or adding
-  an ML-DSA-only fallback) requires new fixed offsets — there is no in-band
-  version to negotiate. Roadmap §2.6 proposes a 1–2 byte suite id reusing the
-  SF-1 height-gated activation pattern; **not implemented today.**
-- Addresses carry no suite id either (§2.1).
+- The verifier parses the envelope, requires `pk_suite == sig_suite`, and
+  dispatches: `0x0001` → hybrid ML-DSA-65 ‖ Falcon-1024 AND-combiner; `0x0002` →
+  ML-DSA-65 only; unknown/reserved (`0x0000`, `0xFFFF`, …) ⇒ `false`. Parse
+  failure (len<4 / bad magic) ⇒ `false`, never a panic (consensus rule).
+- Migrating (e.g. dropping Falcon via `SUITE_MLDSA65_ONLY`, or adding FN-DSA /
+  ML-DSA-87) now registers a new suite id and a dispatch arm; old outputs keep
+  verifying via their suite arm — no forced migration. Gating *acceptance* of new
+  suites behind a height activation (reusing the SF-1 pattern) is future work.
+- Addresses commit to the suite (§2.1): the address hashes the enveloped pk.
 
-Contrast: the PoW domain labels and the Postern product wire formats DO version
-explicitly — the discipline exists in the codebase and simply has not been
-applied to the signature envelope.
+This is a design-stage, **unaudited** change; NO security property is claimed. The
+`0x0002` suite exists as a concrete proof Falcon is removable in principle — no
+live output uses it yet.
 
 ---
 
