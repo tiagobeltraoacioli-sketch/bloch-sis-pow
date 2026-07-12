@@ -98,7 +98,7 @@ async function callRpc(endpoint, method, params) {
 }
 
 const $ = (id) => document.getElementById(id);
-const esc = (s) => String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const ep = () => $("endpoint").value.trim();
 const ts = (t) => new Date(Number(t) * 1000).toISOString().replace("T", " ").replace(".000Z", "Z");
 function fmtBloch(sat) {
