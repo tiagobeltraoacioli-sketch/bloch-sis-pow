@@ -4,7 +4,7 @@
 //! Accepts transactions, deduplicates, evicts by fee rate.
 //! Sprint N-min: per-tx size cap, intra-mempool double-spend detection.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use parking_lot::RwLock;
 use crate::core::Transaction;
@@ -39,6 +39,41 @@ pub struct MempoolEntry {
     pub added_at:   u64,
 }
 
+/// P1 (roadmap §3): fixed-point fee-RATE key, `(fee * FEE_RATE_SCALE) / size`,
+/// as an `Ord` newtype over `u128`. Ordering is ascending, so the lowest-rate
+/// (eviction-target) tx is `btree.iter().next()` and the highest-rate
+/// (block-template head) is `btree.iter().next_back()`. This is the SAME
+/// fixed-point rate the eviction loop already computed at the O(n) min-scan —
+/// no new ranking semantics, only a different data structure.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+struct FeeRateKey(u128);
+
+#[inline]
+fn fee_rate_key(fee: u64, size: usize) -> FeeRateKey {
+    FeeRateKey((fee as u128 * FEE_RATE_SCALE) / (size.max(1) as u128))
+}
+
+/// Behavior-neutral time seam (roadmap §4 DST prerequisite). Production reads
+/// the wall clock (`SystemClock`), so node behavior is unchanged; the DST
+/// harness can inject a deterministic clock via `Mempool::with_clock`. This
+/// replaces the direct `SystemTime::now()` call that stamped `added_at`.
+pub trait Clock: Send + Sync {
+    /// Current time as Unix seconds.
+    fn now_secs(&self) -> u64;
+}
+
+/// Real-wall-clock `Clock` used by `Mempool::new()`. Behavior-identical to the
+/// pre-seam `SystemTime::now()` call.
+pub struct SystemClock;
+impl Clock for SystemClock {
+    fn now_secs(&self) -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+}
+
 pub struct Mempool {
     txs: RwLock<HashMap<[u8; 32], MempoolEntry>>,
     /// Sprint N-min: maps each spent outpoint to the txid that spends it.
@@ -46,19 +81,60 @@ pub struct Mempool {
     /// Invariant: for every (outpoint, spender_txid) entry, txs contains
     /// an entry with key spender_txid whose inputs include outpoint.
     spent: RwLock<HashMap<([u8; 32], u32), [u8; 32]>>,
+    /// P1 (roadmap §3): fee-rate ordered secondary index over `txs`. Maps each
+    /// `FeeRateKey` to the set of txids at that rate (the `HashSet` absorbs rate
+    /// collisions). Makes eviction O(log n) (peek lowest key) instead of an
+    /// O(n) min-scan, and gives `get_for_block` a fee-rate ordering consistent
+    /// with eviction.
+    ///
+    /// INVARIANT: the multiset of txids across all `rate_index` sets is exactly
+    /// the key set of `txs`, and each txid's key is `fee_rate_key(entry.fee,
+    /// entry.tx.actual_size())`. Mutated only on the same paths that mutate
+    /// `txs` (add / eviction / remove / remove_confirmed), always while the
+    /// `txs` write lock is held first — the lock-order doc-comment above stays
+    /// valid (txs → spent → rate_index).
+    rate_index: RwLock<BTreeMap<FeeRateKey, HashSet<[u8; 32]>>>,
     /// P0: running sum of `tx.actual_size()` for every entry in `txs`. Kept in
     /// sync under the `txs` write lock (only mutated while that lock is held),
     /// so reads are consistent with the map. Used to enforce MAX_MEMPOOL_BYTES
     /// in O(1) without rescanning the pool for its total size.
     total_bytes: AtomicUsize,
+    /// P1 time seam (behavior-neutral): stamps `added_at`. Defaults to
+    /// `SystemClock`.
+    clock: Box<dyn Clock>,
 }
 
 impl Mempool {
     pub fn new() -> Self {
+        Self::with_clock(Box::new(SystemClock))
+    }
+
+    /// Construct a mempool with an injected clock (DST / deterministic tests).
+    /// Behavior is identical to `new()` when passed a `SystemClock`.
+    pub fn with_clock(clock: Box<dyn Clock>) -> Self {
         Self {
             txs:   RwLock::new(HashMap::new()),
             spent: RwLock::new(HashMap::new()),
+            rate_index: RwLock::new(BTreeMap::new()),
             total_bytes: AtomicUsize::new(0),
+            clock,
+        }
+    }
+
+    /// Insert a txid into the fee-rate index. Caller MUST hold the `txs` write
+    /// lock (index mutation is serialized behind it).
+    fn index_insert(idx: &mut BTreeMap<FeeRateKey, HashSet<[u8; 32]>>, key: FeeRateKey, txid: [u8; 32]) {
+        idx.entry(key).or_default().insert(txid);
+    }
+
+    /// Remove a txid from the fee-rate index, dropping the bucket if it empties.
+    /// Caller MUST hold the `txs` write lock.
+    fn index_remove(idx: &mut BTreeMap<FeeRateKey, HashSet<[u8; 32]>>, key: FeeRateKey, txid: &[u8; 32]) {
+        if let Some(set) = idx.get_mut(&key) {
+            set.remove(txid);
+            if set.is_empty() {
+                idx.remove(&key);
+            }
         }
     }
 
@@ -70,6 +146,13 @@ impl Mempool {
     ///   - Rejects tx whose inputs conflict with txs already in mempool
     ///   - Maintains the spent-outpoint index alongside the tx map
     pub fn add(&self, tx: Transaction, fee: u64) -> Result<[u8; 32], MempoolError> {
+        // P1 (roadmap §2): additive instrumentation span. No behavior change —
+        // fields are recorded; the reject-reason events below mirror
+        // `inc_tx_rejected(reason)` and the eviction event surfaces the §3
+        // eviction cost this insert paid. Inert unless a tracing subscriber is
+        // installed (subscriber init lives in main.rs, which this dev does not
+        // own — see report).
+        let _span = tracing::debug_span!("mempool.add", fee).entered();
         let txid = tx.txid();
 
         // Structural checks (cheap, before taking write lock on spent).
@@ -102,13 +185,16 @@ impl Mempool {
                 MempoolError::Invalid("output overflow".into())
             })?;
 
-        // Take both write locks in a consistent order (txs first, then spent)
-        // to prevent any future codepath from deadlocking.
+        // Take the write locks in a consistent order (txs → spent → rate_index)
+        // to prevent any future codepath from deadlocking. The rate_index is
+        // mutated only under the txs write lock, exactly like total_bytes.
         let mut pool  = self.txs.write();
         let mut spent = self.spent.write();
+        let mut rate_index = self.rate_index.write();
 
         if pool.contains_key(&txid) {
             crate::metrics::inc_tx_rejected("duplicate");
+            tracing::debug!(reason = "duplicate", "mempool tx rejected");
             return Err(MempoolError::Duplicate);
         }
 
@@ -119,6 +205,7 @@ impl Mempool {
             let op = (inp.prev_txid, inp.prev_index);
             if let Some(existing_txid) = spent.get(&op) {
                 crate::metrics::inc_tx_rejected("conflict");
+                tracing::debug!(reason = "conflict", "mempool tx rejected");
                 return Err(MempoolError::Conflict {
                     outpoint_txid: inp.prev_txid,
                     outpoint_idx:  inp.prev_index,
@@ -133,60 +220,66 @@ impl Mempool {
         //   - count bound: pool.len() < MAX_MEMPOOL_SIZE
         //   - byte  bound: total_bytes + size <= MAX_MEMPOOL_BYTES  (P0)
         //
-        // NOTE (roadmap §3.4 / P1 #10): eviction still does an O(n) min-scan per
-        // evicted tx because `txs` is a HashMap with no fee-rate index. The byte
-        // bound below caps *memory*; the fee-rate-ordered BTreeMap index that
-        // makes eviction O(log n) is deferred to P1 and is NOT load-tested here.
-        // Under a small-high-rate-tx flood this loop can evict several entries
-        // per insert — bounded, but its cost needs load testing to confirm.
+        // P1 (roadmap §3): the O(n) min-scan is GONE. The lowest-fee-rate
+        // resident is `rate_index.iter().next()` (O(log n) peek + O(1) set
+        // removal). The comparison semantics are unchanged: the SAME fixed-point
+        // `FeeRateKey` the old scan computed, so a small-high-rate-tx flood no
+        // longer scans up to 50k entries per accepted tx.
         let mut cur_bytes = self.total_bytes.load(Ordering::Relaxed);
-        let new_rate = (fee as u128 * FEE_RATE_SCALE) / (size.max(1) as u128);
+        let new_key = fee_rate_key(fee, size);
+        let mut evictions: u32 = 0;
         while pool.len() >= MAX_MEMPOOL_SIZE
             || cur_bytes.saturating_add(size) > MAX_MEMPOOL_BYTES
         {
-            let lowest = pool.iter()
-                .map(|(k, e)| (*k, (e.fee as u128 * FEE_RATE_SCALE) / (e.tx.actual_size().max(1) as u128)))
-                .min_by_key(|(_, r)| *r);
+            // Lowest fee-rate resident: first btree bucket, any member.
+            let lowest = rate_index.iter().next()
+                .and_then(|(k, set)| set.iter().next().map(|txid| (*k, *txid)));
             match lowest {
-                Some((k, low_rate)) if new_rate > low_rate => {
-                    // Also drop its spent-set entries before eviction.
-                    if let Some(evicted) = pool.remove(&k) {
+                Some((low_key, victim)) if new_key > low_key => {
+                    // Drop the victim from txs, spent, total_bytes, and the index
+                    // in one step so the three-way invariant never drifts.
+                    Self::index_remove(&mut rate_index, low_key, &victim);
+                    if let Some(evicted) = pool.remove(&victim) {
                         cur_bytes = cur_bytes.saturating_sub(evicted.tx.actual_size());
                         for inp in &evicted.tx.inputs {
                             spent.remove(&(inp.prev_txid, inp.prev_index));
                         }
                     }
+                    evictions += 1;
                 }
                 // Either the pool is empty (only possible when the new tx alone
                 // exceeds the byte cap) or the new tx does not out-rank the
                 // cheapest resident: reject rather than evict a better tx.
                 _ => {
                     crate::metrics::inc_tx_rejected("full");
+                    tracing::debug!(reason = "full", evictions, "mempool tx rejected");
                     return Err(MempoolError::Full);
                 }
             }
         }
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now = self.clock.now_secs();
 
-        // Insert into both maps atomically (we hold both write locks).
+        // Insert into txs, spent, and rate_index atomically (all write locks held).
         for inp in &tx.inputs {
             spent.insert((inp.prev_txid, inp.prev_index), txid);
         }
+        Self::index_insert(&mut rate_index, new_key, txid);
         pool.insert(txid, MempoolEntry { tx, fee, added_at: now });
         self.total_bytes.store(cur_bytes.saturating_add(size), Ordering::Relaxed);
         crate::metrics::inc_tx_accepted();
+        tracing::debug!(size, evictions, "mempool tx accepted");
         Ok(txid)
     }
 
     pub fn remove(&self, txid: &[u8; 32]) -> bool {
         let mut pool  = self.txs.write();
         let mut spent = self.spent.write();
+        let mut rate_index = self.rate_index.write();
         if let Some(entry) = pool.remove(txid) {
             self.total_bytes.fetch_sub(entry.tx.actual_size(), Ordering::Relaxed);
+            let key = fee_rate_key(entry.fee, entry.tx.actual_size());
+            Self::index_remove(&mut rate_index, key, txid);
             for inp in &entry.tx.inputs {
                 spent.remove(&(inp.prev_txid, inp.prev_index));
             }
@@ -204,12 +297,31 @@ impl Mempool {
         self.txs.read().len()
     }
 
-    /// Return up to `limit` txs sorted by fee (highest first) for block template
+    /// Return up to `limit` txs for a block template, HIGHEST FEE-RATE first.
+    ///
+    /// BEHAVIOR CHANGE (P1 / roadmap §3, audit L2) — flagged for the
+    /// consensus/mining owner: this previously sorted by ABSOLUTE fee
+    /// (`b.fee.cmp(&a.fee)`), which disagreed with eviction (which ranks by
+    /// fee/byte). Selection now reads the same `rate_index` ordering as
+    /// eviction — highest fee-RATE first (`rate_index.iter().rev()`) — so
+    /// templates and eviction agree. Block *validity* is unchanged; only which
+    /// txs land in a template (and their order) changes. Ties within a rate
+    /// bucket are unordered (HashSet iteration).
     pub fn get_for_block(&self, limit: usize) -> Vec<Transaction> {
         let pool = self.txs.read();
-        let mut entries: Vec<&MempoolEntry> = pool.values().collect();
-        entries.sort_by(|a, b| b.fee.cmp(&a.fee));
-        entries.iter().take(limit).map(|e| e.tx.clone()).collect()
+        let rate_index = self.rate_index.read();
+        let mut out = Vec::with_capacity(limit.min(pool.len()));
+        'outer: for (_key, set) in rate_index.iter().rev() {
+            for txid in set {
+                if let Some(e) = pool.get(txid) {
+                    out.push(e.tx.clone());
+                    if out.len() >= limit {
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// List all txids in the mempool
@@ -236,11 +348,15 @@ impl Mempool {
         let set: HashSet<[u8; 32]> = txids.iter().cloned().collect();
         let mut pool  = self.txs.write();
         let mut spent = self.spent.write();
+        let mut rate_index = self.rate_index.write();
         // Sprint N-min: collect outpoints to drop from spent before removing
-        // the tx entries themselves.
+        // the tx entries themselves. P1: also drop the fee-rate index entry so
+        // the index never drifts from `txs`.
         for txid in &set {
             if let Some(entry) = pool.get(txid) {
                 self.total_bytes.fetch_sub(entry.tx.actual_size(), Ordering::Relaxed);
+                let key = fee_rate_key(entry.fee, entry.tx.actual_size());
+                Self::index_remove(&mut rate_index, key, txid);
                 for inp in &entry.tx.inputs {
                     spent.remove(&(inp.prev_txid, inp.prev_index));
                 }
@@ -253,6 +369,84 @@ impl Mempool {
     /// diagnostics). O(1) — reads the running counter.
     pub fn size_bytes(&self) -> usize {
         self.total_bytes.load(Ordering::Relaxed)
+    }
+
+    /// P1 (roadmap §3): assert the three-way `txs` ↔ `spent` ↔ `rate_index`
+    /// invariant. Returns `Err(reason)` on the first drift found; `Ok(())` if
+    /// consistent. This is the property the `mempool_ops` fuzz target and the
+    /// `tests/mempool_index_prop.rs` proptest assert never breaks. Not a
+    /// hot-path method — it takes read locks and walks the maps.
+    ///
+    /// Checks:
+    ///   1. index multiset == txs key set, each at its `fee_rate_key`.
+    ///   2. every `spent` entry points at a live tx that claims that outpoint.
+    ///   3. `total_bytes` == Σ actual_size (bounded by MAX_MEMPOOL_BYTES).
+    ///   4. `size()` <= MAX_MEMPOOL_SIZE.
+    pub fn debug_check_invariants(&self) -> Result<(), String> {
+        let pool = self.txs.read();
+        let spent = self.spent.read();
+        let rate_index = self.rate_index.read();
+
+        // 4. count bound.
+        if pool.len() > MAX_MEMPOOL_SIZE {
+            return Err(format!("size {} > MAX_MEMPOOL_SIZE {}", pool.len(), MAX_MEMPOOL_SIZE));
+        }
+
+        // 1. index ↔ txs. Count index members and check each maps to a live tx
+        //    whose fee-rate key matches the bucket it sits in.
+        let mut indexed = 0usize;
+        for (key, set) in rate_index.iter() {
+            if set.is_empty() {
+                return Err("rate_index has an empty bucket (should be pruned)".into());
+            }
+            for txid in set {
+                indexed += 1;
+                match pool.get(txid) {
+                    None => return Err(format!("rate_index txid {} absent from txs", hex::encode(txid))),
+                    Some(e) => {
+                        let expect = fee_rate_key(e.fee, e.tx.actual_size());
+                        if expect != *key {
+                            return Err(format!(
+                                "rate_index txid {} filed under {:?} but its key is {:?}",
+                                hex::encode(txid), key, expect
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        if indexed != pool.len() {
+            return Err(format!("rate_index has {} members but txs has {}", indexed, pool.len()));
+        }
+
+        // 2. spent ↔ txs.
+        for ((prev_txid, prev_index), spender) in spent.iter() {
+            match pool.get(spender) {
+                None => return Err(format!("spent points at absent tx {}", hex::encode(spender))),
+                Some(e) => {
+                    let claims = e.tx.inputs.iter()
+                        .any(|inp| inp.prev_txid == *prev_txid && inp.prev_index == *prev_index);
+                    if !claims {
+                        return Err(format!(
+                            "spent outpoint {}:{} attributed to {} which does not claim it",
+                            hex::encode(prev_txid), prev_index, hex::encode(spender)
+                        ));
+                    }
+                }
+            }
+        }
+
+        // 3. byte counter.
+        let sum: usize = pool.values().map(|e| e.tx.actual_size()).sum();
+        let counted = self.total_bytes.load(Ordering::Relaxed);
+        if sum != counted {
+            return Err(format!("total_bytes {} != Σ actual_size {}", counted, sum));
+        }
+        if counted > MAX_MEMPOOL_BYTES {
+            return Err(format!("total_bytes {} > MAX_MEMPOOL_BYTES {}", counted, MAX_MEMPOOL_BYTES));
+        }
+
+        Ok(())
     }
 }
 
