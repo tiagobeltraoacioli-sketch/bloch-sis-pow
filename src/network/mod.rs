@@ -411,8 +411,21 @@ impl NetworkNode {
                         SwarmEvent::Behaviour(BlochBehaviourEvent::Gossipsub(gossipsub::Event::Message { propagation_source, message, .. })) => {
                             if let Ok(msg) = bincode::serde::decode_from_slice::<NetworkMessage,_>(&message.data, bincode::config::standard()).map(|(v,_)|v) {
                                 match &msg {
-                                    NetworkMessage::NewBlock  { block_hash, height, .. } =>
-                                        info!("← block h={} {}", height, hex::encode(&block_hash[..8])),
+                                    NetworkMessage::NewBlock  { block_hash, height, blue_score, .. } => {
+                                        // P1 (roadmap §2): block-ingest correlation moved here from
+                                        // main.rs (owned by another dev). These fields let a P0
+                                        // supervisor restart be correlated to the block that
+                                        // triggered it. Inert unless a subscriber is installed.
+                                        tracing::info_span!(
+                                            "net_ingest_block",
+                                            block_hash = %hex::encode(&block_hash[..8]),
+                                            height = *height,
+                                            blue_score = *blue_score,
+                                            peer = %propagation_source,
+                                        ).in_scope(|| {
+                                            info!("← block h={} {}", height, hex::encode(&block_hash[..8]));
+                                        });
+                                    }
                                     NetworkMessage::PeerTip { peer_id, blue_score, .. } =>
                                         debug!("← tip from {} score={}", peer_id, blue_score),
                                     NetworkMessage::Headers { entries } =>

@@ -198,7 +198,20 @@ async fn handle_rpc(
     match decision {
         auth::AuthDecision::Allow => {
             let start = std::time::Instant::now();
-            let result = dispatch(method, params, &state).await;
+            // P1 (roadmap §2): per-request tracing span, correlated with the
+            // existing `rpc_requests{method,status}` metric so a slow method is
+            // traceable to a client. `.instrument()` (not an entered guard) is
+            // the correct form across the `dispatch` await. Inert unless a
+            // subscriber is installed (init lives in main.rs, not owned here).
+            use tracing::Instrument;
+            let result = dispatch(method, params, &state)
+                .instrument(tracing::info_span!(
+                    "rpc_request",
+                    method,
+                    client_ip = %client_ip,
+                    id = %id,
+                ))
+                .await;
             let elapsed = start.elapsed();
             let elapsed_ms = elapsed.as_millis();
             crate::metrics::observe_rpc_latency(method, elapsed.as_secs_f64());
