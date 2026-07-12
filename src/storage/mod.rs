@@ -323,6 +323,29 @@ impl Storage {
         Ok((total, count))
     }
 
+    /// Count distinct addresses that currently hold at least one UTXO — i.e.
+    /// the number of on-chain "wallets" with a non-zero balance. Iterates
+    /// CF_ADDR_UTXO whose keys are `[20B addr][32B txid][4B idx]`; the distinct
+    /// 20-byte address prefixes are the wallets. Also returns the total UTXO
+    /// entry count. O(n) over the UTXO-address index.
+    pub fn count_addresses_with_balance(&self) -> Result<(usize, usize), StorageError> {
+        let cf_ai = self.db.cf_handle(CF_ADDR_UTXO)
+            .ok_or(StorageError::CfNotFound(CF_ADDR_UTXO.into()))?;
+        let mut set = std::collections::HashSet::<[u8; 20]>::new();
+        let mut utxos = 0usize;
+        for item in self.db.iterator_cf(&cf_ai, IteratorMode::Start) {
+            if let Ok((k, _)) = item {
+                if k.len() >= 20 {
+                    let mut addr = [0u8; 20];
+                    addr.copy_from_slice(&k[..20]);
+                    set.insert(addr);
+                    utxos += 1;
+                }
+            }
+        }
+        Ok((set.len(), utxos))
+    }
+
     /// O(k) UTXO lookup via address index (was O(n) full UTXO scan)
     pub fn get_utxos_for_address(&self, address_bytes: &[u8]) -> Result<Vec<(Vec<u8>, u32, TxOutput)>, StorageError> {
         if address_bytes.len() < 20 {
