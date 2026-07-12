@@ -41,6 +41,21 @@ The image includes `bloch-wallet` (CLI) + the crypto stack. A touch wallet UI is
 the app layer on top — reuse the Postern Desktop web UI in a mobile shell, or a
 UniFFI-backed native app over `bloch-mobile`'s `WalletCore`.
 
+## Pinned revisions (fill after `nix flake lock` — see REPRO.md §"#2")
+
+Once the Nix host runs `nix flake lock`, record the resolved revs here so the
+aarch64 wallet build is documented and the pin is human-visible:
+
+```
+date:                      <YYYY-MM-DD>
+nixpkgs rev:               <from `nix flake metadata`>
+mobile-nixos rev:          <from `nix flake metadata`>
+mobile-nixos-nixpkgs rev:  <mobile-nixos's own npins nixpkgs pin>
+```
+
+(These are placeholders — an agent cannot run Nix. REPRO.md §"#2" has the exact
+commands that emit each value.)
+
 ## Honesty
 
 - **Not built in this sandbox** (no Nix; Mobile NixOS also needs device configs).

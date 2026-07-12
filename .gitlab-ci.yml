@@ -8,6 +8,7 @@
 stages:
   - check
   - test
+  - nix
 
 variables:
   CARGO_TERM_COLOR: "always"
@@ -101,3 +102,60 @@ pow-estimator:
     - when: manual
   allow_failure: true
   timeout: 60m
+
+# ── Nix stage (roadmap #2 pin-inputs, #9 determinism) ─────────────────────────
+# These jobs need a Linux host with Nix + flakes enabled — NOT the macOS
+# `bloch-mac` shell runner. They target a self-hosted aarch64 Linux runner
+# (tag: bloch-nix-aarch64) so the node crate is repro-checked NATIVELY, without
+# binfmt qemu emulation. Override the default before_script (it exports the Rust
+# toolchain and runs rustc/cargo, which is irrelevant here).
+#
+# NOTE (permissive-license discipline): diffoscope is GPL-3.0 and Nix/CI helpers
+# vary. They run only as ephemeral CI/dev tools, are never linked into or shipped
+# in the image, and so do NOT touch the permissive image closure. The no-AGPL
+# rule bars AGPL anywhere (even as a network service); it does not ban GPL dev
+# tooling. See REPRO.md.
+
+# Single-host reproducibility self-check: `--rebuild --check` forces a local
+# rebuild and fails if the output differs from what is already in the store
+# (Nix's native determinism check). Native aarch64 = the cheapest, honest first
+# measurement (bundled RocksDB 8.10 C++ is the #1 nondeterminism risk).
+#
+# INFORMATIONAL for now (allow_failure): a clean single-host check is necessary
+# but NOT sufficient for the word "reproducible" — that is earned only by the
+# two-builder bit-for-bit compare (repro-manifest.sh + repro-compare.sh across
+# two independent hosts). Flip allow_failure -> false once that is green.
+repro:
+  stage: nix
+  tags:
+    - bloch-nix-aarch64
+  before_script: []
+  script:
+    # (A) the node/wallet crate — native aarch64, highest-risk, cheapest.
+    - nix build .#packages.aarch64-linux.bloch --rebuild --check --keep-failed -L
+    # (B) the aarch64-native sealed image — repro-checked without emulation.
+    - nix build .#packages.aarch64-linux.attested-image --rebuild --check --keep-failed -L
+  after_script:
+    - 'command -v diffoscope >/dev/null && diffoscope /tmp/nix-build-*.check* > diffoscope.txt 2>&1 || true'
+  artifacts:
+    when: on_failure
+    paths:
+      - diffoscope.txt
+  allow_failure: true
+  timeout: 120m
+
+# mainnet-guard (PLACEHOLDER — TODO, gated on Dev-A's `mainnet` feature landing).
+# Once Dev-A's `cargo test --features mainnet` guard is merged (the test that
+# refuses to build/run mainnet while security preconditions are unmet), enable
+# this job by removing the `when: never` rule and the guard below. Until then it
+# is inert so the pipeline neither runs nor fails on a feature that does not yet
+# exist.
+mainnet-guard:
+  stage: check
+  script:
+    # TODO(dev-a): replace with `cargo test --features mainnet --workspace` once
+    # the `mainnet` feature + guard test exist. Keeping it a no-op until then.
+    - 'echo "mainnet-guard: TODO — enable once Dev-A merges the mainnet feature guard"'
+  rules:
+    - when: never   # TODO: remove this rule when the mainnet feature exists
+  allow_failure: true
