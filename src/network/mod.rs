@@ -260,6 +260,9 @@ pub(crate) fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
 pub struct NetworkConfig {
     pub listen_addr:     String,
     pub bootstrap_peers: Vec<String>,
+    /// Opt-in DNS seed hostnames (Bitcoin-style cold-start). Resolved to
+    /// A/AAAA records and dialed as peers. Empty by default — non-privileged.
+    pub dns_seeds:       Vec<String>,
     pub max_peers:       usize,
     pub data_dir:        PathBuf,
     /// Sprint P: if true, PEX will accept RFC1918 / loopback addresses.
@@ -272,6 +275,7 @@ impl Default for NetworkConfig {
         Self {
             listen_addr:     "/ip4/0.0.0.0/tcp/16110".into(),
             bootstrap_peers: vec![],
+            dns_seeds:       vec![],
             max_peers:       50,
             data_dir:        PathBuf::from("./bloch-data"),
             allow_private_peers: false,
@@ -535,7 +539,25 @@ impl NetworkNode {
 
         // Add hardcoded default seeds
         let mut all_seeds: Vec<String> = crate::core::DEFAULT_SEEDS.iter().map(|s| s.to_string()).collect();
-        // DNS seeds: TODO when TXT records are configured
+        // DNS seeds (opt-in, non-privileged): resolve each hostname's A/AAAA
+        // records into peer multiaddrs (Bitcoin-style cold-start). Only acts
+        // when an operator passes --dns-seed; DEFAULT_SEEDS stays empty.
+        for host in self.config.dns_seeds.iter() {
+            let hp = if host.contains(':') { host.clone() } else { format!("{host}:16110") };
+            match tokio::net::lookup_host(hp).await {
+                Ok(addrs) => {
+                    for sa in addrs {
+                        let ma = match sa.ip() {
+                            std::net::IpAddr::V4(v4) => format!("/ip4/{}/tcp/{}", v4, sa.port()),
+                            std::net::IpAddr::V6(v6) => format!("/ip6/{}/tcp/{}", v6, sa.port()),
+                        };
+                        info!("dns-seed {} → {}", host, ma);
+                        all_seeds.push(ma);
+                    }
+                }
+                Err(e) => warn!("dns-seed {}: resolve failed: {}", host, e),
+            }
+        }
         // Add CLI bootstrap peers + known peers
         all_seeds.extend(self.config.bootstrap_peers.iter().cloned());
         all_seeds.extend(known_peers.iter().cloned());

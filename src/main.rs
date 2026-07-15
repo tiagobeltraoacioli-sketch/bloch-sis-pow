@@ -105,6 +105,16 @@ struct Cli {
     /// Sprint P: allow RFC1918 / loopback addresses via PEX. Dev/test only.
     /// Production deployments should leave this off; it opens a scanning vector.
     #[arg(long)]                                         allow_private_peers: bool,
+    /// Maximum peer connections (inbound cap). Raise this on a well-provisioned
+    /// bootstrap / hub node so newcomers aren't rejected once the cap fills;
+    /// keep it modest on a leaf node. Non-consensus — purely an operator knob.
+    #[arg(long, default_value_t = 50)]                   max_peers: usize,
+    /// Optional DNS seed hostname(s): the node resolves each to its A/AAAA
+    /// records and dials them as peers (default port 16110; pass host:port to
+    /// override). Bitcoin-style cold-start convenience — NON-privileged and
+    /// opt-in: the shipped DEFAULT_SEEDS stays empty, so nobody's seed is
+    /// required and you can point at (or run) any seed you trust. Repeatable.
+    #[arg(long)]                                         dns_seed: Vec<String>,
 
     // ── Sprint 2 (AA.1 pt 3): stratum V1 mining server ──────────────
     /// Enable the stratum V1 mining server. Miners can connect at
@@ -389,7 +399,8 @@ async fn main() {
     let net_cfg  = network::NetworkConfig {
         listen_addr:     cli.listen.clone(),
         bootstrap_peers: cli.peer.clone(),
-        max_peers:       50,
+        dns_seeds:       cli.dns_seed.clone(),
+        max_peers:       cli.max_peers,
         data_dir:        data_path.clone(),
         allow_private_peers: cli.allow_private_peers,
     };
@@ -720,6 +731,12 @@ async fn main() {
 
     // ── Continuous Mining Loop ────────────────────────────────────────────────
     if cli.mine {
+        // Fresh-miner fork guard: if the operator configured a bootstrap peer
+        // or DNS seed they intend to JOIN an existing network, so mining before
+        // we have any peer would fork from genesis on the forgeable chain.
+        // Nodes with no peer/seed configured (intentional solo / island) keep
+        // mining immediately.
+        let wants_to_join = !cli.peer.is_empty() || !cli.dns_seed.is_empty();
         let store_m  = store.clone();
         let dag_m    = dag.clone();
         let state_m  = node_state.clone();
@@ -737,7 +754,24 @@ async fn main() {
             // Sprint GG: warn once when we first see IBD active, log
             // transition back to ready so operators see the transition.
             let mut was_syncing_last_tick: bool = false;
+            let mut warned_no_peers: bool = false;
             loop {
+                // Fresh-miner fork guard (see wants_to_join above): a node told
+                // to join a network but with 0 peers so far must not mine — it
+                // would build an isolated fork from genesis that the network
+                // rejects on cumulative work. Pause until at least one peer.
+                if wants_to_join && state_m.read().peer_count == 0 {
+                    if !warned_no_peers {
+                        info!("⛏  no peers yet — miner paused until connected (would otherwise fork from genesis); still trying to reach the configured peer/seed");
+                        warned_no_peers = true;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    continue;
+                }
+                if warned_no_peers {
+                    info!("⛏  peer connected — miner active");
+                    warned_no_peers = false;
+                }
                 // Sprint GG fix (pre-IBD mining bug, 2026-04-22):
                 // During IBD the DAG tip reflects the local view, which
                 // lags the network by up to thousands of blocks. Mining
