@@ -45,6 +45,16 @@ pub struct NodeState {
     pub peer_count:     u32,
     pub mempool_size:   usize,
     pub is_syncing:     bool,
+    /// Highest tip blue-score any peer has announced (via PeerTip). Used to
+    /// release the IBD latch: is_syncing clears once tip_blue_score catches up
+    /// to this. (The old code only cleared on an empty Headers message, which
+    /// no peer ever sends, so is_syncing — and the miner pause — latched
+    /// forever and joining miners synced but never mined.)
+    pub best_seen_blue_score: u64,
+    /// Set once the node has processed at least one remote PeerTip. The
+    /// fresh-miner fork guard waits for this so a joining miner never mines a
+    /// genesis fork in the window between "connected" and "evaluated a tip".
+    pub seen_first_tip: bool,
     pub peer_addresses: Vec<String>,
     pub version:        String,
 }
