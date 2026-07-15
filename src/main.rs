@@ -105,6 +105,13 @@ struct Cli {
     /// Sprint P: allow RFC1918 / loopback addresses via PEX. Dev/test only.
     /// Production deployments should leave this off; it opens a scanning vector.
     #[arg(long)]                                         allow_private_peers: bool,
+    /// Mesh fix: set when this node sits behind a TCP proxy / NAT that makes
+    /// many peers share one source IP (fly.io edge, k8s ingress, CGNAT). The
+    /// gossipsub ip-colocation penalty (-50 x excess^2 above 3 peers/IP) would
+    /// otherwise graylist the whole mesh at ~6 peers and silently blackhole
+    /// every tip announcement. Disables only that weight; all other peer
+    /// scoring stays active. Non-consensus — purely an operator knob.
+    #[arg(long)]                                         behind_proxy: bool,
     /// Maximum peer connections (inbound cap). Raise this on a well-provisioned
     /// bootstrap / hub node so newcomers aren't rejected once the cap fills;
     /// keep it modest on a leaf node. Non-consensus — purely an operator knob.
@@ -403,6 +410,7 @@ async fn main() {
         max_peers:       cli.max_peers,
         data_dir:        data_path.clone(),
         allow_private_peers: cli.allow_private_peers,
+        behind_proxy:    cli.behind_proxy,
     };
     let node = match network::NetworkNode::new(net_cfg) {
         Ok(n)  => { info!("P2P: {}", n.peer_id); n }
@@ -475,6 +483,9 @@ async fn main() {
             // Reverse index: parent_hash → set of orphan hashes waiting for it
             let mut waiting_for: std::collections::HashMap<[u8; 32], HashSet<[u8; 32]>> =
                 std::collections::HashMap::new();
+            // Mesh fix (reciprocal tip): rate limiter for answering behind-
+            // peers' PeerTip announcements with our own tip. None = never sent.
+            let mut last_reciprocal_tip: Option<std::time::Instant> = None;
 
             while let Some(msg) = block_rx.recv().await {
             match msg {
@@ -501,6 +512,34 @@ async fn main() {
                         let _ = otx2.send(network::NetworkMessage::GetHeaders {
                             from_blue_score: our_s, limit: 500
                         }).await;
+                    } else if peer_s < our_s {
+                        // Mesh fix (reciprocal tip): the announcing peer is
+                        // BEHIND us, and its other ways of learning our tip are
+                        // all fragile — the on-connect announce races its
+                        // Subscribe, and our 60s periodic PeerTip is byte-
+                        // identical while our tip is unchanged (dedup-fragile).
+                        // Answer with a fresh-timestamp Version (unique bytes,
+                        // can never be dedup-dropped) carrying our blue_score;
+                        // the peer's Version arm below treats it as an IBD
+                        // trigger. Rate-limited so a burst of behind-tips from
+                        // many peers can't make us spam the sync topic.
+                        let due = last_reciprocal_tip
+                            .map(|t| t.elapsed() >= std::time::Duration::from_secs(15))
+                            .unwrap_or(true);
+                        if due {
+                            last_reciprocal_tip = Some(std::time::Instant::now());
+                            let height = dag2.read().block_count() as u64;
+                            debug!("peer {} behind (score {} < {}), sending reciprocal tip", peer_id, peer_s, our_s);
+                            let _ = otx2.send(network::NetworkMessage::Version {
+                                version:    network::PROTOCOL_VERSION,
+                                user_agent: format!("bloch-layer/{}", env!("CARGO_PKG_VERSION")),
+                                blue_score: our_s,
+                                height,
+                                timestamp:  std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs()).unwrap_or(0),
+                            }).await;
+                        }
                     }
                 }
 
@@ -675,8 +714,45 @@ async fn main() {
                     }
                 }
 
-                // Version handshake (handled at network layer)
-                network::NetworkMessage::Version { .. } | network::NetworkMessage::VersionAck | network::NetworkMessage::PeerExchange { .. } | network::NetworkMessage::PeerRequest => {}
+                // Mesh fix (fresh-joiner IBD): Version was a no-op here, yet it
+                // is the only tip-carrying frame on the wire whose bytes are
+                // always unique (fresh `timestamp` → unique gossipsub
+                // MessageId, so it can never be Duplicate-dropped the way a
+                // byte-identical PeerTip can). Treat it exactly like a PeerTip
+                // for IBD triggering: on-connect handshakes, post-Subscribed
+                // re-announces, periodic announces, and reciprocal tips all
+                // arrive as Version frames.
+                //
+                // SHARED-LATCH NOTE ([stall] interface): this arm feeds the
+                // same is_syncing / best_seen_blue_score / seen_first_tip
+                // latch as the PeerTip arm above, with IDENTICAL semantics.
+                // It widens the set of messages that can raise the
+                // best_seen_blue_score high-water mark (still unvalidated,
+                // peer-supplied). Any [stall]-side fix that decays or
+                // validates that mark must cover this arm too.
+                network::NetworkMessage::Version { version, blue_score: peer_s, .. } => {
+                    if version < network::MIN_PROTOCOL_VERSION { continue; }
+                    let our_s = dag2.read().tip_blue_score();
+                    {
+                        let mut s = state2.write();
+                        s.seen_first_tip = true;
+                        if peer_s > s.best_seen_blue_score { s.best_seen_blue_score = peer_s; }
+                        if s.is_syncing && our_s >= s.best_seen_blue_score {
+                            s.is_syncing = false;
+                            info!("IBD complete (caught up to best announced tip {})", s.best_seen_blue_score);
+                        }
+                    }
+                    if peer_s > our_s {
+                        info!("Version peer ahead (score {} > {}), requesting headers", peer_s, our_s);
+                        state2.write().is_syncing = true;
+                        let _ = otx2.send(network::NetworkMessage::GetHeaders {
+                            from_blue_score: our_s, limit: 500
+                        }).await;
+                    }
+                }
+                network::NetworkMessage::VersionAck
+                | network::NetworkMessage::PeerExchange { .. }
+                | network::NetworkMessage::PeerRequest => {}
             }
             }
           };
@@ -701,6 +777,45 @@ async fn main() {
           }
         }
     });
+
+    // ── Mesh fix: proactive IBD nudge ─────────────────────────────────────────
+    //
+    // A fresh joiner can miss every inbound tip signal: the seed's on-connect
+    // announce races our Subscribe, the 60s periodic PeerTip is dedup-fragile,
+    // and colocation scoring can graylist proxied peers. Don't wait to be told
+    // we're behind — while we have peers and either (a) we've never seen a
+    // remote tip, or (b) we know we're behind (is_syncing latched, or the
+    // best announced blue_score exceeds ours), publish GetHeaders every 30s.
+    //
+    // This also un-crawls multi-batch IBD: the Headers handler requests one
+    // 500-block batch and never issues a follow-up GetHeaders, so a node
+    // thousands of blocks behind previously advanced one batch per 60s tip
+    // re-announce. With the nudge it re-requests from its ADVANCING blue_score
+    // at least every 30s. At parity the nudge stops (and the serving side
+    // suppresses empty Headers replies), so steady-state cost is zero.
+    {
+        let dag_n   = dag.clone();
+        let state_n = node_state.clone();
+        let otx_n   = outbound_tx.clone();
+        tokio::spawn(async move {
+            let mut nudge = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                nudge.tick().await;
+                let our_s = dag_n.read().tip_blue_score();
+                let (peers, syncing, best_seen, seen_tip) = {
+                    let s = state_n.read();
+                    (s.peer_count, s.is_syncing, s.best_seen_blue_score, s.seen_first_tip)
+                };
+                if peers > 0 && (syncing || !seen_tip || best_seen > our_s) {
+                    debug!("IBD nudge: GetHeaders from score {} (best_seen={} syncing={} seen_tip={})",
+                        our_s, best_seen, syncing, seen_tip);
+                    let _ = otx_n.send(network::NetworkMessage::GetHeaders {
+                        from_blue_score: our_s, limit: 500,
+                    }).await;
+                }
+            }
+        });
+    }
 
     // ── Ready ─────────────────────────────────────────────────────────────────
     let (score, count) = { let d = dag.read(); (d.tip_blue_score(), d.block_count()) };
