@@ -49,6 +49,46 @@ impl fmt::Display for PowError {
 #[cfg(feature = "std")]
 impl std::error::Error for PowError {}
 
+/// Errors from decoding a compact difficulty "bits" value into a target.
+///
+/// Returned by [`crate::difficulty::try_bits_to_target`]. Every variant means
+/// the compact value cannot represent a valid 256-bit target; consensus code
+/// must treat blocks carrying such bits as invalid (fail-hard), never map them
+/// to a permissive default target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BitsError {
+    /// The sign bit (0x0080_0000) is set — negative targets are invalid.
+    NegativeFlag,
+    /// The mantissa is zero — encodes no target at all.
+    ZeroMantissa,
+    /// The exponent shifts the mantissa entirely out of the 256-bit range.
+    ExponentOutOfRange {
+        /// Exponent byte found in the compact value.
+        exponent: u32,
+    },
+    /// The exponent is in range but high mantissa bytes would overflow past
+    /// the top of the 256-bit target.
+    MantissaOverflow,
+}
+
+impl fmt::Display for BitsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NegativeFlag => f.write_str("compact bits has the negative-target flag set"),
+            Self::ZeroMantissa => f.write_str("compact bits has a zero mantissa"),
+            Self::ExponentOutOfRange { exponent } => {
+                write!(f, "compact bits exponent {exponent} shifts the mantissa out of 256-bit range")
+            }
+            Self::MantissaOverflow => {
+                f.write_str("compact bits mantissa overflows the 256-bit target range")
+            }
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for BitsError {}
+
 /// Errors from the verifier (verify side).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerifyError {
