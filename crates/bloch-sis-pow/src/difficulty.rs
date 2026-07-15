@@ -15,6 +15,7 @@
 //! block time and uses a 2-day half-life. Both are protocol constants
 //! and changing them is a hard fork.
 
+use crate::error::BitsError;
 use crate::params::AUX_HASH_LEN;
 
 /// Target block time in seconds (= 30s). Hard-fork constant.
@@ -68,21 +69,39 @@ impl Target {
 /// (8 * (exponent - 3))`.
 ///
 /// # Returns
-/// A 32-byte big-endian target. If the compact representation is invalid
-/// (e.g., negative bit set), returns [`Target::MIN`].
-pub fn bits_to_target(bits: u32) -> Target {
+/// `Ok(target)` for a representable compact value, or a [`BitsError`]
+/// describing why the value is invalid:
+///
+/// - [`BitsError::NegativeFlag`] — sign bit (0x0080_0000) set.
+/// - [`BitsError::ZeroMantissa`] — mantissa is zero.
+/// - [`BitsError::ExponentOutOfRange`] — the exponent shifts the mantissa
+///   entirely above the 256-bit range (exponent ≥ 35).
+/// - [`BitsError::MantissaOverflow`] — exponent 33/34 with high mantissa
+///   bytes that would spill past the top of the target.
+///
+/// SECURITY (audit): this is the fail-hard decoder. The previous behavior
+/// mapped an overflowing exponent to [`Target::MAX`] — the *easiest possible*
+/// difficulty — so a block header carrying crafted bits (e.g. `0xFF00FFFF`)
+/// would have every auxiliary hash pass the difficulty filter. Invalid bits
+/// must be an error (or, in the infallible wrapper, the *impossible* target),
+/// never a permissive default.
+pub fn try_bits_to_target(bits: u32) -> Result<Target, BitsError> {
     let exponent = (bits >> 24) as i32;
     let mantissa = bits & 0x007F_FFFF; // mask out the negative-flag bit
 
     // Negative-target compact representations are invalid in this scheme.
-    let neg = (bits & 0x0080_0000) != 0;
-    if neg || mantissa == 0 {
-        return Target::MIN;
+    if (bits & 0x0080_0000) != 0 {
+        return Err(BitsError::NegativeFlag);
+    }
+    if mantissa == 0 {
+        return Err(BitsError::ZeroMantissa);
     }
 
     let mut out = [0u8; AUX_HASH_LEN];
     if exponent <= 3 {
-        // Right-shift case: mantissa >> (8*(3-exponent))
+        // Right-shift case: mantissa >> (8*(3-exponent)). Low bytes shifted
+        // out are dropped — this rounds the target DOWN (harder), which is
+        // the safe direction and matches the compact-format convention.
         let shift = 8 * (3 - exponent);
         let m = mantissa >> shift;
         // Place at end (low position).
@@ -92,18 +111,40 @@ pub fn bits_to_target(bits: u32) -> Target {
     } else {
         // Left-shift case: mantissa << (8*(exponent-3))
         let shift = 8 * (exponent - 3);
-        let total_high_byte = AUX_HASH_LEN as i32 - 1 - shift / 8;
-        if !(0..AUX_HASH_LEN as i32).contains(&total_high_byte) {
-            // Out of range; treat as MAX (would-be too easy).
-            return Target::MAX;
+        // Byte index (big-endian) where the LOWEST mantissa byte lands.
+        let low_byte = AUX_HASH_LEN as i32 - 1 - shift / 8;
+        if !(0..AUX_HASH_LEN as i32).contains(&low_byte) {
+            // Even mantissa = 1 would sit above 2^255-ish; unrepresentable.
+            return Err(BitsError::ExponentOutOfRange { exponent: exponent as u32 });
         }
-        let pos = total_high_byte as usize;
+        let pos = low_byte as usize;
         let m_bytes = mantissa.to_be_bytes(); // [_, b0, b1, b2]
+        // High mantissa bytes that would land above byte 0 overflow the
+        // 256-bit range. The old code silently DROPPED them (encoding a
+        // different, smaller target); fail-hard instead.
+        if (pos < 2 && m_bytes[1] != 0) || (pos < 1 && m_bytes[2] != 0) {
+            return Err(BitsError::MantissaOverflow);
+        }
         if pos >= 2 { out[pos - 2] = m_bytes[1]; }
         if pos >= 1 { out[pos - 1] = m_bytes[2]; }
         out[pos]                         = m_bytes[3];
     }
-    Target(out)
+    Ok(Target(out))
+}
+
+/// Infallible compatibility wrapper around [`try_bits_to_target`].
+///
+/// # Returns
+/// A 32-byte big-endian target. If the compact representation is invalid
+/// (negative bit set, zero mantissa, or an exponent/mantissa that overflows
+/// the 256-bit range), returns [`Target::MIN`] — the *impossible* target that
+/// no hash can meet, so consensus fails CLOSED on malformed bits.
+///
+/// SECURITY (audit): overflowing exponents previously fell back to
+/// [`Target::MAX`] (everything passes). New code should prefer
+/// [`try_bits_to_target`] and reject the block explicitly.
+pub fn bits_to_target(bits: u32) -> Target {
+    try_bits_to_target(bits).unwrap_or(Target::MIN)
 }
 
 /// Encode a 256-bit target back into the compact `u32` bits form.
@@ -320,6 +361,55 @@ mod tests {
         let quad = scale_target_by_pow2_milli(&target, 999_999);
         let mut exp4 = t; mul2_be(&mut exp4); mul2_be(&mut exp4);
         assert_eq!(quad.0, exp4, "single-step easing must cap at ×4");
+    }
+
+    /// Audit fix: invalid compact bits must be a hard error from the checked
+    /// decoder — overflow exponent, mantissa spill, zero mantissa, sign bit.
+    #[test]
+    fn try_bits_to_target_rejects_invalid_bits() {
+        // Overflow exponent: 0xFF puts even mantissa=1 far above 2^256.
+        assert_eq!(
+            try_bits_to_target(0xFF00_FFFF),
+            Err(BitsError::ExponentOutOfRange { exponent: 0xFF }),
+        );
+        // Smallest overflowing exponent: 35 (shift of 32 bytes).
+        assert_eq!(
+            try_bits_to_target(0x2300_FFFF),
+            Err(BitsError::ExponentOutOfRange { exponent: 0x23 }),
+        );
+        // Exponent 34 with a high mantissa byte spilling past byte 0.
+        assert_eq!(try_bits_to_target(0x2201_0001), Err(BitsError::MantissaOverflow));
+        // Zero mantissa encodes nothing.
+        assert_eq!(try_bits_to_target(0x1D00_0000), Err(BitsError::ZeroMantissa));
+        // Negative-target flag.
+        assert_eq!(try_bits_to_target(0x1D80_0001), Err(BitsError::NegativeFlag));
+    }
+
+    /// Audit REGRESSION: the infallible wrapper must fail CLOSED. The old code
+    /// returned Target::MAX (easiest difficulty — every hash passes) for an
+    /// out-of-range exponent, letting crafted header bits neutralize PoW.
+    #[test]
+    fn bits_to_target_fails_closed_on_invalid_bits() {
+        assert_eq!(bits_to_target(0xFF00_FFFF), Target::MIN,
+            "overflow exponent must map to the impossible target, not MAX");
+        assert_eq!(bits_to_target(0x2300_FFFF), Target::MIN);
+        assert_eq!(bits_to_target(0x2201_0001), Target::MIN);
+        // No hash can ever meet the fail-closed target.
+        assert!(!hash_meets_target(&[0x00u8; 32], &bits_to_target(0xFF00_FFFF)));
+    }
+
+    /// Valid compact values decode and round-trip exactly.
+    #[test]
+    fn try_bits_to_target_valid_roundtrip() {
+        // Bitcoin-mainnet-launch-style bits, also used by this chain's tooling.
+        let t = try_bits_to_target(0x1D00_FFFF).expect("0x1d00ffff is valid");
+        assert_eq!(target_to_bits(&t), 0x1D00_FFFF);
+        // Checked and infallible decoders agree on valid input.
+        assert_eq!(bits_to_target(0x1D00_FFFF), t);
+        // Canonical encoding of Target::MAX (exponent 33) is valid too.
+        let max_bits = target_to_bits(&Target::MAX);
+        let rt = try_bits_to_target(max_bits).expect("canonical MAX bits are valid");
+        assert_eq!(target_to_bits(&rt), max_bits);
     }
 
     #[test]

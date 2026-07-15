@@ -1034,50 +1034,14 @@ async fn main() {
     // Lock discipline: accept_block itself takes dag.write() briefly. Each
     // caller is on its own tokio task (one per session), so serialization
     // is the same as any other network-path accept_block caller.
-    let accept_block_cb: Arc<stratum::AcceptBlockFn> = {
-        let dag_cb        = dag.clone();
-        let store_cb      = store.clone();
-        let mempool_cb    = mempool.clone();
-        let node_state_cb = node_state.clone();
-        let shielded_cb = shielded.clone();
-        let otx_cb        = outbound_tx.clone();
-        let tip_tx_cb     = tip_tx.clone();
-
-        Arc::new(move |block: core::Block| -> Result<String, String> {
-            let block_hash = block.header.pow_hash();
-            let height     = block.height;
-            let blue_score = block.blue_score;
-
-            // Delegate all consensus validation + DAG mutation + retarget +
-            // UTXO updates + mempool cleanup to the existing accept_block path.
-            accept_block(
-                &block, block_hash, height,
-                &dag_cb, &store_cb, &mempool_cb, &node_state_cb,
-                Some(&tip_tx_cb), &shielded_cb,
-            )?;
-
-            // Refresh RPC-visible state (mirrors miner loop).
-            {
-                let mut s = node_state_cb.write();
-                s.tip_blue_score = dag_cb.read().tip_blue_score();
-                s.block_count    = dag_cb.read().block_count() as u64;
-                s.mempool_size   = mempool_cb.size();
-            }
-
-            // Broadcast to gossipsub — other peers learn about the block.
-            let data = block.to_bitcoin_bytes();
-            let msg = network::NetworkMessage::NewBlock {
-                block_hash,
-                blue_score,
-                height,
-                block_data: data,
-            };
-            let otx_clone = otx_cb.clone();
-            tokio::spawn(async move { let _ = otx_clone.send(msg).await; });
-
-            Ok(hex::encode(block_hash))
-        })
-    };
+    //
+    // Audit H2: construction moved into the named builder
+    // `make_stratum_accept_block_cb` (below `accept_block`) so the structural
+    // gate can be regression-tested — see `external_submission_tests`.
+    let accept_block_cb: Arc<stratum::AcceptBlockFn> = make_stratum_accept_block_cb(
+        dag.clone(), store.clone(), mempool.clone(), node_state.clone(),
+        shielded.clone(), outbound_tx.clone(), tip_tx.clone(),
+    );
 
     // ───────── B5f pool seam: RPC submitblock hook ─────────
     //
@@ -1095,51 +1059,14 @@ async fn main() {
     //   5. gossip    = broadcast NewBlock so peers learn about it
     //
     // The reference pool consuming this lives in pool/.
-    let rpc_submit_block: Arc<rpc::SubmitBlockFn> = {
-        let dag_cb        = dag.clone();
-        let store_cb      = store.clone();
-        let mempool_cb    = mempool.clone();
-        let node_state_cb = node_state.clone();
-        let shielded_cb   = shielded.clone();
-        let otx_cb        = outbound_tx.clone();
-        let tip_tx_cb     = tip_tx.clone();
-
-        Arc::new(move |block: core::Block| -> Result<String, String> {
-            let block_hash = block.block_hash();
-            if dag_cb.read().has_block(&block_hash) {
-                return Err("duplicate block".to_string());
-            }
-            block.validate_structure()
-                .map_err(|e| format!("structural validation: {}", e))?;
-
-            accept_block(
-                &block, block_hash, block.height,
-                &dag_cb, &store_cb, &mempool_cb, &node_state_cb,
-                Some(&tip_tx_cb), &shielded_cb,
-            )?;
-
-            // Refresh RPC-visible state (mirrors the miner loop).
-            {
-                let mut s = node_state_cb.write();
-                s.tip_blue_score = dag_cb.read().tip_blue_score();
-                s.block_count    = dag_cb.read().block_count() as u64;
-                s.mempool_size   = mempool_cb.size();
-            }
-
-            // Broadcast to gossipsub — other peers learn about the block.
-            let data = block.to_bitcoin_bytes();
-            let msg = network::NetworkMessage::NewBlock {
-                block_hash,
-                blue_score: block.blue_score,
-                height:     block.height,
-                block_data: data,
-            };
-            let otx_clone = otx_cb.clone();
-            tokio::spawn(async move { let _ = otx_clone.send(msg).await; });
-
-            Ok(hex::encode(block_hash))
-        })
-    };
+    //
+    // Construction lives in the named builder `make_rpc_submit_block_cb`
+    // (below `accept_block`) so the stratum and RPC gates can be
+    // regression-tested side by side — see `external_submission_tests`.
+    let rpc_submit_block: Arc<rpc::SubmitBlockFn> = make_rpc_submit_block_cb(
+        dag.clone(), store.clone(), mempool.clone(), node_state.clone(),
+        shielded.clone(), outbound_tx.clone(), tip_tx.clone(),
+    );
 
         // Sprint B5f: Stratum V1/V2 are hash-PoW pool protocols — the share
         // message (`[user, job, en2, ntime, nonce]`) has no field for the
@@ -1342,6 +1269,129 @@ async fn main() {
             error!("Network exited");
         }
     }
+}
+
+// ── External block submission callbacks (stratum V1/V2 + RPC submitblock) ────
+//
+// Both builders wrap the shared `accept_block` consensus pipeline. They are
+// named functions (not inline closures in main()) so their gates can be
+// unit-tested — see `external_submission_tests` at the bottom of this file.
+
+/// Build the AcceptBlockFn shared by the Stratum V1 and V2 servers
+/// (Sprint 10-epsilon Phase 5.a).
+///
+/// SECURITY (audit H2): the callback runs `Block::validate_structure()` —
+/// Module-SIS PoW witness, merkle binding, coinbase format, duplicate-tx and
+/// dust checks — BEFORE handing the block to `accept_block`, mirroring the
+/// gossipsub NewBlock path and the RPC `submitblock` hook. `accept_block`
+/// itself checks bits/height/timestamp/tx-validity but does NOT re-run the
+/// structural checks, so without this gate a stratum-submitted block with no
+/// (or a forged) SIS witness or a non-binding merkle root would enter the
+/// DAG, storage, and gossip broadcast.
+///
+/// NOTE (pre-existing, unchanged here): this path identifies the block by
+/// `header.pow_hash()` while the network/RPC paths use `Block::block_hash()`
+/// (SHA3, binds the SIS witness). Stratum V1/V2 are currently refused at
+/// startup under Module-SIS (see B5f), so the callback is dormant; the
+/// identity unification belongs to the future SIS-native share protocol.
+fn make_stratum_accept_block_cb(
+    dag:        Arc<RwLock<consensus::GhostDAG>>,
+    store:      Arc<storage::Storage>,
+    mempool:    Arc<mempool::Mempool>,
+    node_state: Arc<RwLock<rpc::NodeState>>,
+    shielded:   Arc<RwLock<crate::coherence::ShieldedPool>>,
+    otx:        mpsc::Sender<network::NetworkMessage>,
+    tip_tx:     broadcast::Sender<stratum::TipChanged>,
+) -> Arc<stratum::AcceptBlockFn> {
+    Arc::new(move |block: core::Block| -> Result<String, String> {
+        // ── SECURITY (audit H2): structural gate FIRST ──────────────────
+        // Same call + same error shape as `make_rpc_submit_block_cb`, so
+        // stratum submissions cannot bypass the SIS/merkle/coinbase gate.
+        block.validate_structure()
+            .map_err(|e| format!("structural validation: {}", e))?;
+
+        let block_hash = block.header.pow_hash();
+        let height     = block.height;
+        let blue_score = block.blue_score;
+
+        // Delegate all consensus validation + DAG mutation + retarget +
+        // UTXO updates + mempool cleanup to the existing accept_block path.
+        accept_block(
+            &block, block_hash, height,
+            &dag, &store, &mempool, &node_state,
+            Some(&tip_tx), &shielded,
+        )?;
+
+        // Refresh RPC-visible state (mirrors miner loop).
+        {
+            let mut s = node_state.write();
+            s.tip_blue_score = dag.read().tip_blue_score();
+            s.block_count    = dag.read().block_count() as u64;
+            s.mempool_size   = mempool.size();
+        }
+
+        // Broadcast to gossipsub — other peers learn about the block.
+        let data = block.to_bitcoin_bytes();
+        let msg = network::NetworkMessage::NewBlock {
+            block_hash,
+            blue_score,
+            height,
+            block_data: data,
+        };
+        let otx_clone = otx.clone();
+        tokio::spawn(async move { let _ = otx_clone.send(msg).await; });
+
+        Ok(hex::encode(block_hash))
+    })
+}
+
+/// Build the RPC `submitblock` hook (B5f pool seam). Behavior is unchanged
+/// from the previous inline closure: `Block::block_hash()` identity, dedup,
+/// `validate_structure()`, then the shared `accept_block` pipeline + gossip.
+fn make_rpc_submit_block_cb(
+    dag:        Arc<RwLock<consensus::GhostDAG>>,
+    store:      Arc<storage::Storage>,
+    mempool:    Arc<mempool::Mempool>,
+    node_state: Arc<RwLock<rpc::NodeState>>,
+    shielded:   Arc<RwLock<crate::coherence::ShieldedPool>>,
+    otx:        mpsc::Sender<network::NetworkMessage>,
+    tip_tx:     broadcast::Sender<stratum::TipChanged>,
+) -> Arc<rpc::SubmitBlockFn> {
+    Arc::new(move |block: core::Block| -> Result<String, String> {
+        let block_hash = block.block_hash();
+        if dag.read().has_block(&block_hash) {
+            return Err("duplicate block".to_string());
+        }
+        block.validate_structure()
+            .map_err(|e| format!("structural validation: {}", e))?;
+
+        accept_block(
+            &block, block_hash, block.height,
+            &dag, &store, &mempool, &node_state,
+            Some(&tip_tx), &shielded,
+        )?;
+
+        // Refresh RPC-visible state (mirrors the miner loop).
+        {
+            let mut s = node_state.write();
+            s.tip_blue_score = dag.read().tip_blue_score();
+            s.block_count    = dag.read().block_count() as u64;
+            s.mempool_size   = mempool.size();
+        }
+
+        // Broadcast to gossipsub — other peers learn about the block.
+        let data = block.to_bitcoin_bytes();
+        let msg = network::NetworkMessage::NewBlock {
+            block_hash,
+            blue_score: block.blue_score,
+            height:     block.height,
+            block_data: data,
+        };
+        let otx_clone = otx.clone();
+        tokio::spawn(async move { let _ = otx_clone.send(msg).await; });
+
+        Ok(hex::encode(block_hash))
+    })
 }
 
 // ── Block acceptance + Orphan processing ─────────────────────────────────────
@@ -1906,3 +1956,246 @@ fn validate_tx_standalone(
 // v0.3.1 utxo-fix
 // v0.3.2 balance-fix
 // v0.3.3 recentblocks
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Audit H2 regression tests — external-submission structural gate.
+//
+// The vulnerability: the stratum accept_block_cb handed miner-submitted
+// blocks straight to `accept_block`, which checks bits/height/timestamp/tx
+// validity but NOT `Block::validate_structure()` (Module-SIS PoW witness,
+// merkle binding, coinbase format). A block with no SIS witness therefore
+// passed the stratum path while the gossipsub and RPC paths rejected it.
+//
+// These tests build the callbacks through the same builders `main()` uses,
+// so they exercise the real submission closures, not a re-implementation.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod external_submission_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn unix_now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
+    struct TestNode {
+        _tmp:       TempDir,
+        dag:        Arc<RwLock<consensus::GhostDAG>>,
+        store:      Arc<storage::Storage>,
+        mempool:    Arc<mempool::Mempool>,
+        node_state: Arc<RwLock<rpc::NodeState>>,
+        shielded:   Arc<RwLock<crate::coherence::ShieldedPool>>,
+        otx:        mpsc::Sender<network::NetworkMessage>,
+        // Keep the receiver alive so post-accept broadcasts don't error.
+        _orx:       mpsc::Receiver<network::NetworkMessage>,
+        tip_tx:     broadcast::Sender<stratum::TipChanged>,
+    }
+
+    impl TestNode {
+        fn stratum_cb(&self) -> Arc<stratum::AcceptBlockFn> {
+            make_stratum_accept_block_cb(
+                self.dag.clone(), self.store.clone(), self.mempool.clone(),
+                self.node_state.clone(), self.shielded.clone(),
+                self.otx.clone(), self.tip_tx.clone(),
+            )
+        }
+        fn rpc_cb(&self) -> Arc<rpc::SubmitBlockFn> {
+            make_rpc_submit_block_cb(
+                self.dag.clone(), self.store.clone(), self.mempool.clone(),
+                self.node_state.clone(), self.shielded.clone(),
+                self.otx.clone(), self.tip_tx.clone(),
+            )
+        }
+    }
+
+    fn mk_coinbase(height: u64, value: u64) -> core::Transaction {
+        core::Transaction {
+            version: 1,
+            inputs: vec![core::TxInput {
+                prev_txid:  [0u8; 32],
+                prev_index: u32::MAX,
+                script_sig: format!("height:{}", height).into_bytes(),
+                sequence:   u32::MAX,
+            }],
+            outputs: vec![core::TxOutput {
+                value,
+                script_pubkey: vec![0xAB; 20],
+            }],
+            locktime: 0,
+        }
+    }
+
+    /// Fixture genesis. Deliberately NOT structurally valid (no SIS witness) —
+    /// `accept_block` never re-validates ancestors, it only needs the genesis
+    /// present in the DAG (for height/parent checks) and in storage (for the
+    /// height-0 timestamp that seeds ASERT). The timestamp is "now" so ASERT
+    /// eases difficulty for block 1, keeping the mined-block test fast.
+    fn mk_genesis(ts: u64) -> core::Block {
+        core::Block {
+            header: core::BlockHeader {
+                version:     1,
+                parents:     vec![],
+                merkle_root: core::MerkleRoot::ZERO,
+                timestamp:   ts,
+                bits:        core::GENESIS_BITS,
+                nonce:       0,
+            },
+            transactions: vec![mk_coinbase(0, 0)],
+            blue_score: 0,
+            height: 0,
+            pow_solution: Vec::new(),
+            shielded_transactions: Vec::new(),
+        }
+    }
+
+    fn node_with_genesis(genesis: &core::Block) -> TestNode {
+        let tmp   = TempDir::new().expect("tempdir");
+        let store = Arc::new(storage::Storage::open(&tmp.path().join("db")).expect("storage"));
+        let dag   = Arc::new(RwLock::new(consensus::GhostDAG::with_default_k()));
+
+        let gh = genesis.block_hash();
+        store.put_block(genesis).expect("store genesis");
+        dag.write().add_genesis(gh, genesis.header.timestamp);
+
+        let (otx, orx) = mpsc::channel::<network::NetworkMessage>(64);
+        let (tip_tx, _) = broadcast::channel::<stratum::TipChanged>(8);
+
+        TestNode {
+            _tmp: tmp,
+            dag,
+            store,
+            mempool:    Arc::new(mempool::Mempool::new()),
+            node_state: Arc::new(RwLock::new(rpc::NodeState::default())),
+            shielded:   Arc::new(RwLock::new(crate::coherence::ShieldedPool::new())),
+            otx,
+            _orx: orx,
+            tip_tx,
+        }
+    }
+
+    /// Build a height-1 child of the fixture genesis that satisfies every
+    /// check `accept_block` performs (bits, height, finality, timestamp,
+    /// coinbase value). With `mine == false` the block carries NO Module-SIS
+    /// witness and a stale merkle root, so it fails `validate_structure()`
+    /// while still being acceptable to `accept_block` — exactly the H2 gap.
+    /// With `mine == true` a real SIS witness is mined (k = 4 regime below
+    /// the SF-1 activation height) and the merkle root is binding.
+    fn mk_child(node: &TestNode, genesis: &core::Block, mine: bool) -> core::Block {
+        let gh = genesis.block_hash();
+        let parent_ts = node.store.get_timestamp_at_height(0)
+            .expect("ts read").expect("genesis ts present");
+        let bits = pow::next_bits(
+            core::GENESIS_BITS, core::GENESIS_TIMESTAMP, parent_ts, 1,
+        );
+        let subsidy = core::tokenomics_v2::block_subsidy_sat(1);
+        assert_eq!(
+            core::tokenomics_v2::founder_vesting_delta_sat(1), 0,
+            "fixture assumes no founder vesting output at height 1",
+        );
+
+        let all_txs = vec![mk_coinbase(1, subsidy)];
+        let merkle  = core::Transaction::merkle_root(&all_txs);
+
+        let mut block = core::Block {
+            header: core::BlockHeader {
+                version:     1,
+                parents:     vec![gh],
+                merkle_root: if mine { merkle } else { core::MerkleRoot::ZERO },
+                timestamp:   parent_ts + 30,
+                bits,
+                nonce:       0,
+            },
+            transactions: all_txs,
+            blue_score: 1,
+            height: 1,
+            pow_solution: Vec::new(),
+            shielded_transactions: Vec::new(),
+        };
+
+        if mine {
+            let preimage = block.header.pow_preimage();
+            let (nonce, solution) =
+                pow::mine_sis_pow(&preimage, bits, block.height, 0, 50_000_000)
+                    .expect("SIS solve within attempt budget");
+            block.header.nonce  = nonce;
+            block.pow_solution  = solution.to_vec();
+            assert!(
+                block.validate_structure().is_ok(),
+                "mined fixture block must be structurally valid",
+            );
+        } else {
+            assert!(
+                block.validate_structure().is_err(),
+                "fixture block must fail validate_structure",
+            );
+        }
+        block
+    }
+
+    /// H2 regression: a block with NO Module-SIS witness (and a non-binding
+    /// merkle root) must be rejected by the stratum accept_block_cb BEFORE it
+    /// reaches the DAG/storage. Without the structural gate in
+    /// `make_stratum_accept_block_cb` this block is fully accepted (it passes
+    /// every check `accept_block` makes) and this test fails.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stratum_accept_block_cb_rejects_structure_invalid_block() {
+        let genesis = mk_genesis(unix_now());
+        let node = node_with_genesis(&genesis);
+        let bad = mk_child(&node, &genesis, false);
+
+        let res = (node.stratum_cb())(bad);
+        assert!(
+            res.is_err(),
+            "H2: stratum accept_block_cb must reject a block that fails \
+             validate_structure, got acceptance: {:?}", res,
+        );
+        let msg = res.unwrap_err();
+        assert!(
+            msg.contains("structural validation"),
+            "rejection must come from the structural gate, got: {}", msg,
+        );
+        // Nothing may have leaked into consensus state.
+        assert_eq!(node.dag.read().block_count(), 1, "DAG must contain only genesis");
+    }
+
+    /// The stratum and RPC submission gates must agree: both reject the same
+    /// structurally-invalid block with the same error shape.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stratum_and_rpc_submit_agree_on_structure_invalid_block() {
+        let genesis = mk_genesis(unix_now());
+        let node_a = node_with_genesis(&genesis);
+        let node_b = node_with_genesis(&genesis);
+        let bad = mk_child(&node_a, &genesis, false);
+
+        let stratum_err = (node_a.stratum_cb())(bad.clone()).unwrap_err();
+        let rpc_err     = (node_b.rpc_cb())(bad).unwrap_err();
+
+        assert!(stratum_err.contains("structural validation"), "stratum: {}", stratum_err);
+        assert!(rpc_err.contains("structural validation"),     "rpc: {}",     rpc_err);
+        assert_eq!(node_a.dag.read().block_count(), 1);
+        assert_eq!(node_b.dag.read().block_count(), 1);
+    }
+
+    /// Positive control: a genuinely mined block (real SIS witness, binding
+    /// merkle) is accepted by BOTH the stratum callback and the RPC
+    /// submitblock callback (each against its own fresh node sharing the same
+    /// genesis), proving the added gate does not over-reject.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stratum_and_rpc_submit_agree_on_valid_block() {
+        let genesis = mk_genesis(unix_now());
+        let node_a = node_with_genesis(&genesis);
+        let node_b = node_with_genesis(&genesis);
+        let good = mk_child(&node_a, &genesis, true);
+
+        let stratum_res = (node_a.stratum_cb())(good.clone());
+        assert!(stratum_res.is_ok(), "stratum must accept a valid block: {:?}", stratum_res);
+        assert_eq!(node_a.dag.read().block_count(), 2);
+
+        let rpc_res = (node_b.rpc_cb())(good);
+        assert!(rpc_res.is_ok(), "rpc submitblock must accept a valid block: {:?}", rpc_res);
+        assert_eq!(node_b.dag.read().block_count(), 2);
+    }
+}

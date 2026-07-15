@@ -24,7 +24,7 @@ use sha2::{Sha256, Digest};
 use pex_validator::{
     PexRateLimiter, PexStats,
     is_valid_public_multiaddr, is_lan_multiaddr, enforce_cap, prune_invalid,
-    PEX_BATCH_LIMIT,
+    PEX_BATCH_LIMIT, KNOWN_PEERS_CAP,
 };
 
 use crate::transport::upgrade::KyberConfig;
@@ -77,6 +77,181 @@ pub struct SyncEntry {
     pub hash:       [u8; 32],
     pub blue_score: u64,
     pub height:     u64,
+}
+
+// ── C1: bounded, validated wire decode ────────────────────────────────────────
+//
+// Every gossip frame comes from an untrusted peer. Before this fix the event
+// loop decoded frames with `bincode::config::standard()`, which puts no limit
+// on how many bytes a frame may claim to contain: a tiny crafted frame could
+// declare a multi-GB Vec length, and nothing in the decode path capped list
+// lengths (peer lists, header vectors, address strings). All untrusted decodes
+// now go through `decode_wire_message`, which (1) rejects frames larger than
+// MAX_WIRE_BYTES outright, (2) decodes with a bincode read limit of the same
+// size, and (3) applies explicit post-decode bounds to every variable-length
+// field of `NetworkMessage`.
+//
+// HONESTY CAVEAT on (3): the post-decode bounds run *after* serde has built
+// the value, so they bound acceptance, not the transient decode allocation.
+// The transient allocation is bounded by the 4 MiB byte limit, but bincode's
+// serde bridge decodes collections element-by-element, so a pathological
+// 4 MiB frame of empty strings can transiently amplify to tens of MB of
+// String headers before the bounds check rejects it. That is bounded and
+// short-lived (not the multi-GB pre-allocation this fixes), but tightening it
+// to zero would need a custom `Deserialize` impl — not done here.
+
+/// Hard ceiling on any single gossip frame. Must match gossipsub's
+/// `max_transmit_size` configured in `run()`.
+pub const MAX_WIRE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Max entries in a PEX/PeerCount address list. A compliant node advertises at
+/// most KNOWN_PEERS_CAP (1000) known peers plus a few self-addresses.
+pub const MAX_WIRE_ADDRS: usize = KNOWN_PEERS_CAP + 64;
+/// Max byte length of a single advertised multiaddr string. A real
+/// `/dns4/host/tcp/port/p2p/<peer-id>` is well under 256 bytes; 512 is
+/// generous headroom.
+pub const MAX_WIRE_ADDR_LEN: usize = 512;
+/// Max SyncEntry items in a Headers frame. IBD requests batches of 500
+/// (see main.rs GetHeaders); 2000 leaves headroom.
+pub const MAX_WIRE_SYNC_ENTRIES: usize = 2000;
+/// Max `limit` a peer may request via GetHeaders (bounds the work WE do
+/// serving the response).
+pub const MAX_WIRE_GETHEADERS_LIMIT: u32 = 2000;
+/// Max user_agent length in a Version handshake.
+pub const MAX_WIRE_USER_AGENT_LEN: usize = 128;
+/// Max peer_id string length in a PeerTip (base58 libp2p PeerIds are ~52 chars).
+pub const MAX_WIRE_PEER_ID_LEN: usize = 128;
+
+/// App-score penalty per wire protocol violation. With app_specific_weight
+/// 1.0 and graylist_threshold -400 (see `run()`), four violations graylist
+/// the peer.
+const WIRE_VIOLATION_PENALTY: f64 = -100.0;
+/// Floor so a flood of violations can't drive the score to -inf.
+const WIRE_PENALTY_FLOOR: f64 = -1000.0;
+/// Cap on the number of peers whose penalty score we track (bounds memory
+/// against an attacker cycling peer identities).
+const WIRE_PENALTY_TRACK_CAP: usize = 1024;
+
+#[derive(Debug)]
+pub enum WireDecodeError {
+    /// Frame exceeds MAX_WIRE_BYTES, or the bincode read limit tripped
+    /// (e.g. a declared length larger than the frame could ever satisfy).
+    Oversized(String),
+    /// Frame decoded, but a length field violates protocol bounds.
+    Bounds(&'static str),
+    /// Plain malformed bincode (may be benign version skew, not penalized
+    /// as harshly as a deliberate oversize).
+    Malformed(String),
+}
+
+impl WireDecodeError {
+    /// Oversized and bounds-violating frames are deliberate protocol
+    /// violations — a compliant node cannot produce them. Malformed frames
+    /// may just be a newer/older protocol version.
+    pub fn is_protocol_violation(&self) -> bool {
+        matches!(self, WireDecodeError::Oversized(_) | WireDecodeError::Bounds(_))
+    }
+}
+
+/// Decode an untrusted gossip frame with a hard byte limit and post-decode
+/// bounds validation. This is the ONLY correct way to decode wire bytes from
+/// a peer; `bincode::config::standard()` without a limit must never be used
+/// on untrusted input.
+pub fn decode_wire_message(data: &[u8]) -> Result<NetworkMessage, WireDecodeError> {
+    if data.len() > MAX_WIRE_BYTES {
+        return Err(WireDecodeError::Oversized(format!(
+            "frame is {} bytes (max {})", data.len(), MAX_WIRE_BYTES
+        )));
+    }
+    let cfg = bincode::config::standard().with_limit::<MAX_WIRE_BYTES>();
+    let msg: NetworkMessage = match bincode::serde::decode_from_slice(data, cfg) {
+        Ok((m, _)) => m,
+        Err(bincode::error::DecodeError::LimitExceeded) => {
+            return Err(WireDecodeError::Oversized(format!(
+                "declared content exceeds {} byte read limit", MAX_WIRE_BYTES
+            )));
+        }
+        Err(e) => return Err(WireDecodeError::Malformed(e.to_string())),
+    };
+    validate_wire_bounds(&msg)?;
+    Ok(msg)
+}
+
+/// Explicit bounds on every variable-length field of NetworkMessage.
+fn validate_wire_bounds(msg: &NetworkMessage) -> Result<(), WireDecodeError> {
+    use WireDecodeError::Bounds;
+    fn addrs_ok(addrs: &[String]) -> Result<(), WireDecodeError> {
+        if addrs.len() > MAX_WIRE_ADDRS {
+            return Err(WireDecodeError::Bounds("address list longer than MAX_WIRE_ADDRS"));
+        }
+        if addrs.iter().any(|a| a.len() > MAX_WIRE_ADDR_LEN) {
+            return Err(WireDecodeError::Bounds("address string longer than MAX_WIRE_ADDR_LEN"));
+        }
+        Ok(())
+    }
+    match msg {
+        // The two payload checks below are unreachable today (a payload can't
+        // exceed the frame that carries it, and frames are capped at
+        // MAX_WIRE_BYTES) — kept as belt-and-braces should the byte limit and
+        // this constant ever diverge.
+        NetworkMessage::NewBlock { block_data, .. } => {
+            if block_data.len() > MAX_WIRE_BYTES {
+                return Err(Bounds("block_data larger than MAX_WIRE_BYTES"));
+            }
+        }
+        NetworkMessage::NewTransaction { tx_data, .. } => {
+            if tx_data.len() > MAX_WIRE_BYTES {
+                return Err(Bounds("tx_data larger than MAX_WIRE_BYTES"));
+            }
+        }
+        NetworkMessage::PeerTip { peer_id, .. } => {
+            if peer_id.len() > MAX_WIRE_PEER_ID_LEN {
+                return Err(Bounds("peer_id longer than MAX_WIRE_PEER_ID_LEN"));
+            }
+        }
+        NetworkMessage::PeerExchange { peers } => addrs_ok(peers)?,
+        NetworkMessage::PeerCount { addresses, .. } => addrs_ok(addresses)?,
+        NetworkMessage::GetHeaders { limit, .. } => {
+            if *limit > MAX_WIRE_GETHEADERS_LIMIT {
+                return Err(Bounds("GetHeaders limit above MAX_WIRE_GETHEADERS_LIMIT"));
+            }
+        }
+        NetworkMessage::Headers { entries } => {
+            if entries.len() > MAX_WIRE_SYNC_ENTRIES {
+                return Err(Bounds("Headers entries longer than MAX_WIRE_SYNC_ENTRIES"));
+            }
+        }
+        NetworkMessage::Version { user_agent, .. } => {
+            if user_agent.len() > MAX_WIRE_USER_AGENT_LEN {
+                return Err(Bounds("user_agent longer than MAX_WIRE_USER_AGENT_LEN"));
+            }
+        }
+        NetworkMessage::PeerRequest
+        | NetworkMessage::VersionAck
+        | NetworkMessage::GetBlock { .. } => {}
+    }
+    Ok(())
+}
+
+// ── H4: panic-free truncation of attacker-controlled strings ─────────────────
+
+/// UTF-8-safe prefix of at most `max_bytes` bytes.
+///
+/// The PEX log lines previously used `&s[..s.len().min(N)]`, which panics if
+/// byte N falls in the middle of a multi-byte UTF-8 codepoint — and PEX
+/// address strings are attacker-controlled, so a single crafted multiaddr
+/// containing multi-byte characters at the right offset crashed the whole
+/// network event loop. This walks back to the nearest char boundary instead.
+pub(crate) fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    // `end` is now a char boundary (0 in the worst case), so this cannot panic.
+    &s[..end]
 }
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -352,6 +527,12 @@ impl NetworkNode {
         let mut pex_stats   = PexStats::new();
         let allow_private   = self.config.allow_private_peers;
 
+        // C1: cumulative app-score penalties for peers sending frames that
+        // violate wire bounds (oversized / over-long lists). Bounded map so an
+        // attacker cycling identities can't grow it without limit.
+        let mut wire_penalties: std::collections::HashMap<PeerId, f64> =
+            std::collections::HashMap::new();
+
         // Add hardcoded default seeds
         let mut all_seeds: Vec<String> = crate::core::DEFAULT_SEEDS.iter().map(|s| s.to_string()).collect();
         // DNS seeds: TODO when TXT records are configured
@@ -409,7 +590,41 @@ impl NetworkNode {
                 event = poll_swarm(&mut swarm) => {
                     match event {
                         SwarmEvent::Behaviour(BlochBehaviourEvent::Gossipsub(gossipsub::Event::Message { propagation_source, message, .. })) => {
-                            if let Ok(msg) = bincode::serde::decode_from_slice::<NetworkMessage,_>(&message.data, bincode::config::standard()).map(|(v,_)|v) {
+                            // C1: bounded decode. `decode_wire_message` enforces the
+                            // 4 MiB frame/read limit and per-field length bounds; the
+                            // unlimited `bincode::config::standard()` decode used here
+                            // before let a tiny frame declare multi-GB lengths.
+                            let decoded = decode_wire_message(&message.data);
+                            if let Err(ref e) = decoded {
+                                if e.is_protocol_violation() {
+                                    // Oversized / bounds-violating frames can't come from
+                                    // a compliant node: hit the sender's application score
+                                    // so repeat offenders get graylisted (4 × -100 crosses
+                                    // graylist_threshold -400 at app_specific_weight 1.0).
+                                    // NOTE (honesty): if `with_peer_score` failed above
+                                    // (non-fatal warn path), set_application_score is
+                                    // inert and this is effectively log-only.
+                                    let score = if wire_penalties.len() >= WIRE_PENALTY_TRACK_CAP
+                                        && !wire_penalties.contains_key(&propagation_source)
+                                    {
+                                        // Tracking map is full: apply a one-shot penalty
+                                        // without growing the map.
+                                        WIRE_VIOLATION_PENALTY
+                                    } else {
+                                        let s = wire_penalties.entry(propagation_source).or_insert(0.0);
+                                        *s = (*s + WIRE_VIOLATION_PENALTY).max(WIRE_PENALTY_FLOOR);
+                                        *s
+                                    };
+                                    swarm.behaviour_mut().gossipsub
+                                        .set_application_score(&propagation_source, score);
+                                    warn!("wire violation from {}: {:?} (app score → {})",
+                                        propagation_source, e, score);
+                                } else {
+                                    debug!("undecodable gossip frame from {} ({} bytes)",
+                                        propagation_source, message.data.len());
+                                }
+                            }
+                            if let Ok(msg) = decoded {
                                 match &msg {
                                     NetworkMessage::NewBlock  { block_hash, height, blue_score, .. } => {
                                         // P1 (roadmap §2): block-ingest correlation moved here from
@@ -496,7 +711,9 @@ impl NetworkNode {
                                                 } else {
                                                     pex_stats.record_invalid(1);
                                                 }
-                                                debug!("PEX rejected: {}", &addr_str[..addr_str.len().min(80)]);
+                                                // H4: addr_str is attacker-controlled; byte-index
+                                            // slicing panicked on multi-byte UTF-8 at byte 80.
+                                            debug!("PEX rejected: {}", truncate_utf8(addr_str, 80));
                                                 continue;
                                             }
                                             if known_peers.contains(addr_str) {
@@ -509,7 +726,8 @@ impl NetworkNode {
                                             // DNS transport resolves /dns*/ during the dial, off the
                                             // critical path.
                                             if let Ok(addr) = addr_str.parse::<libp2p::Multiaddr>() {
-                                                info!("PEX dial: {}", &addr_str[..addr_str.len().min(60)]);
+                                                // H4: UTF-8-safe truncation (attacker-controlled).
+                                                info!("PEX dial: {}", truncate_utf8(addr_str, 60));
                                                 let _ = swarm.dial(addr);
                                                 valid_accepted += 1;
                                                 // NB: don't insert into known_peers here; wait for
@@ -560,8 +778,10 @@ impl NetworkNode {
                                     // Enforce cap on live state too
                                     enforce_cap(&mut known_peers);
                                 } else {
+                                    // H4: same panic-free truncation as the PEX log lines
+                                    // (send_back_addr strings are peer-influenced too).
                                     debug!("not adding peer to known_peers (validator rejected): {}",
-                                        &addr_str[..addr_str.len().min(80)]);
+                                        truncate_utf8(&addr_str, 80));
                                 }
                             }
                             // Send version handshake. Sprint CC: read fresh
@@ -1087,5 +1307,162 @@ mod tests {
             "tip_announce interval {:?} outside acceptable bounds [{:?}, {:?}]",
             actual, min_allowed, max_allowed
         );
+    }
+
+    // ─── C1 regression: bounded bincode decode of untrusted gossip ────────
+
+    /// (a) A tiny crafted frame declaring a multi-GB Vec length must return
+    /// a decode error fast, without allocating the declared size. The frame
+    /// is built by taking a genuinely-encoded NewBlock and splicing an 8 GiB
+    /// length varint in place of the block_data length, so the test is
+    /// self-validating against bincode's actual encoding layout.
+    #[test]
+    fn wire_decode_rejects_multi_gb_declared_vec() {
+        let small = NetworkMessage::NewBlock {
+            block_hash: [0u8; 32],
+            blue_score: 0,
+            height:     0,
+            block_data: vec![7u8; 3],
+        };
+        let enc = bincode::serde::encode_to_vec(&small, bincode::config::standard())
+            .expect("encode");
+        // Layout guard: the frame must end with len-varint 0x03 then 7,7,7.
+        // If bincode's encoding ever changes, fail loudly here instead of
+        // silently testing a meaningless byte string.
+        assert!(
+            enc.ends_with(&[3, 7, 7, 7]),
+            "bincode encoding layout changed; update this test"
+        );
+        let mut frame = enc[..enc.len() - 4].to_vec();
+        frame.push(0xFD); // bincode-2 varint marker: u64 follows
+        frame.extend_from_slice(&(8u64 * 1024 * 1024 * 1024).to_le_bytes()); // 8 GiB
+
+        let t0 = std::time::Instant::now();
+        let res = decode_wire_message(&frame);
+        assert!(
+            res.is_err(),
+            "a frame declaring an 8 GiB Vec must not decode: {:?}", res
+        );
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "decode must fail fast (no giant allocation/scan), took {:?}",
+            t0.elapsed()
+        );
+    }
+
+    /// (b) The 4 MiB frame limit: a frame just over MAX_WIRE_BYTES is
+    /// rejected as Oversized; one comfortably under it decodes fine. This
+    /// FAILS without the fix (the old unlimited standard() decode accepted
+    /// the >4 MiB frame).
+    #[test]
+    fn wire_decode_enforces_4mib_frame_limit() {
+        let mk = |n: usize| NetworkMessage::NewBlock {
+            block_hash: [0u8; 32],
+            blue_score: 0,
+            height:     0,
+            block_data: vec![0u8; n],
+        };
+
+        // Just over: payload alone exceeds MAX_WIRE_BYTES, so the whole
+        // frame necessarily does too.
+        let over = bincode::serde::encode_to_vec(&mk(MAX_WIRE_BYTES + 1024), bincode::config::standard())
+            .expect("encode over");
+        assert!(over.len() > MAX_WIRE_BYTES);
+        match decode_wire_message(&over) {
+            Err(WireDecodeError::Oversized(_)) => {}
+            other => panic!("frame over 4 MiB must be Oversized, got {:?}", other),
+        }
+
+        // Comfortably under: must decode and round-trip the payload.
+        let under = bincode::serde::encode_to_vec(&mk(3 * 1024 * 1024), bincode::config::standard())
+            .expect("encode under");
+        assert!(under.len() < MAX_WIRE_BYTES);
+        match decode_wire_message(&under).expect("3 MiB block must decode") {
+            NetworkMessage::NewBlock { block_data, .. } => {
+                assert_eq!(block_data.len(), 3 * 1024 * 1024);
+            }
+            other => panic!("expected NewBlock, got {:?}", other),
+        }
+    }
+
+    /// C1 post-decode bounds: a PeerExchange whose peer list is far longer
+    /// than any compliant node would send must be rejected even though the
+    /// frame is well under the 4 MiB byte limit (the byte limit alone cannot
+    /// catch it). FAILS without the fix. A modest list still passes, and a
+    /// single over-long address string is also rejected.
+    #[test]
+    fn wire_decode_bounds_peer_lists() {
+        // Too many entries, but small total size (< 4 MiB).
+        let peers: Vec<String> = (0..(MAX_WIRE_ADDRS + 1))
+            .map(|i| format!("/ip4/1.2.3.4/tcp/{}", i % 65535))
+            .collect();
+        let bytes = bincode::serde::encode_to_vec(
+            &NetworkMessage::PeerExchange { peers },
+            bincode::config::standard(),
+        ).expect("encode");
+        assert!(bytes.len() < MAX_WIRE_BYTES, "test premise: under byte limit");
+        assert!(
+            matches!(decode_wire_message(&bytes), Err(WireDecodeError::Bounds(_))),
+            "oversized peer list must be a Bounds violation"
+        );
+
+        // One absurdly long address string.
+        let bytes = bincode::serde::encode_to_vec(
+            &NetworkMessage::PeerExchange { peers: vec!["x".repeat(MAX_WIRE_ADDR_LEN + 1)] },
+            bincode::config::standard(),
+        ).expect("encode");
+        assert!(
+            matches!(decode_wire_message(&bytes), Err(WireDecodeError::Bounds(_))),
+            "over-long address string must be a Bounds violation"
+        );
+
+        // A compliant-size list decodes fine.
+        let ok_peers: Vec<String> = (0..10).map(|i| format!("/ip4/9.9.9.{}/tcp/16110", i)).collect();
+        let bytes = bincode::serde::encode_to_vec(
+            &NetworkMessage::PeerExchange { peers: ok_peers.clone() },
+            bincode::config::standard(),
+        ).expect("encode");
+        match decode_wire_message(&bytes).expect("compliant PEX must decode") {
+            NetworkMessage::PeerExchange { peers } => assert_eq!(peers, ok_peers),
+            other => panic!("expected PeerExchange, got {:?}", other),
+        }
+    }
+
+    // ─── H4 regression: UTF-8-safe truncation of PEX strings ──────────────
+
+    /// (c) A PEX address string where byte 80 falls mid-codepoint. The
+    /// pre-fix pattern `&s[..s.len().min(80)]` panics on exactly this input
+    /// (asserted below via catch_unwind, documenting the vulnerability);
+    /// `truncate_utf8` must handle it without panicking.
+    #[test]
+    fn pex_string_truncation_is_utf8_safe() {
+        // "a" + 50×'é' (2 bytes each) = 101 bytes; char boundaries sit at
+        // 0, 1, 3, 5, ..., so byte 80 is mid-codepoint.
+        let s = format!("a{}", "é".repeat(50));
+        assert!(!s.is_char_boundary(80), "test premise: 80 must be mid-codepoint");
+
+        // Document the pre-fix behavior: the old expression panics on this input.
+        let old_pattern_panics = std::panic::catch_unwind(|| {
+            let _ = &s[..s.len().min(80)];
+        }).is_err();
+        assert!(old_pattern_panics, "this input reproduces the pre-fix H4 panic");
+
+        // The fix: no panic, valid UTF-8 prefix, within the byte budget.
+        let t = truncate_utf8(&s, 80);
+        assert!(t.len() <= 80);
+        assert!(s.starts_with(t));
+        assert_eq!(t.len(), 79, "should back off to the char boundary at 79");
+
+        // 4-byte codepoints (emoji): budget 79 backs off to 76.
+        let e = "💥".repeat(30); // 120 bytes
+        let te = truncate_utf8(&e, 79);
+        assert_eq!(te.len(), 76);
+        assert!(e.starts_with(te));
+
+        // Short and boundary-exact strings pass through unchanged.
+        assert_eq!(truncate_utf8("abc", 80), "abc");
+        assert_eq!(truncate_utf8("éé", 4), "éé");
+        // Degenerate: budget smaller than the first codepoint → empty, no panic.
+        assert_eq!(truncate_utf8("💥", 3), "");
     }
 }

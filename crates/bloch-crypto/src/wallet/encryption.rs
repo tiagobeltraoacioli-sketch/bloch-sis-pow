@@ -237,6 +237,35 @@ impl EncryptedKeyfile {
         let ciphertext = B64.decode(&self.cipher.ciphertext_b64).map_err(|e| WalletError::Parse(e.to_string()))?;
         let public = B64.decode(&self.meta.public_key_b64).map_err(|e| WalletError::Parse(e.to_string()))?;
 
+        // SECURITY (audit M): length-guard fields decoded from the untrusted
+        // keyfile BEFORE they reach fixed-size consumers. `Nonce::from_slice`
+        // PANICS on any length other than 12 bytes, so a truncated or corrupt
+        // keyfile would crash the process instead of returning an error. The
+        // salt and ciphertext are guarded too: v1 keyfiles always carry a
+        // 16-byte salt, and an AES-256-GCM ciphertext shorter than the 16-byte
+        // tag cannot possibly be valid.
+        const SALT_LEN: usize = 16;
+        const NONCE_LEN: usize = 12;
+        const GCM_TAG_LEN: usize = 16;
+        if salt.len() != SALT_LEN {
+            return Err(WalletError::Parse(format!(
+                "keyfile salt has invalid length: expected {} bytes, got {}",
+                SALT_LEN, salt.len()
+            )));
+        }
+        if nonce_bytes.len() != NONCE_LEN {
+            return Err(WalletError::Parse(format!(
+                "keyfile nonce has invalid length: expected {} bytes, got {}",
+                NONCE_LEN, nonce_bytes.len()
+            )));
+        }
+        if ciphertext.len() < GCM_TAG_LEN {
+            return Err(WalletError::Parse(format!(
+                "keyfile ciphertext too short: {} bytes, need at least the {}-byte GCM tag",
+                ciphertext.len(), GCM_TAG_LEN
+            )));
+        }
+
         // SECURITY (audit L1): reject absurd KDF params from the untrusted
         // keyfile BEFORE handing them to Argon2. m_cost near u32::MAX (KiB)
         // forces a multi-terabyte allocation that OOM-kills the process on any
@@ -457,6 +486,61 @@ mod tests {
             b"secret", b"public", Network::Mainnet, "twelvechars!", fast_params
         );
         assert!(r12.is_ok(), "12-char password must be accepted");
+    }
+
+    /// Audit REGRESSION: a keyfile with a truncated/corrupt nonce must return
+    /// a parse error, not panic. `Nonce::from_slice` panics on any length
+    /// other than 12 bytes, so before the length guard this test crashed the
+    /// process on decrypt.
+    #[test]
+    fn corrupt_nonce_returns_error_not_panic() {
+        let fast_params = KdfParams { m_cost: 1024, t_cost: 1, p_cost: 1 };
+        let mut keyfile = EncryptedKeyfile::encrypt_with_params(
+            b"secret", b"public", Network::Mainnet, "password-abcd-12", fast_params
+        ).unwrap();
+
+        // Truncated 4-byte nonce (valid base64, wrong decoded length).
+        keyfile.cipher.nonce_b64 = B64.encode([0u8; 4]);
+        let result = keyfile.decrypt("password-abcd-12");
+        assert!(matches!(result, Err(WalletError::Parse(_))),
+            "short nonce must be a Parse error");
+
+        // Oversized 32-byte nonce is equally invalid.
+        keyfile.cipher.nonce_b64 = B64.encode([0u8; 32]);
+        let result = keyfile.decrypt("password-abcd-12");
+        assert!(matches!(result, Err(WalletError::Parse(_))),
+            "long nonce must be a Parse error");
+    }
+
+    /// Audit: truncated salt and tag-less ciphertext must also be clean
+    /// parse errors on decrypt of a corrupt keyfile.
+    #[test]
+    fn corrupt_salt_or_short_ciphertext_returns_error() {
+        let fast_params = KdfParams { m_cost: 1024, t_cost: 1, p_cost: 1 };
+        let keyfile = EncryptedKeyfile::encrypt_with_params(
+            b"secret", b"public", Network::Mainnet, "password-abcd-12", fast_params
+        ).unwrap();
+
+        // Truncated 4-byte salt.
+        let mut kf_salt = EncryptedKeyfile {
+            version: keyfile.version,
+            network: keyfile.network,
+            kdf: KdfDesc { salt_b64: B64.encode([0u8; 4]), algo: keyfile.kdf.algo.clone(),
+                m_cost: keyfile.kdf.m_cost, t_cost: keyfile.kdf.t_cost, p_cost: keyfile.kdf.p_cost },
+            cipher: CipherDesc { algo: keyfile.cipher.algo.clone(),
+                nonce_b64: keyfile.cipher.nonce_b64.clone(),
+                ciphertext_b64: keyfile.cipher.ciphertext_b64.clone() },
+            meta: Meta { public_key_b64: keyfile.meta.public_key_b64.clone(),
+                address: keyfile.meta.address.clone() },
+        };
+        assert!(matches!(kf_salt.decrypt("password-abcd-12"), Err(WalletError::Parse(_))),
+            "short salt must be a Parse error");
+
+        // Ciphertext shorter than the 16-byte GCM tag.
+        kf_salt.kdf.salt_b64 = keyfile.kdf.salt_b64.clone();
+        kf_salt.cipher.ciphertext_b64 = B64.encode([0u8; 8]);
+        assert!(matches!(kf_salt.decrypt("password-abcd-12"), Err(WalletError::Parse(_))),
+            "tag-less ciphertext must be a Parse error");
     }
 
     #[test]
