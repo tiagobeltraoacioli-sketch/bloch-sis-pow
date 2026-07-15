@@ -130,31 +130,14 @@ pub fn with_seeded_rng(seed: &[u8; 32]) -> SeededRngGuard {
     SeededRngGuard { _priv: () }
 }
 
-/// Get random bytes; exposed for PQClean implementations.
+/// Fill `buf` with random bytes — safe-Rust core of the FFI entry point.
 ///
-/// # Behavior
-///
-/// - If a seeded RNG is active on this thread (via `with_seeded_rng`):
-///   fills `buf` with deterministic bytes from that RNG.
+/// - If a seeded RNG is active on this thread (via [`with_seeded_rng`]):
+///   fills `buf` with deterministic bytes from that RNG (infallible).
 /// - Otherwise: fills `buf` with OS entropy via `getrandom::fill` —
-///   identical to upstream pqcrypto-internals.
-///
-/// # Safety
-///
-/// Assumes inputs are valid and may panic over FFI boundary if rng failed.
-///
-/// # Example
-/// ```rust
-/// use pqcrypto_internals::*;
-/// let mut buf = [0u8;10];
-/// unsafe {
-///   PQCRYPTO_RUST_randombytes(buf.as_mut_ptr(), buf.len());
-/// }
-/// ```
-#[no_mangle]
-pub unsafe extern "C" fn PQCRYPTO_RUST_randombytes(buf: *mut u8, len: size_t) -> c_int {
-    let buf = slice::from_raw_parts_mut(buf, len);
-
+///   identical to upstream pqcrypto-internals — and propagates any OS RNG
+///   failure as `Err` instead of panicking.
+pub fn randombytes_fill(buf: &mut [u8]) -> Result<(), getrandom::Error> {
     // Fast path: no seeded RNG → upstream behavior exactly.
     let used_seeded = SEEDED_RNG.with(|cell| {
         let mut opt = cell.borrow_mut();
@@ -168,9 +151,62 @@ pub unsafe extern "C" fn PQCRYPTO_RUST_randombytes(buf: *mut u8, len: size_t) ->
     });
 
     if !used_seeded {
-        getrandom::fill(buf).expect("RNG Failed");
+        getrandom::fill(buf)?;
     }
-    0
+    Ok(())
+}
+
+/// Get random bytes; exposed for PQClean implementations.
+///
+/// # Behavior
+///
+/// Delegates to [`randombytes_fill`] (seeded thread-local stream if active,
+/// OS entropy otherwise) and returns `0` on success.
+///
+/// SECURITY (audit M): this function previously called
+/// `getrandom::fill(buf).expect("RNG Failed")`, which on an OS RNG failure
+/// started an unwind across the `extern "C"` boundary — undefined behavior on
+/// older toolchains and an uncontrolled process abort on current ones. All
+/// failures are now reported as a `-1` error code with no unwinding:
+///
+/// - `buf` is NULL → `-1` (checked before any slice is constructed).
+/// - OS RNG failure → `-1`, `buf` contents unspecified (never partially
+///   trusted). NOTE: PQClean call sites that ignore the return code would
+///   proceed with an unfilled buffer; callers of this crate should treat any
+///   nonzero return as fatal for the surrounding key/signature operation.
+///
+/// # Safety
+///
+/// If `buf` is non-NULL it must be valid for writes of `len` bytes and not
+/// aliased by any Rust reference for the duration of the call.
+///
+/// # Example
+/// ```rust
+/// use pqcrypto_internals::*;
+/// let mut buf = [0u8;10];
+/// unsafe {
+///   PQCRYPTO_RUST_randombytes(buf.as_mut_ptr(), buf.len());
+/// }
+/// ```
+#[no_mangle]
+pub unsafe extern "C" fn PQCRYPTO_RUST_randombytes(buf: *mut u8, len: size_t) -> c_int {
+    // Guard BEFORE constructing a slice: `slice::from_raw_parts_mut` on a
+    // NULL pointer is undefined behavior (it aborts under the debug-build
+    // precondition checks). A bad buffer from the C side must become an
+    // error code, not UB.
+    if buf.is_null() {
+        return -1;
+    }
+    if len == 0 {
+        return 0;
+    }
+    let buf = slice::from_raw_parts_mut(buf, len);
+
+    match randombytes_fill(buf) {
+        Ok(()) => 0,
+        // Report failure as a C error code; never unwind into C.
+        Err(_) => -1,
+    }
 }
 
 #[cfg(test)]
@@ -229,6 +265,44 @@ mod tests {
         }
 
         assert_ne!(a, b);
+    }
+
+    /// Audit REGRESSION: a NULL buffer from the C side must come back as a
+    /// `-1` error code. Before the fix, `slice::from_raw_parts_mut(NULL, ..)`
+    /// was undefined behavior (an abort under debug-build precondition
+    /// checks) — nothing on the error path could cross the FFI boundary as a
+    /// clean error.
+    #[test]
+    fn null_buffer_returns_error_code_not_ub() {
+        let rc = unsafe { PQCRYPTO_RUST_randombytes(core::ptr::null_mut(), 32) };
+        assert_eq!(rc, -1, "NULL buffer must yield -1, not UB/abort");
+    }
+
+    /// Zero-length fills succeed trivially (nothing to write).
+    #[test]
+    fn zero_length_fill_is_ok() {
+        let mut buf = [0u8; 1];
+        let rc = unsafe { PQCRYPTO_RUST_randombytes(buf.as_mut_ptr(), 0) };
+        assert_eq!(rc, 0);
+    }
+
+    /// The safe-Rust core reports success via Result (the OS-failure branch
+    /// propagates `getrandom::Error` instead of panicking; an actual OS RNG
+    /// failure cannot be forced in a portable test).
+    #[test]
+    fn randombytes_fill_returns_result() {
+        let mut buf = [0u8; 32];
+        assert!(randombytes_fill(&mut buf).is_ok());
+
+        // Seeded path is deterministic and infallible.
+        let _g = with_seeded_rng(&[0xA5u8; 32]);
+        let mut a = [0u8; 32];
+        let mut b = [0u8; 32];
+        randombytes_fill(&mut a).unwrap();
+        drop(_g);
+        let _g2 = with_seeded_rng(&[0xA5u8; 32]);
+        randombytes_fill(&mut b).unwrap();
+        assert_eq!(a, b);
     }
 
     /// Dropping the guard restores OS RNG behavior.

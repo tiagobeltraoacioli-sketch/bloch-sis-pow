@@ -87,13 +87,13 @@ mod kat;
 // Public re-exports for the most common types and functions.
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub use error::{PowError, MineError, VerifyError};
+pub use error::{PowError, MineError, VerifyError, BitsError};
 pub use params::{Params, SHIPPED_PARAMS};
 #[allow(deprecated)]
 pub use params::CANONICAL_PARAMS;
 pub use solver::{mine, MineResult};
 pub use verify::{verify, verify_regime};
-pub use difficulty::{Target, bits_to_target, target_to_bits, hash_meets_target};
+pub use difficulty::{Target, bits_to_target, try_bits_to_target, target_to_bits, hash_meets_target};
 
 /// Crate version, derived from Cargo metadata.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

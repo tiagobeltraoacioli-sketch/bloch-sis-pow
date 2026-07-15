@@ -172,12 +172,33 @@ pub enum SpendError {
     Membership(usize),
     Nullifier(usize),
     OutputCommitment(usize),
+    /// public.nullifiers.len() != witness.inputs.len().
+    NullifierCountMismatch { public: usize, witness: usize },
+    /// public.out_commitments.len() != witness.outputs.len().
+    OutputCountMismatch { public: usize, witness: usize },
     Overflow,
     Unbalanced { inputs: u128, outputs: u128, fee: u64 },
 }
 
 /// The EXACT statement the ZK circuit proves (runs on the PRIVATE witness).
 pub fn check_spend(public: &SpendPublic, w: &SpendWitness) -> Result<(), SpendError> {
+    // Bind the public vectors to the witness EXACTLY (C2 fix). Without these
+    // binds a prover could append extra public out_commitments beyond the
+    // witness outputs — commitments the balance check never sees — and mint
+    // unbacked notes into the tree (shielded counterfeiting); likewise the
+    // nullifier count must match the spent inputs one-for-one.
+    if public.out_commitments.len() != w.outputs.len() {
+        return Err(SpendError::OutputCountMismatch {
+            public: public.out_commitments.len(),
+            witness: w.outputs.len(),
+        });
+    }
+    if public.nullifiers.len() != w.inputs.len() {
+        return Err(SpendError::NullifierCountMismatch {
+            public: public.nullifiers.len(),
+            witness: w.inputs.len(),
+        });
+    }
     let mut in_sum: u128 = 0;
     for (i, inp) in w.inputs.iter().enumerate() {
         let cm = inp.note.commitment();
@@ -290,5 +311,63 @@ mod tests {
         // forged membership
         let bad = SpendPublic { anchor: [0xCD; 32], ..public.clone() };
         assert!(matches!(check_spend(&bad, &w), Err(SpendError::Membership(0))));
+    }
+
+    /// C2 regression: the public vectors must be bound to the witness lengths.
+    /// Extra public out_commitments (unseen by the balance check) were the
+    /// counterfeiting vector: a proof over N witness outputs would also attest
+    /// to an N+1-th unbacked commitment entering the tree.
+    #[test]
+    fn check_spend_binds_public_counts_to_witness() {
+        let mut t = CommitmentTree::new();
+        let inp = note(1000, 7);
+        let pos = t.append(inp.commitment());
+        let anchor = t.root();
+        let path = t.path(pos).unwrap();
+        let nk = [3u8; 32];
+        let out = note(900, 8);
+
+        let honest = SpendPublic {
+            anchor,
+            nullifiers: vec![inp.nullifier(&nk, pos)],
+            out_commitments: vec![out.commitment()],
+            fee: 100,
+        };
+        let w = SpendWitness {
+            inputs: vec![SpendInput { note: inp.clone(), position: pos, path, nk }],
+            outputs: vec![out.clone()],
+        };
+
+        // (c) honest spend with matching lengths still verifies.
+        assert_eq!(check_spend(&honest, &w), Ok(()));
+
+        // (a) N witness outputs but N+1 public out_commitments must fail:
+        // the smuggled commitment would mint an unbacked 1M-value note.
+        let smuggled = note(1_000_000, 9);
+        let mut inflated = honest.clone();
+        inflated.out_commitments.push(smuggled.commitment());
+        assert_eq!(
+            check_spend(&inflated, &w),
+            Err(SpendError::OutputCountMismatch { public: 2, witness: 1 })
+        );
+
+        // (b) N witness inputs but fewer public nullifiers must fail with the
+        // distinct count-mismatch error (an input spent without publishing its
+        // nullifier could be double-spent).
+        let mut missing_nf = honest.clone();
+        missing_nf.nullifiers.clear();
+        assert_eq!(
+            check_spend(&missing_nf, &w),
+            Err(SpendError::NullifierCountMismatch { public: 0, witness: 1 })
+        );
+
+        // Extra public nullifiers beyond the witness inputs must also fail:
+        // unproven nullifiers would burn notes the witness never opened.
+        let mut extra_nf = honest.clone();
+        extra_nf.nullifiers.push([0xEE; 32]);
+        assert_eq!(
+            check_spend(&extra_nf, &w),
+            Err(SpendError::NullifierCountMismatch { public: 2, witness: 1 })
+        );
     }
 }
