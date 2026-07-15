@@ -482,6 +482,19 @@ async fn main() {
                 // IBD step 1: peer tip — if behind, request headers
                 network::NetworkMessage::PeerTip { blue_score: peer_s, ref peer_id, .. } => {
                     let our_s = dag2.read().tip_blue_score();
+                    {
+                        let mut s = state2.write();
+                        s.seen_first_tip = true;
+                        if peer_s > s.best_seen_blue_score { s.best_seen_blue_score = peer_s; }
+                        // Release the IBD latch once we've caught up to the best
+                        // tip any peer has announced. Replaces the dead empty-
+                        // Headers clear path below; peers re-announce their tip
+                        // ~every 60s, so a synced node resumes mining promptly.
+                        if s.is_syncing && our_s >= s.best_seen_blue_score {
+                            s.is_syncing = false;
+                            info!("IBD complete (caught up to best announced tip {})", s.best_seen_blue_score);
+                        }
+                    }
                     if peer_s > our_s {
                         info!("Peer {} ahead ({}), requesting headers", peer_id, peer_s);
                         state2.write().is_syncing = true;
@@ -760,16 +773,24 @@ async fn main() {
                 // to join a network but with 0 peers so far must not mine — it
                 // would build an isolated fork from genesis that the network
                 // rejects on cumulative work. Pause until at least one peer.
-                if wants_to_join && state_m.read().peer_count == 0 {
+                // Wait not just for a connection but for the first remote tip:
+                // there is a window where peer_count>0 but no PeerTip has been
+                // evaluated yet, during which a fresh joiner would mine a
+                // genesis fork. seen_first_tip closes that race.
+                let (has_no_peer, no_tip_yet) = {
+                    let s = state_m.read();
+                    (s.peer_count == 0, !s.seen_first_tip)
+                };
+                if wants_to_join && (has_no_peer || no_tip_yet) {
                     if !warned_no_peers {
-                        info!("⛏  no peers yet — miner paused until connected (would otherwise fork from genesis); still trying to reach the configured peer/seed");
+                        info!("⛏  not ready to mine yet — waiting to connect and see the network tip (would otherwise fork from genesis); still trying to reach the configured peer/seed");
                         warned_no_peers = true;
                     }
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     continue;
                 }
                 if warned_no_peers {
-                    info!("⛏  peer connected — miner active");
+                    info!("⛏  connected and tip evaluated — miner active");
                     warned_no_peers = false;
                 }
                 // Sprint GG fix (pre-IBD mining bug, 2026-04-22):
