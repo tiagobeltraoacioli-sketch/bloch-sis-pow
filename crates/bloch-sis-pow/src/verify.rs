@@ -26,7 +26,7 @@
 
 use crate::difficulty::{hash_meets_target, Target};
 use crate::encode::encode_s;
-use crate::error::VerifyError;
+use crate::error::{PowError, VerifyError};
 use crate::expand::expand_matrix_and_target_rows;
 use crate::field::infinity_norm;
 use crate::matrix::residual_centered_rows;
@@ -87,6 +87,17 @@ pub fn verify_regime(
     target: &Target,
     residual_coeffs: usize,
 ) -> Result<(), VerifyError> {
+    // SECURITY (audit): reject k == 0 up front. A zero residual width expands
+    // zero rows and produces an EMPTY residual whose infinity norm is 0 < β,
+    // so the lattice check would silently pass for ANY norm-valid solution —
+    // verification degenerates to a bare hash lottery. It must be an explicit
+    // error, and the guard also runs before any k-derived indexing/division.
+    if residual_coeffs == 0 {
+        return Err(VerifyError::PowError(PowError::InternalInvariant(
+            "residual width k must be at least 1 (k = 0 disables the residual check)",
+        )));
+    }
+
     // Design guardrail (S1), wired: a residual width in the trivial q-ary
     // regime (k·β² ≥ q²) yields no lattice hardness. The full-M width is
     // knowingly trivial (see crate header) and is kept only for wire-format
@@ -100,7 +111,12 @@ pub fn verify_regime(
     );
 
     // (1) Norm check on s.
-    if solution.iter().any(|&v| v.abs() > B) {
+    //
+    // SECURITY (audit): use `unsigned_abs`, not `abs`. `i32::MIN.abs()`
+    // overflows — it panics in debug builds and wraps to i32::MIN (negative,
+    // thus ≤ B) in release builds — so a hostile solution vector containing
+    // i32::MIN could crash the verifier or slip past the bound check.
+    if solution.iter().any(|&v| v.unsigned_abs() > B as u32) {
         return Err(VerifyError::SolutionTooLarge);
     }
 
@@ -169,6 +185,40 @@ mod tests {
         let target = Target::MAX;
         let result = verify(header, nonce, &s, &target);
         assert!(matches!(result, Err(VerifyError::SolutionTooLarge)));
+    }
+
+    /// Audit REGRESSION: a hostile solution containing i32::MIN must be
+    /// cleanly rejected. With the old `v.abs() > B` check, `i32::MIN.abs()`
+    /// panicked in debug builds (verifier DoS) and wrapped to a negative
+    /// value in release builds (bound check bypassed).
+    #[test]
+    fn verify_rejects_i32_min_coefficient_without_panic() {
+        let header = b"i32-min-coefficient";
+        let mut s = [0i32; N];
+        s[0] = i32::MIN;
+        let result = verify(header, 0, &s, &Target::MAX);
+        assert!(matches!(result, Err(VerifyError::SolutionTooLarge)));
+
+        // Also with i32::MIN scattered across several positions.
+        let mut s2 = [0i32; N];
+        s2[N / 2] = i32::MIN;
+        s2[N - 1] = i32::MIN;
+        let result2 = verify(header, 1, &s2, &Target::MAX);
+        assert!(matches!(result2, Err(VerifyError::SolutionTooLarge)));
+    }
+
+    /// Audit REGRESSION: k = 0 must be an explicit error. Previously it
+    /// expanded zero rows, produced an empty residual (norm 0 < β), and any
+    /// norm-valid solution passed — the lattice check was silently disabled.
+    #[test]
+    fn verify_regime_rejects_zero_residual_width() {
+        let header = b"k-zero-regime";
+        let s = [0i32; N]; // norm-valid — would sail through with k = 0
+        let result = verify_regime(header, 0, &s, &Target::MAX, 0);
+        assert!(
+            matches!(result, Err(VerifyError::PowError(PowError::InternalInvariant(_)))),
+            "k = 0 must be rejected, not silently skip the residual check; got {result:?}"
+        );
     }
 
     #[test]

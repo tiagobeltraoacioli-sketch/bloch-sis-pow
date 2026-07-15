@@ -19,8 +19,24 @@ pub fn main() {
     let public: SpendPublic = sp1_zkvm::io::read();
     let witness: SpendWitness = sp1_zkvm::io::read();
 
+    // C2 binds, mirrored in-circuit so the guest agrees with the host check
+    // even if the library statement drifts: every committed public
+    // out_commitment / nullifier must correspond one-for-one to a witness
+    // output / input. Extra public out_commitments the balance check never
+    // sees would mint unbacked notes (shielded counterfeiting).
+    assert!(
+        public.out_commitments.len() == witness.outputs.len(),
+        "public out_commitments not bound to witness outputs"
+    );
+    assert!(
+        public.nullifiers.len() == witness.inputs.len(),
+        "public nullifiers not bound to witness inputs"
+    );
+
     // THE statement: opening + Merkle membership + nullifier + range + balance.
-    // If it does not hold, proving aborts — an invalid spend is unprovable.
+    // If it does not hold, proving aborts — an invalid spend is unprovable
+    // (check_spend also enforces the C2 count binds and returns a distinct
+    // SpendError on mismatch).
     check_spend(&public, &witness).expect("spend statement violated");
 
     // Commit the public inputs so the verifier ties the FRI proof to this

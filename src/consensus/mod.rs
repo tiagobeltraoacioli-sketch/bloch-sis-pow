@@ -699,6 +699,60 @@ impl GhostDAG {
         Ok(result)
     }
 
+    /// Remove a just-added LEAF block, exactly inverting `DagStore::insert`.
+    ///
+    /// CONSENSUS-HALT FIX (DAG-vs-UTXO ordering): `accept_block` inserts a
+    /// block into the DAG *before* it knows whether the reorg the block
+    /// triggers will be accepted. When `reorg::execute_reorg` REFUSES the
+    /// plan (depth cap) the UTXO store is untouched — but without an undo,
+    /// `selected_tip()` has already permanently adopted the fork tip, so
+    /// every later legitimate extension of the real chain is misclassified
+    /// as a fork-loser: a durable consensus halt. This method lets the
+    /// accept path roll the in-memory insertion back on a refused/failed
+    /// disposition (the CF_DAG persist is deferred until after success, see
+    /// `accept_block` in main.rs).
+    ///
+    /// Guards — all return `false` with NO mutation:
+    ///   * `hash` is not in the store,
+    ///   * `hash` is genesis,
+    ///   * `hash` has children (only leaf/tip blocks are safely removable;
+    ///     removing an interior block would corrupt descendants' GhostDAG
+    ///     data — the accept path only ever removes the block it just added).
+    ///
+    /// Returns `true` when the block was removed and each parent regained
+    /// tip status iff it no longer has any remaining children.
+    pub fn remove_block(&mut self, hash: &BlockHash) -> bool {
+        if self.store.genesis == Some(*hash) {
+            return false;
+        }
+        if self.store.children.get(hash).map_or(false, |c| !c.is_empty()) {
+            return false;
+        }
+        let data = match self.store.data.remove(hash) {
+            Some(d) => d,
+            None => return false,
+        };
+        self.store.tips.remove(hash);
+        self.store.children.remove(hash);
+        // Exact inverse of `DagStore::insert`: drop the child edge from each
+        // parent; a parent becomes a tip again iff it is still stored and now
+        // has no children at all.
+        for p in &data.parents {
+            if let Some(ch) = self.store.children.get_mut(p) {
+                ch.remove(hash);
+                if ch.is_empty() {
+                    self.store.children.remove(p);
+                }
+            }
+            if self.store.data.contains_key(p)
+                && self.store.children.get(p).map_or(true, |c| c.is_empty())
+            {
+                self.store.tips.insert(*p);
+            }
+        }
+        true
+    }
+
     /// Select parent with highest blue_work (heaviest chain).
     /// Tie-break: blue_score, then hash (lexicographic, deterministic).
     fn select_parent(&self, parents: &[BlockHash]) -> BlockHash {

@@ -67,10 +67,22 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> io::Result<()> {
 
     // Write + fsync the temp file.
     {
-        let mut f = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)   // explicit: fail if collision
-            .open(&tmp_path)?;
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true)
+            .create_new(true);  // explicit: fail if collision
+        // SECURITY (audit M): every current caller writes wallet keystore
+        // material through this helper. Create the file with owner-only
+        // permissions (0600) BEFORE the first secret byte is written, so
+        // there is never a window where the keystore is group/world-readable
+        // under a permissive umask. rename(2) preserves the temp file's mode,
+        // so the final file ends up 0600 as well (including when it replaces
+        // an older, more permissive keystore).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&tmp_path)?;
         f.write_all(contents)?;
         f.sync_all()?; // fsync the data before rename
     }
@@ -119,6 +131,43 @@ mod tests {
         atomic_write(&path, b"new contents").unwrap();
 
         assert_eq!(fs::read(&path).unwrap(), b"new contents");
+    }
+
+    /// Audit REGRESSION: keystore files must be created owner-only (0600).
+    /// Before the fix the temp file inherited the process umask (typically
+    /// 0644), leaving the encrypted keystore world-readable.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_creates_owner_only_keystore_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("wallet.json");
+        atomic_write(&path, b"{\"cipher\":\"secret keystore bytes\"}").unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600,
+            "keystore file must be 0600, got {:o}", mode & 0o777);
+    }
+
+    /// Overwriting an older, more permissive keystore must also end at 0600
+    /// (rename replaces the target with the 0600 temp file).
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_overwrite_tightens_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("wallet.json");
+
+        fs::write(&path, b"old keystore").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        atomic_write(&path, b"new keystore").unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600,
+            "replaced keystore must be 0600, got {:o}", mode & 0o777);
     }
 
     #[test]

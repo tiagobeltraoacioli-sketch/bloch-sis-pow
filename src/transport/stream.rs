@@ -91,26 +91,71 @@ impl ReadState {
 
 // ── Write state ──────────────────────────────────────────────────────────────
 
+/// A single sealed frame awaiting delivery to the inner stream.
+///
+/// AEAD sealing consumes the tx nonce counter and is NOT replayable, so a
+/// caller's buffer must be sealed exactly ONCE (H3). If the inner stream
+/// returns `Poll::Pending` (or accepts only part of the frame), we keep the
+/// already-sealed bytes here and resume from `cursor` on the next poll — we
+/// never re-seal or re-enqueue the caller's buffer, which would deliver the
+/// payload twice and desync the AEAD nonce/sequence.
+struct PendingFrame {
+    /// Complete wire frame: 4-byte length prefix + ciphertext (incl. tag).
+    bytes: Vec<u8>,
+    /// Offset within `bytes` of the first byte not yet accepted by the
+    /// inner stream (cursor for partial writes).
+    cursor: usize,
+    /// Plaintext payload length sealed into this frame. Reported to the
+    /// `poll_write` caller once the frame is fully handed to the inner
+    /// stream, so the caller's progress accounting matches what was sent.
+    payload_len: usize,
+}
+
+impl PendingFrame {
+    fn is_drained(&self) -> bool {
+        self.cursor >= self.bytes.len()
+    }
+}
+
 /// Internal writer state. We buffer at most one outgoing frame at a time.
+/// `None` means "no frame in progress — poll_write is free to seal one".
 struct WriteState {
-    /// Sealed frame bytes pending write to the inner stream.
-    /// Empty means "no frame in progress — poll_write is free to start one".
-    pending: Vec<u8>,
-    /// Offset within `pending` of the first unwritten byte.
-    cursor:  usize,
+    pending: Option<PendingFrame>,
 }
 
 impl WriteState {
     fn new() -> Self {
-        Self { pending: Vec::new(), cursor: 0 }
+        Self { pending: None }
     }
-    fn is_idle(&self) -> bool {
-        self.cursor >= self.pending.len()
+}
+
+/// Drive `frame` into `inner` as far as possible without sealing anything.
+/// Returns `Ready(Ok(()))` once every byte of the frame has been accepted.
+fn drain_frame<S>(
+    mut inner: Pin<&mut S>,
+    cx: &mut Context<'_>,
+    frame: &mut PendingFrame,
+) -> Poll<io::Result<()>>
+where
+    S: AsyncWrite,
+{
+    while !frame.is_drained() {
+        let slice = &frame.bytes[frame.cursor..];
+        match inner.as_mut().poll_write(cx, slice) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Ready(Ok(0)) => {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "inner write returned 0",
+                )));
+            }
+            Poll::Ready(Ok(n)) => {
+                frame.cursor += n;
+            }
+        }
     }
-    fn reset(&mut self) {
-        self.pending.clear();
-        self.cursor = 0;
-    }
+    Poll::Ready(Ok(()))
 }
 
 // ── KyberStream ──────────────────────────────────────────────────────────────
@@ -255,130 +300,71 @@ where
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        let mut this = self.project();
+
+        // Phase 1 — a previously sealed frame is still outstanding: finish
+        // writing THAT frame and report its payload length. We must NEVER
+        // seal `buf` here: per the AsyncWrite contract, after Pending the
+        // caller retries with the same buffer, and that buffer is exactly
+        // what the pending frame already contains. Re-sealing it (the old
+        // behaviour) delivered the payload to the peer twice and advanced
+        // the AEAD nonce/sequence counter out of sync (finding H3).
+        if let Some(frame) = this.write_state.pending.as_mut() {
+            match drain_frame(this.inner.as_mut(), cx, frame) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Ready(Ok(())) => {
+                    // Honesty caveat: this assumes the caller follows the
+                    // AsyncWrite retry contract (same buffer after Pending).
+                    // We cap at buf.len() so we never report more bytes than
+                    // the caller offered this call, but if a caller retries
+                    // with a *different* buffer, its accounting is undefined
+                    // — as with any buffering AsyncWrite adapter.
+                    let n = frame.payload_len.min(buf.len());
+                    this.write_state.pending = None;
+                    return Poll::Ready(Ok(n));
+                }
+            }
+        }
+
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
 
-        let mut this = self.project();
-
-        // If we have nothing pending, seal the caller's buffer into a new frame.
-        // Note: we intentionally seal the WHOLE buf at once (up to a cap) so
-        // the caller sees a single poll_write consume a known chunk.
-        if this.write_state.is_idle() {
-            // Cap per-frame payload to keep memory bounded.
-            let payload = if buf.len() > MAX_FRAME_PAYLOAD {
-                &buf[..MAX_FRAME_PAYLOAD]
-            } else {
-                buf
-            };
-
-            // Seal: ciphertext = encrypt(payload, aad=length_prefix).
-            let ct = this.tx
-                .seal(payload, &(payload.len() as u32).to_be_bytes())
-                .map_err(transport_err_to_io)?;
-
-            // Prepend length.
-            let mut framed = Vec::with_capacity(4 + ct.len());
-            framed.extend_from_slice(&(ct.len() as u32).to_be_bytes());
-            framed.extend_from_slice(&ct);
-
-            this.write_state.pending = framed;
-            this.write_state.cursor  = 0;
-
-            // Consumed from caller's perspective.
-            // We'll now drain `pending` into the inner stream across potentially
-            // multiple poll_write calls, but we must report progress based on the
-            // caller's buffer, not the inner stream. Pattern: keep looping until
-            // pending is fully written, then return Ok(payload.len()). If inner
-            // goes Pending, we return Pending — the caller will retry with the
-            // same buffer, and on retry we see pending is NOT idle and just
-            // continue draining without re-sealing.
-            let sealed_payload_len = payload.len();
-
-            // Try to drain immediately.
-            while !this.write_state.is_idle() {
-                let slice = &this.write_state.pending[this.write_state.cursor..];
-                match this.inner.as_mut().poll_write(cx, slice) {
-                    Poll::Pending => return Poll::Pending,
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Ready(Ok(0)) => {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::WriteZero,
-                            "inner write returned 0",
-                        )));
-                    }
-                    Poll::Ready(Ok(n)) => {
-                        this.write_state.cursor += n;
-                    }
-                }
-            }
-            this.write_state.reset();
-            return Poll::Ready(Ok(sealed_payload_len));
-        }
-
-        // Pending is in progress — caller retrying. Continue draining.
-        while !this.write_state.is_idle() {
-            let slice = &this.write_state.pending[this.write_state.cursor..];
-            match this.inner.as_mut().poll_write(cx, slice) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Ready(Ok(0)) => {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "inner write returned 0",
-                    )));
-                }
-                Poll::Ready(Ok(n)) => {
-                    this.write_state.cursor += n;
-                }
-            }
-        }
-        // Frame fully written. Tell the caller they can move on.
-        // We don't actually know the original payload length here, so we
-        // report 0 and rely on the caller to have made progress on their
-        // previous call. This is safe because our first branch above
-        // reports the real progress when sealing starts.
-        this.write_state.reset();
-        // Hm — returning Ok(0) here could loop the caller. Better: signal
-        // that the previous call is done by returning Ok(buf.len()) of the
-        // buffer they gave us this time (we'll just seal it now).
-        // Actually, simpler: since is_idle() is now true, re-enter the function.
-        // But we can't re-enter easily; instead, proxy to the top branch logic.
-        // Easiest correct answer: return to top of poll_write. Since we can't
-        // recurse safely here, we return Ok(0) only if buf is empty, else we
-        // seal the buf now inline.
-        //
-        // Inline re-seal path:
+        // Phase 2 — idle: seal the caller's buffer into a new frame,
+        // exactly once. Cap per-frame payload to keep memory bounded.
         let payload = if buf.len() > MAX_FRAME_PAYLOAD {
             &buf[..MAX_FRAME_PAYLOAD]
         } else {
             buf
         };
+
+        // Seal: ciphertext = encrypt(payload, aad=length_prefix).
         let ct = this.tx
             .seal(payload, &(payload.len() as u32).to_be_bytes())
             .map_err(transport_err_to_io)?;
+
+        // Prepend length.
         let mut framed = Vec::with_capacity(4 + ct.len());
         framed.extend_from_slice(&(ct.len() as u32).to_be_bytes());
         framed.extend_from_slice(&ct);
-        this.write_state.pending = framed;
-        this.write_state.cursor  = 0;
-        let sealed_payload_len = payload.len();
-        while !this.write_state.is_idle() {
-            let slice = &this.write_state.pending[this.write_state.cursor..];
-            match this.inner.as_mut().poll_write(cx, slice) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Ready(Ok(0)) => {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "inner write returned 0",
-                    )));
-                }
-                Poll::Ready(Ok(n)) => { this.write_state.cursor += n; }
+
+        let mut frame = PendingFrame {
+            bytes:       framed,
+            cursor:      0,
+            payload_len: payload.len(),
+        };
+
+        // Try to drain immediately. On Pending we PARK the sealed frame —
+        // the retry (Phase 1) resumes from `cursor` without re-sealing.
+        match drain_frame(this.inner.as_mut(), cx, &mut frame) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(frame.payload_len)),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => {
+                this.write_state.pending = Some(frame);
+                Poll::Pending
             }
         }
-        this.write_state.reset();
-        Poll::Ready(Ok(sealed_payload_len))
     }
 
     fn poll_flush(
@@ -387,22 +373,19 @@ where
     ) -> Poll<io::Result<()>> {
         let mut this = self.project();
 
-        // Drain any pending frame first.
-        while !this.write_state.is_idle() {
-            let slice = &this.write_state.pending[this.write_state.cursor..];
-            match this.inner.as_mut().poll_write(cx, slice) {
+        // Drain any pending frame first. NOTE: on completion we deliberately
+        // KEEP the (now fully drained) frame in the pending slot: its
+        // payload_len has not yet been reported to the poll_write caller.
+        // The next poll_write retry will see it drained and report it
+        // WITHOUT sealing anything new — dropping the slot here would make
+        // the retrying writer re-seal the same payload (double delivery).
+        if let Some(frame) = this.write_state.pending.as_mut() {
+            match drain_frame(this.inner.as_mut(), cx, frame) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Ready(Ok(0)) => {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "inner write returned 0 during flush",
-                    )));
-                }
-                Poll::Ready(Ok(n)) => { this.write_state.cursor += n; }
+                Poll::Ready(Ok(())) => {}
             }
         }
-        this.write_state.reset();
 
         this.inner.poll_flush(cx)
     }
@@ -413,22 +396,16 @@ where
     ) -> Poll<io::Result<()>> {
         let mut this = self.project();
 
-        // Drain any pending frame before closing.
-        while !this.write_state.is_idle() {
-            let slice = &this.write_state.pending[this.write_state.cursor..];
-            match this.inner.as_mut().poll_write(cx, slice) {
+        // Drain any pending frame before closing. As in poll_flush, keep the
+        // drained frame parked so an interleaved poll_write retry can still
+        // report it instead of re-sealing.
+        if let Some(frame) = this.write_state.pending.as_mut() {
+            match drain_frame(this.inner.as_mut(), cx, frame) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Ready(Ok(0)) => {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "inner write returned 0 during close",
-                    )));
-                }
-                Poll::Ready(Ok(n)) => { this.write_state.cursor += n; }
+                Poll::Ready(Ok(())) => {}
             }
         }
-        this.write_state.reset();
 
         this.inner.poll_close(cx)
     }
@@ -438,4 +415,172 @@ where
 
 fn transport_err_to_io(e: TransportError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+}
+
+// ── Regression tests: H3 seal-once under backpressure ────────────────────────
+
+#[cfg(test)]
+mod seal_once_tests {
+    use super::*;
+    use crate::transport::{frame_open, RxStream, TxStream, STREAM_KEY_SIZE};
+    use futures::executor::block_on;
+    use futures::io::AsyncWriteExt;
+    use std::collections::VecDeque;
+
+    /// Mock inner AsyncWrite driven by a script: `None` = return
+    /// Poll::Pending (after waking, so block_on re-polls), `Some(n)` =
+    /// accept at most `n` bytes (partial write). Once the script is
+    /// exhausted, every write is accepted in full. All accepted bytes are
+    /// recorded in `written` for wire-level inspection.
+    struct FlakyWriter {
+        script:  VecDeque<Option<usize>>,
+        written: Vec<u8>,
+        /// Total number of poll_write calls observed (sanity/diagnostics).
+        polls: usize,
+    }
+
+    impl FlakyWriter {
+        fn new(script: Vec<Option<usize>>) -> Self {
+            Self { script: script.into(), written: Vec::new(), polls: 0 }
+        }
+    }
+
+    impl AsyncWrite for FlakyWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.polls += 1;
+            match self.script.pop_front() {
+                Some(None) => {
+                    // Simulate backpressure; wake immediately so the
+                    // single-threaded executor retries the write future.
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+                Some(Some(cap)) => {
+                    let n = buf.len().min(cap).max(1);
+                    self.written.extend_from_slice(&buf[..n]);
+                    Poll::Ready(Ok(n))
+                }
+                None => {
+                    self.written.extend_from_slice(buf);
+                    Poll::Ready(Ok(buf.len()))
+                }
+            }
+        }
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// FlakyWriter only writes, but KyberStream::new wants rx keys too.
+    fn keys() -> (TxStream, RxStream) {
+        let key = [0x42u8; STREAM_KEY_SIZE];
+        (TxStream::new(key), RxStream::new(key))
+    }
+
+    /// Decode every complete frame present in `wire` with a receiver that
+    /// shares the sender's key. Panics on trailing garbage. Returns the
+    /// decrypted payloads in order; `rx.counter()` afterwards equals the
+    /// number of frames, so callers can assert sequence advancement.
+    fn decode_all(rx: &mut RxStream, wire: &[u8]) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut off = 0;
+        while off < wire.len() {
+            let (consumed, pt) = frame_open(rx, &wire[off..])
+                .expect("frame must decrypt in order with the shared key");
+            off += consumed;
+            out.push(pt);
+        }
+        assert_eq!(off, wire.len(), "no partial/trailing bytes on the wire");
+        out
+    }
+
+    /// H3 regression: the inner sink returns Pending on the first attempt
+    /// and then accepts the frame in small partial chunks. The payload must
+    /// be sealed exactly once — before the fix, the retry path re-sealed
+    /// the caller's buffer after draining the first frame, so the peer
+    /// received the payload TWICE and the tx counter advanced by two.
+    ///
+    /// This test fails on the pre-fix code (decode_all yields 2 frames)
+    /// and passes with the fix (exactly 1 frame, counter advanced by 1).
+    #[test]
+    fn backpressure_does_not_double_deliver() {
+        let (tx, _rx_unused) = keys();
+        let (_tx_unused, mut rx) = keys();
+
+        // Pending first (parks the sealed frame), then partial writes.
+        let inner = FlakyWriter::new(vec![None, Some(3), None, Some(7), Some(11)]);
+        let mut stream = KyberStream::new(inner, tx, RxStream::new([0u8; STREAM_KEY_SIZE]));
+
+        let payload = b"H3: seal exactly once under backpressure";
+        block_on(async {
+            stream.write_all(payload).await.expect("write_all");
+            stream.flush().await.expect("flush");
+        });
+
+        let wire = stream.into_inner().written;
+        let frames = decode_all(&mut rx, &wire);
+
+        assert_eq!(
+            frames.len(),
+            1,
+            "payload must appear in exactly ONE frame on the wire \
+             (double delivery = H3 regression)"
+        );
+        assert_eq!(frames[0], payload, "single frame carries one payload copy");
+        assert_eq!(
+            rx.counter(),
+            1,
+            "receiver sequence must advance by exactly one for one write"
+        );
+    }
+
+    /// H3 regression, multiple queued writes: under sustained backpressure
+    /// every write must arrive in order, each exactly once, with the
+    /// sequence counter advancing exactly once per write. With the pre-fix
+    /// double-seal, each backpressured write burned TWO tx counters and put
+    /// two payload copies on the wire, so the frame count and rx counter
+    /// both diverged from the number of writes.
+    #[test]
+    fn multiple_writes_under_sustained_backpressure_in_order_once() {
+        let (tx, _r) = keys();
+        let (_t, mut rx) = keys();
+
+        // Sustained backpressure: Pendings and tiny partial accepts
+        // interleaved across all three writes.
+        let inner = FlakyWriter::new(vec![
+            None, Some(2), None, Some(5), None, None, Some(4), Some(1),
+            None, Some(8), None, Some(3), None, Some(6),
+        ]);
+        let mut stream = KyberStream::new(inner, tx, RxStream::new([0u8; STREAM_KEY_SIZE]));
+
+        let payloads: [&[u8]; 3] = [b"first frame", b"second frame", b"third frame"];
+        block_on(async {
+            for p in payloads {
+                stream.write_all(p).await.expect("write_all");
+            }
+            stream.flush().await.expect("flush");
+        });
+
+        let wire = stream.into_inner().written;
+        let frames = decode_all(&mut rx, &wire);
+
+        assert_eq!(frames.len(), 3, "exactly one frame per write, no duplicates");
+        for (i, p) in payloads.iter().enumerate() {
+            assert_eq!(&frames[i], p, "frame {} delivered in order, once", i);
+        }
+        assert_eq!(rx.counter(), 3, "sequence advanced exactly once per write");
+    }
 }

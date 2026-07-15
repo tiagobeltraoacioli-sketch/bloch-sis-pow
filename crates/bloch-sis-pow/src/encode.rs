@@ -28,7 +28,10 @@ pub fn encode_s(s: &[i32]) -> Result<[u8; ENCODED_S_LEN], PowError> {
 
     let mut out = [0u8; ENCODED_S_LEN];
     for (i, &coeff) in s.iter().enumerate() {
-        if coeff.abs() > B {
+        // SECURITY (audit): `unsigned_abs`, not `abs` — `i32::MIN.abs()`
+        // panics in debug builds, and this function receives attacker-
+        // controlled coefficients (e.g. via `compute_aux_hash`).
+        if coeff.unsigned_abs() > B as u32 {
             return Err(PowError::SolutionTooLarge {
                 index: i,
                 value: coeff,
@@ -104,6 +107,22 @@ mod tests {
         let mut s = [0i32; N];
         s[42] = 3; // exceeds B=2
         assert!(encode_s(&s).is_err());
+    }
+
+    /// Audit REGRESSION: i32::MIN must be a clean SolutionTooLarge error.
+    /// With the old `coeff.abs() > B` check, `i32::MIN.abs()` panicked in
+    /// debug builds instead of returning an error.
+    #[test]
+    fn rejects_i32_min_coefficient_without_panic() {
+        let mut s = [0i32; N];
+        s[7] = i32::MIN;
+        match encode_s(&s) {
+            Err(PowError::SolutionTooLarge { index, value, .. }) => {
+                assert_eq!(index, 7);
+                assert_eq!(value, i32::MIN);
+            }
+            other => panic!("expected SolutionTooLarge, got {other:?}"),
+        }
     }
 
     #[test]
