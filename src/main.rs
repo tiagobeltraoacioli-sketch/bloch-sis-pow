@@ -1530,15 +1530,32 @@ fn accept_block(
 
     dag.write().add_block(block_hash, parents, ts, work)
         .map_err(|e| format!("consensus rejection: {}", e))?;
-    if let Some(ddata) = dag.read().get_block_data(&block_hash).cloned() {
-        // Sprint Y (M-2): atomic put to CF_DAG + CF_DAG_INTEGRITY.
-        store.put_dag_with_integrity(&block_hash, &ddata).ok();
-    }
 
-    // Persist block body unconditionally — even if this block ends up in a
-    // losing fork, we keep its bytes so a future reorg can apply it without
-    // re-downloading.
-    store.put_block(block).map_err(|e| e.to_string())?;
+    // CONSENSUS-HALT FIX (DAG-vs-UTXO ordering): the CF_DAG /
+    // CF_DAG_INTEGRITY persist that used to happen right here is DEFERRED
+    // until after the disposition match below succeeds. `add_block` above is
+    // still needed first (GhostDAG selection is the single source of truth
+    // for classifying this block), but if the disposition is REFUSED — e.g.
+    // `execute_reorg` rejects an over-deep fork flip — the in-memory
+    // insertion is rolled back via `GhostDAG::remove_block` and nothing was
+    // persisted, so DAG store, CF_DAG and the applied UTXO state move
+    // together or not at all. Previously the insertion was persisted
+    // unconditionally: a refused deep reorg left `selected_tip()` pinned to
+    // the attacker fork forever (every legitimate extension misclassified as
+    // ForkLoser) — a durable consensus halt.
+
+    // Persist block body — even if this block ends up in a losing fork, we
+    // keep its bytes so a future reorg can apply it without re-downloading.
+    // This must happen BEFORE the disposition match: `execute_reorg` reads
+    // the bodies of `to_apply` blocks (including this one) from CF_BLOCKS.
+    // Block bodies are not consensus state — selected-tip / blue-work
+    // decisions are driven solely by CF_DAG, which is only written after
+    // success — so a body left behind by a rejected block is inert.
+    // On a body-persist failure, roll the in-memory insertion back.
+    if let Err(e) = store.put_block(block) {
+        dag.write().remove_block(&block_hash);
+        return Err(e.to_string());
+    }
 
     // ── Sprint U.4: disposition-based state application (closes C-1) ──
     //
@@ -1627,12 +1644,22 @@ fn accept_block(
             let plan = {
                 let d = dag.read();
                 reorg::compute_reorg_plan(&d, &old_tip, &new_tip)
-            }.ok_or_else(|| format!(
-                "U.4: tip changed to {} via reorg but compute_reorg_plan returned None (old={}, new={})",
-                hex::encode(&new_tip[..8]),
-                hex::encode(&old_tip[..8]),
-                hex::encode(&new_tip[..8]),
-            ))?;
+            };
+            let plan = match plan {
+                Some(p) => p,
+                None => {
+                    // CONSENSUS-HALT FIX: roll the in-memory DAG insertion
+                    // back before rejecting — nothing has been persisted to
+                    // CF_DAG yet, so DAG and applied UTXO state stay in sync.
+                    dag.write().remove_block(&block_hash);
+                    return Err(format!(
+                        "U.4: tip changed to {} via reorg but compute_reorg_plan returned None (old={}, new={})",
+                        hex::encode(&new_tip[..8]),
+                        hex::encode(&old_tip[..8]),
+                        hex::encode(&new_tip[..8]),
+                    ));
+                }
+            };
 
             info!(
                 "🔀 Reorg at h={}: rollback {} blocks, apply {} blocks (lca={})",
@@ -1642,8 +1669,28 @@ fn accept_block(
                 hex::encode(&plan.lca[..8]),
             );
 
-            let outcome = reorg::execute_reorg(store, mempool, &plan)
-                .map_err(|e| format!("U.4: execute_reorg failed: {}", e))?;
+            let outcome = match reorg::execute_reorg(store, mempool, &plan) {
+                Ok(o) => o,
+                Err(e) => {
+                    // CONSENSUS-HALT FIX: a refused reorg (e.g. deeper than
+                    // reorg::MAX_REORG_DEPTH) or a failed one left the UTXO
+                    // store untouched by design. The in-memory DAG insertion
+                    // must be undone as well — otherwise selected_tip()
+                    // permanently adopts a fork whose state was never
+                    // applied, and every legitimate extension of the real
+                    // chain is misclassified as ForkLoser: a durable halt.
+                    // Nothing was persisted to CF_DAG (deferred until after
+                    // this match), so the undo is purely in-memory.
+                    if !dag.write().remove_block(&block_hash) {
+                        warn!(
+                            "U.4: failed to roll back DAG insertion of {} after refused reorg \
+                             (block gained children concurrently?) — tip may be inconsistent",
+                            hex::encode(&block_hash[..8]),
+                        );
+                    }
+                    return Err(format!("U.4: execute_reorg failed: {}", e));
+                }
+            };
 
             info!(
                 "   reorg done: rolled_back={}, applied={}, txs_reinjected={}, txs_discarded={}",
@@ -1665,10 +1712,27 @@ fn accept_block(
                  (old={:?}, new={:?}, block={})",
                 block.height, old_selected_tip, new_selected_tip, hex::encode(&block_hash[..8])
             );
-            // Refuse to mutate state on an unexpected transition. The
-            // block is in the DAG and persisted; a future accept with a
-            // clearer classification can bring it into the selected chain.
+            // Refuse to mutate state on an unexpected transition.
+            // CONSENSUS-HALT FIX: previously the block stayed in the DAG
+            // (and was persisted) while UTXO state was left untouched — the
+            // same DAG-vs-UTXO divergence as the refused-reorg case. Roll
+            // the in-memory insertion back and reject, so a re-submission
+            // can be classified cleanly later.
+            dag.write().remove_block(&block_hash);
+            return Err(format!(
+                "U.4: unexpected selected-tip transition (old={:?}, new={:?}); block {} rejected",
+                old_selected_tip, new_selected_tip, hex::encode(&block_hash[..8]),
+            ));
         }
+    }
+
+    // CONSENSUS-HALT FIX: the DAG entry is persisted only NOW, after the
+    // disposition above has been applied successfully. Every refusal path
+    // above rolled the in-memory insertion back and returned Err, so CF_DAG
+    // can never adopt a fork tip whose chain state was refused.
+    if let Some(ddata) = dag.read().get_block_data(&block_hash).cloned() {
+        // Sprint Y (M-2): atomic put to CF_DAG + CF_DAG_INTEGRITY.
+        store.put_dag_with_integrity(&block_hash, &ddata).ok();
     }
 
     // ── Update node state ────────────────────────────────────────────
@@ -2197,5 +2261,178 @@ mod external_submission_tests {
         let rpc_res = (node_b.rpc_cb())(good);
         assert!(rpc_res.is_ok(), "rpc submitblock must accept a valid block: {:?}", rpc_res);
         assert_eq!(node_b.dag.read().block_count(), 2);
+    }
+
+    // ── CONSENSUS-HALT regression (DAG-vs-UTXO ordering) ────────────────────
+    //
+    // Drive the REAL `accept_block` pipeline (add_block → disposition →
+    // execute_reorg) — NOT a synthetic ReorgPlan — with an attacker fork
+    // whose accumulated blue_work beats the live chain but whose reorg depth
+    // exceeds reorg::MAX_REORG_DEPTH. On the unfixed baseline the flipping
+    // fork block is inserted + persisted into the DAG BEFORE the depth cap
+    // runs; the refusal then leaves selected_tip() pinned to the fork
+    // forever, freezing the real chain (durable halt).
+
+    /// Submit a block through the real `accept_block` pipeline. This is the
+    /// exact function the stratum/RPC callbacks delegate to; those wrappers
+    /// only add the H2 `validate_structure()` pre-gate, which is orthogonal
+    /// to the consensus ordering under test and would force mining a real
+    /// SIS witness for every fixture block.
+    fn accept(node: &TestNode, block: &core::Block) -> Result<[u8; 32], String> {
+        accept_block(
+            block, block.block_hash(), block.height,
+            &node.dag, &node.store, &node.mempool, &node.node_state,
+            Some(&node.tip_tx), &node.shielded,
+        )
+    }
+
+    /// Build an H2-fixture-style (structurally lax) child of `parent` at
+    /// `height` that satisfies every check `accept_block` performs (bits,
+    /// height, finality, timestamp, coinbase value). The merkle root is
+    /// ZERO for these fixtures, so `nonce` is what differentiates
+    /// same-position blocks on competing chains (block_hash covers it).
+    fn mk_block_at(
+        node: &TestNode,
+        parent: [u8; 32],
+        height: u64,
+        ts: u64,
+        nonce: u64,
+    ) -> core::Block {
+        let parent_ts = node.store.get_timestamp_at_height(height - 1)
+            .expect("ts read").expect("parent-height timestamp present");
+        let bits = pow::next_bits(
+            core::GENESIS_BITS, core::GENESIS_TIMESTAMP, parent_ts, height,
+        );
+        let subsidy = core::tokenomics_v2::block_subsidy_sat(height);
+        assert_eq!(
+            core::tokenomics_v2::founder_vesting_delta_sat(height), 0,
+            "fixture assumes no founder vesting output at h={}", height,
+        );
+        core::Block {
+            header: core::BlockHeader {
+                version:     1,
+                parents:     vec![parent],
+                merkle_root: core::MerkleRoot::ZERO,
+                timestamp:   ts,
+                bits,
+                nonce,
+            },
+            transactions: vec![mk_coinbase(height, subsidy)],
+            blue_score: height,
+            height,
+            pow_solution: Vec::new(),
+            shielded_transactions: Vec::new(),
+        }
+    }
+
+    /// Acceptance regression for the DAG-vs-UTXO ordering halt.
+    ///
+    /// FAILS on baseline cad723c (tip poisoned by the refused fork; real
+    /// chain frozen as ForkLoser), PASSES with the fix (GhostDAG undo +
+    /// deferred CF_DAG persist).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn refused_deep_reorg_must_not_poison_dag_selected_tip() {
+        let d = reorg::MAX_REORG_DEPTH;
+        assert!(
+            d <= 16,
+            "this regression builds chains of length MAX_REORG_DEPTH+2 through \
+             the real accept path; keep the cfg(test) cap small (got {})", d,
+        );
+
+        let g_ts    = unix_now();
+        let genesis = mk_genesis(g_ts);
+        let node    = node_with_genesis(&genesis);
+        let gh      = genesis.block_hash();
+
+        // (a) Real chain R: genesis → r1 … r_{D+1}, all through accept_block.
+        let mut parent = gh;
+        for i in 1..=(d + 1) {
+            let b = mk_block_at(&node, parent, i, g_ts + 30 * i, i);
+            accept(&node, &b).expect("real-chain block must be accepted");
+            parent = b.block_hash();
+        }
+        let real_tip = parent;
+        assert_eq!(
+            node.dag.read().selected_tip(), Some(real_tip),
+            "sanity: R's head is the selected tip before the attack",
+        );
+
+        // (b) Attacker fork F branching at genesis: f1 … f_{D+2}, same
+        // per-height timestamps as R (so expected bits — hence per-block
+        // work — match per height) but distinct nonces (distinct hashes).
+        // The fork block at height D+1 TIES R's tip on blue_work; grind its
+        // nonce so its hash LOSES the deterministic tie-break (blue_work,
+        // then blue_score, then lexicographic hash — larger wins) and stays
+        // a fork-loser. The flip then happens deterministically at f_{D+2},
+        // which strictly out-weighs R and forces to_rollback.len() == D+1 > D.
+        let mut fparent = gh;
+        let mut flip_res: Result<[u8; 32], String> = Err("unreached".into());
+        for i in 1..=(d + 2) {
+            let mut nonce = 1_000_000 + i;
+            let mut fb = mk_block_at(&node, fparent, i, g_ts + 30 * i, nonce);
+            if i == d + 1 {
+                while fb.block_hash() >= real_tip {
+                    nonce += 1;
+                    fb = mk_block_at(&node, fparent, i, g_ts + 30 * i, nonce);
+                }
+            }
+            let res = accept(&node, &fb);
+            if i <= d + 1 {
+                assert!(
+                    res.is_ok(),
+                    "non-flipping fork block f{} must be accepted as a \
+                     fork-loser, got: {:?}", i, res,
+                );
+                assert_eq!(
+                    node.dag.read().selected_tip(), Some(real_tip),
+                    "fork-loser f{} must not move the selected tip", i,
+                );
+            }
+            fparent = fb.block_hash();
+            flip_res = res;
+        }
+
+        // (1) The flipping fork block is REFUSED by the reorg depth cap.
+        let err = flip_res.expect_err(
+            "over-deep flipping fork block must be rejected by accept_block",
+        );
+        assert!(
+            err.contains(reorg::ERR_REORG_DEPTH),
+            "rejection must be the depth-cap refusal, got: {}", err,
+        );
+
+        // (2) HALT GUARD: the refusal must leave the DAG selected tip on the
+        // real chain. Baseline fails HERE: add_block already adopted (and
+        // persisted) the fork tip before execute_reorg refused.
+        assert_eq!(
+            node.dag.read().selected_tip(), Some(real_tip),
+            "refused deep reorg must NOT poison the DAG selected tip",
+        );
+
+        // (3) LIVENESS GUARD: a further legitimate extension of the real
+        // chain is still accepted AND applied. Baseline fails here too: with
+        // the tip pinned to the poison fork, R_next is misclassified and the
+        // applied chain state never advances.
+        let r_next = mk_block_at(
+            &node, real_tip, d + 2, g_ts + 30 * (d + 2), 424_242,
+        );
+        let r_next_hash = r_next.block_hash();
+        let res = accept(&node, &r_next);
+        assert!(
+            res.is_ok(),
+            "legitimate extension of the real chain must still be accepted \
+             after the refused fork, got: {:?}", res,
+        );
+        assert_eq!(
+            node.dag.read().selected_tip(), Some(r_next_hash),
+            "real chain must re-take / keep the selected tip",
+        );
+        let tip_meta = node.store.get_meta("tip_hash")
+            .expect("meta read").expect("tip_hash meta present");
+        assert_eq!(
+            tip_meta.as_slice(), &r_next_hash[..],
+            "applied chain state (tip_hash meta / UTXO apply) must advance \
+             with the real chain",
+        );
     }
 }

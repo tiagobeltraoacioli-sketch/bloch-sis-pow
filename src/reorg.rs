@@ -38,7 +38,20 @@ use crate::storage::Storage;
 /// below the finalized height, so any plan deeper than this window indicates
 /// either a bug in plan computation or an attack attempt to unwind history.
 /// Such plans are refused with [`ERR_REORG_DEPTH`] before ANY storage access.
+#[cfg(not(test))]
 pub const MAX_REORG_DEPTH: u64 = crate::core::CHECKPOINT_DEPTH;
+
+/// Test builds use a tiny cap so the accept-path depth-cap regression
+/// (`refused_deep_reorg_must_not_poison_dag_selected_tip` in src/main.rs)
+/// can drive whole real chains through `accept_block` in milliseconds
+/// instead of building 1000-block fixtures. All depth-cap unit tests in
+/// this file are written against the symbolic constant, so they hold at
+/// any value. Production (non-test) builds are unchanged: the cap stays
+/// anchored to the finality window, and integration tests in tests/ link
+/// the library crate compiled WITHOUT `cfg(test)`, so they too see the
+/// production value.
+#[cfg(test)]
+pub const MAX_REORG_DEPTH: u64 = 4;
 
 /// Distinct, machine-matchable error marker for a refused too-deep reorg.
 /// Callers (and tests) can distinguish "refused by policy" from "failed
