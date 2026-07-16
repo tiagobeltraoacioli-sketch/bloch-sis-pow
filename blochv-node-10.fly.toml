@@ -7,7 +7,7 @@ app = "blochv-node-10"
 primary_region = "gru"
 
 [processes]
-  app = "--rpc-bind 0.0.0.0 --rpc-port 16210 --listen /ip4/0.0.0.0/tcp/16110 --data-dir /bloch-data --testnet --peer /ip6/fdaa:6e:e67a:a7b:5c5:e4f9:39a:2/tcp/16110 --allow-private-peers"
+  app = "--rpc-bind 0.0.0.0 --rpc-port 16210 --listen /ip4/0.0.0.0/tcp/16110 --data-dir /bloch-data --testnet --dns-seed blochv-node.internal --peer /ip4/45.32.154.137/tcp/16110 --allow-private-peers"
 
 [mounts]
   source = "bloch_data"
