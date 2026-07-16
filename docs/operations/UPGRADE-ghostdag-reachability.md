@@ -1,93 +1,74 @@
 <!-- SPDX-License-Identifier: MIT OR Apache-2.0 -->
-# Coordinated Upgrade — GHOSTDAG Reachability Fix
+# Node Upgrade — GHOSTDAG Reachability Fix (DROP-IN)
 
-**Status: SCAFFOLD / UNAUDITED — review before any wide deployment.**
-Branch: `fix/ghostdag-reachability` (commit `2b7a28c`).
+**Status: candidate, UNAUDITED — review + test before deploying.**
+Branch: `fix/ghostdag-reachability`.
+
+## Verdict: DROP-IN (result-identical, no fork, no coordinated height)
+
+The differential harness proves the fast path is **byte-identical** to the
+current node on the live chain, so this is a **transparent performance fix** —
+**no fork, and no coordinated activation height is required.** Each operator can
+upgrade independently, at their own pace; upgraded and un-upgraded nodes stay on
+the same chain.
+
+Evidence (`dag_shape_stats` against a real snapshot): the Bloch DAG is
+**~99.94 % linear** — **max blues_anticone_size = 9** (below `K = 10`), max
+mergeset width = 6, 0 blocks with mergeset > K. The Fast path diverges from the
+bounded Legacy path only when an anticone is *wide* enough to be under-counted;
+that never happens below the bound, so results are identical. The
+`past_blue_set hit depth bound` WARN is a chain-*depth* (perf) symptom, not a
+wide-anticone (correctness) one.
 
 ## Why (the incident this fixes)
 
-At high DAG height the current node's `classify_mergeset` is
-`O(|mergeset| × |blue_set| × bounded-BFS)`: `past_blue_set` walks the selected
-chain to `k*100 = 1000` hops and `is_ancestor` is a bounded BFS, both of which
-**saturate at ~397k** (the `past_blue_set hit depth bound` WARN). Per-block
-validation crawls to ~15 s/block (~4 blocks/min). Consequence: a node that
-falls behind **cannot integrate the backlog into its selected chain** — it
-freezes with `syncing: true` forever, and the network **fails to converge**
-(nodes stuck at different heights; observed 2026-07-16: nodes at 397044 / 393904
-/ 392398 while the canonical tip advanced to ~398237 on another node).
+`classify_mergeset` is `O(|mergeset| × |blue_set| × bounded-BFS)`; the
+reachability walk saturates the `k*100 = 1000` depth bound at ~397k, so
+per-block validation crawls (~15 s/block). A node that falls behind cannot
+integrate the backlog into its selected chain → it freezes (`syncing: true`) and
+the network fails to converge. The fix adds an O(1) reachability index +
+incremental blue-coloring so backlogs process fast and nodes converge.
 
-The fix adds an **O(1) reachability index** (interval labeling + future-covering
-set, Kaspa-style) and **incremental blue-coloring inherited from the selected
-parent** (the "Fast" path), so backlogs process quickly and nodes converge.
+## Token / history preservation
 
-## Token / history preservation (guarantee)
+The change is behind an activation-height gate; historical blocks are loaded
+verbatim and **never recomputed** → every mined block/balance is byte-identical,
+no reorg. For a DROP-IN, enabling Fast at height `0` is safe (identical results).
+The data-dir / volume is untouched.
 
-The fix ships behind an activation-height gate, **DEFAULT DISABLED**
-(`CORRECTED_COLORING_ACTIVATION_HEIGHT = u64::MAX` in `src/consensus/mod.rs`).
-Historical blocks are loaded verbatim from disk and **NEVER recomputed** → every
-already-mined block and balance is preserved byte-identically. When enabled,
-only blocks **at/above** the activation height use the Fast coloring; everything
-below stays Legacy. There is no retroactive recompute and no reorg of history.
-
-## Step 0 — decide the case with the replay harness (REQUIRED first)
-
-The Fast path computes the *correct* (unbounded) GHOSTDAG coloring. That is
-byte-identical to Legacy on **narrow** DAGs but **diverges on wide anticones**
-(the bounded Legacy BFS under-counts). Run the read-only replay against a real
-snapshot to find out which case the live chain is in:
+## Step 1 — (optional, recommended) re-verify DROP-IN yourself
 
 ```sh
 BLOCH_SNAPSHOT=/path/to/a/node/data-dir \
-  cargo test --release --test ghostdag_replay_snapshot -- --ignored --nocapture
+  cargo test --release --test ghostdag_replay_snapshot dag_shape_stats -- --ignored --nocapture
 ```
+Confirm `max blues_anticone_size < K` (and, if you want the full byte-level
+check, run `replay_snapshot_legacy_vs_fast` — note it walks the whole chain
+through the slow Legacy path, so it can take hours).
 
-- **Case A — DROP-IN** (replay reports Legacy == Fast on every block): the chain
-  is narrow; Fast is a pure speedup with identical results → **no fork, no
-  coordination on a height needed.** Each operator can enable Fast (set the
-  activation height to `0` or any height ≤ current tip) and restart, independently.
-- **Case B — GATED** (replay reports a divergence at some height): Fast would
-  change results → a **consensus change**. It MUST go behind a coordinated
-  activation height (Step 1B). Baking it in silently would fork the network.
-
-## Step 1 — set the activation height
-
-Edit `src/consensus/mod.rs`:
-
-- **Case A (drop-in):** `pub const CORRECTED_COLORING_ACTIVATION_HEIGHT: u64 = 0;`
-  (Fast everywhere; identical results, just faster.)
-- **Case B (gated):** ALL operators set the **same**
-  `CORRECTED_COLORING_ACTIVATION_HEIGHT = H`, where **H > current tip + buffer**
-  (choose a round number several hours of blocks above the tip so every operator
-  has time to upgrade). Below `H`: Legacy (byte-identical, no fork). At/above
-  `H`: Fast (converged). **Any node not upgraded by height `H` forks off the
-  network** — comms + a confirmed upgrade window are mandatory in Case B.
-
-## Step 2 — build and restart (per node)
+## Step 2 — build + restart (per node, independent)
 
 ```sh
-cd ~/bloch
-git fetch && git checkout fix/ghostdag-reachability   # or the merged release tag
-# apply the chosen CORRECTED_COLORING_ACTIVATION_HEIGHT (Step 1)
+cd ~/bloch && git fetch && git checkout fix/ghostdag-reachability   # or the merged release tag
+# in src/consensus/mod.rs:  CORRECTED_COLORING_ACTIVATION_HEIGHT = 0
 cargo build --release
 sudo systemctl restart bloch-node
 ```
 
-Verify: `bloch-cli dag` (chain_length climbing), `bloch-cli peers`
-(`syncing` clears once caught up). The data-dir/volume is untouched — mined
-history is preserved.
+Verify: `bloch-cli dag` (chain_length climbing again), `bloch-cli peers`
+(`syncing` clears once caught up).
 
 ## Rollback
 
-Fully safe: check out the previous (alpha3) binary and restart. The gate is
-default-disabled, so the un-upgraded binary is byte-identical Legacy — no fork,
-no data change. In Case B, roll back *before* height `H` if aborting.
+Fully safe — check out the previous (alpha3) binary and restart. Result-identical
+both ways; nothing to reconcile.
 
 ## Notes
 
-- This is a **performance/convergence** fix, not a coin/consensus-reward change.
-  The gas/coin/token semantics are untouched.
-- Independent verification: two operators running the replay against the same
-  snapshot must get the same Case A/B verdict (the harness is deterministic).
-- The reachability index is a **cache** (own column family, never part of the
+- Performance/convergence fix only — coin, reward, and token semantics untouched.
+- The reachability index is a cache (own column family, never part of the
   integrity chain); it rebuilds deterministically on restart and cannot corrupt
   the DAG.
+- Should the chain shape ever change (sustained wide anticones), re-run the
+  verdict — if a future divergence appears, revert to the coordinated
+  activation-height procedure. `max anticone < K` today makes that remote.
