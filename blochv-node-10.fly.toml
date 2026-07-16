@@ -1,0 +1,19 @@
+# MINER node (phase 1 = sync as relay, then --mine is enabled once it reaches
+# the network tip). Peers to the primary over Fly's PRIVATE 6PN address —
+# same-org Fly machines can't reach the primary's PUBLIC ip (hairpin NAT), which
+# is why the older followers islanded. HONESTY: Postern-operated on Fly = ONE
+# operator; adding miners CONCENTRATES hashrate and does NOT decentralize.
+app = "blochv-node-10"
+primary_region = "gru"
+
+[processes]
+  app = "--rpc-bind 0.0.0.0 --rpc-port 16210 --listen /ip4/0.0.0.0/tcp/16110 --data-dir /bloch-data --testnet --peer /ip6/fdaa:6e:e67a:a7b:5c5:e4f9:39a:2/tcp/16110 --allow-private-peers"
+
+[mounts]
+  source = "bloch_data"
+  destination = "/bloch-data"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory = "1gb"
