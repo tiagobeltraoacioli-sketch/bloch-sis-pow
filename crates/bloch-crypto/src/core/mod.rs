@@ -224,20 +224,59 @@ pub const CANONICAL_K_ACTIVATION_HEIGHT: u64 = 40_320;
 /// mainnet artifact is cut (see the `mainnet_release_guard` test).
 pub const PLACEHOLDER_ACTIVATION_HEIGHT: u64 = 1_000_000;
 
-/// Consensus selector for the PoW residual-gate width at a given BLOCK height.
+/// Height BELOW which the difficulty-driven k-ramp does NOT yet apply. A FUTURE
+/// activation (well above the tip at rollout) so every node upgrades before k
+/// can change — no fork. Below it, k is the relaxed testnet width (k=4); the
+/// historical k=8 blocks above the retired 40_320 jump stay valid because
+/// k=8 ⊃ k=4 (a k=8 witness also satisfies the k=4 gate). Re-confirm against the
+/// real tip at rollout. CONSENSUS-CRITICAL.
+pub const K_RULE_ACTIVATION_HEIGHT: u64 = 420_480;
+
+/// Work thresholds (`bits_to_work`) at which each residual step unlocks. k rides
+/// the ASERT difficulty — the on-chain hashrate proxy (the Bitcoin model: more
+/// hashrate → higher difficulty → higher k). Steps are ~8× apart because each
+/// +1 to k makes a valid candidate ~8× rarer, so the network needs ~8× the work
+/// to carry it without choking block production. These are the CALIBRATION KNOB:
+/// tune to the sustained-hashrate milestones you want to gate on. Current live
+/// work ≈ 4 (bits 0x203fffc0), so today's chain sits at k=4.
+pub const K_WORK_5: u128 = 32;
+pub const K_WORK_6: u128 = 256;
+pub const K_WORK_7: u128 = 2_048;
+pub const K_WORK_8: u128 = 16_384;
+
+/// Consensus selector for the PoW residual-gate width.
 ///
-/// CONSENSUS-CRITICAL: callers must pass the height of the block whose PoW is
-/// being validated (or mined) — NOT the current tip height. `Block::height` is
-/// itself consensus-checked (wire height vs. content in the NewBlock handler,
-/// and `height == max(parent heights) + 1` in `accept_block`, VULN-02), so a
-/// block lying about its height to dodge the k=8 gate is rejected on height
-/// grounds before it can be accepted.
+/// DIFFICULTY-DRIVEN PROGRESSIVE RAMP (Bitcoin model). k = 4 until
+/// `K_RULE_ACTIVATION_HEIGHT` (upgrade-safe), then k rises 5→6→7→8 as the
+/// block's own ASERT difficulty (`bits`) — the hashrate proxy — sustains above
+/// each `K_WORK_*` threshold, and eases back if it falls (self-healing: a
+/// capacity crash can never re-choke the chain the way a fixed k=8 does).
+///
+/// DETERMINISTIC: `bits` is consensus-validated (retargeted from the parent by
+/// ASERT, not chosen by the miner) and `height` is consensus-checked, so every
+/// node computes the SAME k from the agreed chain — no fork surface. k is a
+/// structural/throughput filter, NOT a cryptographic-hardness claim (β=q/16 is
+/// the trivial q-ary regime at every k in {4..8}); real security is cumulative
+/// SHAKE-256 hashcash work.
+///
+/// CONSENSUS-CRITICAL: callers pass the height AND bits of the block whose PoW
+/// is being validated (or mined) — NOT the current tip.
 #[inline]
-pub const fn canonical_residual_coeffs(height: u64) -> usize {
-    if height >= CANONICAL_K_ACTIVATION_HEIGHT {
-        bloch_sis_pow::CANONICAL_RESIDUAL_COEFFS
+pub fn canonical_residual_coeffs(height: u64, bits: u32) -> usize {
+    if height < K_RULE_ACTIVATION_HEIGHT {
+        return bloch_sis_pow::TESTNET_RESIDUAL_COEFFS; // k = 4, un-choked
+    }
+    let work = bits_to_work(bits);
+    if work >= K_WORK_8 {
+        bloch_sis_pow::CANONICAL_RESIDUAL_COEFFS // 8
+    } else if work >= K_WORK_7 {
+        7
+    } else if work >= K_WORK_6 {
+        6
+    } else if work >= K_WORK_5 {
+        5
     } else {
-        bloch_sis_pow::TESTNET_RESIDUAL_COEFFS
+        bloch_sis_pow::TESTNET_RESIDUAL_COEFFS // 4
     }
 }
 
@@ -1337,7 +1376,7 @@ impl Block {
             self.header.nonce,
             &s,
             &target,
-            canonical_residual_coeffs(self.height),
+            canonical_residual_coeffs(self.height, self.header.bits),
         )
         .is_ok()
     }
@@ -1754,63 +1793,81 @@ mod sf1_tests {
     }
 
     #[test]
-    fn canonical_residual_coeffs_selector_gates_at_activation_height() {
-        let h = CANONICAL_K_ACTIVATION_HEIGHT;
-        assert_eq!(canonical_residual_coeffs(0), TESTNET_RESIDUAL_COEFFS);
-        assert_eq!(canonical_residual_coeffs(h - 1), TESTNET_RESIDUAL_COEFFS);
-        assert_eq!(canonical_residual_coeffs(h), CANONICAL_RESIDUAL_COEFFS);
-        assert_eq!(canonical_residual_coeffs(h + 1), CANONICAL_RESIDUAL_COEFFS);
-        assert_eq!(canonical_residual_coeffs(u64::MAX), CANONICAL_RESIDUAL_COEFFS);
-        // Concrete widths, so a re-parameterization is a conscious edit here too.
+    fn canonical_residual_coeffs_difficulty_driven_ramp() {
+        // Spec mirror of the intended band mapping.
+        fn band(work: u128) -> usize {
+            if work >= K_WORK_8 { 8 } else if work >= K_WORK_7 { 7 }
+            else if work >= K_WORK_6 { 6 } else if work >= K_WORK_5 { 5 } else { 4 }
+        }
+        let a = K_RULE_ACTIVATION_HEIGHT;
+        // Below activation: ALWAYS k=4, whatever the difficulty (upgrade-safe, no fork).
+        for &bits in &[0x203fffc0u32, 0x1d00ffff, 0x0500ffff, u32::MAX] {
+            assert_eq!(canonical_residual_coeffs(0, bits), TESTNET_RESIDUAL_COEFFS);
+            assert_eq!(canonical_residual_coeffs(a - 1, bits), TESTNET_RESIDUAL_COEFFS);
+        }
+        // At/above activation: k tracks the block's own ASERT difficulty (bits→work).
+        for &bits in &[0x203fffc0u32, 0x1f00ffff, 0x1d00ffff, 0x1b00ffff, 0x0500ffff] {
+            let w = bits_to_work(bits);
+            assert_eq!(canonical_residual_coeffs(a, bits), band(w),
+                "bits {:#010x} → work {} → wrong k", bits, w);
+            assert_eq!(canonical_residual_coeffs(a + 50_000, bits), band(w));
+        }
+        // Concrete anchors: today's live difficulty sits at k=4; a very hard target reaches k=8.
+        assert_eq!(canonical_residual_coeffs(a, 0x203fffc0), 4, "current live difficulty must be k=4");
+        assert_eq!(canonical_residual_coeffs(a, 0x0500ffff), 8, "a very hard target reaches full k=8");
+        // Monotone: raising difficulty never lowers k.
+        assert!(canonical_residual_coeffs(a, 0x1b00ffff) >= canonical_residual_coeffs(a, 0x203fffc0));
         assert_eq!(TESTNET_RESIDUAL_COEFFS, 4);
         assert_eq!(CANONICAL_RESIDUAL_COEFFS, 8);
     }
 
     #[test]
-    fn validate_pow_keeps_k4_history_valid_below_activation_only() {
-        // Mine k=4 solutions (cheap, ~2^12 candidates each) until one FAILS
-        // k=8 — true for a fraction 4095/4096 of them; needing more than 8
-        // mines has probability ≈ 4096^-8, so this is deterministic in
-        // practice. That solution models every historical (pre-fork) block.
+    fn validate_pow_k4_witness_rejected_once_the_ramp_lifts_k() {
+        // The test header's difficulty selects k>4 above the rule activation. A
+        // k=4-only witness (one that FAILS that higher band) stays valid BELOW
+        // activation (k=4) but is rejected at/above, where the difficulty-driven
+        // ramp has lifted k — the gate tightens exactly as difficulty rises,
+        // while the pre-activation history keeps validating (k=8 ⊃ k=4 subset).
         let header = sf1_test_header();
+        let k_above = canonical_residual_coeffs(K_RULE_ACTIVATION_HEIGHT, header.bits);
+        assert!(
+            k_above > TESTNET_RESIDUAL_COEFFS,
+            "this test needs the header's difficulty to select k>4 above activation (got k={k_above})",
+        );
         let target = bloch_sis_pow::bits_to_target(header.bits);
-        let mut historical = None;
-        for i in 0..8u64 {
+        // Mine k=4 witnesses until one FAILS the higher band k_above (~7/8 do).
+        let mut only_k4 = None;
+        for i in 0..16u64 {
             let r = mine_window(TESTNET_RESIDUAL_COEFFS, i * 1_000_003, 500_000)
                 .expect("k=4 testnet regime must be brute-force mineable");
             if bloch_sis_pow::verify_regime(
-                &header.pow_preimage(), r.nonce, &r.solution, &target,
-                CANONICAL_RESIDUAL_COEFFS,
+                &header.pow_preimage(), r.nonce, &r.solution, &target, k_above,
             ).is_err() {
-                historical = Some(r);
+                only_k4 = Some(r);
                 break;
             }
         }
-        let r = historical.expect("8 consecutive k=4 solutions all passed k=8 — gate broken");
+        let r = only_k4.expect("no k=4-only witness in 16 windows — gate broken");
+        let mut mh = header;
+        mh.nonce = r.nonce;
 
-        let mut mined_header = header;
-        mined_header.nonce = r.nonce;
-
-        // Below the activation height the k=4 witness stays valid — the
-        // existing chain keeps syncing (the whole point of height-gating).
-        let below = sf1_block(mined_header.clone(), CANONICAL_K_ACTIVATION_HEIGHT - 1, &r.solution);
-        assert!(below.validate_pow(), "pre-fork k=4 block must remain valid below H");
-        let genesis_like = sf1_block(mined_header.clone(), 0, &r.solution);
-        assert!(genesis_like.validate_pow(), "height-0 k=4 block must remain valid");
-
-        // At/above the activation height the SAME witness is rejected: the
-        // fork actually tightens.
-        let at = sf1_block(mined_header.clone(), CANONICAL_K_ACTIVATION_HEIGHT, &r.solution);
-        assert!(!at.validate_pow(), "k=4-only witness must be rejected at H");
-        let above = sf1_block(mined_header, CANONICAL_K_ACTIVATION_HEIGHT + 1, &r.solution);
-        assert!(!above.validate_pow(), "k=4-only witness must be rejected above H");
+        // Valid below activation (k=4) and at height 0.
+        assert!(sf1_block(mh.clone(), K_RULE_ACTIVATION_HEIGHT - 1, &r.solution).validate_pow(),
+            "k=4 witness must stay valid below activation");
+        assert!(sf1_block(mh.clone(), 0, &r.solution).validate_pow(),
+            "height-0 k=4 block must remain valid");
+        // Rejected at/above — the ramp lifted k past 4.
+        assert!(!sf1_block(mh.clone(), K_RULE_ACTIVATION_HEIGHT, &r.solution).validate_pow(),
+            "k=4-only witness must be rejected at activation once k>4");
+        assert!(!sf1_block(mh, K_RULE_ACTIVATION_HEIGHT + 1, &r.solution).validate_pow(),
+            "k=4-only witness must be rejected above activation");
     }
 
     #[test]
-    fn validate_pow_accepts_k8_witness_at_and_below_activation() {
-        // A k=8-mined witness (pinned fast window — see K8_BLOCK_START_NONCE)
-        // passes at/above H, and ALSO below H (prefix subset): un-upgraded
-        // k=4 validators accept post-fork blocks, so no partition.
+    fn validate_pow_accepts_k8_witness_at_every_height() {
+        // A k=8-mined witness satisfies every lower k (prefix subset), so it
+        // validates at ANY height regardless of which k the ramp selects — no
+        // partition between nodes at different points on the ramp.
         let r = mine_window(CANONICAL_RESIDUAL_COEFFS, K8_BLOCK_START_NONCE, 4096)
             .expect("pinned window must contain a k=8 solution — if solver \
                      internals changed, re-run sf1_search_fast_k8_start_nonce_for_block");
@@ -1818,17 +1875,16 @@ mod sf1_tests {
         let mut mined_header = sf1_test_header();
         mined_header.nonce = r.nonce;
 
-        let at = sf1_block(mined_header.clone(), CANONICAL_K_ACTIVATION_HEIGHT, &r.solution);
-        assert!(at.validate_pow(), "k=8 witness must validate at H");
-        let above = sf1_block(mined_header.clone(), CANONICAL_K_ACTIVATION_HEIGHT + 1, &r.solution);
-        assert!(above.validate_pow(), "k=8 witness must validate above H");
-        let below = sf1_block(mined_header.clone(), CANONICAL_K_ACTIVATION_HEIGHT - 1, &r.solution);
-        assert!(below.validate_pow(), "k=8 witness must validate below H (subset property)");
-
+        for h in [0u64, K_RULE_ACTIVATION_HEIGHT - 1, K_RULE_ACTIVATION_HEIGHT, K_RULE_ACTIVATION_HEIGHT + 1] {
+            assert!(
+                sf1_block(mined_header.clone(), h, &r.solution).validate_pow(),
+                "k=8 witness must validate at height {h} (subset property)",
+            );
+        }
         // Tampered nonce breaks it at any height.
         let mut bad_header = mined_header;
         bad_header.nonce = r.nonce.wrapping_add(1);
-        let bad = sf1_block(bad_header, CANONICAL_K_ACTIVATION_HEIGHT, &r.solution);
+        let bad = sf1_block(bad_header, K_RULE_ACTIVATION_HEIGHT, &r.solution);
         assert!(!bad.validate_pow());
     }
 
