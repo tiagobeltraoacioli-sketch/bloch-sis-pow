@@ -513,6 +513,43 @@ pub enum ColoringMode {
     Fast,
 }
 
+/// Activation height for the corrected (`Fast`) GhostDAG coloring.
+///
+/// # TOKEN / HISTORY PRESERVATION — READ BEFORE CHANGING
+///
+/// This is a soft-fork-style activation gate. On the live path (`self.coloring
+/// == Legacy`), a block at `height` is colored with:
+///
+/// ```text
+/// if height >= CORRECTED_COLORING_ACTIVATION_HEIGHT { Fast } else { Legacy }
+/// ```
+///
+/// **Defaulted to `u64::MAX` = DISABLED.** With this value the comparison is
+/// false for every reachable height, so `Legacy` is the effective mode
+/// everywhere and this constant changes ZERO live behavior. Historical blocks
+/// are additionally never recolored: they are loaded from CF_DAG verbatim
+/// (`load_persisted` / `load_persisted_validated` insert stored data without
+/// recomputation), so their coloring — and therefore every already-mined
+/// block, balance, and the entire token supply — is preserved unconditionally.
+///
+/// ## Setting a real activation height (founder action only)
+///
+/// The value MUST be a **future** height, strictly greater than the current
+/// chain tip at the moment of the coordinated upgrade, and MUST be adopted by
+/// ALL nodes simultaneously (a soft-fork upgrade). Only blocks mined at or
+/// above that future height are colored with `Fast`; every block below it keeps
+/// its `Legacy` coloring, so no historical block is ever recomputed and no
+/// reorg of history occurs.
+///
+/// Setting this to a height at or below the current tip is **FORBIDDEN**: it
+/// would retroactively recolor already-mined blocks, which is a history reorg
+/// that can change balances. Do not do it. The replay harness
+/// (`tests/ghostdag_replay_snapshot.rs`) is the tool that first proves whether
+/// `Fast` even differs from `Legacy` on real history; if it is byte-identical
+/// everywhere, `Fast` is a transparent speedup and no activation is needed at
+/// all.
+pub const CORRECTED_COLORING_ACTIVATION_HEIGHT: u64 = u64::MAX;
+
 pub struct GhostDAG {
     pub k: usize,
     pub store: DagStore,
@@ -558,6 +595,41 @@ impl GhostDAG {
         &self.reach
     }
 
+    /// The coloring mode that applies to a block at the given `height`.
+    ///
+    /// - `self.coloring == Fast` (test/replay constructor): always `Fast`.
+    /// - `self.coloring == Legacy` (every live constructor): the
+    ///   [`CORRECTED_COLORING_ACTIVATION_HEIGHT`] soft-fork gate decides — `Fast`
+    ///   at/above the activation height, `Legacy` below it. With the activation
+    ///   height at its default `u64::MAX` this is `Legacy` for every reachable
+    ///   height, so live behavior is unchanged and all history stays
+    ///   Legacy-colored.
+    fn effective_coloring(&self, height: u64) -> ColoringMode {
+        match self.coloring {
+            ColoringMode::Fast => ColoringMode::Fast,
+            ColoringMode::Legacy => {
+                if height >= CORRECTED_COLORING_ACTIVATION_HEIGHT {
+                    ColoringMode::Fast
+                } else {
+                    ColoringMode::Legacy
+                }
+            }
+        }
+    }
+
+    /// Whether the reachability index must be maintained for this DAG.
+    ///
+    /// True when the DAG is a `Fast` constructor OR when the corrected-coloring
+    /// activation gate is armed (a real future height is configured) — in the
+    /// armed case the index must be built from genesis so `Fast` classification
+    /// is ready by the time the activation height is reached. When the gate is
+    /// disabled (`u64::MAX`, the default) and the DAG is `Legacy`, this is
+    /// `false` and the index is never touched — zero overhead, zero change.
+    fn maintains_reachability_index(&self) -> bool {
+        self.coloring == ColoringMode::Fast
+            || CORRECTED_COLORING_ACTIVATION_HEIGHT != u64::MAX
+    }
+
     /// Add genesis block
     pub fn add_genesis(&mut self, hash: BlockHash, timestamp: u64) {
         let data = GhostdagData {
@@ -572,7 +644,7 @@ impl GhostDAG {
             timestamp,
         };
         self.store.genesis = Some(hash);
-        if self.coloring == ColoringMode::Fast {
+        if self.maintains_reachability_index() {
             self.reach.add_genesis(hash);
         }
         self.store.insert(hash, data);
@@ -740,8 +812,13 @@ impl GhostDAG {
         //    block before classification queries it; the index is maintained
         //    incrementally, so it already does. `hash` itself is not queried
         //    during its own classification, so we register it afterwards.
+        //    The coloring is chosen by the height-gated `effective_coloring`:
+        //    Legacy below CORRECTED_COLORING_ACTIVATION_HEIGHT, Fast at/above
+        //    it. With the gate disabled (default u64::MAX) this is always Legacy
+        //    on the live path — historical and new blocks alike stay
+        //    Legacy-colored, preserving all mined tokens.
         let (mergeset_blues, mergeset_reds, blues_anticone_sizes) =
-            match self.coloring {
+            match self.effective_coloring(height) {
                 ColoringMode::Legacy => self.classify_mergeset(&mergeset, &selected_parent),
                 ColoringMode::Fast => self.classify_mergeset_fast(&mergeset, &selected_parent),
             };
@@ -767,7 +844,7 @@ impl GhostDAG {
         // Maintain the reachability index (Fast mode only). Register `hash`
         // now, after classification, before it is inserted into the store — so
         // subsequent blocks can query its ancestry.
-        if self.coloring == ColoringMode::Fast {
+        if self.maintains_reachability_index() {
             self.reach.add_block(hash, &selected_parent, &mergeset);
         }
 
@@ -811,7 +888,7 @@ impl GhostDAG {
         };
         // Keep the reachability index consistent (Fast mode only). The mergeset
         // used at insert time is recoverable as blues ∪ reds.
-        if self.coloring == ColoringMode::Fast {
+        if self.maintains_reachability_index() {
             let mut mergeset = data.mergeset_blues.clone();
             mergeset.extend_from_slice(&data.mergeset_reds);
             self.reach.remove_leaf(hash, &mergeset);

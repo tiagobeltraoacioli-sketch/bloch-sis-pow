@@ -71,12 +71,11 @@ fn decode<T: serde::de::DeserializeOwned>(b: &[u8]) -> Result<T, StorageError> {
 pub struct Storage { db: DB }
 
 impl Storage {
-    pub fn open(path: &Path) -> Result<Self, StorageError> {
-        let mut opts = Options::default();
-        opts.create_if_missing(true);
-        opts.create_missing_column_families(true);
-        opts.set_max_open_files(256);
-        opts.set_write_buffer_size(64 * 1024 * 1024);
+    /// Build the full column-family descriptor list. Shared by the read-write
+    /// [`open`] and the read-only [`open_read_only`] paths so both agree on the
+    /// exact schema (CF names + per-CF options) — the read-only replay harness
+    /// must decode CF_DAG with the identical layout the node wrote.
+    fn cf_descriptors() -> Vec<ColumnFamilyDescriptor> {
         let mut addr_utxo_opts = Options::default();
         addr_utxo_opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(20));
         let cfs = vec![
@@ -132,7 +131,35 @@ impl Storage {
             ColumnFamilyDescriptor::new(CF_FFG_COMMITTEE,             Options::default()),
             ColumnFamilyDescriptor::new(CF_FFG_PENDING_COMMITTEE,     Options::default()),
         ];
-        let db = DB::open_cf_descriptors(&opts, path, cfs)
+        cfs
+    }
+
+    pub fn open(path: &Path) -> Result<Self, StorageError> {
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
+        opts.set_max_open_files(256);
+        opts.set_write_buffer_size(64 * 1024 * 1024);
+        let db = DB::open_cf_descriptors(&opts, path, Self::cf_descriptors())
+            .map_err(|e| StorageError::OpenFailed(e.to_string()))?;
+        Ok(Self { db })
+    }
+
+    /// Open an existing snapshot **read-only**. RocksDB is opened with
+    /// `open_cf_descriptors_read_only`, which acquires no write lock, creates
+    /// nothing, and rejects every mutating call — so a live node can keep the
+    /// same data-dir open while this handle inspects it. Used by the GhostDAG
+    /// differential replay harness (`tests/ghostdag_replay_snapshot.rs`) to read
+    /// CF_DAG without any risk of touching mined history.
+    ///
+    /// `path` is the node data-dir (the same directory passed to [`open`]).
+    /// The DB must already exist; this never creates column families.
+    pub fn open_read_only(path: &Path) -> Result<Self, StorageError> {
+        let opts = Options::default();
+        // `error_if_log_file_exist = false`: tolerate a live/unclean WAL so we
+        // can inspect a running node's dir. Read-only mode never replays into or
+        // mutates the primary.
+        let db = DB::open_cf_descriptors_read_only(&opts, path, Self::cf_descriptors(), false)
             .map_err(|e| StorageError::OpenFailed(e.to_string()))?;
         Ok(Self { db })
     }
