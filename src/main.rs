@@ -105,6 +105,23 @@ struct Cli {
     /// Sprint P: allow RFC1918 / loopback addresses via PEX. Dev/test only.
     /// Production deployments should leave this off; it opens a scanning vector.
     #[arg(long)]                                         allow_private_peers: bool,
+    /// Mesh fix: set when this node sits behind a TCP proxy / NAT that makes
+    /// many peers share one source IP (fly.io edge, k8s ingress, CGNAT). The
+    /// gossipsub ip-colocation penalty (-50 x excess^2 above 3 peers/IP) would
+    /// otherwise graylist the whole mesh at ~6 peers and silently blackhole
+    /// every tip announcement. Disables only that weight; all other peer
+    /// scoring stays active. Non-consensus — purely an operator knob.
+    #[arg(long)]                                         behind_proxy: bool,
+    /// Maximum peer connections (inbound cap). Raise this on a well-provisioned
+    /// bootstrap / hub node so newcomers aren't rejected once the cap fills;
+    /// keep it modest on a leaf node. Non-consensus — purely an operator knob.
+    #[arg(long, default_value_t = 50)]                   max_peers: usize,
+    /// Optional DNS seed hostname(s): the node resolves each to its A/AAAA
+    /// records and dials them as peers (default port 16110; pass host:port to
+    /// override). Bitcoin-style cold-start convenience — NON-privileged and
+    /// opt-in: the shipped DEFAULT_SEEDS stays empty, so nobody's seed is
+    /// required and you can point at (or run) any seed you trust. Repeatable.
+    #[arg(long)]                                         dns_seed: Vec<String>,
 
     // ── Sprint 2 (AA.1 pt 3): stratum V1 mining server ──────────────
     /// Enable the stratum V1 mining server. Miners can connect at
@@ -384,14 +401,41 @@ async fn main() {
         }
     }
 
+    // ── Heal poisoned finality checkpoint (blue-score/height unit bug) ─────────
+    // Older builds persisted finalized_height = tip_blue_score − CHECKPOINT_DEPTH,
+    // which runs ahead of the selected tip's *height* by the DAG width and can
+    // exceed it once the skew passes CHECKPOINT_DEPTH — bricking block ingestion
+    // (every chain-extending block is <= finalized_height and gets rejected). The
+    // monotonic guard in accept_block cannot lower the value, so clamp it down to
+    // a height-based ceiling here, once, at startup.
+    {
+        let tip_h = {
+            let d = dag.read();
+            d.selected_tip()
+                .and_then(|h| d.get_block_data(&h).map(|x| x.height))
+                .unwrap_or(0)
+        };
+        let cap = tip_h.saturating_sub(core::CHECKPOINT_DEPTH);
+        let cur = store.get_meta("finalized_height").ok().flatten()
+            .and_then(|b| b.as_slice().try_into().ok().map(u64::from_le_bytes))
+            .unwrap_or(0);
+        if cur > cap {
+            warn!("finalized_height {} exceeds height-based cap {} \
+                   (blue-score/height unit bug) — clamping to heal ingestion", cur, cap);
+            store.put_meta("finalized_height", &cap.to_le_bytes()).ok();
+        }
+    }
+
     // ── Mempool + Network ─────────────────────────────────────────────────────
     let mempool  = Arc::new(mempool::Mempool::new());
     let net_cfg  = network::NetworkConfig {
         listen_addr:     cli.listen.clone(),
         bootstrap_peers: cli.peer.clone(),
-        max_peers:       50,
+        dns_seeds:       cli.dns_seed.clone(),
+        max_peers:       cli.max_peers,
         data_dir:        data_path.clone(),
         allow_private_peers: cli.allow_private_peers,
+        behind_proxy:    cli.behind_proxy,
     };
     let node = match network::NetworkNode::new(net_cfg) {
         Ok(n)  => { info!("P2P: {}", n.peer_id); n }
@@ -464,6 +508,9 @@ async fn main() {
             // Reverse index: parent_hash → set of orphan hashes waiting for it
             let mut waiting_for: std::collections::HashMap<[u8; 32], HashSet<[u8; 32]>> =
                 std::collections::HashMap::new();
+            // Mesh fix (reciprocal tip): rate limiter for answering behind-
+            // peers' PeerTip announcements with our own tip. None = never sent.
+            let mut last_reciprocal_tip: Option<std::time::Instant> = None;
 
             while let Some(msg) = block_rx.recv().await {
             match msg {
@@ -471,12 +518,53 @@ async fn main() {
                 // IBD step 1: peer tip — if behind, request headers
                 network::NetworkMessage::PeerTip { blue_score: peer_s, ref peer_id, .. } => {
                     let our_s = dag2.read().tip_blue_score();
+                    {
+                        let mut s = state2.write();
+                        s.seen_first_tip = true;
+                        if peer_s > s.best_seen_blue_score { s.best_seen_blue_score = peer_s; }
+                        // Release the IBD latch once we've caught up to the best
+                        // tip any peer has announced. Replaces the dead empty-
+                        // Headers clear path below; peers re-announce their tip
+                        // ~every 60s, so a synced node resumes mining promptly.
+                        if s.is_syncing && our_s >= s.best_seen_blue_score {
+                            s.is_syncing = false;
+                            info!("IBD complete (caught up to best announced tip {})", s.best_seen_blue_score);
+                        }
+                    }
                     if peer_s > our_s {
                         info!("Peer {} ahead ({}), requesting headers", peer_id, peer_s);
                         state2.write().is_syncing = true;
                         let _ = otx2.send(network::NetworkMessage::GetHeaders {
                             from_blue_score: our_s, limit: 500
                         }).await;
+                    } else if peer_s < our_s {
+                        // Mesh fix (reciprocal tip): the announcing peer is
+                        // BEHIND us, and its other ways of learning our tip are
+                        // all fragile — the on-connect announce races its
+                        // Subscribe, and our 60s periodic PeerTip is byte-
+                        // identical while our tip is unchanged (dedup-fragile).
+                        // Answer with a fresh-timestamp Version (unique bytes,
+                        // can never be dedup-dropped) carrying our blue_score;
+                        // the peer's Version arm below treats it as an IBD
+                        // trigger. Rate-limited so a burst of behind-tips from
+                        // many peers can't make us spam the sync topic.
+                        let due = last_reciprocal_tip
+                            .map(|t| t.elapsed() >= std::time::Duration::from_secs(15))
+                            .unwrap_or(true);
+                        if due {
+                            last_reciprocal_tip = Some(std::time::Instant::now());
+                            let height = dag2.read().block_count() as u64;
+                            debug!("peer {} behind (score {} < {}), sending reciprocal tip", peer_id, peer_s, our_s);
+                            let _ = otx2.send(network::NetworkMessage::Version {
+                                version:    network::PROTOCOL_VERSION,
+                                user_agent: format!("bloch-layer/{}", env!("CARGO_PKG_VERSION")),
+                                blue_score: our_s,
+                                height,
+                                timestamp:  std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs()).unwrap_or(0),
+                            }).await;
+                        }
                     }
                 }
 
@@ -651,8 +739,45 @@ async fn main() {
                     }
                 }
 
-                // Version handshake (handled at network layer)
-                network::NetworkMessage::Version { .. } | network::NetworkMessage::VersionAck | network::NetworkMessage::PeerExchange { .. } | network::NetworkMessage::PeerRequest => {}
+                // Mesh fix (fresh-joiner IBD): Version was a no-op here, yet it
+                // is the only tip-carrying frame on the wire whose bytes are
+                // always unique (fresh `timestamp` → unique gossipsub
+                // MessageId, so it can never be Duplicate-dropped the way a
+                // byte-identical PeerTip can). Treat it exactly like a PeerTip
+                // for IBD triggering: on-connect handshakes, post-Subscribed
+                // re-announces, periodic announces, and reciprocal tips all
+                // arrive as Version frames.
+                //
+                // SHARED-LATCH NOTE ([stall] interface): this arm feeds the
+                // same is_syncing / best_seen_blue_score / seen_first_tip
+                // latch as the PeerTip arm above, with IDENTICAL semantics.
+                // It widens the set of messages that can raise the
+                // best_seen_blue_score high-water mark (still unvalidated,
+                // peer-supplied). Any [stall]-side fix that decays or
+                // validates that mark must cover this arm too.
+                network::NetworkMessage::Version { version, blue_score: peer_s, .. } => {
+                    if version < network::MIN_PROTOCOL_VERSION { continue; }
+                    let our_s = dag2.read().tip_blue_score();
+                    {
+                        let mut s = state2.write();
+                        s.seen_first_tip = true;
+                        if peer_s > s.best_seen_blue_score { s.best_seen_blue_score = peer_s; }
+                        if s.is_syncing && our_s >= s.best_seen_blue_score {
+                            s.is_syncing = false;
+                            info!("IBD complete (caught up to best announced tip {})", s.best_seen_blue_score);
+                        }
+                    }
+                    if peer_s > our_s {
+                        info!("Version peer ahead (score {} > {}), requesting headers", peer_s, our_s);
+                        state2.write().is_syncing = true;
+                        let _ = otx2.send(network::NetworkMessage::GetHeaders {
+                            from_blue_score: our_s, limit: 500
+                        }).await;
+                    }
+                }
+                network::NetworkMessage::VersionAck
+                | network::NetworkMessage::PeerExchange { .. }
+                | network::NetworkMessage::PeerRequest => {}
             }
             }
           };
@@ -677,6 +802,45 @@ async fn main() {
           }
         }
     });
+
+    // ── Mesh fix: proactive IBD nudge ─────────────────────────────────────────
+    //
+    // A fresh joiner can miss every inbound tip signal: the seed's on-connect
+    // announce races our Subscribe, the 60s periodic PeerTip is dedup-fragile,
+    // and colocation scoring can graylist proxied peers. Don't wait to be told
+    // we're behind — while we have peers and either (a) we've never seen a
+    // remote tip, or (b) we know we're behind (is_syncing latched, or the
+    // best announced blue_score exceeds ours), publish GetHeaders every 30s.
+    //
+    // This also un-crawls multi-batch IBD: the Headers handler requests one
+    // 500-block batch and never issues a follow-up GetHeaders, so a node
+    // thousands of blocks behind previously advanced one batch per 60s tip
+    // re-announce. With the nudge it re-requests from its ADVANCING blue_score
+    // at least every 30s. At parity the nudge stops (and the serving side
+    // suppresses empty Headers replies), so steady-state cost is zero.
+    {
+        let dag_n   = dag.clone();
+        let state_n = node_state.clone();
+        let otx_n   = outbound_tx.clone();
+        tokio::spawn(async move {
+            let mut nudge = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                nudge.tick().await;
+                let our_s = dag_n.read().tip_blue_score();
+                let (peers, syncing, best_seen, seen_tip) = {
+                    let s = state_n.read();
+                    (s.peer_count, s.is_syncing, s.best_seen_blue_score, s.seen_first_tip)
+                };
+                if peers > 0 && (syncing || !seen_tip || best_seen > our_s) {
+                    debug!("IBD nudge: GetHeaders from score {} (best_seen={} syncing={} seen_tip={})",
+                        our_s, best_seen, syncing, seen_tip);
+                    let _ = otx_n.send(network::NetworkMessage::GetHeaders {
+                        from_blue_score: our_s, limit: 500,
+                    }).await;
+                }
+            }
+        });
+    }
 
     // ── Ready ─────────────────────────────────────────────────────────────────
     let (score, count) = { let d = dag.read(); (d.tip_blue_score(), d.block_count()) };
@@ -720,6 +884,12 @@ async fn main() {
 
     // ── Continuous Mining Loop ────────────────────────────────────────────────
     if cli.mine {
+        // Fresh-miner fork guard: if the operator configured a bootstrap peer
+        // or DNS seed they intend to JOIN an existing network, so mining before
+        // we have any peer would fork from genesis on the forgeable chain.
+        // Nodes with no peer/seed configured (intentional solo / island) keep
+        // mining immediately.
+        let wants_to_join = !cli.peer.is_empty() || !cli.dns_seed.is_empty();
         let store_m  = store.clone();
         let dag_m    = dag.clone();
         let state_m  = node_state.clone();
@@ -737,7 +907,32 @@ async fn main() {
             // Sprint GG: warn once when we first see IBD active, log
             // transition back to ready so operators see the transition.
             let mut was_syncing_last_tick: bool = false;
+            let mut warned_no_peers: bool = false;
             loop {
+                // Fresh-miner fork guard (see wants_to_join above): a node told
+                // to join a network but with 0 peers so far must not mine — it
+                // would build an isolated fork from genesis that the network
+                // rejects on cumulative work. Pause until at least one peer.
+                // Wait not just for a connection but for the first remote tip:
+                // there is a window where peer_count>0 but no PeerTip has been
+                // evaluated yet, during which a fresh joiner would mine a
+                // genesis fork. seen_first_tip closes that race.
+                let (has_no_peer, no_tip_yet) = {
+                    let s = state_m.read();
+                    (s.peer_count == 0, !s.seen_first_tip)
+                };
+                if wants_to_join && (has_no_peer || no_tip_yet) {
+                    if !warned_no_peers {
+                        info!("⛏  not ready to mine yet — waiting to connect and see the network tip (would otherwise fork from genesis); still trying to reach the configured peer/seed");
+                        warned_no_peers = true;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    continue;
+                }
+                if warned_no_peers {
+                    info!("⛏  connected and tip evaluated — miner active");
+                    warned_no_peers = false;
+                }
                 // Sprint GG fix (pre-IBD mining bug, 2026-04-22):
                 // During IBD the DAG tip reflects the local view, which
                 // lags the network by up to thousands of blocks. Mining
@@ -1745,8 +1940,19 @@ fn accept_block(
     info!("✓ block h={} accepted", height);
 
     // ── Update finality checkpoint ───────────────────────────────────
-    // Once tip is CHECKPOINT_DEPTH ahead, finalize everything below
-    let tip_height = dag.read().tip_blue_score();
+    // Once tip is CHECKPOINT_DEPTH ahead, finalize everything below.
+    // NOTE: this MUST be the selected tip's *height*, not tip_blue_score().
+    // finalized_height is compared against block.height at the finality gate
+    // above; feeding it blue_score (which runs ahead of height by the DAG
+    // width) makes the node "finalize" a height above its own tip once the
+    // skew exceeds CHECKPOINT_DEPTH, permanently rejecting every
+    // chain-extending block. Same height unit feeds the pruning block below.
+    let tip_height = {
+        let d = dag.read();
+        d.selected_tip()
+            .and_then(|h| d.get_block_data(&h).map(|data| data.height))
+            .unwrap_or(0)
+    };
     if tip_height > core::CHECKPOINT_DEPTH {
         let new_finalized = tip_height - core::CHECKPOINT_DEPTH;
         let current_finalized = store.get_meta("finalized_height").ok().flatten()
