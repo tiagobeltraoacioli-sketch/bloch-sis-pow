@@ -329,3 +329,49 @@ fn replay_snapshot_legacy_vs_fast() {
     // a red build.
     let _ = divergences;
 }
+
+/// Fast DAG-shape probe (READ-ONLY, no re-classification): reads the on-disk
+/// GhostdagData and reports the mergeset-width / anticone-size distribution.
+/// A narrow DAG (tiny anticones, ~linear) cannot be under-counted by the
+/// bounded Legacy BFS, so Legacy == Fast (DROP-IN). Wide anticones are the only
+/// place divergence can appear. Runs in seconds (no O(depth) classification).
+#[test]
+#[ignore]
+fn dag_shape_stats() {
+    let path = std::env::var("BLOCH_SNAPSHOT")
+        .expect("set BLOCH_SNAPSHOT to the snapshot RocksDB path");
+    let storage = Storage::open_read_only(std::path::Path::new(&path))
+        .expect("open snapshot read-only");
+    let raw = storage.load_all_dag_data().expect("load CF_DAG");
+    let snapshot: std::collections::HashMap<BlockHash, GhostdagData> =
+        raw.into_iter().collect();
+
+    let n = snapshot.len().max(1);
+    let (mut max_mergeset, mut max_anticone) = (0usize, 0usize);
+    let (mut wide_merges, mut merges_gt_k) = (0usize, 0usize);
+    let mut max_blue_score = 0u64;
+    for gd in snapshot.values() {
+        let w = gd.mergeset_blues.len() + gd.mergeset_reds.len();
+        max_mergeset = max_mergeset.max(w);
+        if w > 1 { wide_merges += 1; }
+        if w > GHOSTDAG_K as usize { merges_gt_k += 1; }
+        if let Some(&m) = gd.blues_anticone_sizes.values().max() {
+            max_anticone = max_anticone.max(m);
+        }
+        max_blue_score = max_blue_score.max(gd.blue_score);
+    }
+    println!("=== DAG SHAPE STATS (predicts DROP-IN vs GATED) ===");
+    println!("blocks: {n}  max_blue_score: {max_blue_score}  K: {}", GHOSTDAG_K);
+    println!("max mergeset width (blues+reds): {max_mergeset}");
+    println!("max blues_anticone_size: {max_anticone}");
+    println!(
+        "blocks with mergeset width > 1: {wide_merges} ({:.4}%)",
+        100.0 * wide_merges as f64 / n as f64
+    );
+    println!("blocks with mergeset width > K: {merges_gt_k}");
+    if max_anticone < GHOSTDAG_K as usize && max_mergeset <= GHOSTDAG_K as usize {
+        println!("VERDICT: narrow DAG (max anticone < K) => Legacy cannot under-count => DROP-IN.");
+    } else {
+        println!("VERDICT: wide anticones present => run the full differential to confirm GATED.");
+    }
+}
