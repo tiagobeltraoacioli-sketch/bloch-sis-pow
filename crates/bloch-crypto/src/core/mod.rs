@@ -244,6 +244,39 @@ pub const K_WORK_6: u128 = 256;
 pub const K_WORK_7: u128 = 2_048;
 pub const K_WORK_8: u128 = 16_384;
 
+// ── Difficulty re-anchor (ASERT hard fork) ──────────────────────────────────
+//
+// The genesis-anchored ASERT clamps the *absolute* schedule exponent to ±4×
+// (see bloch_sis_pow::difficulty::scale_target_by_pow2_milli), so difficulty can
+// never exceed 4× GENESIS_BITS however much hashrate joins — a lifetime cap, not
+// a per-step limiter. With the k=8→k=4 throughput filter relaxed, that cap let
+// block production run away (~7 blk/s) and could never rise to meet real hashrate
+// (ASICs/FPGA). Fix: re-anchor ASERT at a fresh (height, timestamp, bits) so the
+// ~62-day accumulated schedule debt resets, AND — only for the re-anchored
+// regime (anchor_height > 0) — widen the clamp so difficulty can track hashrate.
+// Blocks below ASERT_ANCHOR2_HEIGHT keep the genesis anchor and the ±4× bound
+// byte-for-byte, so every historical `expected_bits` still validates on resync
+// (VULN-01 intact) — no fork. CONSENSUS-CRITICAL.
+
+/// Height at which ASERT re-anchors — the first block validated/mined under the
+/// new anchor. Set to the coordinated reset base (392_303, the snapshot tip
+/// *height* — 393_386 was its blue-score, the very unit confusion this release
+/// also fixes) + 1, so every operating node runs this build from the same point.
+/// The reset is coordinated (all nodes wiped to 392_303, all start on this
+/// build), so no node holds a 392_304+ block under the old rules → no fork.
+pub const ASERT_ANCHOR2_HEIGHT: u64 = 392_304;
+
+/// Unix-seconds timestamp of block `ASERT_ANCHOR2_HEIGHT − 1` (the reset base,
+/// height 392_303) — the schedule origin for the re-anchored ASERT. Read from the
+/// block itself so miner and validator agree. (ASERT half-life is 2 days, so this
+/// only needs the block's real wall-clock time; sub-minute precision is moot.)
+pub const ASERT_ANCHOR2_TIMESTAMP: u64 = 1_784_150_901; // block 392_303 (~2026-07-15)
+
+/// Target for the first post-anchor block — calibrated to node3's observed
+/// production so blocks return to ~30 s; ASERT converges any residual error with
+/// the 2-day half-life. ~180× harder than the 0x203fffc0 the chain floods at.
+pub const ASERT_ANCHOR2_BITS: u32 = 0x1f5b0500;
+
 /// Consensus selector for the PoW residual-gate width.
 ///
 /// DIFFICULTY-DRIVEN PROGRESSIVE RAMP (Bitcoin model). k = 4 until

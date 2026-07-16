@@ -401,6 +401,31 @@ async fn main() {
         }
     }
 
+    // ── Heal poisoned finality checkpoint (blue-score/height unit bug) ─────────
+    // Older builds persisted finalized_height = tip_blue_score − CHECKPOINT_DEPTH,
+    // which runs ahead of the selected tip's *height* by the DAG width and can
+    // exceed it once the skew passes CHECKPOINT_DEPTH — bricking block ingestion
+    // (every chain-extending block is <= finalized_height and gets rejected). The
+    // monotonic guard in accept_block cannot lower the value, so clamp it down to
+    // a height-based ceiling here, once, at startup.
+    {
+        let tip_h = {
+            let d = dag.read();
+            d.selected_tip()
+                .and_then(|h| d.get_block_data(&h).map(|x| x.height))
+                .unwrap_or(0)
+        };
+        let cap = tip_h.saturating_sub(core::CHECKPOINT_DEPTH);
+        let cur = store.get_meta("finalized_height").ok().flatten()
+            .and_then(|b| b.as_slice().try_into().ok().map(u64::from_le_bytes))
+            .unwrap_or(0);
+        if cur > cap {
+            warn!("finalized_height {} exceeds height-based cap {} \
+                   (blue-score/height unit bug) — clamping to heal ingestion", cur, cap);
+            store.put_meta("finalized_height", &cap.to_le_bytes()).ok();
+        }
+    }
+
     // ── Mempool + Network ─────────────────────────────────────────────────────
     let mempool  = Arc::new(mempool::Mempool::new());
     let net_cfg  = network::NetworkConfig {
@@ -1915,8 +1940,19 @@ fn accept_block(
     info!("✓ block h={} accepted", height);
 
     // ── Update finality checkpoint ───────────────────────────────────
-    // Once tip is CHECKPOINT_DEPTH ahead, finalize everything below
-    let tip_height = dag.read().tip_blue_score();
+    // Once tip is CHECKPOINT_DEPTH ahead, finalize everything below.
+    // NOTE: this MUST be the selected tip's *height*, not tip_blue_score().
+    // finalized_height is compared against block.height at the finality gate
+    // above; feeding it blue_score (which runs ahead of height by the DAG
+    // width) makes the node "finalize" a height above its own tip once the
+    // skew exceeds CHECKPOINT_DEPTH, permanently rejecting every
+    // chain-extending block. Same height unit feeds the pruning block below.
+    let tip_height = {
+        let d = dag.read();
+        d.selected_tip()
+            .and_then(|h| d.get_block_data(&h).map(|data| data.height))
+            .unwrap_or(0)
+    };
     if tip_height > core::CHECKPOINT_DEPTH {
         let new_finalized = tip_height - core::CHECKPOINT_DEPTH;
         let current_finalized = store.get_meta("finalized_height").ok().flatten()

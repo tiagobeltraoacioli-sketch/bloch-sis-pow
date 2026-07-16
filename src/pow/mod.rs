@@ -80,10 +80,27 @@ pub fn next_bits(
     parent_timestamp: u64,
     height: u64,
 ) -> u32 {
+    // Height-switched ASERT re-anchor (CONSENSUS-CRITICAL). Below
+    // ASERT_ANCHOR2_HEIGHT every node uses the genesis anchor the caller passed,
+    // so all historical `expected_bits` replay byte-identically. At/above it the
+    // schedule re-anchors to a fresh (height, timestamp, bits) reference: this
+    // resets the ~62-day schedule debt the genesis anchor had accumulated (which,
+    // with the ±4× cap, had pinned difficulty far below the real hashrate and let
+    // block production run away) and — via the wide bound in `asert_next_bits`
+    // for anchor_height > 0 — lets difficulty track hashrate freely from here.
+    let (a_bits, a_ts, a_height) = if height >= bloch_crypto::core::ASERT_ANCHOR2_HEIGHT {
+        (
+            bloch_crypto::core::ASERT_ANCHOR2_BITS,
+            bloch_crypto::core::ASERT_ANCHOR2_TIMESTAMP as i64,
+            bloch_crypto::core::ASERT_ANCHOR2_HEIGHT,
+        )
+    } else {
+        (anchor_bits, anchor_timestamp as i64, 0)
+    };
     bloch_sis_pow::difficulty::asert_next_bits(
-        anchor_bits,
-        anchor_timestamp as i64,
-        0, // anchor height = genesis
+        a_bits,
+        a_ts,
+        a_height,
         parent_timestamp as i64,
         height,
     )
@@ -250,6 +267,30 @@ mod tests {
         assert!(verify_sis_pow_full_m(preimage, nonce, &s, bits).is_err());
         // Tampering the nonce breaks it even under the testnet regime.
         assert!(verify_sis_pow_testnet(preimage, nonce.wrapping_add(1), &s, bits).is_err());
+    }
+
+    #[test]
+    fn next_bits_reanchors_at_asert_anchor2_height() {
+        use bloch_crypto::core::{
+            ASERT_ANCHOR2_HEIGHT, ASERT_ANCHOR2_TIMESTAMP, ASERT_ANCHOR2_BITS,
+        };
+        // At/above ASERT_ANCHOR2_HEIGHT the re-anchor governs and the passed
+        // (genesis) anchor is ignored — two very different passed anchors yield
+        // identical bits.
+        let a = next_bits(0x2100ffff, 1_000, ASERT_ANCHOR2_TIMESTAMP, ASERT_ANCHOR2_HEIGHT);
+        let b = next_bits(0x1c3a0000, 9_999, ASERT_ANCHOR2_TIMESTAMP, ASERT_ANCHOR2_HEIGHT);
+        assert_eq!(a, b, "at ANCHOR2 the passed anchor must be ignored (re-anchored)");
+        // On-schedule at the anchor (parent stamped at the anchor ts) → the
+        // schedule deviation is zero, so the target is the anchor target and
+        // bits round-trip to ASERT_ANCHOR2_BITS.
+        assert_eq!(
+            a, target_to_bits(&bits_to_target(ASERT_ANCHOR2_BITS)),
+            "on-schedule at ANCHOR2 must reproduce ANCHOR2 bits"
+        );
+        // One block below, the switch is inactive: the passed genesis anchor
+        // still governs, so the result is NOT the re-anchored bits.
+        let below = next_bits(0x2100ffff, 1_000, ASERT_ANCHOR2_TIMESTAMP, ASERT_ANCHOR2_HEIGHT - 1);
+        assert_ne!(below, a, "below ANCHOR2 must not use the re-anchor");
     }
 
     /// Soft fork SF-1: fixed preimage for the height-aware k=8 e2e test.
