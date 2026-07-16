@@ -260,11 +260,20 @@ pub(crate) fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
 pub struct NetworkConfig {
     pub listen_addr:     String,
     pub bootstrap_peers: Vec<String>,
+    /// Opt-in DNS seed hostnames (Bitcoin-style cold-start). Resolved to
+    /// A/AAAA records and dialed as peers. Empty by default — non-privileged.
+    pub dns_seeds:       Vec<String>,
     pub max_peers:       usize,
     pub data_dir:        PathBuf,
     /// Sprint P: if true, PEX will accept RFC1918 / loopback addresses.
     /// Intended for local development; production should leave this false.
     pub allow_private_peers: bool,
+    /// Mesh fix (fresh-joiner IBD): this node sits behind a TCP proxy / NAT
+    /// where many peers legitimately share one source IP (fly.io edge,
+    /// ingress, CGNAT). Disables the gossipsub ip-colocation penalty weight
+    /// (which would graylist the whole mesh at ~6 peers from one IP and
+    /// silently blackhole every tip announcement). All other scoring stays.
+    pub behind_proxy: bool,
 }
 
 impl Default for NetworkConfig {
@@ -272,9 +281,11 @@ impl Default for NetworkConfig {
         Self {
             listen_addr:     "/ip4/0.0.0.0/tcp/16110".into(),
             bootstrap_peers: vec![],
+            dns_seeds:       vec![],
             max_peers:       50,
             data_dir:        PathBuf::from("./bloch-data"),
             allow_private_peers: false,
+            behind_proxy:    false,
         }
     }
 }
@@ -358,6 +369,19 @@ impl NetworkNode {
             .validation_mode(ValidationMode::Strict)
             .message_id_fn(msg_id_fn)
             .max_transmit_size(4 * 1024 * 1024)
+            // Mesh fix (fresh-joiner IBD): gossipsub's duplicate_cache_time
+            // defaults to 60s — the SAME period as tip_announce below. When
+            // the tip hasn't advanced, the periodic PeerTip is byte-identical,
+            // hashes to the same MessageId, and publish() returns
+            // Err(PublishError::Duplicate) LOCALLY (behaviour.rs checks
+            // duplicate_cache before sending) — the re-announce never leaves
+            // this node. Worse: the on-connect PeerTip for a fresh joiner is
+            // Duplicate-dropped whenever any announce fired in the previous
+            // 60s, so on a quiet/stalled chain a new peer may NEVER receive a
+            // tip. 30s guarantees the 60s periodic announce always clears the
+            // cache; the tip-carrying Version (fresh timestamp → unique bytes)
+            // published alongside it can never be dedup-dropped at all.
+            .duplicate_cache_time(Duration::from_secs(30))
             .build()
             .map_err(|e| NetworkError::StartFailed(format!("gossipsub: {}", e)))?;
 
@@ -367,7 +391,15 @@ impl NetworkNode {
             let mut params = PeerScoreParams::default();
             params.app_specific_weight = 1.0;
             params.ip_colocation_factor_threshold = 3.0; // penalize >3 peers from same IP
-            params.ip_colocation_factor_weight = -50.0;
+            // Mesh fix: behind a fly.io-style proxy/NAT every inbound peer
+            // shares the proxy's source IP, so the colocation penalty
+            // (-50 × excess² above the threshold) crosses graylist_threshold
+            // (-400) at just 6 peers — the node then IGNORES its entire mesh
+            // and every tip announcement is blackholed. Operators who know
+            // they're proxied disable the weight with --behind-proxy; the
+            // default stays hostile to real sybil colocation.
+            params.ip_colocation_factor_weight =
+                if self.config.behind_proxy { 0.0 } else { -50.0 };
             params.decay_interval = Duration::from_secs(60);
             params.decay_to_zero = 0.01;
 
@@ -535,7 +567,25 @@ impl NetworkNode {
 
         // Add hardcoded default seeds
         let mut all_seeds: Vec<String> = crate::core::DEFAULT_SEEDS.iter().map(|s| s.to_string()).collect();
-        // DNS seeds: TODO when TXT records are configured
+        // DNS seeds (opt-in, non-privileged): resolve each hostname's A/AAAA
+        // records into peer multiaddrs (Bitcoin-style cold-start). Only acts
+        // when an operator passes --dns-seed; DEFAULT_SEEDS stays empty.
+        for host in self.config.dns_seeds.iter() {
+            let hp = if host.contains(':') { host.clone() } else { format!("{host}:16110") };
+            match tokio::net::lookup_host(hp).await {
+                Ok(addrs) => {
+                    for sa in addrs {
+                        let ma = match sa.ip() {
+                            std::net::IpAddr::V4(v4) => format!("/ip4/{}/tcp/{}", v4, sa.port()),
+                            std::net::IpAddr::V6(v6) => format!("/ip6/{}/tcp/{}", v6, sa.port()),
+                        };
+                        info!("dns-seed {} → {}", host, ma);
+                        all_seeds.push(ma);
+                    }
+                }
+                Err(e) => warn!("dns-seed {}: resolve failed: {}", host, e),
+            }
+        }
         // Add CLI bootstrap peers + known peers
         all_seeds.extend(self.config.bootstrap_peers.iter().cloned());
         all_seeds.extend(known_peers.iter().cloned());
@@ -803,18 +853,77 @@ impl NetworkNode {
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .map(|d| d.as_secs()).unwrap_or(0),
                             };
+                            // Mesh fix (fresh-joiner IBD): these publishes were
+                            // silently discarded with `let _ =`. Two failure
+                            // modes were invisible in production: (a) publish
+                            // races the new peer's gossipsub Subscribe →
+                            // NoPeersSubscribedToTopic / not-yet-in-mesh, so the
+                            // joiner never receives the frame; (b) a byte-
+                            // identical PeerTip within duplicate_cache_time →
+                            // PublishError::Duplicate, dropped LOCALLY. Both are
+                            // now logged, and the Subscribed handler below
+                            // re-announces once the peer's subscription lands.
                             if let Ok(d) = bincode::serde::encode_to_vec(&version_msg, bincode::config::standard()) {
-                                let _ = swarm.behaviour_mut().gossipsub.publish(sync_t.clone(), d);
+                                if let Err(e) = swarm.behaviour_mut().gossipsub.publish(sync_t.clone(), d) {
+                                    info!("on-connect Version publish failed ({}); will re-announce when {} subscribes to sync", e, peer_id);
+                                }
                             }
                             // Announce our tip to trigger IBD. Sprint CC:
                             // fresh tip read from DAG, not the startup snapshot.
                             let my_tip = build_current_tip(&dag, &peer_id_str);
                             if let Ok(d) = bincode::serde::encode_to_vec(&my_tip, bincode::config::standard()) {
-                                let _ = swarm.behaviour_mut().gossipsub.publish(sync_t.clone(), d);
+                                if let Err(e) = swarm.behaviour_mut().gossipsub.publish(sync_t.clone(), d) {
+                                    info!("on-connect PeerTip publish failed ({}); will re-announce when {} subscribes to sync", e, peer_id);
+                                }
                             }
                             // PEX: request peer list from new connection
                             if let Ok(d) = bincode::serde::encode_to_vec(&NetworkMessage::PeerRequest, bincode::config::standard()) {
-                                let _ = swarm.behaviour_mut().gossipsub.publish(sync_t.clone(), d);
+                                if let Err(e) = swarm.behaviour_mut().gossipsub.publish(sync_t.clone(), d) {
+                                    debug!("on-connect PeerRequest publish failed: {}", e);
+                                }
+                            }
+                        }
+                        // Mesh fix (fresh-joiner IBD): the on-connect announce
+                        // above races the remote peer's Subscribe — until the
+                        // peer's subscription to the sync topic reaches us, any
+                        // publish either errors or is sent to a mesh the joiner
+                        // is not yet part of. THIS event is the moment the peer
+                        // provably subscribed, so re-announce the handshake and
+                        // tip here. The Version frame carries a fresh timestamp,
+                        // so its bytes — and therefore its MessageId — are
+                        // unique: it can never be Duplicate-dropped the way a
+                        // byte-identical PeerTip can, and main.rs treats a
+                        // Version with blue_score > ours as an IBD trigger.
+                        SwarmEvent::Behaviour(BlochBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed { peer_id, topic })) => {
+                            if topic == sync_t.hash() {
+                                let (v_score, v_height) = {
+                                    let d = dag.read();
+                                    (d.tip_blue_score(), d.block_count() as u64)
+                                };
+                                let ver = NetworkMessage::Version {
+                                    version:    PROTOCOL_VERSION,
+                                    user_agent: format!("bloch-layer/{}", env!("CARGO_PKG_VERSION")),
+                                    blue_score: v_score,
+                                    height:     v_height,
+                                    timestamp:  std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_secs()).unwrap_or(0),
+                                };
+                                if let Ok(d) = bincode::serde::encode_to_vec(&ver, bincode::config::standard()) {
+                                    match swarm.behaviour_mut().gossipsub.publish(sync_t.clone(), d) {
+                                        Ok(_)  => info!("→ {} subscribed to sync; announced tip score={} height={}", peer_id, v_score, v_height),
+                                        Err(e) => info!("post-subscribe Version publish failed: {} (periodic announce will retry)", e),
+                                    }
+                                }
+                                let my_tip = build_current_tip(&dag, &peer_id_str);
+                                if let Ok(d) = bincode::serde::encode_to_vec(&my_tip, bincode::config::standard()) {
+                                    if let Err(e) = swarm.behaviour_mut().gossipsub.publish(sync_t.clone(), d) {
+                                        // Duplicate is expected here when the tip
+                                        // hasn't moved since a recent announce;
+                                        // the Version above already carried it.
+                                        debug!("post-subscribe PeerTip publish: {}", e);
+                                    }
+                                }
                             }
                         }
                         SwarmEvent::ConnectionClosed { peer_id, .. } => {
@@ -976,7 +1085,39 @@ impl NetworkNode {
                             debug!("→ announcing tip: height={} score={}", height, blue_score);
                         }
                         if let Ok(d) = bincode::serde::encode_to_vec(&tip, bincode::config::standard()) {
-                            let _ = swarm.behaviour_mut().gossipsub.publish(sync_t.clone(), d);
+                            // Mesh fix: this error was silently discarded. On a
+                            // quiet chain the PeerTip bytes repeat, and with the
+                            // old 60s duplicate_cache_time this publish could
+                            // fail with PublishError::Duplicate every tick.
+                            if let Err(e) = swarm.behaviour_mut().gossipsub.publish(sync_t.clone(), d) {
+                                info!("tip announce publish failed: {} (peers={})", e, peer_count);
+                            }
+                        }
+                        // Mesh fix (dedup-proof announce): also publish a
+                        // Version frame each tick. Its `timestamp` field is
+                        // fresh, so the bytes — and the SHA-256 MessageId —
+                        // differ every announce; gossipsub can never dedup-drop
+                        // it, unlike a byte-identical PeerTip. main.rs treats a
+                        // Version whose blue_score exceeds ours as an IBD
+                        // trigger, so this is a guaranteed once-per-minute
+                        // "you are behind" signal to every meshed peer.
+                        let (v_score, v_height) = {
+                            let d = dag.read();
+                            (d.tip_blue_score(), d.block_count() as u64)
+                        };
+                        let ver = NetworkMessage::Version {
+                            version:    PROTOCOL_VERSION,
+                            user_agent: format!("bloch-layer/{}", env!("CARGO_PKG_VERSION")),
+                            blue_score: v_score,
+                            height:     v_height,
+                            timestamp:  std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs()).unwrap_or(0),
+                        };
+                        if let Ok(d) = bincode::serde::encode_to_vec(&ver, bincode::config::standard()) {
+                            if let Err(e) = swarm.behaviour_mut().gossipsub.publish(sync_t.clone(), d) {
+                                info!("version announce publish failed: {}", e);
+                            }
                         }
                     }
                 }

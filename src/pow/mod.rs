@@ -49,7 +49,7 @@ pub use bloch_sis_pow::CANONICAL_RESIDUAL_COEFFS;
 /// `bloch_crypto::core`, the consensus module `Block::validate_pow` lives in,
 /// so miner and validator provably share one selector). The activation height
 /// is a PLACEHOLDER the founder must set before the live deploy — see its doc.
-pub use bloch_crypto::core::{canonical_residual_coeffs, CANONICAL_K_ACTIVATION_HEIGHT};
+pub use bloch_crypto::core::{canonical_residual_coeffs, CANONICAL_K_ACTIVATION_HEIGHT, K_RULE_ACTIVATION_HEIGHT};
 
 /// GhostDAG accumulated-work contribution of a block at compact difficulty
 /// `bits`, computed from the **crate's** target semantics (consistent with
@@ -80,10 +80,27 @@ pub fn next_bits(
     parent_timestamp: u64,
     height: u64,
 ) -> u32 {
+    // Height-switched ASERT re-anchor (CONSENSUS-CRITICAL). Below
+    // ASERT_ANCHOR2_HEIGHT every node uses the genesis anchor the caller passed,
+    // so all historical `expected_bits` replay byte-identically. At/above it the
+    // schedule re-anchors to a fresh (height, timestamp, bits) reference: this
+    // resets the ~62-day schedule debt the genesis anchor had accumulated (which,
+    // with the ±4× cap, had pinned difficulty far below the real hashrate and let
+    // block production run away) and — via the wide bound in `asert_next_bits`
+    // for anchor_height > 0 — lets difficulty track hashrate freely from here.
+    let (a_bits, a_ts, a_height) = if height >= bloch_crypto::core::ASERT_ANCHOR2_HEIGHT {
+        (
+            bloch_crypto::core::ASERT_ANCHOR2_BITS,
+            bloch_crypto::core::ASERT_ANCHOR2_TIMESTAMP as i64,
+            bloch_crypto::core::ASERT_ANCHOR2_HEIGHT,
+        )
+    } else {
+        (anchor_bits, anchor_timestamp as i64, 0)
+    };
     bloch_sis_pow::difficulty::asert_next_bits(
-        anchor_bits,
-        anchor_timestamp as i64,
-        0, // anchor height = genesis
+        a_bits,
+        a_ts,
+        a_height,
         parent_timestamp as i64,
         height,
     )
@@ -144,7 +161,7 @@ pub fn verify_sis_pow(
         nonce,
         solution,
         &target,
-        canonical_residual_coeffs(height),
+        canonical_residual_coeffs(height, bits),
     )
 }
 
@@ -166,7 +183,7 @@ pub fn mine_sis_pow(
     mine_sis_pow_regime(
         pow_preimage,
         bits,
-        canonical_residual_coeffs(height),
+        canonical_residual_coeffs(height, bits),
         start_nonce,
         max_attempts,
     )
@@ -252,6 +269,30 @@ mod tests {
         assert!(verify_sis_pow_testnet(preimage, nonce.wrapping_add(1), &s, bits).is_err());
     }
 
+    #[test]
+    fn next_bits_reanchors_at_asert_anchor2_height() {
+        use bloch_crypto::core::{
+            ASERT_ANCHOR2_HEIGHT, ASERT_ANCHOR2_TIMESTAMP, ASERT_ANCHOR2_BITS,
+        };
+        // At/above ASERT_ANCHOR2_HEIGHT the re-anchor governs and the passed
+        // (genesis) anchor is ignored — two very different passed anchors yield
+        // identical bits.
+        let a = next_bits(0x2100ffff, 1_000, ASERT_ANCHOR2_TIMESTAMP, ASERT_ANCHOR2_HEIGHT);
+        let b = next_bits(0x1c3a0000, 9_999, ASERT_ANCHOR2_TIMESTAMP, ASERT_ANCHOR2_HEIGHT);
+        assert_eq!(a, b, "at ANCHOR2 the passed anchor must be ignored (re-anchored)");
+        // On-schedule at the anchor (parent stamped at the anchor ts) → the
+        // schedule deviation is zero, so the target is the anchor target and
+        // bits round-trip to ASERT_ANCHOR2_BITS.
+        assert_eq!(
+            a, target_to_bits(&bits_to_target(ASERT_ANCHOR2_BITS)),
+            "on-schedule at ANCHOR2 must reproduce ANCHOR2 bits"
+        );
+        // One block below, the switch is inactive: the passed genesis anchor
+        // still governs, so the result is NOT the re-anchored bits.
+        let below = next_bits(0x2100ffff, 1_000, ASERT_ANCHOR2_TIMESTAMP, ASERT_ANCHOR2_HEIGHT - 1);
+        assert_ne!(below, a, "below ANCHOR2 must not use the re-anchor");
+    }
+
     /// Soft fork SF-1: fixed preimage for the height-aware k=8 e2e test.
     const K8_E2E_PREIMAGE: &[u8] = b"bloch-sf1-k8-e2e-preimage";
 
@@ -267,15 +308,16 @@ mod tests {
     const K8_E2E_START_NONCE: u64 = 4058; // found at attempt 2662 of 4096
 
     #[test]
-    fn canonical_residual_coeffs_gates_at_activation_height() {
-        // (c) the selector: 4 below H, 8 at/above H. The selector itself lives
-        // in bloch_crypto::core (same function Block::validate_pow calls);
-        // this pins the re-export the mining/verify seam uses.
-        let h = CANONICAL_K_ACTIVATION_HEIGHT;
-        assert_eq!(canonical_residual_coeffs(0), TESTNET_RESIDUAL_COEFFS);
-        assert_eq!(canonical_residual_coeffs(h - 1), TESTNET_RESIDUAL_COEFFS);
-        assert_eq!(canonical_residual_coeffs(h), CANONICAL_RESIDUAL_COEFFS);
-        assert_eq!(canonical_residual_coeffs(h + 1), CANONICAL_RESIDUAL_COEFFS);
+    fn canonical_residual_coeffs_difficulty_driven_via_reexport() {
+        // Pins the re-export the mining/verify seam uses. The selector (same fn
+        // Block::validate_pow calls) is difficulty-driven: k=4 below the rule
+        // activation at ANY bits; at/above it, k rides the block's ASERT
+        // difficulty — low difficulty stays k=4, a hard target reaches k=8.
+        let a = K_RULE_ACTIVATION_HEIGHT;
+        assert_eq!(canonical_residual_coeffs(0, 0x0500ffff), TESTNET_RESIDUAL_COEFFS);
+        assert_eq!(canonical_residual_coeffs(a - 1, 0x0500ffff), TESTNET_RESIDUAL_COEFFS);
+        assert_eq!(canonical_residual_coeffs(a, 0x203fffc0), TESTNET_RESIDUAL_COEFFS);
+        assert_eq!(canonical_residual_coeffs(a, 0x0500ffff), CANONICAL_RESIDUAL_COEFFS);
         assert_eq!(TESTNET_RESIDUAL_COEFFS, 4);
         assert_eq!(CANONICAL_RESIDUAL_COEFFS, 8);
     }

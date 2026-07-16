@@ -248,7 +248,15 @@ pub fn asert_next_bits(
     let factor_log2_milli = (exp_num * 1000) / ASERT_HALFLIFE;
 
     let anchor_target = bits_to_target(anchor_bits);
-    let new_target = scale_target_by_pow2_milli(&anchor_target, factor_log2_milli);
+    // The historical genesis-anchored regime (anchor_height == 0) keeps the
+    // ±4× absolute bound so every replayed block's `expected_bits` stays
+    // byte-identical (VULN-01 resync check). A *re-anchored* regime
+    // (anchor_height > 0) instead gets a wide sanity bound so ASERT can track
+    // real hashrate from the fresh schedule — the ±4× cap is what let block
+    // production run away once the k throughput filter was relaxed, and would
+    // also cap difficulty at 4× the anchor forever (ASICs/FPGA can't be tracked).
+    let bound_milli: i64 = if anchor_height > 0 { 260_000 } else { 2_000 };
+    let new_target = scale_target_by_pow2_milli(&anchor_target, factor_log2_milli, bound_milli);
 
     target_to_bits(&new_target)
 }
@@ -259,11 +267,12 @@ pub fn asert_next_bits(
 /// Internally: the integer part becomes a true **bit** shift of the 256-bit
 /// target (2^int_part), and the fractional part a small multiplicative
 /// correction factor in 16-bit fixed point.
-fn scale_target_by_pow2_milli(target: &Target, exponent_milli: i64) -> Target {
-    // Clamp to avoid extreme adjustments per single retarget.
-    let max_milli =  2_000; // 2.0 in milli units → factor 4
-    let min_milli = -2_000; // -2.0 → factor 1/4
-    let e_milli = exponent_milli.clamp(min_milli, max_milli);
+fn scale_target_by_pow2_milli(target: &Target, exponent_milli: i64, bound_milli: i64) -> Target {
+    // Bound the exponent. The genesis regime passes ±2_000 (the historical ±4×
+    // cap, preserved for replay-identical expected_bits); the re-anchored regime
+    // passes a wide bound (~±256 bits) so ASERT can track hashrate freely.
+    // Saturation to MAX / MIN below handles anything past the bound.
+    let e_milli = exponent_milli.clamp(-bound_milli, bound_milli);
 
     // Decompose into integer bits and fractional milli-bits.
     let int_part  = e_milli.div_euclid(1000) as i32;
@@ -278,16 +287,20 @@ fn scale_target_by_pow2_milli(target: &Target, exponent_milli: i64) -> Target {
     // Integer part: a TRUE bit shift of the 256-bit target by 2^int_part —
     // NOT a byte shift. The old byte-shift multiplied by 256^int_part, so the
     // documented ±4× per-step clamp was really ±65536×, silently collapsing
-    // difficulty once the chain drifted off schedule. int_part ∈ [-2, 2] after
-    // the ±2000-milli clamp, i.e. at most two doublings/halvings.
+    // difficulty once the chain drifted off schedule. In the genesis regime
+    // int_part ∈ [-2, 2] (±2000-milli bound); in a re-anchored regime it can
+    // reach ±256 as ASERT tracks large hashrate swings, so the shift count is
+    // capped at 255 — a 256-bit target shifted 256 places has already saturated
+    // to MAX (easier) or MIN=0 (harder).
+    let shift = (int_part.unsigned_abs()).min(255);
     let mut t = target.0;
     if int_part > 0 {
-        for _ in 0..int_part {
+        for _ in 0..shift {
             // Left shift = larger target = easier; overflow saturates to MAX.
             if mul2_be(&mut t) { return Target([0xFFu8; AUX_HASH_LEN]); }
         }
     } else if int_part < 0 {
-        for _ in 0..(-int_part) {
+        for _ in 0..shift {
             // Right shift = smaller target = harder.
             div2_be(&mut t);
         }
@@ -348,19 +361,37 @@ mod tests {
 
         // +1000 milli = 2^1 → exactly one left bit-shift (frac factor is identity
         // at whole-bit exponents).
-        let doubled = scale_target_by_pow2_milli(&target, 1000);
+        let doubled = scale_target_by_pow2_milli(&target, 1000, 2_000);
         let mut exp = t; mul2_be(&mut exp);
         assert_eq!(doubled.0, exp, "int_part=+1 must be ×2 (one bit), not ×256");
 
         // -1000 milli = 2^-1 → one right bit-shift.
-        let halved = scale_target_by_pow2_milli(&target, -1000);
+        let halved = scale_target_by_pow2_milli(&target, -1000, 2_000);
         let mut exph = t; div2_be(&mut exph);
         assert_eq!(halved.0, exph, "int_part=-1 must be ÷2 (one bit)");
 
-        // Off-schedule blow-up clamps at ±2000 milli = ×4, NEVER ×65536.
-        let quad = scale_target_by_pow2_milli(&target, 999_999);
+        // Genesis regime (bound 2_000): off-schedule blow-up clamps at ×4.
+        let quad = scale_target_by_pow2_milli(&target, 999_999, 2_000);
         let mut exp4 = t; mul2_be(&mut exp4); mul2_be(&mut exp4);
-        assert_eq!(quad.0, exp4, "single-step easing must cap at ×4");
+        assert_eq!(quad.0, exp4, "genesis-regime single-step easing must cap at ×4");
+    }
+
+    #[test]
+    fn scale_wide_bound_tracks_beyond_4x() {
+        // Re-anchored regime (wide bound): difficulty must be able to move far
+        // past ±4× so ASERT can track large hashrate swings (ASICs/FPGA). Six
+        // whole bit-shifts harder (−6000 milli) with a wide bound = ÷64, which
+        // the old ±2000 bound could never reach.
+        let mut t = [0u8; 32];
+        t[10] = 0xFF; t[11] = 0xFF; // mid-range target, room to shift both ways
+        let target = Target(t);
+        let harder = scale_target_by_pow2_milli(&target, -6000, 260_000);
+        let mut exp = t; for _ in 0..6 { div2_be(&mut exp); }
+        assert_eq!(harder.0, exp, "wide bound must allow ÷64 (6 bit-shifts harder)");
+        // The same exponent under the genesis bound stays capped at ÷4.
+        let capped = scale_target_by_pow2_milli(&target, -6000, 2_000);
+        let mut exp2 = t; div2_be(&mut exp2); div2_be(&mut exp2);
+        assert_eq!(capped.0, exp2, "genesis bound still caps at ÷4");
     }
 
     /// Audit fix: invalid compact bits must be a hard error from the checked
