@@ -49,7 +49,7 @@ pub use bloch_sis_pow::CANONICAL_RESIDUAL_COEFFS;
 /// `bloch_crypto::core`, the consensus module `Block::validate_pow` lives in,
 /// so miner and validator provably share one selector). The activation height
 /// is a PLACEHOLDER the founder must set before the live deploy — see its doc.
-pub use bloch_crypto::core::{canonical_residual_coeffs, CANONICAL_K_ACTIVATION_HEIGHT};
+pub use bloch_crypto::core::{canonical_residual_coeffs, CANONICAL_K_ACTIVATION_HEIGHT, K_RULE_ACTIVATION_HEIGHT};
 
 /// GhostDAG accumulated-work contribution of a block at compact difficulty
 /// `bits`, computed from the **crate's** target semantics (consistent with
@@ -144,7 +144,7 @@ pub fn verify_sis_pow(
         nonce,
         solution,
         &target,
-        canonical_residual_coeffs(height),
+        canonical_residual_coeffs(height, bits),
     )
 }
 
@@ -166,7 +166,7 @@ pub fn mine_sis_pow(
     mine_sis_pow_regime(
         pow_preimage,
         bits,
-        canonical_residual_coeffs(height),
+        canonical_residual_coeffs(height, bits),
         start_nonce,
         max_attempts,
     )
@@ -267,15 +267,16 @@ mod tests {
     const K8_E2E_START_NONCE: u64 = 4058; // found at attempt 2662 of 4096
 
     #[test]
-    fn canonical_residual_coeffs_gates_at_activation_height() {
-        // (c) the selector: 4 below H, 8 at/above H. The selector itself lives
-        // in bloch_crypto::core (same function Block::validate_pow calls);
-        // this pins the re-export the mining/verify seam uses.
-        let h = CANONICAL_K_ACTIVATION_HEIGHT;
-        assert_eq!(canonical_residual_coeffs(0), TESTNET_RESIDUAL_COEFFS);
-        assert_eq!(canonical_residual_coeffs(h - 1), TESTNET_RESIDUAL_COEFFS);
-        assert_eq!(canonical_residual_coeffs(h), CANONICAL_RESIDUAL_COEFFS);
-        assert_eq!(canonical_residual_coeffs(h + 1), CANONICAL_RESIDUAL_COEFFS);
+    fn canonical_residual_coeffs_difficulty_driven_via_reexport() {
+        // Pins the re-export the mining/verify seam uses. The selector (same fn
+        // Block::validate_pow calls) is difficulty-driven: k=4 below the rule
+        // activation at ANY bits; at/above it, k rides the block's ASERT
+        // difficulty — low difficulty stays k=4, a hard target reaches k=8.
+        let a = K_RULE_ACTIVATION_HEIGHT;
+        assert_eq!(canonical_residual_coeffs(0, 0x0500ffff), TESTNET_RESIDUAL_COEFFS);
+        assert_eq!(canonical_residual_coeffs(a - 1, 0x0500ffff), TESTNET_RESIDUAL_COEFFS);
+        assert_eq!(canonical_residual_coeffs(a, 0x203fffc0), TESTNET_RESIDUAL_COEFFS);
+        assert_eq!(canonical_residual_coeffs(a, 0x0500ffff), CANONICAL_RESIDUAL_COEFFS);
         assert_eq!(TESTNET_RESIDUAL_COEFFS, 4);
         assert_eq!(CANONICAL_RESIDUAL_COEFFS, 8);
     }

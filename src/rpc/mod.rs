@@ -691,7 +691,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 // block THIS TEMPLATE mines (k = 4 below the activation
                 // height, k = 8 at/above), so pool software that honors this
                 // field mines witnesses `validate_pow` will actually accept.
-                "residual_coeffs":      crate::pow::canonical_residual_coeffs(height),
+                "residual_coeffs":      crate::pow::canonical_residual_coeffs(height, bits),
             })
         }
 
