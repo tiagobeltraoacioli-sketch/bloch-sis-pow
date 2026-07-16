@@ -22,6 +22,9 @@ use serde::{Serialize, Deserialize};
 use log::warn;
 use crate::core::GHOSTDAG_K;
 
+pub mod reachability;
+use reachability::ReachabilityStore;
+
 // ── Types ────────────────────────────────────────────────────────────────────
 
 pub type BlockHash = [u8; 32];
@@ -484,18 +487,75 @@ fn topological_sort(store: &DagStore, blocks: Vec<BlockHash>) -> Vec<BlockHash> 
 
 // ── GhostDAG protocol ────────────────────────────────────────────────────────
 
+/// Selects how `classify_mergeset` computes the blue/red partition.
+///
+/// # SAFETY / consensus status
+///
+/// `Legacy` is the byte-for-byte, currently-deployed mainnet-beta behavior:
+/// bounded `is_ancestor` BFS + `k*100`-bounded `past_blue_set`. It is the
+/// default for every live constructor and MUST stay the default until a
+/// differential replay over the real ≥397k history proves `Fast` is
+/// byte-identical.
+///
+/// `Fast` routes all ancestry queries through the interval reachability index
+/// (`reachability::ReachabilityStore`), removing the bounded BFS. It is
+/// **result-identical to `Legacy` on every DAG where the legacy bound never
+/// bit**, and is exercised by `tests/ghostdag_differential.rs`. Where the two
+/// diverge, the legacy (bug-compatible) answer is the consensus-correct one to
+/// keep; adopting `Fast`'s answer there would be a FORK and requires an
+/// activation-height gate. `Fast` is therefore an opt-in mode, never selected
+/// on the live path in this change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColoringMode {
+    /// Deployed behavior — bounded BFS. Default everywhere.
+    Legacy,
+    /// Interval-index-backed unbounded coloring. Opt-in / test-only.
+    Fast,
+}
+
 pub struct GhostDAG {
     pub k: usize,
     pub store: DagStore,
+    /// Coloring strategy. Defaults to `Legacy` (unchanged mainnet behavior).
+    pub coloring: ColoringMode,
+    /// Interval reachability index. Maintained only while `coloring == Fast`;
+    /// left empty (zero overhead) in `Legacy` mode. Never consensus state.
+    reach: ReachabilityStore,
 }
 
 impl GhostDAG {
     pub fn with_default_k() -> Self {
-        Self { k: GHOSTDAG_K, store: DagStore::new() }
+        Self {
+            k: GHOSTDAG_K,
+            store: DagStore::new(),
+            coloring: ColoringMode::Legacy,
+            reach: ReachabilityStore::new(),
+        }
     }
 
     pub fn with_k(k: usize) -> Self {
-        Self { k, store: DagStore::new() }
+        Self {
+            k,
+            store: DagStore::new(),
+            coloring: ColoringMode::Legacy,
+            reach: ReachabilityStore::new(),
+        }
+    }
+
+    /// Test/benchmark constructor: same as `with_k` but selects the `Fast`
+    /// (interval-index) coloring mode. NOT for live use — see [`ColoringMode`].
+    pub fn with_k_fast(k: usize) -> Self {
+        Self {
+            k,
+            store: DagStore::new(),
+            coloring: ColoringMode::Fast,
+            reach: ReachabilityStore::new(),
+        }
+    }
+
+    /// Read-only handle to the reachability index (for tests/diagnostics).
+    pub fn reachability(&self) -> &ReachabilityStore {
+        &self.reach
     }
 
     /// Add genesis block
@@ -512,6 +572,9 @@ impl GhostDAG {
             timestamp,
         };
         self.store.genesis = Some(hash);
+        if self.coloring == ColoringMode::Fast {
+            self.reach.add_genesis(hash);
+        }
         self.store.insert(hash, data);
     }
 
@@ -672,9 +735,16 @@ impl GhostDAG {
         // 3. Compute mergeset (topologically sorted, ancestors first)
         let mergeset = compute_mergeset(&self.store, &parents, &selected_parent);
 
-        // 4. Classify mergeset blocks as blue or red using PHANTOM constraint
+        // 4. Classify mergeset blocks as blue or red using PHANTOM constraint.
+        //    In Fast mode the reachability index must contain every existing
+        //    block before classification queries it; the index is maintained
+        //    incrementally, so it already does. `hash` itself is not queried
+        //    during its own classification, so we register it afterwards.
         let (mergeset_blues, mergeset_reds, blues_anticone_sizes) =
-            self.classify_mergeset(&mergeset, &selected_parent);
+            match self.coloring {
+                ColoringMode::Legacy => self.classify_mergeset(&mergeset, &selected_parent),
+                ColoringMode::Fast => self.classify_mergeset_fast(&mergeset, &selected_parent),
+            };
 
         // 5. Compute blue_score and blue_work
         let blue_score = sp_data.blue_score + mergeset_blues.len() as u64 + 1;
@@ -693,6 +763,13 @@ impl GhostDAG {
             height,
             timestamp,
         };
+
+        // Maintain the reachability index (Fast mode only). Register `hash`
+        // now, after classification, before it is inserted into the store — so
+        // subsequent blocks can query its ancestry.
+        if self.coloring == ColoringMode::Fast {
+            self.reach.add_block(hash, &selected_parent, &mergeset);
+        }
 
         let result = data.clone();
         self.store.insert(hash, data);
@@ -732,6 +809,13 @@ impl GhostDAG {
             Some(d) => d,
             None => return false,
         };
+        // Keep the reachability index consistent (Fast mode only). The mergeset
+        // used at insert time is recoverable as blues ∪ reds.
+        if self.coloring == ColoringMode::Fast {
+            let mut mergeset = data.mergeset_blues.clone();
+            mergeset.extend_from_slice(&data.mergeset_reds);
+            self.reach.remove_leaf(hash, &mergeset);
+        }
         self.store.tips.remove(hash);
         self.store.children.remove(hash);
         // Exact inverse of `DagStore::insert`: drop the child edge from each
@@ -842,6 +926,87 @@ impl GhostDAG {
         }
 
         (mergeset_blues, mergeset_reds, blues_anticone_sizes)
+    }
+
+    /// Fast, interval-index-backed twin of [`classify_mergeset`].
+    ///
+    /// This is a **line-for-line structural copy** of `classify_mergeset` — the
+    /// same blue-set seeding via `past_blue_set` (with its `k*100` bound
+    /// preserved verbatim), the same topological candidate order, the same
+    /// whole-blue-set `blues_anticone_sizes` map shape — with exactly ONE
+    /// difference: every "is X in the anticone of Y?" test routes through the
+    /// O(1)/O(log n) reachability index instead of the bounded backwards BFS in
+    /// `is_ancestor`.
+    ///
+    /// Consequence: for any DAG on which the legacy bounded BFS never returns a
+    /// false negative, this produces a BYTE-IDENTICAL `GhostdagData`. Where the
+    /// legacy bound *did* bite, the two differ — and that difference is a
+    /// consensus question (see [`ColoringMode`]), which is why this path is
+    /// opt-in and the divergence is measured by the differential test rather
+    /// than silently adopted.
+    fn classify_mergeset_fast(
+        &self,
+        mergeset: &[BlockHash],
+        selected_parent: &BlockHash,
+    ) -> (Vec<BlockHash>, Vec<BlockHash>, HashMap<BlockHash, usize>) {
+        // Seed identically to the legacy path — SAME bounded past_blue_set, so
+        // the persisted map shape is preserved byte-for-byte.
+        let mut blue_set: HashSet<BlockHash> = self.past_blue_set(selected_parent);
+        blue_set.insert(*selected_parent);
+
+        let mut blues_anticone_sizes: HashMap<BlockHash, usize> = HashMap::new();
+
+        let mut mergeset_blues = Vec::new();
+        let mut mergeset_reds = Vec::new();
+
+        for b in &blue_set {
+            blues_anticone_sizes.insert(*b, 0);
+        }
+
+        for &candidate in mergeset {
+            let candidate_anticone_in_blue = blue_set.iter()
+                .filter(|&b| self.is_in_anticone_fast(&candidate, b))
+                .count();
+
+            if candidate_anticone_in_blue > self.k {
+                mergeset_reds.push(candidate);
+                continue;
+            }
+
+            let mut constraint_b_ok = true;
+            for (&blue_block, &current_anticone_size) in &blues_anticone_sizes {
+                let in_anticone = self.is_in_anticone_fast(&candidate, &blue_block);
+                if in_anticone && current_anticone_size + 1 > self.k {
+                    constraint_b_ok = false;
+                    break;
+                }
+            }
+
+            if !constraint_b_ok {
+                mergeset_reds.push(candidate);
+                continue;
+            }
+
+            mergeset_blues.push(candidate);
+            blue_set.insert(candidate);
+            blues_anticone_sizes.insert(candidate, candidate_anticone_in_blue);
+
+            for (&blue_block, anticone_size) in blues_anticone_sizes.iter_mut() {
+                if blue_block != candidate && self.is_in_anticone_fast(&candidate, &blue_block) {
+                    *anticone_size += 1;
+                }
+            }
+        }
+
+        (mergeset_blues, mergeset_reds, blues_anticone_sizes)
+    }
+
+    /// Anticone test via the reachability index. Semantically identical to
+    /// [`is_in_anticone`] but backed by the unbounded interval index rather
+    /// than the bounded BFS.
+    fn is_in_anticone_fast(&self, a: &BlockHash, b: &BlockHash) -> bool {
+        if a == b { return false; }
+        !self.reach.is_dag_ancestor(a, b) && !self.reach.is_dag_ancestor(b, a)
     }
 
     /// Compute |anticone(candidate) ∩ blue_set|
