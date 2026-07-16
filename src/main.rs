@@ -596,6 +596,19 @@ async fn main() {
                     if entries.is_empty() {
                         state2.write().is_syncing = false;
                         info!("IBD complete");
+                    } else if entries.len() >= 500 {
+                        // Pipeline IBD: a full batch means the serving peer has
+                        // more. Re-request the next batch IMMEDIATELY from the
+                        // highest blue_score we just learned, instead of waiting
+                        // for the 30s nudge. Turns IBD from ~500 headers / 30s
+                        // into a continuous stream so a node thousands of blocks
+                        // behind converges in seconds, not minutes. At parity
+                        // the batch comes back < 500 (or empty) and the stream
+                        // stops, so steady-state cost is zero.
+                        let next_from = entries.iter().map(|e| e.blue_score).max().unwrap_or(0);
+                        let _ = otx2.send(network::NetworkMessage::GetHeaders {
+                            from_blue_score: next_from, limit: 500,
+                        }).await;
                     }
                 }
 
@@ -674,7 +687,23 @@ async fn main() {
                                 debug!("orphan block h={} (missing {} parents), buffered (pool={})",
                                     height, missing_parents.len(), orphans.len() + 1);
                                 for mp in &missing_parents {
+                                    let first_waiter = !waiting_for.contains_key(mp);
                                     waiting_for.entry(*mp).or_default().insert(block_hash);
+                                    // Kaspa-style recursive ancestor resolution
+                                    // (RequestRelayBlocks): explicitly request each
+                                    // missing parent so the past cone closes even
+                                    // when IBD-by-blue_score hasn't reached this
+                                    // branch. Without this the orphan waits forever
+                                    // and the node silently partitions onto a
+                                    // sub-DAG. Skip parents already buffered or
+                                    // already awaited (their arrival chains the next
+                                    // request), so a deep gap fans out one level at a
+                                    // time instead of duplicating GetBlocks.
+                                    if first_waiter && !orphans.contains_key(mp) {
+                                        let _ = otx2.send(network::NetworkMessage::GetBlock {
+                                            block_hash: *mp,
+                                        }).await;
+                                    }
                                 }
                                 orphans.insert(block_hash, (block, block_data, height));
                                 continue;
@@ -908,6 +937,19 @@ async fn main() {
             // transition back to ready so operators see the transition.
             let mut was_syncing_last_tick: bool = false;
             let mut warned_no_peers: bool = false;
+            // Sync-stall release: is_syncing pauses mining during genuine IBD,
+            // but must never latch forever. If the tip has not advanced for
+            // SYNC_STALL_SECS while syncing — peers cannot deliver the announced
+            // best_seen tip (e.g. the whole network is wedged behind the
+            // reachability perf wall) — resume mining on the best local tip.
+            // is_syncing STAYS true so the IBD nudge keeps pulling; PoW advances
+            // the chain in the meantime and we reorg to any heavier chain the
+            // instant its blocks arrive. This is what stops a network-wide
+            // freeze from being permanent.
+            const SYNC_STALL_SECS: u64 = 90;
+            let mut last_seen_tip: u64 = dag_m.read().tip_blue_score();
+            let mut last_tip_advance = std::time::Instant::now();
+            let mut warned_stall_release: bool = false;
             loop {
                 // Fresh-miner fork guard (see wants_to_join above): a node told
                 // to join a network but with 0 peers so far must not mine — it
@@ -948,7 +990,18 @@ async fn main() {
                 // direction so operators can see when IBD started and
                 // when mining resumed.
                 let syncing_now = state_m.read().is_syncing;
-                if syncing_now {
+                // Track tip progress for the sync-stall release.
+                {
+                    let cur_tip = dag_m.read().tip_blue_score();
+                    if cur_tip > last_seen_tip {
+                        last_seen_tip = cur_tip;
+                        last_tip_advance = std::time::Instant::now();
+                        warned_stall_release = false;
+                    }
+                }
+                let sync_stalled = last_tip_advance.elapsed()
+                    >= std::time::Duration::from_secs(SYNC_STALL_SECS);
+                if syncing_now && !sync_stalled {
                     if !was_syncing_last_tick {
                         info!("⛏  IBD in progress — miner paused, will resume when sync completes");
                         was_syncing_last_tick = true;
@@ -956,7 +1009,12 @@ async fn main() {
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     continue;
                 }
-                if was_syncing_last_tick {
+                if syncing_now && sync_stalled && !warned_stall_release {
+                    warn!("⛏  sync stalled {}s at tip {} (announced best_seen unreachable) — resuming mining on best local tip; will reorg when heavier blocks arrive",
+                        SYNC_STALL_SECS, last_seen_tip);
+                    warned_stall_release = true;
+                }
+                if was_syncing_last_tick && !syncing_now {
                     info!("⛏  IBD complete — miner resumed at tip");
                     was_syncing_last_tick = false;
                 }
