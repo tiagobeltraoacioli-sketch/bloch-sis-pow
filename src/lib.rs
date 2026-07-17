@@ -52,6 +52,8 @@ pub mod attestation;  // Bloch-SIS-Linux L3 — pluggable remote attestation
 pub mod coherence;    // Coherence C2 — shielded pool (notes, tree, spend statement)
 #[cfg(feature = "node")]
 pub mod dandelion;    // Coherence P3 — Dandelion++ tx-relay metadata privacy
+#[cfg(feature = "node")]
+pub mod sync;         // Phase 2 — drop-in Kaspa sync-negotiation layer (frontier reconciliation)
 
 /// Convenience re-exports for consumers of the library (wallet UIs,
 /// block explorers, etc.). Import with `use bloch::prelude::*`.

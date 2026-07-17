@@ -61,6 +61,12 @@ pub enum NetworkMessage {
     GetHeaders { from_blue_score: u64, limit: u32 },
     Headers    { entries: Vec<SyncEntry> },
     GetBlock   { block_hash: [u8; 32] },
+    // Frontier reconciliation (Phase 2 Kaspa sync-negotiation layer)
+    /// Frontier reconciliation: request the peer's DAG frontier. No payload —
+    /// broadcast on the sync topic; every peer replies with Tips.
+    GetTips,
+    /// Frontier reconciliation reply: full DAG frontier + selected-chain locator.
+    Tips { tips: Vec<SyncEntry>, locator: Vec<[u8; 32]> },
     // Protocol handshake
     Version {
         version:    u32,
@@ -114,6 +120,10 @@ pub const MAX_WIRE_ADDR_LEN: usize = 512;
 /// Max SyncEntry items in a Headers frame. IBD requests batches of 500
 /// (see main.rs GetHeaders); 2000 leaves headroom.
 pub const MAX_WIRE_SYNC_ENTRIES: usize = 2000;
+/// Max tip entries in a Tips frame. MUST equal sync::MAX_ADVERTISED_TIPS.
+pub const MAX_WIRE_TIPS: usize = 256;
+/// Max locator hashes in a Tips frame. MUST equal locator::MAX_LOCATOR_LEN.
+pub const MAX_WIRE_LOCATOR: usize = 64;
 /// Max `limit` a peer may request via GetHeaders (bounds the work WE do
 /// serving the response).
 pub const MAX_WIRE_GETHEADERS_LIMIT: u32 = 2000;
@@ -221,6 +231,14 @@ fn validate_wire_bounds(msg: &NetworkMessage) -> Result<(), WireDecodeError> {
                 return Err(Bounds("Headers entries longer than MAX_WIRE_SYNC_ENTRIES"));
             }
         }
+        NetworkMessage::Tips { tips, locator } => {
+            if tips.len() > MAX_WIRE_TIPS {
+                return Err(Bounds("Tips tips longer than MAX_WIRE_TIPS"));
+            }
+            if locator.len() > MAX_WIRE_LOCATOR {
+                return Err(Bounds("Tips locator longer than MAX_WIRE_LOCATOR"));
+            }
+        }
         NetworkMessage::Version { user_agent, .. } => {
             if user_agent.len() > MAX_WIRE_USER_AGENT_LEN {
                 return Err(Bounds("user_agent longer than MAX_WIRE_USER_AGENT_LEN"));
@@ -228,6 +246,7 @@ fn validate_wire_bounds(msg: &NetworkMessage) -> Result<(), WireDecodeError> {
         }
         NetworkMessage::PeerRequest
         | NetworkMessage::VersionAck
+        | NetworkMessage::GetTips
         | NetworkMessage::GetBlock { .. } => {}
     }
     Ok(())
@@ -350,7 +369,9 @@ impl NetworkNode {
         block_tx:       mpsc::Sender<NetworkMessage>,
         mut outbound_rx: mpsc::Receiver<NetworkMessage>,
         dag:            std::sync::Arc<parking_lot::RwLock<crate::consensus::GhostDAG>>,
+        peer_state:     std::sync::Arc<crate::sync::peer_state::PeerStateTable>,
     ) -> Result<(), NetworkError> {
+        use std::time::Instant;
         // Audit M-10 fix: previously used std::hash::DefaultHasher, whose
         // output is not stable across Rust versions (see the SipHasher13
         // -> FxHash transition history). Two nodes on different Rust
@@ -691,16 +712,31 @@ impl NetworkNode {
                                             info!("← block h={} {}", height, hex::encode(&block_hash[..8]));
                                         });
                                     }
-                                    NetworkMessage::PeerTip { peer_id, blue_score, .. } =>
-                                        debug!("← tip from {} score={}", peer_id, blue_score),
+                                    NetworkMessage::PeerTip { peer_id, blue_score, height } => {
+                                        debug!("← tip from {} score={}", peer_id, blue_score);
+                                        // Phase-2: record the untrusted announced hint (no tips).
+                                        peer_state.observe(propagation_source, *blue_score, *height, &[], Instant::now());
+                                    }
                                     NetworkMessage::Headers { entries } =>
                                         info!("← {} headers", entries.len()),
-                                    NetworkMessage::Version { version, user_agent, .. } => {
+                                    NetworkMessage::Tips { tips, .. } => {
+                                        // Phase-2 frontier reconciliation hint: record the peer's
+                                        // advertised DAG frontier + its highest announced score.
+                                        let hashes: Vec<[u8; 32]> = tips.iter().map(|e| e.hash).collect();
+                                        let (bs, ht) = tips.iter()
+                                            .map(|e| (e.blue_score, e.height))
+                                            .max_by_key(|(s, _)| *s)
+                                            .unwrap_or((0, 0));
+                                        peer_state.observe(propagation_source, bs, ht, &hashes, Instant::now());
+                                    }
+                                    NetworkMessage::Version { version, user_agent, blue_score, height, .. } => {
                                         if *version < MIN_PROTOCOL_VERSION {
                                             warn!("← incompatible version {} from {}", version, user_agent);
                                         } else {
                                             debug!("← version {} ({})", version, user_agent);
                                         }
+                                        // Phase-2: record the untrusted announced hint (no tips).
+                                        peer_state.observe(propagation_source, *blue_score, *height, &[], Instant::now());
                                     }
                                     NetworkMessage::PeerRequest => {
                                         let mut my_peers: Vec<String> = known_peers.iter().cloned().collect();
@@ -801,6 +837,7 @@ impl NetworkNode {
                             swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                             peer_count += 1;
                             crate::metrics::set_peer_count(peer_count as i64);
+                            peer_state.on_connect(peer_id, Instant::now());
                             // FIX v0.5.1: Re-announce subscriptions to new peer.
                             // gossipsub only announces subs on initial connect,
                             // but peer_score can ghost peers from mesh. Force
@@ -930,6 +967,7 @@ impl NetworkNode {
                             info!("✗ disconnected: {}", peer_id);
                             peer_count = peer_count.saturating_sub(1);
                             crate::metrics::set_peer_count(peer_count as i64);
+                            peer_state.on_disconnect(&peer_id);
                         }
                         SwarmEvent::NewListenAddr { address, .. } =>
                             info!("listening: {}/p2p/{}", address, self.peer_id),

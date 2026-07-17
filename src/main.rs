@@ -35,6 +35,7 @@ mod coherence;    // Coherence C2 shielded pool
 mod dandelion;    // Coherence P3 Dandelion++ tx-relay privacy
 mod stratum;  // Sprint AA.1 — stratum V1 mining server
 mod stratum_v2;   // Sprint 10-alpha — stratum V2 mining server (NOISE_NX + SV2)
+mod sync;         // Phase 2 — drop-in Kaspa sync-negotiation layer
 
 use clap::Parser;
 use log::{info, warn, error, debug};
@@ -482,6 +483,16 @@ async fn main() {
     let otx2    = outbound_tx.clone();
     let tip_tx2 = tip_tx.clone();
 
+    // ── Phase-2 Kaspa sync-negotiation shared state (drop-in, additive) ───────
+    // `peer_state`: PeerId-keyed chain-state table, written by the network loop
+    // (P4) where the real libp2p PeerId is in scope; read here by the processor
+    // + nudge. `frontier`: in-flight tip-request tracker gating IBD release.
+    // Lock order everywhere: dag → peer_state → frontier → node_state.
+    let peer_state = Arc::new(sync::peer_state::PeerStateTable::new());
+    let frontier   = Arc::new(parking_lot::Mutex::new(sync::frontier::FrontierState::new()));
+    let peer_state2 = peer_state.clone();
+    let frontier2   = frontier.clone();
+
     tokio::spawn(async move {
         use futures::future::FutureExt;
         // ── P0 supervision (roadmap §2.5, top reliability risk #1) ───────────
@@ -521,18 +532,16 @@ async fn main() {
                     {
                         let mut s = state2.write();
                         s.seen_first_tip = true;
+                        // Phase-2: best_seen_blue_score is kept ONLY as an RPC
+                        // display hint — it no longer releases the IBD latch. A
+                        // peer can announce any blue_score; release is decided
+                        // solely by maybe_release_ibd (blue_work-verified below).
                         if peer_s > s.best_seen_blue_score { s.best_seen_blue_score = peer_s; }
-                        // Release the IBD latch once we've caught up to the best
-                        // tip any peer has announced. Replaces the dead empty-
-                        // Headers clear path below; peers re-announce their tip
-                        // ~every 60s, so a synced node resumes mining promptly.
-                        if s.is_syncing && our_s >= s.best_seen_blue_score {
-                            s.is_syncing = false;
-                            info!("IBD complete (caught up to best announced tip {})", s.best_seen_blue_score);
-                        }
                     }
                     if peer_s > our_s {
                         info!("Peer {} ahead ({}), requesting headers", peer_id, peer_s);
+                        // Retained legacy over-trigger fallback (entering IBD is
+                        // always safe); the announced score never RELEASES it.
                         state2.write().is_syncing = true;
                         let _ = otx2.send(network::NetworkMessage::GetHeaders {
                             from_blue_score: our_s, limit: 500
@@ -566,6 +575,46 @@ async fn main() {
                             }).await;
                         }
                     }
+                    maybe_release_ibd(&dag2, &peer_state2, &frontier2, &state2);
+                }
+
+                // Frontier reconciliation: a peer asks for our DAG frontier.
+                // Reply with every tip (as SyncEntry) plus an exponential
+                // block-locator over our selected chain (common-ancestor hint).
+                network::NetworkMessage::GetTips => {
+                    let (entries, locator) = {
+                        let d = dag2.read();
+                        let entries: Vec<network::SyncEntry> = d.tips().iter()
+                            .filter_map(|h| d.get_node(h).map(|n| network::SyncEntry {
+                                hash: *h, blue_score: n.blue_score, height: n.height,
+                            }))
+                            .collect();
+                        let locator = sync::locator::build_locator(&d.selected_chain());
+                        (entries, locator)
+                    };
+                    let _ = otx2.send(network::NetworkMessage::Tips { tips: entries, locator }).await;
+                }
+
+                // Frontier reconciliation: a peer's advertised frontier. GetBlock
+                // every advertised tip we lack; a frontier gap means we are
+                // behind, so enter IBD. Missing parents of the fetched tips flow
+                // into the EXISTING orphan pool via the NewBlock arm — no new
+                // orphan logic here.
+                network::NetworkMessage::Tips { tips, .. } => {
+                    let advertised: Vec<[u8; 32]> = tips.iter().map(|e| e.hash).collect();
+                    let now = std::time::Instant::now();
+                    let to_req = {
+                        let d = dag2.read();
+                        frontier2.lock().to_request(&advertised, |h| d.has_block(h), now)
+                    };
+                    if !to_req.is_empty() {
+                        // Frontier gap → enter IBD (blue_work-verified release).
+                        state2.write().is_syncing = true;
+                        for h in &to_req {
+                            let _ = otx2.send(network::NetworkMessage::GetBlock { block_hash: *h }).await;
+                        }
+                    }
+                    maybe_release_ibd(&dag2, &peer_state2, &frontier2, &state2);
                 }
 
                 // IBD step 2: someone asks for our headers
@@ -594,8 +643,10 @@ async fn main() {
                         let _ = otx2.send(network::NetworkMessage::GetBlock { block_hash: hash }).await;
                     }
                     if entries.is_empty() {
-                        state2.write().is_syncing = false;
-                        info!("IBD complete");
+                        // Phase-2: an empty Headers reply no longer clears
+                        // is_syncing (a lying/lagging peer must not fake
+                        // completion). Release is blue_work-verified only.
+                        maybe_release_ibd(&dag2, &peer_state2, &frontier2, &state2);
                     } else if entries.len() >= 500 {
                         // Pipeline IBD: a full batch means the serving peer has
                         // more. Re-request the next batch IMMEDIATELY from the
@@ -732,6 +783,14 @@ async fn main() {
                                     &dag2, &store2, &mem2, &state2,
                                     Some(&tip_tx2), &shielded2,
                                 );
+                                // Phase-2 frontier: this tip (if it was in flight)
+                                // is now present — clear it and re-test the IBD
+                                // latch. Orphans drained by process_orphans that
+                                // were themselves advertised tips get cleared by
+                                // the next Tips round (to_request skips present
+                                // blocks), so clearing block_hash here suffices.
+                                frontier2.lock().note_received(&block_hash);
+                                maybe_release_ibd(&dag2, &peer_state2, &frontier2, &state2);
                             }}
                         }
                     }
@@ -790,19 +849,18 @@ async fn main() {
                     {
                         let mut s = state2.write();
                         s.seen_first_tip = true;
+                        // Phase-2: RPC hint only — never releases the latch.
                         if peer_s > s.best_seen_blue_score { s.best_seen_blue_score = peer_s; }
-                        if s.is_syncing && our_s >= s.best_seen_blue_score {
-                            s.is_syncing = false;
-                            info!("IBD complete (caught up to best announced tip {})", s.best_seen_blue_score);
-                        }
                     }
                     if peer_s > our_s {
                         info!("Version peer ahead (score {} > {}), requesting headers", peer_s, our_s);
+                        // Retained legacy over-trigger fallback (safe).
                         state2.write().is_syncing = true;
                         let _ = otx2.send(network::NetworkMessage::GetHeaders {
                             from_blue_score: our_s, limit: 500
                         }).await;
                     }
+                    maybe_release_ibd(&dag2, &peer_state2, &frontier2, &state2);
                 }
                 network::NetworkMessage::VersionAck
                 | network::NetworkMessage::PeerExchange { .. }
@@ -848,9 +906,11 @@ async fn main() {
     // at least every 30s. At parity the nudge stops (and the serving side
     // suppresses empty Headers replies), so steady-state cost is zero.
     {
-        let dag_n   = dag.clone();
-        let state_n = node_state.clone();
-        let otx_n   = outbound_tx.clone();
+        let dag_n        = dag.clone();
+        let state_n      = node_state.clone();
+        let otx_n        = outbound_tx.clone();
+        let peer_state_n = peer_state.clone();
+        let frontier_n   = frontier.clone();
         tokio::spawn(async move {
             let mut nudge = tokio::time::interval(std::time::Duration::from_secs(30));
             loop {
@@ -860,12 +920,29 @@ async fn main() {
                     let s = state_n.read();
                     (s.peer_count, s.is_syncing, s.best_seen_blue_score, s.seen_first_tip)
                 };
-                if peers > 0 && (syncing || !seen_tip || best_seen > our_s) {
-                    debug!("IBD nudge: GetHeaders from score {} (best_seen={} syncing={} seen_tip={})",
-                        our_s, best_seen, syncing, seen_tip);
-                    let _ = otx_n.send(network::NetworkMessage::GetHeaders {
-                        from_blue_score: our_s, limit: 500,
-                    }).await;
+                if peers > 0 {
+                    // Retained legacy fallback (gossip path): only when we have a
+                    // reason to believe we're behind, exactly as before.
+                    if syncing || !seen_tip || best_seen > our_s {
+                        debug!("IBD nudge: GetHeaders from score {} (best_seen={} syncing={} seen_tip={})",
+                            our_s, best_seen, syncing, seen_tip);
+                        let _ = otx_n.send(network::NetworkMessage::GetHeaders {
+                            from_blue_score: our_s, limit: 500,
+                        }).await;
+                    }
+                    // Phase-2 frontier reconciliation: every peer replies Tips.
+                    let _ = otx_n.send(network::NetworkMessage::GetTips).await;
+                    // Re-request timed-out tip GetBlocks.
+                    let now = std::time::Instant::now();
+                    let stale = frontier_n.lock().expired(sync::TIP_REQUEST_TIMEOUT, now);
+                    for h in stale {
+                        let _ = otx_n.send(network::NetworkMessage::GetBlock { block_hash: h }).await;
+                    }
+                    // Re-test the blue_work-verified IBD latch so a node never
+                    // wedges in is_syncing after it has actually caught up —
+                    // the liveness backstop against a fabricated high announced
+                    // score freezing the node.
+                    maybe_release_ibd(&dag_n, &peer_state_n, &frontier_n, &state_n);
                 }
             }
         });
@@ -1526,7 +1603,7 @@ async fn main() {
                 // B5f pool seam: submitblock hook (see rpc::SubmitBlockFn).
                 Some(rpc_submit_block.clone()),
             ) => { error!("RPC exited"); }
-        _ = node.run(block_tx, outbound_rx, dag.clone()) => {
+        _ = node.run(block_tx, outbound_rx, dag.clone(), peer_state.clone()) => {
             error!("Network exited");
         }
     }
@@ -2096,6 +2173,45 @@ fn accept_block(
     }
 
     Ok(block_hash)
+}
+
+/// Blue_work-VERIFIED IBD release — the ONLY path that clears `is_syncing`.
+///
+/// Phase-2 sync-negotiation invariant: announced blue_score NEVER releases the
+/// latch (a peer can lie). We clear IBD only when, computed locally from the
+/// DAG: (1) the frontier is reconciled — we `has_block` every connected peer's
+/// advertised tip AND nothing is in flight — AND (2) our selected-tip
+/// `blue_work` is at least the greatest locally-verified `blue_work` reachable
+/// from a connected peer (`servable_blue_work`). Tips we cannot verify against
+/// our own DAG contribute 0, so unbacked high announcements cannot gate release.
+///
+/// Lock order (must match every other call-site): dag → peer_state → frontier
+/// → node_state. All read locks drop before node_state.write().
+fn maybe_release_ibd(
+    dag:        &Arc<RwLock<consensus::GhostDAG>>,
+    peer_state: &Arc<sync::peer_state::PeerStateTable>,
+    frontier:   &Arc<parking_lot::Mutex<sync::frontier::FrontierState>>,
+    node_state: &Arc<RwLock<rpc::NodeState>>,
+) {
+    let (our_work, servable, reconciled) = {
+        let d = dag.read();
+        let our_work = d.selected_tip()
+            .and_then(|h| d.get_node(&h))
+            .map(|n| n.blue_work)
+            .unwrap_or(0);
+        let servable = peer_state.servable_blue_work(|h| d.get_node(h).map(|n| n.blue_work));
+        let advertised = peer_state.connected_advertised_tips();
+        let outstanding = frontier.lock().outstanding();
+        let reconciled = sync::frontier::reconciled(&advertised, |h| d.has_block(h), outstanding);
+        (our_work, servable, reconciled)
+    };
+    if reconciled && our_work >= servable {
+        let mut s = node_state.write();
+        if s.is_syncing {
+            s.is_syncing = false;
+            info!("IBD complete (frontier reconciled; blue_work {} ≥ servable {})", our_work, servable);
+        }
+    }
 }
 
 /// After accepting a block, check if any orphans can now be processed.
