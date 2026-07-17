@@ -1001,6 +1001,14 @@ async fn main() {
                 }
                 let sync_stalled = last_tip_advance.elapsed()
                     >= std::time::Duration::from_secs(SYNC_STALL_SECS);
+                // [no-fork] Freeze finality while mining through a stall (the
+                // announced heaviest tip is unreachable and we mine our local
+                // tip to stay live): a strictly-heavier chain must still be able
+                // to deep-reorg us back once its holder becomes reachable, so
+                // mine-through can never self-finalize a solo fork. Unfrozen
+                // whenever we are synced or catching up normally.
+                FINALITY_FROZEN.store(syncing_now && sync_stalled,
+                    std::sync::atomic::Ordering::Relaxed);
                 if syncing_now && !sync_stalled {
                     if !was_syncing_last_tick {
                         info!("⛏  IBD in progress — miner paused, will resume when sync completes");
@@ -1649,6 +1657,15 @@ fn make_rpc_submit_block_cb(
 
 // ── Block acceptance + Orphan processing ─────────────────────────────────────
 
+/// [no-fork] Set true while the miner is mining through a stalled IBD latch
+/// (the announced heaviest tip is unreachable and we mine our locally-heaviest
+/// validated tip to keep the chain live). While frozen we do NOT advance
+/// `finalized_height`, so a strictly-heavier chain can still deep-reorg us back
+/// once its holder becomes reachable — mine-through can never self-finalize a
+/// solo fork. Driven by the miner loop; cleared when synced / catching up.
+static FINALITY_FROZEN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Validate TX contents, add block to DAG + storage, update UTXO set.
 /// Returns Ok(block_hash) on success.
 fn accept_block(
@@ -2011,7 +2028,11 @@ fn accept_block(
             .and_then(|h| d.get_block_data(&h).map(|data| data.height))
             .unwrap_or(0)
     };
-    if tip_height > core::CHECKPOINT_DEPTH {
+    // [no-fork] Do not advance finality while mining through a stalled latch —
+    // freezing finalized_height keeps a heavier chain able to reorg us back.
+    if tip_height > core::CHECKPOINT_DEPTH
+        && !FINALITY_FROZEN.load(std::sync::atomic::Ordering::Relaxed)
+    {
         let new_finalized = tip_height - core::CHECKPOINT_DEPTH;
         let current_finalized = store.get_meta("finalized_height").ok().flatten()
             .and_then(|b| b.as_slice().try_into().ok().map(u64::from_le_bytes))
