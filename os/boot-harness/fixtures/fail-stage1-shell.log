@@ -1,0 +1,4 @@
+# hand-written synthetic fixture for grader self-test only — not a real boot capture
+[    0.000000] Booting Linux on physical CPU 0x0 [0x410fd034]
+[    0.000000] Linux version 6.6.21 (nixbld@localhost) (aarch64-unknown-linux-gnu-gcc)
+[1;31m-- stage-1 -- dropping to emergency shell

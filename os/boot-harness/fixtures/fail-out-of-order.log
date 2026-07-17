@@ -1,0 +1,5 @@
+# hand-written synthetic fixture for grader self-test only — not a real boot capture
+[    0.000000] systemd[1]: Reached target Local File Systems.
+[    0.500000] Booting Linux on physical CPU 0x0 [0x410fd034]
+[    1.234567] systemd[1]: System time before build time, advancing clock.
+pinephone login:

@@ -1,0 +1,7 @@
+# hand-written synthetic fixture for grader self-test only — not a real boot capture
+[    0.000000] Booting Linux on physical CPU 0x0 [0x410fd034]
+[    1.234567] Mobile-NixOS stage-1: mounting real root filesystem
+[    2.345678] systemd[1]: System time before build time, advancing clock.
+[    3.456789] systemd[1]: Reached target Local File Systems.
+[    4.567890] systemd[1]: Reached target Basic System.
+[    5.678901] systemd[1]: Reached target Multi-User System.
