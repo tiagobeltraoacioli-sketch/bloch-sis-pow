@@ -2193,19 +2193,31 @@ fn maybe_release_ibd(
     frontier:   &Arc<parking_lot::Mutex<sync::frontier::FrontierState>>,
     node_state: &Arc<RwLock<rpc::NodeState>>,
 ) {
-    let (our_work, servable, reconciled) = {
+    let (our_work, our_score, servable, reconciled) = {
         let d = dag.read();
-        let our_work = d.selected_tip()
-            .and_then(|h| d.get_node(&h))
-            .map(|n| n.blue_work)
-            .unwrap_or(0);
+        let selected = d.selected_tip().and_then(|h| d.get_node(&h));
+        let our_work = selected.as_ref().map(|n| n.blue_work).unwrap_or(0);
+        let our_score = selected.as_ref().map(|n| n.blue_score).unwrap_or(0);
         let servable = peer_state.servable_blue_work(|h| d.get_node(h).map(|n| n.blue_work));
         let advertised = peer_state.connected_advertised_tips();
-        let outstanding = frontier.lock().outstanding();
-        let reconciled = sync::frontier::reconciled(&advertised, |h| d.has_block(h), outstanding);
-        (our_work, servable, reconciled)
+        // Frontier lock taken into a local guard (lock order dag→peer_state→
+        // frontier→node_state); compute outstanding + reconciled, drop before write.
+        let fr = frontier.lock();
+        let outstanding = fr.outstanding();
+        let reconciled = sync::frontier::reconciled(
+            &advertised, |h| d.has_block(h), outstanding, |h| fr.is_abandoned(h),
+        );
+        drop(fr);
+        (our_work, our_score, servable, reconciled)
     };
-    if reconciled && our_work >= servable {
+    // Fix #2: NECESSARY (delay-only) condition — never release while any connected
+    // peer ANNOUNCES a strictly higher blue_score than our selected tip. Prevents a
+    // premature release when the frontier is not yet known (peer's tips not yet in
+    // `advertised`, so `reconciled` is vacuously true). Announced score NEVER forces
+    // release (still needs reconciled AND our_work >= servable); it only delays. A
+    // lying high-announce peer at worst keeps us in the 90s throttled mine-through.
+    let announced_ahead = peer_state.best_announced_blue_score() > our_score;
+    if reconciled && our_work >= servable && !announced_ahead {
         let mut s = node_state.write();
         if s.is_syncing {
             s.is_syncing = false;

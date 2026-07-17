@@ -68,7 +68,7 @@ impl FakeDag {
 fn release_condition(dag: &FakeDag, peers: &PeerStateTable, frontier: &FrontierState) -> bool {
     let advertised = peers.connected_advertised_tips();
     let outstanding = frontier.outstanding();
-    let done = reconciled(&advertised, |x| dag.has_block(x), outstanding);
+    let done = reconciled(&advertised, |x| dag.has_block(x), outstanding, |x| frontier.is_abandoned(x));
     let servable = peers.servable_blue_work(|x| dag.blue_work(x));
     done && dag.selected_tip_work() >= servable
 }
