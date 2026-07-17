@@ -51,6 +51,10 @@ use tokio::sync::{mpsc, broadcast};
 #[command(version)]
 struct Cli {
     #[arg(long)]                                         mine: bool,
+    /// Number of CPU cores the SIS miner grinds across in parallel. Each worker
+    /// searches a disjoint nonce range under the same regime (result-identical
+    /// to single-thread mining — pure throughput). Defaults to all logical CPUs.
+    #[arg(long)]                                         mine_threads: Option<usize>,
     #[arg(long)]                                         testnet: bool,
     #[arg(long, default_value = "./bloch-data")]          data_dir: String,
     /// RPC bind address. SECURITY: defaults to 127.0.0.1 (local only).
@@ -1007,8 +1011,15 @@ async fn main() {
         // FIX #8: Convert miner address to proper 20-byte script_pubkey
         let miner_spk = address_to_script_pubkey(&miner_addr);
 
+        // Capacity: grind the SIS search across all logical CPUs by default
+        // (result-identical — see pow::mine_sis_pow_parallel). Override with
+        // --mine-threads. Clamp to >=1.
+        let mine_threads = cli.mine_threads
+            .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))
+            .max(1);
+
         tokio::spawn(async move {
-            info!("⛏  Miner started → {}", miner_addr);
+            info!("⛏  Miner started → {} ({} thread(s))", miner_addr, mine_threads);
             let mut mining_round: u64 = 0;
             // Sprint GG: warn once when we first see IBD active, log
             // transition back to ready so operators see the transition.
@@ -1231,7 +1242,7 @@ async fn main() {
                 let bits = block.header.bits;
                 let mine_height = block.height;
                 let mined = tokio::task::spawn_blocking(move || {
-                    pow::mine_sis_pow(&preimage, bits, mine_height, 0, 50_000_000)
+                    pow::mine_sis_pow_parallel(&preimage, bits, mine_height, 0, 50_000_000, mine_threads)
                 }).await;
 
                 match mined {
