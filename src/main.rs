@@ -2193,13 +2193,14 @@ fn maybe_release_ibd(
     frontier:   &Arc<parking_lot::Mutex<sync::frontier::FrontierState>>,
     node_state: &Arc<RwLock<rpc::NodeState>>,
 ) {
-    let (our_work, our_score, servable, reconciled) = {
+    let (our_work, our_score, servable, reconciled, have_frontier) = {
         let d = dag.read();
         let selected = d.selected_tip().and_then(|h| d.get_node(&h));
         let our_work = selected.as_ref().map(|n| n.blue_work).unwrap_or(0);
         let our_score = selected.as_ref().map(|n| n.blue_score).unwrap_or(0);
         let servable = peer_state.servable_blue_work(|h| d.get_node(h).map(|n| n.blue_work));
         let advertised = peer_state.connected_advertised_tips();
+        let have_frontier = !advertised.is_empty();
         // Frontier lock taken into a local guard (lock order dag→peer_state→
         // frontier→node_state); compute outstanding + reconciled, drop before write.
         let fr = frontier.lock();
@@ -2208,20 +2209,32 @@ fn maybe_release_ibd(
             &advertised, |h| d.has_block(h), outstanding, |h| fr.is_abandoned(h),
         );
         drop(fr);
-        (our_work, our_score, servable, reconciled)
+        (our_work, our_score, servable, reconciled, have_frontier)
     };
-    // Fix #2: NECESSARY (delay-only) condition — never release while any connected
-    // peer ANNOUNCES a strictly higher blue_score than our selected tip. Prevents a
-    // premature release when the frontier is not yet known (peer's tips not yet in
-    // `advertised`, so `reconciled` is vacuously true). Announced score NEVER forces
-    // release (still needs reconciled AND our_work >= servable); it only delays. A
-    // lying high-announce peer at worst keeps us in the 90s throttled mine-through.
-    let announced_ahead = peer_state.best_announced_blue_score() > our_score;
-    if reconciled && our_work >= servable && !announced_ahead {
+    let best_announced = peer_state.best_announced_blue_score();
+    // Release the IBD latch on the FIRST of two signals (both backstopped by the
+    // 90s mine-through valve, so neither can freeze the miner):
+    //  (A) VERIFIED / griefer-proof: we hold every advertised tip (or it is
+    //      abandoned-as-unreachable, per Fix #1) AND our selected chain is at
+    //      least the best VERIFIED reachable work. Gated on `have_frontier` so an
+    //      empty advertised set cannot vacuously release us mid-catch-up.
+    //  (B) LAG / mining-lag tolerant: our selected tip is within IBD_EXIT_LAG
+    //      blue_score of the best ANNOUNCED tip — normal operation, not a bulk
+    //      backlog. This is what lets a trailing MINER keep mining (leapfrog)
+    //      instead of freezing as a pure follower: the canary proved the strict
+    //      verified gate (A) never completes while a peer mines continuously (the
+    //      chased frontier keeps moving). Announced score is UNTRUSTED and only
+    //      ever RELEASES here (never blocks); a lying high-announce peer keeps us
+    //      out of (A)+(B) and we fall back to the 90s throttled mine-through — it
+    //      can never freeze us and never fakes a completion during a real backlog.
+    let verified  = have_frontier && reconciled && our_work >= servable;
+    let caught_up = our_score.saturating_add(sync::IBD_EXIT_LAG) >= best_announced;
+    if verified || caught_up {
         let mut s = node_state.write();
         if s.is_syncing {
             s.is_syncing = false;
-            info!("IBD complete (frontier reconciled; blue_work {} ≥ servable {})", our_work, servable);
+            info!("IBD complete (verified={} caught_up={}; score {} best_announced {}; work {} servable {})",
+                verified, caught_up, our_score, best_announced, our_work, servable);
         }
     }
 }
