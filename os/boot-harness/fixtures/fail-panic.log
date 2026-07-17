@@ -1,0 +1,5 @@
+# hand-written synthetic fixture for grader self-test only — not a real boot capture
+[    0.000000] Booting Linux on physical CPU 0x0 [0x410fd034]
+[    0.000000] Linux version 6.6.21 (nixbld@localhost) (aarch64-unknown-linux-gnu-gcc)
+[    0.891234] Kernel panic - not syncing: Attempted to kill init! exitcode=0x00000100
+[    0.891235] CPU: 0 PID: 1 Comm: init Not tainted 6.6.21 #1

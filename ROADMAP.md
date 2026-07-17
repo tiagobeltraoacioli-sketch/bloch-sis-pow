@@ -89,6 +89,23 @@ later upgrade.)* **Status: GIP-008 APPROVED (founder, 2026-07-10)** for the
 on-chain k-of-n hybrid-signature descriptor-hash direction; consensus code
 lands via the standard GIP activation-signaling path.
 
+### S7 — FFG-BFT checkpoint finality overlay *(gated protocol item)*
+A post-quantum BFT finality gadget that anchors **reorg-proof checkpoints** to the
+base as **ordinary transactions** — an **overlay, not a base-consensus change**
+(the base stays **pure PoW**). Committee = the **miners weighted by hashrate**
+(work-weighted, ~120-block rotation, >2/3 quorum, co-signing with **ML-DSA** —
+post-quantum, no BLS). Raises the 51%-attack safety bar to **67%** and adds
+no-deep-reorg finality below that. Reclassified **into** the protocol from the
+Postern product roadmap: a finality overlay has no operator, so it belongs to the
+ownerless commons, not to a company. Reference scaffold exists
+(`bft/postern-bft-finality` + design `docs/specs/POSTERN-FFG-BFT-FINALITY.md`) —
+**not built, not deployed, no live committee.** **Honest caveat:**
+hashrate-weighted finality is only as decentralized as the hashrate — concentrated
+today, so effectively centralized until miners decentralize, and a >2/3-hashrate
+entity still breaks it. **Gated on:** a stable ownerless base *(architecture
+frozen — done)* → **k=8 PoW reactivation (S1)** → **independent audit (S2)**;
+consensus-touching pieces land via a GIP with node-operator signaling.
+
 ---
 
 ## 🕵️ Privacy track (Coherence)

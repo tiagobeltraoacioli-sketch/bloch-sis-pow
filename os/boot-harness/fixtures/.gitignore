@@ -1,0 +1,4 @@
+# The repo-root .gitignore ignores *.log globally; re-include the grader
+# self-test fixtures — they are hand-written synthetic inputs (not captures
+# of any real boot) that test-check-boot-log.sh needs on every checkout.
+!*.log

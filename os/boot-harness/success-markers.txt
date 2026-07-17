@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# Postern OS Mobile — boot success/failure markers (the SHARED contract).
+#
+# This is the one file both boot gates reference so "booted" means the same
+# thing on both rungs:
+#   - Rung 1 (QEMU-aarch64, this dir's harness) — the software boot chain.
+#   - Rung 2 (real PinePhone, dev owning the hardware rung) — the device chain.
+# Keep it jointly owned: neither rung invents its own private grep list.
+#
+# FORMAT (consumed by check-boot-log.sh):
+#   '+ <extended-regex>'  a REQUIRED success marker (must appear, in this order)
+#   '- <extended-regex>'  a FAILURE marker (must NOT appear anywhere)
+#   '~ <extended-regex>'  an OPTIONAL/informational marker (logged, never gates)
+#   '#' or blank          comment
+#
+# Regexes are POSIX ERE, matched case-sensitively with `grep -E`.
+
+# ── Required success ladder (bootloader → kernel → stage-1 → systemd → login) ──
++ Booting Linux on physical CPU
++ systemd\[1\]:
++ Reached target
++ (login:|◆ Postern OS Mobile)
+
+# ── Hard failures (any one means the boot did NOT pass) ───────────────────────
+- Kernel panic
+- Entering emergency mode
+- Unable to mount root fs
+- -- stage-1 --.*(emergency|shell)
+
+# ── Informational (nice to see; do not gate the QEMU rung) ────────────────────
+# The Postern OS Mobile MOTD from os/mobile.nix — its wallet-first banner.
+~ ◆ Postern OS Mobile — wallet-first
+# Mobile-NixOS stage-1 handing off to the real system.
+~ [Ss]tage-1
+# The functional check (run interactively / via a CI expect wrapper, not here):
+#   bloch-wallet --help          # DoD: prints usage (wallet engine loaded)
+#   systemctl is-system-running  # DoD: running | degraded-with-known-reasons
