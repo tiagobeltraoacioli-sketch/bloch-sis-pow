@@ -173,3 +173,52 @@ fn best_announced_blue_score_zero_with_no_peers() {
     let t = PeerStateTable::new();
     assert_eq!(t.best_announced_blue_score(), 0);
 }
+
+// ── Fix #2 regression: announced-ahead delays a premature IBD release ──────────
+//
+// Reviewer defect: right after a PeerTip/Version says a peer is ahead,
+// `is_syncing=true` but that peer's tips are not yet in `advertised` (they arrive
+// on the slower GetTips round), so `frontier::reconciled` is vacuously true over
+// an empty/partial advertised set and `maybe_release_ibd` releases before actually
+// syncing → the miner mines a short fork.
+//
+// Fix: `maybe_release_ibd` adds a NECESSARY (delay-only) gate
+//   let announced_ahead = peer_state.best_announced_blue_score() > our_score;
+//   if reconciled && our_work >= servable && !announced_ahead { release }
+// Announced score never RELEASES the latch (release still needs reconciled AND
+// our_work >= servable); it only DELAYS a premature release until our own score
+// catches up or the frontier confirms. Backstopped by the 90s mine-through valve,
+// so a lying high-announce peer at worst keeps us in throttled mine-through.
+//
+// The full gate is integration-level (needs the DAG + frontier); this focused unit
+// test pins the building block: with a connected peer announcing a higher
+// blue_score than ours, `best_announced_blue_score()` reflects it, so the
+// `announced_ahead` comparison against `our_score` is true and release is delayed.
+#[test]
+fn announced_ahead_building_block_delays_release() {
+    let t = PeerStateTable::new();
+    let peer = PeerId::random();
+    let now = Instant::now();
+
+    // Our locally-verified selected-tip blue_score (from d.get_node in P5).
+    let our_score: u64 = 100;
+
+    // A connected peer announces a strictly higher blue_score via PeerTip/Version
+    // (no tip hashes yet — the frontier is not known).
+    t.observe(peer, 150, 0, &[], now);
+
+    // best_announced_blue_score() > our_score ⇒ announced_ahead ⇒ release delayed.
+    assert_eq!(t.best_announced_blue_score(), 150);
+    assert!(
+        t.best_announced_blue_score() > our_score,
+        "a peer announcing ahead must make announced_ahead true, delaying IBD release"
+    );
+
+    // Once our own score catches up (or the peer's announcement is not ahead),
+    // announced_ahead is false and this gate no longer blocks release.
+    let our_score_caught_up: u64 = 150;
+    assert!(
+        !(t.best_announced_blue_score() > our_score_caught_up),
+        "when our score matches the announcement, the delay gate opens"
+    );
+}

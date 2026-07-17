@@ -165,27 +165,145 @@ fn expired_returns_stale_and_restamps() {
 fn reconciled_false_when_a_tip_is_absent() {
     let present: HashSet<[u8; 32]> = [h(1)].into_iter().collect();
     let advertised = [h(1), h(2)];
-    assert!(!reconciled(&advertised, oracle(&present), 0));
+    assert!(!reconciled(&advertised, oracle(&present), 0, |_| false));
 }
 
 #[test]
 fn reconciled_false_when_outstanding_nonzero() {
     let present: HashSet<[u8; 32]> = [h(1), h(2)].into_iter().collect();
     let advertised = [h(1), h(2)];
-    assert!(!reconciled(&advertised, oracle(&present), 1));
+    assert!(!reconciled(&advertised, oracle(&present), 1, |_| false));
 }
 
 #[test]
 fn reconciled_true_only_when_all_present_and_nothing_in_flight() {
     let present: HashSet<[u8; 32]> = [h(1), h(2)].into_iter().collect();
     let advertised = [h(1), h(2)];
-    assert!(reconciled(&advertised, oracle(&present), 0));
+    assert!(reconciled(&advertised, oracle(&present), 0, |_| false));
 }
 
 #[test]
 fn reconciled_trivially_true_on_empty_advertised_set() {
     let present: HashSet<[u8; 32]> = HashSet::new();
-    assert!(reconciled(&[], oracle(&present), 0));
+    assert!(reconciled(&[], oracle(&present), 0, |_| false));
+}
+
+// ── Fix #1 regression: phantom-tip give-up (abandonment) ────────────────────────
+//
+// Reviewer defect: `reconciled` required `has_block` for EVERY advertised tip and
+// `expired` re-requested a timed-out tip forever, so one connected peer advertising
+// a tip whose block is never served pinned the node in IBD (`is_syncing`) forever.
+// Fix: after MAX_TIP_ATTEMPTS timed-out re-requests a tip is `abandoned`, drops out
+// of `outstanding`, and `reconciled` treats it as resolved; receipt un-abandons it.
+
+use bloch::sync::frontier::MAX_TIP_ATTEMPTS;
+
+/// A phantom tip (never served) is abandoned after MAX_TIP_ATTEMPTS timeouts,
+/// stops being outstanding, and lets `reconciled` complete — instead of pinning
+/// the node in IBD forever. Receipt then un-abandons it.
+#[test]
+fn phantom_tip_is_abandoned_after_max_attempts_and_unblocks_reconciled() {
+    let phantom = h(42);
+    let present: HashSet<[u8; 32]> = HashSet::new(); // never served
+    let advertised = [phantom];
+    let mut state = FrontierState::new();
+    let timeout = Duration::from_secs(30);
+    let mut now = Instant::now();
+
+    // First request records it in flight (attempt 1).
+    let req = state.to_request(&advertised, oracle(&present), now);
+    assert_eq!(req, vec![phantom]);
+    assert_eq!(state.outstanding(), 1);
+    assert!(!state.is_abandoned(&phantom));
+
+    // Not reconciled while the phantom is in flight (has_block false, not abandoned).
+    assert!(!reconciled(&advertised, oracle(&present), state.outstanding(), |x| state.is_abandoned(x)));
+
+    // expired() bumps the attempt count each round. Attempts 2..MAX_TIP_ATTEMPTS-1
+    // (the 1st in-flight insert already counts as attempt 1) still re-request it.
+    for _ in 0..(MAX_TIP_ATTEMPTS - 2) {
+        now += timeout;
+        let retry = state.expired(timeout, now);
+        assert_eq!(retry, vec![phantom], "still retrying below the give-up threshold");
+        assert!(!state.is_abandoned(&phantom));
+        assert_eq!(state.outstanding(), 1);
+    }
+
+    // The final timeout crosses MAX_TIP_ATTEMPTS: the tip is abandoned, NOT returned.
+    now += timeout;
+    let retry = state.expired(timeout, now);
+    assert!(retry.is_empty(), "abandoned tip is not returned for re-request");
+    assert!(state.is_abandoned(&phantom));
+    assert_eq!(state.outstanding(), 0, "abandoned tip no longer counts as outstanding");
+
+    // Now reconciled completes even though the phantom's block was never served.
+    assert!(
+        reconciled(&advertised, oracle(&present), state.outstanding(), |x| state.is_abandoned(x)),
+        "an abandoned phantom tip must let reconciled complete (no permanent IBD pin)"
+    );
+
+    // Receipt heals: a fork tip that finally arrives is un-abandoned.
+    state.note_received(&phantom);
+    assert!(!state.is_abandoned(&phantom), "note_received un-abandons a tip");
+}
+
+/// A NORMAL tip received before hitting MAX_TIP_ATTEMPTS is never abandoned, and
+/// `reconciled` flips true on receipt (has_block), not via the give-up path.
+#[test]
+fn normal_tip_received_before_giveup_is_never_abandoned() {
+    let tip = h(7);
+    let mut present: HashSet<[u8; 32]> = HashSet::new();
+    let advertised = [tip];
+    let mut state = FrontierState::new();
+    let timeout = Duration::from_secs(30);
+    let mut now = Instant::now();
+
+    let req = state.to_request(&advertised, oracle(&present), now);
+    assert_eq!(req, vec![tip]);
+
+    // A couple of timeouts, well below the give-up threshold — still retrying.
+    for _ in 0..2 {
+        now += timeout;
+        let retry = state.expired(timeout, now);
+        assert_eq!(retry, vec![tip]);
+        assert!(!state.is_abandoned(&tip));
+    }
+    // Not reconciled yet: still in flight and not present.
+    assert!(!reconciled(&advertised, oracle(&present), state.outstanding(), |x| state.is_abandoned(x)));
+
+    // Block arrives: clear in-flight and the DAG now has it.
+    present.insert(tip);
+    state.note_received(&tip);
+    assert!(!state.is_abandoned(&tip));
+    assert_eq!(state.outstanding(), 0);
+    assert!(
+        reconciled(&advertised, oracle(&present), state.outstanding(), |x| state.is_abandoned(x)),
+        "reconciled flips true via has_block on normal receipt, not the give-up path"
+    );
+}
+
+/// An abandoned tip is not re-requested by `to_request` (it stays out until a
+/// genuine receipt un-abandons it), so we don't thrash on a known-unreachable tip.
+#[test]
+fn abandoned_tip_is_not_re_requested() {
+    let phantom = h(99);
+    let present: HashSet<[u8; 32]> = HashSet::new();
+    let advertised = [phantom];
+    let mut state = FrontierState::new();
+    let timeout = Duration::from_secs(30);
+    let mut now = Instant::now();
+
+    state.to_request(&advertised, oracle(&present), now);
+    for _ in 0..MAX_TIP_ATTEMPTS {
+        now += timeout;
+        state.expired(timeout, now);
+    }
+    assert!(state.is_abandoned(&phantom));
+
+    // to_request must NOT re-add an abandoned tip.
+    let req = state.to_request(&advertised, oracle(&present), now);
+    assert!(req.is_empty(), "abandoned tip must not be re-requested");
+    assert_eq!(state.outstanding(), 0);
 }
 
 // ── const wiring ──────────────────────────────────────────────────────────────

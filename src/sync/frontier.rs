@@ -1,5 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
+
+/// Give up fetching an advertised tip after this many timed-out re-requests and
+/// mark it unreachable (`abandoned`). ~8 × TIP_REQUEST_TIMEOUT(30s) ≈ 4 min —
+/// well past the 90s mine-through valve, so a tip that no reachable peer serves
+/// (a fork we cannot reach, a partitioned holder, or a lying peer) stops
+/// blocking `reconciled` instead of pinning the node in `is_syncing` forever.
+pub const MAX_TIP_ATTEMPTS: u32 = 8;
 
 /// Pure: tips we should advertise, bounded to MAX_ADVERTISED_TIPS. Input is
 /// `consensus::GhostDAG::tips()`. Deterministic order (sorted) for testability.
@@ -24,39 +31,50 @@ pub fn diff_missing<F: Fn(&[u8; 32]) -> bool>(
         .collect()
 }
 
-/// Pure sync-completion predicate. True iff every advertised tip is present and
-/// nothing is in flight. `advertised` = union of connected peers' advertised
-/// tips (from PeerStateTable::connected_advertised_tips).
-pub fn reconciled<F: Fn(&[u8; 32]) -> bool>(
+/// Pure sync-completion predicate. True iff every advertised tip is either
+/// present (`has_block`) OR abandoned-as-unreachable (`is_abandoned`), and
+/// nothing is in flight. An abandoned tip counts as "resolved" so a single
+/// unreachable/phantom tip cannot pin the node in IBD forever — the blue_work
+/// gate in maybe_release_ibd still guarantees we only release once our own
+/// selected chain is at least the best VERIFIED reachable work.
+pub fn reconciled<F: Fn(&[u8; 32]) -> bool, G: Fn(&[u8; 32]) -> bool>(
     advertised: &[[u8; 32]],
     has_block: F,
     outstanding: usize,
+    is_abandoned: G,
 ) -> bool {
-    outstanding == 0 && advertised.iter().all(|h| has_block(h))
+    outstanding == 0 && advertised.iter().all(|h| has_block(h) || is_abandoned(h))
 }
 
 /// In-flight tip-request tracker. Shared as Arc<Mutex<FrontierState>>.
 #[derive(Default)]
 pub struct FrontierState {
-    /// tip hash -> time we last (re)requested it via GetBlock.
-    in_flight: HashMap<[u8; 32], Instant>,
+    /// tip hash -> (time we last (re)requested it via GetBlock, attempt count).
+    in_flight: HashMap<[u8; 32], (Instant, u32)>,
+    /// tips given up on after MAX_TIP_ATTEMPTS timed-out re-requests. They no
+    /// longer count as outstanding and `reconciled` treats them as resolved.
+    /// A tip leaves this set the instant its block actually arrives
+    /// (`note_received`), so a fork that later becomes reachable heals.
+    abandoned: HashSet<[u8; 32]>,
 }
 
 impl FrontierState {
     pub fn new() -> Self {
-        Self {
-            in_flight: HashMap::new(),
-        }
+        Self { in_flight: HashMap::new(), abandoned: HashSet::new() }
     }
 
-    /// Number of tip GetBlocks awaiting delivery. Gates IBD release.
+    /// In-flight tip GetBlocks awaiting delivery (excludes abandoned). Gates IBD.
     pub fn outstanding(&self) -> usize {
         self.in_flight.len()
     }
 
-    /// Compute newly-missing tips to GetBlock: diff_missing MINUS already
-    /// in-flight, and record the ones returned as in-flight at `now`.
-    /// P5 sends a GetBlock for each returned hash.
+    /// True if we gave up fetching this tip (declared it unreachable).
+    pub fn is_abandoned(&self, hash: &[u8; 32]) -> bool {
+        self.abandoned.contains(hash)
+    }
+
+    /// Newly-missing tips to GetBlock: diff_missing MINUS in-flight MINUS
+    /// abandoned; records returned ones as in-flight at `now`.
     pub fn to_request<F: Fn(&[u8; 32]) -> bool>(
         &mut self,
         advertised: &[[u8; 32]],
@@ -66,32 +84,43 @@ impl FrontierState {
         let missing = diff_missing(advertised, has_block);
         let mut out = Vec::new();
         for h in missing {
-            if !self.in_flight.contains_key(&h) {
-                self.in_flight.insert(h, now);
+            if !self.in_flight.contains_key(&h) && !self.abandoned.contains(&h) {
+                self.in_flight.insert(h, (now, 1));
                 out.push(h);
             }
         }
         out
     }
 
-    /// Clear a tip once its block is accepted into the DAG. Call from the
-    /// NewBlock-accepted path in P5. No-op if it was never in flight.
+    /// Clear a tip once its block is accepted. Also un-abandons it so a fork tip
+    /// that finally arrives heals. No-op if neither in flight nor abandoned.
     pub fn note_received(&mut self, hash: &[u8; 32]) {
         self.in_flight.remove(hash);
+        self.abandoned.remove(hash);
     }
 
-    /// Return in-flight tips older than `timeout` and refresh their timestamp to
-    /// `now` (so they can be re-requested by the nudge). P5 re-sends GetBlock.
+    /// Timed-out in-flight tips for re-request. Each increments its attempt
+    /// count; at MAX_TIP_ATTEMPTS it is moved to `abandoned` (dropped from
+    /// in-flight, NOT returned). Otherwise its timestamp refreshes and it is
+    /// returned so P5 re-sends GetBlock.
     pub fn expired(&mut self, timeout: Duration, now: Instant) -> Vec<[u8; 32]> {
         let stale: Vec<[u8; 32]> = self
             .in_flight
             .iter()
-            .filter(|(_, t)| now.duration_since(**t) >= timeout)
+            .filter(|(_, (t, _))| now.duration_since(*t) >= timeout)
             .map(|(h, _)| *h)
             .collect();
-        for h in &stale {
-            self.in_flight.insert(*h, now);
+        let mut retry = Vec::new();
+        for h in stale {
+            let attempts = self.in_flight.get(&h).map(|(_, a)| *a).unwrap_or(0) + 1;
+            if attempts >= MAX_TIP_ATTEMPTS {
+                self.in_flight.remove(&h);
+                self.abandoned.insert(h);
+            } else {
+                self.in_flight.insert(h, (now, attempts));
+                retry.push(h);
+            }
         }
-        stale
+        retry
     }
 }
