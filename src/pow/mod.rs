@@ -210,6 +210,41 @@ fn mine_sis_pow_regime(
         .map(|r| (r.nonce, r.solution))
 }
 
+/// Capacity: height-aware consensus miner that grinds across `num_threads`
+/// CPU cores in parallel. Each worker searches a DISJOINT nonce range under
+/// the *same* regime and target, so the returned `(nonce, solution)` is a
+/// valid Bloch-SIS witness identical in kind to the single-threaded
+/// [`mine_sis_pow`] — the first worker to find a solution wins, and
+/// `verify_sis_pow` accepts it byte-for-byte the same way. This is a pure
+/// scheduling/throughput change: no consensus, PoW-format, or verification
+/// behavior is altered. `max_attempts` is the PER-WORKER attempt budget.
+///
+/// `num_threads <= 1` falls back to the single-threaded path so behavior is
+/// unchanged on a single core.
+pub fn mine_sis_pow_parallel(
+    pow_preimage: &[u8],
+    bits: u32,
+    height: u64,
+    start_nonce: u64,
+    max_attempts: u64,
+    num_threads: usize,
+) -> Option<(u64, [i32; SOLUTION_LEN])> {
+    if num_threads <= 1 {
+        return mine_sis_pow(pow_preimage, bits, height, start_nonce, max_attempts);
+    }
+    use bloch_sis_pow::solver::{mine_parallel, MineConfig};
+    let target = bits_to_target(bits);
+    let cfg = MineConfig {
+        start_nonce,
+        candidates_per_nonce: 4096,
+        max_total_attempts: max_attempts,
+        residual_coeffs: canonical_residual_coeffs(height, bits),
+    };
+    mine_parallel(pow_preimage, &target, &cfg, num_threads)
+        .ok()
+        .map(|r| (r.nonce, r.solution))
+}
+
 /// Verify a Module-SIS PoW witness at the full-`M` residual width.
 ///
 /// NOT a consensus path and NOT a secure mode: at `β = q/16`, full-`M` is in
