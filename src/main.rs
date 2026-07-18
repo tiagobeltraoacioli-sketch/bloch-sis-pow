@@ -276,7 +276,10 @@ async fn main() {
 
 
     // ── Consensus ─────────────────────────────────────────────────────────────
-    let dag = Arc::new(RwLock::new(consensus::GhostDAG::with_default_k()));
+    // `with_default_k_env` == `with_default_k` (Legacy) unless the dev/test
+    // override `BLOCH_GHOSTDAG_COLORING=fast` is set. The live gate
+    // (CORRECTED_COLORING_ACTIVATION_HEIGHT) is unchanged; see ColoringMode docs.
+    let dag = Arc::new(RwLock::new(consensus::GhostDAG::with_default_k_env()));
 
     // ── Genesis + DAG reload ─────────────────────────────────────────────────
     if store.get_meta("genesis_hash").ok().flatten().is_none() {
@@ -320,6 +323,15 @@ async fn main() {
             // integrity; see `compute_integrity_hash` for the convention.
             store.put_dag_with_integrity(&hash, &gdata)
                 .expect("persist genesis dag + integrity");
+            // Phase 1: when the reachability index is maintained (Fast / armed),
+            // persist the genesis reachability record + version tag + root.
+            // (Live Legacy path leaves CF_REACHABILITY untouched.)
+            if dag.read().maintains_reachability_index() {
+                let _ = dag.write().reach_take_delta(); // start tracking clean
+                store.store_reachability_snapshot(&dag.read().reach_export_all(),
+                                                  dag.read().reach_root())
+                    .expect("persist genesis reachability index");
+            }
         }
         for tx in &genesis.transactions {
             let txid = tx.txid();
@@ -403,6 +415,98 @@ async fn main() {
                     info!("Genesis loaded (fallback): {}", hex::encode(&gh));
                 }
             }
+        }
+    }
+
+    // ── Phase 2: durable reachability index — load-or-rebuild on boot ─────────
+    //
+    // `load_persisted*` above inserts blocks straight into the in-memory DAG
+    // WITHOUT feeding the reachability index (it bypasses `add_block`). So when
+    // the index is maintained (Fast / armed activation) it is empty here and
+    // must be initialized before it colors any block:
+    //
+    //   * Fast-path: if CF_REACHABILITY carries the matching schema version and
+    //     covers every CF_DAG block, load it directly (no O(chain) recompute).
+    //   * Migration: otherwise rebuild by replaying the SAME `reach.add_block`
+    //     code path in topological order, then persist the fresh snapshot.
+    //   * Guard: random-sample self-check against the brute-force oracle before
+    //     trusting the index; a loaded index that fails is rebuilt once.
+    //
+    // This whole block is inert on the live Legacy path (the gate is disabled),
+    // so it never runs on a mainnet node from this branch. No peer resync ever.
+    if dag.read().maintains_reachability_index() && dag.read().block_count() > 0 {
+        let want_ver = storage::Storage::REACHABILITY_SCHEMA_VERSION;
+        let have_ver = store.get_reachability_version().ok().flatten();
+        let block_count = dag.read().block_count();
+
+        let mut loaded_ok = false;
+        if have_ver == Some(want_ver) {
+            match store.load_all_reachability() {
+                Ok(records) if records.len() == block_count => {
+                    let root = store.get_reachability_root().ok().flatten();
+                    match dag.write().reach_load_records(&records, root) {
+                        Ok(()) => {
+                            loaded_ok = true;
+                            info!("reachability index loaded from disk: {} records", records.len());
+                        }
+                        Err(e) => warn!("reachability load failed ({e}); will rebuild"),
+                    }
+                }
+                Ok(records) => warn!(
+                    "reachability CF covers {}/{} blocks (partial/torn); will rebuild",
+                    records.len(), block_count
+                ),
+                Err(e) => warn!("reachability CF read failed ({e}); will rebuild"),
+            }
+        } else {
+            info!(
+                "reachability index absent/version-mismatch (have {:?}, want {}); \
+                 rebuilding from CF_DAG (one-time)",
+                have_ver, want_ver
+            );
+        }
+
+        let persist_rebuilt = |dag: &Arc<RwLock<consensus::GhostDAG>>, store: &storage::Storage| {
+            let snap = dag.read().reach_export_all();
+            let root = dag.read().reach_root();
+            let _ = dag.write().reach_take_delta(); // clear the rebuild's dirty flags
+            if let Err(e) = store.store_reachability_snapshot(&snap, root) {
+                warn!("failed to persist rebuilt reachability index: {e}");
+            }
+        };
+
+        if !loaded_ok {
+            match dag.write().rebuild_reachability_from_store() {
+                Ok(n) => info!("reachability index rebuilt from CF_DAG: {} blocks", n),
+                Err(e) => {
+                    error!("reachability rebuild FAILED: {e}");
+                    error!("Refusing to continue with an uninitialized Fast-coloring index.");
+                    std::process::exit(1);
+                }
+            }
+            persist_rebuilt(&dag, &store);
+        }
+
+        // Self-check the (loaded or rebuilt) index against the unbounded oracle.
+        if let Err(e) = dag.read().reach_self_check_sample(2000, 0xB10C_5157) {
+            if loaded_ok {
+                warn!("loaded reachability failed self-check ({e}); rebuilding from CF_DAG");
+                match dag.write().rebuild_reachability_from_store() {
+                    Ok(n) => info!("reachability rebuilt after failed self-check: {} blocks", n),
+                    Err(e2) => { error!("rebuild after failed self-check errored: {e2}"); std::process::exit(1); }
+                }
+                persist_rebuilt(&dag, &store);
+                if let Err(e2) = dag.read().reach_self_check_sample(2000, 0x5157_B10C) {
+                    error!("reachability STILL fails self-check after rebuild: {e2}");
+                    std::process::exit(1);
+                }
+                info!("reachability self-check OK after rebuild");
+            } else {
+                error!("rebuilt reachability failed self-check: {e}");
+                std::process::exit(1);
+            }
+        } else {
+            info!("reachability self-check OK (sampled pairs match brute-force oracle)");
         }
     }
 
@@ -1298,9 +1402,17 @@ async fn main() {
                             );
                             continue;
                         }
-                        // Persist DAG data + integrity hash (Sprint Y, M-2)
+                        // Persist DAG data + integrity hash (Sprint Y, M-2).
+                        // Phase 1: fold the reachability delta into the same
+                        // atomic write when the index is maintained; live Legacy
+                        // path is byte-for-byte unchanged.
                         if let Some(ddata) = dag_m.read().get_block_data(&hash).cloned() {
-                            store_m.put_dag_with_integrity(&hash, &ddata).ok();
+                            if dag_m.read().maintains_reachability_index() {
+                                let (upserts, removals) = dag_m.write().reach_take_delta();
+                                store_m.put_dag_with_integrity_and_reach(&hash, &ddata, &upserts, &removals).ok();
+                            } else {
+                                store_m.put_dag_with_integrity(&hash, &ddata).ok();
+                            }
                         }
                         {
                             let mut s = state_m.write();
@@ -2090,7 +2202,16 @@ fn accept_block(
     // can never adopt a fork tip whose chain state was refused.
     if let Some(ddata) = dag.read().get_block_data(&block_hash).cloned() {
         // Sprint Y (M-2): atomic put to CF_DAG + CF_DAG_INTEGRITY.
-        store.put_dag_with_integrity(&block_hash, &ddata).ok();
+        // Phase 1: when the reachability index is maintained, fold its delta
+        // (which may span several blocks if this insert triggered a reindex)
+        // into the SAME WriteBatch, so a crash here leaves CF_DAG and
+        // CF_REACHABILITY consistent all-or-nothing. Live Legacy: unchanged.
+        if dag.read().maintains_reachability_index() {
+            let (upserts, removals) = dag.write().reach_take_delta();
+            store.put_dag_with_integrity_and_reach(&block_hash, &ddata, &upserts, &removals).ok();
+        } else {
+            store.put_dag_with_integrity(&block_hash, &ddata).ok();
+        }
     }
 
     // ── Update node state ────────────────────────────────────────────
