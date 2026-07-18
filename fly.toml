@@ -22,7 +22,7 @@ primary_region = "gru"
 # than the default 50 inbound peers or newcomers get dropped once it fills up
 # (the "~50-node wall"). Non-consensus operator knob (feature/peering-ux).
 [processes]
-  app = "--rpc-bind 0.0.0.0 --rpc-port 16210 --listen /ip4/0.0.0.0/tcp/16110 --data-dir /bloch-data --testnet --mine --max-peers 500 --peer /ip4/45.32.154.137/tcp/16110"
+  app = "--rpc-bind 0.0.0.0 --rpc-port 16210 --listen /ip4/0.0.0.0/tcp/16110 --data-dir /bloch-data --testnet --mine --miner-address bloch1qe986db5149cff7499b282a048272a09aff0af4ff84242073 --max-peers 500 --peer /ip4/45.32.154.137/tcp/16110"
 
 # Persistent chain data. Create the volume once (see README):
 #   flyctl volumes create bloch_data --size 30 --region iad
