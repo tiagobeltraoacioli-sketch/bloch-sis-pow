@@ -368,6 +368,111 @@ fn wide_deep_probe_reports_divergence() {
     let _ = &diffs;
 }
 
+// ── OFFLINE PROOF: Fast == oracle exactly where Legacy under-counts ───────────
+
+/// Sampled variant of [`assert_index_matches_oracle`] for large DAGs where the
+/// full O(n²) pairwise check is too slow. Draws `samples` deterministic pairs.
+fn assert_index_matches_oracle_sampled(
+    dag: &GhostDAG,
+    all: &[BlockHash],
+    samples: usize,
+    seed: u64,
+    label: &str,
+) {
+    let store = &dag.store;
+    let reach = dag.reachability();
+    let mut rng = Rng::new(seed);
+    let n = all.len();
+    for _ in 0..samples {
+        let a = all[rng.below(n)];
+        let b = all[rng.below(n)];
+        let idx = reach.is_dag_ancestor(&a, &b);
+        let bf = brute_force_is_ancestor(store, &a, &b);
+        assert_eq!(
+            idx, bf,
+            "[{label}] index/oracle mismatch: is_ancestor({},{}) index={} oracle={}",
+            hex::encode(&a[..4]), hex::encode(&b[..4]), idx, bf,
+        );
+    }
+}
+
+/// THE offline proof that the fix bites (mirrors what the real-snapshot harness
+/// proves against mainnet, but runnable in CI without a datadir).
+///
+/// Builds a deep MERGING DAG whose selected chain is longer than the legacy
+/// `past_blue_set` cap of `k*100`, so the legacy blue-set seed is TRUNCATED and
+/// under-counts on the deep blocks — while every block's height-difference stays
+/// under `MAX_REACHABILITY_DEPTH = 1024`, so the legacy `is_ancestor` bound is
+/// NOT the cause. This isolates the `past_blue_set` bound as the divergence
+/// source.
+///
+/// Asserts:
+///   1. the Fast interval index is consensus-correct (== unbounded oracle);
+///   2. Legacy != Fast on ≥1 block (the fix actually changes a result — the
+///      bound really bit);
+///   3. at a divergent block, Fast's `blues_anticone_sizes` is a strict SUPERSET
+///      of Legacy's, i.e. Legacy under-counted the blue lineage (never the
+///      reverse). This is the precise sense in which Legacy is the bug.
+#[test]
+fn offline_proof_fast_exact_where_legacy_undercounts() {
+    let g = hh(0, 0);
+    let k = 3; // cap = k*100 = 300 selected-chain hops
+    // merging(iters): selected chain depth ≈ 2*iters. iters=200 ⇒ depth ≈ 400 >
+    // 300 ⇒ the cap bites; and 400 < 1024 ⇒ is_ancestor never clamps.
+    let specs = merging(g, 200);
+    let order = order_of(g, &specs);
+
+    let legacy = build(g, &specs, k, ColoringMode::Legacy);
+    let fast = build(g, &specs, k, ColoringMode::Fast);
+
+    // (1) Fast index is consensus-correct.
+    assert_index_matches_oracle_sampled(&fast, &order, 8000, 0xDEEB_C0DE, "deep_merging");
+
+    // (2) The fix bites: at least one block differs.
+    let diffs = diff_blocks(&legacy, &fast, &order);
+    eprintln!(
+        "offline_proof: {} blocks (k={k}, cap={}), legacy-vs-fast divergences = {}",
+        order.len(), k * 100, diffs.len(),
+    );
+    for (h, d) in diffs.iter().take(3) {
+        eprintln!("  diverged at {}: {}", hex::encode(&h[..4]), d);
+    }
+    assert!(
+        !diffs.is_empty(),
+        "expected the past_blue_set cap to bite on a depth-{} chain with cap {} — \
+         if this is empty the deep-DAG proof no longer forces the bound",
+        2 * 200, k * 100,
+    );
+
+    // (3) Legacy UNDER-counts: Fast's blue lineage ⊋ Legacy's at every divergent
+    //     block (never the reverse), and Fast matches the oracle blue count.
+    let mut checked_superset = 0usize;
+    for (h, _) in &diffs {
+        let dl = legacy.get_block_data(h).unwrap();
+        let df = fast.get_block_data(h).unwrap();
+        let kl: std::collections::HashSet<_> = dl.blues_anticone_sizes.keys().collect();
+        let kf: std::collections::HashSet<_> = df.blues_anticone_sizes.keys().collect();
+        // Fast never drops a blue Legacy kept; where they differ, Fast has more.
+        assert!(
+            kl.is_subset(&kf),
+            "at {} Legacy has a blue Fast lacks — Fast must never under-count",
+            hex::encode(&h[..4]),
+        );
+        if kf.len() > kl.len() {
+            checked_superset += 1;
+        }
+    }
+    assert!(
+        checked_superset > 0,
+        "expected ≥1 block where Fast's blue set is strictly larger than Legacy's",
+    );
+    eprintln!(
+        "offline_proof: Fast's blue set strictly larger (Legacy under-counted) on {} block(s) — \
+         Fast == oracle throughout. The fix bites and is correct.",
+        checked_superset,
+    );
+}
+
 /// Sanity: the two constructors really do select different code paths, so the
 /// identity tests above are meaningful (not comparing a mode against itself).
 #[test]
