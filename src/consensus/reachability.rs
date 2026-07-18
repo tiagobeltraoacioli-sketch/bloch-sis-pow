@@ -87,7 +87,28 @@ pub struct ReachabilityStore {
     /// (merge-edge) ancestry.
     fcs: HashMap<BlockHash, Vec<BlockHash>>,
     root: Option<BlockHash>,
+    /// Durability tracking (Phase 1 — persistent reachability index).
+    ///
+    /// `dirty` holds every block whose persisted record (interval / remaining /
+    /// tree_parent / children / fcs) changed since the last
+    /// [`take_persist_delta`]. A single `add_block` can dirty many blocks when a
+    /// reindex reshuffles a subtree, so this set — not just the newly-added hash
+    /// — is what must be flushed to keep the on-disk index consistent with
+    /// memory. `tombstones` holds blocks removed by [`remove_leaf`] that must be
+    /// deleted from the CF. Both are drained atomically alongside the CF_DAG
+    /// write; see `docs/adr/ADR-035-*` and `Storage::put_dag_with_integrity_and_reach`.
+    ///
+    /// These sets are pure bookkeeping — they are NOT part of any query answer,
+    /// NOT consensus state, and are empty on a freshly-loaded index.
+    dirty: std::collections::HashSet<BlockHash>,
+    tombstones: std::collections::HashSet<BlockHash>,
 }
+
+/// Version tag for the serialized per-block reachability record layout. Bumped
+/// whenever [`ReachabilityStore::encode_record`] / [`decode_record`] change
+/// incompatibly, so a boot against an older on-disk index triggers a rebuild
+/// rather than mis-decoding. Persisted as `reachability/meta/version` in CF_META.
+pub const REACHABILITY_RECORD_VERSION: u32 = 1;
 
 impl Default for ReachabilityStore {
     fn default() -> Self {
@@ -104,7 +125,21 @@ impl ReachabilityStore {
             remaining: HashMap::new(),
             fcs: HashMap::new(),
             root: None,
+            dirty: std::collections::HashSet::new(),
+            tombstones: std::collections::HashSet::new(),
         }
+    }
+
+    /// The root (genesis) block of the labeling, if registered.
+    pub fn root(&self) -> Option<BlockHash> {
+        self.root
+    }
+
+    #[inline]
+    fn mark_dirty(&mut self, hash: BlockHash) {
+        // A block cannot be both live-and-dirty and a tombstone.
+        self.tombstones.remove(&hash);
+        self.dirty.insert(hash);
     }
 
     pub fn is_empty(&self) -> bool {
@@ -127,6 +162,7 @@ impl ReachabilityStore {
         self.remaining.insert(hash, (iv.start, iv.end - 1));
         self.fcs.insert(hash, Vec::new());
         self.root = Some(hash);
+        self.mark_dirty(hash);
     }
 
     /// Add a non-genesis block: `selected_parent` is the tree edge, `mergeset`
@@ -170,11 +206,15 @@ impl ReachabilityStore {
             self.interval.insert(child, iv);
             self.remaining.insert(child, (iv.start, iv.end.saturating_sub(1)));
             self.remaining.insert(*parent, (child_end + 1, hi));
+            self.mark_dirty(child);
+            self.mark_dirty(*parent);
         } else {
             // Parent is out of room — reindex its subtree (or a higher ancestor
             // with slack) so the new child gets a valid interval.
             self.interval.insert(child, Interval { start: 0, end: 0 }); // placeholder
             self.remaining.insert(child, (1, 0));
+            self.mark_dirty(child);
+            self.mark_dirty(*parent);
             self.reindex(*parent);
         }
     }
@@ -206,6 +246,9 @@ impl ReachabilityStore {
     /// subtree sizes. `node`'s own identity point is `iv.end`.
     fn assign_subtree(&mut self, node: BlockHash, iv: Interval) {
         self.interval.insert(node, iv);
+        // This node's interval (and, below, its `remaining`) just changed, so
+        // its persisted record is stale — flag it for the next durable flush.
+        self.mark_dirty(node);
         let children = self.children.get(&node).cloned().unwrap_or_default();
         if children.is_empty() {
             self.remaining.insert(node, (iv.start, iv.end.saturating_sub(1)));
@@ -276,6 +319,7 @@ impl ReachabilityStore {
         // `new_future` is the newest block, so it cannot be an ancestor of any
         // existing FCS member — a plain sorted insert keeps the set correct.
         self.fcs.entry(block).or_default().insert(pp, new_future);
+        self.mark_dirty(block);
     }
 
     // ── queries ─────────────────────────────────────────────────────────────
@@ -339,6 +383,7 @@ impl ReachabilityStore {
             if let Some(f) = self.fcs.get_mut(m) {
                 if let Some(pos) = f.iter().position(|x| x == hash) {
                     f.remove(pos);
+                    self.mark_dirty(*m);
                 }
             }
         }
@@ -349,13 +394,145 @@ impl ReachabilityStore {
                     ch.remove(pos);
                 }
             }
+            self.mark_dirty(parent);
         }
         self.interval.remove(hash);
         self.remaining.remove(hash);
         self.children.remove(hash);
         self.fcs.remove(hash);
+        // Removal wins over any pending dirty flag for this block.
+        self.dirty.remove(hash);
+        self.tombstones.insert(*hash);
         true
     }
+
+    // ── durable serialization (Phase 1) ──────────────────────────────────────
+
+    /// Deterministically encode a single block's reachability record.
+    ///
+    /// Layout (all integers little-endian):
+    /// ```text
+    /// [start u64][end u64][rem_lo u64][rem_hi u64]
+    /// [parent_tag u8][parent 32B]           // tag 0 = no tree parent (root)
+    /// [children_len u32][children 32B*]      // insertion order preserved
+    /// [fcs_len u32][fcs 32B*]                // interval-start-sorted order
+    /// ```
+    /// Byte-for-byte reproducible from equal in-memory state. Returns `None`
+    /// if the block has no interval (never registered / already removed).
+    fn encode_record(&self, hash: &BlockHash) -> Option<Vec<u8>> {
+        let iv = self.interval.get(hash)?;
+        let (lo, hi) = self.remaining.get(hash).copied().unwrap_or((1, 0));
+        let children = self.children.get(hash).cloned().unwrap_or_default();
+        let fcs = self.fcs.get(hash).cloned().unwrap_or_default();
+        let mut out = Vec::with_capacity(41 + 4 + children.len() * 32 + 4 + fcs.len() * 32);
+        out.extend_from_slice(&iv.start.to_le_bytes());
+        out.extend_from_slice(&iv.end.to_le_bytes());
+        out.extend_from_slice(&lo.to_le_bytes());
+        out.extend_from_slice(&hi.to_le_bytes());
+        match self.tree_parent.get(hash) {
+            Some(p) => { out.push(1); out.extend_from_slice(p); }
+            None => { out.push(0); out.extend_from_slice(&[0u8; 32]); }
+        }
+        out.extend_from_slice(&(children.len() as u32).to_le_bytes());
+        for c in &children { out.extend_from_slice(c); }
+        out.extend_from_slice(&(fcs.len() as u32).to_le_bytes());
+        for f in &fcs { out.extend_from_slice(f); }
+        Some(out)
+    }
+
+    /// Drain the pending durability delta: `(upserts, deletes)`. `upserts` are
+    /// `(block_hash, encoded_record)` pairs for every block whose record changed
+    /// since the last drain; `deletes` are blocks removed from the index. The
+    /// caller MUST persist all of these in the SAME atomic batch as the
+    /// corresponding CF_DAG write, then this drain leaves the tracking sets
+    /// empty. Idempotent when nothing changed (returns two empty vecs).
+    pub fn take_persist_delta(&mut self) -> (Vec<(BlockHash, Vec<u8>)>, Vec<BlockHash>) {
+        let mut upserts = Vec::with_capacity(self.dirty.len());
+        // Deterministic order (sorted by hash) so identical logical state
+        // produces identical write sequences — helps reproducibility/debugging.
+        let mut dirty: Vec<BlockHash> = self.dirty.drain().collect();
+        dirty.sort_unstable();
+        for h in dirty {
+            if let Some(rec) = self.encode_record(&h) {
+                upserts.push((h, rec));
+            }
+        }
+        let mut deletes: Vec<BlockHash> = self.tombstones.drain().collect();
+        deletes.sort_unstable();
+        (upserts, deletes)
+    }
+
+    /// Snapshot the ENTIRE index as `(block_hash, encoded_record)` pairs, in
+    /// hash-sorted order. Used to write a freshly-rebuilt index in one batch and
+    /// by round-trip tests. Does not touch the dirty/tombstone tracking.
+    pub fn export_all(&self) -> Vec<(BlockHash, Vec<u8>)> {
+        let mut hashes: Vec<BlockHash> = self.interval.keys().copied().collect();
+        hashes.sort_unstable();
+        hashes.iter().filter_map(|h| self.encode_record(h).map(|r| (*h, r))).collect()
+    }
+
+    /// Rebuild the whole index in-memory from persisted records + the stored
+    /// root. Replaces any current state. Returns `Err` on a malformed record.
+    /// After this the dirty/tombstone sets are empty (the on-disk copy is
+    /// authoritative and already matches memory).
+    pub fn load_from_records(
+        &mut self,
+        records: &[(BlockHash, Vec<u8>)],
+        root: Option<BlockHash>,
+    ) -> Result<(), String> {
+        self.interval.clear();
+        self.tree_parent.clear();
+        self.children.clear();
+        self.remaining.clear();
+        self.fcs.clear();
+        self.dirty.clear();
+        self.tombstones.clear();
+        self.root = root;
+        for (h, bytes) in records {
+            let (iv, rem, parent, children, fcs) = decode_record(bytes)
+                .map_err(|e| format!("reachability record for {} malformed: {e}", hex::encode(&h[..4])))?;
+            self.interval.insert(*h, iv);
+            self.remaining.insert(*h, rem);
+            if let Some(p) = parent { self.tree_parent.insert(*h, p); }
+            self.children.insert(*h, children);
+            self.fcs.insert(*h, fcs);
+        }
+        Ok(())
+    }
+}
+
+/// Decode a record produced by `ReachabilityStore::encode_record`.
+#[allow(clippy::type_complexity)]
+fn decode_record(
+    b: &[u8],
+) -> Result<(Interval, (u64, u64), Option<BlockHash>, Vec<BlockHash>, Vec<BlockHash>), String> {
+    let mut o = 0usize;
+    let rd_u64 = |b: &[u8], o: &mut usize| -> Result<u64, String> {
+        if *o + 8 > b.len() { return Err("truncated u64".into()); }
+        let v = u64::from_le_bytes(b[*o..*o + 8].try_into().unwrap());
+        *o += 8; Ok(v)
+    };
+    let rd_hash = |b: &[u8], o: &mut usize| -> Result<BlockHash, String> {
+        if *o + 32 > b.len() { return Err("truncated hash".into()); }
+        let mut h = [0u8; 32]; h.copy_from_slice(&b[*o..*o + 32]); *o += 32; Ok(h)
+    };
+    let start = rd_u64(b, &mut o)?;
+    let end = rd_u64(b, &mut o)?;
+    let lo = rd_u64(b, &mut o)?;
+    let hi = rd_u64(b, &mut o)?;
+    if o >= b.len() { return Err("truncated parent tag".into()); }
+    let tag = b[o]; o += 1;
+    let parent_raw = rd_hash(b, &mut o)?;
+    let parent = if tag == 1 { Some(parent_raw) } else { None };
+    if o + 4 > b.len() { return Err("truncated children len".into()); }
+    let clen = u32::from_le_bytes(b[o..o + 4].try_into().unwrap()) as usize; o += 4;
+    let mut children = Vec::with_capacity(clen);
+    for _ in 0..clen { children.push(rd_hash(b, &mut o)?); }
+    if o + 4 > b.len() { return Err("truncated fcs len".into()); }
+    let flen = u32::from_le_bytes(b[o..o + 4].try_into().unwrap()) as usize; o += 4;
+    let mut fcs = Vec::with_capacity(flen);
+    for _ in 0..flen { fcs.push(rd_hash(b, &mut o)?); }
+    Ok((Interval { start, end }, (lo, hi), parent, children, fcs))
 }
 
 /// `Vec` partition point where the elements form a prefix satisfying `pred`.
@@ -463,5 +640,73 @@ mod tests {
         assert!(!r.is_dag_ancestor(&a, &b), "siblings are anticone");
         assert!(!r.is_dag_ancestor(&b, &a));
         assert!(!r.is_dag_ancestor(&c, &a));
+    }
+
+    /// Serialize → clear → reload must answer every ancestry query identically.
+    #[test]
+    fn persist_roundtrip_matches() {
+        let mut r = ReachabilityStore::new();
+        let g = h(0);
+        r.add_genesis(g);
+        // Build a merging DAG that forces at least one reindex + non-trivial FCS.
+        let mut prev = g;
+        let mut all = vec![g];
+        for i in 1..=40u16 {
+            let l = h(i);
+            let rr = h(1000 + i);
+            let m = h(2000 + i);
+            r.add_block(l, &prev, &[]);
+            r.add_block(rr, &prev, &[]);
+            r.add_block(m, &l, &[rr]); // selected_parent = l, merges rr
+            all.push(l); all.push(rr); all.push(m);
+            prev = m;
+        }
+        let root = r.root();
+        let records = r.export_all();
+
+        let mut restored = ReachabilityStore::new();
+        restored.load_from_records(&records, root).expect("reload");
+        assert_eq!(restored.len(), r.len());
+        for a in &all {
+            for b in &all {
+                assert_eq!(
+                    r.is_dag_ancestor(a, b),
+                    restored.is_dag_ancestor(a, b),
+                    "roundtrip mismatch for pair"
+                );
+            }
+        }
+    }
+
+    /// The incremental delta drain reproduces the same records as a full export.
+    #[test]
+    fn delta_drain_reconstructs_full_index() {
+        let mut r = ReachabilityStore::new();
+        let g = h(0);
+        r.add_genesis(g);
+        let mut prev = g;
+        for i in 1..=25u16 {
+            let a = h(i);
+            let b = h(500 + i);
+            r.add_block(a, &prev, &[]);
+            r.add_block(b, &a, &[]); // linear-ish with occasional sibling
+            prev = a;
+            let _ = b;
+        }
+        // Apply the drained upserts into a fresh map and compare to export_all.
+        let (upserts, deletes) = r.take_persist_delta();
+        assert!(deletes.is_empty(), "no removals happened");
+        let mut disk: std::collections::HashMap<BlockHash, Vec<u8>> =
+            upserts.into_iter().collect();
+        // A second drain must be empty (idempotent).
+        let (u2, d2) = r.take_persist_delta();
+        assert!(u2.is_empty() && d2.is_empty(), "delta must be empty after drain");
+        let full: std::collections::HashMap<BlockHash, Vec<u8>> =
+            r.export_all().into_iter().collect();
+        // Every current block's delta-record equals its full-export record.
+        for (h, rec) in &full {
+            assert_eq!(disk.remove(h).as_ref(), Some(rec), "record mismatch");
+        }
+        assert!(disk.is_empty(), "delta had records for unknown blocks");
     }
 }
