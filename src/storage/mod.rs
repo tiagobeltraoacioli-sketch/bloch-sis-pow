@@ -20,6 +20,7 @@ const CF_TX_INDEX:   &str = "tx_index";    // txid → [32B block_hash][8B heigh
 const CF_ADDR_TX_HISTORY: &str = "addr_tx_history";  // addr → chronological tx touches
 const CF_UNDO:       &str = "undo";        // Sprint U.1: per-block undo data for reorg rollback
 const CF_DAG_INTEGRITY: &str = "dag_integrity";  // Sprint Y (M-2): hash-chain over GhostdagData
+const CF_REACHABILITY: &str = "reachability";    // Phase 1: durable interval-reachability index (non-consensus cache)
 
 // ── PoBRS Column Families (Sprint 1.5) ─────────────────────────────────
 // Persistence layer for the Proof-of-Blue-and-Red-Score subsystem.
@@ -96,6 +97,10 @@ impl Storage {
             },
             ColumnFamilyDescriptor::new(CF_UNDO,       Options::default()),
             ColumnFamilyDescriptor::new(CF_DAG_INTEGRITY, Options::default()),
+            // Phase 1: durable reachability index. Key = 32B block hash,
+            // value = encode_record() bytes. A rebuildable cache, never part of
+            // the integrity chain; see docs/adr/ADR-035-durable-reachability-index.md.
+            ColumnFamilyDescriptor::new(CF_REACHABILITY, Options::default()),
             // ── PoBRS CFs (Sprint 1.5) ─────────────────────────────
             ColumnFamilyDescriptor::new(CF_POBRS_META,                Options::default()),
             ColumnFamilyDescriptor::new(CF_POBRS_ORACLES,             Options::default()),
@@ -544,6 +549,129 @@ impl Storage {
             }
         }
         Ok(entries)
+    }
+
+    // ── Durable reachability index (Phase 1) ────────────────────────────
+    //
+    // The interval-reachability index (`consensus::reachability::ReachabilityStore`)
+    // is an O(1)/O(log n) DAG-ancestry cache. It is NOT consensus state — it is
+    // never hashed into the integrity chain and can always be rebuilt by
+    // replaying CF_DAG. To make it durable (and avoid an O(chain) rebuild every
+    // boot) its per-block records live in CF_REACHABILITY, and — crucially —
+    // each record delta is written in the SAME WriteBatch as the CF_DAG block it
+    // derives from (`put_dag_with_integrity_and_reach`), so a crash can never
+    // leave the index describing a block CF_DAG doesn't have, or vice-versa.
+    //
+    // The layout version + root live in CF_META under `reachability/meta/*`.
+
+    /// Schema version for the CF_REACHABILITY record layout, mirrored from
+    /// `consensus::reachability::REACHABILITY_RECORD_VERSION`. On boot a
+    /// mismatch (or absent tag) forces a full rebuild from CF_DAG.
+    pub const REACHABILITY_SCHEMA_VERSION: u32 =
+        crate::consensus::reachability::REACHABILITY_RECORD_VERSION;
+
+    /// Atomic CF_DAG + CF_DAG_INTEGRITY + CF_REACHABILITY write.
+    ///
+    /// Identical to [`put_dag_with_integrity`] for the DAG/integrity CFs, but
+    /// additionally folds the reachability delta (`reach_upserts` /
+    /// `reach_removals`, drained from `ReachabilityStore::take_persist_delta`)
+    /// into the SAME `WriteBatch`. All-or-nothing: after a crash the block, its
+    /// integrity link, and every reachability record touched by inserting it
+    /// either all landed or none did.
+    ///
+    /// Used only when the reachability index is being maintained (Fast /
+    /// armed-activation). On the live Legacy path the caller uses the plain
+    /// [`put_dag_with_integrity`] and CF_REACHABILITY stays empty.
+    pub fn put_dag_with_integrity_and_reach(
+        &self,
+        hash: &BlockHash,
+        data: &GhostdagData,
+        reach_upserts: &[(BlockHash, Vec<u8>)],
+        reach_removals: &[BlockHash],
+    ) -> Result<[u8; 32], StorageError> {
+        let parent_integrity: [u8; 32] = match &data.selected_parent {
+            Some(sp) => self.get_integrity_hash(sp)?.unwrap_or([0u8; 32]),
+            None     => [0u8; 32],
+        };
+        let integrity = crate::consensus::compute_integrity_hash(hash, data, &parent_integrity);
+
+        let cf_dag = self.db.cf_handle(CF_DAG)
+            .ok_or(StorageError::CfNotFound(CF_DAG.into()))?;
+        let cf_int = self.db.cf_handle(CF_DAG_INTEGRITY)
+            .ok_or(StorageError::CfNotFound(CF_DAG_INTEGRITY.into()))?;
+        let cf_reach = self.db.cf_handle(CF_REACHABILITY)
+            .ok_or(StorageError::CfNotFound(CF_REACHABILITY.into()))?;
+
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.put_cf(&cf_dag, hash, &encode(data)?);
+        batch.put_cf(&cf_int, hash, &integrity);
+        for (h, rec) in reach_upserts {
+            batch.put_cf(&cf_reach, h, rec);
+        }
+        for h in reach_removals {
+            batch.delete_cf(&cf_reach, h);
+        }
+        self.db.write(batch)
+            .map_err(|e| StorageError::WriteFailed(e.to_string()))?;
+        Ok(integrity)
+    }
+
+    /// Persist a full reachability snapshot + its version tag + root in one
+    /// batch. Used after a boot-time rebuild to write the freshly-materialized
+    /// index. Clears any stale records first so the CF exactly mirrors memory.
+    pub fn store_reachability_snapshot(
+        &self,
+        records: &[(BlockHash, Vec<u8>)],
+        root: Option<BlockHash>,
+    ) -> Result<(), StorageError> {
+        let cf_reach = self.db.cf_handle(CF_REACHABILITY)
+            .ok_or(StorageError::CfNotFound(CF_REACHABILITY.into()))?;
+        let cf_meta = self.db.cf_handle(CF_META)
+            .ok_or(StorageError::CfNotFound(CF_META.into()))?;
+        let mut batch = rocksdb::WriteBatch::default();
+        // Wipe existing records (rebuild replaces the whole index).
+        for item in self.db.iterator_cf(&cf_reach, IteratorMode::Start) {
+            if let Ok((k, _)) = item { batch.delete_cf(&cf_reach, &k); }
+        }
+        for (h, rec) in records {
+            batch.put_cf(&cf_reach, h, rec);
+        }
+        batch.put_cf(&cf_meta, b"reachability/meta/version",
+                     &Self::REACHABILITY_SCHEMA_VERSION.to_le_bytes());
+        match root {
+            Some(r) => batch.put_cf(&cf_meta, b"reachability/meta/root", &r),
+            None    => batch.delete_cf(&cf_meta, b"reachability/meta/root"),
+        }
+        self.db.write(batch).map_err(|e| StorageError::WriteFailed(e.to_string()))
+    }
+
+    /// Load every persisted `(block_hash, record_bytes)` from CF_REACHABILITY.
+    pub fn load_all_reachability(&self) -> Result<Vec<(BlockHash, Vec<u8>)>, StorageError> {
+        let cf = self.db.cf_handle(CF_REACHABILITY)
+            .ok_or(StorageError::CfNotFound(CF_REACHABILITY.into()))?;
+        let mut out = Vec::new();
+        for item in self.db.iterator_cf(&cf, IteratorMode::Start) {
+            if let Ok((k, v)) = item {
+                if k.len() == 32 {
+                    let mut h = [0u8; 32];
+                    h.copy_from_slice(&k);
+                    out.push((h, v.to_vec()));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Read the persisted reachability schema version, if present.
+    pub fn get_reachability_version(&self) -> Result<Option<u32>, StorageError> {
+        Ok(self.get_meta("reachability/meta/version")?
+            .and_then(|b| b.as_slice().try_into().ok().map(u32::from_le_bytes)))
+    }
+
+    /// Read the persisted reachability root (genesis) hash, if present.
+    pub fn get_reachability_root(&self) -> Result<Option<BlockHash>, StorageError> {
+        Ok(self.get_meta("reachability/meta/root")?
+            .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok()))
     }
 
     // ── Coinbase maturity tracking (FIX VULN-03) ────────────────────────
