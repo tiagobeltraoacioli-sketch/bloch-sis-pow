@@ -298,6 +298,46 @@ fn replay_snapshot_legacy_vs_fast() {
         }
     }
 
+    // 4c. Stall-line report: the live chain froze at blue_score 395897 because
+    //     the bounded Legacy path diverged the selected chain. Report the max
+    //     blue_score each replay reaches so the operator can see whether Fast
+    //     advances past the stall where Legacy stalled.
+    const STALL_BLUE_SCORE: u64 = 395_897;
+    let max_bs = |dag: &GhostDAG| -> u64 {
+        order.iter().filter_map(|h| dag.get_block_data(h)).map(|d| d.blue_score).max().unwrap_or(0)
+    };
+    let (legacy_max, fast_max) = (max_bs(&legacy), max_bs(&fast));
+    eprintln!("--- STALL-LINE (blue_score {STALL_BLUE_SCORE}) ---");
+    eprintln!("legacy max blue_score reached: {legacy_max}");
+    eprintln!("fast   max blue_score reached: {fast_max}");
+    eprintln!(
+        "fast advances past the stall line: {}  (legacy past it: {})",
+        fast_max > STALL_BLUE_SCORE, legacy_max > STALL_BLUE_SCORE,
+    );
+
+    // 4d. Truncation-signature report. A block can have the SAME coloring
+    //     decision (blue_score, mergeset_blues, mergeset_reds) yet different
+    //     canonical bytes when only its `blues_anticone_sizes` map differs —
+    //     that is the fingerprint of a truncated Legacy blue-set seed that did
+    //     NOT flip a classification. `decision_flips` are the stronger case
+    //     where the decision itself changed. Reported (not asserted): whether a
+    //     divergence is consensus-relevant is the gate decision below.
+    let mut metadata_only = 0usize;
+    let mut decision_flips = 0usize;
+    for h in &order {
+        if let (Some(dl), Some(df)) = (legacy.get_block_data(h), fast.get_block_data(h)) {
+            if canonical_encode(dl) == canonical_encode(df) { continue; }
+            let same_decision = dl.blue_score == df.blue_score
+                && dl.mergeset_blues == df.mergeset_blues
+                && dl.mergeset_reds == df.mergeset_reds;
+            if same_decision { metadata_only += 1; } else { decision_flips += 1; }
+        }
+    }
+    eprintln!(
+        "divergence breakdown: {decision_flips} decision-flip(s) (blue_score/mergeset changed), \
+         {metadata_only} metadata-only (blues_anticone_sizes seed truncated, decision unchanged)"
+    );
+
     eprintln!("--- RESULT ---");
     eprintln!("blocks replayed: {total}");
     if divergences == 0 {
