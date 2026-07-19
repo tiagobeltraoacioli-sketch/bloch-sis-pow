@@ -243,6 +243,13 @@ pub const fn chain_requires_carryover(id: ChainId) -> bool {
     match id {
         ChainId::Mainnet => false,
         ChainId::Testnet => false,
+        // The decision this exhaustive match was written to force. Genesis-2
+        // exists to carry the ledger over: a node that started it WITHOUT the
+        // snapshot would produce a chain with the right rules and an empty
+        // ledger — every balance silently gone, and nothing in the protocol
+        // objecting. Requiring the flag makes that failure impossible instead
+        // of merely unlikely.
+        ChainId::Genesis2Devnet => true,
     }
 }
 

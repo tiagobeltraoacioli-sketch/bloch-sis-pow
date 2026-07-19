@@ -877,7 +877,7 @@ async fn main() {
                         // Frontier gap → enter IBD (blue_work-verified release).
                         state2.write().is_syncing = true;
                         for h in &to_req {
-                            let _ = otx2.send(network::NetworkMessage::GetBlock { block_hash: *h }).await;
+                            let _ = otx2.send(network::NetworkMessage::GetBlock { block_hash: *h, nonce: getblock_nonce() }).await;
                         }
                     }
                     maybe_release_ibd(&dag2, &peer_state2, &frontier2, &state2);
@@ -906,7 +906,7 @@ async fn main() {
                         .map(|e| e.hash).collect();
                     info!("IBD: need {}/{} blocks", missing.len(), entries.len());
                     for hash in missing {
-                        let _ = otx2.send(network::NetworkMessage::GetBlock { block_hash: hash }).await;
+                        let _ = otx2.send(network::NetworkMessage::GetBlock { block_hash: hash, nonce: getblock_nonce() }).await;
                     }
                     if entries.is_empty() {
                         // Phase-2: an empty Headers reply no longer clears
@@ -943,7 +943,7 @@ async fn main() {
                 }
 
                 // IBD step 4: respond to GetBlock with the actual block
-                network::NetworkMessage::GetBlock { block_hash } => {
+                network::NetworkMessage::GetBlock { block_hash, .. } => {
                     match store2.get_block(&block_hash) {
                         Ok(Some(block)) => {
                             // Sprint 1.c: Bitcoin-format wire.
@@ -1047,7 +1047,7 @@ async fn main() {
                                     // time instead of duplicating GetBlocks.
                                     if first_waiter && !orphans.contains_key(mp) {
                                         let _ = otx2.send(network::NetworkMessage::GetBlock {
-                                            block_hash: *mp,
+                                            block_hash: *mp, nonce: getblock_nonce(),
                                         }).await;
                                     }
                                 }
@@ -1231,7 +1231,7 @@ async fn main() {
                     let now = std::time::Instant::now();
                     let stale = frontier_n.lock().expired(sync::TIP_REQUEST_TIMEOUT, now);
                     for h in stale {
-                        let _ = otx_n.send(network::NetworkMessage::GetBlock { block_hash: h }).await;
+                        let _ = otx_n.send(network::NetworkMessage::GetBlock { block_hash: h, nonce: getblock_nonce() }).await;
                     }
                     // Re-test the blue_work-verified IBD latch so a node never
                     // wedges in is_syncing after it has actually caught up —
@@ -2050,6 +2050,15 @@ fn make_rpc_submit_block_cb(
 /// `finalized_height`, so a strictly-heavier chain can still deep-reorg us back
 /// once its holder becomes reachable — mine-through can never self-finalize a
 /// solo fork. Driven by the miner loop; cleared when synced / catching up.
+/// A per-request nonce whose ONLY job is to make each GetBlock unique on the
+/// wire, so gossipsub's duplicate cache cannot swallow a retry. Monotonic rather
+/// than random: retries must differ from each other, and a counter guarantees
+/// that without depending on an RNG or on the clock's resolution.
+fn getblock_nonce() -> u64 {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 static FINALITY_FROZEN: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
