@@ -180,6 +180,41 @@ pub const GENESIS_TIMESTAMP: u64   = 1777686240;
 // ceremony (B5e). Also the ASERT-Lattice anchor (see src/pow::next_bits).
 pub const GENESIS_BITS:      u32   = 0x2100ffff;
 
+// ── Genesis-2 carry-over commitment ─────────────────────────────────────────
+//
+// Emitted by `bloch-genesis2 --snapshot utxo-snapshot-20260719.tsv --height
+// 413743` after the snapshot verified (supply == height × 8,400 BLCH exactly,
+// utxo count == height). The root is SHAKE-256 over the snapshot file's RAW
+// BYTES, so any edit — truncation, a removed line, or a REORDERING — yields a
+// different root. These four constants bind a Genesis-2 chain to the exact
+// ledger it carries over, the same way GENESIS_POW_SOLUTION binds this chain
+// to its genesis: a node MUST refuse to start (exit 1) if the snapshot it is
+// given does not re-verify against all of them. See src/storage/mod.rs
+// `verify_carryover_snapshot` for the fail-closed loader.
+pub const CARRYOVER_SNAPSHOT_ROOT: [u8; 32] = [
+    0xd3, 0xde, 0x5e, 0x51, 0xee, 0x9d, 0xbb, 0xf3,
+    0x6e, 0xd7, 0x99, 0x81, 0xcb, 0xf6, 0x6e, 0xb5,
+    0x0a, 0x88, 0x94, 0xfc, 0x03, 0x46, 0x10, 0xa2,
+    0x0a, 0x5e, 0xe0, 0x1e, 0xb9, 0x06, 0x06, 0x37,
+];
+pub const CARRYOVER_SOURCE_HEIGHT: u64  = 413_743;
+pub const CARRYOVER_UTXO_COUNT:    u64  = 413_743;
+pub const CARRYOVER_TOTAL_SAT:     u128 = 347_544_120_000_000_000;
+
+/// Whether `id` REQUIRES the carry-over snapshot to be ingested before the
+/// node may run. Deliberately an exhaustive match with no wildcard arm: when a
+/// Genesis-2 chain-id variant is added (g2/T1 adds `Genesis2Devnet`), this
+/// stops compiling until someone makes the explicit decision — silently
+/// defaulting a new chain to "no carry-over needed" is exactly the fail-open
+/// this migration exists to remove. Today no shipped chain requires it; the
+/// loader is still exercisable via the explicit `--carryover-snapshot` flag.
+pub const fn chain_requires_carryover(id: ChainId) -> bool {
+    match id {
+        ChainId::Mainnet => false,
+        ChainId::Testnet => false,
+    }
+}
+
 // ── Soft fork SF-1: canonical residual-gate width, k: 4 → 8 ─────────────────
 //
 // Height-activated tightening of the Bloch-SIS PoW residual gate from the
