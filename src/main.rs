@@ -66,6 +66,15 @@ struct Cli {
     /// recovered. Run at least one archival node, or new nodes cannot join.
     /// Costs disk: the full chain instead of the last 10,000 blocks.
     #[arg(long)]                                         archive: bool,
+    /// Genesis-2 carry-over: path to the blessed UTXO snapshot TSV, ingested
+    /// once at FIRST boot. Before anything is written the file is fully
+    /// verified against the baked-in constants (bloch-crypto core): SHAKE-256
+    /// over its RAW bytes must equal CARRYOVER_SNAPSHOT_ROOT, its line count
+    /// CARRYOVER_UTXO_COUNT, and its summed value CARRYOVER_TOTAL_SAT. Any
+    /// mismatch → the node logs the specific failure(s) and refuses to start
+    /// (exit 1), like the genesis PoW check. A chain-id that REQUIRES
+    /// carry-over refuses to start if this flag is absent.
+    #[arg(long)]                                         carryover_snapshot: Option<PathBuf>,
     #[arg(long)]                                         testnet: bool,
     #[arg(long, default_value = "./bloch-data")]          data_dir: String,
     /// RPC bind address. SECURITY: defaults to 127.0.0.1 (local only).
@@ -298,6 +307,87 @@ async fn main() {
         ARCHIVE_MODE.store(true, std::sync::atomic::Ordering::Relaxed);
         info!("--archive: pruning DISABLED, every block body retained. This node can \
                bootstrap fresh peers; a pruned node cannot.");
+    }
+
+    // ── Genesis-2 carry-over gate (fail closed) ──────────────────────────────
+    // Runs BEFORE genesis initialisation so that on first boot the snapshot is
+    // fully verified before this process writes ANY chain state. Order of
+    // operations on first boot: verify (root + count + supply, all reported) →
+    // ingest (one atomic WriteBatch, UTXOs + marker together) → genesis init.
+    // A crash between ingest and genesis init re-runs both next boot
+    // (idempotent: same keys, same verified bytes).
+    let first_boot = store.get_meta("genesis_hash").ok().flatten().is_none();
+    let carryover_required = core::chain_requires_carryover(core::node_chain_id());
+    if carryover_required && cli.carryover_snapshot.is_none() {
+        error!("this chain-id ({:?}) REQUIRES a carry-over snapshot: pass \
+                --carryover-snapshot <file.tsv> whose SHAKE-256 root is {}. \
+                Refusing to start.",
+               core::node_chain_id(), hex::encode(core::CARRYOVER_SNAPSHOT_ROOT));
+        std::process::exit(1);
+    }
+    if let Some(snap_path) = &cli.carryover_snapshot {
+        if !carryover_required {
+            warn!("--carryover-snapshot on a chain-id ({:?}) that does not require it — \
+                   dev/test use only; the snapshot is still verified fail-closed.",
+                  core::node_chain_id());
+        }
+        if first_boot {
+            info!("carry-over: verifying {} against baked-in constants \
+                   (root {}…, count {}, supply {} sat)…",
+                  snap_path.display(),
+                  &hex::encode(core::CARRYOVER_SNAPSHOT_ROOT)[..16],
+                  core::CARRYOVER_UTXO_COUNT, core::CARRYOVER_TOTAL_SAT);
+            match storage::verify_carryover_snapshot(snap_path) {
+                Ok(snap) => {
+                    info!("carry-over snapshot VERIFIED: root {}, {} UTXOs, {} sat",
+                          hex::encode(snap.root), snap.count, snap.total_sat);
+                    match store.ingest_carryover(&snap) {
+                        Ok(n) => info!("carry-over ingested: {n} UTXOs written atomically \
+                                        (meta carryover_root stamped)"),
+                        Err(e) => {
+                            error!("carry-over ingestion FAILED after verification: {e}. \
+                                    The write batch is atomic — nothing was persisted. \
+                                    Refusing to start.");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                Err(failures) => {
+                    for f in &failures {
+                        error!("carry-over verification FAILED: {f}");
+                    }
+                    error!("REFUSING TO START: {} carry-over check(s) failed; nothing was \
+                            written. Supply this chain's exact blessed snapshot file — \
+                            the loader verifies the bytes it is given and never sorts or \
+                            repairs them.", failures.len());
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            // Already-initialised data-dir: never re-ingest. Prove the ingestion
+            // actually happened, against the SAME root this binary requires.
+            match store.get_meta("carryover_root").ok().flatten() {
+                Some(r) if r.as_slice() == core::CARRYOVER_SNAPSHOT_ROOT => {
+                    info!("carry-over already ingested (meta carryover_root matches {}…); \
+                           snapshot file not re-read.",
+                          &hex::encode(core::CARRYOVER_SNAPSHOT_ROOT)[..16]);
+                }
+                Some(r) => {
+                    error!("carry-over marker MISMATCH: data-dir was ingested from root {} \
+                            but this binary requires {}. This data-dir belongs to a \
+                            different carry-over lineage. Refusing to start.",
+                           hex::encode(&r), hex::encode(core::CARRYOVER_SNAPSHOT_ROOT));
+                    std::process::exit(1);
+                }
+                None => {
+                    error!("carry-over marker ABSENT: this data-dir was initialised WITHOUT \
+                            carry-over ingestion, and grafting a snapshot onto existing \
+                            chain state is not supported. Start from a fresh data-dir. \
+                            Refusing to start.");
+                    std::process::exit(1);
+                }
+            }
+        }
     }
 
     if store.get_meta("genesis_hash").ok().flatten().is_none() {
