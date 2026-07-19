@@ -63,7 +63,7 @@ fn encode<T: serde::Serialize>(v: &T) -> Result<Vec<u8>, StorageError> {
         .map_err(|e| StorageError::SerializeFailed(e.to_string()))
 }
 
-fn decode<T: serde::de::DeserializeOwned>(b: &[u8]) -> Result<T, StorageError> {
+pub fn decode<T: serde::de::DeserializeOwned>(b: &[u8]) -> Result<T, StorageError> {
     bincode::serde::decode_from_slice(b, bincode::config::standard())
         .map(|(v, _)| v)
         .map_err(|e| StorageError::DeserializeFailed(e.to_string()))

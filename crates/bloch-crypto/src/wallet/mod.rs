@@ -631,5 +631,9 @@ fn derive_key(pw: &str, salt: &[u8]) -> Result<Vec<u8>, String> {
     Ok(key)
 }
 
+// Terminal CLI (clap + rpassword) — gated so the pure wallet/crypto subset
+// cross-compiles to wasm32 for the mobile WASM wallet. Native CLI builds enable
+// `wallet-cli` (the `postern-wallet` bin already requires it).
+#[cfg(feature = "wallet-cli")]
 pub mod cli;
 
