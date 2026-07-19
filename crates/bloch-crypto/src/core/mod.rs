@@ -1740,6 +1740,164 @@ pub fn create_genesis_block_with_bits(
         shielded_transactions: Vec::new(),    }
 }
 
+// ── Genesis-2 (carry-over chain, SHA-256d PoW) ───────────────────────────────
+//
+// Genesis-2 is a NEW chain (ChainId::Genesis2Devnet, PowAlgorithm::Sha256d)
+// that carries every balance of the live chain over from a published,
+// independently reproducible UTXO snapshot. The genesis block's coinbase
+// script_sig embeds the carry-over commitment in HUMAN-READABLE form (source
+// height, UTXO count, snapshot-root prefix), so the chain's identity is bound
+// to the ledger it carries and the binding is visible in any block explorer.
+//
+// The commitment constants below are the verified artifact produced by
+// `bloch-snapshot-utxo` + `bloch-genesis2` (both refuse to emit on any
+// verification failure):
+//   height 413,743 · 413,743 UTXOs · 3,475,441,200 BLCH
+//   root d3de5e51ee9dbbf36ed79981cbf66eb50a8894fc034610a20a5ee01eb9060637
+//
+// PoW is double SHA-256 over the 80-byte MiningHeader projection (the g2/T1
+// path: Block::validate_pow's Sha256d arm). The genesis nonce is mined ONCE
+// by `bloch-mine-genesis2`; the node must only VALIDATE — never mine — and
+// refuse to start if validation fails, exactly like create_genesis_block +
+// validate_pow today.
+//
+// Changing ANY of: the carry-over constants, GENESIS2_TIMESTAMP, GENESIS2_BITS,
+// or the miner script_pubkey invalidates GENESIS2_NONCE (the script_sig text is
+// derived from the carry-over constants and feeds the merkle root, which feeds
+// the 80-byte header) — validate_pow then fails and the node must exit(1).
+
+/// SHAKE-256 root of the raw snapshot file bytes (bloch-genesis2 output):
+/// d3de5e51ee9dbbf36ed79981cbf66eb50a8894fc034610a20a5ee01eb9060637.
+pub const GENESIS2_CARRYOVER_SNAPSHOT_ROOT: [u8; 32] = [
+    0xd3, 0xde, 0x5e, 0x51, 0xee, 0x9d, 0xbb, 0xf3,
+    0x6e, 0xd7, 0x99, 0x81, 0xcb, 0xf6, 0x6e, 0xb5,
+    0x0a, 0x88, 0x94, 0xfc, 0x03, 0x46, 0x10, 0xa2,
+    0x0a, 0x5e, 0xe0, 0x1e, 0xb9, 0x06, 0x06, 0x37,
+];
+
+/// Height of the live chain at which the snapshot was frozen.
+pub const GENESIS2_CARRYOVER_SOURCE_HEIGHT: u64 = 413_743;
+
+/// Number of UTXOs in the snapshot (== source height: one coinbase per block,
+/// no spends — verified by bloch-genesis2 before it emitted these constants).
+pub const GENESIS2_CARRYOVER_UTXO_COUNT: u64 = 413_743;
+
+/// Total carried-over supply in sat (3,475,441,200 BLCH × 10⁸).
+pub const GENESIS2_CARRYOVER_TOTAL_SAT: u128 = 347_544_120_000_000_000;
+
+/// Genesis-2 timestamp (fixed at the mining ceremony, 2026-07-19).
+pub const GENESIS2_TIMESTAMP: u64 = 1_784_500_000;
+
+/// Genesis-2 compact difficulty bits. 0x1f00ffff → target 0x0000ffff… —
+/// ~2⁻¹⁶ per double-SHA-256, mined in seconds. A production ceremony re-mines
+/// at real difficulty; the VALIDATION path is identical at any bits.
+pub const GENESIS2_BITS: u32 = 0x1f00ffff;
+
+/// The mined Genesis-2 nonce (bloch-mine-genesis2 ceremony output). Upper 32
+/// bits are zero — only the low 32 enter the 80-byte mining header.
+/// PLACEHOLDER 0 until the devnet ceremony bakes the real value; the pinned
+/// test genesis2_genesis_block.rs FAILS while this is stale, and the node's
+/// startup check must exit(1) — fail closed, never fail open.
+pub const GENESIS2_NONCE: u64 = 0;
+
+/// Expected canonical Genesis-2 block hash, for operator verification and the
+/// fail-closed startup check. Canonical = miner script_pubkey
+/// GENESIS2_MINER_SCRIPT_PUBKEY, all constants above. PLACEHOLDER (all-zero)
+/// until the ceremony bakes the real value — see GENESIS2_NONCE.
+pub const GENESIS2_EXPECTED_HASH: [u8; 32] = [0u8; 32];
+
+/// Canonical Genesis-2 miner script_pubkey: the founder address hash-20
+/// (bloch1qe986db5149cff7499b282a048272a09aff0af4ff84242073 → first 40 hex
+/// chars after the HRP), matching main.rs's address_to_script_pubkey
+/// convention for the existing genesis.
+pub const GENESIS2_MINER_SCRIPT_PUBKEY: [u8; 20] = [
+    0xe9, 0x86, 0xdb, 0x51, 0x49, 0xcf, 0xf7, 0x49,
+    0x9b, 0x28, 0x2a, 0x04, 0x82, 0x72, 0xa0, 0x9a,
+    0xff, 0x0a, 0xf4, 0xff,
+];
+
+/// The human-readable carry-over commitment carried in the Genesis-2 coinbase
+/// script_sig. Derived from the carry-over constants at call time (never a
+/// separately maintained literal), so the text can NEVER drift from the
+/// constants it commits to. Format is the one bloch-genesis2 suggests:
+///
+///   `Bloch carry-over from height 413743: 413743 UTXOs, root d3de5e51ee9dbbf3...`
+///
+/// The 16-hex-char (8-byte) root prefix is for human readability; the FULL
+/// root is enforced by the snapshot loader (fail closed), not by this text.
+pub fn genesis2_coinbase_script_sig() -> Vec<u8> {
+    format!(
+        "Bloch carry-over from height {}: {} UTXOs, root {}...",
+        GENESIS2_CARRYOVER_SOURCE_HEIGHT,
+        GENESIS2_CARRYOVER_UTXO_COUNT,
+        &hex::encode(GENESIS2_CARRYOVER_SNAPSHOT_ROOT)[..16],
+    )
+    .into_bytes()
+}
+
+/// Build the Genesis-2 genesis block with explicit header parameters.
+///
+/// This is the SINGLE construction path shared by the mining tool
+/// (bloch-mine-genesis2, which grinds `nonce`) and the canonical
+/// [`create_genesis2_block`] (which bakes the mined constants) — miner and
+/// validator therefore agree byte-for-byte by construction.
+///
+/// Coinbase: single output paying `tokenomics_v2::block_subsidy_sat(0)` to
+/// `miner_addr` (mirrors create_genesis_block_with_bits), script_sig =
+/// [`genesis2_coinbase_script_sig`]. `pow_solution` is EMPTY — the Sha256d
+/// arm of validate_pow rejects any non-empty witness (fail closed).
+pub fn create_genesis2_block_with_params(
+    miner_addr: &[u8],
+    bits: u32,
+    timestamp: u64,
+    nonce: u64,
+) -> Block {
+    let subsidy = tokenomics_v2::block_subsidy_sat(0);
+    let coinbase = Transaction {
+        version: 1,
+        inputs: vec![TxInput {
+            prev_txid:  [0u8; 32],
+            prev_index: u32::MAX,
+            script_sig: genesis2_coinbase_script_sig(),
+            sequence:   u32::MAX,
+        }],
+        outputs: vec![
+            TxOutput {
+                value:         subsidy,
+                script_pubkey: miner_addr.to_vec(),
+            },
+        ],
+        locktime: 0,
+    };
+    let merkle = Transaction::merkle_root(&[coinbase.clone()]);
+    Block {
+        header: BlockHeader {
+            version:     1,
+            parents:     vec![],
+            merkle_root: merkle,
+            timestamp,
+            bits,
+            nonce,
+        },
+        transactions: vec![coinbase],
+        blue_score: 0,
+        height: 0,
+        // SHA-256d chain: no Module-SIS witness, and validate_pow's Sha256d
+        // arm REQUIRES pow_solution.is_empty() (witness smuggling rejected).
+        pow_solution: Vec::new(),
+        shielded_transactions: Vec::new(),
+    }
+}
+
+/// Creates the canonical Genesis-2 genesis block (height 0) from the baked
+/// ceremony constants. The node must VALIDATE this (validate_pow — Sha256d
+/// arm, requires node_chain_id() == Genesis2Devnet — plus a block_hash match
+/// against GENESIS2_EXPECTED_HASH) and refuse to start on any failure,
+/// exactly as main.rs does for create_genesis_block today.
+pub fn create_genesis2_block(miner_addr: &[u8]) -> Block {
+    create_genesis2_block_with_params(miner_addr, GENESIS2_BITS, GENESIS2_TIMESTAMP, GENESIS2_NONCE)
+}
+
 // ── Difficulty ────────────────────────────────────────────────────────────────
 
 pub fn bits_to_target(bits: u32) -> [u8; 32] {
