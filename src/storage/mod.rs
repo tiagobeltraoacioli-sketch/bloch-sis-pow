@@ -1086,11 +1086,62 @@ impl Storage {
 /// A carry-over snapshot that has passed EVERY check in
 /// [`verify_carryover_snapshot`]. Field access is public for logging; the only
 /// way to construct one outside this module is through verification.
+#[derive(Debug)]
 pub struct CarryoverSnapshot {
     entries: Vec<(Vec<u8>, u32, TxOutput)>,
     pub root: [u8; 32],
     pub count: u64,
     pub total_sat: u128,
+}
+
+/// Verify a carry-over file against the chain's baked-in CARRYOVER_* constants.
+///
+/// Two layers: [`parse_carryover_file`] enforces the structural invariants that
+/// hold for ANY snapshot, then this compares the result to what THIS chain
+/// requires. Fail closed — returns every mismatch, and nothing is written here.
+pub fn verify_carryover_snapshot(path: &Path) -> Result<CarryoverSnapshot, Vec<String>> {
+    use crate::core::{CARRYOVER_SNAPSHOT_ROOT, CARRYOVER_UTXO_COUNT, CARRYOVER_TOTAL_SAT};
+    let snap = parse_carryover_file(path)?;
+    let mut failures = Vec::new();
+    if snap.root != CARRYOVER_SNAPSHOT_ROOT {
+        failures.push(format!("root mismatch: file hashes to {} but this chain requires {} \
+            (SHAKE-256 over raw bytes; any edit, truncation or reordering changes it)",
+            hex::encode(snap.root), hex::encode(CARRYOVER_SNAPSHOT_ROOT)));
+    }
+    if snap.count != CARRYOVER_UTXO_COUNT {
+        failures.push(format!("utxo count mismatch: file has {} line(s), chain requires {}",
+            snap.count, CARRYOVER_UTXO_COUNT));
+    }
+    if snap.total_sat != CARRYOVER_TOTAL_SAT {
+        failures.push(format!("total supply mismatch: file sums to {} sat, chain requires {} \
+            (difference {} sat)", snap.total_sat, CARRYOVER_TOTAL_SAT,
+            snap.total_sat as i128 - CARRYOVER_TOTAL_SAT as i128));
+    }
+    if failures.is_empty() { Ok(snap) } else { Err(failures) }
+}
+
+/// Structural parse of a carry-over file: every invariant that holds for ANY
+/// snapshot, independent of which chain it is destined for.
+///
+/// Split out from [`verify_carryover_snapshot`] because that function compares
+/// against the baked-in CARRYOVER_* constants, so it can only ever succeed for
+/// one exact file. That made the structural rules — unique outpoints, no
+/// zero-value rows, well-formed lines, the byte-root — untestable except against
+/// the production snapshot, which is a poor way to protect invariants that must
+/// hold for every future one too.
+///
+/// Returns the parsed set with its root, or the full list of structural
+/// failures. Says nothing about whether this is the RIGHT ledger — that is the
+/// caller's comparison against the constants.
+pub fn parse_carryover_file(path: &Path) -> Result<CarryoverSnapshot, Vec<String>> {
+    parse_carryover_inner(path)
+}
+
+impl CarryoverSnapshot {
+    /// Number of parsed entries. Distinct from [`Self::count`], which is what the
+    /// chain REQUIRES — comparing the two is the count check, so a test that
+    /// asserts on this is asserting on what the file actually held.
+    pub fn entry_count(&self) -> usize { self.entries.len() }
 }
 
 /// Verify a Genesis-2 carry-over snapshot file against the baked-in
@@ -1109,8 +1160,7 @@ pub struct CarryoverSnapshot {
 ///   3. summed output value == CARRYOVER_TOTAL_SAT.
 ///   plus: every line must parse as `txid_hex \t vout \t value_sat \t spk_hex`
 ///   with a 32-byte txid — a malformed line is a failure, never skipped.
-pub fn verify_carryover_snapshot(path: &Path) -> Result<CarryoverSnapshot, Vec<String>> {
-    use crate::core::{CARRYOVER_SNAPSHOT_ROOT, CARRYOVER_UTXO_COUNT, CARRYOVER_TOTAL_SAT};
+fn parse_carryover_inner(path: &Path) -> Result<CarryoverSnapshot, Vec<String>> {
     use sha3::digest::{Update, ExtendableOutput, XofReader};
 
     let bytes = match std::fs::read(path) {
@@ -1125,12 +1175,6 @@ pub fn verify_carryover_snapshot(path: &Path) -> Result<CarryoverSnapshot, Vec<S
     XofReader::read(&mut hasher.finalize_xof(), &mut root);
 
     let mut failures: Vec<String> = Vec::new();
-    if root != CARRYOVER_SNAPSHOT_ROOT {
-        failures.push(format!(
-            "snapshot root mismatch: file hashes to {} but this chain requires {} \
-             (SHAKE-256 over raw bytes; any edit, truncation or reordering changes it)",
-            hex::encode(root), hex::encode(CARRYOVER_SNAPSHOT_ROOT)));
-    }
 
     // Checks 2 + 3: count and supply over the same bytes, in file order.
     let mut segments: Vec<&[u8]> = bytes.split(|&b| b == b'\n').collect();
@@ -1178,17 +1222,6 @@ pub fn verify_carryover_snapshot(path: &Path) -> Result<CarryoverSnapshot, Vec<S
         failures.push(format!("... and {} more duplicated outpoint(s)", duplicates - 5));
     }
     let count = (entries.len() as u64) + malformed; // every line counts toward shape
-    if count != CARRYOVER_UTXO_COUNT {
-        failures.push(format!(
-            "utxo count mismatch: file has {count} line(s), chain requires {}",
-            CARRYOVER_UTXO_COUNT));
-    }
-    if total_sat != CARRYOVER_TOTAL_SAT {
-        failures.push(format!(
-            "total supply mismatch: file sums to {total_sat} sat, chain requires {} sat \
-             (difference {} sat)",
-            CARRYOVER_TOTAL_SAT, total_sat as i128 - CARRYOVER_TOTAL_SAT as i128));
-    }
 
     if failures.is_empty() {
         Ok(CarryoverSnapshot { entries, root, count, total_sat })
