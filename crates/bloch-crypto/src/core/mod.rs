@@ -41,6 +41,37 @@ pub const SIGHASH_VERSION: u8       = 0x02; // bumps the implicit v1 (no-domain)
 pub enum ChainId {
     Mainnet = 0xB10C_0001,
     Testnet = 0xB10C_0002,
+    /// Genesis-2 DEVNET (carry-over chain, SHA-256d PoW). A TESTNET/devnet
+    /// artifact until a human decides otherwise — NOT a public network, no
+    /// published genesis. Selected ONLY by an explicit node flag, never by
+    /// `for_network` (there is no `address::Network` variant for it). Fresh
+    /// discriminant per the registry rule above; never reuse one.
+    Genesis2Devnet = 0xB10C_0003,
+}
+
+/// Which proof-of-work algorithm a chain runs. The mapping lives in
+/// [`pow_algorithm`] and NOWHERE else — miner (src/pow) and validator
+/// (`Block::validate_pow`) both route through it, so they provably agree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PowAlgorithm {
+    /// SHAKE-256 hashcash with the Module-SIS structural gate (the historical
+    /// Bloch-SIS PoW). Blocks carry a `pow_solution` witness of length N=256.
+    ModuleSis,
+    /// Double SHA-256 over the 80-byte `MiningHeader` projection (Bitcoin
+    /// layout, ASIC-compatible). Blocks carry NO witness: `pow_solution`
+    /// MUST be empty.
+    Sha256d,
+}
+
+/// The ONLY chain-id → PoW-algorithm mapping. Exhaustive over [`ChainId`]
+/// with no wildcard arm: adding a chain variant without deciding its PoW is
+/// a compile error, by design.
+pub const fn pow_algorithm(id: ChainId) -> PowAlgorithm {
+    match id {
+        ChainId::Mainnet => PowAlgorithm::ModuleSis,
+        ChainId::Testnet => PowAlgorithm::ModuleSis,
+        ChainId::Genesis2Devnet => PowAlgorithm::Sha256d,
+    }
 }
 
 impl ChainId {
@@ -1422,31 +1453,53 @@ impl Block {
     }
 
     pub fn validate_pow(&self) -> bool {
-        // Bloch-SIS PoW (B5b-2): the block's solution vector must satisfy the
-        // Module-SIS instance derived from the header, plus the aux-hash
-        // difficulty filter. A SECURE verify regime is gated on the research
-        // track (neither shipped width is secure — see the bloch-sis-pow crate
-        // header). N = 256 (asserted == bloch_sis_pow::params::N in src/pow).
-        //
-        // Soft fork SF-1: the residual width is selected by THIS BLOCK's
-        // height — k = 4 below CANONICAL_K_ACTIVATION_HEIGHT (so the existing
-        // chain keeps validating), k = 8 at/above it. Height-lying is caught
-        // by accept_block's height check (VULN-02) before acceptance, and
-        // claiming a false height ≥ H only makes validation STRICTER.
-        if self.pow_solution.len() != bloch_sis_pow::params::N {
-            return false;
+        // Chain-selectable PoW: dispatch on the node's chain-id through the
+        // single mapping `pow_algorithm` (miner routes through the same fn in
+        // src/pow, so miner and validator provably agree). The two arms are
+        // mutually exclusive by construction: a Module-SIS chain requires the
+        // witness vector (len == N), a SHA-256d chain requires NO witness —
+        // so a SIS witness cannot be smuggled onto a SHA-256d chain and a
+        // witness-less SHA-256d block cannot pass on a Module-SIS chain.
+        match pow_algorithm(node_chain_id()) {
+            PowAlgorithm::ModuleSis => {
+                // Bloch-SIS PoW (B5b-2): the block's solution vector must satisfy the
+                // Module-SIS instance derived from the header, plus the aux-hash
+                // difficulty filter. A SECURE verify regime is gated on the research
+                // track (neither shipped width is secure — see the bloch-sis-pow crate
+                // header). N = 256 (asserted == bloch_sis_pow::params::N in src/pow).
+                //
+                // Soft fork SF-1: the residual width is selected by THIS BLOCK's
+                // height — k = 4 below CANONICAL_K_ACTIVATION_HEIGHT (so the existing
+                // chain keeps validating), k = 8 at/above it. Height-lying is caught
+                // by accept_block's height check (VULN-02) before acceptance, and
+                // claiming a false height ≥ H only makes validation STRICTER.
+                if self.pow_solution.len() != bloch_sis_pow::params::N {
+                    return false;
+                }
+                let mut s = [0i32; 256];
+                s.copy_from_slice(&self.pow_solution);
+                let target = bloch_sis_pow::bits_to_target(self.header.bits);
+                bloch_sis_pow::verify_regime(
+                    &self.header.pow_preimage(),
+                    self.header.nonce,
+                    &s,
+                    &target,
+                    canonical_residual_coeffs(self.height, self.header.bits),
+                )
+                .is_ok()
+            }
+            PowAlgorithm::Sha256d => {
+                // Genesis-2: double SHA-256 over the 80-byte MiningHeader
+                // projection, Bitcoin semantics. `pow_solution` MUST be empty
+                // — a stale/foreign Module-SIS witness on a SHA-256d chain is
+                // consensus-invalid, not merely ignored (fail closed).
+                self.pow_solution.is_empty()
+                    && hash_meets_target(
+                        &self.header.pow_hash(),
+                        &bits_to_target(self.header.bits),
+                    )
+            }
         }
-        let mut s = [0i32; 256];
-        s.copy_from_slice(&self.pow_solution);
-        let target = bloch_sis_pow::bits_to_target(self.header.bits);
-        bloch_sis_pow::verify_regime(
-            &self.header.pow_preimage(),
-            self.header.nonce,
-            &s,
-            &target,
-            canonical_residual_coeffs(self.height, self.header.bits),
-        )
-        .is_ok()
     }
 
     /// Basic coinbase format check (not value — value checked with fees in accept_block)
@@ -2070,5 +2123,98 @@ mod mainnet_release_guard {
             "activation height must not be u64::MAX (soft fork would never activate)");
         assert!(CANONICAL_K_ACTIVATION_HEIGHT < 10_000_000,
             "activation height implausibly large — likely an un-set / accidental value");
+    }
+}
+
+// ── Genesis-2 PoW switch: MiningHeader layout KATs + algorithm mapping ───────
+// The 80-byte layout vectors below were generated by compiling the reference
+// implementation from /Users/tiagoacioli/dev/entanglement-layer/src/core/mod.rs
+// (MiningHeader::to_bytes / pow_hash / parents_commitment extracted verbatim)
+// and printing its output for the fixed header — so these tests pin byte-for-
+// byte equality with the working double-SHA-256 BlockDAG, not just self-
+// consistency.
+#[cfg(test)]
+mod g2_pow_switch_tests {
+    use super::*;
+
+    fn fixed_mining_header() -> MiningHeader {
+        let mut prev = [0u8; 32];
+        let mut merk = [0u8; 32];
+        for i in 0..32 {
+            prev[i] = i as u8;
+            merk[i] = 32 + i as u8;
+        }
+        MiningHeader {
+            version:     0x01020304,
+            prev_hash:   prev,
+            merkle_root: merk,
+            timestamp:   0x11223344,
+            bits:        0x1d00ffff,
+            nonce:       0xdeadbeef,
+        }
+    }
+
+    /// (a) to_bytes matches the entanglement-layer reference byte-for-byte
+    /// (hardcoded expected [u8; 80]) and round-trips through from_bytes.
+    #[test]
+    fn mining_header_80_byte_layout_matches_entanglement_layer() {
+        // Reference output ("to_bytes = …") of the entanglement-layer code:
+        // 04030201 ‖ prev[00..1f] ‖ merkle[20..3f] ‖ 44332211 ‖ ffff001d ‖ efbeadde
+        let expected_hex =
+            "04030201\
+             000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\
+             202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f\
+             44332211ffff001defbeadde";
+        let mut expected = [0u8; 80];
+        let raw = hex::decode(expected_hex.replace(char::is_whitespace, "")).unwrap();
+        expected.copy_from_slice(&raw);
+
+        let mh = fixed_mining_header();
+        assert_eq!(mh.to_bytes(), expected, "80-byte layout drifted from the reference");
+        assert_eq!(MiningHeader::from_bytes(&mh.to_bytes()), mh, "from_bytes must invert to_bytes");
+    }
+
+    /// pow_hash (double SHA-256 of the 80 bytes) matches the reference vector.
+    #[test]
+    fn mining_header_pow_hash_matches_entanglement_layer() {
+        let mh = fixed_mining_header();
+        assert_eq!(
+            hex::encode(mh.pow_hash()),
+            "bb07e62091bc5944be2971adfa2a42b035de2e90d6878aa227ef930ae0aea0b9",
+        );
+    }
+
+    /// parents_commitment matches the reference for the empty / single /
+    /// odd-count (duplicate-last, sorted) cases.
+    #[test]
+    fn parents_commitment_matches_entanglement_layer() {
+        assert_eq!(parents_commitment(&[]), [0u8; 32]);
+        assert_eq!(parents_commitment(&[[7u8; 32]]), [7u8; 32]);
+        let p3 = [[3u8; 32], [1u8; 32], [2u8; 32]];
+        assert_eq!(
+            hex::encode(parents_commitment(&p3)),
+            "223e023fadf1f053df26988871f893c821c28edf77d64a955e6c2a02d547bdac",
+        );
+    }
+
+    /// (d) pow_algorithm's match is wildcard-free in the source, so this
+    /// mapping test plus the compiler's exhaustiveness check pin the
+    /// chain-id → algorithm table. Adding a ChainId variant without deciding
+    /// its PoW fails to compile.
+    #[test]
+    fn pow_algorithm_mapping_is_pinned() {
+        assert_eq!(pow_algorithm(ChainId::Mainnet), PowAlgorithm::ModuleSis);
+        assert_eq!(pow_algorithm(ChainId::Testnet), PowAlgorithm::ModuleSis);
+        assert_eq!(pow_algorithm(ChainId::Genesis2Devnet), PowAlgorithm::Sha256d);
+        // Discriminant registry: obviously distinct, never reused.
+        assert_eq!(ChainId::Genesis2Devnet.to_u32(), 0xB10C_0003);
+        assert_eq!(ChainId::Genesis2Devnet.to_le_bytes(), 0xB10C_0003u32.to_le_bytes());
+    }
+
+    /// The default (unset) chain-id is Mainnet ⇒ ModuleSis: in-process tests
+    /// that never call set_node_chain_id keep validating the SIS path.
+    #[test]
+    fn default_chain_id_maps_to_module_sis() {
+        assert_eq!(pow_algorithm(node_chain_id()), PowAlgorithm::ModuleSis);
     }
 }
