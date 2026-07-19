@@ -1,0 +1,15 @@
+# MINER node (phase 1 = sync). Testing peering to the primary's PUBLIC IPv4.
+app = "blochv-node-7"
+primary_region = "gru"
+
+[processes]
+  app = "--rpc-bind 0.0.0.0 --rpc-port 16210 --listen /ip4/0.0.0.0/tcp/16110 --data-dir /bloch-data --testnet --peer /ip4/213.188.208.175/tcp/16110 --allow-private-peers"
+
+[mounts]
+  source = "bloch_data"
+  destination = "/bloch-data"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory = "1gb"

@@ -20,6 +20,7 @@ const CF_TX_INDEX:   &str = "tx_index";    // txid → [32B block_hash][8B heigh
 const CF_ADDR_TX_HISTORY: &str = "addr_tx_history";  // addr → chronological tx touches
 const CF_UNDO:       &str = "undo";        // Sprint U.1: per-block undo data for reorg rollback
 const CF_DAG_INTEGRITY: &str = "dag_integrity";  // Sprint Y (M-2): hash-chain over GhostdagData
+const CF_REACHABILITY: &str = "reachability";    // Phase 1: durable interval-reachability index (non-consensus cache)
 
 // ── PoBRS Column Families (Sprint 1.5) ─────────────────────────────────
 // Persistence layer for the Proof-of-Blue-and-Red-Score subsystem.
@@ -62,7 +63,7 @@ fn encode<T: serde::Serialize>(v: &T) -> Result<Vec<u8>, StorageError> {
         .map_err(|e| StorageError::SerializeFailed(e.to_string()))
 }
 
-fn decode<T: serde::de::DeserializeOwned>(b: &[u8]) -> Result<T, StorageError> {
+pub fn decode<T: serde::de::DeserializeOwned>(b: &[u8]) -> Result<T, StorageError> {
     bincode::serde::decode_from_slice(b, bincode::config::standard())
         .map(|(v, _)| v)
         .map_err(|e| StorageError::DeserializeFailed(e.to_string()))
@@ -71,12 +72,11 @@ fn decode<T: serde::de::DeserializeOwned>(b: &[u8]) -> Result<T, StorageError> {
 pub struct Storage { db: DB }
 
 impl Storage {
-    pub fn open(path: &Path) -> Result<Self, StorageError> {
-        let mut opts = Options::default();
-        opts.create_if_missing(true);
-        opts.create_missing_column_families(true);
-        opts.set_max_open_files(256);
-        opts.set_write_buffer_size(64 * 1024 * 1024);
+    /// Build the full column-family descriptor list. Shared by the read-write
+    /// [`open`] and the read-only [`open_read_only`] paths so both agree on the
+    /// exact schema (CF names + per-CF options) — the read-only replay harness
+    /// must decode CF_DAG with the identical layout the node wrote.
+    fn cf_descriptors() -> Vec<ColumnFamilyDescriptor> {
         let mut addr_utxo_opts = Options::default();
         addr_utxo_opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(20));
         let cfs = vec![
@@ -97,6 +97,10 @@ impl Storage {
             },
             ColumnFamilyDescriptor::new(CF_UNDO,       Options::default()),
             ColumnFamilyDescriptor::new(CF_DAG_INTEGRITY, Options::default()),
+            // Phase 1: durable reachability index. Key = 32B block hash,
+            // value = encode_record() bytes. A rebuildable cache, never part of
+            // the integrity chain; see docs/adr/ADR-035-durable-reachability-index.md.
+            ColumnFamilyDescriptor::new(CF_REACHABILITY, Options::default()),
             // ── PoBRS CFs (Sprint 1.5) ─────────────────────────────
             ColumnFamilyDescriptor::new(CF_POBRS_META,                Options::default()),
             ColumnFamilyDescriptor::new(CF_POBRS_ORACLES,             Options::default()),
@@ -132,7 +136,35 @@ impl Storage {
             ColumnFamilyDescriptor::new(CF_FFG_COMMITTEE,             Options::default()),
             ColumnFamilyDescriptor::new(CF_FFG_PENDING_COMMITTEE,     Options::default()),
         ];
-        let db = DB::open_cf_descriptors(&opts, path, cfs)
+        cfs
+    }
+
+    pub fn open(path: &Path) -> Result<Self, StorageError> {
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
+        opts.set_max_open_files(256);
+        opts.set_write_buffer_size(64 * 1024 * 1024);
+        let db = DB::open_cf_descriptors(&opts, path, Self::cf_descriptors())
+            .map_err(|e| StorageError::OpenFailed(e.to_string()))?;
+        Ok(Self { db })
+    }
+
+    /// Open an existing snapshot **read-only**. RocksDB is opened with
+    /// `open_cf_descriptors_read_only`, which acquires no write lock, creates
+    /// nothing, and rejects every mutating call — so a live node can keep the
+    /// same data-dir open while this handle inspects it. Used by the GhostDAG
+    /// differential replay harness (`tests/ghostdag_replay_snapshot.rs`) to read
+    /// CF_DAG without any risk of touching mined history.
+    ///
+    /// `path` is the node data-dir (the same directory passed to [`open`]).
+    /// The DB must already exist; this never creates column families.
+    pub fn open_read_only(path: &Path) -> Result<Self, StorageError> {
+        let opts = Options::default();
+        // `error_if_log_file_exist = false`: tolerate a live/unclean WAL so we
+        // can inspect a running node's dir. Read-only mode never replays into or
+        // mutates the primary.
+        let db = DB::open_cf_descriptors_read_only(&opts, path, Self::cf_descriptors(), false)
             .map_err(|e| StorageError::OpenFailed(e.to_string()))?;
         Ok(Self { db })
     }
@@ -261,6 +293,50 @@ impl Storage {
             }
         }
         results
+    }
+
+    /// Iterate the entire UTXO set in DETERMINISTIC order for snapshotting.
+    ///
+    /// Returns `(txid, vout, value, script_pubkey)` sorted by the raw CF_UTXO key,
+    /// which is `txid ‖ vout_be` — so the order is a pure function of the set's
+    /// contents, independent of insertion history, RocksDB compaction state, or
+    /// which node produced it. Two honest nodes at the same height MUST produce
+    /// byte-identical output; that is what makes a commitment over this meaningful.
+    ///
+    /// Why this exists: block bodies below `pruned_height` are deleted (see
+    /// [`Self::prune_blocks_below`]) but the UTXO set is retained in full. On this
+    /// fleet in 2026-07 that left ~95% of history unservable while every balance
+    /// stayed intact and queryable — so the SET is recoverable even when the CHAIN
+    /// that produced it is not. A snapshot taken here is the carry-over artifact
+    /// for any migration, and the input to an assumeutxo-style bootstrap for fresh
+    /// nodes that cannot sync from genesis because no archival peer has the bodies.
+    ///
+    /// Read-only friendly: pair with [`Self::open_read_only`] to snapshot a data-dir
+    /// while the node keeps running on it.
+    pub fn iter_utxos_sorted(&self) -> Result<Vec<(Vec<u8>, u32, u64, Vec<u8>)>, StorageError> {
+        let cf = self.db.cf_handle(CF_UTXO).ok_or(StorageError::CfNotFound(CF_UTXO.into()))?;
+        let mut out: Vec<(Vec<u8>, u32, u64, Vec<u8>)> = Vec::new();
+        for item in self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start) {
+            let (key, val) = item.map_err(|e| StorageError::ReadFailed(e.to_string()))?;
+            // key = txid ‖ vout (4B BE); anything else is not ours — skip rather
+            // than guess, so a malformed row can never silently enter a commitment.
+            if key.len() < 36 { continue; }
+            let txid = key[..key.len() - 4].to_vec();
+            let vout = u32::from_be_bytes([key[key.len()-4], key[key.len()-3],
+                                           key[key.len()-2], key[key.len()-1]]);
+            // Same codec every other UTXO read in this file uses — never a
+            // second decoder, or a snapshot could disagree with the node that
+            // produced it while both look correct.
+            let output: TxOutput = match decode::<TxOutput>(&val) {
+                Ok(o)  => o,
+                Err(_) => continue,
+            };
+            out.push((txid, vout, output.value, output.script_pubkey));
+        }
+        // RocksDB already yields keys in byte order; sort explicitly so the
+        // guarantee is in THIS function rather than in an engine detail.
+        out.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        Ok(out)
     }
 
     pub fn clear_utxos(&self) -> Result<(), StorageError> {
@@ -517,6 +593,129 @@ impl Storage {
             }
         }
         Ok(entries)
+    }
+
+    // ── Durable reachability index (Phase 1) ────────────────────────────
+    //
+    // The interval-reachability index (`consensus::reachability::ReachabilityStore`)
+    // is an O(1)/O(log n) DAG-ancestry cache. It is NOT consensus state — it is
+    // never hashed into the integrity chain and can always be rebuilt by
+    // replaying CF_DAG. To make it durable (and avoid an O(chain) rebuild every
+    // boot) its per-block records live in CF_REACHABILITY, and — crucially —
+    // each record delta is written in the SAME WriteBatch as the CF_DAG block it
+    // derives from (`put_dag_with_integrity_and_reach`), so a crash can never
+    // leave the index describing a block CF_DAG doesn't have, or vice-versa.
+    //
+    // The layout version + root live in CF_META under `reachability/meta/*`.
+
+    /// Schema version for the CF_REACHABILITY record layout, mirrored from
+    /// `consensus::reachability::REACHABILITY_RECORD_VERSION`. On boot a
+    /// mismatch (or absent tag) forces a full rebuild from CF_DAG.
+    pub const REACHABILITY_SCHEMA_VERSION: u32 =
+        crate::consensus::reachability::REACHABILITY_RECORD_VERSION;
+
+    /// Atomic CF_DAG + CF_DAG_INTEGRITY + CF_REACHABILITY write.
+    ///
+    /// Identical to [`put_dag_with_integrity`] for the DAG/integrity CFs, but
+    /// additionally folds the reachability delta (`reach_upserts` /
+    /// `reach_removals`, drained from `ReachabilityStore::take_persist_delta`)
+    /// into the SAME `WriteBatch`. All-or-nothing: after a crash the block, its
+    /// integrity link, and every reachability record touched by inserting it
+    /// either all landed or none did.
+    ///
+    /// Used only when the reachability index is being maintained (Fast /
+    /// armed-activation). On the live Legacy path the caller uses the plain
+    /// [`put_dag_with_integrity`] and CF_REACHABILITY stays empty.
+    pub fn put_dag_with_integrity_and_reach(
+        &self,
+        hash: &BlockHash,
+        data: &GhostdagData,
+        reach_upserts: &[(BlockHash, Vec<u8>)],
+        reach_removals: &[BlockHash],
+    ) -> Result<[u8; 32], StorageError> {
+        let parent_integrity: [u8; 32] = match &data.selected_parent {
+            Some(sp) => self.get_integrity_hash(sp)?.unwrap_or([0u8; 32]),
+            None     => [0u8; 32],
+        };
+        let integrity = crate::consensus::compute_integrity_hash(hash, data, &parent_integrity);
+
+        let cf_dag = self.db.cf_handle(CF_DAG)
+            .ok_or(StorageError::CfNotFound(CF_DAG.into()))?;
+        let cf_int = self.db.cf_handle(CF_DAG_INTEGRITY)
+            .ok_or(StorageError::CfNotFound(CF_DAG_INTEGRITY.into()))?;
+        let cf_reach = self.db.cf_handle(CF_REACHABILITY)
+            .ok_or(StorageError::CfNotFound(CF_REACHABILITY.into()))?;
+
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.put_cf(&cf_dag, hash, &encode(data)?);
+        batch.put_cf(&cf_int, hash, &integrity);
+        for (h, rec) in reach_upserts {
+            batch.put_cf(&cf_reach, h, rec);
+        }
+        for h in reach_removals {
+            batch.delete_cf(&cf_reach, h);
+        }
+        self.db.write(batch)
+            .map_err(|e| StorageError::WriteFailed(e.to_string()))?;
+        Ok(integrity)
+    }
+
+    /// Persist a full reachability snapshot + its version tag + root in one
+    /// batch. Used after a boot-time rebuild to write the freshly-materialized
+    /// index. Clears any stale records first so the CF exactly mirrors memory.
+    pub fn store_reachability_snapshot(
+        &self,
+        records: &[(BlockHash, Vec<u8>)],
+        root: Option<BlockHash>,
+    ) -> Result<(), StorageError> {
+        let cf_reach = self.db.cf_handle(CF_REACHABILITY)
+            .ok_or(StorageError::CfNotFound(CF_REACHABILITY.into()))?;
+        let cf_meta = self.db.cf_handle(CF_META)
+            .ok_or(StorageError::CfNotFound(CF_META.into()))?;
+        let mut batch = rocksdb::WriteBatch::default();
+        // Wipe existing records (rebuild replaces the whole index).
+        for item in self.db.iterator_cf(&cf_reach, IteratorMode::Start) {
+            if let Ok((k, _)) = item { batch.delete_cf(&cf_reach, &k); }
+        }
+        for (h, rec) in records {
+            batch.put_cf(&cf_reach, h, rec);
+        }
+        batch.put_cf(&cf_meta, b"reachability/meta/version",
+                     &Self::REACHABILITY_SCHEMA_VERSION.to_le_bytes());
+        match root {
+            Some(r) => batch.put_cf(&cf_meta, b"reachability/meta/root", &r),
+            None    => batch.delete_cf(&cf_meta, b"reachability/meta/root"),
+        }
+        self.db.write(batch).map_err(|e| StorageError::WriteFailed(e.to_string()))
+    }
+
+    /// Load every persisted `(block_hash, record_bytes)` from CF_REACHABILITY.
+    pub fn load_all_reachability(&self) -> Result<Vec<(BlockHash, Vec<u8>)>, StorageError> {
+        let cf = self.db.cf_handle(CF_REACHABILITY)
+            .ok_or(StorageError::CfNotFound(CF_REACHABILITY.into()))?;
+        let mut out = Vec::new();
+        for item in self.db.iterator_cf(&cf, IteratorMode::Start) {
+            if let Ok((k, v)) = item {
+                if k.len() == 32 {
+                    let mut h = [0u8; 32];
+                    h.copy_from_slice(&k);
+                    out.push((h, v.to_vec()));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Read the persisted reachability schema version, if present.
+    pub fn get_reachability_version(&self) -> Result<Option<u32>, StorageError> {
+        Ok(self.get_meta("reachability/meta/version")?
+            .and_then(|b| b.as_slice().try_into().ok().map(u32::from_le_bytes)))
+    }
+
+    /// Read the persisted reachability root (genesis) hash, if present.
+    pub fn get_reachability_root(&self) -> Result<Option<BlockHash>, StorageError> {
+        Ok(self.get_meta("reachability/meta/root")?
+            .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok()))
     }
 
     // ── Coinbase maturity tracking (FIX VULN-03) ────────────────────────
@@ -810,6 +1009,244 @@ impl Storage {
         }
         Ok(0)
     }
+
+    // ── Genesis-2 carry-over ingestion ──────────────────────────────────────
+
+    /// Write a FULLY-VERIFIED carry-over snapshot into the UTXO set, in one
+    /// atomic `WriteBatch`. Callers MUST obtain `snap` from
+    /// [`verify_carryover_snapshot`] — that is the only constructor — so by the
+    /// time this runs, root, count and supply have all matched the CARRYOVER_*
+    /// constants. Nothing is written on any earlier failure ("no partial
+    /// ingestion: verify fully, then write").
+    ///
+    /// The same batch stamps `meta["carryover_root"]`, so a later boot can
+    /// prove ingestion happened (and against WHICH root) without re-reading
+    /// the file. UTXOs and marker land together or not at all.
+    /// Re-derive the carry-over root FROM THE DATABASE and compare it to the
+    /// constant this binary was built with.
+    ///
+    /// The `carryover_root` meta stamp records what a FILE hashed to at ingest
+    /// time. It says nothing about what the database contains now, and cannot:
+    /// it is a copied string. A data-dir handed out as a "fast bootstrap"
+    /// tarball would therefore run an arbitrary ledger while logging the
+    /// reassuring "carry-over already ingested (matches d3de5e51…)".
+    ///
+    /// That is the exact trust this migration exists to remove — a chain nobody
+    /// has to take on faith — so re-opening it one layer down would defeat the
+    /// point. This function reads every live UTXO back out, rebuilds the
+    /// snapshot's canonical lines in the same sorted order, hashes them, and
+    /// returns what the set ACTUALLY hashes to.
+    ///
+    /// Cost is a full scan, so it is a deliberate `--verify-carryover` run
+    /// rather than something every boot pays for.
+    pub fn derive_carryover_root(&self) -> Result<([u8; 32], u64, u128), StorageError> {
+        use sha3::digest::{ExtendableOutput, Update, XofReader};
+        let rows = self.iter_utxos_sorted()?;
+        let mut hasher = sha3::Shake256::default();
+        let mut total: u128 = 0;
+        for (txid, vout, value, spk) in &rows {
+            // Byte-identical to what bloch-snapshot-utxo writes, or the roots
+            // could not be compared at all.
+            let line = format!("{}\t{}\t{}\t{}\n",
+                hex::encode(txid), vout, value, hex::encode(spk));
+            Update::update(&mut hasher, line.as_bytes());
+            total += *value as u128;
+        }
+        let mut reader = hasher.finalize_xof();
+        let mut root = [0u8; 32];
+        reader.read(&mut root);
+        Ok((root, rows.len() as u64, total))
+    }
+
+    pub fn ingest_carryover(&self, snap: &CarryoverSnapshot) -> Result<u64, StorageError> {
+        let cf_utxo = self.db.cf_handle(CF_UTXO)
+            .ok_or(StorageError::CfNotFound(CF_UTXO.into()))?;
+        let cf_ai = self.db.cf_handle(CF_ADDR_UTXO)
+            .ok_or(StorageError::CfNotFound(CF_ADDR_UTXO.into()))?;
+        let cf_meta = self.db.cf_handle(CF_META)
+            .ok_or(StorageError::CfNotFound(CF_META.into()))?;
+
+        let mut batch = rocksdb::WriteBatch::default();
+        for (txid, vout, output) in &snap.entries {
+            batch.put_cf(&cf_utxo, utxo_key(txid, *vout), encode(output)?);
+            // Address index — same shape put_utxo maintains, so balance and
+            // wallet queries see carried-over coins like any mined coin.
+            if output.script_pubkey.len() >= 20 {
+                batch.put_cf(&cf_ai, addr_utxo_key(&output.script_pubkey, txid, *vout), [0u8; 0]);
+            }
+        }
+        batch.put_cf(&cf_meta, b"carryover_root", snap.root);
+        batch.put_cf(&cf_meta, b"carryover_source_height",
+                     crate::core::CARRYOVER_SOURCE_HEIGHT.to_le_bytes());
+        self.db.write(batch).map_err(|e| StorageError::WriteFailed(e.to_string()))?;
+        Ok(snap.entries.len() as u64)
+    }
+}
+
+/// A carry-over snapshot that has passed EVERY check in
+/// [`verify_carryover_snapshot`]. Field access is public for logging; the only
+/// way to construct one outside this module is through verification.
+#[derive(Debug)]
+pub struct CarryoverSnapshot {
+    entries: Vec<(Vec<u8>, u32, TxOutput)>,
+    pub root: [u8; 32],
+    pub count: u64,
+    pub total_sat: u128,
+}
+
+/// Verify a carry-over file against the chain's baked-in CARRYOVER_* constants.
+///
+/// Two layers: [`parse_carryover_file`] enforces the structural invariants that
+/// hold for ANY snapshot, then this compares the result to what THIS chain
+/// requires. Fail closed — returns every mismatch, and nothing is written here.
+pub fn verify_carryover_snapshot(path: &Path) -> Result<CarryoverSnapshot, Vec<String>> {
+    use crate::core::{CARRYOVER_SNAPSHOT_ROOT, CARRYOVER_UTXO_COUNT, CARRYOVER_TOTAL_SAT};
+    let snap = parse_carryover_file(path)?;
+    let mut failures = Vec::new();
+    if snap.root != CARRYOVER_SNAPSHOT_ROOT {
+        failures.push(format!("root mismatch: file hashes to {} but this chain requires {} \
+            (SHAKE-256 over raw bytes; any edit, truncation or reordering changes it)",
+            hex::encode(snap.root), hex::encode(CARRYOVER_SNAPSHOT_ROOT)));
+    }
+    if snap.count != CARRYOVER_UTXO_COUNT {
+        failures.push(format!("utxo count mismatch: file has {} line(s), chain requires {}",
+            snap.count, CARRYOVER_UTXO_COUNT));
+    }
+    if snap.total_sat != CARRYOVER_TOTAL_SAT {
+        failures.push(format!("total supply mismatch: file sums to {} sat, chain requires {} \
+            (difference {} sat)", snap.total_sat, CARRYOVER_TOTAL_SAT,
+            snap.total_sat as i128 - CARRYOVER_TOTAL_SAT as i128));
+    }
+    if failures.is_empty() { Ok(snap) } else { Err(failures) }
+}
+
+/// Structural parse of a carry-over file: every invariant that holds for ANY
+/// snapshot, independent of which chain it is destined for.
+///
+/// Split out from [`verify_carryover_snapshot`] because that function compares
+/// against the baked-in CARRYOVER_* constants, so it can only ever succeed for
+/// one exact file. That made the structural rules — unique outpoints, no
+/// zero-value rows, well-formed lines, the byte-root — untestable except against
+/// the production snapshot, which is a poor way to protect invariants that must
+/// hold for every future one too.
+///
+/// Returns the parsed set with its root, or the full list of structural
+/// failures. Says nothing about whether this is the RIGHT ledger — that is the
+/// caller's comparison against the constants.
+pub fn parse_carryover_file(path: &Path) -> Result<CarryoverSnapshot, Vec<String>> {
+    parse_carryover_inner(path)
+}
+
+impl CarryoverSnapshot {
+    /// Number of parsed entries. Distinct from [`Self::count`], which is what the
+    /// chain REQUIRES — comparing the two is the count check, so a test that
+    /// asserts on this is asserting on what the file actually held.
+    pub fn entry_count(&self) -> usize { self.entries.len() }
+}
+
+/// Verify a Genesis-2 carry-over snapshot file against the baked-in
+/// CARRYOVER_* constants (bloch-crypto core). Fail closed: returns the FULL
+/// list of mismatches so the operator sees every specific failure, and nothing
+/// is ever written here — ingestion ([`Storage::ingest_carryover`]) only
+/// accepts the value this function returns on success.
+///
+/// Checks, all of them always evaluated (no short-circuit):
+///   1. SHAKE-256 over the file's RAW BYTES == CARRYOVER_SNAPSHOT_ROOT.
+///      The bytes are hashed exactly as given — deliberately NO sorting or
+///      normalisation: a reordered file has a different root and is rejected,
+///      because "same set, different order" is indistinguishable from
+///      tampering once the commitment is over the byte stream.
+///   2. line count == CARRYOVER_UTXO_COUNT.
+///   3. summed output value == CARRYOVER_TOTAL_SAT.
+///   plus: every line must parse as `txid_hex \t vout \t value_sat \t spk_hex`
+///   with a 32-byte txid — a malformed line is a failure, never skipped.
+fn parse_carryover_inner(path: &Path) -> Result<CarryoverSnapshot, Vec<String>> {
+    use sha3::digest::{Update, ExtendableOutput, XofReader};
+
+    let bytes = match std::fs::read(path) {
+        Ok(b)  => b,
+        Err(e) => return Err(vec![format!("cannot read {}: {e}", path.display())]),
+    };
+
+    // Check 1: root over raw bytes.
+    let mut hasher = sha3::Shake256::default();
+    Update::update(&mut hasher, &bytes);
+    let mut root = [0u8; 32];
+    XofReader::read(&mut hasher.finalize_xof(), &mut root);
+
+    let mut failures: Vec<String> = Vec::new();
+
+    // Checks 2 + 3: count and supply over the same bytes, in file order.
+    let mut segments: Vec<&[u8]> = bytes.split(|&b| b == b'\n').collect();
+    if segments.last().is_some_and(|s| s.is_empty()) {
+        segments.pop(); // trailing newline, not an empty record
+    }
+    let mut entries: Vec<(Vec<u8>, u32, TxOutput)> = Vec::with_capacity(segments.len());
+    let mut total_sat: u128 = 0;
+    let mut malformed: u64 = 0;
+    // Outpoints must be DISTINCT. The count check is line-based and the supply
+    // check is value-based, so a file that duplicates one line over another of
+    // equal value passes both — and ingest would then collapse the two into one
+    // key, writing FEWER UTXOs than it reports. The log line "N UTXOs written
+    // atomically" would be false, and the ledger short by one output, with two
+    // of the three checks having approved it.
+    let mut seen: std::collections::HashSet<(Vec<u8>, u32)> = std::collections::HashSet::with_capacity(segments.len());
+    let mut duplicates: u64 = 0;
+    for (i, seg) in segments.iter().enumerate() {
+        match parse_carryover_line(seg) {
+            Some((txid, vout, output)) => {
+                if !seen.insert((txid.clone(), vout)) {
+                    duplicates += 1;
+                    if duplicates <= 5 {
+                        failures.push(format!("line {} duplicates outpoint {}:{} — \
+                            outpoints must be unique", i + 1, hex::encode(&txid), vout));
+                    }
+                    continue;
+                }
+                total_sat += output.value as u128;
+                entries.push((txid, vout, output));
+            }
+            None => {
+                malformed += 1;
+                if malformed <= 5 {
+                    failures.push(format!("line {} is malformed (want \
+                        txid_hex\\tvout\\tvalue_sat\\tspk_hex, 32-byte txid)", i + 1));
+                }
+            }
+        }
+    }
+    if malformed > 5 {
+        failures.push(format!("... and {} more malformed line(s)", malformed - 5));
+    }
+    if duplicates > 5 {
+        failures.push(format!("... and {} more duplicated outpoint(s)", duplicates - 5));
+    }
+    let count = (entries.len() as u64) + malformed; // every line counts toward shape
+
+    if failures.is_empty() {
+        Ok(CarryoverSnapshot { entries, root, count, total_sat })
+    } else {
+        Err(failures)
+    }
+}
+
+/// One snapshot line: `txid_hex \t vout \t value_sat \t script_pubkey_hex`.
+/// Exactly four fields; 32-byte txid. Anything else is None (malformed).
+fn parse_carryover_line(line: &[u8]) -> Option<(Vec<u8>, u32, TxOutput)> {
+    let s = std::str::from_utf8(line).ok()?;
+    let mut it = s.split('\t');
+    let txid = hex::decode(it.next()?).ok()?;
+    let vout: u32 = it.next()?.parse().ok()?;
+    let value: u64 = it.next()?.parse().ok()?;
+    let script_pubkey = hex::decode(it.next()?).ok()?;
+    if it.next().is_some() || txid.len() != 32 { return None; }
+    // A zero-value output is not a spendable UTXO and never appears in a
+    // snapshot this node produced. Accepting one lets a tampered file add rows
+    // that pass BOTH the count and the supply checks — they change the line
+    // count while adding nothing to the total — leaving the byte-root as the
+    // only thing standing between a forged ledger and ingestion. Refuse.
+    if value == 0 { return None; }
+    Some((txid, vout, TxOutput { value, script_pubkey }))
 }
 
 fn utxo_key(txid: &[u8], index: u32) -> Vec<u8> {

@@ -35,6 +35,7 @@ mod coherence;    // Coherence C2 shielded pool
 mod dandelion;    // Coherence P3 Dandelion++ tx-relay privacy
 mod stratum;  // Sprint AA.1 — stratum V1 mining server
 mod stratum_v2;   // Sprint 10-alpha — stratum V2 mining server (NOISE_NX + SV2)
+mod sync;         // Phase 2 — drop-in Kaspa sync-negotiation layer
 
 use clap::Parser;
 use log::{info, warn, error, debug};
@@ -50,6 +51,37 @@ use tokio::sync::{mpsc, broadcast};
 #[command(version)]
 struct Cli {
     #[arg(long)]                                         mine: bool,
+    /// Number of CPU cores the SIS miner grinds across in parallel. Each worker
+    /// searches a disjoint nonce range under the same regime (result-identical
+    /// to single-thread mining — pure throughput). Defaults to all logical CPUs.
+    #[arg(long)]                                         mine_threads: Option<usize>,
+    /// Keep EVERY block body — never prune. An archival node is what lets a
+    /// FRESH node bootstrap: the default pruning depth (10,000 blocks) deletes
+    /// bodies from CF_BLOCKS while the header/DAG map keeps every entry, so a
+    /// pruned node still ADVERTISES headers it can no longer serve. With no
+    /// archival peer anywhere on the network, a new node asks for block 0, is
+    /// promised 500 headers, receives no bodies, and loops forever at height 1.
+    /// That is the observed failure on this fleet (2026-07-19): every node had
+    /// pruned below ~394,913, so those bodies exist nowhere and cannot be
+    /// recovered. Run at least one archival node, or new nodes cannot join.
+    /// Costs disk: the full chain instead of the last 10,000 blocks.
+    /// Re-derive the carry-over root FROM THE DATABASE and exit. Verifies what
+    /// this data-dir actually CONTAINS, not what a file hashed to when it was
+    /// ingested — the meta stamp is a copied string and proves nothing about the
+    /// ledger now. Run this on any data-dir you did not build yourself, and
+    /// especially on one you downloaded: a "fast bootstrap" tarball is exactly
+    /// the case the stamp cannot catch. Exits 0 on match, 1 on mismatch.
+    #[arg(long)]                                         verify_carryover: bool,
+    #[arg(long)]                                         archive: bool,
+    /// Genesis-2 carry-over: path to the blessed UTXO snapshot TSV, ingested
+    /// once at FIRST boot. Before anything is written the file is fully
+    /// verified against the baked-in constants (bloch-crypto core): SHAKE-256
+    /// over its RAW bytes must equal CARRYOVER_SNAPSHOT_ROOT, its line count
+    /// CARRYOVER_UTXO_COUNT, and its summed value CARRYOVER_TOTAL_SAT. Any
+    /// mismatch → the node logs the specific failure(s) and refuses to start
+    /// (exit 1), like the genesis PoW check. A chain-id that REQUIRES
+    /// carry-over refuses to start if this flag is absent.
+    #[arg(long)]                                         carryover_snapshot: Option<PathBuf>,
     #[arg(long)]                                         testnet: bool,
     #[arg(long, default_value = "./bloch-data")]          data_dir: String,
     /// RPC bind address. SECURITY: defaults to 127.0.0.1 (local only).
@@ -271,11 +303,145 @@ async fn main() {
 
 
     // ── Consensus ─────────────────────────────────────────────────────────────
-    let dag = Arc::new(RwLock::new(consensus::GhostDAG::with_default_k()));
+    // `with_default_k_env` == `with_default_k` (Legacy) unless the dev/test
+    // override `BLOCH_GHOSTDAG_COLORING=fast` is set. The live gate
+    // (CORRECTED_COLORING_ACTIVATION_HEIGHT) is unchanged; see ColoringMode docs.
+    let dag = Arc::new(RwLock::new(consensus::GhostDAG::with_default_k_env()));
 
     // ── Genesis + DAG reload ─────────────────────────────────────────────────
+    // --verify-carryover: audit the data-dir and exit. Runs before anything else
+    // starts so it can be pointed at a live node's directory without racing it.
+    if cli.verify_carryover {
+        match store.derive_carryover_root() {
+            Ok((root, count, total)) => {
+                let expected = core::CARRYOVER_SNAPSHOT_ROOT;
+                println!("carry-over audit — derived FROM THE DATABASE, not from any file");
+                println!("  data-dir      : {}", cli.data_dir);
+                println!("  utxo count    : {count}  (chain requires {})", core::CARRYOVER_UTXO_COUNT);
+                println!("  total value   : {total} sat  (chain requires {})", core::CARRYOVER_TOTAL_SAT);
+                println!("  derived root  : {}", hex::encode(root));
+                println!("  required root : {}", hex::encode(expected));
+                let ok = root == expected
+                    && count == core::CARRYOVER_UTXO_COUNT
+                    && total == core::CARRYOVER_TOTAL_SAT;
+                if ok {
+                    println!();
+                    println!("MATCH — this database contains exactly the carried-over ledger.");
+                    std::process::exit(0);
+                }
+                eprintln!();
+                eprintln!("MISMATCH — this data-dir does NOT contain the ledger this binary expects.");
+                eprintln!("If you downloaded it, do not run a node on it. The meta stamp inside a");
+                eprintln!("data-dir records what a file hashed to at ingest time; it is copied text");
+                eprintln!("and a tampered directory can carry a correct-looking one. This check is");
+                eprintln!("the one that reads the actual UTXO set back out.");
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("carry-over audit failed to read the UTXO set: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // Archival mode is process-wide and fixed; set it before any block is accepted.
+    if cli.archive {
+        ARCHIVE_MODE.store(true, std::sync::atomic::Ordering::Relaxed);
+        info!("--archive: pruning DISABLED, every block body retained. This node can \
+               bootstrap fresh peers; a pruned node cannot.");
+    }
+
+    // ── Genesis-2 carry-over gate (fail closed) ──────────────────────────────
+    // Runs BEFORE genesis initialisation so that on first boot the snapshot is
+    // fully verified before this process writes ANY chain state. Order of
+    // operations on first boot: verify (root + count + supply, all reported) →
+    // ingest (one atomic WriteBatch, UTXOs + marker together) → genesis init.
+    // A crash between ingest and genesis init re-runs both next boot
+    // (idempotent: same keys, same verified bytes).
+    let first_boot = store.get_meta("genesis_hash").ok().flatten().is_none();
+    let carryover_required = core::chain_requires_carryover(core::node_chain_id());
+    if carryover_required && cli.carryover_snapshot.is_none() {
+        error!("this chain-id ({:?}) REQUIRES a carry-over snapshot: pass \
+                --carryover-snapshot <file.tsv> whose SHAKE-256 root is {}. \
+                Refusing to start.",
+               core::node_chain_id(), hex::encode(core::CARRYOVER_SNAPSHOT_ROOT));
+        std::process::exit(1);
+    }
+    if let Some(snap_path) = &cli.carryover_snapshot {
+        if !carryover_required {
+            warn!("--carryover-snapshot on a chain-id ({:?}) that does not require it — \
+                   dev/test use only; the snapshot is still verified fail-closed.",
+                  core::node_chain_id());
+        }
+        if first_boot {
+            info!("carry-over: verifying {} against baked-in constants \
+                   (root {}…, count {}, supply {} sat)…",
+                  snap_path.display(),
+                  &hex::encode(core::CARRYOVER_SNAPSHOT_ROOT)[..16],
+                  core::CARRYOVER_UTXO_COUNT, core::CARRYOVER_TOTAL_SAT);
+            match storage::verify_carryover_snapshot(snap_path) {
+                Ok(snap) => {
+                    info!("carry-over snapshot VERIFIED: root {}, {} UTXOs, {} sat",
+                          hex::encode(snap.root), snap.count, snap.total_sat);
+                    match store.ingest_carryover(&snap) {
+                        Ok(n) => info!("carry-over ingested: {n} UTXOs written atomically \
+                                        (meta carryover_root stamped)"),
+                        Err(e) => {
+                            error!("carry-over ingestion FAILED after verification: {e}. \
+                                    The write batch is atomic — nothing was persisted. \
+                                    Refusing to start.");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                Err(failures) => {
+                    for f in &failures {
+                        error!("carry-over verification FAILED: {f}");
+                    }
+                    error!("REFUSING TO START: {} carry-over check(s) failed; nothing was \
+                            written. Supply this chain's exact blessed snapshot file — \
+                            the loader verifies the bytes it is given and never sorts or \
+                            repairs them.", failures.len());
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            // Already-initialised data-dir: never re-ingest. Prove the ingestion
+            // actually happened, against the SAME root this binary requires.
+            match store.get_meta("carryover_root").ok().flatten() {
+                Some(r) if r.as_slice() == core::CARRYOVER_SNAPSHOT_ROOT => {
+                    info!("carry-over already ingested (meta carryover_root matches {}…); \
+                           snapshot file not re-read.",
+                          &hex::encode(core::CARRYOVER_SNAPSHOT_ROOT)[..16]);
+                }
+                Some(r) => {
+                    error!("carry-over marker MISMATCH: data-dir was ingested from root {} \
+                            but this binary requires {}. This data-dir belongs to a \
+                            different carry-over lineage. Refusing to start.",
+                           hex::encode(&r), hex::encode(core::CARRYOVER_SNAPSHOT_ROOT));
+                    std::process::exit(1);
+                }
+                None => {
+                    error!("carry-over marker ABSENT: this data-dir was initialised WITHOUT \
+                            carry-over ingestion, and grafting a snapshot onto existing \
+                            chain state is not supported. Start from a fresh data-dir. \
+                            Refusing to start.");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+
     if store.get_meta("genesis_hash").ok().flatten().is_none() {
-        info!("MINING genesis block — this will take a few seconds...");
+        // NOT mining: the genesis PoW witness is the pre-mined constant
+        // GENESIS_POW_SOLUTION (bloch-crypto core/mod.rs:321), exactly like the
+        // entanglement-layer GENESIS_NONCE pattern. This path CONSTRUCTS the
+        // canonical genesis from constants and VERIFIES it, then refuses to start
+        // if it does not check out. The old "MINING genesis block — this will take
+        // a few seconds" message described work that never happens, and it costs
+        // real diagnosis time: an operator who sees it next to 0% CPU concludes the
+        // node hung during genesis, when in fact this step already finished.
+        info!("Initialising canonical genesis (pre-mined PoW witness) and verifying...");
         let founder_spk = address_to_script_pubkey(FOUNDER_ADDRESS_HEX);
         // V2 (ADR-028): miner slot at genesis uses founder address (genesis
         // bootstrapping convention). Pool addresses come from tokenomics_v2
@@ -315,6 +481,15 @@ async fn main() {
             // integrity; see `compute_integrity_hash` for the convention.
             store.put_dag_with_integrity(&hash, &gdata)
                 .expect("persist genesis dag + integrity");
+            // Phase 1: when the reachability index is maintained (Fast / armed),
+            // persist the genesis reachability record + version tag + root.
+            // (Live Legacy path leaves CF_REACHABILITY untouched.)
+            if dag.read().maintains_reachability_index() {
+                let _ = dag.write().reach_take_delta(); // start tracking clean
+                store.store_reachability_snapshot(&dag.read().reach_export_all(),
+                                                  dag.read().reach_root())
+                    .expect("persist genesis reachability index");
+            }
         }
         for tx in &genesis.transactions {
             let txid = tx.txid();
@@ -401,6 +576,98 @@ async fn main() {
         }
     }
 
+    // ── Phase 2: durable reachability index — load-or-rebuild on boot ─────────
+    //
+    // `load_persisted*` above inserts blocks straight into the in-memory DAG
+    // WITHOUT feeding the reachability index (it bypasses `add_block`). So when
+    // the index is maintained (Fast / armed activation) it is empty here and
+    // must be initialized before it colors any block:
+    //
+    //   * Fast-path: if CF_REACHABILITY carries the matching schema version and
+    //     covers every CF_DAG block, load it directly (no O(chain) recompute).
+    //   * Migration: otherwise rebuild by replaying the SAME `reach.add_block`
+    //     code path in topological order, then persist the fresh snapshot.
+    //   * Guard: random-sample self-check against the brute-force oracle before
+    //     trusting the index; a loaded index that fails is rebuilt once.
+    //
+    // This whole block is inert on the live Legacy path (the gate is disabled),
+    // so it never runs on a mainnet node from this branch. No peer resync ever.
+    if dag.read().maintains_reachability_index() && dag.read().block_count() > 0 {
+        let want_ver = storage::Storage::REACHABILITY_SCHEMA_VERSION;
+        let have_ver = store.get_reachability_version().ok().flatten();
+        let block_count = dag.read().block_count();
+
+        let mut loaded_ok = false;
+        if have_ver == Some(want_ver) {
+            match store.load_all_reachability() {
+                Ok(records) if records.len() == block_count => {
+                    let root = store.get_reachability_root().ok().flatten();
+                    match dag.write().reach_load_records(&records, root) {
+                        Ok(()) => {
+                            loaded_ok = true;
+                            info!("reachability index loaded from disk: {} records", records.len());
+                        }
+                        Err(e) => warn!("reachability load failed ({e}); will rebuild"),
+                    }
+                }
+                Ok(records) => warn!(
+                    "reachability CF covers {}/{} blocks (partial/torn); will rebuild",
+                    records.len(), block_count
+                ),
+                Err(e) => warn!("reachability CF read failed ({e}); will rebuild"),
+            }
+        } else {
+            info!(
+                "reachability index absent/version-mismatch (have {:?}, want {}); \
+                 rebuilding from CF_DAG (one-time)",
+                have_ver, want_ver
+            );
+        }
+
+        let persist_rebuilt = |dag: &Arc<RwLock<consensus::GhostDAG>>, store: &storage::Storage| {
+            let snap = dag.read().reach_export_all();
+            let root = dag.read().reach_root();
+            let _ = dag.write().reach_take_delta(); // clear the rebuild's dirty flags
+            if let Err(e) = store.store_reachability_snapshot(&snap, root) {
+                warn!("failed to persist rebuilt reachability index: {e}");
+            }
+        };
+
+        if !loaded_ok {
+            match dag.write().rebuild_reachability_from_store() {
+                Ok(n) => info!("reachability index rebuilt from CF_DAG: {} blocks", n),
+                Err(e) => {
+                    error!("reachability rebuild FAILED: {e}");
+                    error!("Refusing to continue with an uninitialized Fast-coloring index.");
+                    std::process::exit(1);
+                }
+            }
+            persist_rebuilt(&dag, &store);
+        }
+
+        // Self-check the (loaded or rebuilt) index against the unbounded oracle.
+        if let Err(e) = dag.read().reach_self_check_sample(2000, 0xB10C_5157) {
+            if loaded_ok {
+                warn!("loaded reachability failed self-check ({e}); rebuilding from CF_DAG");
+                match dag.write().rebuild_reachability_from_store() {
+                    Ok(n) => info!("reachability rebuilt after failed self-check: {} blocks", n),
+                    Err(e2) => { error!("rebuild after failed self-check errored: {e2}"); std::process::exit(1); }
+                }
+                persist_rebuilt(&dag, &store);
+                if let Err(e2) = dag.read().reach_self_check_sample(2000, 0x5157_B10C) {
+                    error!("reachability STILL fails self-check after rebuild: {e2}");
+                    std::process::exit(1);
+                }
+                info!("reachability self-check OK after rebuild");
+            } else {
+                error!("rebuilt reachability failed self-check: {e}");
+                std::process::exit(1);
+            }
+        } else {
+            info!("reachability self-check OK (sampled pairs match brute-force oracle)");
+        }
+    }
+
     // ── Heal poisoned finality checkpoint (blue-score/height unit bug) ─────────
     // Older builds persisted finalized_height = tip_blue_score − CHECKPOINT_DEPTH,
     // which runs ahead of the selected tip's *height* by the DAG width and can
@@ -482,6 +749,16 @@ async fn main() {
     let otx2    = outbound_tx.clone();
     let tip_tx2 = tip_tx.clone();
 
+    // ── Phase-2 Kaspa sync-negotiation shared state (drop-in, additive) ───────
+    // `peer_state`: PeerId-keyed chain-state table, written by the network loop
+    // (P4) where the real libp2p PeerId is in scope; read here by the processor
+    // + nudge. `frontier`: in-flight tip-request tracker gating IBD release.
+    // Lock order everywhere: dag → peer_state → frontier → node_state.
+    let peer_state = Arc::new(sync::peer_state::PeerStateTable::new());
+    let frontier   = Arc::new(parking_lot::Mutex::new(sync::frontier::FrontierState::new()));
+    let peer_state2 = peer_state.clone();
+    let frontier2   = frontier.clone();
+
     tokio::spawn(async move {
         use futures::future::FutureExt;
         // ── P0 supervision (roadmap §2.5, top reliability risk #1) ───────────
@@ -521,22 +798,18 @@ async fn main() {
                     {
                         let mut s = state2.write();
                         s.seen_first_tip = true;
+                        // Phase-2: best_seen_blue_score is kept ONLY as an RPC
+                        // display hint — it no longer releases the IBD latch. A
+                        // peer can announce any blue_score; release is decided
+                        // solely by maybe_release_ibd (blue_work-verified below).
                         if peer_s > s.best_seen_blue_score { s.best_seen_blue_score = peer_s; }
-                        // Release the IBD latch once we've caught up to the best
-                        // tip any peer has announced. Replaces the dead empty-
-                        // Headers clear path below; peers re-announce their tip
-                        // ~every 60s, so a synced node resumes mining promptly.
-                        if s.is_syncing && our_s >= s.best_seen_blue_score {
-                            s.is_syncing = false;
-                            info!("IBD complete (caught up to best announced tip {})", s.best_seen_blue_score);
-                        }
                     }
                     if peer_s > our_s {
                         info!("Peer {} ahead ({}), requesting headers", peer_id, peer_s);
+                        // Retained legacy over-trigger fallback (entering IBD is
+                        // always safe); the announced score never RELEASES it.
                         state2.write().is_syncing = true;
-                        let _ = otx2.send(network::NetworkMessage::GetHeaders {
-                            from_blue_score: our_s, limit: 500
-                        }).await;
+                        let _ = otx2.send(network::NetworkMessage::GetHeaders { from_blue_score: our_s, limit: 500, nonce: getblock_nonce() }).await;
                     } else if peer_s < our_s {
                         // Mesh fix (reciprocal tip): the announcing peer is
                         // BEHIND us, and its other ways of learning our tip are
@@ -566,10 +839,50 @@ async fn main() {
                             }).await;
                         }
                     }
+                    maybe_release_ibd(&dag2, &peer_state2, &frontier2, &state2);
+                }
+
+                // Frontier reconciliation: a peer asks for our DAG frontier.
+                // Reply with every tip (as SyncEntry) plus an exponential
+                // block-locator over our selected chain (common-ancestor hint).
+                network::NetworkMessage::GetTips => {
+                    let (entries, locator) = {
+                        let d = dag2.read();
+                        let entries: Vec<network::SyncEntry> = d.tips().iter()
+                            .filter_map(|h| d.get_node(h).map(|n| network::SyncEntry {
+                                hash: *h, blue_score: n.blue_score, height: n.height,
+                            }))
+                            .collect();
+                        let locator = sync::locator::build_locator(&d.selected_chain());
+                        (entries, locator)
+                    };
+                    let _ = otx2.send(network::NetworkMessage::Tips { tips: entries, locator }).await;
+                }
+
+                // Frontier reconciliation: a peer's advertised frontier. GetBlock
+                // every advertised tip we lack; a frontier gap means we are
+                // behind, so enter IBD. Missing parents of the fetched tips flow
+                // into the EXISTING orphan pool via the NewBlock arm — no new
+                // orphan logic here.
+                network::NetworkMessage::Tips { tips, .. } => {
+                    let advertised: Vec<[u8; 32]> = tips.iter().map(|e| e.hash).collect();
+                    let now = std::time::Instant::now();
+                    let to_req = {
+                        let d = dag2.read();
+                        frontier2.lock().to_request(&advertised, |h| d.has_block(h), now)
+                    };
+                    if !to_req.is_empty() {
+                        // Frontier gap → enter IBD (blue_work-verified release).
+                        state2.write().is_syncing = true;
+                        for h in &to_req {
+                            let _ = otx2.send(network::NetworkMessage::GetBlock { block_hash: *h, nonce: getblock_nonce() }).await;
+                        }
+                    }
+                    maybe_release_ibd(&dag2, &peer_state2, &frontier2, &state2);
                 }
 
                 // IBD step 2: someone asks for our headers
-                network::NetworkMessage::GetHeaders { from_blue_score, limit } => {
+                network::NetworkMessage::GetHeaders { from_blue_score, limit, .. } => {
                     let entries: Vec<network::SyncEntry> = {
                         let d = dag2.read();
                         d.ordered_hashes_from(from_blue_score, limit as usize)
@@ -591,16 +904,42 @@ async fn main() {
                         .map(|e| e.hash).collect();
                     info!("IBD: need {}/{} blocks", missing.len(), entries.len());
                     for hash in missing {
-                        let _ = otx2.send(network::NetworkMessage::GetBlock { block_hash: hash }).await;
+                        let _ = otx2.send(network::NetworkMessage::GetBlock { block_hash: hash, nonce: getblock_nonce() }).await;
                     }
                     if entries.is_empty() {
-                        state2.write().is_syncing = false;
-                        info!("IBD complete");
+                        // Phase-2: an empty Headers reply no longer clears
+                        // is_syncing (a lying/lagging peer must not fake
+                        // completion). Release is blue_work-verified only.
+                        maybe_release_ibd(&dag2, &peer_state2, &frontier2, &state2);
+                    } else if entries.len() >= 500 {
+                        // Pipeline IBD: a full batch means the serving peer has
+                        // more. Re-request the next batch IMMEDIATELY from the
+                        // highest blue_score we just learned, instead of waiting
+                        // for the 30s nudge. Turns IBD from ~500 headers / 30s
+                        // into a continuous stream so a node thousands of blocks
+                        // behind converges in seconds, not minutes. At parity
+                        // the batch comes back < 500 (or empty) and the stream
+                        // stops, so steady-state cost is zero.
+                        let next_from = entries.iter().map(|e| e.blue_score).max().unwrap_or(0);
+                        let _ = otx2.send(network::NetworkMessage::GetHeaders { from_blue_score: next_from, limit: 500, nonce: getblock_nonce() }).await;
                     }
                 }
 
+                // A peer told us it cannot serve this body — it pruned it, or never
+                // had it. Log it and move on: the point of the message is that the
+                // requester now KNOWS, instead of waiting on silence and re-asking
+                // the same batch every 30s. If every peer answers NotFound for the
+                // early chain, no archival peer exists and a fresh node genuinely
+                // cannot bootstrap — a condition worth surfacing rather than hiding
+                // behind an apparently-healthy log full of header traffic.
+                network::NetworkMessage::BlockNotFound { block_hash, .. } => {
+                    warn!("peer cannot serve block {} (pruned or unknown) — an \
+                           archival peer is needed to bootstrap from this height",
+                          hex::encode(&block_hash[..8]));
+                }
+
                 // IBD step 4: respond to GetBlock with the actual block
-                network::NetworkMessage::GetBlock { block_hash } => {
+                network::NetworkMessage::GetBlock { block_hash, .. } => {
                     match store2.get_block(&block_hash) {
                         Ok(Some(block)) => {
                             // Sprint 1.c: Bitcoin-format wire.
@@ -612,7 +951,23 @@ async fn main() {
                                 block_data: data,
                             }).await;
                         }
-                        _ => debug!("GetBlock: not found {}", hex::encode(&block_hash[..8])),
+                        // Answer explicitly instead of dropping the frame. A silent
+                        // non-answer is unrecoverable for the requester: it cannot
+                        // tell "body pruned" from "packet lost" from "peer busy", so
+                        // it waits, re-asks the same batch on the 30s nudge, and loops
+                        // forever — exactly how a fresh node sat at height 1 through
+                        // 4,397 identical rounds with 15 peers connected. warn!, not
+                        // debug!: a node advertising headers whose bodies it pruned is
+                        // a real operational fault, and at RUST_LOG=info the old debug
+                        // line made it invisible.
+                        _ => {
+                            warn!("GetBlock: body unavailable (pruned or unknown) for {} \
+                                   — replying NotFound so the peer can try another source",
+                                  hex::encode(&block_hash[..8]));
+                            let _ = otx2.send(network::NetworkMessage::BlockNotFound {
+                                block_hash, nonce: getblock_nonce(),
+                            }).await;
+                        }
                     }
                 }
 
@@ -674,7 +1029,23 @@ async fn main() {
                                 debug!("orphan block h={} (missing {} parents), buffered (pool={})",
                                     height, missing_parents.len(), orphans.len() + 1);
                                 for mp in &missing_parents {
+                                    let first_waiter = !waiting_for.contains_key(mp);
                                     waiting_for.entry(*mp).or_default().insert(block_hash);
+                                    // Kaspa-style recursive ancestor resolution
+                                    // (RequestRelayBlocks): explicitly request each
+                                    // missing parent so the past cone closes even
+                                    // when IBD-by-blue_score hasn't reached this
+                                    // branch. Without this the orphan waits forever
+                                    // and the node silently partitions onto a
+                                    // sub-DAG. Skip parents already buffered or
+                                    // already awaited (their arrival chains the next
+                                    // request), so a deep gap fans out one level at a
+                                    // time instead of duplicating GetBlocks.
+                                    if first_waiter && !orphans.contains_key(mp) {
+                                        let _ = otx2.send(network::NetworkMessage::GetBlock {
+                                            block_hash: *mp, nonce: getblock_nonce(),
+                                        }).await;
+                                    }
                                 }
                                 orphans.insert(block_hash, (block, block_data, height));
                                 continue;
@@ -703,6 +1074,14 @@ async fn main() {
                                     &dag2, &store2, &mem2, &state2,
                                     Some(&tip_tx2), &shielded2,
                                 );
+                                // Phase-2 frontier: this tip (if it was in flight)
+                                // is now present — clear it and re-test the IBD
+                                // latch. Orphans drained by process_orphans that
+                                // were themselves advertised tips get cleared by
+                                // the next Tips round (to_request skips present
+                                // blocks), so clearing block_hash here suffices.
+                                frontier2.lock().note_received(&block_hash);
+                                maybe_release_ibd(&dag2, &peer_state2, &frontier2, &state2);
                             }}
                         }
                     }
@@ -761,19 +1140,16 @@ async fn main() {
                     {
                         let mut s = state2.write();
                         s.seen_first_tip = true;
+                        // Phase-2: RPC hint only — never releases the latch.
                         if peer_s > s.best_seen_blue_score { s.best_seen_blue_score = peer_s; }
-                        if s.is_syncing && our_s >= s.best_seen_blue_score {
-                            s.is_syncing = false;
-                            info!("IBD complete (caught up to best announced tip {})", s.best_seen_blue_score);
-                        }
                     }
                     if peer_s > our_s {
                         info!("Version peer ahead (score {} > {}), requesting headers", peer_s, our_s);
+                        // Retained legacy over-trigger fallback (safe).
                         state2.write().is_syncing = true;
-                        let _ = otx2.send(network::NetworkMessage::GetHeaders {
-                            from_blue_score: our_s, limit: 500
-                        }).await;
+                        let _ = otx2.send(network::NetworkMessage::GetHeaders { from_blue_score: our_s, limit: 500, nonce: getblock_nonce() }).await;
                     }
+                    maybe_release_ibd(&dag2, &peer_state2, &frontier2, &state2);
                 }
                 network::NetworkMessage::VersionAck
                 | network::NetworkMessage::PeerExchange { .. }
@@ -819,9 +1195,11 @@ async fn main() {
     // at least every 30s. At parity the nudge stops (and the serving side
     // suppresses empty Headers replies), so steady-state cost is zero.
     {
-        let dag_n   = dag.clone();
-        let state_n = node_state.clone();
-        let otx_n   = outbound_tx.clone();
+        let dag_n        = dag.clone();
+        let state_n      = node_state.clone();
+        let otx_n        = outbound_tx.clone();
+        let peer_state_n = peer_state.clone();
+        let frontier_n   = frontier.clone();
         tokio::spawn(async move {
             let mut nudge = tokio::time::interval(std::time::Duration::from_secs(30));
             loop {
@@ -831,12 +1209,27 @@ async fn main() {
                     let s = state_n.read();
                     (s.peer_count, s.is_syncing, s.best_seen_blue_score, s.seen_first_tip)
                 };
-                if peers > 0 && (syncing || !seen_tip || best_seen > our_s) {
-                    debug!("IBD nudge: GetHeaders from score {} (best_seen={} syncing={} seen_tip={})",
-                        our_s, best_seen, syncing, seen_tip);
-                    let _ = otx_n.send(network::NetworkMessage::GetHeaders {
-                        from_blue_score: our_s, limit: 500,
-                    }).await;
+                if peers > 0 {
+                    // Retained legacy fallback (gossip path): only when we have a
+                    // reason to believe we're behind, exactly as before.
+                    if syncing || !seen_tip || best_seen > our_s {
+                        debug!("IBD nudge: GetHeaders from score {} (best_seen={} syncing={} seen_tip={})",
+                            our_s, best_seen, syncing, seen_tip);
+                        let _ = otx_n.send(network::NetworkMessage::GetHeaders { from_blue_score: our_s, limit: 500, nonce: getblock_nonce() }).await;
+                    }
+                    // Phase-2 frontier reconciliation: every peer replies Tips.
+                    let _ = otx_n.send(network::NetworkMessage::GetTips).await;
+                    // Re-request timed-out tip GetBlocks.
+                    let now = std::time::Instant::now();
+                    let stale = frontier_n.lock().expired(sync::TIP_REQUEST_TIMEOUT, now);
+                    for h in stale {
+                        let _ = otx_n.send(network::NetworkMessage::GetBlock { block_hash: h, nonce: getblock_nonce() }).await;
+                    }
+                    // Re-test the blue_work-verified IBD latch so a node never
+                    // wedges in is_syncing after it has actually caught up —
+                    // the liveness backstop against a fabricated high announced
+                    // score freezing the node.
+                    maybe_release_ibd(&dag_n, &peer_state_n, &frontier_n, &state_n);
                 }
             }
         });
@@ -901,13 +1294,33 @@ async fn main() {
         // FIX #8: Convert miner address to proper 20-byte script_pubkey
         let miner_spk = address_to_script_pubkey(&miner_addr);
 
+        // Capacity: grind the SIS search across all logical CPUs by default
+        // (result-identical — see pow::mine_sis_pow_parallel). Override with
+        // --mine-threads. Clamp to >=1.
+        let mine_threads = cli.mine_threads
+            .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))
+            .max(1);
+
         tokio::spawn(async move {
-            info!("⛏  Miner started → {}", miner_addr);
+            info!("⛏  Miner started → {} ({} thread(s))", miner_addr, mine_threads);
             let mut mining_round: u64 = 0;
             // Sprint GG: warn once when we first see IBD active, log
             // transition back to ready so operators see the transition.
             let mut was_syncing_last_tick: bool = false;
             let mut warned_no_peers: bool = false;
+            // Sync-stall release: is_syncing pauses mining during genuine IBD,
+            // but must never latch forever. If the tip has not advanced for
+            // SYNC_STALL_SECS while syncing — peers cannot deliver the announced
+            // best_seen tip (e.g. the whole network is wedged behind the
+            // reachability perf wall) — resume mining on the best local tip.
+            // is_syncing STAYS true so the IBD nudge keeps pulling; PoW advances
+            // the chain in the meantime and we reorg to any heavier chain the
+            // instant its blocks arrive. This is what stops a network-wide
+            // freeze from being permanent.
+            const SYNC_STALL_SECS: u64 = 90;
+            let mut last_seen_tip: u64 = dag_m.read().tip_blue_score();
+            let mut last_tip_advance = std::time::Instant::now();
+            let mut warned_stall_release: bool = false;
             loop {
                 // Fresh-miner fork guard (see wants_to_join above): a node told
                 // to join a network but with 0 peers so far must not mine — it
@@ -948,7 +1361,26 @@ async fn main() {
                 // direction so operators can see when IBD started and
                 // when mining resumed.
                 let syncing_now = state_m.read().is_syncing;
-                if syncing_now {
+                // Track tip progress for the sync-stall release.
+                {
+                    let cur_tip = dag_m.read().tip_blue_score();
+                    if cur_tip > last_seen_tip {
+                        last_seen_tip = cur_tip;
+                        last_tip_advance = std::time::Instant::now();
+                        warned_stall_release = false;
+                    }
+                }
+                let sync_stalled = last_tip_advance.elapsed()
+                    >= std::time::Duration::from_secs(SYNC_STALL_SECS);
+                // [no-fork] Freeze finality while mining through a stall (the
+                // announced heaviest tip is unreachable and we mine our local
+                // tip to stay live): a strictly-heavier chain must still be able
+                // to deep-reorg us back once its holder becomes reachable, so
+                // mine-through can never self-finalize a solo fork. Unfrozen
+                // whenever we are synced or catching up normally.
+                FINALITY_FROZEN.store(syncing_now && sync_stalled,
+                    std::sync::atomic::Ordering::Relaxed);
+                if syncing_now && !sync_stalled {
                     if !was_syncing_last_tick {
                         info!("⛏  IBD in progress — miner paused, will resume when sync completes");
                         was_syncing_last_tick = true;
@@ -956,7 +1388,12 @@ async fn main() {
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     continue;
                 }
-                if was_syncing_last_tick {
+                if syncing_now && sync_stalled && !warned_stall_release {
+                    warn!("⛏  sync stalled {}s at tip {} (announced best_seen unreachable) — resuming mining on best local tip; will reorg when heavier blocks arrive",
+                        SYNC_STALL_SECS, last_seen_tip);
+                    warned_stall_release = true;
+                }
+                if was_syncing_last_tick && !syncing_now {
                     info!("⛏  IBD complete — miner resumed at tip");
                     was_syncing_last_tick = false;
                 }
@@ -1088,7 +1525,7 @@ async fn main() {
                 let bits = block.header.bits;
                 let mine_height = block.height;
                 let mined = tokio::task::spawn_blocking(move || {
-                    pow::mine_sis_pow(&preimage, bits, mine_height, 0, 50_000_000)
+                    pow::mine_sis_pow_parallel(&preimage, bits, mine_height, 0, 50_000_000, mine_threads)
                 }).await;
 
                 match mined {
@@ -1144,9 +1581,17 @@ async fn main() {
                             );
                             continue;
                         }
-                        // Persist DAG data + integrity hash (Sprint Y, M-2)
+                        // Persist DAG data + integrity hash (Sprint Y, M-2).
+                        // Phase 1: fold the reachability delta into the same
+                        // atomic write when the index is maintained; live Legacy
+                        // path is byte-for-byte unchanged.
                         if let Some(ddata) = dag_m.read().get_block_data(&hash).cloned() {
-                            store_m.put_dag_with_integrity(&hash, &ddata).ok();
+                            if dag_m.read().maintains_reachability_index() {
+                                let (upserts, removals) = dag_m.write().reach_take_delta();
+                                store_m.put_dag_with_integrity_and_reach(&hash, &ddata, &upserts, &removals).ok();
+                            } else {
+                                store_m.put_dag_with_integrity(&hash, &ddata).ok();
+                            }
                         }
                         {
                             let mut s = state_m.write();
@@ -1460,7 +1905,7 @@ async fn main() {
                 // B5f pool seam: submitblock hook (see rpc::SubmitBlockFn).
                 Some(rpc_submit_block.clone()),
             ) => { error!("RPC exited"); }
-        _ = node.run(block_tx, outbound_rx, dag.clone()) => {
+        _ = node.run(block_tx, outbound_rx, dag.clone(), peer_state.clone()) => {
             error!("Network exited");
         }
     }
@@ -1590,6 +2035,31 @@ fn make_rpc_submit_block_cb(
 }
 
 // ── Block acceptance + Orphan processing ─────────────────────────────────────
+
+/// [no-fork] Set true while the miner is mining through a stalled IBD latch
+/// (the announced heaviest tip is unreachable and we mine our locally-heaviest
+/// validated tip to keep the chain live). While frozen we do NOT advance
+/// `finalized_height`, so a strictly-heavier chain can still deep-reorg us back
+/// once its holder becomes reachable — mine-through can never self-finalize a
+/// solo fork. Driven by the miner loop; cleared when synced / catching up.
+/// A per-request nonce whose ONLY job is to make each GetBlock unique on the
+/// wire, so gossipsub's duplicate cache cannot swallow a retry. Monotonic rather
+/// than random: retries must differ from each other, and a counter guarantees
+/// that without depending on an RNG or on the clock's resolution.
+fn getblock_nonce() -> u64 {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+static FINALITY_FROZEN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Set once from `--archive` at startup. Same static-flag shape as
+/// FINALITY_FROZEN above: accept_block runs far from the CLI struct and
+/// threading a bool through every caller would be noise for a value that is
+/// fixed for the process lifetime.
+static ARCHIVE_MODE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Validate TX contents, add block to DAG + storage, update UTXO set.
 /// Returns Ok(block_hash) on success.
@@ -1927,7 +2397,16 @@ fn accept_block(
     // can never adopt a fork tip whose chain state was refused.
     if let Some(ddata) = dag.read().get_block_data(&block_hash).cloned() {
         // Sprint Y (M-2): atomic put to CF_DAG + CF_DAG_INTEGRITY.
-        store.put_dag_with_integrity(&block_hash, &ddata).ok();
+        // Phase 1: when the reachability index is maintained, fold its delta
+        // (which may span several blocks if this insert triggered a reindex)
+        // into the SAME WriteBatch, so a crash here leaves CF_DAG and
+        // CF_REACHABILITY consistent all-or-nothing. Live Legacy: unchanged.
+        if dag.read().maintains_reachability_index() {
+            let (upserts, removals) = dag.write().reach_take_delta();
+            store.put_dag_with_integrity_and_reach(&block_hash, &ddata, &upserts, &removals).ok();
+        } else {
+            store.put_dag_with_integrity(&block_hash, &ddata).ok();
+        }
     }
 
     // ── Update node state ────────────────────────────────────────────
@@ -1953,7 +2432,11 @@ fn accept_block(
             .and_then(|h| d.get_block_data(&h).map(|data| data.height))
             .unwrap_or(0)
     };
-    if tip_height > core::CHECKPOINT_DEPTH {
+    // [no-fork] Do not advance finality while mining through a stalled latch —
+    // freezing finalized_height keeps a heavier chain able to reorg us back.
+    if tip_height > core::CHECKPOINT_DEPTH
+        && !FINALITY_FROZEN.load(std::sync::atomic::Ordering::Relaxed)
+    {
         let new_finalized = tip_height - core::CHECKPOINT_DEPTH;
         let current_finalized = store.get_meta("finalized_height").ok().flatten()
             .and_then(|b| b.as_slice().try_into().ok().map(u64::from_le_bytes))
@@ -1965,7 +2448,13 @@ fn accept_block(
 
     // ── Prune old block bodies ───────────────────────────────────────
     // Remove full block data beyond PRUNING_DEPTH (keeps height→hash, DAG, TX index)
-    if tip_height > core::PRUNING_DEPTH {
+    if ARCHIVE_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+        // Archival node: keep everything. Logged once per prune window so an
+        // operator can see the choice is in effect rather than inferring it.
+        if tip_height % 10_000 == 0 {
+            info!("archival mode: retaining ALL block bodies (h={}); pruning disabled", tip_height);
+        }
+    } else if tip_height > core::PRUNING_DEPTH {
         let prune_below = tip_height - core::PRUNING_DEPTH;
         let last_pruned = store.pruned_height();
         if prune_below > last_pruned + 1000 { // batch: prune every 1000 blocks
@@ -2017,6 +2506,70 @@ fn accept_block(
     }
 
     Ok(block_hash)
+}
+
+/// Blue_work-VERIFIED IBD release — the ONLY path that clears `is_syncing`.
+///
+/// Phase-2 sync-negotiation invariant: announced blue_score NEVER releases the
+/// latch (a peer can lie). We clear IBD only when, computed locally from the
+/// DAG: (1) the frontier is reconciled — we `has_block` every connected peer's
+/// advertised tip AND nothing is in flight — AND (2) our selected-tip
+/// `blue_work` is at least the greatest locally-verified `blue_work` reachable
+/// from a connected peer (`servable_blue_work`). Tips we cannot verify against
+/// our own DAG contribute 0, so unbacked high announcements cannot gate release.
+///
+/// Lock order (must match every other call-site): dag → peer_state → frontier
+/// → node_state. All read locks drop before node_state.write().
+fn maybe_release_ibd(
+    dag:        &Arc<RwLock<consensus::GhostDAG>>,
+    peer_state: &Arc<sync::peer_state::PeerStateTable>,
+    frontier:   &Arc<parking_lot::Mutex<sync::frontier::FrontierState>>,
+    node_state: &Arc<RwLock<rpc::NodeState>>,
+) {
+    let (our_work, our_score, servable, reconciled, have_frontier) = {
+        let d = dag.read();
+        let selected = d.selected_tip().and_then(|h| d.get_node(&h));
+        let our_work = selected.as_ref().map(|n| n.blue_work).unwrap_or(0);
+        let our_score = selected.as_ref().map(|n| n.blue_score).unwrap_or(0);
+        let servable = peer_state.servable_blue_work(|h| d.get_node(h).map(|n| n.blue_work));
+        let advertised = peer_state.connected_advertised_tips();
+        let have_frontier = !advertised.is_empty();
+        // Frontier lock taken into a local guard (lock order dag→peer_state→
+        // frontier→node_state); compute outstanding + reconciled, drop before write.
+        let fr = frontier.lock();
+        let outstanding = fr.outstanding();
+        let reconciled = sync::frontier::reconciled(
+            &advertised, |h| d.has_block(h), outstanding, |h| fr.is_abandoned(h),
+        );
+        drop(fr);
+        (our_work, our_score, servable, reconciled, have_frontier)
+    };
+    let best_announced = peer_state.best_announced_blue_score();
+    // Release the IBD latch on the FIRST of two signals (both backstopped by the
+    // 90s mine-through valve, so neither can freeze the miner):
+    //  (A) VERIFIED / griefer-proof: we hold every advertised tip (or it is
+    //      abandoned-as-unreachable, per Fix #1) AND our selected chain is at
+    //      least the best VERIFIED reachable work. Gated on `have_frontier` so an
+    //      empty advertised set cannot vacuously release us mid-catch-up.
+    //  (B) LAG / mining-lag tolerant: our selected tip is within IBD_EXIT_LAG
+    //      blue_score of the best ANNOUNCED tip — normal operation, not a bulk
+    //      backlog. This is what lets a trailing MINER keep mining (leapfrog)
+    //      instead of freezing as a pure follower: the canary proved the strict
+    //      verified gate (A) never completes while a peer mines continuously (the
+    //      chased frontier keeps moving). Announced score is UNTRUSTED and only
+    //      ever RELEASES here (never blocks); a lying high-announce peer keeps us
+    //      out of (A)+(B) and we fall back to the 90s throttled mine-through — it
+    //      can never freeze us and never fakes a completion during a real backlog.
+    let verified  = have_frontier && reconciled && our_work >= servable;
+    let caught_up = our_score.saturating_add(sync::IBD_EXIT_LAG) >= best_announced;
+    if verified || caught_up {
+        let mut s = node_state.write();
+        if s.is_syncing {
+            s.is_syncing = false;
+            info!("IBD complete (verified={} caught_up={}; score {} best_announced {}; work {} servable {})",
+                verified, caught_up, our_score, best_announced, our_work, servable);
+        }
+    }
 }
 
 /// After accepting a block, check if any orphans can now be processed.

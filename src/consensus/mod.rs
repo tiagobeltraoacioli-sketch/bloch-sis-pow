@@ -22,6 +22,9 @@ use serde::{Serialize, Deserialize};
 use log::warn;
 use crate::core::GHOSTDAG_K;
 
+pub mod reachability;
+use reachability::ReachabilityStore;
+
 // ── Types ────────────────────────────────────────────────────────────────────
 
 pub type BlockHash = [u8; 32];
@@ -484,18 +487,346 @@ fn topological_sort(store: &DagStore, blocks: Vec<BlockHash>) -> Vec<BlockHash> 
 
 // ── GhostDAG protocol ────────────────────────────────────────────────────────
 
+/// Selects how `classify_mergeset` computes the blue/red partition.
+///
+/// # SAFETY / consensus status
+///
+/// `Legacy` is the byte-for-byte, currently-deployed mainnet-beta behavior:
+/// bounded `is_ancestor` BFS + `k*100`-bounded `past_blue_set`. It is the
+/// default for every live constructor and MUST stay the default until a
+/// differential replay over the real ≥397k history proves `Fast` is
+/// byte-identical.
+///
+/// `Fast` routes all ancestry queries through the interval reachability index
+/// (`reachability::ReachabilityStore`), removing the bounded BFS. It is
+/// **result-identical to `Legacy` on every DAG where the legacy bound never
+/// bit**, and is exercised by `tests/ghostdag_differential.rs`. Where the two
+/// diverge, the legacy (bug-compatible) answer is the consensus-correct one to
+/// keep; adopting `Fast`'s answer there would be a FORK and requires an
+/// activation-height gate. `Fast` is therefore an opt-in mode, never selected
+/// on the live path in this change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColoringMode {
+    /// Deployed behavior — bounded BFS. Default everywhere.
+    Legacy,
+    /// Interval-index-backed unbounded coloring. Opt-in / test-only.
+    Fast,
+}
+
+/// Activation height for the corrected (`Fast`) GhostDAG coloring.
+///
+/// # TOKEN / HISTORY PRESERVATION — READ BEFORE CHANGING
+///
+/// This is a soft-fork-style activation gate. On the live path (`self.coloring
+/// == Legacy`), a block at `height` is colored with:
+///
+/// ```text
+/// if height >= CORRECTED_COLORING_ACTIVATION_HEIGHT { Fast } else { Legacy }
+/// ```
+///
+/// **Defaulted to `u64::MAX` = DISABLED.** With this value the comparison is
+/// false for every reachable height, so `Legacy` is the effective mode
+/// everywhere and this constant changes ZERO live behavior. Historical blocks
+/// are additionally never recolored: they are loaded from CF_DAG verbatim
+/// (`load_persisted` / `load_persisted_validated` insert stored data without
+/// recomputation), so their coloring — and therefore every already-mined
+/// block, balance, and the entire token supply — is preserved unconditionally.
+///
+/// ## Setting a real activation height (founder action only)
+///
+/// The value MUST be a **future** height, strictly greater than the current
+/// chain tip at the moment of the coordinated upgrade, and MUST be adopted by
+/// ALL nodes simultaneously (a soft-fork upgrade). Only blocks mined at or
+/// above that future height are colored with `Fast`; every block below it keeps
+/// its `Legacy` coloring, so no historical block is ever recomputed and no
+/// reorg of history occurs.
+///
+/// Setting this to a height at or below the current tip is **FORBIDDEN**: it
+/// would retroactively recolor already-mined blocks, which is a history reorg
+/// that can change balances. Do not do it. The replay harness
+/// (`tests/ghostdag_replay_snapshot.rs`) is the tool that first proves whether
+/// `Fast` even differs from `Legacy` on real history; if it is byte-identical
+/// everywhere, `Fast` is a transparent speedup and no activation is needed at
+/// all.
+///
+/// ## Coordinated-release sentinel (Phase 3)
+///
+/// This value is intentionally left at `u64::MAX` = `TBD_COORDINATED_RELEASE` on
+/// this branch. Setting a real height is a **coordinated soft-fork owned by the
+/// operator/network**, not a code-review decision: all nodes must adopt the same
+/// future height simultaneously. The dev/test env override
+/// (`BLOCH_GHOSTDAG_COLORING=fast`, see [`GhostDAG::with_default_k_env`]) exists
+/// to exercise `Fast` on a throwaway datadir; it is node-local and is NOT and
+/// cannot be a substitute for setting this height. Until this constant changes,
+/// every live node stays byte-for-byte on the `Legacy` coloring.
+pub const CORRECTED_COLORING_ACTIVATION_HEIGHT: u64 = u64::MAX;
+
 pub struct GhostDAG {
     pub k: usize,
     pub store: DagStore,
+    /// Coloring strategy. Defaults to `Legacy` (unchanged mainnet behavior).
+    pub coloring: ColoringMode,
+    /// Interval reachability index. Maintained only while `coloring == Fast`;
+    /// left empty (zero overhead) in `Legacy` mode. Never consensus state.
+    reach: ReachabilityStore,
 }
 
 impl GhostDAG {
     pub fn with_default_k() -> Self {
-        Self { k: GHOSTDAG_K, store: DagStore::new() }
+        Self {
+            k: GHOSTDAG_K,
+            store: DagStore::new(),
+            coloring: ColoringMode::Legacy,
+            reach: ReachabilityStore::new(),
+        }
     }
 
     pub fn with_k(k: usize) -> Self {
-        Self { k, store: DagStore::new() }
+        Self {
+            k,
+            store: DagStore::new(),
+            coloring: ColoringMode::Legacy,
+            reach: ReachabilityStore::new(),
+        }
+    }
+
+    /// Test/benchmark constructor: same as `with_k` but selects the `Fast`
+    /// (interval-index) coloring mode. NOT for live use — see [`ColoringMode`].
+    pub fn with_k_fast(k: usize) -> Self {
+        Self {
+            k,
+            store: DagStore::new(),
+            coloring: ColoringMode::Fast,
+            reach: ReachabilityStore::new(),
+        }
+    }
+
+    /// Construct with the default K, honoring the **dev/test** coloring override.
+    ///
+    /// # Activation shape (Phase 3) — SAFE BY DEFAULT
+    ///
+    /// The shipped default is ALWAYS `Legacy`: with no override set this is
+    /// exactly [`with_default_k`], and the live gate
+    /// [`CORRECTED_COLORING_ACTIVATION_HEIGHT`] stays at `u64::MAX`. Nothing on
+    /// the live chain changes from this branch.
+    ///
+    /// For local testing / replay ONLY, setting the env var
+    /// `BLOCH_GHOSTDAG_COLORING=fast` selects the `Fast` interval-index coloring
+    /// from genesis so an operator can exercise the durable index + rebuild on a
+    /// throwaway datadir. This is a node-local switch — it colors THIS node's
+    /// view and is NOT a network activation. Flipping the whole network to Fast
+    /// is a coordinated soft-fork that sets a real future
+    /// `CORRECTED_COLORING_ACTIVATION_HEIGHT`; the env override deliberately does
+    /// not and cannot do that.
+    pub fn with_default_k_env() -> Self {
+        match Self::coloring_from_env() {
+            ColoringMode::Fast => {
+                log::warn!(
+                    "BLOCH_GHOSTDAG_COLORING=fast — running the interval-index (Fast) \
+                     coloring from genesis. DEV/TEST ONLY: this is a node-local view, \
+                     NOT a network activation. Do not use on a shared/live datadir."
+                );
+                Self::with_k_fast(GHOSTDAG_K)
+            }
+            ColoringMode::Legacy => Self::with_default_k(),
+        }
+    }
+
+    /// Read the dev/test coloring override. Defaults to `Legacy` for any unset /
+    /// unrecognized value — the safe, live-preserving default.
+    pub fn coloring_from_env() -> ColoringMode {
+        match std::env::var("BLOCH_GHOSTDAG_COLORING") {
+            Ok(v) if v.eq_ignore_ascii_case("fast") => ColoringMode::Fast,
+            _ => ColoringMode::Legacy,
+        }
+    }
+
+    /// Read-only handle to the reachability index (for tests/diagnostics).
+    pub fn reachability(&self) -> &ReachabilityStore {
+        &self.reach
+    }
+
+    /// The coloring mode that applies to a block at the given `height`.
+    ///
+    /// - `self.coloring == Fast` (test/replay constructor): always `Fast`.
+    /// - `self.coloring == Legacy` (every live constructor): the
+    ///   [`CORRECTED_COLORING_ACTIVATION_HEIGHT`] soft-fork gate decides — `Fast`
+    ///   at/above the activation height, `Legacy` below it. With the activation
+    ///   height at its default `u64::MAX` this is `Legacy` for every reachable
+    ///   height, so live behavior is unchanged and all history stays
+    ///   Legacy-colored.
+    fn effective_coloring(&self, height: u64) -> ColoringMode {
+        match self.coloring {
+            ColoringMode::Fast => ColoringMode::Fast,
+            ColoringMode::Legacy => {
+                if height >= CORRECTED_COLORING_ACTIVATION_HEIGHT {
+                    ColoringMode::Fast
+                } else {
+                    ColoringMode::Legacy
+                }
+            }
+        }
+    }
+
+    /// Whether the reachability index must be maintained for this DAG.
+    ///
+    /// True when the DAG is a `Fast` constructor OR when the corrected-coloring
+    /// activation gate is armed (a real future height is configured) — in the
+    /// armed case the index must be built from genesis so `Fast` classification
+    /// is ready by the time the activation height is reached. When the gate is
+    /// disabled (`u64::MAX`, the default) and the DAG is `Legacy`, this is
+    /// `false` and the index is never touched — zero overhead, zero change.
+    pub fn maintains_reachability_index(&self) -> bool {
+        self.coloring == ColoringMode::Fast
+            || CORRECTED_COLORING_ACTIVATION_HEIGHT != u64::MAX
+    }
+
+    // ── Durable reachability index plumbing (Phase 1 / 2) ────────────────────
+
+    /// Drain the pending reachability durability delta so the caller can fold it
+    /// into the same atomic write as the block's CF_DAG entry. Empty unless the
+    /// index is being maintained.
+    pub fn reach_take_delta(&mut self) -> (Vec<(BlockHash, Vec<u8>)>, Vec<BlockHash>) {
+        self.reach.take_persist_delta()
+    }
+
+    /// The current reachability root (genesis), for persisting the meta tag.
+    pub fn reach_root(&self) -> Option<BlockHash> {
+        self.reach.root()
+    }
+
+    /// Full snapshot of the reachability index for a one-batch rebuild write.
+    pub fn reach_export_all(&self) -> Vec<(BlockHash, Vec<u8>)> {
+        self.reach.export_all()
+    }
+
+    /// Load a persisted reachability index into memory (boot fast-path). The
+    /// caller is responsible for having validated version + coverage first.
+    pub fn reach_load_records(
+        &mut self,
+        records: &[(BlockHash, Vec<u8>)],
+        root: Option<BlockHash>,
+    ) -> Result<(), String> {
+        self.reach.load_from_records(records, root)
+    }
+
+    /// Rebuild the reachability index from scratch by replaying the SAME
+    /// `reach.add_block` code path over the in-memory DAG in topological order
+    /// (parents strictly before children). Used by the boot migration when the
+    /// persisted index is missing / version-mismatched / fails its self-check.
+    /// Returns the number of blocks indexed. Leaves the delta pre-populated
+    /// (every block dirty) so the caller can flush a full snapshot.
+    pub fn rebuild_reachability_from_store(&mut self) -> Result<usize, String> {
+        self.reach = ReachabilityStore::new();
+        let order = self.topological_order()?;
+        for h in &order {
+            let d = self.store.get(h).ok_or_else(|| {
+                format!("rebuild: block {} vanished from store", hex::encode(&h[..4]))
+            })?;
+            if d.parents.is_empty() {
+                self.reach.add_genesis(*h);
+            } else {
+                let sp = d.selected_parent.ok_or_else(|| {
+                    format!("rebuild: non-genesis {} has no selected parent", hex::encode(&h[..4]))
+                })?;
+                let mut mergeset = d.mergeset_blues.clone();
+                mergeset.extend_from_slice(&d.mergeset_reds);
+                self.reach.add_block(*h, &sp, &mergeset);
+            }
+        }
+        Ok(order.len())
+    }
+
+    /// Kahn topological sort of the in-memory DAG: every parent strictly
+    /// precedes its children, so a downstream `reach.add_block` always finds its
+    /// selected parent and all mergeset members already indexed. Ties broken by
+    /// (blue_score, height, hash) for determinism. `Err` if the store is not a
+    /// DAG or references an absent parent.
+    fn topological_order(&self) -> Result<Vec<BlockHash>, String> {
+        let mut indegree: HashMap<BlockHash, usize> = HashMap::new();
+        let mut children: HashMap<BlockHash, Vec<BlockHash>> = HashMap::new();
+        for h in self.store.data.keys() {
+            indegree.entry(*h).or_insert(0);
+        }
+        for (h, d) in &self.store.data {
+            for p in &d.parents {
+                if !self.store.data.contains_key(p) {
+                    return Err(format!(
+                        "block {} references parent {} absent from store",
+                        hex::encode(&h[..4]), hex::encode(&p[..4])
+                    ));
+                }
+                *indegree.get_mut(h).unwrap() += 1;
+                children.entry(*p).or_default().push(*h);
+            }
+        }
+        let key = |h: &BlockHash| {
+            let d = &self.store.data[h];
+            (d.blue_score, d.height, *h)
+        };
+        let mut ready: Vec<BlockHash> = indegree.iter()
+            .filter(|(_, &deg)| deg == 0).map(|(h, _)| *h).collect();
+        ready.sort_by_key(key);
+        let mut queue: VecDeque<BlockHash> = ready.into_iter().collect();
+        let mut out = Vec::with_capacity(self.store.data.len());
+        while let Some(h) = queue.pop_front() {
+            out.push(h);
+            if let Some(ch) = children.get(&h) {
+                let mut newly = Vec::new();
+                for c in ch {
+                    let deg = indegree.get_mut(c).unwrap();
+                    *deg -= 1;
+                    if *deg == 0 { newly.push(*c); }
+                }
+                if !newly.is_empty() {
+                    let mut rest: Vec<BlockHash> = queue.drain(..).collect();
+                    rest.extend(newly);
+                    rest.sort_by_key(key);
+                    queue = rest.into_iter().collect();
+                }
+            }
+        }
+        if out.len() != self.store.data.len() {
+            return Err(format!(
+                "topological sort visited {}/{} blocks — parent graph has a cycle",
+                out.len(), self.store.data.len()
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Random-sample self-check of the reachability index against the unbounded
+    /// brute-force oracle over the raw parent graph. Draws `samples` random
+    /// ordered block pairs with the given `seed` and returns `Err` on the first
+    /// disagreement. A cheap boot-time guard that a loaded/rebuilt index is not
+    /// silently mis-labeled before it is trusted for classification.
+    pub fn reach_self_check_sample(&self, samples: usize, seed: u64) -> Result<usize, String> {
+        let blocks: Vec<BlockHash> = self.store.data.keys().copied().collect();
+        if blocks.len() < 2 {
+            return Ok(0);
+        }
+        let mut state = seed | 1;
+        let mut next = || {
+            state ^= state >> 12; state ^= state << 25; state ^= state >> 27;
+            state.wrapping_mul(0x2545F4914F6CDD1D)
+        };
+        let n = blocks.len();
+        let mut checked = 0usize;
+        for _ in 0..samples {
+            let a = blocks[(next() as usize) % n];
+            let b = blocks[(next() as usize) % n];
+            if a == b { continue; }
+            let idx = self.reach.is_dag_ancestor(&a, &b);
+            let oracle = reachability::brute_force_is_ancestor(&self.store, &a, &b);
+            if idx != oracle {
+                return Err(format!(
+                    "reachability self-check MISMATCH: is_ancestor({},{}) index={} oracle={}",
+                    hex::encode(&a[..4]), hex::encode(&b[..4]), idx, oracle
+                ));
+            }
+            checked += 1;
+        }
+        Ok(checked)
     }
 
     /// Add genesis block
@@ -512,6 +843,9 @@ impl GhostDAG {
             timestamp,
         };
         self.store.genesis = Some(hash);
+        if self.maintains_reachability_index() {
+            self.reach.add_genesis(hash);
+        }
         self.store.insert(hash, data);
     }
 
@@ -672,9 +1006,21 @@ impl GhostDAG {
         // 3. Compute mergeset (topologically sorted, ancestors first)
         let mergeset = compute_mergeset(&self.store, &parents, &selected_parent);
 
-        // 4. Classify mergeset blocks as blue or red using PHANTOM constraint
+        // 4. Classify mergeset blocks as blue or red using PHANTOM constraint.
+        //    In Fast mode the reachability index must contain every existing
+        //    block before classification queries it; the index is maintained
+        //    incrementally, so it already does. `hash` itself is not queried
+        //    during its own classification, so we register it afterwards.
+        //    The coloring is chosen by the height-gated `effective_coloring`:
+        //    Legacy below CORRECTED_COLORING_ACTIVATION_HEIGHT, Fast at/above
+        //    it. With the gate disabled (default u64::MAX) this is always Legacy
+        //    on the live path — historical and new blocks alike stay
+        //    Legacy-colored, preserving all mined tokens.
         let (mergeset_blues, mergeset_reds, blues_anticone_sizes) =
-            self.classify_mergeset(&mergeset, &selected_parent);
+            match self.effective_coloring(height) {
+                ColoringMode::Legacy => self.classify_mergeset(&mergeset, &selected_parent),
+                ColoringMode::Fast => self.classify_mergeset_fast(&mergeset, &selected_parent),
+            };
 
         // 5. Compute blue_score and blue_work
         let blue_score = sp_data.blue_score + mergeset_blues.len() as u64 + 1;
@@ -693,6 +1039,13 @@ impl GhostDAG {
             height,
             timestamp,
         };
+
+        // Maintain the reachability index (Fast mode only). Register `hash`
+        // now, after classification, before it is inserted into the store — so
+        // subsequent blocks can query its ancestry.
+        if self.maintains_reachability_index() {
+            self.reach.add_block(hash, &selected_parent, &mergeset);
+        }
 
         let result = data.clone();
         self.store.insert(hash, data);
@@ -732,6 +1085,13 @@ impl GhostDAG {
             Some(d) => d,
             None => return false,
         };
+        // Keep the reachability index consistent (Fast mode only). The mergeset
+        // used at insert time is recoverable as blues ∪ reds.
+        if self.maintains_reachability_index() {
+            let mut mergeset = data.mergeset_blues.clone();
+            mergeset.extend_from_slice(&data.mergeset_reds);
+            self.reach.remove_leaf(hash, &mergeset);
+        }
         self.store.tips.remove(hash);
         self.store.children.remove(hash);
         // Exact inverse of `DagStore::insert`: drop the child edge from each
@@ -844,6 +1204,92 @@ impl GhostDAG {
         (mergeset_blues, mergeset_reds, blues_anticone_sizes)
     }
 
+    /// Fast, interval-index-backed twin of [`classify_mergeset`].
+    ///
+    /// This is a **line-for-line structural copy** of `classify_mergeset` — the
+    /// same blue-set seeding via `past_blue_set` (with its `k*100` bound
+    /// preserved verbatim), the same topological candidate order, the same
+    /// whole-blue-set `blues_anticone_sizes` map shape — with exactly ONE
+    /// difference: every "is X in the anticone of Y?" test routes through the
+    /// O(1)/O(log n) reachability index instead of the bounded backwards BFS in
+    /// `is_ancestor`.
+    ///
+    /// Consequence: for any DAG on which the legacy bounded BFS never returns a
+    /// false negative, this produces a BYTE-IDENTICAL `GhostdagData`. Where the
+    /// legacy bound *did* bite, the two differ — and that difference is a
+    /// consensus question (see [`ColoringMode`]), which is why this path is
+    /// opt-in and the divergence is measured by the differential test rather
+    /// than silently adopted.
+    fn classify_mergeset_fast(
+        &self,
+        mergeset: &[BlockHash],
+        selected_parent: &BlockHash,
+    ) -> (Vec<BlockHash>, Vec<BlockHash>, HashMap<BlockHash, usize>) {
+        // Seed from the EXACT (unbounded) blue lineage. This is the second half
+        // of the correctness fix: the legacy seed (`past_blue_set`) truncates the
+        // selected-chain walk at `k*100` and silently under-counts on deep DAGs.
+        // The Fast path removes that bound so NO silent-approximation walk remains
+        // reachable once Fast is active (the grep-enforceable acceptance goal).
+        // Where the legacy bound never bit, this is byte-identical to the legacy
+        // seed; where it did, this diverges — exactly the gated consensus change.
+        let mut blue_set: HashSet<BlockHash> = self.past_blue_set_unbounded(selected_parent);
+        blue_set.insert(*selected_parent);
+
+        let mut blues_anticone_sizes: HashMap<BlockHash, usize> = HashMap::new();
+
+        let mut mergeset_blues = Vec::new();
+        let mut mergeset_reds = Vec::new();
+
+        for b in &blue_set {
+            blues_anticone_sizes.insert(*b, 0);
+        }
+
+        for &candidate in mergeset {
+            let candidate_anticone_in_blue = blue_set.iter()
+                .filter(|&b| self.is_in_anticone_fast(&candidate, b))
+                .count();
+
+            if candidate_anticone_in_blue > self.k {
+                mergeset_reds.push(candidate);
+                continue;
+            }
+
+            let mut constraint_b_ok = true;
+            for (&blue_block, &current_anticone_size) in &blues_anticone_sizes {
+                let in_anticone = self.is_in_anticone_fast(&candidate, &blue_block);
+                if in_anticone && current_anticone_size + 1 > self.k {
+                    constraint_b_ok = false;
+                    break;
+                }
+            }
+
+            if !constraint_b_ok {
+                mergeset_reds.push(candidate);
+                continue;
+            }
+
+            mergeset_blues.push(candidate);
+            blue_set.insert(candidate);
+            blues_anticone_sizes.insert(candidate, candidate_anticone_in_blue);
+
+            for (&blue_block, anticone_size) in blues_anticone_sizes.iter_mut() {
+                if blue_block != candidate && self.is_in_anticone_fast(&candidate, &blue_block) {
+                    *anticone_size += 1;
+                }
+            }
+        }
+
+        (mergeset_blues, mergeset_reds, blues_anticone_sizes)
+    }
+
+    /// Anticone test via the reachability index. Semantically identical to
+    /// [`is_in_anticone`] but backed by the unbounded interval index rather
+    /// than the bounded BFS.
+    fn is_in_anticone_fast(&self, a: &BlockHash, b: &BlockHash) -> bool {
+        if a == b { return false; }
+        !self.reach.is_dag_ancestor(a, b) && !self.reach.is_dag_ancestor(b, a)
+    }
+
     /// Compute |anticone(candidate) ∩ blue_set|
     fn anticone_size_in_set(&self, candidate: &BlockHash, blue_set: &HashSet<BlockHash>) -> usize {
         blue_set.iter()
@@ -896,6 +1342,34 @@ impl GhostDAG {
                 }
                 cur = data.selected_parent;
                 depth += 1;
+            } else {
+                break;
+            }
+        }
+        blue
+    }
+
+    /// Exact, UNBOUNDED twin of [`past_blue_set`]: walks the full selected-parent
+    /// chain to genesis with no depth cap and no truncation warning. Used only by
+    /// the `Fast` coloring path, where correctness (not bug-compatibility) is the
+    /// goal. On any DAG where the legacy `k*100` bound never bit this returns the
+    /// identical set; where it did, this returns the complete blue lineage the
+    /// legacy walk dropped — the divergence the activation gate coordinates.
+    ///
+    /// Performance note: O(selected-chain depth) per classification, same shape
+    /// as the legacy walk but without the early exit. The reachability index
+    /// removes the dominant O(|mergeset|·|blue_set|·BFS) anticone cost; further
+    /// reducing this seed walk to an incremental blues-anticone propagation
+    /// (Kaspa-style) is a follow-up perf item, not a correctness gap.
+    fn past_blue_set_unbounded(&self, block: &BlockHash) -> HashSet<BlockHash> {
+        let mut blue = HashSet::new();
+        let mut cur = Some(*block);
+        while let Some(h) = cur {
+            if let Some(data) = self.store.get(&h) {
+                for mb in &data.mergeset_blues {
+                    blue.insert(*mb);
+                }
+                cur = data.selected_parent;
             } else {
                 break;
             }

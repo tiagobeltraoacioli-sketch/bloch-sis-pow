@@ -1,0 +1,5 @@
+# hand-written synthetic fixture for grader self-test only — not a real boot capture
+[    0.000000] Booting Linux on physical CPU 0x0 [0x410fd034]
+[    0.000000] Linux version 6.6.21 (nixbld@localhost) (aarch64-unknown-linux-gnu-gcc)
+[    2.100000] VFS: Cannot open root device or unknown-block(0,0)
+[    2.200000] Kernel: Unable to mount root fs on unknown-block(0,0)
