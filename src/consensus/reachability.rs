@@ -222,59 +222,78 @@ impl ReachabilityStore {
     /// Recompute the interval labeling for `node`'s entire subtree, in place,
     /// within `node`'s current interval. If `node`'s interval is too small to
     /// hold its subtree, first reindex `node`'s parent to enlarge `node`.
+    /// Walk UP to the nearest ancestor with room, then re-lay out from there.
+    ///
+    /// Iterative on purpose. The recursive version overflowed the stack on a
+    /// real 408,482-block DAG during the one-time index rebuild — the node
+    /// aborted at startup, which is exactly what every operator is instructed to
+    /// do when the reachability soft-fork activates. A chain this deep is nearly
+    /// linear, so "one level up" is not a shallow hop: it is a walk of the whole
+    /// chain.
     fn reindex(&mut self, node: BlockHash) {
-        let size = self.subtree_size(&node);
-        let cap = self.interval.get(&node).map(|iv| iv.capacity()).unwrap_or(0);
-        if cap < size {
-            // Not enough room here — push the reindex up one level. The root
-            // has ROOT_END capacity, so this always terminates.
-            if let Some(parent) = self.tree_parent.get(&node).copied() {
-                self.reindex(parent);
-                return;
+        let mut cur = node;
+        loop {
+            let size = self.subtree_size(&cur);
+            let cap = self.interval.get(&cur).map(|iv| iv.capacity()).unwrap_or(0);
+            if cap >= size { break; }
+            match self.tree_parent.get(&cur).copied() {
+                Some(parent) => cur = parent,
+                None => {
+                    // At the root with insufficient capacity: only for
+                    // astronomically large DAGs (> 2^62 blocks). Grow the root.
+                    let iv = Interval { start: ROOT_START, end: ROOT_END.max(size + ROOT_START) };
+                    self.interval.insert(cur, iv);
+                    break;
+                }
             }
-            // At the root with insufficient capacity: this only happens for
-            // astronomically large DAGs (> 2^62 blocks). Grow the root.
-            let iv = Interval { start: ROOT_START, end: ROOT_END.max(size + ROOT_START) };
-            self.interval.insert(node, iv);
         }
-        let iv = *self.interval.get(&node).expect("node has interval");
-        self.assign_subtree(node, iv);
+        let iv = *self.interval.get(&cur).expect("node has interval");
+        self.assign_subtree(cur, iv);
     }
 
     /// Lay out `node` and all its tree-descendants within `iv` using a
     /// count-based proportional split, distributing slack in proportion to
     /// subtree sizes. `node`'s own identity point is `iv.end`.
     fn assign_subtree(&mut self, node: BlockHash, iv: Interval) {
-        self.interval.insert(node, iv);
-        // This node's interval (and, below, its `remaining`) just changed, so
-        // its persisted record is stale — flag it for the next durable flush.
-        self.mark_dirty(node);
-        let children = self.children.get(&node).cloned().unwrap_or_default();
-        if children.is_empty() {
-            self.remaining.insert(node, (iv.start, iv.end.saturating_sub(1)));
-            return;
-        }
-        // Children occupy [iv.start, iv.end-1]; iv.end reserved for `node`.
-        let region_start = iv.start;
-        let region_len = iv.end - iv.start; // slots available to children
-        let sizes: Vec<u64> = children.iter().map(|c| self.subtree_size(c)).collect();
-        let total: u64 = sizes.iter().sum::<u64>().max(1);
-        let slack = region_len.saturating_sub(total);
+        // EXPLICIT STACK, not recursion. The recursive form descended once per
+        // block in the subtree, and this chain is nearly linear — rebuilding the
+        // index over 408,482 blocks overflowed the 8 MB main stack and aborted
+        // the process before it finished booting. Since the reachability
+        // soft-fork tells every operator to perform exactly this rebuild on
+        // their first armed boot, that crash would have taken the network down
+        // at activation rather than fixing it.
+        let mut work: Vec<(BlockHash, Interval)> = vec![(node, iv)];
+        while let Some((node, iv)) = work.pop() {
+            self.interval.insert(node, iv);
+            // This node's interval (and, below, its `remaining`) just changed, so
+            // its persisted record is stale — flag it for the next durable flush.
+            self.mark_dirty(node);
+            let children = self.children.get(&node).cloned().unwrap_or_default();
+            if children.is_empty() {
+                self.remaining.insert(node, (iv.start, iv.end.saturating_sub(1)));
+                continue;
+            }
+            // Children occupy [iv.start, iv.end-1]; iv.end reserved for `node`.
+            let region_start = iv.start;
+            let region_len = iv.end - iv.start; // slots available to children
+            let sizes: Vec<u64> = children.iter().map(|c| self.subtree_size(c)).collect();
+            let total: u64 = sizes.iter().sum::<u64>().max(1);
+            let slack = region_len.saturating_sub(total);
 
-        let mut cursor = region_start;
-        for (c, &sz) in children.iter().zip(sizes.iter()) {
-            // proportional share of slack, plus the child's own subtree size
-            let extra = if total > 0 { slack.saturating_mul(sz) / total } else { 0 };
-            let child_len = (sz + extra).max(1);
-            let child_start = cursor;
-            let child_end = (cursor + child_len - 1).min(iv.end - 1);
-            let child_iv = Interval { start: child_start, end: child_end.max(child_start) };
-            cursor = child_end + 1;
-            self.assign_subtree(*c, child_iv);
+            let mut cursor = region_start;
+            for (c, &sz) in children.iter().zip(sizes.iter()) {
+                // proportional share of slack, plus the child's own subtree size
+                let extra = if total > 0 { slack.saturating_mul(sz) / total } else { 0 };
+                let child_len = (sz + extra).max(1);
+                let child_start = cursor;
+                let child_end = (cursor + child_len - 1).min(iv.end - 1);
+                let child_iv = Interval { start: child_start, end: child_end.max(child_start) };
+                cursor = child_end + 1;
+                work.push((*c, child_iv));
+            }
+            // Any trailing slots stay free on `node` for future children.
+            self.remaining.insert(node, (cursor, iv.end.saturating_sub(1)));
         }
-        // Any trailing slots stay free on `node` for future children.
-        let free_lo = cursor.min(iv.end);
-        self.remaining.insert(node, (free_lo, iv.end.saturating_sub(1)));
     }
 
     fn subtree_size(&self, node: &BlockHash) -> u64 {
