@@ -97,6 +97,20 @@ pub enum NetworkMessage {
     VersionAck,
 }
 
+
+impl NetworkMessage {
+    /// Variant name for diagnostics. Derived from Debug so a new variant can
+    /// never silently log as something else — the previous log named only the
+    /// topic and that ambiguity sent a fix to the wrong message.
+    pub fn kind_name(&self) -> &'static str {
+        // Debug prints "Variant { .. }" or "Variant"; take the leading ident.
+        let s: &'static str = Box::leak(format!("{:?}", self).into_boxed_str());
+        match s.find(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+            Some(i) => &s[..i],
+            None => s,
+        }
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SyncEntry {
     pub hash:       [u8; 32],
@@ -1071,8 +1085,23 @@ impl NetworkNode {
                     };
                     if let Ok(data) = bincode::serde::encode_to_vec(&msg, bincode::config::standard()) {
                         if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, data) {
-                            // FIX v0.5.1: Log topic so we can tell which stream is broken.
-                            warn!("publish {}: {}", topic_name, e);
+                            // Name the MESSAGE, not just the topic. The sync topic
+                            // carries GetHeaders, Tips, GetTips, PeerTip and
+                            // GetBlock, so "publish sync: Duplicate" identifies the
+                            // stream and hides the culprit — which cost a wrong fix:
+                            // GetBlock was given a nonce on the reasonable guess that
+                            // it was the suppressed message, the node stayed stalled,
+                            // and the log could not say why. A diagnostic that cannot
+                            // distinguish five causes is a diagnostic that invites
+                            // guessing.
+                            let kind = match &msg {
+                                NetworkMessage::NewBlock { .. }       => "NewBlock",
+                                NetworkMessage::NewTransaction { .. } => "NewTransaction",
+                                NetworkMessage::GetBlock { .. }       => "GetBlock",
+                                NetworkMessage::BlockNotFound { .. }  => "BlockNotFound",
+                                other => other.kind_name(),
+                            };
+                            warn!("publish {} [{}]: {}", topic_name, kind, e);
                         }
                     }
                 }
