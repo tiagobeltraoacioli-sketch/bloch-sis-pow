@@ -79,7 +79,14 @@ pub enum NetworkMessage {
     /// waited and re-asked forever. A fresh node cannot bootstrap from a pruned
     /// peer, and it deserves to LEARN that instead of stalling: on receiving this
     /// it can try another peer, or report honestly that no archival peer exists.
-    BlockNotFound { block_hash: [u8; 32] },
+    /// `nonce` for the same reason GetBlock carries one: without it every answer
+    /// serialises identically, is dedup-dropped locally, and the peer waiting on
+    /// it learns nothing. Measured on a stalled archival node: 7,983 of 8,060
+    /// suppressed publishes in two minutes were THIS message — added the same
+    /// night to fix a silent responder, and immediately becoming the loudest
+    /// source of the noise it was meant to remove. A message that answers a
+    /// repeated question must be as unique as the question.
+    BlockNotFound { block_hash: [u8; 32], nonce: u64 },
     // Frontier reconciliation (Phase 2 Kaspa sync-negotiation layer)
     /// Frontier reconciliation: request the peer's DAG frontier. No payload —
     /// broadcast on the sync topic; every peer replies with Tips.

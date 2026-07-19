@@ -936,7 +936,7 @@ async fn main() {
                 // early chain, no archival peer exists and a fresh node genuinely
                 // cannot bootstrap — a condition worth surfacing rather than hiding
                 // behind an apparently-healthy log full of header traffic.
-                network::NetworkMessage::BlockNotFound { block_hash } => {
+                network::NetworkMessage::BlockNotFound { block_hash, .. } => {
                     warn!("peer cannot serve block {} (pruned or unknown) — an \
                            archival peer is needed to bootstrap from this height",
                           hex::encode(&block_hash[..8]));
@@ -969,7 +969,7 @@ async fn main() {
                                    — replying NotFound so the peer can try another source",
                                   hex::encode(&block_hash[..8]));
                             let _ = otx2.send(network::NetworkMessage::BlockNotFound {
-                                block_hash,
+                                block_hash, nonce: getblock_nonce(),
                             }).await;
                         }
                     }
