@@ -7,7 +7,11 @@
 //! vector via `verify_regime`, with the residual width selected by the
 //! block's height (soft fork SF-1): `TESTNET_RESIDUAL_COEFFS` (= 4) below
 //! `CANONICAL_K_ACTIVATION_HEIGHT`, `CANONICAL_RESIDUAL_COEFFS` (= 8) at or
-//! above it. SHA-256d is gone.
+//! above it. SHA-256d is gone from the Mainnet/Testnet consensus — it returns
+//! ONLY as the Genesis-2 devnet's chain-selected algorithm (see [`sha256d`]
+//! and the pinned dispatcher [`mine_pow_parallel`], which route on
+//! `bloch_crypto::core::pow_algorithm`, the same single mapping
+//! `Block::validate_pow` dispatches on).
 //!
 //! ## Honest status
 //! The reference crate is research-grade. Its full-`M` regime is **unmineable**
@@ -25,6 +29,14 @@
 //! See `BLOCH_DEVELOPMENT_PLAN.md` §3 and `crates/bloch-sis-pow`.
 
 pub use bloch_sis_pow::{bits_to_target, target_to_bits, Target, VerifyError};
+
+// Genesis-2: SHA-256d miner over the 80-byte MiningHeader projection
+// (chain-selectable PoW; the Module-SIS path below is unchanged and remains
+// the Mainnet/Testnet consensus PoW).
+pub mod sha256d;
+pub use sha256d::{mine_sha256d, mine_sha256d_preimage};
+
+use bloch_crypto::core::{node_chain_id, pow_algorithm, PowAlgorithm};
 
 /// PoW solution-vector dimension (the witness a mined block carries).
 /// Must equal the crate's Module-SIS dimension `N`.
@@ -243,6 +255,44 @@ pub fn mine_sis_pow_parallel(
     mine_parallel(pow_preimage, &target, &cfg, num_threads)
         .ok()
         .map(|r| (r.nonce, r.solution))
+}
+
+/// Chain-dispatching parallel miner — the ONE entry point template builders
+/// should call. Routes on `pow_algorithm(node_chain_id())`, the same single
+/// mapping `Block::validate_pow` dispatches on, so what this returns is by
+/// construction what the local validator accepts:
+///
+/// * `ModuleSis` (Mainnet/Testnet): [`mine_sis_pow_parallel`] — returns
+///   `(nonce, witness)` with `witness.len() == 256` (`SOLUTION_LEN`), to be
+///   stored in `Block.pow_solution`.
+/// * `Sha256d` (Genesis2Devnet): [`mine_sha256d_preimage`] — returns
+///   `(nonce, Vec::new())`: `Block.pow_solution` MUST stay empty on a
+///   SHA-256d chain (validate_pow rejects any witness there). The nonce's
+///   upper 32 bits are zero; `None` at 32-bit nonce exhaustion means the
+///   caller must rebuild the template with a fresh timestamp (see
+///   `sha256d` module docs).
+///
+/// `preimage` is `BlockHeader::pow_preimage()` (the 76-byte nonce-less
+/// mining-header prefix) for BOTH arms; `max_attempts` is the per-worker
+/// budget for both arms.
+pub fn mine_pow_parallel(
+    preimage: &[u8],
+    bits: u32,
+    height: u64,
+    start_nonce: u64,
+    max_attempts: u64,
+    threads: usize,
+) -> Option<(u64, Vec<i32>)> {
+    match pow_algorithm(node_chain_id()) {
+        PowAlgorithm::ModuleSis => {
+            mine_sis_pow_parallel(preimage, bits, height, start_nonce, max_attempts, threads)
+                .map(|(nonce, solution)| (nonce, solution.to_vec()))
+        }
+        PowAlgorithm::Sha256d => {
+            mine_sha256d_preimage(preimage, bits, start_nonce, max_attempts, threads)
+                .map(|nonce| (nonce, Vec::new()))
+        }
+    }
 }
 
 /// Verify a Module-SIS PoW witness at the full-`M` residual width.
