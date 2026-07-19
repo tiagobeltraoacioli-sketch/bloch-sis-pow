@@ -1140,9 +1140,25 @@ pub fn verify_carryover_snapshot(path: &Path) -> Result<CarryoverSnapshot, Vec<S
     let mut entries: Vec<(Vec<u8>, u32, TxOutput)> = Vec::with_capacity(segments.len());
     let mut total_sat: u128 = 0;
     let mut malformed: u64 = 0;
+    // Outpoints must be DISTINCT. The count check is line-based and the supply
+    // check is value-based, so a file that duplicates one line over another of
+    // equal value passes both — and ingest would then collapse the two into one
+    // key, writing FEWER UTXOs than it reports. The log line "N UTXOs written
+    // atomically" would be false, and the ledger short by one output, with two
+    // of the three checks having approved it.
+    let mut seen: std::collections::HashSet<(Vec<u8>, u32)> = std::collections::HashSet::with_capacity(segments.len());
+    let mut duplicates: u64 = 0;
     for (i, seg) in segments.iter().enumerate() {
         match parse_carryover_line(seg) {
             Some((txid, vout, output)) => {
+                if !seen.insert((txid.clone(), vout)) {
+                    duplicates += 1;
+                    if duplicates <= 5 {
+                        failures.push(format!("line {} duplicates outpoint {}:{} — \
+                            outpoints must be unique", i + 1, hex::encode(&txid), vout));
+                    }
+                    continue;
+                }
                 total_sat += output.value as u128;
                 entries.push((txid, vout, output));
             }
@@ -1157,6 +1173,9 @@ pub fn verify_carryover_snapshot(path: &Path) -> Result<CarryoverSnapshot, Vec<S
     }
     if malformed > 5 {
         failures.push(format!("... and {} more malformed line(s)", malformed - 5));
+    }
+    if duplicates > 5 {
+        failures.push(format!("... and {} more duplicated outpoint(s)", duplicates - 5));
     }
     let count = (entries.len() as u64) + malformed; // every line counts toward shape
     if count != CARRYOVER_UTXO_COUNT {
@@ -1188,6 +1207,12 @@ fn parse_carryover_line(line: &[u8]) -> Option<(Vec<u8>, u32, TxOutput)> {
     let value: u64 = it.next()?.parse().ok()?;
     let script_pubkey = hex::decode(it.next()?).ok()?;
     if it.next().is_some() || txid.len() != 32 { return None; }
+    // A zero-value output is not a spendable UTXO and never appears in a
+    // snapshot this node produced. Accepting one lets a tampered file add rows
+    // that pass BOTH the count and the supply checks — they change the line
+    // count while adding nothing to the total — leaving the byte-root as the
+    // only thing standing between a forged ledger and ingestion. Refuse.
+    if value == 0 { return None; }
     Some((txid, vout, TxOutput { value, script_pubkey }))
 }
 
