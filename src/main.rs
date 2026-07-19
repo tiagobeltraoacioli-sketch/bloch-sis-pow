@@ -809,9 +809,7 @@ async fn main() {
                         // Retained legacy over-trigger fallback (entering IBD is
                         // always safe); the announced score never RELEASES it.
                         state2.write().is_syncing = true;
-                        let _ = otx2.send(network::NetworkMessage::GetHeaders {
-                            from_blue_score: our_s, limit: 500
-                        }).await;
+                        let _ = otx2.send(network::NetworkMessage::GetHeaders { from_blue_score: our_s, limit: 500, nonce: getblock_nonce() }).await;
                     } else if peer_s < our_s {
                         // Mesh fix (reciprocal tip): the announcing peer is
                         // BEHIND us, and its other ways of learning our tip are
@@ -884,7 +882,7 @@ async fn main() {
                 }
 
                 // IBD step 2: someone asks for our headers
-                network::NetworkMessage::GetHeaders { from_blue_score, limit } => {
+                network::NetworkMessage::GetHeaders { from_blue_score, limit, .. } => {
                     let entries: Vec<network::SyncEntry> = {
                         let d = dag2.read();
                         d.ordered_hashes_from(from_blue_score, limit as usize)
@@ -923,9 +921,7 @@ async fn main() {
                         // the batch comes back < 500 (or empty) and the stream
                         // stops, so steady-state cost is zero.
                         let next_from = entries.iter().map(|e| e.blue_score).max().unwrap_or(0);
-                        let _ = otx2.send(network::NetworkMessage::GetHeaders {
-                            from_blue_score: next_from, limit: 500,
-                        }).await;
+                        let _ = otx2.send(network::NetworkMessage::GetHeaders { from_blue_score: next_from, limit: 500, nonce: getblock_nonce() }).await;
                     }
                 }
 
@@ -1151,9 +1147,7 @@ async fn main() {
                         info!("Version peer ahead (score {} > {}), requesting headers", peer_s, our_s);
                         // Retained legacy over-trigger fallback (safe).
                         state2.write().is_syncing = true;
-                        let _ = otx2.send(network::NetworkMessage::GetHeaders {
-                            from_blue_score: our_s, limit: 500
-                        }).await;
+                        let _ = otx2.send(network::NetworkMessage::GetHeaders { from_blue_score: our_s, limit: 500, nonce: getblock_nonce() }).await;
                     }
                     maybe_release_ibd(&dag2, &peer_state2, &frontier2, &state2);
                 }
@@ -1221,9 +1215,7 @@ async fn main() {
                     if syncing || !seen_tip || best_seen > our_s {
                         debug!("IBD nudge: GetHeaders from score {} (best_seen={} syncing={} seen_tip={})",
                             our_s, best_seen, syncing, seen_tip);
-                        let _ = otx_n.send(network::NetworkMessage::GetHeaders {
-                            from_blue_score: our_s, limit: 500,
-                        }).await;
+                        let _ = otx_n.send(network::NetworkMessage::GetHeaders { from_blue_score: our_s, limit: 500, nonce: getblock_nonce() }).await;
                     }
                     // Phase-2 frontier reconciliation: every peer replies Tips.
                     let _ = otx_n.send(network::NetworkMessage::GetTips).await;

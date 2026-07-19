@@ -58,7 +58,17 @@ pub enum NetworkMessage {
     PeerExchange { peers: Vec<String> },
     PeerRequest,
     PeerCount { count: usize, addresses: Vec<String> },
-    GetHeaders { from_blue_score: u64, limit: u32 },
+    /// `nonce` for the same reason GetBlock and BlockNotFound carry one. A node
+    /// re-asking for the SAME window — which is exactly what a stalled node does,
+    /// every cycle — serialises identically and has the retry dropped locally
+    /// before it reaches the network. Measured at 90 suppressions in two minutes
+    /// on a node that was making no progress.
+    ///
+    /// The general rule this file has now learned three times: on the sync topic,
+    /// deduplication is wrong. It exists to stop gossip storms of the same BLOCK;
+    /// a request is not gossip, and two identical requests are two intentions,
+    /// not one message seen twice.
+    GetHeaders { from_blue_score: u64, limit: u32, nonce: u64 },
     Headers    { entries: Vec<SyncEntry> },
     /// Request a block body. `nonce` exists ONLY to make each request unique on
     /// the wire, and the responder ignores it.
