@@ -28,6 +28,13 @@ path = "src/main.rs"
 [[bin]]
 name = "bloch-wallet"
 path = "src/bin/bloch-wallet.rs"
+# Needs bloch-crypto's optional `wallet-cli` feature (clap + rpassword), which is
+# off by default so the crate still cross-compiles to wasm32 for the browser
+# wallet. Without this line a bare `cargo build` fails on THIS bin alone —
+# "could not find `cli` in `wallet`" — and takes the whole workspace build with
+# it, including `cargo test`. required-features makes cargo skip it instead.
+#   Build it with:  cargo build --bin bloch-wallet --features bloch-crypto/wallet-cli
+required-features = ["bloch-crypto/wallet-cli"]
 
 [[bin]]
 name = "bloch-cli"

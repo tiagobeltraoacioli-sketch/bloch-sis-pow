@@ -58,9 +58,51 @@ pub enum NetworkMessage {
     PeerExchange { peers: Vec<String> },
     PeerRequest,
     PeerCount { count: usize, addresses: Vec<String> },
-    GetHeaders { from_blue_score: u64, limit: u32 },
+    /// `nonce` for the same reason GetBlock and BlockNotFound carry one. A node
+    /// re-asking for the SAME window — which is exactly what a stalled node does,
+    /// every cycle — serialises identically and has the retry dropped locally
+    /// before it reaches the network. Measured at 90 suppressions in two minutes
+    /// on a node that was making no progress.
+    ///
+    /// The general rule this file has now learned three times: on the sync topic,
+    /// deduplication is wrong. It exists to stop gossip storms of the same BLOCK;
+    /// a request is not gossip, and two identical requests are two intentions,
+    /// not one message seen twice.
+    GetHeaders { from_blue_score: u64, limit: u32, nonce: u64 },
     Headers    { entries: Vec<SyncEntry> },
-    GetBlock   { block_hash: [u8; 32] },
+    /// Request a block body. `nonce` exists ONLY to make each request unique on
+    /// the wire, and the responder ignores it.
+    ///
+    /// Without it every re-request serialises to identical bytes, hashes to the
+    /// same gossipsub MessageId, and `publish()` returns `Err(Duplicate)`
+    /// LOCALLY — the retry never leaves this node. That is the same failure this
+    /// file already documents for PeerTip a few lines below `duplicate_cache_time`,
+    /// where the fix was noted as "the tip-carrying Version (fresh timestamp →
+    /// unique bytes) can never be dedup-dropped at all". GetBlock had no such
+    /// field, so IBD retries were silently swallowed: observed on a stalled node
+    /// as 12,235 `publish sync: Duplicate` in ten minutes while it sat at one
+    /// height with peers that HELD the blocks it was asking for.
+    GetBlock   { block_hash: [u8; 32], nonce: u64 },
+    /// Explicit "I cannot serve this body" answer to GetBlock. Added 2026-07-19:
+    /// the responder used to drop unanswerable requests silently, which left the
+    /// requester unable to distinguish a pruned body from a lost packet — it just
+    /// waited and re-asked forever. A fresh node cannot bootstrap from a pruned
+    /// peer, and it deserves to LEARN that instead of stalling: on receiving this
+    /// it can try another peer, or report honestly that no archival peer exists.
+    /// `nonce` for the same reason GetBlock carries one: without it every answer
+    /// serialises identically, is dedup-dropped locally, and the peer waiting on
+    /// it learns nothing. Measured on a stalled archival node: 7,983 of 8,060
+    /// suppressed publishes in two minutes were THIS message — added the same
+    /// night to fix a silent responder, and immediately becoming the loudest
+    /// source of the noise it was meant to remove. A message that answers a
+    /// repeated question must be as unique as the question.
+    BlockNotFound { block_hash: [u8; 32], nonce: u64 },
+    // Frontier reconciliation (Phase 2 Kaspa sync-negotiation layer)
+    /// Frontier reconciliation: request the peer's DAG frontier. No payload —
+    /// broadcast on the sync topic; every peer replies with Tips.
+    GetTips,
+    /// Frontier reconciliation reply: full DAG frontier + selected-chain locator.
+    Tips { tips: Vec<SyncEntry>, locator: Vec<[u8; 32]> },
     // Protocol handshake
     Version {
         version:    u32,
@@ -72,6 +114,20 @@ pub enum NetworkMessage {
     VersionAck,
 }
 
+
+impl NetworkMessage {
+    /// Variant name for diagnostics. Derived from Debug so a new variant can
+    /// never silently log as something else — the previous log named only the
+    /// topic and that ambiguity sent a fix to the wrong message.
+    pub fn kind_name(&self) -> &'static str {
+        // Debug prints "Variant { .. }" or "Variant"; take the leading ident.
+        let s: &'static str = Box::leak(format!("{:?}", self).into_boxed_str());
+        match s.find(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+            Some(i) => &s[..i],
+            None => s,
+        }
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SyncEntry {
     pub hash:       [u8; 32],
@@ -114,6 +170,10 @@ pub const MAX_WIRE_ADDR_LEN: usize = 512;
 /// Max SyncEntry items in a Headers frame. IBD requests batches of 500
 /// (see main.rs GetHeaders); 2000 leaves headroom.
 pub const MAX_WIRE_SYNC_ENTRIES: usize = 2000;
+/// Max tip entries in a Tips frame. MUST equal sync::MAX_ADVERTISED_TIPS.
+pub const MAX_WIRE_TIPS: usize = 256;
+/// Max locator hashes in a Tips frame. MUST equal locator::MAX_LOCATOR_LEN.
+pub const MAX_WIRE_LOCATOR: usize = 64;
 /// Max `limit` a peer may request via GetHeaders (bounds the work WE do
 /// serving the response).
 pub const MAX_WIRE_GETHEADERS_LIMIT: u32 = 2000;
@@ -221,6 +281,14 @@ fn validate_wire_bounds(msg: &NetworkMessage) -> Result<(), WireDecodeError> {
                 return Err(Bounds("Headers entries longer than MAX_WIRE_SYNC_ENTRIES"));
             }
         }
+        NetworkMessage::Tips { tips, locator } => {
+            if tips.len() > MAX_WIRE_TIPS {
+                return Err(Bounds("Tips tips longer than MAX_WIRE_TIPS"));
+            }
+            if locator.len() > MAX_WIRE_LOCATOR {
+                return Err(Bounds("Tips locator longer than MAX_WIRE_LOCATOR"));
+            }
+        }
         NetworkMessage::Version { user_agent, .. } => {
             if user_agent.len() > MAX_WIRE_USER_AGENT_LEN {
                 return Err(Bounds("user_agent longer than MAX_WIRE_USER_AGENT_LEN"));
@@ -228,7 +296,9 @@ fn validate_wire_bounds(msg: &NetworkMessage) -> Result<(), WireDecodeError> {
         }
         NetworkMessage::PeerRequest
         | NetworkMessage::VersionAck
-        | NetworkMessage::GetBlock { .. } => {}
+        | NetworkMessage::GetTips
+        | NetworkMessage::GetBlock { .. }
+        | NetworkMessage::BlockNotFound { .. } => {}
     }
     Ok(())
 }
@@ -350,7 +420,9 @@ impl NetworkNode {
         block_tx:       mpsc::Sender<NetworkMessage>,
         mut outbound_rx: mpsc::Receiver<NetworkMessage>,
         dag:            std::sync::Arc<parking_lot::RwLock<crate::consensus::GhostDAG>>,
+        peer_state:     std::sync::Arc<crate::sync::peer_state::PeerStateTable>,
     ) -> Result<(), NetworkError> {
+        use std::time::Instant;
         // Audit M-10 fix: previously used std::hash::DefaultHasher, whose
         // output is not stable across Rust versions (see the SipHasher13
         // -> FxHash transition history). Two nodes on different Rust
@@ -691,16 +763,31 @@ impl NetworkNode {
                                             info!("← block h={} {}", height, hex::encode(&block_hash[..8]));
                                         });
                                     }
-                                    NetworkMessage::PeerTip { peer_id, blue_score, .. } =>
-                                        debug!("← tip from {} score={}", peer_id, blue_score),
+                                    NetworkMessage::PeerTip { peer_id, blue_score, height } => {
+                                        debug!("← tip from {} score={}", peer_id, blue_score);
+                                        // Phase-2: record the untrusted announced hint (no tips).
+                                        peer_state.observe(propagation_source, *blue_score, *height, &[], Instant::now());
+                                    }
                                     NetworkMessage::Headers { entries } =>
                                         info!("← {} headers", entries.len()),
-                                    NetworkMessage::Version { version, user_agent, .. } => {
+                                    NetworkMessage::Tips { tips, .. } => {
+                                        // Phase-2 frontier reconciliation hint: record the peer's
+                                        // advertised DAG frontier + its highest announced score.
+                                        let hashes: Vec<[u8; 32]> = tips.iter().map(|e| e.hash).collect();
+                                        let (bs, ht) = tips.iter()
+                                            .map(|e| (e.blue_score, e.height))
+                                            .max_by_key(|(s, _)| *s)
+                                            .unwrap_or((0, 0));
+                                        peer_state.observe(propagation_source, bs, ht, &hashes, Instant::now());
+                                    }
+                                    NetworkMessage::Version { version, user_agent, blue_score, height, .. } => {
                                         if *version < MIN_PROTOCOL_VERSION {
                                             warn!("← incompatible version {} from {}", version, user_agent);
                                         } else {
                                             debug!("← version {} ({})", version, user_agent);
                                         }
+                                        // Phase-2: record the untrusted announced hint (no tips).
+                                        peer_state.observe(propagation_source, *blue_score, *height, &[], Instant::now());
                                     }
                                     NetworkMessage::PeerRequest => {
                                         let mut my_peers: Vec<String> = known_peers.iter().cloned().collect();
@@ -801,6 +888,7 @@ impl NetworkNode {
                             swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                             peer_count += 1;
                             crate::metrics::set_peer_count(peer_count as i64);
+                            peer_state.on_connect(peer_id, Instant::now());
                             // FIX v0.5.1: Re-announce subscriptions to new peer.
                             // gossipsub only announces subs on initial connect,
                             // but peer_score can ghost peers from mesh. Force
@@ -930,6 +1018,7 @@ impl NetworkNode {
                             info!("✗ disconnected: {}", peer_id);
                             peer_count = peer_count.saturating_sub(1);
                             crate::metrics::set_peer_count(peer_count as i64);
+                            peer_state.on_disconnect(&peer_id);
                         }
                         SwarmEvent::NewListenAddr { address, .. } =>
                             info!("listening: {}/p2p/{}", address, self.peer_id),
@@ -1013,8 +1102,23 @@ impl NetworkNode {
                     };
                     if let Ok(data) = bincode::serde::encode_to_vec(&msg, bincode::config::standard()) {
                         if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, data) {
-                            // FIX v0.5.1: Log topic so we can tell which stream is broken.
-                            warn!("publish {}: {}", topic_name, e);
+                            // Name the MESSAGE, not just the topic. The sync topic
+                            // carries GetHeaders, Tips, GetTips, PeerTip and
+                            // GetBlock, so "publish sync: Duplicate" identifies the
+                            // stream and hides the culprit — which cost a wrong fix:
+                            // GetBlock was given a nonce on the reasonable guess that
+                            // it was the suppressed message, the node stayed stalled,
+                            // and the log could not say why. A diagnostic that cannot
+                            // distinguish five causes is a diagnostic that invites
+                            // guessing.
+                            let kind = match &msg {
+                                NetworkMessage::NewBlock { .. }       => "NewBlock",
+                                NetworkMessage::NewTransaction { .. } => "NewTransaction",
+                                NetworkMessage::GetBlock { .. }       => "GetBlock",
+                                NetworkMessage::BlockNotFound { .. }  => "BlockNotFound",
+                                other => other.kind_name(),
+                            };
+                            warn!("publish {} [{}]: {}", topic_name, kind, e);
                         }
                     }
                 }

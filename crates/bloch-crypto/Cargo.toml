@@ -25,12 +25,14 @@ required-features = ["wallet-cli"]
 # Bloch-SIS node over RPC. Off by default so the pure wallet/crypto subset
 # cross-compiles for mobile. Mirrors the node's `node` feature gate.
 node = ["dep:reqwest", "dep:async-trait"]
-# `wallet-cli` gates the `postern-wallet` [[bin]] above. Empty marker feature:
-# everything the CLI needs (clap, rpassword, hex, serde_json + this crate's
-# lib; RPC over plain std::net::TcpStream) is already an unconditional dep of
-# this crate — no blst / secp256k1 / tokio / rocksdb / libp2p anywhere in its
-# tree. Off by default; combine with `node` only if WalletClient is wanted.
-wallet-cli = []
+# `wallet-cli` gates the `postern-wallet` [[bin]] above AND the `wallet::cli`
+# module. It pulls the terminal-only deps (clap, rpassword) that do NOT
+# cross-compile to wasm32-unknown-unknown; keeping them behind this feature lets
+# the pure wallet/crypto subset (used by the WASM mobile wallet) build for wasm.
+# hex/serde_json + this crate's lib are unconditional; no blst / secp256k1 /
+# tokio / rocksdb / libp2p anywhere in its tree. Off by default; combine with
+# `node` only if WalletClient is wanted.
+wallet-cli = ["dep:clap", "dep:rpassword"]
 # `mainnet` is an EMPTY marker feature (like `wallet-cli`) with NO deps. It exists
 # only so the release CI guard `mainnet_release_guard::canonical_k_activation_height_is_set_for_mainnet`
 # (core/mod.rs) compiles and runs. Ordinary `--features node` builds do NOT enable
@@ -73,9 +75,10 @@ thiserror = "2"
 chrono    = { version = "0.4", features = ["serde"] }
 log       = "0.4"
 
-# CLI wallet (wallet::cli).
-clap      = { version = "4", features = ["derive"] }
-rpassword = "7"
+# CLI wallet (wallet::cli) — terminal-only, optional so the wasm build skips them.
+# Enabled by the `wallet-cli` feature.
+clap      = { version = "4", features = ["derive"], optional = true }
+rpassword = { version = "7", optional = true }
 
 # Protocol crates shared with the node (path deps, inherited from the workspace).
 bloch-sis-pow  = { path = "../bloch-sis-pow" }
