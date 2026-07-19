@@ -1022,6 +1022,42 @@ impl Storage {
     /// The same batch stamps `meta["carryover_root"]`, so a later boot can
     /// prove ingestion happened (and against WHICH root) without re-reading
     /// the file. UTXOs and marker land together or not at all.
+    /// Re-derive the carry-over root FROM THE DATABASE and compare it to the
+    /// constant this binary was built with.
+    ///
+    /// The `carryover_root` meta stamp records what a FILE hashed to at ingest
+    /// time. It says nothing about what the database contains now, and cannot:
+    /// it is a copied string. A data-dir handed out as a "fast bootstrap"
+    /// tarball would therefore run an arbitrary ledger while logging the
+    /// reassuring "carry-over already ingested (matches d3de5e51…)".
+    ///
+    /// That is the exact trust this migration exists to remove — a chain nobody
+    /// has to take on faith — so re-opening it one layer down would defeat the
+    /// point. This function reads every live UTXO back out, rebuilds the
+    /// snapshot's canonical lines in the same sorted order, hashes them, and
+    /// returns what the set ACTUALLY hashes to.
+    ///
+    /// Cost is a full scan, so it is a deliberate `--verify-carryover` run
+    /// rather than something every boot pays for.
+    pub fn derive_carryover_root(&self) -> Result<([u8; 32], u64, u128), StorageError> {
+        use sha3::digest::{ExtendableOutput, Update, XofReader};
+        let rows = self.iter_utxos_sorted()?;
+        let mut hasher = sha3::Shake256::default();
+        let mut total: u128 = 0;
+        for (txid, vout, value, spk) in &rows {
+            // Byte-identical to what bloch-snapshot-utxo writes, or the roots
+            // could not be compared at all.
+            let line = format!("{}\t{}\t{}\t{}\n",
+                hex::encode(txid), vout, value, hex::encode(spk));
+            Update::update(&mut hasher, line.as_bytes());
+            total += *value as u128;
+        }
+        let mut reader = hasher.finalize_xof();
+        let mut root = [0u8; 32];
+        reader.read(&mut root);
+        Ok((root, rows.len() as u64, total))
+    }
+
     pub fn ingest_carryover(&self, snap: &CarryoverSnapshot) -> Result<u64, StorageError> {
         let cf_utxo = self.db.cf_handle(CF_UTXO)
             .ok_or(StorageError::CfNotFound(CF_UTXO.into()))?;

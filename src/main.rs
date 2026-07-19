@@ -65,6 +65,13 @@ struct Cli {
     /// pruned below ~394,913, so those bodies exist nowhere and cannot be
     /// recovered. Run at least one archival node, or new nodes cannot join.
     /// Costs disk: the full chain instead of the last 10,000 blocks.
+    /// Re-derive the carry-over root FROM THE DATABASE and exit. Verifies what
+    /// this data-dir actually CONTAINS, not what a file hashed to when it was
+    /// ingested — the meta stamp is a copied string and proves nothing about the
+    /// ledger now. Run this on any data-dir you did not build yourself, and
+    /// especially on one you downloaded: a "fast bootstrap" tarball is exactly
+    /// the case the stamp cannot catch. Exits 0 on match, 1 on mismatch.
+    #[arg(long)]                                         verify_carryover: bool,
     #[arg(long)]                                         archive: bool,
     /// Genesis-2 carry-over: path to the blessed UTXO snapshot TSV, ingested
     /// once at FIRST boot. Before anything is written the file is fully
@@ -302,6 +309,41 @@ async fn main() {
     let dag = Arc::new(RwLock::new(consensus::GhostDAG::with_default_k_env()));
 
     // ── Genesis + DAG reload ─────────────────────────────────────────────────
+    // --verify-carryover: audit the data-dir and exit. Runs before anything else
+    // starts so it can be pointed at a live node's directory without racing it.
+    if cli.verify_carryover {
+        match store.derive_carryover_root() {
+            Ok((root, count, total)) => {
+                let expected = core::CARRYOVER_SNAPSHOT_ROOT;
+                println!("carry-over audit — derived FROM THE DATABASE, not from any file");
+                println!("  data-dir      : {}", cli.data_dir);
+                println!("  utxo count    : {count}  (chain requires {})", core::CARRYOVER_UTXO_COUNT);
+                println!("  total value   : {total} sat  (chain requires {})", core::CARRYOVER_TOTAL_SAT);
+                println!("  derived root  : {}", hex::encode(root));
+                println!("  required root : {}", hex::encode(expected));
+                let ok = root == expected
+                    && count == core::CARRYOVER_UTXO_COUNT
+                    && total == core::CARRYOVER_TOTAL_SAT;
+                if ok {
+                    println!();
+                    println!("MATCH — this database contains exactly the carried-over ledger.");
+                    std::process::exit(0);
+                }
+                eprintln!();
+                eprintln!("MISMATCH — this data-dir does NOT contain the ledger this binary expects.");
+                eprintln!("If you downloaded it, do not run a node on it. The meta stamp inside a");
+                eprintln!("data-dir records what a file hashed to at ingest time; it is copied text");
+                eprintln!("and a tampered directory can carry a correct-looking one. This check is");
+                eprintln!("the one that reads the actual UTXO set back out.");
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("carry-over audit failed to read the UTXO set: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     // Archival mode is process-wide and fixed; set it before any block is accepted.
     if cli.archive {
         ARCHIVE_MODE.store(true, std::sync::atomic::Ordering::Relaxed);
