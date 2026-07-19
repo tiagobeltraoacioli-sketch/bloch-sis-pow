@@ -56,21 +56,61 @@ fn main() {
         }
     }
 
-    // READ-ONLY: no write lock, so a live node keeps serving while we snapshot.
-    let store = match bloch::storage::Storage::open_read_only(Path::new(&data_dir)) {
-        Ok(s)  => s,
+    // Open RocksDB DIRECTLY, listing only the column families the DB actually has.
+    //
+    // Storage::open_read_only passes the CURRENT binary's full descriptor list, so it
+    // refuses any data-dir created by an older node ("Column family not found:
+    // reachability" against a node predating that CF). For a forensic/snapshot tool
+    // that is backwards: it must read a database written by ANY version, precisely
+    // because the reason to snapshot is usually that something is wrong with the
+    // node. So: discover the CFs, open those, and touch only `utxo`.
+    //
+    // READ-ONLY acquires no write lock — a live node keeps mining while this runs.
+    let existing = match rocksdb::DB::list_cf(&rocksdb::Options::default(), &data_dir) {
+        Ok(v)  => v,
+        Err(e) => { eprintln!("cannot list column families in {data_dir}: {e}"); std::process::exit(1); }
+    };
+    if !existing.iter().any(|c| c == "utxo") {
+        eprintln!("no `utxo` column family in {data_dir} — is this a Bloch data-dir? \
+                   (note: the RocksDB directory is <data-dir>/db)");
+        std::process::exit(1);
+    }
+    let descriptors: Vec<_> = existing.iter()
+        .map(|name| rocksdb::ColumnFamilyDescriptor::new(name, rocksdb::Options::default()))
+        .collect();
+    let db = match rocksdb::DB::open_cf_descriptors_read_only(
+        &rocksdb::Options::default(), &data_dir, descriptors, false,
+    ) {
+        Ok(d)  => d,
         Err(e) => { eprintln!("cannot open {data_dir} read-only: {e}"); std::process::exit(1); }
     };
 
-    let height = store
-        .get_meta("tip_height").ok().flatten()
-        .and_then(|b| b.as_slice().try_into().ok().map(u64::from_le_bytes));
-    let pruned = store.pruned_height();
-
-    let utxos = match store.iter_utxos_sorted() {
-        Ok(v)  => v,
-        Err(e) => { eprintln!("failed to read the UTXO set: {e}"); std::process::exit(1); }
+    let read_u64_meta = |key: &str| -> Option<u64> {
+        db.cf_handle("meta")
+            .and_then(|cf| db.get_cf(&cf, key.as_bytes()).ok().flatten())
+            .and_then(|b| b.as_slice().try_into().ok().map(u64::from_le_bytes))
     };
+    let height = read_u64_meta("tip_height");
+    let pruned = read_u64_meta("pruned_height").unwrap_or(0);
+
+    // Deterministic order: CF_UTXO keys are `txid ‖ vout_be`, so byte order IS
+    // (txid, vout) order. Sorted explicitly below so the commitment depends on this
+    // function rather than on a RocksDB iteration detail.
+    let cf_utxo = db.cf_handle("utxo").expect("checked above");
+    let mut utxos: Vec<(Vec<u8>, u32, u64, Vec<u8>)> = Vec::new();
+    for item in db.iterator_cf(&cf_utxo, rocksdb::IteratorMode::Start) {
+        let (key, val) = match item { Ok(kv) => kv, Err(e) => {
+            eprintln!("read error while iterating the UTXO set: {e}"); std::process::exit(1); } };
+        if key.len() < 36 { continue; }
+        let txid = key[..key.len() - 4].to_vec();
+        let vout = u32::from_be_bytes([key[key.len()-4], key[key.len()-3],
+                                       key[key.len()-2], key[key.len()-1]]);
+        let output: bloch::core::TxOutput = match bloch::storage::decode(&val) {
+            Ok(o) => o, Err(_) => continue,
+        };
+        utxos.push((txid, vout, output.value, output.script_pubkey));
+    }
+    utxos.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
 
     // Commitment: SHAKE-256 over the same bytes we write, in the same order. The
     // file and the root are therefore two views of one artifact — you can

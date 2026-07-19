@@ -32,9 +32,17 @@ fn main() {
 
     build.include(&includepath);
 
-    if let Some(libc) = std::env::var_os("DEP_WASM32_UNKNOWN_UNKNOWN_OPENBSD_LIBC_INCLUDE") {
-        build.include(libc);
-        println!("cargo::rustc-link-lib=wasm32-unknown-unknown-openbsd-libc");
+    // The freestanding openbsd-libc headers are ONLY for wasm32-unknown-unknown
+    // (which has no libc). On wasm32-wasip1/wasi the wasi-sysroot (added via
+    // --sysroot above) already provides libc; mixing in the openbsd headers there
+    // causes duplicate-typedef errors (sys/types.h __suseconds_t). Native builds
+    // never take either branch. Skipping this on wasi lets the mobile wallet WASM
+    // build target wasi cleanly.
+    if target_os != "wasi" {
+        if let Some(libc) = std::env::var_os("DEP_WASM32_UNKNOWN_UNKNOWN_OPENBSD_LIBC_INCLUDE") {
+            build.include(libc);
+            println!("cargo::rustc-link-lib=wasm32-unknown-unknown-openbsd-libc");
+        }
     }
 
     build.files(common_files).compile("pqclean_common");
