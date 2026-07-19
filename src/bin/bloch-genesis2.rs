@@ -71,6 +71,15 @@ fn main() {
         None => { eprintln!("--height is required: a snapshot without a stated height \
                              cannot be reproduced or compared"); std::process::exit(2); }
     };
+    // A zero height passes every arithmetic check vacuously: 0 == 0 x 8,400 and an
+    // empty file has 0 lines. The tool would emit a fully-formed commitment over
+    // NOTHING, and a chain launched from it would carry no balances at all while
+    // looking correctly verified. Found by adversarial review, not by testing.
+    if height == 0 {
+        eprintln!("height 0 is not a valid carry-over point: every check below would \
+                   pass vacuously over an empty ledger");
+        std::process::exit(2);
+    }
     if height >= FIRST_HALVING_HEIGHT {
         eprintln!("height {height} is at or past the first halving ({FIRST_HALVING_HEIGHT}); \
                    the flat-emission check below no longer applies — extend this tool before \
@@ -126,10 +135,20 @@ fn main() {
     println!("  total supply       : {} BLCH", total_sat / SAT_PER_BLOCH as u128);
     println!("  SHAKE-256 root     : {root_hex}");
     if malformed > 0 {
-        println!("  malformed lines    : {malformed}   <- NOT counted; investigate before use");
+        eprintln!("REFUSING: {malformed} malformed line(s) in {snapshot}.");
+        eprintln!("A malformed line is skipped by the arithmetic but still hashed into the");
+        eprintln!("root, so a corrupted file yields a DIFFERENT root that passes every check");
+        eprintln!("below — a blessed commitment over a ledger nobody can reproduce. Earlier");
+        eprintln!("this printed a warning and exited 0, which is the same defect this whole");
+        eprintln!("migration exists to stop: a warning nobody reads is not a gate.");
+        std::process::exit(1);
     }
     println!();
     println!("Verification");
+    println!("  NOTE: these check the ledger's SHAPE, not its OWNERSHIP. A file with the");
+    println!("  same count and the same total, but every script_pubkey reassigned, passes");
+    println!("  both. The root binds THIS file; it does not prove the file reflects the");
+    println!("  real chain. Only independent reproduction at the same frozen height does.");
     println!("  supply == height x {REWARD_BLOCH_PER_BLOCK} BLCH : {}",
              if supply_ok { "PASS" } else { "FAIL" });
     println!("  utxo count == height                : {}",
