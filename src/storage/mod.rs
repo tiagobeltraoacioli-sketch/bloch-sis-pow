@@ -295,6 +295,50 @@ impl Storage {
         results
     }
 
+    /// Iterate the entire UTXO set in DETERMINISTIC order for snapshotting.
+    ///
+    /// Returns `(txid, vout, value, script_pubkey)` sorted by the raw CF_UTXO key,
+    /// which is `txid ‖ vout_be` — so the order is a pure function of the set's
+    /// contents, independent of insertion history, RocksDB compaction state, or
+    /// which node produced it. Two honest nodes at the same height MUST produce
+    /// byte-identical output; that is what makes a commitment over this meaningful.
+    ///
+    /// Why this exists: block bodies below `pruned_height` are deleted (see
+    /// [`Self::prune_blocks_below`]) but the UTXO set is retained in full. On this
+    /// fleet in 2026-07 that left ~95% of history unservable while every balance
+    /// stayed intact and queryable — so the SET is recoverable even when the CHAIN
+    /// that produced it is not. A snapshot taken here is the carry-over artifact
+    /// for any migration, and the input to an assumeutxo-style bootstrap for fresh
+    /// nodes that cannot sync from genesis because no archival peer has the bodies.
+    ///
+    /// Read-only friendly: pair with [`Self::open_read_only`] to snapshot a data-dir
+    /// while the node keeps running on it.
+    pub fn iter_utxos_sorted(&self) -> Result<Vec<(Vec<u8>, u32, u64, Vec<u8>)>, StorageError> {
+        let cf = self.db.cf_handle(CF_UTXO).ok_or(StorageError::CfNotFound(CF_UTXO.into()))?;
+        let mut out: Vec<(Vec<u8>, u32, u64, Vec<u8>)> = Vec::new();
+        for item in self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start) {
+            let (key, val) = item.map_err(|e| StorageError::ReadFailed(e.to_string()))?;
+            // key = txid ‖ vout (4B BE); anything else is not ours — skip rather
+            // than guess, so a malformed row can never silently enter a commitment.
+            if key.len() < 36 { continue; }
+            let txid = key[..key.len() - 4].to_vec();
+            let vout = u32::from_be_bytes([key[key.len()-4], key[key.len()-3],
+                                           key[key.len()-2], key[key.len()-1]]);
+            // Same codec every other UTXO read in this file uses — never a
+            // second decoder, or a snapshot could disagree with the node that
+            // produced it while both look correct.
+            let output: TxOutput = match decode::<TxOutput>(&val) {
+                Ok(o)  => o,
+                Err(_) => continue,
+            };
+            out.push((txid, vout, output.value, output.script_pubkey));
+        }
+        // RocksDB already yields keys in byte order; sort explicitly so the
+        // guarantee is in THIS function rather than in an engine detail.
+        out.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        Ok(out)
+    }
+
     pub fn clear_utxos(&self) -> Result<(), StorageError> {
         let cf = self.db.cf_handle(CF_UTXO).ok_or(StorageError::CfNotFound(CF_UTXO.into()))?;
         let mut batch = rocksdb::WriteBatch::default();
