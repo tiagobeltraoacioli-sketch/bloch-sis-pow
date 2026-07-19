@@ -55,6 +55,17 @@ struct Cli {
     /// searches a disjoint nonce range under the same regime (result-identical
     /// to single-thread mining — pure throughput). Defaults to all logical CPUs.
     #[arg(long)]                                         mine_threads: Option<usize>,
+    /// Keep EVERY block body — never prune. An archival node is what lets a
+    /// FRESH node bootstrap: the default pruning depth (10,000 blocks) deletes
+    /// bodies from CF_BLOCKS while the header/DAG map keeps every entry, so a
+    /// pruned node still ADVERTISES headers it can no longer serve. With no
+    /// archival peer anywhere on the network, a new node asks for block 0, is
+    /// promised 500 headers, receives no bodies, and loops forever at height 1.
+    /// That is the observed failure on this fleet (2026-07-19): every node had
+    /// pruned below ~394,913, so those bodies exist nowhere and cannot be
+    /// recovered. Run at least one archival node, or new nodes cannot join.
+    /// Costs disk: the full chain instead of the last 10,000 blocks.
+    #[arg(long)]                                         archive: bool,
     #[arg(long)]                                         testnet: bool,
     #[arg(long, default_value = "./bloch-data")]          data_dir: String,
     /// RPC bind address. SECURITY: defaults to 127.0.0.1 (local only).
@@ -282,8 +293,23 @@ async fn main() {
     let dag = Arc::new(RwLock::new(consensus::GhostDAG::with_default_k_env()));
 
     // ── Genesis + DAG reload ─────────────────────────────────────────────────
+    // Archival mode is process-wide and fixed; set it before any block is accepted.
+    if cli.archive {
+        ARCHIVE_MODE.store(true, std::sync::atomic::Ordering::Relaxed);
+        info!("--archive: pruning DISABLED, every block body retained. This node can \
+               bootstrap fresh peers; a pruned node cannot.");
+    }
+
     if store.get_meta("genesis_hash").ok().flatten().is_none() {
-        info!("MINING genesis block — this will take a few seconds...");
+        // NOT mining: the genesis PoW witness is the pre-mined constant
+        // GENESIS_POW_SOLUTION (bloch-crypto core/mod.rs:321), exactly like the
+        // entanglement-layer GENESIS_NONCE pattern. This path CONSTRUCTS the
+        // canonical genesis from constants and VERIFIES it, then refuses to start
+        // if it does not check out. The old "MINING genesis block — this will take
+        // a few seconds" message described work that never happens, and it costs
+        // real diagnosis time: an operator who sees it next to 0% CPU concludes the
+        // node hung during genesis, when in fact this step already finished.
+        info!("Initialising canonical genesis (pre-mined PoW witness) and verifying...");
         let founder_spk = address_to_script_pubkey(FOUNDER_ADDRESS_HEX);
         // V2 (ADR-028): miner slot at genesis uses founder address (genesis
         // bootstrapping convention). Pool addresses come from tokenomics_v2
@@ -771,6 +797,19 @@ async fn main() {
                     }
                 }
 
+                // A peer told us it cannot serve this body — it pruned it, or never
+                // had it. Log it and move on: the point of the message is that the
+                // requester now KNOWS, instead of waiting on silence and re-asking
+                // the same batch every 30s. If every peer answers NotFound for the
+                // early chain, no archival peer exists and a fresh node genuinely
+                // cannot bootstrap — a condition worth surfacing rather than hiding
+                // behind an apparently-healthy log full of header traffic.
+                network::NetworkMessage::BlockNotFound { block_hash } => {
+                    warn!("peer cannot serve block {} (pruned or unknown) — an \
+                           archival peer is needed to bootstrap from this height",
+                          hex::encode(&block_hash[..8]));
+                }
+
                 // IBD step 4: respond to GetBlock with the actual block
                 network::NetworkMessage::GetBlock { block_hash } => {
                     match store2.get_block(&block_hash) {
@@ -784,7 +823,23 @@ async fn main() {
                                 block_data: data,
                             }).await;
                         }
-                        _ => debug!("GetBlock: not found {}", hex::encode(&block_hash[..8])),
+                        // Answer explicitly instead of dropping the frame. A silent
+                        // non-answer is unrecoverable for the requester: it cannot
+                        // tell "body pruned" from "packet lost" from "peer busy", so
+                        // it waits, re-asks the same batch on the 30s nudge, and loops
+                        // forever — exactly how a fresh node sat at height 1 through
+                        // 4,397 identical rounds with 15 peers connected. warn!, not
+                        // debug!: a node advertising headers whose bodies it pruned is
+                        // a real operational fault, and at RUST_LOG=info the old debug
+                        // line made it invisible.
+                        _ => {
+                            warn!("GetBlock: body unavailable (pruned or unknown) for {} \
+                                   — replying NotFound so the peer can try another source",
+                                  hex::encode(&block_hash[..8]));
+                            let _ = otx2.send(network::NetworkMessage::BlockNotFound {
+                                block_hash,
+                            }).await;
+                        }
                     }
                 }
 
@@ -1866,6 +1921,13 @@ fn make_rpc_submit_block_cb(
 static FINALITY_FROZEN: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Set once from `--archive` at startup. Same static-flag shape as
+/// FINALITY_FROZEN above: accept_block runs far from the CLI struct and
+/// threading a bool through every caller would be noise for a value that is
+/// fixed for the process lifetime.
+static ARCHIVE_MODE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Validate TX contents, add block to DAG + storage, update UTXO set.
 /// Returns Ok(block_hash) on success.
 fn accept_block(
@@ -2253,7 +2315,13 @@ fn accept_block(
 
     // ── Prune old block bodies ───────────────────────────────────────
     // Remove full block data beyond PRUNING_DEPTH (keeps height→hash, DAG, TX index)
-    if tip_height > core::PRUNING_DEPTH {
+    if ARCHIVE_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+        // Archival node: keep everything. Logged once per prune window so an
+        // operator can see the choice is in effect rather than inferring it.
+        if tip_height % 10_000 == 0 {
+            info!("archival mode: retaining ALL block bodies (h={}); pruning disabled", tip_height);
+        }
+    } else if tip_height > core::PRUNING_DEPTH {
         let prune_below = tip_height - core::PRUNING_DEPTH;
         let last_pruned = store.pruned_height();
         if prune_below > last_pruned + 1000 { // batch: prune every 1000 blocks

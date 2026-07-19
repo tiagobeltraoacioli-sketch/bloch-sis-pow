@@ -61,6 +61,13 @@ pub enum NetworkMessage {
     GetHeaders { from_blue_score: u64, limit: u32 },
     Headers    { entries: Vec<SyncEntry> },
     GetBlock   { block_hash: [u8; 32] },
+    /// Explicit "I cannot serve this body" answer to GetBlock. Added 2026-07-19:
+    /// the responder used to drop unanswerable requests silently, which left the
+    /// requester unable to distinguish a pruned body from a lost packet — it just
+    /// waited and re-asked forever. A fresh node cannot bootstrap from a pruned
+    /// peer, and it deserves to LEARN that instead of stalling: on receiving this
+    /// it can try another peer, or report honestly that no archival peer exists.
+    BlockNotFound { block_hash: [u8; 32] },
     // Frontier reconciliation (Phase 2 Kaspa sync-negotiation layer)
     /// Frontier reconciliation: request the peer's DAG frontier. No payload —
     /// broadcast on the sync topic; every peer replies with Tips.
@@ -247,7 +254,8 @@ fn validate_wire_bounds(msg: &NetworkMessage) -> Result<(), WireDecodeError> {
         NetworkMessage::PeerRequest
         | NetworkMessage::VersionAck
         | NetworkMessage::GetTips
-        | NetworkMessage::GetBlock { .. } => {}
+        | NetworkMessage::GetBlock { .. }
+        | NetworkMessage::BlockNotFound { .. } => {}
     }
     Ok(())
 }
