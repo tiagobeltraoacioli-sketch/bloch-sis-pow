@@ -87,6 +87,19 @@ fn main() {
         std::process::exit(2);
     }
 
+    // Hash the file's RAW BYTES. The first version rebuilt each line and appended
+    // "\n", which meant a file truncated before its final newline hashed IDENTICALLY
+    // to the intact one — the commitment could not detect the single most likely
+    // corruption of a 50 MB download. Found by adversarial review.
+    let raw = match std::fs::read(&snapshot) {
+        Ok(b)  => b,
+        Err(e) => { eprintln!("cannot read {snapshot}: {e}"); std::process::exit(1); }
+    };
+    if raw.last() != Some(&b'\n') {
+        eprintln!("REFUSING: {snapshot} does not end with a newline — it is truncated.");
+        eprintln!("Every complete snapshot ends with one. Re-download or re-generate it.");
+        std::process::exit(1);
+    }
     let f = match std::fs::File::open(&snapshot) {
         Ok(f)  => f,
         Err(e) => { eprintln!("cannot read {snapshot}: {e}"); std::process::exit(1); }
@@ -105,8 +118,6 @@ fn main() {
             Ok(l)  => l,
             Err(e) => { eprintln!("read error: {e}"); std::process::exit(1); }
         };
-        let with_nl = format!("{line}\n");
-        Update::update(&mut hasher, with_nl.as_bytes());
         let parts: Vec<&str> = line.split('\t').collect();
         if parts.len() != 4 { malformed += 1; continue; }
         match parts[2].parse::<u64>() {
@@ -115,6 +126,7 @@ fn main() {
         }
     }
 
+    Update::update(&mut hasher, &raw);
     let mut reader = hasher.finalize_xof();
     let mut root = [0u8; 32];
     reader.read(&mut root);
