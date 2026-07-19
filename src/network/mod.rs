@@ -60,7 +60,19 @@ pub enum NetworkMessage {
     PeerCount { count: usize, addresses: Vec<String> },
     GetHeaders { from_blue_score: u64, limit: u32 },
     Headers    { entries: Vec<SyncEntry> },
-    GetBlock   { block_hash: [u8; 32] },
+    /// Request a block body. `nonce` exists ONLY to make each request unique on
+    /// the wire, and the responder ignores it.
+    ///
+    /// Without it every re-request serialises to identical bytes, hashes to the
+    /// same gossipsub MessageId, and `publish()` returns `Err(Duplicate)`
+    /// LOCALLY — the retry never leaves this node. That is the same failure this
+    /// file already documents for PeerTip a few lines below `duplicate_cache_time`,
+    /// where the fix was noted as "the tip-carrying Version (fresh timestamp →
+    /// unique bytes) can never be dedup-dropped at all". GetBlock had no such
+    /// field, so IBD retries were silently swallowed: observed on a stalled node
+    /// as 12,235 `publish sync: Duplicate` in ten minutes while it sat at one
+    /// height with peers that HELD the blocks it was asking for.
+    GetBlock   { block_hash: [u8; 32], nonce: u64 },
     /// Explicit "I cannot serve this body" answer to GetBlock. Added 2026-07-19:
     /// the responder used to drop unanswerable requests silently, which left the
     /// requester unable to distinguish a pruned body from a lost packet — it just
