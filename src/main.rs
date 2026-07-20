@@ -36,6 +36,8 @@ mod dandelion;    // Coherence P3 Dandelion++ tx-relay privacy
 mod stratum;  // Sprint AA.1 — stratum V1 mining server
 mod stratum_v2;   // Sprint 10-alpha — stratum V2 mining server (NOISE_NX + SV2)
 mod sync;         // Phase 2 — drop-in Kaspa sync-negotiation layer
+#[cfg(feature = "euvm")]
+mod euvm;         // Step 5.1 — eUTXO VM integration adapter (feature-gated, NOT wired into accept_block)
 
 use clap::Parser;
 use log::{info, warn, error, debug};
@@ -1768,13 +1770,17 @@ async fn main() {
         // a SIS-native share protocol (future work). Refuse to start the server
         // under Module-SIS rather than silently produce rejected blocks. Solo
         // mining (--mine) uses the node's SIS miner.
-        if cli.stratum {
+        // Genesis-2 is pure SHA-256d: the stratum share [user, job, en2, ntime,
+        // nonce] fully determines the block PoW (pow_solution is empty), so V1 pool
+        // mining produces valid blocks. Only Module-SIS — whose share has no field
+        // for the lattice solution vector `s` — must refuse.
+        if cli.stratum && !cli.genesis2 {
             error!("stratum mining is unsupported under Module-SIS PoW (no share \
                     field for the lattice solution). Use solo mining (--mine). \
                     A SIS-native pool protocol is future work (see B5f).");
             std::process::exit(1);
         }
-        if false {
+        if cli.stratum && cli.genesis2 {
         // Parse + validate CLI params
         let bind_addr: std::net::SocketAddr = match cli.stratum_addr.parse() {
             Ok(a)  => a,

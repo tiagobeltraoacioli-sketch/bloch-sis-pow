@@ -7,6 +7,7 @@ members = [
     ".",                       # the bloch node (root package)
     "crates/bloch-crypto",     # lean crypto/wallet/tx surface (extracted island)
     "crates/bloch-sis-pow", "crates/coherence-core", "crates/pqcrypto-internals",
+    "crates/bloch-euvm", "crates/bloch-ffg",  # eUTXO VM + FFG committee (optional, behind `euvm` feature)
 ]
 # coherence-prover (SP1 guest/script/service) + fuzz use heavy/nightly-only
 # toolchains; keep them out of the everyday workspace build.
@@ -58,6 +59,11 @@ default = ["node"]
 # that asserts-equal to this bundle's published canonical (address/txid/sighash)
 # tuple. Empty marker feature; off by default.
 dev_a_frozen = []
+# `euvm` compiles in the native eUTXO contract VM + FFG committee-governed
+# activation (crates/bloch-euvm, crates/bloch-ffg). OFF BY DEFAULT and NOT wired
+# into accept_block yet — with the feature off these crates are not compiled into
+# the node, and behaviour is byte-for-byte unchanged. See crates/bloch-euvm/INTEGRATION.md.
+euvm = ["dep:bloch-euvm", "dep:bloch-ffg"]
 # `node` gates the heavy full-node modules (storage/consensus/mining/network/
 # rpc/…) and their exclusive deps (rocksdb, libp2p, axum, …) so the pure
 # wallet/crypto subset cross-compiles for mobile with `default-features = false`.
@@ -73,8 +79,8 @@ node = [
     "dep:reqwest",
     "bloch-crypto/node",
 ]
-sev-snp = []
-mobile  = []
+sev-snp = ["dep:sev"]
+mobile  = ["dep:x509-parser", "dep:ciborium"]
 # Coherence P1: verify shielded-spend FRI proofs with SP1 (heavy sp1-sdk dep,
 # off by default). Enables ShieldedVerifier::Sp1 + BLOCH_SHIELDED_VERIFY=sp1.
 sp1-verify = ["dep:sp1-sdk"]
@@ -172,6 +178,9 @@ bloch-sis-pow             = { path = "crates/bloch-sis-pow" }
 # util) so every `crate::core::…` path keeps working; downstream products depend
 # on bloch-crypto directly WITHOUT pulling the full node.
 bloch-crypto              = { path = "crates/bloch-crypto" }
+# Optional: only compiled when the `euvm` feature is enabled (off by default).
+bloch-euvm                = { path = "crates/bloch-euvm", optional = true }
+bloch-ffg                 = { path = "crates/bloch-ffg", optional = true }
 
 # Coherence C2: lean shielded-pool primitives (notes, commitments, nullifiers,
 # Merkle accumulator, spend statement). Shared source of truth for the node, the
@@ -184,6 +193,18 @@ coherence-core            = { path = "crates/coherence-core" }
 # were deleted. Bloch-SIS is pure PoW; no threshold/BLS crypto on the consensus
 # path. (Re-add only if a post-quantum finality gadget is ever introduced.)
 
+# ── L3 attestation backends (optional, feature-gated; see [features]) ──
+# `mobile` — verifier-side checks of Android Key Attestation / iOS App Attest.
+# Pure Rust; compiles on every host (end-to-end exercise needs real devices).
+x509-parser = { version = "0.18", features = ["verify"], optional = true }
+ciborium    = { version = "0.2", optional = true }
+
+# `sev-snp` — virtee/sev guest interface to /dev/sev-guest. The crate is
+# Linux-only, hence the target gate; on other hosts the provider honestly
+# reports "hardware not present" without pulling the dep at all.
+[target.'cfg(target_os = "linux")'.dependencies]
+sev = { version = "8", default-features = false, features = ["snp"], optional = true }
+
 [profile.release]
 opt-level      = 3
 lto            = true
@@ -191,6 +212,9 @@ codegen-units  = 1
 
 [dev-dependencies]
 tempfile = "3"
+# test-util enables tokio::test(start_paused) for the stratum session
+# lifetime tests (virtual clock through the 600s read-poll windows).
+tokio = { version = "1", features = ["full", "test-util"] }
 
 # pqcrypto-internals fork VENDORED at crates/pqcrypto-internals (was a private
 # git dep that no clean build — Docker, Akash, CI — could fetch). It is a
