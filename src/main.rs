@@ -83,6 +83,16 @@ struct Cli {
     /// carry-over refuses to start if this flag is absent.
     #[arg(long)]                                         carryover_snapshot: Option<PathBuf>,
     #[arg(long)]                                         testnet: bool,
+    /// Run on the Genesis-2 DEVNET (chain-id Genesis2Devnet, SHA-256d PoW,
+    /// carry-over ledger). Mutually exclusive with --testnet — each selects a
+    /// distinct chain-id and PoW algorithm, and the node chain-id is set once.
+    /// This chain REQUIRES --carryover-snapshot (chain_requires_carryover) and
+    /// refuses to start without it. NOTE: the Genesis-2 genesis BLOCK is not yet
+    /// defined (see the genesis-init gate in main()); a node started with this
+    /// flag ingests the carry-over set and then stops, fail-loud, until block 0's
+    /// consensus parameters are chosen. This flag is the explicit node selector
+    /// the ChainId::Genesis2Devnet doc mandates ("never by for_network").
+    #[arg(long)]                                         genesis2: bool,
     #[arg(long, default_value = "./bloch-data")]          data_dir: String,
     /// RPC bind address. SECURITY: defaults to 127.0.0.1 (local only).
     /// Use --rpc-public to bind 0.0.0.0, which exposes RPC to the internet.
@@ -215,8 +225,17 @@ async fn main() {
     // validator read core::node_chain_id() (design §4.3 invariant 6); without
     // this call a testnet node would default to the Mainnet sighash domain and
     // reject every correctly-signed testnet transaction.
+    // --genesis2 and --testnet are mutually exclusive: each names a distinct
+    // chain-id (and PoW algorithm), and set_node_chain_id is one-shot. Reject the
+    // ambiguous combination loudly rather than silently preferring one.
+    if cli.genesis2 && cli.testnet {
+        eprintln!("❌ --genesis2 and --testnet are mutually exclusive (each selects a different chain-id).");
+        std::process::exit(2);
+    }
     core::set_node_chain_id(
-        if cli.testnet { core::ChainId::Testnet } else { core::ChainId::Mainnet }
+        if cli.genesis2      { core::ChainId::Genesis2Devnet }
+        else if cli.testnet  { core::ChainId::Testnet }
+        else                 { core::ChainId::Mainnet }
     ).expect("node chain-id must be settable exactly once at startup");
 
     // FIX v0.5.1 BLK-3: apply --rpc-public escape hatch.
@@ -433,33 +452,44 @@ async fn main() {
     }
 
     if store.get_meta("genesis_hash").ok().flatten().is_none() {
-        // NOT mining: the genesis PoW witness is the pre-mined constant
-        // GENESIS_POW_SOLUTION (bloch-crypto core/mod.rs:321), exactly like the
-        // entanglement-layer GENESIS_NONCE pattern. This path CONSTRUCTS the
-        // canonical genesis from constants and VERIFIES it, then refuses to start
-        // if it does not check out. The old "MINING genesis block — this will take
-        // a few seconds" message described work that never happens, and it costs
-        // real diagnosis time: an operator who sees it next to 0% CPU concludes the
-        // node hung during genesis, when in fact this step already finished.
-        info!("Initialising canonical genesis (pre-mined PoW witness) and verifying...");
+        // ── Chain-aware genesis construction ─────────────────────────────────
+        // Mainnet/Testnet: the pre-mined Module-SIS genesis (GENESIS_POW_SOLUTION,
+        // a 256-length witness). Genesis-2: the SHA-256d anchor for the carried-over
+        // ledger — zero-value coinbase, EMPTY pow_solution, pre-mined GENESIS2_NONCE.
+        // In both cases this CONSTRUCTS the canonical genesis from constants and
+        // VERIFIES it (validate_pow dispatches on the node chain-id), refusing to
+        // start if it does not check out.
+        info!("Initialising canonical genesis (pre-mined PoW) and verifying...");
         let founder_spk = address_to_script_pubkey(FOUNDER_ADDRESS_HEX);
-        // V2 (ADR-028): miner slot at genesis uses founder address (genesis
-        // bootstrapping convention). Pool addresses come from tokenomics_v2
-        // and panic before Phase 6 — deliberate fail-loud: a node configured
-        // for mainnet without these populated must not produce blocks.
-        let validator_pool_spk = core::tokenomics_v2::validator_pool_address_hash();
-        let oracle_pool_spk    = core::tokenomics_v2::oracle_pool_address_hash();
-        let genesis = core::create_genesis_block(
-            &founder_spk,
-            &validator_pool_spk,
-            &oracle_pool_spk,
-        );
+        let genesis = if core::node_chain_id() == core::ChainId::Genesis2Devnet {
+            // The carry-over UTXO set was ingested above; this writes only block 0.
+            core::create_genesis2_block(&founder_spk)
+        } else {
+            // V2 (ADR-028): miner slot at genesis uses founder address (genesis
+            // bootstrapping convention). Pool addresses come from tokenomics_v2 and
+            // panic before Phase 6 — deliberate fail-loud: a node configured for
+            // mainnet without these populated must not produce blocks.
+            let validator_pool_spk = core::tokenomics_v2::validator_pool_address_hash();
+            let oracle_pool_spk    = core::tokenomics_v2::oracle_pool_address_hash();
+            core::create_genesis_block(&founder_spk, &validator_pool_spk, &oracle_pool_spk)
+        };
 
-        // Genesis carries a mined Module-SIS PoW witness (B5e); refuse to start
-        // if it does not verify (wrong GENESIS_POW_SOLUTION / bits / address).
+        // Genesis carries its chain's mined PoW; refuse to start if it does not
+        // verify (wrong constant / bits / address, or a witness/empty mismatch).
         if !genesis.validate_pow() {
-            error!("Genesis Module-SIS PoW invalid — GENESIS_POW_SOLUTION does not \
-                    verify against the canonical genesis. Regenerate via B5e.");
+            error!("Genesis PoW invalid for chain-id {:?}: the pre-mined genesis does \
+                    not verify against this binary's constants. Refusing to start.",
+                   core::node_chain_id());
+            std::process::exit(1);
+        }
+        // Genesis-2: also pin the exact block hash (fail closed if any baked
+        // constant — bits, timestamp, nonce, coinbase, miner addr — drifted).
+        if core::node_chain_id() == core::ChainId::Genesis2Devnet
+            && genesis.block_hash() != core::GENESIS2_EXPECTED_HASH {
+            error!("Genesis-2 block hash {} != expected {} — a baked constant drifted. \
+                    Refusing to start.",
+                   hex::encode(genesis.block_hash()),
+                   hex::encode(core::GENESIS2_EXPECTED_HASH));
             std::process::exit(1);
         }
 
@@ -472,7 +502,12 @@ async fn main() {
         // value from block 1 onwards (not the fallback constant). Prevents a class of
         // subtle bugs where a retarget could write a different value than accept_block
         // reads on a fresh node.
-        store.put_meta("current_bits", &core::GENESIS_BITS.to_le_bytes())
+        let genesis_bits = if core::node_chain_id() == core::ChainId::Genesis2Devnet {
+            core::GENESIS2_BITS
+        } else {
+            core::GENESIS_BITS
+        };
+        store.put_meta("current_bits", &genesis_bits.to_le_bytes())
             .expect("meta current_bits");
         dag.write().add_genesis(hash, genesis.header.timestamp);
         if let Some(gdata) = dag.read().get_block_data(&hash).cloned() {
@@ -1408,10 +1443,15 @@ async fn main() {
                         .unwrap_or(0);
                     // ASERT-Lattice difficulty anchored at genesis (B5c): bits
                     // are computed per-block from the parent timestamp, not read
-                    // from a windowed-retarget meta key.
+                    // from a windowed-retarget meta key. Genesis-2 uses a FIXED
+                    // devnet difficulty (must match accept_block's expected_bits).
                     let parent_ts = store_m.get_timestamp_at_height(h).ok().flatten()
                         .unwrap_or(core::GENESIS_TIMESTAMP);
-                    let bits = pow::next_bits(core::GENESIS_BITS, core::GENESIS_TIMESTAMP, parent_ts, h + 1);
+                    let bits = if core::node_chain_id() == core::ChainId::Genesis2Devnet {
+                        core::GENESIS2_BITS
+                    } else {
+                        pow::next_bits(core::GENESIS_BITS, core::GENESIS_TIMESTAMP, parent_ts, h + 1)
+                    };
                     (tips, bits, h)
                 };
 
@@ -1462,9 +1502,13 @@ async fn main() {
                 // Pool addresses come from tokenomics_v2 panicking accessors
                 // — deliberate fail-loud until Phase 6 sets the constants.
                 let block_height = current_height + 1;
-                let subsidy = core::tokenomics_v2::block_subsidy_sat(block_height);
+                // Genesis-2 continues emission from the carried height: the miner
+                // must pay the subsidy for the ABSOLUTE height, exactly as the
+                // validator (validate_coinbase_value) computes it via emission_height.
+                let emission_h = core::emission_height(block_height);
+                let subsidy = core::tokenomics_v2::block_subsidy_sat(emission_h);
                 let founder_vesting =
-                    core::tokenomics_v2::founder_vesting_delta_sat(block_height);
+                    core::tokenomics_v2::founder_vesting_delta_sat(emission_h);
 
                 // Pure PoW (B3): 100% of subsidy + fees to the miner.
                 let mut cb_outputs = vec![
@@ -2087,12 +2131,19 @@ fn accept_block(
     // ── FIX VULN-01: Validate difficulty bits match expected ──────────
     // ASERT-Lattice (B5c): expected bits are derived per-block from the
     // parent timestamp + genesis anchor — miner and validator agree by
-    // computing the same function (src/pow::next_bits).
+    // computing the same function (src/pow::next_bits). Genesis-2 (devnet)
+    // uses a FIXED difficulty (GENESIS2_BITS): the SIS ASERT path re-anchors to
+    // mainnet constants and interprets `bits` with SIS semantics, neither of
+    // which applies to a fresh SHA-256d chain — so it is bypassed here.
     let parent_ts = store.get_timestamp_at_height(block.height.saturating_sub(1))
         .ok().flatten().unwrap_or(core::GENESIS_TIMESTAMP);
-    let expected_bits = pow::next_bits(
-        core::GENESIS_BITS, core::GENESIS_TIMESTAMP, parent_ts, block.height,
-    );
+    let expected_bits = if core::node_chain_id() == core::ChainId::Genesis2Devnet {
+        core::GENESIS2_BITS
+    } else {
+        pow::next_bits(
+            core::GENESIS_BITS, core::GENESIS_TIMESTAMP, parent_ts, block.height,
+        )
+    };
     if block.header.bits != expected_bits {
         return Err(format!(
             "invalid difficulty: block bits 0x{:08x} != expected 0x{:08x}",

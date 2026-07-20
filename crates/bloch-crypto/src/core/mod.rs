@@ -232,6 +232,24 @@ pub const CARRYOVER_SOURCE_HEIGHT: u64  = 413_743;
 pub const CARRYOVER_UTXO_COUNT:    u64  = 413_743;
 pub const CARRYOVER_TOTAL_SAT:     u128 = 347_544_120_000_000_000;
 
+/// The ABSOLUTE emission height for a block at node-local `local_height`.
+///
+/// CONSENSUS-CRITICAL and read by BOTH the validator (`validate_coinbase_value`)
+/// and the miner, so they provably agree on the subsidy. Genesis-2 restarts the
+/// local chain at height 0 but must CONTINUE emission from where the carried
+/// ledger stopped, so the emission height is offset by CARRYOVER_SOURCE_HEIGHT:
+/// local height 1 == absolute 413,744 == the first NEW 8,400-BLOCH reward, and
+/// halvings land at the correct absolute heights. The genesis anchor (local 0)
+/// pays nothing regardless — its reward is already in the carried set. On every
+/// other chain this is the identity.
+#[inline]
+pub fn emission_height(local_height: u64) -> u64 {
+    match node_chain_id() {
+        ChainId::Genesis2Devnet => local_height + CARRYOVER_SOURCE_HEIGHT,
+        _ => local_height,
+    }
+}
+
 /// Whether `id` REQUIRES the carry-over snapshot to be ingested before the
 /// node may run. Deliberately an exhaustive match with no wildcard arm: when a
 /// Genesis-2 chain-id variant is added (g2/T1 adds `Genesis2Devnet`), this
@@ -1559,8 +1577,14 @@ impl Block {
         // validator/oracle pool outputs (B2 removed BFT/PoBRS). Shape:
         //   - founder_vesting_delta(h) == 0  → 1 output:  [miner]
         //   - founder_vesting_delta(h)  > 0  → 2 outputs: [miner, founder]
-        let subsidy = tokenomics_v2::block_subsidy_sat(self.height);
-        let founder_delta = tokenomics_v2::founder_vesting_delta_sat(self.height);
+        // Genesis-2 continues emission from the carried height: a block at local
+        // height h emits as if at absolute height h + CARRYOVER_SOURCE_HEIGHT.
+        // `emission_height` is the identity on every other chain. Reading it here
+        // (the consensus authority) guarantees no over-emission and the correct
+        // halving schedule regardless of any miner-side mismatch.
+        let eh = emission_height(self.height);
+        let subsidy = tokenomics_v2::block_subsidy_sat(eh);
+        let founder_delta = tokenomics_v2::founder_vesting_delta_sat(eh);
         let expected_n = if founder_delta > 0 { 2 } else { 1 };
 
         if cb.outputs.len() != expected_n {
@@ -1840,13 +1864,18 @@ pub const GENESIS2_BITS: u32 = 0x1f00ffff;
 /// PLACEHOLDER 0 until the devnet ceremony bakes the real value; the pinned
 /// test genesis2_genesis_block.rs FAILS while this is stale, and the node's
 /// startup check must exit(1) — fail closed, never fail open.
-pub const GENESIS2_NONCE: u64 = 0;
+pub const GENESIS2_NONCE: u64 = 68_724;
 
 /// Expected canonical Genesis-2 block hash, for operator verification and the
 /// fail-closed startup check. Canonical = miner script_pubkey
 /// GENESIS2_MINER_SCRIPT_PUBKEY, all constants above. PLACEHOLDER (all-zero)
 /// until the ceremony bakes the real value — see GENESIS2_NONCE.
-pub const GENESIS2_EXPECTED_HASH: [u8; 32] = [0u8; 32];
+pub const GENESIS2_EXPECTED_HASH: [u8; 32] = [
+    0xd2, 0xef, 0xc5, 0x08, 0xa6, 0xde, 0x31, 0x1e,
+    0xe2, 0xa8, 0xb0, 0x44, 0x5e, 0xf9, 0x21, 0xbf,
+    0xb4, 0xbb, 0xd3, 0x82, 0x1b, 0xd2, 0xab, 0xec,
+    0xd5, 0xd6, 0x0a, 0xe6, 0x3d, 0x83, 0x07, 0xb8,
+];
 
 /// Canonical Genesis-2 miner script_pubkey: the founder address hash-20
 /// (bloch1qe986db5149cff7499b282a048272a09aff0af4ff84242073 → first 40 hex
@@ -1894,7 +1923,11 @@ pub fn create_genesis2_block_with_params(
     timestamp: u64,
     nonce: u64,
 ) -> Block {
-    let subsidy = tokenomics_v2::block_subsidy_sat(0);
+    // ZERO-value anchor coinbase (consensus decision, 2026-07-20): the carried
+    // ledger already holds the reward for its tip (absolute height
+    // CARRYOVER_SOURCE_HEIGHT), so genesis must NOT mint again — it only anchors
+    // the DAG. Emission then CONTINUES from local height 1 == absolute 413,744
+    // (see `emission_height`), so there is no double-emission and no inflation.
     let coinbase = Transaction {
         version: 1,
         inputs: vec![TxInput {
@@ -1905,7 +1938,7 @@ pub fn create_genesis2_block_with_params(
         }],
         outputs: vec![
             TxOutput {
-                value:         subsidy,
+                value:         0,
                 script_pubkey: miner_addr.to_vec(),
             },
         ],
