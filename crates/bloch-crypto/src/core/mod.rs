@@ -1857,7 +1857,7 @@ pub const GENESIS2_TIMESTAMP: u64 = 1_784_500_000;
 /// Genesis-2 compact difficulty bits. 0x1f00ffff → target 0x0000ffff… —
 /// ~2⁻¹⁶ per double-SHA-256, mined in seconds. A production ceremony re-mines
 /// at real difficulty; the VALIDATION path is identical at any bits.
-pub const GENESIS2_BITS: u32 = 0x1f00ffff;
+pub const GENESIS2_BITS: u32 = 0x1d00ffff;
 
 /// Genesis-2 difficulty retarget window (blocks). Bitcoin-style windowed retarget
 /// (core::retarget_bits_g2), but SHORTER than Bitcoin's 2016 so a fresh chain
@@ -1871,17 +1871,17 @@ pub const GENESIS2_RETARGET_WINDOW: u64 = 60;
 /// PLACEHOLDER 0 until the devnet ceremony bakes the real value; the pinned
 /// test genesis2_genesis_block.rs FAILS while this is stale, and the node's
 /// startup check must exit(1) — fail closed, never fail open.
-pub const GENESIS2_NONCE: u64 = 68_724;
+pub const GENESIS2_NONCE: u64 = 1_798_023_308;
 
 /// Expected canonical Genesis-2 block hash, for operator verification and the
 /// fail-closed startup check. Canonical = miner script_pubkey
 /// GENESIS2_MINER_SCRIPT_PUBKEY, all constants above. PLACEHOLDER (all-zero)
 /// until the ceremony bakes the real value — see GENESIS2_NONCE.
 pub const GENESIS2_EXPECTED_HASH: [u8; 32] = [
-    0xd2, 0xef, 0xc5, 0x08, 0xa6, 0xde, 0x31, 0x1e,
-    0xe2, 0xa8, 0xb0, 0x44, 0x5e, 0xf9, 0x21, 0xbf,
-    0xb4, 0xbb, 0xd3, 0x82, 0x1b, 0xd2, 0xab, 0xec,
-    0xd5, 0xd6, 0x0a, 0xe6, 0x3d, 0x83, 0x07, 0xb8,
+    0xa7, 0xb3, 0xde, 0x01, 0x09, 0x88, 0xac, 0xcb,
+    0x58, 0x7a, 0x98, 0x71, 0x5c, 0x18, 0x1c, 0x8a,
+    0x14, 0x34, 0x1a, 0x79, 0x7e, 0x96, 0xb1, 0xe1,
+    0xcd, 0xa3, 0x19, 0xa7, 0xe7, 0x7b, 0x2b, 0xab,
 ];
 
 /// Canonical Genesis-2 miner script_pubkey: the founder address hash-20

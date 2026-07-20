@@ -37,6 +37,13 @@ RUN apt-get update && apt-get install -y \
 
 COPY --from=builder /build/target/release/bloch /usr/local/bin/bloch
 
+# Genesis-2 carry-over snapshot, verified fail-closed at first boot. Baked at
+# /carryover.tsv — OUTSIDE /bloch-data, because that path is a mounted volume
+# that would hide a file baked into the image. Nodes pass
+# --carryover-snapshot /carryover.tsv.
+COPY carryover.tsv /carryover.tsv
+RUN chown 10001:10001 /carryover.tsv
+
 # ── Hardening (Bloch-SIS-Linux L2, container tier) ────────────────────────────
 # Non-root user (created without useradd so it works on any slim base), owning
 # the data dir. The node binds ports >1024, so it needs no capabilities.
