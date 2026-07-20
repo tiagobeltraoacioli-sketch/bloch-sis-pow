@@ -241,9 +241,14 @@ fn rpc_call(
     stream.set_read_timeout(Some(std::time::Duration::from_secs(30)))
         .map_err(|e| e.to_string())?;
 
+    // Optional API key for auth-required writes (sendrawtransaction): set
+    // BLOCH_RPC_API_KEY. Sent as the x-api-key header the node expects.
+    let api_key_hdr = std::env::var("BLOCH_RPC_API_KEY")
+        .map(|k| format!("x-api-key: {}\r\n", k))
+        .unwrap_or_default();
     let request = format!(
-        "POST / HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        addr, body_str.len(), body_str
+        "POST / HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+        addr, api_key_hdr, body_str.len(), body_str
     );
 
     stream.write_all(request.as_bytes()).map_err(|e| format!("write failed: {}", e))?;
@@ -345,7 +350,10 @@ fn do_send(params: &[&str], rpc_host: &str, rpc_port: u16) {
     println!("Fee:    {} BLOCH", fee_bloch);
 
     // Get UTXOs via RPC
-    let utxos_result = match rpc_call(rpc_host, rpc_port, "getutxos", &serde_json::json!([keypair.address])) {
+    // Pass a UTXO limit: a huge wallet (e.g. the carry-over founder set with
+    // hundreds of thousands of UTXOs) otherwise returns a multi-MB response that
+    // times out the client. A handful of UTXOs is plenty to cover any single spend.
+    let utxos_result = match rpc_call(rpc_host, rpc_port, "getutxos", &serde_json::json!([keypair.address, 50])) {
         Ok(r) => r,
         Err(e) => { eprintln!("RPC error: {}", e); process::exit(1); }
     };

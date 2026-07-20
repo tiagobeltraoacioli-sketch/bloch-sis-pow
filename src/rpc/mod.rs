@@ -458,22 +458,32 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
         // ── Wallet: list UTXOs for address (needed by wallet CLI) ────
         "getutxos" => {
             let addr = params.and_then(|p| p.get(0)).and_then(|v| v.as_str()).unwrap_or("");
+            // Optional 2nd param: max UTXOs to return. A wallet with hundreds of
+            // thousands of UTXOs (e.g. the carry-over founder set) otherwise serializes
+            // a multi-MB response that overflows clients; a spender only needs enough
+            // UTXOs to cover the amount, so it can pass a small limit.
+            let limit = params.and_then(|p| p.get(1)).and_then(|v| v.as_u64()).map(|n| n as usize);
             let addr_bytes = parse_address(addr);
             match addr_bytes {
                 Some(ab) => match state.store.get_utxos_for_address(&ab) {
                     Ok(utxos) => {
-                        let list: Vec<Value> = utxos.iter().map(|(txid, idx, out)| {
-                            json!({
-                                "txid":          hex::encode(txid),
-                                "index":         idx,
-                                "value":         out.value,
-                                "script_pubkey": hex::encode(&out.script_pubkey),
-                            })
-                        }).collect();
                         let total: u64 = utxos.iter().map(|(_, _, o)| o.value).sum();
+                        let full_count = utxos.len();
+                        let iter = utxos.iter();
+                        let list: Vec<Value> = match limit {
+                            Some(n) => iter.take(n).map(|(txid, idx, out)| json!({
+                                "txid": hex::encode(txid), "index": idx,
+                                "value": out.value, "script_pubkey": hex::encode(&out.script_pubkey),
+                            })).collect(),
+                            None => iter.map(|(txid, idx, out)| json!({
+                                "txid": hex::encode(txid), "index": idx,
+                                "value": out.value, "script_pubkey": hex::encode(&out.script_pubkey),
+                            })).collect(),
+                        };
                         json!({
                             "address":    addr,
-                            "utxo_count": list.len(),
+                            "utxo_count": full_count,
+                            "returned":   list.len(),
                             "satoshis":   total,
                             "bloch":       total as f64 / 1e8,
                             "utxos":      list,
