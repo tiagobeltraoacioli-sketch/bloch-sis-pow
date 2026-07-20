@@ -136,6 +136,29 @@ fn main() {
             return;
         }
 
+        // ── Diagnostic: key format (no secret leaked — lengths/suite only) ─────
+        "keyinfo" => {
+            require_params(params, 1, "keyinfo <wallet.json>");
+            let pw = read_password("Wallet password: ");
+            let path = std::path::Path::new(params[0]);
+            match bloch::wallet::Keypair::load_encrypted(path, &pw) {
+                Ok(kp) => {
+                    let pk = &kp.public_key; let sk = &kp.private_key;
+                    let suite = |b: &[u8]| -> String {
+                        if b.len() >= 4 && b[0]==0xB1 && b[1]==0x0C {
+                            format!("enveloped suite 0x{:04x}", u16::from_le_bytes([b[2],b[3]]))
+                        } else { "RAW (no envelope)".into() }
+                    };
+                    println!("address:      {}", kp.address);
+                    println!("pubkey  len:  {}  ({})", pk.len(), suite(pk));
+                    println!("privkey len:  {}  ({})", sk.len(), suite(sk));
+                    println!("expected: hybrid pk=3749 sk=4032+falcon(~2300); mldsa-only pk=1956 sk=4036");
+                }
+                Err(e) => { eprintln!("load failed: {}", e); process::exit(1); }
+            }
+            return;
+        }
+
         // ── Wallet: generate ───────────────────────────────────────
         "newwallet" | "createwallet" => {
             require_params(params, 1, "newwallet <output_path.json>");

@@ -435,7 +435,20 @@ impl Drop for Keypair {
 
 impl Keypair {
     pub fn sign(&self, msg: &[u8]) -> Result<Vec<u8>, String> {
-        crypto::sign(&self.private_key, msg).map_err(|e| e.to_string())
+        // Legacy v2 keystores stored the RAW private key (no 4-byte suite envelope),
+        // while newer keys and crypto::sign use the enveloped form. If this key is
+        // un-enveloped, wrap it under the SAME suite the (enveloped) public key
+        // declares, so the signature matches the address's suite. Never mutates the
+        // stored key; only the bytes handed to sign().
+        let sk: std::borrow::Cow<[u8]> = if crypto::parse_envelope(&self.private_key).is_some() {
+            std::borrow::Cow::Borrowed(&self.private_key)
+        } else {
+            let suite = crypto::parse_envelope(&self.public_key)
+                .map(|(s, _)| s)
+                .unwrap_or(crypto::SUITE_MLDSA65_FALCON1024);
+            std::borrow::Cow::Owned(crypto::wrap_envelope(suite, &self.private_key))
+        };
+        crypto::sign(&sk, msg).map_err(|e| e.to_string())
     }
 
     pub fn verify(pk: &[u8], msg: &[u8], sig: &[u8]) -> bool {
@@ -583,9 +596,14 @@ impl TxBuilder {
 
         let mut tx = Transaction { version: 1, inputs, outputs, locktime: 0 };
 
-        // Chain-id (Roadmap #8) from the keypair's address prefix (mainnet vs
-        // testnet) — must match the node validator's node_chain_id().
-        let chain_id = if keypair.address.starts_with(TESTNET_PREFIX) {
+        // Chain-id (Roadmap #8) — folded into every input's sighash, so it MUST
+        // match the node validator's node_chain_id() or the signature is rejected.
+        // Derived from the address prefix (mainnet/testnet) by default; override to
+        // Genesis-2 via BLOCH_GENESIS2=1 when signing for the SHA-256d carry-over
+        // chain (whose addresses keep the mainnet prefix but whose chain-id differs).
+        let chain_id = if std::env::var("BLOCH_GENESIS2").is_ok() {
+            crate::core::ChainId::Genesis2Devnet
+        } else if keypair.address.starts_with(TESTNET_PREFIX) {
             crate::core::ChainId::Testnet
         } else {
             crate::core::ChainId::Mainnet
@@ -637,3 +655,57 @@ fn derive_key(pw: &str, salt: &[u8]) -> Result<Vec<u8>, String> {
 #[cfg(feature = "wallet-cli")]
 pub mod cli;
 
+
+#[cfg(test)]
+mod legacy_sign_tests {
+    use super::*;
+    // A legacy-format key (raw sk, enveloped pk — the founder v2 shape) must sign and
+    // the signature must verify under the enveloped pubkey (the exact consensus check).
+    #[test]
+    fn legacy_raw_sk_signs_and_verifies() {
+        let (pk_env, sk_env) = crypto::generate_keypair(); // both enveloped
+        // strip the 4-byte envelope from the sk to simulate the legacy v2 keystore
+        let raw_sk = sk_env[4..].to_vec();
+        assert!(crypto::parse_envelope(&raw_sk).map(|(s,_)| s) != Some(0xB10C_u16) , "raw sk must look un-enveloped");
+        let kp = Keypair {
+            private_key: raw_sk,
+            public_key: pk_env.clone(),
+            address: crypto::address_from_pubkey(&pk_env, false),
+        };
+        let msg = b"experimental-tx-sighash";
+        let sig = kp.sign(msg).expect("legacy sign must succeed");
+        assert!(crypto::verify(&pk_env, msg, &sig), "signature must verify under enveloped pubkey");
+    }
+
+    /// THE founder case: a fully PRE-ENVELOPE wallet — RAW pubkey AND RAW privkey,
+    /// address = SHA3-256(raw pubkey) — must produce a spend that passes the node's
+    /// EXACT acceptance path (main.rs: pk_hash==script_pubkey AND crypto::verify).
+    #[test]
+    fn pre_envelope_founder_style_spend_verifies() {
+        use sha3::{Sha3_256, Digest};
+        let (pk_env, sk_env) = crypto::generate_keypair();
+        let raw_pk = pk_env[4..].to_vec();   // 3745 — like the founder pubkey
+        let raw_sk = sk_env[4..].to_vec();   // 6337 — like the founder privkey
+        // address the OLD chain stored: SHA3-256(RAW pubkey)[..20]
+        let script_pubkey = Sha3_256::digest(&raw_pk)[..20].to_vec();
+
+        let kp = Keypair {
+            private_key: raw_sk,
+            public_key: raw_pk.clone(),      // the CLI puts THIS raw pk in script_sig
+            address: crypto::address_from_pubkey(&raw_pk, false),
+        };
+        let sighash = b"genesis2-input-sighash";
+        let sig = kp.sign(sighash).expect("founder-style sign must succeed");
+
+        // Replicate the node's two consensus checks (src/main.rs:2764-2778):
+        // 1) pubkey hash matches the UTXO's script_pubkey
+        let pk_hash = Sha3_256::digest(&raw_pk)[..20].to_vec();
+        assert_eq!(pk_hash, script_pubkey, "raw pubkey must hash to the carry-over address");
+        // 2) crypto::verify accepts the raw pubkey + signature (the legacy fix)
+        assert!(crypto::verify(&raw_pk, sighash, &sig), "node verify must accept the pre-envelope spend");
+
+        // And a wrong key must still be rejected (no weakening).
+        let (other_env, _) = crypto::generate_keypair();
+        assert!(!crypto::verify(&other_env[4..], sighash, &sig), "a different pubkey must NOT verify");
+    }
+}
