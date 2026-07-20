@@ -8,6 +8,7 @@ members = [
     "crates/bloch-crypto",     # lean crypto/wallet/tx surface (extracted island)
     "crates/bloch-sis-pow", "crates/coherence-core", "crates/pqcrypto-internals",
     "crates/bloch-euvm", "crates/bloch-ffg",  # eUTXO VM + FFG committee (optional, behind `euvm` feature)
+    "crates/bloch-btc-wallet",
 ]
 # coherence-prover (SP1 guest/script/service) + fuzz use heavy/nightly-only
 # toolchains; keep them out of the everyday workspace build.
