@@ -1,0 +1,15 @@
+# ── Genesis-2 MINER (new app, no old-testnet reuse) — peers to node-8 bootstrap ─
+app = "blochv-g2-1"
+primary_region = "gru"
+
+[processes]
+  app = "--rpc-bind 0.0.0.0 --rpc-port 16210 --listen /ip6/::/tcp/16110 --data-dir /bloch-data --genesis2 --carryover-snapshot /carryover.tsv --mine --dns-seed blochv-node-8.internal --allow-private-peers"
+
+[mounts]
+  source = "bloch_data"
+  destination = "/bloch-data"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory = "1gb"
