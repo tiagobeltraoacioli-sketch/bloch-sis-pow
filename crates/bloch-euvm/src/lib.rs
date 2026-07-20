@@ -109,6 +109,10 @@ pub enum Op {
     Dup,
     Drop,
     Swap,
+    /// Copy the element `n` positions below the top to the top (`Pick(0)` == `Dup`).
+    /// Like Bitcoin's `OP_PICK` — lets a validator reach redeemer values that sit
+    /// under the datum (e.g. a pubkey/signature pair) without consuming them.
+    Pick(u8),
     Add,
     Sub,
     Mul,
@@ -227,6 +231,11 @@ pub fn run(
                 st.push(a);
                 st.push(b);
             }
+            Op::Pick(n) => {
+                let idx = st.len().checked_sub(1 + *n as usize).ok_or(VmError::StackUnderflow)?;
+                let v = st[idx].clone();
+                st.push(v);
+            }
             Op::Add => {
                 let b = as_int(pop!())?;
                 let a = as_int(pop!())?;
@@ -344,6 +353,7 @@ pub fn encode_program(program: &[Op]) -> Vec<u8> {
             Op::Dup => o.push(0x10),
             Op::Drop => o.push(0x11),
             Op::Swap => o.push(0x12),
+            Op::Pick(n) => { o.push(0x13); o.push(*n); }
             Op::Add => o.push(0x20),
             Op::Sub => o.push(0x21),
             Op::Mul => o.push(0x22),
@@ -710,6 +720,27 @@ mod tests {
         };
         let mut g3 = 1000;
         assert_eq!(spend(&input, &program, vec![], &escape, &noop, &mut g3), Err(VmError::Assert));
+    }
+
+    /// `Pick(n)` copies the n-th element below the top (Pick(0)==Dup) — lets a
+    /// validator reach redeemer values that sit under the datum.
+    #[test]
+    fn pick_reaches_under_top() {
+        let noop = MockVerifier { good: vec![] };
+        let ctx = Ctx::default();
+        // seed [10, 20, 30] (top=30); Pick(2) copies 10 → top; check == 10
+        let program = vec![Op::Pick(2), Op::PushInt(10), Op::Eq];
+        let mut g = 100;
+        assert_eq!(
+            run(&program, vec![Val::Int(10), Val::Int(20), Val::Int(30)], &ctx, &noop, &mut g),
+            Ok(true)
+        );
+        // Pick(0) == Dup
+        let mut g2 = 100;
+        assert_eq!(run(&vec![Op::Pick(0), Op::Eq], vec![Val::Int(7)], &ctx, &noop, &mut g2), Ok(true));
+        // Pick beyond the stack → underflow
+        let mut g3 = 100;
+        assert_eq!(run(&vec![Op::Pick(5)], vec![Val::Int(1)], &ctx, &noop, &mut g3), Err(VmError::StackUnderflow));
     }
 
     /// `validator_hash` is deterministic and distinguishes distinct programs.
