@@ -1442,13 +1442,13 @@ async fn main() {
                         .max()
                         .unwrap_or(0);
                     // ASERT-Lattice difficulty anchored at genesis (B5c): bits
-                    // are computed per-block from the parent timestamp, not read
-                    // from a windowed-retarget meta key. Genesis-2 uses a FIXED
-                    // devnet difficulty (must match accept_block's expected_bits).
+                    // are computed per-block from the parent timestamp. Genesis-2
+                    // uses a Bitcoin-style windowed retarget (must match
+                    // accept_block's expected_bits exactly).
                     let parent_ts = store_m.get_timestamp_at_height(h).ok().flatten()
                         .unwrap_or(core::GENESIS_TIMESTAMP);
                     let bits = if core::node_chain_id() == core::ChainId::Genesis2Devnet {
-                        core::GENESIS2_BITS
+                        genesis2_expected_bits(&store_m, h + 1)
                     } else {
                         pow::next_bits(core::GENESIS_BITS, core::GENESIS_TIMESTAMP, parent_ts, h + 1)
                     };
@@ -1646,8 +1646,15 @@ async fn main() {
                             s.mempool_size   = mem_m.size();
                         }
 
-                        // Difficulty is per-block ASERT-Lattice (B5c) — no
-                        // windowed retarget / current_bits meta write.
+                        // Difficulty is per-block ASERT-Lattice (B5c) on the SIS
+                        // chains — no current_bits write. Genesis-2 uses a
+                        // Bitcoin-style windowed retarget whose in-force value is
+                        // cached in current_bits; self-mined blocks don't route
+                        // through accept_block, so persist it HERE too or the
+                        // difficulty resets to the anchor every window.
+                        if core::node_chain_id() == core::ChainId::Genesis2Devnet {
+                            let _ = store_m.put_meta("current_bits", &block.header.bits.to_le_bytes());
+                        }
 
                         let confirmed: Vec<[u8;32]> = block.transactions.iter().map(|t| t.txid()).collect();
                         mem_m.remove_confirmed(&confirmed);
@@ -2107,6 +2114,29 @@ static FINALITY_FROZEN: std::sync::atomic::AtomicBool =
 static ARCHIVE_MODE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Genesis-2 Bitcoin-style difficulty: the `bits` a block at local `height` must
+/// carry. Difficulty holds constant within a DIFFICULTY_WINDOW and retargets on
+/// each window boundary from the wall time that window actually took (core::
+/// retarget_bits_g2, clamped ±4×). `current_bits` meta caches the in-force value
+/// — seeded at genesis, rewritten when a boundary block is accepted. The miner
+/// and the validator both call THIS, so their expected `bits` agree by
+/// construction (and a bought-hashrate spike ramps difficulty up each window).
+fn genesis2_expected_bits(store: &storage::Storage, height: u64) -> u32 {
+    let cur = store.get_meta("current_bits").ok().flatten()
+        .and_then(|b| <[u8; 4]>::try_from(b.as_slice()).ok())
+        .map(u32::from_le_bytes)
+        .unwrap_or(core::GENESIS2_BITS);
+    let window = core::GENESIS2_RETARGET_WINDOW;
+    if height >= window && height % window == 0 {
+        let first = store.get_timestamp_at_height(height - window).ok().flatten();
+        let last = store.get_timestamp_at_height(height - 1).ok().flatten();
+        if let (Some(first), Some(last)) = (first, last) {
+            return core::retarget_bits_g2(cur, last.saturating_sub(first));
+        }
+    }
+    cur
+}
+
 /// Validate TX contents, add block to DAG + storage, update UTXO set.
 /// Returns Ok(block_hash) on success.
 fn accept_block(
@@ -2140,7 +2170,7 @@ fn accept_block(
     let parent_ts = store.get_timestamp_at_height(block.height.saturating_sub(1))
         .ok().flatten().unwrap_or(core::GENESIS_TIMESTAMP);
     let expected_bits = if core::node_chain_id() == core::ChainId::Genesis2Devnet {
-        core::GENESIS2_BITS
+        genesis2_expected_bits(store, block.height)
     } else {
         pow::next_bits(
             core::GENESIS_BITS, core::GENESIS_TIMESTAMP, parent_ts, block.height,
@@ -2273,6 +2303,14 @@ fn accept_block(
     if let Err(e) = store.put_block(block) {
         dag.write().remove_block(&block_hash);
         return Err(e.to_string());
+    }
+
+    // Genesis-2 Bitcoin-style difficulty: persist the bits now in force so the
+    // NEXT block's expected_bits (genesis2_expected_bits) reads them. Within a
+    // window this rewrites the same value; a window-boundary block writes the new
+    // retargeted bits, so difficulty carries forward instead of resetting.
+    if core::node_chain_id() == core::ChainId::Genesis2Devnet {
+        let _ = store.put_meta("current_bits", &block.header.bits.to_le_bytes());
     }
 
     // ── Sprint U.4: disposition-based state application (closes C-1) ──

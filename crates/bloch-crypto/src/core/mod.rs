@@ -1859,6 +1859,13 @@ pub const GENESIS2_TIMESTAMP: u64 = 1_784_500_000;
 /// at real difficulty; the VALIDATION path is identical at any bits.
 pub const GENESIS2_BITS: u32 = 0x1f00ffff;
 
+/// Genesis-2 difficulty retarget window (blocks). Bitcoin-style windowed retarget
+/// (core::retarget_bits_g2), but SHORTER than Bitcoin's 2016 so a fresh chain
+/// onboarding real (bought) SHA-256 hashrate ramps difficulty quickly instead of
+/// flooding for a full 2016-block window at the anchor difficulty. 60 blocks ==
+/// 30 min at the 30 s target.
+pub const GENESIS2_RETARGET_WINDOW: u64 = 60;
+
 /// The mined Genesis-2 nonce (bloch-mine-genesis2 ceremony output). Upper 32
 /// bits are zero — only the low 32 enter the 80-byte mining header.
 /// PLACEHOLDER 0 until the devnet ceremony bakes the real value; the pinned
@@ -2041,14 +2048,43 @@ pub fn retarget_bits(old_bits: u32, elapsed_secs: u64) -> u32 {
     target_to_bits(&buf)
 }
 
+/// Genesis-2 Bitcoin-style retarget: identical math to [`retarget_bits`], but the
+/// pow-limit (easiest allowed target / lowest difficulty) is GENESIS2_BITS, the
+/// chain's own anchor, not the Module-SIS GENESIS_BITS. Called every
+/// DIFFICULTY_WINDOW blocks with the wall time elapsed over that window; miner and
+/// validator both route through it so their expected `bits` agree.
+pub fn retarget_bits_g2(old_bits: u32, elapsed_secs: u64) -> u32 {
+    use primitive_types::U256;
+
+    let target_secs = TARGET_BLOCK_TIME * GENESIS2_RETARGET_WINDOW;
+    let clamped = elapsed_secs
+        .max(target_secs / MAX_RETARGET_FACTOR)
+        .min(target_secs * MAX_RETARGET_FACTOR);
+
+    let old       = U256::from_big_endian(&bits_to_target(old_bits));
+    let pow_limit = U256::from_big_endian(&bits_to_target(GENESIS2_BITS));
+
+    let new = (old * U256::from(clamped) / U256::from(target_secs)).min(pow_limit);
+    target_to_bits(&new.to_big_endian())
+}
+
 fn target_to_bits(target: &[u8; 32]) -> u32 {
     let leading = target.iter().take_while(|&&b| b == 0).count();
-    let exp = 32 - leading;
+    let mut exp = 32 - leading;
     if exp < 3 { return 0x03000001; }
     let start = 32 - exp;
-    let mant = ((target[start] as u32) << 16)
+    let mut mant = ((target[start] as u32) << 16)
              | ((target.get(start + 1).copied().unwrap_or(0) as u32) << 8)
              | (target.get(start + 2).copied().unwrap_or(0) as u32);
+    // Bitcoin compact is SIGNED: if the mantissa's top bit is set (>= 0x800000),
+    // shift it down a byte and bump the exponent so the encoding is never mistaken
+    // for a negative target. Without this, a value like 0x1effff00 (mantissa
+    // 0xffff00) round-trips through the SIS sign-checking bits_to_target to a ZERO
+    // target → bits_to_work returns u128::MAX → blue_work overflow (consensus:1029).
+    if mant & 0x0080_0000 != 0 {
+        mant >>= 8;
+        exp += 1;
+    }
     ((exp as u32) << 24) | (mant & 0x00ff_ffff)
 }
 
