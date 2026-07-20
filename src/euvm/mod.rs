@@ -173,10 +173,141 @@ pub fn try_spend_input(
     bloch_euvm::spend(prev_output, validator, redeemer, &ctx, &NodePqVerifier, gas)
 }
 
+// ── Step 5.4 — block-level validation orchestration (still NOT in accept_block) ──
+//
+// Validates node transactions through the eUTXO model with PER-INPUT sighashes (each
+// input verifies its own sighash, unlike the single-ctx foundation `validate_tx`),
+// per-asset value conservation, and a per-tx + block gas ceiling. Prev-outputs and
+// the revealed validator program are supplied by resolvers, so this is pure and
+// testable without a UTXO store.
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EuvmTxError {
+    UnresolvedInput(usize),
+    ValueNotConserved,
+    ValidatorRejected(usize),
+    Vm(usize, bloch_euvm::VmError),
+    OutOfBlockGas,
+}
+
+/// Validate one node transaction. `resolve_prev(i)` returns the `ExtOutput` the i-th
+/// input spends; `resolve_validator(i)` returns the revealed validator program for
+/// that input; `redeemer(i)` supplies the redeemer values (e.g. `[pubkey, sig]`).
+/// Returns gas used.
+pub fn validate_tx_euvm<P, V, R>(
+    tx: &Transaction,
+    chain_id: ChainId,
+    mut resolve_prev: P,
+    mut resolve_validator: V,
+    mut redeemer: R,
+    gas_limit: u64,
+) -> Result<u64, EuvmTxError>
+where
+    P: FnMut(usize) -> Option<ExtOutput>,
+    V: FnMut(usize) -> Vec<Op>,
+    R: FnMut(usize) -> Vec<Val>,
+{
+    // resolve inputs
+    let mut prevs = Vec::with_capacity(tx.inputs.len());
+    for i in 0..tx.inputs.len() {
+        prevs.push(resolve_prev(i).ok_or(EuvmTxError::UnresolvedInput(i))?);
+    }
+    // per-asset value conservation: inputs == outputs + (BLCH fee). Fee is whatever
+    // BLCH is not carried to an output; every non-BLCH asset must balance exactly.
+    {
+        use std::collections::BTreeSet;
+        let mut assets: BTreeSet<[u8; 32]> = BTreeSet::new();
+        for p in &prevs { assets.extend(p.value.keys().copied()); }
+        for o in &tx.outputs { assets.insert(bloch_euvm::BLCH); let _ = o; }
+        assets.insert(bloch_euvm::BLCH);
+        let out_decoded: Vec<ExtOutput> = tx.outputs.iter().map(decode_output).collect();
+        for a in &assets {
+            let ins: u128 = prevs.iter().map(|p| bloch_euvm::value_get(&p.value, a) as u128).sum();
+            let outs: u128 = out_decoded.iter().map(|o| bloch_euvm::value_get(&o.value, a) as u128).sum();
+            if *a == bloch_euvm::BLCH {
+                if outs > ins { return Err(EuvmTxError::ValueNotConserved); } // fee = ins - outs >= 0
+            } else if ins != outs {
+                return Err(EuvmTxError::ValueNotConserved);
+            }
+        }
+    }
+    // run each input's validator with ITS OWN sighash
+    let mut gas = gas_limit;
+    for i in 0..tx.inputs.len() {
+        let ctx = build_ctx(tx, i, chain_id);
+        let validator = resolve_validator(i);
+        match bloch_euvm::spend(&prevs[i], &validator, redeemer(i), &ctx, &NodePqVerifier, &mut gas) {
+            Ok(true) => {}
+            Ok(false) => return Err(EuvmTxError::ValidatorRejected(i)),
+            Err(e) => return Err(EuvmTxError::Vm(i, e)),
+        }
+    }
+    Ok(gas_limit - gas)
+}
+
+/// Validate a block's transactions under a per-tx and block-wide gas ceiling.
+pub fn validate_block_euvm<F>(
+    txs: &[Transaction],
+    chain_id: ChainId,
+    mut resolver: F,
+    per_tx_gas: u64,
+    block_gas: u64,
+) -> Result<u64, (usize, EuvmTxError)>
+where
+    F: FnMut(usize, usize) -> Option<(ExtOutput, Vec<Op>, Vec<Val>)>,
+{
+    let mut total: u64 = 0;
+    for (ti, tx) in txs.iter().enumerate() {
+        // snapshot resolutions for this tx up front so the closures are simple
+        let mut resolved: Vec<Option<(ExtOutput, Vec<Op>, Vec<Val>)>> =
+            (0..tx.inputs.len()).map(|ii| resolver(ti, ii)).collect();
+        let used = validate_tx_euvm(
+            tx,
+            chain_id,
+            |i| resolved[i].as_ref().map(|r| r.0.clone()),
+            |i| resolved[i].as_ref().map(|r| r.1.clone()).unwrap_or_default(),
+            |i| resolved[i].as_ref().map(|r| r.2.clone()).unwrap_or_default(),
+            per_tx_gas,
+        )
+        .map_err(|e| (ti, e))?;
+        let _ = &mut resolved;
+        total = total.checked_add(used).ok_or((ti, EuvmTxError::OutOfBlockGas))?;
+        if total > block_gas {
+            return Err((ti, EuvmTxError::OutOfBlockGas));
+        }
+    }
+    Ok(total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use bloch_crypto::core::{TxInput, TxOutput as NodeOut, Transaction as NodeTx};
+
+    /// Build a real-PQ-signed 1-input tx spending `value` BLCH, plus its (prev, validator,
+    /// redeemer) resolution. Returns (tx, prev, validator, redeemer).
+    fn signed_tx(value: u64, out_value: u64, chain: ChainId) -> (NodeTx, ExtOutput, Vec<Op>, Vec<Val>) {
+        let (pk, sk) = bloch_crypto::crypto::generate_keypair();
+        let mut tx = NodeTx {
+            version: 1,
+            inputs: vec![TxInput { prev_txid: [1u8; 32], prev_index: 0, script_sig: vec![], sequence: 0xffff_ffff }],
+            outputs: vec![NodeOut { value: out_value, script_pubkey: vec![5u8; 20] }],
+            locktime: 0,
+        };
+        let sighash = tx.sighash(0, chain);
+        let sig = bloch_crypto::crypto::sign(&sk, &sighash).unwrap();
+        let mut ss = Vec::new();
+        ss.extend_from_slice(&(sig.len() as u32).to_le_bytes());
+        ss.extend_from_slice(&sig);
+        ss.extend_from_slice(&(pk.len() as u32).to_le_bytes());
+        ss.extend_from_slice(&pk);
+        tx.inputs[0].script_sig = ss.clone();
+        let validator = sig_check_validator();
+        let prev = ExtOutput { value: blch(value), validator_hash: validator_hash(&validator), datum: Val::Int(0) };
+        let (rsig, rpk) = bloch_crypto::core::Transaction::parse_script_sig(&ss).unwrap();
+        let redeemer = vec![Val::Bytes(rpk), Val::Bytes(rsig)];
+        (tx, prev, validator, redeemer)
+    }
 
     /// The adapter compiles and the activation gate is closed until the committee
     /// signs. (Uses a committee whose members carry no real keys, so a real quorum
@@ -288,5 +419,62 @@ mod tests {
         bad_tx.inputs[0].script_sig[l / 2] ^= 0xff;
         let mut gas2 = 100_000;
         assert_eq!(try_spend_input(&bad_tx, 0, &prev, &validator, chain, &mut gas2), Ok(false));
+    }
+
+    /// Step 5.4 — a whole tx validates through the block-level path: conservation
+    /// holds (100 in, 90 out, fee 10) and the real-PQ input validator accepts.
+    #[test]
+    fn tx_level_validation_real_pq() {
+        let chain = ChainId::Genesis2Devnet;
+        let (tx, prev, validator, redeemer) = signed_tx(100, 90, chain);
+        let used = validate_tx_euvm(
+            &tx, chain,
+            |_| Some(prev.clone()),
+            |_| validator.clone(),
+            |_| redeemer.clone(),
+            100_000,
+        );
+        assert!(used.is_ok(), "valid tx should pass: {used:?}");
+
+        // value not conserved: output 90 but claims prev only 80 (out > in) → reject
+        let bad = validate_tx_euvm(
+            &tx, chain,
+            |_| Some(ExtOutput { value: blch(80), validator_hash: prev.validator_hash, datum: Val::Int(0) }),
+            |_| validator.clone(),
+            |_| redeemer.clone(),
+            100_000,
+        );
+        assert_eq!(bad, Err(EuvmTxError::ValueNotConserved));
+
+        // unresolved input → reject
+        let un = validate_tx_euvm(&tx, chain, |_| None, |_| validator.clone(), |_| redeemer.clone(), 100_000);
+        assert_eq!(un, Err(EuvmTxError::UnresolvedInput(0)));
+    }
+
+    /// Step 5.4 — a block of two real-PQ-signed txs validates, and a block-gas
+    /// ceiling below the block's usage is rejected.
+    #[test]
+    fn block_level_validation_and_gas_ceiling() {
+        let chain = ChainId::Genesis2Devnet;
+        let (tx1, prev1, val1, red1) = signed_tx(100, 100, chain);
+        let (tx2, prev2, val2, red2) = signed_tx(50, 50, chain);
+        let txs = vec![tx1, tx2];
+        let resolutions = vec![(prev1, val1, red1), (prev2, val2, red2)];
+
+        // ample block gas → ok
+        let ok = validate_block_euvm(
+            &txs, chain,
+            |ti, _ii| Some(resolutions[ti].clone()),
+            100_000, 1_000_000,
+        );
+        assert!(ok.is_ok(), "block should validate: {ok:?}");
+
+        // block gas ceiling of 1 (each sig costs ~1000) → OutOfBlockGas
+        let starved = validate_block_euvm(
+            &txs, chain,
+            |ti, _ii| Some(resolutions[ti].clone()),
+            100_000, 1,
+        );
+        assert!(matches!(starved, Err((_, EuvmTxError::OutOfBlockGas))));
     }
 }
