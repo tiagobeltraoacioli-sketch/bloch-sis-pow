@@ -120,9 +120,9 @@ pub struct FeatureActivation {
 pub fn activation_message(a: &FeatureActivation) -> Vec<u8> {
     let mut h = Sha256::new();
     h.update(b"BLOCH-FFG-ACTIVATE-v1");
-    h.update(&(a.feature.len() as u32).to_le_bytes());
+    h.update((a.feature.len() as u32).to_le_bytes());
     h.update(a.feature.as_bytes());
-    h.update(&a.activation_height.to_le_bytes());
+    h.update(a.activation_height.to_le_bytes());
     h.finalize().to_vec()
 }
 
@@ -151,7 +151,7 @@ pub struct Checkpoint {
 pub fn checkpoint_message(cp: &Checkpoint) -> Vec<u8> {
     let mut h = Sha256::new();
     h.update(b"BLOCH-FFG-FINAL-v1");
-    h.update(&cp.height.to_le_bytes());
+    h.update(cp.height.to_le_bytes());
     h.update(cp.block_hash);
     h.finalize().to_vec()
 }
@@ -186,7 +186,7 @@ pub fn replacement_message(seat: u8, candidate_pubkey: &[u8]) -> Vec<u8> {
     let mut h = Sha256::new();
     h.update(b"BLOCH-FFG-REPLACE-v1");
     h.update([seat]);
-    h.update(&(candidate_pubkey.len() as u32).to_le_bytes());
+    h.update((candidate_pubkey.len() as u32).to_le_bytes());
     h.update(candidate_pubkey);
     h.finalize().to_vec()
 }
