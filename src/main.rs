@@ -1556,26 +1556,28 @@ async fn main() {
                     pow_solution: Vec::new(),
                     shielded_transactions: Vec::new(),                };
 
-                // Bloch-SIS PoW (B5b-2b): mine a Module-SIS solution. The
-                // preimage excludes the nonce (the miner varies the nonce
-                // internally); on success we attach the solution vector as the
-                // block's PoW witness.
-                //
-                // Soft fork SF-1: the residual width is selected by the height
-                // of the block BEING MINED (tip + 1), matching what
-                // Block::validate_pow will check on acceptance — k = 4 below
-                // CANONICAL_K_ACTIVATION_HEIGHT, k = 8 at/above it.
+                // Chain-selectable PoW: route through the SAME dispatcher the
+                // validator uses (pow::mine_pow_parallel → pow_algorithm), so the
+                // miner and Block::validate_pow provably agree. On a Module-SIS
+                // chain this grinds the SIS witness (SF-1 residual width by the
+                // height of the block being mined); on a SHA-256d chain
+                // (Genesis-2) it grinds the header nonce and returns an EMPTY
+                // witness — which is what the SHA-256d validate_pow arm requires.
+                // Using mine_sis_pow_parallel directly here was a bug: it grinds a
+                // SIS solution on EVERY chain, so a Genesis-2 node could never
+                // produce a valid block (its witness must be empty) and stayed at
+                // genesis forever.
                 let preimage = block.header.pow_preimage();
                 let bits = block.header.bits;
                 let mine_height = block.height;
                 let mined = tokio::task::spawn_blocking(move || {
-                    pow::mine_sis_pow_parallel(&preimage, bits, mine_height, 0, 50_000_000, mine_threads)
+                    pow::mine_pow_parallel(&preimage, bits, mine_height, 0, 50_000_000, mine_threads)
                 }).await;
 
                 match mined {
                     Ok(Some((nonce, solution))) => {
                         block.header.nonce = nonce;
-                        block.pow_solution = solution.to_vec();
+                        block.pow_solution = solution;
                         let hash = block.block_hash();
                         info!("⛏  Block found! h={} {}", block.height, hex::encode(&hash[..8]));
 
