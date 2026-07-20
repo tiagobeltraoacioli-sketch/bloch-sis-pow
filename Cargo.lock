@@ -1484,6 +1484,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloch-btc-wallet"
+version = "0.0.1"
+dependencies = [
+ "bitcoin",
+ "bloch-crypto",
+ "bloch-euvm",
+]
+
+[[package]]
 name = "bloch-crypto"
 version = "0.1.0-genesis"
 dependencies = [

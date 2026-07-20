@@ -1,0 +1,14 @@
+# bloch-btc-wallet — FOUNDATION: derive standard Bitcoin addresses AND a companion
+# post-quantum keypair from ONE seed (a "quantum-ready" hybrid wallet identity).
+# STANDALONE (own [workspace]); not wired into the node.
+[package]
+name = "bloch-btc-wallet"
+version = "0.0.1"
+edition = "2021"
+description = "Postern wallet: BTC address derivation + companion ML-DSA/Falcon PQ key from one seed"
+license = "MIT"
+
+[dependencies]
+bitcoin = "0.32"
+bloch-crypto = { path = "../bloch-crypto" }
+bloch-euvm = { path = "../bloch-euvm" }
