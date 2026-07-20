@@ -8,7 +8,5 @@ edition = "2021"
 description = "Static FFG committee: 14-of-21 finality + committee-governed feature activation (foundation, not consensus-wired)"
 license = "MIT"
 
-[workspace]
-
 [dependencies]
 sha2 = "0.10"
