@@ -94,10 +94,17 @@ pub struct Ctx {
 }
 
 /// Host-provided signature verification. Kept outside the VM so the machine stays
-/// pure/deterministic and unit-testable; production plugs the real PQ verifier in.
+/// pure/deterministic and unit-testable; production plugs the real verifiers in.
 pub trait SigVerifier {
-    /// Verify `sig` over `msg` under `pubkey`. MUST be deterministic.
+    /// Verify a post-quantum `sig` (hybrid ML-DSA-65 ‖ Falcon-1024) over `msg` under
+    /// `pubkey`. MUST be deterministic.
     fn verify(&self, msg: &[u8], pubkey: &[u8], sig: &[u8]) -> bool;
+    /// Verify a **secp256k1 ECDSA** `sig` (the Bitcoin curve) over `msg` under
+    /// `pubkey`. Enables hybrid BTC-key + PQ-key validators (wBTC-PQ, §5-sexies).
+    /// Default returns false so verifiers that only do PQ are unaffected.
+    fn verify_ecdsa(&self, _msg: &[u8], _pubkey: &[u8], _sig: &[u8]) -> bool {
+        false
+    }
 }
 
 /// The instruction set (minimal but real: arithmetic, comparison, hashing, context,
@@ -129,6 +136,9 @@ pub enum Op {
     CtxField(u8),
     /// pop sig, pop pubkey, pop msg; push Int(1) if the host verifier accepts, else 0.
     VerifySig,
+    /// Like [`Op::VerifySig`] but verifies a **secp256k1 ECDSA** (Bitcoin) signature
+    /// via `SigVerifier::verify_ecdsa`. Enables hybrid BTC-key + PQ-key validators.
+    VerifyEcdsa,
     /// pop top; if not truthy, abort with [`VmError::Assert`].
     Verify,
     /// push `ctx.tx_outputs[i].datum` (the state of the i-th created output).
@@ -164,7 +174,7 @@ pub enum VmError {
 /// are cheap. (Illustrative schedule for the foundation.)
 fn gas_cost(op: &Op) -> u64 {
     match op {
-        Op::VerifySig => 1000,
+        Op::VerifySig | Op::VerifyEcdsa => 1000,
         Op::Sha256d | Op::Shake256 => 60,
         Op::Mul | Op::Add | Op::Sub => 4,
         _ => 1,
@@ -298,6 +308,12 @@ pub fn run(
                 let msg = as_bytes(pop!())?;
                 st.push(Val::Int(verifier.verify(&msg, &pk, &sig) as i128));
             }
+            Op::VerifyEcdsa => {
+                let sig = as_bytes(pop!())?;
+                let pk = as_bytes(pop!())?;
+                let msg = as_bytes(pop!())?;
+                st.push(Val::Int(verifier.verify_ecdsa(&msg, &pk, &sig) as i128));
+            }
             Op::Verify => {
                 let top = pop!();
                 if !top.truthy()? {
@@ -365,6 +381,7 @@ pub fn encode_program(program: &[Op]) -> Vec<u8> {
             Op::Size => o.push(0x42),
             Op::CtxField(i) => { o.push(0x50); o.push(*i); }
             Op::VerifySig => o.push(0x60),
+            Op::VerifyEcdsa => o.push(0x62),
             Op::Verify => o.push(0x61),
             Op::TxOutDatum(i) => { o.push(0x70); o.push(*i); }
             Op::TxOutValidator(i) => { o.push(0x71); o.push(*i); }
@@ -526,6 +543,48 @@ mod tests {
         fn verify(&self, msg: &[u8], pk: &[u8], sig: &[u8]) -> bool {
             self.good.iter().any(|(m, p, s)| m == msg && p == pk && s == sig)
         }
+        // ECDSA mock: accept if the sig equals b"ECDSA:" ‖ pk (distinct from PQ path).
+        fn verify_ecdsa(&self, _msg: &[u8], pk: &[u8], sig: &[u8]) -> bool {
+            let mut e = b"ECDSA:".to_vec();
+            e.extend_from_slice(pk);
+            sig == e.as_slice()
+        }
+    }
+
+    /// Hybrid BTC(ECDSA) + Bloch(PQ) 2-of-2 validator: BOTH must verify to spend.
+    /// This is the wBTC-PQ guard — a BTC key and a post-quantum key together (§5-sexies).
+    #[test]
+    fn hybrid_ecdsa_and_pq_validator() {
+        let msg = b"sighash".to_vec();
+        let btc_pk = b"btc-pubkey".to_vec();
+        let pq_pk = b"pq-pubkey".to_vec();
+        let pq_sig = b"pq-sig".to_vec();
+        let mut btc_sig = b"ECDSA:".to_vec();
+        btc_sig.extend_from_slice(&btc_pk);
+
+        // validator: VerifyEcdsa(msg, btc_pk, btc_sig) AND VerifySig(msg, pq_pk, pq_sig)
+        let program = vec![
+            Op::CtxField(0), Op::PushBytes(btc_pk.clone()), Op::PushBytes(btc_sig.clone()), Op::VerifyEcdsa, Op::Verify,
+            Op::CtxField(0), Op::PushBytes(pq_pk.clone()), Op::PushBytes(pq_sig.clone()), Op::VerifySig,
+        ];
+        let ctx = Ctx { fields: vec![Val::Bytes(msg.clone())], ..Default::default() };
+        let v = MockVerifier { good: vec![(msg.clone(), pq_pk.clone(), pq_sig.clone())] };
+        let mut g = 5000;
+        assert_eq!(run(&program, vec![], &ctx, &v, &mut g), Ok(true)); // both good → spend
+
+        // PQ sig missing → the AND fails
+        let v_no_pq = MockVerifier { good: vec![] };
+        let mut g2 = 5000;
+        assert_eq!(run(&program, vec![], &ctx, &v_no_pq, &mut g2), Ok(false));
+
+        // BTC sig wrong → VerifyEcdsa's assertion fails
+        let bad_btc = {
+            let mut p = program.clone();
+            p[2] = Op::PushBytes(b"wrong".to_vec());
+            p
+        };
+        let mut g3 = 5000;
+        assert_eq!(run(&bad_btc, vec![], &ctx, &v, &mut g3), Err(VmError::Assert));
     }
 
     fn sha256d(b: &[u8]) -> Vec<u8> {
