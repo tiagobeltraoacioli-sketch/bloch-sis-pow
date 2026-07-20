@@ -344,6 +344,11 @@ pub struct NetworkConfig {
     /// (which would graylist the whole mesh at ~6 peers from one IP and
     /// silently blackhole every tip announcement). All other scoring stays.
     pub behind_proxy: bool,
+    /// Enable mDNS zero-config LAN peer discovery. OFF by default: public nodes
+    /// bootstrap via explicit `--peer` / `--dns-seed`, and mDNS (a) is useless off
+    /// a LAN and (b) exercises hickory-proto's mDNS record parser (RUSTSEC-2026-0118/
+    /// 0119 — LAN-only DoS surface). Turn on only for local/dev zero-config discovery.
+    pub enable_mdns: bool,
 }
 
 impl Default for NetworkConfig {
@@ -356,6 +361,7 @@ impl Default for NetworkConfig {
             data_dir:        PathBuf::from("./bloch-data"),
             allow_private_peers: false,
             behind_proxy:    false,
+            enable_mdns:     false,
         }
     }
 }
@@ -371,7 +377,9 @@ impl Default for NetworkConfig {
 #[derive(libp2p::swarm::NetworkBehaviour)]
 struct BlochBehaviour {
     gossipsub: gossipsub::Behaviour,
-    mdns:      mdns::tokio::Behaviour,
+    // Toggle: mDNS is present only when `--enable-mdns` is set (off by default).
+    // Disabled → the hickory-proto mDNS parser is never exercised (RUSTSEC-2026-0118/0119).
+    mdns:      libp2p::swarm::behaviour::toggle::Toggle<mdns::tokio::Behaviour>,
     identify:  identify::Behaviour,
     // P0 (roadmap §1.3 / §4.1): swarm-level connection limits. `max_peers` was
     // previously only an app-side counter checked in the PEX/mDNS dial paths,
@@ -539,6 +547,7 @@ impl NetworkNode {
         // Captured for the connection-limits behaviour below (avoids borrowing
         // `self` inside the `with_behaviour` closure).
         let max_peers = self.config.max_peers;
+        let enable_mdns = self.config.enable_mdns;
 
         let mut swarm = SwarmBuilder::with_existing_identity(self.local_key.clone())
             .with_tokio()
@@ -559,10 +568,17 @@ impl NetworkNode {
             .await
             .map_err(|e| NetworkError::StartFailed(e.to_string()))?
             .with_behaviour(|key| {
-                let mdns = mdns::tokio::Behaviour::new(
-                    mdns::Config::default(),
-                    key.public().to_peer_id(),
-                )?;
+                // mDNS only when explicitly enabled; otherwise a disabled Toggle
+                // (its record parser — the hickory-proto DoS surface — never runs).
+                let mdns: libp2p::swarm::behaviour::toggle::Toggle<mdns::tokio::Behaviour> =
+                    if enable_mdns {
+                        Some(mdns::tokio::Behaviour::new(
+                            mdns::Config::default(),
+                            key.public().to_peer_id(),
+                        )?).into()
+                    } else {
+                        None.into()
+                    };
                 let identify = identify::Behaviour::new(
                     identify::Config::new("/bloch-sis/1.0.0".into(), key.public()),
                 );

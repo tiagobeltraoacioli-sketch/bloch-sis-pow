@@ -156,6 +156,10 @@ struct Cli {
     /// every tip announcement. Disables only that weight; all other peer
     /// scoring stays active. Non-consensus — purely an operator knob.
     #[arg(long)]                                         behind_proxy: bool,
+    /// Enable mDNS zero-config LAN peer discovery (OFF by default). Public nodes
+    /// bootstrap via --peer/--dns-seed and should leave this off — mDNS is useless
+    /// off a LAN and exercises a DNS-record parser with known LAN-only DoS CVEs.
+    #[arg(long)]                                         enable_mdns: bool,
     /// Maximum peer connections (inbound cap). Raise this on a well-provisioned
     /// bootstrap / hub node so newcomers aren't rejected once the cap fills;
     /// keep it modest on a leaf node. Non-consensus — purely an operator knob.
@@ -740,6 +744,7 @@ async fn main() {
         data_dir:        data_path.clone(),
         allow_private_peers: cli.allow_private_peers,
         behind_proxy:    cli.behind_proxy,
+        enable_mdns:     cli.enable_mdns,
     };
     let node = match network::NetworkNode::new(net_cfg) {
         Ok(n)  => { info!("P2P: {}", n.peer_id); n }
