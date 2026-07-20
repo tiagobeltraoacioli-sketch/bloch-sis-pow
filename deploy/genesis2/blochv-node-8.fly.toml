@@ -1,22 +1,13 @@
-# ── Genesis-2 ARCHIVAL node (TEMPLATE — NOT deployed) ────────────────────────
-# Role: the ONE archival relay that makes the Genesis-2 network joinable.
-#   --archive        pruning disabled; retains every block body so fresh nodes
-#                    can bootstrap (a pruned node cannot — see 0792a07).
-#   --genesis2       chain-id Genesis2Devnet (SHA-256d PoW, carry-over ledger).
-#   --carryover-snapshot  the blessed UTXO TSV, verified fail-closed at first boot
-#                    against the baked-in root/count/supply. MUST be present on the
-#                    volume at this path BEFORE first boot (see deploy/genesis2/README).
-# No --mine here on purpose: the archival node's job is to SERVE history, and
-# Postern-operated mining concentrates hashrate under one operator (honesty note
-# carried from the testnet configs).
-#
-# BLOCKED until: (1) the Genesis-2 genesis block is defined (main.rs genesis gate),
-# and (2) carryover.tsv exists (gated on the 408k carry-over verification).
+# ── Genesis-2 BOOTSTRAP + ARCHIVAL node ──────────────────────────────────────
+# The one node that (a) mines the first blocks so the fresh chain starts, and
+# (b) --archive keeps every block body so new nodes can bootstrap (a pruned node
+# cannot). NO --dns-seed/--peer: it does not wait to "see the network tip", so it
+# mines as soon as a peer connects (the miner fleet peers TO it via Fly DNS).
 app = "blochv-node-8"
 primary_region = "gru"
 
 [processes]
-  app = "--rpc-bind 0.0.0.0 --rpc-port 16210 --listen /ip4/0.0.0.0/tcp/16110 --data-dir /bloch-data --genesis2 --carryover-snapshot /bloch-data/carryover.tsv --archive --dns-seed blochv-node.internal --allow-private-peers"
+  app = "--rpc-bind 0.0.0.0 --rpc-port 16210 --listen /ip6/::/tcp/16110 --data-dir /bloch-data --genesis2 --carryover-snapshot /carryover.tsv --archive --mine --allow-private-peers"
 
 [mounts]
   source = "bloch_data"

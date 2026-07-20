@@ -1,14 +1,12 @@
-# ── Genesis-2 MINER node (TEMPLATE — NOT deployed) ───────────────────────────
-# Identical role to node-7: sync off the archival node-8, then --mine at tip.
-# Peers over Fly's PRIVATE 6PN address (blochv-node.internal).
-# HONESTY: another Postern-operated miner = more hashrate under ONE operator.
-#
-# BLOCKED until: Genesis-2 genesis defined + carryover.tsv present on the volume.
+# ── Genesis-2 MINER node (peers to the fleet over Fly private DNS) ────────────
+# Fresh SHA-256d chain: ingests the carry-over ledger at first boot, syncs off
+# the fleet, and mines. HONESTY: Postern-operated miners = ONE operator; this
+# concentrates hashrate and does NOT decentralize.
 app = "blochv-node-10"
 primary_region = "gru"
 
 [processes]
-  app = "--rpc-bind 0.0.0.0 --rpc-port 16210 --listen /ip4/0.0.0.0/tcp/16110 --data-dir /bloch-data --genesis2 --carryover-snapshot /bloch-data/carryover.tsv --mine --dns-seed blochv-node.internal --allow-private-peers"
+  app = "--rpc-bind 0.0.0.0 --rpc-port 16210 --listen /ip4/0.0.0.0/tcp/16110 --data-dir /bloch-data --genesis2 --carryover-snapshot /carryover.tsv --mine --dns-seed blochv-node.internal --allow-private-peers"
 
 [mounts]
   source = "bloch_data"

@@ -2,7 +2,7 @@
 # Fresh SHA-256d chain: ingests the carry-over ledger at first boot, syncs off
 # the fleet, and mines. HONESTY: Postern-operated miners = ONE operator; this
 # concentrates hashrate and does NOT decentralize.
-app = "blochv-node-7"
+app = "blochv-node-9"
 primary_region = "gru"
 
 [processes]
