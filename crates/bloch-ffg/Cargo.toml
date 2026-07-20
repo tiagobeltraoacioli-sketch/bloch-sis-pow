@@ -1,0 +1,14 @@
+# bloch-ffg — FOUNDATION of the static FFG committee (study §4-bis) + committee-
+# governed feature activation (§5-quater step 6). STANDALONE and NOT wired into node
+# consensus; the empty [workspace] table keeps it out of the node build.
+[package]
+name = "bloch-ffg"
+version = "0.0.1"
+edition = "2021"
+description = "Static FFG committee: 14-of-21 finality + committee-governed feature activation (foundation, not consensus-wired)"
+license = "MIT"
+
+[workspace]
+
+[dependencies]
+sha2 = "0.10"
