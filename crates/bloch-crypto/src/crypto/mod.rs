@@ -45,7 +45,7 @@ pub const SUITE_MLDSA65_ONLY: u16 = 0x0002;
 /// Parse the 4-byte suite envelope header. `None` on any malformation
 /// (len < 4 or bad magic) — the caller MUST treat `None` as invalid (`false`),
 /// never a panic. The returned body is everything after the header.
-fn parse_envelope(b: &[u8]) -> Option<(u16, &[u8])> {
+pub(crate) fn parse_envelope(b: &[u8]) -> Option<(u16, &[u8])> {
     if b.len() < SUITE_HEADER_LEN { return None; }
     if b[0] != SUITE_MAGIC[0] || b[1] != SUITE_MAGIC[1] { return None; }
     let suite = u16::from_le_bytes([b[2], b[3]]);
@@ -53,7 +53,7 @@ fn parse_envelope(b: &[u8]) -> Option<(u16, &[u8])> {
 }
 
 /// Prepend the 4-byte suite header (`magic ‖ suite_id LE`) to a body.
-fn wrap_envelope(suite: u16, body: &[u8]) -> Vec<u8> {
+pub(crate) fn wrap_envelope(suite: u16, body: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(SUITE_HEADER_LEN + body.len());
     out.extend_from_slice(&SUITE_MAGIC);
     out.extend_from_slice(&suite.to_le_bytes());
@@ -162,18 +162,28 @@ pub fn sign(secret_key_bytes: &[u8], message: &[u8]) -> Result<Vec<u8>, CryptoEr
     }
 }
 
+/// Parse a suite envelope, or fall back to the LEGACY pre-envelope encoding:
+/// carry-over wallets created before the 4-byte header (their address is
+/// `SHA3-256(raw hybrid pubkey)`) present a bare `mldsa ‖ falcon` body with no
+/// magic. Treat a no-magic object as suite 0x0001 (hybrid), the only suite the
+/// old chain produced. A genuine hybrid pubkey/sig never starts with `B1 0C`
+/// (those are ML-DSA bytes), so this is unambiguous; a mismatch still ⇒ verify
+/// false via the body checks. This restores spendability of pre-envelope
+/// carry-over funds without weakening enveloped verification. CONSENSUS-CRITICAL.
+fn parse_envelope_or_legacy(b: &[u8]) -> (u16, &[u8]) {
+    match parse_envelope(b) {
+        Some((suite, body)) => (suite, body),
+        None => (SUITE_MLDSA65_FALCON1024, b),
+    }
+}
+
 pub fn verify(public_key_bytes: &[u8], message: &[u8], signature_bytes: &[u8]) -> bool {
-    // Suite-ID dispatch (design §2.3). Strip the 4-byte header on BOTH the pk
-    // and the sig; a pk of one suite must not verify a sig of another. Any parse
-    // failure ⇒ false, never a panic (consensus rule). NO security is claimed.
-    let (pk_suite, pk_body) = match parse_envelope(public_key_bytes) {
-        Some(x) => x,
-        None => { debug!("crypto::verify: pubkey envelope parse failed (len={})", public_key_bytes.len()); return false; }
-    };
-    let (sig_suite, sig_body) = match parse_envelope(signature_bytes) {
-        Some(x) => x,
-        None => { debug!("crypto::verify: sig envelope parse failed (len={})", signature_bytes.len()); return false; }
-    };
+    // Suite-ID dispatch (design §2.3). Accepts enveloped objects AND legacy
+    // pre-envelope (raw hybrid) objects from the carry-over. A pk of one suite
+    // must not verify a sig of another. Any body parse failure ⇒ false, never a
+    // panic (consensus rule). NO security is claimed.
+    let (pk_suite, pk_body) = parse_envelope_or_legacy(public_key_bytes);
+    let (sig_suite, sig_body) = parse_envelope_or_legacy(signature_bytes);
     if pk_suite != sig_suite {
         debug!("crypto::verify: suite mismatch (pk={:#06x}, sig={:#06x})", pk_suite, sig_suite);
         return false;
