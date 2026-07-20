@@ -132,6 +132,47 @@ pub fn build_ctx(tx: &Transaction, input_index: usize, chain_id: ChainId) -> EuC
     }
 }
 
+// ── Step 5.3 — run a validator end-to-end with the REAL PQ verifier ───────────
+//
+// Extract (sig, pubkey) from a node `script_sig` and run a validator that checks
+// the signature over the input's sighash through [`NodePqVerifier`] — i.e. the VM
+// verifies signatures with the exact hybrid ML-DSA-65 ‖ Falcon-1024 consensus rule.
+// Still NOT called from accept_block.
+
+/// A minimal signature-checking validator: verify one PQ signature over the input's
+/// sighash. The output is spent with redeemer `[pubkey, sig]`, so `spend` seeds the
+/// stack `[datum, pubkey, sig]` (top = sig). VerifySig needs `[msg, pubkey, sig]`
+/// (top = sig), so we push msg and use `Pick` to copy pubkey and sig above it —
+/// leaving the redeemer intact underneath.
+pub fn sig_check_validator() -> Vec<Op> {
+    vec![
+        // stack: [datum, pubkey, sig]
+        Op::CtxField(0), // -> [datum, pubkey, sig, msg]
+        Op::Pick(2),     // copy pubkey -> [datum, pubkey, sig, msg, pubkey]
+        Op::Pick(2),     // copy sig    -> [datum, pubkey, sig, msg, pubkey, sig]
+        Op::VerifySig,   // pops sig,pubkey,msg -> [datum, pubkey, sig, result]
+    ]
+}
+
+/// Try to authorize spending `input` of `tx` under `prev_output`, using the revealed
+/// `(sig, pubkey)` from the input's `script_sig` and the real PQ verifier. Returns
+/// whether the validator accepts. Pure — no consensus side effects.
+pub fn try_spend_input(
+    tx: &Transaction,
+    input_index: usize,
+    prev_output: &ExtOutput,
+    validator: &[Op],
+    chain_id: ChainId,
+    gas: &mut u64,
+) -> Result<bool, bloch_euvm::VmError> {
+    let ctx = build_ctx(tx, input_index, chain_id);
+    let (sig, pk) = bloch_crypto::core::Transaction::parse_script_sig(&tx.inputs[input_index].script_sig)
+        .unwrap_or((Vec::new(), Vec::new()));
+    // redeemer supplies pubkey then sig on top of the datum
+    let redeemer = vec![Val::Bytes(pk), Val::Bytes(sig)];
+    bloch_euvm::spend(prev_output, validator, redeemer, &ctx, &NodePqVerifier, gas)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,5 +248,45 @@ mod tests {
         assert_eq!(ctx.tx_outputs[1].value, blch(200));
         // sighash is deterministic
         assert_eq!(build_ctx(&tx, 0, ChainId::Genesis2Devnet).fields, ctx.fields);
+    }
+
+    /// Step 5.3 — END TO END with a REAL hybrid ML-DSA-65‖Falcon-1024 key: a validator
+    /// verifies a real signature over the real sighash through NodePqVerifier. This is
+    /// the exact consensus signature rule, running inside the VM.
+    #[test]
+    fn real_pq_signature_verifies_through_vm() {
+        let (pk, sk) = bloch_crypto::crypto::generate_keypair();
+        let chain = ChainId::Genesis2Devnet;
+
+        // a 1-input tx; sign its sighash and pack (sig, pk) into the script_sig.
+        let mut tx = NodeTx {
+            version: 1,
+            inputs: vec![TxInput { prev_txid: [1u8; 32], prev_index: 0, script_sig: vec![], sequence: 0xffff_ffff }],
+            outputs: vec![NodeOut { value: 100, script_pubkey: vec![5u8; 20] }],
+            locktime: 0,
+        };
+        let sighash = tx.sighash(0, chain);
+        let sig = bloch_crypto::crypto::sign(&sk, &sighash).expect("sign");
+        // script_sig layout parsed by parse_script_sig: [sig_len|sig|pk_len|pk]
+        let mut ss = Vec::new();
+        ss.extend_from_slice(&(sig.len() as u32).to_le_bytes());
+        ss.extend_from_slice(&sig);
+        ss.extend_from_slice(&(pk.len() as u32).to_le_bytes());
+        ss.extend_from_slice(&pk);
+        tx.inputs[0].script_sig = ss;
+
+        let validator = sig_check_validator();
+        let prev = ExtOutput { value: blch(100), validator_hash: validator_hash(&validator), datum: Val::Int(0) };
+
+        // valid signature → validator accepts
+        let mut gas = 100_000;
+        assert_eq!(try_spend_input(&tx, 0, &prev, &validator, chain, &mut gas), Ok(true));
+
+        // tamper the signature → validator rejects (real verifier says no)
+        let mut bad_tx = tx.clone();
+        let l = bad_tx.inputs[0].script_sig.len();
+        bad_tx.inputs[0].script_sig[l / 2] ^= 0xff;
+        let mut gas2 = 100_000;
+        assert_eq!(try_spend_input(&bad_tx, 0, &prev, &validator, chain, &mut gas2), Ok(false));
     }
 }
