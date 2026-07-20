@@ -1,0 +1,24 @@
+# ── Genesis-2 MINER node (TEMPLATE — NOT deployed) ───────────────────────────
+# Phase 1 = sync as relay off the archival node (node-8), then --mine once at tip.
+# Peers to node-8 over Fly's PRIVATE 6PN address (blochv-node.internal); same-org
+# Fly machines cannot reach a peer's PUBLIC ip (hairpin NAT).
+#   --genesis2 + --carryover-snapshot: same fail-closed carry-over as the archival
+#   node; every Genesis-2 node ingests the SAME blessed set at first boot.
+# HONESTY: Postern-operated miners on Fly = ONE operator; adding them CONCENTRATES
+# hashrate and does NOT decentralize.
+#
+# BLOCKED until: Genesis-2 genesis defined + carryover.tsv present on the volume.
+app = "blochv-node-7"
+primary_region = "gru"
+
+[processes]
+  app = "--rpc-bind 0.0.0.0 --rpc-port 16210 --listen /ip4/0.0.0.0/tcp/16110 --data-dir /bloch-data --genesis2 --carryover-snapshot /bloch-data/carryover.tsv --mine --dns-seed blochv-node.internal --allow-private-peers"
+
+[mounts]
+  source = "bloch_data"
+  destination = "/bloch-data"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory = "1gb"
