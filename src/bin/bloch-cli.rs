@@ -131,7 +131,7 @@ fn main() {
 
         // ── Wallet: send (builds + signs + broadcasts) ─────────────
         "send" => {
-            require_params(params, 3, "send <wallet.json> <to_address> <amount_bloch> [--fee 0.001]");
+            require_params(params, 3, "send <wallet.json> <to_address> <amount_bloch> [--fee 0.001] [--chain genesis2|mainnet|testnet]");
             do_send(params, &rpc_host, rpc_port);
             return;
         }
@@ -346,15 +346,34 @@ fn do_send(params: &[&str], rpc_host: &str, rpc_port: u16) {
 
     // Parse fee (default 0.001 BLOCH)
     let mut fee_bloch: f64 = 0.001;
+    // Chain-id to sign for. The sighash folds in the chain-id, so signing for
+    // the wrong one yields a SILENTLY-rejected tx ("invalid signature"). The
+    // LIVE network is Genesis-2, so default to it (previously the wallet fell
+    // back to Mainnet/Testnet by address prefix and required BLOCH_GENESIS2=1).
+    // Override with `--chain mainnet|testnet|genesis2`.
+    let mut chain: String = "genesis2".to_string();
     let mut i = 3;
     while i < params.len() {
         if params[i] == "--fee" && i + 1 < params.len() {
             fee_bloch = params[i + 1].parse().unwrap_or_else(|_| die("invalid fee"));
             i += 2;
+        } else if params[i] == "--chain" && i + 1 < params.len() {
+            chain = params[i + 1].to_lowercase();
+            i += 2;
         } else {
             i += 1;
         }
     }
+    // The wallet's TxBuilder derives the sighash chain-id from BLOCH_GENESIS2
+    // (set => Genesis2Devnet; unset => Testnet/Mainnet by address prefix). Fold
+    // the --chain choice into it, and always print it so the choice is visible.
+    match chain.as_str() {
+        "genesis2" | "g2" => std::env::set_var("BLOCH_GENESIS2", "1"),
+        "mainnet" | "testnet" => { std::env::remove_var("BLOCH_GENESIS2"); }
+        other => die(&format!(
+            "unknown --chain '{}': use genesis2 | mainnet | testnet", other)),
+    }
+    println!("Signing for chain: {}", chain);
 
     let amount_sats = bloch_to_sats(amount_str);
     let fee_sats = (fee_bloch * 1e8) as u64;

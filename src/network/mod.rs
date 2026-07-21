@@ -6,6 +6,7 @@
 //! Sprint P: PEX hardening (rate limit, address validation, known_peers cap).
 
 pub mod pex_validator;
+pub mod sync_rr;
 
 use libp2p::{
     identity, identify, mdns, PeerId, Multiaddr,
@@ -128,7 +129,7 @@ impl NetworkMessage {
         }
     }
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncEntry {
     pub hash:       [u8; 32],
     pub blue_score: u64,
@@ -430,6 +431,10 @@ pub struct NetworkConfig {
     /// a LAN and (b) exercises hickory-proto's mDNS record parser (RUSTSEC-2026-0118/
     /// 0119 — LAN-only DoS surface). Turn on only for local/dev zero-config discovery.
     pub enable_mdns: bool,
+    /// Announce-then-pull: this node runs with `--archive` (full block bodies
+    /// retained, never pruned). Advertised to peers via the identify
+    /// agent-version so they prefer us as the directed-pull source during IBD.
+    pub archive: bool,
 }
 
 impl Default for NetworkConfig {
@@ -443,6 +448,7 @@ impl Default for NetworkConfig {
             allow_private_peers: false,
             behind_proxy:    false,
             enable_mdns:     false,
+            archive:         false,
         }
     }
 }
@@ -462,6 +468,11 @@ struct BlochBehaviour {
     // Disabled → the hickory-proto mDNS parser is never exercised (RUSTSEC-2026-0118/0119).
     mdns:      libp2p::swarm::behaviour::toggle::Toggle<mdns::tokio::Behaviour>,
     identify:  identify::Behaviour,
+    // Announce-then-pull: directed IBD PULL path (GetBlock/GetHeaders/GetTips)
+    // over libp2p request-response (`/bloch/sync/1`), so block/header FETCHING
+    // is a directed request to ONE peer instead of a gossipsub broadcast to the
+    // whole mesh (removes the O(peers) IBD amplification). See `sync_rr`.
+    sync_rr:   sync_rr::Behaviour,
     // P0 (roadmap §1.3 / §4.1): swarm-level connection limits. `max_peers` was
     // previously only an app-side counter checked in the PEX/mDNS dial paths,
     // so inbound connection floods / eclipse setup were NOT bounded by libp2p.
@@ -521,6 +532,11 @@ impl NetworkNode {
         mut outbound_rx: mpsc::Receiver<NetworkMessage>,
         dag:            std::sync::Arc<parking_lot::RwLock<crate::consensus::GhostDAG>>,
         peer_state:     std::sync::Arc<crate::sync::peer_state::PeerStateTable>,
+        // Announce-then-pull: the network loop serves inbound directed
+        // GetBlock pulls straight from the block store (bodies live here, not
+        // in the DAG), replying to the ONE requesting peer over
+        // request-response — no gossip, no O(peers) fan-out.
+        store:          std::sync::Arc<crate::storage::Storage>,
         listen_report:  Option<mpsc::UnboundedSender<Multiaddr>>,
     ) -> Result<(), NetworkError> {
         use std::time::Instant;
@@ -641,6 +657,7 @@ impl NetworkNode {
         // `self` inside the `with_behaviour` closure).
         let max_peers = self.config.max_peers;
         let enable_mdns = self.config.enable_mdns;
+        let archive = self.config.archive;
 
         let mut swarm = SwarmBuilder::with_existing_identity(self.local_key.clone())
             .with_tokio()
@@ -672,8 +689,16 @@ impl NetworkNode {
                     } else {
                         None.into()
                     };
+                // Announce-then-pull: advertise our archival status in the
+                // identify agent-version (`bloch/<ver>/a|n`). We deliberately do
+                // NOT add a field to the gossip `Version` frame — that would
+                // change the bincode wire layout and break a mixed old/new
+                // fleet — whereas the identify agent-version is a plain string
+                // old binaries simply don't parse. Peers read it to prefer an
+                // archival peer for directed IBD pulls (see sync_rr).
                 let identify = identify::Behaviour::new(
-                    identify::Config::new("/bloch-sis/1.0.0".into(), key.public()),
+                    identify::Config::new("/bloch-sis/1.0.0".into(), key.public())
+                        .with_agent_version(sync_rr::agent_version(archive)),
                 );
                 // Cap connections at the swarm layer to match max_peers. We
                 // allow 2× established total for churn/reconnect headroom, but
@@ -693,6 +718,7 @@ impl NetworkNode {
                     gossipsub: gs,
                     mdns,
                     identify,
+                    sync_rr: sync_rr::new_behaviour(),
                     connection_limits,
                 })
             })
@@ -807,6 +833,17 @@ impl NetworkNode {
         const MDNS_DIAL_LIMIT: usize = 8; // max LAN peers auto-dialed per mDNS event
         let mut observed_by: std::collections::HashMap<Multiaddr, std::collections::HashSet<PeerId>> =
             std::collections::HashMap::new();
+        // Announce-then-pull: per-peer sync hints (highest announced blue_score
+        // + archival bit) used to pick the ONE peer a directed IBD pull goes to,
+        // the set of explicitly-configured `--peer`s, and the in-flight directed
+        // requests (so a request that fails — peer doesn't speak /bloch/sync/1,
+        // dial/timeout — can be re-published on gossip for a mixed fleet).
+        let mut peer_sync: std::collections::HashMap<PeerId, sync_rr::PeerSync> =
+            std::collections::HashMap::new();
+        let explicit_peers = sync_rr::explicit_peer_ids(&self.config.bootstrap_peers);
+        let mut inflight_pull: std::collections::HashMap<
+            libp2p::request_response::OutboundRequestId, NetworkMessage> =
+            std::collections::HashMap::new();
         let mut heartbeat   = tokio::time::interval(Duration::from_secs(30));
         let mut save_peers  = tokio::time::interval(Duration::from_secs(60));
         // Sprint CC: periodic tip announce. Re-publishes the current
@@ -871,6 +908,9 @@ impl NetworkNode {
                                         debug!("← tip from {} score={}", peer_id, blue_score);
                                         // Phase-2: record the untrusted announced hint (no tips).
                                         peer_state.observe(propagation_source, *blue_score, *height, &[], Instant::now());
+                                        // Announce-then-pull: track highest announced score
+                                        // for directed-pull peer selection.
+                                        track_peer_score(&mut peer_sync, propagation_source, *blue_score);
                                     }
                                     NetworkMessage::Headers { entries } =>
                                         info!("← {} headers", entries.len()),
@@ -883,6 +923,7 @@ impl NetworkNode {
                                             .max_by_key(|(s, _)| *s)
                                             .unwrap_or((0, 0));
                                         peer_state.observe(propagation_source, bs, ht, &hashes, Instant::now());
+                                        track_peer_score(&mut peer_sync, propagation_source, bs);
                                     }
                                     NetworkMessage::Version { version, user_agent, blue_score, height, .. } => {
                                         if *version < MIN_PROTOCOL_VERSION {
@@ -892,6 +933,7 @@ impl NetworkNode {
                                         }
                                         // Phase-2: record the untrusted announced hint (no tips).
                                         peer_state.observe(propagation_source, *blue_score, *height, &[], Instant::now());
+                                        track_peer_score(&mut peer_sync, propagation_source, *blue_score);
                                     }
                                     NetworkMessage::PeerRequest => {
                                         let mut my_peers: Vec<String> = known_peers.iter().cloned().collect();
@@ -1123,6 +1165,9 @@ impl NetworkNode {
                             peer_count = peer_count.saturating_sub(1);
                             crate::metrics::set_peer_count(peer_count as i64);
                             peer_state.on_disconnect(&peer_id);
+                            // Announce-then-pull: drop the peer from directed-pull
+                            // candidates (only fires on the LAST connection to it).
+                            peer_sync.remove(&peer_id);
                         }
                         SwarmEvent::NewListenAddr { address, .. } => {
                             info!("listening: {}/p2p/{}", address, self.peer_id);
@@ -1203,12 +1248,77 @@ impl NetworkNode {
                             // rate-limit / batch-cap / dial-confirmation guards and
                             // let a peer inject a victim IP dialed on every boot.
                             // Peer discovery goes exclusively through hardened PEX.
+                            //
+                            // Announce-then-pull: learn the peer's archival bit
+                            // from its identify agent-version so directed IBD
+                            // pulls prefer an archival peer. Old binaries don't
+                            // advertise it → archival stays unknown (fine).
+                            if let Some(arch) = sync_rr::parse_archival_agent(&info.agent_version) {
+                                peer_sync.entry(peer_id).or_default().archival = Some(arch);
+                            }
                         }
+                        // ── Announce-then-pull: directed IBD sync ────────────
+                        SwarmEvent::Behaviour(BlochBehaviourEvent::SyncRr(ev)) => match ev {
+                            libp2p::request_response::Event::Message { peer, message, .. } => match message {
+                                // We are the SERVER: a peer directed a pull at
+                                // us. Serve it from our DAG + block store and
+                                // reply to THAT peer only (no gossip fan-out).
+                                libp2p::request_response::Message::Request { request, channel, .. } => {
+                                    let resp = serve_sync_request(&dag, &store, &request);
+                                    if swarm.behaviour_mut().sync_rr.send_response(channel, resp).is_err() {
+                                        debug!("sync_rr: response channel closed for {}", peer);
+                                    }
+                                }
+                                // We are the CLIENT: our directed pull was
+                                // answered. Feed the answer into the SAME ingest
+                                // channel the gossip path uses, so main.rs
+                                // processes fetched blocks/headers unchanged.
+                                libp2p::request_response::Message::Response { request_id, response } => {
+                                    inflight_pull.remove(&request_id);
+                                    let _ = block_tx.try_send(sync_rr::response_to_message(response));
+                                }
+                            },
+                            // Directed pull failed: peer doesn't speak
+                            // /bloch/sync/1, dial failed, or timed out. Degrade
+                            // gracefully — re-publish the request on the gossip
+                            // sync topic so an OLD-binary peer can still answer.
+                            libp2p::request_response::Event::OutboundFailure { peer, request_id, error, .. } => {
+                                if let Some(m) = inflight_pull.remove(&request_id) {
+                                    debug!("directed pull [{}] to {} failed ({}); falling back to gossip",
+                                        m.kind_name(), peer, error);
+                                    publish_gossip(&mut swarm, &sync_t, &m);
+                                }
+                            }
+                            _ => {}
+                        },
                         _ => {}
                     }
                 }
 
                 Some(msg) = outbound_rx.recv() => {
+                    // Announce-then-pull: IBD FETCH requests (GetBlock /
+                    // GetHeaders / GetTips) are DIRECTED to one selected peer
+                    // over request-response, NOT broadcast to the gossip mesh.
+                    // This is the fix for the O(peers × blocks) IBD
+                    // amplification that saturated the gossipsub send queue and
+                    // stalled block propagation. Everything else (PeerTip,
+                    // Version, NewBlock, NewTransaction, and the RESPONSE frames
+                    // Headers/Tips/BlockNotFound that answer legacy gossip
+                    // requesters) stays on gossip exactly as before.
+                    if let Some(req) = sync_rr::as_pull_request(&msg) {
+                        match sync_rr::select_pull_peer(&peer_sync, &explicit_peers) {
+                            Some(peer) => {
+                                let id = swarm.behaviour_mut().sync_rr.send_request(&peer, req);
+                                debug!("→ directed pull [{}] to {}", msg.kind_name(), peer);
+                                inflight_pull.insert(id, msg);
+                            }
+                            // No peer to direct to yet (very early boot). Fall
+                            // back to the legacy gossip request so it still goes
+                            // out; a connected peer will answer.
+                            None => publish_gossip(&mut swarm, &sync_t, &msg),
+                        }
+                        continue;
+                    }
                     let (topic, topic_name) = match &msg {
                         NetworkMessage::NewBlock { .. }        => (block_t.clone(), "blocks"),
                         NetworkMessage::NewTransaction { .. }  => (tx_t.clone(),    "txs"),
@@ -1489,6 +1599,84 @@ pub fn build_current_tip(
         peer_id:    peer_id.to_string(),
         blue_score: d.tip_blue_score(),
         height:     d.block_count() as u64,
+    }
+}
+
+// ── Announce-then-pull: directed sync helpers ────────────────────────────────
+
+/// Record a peer's highest announced `blue_score` for directed-pull selection.
+/// Monotonic (never lowers a known score) and preserves any known archival bit.
+fn track_peer_score(
+    peer_sync: &mut std::collections::HashMap<PeerId, sync_rr::PeerSync>,
+    peer: PeerId,
+    blue_score: u64,
+) {
+    let e = peer_sync.entry(peer).or_default();
+    if blue_score > e.blue_score {
+        e.blue_score = blue_score;
+    }
+}
+
+/// Publish a message on the gossip sync topic (used for the very-early-boot and
+/// mixed-fleet graceful-degradation fallbacks of the directed pull path).
+fn publish_gossip(
+    swarm: &mut libp2p::Swarm<BlochBehaviour>,
+    topic: &IdentTopic,
+    msg:   &NetworkMessage,
+) {
+    if let Ok(data) = bincode::serde::encode_to_vec(msg, bincode::config::standard()) {
+        if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), data) {
+            debug!("gossip fallback publish [{}]: {}", msg.kind_name(), e);
+        }
+    }
+}
+
+/// Serve an inbound directed `SyncRequest` from our DAG + block store. This is
+/// the SERVER side of announce-then-pull: block bodies live in the store (not
+/// the DAG), headers/tips come from the DAG — exactly the same sources the
+/// legacy gossip responders in `main.rs` read, so the answers are identical;
+/// only the transport (directed request-response vs. gossip broadcast) differs.
+fn serve_sync_request(
+    dag:   &std::sync::Arc<parking_lot::RwLock<crate::consensus::GhostDAG>>,
+    store: &std::sync::Arc<crate::storage::Storage>,
+    req:   &sync_rr::SyncRequest,
+) -> sync_rr::SyncResponse {
+    use sync_rr::{SyncRequest, SyncResponse};
+    match req {
+        SyncRequest::GetBlock { block_hash } => match store.get_block(block_hash) {
+            Ok(Some(block)) => SyncResponse::Block {
+                block_hash: *block_hash,
+                blue_score: block.blue_score,
+                height:     block.height,
+                block_data: block.to_bitcoin_bytes(),
+            },
+            // Pruned or unknown — answer explicitly (same semantics as the
+            // gossip BlockNotFound) so the requester tries another peer.
+            _ => SyncResponse::BlockNotFound { block_hash: *block_hash },
+        },
+        SyncRequest::GetHeaders { from_blue_score, limit } => {
+            let d = dag.read();
+            let entries: Vec<SyncEntry> = d
+                .ordered_hashes_from(*from_blue_score, *limit as usize)
+                .iter()
+                .filter_map(|h| d.get_node(h).map(|n| SyncEntry {
+                    hash: *h, blue_score: n.blue_score, height: n.height,
+                }))
+                .collect();
+            SyncResponse::Headers { entries }
+        }
+        SyncRequest::GetTips => {
+            let d = dag.read();
+            let tips: Vec<SyncEntry> = d
+                .tips()
+                .iter()
+                .filter_map(|h| d.get_node(h).map(|n| SyncEntry {
+                    hash: *h, blue_score: n.blue_score, height: n.height,
+                }))
+                .collect();
+            let locator = crate::sync::locator::build_locator(&d.selected_chain());
+            SyncResponse::Tips { tips, locator }
+        }
     }
 }
 

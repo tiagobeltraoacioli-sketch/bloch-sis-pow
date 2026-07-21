@@ -745,6 +745,7 @@ async fn main() {
         allow_private_peers: cli.allow_private_peers,
         behind_proxy:    cli.behind_proxy,
         enable_mdns:     cli.enable_mdns,
+        archive:         cli.archive,
     };
     let node = match network::NetworkNode::new(net_cfg) {
         Ok(n)  => { info!("P2P: {}", n.peer_id); n }
@@ -1972,7 +1973,7 @@ async fn main() {
             ) => { error!("RPC exited"); }
         // Sprint EE (S3): `None` = no listen-addr report; production behavior
         // is byte-identical to before the harness affordance was added.
-        _ = node.run(block_tx, outbound_rx, dag.clone(), peer_state.clone(), None) => {
+        _ = node.run(block_tx, outbound_rx, dag.clone(), peer_state.clone(), store.clone(), None) => {
             error!("Network exited");
         }
     }
