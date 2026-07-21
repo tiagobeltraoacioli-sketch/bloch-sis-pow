@@ -1851,16 +1851,17 @@ async fn main() {
     // The authority keypair at --sv2-cert-path is auto-generated on
     // first run and must be preserved across restarts -- its fingerprint
     // is what miners pin. Losing it invalidates all miner trust.
-    if cli.sv2_enable {
-        // Sprint B5f: same as Stratum V1 — the SV2 SubmitShares message carries
-        // no Module-SIS solution vector, so it cannot produce valid Bloch-SIS
-        // blocks. Refuse to start; solo mining (--mine) uses the SIS miner.
+    if cli.sv2_enable
+        && matches!(core::pow_algorithm(core::node_chain_id()), core::PowAlgorithm::ModuleSis)
+    {
+        // The SV2 SubmitShares message carries no Module-SIS solution vector,
+        // so it cannot produce valid Bloch-SIS blocks. Under SHA-256d
+        // (Genesis-2) SV2 works like V1 (standard shares) and IS enabled below.
         error!("stratum V2 mining is unsupported under Module-SIS PoW (no share \
-                field for the lattice solution). Use solo mining (--mine). \
-                A SIS-native pool protocol is future work (see B5f).");
+                field for the lattice solution). Use solo mining (--mine).");
         std::process::exit(1);
     }
-    if false {
+    if cli.sv2_enable {
         let sv2_bind: std::net::SocketAddr = match cli.sv2_addr.parse() {
             Ok(a)  => a,
             Err(e) => {
@@ -1969,7 +1970,9 @@ async fn main() {
                 // B5f pool seam: submitblock hook (see rpc::SubmitBlockFn).
                 Some(rpc_submit_block.clone()),
             ) => { error!("RPC exited"); }
-        _ = node.run(block_tx, outbound_rx, dag.clone(), peer_state.clone()) => {
+        // Sprint EE (S3): `None` = no listen-addr report; production behavior
+        // is byte-identical to before the harness affordance was added.
+        _ = node.run(block_tx, outbound_rx, dag.clone(), peer_state.clone(), None) => {
             error!("Network exited");
         }
     }

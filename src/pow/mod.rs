@@ -289,7 +289,10 @@ pub fn mine_pow_parallel(
                 .map(|(nonce, solution)| (nonce, solution.to_vec()))
         }
         PowAlgorithm::Sha256d => {
-            mine_sha256d_preimage(preimage, bits, start_nonce, max_attempts, threads)
+            // Height-gated endianness fork: grind for Bitcoin little-endian at
+            // and above the fork height so the mined block validates.
+            let little_endian = height >= bloch_crypto::core::SHA256D_LE_FORK_HEIGHT;
+            mine_sha256d_preimage(preimage, bits, start_nonce, max_attempts, threads, little_endian)
                 .map(|nonce| (nonce, Vec::new()))
         }
     }

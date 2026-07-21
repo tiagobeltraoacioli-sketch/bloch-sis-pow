@@ -197,10 +197,14 @@ impl SessionRegistry {
         Self { sessions: Mutex::new(Vec::new()), max }
     }
 
-    /// Attempt to register. Returns true if under the cap.
+    /// Attempt to register. Returns true if under the cap. The cap counts only
+    /// LIVE (non-Dead) sessions: under ttl:2 churn a burst of sessions can be
+    /// mid-teardown (Dead, but still registered during their up-to-2s writer
+    /// join) — counting those would spuriously reject fresh MRR connections.
     pub fn register(&self, s: Arc<Session>) -> bool {
         let mut g = self.sessions.lock();
-        if g.len() >= self.max { return false; }
+        let live = g.iter().filter(|x| !x.is_dead()).count();
+        if live >= self.max { return false; }
         g.push(s);
         true
     }
@@ -213,6 +217,13 @@ impl SessionRegistry {
 
     pub fn len(&self) -> usize {
         self.sessions.lock().len()
+    }
+
+    /// Count of LIVE (non-Dead) sessions — the number that counts against the
+    /// connection cap. Excludes sessions in teardown so they don't starve
+    /// fresh connections under ttl:2 churn.
+    pub fn live_len(&self) -> usize {
+        self.sessions.lock().iter().filter(|s| !s.is_dead()).count()
     }
 
     pub fn is_empty(&self) -> bool { self.len() == 0 }
@@ -244,6 +255,34 @@ pub async fn run(
     config:         StratumConfig,
     mut tip_rx:     broadcast::Receiver<TipChanged>,
 ) -> std::io::Result<()> {
+    // ── Consensus safety guard (fail-closed) ──────────────────────────
+    // The stratum server produces SHA-256d work: an 80-byte MiningHeader
+    // and an EMPTY `pow_solution`. A node validates a block with the PoW
+    // algorithm `pow_algorithm(node_chain_id())` selects — and ONLY
+    // Genesis2Devnet maps to Sha256d. On any other chain-id (the default
+    // when the node is launched without `--genesis2` is Mainnet ⇒
+    // ModuleSis) the validator takes the Module-SIS arm, which requires a
+    // 256-element `pow_solution`, and rejects EVERY block this server
+    // mines as "invalid PoW" — silently burning all connected hashrate
+    // (the ASIC symptom). The stratum's own share check is hard-coded
+    // SHA-256d, so it accepts the share and only accept_block rejects it:
+    // a self-inconsistent node. This is a startup misconfiguration, not a
+    // runtime condition, so fail loud instead of mining un-acceptable work.
+    let cid = crate::core::node_chain_id();
+    if cid != crate::core::ChainId::Genesis2Devnet {
+        error!(
+            "stratum: refusing to start — node chain-id is {:?}, but the SHA-256d \
+             stratum requires Genesis2Devnet. Blocks would be mined as SHA-256d yet \
+             validated as Module-SIS and rejected ('invalid PoW'), wasting all \
+             hashrate. Restart the node with --genesis2.",
+            cid
+        );
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "stratum requires --genesis2 (Sha256d PoW); refusing to mine un-acceptable blocks",
+        ));
+    }
+
     info!("stratum: binding {} mode={}", config.bind_addr, config.mode);
     let listener = TcpListener::bind(config.bind_addr).await?;
     info!("stratum: listening on {}", config.bind_addr);
@@ -267,7 +306,7 @@ pub async fn run(
                         let id = next_session_id;
                         next_session_id += 1;
 
-                        if registry.len() >= config.max_sessions {
+                        if registry.live_len() >= config.max_sessions {
                             warn!("stratum: rejecting {} — session cap {} reached",
                                 peer_addr, config.max_sessions);
                             drop(socket);
@@ -309,15 +348,19 @@ pub async fn run(
             evt = tip_rx.recv() => {
                 match evt {
                     Ok(tip) => {
-                        let n_sessions = registry.len();
-                        info!("stratum: tip changed to h={} (notifying {} sessions)",
-                            tip.height, n_sessions);
+                        // Count what we will actually notify: the authorized
+                        // subset (a session with no miner address gets no
+                        // template). Logging registry.len() here used to
+                        // mislabel the notify fan-out.
+                        let authorized = registry.authorized_sessions();
+                        info!("stratum: tip changed to h={} (notifying {} authorized of {} sessions)",
+                            tip.height, authorized.len(), registry.len());
                         // Sprint 2.d: rebuild template per authorized session
                         // (each session has its own miner_spk in the coinbase
                         // output). clean_jobs=true so miners abandon the old
                         // work — it can no longer win at the new height.
                         if let Some(ref ctx) = config.node_ctx {
-                            for s in registry.authorized_sessions() {
+                            for s in authorized {
                                 if let Err(reason) = session::install_fresh_template(&s, ctx, true) {
                                     warn!("stratum: session {} tip-change reinstall failed: {}",
                                           s.id, reason);

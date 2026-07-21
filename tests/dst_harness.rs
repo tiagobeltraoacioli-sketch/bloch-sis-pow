@@ -307,3 +307,85 @@ async fn scenario_panicking_processor_restarts_with_backoff() {
     assert!(n_panics >= 6, "expected repeated panics to be caught, got {n_panics}");
     assert_eq!(n_processed, good, "processor must resume after each restart");
 }
+
+// ── Scenario 5: equivocation — two conflicting blocks at one height ───────────
+//
+// Sprint EE (S3) addition. An equivocating miner produces TWO children of the
+// same parent (same height, conflicting "versions" of the next block) and shows
+// a different one first to each side of the network. GhostDAG is a DAG, so both
+// blocks are legitimately ACCEPTED (they are siblings in each other's anticone)
+// — equivocation here is not slashable double-signing but a fork-choice attack
+// surface: the property that must hold is that every node, regardless of WHICH
+// equivocating block it saw first, converges to the IDENTICAL selected tip,
+// selected chain, and blue classification once it has seen both. Identical
+// state means the equivocation bought the attacker nothing.
+//
+// This drives the REAL consensus type (bloch::consensus::GhostDAG), not the
+// SimBlock tip model above. The transport-level version of the same scenario
+// (blocks delivered through a live gossipsub mesh) lives in
+// tests/sprint_ee_transport_convergence.rs.
+
+#[test]
+fn scenario_equivocation_conflicting_blocks_converge() {
+    use bloch::consensus::GhostDAG;
+
+    fn h(n: u8) -> [u8; 32] {
+        let mut b = [0u8; 32];
+        b[0] = n;
+        b
+    }
+
+    // 4 sim nodes, each a real GhostDAG with the same genesis.
+    let n = 4usize;
+    let mut dags: Vec<GhostDAG> = (0..n)
+        .map(|_| {
+            let mut d = GhostDAG::with_k(3);
+            d.add_genesis(h(0), 0);
+            d
+        })
+        .collect();
+
+    // Honest prefix: G <- 1 <- 2 on every node.
+    for d in dags.iter_mut() {
+        d.add_block(h(1), vec![h(0)], 1, 1_000).expect("honest block 1");
+        d.add_block(h(2), vec![h(1)], 2, 1_000).expect("honest block 2");
+    }
+
+    // Equivocation: 0xA3 and 0xB3 are BOTH children of block 2 — same height,
+    // conflicting. Even-indexed nodes see 0xA3 first; odd-indexed see 0xB3
+    // first. The "heal" is the later arrival of the other equivocating block.
+    let eq_a = h(0xA3);
+    let eq_b = h(0xB3);
+    for (i, d) in dags.iter_mut().enumerate() {
+        let (first, second) = if i % 2 == 0 { (eq_a, eq_b) } else { (eq_b, eq_a) };
+        d.add_block(first, vec![h(2)], 3, 1_000).expect("equivocating block (first seen)");
+        d.add_block(second, vec![h(2)], 3, 1_000).expect("equivocating block (second seen)");
+    }
+
+    // An honest successor merges both equivocating tips (the normal DAG miner
+    // behavior: point at every known tip), forcing blue/red classification of
+    // the equivocation pair on every node.
+    for d in dags.iter_mut() {
+        d.add_block(h(4), vec![eq_a, eq_b], 4, 1_000).expect("merge block");
+    }
+
+    // Convergence: byte-identical fork choice and coloring on all nodes,
+    // regardless of equivocation arrival order.
+    let tip0 = dags[0].selected_tip();
+    let chain0 = dags[0].selected_chain();
+    let score0 = dags[0].tip_blue_score();
+    assert!(tip0.is_some(), "reference node must have a tip");
+    for (i, d) in dags.iter().enumerate() {
+        assert_eq!(d.selected_tip(), tip0, "node {i}: selected tip diverged");
+        assert_eq!(d.selected_chain(), chain0, "node {i}: selected chain diverged");
+        assert_eq!(d.tip_blue_score(), score0, "node {i}: blue score diverged");
+        for id in [h(0), h(1), h(2), eq_a, eq_b, h(4)] {
+            assert_eq!(
+                d.is_blue(&id),
+                dags[0].is_blue(&id),
+                "node {i}: blue/red classification diverged for block {:02x}",
+                id[0]
+            );
+        }
+    }
+}

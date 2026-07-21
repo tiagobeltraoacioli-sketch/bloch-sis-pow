@@ -30,12 +30,24 @@ use log::{info, warn};
 
 use crate::core::{
     Block, BlockHeader, MerkleRoot, MiningHeader, Transaction,
-    bits_to_target, hash_meets_target,
+    bits_to_target, hash_meets_target, sha256d_pow_valid,
+    difficulty_to_target, difficulty_from_bits,
 };
 
 use super::jobs::{walk_merkle_branch, stratum_txid_of_bytes};
 use super::protocol::{ErrorCode, StratumError, StratumRequest, StratumResponse};
-use super::session::Session;
+use super::session::{Session, MAX_JOB_ID_LEN};
+
+/// True iff big-endian target `a` is >= `b` (i.e. `a` is EASIER-or-equal:
+/// any hash meeting `b` also meets `a`). Used to enforce, in target space,
+/// the consensus-firewall invariant that a share is never harder than a block.
+fn target_ge(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    for (x, y) in a.iter().zip(b.iter()) {
+        if x > y { return true; }
+        if x < y { return false; }
+    }
+    true
+}
 
 /// Callback invoked on a valid share. The implementer (typically
 /// main.rs wiring) does:
@@ -81,6 +93,14 @@ pub fn handle_submit(
             StratumError::new(ErrorCode::Other, "job_id must be string")),
     };
 
+    // Bound job_id length BEFORE it is stored in the dedup set — a legit id
+    // ('{sid:x}-{height}-{ctr:x}') is well under the cap; a longer one is an
+    // attacker padding the per-session dedup set for memory amplification.
+    if job_id.len() > MAX_JOB_ID_LEN {
+        return StratumResponse::error(id,
+            StratumError::new(ErrorCode::JobNotFoundOrStale, "job_id too long"));
+    }
+
     let en2_hex = match params[2].as_str() {
         Some(s) => s.to_string(),
         None    => return StratumResponse::error(id,
@@ -125,7 +145,10 @@ pub fn handle_submit(
     //    Note: we check duplicate BEFORE template lookup so that repeated
     //    submissions against a just-evicted job still get error-22
     //    (not error-21), matching miner expectations.
-    if session.record_submission(&job_id, &en2_hex, &nonce_hex).is_err() {
+    //    ntime is part of the key: cpuminer rolls ntime by default, so two
+    //    submissions differing only in ntime are DISTINCT solutions and must
+    //    not collide as false duplicates.
+    if session.record_submission(&job_id, &en2_hex, &ntime_hex, &nonce_hex).is_err() {
         return StratumResponse::error(id,
             StratumError::new(ErrorCode::DuplicateShare, "duplicate share"));
     }
@@ -182,14 +205,44 @@ pub fn handle_submit(
         nonce,
     };
 
-    let hash   = mh.pow_hash();
-    let target = bits_to_target(template.bits);
-    if !hash_meets_target(&hash, &target) {
-        // Low-difficulty share: hash above target. In solo mode this
-        // is always an error (pool mode would accept it against a
-        // weaker share target).
+    let hash         = mh.pow_hash();
+    let block_target = bits_to_target(template.bits);   // consensus target — NEVER derived from share diff
+    let net_diff     = difficulty_from_bits(template.bits);
+
+    // DUAL-TARGET. The share target is the miner-facing accept bound; the
+    // block target is the consensus bound. The share is capped to be no harder
+    // than a block (share_diff <= net_diff), and the cap is re-enforced in
+    // TARGET space below so rounding can never make the share harder than the
+    // block: a hash meeting the block target ALWAYS meets the share target.
+    let eff_share_diff = session.share_difficulty().min(net_diff);
+    let share_target_raw = difficulty_to_target(eff_share_diff);
+    let share_target = if target_ge(&share_target_raw, &block_target) {
+        share_target_raw
+    } else {
+        block_target
+    };
+
+    // (a) SHARE GATE (weak) — the miner-facing accept/reject. Height-gated
+    //     endianness: post-fork the hash is compared Bitcoin little-endian, so
+    //     a standard SHA-256 miner's share is accepted (the whole point of the
+    //     fork). Pre-fork it stays legacy big-endian.
+    if !sha256d_pow_valid(&hash, &share_target, template.height) {
         return StratumResponse::error(id,
             StratumError::new(ErrorCode::LowDifficulty, "share above target"));
+    }
+
+    // (b) Accounting + vardiff: count the accepted share and, if the window
+    //     criteria are met, retarget and push a fresh mining.set_difficulty
+    //     now (ordered before any subsequent notify by the FIFO channel).
+    if let Some(new_diff) = session.record_share_and_maybe_retarget(net_diff) {
+        let _ = session.send_set_difficulty(new_diff);
+    }
+
+    // (c) BLOCK GATE (strong) — solo semantics preserved. A valid share that
+    //     is NOT a block returns success WITHOUT assembling a Block or calling
+    //     accept_block. Same height-gated endianness as the consensus check.
+    if !sha256d_pow_valid(&hash, &block_target, template.height) {
+        return StratumResponse::ok(id, Value::from(true));
     }
 
     // 11. Share meets the block target: this IS a block. Assemble the
@@ -214,11 +267,15 @@ pub fn handle_submit(
         shielded_transactions: Vec::new(),    };
 
     // Sanity: the assembled block's pow_hash must equal mh.pow_hash.
-    // If not, the MiningHeader projection in core::BlockHeader has
-    // drifted from MiningHeader::pow_hash and every submit would be
-    // rejected by the DAG despite passing our local target check.
-    debug_assert_eq!(block.header.pow_hash(), hash,
-        "mining header projection mismatch — AA.0 invariant broken");
+    // If not, the MiningHeader projection in core::BlockHeader has drifted
+    // from MiningHeader::pow_hash and this block would be rejected by the DAG
+    // despite passing our local target check. Promoted from debug_assert to a
+    // LIVE (release) check: fail the submit rather than ship a drifted block.
+    if block.header.pow_hash() != hash {
+        warn!("stratum: session {} mining-header projection mismatch — refusing to ship drifted block", session.id);
+        return StratumResponse::error(id,
+            StratumError::new(ErrorCode::Other, "internal: mining header projection mismatch"));
+    }
 
     // 12. Deliver to node. Success → report block hash, log the find.
     //     Failure → propagate reason as error-20.
@@ -492,6 +549,60 @@ mod tests {
         assert!(b.transactions[0].is_coinbase());
     }
 
+    #[test]
+    fn assembled_block_carries_consensus_bits_regardless_of_share_diff() {
+        // Consensus firewall: the block's bits must ALWAYS be template.bits,
+        // never the session share difficulty. Set an absurd share diff and
+        // confirm the mined block still carries the template bits.
+        let s = mk_session();
+        s.set_share_difficulty(0.0001); // very easy share target
+        let tmpl = easy_template("consensus-1");
+        s.push_template(tmpl.clone());
+        let (cb, recorded) = accepting_callback();
+
+        let en2 = [0x01, 0x02, 0x03, 0x04];
+        let ntime: u32 = 0;
+        let nonce = find_valid_nonce(&tmpl, &s.extranonce1, &en2, ntime)
+            .expect("must find a valid nonce for easy target");
+        let req = submit_req(1, "consensus-1",
+            &hex::encode(en2), &format!("{:08x}", ntime), &format!("{:08x}", nonce));
+        let resp = handle_submit(&s, &req, &*cb);
+        assert!(resp.error.is_none(), "should succeed: {:?}", resp.error);
+
+        let blocks = recorded.lock().unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].header.bits, tmpl.bits,
+            "assembled block must carry consensus bits, not the share difficulty");
+    }
+
+    #[test]
+    fn ntime_rolled_share_is_not_a_duplicate() {
+        // Same (job, en2, nonce) but DIFFERENT ntime must NOT be error-22 —
+        // cpuminer rolls ntime and each is a distinct solution.
+        let s = mk_session();
+        s.push_template(easy_template("ntime-job"));
+        let (cb, _) = accepting_callback();
+
+        let r1 = submit_req(1, "ntime-job", "cafebabe", "00000001", "00000000");
+        let r2 = submit_req(2, "ntime-job", "cafebabe", "00000002", "00000000");
+        let _ = handle_submit(&s, &r1, &*cb);
+        let resp2 = handle_submit(&s, &r2, &*cb);
+        if let Some(err) = &resp2.error {
+            let code = err.as_array().unwrap()[0].as_u64().unwrap();
+            assert_ne!(code, 22, "different ntime must not be a duplicate");
+        }
+    }
+
+    #[test]
+    fn overlong_job_id_returns_21() {
+        let s = mk_session();
+        let (cb, _) = accepting_callback();
+        let long_job = "j".repeat(MAX_JOB_ID_LEN + 1);
+        let req = submit_req(1, &long_job, "00000000", "00000000", "00000000");
+        let resp = handle_submit(&s, &req, &*cb);
+        assert_err_code(&resp, 21);
+    }
+
     // ── Hard target: rejects low-difficulty share ───────────────
 
     #[test]
@@ -500,6 +611,10 @@ mod tests {
 
         // Difficulty-1 target (0x1d00ffff). With nonce=0 and a fresh
         // template, overwhelmingly probable to fail the target test.
+        // Pin the share difficulty to the network difficulty (1.0) so the
+        // share target == block target and the test stays deterministic (a
+        // lower share diff would make the gate easier and occasionally pass).
+        s.set_share_difficulty(1.0);
         let miner_spk = vec![0x11u8; 20];
         let hard_tmpl = Template::build(
             vec![[0u8; 32]], 1, 0, 0x1d00ffff, &miner_spk, 0,

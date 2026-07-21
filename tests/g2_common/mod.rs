@@ -41,7 +41,7 @@ pub fn block_with(header: BlockHeader, height: u64, pow_solution: Vec<i32>) -> B
 /// bytes.
 pub fn mined_sha256d_block() -> Block {
     let mut header = sha_header();
-    let nonce = bloch::pow::mine_sha256d(&header, header.bits, 0, 1 << 22, 1)
+    let nonce = bloch::pow::mine_sha256d(&header, header.bits, 0, 1 << 22, 1, false)
         .expect("~2^-16 target must be hit within 2^22 attempts");
     header.nonce = nonce;
     block_with(header, 0, Vec::new())
