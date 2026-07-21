@@ -71,6 +71,12 @@ pub struct MetricsState {
     pub reorg_attempts_total:            IntCounter,
     pub reorg_failures_total:            IntCounter,
     pub fork_depth:                      IntGauge,
+    /// S5: explicit success counter — success-rate becomes a direct series
+    /// instead of being derived as attempts - failures.
+    pub reorg_success_total:             IntCounter,
+    /// S5: per-attempt depth distribution. `fork_depth` is last-value-only
+    /// (racy under scrape); the histogram records every attempt.
+    pub reorg_depth:                     Histogram,
 
     // ── Histograms (Phase 2) ────────────────────────────────────
     pub block_validation_seconds:        Histogram,
@@ -174,6 +180,24 @@ impl MetricsState {
             registry
         ).expect("register fork_depth");
 
+        let reorg_success_total = register_int_counter_with_registry!(
+            opts!("bloch_reorg_success_total",
+                  "Chain reorganizations completed successfully (atomic chain-switch batch committed)"),
+            registry
+        ).expect("register reorg_success_total");
+
+        // Depth buckets anchored to the finality window: MAX_REORG_DEPTH =
+        // core::CHECKPOINT_DEPTH = 1_000 in production builds, so the top
+        // bucket sits at the cap and +Inf catches only refused over-deep plans.
+        let reorg_depth = register_histogram_with_registry!(
+            histogram_opts!(
+                "bloch_reorg_depth",
+                "Blocks rolled back per reorg attempt (observed before execution; includes failed and depth-refused attempts)",
+                vec![1.0, 2.0, 3.0, 5.0, 8.0, 13.0, 21.0, 50.0, 100.0, 250.0, 500.0, 1000.0]
+            ),
+            registry
+        ).expect("register reorg_depth");
+
         // ── Histograms ───────────────────────────────────────────
         // Block validation buckets tuned for expected range: 1ms..10s
         let block_validation_seconds = register_histogram_with_registry!(
@@ -213,6 +237,8 @@ impl MetricsState {
             reorg_attempts_total,
             reorg_failures_total,
             fork_depth,
+            reorg_success_total,
+            reorg_depth,
             block_validation_seconds,
             rpc_latency_seconds,
         }
@@ -313,6 +339,20 @@ pub fn inc_reorg_failure() {
 #[inline]
 pub fn set_fork_depth(depth: i64) {
     if let Some(m) = METRICS.get() { m.fork_depth.set(depth); }
+}
+
+/// S5: record a successfully committed reorg (the Ok path of `execute_reorg`).
+#[inline]
+pub fn inc_reorg_success() {
+    if let Some(m) = METRICS.get() { m.reorg_success_total.inc(); }
+}
+
+/// S5: observe the depth (blocks rolled back) of a reorg attempt. Called at
+/// the start of `execute_reorg` alongside `set_fork_depth`, so the histogram
+/// counts every attempt — including ones later refused by the depth cap.
+#[inline]
+pub fn observe_reorg_depth(depth: f64) {
+    if let Some(m) = METRICS.get() { m.reorg_depth.observe(depth); }
 }
 
 #[inline]
@@ -449,6 +489,9 @@ mod tests {
         assert!(names.contains(&"bloch_reorg_attempts_total"));
         assert!(names.contains(&"bloch_reorg_failures_total"));
         assert!(names.contains(&"bloch_fork_depth"));
+        assert!(names.contains(&"bloch_reorg_success_total"));
+        // bloch_reorg_depth is a Histogram — presence after observation is
+        // asserted in reorg_metrics_track_attempts_failures_and_depth.
 
         // Phase 2 histograms (same rule — only shown after first observation)
         // We skip assert on those; gauges verify registry is alive.
@@ -525,15 +568,27 @@ mod tests {
         s.reorg_attempts_total.inc();
         s.reorg_failures_total.inc();
         s.fork_depth.set(7);
+        s.reorg_success_total.inc();
+        s.reorg_depth.observe(7.0);
+        s.reorg_depth.observe(2.0);
 
         assert_eq!(s.reorg_attempts_total.get(), 2);
         assert_eq!(s.reorg_failures_total.get(), 1);
+        assert_eq!(s.reorg_success_total.get(), 1);
 
         let families = s.registry.gather();
         let depth = families.iter()
             .find(|f| f.name() == "bloch_fork_depth").unwrap()
             .get_metric()[0].get_gauge().value() as i64;
         assert_eq!(depth, 7);
+
+        // Histogram: registered under the bloch_ prefix, both observations
+        // recorded, sum matches (7 + 2).
+        let hist = families.iter()
+            .find(|f| f.name() == "bloch_reorg_depth").unwrap()
+            .get_metric()[0].get_histogram();
+        assert_eq!(hist.get_sample_count(), 2);
+        assert!((hist.get_sample_sum() - 9.0).abs() < 1e-9);
     }
 
     #[test]
@@ -560,6 +615,8 @@ mod tests {
         // no prior test has called install().
         set_block_count(999);
         inc_block_accepted();
+        inc_reorg_success();
+        observe_reorg_depth(3.0);
         observe_rpc_latency("foo", 0.1);
         // If we got here without panic, test passes.
     }

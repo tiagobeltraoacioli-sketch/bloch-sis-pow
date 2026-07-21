@@ -58,13 +58,30 @@ trademark-gate:
 
 # Supply-chain — RUSTSEC advisories, permissive-license + no-git-dep policy.
 # BLOCKING: a supply-chain violation must fail the pipeline; see deny.toml.
+# S5: flipped from informational to blocking. The old comment's precondition
+# ("verified green on the new Linux runner") is a CI-run verification, not an
+# external gate: run `cargo deny check advisories bans licenses sources` once
+# on the runner before merging this flip. If the first blocking run surfaces a
+# pre-existing advisory, fix it or add an `ignore` entry to deny.toml WITH a
+# written rationale — do not re-flip to allow_failure.
 supply-chain:
   stage: check
   script:
     - cargo install cargo-deny --locked 2>/dev/null || true
     - cargo deny check advisories bans licenses sources
-  # Informational until verified green on the new Linux runner, then flip to blocking.
-  allow_failure: true
+  allow_failure: false
+
+# cargo-audit — narrower RUSTSEC-only backstop to cargo-deny: an independent
+# implementation of the advisory check, so a cargo-deny regression or a
+# deny.toml misconfiguration cannot silently disable advisory scanning.
+# BLOCKING, same posture as supply-chain. `--deny warnings` also fails on
+# unmaintained/unsound informational advisories.
+cargo-audit:
+  stage: check
+  script:
+    - cargo install cargo-audit --locked 2>/dev/null || true
+    - cargo audit --deny warnings
+  allow_failure: false
 
 # Secret scanning — catch committed credentials (e.g. a leaked token) before they
 # reach history. Best practice given the project's own PAT-rotation lesson.
