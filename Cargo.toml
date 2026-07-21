@@ -136,7 +136,7 @@ rand         = "0.9"
 rocksdb      = { version = "0.22", optional = true }
 
 # FIX: libp2p 0.53 → 0.56 (pulls ring 0.17+, fixes AES panic vulnerability)
-libp2p       = { version = "0.56", features = ["tcp", "noise", "yamux", "gossipsub", "mdns", "tokio", "dns", "websocket", "identify", "ping", "macros", "ed25519"], optional = true }
+libp2p       = { version = "0.56", features = ["tcp", "noise", "yamux", "gossipsub", "mdns", "tokio", "dns", "websocket", "identify", "ping", "macros", "ed25519", "request-response"], optional = true }
 
 # FIX: jsonrpc-http-server uses net2+instant (unmaintained) → replace with axum
 axum         = { version = "0.8", optional = true }

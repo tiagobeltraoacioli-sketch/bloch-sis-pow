@@ -119,6 +119,8 @@ async fn spawn_node(bootstrap_peers: Vec<String>, max_peers: usize) -> Harness {
         behind_proxy:        true,
         // Deterministic wiring ONLY via bootstrap_peers — no LAN discovery.
         enable_mdns:         false,
+        // Announce-then-pull: harness nodes are not archival advertisers.
+        archive:             false,
     };
     let node = NetworkNode::new(cfg).expect("NetworkNode::new");
     let peer_id = node.peer_id;
@@ -126,6 +128,12 @@ async fn spawn_node(bootstrap_peers: Vec<String>, max_peers: usize) -> Harness {
     let dag = Arc::new(RwLock::new(GhostDAG::with_k(K)));
     dag.write().add_genesis(GENESIS, 0);
     let peer_state = Arc::new(PeerStateTable::new());
+    // Announce-then-pull: run() now serves inbound directed GetBlock pulls from
+    // the block store. The harness exercises the gossip path, so an empty store
+    // is fine (directed GetBlock would answer BlockNotFound).
+    let store = Arc::new(
+        bloch::storage::Storage::open(&dir.path().join("db")).expect("store"),
+    );
 
     let (block_tx, mut block_rx) = mpsc::channel::<NetworkMessage>(1024);
     let (outbound_tx, outbound_rx) = mpsc::channel::<NetworkMessage>(1024);
@@ -135,9 +143,10 @@ async fn spawn_node(bootstrap_peers: Vec<String>, max_peers: usize) -> Harness {
     {
         let dag = dag.clone();
         let peer_state = peer_state.clone();
+        let store = store.clone();
         tokio::spawn(async move {
             let _ = node
-                .run(block_tx, outbound_rx, dag, peer_state, Some(addr_tx))
+                .run(block_tx, outbound_rx, dag, peer_state, store, Some(addr_tx))
                 .await;
         });
     }
