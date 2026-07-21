@@ -81,6 +81,26 @@ enum Cmd {
     },
     /// Sign arbitrary message
     Sign { keystore: PathBuf, message: String },
+    /// P4.3 — Create a signed selective-disclosure bundle (view/audit key).
+    /// Prompts for the BIP39 seed phrase; discloses ONLY the given receive
+    /// indices (0 = base address). The bundle contains public data + signatures
+    /// only — never the seed or any secret key.
+    Disclose {
+        /// Comma-separated receive indices, e.g. "0,2,5"
+        indices: String,
+        /// What this disclosure is for (bound into the signatures)
+        #[arg(long)]
+        purpose: String,
+        /// Who this disclosure is addressed to (bound in; verifiers must check it)
+        #[arg(long)]
+        audience: String,
+        #[arg(long, default_value = "./bloch-disclosure.json")]
+        output: PathBuf,
+    },
+    /// Verify a disclosure bundle OFFLINE (no node needed)
+    VerifyBundle { bundle: PathBuf },
+    /// Watch-only audit: verify a bundle, then sum balances over its addresses
+    Watch { bundle: PathBuf },
 }
 
 pub fn main() {
@@ -248,6 +268,100 @@ pub fn main() {
             }
         }
 
+        Cmd::Disclose { indices, purpose, audience, output } => {
+            let idx: Vec<u32> = match indices.split(',')
+                .map(|s| s.trim().parse::<u32>())
+                .collect::<Result<Vec<_>, _>>()
+            {
+                Ok(v) if !v.is_empty() => v,
+                _ => { err("indices must be a comma-separated list of numbers, e.g. 0,2,5"); unreachable!() }
+            };
+
+            println!("  {}Selective disclosure — reveals ONLY the listed indices.{}", MUTED, RESET);
+            println!("  {}The bundle proves control of those addresses; it cannot and{}", DIM, RESET);
+            println!("  {}does not prove they are ALL of your addresses (by design).{}", DIM, RESET);
+            println!();
+
+            let phrase = prompt_password(&format!("  {}seed phrase:{} ", MUTED, RESET));
+            let seed = match crate::wallet::SeedPhrase::parse(&phrase) {
+                Ok(s) => s,
+                Err(e) => { err(&format!("Invalid seed phrase: {}", e)); unreachable!() }
+            };
+            let network = if cli.testnet { crate::address::Network::Testnet }
+                          else { crate::address::Network::Mainnet };
+
+            print!("  {}deriving {} keypair(s) + signing (slow: hybrid PQ keygen)...{}\r",
+                MUTED, idx.len(), RESET);
+            let seed_bytes = seed.to_seed_bytes();
+            let bundle = match crate::wallet::DisclosureBundle::create(
+                &seed_bytes, &idx, network, &purpose, &audience)
+            {
+                Ok(b) => b,
+                Err(e) => { err(&format!("Disclosure failed: {}", e)); unreachable!() }
+            };
+
+            let json = serde_json::to_string_pretty(&bundle).unwrap();
+            match crate::util::atomic_write(&output, json.as_bytes()) {
+                Ok(()) => {
+                    ok(&format!("Disclosure bundle saved: {}", amber(&output.display().to_string())));
+                    println!();
+                    for e in &bundle.entries {
+                        label(&format!("index {}", e.index), &e.address);
+                    }
+                    println!();
+                    println!("  {}Share this file with '{}' only — anyone holding it can see{}",
+                        MUTED, audience, RESET);
+                    println!("  {}these addresses' full on-chain history, forever.{}", MUTED, RESET);
+                }
+                Err(e) => err(&format!("Save failed: {}", e)),
+            }
+        }
+
+        Cmd::VerifyBundle { bundle } => {
+            let verified = load_and_verify_bundle(&bundle);
+            ok("bundle signatures + address bindings verified");
+            println!();
+            label("network",  &format!("{:?}", verified.network));
+            label("purpose",  &verified.purpose);
+            label("audience", &verified.audience);
+            label("created",  &verified.created_at);
+            println!();
+            for (index, addr) in &verified.addresses {
+                label(&format!("index {}", index), &addr.to_string());
+            }
+            println!();
+            println!("  {}Proven: the discloser controls these addresses.{}", MUTED, RESET);
+            println!("  {}NOT proven: that these are all of their addresses (selective).{}", DIM, RESET);
+            println!("  {}Check the audience field names YOU before trusting the bundle.{}", DIM, RESET);
+        }
+
+        Cmd::Watch { bundle } => {
+            let verified = load_and_verify_bundle(&bundle);
+            ok(&format!("bundle verified — {} address(es)", verified.addresses.len()));
+            println!();
+
+            let mut total: u64 = 0;
+            for (index, addr) in &verified.addresses {
+                let addr_str = addr.to_string();
+                let resp = rpc_call(&cli.rpc, "getbalance", serde_json::json!([addr_str]));
+                match resp.get("error") {
+                    Some(e) if !e.is_null() =>
+                        label(&format!("index {}", index), &red(&format!("RPC error: {}", e))),
+                    _ => {
+                        let sats = resp["satoshis"].as_u64().unwrap_or(0);
+                        total = total.saturating_add(sats);
+                        label(&format!("index {}", index),
+                            &format!("{:.8} BLOCH  {}{}{}", sats as f64 / 1e8, DIM, addr_str, RESET));
+                    }
+                }
+            }
+            println!();
+            println!("  {} {}", amber("disclosed total"),
+                bold(&format!("{:.8} BLOCH", total as f64 / 1e8)));
+            println!("  {}(total over the DISCLOSED subset only — not a whole-wallet total){}",
+                MUTED, RESET);
+        }
+
         Cmd::Sign { keystore, message } => {
             let kp  = load_kp(&keystore);
             let msg = hex::decode(&message)
@@ -271,6 +385,21 @@ pub fn main() {
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
+
+fn load_and_verify_bundle(path: &PathBuf) -> crate::wallet::VerifiedDisclosure {
+    let json = match std::fs::read_to_string(path) {
+        Ok(j) => j,
+        Err(e) => { err(&format!("Cannot read bundle: {}", e)); unreachable!() }
+    };
+    let bundle: crate::wallet::DisclosureBundle = match serde_json::from_str(&json) {
+        Ok(b) => b,
+        Err(e) => { err(&format!("Bundle parse failed: {}", e)); unreachable!() }
+    };
+    match bundle.verify() {
+        Ok(v) => v,
+        Err(e) => { err(&format!("Bundle verification FAILED: {}", e)); unreachable!() }
+    }
+}
 
 fn load_kp(path: &PathBuf) -> crate::wallet::Keypair {
     let pw = prompt_password(&format!("  {}password:{} ", MUTED, RESET));
