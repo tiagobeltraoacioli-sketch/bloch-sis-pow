@@ -140,9 +140,14 @@ impl Template {
         // Bloch pure-PoW coinbase (B3):
         //   output[0] = miner   = full subsidy + total_fees
         //   output[1] = founder = vesting delta (if > 0)
-        let subsidy = crate::core::tokenomics_v2::block_subsidy_sat(height);
+        // Genesis-2 continues emission from the carried height: the coinbase must
+        // pay the subsidy for the ABSOLUTE (emission) height, exactly as the
+        // validator (validate_coinbase_value) computes it. `emission_height` is the
+        // identity on every other chain, so this is a no-op there (Module-SIS, etc.).
+        let emission_h = crate::core::emission_height(height);
+        let subsidy = crate::core::tokenomics_v2::block_subsidy_sat(emission_h);
         let founder_vesting =
-            crate::core::tokenomics_v2::founder_vesting_delta_sat(height);
+            crate::core::tokenomics_v2::founder_vesting_delta_sat(emission_h);
 
         let mut cb_outputs = vec![
             TxOutput {
@@ -239,7 +244,9 @@ impl Template {
         let branch: Vec<String> = self.merkle_branch.iter().map(hex::encode).collect();
         json!([
             self.job_id.clone(),
-            hex::encode(self.prev_hash),
+            // Stratum sends prev_hash with each 32-bit word byte-reversed; the
+            // miner's le32dec UNDOES it to recover the raw consensus prev_hash.
+            hex::encode(stratum_prevhash(&self.prev_hash)),
             hex::encode(&self.coinb1),
             hex::encode(&self.coinb2),
             branch,
@@ -249,6 +256,25 @@ impl Template {
             clean_jobs,
         ])
     }
+}
+
+/// Stratum V1 transmits the previous-block hash with each 32-bit word
+/// byte-reversed. Standard SHA-256 miners (cpuminer, Antminer/BMMiner,
+/// Whatsminer) run `le32dec` over each word when assembling the 80-byte
+/// header, which UNDOES this swap and yields the raw consensus `prev_hash`
+/// that `MiningHeader::to_bytes()` hashes. Sending the hash raw (no swap)
+/// makes the miner hash a word-swapped prev_hash, so its PoW never matches
+/// the node's reconstruction — every share/block is rejected as "invalid
+/// PoW" (the long-standing ASIC/stratum rejection bug). This swap fixes it.
+fn stratum_prevhash(prev: &[u8; 32]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    for i in 0..8 {
+        out[i * 4]     = prev[i * 4 + 3];
+        out[i * 4 + 1] = prev[i * 4 + 2];
+        out[i * 4 + 2] = prev[i * 4 + 1];
+        out[i * 4 + 3] = prev[i * 4];
+    }
+    out
 }
 
 // ── Merkle branch primitives ───────────────────────────────────────

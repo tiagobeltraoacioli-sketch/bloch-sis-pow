@@ -155,6 +155,8 @@ fn main() {
         cli.start_nonce,
         1u64 << 32,
         n_threads,
+        // Genesis block is height 0 — pre-fork, legacy big-endian rule.
+        false,
     ) {
         Some(n) => n,
         None => {

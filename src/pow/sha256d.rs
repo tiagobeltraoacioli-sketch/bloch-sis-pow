@@ -46,8 +46,9 @@ pub fn mine_sha256d(
     start_nonce: u64,
     max_attempts: u64,
     threads: usize,
+    little_endian: bool,
 ) -> Option<u64> {
-    mine_sha256d_preimage(&header.pow_preimage(), bits, start_nonce, max_attempts, threads)
+    mine_sha256d_preimage(&header.pow_preimage(), bits, start_nonce, max_attempts, threads, little_endian)
 }
 
 /// Preimage-level entry point used by the chain-dispatching
@@ -62,6 +63,10 @@ pub fn mine_sha256d_preimage(
     start_nonce: u64,
     max_attempts: u64,
     threads: usize,
+    // At/above SHA256D_LE_FORK_HEIGHT the consensus compares the hash in
+    // Bitcoin little-endian order; the miner must grind for the SAME condition
+    // it will be validated against, so the caller passes height >= fork here.
+    little_endian: bool,
 ) -> Option<u64> {
     if preimage.len() != PREIMAGE_LEN {
         return None; // fail closed: not a mining-header prefix
@@ -104,7 +109,14 @@ pub fn mine_sha256d_preimage(
                     }
                     buf[PREIMAGE_LEN..].copy_from_slice(&(idx as u32).to_le_bytes());
                     let h: [u8; 32] = Sha256::digest(Sha256::digest(buf)).into();
-                    if hash_meets_target(&h, target) {
+                    // Post-fork: compare in Bitcoin little-endian (hash reversed)
+                    // so the mined nonce is exactly what consensus will accept.
+                    let ok = if little_endian {
+                        let mut r = h; r.reverse(); hash_meets_target(&r, target)
+                    } else {
+                        hash_meets_target(&h, target)
+                    };
+                    if ok {
                         best.fetch_min(idx, Ordering::SeqCst);
                         found.store(true, Ordering::SeqCst);
                         return;
@@ -147,7 +159,7 @@ mod tests {
         let target = bits_to_target(header.bits);
 
         for threads in [1usize, 4] {
-            let nonce = mine_sha256d(&header, header.bits, 0, 1 << 22, threads)
+            let nonce = mine_sha256d(&header, header.bits, 0, 1 << 22, threads, false)
                 .expect("2^-16 target must be hit well within the budget");
             assert!(nonce <= u32::MAX as u64, "upper 32 bits must be zero");
             let mut mined = header.clone();
@@ -159,6 +171,33 @@ mod tests {
         }
     }
 
+    /// Post-fork (little-endian) round trip: a nonce mined with the LE rule
+    /// must be accepted by the height-gated consensus check at a height >=
+    /// SHA256D_LE_FORK_HEIGHT, and the LEGACY big-endian check must reject it
+    /// (they select disjoint hash sets — that is exactly why the fork is a
+    /// hard fork). Guards the ASIC-compatibility fix end to end.
+    #[test]
+    fn little_endian_mined_nonce_validates_post_fork() {
+        use bloch_crypto::core::{sha256d_pow_valid, SHA256D_LE_FORK_HEIGHT};
+        let header = test_header();
+        let target = bits_to_target(header.bits);
+        let nonce = mine_sha256d(&header, header.bits, 0, 1 << 22, 4, true)
+            .expect("LE target must be hit within the budget");
+        let mut mined = header.clone();
+        mined.nonce = nonce;
+        let h = mined.pow_hash();
+        assert!(
+            sha256d_pow_valid(&h, &target, SHA256D_LE_FORK_HEIGHT),
+            "post-fork consensus must accept an LE-mined nonce",
+        );
+        // The legacy big-endian rule would (with overwhelming probability)
+        // reject it — an LE-small hash is not BE-small.
+        assert!(
+            !hash_meets_target(&h, &target),
+            "an LE-mined hash must not satisfy the legacy big-endian rule",
+        );
+    }
+
     /// Nonce exhaustion returns None instead of wrapping: starting past the
     /// 32-bit boundary, and starting near it with an impossible target, both
     /// terminate with None.
@@ -167,13 +206,13 @@ mod tests {
         let header = test_header();
         // Start beyond the 32-bit space entirely.
         assert_eq!(
-            mine_sha256d(&header, header.bits, (u32::MAX as u64) + 1, 1_000, 4),
+            mine_sha256d(&header, header.bits, (u32::MAX as u64) + 1, 1_000, 4, false),
             None,
         );
         // Start 256 below the boundary with an unreachable all-zero target
         // (bits exp out of range): must scan ≤ 257 nonces and stop, not wrap.
         assert_eq!(
-            mine_sha256d(&header, 0x0000_0001, u32::MAX as u64 - 256, 1 << 20, 4),
+            mine_sha256d(&header, 0x0000_0001, u32::MAX as u64 - 256, 1 << 20, 4, false),
             None,
         );
     }
@@ -181,7 +220,7 @@ mod tests {
     /// A non-76-byte preimage fails closed.
     #[test]
     fn wrong_preimage_length_fails_closed() {
-        assert_eq!(mine_sha256d_preimage(&[0u8; 80], 0x207fffff, 0, 10, 1), None);
-        assert_eq!(mine_sha256d_preimage(&[0u8; 75], 0x207fffff, 0, 10, 1), None);
+        assert_eq!(mine_sha256d_preimage(&[0u8; 80], 0x207fffff, 0, 10, 1, false), None);
+        assert_eq!(mine_sha256d_preimage(&[0u8; 75], 0x207fffff, 0, 10, 1, false), None);
     }
 }

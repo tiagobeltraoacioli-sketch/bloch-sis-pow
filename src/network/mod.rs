@@ -185,12 +185,12 @@ pub const MAX_WIRE_PEER_ID_LEN: usize = 128;
 /// App-score penalty per wire protocol violation. With app_specific_weight
 /// 1.0 and graylist_threshold -400 (see `run()`), four violations graylist
 /// the peer.
-const WIRE_VIOLATION_PENALTY: f64 = -100.0;
+pub const WIRE_VIOLATION_PENALTY: f64 = -100.0;
 /// Floor so a flood of violations can't drive the score to -inf.
-const WIRE_PENALTY_FLOOR: f64 = -1000.0;
+pub const WIRE_PENALTY_FLOOR: f64 = -1000.0;
 /// Cap on the number of peers whose penalty score we track (bounds memory
 /// against an attacker cycling peer identities).
-const WIRE_PENALTY_TRACK_CAP: usize = 1024;
+pub const WIRE_PENALTY_TRACK_CAP: usize = 1024;
 
 #[derive(Debug)]
 pub enum WireDecodeError {
@@ -301,6 +301,87 @@ fn validate_wire_bounds(msg: &NetworkMessage) -> Result<(), WireDecodeError> {
         | NetworkMessage::BlockNotFound { .. } => {}
     }
     Ok(())
+}
+
+// ── Sprint EE (S3): frame-reaction unit — extracted from `run()` ─────────────
+//
+// The decode → penalize/ignore/accept decision used to live inline in the
+// gossipsub `Message` arm of `run()`'s event loop, so the ONLY way to exercise
+// the peer-scoring reaction to an invalid-block frame, an oversized frame, or
+// a bounds-violating list was to stand up a live swarm — which made the
+// reaction untested. This extraction is behavior-preserving: `run()` is now a
+// thin consumer (classify → apply app score / log / forward), and the reaction
+// itself is asserted deterministically in unit tests and in
+// tests/sprint_ee_transport_convergence.rs without any networking.
+
+/// What the node does in response to a single gossip frame from a peer.
+#[derive(Debug)]
+pub enum WireReaction {
+    /// Frame decoded and passed bounds validation — process it.
+    Accept(NetworkMessage),
+    /// Deliberate protocol violation (oversized frame / bounds-violating
+    /// lengths — e.g. an invalid-block frame larger than MAX_WIRE_BYTES):
+    /// `score` is the peer's new cumulative application score to install via
+    /// `gossipsub.set_application_score`. With app_specific_weight 1.0 and
+    /// graylist_threshold -400, the fourth violation graylists the peer.
+    Penalize { error: WireDecodeError, score: f64 },
+    /// Malformed bincode — possibly benign version skew. Log-only, no penalty.
+    IgnoreMalformed(String),
+}
+
+/// Cumulative per-peer wire-violation penalty state. Bounded to
+/// [`WIRE_PENALTY_TRACK_CAP`] peers so an attacker cycling identities cannot
+/// grow the map without limit; once full, untracked offenders still receive a
+/// one-shot [`WIRE_VIOLATION_PENALTY`] without being inserted.
+pub struct WirePenaltyTracker {
+    penalties: std::collections::HashMap<PeerId, f64>,
+}
+
+impl WirePenaltyTracker {
+    pub fn new() -> Self {
+        Self { penalties: std::collections::HashMap::new() }
+    }
+
+    /// Decode an untrusted gossip frame and decide the reaction. This is the
+    /// exact logic previously inline in `run()`:
+    ///   - decodes via [`decode_wire_message`] (4 MiB frame/read limit +
+    ///     post-decode bounds);
+    ///   - protocol violations (Oversized/Bounds) accumulate
+    ///     [`WIRE_VIOLATION_PENALTY`] per offense, floored at
+    ///     [`WIRE_PENALTY_FLOOR`];
+    ///   - if the tracking map is full and the peer untracked, the penalty is
+    ///     applied one-shot without growing the map;
+    ///   - plain-malformed frames are ignored (may be version skew).
+    pub fn classify(&mut self, peer: PeerId, data: &[u8]) -> WireReaction {
+        match decode_wire_message(data) {
+            Ok(msg) => WireReaction::Accept(msg),
+            Err(e) if e.is_protocol_violation() => {
+                let score = if self.penalties.len() >= WIRE_PENALTY_TRACK_CAP
+                    && !self.penalties.contains_key(&peer)
+                {
+                    // Tracking map is full: apply a one-shot penalty
+                    // without growing the map.
+                    WIRE_VIOLATION_PENALTY
+                } else {
+                    let s = self.penalties.entry(peer).or_insert(0.0);
+                    *s = (*s + WIRE_VIOLATION_PENALTY).max(WIRE_PENALTY_FLOOR);
+                    *s
+                };
+                WireReaction::Penalize { error: e, score }
+            }
+            Err(e) => WireReaction::IgnoreMalformed(format!("{:?}", e)),
+        }
+    }
+
+    /// Number of peers currently tracked (observability for tests/metrics).
+    pub fn tracked_peers(&self) -> usize {
+        self.penalties.len()
+    }
+
+    /// Current cumulative score for a peer, if tracked.
+    pub fn score_of(&self, peer: &PeerId) -> Option<f64> {
+        self.penalties.get(peer).copied()
+    }
 }
 
 // ── H4: panic-free truncation of attacker-controlled strings ─────────────────
@@ -423,12 +504,24 @@ impl NetworkNode {
     ///
     /// The fix here is to take the DAG by `Arc<RwLock<...>>` so the
     /// network loop can read the *current* tip before each publish.
+    ///
+    /// Sprint EE (S3 transport harness): `listen_report`, when `Some`, receives
+    /// every address this swarm binds (fired from `SwarmEvent::NewListenAddr`).
+    /// This is the affordance the sprint_ee_convergence.rs header names as the
+    /// blocker for a real two-node in-process harness: with `/ip4/127.0.0.1/tcp/0`
+    /// the kernel picks the port, and before this parameter the bound address
+    /// was only *logged*, so a second in-process node could not be wired to the
+    /// first deterministically (fixed ports = CI flakiness). Production passes
+    /// `None` (see main.rs) — zero behavior change; the channel is unbounded so
+    /// the swarm loop never blocks on a slow observer, and a dropped receiver
+    /// is ignored (`let _ =`).
     pub async fn run(
         self,
         block_tx:       mpsc::Sender<NetworkMessage>,
         mut outbound_rx: mpsc::Receiver<NetworkMessage>,
         dag:            std::sync::Arc<parking_lot::RwLock<crate::consensus::GhostDAG>>,
         peer_state:     std::sync::Arc<crate::sync::peer_state::PeerStateTable>,
+        listen_report:  Option<mpsc::UnboundedSender<Multiaddr>>,
     ) -> Result<(), NetworkError> {
         use std::time::Instant;
         // Audit M-10 fix: previously used std::hash::DefaultHasher, whose
@@ -648,10 +741,10 @@ impl NetworkNode {
         let allow_private   = self.config.allow_private_peers;
 
         // C1: cumulative app-score penalties for peers sending frames that
-        // violate wire bounds (oversized / over-long lists). Bounded map so an
-        // attacker cycling identities can't grow it without limit.
-        let mut wire_penalties: std::collections::HashMap<PeerId, f64> =
-            std::collections::HashMap::new();
+        // violate wire bounds (oversized / over-long lists). Sprint EE (S3):
+        // the map + reaction logic moved into WirePenaltyTracker so the
+        // reaction is unit-testable without a live swarm; behavior unchanged.
+        let mut wire_tracker = WirePenaltyTracker::new();
 
         // Add hardcoded default seeds
         let mut all_seeds: Vec<String> = crate::core::DEFAULT_SEEDS.iter().map(|s| s.to_string()).collect();
@@ -728,13 +821,17 @@ impl NetworkNode {
                 event = poll_swarm(&mut swarm) => {
                     match event {
                         SwarmEvent::Behaviour(BlochBehaviourEvent::Gossipsub(gossipsub::Event::Message { propagation_source, message, .. })) => {
-                            // C1: bounded decode. `decode_wire_message` enforces the
-                            // 4 MiB frame/read limit and per-field length bounds; the
-                            // unlimited `bincode::config::standard()` decode used here
+                            // C1: bounded decode. `decode_wire_message` (inside
+                            // `classify`) enforces the 4 MiB frame/read limit and
+                            // per-field length bounds; the unlimited
+                            // `bincode::config::standard()` decode used here
                             // before let a tiny frame declare multi-GB lengths.
-                            let decoded = decode_wire_message(&message.data);
-                            if let Err(ref e) = decoded {
-                                if e.is_protocol_violation() {
+                            // Sprint EE (S3): the reaction decision is computed by
+                            // WirePenaltyTracker (unit-testable, no swarm); this
+                            // arm only APPLIES it.
+                            let reaction = wire_tracker.classify(propagation_source, &message.data);
+                            match &reaction {
+                                WireReaction::Penalize { error, score } => {
                                     // Oversized / bounds-violating frames can't come from
                                     // a compliant node: hit the sender's application score
                                     // so repeat offenders get graylisted (4 × -100 crosses
@@ -742,27 +839,18 @@ impl NetworkNode {
                                     // NOTE (honesty): if `with_peer_score` failed above
                                     // (non-fatal warn path), set_application_score is
                                     // inert and this is effectively log-only.
-                                    let score = if wire_penalties.len() >= WIRE_PENALTY_TRACK_CAP
-                                        && !wire_penalties.contains_key(&propagation_source)
-                                    {
-                                        // Tracking map is full: apply a one-shot penalty
-                                        // without growing the map.
-                                        WIRE_VIOLATION_PENALTY
-                                    } else {
-                                        let s = wire_penalties.entry(propagation_source).or_insert(0.0);
-                                        *s = (*s + WIRE_VIOLATION_PENALTY).max(WIRE_PENALTY_FLOOR);
-                                        *s
-                                    };
                                     swarm.behaviour_mut().gossipsub
-                                        .set_application_score(&propagation_source, score);
+                                        .set_application_score(&propagation_source, *score);
                                     warn!("wire violation from {}: {:?} (app score → {})",
-                                        propagation_source, e, score);
-                                } else {
+                                        propagation_source, error, score);
+                                }
+                                WireReaction::IgnoreMalformed(_) => {
                                     debug!("undecodable gossip frame from {} ({} bytes)",
                                         propagation_source, message.data.len());
                                 }
+                                WireReaction::Accept(_) => {}
                             }
-                            if let Ok(msg) = decoded {
+                            if let WireReaction::Accept(msg) = reaction {
                                 match &msg {
                                     NetworkMessage::NewBlock  { block_hash, height, blue_score, .. } => {
                                         // P1 (roadmap §2): block-ingest correlation moved here from
@@ -1036,8 +1124,18 @@ impl NetworkNode {
                             crate::metrics::set_peer_count(peer_count as i64);
                             peer_state.on_disconnect(&peer_id);
                         }
-                        SwarmEvent::NewListenAddr { address, .. } =>
-                            info!("listening: {}/p2p/{}", address, self.peer_id),
+                        SwarmEvent::NewListenAddr { address, .. } => {
+                            info!("listening: {}/p2p/{}", address, self.peer_id);
+                            // Sprint EE (S3 transport harness): report the bound
+                            // addr to an in-process observer so a peer node can
+                            // be wired to this one deterministically even with
+                            // an ephemeral `/tcp/0` listen port. `None` in
+                            // production — this arm then behaves exactly as
+                            // before (log only).
+                            if let Some(report) = &listen_report {
+                                let _ = report.send(address.clone());
+                            }
+                        }
                         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                             warn!("dial failed{}: {}",
                                 peer_id.map(|p| format!(" to {}", p)).unwrap_or_default(),
@@ -1725,5 +1823,125 @@ mod tests {
         assert_eq!(truncate_utf8("éé", 4), "éé");
         // Degenerate: budget smaller than the first codepoint → empty, no panic.
         assert_eq!(truncate_utf8("💥", 3), "");
+    }
+
+    // ─── Sprint EE (S3): extracted frame-reaction unit ────────────────────
+
+    /// The reaction to a valid frame is Accept carrying the decoded message.
+    #[test]
+    fn wire_reaction_accepts_valid_frame() {
+        let mut t = WirePenaltyTracker::new();
+        let peer = PeerId::random();
+        let bytes = bincode::serde::encode_to_vec(
+            &NetworkMessage::GetTips, bincode::config::standard()).expect("encode");
+        match t.classify(peer, &bytes) {
+            WireReaction::Accept(NetworkMessage::GetTips) => {}
+            other => panic!("expected Accept(GetTips), got {:?}", other),
+        }
+        assert_eq!(t.score_of(&peer), None, "valid frames must not be penalized");
+    }
+
+    /// An invalid-block frame (NewBlock larger than MAX_WIRE_BYTES) is a
+    /// protocol violation: cumulative -100 per offense; the FOURTH crosses
+    /// graylist_threshold (-400). This is the deterministic, swarm-free
+    /// assertion of the reaction `run()` applies via set_application_score.
+    #[test]
+    fn wire_reaction_penalizes_oversized_invalid_block_cumulatively() {
+        let mut t = WirePenaltyTracker::new();
+        let peer = PeerId::random();
+        let big = bincode::serde::encode_to_vec(
+            &NetworkMessage::NewBlock {
+                block_hash: [0u8; 32],
+                blue_score: 0,
+                height:     0,
+                block_data: vec![0u8; MAX_WIRE_BYTES + 1024],
+            },
+            bincode::config::standard(),
+        ).expect("encode");
+
+        for i in 1..=4i32 {
+            match t.classify(peer, &big) {
+                WireReaction::Penalize { score, error } => {
+                    assert!(error.is_protocol_violation());
+                    assert_eq!(score, WIRE_VIOLATION_PENALTY * f64::from(i));
+                }
+                other => panic!("expected Penalize, got {:?}", other),
+            }
+        }
+        // Fourth violation: -400 == the gossipsub graylist_threshold in run().
+        assert_eq!(t.score_of(&peer), Some(-400.0));
+    }
+
+    /// The cumulative penalty floors at WIRE_PENALTY_FLOOR — a flood of
+    /// violations cannot drive the score to -inf.
+    #[test]
+    fn wire_reaction_penalty_floors() {
+        let mut t = WirePenaltyTracker::new();
+        let peer = PeerId::random();
+        let bad: Vec<u8> = vec![0u8; MAX_WIRE_BYTES + 1];
+        for _ in 0..30 {
+            t.classify(peer, &bad);
+        }
+        assert_eq!(t.score_of(&peer), Some(WIRE_PENALTY_FLOOR));
+    }
+
+    /// A bounds-violating frame UNDER the byte limit (PEX list too long) is
+    /// also a protocol violation — the byte limit alone can't catch it.
+    #[test]
+    fn wire_reaction_penalizes_bounds_violation() {
+        let mut t = WirePenaltyTracker::new();
+        let peer = PeerId::random();
+        let peers: Vec<String> = (0..(MAX_WIRE_ADDRS + 1))
+            .map(|i| format!("/ip4/1.2.3.4/tcp/{}", i % 65535))
+            .collect();
+        let bytes = bincode::serde::encode_to_vec(
+            &NetworkMessage::PeerExchange { peers },
+            bincode::config::standard(),
+        ).expect("encode");
+        assert!(bytes.len() < MAX_WIRE_BYTES);
+        match t.classify(peer, &bytes) {
+            WireReaction::Penalize { error: WireDecodeError::Bounds(_), score } => {
+                assert_eq!(score, WIRE_VIOLATION_PENALTY);
+            }
+            other => panic!("expected Penalize(Bounds), got {:?}", other),
+        }
+    }
+
+    /// Plain-malformed bincode (possible benign version skew) is ignored,
+    /// never penalized.
+    #[test]
+    fn wire_reaction_ignores_malformed_without_penalty() {
+        let mut t = WirePenaltyTracker::new();
+        let peer = PeerId::random();
+        match t.classify(peer, &[0xFF; 16]) {
+            WireReaction::IgnoreMalformed(_) => {}
+            other => panic!("expected IgnoreMalformed, got {:?}", other),
+        }
+        assert_eq!(t.score_of(&peer), None);
+        assert_eq!(t.tracked_peers(), 0);
+    }
+
+    /// Once the tracking map is full, an untracked offender still gets a
+    /// one-shot penalty but the map does not grow (memory bound against
+    /// identity cycling).
+    #[test]
+    fn wire_reaction_track_cap_bounds_memory() {
+        let mut t = WirePenaltyTracker::new();
+        let bad: Vec<u8> = vec![0u8; MAX_WIRE_BYTES + 1];
+        for _ in 0..WIRE_PENALTY_TRACK_CAP {
+            t.classify(PeerId::random(), &bad);
+        }
+        assert_eq!(t.tracked_peers(), WIRE_PENALTY_TRACK_CAP);
+
+        // Map full: a NEW offender is penalized one-shot, map unchanged.
+        let late = PeerId::random();
+        match t.classify(late, &bad) {
+            WireReaction::Penalize { score, .. } => {
+                assert_eq!(score, WIRE_VIOLATION_PENALTY);
+            }
+            other => panic!("expected Penalize, got {:?}", other),
+        }
+        assert_eq!(t.tracked_peers(), WIRE_PENALTY_TRACK_CAP, "map must not grow past cap");
+        assert_eq!(t.score_of(&late), None, "one-shot offender is not inserted");
     }
 }

@@ -1519,9 +1519,10 @@ impl Block {
                 // — a stale/foreign Module-SIS witness on a SHA-256d chain is
                 // consensus-invalid, not merely ignored (fail closed).
                 self.pow_solution.is_empty()
-                    && hash_meets_target(
+                    && sha256d_pow_valid(
                         &self.header.pow_hash(),
                         &bits_to_target(self.header.bits),
+                        self.height,
                     )
             }
         }
@@ -2001,6 +2002,167 @@ pub fn hash_meets_target(hash: &[u8; 32], target: &[u8; 32]) -> bool {
         if h > t { return false; }
     }
     true
+}
+
+/// Genesis-2 SHA-256d PoW endianness hard fork (grandfathered by height).
+///
+/// The legacy rule compared the raw double-SHA256 output BIG-ENDIAN
+/// (`hash[0]` as the most-significant byte). Every off-the-shelf SHA-256
+/// ASIC and cpuminer instead treats the double-SHA256 output as a
+/// LITTLE-ENDIAN 256-bit integer (Bitcoin's convention — the hash read
+/// reversed). Under the legacy rule no standard miner's share or block ever
+/// validated ("invalid PoW"), so the chain was not actually ASIC-mineable.
+///
+/// At and above this height the comparison switches to Bitcoin little-endian,
+/// making the chain mineable by standard hardware. Blocks BELOW this height
+/// keep the legacy big-endian rule, so the existing chain stays valid — this
+/// is a coordinated flag-day hard fork: every Genesis-2 node must run a binary
+/// with this rule before the chain reaches this height.
+pub const SHA256D_LE_FORK_HEIGHT: u64 = 2400;
+
+/// Height-gated SHA-256d PoW check. Below [`SHA256D_LE_FORK_HEIGHT`]: the
+/// legacy big-endian comparison. At/above: Bitcoin's little-endian convention
+/// (reverse the double-SHA256 output, then compare big-endian against the
+/// target), so standard SHA-256 miners' work validates. The block's `pow_hash`
+/// itself is UNCHANGED (still the raw double-SHA256, preserving block identity
+/// and the parents commitment) — only the target comparison endianness moves.
+pub fn sha256d_pow_valid(pow_hash: &[u8; 32], target: &[u8; 32], height: u64) -> bool {
+    if height >= SHA256D_LE_FORK_HEIGHT {
+        let mut rev = *pow_hash;
+        rev.reverse();
+        hash_meets_target(&rev, target)
+    } else {
+        hash_meets_target(pow_hash, target)
+    }
+}
+
+/// Convert a floating-point difficulty into a 256-bit target (big-endian),
+/// Bitcoin diff-1 convention: `target(d) = diff1_target / d`, where
+/// `diff1_target = bits_to_target(0x1d00ffff)` (which coincides with the
+/// Genesis-2 pow-limit). A LARGER `d` yields a SMALLER target (harder to
+/// meet); `d < 1` yields a target EASIER than diff-1 — exactly what small /
+/// CPU miners need for frequent shares.
+///
+/// This is the share-target side of the stratum vardiff: the block's `bits`
+/// are NEVER derived from this — consensus keeps using `template.bits`. This
+/// only produces the per-miner accept/reject bound.
+///
+/// Fixed-point millionths keep precision and avoid U256 overflow: `diff1` is
+/// ~2^224, so `diff1 * 1e6` is ~2^244, comfortably inside a U256. `diff` is
+/// clamped to a strictly-positive, finite value (>= 1e-6 effective) so the
+/// integer denominator is always >= 1 and the division never traps.
+pub fn difficulty_to_target(diff: f64) -> [u8; 32] {
+    use primitive_types::U256;
+    // Scale to integer millionths; reject non-finite / sub-millionth inputs
+    // by flooring the denominator at 1 (== the easiest representable target).
+    let scaled = (diff.max(f64::MIN_POSITIVE) * 1_000_000.0).round();
+    let d: u128 = if scaled.is_finite() && scaled >= 1.0 { scaled as u128 } else { 1 };
+    let d = d.max(1);
+    let diff1 = U256::from_big_endian(&bits_to_target(0x1d00ffff));
+    let t = diff1 * U256::from(1_000_000u64) / U256::from(d);
+    // primitive-types 0.13: to_big_endian() returns [u8; 32] directly.
+    t.to_big_endian()
+}
+
+/// Difficulty implied by compact `bits`, Bitcoin diff-1 convention:
+/// `difficulty = diff1_target / target(bits)`. The live Genesis-2 chain sits
+/// ~4.35 at nbits 0x1c3acb93; a fresh devnet at 0x1d00ffff returns exactly
+/// 1.0. Used as the network difficulty and, critically, as the HARD CAP on
+/// per-miner share difficulty (a share is never harder than a real block).
+///
+/// Computed by scaling the target ratio by 1e6 in integer (U256) space and
+/// dividing back into f64, so difficulties > 1 keep their fractional part
+/// instead of truncating. For regtest-easy targets (difficulty far below
+/// 1e-6) this floors to 0.0 — acceptable, because the submit path additionally
+/// clamps the share target to be no harder than the block target in target
+/// space, so correctness never depends on this value's precision at the
+/// sub-millionth extreme.
+pub fn difficulty_from_bits(bits: u32) -> f64 {
+    use primitive_types::U256;
+    let diff1  = U256::from_big_endian(&bits_to_target(0x1d00ffff));
+    let target = U256::from_big_endian(&bits_to_target(bits));
+    if target.is_zero() {
+        return f64::INFINITY;
+    }
+    let scaled = diff1 * U256::from(1_000_000u64) / target;
+    // scaled == difficulty * 1e6. For any realistic consensus `bits` this is
+    // far below u128::MAX; guard the extreme anyway so we never panic.
+    if scaled > U256::from(u128::MAX) {
+        return f64::INFINITY;
+    }
+    scaled.as_u128() as f64 / 1_000_000.0
+}
+
+#[cfg(test)]
+mod vardiff_target_tests {
+    use super::*;
+
+    #[test]
+    fn diff1_roundtrips_to_pow_limit() {
+        // difficulty 1.0 must reproduce the diff-1 / pow-limit target exactly.
+        assert_eq!(difficulty_to_target(1.0), bits_to_target(0x1d00ffff));
+        // and the inverse: diff-1 bits == difficulty 1.0.
+        assert!((difficulty_from_bits(0x1d00ffff) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn higher_difficulty_is_a_smaller_target() {
+        // Monotonicity: d up => target down (harder).
+        let a = difficulty_to_target(0.001);
+        let b = difficulty_to_target(0.01);
+        let c = difficulty_to_target(1.0);
+        let d = difficulty_to_target(4.35);
+        assert!(hash_meets_target(&c, &a), "target(1.0) <= target(0.001)");
+        assert!(hash_meets_target(&c, &b), "target(1.0) <= target(0.01)");
+        assert!(hash_meets_target(&d, &c), "target(4.35) <= target(1.0)");
+    }
+
+    #[test]
+    fn share_target_never_harder_than_block_when_diff_at_or_below_net() {
+        // The core consensus-firewall invariant: for share_difficulty <=
+        // net_difficulty, share_target >= block_target (share never harder).
+        for &bits in &[0x1d00ffff_u32, 0x1c3acb93, 0x1e00ffff] {
+            let net = difficulty_from_bits(bits);
+            let block_target = bits_to_target(bits);
+            // pick a share difficulty at and below the cap
+            for frac in [1.0_f64, 0.5, 0.1, 0.01] {
+                let share_target = difficulty_to_target(net * frac);
+                // share_target must be >= block_target: block-meeting hash
+                // (== block_target) must also meet share_target.
+                assert!(hash_meets_target(&block_target, &share_target),
+                    "share_target < block_target for bits={:#x} frac={}", bits, frac);
+            }
+        }
+    }
+
+    #[test]
+    fn live_bits_report_expected_network_difficulty() {
+        // nbits 0x1c3acb93 is the live chain sample — difficulty ~4.35.
+        let d = difficulty_from_bits(0x1c3acb93);
+        assert!(d > 4.0 && d < 5.0, "expected ~4.35, got {}", d);
+    }
+
+    #[test]
+    fn le_fork_gating_flips_endianness_at_height() {
+        // A hash that is LE-small (Bitcoin/ASIC valid) but BE-large (legacy
+        // invalid): high leading byte, all-zero trailing bytes. This is exactly
+        // the shape a real SHA-256 miner produces and the legacy rule rejected.
+        let target = bits_to_target(0x1d00ffff);
+        let mut h = [0x11u8; 32];
+        h[0] = 0xff;                       // BE most-significant byte huge
+        h[31] = 0x00; h[30] = 0x00;        // LE most-significant bytes zero
+        h[29] = 0x00; h[28] = 0x00;
+
+        // Pre-fork (legacy big-endian): hash[0]=0xff > target[0]=0x00 -> reject.
+        assert!(!sha256d_pow_valid(&h, &target, SHA256D_LE_FORK_HEIGHT - 1),
+            "legacy rule must reject an LE-small / BE-large hash");
+        // At/after the fork (Bitcoin little-endian, hash reversed): accepts.
+        assert!(sha256d_pow_valid(&h, &target, SHA256D_LE_FORK_HEIGHT),
+            "post-fork rule must accept a standard little-endian hash");
+        // And the boundary is exact.
+        assert!(!sha256d_pow_valid(&h, &target, SHA256D_LE_FORK_HEIGHT - 1));
+        assert!(sha256d_pow_valid(&h, &target, SHA256D_LE_FORK_HEIGHT + 1));
+    }
 }
 
 /// Convert difficulty bits to work value (higher difficulty = higher work).

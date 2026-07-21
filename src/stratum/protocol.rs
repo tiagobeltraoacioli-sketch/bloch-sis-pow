@@ -152,6 +152,7 @@ pub mod methods {
     pub const SUBSCRIBE:             &str = "mining.subscribe";
     pub const AUTHORIZE:             &str = "mining.authorize";
     pub const SUBMIT:                &str = "mining.submit";
+    pub const CONFIGURE:             &str = "mining.configure";
     pub const EXTRANONCE_SUBSCRIBE:  &str = "mining.extranonce.subscribe";
     pub const SUGGEST_DIFFICULTY:    &str = "mining.suggest_difficulty";
     pub const SUGGEST_TARGET:        &str = "mining.suggest_target";

@@ -836,7 +836,7 @@ async fn dispatch_submit_shares_standard(
     use crate::stratum_v2::block_reconstruct::{
         reconstruct_block_for_sv2_submit, BlockReconstructError,
     };
-    use crate::core::{bits_to_target, hash_meets_target};
+    use crate::core::{bits_to_target, sha256d_pow_valid};
     use tokio::io::AsyncWriteExt;
 
     // Decoder failure — frame is malformed, we don't know
@@ -949,8 +949,11 @@ async fn dispatch_submit_shares_standard(
     };
 
     // --- Step 4: PoW check against block target -------------------
+    // Height-gated endianness (SHA256D_LE_FORK_HEIGHT): at/above the fork the
+    // hash is compared Bitcoin little-endian, matching V1 and consensus, so a
+    // standard SV2 miner's share validates.
     let block_target = bits_to_target(cached.template.bits);
-    if !hash_meets_target(&reconstructed.pow_hash, &block_target) {
+    if !sha256d_pow_valid(&reconstructed.pow_hash, &block_target, cached.template.height) {
         log::debug!(
             "stratum_v2: session {} ch={} seq={} job={} below block target (bits=0x{:08x}); responding difficulty-too-low",
             session_id, decoded.channel_id, decoded.sequence_number,
