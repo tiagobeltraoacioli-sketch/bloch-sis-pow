@@ -764,11 +764,16 @@ pub fn execute_reorg(
     // Sprint FF observability: record every attempt and surface the fork
     // depth before doing any work. Failures (including refused-by-depth-cap
     // plans) increment the failures counter — that is the one to alert on.
+    // S5: the depth histogram keeps the per-attempt distribution (the gauge
+    // is last-value-only), and the explicit success counter makes the success
+    // rate a direct series (invariant: attempts == success + failures).
     crate::metrics::inc_reorg_attempt();
     crate::metrics::set_fork_depth(plan.to_rollback.len() as i64);
+    crate::metrics::observe_reorg_depth(plan.to_rollback.len() as f64);
     let result = execute_reorg_inner(store, mempool, plan);
-    if result.is_err() {
-        crate::metrics::inc_reorg_failure();
+    match &result {
+        Ok(_)  => crate::metrics::inc_reorg_success(),
+        Err(_) => crate::metrics::inc_reorg_failure(),
     }
     result
 }
