@@ -48,11 +48,28 @@ use sha3::{Sha3_256, Digest};
 use argon2::{Argon2, Algorithm, Version, Params};
 use rand::RngCore;
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Current keyfile version.
 /// v1 = Argon2id + AES-256-GCM (this implementation).
 const KEYFILE_VERSION: u32 = 1;
+
+/// v2 keyfile (P4 — diversified-address wallets): same Argon2id + AES-256-GCM
+/// construction, but the ciphertext protects the wallet MASTER SEED alongside
+/// the base secret key, so index-N receive addresses (`crypto::diversified_*`)
+/// and selective-disclosure bundles (`wallet::disclosure`) can be produced from
+/// an encrypted-at-rest store instead of forcing the user to re-type the seed
+/// phrase for every derivation. v2 uses its OWN AAD domain ("bloch-kf2" + the
+/// version number, see `keyfile_aad_v2`), so a v2 ciphertext can never be
+/// re-labelled and decrypted under v1 semantics or vice versa — the GCM tag
+/// fails on any cross-version replay.
+pub const KEYFILE_VERSION_V2: u32 = 2;
+
+/// Bounds for the v2 plaintext layout (`[4B seed_len LE][seed][secret]`).
+/// The BIP39 PBKDF2 seed is 64 bytes; 32 is the floor `generate_keypair_from_seed`
+/// accepts; 128 leaves headroom without letting a corrupt field run away.
+const V2_SEED_MIN: usize = 32;
+const V2_SEED_MAX: usize = 128;
 
 /// KDF parameters. Tuned for ~4 seconds on modern CPU (2026).
 ///
@@ -308,6 +325,187 @@ impl EncryptedKeyfile {
 
         Ok((secret, public, net))
     }
+
+    // ── v2: master seed encrypted at rest (P4) ────────────────────────────────
+
+    /// Encrypt a v2 keyfile protecting `(master_seed, secret)` under `password`
+    /// with default KDF params. `master_seed` is the 64-byte BIP39 seed
+    /// (`SeedPhrase::to_seed_bytes()`); `secret`/`public` are the base (index-0)
+    /// keypair, so a v2 file is a strict superset of a v1 file: everything v1
+    /// enabled still works, plus diversified derivation and disclosure.
+    pub fn encrypt_seed_v2(
+        master_seed: &[u8],
+        secret: &[u8],
+        public: &[u8],
+        network: Network,
+        password: &str,
+    ) -> Result<Self, WalletError> {
+        Self::encrypt_seed_v2_with_params(
+            master_seed, secret, public, network, password, KdfParams::default())
+    }
+
+    /// v2 encrypt with custom KDF parameters (tuning / low-resource devices).
+    pub fn encrypt_seed_v2_with_params(
+        master_seed: &[u8],
+        secret: &[u8],
+        public: &[u8],
+        network: Network,
+        password: &str,
+        params: KdfParams,
+    ) -> Result<Self, WalletError> {
+        if master_seed.len() < V2_SEED_MIN || master_seed.len() > V2_SEED_MAX {
+            return Err(WalletError::Crypto(format!(
+                "master seed length {} out of bounds ({}..={})",
+                master_seed.len(), V2_SEED_MIN, V2_SEED_MAX)));
+        }
+        // Same blocking password policy as v1 (Sprint T.3 / Audit M-5).
+        validate_password_strength(password)?;
+
+        let mut salt = [0u8; 16];
+        let mut nonce_bytes = [0u8; 12];
+        rand::rng().fill_bytes(&mut salt);
+        rand::rng().fill_bytes(&mut nonce_bytes);
+
+        let mut key = [0u8; 32];
+        derive_key(password, &salt, params, &mut key)?;
+
+        // Plaintext: [4B seed_len LE][seed][secret]. Zeroizing so the buffer
+        // wipes on every exit path.
+        let mut plain = Zeroizing::new(Vec::with_capacity(4 + master_seed.len() + secret.len()));
+        plain.extend_from_slice(&(master_seed.len() as u32).to_le_bytes());
+        plain.extend_from_slice(master_seed);
+        plain.extend_from_slice(secret);
+
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        // v2 AAD domain: binds version + public key + network (audit M2 for v1,
+        // extended with the version so cross-version replay breaks the tag).
+        let aad = keyfile_aad_v2(public, network);
+        let ciphertext = cipher.encrypt(nonce, Payload { msg: plain.as_slice(), aad: &aad })
+            .map_err(|e| WalletError::Crypto(format!("AES-GCM encrypt: {}", e)))?;
+
+        key.zeroize();
+
+        let hash_full = Sha3_256::digest(public);
+        let mut addr_hash = [0u8; 20];
+        addr_hash.copy_from_slice(&hash_full[..20]);
+        let is_testnet = matches!(network, Network::Testnet);
+        let address = crate::crypto::address_from_hash(&addr_hash, is_testnet);
+
+        Ok(EncryptedKeyfile {
+            version: KEYFILE_VERSION_V2,
+            network: network.into(),
+            kdf: KdfDesc {
+                algo: "argon2id".to_string(),
+                salt_b64: B64.encode(&salt),
+                m_cost: params.m_cost,
+                t_cost: params.t_cost,
+                p_cost: params.p_cost,
+            },
+            cipher: CipherDesc {
+                algo: "aes-256-gcm".to_string(),
+                nonce_b64: B64.encode(&nonce_bytes),
+                ciphertext_b64: B64.encode(&ciphertext),
+            },
+            meta: Meta {
+                public_key_b64: B64.encode(public),
+                address,
+            },
+        })
+    }
+
+    /// Decrypt a v2 keyfile. Returns `(master_seed, secret, public, network)`
+    /// with both secrets in `Zeroizing` wrappers so they wipe when the caller
+    /// drops them.
+    ///
+    /// The guards below intentionally mirror `decrypt()` verbatim rather than
+    /// share a helper: the v1 path is audited (M, M2, L1) and stays untouched.
+    pub fn decrypt_v2(&self, password: &str)
+        -> Result<(Zeroizing<Vec<u8>>, Zeroizing<Vec<u8>>, Vec<u8>, Network), WalletError>
+    {
+        if self.version != KEYFILE_VERSION_V2 {
+            return Err(WalletError::UnsupportedVersion(self.version));
+        }
+        if self.kdf.algo != "argon2id" {
+            return Err(WalletError::Parse(format!("unknown KDF: {}", self.kdf.algo)));
+        }
+        if self.cipher.algo != "aes-256-gcm" {
+            return Err(WalletError::Parse(format!("unknown cipher: {}", self.cipher.algo)));
+        }
+
+        let salt = B64.decode(&self.kdf.salt_b64).map_err(|e| WalletError::Parse(e.to_string()))?;
+        let nonce_bytes = B64.decode(&self.cipher.nonce_b64).map_err(|e| WalletError::Parse(e.to_string()))?;
+        let ciphertext = B64.decode(&self.cipher.ciphertext_b64).map_err(|e| WalletError::Parse(e.to_string()))?;
+        let public = B64.decode(&self.meta.public_key_b64).map_err(|e| WalletError::Parse(e.to_string()))?;
+
+        // Length guards (audit M): Nonce::from_slice panics off-length; salt is
+        // fixed 16B; a GCM ciphertext below tag size cannot be valid.
+        const SALT_LEN: usize = 16;
+        const NONCE_LEN: usize = 12;
+        const GCM_TAG_LEN: usize = 16;
+        if salt.len() != SALT_LEN {
+            return Err(WalletError::Parse(format!(
+                "keyfile salt has invalid length: expected {} bytes, got {}",
+                SALT_LEN, salt.len())));
+        }
+        if nonce_bytes.len() != NONCE_LEN {
+            return Err(WalletError::Parse(format!(
+                "keyfile nonce has invalid length: expected {} bytes, got {}",
+                NONCE_LEN, nonce_bytes.len())));
+        }
+        if ciphertext.len() < GCM_TAG_LEN {
+            return Err(WalletError::Parse(format!(
+                "keyfile ciphertext too short: {} bytes, need at least the {}-byte GCM tag",
+                ciphertext.len(), GCM_TAG_LEN)));
+        }
+
+        // KDF-parameter bounds (audit L1): reject OOM/slow-loris params from
+        // the untrusted file before Argon2 sees them.
+        const MAX_M_COST_KIB: u32 = 1024 * 1024; // 1 GiB
+        const MAX_T_COST: u32 = 16;
+        const MAX_P_COST: u32 = 16;
+        if self.kdf.m_cost > MAX_M_COST_KIB
+            || self.kdf.t_cost > MAX_T_COST
+            || self.kdf.p_cost > MAX_P_COST
+        {
+            return Err(WalletError::Parse(format!(
+                "KDF params out of bounds (m_cost={} KiB, t_cost={}, p_cost={})",
+                self.kdf.m_cost, self.kdf.t_cost, self.kdf.p_cost)));
+        }
+
+        let params = KdfParams {
+            m_cost: self.kdf.m_cost,
+            t_cost: self.kdf.t_cost,
+            p_cost: self.kdf.p_cost,
+        };
+        let mut key = [0u8; 32];
+        derive_key(password, &salt, params, &mut key)?;
+
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        let net: Network = self.network.into();
+        let aad = keyfile_aad_v2(&public, net);
+        let plain = Zeroizing::new(
+            cipher.decrypt(nonce, Payload { msg: ciphertext.as_ref(), aad: &aad })
+                .map_err(|_| WalletError::WrongPassword)?);
+        key.zeroize();
+
+        // Parse [4B seed_len LE][seed][secret] with bounds checks — the
+        // plaintext is authenticated, so a failure here means an encoder bug,
+        // but never index out of bounds.
+        if plain.len() < 4 {
+            return Err(WalletError::Parse("v2 payload truncated (missing seed length)".into()));
+        }
+        let seed_len = u32::from_le_bytes([plain[0], plain[1], plain[2], plain[3]]) as usize;
+        if seed_len < V2_SEED_MIN || seed_len > V2_SEED_MAX || plain.len() < 4 + seed_len {
+            return Err(WalletError::Parse(format!(
+                "v2 payload seed length {} out of bounds", seed_len)));
+        }
+        let master_seed = Zeroizing::new(plain[4..4 + seed_len].to_vec());
+        let secret = Zeroizing::new(plain[4 + seed_len..].to_vec());
+
+        Ok((master_seed, secret, public, net))
+    }
 }
 
 /// AAD that binds the public key + network into the keyfile AEAD (audit M2),
@@ -316,6 +514,21 @@ impl EncryptedKeyfile {
 fn keyfile_aad(public: &[u8], network: Network) -> Vec<u8> {
     let mut aad = Vec::with_capacity(public.len() + 9);
     aad.extend_from_slice(b"bloch-kf");
+    aad.push(match network { Network::Testnet => 1u8, _ => 0u8 });
+    aad.extend_from_slice(public);
+    aad
+}
+
+/// v2 AAD: a DISTINCT domain tag plus the format version, then the same
+/// network + public-key binding as v1. Because the v1 tag ("bloch-kf") and the
+/// v2 tag ("bloch-kf2" + version bytes) never collide, flipping the `version`
+/// field on a keyfile re-routes decryption to the other AAD and the GCM tag
+/// fails closed (`WrongPassword`) — a v2 seed ciphertext can never be
+/// mis-decrypted as a v1 "secret key only" blob or vice versa.
+fn keyfile_aad_v2(public: &[u8], network: Network) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(public.len() + 14);
+    aad.extend_from_slice(b"bloch-kf2");
+    aad.extend_from_slice(&KEYFILE_VERSION_V2.to_le_bytes());
     aad.push(match network { Network::Testnet => 1u8, _ => 0u8 });
     aad.extend_from_slice(public);
     aad
@@ -556,6 +769,110 @@ mod tests {
         // Same secret, same password, but different salt → different output
         assert_ne!(k1.cipher.ciphertext_b64, k2.cipher.ciphertext_b64);
         assert_ne!(k1.kdf.salt_b64, k2.kdf.salt_b64);
+    }
+
+    // ── v2 (master seed at rest) ─────────────────────────────────────────────
+
+    fn v2_fixture() -> (EncryptedKeyfile, Vec<u8>, Vec<u8>, Vec<u8>) {
+        let fast_params = KdfParams { m_cost: 1024, t_cost: 1, p_cost: 1 };
+        let seed = vec![0x42u8; 64];       // 64-byte BIP39-style seed
+        let secret = b"base secret key bytes".to_vec();
+        let public = b"base public key bytes".to_vec();
+        let kf = EncryptedKeyfile::encrypt_seed_v2_with_params(
+            &seed, &secret, &public, Network::Testnet, "password-abcd-12", fast_params
+        ).unwrap();
+        (kf, seed, secret, public)
+    }
+
+    #[test]
+    fn v2_roundtrip_recovers_seed_secret_public_network() {
+        let (kf, seed, secret, public) = v2_fixture();
+        assert_eq!(kf.version, KEYFILE_VERSION_V2);
+
+        let (d_seed, d_secret, d_public, d_net) = kf.decrypt_v2("password-abcd-12").unwrap();
+        assert_eq!(d_seed.as_slice(), seed.as_slice());
+        assert_eq!(d_secret.as_slice(), secret.as_slice());
+        assert_eq!(d_public, public);
+        assert!(matches!(d_net, Network::Testnet));
+    }
+
+    #[test]
+    fn v2_wrong_password_fails() {
+        let (kf, ..) = v2_fixture();
+        assert!(matches!(kf.decrypt_v2("wrong-password-x"), Err(WalletError::WrongPassword)));
+    }
+
+    #[test]
+    fn v2_rejects_out_of_bounds_seed_lengths() {
+        let fast_params = KdfParams { m_cost: 1024, t_cost: 1, p_cost: 1 };
+        for bad_len in [0usize, 16, 31, 129] {
+            let r = EncryptedKeyfile::encrypt_seed_v2_with_params(
+                &vec![1u8; bad_len], b"sk", b"pk", Network::Mainnet,
+                "password-abcd-12", fast_params);
+            assert!(matches!(r, Err(WalletError::Crypto(_))),
+                "seed length {} must be rejected", bad_len);
+        }
+    }
+
+    /// Cross-version replay must fail CLOSED in both directions: the version
+    /// field routes to a different AAD domain, so the GCM tag cannot verify.
+    #[test]
+    fn v2_version_field_tamper_fails_both_directions() {
+        // v2 file re-labelled as v1 → v1 decrypt path → v1 AAD → tag failure.
+        let (mut kf, ..) = v2_fixture();
+        kf.version = KEYFILE_VERSION;
+        assert!(matches!(kf.decrypt("password-abcd-12"), Err(WalletError::WrongPassword)),
+            "v2 ciphertext must not decrypt under v1 semantics");
+
+        // v1 file re-labelled as v2 → v2 decrypt path → v2 AAD → tag failure.
+        let fast_params = KdfParams { m_cost: 1024, t_cost: 1, p_cost: 1 };
+        let mut kf1 = EncryptedKeyfile::encrypt_with_params(
+            b"secret", b"public", Network::Mainnet, "password-abcd-12", fast_params
+        ).unwrap();
+        kf1.version = KEYFILE_VERSION_V2;
+        assert!(matches!(kf1.decrypt_v2("password-abcd-12"), Err(WalletError::WrongPassword)),
+            "v1 ciphertext must not decrypt under v2 semantics");
+    }
+
+    /// Version guards: each decrypt path refuses the other version OUTRIGHT
+    /// (before any KDF work) when the label is honest.
+    #[test]
+    fn v2_and_v1_version_guards() {
+        let (kf2, ..) = v2_fixture();
+        assert!(matches!(kf2.decrypt("password-abcd-12"),
+            Err(WalletError::UnsupportedVersion(2))));
+
+        let fast_params = KdfParams { m_cost: 1024, t_cost: 1, p_cost: 1 };
+        let kf1 = EncryptedKeyfile::encrypt_with_params(
+            b"secret", b"public", Network::Mainnet, "password-abcd-12", fast_params
+        ).unwrap();
+        assert!(matches!(kf1.decrypt_v2("password-abcd-12"),
+            Err(WalletError::UnsupportedVersion(1))));
+    }
+
+    /// Audit M2 carried into v2: a swapped public key breaks the AAD binding.
+    #[test]
+    fn v2_tampered_public_key_fails_tag() {
+        let (mut kf, ..) = v2_fixture();
+        kf.meta.public_key_b64 = B64.encode(b"attacker public key");
+        assert!(matches!(kf.decrypt_v2("password-abcd-12"), Err(WalletError::WrongPassword)));
+    }
+
+    /// The decrypted v2 seed must drive diversified derivation end-to-end:
+    /// encrypted-at-rest store → unlock → same addresses as the live seed.
+    #[test]
+    fn v2_seed_supports_diversified_derivation_after_unlock() {
+        let fast_params = KdfParams { m_cost: 1024, t_cost: 1, p_cost: 1 };
+        let seed = vec![7u8; 64];
+        let kf = EncryptedKeyfile::encrypt_seed_v2_with_params(
+            &seed, b"sk-bytes", b"pk-bytes", Network::Testnet,
+            "password-abcd-12", fast_params
+        ).unwrap();
+        let (d_seed, ..) = kf.decrypt_v2("password-abcd-12").unwrap();
+        let live = crate::crypto::diversified_address(&seed, 3, true).unwrap();
+        let stored = crate::crypto::diversified_address(&d_seed, 3, true).unwrap();
+        assert_eq!(live, stored,
+            "address derived from the at-rest seed must match the live seed");
     }
 
     #[test]

@@ -43,9 +43,11 @@ pub mod encryption;
 #[cfg(feature = "node")]
 pub mod client;
 pub mod errors;
+pub mod disclosure;
 
 pub use seed::SeedPhrase;
 pub use errors::WalletError;
+pub use disclosure::{DisclosureBundle, DisclosureEntry, VerifiedDisclosure, DisclosureError};
 
 /// Local UTXO representation for wallet operations.
 #[derive(Debug, Clone)]
