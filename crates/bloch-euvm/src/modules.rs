@@ -394,6 +394,27 @@ pub fn compile_charter(charter: &TokenCharter) -> CompiledToken {
     }
 }
 
+/// **Fail-closed audited compile.** Run the [`crate::kirpich`] internal audit over
+/// `charter` *first*; if the audit denies (any [`crate::kirpich::Severity::Deny`]
+/// finding), refuse to compile and return the full [`crate::kirpich::AuditReport`] as the
+/// error. Otherwise compile exactly as [`compile_charter`] does.
+///
+/// This is the gated build entry point: a charter with a hard defect (an ambiguous
+/// minting policy, an unsatisfiable quorum, a permanently-locked custody leg, a corrupt
+/// emitted validator, …) never reaches the compiler. `Warn`/`Info` findings do not block
+/// and are not surfaced on the `Ok` path; a caller that wants the advisories should call
+/// [`crate::kirpich::kirpich_audit`] directly. [`compile_charter`] itself is left
+/// untouched (un-audited) for callers that opt out of the gate.
+pub fn compile_charter_audited(
+    charter: &TokenCharter,
+) -> Result<CompiledToken, crate::kirpich::AuditReport> {
+    let report = crate::kirpich::kirpich_audit(charter);
+    if report.denied {
+        return Err(report);
+    }
+    Ok(compile_charter(charter))
+}
+
 /// SHA-256d (double SHA-256), matching the VM's [`crate::Op::Sha256d`] and
 /// `validator_hash` convention.
 fn sha256d(b: &[u8]) -> [u8; 32] {
