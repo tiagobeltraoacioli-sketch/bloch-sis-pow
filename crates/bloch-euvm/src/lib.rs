@@ -534,9 +534,14 @@ pub fn fee_burn(fee: u64, burn_bps: u16) -> (u64, u64) {
 // Reference/foundation modules (standalone, tests-only, NOT consensus-wired).
 pub mod batcher;
 pub mod harness;
+pub mod kirpich;
 pub mod minting;
 pub mod modules;
 pub mod state;
+
+// Kirpich — the deterministic, fail-closed internal-audit gate over the Ustav charter
+// compile path (see [`modules::compile_charter_audited`]). Re-exported for ergonomic use.
+pub use kirpich::{kirpich_audit, AuditReport, Finding, Severity};
 
 // ─────────────────────────────────────────────────────────────────────────────
 #[cfg(test)]
