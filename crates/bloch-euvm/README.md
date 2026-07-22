@@ -62,7 +62,10 @@ a valid swap passes; a swap that would drain the pool is rejected by the validat
 - **Step 5 — integrate into the real node** (behind a flag, on a dedicated branch,
   with consensus tests and a third-party audit before any activation). This is the
   line that touches the live chain; it is intentionally **not** done here.
-- **Step 6 — merged mining (AuxPoW) + FFG committee** for the parallel-chain model.
+- **Step 6 — merged mining (AuxPoW)** for the parallel-chain model. (An earlier draft
+  paired this with an FFG committee; FFG has been **dropped** — the base is pure PoW
+  with deterministic, proof-gated validation, and any activation is a height-gated
+  hard fork, never a committee vote.)
 - Not yet modelled: minting policies (native token issuance), a higher-level contract
   language over these opcodes, and the batcher/routing layer for AMM concurrency.
 
