@@ -16,7 +16,7 @@ exclude = ["crates/coherence-prover", "fuzz"]
 
 [package]
 name = "bloch"
-version = "0.1.0-genesis"
+version = "0.3.0-genesis2"
 edition = "2021"
 authors = ["Bloch-SIS Protocol"]
 description = "Bloch-SIS Protocol: post-quantum pure-PoW BlockDAG L1 — SHAKE-256 hashcash PoW with a Module-SIS structural gate, hybrid Falcon+ML-DSA signatures, GhostDAG-Q"
