@@ -1,0 +1,95 @@
+---
+# Akash SDL — Bloch-SIS-PoW GENESIS-2 archival node (v0.3.0-genesis2).
+#
+# Restarts an Akash node "in the new model": the live SHA-256d Genesis-2 chain,
+# running as an ARCHIVAL peer (keeps + serves full history) rather than a CPU
+# miner. SHA-256d does not mine usefully on CPU, so these nodes earn nothing by
+# mining — their value is being reachable archival peers (they fix the
+# "an archival peer is needed to bootstrap" problem for everyone).
+#
+# BEFORE DEPLOYING:
+#   1. Build + push the image (the Dockerfile builds v0.3.0-genesis2 and bakes in
+#      /carryover.tsv):   docker build -t docker.io/blochv/bloch:0.3-genesis2 .
+#                         docker push  docker.io/blochv/bloch:0.3-genesis2
+#   2. Deploy / update:   akash tx deployment update deploy-genesis2.yaml --from <key> ...
+#      (in-place update keeps the persistent /bloch-data volume; a fresh lease
+#       re-syncs from the baked-in carry-over snapshot.)  Or paste into the
+#       Akash Console → "Run your own SDL".
+
+version: "2.0"
+
+services:
+  bloch-node:
+    image: docker.io/blochv/bloch:0.3-genesis2
+    args:
+      - "--genesis2"
+      - "--archive"
+      - "--carryover-snapshot"
+      - "/carryover.tsv"          # baked into the image by the Dockerfile
+      - "--data-dir"
+      - "/bloch-data"
+      - "--listen"
+      - "/ip4/0.0.0.0/tcp/16110"
+      # Live bootstrap peers (founder + Mumbai are archival; the rest are seeds).
+      - "--peer"
+      - "/ip4/51.83.249.212/tcp/16110"
+      - "--peer"
+      - "/ip4/148.113.59.206/tcp/16110"
+      - "--peer"
+      - "/ip4/45.76.138.60/tcp/16110"
+      - "--peer"
+      - "/ip4/45.76.82.134/tcp/16110"
+      - "--peer"
+      - "/ip4/137.66.39.208/tcp/16110"
+      - "--rpc-bind"
+      - "127.0.0.1"               # RPC stays LOCAL (not globally exposed below)
+      - "--rpc-port"
+      - "16210"
+      - "--max-peers"
+      - "500"
+    env:
+      # gossipsub=error silences the benign, high-volume "Send Queue full" line
+      # that otherwise fills the container log / disk.
+      - RUST_LOG=info,libp2p_gossipsub=error
+    expose:
+      # P2P only — must be globally reachable so peers can connect/sync from it.
+      - port: 16110
+        as: 16110
+        proto: tcp
+        to:
+          - global: true
+      # RPC is intentionally NOT exposed globally (archival peers don't need it;
+      # exposing it without --rpc-api-key would be a write risk). Add an expose
+      # entry + "--rpc-public --rpc-api-key <LONG-RANDOM>" only if you must.
+    params:
+      storage:
+        chaindata:
+          mount: /bloch-data
+          readOnly: false
+
+profiles:
+  compute:
+    bloch-node:
+      resources:
+        cpu:
+          units: 2            # archival peer, no CPU mining — 2 cores is plenty
+        memory:
+          size: 4Gi           # node + RocksDB (no ~40 mining threads anymore)
+        storage:
+          - size: 4Gi          # ephemeral root (image carries the carry-over)
+          - name: chaindata     # persistent Genesis-2 chain data (survives restarts)
+            size: 30Gi
+            attributes:
+              persistent: true
+              class: beta3
+  placement:
+    dcloud:
+      pricing:
+        bloch-node:
+          denom: uakt
+          amount: 100000       # max uAKT/block; 2-CPU is cheap, market-set lower
+deployment:
+  bloch-node:
+    dcloud:
+      profile: bloch-node
+      count: 1
