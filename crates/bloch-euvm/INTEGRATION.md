@@ -1,32 +1,41 @@
 # Step 5 — integrating the eUTXO VM into node consensus (PLAN, not wired)
 
 Branch: `euvm/integrate`. **Nothing here changes the live validation path.** This is
-the design + task plan for wiring `bloch-euvm` (VM) and `bloch-ffg` (committee-
-governed activation) into the node, to be implemented behind a flag, tested against
-consensus, and **only ever activated by a 14-of-21 committee quorum at a coordinated
-height** — never by shipping this code.
+the design + task plan for wiring `bloch-euvm` (VM) into the node, to be implemented
+behind a flag, tested against consensus, and **only ever activated at a coordinated
+hard-fork height** — never by shipping this code.
+
+> **Consensus model — no FFG committee (updated).** An earlier draft gated activation
+> on a `bloch-ffg` 14-of-21 committee quorum. That committee-governance path has been
+> **dropped**: the base is **pure PoW with deterministic, proof-gated validation** —
+> no bonded committee, no 2/3 vote, no finality gadget. Activation is therefore a
+> plain **height-gated hard fork**, deterministic and identical for every node — the
+> same pattern the ZK-Ledger groundwork uses (an activation-height sentinel pinned at
+> `u64::MAX` until a coordinated fork height is set). `bloch-ffg` is not a dependency
+> of this integration.
 
 ## Invariant that governs everything
 
-> When the `euvm` feature is **inactive** (default, and until the committee
-> activates it at its height), the node must behave **byte-for-byte** as today.
+> When the `euvm` feature is **inactive** (default, and until the activation height),
+> the node must behave **byte-for-byte** as today.
 > Old blocks must re-validate identically on resync (VULN-01 style: no silent fork).
 
 So integration is *additive*: a new output kind and a new spend path that only
 engage for eUTXO outputs, gated by `is_feature_active(...)`.
 
-## The activation gate (bloch-ffg)
+## The activation gate (deterministic, height-gated — no committee)
 
 ```
+// EUVM_ACTIVATION_HEIGHT is u64::MAX until a coordinated hard-fork height is chosen;
+// pinning it inert keeps the feature off while the code ships and is reviewed.
 active = height >= EUVM_ACTIVATION_HEIGHT
-      && bloch_ffg::is_feature_active(&committee, &FeatureActivation{feature:"euvm", height},
-                                      &committee_sigs, &pq_verifier, height)
 ```
 
-- The committee, the activation record, and the 14-of-21 signatures live **on-chain**
-  (a committee-registry commitment + an activation transaction), so every node checks
-  the same thing deterministically.
-- Below the activation height, `active == false` and none of the new code runs.
+- Activation is a **height-gated hard fork**: every node evaluates the same constant
+  against the block height, deterministically — no on-chain committee registry, no
+  activation signatures, no quorum.
+- Below the activation height, `active == false` and none of the new code runs; at or
+  above it, the eUTXO output kind + spend path engage on every node at once.
 
 ## Data-model mapping (node `Transaction` ↔ eUTXO)
 
@@ -58,19 +67,19 @@ The miner (block builder) mirrors the same checks so it never builds an invalid 
 
 ## Workspace wiring
 
-`bloch-euvm` and `bloch-ffg` currently carry an empty `[workspace]` (own roots, out of
-the node build) so they cannot destabilize the live node. Integration step:
-- Remove their `[workspace]` tables; add them to the node workspace `members`.
-- Add `bloch-euvm`/`bloch-ffg` as **optional** path deps under a `euvm` feature in the
-  node `Cargo.toml`; `default = []`. With the feature off, they are not compiled in.
+`bloch-euvm` currently carries an empty `[workspace]` (own roots, out of
+the node build) so it cannot destabilize the live node. Integration step:
+- Remove its `[workspace]` table; add it to the node workspace `members`.
+- Add `bloch-euvm` as an **optional** path dep under a `euvm` feature in the
+  node `Cargo.toml`; `default = []`. With the feature off, it is not compiled in.
 - Provide a `SigVerifier` adapter in the node that calls `bloch_crypto::verify`.
 
 ## Consensus-test plan (the gate to any activation)
 
 1. **Feature-off identity:** a corpus of historical blocks re-validates byte-identical
    with the feature compiled off AND compiled-on-but-inactive.
-2. **Activation determinism:** all nodes flip at the same height iff the on-chain
-   14-of-21 activation is present; with 13 sigs, none activate.
+2. **Activation determinism:** all nodes flip at exactly `EUVM_ACTIVATION_HEIGHT`
+   and not one block before — a pure height comparison, identical on every node.
 3. **eUTXO happy/again-paths:** P2PKH-as-validator, multisig, hash-lock, AMM swap,
    token conservation — mirrored from `bloch-euvm`'s unit tests but through the real
    `Transaction`/sighash/PQ verifier.
@@ -88,4 +97,5 @@ the node build) so they cannot destabilize the live node. Integration step:
 - No activation constant is set live.
 
 The order is deliberate: **plan → feature-gated wiring + consensus tests → external
-audit → committee-signed activation at a height.** This document is step-5.0.
+audit → height-gated hard-fork activation** (a coordinated fork height, no committee).
+This document is step-5.0.
