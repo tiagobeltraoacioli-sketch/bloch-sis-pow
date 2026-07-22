@@ -1,0 +1,16 @@
+Authors & Copyright
+===================
+
+Copyright (C) 2026 Tiago Beltrão de Azevedo Tenório Acioli
+Contact: tiagobeltraoacioli@gmail.com
+
+Sole author and copyright holder: Tiago Beltrão de Azevedo Tenório Acioli
+
+The Bloch-SIS-PoW *protocol* (its consensus rules and specification) is an open,
+ownerless commons — anyone is free to implement it. *This implementation* — all
+source code in this repository — is the author's copyrighted work, licensed to
+the public under the GNU Affero General Public License, version 3 or later
+(AGPL-3.0-or-later); see the LICENSE file. A separate commercial license without
+the AGPL's copyleft obligations is available from the author.
+
+"Bloch-SIS-PoW" and "Postern Labs" are trademarks of the author.

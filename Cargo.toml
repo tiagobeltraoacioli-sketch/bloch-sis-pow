@@ -20,7 +20,7 @@ version = "0.1.0-genesis"
 edition = "2021"
 authors = ["Bloch-SIS Protocol"]
 description = "Bloch-SIS Protocol: post-quantum pure-PoW BlockDAG L1 — SHAKE-256 hashcash PoW with a Module-SIS structural gate, hybrid Falcon+ML-DSA signatures, GhostDAG-Q"
-license = "MIT"
+license = "AGPL-3.0-or-later"
 repository  = "https://gitlab.com/bloch-protocol/bloch"
 
 [[bin]]

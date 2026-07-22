@@ -124,3 +124,18 @@ cumulative hashcash work on the aux SHAKE-256 target
 ## License
 
 MIT OR Apache-2.0.
+
+## License & Copyright
+
+Copyright (C) 2026 Tiago Beltrão de Azevedo Tenório Acioli.
+
+The Bloch-SIS-PoW **protocol** (its consensus rules and specification) is an open,
+ownerless commons — anyone may implement it. **This implementation** (all source
+in this repository) is the author's copyrighted work, licensed to the public under
+the **GNU Affero General Public License v3.0 or later** (`AGPL-3.0-or-later`); see
+[LICENSE](LICENSE) and [AUTHORS](AUTHORS). Any distributed fork — or any use of the
+software to provide a service over a network — must release its complete
+corresponding source under the same license. A commercial license without the AGPL
+obligations is available from the author.
+
+"Bloch-SIS-PoW" and "Postern Labs" are trademarks of the author.
