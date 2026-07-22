@@ -7,7 +7,7 @@ name = "bloch-euvm"
 version = "0.0.1"
 edition = "2021"
 description = "Minimal deterministic eUTXO validator VM for Bloch (foundation, not consensus-wired)"
-license = "MIT"
+license = "AGPL-3.0-or-later"
 
 [dependencies]
 sha2 = "0.10"

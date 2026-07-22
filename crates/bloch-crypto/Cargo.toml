@@ -4,7 +4,7 @@ version = "0.1.0-genesis"
 edition = "2021"
 authors = ["Bloch-SIS Protocol"]
 description = "Bloch-SIS Protocol: lean crypto / wallet / transaction surface (post-quantum signatures, HD wallet, tx construction) — the node's non-node island extracted so downstream products can depend on it without the full node"
-license = "MIT"
+license = "AGPL-3.0-or-later"
 repository = "https://gitlab.com/bloch-protocol/bloch"
 
 [lib]

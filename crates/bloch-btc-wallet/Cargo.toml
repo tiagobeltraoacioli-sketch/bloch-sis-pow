@@ -6,7 +6,7 @@ name = "bloch-btc-wallet"
 version = "0.0.1"
 edition = "2021"
 description = "Postern wallet: BTC address derivation + companion ML-DSA/Falcon PQ key from one seed"
-license = "MIT"
+license = "AGPL-3.0-or-later"
 
 [dependencies]
 bitcoin = "0.32"
