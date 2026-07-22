@@ -1490,7 +1490,6 @@ dependencies = [
  "bitcoin",
  "bloch-crypto",
  "bloch-euvm",
- "hex",
 ]
 
 [[package]]
