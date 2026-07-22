@@ -172,7 +172,7 @@ pub enum VmError {
 
 /// Per-op gas cost. Signature checks dominate real cost; hashing is mid; stack ops
 /// are cheap. (Illustrative schedule for the foundation.)
-fn gas_cost(op: &Op) -> u64 {
+pub fn gas_cost(op: &Op) -> u64 {
     match op {
         Op::VerifySig | Op::VerifyEcdsa => 1000,
         Op::Sha256d | Op::Shake256 => 60,
@@ -529,6 +529,14 @@ pub fn fee_burn(fee: u64, burn_bps: u16) -> (u64, u64) {
     let burned = (fee as u128 * burn_bps.min(10_000) as u128 / 10_000) as u64;
     (burned, fee - burned)
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Reference/foundation modules (standalone, tests-only, NOT consensus-wired).
+pub mod batcher;
+pub mod harness;
+pub mod minting;
+pub mod modules;
+pub mod state;
 
 // ─────────────────────────────────────────────────────────────────────────────
 #[cfg(test)]
