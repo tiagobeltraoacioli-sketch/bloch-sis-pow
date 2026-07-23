@@ -16,8 +16,20 @@
 //! The pump forwards every line UNCHANGED. It only *observes*: it caches the
 //! last `mining.notify` for keepalive re-feed, tracks the per-connection
 //! difficulty, and — for `mining.submit` — records a [`Share`] and folds the
-//! node's response ([`ShareOutcome`]) into [`Metrics`], the PPLNS window and
-//! the block-found hook.
+//! node's response ([`ShareOutcome`]) into [`Metrics`], the pool-wide PPLNS
+//! ledger ([`crate::pplns::PplnsLedger`]) and the block-found hook.
+//!
+//! ### Sprint-2 module split (was inline in Sprint 1)
+//!
+//! Two pieces that lived in this file in Sprint 1 now live in sibling modules
+//! so the four Sprint-2 devs edit disjoint files:
+//!
+//!   * the extranonce1 collision guard (`ExtranonceRegistry` /
+//!     `WorkerExtranonce`) plus the new *re-dial-until-unique* helper
+//!     [`claim_unique`] → `crate::extranonce` (G2);
+//!   * per-worker `Accounting` → the pool-wide [`crate::pplns::PplnsLedger`]
+//!     (G1), so payout-share can span every worker rather than being trapped
+//!     inside each `run_worker`.
 //!
 //! ### Sibling interfaces (the ACTUAL module APIs)
 //!
@@ -38,6 +50,13 @@
 //! //      buffered, so the router just forwards those raw lines downstream)
 //! //   async fn write(&mut self, line: &str) -> Result<(), PoolError>
 //! //   async fn reconnect(&mut self, &HandshakeReplay) -> Result<SubscribeResult, PoolError>
+//! //
+//! // crate::extranonce::claim_unique(&mut upstream, &replay, &mut wx, &cfg,
+//! //     &metrics, worker, initial) -> Result<(), PoolError>
+//! //   (assigns wx to a not-in-use extranonce1, re-dialing the upstream up
+//! //    to cfg.extranonce_redial_max times; falls back to log+count+serve)
+//! //
+//! // crate::pplns::PplnsLedger::record(worker, job_id, difficulty, outcome)
 //! ```
 //!
 //! Keepalive is kept entirely inside the router as a router-owned
@@ -47,14 +66,16 @@
 //! byte counters and worker connect/disconnect counters are owned by the conn
 //! and server modules respectively; the router only records share outcomes.
 
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::collections::VecDeque;
+use std::sync::Arc;
 
 use serde_json::Value;
 
 use crate::downstream::DownstreamConn;
 use crate::upstream::UpstreamConn;
+
+use crate::extranonce::{claim_unique, ExtranonceRegistry, WorkerExtranonce};
+use crate::pplns::PplnsLedger;
 
 use crate::types::{
     methods, ClientMsg, Framed, HandshakeReplay, Line, Metrics, PoolError, ProxyConfig, RawRequest,
@@ -75,99 +96,8 @@ const PENDING_CAP: usize = 4096;
 const PRE_SUBSCRIBE_CAP: usize = 32;
 
 // ─────────────────────────────────────────────────────────────────────────
-// Extranonce1 collision guard
+// Downstream extranonce reassignment helper
 // ─────────────────────────────────────────────────────────────────────────
-
-/// Process-wide registry of the `extranonce1` values currently assigned to
-/// live workers.
-///
-/// The node's extranonce1 is a 32-bit value with NO uniqueness registry
-/// (see the node's `session.rs::handle_subscribe`), so two upstreams can be
-/// handed the same value and then duplicate ALL work silently. This registry
-/// makes that observable: when a worker is assigned an extranonce1 already
-/// held by another live worker, the proxy logs a WARN and bumps
-/// `bloch_pool_extranonce1_collisions_total` instead of silently colliding.
-#[derive(Debug, Default)]
-pub struct ExtranonceRegistry {
-    live: Mutex<HashSet<String>>,
-}
-
-impl ExtranonceRegistry {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Try to claim `en1`. Returns `true` if it was unique (now registered),
-    /// `false` if another live worker already holds it (a collision — the
-    /// caller must NOT treat the search space as disjoint).
-    fn try_claim(&self, en1: &str) -> bool {
-        // A poisoned lock only means a previous holder panicked; the set is
-        // still usable, so recover rather than propagate.
-        let mut g = self.live.lock().unwrap_or_else(|e| e.into_inner());
-        g.insert(en1.to_string())
-    }
-
-    /// Release `en1` (called when the claiming worker drops it or exits).
-    fn release(&self, en1: &str) {
-        let mut g = self.live.lock().unwrap_or_else(|e| e.into_inner());
-        g.remove(en1);
-    }
-
-    #[cfg(test)]
-    fn contains(&self, en1: &str) -> bool {
-        self.live.lock().unwrap_or_else(|e| e.into_inner()).contains(en1)
-    }
-}
-
-/// RAII holder of ONE worker's current extranonce1 claim. Registers the
-/// claim on [`assign`](WorkerExtranonce::assign) (logging + counting a
-/// collision if the value is already live), moves the claim on reassignment
-/// (reconnect), and releases it on drop so a worker that exits — normally,
-/// by error, or by panic — never leaks its extranonce1.
-struct WorkerExtranonce {
-    registry: Arc<ExtranonceRegistry>,
-    /// The extranonce1 THIS worker currently owns a registry slot for, if
-    /// any. `None` when the current value collided with another worker (we
-    /// leave that other worker as the owner) or before the first assign.
-    held: Option<String>,
-}
-
-impl WorkerExtranonce {
-    fn new(registry: Arc<ExtranonceRegistry>) -> Self {
-        Self { registry, held: None }
-    }
-
-    /// Adopt `en1` as this worker's extranonce1. Releases any previously
-    /// held value first. On a collision, counts the metric and warns but
-    /// proceeds (the proxy stays transparent; it does not drop the worker).
-    fn assign(&mut self, en1: &str, metrics: &Metrics, worker: WorkerId) {
-        if self.held.as_deref() == Some(en1) {
-            return; // unchanged
-        }
-        if let Some(prev) = self.held.take() {
-            self.registry.release(&prev);
-        }
-        if self.registry.try_claim(en1) {
-            self.held = Some(en1.to_string());
-        } else {
-            metrics.extranonce1_collision();
-            log::warn!(
-                "{worker}: node assigned extranonce1 {en1} already in use by another live \
-                 worker — search spaces OVERLAP; work will be duplicated"
-            );
-            // Leave `held` = None: the other worker owns the slot, so we must
-            // not remove it on our drop.
-        }
-    }
-}
-
-impl Drop for WorkerExtranonce {
-    fn drop(&mut self) {
-        if let Some(en1) = self.held.take() {
-            self.registry.release(&en1);
-        }
-    }
-}
 
 /// Build a downstream `mining.set_extranonce` notification from a fresh
 /// subscribe result, so an idle-through-reconnect miner picks up its new
@@ -182,134 +112,16 @@ fn build_set_extranonce(sub: &SubscribeResult) -> String {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Accounting + PPLNS stub
-// ─────────────────────────────────────────────────────────────────────────
-
-/// One retained accepted share (the PPLNS window is a ring of these).
-#[derive(Clone, Debug)]
-pub struct ShareRecord {
-    pub worker: WorkerId,
-    pub job_id: String,
-    pub difficulty: f64,
-    pub outcome: ShareOutcome,
-    pub at: Instant,
-}
-
-/// Per-worker share accounting plus a PPLNS stub.
-///
-/// The window retains only *accepted* shares (difficulty-weighted, capped at
-/// `cfg.pplns_window_shares`); the running totals count every outcome. Payout
-/// settlement is out of Sprint-1 scope — [`Accounting::pplns_credit`] returns
-/// proportional credit fractions only.
-#[derive(Debug)]
-pub struct Accounting {
-    window: VecDeque<ShareRecord>,
-    cap: usize,
-    total_accepted: u64,
-    total_rejected: u64,
-    total_stale: u64,
-    total_duplicate: u64,
-    total_blocks: u64,
-}
-
-impl Accounting {
-    pub fn new(cfg: &ProxyConfig) -> Self {
-        Self {
-            window: VecDeque::new(),
-            cap: cfg.pplns_window_shares,
-            total_accepted: 0,
-            total_rejected: 0,
-            total_stale: 0,
-            total_duplicate: 0,
-            total_blocks: 0,
-        }
-    }
-
-    /// Fold one share result: bump the totals for every outcome, and push the
-    /// share onto the PPLNS window if it was accepted (and retention is on).
-    pub fn record(&mut self, share: &Share, outcome: &ShareOutcome) {
-        match outcome {
-            ShareOutcome::Accepted => self.total_accepted += 1,
-            ShareOutcome::Block => {
-                self.total_accepted += 1;
-                self.total_blocks += 1;
-            }
-            ShareOutcome::Stale => {
-                self.total_rejected += 1;
-                self.total_stale += 1;
-            }
-            ShareOutcome::Duplicate => {
-                self.total_rejected += 1;
-                self.total_duplicate += 1;
-            }
-            ShareOutcome::LowDifficulty | ShareOutcome::Rejected { .. } => {
-                self.total_rejected += 1;
-            }
-        }
-
-        if outcome.is_accepted() && self.cap > 0 {
-            self.window.push_back(ShareRecord {
-                worker: share.worker,
-                job_id: share.job_id.clone(),
-                difficulty: share.difficulty,
-                outcome: outcome.clone(),
-                at: Instant::now(),
-            });
-            while self.window.len() > self.cap {
-                self.window.pop_front();
-            }
-        }
-    }
-
-    pub fn window_len(&self) -> usize {
-        self.window.len()
-    }
-
-    /// PPLNS stub: proportional (difficulty-weighted) credit across the shares
-    /// currently in the window. Fractions sum to ~1.0; an empty window (or one
-    /// with no positive weight) yields an empty map. A non-positive share
-    /// difficulty is treated as unit weight so credit is never lost.
-    pub fn pplns_credit(&self) -> HashMap<WorkerId, f64> {
-        let mut per: HashMap<WorkerId, f64> = HashMap::new();
-        let mut total = 0.0f64;
-        for rec in &self.window {
-            let w = if rec.difficulty > 0.0 { rec.difficulty } else { 1.0 };
-            *per.entry(rec.worker).or_insert(0.0) += w;
-            total += w;
-        }
-        if total <= 0.0 {
-            return HashMap::new();
-        }
-        for v in per.values_mut() {
-            *v /= total;
-        }
-        per
-    }
-
-    pub fn total_accepted(&self) -> u64 {
-        self.total_accepted
-    }
-    pub fn total_rejected(&self) -> u64 {
-        self.total_rejected
-    }
-    pub fn total_stale(&self) -> u64 {
-        self.total_stale
-    }
-    pub fn total_duplicate(&self) -> u64 {
-        self.total_duplicate
-    }
-    pub fn total_blocks(&self) -> u64 {
-        self.total_blocks
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────
-// Eixo-2 seam (all no-ops in Sprint 1)
+// Eixo-2 seam (all no-ops in Sprint 1; G3 observability annotates it)
 // ─────────────────────────────────────────────────────────────────────────
 
 /// Stable call sites for Sprint-2 multi-tip DAG dispatch. Every method is a
 /// no-op today; they exist so the pump does not need editing when Eixo-2
-/// lands.
+/// lands. Sprint 2's HONEST verdict is that pool-influenced multi-tip is not
+/// achievable without a node change (the node's stratum/RPC build every job's
+/// parents from ALL current DAG tips and accept no parent selection), so this
+/// seam is fed by the read-only DAG-frontier observer (`crate::rpc`) as
+/// OBSERVABILITY only, never as steering.
 #[derive(Clone, Debug, Default)]
 pub struct RouterHooks;
 
@@ -371,11 +183,15 @@ fn is_transient(e: &PoolError) -> bool {
 /// Full lifecycle of one worker. Spawned per accepted connection by the
 /// server. Never panics; returns `Ok(())` after either side closes cleanly,
 /// or `Err` on an unrecoverable transport/protocol fault.
+///
+/// `registry` is the process-wide extranonce1 collision guard; `ledger` is
+/// the pool-wide PPLNS ledger every worker records accepted shares into.
 pub async fn run_worker(
     mut down: DownstreamConn,
     cfg: Arc<ProxyConfig>,
     metrics: Arc<Metrics>,
     registry: Arc<ExtranonceRegistry>,
+    ledger: Arc<PplnsLedger>,
 ) -> Result<(), PoolError> {
     let worker = down.worker;
 
@@ -405,9 +221,13 @@ pub async fn run_worker(
     let mut upstream =
         UpstreamConn::connect(cfg.clone(), metrics.clone(), worker, replay.clone()).await?;
 
-    // Track this worker's extranonce1 in the process-wide collision guard.
+    // Track this worker's extranonce1 in the process-wide collision guard,
+    // re-dialing the upstream (bounded by cfg.extranonce_redial_max) until the
+    // node hands a not-in-use value, or falling back to log+count+serve. On
+    // initial connect (`true`) the re-dial preserves the subscribe-result
+    // prelude so the miner still inherits the FINAL extranonce1 downstream.
     let mut wx = WorkerExtranonce::new(registry);
-    wx.assign(&upstream.extranonce1, &metrics, worker);
+    claim_unique(&mut upstream, &replay, &mut wx, &cfg, &metrics, worker, true).await?;
     log::info!(
         "{worker}: upstream established (extranonce1={})",
         upstream.extranonce1
@@ -419,7 +239,6 @@ pub async fn run_worker(
     // handshake-replay step is needed here.
 
     // ── 3. Transparent bidirectional pump ────────────────────────────────
-    let mut accounting = Accounting::new(&cfg);
     let hooks = RouterHooks::new();
     let mut current_difficulty = 0.0f64;
     let mut last_notify_raw: Option<Line> = None;
@@ -474,7 +293,7 @@ pub async fn run_worker(
                                 log::warn!("{worker}: upstream write failed ({e}) — reconnecting");
                                 if !reconnect_upstream(
                                     &mut upstream, &mut down, &replay, &authorize_line,
-                                    miner_wants_extranonce, &mut wx, &metrics, worker,
+                                    miner_wants_extranonce, &mut wx, &cfg, &metrics, worker,
                                 ).await? {
                                     break;
                                 }
@@ -512,7 +331,7 @@ pub async fn run_worker(
                         log::warn!("{worker}: upstream EOF — reconnecting");
                         if !reconnect_upstream(
                             &mut upstream, &mut down, &replay, &authorize_line,
-                            miner_wants_extranonce, &mut wx, &metrics, worker,
+                            miner_wants_extranonce, &mut wx, &cfg, &metrics, worker,
                         ).await? {
                             break;
                         }
@@ -541,7 +360,7 @@ pub async fn run_worker(
                                 let outcome = hooks.classify_block(outcome);
                                 // A bare boolean ack (authorize / configure /
                                 // suggest_difficulty) classifies as SubmitResult
-                                // too, so only fold into counters + accounting
+                                // too, so only fold into counters + the ledger
                                 // when the id actually matches a submit we
                                 // forwarded. Non-matching acks are forwarded
                                 // downstream verbatim (already done) but NOT
@@ -551,7 +370,12 @@ pub async fn run_worker(
                                 {
                                     metrics.record_outcome(&outcome);
                                     if let Some((_, share)) = pending.remove(pos) {
-                                        accounting.record(&share, &outcome);
+                                        ledger.record(
+                                            share.worker,
+                                            &share.job_id,
+                                            share.difficulty,
+                                            &outcome,
+                                        );
                                     }
                                 } else {
                                     log::debug!(
@@ -569,7 +393,7 @@ pub async fn run_worker(
                         log::warn!("{worker}: upstream error ({e}) — reconnecting");
                         if !reconnect_upstream(
                             &mut upstream, &mut down, &replay, &authorize_line,
-                            miner_wants_extranonce, &mut wx, &metrics, worker,
+                            miner_wants_extranonce, &mut wx, &cfg, &metrics, worker,
                         ).await? {
                             break;
                         }
@@ -602,13 +426,7 @@ pub async fn run_worker(
         }
     }
 
-    log::info!(
-        "{worker}: worker finished (accepted={}, rejected={}, blocks={}, window={})",
-        accounting.total_accepted(),
-        accounting.total_rejected(),
-        accounting.total_blocks(),
-        accounting.window_len()
-    );
+    log::info!("{worker}: worker finished");
     Ok(())
 }
 
@@ -617,11 +435,12 @@ pub async fn run_worker(
 ///
 ///   1. re-dial + re-subscribe (via `upstream.reconnect`, which yields the
 ///      node's fresh `SubscribeResult`),
-///   2. update the extranonce1 collision guard,
+///   2. claim a not-in-use extranonce1 in the collision guard, re-dialing
+///      (bounded) if the node handed one already live (via [`claim_unique`]),
 ///   3. REPLAY `mining.authorize` upstream — a reconnected session is
 ///      Subscribed but NOT Authorized, so without this every subsequent
 ///      submit is rejected as unauthorized (error 24),
-///   4. if the node handed out a NEW extranonce1, surface it downstream:
+///   4. if the effective extranonce1 CHANGED, surface it downstream:
 ///      push `mining.set_extranonce` if the miner subscribed to extranonce
 ///      updates, otherwise signal the caller to DROP the downstream so the
 ///      miner reconnects and re-subscribes on a clean session (an ASIC that
@@ -637,14 +456,19 @@ async fn reconnect_upstream(
     authorize_line: &Option<Line>,
     miner_wants_extranonce: bool,
     wx: &mut WorkerExtranonce,
-    metrics: &Metrics,
+    cfg: &Arc<ProxyConfig>,
+    metrics: &Arc<Metrics>,
     worker: WorkerId,
 ) -> Result<bool, PoolError> {
     let old_en1 = upstream.extranonce1.clone();
-    let sub = upstream.reconnect(replay).await?;
+    upstream.reconnect(replay).await?;
 
-    // Refresh the collision guard with the (possibly new) extranonce1.
-    wx.assign(&sub.extranonce1, metrics, worker);
+    // Refresh the collision guard with the (possibly new) extranonce1, and
+    // re-dial for a unique one if it collided. This may itself re-dial the
+    // upstream, so read the EFFECTIVE extranonce1 back off `upstream`
+    // afterwards rather than trusting the pre-claim reconnect result.
+    claim_unique(upstream, replay, wx, cfg, metrics, worker, false).await?;
+    let new_en1 = upstream.extranonce1.clone();
 
     // Re-authorize: the fresh session is Subscribed but not Authorized.
     if let Some(auth) = authorize_line {
@@ -657,19 +481,21 @@ async fn reconnect_upstream(
     }
 
     // Propagate a changed extranonce1 to the miner, or drop so it re-subscribes.
-    if sub.extranonce1 != old_en1 {
+    if new_en1 != old_en1 {
         if miner_wants_extranonce {
+            let sub = SubscribeResult {
+                extranonce1: new_en1.clone(),
+                extranonce2_size: upstream.extranonce2_size,
+            };
             let line = build_set_extranonce(&sub);
             down.write(&line).await?;
             log::info!(
-                "{worker}: extranonce1 changed {old_en1}->{} on reconnect; sent set_extranonce",
-                sub.extranonce1
+                "{worker}: extranonce1 changed {old_en1}->{new_en1} on reconnect; sent set_extranonce"
             );
         } else {
             log::warn!(
-                "{worker}: extranonce1 changed {old_en1}->{} on reconnect but miner did not \
-                 subscribe to extranonce updates — dropping downstream so it re-subscribes",
-                sub.extranonce1
+                "{worker}: extranonce1 changed {old_en1}->{new_en1} on reconnect but miner did not \
+                 subscribe to extranonce updates — dropping downstream so it re-subscribes"
             );
             return Ok(false);
         }
@@ -735,7 +561,8 @@ async fn read_handshake(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ProxyConfig, Share, ShareOutcome, WorkerId};
+    use crate::types::{Share, ShareOutcome, WorkerId};
+    use std::time::Instant;
 
     fn mk_share(worker: u64, job: &str, diff: f64) -> Share {
         Share {
@@ -747,99 +574,6 @@ mod tests {
             difficulty: diff,
             submitted_at: Instant::now(),
         }
-    }
-
-    fn cfg_with_window(n: usize) -> ProxyConfig {
-        ProxyConfig {
-            pplns_window_shares: n,
-            ..ProxyConfig::default()
-        }
-    }
-
-    #[test]
-    fn accepted_share_enters_window_and_totals() {
-        let mut acc = Accounting::new(&cfg_with_window(10));
-        acc.record(&mk_share(1, "j1", 4.0), &ShareOutcome::Accepted);
-        assert_eq!(acc.window_len(), 1);
-        assert_eq!(acc.total_accepted(), 1);
-        assert_eq!(acc.total_rejected(), 0);
-    }
-
-    #[test]
-    fn rejected_outcomes_touch_totals_not_window() {
-        let mut acc = Accounting::new(&cfg_with_window(10));
-        acc.record(&mk_share(1, "j1", 4.0), &ShareOutcome::Stale);
-        acc.record(&mk_share(1, "j2", 4.0), &ShareOutcome::Duplicate);
-        acc.record(&mk_share(1, "j3", 4.0), &ShareOutcome::LowDifficulty);
-        acc.record(
-            &mk_share(1, "j4", 4.0),
-            &ShareOutcome::Rejected { code: 20, message: "nope".into() },
-        );
-        assert_eq!(acc.window_len(), 0);
-        assert_eq!(acc.total_rejected(), 4);
-        assert_eq!(acc.total_stale(), 1);
-        assert_eq!(acc.total_duplicate(), 1);
-        assert_eq!(acc.total_accepted(), 0);
-    }
-
-    #[test]
-    fn block_counts_as_accepted_plus_block() {
-        let mut acc = Accounting::new(&cfg_with_window(10));
-        acc.record(&mk_share(7, "j1", 1.0), &ShareOutcome::Block);
-        assert_eq!(acc.total_accepted(), 1);
-        assert_eq!(acc.total_blocks(), 1);
-        assert_eq!(acc.window_len(), 1);
-    }
-
-    #[test]
-    fn window_is_capped_and_drops_oldest() {
-        let mut acc = Accounting::new(&cfg_with_window(3));
-        for i in 0..5 {
-            acc.record(&mk_share(1, &format!("j{i}"), 1.0), &ShareOutcome::Accepted);
-        }
-        assert_eq!(acc.window_len(), 3);
-        assert_eq!(acc.total_accepted(), 5);
-    }
-
-    #[test]
-    fn zero_window_disables_retention_but_keeps_totals() {
-        let mut acc = Accounting::new(&cfg_with_window(0));
-        acc.record(&mk_share(1, "j1", 4.0), &ShareOutcome::Accepted);
-        assert_eq!(acc.window_len(), 0);
-        assert_eq!(acc.total_accepted(), 1);
-        assert!(acc.pplns_credit().is_empty());
-    }
-
-    #[test]
-    fn pplns_credit_is_difficulty_weighted_and_normalized() {
-        let mut acc = Accounting::new(&cfg_with_window(100));
-        // worker 1: 3 + 1 = 4 weight; worker 2: 4 weight → 50/50.
-        acc.record(&mk_share(1, "j", 3.0), &ShareOutcome::Accepted);
-        acc.record(&mk_share(1, "j", 1.0), &ShareOutcome::Accepted);
-        acc.record(&mk_share(2, "j", 4.0), &ShareOutcome::Accepted);
-
-        let credit = acc.pplns_credit();
-        let c1 = *credit.get(&WorkerId(1)).unwrap();
-        let c2 = *credit.get(&WorkerId(2)).unwrap();
-        assert!((c1 - 0.5).abs() < 1e-9, "c1={c1}");
-        assert!((c2 - 0.5).abs() < 1e-9, "c2={c2}");
-        assert!(((c1 + c2) - 1.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn pplns_treats_nonpositive_difficulty_as_unit_weight() {
-        let mut acc = Accounting::new(&cfg_with_window(100));
-        acc.record(&mk_share(1, "j", 0.0), &ShareOutcome::Accepted);
-        acc.record(&mk_share(2, "j", 0.0), &ShareOutcome::Accepted);
-        let credit = acc.pplns_credit();
-        assert!((credit.get(&WorkerId(1)).unwrap() - 0.5).abs() < 1e-9);
-        assert!((credit.get(&WorkerId(2)).unwrap() - 0.5).abs() < 1e-9);
-    }
-
-    #[test]
-    fn empty_window_has_empty_credit() {
-        let acc = Accounting::new(&cfg_with_window(100));
-        assert!(acc.pplns_credit().is_empty());
     }
 
     #[test]
@@ -886,68 +620,24 @@ mod tests {
 
     #[test]
     fn submit_result_correlates_to_pending_share_by_id() {
-        // Mirror the pump's correlation logic in isolation.
+        // Mirror the pump's correlation logic in isolation: a SubmitResult is
+        // folded into accounting only when its id matches a pending submit.
         let mut pending: VecDeque<(String, Share)> = VecDeque::new();
         let id = Some(Value::from(42u64));
         pending.push_back((id_key(&id), mk_share(1, "j1", 8.0)));
 
-        let mut acc = Accounting::new(&cfg_with_window(100));
+        // Matching id removes exactly the pending share.
         let key = id_key(&id);
         let pos = pending.iter().position(|(k, _)| *k == key).unwrap();
         let (_, share) = pending.remove(pos).unwrap();
-        acc.record(&share, &ShareOutcome::Accepted);
-
+        assert_eq!(share.worker, WorkerId(1));
         assert!(pending.is_empty());
-        assert_eq!(acc.window_len(), 1);
-        let credit = acc.pplns_credit();
-        assert!((credit.get(&WorkerId(1)).unwrap() - 1.0).abs() < 1e-9);
-    }
 
-    #[test]
-    fn extranonce_registry_flags_collisions_and_counts_metric() {
-        let reg = Arc::new(ExtranonceRegistry::new());
-        let metrics = Metrics::new();
-
-        // Worker A claims "aaaa" — unique.
-        let mut a = WorkerExtranonce::new(reg.clone());
-        a.assign("aaaa", &metrics, WorkerId(1));
-        assert!(reg.contains("aaaa"));
-        assert_eq!(metrics.snapshot().extranonce1_collisions, 0);
-
-        // Worker B is handed the SAME "aaaa" — collision counted, A keeps slot.
-        let mut b = WorkerExtranonce::new(reg.clone());
-        b.assign("aaaa", &metrics, WorkerId(2));
-        assert_eq!(metrics.snapshot().extranonce1_collisions, 1);
-        assert!(reg.contains("aaaa"));
-
-        // B dropping must NOT evict A's still-live claim.
-        drop(b);
-        assert!(reg.contains("aaaa"), "B's drop wrongly released A's extranonce1");
-
-        // A dropping releases it.
-        drop(a);
-        assert!(!reg.contains("aaaa"));
-    }
-
-    #[test]
-    fn extranonce_reassign_moves_the_claim() {
-        let reg = Arc::new(ExtranonceRegistry::new());
-        let metrics = Metrics::new();
-        let mut w = WorkerExtranonce::new(reg.clone());
-
-        w.assign("1111", &metrics, WorkerId(1));
-        assert!(reg.contains("1111"));
-
-        // Reconnect hands out a fresh extranonce1: old released, new claimed.
-        w.assign("2222", &metrics, WorkerId(1));
-        assert!(!reg.contains("1111"));
-        assert!(reg.contains("2222"));
-        assert_eq!(metrics.snapshot().extranonce1_collisions, 0);
-
-        // Re-assigning the SAME value is a no-op (no self-collision).
-        w.assign("2222", &metrics, WorkerId(1));
-        assert_eq!(metrics.snapshot().extranonce1_collisions, 0);
-        assert!(reg.contains("2222"));
+        // A non-matching id (e.g. an authorize ack) finds nothing to fold.
+        pending.push_back((id_key(&Some(Value::from(1u64))), mk_share(1, "j2", 8.0)));
+        let ack_key = id_key(&Some(Value::from(99u64)));
+        assert!(pending.iter().position(|(k, _)| *k == ack_key).is_none());
+        assert_eq!(pending.len(), 1);
     }
 
     #[test]
