@@ -268,6 +268,28 @@ fn compile_vesting(c: &VestingConfig) -> Vec<Op> {
 /// Counts verifying signatures and asserts `count >= threshold`.
 fn compile_governance(c: &GovernanceConfig) -> Vec<Op> {
     let m = c.signers.len();
+
+    // ── Fail-closed compile-time guards ──────────────────────────────────────────
+    // A charter that would emit a subtly-broken quorum program is refused by emitting
+    // an UNSPENDABLE sentinel (`[PushInt(0)]`, which always evaluates false → the guard
+    // authorizes no spend) rather than a program that silently mis-gates. Fail-closed:
+    //
+    //  * `threshold == 0` with real members → a "0-of-m" gate guards nothing (a spend
+    //    needs zero valid signatures). The empty-signer degenerate case (m == 0) keeps
+    //    its documented trivial behaviour and is not caught here.
+    //  * duplicate signer pubkeys → one reused key/signature satisfies multiple slots,
+    //    silently halving (or worse) the distinct keys a quorum actually requires.
+    //  * `m > 253` → the first signer's Pick depth is `m + 2`; for m ≥ 254 that is ≥ 256
+    //    and truncates in the `as u8` cast (256 → `Pick(0)` == `Dup`), making the guard
+    //    check `verify(msg, pk, pk)` — a silent, un-surfaced liveness/censorship break.
+    let has_dup_signer = {
+        let mut seen = std::collections::BTreeSet::new();
+        c.signers.iter().any(|pk| !seen.insert(pk.as_slice()))
+    };
+    if (!c.signers.is_empty() && c.threshold == 0) || has_dup_signer || m > 253 {
+        return vec![Op::PushInt(0)]; // unspendable: always false, never authorizes a spend
+    }
+
     let mut p = Vec::new();
     // acc := 0  →  invariant per iteration: stack = [datum, sig_1..sig_m, acc]
     p.push(Op::PushInt(0));
@@ -275,7 +297,8 @@ fn compile_governance(c: &GovernanceConfig) -> Vec<Op> {
         // 1-based absolute index of this signer's sig on the stack.
         let i = i0 + 1;
         // At Pick time the stack is [datum, sigs.., acc, msg, pk]; the sig sits
-        // (m + 3 - i) slots below the top (see module derivation).
+        // (m + 3 - i) slots below the top (see module derivation). Guarded above:
+        // m ≤ 253 ⇒ max depth (i == 1) is m + 2 ≤ 255, so the `as u8` cast is exact.
         let depth = (m + 3 - i) as u8;
         p.push(Op::CtxField(FIELD_SIGHASH)); // push msg
         p.push(Op::PushBytes(pk.clone())); // push signer pubkey
@@ -788,18 +811,16 @@ mod tests {
     // `governance_pick_depth_*` tests and the doc comments on each).
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// **BUG.** `compile_governance` computes each signer's stack depth as
-    /// `(m + 3 - i) as u8`. For the first signer in a charter with `m >= 254`
-    /// members, that depth is `m + 2 >= 256`, which silently wraps in the `as u8`
-    /// cast (`256 as u8 == 0`) instead of erroring at compile time. `Pick(0)` is
-    /// `Dup`, so the compiled program duplicates the just-pushed PUBKEY instead of
-    /// reaching down to the real signature slot — it ends up checking
-    /// `verify(msg, pk, pk)`, which a genuine signature can never satisfy.
+    /// REGRESSION (F6 fixed): `compile_governance` used to compute each signer's stack
+    /// depth as `(m + 3 - i) as u8`. For the first signer of a charter with `m >= 254`
+    /// members that depth is `m + 2 >= 256`, which silently wrapped in the `as u8` cast
+    /// (`256 as u8 == 0`); `Pick(0)` is `Dup`, so the guard checked `verify(msg, pk, pk)`
+    /// — an un-surfaced liveness break where a fully, correctly signed unanimous
+    /// redeemer could never spend.
     ///
-    /// Demonstrated here at the functional level: a *unanimous* (threshold == m)
-    /// governance charter with 254 signers, where every single signer supplies a
-    /// genuinely valid signature, is nonetheless rejected — a silent liveness /
-    /// censorship defect with no error surfaced anywhere in the compiler.
+    /// Fixed: `m > 253` now fails closed at compile time, emitting the unspendable
+    /// sentinel `[PushInt(0)]`. The defect can no longer masquerade as a working guard —
+    /// the module is an explicit no-op-deny, and this test fails if truncation returns.
     #[test]
     fn governance_pick_depth_u8_truncation_bug_m254_unanimous_fails() {
         let m = 254usize;
@@ -814,7 +835,16 @@ mod tests {
         let cm = &ct.validators[0];
         let ctx = ctx_with(0, vec![]);
 
-        // Every signer supplies a genuinely valid, distinct signature.
+        // The compiler fails closed: an m=254 governance is an unspendable sentinel,
+        // NOT a truncated Pick(0) program masquerading as a real quorum.
+        assert_eq!(cm.program.len(), 1, "fail-closed governance is a single-op sentinel");
+        assert!(
+            matches!(cm.program[0], Op::PushInt(0)),
+            "expected the fail-closed PushInt(0) sentinel, got {:?}",
+            cm.program[0]
+        );
+
+        // Even a fully, correctly signed unanimous redeemer cannot spend it (by design).
         let sigs: Vec<Vec<u8>> = (0..m).map(|i| format!("sig-{i:04}").into_bytes()).collect();
         let redeemer: Vec<Val> = sigs.iter().cloned().map(Val::Bytes).collect();
         let good: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = signers
@@ -825,48 +855,39 @@ mod tests {
             .collect();
         let v = MockVerifier { good };
 
-        let mut gas = 10_000_000; // generous; see gas_cost_is_deterministic_and_matches_formula_for_each_module
+        let mut gas = 10_000_000;
         let out = ExtOutput { value: blch(1000), validator_hash: cm.validator_hash, datum: Val::Int(0) };
         let result = spend(&out, &cm.program, redeemer, &ctx, &v, &mut gas);
-
-        // If this ever starts failing with Ok(true), the u8-truncation bug has been
-        // fixed (e.g. Pick widened to u16, or `compile_governance` now rejects
-        // configs with `signers.len() > 253`) — update/remove this regression test.
         assert_eq!(
             result,
             Ok(false),
-            "BUG CONFIRMED: unanimous governance with m=254 wrongly rejects a fully, \
-             correctly signed redeemer because of u8 Pick-depth truncation in \
-             compile_governance (signer #1's Pick wraps to Pick(0)==Dup)"
+            "fail-closed m=254 governance must authorize no spend (unspendable sentinel)"
         );
     }
 
-    /// Same root cause as above, shown directly on the emitted bytecode instead of
-    /// through a MockVerifier: signer #1 (i=1) needs depth `m+2 = 256`, which does
-    /// not fit in `u8`; the compiler emits `Op::Pick(0)` (silently wrapped) rather
-    /// than failing to compile.
+    /// REGRESSION (F6 fixed), shown directly on the emitted bytecode: a charter that
+    /// would need an un-representable Pick depth (`m + 2 = 256` for signer #1 when
+    /// `m == 254`) no longer emits a silently-wrapped `Op::Pick(0)`. Instead the
+    /// compiler fails closed and emits exactly the unspendable `[PushInt(0)]` sentinel.
     #[test]
     fn governance_pick_depth_truncation_visible_in_bytecode() {
         let m = 254usize;
         let signers: Vec<Vec<u8>> = (0..m).map(|i| format!("s{i}").into_bytes()).collect();
         let program = compile_governance(&GovernanceConfig { signers, threshold: 1 });
-        // Layout per signer: [CtxField, PushBytes, Pick, VerifySig, Add]; signer #1
-        // is the first group, right after the leading PushInt(0) accumulator seed.
-        match &program[3] {
-            Op::Pick(0) => {} // confirms the wraparound — conceptually this should
-            // be an unrepresentable Pick(256).
-            other => panic!(
-                "expected the wrapped Op::Pick(0) demonstrating the u8 truncation bug, \
-                 got {other:?} instead — has compile_governance changed?"
-            ),
-        }
+        // Fail-closed: bytecode == vec![PushInt(0)] (Op has no PartialEq, so match).
+        assert_eq!(program.len(), 1, "fail-closed governance emits a single-op sentinel");
+        assert!(
+            matches!(program[0], Op::PushInt(0)),
+            "expected the fail-closed PushInt(0) sentinel, got {:?}",
+            program[0]
+        );
     }
 
-    /// **Design hazard (not a code bug):** `compile_governance` does not deduplicate
-    /// `signers`. A charter that (accidentally or otherwise) lists the same pubkey
-    /// twice lets ONE real signature — reused across both of that key's redeemer
-    /// slots — count twice toward the threshold, silently halving the number of
-    /// distinct keys actually required for quorum.
+    /// REGRESSION (F6 fixed): `compile_governance` used to accept duplicate `signers`,
+    /// so ONE real signature — reused across both of a key's redeemer slots — counted
+    /// twice toward the threshold, silently halving the distinct keys a quorum needs.
+    /// Fixed: a charter with any repeated signer pubkey compiles fail-closed
+    /// (unspendable `[PushInt(0)]`), so a single reused key can no longer forge quorum.
     #[test]
     fn governance_duplicate_signer_pubkey_lets_one_key_satisfy_two_slots() {
         let shared = b"shared-key".to_vec();
@@ -884,13 +905,16 @@ mod tests {
         // Only ONE distinct key ever signs; `other` never does.
         let v = MockVerifier { good: vec![(MSG.to_vec(), shared, sig.clone())] };
         let redeemer = vec![Val::Bytes(sig.clone()), Val::Bytes(sig), Val::Bytes(b"unused".to_vec())];
-        // A single signer satisfies what looks like a "2-of-3" gate.
-        assert_eq!(run_module(cm, Val::Int(0), redeemer, &ctx, &v), Ok(true));
+        // Fail-closed: the duplicate-signer charter authorizes no spend.
+        assert_eq!(run_module(cm, Val::Int(0), redeemer, &ctx, &v), Ok(false));
     }
 
-    /// Edge case / foot-gun: `threshold == 0` is satisfied unconditionally (the
-    /// running count is always `>= 0`), so a "0-of-m" governance module guards
-    /// nothing at all — not even a single valid signature is required.
+    /// REGRESSION (F6 fixed): `threshold == 0` on a governance with real members used to
+    /// pass unconditionally (running count is always `>= 0`) — a "0-of-m" gate that
+    /// guards nothing. Fixed: a zero threshold with a non-empty signer set compiles
+    /// fail-closed (unspendable `[PushInt(0)]`); no spend is authorized. (The `m == 0`
+    /// empty-signer degenerate case keeps its documented trivial behaviour — see
+    /// `governance_empty_signers_no_panic_and_threshold_gates_correctly`.)
     #[test]
     fn governance_zero_threshold_always_passes_even_with_zero_valid_signatures() {
         let ct = compile_charter(&TokenCharter {
@@ -904,7 +928,7 @@ mod tests {
         let ctx = ctx_with(0, vec![]);
         let no = MockVerifier { good: vec![] };
         let redeemer = vec![Val::Bytes(b"bad1".to_vec()), Val::Bytes(b"bad2".to_vec())];
-        assert_eq!(run_module(cm, Val::Int(0), redeemer, &ctx, &no), Ok(true));
+        assert_eq!(run_module(cm, Val::Int(0), redeemer, &ctx, &no), Ok(false));
     }
 
     /// `m == 0` (no signers at all) must not panic, and the threshold still gates
@@ -1017,17 +1041,22 @@ mod tests {
                 (MSG.to_vec(), b"pq-pk".to_vec(), b"pqsig".to_vec()),
             ],
         };
+        // Expected gas reflects the F2 length-proportional model (op_gas): base cost +
+        // one gas per 32-byte word of the operand each op copies/hashes. Copying a Bytes
+        // operand (PushBytes/Pick of a pubkey or sig) now costs +1 word over the old flat
+        // model, so every signature-bearing module is a few gas dearer than the pre-F2
+        // baseline — an exact, input-independent regression guard against stray ops.
         let cases: Vec<(usize, Vec<Val>, u64)> = vec![
-            (0, vec![Val::Int(500_000), Val::Bytes(b"s".to_vec())], 1008), // supply
-            (1, vec![Val::Bytes(b"s".to_vec())], 1012),                    // transfer-policy
-            (2, vec![Val::Bytes(b"member".to_vec())], 62),                 // kyc-gate
-            (3, vec![Val::Bytes(b"s".to_vec())], 1008),                    // vesting
+            (0, vec![Val::Int(500_000), Val::Bytes(b"s".to_vec())], 1010), // supply
+            (1, vec![Val::Bytes(b"s".to_vec())], 1014),                    // transfer-policy
+            (2, vec![Val::Bytes(b"member".to_vec())], 63),                 // kyc-gate
+            (3, vec![Val::Bytes(b"s".to_vec())], 1010),                    // vesting
             (
                 4,
                 vec![Val::Bytes(b"s1".to_vec()), Val::Bytes(b"s2".to_vec()), Val::Bytes(b"s3".to_vec())],
-                1007 * 3 + 4, // governance, m=3
+                1009 * 3 + 4, // governance, m=3
             ),
-            (5, vec![Val::Bytes(ecdsa_sig(b"btc-pk")), Val::Bytes(b"pqsig".to_vec())], 2007), // custody
+            (5, vec![Val::Bytes(ecdsa_sig(b"btc-pk")), Val::Bytes(b"pqsig".to_vec())], 2011), // custody
         ];
         for (idx, redeemer, expected_gas) in cases {
             let cm = &ct.validators[idx];
@@ -1100,7 +1129,10 @@ mod tests {
                 let count = good.len() as u32;
                 let v = MockVerifier { good };
                 let redeemer: Vec<Val> = sigs.iter().cloned().map(Val::Bytes).collect();
-                let expected = count >= threshold;
+                // `threshold == 0` on a non-empty signer set now compiles fail-closed
+                // (unspendable) — see governance_zero_threshold_*; otherwise the gate
+                // passes iff enough distinct signers verified.
+                let expected = threshold != 0 && count >= threshold;
                 assert_eq!(
                     run_module(cm, Val::Int(0), redeemer, &ctx, &v),
                     Ok(expected),

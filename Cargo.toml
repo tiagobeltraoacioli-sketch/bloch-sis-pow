@@ -210,6 +210,14 @@ sev = { version = "8", default-features = false, features = ["snp"], optional = 
 opt-level      = 3
 lto            = true
 codegen-units  = 1
+# MANDATORY for any consensus build (bloch-euvm audit F3, 2026-07): without this,
+# release builds WRAP on integer overflow while debug/test builds PANIC — a
+# validator set on mixed profiles can diverge (crash vs. wrapped value) on the same
+# input = a consensus split. `overflow-checks = true` makes every profile fail-closed
+# identically (checked arithmetic in-source turns these into deterministic Err/VmError;
+# any remaining unchecked overflow panics rather than silently wrapping). Do NOT remove
+# this from a consensus build profile.
+overflow-checks = true
 
 [dev-dependencies]
 tempfile = "3"

@@ -120,13 +120,20 @@ pub struct Settlement {
 }
 
 impl Settlement {
-    /// Old constant-product `k = old0·old1` as `i128` (checked context; reserves are u64).
-    pub fn old_k(&self) -> i128 {
-        self.old0 as i128 * self.old1 as i128
+    /// Old constant-product `k = old0·old1` as `i128`, or `None` on overflow.
+    ///
+    /// Fail-closed: two reserves near `u64::MAX` square past `i128::MAX`
+    /// (`(2^64-1)^2 ≈ 3.4e38 > i128::MAX ≈ 1.7e38`). Using `checked_mul` (matching the
+    /// VM's own `Op::Mul` -> `VmError::Overflow`) means these `pub` helpers never panic
+    /// under `overflow-checks` and never wrap negative in release — the invariant check
+    /// stays sound across build profiles. A `None` here is a determinism-preserving
+    /// refusal, not a crash.
+    pub fn old_k(&self) -> Option<i128> {
+        (self.old0 as i128).checked_mul(self.old1 as i128)
     }
-    /// New constant-product `k = new0·new1` as `i128`.
-    pub fn new_k(&self) -> i128 {
-        self.new0 as i128 * self.new1 as i128
+    /// New constant-product `k = new0·new1` as `i128`, or `None` on overflow (see [`Self::old_k`]).
+    pub fn new_k(&self) -> Option<i128> {
+        (self.new0 as i128).checked_mul(self.new1 as i128)
     }
 }
 
@@ -243,13 +250,34 @@ pub fn settle(
         }
 
         // Accept: move reserves and emit the fill. give_amount in, dy out.
-        if order.give_asset == asset0 {
-            r0 = r0.saturating_add(order.give_amount);
-            r1 -= dy; // dy < r1 guaranteed by amm_out
+        //
+        // Fail-closed reserve update (checked, never `saturating_add`): if adding this
+        // order's give would push a reserve past `u64::MAX`, the true conserved sum is
+        // not representable — so the order is DROPPED and REFUNDED (reserves untouched),
+        // exactly like every other rejection path. Saturating here would silently clamp
+        // the reserve and make `Settlement.new{0,1}` a value-conservation lie. `dy < the
+        // reserve being paid out` is guaranteed by `amm_out`, but the subtraction is
+        // checked too so an adversarial/degenerate input can only refuse, never panic.
+        let updated = if order.give_asset == asset0 {
+            match (r0.checked_add(order.give_amount), r1.checked_sub(dy)) {
+                (Some(n0), Some(n1)) => Some((n0, n1)),
+                _ => None,
+            }
         } else {
-            r1 = r1.saturating_add(order.give_amount);
-            r0 -= dy;
-        }
+            match (r1.checked_add(order.give_amount), r0.checked_sub(dy)) {
+                (Some(n1), Some(n0)) => Some((n0, n1)),
+                _ => None,
+            }
+        };
+        let (n0, n1) = match updated {
+            Some(nn) => nn,
+            None => {
+                fills.push(refund(order));
+                continue;
+            }
+        };
+        r0 = n0;
+        r1 = n1;
         let out_asset = order.want_asset;
         fills.push(Fill {
             order,
@@ -505,7 +533,7 @@ mod tests {
             order(3, A, 7_500, B, 0),
         ];
         let s = settle(&p, &os, 30, 1_000_000).unwrap();
-        assert!(s.new_k() >= s.old_k(), "aggregate invariant violated");
+        assert!(s.new_k().unwrap() >= s.old_k().unwrap(), "aggregate invariant violated");
 
         let tx = build_settlement_tx(&p, &pool_program(), &s, &anyone(), 0, vec![]);
         // The pool validator is inputs[0]; it enforces continuation + new_k >= old_k.
@@ -673,7 +701,7 @@ mod tests {
         assert_eq!(settle(&p, &m, 30, 1_000_000).unwrap(), settle(&p, &n, 30, 1_000_000).unwrap());
         // sanity: three identical A->B fills all succeeded and k grew
         assert!(s1.fills.iter().all(|f| f.filled));
-        assert!(s1.new_k() >= s1.old_k());
+        assert!(s1.new_k().unwrap() >= s1.old_k().unwrap());
     }
 
     // ── ADVERSARIAL + PROPERTY TESTS (appended; no logic changes above) ──────
@@ -701,10 +729,12 @@ mod tests {
     /// order (like every other rejection path) when it would overflow, instead of
     /// `saturating_add`.
     ///
-    /// This test PINS today's actual (buggy) behavior so it is visible in the suite;
-    /// it is not asserting the desired behavior. If `settle` is fixed to reject
-    /// overflowing fills, this assertion should be updated to expect
-    /// `filled == false` and `new0 == old0`.
+    /// REGRESSION (F5 fixed): the accept arm now updates reserves with `checked_add`
+    /// (never `saturating_add`). An order whose fill would push a reserve past
+    /// `u64::MAX` is DROPPED and REFUNDED — fail-closed, like every other rejection —
+    /// so `Settlement.new{0,1}` are always the true, un-clamped reserves and guarantee
+    /// (d) "every asset balances exactly" holds INSIDE the returned struct, before any
+    /// validator sees it. This test fails if the silent saturation ever returns.
     #[test]
     fn bug_reserve_overflow_silently_saturates_instead_of_failing_closed() {
         let mut value = Value::new();
@@ -715,30 +745,26 @@ mod tests {
             validator_hash: validator_hash(&pool_program()),
             datum: Val::Int(0),
         };
-        // give_amount large enough that (a) dy is still nonzero (accept path taken)
-        // and (b) old0 + give_amount truly overflows u64.
+        // give_amount large enough that (a) dy is still nonzero (accept path reached)
+        // and (b) old0 + give_amount truly overflows u64 — so the checked_add refuses.
         let o = order(1, A, u64::MAX / 2, B, 0);
         let s = settle(&p, &[o], 0, 1_000_000).unwrap();
 
-        assert!(s.fills[0].filled, "accept path was taken (dy > 0)");
-        // The true, conserved value would be old0 + give_amount > u64::MAX — not
-        // representable. Today's code clamps instead of refusing:
-        assert_eq!(s.new0, u64::MAX, "current (buggy) behavior: saturates to u64::MAX");
-        assert_ne!(
-            s.new0 as u128,
-            s.old0 as u128 + (u64::MAX / 2) as u128,
-            "new0 does NOT equal the true conserved sum — value was silently dropped"
-        );
+        // Fixed: the overflowing order is refunded, not silently saturated.
+        assert!(!s.fills[0].filled, "overflowing fill must be dropped & refunded");
+        assert_eq!(s.fills[0].out_asset, A, "refund is in the give asset");
+        assert_eq!(s.fills[0].out_amount, u64::MAX / 2, "give refunded intact");
+        // Reserves untouched: new0 is the TRUE reserve (== old0), never a clamped lie.
+        assert_eq!(s.new0, s.old0, "no saturation: reserve stays the true value");
+        assert_eq!(s.new1, s.old1);
 
-        // The only reason this doesn't corrupt state end-to-end today is that the
-        // separate, independent per-asset conservation check in validate_tx catches
-        // the mismatch between the (un-clamped) funding input and the (clamped)
-        // continuation output.
+        // Because the give is refunded intact, the built tx now genuinely conserves
+        // value and passes the real validator (no reliance on a downstream mismatch).
         let tx = build_settlement_tx(&p, &pool_program(), &s, &anyone(), 0, vec![]);
-        match validate_tx(&tx, &Noop, 500_000) {
-            Err(TxError::ValueNotConserved { asset, .. }) => assert_eq!(asset, A),
-            other => panic!("expected ValueNotConserved to catch the saturation, got {other:?}"),
-        }
+        assert!(
+            validate_tx(&tx, &Noop, 500_000).is_ok(),
+            "fail-closed refund must conserve value end-to-end"
+        );
     }
 
     /// GAS BOUNDS: a zero gas budget must refuse every order (deterministically) and

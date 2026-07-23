@@ -33,7 +33,8 @@
 //!
 //! Unaudited reference. Not consensus-wired.
 
-use crate::{fee_burn, validate_block, EuTx, SigVerifier, TxError};
+use crate::state::SparseMerkleTree;
+use crate::{fee_burn, validate_block, EuTx, ExtOutput, SigVerifier, TxError, Val};
 
 /// **The activation height for the eUTXO VM feature.**
 ///
@@ -137,13 +138,87 @@ pub fn legacy_committed_bytes(block: &BlockModel) -> Vec<u8> {
     block.legacy_bytes.clone()
 }
 
+/// Canonical, deterministic byte encoding of a single eUTXO output — the leaf value
+/// committed into the state tree. Length-prefixed and fully typed so that two outputs
+/// differing in *any* field (a single asset amount, the validator hash, or the datum)
+/// encode to distinct bytes and therefore distinct leaves. No float/clock/HashMap: the
+/// multi-asset `Value` is a `BTreeMap` (canonical key order) and `datum` is tagged.
+fn encode_output(o: &ExtOutput) -> Vec<u8> {
+    let mut b = Vec::new();
+    // Multi-asset value bundle: count, then each (asset_id, amount) in BTreeMap order.
+    b.extend_from_slice(&(o.value.len() as u64).to_le_bytes());
+    for (asset, amt) in &o.value {
+        b.extend_from_slice(asset);
+        b.extend_from_slice(&amt.to_le_bytes());
+    }
+    // The guarding validator's hash.
+    b.extend_from_slice(&o.validator_hash);
+    // The datum, domain-tagged so Int/Bytes spaces never collide.
+    match &o.datum {
+        Val::Int(n) => {
+            b.push(0x00);
+            b.extend_from_slice(&n.to_le_bytes());
+        }
+        Val::Bytes(bytes) => {
+            b.push(0x01);
+            b.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+            b.extend_from_slice(bytes);
+        }
+    }
+    b
+}
+
+/// **The resulting-eUTXO-state root (F1).** Commit the block's token movements as a
+/// [`SparseMerkleTree::root`] over the resulting state, not a scalar summary. Every
+/// consumed input and every created output is keyed by a domain-separated
+/// `(kind ‖ tx_index ‖ index)` position and its value is the canonical
+/// [`encode_output`] blob. Two blocks that move different amounts, spend different
+/// inputs, or write different datums therefore land on distinct leaves and produce
+/// distinct roots — the byte-identical-commitment collision (a scalar summary bound
+/// only `n_txs/gas/burned/to_miner`) is closed.
+///
+/// Deterministic and no-panic: `SparseMerkleTree` is a `BTreeMap` (canonical order),
+/// the encoding is length-prefixed little-endian, and no arithmetic here can overflow
+/// (positions are `usize`→`u64` casts, never added).
+fn eutxo_state_root(txs: &[EuTx]) -> [u8; 32] {
+    let mut smt = SparseMerkleTree::new();
+    for (ti, tx) in txs.iter().enumerate() {
+        let ti = ti as u64;
+        // Consumed inputs (kind 0x00) — bind what the block spent.
+        for (ii, inp) in tx.inputs.iter().enumerate() {
+            let mut key = Vec::with_capacity(1 + 8 + 8);
+            key.push(0x00);
+            key.extend_from_slice(&ti.to_le_bytes());
+            key.extend_from_slice(&(ii as u64).to_le_bytes());
+            smt.insert(&key, &encode_output(&inp.prev_output));
+        }
+        // Created outputs (kind 0x01) — bind the resulting UTXO set.
+        for (oi, out) in tx.outputs.iter().enumerate() {
+            let mut key = Vec::with_capacity(1 + 8 + 8);
+            key.push(0x01);
+            key.extend_from_slice(&ti.to_le_bytes());
+            key.extend_from_slice(&(oi as u64).to_le_bytes());
+            smt.insert(&key, &encode_output(out));
+        }
+    }
+    smt.root()
+}
+
 /// Deterministic, canonical encoding of the eUTXO section appended to the legacy bytes
-/// on the *active* path. Length-prefixed, little-endian, no float/clock — same inputs
-/// → same bytes on every node. (Illustrative commitment for the reference harness; the
-/// real node would commit an eUTXO Merkle root here.)
-fn encode_eu_section(n_txs: u64, gas_used: u64, burned: u64, to_miner: u64) -> Vec<u8> {
-    let mut o = Vec::with_capacity(4 + 8 * 4);
+/// on the *active* path. Layout: `"EUV1" ‖ state_root(32) ‖ n_txs ‖ gas_used ‖ burned
+/// ‖ to_miner`, all little-endian. The **32-byte state root binds the resulting eUTXO
+/// state** (see [`eutxo_state_root`]); the four `u64`s are bound side-data (fee/gas
+/// accounting), NOT the commitment itself. Same inputs → same bytes on every node.
+fn encode_eu_section(
+    state_root: &[u8; 32],
+    n_txs: u64,
+    gas_used: u64,
+    burned: u64,
+    to_miner: u64,
+) -> Vec<u8> {
+    let mut o = Vec::with_capacity(4 + 32 + 8 * 4);
     o.extend_from_slice(b"EUV1");
+    o.extend_from_slice(state_root);
     o.extend_from_slice(&n_txs.to_le_bytes());
     o.extend_from_slice(&gas_used.to_le_bytes());
     o.extend_from_slice(&burned.to_le_bytes());
@@ -195,8 +270,11 @@ pub fn accept_block_model(
     }
     let (fee_burned, fee_to_miner) = fee_burn(total_fee, EUVM_BURN_BPS);
 
+    // Commit a real root over the resulting eUTXO state (F1) — not a scalar summary.
+    let state_root = eutxo_state_root(&block.eu_txs);
     let mut committed_bytes = block.legacy_bytes.clone();
     committed_bytes.extend_from_slice(&encode_eu_section(
+        &state_root,
         block.eu_txs.len() as u64,
         eu_gas_used,
         fee_burned,
@@ -672,28 +750,45 @@ mod tests {
         assert!(matches!(got, Err(AcceptError::Euvm { tx_index: 0, err: TxError::Vm(0, VmError::OutOfGas) })));
     }
 
-    /// Canonical-encoding property: the active-path eUTXO section is a fixed-size
-    /// header (`"EUV1"` + four `u64`s = 36 bytes) regardless of how many `eu_txs` were
-    /// in the block. Guards against the section's size silently becoming
-    /// tx-count-dependent (which would change the byte-identity/reproducibility
-    /// argument the harness exists to pin down).
+    /// Canonical-encoding property (F1 fixed): the active-path eUTXO section is
+    /// `"EUV1" ‖ state_root(32) ‖ four u64s` — it now carries a **32-byte root** over
+    /// the resulting eUTXO state, not just a scalar header. The section is a fixed size
+    /// (the root and the side-data are both fixed width, independent of tx count) AND
+    /// the committed root DIFFERS across blocks with distinct resulting state — the
+    /// regression guard for the scalar-summary collision the audit found.
     #[test]
-    fn eu_section_header_is_fixed_size_regardless_of_tx_count() {
+    fn eu_section_carries_state_root_and_differs_across_distinct_states() {
         let v = NoopVerifier;
         let legacy = b"LEGACY".to_vec();
-        const HEADER_LEN: usize = 4 + 8 * 4;
+        // "EUV1"(4) + state_root(32) + n_txs/gas/burned/to_miner (4 * u64).
+        const SECTION_LEN: usize = 4 + 32 + 8 * 4;
 
+        let mut seen_roots: Vec<[u8; 32]> = Vec::new();
         for n in [0usize, 1, 2, 5] {
-            let txs: Vec<EuTx> = (0..n as u64).map(|i| ok_tx(100 + i, 1)).collect();
+            // Distinct per-n movements so the resulting state genuinely differs.
+            let txs: Vec<EuTx> = (0..n as u64).map(|i| ok_tx(1_000 + 10 * n as u64 + i, 1)).collect();
             let b = block(EUVM_ACTIVATION_HEIGHT, &legacy, txs);
             let out = accept_block_model(&b, &v, DEFAULT_GAS_CEILINGS).unwrap();
+
+            // Fixed section size (root width is constant regardless of tx count).
             assert_eq!(
                 out.committed_bytes.len(),
-                legacy.len() + HEADER_LEN,
+                legacy.len() + SECTION_LEN,
                 "eu section length must not depend on tx count (n={n})"
             );
             assert!(out.committed_bytes.starts_with(&legacy));
             assert_eq!(&out.committed_bytes[legacy.len()..legacy.len() + 4], b"EUV1");
+
+            // The 32 bytes after "EUV1" are the committed state root; distinct states
+            // must yield distinct roots (no scalar-summary collisions).
+            let root_off = legacy.len() + 4;
+            let mut root = [0u8; 32];
+            root.copy_from_slice(&out.committed_bytes[root_off..root_off + 32]);
+            assert!(
+                !seen_roots.contains(&root),
+                "distinct resulting states collided on the same root (n={n})"
+            );
+            seen_roots.push(root);
         }
     }
 
