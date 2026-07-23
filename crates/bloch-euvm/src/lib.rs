@@ -168,10 +168,25 @@ pub enum VmError {
     ValidatorHashMismatch,
     Assert,
     EmptyResult,
+    /// The live stack's total byte size exceeded [`MAX_TOTAL_BYTES`] (F2 memory ceiling).
+    /// Fail-closed: a program that amplifies memory (e.g. `Dup` on a large blob) aborts
+    /// deterministically instead of letting per-node RAM limits decide acceptance.
+    MemoryLimitExceeded,
+    /// A single `Bytes` operand exceeded [`MAX_OPERAND_BYTES`] (F2 per-operand ceiling).
+    OperandTooLarge,
+    /// The program had more ops than [`MAX_PROGRAM_OPS`] (F2 per-program ceiling).
+    ProgramTooLarge,
 }
 
-/// Per-op gas cost. Signature checks dominate real cost; hashing is mid; stack ops
-/// are cheap. (Illustrative schedule for the foundation.)
+/// **Static base cost of an op** — the length-INDEPENDENT part of its gas price.
+/// Signature checks dominate real cost; hashing is mid; stack ops are cheap.
+///
+/// F2: this is only the *base*. The real charge in [`run`] is
+/// [`op_gas`]`(op, stack)` = this base **plus** a term proportional to the operand's
+/// byte length for every op that copies or hashes bytes (`PushBytes`, `Dup`, `Pick`,
+/// `Sha256d`, `Shake256`, `Size`). A flat schedule let a 1-byte and an 8-MB hash both
+/// cost 60 gas — gas then bounded neither CPU nor memory (machine-dependent block
+/// acceptance = consensus split). Charging ∝ bytes restores that bound deterministically.
 pub fn gas_cost(op: &Op) -> u64 {
     match op {
         Op::VerifySig | Op::VerifyEcdsa => 1000,
@@ -181,7 +196,82 @@ pub fn gas_cost(op: &Op) -> u64 {
     }
 }
 
+/// Number of 32-byte words spanning `len` bytes (ceiling division). The unit the
+/// byte-proportional gas term is charged in — deterministic, overflow-free for any
+/// `len <= MAX_OPERAND_BYTES`.
+#[inline]
+fn words(len: u64) -> u64 {
+    len / 32 + if len % 32 != 0 { 1 } else { 0 }
+}
+
+/// **The real, length-proportional gas cost of `op` given the current `stack`** (F2).
+/// Base [`gas_cost`] plus one gas per 32-byte word of the operand the op copies or
+/// hashes. Deterministic function of byte length only; never panics; saturating so an
+/// (already ceiling-bounded) operand can never overflow the charge.
+fn op_gas(op: &Op, stack: &[Val]) -> u64 {
+    let top_len = || -> u64 {
+        match stack.last() {
+            Some(Val::Bytes(b)) => b.len() as u64,
+            _ => 0,
+        }
+    };
+    match op {
+        Op::PushBytes(b) => 1u64.saturating_add(words(b.len() as u64)),
+        Op::Dup => 1u64.saturating_add(words(top_len())),
+        Op::Pick(n) => {
+            let l = stack
+                .len()
+                .checked_sub(1 + *n as usize)
+                .and_then(|i| stack.get(i))
+                .map(|v| match v {
+                    Val::Bytes(b) => b.len() as u64,
+                    _ => 0,
+                })
+                .unwrap_or(0);
+            1u64.saturating_add(words(l))
+        }
+        Op::Sha256d | Op::Shake256 => 60u64.saturating_add(words(top_len())),
+        Op::Size => 1u64.saturating_add(words(top_len())),
+        _ => gas_cost(op),
+    }
+}
+
 const MAX_STACK: usize = 1024;
+
+/// **F2 hard ceilings — memory/size bounds enforced fail-closed inside [`run`].**
+///
+/// Max byte length of any single `Bytes` operand. Bigger operands → [`VmError::OperandTooLarge`].
+pub const MAX_OPERAND_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
+/// Max number of ops in a validator program. Bigger → [`VmError::ProgramTooLarge`].
+pub const MAX_PROGRAM_OPS: usize = 100_000;
+/// Max total live-stack byte size at any point during execution — the memory ceiling.
+/// Exceeding it (e.g. via `Dup`-amplification) → [`VmError::MemoryLimitExceeded`].
+pub const MAX_TOTAL_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
+
+/// **F2 tx-level structural ceilings** (enforced by [`check_tx_resource_limits`],
+/// BEFORE the unmetered conservation scan and the per-input `ctx.clone`).
+pub const MAX_TX_INPUTS: usize = 1024;
+/// Max outputs per transaction.
+pub const MAX_TX_OUTPUTS: usize = 1024;
+/// Max distinct assets referenced across a transaction's inputs + outputs (and the max
+/// entries in any single multi-asset `Value`).
+pub const MAX_TX_DISTINCT_ASSETS: usize = 4096;
+/// Max total operand bytes carried by a transaction (datums + value maps + programs +
+/// redeemers) — bounds the O(#in · #out · output_size) `ctx.clone` work.
+pub const MAX_TX_BYTES: usize = 1024 * 1024; // 1 MiB
+
+/// Sum of the live-stack's `Bytes` byte lengths (saturating). O(stack depth), and
+/// `MAX_STACK` bounds the depth, so this is a bounded, deterministic scan.
+#[inline]
+fn stack_heap_bytes(stack: &[Val]) -> usize {
+    let mut total: usize = 0;
+    for v in stack {
+        if let Val::Bytes(b) = v {
+            total = total.saturating_add(b.len());
+        }
+    }
+    total
+}
 
 /// Run a validator `program`. The stack is seeded with `initial` (bottom → top),
 /// typically `[datum, redeemer...]`. Returns `true` iff execution finishes with a
@@ -196,6 +286,31 @@ pub fn run(
     let mut st: Vec<Val> = initial;
     if st.len() > MAX_STACK {
         return Err(VmError::StackTooDeep);
+    }
+
+    // ── F2 ceilings, enforced fail-closed BEFORE any execution ──
+    // Per-program op count.
+    if program.len() > MAX_PROGRAM_OPS {
+        return Err(VmError::ProgramTooLarge);
+    }
+    // Per-operand byte cap: every literal in the program and every seeded stack value.
+    for op in program {
+        if let Op::PushBytes(b) = op {
+            if b.len() > MAX_OPERAND_BYTES {
+                return Err(VmError::OperandTooLarge);
+            }
+        }
+    }
+    for v in &st {
+        if let Val::Bytes(b) = v {
+            if b.len() > MAX_OPERAND_BYTES {
+                return Err(VmError::OperandTooLarge);
+            }
+        }
+    }
+    // Total-allocated-bytes (memory) ceiling on the seeded stack.
+    if stack_heap_bytes(&st) > MAX_TOTAL_BYTES {
+        return Err(VmError::MemoryLimitExceeded);
     }
 
     macro_rules! pop {
@@ -222,7 +337,9 @@ pub fn run(
     }
 
     for op in program {
-        let cost = gas_cost(op);
+        // F2: gas is a deterministic function of OPERAND BYTE LENGTH, not a flat per-op
+        // constant. Charged up-front (before the op runs) from the current stack.
+        let cost = op_gas(op, &st);
         *gas = gas.checked_sub(cost).ok_or(VmError::OutOfGas)?;
 
         match op {
@@ -348,6 +465,11 @@ pub fn run(
         if st.len() > MAX_STACK {
             return Err(VmError::StackTooDeep);
         }
+        // F2 memory ceiling: catch operand-size amplification (e.g. `Dup` cloning a
+        // large blob) the instant it crosses the bound — fail-closed, deterministic.
+        if stack_heap_bytes(&st) > MAX_TOTAL_BYTES {
+            return Err(VmError::MemoryLimitExceeded);
+        }
     }
 
     st.last().ok_or(VmError::EmptyResult)?.truthy()
@@ -463,10 +585,103 @@ pub enum TxError {
     ValidatorRejected(usize),
     Vm(usize, VmError),
     OutOfBlockGas,
+    /// The transaction exceeded a hard structural resource ceiling (F2): too many
+    /// inputs/outputs, too many distinct assets, or too large a total operand size.
+    /// The pre-VM conservation scan and the per-input `ctx.clone` are O(#assets ·
+    /// (#in+#out)) and O(#in · #out · output_size) respectively and run BEFORE any gas
+    /// is charged; without a ceiling that work is unbounded and unmetered (machine-
+    /// dependent = consensus split). `what` names the ceiling that fired. Fail-closed.
+    ResourceLimit { what: &'static str },
+}
+
+/// Bytes of operand data a single [`ExtOutput`] carries (value map + datum) — the
+/// quantity `ctx.clone` copies per input. Saturating; deterministic.
+fn ext_output_bytes(o: &ExtOutput) -> usize {
+    let mut n = o.value.len().saturating_mul(40); // (32-byte id + 8-byte amount) per asset
+    n = n.saturating_add(match &o.datum {
+        Val::Int(_) => 16,
+        Val::Bytes(b) => b.len(),
+    });
+    n
+}
+
+/// **F2 structural resource ceilings for a transaction — enforced BEFORE the unmetered
+/// conservation scan and the per-input `ctx.clone`.** Caps input/output counts, the
+/// number of distinct assets (and any single `Value`'s entry count), and the total
+/// operand bytes the tx carries. Returns [`TxError::ResourceLimit`] fail-closed on any
+/// breach. Bounded work: every check is O(1) per input/output plus a single early-
+/// bailing asset-set scan, so this checker cannot itself be a DoS.
+///
+/// Shared choke point: the mint-aware mirror ([`crate::minting::validate_tx_with_mint`])
+/// must call this too, wrapping the error as `MintTxError::Tx(..)`, so both validation
+/// paths share one deterministic bound.
+pub fn check_tx_resource_limits(tx: &EuTx) -> Result<(), TxError> {
+    if tx.inputs.len() > MAX_TX_INPUTS {
+        return Err(TxError::ResourceLimit { what: "too many inputs" });
+    }
+    if tx.outputs.len() > MAX_TX_OUTPUTS {
+        return Err(TxError::ResourceLimit { what: "too many outputs" });
+    }
+
+    let mut assets: std::collections::BTreeSet<AssetId> = std::collections::BTreeSet::new();
+    let mut total_bytes: usize = 0;
+
+    // Inputs: prev_output + revealed validator program + redeemer.
+    for i in &tx.inputs {
+        if i.prev_output.value.len() > MAX_TX_DISTINCT_ASSETS {
+            return Err(TxError::ResourceLimit { what: "value has too many assets" });
+        }
+        for k in i.prev_output.value.keys() {
+            assets.insert(*k);
+            if assets.len() > MAX_TX_DISTINCT_ASSETS {
+                return Err(TxError::ResourceLimit { what: "too many distinct assets" });
+            }
+        }
+        total_bytes = total_bytes.saturating_add(ext_output_bytes(&i.prev_output));
+        if i.validator.len() > MAX_PROGRAM_OPS {
+            return Err(TxError::ResourceLimit { what: "validator program too large" });
+        }
+        for op in &i.validator {
+            if let Op::PushBytes(b) = op {
+                total_bytes = total_bytes.saturating_add(b.len());
+            }
+        }
+        for r in &i.redeemer {
+            if let Val::Bytes(b) = r {
+                total_bytes = total_bytes.saturating_add(b.len());
+            }
+        }
+        if total_bytes > MAX_TX_BYTES {
+            return Err(TxError::ResourceLimit { what: "transaction operand bytes exceed ceiling" });
+        }
+    }
+
+    // Outputs: value + datum.
+    for o in &tx.outputs {
+        if o.value.len() > MAX_TX_DISTINCT_ASSETS {
+            return Err(TxError::ResourceLimit { what: "value has too many assets" });
+        }
+        for k in o.value.keys() {
+            assets.insert(*k);
+            if assets.len() > MAX_TX_DISTINCT_ASSETS {
+                return Err(TxError::ResourceLimit { what: "too many distinct assets" });
+            }
+        }
+        total_bytes = total_bytes.saturating_add(ext_output_bytes(o));
+        if total_bytes > MAX_TX_BYTES {
+            return Err(TxError::ResourceLimit { what: "transaction operand bytes exceed ceiling" });
+        }
+    }
+
+    Ok(())
 }
 
 /// Validate one eUTXO transaction against a per-tx `gas_limit`. Returns gas used.
 pub fn validate_tx(tx: &EuTx, verifier: &dyn SigVerifier, gas_limit: u64) -> Result<u64, TxError> {
+    // (0) F2: fail-closed structural ceilings BEFORE the unmetered per-asset scan and
+    // the per-input ctx.clone — those are O(#assets·(#in+#out)) / O(#in·#out·size) and
+    // run off the gas meter; without this bound the work is machine-dependent.
+    check_tx_resource_limits(tx)?;
     // (1) per-asset native-value conservation. The fee is charged in BLCH only;
     // every other asset must balance exactly (no mint/burn without a policy).
     let mut assets: std::collections::BTreeSet<AssetId> = std::collections::BTreeSet::new();

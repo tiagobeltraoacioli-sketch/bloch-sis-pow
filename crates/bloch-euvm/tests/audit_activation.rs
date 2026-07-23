@@ -25,12 +25,13 @@ impl SigVerifier for PqOnlyVerifier {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// FINDING A — active-path `committed_bytes` does not bind the eUTXO state.
-// Two blocks with DIFFERENT outputs (different committed value distribution) but the
-// same (tx count, gas used, fee split) produce BYTE-IDENTICAL committed_bytes.
-// A commitment that does not bind the transactions/state it commits is not a sound
-// consensus commitment: nodes that disagree on eUTXO state would not diverge here,
-// and an adversary can swap the block's real effect while preserving the summary.
+// FINDING A (FIXED — regression) — active-path `committed_bytes` now binds the eUTXO
+// state. Two blocks with DIFFERENT outputs (different committed value distribution) but
+// the same (tx count, gas used, fee split) used to produce BYTE-IDENTICAL committed_bytes
+// — a commitment that did not bind the transactions/state it committed, letting an
+// adversary swap the block's real effect while preserving the summary. The fix folds an
+// eUTXO state root into committed_bytes, so differing state now yields differing bytes.
+// This test fails closed if that binding is ever removed.
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn anyone_tx(value: u64, fee: u64) -> EuTx {
@@ -67,9 +68,10 @@ fn finding_a_committed_bytes_do_not_bind_eutxo_state() {
 
     // The two blocks move very different amounts of value (90 vs 999_990 BLCH out)...
     assert_ne!(block_small.eu_txs[0].outputs, block_huge.eu_txs[0].outputs);
-    // ...yet the node's committed bytes are byte-for-byte identical. The commitment
-    // binds only the 36-byte summary (count/gas/burn/miner), not the eUTXO state root.
-    assert_eq!(
+    // ...so the node's committed bytes must now differ: the commitment binds the eUTXO
+    // state root, not merely the summary (count/gas/burn/miner). Fail-closed regression
+    // guard for FINDING A — differing committed state must yield differing committed bytes.
+    assert_ne!(
         out_small.committed_bytes, out_huge.committed_bytes,
         "committed_bytes MUST differ when the committed eUTXO state differs"
     );

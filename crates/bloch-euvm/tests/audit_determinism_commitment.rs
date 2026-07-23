@@ -3,10 +3,11 @@
 //! Separate file so the existing tests/audit_determinism.rs is left untouched.
 //!
 //! Positive confirmations (encode_program / SMT root are byte-stable and order-
-//! independent) plus the one concrete consensus-commitment gap: accept_block_model
-//! commits only a 36-byte (n_txs, gas, burned, to_miner) SUMMARY, never a root over
-//! the eUTXO outputs/state — so two blocks carrying DIFFERENT eUTXO transactions
-//! commit BYTE-IDENTICAL bytes. Determinism holds; state-binding does not.
+//! independent) plus the F1 regression guard: accept_block_model now commits a real
+//! SparseMerkleTree root over the resulting eUTXO state (carrying n_txs/gas/burned/
+//! to_miner as bound side-data), so two blocks carrying DIFFERENT eUTXO transactions
+//! commit DIFFERENT bytes. Determinism holds AND state-binding holds; if the harness
+//! ever reverts to a scalar summary these tests fail (the blocks collide again).
 
 use bloch_euvm::harness::{
     accept_block_model, BlockModel, DEFAULT_GAS_CEILINGS, EUVM_ACTIVATION_HEIGHT,
@@ -98,11 +99,14 @@ fn committed_bytes_do_not_bind_eutxo_state_two_distinct_blocks_collide() {
     );
     assert!(out_a.feature_active && out_b.feature_active);
 
-    // The defect: identical commitment for two different eUTXO states.
-    assert_eq!(
+    // F1 FIXED: the commitment now binds the resulting eUTXO state (a SparseMerkleTree
+    // root), so two blocks moving different BLCH produce DIFFERENT committed bytes.
+    // (Regression guard: if the harness ever reverts to a scalar summary, these two
+    // blocks collide again and this assertion fails.)
+    assert_ne!(
         out_a.committed_bytes, out_b.committed_bytes,
-        "committed bytes are identical for two DIFFERENT eUTXO states — \
-         encode_eu_section commits a summary, not a state root"
+        "committed bytes must diverge for two DIFFERENT eUTXO states — \
+         the commitment binds a state root, not just a summary"
     );
 }
 
@@ -117,8 +121,10 @@ fn distinct_output_datums_produce_the_same_commitment() {
     };
     let a = accept_block_model(&mk(0), &v, DEFAULT_GAS_CEILINGS).unwrap();
     let b = accept_block_model(&mk(7), &v, DEFAULT_GAS_CEILINGS).unwrap();
-    assert_eq!(
+    // F1 FIXED: the output datum is part of the committed leaf, so distinct datums
+    // (0 vs 7) now produce distinct commitments — the state is bound.
+    assert_ne!(
         a.committed_bytes, b.committed_bytes,
-        "distinct output datums produce the same commitment — state is not bound"
+        "distinct output datums must produce distinct commitments — state is bound"
     );
 }

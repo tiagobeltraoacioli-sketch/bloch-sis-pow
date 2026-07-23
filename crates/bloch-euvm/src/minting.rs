@@ -126,6 +126,12 @@ pub enum MintTxError {
     PolicyAssetMismatch { asset: AssetId },
     /// Two mint requests named the same asset — ambiguous; present a single net delta.
     DuplicatePolicy { asset: AssetId },
+    /// The `mints` slice is not in strictly ascending `asset_id` order. A logical
+    /// mint-set has exactly one canonical encoding; accepting any permutation would
+    /// make *which* error surfaces (and where the shared gas budget is exhausted)
+    /// depend on the Vec order — a non-canonical-encoding / malleability hazard.
+    /// Present mints sorted ascending by `asset_id` (duplicates are `DuplicatePolicy`).
+    NonCanonicalMintOrder { prev: AssetId, next: AssetId },
     /// The policy program ran to `false` — the delta is not authorised.
     PolicyRejected { asset: AssetId },
     /// The policy program errored (bad opcode use, out of gas, …).
@@ -178,6 +184,14 @@ pub fn validate_tx_with_mint(
     // The net signed delta per asset, keyed canonically for determinism.
     let mut net_mint: BTreeMap<AssetId, i128> = BTreeMap::new();
 
+    // F4 (canonical mint ordering): the `mints` slice MUST arrive in strictly
+    // ascending `asset_id` order. Conservation itself is order-independent (it folds
+    // through a `BTreeMap`), but *which* rejection surfaces and *where* the shared gas
+    // budget runs out are not — so a non-canonical encoding is a malleability hazard.
+    // Enforcing one canonical order (checked pre-gas, mirroring the DuplicatePolicy
+    // guard) makes the accept/error outcome a deterministic function of the mint-SET.
+    let mut prev_asset: Option<AssetId> = None;
+
     for req in mints {
         let asset = req.action.asset_id;
         let delta = req.action.delta;
@@ -186,6 +200,15 @@ pub fn validate_tx_with_mint(
         if asset == BLCH {
             return Err(MintTxError::BlchMintForbidden);
         }
+        // Reject any non-ascending step before spending gas. `asset < prev` is a
+        // genuine ordering violation; `asset == prev` falls through to the
+        // DuplicatePolicy guard below (preserving that error's identity).
+        if let Some(prev) = prev_asset {
+            if asset < prev {
+                return Err(MintTxError::NonCanonicalMintOrder { prev, next: asset });
+            }
+        }
+        prev_asset = Some(asset);
         // The policy must be the one that *defines* this asset.
         if policy_asset_id(&req.policy) != asset {
             return Err(MintTxError::PolicyAssetMismatch { asset });
@@ -305,13 +328,25 @@ pub fn validate_tx_with_mint(
 /// from `ctx.fields[3]` and `delta` from `ctx.fields[1]`, it computes the new supply
 /// and asserts it does not exceed `cap`. Burns (negative delta) always satisfy the
 /// cap. No redeemer required.
+///
+/// **F3/F5 fix — no `cap + 1` native overflow.** The prior implementation emitted
+/// `PushInt(cap + 1)` and tested `new_supply < cap + 1`. That native-`i128`
+/// `cap + 1` overflows when `cap == i128::MAX`: it *panics* under `overflow-checks`
+/// (debug/test and any consensus build) and *wraps* to `i128::MIN` in a plain
+/// release build (a dead, reject-everything policy) — a build-profile-dependent
+/// hazard reachable by a public constructor with an in-range argument. We now emit
+/// `new_supply <= cap` directly as `!(cap < new_supply)`, pushing `cap` unmodified
+/// (always a valid `i128`, never an addition). Semantics are identical for every
+/// finite `cap`, and `cap == i128::MAX` becomes the intended "no effective cap"
+/// (every `new_supply` satisfies `new_supply <= i128::MAX`) with no panic and no wrap.
 pub fn fixed_supply_cap_policy(cap: i128) -> MintingPolicy {
     vec![
-        Op::CtxField(MINT_CTX_PRIOR_SUPPLY), // [prior]
-        Op::CtxField(MINT_CTX_DELTA),        // [prior, delta]
-        Op::Add,                             // [new_supply]
-        Op::PushInt(cap + 1),                // [new_supply, cap+1]
-        Op::Lt,                              // [new_supply < cap+1]  ==  new_supply <= cap
+        Op::PushInt(cap),                    // [cap]
+        Op::CtxField(MINT_CTX_PRIOR_SUPPLY), // [cap, prior]
+        Op::CtxField(MINT_CTX_DELTA),        // [cap, prior, delta]
+        Op::Add,                             // [cap, new_supply]
+        Op::Lt,                              // [cap < new_supply]
+        Op::Not,                             // [new_supply <= cap]
     ]
 }
 
@@ -902,67 +937,108 @@ mod tests {
         vec![Op::PushInt(1)]
     }
 
-    // ── BUG FOUND: `fixed_supply_cap_policy(i128::MAX)` is unsound at construction ──
+    // ── F3/F5 FIXED: `fixed_supply_cap_policy(i128::MAX)` is now well-formed ──
     //
-    // The constructor computes `cap + 1` at the *Rust* level (not through the VM's
-    // checked-`i128` ops) to build the `PushInt(cap + 1)` operand. With
-    // `cap == i128::MAX` this addition itself overflows i128::MAX:
-    //   - In a debug build (incl. plain `cargo test`) this PANICS
-    //     ("attempt to add with overflow") — a crash reachable just by calling a
-    //     public reference constructor with a boundary value, i.e. a DoS surface,
-    //     not merely a validation error.
-    //   - In a release build the overflow silently wraps: `cap + 1` becomes
-    //     `i128::MIN`, so the emitted check becomes `new_supply < i128::MIN`, which
-    //     is *never* true — the resulting policy rejects every mint, including
-    //     `delta == 0`. So a caller who picks `i128::MAX` to mean "effectively no
-    //     cap" instead gets a policy that can never authorise anything.
-    // This test documents both outcomes without patching the constructor (per the
-    // "append tests only, don't change module logic" mandate) and proves neither
-    // outcome is a silent wrap into an *authorising* policy (i.e. it fails closed
-    // either way) — but the panic path is a real crash bug worth fixing upstream.
+    // The constructor no longer computes `cap + 1` in native `i128` (which overflowed
+    // for `cap == i128::MAX` — panicking under overflow-checks, wrapping to a dead
+    // reject-everything policy in release). It emits `new_supply <= cap` as
+    // `!(cap < new_supply)` with `PushInt(cap)` unmodified. This regression test
+    // asserts the FIXED behaviour: construction never panics, and `cap == i128::MAX`
+    // yields the intended "no effective cap" — a positive mint is AUTHORISED (i.e. the
+    // relaxed conservation check is the only thing left to satisfy), not silently
+    // rejected. It FAILS if the `cap + 1` overflow hazard is ever reintroduced.
     #[test]
     fn fixed_supply_cap_policy_max_cap_is_a_construction_hazard() {
+        // (1) Construction must not panic on the in-range boundary argument.
         let prev_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {})); // silence the expected panic's stderr spam
+        std::panic::set_hook(Box::new(|_| {}));
         let built = std::panic::catch_unwind(|| fixed_supply_cap_policy(i128::MAX));
         std::panic::set_hook(prev_hook);
+        let policy = built.expect("fixed_supply_cap_policy(i128::MAX) must not panic after the fix");
 
-        match built {
-            Err(_) => {
-                // Debug-profile behaviour (this is what `cargo test` hits by default):
-                // confirmed panic-on-construct. Documented as a bug; not asserted as
-                // "expected" behaviour — a reference policy constructor should never
-                // panic on an in-range i128 argument.
-            }
-            Ok(policy) => {
-                // Release-profile behaviour: wrapped to a policy that rejects
-                // everything, including a no-op zero delta. Fails closed (no
-                // inflation risk) but is a functional bug (cap meant to be
-                // permissive is instead maximally restrictive).
-                let asset = policy_asset_id(&policy);
-                let tx = EuTx {
-                    inputs: vec![],
-                    outputs: vec![],
-                    fee: 0,
-                    sighash: vec![],
-                };
-                let mints = vec![MintRequest {
-                    policy,
-                    redeemer: vec![],
-                    action: MintAction { asset_id: asset, delta: 0 },
-                }];
-                assert_eq!(
-                    validate_tx_with_mint(&tx, &mints, &MintCtx::default(), &noop(), 50_000),
-                    Err(MintTxError::PolicyRejected { asset })
-                );
-            }
-        }
+        // (2) The policy is the intended no-op cap: a positive delta is authorised, so
+        // a well-formed conserving mint of it succeeds (no dead reject-everything).
+        let asset = policy_asset_id(&policy);
+        let tx = EuTx {
+            inputs: vec![],
+            outputs: vec![out(asset_val(asset, 500))],
+            fee: 0,
+            sighash: vec![],
+        };
+        let mints = vec![MintRequest {
+            policy,
+            redeemer: vec![],
+            action: MintAction { asset_id: asset, delta: 500 },
+        }];
+        assert!(
+            validate_tx_with_mint(&tx, &mints, &MintCtx::default(), &noop(), 50_000).is_ok(),
+            "cap==i128::MAX must be a permissive (no-effective-cap) policy, not a dead reject-all"
+        );
+    }
+
+    /// F4 regression: the ACCEPTED outcome must be independent of `mints` Vec order —
+    /// the canonical (ascending `asset_id`) encoding is accepted; any other permutation
+    /// of the SAME logical mint-set is rejected with `NonCanonicalMintOrder`. This
+    /// proves conservation's order-independence is matched by a canonical encoding rule
+    /// (so *which* error/gas-exhaustion surfaces can no longer depend on the slice order).
+    #[test]
+    fn mints_out_of_canonical_order_is_rejected() {
+        // Two independently-valid permissive policies over two distinct assets.
+        let policy_x = fixed_supply_cap_policy(1_000);
+        let policy_y = fixed_supply_cap_policy(2_000);
+        let asset_x = policy_asset_id(&policy_x);
+        let asset_y = policy_asset_id(&policy_y);
+        assert_ne!(asset_x, asset_y);
+
+        // Canonical ascending order and the deltas that go with each asset.
+        let (lo_pol, lo_asset, lo_delta, hi_pol, hi_asset, hi_delta) = if asset_x < asset_y {
+            (policy_x, asset_x, 100i128, policy_y, asset_y, 200i128)
+        } else {
+            (policy_y, asset_y, 200i128, policy_x, asset_x, 100i128)
+        };
+
+        // A tx that conserves both freshly-minted assets exactly.
+        let mk_tx = || EuTx {
+            inputs: vec![],
+            outputs: vec![
+                out(asset_val(lo_asset, lo_delta as u64)),
+                out(asset_val(hi_asset, hi_delta as u64)),
+            ],
+            fee: 0,
+            sighash: vec![],
+        };
+        let lo_req = || MintRequest {
+            policy: lo_pol.clone(),
+            redeemer: vec![],
+            action: MintAction { asset_id: lo_asset, delta: lo_delta },
+        };
+        let hi_req = || MintRequest {
+            policy: hi_pol.clone(),
+            redeemer: vec![],
+            action: MintAction { asset_id: hi_asset, delta: hi_delta },
+        };
+
+        // Canonical order (ascending) → accepted.
+        let canonical = vec![lo_req(), hi_req()];
+        assert!(
+            validate_tx_with_mint(&mk_tx(), &canonical, &MintCtx::default(), &noop(), 50_000).is_ok(),
+            "canonical ascending mint order must be accepted"
+        );
+
+        // Reversed (descending) — SAME logical mint-set → rejected as non-canonical.
+        let reversed = vec![hi_req(), lo_req()];
+        assert_eq!(
+            validate_tx_with_mint(&mk_tx(), &reversed, &MintCtx::default(), &noop(), 50_000),
+            Err(MintTxError::NonCanonicalMintOrder { prev: hi_asset, next: lo_asset })
+        );
     }
 
     /// `fixed_supply_cap_policy(-1)`: a negative cap combined with the separate
     /// non-negativity floor makes the policy self-contradictory (it only authorises
     /// deltas that would make supply negative, which the floor check then always
     /// vetoes) — a degenerate but *safe* (fail-closed, non-panicking) configuration.
+    /// After the F3/F5 fix this holds via the checked `!(cap < new_supply)` form (no
+    /// `cap + 1`): `new_supply == 0`, `-1 < 0` is true, `Not` → `false` → rejected.
     #[test]
     fn negative_cap_policy_is_self_contradictory_but_fails_closed_not_panics() {
         let policy = fixed_supply_cap_policy(-1);
@@ -1249,7 +1325,7 @@ mod tests {
         prior.insert(asset_b, 1000i128); // plenty of headroom for the 50 burn
         let mctx = MintCtx { height: 0, prior_supply: prior };
 
-        let mints = vec![
+        let mut mints = vec![
             MintRequest {
                 policy: policy_a,
                 redeemer: vec![],
@@ -1261,6 +1337,8 @@ mod tests {
                 action: MintAction { asset_id: asset_b, delta: -50 },
             },
         ];
+        // F4: mints must be presented in canonical ascending asset_id order.
+        mints.sort_by(|x, y| x.action.asset_id.cmp(&y.action.asset_id));
         let v = MockVerifier { good: vec![(sighash, minter_pk, sig)] };
         assert!(validate_tx_with_mint(&tx, &mints, &mctx, &v, 100_000).is_ok());
     }

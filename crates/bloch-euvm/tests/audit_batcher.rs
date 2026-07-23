@@ -78,41 +78,32 @@ fn owner_address_grinds_execution_priority_and_extracts_price() {
     assert_eq!(s2, s2_rev, "advantage is address-determined, not submission-order");
 }
 
-/// FINDING 2 (pub-API panic on adversarial reserves — DoS / determinism hazard).
+/// FINDING 2 FIXED (regression): `Settlement::old_k()` / `new_k()` used the NATIVE `*`
+/// operator (unchecked), unlike every other arithmetic site in the crate. For reserves
+/// near `u64::MAX` the product exceeds `i128::MAX` (~1.7e38 < (2^64)^2 = ~3.4e38): the
+/// multiply overflowed, panicking under overflow-checks and wrapping negative in release.
 ///
-/// `Settlement::old_k()` / `new_k()` compute `old0 as i128 * old1 as i128` with the
-/// NATIVE `*` operator (unchecked), unlike every other arithmetic site in the crate
-/// (which is checked i128 / `checked_*`). For reserves near `u64::MAX`, the product
-/// exceeds `i128::MAX` (~1.7e38 < (2^64)^2 = ~3.4e38): the multiply OVERFLOWS,
-/// PANICKING in debug builds (incl. `cargo test`) and silently WRAPPING to a negative
-/// `i128` in release. These are `pub` methods on a `pub` struct that any consensus
-/// caller comparing `new_k() >= old_k()` would use — a panic path (node crash) and a
-/// release-mode wrap that makes the invariant check nonsense, both reachable from a
-/// pool whose reserves are a high-supply token.
+/// Now they use `checked_mul` and return `Option<i128>` — a `None` fail-closed refusal,
+/// matching the VM's own `Op::Mul`. No panic, no wrap. This test fails if the unchecked
+/// multiply (and the panic) return.
 #[test]
-#[should_panic(expected = "overflow")]
 fn settlement_old_k_panics_on_large_reserves_debug() {
     // Empty batch just carries the pool reserves through into old0/old1.
     let p = pool(u64::MAX, u64::MAX);
     let s = settle(&p, &[], 30, 1_000).unwrap();
-    // old0 * old1 = (2^64-1)^2 overflows i128 -> panic in debug.
-    let _ = s.old_k();
+    // old0 * old1 = (2^64-1)^2 exceeds i128::MAX -> fail-closed None, never a panic.
+    assert_eq!(s.old_k(), None, "old_k must fail closed to None, not panic/wrap");
+    assert_eq!(s.new_k(), None, "new_k must fail closed to None, not panic/wrap");
 }
 
-/// FINDING 3 (documented-but-live defect: `saturating_add` reserve update).
+/// FINDING 3 FIXED (regression): `settle`'s accept arm used `saturating_add`, not
+/// `checked_add`. Near `u64::MAX` an accepted fill silently CLAMPED the reserve, so the
+/// returned `Settlement.new0` was NOT the conserved value — guarantee (d) "every asset
+/// balances exactly" was violated INSIDE the struct `settle` hands back.
 ///
-/// `settle`'s accept arm updates a reserve with `saturating_add`, not `checked_add`.
-/// Near `u64::MAX` an accepted fill silently CLAMPS the reserve, so the returned
-/// `Settlement.new0` is NOT `old0 + give_amount` — the module's own guarantee (d)
-/// "every asset balances exactly" is violated INSIDE the struct `settle` hands back,
-/// before any validator sees it. A caller reading `Settlement` fields directly (a
-/// natural use — e.g. to display/settle without a full `build_settlement_tx` +
-/// `validate_tx` round trip) observes a lying, non-conserving reserve number.
-///
-/// This confirms the in-module pin: today the corruption is only caught by the
-/// *independent* conservation check in `validate_tx` (the funding input keeps the
-/// true, un-clamped amount), not by `settle`/`amm_out` failing closed the way they
-/// correctly do on i128 overflow. Fix: `checked_add` + drop/refund on overflow.
+/// Fixed: the reserve update is `checked_add`/`checked_sub`; an order whose fill would
+/// overflow u64 is DROPPED and REFUNDED (reserves untouched), like every other rejection.
+/// So `new0` is always the true, un-clamped reserve. This test fails if saturation returns.
 #[test]
 fn settle_reserve_update_saturates_instead_of_failing_closed() {
     let mut value = Value::new();
@@ -120,17 +111,22 @@ fn settle_reserve_update_saturates_instead_of_failing_closed() {
     value.insert(B, 1_000_000);
     let p = ExtOutput { value, validator_hash: [0u8; 32], datum: Val::Int(0) };
 
-    // Large give so dy>0 (accept path) AND old0 + give overflows u64.
+    // Large give so dy>0 (accept path reached) AND old0 + give overflows u64.
     let o = order(1, A, u64::MAX / 2, B, 0);
     let s = settle(&p, &[o], 0, 1_000_000).unwrap();
 
-    assert!(s.fills[0].filled, "accept path taken");
-    // True conserved reserve would be (u64::MAX-10) + u64::MAX/2 > u64::MAX.
+    // Precondition: the true conserved reserve would exceed u64.
     let true_sum = (u64::MAX - 10) as u128 + (u64::MAX / 2) as u128;
     assert!(true_sum > u64::MAX as u128, "precondition: real sum overflows u64");
-    // settle returns the CLAMPED value, silently dropping the excess — not conserved.
-    assert_eq!(s.new0, u64::MAX, "settle saturates instead of refusing the order");
-    assert_ne!(s.new0 as u128, true_sum, "Settlement.new0 is NOT the conserved sum");
+
+    // Fixed: the overflowing order is refunded, not silently saturated.
+    assert!(!s.fills[0].filled, "overflowing order must be refunded, not filled");
+    assert_eq!(s.fills[0].out_asset, A, "refund is in the give asset");
+    assert_eq!(s.fills[0].out_amount, u64::MAX / 2, "give refunded intact");
+    // The reserve stays the true, un-clamped value: order dropped, so new0 == old0.
+    assert_eq!(s.new0, s.old0, "no saturation: reserve unchanged when the order is dropped");
+    assert_eq!(s.new0, u64::MAX - 10);
+    assert_eq!(s.new1, s.old1);
 }
 
 /// CONTROL: the pool itself is genuinely safe against a single order through the AMM
