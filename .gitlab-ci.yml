@@ -138,6 +138,46 @@ osv-scanner:
     - osv-scanner --lockfile=Cargo.lock
   allow_failure: true
 
+# cargo-geiger — quantifies `unsafe` across the dependency tree (own code +
+# transitive), so a dependency bump that pulls in new unsafe is visible in the
+# diff. NON-BLOCKING: geiger's cargo-metadata pass fails to match the workspace
+# path-dep `bloch-euvm@0.0.1` and emits "Failed to match" noise instead of a
+# clean table (a known geiger limitation with path deps), so it is an
+# early-warning surface, not a gate. First-party crates are separately held
+# `unsafe`-free by the hardened-clippy + internal audit. Local: `cargo geiger`.
+cargo-geiger:
+  stage: check
+  script:
+    - cargo install cargo-geiger --locked 2>/dev/null || true
+    - cargo geiger --all-features --output-format Ascii || true
+  allow_failure: true
+
+# cargo-fuzz smoke — links the fuzz harness against the REAL bloch API and runs
+# each scanner-priority target for a few seconds to prove it does not fault on
+# shallow input. NON-BLOCKING: a bounded smoke run is a build/link + no-shallow-
+# crash check, NOT a coverage-exhausting campaign (that runs continuously in
+# OSS-Fuzz — see fuzz/oss-fuzz/). Needs the nightly toolchain + cargo-fuzz +
+# libFuzzer; the guard skips soft if nightly is unavailable on the runner.
+# Local: `cargo +nightly fuzz run <target> -- -max_total_time=30`.
+fuzz-smoke:
+  stage: test
+  before_script: []
+  script:
+    - |
+      if ! rustup toolchain list | grep -q nightly; then
+        echo "nightly toolchain not installed on this runner — skipping fuzz smoke (informational)."
+        echo "install: rustup toolchain install nightly && cargo install cargo-fuzz"
+        exit 0
+      fi
+    - cargo install cargo-fuzz --locked 2>/dev/null || true
+    - |
+      for t in block_parse tx_parse sha256d_pow ghostdag_order sig_verify; do
+        echo "== fuzz smoke: $t =="
+        cargo +nightly fuzz run "$t" -- -max_total_time=20 -runs=100000
+      done
+  allow_failure: true
+  timeout: 30m
+
 # Secret scanning — catch committed credentials (e.g. a leaked token) before they
 # reach history. Best practice given the project's own PAT-rotation lesson.
 secret-scan:

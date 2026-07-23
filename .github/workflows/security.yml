@@ -1,0 +1,191 @@
+# Bloch-SIS Protocol — Security scanners (GitHub Actions)
+#
+# GitHub mirror of the security stage in .gitlab-ci.yml. GitLab CI runs on a
+# self-hosted aarch64 Linux runner; this runs on GitHub-hosted ubuntu-latest,
+# which already ships clang + cmake for the C-toolchain deps (rocksdb bindgen,
+# blst, pqcrypto/PQClean).
+#
+# Gating philosophy (identical to GitLab):
+#   BLOCKING     — cargo-audit, cargo-deny, clippy-hardened. A known
+#                  high-severity advisory, a supply-chain/license violation, or
+#                  a panic/overflow in consensus code must fail the pipeline.
+#   REPORT-ONLY  — cargo-geiger, miri, cargo-fuzz smoke, osv-scanner (early-
+#                  warning surfaces; network/nightly-dependent or noisy, triaged
+#                  in SECURITY_TOOLING.md, not yet hard gates). These use
+#                  `continue-on-error: true` — GitHub's equivalent of GitLab's
+#                  `allow_failure: true`.
+#
+# What these tools CANNOT catch (consensus logic + cryptographic parameter
+# choices) is documented in SECURITY_TOOLING.md and requires human + third-party
+# review before any consensus activation.
+
+name: security
+
+on:
+  push:
+    branches: [main, "euvm/**"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── BLOCKING ────────────────────────────────────────────────────────────────
+
+  # cargo-audit — RUSTSEC-only advisory backstop. `--deny warnings` also fails on
+  # unmaintained/unsound informational advisories. The tracked ignore set (with
+  # rationale) lives in audit.toml / .cargo/audit.toml.
+  cargo-audit:
+    name: cargo-audit (blocking)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: cargo audit
+        run: cargo audit --deny warnings
+
+  # cargo-deny — advisories + license policy (permissive only; AGPL allowed for
+  # the six first-party crates, copyleft denied for third-party deps) + banned/
+  # duplicate crates + untrusted registries. See deny.toml.
+  cargo-deny:
+    name: cargo-deny (blocking)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+      - name: cargo deny check
+        run: cargo deny check advisories bans licenses sources
+
+  # clippy-hardened — BLOCKING, scoped to CONSENSUS-CRITICAL code only. Denies
+  # panics (unwrap/expect) and unchecked arithmetic in consensus, emission and
+  # tokenomics paths (a panic reachable from an untrusted block/tx is a DoS; an
+  # emission overflow is an inflation bug). See scripts/hardened-clippy.sh.
+  clippy-hardened:
+    name: clippy-hardened (blocking)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install C toolchain (rocksdb/blst/PQClean)
+        run: sudo apt-get update && sudo apt-get install -y clang cmake
+      - name: hardened clippy
+        run: bash scripts/hardened-clippy.sh
+
+  # ── REPORT-ONLY (early-warning; continue-on-error) ──────────────────────────
+
+  # clippy (full, pedantic) — informational; the fork is not yet pedantic-clean.
+  clippy:
+    name: clippy (report-only)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install C toolchain
+        run: sudo apt-get update && sudo apt-get install -y clang cmake
+      - run: cargo clippy --all-targets
+
+  # cargo-geiger — quantifies `unsafe` across the dependency tree. Non-blocking:
+  # geiger's cargo-metadata pass mismatches the workspace path-dep bloch-euvm and
+  # emits "Failed to match" noise instead of a clean table (known geiger path-dep
+  # limitation). First-party crates are separately held unsafe-free.
+  cargo-geiger:
+    name: cargo-geiger (report-only)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install C toolchain
+        run: sudo apt-get update && sudo apt-get install -y clang cmake
+      - name: Install cargo-geiger
+        run: cargo install cargo-geiger --locked
+      - run: cargo geiger --all-features --output-format Ascii
+
+  # miri — UB / provenance / uninit-read on the pure-Rust consensus + emission
+  # unit tests. Scoped to FFI-free crates (the node's C FFI — PQClean, rocksdb,
+  # blst — cannot run under Miri). Non-blocking (needs nightly + rust-src).
+  miri:
+    name: miri-consensus (report-only)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri, rust-src
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo miri test (tokenomics/emission)
+        run: cargo +nightly miri test -p bloch-crypto --lib tokenomics
+
+  # cargo-fuzz smoke — links the fuzz harness against the REAL bloch API and runs
+  # each scanner-priority target for a bounded time to prove it does not fault on
+  # shallow input. NOT a coverage-exhausting campaign (that runs continuously in
+  # OSS-Fuzz — see fuzz/oss-fuzz/). Non-blocking.
+  fuzz-smoke:
+    name: cargo-fuzz smoke (report-only)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: Install C toolchain + cargo-fuzz
+        run: |
+          sudo apt-get update && sudo apt-get install -y clang cmake
+          cargo install cargo-fuzz --locked
+      - name: fuzz smoke (priority surfaces)
+        run: |
+          for t in block_parse tx_parse sha256d_pow ghostdag_order sig_verify; do
+            echo "== fuzz smoke: $t =="
+            cargo +nightly fuzz run "$t" -- -max_total_time=20 -runs=100000
+          done
+
+  # osv-scanner — supplementary scan against the OSV.dev DB (RustSec + GHSA).
+  # Catches GHSA-only advisories cargo-audit's RustSec-only feed misses (e.g.
+  # yamux GHSA-vxx9-2994-q338). Non-blocking early-warning surface; findings are
+  # triaged in SECURITY_TOOLING.md §Advisory-posture.
+  osv-scanner:
+    name: osv-scanner (report-only)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run osv-scanner
+        uses: google/osv-scanner-action/osv-scanner-action@v1.9.2
+        with:
+          scan-args: |-
+            --lockfile=Cargo.lock
+
+  # gitleaks — catch committed credentials before they reach history (the
+  # project has its own PAT-rotation lesson). Non-blocking early-warning.
+  secret-scan:
+    name: gitleaks (report-only)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
