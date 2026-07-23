@@ -17,8 +17,10 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 
 use crate::downstream::DownstreamConn;
+use crate::extranonce::ExtranonceRegistry;
 use crate::metrics;
-use crate::router::{self, ExtranonceRegistry};
+use crate::pplns::PplnsLedger;
+use crate::router;
 use crate::types::{Metrics, PoolError, ProxyConfig, WorkerId};
 
 /// Owns the shared config + metrics and runs the whole proxy process.
@@ -27,6 +29,10 @@ pub struct ProxyServer {
     metrics: Arc<Metrics>,
     /// Process-wide extranonce1 collision guard, shared by every worker.
     extranonce_registry: Arc<ExtranonceRegistry>,
+    /// Pool-wide PPLNS ledger (G1): every worker records its accepted shares
+    /// here so payout-share can be computed across all workers. Shared with
+    /// the metrics endpoint, which exposes a `/pplns` query + aggregate gauges.
+    ledger: Arc<PplnsLedger>,
 }
 
 /// RAII guard: increments `workers_active`/`workers_total` on construction
@@ -52,10 +58,13 @@ impl Drop for WorkerGuard {
 
 impl ProxyServer {
     pub fn new(cfg: ProxyConfig) -> Self {
+        let cfg = Arc::new(cfg);
+        let ledger = Arc::new(PplnsLedger::new(&cfg));
         ProxyServer {
-            cfg: Arc::new(cfg),
+            cfg,
             metrics: Arc::new(Metrics::new()),
             extranonce_registry: Arc::new(ExtranonceRegistry::new()),
+            ledger,
         }
     }
 
@@ -78,14 +87,37 @@ impl ProxyServer {
 
         // Metrics endpoint on its own task. A bind failure there is logged but
         // must not take the proxy down — mining continues without metrics.
+        // The ledger is shared in so the endpoint can render aggregate PPLNS
+        // gauges and answer the `/pplns` payout-share query.
         {
             let m = self.metrics.clone();
             let addr = self.cfg.metrics_addr.clone();
+            let ledger = self.ledger.clone();
             tokio::spawn(async move {
-                if let Err(e) = metrics::serve_metrics(&addr, m).await {
+                if let Err(e) = metrics::serve_metrics(&addr, m, ledger).await {
                     log::error!("metrics endpoint failed: {}", e);
                 }
             });
+        }
+
+        // Sprint-2 G3: read-only DAG-frontier observer. Polls the node's
+        // JSON-RPC (getdaginfo / getblocktemplate) and publishes DAG gauges.
+        // Purely observational — it never steers work (multi-tip steering is
+        // infeasible without a node change; see the PMO verdict). A failing
+        // poll only bumps `rpc_poll_failures` and is retried; it never affects
+        // mining.
+        if self.cfg.rpc_observer_enabled {
+            log::info!(
+                "DAG-frontier observer enabled: polling {} every {}s",
+                self.cfg.rpc_addr,
+                self.cfg.rpc_poll_secs
+            );
+            tokio::spawn(crate::rpc::run_dag_observer(
+                self.cfg.clone(),
+                self.metrics.clone(),
+            ));
+        } else {
+            log::info!("DAG-frontier observer disabled (BLOCH_POOL_RPC_OBSERVER=off)");
         }
 
         let shutdown = shutdown_signal();
@@ -137,13 +169,14 @@ impl ProxyServer {
                     let cfg = self.cfg.clone();
                     let metrics = self.metrics.clone();
                     let registry = self.extranonce_registry.clone();
+                    let ledger = self.ledger.clone();
                     tokio::spawn(async move {
                         // Guard bumps workers_active now and releases on any exit.
                         let _guard = WorkerGuard::new(metrics.clone());
                         // Wrap the accepted stream; the router owns per-worker
                         // session state from here.
                         let down = DownstreamConn::new(stream, id, cfg.clone(), metrics.clone());
-                        match router::run_worker(down, cfg, metrics, registry).await {
+                        match router::run_worker(down, cfg, metrics, registry, ledger).await {
                             Ok(()) => log::info!("worker {} closed", id),
                             Err(e) => log::info!("worker {} closed: {}", id, e),
                         }
@@ -199,6 +232,12 @@ async fn shutdown_signal() {
 /// | `BLOCH_POOL_KEEPALIVE_SECS`| `keepalive_idle` (s)   | `20` |
 /// | `BLOCH_POOL_VARDIFF`       | `vardiff_override`     | `1`/`true`/`off` |
 /// | `BLOCH_POOL_PPLNS_WINDOW`  | `pplns_window_shares`  | `100000` |
+/// | `BLOCH_POOL_PPLNS_WINDOW_SECS`   | `pplns_window_secs`     | `600` |
+/// | `BLOCH_POOL_EXTRANONCE_REDIAL_MAX` | `extranonce_redial_max` | `3` |
+/// | `BLOCH_POOL_RPC`           | `rpc_addr`             | `127.0.0.1:16210` |
+/// | `BLOCH_POOL_RPC_POLL_SECS` | `rpc_poll_secs`        | `10` |
+/// | `BLOCH_POOL_RPC_API_KEY`   | `rpc_api_key`          | `secret` |
+/// | `BLOCH_POOL_RPC_OBSERVER`  | `rpc_observer_enabled` | `1`/`true`/`off` |
 /// | `BLOCH_POOL_MAX_WORKERS`   | `max_workers`          | `4096` |
 ///
 /// An unset variable keeps the default; a set-but-unparseable variable is a
@@ -238,6 +277,33 @@ where
     }
     if let Some(v) = get("BLOCH_POOL_PPLNS_WINDOW") {
         cfg.pplns_window_shares = parse_field::<usize>("BLOCH_POOL_PPLNS_WINDOW", &v)?;
+    }
+    if let Some(v) = get("BLOCH_POOL_PPLNS_WINDOW_SECS") {
+        cfg.pplns_window_secs = parse_field::<u64>("BLOCH_POOL_PPLNS_WINDOW_SECS", &v)?;
+    }
+    if let Some(v) = get("BLOCH_POOL_EXTRANONCE_REDIAL_MAX") {
+        cfg.extranonce_redial_max =
+            parse_field::<u32>("BLOCH_POOL_EXTRANONCE_REDIAL_MAX", &v)?;
+    }
+    if let Some(v) = get("BLOCH_POOL_RPC") {
+        cfg.rpc_addr = v;
+    }
+    if let Some(v) = get("BLOCH_POOL_RPC_POLL_SECS") {
+        let secs = parse_field::<u64>("BLOCH_POOL_RPC_POLL_SECS", &v)?;
+        if secs == 0 {
+            return Err(PoolError::Config(
+                "BLOCH_POOL_RPC_POLL_SECS must be >= 1".to_string(),
+            ));
+        }
+        cfg.rpc_poll_secs = secs;
+    }
+    if let Some(v) = get("BLOCH_POOL_RPC_API_KEY") {
+        // An empty key is treated as "no key" so `KEY=` doesn't send a blank
+        // auth header.
+        cfg.rpc_api_key = if v.trim().is_empty() { None } else { Some(v) };
+    }
+    if let Some(v) = get("BLOCH_POOL_RPC_OBSERVER") {
+        cfg.rpc_observer_enabled = parse_bool("BLOCH_POOL_RPC_OBSERVER", &v)?;
     }
     if let Some(v) = get("BLOCH_POOL_MAX_WORKERS") {
         let n = parse_field::<usize>("BLOCH_POOL_MAX_WORKERS", &v)?;
@@ -296,7 +362,20 @@ mod tests {
         assert_eq!(cfg.keepalive_idle, def.keepalive_idle);
         assert_eq!(cfg.vardiff_override, def.vardiff_override);
         assert_eq!(cfg.pplns_window_shares, def.pplns_window_shares);
+        assert_eq!(cfg.pplns_window_secs, def.pplns_window_secs);
+        assert_eq!(cfg.extranonce_redial_max, def.extranonce_redial_max);
+        assert_eq!(cfg.rpc_addr, def.rpc_addr);
+        assert_eq!(cfg.rpc_poll_secs, def.rpc_poll_secs);
+        assert_eq!(cfg.rpc_api_key, def.rpc_api_key);
+        assert_eq!(cfg.rpc_observer_enabled, def.rpc_observer_enabled);
         assert_eq!(cfg.max_workers, def.max_workers);
+        // Sprint-2 defaults, pinned so a stray change is caught.
+        assert_eq!(cfg.pplns_window_secs, 0);
+        assert_eq!(cfg.extranonce_redial_max, 3);
+        assert_eq!(cfg.rpc_addr, "127.0.0.1:16210");
+        assert_eq!(cfg.rpc_poll_secs, 10);
+        assert_eq!(cfg.rpc_api_key, None);
+        assert!(cfg.rpc_observer_enabled);
     }
 
     #[test]
@@ -308,6 +387,12 @@ mod tests {
         map.insert("BLOCH_POOL_KEEPALIVE_SECS", "45");
         map.insert("BLOCH_POOL_VARDIFF", "true");
         map.insert("BLOCH_POOL_PPLNS_WINDOW", "250000");
+        map.insert("BLOCH_POOL_PPLNS_WINDOW_SECS", "600");
+        map.insert("BLOCH_POOL_EXTRANONCE_REDIAL_MAX", "7");
+        map.insert("BLOCH_POOL_RPC", "10.0.0.2:16210");
+        map.insert("BLOCH_POOL_RPC_POLL_SECS", "30");
+        map.insert("BLOCH_POOL_RPC_API_KEY", "s3cret");
+        map.insert("BLOCH_POOL_RPC_OBSERVER", "off");
         map.insert("BLOCH_POOL_MAX_WORKERS", "128");
         let cfg = config_from_getter(getter(&map)).unwrap();
         assert_eq!(cfg.listen_addr, "0.0.0.0:4444");
@@ -316,7 +401,72 @@ mod tests {
         assert_eq!(cfg.keepalive_idle, Duration::from_secs(45));
         assert!(cfg.vardiff_override);
         assert_eq!(cfg.pplns_window_shares, 250_000);
+        assert_eq!(cfg.pplns_window_secs, 600);
+        assert_eq!(cfg.extranonce_redial_max, 7);
+        assert_eq!(cfg.rpc_addr, "10.0.0.2:16210");
+        assert_eq!(cfg.rpc_poll_secs, 30);
+        assert_eq!(cfg.rpc_api_key.as_deref(), Some("s3cret"));
+        assert!(!cfg.rpc_observer_enabled);
         assert_eq!(cfg.max_workers, 128);
+    }
+
+    #[test]
+    fn rpc_observer_bool_variants_parse() {
+        for (s, want) in [("1", true), ("on", true), ("0", false), ("off", false)] {
+            let mut map = HashMap::new();
+            map.insert("BLOCH_POOL_RPC_OBSERVER", s);
+            let cfg = config_from_getter(getter(&map)).unwrap();
+            assert_eq!(cfg.rpc_observer_enabled, want, "for {s:?}");
+        }
+        let mut map = HashMap::new();
+        map.insert("BLOCH_POOL_RPC_OBSERVER", "sometimes");
+        assert!(matches!(
+            config_from_getter(getter(&map)).unwrap_err(),
+            PoolError::Config(_)
+        ));
+    }
+
+    #[test]
+    fn empty_rpc_api_key_is_none() {
+        let mut map = HashMap::new();
+        map.insert("BLOCH_POOL_RPC_API_KEY", "");
+        let cfg = config_from_getter(getter(&map)).unwrap();
+        assert_eq!(cfg.rpc_api_key, None);
+
+        let mut map2 = HashMap::new();
+        map2.insert("BLOCH_POOL_RPC_API_KEY", "   ");
+        let cfg2 = config_from_getter(getter(&map2)).unwrap();
+        assert_eq!(cfg2.rpc_api_key, None);
+    }
+
+    #[test]
+    fn zero_rpc_poll_secs_rejected() {
+        let mut map = HashMap::new();
+        map.insert("BLOCH_POOL_RPC_POLL_SECS", "0");
+        assert!(matches!(
+            config_from_getter(getter(&map)).unwrap_err(),
+            PoolError::Config(_)
+        ));
+    }
+
+    #[test]
+    fn bad_redial_max_is_config_error() {
+        let mut map = HashMap::new();
+        map.insert("BLOCH_POOL_EXTRANONCE_REDIAL_MAX", "-1");
+        assert!(matches!(
+            config_from_getter(getter(&map)).unwrap_err(),
+            PoolError::Config(_)
+        ));
+    }
+
+    #[test]
+    fn bad_pplns_window_secs_is_config_error() {
+        let mut map = HashMap::new();
+        map.insert("BLOCH_POOL_PPLNS_WINDOW_SECS", "ages");
+        assert!(matches!(
+            config_from_getter(getter(&map)).unwrap_err(),
+            PoolError::Config(_)
+        ));
     }
 
     #[test]

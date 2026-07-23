@@ -296,6 +296,27 @@ pub struct ProxyConfig {
     /// PPLNS sliding window length (number of most-recent accepted shares
     /// retained for the payout stub). 0 disables accounting retention.
     pub pplns_window_shares: usize,
+    /// Sprint-2 PPLNS *time* window, in seconds. The pool-wide
+    /// [`crate::pplns::PplnsLedger`] retains difficulty-weighted accepted
+    /// shares younger than this so payout-share can span all workers. `0`
+    /// disables time-based eviction (only the count cap applies). Default 0.
+    pub pplns_window_secs: u64,
+    /// Sprint-2 G2: max times a colliding upstream is re-dialed to obtain a
+    /// not-in-use extranonce1 before falling back to log+count+serve. Bounds
+    /// the re-dial loop so a node that never hands a unique value cannot spin
+    /// forever. Default 3.
+    pub extranonce_redial_max: u32,
+    /// Sprint-2 G3: node JSON-RPC endpoint the read-only DAG-frontier
+    /// observer polls (`ip:port`). Default `127.0.0.1:16210`.
+    pub rpc_addr: String,
+    /// Sprint-2 G3: seconds between DAG-frontier observer polls. Default 10.
+    pub rpc_poll_secs: u64,
+    /// Sprint-2 G3: optional API key sent as an auth header on RPC polls.
+    /// `None` (default) sends no auth header.
+    pub rpc_api_key: Option<String>,
+    /// Sprint-2 G3: whether to spawn the read-only DAG-frontier observer.
+    /// Default `true`.
+    pub rpc_observer_enabled: bool,
     /// Max downstream connections accepted concurrently (fd guard).
     pub max_workers: usize,
 }
@@ -314,6 +335,12 @@ impl Default for ProxyConfig {
             vardiff_override: false,
             vardiff_target_secs: 10.0,
             pplns_window_shares: 100_000,
+            pplns_window_secs: 0,
+            extranonce_redial_max: 3,
+            rpc_addr: "127.0.0.1:16210".to_string(),
+            rpc_poll_secs: 10,
+            rpc_api_key: None,
+            rpc_observer_enabled: true,
             max_workers: 4096,
         }
     }
@@ -385,6 +412,23 @@ pub struct Metrics {
     /// Times a node-assigned extranonce1 was found already in use by another
     /// live worker (duplicated search space — see `ExtranonceRegistry`).
     pub extranonce1_collisions: AtomicU64,
+    /// Sprint-2 G2: times a colliding upstream was re-dialed to try to obtain
+    /// a not-in-use extranonce1 (each re-dial attempt, not each worker).
+    pub extranonce1_redials: AtomicU64,
+    /// Sprint-2 G2: workers that exhausted `extranonce_redial_max` re-dials
+    /// and were served on a still-colliding extranonce1 (fallback path).
+    pub extranonce1_unresolved: AtomicU64,
+    /// Sprint-2 G3 (DAG-frontier observer) — latest polled DAG facts. These
+    /// are gauges (levels), set wholesale on each successful poll; they read 0
+    /// until the first successful poll.
+    pub dag_tip_count: AtomicI64,
+    pub dag_block_count: AtomicI64,
+    pub dag_tip_blue_score: AtomicI64,
+    pub dag_tip_height: AtomicI64,
+    /// Parents in the latest `getblocktemplate` snapshot (multi-parent width).
+    pub template_parent_count: AtomicI64,
+    /// Sprint-2 G3: failed DAG-frontier RPC polls (transport/parse/auth).
+    pub rpc_poll_failures: AtomicU64,
     pub bytes_up: AtomicU64,
     pub bytes_down: AtomicU64,
 }
@@ -442,6 +486,30 @@ impl Metrics {
     pub fn extranonce1_collision(&self) {
         self.extranonce1_collisions.fetch_add(1, Ordering::Relaxed);
     }
+    /// Sprint-2 G2: count one upstream re-dial attempted to escape a collision.
+    pub fn extranonce1_redial(&self) {
+        self.extranonce1_redials.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Sprint-2 G2: count one worker served on a still-colliding extranonce1
+    /// after exhausting the bounded re-dials.
+    pub fn extranonce1_unresolved(&self) {
+        self.extranonce1_unresolved.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Sprint-2 G3: publish the latest DAG-frontier facts from a poll.
+    pub fn set_dag(&self, tip_count: i64, block_count: i64, tip_blue_score: i64, tip_height: i64) {
+        self.dag_tip_count.store(tip_count, Ordering::Relaxed);
+        self.dag_block_count.store(block_count, Ordering::Relaxed);
+        self.dag_tip_blue_score.store(tip_blue_score, Ordering::Relaxed);
+        self.dag_tip_height.store(tip_height, Ordering::Relaxed);
+    }
+    /// Sprint-2 G3: publish the parent count of the latest block template.
+    pub fn set_template_parent_count(&self, n: i64) {
+        self.template_parent_count.store(n, Ordering::Relaxed);
+    }
+    /// Sprint-2 G3: count one failed DAG-frontier RPC poll.
+    pub fn rpc_poll_failed(&self) {
+        self.rpc_poll_failures.fetch_add(1, Ordering::Relaxed);
+    }
 
     /// Plain-old-data snapshot for rendering. Reading atomics is `Relaxed`;
     /// a snapshot is not globally consistent, which is fine for metrics.
@@ -457,6 +525,14 @@ impl Metrics {
             upstream_reconnects: self.upstream_reconnects.load(Ordering::Relaxed),
             upstream_connect_failures: self.upstream_connect_failures.load(Ordering::Relaxed),
             extranonce1_collisions: self.extranonce1_collisions.load(Ordering::Relaxed),
+            extranonce1_redials: self.extranonce1_redials.load(Ordering::Relaxed),
+            extranonce1_unresolved: self.extranonce1_unresolved.load(Ordering::Relaxed),
+            dag_tip_count: self.dag_tip_count.load(Ordering::Relaxed),
+            dag_block_count: self.dag_block_count.load(Ordering::Relaxed),
+            dag_tip_blue_score: self.dag_tip_blue_score.load(Ordering::Relaxed),
+            dag_tip_height: self.dag_tip_height.load(Ordering::Relaxed),
+            template_parent_count: self.template_parent_count.load(Ordering::Relaxed),
+            rpc_poll_failures: self.rpc_poll_failures.load(Ordering::Relaxed),
             bytes_up: self.bytes_up.load(Ordering::Relaxed),
             bytes_down: self.bytes_down.load(Ordering::Relaxed),
         }
@@ -476,6 +552,14 @@ pub struct MetricsSnapshot {
     pub upstream_reconnects: u64,
     pub upstream_connect_failures: u64,
     pub extranonce1_collisions: u64,
+    pub extranonce1_redials: u64,
+    pub extranonce1_unresolved: u64,
+    pub dag_tip_count: i64,
+    pub dag_block_count: i64,
+    pub dag_tip_blue_score: i64,
+    pub dag_tip_height: i64,
+    pub template_parent_count: i64,
+    pub rpc_poll_failures: u64,
     pub bytes_up: u64,
     pub bytes_down: u64,
 }

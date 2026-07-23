@@ -19,9 +19,11 @@
 //!     malformed input — unclassifiable lines become `Passthrough` and are
 //!     forwarded verbatim by the router);
 //!   * forward raw miner lines (`authorize` / `submit` / …) up unchanged;
-//!   * reconnect-with-exponential-backoff, re-replaying the handshake and
-//!     surfacing the fresh `extranonce1` so the router can push a
-//!     downstream `mining.set_extranonce`.
+//!   * single-attempt re-dial (`redial` / `reconnect`), re-replaying the
+//!     handshake and surfacing the fresh `extranonce1` so the router can
+//!     push a downstream `mining.set_extranonce` — the caller (reconnect
+//!     arms and the extranonce re-dial-until-unique loop) owns attempt
+//!     counting and backoff.
 //!
 //! Classification of the *node→proxy* stream lives here (this module's job
 //! is to "read/classify node lines"); the sibling `codec` module owns the
@@ -77,9 +79,6 @@ pub struct UpstreamConn {
 
     cfg: Arc<ProxyConfig>,
     metrics: Arc<Metrics>,
-
-    /// Current reconnect backoff (grows min..max across failed dials).
-    backoff: Duration,
 }
 
 /// Internal bundle returned by a successful dial + handshake.
@@ -102,7 +101,6 @@ impl UpstreamConn {
         replay: HandshakeReplay,
     ) -> Result<Self, PoolError> {
         let est = establish(&cfg, &metrics, &replay).await?;
-        let backoff = cfg.reconnect_backoff_min;
         Ok(Self {
             worker,
             extranonce1: est.sub.extranonce1,
@@ -112,7 +110,6 @@ impl UpstreamConn {
             writer: est.writer,
             cfg,
             metrics,
-            backoff,
         })
     }
 
@@ -141,12 +138,66 @@ impl UpstreamConn {
         write_line(&mut self.writer, line, &self.metrics).await
     }
 
-    /// Re-dial with exponential backoff (`reconnect_backoff_min` ..
-    /// `reconnect_backoff_max`) and re-replay `replay`, returning the fresh
+    /// Re-establish this connection to the node ONCE (backoff-free) and
+    /// re-replay `replay`, swapping in the fresh framer/writer and updating
+    /// [`extranonce1`](UpstreamConn::extranonce1) / `extranonce2_size` to the
+    /// node's freshly-assigned values, then returning the fresh
+    /// [`SubscribeResult`].
+    ///
+    /// `preserve_prelude` controls what the NEXT [`read`](UpstreamConn::read)
+    /// yields:
+    ///   * `true` — keep the fresh handshake prelude (the subscribe-result
+    ///     plus any lines seen before it) buffered, so the router can forward
+    ///     the node's subscribe response downstream verbatim. Used on the
+    ///     very first extranonce claim, where the miner still expects to see a
+    ///     subscribe-result on its own stream.
+    ///   * `false` — drop the prelude. Used on reconnect, where the miner
+    ///     already subscribed once and the router surfaces a changed
+    ///     extranonce1 via `mining.set_extranonce` instead.
+    ///
+    /// Unlike [`reconnect`](UpstreamConn::reconnect) this does NOT bump
+    /// `upstream_reconnects`: it is the single-attempt primitive that both
+    /// `reconnect` and the extranonce re-dial-until-unique loop build on, so
+    /// the CALLER owns attempt counting/backoff and any success metric. A
+    /// dial/handshake failure surfaces as `Err` (and bumps
+    /// `upstream_connect_failures` inside `establish`).
+    ///
+    /// Note: `replay` carries only `configure?`+`subscribe`, so after a
+    /// re-dial the node connection is Subscribed but not Authorized —
+    /// re-sending `mining.authorize` (via [`UpstreamConn::write`]) is the
+    /// router's responsibility, matching the initial-connect flow where
+    /// authorize travels through the live pump rather than the handshake.
+    pub async fn redial(
+        &mut self,
+        replay: &HandshakeReplay,
+        preserve_prelude: bool,
+    ) -> Result<SubscribeResult, PoolError> {
+        let est = establish(&self.cfg, &self.metrics, replay).await?;
+        self.framer = est.framer;
+        self.writer = est.writer;
+        self.prelude = if preserve_prelude {
+            est.prelude
+        } else {
+            // The miner already subscribed; the router pushes set_extranonce
+            // from the returned SubscribeResult rather than re-forwarding the
+            // node's handshake responses downstream.
+            VecDeque::new()
+        };
+        self.extranonce1 = est.sub.extranonce1.clone();
+        self.extranonce2_size = est.sub.extranonce2_size;
+        Ok(est.sub)
+    }
+
+    /// Re-dial the node once (via [`redial`](UpstreamConn::redial) with the
+    /// prelude dropped) and re-replay `replay`, returning the fresh
     /// [`SubscribeResult`] so the router can emit a downstream
-    /// `mining.set_extranonce`. Retries indefinitely on dial/handshake
-    /// failure (each failure bumps `upstream_connect_failures` and grows the
-    /// backoff); bumps `upstream_reconnects` once on success.
+    /// `mining.set_extranonce`, and bumping `upstream_reconnects` on success.
+    ///
+    /// This is the transient-fault recovery entry point used by the router's
+    /// reconnect arms. It performs a SINGLE re-establish (no internal
+    /// backoff/retry loop — the caller decides whether to retry); a
+    /// dial/handshake failure surfaces as `Err` and bumps
+    /// `upstream_connect_failures` (inside `establish`).
     ///
     /// Note: `replay` carries only `configure?`+`subscribe`, so after a
     /// reconnect the node connection is Subscribed but not Authorized —
@@ -157,36 +208,9 @@ impl UpstreamConn {
         &mut self,
         replay: &HandshakeReplay,
     ) -> Result<SubscribeResult, PoolError> {
-        self.backoff = self.cfg.reconnect_backoff_min;
-        loop {
-            match establish(&self.cfg, &self.metrics, replay).await {
-                Ok(est) => {
-                    self.framer = est.framer;
-                    self.writer = est.writer;
-                    // Do NOT re-forward the handshake responses downstream:
-                    // the miner already subscribed. The router pushes
-                    // set_extranonce from the returned SubscribeResult.
-                    self.prelude = VecDeque::new();
-                    self.extranonce1 = est.sub.extranonce1.clone();
-                    self.extranonce2_size = est.sub.extranonce2_size;
-                    self.metrics.upstream_reconnected();
-                    return Ok(est.sub);
-                }
-                Err(e) => {
-                    log::warn!(
-                        "upstream {} reconnect attempt failed: {} (backoff {:?})",
-                        self.worker,
-                        e,
-                        self.backoff
-                    );
-                    tokio::time::sleep(self.backoff).await;
-                    // Grow, clamped to max; never below 1ms so a misconfigured
-                    // zero floor can't spin.
-                    let grown = self.backoff.max(Duration::from_millis(1)) * 2;
-                    self.backoff = grown.min(self.cfg.reconnect_backoff_max);
-                }
-            }
-        }
+        let sr = self.redial(replay, false).await?;
+        self.metrics.upstream_reconnected();
+        Ok(sr)
     }
 }
 
@@ -778,6 +802,70 @@ mod tests {
         assert_eq!(sr.extranonce1, "cafebabe");
         assert_eq!(conn.extranonce1, "cafebabe");
         assert_eq!(metrics.snapshot().upstream_reconnects, 1);
+    }
+
+    #[tokio::test]
+    async fn redial_preserve_prelude_keeps_fresh_subscribe_result_buffered() {
+        // Two connections: the initial "deadbeef", then a redial to "cafebabe".
+        let (addr, _mock) = spawn_mock_node(vec!["deadbeef", "cafebabe"]).await;
+        let cfg = test_cfg(addr);
+        let metrics = Arc::new(Metrics::new());
+        let mut conn = UpstreamConn::connect(cfg, metrics.clone(), WorkerId(5), subscribe_replay())
+            .await
+            .unwrap();
+        assert_eq!(conn.extranonce1, "deadbeef");
+
+        // redial(preserve_prelude = true): the fresh handshake prelude (the
+        // subscribe-result) must be buffered for the next read().
+        let replay = subscribe_replay();
+        let sr = conn
+            .redial(&replay, true)
+            .await
+            .expect("redial should succeed");
+        assert_eq!(sr.extranonce1, "cafebabe");
+        assert_eq!(conn.extranonce1, "cafebabe");
+        // redial itself must NOT bump the reconnect counter.
+        assert_eq!(metrics.snapshot().upstream_reconnects, 0);
+
+        // First read after a preserving redial yields the buffered fresh
+        // subscribe-result.
+        match conn.read().await.unwrap() {
+            Some(f) => match f.parsed {
+                ServerMsg::SubscribeResult(got) => assert_eq!(got.extranonce1, "cafebabe"),
+                other => panic!("expected buffered SubscribeResult, got {:?}", other),
+            },
+            None => panic!("expected a buffered subscribe result after preserving redial"),
+        }
+    }
+
+    #[tokio::test]
+    async fn redial_without_preserve_drops_prelude() {
+        let (addr, _mock) = spawn_mock_node(vec!["deadbeef", "cafebabe"]).await;
+        let cfg = test_cfg(addr);
+        let metrics = Arc::new(Metrics::new());
+        let mut conn = UpstreamConn::connect(cfg, metrics.clone(), WorkerId(6), subscribe_replay())
+            .await
+            .unwrap();
+
+        // redial(preserve_prelude = false): the buffered subscribe-result is
+        // dropped, so the next read() is the LIVE stream (the node's notify),
+        // never a buffered subscribe-result.
+        let replay = subscribe_replay();
+        let sr = conn
+            .redial(&replay, false)
+            .await
+            .expect("redial should succeed");
+        assert_eq!(sr.extranonce1, "cafebabe");
+        assert_eq!(conn.extranonce1, "cafebabe");
+        assert_eq!(metrics.snapshot().upstream_reconnects, 0);
+
+        match conn.read().await.unwrap() {
+            Some(f) => match f.parsed {
+                ServerMsg::Notify(job) => assert_eq!(job.job_id, "job1"),
+                other => panic!("expected live Notify (prelude dropped), got {:?}", other),
+            },
+            None => panic!("expected the live notify after a non-preserving redial"),
+        }
     }
 
     #[tokio::test]
