@@ -224,6 +224,9 @@ tempfile = "3"
 # test-util enables tokio::test(start_paused) for the stratum session
 # lifetime tests (virtual clock through the 600s read-poll windows).
 tokio = { version = "1", features = ["full", "test-util"] }
+# Property-based invariant tests for GhostDAG consensus ordering
+# (determinism, parent-order independence, blue-score monotonicity).
+proptest = "1"
 
 # pqcrypto-internals fork VENDORED at crates/pqcrypto-internals (was a private
 # git dep that no clean build — Docker, Akash, CI — could fetch). It is a

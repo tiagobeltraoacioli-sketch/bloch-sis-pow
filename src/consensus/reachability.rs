@@ -528,7 +528,9 @@ fn decode_record(
     let mut o = 0usize;
     let rd_u64 = |b: &[u8], o: &mut usize| -> Result<u64, String> {
         if *o + 8 > b.len() { return Err("truncated u64".into()); }
-        let v = u64::from_le_bytes(b[*o..*o + 8].try_into().unwrap());
+        let v = u64::from_le_bytes(
+            b[*o..*o + 8].try_into().map_err(|_| "u64 slice".to_string())?,
+        );
         *o += 8; Ok(v)
     };
     let rd_hash = |b: &[u8], o: &mut usize| -> Result<BlockHash, String> {
@@ -544,11 +546,11 @@ fn decode_record(
     let parent_raw = rd_hash(b, &mut o)?;
     let parent = if tag == 1 { Some(parent_raw) } else { None };
     if o + 4 > b.len() { return Err("truncated children len".into()); }
-    let clen = u32::from_le_bytes(b[o..o + 4].try_into().unwrap()) as usize; o += 4;
+    let clen = u32::from_le_bytes(b[o..o + 4].try_into().map_err(|_| "children len slice".to_string())?) as usize; o += 4;
     let mut children = Vec::with_capacity(clen);
     for _ in 0..clen { children.push(rd_hash(b, &mut o)?); }
     if o + 4 > b.len() { return Err("truncated fcs len".into()); }
-    let flen = u32::from_le_bytes(b[o..o + 4].try_into().unwrap()) as usize; o += 4;
+    let flen = u32::from_le_bytes(b[o..o + 4].try_into().map_err(|_| "fcs len slice".to_string())?) as usize; o += 4;
     let mut fcs = Vec::with_capacity(flen);
     for _ in 0..flen { fcs.push(rd_hash(b, &mut o)?); }
     Ok((Interval { start, end }, (lo, hi), parent, children, fcs))

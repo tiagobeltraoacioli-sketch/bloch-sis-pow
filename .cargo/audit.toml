@@ -1,0 +1,45 @@
+# cargo-audit configuration — keeps `cargo audit --deny warnings` (the CI gate
+# in .gitlab-ci.yml) in lock-step with cargo-deny's advisory policy in
+# ../deny.toml. cargo-audit does NOT read deny.toml, so the unmaintained-crate
+# dispositions are mirrored here.
+#
+# POLICY (kept identical to deny.toml — SECURITY_TOOLING.md §Advisory-posture is
+# the authoritative disposition table):
+#   * Genuine VULNERABILITY-class advisories are never dismissed lightly. The two
+#     open hickory-proto advisories (RUSTSEC-2026-0118 / -0119) are ACCEPTED, not
+#     fixed: the fix is hickory 0.26.x but libp2p 0.56.0 pins hickory-proto 0.25.2
+#     via libp2p-dns + libp2p-mdns, so there is no bump path until libp2p repins.
+#     They are tracked here and in deny.toml as OPEN, with a reachability
+#     rationale, and MUST be removed the moment a libp2p release ships hickory
+#     >= 0.26.x. This mirrors the intentional risk-acceptance in deny.toml.
+#   * All other entries are `unmaintained` / `unsound` notices with no runtime
+#     attack surface on the node, each with a written rationale.
+#
+# NOTE: `cargo audit` (RUSTSEC-only) does NOT flag the GHSA-only advisories that
+# osv-scanner surfaces — yamux 0.12.1 (GHSA-vxx9-2994-q338, CVSS 8.7, libp2p-yamux
+# 0.47-pinned) and the SP1 plonky3 p3-challenger/p3-symmetric crates. Those remain
+# OPEN residuals documented in SECURITY_TOOLING.md; run osv-scanner to see them.
+[advisories]
+ignore = [
+    # ── Post-quantum crypto: vendored, intentionally pinned (PQClean archived) ──
+    "RUSTSEC-2026-0165", # pqcrypto-falcon    unmaintained
+    "RUSTSEC-2026-0166", # pqcrypto-mldsa     unmaintained
+    "RUSTSEC-2026-0162", # pqcrypto-traits    unmaintained
+    "RUSTSEC-2026-0163", # pqcrypto-internals unmaintained (vendored crate)
+    "RUSTSEC-2024-0381", # pqcrypto-kyber     superseded by pqcrypto-mlkem
+    # ── Transitive, no first-party call path ──────────────────────────────────
+    "RUSTSEC-2025-0141", # bincode 1.3.3 unmaintained — wire format uses 2.x
+    "RUSTSEC-2024-0436", # paste unmaintained — compile-time proc-macro helper
+    "RUSTSEC-2026-0173", # proc-macro-error2 unmaintained — compile-time only
+    "RUSTSEC-2025-0134", # rustls-pemfile unmaintained — transitive TLS PEM decode
+    # ── SP1 prover / zk host-side toolchain (not the node runtime path) ────────
+    "RUSTSEC-2025-0012", # backoff unmaintained       — via sp1-sdk
+    "RUSTSEC-2024-0384", # instant unmaintained       — via backoff (SP1)
+    "RUSTSEC-2021-0139", # ansi_term unmaintained     — via tracing-forest (SP1)
+    "RUSTSEC-2024-0388", # derivative unmaintained    — via ark-ff (zk stack)
+    "RUSTSEC-2025-0119", # number_prefix unmaintained — via indicatif (SP1 CLI)
+    "RUSTSEC-2026-0002", # lru UNSOUND (IterMut aliasing) — sp1-prover host-side
+    # ── Accepted vulnerabilities, no upstream bump path (mirrors deny.toml) ─────
+    "RUSTSEC-2026-0118", # hickory-proto NSEC3 unbounded loop — libp2p 0.56-pinned
+    "RUSTSEC-2026-0119", # hickory-proto O(n^2) name compression — libp2p-pinned
+]

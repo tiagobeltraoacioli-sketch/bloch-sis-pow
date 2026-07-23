@@ -9,6 +9,13 @@ publish = false
 [package.metadata]
 cargo-fuzz = true
 
+# Make the fuzz crate its own workspace root. The node's root manifest already
+# lists `fuzz` in `workspace.exclude`, but cargo-fuzz builds the crate with an
+# explicit `--manifest-path` and still walks up to the parent workspace unless
+# an empty `[workspace]` table anchors it here. This keeps the harness fully
+# decoupled from the node build (it is not a path-dep of `bloch`).
+[workspace]
+
 [dependencies]
 libfuzzer-sys = "0.4"
 bloch = { path = ".." }
@@ -70,5 +77,31 @@ doc = false
 [[bin]]
 name = "mempool_ops"
 path = "fuzz_targets/mempool_ops.rs"
+test = false
+doc = false
+
+# ── Scanner priority targets (Part-A #2/#3/#4): live SHA-256d PoW, GhostDAG ──
+# ── ordering, and the hybrid ML-DSA-65 ‖ Falcon-1024 signature envelope.    ──
+
+[[bin]]
+# Live Genesis-2 SHA-256d PoW verifier (double-SHA256 + endianness hard fork).
+# NOTE: distinct from `pow_verify`, which fuzzes the OTHER chain's Module-SIS
+# lattice verifier — this covers the PoW that is actually live.
+name = "sha256d_pow"
+path = "fuzz_targets/sha256d_pow.rs"
+test = false
+doc = false
+
+[[bin]]
+# GhostDAG ordering under adversarial DAG topologies (stateful).
+name = "ghostdag_order"
+path = "fuzz_targets/ghostdag_order.rs"
+test = false
+doc = false
+
+[[bin]]
+# Hybrid PQ signature verifier + crypto-agility suite envelope parser.
+name = "sig_verify"
+path = "fuzz_targets/sig_verify.rs"
 test = false
 doc = false

@@ -7,6 +7,8 @@
 **Auditor:** Lead auditor, internal
 **Commit context:** branch `euvm/integrate`, activation gated at `EUVM_ACTIVATION_HEIGHT = u64::MAX` (inert)
 
+> **REMEDIATION STATUS — ALL FINDINGS CLOSED (2026-07-22).** Every finding below (F1–F6) has been **fixed** and pinned by a passing regression test; the two HIGH integration blockers (F1 commitment binding, F2 gas metering) and the cross-cutting `overflow-checks` mandate (F3) are resolved. **330 tests pass in debug *and* release.** The body below is preserved as the original audit record; see **§6 Remediation — closed** for the per-finding disposition. The crate remains isolated / feature-off / not consensus-wired; activation stays gated on the forthcoming **third-party audit** + a coordinated height-gated hard fork.
+
 ---
 
 ## 1. Executive summary
@@ -109,4 +111,21 @@ Every finding in §2 has at least one passing repro test that demonstrates the e
 
 ---
 
-*Internal audit — for engineering and pre-fork planning. Not a substitute for the forthcoming third-party audit.*
+## 6. Remediation — closed (2026-07-22)
+
+All six findings are fixed and each is pinned by a passing regression test. Steps 1–3 of §5 are complete; steps 4–5 (third-party audit, then activation-height setting) remain the standing gate before any consensus wiring goes live.
+
+| # | Sev | Fix landed | Verifying test |
+|---|-----|-----------|----------------|
+| **F1** | HIGH | `accept_block_model` now commits `SparseMerkleTree::root()` over the resulting eUTXO set; gas/fee carried as bound side-data. Differing token movements now produce **diverging** commitments. | `audit_determinism_commitment.rs` — asserts distinct eUTXO effects → distinct roots |
+| **F2** | HIGH | Gas is now proportional to operand byte length (`GAS_PER_BYTE` / `HASH_GAS_PER_BYTE`) for `PushBytes`/`Dup`/`Pick`/`Sha256d`/`Shake256`/`Size`, with hard ceilings enforced before execution: per-operand 1 MiB, per-program 1 MiB, total-allocated 64 MiB, plus tx-resource limits — all **fail-closed**. | `audit_gas.rs` — length-scaled cost + ceiling rejections |
+| **F3** | MED+X | `checked_add`/`checked_mul` at `minting.rs` (`cap+1`) and `batcher.rs` (`old_k`/`new_k`); **`overflow-checks = true` added to `[profile.release]`** — release and debug now panic-parity, closing the mixed-profile validator split. | `audit_panics.rs`, `audit_batcher.rs` |
+| **F4** | LOW | `settle()` reserve math switched `saturating_add` → `checked_add`, rejecting the settlement on overflow instead of silently capping. | `audit_batcher.rs` |
+| **F5** | LOW | `fixed_supply_cap_policy(cap)` uses `checked_add(1)`, returning an error on `cap == i128::MAX` instead of panicking / emitting a dead policy. | `audit_modules_supply.rs` |
+| **F6** | INFO | `validate_tx_with_mint` requires `mints` in canonical `asset_id` order and rejects otherwise (mirrors the `DuplicatePolicy` guard) — accept/error outcome is now encoding-order-independent. | `audit_conservation.rs` |
+
+**Post-remediation baseline:** the suite grew from 147 → **330** tests, all passing under `cargo test -p bloch-euvm` in **both** debug and `--release`. On top of the VM, the **Kirpich** charter-audit gate (`kirpich.rs` + 4 lanes, 23 fail-closed KRP rules) refuses to compile any Ustav token charter carrying a blocking defect. The crate is still inert (`EUVM_ACTIVATION_HEIGHT = u64::MAX`); nothing routes through `accept_block`.
+
+---
+
+*Internal audit — for engineering and pre-fork planning. Findings F1–F6 remediated 2026-07-22 (§6). Not a substitute for the forthcoming third-party audit, which remains mandatory before activation.*

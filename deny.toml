@@ -15,6 +15,71 @@ yanked = "deny"
 # `cargo deny check advisories` pulls the RUSTSEC DB and fails on unfixed
 # vulnerabilities; add explicit `ignore = ["RUSTSEC-XXXX-YYYY"]` entries only with
 # a written rationale.
+#
+# The ignores below are limited to `unmaintained`/`notice`-class advisories with
+# a written rationale (no fix path). Actual `vulnerability`-class advisories are
+# NEVER ignored here — they must be fixed by bumping the offending dependency.
+# See SECURITY_TOOLING.md §Advisory-posture for the full disposition table.
+ignore = [
+    # ── Post-quantum crypto: vendored, intentionally pinned ────────────────
+    # PQClean upstream is being archived, so the pqcrypto-* wrappers are flagged
+    # `unmaintained`. Bloch VENDORS these (crates/pqcrypto-internals, seeded-RNG
+    # override) precisely so the exact FIPS-204/Falcon reference impl is frozen
+    # under Cargo.lock. There is no drop-in replacement that keeps the same
+    # KATs; migration is a deliberate crypto-review event, not a `cargo update`.
+    "RUSTSEC-2026-0165", # pqcrypto-falcon  unmaintained (PQClean archived)
+    "RUSTSEC-2026-0166", # pqcrypto-mldsa   unmaintained (PQClean archived)
+    "RUSTSEC-2026-0162", # pqcrypto-traits  unmaintained (PQClean archived)
+    "RUSTSEC-2024-0381", # pqcrypto-kyber   superseded by pqcrypto-mlkem (transitive)
+    # ── Transitive, no first-party call path ──────────────────────────────
+    "RUSTSEC-2025-0141", # bincode 1.3.3 unmaintained — transitive only; the
+                         # wire format uses bincode 2.x. 1.x is pulled by a dep
+                         # and carries no first-party (de)serialization path.
+    "RUSTSEC-2024-0436", # paste unmaintained — transitive proc-macro helper,
+                         # compile-time only, no runtime attack surface.
+    "RUSTSEC-2026-0163", # pqcrypto-internals unmaintained (PQClean archived) —
+                         # same disposition as the pqcrypto-* wrappers above; it
+                         # is the VENDORED crate (crates/pqcrypto-internals),
+                         # frozen under Cargo.lock with the seeded-RNG override.
+                         # Migration is a deliberate crypto-review event.
+    # ── SP1 prover / zk host-side toolchain (NOT the node runtime path) ────
+    # The following are pulled EXCLUSIVELY through the pinned SP1 zkVM prover
+    # stack (sp1-sdk / sp1-core-machine / arkworks) — host-side proof
+    # generation and CLI UX, never the consensus, mempool, or P2P runtime of
+    # the node. They are unmaintained with no drop-in that keeps the pinned
+    # SP1 4.2.1 build reproducible; replacing them means patching sp1-sdk.
+    "RUSTSEC-2025-0012", # backoff unmaintained — retry helper, via sp1-sdk only.
+    "RUSTSEC-2024-0384", # instant unmaintained — time shim, via backoff (SP1).
+    "RUSTSEC-2021-0139", # ansi_term unmaintained — terminal colour, via
+                         # tracing-forest → sp1-core-machine (prover logging).
+    "RUSTSEC-2024-0388", # derivative unmaintained — derive macro, via ark-ff
+                         # (arkworks field arithmetic in the SP1/zk stack);
+                         # proc-macro, compile-time only, no runtime surface.
+    "RUSTSEC-2025-0119", # number_prefix unmaintained — via indicatif progress
+                         # bars in the SP1 prover CLI; host-side UX only.
+    "RUSTSEC-2026-0002", # lru UNSOUND (IterMut Stacked-Borrows aliasing) — pulled
+                         # ONLY by sp1-prover (host-side proving), not the node
+                         # runtime; the unsoundness manifests only under Miri /
+                         # strict-aliasing, and sp1-prover 4.2.1 pins this lru.
+    "RUSTSEC-2026-0173", # proc-macro-error2 unmaintained — compile-time proc-macro
+                         # helper (derive-macro diagnostics); no runtime surface.
+    "RUSTSEC-2025-0134", # rustls-pemfile unmaintained — PEM decode, superseded by
+                         # rustls-pki-types; transitive via the rustls/reqwest TLS
+                         # stack, not a first-party parse path.
+    # ── REAL VULNERABILITIES with NO upstream fix available yet (TRACKED) ──────
+    # These are genuine advisories, NOT unmaintained-notices. They are ignored
+    # ONLY because the fix (hickory 0.26.x, which moved DnssecDnsHandle/NSEC3 code
+    # to hickory-net) is not yet reachable: libp2p 0.56.0 pins hickory-proto 0.25.2
+    # via libp2p-dns + libp2p-mdns. We cannot bump hickory without a libp2p release
+    # that repins it. Reachability: the DNS surface is /dns4/ multiaddr resolution
+    # (libp2p-dns) and LAN-only mDNS peer discovery — the node's canonical peering
+    # uses /ip4/ addresses (no DNS resolution), and DNSSEC validation is not enabled,
+    # so the practical exposure is a self-inflicted malicious resolver / hostile LAN.
+    # ACTION: remove these two the moment a libp2p release pins hickory >= 0.26.x.
+    # Documented as an OPEN finding in SECURITY_TOOLING.md — accepted, not dismissed.
+    "RUSTSEC-2026-0118", # hickory-proto NSEC3 closest-encloser unbounded loop (DoS)
+    "RUSTSEC-2026-0119", # hickory-proto O(n^2) name compression CPU exhaustion (DoS)
+]
 
 [bans]
 multiple-versions = "warn"
@@ -41,6 +106,49 @@ allow = [
     "CC0-1.0",
     "0BSD",
 ]
+
+# ── First-party AGPL exceptions ───────────────────────────────────────────
+# The project relicensed its OWN workspace crates MIT→AGPL-3.0-or-later.
+# cargo-deny applies the license policy to workspace members too, so without
+# these the build rejects Bloch's own code. AGPL is allowed ONLY for the six
+# named first-party crates — it is deliberately NOT in the global `allow`
+# above, so any THIRD-PARTY AGPL/GPL/LGPL dependency still fails the gate.
+# (Add coherence-prover here with the same block when it enters the scan
+# scope — it is AGPL but currently excluded from the workspace.)
+[[licenses.exceptions]]
+name = "bloch"
+allow = ["AGPL-3.0-or-later"]
+[[licenses.exceptions]]
+name = "bloch-crypto"
+allow = ["AGPL-3.0-or-later"]
+[[licenses.exceptions]]
+name = "bloch-euvm"
+allow = ["AGPL-3.0-or-later"]
+[[licenses.exceptions]]
+name = "bloch-ffg"
+allow = ["AGPL-3.0-or-later"]
+[[licenses.exceptions]]
+name = "coherence-core"
+allow = ["AGPL-3.0-or-later"]
+[[licenses.exceptions]]
+name = "bloch-btc-wallet"
+allow = ["AGPL-3.0-or-later"]
+
+# ── Third-party permissive-data license ───────────────────────────────────
+# webpki-roots (Mozilla CA set, pulled transitively via reqwest/libp2p-websocket)
+# ships the CA data under CDLA-Permissive-2.0 — a permissive data-sharing
+# license with no copyleft on the linking code. Scoped to webpki-roots so the
+# global policy is not widened. Covers both 0.26.x and 1.x in the tree.
+[[licenses.exceptions]]
+name = "webpki-roots"
+allow = ["CDLA-Permissive-2.0"]
+
+# hex_lit (compile-time hex literal macro, transitive) ships under MITNFA
+# (MIT No False Attribution) — permissive, MIT plus a no-false-attribution
+# clause. Scoped so the global policy is not widened.
+[[licenses.exceptions]]
+name = "hex_lit"
+allow = ["MITNFA"]
 
 [sources]
 unknown-registry = "deny"

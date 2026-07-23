@@ -91,3 +91,6 @@ async-trait = { version = "0.1", optional = true }
 [dev-dependencies]
 tempfile = "3"
 tokio    = { version = "1", features = ["full"] }
+# Property-based invariant tests for the Genesis-locked emission / halving /
+# founder-vesting math in src/core/tokenomics_v2.rs (consensus-critical).
+proptest = "1"

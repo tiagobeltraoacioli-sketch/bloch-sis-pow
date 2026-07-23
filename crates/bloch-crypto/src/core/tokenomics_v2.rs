@@ -447,3 +447,67 @@ mod tests {
         ]);
     }
 }
+
+// ── Property-based invariants (security scanner lane) ───────────────────────
+//
+// These `proptest` cases assert the *consensus invariants* of the emission
+// schedule across the whole height domain, not just the hand-picked heights in
+// the unit tests above. A regression that (for example) lets the subsidy climb
+// after a halving, breaks value conservation in the split, or lets founder
+// vesting over-pay would be an inflation bug — the most severe class of
+// consensus fault. Run with: `cargo test -p bloch-crypto tokenomics`.
+#[cfg(test)]
+mod proptest_invariants {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        // Subsidy never exceeds the genesis initial reward and never drops
+        // below the perpetual tail floor — the emission envelope.
+        #[test]
+        fn subsidy_within_envelope(h in 0u64..u64::MAX) {
+            let s = block_subsidy_sat(h);
+            prop_assert!(s >= TAIL_FLOOR_SAT, "subsidy below tail floor at h={h}");
+            prop_assert!(s <= INITIAL_BLOCK_REWARD_SAT, "subsidy above initial reward at h={h}");
+        }
+
+        // Emission is monotonically NON-INCREASING in height: halvings only ever
+        // reduce (or hold) the subsidy. A violation would be a stealth inflation.
+        #[test]
+        fn subsidy_monotone_non_increasing(a in 0u64..u64::MAX, b in 0u64..u64::MAX) {
+            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+            prop_assert!(block_subsidy_sat(hi) <= block_subsidy_sat(lo));
+        }
+
+        // Value conservation: the three-way split neither creates nor destroys
+        // satoshi, and the sub-satoshi remainder always accrues to the miner.
+        #[test]
+        fn split_conserves_value(subsidy in 0u64..=INITIAL_BLOCK_REWARD_SAT) {
+            let (miner, validator, oracle) = split_subsidy_sat(subsidy);
+            prop_assert_eq!(miner + validator + oracle, subsidy, "split lost/created value");
+            // Genesis-2 is pure PoW: pools removed, miner takes 100%.
+            prop_assert_eq!(validator, 0);
+            prop_assert_eq!(oracle, 0);
+            prop_assert_eq!(miner, subsidy);
+        }
+
+        // Cumulative founder vesting is monotonically non-decreasing and never
+        // exceeds the fixed premine — the founder can never be over-paid.
+        #[test]
+        fn founder_vesting_monotone_and_capped(a in 0u64..=(FOUNDER_VESTING_END + MONTH_BLOCKS), b in 0u64..=(FOUNDER_VESTING_END + MONTH_BLOCKS)) {
+            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+            let v_lo = founder_vested_amount_sat(lo);
+            let v_hi = founder_vested_amount_sat(hi);
+            prop_assert!(v_hi >= v_lo, "vesting decreased between h={lo} and h={hi}");
+            prop_assert!(v_hi <= FOUNDER_PREMINE_TOTAL_SAT, "vesting over-paid at h={hi}");
+        }
+
+        // The per-block delta is exactly the first difference of the cumulative
+        // curve — the coinbase output can never mint more than vested this block.
+        #[test]
+        fn vesting_delta_matches_curve(h in 1u64..=(FOUNDER_VESTING_END + MONTH_BLOCKS)) {
+            let expected = founder_vested_amount_sat(h) - founder_vested_amount_sat(h - 1);
+            prop_assert_eq!(founder_vesting_delta_sat(h), expected);
+        }
+    }
+}
