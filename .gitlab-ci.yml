@@ -42,6 +42,40 @@ clippy:
     - cargo clippy --all-targets
   allow_failure: true
 
+# Hardened Clippy — BLOCKING, scoped to CONSENSUS-CRITICAL code only.
+# Denies panics (unwrap/expect) and unchecked arithmetic in consensus, emission
+# and tokenomics paths — a panic reachable from an untrusted block/tx is a DoS,
+# and an arithmetic overflow in emission is an inflation bug. See
+# scripts/hardened-clippy.sh for the exact scope + why --no-deps is required.
+clippy-hardened:
+  stage: check
+  script:
+    - rustup component add clippy || true
+    - bash scripts/hardened-clippy.sh
+
+# Property-based consensus invariants — determinism / parent-order independence
+# of GhostDAG colouring, emission monotonicity + value conservation, founder
+# vesting cap. Part of the workspace test run, called out here for visibility.
+consensus-proptest:
+  stage: test
+  script:
+    - cargo test -p bloch ghostdag_proptest
+    - cargo test -p bloch-crypto --lib tokenomics
+
+# Miri — UB / provenance / uninit-read check on the pure-Rust consensus + emission
+# unit tests. NOT the whole workspace: the node pulls in C FFI (PQClean, rocksdb,
+# blst) that Miri cannot execute, so Miri is scoped to the FFI-free crates/tests.
+# `cargo miri setup` needs the rust-src component (network); mark non-blocking.
+miri-consensus:
+  stage: test
+  allow_failure: true
+  script:
+    - rustup toolchain install nightly --component miri --component rust-src || true
+    - cargo +nightly miri test -p bloch-crypto --lib tokenomics
+    # Local command (documented, may need `cargo +nightly miri setup` first):
+    #   cargo +nightly miri test -p bloch-crypto --lib tokenomics
+  when: manual
+
 # Trademark + attestation-bleed gate (roadmap risk R1, CRITICAL).
 # BLOCKING: fails the pipeline on any occurrence of the Class-9 registered mark
 # (ship as Yagabona / Izbushka) OR any affirmative unearned earned-word claim. It
@@ -82,6 +116,27 @@ cargo-audit:
     - cargo install cargo-audit --locked 2>/dev/null || true
     - cargo audit --deny warnings
   allow_failure: false
+
+# osv-scanner — supplementary advisory scan against the OSV.dev DB (RustSec +
+# GHSA). Catches GHSA-only advisories that cargo-audit's RustSec-only feed does
+# NOT carry (e.g. yamux GHSA-vxx9-2994-q338, the plonky3 p3-* crates). Kept
+# NON-BLOCKING: it needs network for the OSV DB and its GHSA set overlaps but is
+# not identical to the deny.toml/audit.toml ignore policy, so it is an early-
+# warning surface, not a hard gate. Findings are triaged in SECURITY_TOOLING.md
+# §Advisory-posture. Local run: osv-scanner --lockfile=Cargo.lock
+osv-scanner:
+  stage: check
+  before_script: []
+  script:
+    - |
+      if ! command -v osv-scanner >/dev/null; then
+        echo "osv-scanner not installed on this runner — install:"
+        echo "  go install github.com/google/osv-scanner/cmd/osv-scanner@latest"
+        echo "skipping (informational)."
+        exit 0
+      fi
+    - osv-scanner --lockfile=Cargo.lock
+  allow_failure: true
 
 # Secret scanning — catch committed credentials (e.g. a leaked token) before they
 # reach history. Best practice given the project's own PAT-rotation lesson.

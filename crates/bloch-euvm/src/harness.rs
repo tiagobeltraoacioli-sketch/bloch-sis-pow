@@ -57,6 +57,11 @@ pub const EUVM_BURN_BPS: u16 = 2_000;
 /// [`EUVM_ACTIVATION_HEIGHT`] is `u64::MAX`, this is `false` for every real height
 /// today.
 #[inline]
+// `EUVM_ACTIVATION_HEIGHT` is the `u64::MAX` disabled-sentinel today, so Clippy
+// flags `>=` as an absurd extreme comparison. The `>=` is deliberate: it is the
+// correct activation predicate for when the constant is later set to a real
+// height by a hard fork. Keep it (do not narrow to `==`) and silence the lint.
+#[allow(clippy::absurd_extreme_comparisons)]
 pub const fn is_feature_active(height: u64) -> bool {
     height >= EUVM_ACTIVATION_HEIGHT
 }

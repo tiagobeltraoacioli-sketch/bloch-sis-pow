@@ -756,7 +756,13 @@ impl GhostDAG {
                         hex::encode(&h[..4]), hex::encode(&p[..4])
                     ));
                 }
-                *indegree.get_mut(h).unwrap() += 1;
+                // `h` is a key of `self.store.data`, and every such key was
+                // seeded into `indegree` above, so this lookup is infallible.
+                // Return an error instead of panicking to keep this consensus
+                // path fail-closed rather than aborting the node (DoS).
+                *indegree
+                    .get_mut(h)
+                    .ok_or_else(|| format!("indegree missing {}", hex::encode(&h[..4])))? += 1;
                 children.entry(*p).or_default().push(*h);
             }
         }
@@ -774,7 +780,13 @@ impl GhostDAG {
             if let Some(ch) = children.get(&h) {
                 let mut newly = Vec::new();
                 for c in ch {
-                    let deg = indegree.get_mut(c).unwrap();
+                    // `c` is a child recorded from a parent edge whose endpoint
+                    // is a store key, so it is always present in `indegree`.
+                    // Fail-closed (error) rather than panic on the impossible
+                    // branch.
+                    let deg = indegree
+                        .get_mut(c)
+                        .ok_or_else(|| format!("indegree missing child {}", hex::encode(&c[..4])))?;
                     *deg -= 1;
                     if *deg == 0 { newly.push(*c); }
                 }
@@ -1809,5 +1821,155 @@ mod tests {
              that the bound test must account for",
             blues.len(),
         );
+    }
+}
+
+// ── Property-based GhostDAG invariants (security scanner lane) ───────────────
+//
+// GhostDAG ordering is consensus-critical: if two honest nodes colour the same
+// DAG differently — because block/parent ingestion order leaked into the result,
+// or because a `HashMap` iteration order made colouring nondeterministic — they
+// disagree on `blue_score`, hence on the selected chain, hence they fork. These
+// `proptest` cases build randomly-shaped DAGs and assert the ordering is a pure
+// deterministic function of the DAG structure alone. Run with:
+//   `cargo test -p bloch ghostdag_proptest`
+#[cfg(test)]
+mod ghostdag_proptest {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn idx_hash(i: usize) -> BlockHash {
+        let mut h = [0u8; 32];
+        h[..8].copy_from_slice(&(i as u64).to_le_bytes());
+        h
+    }
+
+    /// Build a DAG from a structural description. `shape[i]` is the parent-index
+    /// set of block `i` (block 0 is genesis, always empty). `reverse` flips each
+    /// parent vector to probe parent-order independence; `k` is the GhostDAG
+    /// anticone bound.
+    fn build(shape: &[Vec<usize>], k: usize, reverse: bool) -> GhostDAG {
+        let mut dag = GhostDAG::with_k(k);
+        dag.add_genesis(idx_hash(0), 0);
+        for (i, parents) in shape.iter().enumerate().skip(1) {
+            let mut ph: Vec<BlockHash> = parents.iter().map(|&j| idx_hash(j)).collect();
+            if reverse {
+                ph.reverse();
+            }
+            dag.add_block(idx_hash(i), ph, i as u64, 1000)
+                .expect("well-formed block must be accepted");
+        }
+        dag
+    }
+
+    /// A structurally valid DAG shape: block `i` (>0) has a non-empty parent set
+    /// drawn from `{0..i}`, so parents always exist when added in index order.
+    fn dag_shape() -> impl Strategy<Value = (Vec<Vec<usize>>, usize)> {
+        (proptest::collection::vec(any::<u64>(), 1..18usize), 1usize..6)
+            .prop_map(|(seeds, k)| {
+                let n = seeds.len();
+                let mut shape: Vec<Vec<usize>> = Vec::with_capacity(n);
+                for (i, seed) in seeds.iter().enumerate() {
+                    if i == 0 {
+                        shape.push(vec![]);
+                        continue;
+                    }
+                    let mut parents: Vec<usize> =
+                        (0..i).filter(|j| (seed >> (j % 64)) & 1 == 1).collect();
+                    if parents.is_empty() {
+                        parents.push(i - 1);
+                    }
+                    shape.push(parents);
+                }
+                (shape, k)
+            })
+    }
+
+    proptest! {
+        // Determinism: colouring the identical DAG twice yields byte-identical
+        // per-block data. Catches any nondeterminism (e.g. HashMap iteration
+        // order) leaking into blue_score / blue_work / selected_parent.
+        #[test]
+        fn colouring_is_deterministic((shape, k) in dag_shape()) {
+            let a = build(&shape, k, false);
+            let b = build(&shape, k, false);
+            for i in 0..shape.len() {
+                let h = idx_hash(i);
+                let da = a.get_block_data(&h).unwrap();
+                let db = b.get_block_data(&h).unwrap();
+                prop_assert_eq!(da.blue_score, db.blue_score);
+                prop_assert_eq!(da.blue_work, db.blue_work);
+                prop_assert_eq!(da.selected_parent, db.selected_parent);
+                prop_assert_eq!(da.height, db.height);
+            }
+        }
+
+        // Parent-order independence: reversing every parent vector (as gossip
+        // reordering would) must not change any block's colouring. A failure
+        // here is a consensus-split vulnerability.
+        #[test]
+        fn colouring_ignores_parent_order((shape, k) in dag_shape()) {
+            let fwd = build(&shape, k, false);
+            let rev = build(&shape, k, true);
+            for i in 0..shape.len() {
+                let h = idx_hash(i);
+                let df = fwd.get_block_data(&h).unwrap();
+                let dr = rev.get_block_data(&h).unwrap();
+                prop_assert_eq!(df.blue_score, dr.blue_score, "blue_score depends on parent order at block {}", i);
+                prop_assert_eq!(df.blue_work, dr.blue_work);
+                prop_assert_eq!(df.selected_parent, dr.selected_parent);
+                prop_assert_eq!(df.height, dr.height);
+            }
+        }
+
+        // Monotonicity: every non-genesis block dominates its selected parent in
+        // blue_score and blue_work, and strictly increases height. Genesis is 0.
+        #[test]
+        fn blue_score_monotone_over_selected_parent((shape, k) in dag_shape()) {
+            let dag = build(&shape, k, false);
+            prop_assert_eq!(dag.get_block_data(&idx_hash(0)).unwrap().blue_score, 0);
+            for i in 1..shape.len() {
+                let d = dag.get_block_data(&idx_hash(i)).unwrap();
+                let sp = d.selected_parent.expect("non-genesis has a selected parent");
+                let sd = dag.get_block_data(&sp).unwrap();
+                prop_assert!(d.blue_score >= sd.blue_score, "blue_score regressed vs selected parent at block {}", i);
+                prop_assert!(d.blue_work >= sd.blue_work, "blue_work regressed vs selected parent at block {}", i);
+                prop_assert!(d.height >= sd.height + 1, "height did not increase over selected parent at block {}", i);
+            }
+        }
+
+        // The selected chain (tip → genesis) has non-increasing blue_score.
+        #[test]
+        fn selected_chain_blue_score_non_increasing((shape, k) in dag_shape()) {
+            let dag = build(&shape, k, false);
+            let chain = dag.selected_chain();
+            for w in chain.windows(2) {
+                let child = dag.get_block_data(&w[0]).unwrap();
+                let parent = dag.get_block_data(&w[1]).unwrap();
+                prop_assert!(child.blue_score >= parent.blue_score);
+            }
+        }
+
+        // topological_order is a valid, complete, deterministic linearisation:
+        // it lists every block exactly once and always places a block after all
+        // of its parents.
+        #[test]
+        fn topological_order_is_valid_and_deterministic((shape, k) in dag_shape()) {
+            let dag = build(&shape, k, false);
+            let ord = dag.topological_order().expect("topological order must exist for a DAG");
+            prop_assert_eq!(ord.len(), dag.block_count());
+            let pos: std::collections::HashMap<BlockHash, usize> =
+                ord.iter().enumerate().map(|(p, h)| (*h, p)).collect();
+            for i in 0..shape.len() {
+                let h = idx_hash(i);
+                let d = dag.get_block_data(&h).unwrap();
+                for p in &d.parents {
+                    prop_assert!(pos[p] < pos[&h], "parent ordered after child at block {}", i);
+                }
+            }
+            // Determinism: recomputing on an independently-built DAG matches.
+            let dag2 = build(&shape, k, false);
+            prop_assert_eq!(ord, dag2.topological_order().unwrap());
+        }
     }
 }

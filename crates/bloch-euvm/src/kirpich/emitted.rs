@@ -1199,10 +1199,20 @@ mod tests {
         audit(&charter, &mut a);
         audit(&charter, &mut b);
         assert_eq!(a, b, "identical charter must yield byte-identical findings");
-        assert_eq!(count_code(&a, "KRP-064"), 2, "{a:?}");
-        // Charter-order preserved: idx0's finding must precede idx1's.
-        assert_eq!(a[0].index, Some(0));
-        assert_eq!(a[1].index, Some(1));
+        // Each defective module now yields TWO KRP-064 findings: the config-level neuter
+        // (Deny) plus the emitted-bytecode "dead guard" (Warn). Post-F6 the compiler fails
+        // these charters closed to the unspendable `[PushInt(0)]` sentinel, which
+        // `constant_tail_verdict` correctly reads as a compile-time constant FALSE verdict.
+        assert_eq!(count_code(&a, "KRP-064"), 4, "{a:?}");
+        // Charter-order preserved: both of idx0's findings precede both of idx1's, and
+        // within a module the config-level Deny precedes the bytecode dead-guard Warn.
+        assert_eq!(
+            a.iter().map(|f| f.index).collect::<Vec<_>>(),
+            vec![Some(0), Some(0), Some(1), Some(1)],
+        );
+        assert_eq!(a[0].severity, Severity::Deny);
+        assert_eq!(a[1].severity, Severity::Warn);
+        assert!(a[1].message.contains("dead guard"));
     }
 
     // ── cross-rule ordering: all five codes firing together ────────────────
