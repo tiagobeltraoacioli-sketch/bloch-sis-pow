@@ -119,6 +119,18 @@ pub fn handle_submit(
             StratumError::new(ErrorCode::Other, "nonce must be hex string")),
     };
 
+    // Optional 6th param: the version-rolling (BIP320 / ASICBoost) nVersion the
+    // miner actually hashed. A version-rolling ASIC (common via rentals) sends
+    // it; without honoring it we re-hash the block with the job's UNROLLED
+    // version and reject an otherwise-valid solve. Absent → use the job version.
+    let version_rolled: Option<u32> = params.get(5)
+        .and_then(|v| v.as_str())
+        .and_then(|s| {
+            let t = s.trim();
+            let t = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")).unwrap_or(t);
+            u32::from_str_radix(t, 16).ok()
+        });
+
     // 4. Decode hex.
     let en2 = match hex::decode(&en2_hex) {
         Ok(v) if v.len() == 4 => v,
@@ -161,6 +173,17 @@ pub fn handle_submit(
                 format!("job_id '{}' not in retention window", job_id))),
     };
 
+    // The header version the miner ACTUALLY hashed: the job version with the
+    // BIP320-masked bits replaced by the miner's version-roll (if any). Used for
+    // BOTH the PoW check and the assembled block, so a version-rolling ASIC's
+    // solve hashes and stores consistently instead of being re-hashed with the
+    // unrolled version (which would reject a valid block).
+    const VERSION_ROLLING_MASK: u32 = 0x1fffe000;
+    let eff_version = match version_rolled {
+        Some(v) => (template.version & !VERSION_ROLLING_MASK) | (v & VERSION_ROLLING_MASK),
+        None    => template.version,
+    };
+
     // 7. Reconstruct the coinbase bytes:
     //    coinb1 || extranonce1 || extranonce2 || coinb2
     let mut coinbase_bytes = Vec::with_capacity(
@@ -197,7 +220,7 @@ pub fn handle_submit(
 
     // 10. Assemble the 80-byte mining header and check PoW.
     let mh = MiningHeader {
-        version:     template.version,
+        version:     eff_version,
         prev_hash:   template.prev_hash,
         merkle_root,
         timestamp:   ntime,
@@ -253,7 +276,7 @@ pub fn handle_submit(
 
     let block = Block {
         header: BlockHeader {
-            version:     template.version,
+            version:     eff_version,
             parents:     template.parents.clone(),
             merkle_root: MerkleRoot(merkle_root),
             timestamp:   ntime as u64,

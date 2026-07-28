@@ -196,6 +196,11 @@ pub struct Share {
     pub extranonce2: String,
     pub ntime: String,
     pub nonce: String,
+    /// The OPTIONAL rolled nVersion from a version-rolling (ASICBoost) miner's
+    /// 6th `mining.submit` param (BIP310). `None` when the miner does not
+    /// version-roll. Load-bearing: an ASIC's header uses THIS version, not the
+    /// job's, so dropping it makes every rolled share reconstruct wrong.
+    pub version: Option<u32>,
     /// The difficulty this worker was at when the share was found
     /// (last `mining.set_difficulty` seen for the worker). Filled by the
     /// router from session state, not present on the wire.
@@ -293,6 +298,36 @@ pub struct ProxyConfig {
     pub vardiff_override: bool,
     /// Target seconds-per-share for the vardiff controller when enabled.
     pub vardiff_target_secs: f64,
+    /// Mini-pool vardiff engine (`crate::vardiff::Vardiff`) seed difficulty,
+    /// served downstream on subscribe. `BLOCH_POOL_VARDIFF_INITIAL`, default
+    /// 1024.
+    pub vardiff_initial: f64,
+    /// Vardiff clamp band floor. `BLOCH_POOL_VARDIFF_MIN`, default 16.
+    pub vardiff_min: f64,
+    /// Vardiff clamp band ceiling. `BLOCH_POOL_VARDIFF_MAX`, default 2^32.
+    pub vardiff_max: f64,
+    /// Accepted shares between vardiff retargets.
+    /// `BLOCH_POOL_VARDIFF_RETARGET_SHARES`, default 8.
+    pub vardiff_retarget_shares: usize,
+    /// Seconds a vardiff RAISE keeps the pre-raise difficulty valid for
+    /// shares in flight (stratum miners only apply a pushed `set_difficulty`
+    /// at the next job, so without this every raise mass-rejects the miner's
+    /// work until the next notify). `BLOCH_POOL_VARDIFF_GRACE_SECS`,
+    /// default 120.
+    pub vardiff_grace_secs: u64,
+    /// SHA-256d PoW compare endianness OVERRIDE for the local share validator.
+    /// `None` (the default) is the CORRECT steady-state setting: `le` is
+    /// computed PER JOB from that job's own height against
+    /// `validator::SHA256D_LE_FORK_HEIGHT` (2400), mirroring the node's own
+    /// per-submit height gate (`sha256d_pow_valid`) exactly. A converged
+    /// chain permanently past height 2400 behaves as if this were hardcoded
+    /// `true` — which is ALL this used to be, and why a fresh/replayed chain
+    /// (job heights back in the tens) silently forwarded every genuine block
+    /// solution under the wrong convention and had it bounced as
+    /// error-23 LowDifficulty. `Some(v)` (via `BLOCH_POOL_SHA256D_LE`) forces
+    /// `le=v` for every job regardless of height — an escape hatch for
+    /// debugging, not something normal operation should need.
+    pub sha256d_le: Option<bool>,
     /// PPLNS sliding window length (number of most-recent accepted shares
     /// retained for the payout stub). 0 disables accounting retention.
     pub pplns_window_shares: usize,
@@ -333,7 +368,14 @@ impl Default for ProxyConfig {
             reconnect_backoff_max: Duration::from_secs(30),
             keepalive_idle: Duration::from_secs(20),
             vardiff_override: false,
-            vardiff_target_secs: 10.0,
+            // Design default: 5s per share (overrides the old 10.0).
+            vardiff_target_secs: 5.0,
+            vardiff_initial: 1024.0,
+            vardiff_min: 16.0,
+            vardiff_max: 4_294_967_296.0,
+            vardiff_retarget_shares: 8,
+            vardiff_grace_secs: 120,
+            sha256d_le: None,
             pplns_window_shares: 100_000,
             pplns_window_secs: 0,
             extranonce_redial_max: 3,

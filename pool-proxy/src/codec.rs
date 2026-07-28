@@ -346,10 +346,17 @@ pub fn parse_set_extranonce(n: &RawNotification) -> Option<(String, usize)> {
     Some((extranonce1, extranonce2_size))
 }
 
-/// Parse a `mining.submit`: `[worker_name, job_id, extranonce2, ntime, nonce]`.
-/// The wire `worker_name` (params[0]) is ignored — the proxy's own
-/// `WorkerId` is authoritative. `difficulty` is left at `0.0` for the router
-/// to fill from session state (it is not present on the wire).
+/// Parse a `mining.submit`:
+/// `[worker_name, job_id, extranonce2, ntime, nonce, version_bits?]`.
+/// The wire `worker_name` (params[0]) is ignored — the proxy's own `WorkerId`
+/// is authoritative. `difficulty` is left at `0.0` for the router to fill from
+/// session state (it is not present on the wire).
+///
+/// The OPTIONAL 6th param is a version-rolling (ASICBoost / BIP310) miner's
+/// rolled nVersion, hex. Antminer/Whatsminer firmware and MRR/NiceHash rig
+/// proxies append it whenever they version-roll. Dropping it makes the pool
+/// reconstruct every rolled share's header with the STATIC job version, so the
+/// hash never matches and every share rejects as low-difficulty.
 pub fn parse_submit(req: &RawRequest, worker: WorkerId) -> Option<Share> {
     let arr = req.params.as_array()?;
     if arr.len() < 5 {
@@ -359,12 +366,21 @@ pub fn parse_submit(req: &RawRequest, worker: WorkerId) -> Option<Share> {
     let extranonce2 = arr[2].as_str()?.to_string();
     let ntime = arr[3].as_str()?.to_string();
     let nonce = arr[4].as_str()?.to_string();
+    // 6th param (version-rolling bits): present only for version-rolling miners.
+    // Tolerate an optional 0x prefix; ignore a malformed value rather than
+    // dropping the whole submit (fall back to the job version).
+    let version = arr.get(5).and_then(Value::as_str).and_then(|s| {
+        let t = s.trim();
+        let t = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")).unwrap_or(t);
+        u32::from_str_radix(t, 16).ok()
+    });
     Some(Share {
         worker,
         job_id,
         extranonce2,
         ntime,
         nonce,
+        version,
         difficulty: 0.0,
         submitted_at: Instant::now(),
     })

@@ -640,26 +640,47 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             // tip blue score + 1 (mirrors the solo miner loop).
             let (parents, height, blue_score) = {
                 let d = state.dag.read();
-                let tips = d.tips();
+                // Mine only on BODIED tips: a header-only tip (body never
+                // arrived over headers-first sync) is unmineable — a block
+                // built on it can't be validated by accept_block, so the
+                // template would wedge the miner on a phantom parent.
+                let tips = d.bodied_tips(|h| state.store.get_block(h).ok().flatten().is_some());
                 if tips.is_empty() {
-                    return json!({ "error": "node has no tip yet (still syncing genesis?)" });
+                    return json!({ "error": "node has no bodied tip yet (still syncing genesis?)" });
                 }
+                // height / blue_score from the bodied parents only — NOT
+                // tip_blue_score(), which follows the bodyless selected_tip.
                 let max_parent_height = tips.iter()
                     .filter_map(|t| d.get_block_data(t))
                     .map(|dd| dd.height)
                     .max()
                     .unwrap_or(0);
-                (tips, max_parent_height + 1, d.tip_blue_score() + 1)
+                let max_parent_blue_score = tips.iter()
+                    .filter_map(|t| d.get_block_data(t))
+                    .map(|dd| dd.blue_score)
+                    .max()
+                    .unwrap_or(0);
+                (tips, max_parent_height + 1, max_parent_blue_score + 1)
             };
 
-            // Expected bits — the SAME function accept_block validates with
-            // (VULN-01): ASERT-Lattice anchored at genesis, keyed on the
-            // parent timestamp.
+            // Expected bits — EXACTLY what accept_block validates the next block
+            // with, keyed on the node's chain-id. On Genesis-2 (SHA-256d devnet —
+            // the live G2 chain) that is the Bitcoin-style windowed retarget over
+            // the persisted `current_bits` (pow::genesis2_expected_bits, shared
+            // verbatim with accept_block + the solo miner). It is NOT the SIS
+            // ASERT path anchored at GENESIS_BITS (0x2100ffff): on this chain that
+            // path collapses to a trivial diff-1 target, so every share meets it
+            // and the DAG floods with same-height blocks — the getblocktemplate
+            // difficulty bug that wedged the chain. Mainnet/Testnet keep ASERT.
             let parent_ts = state.store.get_timestamp_at_height(height.saturating_sub(1))
                 .ok().flatten().unwrap_or(crate::core::GENESIS_TIMESTAMP);
-            let bits = crate::pow::next_bits(
-                crate::core::GENESIS_BITS, crate::core::GENESIS_TIMESTAMP, parent_ts, height,
-            );
+            let bits = if crate::core::node_chain_id() == crate::core::ChainId::Genesis2Devnet {
+                crate::pow::genesis2_expected_bits(&state.store, height)
+            } else {
+                crate::pow::next_bits(
+                    crate::core::GENESIS_BITS, crate::core::GENESIS_TIMESTAMP, parent_ts, height,
+                )
+            };
 
             // Mempool selection + per-tx fees (mirrors stratum's
             // install_fresh_template).

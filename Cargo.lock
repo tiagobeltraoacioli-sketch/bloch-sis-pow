@@ -1546,6 +1546,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloch-pq-vault"
+version = "0.0.1"
+dependencies = [
+ "bitcoin",
+ "bloch-btc-wallet",
+ "bloch-crypto",
+ "bloch-euvm",
+ "hex",
+ "hkdf",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "bloch-sis-pow"
 version = "0.1.0"
 dependencies = [

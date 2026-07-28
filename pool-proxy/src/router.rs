@@ -68,6 +68,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::Instant;
 
 use serde_json::Value;
 
@@ -76,10 +77,12 @@ use crate::upstream::UpstreamConn;
 
 use crate::extranonce::{claim_unique, ExtranonceRegistry, WorkerExtranonce};
 use crate::pplns::PplnsLedger;
+use crate::vardiff::Vardiff;
+use crate::validator;
 
 use crate::types::{
-    methods, ClientMsg, Framed, HandshakeReplay, Line, Metrics, PoolError, ProxyConfig, RawRequest,
-    ServerMsg, Share, ShareOutcome, SubscribeResult, TipHint, WorkerId,
+    methods, ClientMsg, Framed, HandshakeReplay, Line, Metrics, PoolError,
+    ProxyConfig, RawRequest, ServerMsg, Share, ShareOutcome, SubscribeResult, TipHint, WorkerId,
 };
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -176,6 +179,15 @@ fn is_transient(e: &PoolError) -> bool {
     )
 }
 
+/// Render a JSON-RPC `id` for a proxy-authored response line. `5` → `5`,
+/// `"abc"` → `"abc"` (quoted), absent → `null`.
+fn id_json(id: &Option<Value>) -> String {
+    match id {
+        Some(v) => v.to_string(),
+        None => "null".to_string(),
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Worker lifecycle
 // ─────────────────────────────────────────────────────────────────────────
@@ -238,9 +250,19 @@ pub async fn run_worker(
     // pump below forwards those raw lines downstream verbatim — no separate
     // handshake-replay step is needed here.
 
-    // ── 3. Transparent bidirectional pump ────────────────────────────────
+    // ── 3. Transparent bidirectional pump (the NODE is authoritative) ─────
+    //
+    // Every miner line — INCLUDING `mining.submit` (with its optional 6th
+    // version-rolling param) — is forwarded to the node VERBATIM; the node
+    // validates each submit and its accept/reject flows back as a
+    // `SubmitResult`, which the proxy RELAYS downstream and folds into
+    // metrics/PPLNS. The proxy performs NO local header reconstruction and NO
+    // local accept/reject. Its only editorial acts are (a) suppressing the
+    // node's `set_difficulty` in favour of announcing its OWN per-worker
+    // vardiff share-target, and (b) answering `mining.configure` in the
+    // handshake (see `read_handshake`) so version-rolling ASICs subscribe.
     let hooks = RouterHooks::new();
-    let mut current_difficulty = 0.0f64;
+    let mut vardiff = Vardiff::from_cfg(&cfg);
     let mut last_notify_raw: Option<Line> = None;
     // The miner's raw `mining.authorize` line, captured as it flows through
     // the pump. Replayed to the node after any upstream reconnect — a fresh
@@ -283,11 +305,16 @@ pub async fn run_worker(
                             _ => {}
                         }
 
-                        // Transparent: forward the exact bytes upstream. A
-                        // transient write fault (node restarted) triggers the
-                        // same reconnect path as an upstream read EOF, then we
-                        // re-forward this very line — rather than tearing the
-                        // miner down.
+                        // Transparent: forward the EXACT bytes upstream. For a
+                        // `mining.submit` this INCLUDES the optional 6th
+                        // version-rolling param, which lives verbatim in `raw`
+                        // — so an AsicBoost/BIP310 miner's rolled nVersion
+                        // reaches the node and the node reconstructs the header
+                        // it ACTUALLY hashed (dropping the 6th param made the
+                        // node rebuild with the static version and reject). A
+                        // transient write fault triggers the same reconnect-
+                        // and-re-forward path as an upstream read EOF rather
+                        // than tearing the miner down.
                         if let Err(e) = upstream.write(&raw).await {
                             if is_transient(&e) {
                                 log::warn!("{worker}: upstream write failed ({e}) — reconnecting");
@@ -297,6 +324,8 @@ pub async fn run_worker(
                                 ).await? {
                                     break;
                                 }
+                                // A fresh upstream re-announces our difficulty.
+                                vardiff.reset_announced();
                                 upstream.write(&raw).await?;
                                 keepalive.as_mut().reset(
                                     tokio::time::Instant::now() + cfg.keepalive_idle,
@@ -306,15 +335,21 @@ pub async fn run_worker(
                             }
                         }
 
+                        // A forwarded `mining.submit` is remembered so the
+                        // node's later `SubmitResult` (same JSON-RPC id) can be
+                        // correlated → counted → relayed. The NODE — not the
+                        // proxy — decides accept/reject.
                         if let ClientMsg::Submit(mut share) = parsed {
-                            // Fill in the fields only the router knows.
                             share.worker = worker;
-                            share.difficulty = current_difficulty;
+                            share.difficulty = vardiff.current();
                             let key = id_key(&extract_request_id(&raw));
                             if pending.len() >= PENDING_CAP {
                                 pending.pop_front();
                             }
                             pending.push_back((key, share));
+                            keepalive.as_mut().reset(
+                                tokio::time::Instant::now() + cfg.keepalive_idle,
+                            );
                         }
                     }
                     Err(e) => {
@@ -335,58 +370,79 @@ pub async fn run_worker(
                         ).await? {
                             break;
                         }
+                        vardiff.reset_announced();
                         keepalive
                             .as_mut()
                             .reset(tokio::time::Instant::now() + cfg.keepalive_idle);
                     }
                     Ok(Some(framed)) => {
                         let Framed { raw, parsed } = framed;
-                        // Transparent: forward the exact bytes downstream.
-                        down.write(&raw).await?;
                         keepalive
                             .as_mut()
                             .reset(tokio::time::Instant::now() + cfg.keepalive_idle);
 
+                        // Forward PER classification: everything reaches the
+                        // miner EXCEPT the node's `set_difficulty`, which the
+                        // proxy suppresses in favour of its own vardiff target.
                         match parsed {
                             ServerMsg::Notify(_job) => {
-                                // Cache raw job for keepalive re-feed.
+                                // Announce OUR vardiff share-target before the
+                                // first job so the miner mines at the proxy's
+                                // target, not the node's default.
+                                if vardiff.needs_announce() {
+                                    down.write(&vardiff.set_difficulty_line()).await?;
+                                    vardiff.mark_announced();
+                                }
+                                down.write(&raw).await?; // forward the real job
                                 last_notify_raw = Some(raw);
                             }
-                            ServerMsg::SetDifficulty(d) => {
-                                current_difficulty = d;
+                            ServerMsg::SetDifficulty(_d) => {
+                                // SUPPRESS: we serve our own per-worker vardiff.
                             }
                             ServerMsg::SubmitResult { id, outcome } => {
                                 let key = id_key(&id);
                                 let outcome = hooks.classify_block(outcome);
-                                // A bare boolean ack (authorize / configure /
-                                // suggest_difficulty) classifies as SubmitResult
-                                // too, so only fold into counters + the ledger
-                                // when the id actually matches a submit we
-                                // forwarded. Non-matching acks are forwarded
-                                // downstream verbatim (already done) but NOT
-                                // counted.
                                 if let Some(pos) =
                                     pending.iter().position(|(k, _)| *k == key)
                                 {
+                                    // Correlates to a submit we forwarded: the
+                                    // NODE decided accept/reject. RELAY its
+                                    // verdict downstream verbatim, then fold the
+                                    // node's outcome into metrics + PPLNS, and
+                                    // drive vardiff off the node's acceptance.
+                                    down.write(&raw).await?;
                                     metrics.record_outcome(&outcome);
                                     if let Some((_, share)) = pending.remove(pos) {
                                         ledger.record(
-                                            share.worker,
-                                            &share.job_id,
-                                            share.difficulty,
-                                            &outcome,
+                                            worker, &share.job_id, share.difficulty, &outcome,
                                         );
+                                        if matches!(
+                                            outcome,
+                                            ShareOutcome::Accepted | ShareOutcome::Block
+                                        ) && vardiff
+                                            .on_accepted(Instant::now(), share.difficulty)
+                                            .is_some()
+                                        {
+                                            down.write(&vardiff.set_difficulty_line()).await?;
+                                            vardiff.mark_announced();
+                                        }
                                     }
                                 } else {
-                                    log::debug!(
-                                        "{worker}: response id={key} matched no pending submit \
-                                         (authorize/configure/suggest ack) — not counted"
-                                    );
+                                    // A bare boolean ack (authorize / configure /
+                                    // suggest_difficulty) matches no pending
+                                    // submit: forward downstream verbatim but do
+                                    // NOT count it as a share.
+                                    down.write(&raw).await?;
                                 }
                             }
+                            ServerMsg::SetExtranonce { .. } => {
+                                // Forward the reassignment downstream verbatim.
+                                down.write(&raw).await?;
+                            }
                             ServerMsg::SubscribeResult(_)
-                            | ServerMsg::SetExtranonce { .. }
-                            | ServerMsg::Passthrough => {}
+                            | ServerMsg::Passthrough => {
+                                down.write(&raw).await?;
+                            }
                         }
                     }
                     Err(ref e) if is_transient(e) => {
@@ -397,6 +453,7 @@ pub async fn run_worker(
                         ).await? {
                             break;
                         }
+                        vardiff.reset_announced();
                         keepalive
                             .as_mut()
                             .reset(tokio::time::Instant::now() + cfg.keepalive_idle);
@@ -519,7 +576,25 @@ async fn read_handshake(
             Ok(Some(framed)) => {
                 let Framed { raw, parsed } = framed;
                 match parsed {
-                    ClientMsg::Configure { .. } => {
+                    ClientMsg::Configure { id, .. } => {
+                        // AsicBoost / BIP310 version-rolling miners send
+                        // `mining.configure` FIRST and BLOCK until they receive
+                        // the server's response before they will send
+                        // `mining.subscribe`. Previously this arm only stashed
+                        // the line for later upstream replay and looped straight
+                        // back to `down.read()` waiting for a subscribe that the
+                        // miner is (correctly) refusing to send — so the
+                        // handshake hung and every version-rolling ASIC timed out
+                        // with 0 shares. Answer the configure here so the miner
+                        // proceeds, offering the pool-wide version-rolling mask.
+                        let resp = format!(
+                            r#"{{"id":{},"result":{{"version-rolling":true,"version-rolling.mask":"{:08x}"}},"error":null}}"#,
+                            id_json(&id),
+                            validator::VERSION_ROLLING_MASK,
+                        );
+                        down.write(&resp).await?;
+                        // Still keep the raw line so the upstream session
+                        // negotiates version-rolling with the node too.
                         replay.configure = Some(raw);
                     }
                     ClientMsg::Subscribe { .. } => {
@@ -571,6 +646,7 @@ mod tests {
             extranonce2: "00000000".to_string(),
             ntime: "60000000".to_string(),
             nonce: "deadbeef".to_string(),
+            version: None,
             difficulty: diff,
             submitted_at: Instant::now(),
         }
@@ -656,6 +732,68 @@ mod tests {
             }
             other => panic!("expected SetExtranonce, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn handshake_answers_configure_then_reads_subscribe() {
+        use crate::types::{Metrics, ProxyConfig, WorkerId};
+        use std::sync::Arc;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::{TcpListener, TcpStream};
+
+        // A wired-up miner<->proxy socket pair, proxy side wrapped in a
+        // DownstreamConn just like the accept loop does.
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let miner = TcpStream::connect(addr).await.expect("connect");
+        let (server, _) = listener.accept().await.expect("accept");
+        let mut down = DownstreamConn::new(
+            server,
+            WorkerId(7),
+            Arc::new(ProxyConfig::default()),
+            Arc::new(Metrics::new()),
+        );
+
+        // Drive a version-rolling ASIC: send configure, WAIT for the reply
+        // (as a real AsicBoost miner does) and only THEN send subscribe.
+        let miner_task = tokio::spawn(async move {
+            let (rd, mut wr) = miner.into_split();
+            let mut lines = BufReader::new(rd).lines();
+
+            wr.write_all(
+                b"{\"id\":1,\"method\":\"mining.configure\",\
+                  \"params\":[[\"version-rolling\"],{\"version-rolling.mask\":\"ffffffff\"}]}\n",
+            )
+            .await
+            .unwrap();
+            wr.flush().await.unwrap();
+
+            // The proxy MUST answer configure before the miner will subscribe.
+            let resp = lines.next_line().await.unwrap().expect("configure reply");
+            assert!(resp.contains("\"version-rolling\":true"), "resp={resp}");
+            assert!(resp.contains("\"version-rolling.mask\":\"1fffe000\""), "resp={resp}");
+            assert!(resp.contains("\"id\":1"), "resp={resp}");
+
+            wr.write_all(
+                b"{\"id\":2,\"method\":\"mining.subscribe\",\"params\":[\"cgminer/4.11\"]}\n",
+            )
+            .await
+            .unwrap();
+            wr.flush().await.unwrap();
+        });
+
+        // With the configure reply in place the handshake completes:
+        // configure is captured for upstream replay, subscribe terminates it.
+        let replay = read_handshake(&mut down, WorkerId(7))
+            .await
+            .expect("handshake completes");
+        assert!(replay.configure.is_some(), "configure captured for replay");
+        assert!(
+            replay.subscribe.contains("mining.subscribe"),
+            "subscribe line captured: {}",
+            replay.subscribe
+        );
+        miner_task.await.unwrap();
     }
 
     #[test]

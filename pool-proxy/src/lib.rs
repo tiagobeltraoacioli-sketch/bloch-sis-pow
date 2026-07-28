@@ -9,3 +9,6 @@ pub mod rpc;
 pub mod router;
 pub mod server;
 pub mod metrics;
+pub mod validator;
+pub mod vardiff;
+pub mod jobstore;
