@@ -173,14 +173,15 @@ fn finding_c_ecdsa_only_validator_unspendable_under_pq_only_verifier() {
 
 #[test]
 fn control_height_gate_and_feature_off_are_clean() {
-    // Sentinel inert: no realistic height activates.
-    assert_eq!(EUVM_ACTIVATION_HEIGHT, u64::MAX);
-    for h in [0u64, 1, 2_400, 3_000, 21_000_000, u64::MAX - 1] {
+    // Coordinated Genesis-2 activation height (above the live tip): no height
+    // the fleet has produced to date activates the feature.
+    assert_eq!(EUVM_ACTIVATION_HEIGHT, 4320);
+    for h in [0u64, 1, 2_400, 3_000, 3_757, EUVM_ACTIVATION_HEIGHT - 1] {
         assert!(!is_feature_active(h));
     }
-    // Exact, off-by-one-clean flip.
-    assert!(!is_feature_active(u64::MAX - 1));
-    assert!(is_feature_active(u64::MAX));
+    // Exact, off-by-one-clean flip at the coordinated height.
+    assert!(!is_feature_active(EUVM_ACTIVATION_HEIGHT - 1));
+    assert!(is_feature_active(EUVM_ACTIVATION_HEIGHT));
 
     // Feature-off byte identity, even with (malformed) eu_txs present.
     struct Noop;

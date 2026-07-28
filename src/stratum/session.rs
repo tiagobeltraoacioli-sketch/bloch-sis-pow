@@ -70,19 +70,24 @@ pub fn install_fresh_template(
     };
     let miner_spk: Vec<u8> = parsed_addr.hash().to_vec();
 
-    // 2. Snapshot DAG state: tip for height/blue_score, tips() for parents.
-    //    Nested scope drops the read lock before we touch mempool/storage.
+    // 2. Snapshot DAG state: best BODIED tip for height/blue_score,
+    //    bodied_tips() for parents. A header-only tip (body never arrived
+    //    over headers-first sync) is unmineable — the assembled block can't
+    //    be validated by accept_block, so building on it silently stalls the
+    //    miner on a phantom parent. Nested scope drops the read lock before
+    //    we touch mempool/storage.
     let (parents, height, blue_score) = {
+        let has_body = |h: &[u8; 32]| ctx.store.get_block(h).ok().flatten().is_some();
         let d = ctx.dag.read();
-        let tip_hash = match d.selected_tip() {
+        let tip_hash = match d.best_bodied_tip(has_body) {
             Some(h) => h,
-            None    => return Err("DAG has no selected tip — node not ready?"),
+            None    => return Err("DAG has no bodied tip — node not ready?"),
         };
         let data = match d.get_block_data(&tip_hash) {
             Some(dd) => dd.clone(),
-            None     => return Err("DAG selected_tip missing block data — inconsistent state"),
+            None     => return Err("DAG bodied tip missing block data — inconsistent state"),
         };
-        let parents_vec: Vec<[u8; 32]> = d.tips();
+        let parents_vec: Vec<[u8; 32]> = d.bodied_tips(has_body);
         // Next block extends the tip.
         (parents_vec, data.height + 1, data.blue_score + 1)
     };

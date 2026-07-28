@@ -8,6 +8,14 @@ use std::time::{Duration, Instant};
 /// blocking `reconciled` instead of pinning the node in `is_syncing` forever.
 pub const MAX_TIP_ATTEMPTS: u32 = 8;
 
+/// Attempt-count jump applied on an EXPLICIT `BlockNotFound` (vs a silent
+/// timeout, which adds 1). A tip a peer definitively cannot serve should be
+/// abandoned in seconds, not after 4 min of timeouts: two NotFounds (2×4 past
+/// the initial attempt of 1) cross `MAX_TIP_ATTEMPTS`. This is the H=3413
+/// unstick — the orphan header chain whose bodies are gone network-wide gets
+/// abandoned promptly so `maybe_release_ibd` can release `is_syncing`.
+pub const NOT_FOUND_PENALTY: u32 = 4;
+
 /// Pure: tips we should advertise, bounded to MAX_ADVERTISED_TIPS. Input is
 /// `consensus::GhostDAG::tips()`. Deterministic order (sorted) for testability.
 pub fn advertise_tips(dag_tips: &[[u8; 32]]) -> Vec<[u8; 32]> {
@@ -97,6 +105,28 @@ impl FrontierState {
     pub fn note_received(&mut self, hash: &[u8; 32]) {
         self.in_flight.remove(hash);
         self.abandoned.remove(hash);
+    }
+
+    /// A peer answered GetBlock with an explicit `BlockNotFound` — a DEFINITIVE
+    /// "I don't hold this body" (pruned/unknown), unlike a silent timeout. Count
+    /// it toward abandonment AGGRESSIVELY: an unreachable tip that peers NotFound
+    /// must not pin the node in IBD for 8×30s of timeouts (which was the H=3413
+    /// symptom — the orphan header chain's bodies are gone network-wide, every
+    /// peer NotFounds them, yet the node kept `is_syncing=true` forever). Adds
+    /// `NOT_FOUND_PENALTY` to the attempt count; at `MAX_TIP_ATTEMPTS` the tip is
+    /// abandoned (treated as resolved by `reconciled`, releasing IBD). No-op for
+    /// a hash we are not currently chasing.
+    pub fn note_not_found(&mut self, hash: &[u8; 32], now: Instant) {
+        let attempts = match self.in_flight.get(hash) {
+            Some((_, a)) => a.saturating_add(NOT_FOUND_PENALTY),
+            None => return,
+        };
+        if attempts >= MAX_TIP_ATTEMPTS {
+            self.in_flight.remove(hash);
+            self.abandoned.insert(*hash);
+        } else {
+            self.in_flight.insert(*hash, (now, attempts));
+        }
     }
 
     /// Timed-out in-flight tips for re-request. Each increments its attempt

@@ -1,0 +1,86 @@
+---
+# Akash SDL — Bloch Genesis-2 EUVM ARCHIVAL node #1 (first canary).
+#
+# Single archival node on the euvm activation binary (EUVM_ACTIVATION_HEIGHT=4320).
+# Purpose: prove a fresh euvm node syncs 0→3413→4170 (pulling the 3413→4170 bodies
+# from the still-live Akash archival nodes, since the founder lost the 3414 parent)
+# and crosses 4320 without forking. Once green, scale to the rest.
+#
+# Archival, NOT mining: SHA-256d earns nothing on CPU; value = reachable euvm peer
+# that serves history. Small profile is plenty (RocksDB + no mining threads).
+#
+# BEFORE DEPLOY: docker build -f Dockerfile.euvm -t docker.io/blochv/bloch:0.3-genesis2-euvm .
+#                docker push  docker.io/blochv/bloch:0.3-genesis2-euvm
+
+version: "2.0"
+
+services:
+  bloch-node:
+    image: docker.io/blochv/bloch:0.3-genesis2-euvm
+    args:
+      - "--genesis2"
+      - "--archive"
+      - "--carryover-snapshot"
+      - "/carryover.tsv"
+      - "--data-dir"
+      - "/bloch-data"
+      - "--listen"
+      - "/ip4/0.0.0.0/tcp/16110"
+      - "--peer"
+      - "/ip4/51.83.249.212/tcp/16110"
+      - "--peer"
+      - "/ip4/148.113.59.206/tcp/16110"
+      - "--peer"
+      - "/ip4/45.76.138.60/tcp/16110"
+      - "--peer"
+      - "/ip4/45.76.82.134/tcp/16110"
+      - "--peer"
+      - "/ip4/137.66.39.208/tcp/16110"
+      # + current live Akash nodes' forwarded 16110 endpoints (they hold 3413→4170
+      #   bodies) — added at deploy time once known.
+      - "--rpc-bind"
+      - "127.0.0.1"
+      - "--rpc-port"
+      - "16210"
+      - "--max-peers"
+      - "100"
+    env:
+      - RUST_LOG=info,libp2p_gossipsub=error
+    expose:
+      - port: 16110
+        as: 16110
+        proto: tcp
+        to:
+          - global: true
+    params:
+      storage:
+        chaindata:
+          mount: /bloch-data
+          readOnly: false
+
+profiles:
+  compute:
+    bloch-node:
+      resources:
+        cpu:
+          units: 2
+        memory:
+          size: 4Gi
+        storage:
+          - size: 4Gi
+          - name: chaindata
+            size: 30Gi
+            attributes:
+              persistent: true
+              class: beta3
+  placement:
+    dcloud:
+      pricing:
+        bloch-node:
+          denom: uakt
+          amount: 100000
+deployment:
+  bloch-node:
+    dcloud:
+      profile: bloch-node
+      count: 1

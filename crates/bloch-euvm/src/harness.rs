@@ -43,7 +43,13 @@ use crate::{fee_burn, validate_block, EuTx, ExtOutput, SigVerifier, TxError, Val
 /// changing this constant to a coordinated hard-fork height (and only then). This is a
 /// pure height gate: no committee registry, no activation signatures, no quorum, no
 /// finality gadget (FFG was dropped).
-pub const EUVM_ACTIVATION_HEIGHT: u64 = u64::MAX;
+// COORDINATED Genesis-2 activation height. 4320 is above the current network tip
+// (~3757), so euvm/Ustav/Kirpich stays INERT on every block the fleet has produced
+// to date — the canonical a397a9d2 binary and this one are byte-identical below
+// 4320, so shipping this is NOT a hard fork for the live chain. (Was momentarily 10
+// for an isolated single-node rehearsal; that value would have activated euvm
+// immediately at the live tip and forked the fleet.)
+pub const EUVM_ACTIVATION_HEIGHT: u64 = 4320;
 
 /// Base-fee burn fraction, in basis points (§5-bis, EIP-1559-style). `2000` = 20% of
 /// the BLCH fee is burned (removed from supply); the remainder goes to the miner.
@@ -339,13 +345,19 @@ mod tests {
         BlockModel { height, legacy_bytes: legacy.to_vec(), eu_txs }
     }
 
-    /// The sentinel is inert: nothing activates by merely shipping.
+    /// Activation is pinned to the coordinated Genesis-2 height (4320), which is
+    /// above the live tip — so shipping this binary activates nothing on any
+    /// block the fleet has produced to date (byte-identical to a397a9d2 below it).
     #[test]
-    fn activation_height_is_inert_sentinel() {
-        assert_eq!(EUVM_ACTIVATION_HEIGHT, u64::MAX);
-        // Every realistic height today is below the sentinel → feature off.
-        for h in [0u64, 1, 2_400, 3_000, 1_000_000, u64::MAX - 1] {
-            assert!(!is_feature_active(h), "height {h} must be inactive under the sentinel");
+    fn activation_height_is_coordinated_future_height() {
+        assert_eq!(EUVM_ACTIVATION_HEIGHT, 4320);
+        // Every height at/below the live tip today is below activation → feature off.
+        for h in [0u64, 1, 2_400, 3_000, 3_757, EUVM_ACTIVATION_HEIGHT - 1] {
+            assert!(!is_feature_active(h), "height {h} must be inactive below activation");
+        }
+        // At/above the coordinated height the feature is on.
+        for h in [EUVM_ACTIVATION_HEIGHT, EUVM_ACTIVATION_HEIGHT + 1, 1_000_000] {
+            assert!(is_feature_active(h), "height {h} must be active at/above activation");
         }
     }
 
