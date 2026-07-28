@@ -1,0 +1,43 @@
+# pq-shield-api — a NON-CUSTODIAL developer HTTP API on top of `bloch-pq-vault`.
+#
+# Construction + verification ONLY. The server NEVER holds a private key and NEVER
+# signs: every route returns an UNSIGNED artifact (address / script / sighash /
+# commitment bytes) for the client to sign LOCALLY. Any request field that looks
+# like secret material is rejected (HTTP 400).
+#
+# This crate is its OWN workspace (empty [workspace] below) so it is fully
+# detached from the parent Bloch node workspace — building/running the API never
+# touches the chain node. It links `bloch-pq-vault` by path to reuse the real
+# crypto/script code (no reimplementation).
+[package]
+name = "pq-shield-api"
+version = "0.1.0"
+edition = "2021"
+description = "Non-custodial developer HTTP API for PQ-Shield Bitcoin vaults (construction + verification only; never holds a key, never signs)"
+license = "AGPL-3.0-or-later"
+
+# Detach from the parent workspace — keep the node build untouched.
+[workspace]
+
+[[bin]]
+name = "pq-shield-api"
+path = "src/main.rs"
+
+[lib]
+name = "pq_shield_api"
+path = "src/lib.rs"
+
+[dependencies]
+bloch-pq-vault = { path = "../../crates/bloch-pq-vault" }
+bitcoin        = "0.32"
+axum           = "0.7"
+tokio          = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+serde          = { version = "1", features = ["derive"] }
+serde_json     = "1"
+hex            = "0.4"
+
+# Mirror the parent workspace's vendored pqcrypto-internals fork (adds
+# `with_seeded_rng`, required by bloch-crypto). A detached workspace does not
+# inherit the parent's [patch], so we restate it here with a re-based path.
+[patch.crates-io]
+pqcrypto-internals = { path = "../../crates/pqcrypto-internals" }
