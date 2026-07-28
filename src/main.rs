@@ -979,6 +979,16 @@ async fn main() {
                     warn!("peer cannot serve block {} (pruned or unknown) — an \
                            archival peer is needed to bootstrap from this height",
                           hex::encode(&block_hash[..8]));
+                    // An explicit NotFound is DEFINITIVE (not a lost packet or a
+                    // busy peer): advance this tip toward abandonment so an
+                    // unreachable frontier — the H=3413 orphan header chain whose
+                    // bodies are gone network-wide — stops pinning us in IBD.
+                    // Then re-check the release gate: once every advertised tip is
+                    // held-or-abandoned, maybe_release_ibd clears is_syncing and
+                    // the node serves/mines/propagates its bodied tip instead of
+                    // chasing dead work forever.
+                    frontier2.lock().note_not_found(&block_hash, std::time::Instant::now());
+                    maybe_release_ibd(&dag2, &peer_state2, &frontier2, &state2);
                 }
 
                 // IBD step 4: respond to GetBlock with the actual block
@@ -1441,12 +1451,26 @@ async fn main() {
                     was_syncing_last_tick = false;
                 }
 
-                let (tips, current_bits, current_height) = {
+                let (tips, current_bits, current_height, current_blue_score) = {
                     let d = dag_m.read();
-                    let tips = d.tips();
+                    // Mine only on BODIED tips: a header-only tip (accepted via
+                    // headers-first sync but whose body never arrived) is
+                    // unmineable — a candidate built on it can't be validated by
+                    // accept_block, so the miner silently stalls on a phantom
+                    // parent. This is exactly what wedged the founder behind a
+                    // bodyless header. Fall back to the nearest bodied ancestor
+                    // when every tip is header-only.
+                    let tips = d.bodied_tips(|h| store_m.get_block(h).ok().flatten().is_some());
                     let h = tips.iter()
                         .filter_map(|t| d.get_block_data(t))
                         .map(|data| data.height)
+                        .max()
+                        .unwrap_or(0);
+                    // blue_score from the bodied parents only — NOT
+                    // tip_blue_score(), which follows the bodyless selected_tip.
+                    let bs = tips.iter()
+                        .filter_map(|t| d.get_block_data(t))
+                        .map(|data| data.blue_score)
                         .max()
                         .unwrap_or(0);
                     // ASERT-Lattice difficulty anchored at genesis (B5c): bits
@@ -1460,7 +1484,7 @@ async fn main() {
                     } else {
                         pow::next_bits(core::GENESIS_BITS, core::GENESIS_TIMESTAMP, parent_ts, h + 1)
                     };
-                    (tips, bits, h)
+                    (tips, bits, h, bs)
                 };
 
                 // Re-broadcast mempool TXs before mining
@@ -1559,7 +1583,7 @@ async fn main() {
                         nonce:       0,
                     },
                     transactions: all_txs,
-                    blue_score:   dag_m.read().tip_blue_score() + 1,
+                    blue_score:   current_blue_score + 1,
                     height:       current_height + 1,
                     pow_solution: Vec::new(),
                     shielded_transactions: Vec::new(),                };
@@ -1674,12 +1698,15 @@ async fn main() {
                         // reorg racing our add_block, the tip may not actually
                         // be our block.
                         {
-                            let new_tip = { dag_m.read().selected_tip() };
+                            // Bodied tip only: a header-only tip is unmineable,
+                            // so notify stratum on the best BODIED tip / parents.
+                            let has_body = |h: &[u8; 32]| store_m.get_block(h).ok().flatten().is_some();
+                            let new_tip = { dag_m.read().best_bodied_tip(has_body) };
                             if new_tip != old_tip_mined {
                                 if let Some(tip_hash) = new_tip {
                                     let d = dag_m.read();
                                     if let Some(data) = d.get_block_data(&tip_hash).cloned() {
-                                        let tips_parents: Vec<[u8; 32]> = d.tips();
+                                        let tips_parents: Vec<[u8; 32]> = d.bodied_tips(has_body);
                                         drop(d);
                                         let bits = store_m.get_meta("current_bits").ok().flatten()
                                             .and_then(|b| b.as_slice().try_into().ok().map(u32::from_le_bytes))
@@ -2136,20 +2163,12 @@ static ARCHIVE_MODE: std::sync::atomic::AtomicBool =
 /// — seeded at genesis, rewritten when a boundary block is accepted. The miner
 /// and the validator both call THIS, so their expected `bits` agree by
 /// construction (and a bought-hashrate spike ramps difficulty up each window).
+/// Genesis-2 expected difficulty bits. Thin delegate to the single source of
+/// truth in `pow::genesis2_expected_bits`, shared verbatim with the
+/// `getblocktemplate` RPC so the mining template can never serve a target the
+/// validator would reject (the trivial-diff `0x2100ffff` flood bug).
 fn genesis2_expected_bits(store: &storage::Storage, height: u64) -> u32 {
-    let cur = store.get_meta("current_bits").ok().flatten()
-        .and_then(|b| <[u8; 4]>::try_from(b.as_slice()).ok())
-        .map(u32::from_le_bytes)
-        .unwrap_or(core::GENESIS2_BITS);
-    let window = core::GENESIS2_RETARGET_WINDOW;
-    if height >= window && height % window == 0 {
-        let first = store.get_timestamp_at_height(height - window).ok().flatten();
-        let last = store.get_timestamp_at_height(height - 1).ok().flatten();
-        if let (Some(first), Some(last)) = (first, last) {
-            return core::retarget_bits_g2(cur, last.saturating_sub(first));
-        }
-    }
-    cur
+    pow::genesis2_expected_bits(store, height)
 }
 
 /// Validate TX contents, add block to DAG + storage, update UTXO set.
@@ -2584,12 +2603,15 @@ fn accept_block(
     // (post-accept). Stratum consumers use this + dag.tips() +
     // current_bits to build a fresh template for the NEXT block.
     if let Some(tip_tx) = tip_tx {
-        let new_tip = { dag.read().selected_tip() };
+        // Bodied tip only: a header-only tip is unmineable, so stratum must
+        // be notified on the best BODIED tip / parents, never a phantom.
+        let has_body = |h: &[u8; 32]| store.get_block(h).ok().flatten().is_some();
+        let new_tip = { dag.read().best_bodied_tip(has_body) };
         if new_tip != old_tip {
             if let Some(tip_hash) = new_tip {
                 let d = dag.read();
                 if let Some(data) = d.get_block_data(&tip_hash).cloned() {
-                    let tips_parents: Vec<[u8; 32]> = d.tips();
+                    let tips_parents: Vec<[u8; 32]> = d.bodied_tips(has_body);
                     drop(d);
 
                     let bits = store.get_meta("current_bits").ok().flatten()

@@ -42,13 +42,29 @@ cargo +nightly fuzz run sig_verify   -- -max_total_time=300
 
 Reproduce a crash: `cargo +nightly fuzz run <target> fuzz/artifacts/...`.
 
-Status of the three new scanner-priority targets (`sha256d_pow`,
-`ghostdag_order`, `sig_verify`): their API usage is compile-verified against the
-built `bloch` crate, but they were NOT executed in the dev sandbox — libFuzzer
-needs the nightly toolchain + sanitizer runtime, which is not installed here.
-Run them on a capable runner / in CI (see `oss-fuzz/`) with the commands above.
+## Execution status (last local run: 2026-07-22, nightly + cargo-fuzz 0.12.0, macOS x86_64, AddressSanitizer)
 
-This crate is **not** part of the node build (not a path-dep). Not run in the
-dev sandbox (needs the nightly + libFuzzer toolchain) — it is a ready harness;
-wire `cargo fuzz run` into CI/nightly on a capable runner. New parsers of
-untrusted bytes should get a target here.
+The four scanner-priority surfaces were **built and executed** locally — no
+crash, panic, over-allocation, or hang was observed in short smoke runs:
+
+| Target           | Surface                                   | Result (ASan)              |
+|------------------|-------------------------------------------|----------------------------|
+| `block_parse`    | Block wire deser (primary remote surface) | 167 326 runs, ~7 967 exec/s, clean |
+| `tx_parse`       | Transaction wire deser                    | 257 762 runs, ~8 314 exec/s, clean |
+| `sha256d_pow`    | LIVE Genesis-2 SHA-256d PoW path          | 174 420 runs, ~8 305 exec/s, clean |
+| `ghostdag_order` | GhostDAG ordering (stateful)              |  41 067 runs, ~1 955 exec/s, clean |
+| `sig_verify`     | Hybrid ML-DSA-65 ‖ Falcon-1024 verify     | 172 169 runs, ~8 198 exec/s, clean |
+
+Smoke runs (20–30 s) prove the harness links against the real `bloch` API and
+does not fault on shallow inputs; they are **not** a coverage-exhausting
+campaign. Run a real campaign (minutes–hours, or continuously in OSS-Fuzz)
+before drawing any assurance conclusion. The remaining targets
+(`netmsg_decode`, `handshake_decode`, `merkle_path`, `mempool_ops`,
+`pow_verify`, `pow_decode`) build from the same crate and toolchain but were not
+individually smoke-run in this pass.
+
+This crate is **not** part of the node build (not a path-dep of `bloch`); it is
+its own workspace root (empty `[workspace]` table) so `cargo fuzz build` does not
+walk up into the node workspace. Wire `cargo fuzz run` into CI/nightly on a
+capable runner (see `oss-fuzz/`). New parsers of untrusted bytes should get a
+target here.

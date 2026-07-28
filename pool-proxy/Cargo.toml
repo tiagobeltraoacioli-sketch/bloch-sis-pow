@@ -1,0 +1,52 @@
+# bloch-pool-proxy — Sprint 1 "Eixo 1": a smart Stratum V1 proxy / mini-pool.
+#
+# Transparent proxy that gives MANY miners/ASICs disjoint search spaces WITHOUT
+# reimplementing PoW: it opens ONE upstream Stratum connection per downstream
+# worker to the node's :3333, and the node assigns each upstream a distinct
+# extranonce1 (see node src/stratum/session.rs::handle_subscribe). Workers are
+# therefore normally disjoint — but the node's 32-bit extranonce1 is NOT
+# guaranteed unique, so the proxy runs a live collision guard (log + metric)
+# rather than assuming disjointness by construction. The proxy only observes the
+# stream for vardiff/keepalive/share-accounting/metrics. No SHA-256d, no rebuild,
+# no consensus code — hence ZERO dependency on bloch-crypto / bloch-sis-pow.
+#
+# Its OWN [workspace] (like l2/*) so it is NOT a member of the node's consensus
+# workspace and cannot touch consensus crates.
+#
+# NOTE: a prior, different pool scaffold already exists at pool/ (a native
+# RPC pool built on getblocktemplate, depending on bloch-crypto). This proxy
+# is a distinct deliverable — see integration_notes for placement.
+
+[workspace]
+
+[package]
+name = "bloch-pool-proxy"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "Smart Stratum V1 proxy / mini-pool for Bloch-SIS-PoW: per-worker extranonce partitioning via one-upstream-per-worker, vardiff, keepalive, PPLNS stub, Prometheus metrics"
+
+[[bin]]
+name = "bloch-pool-proxy"
+path = "src/main.rs"
+
+[lib]
+name = "bloch_pool_proxy"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+env_logger = "0.11"
+# Leaf crates for the local SHA-256d share validator (§ vardiff design). These
+# are pure-Rust leaf deps — the proxy still has ZERO dependency on bloch-crypto;
+# the ~30 lines of target math are COPIED verbatim so the compare is
+# byte-identical to the node without linking consensus code.
+sha2 = "0.10"
+primitive-types = "0.13"
+hex = "0.4"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }

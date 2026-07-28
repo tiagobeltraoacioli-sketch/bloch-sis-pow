@@ -1,0 +1,96 @@
+---
+# Akash SDL — Bloch-SIS-PoW GENESIS-2 EUVM rig (v0.3.0-genesis2 + --features euvm).
+#
+# Runs the euvm activation binary (EUVM_ACTIVATION_HEIGHT=4320). Below 4320 it is
+# byte-for-byte legacy (no divergence); at 4320 euvm/Kirpich/Ustav activate — so
+# EVERY node that crosses 4320 MUST run this image or it forks off the chain.
+#
+# 40-CPU "rig": archival + euvm-aware. NOTE: SHA-256d does not mine usefully on
+# CPU, so --mine here earns ~nothing; the value is a well-resourced archival peer
+# that runs euvm and serves history. Drop "--mine"/"--miner-address" to run pure
+# archival.
+#
+# Peers: founder (OVH, --archive anchor) + Mumbai archival + current live Akash
+# nodes (they hold the 3413→4170 bodies the founder alone lost) + seeds. Fresh
+# nodes CANNOT sync past H=3413 from the founder alone (parent body 3a4b2c12…
+# gone network-wide) — they pull it from the still-running Akash archival nodes.
+#
+# BEFORE DEPLOYING: build+push the euvm image:
+#   docker build -f Dockerfile.euvm -t docker.io/blochv/bloch:0.3-genesis2-euvm .
+#   docker push  docker.io/blochv/bloch:0.3-genesis2-euvm
+
+version: "2.0"
+
+services:
+  bloch-node:
+    image: docker.io/blochv/bloch:0.3-genesis2-euvm
+    args:
+      - "--genesis2"
+      - "--archive"
+      - "--carryover-snapshot"
+      - "/carryover.tsv"
+      - "--data-dir"
+      - "/bloch-data"
+      - "--listen"
+      - "/ip4/0.0.0.0/tcp/16110"
+      # founder (OVH, archival anchor) + Mumbai archival
+      - "--peer"
+      - "/ip4/51.83.249.212/tcp/16110"
+      - "--peer"
+      - "/ip4/148.113.59.206/tcp/16110"
+      # seeds
+      - "--peer"
+      - "/ip4/45.76.138.60/tcp/16110"
+      - "--peer"
+      - "/ip4/45.76.82.134/tcp/16110"
+      - "--peer"
+      - "/ip4/137.66.39.208/tcp/16110"
+      # NOTE: also add --peer for the current live Akash nodes' provider
+      # host:port (they carry the 3413→4170 bodies) — filled in at deploy time
+      # once their forwarded 16110 endpoints are known.
+      - "--rpc-bind"
+      - "127.0.0.1"
+      - "--rpc-port"
+      - "16210"
+      - "--max-peers"
+      - "100"
+    env:
+      - RUST_LOG=info,libp2p_gossipsub=error
+    expose:
+      - port: 16110
+        as: 16110
+        proto: tcp
+        to:
+          - global: true
+    params:
+      storage:
+        chaindata:
+          mount: /bloch-data
+          readOnly: false
+
+profiles:
+  compute:
+    bloch-node:
+      resources:
+        cpu:
+          units: 40
+        memory:
+          size: 16Gi
+        storage:
+          - size: 4Gi
+          - name: chaindata
+            size: 30Gi
+            attributes:
+              persistent: true
+              class: beta3
+  placement:
+    dcloud:
+      pricing:
+        bloch-node:
+          denom: uakt
+          amount: 1000000
+deployment:
+  bloch-node:
+    dcloud:
+      profile: bloch-node
+      count: 1
