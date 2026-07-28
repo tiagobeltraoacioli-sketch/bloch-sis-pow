@@ -1,0 +1,22 @@
+# bloch-pq-vault — FOUNDATION: a non-custodial, native, opt-in post-quantum
+# *defensive vault* for coins with no PQ signature scheme (Bitcoin reference).
+#
+# Implements the achievable, honest scope of docs/specs/PQ-SHIELD-NONCUSTODIAL-NATIVE.md:
+# a commit-delay-reveal P2WSH vault + a PQ-gated clawback, anchored on Bloch by a
+# PQ-signed commitment. This is NOT unconditional quantum immunity — see the crate
+# docs' HONEST LIMITS section and the spec §9. STANDALONE; not wired into the node.
+[package]
+name = "bloch-pq-vault"
+version = "0.0.1"
+edition = "2021"
+description = "Non-custodial PQ-shield Bitcoin vault (P2WSH commit-delay-reveal + PQ-authorized clawback) with a Bloch PQ anchor"
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+bitcoin          = "0.32"
+bloch-crypto     = { path = "../bloch-crypto" }
+bloch-euvm       = { path = "../bloch-euvm" }
+bloch-btc-wallet = { path = "../bloch-btc-wallet" }
+sha2             = "0.10"
+hkdf             = "0.12"
+hex              = "0.4"
