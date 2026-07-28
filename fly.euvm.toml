@@ -1,0 +1,14 @@
+app = "bloch-euvm-rehearsal"
+primary_region = "gru"
+
+[build]
+  dockerfile = "Dockerfile.euvm"
+
+# ISOLADO: --listen 127.0.0.1 (localhost), RPC local, SEM --peer, SEM --dns-seed.
+# Nenhum [[services]] → Fly NÃO expõe porta pública. Zero contato com a mainnet.
+[processes]
+  app = "--genesis2 --carryover-snapshot /carryover.tsv --data-dir /bloch-data --mine --mine-threads 4 --miner-address bloch1qe986db5149cff7499b282a048272a09aff0af4ff84242073 --rpc-bind 127.0.0.1 --rpc-port 16210 --listen /ip4/127.0.0.1/tcp/16110"
+
+[[vm]]
+  size = "shared-cpu-4x"
+  memory = "4gb"

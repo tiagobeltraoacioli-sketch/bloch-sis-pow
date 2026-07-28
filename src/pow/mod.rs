@@ -118,6 +118,33 @@ pub fn next_bits(
     )
 }
 
+/// Genesis-2 devnet expected difficulty `bits` for the block at `height`.
+///
+/// SINGLE SOURCE OF TRUTH shared by `accept_block` (validation), the internal
+/// solo miner, and the `getblocktemplate` RPC so every producer serves EXACTLY
+/// the target the validator enforces. Genesis-2 is a fresh SHA-256d chain with
+/// a Bitcoin-style windowed retarget: `current_bits` (persisted in meta) holds
+/// the active target between boundaries, recomputed every
+/// `GENESIS2_RETARGET_WINDOW` blocks from that window's timespan. It must NEVER
+/// be confused with the SIS ASERT path anchored at `GENESIS_BITS` (0x2100ffff),
+/// which — on this chain — yields a trivial diff-1 target that floods the DAG
+/// with same-height blocks.
+pub fn genesis2_expected_bits(store: &crate::storage::Storage, height: u64) -> u32 {
+    let cur = store.get_meta("current_bits").ok().flatten()
+        .and_then(|b| <[u8; 4]>::try_from(b.as_slice()).ok())
+        .map(u32::from_le_bytes)
+        .unwrap_or(crate::core::GENESIS2_BITS);
+    let window = crate::core::GENESIS2_RETARGET_WINDOW;
+    if height >= window && height % window == 0 {
+        let first = store.get_timestamp_at_height(height - window).ok().flatten();
+        let last = store.get_timestamp_at_height(height - 1).ok().flatten();
+        if let (Some(first), Some(last)) = (first, last) {
+            return crate::core::retarget_bits_g2(cur, last.saturating_sub(first));
+        }
+    }
+    cur
+}
+
 /// Testnet-regime verify: relaxed residual width (k = 4), height-blind.
 /// **Zero security** — dev only. Consensus code must use the height-aware
 /// [`verify_sis_pow`] instead (this is the pre-activation regime only).

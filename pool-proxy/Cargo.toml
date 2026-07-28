@@ -40,6 +40,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 log = "0.4"
 env_logger = "0.11"
+# Leaf crates for the local SHA-256d share validator (§ vardiff design). These
+# are pure-Rust leaf deps — the proxy still has ZERO dependency on bloch-crypto;
+# the ~30 lines of target math are COPIED verbatim so the compare is
+# byte-identical to the node without linking consensus code.
+sha2 = "0.10"
+primitive-types = "0.13"
+hex = "0.4"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

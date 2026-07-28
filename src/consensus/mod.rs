@@ -1417,6 +1417,76 @@ impl GhostDAG {
         self.store.tips.iter().cloned().collect()
     }
 
+    /// Best tip whose BODY is available, walking the selected-parent chain
+    /// down from the highest-blue-work tip until a bodied block is found.
+    ///
+    /// A header-only tip — accepted via headers-first sync but whose body
+    /// never arrived (e.g. an unreachable chain advertised by peers) — is
+    /// UNMINEABLE: a block built on it cannot be validated by accept_block,
+    /// so the internal miner and stratum silently stall on a phantom parent.
+    /// This is exactly what wedged the founder at H=3737 behind a bodyless
+    /// H=3738 header. `has_body(&hash)` must return true iff the full block
+    /// body is present in block storage.
+    pub fn best_bodied_tip<F: Fn(&BlockHash) -> bool>(&self, has_body: F) -> Option<BlockHash> {
+        // Resolve EVERY tip to a bodied candidate — the tip itself when its
+        // body is present, else its nearest bodied ancestor along the
+        // selected-parent chain — then return the heaviest candidate under
+        // GhostDAG's own tip ordering (blue_work, then blue_score, then hash).
+        //
+        // This deliberately EXCLUDES a header-only tip from selection. A
+        // dominant-blue_work but BODILESS tip — e.g. a persisted N-way merge
+        // header whose body never arrived — can never be extended, so the miner
+        // must build on the heaviest tip we actually hold a body for. The prior
+        // implementation walked selected_parent down from the single
+        // highest-blue_work tip and so returned that phantom's bodied ANCESTOR,
+        // leaving the miner producing sibling blocks that always lost the
+        // blue_work race to the phantom → a persisted deadlock no restart could
+        // clear (h3757/b3ee487b). Scanning all tips instead lets a freshly-mined
+        // bodied tip win selection and the chain advance. Recomputed from the
+        // store on every call — no persisted latch, so this is restart-safe.
+        let mut best: Option<BlockHash> = None;
+        for tip in self.store.tips.iter() {
+            // Nearest bodied block at or below this tip.
+            let mut cur = Some(*tip);
+            let candidate = loop {
+                match cur {
+                    Some(h) if has_body(&h)  => break Some(h),
+                    Some(h)                  => cur = self.store.get(&h).and_then(|d| d.selected_parent),
+                    None                     => break None,
+                }
+            };
+            if let Some(c) = candidate {
+                best = Some(match best {
+                    None => c,
+                    Some(b) => {
+                        let dc = self.store.get(&c);
+                        let db = self.store.get(&b);
+                        let wc = dc.map(|d| d.blue_work).unwrap_or(0);
+                        let wb = db.map(|d| d.blue_work).unwrap_or(0);
+                        let sc = dc.map(|d| d.blue_score).unwrap_or(0);
+                        let sb = db.map(|d| d.blue_score).unwrap_or(0);
+                        if wc.cmp(&wb).then(sc.cmp(&sb)).then(c.cmp(&b)).is_gt() { c } else { b }
+                    }
+                });
+            }
+        }
+        best
+    }
+
+    /// Tips that are safe to mine on: those whose body is available. When
+    /// every tip is header-only, falls back to the nearest bodied ancestor
+    /// via [`best_bodied_tip`] so mining never stalls on a phantom parent.
+    pub fn bodied_tips<F: Fn(&BlockHash) -> bool>(&self, has_body: F) -> Vec<BlockHash> {
+        let bodied: Vec<BlockHash> = self.store.tips.iter()
+            .filter(|h| has_body(h))
+            .cloned()
+            .collect();
+        if !bodied.is_empty() {
+            return bodied;
+        }
+        self.best_bodied_tip(has_body).into_iter().collect()
+    }
+
     pub fn block_count(&self) -> usize {
         self.store.data.len()
     }

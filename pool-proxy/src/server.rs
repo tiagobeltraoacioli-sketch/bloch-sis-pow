@@ -275,6 +275,31 @@ where
     if let Some(v) = get("BLOCH_POOL_VARDIFF") {
         cfg.vardiff_override = parse_bool("BLOCH_POOL_VARDIFF", &v)?;
     }
+    if let Some(v) = get("BLOCH_POOL_VARDIFF_INITIAL") {
+        cfg.vardiff_initial = parse_field::<f64>("BLOCH_POOL_VARDIFF_INITIAL", &v)?;
+    }
+    if let Some(v) = get("BLOCH_POOL_VARDIFF_TARGET_SECS") {
+        cfg.vardiff_target_secs = parse_field::<f64>("BLOCH_POOL_VARDIFF_TARGET_SECS", &v)?;
+    }
+    if let Some(v) = get("BLOCH_POOL_VARDIFF_MIN") {
+        cfg.vardiff_min = parse_field::<f64>("BLOCH_POOL_VARDIFF_MIN", &v)?;
+    }
+    if let Some(v) = get("BLOCH_POOL_VARDIFF_MAX") {
+        cfg.vardiff_max = parse_field::<f64>("BLOCH_POOL_VARDIFF_MAX", &v)?;
+    }
+    if let Some(v) = get("BLOCH_POOL_VARDIFF_RETARGET_SHARES") {
+        cfg.vardiff_retarget_shares =
+            parse_field::<usize>("BLOCH_POOL_VARDIFF_RETARGET_SHARES", &v)?;
+    }
+    if let Some(v) = get("BLOCH_POOL_VARDIFF_GRACE_SECS") {
+        cfg.vardiff_grace_secs = parse_field::<u64>("BLOCH_POOL_VARDIFF_GRACE_SECS", &v)?;
+    }
+    if let Some(v) = get("BLOCH_POOL_SHA256D_LE") {
+        // Explicit override: force `le` for every job, ignoring its height.
+        // Leave unset in normal operation — the per-job height gate
+        // (`validator::le_for_height`) is what actually mirrors the node.
+        cfg.sha256d_le = Some(parse_bool("BLOCH_POOL_SHA256D_LE", &v)?);
+    }
     if let Some(v) = get("BLOCH_POOL_PPLNS_WINDOW") {
         cfg.pplns_window_shares = parse_field::<usize>("BLOCH_POOL_PPLNS_WINDOW", &v)?;
     }

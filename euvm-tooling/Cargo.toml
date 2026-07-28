@@ -1,0 +1,21 @@
+# euvm-tooling — developer tooling around the standalone bloch-euvm crate.
+#
+# STANDALONE crate with its OWN [workspace] table so it is NOT swept into the
+# node's root workspace. It depends on bloch-euvm by path and builds the six
+# dev-tooling components (sim, asm, encode, tx, examples, docs) around its
+# public API. Owned by the PMO: do not edit Cargo.toml or src/lib.rs — fill in
+# your own module file only.
+[package]
+name = "euvm-tooling"
+version = "0.0.1"
+edition = "2021"
+description = "Developer tooling (assembler, simulator, encoders, tx-builder, examples) for the bloch-euvm eUTXO validator VM"
+license = "AGPL-3.0-or-later"
+
+# Own workspace root — isolates this crate from the parent node workspace.
+[workspace]
+
+[dependencies]
+bloch-euvm = { path = "../crates/bloch-euvm" }
+hex = "0.4"
+sha2 = "0.10"
