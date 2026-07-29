@@ -57,7 +57,7 @@ pub const EUVM_FEATURE: &str = "euvm";
 
 /// Fraction of the eUTXO transaction fee that is burned (basis points), per the
 /// ETH-style fee-burn design (§5-bis). Illustrative until governance sets it.
-pub const EUVM_BURN_BPS: u16 = 5_000; // 50%
+pub const EUVM_BURN_BPS: u16 = 2_000; // 20% (founder decision 2026-07-29; matches the design/harness value)
 
 /// Canonical eUTXO gas ceilings — the SINGLE source of truth shared by the
 /// accept_block hook (D2) and the miner mirror (D3), so miner and validator
