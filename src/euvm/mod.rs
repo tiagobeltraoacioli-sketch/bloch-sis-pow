@@ -1611,13 +1611,13 @@ mod tests {
         let mut trailing = good.clone();
         trailing.push(0x00);
         assert_eq!(
-            decode_input_witness(&trailing),
-            Err(EuMapError::TrailingBytes { extra: 1 })
+            decode_input_witness(&trailing).unwrap_err(),
+            EuMapError::TrailingBytes { extra: 1 }
         );
         // unknown op tag inside the validator (first program byte is Sha256d=0x40)
         let mut bad_op = good.clone();
         bad_op[4] = 0xFF;
-        assert_eq!(decode_input_witness(&bad_op), Err(EuMapError::BadOpTag(0xFF)));
+        assert_eq!(decode_input_witness(&bad_op).unwrap_err(), EuMapError::BadOpTag(0xFF));
         // unknown Val tag in the redeemer: rebuild with a corrupted item tag
         let vb = bloch_euvm::encode_program(&w.validator);
         let mut bad_val = Vec::new();
@@ -1625,12 +1625,12 @@ mod tests {
         bad_val.extend_from_slice(&vb);
         bad_val.extend_from_slice(&1u32.to_le_bytes());
         bad_val.push(0x02); // not a datum tag
-        assert_eq!(decode_input_witness(&bad_val), Err(EuMapError::BadDatumTag(0x02)));
+        assert_eq!(decode_input_witness(&bad_val).unwrap_err(), EuMapError::BadDatumTag(0x02));
         // oversize witness rejected up front
         let huge = vec![0u8; MAX_WITNESS_BYTES + 1];
         assert_eq!(
-            decode_input_witness(&huge),
-            Err(EuMapError::WitnessTooLong { len: MAX_WITNESS_BYTES + 1 })
+            decode_input_witness(&huge).unwrap_err(),
+            EuMapError::WitnessTooLong { len: MAX_WITNESS_BYTES + 1 }
         );
         // a hostile redeemer_count cannot allocate: claims u32::MAX items
         let mut hostile = Vec::new();
