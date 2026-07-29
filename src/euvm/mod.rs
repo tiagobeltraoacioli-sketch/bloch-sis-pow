@@ -59,6 +59,15 @@ pub const EUVM_FEATURE: &str = "euvm";
 /// ETH-style fee-burn design (§5-bis). Illustrative until governance sets it.
 pub const EUVM_BURN_BPS: u16 = 5_000; // 50%
 
+/// Canonical eUTXO gas ceilings — the SINGLE source of truth shared by the
+/// accept_block hook (D2) and the miner mirror (D3), so miner and validator
+/// agree by construction. They live here (the euvm module compiles into BOTH
+/// the bin and the lib crate) rather than at a crate root. DoS/IBD-conservative
+/// and still covers the ~1.4M-gas max-input (1024) legacy tx. Raising either is
+/// a consensus change.
+pub const EUVM_PER_TX_GAS: u64 = 2_000_000;
+pub const EUVM_BLOCK_GAS:  u64 = 8_000_000;
+
 /// Bridges the VM `SigVerifier` trait to the node's real hybrid
 /// post-quantum verifier. This is the single point where "a signature is valid"
 /// means exactly what consensus means by it.

@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 120 120" role="img" aria-label="Postern Labs">
+  <!-- Favicon: inner cross dropped (vanishes < 16px), strokes/nodes thickened for legibility -->
+  <polygon points="60,16 106,94 14,94" fill="none" stroke="#D2955C" stroke-width="7" stroke-linejoin="round"/>
+  <circle cx="36" cy="94" r="7" fill="#D2955C"/>
+  <circle cx="60" cy="94" r="7" fill="#D2955C"/>
+  <circle cx="84" cy="94" r="7" fill="#D2955C"/>
+  <circle cx="60" cy="16" r="9" fill="#E0A870"/>
+</svg>
