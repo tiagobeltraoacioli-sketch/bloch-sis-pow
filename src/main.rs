@@ -1557,6 +1557,37 @@ async fn main() {
                 mining_round += 1;
                 let txs = mem_m.get_for_block(2000);
 
+                // ── eUTXO miner↔validator mirror (D3, feature-gated) ──────────
+                // Before finalizing the candidate, run the SAME eUTXO
+                // validation the acceptor (accept_block's D2 hook) runs —
+                // euvm::validate_node_block via euvm::miner::mirror_candidate_txs
+                // — over the selected txs, excluding any tx the validator would
+                // reject (drop-and-re-check until the whole set passes). Also
+                // returns the burn-aware fee total the coinbase may claim, so
+                // miner and validator agree on both VALIDITY and VALUE by
+                // construction. Guarded by euvm_active(next height): inactive
+                // heights and the feature-off build behave exactly as before.
+                #[cfg(feature = "euvm")]
+                let (txs, euvm_claimable_fees): (Vec<core::Transaction>, Option<u64>) =
+                    if euvm::euvm_active(current_height + 1) {
+                        let mirrored = euvm::miner::mirror_candidate_txs(
+                            txs,
+                            core::node_chain_id(),
+                            |txid: &[u8; 32], idx: u32| {
+                                store_m.get_utxo(txid, idx).ok().flatten()
+                            },
+                        );
+                        if mirrored.dropped > 0 {
+                            warn!(
+                                "⛏  euvm mirror: excluded {} tx(s) the validator would reject ({} kept, gas_used={})",
+                                mirrored.dropped, mirrored.txs.len(), mirrored.gas_used
+                            );
+                        }
+                        (mirrored.txs, Some(mirrored.claimable_fees))
+                    } else {
+                        (txs, None)
+                    };
+
                 // FIX VULN-05: Compute fees and include in coinbase
                 let total_fees: u64 = txs.iter().map(|tx| {
                     let total_in: u64 = tx.inputs.iter()
@@ -1568,6 +1599,17 @@ async fn main() {
                         .unwrap_or(u64::MAX); // overflow → caller will reject
                     total_in.saturating_sub(total_out)
                 }).sum();
+
+                // eUTXO fee mirror (D3): when the VM is active, the coinbase
+                // claims the mirror's burn-aware fee total for the SAME kept
+                // set (full fee for legacy txs, post-burn miner share for
+                // eUTXO-touching txs). validate_coinbase_value enforces
+                // `miner_output <= subsidy + total_fees` as a ceiling, so this
+                // (never-larger) claim is valid against both today's acceptor
+                // and a burn-enforcing D2 acceptor — the miner can never
+                // over-claim. Inactive → None → legacy computation above wins.
+                #[cfg(feature = "euvm")]
+                let total_fees: u64 = euvm_claimable_fees.unwrap_or(total_fees);
 
                 // V2 coinbase per TOKENOMICS_V2 §4 (ADR-028):
                 //   output[0] = miner          = 70% subsidy + total_fees
