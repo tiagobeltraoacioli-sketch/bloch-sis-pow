@@ -199,6 +199,14 @@ pub enum EuMapError {
     FeeOverflow,
     /// `input_index` out of range for this transaction.
     BadInputIndex { index: usize, len: usize },
+    /// Unknown opcode tag while decoding a validator program from a witness
+    /// ([`decode_program`] — strict inverse of `bloch_euvm::encode_program`).
+    BadOpTag(u8),
+    /// A single input witness (`script_sig`) exceeds [`MAX_WITNESS_BYTES`].
+    WitnessTooLong { len: usize },
+    /// Decoding input `input`'s witness from its `script_sig` failed; `source`
+    /// is the underlying codec error (truncation, trailing bytes, bad tag, ...).
+    WitnessDecode { input: usize, source: Box<EuMapError> },
 }
 
 impl std::fmt::Display for EuMapError {
@@ -226,11 +234,61 @@ impl std::fmt::Display for EuMapError {
             FeeUnderflow { in_blch, out_blch } => write!(f, "BLCH outputs {out_blch} exceed inputs {in_blch}"),
             FeeOverflow => write!(f, "implied BLCH fee overflows u64"),
             BadInputIndex { index, len } => write!(f, "input index {index} out of range (tx has {len} inputs)"),
+            BadOpTag(t) => write!(f, "unknown op tag 0x{t:02x} in witness validator program"),
+            WitnessTooLong { len } => write!(f, "witness script_sig too long ({len} bytes)"),
+            WitnessDecode { input, source } => write!(f, "input {input}: witness decode failed: {source}"),
         }
     }
 }
 
 impl std::error::Error for EuMapError {}
+
+// ── Strict byte cursor + Val codec (shared by script and witness codecs) ──────
+
+/// Strict cursor: the next `n` bytes of `buf` or a typed truncation error.
+/// Never panics; never reads past `buf`.
+fn take<'a>(buf: &'a [u8], pos: &mut usize, n: usize) -> Result<&'a [u8], EuMapError> {
+    let have = buf.len() - *pos;
+    if have < n {
+        return Err(EuMapError::Truncated { need: n, have });
+    }
+    let s = &buf[*pos..*pos + n];
+    *pos += n;
+    Ok(s)
+}
+
+/// Canonical [`Val`] encoding — THE datum codec. Used byte-identically for a
+/// tagged script's datum and for every witness redeemer item (PMO pinned wire
+/// format): `Int → 0x00 ‖ i128 LE[16]`, `Bytes → 0x01 ‖ u32 LE len ‖ bytes`.
+fn encode_val(v: &Val, out: &mut Vec<u8>) {
+    match v {
+        Val::Int(n) => {
+            out.push(DATUM_TAG_INT);
+            out.extend_from_slice(&n.to_le_bytes());
+        }
+        Val::Bytes(b) => {
+            out.push(DATUM_TAG_BYTES);
+            out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            out.extend_from_slice(b);
+        }
+    }
+}
+
+/// Strict inverse of [`encode_val`]. Typed errors, never panics.
+fn decode_val(buf: &[u8], pos: &mut usize) -> Result<Val, EuMapError> {
+    match take(buf, pos, 1)?[0] {
+        DATUM_TAG_INT => {
+            let raw: [u8; 16] = take(buf, pos, 16)?.try_into().expect("slice is 16 bytes");
+            Ok(Val::Int(i128::from_le_bytes(raw)))
+        }
+        DATUM_TAG_BYTES => {
+            let raw: [u8; 4] = take(buf, pos, 4)?.try_into().expect("slice is 4 bytes");
+            let len = u32::from_le_bytes(raw) as usize;
+            Ok(Val::Bytes(take(buf, pos, len)?.to_vec()))
+        }
+        t => Err(EuMapError::BadDatumTag(t)),
+    }
+}
 
 // ── Tagged-output codec (script level) ────────────────────────────────────────
 
@@ -280,17 +338,7 @@ pub fn encode_eutxo_script(s: &EutxoScript) -> Result<Vec<u8>, EuMapError> {
     let mut out = Vec::with_capacity(EUTXO_SCRIPT_MIN_LEN + 16 + 40 * s.assets.len());
     out.push(EUTXO_SCRIPT_TAG);
     out.extend_from_slice(&s.validator_hash);
-    match &s.datum {
-        Val::Int(n) => {
-            out.push(DATUM_TAG_INT);
-            out.extend_from_slice(&n.to_le_bytes());
-        }
-        Val::Bytes(b) => {
-            out.push(DATUM_TAG_BYTES);
-            out.extend_from_slice(&(b.len() as u32).to_le_bytes());
-            out.extend_from_slice(b);
-        }
-    }
+    encode_val(&s.datum, &mut out);
     // asset count fits u16: MAX_TX_DISTINCT_ASSETS (4096) < u16::MAX.
     out.extend_from_slice(&(s.assets.len() as u16).to_le_bytes());
     for (id, amount) in &s.assets {
@@ -318,16 +366,6 @@ pub fn decode_eutxo_script(spk: &[u8]) -> Result<EutxoScript, EuMapError> {
     if spk.len() > MAX_SCRIPT_PUBKEY_LEN {
         return Err(EuMapError::ScriptTooLong { len: spk.len() });
     }
-    /// Strict cursor: the next `n` bytes of `buf` or a typed truncation error.
-    fn take<'a>(buf: &'a [u8], pos: &mut usize, n: usize) -> Result<&'a [u8], EuMapError> {
-        let have = buf.len() - *pos;
-        if have < n {
-            return Err(EuMapError::Truncated { need: n, have });
-        }
-        let s = &buf[*pos..*pos + n];
-        *pos += n;
-        Ok(s)
-    }
     let mut pos: usize = 0;
 
     if take(spk, &mut pos, 1)?[0] != EUTXO_SCRIPT_TAG {
@@ -336,18 +374,7 @@ pub fn decode_eutxo_script(spk: &[u8]) -> Result<EutxoScript, EuMapError> {
     let mut vh = [0u8; 32];
     vh.copy_from_slice(take(spk, &mut pos, 32)?);
 
-    let datum = match take(spk, &mut pos, 1)?[0] {
-        DATUM_TAG_INT => {
-            let raw: [u8; 16] = take(spk, &mut pos, 16)?.try_into().expect("slice is 16 bytes");
-            Val::Int(i128::from_le_bytes(raw))
-        }
-        DATUM_TAG_BYTES => {
-            let raw: [u8; 4] = take(spk, &mut pos, 4)?.try_into().expect("slice is 4 bytes");
-            let len = u32::from_le_bytes(raw) as usize;
-            Val::Bytes(take(spk, &mut pos, len)?.to_vec())
-        }
-        t => return Err(EuMapError::BadDatumTag(t)),
-    };
+    let datum = decode_val(spk, &mut pos)?;
 
     let raw: [u8; 2] = take(spk, &mut pos, 2)?.try_into().expect("slice is 2 bytes");
     let count = u16::from_le_bytes(raw) as usize;
@@ -505,6 +532,174 @@ pub struct EuWitness {
     pub validator: Vec<Op>,
     /// Redeemer values pushed above the datum (bottom → top).
     pub redeemer: Vec<Val>,
+}
+
+// ── CANONICAL witness wire codec (D2 owns this; D3/D5 reference it) ───────────
+//
+// Witnesses travel in the EXISTING `TxInput.script_sig` — no tx/block struct or
+// serialization change. Parsing is driven by the spent PREVOUT's script type:
+//
+// - prevout is legacy 20-byte P2PKH → `script_sig` keeps the existing legacy
+//   `sig ‖ pubkey` format; the witness slot is `None` (the adapter's
+//   [`map_tx_to_eutx`] handles legacy inputs itself).
+// - prevout [`is_eutxo_script`] → `script_sig` is:
+//
+//   ```text
+//   u32 LE (validator_bytes length)
+//   ‖ validator_bytes                  — bloch_euvm::encode_program(&validator)
+//   ‖ u32 LE (redeemer_count)
+//   ‖ redeemer_count × Val             — EXACTLY the datum codec (encode_val):
+//                                        Int → 0x00 ‖ i128 LE[16]
+//                                        Bytes → 0x01 ‖ u32 LE len ‖ bytes
+//   ```
+//
+// Decode is STRICT: typed [`EuMapError`]s, the whole `script_sig` must be
+// consumed, unknown tags rejected, never panics, no allocation driven by
+// untrusted counts. `encode_input_witness(decode_input_witness(b)) == b` for
+// every accepted byte string.
+
+/// Maximum bytes of a single input witness (`script_sig`) the codec will
+/// decode. Mirrors the node's transaction-decode cap (`core::Transaction`
+/// deserialization rejects `script_sig` longer than 10 000 bytes), so nothing
+/// this codec accepts can be unserializable on the wire — and a hostile
+/// in-memory buffer cannot drive unbounded work.
+pub const MAX_WITNESS_BYTES: usize = 10_000;
+
+/// Strict inverse of `bloch_euvm::encode_program`: decode a validator program
+/// from its canonical byte encoding. Unknown op tags and truncated operands
+/// are typed errors; for every accepted byte string,
+/// `bloch_euvm::encode_program(&decode_program(b)?) == b` byte-exact.
+///
+/// The tag map is pinned to `encode_program`'s (that match is exhaustive over
+/// `Op` with no wildcard, so a new opcode in `bloch-euvm` breaks ITS compile
+/// first and this decoder must be extended consciously — never silently).
+pub fn decode_program(bytes: &[u8]) -> Result<Vec<Op>, EuMapError> {
+    let mut pos: usize = 0;
+    let mut ops = Vec::new(); // ≥ 1 byte per op ⇒ ops.len() ≤ bytes.len(): bounded
+    while pos < bytes.len() {
+        let tag = take(bytes, &mut pos, 1)?[0];
+        let op = match tag {
+            0x01 => {
+                let raw: [u8; 16] =
+                    take(bytes, &mut pos, 16)?.try_into().expect("slice is 16 bytes");
+                Op::PushInt(i128::from_le_bytes(raw))
+            }
+            0x02 => {
+                let raw: [u8; 4] =
+                    take(bytes, &mut pos, 4)?.try_into().expect("slice is 4 bytes");
+                let len = u32::from_le_bytes(raw) as usize;
+                Op::PushBytes(take(bytes, &mut pos, len)?.to_vec())
+            }
+            0x10 => Op::Dup,
+            0x11 => Op::Drop,
+            0x12 => Op::Swap,
+            0x13 => Op::Pick(take(bytes, &mut pos, 1)?[0]),
+            0x20 => Op::Add,
+            0x21 => Op::Sub,
+            0x22 => Op::Mul,
+            0x30 => Op::Eq,
+            0x31 => Op::Lt,
+            0x32 => Op::Not,
+            0x40 => Op::Sha256d,
+            0x41 => Op::Shake256,
+            0x42 => Op::Size,
+            0x50 => Op::CtxField(take(bytes, &mut pos, 1)?[0]),
+            0x60 => Op::VerifySig,
+            0x61 => Op::Verify,
+            0x62 => Op::VerifyEcdsa,
+            0x70 => Op::TxOutDatum(take(bytes, &mut pos, 1)?[0]),
+            0x71 => Op::TxOutValidator(take(bytes, &mut pos, 1)?[0]),
+            0x72 => Op::TxOutValue(take(bytes, &mut pos, 1)?[0]),
+            0x73 => Op::SelfValidator,
+            0x74 => Op::SelfAsset,
+            0x75 => Op::TxOutAsset(take(bytes, &mut pos, 1)?[0]),
+            t => return Err(EuMapError::BadOpTag(t)),
+        };
+        ops.push(op);
+    }
+    Ok(ops)
+}
+
+/// Encode an [`EuWitness`] into the pinned `script_sig` wire format (the
+/// inverse of [`decode_input_witness`]; D5 uses this to build contract
+/// spends). Infallible: any witness encodes; one exceeding
+/// [`MAX_WITNESS_BYTES`] simply produces a `script_sig` the node's tx wire
+/// codec (and this codec's decoder) will reject.
+pub fn encode_input_witness(w: &EuWitness) -> Vec<u8> {
+    let vb = bloch_euvm::encode_program(&w.validator);
+    let mut out = Vec::with_capacity(8 + vb.len());
+    out.extend_from_slice(&(vb.len() as u32).to_le_bytes());
+    out.extend_from_slice(&vb);
+    out.extend_from_slice(&(w.redeemer.len() as u32).to_le_bytes());
+    for v in &w.redeemer {
+        encode_val(v, &mut out);
+    }
+    out
+}
+
+/// Strictly decode ONE input witness from raw `script_sig` bytes per the
+/// pinned wire format. Typed errors, never panics, whole buffer must be
+/// consumed. Callers normally go through [`decode_input_witnesses`], which
+/// applies the prevout-type dispatch and adds the input index to errors.
+pub fn decode_input_witness(script_sig: &[u8]) -> Result<EuWitness, EuMapError> {
+    if script_sig.len() > MAX_WITNESS_BYTES {
+        return Err(EuMapError::WitnessTooLong { len: script_sig.len() });
+    }
+    let mut pos: usize = 0;
+    let raw: [u8; 4] = take(script_sig, &mut pos, 4)?.try_into().expect("slice is 4 bytes");
+    let vlen = u32::from_le_bytes(raw) as usize;
+    let validator = decode_program(take(script_sig, &mut pos, vlen)?)?;
+    let raw: [u8; 4] = take(script_sig, &mut pos, 4)?.try_into().expect("slice is 4 bytes");
+    let rcount = u32::from_le_bytes(raw) as usize;
+    // Each Val is ≥ 1 byte, so a hostile rcount can only fail with Truncated —
+    // and we never pre-allocate from it.
+    let mut redeemer = Vec::new();
+    for _ in 0..rcount {
+        redeemer.push(decode_val(script_sig, &mut pos)?);
+    }
+    if pos != script_sig.len() {
+        return Err(EuMapError::TrailingBytes { extra: script_sig.len() - pos });
+    }
+    Ok(EuWitness { validator, redeemer })
+}
+
+/// THE canonical per-input witness extraction for a whole transaction —
+/// exactly what the accept_block hook feeds to [`validate_node_tx`] /
+/// [`validate_node_block`], and the reference D3 (miner mirror) and D5 (RPC)
+/// must match. Per input `i`:
+///
+/// - `prevouts[i]` legacy P2PKH (or anything not [`is_eutxo_script`]) →
+///   `None` — the input's `script_sig` stays in the legacy `sig ‖ pubkey`
+///   format and is handled by the adapter's legacy arm. A malformed prevout
+///   script is NOT this codec's concern: [`map_tx_to_eutx`]'s strict
+///   [`decode_output`] rejects it fail-closed.
+/// - `prevouts[i]` tagged eUTXO → `Some(`[`decode_input_witness`]` of its
+///   script_sig)`, errors wrapped with the input index
+///   ([`EuMapError::WitnessDecode`]).
+pub fn decode_input_witnesses(
+    tx: &Transaction,
+    prevouts: &[TxOutput],
+) -> Result<Vec<Option<EuWitness>>, EuMapError> {
+    if prevouts.len() != tx.inputs.len() {
+        return Err(EuMapError::PrevoutCountMismatch {
+            inputs: tx.inputs.len(),
+            prevouts: prevouts.len(),
+        });
+    }
+    tx.inputs
+        .iter()
+        .zip(prevouts)
+        .enumerate()
+        .map(|(i, (inp, prev))| {
+            if is_eutxo_script(&prev.script_pubkey) {
+                decode_input_witness(&inp.script_sig)
+                    .map(Some)
+                    .map_err(|e| EuMapError::WitnessDecode { input: i, source: Box::new(e) })
+            } else {
+                Ok(None)
+            }
+        })
+        .collect()
 }
 
 /// Map a node [`Transaction`] to a [`bloch_euvm::EuTx`] for VM validation.
@@ -1308,6 +1503,231 @@ mod tests {
         assert_eq!(
             validate_node_tx(&burn_tx, std::slice::from_ref(&prevout), &witness(vec![Val::Bytes(preimage)]), CHAIN, 100_000),
             Err(EuvmTxError::ValueNotConserved { asset: a, in_sum: 7, out_sum: 0 })
+        );
+    }
+
+    // ── canonical witness wire codec (D2) ──
+
+    /// A program exercising EVERY opcode (operand-carrying and unit), so the
+    /// round-trip proves the whole tag map.
+    fn every_op_program() -> Vec<Op> {
+        vec![
+            Op::PushInt(0),
+            Op::PushInt(i128::MIN),
+            Op::PushInt(i128::MAX),
+            Op::PushBytes(vec![]),
+            Op::PushBytes(b"witness bytes".to_vec()),
+            Op::Dup,
+            Op::Drop,
+            Op::Swap,
+            Op::Pick(2),
+            Op::Add,
+            Op::Sub,
+            Op::Mul,
+            Op::Eq,
+            Op::Lt,
+            Op::Not,
+            Op::Sha256d,
+            Op::Shake256,
+            Op::Size,
+            Op::CtxField(0),
+            Op::VerifySig,
+            Op::Verify,
+            Op::VerifyEcdsa,
+            Op::TxOutDatum(1),
+            Op::TxOutValidator(2),
+            Op::TxOutValue(3),
+            Op::SelfValidator,
+            Op::SelfAsset,
+            Op::TxOutAsset(4),
+        ]
+    }
+
+    #[test]
+    fn witness_codec_round_trip() {
+        let cases = vec![
+            EuWitness { validator: vec![], redeemer: vec![] },
+            EuWitness { validator: every_op_program(), redeemer: vec![] },
+            EuWitness {
+                validator: vec![Op::Sha256d, Op::PushBytes(vec![7u8; 32]), Op::Eq],
+                redeemer: vec![
+                    Val::Int(0),
+                    Val::Int(-1),
+                    Val::Int(i128::MAX),
+                    Val::Bytes(vec![]),
+                    Val::Bytes(b"preimage".to_vec()),
+                ],
+            },
+        ];
+        for w in &cases {
+            let enc = encode_input_witness(w);
+            let dec = decode_input_witness(&enc).expect("decode");
+            // Op has no PartialEq — compare via the canonical program encoding
+            // (injective per encode_program's contract).
+            assert_eq!(
+                bloch_euvm::encode_program(&dec.validator),
+                bloch_euvm::encode_program(&w.validator),
+                "validator round-trip"
+            );
+            assert_eq!(dec.redeemer, w.redeemer, "redeemer round-trip");
+            // byte-exact re-encode
+            assert_eq!(encode_input_witness(&dec), enc, "byte round-trip");
+        }
+        // decode_program alone is the strict inverse of encode_program
+        let pb = bloch_euvm::encode_program(&every_op_program());
+        let ops = decode_program(&pb).expect("program decode");
+        assert_eq!(bloch_euvm::encode_program(&ops), pb);
+    }
+
+    #[test]
+    fn witness_strict_decode_rejects() {
+        let w = EuWitness {
+            validator: vec![Op::Sha256d, Op::PushBytes(b"lock".to_vec()), Op::Eq],
+            redeemer: vec![Val::Bytes(b"pre".to_vec()), Val::Int(7)],
+        };
+        let good = encode_input_witness(&w);
+        assert!(decode_input_witness(&good).is_ok());
+
+        // every strict prefix fails (truncation), never panics
+        for cut in 0..good.len() {
+            assert!(decode_input_witness(&good[..cut]).is_err(), "prefix {cut} must fail");
+        }
+        // trailing garbage rejected
+        let mut trailing = good.clone();
+        trailing.push(0x00);
+        assert_eq!(
+            decode_input_witness(&trailing),
+            Err(EuMapError::TrailingBytes { extra: 1 })
+        );
+        // unknown op tag inside the validator (first program byte is Sha256d=0x40)
+        let mut bad_op = good.clone();
+        bad_op[4] = 0xFF;
+        assert_eq!(decode_input_witness(&bad_op), Err(EuMapError::BadOpTag(0xFF)));
+        // unknown Val tag in the redeemer: rebuild with a corrupted item tag
+        let vb = bloch_euvm::encode_program(&w.validator);
+        let mut bad_val = Vec::new();
+        bad_val.extend_from_slice(&(vb.len() as u32).to_le_bytes());
+        bad_val.extend_from_slice(&vb);
+        bad_val.extend_from_slice(&1u32.to_le_bytes());
+        bad_val.push(0x02); // not a datum tag
+        assert_eq!(decode_input_witness(&bad_val), Err(EuMapError::BadDatumTag(0x02)));
+        // oversize witness rejected up front
+        let huge = vec![0u8; MAX_WITNESS_BYTES + 1];
+        assert_eq!(
+            decode_input_witness(&huge),
+            Err(EuMapError::WitnessTooLong { len: MAX_WITNESS_BYTES + 1 })
+        );
+        // a hostile redeemer_count cannot allocate: claims u32::MAX items
+        let mut hostile = Vec::new();
+        hostile.extend_from_slice(&0u32.to_le_bytes()); // empty program
+        hostile.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(
+            decode_input_witness(&hostile),
+            Err(EuMapError::Truncated { .. })
+        ));
+        // deterministic junk mini-corpus: must return, never panic
+        for len in 0..64usize {
+            let junk: Vec<u8> =
+                (0..len).map(|i| (i as u8).wrapping_mul(41).wrapping_add(0x13)).collect();
+            let _ = decode_input_witness(&junk);
+        }
+    }
+
+    #[test]
+    fn decode_input_witnesses_is_prevout_driven() {
+        let (pk, _) = kp();
+        let hashlock = vec![Op::Sha256d, Op::PushBytes(vec![9u8; 32]), Op::Eq];
+        let witness = EuWitness {
+            validator: hashlock.clone(),
+            redeemer: vec![Val::Bytes(b"pre".to_vec())],
+        };
+        // 2-input tx: input 0 spends legacy (script_sig = legacy sig‖pk blob),
+        // input 1 spends a tagged output (script_sig = pinned witness format).
+        let mut tx = NodeTx {
+            version: 1,
+            inputs: vec![mk_input([1u8; 32]), mk_input([2u8; 32])],
+            outputs: vec![NodeOut { value: 10, script_pubkey: vec![5u8; 20] }],
+            locktime: 0,
+        };
+        tx.inputs[0].script_sig = NodeTx::build_script_sig(b"sig", pk);
+        tx.inputs[1].script_sig = encode_input_witness(&witness);
+        let legacy_prev = NodeOut { value: 50, script_pubkey: legacy_pubkey_hash(pk).to_vec() };
+        let tagged_prev = encode_output(&ExtOutput {
+            value: blch(50),
+            validator_hash: validator_hash(&hashlock),
+            datum: Val::Int(0),
+        }).expect("encode");
+        let prevouts = vec![legacy_prev.clone(), tagged_prev.clone()];
+
+        let ws = decode_input_witnesses(&tx, &prevouts).expect("decode");
+        assert_eq!(ws.len(), 2);
+        assert!(ws[0].is_none(), "legacy prevout → None");
+        let w1 = ws[1].as_ref().expect("tagged prevout → Some");
+        assert_eq!(
+            bloch_euvm::encode_program(&w1.validator),
+            bloch_euvm::encode_program(&hashlock)
+        );
+        assert_eq!(w1.redeemer, witness.redeemer);
+
+        // count mismatch is typed
+        assert_eq!(
+            decode_input_witnesses(&tx, &prevouts[..1]).unwrap_err(),
+            EuMapError::PrevoutCountMismatch { inputs: 2, prevouts: 1 }
+        );
+        // garbage script_sig under a TAGGED prevout fails with the input index
+        let mut bad = tx.clone();
+        bad.inputs[1].script_sig = vec![1, 2, 3];
+        match decode_input_witnesses(&bad, &prevouts).unwrap_err() {
+            EuMapError::WitnessDecode { input: 1, .. } => {}
+            e => panic!("expected WitnessDecode at input 1, got {e:?}"),
+        }
+        // garbage script_sig under a LEGACY prevout is NOT the codec's concern
+        let mut legacy_garbage = tx.clone();
+        legacy_garbage.inputs[0].script_sig = vec![1, 2, 3];
+        assert!(decode_input_witnesses(&legacy_garbage, &prevouts).is_ok());
+    }
+
+    /// End-to-end: a witness built with `encode_input_witness`, carried in the
+    /// REAL `script_sig`, decoded by `decode_input_witnesses`, authorizes a
+    /// contract spend through `validate_node_tx` — the exact accept_block hook
+    /// pipeline over the pinned wire format.
+    #[test]
+    fn witness_wire_format_is_consensus_executable() {
+        use sha2::{Digest as _, Sha256};
+        let preimage = b"wire-format-secret".to_vec();
+        let lock = Sha256::digest(Sha256::digest(&preimage)).to_vec();
+        let hashlock = vec![Op::Sha256d, Op::PushBytes(lock), Op::Eq];
+
+        let prevout = encode_output(&ExtOutput {
+            value: blch(100),
+            validator_hash: validator_hash(&hashlock),
+            datum: Val::Int(0),
+        }).expect("encode prevout");
+
+        let mut tx = NodeTx {
+            version: 1,
+            inputs: vec![mk_input([3u8; 32])],
+            outputs: vec![NodeOut { value: 90, script_pubkey: vec![5u8; 20] }],
+            locktime: 0,
+        };
+        tx.inputs[0].script_sig = encode_input_witness(&EuWitness {
+            validator: hashlock,
+            redeemer: vec![Val::Bytes(preimage)],
+        });
+
+        let ws = decode_input_witnesses(&tx, std::slice::from_ref(&prevout)).expect("decode");
+        let used = validate_node_tx(&tx, std::slice::from_ref(&prevout), &ws, CHAIN, 100_000)
+            .expect("spend authorizes through the wire format");
+        assert!(used > 0);
+
+        // flipping one witness byte (inside the preimage) must fail the spend
+        let mut bad = tx.clone();
+        let l = bad.inputs[0].script_sig.len();
+        bad.inputs[0].script_sig[l - 1] ^= 0xFF;
+        let ws_bad = decode_input_witnesses(&bad, std::slice::from_ref(&prevout)).expect("decodes");
+        assert_eq!(
+            validate_node_tx(&bad, std::slice::from_ref(&prevout), &ws_bad, CHAIN, 100_000),
+            Err(EuvmTxError::ValidatorRejected(0))
         );
     }
 
