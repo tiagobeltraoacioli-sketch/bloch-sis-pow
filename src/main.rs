@@ -3217,6 +3217,25 @@ fn validate_tx_standalone(
     let lookup = |txid: &[u8; 32], idx: u32| -> Result<Option<core::TxOutput>, String> {
         store.get_utxo(txid, idx).map_err(|e| e.to_string())
     };
+
+    // ── eUTXO VM admission (D6, feature `euvm`) ──────────────────────────
+    // Same gate + routing as accept_block's D2 hook (validate_tx_in_block_euvm
+    // above): VM-touching txs validate through the ONE shared standalone
+    // mirror `rpc::euvm_admit_tx_standalone` (strict output decode,
+    // decode_input_witnesses, validate_node_tx under EUVM_PER_TX_GAS,
+    // prevouts from the confirmed UTXO set); pure-legacy txs return `None`
+    // and fall through to the UNCHANGED legacy path below. Gate closed —
+    // or feature off, in which case this block does not exist in the build —
+    // behaviour is byte-identical to before. `current_height` here is the
+    // dag block_count = the height the next block will carry, matching the
+    // D3 miner's `euvm_active(h + 1)` guard.
+    #[cfg(feature = "euvm")]
+    if crate::euvm::euvm_active(current_height) {
+        if let Some(fee) = rpc::euvm_admit_tx_standalone(tx, &lookup)? {
+            return Ok(fee);
+        }
+    }
+
     validate_tx_inputs(tx, &lookup, None)
 }
 // v0.2.0 PoI
@@ -3787,6 +3806,79 @@ mod euvm_hook_tests {
         assert_eq!(fee, 5);
         assert!(gas_used > 0, "VM execution must consume gas");
         assert!(spent.contains(&(spend.inputs[0].prev_txid, 0)));
+    }
+
+    /// D6 — mempool admission mirrors block acceptance: over the SAME store,
+    /// the SAME contract spend is judged identically by the D2 hook
+    /// (`validate_tx_in_block_euvm`) and by the standalone admission mirror
+    /// both gated call sites use (`rpc::euvm_admit_tx_standalone`), for the
+    /// valid and the invalid variant alike. Admission returns the FULL fee
+    /// the tx pays; acceptance credits the post-burn miner share of that
+    /// same fee.
+    #[test]
+    fn admission_matches_acceptance() {
+        let (_tmp, store) = mk_store();
+        let (program, preimage) = hashlock();
+
+        // Confirm the funding output in the store: the block context and the
+        // mempool's confirmed-UTXO lookup then resolve the SAME prevout.
+        let funding = funding_tx(vec![tagged_out(100, &program)]);
+        store.put_utxo(&funding.txid(), 0, &funding.outputs[0]).expect("seed utxo");
+
+        let mut spend = core::Transaction {
+            version: 1,
+            inputs: vec![core::TxInput {
+                prev_txid: funding.txid(), prev_index: 0,
+                script_sig: vec![], sequence: u32::MAX,
+            }],
+            outputs: vec![core::TxOutput { value: 90, script_pubkey: vec![5u8; 20] }],
+            locktime: 0,
+        };
+        spend.inputs[0].script_sig = encode_input_witness(&EuWitness {
+            validator: program.clone(),
+            redeemer: vec![Val::Bytes(preimage.clone())],
+        });
+
+        let lookup = |txid: &[u8; 32], idx: u32| -> Result<Option<core::TxOutput>, String> {
+            store.get_utxo(txid, idx).map_err(|e| e.to_string())
+        };
+
+        // Valid spend: both paths accept. Admission fee is pre-burn (what
+        // the tx pays); acceptance credits the post-burn miner share.
+        let block = mk_block(vec![coinbase(), spend.clone()]);
+        let mut spent = HashSet::new();
+        let mut gas = 0u64;
+        let accepted_fee = validate_tx_in_block_euvm(
+            &block, &spend, &store, &mut spent, 0,
+            EUVM_PER_TX_GAS, EUVM_BLOCK_GAS, &mut gas,
+        ).expect("D2 hook must accept the valid spend");
+        let admitted_fee = rpc::euvm_admit_tx_standalone(&spend, &lookup)
+            .expect("admission must accept the valid spend")
+            .expect("must be routed as a VM tx");
+        assert_eq!(admitted_fee, 10, "full pre-burn fee = 100 - 90");
+        assert_eq!(
+            accepted_fee,
+            bloch_euvm::fee_burn(admitted_fee, EUVM_BURN_BPS).1,
+            "acceptance credits the post-burn share of the admitted fee"
+        );
+
+        // Invalid variant (wrong preimage): both paths reject, with the
+        // IDENTICAL error — admission == acceptance by construction.
+        let mut bad = spend.clone();
+        bad.inputs[0].script_sig = encode_input_witness(&EuWitness {
+            validator: program,
+            redeemer: vec![Val::Bytes(b"wrong-preimage".to_vec())],
+        });
+        let bad_block = mk_block(vec![coinbase(), bad.clone()]);
+        let mut spent2 = HashSet::new();
+        let mut gas2 = 0u64;
+        let acc_err = validate_tx_in_block_euvm(
+            &bad_block, &bad, &store, &mut spent2, 0,
+            EUVM_PER_TX_GAS, EUVM_BLOCK_GAS, &mut gas2,
+        ).unwrap_err();
+        let adm_err = rpc::euvm_admit_tx_standalone(&bad, &lookup).unwrap_err();
+        assert_eq!(acc_err, adm_err, "both paths must reject identically");
+        assert!(acc_err.contains("validator rejected"), "got: {acc_err}");
     }
 
     /// Wrong preimage, wrong revealed program, and garbage witness bytes are

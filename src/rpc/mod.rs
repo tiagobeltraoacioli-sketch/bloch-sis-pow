@@ -1372,6 +1372,26 @@ fn validate_tx_for_mempool(tx: &Transaction, store: &Arc<Storage>, current_heigh
         store.get_coinbase_height(txid).ok().flatten()
     })?;
 
+    // ── eUTXO VM admission (D6, feature `euvm`) ──────────────────────────
+    // Height-gated exactly like accept_block's D2 hook (D4's plain height
+    // gate; callers pass `current_height` = dag block_count = the height the
+    // next block will carry, matching the D3 miner's `euvm_active(h + 1)`
+    // guard). VM-touching txs route through the SAME `validate_node_tx` /
+    // `EUVM_PER_TX_GAS` as block validation, so admission accepts exactly
+    // what acceptance would; pure-legacy txs return `None` and fall through
+    // to the UNCHANGED path below. Gate closed — or feature off, in which
+    // case this block does not exist in the build — behaviour is
+    // byte-identical to before.
+    #[cfg(feature = "euvm")]
+    if crate::euvm::euvm_active(current_height) {
+        let lookup = |txid: &[u8; 32], idx: u32| -> Result<Option<crate::core::TxOutput>, String> {
+            store.get_utxo(txid, idx).map_err(|e| e.to_string())
+        };
+        if let Some(fee) = euvm_admit_tx_standalone(tx, &lookup)? {
+            return Ok(fee);
+        }
+    }
+
     let mut total_in = 0u64;
     for (i, inp) in tx.inputs.iter().enumerate() {
         let utxo = store.get_utxo(&inp.prev_txid, inp.prev_index)
@@ -1391,6 +1411,115 @@ fn validate_tx_for_mempool(tx: &Transaction, store: &Arc<Storage>, current_heigh
         .ok_or_else(|| "output sum overflow".to_string())?;
     if total_in < total_out { return Err("inputs < outputs".into()); }
     Ok(total_in - total_out)
+}
+
+/// eUTXO VM mempool-admission routing (D6, feature `euvm`) — the ONE shared
+/// standalone-tx mirror of the accept_block hook (D2,
+/// `validate_tx_in_block_euvm` in main.rs), called from BOTH admission paths:
+/// `validate_tx_for_mempool` above (RPC `sendrawtransaction`) and
+/// `validate_tx_standalone` in main.rs (gossip relay). Callers gate on
+/// `crate::euvm::euvm_active(height)` and have already run the coinbase
+/// maturity check (same single source of truth as D2's step (d)); coinbase
+/// txs never reach here (both callers reject them earlier).
+///
+/// Mirrors D2 step by step — same routing predicate, same
+/// `crate::euvm::validate_node_tx` entrypoint, same
+/// `crate::euvm::EUVM_PER_TX_GAS` ceiling — with ONE structural difference:
+/// prevouts resolve against the CONFIRMED UTXO set only (`lookup`), never
+/// against unconfirmed mempool outputs (matches D5's builder; a tx chaining
+/// off an unconfirmed parent is simply not admitted yet).
+///
+/// (a) strict-output tightening: EVERY output (legacy txs included) must
+///     strictly decode as legacy P2PKH or a valid tagged eUTXO script —
+///     identical to D2's fail-closed G3 rule, so a malformed-output legacy
+///     tx can no longer sit unminable in the mempool;
+/// (b) resolve prevouts via `lookup`;
+/// (c) classify with D2's EXACT predicate — VM tx iff ANY output is tagged,
+///     OR every prevout resolved AND ANY of them is tagged. Pure-legacy →
+///     `Ok(None)`: the caller runs the UNCHANGED legacy path (which also
+///     reproduces the canonical "UTXO not found" error for unresolved
+///     legacy inputs);
+/// (e) intra-tx double-spend — D2's `spent_in_block` insert-as-check,
+///     restricted to this single tx (block-level cross-tx conflicts are by
+///     definition out of standalone scope);
+/// (f) witnesses per the pinned wire format (`decode_input_witnesses`);
+/// (g) the VM pass: `validate_node_tx` under `EUVM_PER_TX_GAS`. (The
+///     block-wide `EUVM_BLOCK_GAS` ceiling is a packing concern: any tx
+///     within the per-tx ceiling fits an otherwise-empty block, and the D3
+///     miner mirror enforces the block ceiling when templating.)
+///
+/// Returns `Ok(Some(fee))` for an admitted VM tx — the FULL fee the tx pays
+/// (pre-burn: the `EUVM_BURN_BPS` split is a coinbase-crediting rule applied
+/// at block level by D2/D3, not a property of the tx, and the mempool fee
+/// field feeds relay/ordering, not the coinbase). `Ok(None)` = not a VM tx,
+/// caller continues unchanged. `Err` = reject, do not admit or relay.
+#[cfg(feature = "euvm")]
+pub(crate) fn euvm_admit_tx_standalone(
+    tx: &Transaction,
+    lookup: &dyn Fn(&[u8; 32], u32) -> Result<Option<crate::core::TxOutput>, String>,
+) -> Result<Option<u64>, String> {
+    // (a) Strict-output tightening — same rule, same error text as D2 (a).
+    for (oi, o) in tx.outputs.iter().enumerate() {
+        crate::euvm::decode_output(o)
+            .map_err(|e| format!("euvm: tx output {} invalid: {}", oi, e))?;
+    }
+
+    // (b) Resolve prevouts from the CONFIRMED UTXO set (mempool shape of
+    // D2 (b), which additionally overlays the block's own outputs).
+    let mut prevouts: Vec<crate::core::TxOutput> = Vec::with_capacity(tx.inputs.len());
+    let mut unresolved: Option<usize> = None;
+    for (i, inp) in tx.inputs.iter().enumerate() {
+        match lookup(&inp.prev_txid, inp.prev_index)? {
+            Some(u) => prevouts.push(u),
+            None    => { unresolved = Some(i); break; }
+        }
+    }
+
+    // (c) Classify — D2's EXACT routing predicate (verbatim).
+    let vm_tx =
+        tx.outputs.iter().any(|o| crate::euvm::is_eutxo_script(&o.script_pubkey))
+        || (unresolved.is_none()
+            && prevouts.iter().any(|p| crate::euvm::is_eutxo_script(&p.script_pubkey)));
+    if !vm_tx {
+        return Ok(None);
+    }
+    if let Some(i) = unresolved {
+        let inp = &tx.inputs[i];
+        return Err(format!("UTXO {}:{} not found",
+            hex::encode(&inp.prev_txid[..8]), inp.prev_index));
+    }
+
+    // (e) Intra-tx double-spend — D2's insert-as-check over one tx.
+    {
+        let mut seen: std::collections::HashSet<([u8; 32], u32)> = std::collections::HashSet::new();
+        for inp in &tx.inputs {
+            if !seen.insert((inp.prev_txid, inp.prev_index)) {
+                return Err(format!("double-spend: {}:{} already consumed",
+                    hex::encode(&inp.prev_txid[..8]), inp.prev_index));
+            }
+        }
+    }
+
+    // (f) Witnesses per the pinned wire format (prevout-type driven).
+    let witnesses = crate::euvm::decode_input_witnesses(tx, &prevouts)
+        .map_err(|e| format!("euvm: {}", e))?;
+
+    // (g) The VM pass — same entrypoint, same per-tx gas constant as D2 (g).
+    crate::euvm::validate_node_tx(
+        tx, &prevouts, &witnesses, crate::core::node_chain_id(), crate::euvm::EUVM_PER_TX_GAS,
+    ).map_err(|e| format!("euvm: tx invalid: {}", e))?;
+
+    // Fee = inputs − outputs (checked; the mapper already proved out ≤ in).
+    let total_in: u64 = prevouts.iter()
+        .try_fold(0u64, |acc, p| acc.checked_add(p.value))
+        .ok_or("input overflow")?;
+    let total_out: u64 = tx.outputs.iter()
+        .try_fold(0u64, |acc, o| acc.checked_add(o.value))
+        .ok_or("output sum overflow")?;
+    if total_in < total_out {
+        return Err(format!("inputs {} < outputs {}", total_in, total_out));
+    }
+    Ok(Some(total_in - total_out))
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1416,4 +1545,179 @@ fn format_hashrate(hs: f64) -> String {
         }
     }
     format!("{:.2} H/s", hs)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// D6 — eUTXO mempool-admission tests.
+//
+// Same rationale as main.rs `euvm_hook_tests`: the D4 gate reads
+// `core::node_chain_id()` (process-global, u64::MAX sentinel outside
+// Genesis-3), so these tests exercise `euvm_admit_tx_standalone` DIRECTLY —
+// the exact code both gated call sites (`validate_tx_for_mempool` here,
+// `validate_tx_standalone` in main.rs) dispatch to when the gate is open.
+// Gate-closed byte-identity is covered by the untouched legacy tests plus
+// the feature-off build. Admission↔acceptance parity against the real D2
+// hook is asserted in main.rs `euvm_hook_tests::admission_matches_acceptance`.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(all(test, feature = "euvm"))]
+mod euvm_admission_tests {
+    use super::*;
+    use crate::core::{TxInput, TxOutput};
+    use crate::euvm::{encode_eutxo_script, encode_input_witness, EuWitness, EutxoScript};
+    use bloch_euvm::{validator_hash, Op, Val, Value};
+    use std::collections::HashMap;
+
+    /// SHA-256d hashlock: spend by revealing the preimage in the redeemer.
+    fn hashlock() -> (Vec<Op>, Vec<u8>) {
+        use sha2::{Digest as _, Sha256};
+        let preimage = b"d6-admission-secret".to_vec();
+        let lock = Sha256::digest(Sha256::digest(&preimage)).to_vec();
+        (vec![Op::Sha256d, Op::PushBytes(lock), Op::Eq], preimage)
+    }
+
+    fn tagged_out(value: u64, program: &[Op]) -> TxOutput {
+        TxOutput {
+            value,
+            script_pubkey: encode_eutxo_script(&EutxoScript {
+                validator_hash: validator_hash(program),
+                datum: Val::Int(0),
+                assets: Value::new(),
+            }).expect("encode"),
+        }
+    }
+
+    /// Confirmed-UTXO lookup over a plain map — the same closure shape both
+    /// call sites build over `store.get_utxo`.
+    fn lookup_of(
+        map: HashMap<([u8; 32], u32), TxOutput>,
+    ) -> impl Fn(&[u8; 32], u32) -> Result<Option<TxOutput>, String> {
+        move |txid, idx| Ok(map.get(&(*txid, idx)).cloned())
+    }
+
+    fn spend_tx(prev_txid: [u8; 32], out: TxOutput, script_sig: Vec<u8>) -> Transaction {
+        Transaction {
+            version: 1,
+            inputs: vec![TxInput { prev_txid, prev_index: 0, script_sig, sequence: u32::MAX }],
+            outputs: vec![out],
+            locktime: 0,
+        }
+    }
+
+    fn legacy_out(value: u64) -> TxOutput {
+        TxOutput { value, script_pubkey: vec![5u8; 20] }
+    }
+
+    fn witness_bytes(program: &[Op], redeemer: Vec<Val>) -> Vec<u8> {
+        encode_input_witness(&EuWitness { validator: program.to_vec(), redeemer })
+    }
+
+    /// A valid contract spend (the shape `euvm_buildtx` emits) is admitted,
+    /// with the FULL (pre-burn) fee returned for mempool ordering.
+    #[test]
+    fn valid_contract_tx_admitted() {
+        let (program, preimage) = hashlock();
+        let lookup = lookup_of(HashMap::from([(([7u8; 32], 0u32), tagged_out(100, &program))]));
+        let tx = spend_tx([7u8; 32], legacy_out(90),
+                          witness_bytes(&program, vec![Val::Bytes(preimage)]));
+        let fee = euvm_admit_tx_standalone(&tx, &lookup)
+            .expect("valid contract spend must be admitted");
+        assert_eq!(fee, Some(10), "full pre-burn fee = 100 - 90");
+    }
+
+    /// Bad witnesses are deterministic rejections: wrong preimage (validator
+    /// says no) and garbage bytes (typed strict-decode failure).
+    #[test]
+    fn bad_witness_rejected() {
+        let (program, _) = hashlock();
+        let map = HashMap::from([(([7u8; 32], 0u32), tagged_out(100, &program))]);
+
+        let wrong = spend_tx([7u8; 32], legacy_out(90),
+                             witness_bytes(&program, vec![Val::Bytes(b"wrong-preimage".to_vec())]));
+        let err = euvm_admit_tx_standalone(&wrong, &lookup_of(map.clone())).unwrap_err();
+        assert!(err.contains("validator rejected"), "got: {err}");
+
+        let garbage = spend_tx([7u8; 32], legacy_out(90), vec![0xDE, 0xAD]);
+        let err2 = euvm_admit_tx_standalone(&garbage, &lookup_of(map)).unwrap_err();
+        assert!(err2.contains("witness decode failed"), "got: {err2}");
+    }
+
+    /// BLCH inflation (outputs > inputs) is rejected inside the VM pass.
+    #[test]
+    fn value_inflation_rejected() {
+        let (program, preimage) = hashlock();
+        let lookup = lookup_of(HashMap::from([(([7u8; 32], 0u32), tagged_out(100, &program))]));
+        let tx = spend_tx([7u8; 32], legacy_out(150),
+                          witness_bytes(&program, vec![Val::Bytes(preimage)]));
+        let err = euvm_admit_tx_standalone(&tx, &lookup).unwrap_err();
+        assert!(err.contains("euvm"), "must be a VM-path rejection, got: {err}");
+    }
+
+    /// Pure-legacy txs return `Ok(None)` — the caller's UNCHANGED legacy path
+    /// does all validation (note the junk script_sig is NOT rejected here),
+    /// whether the prevout resolves or not (unresolved legacy reproduces the
+    /// canonical "UTXO not found" on the legacy path, exactly like D2).
+    #[test]
+    fn pure_legacy_falls_through_unchanged() {
+        let resolved = lookup_of(HashMap::from([(([7u8; 32], 0u32), legacy_out(100))]));
+        let tx = spend_tx([7u8; 32], legacy_out(90), vec![0xDE, 0xAD]);
+        assert_eq!(euvm_admit_tx_standalone(&tx, &resolved), Ok(None));
+
+        let unresolved = lookup_of(HashMap::new());
+        assert_eq!(euvm_admit_tx_standalone(&tx, &unresolved), Ok(None));
+    }
+
+    /// D2 predicate, output arm: a tagged OUTPUT makes a tx a VM tx even when
+    /// every input is legacy — it must NOT fall through (here the malformed
+    /// legacy script_sig fails the mapper's legacy arm, fail-closed).
+    #[test]
+    fn tagged_output_routes_through_vm() {
+        let (program, _) = hashlock();
+        let lookup = lookup_of(HashMap::from([(([7u8; 32], 0u32), legacy_out(100))]));
+        let tx = spend_tx([7u8; 32], tagged_out(90, &program), vec![0xDE, 0xAD]);
+        let res = euvm_admit_tx_standalone(&tx, &lookup);
+        assert!(matches!(res, Err(_)), "VM tx must not fall through: {res:?}");
+    }
+
+    /// A VM tx with an unresolved prevout is rejected with the canonical
+    /// "UTXO not found" error (D2's exact behaviour).
+    #[test]
+    fn unresolved_vm_tx_rejected() {
+        let (program, _) = hashlock();
+        let tx = spend_tx([7u8; 32], tagged_out(90, &program), vec![]);
+        let err = euvm_admit_tx_standalone(&tx, &lookup_of(HashMap::new())).unwrap_err();
+        assert!(err.contains("not found"), "got: {err}");
+    }
+
+    /// Spending the same outpoint twice within one tx is rejected (D2's
+    /// spent_in_block insert-as-check, restricted to a single tx).
+    #[test]
+    fn intra_tx_double_spend_rejected() {
+        let (program, preimage) = hashlock();
+        let lookup = lookup_of(HashMap::from([(([7u8; 32], 0u32), tagged_out(100, &program))]));
+        let w = witness_bytes(&program, vec![Val::Bytes(preimage)]);
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![
+                TxInput { prev_txid: [7u8; 32], prev_index: 0, script_sig: w.clone(), sequence: u32::MAX },
+                TxInput { prev_txid: [7u8; 32], prev_index: 0, script_sig: w, sequence: u32::MAX },
+            ],
+            outputs: vec![legacy_out(90)],
+            locktime: 0,
+        };
+        let err = euvm_admit_tx_standalone(&tx, &lookup).unwrap_err();
+        assert!(err.contains("double-spend"), "got: {err}");
+    }
+
+    /// D2 (a) strict-output tightening applies at admission too: a tx whose
+    /// output strictly decodes as neither legacy P2PKH nor tagged eUTXO is
+    /// rejected even if it is otherwise legacy — it could never be mined.
+    #[test]
+    fn malformed_output_rejected() {
+        let lookup = lookup_of(HashMap::from([(([7u8; 32], 0u32), legacy_out(100))]));
+        let tx = spend_tx([7u8; 32],
+                          TxOutput { value: 90, script_pubkey: vec![0u8; 21] },
+                          vec![0xDE, 0xAD]);
+        let err = euvm_admit_tx_standalone(&tx, &lookup).unwrap_err();
+        assert!(err.contains("output 0 invalid"), "got: {err}");
+    }
 }
