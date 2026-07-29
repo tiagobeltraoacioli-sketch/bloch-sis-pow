@@ -52,10 +52,11 @@ use super::{is_eutxo_script, validate_node_block, EuWitness, EUVM_BURN_BPS};
 // 2000-tx template of typical 1–2-input txs (~5M) an order of magnitude below
 // the ceiling while still capping adversarial blocks deterministically.
 
-/// Per-transaction gas ceiling — MUST equal the acceptor's (see PMO-DEDUP above).
-pub const EUVM_PER_TX_GAS: u64 = 4_000_000;
-/// Block-wide gas ceiling — MUST equal the acceptor's (see PMO-DEDUP above).
-pub const EUVM_BLOCK_GAS: u64 = 40_000_000;
+// PMO-RECONCILED: the gas ceilings are the acceptor's (D2) values — a single
+// source of truth at the crate root — so miner and validator agree by
+// construction. Canonical = 2_000_000 / 8_000_000 (DoS/IBD-conservative; still
+// covers the ~1.4M max-input legacy tx). Do NOT redefine here.
+use super::{EUVM_PER_TX_GAS, EUVM_BLOCK_GAS};
 
 // ── Witness wire codec (pinned by PMO) ────────────────────────────────────────
 //

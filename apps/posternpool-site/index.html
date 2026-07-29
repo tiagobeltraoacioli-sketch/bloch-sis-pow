@@ -1,0 +1,455 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="color-scheme" content="dark light" />
+<title>Postern Pool — Bloch SHA-256d mining</title>
+<meta name="description" content="Postern Pool — a non-custodial SHA-256d mining pool for Bloch, the post-quantum, pure-proof-of-work base chain. Point any Bitcoin ASIC, GPU, or CPU at it and mine to your own bloch1q… address." />
+<link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+<meta property="og:title" content="Postern Pool — Bloch SHA-256d mining" />
+<meta property="og:description" content="Non-custodial SHA-256d pool for Bloch. Same hashing as Bitcoin — mine to your own address. Do povo, para o povo." />
+<meta property="og:type" content="website" />
+
+<style>
+/* ---- @font-face — same-origin subset woff2 (OFL 1.1) --------------------- */
+@font-face{font-family:"Fraunces";font-style:normal;font-weight:600;font-display:swap;src:url("/brand/fonts/Fraunces-SemiBold.subset.woff2") format("woff2");}
+@font-face{font-family:"JetBrains Mono";font-style:normal;font-weight:400;font-display:swap;src:url("/brand/fonts/JetBrainsMono-Regular.subset.woff2") format("woff2");}
+@font-face{font-family:"JetBrains Mono";font-style:normal;font-weight:500;font-display:swap;src:url("/brand/fonts/JetBrainsMono-Medium.subset.woff2") format("woff2");}
+
+/* ============================  DARK (default)  ============================ */
+:root{
+  --font-ui:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+  --font-mono:"JetBrains Mono",ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+  --font-display:"Fraunces",ui-serif,Georgia,"Times New Roman",serif;
+
+  --bg:#0C111A;--bg-glow:#171D26;--bg-deep:#070A11;
+  --surface:#12161F;--surface-2:#171D28;--surface-3:#1E2532;--panel:#10151F;
+  --border:#232B36;--border-hi:#37424F;--line:#242C37;--line-soft:#1A222C;
+
+  --text:#E3E7EA;--text-dim:#9AA7B4;--muted:#6B7787;
+  --ink-hi:var(--text);--ink-body:var(--text-dim);--ink-caption:var(--muted);
+
+  --brass:#D2955C;--brass-hi:#E0A870;--brass-deep:#B87740;--brass-dim:#8F6238;
+  --brass-ink:#140D05;--brass-glow:rgba(210,149,92,.14);
+  --accent:#D2955C;--link:#D2955C;--link-hover:#E0A870;
+
+  --ok:#8FB99A;--danger:#E0736A;--warn-bg:#1C140A;--warn-bord:#5A4620;
+
+  --fs-eyebrow:0.82rem;
+  --fs-h1:clamp(2.4rem,1.3rem + 4.2vw,4.2rem);
+  --fs-h2:clamp(1.7rem,1.2rem + 2.2vw,2.6rem);
+  --fs-h3:1.18rem;
+  --fs-lede:clamp(1.06rem,0.98rem + 0.5vw,1.24rem);
+  --fs-body:1.02rem;--fs-caption:0.82rem;
+  --lh-tight:1.04;--lh-snug:1.18;--lh-body:1.62;
+  --tracking-eyebrow:0.26em;--tracking-wordmark:0.02em;
+  --section-y:clamp(3.5rem,2.5rem + 5vw,6.5rem);
+  --stack-1:0.5rem;--stack-2:1.4rem;--col-gap:clamp(2.5rem,1rem + 6vw,6rem);
+  color-scheme:dark light;
+}
+@media (prefers-color-scheme:light){
+  :root{
+    --bg:#F3F6FA;--bg-glow:#FBFCFE;--bg-deep:#E6ECF3;
+    --surface:#FFFFFF;--surface-2:#EEF2F7;--surface-3:#E1E8F1;--panel:#FFFFFF;
+    --border:#D2DBE5;--border-hi:#A9B8C8;--line:#D2DBE4;--line-soft:#E3E9F0;
+    --text:#131A24;--text-dim:#46566A;--muted:#66748A;
+    --brass:#A8652E;--brass-hi:#B87740;--brass-deep:#8A5528;--brass-dim:#A9763F;
+    --brass-ink:#FFF7EE;--brass-glow:rgba(168,101,46,.12);
+    --accent:#A8652E;--link:#A8652E;--link-hover:#8A5528;
+    --ok:#3C7A4C;--danger:#B23830;--warn-bg:#FBF3E7;--warn-bord:#C9A06A;
+  }
+}
+
+*{box-sizing:border-box;}
+html{scroll-behavior:smooth;}
+body{
+  margin:0;
+  background:
+    radial-gradient(120% 80% at 50% -10%,var(--bg-glow) 0%,transparent 60%),
+    linear-gradient(180deg,var(--bg) 0%,var(--bg-deep) 100%);
+  background-color:var(--bg);background-attachment:fixed;
+  color:var(--ink-body);font-family:var(--font-ui);font-size:var(--fs-body);
+  line-height:var(--lh-body);-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;
+}
+a{color:var(--link);text-decoration:none;text-decoration-color:color-mix(in srgb,var(--link) 45%,transparent);}
+a:hover{color:var(--link-hover);text-decoration:underline;}
+
+.wrap{width:100%;max-width:1080px;margin:0 auto;padding:0 clamp(1rem,3vw,2.4rem);}
+section{padding:var(--section-y) 0;}
+section + section{border-top:1px solid var(--line-soft);}
+
+/* ---- mark ---- */
+.postern-mark{display:inline-block;line-height:0;color:var(--brass);}
+.postern-mark svg{display:block;width:100%;height:100%;}
+
+/* ---- wordmark ---- */
+.wordmark{font-family:var(--font-display);font-weight:600;font-size:1.3rem;letter-spacing:var(--tracking-wordmark);line-height:1;white-space:nowrap;text-transform:lowercase;}
+.wordmark .wm-postern{color:var(--ink-hi);}
+.wordmark .wm-mid{color:var(--brass);padding:0 .14em;}
+.wordmark .wm-labs{color:var(--brass);}
+
+/* ---- header ---- */
+.postern-header{position:sticky;top:0;z-index:50;backdrop-filter:blur(14px);
+  background:color-mix(in srgb,var(--bg) 82%,transparent);
+  display:flex;align-items:center;justify-content:space-between;gap:1.5rem;
+  padding:.85rem clamp(1rem,3vw,2.4rem);border-bottom:1px solid var(--line-soft);}
+.wordmark-lockup{display:inline-flex;align-items:center;gap:.7rem;text-decoration:none;}
+.wordmark-lockup:hover{text-decoration:none;}
+.wordmark-lockup .postern-mark{width:32px;height:32px;}
+.header-nav{display:flex;gap:.4rem;font-family:var(--font-mono);font-size:.78rem;letter-spacing:.08em;text-transform:uppercase;}
+.header-nav a{color:var(--ink-caption);padding:.4rem .6rem;border-radius:7px;}
+.header-nav a:hover{color:var(--ink-hi);background:var(--surface-2);text-decoration:none;}
+@media (max-width:640px){.header-nav{display:none;}}
+
+/* ---- eyebrow ---- */
+.kicker{display:inline-flex;align-items:center;gap:.6em;margin:0 0 var(--stack-1);
+  font-family:var(--font-mono);font-weight:500;font-size:var(--fs-eyebrow);line-height:1;
+  letter-spacing:var(--tracking-eyebrow);text-transform:uppercase;color:var(--brass);}
+.kicker::before{content:"";flex:0 0 auto;width:.44em;height:.44em;border-radius:50%;
+  background:var(--brass);box-shadow:0 0 0 .18em var(--brass-glow);}
+
+/* ---- headlines ---- */
+h1,.h1{margin:0 0 var(--stack-2);font-family:var(--font-display);font-weight:600;
+  font-size:var(--fs-h1);line-height:var(--lh-tight);letter-spacing:-0.006em;color:var(--ink-hi);text-wrap:balance;}
+h2{margin:0 0 var(--stack-2);font-family:var(--font-display);font-weight:600;
+  font-size:var(--fs-h2);line-height:var(--lh-snug);letter-spacing:-0.004em;color:var(--ink-hi);text-wrap:balance;}
+h3{font-family:var(--font-display);font-weight:600;font-size:var(--fs-h3);color:var(--ink-hi);margin:0 0 .5rem;}
+.brass{color:var(--brass-hi);}
+.lede{font-size:var(--fs-lede);color:var(--ink-body);max-width:46ch;}
+p{max-width:64ch;}
+
+.section-label{font-family:var(--font-mono);font-weight:500;font-size:.74rem;letter-spacing:.2em;
+  text-transform:uppercase;color:var(--brass);margin:0 0 1rem;}
+
+/* ---- hero ---- */
+.hero{display:grid;grid-template-columns:1fr auto;gap:var(--col-gap);align-items:center;padding-top:clamp(3rem,6vw,5rem);}
+.hero-art{width:clamp(150px,20vw,220px);aspect-ratio:1;filter:drop-shadow(0 0 40px var(--brass-glow));}
+@media (max-width:760px){.hero{grid-template-columns:1fr;}.hero-art{width:130px;order:-1;}}
+.hero .btns{display:flex;gap:.8rem;flex-wrap:wrap;margin-top:1.6rem;}
+
+/* ---- buttons ---- */
+.btn{display:inline-flex;align-items:center;gap:.55em;font-family:var(--font-mono);font-weight:500;
+  font-size:.9rem;letter-spacing:.04em;padding:.7em 1.2em;border-radius:8px;border:1px solid var(--border-hi);
+  color:var(--ink-hi);background:var(--surface-2);text-decoration:none;cursor:pointer;
+  transition:background .15s,border-color .15s,color .15s;}
+.btn:hover{background:var(--surface-3);border-color:var(--brass);text-decoration:none;}
+.btn--primary{background:var(--brass);border-color:var(--brass);color:var(--brass-ink);}
+.btn--primary:hover{background:var(--brass-hi);border-color:var(--brass-hi);color:var(--brass-ink);}
+
+/* ---- cards ---- */
+.grid{display:grid;gap:1.1rem;}
+.grid-3{grid-template-columns:repeat(3,1fr);}
+.grid-2{grid-template-columns:repeat(2,1fr);}
+@media (max-width:760px){.grid-3,.grid-2{grid-template-columns:1fr;}}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:clamp(1.2rem,2vw,1.6rem);}
+.card:hover{border-color:var(--border-hi);}
+.card h3{font-size:1.05rem;}
+.card p{font-size:.94rem;color:var(--ink-body);margin:.4rem 0 0;}
+.card .num{font-family:var(--font-mono);color:var(--brass);font-size:.8rem;letter-spacing:.1em;}
+
+/* ---- connect / code ---- */
+.connect-panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:clamp(1.2rem,2.4vw,1.8rem);}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:.5rem 1.2rem;font-family:var(--font-mono);font-size:.9rem;align-items:center;}
+.kv dt{color:var(--muted);letter-spacing:.06em;text-transform:uppercase;font-size:.72rem;white-space:nowrap;}
+.kv dd{margin:0;color:var(--ink-hi);word-break:break-all;}
+.kv dd .val{color:var(--brass-hi);}
+@media (max-width:520px){.kv{grid-template-columns:1fr;gap:.1rem 0;}.kv dt{margin-top:.7rem;}}
+
+.warn{display:flex;gap:.8rem;align-items:flex-start;margin-top:1.4rem;padding:1rem 1.1rem;
+  background:var(--warn-bg);border:1px solid var(--warn-bord);border-radius:10px;}
+.warn .ic{flex:0 0 auto;color:var(--brass-hi);font-family:var(--font-mono);font-weight:700;font-size:1.1rem;line-height:1.3;}
+.warn strong{color:var(--brass-hi);}
+.warn p{margin:0;font-size:.92rem;color:var(--ink-body);max-width:none;}
+.warn code{color:var(--ink-hi);background:color-mix(in srgb,var(--brass) 12%,transparent);padding:.05em .35em;border-radius:4px;}
+
+.code-block{position:relative;margin:1rem 0 0;}
+.code-block .lbl{font-family:var(--font-mono);font-size:.7rem;letter-spacing:.16em;text-transform:uppercase;color:var(--muted);margin-bottom:.4rem;}
+pre{margin:0;background:var(--panel);border:1px solid var(--line);border-radius:10px;
+  padding:1rem 1.1rem;overflow-x:auto;font-family:var(--font-mono);font-size:.84rem;line-height:1.55;color:var(--ink-hi);}
+pre .cm{color:var(--muted);}
+pre .fl{color:var(--brass);}
+.copy-btn{position:absolute;top:1.7rem;right:.6rem;font-family:var(--font-mono);font-size:.66rem;
+  letter-spacing:.08em;text-transform:uppercase;background:var(--surface-2);border:1px solid var(--border);
+  color:var(--ink-caption);border-radius:6px;padding:.3em .6em;cursor:pointer;transition:all .15s;}
+.copy-btn:hover{color:var(--ink-hi);border-color:var(--brass);}
+
+/* ---- stats ---- */
+#stats{display:none;}
+.stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:1rem;margin-top:.5rem;}
+.stat{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.1rem 1.2rem;}
+.stat .lab{font-family:var(--font-mono);font-size:.68rem;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);}
+.stat .v{font-family:var(--font-mono);font-size:1.5rem;color:var(--brass-hi);margin-top:.35rem;line-height:1;}
+.stat .v.dim{color:var(--muted);font-size:1.1rem;}
+.stats-note{font-family:var(--font-mono);font-size:.74rem;color:var(--muted);margin-top:1rem;letter-spacing:.03em;}
+.soon-note{font-family:var(--font-mono);font-size:.82rem;color:var(--muted);letter-spacing:.04em;
+  border:1px dashed var(--border);border-radius:10px;padding:1rem 1.2rem;background:var(--surface);}
+
+/* ---- lists ---- */
+.why-list{list-style:none;padding:0;margin:1.2rem 0 0;display:grid;gap:1rem;}
+.why-list li{display:flex;gap:.9rem;align-items:flex-start;}
+.why-list .dot{flex:0 0 auto;width:.55em;height:.55em;margin-top:.55em;border-radius:50%;background:var(--brass);box-shadow:0 0 0 .16em var(--brass-glow);}
+.why-list p{margin:0;color:var(--ink-body);}
+.why-list b{color:var(--ink-hi);font-weight:600;}
+
+/* ---- footer ---- */
+.postern-footer{display:flex;align-items:flex-end;justify-content:space-between;gap:2rem;flex-wrap:wrap;
+  padding:var(--section-y) clamp(1rem,3vw,2.4rem) 2.4rem;border-top:1px solid var(--line-soft);color:var(--ink-caption);}
+.foot-left{max-width:52ch;}
+.foot-tagline{font-family:var(--font-mono);font-weight:500;font-size:var(--fs-caption);letter-spacing:.04em;color:var(--ink-caption);}
+.foot-disclaimer{font-size:.82rem;color:var(--muted);margin:.8rem 0 0;max-width:60ch;}
+.foot-links{display:flex;gap:1.2rem;font-family:var(--font-mono);font-size:.8rem;letter-spacing:.04em;margin:.8rem 0 0;flex-wrap:wrap;}
+.postern-footer .wordmark{font-size:1.1rem;}
+@media (max-width:560px){.postern-footer{flex-direction:column;align-items:flex-start;gap:1.4rem;}}
+</style>
+</head>
+
+<body>
+
+<header class="postern-header">
+  <a class="wordmark-lockup" href="/" aria-label="Postern Labs — home">
+    <span class="postern-mark" aria-hidden="true">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120">
+        <polygon points="60,14 104,92 16,92" fill="none" stroke="#D2955C" stroke-width="3" stroke-linejoin="round"/>
+        <line x1="60" y1="14" x2="60" y2="92" stroke="#3A4657" stroke-width="2"/>
+        <line x1="38" y1="53" x2="82" y2="53" stroke="#3A4657" stroke-width="2"/>
+        <circle cx="38" cy="92" r="4.5" fill="#D2955C"/>
+        <circle cx="60" cy="92" r="4.5" fill="#D2955C"/>
+        <circle cx="82" cy="92" r="4.5" fill="#D2955C"/>
+        <circle cx="60" cy="14" r="6" fill="#E0A870"/>
+      </svg>
+    </span>
+    <span class="wordmark"><span class="wm-postern">postern</span><span class="wm-mid">·</span><span class="wm-labs">labs</span></span>
+  </a>
+  <nav class="header-nav" aria-label="Sections">
+    <a href="#connect">Connect</a>
+    <a href="#why">Why</a>
+    <a href="#proxy">Proxy</a>
+    <a href="#stats">Stats</a>
+  </nav>
+</header>
+
+<main class="wrap">
+
+  <!-- ============ HERO ============ -->
+  <section class="hero" aria-labelledby="hero-title">
+    <div>
+      <p class="kicker">Postern Pool · Bloch mining</p>
+      <h1 id="hero-title">SHA-256d mining for the <span class="brass">post-quantum</span> base chain.</h1>
+      <p class="lede">Bloch hashes exactly like Bitcoin — double-SHA-256. Point any BTC ASIC, GPU, or CPU miner at Postern Pool and mine straight to your own <code style="font-family:var(--font-mono);color:var(--brass-hi)">bloch1q…</code> address. Non-custodial by construction: the pool never holds your coins.</p>
+      <div class="btns">
+        <a class="btn btn--primary" href="#connect">How to connect</a>
+        <a class="btn" href="#why">Why SHA-256d</a>
+      </div>
+    </div>
+    <span class="postern-mark hero-art" aria-hidden="true">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120">
+        <polygon points="60,14 104,92 16,92" fill="none" stroke="#D2955C" stroke-width="3" stroke-linejoin="round"/>
+        <line x1="60" y1="14" x2="60" y2="92" stroke="#3A4657" stroke-width="2"/>
+        <line x1="38" y1="53" x2="82" y2="53" stroke="#3A4657" stroke-width="2"/>
+        <circle cx="38" cy="92" r="4.5" fill="#D2955C"/>
+        <circle cx="60" cy="92" r="4.5" fill="#D2955C"/>
+        <circle cx="82" cy="92" r="4.5" fill="#D2955C"/>
+        <circle cx="60" cy="14" r="6" fill="#E0A870"/>
+      </svg>
+    </span>
+  </section>
+
+  <!-- ============ CONNECT ============ -->
+  <section id="connect" aria-labelledby="connect-title">
+    <p class="section-label">Connect a miner</p>
+    <h2 id="connect-title">Point hashrate at the pool</h2>
+    <p>Standard Stratum V1. Works with any SHA-256d miner. The one rule that trips people up: your username is your <b>bare</b> Bloch address — no worker suffix.</p>
+
+    <div class="connect-panel" style="margin-top:1.6rem">
+      <dl class="kv">
+        <dt>Pool URL</dt><dd><span class="val">stratum+tcp://stratum.posternpool.com:3336</span></dd>
+        <dt>Username</dt><dd>your own bare <span class="val">bloch1q…</span> address <span style="color:var(--muted)">— NO worker suffix</span></dd>
+        <dt>Password</dt><dd><span class="val">x</span> <span style="color:var(--muted)">(any value; ignored)</span></dd>
+        <dt>Algorithm</dt><dd><span class="val">sha256d</span></dd>
+      </dl>
+
+      <div class="warn" role="note">
+        <span class="ic" aria-hidden="true">&#9888;</span>
+        <p><strong>Do NOT append a worker name.</strong> The pool expects a <em>bare</em> address as the username. Sending <code>address.worker</code> is rejected with <code>invalid address: expected 48</code>. Use <code>bloch1q…</code> alone — nothing after it, no dot, no rig name.</p>
+      </div>
+    </div>
+
+    <div class="grid grid-2" style="margin-top:1.6rem">
+      <div>
+        <div class="code-block">
+          <div class="lbl">Bitcoin ASIC — Antminer / Whatsminer / Bitaxe (pool config)</div>
+          <button class="copy-btn" data-copy="asic">Copy</button>
+<pre id="cb-asic"><span class="cm"># In the miner's web UI, add a pool:</span>
+URL      <span class="fl">stratum+tcp://stratum.posternpool.com:3336</span>
+Worker   <span class="fl">bloch1qyour_own_address_here</span>   <span class="cm"># bare — NO .worker</span>
+Password <span class="fl">x</span></pre>
+        </div>
+      </div>
+      <div>
+        <div class="code-block">
+          <div class="lbl">GPU — ccminer</div>
+          <button class="copy-btn" data-copy="ccminer">Copy</button>
+<pre id="cb-ccminer"><span class="fl">ccminer</span> -a sha256d \
+  -o stratum+tcp://stratum.posternpool.com:3336 \
+  -u bloch1qyour_own_address_here \
+  -p x</pre>
+        </div>
+      </div>
+      <div>
+        <div class="code-block">
+          <div class="lbl">CPU — cpuminer / minerd</div>
+          <button class="copy-btn" data-copy="cpuminer">Copy</button>
+<pre id="cb-cpuminer"><span class="fl">minerd</span> -a sha256d \
+  -o stratum+tcp://stratum.posternpool.com:3336 \
+  -u bloch1qyour_own_address_here \
+  -p x</pre>
+        </div>
+      </div>
+      <div>
+        <div class="code-block">
+          <div class="lbl">Get an address first</div>
+          <button class="copy-btn" data-copy="addr">Copy</button>
+<pre id="cb-addr"><span class="cm"># From your Bloch node / wallet:</span>
+<span class="fl">bloch-cli</span> getnewaddress
+<span class="cm"># -> bloch1q…  (this is your -u username)</span>
+<span class="cm"># Rewards are paid to THIS address. Keep the key.</span></pre>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ WHY ============ -->
+  <section id="why" aria-labelledby="why-title">
+    <p class="section-label">Why SHA-256d</p>
+    <h2 id="why-title">Bitcoin-class hashrate, securing a <span class="brass">quantum-resistant</span> base.</h2>
+    <ul class="why-list">
+      <li><span class="dot" aria-hidden="true"></span><p><b>ASIC-honest by design.</b> Bloch uses the same double-SHA-256 as Bitcoin, so the enormous existing pool of SHA-256d ASICs can be pointed at it directly. No novel PoW to game, no hidden ASIC advantage — the honest incumbent hardware just works.</p></li>
+      <li><span class="dot" aria-hidden="true"></span><p><b>Proof-of-work, all the way down.</b> Coins don't vote; hashrate secures. Bloch is a pure-PoW, fair-launch base — the post-quantum signature layer sits on top of the same battle-tested mining economics that secure Bitcoin.</p></li>
+      <li><span class="dot" aria-hidden="true"></span><p><b>Decentralization is a verb.</b> Running a node and pointing hashrate at it is how the network spreads out. Do povo, para o povo — from the people, for the people. Every independent miner is one more root the base can't be pulled up by.</p></li>
+    </ul>
+  </section>
+
+  <!-- ============ PROXY TECH ============ -->
+  <section id="proxy" aria-labelledby="proxy-title">
+    <p class="section-label">Pool proxy tech</p>
+    <h2 id="proxy-title">Self-hostable. Non-custodial. Yours.</h2>
+    <p>Postern Pool runs on <code style="font-family:var(--font-mono);color:var(--brass-hi)">bloch-pool-proxy</code> — a lean Stratum front-end you can run yourself. Don't trust our pool? Run your own against your own node.</p>
+    <div class="grid grid-3" style="margin-top:1.4rem">
+      <div class="card"><span class="num">01</span><h3>Extranonce partitioning</h3><p>Each connection gets a distinct search space — many miners, no wasted or colliding work.</p></div>
+      <div class="card"><span class="num">02</span><h3>Vardiff</h3><p>Per-connection difficulty auto-tunes from a Bitaxe to a full ASIC farm, keeping share rates sane.</p></div>
+      <div class="card"><span class="num">03</span><h3>PPLNS payouts</h3><p>Pay-per-last-N-shares rewards sustained contribution and resists pool-hopping.</p></div>
+      <div class="card"><span class="num">04</span><h3>Non-custodial</h3><p>The block template pays your address directly. The proxy coordinates work — it never takes custody of coins.</p></div>
+      <div class="card"><span class="num">05</span><h3>Bring your own node</h3><p>Point the proxy at any Bloch node's RPC. No middleman between you and the chain.</p></div>
+      <div class="card"><span class="num">06</span><h3>Open by default</h3><p>Same Stratum V1 any BTC-class miner already speaks — nothing proprietary to install.</p></div>
+    </div>
+  </section>
+
+  <!-- ============ LIVE STATS (hidden until /rpc responds) ============ -->
+  <section id="stats" aria-labelledby="stats-title">
+    <p class="section-label">Live pool &amp; chain</p>
+    <h2 id="stats-title">Network status</h2>
+    <div class="stat-grid" id="stat-grid"></div>
+    <p class="stats-note" id="stats-note"></p>
+  </section>
+
+</main>
+
+<footer class="postern-footer">
+  <div class="foot-left">
+    <p class="foot-tagline">Math, applied. For life.</p>
+    <p class="foot-disclaimer">Genesis-2 is early-stage and evolving. Difficulty and rewards are still being tuned, and the chain is actively being stabilized. Non-custodial is real — you mine to your own address — but rewards are not guaranteed. Mine at your own discretion.</p>
+    <div class="foot-links">
+      <a href="https://explorer.posternpool.com">Explorer ↗</a>
+      <a href="#connect">Connect a miner</a>
+    </div>
+  </div>
+  <span class="wordmark"><span class="wm-postern">postern</span><span class="wm-mid">·</span><span class="wm-labs">labs</span></span>
+</footer>
+
+<script>
+// ---- copy buttons -------------------------------------------------------
+document.querySelectorAll('.copy-btn').forEach(function(b){
+  b.addEventListener('click', function(){
+    var pre = document.getElementById('cb-' + b.dataset.copy);
+    if(!pre) return;
+    navigator.clipboard.writeText(pre.innerText).then(function(){
+      var t = b.textContent; b.textContent = 'Copied'; setTimeout(function(){ b.textContent = t; }, 1400);
+    }).catch(function(){});
+  });
+});
+
+// ---- live stats (graceful) ---------------------------------------------
+// Probe /rpc. If BLOCH_RPC_URL isn't configured (503) or the node is
+// unreachable/stalled, keep the section hidden — no fabricated numbers.
+(function(){
+  var section = document.getElementById('stats');
+  var grid = document.getElementById('stat-grid');
+  var note = document.getElementById('stats-note');
+
+  function rpc(method, params){
+    return fetch('/rpc', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({jsonrpc:'2.0', id:1, method:method, params:params||[]})
+    }).then(function(r){
+      if(!r.ok) throw new Error('http ' + r.status);
+      return r.json();
+    }).then(function(j){
+      if(j.error) throw new Error(j.error.message || 'rpc error');
+      return j.result;
+    });
+  }
+
+  function fmt(n){
+    if(n === null || n === undefined || n === '') return null;
+    if(typeof n === 'number'){
+      if(n >= 1e12) return (n/1e12).toFixed(2)+'T';
+      if(n >= 1e9)  return (n/1e9).toFixed(2)+'G';
+      if(n >= 1e6)  return (n/1e6).toFixed(2)+'M';
+      if(n >= 1e3)  return (n/1e3).toFixed(2)+'K';
+      return String(n);
+    }
+    return String(n);
+  }
+
+  function pick(o){ for(var i=1;i<arguments.length;i++){ var k=arguments[i]; if(o && o[k]!=null) return o[k]; } return null; }
+
+  function cell(label, value){
+    var el = document.createElement('div');
+    el.className = 'stat';
+    var dim = (value == null);
+    el.innerHTML = '<div class="lab">'+label+'</div><div class="v'+(dim?' dim':'')+'">'+(dim?'—':value)+'</div>';
+    return el;
+  }
+
+  // getdaginfo is the broadest single read; fall back tolerantly.
+  Promise.allSettled([ rpc('getdaginfo'), rpc('gethashrate'), rpc('getpeers') ])
+    .then(function(res){
+      var dag = res[0].status==='fulfilled' ? res[0].value : null;
+      var hr  = res[1].status==='fulfilled' ? res[1].value : null;
+      var pr  = res[2].status==='fulfilled' ? res[2].value : null;
+
+      // If nothing came back at all, the RPC isn't live — stay hidden.
+      if(!dag && !hr && !pr) return;
+
+      var height = dag ? pick(dag,'blockCount','blockcount','tipHeight','height') : null;
+      var blue   = dag ? pick(dag,'blueScore','bluescore','virtualDaaScore') : null;
+      var diff   = dag ? pick(dag,'difficulty') : null;
+      var hashrate = (typeof hr === 'number' || typeof hr === 'string') ? hr : (hr ? pick(hr,'hashrate','hashesPerSecond') : null);
+      var miners = Array.isArray(pr) ? pr.length : (pr ? pick(pr,'connected','count') : null);
+
+      grid.appendChild(cell('Tip height', height!=null?fmt(Number(height)):null));
+      grid.appendChild(cell('Blue score', blue!=null?fmt(Number(blue)):null));
+      grid.appendChild(cell('Difficulty', diff!=null?fmt(Number(diff)):null));
+      grid.appendChild(cell('Network hashrate', hashrate!=null?(fmt(Number(hashrate))+' H/s'):null));
+      grid.appendChild(cell('Connected peers', miners!=null?fmt(Number(miners)):null));
+
+      note.textContent = 'Live from a read-only Bloch node · Genesis-2 · figures may be stalled while the chain is being stabilized.';
+      section.style.display = 'block';
+    })
+    .catch(function(){ /* stay hidden */ });
+})();
+</script>
+
+</body>
+</html>

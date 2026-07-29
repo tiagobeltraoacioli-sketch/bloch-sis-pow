@@ -1,0 +1,25 @@
+{
+  "name": "bloch-explorer",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "DAG-aware block explorer for the Bloch (GhostDAG-Q) chain — explorer.posternlabs.com",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "deploy": "CLOUDFLARE_ACCOUNT_ID=4e44d592d0229f8faa3fdb2f139c611c npx wrangler pages deploy dist --project-name bloch-explorer --branch main --commit-dirty=true"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.43",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.11"
+  }
+}

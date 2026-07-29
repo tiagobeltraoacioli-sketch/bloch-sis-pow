@@ -3016,18 +3016,11 @@ fn validate_tx_in_block_with_maturity(
 /// that, leaves generous room for real contracts (thousands of hash ops over
 /// ≤10 KB operands), and bounds a single adversarial tx to well under a
 /// second of CPU. Raising this is a consensus change.
+// PMO-RECONCILED: the gas ceilings are defined ONCE in the euvm module
+// (`crate::euvm`) so the bin (this hook) and the lib (the miner mirror + RPC)
+// share one source of truth. Re-exported here for the accept_block usages.
 #[cfg(feature = "euvm")]
-const EUVM_PER_TX_GAS: u64 = 2_000_000;
-
-/// Block-wide VM gas ceiling (consensus constant) — the block-level DoS bound.
-///
-/// 4× the per-tx ceiling: an adversarial block maxing this out costs ≈ 2.4 s
-/// of single-threaded VM CPU (8 M gas × ~0.3 µs/gas) — bounded and tolerable
-/// for 30 s blocks and IBD — while legitimate capacity (a full 1 MB block of
-/// PQ-signed spends needs < 200 k gas) has ~40× headroom. Raising this is a
-/// consensus change.
-#[cfg(feature = "euvm")]
-const EUVM_BLOCK_GAS: u64 = 8_000_000;
+use crate::euvm::{EUVM_PER_TX_GAS, EUVM_BLOCK_GAS};
 
 /// eUTXO-era coinbase rule: every coinbase output must be a legacy 20-byte
 /// P2PKH script. The VM pass (rightly) skips the coinbase — it spends nothing

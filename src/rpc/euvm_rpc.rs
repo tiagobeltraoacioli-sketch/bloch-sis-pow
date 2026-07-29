@@ -1042,7 +1042,7 @@ mod tests {
             CHAIN,
             0,
         )
-        .unwrap_err();
+        .err().expect("build must fail");
         assert!(err.contains("hashes to"), "got: {err}");
 
         // witness supplied for a legacy prevout → rejected
@@ -1057,7 +1057,7 @@ mod tests {
             CHAIN,
             0,
         )
-        .unwrap_err();
+        .err().expect("build must fail");
         assert!(err.contains("legacy"), "got: {err}");
 
         // keys supplied for a contract prevout → rejected
@@ -1072,7 +1072,7 @@ mod tests {
             CHAIN,
             0,
         )
-        .unwrap_err();
+        .err().expect("build must fail");
         assert!(err.contains("contract"), "got: {err}");
 
         // outputs exceed inputs → negative fee rejected
@@ -1087,7 +1087,7 @@ mod tests {
             CHAIN,
             0,
         )
-        .unwrap_err();
+        .err().expect("build must fail");
         assert!(err.contains("exceed"), "got: {err}");
     }
 
