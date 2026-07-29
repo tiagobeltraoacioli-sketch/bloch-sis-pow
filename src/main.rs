@@ -2322,7 +2322,44 @@ fn accept_block(
     };
     let mut spent_in_block: HashSet<([u8; 32], u32)> = HashSet::new();
     let mut total_fees: u64 = 0;
+
+    // ── eUTXO VM hook (D2, feature `euvm`) ───────────────────────────
+    // Height-gated by the D4 activation gate (plain deterministic height:
+    // 0 on Genesis-3 mainnet, u64::MAX sentinel elsewhere). When the gate
+    // is CLOSED — or the feature is off, in which case every cfg'd
+    // statement below does not exist — the loop is byte-identical to the
+    // legacy path. When OPEN:
+    //   * the coinbase must pay to legacy P2PKH outputs only (a tagged
+    //     coinbase output would mint native assets from nothing, because
+    //     the VM pass skips the coinbase);
+    //   * every non-coinbase tx goes through validate_tx_in_block_euvm,
+    //     which routes pure-legacy txs to the UNCHANGED legacy check and
+    //     VM-touching txs through the adapter (witnesses from script_sig,
+    //     per-input sighash + real PQ verifier, strict output decode,
+    //     non-BLCH conservation, per-tx + block gas ceilings, fee burn).
+    #[cfg(feature = "euvm")]
+    let euvm_on = crate::euvm::euvm_active(block.height);
+    #[cfg(feature = "euvm")]
+    let mut euvm_block_gas_used: u64 = 0;
+    #[cfg(feature = "euvm")]
+    if euvm_on {
+        euvm_check_coinbase_outputs(block)?;
+    }
+
     for tx in block.transactions.iter().skip(1) {
+        #[cfg(feature = "euvm")]
+        if euvm_on {
+            let fee = validate_tx_in_block_euvm(
+                block, tx, store, &mut spent_in_block, current_height,
+                EUVM_PER_TX_GAS, EUVM_BLOCK_GAS, &mut euvm_block_gas_used,
+            )?;
+            // `fee` is the miner-creditable remainder AFTER the eUTXO fee
+            // burn — validate_coinbase_value below therefore caps the miner
+            // output at subsidy + post-burn fees, which is what enforces
+            // the burn (the burned sats simply become unclaimable).
+            total_fees = total_fees.saturating_add(fee);
+            continue;
+        }
         let fee = validate_tx_in_block_with_maturity(
             block, tx, store, &mut spent_in_block, current_height
         )?;
@@ -2918,6 +2955,208 @@ fn validate_tx_in_block_with_maturity(
     validate_tx_inputs(tx, &lookup, Some(spent_in_block))
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// eUTXO VM consensus hook (D2, feature `euvm`) — helpers for accept_block.
+//
+// Everything here is compiled ONLY under `--features euvm` and reached ONLY
+// when `crate::euvm::euvm_active(block.height)` (D4's plain height gate:
+// active from h0 on Genesis-3 mainnet, inert u64::MAX sentinel elsewhere).
+// With the feature off, accept_block is byte-identical to the legacy node.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Per-transaction VM gas ceiling (consensus constant).
+///
+/// Sizing: gas is calibrated so one hybrid ML-DSA-65 ‖ Falcon-1024 signature
+/// verify = 1000 gas ≈ 0.3 ms, and byte-touching ops charge ~1 gas per 32-byte
+/// word. A legacy-mapped input (sighash push + two ~4–7 KB Pick copies + one
+/// VerifySig) costs ≈ 1300 gas; the largest tx that physically fits in a
+/// 1 MB block carries ~130 hybrid-signed inputs ≈ 170 k gas. 2 M gas is >10×
+/// that, leaves generous room for real contracts (thousands of hash ops over
+/// ≤10 KB operands), and bounds a single adversarial tx to well under a
+/// second of CPU. Raising this is a consensus change.
+#[cfg(feature = "euvm")]
+const EUVM_PER_TX_GAS: u64 = 2_000_000;
+
+/// Block-wide VM gas ceiling (consensus constant) — the block-level DoS bound.
+///
+/// 4× the per-tx ceiling: an adversarial block maxing this out costs ≈ 2.4 s
+/// of single-threaded VM CPU (8 M gas × ~0.3 µs/gas) — bounded and tolerable
+/// for 30 s blocks and IBD — while legitimate capacity (a full 1 MB block of
+/// PQ-signed spends needs < 200 k gas) has ~40× headroom. Raising this is a
+/// consensus change.
+#[cfg(feature = "euvm")]
+const EUVM_BLOCK_GAS: u64 = 8_000_000;
+
+/// eUTXO-era coinbase rule: every coinbase output must be a legacy 20-byte
+/// P2PKH script. The VM pass (rightly) skips the coinbase — it spends nothing
+/// — so a TAGGED coinbase output would enter the UTXO set with an arbitrary
+/// native-asset table, minting assets from nothing outside any conservation
+/// check. Fail closed. (This also rejects malformed coinbase scripts, closing
+/// the same strict-decode gap for the one tx the VM never sees. Miner payouts
+/// and the founder-vesting output are 20-byte P2PKH already, so no legitimate
+/// coinbase changes shape.)
+#[cfg(feature = "euvm")]
+fn euvm_check_coinbase_outputs(block: &core::Block) -> Result<(), String> {
+    if let Some(cb) = block.transactions.first() {
+        for (oi, o) in cb.outputs.iter().enumerate() {
+            if !crate::euvm::is_legacy_p2pkh_script(&o.script_pubkey) {
+                return Err(format!(
+                    "euvm: coinbase output {} must be a legacy 20-byte P2PKH script \
+                     (len {})", oi, o.script_pubkey.len(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate ONE non-coinbase transaction of `block` under eUTXO-active
+/// consensus. Returns the MINER-CREDITABLE fee (post-burn) in sats.
+///
+/// Routing (deterministic, prevout-driven):
+/// * **Pure-legacy tx** — no eUTXO-tagged prevout and no tagged output —
+///   delegates to [`validate_tx_in_block_with_maturity`] UNCHANGED (same
+///   signature rule, same errors, full fee to the miner, no gas), after the
+///   strict-output tightening below.
+/// * **VM tx** — any tagged prevout OR any tagged output — goes through the
+///   D1 adapter: witnesses decoded from `script_sig` per the pinned wire
+///   format, [`crate::euvm::validate_node_tx`] (strict decode, witness
+///   discipline, per-input sighash through the real PQ verifier, exact
+///   non-BLCH conservation, F2 resource ceilings) under the per-tx gas
+///   ceiling, plus the block-wide gas ceiling accumulated in
+///   `block_gas_used`. Its BLCH fee is then split by
+///   `bloch_euvm::fee_burn(fee, EUVM_BURN_BPS)`; only the miner share is
+///   returned. Tagged outputs created by all-legacy inputs are VM txs too —
+///   otherwise a legacy spend could mint native assets unchecked.
+///
+/// G3 strict-output tightening (adopted consciously, per D1's flags): every
+/// output of EVERY non-coinbase tx must strictly decode as either legacy
+/// 20-byte P2PKH or a valid tagged eUTXO script. Legacy consensus accepted
+/// any `script_pubkey` blob at creation; on the fresh Genesis-3 chain,
+/// malformed output scripts are invalid from h0.
+///
+/// The non-VM state checks mirror the legacy path exactly: same
+/// block-then-store prevout lookup (so in-block outputs are spendable), same
+/// `core::check_coinbase_maturity` single source of truth, same
+/// `spent_in_block` double-spend set (also catching intra-tx duplicates).
+#[cfg(feature = "euvm")]
+#[allow(clippy::too_many_arguments)]
+fn validate_tx_in_block_euvm(
+    block:          &core::Block,
+    tx:             &core::Transaction,
+    store:          &Arc<storage::Storage>,
+    spent_in_block: &mut HashSet<([u8; 32], u32)>,
+    current_height: u64,
+    per_tx_gas:     u64,
+    block_gas:      u64,
+    block_gas_used: &mut u64,
+) -> Result<u64, String> {
+    // (a) Strict-output tightening: every output must decode (fail-closed).
+    for (oi, o) in tx.outputs.iter().enumerate() {
+        crate::euvm::decode_output(o)
+            .map_err(|e| format!("euvm: tx output {} invalid: {}", oi, e))?;
+    }
+
+    // (b) Resolve prevouts through the SAME lookup as the legacy path:
+    // this block's own outputs first, then the persistent UTXO set.
+    let block_utxos: std::collections::HashMap<([u8; 32], u32), core::TxOutput> =
+        block.transactions
+            .iter()
+            .flat_map(|t| {
+                let txid = t.txid();
+                t.outputs.iter().enumerate()
+                    .map(move |(i, o)| ((txid, i as u32), o.clone()))
+            })
+            .collect();
+    let lookup = |txid: &[u8; 32], idx: u32| -> Result<Option<core::TxOutput>, String> {
+        if let Some(out) = block_utxos.get(&(*txid, idx)) {
+            return Ok(Some(out.clone()));
+        }
+        store.get_utxo(txid, idx).map_err(|e| e.to_string())
+    };
+    let mut prevouts: Vec<core::TxOutput> = Vec::with_capacity(tx.inputs.len());
+    let mut unresolved: Option<usize> = None;
+    for (i, inp) in tx.inputs.iter().enumerate() {
+        match lookup(&inp.prev_txid, inp.prev_index)? {
+            Some(u) => prevouts.push(u),
+            None    => { unresolved = Some(i); break; }
+        }
+    }
+
+    // (c) Classify. An unresolved prevout can never authorize a spend on
+    // either path; routing it to the legacy path (unless a tagged output
+    // forces the VM path) reproduces the canonical "UTXO not found" error.
+    let vm_tx =
+        tx.outputs.iter().any(|o| crate::euvm::is_eutxo_script(&o.script_pubkey))
+        || (unresolved.is_none()
+            && prevouts.iter().any(|p| crate::euvm::is_eutxo_script(&p.script_pubkey)));
+    if !vm_tx {
+        // Pure-legacy tx: the UNCHANGED consensus path (script_sig parse,
+        // SHA3-256(pk)[..20] binding, per-input PQ signature, maturity,
+        // double-spend, fee) — byte-identical semantics to the closed gate.
+        return validate_tx_in_block_with_maturity(
+            block, tx, store, spent_in_block, current_height,
+        );
+    }
+    if let Some(i) = unresolved {
+        let inp = &tx.inputs[i];
+        return Err(format!("UTXO {}:{} not found",
+            hex::encode(&inp.prev_txid[..8]), inp.prev_index));
+    }
+
+    // (d) Coinbase maturity — same single source of truth as the legacy path.
+    core::check_coinbase_maturity(tx, current_height, |txid| {
+        store.get_coinbase_height(txid).ok().flatten()
+    })?;
+
+    // (e) Double-spend within the block context (insert-as-check also
+    // catches a tx spending the same outpoint twice in its own inputs).
+    for inp in &tx.inputs {
+        let outpoint = (inp.prev_txid, inp.prev_index);
+        if !spent_in_block.insert(outpoint) {
+            return Err(format!("double-spend: {}:{} already consumed",
+                hex::encode(&inp.prev_txid[..8]), inp.prev_index));
+        }
+    }
+
+    // (f) Witnesses per the pinned wire format (prevout-type driven):
+    // tagged prevout → strict witness decode from script_sig; legacy → None.
+    let witnesses = crate::euvm::decode_input_witnesses(tx, &prevouts)
+        .map_err(|e| format!("euvm: {}", e))?;
+
+    // (g) The VM pass: strict mapping, witness discipline, F2 resource
+    // ceilings, exact non-BLCH conservation, every input's validator with
+    // ITS OWN sighash through the real PQ verifier — under the per-tx gas
+    // ceiling; then the block-wide ceiling.
+    let used = crate::euvm::validate_node_tx(
+        tx, &prevouts, &witnesses, core::node_chain_id(), per_tx_gas,
+    ).map_err(|e| format!("euvm: tx invalid: {}", e))?;
+    *block_gas_used = block_gas_used.checked_add(used)
+        .ok_or("euvm: block gas accounting overflow")?;
+    if *block_gas_used > block_gas {
+        return Err(format!(
+            "euvm: block gas ceiling exceeded ({} > {})", block_gas_used, block_gas,
+        ));
+    }
+
+    // (h) BLCH fee (checked, same arithmetic as the legacy path; the mapper
+    // already proved out ≤ in) split by the consensus burn rate. Only the
+    // miner share is credited toward validate_coinbase_value, so the burned
+    // sats are permanently unclaimable — supply strictly shrinks.
+    let total_in: u64 = prevouts.iter()
+        .try_fold(0u64, |acc, p| acc.checked_add(p.value))
+        .ok_or("input overflow")?;
+    let total_out: u64 = tx.outputs.iter()
+        .try_fold(0u64, |acc, o| acc.checked_add(o.value))
+        .ok_or("output sum overflow")?;
+    if total_in < total_out {
+        return Err(format!("inputs {} < outputs {}", total_in, total_out));
+    }
+    let fee = total_in - total_out;
+    let (_burned, fee_to_miner) = bloch_euvm::fee_burn(fee, crate::euvm::EUVM_BURN_BPS);
+    Ok(fee_to_miner)
+}
+
 /// Standalone tx validation (for mempool / sendrawtransaction).
 /// Returns the fee (total_in - total_out).
 /// Also checks coinbase maturity (VULN-03).
@@ -3375,5 +3614,393 @@ mod external_submission_tests {
             "applied chain state (tip_hash meta / UTXO apply) must advance \
              with the real chain",
         );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// D2 — eUTXO accept_block hook tests (feature `euvm`).
+//
+// The process chain-id is a set-once OnceLock shared by every test in this
+// binary and defaults to Mainnet, whose euvm activation height is the inert
+// u64::MAX sentinel — so the accept_block GATE cannot be flipped open here
+// without breaking the adapter's gate tests. These tests therefore exercise
+// `validate_tx_in_block_euvm` / `euvm_check_coinbase_outputs` DIRECTLY (the
+// exact code the gate dispatches to on Genesis-3), signing with
+// `core::node_chain_id()` just as the hook validates with it. Gate-closed
+// byte-identity is covered by the untouched legacy tests above plus the
+// feature-off build.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(all(test, feature = "euvm"))]
+mod euvm_hook_tests {
+    use super::*;
+    use crate::euvm::{
+        encode_eutxo_script, encode_input_witness, EuWitness, EutxoScript, EUVM_BURN_BPS,
+    };
+    use bloch_euvm::{validator_hash, Op, Val, Value};
+    use std::sync::OnceLock;
+    use tempfile::TempDir;
+
+    /// Empty store (TempDir-backed): every prevout resolves from the BLOCK's
+    /// own outputs, exactly like a same-block spend on the live path.
+    fn mk_store() -> (TempDir, Arc<storage::Storage>) {
+        let tmp = TempDir::new().expect("tempdir");
+        let store = Arc::new(storage::Storage::open(&tmp.path().join("db")).expect("storage"));
+        (tmp, store)
+    }
+
+    fn kp() -> &'static (Vec<u8>, Vec<u8>) {
+        static K: OnceLock<(Vec<u8>, Vec<u8>)> = OnceLock::new();
+        K.get_or_init(crypto::generate_keypair)
+    }
+
+    fn coinbase() -> core::Transaction {
+        core::Transaction {
+            version: 1,
+            inputs: vec![core::TxInput {
+                prev_txid: [0u8; 32], prev_index: u32::MAX,
+                script_sig: b"euvm-test".to_vec(), sequence: u32::MAX,
+            }],
+            outputs: vec![core::TxOutput { value: 8_400, script_pubkey: vec![0xAB; 20] }],
+            locktime: 0,
+        }
+    }
+
+    /// A funding tx whose outputs seed the block's own UTXO view (its inputs
+    /// are never validated here — only the tx under test is).
+    fn funding_tx(outputs: Vec<core::TxOutput>) -> core::Transaction {
+        core::Transaction {
+            version: 1,
+            inputs: vec![core::TxInput {
+                prev_txid: [9u8; 32], prev_index: 0,
+                script_sig: vec![], sequence: u32::MAX,
+            }],
+            outputs,
+            locktime: 0,
+        }
+    }
+
+    fn mk_block(txs: Vec<core::Transaction>) -> core::Block {
+        core::Block {
+            header: core::BlockHeader {
+                version: 1, parents: vec![], merkle_root: core::MerkleRoot::ZERO,
+                timestamp: 0, bits: core::GENESIS_BITS, nonce: 0,
+            },
+            transactions: txs,
+            blue_score: 0, height: 1, pow_solution: Vec::new(),
+            shielded_transactions: Vec::new(),
+        }
+    }
+
+    fn hashlock() -> (Vec<Op>, Vec<u8>) {
+        use sha2::{Digest as _, Sha256};
+        let preimage = b"d2-hook-secret".to_vec();
+        let lock = Sha256::digest(Sha256::digest(&preimage)).to_vec();
+        (vec![Op::Sha256d, Op::PushBytes(lock), Op::Eq], preimage)
+    }
+
+    fn tagged_out(value: u64, program: &[Op]) -> core::TxOutput {
+        core::TxOutput {
+            value,
+            script_pubkey: encode_eutxo_script(&EutxoScript {
+                validator_hash: validator_hash(program),
+                datum: Val::Int(0),
+                assets: Value::new(),
+            }).expect("encode"),
+        }
+    }
+
+    /// Block fixture: [coinbase, funding(tagged 100), spend(out_value legacy)]
+    /// with the witness carried in the REAL script_sig wire format. Returns
+    /// (block, spend_tx).
+    fn contract_spend_block(redeemer_preimage: &[u8], out_value: u64)
+        -> (core::Block, core::Transaction)
+    {
+        let (program, _) = hashlock();
+        let funding = funding_tx(vec![tagged_out(100, &program)]);
+        let mut spend = core::Transaction {
+            version: 1,
+            inputs: vec![core::TxInput {
+                prev_txid: funding.txid(), prev_index: 0,
+                script_sig: vec![], sequence: u32::MAX,
+            }],
+            outputs: vec![core::TxOutput { value: out_value, script_pubkey: vec![5u8; 20] }],
+            locktime: 0,
+        };
+        spend.inputs[0].script_sig = encode_input_witness(&EuWitness {
+            validator: program,
+            redeemer: vec![Val::Bytes(redeemer_preimage.to_vec())],
+        });
+        let block = mk_block(vec![coinbase(), funding, spend.clone()]);
+        (block, spend)
+    }
+
+    /// Valid contract spend: accepted, gas metered, fee burned at
+    /// EUVM_BURN_BPS (50%) — fee 10 → 5 to the miner.
+    #[test]
+    fn valid_eutxo_tx_accepted_with_burned_fee() {
+        let (_tmp, store) = mk_store();
+        let (_, preimage) = hashlock();
+        let (block, spend) = contract_spend_block(&preimage, 90);
+        let mut spent = HashSet::new();
+        let mut gas_used = 0u64;
+        let fee = validate_tx_in_block_euvm(
+            &block, &spend, &store, &mut spent, 0,
+            EUVM_PER_TX_GAS, EUVM_BLOCK_GAS, &mut gas_used,
+        ).expect("valid contract spend must be accepted");
+        // fee 10, burn 50% → 5 creditable; the outpoint is marked spent.
+        assert_eq!(EUVM_BURN_BPS, 5_000, "test assumes the 50% burn constant");
+        assert_eq!(fee, 5);
+        assert!(gas_used > 0, "VM execution must consume gas");
+        assert!(spent.contains(&(spend.inputs[0].prev_txid, 0)));
+    }
+
+    /// Wrong preimage, wrong revealed program, and garbage witness bytes are
+    /// all deterministic rejections.
+    #[test]
+    fn invalid_witness_rejected() {
+        let (_tmp, store) = mk_store();
+        // wrong preimage
+        let (block, spend) = contract_spend_block(b"wrong-preimage", 90);
+        let mut spent = HashSet::new();
+        let mut gas = 0u64;
+        let err = validate_tx_in_block_euvm(
+            &block, &spend, &store, &mut spent, 0,
+            EUVM_PER_TX_GAS, EUVM_BLOCK_GAS, &mut gas,
+        ).unwrap_err();
+        assert!(err.contains("validator rejected"), "got: {err}");
+
+        // wrong revealed program (validator-hash mismatch)
+        let (_, preimage) = hashlock();
+        let (mut block2, mut spend2) = contract_spend_block(&preimage, 90);
+        spend2.inputs[0].script_sig = encode_input_witness(&EuWitness {
+            validator: vec![Op::PushInt(1)],
+            redeemer: vec![],
+        });
+        block2.transactions[2] = spend2.clone();
+        let mut spent2 = HashSet::new();
+        let mut gas2 = 0u64;
+        let err2 = validate_tx_in_block_euvm(
+            &block2, &spend2, &store, &mut spent2, 0,
+            EUVM_PER_TX_GAS, EUVM_BLOCK_GAS, &mut gas2,
+        ).unwrap_err();
+        assert!(err2.contains("ValidatorHashMismatch"), "got: {err2}");
+
+        // garbage witness bytes are a typed decode rejection
+        let (mut block3, mut spend3) = contract_spend_block(&preimage, 90);
+        spend3.inputs[0].script_sig = vec![0xDE, 0xAD];
+        block3.transactions[2] = spend3.clone();
+        let mut spent3 = HashSet::new();
+        let mut gas3 = 0u64;
+        let err3 = validate_tx_in_block_euvm(
+            &block3, &spend3, &store, &mut spent3, 0,
+            EUVM_PER_TX_GAS, EUVM_BLOCK_GAS, &mut gas3,
+        ).unwrap_err();
+        assert!(err3.contains("witness decode failed"), "got: {err3}");
+    }
+
+    /// BLCH inflation (outputs > inputs) is rejected before any fee credit.
+    #[test]
+    fn value_inflation_rejected() {
+        let (_tmp, store) = mk_store();
+        let (_, preimage) = hashlock();
+        let (block, spend) = contract_spend_block(&preimage, 200); // 100 in, 200 out
+        let mut spent = HashSet::new();
+        let mut gas = 0u64;
+        let err = validate_tx_in_block_euvm(
+            &block, &spend, &store, &mut spent, 0,
+            EUVM_PER_TX_GAS, EUVM_BLOCK_GAS, &mut gas,
+        ).unwrap_err();
+        assert!(err.contains("exceed inputs"), "got: {err}");
+    }
+
+    /// Native-asset minting (tagged output carrying assets no input supplied)
+    /// is rejected by exact non-BLCH conservation — even from all-legacy
+    /// inputs, which is why tagged OUTPUTS alone force the VM path.
+    #[test]
+    fn asset_minting_rejected() {
+        let (_tmp, store) = mk_store();
+        let (pk, sk) = kp();
+        let pkh = {
+            use sha3::{Digest as _, Sha3_256};
+            Sha3_256::digest(pk)[..20].to_vec()
+        };
+        let funding = funding_tx(vec![core::TxOutput { value: 100, script_pubkey: pkh }]);
+        let mut asset_id = [0u8; 32];
+        asset_id[0] = 7;
+        let mut minted = Value::new();
+        minted.insert(asset_id, 55);
+        let mint_out = core::TxOutput {
+            value: 90,
+            script_pubkey: encode_eutxo_script(&EutxoScript {
+                validator_hash: [1u8; 32],
+                datum: Val::Int(0),
+                assets: minted,
+            }).expect("encode"),
+        };
+        let mut spend = core::Transaction {
+            version: 1,
+            inputs: vec![core::TxInput {
+                prev_txid: funding.txid(), prev_index: 0,
+                script_sig: vec![], sequence: u32::MAX,
+            }],
+            outputs: vec![mint_out],
+            locktime: 0,
+        };
+        let sighash = spend.sighash(0, core::node_chain_id());
+        let sig = crypto::sign(sk, &sighash).expect("sign");
+        spend.inputs[0].script_sig = core::Transaction::build_script_sig(&sig, pk);
+        let block = mk_block(vec![coinbase(), funding, spend.clone()]);
+        let mut spent = HashSet::new();
+        let mut gas = 0u64;
+        let err = validate_tx_in_block_euvm(
+            &block, &spend, &store, &mut spent, 0,
+            EUVM_PER_TX_GAS, EUVM_BLOCK_GAS, &mut gas,
+        ).unwrap_err();
+        assert!(err.contains("not conserved"), "got: {err}");
+    }
+
+    /// Gas ceilings: a tx over the per-tx budget aborts with OutOfGas; a
+    /// block whose accumulated gas crosses the block ceiling is rejected.
+    #[test]
+    fn gas_ceilings_enforced() {
+        let (_tmp, store) = mk_store();
+        let (_, preimage) = hashlock();
+
+        // per-tx: starve the budget below the hashlock's cost
+        let (block, spend) = contract_spend_block(&preimage, 90);
+        let mut spent = HashSet::new();
+        let mut gas = 0u64;
+        let err = validate_tx_in_block_euvm(
+            &block, &spend, &store, &mut spent, 0,
+            10, EUVM_BLOCK_GAS, &mut gas,
+        ).unwrap_err();
+        assert!(err.contains("OutOfGas"), "got: {err}");
+
+        // block-wide: a valid tx whose metered gas lands past the ceiling
+        let mut spent2 = HashSet::new();
+        let mut gas2 = 0u64;
+        let err2 = validate_tx_in_block_euvm(
+            &block, &spend, &store, &mut spent2, 0,
+            EUVM_PER_TX_GAS, 1, &mut gas2,
+        ).unwrap_err();
+        assert!(err2.contains("block gas ceiling exceeded"), "got: {err2}");
+        assert!(gas2 > 1, "the tx's real gas must have been metered");
+    }
+
+    /// A pure-legacy tx routes to the UNCHANGED legacy path: identical fee
+    /// and bookkeeping to validate_tx_in_block_with_maturity, no burn, no gas.
+    #[test]
+    fn pure_legacy_tx_routes_unchanged() {
+        let (_tmp, store) = mk_store();
+        let (pk, sk) = kp();
+        let pkh = {
+            use sha3::{Digest as _, Sha3_256};
+            Sha3_256::digest(pk)[..20].to_vec()
+        };
+        let funding = funding_tx(vec![core::TxOutput { value: 100, script_pubkey: pkh }]);
+        let mut spend = core::Transaction {
+            version: 1,
+            inputs: vec![core::TxInput {
+                prev_txid: funding.txid(), prev_index: 0,
+                script_sig: vec![], sequence: u32::MAX,
+            }],
+            outputs: vec![core::TxOutput { value: 90, script_pubkey: vec![5u8; 20] }],
+            locktime: 0,
+        };
+        let sighash = spend.sighash(0, core::node_chain_id());
+        let sig = crypto::sign(sk, &sighash).expect("sign");
+        spend.inputs[0].script_sig = core::Transaction::build_script_sig(&sig, pk);
+        let block = mk_block(vec![coinbase(), funding, spend.clone()]);
+
+        let mut spent_a = HashSet::new();
+        let mut gas = 0u64;
+        let fee_hook = validate_tx_in_block_euvm(
+            &block, &spend, &store, &mut spent_a, 0,
+            EUVM_PER_TX_GAS, EUVM_BLOCK_GAS, &mut gas,
+        ).expect("legacy tx valid through the hook");
+        let mut spent_b = HashSet::new();
+        let fee_legacy = validate_tx_in_block_with_maturity(
+            &block, &spend, &store, &mut spent_b, 0,
+        ).expect("legacy tx valid through the legacy path");
+        assert_eq!(fee_hook, fee_legacy, "legacy fee must be untouched (no burn)");
+        assert_eq!(fee_hook, 10);
+        assert_eq!(gas, 0, "pure-legacy txs consume no VM gas");
+        assert_eq!(spent_a, spent_b, "identical double-spend bookkeeping");
+    }
+
+    /// The G3 strict-output tightening: a malformed output script (neither
+    /// 20-byte P2PKH nor valid tagged) is invalid under the hook — the legacy
+    /// path accepts the same tx, and that delta is the deliberate tightening.
+    #[test]
+    fn malformed_output_script_rejected_under_euvm() {
+        let (_tmp, store) = mk_store();
+        let (pk, sk) = kp();
+        let pkh = {
+            use sha3::{Digest as _, Sha3_256};
+            Sha3_256::digest(pk)[..20].to_vec()
+        };
+        let funding = funding_tx(vec![core::TxOutput { value: 100, script_pubkey: pkh }]);
+        let mut spend = core::Transaction {
+            version: 1,
+            inputs: vec![core::TxInput {
+                prev_txid: funding.txid(), prev_index: 0,
+                script_sig: vec![], sequence: u32::MAX,
+            }],
+            // 21-byte blob: legacy consensus accepts it at creation; euvm rejects
+            outputs: vec![core::TxOutput { value: 90, script_pubkey: vec![7u8; 21] }],
+            locktime: 0,
+        };
+        let sighash = spend.sighash(0, core::node_chain_id());
+        let sig = crypto::sign(sk, &sighash).expect("sign");
+        spend.inputs[0].script_sig = core::Transaction::build_script_sig(&sig, pk);
+        let block = mk_block(vec![coinbase(), funding, spend.clone()]);
+
+        let mut spent = HashSet::new();
+        let mut gas = 0u64;
+        let err = validate_tx_in_block_euvm(
+            &block, &spend, &store, &mut spent, 0,
+            EUVM_PER_TX_GAS, EUVM_BLOCK_GAS, &mut gas,
+        ).unwrap_err();
+        assert!(err.contains("output 0 invalid"), "got: {err}");
+        let mut spent_l = HashSet::new();
+        assert!(
+            validate_tx_in_block_with_maturity(&block, &spend, &store, &mut spent_l, 0).is_ok(),
+            "legacy path accepts the same tx — the delta is the deliberate tightening"
+        );
+    }
+
+    /// Double-spends across txs of the same block stay rejected on the VM path.
+    #[test]
+    fn double_spend_rejected_on_vm_path() {
+        let (_tmp, store) = mk_store();
+        let (_, preimage) = hashlock();
+        let (block, spend) = contract_spend_block(&preimage, 90);
+        let mut spent = HashSet::new();
+        let mut gas = 0u64;
+        assert!(validate_tx_in_block_euvm(
+            &block, &spend, &store, &mut spent, 0,
+            EUVM_PER_TX_GAS, EUVM_BLOCK_GAS, &mut gas,
+        ).is_ok());
+        // same outpoint again → double-spend
+        let err = validate_tx_in_block_euvm(
+            &block, &spend, &store, &mut spent, 0,
+            EUVM_PER_TX_GAS, EUVM_BLOCK_GAS, &mut gas,
+        ).unwrap_err();
+        assert!(err.contains("double-spend"), "got: {err}");
+    }
+
+    /// eUTXO-era coinbase rule: only legacy 20-byte P2PKH coinbase outputs
+    /// (a tagged coinbase output would mint native assets outside the VM pass).
+    #[test]
+    fn coinbase_outputs_must_be_legacy() {
+        let ok_block = mk_block(vec![coinbase()]);
+        assert!(euvm_check_coinbase_outputs(&ok_block).is_ok());
+
+        let (program, _) = hashlock();
+        let mut bad_cb = coinbase();
+        bad_cb.outputs.push(tagged_out(0, &program));
+        let bad_block = mk_block(vec![bad_cb]);
+        let err = euvm_check_coinbase_outputs(&bad_block).unwrap_err();
+        assert!(err.contains("coinbase output 1"), "got: {err}");
     }
 }
