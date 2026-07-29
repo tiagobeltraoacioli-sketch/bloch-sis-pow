@@ -131,7 +131,7 @@ fn main() {
 
         // ── Wallet: send (builds + signs + broadcasts) ─────────────
         "send" => {
-            require_params(params, 3, "send <wallet.json> <to_address> <amount_bloch> [--fee 0.001] [--chain genesis2|mainnet|testnet]");
+            require_params(params, 3, "send <wallet.json> <to_address> <amount_bloch> [--fee 0.001] [--chain genesis3|genesis2|mainnet|testnet]");
             do_send(params, &rpc_host, rpc_port);
             return;
         }
@@ -350,7 +350,7 @@ fn do_send(params: &[&str], rpc_host: &str, rpc_port: u16) {
     // the wrong one yields a SILENTLY-rejected tx ("invalid signature"). The
     // LIVE network is Genesis-2, so default to it (previously the wallet fell
     // back to Mainnet/Testnet by address prefix and required BLOCH_GENESIS2=1).
-    // Override with `--chain mainnet|testnet|genesis2`.
+    // Override with `--chain genesis3|genesis2|mainnet|testnet`.
     let mut chain: String = "genesis2".to_string();
     let mut i = 3;
     while i < params.len() {
@@ -364,14 +364,25 @@ fn do_send(params: &[&str], rpc_host: &str, rpc_port: u16) {
             i += 1;
         }
     }
-    // The wallet's TxBuilder derives the sighash chain-id from BLOCH_GENESIS2
-    // (set => Genesis2Devnet; unset => Testnet/Mainnet by address prefix). Fold
-    // the --chain choice into it, and always print it so the choice is visible.
+    // The wallet's TxBuilder derives the sighash chain-id from BLOCH_GENESIS3 /
+    // BLOCH_GENESIS2 (set => Genesis3Mainnet / Genesis2Devnet; unset =>
+    // Testnet/Mainnet by address prefix). Fold the --chain choice into it, and
+    // always print it so the choice is visible.
     match chain.as_str() {
-        "genesis2" | "g2" => std::env::set_var("BLOCH_GENESIS2", "1"),
-        "mainnet" | "testnet" => { std::env::remove_var("BLOCH_GENESIS2"); }
+        "genesis3" | "g3" => {
+            std::env::remove_var("BLOCH_GENESIS2");
+            std::env::set_var("BLOCH_GENESIS3", "1");
+        }
+        "genesis2" | "g2" => {
+            std::env::remove_var("BLOCH_GENESIS3");
+            std::env::set_var("BLOCH_GENESIS2", "1");
+        }
+        "mainnet" | "testnet" => {
+            std::env::remove_var("BLOCH_GENESIS2");
+            std::env::remove_var("BLOCH_GENESIS3");
+        }
         other => die(&format!(
-            "unknown --chain '{}': use genesis2 | mainnet | testnet", other)),
+            "unknown --chain '{}': use genesis3 | genesis2 | mainnet | testnet", other)),
     }
     println!("Signing for chain: {}", chain);
 

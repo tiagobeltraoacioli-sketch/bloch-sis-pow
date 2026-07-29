@@ -47,6 +47,16 @@ pub enum ChainId {
     /// `for_network` (there is no `address::Network` variant for it). Fresh
     /// discriminant per the registry rule above; never reuse one.
     Genesis2Devnet = 0xB10C_0003,
+    /// Genesis-3 MAINNET (fresh SHA-256d chain, carry-over ledger). A brand-new
+    /// chain that starts at height 0 with its OWN genesis block (distinct
+    /// coinbase banner ⇒ distinct genesis hash — NOT a fork of Genesis-2),
+    /// ingests the SAME carry-over ledger as Genesis-2 as its opening
+    /// balances, and validates SHA-256d little-endian (ASIC-native) from
+    /// height 0 (see `sha256d_le_fork_height_for`). Labeled MAINNET — no
+    /// devnet caveat. Selected ONLY by the explicit `--genesis3` node flag,
+    /// never by `for_network`. Fresh discriminant per the registry rule
+    /// above; never reuse one.
+    Genesis3Mainnet = 0xB10C_0004,
 }
 
 /// Which proof-of-work algorithm a chain runs. The mapping lives in
@@ -71,6 +81,8 @@ pub const fn pow_algorithm(id: ChainId) -> PowAlgorithm {
         ChainId::Mainnet => PowAlgorithm::ModuleSis,
         ChainId::Testnet => PowAlgorithm::ModuleSis,
         ChainId::Genesis2Devnet => PowAlgorithm::Sha256d,
+        // Genesis-3 mainnet: SHA-256d, ASIC-compatible, like Genesis-2.
+        ChainId::Genesis3Mainnet => PowAlgorithm::Sha256d,
     }
 }
 
@@ -246,6 +258,9 @@ pub const CARRYOVER_TOTAL_SAT:     u128 = 347_544_120_000_000_000;
 pub fn emission_height(local_height: u64) -> u64 {
     match node_chain_id() {
         ChainId::Genesis2Devnet => local_height + CARRYOVER_SOURCE_HEIGHT,
+        // Genesis-3 carries the SAME ledger (same snapshot, same source
+        // height), so emission continues from the same absolute height.
+        ChainId::Genesis3Mainnet => local_height + CARRYOVER_SOURCE_HEIGHT,
         _ => local_height,
     }
 }
@@ -268,6 +283,9 @@ pub const fn chain_requires_carryover(id: ChainId) -> bool {
         // objecting. Requiring the flag makes that failure impossible instead
         // of merely unlikely.
         ChainId::Genesis2Devnet => true,
+        // Genesis-3 exists for the same reason: a fresh chain whose opening
+        // balances ARE the carried-over ledger. Same fail-closed rule.
+        ChainId::Genesis3Mainnet => true,
     }
 }
 
@@ -1981,6 +1999,212 @@ pub fn create_genesis2_block(miner_addr: &[u8]) -> Block {
     create_genesis2_block_with_params(miner_addr, GENESIS2_BITS, GENESIS2_TIMESTAMP, GENESIS2_NONCE)
 }
 
+// ── Genesis-3 (MAINNET: fresh SHA-256d chain, carry-over ledger) ─────────────
+//
+// Genesis-3 is a brand-new chain (ChainId::Genesis3Mainnet, PowAlgorithm::
+// Sha256d) that starts at height 0 with its OWN genesis block and ingests the
+// SAME carry-over ledger as Genesis-2 as its opening balances. It is NOT a
+// fork of Genesis-2: the genesis coinbase banner differs, so the genesis hash
+// differs and the two chains can never confuse each other's blocks (the
+// sighash chain-id additionally domain-separates every signature).
+//
+// Two deliberate differences from Genesis-2:
+//   1. LITTLE-ENDIAN SHA-256d FROM HEIGHT 0. Genesis-2 started big-endian and
+//      hard-forked to Bitcoin little-endian at SHA256D_LE_FORK_HEIGHT; every
+//      off-the-shelf ASIC/cpuminer is little-endian, so a fresh chain has no
+//      reason to relive that migration. See `sha256d_le_fork_height_for`.
+//   2. Labeled MAINNET. No devnet caveat anywhere in a Genesis-3 node's
+//      banners or logs.
+//
+// Everything else mirrors Genesis-2 byte-for-byte in KIND: zero-value anchor
+// coinbase (the carried ledger already holds the reward for its tip — genesis
+// must anchor WITHOUT re-minting), empty pow_solution, Bitcoin-style windowed
+// retarget, emission offset by the carry-over source height.
+//
+// Changing ANY of: the carry-over constants, GENESIS3_TIMESTAMP, GENESIS3_BITS,
+// or the miner script_pubkey invalidates GENESIS3_NONCE (the script_sig text
+// feeds the merkle root, which feeds the 80-byte mining header).
+
+/// Genesis-3 carries the SAME ledger as Genesis-2: identical snapshot file,
+/// identical SHAKE-256 root. One blessed snapshot, two chains anchored to it.
+pub const GENESIS3_CARRYOVER_SNAPSHOT_ROOT: [u8; 32] = GENESIS2_CARRYOVER_SNAPSHOT_ROOT;
+
+/// Height of the source chain at which the snapshot was frozen (== Genesis-2's).
+pub const GENESIS3_CARRYOVER_SOURCE_HEIGHT: u64 = 413_743;
+
+/// Number of UTXOs in the snapshot (== source height; same set as Genesis-2).
+pub const GENESIS3_CARRYOVER_UTXO_COUNT: u64 = 413_743;
+
+/// Total carried-over supply in sat (3,475,441,200 BLCH × 10⁸; same as Genesis-2).
+pub const GENESIS3_CARRYOVER_TOTAL_SAT: u128 = 347_544_120_000_000_000;
+
+/// Genesis-3 timestamp. A FIXED value chosen for the Genesis-3 mainnet launch
+/// (2026-07-29 relaunch decision), deliberately DISTINCT from
+/// GENESIS2_TIMESTAMP (1_784_500_000) so the two genesis headers differ even
+/// before the coinbase banner does. 1_785_500_000 ≈ 2026-08-01 00:53:20 UTC.
+pub const GENESIS3_TIMESTAMP: u64 = 1_785_500_000;
+
+/// Genesis-3 compact difficulty bits: same easy pow-limit start as Genesis-2
+/// (0x1d00ffff == Bitcoin diff-1). The windowed retarget ramps real hashrate
+/// quickly (see GENESIS3_RETARGET_WINDOW).
+pub const GENESIS3_BITS: u32 = 0x1d00ffff;
+
+/// Genesis-3 difficulty retarget window (blocks) — 60 blocks == 30 min at the
+/// 30 s target, same as Genesis-2.
+pub const GENESIS3_RETARGET_WINDOW: u64 = 60;
+
+// The shared SHA-256d retarget path (`pow::genesis2_expected_bits` +
+// `retarget_bits_g2`) is keyed on the GENESIS2_* constants and serves BOTH
+// SHA-256d chains. That is sound ONLY while Genesis-3's window/anchor equal
+// Genesis-2's — enforced at compile time here. If either assert ever fires,
+// the retarget path must be made chain-aware before shipping.
+const _: () = assert!(GENESIS3_RETARGET_WINDOW == GENESIS2_RETARGET_WINDOW);
+const _: () = assert!(GENESIS3_BITS == GENESIS2_BITS);
+
+/// The mined Genesis-3 nonce (grind_genesis3 ceremony output).
+///
+/// ⚠ PLACEHOLDER 0 until the ceremony bakes the real value: run
+/// `cargo run --release --bin grind_genesis3` and paste the printed
+/// constants here. While stale, `create_genesis3_block` PANICS (fail closed)
+/// and a `--genesis3` node cannot start — never fail open.
+pub const GENESIS3_NONCE: u64 = 0;
+
+/// Expected canonical Genesis-3 block hash for the fail-closed startup check.
+/// ⚠ PLACEHOLDER (all-zero) until the grind_genesis3 ceremony bakes the real
+/// value. While all-zero, the hash pin is SKIPPED (the PoW check above still
+/// fail-closes on the placeholder nonce); once nonzero it is ENFORCED.
+pub const GENESIS3_EXPECTED_HASH: [u8; 32] = [
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Canonical Genesis-3 miner script_pubkey: the founder address hash-20, same
+/// convention (and same founder wallet) as GENESIS2_MINER_SCRIPT_PUBKEY.
+pub const GENESIS3_MINER_SCRIPT_PUBKEY: [u8; 20] = [
+    0xe9, 0x86, 0xdb, 0x51, 0x49, 0xcf, 0xf7, 0x49,
+    0x9b, 0x28, 0x2a, 0x04, 0x82, 0x72, 0xa0, 0x9a,
+    0xff, 0x0a, 0xf4, 0xff,
+];
+
+/// The human-readable Genesis-3 coinbase banner. Like Genesis-2's it is
+/// DERIVED from the carry-over constants at call time (can never drift), but
+/// the text is DISTINCT — it names the chain ("BLOCH Genesis-3 mainnet") — so
+/// the coinbase txid, merkle root, and therefore the genesis hash all differ
+/// from Genesis-2's:
+///
+///   `BLOCH Genesis-3 mainnet carry-over from height 413743: 413743 UTXOs, root d3de5e51ee9dbbf3...`
+///
+/// (Pure ASCII, like Genesis-2's banner, so every explorer renders it.)
+///
+/// The 16-hex-char (8-byte) root prefix is for human readability; the FULL
+/// root is enforced by the snapshot loader (fail closed), not by this text.
+pub fn genesis3_coinbase_script_sig() -> Vec<u8> {
+    format!(
+        "BLOCH Genesis-3 mainnet carry-over from height {}: {} UTXOs, root {}...",
+        GENESIS3_CARRYOVER_SOURCE_HEIGHT,
+        GENESIS3_CARRYOVER_UTXO_COUNT,
+        &hex::encode(GENESIS3_CARRYOVER_SNAPSHOT_ROOT)[..16],
+    )
+    .into_bytes()
+}
+
+/// Build the Genesis-3 genesis block with explicit header parameters.
+///
+/// The SINGLE construction path shared by the grinder (`grind_genesis3`,
+/// which grinds `nonce`) and the canonical [`create_genesis3_block`] (which
+/// bakes the ceremony constants) — grinder and validator agree byte-for-byte
+/// by construction. Mirrors [`create_genesis2_block_with_params`] exactly:
+/// ZERO-value anchor coinbase (the carried ledger already holds the reward
+/// for its tip; genesis must NOT re-mint — emission continues from local
+/// height 1 == absolute GENESIS3_CARRYOVER_SOURCE_HEIGHT + 1 via
+/// `emission_height`), script_sig = [`genesis3_coinbase_script_sig`],
+/// `pow_solution` EMPTY (the Sha256d arm of validate_pow rejects any
+/// non-empty witness — fail closed).
+pub fn create_genesis3_block_with_params(
+    miner_addr: &[u8],
+    bits: u32,
+    timestamp: u64,
+    nonce: u64,
+) -> Block {
+    let coinbase = Transaction {
+        version: 1,
+        inputs: vec![TxInput {
+            prev_txid:  [0u8; 32],
+            prev_index: u32::MAX,
+            script_sig: genesis3_coinbase_script_sig(),
+            sequence:   u32::MAX,
+        }],
+        outputs: vec![
+            TxOutput {
+                value:         0,
+                script_pubkey: miner_addr.to_vec(),
+            },
+        ],
+        locktime: 0,
+    };
+    let merkle = Transaction::merkle_root(&[coinbase.clone()]);
+    Block {
+        header: BlockHeader {
+            version:     1,
+            parents:     vec![],
+            merkle_root: merkle,
+            timestamp,
+            bits,
+            nonce,
+        },
+        transactions: vec![coinbase],
+        blue_score: 0,
+        height: 0,
+        // SHA-256d chain: no Module-SIS witness (validate_pow's Sha256d arm
+        // REQUIRES pow_solution.is_empty()).
+        pow_solution: Vec::new(),
+        shielded_transactions: Vec::new(),
+    }
+}
+
+/// Creates the canonical Genesis-3 genesis block (height 0) from the baked
+/// ceremony constants — and VERIFIES it before returning (fail closed):
+///
+///   1. The header's SHA-256d PoW must meet GENESIS3_BITS under the EXACT
+///      rule a Genesis-3 validator applies at height 0 — little-endian from
+///      genesis (`sha256d_pow_valid_for_chain(Genesis3Mainnet, …, 0)`, the
+///      same function `Block::validate_pow` routes through on a G3 node).
+///   2. If GENESIS3_EXPECTED_HASH is non-zero, the block hash must equal it.
+///
+/// While GENESIS3_NONCE/GENESIS3_EXPECTED_HASH are the pre-ceremony
+/// placeholders this PANICS — a `--genesis3` node refuses to start until the
+/// grind_genesis3 output is baked in. Once real values are pasted, any drift
+/// in ANY baked constant is caught here before a single byte of chain state
+/// is written.
+pub fn create_genesis3_block(miner_addr: &[u8]) -> Block {
+    let genesis = create_genesis3_block_with_params(
+        miner_addr, GENESIS3_BITS, GENESIS3_TIMESTAMP, GENESIS3_NONCE,
+    );
+    assert!(
+        sha256d_pow_valid_for_chain(
+            ChainId::Genesis3Mainnet,
+            &genesis.header.pow_hash(),
+            &bits_to_target(GENESIS3_BITS),
+            0,
+        ),
+        "Genesis-3 genesis PoW does not meet GENESIS3_BITS under the \
+         little-endian-from-height-0 rule. If GENESIS3_NONCE is still the \
+         pre-ceremony placeholder, run `cargo run --release --bin \
+         grind_genesis3` and bake the printed constants into core/mod.rs. \
+         Refusing to construct an invalid genesis (fail closed).",
+    );
+    if GENESIS3_EXPECTED_HASH != [0u8; 32] {
+        assert!(
+            genesis.block_hash() == GENESIS3_EXPECTED_HASH,
+            "Genesis-3 block hash != GENESIS3_EXPECTED_HASH — a baked constant \
+             drifted. Refusing to construct (fail closed).",
+        );
+    }
+    genesis
+}
+
 // ── Difficulty ────────────────────────────────────────────────────────────────
 
 pub fn bits_to_target(bits: u32) -> [u8; 32] {
@@ -2020,20 +2244,63 @@ pub fn hash_meets_target(hash: &[u8; 32], target: &[u8; 32]) -> bool {
 /// with this rule before the chain reaches this height.
 pub const SHA256D_LE_FORK_HEIGHT: u64 = 2400;
 
-/// Height-gated SHA-256d PoW check. Below [`SHA256D_LE_FORK_HEIGHT`]: the
-/// legacy big-endian comparison. At/above: Bitcoin's little-endian convention
-/// (reverse the double-SHA256 output, then compare big-endian against the
-/// target), so standard SHA-256 miners' work validates. The block's `pow_hash`
-/// itself is UNCHANGED (still the raw double-SHA256, preserving block identity
-/// and the parents commitment) — only the target comparison endianness moves.
-pub fn sha256d_pow_valid(pow_hash: &[u8; 32], target: &[u8; 32], height: u64) -> bool {
-    if height >= SHA256D_LE_FORK_HEIGHT {
+/// The SHA-256d little-endian fork height for a given chain — the SINGLE
+/// per-chain source of truth for PoW-comparison endianness, read by the
+/// validator ([`sha256d_pow_valid`] via `node_chain_id()`), the miner
+/// (`src/pow::mine_pow_parallel`), and the Genesis-3 grinder. Exhaustive over
+/// [`ChainId`] with no wildcard arm: adding a chain without deciding its
+/// endianness rule is a compile error, by design.
+///
+/// * Genesis-2 (and the SIS chains, where this value is never consulted —
+///   they are not SHA-256d): the historical [`SHA256D_LE_FORK_HEIGHT`]
+///   flag-day (big-endian below, Bitcoin little-endian at/above).
+/// * Genesis-3 mainnet: **0** — little-endian (ASIC-native) from the genesis
+///   block itself. A fresh chain has no legacy big-endian blocks to
+///   grandfather, so ASIC shares validate from block 1 (and the genesis
+///   ceremony grinds under the same rule).
+pub const fn sha256d_le_fork_height_for(id: ChainId) -> u64 {
+    match id {
+        ChainId::Mainnet         => SHA256D_LE_FORK_HEIGHT,
+        ChainId::Testnet         => SHA256D_LE_FORK_HEIGHT,
+        ChainId::Genesis2Devnet  => SHA256D_LE_FORK_HEIGHT,
+        ChainId::Genesis3Mainnet => 0,
+    }
+}
+
+/// Chain-explicit SHA-256d PoW check. Below the chain's LE fork height
+/// ([`sha256d_le_fork_height_for`]): the legacy big-endian comparison.
+/// At/above: Bitcoin's little-endian convention (reverse the double-SHA256
+/// output, then compare big-endian against the target), so standard SHA-256
+/// miners' work validates. The block's `pow_hash` itself is UNCHANGED (still
+/// the raw double-SHA256, preserving block identity and the parents
+/// commitment) — only the target comparison endianness moves.
+///
+/// This chain-explicit form exists so genesis builders/grinders can verify
+/// under a NAMED chain's rule without depending on the process-wide chain-id
+/// pin; consensus call sites use [`sha256d_pow_valid`], which routes through
+/// `node_chain_id()`.
+pub fn sha256d_pow_valid_for_chain(
+    id: ChainId,
+    pow_hash: &[u8; 32],
+    target: &[u8; 32],
+    height: u64,
+) -> bool {
+    if height >= sha256d_le_fork_height_for(id) {
         let mut rev = *pow_hash;
         rev.reverse();
         hash_meets_target(&rev, target)
     } else {
         hash_meets_target(pow_hash, target)
     }
+}
+
+/// Height-gated SHA-256d PoW check for THIS node's chain (the consensus
+/// entry point — `Block::validate_pow`'s Sha256d arm and both stratum share
+/// paths route through it). Behaviour per chain is defined by
+/// [`sha256d_le_fork_height_for`]: unchanged for Genesis-2 (flag-day at
+/// [`SHA256D_LE_FORK_HEIGHT`]); little-endian from height 0 on Genesis-3.
+pub fn sha256d_pow_valid(pow_hash: &[u8; 32], target: &[u8; 32], height: u64) -> bool {
+    sha256d_pow_valid_for_chain(node_chain_id(), pow_hash, target, height)
 }
 
 /// Convert a floating-point difficulty into a 256-bit target (big-endian),
@@ -2465,7 +2732,13 @@ mod chain_id_tests {
     fn chain_id_registry_values() {
         assert_eq!(ChainId::Mainnet.to_u32(), 0xB10C_0001);
         assert_eq!(ChainId::Testnet.to_u32(), 0xB10C_0002);
+        assert_eq!(ChainId::Genesis3Mainnet.to_u32(), 0xB10C_0004);
         assert_eq!(ChainId::Mainnet.to_le_bytes(), [0x01, 0x00, 0x0C, 0xB1]);
+        // Genesis-3: SHA-256d, carry-over required, little-endian from h0.
+        assert_eq!(pow_algorithm(ChainId::Genesis3Mainnet), PowAlgorithm::Sha256d);
+        assert!(chain_requires_carryover(ChainId::Genesis3Mainnet));
+        assert_eq!(sha256d_le_fork_height_for(ChainId::Genesis3Mainnet), 0);
+        assert_eq!(sha256d_le_fork_height_for(ChainId::Genesis2Devnet), SHA256D_LE_FORK_HEIGHT);
         assert_eq!(ChainId::for_network(crate::address::Network::Mainnet), ChainId::Mainnet);
         assert_eq!(ChainId::for_network(crate::address::Network::Testnet), ChainId::Testnet);
     }

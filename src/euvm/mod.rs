@@ -9,17 +9,18 @@
 //! - [`NodePqVerifier`] bridges the VM's `SigVerifier` trait to the node's real
 //!   hybrid ML-DSA-65 ‖ Falcon-1024 verifier (`bloch_crypto::crypto::verify`), so
 //!   validators verify signatures with the exact consensus rule.
-//! - [`euvm_active`] is the committee-governed activation gate: the VM engages only
-//!   at/after the activation height AND when a 14-of-21 committee quorum has signed
-//!   the activation (`bloch_ffg`). Until then it returns `false` and no eUTXO code
-//!   runs.
+//! - [`euvm_active`] is a PLAIN, DETERMINISTIC HEIGHT gate — no committee, no
+//!   quorum, no signatures, no FFG (the committee model was dropped; see
+//!   `crates/bloch-euvm/src/harness.rs`: "Deterministic, height-gated
+//!   activation — NO committee / quorum / FFG"). The activation height is
+//!   per-chain via [`euvm_activation_height`]: 0 on Genesis-3 mainnet (active
+//!   from genesis), `u64::MAX` (inert sentinel) everywhere else.
 //!
 //! See `crates/bloch-euvm/INTEGRATION.md` for the full plan and the consensus-test
 //! gate that must pass before any activation.
 
-use bloch_ffg::{Committee, FeatureActivation, SeatSig, SigVerifier as FfgVerifier};
-
-/// The feature name the committee signs to switch the VM on.
+/// The name of the height-gated VM feature (labels/metrics only — no
+/// committee signs anything; activation is the pure height gate below).
 pub const EUVM_FEATURE: &str = "euvm";
 
 /// Fraction of the eUTXO transaction fee that is burned (basis points), per the
@@ -37,27 +38,38 @@ impl bloch_euvm::SigVerifier for NodePqVerifier {
     }
 }
 
-impl FfgVerifier for NodePqVerifier {
-    fn verify(&self, msg: &[u8], pubkey: &[u8], sig: &[u8]) -> bool {
-        bloch_crypto::crypto::verify(pubkey, msg, sig)
+/// The eUTXO VM activation height for THIS node's chain — the canonical
+/// per-chain gate value read by [`euvm_active`]. Exhaustive over [`ChainId`]
+/// (no wildcard) so adding a chain forces an explicit decision:
+///
+/// - `Genesis3Mainnet`: **0** — the VM is considered active from genesis on
+///   the fresh Genesis-3 mainnet (no legacy blocks below the gate exist, so
+///   there is nothing to grandfather).
+/// - every other chain: `u64::MAX` — the inert sentinel, matching the
+///   pre-existing behaviour (merely shipping this code activates nothing on
+///   Mainnet/Testnet/Genesis-2; a real activation there is a deliberate,
+///   reviewable constant change, cf. `bloch_euvm::harness`).
+///
+/// NOTE: `euvm_active` is currently INERT even when it returns `true` — the
+/// execution hook into `accept_block` is NOT implemented, so nothing calls
+/// the VM during block acceptance. Block acceptance is byte-identical with
+/// and without `--features euvm`.
+pub fn euvm_activation_height() -> u64 {
+    match bloch_crypto::core::node_chain_id() {
+        ChainId::Mainnet        => u64::MAX,
+        ChainId::Testnet        => u64::MAX,
+        ChainId::Genesis2Devnet => u64::MAX,
+        ChainId::Genesis3Mainnet => 0,
     }
 }
 
-/// Committee-governed activation gate. The eUTXO VM engages at `height` iff the
-/// committee has authorized activation at `activation_height` with a 14-of-21
-/// quorum AND `height >= activation_height`. Deterministic — every node computes
-/// the same answer from the same on-chain committee + activation record.
-pub fn euvm_active(
-    committee: &Committee,
-    activation_height: u64,
-    committee_sigs: &[SeatSig],
-    height: u64,
-) -> bool {
-    let act = FeatureActivation {
-        feature: EUVM_FEATURE.to_string(),
-        activation_height,
-    };
-    bloch_ffg::is_feature_active(committee, &act, committee_sigs, &NodePqVerifier, height)
+/// Height-gated activation — a pure, deterministic comparison, mirroring
+/// `bloch_euvm::harness::is_feature_active`. NO committee / quorum / FFG
+/// (that model was dropped; `bloch-ffg` remains a standalone foundation crate
+/// but the node's gate no longer depends on it). Every node computes the same
+/// answer from the block height and its chain-id alone.
+pub fn euvm_active(height: u64) -> bool {
+    height >= euvm_activation_height()
 }
 
 // ── Step 5.2 — map the node `Transaction` to the VM's eUTXO view ──────────────
@@ -309,18 +321,18 @@ mod tests {
         (tx, prev, validator, redeemer)
     }
 
-    /// The adapter compiles and the activation gate is closed until the committee
-    /// signs. (Uses a committee whose members carry no real keys, so a real quorum
-    /// cannot form here — the gate must stay closed, which is the safe default.)
+    /// The adapter compiles and the height gate is CLOSED by default: an
+    /// unpinned test process defaults to ChainId::Mainnet, whose activation
+    /// height is the u64::MAX inert sentinel — no height activates the VM.
+    /// (The Genesis3Mainnet => 0 arm can't also be asserted here: the process
+    /// chain-id is a set-once OnceLock shared across tests in this binary.)
     #[test]
     fn activation_gate_defaults_closed() {
-        let pks: Vec<Vec<u8>> = (0..bloch_ffg::COMMITTEE_SIZE)
-            .map(|i| format!("seat-{i}").into_bytes())
-            .collect();
-        let committee = Committee::new(pks).unwrap();
-        // no signatures → never active, even above the height
-        assert!(!euvm_active(&committee, 1000, &[], 2000));
-        assert!(!euvm_active(&committee, 1000, &[], 0));
+        assert_eq!(euvm_activation_height(), u64::MAX,
+            "non-G3 chains must keep the inert sentinel");
+        assert!(!euvm_active(0));
+        assert!(!euvm_active(1_000_000));
+        assert!(!euvm_active(u64::MAX - 1));
     }
 
     #[test]

@@ -674,7 +674,9 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             // difficulty bug that wedged the chain. Mainnet/Testnet keep ASERT.
             let parent_ts = state.store.get_timestamp_at_height(height.saturating_sub(1))
                 .ok().flatten().unwrap_or(crate::core::GENESIS_TIMESTAMP);
-            let bits = if crate::core::node_chain_id() == crate::core::ChainId::Genesis2Devnet {
+            let bits = if matches!(crate::core::pow_algorithm(crate::core::node_chain_id()),
+                                   crate::core::PowAlgorithm::Sha256d) {
+                // Both SHA-256d chains (Genesis-2 devnet, Genesis-3 mainnet).
                 crate::pow::genesis2_expected_bits(&state.store, height)
             } else {
                 crate::pow::next_bits(

@@ -92,15 +92,23 @@ pub fn install_fresh_template(
         (parents_vec, data.height + 1, data.blue_score + 1)
     };
 
-    // 3. Current difficulty target. FAIL CLOSED: if current_bits is
-    //    unreadable we must NOT guess diff-1 — on the live chain (~4.35) that
-    //    is EASIER than reality, so shares would pass the local gate but the
-    //    assembled block would be rejected by the node, silently burning the
-    //    miner's work. Skip the notify instead.
-    let bits = match read_current_bits(ctx) {
-        Some(b) => b,
-        None    => return Err("current_bits unreadable — refusing to notify on a guessed target"),
-    };
+    // 3. Difficulty target for the block BEING MINED (height). FAIL CLOSED:
+    //    if current_bits is unreadable we must NOT guess diff-1 — on the live
+    //    chain that is EASIER than reality, so shares would pass the local
+    //    gate but the assembled block would be rejected by the node, silently
+    //    burning the miner's work. Skip the notify instead.
+    //
+    //    RETARGET-BOUNDARY FIX: the raw `current_bits` meta is the bits of the
+    //    TIP block. At a retarget boundary (height % GENESIS*_RETARGET_WINDOW
+    //    == 0) the validator demands the RETARGETED bits for the next block —
+    //    a template built from the stale tip bits is rejected ("invalid
+    //    difficulty") on every boundary, stalling the chain each window. Use
+    //    the validator's single source of truth instead: off-boundary it
+    //    equals current_bits; at a boundary it applies the retarget.
+    if read_current_bits(ctx).is_none() {
+        return Err("current_bits unreadable — refusing to notify on a guessed target");
+    }
+    let bits = crate::pow::genesis2_expected_bits(&ctx.store, height);
 
     // Net difficulty is the HARD CAP on this session's share difficulty: a
     // share is never harder than a real block. Recompute per template because

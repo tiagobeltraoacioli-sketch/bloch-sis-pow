@@ -258,28 +258,30 @@ pub async fn run(
     // ── Consensus safety guard (fail-closed) ──────────────────────────
     // The stratum server produces SHA-256d work: an 80-byte MiningHeader
     // and an EMPTY `pow_solution`. A node validates a block with the PoW
-    // algorithm `pow_algorithm(node_chain_id())` selects — and ONLY
-    // Genesis2Devnet maps to Sha256d. On any other chain-id (the default
-    // when the node is launched without `--genesis2` is Mainnet ⇒
-    // ModuleSis) the validator takes the Module-SIS arm, which requires a
-    // 256-element `pow_solution`, and rejects EVERY block this server
-    // mines as "invalid PoW" — silently burning all connected hashrate
-    // (the ASIC symptom). The stratum's own share check is hard-coded
-    // SHA-256d, so it accepts the share and only accept_block rejects it:
-    // a self-inconsistent node. This is a startup misconfiguration, not a
+    // algorithm `pow_algorithm(node_chain_id())` selects — only the
+    // SHA-256d chains (Genesis2Devnet, Genesis3Mainnet) map to Sha256d.
+    // On any other chain-id (the default when the node is launched without
+    // `--genesis2`/`--genesis3` is Mainnet ⇒ ModuleSis) the validator
+    // takes the Module-SIS arm, which requires a 256-element
+    // `pow_solution`, and rejects EVERY block this server mines as
+    // "invalid PoW" — silently burning all connected hashrate (the ASIC
+    // symptom). The stratum's own share check is hard-coded SHA-256d, so
+    // it accepts the share and only accept_block rejects it: a
+    // self-inconsistent node. This is a startup misconfiguration, not a
     // runtime condition, so fail loud instead of mining un-acceptable work.
     let cid = crate::core::node_chain_id();
-    if cid != crate::core::ChainId::Genesis2Devnet {
+    if crate::core::pow_algorithm(cid) != crate::core::PowAlgorithm::Sha256d {
         error!(
             "stratum: refusing to start — node chain-id is {:?}, but the SHA-256d \
-             stratum requires Genesis2Devnet. Blocks would be mined as SHA-256d yet \
-             validated as Module-SIS and rejected ('invalid PoW'), wasting all \
-             hashrate. Restart the node with --genesis2.",
+             stratum requires a SHA-256d chain (Genesis2Devnet or Genesis3Mainnet). \
+             Blocks would be mined as SHA-256d yet validated as Module-SIS and \
+             rejected ('invalid PoW'), wasting all hashrate. Restart the node with \
+             --genesis2 or --genesis3.",
             cid
         );
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "stratum requires --genesis2 (Sha256d PoW); refusing to mine un-acceptable blocks",
+            "stratum requires a Sha256d chain (--genesis2 / --genesis3); refusing to mine un-acceptable blocks",
         ));
     }
 

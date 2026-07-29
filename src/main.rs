@@ -95,6 +95,15 @@ struct Cli {
     /// consensus parameters are chosen. This flag is the explicit node selector
     /// the ChainId::Genesis2Devnet doc mandates ("never by for_network").
     #[arg(long)]                                         genesis2: bool,
+    /// Run on Genesis-3 MAINNET (chain-id Genesis3Mainnet, SHA-256d PoW,
+    /// carry-over ledger). Requires --carryover-snapshot. A brand-new chain
+    /// starting at height 0 with its own genesis block, opening balances ==
+    /// the same carried-over ledger as Genesis-2, and SHA-256d validated
+    /// LITTLE-ENDIAN (ASIC-native) from height 0. Mutually exclusive with
+    /// --genesis2 and --testnet — each selects a distinct chain-id and the
+    /// node chain-id is set once. This is the explicit node selector the
+    /// ChainId::Genesis3Mainnet doc mandates ("never by for_network").
+    #[arg(long)]                                         genesis3: bool,
     #[arg(long, default_value = "./bloch-data")]          data_dir: String,
     /// RPC bind address. SECURITY: defaults to 127.0.0.1 (local only).
     /// Use --rpc-public to bind 0.0.0.0, which exposes RPC to the internet.
@@ -238,8 +247,17 @@ async fn main() {
         eprintln!("❌ --genesis2 and --testnet are mutually exclusive (each selects a different chain-id).");
         std::process::exit(2);
     }
+    if cli.genesis3 && cli.genesis2 {
+        eprintln!("❌ --genesis3 and --genesis2 are mutually exclusive (each selects a different chain-id).");
+        std::process::exit(2);
+    }
+    if cli.genesis3 && cli.testnet {
+        eprintln!("❌ --genesis3 and --testnet are mutually exclusive (each selects a different chain-id).");
+        std::process::exit(2);
+    }
     core::set_node_chain_id(
-        if cli.genesis2      { core::ChainId::Genesis2Devnet }
+        if cli.genesis3      { core::ChainId::Genesis3Mainnet }
+        else if cli.genesis2 { core::ChainId::Genesis2Devnet }
         else if cli.testnet  { core::ChainId::Testnet }
         else                 { core::ChainId::Mainnet }
     ).expect("node chain-id must be settable exactly once at startup");
@@ -467,17 +485,27 @@ async fn main() {
         // start if it does not check out.
         info!("Initialising canonical genesis (pre-mined PoW) and verifying...");
         let founder_spk = address_to_script_pubkey(FOUNDER_ADDRESS_HEX);
-        let genesis = if core::node_chain_id() == core::ChainId::Genesis2Devnet {
-            // The carry-over UTXO set was ingested above; this writes only block 0.
-            core::create_genesis2_block(&founder_spk)
-        } else {
-            // V2 (ADR-028): miner slot at genesis uses founder address (genesis
-            // bootstrapping convention). Pool addresses come from tokenomics_v2 and
-            // panic before Phase 6 — deliberate fail-loud: a node configured for
-            // mainnet without these populated must not produce blocks.
-            let validator_pool_spk = core::tokenomics_v2::validator_pool_address_hash();
-            let oracle_pool_spk    = core::tokenomics_v2::oracle_pool_address_hash();
-            core::create_genesis_block(&founder_spk, &validator_pool_spk, &oracle_pool_spk)
+        let genesis = match core::node_chain_id() {
+            core::ChainId::Genesis2Devnet => {
+                // The carry-over UTXO set was ingested above; this writes only block 0.
+                core::create_genesis2_block(&founder_spk)
+            }
+            core::ChainId::Genesis3Mainnet => {
+                // Genesis-3 MAINNET: same carry-over anchor rule, its own
+                // genesis block (distinct banner ⇒ distinct hash), and the
+                // builder itself fail-closes on any baked-constant drift
+                // (PoW under the LE-from-h0 rule + expected-hash pin).
+                core::create_genesis3_block(&founder_spk)
+            }
+            _ => {
+                // V2 (ADR-028): miner slot at genesis uses founder address (genesis
+                // bootstrapping convention). Pool addresses come from tokenomics_v2 and
+                // panic before Phase 6 — deliberate fail-loud: a node configured for
+                // mainnet without these populated must not produce blocks.
+                let validator_pool_spk = core::tokenomics_v2::validator_pool_address_hash();
+                let oracle_pool_spk    = core::tokenomics_v2::oracle_pool_address_hash();
+                core::create_genesis_block(&founder_spk, &validator_pool_spk, &oracle_pool_spk)
+            }
         };
 
         // Genesis carries its chain's mined PoW; refuse to start if it does not
@@ -498,6 +526,18 @@ async fn main() {
                    hex::encode(core::GENESIS2_EXPECTED_HASH));
             std::process::exit(1);
         }
+        // Genesis-3: same pin (belt and braces — create_genesis3_block already
+        // asserts it). Skipped while GENESIS3_EXPECTED_HASH is the all-zero
+        // pre-ceremony placeholder; enforced once the real value is baked.
+        if core::node_chain_id() == core::ChainId::Genesis3Mainnet
+            && core::GENESIS3_EXPECTED_HASH != [0u8; 32]
+            && genesis.block_hash() != core::GENESIS3_EXPECTED_HASH {
+            error!("Genesis-3 block hash {} != expected {} — a baked constant drifted. \
+                    Refusing to start.",
+                   hex::encode(genesis.block_hash()),
+                   hex::encode(core::GENESIS3_EXPECTED_HASH));
+            std::process::exit(1);
+        }
 
         let hash = genesis.block_hash();
         store.put_block(&genesis).expect("store genesis");
@@ -508,10 +548,10 @@ async fn main() {
         // value from block 1 onwards (not the fallback constant). Prevents a class of
         // subtle bugs where a retarget could write a different value than accept_block
         // reads on a fresh node.
-        let genesis_bits = if core::node_chain_id() == core::ChainId::Genesis2Devnet {
-            core::GENESIS2_BITS
-        } else {
-            core::GENESIS_BITS
+        let genesis_bits = match core::node_chain_id() {
+            core::ChainId::Genesis2Devnet  => core::GENESIS2_BITS,
+            core::ChainId::Genesis3Mainnet => core::GENESIS3_BITS,
+            _                              => core::GENESIS_BITS,
         };
         store.put_meta("current_bits", &genesis_bits.to_le_bytes())
             .expect("meta current_bits");
@@ -1479,7 +1519,11 @@ async fn main() {
                     // accept_block's expected_bits exactly).
                     let parent_ts = store_m.get_timestamp_at_height(h).ok().flatten()
                         .unwrap_or(core::GENESIS_TIMESTAMP);
-                    let bits = if core::node_chain_id() == core::ChainId::Genesis2Devnet {
+                    let bits = if matches!(core::pow_algorithm(core::node_chain_id()),
+                                           core::PowAlgorithm::Sha256d) {
+                        // Both SHA-256d chains (Genesis-2 devnet, Genesis-3
+                        // mainnet): the windowed retarget, shared with
+                        // accept_block (see pow::genesis2_expected_bits).
                         genesis2_expected_bits(&store_m, h + 1)
                     } else {
                         pow::next_bits(core::GENESIS_BITS, core::GENESIS_TIMESTAMP, parent_ts, h + 1)
@@ -1679,12 +1723,14 @@ async fn main() {
                         }
 
                         // Difficulty is per-block ASERT-Lattice (B5c) on the SIS
-                        // chains — no current_bits write. Genesis-2 uses a
-                        // Bitcoin-style windowed retarget whose in-force value is
-                        // cached in current_bits; self-mined blocks don't route
-                        // through accept_block, so persist it HERE too or the
+                        // chains — no current_bits write. The SHA-256d chains
+                        // (Genesis-2, Genesis-3) use a Bitcoin-style windowed
+                        // retarget whose in-force value is cached in
+                        // current_bits; self-mined blocks don't route through
+                        // accept_block, so persist it HERE too or the
                         // difficulty resets to the anchor every window.
-                        if core::node_chain_id() == core::ChainId::Genesis2Devnet {
+                        if matches!(core::pow_algorithm(core::node_chain_id()),
+                                    core::PowAlgorithm::Sha256d) {
                             let _ = store_m.put_meta("current_bits", &block.header.bits.to_le_bytes());
                         }
 
@@ -1803,17 +1849,22 @@ async fn main() {
         // a SIS-native share protocol (future work). Refuse to start the server
         // under Module-SIS rather than silently produce rejected blocks. Solo
         // mining (--mine) uses the node's SIS miner.
-        // Genesis-2 is pure SHA-256d: the stratum share [user, job, en2, ntime,
-        // nonce] fully determines the block PoW (pow_solution is empty), so V1 pool
-        // mining produces valid blocks. Only Module-SIS — whose share has no field
-        // for the lattice solution vector `s` — must refuse.
-        if cli.stratum && !cli.genesis2 {
+        // Genesis-2 AND Genesis-3 are pure SHA-256d: the stratum share [user, job,
+        // en2, ntime, nonce] fully determines the block PoW (pow_solution is
+        // empty), so V1 pool mining produces valid blocks on either. Only
+        // Module-SIS — whose share has no field for the lattice solution
+        // vector `s` — must refuse.
+        let stratum_sha256d = matches!(
+            core::pow_algorithm(core::node_chain_id()),
+            core::PowAlgorithm::Sha256d
+        );
+        if cli.stratum && !stratum_sha256d {
             error!("stratum mining is unsupported under Module-SIS PoW (no share \
                     field for the lattice solution). Use solo mining (--mine). \
                     A SIS-native pool protocol is future work (see B5f).");
             std::process::exit(1);
         }
-        if cli.stratum && cli.genesis2 {
+        if cli.stratum && stratum_sha256d {
         // Parse + validate CLI params
         let bind_addr: std::net::SocketAddr = match cli.stratum_addr.parse() {
             Ok(a)  => a,
@@ -2203,7 +2254,9 @@ fn accept_block(
     // which applies to a fresh SHA-256d chain — so it is bypassed here.
     let parent_ts = store.get_timestamp_at_height(block.height.saturating_sub(1))
         .ok().flatten().unwrap_or(core::GENESIS_TIMESTAMP);
-    let expected_bits = if core::node_chain_id() == core::ChainId::Genesis2Devnet {
+    let expected_bits = if matches!(core::pow_algorithm(core::node_chain_id()),
+                                    core::PowAlgorithm::Sha256d) {
+        // Both SHA-256d chains (Genesis-2 devnet, Genesis-3 mainnet).
         genesis2_expected_bits(store, block.height)
     } else {
         pow::next_bits(
@@ -2339,11 +2392,12 @@ fn accept_block(
         return Err(e.to_string());
     }
 
-    // Genesis-2 Bitcoin-style difficulty: persist the bits now in force so the
-    // NEXT block's expected_bits (genesis2_expected_bits) reads them. Within a
-    // window this rewrites the same value; a window-boundary block writes the new
-    // retargeted bits, so difficulty carries forward instead of resetting.
-    if core::node_chain_id() == core::ChainId::Genesis2Devnet {
+    // SHA-256d (Genesis-2 / Genesis-3) Bitcoin-style difficulty: persist the
+    // bits now in force so the NEXT block's expected_bits
+    // (genesis2_expected_bits) reads them. Within a window this rewrites the
+    // same value; a window-boundary block writes the new retargeted bits, so
+    // difficulty carries forward instead of resetting.
+    if matches!(core::pow_algorithm(core::node_chain_id()), core::PowAlgorithm::Sha256d) {
         let _ = store.put_meta("current_bits", &block.header.bits.to_le_bytes());
     }
 
