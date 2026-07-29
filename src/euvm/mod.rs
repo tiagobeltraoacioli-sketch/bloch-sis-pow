@@ -45,6 +45,12 @@
 // than annotate every item. Remove once the hook is wired.
 #![allow(dead_code)]
 
+// D3 — miner/block-builder mirror of the validator (see miner.rs). The whole
+// `euvm` module is already feature-gated at its declaration in main.rs; the
+// explicit cfg here restates the contract for readers and future refactors.
+#[cfg(feature = "euvm")]
+pub mod miner;
+
 /// The name of the height-gated VM feature (labels/metrics only — no
 /// committee signs anything; activation is the pure height gate below).
 pub const EUVM_FEATURE: &str = "euvm";
