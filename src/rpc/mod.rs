@@ -10,6 +10,12 @@
 
 pub mod auth;
 
+// D5 — eUTXO RPC/wallet helpers (euvm_buildtx / euvm_listutxos / euvm_getutxo).
+// Feature-gated: with `euvm` off this module does not exist and the methods
+// below are simply not registered — default build byte-for-byte unaffected.
+#[cfg(feature = "euvm")]
+pub mod euvm_rpc;
+
 use std::sync::Arc;
 use parking_lot::RwLock;
 use log::{info, error};
@@ -1298,6 +1304,19 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             serde_json::to_value(crate::attestation::current_report(nonce))
                 .unwrap_or_else(|e| json!({ "error": format!("attestation serialize: {}", e) }))
         }
+
+        // ── D5: eUTXO VM — build/inspect eUTXO transactions (feature-gated) ──
+        //
+        // Registered ONLY under `--features euvm`; default builds fall through
+        // to "unknown method". These methods produce/inspect transactions that
+        // go through the NORMAL submit path (`sendrawtransaction`) — nothing
+        // here touches consensus. See src/rpc/euvm_rpc.rs for shapes/docs.
+        #[cfg(feature = "euvm")]
+        "euvm_buildtx" => euvm_rpc::rpc_buildtx(params, state).await,
+        #[cfg(feature = "euvm")]
+        "euvm_listutxos" => euvm_rpc::rpc_listutxos(params, state),
+        #[cfg(feature = "euvm")]
+        "euvm_getutxo" => euvm_rpc::rpc_getutxo(params, state),
 
         _ => json!({ "error": format!("unknown method: {}", method) }),
     }
