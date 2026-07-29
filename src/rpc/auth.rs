@@ -35,7 +35,11 @@ const RL_GC_INTERVAL: Duration = Duration::from_secs(10 * 60);
 /// Methods we treat as "writes" (mutating, gossipped to peers).
 /// Anything else is a read-only query of chain state.
 /// `submitblock` is the B5f pool seam (see rpc::SubmitBlockFn).
-pub const WRITE_METHODS: &[&str] = &["sendrawtransaction", "submitblock"];
+/// `euvm_buildtx` (D5, `--features euvm` only) does not mutate chain state,
+/// but it may carry SECRET KEYS for server-side signing and does CPU-heavy PQ
+/// signing/VM work — auth + the tighter write rate limit apply. Listing the
+/// name here is harmless when the feature is off (the method never registers).
+pub const WRITE_METHODS: &[&str] = &["sendrawtransaction", "submitblock", "euvm_buildtx"];
 
 /// Type alias for a direct (non-keyed) in-memory rate limiter.
 type IpRateLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;

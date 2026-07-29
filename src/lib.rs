@@ -55,6 +55,12 @@ pub mod dandelion;    // Coherence P3 — Dandelion++ tx-relay metadata privacy
 #[cfg(feature = "node")]
 pub mod sync;         // Phase 2 — drop-in Kaspa sync-negotiation layer (frontier reconciliation)
 
+// D1/D5 — eUTXO VM adapter (same src/euvm/mod.rs the bin compiles). The lib
+// needs it because src/rpc (shared with the bin) hosts the feature-gated
+// euvm_* RPC methods, which consume the adapter via `crate::euvm`.
+#[cfg(all(feature = "node", feature = "euvm"))]
+pub mod euvm;
+
 /// Convenience re-exports for consumers of the library (wallet UIs,
 /// block explorers, etc.). Import with `use bloch::prelude::*`.
 pub mod prelude {

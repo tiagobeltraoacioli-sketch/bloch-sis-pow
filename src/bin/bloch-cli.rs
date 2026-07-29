@@ -218,6 +218,37 @@ fn main() {
             ("submitpoivote", serde_json::json!([params[0], params[1], params[2]]))
         }
 
+        // ── eUTXO VM (node must run with --features euvm) ──────────
+        // Thin passthroughs to the D5 euvm_* RPC methods; on a node built
+        // without the feature they return "unknown method".
+        "euvm_utxos" | "euvm_listutxos" => {
+            // [validator_hash|null] [limit] [offset]
+            let vh = params.get(0)
+                .filter(|s| **s != "null" && !s.is_empty())
+                .map(|s| serde_json::json!(s))
+                .unwrap_or(serde_json::Value::Null);
+            let limit: u64 = params.get(1).and_then(|s| s.parse().ok()).unwrap_or(100);
+            let offset: u64 = params.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+            ("euvm_listutxos", serde_json::json!([vh, limit, offset]))
+        }
+
+        "euvm_getutxo" => {
+            require_params(params, 2, "euvm_getutxo <txid_hex> <index>");
+            let idx: u64 = params[1].parse().unwrap_or_else(|_| die("index must be a number"));
+            ("euvm_getutxo", serde_json::json!([params[0], idx]))
+        }
+
+        "euvm_buildtx" => {
+            // Takes the full build-request object as ONE JSON argument:
+            //   bloch-cli euvm_buildtx '{"inputs":[...],"outputs":[...]}'
+            // (May carry secret keys — the node treats it as an auth-gated
+            // write; set BLOCH_RPC_API_KEY if the node requires auth.)
+            require_params(params, 1, "euvm_buildtx '<build-request-json>'");
+            let obj: serde_json::Value = serde_json::from_str(params[0])
+                .unwrap_or_else(|e| die(&format!("argument must be valid JSON: {}", e)));
+            ("euvm_buildtx", serde_json::json!([obj]))
+        }
+
         // ── Help ───────────────────────────────────────────────────
         "help" => { print_usage(); return; }
 
@@ -722,6 +753,13 @@ fn print_usage() {
     bloch-cli newaddress <wallet-hd.json> [label]    Add new address
     bloch-cli addresses <wallet-hd.json>    List all addresses
     bloch-cli importfounder <wallet-hd.json> <founder.json>    Import simple wallet
+
+  eUTXO VM (node built with --features euvm)
+    bloch-cli euvm_utxos [validator_hash] [limit] [offset]   List eUTXO contract UTXOs
+    bloch-cli euvm_getutxo <txid> <index>   Inspect one UTXO (legacy or eUTXO, decoded)
+    bloch-cli euvm_buildtx '<json>'         Build (and pre-validate) an eUTXO raw tx
+                                            from a JSON build-request; broadcast the
+                                            returned raw_tx with 'sendraw'
 
   PROOF-OF-IMPROVEMENT (PoI)
     bloch-cli treasury                      Treasury balance and stats
