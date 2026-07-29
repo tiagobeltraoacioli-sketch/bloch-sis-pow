@@ -1,0 +1,79 @@
+# Akash SDL — Bloch Genesis-2 node + CPU miner (40 vCPU each), linked to OVH.
+# Manual deploy: console.akash.network → Deploy (paste this), or
+#   provider-services tx deployment create akash-node.yaml --from <wallet>
+#
+# PREREQUISITE — Akash pulls a PRE-BUILT image (it does not build the Dockerfile).
+# Build the FORK binary image (carryover.tsv is COPY'd in) and push to a PUBLIC
+# registry, from the repo ROOT:
+#   docker build -f Dockerfile -t docker.io/YOUR_USER/bloch-node:latest .
+#   docker push docker.io/YOUR_USER/bloch-node:latest
+# The image already contains /carryover.tsv and the SHA256D_LE_FORK_HEIGHT=2400 fork.
+---
+version: "2.0"
+
+services:
+  node:
+    image: docker.io/blochv/bloch-node:fork-n2400-2
+    # Args are passed to the bloch entrypoint. Linked to OVH from the start so it
+    # syncs the CANONICAL little-endian chain (not an isolated fork), and mines.
+    args:
+      - --genesis2
+      - --archive                               # retain ALL block bodies → each node is
+                                                #   itself archival, bootstraps fully from
+                                                #   OVH, and can serve bodies to the others
+                                                #   (fixes "an archival peer is needed")
+      - --carryover-snapshot
+      - /carryover.tsv
+      - --data-dir
+      - /data
+      - --listen
+      - /ip4/0.0.0.0/tcp/16110
+      - --peer
+      - /ip4/51.83.249.212/tcp/16110          # OVH — canonical archival anchor
+      - --rpc-bind
+      - 127.0.0.1
+      - --rpc-port
+      - "16210"
+      - --mine
+      - --miner-address
+      - bloch1qe986db5149cff7499b282a048272a09aff0af4ff84242073   # founder payout
+      - --max-peers
+      - "40"
+    expose:
+      - port: 16110                              # p2p (gossip/sync)
+        as: 16110
+        to:
+          - global: true
+    params:
+      storage:
+        data:
+          mount: /data                          # chain data (persistent)
+          readOnly: false
+
+profiles:
+  compute:
+    node:
+      resources:
+        cpu:
+          units: 40                             # 40 vCPU → SHA-256d mining hashrate
+        memory:
+          size: 8Gi
+        storage:
+          - size: 10Gi                          # ephemeral root
+          - name: data
+            size: 20Gi                          # chain + rocksdb (small chain today)
+            attributes:
+              persistent: true
+              class: beta3
+  placement:
+    akash:
+      pricing:
+        node:
+          denom: uakt
+          amount: 100000                        # max uAKT/block; raise if no bids
+
+deployment:
+  node:
+    akash:
+      profile: node
+      count: 10                                  # 10 × 40 vCPU = 400 vCPU (temporary, until block 2400)
