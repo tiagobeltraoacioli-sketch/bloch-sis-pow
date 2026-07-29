@@ -61,11 +61,21 @@ pub fn build_template_for_sv2(
         }
     }
 
+    // RETARGET-BOUNDARY FIX: `tip.bits` are the bits of the TIP block, but
+    // the template is for the NEXT block (`height`). At a retarget boundary
+    // the validator demands the retargeted bits — a template carrying the
+    // stale tip bits is rejected ("invalid difficulty") on every window
+    // boundary. Use the validator's single source of truth (shared with
+    // accept_block, the solo miner, V1 stratum, and getblocktemplate):
+    // off-boundary it equals the tip/current bits; at a boundary it applies
+    // the retarget.
+    let bits = crate::pow::genesis2_expected_bits(&ctx.store, height);
+
     Ok(Template::build(
         tip.parents.clone(),
         height,
         blue_score,
-        tip.bits,
+        bits,
         miner_spk,
         total_fees,
         other_txs,

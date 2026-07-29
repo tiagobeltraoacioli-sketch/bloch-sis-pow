@@ -600,10 +600,14 @@ impl TxBuilder {
 
         // Chain-id (Roadmap #8) — folded into every input's sighash, so it MUST
         // match the node validator's node_chain_id() or the signature is rejected.
-        // Derived from the address prefix (mainnet/testnet) by default; override to
-        // Genesis-2 via BLOCH_GENESIS2=1 when signing for the SHA-256d carry-over
-        // chain (whose addresses keep the mainnet prefix but whose chain-id differs).
-        let chain_id = if std::env::var("BLOCH_GENESIS2").is_ok() {
+        // Derived from the address prefix (mainnet/testnet) by default; override
+        // via BLOCH_GENESIS3=1 (Genesis-3 mainnet) or BLOCH_GENESIS2=1
+        // (Genesis-2 devnet) when signing for a SHA-256d carry-over chain
+        // (whose addresses keep the mainnet prefix but whose chain-id differs).
+        // BLOCH_GENESIS3 wins if both are set (explicit and newest chain).
+        let chain_id = if std::env::var("BLOCH_GENESIS3").is_ok() {
+            crate::core::ChainId::Genesis3Mainnet
+        } else if std::env::var("BLOCH_GENESIS2").is_ok() {
             crate::core::ChainId::Genesis2Devnet
         } else if keypair.address.starts_with(TESTNET_PREFIX) {
             crate::core::ChainId::Testnet

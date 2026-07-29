@@ -118,17 +118,23 @@ pub fn next_bits(
     )
 }
 
-/// Genesis-2 devnet expected difficulty `bits` for the block at `height`.
+/// SHA-256d expected difficulty `bits` for the block at `height` — serves
+/// BOTH SHA-256d chains (Genesis-2 devnet AND Genesis-3 mainnet; the name
+/// keeps its historical `genesis2_` prefix).
 ///
 /// SINGLE SOURCE OF TRUTH shared by `accept_block` (validation), the internal
-/// solo miner, and the `getblocktemplate` RPC so every producer serves EXACTLY
-/// the target the validator enforces. Genesis-2 is a fresh SHA-256d chain with
-/// a Bitcoin-style windowed retarget: `current_bits` (persisted in meta) holds
-/// the active target between boundaries, recomputed every
-/// `GENESIS2_RETARGET_WINDOW` blocks from that window's timespan. It must NEVER
-/// be confused with the SIS ASERT path anchored at `GENESIS_BITS` (0x2100ffff),
-/// which — on this chain — yields a trivial diff-1 target that floods the DAG
-/// with same-height blocks.
+/// solo miner, the stratum V1/V2 template builders, and the
+/// `getblocktemplate` RPC so every producer serves EXACTLY the target the
+/// validator enforces. Both chains run a Bitcoin-style windowed retarget:
+/// `current_bits` (persisted in meta) holds the active target between
+/// boundaries, recomputed every `GENESIS2_RETARGET_WINDOW` blocks from that
+/// window's timespan. Genesis-3 shares the constants (`GENESIS3_BITS ==
+/// GENESIS2_BITS`, `GENESIS3_RETARGET_WINDOW == GENESIS2_RETARGET_WINDOW` —
+/// enforced by const asserts in core/mod.rs), so this one function is correct
+/// for both; if G3 ever diverges, those asserts fire and this path must be
+/// made chain-aware. It must NEVER be confused with the SIS ASERT path
+/// anchored at `GENESIS_BITS` (0x2100ffff), which — on these chains — yields
+/// a trivial diff-1 target that floods the DAG with same-height blocks.
 pub fn genesis2_expected_bits(store: &crate::storage::Storage, height: u64) -> u32 {
     let cur = store.get_meta("current_bits").ok().flatten()
         .and_then(|b| <[u8; 4]>::try_from(b.as_slice()).ok())
@@ -316,9 +322,12 @@ pub fn mine_pow_parallel(
                 .map(|(nonce, solution)| (nonce, solution.to_vec()))
         }
         PowAlgorithm::Sha256d => {
-            // Height-gated endianness fork: grind for Bitcoin little-endian at
-            // and above the fork height so the mined block validates.
-            let little_endian = height >= bloch_crypto::core::SHA256D_LE_FORK_HEIGHT;
+            // Per-chain endianness rule (single source of truth:
+            // core::sha256d_le_fork_height_for — Genesis-2 flag-day at
+            // SHA256D_LE_FORK_HEIGHT, Genesis-3 little-endian from height 0):
+            // grind for exactly the comparison the validator will apply.
+            let little_endian =
+                height >= bloch_crypto::core::sha256d_le_fork_height_for(node_chain_id());
             mine_sha256d_preimage(preimage, bits, start_nonce, max_attempts, threads, little_endian)
                 .map(|nonce| (nonce, Vec::new()))
         }
