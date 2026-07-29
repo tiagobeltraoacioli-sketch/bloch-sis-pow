@@ -1,0 +1,77 @@
+# Akash SDL — Coherence SP1 prover (GPU) for Bloch shielded transactions (roadmap P1).
+# Manual deploy: paste this into the Akash Console (console.akash.network) → Deploy,
+# or `provider-services tx deployment create akash-deploy.yaml --from <wallet>`.
+#
+# PREREQUISITE — Akash pulls a PRE-BUILT image, it does not build the Dockerfile.
+# Build + push the prover image to a PUBLIC registry first (from repo root):
+#   docker build -f deploy/sp1-prover/Dockerfile -t <registry>/bloch-sp1-prover:latest .
+#   docker push <registry>/bloch-sp1-prover:latest
+# then set `image:` below. (CPU-only fallback: build with --build-arg CUDA_FEATURE=""
+# and drop the `gpu:` block in the profile.)
+---
+version: "2.0"
+
+services:
+  prover:
+    # ← replace with your pushed image (Docker Hub / ghcr.io / etc.)
+    image: docker.io/YOUR_USER/bloch-sp1-prover:latest
+    expose:
+      - port: 8080
+        as: 80
+        to:
+          - global: true
+      # For HTTPS, front it with your own TLS/reverse-proxy, or expose 443 via a
+      # provider that terminates TLS. The service itself speaks plain HTTP on 8080.
+    env:
+      - RUST_LOG=info
+      - PORT=8080
+      - SP1_HOME=/data/.sp1
+      # Guards POST /prove. Generate one: `openssl rand -hex 32` and set it here
+      # (and in the wallet/prover client). Do NOT ship this file with a real token.
+      - PROVER_AUTH_TOKEN=CHANGE_ME_openssl_rand_hex_32
+    params:
+      storage:
+        artifacts:
+          mount: /data          # SP1 proving-key / circuit-artifact cache (GBs)
+          readOnly: false
+
+profiles:
+  compute:
+    prover:
+      resources:
+        cpu:
+          units: 8
+        memory:
+          size: 32Gi
+        storage:
+          - size: 16Gi          # ephemeral root
+          - name: artifacts     # persistent cache → warm cold-starts
+            size: 60Gi
+            attributes:
+              persistent: true
+              class: beta3
+        gpu:
+          units: 1
+          attributes:
+            vendor:
+              nvidia:
+                # L40S matches the Fly setup; swap/add models by availability.
+                - model: l40s
+                - model: a100
+                - model: h100
+                - model: rtx4090
+  placement:
+    akash:
+      # Optional: restrict to audited providers.
+      # attributes:
+      #   host: akash
+      pricing:
+        prover:
+          denom: uakt
+          amount: 100000        # max uAKT/block bid you'll accept; raise if no bids
+
+deployment:
+  prover:
+    akash:
+      profile: prover
+      count: 1
