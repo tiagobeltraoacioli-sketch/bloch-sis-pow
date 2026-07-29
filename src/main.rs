@@ -3801,9 +3801,9 @@ mod euvm_hook_tests {
             &block, &spend, &store, &mut spent, 0,
             EUVM_PER_TX_GAS, EUVM_BLOCK_GAS, &mut gas_used,
         ).expect("valid contract spend must be accepted");
-        // fee 10, burn 50% → 5 creditable; the outpoint is marked spent.
-        assert_eq!(EUVM_BURN_BPS, 5_000, "test assumes the 50% burn constant");
-        assert_eq!(fee, 5);
+        // fee 10, burn 20% → 8 creditable; the outpoint is marked spent.
+        assert_eq!(EUVM_BURN_BPS, 2_000, "test assumes the 20% burn constant");
+        assert_eq!(fee, 8);
         assert!(gas_used > 0, "VM execution must consume gas");
         assert!(spent.contains(&(spend.inputs[0].prev_txid, 0)));
     }
