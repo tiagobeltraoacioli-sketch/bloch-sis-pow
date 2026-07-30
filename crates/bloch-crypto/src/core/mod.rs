@@ -2042,7 +2042,7 @@ pub const GENESIS3_CARRYOVER_TOTAL_SAT: u128 = 347_544_120_000_000_000;
 /// (2026-07-29 relaunch decision), deliberately DISTINCT from
 /// GENESIS2_TIMESTAMP (1_784_500_000) so the two genesis headers differ even
 /// before the coinbase banner does. 1_785_500_000 ≈ 2026-08-01 00:53:20 UTC.
-pub const GENESIS3_TIMESTAMP: u64 = 1_785_500_000;
+pub const GENESIS3_TIMESTAMP: u64 = 1_785_365_935;
 
 /// Genesis-3 compact difficulty bits: same easy pow-limit start as Genesis-2
 /// (0x1d00ffff == Bitcoin diff-1). The windowed retarget ramps real hashrate
@@ -2067,17 +2067,17 @@ const _: () = assert!(GENESIS3_BITS == GENESIS2_BITS);
 /// `cargo run --release --bin grind_genesis3` and paste the printed
 /// constants here. While stale, `create_genesis3_block` PANICS (fail closed)
 /// and a `--genesis3` node cannot start — never fail open.
-pub const GENESIS3_NONCE: u64 = 2_466_417_754;
+pub const GENESIS3_NONCE: u64 = 10_751_391;
 
 /// Expected canonical Genesis-3 block hash for the fail-closed startup check.
 /// ⚠ PLACEHOLDER (all-zero) until the grind_genesis3 ceremony bakes the real
 /// value. While all-zero, the hash pin is SKIPPED (the PoW check above still
 /// fail-closes on the placeholder nonce); once nonzero it is ENFORCED.
 pub const GENESIS3_EXPECTED_HASH: [u8; 32] = [
-    0x6e, 0xc7, 0xb5, 0xe3, 0xf0, 0x9e, 0x24, 0x80,
-    0x91, 0xdf, 0xda, 0xc9, 0xf1, 0xaa, 0x52, 0x97,
-    0x3d, 0x12, 0x22, 0xd8, 0xe5, 0x34, 0xa2, 0x1e,
-    0x6a, 0xa2, 0xbb, 0x21, 0xc6, 0x09, 0xe6, 0x0d,
+    0xc7, 0x52, 0x2d, 0x0e, 0xf2, 0x9f, 0xe6, 0x74,
+    0x63, 0xbe, 0x45, 0xa8, 0x09, 0x5d, 0xb7, 0xf5,
+    0xe2, 0x3b, 0x95, 0x42, 0xdd, 0xe8, 0x67, 0x36,
+    0x3e, 0xa3, 0x13, 0x16, 0x47, 0xaf, 0xf3, 0x48,
 ];
 
 /// Canonical Genesis-3 miner script_pubkey: the founder address hash-20, same

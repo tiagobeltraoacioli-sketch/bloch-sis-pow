@@ -2138,7 +2138,15 @@ fn make_stratum_accept_block_cb(
         block.validate_structure()
             .map_err(|e| format!("structural validation: {}", e))?;
 
-        let block_hash = block.header.pow_hash();
+        // FIX (Genesis-3 SHA-256d): identify the block by block_hash(), NOT
+        // header.pow_hash(). The old pow_hash keying was assumed dormant "under
+        // Module-SIS" (stratum refused at startup), but G3 is SHA-256d so this
+        // callback is LIVE — and keying the DAG by pow_hash while put_block
+        // stores the body by block_hash made has_body(tip) fail, so
+        // best_bodied_tip only ever saw genesis → template stuck at h0 → every
+        // mined block became an h1 sibling and the chain never reached h2.
+        // Using block_hash() unifies identity with the network/RPC accept path.
+        let block_hash = block.block_hash();
         let height     = block.height;
         let blue_score = block.blue_score;
 
