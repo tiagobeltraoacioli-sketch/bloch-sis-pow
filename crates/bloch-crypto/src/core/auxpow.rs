@@ -272,6 +272,51 @@ impl AuxPow {
     }
 }
 
+// ── Pool side (merge-mining producer) ────────────────────────────────────────
+//
+// These build the artifacts a merge-mining pool embeds in the PARENT Bitcoin
+// block so the resulting AuxPow verifies on Bloch. Single source of truth for
+// the commitment format, shared by the pool and the node's `verify`.
+
+/// The merge-mining commitment a pool must place in the parent Bitcoin
+/// coinbase's scriptSig: `fa be 6d 6d ‖ bloch_block_hash ‖ size(=1) ‖ nonce(=0)`
+/// (single merge-mined chain — Bloch is the only aux chain, slot 0).
+pub fn merge_mining_commitment(bloch_block_hash: [u8; 32]) -> Vec<u8> {
+    let mut c = Vec::with_capacity(4 + 32 + 4 + 4);
+    c.extend_from_slice(&MERGED_MINING_MAGIC);
+    c.extend_from_slice(&bloch_block_hash);
+    c.extend_from_slice(&1u32.to_le_bytes()); // merkle_size = 2^0
+    c.extend_from_slice(&0u32.to_le_bytes()); // merkle_nonce (index 0 for single chain)
+    c
+}
+
+/// Compute the Bitcoin merkle branch of the tx at `index` (the coinbase is 0)
+/// from the parent block's `txids`, in the internal byte order the parent
+/// header's merkle root uses. Folding the tx's txid up this branch (see
+/// [`AuxPow::verify`]) reproduces that merkle root.
+pub fn coinbase_merkle_branch(txids: &[[u8; 32]], index: u32) -> Vec<[u8; 32]> {
+    let mut branch = Vec::new();
+    let mut level: Vec<[u8; 32]> = txids.to_vec();
+    let mut idx = index as usize;
+    while level.len() > 1 {
+        if level.len() % 2 == 1 {
+            let last = *level.last().unwrap();
+            level.push(last); // Bitcoin duplicates the last node on an odd level
+        }
+        branch.push(level[idx ^ 1]);
+        let mut next = Vec::with_capacity(level.len() / 2);
+        for pair in level.chunks(2) {
+            let mut buf = [0u8; 64];
+            buf[..32].copy_from_slice(&pair[0]);
+            buf[32..].copy_from_slice(&pair[1]);
+            next.push(sha256d(&buf));
+        }
+        level = next;
+        idx >>= 1;
+    }
+    branch
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -398,6 +443,62 @@ mod tests {
         assert_eq!(used2, bytes.len());
         // Truncated → error, never a panic.
         assert!(AuxPow::from_bytes(&bytes[..bytes.len() - 1]).is_err());
+    }
+
+    /// Full merkle root of a Bitcoin tx list (duplicating the last node on odd
+    /// levels), for cross-checking the pool's coinbase branch.
+    fn merkle_root_of(txids: &[[u8; 32]]) -> [u8; 32] {
+        let mut level = txids.to_vec();
+        while level.len() > 1 {
+            if level.len() % 2 == 1 {
+                let last = *level.last().unwrap();
+                level.push(last);
+            }
+            let mut next = Vec::new();
+            for pair in level.chunks(2) {
+                let mut b = [0u8; 64];
+                b[..32].copy_from_slice(&pair[0]);
+                b[32..].copy_from_slice(&pair[1]);
+                next.push(sha256d(&b));
+            }
+            level = next;
+        }
+        level[0]
+    }
+
+    #[test]
+    fn pool_commitment_and_branch_produce_a_verifiable_auxpow() {
+        // The Bloch block a pool merge-mines.
+        let bloch_hash = [0x9Au8; 32];
+
+        // POOL: embed the commitment in the parent Bitcoin coinbase.
+        let mut coinbase = b"btc-coinbase-prefix".to_vec();
+        coinbase.extend_from_slice(&merge_mining_commitment(bloch_hash));
+        coinbase.extend_from_slice(b"btc-coinbase-suffix");
+        let coinbase_txid = sha256d(&coinbase);
+
+        // A parent Bitcoin block: coinbase + 2 other txs (3 = odd level, so the
+        // duplicate-last path is exercised).
+        let txids = vec![coinbase_txid, [0x01u8; 32], [0x02u8; 32]];
+        let branch = coinbase_merkle_branch(&txids, 0);
+        let root = merkle_root_of(&txids);
+        // The pool's branch folds the coinbase to the real parent merkle root.
+        assert_eq!(merkle_fold(coinbase_txid, &branch, 0), root);
+
+        // POOL assembles the AuxPow proof.
+        let aux = AuxPow {
+            parent_header: parent_header_with_merkle(root),
+            coinbase_tx: coinbase,
+            coinbase_branch: branch,
+            coinbase_index: 0,
+            chain_branch: vec![],
+            chain_index: 0,
+        };
+
+        // NODE accepts it — the pool↔node merged-mining contract holds.
+        assert_eq!(aux.verify(bloch_hash, 0x20ff_ffff), Ok(()));
+        // ...but only for THIS Bloch block (the commitment binds it).
+        assert_eq!(aux.verify([0x00u8; 32], 0x20ff_ffff), Err(AuxPowError::AuxRootMismatch));
     }
 
     #[test]
