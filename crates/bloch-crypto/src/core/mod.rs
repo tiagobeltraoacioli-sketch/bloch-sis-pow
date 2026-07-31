@@ -11,8 +11,14 @@ use serde::{Serialize, Deserialize};
 pub mod tokenomics_v2;
 
 /// Merged-mining (AuxPoW) verifier — dual-mine Bloch with Bitcoin (SHA-256d).
-/// Verifier + tests only; consensus wiring is a separate flag-day change.
 pub mod auxpow;
+
+/// Height at/above which merged-mining (AuxPoW) blocks are accepted. DISABLED
+/// by default (`u64::MAX`): merged mining is plumbed but INERT until a
+/// coordinated flag-day sets a real activation height (exactly like the earlier
+/// SHA-256d-LE fork). A block carrying an `auxpow` below this height is invalid
+/// (fail closed), and it never affects `block_hash`.
+pub const AUXPOW_ACTIVATION_HEIGHT: u64 = u64::MAX;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -1284,6 +1290,14 @@ pub struct Block {
     /// transparent txs + pow_solution.
     #[serde(default)]
     pub shielded_transactions: Vec<coherence_core::ShieldedTx>,
+    /// Merged-mining (AuxPoW) proof: when present AND the block height is at/above
+    /// [`AUXPOW_ACTIVATION_HEIGHT`], the block's PoW is provided by a parent
+    /// Bitcoin block that commits to this block (see [`auxpow`]). `None` for
+    /// natively-mined blocks (the only kind before activation) — so blocks
+    /// without it are byte-identical to before (genesis-preserving). Not part of
+    /// `block_hash` (the AuxPoW commits TO the block hash).
+    #[serde(default)]
+    pub auxpow: Option<auxpow::AuxPow>,
 }
 
 impl Block {
@@ -1345,6 +1359,14 @@ impl Block {
         write_varint(&mut out, self.shielded_transactions.len() as u64);
         for stx in &self.shielded_transactions {
             write_shielded_tx(&mut out, stx);
+        }
+
+        // Optional merged-mining (AuxPoW) trailer — present ONLY when this block
+        // was merge-mined, so natively-mined blocks + genesis stay byte-identical
+        // to before. Never part of block IDENTITY (it commits TO the block hash).
+        if let Some(aux) = &self.auxpow {
+            out.push(1);
+            out.extend_from_slice(&aux.to_bytes());
         }
 
         out
@@ -1450,7 +1472,26 @@ impl Block {
             body_offset += sh_cur.position() as usize;
         }
 
-        // Strict: no trailing bytes past the shielded suffix.
+        // Optional merged-mining (AuxPoW) trailer (backward-compatible): older
+        // blocks have none — when `body_offset == body.len()` the block is
+        // natively mined and `auxpow` is None.
+        let auxpow = if body_offset < body.len() {
+            let present = body[body_offset];
+            body_offset += 1;
+            match present {
+                0 => None,
+                1 => {
+                    let (aux, used) = auxpow::AuxPow::from_bytes(&body[body_offset..])?;
+                    body_offset += used;
+                    Some(aux)
+                }
+                other => return Err(format!("invalid auxpow presence byte {other}")),
+            }
+        } else {
+            None
+        };
+
+        // Strict: no trailing bytes past the (optional) auxpow trailer.
         if body_offset != body.len() {
             return Err(format!(
                 "trailing bytes in block body: parsed {} of {}",
@@ -1465,6 +1506,7 @@ impl Block {
             height,
             pow_solution,
             shielded_transactions,
+            auxpow,
         })
     }
 
@@ -1536,16 +1578,28 @@ impl Block {
                 .is_ok()
             }
             PowAlgorithm::Sha256d => {
-                // Genesis-2: double SHA-256 over the 80-byte MiningHeader
-                // projection, Bitcoin semantics. `pow_solution` MUST be empty
-                // — a stale/foreign Module-SIS witness on a SHA-256d chain is
+                // A stale/foreign Module-SIS witness on a SHA-256d chain is
                 // consensus-invalid, not merely ignored (fail closed).
-                self.pow_solution.is_empty()
-                    && sha256d_pow_valid(
+                if !self.pow_solution.is_empty() {
+                    return false;
+                }
+                match &self.auxpow {
+                    // MERGED-MINING (AuxPoW): the PoW comes from a parent Bitcoin
+                    // block that commits to THIS block's hash and meets Bloch's
+                    // own target. Same SHA-256d work secures both chains.
+                    Some(aux) if self.height >= AUXPOW_ACTIVATION_HEIGHT => {
+                        aux.verify(self.block_hash(), self.header.bits).is_ok()
+                    }
+                    // AuxPoW carried before activation → invalid (fail closed).
+                    Some(_) => false,
+                    // NATIVE SHA-256d (Genesis-2): double SHA-256 over the
+                    // 80-byte MiningHeader projection, Bitcoin semantics.
+                    None => sha256d_pow_valid(
                         &self.header.pow_hash(),
                         &bits_to_target(self.header.bits),
                         self.height,
-                    )
+                    ),
+                }
             }
         }
     }
@@ -1826,7 +1880,9 @@ pub fn create_genesis_block_with_bits(
         // genesis (miner = FOUNDER_ADDRESS_HEX, bits = GENESIS_BITS); with
         // other args the block is well-formed but its PoW won't verify.
         pow_solution: GENESIS_POW_SOLUTION.to_vec(),
-        shielded_transactions: Vec::new(),    }
+        shielded_transactions: Vec::new(),
+            auxpow: None,
+        }
 }
 
 // ── Genesis-2 (carry-over chain, SHA-256d PoW) ───────────────────────────────
@@ -1991,6 +2047,7 @@ pub fn create_genesis2_block_with_params(
         // arm REQUIRES pow_solution.is_empty() (witness smuggling rejected).
         pow_solution: Vec::new(),
         shielded_transactions: Vec::new(),
+        auxpow: None,
     }
 }
 
@@ -2165,6 +2222,7 @@ pub fn create_genesis3_block_with_params(
         // REQUIRES pow_solution.is_empty()).
         pow_solution: Vec::new(),
         shielded_transactions: Vec::new(),
+        auxpow: None,
     }
 }
 
@@ -2551,7 +2609,36 @@ mod sf1_tests {
             height,
             pow_solution: solution.to_vec(),
             shielded_transactions: vec![],
+            auxpow: None,
         }
+    }
+
+    #[test]
+    fn block_auxpow_trailer_round_trips_and_none_is_byte_compatible() {
+        let mut blk = create_genesis2_block(&[0u8; 20]);
+
+        // None: no trailer — round-trips and parses back to None.
+        let none_bytes = blk.to_bitcoin_bytes();
+        let back = Block::from_bitcoin_bytes(&none_bytes).expect("None round-trips");
+        assert!(back.auxpow.is_none());
+
+        // Some: attach an AuxPoW (serialization does not validate PoW).
+        let aux = auxpow::AuxPow {
+            parent_header: vec![7u8; 80],
+            coinbase_tx: b"\xfa\xbe\x6d\x6d coinbase".to_vec(),
+            coinbase_branch: vec![[1u8; 32], [2u8; 32]],
+            coinbase_index: 0,
+            chain_branch: vec![],
+            chain_index: 0,
+        };
+        blk.auxpow = Some(aux.clone());
+        let some_bytes = blk.to_bitcoin_bytes();
+        // Exactly one presence byte + the encoded trailer longer than None.
+        assert_eq!(some_bytes.len(), none_bytes.len() + 1 + aux.to_bytes().len());
+        let back2 = Block::from_bitcoin_bytes(&some_bytes).expect("Some round-trips");
+        assert_eq!(back2.auxpow, Some(aux));
+        // The None encoding is a strict prefix of nothing extra — genesis-preserving.
+        assert_eq!(&some_bytes[..none_bytes.len()], &none_bytes[..]);
     }
 
     /// Pre-searched start nonce whose FIRST 4096-candidate window contains a
