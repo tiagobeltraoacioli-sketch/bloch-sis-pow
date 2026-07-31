@@ -10,6 +10,10 @@ use serde::{Serialize, Deserialize};
 // removed in Sprint 2.1.D C4.
 pub mod tokenomics_v2;
 
+/// Merged-mining (AuxPoW) verifier — dual-mine Bloch with Bitcoin (SHA-256d).
+/// Verifier + tests only; consensus wiring is a separate flag-day change.
+pub mod auxpow;
+
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 pub const MAINNET_PREFIX:        &str  = "bloch1q";
