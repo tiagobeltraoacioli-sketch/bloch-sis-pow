@@ -10,6 +10,9 @@ pub mod rpc;
 /// win, produce the AuxPoW blob the Bloch node accepts. SCAFFOLD (see
 /// docs/MERGED-MINING.md); format pinned to `bloch-crypto::core::auxpow`.
 pub mod btc_rpc;
+/// Bitcoin block serialization primitives (vector-tested against the genesis
+/// block + BIP CompactSize/BIP141) for the merged-mining BTC-relay path.
+pub mod btc_block;
 pub mod mergedmining;
 /// Merged-mining engine: composes the node + bitcoind RPCs with the
 /// `mergedmining` producers into a serveable round + dual-submit decision.
