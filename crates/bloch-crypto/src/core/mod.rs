@@ -19,7 +19,7 @@ pub mod auxpow;
 /// SHA-256d-LE fork). A block carrying an `auxpow` below this height is invalid
 /// (fail closed), and it never affects `block_hash`.
 #[cfg(not(feature = "auxpow-rehearsal"))]
-pub const AUXPOW_ACTIVATION_HEIGHT: u64 = u64::MAX;
+pub const AUXPOW_ACTIVATION_HEIGHT: u64 = 8500; // FLAG-DAY 2026-08-01 (G3 mainnet): merged mining activates at height 8500 (chain was ~7503 at the coordinated fleet upgrade). Below this the binary is behaviour-identical to the pre-AuxPoW node; a block carrying an `auxpow` below 8500 stays fail-closed.
 /// REGTEST / REHEARSAL ONLY — enabled by the `auxpow-rehearsal` cargo feature,
 /// which a MAINNET artifact never sets. Activating at height 0 lets a local,
 /// off-mainnet build actually ACCEPT merged-mined blocks (validate_pow's active
