@@ -14,6 +14,9 @@ pub mod mergedmining;
 /// Merged-mining engine: composes the node + bitcoind RPCs with the
 /// `mergedmining` producers into a serveable round + dual-submit decision.
 pub mod merged_engine;
+/// Merged-mining Stratum SERVER handler (the socket wire): a pure per-worker
+/// protocol state machine + the async loop that drives the engine.
+pub mod merged_serve;
 pub mod router;
 pub mod server;
 pub mod metrics;
