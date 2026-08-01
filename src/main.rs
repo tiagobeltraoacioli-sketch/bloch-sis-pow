@@ -1672,7 +1672,9 @@ async fn main() {
                     blue_score:   current_blue_score + 1,
                     height:       current_height + 1,
                     pow_solution: Vec::new(),
-                    shielded_transactions: Vec::new(),                };
+                    shielded_transactions: Vec::new(),
+                    auxpow: None,
+                };
 
                 // Chain-selectable PoW: route through the SAME dispatcher the
                 // validator uses (pow::mine_pow_parallel → pow_algorithm), so the
@@ -3419,7 +3421,8 @@ mod external_submission_tests {
             height: 1,
             pow_solution: Vec::new(),
             shielded_transactions: Vec::new(),
-        };
+                    auxpow: None,
+                };
 
         if mine {
             let preimage = block.header.pow_preimage();

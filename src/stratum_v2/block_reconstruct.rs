@@ -192,7 +192,9 @@ pub fn reconstruct_block_for_sv2_submit(
         blue_score: template.blue_score,
         height:     template.height,
         pow_solution: Vec::new(),
-        shielded_transactions: Vec::new(),    };
+        shielded_transactions: Vec::new(),
+        auxpow: None,
+    };
 
     // AA.0 invariant check — BlockHeader projection must match
     // MiningHeader projection. Debug-only; catastrophic drift would

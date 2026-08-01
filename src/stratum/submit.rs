@@ -287,7 +287,9 @@ pub fn handle_submit(
         blue_score: template.blue_score,
         height:     template.height,
         pow_solution: Vec::new(),
-        shielded_transactions: Vec::new(),    };
+        shielded_transactions: Vec::new(),
+        auxpow: None,
+    };
 
     // Sanity: the assembled block's pow_hash must equal mh.pow_hash.
     // If not, the MiningHeader projection in core::BlockHeader has drifted
