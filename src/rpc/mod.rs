@@ -753,6 +753,105 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             }
         }
 
+        // ── Merged mining (AuxPoW) pool seam: createauxblock / submitauxblock ──
+        //
+        // Namecoin-style light-pool RPCs. The NODE builds + caches the candidate
+        // Bloch block (so it owns the exact `block_hash()` the pool commits into
+        // the parent Bitcoin coinbase) and accepts the AuxPoW proof back. Merged
+        // mining is INERT until AUXPOW_ACTIVATION_HEIGHT: `validate_pow` fails a
+        // pre-activation auxpow CLOSED, so on mainnet these build a candidate but
+        // the submit is rejected until a coordinated flag-day. See the pool side
+        // in pool-proxy/src/mergedmining.rs and docs/MERGED-MINING.md.
+        "createauxblock" => {
+            let addr = params.and_then(|p| p.get(0)).and_then(|v| v.as_str()).unwrap_or("");
+            let miner_spk = match parse_address(addr) {
+                Some(h) => h,
+                None => return json!({ "error": "invalid pool payout address" }),
+            };
+            // Merged mining requires a SHA-256d chain (shared work with Bitcoin).
+            if !matches!(
+                crate::core::pow_algorithm(crate::core::node_chain_id()),
+                crate::core::PowAlgorithm::Sha256d
+            ) {
+                return json!({ "error": "merged mining requires a SHA-256d chain" });
+            }
+            // Snapshot DAG on BODIED tips — identical rule to getblocktemplate.
+            let (parents, height, blue_score) = {
+                let d = state.dag.read();
+                let tips = d.bodied_tips(|h| state.store.get_block(h).ok().flatten().is_some());
+                if tips.is_empty() {
+                    return json!({ "error": "node has no bodied tip yet (still syncing?)" });
+                }
+                let max_h = tips.iter().filter_map(|t| d.get_block_data(t)).map(|dd| dd.height).max().unwrap_or(0);
+                let max_bs = tips.iter().filter_map(|t| d.get_block_data(t)).map(|dd| dd.blue_score).max().unwrap_or(0);
+                (tips, max_h + 1, max_bs + 1)
+            };
+            let bits = crate::pow::genesis2_expected_bits(&state.store, height);
+            let txs = state.mempool.get_for_block(2000);
+            let total_fees: u64 = txs
+                .iter()
+                .map(|tx| state.mempool.get_entry(&tx.txid()).map(|e| e.fee).unwrap_or(0))
+                .sum();
+            let template = crate::stratum::jobs::Template::build(
+                parents, height, blue_score, bits, &miner_spk, total_fees, txs,
+                b"bloch-auxpow", format!("aux-{}", height),
+            );
+            let block = match template.candidate_block() {
+                Ok(b) => b,
+                Err(e) => return json!({ "error": format!("candidate build failed: {}", e) }),
+            };
+            let hash = block.block_hash();
+            aux_candidate_put(hash, block);
+            json!({
+                "hash":              hex::encode(hash),   // Bloch block hash → commit in the BTC coinbase
+                "bits":              bits,                // Bloch target the parent BTC PoW must meet
+                "height":            height,
+                "chainid":           crate::core::auxpow::AUXPOW_CHAIN_ID,
+                // Honesty markers: merged mining is inert until this height.
+                "activation_height": crate::core::AUXPOW_ACTIVATION_HEIGHT,
+                "active":            height >= crate::core::AUXPOW_ACTIVATION_HEIGHT,
+            })
+        }
+
+        "submitauxblock" => {
+            let hash_hex = params.and_then(|p| p.get(0)).and_then(|v| v.as_str()).unwrap_or("");
+            let aux_hex  = params.and_then(|p| p.get(1)).and_then(|v| v.as_str()).unwrap_or("");
+            let hash_bytes = match hex::decode(hash_hex) {
+                Ok(b) if b.len() == 32 => {
+                    let mut h = [0u8; 32];
+                    h.copy_from_slice(&b);
+                    h
+                }
+                _ => return json!({ "error": "invalid aux block hash (need 32-byte hex)" }),
+            };
+            let aux_bytes = match hex::decode(aux_hex) {
+                Ok(b) => b,
+                Err(_) => return json!({ "error": "invalid auxpow hex" }),
+            };
+            let aux = match crate::core::auxpow::AuxPow::from_bytes(&aux_bytes) {
+                Ok((v, _used)) => v,
+                Err(e) => return json!({ "error": format!("auxpow decode failed: {}", e) }),
+            };
+            let mut block = match aux_candidate_get(&hash_bytes) {
+                Some(b) => b,
+                None => return json!({ "error": "unknown aux hash — call createauxblock first (cache is small)" }),
+            };
+            // Cheap pre-check for a clear error; validate_pow inside the accept
+            // pipeline is the authority (and enforces AUXPOW_ACTIVATION_HEIGHT).
+            // block_hash() excludes auxpow, so it equals the pre-attach hash.
+            if let Err(e) = aux.verify(hash_bytes, block.header.bits) {
+                return json!({ "error": format!("auxpow does not prove this block: {:?}", e) });
+            }
+            block.auxpow = Some(aux);
+            match &state.submit_block {
+                None => json!({ "error": "submitauxblock not wired (node started without a block-submission hook)" }),
+                Some(hook) => match hook(block) {
+                    Ok(h) => json!({ "accepted": true, "hash": h }),
+                    Err(reason) => json!({ "error": format!("rejected: {}", reason) }),
+                },
+            }
+        }
+
         "getdaginfo" => {
             let dag = state.dag.read();
             let tips = dag.tips();
@@ -1324,6 +1423,36 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
+/// Bounded ring of merged-mining candidate blocks the node templated via
+/// `createauxblock`, keyed by `block_hash()`. `submitauxblock` looks a block up,
+/// attaches the AuxPoW, and routes it through the accept pipeline. Small (the
+/// pool re-creates a candidate each round); process-local (rebuilt on restart —
+/// the pool simply re-creates), which is fine because merged mining is inert on
+/// mainnet until AUXPOW_ACTIVATION_HEIGHT and the accept path re-validates.
+const AUX_CANDIDATE_CAP: usize = 64;
+
+#[allow(clippy::type_complexity)]
+fn aux_candidates() -> &'static std::sync::Mutex<std::collections::VecDeque<([u8; 32], crate::core::Block)>> {
+    static C: std::sync::OnceLock<std::sync::Mutex<std::collections::VecDeque<([u8; 32], crate::core::Block)>>> =
+        std::sync::OnceLock::new();
+    C.get_or_init(|| std::sync::Mutex::new(std::collections::VecDeque::new()))
+}
+
+fn aux_candidate_put(hash: [u8; 32], block: crate::core::Block) {
+    let mut c = aux_candidates().lock().unwrap();
+    if let Some(pos) = c.iter().position(|(h, _)| *h == hash) {
+        c.remove(pos);
+    }
+    c.push_back((hash, block));
+    while c.len() > AUX_CANDIDATE_CAP {
+        c.pop_front();
+    }
+}
+
+fn aux_candidate_get(hash: &[u8; 32]) -> Option<crate::core::Block> {
+    aux_candidates().lock().unwrap().iter().find(|(h, _)| h == hash).map(|(_, b)| b.clone())
+}
+
 /// Parse a bloch1q/bloch1t address to 20-byte pubkey hash
 /// Sprint K: Checksum-validated address parsing.
 /// Delegates to `Address::parse()` from Sprint A — enforces full 54-char
@@ -1389,6 +1518,23 @@ fn validate_tx_for_mempool(tx: &Transaction, store: &Arc<Storage>, current_heigh
         };
         if let Some(fee) = euvm_admit_tx_standalone(tx, &lookup)? {
             return Ok(fee);
+        }
+    }
+
+    // Dust policy (pool-DoS fix): refuse a tx carrying any sub-dust output
+    // (0 < value < DUST_THRESHOLD) at ADMISSION. Block consensus already
+    // rejects such a tx once mined (Block::validate_dust, which exempts the
+    // coinbase and scans every other tx), so a dust tx that slips into the
+    // mempool poisons every block template that includes it — a cheap way to
+    // make an honest pool produce nothing but rejected blocks. Reject it here,
+    // before the expensive signature checks, so it never reaches a template.
+    const DUST_THRESHOLD_SATS: u64 = 546;
+    for (i, o) in tx.outputs.iter().enumerate() {
+        if o.value > 0 && o.value < DUST_THRESHOLD_SATS {
+            return Err(format!(
+                "output {} below dust threshold ({} < {} sats)",
+                i, o.value, DUST_THRESHOLD_SATS
+            ));
         }
     }
 

@@ -256,6 +256,53 @@ impl Template {
             clean_jobs,
         ])
     }
+
+    /// Assemble the FULL candidate [`crate::core::Block`] this template mines,
+    /// with a FIXED (zero) extranonce and `nonce = 0`.
+    ///
+    /// For MERGED MINING the Bloch header carries no Bloch-side PoW — the parent
+    /// Bitcoin block's work secures it — so the node hands the pool THIS block's
+    /// `block_hash()` to commit into the BTC coinbase, caches the block, and
+    /// `submitauxblock` later attaches the AuxPoW and routes it through the same
+    /// accept path. Mirrors the reconstruction in `submit.rs` (coinb1 ‖ zero
+    /// extranonce ‖ coinb2, template ntime); `auxpow` is left `None` here and
+    /// filled by the submit RPC.
+    pub fn candidate_block(&self) -> Result<crate::core::Block, String> {
+        let mut coinbase_bytes =
+            Vec::with_capacity(self.coinb1.len() + EXTRANONCE_TOTAL_BYTES + self.coinb2.len());
+        coinbase_bytes.extend_from_slice(&self.coinb1);
+        coinbase_bytes.extend_from_slice(&[0u8; EXTRANONCE_TOTAL_BYTES]);
+        coinbase_bytes.extend_from_slice(&self.coinb2);
+
+        let coinbase_tx = crate::core::Transaction::from_stratum_bytes(&coinbase_bytes)
+            .map_err(|e| format!("candidate coinbase parse failed: {e}"))?;
+        if !coinbase_tx.is_coinbase() {
+            return Err("candidate reconstructed tx is not a coinbase".to_string());
+        }
+        let coinbase_txid = stratum_txid_of_bytes(&coinbase_bytes);
+        let merkle_root = walk_merkle_branch(coinbase_txid, &self.merkle_branch);
+
+        let mut transactions = Vec::with_capacity(self.other_txs.len() + 1);
+        transactions.push(coinbase_tx);
+        transactions.extend(self.other_txs.iter().cloned());
+
+        Ok(crate::core::Block {
+            header: crate::core::BlockHeader {
+                version:     self.version,
+                parents:     self.parents.clone(),
+                merkle_root: crate::core::MerkleRoot(merkle_root),
+                timestamp:   self.ntime as u64,
+                bits:        self.bits,
+                nonce:       0,
+            },
+            transactions,
+            blue_score: self.blue_score,
+            height:     self.height,
+            pow_solution: Vec::new(),
+            shielded_transactions: Vec::new(),
+            auxpow: None,
+        })
+    }
 }
 
 /// Stratum V1 transmits the previous-block hash with each 32-bit word
@@ -376,6 +423,59 @@ mod tests {
             }).collect();
         }
         level[0]
+    }
+
+    /// `candidate_block()` (the createauxblock core) yields a deterministic,
+    /// valid Bloch block, and a pool-built AuxPoW committing to its
+    /// `block_hash()` verifies — exactly the createauxblock→submitauxblock loop.
+    #[test]
+    fn candidate_block_is_deterministic_and_auxpow_binds_to_it() {
+        fn dsha(b: &[u8]) -> [u8; 32] {
+            Sha256::digest(Sha256::digest(b)).into()
+        }
+        let bits = 0x20ff_ffffu32; // easy parent target — no mining in the test
+        let template = Template::build(
+            vec![[0u8; 32]], // one parent
+            5_600,           // height
+            5_600,           // blue_score
+            bits,
+            &[0u8; 20],      // miner script_pubkey (address hash)
+            0,               // total_fees
+            vec![],          // no mempool txs
+            b"bloch-auxpow",
+            "aux-5600".to_string(),
+        );
+
+        let block = template.candidate_block().expect("candidate builds");
+        // Deterministic: rebuilding the same template yields the same identity.
+        let block2 = template.candidate_block().expect("candidate builds");
+        assert_eq!(block.block_hash(), block2.block_hash());
+        // Well-formed candidate: coinbase first, no Bloch PoW witness, no auxpow yet.
+        assert!(block.transactions[0].is_coinbase());
+        assert_eq!(block.height, 5_600);
+        assert_eq!(block.header.bits, bits);
+        assert!(block.pow_solution.is_empty());
+        assert!(block.auxpow.is_none());
+
+        // POOL commits to THIS block's hash in a parent Bitcoin coinbase.
+        let aux_hash = block.block_hash();
+        let mut coinbase = b"btc-cb-prefix".to_vec();
+        coinbase.extend_from_slice(&crate::core::auxpow::merge_mining_commitment(aux_hash));
+        coinbase.extend_from_slice(b"btc-cb-suffix");
+        let coinbase_txid = dsha(&coinbase); // single-tx parent → root == txid
+        let mut parent_header = [0u8; 80];
+        parent_header[36..68].copy_from_slice(&coinbase_txid);
+        parent_header[72..76].copy_from_slice(&bits.to_le_bytes());
+        let aux = crate::core::auxpow::AuxPow {
+            parent_header: parent_header.to_vec(),
+            coinbase_tx: coinbase,
+            coinbase_branch: vec![],
+            coinbase_index: 0,
+            chain_branch: vec![],
+            chain_index: 0,
+        };
+        // submitauxblock's pre-check: the proof binds to this exact block.
+        assert_eq!(aux.verify(aux_hash, block.header.bits), Ok(()));
     }
 
     #[test]

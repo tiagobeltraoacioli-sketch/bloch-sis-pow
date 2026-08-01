@@ -263,7 +263,8 @@ fn main() {
         blue_score: 0,
         height: 0,
         pow_solution: Vec::new(),
-        shielded_transactions: Vec::new(),    };
+        shielded_transactions: Vec::new(),
+        auxpow: None,    };
     let block_hash = final_block.block_hash();
 
     let pow_ok = final_block.validate_pow();
