@@ -108,6 +108,20 @@ pub struct TemplateInfo {
     pub blue_score: u64,
 }
 
+/// Result of the node's `createauxblock` (merged mining): the candidate Bloch
+/// block identity a pool commits into the parent Bitcoin coinbase, its target,
+/// and whether merged mining is ACTIVE at this height. On mainnet `active` is
+/// `false` (inert until a flag-day); a rehearsal build reports `true`.
+#[derive(Clone, Debug, Default)]
+pub struct AuxBlockInfo {
+    /// The Bloch block hash to commit (raw internal order — NOT reversed).
+    pub hash: [u8; 32],
+    /// Bloch's compact target the parent Bitcoin PoW must meet.
+    pub bits: u32,
+    pub height: u64,
+    pub active: bool,
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // The hand-rolled JSON-RPC-over-HTTP/1.1 client.
 // ──────────────────────────────────────────────────────────────────────────────
@@ -231,6 +245,59 @@ impl RpcClient {
         let v = self.call("getblocktemplate", Value::Null).await?;
         Ok(parse_template_info(&v))
     }
+
+    /// `createauxblock(pool_bloch_addr)` — the node builds + caches a candidate
+    /// Bloch block and returns its identity for merge-mining. The pool commits
+    /// `hash` into the parent Bitcoin coinbase and mines against `bits`.
+    pub async fn create_aux_block(&self, pool_bloch_addr: &str) -> Result<AuxBlockInfo, PoolError> {
+        let v = self.call("createauxblock", serde_json::json!([pool_bloch_addr])).await?;
+        if let Some(e) = v.get("error").and_then(Value::as_str) {
+            return Err(PoolError::Protocol(format!("createauxblock: {e}")));
+        }
+        let hash = v
+            .get("hash")
+            .and_then(Value::as_str)
+            .and_then(hex32_internal)
+            .ok_or_else(|| PoolError::Protocol("createauxblock: missing/short hash".into()))?;
+        Ok(AuxBlockInfo {
+            hash,
+            bits: v.get("bits").and_then(Value::as_u64).unwrap_or(0) as u32,
+            height: v.get("height").and_then(Value::as_u64).unwrap_or(0),
+            active: v.get("active").and_then(Value::as_bool).unwrap_or(false),
+        })
+    }
+
+    /// `submitauxblock(hash, auxpow_hex)` — hand the node the AuxPoW proof for a
+    /// Bloch-target win. Returns the accepted node block hash, or an error.
+    pub async fn submit_aux_block(
+        &self,
+        aux_hash: &[u8; 32],
+        auxpow_hex: &str,
+    ) -> Result<String, PoolError> {
+        let v = self
+            .call("submitauxblock", serde_json::json!([hex::encode(aux_hash), auxpow_hex]))
+            .await?;
+        if let Some(e) = v.get("error").and_then(Value::as_str) {
+            return Err(PoolError::Protocol(format!("submitauxblock: {e}")));
+        }
+        v.get("hash")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| PoolError::Protocol("submitauxblock: no accepted hash".into()))
+    }
+}
+
+/// Decode a 32-byte hex string in INTERNAL order (no reversal) — the Bloch
+/// `block_hash` is SHA3 in internal byte order, unlike Bitcoin's reversed
+/// display hashes.
+fn hex32_internal(s: &str) -> Option<[u8; 32]> {
+    let b = hex::decode(s).ok()?;
+    if b.len() != 32 {
+        return None;
+    }
+    let mut a = [0u8; 32];
+    a.copy_from_slice(&b);
+    Some(a)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
