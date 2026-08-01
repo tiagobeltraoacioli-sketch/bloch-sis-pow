@@ -168,19 +168,46 @@ impl ProxyServer {
 
                     let cfg = self.cfg.clone();
                     let metrics = self.metrics.clone();
-                    let registry = self.extranonce_registry.clone();
-                    let ledger = self.ledger.clone();
-                    tokio::spawn(async move {
-                        // Guard bumps workers_active now and releases on any exit.
-                        let _guard = WorkerGuard::new(metrics.clone());
-                        // Wrap the accepted stream; the router owns per-worker
-                        // session state from here.
-                        let down = DownstreamConn::new(stream, id, cfg.clone(), metrics.clone());
-                        match router::run_worker(down, cfg, metrics, registry, ledger).await {
-                            Ok(()) => log::info!("worker {} closed", id),
-                            Err(e) => log::info!("worker {} closed: {}", id, e),
-                        }
-                    });
+
+                    if let Some(m) = cfg.merged.clone() {
+                        // MERGED-MINING serve mode: the proxy generates jobs from
+                        // the node (createauxblock) + bitcoind (getblocktemplate)
+                        // and dual-checks shares (see crate::merged_serve).
+                        let node = crate::rpc::RpcClient::new(cfg.rpc_addr.clone(), cfg.rpc_api_key.clone());
+                        let btc = crate::btc_rpc::BtcRpcClient::new(
+                            m.btc_rpc_addr, m.btc_rpc_user, m.btc_rpc_pass,
+                        );
+                        let mcfg = crate::merged_engine::MergedConfig {
+                            pool_bloch_addr: m.pool_bloch_addr,
+                            btc_payout_script: m.btc_payout_script,
+                            coinbase_tag: m.coinbase_tag,
+                        };
+                        let refresh = std::time::Duration::from_secs(m.refresh_secs);
+                        let diff = m.share_diff;
+                        tokio::spawn(async move {
+                            let _guard = WorkerGuard::new(metrics.clone());
+                            match crate::merged_serve::serve_merged(
+                                stream, id.0, node, btc, mcfg, diff, refresh,
+                            ).await {
+                                Ok(()) => log::info!("merged worker {} closed", id),
+                                Err(e) => log::info!("merged worker {} closed: {}", id, e),
+                            }
+                        });
+                    } else {
+                        let registry = self.extranonce_registry.clone();
+                        let ledger = self.ledger.clone();
+                        tokio::spawn(async move {
+                            // Guard bumps workers_active now and releases on any exit.
+                            let _guard = WorkerGuard::new(metrics.clone());
+                            // Wrap the accepted stream; the router owns per-worker
+                            // session state from here.
+                            let down = DownstreamConn::new(stream, id, cfg.clone(), metrics.clone());
+                            match router::run_worker(down, cfg, metrics, registry, ledger).await {
+                                Ok(()) => log::info!("worker {} closed", id),
+                                Err(e) => log::info!("worker {} closed: {}", id, e),
+                            }
+                        });
+                    }
                 }
             }
         }
@@ -340,6 +367,39 @@ where
         cfg.max_workers = n;
     }
 
+    // Merged mining (AuxPoW): enabled by BLOCH_POOL_MERGED=on. When on, the
+    // pool addr + BTC RPC creds are REQUIRED (fail loud rather than serve broken
+    // jobs). The node endpoint reuses BLOCH_POOL_RPC / BLOCH_POOL_RPC_API_KEY.
+    if get("BLOCH_POOL_MERGED").map(|v| parse_bool("BLOCH_POOL_MERGED", &v)).transpose()?.unwrap_or(false) {
+        let require = |k: &str| -> Result<String, PoolError> {
+            get(k).filter(|v| !v.trim().is_empty())
+                .ok_or_else(|| PoolError::Config(format!("{k} is required when BLOCH_POOL_MERGED=on")))
+        };
+        let btc_payout_hex = require("BLOCH_POOL_BTC_PAYOUT_SCRIPT")?;
+        let btc_payout_script = hex::decode(btc_payout_hex.trim()).map_err(|e| {
+            PoolError::Config(format!("BLOCH_POOL_BTC_PAYOUT_SCRIPT: invalid hex: {e}"))
+        })?;
+        let coinbase_tag = get("BLOCH_POOL_MERGED_TAG").unwrap_or_else(|| "bloch/merged".to_string());
+        let share_diff = match get("BLOCH_POOL_MERGED_DIFF") {
+            Some(v) => parse_field::<f64>("BLOCH_POOL_MERGED_DIFF", &v)?,
+            None => 1.0,
+        };
+        let refresh_secs = match get("BLOCH_POOL_MERGED_REFRESH_SECS") {
+            Some(v) => parse_field::<u64>("BLOCH_POOL_MERGED_REFRESH_SECS", &v)?.max(1),
+            None => 15,
+        };
+        cfg.merged = Some(crate::types::MergedServeConfig {
+            btc_rpc_addr: require("BLOCH_POOL_BTC_RPC")?,
+            btc_rpc_user: get("BLOCH_POOL_BTC_RPC_USER").unwrap_or_default(),
+            btc_rpc_pass: get("BLOCH_POOL_BTC_RPC_PASS").unwrap_or_default(),
+            pool_bloch_addr: require("BLOCH_POOL_BLOCH_ADDR")?,
+            btc_payout_script,
+            coinbase_tag: coinbase_tag.into_bytes(),
+            share_diff,
+            refresh_secs,
+        });
+    }
+
     Ok(cfg)
 }
 
@@ -401,6 +461,46 @@ mod tests {
         assert_eq!(cfg.rpc_poll_secs, 10);
         assert_eq!(cfg.rpc_api_key, None);
         assert!(cfg.rpc_observer_enabled);
+    }
+
+    #[test]
+    fn merged_is_off_by_default_and_requires_fields_when_on() {
+        // Default: disabled.
+        let empty: HashMap<&str, &str> = HashMap::new();
+        assert!(config_from_getter(getter(&empty)).unwrap().merged.is_none());
+
+        // Enabled but missing the required pool/BTC-RPC fields → a Config error.
+        let mut m: HashMap<&str, &str> = HashMap::new();
+        m.insert("BLOCH_POOL_MERGED", "on");
+        assert!(config_from_getter(getter(&m)).is_err());
+
+        // Bad payout hex → error.
+        m.insert("BLOCH_POOL_BTC_RPC", "127.0.0.1:18443");
+        m.insert("BLOCH_POOL_BLOCH_ADDR", "bloch1qexample");
+        m.insert("BLOCH_POOL_BTC_PAYOUT_SCRIPT", "zznothex");
+        assert!(config_from_getter(getter(&m)).is_err());
+    }
+
+    #[test]
+    fn merged_full_config_populates() {
+        let mut m: HashMap<&str, &str> = HashMap::new();
+        m.insert("BLOCH_POOL_MERGED", "on");
+        m.insert("BLOCH_POOL_BTC_RPC", "127.0.0.1:18443");
+        m.insert("BLOCH_POOL_BTC_RPC_USER", "u");
+        m.insert("BLOCH_POOL_BTC_RPC_PASS", "p");
+        m.insert("BLOCH_POOL_BLOCH_ADDR", "bloch1qexample");
+        m.insert("BLOCH_POOL_BTC_PAYOUT_SCRIPT", "5121ff"); // arbitrary valid hex
+        m.insert("BLOCH_POOL_MERGED_DIFF", "0.5");
+        m.insert("BLOCH_POOL_MERGED_REFRESH_SECS", "7");
+        m.insert("BLOCH_POOL_MERGED_TAG", "mytag");
+        let cfg = config_from_getter(getter(&m)).unwrap();
+        let mm = cfg.merged.expect("merged enabled");
+        assert_eq!(mm.btc_rpc_addr, "127.0.0.1:18443");
+        assert_eq!(mm.pool_bloch_addr, "bloch1qexample");
+        assert_eq!(mm.btc_payout_script, vec![0x51, 0x21, 0xff]);
+        assert_eq!(mm.coinbase_tag, b"mytag".to_vec());
+        assert_eq!(mm.share_diff, 0.5);
+        assert_eq!(mm.refresh_secs, 7);
     }
 
     #[test]

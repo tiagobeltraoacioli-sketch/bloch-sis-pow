@@ -354,6 +354,33 @@ pub struct ProxyConfig {
     pub rpc_observer_enabled: bool,
     /// Max downstream connections accepted concurrently (fd guard).
     pub max_workers: usize,
+    /// Merged-mining (AuxPoW) serve config. `None` (default) = plain transparent
+    /// proxy. `Some` enables the merged-serve path: a downstream worker is served
+    /// jobs the proxy GENERATES from the node (`createauxblock`) + bitcoind
+    /// (`getblocktemplate`), and its shares are checked against BOTH targets
+    /// (see `crate::merged_serve`). Merged mining is inert on mainnet until the
+    /// node's `AUXPOW_ACTIVATION_HEIGHT` flag-day.
+    pub merged: Option<MergedServeConfig>,
+}
+
+/// Operator config for the merged-mining serve path. The NODE endpoint reuses
+/// [`ProxyConfig::rpc_addr`] / [`ProxyConfig::rpc_api_key`].
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct MergedServeConfig {
+    /// bitcoind JSON-RPC `host:port`.
+    pub btc_rpc_addr: String,
+    pub btc_rpc_user: String,
+    pub btc_rpc_pass: String,
+    /// Bloch payout address — the node's coinbase pays this (`createauxblock`).
+    pub pool_bloch_addr: String,
+    /// The pool's Bitcoin coinbase output scriptPubKey (BTC rewards).
+    pub btc_payout_script: Vec<u8>,
+    /// Arbitrary attribution tag placed in the BTC coinbase scriptSig.
+    pub coinbase_tag: Vec<u8>,
+    /// Per-worker share difficulty served downstream.
+    pub share_diff: f64,
+    /// Seconds between round refreshes (new BTC template + Bloch candidate).
+    pub refresh_secs: u64,
 }
 
 impl Default for ProxyConfig {
@@ -384,6 +411,7 @@ impl Default for ProxyConfig {
             rpc_api_key: None,
             rpc_observer_enabled: true,
             max_workers: 4096,
+            merged: None,
         }
     }
 }
