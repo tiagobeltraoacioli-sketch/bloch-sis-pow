@@ -3356,6 +3356,7 @@ mod external_submission_tests {
             height: 0,
             pow_solution: Vec::new(),
             shielded_transactions: Vec::new(),
+            auxpow: None,
         }
     }
 
@@ -3567,6 +3568,7 @@ mod external_submission_tests {
             height,
             pow_solution: Vec::new(),
             shielded_transactions: Vec::new(),
+            auxpow: None,
         }
     }
 
@@ -3753,6 +3755,7 @@ mod euvm_hook_tests {
             transactions: txs,
             blue_score: 0, height: 1, pow_solution: Vec::new(),
             shielded_transactions: Vec::new(),
+            auxpow: None,
         }
     }
 

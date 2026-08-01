@@ -932,6 +932,7 @@ mod reorg_hardening_unit_tests {
             height,
             pow_solution: Vec::new(),
             shielded_transactions: Vec::new(),
+            auxpow: None,
         }
     }
 
