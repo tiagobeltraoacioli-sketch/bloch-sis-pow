@@ -241,7 +241,12 @@ pub async fn submit_win(
                 if let Some((_hash, header, coinbase)) =
                     crate::btc_block::header_and_coinbase_from_auxpow(&blob)
                 {
-                    let block_hex = crate::btc_block::build_block_hex(&header, &coinbase, &[]);
+                    // BIP144 segwit block: the coinbase carries its witness (the
+                    // all-zero reserved value) so bitcoind can verify the witness
+                    // commitment. Empty-block relay (no mempool txs); a non-empty
+                    // relay would pass the template's raw txs as `other_txs`.
+                    let block_hex = crate::btc_block::build_segwit_block_hex(&header, &coinbase, &[0u8; 32], &[])
+                        .unwrap_or_else(|| crate::btc_block::build_block_hex(&header, &coinbase, &[]));
                     match btc.submit_block(&block_hex).await {
                         Ok(None) => log::info!("merged: BTC block relayed to bitcoind"),
                         Ok(Some(reason)) => log::warn!("merged: bitcoind rejected BTC block: {reason}"),
