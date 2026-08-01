@@ -126,6 +126,54 @@ pub fn header_and_coinbase_from_auxpow(blob: &[u8]) -> Option<([u8; 32], [u8; 80
     Some((block_header_hash(&header), header, coinbase))
 }
 
+/// Convert a non-witness (legacy) coinbase serialization into its BIP144 segwit
+/// form: insert the `00 01` marker+flag after the 4-byte version, and append the
+/// coinbase input's witness (`CompactSize(1) ‖ CompactSize(32) ‖ reserved(32)`)
+/// immediately before the 4-byte locktime. The txid (legacy serialization) is
+/// unchanged — only the wire/relay form gains the witness. `coinbase` must be a
+/// legacy tx of at least version(4)+…+locktime(4) bytes.
+pub fn coinbase_with_witness(coinbase: &[u8], witness_reserved: &[u8; 32]) -> Option<Vec<u8>> {
+    if coinbase.len() < 8 {
+        return None;
+    }
+    let (version, rest) = coinbase.split_at(4);
+    let body = &rest[..rest.len() - 4]; // inputs+outputs (between version and locktime)
+    let locktime = &coinbase[coinbase.len() - 4..];
+    let mut out = Vec::with_capacity(coinbase.len() + 2 + 34);
+    out.extend_from_slice(version);
+    out.extend_from_slice(&[0x00, 0x01]); // segwit marker + flag
+    out.extend_from_slice(body);
+    // coinbase input witness: one stack item, 32 bytes, the reserved value.
+    out.extend_from_slice(&compact_size(1));
+    out.extend_from_slice(&compact_size(32));
+    out.extend_from_slice(witness_reserved);
+    out.extend_from_slice(locktime);
+    Some(out)
+}
+
+/// Serialize a Bitcoin block in BIP144 SEGWIT form for `submitblock`:
+/// `header(80) ‖ CompactSize(tx_count) ‖ segwit-coinbase ‖ other_txs…`. The
+/// header's merkle root still commits to the LEGACY txids (what the miner
+/// hashed, and what the AuxPoW folds) — only the block BODY carries the coinbase
+/// witness so bitcoind can verify the witness commitment. `other_txs` are their
+/// own already-serialized (witness-carrying, as from `getblocktemplate`) forms.
+pub fn build_segwit_block_hex(
+    header: &[u8; 80],
+    coinbase_legacy: &[u8],
+    witness_reserved: &[u8; 32],
+    other_txs: &[Vec<u8>],
+) -> Option<String> {
+    let cb = coinbase_with_witness(coinbase_legacy, witness_reserved)?;
+    let mut b = Vec::with_capacity(80 + 9 + cb.len() + other_txs.iter().map(Vec::len).sum::<usize>());
+    b.extend_from_slice(header);
+    b.extend_from_slice(&compact_size(1 + other_txs.len() as u64));
+    b.extend_from_slice(&cb);
+    for t in other_txs {
+        b.extend_from_slice(t);
+    }
+    Some(hex::encode(b))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,5 +305,51 @@ mod tests {
         assert_eq!(hash, block_header_hash(&header));
         // Truncated → None, never a panic.
         assert!(header_and_coinbase_from_auxpow(&blob[..50]).is_none());
+    }
+
+    #[test]
+    fn coinbase_with_witness_inserts_marker_flag_and_witness() {
+        // Use the genesis coinbase (a valid legacy tx) as the input.
+        let legacy = hex_to_bytes(GENESIS_COINBASE).unwrap();
+        let reserved = [0u8; 32];
+        let sw = coinbase_with_witness(&legacy, &reserved).expect("converts");
+
+        // version(4) preserved, then the 00 01 marker+flag.
+        assert_eq!(&sw[0..4], &legacy[0..4]);
+        assert_eq!(&sw[4..6], &[0x00, 0x01]);
+        // Tail: … witness(01 20 ‖ 32 zero) ‖ locktime(4). Locktime unchanged.
+        assert_eq!(&sw[sw.len() - 4..], &legacy[legacy.len() - 4..]);
+        let witness = &sw[sw.len() - 4 - 34..sw.len() - 4];
+        assert_eq!(witness[0], 0x01); // one stack item
+        assert_eq!(witness[1], 0x20); // 32 bytes
+        assert_eq!(&witness[2..34], &reserved[..]);
+        // Exactly +2 (marker/flag) +34 (witness) bytes over the legacy form.
+        assert_eq!(sw.len(), legacy.len() + 2 + 34);
+
+        // Stripping marker/flag + witness reconstructs the legacy tx exactly.
+        let mut back = Vec::new();
+        back.extend_from_slice(&sw[0..4]); // version
+        back.extend_from_slice(&sw[6..sw.len() - 4 - 34]); // body (skip 00 01; drop witness)
+        back.extend_from_slice(&sw[sw.len() - 4..]); // locktime
+        assert_eq!(back, legacy);
+    }
+
+    #[test]
+    fn segwit_block_carries_witness_but_header_is_unchanged() {
+        let header_bytes = hex_to_bytes(GENESIS_HEADER).unwrap();
+        let mut header = [0u8; 80];
+        header.copy_from_slice(&header_bytes);
+        let legacy_cb = hex_to_bytes(GENESIS_COINBASE).unwrap();
+        let block = build_segwit_block_hex(&header, &legacy_cb, &[0u8; 32], &[]).expect("builds");
+        let raw = hex_to_bytes(&block).unwrap();
+        // Header is byte-identical to the legacy block's header.
+        assert_eq!(&raw[0..80], &header_bytes[..]);
+        // tx count varint (01) then the segwit coinbase marker+flag at [81..83].
+        assert_eq!(raw[80], 0x01);
+        assert_eq!(&raw[81..85], &legacy_cb[0..4]); // coinbase version
+        assert_eq!(&raw[85..87], &[0x00, 0x01]); // marker+flag
+        // The non-witness block (what the txid-merkle commits to) is the shorter form.
+        let legacy_block = build_block_hex(&header, &legacy_cb, &[]);
+        assert!(raw.len() > hex_to_bytes(&legacy_block).unwrap().len());
     }
 }
