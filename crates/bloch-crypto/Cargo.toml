@@ -40,6 +40,12 @@ wallet-cli = ["dep:clap", "dep:rpassword"]
 # the guard bites only when a mainnet artifact is cut:
 #   cargo test -p bloch-crypto --features mainnet canonical_k_activation_height_is_set_for_mainnet
 mainnet = []
+# `auxpow-rehearsal` is an EMPTY marker feature (no deps). It ONLY lowers
+# AUXPOW_ACTIVATION_HEIGHT to 0 (core/mod.rs) so a LOCAL, off-mainnet build
+# accepts merged-mined (AuxPoW) blocks — for exercising the end-to-end BTC↔Bloch
+# dual-mining loop against `bitcoind -regtest`. A mainnet artifact NEVER enables
+# it (default keeps AUXPOW_ACTIVATION_HEIGHT = u64::MAX, merged mining INERT).
+auxpow-rehearsal = []
 
 [dependencies]
 # Post-quantum signatures (hybrid ML-DSA-65 ‖ Falcon-1024) + seeded keygen.

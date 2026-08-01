@@ -18,7 +18,16 @@ pub mod auxpow;
 /// coordinated flag-day sets a real activation height (exactly like the earlier
 /// SHA-256d-LE fork). A block carrying an `auxpow` below this height is invalid
 /// (fail closed), and it never affects `block_hash`.
+#[cfg(not(feature = "auxpow-rehearsal"))]
 pub const AUXPOW_ACTIVATION_HEIGHT: u64 = u64::MAX;
+/// REGTEST / REHEARSAL ONLY — enabled by the `auxpow-rehearsal` cargo feature,
+/// which a MAINNET artifact never sets. Activating at height 0 lets a local,
+/// off-mainnet build actually ACCEPT merged-mined blocks (validate_pow's active
+/// AuxPoW arm) so the end-to-end BTC↔Bloch dual-mining loop can be exercised
+/// against `bitcoind -regtest`. The real mainnet flag-day is a separate, higher
+/// value chosen at coordinated fleet-upgrade time — NOT this.
+#[cfg(feature = "auxpow-rehearsal")]
+pub const AUXPOW_ACTIVATION_HEIGHT: u64 = 0;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -2639,6 +2648,81 @@ mod sf1_tests {
         assert_eq!(back2.auxpow, Some(aux));
         // The None encoding is a strict prefix of nothing extra — genesis-preserving.
         assert_eq!(&some_bytes[..none_bytes.len()], &none_bytes[..]);
+    }
+
+    /// END-TO-END merged-mining acceptance at the BLOCK level: the pool commits
+    /// to the REAL `block_hash()`, and the AuxPoW the node checks is exactly the
+    /// call `validate_pow` makes in its active arm — `aux.verify(block_hash(),
+    /// header.bits)` (core/mod.rs, PowAlgorithm::Sha256d, Some(aux) at/above
+    /// AUXPOW_ACTIVATION_HEIGHT). Proves the pool↔node contract binds to the
+    /// block's true identity, survives the on-wire (bitcoin) serialization, and
+    /// rejects any tamper to the block header. Runs with NO mining and NO chain
+    /// state, so it is deterministic and mainnet-safe (activation is untouched).
+    #[test]
+    fn merged_mined_block_binds_to_real_block_hash_and_survives_serialization() {
+        use auxpow::{coinbase_merkle_branch, merge_mining_commitment, AuxPow, AuxPowError};
+        // Bitcoin txid = double-SHA256, internal byte order (matches auxpow).
+        fn dsha(b: &[u8]) -> [u8; 32] {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(Sha256::digest(b)).into()
+        }
+
+        // A real SHA-256d (Genesis-2 kind) block is the aux chain block: empty
+        // pow_solution, so validate_pow routes to the Sha256d arm.
+        let mut blk = create_genesis2_block(&[0u8; 20]);
+        blk.height = 5_600; // a post-activation height (rehearsal semantics)
+        blk.header.bits = 0x20ff_ffff; // easy parent target → no mining needed
+        let aux_hash = blk.block_hash(); // the REAL Bloch block identity
+
+        // POOL: embed the merge-mining commitment in the parent Bitcoin coinbase.
+        let mut coinbase = b"btc-coinbase-prefix".to_vec();
+        coinbase.extend_from_slice(&merge_mining_commitment(aux_hash));
+        coinbase.extend_from_slice(b"btc-coinbase-suffix");
+        let coinbase_txid = dsha(&coinbase);
+        // Single-tx parent: merkle root == coinbase txid, empty branch.
+        assert!(coinbase_merkle_branch(&[coinbase_txid], 0).is_empty());
+        let mut parent_header = [0u8; 80];
+        parent_header[0..4].copy_from_slice(&2i32.to_le_bytes()); // version
+        parent_header[36..68].copy_from_slice(&coinbase_txid); // merkle root
+        parent_header[68..72].copy_from_slice(&1_700_000_000u32.to_le_bytes()); // time
+        parent_header[72..76].copy_from_slice(&0x20ff_ffffu32.to_le_bytes()); // bits
+
+        let aux = AuxPow {
+            parent_header: parent_header.to_vec(),
+            coinbase_tx: coinbase,
+            coinbase_branch: vec![],
+            coinbase_index: 0,
+            chain_branch: vec![],
+            chain_index: 0,
+        };
+        blk.auxpow = Some(aux.clone());
+
+        // (1) The EXACT expression validate_pow runs when AuxPoW is active.
+        assert_eq!(
+            blk.auxpow.as_ref().unwrap().verify(blk.block_hash(), blk.header.bits),
+            Ok(())
+        );
+
+        // (2) The AuxPoW survives the on-wire bitcoin serialization, and the
+        // deserialized block still binds to the same identity + verifies.
+        let bytes = blk.to_bitcoin_bytes();
+        let back = Block::from_bitcoin_bytes(&bytes).expect("block round-trips");
+        assert_eq!(back.auxpow, Some(aux));
+        assert_eq!(back.block_hash(), aux_hash, "identity preserved across serde");
+        assert_eq!(
+            back.auxpow.as_ref().unwrap().verify(back.block_hash(), back.header.bits),
+            Ok(())
+        );
+
+        // (3) Tamper with ANY header field → block_hash changes → the parent's
+        // commitment no longer matches → rejected (fail closed).
+        let mut tampered = blk.clone();
+        tampered.header.timestamp ^= 1;
+        assert_ne!(tampered.block_hash(), aux_hash);
+        assert_eq!(
+            tampered.auxpow.as_ref().unwrap().verify(tampered.block_hash(), tampered.header.bits),
+            Err(AuxPowError::AuxRootMismatch)
+        );
     }
 
     /// Pre-searched start nonce whose FIRST 4096-candidate window contains a
