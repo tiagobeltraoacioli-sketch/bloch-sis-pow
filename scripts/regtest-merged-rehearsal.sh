@@ -82,7 +82,7 @@ fi
 
 PIDS=()
 cleanup() {
-  log "cleaning up…"
+  log "cleaning up..."
   for pid in "${PIDS[@]:-}"; do kill "$pid" 2>/dev/null || true; done
   bitcoin-cli -regtest -datadir="$WORK/btc" -rpcuser="$BTC_RPC_USER" -rpcpassword="$BTC_RPC_PASS" stop 2>/dev/null || true
   sleep 1
@@ -93,16 +93,16 @@ trap cleanup EXIT INT TERM
 log "workdir: $WORK  (KEEP_WORK=1 to preserve)"
 
 # ── 1. Build node (rehearsal) + proxy ────────────────────────────────────────
-log "building bloch node --features 'node auxpow-rehearsal' (activation lowered to 0)…"
+log "building bloch node --features 'node auxpow-rehearsal' (activation lowered to 0)..."
 ( cd "$REPO" && cargo build --release --features "node auxpow-rehearsal" --bin bloch )
-log "building bloch-pool-proxy…"
+log "building bloch-pool-proxy..."
 ( cd "$REPO/pool-proxy" && cargo build --release )
 PROXY_BIN="$REPO/pool-proxy/target/release/bloch-pool-proxy"
 [ -x "$PROXY_BIN" ] || PROXY_BIN="$REPO/target/release/bloch-pool-proxy"
 
 # ── 2. bitcoind -regtest ─────────────────────────────────────────────────────
 mkdir -p "$WORK/btc"
-log "starting bitcoind -regtest on :$BTC_RPC_PORT…"
+log "starting bitcoind -regtest on :$BTC_RPC_PORT..."
 bitcoind -regtest -datadir="$WORK/btc" -rpcuser="$BTC_RPC_USER" -rpcpassword="$BTC_RPC_PASS" \
   -rpcport="$BTC_RPC_PORT" -fallbackfee=0.0001 -daemon
 BCLI=(bitcoin-cli -regtest -datadir="$WORK/btc" -rpcuser="$BTC_RPC_USER" -rpcpassword="$BTC_RPC_PASS" -rpcport="$BTC_RPC_PORT")
@@ -118,7 +118,7 @@ BTC_PAYOUT_SPK="$("${BCLI[@]}" getaddressinfo "$BTC_ADDR" | sed -n 's/.*"scriptP
 log "bitcoind ready; BTC payout spk=$BTC_PAYOUT_SPK"
 
 # ── 3. Bloch node (rehearsal build) ──────────────────────────────────────────
-log "starting bloch node…  ($NODE_START_CMD)"
+log "starting bloch node...  ($NODE_START_CMD)"
 mkdir -p "$WORK/g3-data"
 # shellcheck disable=SC2086
 $NODE_START_CMD >"$WORK/node.log" 2>&1 &
@@ -140,7 +140,7 @@ printf '%s' "$AUX" | grep -q '"active":true' \
 log "createauxblock OK + active: $(printf '%s' "$AUX" | tr ',' '\n' | grep -E 'hash|bits|active' | tr '\n' ' ')"
 
 # ── 4. bloch-pool-proxy (merged mode) ────────────────────────────────────────
-log "starting bloch-pool-proxy in merged mode on $PROXY_LISTEN…"
+log "starting bloch-pool-proxy in merged mode on $PROXY_LISTEN..."
 BLOCH_POOL_LISTEN="$PROXY_LISTEN" \
 BLOCH_POOL_METRICS="127.0.0.1:0" \
 BLOCH_POOL_RPC="127.0.0.1:$NODE_RPC_PORT" \
@@ -162,7 +162,7 @@ log "proxy up (log: $WORK/proxy.log)"
 
 # ── 5. CPU miner ─────────────────────────────────────────────────────────────
 if command -v minerd >/dev/null; then
-  log "starting cpuminer (minerd) against $PROXY_LISTEN…"
+  log "starting cpuminer (minerd) against $PROXY_LISTEN..."
   minerd -a sha256d -o "stratum+tcp://$PROXY_LISTEN" -u "$BLOCH_ADDR" -p x \
     >"$WORK/miner.log" 2>&1 &
   PIDS+=($!)
@@ -172,7 +172,7 @@ else
 fi
 
 # ── 6. Verify a merged block is accepted ─────────────────────────────────────
-log "waiting up to ${REHEARSAL_TIMEOUT}s for a merged Bloch block…"
+log "waiting up to ${REHEARSAL_TIMEOUT}s for a merged Bloch block..."
 deadline=$(( SECONDS + REHEARSAL_TIMEOUT ))
 while [ "$SECONDS" -lt "$deadline" ]; do
   now="$(bloch_count)"

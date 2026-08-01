@@ -81,6 +81,11 @@ node = [
     "dep:reqwest",
     "bloch-crypto/node",
 ]
+# `auxpow-rehearsal` forwards bloch-crypto's REGTEST-ONLY marker feature, which
+# lowers AUXPOW_ACTIVATION_HEIGHT to 0 so a LOCAL, off-mainnet build accepts
+# merged-mined (AuxPoW) blocks — for the end-to-end regtest rehearsal
+# (scripts/regtest-merged-rehearsal.sh). A mainnet artifact NEVER sets it.
+auxpow-rehearsal = ["bloch-crypto/auxpow-rehearsal"]
 sev-snp = ["dep:sev"]
 mobile  = ["dep:x509-parser", "dep:ciborium"]
 # Coherence P1: verify shielded-spend FRI proofs with SP1 (heavy sp1-sdk dep,
