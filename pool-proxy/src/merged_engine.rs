@@ -216,19 +216,39 @@ pub async fn create_round(
 }
 
 /// Perform the submit(s) for a classified win. Returns the node's accepted block
-/// hash on a Bloch-target win, else `None`. The BTC-block relay for a
-/// `BtcAndBloch` win is a documented scaffold (needs full block assembly).
+/// hash on a Bloch-target win, else `None`.
+///
+/// The Bloch side (`submitauxblock`) is the point and is authoritative. For a
+/// `BtcAndBloch` win the parent header also met Bitcoin's target, so the block
+/// is worth relaying to `bitcoind` — assembled from the SAME AuxPoW blob (parent
+/// header + coinbase) via the vector-tested [`crate::btc_block`] and submitted
+/// best-effort. A block carrying mempool txs needs those txs' raw bytes + the
+/// segwit witness wrapper (a live-`bitcoind` sign-off item); the Bloch
+/// acceptance never depends on the relay, so a rejected relay is only logged.
 pub async fn submit_win(
     node: &RpcClient,
-    _btc: &BtcRpcClient,
+    btc: &BtcRpcClient,
     aux_hash: &[u8; 32],
     action: &SubmitAction,
 ) -> Result<Option<String>, PoolError> {
     match action {
-        SubmitAction::Bloch { auxpow_hex } | SubmitAction::BtcAndBloch { auxpow_hex } => {
+        SubmitAction::Bloch { auxpow_hex } => Ok(Some(node.submit_aux_block(aux_hash, auxpow_hex).await?)),
+        SubmitAction::BtcAndBloch { auxpow_hex } => {
+            // Bloch side first (authoritative).
             let h = node.submit_aux_block(aux_hash, auxpow_hex).await?;
-            // TODO(scaffold): BtcAndBloch also assembles + submits the full BTC
-            // block to bitcoind via `_btc.submit_block(block_hex)`.
+            // BTC side (best-effort relay) — reconstruct the block from the blob.
+            if let Ok(blob) = hex::decode(auxpow_hex) {
+                if let Some((_hash, header, coinbase)) =
+                    crate::btc_block::header_and_coinbase_from_auxpow(&blob)
+                {
+                    let block_hex = crate::btc_block::build_block_hex(&header, &coinbase, &[]);
+                    match btc.submit_block(&block_hex).await {
+                        Ok(None) => log::info!("merged: BTC block relayed to bitcoind"),
+                        Ok(Some(reason)) => log::warn!("merged: bitcoind rejected BTC block: {reason}"),
+                        Err(e) => log::warn!("merged: submitblock failed: {e}"),
+                    }
+                }
+            }
             Ok(Some(h))
         }
         SubmitAction::Share | SubmitAction::Nothing => Ok(None),
