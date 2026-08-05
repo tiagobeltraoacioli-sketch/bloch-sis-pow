@@ -2297,6 +2297,19 @@ fn accept_block(
     // {} scope ensures the lock drops immediately.
     let old_tip = { dag.read().selected_tip() };
 
+    // ── Early dedup ──────────────────────────────────────────────────
+    // A block already in the DAG needs no re-validation. Return the same
+    // "already in DAG" rejection `add_block` produces, but BEFORE tx
+    // validation — so a re-gossip / IBD re-request flood of known blocks
+    // stays cheap now that the finality gate below no longer rejects (and
+    // thereby short-circuits) below-finality blocks.
+    if dag.read().get_block_data(&block_hash).is_some() {
+        return Err(format!(
+            "consensus rejection: block already in DAG: {}",
+            hex::encode(block_hash)
+        ));
+    }
+
     // ── FIX VULN-01: Validate difficulty bits match expected ──────────
     // ASERT-Lattice (B5c): expected bits are derived per-block from the
     // parent timestamp + genesis anchor — miner and validator agree by
@@ -2344,18 +2357,22 @@ fn accept_block(
         }
     }
 
-    // ── Finality checkpoint: reject deep reorgs ──────────────────────
-    {
-        let finalized_height = store.get_meta("finalized_height").ok().flatten()
-            .and_then(|b| b.as_slice().try_into().ok().map(u64::from_le_bytes))
-            .unwrap_or(0);
-        if block.height <= finalized_height {
-            return Err(format!(
-                "finality: block h={} at or below finalized height {}",
-                block.height, finalized_height
-            ));
-        }
-    }
+    // ── Finality checkpoint ──────────────────────────────────────────
+    // A block at or below the finalized height is NOT rejected here. It may
+    // be a required GhostDAG mergeset member — a red/side "fork-loser" in a
+    // heavier block's past — and discarding its body is exactly what starved
+    // tip-selection and IBD: nodes advertised headers whose bodies no one
+    // retained ("body unavailable / an archival peer is needed"), so the
+    // selected tip froze while blue_score kept climbing. Finality is enforced
+    // where it matters instead — a below-finality block must never become the
+    // SELECTED tip — at the disposition guard below (and, redundantly, by the
+    // MAX_REORG_DEPTH cap in execute_reorg, since MAX_REORG_DEPTH ==
+    // CHECKPOINT_DEPTH: any flip landing at/below finalized_height is > that
+    // depth and already refused). Inert fork-losers are retained so the DAG
+    // stays complete and every advertised body is servable.
+    let finalized_height = store.get_meta("finalized_height").ok().flatten()
+        .and_then(|b| b.as_slice().try_into().ok().map(u64::from_le_bytes))
+        .unwrap_or(0);
 
     // ── FIX VULN-04: Validate timestamp ──────────────────────────────
     {
@@ -2541,6 +2558,26 @@ fn accept_block(
         }
         _ => Disposition::Unexpected,
     };
+
+    // ── Finality invariant: below-finality blocks stay inert ─────────
+    // A block at or below the finalized height is welcome in the DAG as a
+    // fork-loser (its body was retained above), but it must NEVER become the
+    // selected tip — that would rewrite finalized history. In practice an
+    // Extension cannot reach here below finality (it extends a tip already
+    // above it), and a Reorg flipping the tip below finality is over-deep and
+    // also refused by MAX_REORG_DEPTH; this guard makes the invariant explicit
+    // and independent of that constant. Roll the in-memory insertion back the
+    // same way the refused-reorg path does (nothing is persisted to CF_DAG
+    // yet; the body left in CF_BLOCKS is inert).
+    if block.height <= finalized_height
+        && matches!(disposition, Disposition::Extension | Disposition::Reorg)
+    {
+        dag.write().remove_block(&block_hash);
+        return Err(format!(
+            "finality: block h={} may not become the selected tip at or below finalized height {}",
+            block.height, finalized_height
+        ));
+    }
 
     match disposition {
         Disposition::ForkLoser => {
@@ -3680,6 +3717,78 @@ mod external_submission_tests {
             tip_meta.as_slice(), &r_next_hash[..],
             "applied chain state (tip_hash meta / UTXO apply) must advance \
              with the real chain",
+        );
+    }
+
+    /// Root-cause regression for the red/side-block body-retention starvation
+    /// that froze tip-selection (selected tip stuck while blue_score climbed)
+    /// and stalled IBD ("body unavailable — an archival peer is needed").
+    ///
+    /// A block at or below the finalized height that is a *fork-loser* must be
+    /// ACCEPTED and RETAINED (body in CF_BLOCKS + entry in the DAG) so it can
+    /// serve as a GhostDAG mergeset member — it must NOT be rejected by the
+    /// finality checkpoint, and it must NOT move the selected tip. Pre-fix,
+    /// accept_block rejected it outright ("finality: ... at or below finalized
+    /// height"), so its body was never stored and no node could serve it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn below_finality_fork_loser_is_retained_not_rejected() {
+        let g_ts    = unix_now();
+        let genesis = mk_genesis(g_ts);
+        let node    = node_with_genesis(&genesis);
+        let gh      = genesis.block_hash();
+
+        // Real chain: genesis → r1 … r5, all through the real accept path.
+        let mut parent = gh;
+        let mut r1 = gh;
+        for i in 1..=5u64 {
+            let b = mk_block_at(&node, parent, i, g_ts + 30 * i, i);
+            accept(&node, &b).expect("real-chain block must be accepted");
+            if i == 1 { r1 = b.block_hash(); }
+            parent = b.block_hash();
+        }
+        let real_tip = parent;
+
+        // Simulate a finalized checkpoint at height 3 (as a live node sets once
+        // its tip is CHECKPOINT_DEPTH ahead).
+        node.store.put_meta("finalized_height", &3u64.to_le_bytes())
+            .expect("set finalized_height");
+
+        // A side block at height 2 (<= finalized 3): sibling of r2 (same parent
+        // r1, distinct nonce → distinct hash). It is a fork-loser — the real
+        // chain to r5 has far more blue work.
+        let fork = mk_block_at(&node, r1, 2, g_ts + 30 * 2, 987_654);
+        let fork_hash = fork.block_hash();
+        assert_ne!(fork_hash, real_tip);
+
+        let res = accept(&node, &fork);
+        assert!(
+            res.is_ok(),
+            "a below-finality FORK-LOSER must be accepted (retained as a \
+             mergeset member), not rejected by finality; got: {:?}", res,
+        );
+
+        // Retained: body servable + present in the DAG.
+        assert!(
+            node.store.get_block(&fork_hash).expect("body read").is_some(),
+            "below-finality fork-loser body must be RETAINED in CF_BLOCKS \
+             (else peers answer 'body unavailable')",
+        );
+        assert!(
+            node.dag.read().get_block_data(&fork_hash).is_some(),
+            "below-finality fork-loser must be present in the DAG",
+        );
+
+        // Inert: it must NOT move the selected tip (finality invariant intact).
+        assert_eq!(
+            node.dag.read().selected_tip(), Some(real_tip),
+            "a below-finality fork-loser must NOT become the selected tip",
+        );
+
+        // And re-submitting it is a cheap dedup no-op rejection, not a re-run.
+        let again = accept(&node, &fork);
+        assert!(
+            again.is_err() && again.unwrap_err().contains("already in DAG"),
+            "a block already in the DAG must be rejected by the early dedup",
         );
     }
 }
