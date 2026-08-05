@@ -100,6 +100,10 @@ quick start, prebuilt `bloch` + `bloch-cli` for **Linux x86_64** are published:
 Requires **glibc ≥ 2.39** (Ubuntu 24.04+); on older distros build from source.
 Unpack and verify `SHA256SUMS` before running.
 
+> **Fresh node stuck while syncing?** From-scratch sync currently stalls around
+> block ~10968. Bootstrap from a datadir snapshot instead (starts near the tip,
+> no full sync) — see [docs/SNAPSHOT-BOOTSTRAP.md](./docs/SNAPSHOT-BOOTSTRAP.md).
+
 ## Run (mainnet beta, solo mining)
 
 ```bash
