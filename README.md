@@ -88,6 +88,18 @@ Binaries in `target/release/`: `bloch` (full node), `bloch-wallet`,
 `bloch-cli`, `bloch-calibrate`, `bloch-mine-genesis`,
 `bloch-migrate-addr-history`.
 
+### Prebuilt binaries (Linux x86_64)
+
+Building from source is recommended (you run the bytes you compiled). For a
+quick start, prebuilt `bloch` + `bloch-cli` for **Linux x86_64** are published:
+
+- GitHub release: [`genesis3-node-linux-20260805`](https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow/releases/tag/genesis3-node-linux-20260805)
+- GitLab release: [`genesis3-node-linux-20260805`](https://gitlab.com/blochsispow-group/BlochSISPoW-project/-/releases/genesis3-node-linux-20260805)
+- Mirror: <https://posternlabs.com/dl/bloch-genesis3-linux-x86_64.tar.gz>
+
+Requires **glibc ≥ 2.39** (Ubuntu 24.04+); on older distros build from source.
+Unpack and verify `SHA256SUMS` before running.
+
 ## Run (mainnet beta, solo mining)
 
 ```bash
