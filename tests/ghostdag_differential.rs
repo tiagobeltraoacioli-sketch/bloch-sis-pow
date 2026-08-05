@@ -19,7 +19,7 @@
 //! aggressively wide+deep DAG.
 
 use std::collections::HashMap;
-use bloch::consensus::{GhostDAG, ColoringMode, BlockHash, GhostdagData, canonical_encode};
+use bloch::consensus::{GhostDAG, ColoringMode, BlockHash, GhostdagData, canonical_encode, CORRECTED_COLORING_ACTIVATION_HEIGHT};
 use bloch::consensus::reachability::brute_force_is_ancestor;
 
 // ── deterministic RNG (xorshift64*) ──────────────────────────────────────────
@@ -482,8 +482,19 @@ fn modes_are_distinct() {
     let fast = build(g, &linear(g, 3), 10, ColoringMode::Fast);
     assert_eq!(legacy.coloring, ColoringMode::Legacy);
     assert_eq!(fast.coloring, ColoringMode::Fast);
-    // Fast maintains the index; legacy leaves it empty.
-    assert!(!fast.reachability().is_empty());
-    assert!(legacy.reachability().is_empty());
+    // The distinction that makes the identity tests meaningful is the coloring
+    // code path (asserted above via `.coloring`). Index maintenance depends on
+    // the corrected-coloring gate: Fast always maintains it; Legacy leaves it
+    // empty ONLY while the gate is disabled (`u64::MAX`). Once the gate is armed
+    // (WS-A), the index is built from genesis in BOTH modes so Fast is ready by
+    // the activation height — Legacy still *colors* via the Legacy path.
+    assert!(!fast.reachability().is_empty(), "Fast always maintains the index");
+    if CORRECTED_COLORING_ACTIVATION_HEIGHT == u64::MAX {
+        assert!(legacy.reachability().is_empty(),
+            "gate disabled ⇒ Legacy leaves the index empty (zero overhead)");
+    } else {
+        assert!(!legacy.reachability().is_empty(),
+            "gate armed ⇒ Legacy also builds the index from genesis");
+    }
     let _ : HashMap<BlockHash, u8> = HashMap::new(); // keep HashMap import used
 }
