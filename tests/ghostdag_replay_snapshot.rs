@@ -203,6 +203,92 @@ fn replay(
     dag
 }
 
+/// FAST validation of WS-B: replay ONLY the Fast (compact, O(k)) coloring — no
+/// O(N²) in-test Legacy rebuild — and compare its DECISIONS against the ON-DISK
+/// snapshot, which IS the real Legacy-produced mainnet chain. Confirms 0
+/// decision-flips + a correct-subset compact anticone map on real history in the
+/// time of one Fast replay (minutes) instead of ~23 min.
+#[test]
+#[ignore = "requires a real mainnet RocksDB snapshot at $BLOCH_SNAPSHOT; run with --ignored --nocapture"]
+fn replay_snapshot_fast_vs_ondisk() {
+    let path = match std::env::var("BLOCH_SNAPSHOT") {
+        Ok(p) if !p.is_empty() => p,
+        _ => { eprintln!("BLOCH_SNAPSHOT not set — skipping."); return; }
+    };
+    eprintln!("=== WS-B Fast vs on-disk (the real Legacy chain), READ-ONLY ===");
+    let storage = Storage::open_read_only(std::path::Path::new(&path))
+        .expect("open snapshot read-only (is $BLOCH_SNAPSHOT a node data-dir/db?)");
+    let raw = storage.load_all_dag_data().expect("load CF_DAG");
+    let snapshot: HashMap<BlockHash, GhostdagData> = raw.into_iter().collect();
+    let total = snapshot.len();
+    assert!(total > 0, "snapshot CF_DAG is empty");
+    let order = topo_sort(&snapshot).expect("snapshot is a valid DAG");
+
+    // Only the Fast replay — O(N·k), not the O(N²) Legacy rebuild.
+    let fast = replay(&order, &snapshot, ColoringMode::Fast);
+    eprintln!("replayed {total} blocks through WS-B Fast coloring");
+
+    let mut decision_flips = 0usize;
+    let mut map_value_errors = 0usize;
+    let mut compact_smaller = 0usize;
+    let mut lowest_flip: Option<(u64, BlockHash, String)> = None;
+
+    for h in &order {
+        let df = fast.get_block_data(h).expect("fast replay has every block");
+        let ds = &snapshot[h]; // on-disk == the live Legacy chain
+
+        // (1) DECISIONS must be byte-identical to the real chain.
+        let mut flip = String::new();
+        if df.blue_score != ds.blue_score {
+            flip += &format!("blue_score {}!={} ", df.blue_score, ds.blue_score);
+        }
+        if df.blue_work != ds.blue_work {
+            flip += &format!("blue_work {}!={} ", df.blue_work, ds.blue_work);
+        }
+        if df.selected_parent != ds.selected_parent { flip += "selected_parent "; }
+        if df.mergeset_blues != ds.mergeset_blues {
+            flip += &format!("mergeset_blues {}!={} ", df.mergeset_blues.len(), ds.mergeset_blues.len());
+        }
+        if df.mergeset_reds != ds.mergeset_reds {
+            flip += &format!("mergeset_reds {}!={} ", df.mergeset_reds.len(), ds.mergeset_reds.len());
+        }
+        if !flip.is_empty() {
+            decision_flips += 1;
+            let ht = ds.height;
+            if lowest_flip.as_ref().map_or(true, |(lh, ..)| ht < *lh) {
+                lowest_flip = Some((ht, *h, flip));
+            }
+        }
+
+        // (2) Compact map correctness: every Fast entry appears in the on-disk
+        //     whole-history map with the SAME value (compact ⊆ whole, equal values).
+        for (k, v) in &df.blues_anticone_sizes {
+            match ds.blues_anticone_sizes.get(k) {
+                Some(sv) if sv == v => {}
+                _ => map_value_errors += 1,
+            }
+        }
+        if df.blues_anticone_sizes.len() < ds.blues_anticone_sizes.len() {
+            compact_smaller += 1;
+        }
+    }
+
+    eprintln!("--- WS-B RESULT (real mainnet, {total} blocks) ---");
+    eprintln!("decision-flips (Fast vs on-disk Legacy): {decision_flips}");
+    eprintln!("compact-map value errors: {map_value_errors}");
+    eprintln!("blocks where compact map is strictly smaller: {compact_smaller} / {total}");
+    if let Some((h, hash, f)) = &lowest_flip {
+        eprintln!("LOWEST decision-flip at height {h} ({}): {f}", short(hash));
+    }
+    assert_eq!(decision_flips, 0,
+        "WS-B Fast must not flip any decision vs the real Legacy chain");
+    assert_eq!(map_value_errors, 0,
+        "compact anticone values must match the whole-history values on real history");
+    assert!(compact_smaller > 0,
+        "expected the compact map to be strictly smaller on real deep history");
+    eprintln!("✓ WS-B correct: 0 decision-flips + correct-subset compact map on {total} real blocks.");
+}
+
 #[test]
 #[ignore = "requires a real mainnet RocksDB snapshot at $BLOCH_SNAPSHOT; run with --ignored --nocapture"]
 fn replay_snapshot_legacy_vs_fast() {
