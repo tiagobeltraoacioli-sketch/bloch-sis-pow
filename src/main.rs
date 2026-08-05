@@ -556,7 +556,11 @@ async fn main() {
         store.put_meta("current_bits", &genesis_bits.to_le_bytes())
             .expect("meta current_bits");
         dag.write().add_genesis(hash, genesis.header.timestamp);
-        if let Some(gdata) = dag.read().get_block_data(&hash).cloned() {
+        // Bind in a `let` so the read guard drops before the `dag.write()` inside
+        // (parking_lot RwLock is not reentrant — holding this read across the
+        // write deadlocks once the reachability gate is armed).
+        let gdata_opt = dag.read().get_block_data(&hash).cloned();
+        if let Some(gdata) = gdata_opt {
             // Sprint Y (M-2): atomic put to CF_DAG + CF_DAG_INTEGRITY.
             // Genesis anchors the hash-chain with an all-zero parent
             // integrity; see `compute_integrity_hash` for the convention.
@@ -727,7 +731,11 @@ async fn main() {
         }
 
         // Self-check the (loaded or rebuilt) index against the unbounded oracle.
-        if let Err(e) = dag.read().reach_self_check_sample(2000, 0xB10C_5157) {
+        // Bind in a `let` so the read guard drops before the rebuild's
+        // `dag.write()` below (non-reentrant RwLock — holding it across the write
+        // would deadlock the very path that recovers from a bad index).
+        let self_check = dag.read().reach_self_check_sample(2000, 0xB10C_5157);
+        if let Err(e) = self_check {
             if loaded_ok {
                 warn!("loaded reachability failed self-check ({e}); rebuilding from CF_DAG");
                 match dag.write().rebuild_reachability_from_store() {
@@ -1751,7 +1759,12 @@ async fn main() {
                         // Phase 1: fold the reachability delta into the same
                         // atomic write when the index is maintained; live Legacy
                         // path is byte-for-byte unchanged.
-                        if let Some(ddata) = dag_m.read().get_block_data(&hash).cloned() {
+                        // Bind in a `let` first so the read guard drops before
+                        // `dag_m.write()` below — parking_lot RwLock is not
+                        // reentrant, and holding the read across the write
+                        // deadlocks once the reachability gate is armed.
+                        let ddata_opt = dag_m.read().get_block_data(&hash).cloned();
+                        if let Some(ddata) = ddata_opt {
                             if dag_m.read().maintains_reachability_index() {
                                 let (upserts, removals) = dag_m.write().reach_take_delta();
                                 store_m.put_dag_with_integrity_and_reach(&hash, &ddata, &upserts, &removals).ok();
@@ -2700,7 +2713,13 @@ fn accept_block(
     // disposition above has been applied successfully. Every refusal path
     // above rolled the in-memory insertion back and returned Err, so CF_DAG
     // can never adopt a fork tip whose chain state was refused.
-    if let Some(ddata) = dag.read().get_block_data(&block_hash).cloned() {
+    // NOTE: bind the cloned data in its own `let` so the `dag.read()` guard is
+    // released at the `;` — parking_lot's RwLock is NOT reentrant, so keeping a
+    // read guard alive across `dag.write()` below deadlocks (write parks waiting
+    // for the reader that this same thread holds). Harmless while Legacy left the
+    // index untouched; a hard hang once the reachability gate arms `dag.write()`.
+    let ddata_opt = dag.read().get_block_data(&block_hash).cloned();
+    if let Some(ddata) = ddata_opt {
         // Sprint Y (M-2): atomic put to CF_DAG + CF_DAG_INTEGRITY.
         // Phase 1: when the reachability index is maintained, fold its delta
         // (which may span several blocks if this insert triggered a reindex)

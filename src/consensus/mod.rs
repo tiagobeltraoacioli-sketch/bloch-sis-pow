@@ -559,7 +559,21 @@ pub enum ColoringMode {
 /// to exercise `Fast` on a throwaway datadir; it is node-local and is NOT and
 /// cannot be a substitute for setting this height. Until this constant changes,
 /// every live node stays byte-for-byte on the `Legacy` coloring.
-pub const CORRECTED_COLORING_ACTIVATION_HEIGHT: u64 = u64::MAX;
+///
+/// WS-A (2026-08-05): armed to a FUTURE flag-day height. The replay-snapshot
+/// proof (h18532) showed `Fast` is NOT byte-identical to `Legacy` — it diverges
+/// only in the `blues_anticone_sizes` metadata field (Legacy's bounded seed
+/// under-counts), with **zero** blue_score / mergeset / selected-chain / balance
+/// changes. Adopting the exact `Fast` coloring is therefore a consensus change
+/// and MUST be gated at a height ABOVE every already-mined block: history below
+/// the gate keeps its Legacy `GhostdagData` (no reorg, no balance recompute) and
+/// only blocks at/above the gate use the exact index-based coloring.
+///
+/// ⚠️ OPERATOR: re-confirm this value at flag-day BUILD time — it MUST be safely
+/// above the chain tip when the binary is deployed fleet-wide (tip was ~18,844 on
+/// 2026-08-05; 40,000 ≈ ~7 days of head-room at 30 s blocks). If the tip could
+/// pass it before every node upgrades, raise it. All nodes MUST run the same H.
+pub const CORRECTED_COLORING_ACTIVATION_HEIGHT: u64 = 40_000;
 
 pub struct GhostDAG {
     pub k: usize,
@@ -1593,6 +1607,30 @@ mod tests {
         let mut h = [0u8; 32];
         h[0] = n;
         h
+    }
+
+    /// WS-A: the corrected-coloring gate is armed to a FUTURE height. A Legacy
+    /// (production) DAG stays Legacy below the gate — so all already-mined
+    /// history keeps its coloring, no reorg / no balance recompute — and flips
+    /// to the exact index-based `Fast` coloring at/above it. Arming the gate also
+    /// turns on reachability-index maintenance from genesis so `Fast` is ready by
+    /// the activation height.
+    #[test]
+    fn corrected_coloring_gate_is_armed_at_future_height() {
+        assert_ne!(
+            CORRECTED_COLORING_ACTIVATION_HEIGHT, u64::MAX,
+            "WS-A: gate must be armed to a real future height, not disabled",
+        );
+        let dag = GhostDAG::with_default_k(); // Legacy constructor = production path
+        assert!(
+            dag.maintains_reachability_index(),
+            "an armed gate must maintain the reachability index from genesis",
+        );
+        let h = CORRECTED_COLORING_ACTIVATION_HEIGHT;
+        assert!(matches!(dag.effective_coloring(0), ColoringMode::Legacy));
+        assert!(matches!(dag.effective_coloring(h - 1), ColoringMode::Legacy));
+        assert!(matches!(dag.effective_coloring(h), ColoringMode::Fast));
+        assert!(matches!(dag.effective_coloring(h + 1), ColoringMode::Fast));
     }
 
     #[test]
