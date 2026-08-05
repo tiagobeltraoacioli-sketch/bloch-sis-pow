@@ -1352,14 +1352,6 @@ impl GhostDAG {
         out
     }
 
-    /// Anticone test via the reachability index. Semantically identical to
-    /// [`is_in_anticone`] but backed by the unbounded interval index rather
-    /// than the bounded BFS.
-    fn is_in_anticone_fast(&self, a: &BlockHash, b: &BlockHash) -> bool {
-        if a == b { return false; }
-        !self.reach.is_dag_ancestor(a, b) && !self.reach.is_dag_ancestor(b, a)
-    }
-
     /// Compute |anticone(candidate) ∩ blue_set|
     fn anticone_size_in_set(&self, candidate: &BlockHash, blue_set: &HashSet<BlockHash>) -> usize {
         blue_set.iter()
@@ -1412,34 +1404,6 @@ impl GhostDAG {
                 }
                 cur = data.selected_parent;
                 depth += 1;
-            } else {
-                break;
-            }
-        }
-        blue
-    }
-
-    /// Exact, UNBOUNDED twin of [`past_blue_set`]: walks the full selected-parent
-    /// chain to genesis with no depth cap and no truncation warning. Used only by
-    /// the `Fast` coloring path, where correctness (not bug-compatibility) is the
-    /// goal. On any DAG where the legacy `k*100` bound never bit this returns the
-    /// identical set; where it did, this returns the complete blue lineage the
-    /// legacy walk dropped — the divergence the activation gate coordinates.
-    ///
-    /// Performance note: O(selected-chain depth) per classification, same shape
-    /// as the legacy walk but without the early exit. The reachability index
-    /// removes the dominant O(|mergeset|·|blue_set|·BFS) anticone cost; further
-    /// reducing this seed walk to an incremental blues-anticone propagation
-    /// (Kaspa-style) is a follow-up perf item, not a correctness gap.
-    fn past_blue_set_unbounded(&self, block: &BlockHash) -> HashSet<BlockHash> {
-        let mut blue = HashSet::new();
-        let mut cur = Some(*block);
-        while let Some(h) = cur {
-            if let Some(data) = self.store.get(&h) {
-                for mb in &data.mergeset_blues {
-                    blue.insert(*mb);
-                }
-                cur = data.selected_parent;
             } else {
                 break;
             }
