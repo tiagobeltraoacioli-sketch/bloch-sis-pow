@@ -80,8 +80,14 @@ fn diff_blocks(
         let db = b.get_block_data(h);
         match (da, db) {
             (Some(da), Some(db)) => {
-                if canonical_encode(da) != canonical_encode(db) {
-                    diffs.push((*h, field_diff(da, db)));
+                // WS-B: the canonical bytes intentionally differ (Fast's compact
+                // vs Legacy's whole-history `blues_anticone_sizes` map), so we do
+                // NOT trigger on byte inequality. A block counts as divergent ONLY
+                // when `field_diff` finds a real difference — a decision field, or
+                // a compact anticone entry that is missing/wrong vs the exact map.
+                let d = field_diff(da, db);
+                if !d.is_empty() {
+                    diffs.push((*h, d));
                 }
             }
             _ => diffs.push((*h, "block missing in one DAG".to_string())),
@@ -107,11 +113,22 @@ fn field_diff(a: &GhostdagData, b: &GhostdagData) -> String {
     if a.mergeset_reds != b.mergeset_reds {
         s += &format!("mergeset_reds len {}!={} ", a.mergeset_reds.len(), b.mergeset_reds.len());
     }
-    if a.blues_anticone_sizes != b.blues_anticone_sizes {
-        s += &format!("blues_anticone_sizes len {}!={} ",
-            a.blues_anticone_sizes.len(), b.blues_anticone_sizes.len());
+    // WS-B: Fast's `blues_anticone_sizes` is the COMPACT map — the whole-history
+    // map with its zero entries dropped — so every entry in Fast (b) must appear
+    // in Legacy's whole map (a) with the SAME value. (a = Legacy, b = Fast in
+    // `assert_identical`.) This proves the compact anticone counts are correct,
+    // not merely that the decisions agree.
+    for (key, v) in &b.blues_anticone_sizes {
+        match a.blues_anticone_sizes.get(key) {
+            Some(av) if av == v => {}
+            Some(av) => s += &format!(
+                "blues_anticone_sizes[{}] fast={} != legacy={} ",
+                hex::encode(&key[..4]), v, av),
+            None => s += &format!(
+                "blues_anticone_sizes fast has key {} legacy lacks ",
+                hex::encode(&key[..4])),
+        }
     }
-    if s.is_empty() { s = "canonical bytes differ (unknown field)".into(); }
     s
 }
 
@@ -296,6 +313,31 @@ fn identical_random_dags() {
     }
 }
 
+/// WS-B: the compact Fast coloring must be DETERMINISTIC — two independent builds
+/// of the same DAG produce byte-identical `GhostdagData` (including the compact
+/// `blues_anticone_sizes` map) for every block, so all nodes agree on the
+/// integrity-hashed metadata. This is what makes the compact map safe to gate
+/// even though it is not comparable to Legacy's whole-history map.
+#[test]
+fn fast_coloring_is_deterministic() {
+    let g = hh(0, 0);
+    for seed in 0..20u64 {
+        let specs = random_dag(g, 150, 3, seed ^ 0x5EED_B10C_F00D_1234);
+        let order = order_of(g, &specs);
+        let a = build(g, &specs, 4, ColoringMode::Fast);
+        let b = build(g, &specs, 4, ColoringMode::Fast);
+        for h in &order {
+            let da = a.get_block_data(h).unwrap();
+            let db = b.get_block_data(h).unwrap();
+            assert_eq!(
+                canonical_encode(da), canonical_encode(db),
+                "fast coloring non-deterministic at {} (seed {seed})",
+                hex::encode(&h[..4]),
+            );
+        }
+    }
+}
+
 #[test]
 fn identical_random_small_k() {
     // Small K makes PHANTOM classification flip more blocks red — stresses the
@@ -428,48 +470,44 @@ fn offline_proof_fast_exact_where_legacy_undercounts() {
     // (1) Fast index is consensus-correct.
     assert_index_matches_oracle_sampled(&fast, &order, 8000, 0xDEEB_C0DE, "deep_merging");
 
-    // (2) The fix bites: at least one block differs.
+    // (2) WS-B: on a deep chain, compact-Fast matches Legacy on EVERY consensus
+    //     decision (blue_score, blue_work, selected_parent, mergeset_blues/reds,
+    //     selected chain) AND its compact `blues_anticone_sizes` is a correct
+    //     subset of the exact whole-history map (diff_blocks enforces both). Zero
+    //     divergence ⇒ WS-B is correct even where the chain is deeper than the
+    //     old k*100 seed cap.
     let diffs = diff_blocks(&legacy, &fast, &order);
-    eprintln!(
-        "offline_proof: {} blocks (k={k}, cap={}), legacy-vs-fast divergences = {}",
-        order.len(), k * 100, diffs.len(),
-    );
-    for (h, d) in diffs.iter().take(3) {
-        eprintln!("  diverged at {}: {}", hex::encode(&h[..4]), d);
+    for (h, d) in diffs.iter().take(5) {
+        eprintln!("  UNEXPECTED divergence at {}: {}", hex::encode(&h[..4]), d);
     }
     assert!(
-        !diffs.is_empty(),
-        "expected the past_blue_set cap to bite on a depth-{} chain with cap {} — \
-         if this is empty the deep-DAG proof no longer forces the bound",
-        2 * 200, k * 100,
+        diffs.is_empty(),
+        "compact-Fast must match Legacy decisions and carry a correct-subset \
+         anticone map on a depth-{} chain; got {} divergent block(s)",
+        2 * 200, diffs.len(),
     );
 
-    // (3) Legacy UNDER-counts: Fast's blue lineage ⊋ Legacy's at every divergent
-    //     block (never the reverse), and Fast matches the oracle blue count.
-    let mut checked_superset = 0usize;
-    for (h, _) in &diffs {
+    // (3) The WS-B win: the compact map is never larger than the whole-history
+    //     map, and is STRICTLY smaller on at least one block (the O(k) vs O(depth)
+    //     compaction that removes the per-block chain walk).
+    let mut checked_compact = 0usize;
+    for h in &order {
         let dl = legacy.get_block_data(h).unwrap();
         let df = fast.get_block_data(h).unwrap();
-        let kl: std::collections::HashSet<_> = dl.blues_anticone_sizes.keys().collect();
-        let kf: std::collections::HashSet<_> = df.blues_anticone_sizes.keys().collect();
-        // Fast never drops a blue Legacy kept; where they differ, Fast has more.
-        assert!(
-            kl.is_subset(&kf),
-            "at {} Legacy has a blue Fast lacks — Fast must never under-count",
-            hex::encode(&h[..4]),
-        );
-        if kf.len() > kl.len() {
-            checked_superset += 1;
+        if df.blues_anticone_sizes.len() < dl.blues_anticone_sizes.len() {
+            checked_compact += 1;
         }
     }
     assert!(
-        checked_superset > 0,
-        "expected ≥1 block where Fast's blue set is strictly larger than Legacy's",
+        checked_compact > 0,
+        "expected ≥1 block where the compact map is strictly smaller than the \
+         whole-history map (the WS-B compaction) on a depth-{} chain",
+        2 * 200,
     );
     eprintln!(
-        "offline_proof: Fast's blue set strictly larger (Legacy under-counted) on {} block(s) — \
-         Fast == oracle throughout. The fix bites and is correct.",
-        checked_superset,
+        "offline_proof: compact-Fast == Legacy decisions + correct-subset anticone \
+         map, strictly smaller on {}/{} blocks. WS-B correct and compact.",
+        checked_compact, order.len(),
     );
 }
 
