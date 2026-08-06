@@ -2323,6 +2323,12 @@ fn accept_block(
         ));
     }
 
+    // finalized_height bounds both the difficulty re-validation just below and
+    // the disposition guard further down. Read it once, up front.
+    let finalized_height = store.get_meta("finalized_height").ok().flatten()
+        .and_then(|b| b.as_slice().try_into().ok().map(u64::from_le_bytes))
+        .unwrap_or(0);
+
     // ── FIX VULN-01: Validate difficulty bits match expected ──────────
     // ASERT-Lattice (B5c): expected bits are derived per-block from the
     // parent timestamp + genesis anchor — miner and validator agree by
@@ -2330,22 +2336,39 @@ fn accept_block(
     // uses a FIXED difficulty (GENESIS2_BITS): the SIS ASERT path re-anchors to
     // mainnet constants and interprets `bits` with SIS semantics, neither of
     // which applies to a fresh SHA-256d chain — so it is bypassed here.
-    let parent_ts = store.get_timestamp_at_height(block.height.saturating_sub(1))
-        .ok().flatten().unwrap_or(core::GENESIS_TIMESTAMP);
-    let expected_bits = if matches!(core::pow_algorithm(core::node_chain_id()),
-                                    core::PowAlgorithm::Sha256d) {
-        // Both SHA-256d chains (Genesis-2 devnet, Genesis-3 mainnet).
-        genesis2_expected_bits(store, block.height)
-    } else {
-        pow::next_bits(
-            core::GENESIS_BITS, core::GENESIS_TIMESTAMP, parent_ts, block.height,
-        )
-    };
-    if block.header.bits != expected_bits {
-        return Err(format!(
-            "invalid difficulty: block bits 0x{:08x} != expected 0x{:08x}",
-            block.header.bits, expected_bits
-        ));
+    //
+    // FINALITY FLOOR (backfill dead-lock fix): expected_bits is re-derived from
+    // this block's ancestor history in `store` (retarget window). Below the
+    // finality checkpoint a *syncing* node's copy of that history may be
+    // pruned/incomplete, so the re-derivation yields the WRONG expected value
+    // and a FALSE "invalid difficulty". That false reject dead-locks backfill:
+    // the required below-finality fork-loser is re-requested and re-rejected
+    // forever, so a heavier block's mergeset never closes, the selected tip
+    // freezes, and IBD never releases (exactly what stranded followers at the
+    // damaged fork). A below-finality block is settled history — it already
+    // passed structural PoW in `validate_structure()` and can only ever be an
+    // inert fork-loser, NEVER the selected tip (enforced at the disposition
+    // guard below + the MAX_REORG_DEPTH == CHECKPOINT_DEPTH cap). So re-derive
+    // and check difficulty only ABOVE finality (assume-valid-below-checkpoint,
+    // matching the fork-loser retention policy documented at the guard below).
+    if block.height > finalized_height {
+        let parent_ts = store.get_timestamp_at_height(block.height.saturating_sub(1))
+            .ok().flatten().unwrap_or(core::GENESIS_TIMESTAMP);
+        let expected_bits = if matches!(core::pow_algorithm(core::node_chain_id()),
+                                        core::PowAlgorithm::Sha256d) {
+            // Both SHA-256d chains (Genesis-2 devnet, Genesis-3 mainnet).
+            genesis2_expected_bits(store, block.height)
+        } else {
+            pow::next_bits(
+                core::GENESIS_BITS, core::GENESIS_TIMESTAMP, parent_ts, block.height,
+            )
+        };
+        if block.header.bits != expected_bits {
+            return Err(format!(
+                "invalid difficulty: block bits 0x{:08x} != expected 0x{:08x}",
+                block.header.bits, expected_bits
+            ));
+        }
     }
 
     // ── FIX VULN-02: Validate height matches DAG position ────────────
@@ -2383,9 +2406,7 @@ fn accept_block(
     // CHECKPOINT_DEPTH: any flip landing at/below finalized_height is > that
     // depth and already refused). Inert fork-losers are retained so the DAG
     // stays complete and every advertised body is servable.
-    let finalized_height = store.get_meta("finalized_height").ok().flatten()
-        .and_then(|b| b.as_slice().try_into().ok().map(u64::from_le_bytes))
-        .unwrap_or(0);
+    // (`finalized_height` was read up-front, above the difficulty check.)
 
     // ── FIX VULN-04: Validate timestamp ──────────────────────────────
     {
@@ -3808,6 +3829,83 @@ mod external_submission_tests {
         assert!(
             again.is_err() && again.unwrap_err().contains("already in DAG"),
             "a block already in the DAG must be rejected by the early dedup",
+        );
+    }
+
+    /// Root-cause regression for the BACKFILL DEAD-LOCK that stranded followers
+    /// at the damaged fork. `accept_block` re-derives expected difficulty bits
+    /// from the block's ancestor history in `store`. On a *syncing* node that
+    /// history is pruned/incomplete below the finality checkpoint, so the
+    /// re-derivation yields the WRONG expected value → a FALSE "invalid
+    /// difficulty" reject. Because the rejected block is a required below-finality
+    /// fork-loser (a heavier block's mergeset member), it is re-requested and
+    /// re-rejected forever: the mergeset never closes, the selected tip freezes,
+    /// IBD never releases. Fix: skip the difficulty re-derivation at/below
+    /// `finalized_height` (assume-valid-below-checkpoint) — the block is settled
+    /// history that can only ever be an inert fork-loser. The check stays fully
+    /// enforced ABOVE finality, where the ancestor context is complete.
+    ///
+    /// NOTE: `accept()` calls `accept_block` directly (structural PoW/merkle are
+    /// validated upstream in the NewBlock handler, not here), so mutating
+    /// `header.bits` exercises exactly the accept_block difficulty gate.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn below_finality_skips_difficulty_recheck() {
+        let g_ts    = unix_now();
+        let genesis = mk_genesis(g_ts);
+        let node    = node_with_genesis(&genesis);
+        let gh      = genesis.block_hash();
+
+        // Real chain: genesis → r1 … r5.
+        let mut parent = gh;
+        let mut r1 = gh;
+        let mut r3 = gh;
+        for i in 1..=5u64 {
+            let b = mk_block_at(&node, parent, i, g_ts + 30 * i, i);
+            accept(&node, &b).expect("real-chain block must be accepted");
+            if i == 1 { r1 = b.block_hash(); }
+            if i == 3 { r3 = b.block_hash(); }
+            parent = b.block_hash();
+        }
+        let real_tip = parent;
+
+        // Finalize at height 3.
+        node.store.put_meta("finalized_height", &3u64.to_le_bytes())
+            .expect("set finalized_height");
+
+        // (1) BELOW finality (h=2 ≤ 3): fork-loser sibling of r2 with the WRONG
+        // difficulty bits. Pre-fix this was rejected "invalid difficulty" and
+        // dead-locked backfill; post-fix the difficulty re-check is skipped
+        // below finality and the block is retained as an inert fork-loser.
+        let mut below = mk_block_at(&node, r1, 2, g_ts + 30 * 2, 111_222);
+        let good_bits = below.header.bits;
+        below.header.bits = good_bits ^ 0x0000_0001; // != expected
+        assert_ne!(below.header.bits, good_bits);
+        let below_hash = below.block_hash();
+        let res = accept(&node, &below);
+        assert!(
+            res.is_ok(),
+            "below-finality block must SKIP the difficulty re-check and be \
+             retained as a fork-loser; got: {:?}", res,
+        );
+        assert!(
+            node.dag.read().get_block_data(&below_hash).is_some(),
+            "below-finality fork-loser must be present in the DAG",
+        );
+        assert_eq!(
+            node.dag.read().selected_tip(), Some(real_tip),
+            "below-finality fork-loser must NOT move the selected tip",
+        );
+
+        // (2) ABOVE finality (h=4 > 3): sibling of r4 with WRONG bits. The
+        // difficulty check MUST still fire here — the floor only lifts the check
+        // below finality, never above it.
+        let mut above = mk_block_at(&node, r3, 4, g_ts + 30 * 4, 333_444);
+        above.header.bits ^= 0x0000_0001; // != expected
+        let res2 = accept(&node, &above);
+        assert!(
+            res2.is_err() && res2.as_ref().unwrap_err().contains("invalid difficulty"),
+            "above-finality block with wrong bits must STILL be rejected for \
+             difficulty; got: {:?}", res2,
         );
     }
 }
