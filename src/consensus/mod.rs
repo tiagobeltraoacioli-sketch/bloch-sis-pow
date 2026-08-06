@@ -569,11 +569,18 @@ pub enum ColoringMode {
 /// the gate keeps its Legacy `GhostdagData` (no reorg, no balance recompute) and
 /// only blocks at/above the gate use the exact index-based coloring.
 ///
-/// ⚠️ OPERATOR: re-confirm this value at flag-day BUILD time — it MUST be safely
-/// above the chain tip when the binary is deployed fleet-wide (tip was ~18,844 on
-/// 2026-08-05; 40,000 ≈ ~7 days of head-room at 30 s blocks). If the tip could
-/// pass it before every node upgrades, raise it. All nodes MUST run the same H.
-pub const CORRECTED_COLORING_ACTIVATION_HEIGHT: u64 = 40_000;
+/// ⚠️ OPERATOR: re-confirm this value at flag-day BUILD time. It should sit at/near
+/// the chain tip when the binary is deployed so `Fast` activates promptly and the
+/// authoritative miner is not stranded on the heavy `Legacy` coloring of the wide
+/// damaged-fork anticone (which starves RPC/block-production under armed+mining).
+/// FLAG-DAY LOWERED 2026-08-06 from 40_000 → 21_430: the 40k value left the miner
+/// ~18k blocks (~6 days) of degraded Legacy operation. 21_430 was just above the
+/// live tip (~21_426) at deploy, so only NEW blocks (height ≥ H) use the O(k) index
+/// coloring — already-stored blocks keep their Legacy `GhostdagData` (no reorg, no
+/// balance recompute), and `Fast`≡`Legacy` in decisions (replay: 0 flips on 18,532
+/// real blocks) so a late sibling/reorg landing at a boundary height is consistent.
+/// All armed nodes SHOULD run the same H.
+pub const CORRECTED_COLORING_ACTIVATION_HEIGHT: u64 = 21_430;
 
 pub struct GhostDAG {
     pub k: usize,
