@@ -844,6 +844,17 @@ impl NetworkNode {
         let mut inflight_pull: std::collections::HashMap<
             libp2p::request_response::OutboundRequestId, NetworkMessage> =
             std::collections::HashMap::new();
+        // Re-gossip rate-limit. Serving a legacy-gossip `GetBlock` re-broadcasts the
+        // whole block to the mesh; external peers spamming `GetBlock` for the same
+        // blocks turned that into a `publish blocks [NewBlock]: Duplicate` storm that
+        // saturated the send path (and the request-response handler alongside it). We
+        // keep the FIRST publish of each block (gossipsub then relays it mesh-wide) and
+        // suppress re-publishes of the SAME block within a short window; a peer that
+        // missed the first broadcast re-requests after the window. Pruned on insert, so
+        // the map stays bounded to blocks seen within the TTL.
+        let mut recent_block_publishes: std::collections::HashMap<[u8; 32], std::time::Instant> =
+            std::collections::HashMap::new();
+        const REGOSSIP_SUPPRESS_TTL: Duration = Duration::from_secs(10);
         let mut heartbeat   = tokio::time::interval(Duration::from_secs(30));
         let mut save_peers  = tokio::time::interval(Duration::from_secs(60));
         // Sprint CC: periodic tip announce. Re-publishes the current
@@ -1318,6 +1329,19 @@ impl NetworkNode {
                             None => publish_gossip(&mut swarm, &sync_t, &msg),
                         }
                         continue;
+                    }
+                    // Re-gossip rate-limit (see `recent_block_publishes` decl): drop a
+                    // re-broadcast of a block already published within the TTL. The first
+                    // broadcast + gossipsub relay covers the mesh; this kills the
+                    // GetBlock-serving amplification storm without changing which blocks
+                    // propagate.
+                    if let NetworkMessage::NewBlock { block_hash, .. } = &msg {
+                        let now = std::time::Instant::now();
+                        recent_block_publishes.retain(|_, t| now.duration_since(*t) < REGOSSIP_SUPPRESS_TTL);
+                        if recent_block_publishes.contains_key(block_hash) {
+                            continue;
+                        }
+                        recent_block_publishes.insert(*block_hash, now);
                     }
                     let (topic, topic_name) = match &msg {
                         NetworkMessage::NewBlock { .. }        => (block_t.clone(), "blocks"),
