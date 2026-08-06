@@ -208,13 +208,26 @@ pub fn decode_frame<M: for<'de> Deserialize<'de>>(buf: &[u8]) -> io::Result<M> {
 pub type Behaviour = request_response::Behaviour<BlochSyncCodec>;
 pub type Event = request_response::Event<SyncRequest, SyncResponse>;
 
+/// Max concurrent request-response streams (inbound + outbound) the handler keeps
+/// open per connection before it drops new INBOUND streams with
+/// "Dropping inbound stream because we are at capacity". libp2p's default is 100,
+/// which a node catching up across the wide damaged-fork anticone blows past: the
+/// recursive missing-parent resolution (`GetBlock` per absent ancestor) opens a
+/// burst of streams, and once at capacity the peer's new-block deliveries AND its
+/// inbound peering handshake get dropped — the follower sits `syncing:false` at its
+/// snapshot tip and never converges. Raised well above the observed ~80 streams/s so
+/// sync bursts flow; DoS headroom is a non-issue on the small trusted fleet.
+const MAX_CONCURRENT_SYNC_STREAMS: usize = 2048;
+
 /// Build the request-response behaviour for `/bloch/sync/1`. `Full` support =
 /// this node both serves inbound pulls and issues outbound pulls.
 pub fn new_behaviour() -> Behaviour {
     Behaviour::with_codec(
         BlochSyncCodec,
         std::iter::once((SYNC_PROTOCOL, ProtocolSupport::Full)),
-        RrConfig::default().with_request_timeout(Duration::from_secs(30)),
+        RrConfig::default()
+            .with_request_timeout(Duration::from_secs(30))
+            .with_max_concurrent_streams(MAX_CONCURRENT_SYNC_STREAMS),
     )
 }
 
