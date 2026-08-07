@@ -93,16 +93,23 @@ Binaries in `target/release/`: `bloch` (full node), `bloch-wallet`,
 Building from source is recommended (you run the bytes you compiled). For a
 quick start, prebuilt `bloch` + `bloch-cli` for **Linux x86_64** are published:
 
-- GitHub release: [`genesis3-node-linux-20260805`](https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow/releases/tag/genesis3-node-linux-20260805)
-- GitLab release: [`genesis3-node-linux-20260805`](https://gitlab.com/blochsispow-group/BlochSISPoW-project/-/releases/genesis3-node-linux-20260805)
-- Mirror: <https://posternlabs.com/dl/bloch-genesis3-linux-x86_64.tar.gz>
+- GitHub release: [`genesis3-node-regossip-meshfix-20260807`](https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow/releases/tag/genesis3-node-regossip-meshfix-20260807)
+- GitLab release: [`genesis3-node-regossip-meshfix-20260807`](https://gitlab.com/blochsispow-group/BlochSISPoW-project/-/releases/genesis3-node-regossip-meshfix-20260807)
+
+This is the binary the mainnet fleet runs (byte-identical). Earlier releases —
+including `genesis3-node-flagday-h21430-20260806` — ship a build with a gossip
+re-broadcast loop (empty gossipsub mesh, `NoPeersSubscribedToTopic`); do not
+use them.
 
 Requires **glibc ≥ 2.39** (Ubuntu 24.04+); on older distros build from source.
 Unpack and verify `SHA256SUMS` before running.
 
-> **Fresh node stuck while syncing?** From-scratch sync currently stalls around
-> block ~10968. Bootstrap from a datadir snapshot instead (starts near the tip,
-> no full sync) — see [docs/SNAPSHOT-BOOTSTRAP.md](./docs/SNAPSHOT-BOOTSTRAP.md).
+> **Fresh node stuck while syncing?** Upgrading the binary does **not** resume
+> a stalled sync: from-scratch sync currently stalls (last verified at
+> block_count 26474) because peers cannot serve some historical block bodies.
+> Bootstrap from a datadir snapshot instead (starts near the tip, no full
+> sync) — see [docs/SNAPSHOT-BOOTSTRAP.md](./docs/SNAPSHOT-BOOTSTRAP.md); an
+> updated snapshot is being prepared.
 
 ## Run (mainnet beta, solo mining)
 
