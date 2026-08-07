@@ -483,6 +483,50 @@ struct BlochBehaviour {
 
 // ── Node ──────────────────────────────────────────────────────────────────────
 
+/// Yamux per-connection substream cap.
+///
+/// Must sit ABOVE `sync_rr::MAX_CONCURRENT_SYNC_STREAMS` (2048) or the
+/// transport vetoes the request-response layer: fecf29b raised the rr cap
+/// 100 → 2048 so sync bursts flow, but the swarm was still built with
+/// `yamux::Config::default`, whose yamux-0.13 backend caps a connection at
+/// 512 substreams — and yamux does NOT backpressure at that cap, it KILLS
+/// the whole connection (`connection.rs`: inbound over the cap →
+/// `Action::Terminate`, outbound → `ConnectionError::TooManyStreams`;
+/// logged as "maximum number of streams reached" followed by our
+/// "✗ disconnected"). A node catching up across the damaged-fork anticone
+/// opens a GetBlock burst, blows through 512, and the transport drops the
+/// very peer it was syncing from — observed on node4 as a 0↔3-peer
+/// connect/disconnect oscillation (15 connects / 15 disconnects / 12×
+/// "maximum number of streams" in 15 min).
+///
+/// 4096 = 2× the rr cap: room for all 2048 sync streams plus gossipsub,
+/// identify and ping substreams, with slack for streams in half-closed
+/// teardown. Memory stays bounded by the rr cap (sync frames are the only
+/// bulk payload; gossip is capped at 4 MiB per message elsewhere).
+///
+/// KNOWN TRADE-OFF (libp2p-yamux 0.47 API, verified in the crate source):
+/// `Config::set_max_num_streams` — or ANY setter — switches the muxer
+/// backend from yamux 0.13 to yamux 0.12 (`Config::set()` replaces
+/// `Config013` with `Config012::default()`; the crate's own test
+/// `config_set_switches_to_v012` pins this as intended). There is NO way to
+/// raise the 0.13 cap through the 0.47 public API. yamux 0.12 (cap default
+/// 8192, static 256 KiB windows, `WindowUpdateMode::OnRead` backpressure)
+/// was libp2p's production muxer for years and speaks the same wire
+/// protocol, so mixed 0.12/0.13 fleets interoperate — but a NOT-yet-updated
+/// remote still enforces 512 on ITS side of the connection, so the churn
+/// only fully stops once both endpoints run this build.
+const MAX_YAMUX_STREAMS: usize = 4096;
+
+/// Builder for the swarm's yamux config — passed to `with_tcp` /
+/// `with_websocket` in place of `yamux::Config::default` (the builder accepts
+/// any `FnOnce() -> Config`). See `MAX_YAMUX_STREAMS` for why and for the
+/// 0.13→0.12 backend consequence.
+fn yamux_config() -> yamux::Config {
+    let mut cfg = yamux::Config::default();
+    cfg.set_max_num_streams(MAX_YAMUX_STREAMS);
+    cfg
+}
+
 pub struct NetworkNode {
     pub peer_id: PeerId,
     pub config:  NetworkConfig,
@@ -683,14 +727,14 @@ impl NetworkNode {
                 |keys: &identity::Keypair| -> Result<KyberConfig, std::convert::Infallible> {
                     Ok(KyberConfig::new(keys))
                 },
-                yamux::Config::default,
+                yamux_config,
             )
             .map_err(|e| NetworkError::StartFailed(e.to_string()))?
             .with_websocket(
                 |keys: &identity::Keypair| -> Result<KyberConfig, std::convert::Infallible> {
                     Ok(KyberConfig::new(keys))
                 },
-                yamux::Config::default,
+                yamux_config,
             )
             .await
             .map_err(|e| NetworkError::StartFailed(e.to_string()))?
@@ -871,7 +915,14 @@ impl NetworkNode {
         // the map stays bounded to blocks seen within the TTL.
         let mut recent_block_publishes: std::collections::HashMap<[u8; 32], std::time::Instant> =
             std::collections::HashMap::new();
-        const REGOSSIP_SUPPRESS_TTL: Duration = Duration::from_secs(10);
+        // Follow-up to 004c477 (which set 10s): the window MUST be >= gossipsub's
+        // `duplicate_cache_time` (30s, configured above). The message-id is a
+        // content hash, so a re-publish of the same block between 10s and 30s
+        // passed this filter only to be refused by gossipsub's duplicate cache
+        // anyway ("publish blocks [NewBlock]: Duplicate") — paying the bincode
+        // encode + SHA-256 of a multi-MB body per attempt and spamming the log.
+        // 10s < 30s made the 10–30s band pure waste; align the windows.
+        const REGOSSIP_SUPPRESS_TTL: Duration = Duration::from_secs(30);
         let mut heartbeat   = tokio::time::interval(Duration::from_secs(30));
         let mut save_peers  = tokio::time::interval(Duration::from_secs(60));
         // Sprint CC: periodic tip announce. Re-publishes the current
@@ -931,6 +982,30 @@ impl NetworkNode {
                                         ).in_scope(|| {
                                             info!("← block h={} {}", height, hex::encode(&block_hash[..8]));
                                         });
+                                        // Re-gossip suppression, RECEIVE side (the half 004c477
+                                        // missed): gossipsub's duplicate cache holds messages we
+                                        // RECEIVED as well as ones we published, and the message-id
+                                        // is a content hash — so answering a legacy-gossip GetBlock
+                                        // for a block that arrived on the mesh within the last 30s
+                                        // is a GUARANTEED local `Err(Duplicate)`: gossipsub refuses
+                                        // the publish before it leaves the node, after we already
+                                        // paid the store read, the bincode encode and the SHA-256 of
+                                        // a multi-MB body. That is exactly the persisting
+                                        // "publish blocks [NewBlock]: Duplicate" storm: each DISTINCT
+                                        // block a syncing peer walks produces one distinct
+                                        // (message-id) doomed publish that the publish-side map never
+                                        // saw. Recording received blocks here makes the outbound
+                                        // filter skip them — behavior-identical (the publish could
+                                        // never have left the node; gossipsub itself already relayed
+                                        // the received message mesh-wide), it only deletes the
+                                        // wasted encode/hash work and the log spam. A block we MINE
+                                        // can never be in this map (its content hash is new), so own
+                                        // announcements are never suppressed. Pruned on insert, same
+                                        // as the publish side, so the map stays bounded even if no
+                                        // publish attempt runs for a while.
+                                        let now = Instant::now();
+                                        recent_block_publishes.retain(|_, t| now.duration_since(*t) < REGOSSIP_SUPPRESS_TTL);
+                                        recent_block_publishes.insert(*block_hash, now);
                                     }
                                     NetworkMessage::PeerTip { peer_id, blue_score, height } => {
                                         debug!("← tip from {} score={}", peer_id, blue_score);
