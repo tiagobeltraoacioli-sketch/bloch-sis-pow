@@ -10,19 +10,24 @@ snapshot height and follows the chain live; no full IBD.
 
 ## Download
 
-Current snapshot — taken **2026-08-07 23:02 UTC** at **block_count 28904**
-(node at the network tip, clean SIGTERM shutdown):
+Current snapshot — taken **2026-08-08 19:50 UTC** from the **block producer**
+at the network tip (height ~27,147; clean `systemctl stop`, 0.33 s stop window,
+`cp -a` from the quiesced datadir):
 
 ```bash
-curl -fL -O https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow/releases/download/g3-datadir-snapshot-20260807/bloch-g3-datadir-snapshot-20260807.tar.gz
-curl -fL -O https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow/releases/download/g3-datadir-snapshot-20260807/bloch-g3-datadir-snapshot-20260807.tar.gz.sha256
+curl -fL -O https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow/releases/download/g3-datadir-snapshot-20260808/bloch-g3-datadir-snapshot-20260808.tar.gz
+curl -fL -O https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow/releases/download/g3-datadir-snapshot-20260808/bloch-g3-datadir-snapshot-20260808.tar.gz.sha256
 
-sha256sum -c bloch-g3-datadir-snapshot-20260807.tar.gz.sha256
-# expect: 760165389e9415b3e3931e1f53ddb53730a4a0ee90490f8071793229dcc6ea92
+sha256sum -c bloch-g3-datadir-snapshot-20260808.tar.gz.sha256
+# expect: dc02514f19494b5cf1f60ed59805db65edfbf89e250ad2bbfb3da28b2b058f65
 ```
 
-- ~1.1 GB compressed (~1.5 GB on disk), taken at **block_count 28,904**
-  (`tip_blue_score` 27,516).
+> **Run it with the [`genesis3-node-ancestry-flagday-h30000-20260808`](https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow/releases/tag/genesis3-node-ancestry-flagday-h30000-20260808)
+> binary.** The consensus flag-day at height 30,000 (difficulty derived from
+> block ancestry) is imminent; every earlier binary diverges there regardless
+> of which snapshot it starts from.
+
+- ~225 MB compressed (~309 MB on disk), taken at tip height ~27,147.
 - The archive contains a `g3-data/` RocksDB directory only. `p2p_identity.bin`
   and `known_peers.json` are **not** included — your node generates a fresh
   libp2p identity on first boot (a shared identity would collide on the
@@ -32,8 +37,13 @@ sha256sum -c bloch-g3-datadir-snapshot-20260807.tar.gz.sha256
   300 MiB. Mint a new R2 S3 API token (dash → R2 → Manage R2 API Tokens) and
   `aws s3 cp` from a fleet box to restore the old URL pattern.
 
-Superseded: `bloch-g3-datadir-snapshot-20260805.tar.gz` (block 17,587, sha
-`b7c8aad6…`) — nodes restored from it stall at 26,474.
+Superseded:
+
+- `bloch-g3-datadir-snapshot-20260807.tar.gz` (block_count 28,904, sha
+  `76016538…`) — predates the difficulty-ancestry rollout; prefer the current
+  one.
+- `bloch-g3-datadir-snapshot-20260805.tar.gz` (block 17,587, sha
+  `b7c8aad6…`) — nodes restored from it stall at 26,474.
 
 ## Run against it
 
@@ -42,7 +52,7 @@ Stop your node if running, extract, and point `--data-dir` at `g3-data`. Use the
 **still requires even with a full datadir** (it verifies the carry-over root):
 
 ```bash
-tar -xzf bloch-g3-datadir-snapshot-20260807.tar.gz     # -> ./g3-data
+tar -xzf bloch-g3-datadir-snapshot-20260808.tar.gz     # -> ./g3-data
 
 bloch --genesis3 --archive \
   --data-dir ./g3-data \
@@ -59,13 +69,15 @@ bloch --genesis3 --archive \
 ## Verify
 
 ```bash
-bloch-cli getblockcount        # starts at 28904 and climbs to the network tip
+bloch-cli getblockcount        # starts at the snapshot's count and climbs to the network tip
 bloch-cli getnetworkinfo       # "syncing": false, peers > 0
 ```
 
-Validated end-to-end (2026-08-07) on a clean node (node4): opens at 28,904,
-does **not** stall at 26,474, reaches the live tip and tracks it
-(`syncing: false`, peers > 0, zero "cannot serve block" warnings).
+The 2026-08-08 archive was verified before publishing (extracts cleanly,
+RocksDB `CURRENT`/`MANIFEST` intact, no identity/peer files). The previous
+snapshot (2026-08-07) was additionally validated end-to-end on a clean node
+(node4): opened at its tip, did **not** stall at 26,474, reached the live tip
+and tracked it (`syncing: false`, peers > 0).
 
 ## Known limitation: catching up a large gap may stall
 
