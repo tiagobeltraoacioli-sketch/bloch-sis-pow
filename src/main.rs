@@ -850,6 +850,20 @@ async fn main() {
     let peer_state2 = peer_state.clone();
     let frontier2   = frontier.clone();
 
+    // ── Echo-storm fix: correlate Headers replies with OUR OWN requests ──────
+    // The gossip GetHeaders server arm replies by BROADCASTING Headers to the
+    // whole mesh (wire compat: a gossip requester can only be answered on
+    // gossip), so every node also receives replies meant for someone else.
+    // Since the Headers frame carries no requester id (adding one would change
+    // the wire format for the deployed fleet), correlation is local: record a
+    // monotonic ms timestamp every time WE send a GetHeaders; a Headers frame
+    // is "solicited" only within HEADERS_SOLICITED_WINDOW_MS of that. Shared
+    // between the processor task (send sites + Headers arm) and the 30s nudge
+    // task (its own send site). u64::MAX = never sent.
+    let proc_start = std::time::Instant::now();
+    let getheaders_sent_ms = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+    let getheaders_sent2   = getheaders_sent_ms.clone();
+
     tokio::spawn(async move {
         use futures::future::FutureExt;
         // ── P0 supervision (roadmap §2.5, top reliability risk #1) ───────────
@@ -888,6 +902,15 @@ async fn main() {
             // Mesh fix (reciprocal tip): rate limiter for answering behind-
             // peers' PeerTip announcements with our own tip. None = never sent.
             let mut last_reciprocal_tip: Option<std::time::Instant> = None;
+            // Echo-storm fix (server side): TTL-dedupe of gossip GetHeaders
+            // service. A gossip GetHeaders reaches EVERY node and each reply is
+            // a mesh-wide Headers broadcast — N serving nodes × M requesters
+            // asking the same range was the measured ~16 frames/s echo. Within
+            // the TTL the FIRST broadcast already reached every requester, so
+            // identical (from_blue_score, limit) requests are served once.
+            const HEADERS_SERVE_DEDUP_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+            let mut recent_headers_served: std::collections::HashMap<(u64, u32), std::time::Instant> =
+                std::collections::HashMap::new();
 
             loop {
             // Orphan-deadlock fix: the message wait is now a select between the
@@ -932,6 +955,7 @@ async fn main() {
                         // Retained legacy over-trigger fallback (entering IBD is
                         // always safe); the announced score never RELEASES it.
                         state2.write().is_syncing = true;
+                        getheaders_sent2.store(proc_start.elapsed().as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
                         let _ = otx2.send(network::NetworkMessage::GetHeaders { from_blue_score: our_s, limit: 500, nonce: getblock_nonce() }).await;
                     } else if peer_s < our_s {
                         // Mesh fix (reciprocal tip): the announcing peer is
@@ -1004,8 +1028,22 @@ async fn main() {
                     maybe_release_ibd(&dag2, &peer_state2, &frontier2, &state2);
                 }
 
-                // IBD step 2: someone asks for our headers
+                // IBD step 2: someone asks for our headers.
+                // NB: this arm only serves GOSSIP requesters (old binaries /
+                // early-boot fallback) — directed pulls are served in
+                // network/mod.rs (sync_rr) and answered to that peer alone.
                 network::NetworkMessage::GetHeaders { from_blue_score, limit, .. } => {
+                    // Echo-storm fix (server side): the reply below is a mesh-
+                    // wide broadcast; within the TTL the first one already
+                    // reached every requester of this same range. Serve it once.
+                    let now = std::time::Instant::now();
+                    recent_headers_served.retain(|_, t| now.duration_since(*t) < HEADERS_SERVE_DEDUP_TTL);
+                    if recent_headers_served.contains_key(&(from_blue_score, limit)) {
+                        debug!("GetHeaders from_score={} limit={}: served this range <{:?} ago; suppressing duplicate broadcast",
+                            from_blue_score, limit, HEADERS_SERVE_DEDUP_TTL);
+                        continue;
+                    }
+                    recent_headers_served.insert((from_blue_score, limit), now);
                     let entries: Vec<network::SyncEntry> = {
                         let d = dag2.read();
                         d.ordered_hashes_from(from_blue_score, limit as usize)
@@ -1022,10 +1060,35 @@ async fn main() {
 
                 // IBD step 3: received headers — request missing blocks
                 network::NetworkMessage::Headers { entries } => {
+                    // Echo-storm fix (client side): Headers replies to gossip
+                    // requesters are mesh-wide broadcasts, so we also hear
+                    // frames answering SOMEONE ELSE. The frame carries no
+                    // requester id (wire compat), so correlate locally: it is
+                    // "solicited" only if WE sent a GetHeaders recently. An
+                    // unsolicited frame must never drive the pipeline — every
+                    // listener continuing the stream on every overheard batch
+                    // was the ~16 frames/s echo amplifier ("IBD: need 0/500"
+                    // forever on synced nodes).
+                    let solicited = {
+                        let sent = getheaders_sent2.load(std::sync::atomic::Ordering::Relaxed);
+                        sent != u64::MAX
+                            && (proc_start.elapsed().as_millis() as u64).saturating_sub(sent)
+                                <= HEADERS_SOLICITED_WINDOW_MS
+                    };
                     let missing: Vec<_> = entries.iter()
                         .filter(|e| !dag2.read().has_block(&e.hash))
                         .map(|e| e.hash).collect();
+                    if !solicited && missing.is_empty() {
+                        // Pure echo of someone else's IBD stream: nothing we
+                        // lack, nothing we asked. Ignore silently (debug, not
+                        // info — this was continuous log spam at parity).
+                        debug!("Headers echo ignored ({} entries, 0 missing, no GetHeaders of ours outstanding)", entries.len());
+                        continue;
+                    }
                     info!("IBD: need {}/{} blocks", missing.len(), entries.len());
+                    // Missing bodies are still fetched even from an overheard
+                    // frame — if we lack them we are genuinely behind, and the
+                    // fetch is a directed pull (no gossip amplification).
                     for hash in missing {
                         let _ = otx2.send(network::NetworkMessage::GetBlock { block_hash: hash, nonce: getblock_nonce() }).await;
                     }
@@ -1034,7 +1097,7 @@ async fn main() {
                         // is_syncing (a lying/lagging peer must not fake
                         // completion). Release is blue_work-verified only.
                         maybe_release_ibd(&dag2, &peer_state2, &frontier2, &state2);
-                    } else if entries.len() >= 500 {
+                    } else if entries.len() >= 500 && solicited {
                         // Pipeline IBD: a full batch means the serving peer has
                         // more. Re-request the next batch IMMEDIATELY from the
                         // highest blue_score we just learned, instead of waiting
@@ -1044,6 +1107,7 @@ async fn main() {
                         // the batch comes back < 500 (or empty) and the stream
                         // stops, so steady-state cost is zero.
                         let next_from = entries.iter().map(|e| e.blue_score).max().unwrap_or(0);
+                        getheaders_sent2.store(proc_start.elapsed().as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
                         let _ = otx2.send(network::NetworkMessage::GetHeaders { from_blue_score: next_from, limit: 500, nonce: getblock_nonce() }).await;
                     }
                 }
@@ -1286,6 +1350,7 @@ async fn main() {
                         info!("Version peer ahead (score {} > {}), requesting headers", peer_s, our_s);
                         // Retained legacy over-trigger fallback (safe).
                         state2.write().is_syncing = true;
+                        getheaders_sent2.store(proc_start.elapsed().as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
                         let _ = otx2.send(network::NetworkMessage::GetHeaders { from_blue_score: our_s, limit: 500, nonce: getblock_nonce() }).await;
                     }
                     maybe_release_ibd(&dag2, &peer_state2, &frontier2, &state2);
@@ -1339,6 +1404,7 @@ async fn main() {
         let otx_n        = outbound_tx.clone();
         let peer_state_n = peer_state.clone();
         let frontier_n   = frontier.clone();
+        let getheaders_sent_n = getheaders_sent_ms.clone();
         tokio::spawn(async move {
             let mut nudge = tokio::time::interval(std::time::Duration::from_secs(30));
             loop {
@@ -1354,6 +1420,7 @@ async fn main() {
                     if syncing || !seen_tip || best_seen > our_s {
                         debug!("IBD nudge: GetHeaders from score {} (best_seen={} syncing={} seen_tip={})",
                             our_s, best_seen, syncing, seen_tip);
+                        getheaders_sent_n.store(proc_start.elapsed().as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
                         let _ = otx_n.send(network::NetworkMessage::GetHeaders { from_blue_score: our_s, limit: 500, nonce: getblock_nonce() }).await;
                     }
                     // Phase-2 frontier reconciliation: every peer replies Tips.
@@ -2299,6 +2366,13 @@ fn getblock_nonce() -> u64 {
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
+
+/// Echo-storm fix: a broadcast Headers frame counts as a reply to OUR OWN
+/// GetHeaders only within this window of us actually sending one. Generous vs
+/// the ~seconds a real reply takes (each pipeline continuation refreshes the
+/// stamp), and safely above the 30s IBD nudge period, so a syncing node can
+/// never starve itself; a SYNCED node stops reacting to overheard streams.
+const HEADERS_SOLICITED_WINDOW_MS: u64 = 60_000;
 
 static FINALITY_FROZEN: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
