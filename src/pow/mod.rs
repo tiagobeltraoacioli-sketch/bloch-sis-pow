@@ -524,3 +524,78 @@ mod tests {
         assert_eq!(t.as_bytes(), t2.as_bytes());
     }
 }
+
+/// Ancestry-derived expected `bits` — the consensus-safe replacement for
+/// [`genesis2_expected_bits`].
+///
+/// ## Why this exists
+///
+/// `genesis2_expected_bits` derives the answer from two pieces of LOCAL,
+/// MUTABLE state rather than from the block's own ancestry:
+///
+/// 1. the `current_bits` meta key, rewritten on **every** accepted block
+///    (including out-of-order backfill and fork-losers), and
+/// 2. `get_timestamp_at_height`, whose column family is keyed by height
+///    alone — in a DAG many blocks share a height, so it is last-write-wins.
+///
+/// Two nodes running an IDENTICAL binary therefore compute DIFFERENT expected
+/// bits purely because they accepted blocks in a different order, and every
+/// follower freezes forever at the first retarget boundary (`h % window == 0`)
+/// where its cache diverged from the producer's. Measured 2026-08-08 at
+/// h=25020: producer served bits 0x1a265e4e, a follower on the same binary
+/// expected 0x1a26ac86 and rejected the block ~3x/min.
+///
+/// ## What this does instead
+///
+/// Everything is read from the block's own selected-parent chain, which is
+/// identical on every honest node regardless of arrival order:
+///
+/// * **bits in force** = the header bits of this block's selected parent.
+///   Every block already carries its bits, so no extra storage is needed.
+/// * **retarget timespan** = `timestamp(height-1) - timestamp(height-window)`,
+///   both read by walking `selected_parent` from this block's selected parent,
+///   never by height index.
+///
+/// Returns `None` when the ancestry needed is not available locally (pruned or
+/// still syncing) so the caller can fall back rather than reject a valid block.
+pub fn genesis2_expected_bits_ancestry(
+    store: &crate::storage::Storage,
+    dag: &crate::consensus::GhostDAG,
+    parents: &[crate::consensus::BlockHash],
+    height: u64,
+) -> Option<u32> {
+    // Selected parent = argmax(blue_work) over parents, ties broken by hash —
+    // the same rule GhostDAG itself uses, so this is not a second opinion.
+    let sp = parents.iter()
+        .filter_map(|p| dag.get_block_data(p).map(|d| (*p, d.blue_work)))
+        .max_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)))
+        .map(|(h, _)| h)?;
+
+    // Bits in force = the selected parent's own header bits.
+    let cur = store.get_block(&sp).ok().flatten()?.header.bits;
+
+    let window = crate::core::GENESIS2_RETARGET_WINDOW;
+    if height < window || height % window != 0 {
+        return Some(cur);
+    }
+
+    // Retarget boundary: walk this block's selected-parent chain for the two
+    // timestamps. `sp` is at height-1 by construction of `height`.
+    let sp_data = dag.get_block_data(&sp)?;
+    let last = sp_data.timestamp;
+
+    let target_height = height - window;
+    let mut cursor = sp;
+    let mut data = sp_data;
+    while data.height > target_height {
+        let next = data.selected_parent?;
+        cursor = next;
+        data = dag.get_block_data(&cursor)?;
+    }
+    if data.height != target_height {
+        return None; // ancestry incomplete — caller falls back
+    }
+    let first = data.timestamp;
+
+    Some(crate::core::retarget_bits_g2(cur, last.saturating_sub(first)))
+}
