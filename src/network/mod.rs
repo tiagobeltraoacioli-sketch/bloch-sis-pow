@@ -593,6 +593,17 @@ impl NetworkNode {
             params.decay_to_zero = 0.01;
 
             // Score params for each topic
+            // P3/P3b MUST be disabled on a low-rate chain. TopicScoreParams::default()
+            // ships mesh_message_deliveries_weight = -1.0 with threshold = 20.0 and
+            // activation = 5s. Five seconds after a peer joins the mesh, gossipsub
+            // charges -1.0 × (20 − delivered)² × topic_weight. Bloch produces roughly
+            // one block every 26 s, so `delivered` is 0 and the peer takes -400 ×
+            // topic_weight — summed across blocks/txs/sync that is ≈ -400, i.e. exactly
+            // graylist_threshold. Every peer that grafted was therefore guaranteed to be
+            // pruned within seconds ("Prune peer with negative score"), the mesh could
+            // never hold anyone, publish() returned NoPeersSubscribedToTopic and the
+            // miner's blocks never propagated. These penalties are designed for
+            // high-throughput topics; they are actively harmful here.
             let block_topic_params = TopicScoreParams {
                 topic_weight: 0.5,
                 time_in_mesh_weight: 0.1,
@@ -601,6 +612,8 @@ impl NetworkNode {
                 first_message_deliveries_weight: 1.0,
                 first_message_deliveries_decay: 0.97,
                 first_message_deliveries_cap: 100.0,
+                mesh_message_deliveries_weight: 0.0,  // P3 off — see note above
+                mesh_failure_penalty_weight:    0.0,  // P3b off — same reason
                 invalid_message_deliveries_weight: -100.0, // harsh penalty for invalid blocks
                 invalid_message_deliveries_decay: 0.5,
                 ..Default::default()
@@ -616,6 +629,8 @@ impl NetworkNode {
                 first_message_deliveries_cap: 100.0,
                 invalid_message_deliveries_weight: -50.0,
                 invalid_message_deliveries_decay: 0.5,
+                mesh_message_deliveries_weight: 0.0,  // P3 off — see block_topic_params
+                mesh_failure_penalty_weight:    0.0,  // P3b off
                 ..Default::default()
             };
 
@@ -626,6 +641,8 @@ impl NetworkNode {
                 time_in_mesh_cap: 50.0,
                 invalid_message_deliveries_weight: -20.0,
                 invalid_message_deliveries_decay: 0.8,
+                mesh_message_deliveries_weight: 0.0,  // P3 off — see block_topic_params
+                mesh_failure_penalty_weight:    0.0,  // P3b off
                 ..Default::default()
             };
 
@@ -1042,18 +1059,30 @@ impl NetworkNode {
                         }
                         SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                             info!("✓ connected: {}", peer_id);
-                            swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                            // DO NOT call gossipsub.add_explicit_peer() here.
+                            //
+                            // An "explicit peer" in gossipsub is a manually-pinned direct
+                            // link that is DELIBERATELY EXCLUDED from mesh construction.
+                            // libp2p-gossipsub 0.49.5 behaviour.rs:2224 filters mesh graft
+                            // candidates with `!explicit_peers.contains(peer)`, and :1395
+                            // answers an incoming GRAFT from an explicit peer by PRUNING it
+                            // on every topic ("we don't GRAFT to/from explicit peers").
+                            //
+                            // Marking EVERY connection explicit therefore made the mesh
+                            // permanently unbuildable: heartbeat logged
+                            // "Mesh low. Topic contains: 0" and "RANDOM PEERS: Got 0 peers"
+                            // forever, publish() returned NoPeersSubscribedToTopic, and the
+                            // miner's blocks never reached the network — every non-mining
+                            // node stalled while the producer kept extending alone.
+                            // Reproduced with two fresh nodes on localhost (2026-08-07).
                             peer_count += 1;
                             crate::metrics::set_peer_count(peer_count as i64);
                             peer_state.on_connect(peer_id, Instant::now());
-                            // FIX v0.5.1: Re-announce subscriptions to new peer.
-                            // gossipsub only announces subs on initial connect,
-                            // but peer_score can ghost peers from mesh. Force
-                            // re-broadcast of our subscribed topics so the new
-                            // peer adds us to its mesh for blocks/txs/sync.
-                            for t in [&block_t, &tx_t, &sync_t] {
-                                let _ = swarm.behaviour_mut().gossipsub.subscribe(t);
-                            }
+                            // NOTE: re-calling gossipsub.subscribe() here would be a no-op —
+                            // it returns Ok(false) and sends nothing when the topic is already
+                            // subscribed (it logs "Topic is already in the mesh"). gossipsub
+                            // already sends our subscription set on connection establishment,
+                            // so there is nothing to force.
                             // Save peer address for next startup.
                             // Sprint P: also track listener peers (was a bug — only dialers
                             // entered known_peers, so known_peers.json only grew with outbound
@@ -1219,7 +1248,9 @@ impl NetworkNode {
                                     continue;
                                 }
                                 info!("mDNS discovered (LAN): {} at {}", peer_id, addr);
-                                swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                                // Same reason as the ConnectionEstablished arm above: an
+                                // explicit peer is excluded from the mesh. Just dial it and
+                                // let normal mesh maintenance graft it.
                                 if swarm.dial(addr).is_ok() { dialed += 1; }
                             }
                         }
