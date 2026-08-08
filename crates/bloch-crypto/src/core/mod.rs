@@ -49,16 +49,27 @@ pub const AUXPOW_ACTIVATION_HEIGHT: u64 = 0;
 /// BEFORE the chain reaches this height — same discipline as
 /// `AUXPOW_ACTIVATION_HEIGHT` and the earlier SHA-256d-LE fork.
 ///
-/// Set to 30_000 on 2026-08-08. The first draft said 27_000, which the chain
-/// would have reached ~2h later (measured tip_height 26_722 advancing at
-/// 0.039 blocks/s) — not enough room to upgrade the fleet without rushing the
-/// only block-producing node. Deploying AFTER the flag-day height would be the
-/// dangerous case: upgraded nodes would re-derive bits for blocks the producer
-/// had already mined under the order-dependent rule, and any retarget boundary
-/// where the two disagree is a real fork. Raise this again if the fleet is
-/// still not upgraded as the chain approaches it — raising costs nothing,
-/// arriving late costs a fork.
-pub const DIFFICULTY_ANCESTRY_FORK_HEIGHT: u64 = 30_000;
+/// Set to 27_600 on 2026-08-08 — a retarget boundary (460 × 60) roughly 230
+/// blocks above the tip at the time, which is ~100 minutes of build-and-deploy
+/// margin.
+///
+/// It was briefly 30_000, and that was wrong. The reasoning then was that a
+/// distant height buys room to upgrade the fleet without rushing the only
+/// block-producing node. What that missed: below the fork height the legacy
+/// order-dependent rule still applies, so every follower keeps freezing at
+/// every retarget boundary on the way there. 30_000 was ~2_900 blocks out —
+/// about 48 boundaries — and followers were observed dying at the first one
+/// each time (node4 at 27_120 = 452×60, miner-box at 25_440 = 424×60, both
+/// logging `invalid difficulty`). A follower's chance of crossing 48 boundaries
+/// is nil, so a distant flag-day is not a safety margin at all: it is a
+/// guarantee that no follower ever reaches the fix.
+///
+/// The real constraint is narrower than it looks — only the PRODUCER must be
+/// upgraded before the chain reaches this height, because it is the one
+/// stamping bits. Followers are restored from a producer datadir above the
+/// fork height afterwards, so their exposure to the legacy window is zero.
+/// Pick a height just far enough to deploy to the producer, and no further.
+pub const DIFFICULTY_ANCESTRY_FORK_HEIGHT: u64 = 27_600;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
