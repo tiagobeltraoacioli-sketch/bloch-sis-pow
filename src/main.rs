@@ -2986,7 +2986,7 @@ fn maybe_release_ibd(
     frontier:   &Arc<parking_lot::Mutex<sync::frontier::FrontierState>>,
     node_state: &Arc<RwLock<rpc::NodeState>>,
 ) {
-    let (our_work, our_score, servable, reconciled, have_frontier) = {
+    let (our_work, our_score, servable, reconciled, have_frontier, abandoned_gap) = {
         let d = dag.read();
         let selected = d.selected_tip().and_then(|h| d.get_node(&h));
         let our_work = selected.as_ref().map(|n| n.blue_work).unwrap_or(0);
@@ -3001,8 +3001,16 @@ fn maybe_release_ibd(
         let reconciled = sync::frontier::reconciled(
             &advertised, |h| d.has_block(h), outstanding, |h| fr.is_abandoned(h),
         );
+        // Honest-RPC fix: an advertised tip we do NOT hold that only counts as
+        // "resolved" because we gave up fetching it (abandoned after
+        // BlockNotFound/timeouts). Giving up is not catching up — this must
+        // never let the VERIFIED release claim completion (the captured lie:
+        // "IBD complete (verified=true caught_up=false; score 27779
+        // best_announced 27852)", declared complete 173 blue_score behind
+        // BECAUSE the unreachable frontier made `servable` under-count).
+        let abandoned_gap = advertised.iter().any(|h| !d.has_block(h) && fr.is_abandoned(h));
         drop(fr);
-        (our_work, our_score, servable, reconciled, have_frontier)
+        (our_work, our_score, servable, reconciled, have_frontier, abandoned_gap)
     };
     let best_announced = peer_state.best_announced_blue_score();
     // Release the IBD latch on the FIRST of two signals (both backstopped by the
@@ -3020,14 +3028,25 @@ fn maybe_release_ibd(
     //      ever RELEASES here (never blocks); a lying high-announce peer keeps us
     //      out of (A)+(B) and we fall back to the 90s throttled mine-through — it
     //      can never freeze us and never fakes a completion during a real backlog.
-    let verified  = have_frontier && reconciled && our_work >= servable;
+    // Honest-RPC fix: `!abandoned_gap` keeps an abandoned (given-up) frontier
+    // from releasing the VERIFIED path — `servable` under-counts exactly when
+    // tips were abandoned, so "our_work >= servable" is vacuous then. The
+    // caught_up path (B) still releases a node genuinely near the announced
+    // tip, and the 90s mine-through valve still protects miner liveness, so a
+    // phantom unreachable tip cannot freeze anything — the node just STOPS
+    // CLAIMING it finished syncing when it actually gave up.
+    let verified  = have_frontier && reconciled && !abandoned_gap && our_work >= servable;
     let caught_up = our_score.saturating_add(sync::IBD_EXIT_LAG) >= best_announced;
-    if verified || caught_up {
+    {
         let mut s = node_state.write();
-        if s.is_syncing {
+        // Refresh the RPC honesty hint on every latch re-test (event-driven +
+        // 30s nudge), so `getnetworkinfo` can report real lag (`behind_by`)
+        // even while `syncing` stays latched — or after a stale release.
+        s.best_announced_blue_score = best_announced;
+        if (verified || caught_up) && s.is_syncing {
             s.is_syncing = false;
-            info!("IBD complete (verified={} caught_up={}; score {} best_announced {}; work {} servable {})",
-                verified, caught_up, our_score, best_announced, our_work, servable);
+            info!("IBD complete (verified={} caught_up={}; score {} best_announced {}; work {} servable {}; abandoned_gap={})",
+                verified, caught_up, our_score, best_announced, our_work, servable, abandoned_gap);
         }
     }
 }
