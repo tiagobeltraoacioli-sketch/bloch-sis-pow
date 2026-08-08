@@ -29,6 +29,37 @@ pub const AUXPOW_ACTIVATION_HEIGHT: u64 = 8500; // FLAG-DAY 2026-08-01 (G3 mainn
 #[cfg(feature = "auxpow-rehearsal")]
 pub const AUXPOW_ACTIVATION_HEIGHT: u64 = 0;
 
+/// FLAG-DAY: height at/above which `bits` is validated from the block's own
+/// selected-parent ancestry (`pow::genesis2_expected_bits_ancestry`) instead of
+/// from mutable local state.
+///
+/// The legacy path derived the expected difficulty from the `current_bits` meta
+/// key — rewritten on EVERY accepted block, including out-of-order backfill and
+/// fork-losers — and from `get_timestamp_at_height`, a column family keyed by
+/// height alone and therefore last-write-wins in a DAG. Two nodes on an
+/// IDENTICAL binary consequently disagreed purely because they accepted blocks
+/// in a different order, and every follower froze permanently at the first
+/// retarget boundary where its cache had diverged (measured at h=25020: served
+/// 0x1a265e4e, follower expected 0x1a26ac86). The chain effectively had one
+/// producer and no independent validator.
+///
+/// Below this height the legacy path is retained verbatim so settled history
+/// stays valid; at and above it, difficulty is a pure function of ancestry and
+/// arrival order cannot change the verdict. Coordinated fleet upgrade required
+/// BEFORE the chain reaches this height — same discipline as
+/// `AUXPOW_ACTIVATION_HEIGHT` and the earlier SHA-256d-LE fork.
+///
+/// Set to 30_000 on 2026-08-08. The first draft said 27_000, which the chain
+/// would have reached ~2h later (measured tip_height 26_722 advancing at
+/// 0.039 blocks/s) — not enough room to upgrade the fleet without rushing the
+/// only block-producing node. Deploying AFTER the flag-day height would be the
+/// dangerous case: upgraded nodes would re-derive bits for blocks the producer
+/// had already mined under the order-dependent rule, and any retarget boundary
+/// where the two disagree is a real fork. Raise this again if the fleet is
+/// still not upgraded as the chain approaches it — raising costs nothing,
+/// arriving late costs a fork.
+pub const DIFFICULTY_ANCESTRY_FORK_HEIGHT: u64 = 30_000;
+
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 pub const MAINNET_PREFIX:        &str  = "bloch1q";
