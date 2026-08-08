@@ -34,6 +34,42 @@ pub const TOPIC_BLOCKS: &str = "bloch/blocks/1";
 pub const TOPIC_TXS:    &str = "bloch/txs/1";
 pub const TOPIC_SYNC:   &str = "bloch/sync/1";
 
+// ── Ingest-drop visibility (orphan-deadlock fix, companion) ──────────────────
+//
+// Every inbound frame reaches the message processor through a bounded (1000)
+// mpsc channel via `try_send`, and a full channel used to drop the frame IN
+// SILENCE — including GetBlock RESPONSES the orphan pool was waiting on. The
+// drop stays (backpressure by shedding is the design; blocking the swarm loop
+// would be worse), but it must be VISIBLE: a counter + WARN so an operator can
+// correlate "orphan waits forever" with "ingest channel overflowed".
+static INGEST_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Total inbound frames dropped because the swarm→processor channel was full.
+pub fn ingest_drops_total() -> u64 {
+    INGEST_DROPS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Forward an inbound frame to the processor, counting + logging drops instead
+/// of discarding them silently. WARNs on the first drop and every 100th after
+/// (a storm that overflows a 1000-slot channel would otherwise flood the log).
+fn forward_to_processor(block_tx: &mpsc::Sender<NetworkMessage>, msg: NetworkMessage, source: &str) {
+    use tokio::sync::mpsc::error::TrySendError;
+    match block_tx.try_send(msg) {
+        Ok(())                       => {}
+        Err(TrySendError::Full(m))   => {
+            let n = INGEST_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n == 1 || n % 100 == 0 {
+                warn!("ingest channel FULL — dropped inbound [{}] from {} \
+                       (total dropped: {}; lost GetBlock replies are re-requested \
+                       by the orphan sweep)", m.kind_name(), source, n);
+            }
+        }
+        Err(TrySendError::Closed(m)) => {
+            warn!("ingest channel CLOSED — dropped inbound [{}] from {}", m.kind_name(), source);
+        }
+    }
+}
+
 // ── Messages ──────────────────────────────────────────────────────────────────
 
 /// Protocol version for forward compatibility and hard fork coordination.
@@ -1129,7 +1165,7 @@ impl NetworkNode {
                                     }
                                     _ => {}
                                 }
-                                let _ = block_tx.try_send(msg);
+                                forward_to_processor(&block_tx, msg, "gossip");
                             }
                         }
                         SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
@@ -1392,7 +1428,7 @@ impl NetworkNode {
                                 // processes fetched blocks/headers unchanged.
                                 libp2p::request_response::Message::Response { request_id, response } => {
                                     inflight_pull.remove(&request_id);
-                                    let _ = block_tx.try_send(sync_rr::response_to_message(response));
+                                    forward_to_processor(&block_tx, sync_rr::response_to_message(response), "directed-pull");
                                 }
                             },
                             // Directed pull failed: peer doesn't speak
@@ -1485,7 +1521,7 @@ impl NetworkNode {
                     let current_height = dag.read().block_count() as u64;
                     info!("peers: {} | height: {}", peer_count, current_height);
                     let addrs: Vec<String> = known_peers.iter().cloned().collect();
-                    let _ = block_tx.try_send(NetworkMessage::PeerCount { count: peer_count, addresses: addrs });
+                    forward_to_processor(&block_tx, NetworkMessage::PeerCount { count: peer_count, addresses: addrs }, "heartbeat");
 
                     // Sprint P: emit aggregated PEX stats (every 60s, only if activity)
                     if let Some(line) = pex_stats.tick() {

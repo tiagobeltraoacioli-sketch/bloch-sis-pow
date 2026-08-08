@@ -1,6 +1,7 @@
 //! Bloch drop-in Kaspa sync-negotiation layer (Phase 2). Additive over gossip.
 pub mod frontier;
 pub mod locator;
+pub mod parent_fetch;
 pub mod peer_state;
 
 /// Max tip hashes we advertise / accept in one Tips frame. GHOSTDAG_K=10 caps

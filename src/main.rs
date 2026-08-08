@@ -876,11 +876,43 @@ async fn main() {
             // Reverse index: parent_hash → set of orphan hashes waiting for it
             let mut waiting_for: std::collections::HashMap<[u8; 32], HashSet<[u8; 32]>> =
                 std::collections::HashMap::new();
+            // Orphan-deadlock fix: per-missing-parent retry state. The one-shot
+            // GetBlock below (first_waiter && !buffered) is recorded here; the
+            // periodic sweep re-requests lost ones with backoff and prunes
+            // hopeless ones so waiting_for cannot grow stale forever.
+            let mut parent_fetch = sync::parent_fetch::ParentFetchTracker::new();
+            let mut orphan_sweep = tokio::time::interval(sync::parent_fetch::SWEEP_PERIOD);
+            orphan_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // Never fire immediately on (re)start — tick 0 is now.
+            orphan_sweep.reset();
             // Mesh fix (reciprocal tip): rate limiter for answering behind-
             // peers' PeerTip announcements with our own tip. None = never sent.
             let mut last_reciprocal_tip: Option<std::time::Instant> = None;
 
-            while let Some(msg) = block_rx.recv().await {
+            loop {
+            // Orphan-deadlock fix: the message wait is now a select between the
+            // inbound channel and the ~30s orphan sweep. The match body below is
+            // unchanged; `continue`/`break` semantics inside it are identical.
+            let msg = tokio::select! {
+                m = block_rx.recv() => match m { Some(m) => m, None => break },
+                _ = orphan_sweep.tick() => {
+                    let ready = sweep_orphan_parents(
+                        &mut orphans, &mut waiting_for, &mut parent_fetch,
+                        &dag2, &otx2,
+                    ).await;
+                    // Defensive liveness: a waited-on parent that is ALREADY in
+                    // the DAG (its accept raced the waiting_for insert) would
+                    // otherwise strand its orphans forever — drain them now.
+                    for p in ready {
+                        process_orphans(
+                            p, &mut orphans, &mut waiting_for,
+                            &dag2, &store2, &mem2, &state2,
+                            Some(&tip_tx2), &shielded2,
+                        );
+                    }
+                    continue;
+                }
+            };
             match msg {
 
                 // IBD step 1: peer tip — if behind, request headers
@@ -1143,6 +1175,12 @@ async fn main() {
                                     // request), so a deep gap fans out one level at a
                                     // time instead of duplicating GetBlocks.
                                     if first_waiter && !orphans.contains_key(mp) {
+                                        // Orphan-deadlock fix: record the attempt so the
+                                        // periodic sweep can re-request it if the response
+                                        // is lost (this send used to be fire-and-forget-
+                                        // exactly-once — a dropped reply deadlocked the
+                                        // orphan and every descendant forever).
+                                        parent_fetch.note_requested(*mp, std::time::Instant::now());
                                         let _ = otx2.send(network::NetworkMessage::GetBlock {
                                             block_hash: *mp, nonce: getblock_nonce(),
                                         }).await;
@@ -2969,6 +3007,95 @@ fn process_orphans(
             }
         }
     }
+}
+
+/// Orphan-deadlock fix: periodic (~30s) sweep over the missing-parent set.
+///
+/// The one-shot GetBlock in the NewBlock orphan arm has no timeout and no
+/// retry — a single lost response (full ingest channel, gossip publish racing
+/// a subscription, directed-pull timeout) used to deadlock the orphan and
+/// every descendant forever. This sweep re-emits GetBlock for parents pending
+/// past their (exponential, capped) backoff, gives up past an attempt/age
+/// ceiling (dropping the dependent orphans so `waiting_for` stays bounded),
+/// and returns waited-on parents that are ALREADY in the DAG so the caller
+/// can drain their orphans (accept/insert race liveness).
+///
+/// NOT consensus: only re-sends an existing wire message and prunes a local
+/// buffer. Validation/acceptance paths untouched.
+async fn sweep_orphan_parents(
+    orphans:      &mut std::collections::HashMap<[u8; 32], (core::Block, Vec<u8>, u64)>,
+    waiting_for:  &mut std::collections::HashMap<[u8; 32], HashSet<[u8; 32]>>,
+    parent_fetch: &mut sync::parent_fetch::ParentFetchTracker,
+    dag:          &Arc<RwLock<consensus::GhostDAG>>,
+    otx:          &tokio::sync::mpsc::Sender<network::NetworkMessage>,
+) -> Vec<[u8; 32]> {
+    let now = std::time::Instant::now();
+    // Partition waited-on parents WITHOUT holding the DAG lock across awaits:
+    //  ready — already in the DAG (drainable orphans);
+    //  chased — not buffered, not in the DAG: these need (re-)fetching.
+    let (ready, chased) = {
+        let d = dag.read();
+        let mut ready = Vec::new();
+        let mut chased = Vec::new();
+        for p in waiting_for.keys() {
+            if d.has_block(p) {
+                ready.push(*p);
+            } else if !orphans.contains_key(p) {
+                chased.push(*p);
+            }
+        }
+        (ready, chased)
+    };
+    let (retry, give_up) = parent_fetch.sweep(&chased, now);
+    for h in &retry {
+        let _ = otx.send(network::NetworkMessage::GetBlock {
+            block_hash: *h, nonce: getblock_nonce(),
+        }).await;
+    }
+    if !retry.is_empty() {
+        info!("orphan sweep: re-requested {} missing parent(s) (orphans={} waiting={})",
+            retry.len(), orphans.len(), waiting_for.len());
+    }
+    for (h, attempts) in give_up {
+        let dropped = drop_orphan_subtree(h, orphans, waiting_for);
+        warn!("orphan sweep: giving up on missing parent {} after {} attempts; \
+               dropped {} dependent orphan(s) — peers will re-announce if the \
+               branch is real", hex::encode(&h[..8]), attempts, dropped);
+    }
+    ready
+}
+
+/// Remove every orphan transitively waiting on `root_parent` (which we gave up
+/// fetching), cleaning their `waiting_for` back-references. Returns how many
+/// orphans were dropped. Dropped orphans are NOT banned: if a peer re-announces
+/// the branch and its ancestry becomes fetchable, it re-enters the pool.
+fn drop_orphan_subtree(
+    root_parent: [u8; 32],
+    orphans:     &mut std::collections::HashMap<[u8; 32], (core::Block, Vec<u8>, u64)>,
+    waiting_for: &mut std::collections::HashMap<[u8; 32], HashSet<[u8; 32]>>,
+) -> usize {
+    let mut dropped = 0usize;
+    let mut stack: Vec<[u8; 32]> = waiting_for
+        .remove(&root_parent)
+        .map(|s| s.into_iter().collect())
+        .unwrap_or_default();
+    while let Some(h) = stack.pop() {
+        if let Some((block, _, _)) = orphans.remove(&h) {
+            dropped += 1;
+            // Detach from any OTHER parents this orphan was waiting on.
+            for p in &block.header.parents {
+                if let Some(set) = waiting_for.get_mut(p) {
+                    set.remove(&h);
+                    if set.is_empty() { waiting_for.remove(p); }
+                }
+            }
+            // Cascade: orphans waiting on the one we just dropped.
+            if let Some(children) = waiting_for.remove(&h) {
+                stack.extend(children);
+            }
+        }
+    }
+    dropped
 }
 
 // ── Unified TX validation ────────────────────────────────────────────────────
