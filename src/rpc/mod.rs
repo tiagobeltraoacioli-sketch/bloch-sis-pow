@@ -61,6 +61,14 @@ pub struct NodeState {
     /// fresh-miner fork guard waits for this so a joining miner never mines a
     /// genesis fork in the window between "connected" and "evaluated a tip".
     pub seen_first_tip: bool,
+    /// Honest-RPC fix: highest blue_score announced by a CONNECTED peer,
+    /// refreshed by every maybe_release_ibd re-test (event-driven + 30s
+    /// nudge). UNTRUSTED wire hint — never gates consensus or the IBD latch;
+    /// it exists so `getnetworkinfo` can report `best_announced`/`behind_by`
+    /// and a lagging node SAYS it is lagging instead of just `syncing:false`.
+    /// Differs from `best_seen_blue_score` (lifetime max over any peer ever,
+    /// including long-gone ones): this one tracks currently-connected peers.
+    pub best_announced_blue_score: u64,
     pub peer_addresses: Vec<String>,
     pub version:        String,
 }
@@ -280,6 +288,15 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 "peers":           s.peer_count,
                 "mempool":         s.mempool_size,
                 "syncing":         s.is_syncing,
+                // Honest-lag fields: `best_announced` is the highest blue_score
+                // any CONNECTED peer claims (untrusted hint); `behind_by` is how
+                // far our selected tip trails it. A node that gave up on an
+                // unreachable frontier used to report syncing:false and NOTHING
+                // else — operators and the explorer could not see real lag.
+                // behind_by > 0 with syncing:false means "released by the lag
+                // tolerance or gave up", not "provably at the network tip".
+                "best_announced":  s.best_announced_blue_score,
+                "behind_by":       s.best_announced_blue_score.saturating_sub(s.tip_blue_score),
                 "chain":           "bloch-sis",
                 "pruned_height":   pruned_h,
             })
