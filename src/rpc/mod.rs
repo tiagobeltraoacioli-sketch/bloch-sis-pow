@@ -765,8 +765,17 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 })
             }).collect();
 
-            let subsidy = crate::core::tokenomics_v2::block_subsidy_sat(height);
-            let founder_vesting = crate::core::tokenomics_v2::founder_vesting_delta_sat(height);
+            // CONSENSUS: subsidy/vesting are functions of the EMISSION height
+            // (local + CARRYOVER_SOURCE_HEIGHT on carry-over chains), exactly
+            // as validate_coinbase_value computes them. This call site used the
+            // LOCAL height — latent while both fell in the same 8,400 epoch,
+            // but from the Emission V3 flag-day (local 40,000) onward it would
+            // hand pools an 8,400-BLCH template that consensus rejects at
+            // 2,600. Same single-gated-function rule as the miner (main.rs)
+            // and stratum (jobs.rs) paths.
+            let emission_h = crate::core::emission_height(height);
+            let subsidy = crate::core::tokenomics_v2::block_subsidy_sat(emission_h);
+            let founder_vesting = crate::core::tokenomics_v2::founder_vesting_delta_sat(emission_h);
 
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -775,6 +784,11 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             json!({
                 "parents":              parents.iter().map(hex::encode).collect::<Vec<_>>(),
                 "height":               height,
+                // The emission height the subsidy was computed at, so external
+                // pool software can re-derive/verify the subsidy through
+                // tokenomics_v2::block_subsidy_sat without knowing the chain's
+                // carry-over offset.
+                "emission_height":      emission_h,
                 "blue_score":           blue_score,
                 "bits":                 bits,
                 "cur_time":             now,
@@ -1040,10 +1054,13 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             use crate::core::tokenomics_v2 as v2;
             let current_height = state.node_state.read().block_count;
             let next_height    = current_height.saturating_add(1);
-            let subsidy        = v2::block_subsidy_sat(next_height);
+            // Subsidy is a function of the EMISSION height (carry-over offset),
+            // same gated function as consensus — see validate_coinbase_value.
+            let next_emission_h = crate::core::emission_height(next_height);
+            let subsidy        = v2::block_subsidy_sat(next_emission_h);
             let (miner_subsidy, validator_subsidy, oracle_subsidy) =
                 v2::split_subsidy_sat(subsidy);
-            let founder_vesting = v2::founder_vesting_delta_sat(next_height);
+            let founder_vesting = v2::founder_vesting_delta_sat(next_emission_h);
             let vesting_per_month_sat: u64 = v2::founder_monthly_tranche_sat();
 
             let validator_pool = match v2::VALIDATOR_POOL_ADDRESS_HASH {

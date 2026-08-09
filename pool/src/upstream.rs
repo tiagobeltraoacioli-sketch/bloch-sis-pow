@@ -24,6 +24,13 @@ use serde_json::{json, Value};
 pub struct BlockTemplate {
     pub parents:              Vec<[u8; 32]>,
     pub height:               u64,
+    /// The ABSOLUTE emission height the node computed `subsidy_sat` at
+    /// (local height + carry-over offset on Genesis-2/3 chains). This — not
+    /// `height` — is what `tokenomics_v2::block_subsidy_sat` takes: from the
+    /// Emission V3 flag-day onward, checking the subsidy against the LOCAL
+    /// height computes the wrong epoch. Falls back to `height` when the node
+    /// predates the field (identity on non-carry-over chains).
+    pub emission_height:      u64,
     pub blue_score:           u64,
     /// Expected compact difficulty bits for the next block. The node
     /// computes this with the same ASERT-Lattice call `accept_block`
@@ -129,9 +136,14 @@ impl Upstream {
 
         // Reward-bearing fields hard-error like height/bits: a renamed
         // or missing field must NOT silently become a 0-sat coinbase.
+        let height = v.get("height").and_then(|x| x.as_u64()).ok_or("template missing height")?;
         Ok(BlockTemplate {
             parents,
-            height:              v.get("height").and_then(|x| x.as_u64()).ok_or("template missing height")?,
+            height,
+            // Older nodes don't serve emission_height; fall back to the local
+            // height (correct only on chains without a carry-over offset —
+            // the divergence check in main.rs then degrades, it never lies).
+            emission_height:     v.get("emission_height").and_then(|x| x.as_u64()).unwrap_or(height),
             blue_score:          v.get("blue_score").and_then(|x| x.as_u64()).unwrap_or(0),
             bits,
             cur_time:            v.get("cur_time").and_then(|x| x.as_u64()).ok_or("template missing cur_time")?,

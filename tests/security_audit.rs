@@ -118,7 +118,7 @@ mod security_tests {
             blue_score:   0,
             height:       0,
             pow_solution: Vec::new(),
-            shielded_transactions: Vec::new(),        };
+            shielded_transactions: Vec::new(), auxpow: None,        };
 
         // Sanity: at real h=0, the coinbase passes validation (correct values)
         assert!(
@@ -322,7 +322,7 @@ mod security_tests {
             blue_score:   0,
             height,
             pow_solution: Vec::new(),
-            shielded_transactions: Vec::new(),        };
+            shielded_transactions: Vec::new(), auxpow: None,        };
 
         // Correct coinbase passes
         assert!(

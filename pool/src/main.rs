@@ -190,14 +190,18 @@ async fn template_loop(pool: Arc<PoolState>) {
         match tmpl {
             Err(e) => warn!("getblocktemplate failed (node down?): {}", e),
             Ok(tmpl) => {
-                // Never trust a divergent node across a halving: the
-                // subsidy must match consensus for the height, or the
-                // coinbase (and every miner's reward) would be wrong.
-                let expect = bloch_crypto::core::tokenomics_v2::block_subsidy_sat(tmpl.height);
+                // Never trust a divergent node across a halving (or across the
+                // Emission V3 flag-day): the subsidy must match consensus for
+                // the EMISSION height — block_subsidy_sat takes the absolute
+                // emission height (local + carry-over offset), which the node
+                // reports as `emission_height`. Checking against the LOCAL
+                // height would compute the wrong epoch from the V3 fork
+                // (local 40,000 = emission 453,743) onward.
+                let expect = bloch_crypto::core::tokenomics_v2::block_subsidy_sat(tmpl.emission_height);
                 if tmpl.subsidy_sat != expect {
-                    error!("template subsidy {} sat != consensus {} sat at h={} — \
+                    error!("template subsidy {} sat != consensus {} sat at h={} (emission h={}) — \
                             refusing to cut a job from a divergent node",
-                        tmpl.subsidy_sat, expect, tmpl.height);
+                        tmpl.subsidy_sat, expect, tmpl.height, tmpl.emission_height);
                     tokio::time::sleep(refresh).await;
                     continue;
                 }

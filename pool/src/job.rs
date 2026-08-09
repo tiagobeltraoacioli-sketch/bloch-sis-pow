@@ -124,6 +124,7 @@ mod tests {
         BlockTemplate {
             parents:              vec![[0x11u8; 32]],
             height:               42,
+            emission_height:      42, // identity chain in tests (no carry-over)
             blue_score:           42,
             bits:                 0x2100ffff,
             cur_time:             1_777_686_999,
