@@ -2,6 +2,7 @@
 //!
 //! Phase 1 exposed a minimal server + 5 base gauges. Phase 2 adds:
 //!   - Counters: block_accepted_total, block_rejected_total,
+//!     block_backfill_dropped_total,
 //!               tx_accepted_total, tx_rejected_total{reason},
 //!               kyber_handshake_failures_total,
 //!               rpc_requests_total{method,status}
@@ -58,6 +59,7 @@ pub struct MetricsState {
     // ── Counters (Phase 2) ──────────────────────────────────────
     pub block_accepted_total:            IntCounter,
     pub block_rejected_total:            IntCounter,
+    pub block_backfill_dropped_total:    IntCounter,
     pub tx_accepted_total:               IntCounter,
     pub tx_rejected_total:               IntCounterVec,
     pub kyber_handshake_failures_total:  IntCounter,
@@ -127,6 +129,17 @@ impl MetricsState {
                   "Blocks rejected during validation"),
             registry
         ).expect("register block_rejected_total");
+
+        // Deliberately NOT block_rejected_total: dropping unsolicited deep
+        // backfill is healthy defensive behaviour, not an invalid block. The
+        // rejection counter is the signal used to spot consensus divergence
+        // (an `invalid difficulty` storm is what exposed the order-dependent
+        // difficulty bug), so it must stay clean.
+        let block_backfill_dropped_total = register_int_counter_with_registry!(
+            opts!("bloch_block_backfill_dropped_total",
+                  "Unsolicited deep backfill blocks dropped by the flood guard"),
+            registry
+        ).expect("register block_backfill_dropped_total");
 
         let tx_accepted_total = register_int_counter_with_registry!(
             opts!("bloch_tx_accepted_total",
@@ -229,6 +242,7 @@ impl MetricsState {
             mempool_size,
             block_accepted_total,
             block_rejected_total,
+            block_backfill_dropped_total,
             tx_accepted_total,
             tx_rejected_total,
             kyber_handshake_failures_total,
@@ -284,6 +298,11 @@ pub fn inc_block_accepted() {
 #[inline]
 pub fn inc_block_rejected() {
     if let Some(m) = METRICS.get() { m.block_rejected_total.inc(); }
+}
+
+#[inline]
+pub fn inc_block_backfill_dropped() {
+    if let Some(m) = METRICS.get() { m.block_backfill_dropped_total.inc(); }
 }
 
 #[inline]

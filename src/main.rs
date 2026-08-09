@@ -1202,6 +1202,57 @@ async fn main() {
                                 continue;
                             }
 
+                            // ── BACKFILL-FLOOD guard (frente BACKFILL-FLOOD) ──────────
+                            // `height` is now content-verified (== block.height). A block
+                            // far BELOW our selected tip that we did NOT ask for is
+                            // backfill a healthy node PULLS, never something a peer should
+                            // PUSH. Ingesting one is not cheap: add_block →
+                            // compute_mergeset unconditionally walks compute_past(selected
+                            // parent) (O(past-cone)) and the reachability index reindexes
+                            // the whole subtree above the insertion point — measured at
+                            // ~7.0s for a SINGLE h=10.8k block against a 27.4k tip vs
+                            // ~6ms to extend the tip (tests/backfill_flood_lab.rs). All of
+                            // it runs under the global dag.write(), so one lagging peer
+                            // pushing thousands of these (observed: 12D3KooWBZeik… on
+                            // 2026-08-09, 1.270 blocks in 5 min) starves the miner's
+                            // read/write for up to ~10s at a time and freezes block
+                            // production. Drop such a block cheaply UNLESS we explicitly
+                            // requested it (orphan-parent resolution). Backfill for
+                            // legitimately-behind nodes is unaffected: they PULL via
+                            // directed GetBlock/GetHeaders, which we serve straight from
+                            // storage (store.get_block — no add_block, no cone walk). A
+                            // node still mid-IBD has a LOW tip, so height is never far
+                            // below it and this never fires. Not consensus: declining to
+                            // ingest an ancient gossiped block changes no validation rule.
+                            {
+                                let tip_h = {
+                                    let d = dag2.read();
+                                    d.selected_tip()
+                                        .and_then(|t| d.get_block_data(&t).map(|bd| bd.height))
+                                        .unwrap_or(0)
+                                };
+                                let awaited = waiting_for.contains_key(&block_hash)
+                                    || parent_fetch.is_awaited(&block_hash);
+                                // CHECKPOINT_DEPTH is the finality horizon: a block deeper
+                                // than that below the tip can never legitimately become the
+                                // selected tip (disposition guard + MAX_REORG_DEPTH), and a
+                                // real mergeset member of a recent tip sits within the
+                                // (narrow, K=10) anticone near tip height — never this far
+                                // down. So this window drops only useless/attack pushes.
+                                if !awaited
+                                    && tip_h > core::CHECKPOINT_DEPTH
+                                    && height + core::CHECKPOINT_DEPTH < tip_h
+                                {
+                                    debug!(
+                                        "backfill-flood guard: dropped unsolicited deep block h={} \
+                                         (tip h={}, {} below) from gossip — backfill must be pulled",
+                                        height, tip_h, tip_h - height
+                                    );
+                                    crate::metrics::inc_block_backfill_dropped();
+                                    continue;
+                                }
+                            }
+
                             // Structural validation (PoW, merkle, coinbase) — always do first
                             if let Err(reason) = block.validate_structure() {
                                 warn!("block {} rejected ({})", hex::encode(&block_hash[..8]), reason);

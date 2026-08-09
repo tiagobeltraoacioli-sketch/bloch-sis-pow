@@ -87,6 +87,14 @@ impl ParentFetchTracker {
         self.map.is_empty()
     }
 
+    /// True iff we have an outstanding GetBlock for `hash` — i.e. this block
+    /// is a missing parent we explicitly PULLED. Used by the backfill-flood
+    /// guard to tell a solicited deep block (keep it) from an unsolicited
+    /// deep block a peer PUSHED at us (drop it cheaply).
+    pub fn is_awaited(&self, hash: &[u8; 32]) -> bool {
+        self.map.contains_key(hash)
+    }
+
     /// One sweep step. `chased` is the set of parents that still need
     /// fetching: keys of `waiting_for` that are neither buffered in the
     /// orphan pool nor already in the DAG (the caller filters; this keeps
