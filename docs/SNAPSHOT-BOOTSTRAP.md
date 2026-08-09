@@ -10,24 +10,28 @@ snapshot height and follows the chain live; no full IBD.
 
 ## Download
 
-Current snapshot — taken **2026-08-08 19:50 UTC** from the **block producer**
-at the network tip (height ~27,147; clean `systemctl stop`, 0.33 s stop window,
-`cp -a` from the quiesced datadir):
+Current snapshot — taken from the **block producer** at height **≈27,614 —
+above the h=27,600 difficulty-ancestry flag-day**, which mainnet has already
+crossed. Both fleet followers were restored from exactly this archive and
+converged with the producer (zero `invalid difficulty` rejections):
 
 ```bash
-curl -fL -O https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow/releases/download/g3-datadir-snapshot-20260808/bloch-g3-datadir-snapshot-20260808.tar.gz
-curl -fL -O https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow/releases/download/g3-datadir-snapshot-20260808/bloch-g3-datadir-snapshot-20260808.tar.gz.sha256
+curl -fL -O https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow/releases/download/g3-datadir-snapshot-h27614-20260808/bloch-g3-datadir-snapshot-h27614-20260808.tar.gz
+curl -fL -O https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow/releases/download/g3-datadir-snapshot-h27614-20260808/bloch-g3-datadir-snapshot-h27614-20260808.tar.gz.sha256
 
-sha256sum -c bloch-g3-datadir-snapshot-20260808.tar.gz.sha256
-# expect: dc02514f19494b5cf1f60ed59805db65edfbf89e250ad2bbfb3da28b2b058f65
+sha256sum -c bloch-g3-datadir-snapshot-h27614-20260808.tar.gz.sha256
+# expect: 12e813e42f92672352415f0fd03225f794ca37820d706ca2d7728aa0b53c3c4d
 ```
 
-> **Run it with the [`genesis3-node-ancestry-flagday-h30000-20260808`](https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow/releases/tag/genesis3-node-ancestry-flagday-h30000-20260808)
-> binary.** The consensus flag-day at height 30,000 (difficulty derived from
-> block ancestry) is imminent; every earlier binary diverges there regardless
-> of which snapshot it starts from.
+> **Run it with the [`genesis3-node-flagday-h27600-rpcfix-20260808`](https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow/releases/tag/genesis3-node-flagday-h27600-rpcfix-20260808)
+> binary.** The consensus flag-day at height 27,600 (difficulty derived from
+> block ancestry) has **already passed**; every earlier binary is already
+> diverging from the network regardless of which snapshot it starts from.
+> A snapshot **below** h27,600 is equally unusable: it drops you into the
+> legacy, acceptance-order-dependent difficulty window, where followers freeze
+> at the first retarget boundary (`h % 60`).
 
-- ~225 MB compressed (~309 MB on disk), taken at tip height ~27,147.
+- ~117 MB compressed, taken at height ≈27,614.
 - The archive contains a `g3-data/` RocksDB directory only. `p2p_identity.bin`
   and `known_peers.json` are **not** included — your node generates a fresh
   libp2p identity on first boot (a shared identity would collide on the
@@ -39,6 +43,10 @@ sha256sum -c bloch-g3-datadir-snapshot-20260808.tar.gz.sha256
 
 Superseded:
 
+- `bloch-g3-datadir-snapshot-20260808.tar.gz` (tip ~h27,147, sha
+  `dc02514f…`) — **below the h27,600 flag-day**; restoring it lands you in the
+  legacy difficulty window and you freeze at the first retarget boundary. Do
+  not use.
 - `bloch-g3-datadir-snapshot-20260807.tar.gz` (block_count 28,904, sha
   `76016538…`) — predates the difficulty-ancestry rollout; prefer the current
   one.
@@ -52,7 +60,7 @@ Stop your node if running, extract, and point `--data-dir` at `g3-data`. Use the
 **still requires even with a full datadir** (it verifies the carry-over root):
 
 ```bash
-tar -xzf bloch-g3-datadir-snapshot-20260808.tar.gz     # -> ./g3-data
+tar -xzf bloch-g3-datadir-snapshot-h27614-20260808.tar.gz     # -> ./g3-data
 
 bloch --genesis3 --archive \
   --data-dir ./g3-data \
@@ -73,11 +81,10 @@ bloch-cli getblockcount        # starts at the snapshot's count and climbs to th
 bloch-cli getnetworkinfo       # "syncing": false, peers > 0
 ```
 
-The 2026-08-08 archive was verified before publishing (extracts cleanly,
-RocksDB `CURRENT`/`MANIFEST` intact, no identity/peer files). The previous
-snapshot (2026-08-07) was additionally validated end-to-end on a clean node
-(node4): opened at its tip, did **not** stall at 26,474, reached the live tip
-and tracked it (`syncing: false`, peers > 0).
+The h≈27,614 archive was verified before publishing (extracts cleanly,
+RocksDB `CURRENT`/`MANIFEST` intact, no identity/peer files — 164 entries) and
+validated end-to-end: **both fleet followers were restored from exactly this
+archive**, reached the live tip and tracked it in consensus with the producer.
 
 ## Known limitation: catching up a large gap may stall
 

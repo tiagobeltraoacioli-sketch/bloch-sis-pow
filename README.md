@@ -93,13 +93,14 @@ Binaries in `target/release/`: `bloch` (full node), `bloch-wallet`,
 Building from source is recommended (you run the bytes you compiled). For a
 quick start, prebuilt `bloch` + `bloch-cli` for **Linux x86_64** are published:
 
-- GitHub release: [`genesis3-node-ancestry-flagday-h30000-20260808`](https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow/releases/tag/genesis3-node-ancestry-flagday-h30000-20260808)
-- GitLab release: [`genesis3-node-ancestry-flagday-h30000-20260808`](https://gitlab.com/blochsispow-group/BlochSISPoW-project/-/releases/genesis3-node-ancestry-flagday-h30000-20260808)
+- GitHub release: [`genesis3-node-flagday-h27600-rpcfix-20260808`](https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow/releases/tag/genesis3-node-flagday-h27600-rpcfix-20260808)
+- GitLab release: [`genesis3-node-flagday-h27600-rpcfix-20260808`](https://gitlab.com/blochsispow-group/BlochSISPoW-project/-/releases/genesis3-node-flagday-h27600-rpcfix-20260808)
 
-This is the binary the mainnet fleet runs (byte-identical, commit `7a8bbf4`).
-**Every earlier release diverges from the network at the height-30,000
-consensus flag-day** (difficulty derived from block ancestry) — including
-`genesis3-node-regossip-meshfix-20260807`; do not use them.
+This is the binary the mainnet fleet runs (byte-identical, commit `fd6537f`).
+**The height-27,600 consensus flag-day (difficulty derived from block
+ancestry) has already passed — every earlier release is already diverging
+from the network**, including `genesis3-node-ancestry-flagday-h30000-20260808`
+(whose flag-day of 30,000 will never activate correctly); do not use them.
 
 Requires **glibc ≥ 2.39** (Ubuntu 24.04+); on older distros build from source.
 Unpack and verify `SHA256SUMS` before running.
