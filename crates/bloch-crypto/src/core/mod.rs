@@ -69,7 +69,29 @@ pub const AUXPOW_ACTIVATION_HEIGHT: u64 = 0;
 /// stamping bits. Followers are restored from a producer datadir above the
 /// fork height afterwards, so their exposure to the legacy window is zero.
 /// Pick a height just far enough to deploy to the producer, and no further.
-pub const DIFFICULTY_ANCESTRY_FORK_HEIGHT: u64 = 27_600;
+// EMERGENCY 2026-08-09 05:2x: raised 27_600 -> 29_400 to restore block
+// production. At h=28_080 (468x60, a retarget boundary) with TWO open tips at
+// 28_079, the miner and the validator on the SAME node disagreed: the template
+// stamped bits 0x1a0abee4 and accept_block rejected that very block expecting
+// 0x1a0ac909. Deterministic, so every block the ASIC found was discarded and
+// the chain sat still for ~40 minutes.
+//
+// Root of the asymmetry is in genesis2_expected_bits_ancestry: the selected
+// parent is argmax(blue_work) over the `parents` slice, and the two call sites
+// do not pass the same slice — the miner passes the DAG's bodied tips, the
+// validator passes block.header.parents — nor is the walk guaranteed to
+// succeed on both sides (it returns None on an incomplete chain and the caller
+// silently falls back to the LEGACY value, so one side can be on the new rule
+// while the other is on the old one). With a single tip these coincide, which
+// is why it survived the flag-day and only fired at the first boundary that
+// had two.
+//
+// Above the fork height both sides therefore use the legacy rule again and
+// agree with each other. This re-exposes the follower-freeze this fix exists to
+// solve, so it is a stopgap: fix the asymmetry (pass the same parent set on
+// both sides, and make the fallback symmetric or fail closed) and lower this
+// back BEFORE the chain reaches 29_400.
+pub const DIFFICULTY_ANCESTRY_FORK_HEIGHT: u64 = 29_400;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
