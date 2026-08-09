@@ -1075,15 +1075,23 @@ impl NetworkNode {
                                         track_peer_score(&mut peer_sync, propagation_source, *blue_score);
                                     }
                                     NetworkMessage::PeerRequest => {
-                                        let mut my_peers: Vec<String> = known_peers.iter().cloned().collect();
+                                        // PROPAGAÇÃO-CHURN fix: never put an entry on the wire
+                                        // that a compliant receiver must penalize. known_peers is
+                                        // kept canonical now, but a file written by an OLD binary
+                                        // survives until the startup prune — filter at the send
+                                        // seam too, so one stale entry can't graylist us
+                                        // (−100/frame at every receiver) for the whole session.
+                                        let mut my_peers: Vec<String> = known_peers.iter()
+                                            .filter(|a| is_valid_public_multiaddr(a, allow_private))
+                                            .cloned().collect();
                                         // PRINCIPLES.md #2 ("every node is a seed"): advertise our
                                         // OWN reachable address(es) — learned via identify's
                                         // observed_addr and stored as external addresses — so a node
                                         // that nobody knows can still be gossiped onward. Formatted
-                                        // exactly like the other PEX entries (append /p2p/<peer_id>);
-                                        // de-duplicated against known_peers.
+                                        // exactly like the other PEX entries (canonical single
+                                        // /p2p/<peer_id> suffix); de-duplicated against known_peers.
                                         for addr in swarm.external_addresses() {
-                                            let self_addr = format!("{}/p2p/{}", addr, peer_id_str);
+                                            let self_addr = canonical_peer_addr(addr, &self.peer_id);
                                             if !my_peers.contains(&self_addr) {
                                                 my_peers.push(self_addr);
                                             }
@@ -1195,17 +1203,39 @@ impl NetworkNode {
                             // already sends our subscription set on connection establishment,
                             // so there is nothing to force.
                             // Save peer address for next startup.
-                            // Sprint P: also track listener peers (was a bug — only dialers
-                            // entered known_peers, so known_peers.json only grew with outbound
-                            // connections). Both sides get filtered through the validator so
-                            // we don't pollute known_peers with garbage.
+                            //
+                            // PROPAGAÇÃO-CHURN fix (2026-08-09), two parts:
+                            //
+                            // (a) Dialer: the dialed `address` already ENDS in
+                            //     `/p2p/<peer_id>` (bootstrap/PEX/known_peers
+                            //     entries all carry it), so the previous
+                            //     `format!("{}/p2p/{}", address, peer_id)`
+                            //     appended a second component — and one more on
+                            //     every later successful dial of the stored
+                            //     result. Mainnet files were measured with
+                            //     chains up to 15 components (885 bytes); past
+                            //     ~9 the string exceeds MAX_WIRE_ADDR_LEN and
+                            //     every PeerExchange carrying it graylists US
+                            //     at the receiver (−100/frame, −400 = graylist)
+                            //     → our blocks/tips blackholed with TCP up.
+                            //     `canonical_peer_addr` strips every P2p
+                            //     component and appends exactly one — it is
+                            //     idempotent, so re-observation never grows.
+                            //
+                            // (b) Listener: `send_back_addr` is the remote's
+                            //     EPHEMERAL socket (e.g. /tcp/55964), never its
+                            //     listen address — it is not dialable, so
+                            //     persisting it only filled known_peers with
+                            //     garbage (226 of node4's 265 entries) that
+                            //     wasted the receiver-side PEX_BATCH_LIMIT
+                            //     slots real peers needed. Reachable listeners
+                            //     are discovered via PEX self-advertise
+                            //     (identify observed_addr + quorum), not here.
                             let addr_to_remember = match &endpoint {
                                 libp2p::core::ConnectedPoint::Dialer { address, .. } => {
-                                    Some(format!("{}/p2p/{}", address, peer_id))
+                                    Some(canonical_peer_addr(address, &peer_id))
                                 }
-                                libp2p::core::ConnectedPoint::Listener { send_back_addr, .. } => {
-                                    Some(format!("{}/p2p/{}", send_back_addr, peer_id))
-                                }
+                                libp2p::core::ConnectedPoint::Listener { .. } => None,
                             };
                             if let Some(addr_str) = addr_to_remember {
                                 if is_valid_public_multiaddr(&addr_str, allow_private) {
@@ -1382,7 +1412,10 @@ impl NetworkNode {
                             // independent quorum of DISTINCT peers before trusting
                             // it as our external address — only then is it eligible
                             // for PEX self-advertise. Never trust one peer.
-                            let cand = format!("{}/p2p/{}", info.observed_addr, peer_id_str);
+                            // PROPAGAÇÃO-CHURN fix: canonical form (strip any
+                            // P2p the remote may have echoed, append ours once)
+                            // — same normalization as every other stored addr.
+                            let cand = canonical_peer_addr(&info.observed_addr, &self.peer_id);
                             if is_valid_public_multiaddr(&cand, allow_private)
                                 && (observed_by.len() < OBSERVED_ADDR_CAP
                                     || observed_by.contains_key(&info.observed_addr))
@@ -1725,6 +1758,32 @@ async fn resolve_multiaddr(addr: &str) -> String {
         }
     }
     addr.to_string()
+}
+
+/// PROPAGAÇÃO-CHURN fix (2026-08-09): the ONE canonical string form of a
+/// peer's address for known_peers / PEX — transport components only, plus
+/// exactly one trailing `/p2p/<peer_id>`.
+///
+/// Every place that used to build a persistable address with
+/// `format!("{}/p2p/{}", observed, peer_id)` concatenated a NEW `/p2p/`
+/// component onto an address that (on the Dialer path) already ended in one.
+/// Each successful dial of the stored entry re-observed it and appended
+/// again — mainnet known_peers.json files were measured with chains up to
+/// 15 `/p2p/` components (885 bytes). Past ~9 components the string exceeds
+/// MAX_WIRE_ADDR_LEN, at which point every PeerExchange carrying it is a
+/// wire violation at the receiver: −100 app score per frame, graylist at
+/// −400, and the sender's blocks/tips are blackholed while TCP stays up —
+/// the 2026-08-09 non-convergence incident.
+///
+/// Stripping ALL P2p components before appending exactly one makes this
+/// function idempotent: re-observing a canonical address yields the same
+/// string forever.
+pub fn canonical_peer_addr(addr: &Multiaddr, peer_id: &PeerId) -> String {
+    let transport: Multiaddr = addr
+        .iter()
+        .filter(|p| !matches!(p, libp2p::multiaddr::Protocol::P2p(_)))
+        .collect();
+    format!("{}/p2p/{}", transport, peer_id)
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -47,20 +47,34 @@ pub const PEX_STATS_LOG_INTERVAL: Duration = Duration::from_secs(60);
 /// Rules:
 /// - Must parse as a valid libp2p Multiaddr
 /// - Must contain /tcp/ (we don't PEX QUIC/WebTransport yet)
-/// - Must contain /p2p/<peer_id> (need to know who we're dialing)
+/// - Must end in exactly ONE /p2p/<peer_id> component (need to know who
+///   we're dialing — and the canonical form has the peer id LAST, once)
+/// - Must fit MAX_WIRE_ADDR_LEN (an entry the wire bound forbids can never
+///   be exchanged, and carrying it in a PeerExchange graylists the sender)
 /// - IP must not be loopback, link-local, or unspecified
 /// - When `allow_private=false`: rejects RFC1918 (private networks)
+///
+/// PROPAGAÇÃO-CHURN fix (2026-08-09): the single-final-P2p and length rules
+/// are what let `prune_invalid` self-heal a poisoned known_peers.json at
+/// startup. The old check ("contains a P2p somewhere") accepted the
+/// `/p2p/<id>/p2p/<id>/…` chains the ConnectionEstablished handler used to
+/// build, so the poison round-tripped load → PEX → penalty forever.
 pub fn is_valid_public_multiaddr(addr: &str, allow_private: bool) -> bool {
+    if addr.len() > super::MAX_WIRE_ADDR_LEN {
+        return false;
+    }
     let ma: Multiaddr = match addr.parse() {
         Ok(m) => m,
         Err(_) => return false,
     };
 
     let mut has_tcp = false;
-    let mut has_p2p = false;
+    let mut p2p_count = 0usize;
+    let mut last_is_p2p = false;
     let mut ip_ok = false;
 
     for proto in ma.iter() {
+        last_is_p2p = matches!(proto, Protocol::P2p(_));
         match proto {
             Protocol::Ip4(ip) => {
                 ip_ok = is_acceptable_ipv4(&ip, allow_private);
@@ -76,12 +90,12 @@ pub fn is_valid_public_multiaddr(addr: &str, allow_private: bool) -> bool {
                 ip_ok = true;
             }
             Protocol::Tcp(_) => has_tcp = true,
-            Protocol::P2p(_) => has_p2p = true,
+            Protocol::P2p(_) => p2p_count += 1,
             _ => {}
         }
     }
 
-    ip_ok && has_tcp && has_p2p
+    ip_ok && has_tcp && p2p_count == 1 && last_is_p2p
 }
 
 /// Whether a multiaddr points at a LAN (private / loopback / link-local) IP.
