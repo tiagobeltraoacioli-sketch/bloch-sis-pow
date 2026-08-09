@@ -1,7 +1,15 @@
 import { rpcAllSettled, rpc } from "../lib/rpc";
-import { fetchDagWindow, NetworkInfo, DagInfo, STALL_THRESHOLD_SECS } from "../lib/chain";
+import {
+  fetchDagWindow,
+  NetworkInfo,
+  DagInfo,
+  STALL_THRESHOLD_SECS,
+  totalSupplySat,
+  CARRYOVER_TOTAL_SAT,
+} from "../lib/chain";
 import { useAsync } from "../lib/hooks";
 import { Stat, Loading, ErrorBox } from "../components/ui";
+import { HalvingCard } from "../components/halving";
 import { SearchBox } from "../components/search";
 import { DagView } from "../components/dag";
 import { Link } from "../lib/router";
@@ -84,6 +92,8 @@ export function Dashboard() {
         </div>
       )}
 
+      <HalvingCard tipHeight={tipHeight} observedBlockSecs={chain?.avg_block_time_secs} />
+
       <div className="grid stat-grid">
         <Stat
           label="Tip height"
@@ -104,10 +114,10 @@ export function Dashboard() {
           sub={`target 30s · median ${fmtDuration(d.bt?.p50_secs ?? 0)}`}
         />
         <Stat
-          label="Supply (circ.)"
-          value={fmtBloch(d.supply?.total_sats ?? 0, 0)}
+          label="Total supply"
+          value={fmtBloch(totalSupplySat(d.supply?.total_sats), 0)}
           unit="BLOCH"
-          sub={`${fmtInt(d.supply?.total_addresses ?? 0)} addresses`}
+          sub={`incl. ${fmtBloch(CARRYOVER_TOTAL_SAT, 0)} carry-over`}
         />
         <Stat label="Mempool" value={fmtInt(net?.mempool ?? d.mp?.size ?? 0)} sub="pending txs" />
         <Stat label="Peers" value={fmtInt(net?.peers ?? 0)} sub={net?.syncing ? "syncing" : "in sync"} />

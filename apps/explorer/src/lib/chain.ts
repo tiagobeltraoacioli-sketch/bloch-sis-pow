@@ -1,6 +1,29 @@
 import { rpc } from "./rpc";
 import type { DagBlock } from "../components/dag";
 
+/**
+ * Genesis-1 carry-over opening balances, baked into Genesis-3 at height 0.
+ *
+ * `getsupplydistribution` walks the live UTXO set and does NOT see these — the
+ * snapshot is loaded separately at genesis (see `CARRYOVER_TOTAL_SAT` /
+ * `CARRYOVER_UTXO_COUNT` in `crates/bloch-crypto/src/core/mod.rs`). Reporting the
+ * RPC figure on its own understates total supply by this whole amount, so every
+ * supply readout must add it back.
+ */
+export const CARRYOVER_TOTAL_SAT = 347_544_120_000_000_000n; // 3,475,441,200 BLOCH
+export const CARRYOVER_UTXO_COUNT = 413_743;
+
+/** Total supply = UTXO-set supply reported by the RPC + the carry-over set. */
+export function totalSupplySat(rpcTotalSats: number | string | bigint | undefined): bigint {
+  let live: bigint;
+  try {
+    live = BigInt(typeof rpcTotalSats === "number" ? Math.round(rpcTotalSats) : (rpcTotalSats ?? 0));
+  } catch {
+    live = 0n;
+  }
+  return live + CARRYOVER_TOTAL_SAT;
+}
+
 export interface NetworkInfo {
   blocks: number;
   blue_score: number;
