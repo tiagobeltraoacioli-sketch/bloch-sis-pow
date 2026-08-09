@@ -3,6 +3,7 @@ import { useAsync } from "../lib/hooks";
 import { Loading, ErrorBox } from "../components/ui";
 import { ChartCard, LineChart, BarChart, ProportionBars } from "../components/charts";
 import { difficultyFromBits, fmtNum, fmtDuration, fmtHashrate, fmtBloch, fmtInt } from "../lib/format";
+import { totalSupplySat, CARRYOVER_TOTAL_SAT, CARRYOVER_UTXO_COUNT } from "../lib/chain";
 
 // Brand ramp: Amber Copper family carries the signal; cool blue / sage / slate
 // fill the secondary categories. One accent per figure stays true to the kit.
@@ -29,6 +30,14 @@ export function ChartsPage() {
   const diffPoints = (d.diff?.points || [])
     .map((p: any) => ({ x: p.height, y: difficultyFromBits(p.bits), label: `h${p.height}: ${fmtNum(difficultyFromBits(p.bits), 0)}` }))
     .sort((a: any, b: any) => a.x - b.x);
+
+  // Percentage change between the last two retarget points — the number that
+  // actually moves. Absolute difficulty barely does at this magnitude.
+  const diffDelta =
+    diffPoints.length >= 2 && diffPoints[diffPoints.length - 2].y > 0
+      ? ((diffPoints[diffPoints.length - 1].y - diffPoints[diffPoints.length - 2].y) /
+          diffPoints[diffPoints.length - 2].y) * 100
+      : null;
 
   const bt = d.bt;
   const btBars = bt
@@ -76,11 +85,16 @@ export function ChartsPage() {
       <div className="grid two-col" style={{ marginTop: 14 }}>
         <ChartCard
           title="Supply distribution"
-          hint={`${fmtInt(d.supply?.total_addresses ?? 0)} addresses · ${fmtBloch(d.supply?.total_sats ?? 0, 0)} BLOCH`}
+          hint={`${fmtInt(d.supply?.total_addresses ?? 0)} addresses · ${fmtBloch(d.supply?.total_sats ?? 0, 0)} BLOCH in the UTXO set`}
         >
           <ProportionBars rows={supplyRows} />
           <div className="faint" style={{ fontSize: 12, marginTop: 8 }}>
-            Concentration reflects the disclosed 17% founder premine + carry-over set.
+            Bars cover the live UTXO set only. Total supply is{" "}
+            {fmtBloch(totalSupplySat(d.supply?.total_sats), 0)} BLOCH — the Genesis-1 carry-over
+            ({fmtBloch(CARRYOVER_TOTAL_SAT, 0)} BLOCH across {fmtInt(CARRYOVER_UTXO_COUNT)} UTXOs) is
+            loaded at genesis and is not walked by <code>getsupplydistribution</code>, so it does not
+            appear in these tiers. Concentration reflects the disclosed 17% founder premine plus that
+            carry-over set.
           </div>
         </ChartCard>
 
@@ -99,7 +113,19 @@ export function ChartsPage() {
         <div className="chart-head"><h3>Network</h3><span className="hint">from getchainstats</span></div>
         <div className="grid stat-grid" style={{ marginTop: 8 }}>
           <div className="stat"><div className="label">Hashrate</div><div className="value sm">{fmtHashrate(d.chain?.hashrate_hs ?? 0)}</div></div>
-          <div className="stat"><div className="label">Difficulty</div><div className="value sm">{fmtNum(d.chain?.current_difficulty ?? 0, 0)}</div></div>
+          <div className="stat">
+            <div className="label">Difficulty</div>
+            {/* Shown scaled, with the change since the last retarget. As a raw
+                integer this reads as frozen: consecutive retargets differ by
+                ~22k out of ~437M (0.005%), so every leading digit stays put and
+                a live value looks stale. Full precision is in the title. */}
+            <div className="value sm" title={fmtNum(d.chain?.current_difficulty ?? 0, 0)}>
+              {fmtNum((d.chain?.current_difficulty ?? 0) / 1e6, 2)}<span className="unit">M</span>
+            </div>
+            {diffDelta != null && (
+              <div className="sub">{diffDelta >= 0 ? "+" : ""}{fmtNum(diffDelta, 3)}% since last retarget</div>
+            )}
+          </div>
           <div className="stat"><div className="label">Avg block time</div><div className="value sm">{fmtDuration(d.chain?.avg_block_time_secs ?? 0)}</div></div>
           <div className="stat"><div className="label">Blocks / 24h</div><div className="value sm">{fmtInt(d.chain?.blocks_last_24h ?? 0)}</div></div>
           <div className="stat"><div className="label">Txs / 24h</div><div className="value sm">{fmtInt(d.chain?.txs_last_24h ?? 0)}</div></div>
