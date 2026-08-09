@@ -108,7 +108,28 @@ pub fn install_fresh_template(
     if read_current_bits(ctx).is_none() {
         return Err("current_bits unreadable — refusing to notify on a guessed target");
     }
-    let bits = crate::pow::genesis2_expected_bits(&ctx.store, height);
+    // FLAG-DAY core::DIFFICULTY_ANCESTRY_FORK_HEIGHT (gated inside the
+    // function): expected bits are a pure function of the EXACT parent set
+    // this template stamps into the header — the same slice, the same choke
+    // point, the validator uses on submit. This call site used the legacy
+    // order-dependent path unconditionally, which is what halted mainnet at
+    // h=28080: the template stamped legacy bits (0x1a0abee4, flipped from
+    // 0x1a0abb83 when a second 28079 tip rewrote CF_TIMESTAMPS) while
+    // accept_block on the SAME node expected the ancestry value (0x1a0ac909)
+    // — every ASIC block was self-rejected. FAIL CLOSED on an unreadable
+    // ancestry: skip the notify rather than burn miner work on a doomed
+    // target.
+    let bits = {
+        let d = ctx.dag.read();
+        match crate::pow::genesis2_expected_bits_for_parents(&ctx.store, &d, &parents, height) {
+            Ok(b) => b,
+            Err(e) => {
+                log::warn!("stratum: refusing template at h={}: expected bits not derivable: {}",
+                           height, e);
+                return Err("expected bits not derivable from parent ancestry — refusing to notify on a guessed target");
+            }
+        }
+    };
 
     // Net difficulty is the HARD CAP on this session's share difficulty: a
     // share is never harder than a real block. Recompute per template because

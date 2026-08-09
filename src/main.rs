@@ -1691,32 +1691,40 @@ async fn main() {
                     // accept_block's expected_bits exactly).
                     let parent_ts = store_m.get_timestamp_at_height(h).ok().flatten()
                         .unwrap_or(core::GENESIS_TIMESTAMP);
-                    let bits = if matches!(core::pow_algorithm(core::node_chain_id()),
-                                           core::PowAlgorithm::Sha256d) {
+                    let bits_res = if matches!(core::pow_algorithm(core::node_chain_id()),
+                                               core::PowAlgorithm::Sha256d) {
                         // Both SHA-256d chains (Genesis-2 devnet, Genesis-3
-                        // mainnet): the windowed retarget, shared with
-                        // accept_block (see pow::genesis2_expected_bits).
-                        //
-                        // MUST mirror accept_block's flag-day switch exactly —
-                        // if the miner kept using the legacy value at/above
-                        // DIFFICULTY_ANCESTRY_FORK_HEIGHT it would stamp bits
-                        // that every upgraded validator (including this node)
-                        // rejects, and the producer would mine itself off the
-                        // network. `tips` here are the parents of the block
-                        // being built, which is exactly what the validator
-                        // will pass as block.header.parents. Reuse the `d` guard
-                        // already held here — taking a second read() on the same
-                        // RwLock from this thread can deadlock.
-                        if h + 1 >= core::DIFFICULTY_ANCESTRY_FORK_HEIGHT {
-                            pow::genesis2_expected_bits_ancestry(&store_m, &d, &tips, h + 1)
-                                .unwrap_or_else(|| genesis2_expected_bits(&store_m, h + 1))
-                        } else {
-                            genesis2_expected_bits(&store_m, h + 1)
-                        }
+                        // mainnet): the single expected-bits choke point shared
+                        // with accept_block, stratum V1/V2, getblocktemplate
+                        // and createauxblock. `tips` here are the exact parents
+                        // the block header will carry (parents: tips.clone()
+                        // below), which is what the validator will pass as
+                        // block.header.parents — so producer and validator
+                        // agree BY CONSTRUCTION, whenever the tip set is read.
+                        // Reuse the `d` guard already held here — taking a
+                        // second read() on the same RwLock from this thread
+                        // can deadlock.
+                        pow::genesis2_expected_bits_for_parents(&store_m, &d, &tips, h + 1)
                     } else {
-                        pow::next_bits(core::GENESIS_BITS, core::GENESIS_TIMESTAMP, parent_ts, h + 1)
+                        Ok(pow::next_bits(core::GENESIS_BITS, core::GENESIS_TIMESTAMP, parent_ts, h + 1))
                     };
-                    (tips, bits, h, bs)
+                    (tips, bits_res, h, bs)
+                };
+
+                // FAIL CLOSED above the difficulty flag-day: if the expected
+                // bits cannot be derived from our own tips' ancestry, DO NOT
+                // guess (the legacy fallback here is exactly what split the
+                // producer from its own validator at h=28080). Skip the round
+                // and retry — our own view must complete before we may mine.
+                let current_bits = match current_bits {
+                    Ok(b) => b,
+                    Err(e) => {
+                        warn!("⛏  cannot derive expected bits for next block (h={}): {} — \
+                               skipping mining round (fail-closed, no guessed target)",
+                              current_height + 1, e);
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        continue;
+                    }
                 };
 
                 // Re-broadcast mempool TXs before mining
@@ -2459,20 +2467,11 @@ static FINALITY_FROZEN: std::sync::atomic::AtomicBool =
 static ARCHIVE_MODE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Genesis-2 Bitcoin-style difficulty: the `bits` a block at local `height` must
-/// carry. Difficulty holds constant within a DIFFICULTY_WINDOW and retargets on
-/// each window boundary from the wall time that window actually took (core::
-/// retarget_bits_g2, clamped ±4×). `current_bits` meta caches the in-force value
-/// — seeded at genesis, rewritten when a boundary block is accepted. The miner
-/// and the validator both call THIS, so their expected `bits` agree by
-/// construction (and a bought-hashrate spike ramps difficulty up each window).
-/// Genesis-2 expected difficulty bits. Thin delegate to the single source of
-/// truth in `pow::genesis2_expected_bits`, shared verbatim with the
-/// `getblocktemplate` RPC so the mining template can never serve a target the
-/// validator would reject (the trivial-diff `0x2100ffff` flood bug).
-fn genesis2_expected_bits(store: &storage::Storage, height: u64) -> u32 {
-    pow::genesis2_expected_bits(store, height)
-}
+// The thin `genesis2_expected_bits` delegate that used to live here is gone:
+// every producer and the validator now share ONE height-gated choke point,
+// `pow::genesis2_expected_bits_for_parents` (legacy below the ancestry
+// flag-day, pure ancestry function of the block's own parent set at/above it),
+// so a template can never serve a target the validator would reject.
 
 /// Validate TX contents, add block to DAG + storage, update UTXO set.
 /// Returns Ok(block_hash) on success.
@@ -2545,24 +2544,32 @@ fn accept_block(
                                         core::PowAlgorithm::Sha256d) {
             // Both SHA-256d chains (Genesis-2 devnet, Genesis-3 mainnet).
             //
-            // FLAG-DAY core::DIFFICULTY_ANCESTRY_FORK_HEIGHT: at/above it the
-            // expected bits come from THIS block's selected-parent ancestry, so
-            // the verdict no longer depends on the order in which this node
-            // happened to accept blocks. Below it the legacy order-dependent
-            // path is kept verbatim so settled history stays valid.
+            // FLAG-DAY core::DIFFICULTY_ANCESTRY_FORK_HEIGHT (gated inside
+            // genesis2_expected_bits_for_parents): at/above it the expected
+            // bits are a pure function of THIS block's parent set and its
+            // selected-parent ancestry, so the verdict no longer depends on
+            // the order in which this node happened to accept blocks. Below
+            // it the legacy order-dependent path is kept verbatim so settled
+            // history stays valid.
             //
-            // The ancestry function returns None when the needed ancestors are
-            // not held locally (pruned / mid-IBD). Falling back to the legacy
-            // value there is deliberate: it is what this node would have done
-            // anyway, so the fallback can never be MORE rejecting than before.
-            if block.height >= core::DIFFICULTY_ANCESTRY_FORK_HEIGHT {
+            // FAIL CLOSED above the flag-day: if the ancestry cannot be read,
+            // REJECT with an explicit reason instead of silently falling back
+            // to the legacy value. The silent fallback meant one node could
+            // validate with the old rule while its peers used the new one — a
+            // consensus split with no signal (incident 2026-08-09, h=28080).
+            // The cost is bounded: this check only runs above finalized_height,
+            // and a block's parents must already be in the DAG for it to be
+            // acceptable at all, so a well-formed accept can only trip this if
+            // OUR view is genuinely incomplete — in which case rejecting and
+            // re-requesting after sync is the correct outcome.
+            {
                 let d = dag.read();
-                pow::genesis2_expected_bits_ancestry(
+                pow::genesis2_expected_bits_for_parents(
                     store, &d, &block.header.parents, block.height,
                 )
-                .unwrap_or_else(|| genesis2_expected_bits(store, block.height))
-            } else {
-                genesis2_expected_bits(store, block.height)
+                .map_err(|e| format!(
+                    "invalid difficulty: expected bits not derivable \
+                     (fail-closed above ancestry flag-day): {}", e))?
             }
         } else {
             pow::next_bits(

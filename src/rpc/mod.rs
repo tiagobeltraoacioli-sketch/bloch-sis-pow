@@ -729,7 +729,22 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             let bits = if matches!(crate::core::pow_algorithm(crate::core::node_chain_id()),
                                    crate::core::PowAlgorithm::Sha256d) {
                 // Both SHA-256d chains (Genesis-2 devnet, Genesis-3 mainnet).
-                crate::pow::genesis2_expected_bits(&state.store, height)
+                //
+                // FLAG-DAY core::DIFFICULTY_ANCESTRY_FORK_HEIGHT (gated inside
+                // the function): expected bits are a pure function of the EXACT
+                // `parents` this template serves — the same slice, the same
+                // choke point, accept_block validates on submitblock. This call
+                // site used the legacy order-dependent path unconditionally
+                // (the h=28080 producer-self-reject class of bug). FAIL CLOSED:
+                // no template beats a doomed template.
+                let d = state.dag.read();
+                match crate::pow::genesis2_expected_bits_for_parents(
+                    &state.store, &d, &parents, height,
+                ) {
+                    Ok(b) => b,
+                    Err(e) => return json!({ "error": format!(
+                        "expected bits not derivable from parent ancestry (fail-closed): {}", e) }),
+                }
             } else {
                 crate::pow::next_bits(
                     crate::core::GENESIS_BITS, crate::core::GENESIS_TIMESTAMP, parent_ts, height,
@@ -832,7 +847,23 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 let max_bs = tips.iter().filter_map(|t| d.get_block_data(t)).map(|dd| dd.blue_score).max().unwrap_or(0);
                 (tips, max_h + 1, max_bs + 1)
             };
-            let bits = crate::pow::genesis2_expected_bits(&state.store, height);
+            // FLAG-DAY core::DIFFICULTY_ANCESTRY_FORK_HEIGHT (gated inside the
+            // function): pure function of the EXACT `parents` this candidate
+            // carries — same choke point as accept_block. Merged-mining
+            // candidates are real mainnet blocks (the pool commits this hash
+            // into the BTC coinbase), so a legacy-bits candidate here would be
+            // self-rejected exactly like the h=28080 stratum incident. FAIL
+            // CLOSED on unreadable ancestry.
+            let bits = {
+                let d = state.dag.read();
+                match crate::pow::genesis2_expected_bits_for_parents(
+                    &state.store, &d, &parents, height,
+                ) {
+                    Ok(b) => b,
+                    Err(e) => return json!({ "error": format!(
+                        "expected bits not derivable from parent ancestry (fail-closed): {}", e) }),
+                }
+            };
             let txs = state.mempool.get_for_block(2000);
             let total_fees: u64 = txs
                 .iter()

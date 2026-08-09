@@ -30,7 +30,7 @@ pub const AUXPOW_ACTIVATION_HEIGHT: u64 = 8500; // FLAG-DAY 2026-08-01 (G3 mainn
 pub const AUXPOW_ACTIVATION_HEIGHT: u64 = 0;
 
 /// FLAG-DAY: height at/above which `bits` is validated from the block's own
-/// selected-parent ancestry (`pow::genesis2_expected_bits_ancestry`) instead of
+/// selected-parent ancestry (`pow::genesis2_expected_bits_for_parents`) instead of
 /// from mutable local state.
 ///
 /// The legacy path derived the expected difficulty from the `current_bits` meta
@@ -76,22 +76,59 @@ pub const AUXPOW_ACTIVATION_HEIGHT: u64 = 0;
 // 0x1a0ac909. Deterministic, so every block the ASIC found was discarded and
 // the chain sat still for ~40 minutes.
 //
-// Root of the asymmetry is in genesis2_expected_bits_ancestry: the selected
-// parent is argmax(blue_work) over the `parents` slice, and the two call sites
-// do not pass the same slice — the miner passes the DAG's bodied tips, the
-// validator passes block.header.parents — nor is the walk guaranteed to
-// succeed on both sides (it returns None on an incomplete chain and the caller
-// silently falls back to the LEGACY value, so one side can be on the new rule
-// while the other is on the old one). With a single tip these coincide, which
-// is why it survived the flag-day and only fired at the first boundary that
-// had two.
+// POST-MORTEM 2026-08-09 (frente ASSIMETRIA-DIFICULDADE) — the actual root
+// cause, established from the producer + node4 journals:
 //
-// Above the fork height both sides therefore use the legacy rule again and
-// agree with each other. This re-exposes the follower-freeze this fix exists to
-// solve, so it is a stopgap: fix the asymmetry (pass the same parent set on
-// both sides, and make the fallback symmetric or fail closed) and lower this
-// back BEFORE the chain reaches 29_400.
-pub const DIFFICULTY_ANCESTRY_FORK_HEIGHT: u64 = 29_400;
+//   * The flag-day switch to the ancestry rule was wired into accept_block and
+//     the INTERNAL solo miner only. The four OTHER template producers —
+//     stratum V1 (session.rs, the ASIC path that actually mines), stratum V2
+//     (template_adapter.rs), getblocktemplate and createauxblock (rpc/mod.rs)
+//     — still called the LEGACY genesis2_expected_bits unconditionally. So at
+//     every height >= flag-day the producer stamped legacy bits and validated
+//     with ancestry bits.
+//   * Off retarget boundaries the two coincide, and at single-tip boundaries
+//     they also coincide — which is why 27_600 itself passed clean. The first
+//     boundary with TWO tips at boundary-1 exposed the split: the legacy value
+//     depends on CF_TIMESTAMPS[h-1], a height-keyed last-write-wins cell, so
+//     the producer's own template flipped 0x1a0abb83 -> 0x1a0abee4 the moment
+//     the second 28_079 block landed (journal 04:42:23 vs 04:43:09), while
+//     ancestry over the two-tip parent set gave 0x1a0ac909.
+//   * The ancestry rule itself was CONSISTENT across nodes: the producer's
+//     validator and node4's pre-stopgap binary both expected 0x1a0ac909 for
+//     block e5c2ad6a. The third opinion (0x1a0abb83) was node4's LEGACY value
+//     under the stopgap binary — the original order-dependent bug, which is
+//     why the stopgap left node4/miner-box permanently frozen at 28_079.
+//
+// FIX (this flag-day): every producer and the validator now route through ONE
+// height-gated choke point, pow::genesis2_expected_bits_for_parents, computed
+// over EXACTLY the parents slice the block header carries — a pure function of
+// consensus data, so arrival order and template timing cannot change the
+// verdict. Ancestry-incomplete cases FAIL CLOSED (refuse the template / reject
+// with an explicit reason) instead of silently falling back to the legacy
+// value; the silent fallback and the silent dropping of DAG-missing parents
+// were the two remaining ways for one side to be on the old rule while the
+// other was on the new one.
+//
+// Set to 30_030 — deliberately MID-WINDOW (30_030 = 500*60 + 30, enforced by
+// the const assert below), not a boundary: at activation the old and new rules
+// agree off-boundary (both yield the bits in force), so the switch itself
+// cannot fork; the first retarget under the unified rule lands at 30_060 with
+// the fleet already on it. Deploy discipline, in order of hardness:
+//   1. The PRODUCER must run this binary BEFORE the chain reaches 29_400 —
+//      the previous binary re-arms the broken asymmetric rule there and the
+//      h=28_080 halt repeats.
+//   2. Followers are restored from a producer datadir (standard runbook) and
+//      upgraded before 30_030. Between deploy and 30_030 the legacy rule is
+//      still in force, so an un-restored follower with diverged local state
+//      stays frozen until its datadir is replaced — expected, not a regression.
+pub const DIFFICULTY_ANCESTRY_FORK_HEIGHT: u64 = 30_030;
+
+// The flag-day must not sit ON a retarget boundary: activating exactly where
+// the two rules first diverge would make the switch itself the incident.
+const _: () = assert!(
+    DIFFICULTY_ANCESTRY_FORK_HEIGHT % GENESIS2_RETARGET_WINDOW != 0,
+    "DIFFICULTY_ANCESTRY_FORK_HEIGHT must be mid-window, never a retarget boundary"
+);
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
