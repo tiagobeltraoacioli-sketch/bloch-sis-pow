@@ -227,7 +227,15 @@ fn address_to_script_pubkey(addr: &str) -> Vec<u8> {
     hex::decode(hash_hex).unwrap_or_else(|_| addr.as_bytes().to_vec())
 }
 
-#[tokio::main]
+// Floor the worker count at 4. The default is the core count, and the
+// production nodes are 2-core boxes: with only two workers, any pair of tasks
+// that blocks (a held `node_state`/`dag` lock, a synchronous RocksDB read)
+// parks the entire runtime, including the RPC accept loop. The RPC dispatch
+// itself now runs on the blocking pool (see rpc/mod.rs), which is the actual
+// fix; this is headroom so the async side keeps making progress while blocking
+// work is in flight. Extra workers on a 2-core box cost context switches, not
+// correctness.
+#[tokio::main(worker_threads = 4)]
 async fn main() {
     env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("info")

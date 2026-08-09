@@ -228,14 +228,43 @@ async fn handle_rpc(
             // the correct form across the `dispatch` await. Inert unless a
             // subscriber is installed (init lives in main.rs, not owned here).
             use tracing::Instrument;
-            let result = dispatch(method, params, &state)
+            // The dispatch arms below do their work INLINE and BLOCKING:
+            // parking_lot acquisitions on `node_state`/`dag` and synchronous
+            // RocksDB reads, none of which yield. Running that directly on a
+            // tokio worker means a writer holding `node_state` (main.rs:2303,
+            // :2352, :2910, :3080) parks the worker for as long as it holds the
+            // lock. With `#[tokio::main]` defaulting worker_threads to the core
+            // count — 2 on the production box — two stalled requests park the
+            // WHOLE runtime, so it stops accepting connections at all.
+            //
+            // Measured on the producer, 2026-08-09: getblockcount took 30.01s
+            // and 20.42s back to back while createauxblock returned in 0.01s.
+            // The pool proxy times out at 10s and retries ~1/s, so the accept
+            // queue filled (129 pending against a backlog of 128) and the node
+            // never recovered on its own — only a restart cleared it, which is
+            // why a watchdog was papering over this.
+            //
+            // Hand the whole dispatch to the blocking pool so worker threads
+            // stay free to accept and poll. `block_on` is legal here precisely
+            // because a spawn_blocking thread is not a runtime worker.
+            let d_state  = state.clone();
+            let d_method = method.to_string();
+            let d_params = params.cloned();
+            let d_handle = tokio::runtime::Handle::current();
+            let result = tokio::task::spawn_blocking(move || {
+                d_handle.block_on(dispatch(&d_method, d_params.as_ref(), &d_state))
+            })
                 .instrument(tracing::info_span!(
                     "rpc_request",
                     method,
                     client_ip = %client_ip,
                     id = %id,
                 ))
-                .await;
+                .await
+                .unwrap_or_else(|e| {
+                    log::error!("rpc dispatch task failed: {}", e);
+                    json!({ "error": "internal dispatch failure" })
+                });
             let elapsed = start.elapsed();
             let elapsed_ms = elapsed.as_millis();
             crate::metrics::observe_rpc_latency(method, elapsed.as_secs_f64());
