@@ -1,0 +1,71 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! # bloch-pos-committee
+//!
+//! The committee layer of the Proof-of-Stake migration design
+//! (`docs/specs/BLOCH-POS-SHA3-LATTICE-MIGRATION.md`, §6.5.2):
+//!
+//! - a **per-slot subcommittee** (8 validators) whose only job is to give
+//!   LMD-GHOST its fork-choice weight between epoch boundaries;
+//! - an **epoch committee** (128 validators) that votes once per epoch for
+//!   justification and finality.
+//!
+//! ## Why the split exists
+//!
+//! The hybrid ML-DSA-65 ‖ Falcon-1024 signature is ≈ 4,589 B and costs a
+//! measured 7,274,849 RV32IM instructions to verify in-circuit
+//! (`spikes/prover-cost/RESULTS.md`). Having a full committee attest every slot
+//! — the Ethereum shape — would cost 308.7 GB of signatures per year and
+//! 15.5 M proving cycles per second. Moving the full vote to the epoch boundary
+//! cuts both by 32×, but epoch-only voting leaves nothing weighting the fork
+//! choice *inside* an epoch, which makes short reorgs cheap. The small per-slot
+//! sample buys that weight back for 1/8 the per-slot cost.
+//!
+//! ## Status
+//!
+//! **UNAUDITED. Not wired into the node.** This crate is not a member of the
+//! node workspace and is not a path-dependency of `bloch`, so the node's build
+//! and validation path are untouched — the same posture
+//! `crates/coherence-prover` takes. Activation, when it comes, is a
+//! height-gated flag day like `STATE_ROOT_ACTIVATION_HEIGHT`.
+//!
+//! ## The rule this crate is written to obey
+//!
+//! Every consensus-relevant value must be derivable from the parent block's
+//! committed state, never from node-local mutable state (§5.5 of the design —
+//! the rule that exists because `expected_bits` was read from mutable local
+//! state and split consensus on 2026-08-08). Accordingly, [`sample::sample`]
+//! takes the beacon mix, the index, and the validator set as arguments; there
+//! is no cached set, no clock, and no interior mutability anywhere in the
+//! sampling or fork-choice path.
+
+pub mod attestation;
+pub mod forkchoice;
+pub mod params;
+pub mod sample;
+
+pub use attestation::{Attestation, AttestationData, RejectReason, SignatureVerifier};
+pub use forkchoice::{BlockTree, LatestMessage, Store};
+pub use params::{COMMITTEE_SIZE, SLOTS_PER_EPOCH, SLOT_SUBCOMMITTEE_SIZE};
+pub use sample::{is_selected, sample, Role, Validator};
+
+/// Draw the per-slot fork-choice subcommittee.
+pub fn slot_subcommittee(beacon_mix: &[u8; 32], slot: u64, validators: &[Validator]) -> Vec<u32> {
+    sample(beacon_mix, slot, Role::SlotSubcommittee, validators, SLOT_SUBCOMMITTEE_SIZE)
+}
+
+/// Draw the epoch finality committee.
+pub fn epoch_committee(beacon_mix: &[u8; 32], epoch: u64, validators: &[Validator]) -> Vec<u32> {
+    sample(beacon_mix, epoch, Role::EpochCommittee, validators, COMMITTEE_SIZE)
+}
+
+/// Epoch containing `slot`.
+pub const fn epoch_of(slot: u64) -> u64 {
+    slot / SLOTS_PER_EPOCH
+}
+
+/// Is `slot` the last slot of its epoch — the one carrying the full committee's
+/// finality vote?
+pub const fn is_epoch_boundary(slot: u64) -> bool {
+    (slot + 1) % SLOTS_PER_EPOCH == 0
+}
