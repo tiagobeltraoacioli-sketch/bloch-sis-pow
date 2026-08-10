@@ -14,7 +14,7 @@
 //
 //      below the fork:  subsidy(h) = max(8400 >> (h / 1,036,800), 100)   — V2, verbatim
 //      at/above it:     epoch  = (h − 453,743) / 1,555,200               — counter RESTARTS
-//                       subsidy = max(2600 >> epoch, 100)
+//                       subsidy = max(2600 >> epoch, 60)                 — V3-only 60 floor (PISO-60)
 //
 //    The first V3 halving is therefore counted FROM THE FORK, not from any
 //    absolute-height multiple.
@@ -26,8 +26,15 @@
 /** Absolute emission height the carried ledger stopped at. */
 export const CARRYOVER_SOURCE_HEIGHT = 413_743;
 export const TARGET_BLOCK_SECS = 30;
-/** Perpetual tail: the subsidy never falls below this, so emission never ends. */
+/** V2 tail floor — legacy PRE-fork branch only. Never applies to the V3 curve. */
 export const TAIL_FLOOR_BLOCH = 100;
+/**
+ * V3 perpetual tail floor (PISO-60): post-fork the subsidy never falls below
+ * this, so emission never ends. Deliberately its own constant — reusing the
+ * V2 floor in the V3 branch (or vice versa) is exactly the drift the node
+ * guards against with `EMISSION_V3_TAIL_FLOOR_*` in tokenomics_v2.rs.
+ */
+export const EMISSION_V3_TAIL_FLOOR_BLOCH = 60;
 
 // ── Legacy V2 curve (governs emission heights BELOW the V3 fork) ──────────
 export const V2_HALVING_INTERVAL = 1_036_800; // ~1 year @ 30 s (360 × 2880)
@@ -41,8 +48,8 @@ export const EMISSION_V3_FORK_LOCAL_HEIGHT = 40_000;
 export const EMISSION_V3_INITIAL_REWARD_BLOCH = 2_600;
 /** Blocks per V3 halving epoch — ~1.5 years at the 30 s target (1.5 × 1,036,800). */
 export const EMISSION_V3_HALVING_INTERVAL = 1_555_200;
-/** First V3 epoch on the floor: 2600 >> 4 = 162 ≥ 100 but 2600 >> 5 = 81 < 100. */
-export const EMISSION_V3_TAIL_ACTIVATION_EPOCH = 5;
+/** First V3 epoch on the floor: 2600 >> 5 = 81 ≥ 60 but 2600 >> 6 = 40 < 60. */
+export const EMISSION_V3_TAIL_ACTIVATION_EPOCH = 6;
 
 // Backwards-compatible aliases (post-fork era values).
 export const HALVING_INTERVAL = EMISSION_V3_HALVING_INTERVAL;
@@ -64,7 +71,7 @@ export function subsidyBloch(absHeight: number): number {
     );
     const geometric =
       epoch >= 64 ? 0 : Math.floor(EMISSION_V3_INITIAL_REWARD_BLOCH / 2 ** epoch);
-    return Math.max(geometric, TAIL_FLOOR_BLOCH);
+    return Math.max(geometric, EMISSION_V3_TAIL_FLOOR_BLOCH); // V3 floor, never the V2 100
   }
   const epoch = Math.floor(absHeight / V2_HALVING_INTERVAL);
   const geometric = epoch >= 64 ? 0 : Math.floor(V2_INITIAL_REWARD_BLOCH / 2 ** epoch);
@@ -138,7 +145,9 @@ export function halvingAt(localHeight: number): Halving {
     eraBlocks: EMISSION_V3_HALVING_INTERVAL,
     rewardNow,
     rewardNext,
-    tailReached: rewardNow === TAIL_FLOOR_BLOCH && rewardNext === TAIL_FLOOR_BLOCH,
+    // Tail is only reachable post-fork, so it is the V3 floor by definition.
+    tailReached:
+      rewardNow === EMISSION_V3_TAIL_FLOOR_BLOCH && rewardNext === EMISSION_V3_TAIL_FLOOR_BLOCH,
   };
 }
 
