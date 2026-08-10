@@ -132,8 +132,9 @@ export function HalvingCard({
           BLOCH — a 69% cut — and halvings move from every 1,036,800 blocks (~1 year) to every{" "}
           {fmtInt(EMISSION_V3_HALVING_INTERVAL)} (~1.5 years), with the epoch counter restarted at
           the fork. The 100 BLOCH perpetual tail floor is unchanged. The reason: the old schedule
-          would have emitted ≈26.92B BLOCH over 100 years against a documented nominal of 17.43B;
-          the new curve emits 17,423,942,400 over the 100 years after the fork. The fork logic is
+          would have emitted ≈26.92B BLOCH over 100 years against a documented mining nominal of
+          17.43B; the new curve emits ≈17.42B over the 100 years after the fork — a floor, not a
+          cap: coinbase is paid per DAG block and the tail is perpetual. The fork logic is
           already in the deployed node binary and is inert until this height. Nodes built without
           it will reject post-fork blocks — update before the fork.
         </div>
