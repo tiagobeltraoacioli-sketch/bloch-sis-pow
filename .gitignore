@@ -37,3 +37,6 @@ desktop/src-tauri/gen/
 # build artifacts in any subcrate
 **/target/
 carryover.tsv
+
+# PDF gerado a partir do .md pelo pipeline do spike — nao versionar
+docs/specs/*.pdf
