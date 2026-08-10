@@ -251,7 +251,8 @@ pub fn node_chain_id() -> ChainId {
 pub const GHOSTDAG_K:            usize = 10;
 // V2 tokenomics emission constants live in `tokenomics_v2` module:
 //   - INITIAL_BLOCK_REWARD_SAT (1905 BLOCH) — replaces V1 BLOCK_REWARD
-//   - TAIL_FLOOR_SAT (25 BLOCH) — perpetual mining reward post halving 7
+//   - TAIL_FLOOR_SAT (100 BLOCH) — V2 tail floor, legacy pre-fork branch only
+//   - EMISSION_V3_TAIL_FLOOR_SAT (60 BLOCH) — V3 perpetual tail (PISO-60)
 //   - HALVING_INTERVAL (210_000) — reused below; same value V1/V2
 //   - block_subsidy_sat(h), split_subsidy_sat(s), founder_vesting_delta_sat(h)
 // See docs/specs/TOKENOMICS_V2.md §3-§5 and ADR-028.

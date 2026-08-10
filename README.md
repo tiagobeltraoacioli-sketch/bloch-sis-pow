@@ -74,7 +74,7 @@ classical primitive on the consensus path.
 | Emission | 100% to miner (no validator/oracle pools) |
 | Block reward | **2,600 BLOCH/block** since the Emission V3 fork at height 40,000 (8,400 before it) |
 | Halving | Every **1,555,200 blocks** (~1.5 years @ 30 s); counter restarted at the V3 fork |
-| Tail | 100 BLOCH/block, perpetual (Monero-style disinflation) |
+| Tail | **60 BLOCH/block**, perpetual (Monero-style disinflation) — V3 curve; the legacy V2 floor of 100 only governs pre-fork history |
 | Block time | 30 seconds |
 | Founder premine | 3,570,000,000 BLOCH (17%) — 10-year cliff, then 40-year **monthly** vesting on-chain |
 
@@ -92,15 +92,17 @@ mining-emission nominal of 17.43 B. Emission V3 slows the curve:
   through height 39,999; the first 2,600 block is height 40,000.
 - **Halving interval:** 1,036,800 → **1,555,200 blocks** (~1.5 years @ 30 s).
   The halving counter restarts at the fork.
-- **Schedule from the fork:** 2,600 → 1,300 → 650 → 325 → 162, then the
-  unchanged perpetual **100 BLOCH/block tail** (from V3 epoch 5).
-- **Emission:** from the fork, the V3 curve emits **≈ 17.42 B** BLOCH over
-  the following 100 years — a floor, not an exact total and not a cap
-  (coinbases are paid per DAG block, and the 100 BLOCH tail is perpetual).
-  This figure is **mining emission, not total supply**: pre-fork emission
-  (including the Genesis-1/2 carryover) sits on top of it, and the
-  reconciliation of the resulting totals against the nominal figures is
-  under review. Supply is **not hard-capped**.
+- **Schedule from the fork:** 2,600 → 1,300 → 650 → 325 → 162 → 81, then a
+  perpetual **60 BLOCH/block tail** (from V3 epoch 6, ~9 years after the
+  fork). The 60 floor is V3-only (PISO-60); the legacy V2 floor of 100
+  still governs every pre-fork coinbase.
+- **Emission:** from the fork, the V3 curve emits **exactly 13,620,441,600**
+  BLOCH over the following 100 years — a floor, not a cap (coinbases are
+  paid per DAG block, and the 60 BLOCH tail is perpetual). This closes the
+  full accounting near the 21 B nominal: ≈3.78 B already emitted (3.475 B
+  carryover + G3 mining, measured 2026-08-09) + 13.62 B over the next 100
+  years + 3.57 B locked founder premine = **≈20.98 B** (−0.12%). Supply is
+  **not hard-capped**.
 
 Consensus source of truth: `crates/bloch-crypto/src/core/tokenomics_v2.rs`.
 Normative spec: [`docs/specs/TOKENOMICS_V3.md`](./docs/specs/TOKENOMICS_V3.md);

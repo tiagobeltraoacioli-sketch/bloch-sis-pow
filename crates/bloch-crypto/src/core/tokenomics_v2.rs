@@ -98,9 +98,21 @@ const _: () = assert!(TAIL_ACTIVATION_HEIGHT == 7_257_600);
 // WHY: the V2 curve (8,400 BLOCH initial, yearly halving) read forward from
 // the Genesis-3 restart emits ≈26.92B BLOCH over 100 years — 54% above the
 // documented `MINING_EMISSION_NOMINAL` of 17.43B. Emission V3 slows the
-// curve so that the 100 years FOLLOWING the fork emit 17,423,942,400 BLOCH
-// (≈ the documented nominal, read forward), and moves halvings to every
-// 1.5 years.
+// curve (2,600 initial, 1.5-year halvings) and, with the V3-only tail floor
+// of 60 BLOCH (PISO-60, below), the 100 years FOLLOWING the fork emit
+// 13,620,441,600 BLOCH — chosen so the FULL accounting closes at the
+// documented 21B nominal:
+//
+//   already emitted (carryover 3,475,441,200 + G3-mined 309,128,400,
+//   measured 2026-08-09)                          =  3,784,569,600
+//   100-year post-fork V3 emission                = 13,620,441,600
+//   founder premine (locked, not yet emitted)     =  3,570,000,000
+//   ─────────────────────────────────────────────────────────────
+//   grand total                                   = 20,975,011,200  (−0.12%)
+//
+// With the old shared 100-BLOCH floor the same accounting closed at 24.78B
+// (+18%). The alternative — cutting the initial reward to 1,350 (an 84% cut
+// instead of 69%) — was rejected in favour of trimming the tail.
 //
 // NON-RETROACTIVE by construction: `block_subsidy_sat` takes an EMISSION
 // height (local + CARRYOVER_SOURCE_HEIGHT via `core::emission_height`).
@@ -108,7 +120,7 @@ const _: () = assert!(TAIL_ACTIVATION_HEIGHT == 7_257_600);
 // stays valid. At/above the fork:
 //
 //   epoch  = (h − EMISSION_V3_FORK_EMISSION_HEIGHT) / EMISSION_V3_HALVING_INTERVAL
-//   reward = max(2,600 >> epoch, 100) BLOCH
+//   reward = max(2,600 >> epoch, 60) BLOCH   (V3-only floor — see PISO-60 below)
 //
 // The halving counter RESTARTS at the fork (epoch 0 = first V3 block); it
 // does NOT continue the absolute-height count, which would hand the first
@@ -129,6 +141,26 @@ pub const EMISSION_V3_INITIAL_REWARD_BLOCH: u64 = 2_600;
 pub const EMISSION_V3_INITIAL_REWARD_SAT:   u64 = EMISSION_V3_INITIAL_REWARD_BLOCH * SAT_PER_BLOCH;
 pub const EMISSION_V3_HALVING_INTERVAL:     u64 = 1_555_200; // 1.5 yr @ 30 s (1.5 × 1,036,800)
 
+// ── PISO-60: V3-only perpetual tail floor ─────────────────────────────────
+//
+// The V3 curve has its OWN tail floor, 60 BLOCH/block. It deliberately does
+// NOT reuse the shared `TAIL_FLOOR_*` (100 BLOCH) above: that constant is the
+// V2 floor and governs the legacy branch of `block_subsidy_sat` — i.e. ALL
+// pre-fork history. Changing the shared floor would re-validate historical
+// coinbases against a different curve and invalidate the chain; changing THIS
+// one only moves the (far-future) V3 tail. 60 was chosen so the 100-year
+// post-fork emission (13,620,441,600 BLOCH) closes the grand total at ≈21B
+// nominal (see the accounting in the section header above).
+pub const EMISSION_V3_TAIL_FLOOR_BLOCH: u64 = 60;
+pub const EMISSION_V3_TAIL_FLOOR_SAT:   u64 = EMISSION_V3_TAIL_FLOOR_BLOCH * SAT_PER_BLOCH;
+
+// What consensus requires is that the two floors never cross branches:
+// `TAIL_FLOOR_*` only in the legacy (pre-fork) branch, `EMISSION_V3_TAIL_
+// FLOOR_*` only in the V3 branch. Pin both values so any attempt to
+// “simplify” back to a single shared constant breaks the build:
+const _: () = assert!(TAIL_FLOOR_BLOCH == 100, "V2 floor is consensus for all pre-fork history");
+const _: () = assert!(EMISSION_V3_TAIL_FLOOR_BLOCH == 60, "V3 floor is consensus from the fork on");
+
 // The two spellings of the fork height must agree with the carry-over offset.
 const _: () = assert!(
     EMISSION_V3_FORK_EMISSION_HEIGHT
@@ -144,36 +176,43 @@ const _: () = assert!(EMISSION_V3_FORK_EMISSION_HEIGHT < HALVING_INTERVAL);
 // 1.5-year interval is exactly 1.5 × the V2 yearly interval.
 const _: () = assert!(EMISSION_V3_HALVING_INTERVAL * 2 == HALVING_INTERVAL * 3);
 
-/// First V3 epoch whose geometric reward falls below the tail floor:
-/// 2,600 >> 4 = 162 ≥ 100 but 2,600 >> 5 = 81 < 100 → floor from epoch 5.
-pub const EMISSION_V3_TAIL_ACTIVATION_EPOCH:  u64 = 5;
+/// First V3 epoch whose geometric reward falls below the V3 tail floor:
+/// 2,600 >> 5 = 81 ≥ 60 but 2,600 >> 6 = 40 < 60 → floor from epoch 6.
+/// (Under the old shared 100 floor this was epoch 5 — PISO-60 pushes the
+/// floor one epoch later, letting epoch 5 pay its geometric 81 BLOCH.)
+pub const EMISSION_V3_TAIL_ACTIVATION_EPOCH:  u64 = 6;
 pub const EMISSION_V3_TAIL_ACTIVATION_HEIGHT: u64 =
     EMISSION_V3_FORK_EMISSION_HEIGHT
         + EMISSION_V3_TAIL_ACTIVATION_EPOCH * EMISSION_V3_HALVING_INTERVAL;
 
-// Pin the tail-activation epoch algebraically (mirrors the intent of the old
-// `TAIL_ACTIVATION_HEIGHT == 7_257_600` assert, for the V3 curve).
+// Pin the tail-activation epoch algebraically against the V3 floor (mirrors
+// the intent of the old `TAIL_ACTIVATION_HEIGHT == 7_257_600` assert, for
+// the V3 curve). NOTE: these compare against EMISSION_V3_TAIL_FLOOR_BLOCH,
+// not the V2 TAIL_FLOOR_BLOCH — the V2 floor never touches the V3 branch.
 const _: () = assert!(
-    EMISSION_V3_INITIAL_REWARD_BLOCH >> (EMISSION_V3_TAIL_ACTIVATION_EPOCH - 1) >= TAIL_FLOOR_BLOCH
+    EMISSION_V3_INITIAL_REWARD_BLOCH >> (EMISSION_V3_TAIL_ACTIVATION_EPOCH - 1)
+        >= EMISSION_V3_TAIL_FLOOR_BLOCH
 );
 const _: () = assert!(
-    EMISSION_V3_INITIAL_REWARD_BLOCH >> EMISSION_V3_TAIL_ACTIVATION_EPOCH < TAIL_FLOOR_BLOCH
+    EMISSION_V3_INITIAL_REWARD_BLOCH >> EMISSION_V3_TAIL_ACTIVATION_EPOCH
+        < EMISSION_V3_TAIL_FLOOR_BLOCH
 );
-const _: () = assert!(EMISSION_V3_TAIL_ACTIVATION_HEIGHT == 8_229_743);
+// 453,743 + 6 × 1,555,200 = 9,784,943 (was 8,229,743 under the 100 floor).
+const _: () = assert!(EMISSION_V3_TAIL_ACTIVATION_HEIGHT == 9_784_943);
 
 /// Exact Σ subsidy (BLOCH) over the 100 years (103,680,000 blocks) following
 /// the V3 fork. Closed form, integer arithmetic (the sat total exceeds 2^53,
 /// so floating point MUST NOT be used anywhere near this figure):
-///   5 geometric epochs × 1,555,200 blocks × (2600+1300+650+325+162) BLOCH
-/// + (103,680,000 − 7,776,000) tail blocks × 100 BLOCH
-/// = 7,833,542,400 + 9,590,400,000 = 17,423,942,400 BLOCH.
+///   6 geometric epochs × 1,555,200 blocks × (2600+1300+650+325+162+81) BLOCH
+/// + (103,680,000 − 9,331,200) tail blocks × 60 BLOCH
+/// = 7,959,513,600 + 5,660,928,000 = 13,620,441,600 BLOCH.
 /// Verified against a full per-block walk of `block_subsidy_sat` in tests.
-pub const EMISSION_V3_100Y_TOTAL_BLOCH: u128 = 17_423_942_400;
+pub const EMISSION_V3_100Y_TOTAL_BLOCH: u128 = 13_620_441_600;
 
 const _: () = assert!(
     EMISSION_V3_100Y_TOTAL_BLOCH
-        == 1_555_200u128 * (2_600 + 1_300 + 650 + 325 + 162)
-            + (103_680_000u128 - 5 * 1_555_200) * 100
+        == 1_555_200u128 * (2_600 + 1_300 + 650 + 325 + 162 + 81)
+            + (103_680_000u128 - 6 * 1_555_200) * 60
 );
 
 /// Block subsidy in satoshi at the given EMISSION height (local height +
@@ -189,8 +228,9 @@ const _: () = assert!(
 ///   VERBATIM (8,400 initial, yearly halving, 100 floor). Changing this
 ///   branch invalidates every historical coinbase.
 /// - `height >= EMISSION_V3_FORK_EMISSION_HEIGHT` → V3 curve:
-///   `max(2,600 >> epoch, 100)` with the epoch counter restarted at the fork
-///   and 1.5-year (1,555,200-block) halvings.
+///   `max(2,600 >> epoch, 60)` with the epoch counter restarted at the fork,
+///   1.5-year (1,555,200-block) halvings, and the V3-ONLY tail floor
+///   (`EMISSION_V3_TAIL_FLOOR_SAT` = 60 — never the V2 floor).
 ///
 /// Both branches halve the per-block reward in BLOCH-integer space, then
 /// multiply up to satoshi (spec §3.1 semantics; see the module-level note).
@@ -205,14 +245,18 @@ pub fn block_subsidy_sat(height: u64) -> u64 {
             EMISSION_V3_INITIAL_REWARD_BLOCH >> epoch
         };
         let geometric_sat = geometric_bloch * SAT_PER_BLOCH;
-        if geometric_sat < TAIL_FLOOR_SAT {
-            TAIL_FLOOR_SAT
+        // PISO-60: the V3 branch floors at ITS OWN 60-BLOCH constant. Using
+        // the shared V2 `TAIL_FLOOR_SAT` here would be wrong (and using the
+        // V3 floor in the branch below would invalidate history).
+        if geometric_sat < EMISSION_V3_TAIL_FLOOR_SAT {
+            EMISSION_V3_TAIL_FLOOR_SAT
         } else {
             geometric_sat
         }
     } else {
-        // Legacy V2 curve — verbatim. Governs ALL pre-fork history; every
-        // historical block's coinbase re-validates against this branch.
+        // Legacy V2 curve — verbatim, incl. its own 100-BLOCH TAIL_FLOOR_SAT.
+        // Governs ALL pre-fork history; every historical block's coinbase
+        // re-validates against this branch.
         let halvings = height / HALVING_INTERVAL;
         let geometric_bloch = if halvings >= 64 {
             0
@@ -471,29 +515,34 @@ mod tests {
         assert_eq!(miner + validator + oracle, INITIAL_BLOCK_REWARD_SAT);
     }
 
-    /// Tail-floor activation, REINTERPRETED under Emission V3.
+    /// Tail-floor activation, REINTERPRETED under Emission V3 + PISO-60.
     ///
     /// The old test asserted the V2 tail at TAIL_ACTIVATION_HEIGHT
     /// (7,257,600) — that height is now governed by the V3 curve (it is far
     /// above the fork), so the V2 tail is counterfactual and can no longer be
     /// observed through `block_subsidy_sat`. The intent — "the floor kicks in
-    /// exactly where the geometric term drops below 100 BLOCH, and holds
-    /// forever" — is preserved against the V3 curve.
+    /// exactly where the geometric term drops below the floor, and holds
+    /// forever" — is preserved against the V3 curve and ITS 60-BLOCH floor:
+    /// 2600 >> 5 = 81 ≥ 60, 2600 >> 6 = 40 < 60 → floor from epoch 6 (one
+    /// epoch later than under the old shared 100 floor).
     #[test]
-    fn tail_floor_activates_at_v3_epoch_5() {
-        // Last block of V3 epoch 4 still pays geometric: 2600 >> 4 = 162.
+    fn tail_floor_activates_at_v3_epoch_6() {
+        // Last block of V3 epoch 5 still pays geometric: 2600 >> 5 = 81.
         assert_eq!(
             block_subsidy_sat(EMISSION_V3_TAIL_ACTIVATION_HEIGHT - 1),
-            162 * SAT_PER_BLOCH
+            81 * SAT_PER_BLOCH
         );
-        // First block of V3 epoch 5: 2600 >> 5 = 81 < 100 → floor.
+        // First block of V3 epoch 6: 2600 >> 6 = 40 < 60 → V3 floor.
         assert_eq!(
             block_subsidy_sat(EMISSION_V3_TAIL_ACTIVATION_HEIGHT),
-            TAIL_FLOOR_SAT
+            EMISSION_V3_TAIL_FLOOR_SAT
         );
-        // Far in the future: still tail floor (shift saturates to 0 → floor).
-        assert_eq!(block_subsidy_sat(1_000_000_000), TAIL_FLOOR_SAT);
-        assert_eq!(block_subsidy_sat(u64::MAX), TAIL_FLOOR_SAT);
+        assert_eq!(EMISSION_V3_TAIL_FLOOR_SAT, 60 * SAT_PER_BLOCH);
+        // Far in the future: still the V3 floor (shift saturates to 0).
+        assert_eq!(block_subsidy_sat(1_000_000_000), EMISSION_V3_TAIL_FLOOR_SAT);
+        assert_eq!(block_subsidy_sat(u64::MAX), EMISSION_V3_TAIL_FLOOR_SAT);
+        // The V2 floor (100) must NEVER surface through the V3 branch.
+        assert_ne!(block_subsidy_sat(u64::MAX), TAIL_FLOOR_SAT);
     }
 
     /// The legacy V2 curve, re-implemented verbatim as it stood BEFORE the
@@ -542,7 +591,7 @@ mod tests {
     }
 
     /// TEST 2 — The V3 curve: 2,600 at the fork, halving every 1,555,200
-    /// blocks (1.5 yr), floor at 100 once 2600 >> n < 100.
+    /// blocks (1.5 yr), V3 floor at 60 once 2600 >> n < 60 (epoch 6 on).
     #[test]
     fn emission_v3_curve_boundaries() {
         let f = EMISSION_V3_FORK_EMISSION_HEIGHT;
@@ -553,14 +602,17 @@ mod tests {
         assert_eq!(block_subsidy_sat(f + 2 * i),   650 * SAT_PER_BLOCH);
         assert_eq!(block_subsidy_sat(f + 3 * i),   325 * SAT_PER_BLOCH);
         assert_eq!(block_subsidy_sat(f + 4 * i),   162 * SAT_PER_BLOCH); // 325 >> 1 int-div
-        assert_eq!(block_subsidy_sat(f + 5 * i),   TAIL_FLOOR_SAT);      // 81 < 100 → floor
+        assert_eq!(block_subsidy_sat(f + 5 * i),    81 * SAT_PER_BLOCH); // 81 ≥ 60 → geometric
+        assert_eq!(block_subsidy_sat(f + 6 * i), EMISSION_V3_TAIL_FLOOR_SAT); // 40 < 60 → floor
         // Last block of each epoch still pays that epoch's reward.
         assert_eq!(block_subsidy_sat(f + i - 1),     2_600 * SAT_PER_BLOCH);
         assert_eq!(block_subsidy_sat(f + 2 * i - 1), 1_300 * SAT_PER_BLOCH);
         assert_eq!(block_subsidy_sat(f + 5 * i - 1),   162 * SAT_PER_BLOCH);
-        // Floor holds across later epochs.
-        assert_eq!(block_subsidy_sat(f + 6 * i), TAIL_FLOOR_SAT);
-        assert_eq!(block_subsidy_sat(f + 40 * i), TAIL_FLOOR_SAT);
+        assert_eq!(block_subsidy_sat(f + 6 * i - 1),    81 * SAT_PER_BLOCH);
+        // Floor holds across later epochs — at 60, never the V2 100.
+        assert_eq!(block_subsidy_sat(f + 7 * i), EMISSION_V3_TAIL_FLOOR_SAT);
+        assert_eq!(block_subsidy_sat(f + 40 * i), EMISSION_V3_TAIL_FLOOR_SAT);
+        assert_eq!(block_subsidy_sat(f + 40 * i), 60 * SAT_PER_BLOCH);
     }
 
     /// TEST 3 — The step is exactly at the fork, and nowhere else: fork − 1
@@ -577,9 +629,9 @@ mod tests {
         assert_eq!(f - super::super::CARRYOVER_SOURCE_HEIGHT, 40_000);
     }
 
-    /// TEST 4 + 5 — Σ subsidy over the 100 years (103,680,000 blocks) after
-    /// the fork equals EXACTLY 17,423,942,400 BLOCH, computed per-block in
-    /// u128 integer sats. The sat total (1.74e18) exceeds 2^53, so any f64
+    /// TEST 4 — Σ subsidy over the 100 years (103,680,000 blocks) after
+    /// the fork equals EXACTLY 13,620,441,600 BLOCH, computed per-block in
+    /// u128 integer sats. The sat total (1.36e18) exceeds 2^53, so any f64
     /// in this pipeline silently corrupts the figure — asserted explicitly.
     #[test]
     fn emission_v3_100_year_sum() {
@@ -592,15 +644,49 @@ mod tests {
         assert_eq!(
             total_sat,
             EMISSION_V3_100Y_TOTAL_BLOCH * (SAT_PER_BLOCH as u128),
-            "100-year post-fork emission must be exactly 17,423,942,400 BLOCH",
+            "100-year post-fork emission must be exactly 13,620,441,600 BLOCH",
         );
+        assert_eq!(EMISSION_V3_100Y_TOTAL_BLOCH, 13_620_441_600);
         // Integer-only guard: the total does not fit float53 — using f64
         // anywhere in this sum yields a wrong number (it has, historically).
         assert!(total_sat > (1u128 << 53));
-        // And the figure matches the documented nominal read forward (17.43B)
-        // to within 0.04%: 17,423,942,400 vs 17,430,000,000.
-        assert!(EMISSION_V3_100Y_TOTAL_BLOCH < 17_430_000_000);
-        assert!(EMISSION_V3_100Y_TOTAL_BLOCH > 17_400_000_000);
+    }
+
+    /// TEST 5 — Full supply accounting (PISO-60 rationale). Everything that
+    /// exists or will exist over the 100 years after the fork closes at the
+    /// documented 21B nominal, deviation < 0.5%.
+    ///
+    /// "Already emitted" is the 2026-08-09 measurement: Genesis-1 carryover
+    /// 3,475,441,200 + mined since Genesis-3 restart 309,128,400. The few
+    /// thousand pre-fork blocks still to be mined between that measurement
+    /// (local ≈36.8k) and the fork (local 40,000) add ≈27M BLOCH at 8,400 —
+    /// inside the tolerance band, and they narrow the deviation, not widen it.
+    ///
+    /// With the old shared 100 floor this total was 24,778,512,000 (≈24.78B,
+    /// +18%); PISO-60 brings it to 20,975,011,200 (−0.12%).
+    #[test]
+    fn total_supply_closes_near_nominal() {
+        const CARRYOVER_BLOCH:      u128 = 3_475_441_200;
+        const MINED_SINCE_G3_BLOCH: u128 =   309_128_400;
+        const ALREADY_EXISTS_BLOCH: u128 = CARRYOVER_BLOCH + MINED_SINCE_G3_BLOCH;
+        const PREMINE_BLOCH:        u128 = 3_570_000_000; // locked, not yet emitted
+        const NOMINAL_BLOCH:        u128 = 21_000_000_000;
+
+        assert_eq!(ALREADY_EXISTS_BLOCH, 3_784_569_600);
+
+        let grand_total =
+            ALREADY_EXISTS_BLOCH + EMISSION_V3_100Y_TOTAL_BLOCH + PREMINE_BLOCH;
+        assert_eq!(grand_total, 20_975_011_200);
+
+        // |deviation| < 0.5% of nominal, in pure integer arithmetic:
+        // |21,000,000,000 − 20,975,011,200| = 24,988,800 → 0.119%.
+        let deviation = NOMINAL_BLOCH - grand_total; // grand_total < nominal
+        assert!(grand_total < NOMINAL_BLOCH);
+        assert_eq!(deviation, 24_988_800);
+        assert!(
+            deviation * 1_000 < NOMINAL_BLOCH * 5,
+            "grand total must stay within 0.5% of the 21B nominal",
+        );
     }
 
     /// Pre-cliff: nothing vested.
@@ -715,11 +801,22 @@ mod proptest_invariants {
     proptest! {
         // Subsidy never exceeds the genesis initial reward and never drops
         // below the perpetual tail floor — the emission envelope.
+        //
+        // REINTERPRETED under PISO-60: the global lower bound is now the V3
+        // floor (60), which governs everything at/above the fork. The V2
+        // floor (100) still bounds its own branch — but the reachable
+        // pre-fork domain is entirely epoch 0 (8,400), asserted per-branch.
         #[test]
         fn subsidy_within_envelope(h in 0u64..u64::MAX) {
             let s = block_subsidy_sat(h);
-            prop_assert!(s >= TAIL_FLOOR_SAT, "subsidy below tail floor at h={h}");
+            prop_assert!(s >= EMISSION_V3_TAIL_FLOOR_SAT, "subsidy below V3 tail floor at h={h}");
             prop_assert!(s <= INITIAL_BLOCK_REWARD_SAT, "subsidy above initial reward at h={h}");
+            if h < EMISSION_V3_FORK_EMISSION_HEIGHT {
+                // Legacy branch: the whole pre-fork domain sits in V2 epoch 0
+                // and its own floor (100) trivially holds.
+                prop_assert!(s >= TAIL_FLOOR_SAT, "pre-fork subsidy below V2 floor at h={h}");
+                prop_assert_eq!(s, INITIAL_BLOCK_REWARD_SAT);
+            }
         }
 
         // Emission is monotonically NON-INCREASING in height: halvings only ever
