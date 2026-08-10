@@ -2,6 +2,7 @@
 
 **Status:** Consensus rule — live schedule of the Genesis-3 mainnet
 **Date:** 2026-08-09
+**Amended:** 2026-08-10 — owner decision: the V3 tail floor is **60 BLOCH/block entering at epoch 6** (epoch 5 pays the true halving value 81), not 100 at epoch 5 as first drafted. Implemented as a V3-specific floor (PISO-60; the V2 floor of 100 still governs all pre-fork history) and shipped in the mandatory release **`genesis3-node-emission-v3-floor60-20260810`** (`bloch` sha256 `dfc6962df85bd87a780a4a15ccf330dc08ae860dd9cf4e3ad647b5e9c79601a8`); all earlier binaries (incl. `6ffc5f12…`/`c21e09d`) are superseded.
 **Consensus source of truth:** `crates/bloch-crypto/src/core/tokenomics_v2.rs` (`block_subsidy_sat` and the `EMISSION_V3_*` constants — const-asserted and exhaustively tested)
 **Activation:** flag-day hard fork at **emission height 453,743 = node-local height 40,000** (commit `8538dea`)
 **Supersedes:** the emission curve of `docs/specs/TOKENOMICS_V2.md` (both its original 1B parameter set and the B3b 21B re-basing) — see ADR-035
@@ -72,7 +73,7 @@ construction.
 
 ```
 epoch  = (h − 453,743) / 1,555,200
-reward = max(2,600 >> epoch, 100) BLOCH
+reward = max(2,600 >> epoch, 60) BLOCH
 ```
 
 - **Initial reward: 2,600 BLOCH/block** — a single clean 8,400 → 2,600 step
@@ -81,10 +82,14 @@ reward = max(2,600 >> epoch, 100) BLOCH
   (1.5 × the old 1,036,800 yearly interval).
 - **The epoch counter restarts at the fork** (the first V3 block is epoch 0);
   it does not inherit the absolute-height count.
-- **Tail floor: 100 BLOCH/block, perpetual** (unchanged from V2). The
-  geometric reward falls below the floor at epoch 5 (2,600 >> 5 = 81 < 100),
-  i.e. from emission height **8,229,743** (local 7,816,000) the reward is a
-  flat 100 BLOCH/block forever.
+- **Tail floor: 60 BLOCH/block, perpetual** (`EMISSION_V3_TAIL_FLOOR_BLOCH`
+  — a V3-specific floor; the V2 floor of 100 governs only pre-fork
+  history). Epoch 5 pays the true halving value **81** (2,600 >> 5 = 81 ≥
+  60); the geometric reward first falls below the floor at **epoch 6**
+  (2,600 >> 6 = 40 < 60), i.e. from emission height **9,784,943** (local
+  9,371,200, ~9 years after the fork) the reward is a flat 60 BLOCH/block
+  forever (const-asserted: `EMISSION_V3_TAIL_ACTIVATION_EPOCH = 6`,
+  `EMISSION_V3_TAIL_ACTIVATION_HEIGHT = 9_784_943`).
 
 ### 3.3 V3 halving table
 
@@ -95,23 +100,25 @@ reward = max(2,600 >> epoch, 100) BLOCH
 | 2 | 650 | 3,564,143 – 5,119,342 | 3,150,400 – 4,705,599 | 1,010,880,000 |
 | 3 | 325 | 5,119,343 – 6,674,542 | 4,705,600 – 6,260,799 | 505,440,000 |
 | 4 | 162 | 6,674,543 – 8,229,742 | 6,260,800 – 7,815,999 | 251,942,400 |
-| 5+ | 100 (tail) | 8,229,743 → ∞ | 7,816,000 → ∞ | 100/block, perpetual |
+| 5 | 81 | 8,229,743 – 9,784,942 | 7,816,000 – 9,371,199 | 125,971,200 |
+| 6+ | 60 (tail) | 9,784,943 → ∞ | 9,371,200 → ∞ | 60/block, perpetual |
 
-Geometric phase total: **7,833,542,400 BLOCH**. Summed over the 100 years
+Geometric phase total: **7,959,513,600 BLOCH**. Summed over the 100 years
 (103,680,000 heights) following the fork, the curve yields exactly
-**17,423,942,400 BLOCH** — verified per-height in `u128` by test (the sat
-total exceeds 2⁵³; no floating point is used anywhere near these figures):
+**13,620,441,600 BLOCH** (`EMISSION_V3_100Y_TOTAL_BLOCH`) — verified
+per-height in `u128` by test (the sat total exceeds 2⁵³; no floating point
+is used anywhere near these figures):
 
 ```
-1,555,200 × (2,600 + 1,300 + 650 + 325 + 162)
-+ (103,680,000 − 5 × 1,555,200) × 100
-= 7,833,542,400 + 9,590,400,000 = 17,423,942,400
+1,555,200 × (2,600 + 1,300 + 650 + 325 + 162 + 81)
++ (103,680,000 − 6 × 1,555,200) × 60
+= 7,959,513,600 + 5,660,928,000 = 13,620,441,600
 ```
 
 **Curve sum vs realized emission:** coinbases are paid per accepted **DAG
 block**, and a BlockDAG accepts side ("red") blocks beyond the selected
 chain — so realized emission runs slightly **above** the per-height curve
-sum. Treat 17,423,942,400 as the exact 100-year value of the curve and a
+sum. Treat 13,620,441,600 as the exact 100-year value of the curve and a
 floor on realized emission, not a cap. (Same trap when measuring: RPC
 `getblockcount` counts DAG blocks, not chain height — the height that gates
 this fork is `getdaginfo → tip_height` / `getblocktemplate → height`.)
@@ -121,9 +128,24 @@ this fork is `getdaginfo → tip_height` / `getblocktemplate → height`.)
 The V2 curve (8,400 BLOCH initial, yearly halving), read forward from the
 Genesis-3 restart, would have emitted **≈26.92B BLOCH over 100 years — 54%
 above the documented `MINING_EMISSION_NOMINAL` of 17.43B**. The restart
-re-anchored the curve without re-scaling it. Emission V3 slows the curve so
-that the 100 years following the fork emit ≈ the documented nominal
-(17,423,942,400 BLOCH) and moves halvings to every 1.5 years.
+re-anchored the curve without re-scaling it. Emission V3 slows the curve
+and moves halvings to every 1.5 years, **realigning emission with the
+documented nominals (17.43B mining / 21B total) to within ~0.5%** — always
+stated with the full decomposition (measured 2026-08-09):
+
+| Component | BLOCH |
+|---|---:|
+| Carry-over (Genesis-1, 413,743 UTXOs × 8,400) | 3,475,441,200 |
+| Mined since Genesis-3 (36,801 coinbases × 8,400) | 309,128,400 |
+| + Future V3 emission over 100 yr (floor 60 from epoch 6) | 13,620,441,600 |
+| = Mining total (nominal 17,430,000,000) | **17,405,011,200** |
+| + Founder premine | 3,570,000,000 |
+| = Total (nominal 21,000,000,000) | **20,975,011,200** |
+
+The mined-side figure keeps growing at 8,400/coinbase until the fork
+(≈17.50B mining total at the fork, ≈ +0.4% over nominal) — anchor any
+restatement to its measurement date, and remember every figure is a floor
+(per-DAG-block coinbases, perpetual tail), never a cap.
 
 Deployment discipline (const-asserted in code):
 
@@ -137,9 +159,9 @@ Deployment discipline (const-asserted in code):
 
 ## 5. The 21B nominal is NOT a hard cap
 
-There is **no maximum supply**. The 100 BLOCH/block tail floor is perpetual
-(Monero-style): ≈ 104M BLOCH/year at the 30 s target (0.5%/year against the
-21B nominal, asymptotically → 0%). "Nominal supply" is a design target that
+There is **no maximum supply**. The 60 BLOCH/block V3 tail floor is
+perpetual (Monero-style): ≈ 62M BLOCH/year at the 30 s target (≈0.3%/year
+against the 21B nominal, asymptotically → 0%). "Nominal supply" is a design target that
 the geometric phase approaches — not a ceiling the chain enforces. Any
 document, listing form or integration that describes BLOCH as "hard-capped"
 or "fixed supply" is wrong. (And the unit is **billions** — 21,000,000,000

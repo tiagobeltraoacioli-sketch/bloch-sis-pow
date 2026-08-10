@@ -26,7 +26,9 @@ build products on the open protocol; Postern is one builder among many.
 > - **Emission V3 flag-day, local h=40,000 (ETA ~2026-08-12/13)** — block
 >   reward 8,400 → 2,600 BLOCH, halvings every 1,555,200 blocks
 >   (`docs/specs/TOKENOMICS_V3.md`, ADR-035). Armed in the fleet binary
->   (`c21e09d`), inert until the height.
+>   (release `genesis3-node-emission-v3-floor60-20260810`, sha256
+>   `dfc6962d…`, incl. the PISO-60 60-BLOCH V3 tail floor), inert until the
+>   height.
 > - **From-scratch sync is not supported** (pre-2026-08-05 block bodies no
 >   longer exist on the network); new nodes bootstrap from a datadir snapshot
 >   (`docs/SNAPSHOT-BOOTSTRAP.md`). A poisoned `known_peers.json` self-heals
@@ -66,19 +68,25 @@ build products on the open protocol; Postern is one builder among many.
 - **Hybrid signatures** — Falcon-1024 ‖ ML-DSA-65 (both must verify), tx + peer
   identity, seed-deterministic. SHAKE-256 hashing throughout.
 - **Tokenomics** — 21 B nominal supply (**not hard-capped**: perpetual
-  100 BLOCH/block tail, Monero-style; nominal = 3.57 B founder premine +
+  60 BLOCH/block V3 tail, Monero-style; nominal = 3.57 B founder premine +
   17.43 B mining nominal), 100 % miner emission, 17 % founder premine
   (10-yr cliff + 40-yr monthly vesting), 30 s blocks. **Emission V3**
   flag-day fork at local height 40,000 (ETA ~Aug 12–13, 2026; chain height
   30,293 measured 2026-08-09): block reward 8,400 → 2,600 BLOCH (−69 %),
   halving interval 1,036,800 → 1,555,200 blocks (~1.5 yr @ 30 s); V3
-  schedule 2,600 / 1,300 / 650 / 325 / 162 then the perpetual 100 tail.
-  The old V2 curve would have emitted 26.92 B over 100 years against the
-  documented 17.43 B mining nominal (the bug); the V3 curve emits ≈ 17.42 B
-  from the fork over that window (a floor — coinbases are paid per DAG
-  block — not a cap, and mining emission, not total supply); reconciliation
-  of pre-fork emission against the nominal figures is under review. Source
-  of truth: `crates/bloch-crypto/src/core/tokenomics_v2.rs`.
+  schedule 2,600 / 1,300 / 650 / 325 / 162 / 81 then the perpetual 60 tail
+  (from V3 epoch 6, ~9 yr after the fork; the V2 floor of 100 governs
+  pre-fork history). The old V2 curve would have emitted 26.92 B over 100
+  years against the documented 17.43 B mining nominal (the bug). **V3
+  realigns emission with the documented nominals to within ~0.5%**
+  (measured 2026-08-09): carryover 3,475,441,200 + mined-since-G3
+  309,128,400 + future V3 emission over 100 yr 13,620,441,600 =
+  17,405,011,200 mining total vs the 17.43 B mining nominal; + premine
+  3,570,000,000 = 20,975,011,200 vs the 21 B total nominal. Figures are
+  floors, not caps: coinbases are paid per DAG block, and the mined side
+  grows at 8,400/coinbase until the fork (≈ 17.50 B mining total at the
+  fork). Source of truth:
+  `crates/bloch-crypto/src/core/tokenomics_v2.rs`.
 - Node boots, validates genesis, and mines end-to-end (`--mine`).
 
 ### Security

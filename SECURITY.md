@@ -10,7 +10,9 @@ ASICs, with **Bitcoin merged mining (AuxPoW) active since height 8,500**.
 chains; that regime no longer exists on the live network.) The network is
 **unaudited**, nascent, low-hashrate, and **51%-attackable** — running a live
 mainnet is a designation, not a security claim, and no security property is
-claimed. The posture we are building toward — and its open gates — is in
+claimed. **No external security audit has been contracted to date**; if any
+other page or document suggests otherwise, this statement is the accurate
+one. The posture we are building toward — and its open gates — is in
 [`docs/THREAT-MODEL.md`](./docs/THREAT-MODEL.md) and [`ROADMAP.md`](./ROADMAP.md).
 
 ## Reporting a vulnerability

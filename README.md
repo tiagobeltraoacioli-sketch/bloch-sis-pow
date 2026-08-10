@@ -74,7 +74,7 @@ classical primitive on the consensus path.
 | Emission | 100% to miner (no validator/oracle pools) |
 | Block reward | **2,600 BLOCH/block** since the Emission V3 fork at height 40,000 (8,400 before it) |
 | Halving | Every **1,555,200 blocks** (~1.5 years @ 30 s); counter restarted at the V3 fork |
-| Tail | **60 BLOCH/block**, perpetual (Monero-style disinflation) — V3 curve; the legacy V2 floor of 100 only governs pre-fork history |
+| Tail | **60 BLOCH/block**, perpetual, from V3 epoch 6 (~9 years after the fork; Monero-style disinflation — the V2 floor of 100 governs pre-fork history) |
 | Block time | 30 seconds |
 | Founder premine | 3,570,000,000 BLOCH (17%) — 10-year cliff, then 40-year **monthly** vesting on-chain |
 
@@ -92,17 +92,29 @@ mining-emission nominal of 17.43 B. Emission V3 slows the curve:
   through height 39,999; the first 2,600 block is height 40,000.
 - **Halving interval:** 1,036,800 → **1,555,200 blocks** (~1.5 years @ 30 s).
   The halving counter restarts at the fork.
-- **Schedule from the fork:** 2,600 → 1,300 → 650 → 325 → 162 → 81, then a
-  perpetual **60 BLOCH/block tail** (from V3 epoch 6, ~9 years after the
-  fork). The 60 floor is V3-only (PISO-60); the legacy V2 floor of 100
-  still governs every pre-fork coinbase.
-- **Emission:** from the fork, the V3 curve emits **exactly 13,620,441,600**
-  BLOCH over the following 100 years — a floor, not a cap (coinbases are
-  paid per DAG block, and the 60 BLOCH tail is perpetual). This closes the
-  full accounting near the 21 B nominal: ≈3.78 B already emitted (3.475 B
-  carryover + G3 mining, measured 2026-08-09) + 13.62 B over the next 100
-  years + 3.57 B locked founder premine = **≈20.98 B** (−0.12%). Supply is
-  **not hard-capped**.
+- **Schedule from the fork:** 2,600 → 1,300 → 650 → 325 → 162 → 81, then
+  the perpetual **60 BLOCH/block tail** (from V3 epoch 6, ~9 years after
+  the fork; epoch 5 pays the true halving value 81). The 60 floor is
+  V3-only (PISO-60); the legacy V2 floor of 100 still governs every
+  pre-fork coinbase.
+- **Emission accounting** (measured 2026-08-09; the mined-since-G3 figure
+  keeps growing at 8,400/coinbase until the fork):
+
+  | Component (mining side) | BLOCH |
+  | --- | --- |
+  | Genesis-1 carryover (413,743 UTXOs × 8,400) | 3,475,441,200 |
+  | Mined since Genesis-3 (36,801 coinbases × 8,400) | 309,128,400 |
+  | Future V3 emission, 100 years from the fork | 13,620,441,600 |
+  | **Mining total** (documented mining nominal: 17,430,000,000) | **17,405,011,200** |
+  | + Founder premine | 3,570,000,000 |
+  | **Total** (nominal total supply: 21,000,000,000) | **20,975,011,200** |
+
+  **Emission V3 realigns the emission schedule with the documented nominals
+  (17.43 B mining / 21 B total) to within ~0.5%.** These figures are floors,
+  not exact totals and not caps: coinbases are paid per DAG block, the
+  mined-side total keeps growing until the fork (≈ 17.50 B mining total at
+  the fork), and the 60 BLOCH tail is perpetual. Supply is **not
+  hard-capped**.
 
 Consensus source of truth: `crates/bloch-crypto/src/core/tokenomics_v2.rs`.
 Normative spec: [`docs/specs/TOKENOMICS_V3.md`](./docs/specs/TOKENOMICS_V3.md);
@@ -146,10 +158,14 @@ actively diverge, not merely lag:
   (commit `1f7d328`) rejects the blocks the network produces today.
 - the **Emission V3 flag-day (local height 40,000, ETA ~2026-08-12/13)** cuts
   the block reward 8,400 → 2,600 BLOCH. **Any binary built before commit
-  `8538dea` forks off the network at that height.** The fleet runs commit
-  `c21e09d` (Emission V3 + the PEX `known_peers` fix); if the latest published
-  release still predates it, build from source (`g3-integration` branch)
-  before height 40,000.
+  `8538dea` forks off the network at that height.** The mandatory release is
+  **[`genesis3-node-emission-v3-floor60-20260810`](https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow/releases/tag/genesis3-node-emission-v3-floor60-20260810)**
+  (`bloch` binary sha256
+  `dfc6962df85bd87a780a4a15ccf330dc08ae860dd9cf4e3ad647b5e9c79601a8`) — the
+  build the fleet runs, carrying Emission V3 with the 60-BLOCH V3 tail floor
+  (PISO-60), the difficulty choke point, and the PEX `known_peers` fix. All
+  earlier releases — including those shipping commit `c21e09d` (binary
+  `6ffc5f12…`) — are superseded.
 
 Requires **glibc ≥ 2.39** (Ubuntu 24.04+); on older distros build from source.
 Unpack and verify `SHA256SUMS` before running.

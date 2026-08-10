@@ -22,9 +22,10 @@ older builds actively diverge. Two consensus flag-days matter here:
   (`genesis3-node-difficulty-choke-20260809`) reject today's blocks.
 - **Emission V3, local h=40,000 (ETA ~2026-08-12/13)** — block reward
   8,400 → 2,600 BLOCH (`docs/specs/TOKENOMICS_V3.md`). Any binary without
-  commit `8538dea` forks off the network at that height. The fleet runs
-  commit `c21e09d`; if the latest release predates it, build from source
-  (`g3-integration`) before h=40,000.
+  commit `8538dea` forks off the network at that height. The fleet runs the
+  mandatory release `genesis3-node-emission-v3-floor60-20260810` (`bloch`
+  sha256 `dfc6962d…`, incl. the PISO-60 60-BLOCH V3 tail floor); earlier
+  releases are superseded — upgrade before h=40,000.
 
 Since commit `c21e09d`, a stale or poisoned `known_peers.json` is pruned
 automatically on load (the PEX address-poisoning fix) — restoring an old
