@@ -1,0 +1,24 @@
+[package]
+name = "pos-prover-cost-spike"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone spike — deliberately NOT a member of the node workspace, so it
+# cannot affect the node build. See README.md.
+
+[workspace]
+
+[dependencies]
+# The chain's CURRENT signature stack (PQClean C reference, via FFI).
+pqcrypto-mldsa  = "0.1"
+pqcrypto-falcon = "0.4"
+pqcrypto-traits = "0.3"
+
+# Candidate PURE-RUST verifiers — the only kind that can target the zkVM
+# without a RISC-V C toolchain.
+fips204 = "0.4"
+
+sha3 = "0.10"
+hex  = "0.4"
+tide-fn-dsa-vrfy = "0.4"
