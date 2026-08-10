@@ -1,6 +1,6 @@
 # BLOCH Tokenomics V2 — Specification
 
-**Status:** Genesis-locked, pre-commitment doctrine — supersedes V1
+**Status:** HISTORICAL — parameter values superseded by the deployed Genesis-3 chain (see notice below); retained for design history and doctrine
 **Version:** 2.0
 **Date:** 2026-05-01
 **Author:** BLOCH Founder
@@ -12,6 +12,26 @@
 > — Doutrina BLOCH, *Ensaio 2 — Pre-Commitment Doctrine*
 
 ---
+
+> **⚠️ HISTORICAL NOTICE (2026-08) — the numbers below are NOT the live chain.**
+> This document records the pre-Genesis-3 V2 *design* (150 s blocks,
+> 210,000-block halving, 800 M mining emission). The **deployed Genesis-3
+> mainnet** takes its consensus constants from
+> `crates/bloch-crypto/src/core/tokenomics_v2.rs`: 30 s blocks, 8,400 BLOCH
+> initial reward, 1,036,800-block halving, perpetual 100 BLOCH tail.
+> Furthermore, the **Emission V3 flag-day hard fork** at local height **40,000**
+> (Aug 2026; emission height 453,743 incl. carryover) cuts the block reward
+> 8,400 → **2,600 BLOCH** (−69%) and lengthens the halving interval to
+> **1,555,200 blocks** (~1.5 yr @ 30 s), with the schedule
+> 2,600 → 1,300 → 650 → 325 → 162 → perpetual 100 tail. Over the 100 years
+> after the fork the V3 curve emits ≈ 17.42 B BLOCH — a floor, not a cap,
+> and mining emission, not total supply (the uncorrected V2 curve would have
+> emitted 26.92 B against the documented 17.43 B mining nominal — the bug
+> the fork addresses); pre-fork emission incl. the carryover sits on top of
+> that, and its reconciliation against the nominal figures is under review.
+> The supply is **not hard-capped** (the tail is perpetual). Current spec:
+> [`TOKENOMICS_V3.md`](./TOKENOMICS_V3.md) + `docs/adr/ADR-035-emission-v3-schedule.md`.
+> Read the rest of this file as design history only.
 
 ## 1. Preamble
 

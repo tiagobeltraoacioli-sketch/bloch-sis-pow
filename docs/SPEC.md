@@ -663,8 +663,15 @@ Genesis is pinned (`GENESIS_*`, `core/mod.rs:95-182`), including a testnet-regim
 
 ### 7.3 Emission (context)
 
-Tokenomics V2 (`core/mod.rs:8-28`, `tokenomics_v2.rs`): `HALVING_INTERVAL =
-210_000`; initial subsidy 1905 BLOCH; tail floor 25 BLOCH; **the coin is
+Tokenomics (`tokenomics_v2.rs`): initial subsidy 8,400 BLOCH,
+`HALVING_INTERVAL = 1_036_800` (~1 yr @ 30 s) — this V2 curve governs only
+heights below the **Emission V3** flag-day fork at local height 40,000
+(emission height 453,743 incl. carryover). From the fork: subsidy
+2,600 BLOCH (`EMISSION_V3_INITIAL_REWARD_BLOCH`), halving every 1,555,200
+blocks (~1.5 yr, `EMISSION_V3_HALVING_INTERVAL`, counter restarts at the
+fork), schedule 2,600 → 1,300 → 650 → 325 → 162 then a perpetual
+100 BLOCH tail floor (supply is **not hard-capped**; see
+`docs/specs/TOKENOMICS_V3.md`). **The coin is
 valueless by design** — emission parameters do not confer value or a security.
 
 ---

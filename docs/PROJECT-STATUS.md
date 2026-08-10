@@ -43,8 +43,20 @@ build products on the open protocol; Postern is one builder among many.
   (~M/k faster in the relaxed pre-activation regime), consensus-neutral (equivalence-tested).
 - **Hybrid signatures** — Falcon-1024 ‖ ML-DSA-65 (both must verify), tx + peer
   identity, seed-deterministic. SHAKE-256 hashing throughout.
-- **Tokenomics** — 21 B supply, 100 % miner emission, 17 % founder premine
-  (10-yr cliff + 40-yr monthly vesting), 30 s blocks.
+- **Tokenomics** — 21 B nominal supply (**not hard-capped**: perpetual
+  100 BLOCH/block tail, Monero-style; nominal = 3.57 B founder premine +
+  17.43 B mining nominal), 100 % miner emission, 17 % founder premine
+  (10-yr cliff + 40-yr monthly vesting), 30 s blocks. **Emission V3**
+  flag-day fork at local height 40,000 (ETA ~Aug 12–13, 2026; chain height
+  30,293 measured 2026-08-09): block reward 8,400 → 2,600 BLOCH (−69 %),
+  halving interval 1,036,800 → 1,555,200 blocks (~1.5 yr @ 30 s); V3
+  schedule 2,600 / 1,300 / 650 / 325 / 162 then the perpetual 100 tail.
+  The old V2 curve would have emitted 26.92 B over 100 years against the
+  documented 17.43 B mining nominal (the bug); the V3 curve emits ≈ 17.42 B
+  from the fork over that window (a floor — coinbases are paid per DAG
+  block — not a cap, and mining emission, not total supply); reconciliation
+  of pre-fork emission against the nominal figures is under review. Source
+  of truth: `crates/bloch-crypto/src/core/tokenomics_v2.rs`.
 - Node boots, validates genesis, and mines end-to-end (`--mine`).
 
 ### Security
