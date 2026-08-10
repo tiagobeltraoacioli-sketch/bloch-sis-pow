@@ -61,10 +61,13 @@ struct Cli {
 struct CurrentJob {
     id:       String,
     preimage: Vec<u8>,
-    /// Height of the block this job mines — selects the residual-gate width
-    /// (k=4 below the k=8 soft-fork activation height, k=8 at/above it) so the
-    /// miner produces witnesses the node's height-aware `validate_pow` accepts.
+    /// Height of the block this job mines — with `bits`, selects the
+    /// residual-gate width (difficulty-driven k-ramp) so the miner produces
+    /// witnesses the node's consensus `validate_pow` accepts.
     height:   u64,
+    /// Compact BLOCK difficulty bits (mining.notify params[2]) — the second
+    /// input to `canonical_residual_coeffs`; also committed in the preimage.
+    bits:     u32,
 }
 
 fn send(stream: &mut TcpStream, v: Value) -> std::io::Result<()> {
@@ -203,9 +206,9 @@ fn main() -> std::io::Result<()> {
             start_nonce:          nonce_cursor,
             candidates_per_nonce: 2048,
             max_total_attempts:   cli.burst,
-            // Height-aware gate width: matches the node's consensus selection
-            // (k=4 below the soft-fork activation height, k=8 at/above it).
-            residual_coeffs:      bloch_crypto::core::canonical_residual_coeffs(j.height),
+            // Consensus gate width: matches the node's selection exactly
+            // (difficulty-driven k-ramp keyed on the job's height + bits).
+            residual_coeffs:      bloch_crypto::core::canonical_residual_coeffs(j.height, j.bits),
         };
         match mine(&j.preimage, target, &cfg, None) {
             Ok(found) => {
@@ -289,13 +292,22 @@ fn handle_message(
         Some("mining.notify") => {
             let id = msg.pointer("/params/0").and_then(|v| v.as_str()).unwrap_or_default();
             let preimage_hex = msg.pointer("/params/1").and_then(|v| v.as_str()).unwrap_or_default();
+            // Block bits (params[2]) select the consensus residual-gate width
+            // together with the height — a job without them is unusable
+            // (mining k≠consensus-k wastes every share).
+            let bits = msg.pointer("/params/2").and_then(|v| v.as_str())
+                .and_then(|s| u32::from_str_radix(s, 16).ok());
             let height = msg.pointer("/params/3").and_then(|v| v.as_u64()).unwrap_or(0);
             let clean = msg.pointer("/params/4").and_then(|v| v.as_bool()).unwrap_or(true);
+            let Some(bits) = bits else {
+                eprintln!("mining.notify missing/invalid bits — ignoring job");
+                return;
+            };
             if let Ok(preimage) = hex::decode(preimage_hex) {
                 if preimage.len() == 76 {
-                    println!("new job {} (height {}{})", id, height,
+                    println!("new job {} (height {}, bits 0x{:08x}{})", id, height, bits,
                         if clean { ", clean" } else { "" });
-                    *job = Some(CurrentJob { id: id.to_string(), preimage, height });
+                    *job = Some(CurrentJob { id: id.to_string(), preimage, height, bits });
                     // Only restart the nonce search on clean jobs (tip
                     // change). A periodic refresh keeps the cursor so
                     // the search keeps exploring its range instead of

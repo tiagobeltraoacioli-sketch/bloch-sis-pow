@@ -379,11 +379,12 @@ async fn handle_submit(
     // target. CPU cost is a k-row expansion; fine for a reference pool.
     let share_target = pool.share_target;
     let preimage = job.preimage.clone();
-    // Height-aware gate width: identical selection to the node's consensus
-    // (k=4 below the k=8 soft-fork activation height, k=8 at/above it), so a
-    // share that clears the BLOCK target is one the node's `validate_pow` at
-    // this height will accept on `submitblock`.
-    let residual_coeffs = bloch_crypto::core::canonical_residual_coeffs(job.height);
+    // Consensus gate width: identical selection to the node's `validate_pow`
+    // (`canonical_residual_coeffs(block.height, block.header.bits)` — the
+    // difficulty-driven k-ramp), so a share that clears the BLOCK target is
+    // one the node will accept on `submitblock`. Height and bits are the
+    // JOB's (the block being mined), never the tip's.
+    let residual_coeffs = bloch_crypto::core::canonical_residual_coeffs(job.height, job.bits);
     let verdict = tokio::task::spawn_blocking(move || {
         verify_regime(&preimage, nonce, &solution, &share_target, residual_coeffs)
             .map(|_| (compute_aux_hash(&preimage, nonce, &solution), solution))

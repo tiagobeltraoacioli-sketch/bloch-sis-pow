@@ -45,6 +45,48 @@ pub struct BlockTemplate {
     pub transactions:         Vec<Transaction>,
 }
 
+impl BlockTemplate {
+    /// The subsidy CONSENSUS requires for this template, computed — like the
+    /// validator's `validate_coinbase_value` — at the EMISSION height, never
+    /// the local height. From the Emission V3 flag-day (local 40,000 =
+    /// emission 453,743) onward those disagree: the local height would say
+    /// 8,400 BLOCH while consensus pays 2,600, and every block built on the
+    /// wrong figure is rejected.
+    pub fn consensus_subsidy_sat(&self) -> u64 {
+        bloch_crypto::core::tokenomics_v2::block_subsidy_sat(self.emission_height)
+    }
+
+    /// The founder-vesting delta CONSENSUS requires for this template — same
+    /// emission-height keying as the subsidy (`validate_coinbase_value`
+    /// enforces the exact value AND address of output[1] whenever this is
+    /// non-zero).
+    pub fn consensus_founder_vesting_sat(&self) -> u64 {
+        bloch_crypto::core::tokenomics_v2::founder_vesting_delta_sat(self.emission_height)
+    }
+
+    /// Full divergence check: Err(reason) when the node's reward-bearing
+    /// fields do not match consensus for this template's emission height —
+    /// the pool must refuse to cut jobs from such a node (mining them
+    /// produces only rejected blocks). This is THE choke point: every
+    /// template goes through it before `Job::build` copies the node's
+    /// figures into a coinbase.
+    pub fn check_reward_consensus(&self) -> Result<(), String> {
+        let expect_subsidy = self.consensus_subsidy_sat();
+        if self.subsidy_sat != expect_subsidy {
+            return Err(format!(
+                "template subsidy {} sat != consensus {} sat at h={} (emission h={})",
+                self.subsidy_sat, expect_subsidy, self.height, self.emission_height));
+        }
+        let expect_vesting = self.consensus_founder_vesting_sat();
+        if self.founder_vesting_sat != expect_vesting {
+            return Err(format!(
+                "template founder vesting {} sat != consensus {} sat at h={} (emission h={})",
+                self.founder_vesting_sat, expect_vesting, self.height, self.emission_height));
+        }
+        Ok(())
+    }
+}
+
 pub struct Upstream {
     url:   String,
     agent: ureq::Agent,
@@ -190,5 +232,108 @@ impl Upstream {
         } else {
             Err(format!("submitblock: unexpected response {}", v))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bloch_crypto::core::tokenomics_v2::{
+        EMISSION_V3_FORK_EMISSION_HEIGHT, EMISSION_V3_FORK_LOCAL_HEIGHT,
+        EMISSION_V3_INITIAL_REWARD_SAT, INITIAL_BLOCK_REWARD_SAT,
+        block_subsidy_sat,
+    };
+
+    /// A minimal template at (local, emission) heights with the given
+    /// reward-bearing fields — everything else is irrelevant to the check.
+    fn tmpl(height: u64, emission_height: u64, subsidy_sat: u64, vesting_sat: u64) -> BlockTemplate {
+        BlockTemplate {
+            parents:              vec![[0u8; 32]],
+            height,
+            emission_height,
+            blue_score:           height,
+            bits:                 0x203fffc0,
+            cur_time:             1_786_000_000,
+            subsidy_sat,
+            founder_vesting_sat:  vesting_sat,
+            founder_address_hash: [0u8; 20],
+            total_fees:           0,
+            transactions:         Vec::new(),
+        }
+    }
+
+    // ── The Emission V3 fork boundary (local 40,000 = emission 453,743) ──
+
+    #[test]
+    fn pre_fork_template_pays_v2_subsidy() {
+        // Last pre-fork block: consensus still pays the V2 curve (8,400).
+        let t = tmpl(EMISSION_V3_FORK_LOCAL_HEIGHT - 1,
+                     EMISSION_V3_FORK_EMISSION_HEIGHT - 1,
+                     INITIAL_BLOCK_REWARD_SAT, 0);
+        assert_eq!(t.consensus_subsidy_sat(), INITIAL_BLOCK_REWARD_SAT);
+        t.check_reward_consensus().expect("V2 subsidy is correct pre-fork");
+        // A node already paying the V3 figure pre-fork is divergent.
+        let early = tmpl(EMISSION_V3_FORK_LOCAL_HEIGHT - 1,
+                         EMISSION_V3_FORK_EMISSION_HEIGHT - 1,
+                         EMISSION_V3_INITIAL_REWARD_SAT, 0);
+        early.check_reward_consensus().expect_err("V3 subsidy pre-fork must be refused");
+    }
+
+    #[test]
+    fn post_fork_template_must_pay_v3_subsidy() {
+        // First fork block: consensus flips to 2,600 BLOCH.
+        let t = tmpl(EMISSION_V3_FORK_LOCAL_HEIGHT,
+                     EMISSION_V3_FORK_EMISSION_HEIGHT,
+                     EMISSION_V3_INITIAL_REWARD_SAT, 0);
+        assert_eq!(t.consensus_subsidy_sat(), EMISSION_V3_INITIAL_REWARD_SAT);
+        t.check_reward_consensus().expect("V3 subsidy is correct at the fork");
+
+        // THE latent bug this check exists for: a node still serving the V2
+        // figure at the fork. Cutting that job would have every ASIC block
+        // rejected by consensus — the pool must refuse the template instead.
+        let stale = tmpl(EMISSION_V3_FORK_LOCAL_HEIGHT,
+                         EMISSION_V3_FORK_EMISSION_HEIGHT,
+                         INITIAL_BLOCK_REWARD_SAT, 0);
+        let why = stale.check_reward_consensus().expect_err("8,400 at the fork must be refused");
+        assert!(why.contains("subsidy"), "refusal names the divergent field: {}", why);
+    }
+
+    #[test]
+    fn local_height_keying_is_the_bug_not_the_fix() {
+        // Documents the trap: at the fork, the LOCAL height still computes
+        // the pre-fork subsidy (40,000 is epochs away from any V2 halving),
+        // while the EMISSION height computes the V3 one. Keying any check on
+        // the local height silently blesses the wrong figure — which is why
+        // check_reward_consensus (and the node's validate_coinbase_value)
+        // key on emission height only.
+        assert_eq!(block_subsidy_sat(EMISSION_V3_FORK_LOCAL_HEIGHT),
+                   INITIAL_BLOCK_REWARD_SAT);
+        assert_eq!(block_subsidy_sat(EMISSION_V3_FORK_EMISSION_HEIGHT),
+                   EMISSION_V3_INITIAL_REWARD_SAT);
+        assert_ne!(block_subsidy_sat(EMISSION_V3_FORK_LOCAL_HEIGHT),
+                   block_subsidy_sat(EMISSION_V3_FORK_EMISSION_HEIGHT));
+    }
+
+    #[test]
+    fn divergent_founder_vesting_is_refused() {
+        // Vesting is cliff-locked (zero) for years around the fork; a node
+        // claiming a non-zero vesting output is divergent — consensus
+        // enforces output[1]'s exact value, so blocks built on it die too.
+        let t = tmpl(EMISSION_V3_FORK_LOCAL_HEIGHT,
+                     EMISSION_V3_FORK_EMISSION_HEIGHT,
+                     EMISSION_V3_INITIAL_REWARD_SAT, 1);
+        let why = t.check_reward_consensus().expect_err("phantom vesting must be refused");
+        assert!(why.contains("vesting"), "refusal names the divergent field: {}", why);
+    }
+
+    #[test]
+    fn identity_chain_fallback_still_checks() {
+        // Older nodes without `emission_height` fall back to the local
+        // height (upstream parse). On a no-carry-over chain that is exact;
+        // the check then still catches a wrong subsidy.
+        let t = tmpl(42, 42, INITIAL_BLOCK_REWARD_SAT, 0);
+        t.check_reward_consensus().expect("identity chain, correct subsidy");
+        let bad = tmpl(42, 42, INITIAL_BLOCK_REWARD_SAT - 1, 0);
+        bad.check_reward_consensus().expect_err("wrong subsidy on identity chain");
     }
 }

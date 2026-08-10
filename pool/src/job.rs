@@ -92,6 +92,11 @@ impl Job {
             height:       tmpl.height,
             pow_solution: Vec::new(),
             shielded_transactions: Vec::new(),
+            // The pool mines Bloch natively (SIS PoW over the header
+            // preimage) — merged-mining proofs are built by the AuxPoW
+            // pool path, never here. Pre-activation blocks MUST be None
+            // to stay byte-identical on the wire (genesis-preserving).
+            auxpow: None,
         };
 
         let preimage = block.header.pow_preimage();
@@ -160,6 +165,49 @@ mod tests {
         job.block
             .validate_coinbase_value(t.total_fees)
             .expect("pool coinbase must satisfy consensus value rule");
+    }
+
+    /// End-to-end across the Emission V3 fork: a job cut from a
+    /// consensus-correct template passes the REAL consensus rule
+    /// (`validate_coinbase_value`) on both sides of the boundary, and a job
+    /// carrying the stale pre-fork subsidy at the fork is rejected by it.
+    ///
+    /// NOTE on heights: this test process never calls `set_node_chain_id`,
+    /// so `emission_height()` inside the validator is the identity — we
+    /// place the block at its EMISSION height directly, which exercises the
+    /// exact schedule the live G3 chain hits at local 40,000.
+    #[test]
+    fn coinbase_correct_across_emission_v3_fork() {
+        use bloch_crypto::core::tokenomics_v2::{
+            EMISSION_V3_FORK_EMISSION_HEIGHT, EMISSION_V3_INITIAL_REWARD_SAT,
+            INITIAL_BLOCK_REWARD_SAT, block_subsidy_sat,
+        };
+
+        for eh in [EMISSION_V3_FORK_EMISSION_HEIGHT - 1, EMISSION_V3_FORK_EMISSION_HEIGHT] {
+            let mut t = tmpl(0);
+            t.height = eh;
+            t.emission_height = eh;
+            t.subsidy_sat = block_subsidy_sat(eh);
+            let job = Job::build(&t, &[0x22u8; 20], "test-pool", "j1".into());
+            job.block
+                .validate_coinbase_value(t.total_fees)
+                .unwrap_or_else(|e| panic!("consensus rejected correct coinbase at emission h{}: {}", eh, e));
+        }
+
+        // Sanity: the boundary really flips 8,400 → 2,600.
+        assert_eq!(block_subsidy_sat(EMISSION_V3_FORK_EMISSION_HEIGHT - 1), INITIAL_BLOCK_REWARD_SAT);
+        assert_eq!(block_subsidy_sat(EMISSION_V3_FORK_EMISSION_HEIGHT), EMISSION_V3_INITIAL_REWARD_SAT);
+
+        // The failure mode this sprint exists to prevent: stale 8,400
+        // subsidy in the coinbase AT the fork → consensus rejects the block.
+        let mut stale = tmpl(0);
+        stale.height = EMISSION_V3_FORK_EMISSION_HEIGHT;
+        stale.emission_height = EMISSION_V3_FORK_EMISSION_HEIGHT;
+        stale.subsidy_sat = INITIAL_BLOCK_REWARD_SAT;
+        let job = Job::build(&stale, &[0x22u8; 20], "test-pool", "j1".into());
+        job.block
+            .validate_coinbase_value(stale.total_fees)
+            .expect_err("consensus must reject an 8,400-BLOCH coinbase at the V3 fork");
     }
 
     #[test]
