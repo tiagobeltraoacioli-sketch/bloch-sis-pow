@@ -13,6 +13,28 @@ RPC/API only, every node a seed); the **products** — the OSes, wallet, explore
 attestation — are **Postern Labs** (owned, rebranded off "Bloch"). Anyone may
 build products on the open protocol; Postern is one builder among many.
 
+> ## Live network — Genesis-3 mainnet (status as of 2026-08-09)
+> Much of this document predates the **Genesis-3 relaunch (2026-07-29)**. The
+> live mainnet is **Genesis-3** (chain id `0xB10C_0004`): a carry-over restart
+> (opening balance = 413,743 UTXOs / 3,475,441,200 BLOCH — `docs/CARRYOVER.md`)
+> whose chain-selected PoW is **SHA-256d** — ASIC-mined and **merged-mineable
+> with Bitcoin** (AuxPoW, active since local h=8,500 —
+> `docs/MERGED-MINING.md`). Current consensus state:
+> - **Difficulty-from-ancestry flag-day, local h=30,030 — ACTIVE.** Expected
+>   difficulty is a pure function of the block's own ancestry (commit
+>   `1f7d328`); older builds reject today's blocks.
+> - **Emission V3 flag-day, local h=40,000 (ETA ~2026-08-12/13)** — block
+>   reward 8,400 → 2,600 BLOCH, halvings every 1,555,200 blocks
+>   (`docs/specs/TOKENOMICS_V3.md`, ADR-035). Armed in the fleet binary
+>   (`c21e09d`), inert until the height.
+> - **From-scratch sync is not supported** (pre-2026-08-05 block bodies no
+>   longer exist on the network); new nodes bootstrap from a datadir snapshot
+>   (`docs/SNAPSHOT-BOOTSTRAP.md`). A poisoned `known_peers.json` self-heals
+>   on boot since `c21e09d` (PEX address fix).
+> The k-regime story in the caveat below concerns the **Bloch-SIS lattice
+> reference PoW chain**, not Genesis-3's SHA-256d; the maturity caveats
+> (nascent, low-hashrate, 51%-attackable, unaudited) apply to both.
+
 > ## 🔴 Hard caveat — read first
 > The chain is designated **mainnet beta** — a designation, **not** a security
 > claim. The **relaxed regime (k=4) currently applies** (residual checked on a

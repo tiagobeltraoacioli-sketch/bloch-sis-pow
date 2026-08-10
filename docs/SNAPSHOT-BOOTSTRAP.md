@@ -1,19 +1,44 @@
 # Bootstrap a node from a datadir snapshot (skip initial sync)
 
-Syncing a Genesis-3 node from scratch currently stalls (most recently around
-block **26474**): the DAG needs certain side-block ("red") bodies that peers no
-longer serve — bodies discarded before the retention fix (`4c0ba0c`) are gone
-from the fleet, so from-zero sync can't complete. Until the block-serving path
-is fixed in the node, bootstrap from a snapshot — a consistent copy of an
-already-synced **archival** node's data directory. Your node starts at the
-snapshot height and follows the chain live; no full IBD.
+**Syncing a Genesis-3 node from scratch does not work — and cannot be made to
+work by retrying or upgrading.** The DAG needs certain side-block ("red")
+bodies that no peer serves anymore: bodies discarded before the retention fix
+(`4c0ba0c`, 2026-08-05) are gone from the whole network, so from-zero IBD
+stalls (around block_count **26,474**) and can never complete. The supported
+onboarding path is a snapshot — a consistent copy of an already-synced
+**archival** node's data directory. Your node starts at the snapshot height
+and follows the chain live; no full IBD.
+
+## Which binary
+
+Run the **latest published release** (see the
+[releases page](https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow/releases));
+older builds actively diverge. Two consensus flag-days matter here:
+
+- **Difficulty-from-ancestry, local h=30,030 — already active.** The expected
+  difficulty of a block is now a pure function of the block's own ancestry
+  (parents carried in the header), so arrival order can no longer split
+  producer and validator. Builds older than commit `1f7d328`
+  (`genesis3-node-difficulty-choke-20260809`) reject today's blocks.
+- **Emission V3, local h=40,000 (ETA ~2026-08-12/13)** — block reward
+  8,400 → 2,600 BLOCH (`docs/specs/TOKENOMICS_V3.md`). Any binary without
+  commit `8538dea` forks off the network at that height. The fleet runs
+  commit `c21e09d`; if the latest release predates it, build from source
+  (`g3-integration`) before h=40,000.
+
+Since commit `c21e09d`, a stale or poisoned `known_peers.json` is pruned
+automatically on load (the PEX address-poisoning fix) — restoring an old
+datadir no longer requires deleting peer files by hand.
 
 ## Download
 
-Current snapshot — taken from the **block producer** at height **≈27,614 —
-above the h=27,600 difficulty-ancestry flag-day**, which mainnet has already
-crossed. Both fleet followers were restored from exactly this archive and
-converged with the producer (zero `invalid difficulty` rejections):
+Current published snapshot — taken from the **block producer** at height
+**≈27,614**. Note it sits **below the h=30,030 difficulty flag-day**: a node
+restored from it syncs the 27,614 → 30,030 stretch under the legacy
+(order-sensitive) difficulty rule and may freeze at a retarget boundary on the
+way up — if `block_count` stops climbing, restart the node and it resumes. A
+snapshot taken **above h=30,030** will replace this one as the recommended
+bootstrap; check the releases page for a newer `g3-datadir-snapshot-*` first:
 
 ```bash
 curl -fL -O https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow/releases/download/g3-datadir-snapshot-h27614-20260808/bloch-g3-datadir-snapshot-h27614-20260808.tar.gz
@@ -23,13 +48,12 @@ sha256sum -c bloch-g3-datadir-snapshot-h27614-20260808.tar.gz.sha256
 # expect: 12e813e42f92672352415f0fd03225f794ca37820d706ca2d7728aa0b53c3c4d
 ```
 
-> **Run it with the [`genesis3-node-flagday-h27600-rpcfix-20260808`](https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow/releases/tag/genesis3-node-flagday-h27600-rpcfix-20260808)
-> binary.** The consensus flag-day at height 27,600 (difficulty derived from
-> block ancestry) has **already passed**; every earlier binary is already
-> diverging from the network regardless of which snapshot it starts from.
-> A snapshot **below** h27,600 is equally unusable: it drops you into the
-> legacy, acceptance-order-dependent difficulty window, where followers freeze
-> at the first retarget boundary (`h % 60`).
+> **Run it with the newest binary** (see "Which binary" above — as of
+> 2026-08-09 that means `genesis3-node-difficulty-choke-20260809` or newer;
+> before local h=40,000 the binary must carry Emission V3). The release the
+> snapshot's own notes referenced at publication
+> (`genesis3-node-flagday-h27600-rpcfix-20260808`) is **superseded** and now
+> rejects the network's blocks — do not use it.
 
 - ~117 MB compressed, taken at height ≈27,614.
 - The archive contains a `g3-data/` RocksDB directory only. `p2p_identity.bin`
@@ -88,11 +112,14 @@ archive**, reached the live tip and tracked it in consensus with the producer.
 
 ## Known limitation: catching up a large gap may stall
 
-The snapshot removes the dead 26,474 wall, but the peer block-body-serving
-path has a live bug (under fix): a node backfilling a **large** gap (hundreds
-of blocks / snapshot hours stale) can freeze mid-catch-up with repeated
-`peer cannot serve block <hash> (pruned or unknown)` warnings even though its
-peers hold those bodies. Restore the snapshot **as soon as possible after
+The snapshot removes the dead 26,474 wall, but a node backfilling a **large**
+gap (hundreds of blocks / snapshot hours stale) can still freeze mid-catch-up
+with repeated `peer cannot serve block <hash> (pruned or unknown)` warnings
+even though its peers hold those bodies. The 2026-08-09 builds hardened this
+path — a backfill ingest guard (one stale peer can no longer halt ingestion)
+and the PEX `known_peers` fix (poisoned peer addresses were gray-listing
+nodes into a gossip blackhole; entries now self-heal on load) — but the
+operational advice stands: restore the snapshot **as soon as possible after
 downloading**, and if catch-up freezes (block_count stops climbing), **restart
 the node** (`SIGTERM`, never `kill -9`) — each restart resumes backfill. A
 node that reaches the tip tracks it reliably from then on.

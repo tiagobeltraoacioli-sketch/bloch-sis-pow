@@ -1,8 +1,20 @@
 # Migration: Tokenomics V1 → V2
 
+> ## ⚠️ HISTORICAL — completed migration; numbers below are twice superseded
+> This checklist migrated the code off V1 in 2026-05. The "V2" numbers it
+> targets (1B nominal, 1,905 reward, 150 s blocks, 70/25/5) were later
+> re-based by the Bloch-SIS B3b revision (21B nominal, 8,400 reward, 30 s
+> blocks, 100% miner — `crates/bloch-crypto/src/core/tokenomics_v2.rs`),
+> and the emission curve is superseded by **Emission V3** (2,600 BLOCH
+> initial, 1.5-year halvings) from emission height 453,743 / local height
+> 40,000 — see [`docs/specs/TOKENOMICS_V3.md`](./specs/TOKENOMICS_V3.md)
+> and ADR-035. There is no V2 → V3 migration checklist: V3 is a single
+> height-gated flag-day fork, deployed by upgrading the node binary before
+> local height 40,000.
+
 | Field | Value |
 |---|---|
-| **Status** | Engineering checklist |
+| **Status** | Historical (completed; superseded — see banner) |
 | **Date** | 2026-05-01 |
 | **Companion docs** | `docs/specs/TOKENOMICS_V2.md`, `docs/adr/ADR-028-tokenomics-v2-activation.md`, `docs/specs/historical/TOKENOMICS_V1_SUPERSEDED.md` |
 | **Estimated effort** | 4–6 days focused engineering |

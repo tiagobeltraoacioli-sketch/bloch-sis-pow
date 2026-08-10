@@ -8,6 +8,8 @@ network. This is the #1 reason a brand-new node "doesn't sync."
 The snapshot ships in this repo, gzip-compressed:
 
 - **`carryover.tsv.gz`** — 413,743 UTXOs, ~16 MB compressed (~50 MB unpacked)
+  — total **3,475,441,200 BLOCH** (= 413,743 × 8,400 exactly; consensus
+  constant `CARRYOVER_TOTAL_SAT`)
 - **`carryover.tsv.gz.sha256`** — checksums for both the compressed and the
   uncompressed file
 
