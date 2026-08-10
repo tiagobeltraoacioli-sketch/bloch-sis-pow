@@ -1,56 +1,95 @@
-// Halving schedule.
+// Emission schedule — V2 curve below the Emission V3 fork, V3 curve at/above it.
 //
-// THE THING THAT IS EASY TO GET WRONG: Bloch's subsidy is NOT a function of the
-// local block height you see in the explorer. Genesis-3 restarted the local
-// chain at height 0 but deliberately CONTINUES emission from where the carried
-// Genesis-1 ledger stopped, so the node offsets the height before computing the
-// subsidy:
+// TWO THINGS THAT ARE EASY TO GET WRONG:
 //
-//   emission_height(local) = local + CARRYOVER_SOURCE_HEIGHT     (413,743)
-//   subsidy(h)            = max(8400 >> (h / HALVING_INTERVAL), 100) BLOCH
+// 1. Bloch's subsidy is NOT a function of the local block height you see in the
+//    explorer. Genesis-3 restarted the local chain at height 0 but deliberately
+//    CONTINUES emission from where the carried Genesis-1 ledger stopped, so the
+//    node offsets the height before computing the subsidy:
 //
-// Source of truth, both consensus-critical:
+//      emission_height(local) = local + CARRYOVER_SOURCE_HEIGHT     (413,743)
+//
+// 2. Emission V3 (flag-day hard fork at emission height 453,743 = LOCAL 40,000)
+//    replaces the curve at/above the fork, NON-retroactively:
+//
+//      below the fork:  subsidy(h) = max(8400 >> (h / 1,036,800), 100)   — V2, verbatim
+//      at/above it:     epoch  = (h − 453,743) / 1,555,200               — counter RESTARTS
+//                       subsidy = max(2600 >> epoch, 100)
+//
+//    The first V3 halving is therefore counted FROM THE FORK, not from any
+//    absolute-height multiple.
+//
+// Source of truth, all consensus-critical (commit c21e09d):
 //   crates/bloch-crypto/src/core/mod.rs            → emission_height(), CARRYOVER_SOURCE_HEIGHT
-//   crates/bloch-crypto/src/core/tokenomics_v2.rs  → block_subsidy_sat(), HALVING_INTERVAL
-//
-// Reading the halving off the raw local height would put the first one at local
-// 1,036,800 — roughly 413,743 blocks (~5 months) later than it actually lands.
+//   crates/bloch-crypto/src/core/tokenomics_v2.rs  → block_subsidy_sat(), EMISSION_V3_* constants
 
 /** Absolute emission height the carried ledger stopped at. */
 export const CARRYOVER_SOURCE_HEIGHT = 413_743;
-/** Blocks per halving epoch — ~1 year at the 30 s target (360 × 2880). */
-export const HALVING_INTERVAL = 1_036_800;
-export const INITIAL_REWARD_BLOCH = 8_400;
+export const TARGET_BLOCK_SECS = 30;
 /** Perpetual tail: the subsidy never falls below this, so emission never ends. */
 export const TAIL_FLOOR_BLOCH = 100;
-/** Epoch at which `8400 >> n` drops under the tail floor and the floor takes over. */
-export const TAIL_ACTIVATION_EPOCH = 7;
-export const TARGET_BLOCK_SECS = 30;
+
+// ── Legacy V2 curve (governs emission heights BELOW the V3 fork) ──────────
+export const V2_HALVING_INTERVAL = 1_036_800; // ~1 year @ 30 s (360 × 2880)
+export const V2_INITIAL_REWARD_BLOCH = 8_400;
+
+// ── Emission V3 (flag-day hard fork) ──────────────────────────────────────
+/** V3 fork in EMISSION-height space: 453,743 = local 40,000 + carryover offset. */
+export const EMISSION_V3_FORK_EMISSION_HEIGHT = 453_743;
+/** The same fork expressed in node-LOCAL height (what the explorer shows). */
+export const EMISSION_V3_FORK_LOCAL_HEIGHT = 40_000;
+export const EMISSION_V3_INITIAL_REWARD_BLOCH = 2_600;
+/** Blocks per V3 halving epoch — ~1.5 years at the 30 s target (1.5 × 1,036,800). */
+export const EMISSION_V3_HALVING_INTERVAL = 1_555_200;
+/** First V3 epoch on the floor: 2600 >> 4 = 162 ≥ 100 but 2600 >> 5 = 81 < 100. */
+export const EMISSION_V3_TAIL_ACTIVATION_EPOCH = 5;
+
+// Backwards-compatible aliases (post-fork era values).
+export const HALVING_INTERVAL = EMISSION_V3_HALVING_INTERVAL;
+export const INITIAL_REWARD_BLOCH = EMISSION_V3_INITIAL_REWARD_BLOCH;
 
 /** Absolute emission height for a local Genesis-3 height. */
 export function emissionHeight(localHeight: number): number {
   return localHeight + CARRYOVER_SOURCE_HEIGHT;
 }
 
-/** Block subsidy in whole BLOCH at an ABSOLUTE emission height. */
+/**
+ * Block subsidy in whole BLOCH at an ABSOLUTE emission height.
+ * Mirrors `block_subsidy_sat` (tokenomics_v2.rs) exactly, including the V3 gate.
+ */
 export function subsidyBloch(absHeight: number): number {
-  const epoch = Math.floor(absHeight / HALVING_INTERVAL);
-  const geometric = epoch >= 64 ? 0 : Math.floor(INITIAL_REWARD_BLOCH / 2 ** epoch);
+  if (absHeight >= EMISSION_V3_FORK_EMISSION_HEIGHT) {
+    const epoch = Math.floor(
+      (absHeight - EMISSION_V3_FORK_EMISSION_HEIGHT) / EMISSION_V3_HALVING_INTERVAL,
+    );
+    const geometric =
+      epoch >= 64 ? 0 : Math.floor(EMISSION_V3_INITIAL_REWARD_BLOCH / 2 ** epoch);
+    return Math.max(geometric, TAIL_FLOOR_BLOCH);
+  }
+  const epoch = Math.floor(absHeight / V2_HALVING_INTERVAL);
+  const geometric = epoch >= 64 ? 0 : Math.floor(V2_INITIAL_REWARD_BLOCH / 2 ** epoch);
   return Math.max(geometric, TAIL_FLOOR_BLOCH);
 }
 
 export interface Halving {
-  /** Current epoch index (0 = the 8,400 BLOCH era). */
+  /**
+   * What the next reward change IS: the one-off V3 fork step (8,400 → 2,600),
+   * or an ordinary V3 halving after it.
+   */
+  kind: "fork" | "halving";
+  /** V3 epoch index (0 = the 2,600 BLOCH era). −1 while still pre-fork. */
   epoch: number;
   /** Absolute emission height right now. */
   absHeight: number;
-  /** LOCAL height at which the next halving lands — what the explorer shows. */
+  /** LOCAL height at which the next reward change lands — what the explorer shows. */
   nextLocalHeight: number;
-  /** Absolute height of the next halving. */
+  /** Absolute height of the next reward change. */
   nextAbsHeight: number;
   blocksRemaining: number;
-  /** 0..1 through the current epoch. */
+  /** 0..1 through the current era (pre-fork: Genesis-3 → fork). */
   progress: number;
+  /** Total blocks in the current era (denominator of `progress`). */
+  eraBlocks: number;
   rewardNow: number;
   rewardNext: number;
   /** True once the tail floor holds and no further halving changes the reward. */
@@ -59,18 +98,44 @@ export interface Halving {
 
 export function halvingAt(localHeight: number): Halving {
   const absHeight = emissionHeight(localHeight);
-  const epoch = Math.floor(absHeight / HALVING_INTERVAL);
-  const nextAbsHeight = (epoch + 1) * HALVING_INTERVAL;
+
+  if (absHeight < EMISSION_V3_FORK_EMISSION_HEIGHT) {
+    // Pre-fork: the next reward change is the Emission V3 flag-day itself.
+    // (The fork lands before the V2 curve's first halving, so the whole
+    // pre-fork era is the flat 8,400 BLOCH epoch — const-asserted in the node.)
+    return {
+      kind: "fork",
+      epoch: -1,
+      absHeight,
+      nextLocalHeight: EMISSION_V3_FORK_LOCAL_HEIGHT,
+      nextAbsHeight: EMISSION_V3_FORK_EMISSION_HEIGHT,
+      blocksRemaining: Math.max(0, EMISSION_V3_FORK_LOCAL_HEIGHT - localHeight),
+      progress: Math.min(1, Math.max(0, localHeight / EMISSION_V3_FORK_LOCAL_HEIGHT)),
+      eraBlocks: EMISSION_V3_FORK_LOCAL_HEIGHT,
+      rewardNow: subsidyBloch(absHeight),
+      rewardNext: EMISSION_V3_INITIAL_REWARD_BLOCH,
+      tailReached: false,
+    };
+  }
+
+  // Post-fork: epochs are counted FROM THE FORK.
+  const sinceFork = absHeight - EMISSION_V3_FORK_EMISSION_HEIGHT;
+  const epoch = Math.floor(sinceFork / EMISSION_V3_HALVING_INTERVAL);
+  const nextAbsHeight =
+    EMISSION_V3_FORK_EMISSION_HEIGHT + (epoch + 1) * EMISSION_V3_HALVING_INTERVAL;
   const nextLocalHeight = nextAbsHeight - CARRYOVER_SOURCE_HEIGHT;
   const rewardNow = subsidyBloch(absHeight);
   const rewardNext = subsidyBloch(nextAbsHeight);
   return {
+    kind: "halving",
     epoch,
     absHeight,
     nextLocalHeight,
     nextAbsHeight,
     blocksRemaining: Math.max(0, nextLocalHeight - localHeight),
-    progress: (absHeight - epoch * HALVING_INTERVAL) / HALVING_INTERVAL,
+    progress:
+      (sinceFork - epoch * EMISSION_V3_HALVING_INTERVAL) / EMISSION_V3_HALVING_INTERVAL,
+    eraBlocks: EMISSION_V3_HALVING_INTERVAL,
     rewardNow,
     rewardNext,
     tailReached: rewardNow === TAIL_FLOOR_BLOCH && rewardNext === TAIL_FLOOR_BLOCH,
