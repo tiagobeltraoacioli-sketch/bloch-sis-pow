@@ -4,7 +4,7 @@
 **Date:** 2026-08-09
 **Related:** `docs/specs/TOKENOMICS_V3.md` (normative spec), ADR-028 (V2 activation), ADR-010 lineage (historical emission doctrine)
 **Supersedes:** the emission curve of ADR-028 / `docs/specs/TOKENOMICS_V2.md` from emission height 453,743 onward
-**Code:** commit `8538dea` (`crates/bloch-crypto/src/core/tokenomics_v2.rs`)
+**Code:** commits `8538dea` (V3 fork) + `a85b0e0` (PISO-60 tail floor) (`crates/bloch-crypto/src/core/tokenomics_v2.rs`)
 
 ---
 
@@ -76,7 +76,7 @@ A height-gated flag-day hard fork, **Emission V3**:
   closes at 7,959,513,600, tail 60 from emission height 9,784,943).
   Realized emission is paid per accepted DAG block and can slightly exceed
   the per-height sum — the figure is a floor, not a cap.
-- CONSENSUS CHANGE: nodes on binaries without commit `8538dea` fork off the
+- CONSENSUS CHANGE: nodes on binaries without commit `a85b0e0` fork off the
   network at local height 40,000 — coordinated flag-day deployment of the
   fleet and public release before that height is mandatory.
 - Tests pin: exhaustive pre-fork non-regression (all 453,743 heights), the
