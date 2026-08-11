@@ -46,11 +46,13 @@ pub mod params;
 pub mod tokenomics_v4;
 pub mod rewards;
 pub mod sample;
+pub mod schedule;
 
 pub use attestation::{Attestation, AttestationData, RejectReason, SignatureVerifier};
 pub use forkchoice::{BlockTree, LatestMessage, Store};
 pub use params::{COMMITTEE_SIZE, SLOTS_PER_EPOCH, SLOT_SUBCOMMITTEE_SIZE};
 pub use sample::{is_selected, sample, Role, Validator};
+pub use schedule::{epoch_schedule, proposer, EpochSchedule};
 
 /// Draw the per-slot fork-choice subcommittee.
 pub fn slot_subcommittee(beacon_mix: &[u8; 32], slot: u64, validators: &[Validator]) -> Vec<u32> {
