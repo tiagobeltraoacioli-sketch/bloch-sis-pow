@@ -108,7 +108,10 @@ but it is not free: a node syncing from scratch trusts the Foundation's
 checkpoint. Two mitigations worth building in from the start — publish
 checkpoints under an *m-of-n* key held by parties beyond the Foundation, and
 set an explicit review date at which the arrangement is reconsidered rather
-than letting it become permanent by default.
+than letting it become permanent by default. Both are adopted with concrete
+parameters in `BLOCH-WEAK-SUBJECTIVITY.md` §6 (phased 2-of-3 → 3-of-5 with a
+client-enforced external-signer minimum; 12-month review with a hard stop at
+15 months).
 
 ### 5.4 The taint list is an unaudited power
 

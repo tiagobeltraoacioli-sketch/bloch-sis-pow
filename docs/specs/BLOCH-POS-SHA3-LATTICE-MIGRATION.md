@@ -241,9 +241,10 @@ creates a validator set at all. Its length is determined by §11, not by §12.
 | `EPOCHS_PER_CHECKPOINT` | 1 | Justification per epoch; finality ≈ 32 min |
 | `MIN_DEPOSIT_BLCH` | 100,000 | Sized so a validator set of ~1,000 is reachable from realistic untainted float |
 | `MAX_VALIDATOR_STAKE` | 1% of active stake | §4.1.3 |
-| `COMMITTEE_SIZE` | **128** | Raised from 64 — the epoch cadence pays for it, §6.5 |
-| `SLOT_SUBCOMMITTEE_SIZE` | **8** | Per-slot fork-choice weight only, §6.5.2 |
-| `ATTESTATION_CADENCE` | **epoch boundary** | Full committee votes once per epoch, not once per slot |
+| ~~`COMMITTEE_SIZE`~~ | **removed** | Replaced by partitioning — see §6.5.3 |
+| ~~`SLOT_SUBCOMMITTEE_SIZE`~~ | **removed** | Same |
+| Committee size | **derived: `ceil(N / 32)`** | The active set is partitioned, not sampled |
+| `ATTESTATION_CADENCE` | **once per validator per epoch** | Each validator serves in exactly one slot committee |
 | `ACTIVATION_DELAY_EPOCHS` | 8 | ~2.1 h |
 | `EXIT_DELAY_EPOCHS` | 32 | ~8.5 h |
 | `WITHDRAWAL_DELAY_EPOCHS` | 2,048 | ~22.8 days; weak-subjectivity margin |
@@ -541,7 +542,47 @@ question. And **the cost is exactly linear in N** (0.41% spread across four
 distinct signature pairs, zero fixed overhead), so batching buys nothing in the
 guest: any saving must come from the proof system itself.
 
-#### 6.5.2 Per-slot subcommittee — why epoch-only voting is not enough
+#### 6.5.3 Partition, do not sample — the F1 correction
+
+The adversarial review found that the sampled design has **no coherent quorum
+denominator**, and that both readings fail:
+
+| Denominator | Failure |
+|---|---|
+| Network stake | A 128-validator sample cannot hold ⅔ of network stake past ~192 validators — and gate G4 *requires* ≥ 200. **Finality structurally unreachable**; the inactivity leak fires forever |
+| Committee stake | A 128-sample has enough variance that a ~30%-stake adversary exceeds ⅓ of the committee in roughly one epoch in five, stalling finality below the nominal threshold |
+
+**The fix is to partition the active set rather than sample it.** Shuffle
+deterministically, cut into 32 committees, one per slot. Every validator lands
+in exactly one committee and votes exactly once per epoch, so the union of an
+epoch's committees *is* the active set. The denominator is then total active
+stake, unambiguous and reachable by construction — the property Ethereum has,
+which the sampled design gave up without noticing what it was buying.
+
+It also removes finding **F2**. Under independent per-slot draws a validator was
+routinely drawn in several slots of one epoch and emitted several attestations
+sharing a `target_epoch`, which `is_double_vote` correctly flags as slashable.
+Honest validators slashed themselves, and the reward was harvestable. Under a
+partition, two attestations sharing a target epoch really are equivocation.
+
+**Cost, stated honestly.** One hybrid signature per active validator per epoch,
+against 384 under the sampled design:
+
+| Validators | Sampled | Partitioned | Per slot | KB/slot |
+|---:|---:|---:|---:|---:|
+| 200 | 384 | 200 | 7 | 31 |
+| 384 | 384 | 384 | 12 | 54 |
+| 1,000 | 384 | 1,000 | 32 | 143 |
+| 4,096 | 384 | 4,096 | 128 | 574 |
+
+Partitioning is **cheaper below 384 validators** — where gate G4 puts the launch
+— and more expensive above. The scaling ceiling is around 4,096 validators, past
+which sub-sampling would have to return and F1 with it. Aggregation would lift
+the ceiling; the measured in-circuit cost (§6.5.1) says that is research, not
+engineering. Recording the ceiling now is better than discovering it at 5,000
+validators.
+
+#### 6.5.2 Per-slot subcommittee — superseded by §6.5.3
 
 Epoch-only voting removes the per-slot attestation weight that LMD-GHOST uses
 for fork choice. Without it, intra-epoch reorgs become cheap: ordering inside an
@@ -960,7 +1001,9 @@ engineering.
    The question that replaces it is narrower and practical — publish under an
    *m-of-n* key held beyond the Foundation, with an explicit review date, so the
    arrangement does not become permanent by inertia
-   (`BLOCH-ENTITY-STRUCTURE.md` §5.3).
+   (`BLOCH-ENTITY-STRUCTURE.md` §5.3). The mechanism — checkpoint format,
+   cadence, boot consumption, and the m-of-n/review-date parameters — is
+   specified in [`BLOCH-WEAK-SUBJECTIVITY.md`](BLOCH-WEAK-SUBJECTIVITY.md).
 6. ~~**Do nothing** — fix the difficulty defect and stay on PoW.~~ **Overtaken
    by events.** The founder decided on a Genesis-4 relaunch with new tokenomics
    on 2026-08-10, so the live chain is not the thing being changed; it is being

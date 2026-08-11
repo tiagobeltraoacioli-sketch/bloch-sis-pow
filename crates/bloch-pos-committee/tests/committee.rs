@@ -1009,3 +1009,128 @@ fn empty_registry_does_not_divide_by_zero() {
     assert!(r.validators().is_empty());
     assert!(slot_subcommittee(&MIX, 1, &r.validators()).is_empty());
 }
+
+// ── particao de epoca (correcao do F1) ──────────────────────────────────────
+
+use bloch_pos_committee::committees::{
+    committee_for_slot, epoch_committees, is_supermajority, total_active_stake,
+};
+
+#[test]
+fn every_validator_serves_exactly_once_per_epoch() {
+    // A propriedade que conserta o F1: a uniao dos comites de uma epoca E o
+    // conjunto ativo, entao o denominador do quorum e alcancavel por
+    // construcao. Amostrar 128 nunca alcanca 2/3 do stake da rede.
+    let vs = uniform_set(500, 100_000);
+    let cs = epoch_committees(&MIX, 7, &vs);
+    assert_eq!(cs.len(), SLOTS_PER_EPOCH as usize);
+
+    let mut all: Vec<u32> = cs.iter().flatten().copied().collect();
+    all.sort_unstable();
+    let mut expected: Vec<u32> = (0..500u32).collect();
+    expected.sort_unstable();
+    assert_eq!(all, expected, "a uniao dos comites deve ser o conjunto ativo");
+
+    let mut dedup = all.clone();
+    dedup.dedup();
+    assert_eq!(dedup.len(), all.len(), "nenhum validador em dois comites");
+}
+
+#[test]
+fn partition_fixes_the_self_slashing_hazard() {
+    // F2: com sorteios independentes por slot, um validador honesto aparecia em
+    // varios slots da mesma epoca e emitia varias atestacoes com o mesmo
+    // target_epoch — que is_double_vote marca como ofensa. Sob particao ele
+    // atesta uma vez so, entao duas atestacoes com o mesmo alvo sao mesmo
+    // equivocacao.
+    let vs = uniform_set(300, 100_000);
+    for epoch in 0..8u64 {
+        let cs = epoch_committees(&MIX, epoch, &vs);
+        for v in 0..300u32 {
+            let n = cs.iter().filter(|c| c.contains(&v)).count();
+            assert_eq!(n, 1, "validador {v} servindo {n} vezes na epoca {epoch}");
+        }
+    }
+}
+
+#[test]
+fn partition_is_independent_of_input_order() {
+    let vs = uniform_set(400, 100_000);
+    let mut rev = vs.clone();
+    rev.reverse();
+    assert_eq!(epoch_committees(&MIX, 3, &vs), epoch_committees(&MIX, 3, &rev));
+}
+
+#[test]
+fn partition_is_deterministic_and_moves_with_its_inputs() {
+    let vs = uniform_set(400, 100_000);
+    assert_eq!(epoch_committees(&MIX, 3, &vs), epoch_committees(&MIX, 3, &vs));
+    assert_ne!(epoch_committees(&MIX, 3, &vs), epoch_committees(&MIX, 4, &vs));
+    assert_ne!(epoch_committees(&MIX, 3, &vs), epoch_committees(&[9u8; 32], 3, &vs));
+}
+
+#[test]
+fn committee_sizes_differ_by_at_most_one() {
+    for n in [200u32, 384, 500, 1000] {
+        let vs = uniform_set(n, 100_000);
+        let cs = epoch_committees(&MIX, 1, &vs);
+        let lo = cs.iter().map(|c| c.len()).min().unwrap();
+        let hi = cs.iter().map(|c| c.len()).max().unwrap();
+        assert!(hi - lo <= 1, "n={n}: tamanhos de {lo} a {hi}");
+        assert_eq!(cs.iter().map(|c| c.len()).sum::<usize>(), n as usize);
+    }
+}
+
+#[test]
+fn ineligible_validators_are_never_assigned() {
+    let mut vs = uniform_set(100, 100_000);
+    for v in vs.iter_mut().take(40) {
+        v.effective_stake = 0;
+    }
+    let cs = epoch_committees(&MIX, 1, &vs);
+    let all: Vec<u32> = cs.iter().flatten().copied().collect();
+    assert_eq!(all.len(), 60);
+    assert!(all.iter().all(|v| *v >= 40));
+}
+
+#[test]
+fn fewer_validators_than_slots_leaves_empty_committees() {
+    let vs = uniform_set(5, 100_000);
+    let cs = epoch_committees(&MIX, 1, &vs);
+    assert_eq!(cs.iter().filter(|c| !c.is_empty()).count(), 5);
+    assert_eq!(cs.iter().flatten().count(), 5);
+    // Conjunto vazio nao quebra e nao inventa membro.
+    let empty = epoch_committees(&MIX, 1, &[]);
+    assert_eq!(empty.len(), SLOTS_PER_EPOCH as usize);
+    assert!(empty.iter().all(|c| c.is_empty()));
+}
+
+#[test]
+fn committee_for_slot_selects_the_right_slice() {
+    let vs = uniform_set(200, 100_000);
+    let cs = epoch_committees(&MIX, 2, &vs);
+    for i in 0..SLOTS_PER_EPOCH {
+        let slot = 2 * SLOTS_PER_EPOCH + i;
+        assert_eq!(committee_for_slot(&MIX, slot, &vs), cs[i as usize]);
+    }
+}
+
+#[test]
+fn quorum_is_exact_at_two_thirds_and_reachable() {
+    // Aritmetica inteira: 2/3 exato justifica, um satoshi abaixo nao.
+    assert!(is_supermajority(2, 3));
+    assert!(!is_supermajority(1, 3));
+    assert!(is_supermajority(67, 100));
+    assert!(!is_supermajority(66, 100));
+    assert!(!is_supermajority(0, 0), "conjunto vazio nao auto-justifica");
+    assert!(is_supermajority(u128::MAX, u128::MAX), "sem overflow no topo");
+
+    // E o ponto do F1: o denominador e alcancavel, porque a uniao dos comites
+    // e o conjunto ativo.
+    let vs = uniform_set(300, 100_000);
+    let total = total_active_stake(&vs);
+    let cs = epoch_committees(&MIX, 1, &vs);
+    let reachable: u128 = cs.iter().flatten().count() as u128 * 100_000;
+    assert_eq!(reachable, total);
+    assert!(is_supermajority(reachable, total));
+}
