@@ -95,6 +95,13 @@ pub const DS_SLASH: [u8; 16] = *b"BLCH4:SLASH\0\0\0\0\0";
 /// distinct tag and the spec table needs the row added (flagged in
 /// `BLOCH-POS-INTERFACES.md`).
 pub const DS_PROPOSE: [u8; 16] = *b"BLCH4:PROPOSE\0\0\0";
+/// Deposit proof-of-possession domain (§6.1, §7.1). A PoP bound to its own
+/// domain cannot be replayed as an attestation or a block signature — the tag
+/// is what makes a signature mean one thing only.
+/// Voluntary-exit signing domain (§7.2). Not in the §6.1 table by name, but
+/// the exit is "a hybrid-signed message" and every signed message gets its own
+/// tag; all tags are fixed 16 bytes, so no tag can prefix another.
+pub const DS_EXIT: [u8; 16] = *b"BLCH4:EXIT\0\0\0\0\0\0";
 
 /// Role tags, mixed into the sortition seed so the per-slot subcommittee is not
 /// a predictable subset of the epoch committee.
