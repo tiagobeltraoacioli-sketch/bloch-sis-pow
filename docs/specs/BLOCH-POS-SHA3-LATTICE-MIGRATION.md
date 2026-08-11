@@ -488,7 +488,7 @@ figures, from `spikes/prover-cost/`:
 |---|---|---|---|
 | Committee 64, **every slot** | 308.7 GB | 286.8 KB | 15.52 M |
 | Committee 128, **epoch only** | 19.3 GB | 17.9 KB | 0.97 M |
-| **Committee 128 epoch + 8 per slot** (chosen) | **57.9 GB** | **53.8 KB** | **2.91 M** |
+| **Committee 128 epoch + 8 per slot** (**adopted**, founder decision 2026-08-10) | **57.9 GB** | **53.8 KB** | **2.91 M** |
 
 Per-slot voting made the quorum the dominant term in block size and forced the
 committee down to 64. Epoch-boundary voting removes that pressure entirely: the
@@ -937,13 +937,21 @@ engineering.
    the price of keeping both the ZK ledger and taint-based eligibility, and it
    interacts with fungibility and with exchange listing (already blocked on PQ
    custody).
-5. **Weak subjectivity.** What is the published checkpoint distribution
-   mechanism, and who signs it in an ownerless system? This is the sharpest
-   philosophical conflict PoS creates for Bloch and has no clean answer yet.
-6. **Do nothing.** Fixing the order-dependent difficulty defect (§2) and
-   keeping PoW with merged mining is a legitimate alternative that achieves
-   part of the same stability goal at a fraction of the risk. Phase 0 should
-   weigh it seriously rather than treat this document as the only option.
+5. ~~**Weak subjectivity** — who signs the checkpoint in an ownerless system?~~
+   **Answered by [ADR-036](../adr/ADR-036-retract-ownerless-adopt-foundation.md):**
+   the ownerless premise is retracted and the Foundation publishes checkpoints.
+   The question that replaces it is narrower and practical — publish under an
+   *m-of-n* key held beyond the Foundation, with an explicit review date, so the
+   arrangement does not become permanent by inertia
+   (`BLOCH-ENTITY-STRUCTURE.md` §5.3).
+6. ~~**Do nothing** — fix the difficulty defect and stay on PoW.~~ **Overtaken
+   by events.** The founder decided on a Genesis-4 relaunch with new tokenomics
+   on 2026-08-10, so the live chain is not the thing being changed; it is being
+   replaced. This option is retained only as history — it was the right question
+   to ask while the alternative was amending the running chain.
+7. **Attestation cadence** — ~~per-slot vs epoch-boundary voting~~ **decided**:
+   the hybrid, 8 per slot for fork-choice weight plus 128 at the epoch boundary
+   for finality (§6.5.2). Confirmed 2026-08-10.
 
 ---
 
