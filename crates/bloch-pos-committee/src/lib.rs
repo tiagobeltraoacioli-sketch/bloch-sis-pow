@@ -46,11 +46,17 @@ pub mod params;
 pub mod tokenomics_v4;
 pub mod rewards;
 pub mod sample;
+pub mod staking;
 
 pub use attestation::{Attestation, AttestationData, RejectReason, SignatureVerifier};
 pub use forkchoice::{BlockTree, LatestMessage, Store};
 pub use params::{COMMITTEE_SIZE, SLOTS_PER_EPOCH, SLOT_SUBCOMMITTEE_SIZE};
 pub use sample::{is_selected, sample, Role, Validator};
+pub use staking::{
+    resolve_activations, validate_deposit, validate_exit, validate_withdrawal, DepositInput,
+    DepositReject, DepositTx, ExitReject, ExitTx, HybridKeyVerifier, QueuedDeposit,
+    ValidatorRecord, WithdrawReject,
+};
 
 /// Draw the per-slot fork-choice subcommittee.
 pub fn slot_subcommittee(beacon_mix: &[u8; 32], slot: u64, validators: &[Validator]) -> Vec<u32> {
