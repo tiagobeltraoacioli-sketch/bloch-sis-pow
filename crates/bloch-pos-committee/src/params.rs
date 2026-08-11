@@ -46,6 +46,10 @@ pub const MAX_DRAWS_PER_SLOT: usize = 4096;
 pub const DS_SORTITION: [u8; 16] = *b"BLCH4:SORTIT\0\0\0\0";
 /// Attestation signing root domain.
 pub const DS_ATTEST: [u8; 16] = *b"BLCH4:ATTEST\0\0\0\0";
+/// State SMT node domain (§6.1) — every hash in [`crate::state_root`] starts
+/// with this tag so a state-tree node can never collide with a block id, a
+/// transaction Merkle node, or any other SHA3 use in the protocol.
+pub const DS_STATE: [u8; 16] = *b"BLCH4:STATE\0\0\0\0\0";
 
 /// Role tags, mixed into the sortition seed so the per-slot subcommittee is not
 /// a predictable subset of the epoch committee.
