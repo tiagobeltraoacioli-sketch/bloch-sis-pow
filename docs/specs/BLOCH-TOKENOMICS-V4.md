@@ -233,7 +233,7 @@ full 5.45%.
 For reference, Bloch's year-1 inflation of 5.45% lands almost exactly on
 Solana's current 5.5–5.9%.
 
-### 6.3.1 This requires delegation — a new subsystem
+### 6.3.1 Delegation — implemented (`crates/bloch-pos-committee/src/delegation.rs`)
 
 Commission is meaningless without delegated stake, and pro-rata-to-all-stake
 rewards only make sense if stake can sit behind an operator without running
@@ -241,14 +241,45 @@ one. **The Solana revenue model cannot be adopted without adding delegation**,
 which the PoS design does not currently have: validators deposit directly with
 a 100,000 BLCH minimum.
 
-Delegation is not a small addition. It brings stake accounts, a delegate/undelegate
-lifecycle, commission accounting, and per-epoch reward distribution across
-potentially many delegators per validator. It also cuts both ways for
-decentralisation: it removes the 100,000 BLCH barrier to participation (minimum
-delegation is proposed at 10 BLCH), but it lets large operators accumulate
-delegated stake, and it gives an insider bucket a way to spread holdings across
-many validators while retaining economic control. The §7A concentration model
-does not currently account for that.
+Four rules make delegation safe to add:
+
+| Rule | Value | Why |
+|---|---|---|
+| Warm-up / cool-down rate limit | 9% of active stake per epoch | Committees are stake-weighted, so instant activation is instant control. Matches Solana |
+| Delegated stake counts toward the per-validator cap | 1% of active stake | Delegation must not be a route around §4.1 |
+| Delegators are exposed to slashing | pro-rata | Otherwise delegation is all yield and no risk, and nobody cares who they delegate to |
+| Tainted coins cannot delegate | — | §4.1 follows coins, not accounts; otherwise delegation launders eligibility |
+
+Two implementation findings worth recording, because both were wrong in the
+first cut:
+
+- **The cap must be resolved by fixed-point iteration, not measured against the
+  uncapped total.** Against the uncapped total, an operator holding 90% of raw
+  stake among a hundred is clamped to 9.99M versus 1M for everyone else — still
+  ten times any peer, 9.2% of effective weight, present in over half of all
+  committees. The cap's strength degrades exactly as concentration rises, which
+  is when it is needed. Iterating to a fixed point clamps that same operator to
+  1.0%, level with a normal validator: a ninefold improvement. The iteration is
+  safe to specify — clamping only lowers the total, which only lowers the cap,
+  so it is monotone and converges — and the round count is fixed so every node
+  stops at the same number.
+- **The rate limit needs a liveness escape.** A strict 9% budget deadlocks
+  forever on any single delegation larger than 9% of active stake, which on a
+  young network is most of them, and deadlocks at genesis where active stake is
+  zero. Genesis is unlimited, and thereafter the head of the queue always
+  progresses even if it exceeds the budget — bounding disruption to one record
+  per epoch while guaranteeing the queue drains.
+
+**Decentralisation cuts both ways**, and this is now measurable rather than
+asserted: `Registry::top_share_bps` and `Registry::nakamoto_coefficient` compute
+gates G2 and G3 directly from the delegation set, closing the gap §7A left open.
+The Nakamoto coefficient is computed at the **one-third** threshold — the point
+at which a two-thirds quorum can be stalled — not one half, which would flatter
+the figure.
+
+The honest limit: those metrics see the *operator* view, which is what consensus
+sees. They cannot see one beneficial owner standing behind several delegators,
+and no on-chain metric can.
 
 ### 6.3.2 Conflict to resolve: fee burn versus "100% of fees"
 

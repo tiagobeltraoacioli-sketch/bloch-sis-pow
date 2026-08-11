@@ -800,3 +800,167 @@ fn nominal_yield_exceeds_inflation_when_not_all_supply_is_staked() {
     assert!(y > 545, "yield {y}bps deveria superar a inflacao de 545bps");
     assert_eq!(y, 817); // 8,17%
 }
+
+// ── delegacao ───────────────────────────────────────────────────────────────
+
+use bloch_pos_committee::delegation::{self, Delegation, Registry, StakeState};
+
+fn deleg(delegator: u32, validator: u32, bloch: u128, epoch: u64) -> Delegation {
+    Delegation {
+        delegator, validator,
+        amount_sat: bloch * tk::SAT_PER_BLOCH,
+        requested_epoch: epoch, deactivate_epoch: None, eligible: true,
+    }
+}
+
+#[test]
+fn delegation_activates_and_counts_as_validator_stake() {
+    let ds = vec![deleg(1, 10, 1_000_000, 0), deleg(2, 10, 500_000, 0)];
+    let r = Registry::resolve(&ds, 5);
+    assert_eq!(r.stake_of(10), 1_500_000 * tk::SAT_PER_BLOCH);
+    assert_eq!(r.validators().len(), 1);
+}
+
+#[test]
+fn dust_and_tainted_delegations_never_count() {
+    let mut small = deleg(1, 10, 1, 0);
+    small.amount_sat = delegation::MIN_DELEGATION_SAT - 1;
+    let mut tainted = deleg(2, 10, 1_000_000, 0);
+    tainted.eligible = false; // §4.1: coins carry the ineligibility
+    let r = Registry::resolve(&[small, tainted], 10);
+    assert_eq!(r.stake_of(10), 0);
+    assert_eq!(r.total_active(), 0);
+    assert_eq!(r.state_of(&tainted), StakeState::Inactive);
+}
+
+#[test]
+fn warmup_is_rate_limited_so_stake_cannot_seize_the_set_in_one_epoch() {
+    // A large incumbent, then a whale that tries to activate everything at once.
+    let mut ds = vec![deleg(1, 10, 100_000_000, 0)];
+    for i in 0..20u32 {
+        ds.push(deleg(100 + i, 20, 10_000_000, 1));
+    }
+    let e1 = Registry::resolve(&ds, 1);
+    let e40 = Registry::resolve(&ds, 40);
+    assert!(e1.stake_of(20) < e40.stake_of(20),
+        "a baleia entrou inteira numa epoca so: {} vs {}", e1.stake_of(20), e40.stake_of(20));
+    // And eventually it all lands.
+    assert_eq!(e40.stake_of(20), 200_000_000 * tk::SAT_PER_BLOCH);
+}
+
+#[test]
+fn registry_is_independent_of_input_order() {
+    // The consensus bug found in the sampling path: output must depend on the
+    // set, never on how the caller ordered it.
+    let ds = vec![deleg(1, 10, 1_000, 0), deleg(2, 20, 2_000, 0), deleg(3, 30, 3_000, 1)];
+    let mut rev = ds.clone();
+    rev.reverse();
+    let a = Registry::resolve(&ds, 6);
+    let b = Registry::resolve(&rev, 6);
+    assert_eq!(a.validators(), b.validators());
+    assert_eq!(a.total_active(), b.total_active());
+}
+
+#[test]
+fn validators_come_out_sorted_and_capped() {
+    // One operator with 90% of stake must be clamped to the 1% cap.
+    let mut ds = vec![deleg(1, 50, 900_000_000, 0)];
+    for i in 0..99u32 {
+        ds.push(deleg(200 + i, i, 1_000_000, 0));
+    }
+    let r = Registry::resolve(&ds, 200);
+    let vs = r.validators();
+    assert!(vs.windows(2).all(|w| w[0].index < w[1].index), "saida nao ordenada");
+    let whale = vs.iter().find(|v| v.index == 50).unwrap();
+    assert_eq!(whale.effective_stake as u128, r.cap_sat());
+    assert!(r.stake_of(50) > r.cap_sat(), "o teste nao esta exercitando o teto");
+    // Fixed point: the cap lands level with a normal validator, not 10x above.
+    let normal = vs.iter().find(|v| v.index == 0).unwrap().effective_stake as u128;
+    assert!(whale.effective_stake as u128 <= normal * 11 / 10,
+        "teto deixou a baleia em {} contra {normal} de um validador normal",
+        whale.effective_stake);
+}
+
+#[test]
+fn cap_pushes_the_sampler_away_from_the_whale() {
+    // The cap has to actually change who gets drawn, not merely exist.
+    let mut ds = vec![deleg(1, 50, 900_000_000, 0)];
+    for i in 0..99u32 {
+        ds.push(deleg(200 + i, i, 1_000_000, 0));
+    }
+    let vs = Registry::resolve(&ds, 200).validators();
+    let mut whale_draws = 0;
+    for slot in 0..500u64 {
+        if slot_subcommittee(&MIX, slot, &vs).contains(&50) {
+            whale_draws += 1;
+        }
+    }
+    // Uncapped, an operator holding 90% of raw stake would be in essentially
+    // every committee. The fixed-point cap levels it with a normal validator,
+    // so it should appear at roughly the same rate as anyone else: 8 seats out
+    // of 100 operators is ~8% of committees.
+    assert!(whale_draws < 100, "baleia sorteada em {whale_draws}/500 comites");
+}
+
+#[test]
+fn deactivation_removes_stake_after_the_request() {
+    let mut d = deleg(1, 10, 1_000_000, 0);
+    d.deactivate_epoch = Some(5);
+    let before = Registry::resolve(&[d], 4);
+    let after = Registry::resolve(&[d], 6);
+    assert!(before.stake_of(10) > 0);
+    assert_eq!(after.stake_of(10), 0);
+    assert_eq!(before.state_of(&d), StakeState::Active);
+}
+
+#[test]
+fn stake_is_withdrawable_only_after_the_cooldown() {
+    let mut d = deleg(1, 10, 1_000_000, 0);
+    d.deactivate_epoch = Some(5);
+    let mid = Registry::resolve(&[d], 5 + delegation::COOLDOWN_EPOCHS - 1);
+    let done = Registry::resolve(&[d], 5 + delegation::COOLDOWN_EPOCHS);
+    assert_eq!(mid.state_of(&d), StakeState::Deactivating);
+    assert_eq!(done.state_of(&d), StakeState::Inactive);
+}
+
+#[test]
+fn slashing_hits_delegators_pro_rata_with_the_operator() {
+    let ds = vec![
+        deleg(1, 10, 1_000, 0),   // operator's own
+        deleg(2, 10, 3_000, 0),   // delegator
+        deleg(3, 99, 5_000, 0),   // different validator, untouched
+    ];
+    let losses = delegation::apply_slash(&ds, 10, 500); // 5%
+    assert_eq!(losses[0], 50 * tk::SAT_PER_BLOCH);
+    assert_eq!(losses[1], 150 * tk::SAT_PER_BLOCH);
+    assert_eq!(losses[2], 0);
+    // Proportional: the delegator staked 3× and loses 3×.
+    assert_eq!(losses[1], losses[0] * 3);
+}
+
+#[test]
+fn concentration_metrics_track_the_gates() {
+    // Ten equal operators: top share 10%, and it takes 4 to pass one third.
+    let ds: Vec<Delegation> = (0..10u32).map(|i| deleg(i, i, 1_000_000, 0)).collect();
+    let r = Registry::resolve(&ds, 200);
+    assert_eq!(r.top_share_bps(), 1_000);
+    assert_eq!(r.nakamoto_coefficient(), 4);
+
+    // One operator at half: G2 (<2500 bps) and G3 (>=7) both fail.
+    let mut ds2 = vec![deleg(99, 99, 9_000_000, 0)];
+    ds2.extend((0..9u32).map(|i| deleg(i, i, 1_000_000, 0)));
+    let r2 = Registry::resolve(&ds2, 400);
+    assert!(r2.top_share_bps() > 2_500, "G2 deveria falhar");
+    assert_eq!(r2.nakamoto_coefficient(), 1, "G3 deveria falhar");
+}
+
+#[test]
+fn empty_registry_does_not_divide_by_zero() {
+    let r = Registry::resolve(&[], 10);
+    assert_eq!(r.total_active(), 0);
+    assert_eq!(r.cap_sat(), 0);
+    assert_eq!(r.top_share_bps(), 0);
+    assert_eq!(r.nakamoto_coefficient(), 0);
+    assert!(r.validators().is_empty());
+    assert!(slot_subcommittee(&MIX, 1, &r.validators()).is_empty());
+}

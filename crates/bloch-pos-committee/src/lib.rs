@@ -40,6 +40,7 @@
 //! sampling or fork-choice path.
 
 pub mod attestation;
+pub mod delegation;
 pub mod forkchoice;
 pub mod params;
 pub mod tokenomics_v4;
