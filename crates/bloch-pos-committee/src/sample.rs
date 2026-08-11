@@ -86,6 +86,21 @@ pub fn sample(
     // failure shape as `expected_bits` reading node-local mutable state
     // (§5.5); it is cheap to prevent and near-impossible to debug in the wild.
     eligible.sort_unstable_by_key(|v| v.index);
+
+    // A duplicate validator index is a malformed registry, and the sampler used
+    // to accept it silently: both entries occupied adjacent cumulative-stake
+    // ranges and both could be drawn, so one validator took two seats and the
+    // committee had one fewer distinct member than its size claims — found by
+    // property test, 2026-08-11.
+    //
+    // Deduplicating keeps the function total and deterministic, which a panic
+    // would not: a consensus function that aborts on malformed committed state
+    // takes the node down instead of rejecting a block. Keeping the first
+    // occurrence after the index sort is order-independent, since the sort key
+    // is the index itself. Summing the stakes instead would be worse — it would
+    // silently grant the duplicate more weight, which is exactly the outcome a
+    // corrupt registry would be trying to buy.
+    eligible.dedup_by_key(|v| v.index);
     // Fewer eligible validators than seats: everyone serves. Not an error —
     // it is the expected state of a young network, and the caller decides
     // whether that quorum is acceptable.

@@ -353,22 +353,43 @@ fn stale_message_cannot_move_the_head_back() {
 }
 
 #[test]
-fn equivocation_in_one_slot_keeps_the_first_message() {
-    // Two conflicting votes at the same slot: head selection must not depend on
-    // which arrived last, or two honest nodes diverge from identical data.
-    let (parents, _) = tree();
+fn equivocation_in_one_slot_drops_the_validator_entirely() {
+    // This test used to assert the opposite — that each node keeps whichever
+    // message it saw first — and it passed, because both nodes ended up with
+    // *some* weight. What it never checked was whether they agreed on the HEAD,
+    // and they did not: keeping the first-seen message makes the head a function
+    // of gossip arrival order, which is the exact divergence fork choice exists
+    // to prevent. Found by property test, 2026-08-11.
+    let (parents, children) = tree();
     let t = BlockTree { parents: &parents };
     let mut a = Store::new();
     let mut b = Store::new();
     a.set_stake(0, 100);
     b.set_stake(0, 100);
+    a.set_stake(1, 10);
+    b.set_stake(1, 10);
+    // An honest validator, so the head is defined after the equivocator is gone.
+    a.observe(1, LatestMessage { slot: 3, root: root(2) });
+    b.observe(1, LatestMessage { slot: 3, root: root(2) });
+
+    // Validator 0 equivocates; the two nodes see the pair in opposite orders.
     a.observe(0, LatestMessage { slot: 3, root: root(2) });
     a.observe(0, LatestMessage { slot: 3, root: root(3) });
     b.observe(0, LatestMessage { slot: 3, root: root(3) });
     b.observe(0, LatestMessage { slot: 3, root: root(2) });
-    // Each node keeps whichever it saw first — but neither double-counts.
-    assert_eq!(a.weight(&t, &root(0)), 100);
-    assert_eq!(b.weight(&t, &root(0)), 100);
+
+    // The equivocator contributes nothing, on both nodes.
+    assert_eq!(a.weight(&t, &root(0)), 10);
+    assert_eq!(b.weight(&t, &root(0)), 10);
+    assert_eq!(a.equivocators().count(), 1);
+    assert_eq!(b.equivocators().count(), 1);
+
+    // And — the property the old test never asserted — they agree on the head.
+    assert_eq!(a.head(&t, root(0), &children), b.head(&t, root(0), &children));
+
+    // A late message from a barred validator stays barred.
+    assert!(!a.observe(0, LatestMessage { slot: 9, root: root(3) }));
+    assert_eq!(a.weight(&t, &root(0)), 10);
 }
 
 #[test]

@@ -77,12 +77,25 @@ pub struct Delegation {
 }
 
 impl Delegation {
-    /// Deterministic queue order: by request epoch, then validator, then
-    /// delegator. Never by position in the input slice — that was a real
-    /// consensus bug in the sampling path, where the committee depended on how
-    /// the caller happened to lay the registry out in memory.
-    fn queue_key(&self) -> (u64, u32, u32) {
-        (self.requested_epoch, self.validator, self.delegator)
+    /// Deterministic queue order: request epoch, validator, delegator, amount.
+    ///
+    /// Never by position in the input slice — that was a real consensus bug in
+    /// the sampling path, where the committee depended on how the caller
+    /// happened to lay the registry out in memory.
+    ///
+    /// `amount_sat` is part of the key, and leaving it out was the same bug in
+    /// a second place. Nothing forbids one delegator bonding to one validator
+    /// twice in one epoch, so without the amount those two records tie; a
+    /// stable sort then preserves *caller order*, and under the warm-up budget
+    /// a tie decides which record is admitted first. Two nodes holding the
+    /// identical delegation set but iterating it differently resolved to
+    /// different registries — found by property test, 2026-08-11.
+    ///
+    /// Records identical in all four components are interchangeable: admitting
+    /// either yields the same stake, so a residual tie cannot change the
+    /// result.
+    fn queue_key(&self) -> (u64, u32, u32, u128) {
+        (self.requested_epoch, self.validator, self.delegator, self.amount_sat)
     }
 }
 
@@ -109,6 +122,14 @@ pub struct Registry {
     /// (validator, active stake) sorted by validator index.
     stakes: Vec<(u32, u128)>,
     total_active: u128,
+    /// Queue keys of the delegations actually admitted at this epoch, sorted.
+    ///
+    /// Needed because "is this delegation active?" is a question about the
+    /// record, not about its validator. Answering it from the validator's
+    /// aggregate stake reported a queued delegation as `Active` whenever some
+    /// *other* delegation to the same validator had already been admitted —
+    /// found by property test, 2026-08-11.
+    admitted: Vec<(u64, u32, u32, u128)>,
 }
 
 impl Registry {
@@ -192,7 +213,15 @@ impl Registry {
             }
         }
 
-        Registry { epoch, stakes: active, total_active }
+        let mut admitted_keys: Vec<(u64, u32, u32, u128)> = queue
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| admitted[*i])
+            .map(|(_, d)| d.queue_key())
+            .collect();
+        admitted_keys.sort_unstable();
+
+        Registry { epoch, stakes: active, total_active, admitted: admitted_keys }
     }
 
     pub fn epoch(&self) -> u64 {
@@ -315,7 +344,12 @@ impl Registry {
             Some(de) if self.epoch >= de + COOLDOWN_EPOCHS => StakeState::Inactive,
             Some(de) if self.epoch >= de => StakeState::Deactivating,
             _ => {
-                if self.stake_of(d.validator) > 0 && d.requested_epoch <= self.epoch {
+                // Ask about THIS record, not about its validator. Reading the
+                // validator's aggregate stake reported a delegation still in
+                // the warm-up queue as Active whenever any other delegation to
+                // the same validator had been admitted — so the sum of the
+                // records reported Active exceeded total_active().
+                if self.admitted.binary_search(&d.queue_key()).is_ok() {
                     StakeState::Active
                 } else {
                     StakeState::Activating

@@ -31,11 +31,17 @@ pub struct BlockTree<'a> {
 pub struct Store {
     latest: HashMap<u32, LatestMessage>,
     stake: HashMap<u32, u64>,
+    /// Validators observed equivocating; excluded from weight forever.
+    equivocators: std::collections::HashSet<u32>,
 }
 
 impl Store {
     pub fn new() -> Self {
-        Store { latest: HashMap::new(), stake: HashMap::new() }
+        Store {
+            latest: HashMap::new(),
+            stake: HashMap::new(),
+            equivocators: std::collections::HashSet::new(),
+        }
     }
 
     /// Register a validator's effective stake (as committed by the parent
@@ -47,19 +53,45 @@ impl Store {
     /// Record a vote. Older messages are ignored, so replaying an old
     /// attestation cannot move the head backwards.
     ///
-    /// Equal slots are also ignored: a validator that signs two different heads
-    /// in one slot is equivocating, and the first message seen is kept rather
-    /// than letting the last one on the wire decide. That makes head selection
-    /// independent of gossip arrival order, which is what stops two honest
-    /// nodes from computing different heads from the same set of messages.
+    /// A validator that signs two different heads in one slot is **equivocating**
+    /// and is dropped from fork-choice weight entirely, permanently.
+    ///
+    /// An earlier version kept the first message seen and claimed that made head
+    /// selection independent of arrival order. It did the opposite: with an
+    /// equivocating validator, two honest nodes holding the identical message
+    /// set each kept whichever arrived first and computed *different heads* —
+    /// found by property test, 2026-08-11.
+    ///
+    /// Discarding the equivocator is order-independent by construction: the
+    /// outcome depends on whether a conflicting pair exists in the set, never on
+    /// which half arrived first. It also matches the finality gadget, which
+    /// drops equivocators from both tallies, and it is the honest posture —
+    /// equivocation is slashable (§7.3), so the validator is about to be ejected
+    /// regardless. Its votes are evidence, not weight.
     pub fn observe(&mut self, validator: u32, msg: LatestMessage) -> bool {
+        if self.equivocators.contains(&validator) {
+            return false;
+        }
         match self.latest.get(&validator) {
+            // Same slot, different head: equivocation. Drop the stored message
+            // and bar the validator — both halves of the pair are refused, so
+            // arrival order cannot matter.
+            Some(prev) if prev.slot == msg.slot && prev.root != msg.root => {
+                self.latest.remove(&validator);
+                self.equivocators.insert(validator);
+                false
+            }
             Some(prev) if prev.slot >= msg.slot => false,
             _ => {
                 self.latest.insert(validator, msg);
                 true
             }
         }
+    }
+
+    /// Validators barred for equivocating. Feeds the slashing pipeline (§7.3).
+    pub fn equivocators(&self) -> impl Iterator<Item = &u32> {
+        self.equivocators.iter()
     }
 
     /// Total stake whose latest message is `root` or a descendant of it.
