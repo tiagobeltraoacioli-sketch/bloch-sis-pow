@@ -40,6 +40,7 @@
 //! sampling or fork-choice path.
 
 pub mod attestation;
+pub mod beacon;
 pub mod delegation;
 pub mod forkchoice;
 pub mod interfaces;
@@ -54,8 +55,9 @@ pub use interfaces::{
     RandomnessBeacon, SlashingRules, StakingLifecycle, StateCommitment, StateReader,
     StateTransition,
 };
+pub use beacon::{mix_in, process_reveal, BeaconError, RandaoChain, RevealState};
 pub use forkchoice::{BlockTree, LatestMessage, Store};
-pub use params::{COMMITTEE_SIZE, SLOTS_PER_EPOCH, SLOT_SUBCOMMITTEE_SIZE};
+pub use params::{COMMITTEE_SIZE, RANDAO_CHAIN_LENGTH, SLOTS_PER_EPOCH, SLOT_SUBCOMMITTEE_SIZE};
 pub use sample::{is_selected, sample, Role, Validator};
 
 /// Draw the per-slot fork-choice subcommittee.

@@ -41,6 +41,17 @@ pub const SLOT_DURATION_SECS: u64 = 30;
 /// exist to prevent from ever reaching mainnet.
 pub const MAX_DRAWS_PER_SLOT: usize = 4096;
 
+/// Length of the RANDAO hash chain committed at registration (§6.3, Appendix
+/// A). A validator's commitment supports exactly this many reveals — one per
+/// slot it actually proposes — before a re-commit transaction is required.
+///
+/// At one reveal per proposed slot, 8,192 reveals is years of proposing for
+/// any validator in a set of realistic size, so re-commits are rare; but the
+/// exhaustion path must still exist and be enforced, because a chain that
+/// silently accepted reveal 8,193 would be accepting a value with no
+/// registered commitment behind it.
+pub const RANDAO_CHAIN_LENGTH: u32 = 8_192;
+
 /// Domain separation tags (§6.1). Fixed 16 bytes, right-padded with zeros, so
 /// no tag can be a prefix of another.
 pub const DS_SORTITION: [u8; 16] = *b"BLCH4:SORTIT\0\0\0\0";
