@@ -105,6 +105,7 @@ pub const DS_EXIT: [u8; 16] = *b"BLCH4:EXIT\0\0\0\0\0\0";
 /// State SMT node domain (§6.1) — every hash in [`crate::state_root`] starts
 /// with this tag so a state-tree node can never collide with a block id, a
 /// transaction Merkle node, or any other SHA3 use in the protocol.
+/// Slashing-evidence identity domain (anti-replay key, §7.3).
 
 /// Role tags, mixed into the sortition seed so the per-slot subcommittee is not
 /// a predictable subset of the epoch committee.

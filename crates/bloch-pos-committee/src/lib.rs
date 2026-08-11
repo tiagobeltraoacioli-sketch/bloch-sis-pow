@@ -61,6 +61,9 @@ pub use interfaces::{
 };
 pub use beacon::{mix_in, process_reveal, BeaconError, RandaoChain, RevealState};
 pub use finality::{Checkpoint, EpochOutcome, EpochVotes, FinalityError, FinalityState};
+pub mod slashing;
+pub use slashing::{
+    EvidenceError, SlashableOffense, SlashingEvidence, SlashingOutcome, SlashingState,
 pub use forkchoice::{BlockTree, LatestMessage, Store};
 pub use params::{COMMITTEE_SIZE, RANDAO_CHAIN_LENGTH, SLOTS_PER_EPOCH, SLOT_SUBCOMMITTEE_SIZE};
 pub use sample::{is_selected, sample, Role, Validator};
