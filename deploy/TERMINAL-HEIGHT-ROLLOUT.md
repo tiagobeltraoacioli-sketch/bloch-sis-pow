@@ -88,3 +88,41 @@ The rule must be running on the fleet before height 80,000. Any box still on an
 old binary at that height keeps mining past the end and forks. That is
 survivable — the canonical record is the signed snapshot, not the longest chain
 — but it is avoidable, and avoiding it is the entire point of deploying early.
+
+---
+
+## Rollout record — 2026-08-11
+
+Deployed to all three boxes. Binary `af72aefbc351fc353bc0bb4136cf94c09896c6e019f05b8baf9a2a29e92607fb`,
+stamped `bloch 0.3.0-genesis2 (6ec737838cac)`.
+
+| Box | Was | Now | Height after | Restarts |
+|---|---|---|---|---|
+| node4 | `bloch-p60` `a85b0e0` | `bloch-terminal-height` | 43,110 | 0 |
+| miner-box | `bloch-p60` `a85b0e0` | `bloch-terminal-height` | 43,110 | 0 |
+| auxpow (producer) | `bloch-p60` `a85b0e0` | `bloch-terminal-height` | 43,111 | 0 |
+
+Producer kept producing across the restart: 7 blocks in 180 s, against 3 in
+60 s measured before. No `past the terminal height`, no panics, no consensus
+rejections, no `invalid difficulty` on any box. `bloch-merged-pool`,
+`bloch-pool-proxy`, `bitcoind-mainnet`, `bloch-gpu-miner`, `bloch-l2`,
+`bloch-rpc-bridge` and `cloudflared` were not touched and stayed up.
+
+### Correction to the pre-deploy survey
+
+The survey that preceded this reported "three boxes, three different binaries".
+**That was wrong.** It read the `ExecStart` of the *base unit* on each box,
+when every box carries a stack of systemd drop-ins — up to sixteen on auxpow —
+and the last one alphabetically wins. All three were in fact running the same
+binary, `bloch-p60`, sha `dfc6962d…`, built from commit `a85b0e0`.
+
+The fleet was uniform, and better documented than reported: each drop-in
+records the commit and sha of the binary it installs, and that convention is
+what made this deploy verifiable. The authoritative way to ask what is running
+is `readlink /proc/$(systemctl show $SVC -p ExecMainPID --value)/exe`, not
+`systemctl cat`.
+
+What survives from the survey: the uncommitted pool-proxy work on auxpow was
+real and is now in git, and the version string carried no commit — which is why
+identifying `bloch-p60` took md5 comparison rather than one command. That is
+fixed; the table above is the proof.
