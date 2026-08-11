@@ -145,13 +145,57 @@ takes years to accumulate. The gates G1–G4 would fail on day one.
 - At 30 s slots: 42,076,800 slots in 40 years.
 - **Average 1,276 BLCH per block.**
 
-The curve itself is not specified by this decision. Three candidates:
+### 6.1 Curve — decided: 10% annual disinflation
 
-| Curve | Behaviour | Note |
-|---|---|---|
-| Flat | 1,276 BLCH/block for 40 years | Simplest; no early-adopter premium |
-| Halving | Higher early, halving every N years | Familiar; front-loads to early validators |
-| Smooth decay | Continuous exponential to a floor | Avoids halving cliffs entirely |
+Founder constraint: **annual inflation under 7%**. Combined with the
+decentralisation requirement from §7A, that pins the curve almost exactly.
+
+| Curve | Year-1 inflation | Decentralisation gate |
+|---|---:|---|
+| Flat, 1,276 BLCH/block | 1.34% | **Fails** — validators never outpace insider unlocks |
+| Halving every 4 years | 6.72% | Passes, but revenue halves on scheduled dates |
+| Decay, 8%/year decline | 4.45% | **Fails at month 36** — too flat |
+| **Decay, 10%/year decline** | **5.45%** | **Passes** |
+| Decay, 12%/year decline | 6.48% | Passes, but close to the 7% ceiling |
+
+**Adopted: reward declines 10% per year**, constant within each year, summing
+to exactly the 53.7 B allocation across 40 years.
+
+| Year | BLCH/block | Inflation (of total supply) |
+|---:|---:|---:|
+| 1 | 5,181.54 | 5.45% |
+| 5 | 3,399.61 | 3.58% |
+| 10 | 2,007.43 | 2.11% |
+| 20 | 699.95 | 0.74% |
+| 40 | 85.10 | 0.09% |
+
+Truncation residual across the whole 40-year schedule: **67,200 sat
+(0.000672 BLCH)** — under the allocation, never over.
+
+**The denominator is load-bearing.** These figures are issuance over **total
+supply**, which is how Solana and Ethereum report inflation. Measured against
+*circulating* supply the same curve reads over 100% in year one — not because
+issuance is high, but because almost every allocation is still vesting at
+genesis, so the float is only ~6.3 B. Any public figure must say which
+denominator it uses.
+
+A hard 7%-of-*circulating* rule was modelled and rejected: it emits only 0.44 B
+in year 1 and 6.65 B by year 5, so validators never outpace the insider unlock
+schedule, and the concentration gate fails outright.
+
+### 6.2 Why not a halving
+
+Neither Ethereum nor Solana has one — halving is essentially a Bitcoin
+convention. Ethereum's issuance is dynamic (it scales with total ETH staked,
+with base fees burned on top, so net issuance can go negative); Solana runs
+smooth disinflation, 8% initial declining 15%/year to a 1.5% floor. The curve
+adopted here is the Solana shape adapted to a hard cap: no floor, no tail, the
+schedule simply ends.
+
+Beyond convention, a halving is a scheduled date on which every validator's
+revenue drops by half at once, and marginal operators exit together. Continuous
+decay has no such edges — the same reasoning that put founder vesting on a
+per-slot line rather than monthly tranches.
 
 **Hard cap — a reversal worth recording.** The current design is explicitly
 *not* hard-capped: `tokenomics_v2.rs` runs a perpetual 100 BLCH tail
@@ -275,9 +319,7 @@ vesting schedule that lives in a spreadsheet is not a vesting schedule.
 ## 9. Open decisions
 
 1. ~~Vesting for VC, team, marketing, liquidity~~ — **decided**, §7.
-2. **Emission curve: flat, halving, or smooth decay (§6, §7A) — now the most
-   consequential open decision.** Flat fails gate G2 for ~5 years; front-loaded
-   passes from month 24. Recommendation: halving every 4 years.
+2. ~~Emission curve~~ — **decided**: 10%/year smooth disinflation (§6.1).
 3. Snapshot height, announced in advance (§3).
 4. Confirmation of pro-rata scale-down for the over-cap case (§3).
 5. Decimal places and the `u128` accumulator audit (§8.1).

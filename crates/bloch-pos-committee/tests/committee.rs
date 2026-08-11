@@ -632,3 +632,47 @@ fn total_supply_is_over_half_of_u64_max() {
     assert!(tk::TOTAL_SUPPLY_SAT > (u64::MAX as u128) / 2);
     assert!(tk::TOTAL_SUPPLY_SAT < u64::MAX as u128);
 }
+
+#[test]
+fn decay_curve_meets_the_inflation_target() {
+    // Founder requirement: annual inflation under 7% of total supply.
+    let y1 = tk::annual_inflation_bps(0);
+    assert!(y1 < 700, "ano 1 = {}bps, acima do teto de 700", y1);
+    assert_eq!(y1, 545); // 5.45%
+    assert!(tk::annual_inflation_bps(4) < y1);
+    assert!(tk::annual_inflation_bps(9) < tk::annual_inflation_bps(4));
+    assert_eq!(tk::annual_inflation_bps(9), 211); // 2.11% no ano 10
+}
+
+#[test]
+fn decay_curve_declines_ten_percent_a_year() {
+    let y0 = tk::validator_reward_decay_sat(0);
+    let y1 = tk::validator_reward_decay_sat(tk::SLOTS_PER_YEAR);
+    let ratio = y1 * 1000 / y0;
+    assert!((899..=901).contains(&ratio), "razao anual = {ratio}/1000");
+    assert_eq!(y0 / tk::SAT_PER_BLOCH, 5_181);
+}
+
+#[test]
+fn decay_curve_emits_the_allocation_exactly() {
+    let alloc = tk::VALIDATOR_EMISSION_BLOCH * tk::SAT_PER_BLOCH;
+    let emitted = tk::validator_emitted_decay_by(tk::EMISSION_SLOTS);
+    // Under the cap, never over: truncation may strand dust, never mint.
+    assert!(emitted <= alloc, "emitiu {emitted} > alocado {alloc}");
+    let residual = alloc - emitted;
+    assert_eq!(residual, 67_200, "residuo mudou: {residual} sat");
+    assert!(residual < tk::SAT_PER_BLOCH, "residuo passou de 1 BLCH");
+    assert_eq!(tk::validator_emitted_decay_by(u64::MAX), emitted);
+    assert_eq!(tk::validator_reward_decay_sat(tk::EMISSION_SLOTS), 0);
+}
+
+#[test]
+fn decay_front_loads_enough_to_outpace_insider_unlocks() {
+    // The decentralisation constraint: by month 24 validators must hold more
+    // than any single insider bucket has unlocked by then.
+    let m24 = 2 * tk::SLOTS_PER_YEAR;
+    let validators = tk::validator_emitted_decay_by(m24);
+    let biggest_insider = tk::vc_vested_sat(m24); // VC cliffs first
+    assert!(validators > biggest_insider * 2,
+        "validadores {validators} vs maior insider {biggest_insider}");
+}

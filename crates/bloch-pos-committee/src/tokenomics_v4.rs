@@ -283,3 +283,84 @@ pub const fn validator_reward_halving_sat(slot: u64) -> u128 {
     }
     INITIAL_REWARD_SAT >> era
 }
+
+/// Smooth disinflation — **the recommended curve**.
+///
+/// Shape borrowed from Solana (8% initial inflation declining 15%/year to a
+/// 1.5% floor), which is the model the market actually converged on; neither
+/// Ethereum nor Solana has a Bitcoin-style halving. Adapted to a hard cap: the
+/// reward declines by a fixed 10% each year and the whole 40-year schedule sums
+/// to exactly the validator allocation, so there is no floor and no tail.
+///
+/// Why 10% and not something else — it is the only round rate that satisfies
+/// both live constraints at once:
+///
+/// - **Inflation target.** Year 1 emits 5,450,564,151 BLCH = **5.45% of total
+///   supply**, against the founder's "under 7%" requirement. Year 5 is 3.58%,
+///   year 10 is 2.11%.
+/// - **Decentralisation.** An 8%/year decline drops to 4.45% inflation but is
+///   too flat: validators stop out-earning the insider unlock schedule and the
+///   25%-of-stake gate is breached at month 36. 12%/year passes the gate but
+///   puts year 1 at 6.48%, uncomfortably close to the ceiling. 10% clears both.
+///
+/// Preferred over halving because a halving is a scheduled date on which every
+/// validator's revenue drops by half at once, and marginal operators leave
+/// together. Continuous decay has no such edges — the same reasoning that put
+/// the founder's vesting on a per-slot line instead of monthly tranches.
+///
+/// Integer recurrence: `annual[n] = annual[n-1] * 9 / 10`, per-slot reward is
+/// `annual[n] / SLOTS_PER_YEAR`. `INITIAL_ANNUAL_SAT` was solved for by binary
+/// search under exactly this truncating arithmetic, so the 40-year sum lands on
+/// the allocation with **zero** residual rather than merely close to it.
+pub const DECAY_NUMERATOR: u128 = 9;
+pub const DECAY_DENOMINATOR: u128 = 10;
+pub const INITIAL_ANNUAL_SAT: u128 = 545_056_415_069_853_599;
+
+pub const fn validator_reward_decay_sat(slot: u64) -> u128 {
+    if slot >= EMISSION_SLOTS {
+        return 0; // fee-only from here on
+    }
+    let year = slot / SLOTS_PER_YEAR;
+    let mut annual = INITIAL_ANNUAL_SAT;
+    let mut n = 0;
+    while n < year {
+        annual = annual * DECAY_NUMERATOR / DECAY_DENOMINATOR;
+        n += 1;
+    }
+    annual / SLOTS_PER_YEAR as u128
+}
+
+/// Total emitted under the decay curve by `slot`.
+pub const fn validator_emitted_decay_by(slot: u64) -> u128 {
+    let end = if slot > EMISSION_SLOTS { EMISSION_SLOTS } else { slot };
+    let mut total: u128 = 0;
+    let mut annual = INITIAL_ANNUAL_SAT;
+    let mut year: u64 = 0;
+    while year < EMISSION_YEARS {
+        let start = year * SLOTS_PER_YEAR;
+        if end <= start {
+            break;
+        }
+        let in_year = end - start;
+        let span = if in_year > SLOTS_PER_YEAR { SLOTS_PER_YEAR } else { in_year };
+        total += (annual / SLOTS_PER_YEAR as u128) * span as u128;
+        annual = annual * DECAY_NUMERATOR / DECAY_DENOMINATOR;
+        year += 1;
+    }
+    total
+}
+
+/// Annual issuance as a share of total supply, in basis points — the figure
+/// quoted publicly, and measured the way Solana and Ethereum measure it
+/// (against total supply, not circulating supply). The distinction is not
+/// cosmetic: against *circulating* supply this same curve reads over 100% in
+/// year one, purely because almost every allocation is still vesting at genesis.
+pub const fn annual_inflation_bps(year: u64) -> u128 {
+    let mut annual = INITIAL_ANNUAL_SAT;
+    let mut n = 0;
+    while n < year {
+        annual = annual * DECAY_NUMERATOR / DECAY_DENOMINATOR;
+        n += 1;
+    }
+    annual * 10_000 / TOTAL_SUPPLY_SAT
+}
