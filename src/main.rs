@@ -1816,6 +1816,25 @@ async fn main() {
                 // Pool addresses come from tokenomics_v2 panicking accessors
                 // — deliberate fail-loud until Phase 6 sets the constants.
                 let block_height = current_height + 1;
+
+                // TERMINAL HEIGHT. The chain ends here; accept_block refuses
+                // anything above it. Stop the round before assembling a block
+                // and grinding PoW on it — otherwise the miner burns every
+                // core forever on work its own node rejects on submit, which
+                // reads in the logs like a validation bug rather than like the
+                // chain having ended. Logged once per round at a low rate by
+                // the sleep below.
+                if core::is_past_terminal_height(block_height) {
+                    if mining_round % 120 == 0 {
+                        info!(
+                            "⛏  chain ended at terminal height {} — miner idle",
+                            core::terminal_height(core::node_chain_id()).unwrap_or(0)
+                        );
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    continue;
+                }
+
                 // Genesis-2 continues emission from the carried height: the miner
                 // must pay the subsidy for the ABSOLUTE height, exactly as the
                 // validator (validate_coinbase_value) computes it via emission_height.

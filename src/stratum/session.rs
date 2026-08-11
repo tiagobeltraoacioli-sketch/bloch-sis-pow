@@ -92,6 +92,22 @@ pub fn install_fresh_template(
         (parents_vec, data.height + 1, data.blue_score + 1)
     };
 
+    // 2b. TERMINAL HEIGHT. The Genesis-3 chain ends at
+    //     core::GENESIS3_TERMINAL_HEIGHT; accept_block rejects anything above
+    //     it. Without this guard the pool keeps handing out jobs past the end,
+    //     miners burn hashrate on blocks their own node will refuse, and the
+    //     logs fill with self-rejections that look like a bug rather than the
+    //     chain having ended. Same fail-closed shape as the checks below:
+    //     refuse to notify rather than send work that cannot win.
+    if crate::core::is_past_terminal_height(height) {
+        log::info!(
+            "stratum: chain ended at terminal height {} — no further templates (requested h={})",
+            crate::core::terminal_height(crate::core::node_chain_id()).unwrap_or(0),
+            height
+        );
+        return Err("chain has reached its terminal height — no further work");
+    }
+
     // 3. Difficulty target for the block BEING MINED (height). FAIL CLOSED:
     //    if current_bits is unreadable we must NOT guess diff-1 — on the live
     //    chain that is EASIER than reality, so shares would pass the local
