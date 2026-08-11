@@ -676,3 +676,127 @@ fn decay_front_loads_enough_to_outpace_insider_unlocks() {
     assert!(validators > biggest_insider * 2,
         "validadores {validators} vs maior insider {biggest_insider}");
 }
+
+// ── receita do validador (modelo Solana) ────────────────────────────────────
+
+use bloch_pos_committee::rewards::{self, StakeAccount};
+
+fn acct(self_s: u128, deleg: u128, comm: u128) -> StakeAccount {
+    StakeAccount { self_stake: self_s, delegated_stake: deleg,
+                   commission_bps: comm, credits: 100, max_credits: 100 }
+}
+
+#[test]
+fn base_fee_burns_half_priority_fee_does_not() {
+    let s = rewards::split_fees(1_000, 4_000);
+    assert_eq!(s.burned, 500);
+    assert_eq!(s.to_producer, 500 + 4_000);
+    assert_eq!(s.burned + s.to_producer, 5_000, "fee sumiu ou foi criada");
+}
+
+#[test]
+fn fee_split_conserves_value_for_arbitrary_inputs() {
+    for (b, p) in [(0, 0), (1, 0), (0, 1), (7, 13), (999_999, 1), (u64::MAX as u128, 0)] {
+        let s = rewards::split_fees(b, p);
+        assert_eq!(s.burned + s.to_producer, b + p, "base={b} prio={p}");
+    }
+}
+
+#[test]
+fn rewards_are_pro_rata_to_stake_not_to_block_production() {
+    // The Solana property: a validator that never leads still earns on its
+    // stake. Two validators, same stake, same credits, same payout.
+    let issuance = 1_000_000u128;
+    let total = 1_000u128;
+    let a = rewards::distribute(&acct(500, 0, 0), issuance, total);
+    let b = rewards::distribute(&acct(500, 0, 0), issuance, total);
+    assert_eq!(a.operator, b.operator);
+    assert_eq!(a.operator, issuance / 2);
+}
+
+#[test]
+fn commission_is_charged_only_on_delegated_stake() {
+    // 10% commission, half the stake delegated.
+    let p = rewards::distribute(&acct(500, 500, 1_000), 1_000_000, 1_000);
+    assert_eq!(p.delegators + p.operator, 1_000_000);
+    // Delegators' gross is 500_000; commission takes 10% = 50_000.
+    assert_eq!(p.delegators, 450_000);
+    assert_eq!(p.operator, 500_000 + 50_000);
+}
+
+#[test]
+fn zero_commission_gives_delegators_everything_they_earned() {
+    let p = rewards::distribute(&acct(0, 1_000, 0), 1_000_000, 1_000);
+    assert_eq!(p.delegators, 1_000_000);
+    assert_eq!(p.operator, 0);
+}
+
+#[test]
+fn full_commission_is_allowed_and_takes_all_delegator_rewards() {
+    // Legal, and the reason wallets must display the rate.
+    let p = rewards::distribute(&acct(0, 1_000, 10_000), 1_000_000, 1_000);
+    assert_eq!(p.delegators, 0);
+    assert_eq!(p.operator, 1_000_000);
+}
+
+#[test]
+fn missed_attestations_forfeit_rewards_for_operator_and_delegators() {
+    let mut a = acct(500, 500, 0);
+    a.credits = 50; // half the epoch missed
+    let p = rewards::distribute(&a, 1_000_000, 1_000);
+    assert_eq!(p.forfeited, 500_000);
+    assert_eq!(p.operator + p.delegators, 500_000);
+}
+
+#[test]
+fn offline_validator_earns_nothing_and_neither_do_its_delegators() {
+    let mut a = acct(500, 500, 0);
+    a.credits = 0;
+    let p = rewards::distribute(&a, 1_000_000, 1_000);
+    assert_eq!(p.operator, 0);
+    assert_eq!(p.delegators, 0);
+    assert_eq!(p.forfeited, 1_000_000);
+}
+
+#[test]
+fn distribute_never_pays_more_than_the_stake_share() {
+    let issuance = 5_000_000u128;
+    let total = 10_000u128;
+    for (s, d, c) in [(1u128, 0u128, 0u128), (0, 1, 10_000), (3_000, 7_000, 750), (10_000, 0, 0)] {
+        let p = rewards::distribute(&acct(s, d, c), issuance, total);
+        let share = issuance * (s + d) / total;
+        assert!(p.operator + p.delegators + p.forfeited <= share + 1,
+            "pagou acima da fatia: {s}/{d}/{c}");
+    }
+}
+
+#[test]
+fn degenerate_inputs_pay_nothing_instead_of_panicking() {
+    let p = rewards::distribute(&acct(0, 0, 0), 1_000_000, 1_000);
+    assert_eq!((p.operator, p.delegators, p.forfeited), (0, 0, 0));
+    let p = rewards::distribute(&acct(100, 0, 0), 1_000_000, 0);
+    assert_eq!((p.operator, p.delegators), (0, 0));
+    let mut a = acct(100, 0, 0);
+    a.max_credits = 0;
+    assert_eq!(rewards::distribute(&a, 1_000_000, 1_000).operator, 0);
+}
+
+#[test]
+fn distribution_does_not_overflow_at_full_supply_scale() {
+    // issuance × stake is the product of two ~1e19 values.
+    let sat = tk::SAT_PER_BLOCH;
+    let total = tk::TOTAL_SUPPLY_BLOCH * sat;
+    let issuance = 5_450_564_151 * sat;
+    let p = rewards::distribute(&acct(total / 2, total / 2, 500), issuance, total);
+    assert_eq!(p.operator + p.delegators, issuance);
+}
+
+#[test]
+fn nominal_yield_exceeds_inflation_when_not_all_supply_is_staked() {
+    let sat = tk::SAT_PER_BLOCH;
+    let issuance = 5_450_564_151 * sat;                    // ano 1
+    let staked = tk::TOTAL_SUPPLY_BLOCH * sat * 2 / 3;     // dois tercos, como Solana
+    let y = rewards::nominal_yield_bps(issuance, staked);
+    assert!(y > 545, "yield {y}bps deveria superar a inflacao de 545bps");
+    assert_eq!(y, 817); // 8,17%
+}

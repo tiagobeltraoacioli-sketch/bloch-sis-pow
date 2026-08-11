@@ -43,6 +43,7 @@ pub mod attestation;
 pub mod forkchoice;
 pub mod params;
 pub mod tokenomics_v4;
+pub mod rewards;
 pub mod sample;
 
 pub use attestation::{Attestation, AttestationData, RejectReason, SignatureVerifier};

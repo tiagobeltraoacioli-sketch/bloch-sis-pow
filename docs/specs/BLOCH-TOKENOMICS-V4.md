@@ -209,6 +209,66 @@ rationale rather than silently superseding it.
 
 ---
 
+## 6.3 Validator revenue — Solana model
+
+Adopted: validator revenue mirrors Solana's, which has three parts.
+
+| Stream | Rule | Note |
+|---|---|---|
+| **Inflation rewards** | Pro-rata to **all active stake**, scaled by attestation credits earned; validator takes a **commission** on delegated stake only | Producing blocks is not how you get paid — being staked behind a performing validator is |
+| **Base fee** | **50% burned**, 50% to the block producer | Solana's split |
+| **Priority fee** | **100% to the block producer** | Solana moved from 50/50 to 100% with SIMD-0096 |
+
+Commission is uncapped by consensus (Solana allows 0–100%; single digits in
+practice). A cap is trivially evaded by an operator running its own delegation
+front-end, so the rule is disclosure rather than limitation: wallets and the
+explorer must surface the rate prominently.
+
+**Yield versus inflation.** These are different numbers and both get quoted. At
+year-1 issuance with two thirds of supply staked — Solana's rough ratio — the
+nominal staking yield is **8.17%**, against **5.45%** inflation. A staker's
+real position is what remains after dilution; a non-staker is diluted by the
+full 5.45%.
+
+For reference, Bloch's year-1 inflation of 5.45% lands almost exactly on
+Solana's current 5.5–5.9%.
+
+### 6.3.1 This requires delegation — a new subsystem
+
+Commission is meaningless without delegated stake, and pro-rata-to-all-stake
+rewards only make sense if stake can sit behind an operator without running
+one. **The Solana revenue model cannot be adopted without adding delegation**,
+which the PoS design does not currently have: validators deposit directly with
+a 100,000 BLCH minimum.
+
+Delegation is not a small addition. It brings stake accounts, a delegate/undelegate
+lifecycle, commission accounting, and per-epoch reward distribution across
+potentially many delegators per validator. It also cuts both ways for
+decentralisation: it removes the 100,000 BLCH barrier to participation (minimum
+delegation is proposed at 10 BLCH), but it lets large operators accumulate
+delegated stake, and it gives an insider bucket a way to spread holdings across
+many validators while retaining economic control. The §7A concentration model
+does not currently account for that.
+
+### 6.3.2 Conflict to resolve: fee burn versus "100% of fees"
+
+§1 states that after the 100 B is emitted, validators are paid **100% from
+fees**. The Solana model **burns half the base fee**, so validators never
+receive 100% of fees. The two statements cannot both hold as written.
+
+Reconcilable options:
+
+1. Burn during emission, stop burning when emission ends — honours both, at
+   different times.
+2. Never burn; 100% of all fees to producers — abandons the deflationary
+   counterweight that makes the hard cap meaningful.
+3. Always burn 50% of base fee — abandons the "100% of fees" statement.
+
+This must be decided explicitly rather than settled by whichever document is
+read last.
+
+---
+
 ## 7. Vesting — schedules and their basis
 
 Schedules follow prevailing market practice for recent L1 launches.
@@ -324,7 +384,10 @@ vesting schedule that lives in a spreadsheet is not a vesting schedule.
 4. Confirmation of pro-rata scale-down for the over-cap case (§3).
 5. Decimal places and the `u128` accumulator audit (§8.1).
 6. ADR retracting the perpetual-tail rationale (§6).
-7. **The VC allocation against the ownerless thesis.** ADR-033 restored an
+7. **Delegation** (§6.3.1) — required by the Solana revenue model, absent from
+   the current PoS design, and not yet reflected in the concentration model.
+8. **Fee burn versus "100% of fees" after emission** (§6.3.2).
+9. **The VC allocation against the ownerless thesis.** ADR-033 restored an
    ownerless position; ADR-034 records a founder anonymisation/relinquishment
    pact; the public posture is a civic node movement, "coins don't vote", not a
    security. A 10% allocation sold to funds introduces investors with a return
