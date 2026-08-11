@@ -50,7 +50,7 @@ use tokio::sync::{mpsc, broadcast};
 #[derive(Parser)]
 #[command(name = "bloch")]
 #[command(about = "Bloch-SIS Protocol — Module-SIS PoW · Falcon‖ML-DSA · GhostDAG-Q")]
-#[command(version)]
+#[command(version = env!("BLOCH_BUILD_VERSION"))]
 struct Cli {
     #[arg(long)]                                         mine: bool,
     /// Number of CPU cores the SIS miner grinds across in parallel. Each worker
