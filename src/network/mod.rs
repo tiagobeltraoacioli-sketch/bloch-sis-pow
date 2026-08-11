@@ -844,6 +844,17 @@ impl NetworkNode {
         let mut inflight_pull: std::collections::HashMap<
             libp2p::request_response::OutboundRequestId, NetworkMessage> =
             std::collections::HashMap::new();
+        // Re-gossip rate-limit. Serving a legacy-gossip `GetBlock` re-broadcasts the
+        // whole block to the mesh; external peers spamming `GetBlock` for the same
+        // blocks turned that into a `publish blocks [NewBlock]: Duplicate` storm that
+        // saturated the send path (and the request-response handler alongside it). We
+        // keep the FIRST publish of each block (gossipsub then relays it mesh-wide) and
+        // suppress re-publishes of the SAME block within a short window; a peer that
+        // missed the first broadcast re-requests after the window. Pruned on insert, so
+        // the map stays bounded to blocks seen within the TTL.
+        let mut recent_block_publishes: std::collections::HashMap<[u8; 32], std::time::Instant> =
+            std::collections::HashMap::new();
+        const REGOSSIP_SUPPRESS_TTL: Duration = Duration::from_secs(10);
         let mut heartbeat   = tokio::time::interval(Duration::from_secs(30));
         let mut save_peers  = tokio::time::interval(Duration::from_secs(60));
         // Sprint CC: periodic tip announce. Re-publishes the current
@@ -1031,18 +1042,30 @@ impl NetworkNode {
                         }
                         SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                             info!("✓ connected: {}", peer_id);
-                            swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                            // DO NOT call gossipsub.add_explicit_peer() here.
+                            //
+                            // An "explicit peer" in gossipsub is a manually-pinned direct
+                            // link that is DELIBERATELY EXCLUDED from mesh construction.
+                            // libp2p-gossipsub 0.49.5 behaviour.rs:2224 filters mesh graft
+                            // candidates with `!explicit_peers.contains(peer)`, and :1395
+                            // answers an incoming GRAFT from an explicit peer by PRUNING it
+                            // on every topic ("we don't GRAFT to/from explicit peers").
+                            //
+                            // Marking EVERY connection explicit therefore made the mesh
+                            // permanently unbuildable: heartbeat logged
+                            // "Mesh low. Topic contains: 0" and "RANDOM PEERS: Got 0 peers"
+                            // forever, publish() returned NoPeersSubscribedToTopic, and the
+                            // miner's blocks never reached the network — every non-mining
+                            // node stalled while the producer kept extending alone.
+                            // Reproduced with two fresh nodes on localhost (2026-08-07).
                             peer_count += 1;
                             crate::metrics::set_peer_count(peer_count as i64);
                             peer_state.on_connect(peer_id, Instant::now());
-                            // FIX v0.5.1: Re-announce subscriptions to new peer.
-                            // gossipsub only announces subs on initial connect,
-                            // but peer_score can ghost peers from mesh. Force
-                            // re-broadcast of our subscribed topics so the new
-                            // peer adds us to its mesh for blocks/txs/sync.
-                            for t in [&block_t, &tx_t, &sync_t] {
-                                let _ = swarm.behaviour_mut().gossipsub.subscribe(t);
-                            }
+                            // NOTE: re-calling gossipsub.subscribe() here would be a no-op —
+                            // it returns Ok(false) and sends nothing when the topic is already
+                            // subscribed (it logs "Topic is already in the mesh"). gossipsub
+                            // already sends our subscription set on connection establishment,
+                            // so there is nothing to force.
                             // Save peer address for next startup.
                             // Sprint P: also track listener peers (was a bug — only dialers
                             // entered known_peers, so known_peers.json only grew with outbound
@@ -1208,7 +1231,9 @@ impl NetworkNode {
                                     continue;
                                 }
                                 info!("mDNS discovered (LAN): {} at {}", peer_id, addr);
-                                swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                                // Same reason as the ConnectionEstablished arm above: an
+                                // explicit peer is excluded from the mesh. Just dial it and
+                                // let normal mesh maintenance graft it.
                                 if swarm.dial(addr).is_ok() { dialed += 1; }
                             }
                         }
@@ -1318,6 +1343,19 @@ impl NetworkNode {
                             None => publish_gossip(&mut swarm, &sync_t, &msg),
                         }
                         continue;
+                    }
+                    // Re-gossip rate-limit (see `recent_block_publishes` decl): drop a
+                    // re-broadcast of a block already published within the TTL. The first
+                    // broadcast + gossipsub relay covers the mesh; this kills the
+                    // GetBlock-serving amplification storm without changing which blocks
+                    // propagate.
+                    if let NetworkMessage::NewBlock { block_hash, .. } = &msg {
+                        let now = std::time::Instant::now();
+                        recent_block_publishes.retain(|_, t| now.duration_since(*t) < REGOSSIP_SUPPRESS_TTL);
+                        if recent_block_publishes.contains_key(block_hash) {
+                            continue;
+                        }
+                        recent_block_publishes.insert(*block_hash, now);
                     }
                     let (topic, topic_name) = match &msg {
                         NetworkMessage::NewBlock { .. }        => (block_t.clone(), "blocks"),

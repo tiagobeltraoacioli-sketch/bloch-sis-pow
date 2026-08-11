@@ -556,7 +556,11 @@ async fn main() {
         store.put_meta("current_bits", &genesis_bits.to_le_bytes())
             .expect("meta current_bits");
         dag.write().add_genesis(hash, genesis.header.timestamp);
-        if let Some(gdata) = dag.read().get_block_data(&hash).cloned() {
+        // Bind in a `let` so the read guard drops before the `dag.write()` inside
+        // (parking_lot RwLock is not reentrant — holding this read across the
+        // write deadlocks once the reachability gate is armed).
+        let gdata_opt = dag.read().get_block_data(&hash).cloned();
+        if let Some(gdata) = gdata_opt {
             // Sprint Y (M-2): atomic put to CF_DAG + CF_DAG_INTEGRITY.
             // Genesis anchors the hash-chain with an all-zero parent
             // integrity; see `compute_integrity_hash` for the convention.
@@ -727,7 +731,11 @@ async fn main() {
         }
 
         // Self-check the (loaded or rebuilt) index against the unbounded oracle.
-        if let Err(e) = dag.read().reach_self_check_sample(2000, 0xB10C_5157) {
+        // Bind in a `let` so the read guard drops before the rebuild's
+        // `dag.write()` below (non-reentrant RwLock — holding it across the write
+        // would deadlock the very path that recovers from a bad index).
+        let self_check = dag.read().reach_self_check_sample(2000, 0xB10C_5157);
+        if let Err(e) = self_check {
             if loaded_ok {
                 warn!("loaded reachability failed self-check ({e}); rebuilding from CF_DAG");
                 match dag.write().rebuild_reachability_from_store() {
@@ -1751,7 +1759,12 @@ async fn main() {
                         // Phase 1: fold the reachability delta into the same
                         // atomic write when the index is maintained; live Legacy
                         // path is byte-for-byte unchanged.
-                        if let Some(ddata) = dag_m.read().get_block_data(&hash).cloned() {
+                        // Bind in a `let` first so the read guard drops before
+                        // `dag_m.write()` below — parking_lot RwLock is not
+                        // reentrant, and holding the read across the write
+                        // deadlocks once the reachability gate is armed.
+                        let ddata_opt = dag_m.read().get_block_data(&hash).cloned();
+                        if let Some(ddata) = ddata_opt {
                             if dag_m.read().maintains_reachability_index() {
                                 let (upserts, removals) = dag_m.write().reach_take_delta();
                                 store_m.put_dag_with_integrity_and_reach(&hash, &ddata, &upserts, &removals).ok();
@@ -2297,6 +2310,25 @@ fn accept_block(
     // {} scope ensures the lock drops immediately.
     let old_tip = { dag.read().selected_tip() };
 
+    // ── Early dedup ──────────────────────────────────────────────────
+    // A block already in the DAG needs no re-validation. Return the same
+    // "already in DAG" rejection `add_block` produces, but BEFORE tx
+    // validation — so a re-gossip / IBD re-request flood of known blocks
+    // stays cheap now that the finality gate below no longer rejects (and
+    // thereby short-circuits) below-finality blocks.
+    if dag.read().get_block_data(&block_hash).is_some() {
+        return Err(format!(
+            "consensus rejection: block already in DAG: {}",
+            hex::encode(block_hash)
+        ));
+    }
+
+    // finalized_height bounds both the difficulty re-validation just below and
+    // the disposition guard further down. Read it once, up front.
+    let finalized_height = store.get_meta("finalized_height").ok().flatten()
+        .and_then(|b| b.as_slice().try_into().ok().map(u64::from_le_bytes))
+        .unwrap_or(0);
+
     // ── FIX VULN-01: Validate difficulty bits match expected ──────────
     // ASERT-Lattice (B5c): expected bits are derived per-block from the
     // parent timestamp + genesis anchor — miner and validator agree by
@@ -2304,22 +2336,39 @@ fn accept_block(
     // uses a FIXED difficulty (GENESIS2_BITS): the SIS ASERT path re-anchors to
     // mainnet constants and interprets `bits` with SIS semantics, neither of
     // which applies to a fresh SHA-256d chain — so it is bypassed here.
-    let parent_ts = store.get_timestamp_at_height(block.height.saturating_sub(1))
-        .ok().flatten().unwrap_or(core::GENESIS_TIMESTAMP);
-    let expected_bits = if matches!(core::pow_algorithm(core::node_chain_id()),
-                                    core::PowAlgorithm::Sha256d) {
-        // Both SHA-256d chains (Genesis-2 devnet, Genesis-3 mainnet).
-        genesis2_expected_bits(store, block.height)
-    } else {
-        pow::next_bits(
-            core::GENESIS_BITS, core::GENESIS_TIMESTAMP, parent_ts, block.height,
-        )
-    };
-    if block.header.bits != expected_bits {
-        return Err(format!(
-            "invalid difficulty: block bits 0x{:08x} != expected 0x{:08x}",
-            block.header.bits, expected_bits
-        ));
+    //
+    // FINALITY FLOOR (backfill dead-lock fix): expected_bits is re-derived from
+    // this block's ancestor history in `store` (retarget window). Below the
+    // finality checkpoint a *syncing* node's copy of that history may be
+    // pruned/incomplete, so the re-derivation yields the WRONG expected value
+    // and a FALSE "invalid difficulty". That false reject dead-locks backfill:
+    // the required below-finality fork-loser is re-requested and re-rejected
+    // forever, so a heavier block's mergeset never closes, the selected tip
+    // freezes, and IBD never releases (exactly what stranded followers at the
+    // damaged fork). A below-finality block is settled history — it already
+    // passed structural PoW in `validate_structure()` and can only ever be an
+    // inert fork-loser, NEVER the selected tip (enforced at the disposition
+    // guard below + the MAX_REORG_DEPTH == CHECKPOINT_DEPTH cap). So re-derive
+    // and check difficulty only ABOVE finality (assume-valid-below-checkpoint,
+    // matching the fork-loser retention policy documented at the guard below).
+    if block.height > finalized_height {
+        let parent_ts = store.get_timestamp_at_height(block.height.saturating_sub(1))
+            .ok().flatten().unwrap_or(core::GENESIS_TIMESTAMP);
+        let expected_bits = if matches!(core::pow_algorithm(core::node_chain_id()),
+                                        core::PowAlgorithm::Sha256d) {
+            // Both SHA-256d chains (Genesis-2 devnet, Genesis-3 mainnet).
+            genesis2_expected_bits(store, block.height)
+        } else {
+            pow::next_bits(
+                core::GENESIS_BITS, core::GENESIS_TIMESTAMP, parent_ts, block.height,
+            )
+        };
+        if block.header.bits != expected_bits {
+            return Err(format!(
+                "invalid difficulty: block bits 0x{:08x} != expected 0x{:08x}",
+                block.header.bits, expected_bits
+            ));
+        }
     }
 
     // ── FIX VULN-02: Validate height matches DAG position ────────────
@@ -2344,18 +2393,20 @@ fn accept_block(
         }
     }
 
-    // ── Finality checkpoint: reject deep reorgs ──────────────────────
-    {
-        let finalized_height = store.get_meta("finalized_height").ok().flatten()
-            .and_then(|b| b.as_slice().try_into().ok().map(u64::from_le_bytes))
-            .unwrap_or(0);
-        if block.height <= finalized_height {
-            return Err(format!(
-                "finality: block h={} at or below finalized height {}",
-                block.height, finalized_height
-            ));
-        }
-    }
+    // ── Finality checkpoint ──────────────────────────────────────────
+    // A block at or below the finalized height is NOT rejected here. It may
+    // be a required GhostDAG mergeset member — a red/side "fork-loser" in a
+    // heavier block's past — and discarding its body is exactly what starved
+    // tip-selection and IBD: nodes advertised headers whose bodies no one
+    // retained ("body unavailable / an archival peer is needed"), so the
+    // selected tip froze while blue_score kept climbing. Finality is enforced
+    // where it matters instead — a below-finality block must never become the
+    // SELECTED tip — at the disposition guard below (and, redundantly, by the
+    // MAX_REORG_DEPTH cap in execute_reorg, since MAX_REORG_DEPTH ==
+    // CHECKPOINT_DEPTH: any flip landing at/below finalized_height is > that
+    // depth and already refused). Inert fork-losers are retained so the DAG
+    // stays complete and every advertised body is servable.
+    // (`finalized_height` was read up-front, above the difficulty check.)
 
     // ── FIX VULN-04: Validate timestamp ──────────────────────────────
     {
@@ -2542,6 +2593,26 @@ fn accept_block(
         _ => Disposition::Unexpected,
     };
 
+    // ── Finality invariant: below-finality blocks stay inert ─────────
+    // A block at or below the finalized height is welcome in the DAG as a
+    // fork-loser (its body was retained above), but it must NEVER become the
+    // selected tip — that would rewrite finalized history. In practice an
+    // Extension cannot reach here below finality (it extends a tip already
+    // above it), and a Reorg flipping the tip below finality is over-deep and
+    // also refused by MAX_REORG_DEPTH; this guard makes the invariant explicit
+    // and independent of that constant. Roll the in-memory insertion back the
+    // same way the refused-reorg path does (nothing is persisted to CF_DAG
+    // yet; the body left in CF_BLOCKS is inert).
+    if block.height <= finalized_height
+        && matches!(disposition, Disposition::Extension | Disposition::Reorg)
+    {
+        dag.write().remove_block(&block_hash);
+        return Err(format!(
+            "finality: block h={} may not become the selected tip at or below finalized height {}",
+            block.height, finalized_height
+        ));
+    }
+
     match disposition {
         Disposition::ForkLoser => {
             info!(
@@ -2663,7 +2734,13 @@ fn accept_block(
     // disposition above has been applied successfully. Every refusal path
     // above rolled the in-memory insertion back and returned Err, so CF_DAG
     // can never adopt a fork tip whose chain state was refused.
-    if let Some(ddata) = dag.read().get_block_data(&block_hash).cloned() {
+    // NOTE: bind the cloned data in its own `let` so the `dag.read()` guard is
+    // released at the `;` — parking_lot's RwLock is NOT reentrant, so keeping a
+    // read guard alive across `dag.write()` below deadlocks (write parks waiting
+    // for the reader that this same thread holds). Harmless while Legacy left the
+    // index untouched; a hard hang once the reachability gate arms `dag.write()`.
+    let ddata_opt = dag.read().get_block_data(&block_hash).cloned();
+    if let Some(ddata) = ddata_opt {
         // Sprint Y (M-2): atomic put to CF_DAG + CF_DAG_INTEGRITY.
         // Phase 1: when the reachability index is maintained, fold its delta
         // (which may span several blocks if this insert triggered a reindex)
@@ -3680,6 +3757,155 @@ mod external_submission_tests {
             tip_meta.as_slice(), &r_next_hash[..],
             "applied chain state (tip_hash meta / UTXO apply) must advance \
              with the real chain",
+        );
+    }
+
+    /// Root-cause regression for the red/side-block body-retention starvation
+    /// that froze tip-selection (selected tip stuck while blue_score climbed)
+    /// and stalled IBD ("body unavailable — an archival peer is needed").
+    ///
+    /// A block at or below the finalized height that is a *fork-loser* must be
+    /// ACCEPTED and RETAINED (body in CF_BLOCKS + entry in the DAG) so it can
+    /// serve as a GhostDAG mergeset member — it must NOT be rejected by the
+    /// finality checkpoint, and it must NOT move the selected tip. Pre-fix,
+    /// accept_block rejected it outright ("finality: ... at or below finalized
+    /// height"), so its body was never stored and no node could serve it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn below_finality_fork_loser_is_retained_not_rejected() {
+        let g_ts    = unix_now();
+        let genesis = mk_genesis(g_ts);
+        let node    = node_with_genesis(&genesis);
+        let gh      = genesis.block_hash();
+
+        // Real chain: genesis → r1 … r5, all through the real accept path.
+        let mut parent = gh;
+        let mut r1 = gh;
+        for i in 1..=5u64 {
+            let b = mk_block_at(&node, parent, i, g_ts + 30 * i, i);
+            accept(&node, &b).expect("real-chain block must be accepted");
+            if i == 1 { r1 = b.block_hash(); }
+            parent = b.block_hash();
+        }
+        let real_tip = parent;
+
+        // Simulate a finalized checkpoint at height 3 (as a live node sets once
+        // its tip is CHECKPOINT_DEPTH ahead).
+        node.store.put_meta("finalized_height", &3u64.to_le_bytes())
+            .expect("set finalized_height");
+
+        // A side block at height 2 (<= finalized 3): sibling of r2 (same parent
+        // r1, distinct nonce → distinct hash). It is a fork-loser — the real
+        // chain to r5 has far more blue work.
+        let fork = mk_block_at(&node, r1, 2, g_ts + 30 * 2, 987_654);
+        let fork_hash = fork.block_hash();
+        assert_ne!(fork_hash, real_tip);
+
+        let res = accept(&node, &fork);
+        assert!(
+            res.is_ok(),
+            "a below-finality FORK-LOSER must be accepted (retained as a \
+             mergeset member), not rejected by finality; got: {:?}", res,
+        );
+
+        // Retained: body servable + present in the DAG.
+        assert!(
+            node.store.get_block(&fork_hash).expect("body read").is_some(),
+            "below-finality fork-loser body must be RETAINED in CF_BLOCKS \
+             (else peers answer 'body unavailable')",
+        );
+        assert!(
+            node.dag.read().get_block_data(&fork_hash).is_some(),
+            "below-finality fork-loser must be present in the DAG",
+        );
+
+        // Inert: it must NOT move the selected tip (finality invariant intact).
+        assert_eq!(
+            node.dag.read().selected_tip(), Some(real_tip),
+            "a below-finality fork-loser must NOT become the selected tip",
+        );
+
+        // And re-submitting it is a cheap dedup no-op rejection, not a re-run.
+        let again = accept(&node, &fork);
+        assert!(
+            again.is_err() && again.unwrap_err().contains("already in DAG"),
+            "a block already in the DAG must be rejected by the early dedup",
+        );
+    }
+
+    /// Root-cause regression for the BACKFILL DEAD-LOCK that stranded followers
+    /// at the damaged fork. `accept_block` re-derives expected difficulty bits
+    /// from the block's ancestor history in `store`. On a *syncing* node that
+    /// history is pruned/incomplete below the finality checkpoint, so the
+    /// re-derivation yields the WRONG expected value → a FALSE "invalid
+    /// difficulty" reject. Because the rejected block is a required below-finality
+    /// fork-loser (a heavier block's mergeset member), it is re-requested and
+    /// re-rejected forever: the mergeset never closes, the selected tip freezes,
+    /// IBD never releases. Fix: skip the difficulty re-derivation at/below
+    /// `finalized_height` (assume-valid-below-checkpoint) — the block is settled
+    /// history that can only ever be an inert fork-loser. The check stays fully
+    /// enforced ABOVE finality, where the ancestor context is complete.
+    ///
+    /// NOTE: `accept()` calls `accept_block` directly (structural PoW/merkle are
+    /// validated upstream in the NewBlock handler, not here), so mutating
+    /// `header.bits` exercises exactly the accept_block difficulty gate.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn below_finality_skips_difficulty_recheck() {
+        let g_ts    = unix_now();
+        let genesis = mk_genesis(g_ts);
+        let node    = node_with_genesis(&genesis);
+        let gh      = genesis.block_hash();
+
+        // Real chain: genesis → r1 … r5.
+        let mut parent = gh;
+        let mut r1 = gh;
+        let mut r3 = gh;
+        for i in 1..=5u64 {
+            let b = mk_block_at(&node, parent, i, g_ts + 30 * i, i);
+            accept(&node, &b).expect("real-chain block must be accepted");
+            if i == 1 { r1 = b.block_hash(); }
+            if i == 3 { r3 = b.block_hash(); }
+            parent = b.block_hash();
+        }
+        let real_tip = parent;
+
+        // Finalize at height 3.
+        node.store.put_meta("finalized_height", &3u64.to_le_bytes())
+            .expect("set finalized_height");
+
+        // (1) BELOW finality (h=2 ≤ 3): fork-loser sibling of r2 with the WRONG
+        // difficulty bits. Pre-fix this was rejected "invalid difficulty" and
+        // dead-locked backfill; post-fix the difficulty re-check is skipped
+        // below finality and the block is retained as an inert fork-loser.
+        let mut below = mk_block_at(&node, r1, 2, g_ts + 30 * 2, 111_222);
+        let good_bits = below.header.bits;
+        below.header.bits = good_bits ^ 0x0000_0001; // != expected
+        assert_ne!(below.header.bits, good_bits);
+        let below_hash = below.block_hash();
+        let res = accept(&node, &below);
+        assert!(
+            res.is_ok(),
+            "below-finality block must SKIP the difficulty re-check and be \
+             retained as a fork-loser; got: {:?}", res,
+        );
+        assert!(
+            node.dag.read().get_block_data(&below_hash).is_some(),
+            "below-finality fork-loser must be present in the DAG",
+        );
+        assert_eq!(
+            node.dag.read().selected_tip(), Some(real_tip),
+            "below-finality fork-loser must NOT move the selected tip",
+        );
+
+        // (2) ABOVE finality (h=4 > 3): sibling of r4 with WRONG bits. The
+        // difficulty check MUST still fire here — the floor only lifts the check
+        // below finality, never above it.
+        let mut above = mk_block_at(&node, r3, 4, g_ts + 30 * 4, 333_444);
+        above.header.bits ^= 0x0000_0001; // != expected
+        let res2 = accept(&node, &above);
+        assert!(
+            res2.is_err() && res2.as_ref().unwrap_err().contains("invalid difficulty"),
+            "above-finality block with wrong bits must STILL be rejected for \
+             difficulty; got: {:?}", res2,
         );
     }
 }

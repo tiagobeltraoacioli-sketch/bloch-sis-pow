@@ -16,9 +16,10 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
-use crate::merged_engine::{create_round, decide_submit, submit_win, MergedConfig, SubmitAction};
+use crate::addr::{parse_worker_username, WorkerPayout};
+use crate::merged_engine::{create_round, decide_submit, submit_win, MergedConfig, MergedRound, SubmitAction};
 use crate::mergedmining::{classify_merged_share, merged_job_to_notify, MergedJob};
-use crate::rpc::{AuxBlockInfo, RpcClient};
+use crate::rpc::RpcClient;
 use crate::btc_rpc::BtcRpcClient;
 use crate::types::PoolError;
 use crate::validator::difficulty_to_target;
@@ -46,8 +47,12 @@ pub struct MergedWorker {
     share_diff: f64,
     worker_target: [u8; 32],
     authorized: bool,
+    /// Where THIS worker's rewards go, parsed from the Stratum username.
+    payout: Option<WorkerPayout>,
     round: Option<MergedJob>,
     aux_hash: Option<[u8; 32]>,
+    /// The parent-BTC transactions the current round's header commits to.
+    btc_txs: Vec<Vec<u8>>,
 }
 
 impl MergedWorker {
@@ -57,8 +62,10 @@ impl MergedWorker {
             share_diff,
             worker_target: difficulty_to_target(share_diff),
             authorized: false,
+            payout: None,
             round: None,
             aux_hash: None,
+            btc_txs: Vec::new(),
         }
     }
 
@@ -68,6 +75,14 @@ impl MergedWorker {
     pub fn has_round(&self) -> bool {
         self.round.is_some()
     }
+    /// This worker's declared payout targets (set by `mining.authorize`).
+    pub fn payout(&self) -> Option<&WorkerPayout> {
+        self.payout.as_ref()
+    }
+    /// The current round's parent-BTC transactions (for a BTC-target relay).
+    pub fn btc_txs(&self) -> &[Vec<u8>] {
+        &self.btc_txs
+    }
     /// Total extranonce length (en1 + en2) the round's coinbase must reserve.
     pub fn extranonce_total_len() -> usize {
         EN1_LEN + EN2_SIZE
@@ -75,9 +90,10 @@ impl MergedWorker {
 
     /// Install a fresh round (from [`create_round`]); the loop then serves
     /// [`Self::set_difficulty_line`] + [`Self::notify_line`].
-    pub fn set_round(&mut self, aux: &AuxBlockInfo, job: MergedJob) {
-        self.aux_hash = Some(aux.hash);
-        self.round = Some(job);
+    pub fn set_round(&mut self, round: MergedRound) {
+        self.aux_hash = Some(round.aux.hash);
+        self.round = Some(round.job);
+        self.btc_txs = round.btc_txs;
     }
 
     /// `mining.set_difficulty` for this worker's share difficulty.
@@ -105,9 +121,30 @@ impl MergedWorker {
 
         match method {
             "mining.subscribe" => WorkerReaction::Send(vec![self.subscribe_reply(&id)]),
+            // OPEN pool: the username DECLARES where this worker's rewards go.
+            // Refuse rather than serve jobs whose coinbase would pay someone
+            // else — a silent fallback to the operator's address is exactly the
+            // failure mode a non-custodial pool must not have.
             "mining.authorize" => {
-                self.authorized = true; // solo/merged: node owns payout addr, any worker ok
-                WorkerReaction::Send(vec![ok_true(&id)])
+                let user = params.first().and_then(Value::as_str).unwrap_or("");
+                match parse_worker_username(user) {
+                    Some(p) => {
+                        log::info!(
+                            "merged: worker authorized — bloch={} btc={} label={}",
+                            p.bloch_addr,
+                            p.btc_script.as_deref().map_or("operator-fallback".into(), hex::encode),
+                            p.label.as_deref().unwrap_or("-"),
+                        );
+                        self.payout = Some(p);
+                        self.authorized = true;
+                        WorkerReaction::Send(vec![ok_true(&id)])
+                    }
+                    None => WorkerReaction::Send(vec![err(
+                        &id,
+                        24,
+                        "username must be <bloch-address>[.<btc-address>][.<label>]",
+                    )]),
+                }
             }
             "mining.submit" => self.handle_submit(&id, &params),
             // Version-rolling negotiation: accept a permissive mask so ASICs proceed.
@@ -164,7 +201,7 @@ impl MergedWorker {
         match &action {
             SubmitAction::Nothing => WorkerReaction::Send(vec![err(id, 23, "share above target")]),
             SubmitAction::Share => WorkerReaction::Send(vec![ok_true(id)]),
-            SubmitAction::Bloch { .. } | SubmitAction::BtcAndBloch { .. } => WorkerReaction::Win {
+            SubmitAction::Bloch { .. } | SubmitAction::Btc { .. } | SubmitAction::BtcAndBloch { .. } => WorkerReaction::Win {
                 reply: ok_true(id),
                 aux_hash: self.aux_hash.unwrap_or([0u8; 32]),
                 action,
@@ -227,8 +264,11 @@ pub async fn serve_merged(
                     }
                     WorkerReaction::Win { reply, aux_hash, action } => {
                         send_line(&mut wr, &reply).await?;
-                        match submit_win(&node, &btc, &aux_hash, &action).await {
-                            Ok(Some(h)) => log::info!("merged: BLOCH BLOCK accepted by node: {h}"),
+                        match submit_win(&node, &btc, &aux_hash, &action, worker.btc_txs()).await {
+                            Ok(Some(h)) => log::info!(
+                                "merged: BLOCH BLOCK accepted by node: {h} (payout {})",
+                                worker.payout().map_or("?", |p| p.bloch_addr.as_str()),
+                            ),
                             Ok(None)    => {}
                             Err(e)      => log::warn!("merged: submit_win failed: {e}"),
                         }
@@ -253,9 +293,15 @@ async fn start_round(
 ) -> Result<(), PoolError> {
     *round_ctr += 1;
     let job_id = format!("m{round_ctr:x}");
-    let (aux, job) =
-        create_round(node, btc, cfg, job_id, MergedWorker::extranonce_total_len()).await?;
-    worker.set_round(&aux, job);
+    // Build the round against THIS worker's payout targets, falling back to the
+    // operator's config only for a part the worker did not declare.
+    let effective = match worker.payout() {
+        Some(p) => cfg.with_payout(&p.bloch_addr, p.btc_script.as_deref()),
+        None => cfg.clone(),
+    };
+    let round =
+        create_round(node, btc, &effective, job_id, MergedWorker::extranonce_total_len()).await?;
+    worker.set_round(round);
     send_line(wr, &worker.set_difficulty_line()).await?;
     if let Some(n) = worker.notify_line(true) {
         send_line(wr, &n).await?;
@@ -290,9 +336,11 @@ mod tests {
         };
         let job = build_round_job("m1".into(), &aux, &tmpl, &[0x51], b"tag", MergedWorker::extranonce_total_len());
         w.authorized = true;
-        w.set_round(&aux, job);
+        w.set_round(crate::merged_engine::MergedRound { aux, job, btc_txs: vec![] });
         w
     }
+
+    const TEST_USER: &str = "bloch1qe986db5149cff7499b282a048272a09aff0af4ff84242073.bc1qjpnqq4f6hjh2n39tzwy8ttrj4h78yx22retkyk";
 
     #[test]
     fn subscribe_advertises_extranonce() {
@@ -308,12 +356,37 @@ mod tests {
     }
 
     #[test]
-    fn authorize_marks_authorized_and_replies_true() {
+    fn authorize_records_the_workers_own_payout_targets() {
         let mut w = MergedWorker::new([0; 4], 1.0);
         assert!(!w.is_authorized());
-        let r = w.handle_line(r#"{"id":2,"method":"mining.authorize","params":["addr","x"]}"#);
+        let r = w.handle_line(&format!(
+            r#"{{"id":2,"method":"mining.authorize","params":["{TEST_USER}","x"]}}"#
+        ));
         assert!(matches!(r, WorkerReaction::Send(l) if l[0].contains("\"result\":true")));
         assert!(w.is_authorized());
+        let p = w.payout().expect("payout parsed from username");
+        assert_eq!(p.bloch_addr, "bloch1qe986db5149cff7499b282a048272a09aff0af4ff84242073");
+        assert_eq!(
+            hex::encode(p.btc_script.as_ref().unwrap()),
+            "0014906600553abcaea9c4ab138875ac72adfc72194a"
+        );
+    }
+
+    /// An open pool must not mine a stranger's coinbase into the operator's
+    /// wallet: no parseable Bloch address → no authorize, no jobs.
+    #[test]
+    fn authorize_without_a_bloch_address_is_refused() {
+        let mut w = MergedWorker::new([0; 4], 1.0);
+        let r = w.handle_line(r#"{"id":2,"method":"mining.authorize","params":["addr","x"]}"#);
+        match r {
+            WorkerReaction::Send(l) => {
+                assert!(l[0].contains("username must be"), "explains the grammar: {}", l[0]);
+                assert!(l[0].contains("\"result\":null"));
+            }
+            other => panic!("expected an error reply, got {other:?}"),
+        }
+        assert!(!w.is_authorized());
+        assert!(w.payout().is_none());
     }
 
     #[test]

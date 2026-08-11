@@ -559,7 +559,28 @@ pub enum ColoringMode {
 /// to exercise `Fast` on a throwaway datadir; it is node-local and is NOT and
 /// cannot be a substitute for setting this height. Until this constant changes,
 /// every live node stays byte-for-byte on the `Legacy` coloring.
-pub const CORRECTED_COLORING_ACTIVATION_HEIGHT: u64 = u64::MAX;
+///
+/// WS-A (2026-08-05): armed to a FUTURE flag-day height. The replay-snapshot
+/// proof (h18532) showed `Fast` is NOT byte-identical to `Legacy` — it diverges
+/// only in the `blues_anticone_sizes` metadata field (Legacy's bounded seed
+/// under-counts), with **zero** blue_score / mergeset / selected-chain / balance
+/// changes. Adopting the exact `Fast` coloring is therefore a consensus change
+/// and MUST be gated at a height ABOVE every already-mined block: history below
+/// the gate keeps its Legacy `GhostdagData` (no reorg, no balance recompute) and
+/// only blocks at/above the gate use the exact index-based coloring.
+///
+/// ⚠️ OPERATOR: re-confirm this value at flag-day BUILD time. It should sit at/near
+/// the chain tip when the binary is deployed so `Fast` activates promptly and the
+/// authoritative miner is not stranded on the heavy `Legacy` coloring of the wide
+/// damaged-fork anticone (which starves RPC/block-production under armed+mining).
+/// FLAG-DAY LOWERED 2026-08-06 from 40_000 → 21_430: the 40k value left the miner
+/// ~18k blocks (~6 days) of degraded Legacy operation. 21_430 was just above the
+/// live tip (~21_426) at deploy, so only NEW blocks (height ≥ H) use the O(k) index
+/// coloring — already-stored blocks keep their Legacy `GhostdagData` (no reorg, no
+/// balance recompute), and `Fast`≡`Legacy` in decisions (replay: 0 flips on 18,532
+/// real blocks) so a late sibling/reorg landing at a boundary height is consistent.
+/// All armed nodes SHOULD run the same H.
+pub const CORRECTED_COLORING_ACTIVATION_HEIGHT: u64 = 21_430;
 
 pub struct GhostDAG {
     pub k: usize,
@@ -1216,90 +1237,126 @@ impl GhostDAG {
         (mergeset_blues, mergeset_reds, blues_anticone_sizes)
     }
 
-    /// Fast, interval-index-backed twin of [`classify_mergeset`].
+    /// WS-B: compact, `O(k · mergeset)` GHOSTDAG coloring (Kaspa protocol).
     ///
-    /// This is a **line-for-line structural copy** of `classify_mergeset` — the
-    /// same blue-set seeding via `past_blue_set` (with its `k*100` bound
-    /// preserved verbatim), the same topological candidate order, the same
-    /// whole-blue-set `blues_anticone_sizes` map shape — with exactly ONE
-    /// difference: every "is X in the anticone of Y?" test routes through the
-    /// O(1)/O(log n) reachability index instead of the bounded backwards BFS in
-    /// `is_ancestor`.
+    /// Replaces the old whole-blue-set seed + per-candidate full-set scan — which
+    /// walked the ENTIRE selected chain (`past_blue_set_unbounded`, O(depth)) and
+    /// materialized every historical blue — with a BOUNDED selected-chain walk:
+    /// for each mergeset candidate we scan only each chain block's
+    /// `mergeset_blues`, stopping the instant a chain block is an ancestor of the
+    /// candidate (everything deeper is in the candidate's past, never its
+    /// anticone). The per-block `blues_anticone_sizes` map is now COMPACT — only
+    /// the blues this block adds and the sizes it bumps — and is read back for
+    /// later blocks via [`blue_anticone_size`](Self::blue_anticone_size).
     ///
-    /// Consequence: for any DAG on which the legacy bounded BFS never returns a
-    /// false negative, this produces a BYTE-IDENTICAL `GhostdagData`. Where the
-    /// legacy bound *did* bite, the two differ — and that difference is a
-    /// consensus question (see [`ColoringMode`]), which is why this path is
-    /// opt-in and the divergence is measured by the differential test rather
-    /// than silently adopted.
+    /// Byte-identity note: the blue/red DECISIONS — hence `mergeset_blues`,
+    /// `blue_score`, and the selected chain — are identical to the exact
+    /// whole-set algorithm (validated against Legacy by `ghostdag_differential`).
+    /// The `blues_anticone_sizes` map SHAPE differs (compact vs whole-history);
+    /// that difference is exactly the gated-consensus metadata change activated
+    /// with the reachability index at [`CORRECTED_COLORING_ACTIVATION_HEIGHT`].
     fn classify_mergeset_fast(
         &self,
         mergeset: &[BlockHash],
         selected_parent: &BlockHash,
     ) -> (Vec<BlockHash>, Vec<BlockHash>, HashMap<BlockHash, usize>) {
-        // Seed from the EXACT (unbounded) blue lineage. This is the second half
-        // of the correctness fix: the legacy seed (`past_blue_set`) truncates the
-        // selected-chain walk at `k*100` and silently under-counts on deep DAGs.
-        // The Fast path removes that bound so NO silent-approximation walk remains
-        // reachable once Fast is active (the grep-enforceable acceptance goal).
-        // Where the legacy bound never bit, this is byte-identical to the legacy
-        // seed; where it did, this diverges — exactly the gated consensus change.
-        let mut blue_set: HashSet<BlockHash> = self.past_blue_set_unbounded(selected_parent);
-        blue_set.insert(*selected_parent);
+        // Re-seeded semantics matching `classify_mergeset` (the consensus
+        // reference), but with its O(depth) whole-blue-set seed + per-candidate
+        // full scan replaced by the BOUNDED chain walk in
+        // `candidate_anticone_blues`. `cur_blues_anticone_sizes` is COMPACT: an
+        // entry exists only once a blue's (re-seeded) anticone count is set —
+        // `selected_parent`, this block's own mergeset blues, and any historical
+        // blue this block bumps. An absent blue counts as 0. This is exactly the
+        // whole-history map with its zero entries dropped, so it carries the SAME
+        // value on every key it keeps (validated by `ghostdag_differential`).
+        // The selected parent is seeded blue (size 0) and stripped from the
+        // returned `mergeset_blues` (blue_score = sp.blue_score + |blues| + 1).
+        let mut cur_mergeset_blues: Vec<BlockHash> = Vec::with_capacity(mergeset.len() + 1);
+        let mut cur_blues_anticone_sizes: HashMap<BlockHash, usize> = HashMap::new();
+        cur_mergeset_blues.push(*selected_parent);
+        cur_blues_anticone_sizes.insert(*selected_parent, 0);
 
-        let mut blues_anticone_sizes: HashMap<BlockHash, usize> = HashMap::new();
-
-        let mut mergeset_blues = Vec::new();
-        let mut mergeset_reds = Vec::new();
-
-        for b in &blue_set {
-            blues_anticone_sizes.insert(*b, 0);
-        }
+        let mut mergeset_reds: Vec<BlockHash> = Vec::new();
 
         for &candidate in mergeset {
-            let candidate_anticone_in_blue = blue_set.iter()
-                .filter(|&b| self.is_in_anticone_fast(&candidate, b))
-                .count();
+            // Every blue in the candidate's anticone (bounded selected-chain walk).
+            let anticone_blues =
+                self.candidate_anticone_blues(selected_parent, &cur_mergeset_blues, &candidate);
 
-            if candidate_anticone_in_blue > self.k {
+            // Constraint (a): |anticone(candidate) ∩ blue_set| ≤ k.
+            if anticone_blues.len() > self.k {
+                mergeset_reds.push(candidate);
+                continue;
+            }
+            // Constraint (b): colouring the candidate blue must not push any blue
+            // it lands in the anticone of over k (re-seeded count, absent = 0).
+            let violates_b = anticone_blues
+                .iter()
+                .any(|b| *cur_blues_anticone_sizes.get(b).unwrap_or(&0) + 1 > self.k);
+            if violates_b {
                 mergeset_reds.push(candidate);
                 continue;
             }
 
-            let mut constraint_b_ok = true;
-            for (&blue_block, &current_anticone_size) in &blues_anticone_sizes {
-                let in_anticone = self.is_in_anticone_fast(&candidate, &blue_block);
-                if in_anticone && current_anticone_size + 1 > self.k {
-                    constraint_b_ok = false;
-                    break;
-                }
-            }
-
-            if !constraint_b_ok {
-                mergeset_reds.push(candidate);
-                continue;
-            }
-
-            mergeset_blues.push(candidate);
-            blue_set.insert(candidate);
-            blues_anticone_sizes.insert(candidate, candidate_anticone_in_blue);
-
-            for (&blue_block, anticone_size) in blues_anticone_sizes.iter_mut() {
-                if blue_block != candidate && self.is_in_anticone_fast(&candidate, &blue_block) {
-                    *anticone_size += 1;
-                }
+            // Blue: record its own count and bump every blue in its anticone.
+            cur_mergeset_blues.push(candidate);
+            cur_blues_anticone_sizes.insert(candidate, anticone_blues.len());
+            for b in &anticone_blues {
+                *cur_blues_anticone_sizes.entry(*b).or_insert(0) += 1;
             }
         }
 
-        (mergeset_blues, mergeset_reds, blues_anticone_sizes)
+        let mergeset_blues: Vec<BlockHash> =
+            cur_mergeset_blues.into_iter().filter(|b| b != selected_parent).collect();
+        (mergeset_blues, mergeset_reds, cur_blues_anticone_sizes)
     }
 
-    /// Anticone test via the reachability index. Semantically identical to
-    /// [`is_in_anticone`] but backed by the unbounded interval index rather
-    /// than the bounded BFS.
-    fn is_in_anticone_fast(&self, a: &BlockHash, b: &BlockHash) -> bool {
-        if a == b { return false; }
-        !self.reach.is_dag_ancestor(a, b) && !self.reach.is_dag_ancestor(b, a)
+    /// Collect every blue in the candidate's anticone via a BOUNDED selected-chain
+    /// walk. Phase 0 scans the block-under-construction's own blues
+    /// (`selected_parent` + mergeset candidates already coloured blue). Phase 1
+    /// walks `selected_parent` and up, stopping the instant a chain block is an
+    /// ancestor of the candidate — everything deeper is in the candidate's past,
+    /// never its anticone. Each block belongs to exactly one mergeset, so there
+    /// are no duplicates. This replaces the old O(depth) `past_blue_set_unbounded`
+    /// seed + full-set scan while producing the identical anticone set.
+    fn candidate_anticone_blues(
+        &self,
+        selected_parent: &BlockHash,
+        cur_mergeset_blues: &[BlockHash],
+        candidate: &BlockHash,
+    ) -> Vec<BlockHash> {
+        let mut out: Vec<BlockHash> = Vec::new();
+
+        // Phase 0 — the under-construction block's own accumulated blues.
+        for &blue in cur_mergeset_blues {
+            if !self.reach.is_dag_ancestor(&blue, candidate)
+                && !self.reach.is_dag_ancestor(candidate, &blue)
+            {
+                out.push(blue);
+            }
+        }
+
+        // Phase 1 — selected_parent and up, until an ancestor of the candidate.
+        let mut chain = Some(*selected_parent);
+        while let Some(h) = chain {
+            if self.reach.is_dag_ancestor(&h, candidate) {
+                break;
+            }
+            let d = match self.store.get(&h) {
+                Some(d) => d,
+                None => break, // missing ancestor (shouldn't happen) — stop
+            };
+            for &blue in &d.mergeset_blues {
+                if !self.reach.is_dag_ancestor(&blue, candidate)
+                    && !self.reach.is_dag_ancestor(candidate, &blue)
+                {
+                    out.push(blue);
+                }
+            }
+            chain = d.selected_parent;
+        }
+
+        out
     }
 
     /// Compute |anticone(candidate) ∩ blue_set|
@@ -1354,34 +1411,6 @@ impl GhostDAG {
                 }
                 cur = data.selected_parent;
                 depth += 1;
-            } else {
-                break;
-            }
-        }
-        blue
-    }
-
-    /// Exact, UNBOUNDED twin of [`past_blue_set`]: walks the full selected-parent
-    /// chain to genesis with no depth cap and no truncation warning. Used only by
-    /// the `Fast` coloring path, where correctness (not bug-compatibility) is the
-    /// goal. On any DAG where the legacy `k*100` bound never bit this returns the
-    /// identical set; where it did, this returns the complete blue lineage the
-    /// legacy walk dropped — the divergence the activation gate coordinates.
-    ///
-    /// Performance note: O(selected-chain depth) per classification, same shape
-    /// as the legacy walk but without the early exit. The reachability index
-    /// removes the dominant O(|mergeset|·|blue_set|·BFS) anticone cost; further
-    /// reducing this seed walk to an incremental blues-anticone propagation
-    /// (Kaspa-style) is a follow-up perf item, not a correctness gap.
-    fn past_blue_set_unbounded(&self, block: &BlockHash) -> HashSet<BlockHash> {
-        let mut blue = HashSet::new();
-        let mut cur = Some(*block);
-        while let Some(h) = cur {
-            if let Some(data) = self.store.get(&h) {
-                for mb in &data.mergeset_blues {
-                    blue.insert(*mb);
-                }
-                cur = data.selected_parent;
             } else {
                 break;
             }
@@ -1593,6 +1622,30 @@ mod tests {
         let mut h = [0u8; 32];
         h[0] = n;
         h
+    }
+
+    /// WS-A: the corrected-coloring gate is armed to a FUTURE height. A Legacy
+    /// (production) DAG stays Legacy below the gate — so all already-mined
+    /// history keeps its coloring, no reorg / no balance recompute — and flips
+    /// to the exact index-based `Fast` coloring at/above it. Arming the gate also
+    /// turns on reachability-index maintenance from genesis so `Fast` is ready by
+    /// the activation height.
+    #[test]
+    fn corrected_coloring_gate_is_armed_at_future_height() {
+        assert_ne!(
+            CORRECTED_COLORING_ACTIVATION_HEIGHT, u64::MAX,
+            "WS-A: gate must be armed to a real future height, not disabled",
+        );
+        let dag = GhostDAG::with_default_k(); // Legacy constructor = production path
+        assert!(
+            dag.maintains_reachability_index(),
+            "an armed gate must maintain the reachability index from genesis",
+        );
+        let h = CORRECTED_COLORING_ACTIVATION_HEIGHT;
+        assert!(matches!(dag.effective_coloring(0), ColoringMode::Legacy));
+        assert!(matches!(dag.effective_coloring(h - 1), ColoringMode::Legacy));
+        assert!(matches!(dag.effective_coloring(h), ColoringMode::Fast));
+        assert!(matches!(dag.effective_coloring(h + 1), ColoringMode::Fast));
     }
 
     #[test]
