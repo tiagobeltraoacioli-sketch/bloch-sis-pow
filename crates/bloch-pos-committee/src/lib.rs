@@ -42,12 +42,18 @@
 pub mod attestation;
 pub mod delegation;
 pub mod forkchoice;
+pub mod interfaces;
 pub mod params;
 pub mod tokenomics_v4;
 pub mod rewards;
 pub mod sample;
 
 pub use attestation::{Attestation, AttestationData, RejectReason, SignatureVerifier};
+pub use interfaces::{
+    BlockHeaderV4, BlockId, Checkpoint, FinalityGadget, FinalityState, ProposerDuties,
+    RandomnessBeacon, SlashingRules, StakingLifecycle, StateCommitment, StateReader,
+    StateTransition,
+};
 pub use forkchoice::{BlockTree, LatestMessage, Store};
 pub use params::{COMMITTEE_SIZE, SLOTS_PER_EPOCH, SLOT_SUBCOMMITTEE_SIZE};
 pub use sample::{is_selected, sample, Role, Validator};

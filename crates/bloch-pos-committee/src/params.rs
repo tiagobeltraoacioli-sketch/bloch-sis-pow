@@ -46,6 +46,30 @@ pub const MAX_DRAWS_PER_SLOT: usize = 4096;
 pub const DS_SORTITION: [u8; 16] = *b"BLCH4:SORTIT\0\0\0\0";
 /// Attestation signing root domain.
 pub const DS_ATTEST: [u8; 16] = *b"BLCH4:ATTEST\0\0\0\0";
+/// Block identity (§5.4). The one and only block identifier is
+/// `SHA3-256(DS_BLOCK ‖ canonical header)` — the tag is what guarantees a block
+/// id can never collide with any other domain's digest of the same bytes.
+pub const DS_BLOCK: [u8; 16] = *b"BLCH4:BLOCK\0\0\0\0\0";
+/// Transaction Merkle tree (`body_root`).
+pub const DS_BODY: [u8; 16] = *b"BLCH4:BODY\0\0\0\0\0\0";
+/// State SMT nodes (`state_root`).
+pub const DS_STATE: [u8; 16] = *b"BLCH4:STATE\0\0\0\0\0";
+/// Beacon mixing (§6.3): `mix' = SHA3-256(DS_RANDAO ‖ mix ‖ reveal)`.
+pub const DS_RANDAO: [u8; 16] = *b"BLCH4:RANDAO\0\0\0\0";
+/// Deposit message signing root (§7.1 proof of possession).
+pub const DS_DEPOSIT: [u8; 16] = *b"BLCH4:DEPOSIT\0\0\0";
+/// Slashing evidence and voluntary-exit signing roots (§7.2, §7.3).
+pub const DS_SLASH: [u8; 16] = *b"BLCH4:SLASH\0\0\0\0\0";
+/// Proposer signature domain over the header.
+///
+/// **Not in the §6.1 table** — the spec assigns a tag to block identity but
+/// none to the proposer's signature, leaving the signature to cover the same
+/// domain-tagged bytes as the id. Signing the id would work, but a signature
+/// domain that is also an identifier domain invites exactly the cross-protocol
+/// replay games domain separation exists to end, so this crate freezes a
+/// distinct tag and the spec table needs the row added (flagged in
+/// `BLOCH-POS-INTERFACES.md`).
+pub const DS_PROPOSE: [u8; 16] = *b"BLCH4:PROPOSE\0\0\0";
 
 /// Role tags, mixed into the sortition seed so the per-slot subcommittee is not
 /// a predictable subset of the epoch committee.
