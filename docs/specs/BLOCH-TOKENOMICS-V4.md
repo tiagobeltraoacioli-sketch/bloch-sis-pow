@@ -82,16 +82,64 @@ headroom, it is a deadline.**
 
 Two consequences that need a decision now:
 
-1. **The snapshot height must be announced in advance and fixed.** Otherwise the
-   cap creates an incentive to mine hard right before an unannounced snapshot,
-   and the choice of height becomes a discretionary act that redistributes value
-   between third parties.
+1. **The snapshot height is fixed at 80,000** — see §3.1.
 2. **A rule is needed for the over-cap case.** The proposal here is
    **pro-rata scale-down**: if measured non-founder holdings exceed 300 M, every
    non-founder balance is multiplied by `300_000_000 / total_non_founder`. It is
    neutral, needs no discretion, and it is the only rule that treats a holder's
    position the same regardless of when they acquired it. A first-come or
    by-address cut would not.
+
+### 3.1 Snapshot height — decided: 80,000
+
+Measured at height **40,424**: non-founder holdings ≈ **236.8 M BLCH**, 79% of
+the cap, growing **≈ 3.97 M/day**. On the central estimate the cap binds around
+height **86,300**, roughly 16 days out.
+
+**The height must land before the cap binds, and that is the whole argument.**
+Below the cap every holder keeps 100% of their position and no scale-down runs
+at all. Above it, the 300 M becomes a fixed pot shared pro-rata, and every coin
+mined after that point dilutes everyone — individually rational to chase,
+collectively worthless, and a pure race.
+
+| Height | Days out | Preserved at r=12% | r=16% | r=20% | r=25% |
+|---:|---:|---:|---:|---:|---:|
+| 60,000 | 6.8 | 100% | 100% | 100% | 98% |
+| 70,000 | 10.3 | 100% | 100% | 100% | 91% |
+| **80,000** | **13.7** | **100%** | **100%** | **95%** | 86% |
+| 86,000 | 15.8 | 100% | 100% | 92% | 83% |
+| 100,000 | 20.7 | 100% | 94% | 86% | 77% |
+
+`r` is the share of emission going to third-party miners. The central estimate,
+16.4%, is derived from a single prior measurement rather than a fresh audit, so
+the table spans the plausible range.
+
+**80,000** gives about two weeks of notice — the recognisable norm for a
+snapshot — on a round, legible number, and preserves every holder in full
+unless third-party mining is running well above the estimate.
+
+**Longer notice is actively worse here, which is counterintuitive.** Holders
+need do nothing: balances are captured on-chain automatically, there is no
+claim and no migration. So the notice period buys transparency, not time to
+act — and the one action it does enable is accumulating more coins before the
+cut, which dilutes everybody. The usual "give people plenty of warning" instinct
+inverts.
+
+**Before announcing**, measure the non-founder total against live balances
+rather than trusting the 16.4% estimate. If the real rate is above ~20%, drop
+to 70,000.
+
+**The dead period must be stated loudly.** Genesis-4 will not launch for months
+after height 80,000. Between the snapshot and the launch, coins mined or bought
+on the live chain **do not carry over**. Anyone acquiring BLCH in that window
+gets nothing in the new chain unless the rule changes. Published in one line,
+prominently, or it is a trap.
+
+**One trust point, named.** The taint list — which addresses count as founder —
+is set by the founder. Nothing in the protocol stops founder-controlled coins
+from being presented as third-party holdings and capturing part of the 300 M.
+The list should be published with the announcement so it can be argued with
+before the height passes, not after.
 
 ---
 
@@ -435,10 +483,8 @@ vesting schedule that lives in a spreadsheet is not a vesting schedule.
 7. ~~Delegation~~ — **implemented**, §6.3.1, with the concentration gates now
    computed from the delegation set.
 8. ~~Fee burn versus "100% of fees"~~ — **decided**, §6.3.2.
-9. **The VC allocation against the ownerless thesis.** ADR-033 restored an
-   ownerless position; ADR-034 records a founder anonymisation/relinquishment
-   pact; the public posture is a civic node movement, "coins don't vote", not a
-   security. A 10% allocation sold to funds introduces investors with a return
-   expectation and, in practice, an issuer. That is a coherent thing to want,
-   but it cannot coexist unstated with the current public documents — one of the
-   two has to be retracted, in writing, before either is published.
+9. ~~The VC allocation against the ownerless thesis~~ — **resolved**: the
+   ownerless thesis is retracted and a Solana-style foundation adopted
+   ([ADR-036](../adr/ADR-036-retract-ownerless-adopt-foundation.md)). What
+   remains is execution: rewrite the public copy before any announcement, and
+   treat the Phase 0 legal review as blocking rather than precautionary.
