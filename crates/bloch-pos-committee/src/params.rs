@@ -46,6 +46,8 @@ pub const MAX_DRAWS_PER_SLOT: usize = 4096;
 pub const DS_SORTITION: [u8; 16] = *b"BLCH4:SORTIT\0\0\0\0";
 /// Attestation signing root domain.
 pub const DS_ATTEST: [u8; 16] = *b"BLCH4:ATTEST\0\0\0\0";
+/// Slashing-evidence identity domain (anti-replay key, §7.3).
+pub const DS_SLASH: [u8; 16] = *b"BLCH4:SLASH\0\0\0\0\0";
 
 /// Role tags, mixed into the sortition seed so the per-slot subcommittee is not
 /// a predictable subset of the epoch committee.

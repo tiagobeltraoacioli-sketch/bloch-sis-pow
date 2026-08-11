@@ -46,8 +46,12 @@ pub mod params;
 pub mod tokenomics_v4;
 pub mod rewards;
 pub mod sample;
+pub mod slashing;
 
 pub use attestation::{Attestation, AttestationData, RejectReason, SignatureVerifier};
+pub use slashing::{
+    EvidenceError, SlashableOffense, SlashingEvidence, SlashingOutcome, SlashingState,
+};
 pub use forkchoice::{BlockTree, LatestMessage, Store};
 pub use params::{COMMITTEE_SIZE, SLOTS_PER_EPOCH, SLOT_SUBCOMMITTEE_SIZE};
 pub use sample::{is_selected, sample, Role, Validator};
