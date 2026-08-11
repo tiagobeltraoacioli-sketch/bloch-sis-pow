@@ -49,6 +49,16 @@ pub fn build_template_for_sv2(
         (data.height + 1, data.blue_score + 1)
     };
 
+    // TERMINAL HEIGHT — same guard as the V1 path in stratum/session.rs.
+    // accept_block refuses anything above it, so producing a template here
+    // would only hand a miner work that cannot be accepted.
+    if crate::core::is_past_terminal_height(height) {
+        return Err(TemplateBuildError::ChainEnded {
+            terminal: crate::core::terminal_height(crate::core::node_chain_id()).unwrap_or(0),
+            requested: height,
+        });
+    }
+
     // Explicit `Vec<Transaction>` annotation + `for` loop removes any
     // closure-inference ambiguity that plagues the `.iter().map().sum()`
     // version in this module (works in V1 only because V1's session.rs
@@ -99,6 +109,8 @@ pub enum TemplateBuildError {
     TipDataMissing,
     #[error("expected bits not derivable from parent ancestry (fail-closed): {0}")]
     BitsUnavailable(String),
+    #[error("chain reached its terminal height {terminal} — no further work (requested h={requested})")]
+    ChainEnded { terminal: u64, requested: u64 },
 }
 
 #[cfg(test)]
