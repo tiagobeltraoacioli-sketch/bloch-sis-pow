@@ -52,30 +52,49 @@ pub mod sample;
 pub mod staking;
 pub mod state_root;
 pub mod schedule;
+pub mod slashing;
 
 pub use attestation::{Attestation, AttestationData, RejectReason, SignatureVerifier};
-pub use interfaces::{
-    BlockHeaderV4, BlockId, Checkpoint, FinalityGadget, FinalityState, ProposerDuties,
-    RandomnessBeacon, SlashingRules, StakingLifecycle, StateCommitment, StateReader,
-    StateTransition,
-};
 pub use beacon::{mix_in, process_reveal, BeaconError, RandaoChain, RevealState};
-pub use finality::{Checkpoint, EpochOutcome, EpochVotes, FinalityError, FinalityState};
-pub mod slashing;
-pub use slashing::{
-    EvidenceError, SlashableOffense, SlashingEvidence, SlashingOutcome, SlashingState,
 pub use forkchoice::{BlockTree, LatestMessage, Store};
 pub use params::{COMMITTEE_SIZE, RANDAO_CHAIN_LENGTH, SLOTS_PER_EPOCH, SLOT_SUBCOMMITTEE_SIZE};
 pub use sample::{is_selected, sample, Role, Validator};
+pub use schedule::{epoch_schedule, proposer, EpochSchedule};
+pub use slashing::{
+    EvidenceError, SlashableOffense, SlashingEvidence, SlashingOutcome, SlashingState,
+};
 pub use staking::{
     resolve_activations, validate_deposit, validate_exit, validate_withdrawal, DepositInput,
-    DepositReject, DepositTx, ExitReject, ExitTx, HybridKeyVerifier, QueuedDeposit,
-    ValidatorRecord, WithdrawReject,
+    DepositReject, DepositTx, ExitReject, ExitTx, HybridKeyVerifier, QueuedDeposit, WithdrawReject,
+};
 pub use state_root::{
     build_state_tree, state_root, verify_inclusion, ConsensusState, EutxoEntry, InclusionProof,
-    ParticipationRecord, RandaoMix, Smt, ValidatorRecord,
+    ParticipationRecord, RandaoMix, Smt,
 };
-pub use schedule::{epoch_schedule, proposer, EpochSchedule};
+pub use interfaces::{
+    BlockHeaderV4, BlockId, FinalityGadget, ProposerDuties, RandomnessBeacon, SlashingRules,
+    StakingLifecycle, StateCommitment, StateReader, StateTransition,
+};
+pub use finality::{EpochOutcome, EpochVotes, FinalityError};
+
+// ── Names that exist in two modules — NOT re-exported flat ──────────────────
+//
+// Three names collided when the parallel workstreams were integrated, and each
+// collision is a real design question, not a namespacing accident. Flattening
+// either side would pick a winner silently, so callers must qualify:
+//
+//   `interfaces::Checkpoint`     vs `finality::Checkpoint`
+//   `interfaces::FinalityState`  vs `finality::FinalityState`
+//   `staking::ValidatorRecord`   vs `state_root::ValidatorRecord`
+//
+// The first two are the same concept declared twice: the PMO froze them as part
+// of the `FinalityGadget` boundary while the gadget author wrote concrete ones.
+// The third is genuinely two different records that happen to share a name —
+// staking's is the lifecycle record (activation/exit epochs, withdrawal
+// address), state_root's is what gets committed into the SMT. They may want
+// different names rather than one merged type.
+//
+// Resolving these is an integration decision, deliberately left visible.
 
 /// Draw the per-slot fork-choice subcommittee.
 pub fn slot_subcommittee(beacon_mix: &[u8; 32], slot: u64, validators: &[Validator]) -> Vec<u32> {
