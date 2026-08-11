@@ -129,11 +129,49 @@ inverts.
 rather than trusting the 16.4% estimate. If the real rate is above ~20%, drop
 to 70,000.
 
-**The dead period must be stated loudly.** Genesis-4 will not launch for months
-after height 80,000. Between the snapshot and the launch, coins mined or bought
-on the live chain **do not carry over**. Anyone acquiring BLCH in that window
-gets nothing in the new chain unless the rule changes. Published in one line,
-prominently, or it is a trap.
+### 3.2 The chain halts at the snapshot
+
+**Height 80,000 is a terminal height, not just a measurement point.** The
+current chain stops producing blocks there; Genesis-4 launches from the
+snapshot roughly six months later, after code review.
+
+This resolves the dead-period problem rather than mitigating it. Had the chain
+kept running, the 166 days between snapshot and launch would have meant
+4,016 M BLCH mined by people receiving nothing — and, worse, a rational miner
+switches off the day after the snapshot, leaving the network without hashrate
+during exactly the six months it still has users, wallets and an explorer
+pointed at it. Halting removes both: nobody mines coins with no future, and
+nobody buys into a chain with no future.
+
+Two things must exist **before** height 80,000, which is about two weeks away.
+
+#### 3.2.1 The halt has to be a consensus rule
+
+A chain does not stop because it was announced. Blocks above the terminal
+height must be **invalid**, shipped in a release and running on the fleet
+before the height arrives. Otherwise miners simply continue and the "halt" is a
+fork nobody agreed to.
+
+This is a flag day in reverse and it inherits every flag-day hazard this project
+has already lived through: the release must actually be the binary the fleet
+runs. Anyone who does not upgrade will keep mining past 80,000 on a fork; that
+is tolerable, but only if the canonical snapshot is fixed at 80,000 and said so
+publicly.
+
+#### 3.2.2 After the halt, the chain's own history stops being evidence
+
+This is the non-obvious one. PoW security is bought with ongoing hashrate. The
+moment mining stops, the cost of rewriting history from below height 80,000
+collapses toward zero — anyone with modest hashrate can produce an alternative
+chain ending at 80,000 with different balances, and after a few months of no
+honest mining, it may carry more accumulated work than the real one.
+
+Therefore the **signed snapshot artifact is canonical, not the chain**. At the
+halt, produce the balance set, hash it, sign it, and publish the digest widely
+enough that it cannot be quietly replaced — the same pattern already used for
+`carryover.tsv.gz` and its `.sha256`. Genesis-4 must be built from that
+artifact, and the artifact's digest should appear in the Genesis-4 genesis
+block itself. A chain nobody is defending is not a record.
 
 **One trust point, named.** The taint list — which addresses count as founder —
 is set by the founder. Nothing in the protocol stops founder-controlled coins

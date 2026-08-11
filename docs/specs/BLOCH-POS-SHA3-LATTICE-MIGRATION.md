@@ -689,9 +689,26 @@ in the same commit, not later.
 
 ## 8. The transition mechanism
 
-Genesis-4 is a **flag-day fork on the existing chain**, not a new genesis. The
-carryover approach used for Genesis-3 is explicitly rejected here: a new
-genesis at this stage would reset the very distribution history that §4.1
+> **SUPERSEDED 2026-08-10.** This section designed Genesis-4 as a flag-day fork
+> on the running chain, with a hybrid period, and explicitly rejected a fresh
+> genesis. The founder decided otherwise: the chain **halts** at height 80,000,
+> a signed balance snapshot is taken, and Genesis-4 launches from it about six
+> months later after code review (`BLOCH-TOKENOMICS-V4.md` §3.2).
+>
+> What that changes: there is no hybrid period, no `TRANSITION_START`, no
+> DAG→linear seam to cross, and no upgrade partition — the old chain is not
+> continued, it is ended. The one thing that gets *harder* is §4.1: the taint
+> machinery was built because the live distribution could not be fixed. With a
+> fresh genesis and a new allocation, taint applies to the carried-over balances
+> only, and the concentration answer comes from the allocation itself (§5 of the
+> tokenomics spec) rather than from tracking coins.
+>
+> The text below is retained because the gates (§11), the rollback thinking
+> (§13) and the testing strategy (§12) still apply to launching a new chain.
+
+Genesis-4 was designed as a **flag-day fork on the existing chain**, not a new
+genesis. The carryover approach used for Genesis-3 was rejected here: a new
+genesis at that stage would reset the very distribution history that §4.1
 depends on.
 
 ```
