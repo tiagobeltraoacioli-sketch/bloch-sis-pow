@@ -95,23 +95,29 @@ pub const fn founder_vested_sat(slot: u64) -> u128 {
 
 // ── Validator emission ──────────────────────────────────────────────────────
 
-/// Flat per-slot validator reward.
-///
-/// One of the three candidate curves in §6 of the spec (flat / halving / smooth
-/// decay); the choice is **not yet made**. Flat is implemented here because it
-/// is the only one that needs no further parameters, so it can serve as the
-/// reference against which the others are compared.
-pub const fn validator_reward_sat(slot: u64) -> u128 {
-    if slot >= EMISSION_SLOTS {
-        return 0; // fee-only from here on
-    }
-    (VALIDATOR_EMISSION_BLOCH * SAT_PER_BLOCH) / EMISSION_SLOTS as u128
+/// Total emitted to validators by `slot` under the flat curve, for supply
+/// accounting. The halving equivalent is [`validator_emitted_halving_by`].
+pub const fn validator_emitted_flat_by(slot: u64) -> u128 {
+    let s = if slot > EMISSION_SLOTS { EMISSION_SLOTS } else { slot };
+    validator_reward_flat_sat(0) * s as u128
 }
 
-/// Total emitted to validators by `slot`, used for supply accounting.
-pub const fn validator_emitted_by(slot: u64) -> u128 {
-    let s = if slot > EMISSION_SLOTS { EMISSION_SLOTS } else { slot };
-    validator_reward_sat(0) * s as u128
+/// Total emitted to validators by `slot` under the halving curve.
+pub const fn validator_emitted_halving_by(slot: u64) -> u128 {
+    let end = if slot > EMISSION_SLOTS { EMISSION_SLOTS } else { slot };
+    let mut total: u128 = 0;
+    let mut era: u64 = 0;
+    while era < HALVINGS as u64 {
+        let era_start = era * HALVING_PERIOD_SLOTS;
+        if end <= era_start {
+            break;
+        }
+        let in_era = end - era_start;
+        let span = if in_era > HALVING_PERIOD_SLOTS { HALVING_PERIOD_SLOTS } else { in_era };
+        total += (INITIAL_REWARD_SAT >> era) * span as u128;
+        era += 1;
+    }
+    total
 }
 
 // ── Carryover scale-down ────────────────────────────────────────────────────
@@ -163,3 +169,117 @@ const _: () = assert!(
     TOTAL_SUPPLY_SAT > (u64::MAX as u128) / 2,
     "supply agora cabe com folga em u64 — reavalie a escolha de u128 explicitamente"
 );
+
+// ── Vesting: team, VC, marketing, liquidity ─────────────────────────────────
+//
+// Schedules follow prevailing market practice (§7 of the spec), with the cliffs
+// deliberately staggered. The single most cited failure mode in vesting design
+// is the "cliff wall" — several buckets beginning to unlock in the same month,
+// concentrating sell pressure into one date. Founder (24), team (18) and VC
+// (12) cliff six months apart, so unlocks arrive as a stream.
+
+pub const MONTH_SLOTS: u64 = SLOTS_PER_YEAR / 12;
+
+/// VC / crypto hedge funds: 12-month cliff, 24-month linear (3 years total).
+/// A 12-month cliff is the standard among recent L1s; funds rarely accept more.
+pub const VC_CLIFF_SLOTS: u64 = 12 * MONTH_SLOTS;
+pub const VC_VESTING_SLOTS: u64 = 24 * MONTH_SLOTS;
+
+/// Development team: 18-month cliff, 36-month linear (4.5 years total).
+/// The institutional standard is a 12-month cliff plus 36-month linear; 18 is
+/// both defensible where institutional investors participate and necessary here
+/// to keep the team cliff off the VC cliff month.
+pub const TEAM_CLIFF_SLOTS: u64 = 18 * MONTH_SLOTS;
+pub const TEAM_VESTING_SLOTS: u64 = 36 * MONTH_SLOTS;
+
+/// Marketing: 25% at genesis for listing and launch activity, the rest linear
+/// over 24 months. Mirrors the common split between launch spend (immediate)
+/// and ongoing programmes (vested).
+pub const MARKETING_TGE_NUMERATOR: u128 = 25;
+pub const MARKETING_TGE_DENOMINATOR: u128 = 100;
+pub const MARKETING_VESTING_SLOTS: u64 = 24 * MONTH_SLOTS;
+
+/// Generic cliff-then-linear unlock, in satoshis.
+pub const fn vested_sat(total_bloch: u128, slot: u64, cliff: u64, duration: u64) -> u128 {
+    let total = total_bloch * SAT_PER_BLOCH;
+    if slot < cliff {
+        return 0;
+    }
+    if duration == 0 || slot >= cliff + duration {
+        return total;
+    }
+    total * (slot - cliff) as u128 / duration as u128
+}
+
+pub const fn vc_vested_sat(slot: u64) -> u128 {
+    vested_sat(VC_BLOCH, slot, VC_CLIFF_SLOTS, VC_VESTING_SLOTS)
+}
+
+pub const fn team_vested_sat(slot: u64) -> u128 {
+    vested_sat(TEAM_BLOCH, slot, TEAM_CLIFF_SLOTS, TEAM_VESTING_SLOTS)
+}
+
+pub const fn marketing_vested_sat(slot: u64) -> u128 {
+    let total = MARKETING_BLOCH * SAT_PER_BLOCH;
+    let at_tge = total * MARKETING_TGE_NUMERATOR / MARKETING_TGE_DENOMINATOR;
+    at_tge + vested_sat(MARKETING_BLOCH - MARKETING_BLOCH * MARKETING_TGE_NUMERATOR
+        / MARKETING_TGE_DENOMINATOR, slot, 0, MARKETING_VESTING_SLOTS)
+}
+
+/// Liquidity is fully unlocked at genesis — that is its function. Vesting the
+/// liquidity bucket would defeat the purpose of having one.
+pub const fn liquidity_vested_sat(_slot: u64) -> u128 {
+    LIQUIDITY_BLOCH * SAT_PER_BLOCH
+}
+
+/// Total insider supply unlocked by `slot` (founder + team + VC + marketing).
+/// Liquidity and carryover holders are excluded: neither is an insider bloc.
+pub const fn insider_unlocked_sat(slot: u64) -> u128 {
+    founder_vested_sat(slot) + team_vested_sat(slot) + vc_vested_sat(slot)
+        + marketing_vested_sat(slot)
+}
+
+// ── Emission curve: the decision that actually drives decentralisation ──────
+//
+// Modelling the unlock schedule against the PoS activation gates showed that
+// the emission curve, not the vesting schedule, decides whether gate G2
+// (no entity above 25% of active stake) can ever be met. With a FLAT curve the
+// validator share is still only ~24% of circulating supply after ten years, and
+// some bucket sits at or above 25% in months 6, 12, 24, 36 and 48. With a
+// front-loaded curve validators pass 45% of circulating inside two years and
+// only months 6 and 12 breach — and that breach is the liquidity bucket, which
+// disperses to traders rather than acting as one entity.
+//
+// The choice is open decision #2 in the spec. Both curves are provided; neither
+// is aliased as "the" reward, because picking one here would make a founder
+// decision look like an implementation detail.
+
+/// Flat: constant reward for 40 years, then fee-only.
+pub const fn validator_reward_flat_sat(slot: u64) -> u128 {
+    if slot >= EMISSION_SLOTS {
+        return 0;
+    }
+    (VALIDATOR_EMISSION_BLOCH * SAT_PER_BLOCH) / EMISSION_SLOTS as u128
+}
+
+/// Halving every 4 years, 10 halvings across the 40-year window.
+///
+/// `R0` is derived so the ten periods sum to exactly the validator allocation:
+/// the geometric sum is `R0 · P · (2046/1024)`, so `R0 = alloc · 1024 / (P · 2046)`.
+/// Initial reward ≈ 6,387 BLCH/block, final period ≈ 6.24 BLCH/block, and the
+/// truncation residual over the whole 40 years is under 0.2 BLCH.
+pub const HALVING_PERIOD_SLOTS: u64 = 4 * SLOTS_PER_YEAR;
+pub const HALVINGS: u32 = 10;
+pub const INITIAL_REWARD_SAT: u128 =
+    (VALIDATOR_EMISSION_BLOCH * SAT_PER_BLOCH * 1024) / (HALVING_PERIOD_SLOTS as u128 * 2046);
+
+pub const fn validator_reward_halving_sat(slot: u64) -> u128 {
+    if slot >= EMISSION_SLOTS {
+        return 0;
+    }
+    let era = slot / HALVING_PERIOD_SLOTS;
+    if era >= HALVINGS as u64 {
+        return 0;
+    }
+    INITIAL_REWARD_SAT >> era
+}

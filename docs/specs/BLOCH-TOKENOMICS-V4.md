@@ -21,12 +21,12 @@ not carried over; it is replaced by a new, vested 17% allocation.
 
 | Destination | BLCH | Share | Unlock |
 |---|---:|---:|---|
-| Founder | 17,000,000,000 | 17.00% | **2-year cliff, then 10-year linear vesting** |
-| VC / crypto hedge funds | 10,000,000,000 | 10.00% | **unspecified — §7** |
-| Development team | 10,000,000,000 | 10.00% | **unspecified — §7** |
-| Marketing | 4,000,000,000 | 4.00% | **unspecified — §7** |
-| Liquidity | 5,000,000,000 | 5.00% | **unspecified — §7** |
-| Carryover holders | ≤ 300,000,000 | ≤ 0.30% | liquid at genesis |
+| Founder | 17,000,000,000 | 17.00% | 24-month cliff, then 120-month linear |
+| VC / crypto hedge funds | 10,000,000,000 | 10.00% | 12-month cliff, then 24-month linear |
+| Development team | 10,000,000,000 | 10.00% | 18-month cliff, then 36-month linear |
+| Marketing | 4,000,000,000 | 4.00% | 25% at genesis, remainder linear over 24 months |
+| Liquidity | 5,000,000,000 | 5.00% | 100% liquid at genesis |
+| Carryover holders | ≤ 300,000,000 | ≤ 0.30% | 100% liquid at genesis, no vesting |
 | **Validators** | **53,700,000,000** | **53.70%** | emitted over 40 years |
 | **Total** | **100,000,000,000** | **100.00%** | |
 
@@ -165,15 +165,76 @@ rationale rather than silently superseding it.
 
 ---
 
-## 7. Unspecified — blocking
+## 7. Vesting — schedules and their basis
 
-Vesting for **VC (10%), team (10%), marketing (4%) and liquidity (5%)** was not
-specified. This is not a detail: per §5 it decides whether the relaunch fixes
-the concentration problem or reproduces it. It also decides whether the PoS
-activation gates G1–G4 can ever be met.
+Schedules follow prevailing market practice for recent L1 launches.
 
-Liquidity is the one allocation with a genuine argument for being liquid at
-genesis — that is its function. The other three are not obviously so.
+| Bucket | Genesis | Cliff | Linear | Total | Market basis |
+|---|---:|---:|---:|---:|---|
+| Founder | 0% | 24 mo | 120 mo | 12 yr | Far above market; a founder decision, not a benchmark |
+| VC / hedge funds | 0% | **12 mo** | 24 mo | 3 yr | 12-month cliff is the standard among recent L1s (Sui Series A and B both cliff at 12 months); investor vests typically run 2–3 years |
+| Team | 0% | **18 mo** | 36 mo | 4.5 yr | Institutional standard is 12-month cliff + 36-month linear; 18 months is "defensible and increasingly expected" where institutional investors participate, and it keeps the team cliff off the VC cliff month |
+| Marketing | **25%** | — | 24 mo | 2 yr | Listing and launch spend is commonly unlocked at TGE for launch momentum; ongoing programmes vest over ~24–25 months |
+| Liquidity | **100%** | — | — | — | Liquidity is conventionally 100% unlocked at TGE — vesting it defeats its purpose |
+| Holders | **100%** | — | — | — | Founder decision: carried-over balances are not vested |
+
+**Cliffs are staggered on purpose.** The most cited failure mode in vesting
+design is the *cliff wall* — several buckets beginning to unlock in the same
+month, concentrating sell pressure on one date. VC (12), team (18) and founder
+(24) are six months apart, so unlocks arrive as a stream.
+
+**Where this sits against peers.** Insider share here (founder + VC + team +
+marketing = 41%) falls between Aptos (~32.5% team plus investors) and Celestia
+(~53%). The VC allocation at 10% is below Sui's 14.1% for private investors.
+
+---
+
+## 7A. The unlock model, run against the PoS gates
+
+Modelling the schedules month by month, treating each bucket as a single
+entity (worst case), against gate **G2 — no entity above 25% of active stake**:
+
+**With the flat emission curve:**
+
+| Month | Circulating (B) | Validators | Largest bucket | Insiders |
+|---:|---:|---:|---:|---:|
+| 6 | 7.7 | 8.7% | **64.8%** | 22.7% |
+| 12 | 9.1 | 14.7% | **54.7%** | 27.3% |
+| 24 | 18.7 | 14.4% | **26.8%** | 57.2% |
+| 36 | 30.0 | 13.4% | **33.3%** | 68.9% |
+| 60 | 41.1 | 16.3% | 24.3% | 70.8% |
+| 120 | 56.3 | 23.8% | 24.1% | 66.8% |
+
+**G2 fails for roughly the first five years, and insiders peak near 71% of
+circulating supply.** The vesting schedule alone does not fix concentration —
+it reschedules it. The cause is structural: insiders unlock 41 B over ~12 years
+while validators earn only 1.34 B/year under a flat curve.
+
+**With a front-loaded curve (halving every 4 years):**
+
+| Month | Circulating (B) | Validators | Largest bucket | Insiders |
+|---:|---:|---:|---:|---:|
+| 6 | 10.4 | 32.3% | 48.0% | 16.8% |
+| 12 | 14.5 | 46.3% | 34.4% | 17.2% |
+| 24 | 29.4 | 45.7% | **17.0%** | 36.3% |
+| 36 | 46.2 | 43.7% | **21.7%** | 44.8% |
+| 60 | 64.6 | 46.8% | **15.5%** | 45.0% |
+| 120 | 86.6 | 50.4% | **15.7%** | 43.4% |
+
+Validators cross 45% of circulating supply inside two years, the largest bucket
+stays under 25% from month 24 onward, and insiders peak near 45% rather than
+71%. The only breaches are months 6 and 12 — and there the largest bucket is
+**liquidity**, which disperses to traders and exchanges rather than acting as a
+single entity.
+
+**Conclusion: the emission curve, not the vesting schedule, is the lever that
+decides whether PoS can ever activate.** Open decision #2 in §9 is therefore
+not a free parameter — it is the most consequential number left in V4, and the
+recommendation is a front-loaded curve.
+
+Halving parameters, if adopted: initial reward **6,387 BLCH/block**, halving
+every 4 years, 10 halvings across the 40-year window, final period 6.24
+BLCH/block, truncation residual under 0.2 BLCH over the whole schedule.
 
 ---
 
@@ -213,8 +274,10 @@ vesting schedule that lives in a spreadsheet is not a vesting schedule.
 
 ## 9. Open decisions
 
-1. Vesting for VC, team, marketing, liquidity (§7) — **blocking**.
-2. Emission curve: flat, halving, or smooth decay (§6).
+1. ~~Vesting for VC, team, marketing, liquidity~~ — **decided**, §7.
+2. **Emission curve: flat, halving, or smooth decay (§6, §7A) — now the most
+   consequential open decision.** Flat fails gate G2 for ~5 years; front-loaded
+   passes from month 24. Recommendation: halving every 4 years.
 3. Snapshot height, announced in advance (§3).
 4. Confirmation of pro-rata scale-down for the over-cap case (§3).
 5. Decimal places and the `u128` accumulator audit (§8.1).

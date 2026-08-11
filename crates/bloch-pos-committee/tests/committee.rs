@@ -465,26 +465,132 @@ fn founder_vesting_never_decreases() {
 
 #[test]
 fn validator_emission_stops_after_forty_years() {
-    assert!(tk::validator_reward_sat(0) > 0);
-    assert!(tk::validator_reward_sat(tk::EMISSION_SLOTS - 1) > 0);
-    assert_eq!(tk::validator_reward_sat(tk::EMISSION_SLOTS), 0);
-    assert_eq!(tk::validator_reward_sat(u64::MAX), 0);
+    for f in [tk::validator_reward_flat_sat as fn(u64) -> u128, tk::validator_reward_halving_sat] {
+        assert!(f(0) > 0);
+        assert!(f(tk::EMISSION_SLOTS - 1) > 0);
+        assert_eq!(f(tk::EMISSION_SLOTS), 0);
+        assert_eq!(f(u64::MAX), 0);
+    }
 }
 
 #[test]
-fn validator_emission_never_exceeds_its_allocation() {
+fn neither_curve_exceeds_the_allocation() {
     let alloc = tk::VALIDATOR_EMISSION_BLOCH * tk::SAT_PER_BLOCH;
-    let emitted = tk::validator_emitted_by(tk::EMISSION_SLOTS);
-    assert!(emitted <= alloc, "emitiu {emitted} > alocado {alloc}");
-    // Truncation loses at most one satoshi per slot.
-    assert!(alloc - emitted < tk::EMISSION_SLOTS as u128);
-    assert_eq!(tk::validator_emitted_by(u64::MAX), emitted);
+    for emitted in [
+        tk::validator_emitted_flat_by(tk::EMISSION_SLOTS),
+        tk::validator_emitted_halving_by(tk::EMISSION_SLOTS),
+    ] {
+        assert!(emitted <= alloc, "emitiu {emitted} > alocado {alloc}");
+        // Truncation may strand a little dust; it must never mint.
+        assert!(alloc - emitted < tk::EMISSION_SLOTS as u128);
+    }
+    assert_eq!(tk::validator_emitted_flat_by(u64::MAX),
+               tk::validator_emitted_flat_by(tk::EMISSION_SLOTS));
+    assert_eq!(tk::validator_emitted_halving_by(u64::MAX),
+               tk::validator_emitted_halving_by(tk::EMISSION_SLOTS));
 }
 
 #[test]
-fn average_block_reward_matches_the_spec() {
-    let per_slot_bloch = tk::validator_reward_sat(0) / tk::SAT_PER_BLOCH;
-    assert_eq!(per_slot_bloch, 1_276);
+fn flat_curve_matches_the_spec_average() {
+    assert_eq!(tk::validator_reward_flat_sat(0) / tk::SAT_PER_BLOCH, 1_276);
+}
+
+#[test]
+fn halving_curve_halves_every_four_years() {
+    let r0 = tk::validator_reward_halving_sat(0);
+    assert_eq!(r0 / tk::SAT_PER_BLOCH, 6_387);
+    assert_eq!(tk::validator_reward_halving_sat(tk::HALVING_PERIOD_SLOTS), r0 / 2);
+    assert_eq!(tk::validator_reward_halving_sat(2 * tk::HALVING_PERIOD_SLOTS), r0 / 4);
+    // Front-loading is the whole point: half the allocation inside four years.
+    let first_era = tk::validator_emitted_halving_by(tk::HALVING_PERIOD_SLOTS);
+    let alloc = tk::VALIDATOR_EMISSION_BLOCH * tk::SAT_PER_BLOCH;
+    let share = first_era * 100 / alloc;
+    assert!(share >= 49 && share <= 51, "primeiro era emitiu {share}%");
+}
+
+#[test]
+fn halving_beats_flat_on_early_validator_share() {
+    // The measured reason to prefer front-loading: at two years the halving
+    // curve has put far more stake in validator hands than the flat curve.
+    let two_years = 2 * tk::SLOTS_PER_YEAR;
+    let h = tk::validator_emitted_halving_by(two_years);
+    let f = tk::validator_emitted_flat_by(two_years);
+    assert!(h > f * 4, "halving {h} deveria superar flat {f} com folga");
+}
+
+// ── vesting ─────────────────────────────────────────────────────────────────
+
+#[test]
+fn cliffs_are_staggered_to_avoid_a_cliff_wall() {
+    // Founder 24 mo, team 18 mo, VC 12 mo — three distinct months.
+    let m = tk::MONTH_SLOTS;
+    assert_eq!(tk::VC_CLIFF_SLOTS / m, 12);
+    assert_eq!(tk::TEAM_CLIFF_SLOTS / m, 18);
+    assert_eq!(tk::FOUNDER_CLIFF_SLOTS / m, 24);
+    let mut cliffs = [tk::VC_CLIFF_SLOTS, tk::TEAM_CLIFF_SLOTS, tk::FOUNDER_CLIFF_SLOTS];
+    cliffs.sort();
+    assert!(cliffs.windows(2).all(|w| w[1] - w[0] >= 6 * m), "cliffs a menos de 6 meses");
+}
+
+#[test]
+fn locked_buckets_release_nothing_at_genesis() {
+    assert_eq!(tk::vc_vested_sat(0), 0);
+    assert_eq!(tk::team_vested_sat(0), 0);
+    assert_eq!(tk::founder_vested_sat(0), 0);
+}
+
+#[test]
+fn each_bucket_vests_fully_and_never_over() {
+    let cases: [(fn(u64) -> u128, u128); 3] = [
+        (tk::vc_vested_sat, tk::VC_BLOCH),
+        (tk::team_vested_sat, tk::TEAM_BLOCH),
+        (tk::marketing_vested_sat, tk::MARKETING_BLOCH),
+    ];
+    for (f, total) in cases {
+        let want = total * tk::SAT_PER_BLOCH;
+        assert_eq!(f(u64::MAX), want);
+        assert!(f(10 * tk::SLOTS_PER_YEAR) <= want);
+    }
+}
+
+#[test]
+fn marketing_releases_a_quarter_at_genesis() {
+    let total = tk::MARKETING_BLOCH * tk::SAT_PER_BLOCH;
+    assert_eq!(tk::marketing_vested_sat(0), total / 4);
+    assert_eq!(tk::marketing_vested_sat(tk::MARKETING_VESTING_SLOTS), total);
+}
+
+#[test]
+fn liquidity_is_fully_liquid_at_genesis() {
+    let total = tk::LIQUIDITY_BLOCH * tk::SAT_PER_BLOCH;
+    assert_eq!(tk::liquidity_vested_sat(0), total);
+}
+
+#[test]
+fn insider_unlock_is_monotonic_and_capped() {
+    let cap = (tk::FOUNDER_BLOCH + tk::TEAM_BLOCH + tk::VC_BLOCH + tk::MARKETING_BLOCH)
+        * tk::SAT_PER_BLOCH;
+    let step = tk::MONTH_SLOTS;
+    let mut prev = 0u128;
+    let mut slot = 0u64;
+    while slot < 13 * tk::SLOTS_PER_YEAR {
+        let v = tk::insider_unlocked_sat(slot);
+        assert!(v >= prev, "insider unlock regrediu no slot {slot}");
+        assert!(v <= cap);
+        prev = v;
+        slot += step;
+    }
+    assert_eq!(tk::insider_unlocked_sat(u64::MAX), cap);
+}
+
+#[test]
+fn nothing_but_liquidity_marketing_and_holders_circulates_at_genesis() {
+    // The strongest property of the V4 schedule: at genesis no insider bucket
+    // except a quarter of marketing has any spendable stake at all.
+    let sat = tk::SAT_PER_BLOCH;
+    let circulating_insiders = tk::insider_unlocked_sat(0);
+    assert_eq!(circulating_insiders, tk::MARKETING_BLOCH * sat / 4);
+    assert_eq!(tk::founder_vested_sat(0), 0);
 }
 
 #[test]
