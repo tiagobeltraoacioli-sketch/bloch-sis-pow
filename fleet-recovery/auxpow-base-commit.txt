@@ -1,0 +1,2 @@
+006c658 FLAG-DAY: activate merged mining (AuxPoW) at G3 height 8500
+006c65819238deb9dcc1a77938b9cb42c1beceab
