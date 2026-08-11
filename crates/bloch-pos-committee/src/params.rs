@@ -41,6 +41,21 @@ pub const SLOT_DURATION_SECS: u64 = 30;
 /// exist to prevent from ever reaching mainnet.
 pub const MAX_DRAWS_PER_SLOT: usize = 4096;
 
+/// Epochs of non-finality tolerated before the inactivity leak switches on
+/// (§5.1: "quadratic after 4 epochs of non-finality"). Below this, a stall is
+/// treated as transient — leaking on every hiccup would punish ordinary
+/// network jitter; above it, the set is presumed partitioned or abandoned and
+/// liveness is bought back by shrinking the absent stake.
+pub const INACTIVITY_LEAK_THRESHOLD_EPOCHS: u64 = 4;
+
+/// Divisor of the per-epoch inactivity bite: an absent validator loses
+/// `stake * t / QUOTIENT` in the t-th epoch beyond the threshold, so the
+/// cumulative loss grows quadratically. 64 is sized for recovery in tens of
+/// epochs (≈ hours at 16 min/epoch), not days: with a 40%-absent set, the
+/// live 60% regains a 2/3 supermajority after ~6 leak epochs. Like every
+/// §5.1 value this is a Phase-1 proposal needing a KAT and a devnet sweep.
+pub const INACTIVITY_LEAK_QUOTIENT: u128 = 64;
+
 /// Domain separation tags (§6.1). Fixed 16 bytes, right-padded with zeros, so
 /// no tag can be a prefix of another.
 pub const DS_SORTITION: [u8; 16] = *b"BLCH4:SORTIT\0\0\0\0";
