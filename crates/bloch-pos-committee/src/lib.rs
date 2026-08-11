@@ -51,6 +51,7 @@ pub mod rewards;
 pub mod sample;
 pub mod staking;
 pub mod state_root;
+pub mod schedule;
 
 pub use attestation::{Attestation, AttestationData, RejectReason, SignatureVerifier};
 pub use interfaces::{
@@ -71,6 +72,7 @@ pub use state_root::{
     build_state_tree, state_root, verify_inclusion, ConsensusState, EutxoEntry, InclusionProof,
     ParticipationRecord, RandaoMix, Smt, ValidatorRecord,
 };
+pub use schedule::{epoch_schedule, proposer, EpochSchedule};
 
 /// Draw the per-slot fork-choice subcommittee.
 pub fn slot_subcommittee(beacon_mix: &[u8; 32], slot: u64, validators: &[Validator]) -> Vec<u32> {
