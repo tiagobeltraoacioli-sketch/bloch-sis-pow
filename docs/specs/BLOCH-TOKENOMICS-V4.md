@@ -281,22 +281,39 @@ The honest limit: those metrics see the *operator* view, which is what consensus
 sees. They cannot see one beneficial owner standing behind several delegators,
 and no on-chain metric can.
 
-### 6.3.2 Conflict to resolve: fee burn versus "100% of fees"
+### 6.3.2 Fee policy — decided: two eras
 
-§1 states that after the 100 B is emitted, validators are paid **100% from
-fees**. The Solana model **burns half the base fee**, so validators never
-receive 100% of fees. The two statements cannot both hold as written.
+| Era | Base fee | Priority fee |
+|---|---|---|
+| **During emission** (40 years) | 50% burned, 50% to producer | 100% to producer |
+| **After emission** | **100% to producer, no burn** | 100% to producer |
 
-Reconcilable options:
+The burn is the deflationary counterweight that gives the hard cap meaning
+while new supply is still arriving. Once issuance stops, fees are the entire
+security budget, and burning part of the only remaining revenue would shrink
+the validator set for no gain. The switch is at exactly the slot emission
+stops, so there is never a window with both issuance and a burn, nor one with
+neither.
 
-1. Burn during emission, stop burning when emission ends — honours both, at
-   different times.
-2. Never burn; 100% of all fees to producers — abandons the deflationary
-   counterweight that makes the hard cap meaningful.
-3. Always burn 50% of base fee — abandons the "100% of fees" statement.
+**Consequence for the supply figure — this changes what "100 billion" means.**
+Burned fees are permanently destroyed, so total supply never reaches
+100,000,000,000. The correct statement is:
 
-This must be decided explicitly rather than settled by whichever document is
-read last.
+> 100,000,000,000 BLCH is the **maximum ever issued**. Circulating supply
+> settles at that figure minus everything burned during the 40-year emission
+> era, and is fixed thereafter.
+
+Any published supply number must use "maximum issued", not "total supply" —
+the two diverge from the first burned fee onward, and the gap only grows.
+
+**A cliff worth naming.** At the era boundary, validator revenue loses the
+year-40 emission (85.10 BLCH/block) and gains only the other half of the base
+fee. Unless fee revenue by year 40 is comparable to 85 BLCH/block, this is a
+step down in validator income, and it is inherent to any hard cap rather than
+to this fee policy — the perpetual tail in V2 existed precisely to avoid it.
+Whether fee revenue reaches that level by year 40 is unknowable now; what is
+knowable is that the chain should be monitoring the ratio long before it
+matters.
 
 ---
 
@@ -415,9 +432,9 @@ vesting schedule that lives in a spreadsheet is not a vesting schedule.
 4. Confirmation of pro-rata scale-down for the over-cap case (§3).
 5. Decimal places and the `u128` accumulator audit (§8.1).
 6. ADR retracting the perpetual-tail rationale (§6).
-7. **Delegation** (§6.3.1) — required by the Solana revenue model, absent from
-   the current PoS design, and not yet reflected in the concentration model.
-8. **Fee burn versus "100% of fees" after emission** (§6.3.2).
+7. ~~Delegation~~ — **implemented**, §6.3.1, with the concentration gates now
+   computed from the delegation set.
+8. ~~Fee burn versus "100% of fees"~~ — **decided**, §6.3.2.
 9. **The VC allocation against the ownerless thesis.** ADR-033 restored an
    ownerless position; ADR-034 records a founder anonymisation/relinquishment
    pact; the public posture is a civic node movement, "coins don't vote", not a

@@ -48,21 +48,36 @@ pub struct FeeSplit {
     pub burned: u128,
 }
 
-/// Split base and priority fees Solana-style.
+/// Split base and priority fees for a block at `slot`.
 ///
-/// Note the tension this creates with the stated end state, "after the 100 B is
-/// emitted, validators are paid 100% from fees": burning half the base fee
-/// means validators never receive 100% of fees. The two statements are
-/// reconcilable — burn during emission, stop burning once emission ends — but
-/// that has to be an explicit decision, not an accident of which document is
-/// read last. See the open question in `BLOCH-TOKENOMICS-V4.md`.
-pub const fn split_fees(base_fee: u128, priority_fee: u128) -> FeeSplit {
+/// **Two eras, by founder decision.**
+///
+/// - *During emission* (`slot < EMISSION_SLOTS`): Solana's split — half the base
+///   fee burned, priority fees entirely to the producer. The burn is the
+///   deflationary counterweight that gives the hard cap its meaning while new
+///   supply is still arriving.
+/// - *After emission*: **no burn at all**, 100% of every fee to the producer.
+///   Once issuance stops, fees are the entire security budget, and burning part
+///   of the only remaining revenue would shrink the validator set for no gain.
+///
+/// The switch happens at exactly the slot emission stops, so there is never a
+/// window where both issuance and a burn apply, nor one where neither does.
+pub const fn split_fees_at(base_fee: u128, priority_fee: u128, slot: u64) -> FeeSplit {
+    if slot >= crate::tokenomics_v4::EMISSION_SLOTS {
+        return FeeSplit { to_producer: base_fee + priority_fee, burned: 0 };
+    }
     let base_burn = base_fee * BASE_FEE_BURN_BPS / BPS;
     let prio_producer = priority_fee * PRIORITY_FEE_PRODUCER_BPS / BPS;
     FeeSplit {
         to_producer: (base_fee - base_burn) + prio_producer,
         burned: base_burn + (priority_fee - prio_producer),
     }
+}
+
+/// The emission-era split. Kept as a named entry point because most callers are
+/// reasoning about the live chain, not the year-40 end state.
+pub const fn split_fees(base_fee: u128, priority_fee: u128) -> FeeSplit {
+    split_fees_at(base_fee, priority_fee, 0)
 }
 
 // ── Commission ──────────────────────────────────────────────────────────────

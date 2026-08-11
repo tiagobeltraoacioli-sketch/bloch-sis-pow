@@ -695,6 +695,30 @@ fn base_fee_burns_half_priority_fee_does_not() {
 }
 
 #[test]
+fn burn_stops_when_emission_ends() {
+    let last = tk::EMISSION_SLOTS - 1;
+    let first_after = tk::EMISSION_SLOTS;
+    let during = rewards::split_fees_at(1_000, 4_000, last);
+    let after = rewards::split_fees_at(1_000, 4_000, first_after);
+    assert_eq!(during.burned, 500);
+    assert_eq!(after.burned, 0);
+    assert_eq!(after.to_producer, 5_000, "pos-emissao o validador leva tudo");
+    // No window with both issuance and no burn, or neither.
+    assert!(tk::validator_reward_decay_sat(last) > 0);
+    assert_eq!(tk::validator_reward_decay_sat(first_after), 0);
+}
+
+#[test]
+fn fee_split_conserves_value_in_both_eras() {
+    for slot in [0u64, 1, tk::EMISSION_SLOTS - 1, tk::EMISSION_SLOTS, u64::MAX] {
+        for (b, p) in [(0u128, 0u128), (1, 0), (0, 1), (7, 13), (999_999, 1)] {
+            let s = rewards::split_fees_at(b, p, slot);
+            assert_eq!(s.burned + s.to_producer, b + p, "slot={slot} base={b} prio={p}");
+        }
+    }
+}
+
+#[test]
 fn fee_split_conserves_value_for_arbitrary_inputs() {
     for (b, p) in [(0, 0), (1, 0), (0, 1), (7, 13), (999_999, 1), (u64::MAX as u128, 0)] {
         let s = rewards::split_fees(b, p);
