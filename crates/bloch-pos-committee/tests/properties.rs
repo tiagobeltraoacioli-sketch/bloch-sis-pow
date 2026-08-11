@@ -915,16 +915,29 @@ fn probe_state_of_agrees_with_the_admitted_registry() {
     let ds = [seed, first, queued];
     let r = Registry::resolve(&ds, 1);
 
-    let active_sum: u128 = ds
-        .iter()
-        .filter(|d| r.state_of(d) == StakeState::Active)
-        .map(|d| d.amount_sat)
-        .sum();
+    // A invariante original somava o amount INTEIRO de toda delegacao reportada
+    // Active. Ela pegou o bug real de state_of, e depois quebrou por um motivo
+    // diferente: com ativacao parcial (correcao do F3) uma delegacao contribui
+    // stake enquanto ainda reporta Activating, entao "soma dos Active" nunca
+    // igualaria o total. A invariante certa e sobre a PORCAO ativada.
+    let activated_sum: u128 = ds.iter().map(|d| r.activated_sat(d)).sum();
     assert_eq!(
-        active_sum,
+        activated_sum,
         r.total_active(),
-        "state_of reports stake as Active that the registry has not admitted"
+        "a soma das porcoes ativadas tem de ser exatamente o stake ativo"
     );
+
+    // E o que a sonda existia para pegar continua fixado: nenhuma delegacao
+    // pode ser reportada Active sem estar integralmente ativada.
+    for d in ds.iter() {
+        if r.state_of(d) == StakeState::Active {
+            assert_eq!(
+                r.activated_sat(d),
+                d.amount_sat,
+                "state_of reportou Active uma delegacao que nao esta inteira"
+            );
+        }
+    }
 }
 
 // ═══ Epoch arithmetic ═══════════════════════════════════════════════════════

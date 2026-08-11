@@ -130,6 +130,13 @@ pub struct Registry {
     /// *other* delegation to the same validator had already been admitted —
     /// found by property test, 2026-08-11.
     admitted: Vec<(u64, u32, u32, u128)>,
+    /// Queue key -> satoshis of that delegation actually activated, sorted.
+    ///
+    /// Partial activation means a delegation can contribute stake without being
+    /// fully admitted, so "is it active?" and "how much of it is active?" are
+    /// different questions and both have callers: consensus wants the stake, a
+    /// wallet wants to tell its user that 500 of their 1,000 BLCH are earning.
+    activated: Vec<((u64, u32, u32, u128), u128)>,
 }
 
 impl Registry {
@@ -147,7 +154,9 @@ impl Registry {
 
         let mut active: Vec<(u32, u128)> = Vec::new();
         let mut total_active: u128 = 0;
-        let mut admitted = vec![false; queue.len()];
+        // How much of each queued delegation is currently active. Partial
+        // activation is the whole point — see the loop below.
+        let mut activated: Vec<u128> = vec![0; queue.len()];
 
         for e in 0..=epoch {
             // Genesis is unlimited: the rate limit exists to stop new stake
@@ -157,55 +166,70 @@ impl Registry {
             let budget = if e == 0 {
                 u128::MAX
             } else {
-                total_active * WARMUP_RATE_BPS / 10_000
+                // FLOOR, and it is load-bearing. The rate is a fraction of the
+                // stake that is *currently* active, so during a drain the
+                // budget shrinks with the thing it is draining: the tail decays
+                // geometrically and never reaches zero. A mass exit would leave
+                // a dust remainder bonded forever — caught by
+                // `deactivation_drains_gradually_and_completes`, which ran 200
+                // epochs and still found 937,812 sat stuck.
+                //
+                // Any positive floor guarantees termination. `MIN_DELEGATION_SAT`
+                // is the natural one: it is already the smallest unit of stake
+                // the system recognises, so a floor below it would be a budget
+                // that cannot admit or release anything. Ethereum solves the
+                // same problem the same way, with a minimum churn limit.
+                let rate = total_active * WARMUP_RATE_BPS / 10_000;
+                if rate > MIN_DELEGATION_SAT { rate } else { MIN_DELEGATION_SAT }
             };
 
-            // Head-of-queue always progresses, even when the delegation alone
-            // exceeds the epoch's budget. Without this the queue deadlocks
-            // forever on any single delegation larger than 9% of active stake
-            // — and on a small network that is most of them. Admitting one
-            // oversized entry per epoch bounds the disruption to one record
-            // per epoch while guaranteeing liveness.
+            // PARTIAL ACTIVATION. A delegation larger than the epoch's budget
+            // activates in slices across several epochs instead of waiting for
+            // a budget that will never come.
+            //
+            // The previous rule let the head of the queue through whole,
+            // whatever its size, to avoid deadlocking on any delegation bigger
+            // than 9% of active stake — which on a young network is most of
+            // them. That bought liveness by selling the cap: a single large
+            // delegation activated entirely in one epoch, which is exactly the
+            // "instant activation is instant control" the limit exists to stop
+            // (adversarial review, finding F3, 2026-08-11).
+            //
+            // Slicing gives both. The queue always drains, and the 9% ceiling
+            // holds absolutely, in both directions. It is also what Solana and
+            // Ethereum do, for the same reason.
             let mut used: u128 = 0;
-            let mut any_admitted = false;
-
             for (i, d) in queue.iter().enumerate() {
-                if admitted[i] || d.requested_epoch > e {
+                if d.requested_epoch > e || d.deactivate_epoch.is_some_and(|de| de <= e) {
                     continue;
                 }
-                if used + d.amount_sat > budget && any_admitted {
-                    continue; // waits for a later epoch; queue order is stable
+                let remaining = d.amount_sat - activated[i];
+                if remaining == 0 || used >= budget {
+                    continue;
                 }
-                used = used.saturating_add(d.amount_sat);
-                any_admitted = true;
-                admitted[i] = true;
-                total_active += d.amount_sat;
+                let take = remaining.min(budget - used);
+                used += take;
+                activated[i] += take;
+                total_active += take;
                 match active.binary_search_by_key(&d.validator, |(v, _)| *v) {
-                    Ok(pos) => active[pos].1 += d.amount_sat,
-                    Err(pos) => active.insert(pos, (d.validator, d.amount_sat)),
+                    Ok(pos) => active[pos].1 += take,
+                    Err(pos) => active.insert(pos, (d.validator, take)),
                 }
             }
 
-            // Cool-down, rate-limited and liveness-guaranteed the same way.
+            // Cool-down, sliced the same way and against the same budget.
             let mut released: u128 = 0;
-            let mut any_released = false;
             for (i, d) in queue.iter().enumerate() {
-                if !admitted[i] {
-                    continue;
-                }
                 let Some(de) = d.deactivate_epoch else { continue };
-                if de > e {
+                if de > e || activated[i] == 0 || released >= budget {
                     continue;
                 }
-                if released + d.amount_sat > budget && any_released {
-                    continue;
-                }
-                released = released.saturating_add(d.amount_sat);
-                any_released = true;
-                admitted[i] = false;
-                total_active -= d.amount_sat;
+                let give = activated[i].min(budget - released);
+                released += give;
+                activated[i] -= give;
+                total_active -= give;
                 if let Ok(pos) = active.binary_search_by_key(&d.validator, |(v, _)| *v) {
-                    active[pos].1 -= d.amount_sat;
+                    active[pos].1 -= give;
                     if active[pos].1 == 0 {
                         active.remove(pos);
                     }
@@ -213,15 +237,31 @@ impl Registry {
             }
         }
 
+        // A delegation counts as admitted only once it is FULLY activated;
+        // a partially activated one is still warming up.
         let mut admitted_keys: Vec<(u64, u32, u32, u128)> = queue
             .iter()
             .enumerate()
-            .filter(|(i, _)| admitted[*i])
+            .filter(|(i, d)| activated[*i] == d.amount_sat)
             .map(|(_, d)| d.queue_key())
             .collect();
         admitted_keys.sort_unstable();
 
-        Registry { epoch, stakes: active, total_active, admitted: admitted_keys }
+        let mut activated_map: Vec<((u64, u32, u32, u128), u128)> = queue
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| activated[*i] > 0)
+            .map(|(i, d)| (d.queue_key(), activated[i]))
+            .collect();
+        activated_map.sort_unstable();
+
+        Registry {
+            epoch,
+            stakes: active,
+            total_active,
+            admitted: admitted_keys,
+            activated: activated_map,
+        }
     }
 
     pub fn epoch(&self) -> u64 {
@@ -333,6 +373,19 @@ impl Registry {
             }
         }
         sorted.len()
+    }
+
+    /// Satoshis of `d` currently counted as active stake.
+    ///
+    /// Between zero and `d.amount_sat`: partial while warming up or draining.
+    /// The sum of this over every delegation equals [`Registry::total_active`],
+    /// which the sum of fully-admitted amounts does not — a delegation halfway
+    /// through warm-up contributes stake while still reporting `Activating`.
+    pub fn activated_sat(&self, d: &Delegation) -> u128 {
+        self.activated
+            .binary_search_by_key(&d.queue_key(), |(k, _)| *k)
+            .map(|i| self.activated[i].1)
+            .unwrap_or(0)
     }
 
     /// Lifecycle position of one delegation at this epoch.

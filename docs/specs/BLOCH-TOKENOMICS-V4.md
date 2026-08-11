@@ -181,6 +181,60 @@ before the height passes, not after.
 
 ---
 
+## 3.3 Genesis bootstrap — who produces block 1
+
+The adversarial review found a gap the halt decision opened and nothing closed.
+The original migration design seeded the validator set during a **hybrid PoW
+phase**: miners kept producing while deposits accumulated, so PoS activated onto
+an existing, funded validator set. Halting Genesis-3 and launching Genesis-4
+from a snapshot deleted that phase. Genesis-4 has no PoW, and deposits are
+transactions — which need blocks, which need validators.
+
+**The chain cannot start.** This is not a subtle failure: without an initial
+validator set there is no proposer for slot 0.
+
+### The fix: a genesis validator set
+
+The genesis block carries an initial validator set the same way it carries the
+allocations — as consensus data, active from slot 0, with no deposit
+transaction required because there is no chain yet to carry one. Every later
+validator joins through the ordinary deposit path.
+
+Three things this must satisfy, and one it must not pretend to.
+
+**It must be funded from a named bucket.** At genesis the only liquid supply is
+liquidity (5%), the marketing TGE tranche (25% of 4%) and the carryover holders
+(≤ 0.3%) — everything else is cliffed. Genesis validators therefore stake from
+the Foundation's holdings, and that has to be said plainly rather than shown as
+an unexplained line in the genesis file.
+
+**It must be large enough to be meaningful and small enough to be honest.** The
+partition in §6.5.3 cuts the active set into 32 committees, so a set below 32
+leaves empty committees and slots with no attesters. A floor of **64 genesis
+validators** gives every slot at least two.
+
+**It must be replaceable.** Genesis validators exit through the ordinary path as
+independent stake arrives. Nothing in consensus privileges them after genesis.
+
+### What it must not pretend
+
+**Genesis-validator stake does not count toward gates G1–G4.** A Foundation-
+funded set spread across 64 records reads as 64 independent participants to
+`top_share_bps` and `nakamoto_coefficient`, which measure the operator view —
+they cannot see one beneficial owner behind many records, and no on-chain metric
+can. The same reporting rule already written for the delegation program
+(`BLOCH-ENTITY-STRUCTURE.md` §5.1) applies here and for the same reason: the
+gates are measured on stake whose beneficial owner is not the Foundation, the
+founder, or Postern Labs.
+
+So the honest statement of the launch is: **the chain starts centralised, by
+construction, and the gates measure the distance from there.** A hybrid PoW
+phase would have bought a genuinely independent initial set; the halt bought a
+clean break instead. That was a defensible trade, but it was made without
+noticing this was part of the price.
+
+---
+
 ## 4. What this does to existing holders
 
 Stated plainly, because it affects parties who are not in the room:
@@ -521,7 +575,10 @@ vesting schedule that lives in a spreadsheet is not a vesting schedule.
 7. ~~Delegation~~ — **implemented**, §6.3.1, with the concentration gates now
    computed from the delegation set.
 8. ~~Fee burn versus "100% of fees"~~ — **decided**, §6.3.2.
-9. ~~The VC allocation against the ownerless thesis~~ — **resolved**: the
+9. **Genesis validator set** (§3.3) — how many, funded from which bucket, and
+   who operates them. The count floor (64) and the exclusion from G1–G4 are
+   settled; the operators are not.
+10. ~~The VC allocation against the ownerless thesis~~ — **resolved**: the
    ownerless thesis is retracted and a Solana-style foundation adopted
    ([ADR-036](../adr/ADR-036-retract-ownerless-adopt-foundation.md)). What
    remains is execution: rewrite the public copy before any announcement, and

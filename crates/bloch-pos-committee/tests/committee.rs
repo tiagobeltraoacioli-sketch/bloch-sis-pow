@@ -948,14 +948,28 @@ fn cap_pushes_the_sampler_away_from_the_whale() {
 }
 
 #[test]
-fn deactivation_removes_stake_after_the_request() {
+fn deactivation_drains_gradually_and_completes() {
+    // Antes da correcao do F3 a saida era instantanea: um registro saia inteiro
+    // numa epoca so. Agora o cool-down e fatiado pelo mesmo orcamento de 9% do
+    // warm-up, entao a saida drena e o teto vale nos DOIS sentidos — esvaziar o
+    // conjunto rapido era tao perigoso quanto enche-lo.
     let mut d = deleg(1, 10, 1_000_000, 0);
     d.deactivate_epoch = Some(5);
-    let before = Registry::resolve(&[d], 4);
-    let after = Registry::resolve(&[d], 6);
-    assert!(before.stake_of(10) > 0);
-    assert_eq!(after.stake_of(10), 0);
-    assert_eq!(before.state_of(&d), StakeState::Active);
+    let at = |e: u64| Registry::resolve(&[d], e).stake_of(10);
+
+    let before = at(4);
+    assert!(before > 0, "ativa antes do pedido de saida");
+    assert_eq!(Registry::resolve(&[d], 4).state_of(&d), StakeState::Active);
+
+    // Drena de forma monotona, sem sumir de uma vez.
+    let after_one = at(6);
+    let after_two = at(7);
+    assert!(after_one < before, "nao comecou a drenar");
+    assert!(after_two < after_one, "drenagem parou no meio");
+    assert!(after_one > 0, "saiu tudo numa epoca so — o teto foi contornado");
+
+    // E termina.
+    assert_eq!(at(200), 0, "a saida nunca completou");
 }
 
 #[test]
@@ -1133,4 +1147,39 @@ fn quorum_is_exact_at_two_thirds_and_reachable() {
     let reachable: u128 = cs.iter().flatten().count() as u128 * 100_000;
     assert_eq!(reachable, total);
     assert!(is_supermajority(reachable, total));
+}
+
+#[test]
+fn warmup_cap_holds_even_for_an_oversized_delegation() {
+    // F3: a escapatoria de liveness anterior admitia a cabeca da fila INTEIRA,
+    // qualquer que fosse o tamanho — entao uma delegacao grande ativava de uma
+    // vez e contornava o teto de 9%. Com fatiamento, ela entra em pedacos.
+    let incumbent = deleg(1, 10, 100_000_000, 0);
+    let whale = deleg(2, 20, 500_000_000, 1); // 5x o incumbente
+    let ds = vec![incumbent, whale];
+
+    let base = Registry::resolve(&ds, 0).total_active();
+    let e1 = Registry::resolve(&ds, 1);
+    let entered = e1.total_active() - base;
+    let cap = base * 9 / 100;
+    assert!(entered <= cap + 1, "entrou {entered}, teto era {cap} — F3 de volta");
+    assert!(entered > 0, "nada entrou: deadlock, que e o bug que a escapatoria consertava");
+
+    // Parcialmente ativa nao conta como admitida.
+    assert_eq!(e1.state_of(&whale), StakeState::Activating);
+
+    // E eventualmente entra inteira.
+    let done = Registry::resolve(&ds, 400);
+    assert_eq!(done.stake_of(20), 500_000_000 * tk::SAT_PER_BLOCH);
+    assert_eq!(done.state_of(&whale), StakeState::Active);
+}
+
+#[test]
+fn genesis_is_still_unlimited_so_the_chain_can_start() {
+    // A excecao do genesis continua: no epoch 0 nao existe conjunto a proteger,
+    // e sem ela nada nunca ativa (orcamento de 9% de zero e zero).
+    let ds: Vec<Delegation> = (0..10u32).map(|i| deleg(i, i, 1_000_000, 0)).collect();
+    let r = Registry::resolve(&ds, 0);
+    assert_eq!(r.total_active(), 10_000_000 * tk::SAT_PER_BLOCH);
+    assert_eq!(r.validators().len(), 10);
 }
