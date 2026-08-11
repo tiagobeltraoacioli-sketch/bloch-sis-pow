@@ -102,6 +102,9 @@ pub const DS_PROPOSE: [u8; 16] = *b"BLCH4:PROPOSE\0\0\0";
 /// the exit is "a hybrid-signed message" and every signed message gets its own
 /// tag; all tags are fixed 16 bytes, so no tag can prefix another.
 pub const DS_EXIT: [u8; 16] = *b"BLCH4:EXIT\0\0\0\0\0\0";
+/// State SMT node domain (§6.1) — every hash in [`crate::state_root`] starts
+/// with this tag so a state-tree node can never collide with a block id, a
+/// transaction Merkle node, or any other SHA3 use in the protocol.
 
 /// Role tags, mixed into the sortition seed so the per-slot subcommittee is not
 /// a predictable subset of the epoch committee.

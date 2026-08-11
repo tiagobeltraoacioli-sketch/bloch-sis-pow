@@ -50,6 +50,7 @@ pub mod tokenomics_v4;
 pub mod rewards;
 pub mod sample;
 pub mod staking;
+pub mod state_root;
 
 pub use attestation::{Attestation, AttestationData, RejectReason, SignatureVerifier};
 pub use interfaces::{
@@ -66,6 +67,9 @@ pub use staking::{
     resolve_activations, validate_deposit, validate_exit, validate_withdrawal, DepositInput,
     DepositReject, DepositTx, ExitReject, ExitTx, HybridKeyVerifier, QueuedDeposit,
     ValidatorRecord, WithdrawReject,
+pub use state_root::{
+    build_state_tree, state_root, verify_inclusion, ConsensusState, EutxoEntry, InclusionProof,
+    ParticipationRecord, RandaoMix, Smt, ValidatorRecord,
 };
 
 /// Draw the per-slot fork-choice subcommittee.
