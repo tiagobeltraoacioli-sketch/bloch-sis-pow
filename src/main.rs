@@ -2509,6 +2509,21 @@ fn accept_block(
         ));
     }
 
+    // ── Terminal height: the chain stops here ────────────────────────
+    // Genesis-3 is being retired at a fixed height, with a signed snapshot
+    // taken there and Genesis-4 launched from it (core::terminal_height).
+    // Checked BEFORE any expensive validation and before the tx work below:
+    // past the terminal height there is nothing worth spending cycles on, and
+    // a node still receiving these is talking to a peer that has not upgraded.
+    if core::is_past_terminal_height(height) {
+        return Err(format!(
+            "consensus rejection: height {} is past the terminal height {} — \
+             this chain has ended; Genesis-4 launches from the snapshot",
+            height,
+            core::terminal_height(core::node_chain_id()).unwrap_or(0)
+        ));
+    }
+
     // finalized_height bounds both the difficulty re-validation just below and
     // the disposition guard further down. Read it once, up front.
     let finalized_height = store.get_meta("finalized_height").ok().flatten()

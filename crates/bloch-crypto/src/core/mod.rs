@@ -410,6 +410,61 @@ pub const fn chain_requires_carryover(id: ChainId) -> bool {
     }
 }
 
+// ── Genesis-3 terminal height: the chain stops ──────────────────────────────
+//
+// The Genesis-3 chain is being retired. A signed UTXO snapshot is taken at the
+// terminal height, and Genesis-4 launches from that artifact about six months
+// later (`docs/specs/BLOCH-TOKENOMICS-V4.md` §3.2).
+//
+// A chain does not stop because it was announced. If blocks above the terminal
+// height are merely *unwanted*, miners keep producing them and the "halt" is a
+// fork nobody agreed to. Making them **invalid** is what actually ends the
+// chain, and it has to be running on the fleet before the height arrives —
+// this is a flag day in reverse, with every flag-day hazard intact.
+//
+// Two consequences worth stating where the constant lives:
+//
+//   1. Anyone who does not upgrade keeps mining past the terminal height on a
+//      fork. That is tolerable only because the canonical artifact is the
+//      signed snapshot at this height, not whatever chain has the most work
+//      afterwards.
+//   2. Once mining stops, this chain's history stops being evidence. PoW
+//      security is bought with ongoing hashrate; with none, rewriting history
+//      below the terminal height costs almost nothing. The snapshot digest
+//      goes into the Genesis-4 genesis block precisely so the record does not
+//      depend on a chain nobody is defending.
+
+/// Last valid height on the Genesis-3 mainnet. Blocks ABOVE this are invalid.
+pub const GENESIS3_TERMINAL_HEIGHT: u64 = 80_000;
+
+/// The terminal height for `id`, if that chain has one.
+///
+/// Exhaustive with no wildcard arm, deliberately — the same fail-closed idiom
+/// as [`chain_requires_carryover`]. When a new chain-id is added this stops
+/// compiling until someone decides whether it terminates, instead of silently
+/// inheriting "runs forever".
+pub const fn terminal_height(id: ChainId) -> Option<u64> {
+    match id {
+        // Development and legacy chains are not being retired by this rule.
+        ChainId::Mainnet => None,
+        ChainId::Testnet => None,
+        ChainId::Genesis2Devnet => None,
+        // The chain being retired.
+        ChainId::Genesis3Mainnet => Some(GENESIS3_TERMINAL_HEIGHT),
+    }
+}
+
+/// Is `height` beyond the terminal height for this node's chain?
+///
+/// The terminal height itself is **valid** — it is the last block, and the
+/// height the snapshot is taken at. Only heights strictly above it are refused.
+pub fn is_past_terminal_height(height: u64) -> bool {
+    match terminal_height(node_chain_id()) {
+        Some(t) => height > t,
+        None => false,
+    }
+}
+
 // ── Soft fork SF-1: canonical residual-gate width, k: 4 → 8 ─────────────────
 //
 // Height-activated tightening of the Bloch-SIS PoW residual gate from the
@@ -3003,6 +3058,41 @@ mod chain_id_tests {
             outputs: vec![TxOutput { value: 42, script_pubkey: vec![9u8; 20] }],
             locktime: 0,
         }
+    }
+
+    #[test]
+    fn terminal_height_only_retires_genesis3() {
+        // Exhaustive by construction; this pins the intent so a future chain-id
+        // cannot quietly inherit a terminal height it was never meant to have.
+        assert_eq!(terminal_height(ChainId::Genesis3Mainnet), Some(80_000));
+        assert_eq!(terminal_height(ChainId::Mainnet), None);
+        assert_eq!(terminal_height(ChainId::Testnet), None);
+        assert_eq!(terminal_height(ChainId::Genesis2Devnet), None);
+    }
+
+    #[test]
+    fn the_terminal_height_itself_is_valid() {
+        // Off-by-one here would either lose the last block or admit one past
+        // the snapshot — and the snapshot is taken AT the terminal height.
+        let t = GENESIS3_TERMINAL_HEIGHT;
+        let past = |h: u64| match terminal_height(ChainId::Genesis3Mainnet) {
+            Some(x) => h > x,
+            None => false,
+        };
+        assert!(!past(t - 1));
+        assert!(!past(t), "a altura terminal e o ultimo bloco valido");
+        assert!(past(t + 1));
+        assert!(past(u64::MAX));
+    }
+
+    #[test]
+    fn terminal_height_is_still_ahead_of_the_live_chain() {
+        // The rule must ship INERT: at the time of writing the chain is near
+        // height 40,400, so every block validates exactly as before. If this
+        // ever fails, the constant was set at or below the tip and the release
+        // would retroactively invalidate live history.
+        assert!(GENESIS3_TERMINAL_HEIGHT > 40_424,
+            "altura terminal nao pode estar no passado da cadeia viva");
     }
 
     #[test]
