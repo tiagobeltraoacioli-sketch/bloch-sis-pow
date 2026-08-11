@@ -24,20 +24,33 @@ fn main() {
         if s.is_empty() { None } else { Some(s) }
     };
 
-    let commit = git(&["rev-parse", "--short=12", "HEAD"]).unwrap_or_else(|| "unknown".into());
+    // A containerised or CI build has no .git, so the commit is passed in.
+    // Env var wins over the repo: the caller knows what it is building, and a
+    // build script guessing from a partial checkout is how stamps go stale.
+    let commit = std::env::var("BLOCH_BUILD_COMMIT")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| git(&["rev-parse", "--short=12", "HEAD"]))
+        .unwrap_or_else(|| "unknown".into());
 
     // A dirty build is the thing that made the fleet unidentifiable in the
     // first place, so it is marked loudly rather than hidden.
-    let dirty = match git(&["status", "--porcelain"]) {
-        Some(s) if !s.is_empty() => "+dirty",
-        Some(_) => "",
-        None => "+nogit",
+    let dirty = if std::env::var("BLOCH_BUILD_COMMIT").is_ok() {
+        // Caller-supplied commit: it asserted the tree state, do not second-guess.
+        ""
+    } else {
+        match git(&["status", "--porcelain"]) {
+            Some(s) if !s.is_empty() => "+dirty",
+            Some(_) => "",
+            None => "+nogit",
+        }
     };
 
     println!("cargo:rustc-env=BLOCH_BUILD_VERSION={pkg} ({commit}{dirty})");
 
     // Rebuild when HEAD moves, so the stamp cannot go stale in an incremental
     // build — a stale stamp is worse than no stamp: it is a confident lie.
+    println!("cargo:rerun-if-env-changed=BLOCH_BUILD_COMMIT");
     for p in [".git/HEAD", ".git/index"] {
         if std::path::Path::new(p).exists() {
             println!("cargo:rerun-if-changed={p}");

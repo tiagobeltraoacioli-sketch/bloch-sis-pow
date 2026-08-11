@@ -17,7 +17,7 @@ RUN apt-get update && apt-get install -y \
 
 # Copy the whole workspace. `crates/` holds the vendored bloch-sis-pow path
 # dependency, so it MUST be present or the build fails to resolve it.
-COPY Cargo.toml Cargo.lock* ./
+COPY Cargo.toml Cargo.lock* build.rs ./
 COPY crates ./crates
 COPY src ./src
 COPY tests ./tests
@@ -26,6 +26,11 @@ COPY tests ./tests
 # the committed Cargo.lock (fails on drift) — required for reproducibility.
 # SOURCE_DATE_EPOCH (passed as a build arg) clamps build timestamps.
 ARG SOURCE_DATE_EPOCH
+# The container has no .git, so the commit is passed in and stamped into
+# `bloch --version`. Without it the binary is unidentifiable once deployed —
+# the exact condition the 2026-08-11 fleet survey ran into.
+ARG BLOCH_BUILD_COMMIT
+ENV BLOCH_BUILD_COMMIT=${BLOCH_BUILD_COMMIT}
 RUN cargo build --release --locked --bin bloch
 
 # ─── Runtime ─────────────────────────────────────────────────
