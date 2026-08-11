@@ -417,3 +417,112 @@ fn subcommittee_actually_carries_intra_epoch_weight() {
     assert!(s.weight(&t, &root(1)) > 0);
     assert_eq!(s.head(&t, root(0), &children), root(2));
 }
+
+// ── tokenomics V4 ───────────────────────────────────────────────────────────
+
+use bloch_pos_committee::tokenomics_v4 as tk;
+
+#[test]
+fn allocations_sum_to_total_supply() {
+    let sum = tk::FOUNDER_BLOCH + tk::VC_BLOCH + tk::TEAM_BLOCH + tk::MARKETING_BLOCH
+        + tk::LIQUIDITY_BLOCH + tk::HOLDER_CARRYOVER_CAP_BLOCH + tk::VALIDATOR_EMISSION_BLOCH;
+    assert_eq!(sum, tk::TOTAL_SUPPLY_BLOCH);
+    assert_eq!(tk::VALIDATOR_EMISSION_BLOCH, 53_700_000_000);
+}
+
+#[test]
+fn founder_is_fully_locked_through_the_cliff() {
+    assert_eq!(tk::founder_vested_sat(0), 0);
+    assert_eq!(tk::founder_vested_sat(tk::FOUNDER_CLIFF_SLOTS - 1), 0);
+    // First slot after the cliff releases essentially nothing — linear, no jump.
+    assert_eq!(tk::founder_vested_sat(tk::FOUNDER_CLIFF_SLOTS), 0);
+}
+
+#[test]
+fn founder_vesting_is_linear_and_completes_exactly() {
+    let total = tk::FOUNDER_BLOCH * tk::SAT_PER_BLOCH;
+    let mid = tk::FOUNDER_CLIFF_SLOTS + tk::FOUNDER_VESTING_SLOTS / 2;
+    let half = tk::founder_vested_sat(mid);
+    let err = (half as i128 - (total / 2) as i128).abs();
+    assert!(err < 1_000_000, "meio do vesting deveria ser ~metade, erro {err}");
+    // Exact at the end: no dust may be stranded, or supply accounting breaks.
+    assert_eq!(tk::founder_vested_sat(tk::FOUNDER_VESTING_END_SLOT), total);
+    assert_eq!(tk::founder_vested_sat(u64::MAX), total);
+}
+
+#[test]
+fn founder_vesting_never_decreases() {
+    let step = tk::SLOTS_PER_YEAR / 12;
+    let mut prev = 0u128;
+    let mut slot = 0u64;
+    while slot < tk::FOUNDER_VESTING_END_SLOT + step {
+        let v = tk::founder_vested_sat(slot);
+        assert!(v >= prev, "vesting regrediu no slot {slot}");
+        prev = v;
+        slot += step;
+    }
+}
+
+#[test]
+fn validator_emission_stops_after_forty_years() {
+    assert!(tk::validator_reward_sat(0) > 0);
+    assert!(tk::validator_reward_sat(tk::EMISSION_SLOTS - 1) > 0);
+    assert_eq!(tk::validator_reward_sat(tk::EMISSION_SLOTS), 0);
+    assert_eq!(tk::validator_reward_sat(u64::MAX), 0);
+}
+
+#[test]
+fn validator_emission_never_exceeds_its_allocation() {
+    let alloc = tk::VALIDATOR_EMISSION_BLOCH * tk::SAT_PER_BLOCH;
+    let emitted = tk::validator_emitted_by(tk::EMISSION_SLOTS);
+    assert!(emitted <= alloc, "emitiu {emitted} > alocado {alloc}");
+    // Truncation loses at most one satoshi per slot.
+    assert!(alloc - emitted < tk::EMISSION_SLOTS as u128);
+    assert_eq!(tk::validator_emitted_by(u64::MAX), emitted);
+}
+
+#[test]
+fn average_block_reward_matches_the_spec() {
+    let per_slot_bloch = tk::validator_reward_sat(0) / tk::SAT_PER_BLOCH;
+    assert_eq!(per_slot_bloch, 1_276);
+}
+
+#[test]
+fn carryover_below_cap_is_untouched() {
+    let sat = tk::SAT_PER_BLOCH;
+    // Measured floor: 181,104,000 BLCH across four non-founder addresses.
+    let total = 181_104_000 * sat;
+    assert_eq!(tk::scaled_carryover_sat(177_063_600 * sat, total), 177_063_600 * sat);
+    assert_eq!(tk::scaled_carryover_sat(411_600 * sat, total), 411_600 * sat);
+}
+
+#[test]
+fn carryover_over_cap_scales_pro_rata() {
+    let sat = tk::SAT_PER_BLOCH;
+    let total = 600_000_000 * sat; // twice the cap
+    // Every holder keeps exactly half.
+    assert_eq!(tk::scaled_carryover_sat(400_000_000 * sat, total), 200_000_000 * sat);
+    assert_eq!(tk::scaled_carryover_sat(2 * sat, total), sat);
+    // And the scaled total lands on the cap, not near it.
+    let a = tk::scaled_carryover_sat(400_000_000 * sat, total);
+    let b = tk::scaled_carryover_sat(200_000_000 * sat, total);
+    assert_eq!(a + b, tk::HOLDER_CARRYOVER_CAP_BLOCH * sat);
+}
+
+#[test]
+fn carryover_scaling_does_not_overflow_at_full_supply() {
+    // balance × cap is the product of two ~1e19 values: it overflows u64 by
+    // twenty orders of magnitude. This must stay in u128 and stay exact.
+    let sat = tk::SAT_PER_BLOCH;
+    let huge = tk::TOTAL_SUPPLY_BLOCH * sat;
+    let out = tk::scaled_carryover_sat(huge, huge);
+    assert_eq!(out, tk::HOLDER_CARRYOVER_CAP_BLOCH * sat);
+}
+
+#[test]
+fn total_supply_is_over_half_of_u64_max() {
+    // The documented reason every quantity is u128 (§8.1). If this ever fails,
+    // the u128 choice should be revisited deliberately.
+    assert!(tk::TOTAL_SUPPLY_SAT > (u64::MAX as u128) / 2);
+    assert!(tk::TOTAL_SUPPLY_SAT < u64::MAX as u128);
+}
