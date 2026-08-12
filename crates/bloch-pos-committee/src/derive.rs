@@ -41,7 +41,9 @@ use crate::params::DS_BODY;
 use crate::sample::Validator;
 use crate::schedule;
 use crate::state_root::{
-    state_root, ConsensusState, EutxoEntry, ParticipationRecord, RandaoMix, ValidatorRecord,
+    state_root, ConsensusState, DelegationRecord, DepositQueueRecord, EutxoEntry,
+    FcEquivocatorRecord, FcMessageRecord, FinalityRecord, ParticipationRecord, PendingFeeRecord,
+    PendingVoteRecord, RandaoMix, ValidatorRecord,
 };
 use sha3::{Digest, Sha3_256};
 use std::collections::BTreeMap;
@@ -72,6 +74,27 @@ pub struct ChainState {
     /// Beacon mix history: the accumulated mix as of the last processed block
     /// of each of the last two epochs (§5.5 keeps exactly 2).
     pub randao_mixes: Vec<RandaoMix>,
+    /// Justification/finality bookkeeping (§5.5, 2026-08-11 extension).
+    /// Carried through this seam unchanged — advancing it is epoch
+    /// processing, the transition's job — but carried, because the state root
+    /// commits all components and a root over a subset is not the root the
+    /// header must carry.
+    pub finality: FinalityRecord,
+    /// Epoch-boundary votes pending the finality tally. Carried unchanged;
+    /// accumulating them is the transition's job.
+    pub pending_votes: Vec<PendingVoteRecord>,
+    /// LMD-GHOST latest messages. Carried unchanged.
+    pub fc_messages: Vec<FcMessageRecord>,
+    /// Fork-choice equivocator bar. Carried unchanged.
+    pub fc_equivocators: Vec<FcEquivocatorRecord>,
+    /// The permanent deposit queue. Carried unchanged (deposits are
+    /// transactions, and transactions are opaque at this seam).
+    pub deposit_queue: Vec<DepositQueueRecord>,
+    /// The permanent delegation history. Carried unchanged, same reason.
+    pub delegations: Vec<DelegationRecord>,
+    /// Fee rewards pending the epoch boundary. Carried unchanged, same
+    /// reason.
+    pub pending_fees: Vec<PendingFeeRecord>,
     /// Taint-set root (§4.1), carried.
     pub taint_root: [u8; 32],
     /// Coherence accumulator root (§6.6.2), carried — never recomputed.
@@ -91,6 +114,13 @@ impl ChainState {
             current_participation: &self.current_participation,
             previous_participation: &self.previous_participation,
             randao_mixes: &self.randao_mixes,
+            finality: &self.finality,
+            pending_votes: &self.pending_votes,
+            fc_messages: &self.fc_messages,
+            fc_equivocators: &self.fc_equivocators,
+            deposit_queue: &self.deposit_queue,
+            delegations: &self.delegations,
+            pending_fees: &self.pending_fees,
             taint_root: self.taint_root,
             coherence_accumulator_root: self.coherence_accumulator_root,
             coherence_nullifier_root: self.coherence_nullifier_root,
@@ -110,8 +140,16 @@ pub struct ParentState<'a> {
     /// The consensus-state components committed at the parent.
     pub chain: &'a ChainState,
     /// Per-validator committed RANDAO chain heads, sorted by validator index.
-    /// (Not part of the SMT yet — tracked alongside until DEV-1's registry
-    /// record grows its `randao_commitment` column.)
+    ///
+    /// The registry record grew its `randao_commitment`/`reveals_used`
+    /// columns on 2026-08-11 and the transition commits them into the SMT.
+    /// This seam still reads chain heads from this side list and carries the
+    /// registry's columns *unchanged* through [`post_chain_state`] — meaning
+    /// its root and the transition's root for the same block differ until the
+    /// seam is folded into the transition (the pre-existing integration step,
+    /// flagged in the module docs, not widened here). Each stack remains
+    /// internally consistent: its producer and its validator use the same
+    /// derivation.
     pub reveal_states: &'a [(u32, RevealState)],
 }
 
@@ -570,7 +608,7 @@ pub fn validate_block(
 #[cfg(test)]
 mod coherence_tests {
     use super::*;
-    use crate::state_root::RandaoMix;
+    use crate::state_root::{CheckpointRecord, FinalityRecord, RandaoMix};
 
     fn chain(acc: [u8; 32], nf: [u8; 32]) -> ChainState {
         ChainState {
@@ -579,6 +617,26 @@ mod coherence_tests {
             current_participation: Vec::new(),
             previous_participation: Vec::new(),
             randao_mixes: vec![RandaoMix { epoch: 0, mix: [0u8; 32] }],
+            // The bookkeeping components the S5.5 extension added. Empty here
+            // on purpose: this fixture exercises the Coherence binding only,
+            // and listing them explicitly (rather than `..Default::default()`)
+            // means the next component added breaks this line and gets looked
+            // at, instead of silently defaulting to empty inside a test that
+            // claims to cover the state.
+            finality: FinalityRecord {
+                justified: Vec::new(),
+                current_justified: CheckpointRecord { epoch: 0, root: [0u8; 32] },
+                previous_justified: CheckpointRecord { epoch: 0, root: [0u8; 32] },
+                finalized: CheckpointRecord { epoch: 0, root: [0u8; 32] },
+                leaked: Vec::new(),
+                next_epoch: 0,
+            },
+            pending_votes: Vec::new(),
+            fc_messages: Vec::new(),
+            fc_equivocators: Vec::new(),
+            deposit_queue: Vec::new(),
+            delegations: Vec::new(),
+            pending_fees: Vec::new(),
             taint_root: [0u8; 32],
             coherence_accumulator_root: acc,
             coherence_nullifier_root: nf,

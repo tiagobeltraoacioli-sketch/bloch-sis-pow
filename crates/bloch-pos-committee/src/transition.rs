@@ -66,21 +66,49 @@
 //! *parent* state twice yields bit-identical children — holds because the
 //! function is pure, and is pinned by test.
 //!
-//! ## What is honestly not committed yet (flagged, not hidden)
+//! ## The commitment covers the whole committed state (closed 2026-08-11)
 //!
-//! [`crate::state_root::ConsensusState`] — the frozen §5.5 component list —
-//! commits the registry, participation, beacon mix history and the carried
-//! roots. The following consensus-relevant fields of [`CommittedState`] do
-//! **not** yet appear under a `StateRoots` component and therefore are not
-//! bound by the header's `state_root`: the finality bookkeeping, per-validator
-//! RANDAO chain positions (`reveals_used`), the deposit/delegation queues,
-//! pending fee rewards, fork-choice latest messages, the slashing state
-//! (applied-evidence ids, correlation window) and the delegator slash-loss
-//! ledger — though the slash's *effects* on the registry (the `slashed` flag,
-//! the reduced bond) ARE committed via the registry component. Extending the closed
-//! component list is a visible spec change (interfaces §Boundary 7) that needs
-//! the two-reviewer rule; recorded in `BLOCH-POS-INTERFACES.md` as an open
-//! point rather than smuggled in here as an eighth leaf.
+//! An earlier revision of this module honestly flagged a gap: the finality
+//! bookkeeping, per-validator RANDAO chain positions (`reveals_used`), the
+//! deposit/delegation queues, pending fee rewards and fork-choice latest
+//! messages lived in [`CommittedState`] but not under the header's
+//! `state_root`. That gap is now closed by the visible §5.5 component-list
+//! extension (see [`crate::state_root`] module docs and interfaces
+//! §Boundary 7): every one of those fields is committed, and
+//! [`CommittedState::compute_root`] below is the single place the mapping
+//! from state to components is defined.
+//!
+//! **One gap reopened in the same wave and is still open.** Slashing was wired
+//! into the transition concurrently with the extension above, so its state —
+//! the applied-evidence id set, the correlation window, and the delegator
+//! slash-loss ledger — is *not* under a component, and the extension did not
+//! cover it. The slash's **effects** on the registry (the `slashed` flag, the
+//! reduced bond) ARE committed, so a state-synced node sees the outcome; what
+//! it cannot reconstruct is the replay-protection set, which is what stops the
+//! same evidence being applied twice. That is the §5.5 failure shape and it
+//! needs the same treatment — recorded here and in `BLOCH-POS-INTERFACES.md`
+//! rather than left to be discovered.
+//!
+//! What remains **outside** the root by design stays outside for a stated
+//! reason, not by omission — each entry carries the reconstruction argument
+//! §5.5 demands:
+//!
+//! - `slot` and `head`: bound by the block header itself. `head` *cannot* be
+//!   committed without circularity — it is the id of the very header that
+//!   carries this root — and `slot` only changes when `head` does, so the
+//!   header binds both. A state-synced node reads them from the header it
+//!   trusted to get the root.
+//! - `epoch`: committed, indirectly but bindingly — the running mix is a
+//!   randao-history leaf whose entry key *is* the current epoch, so two
+//!   states that differ only in epoch produce different roots (pinned by
+//!   test).
+//! - `genesis_mix` and `genesis_cohort`: genesis constants, immutable after
+//!   the genesis block, part of chain identity exactly like the genesis id.
+//!   The §5.5 failure shape requires *mutable* local state; a node that
+//!   disagrees on these is on a different chain, not a diverged one.
+//! - `pubkey_index`: a pure index over the committed registry
+//!   (`SHA3-256(pubkey) → index`), reconstructible from the registry leaves
+//!   alone.
 //!
 //! Similarly, [`block_id`] and [`proposal_signing_root`] below implement the
 //! §5.4/§6.1 formulas (`SHA3-256(DS_BLOCK ‖ canonical header)`,
@@ -108,7 +136,9 @@ use crate::schedule;
 use crate::slashing;
 use crate::staking::{self, QueuedDeposit};
 use crate::state_root::{
-    ConsensusState, ParticipationRecord, RandaoMix, ValidatorRecord as CommittedValidatorRecord,
+    CheckpointRecord, ConsensusState, DelegationRecord, DepositQueueRecord, FcEquivocatorRecord,
+    FcMessageRecord, FinalityRecord, LeakRecord, ParticipationRecord, PendingFeeRecord,
+    PendingVoteRecord, RandaoMix, ValidatorRecord as CommittedValidatorRecord,
 };
 use crate::tokenomics_v4;
 use sha3::{Digest, Sha3_256};
@@ -451,8 +481,12 @@ impl CommittedState {
         }
     }
 
-    /// Recompute the committed state root from the frozen §5.5 components.
-    /// Pure recomputation on every call — no memoized value can go stale.
+    /// Recompute the committed state root from the §5.5 components. Pure
+    /// recomputation on every call — no memoized value can go stale. This is
+    /// the one place [`CommittedState`] fields map to committed components;
+    /// a field added to the struct but not to this function is exactly the
+    /// gap the 2026-08-11 extension closed, and the field-coverage test at
+    /// the bottom of this file exists to make that regression loud.
     fn compute_root(&self) -> [u8; 32] {
         let validators: Vec<CommittedValidatorRecord> = self
             .validators
@@ -468,6 +502,13 @@ impl CommittedState {
                 activation_epoch: r.activation_epoch,
                 exit_epoch: r.exit_epoch,
                 slashed: r.slashed,
+                // The RANDAO chain pair (head, position) is committed as
+                // advanced — step 5 of the transition reads it back from
+                // exactly here.
+                randao_commitment: r.randao_commitment,
+                reveals_used: *self.reveals_used.get(&r.index).unwrap_or(&0),
+                withdrawable_epoch: r.withdrawable_epoch,
+                withdrawal_credentials: r.withdrawal_credentials.clone(),
             })
             .collect();
         let current: Vec<ParticipationRecord> = self
@@ -490,6 +531,88 @@ impl CommittedState {
             .collect();
         mixes.push(RandaoMix { epoch: self.epoch, mix: self.randao_mix });
 
+        // Finality bookkeeping: the engine's full fold state plus the frozen
+        // view's previous-justified checkpoint, in one leaf.
+        let cp = |c: finality::Checkpoint| CheckpointRecord { epoch: c.epoch, root: c.root };
+        let finality_record = FinalityRecord {
+            justified: self.finality_engine.justified_checkpoints().map(cp).collect(),
+            current_justified: cp(self.finality_engine.current_justified()),
+            previous_justified: CheckpointRecord {
+                epoch: self.previous_justified.epoch,
+                root: self.previous_justified.root,
+            },
+            finalized: cp(self.finality_engine.finalized()),
+            leaked: self
+                .finality_engine
+                .leaked_stakes()
+                .map(|(validator, leaked_sat)| LeakRecord { validator, leaked_sat })
+                .collect(),
+            next_epoch: self.finality_engine.next_epoch(),
+        };
+        // The signing root travels from the accumulation key into the leaf
+        // key untouched — computed once, in attestation.rs, never re-derived.
+        let pending_votes: Vec<PendingVoteRecord> = self
+            .pending_votes
+            .iter()
+            .map(|((validator, signing_root), d)| PendingVoteRecord {
+                validator: *validator,
+                signing_root: *signing_root,
+                slot: d.slot,
+                head: d.head,
+                source_epoch: d.source_epoch,
+                source_root: d.source_root,
+                target_epoch: d.target_epoch,
+                target_root: d.target_root,
+            })
+            .collect();
+        let fc_messages: Vec<FcMessageRecord> = self
+            .latest_messages
+            .iter()
+            .map(|(validator, (slot, root))| FcMessageRecord {
+                validator: *validator,
+                slot: *slot,
+                root: *root,
+            })
+            .collect();
+        let fc_equivocators: Vec<FcEquivocatorRecord> = self
+            .fc_equivocators
+            .iter()
+            .map(|validator| FcEquivocatorRecord { validator: *validator })
+            .collect();
+        let deposit_queue: Vec<DepositQueueRecord> = self
+            .deposit_history
+            .iter()
+            .map(|d| DepositQueueRecord {
+                pubkey_hash: d.pubkey_hash,
+                deposit_epoch: d.deposit_epoch,
+                amount_sat: d.amount_sat,
+            })
+            .collect();
+        // Positionally keyed: the history's append order is chain order (see
+        // DelegationRecord docs for why content cannot key duplicates).
+        let delegations: Vec<DelegationRecord> = self
+            .delegations
+            .iter()
+            .enumerate()
+            .map(|(position, d)| DelegationRecord {
+                position: position as u64,
+                delegator: d.delegator,
+                validator: d.validator,
+                amount_sat: d.amount_sat,
+                requested_epoch: d.requested_epoch,
+                deactivate_epoch: d.deactivate_epoch,
+                eligible: d.eligible,
+            })
+            .collect();
+        let pending_fees: Vec<PendingFeeRecord> = self
+            .pending_fee_rewards
+            .iter()
+            .map(|(validator, amount_sat)| PendingFeeRecord {
+                validator: *validator,
+                amount_sat: *amount_sat,
+            })
+            .collect();
+
         crate::state_root::state_root(&ConsensusState {
             // The eUTXO set is owned by the node's transaction layer, which
             // this standalone crate cannot see (transactions are opaque);
@@ -499,6 +622,13 @@ impl CommittedState {
             current_participation: &current,
             previous_participation: &previous,
             randao_mixes: &mixes,
+            finality: &finality_record,
+            pending_votes: &pending_votes,
+            fc_messages: &fc_messages,
+            fc_equivocators: &fc_equivocators,
+            deposit_queue: &deposit_queue,
+            delegations: &delegations,
+            pending_fees: &pending_fees,
             taint_root: self.taint_root,
             coherence_accumulator_root: self.coherence_accumulator_root,
             coherence_nullifier_root: self.coherence_nullifier_root,
@@ -2065,5 +2195,251 @@ mod tests {
         // And the share of the post-cap total is at most one third — the
         // point of the whole rule: the founder cannot stall finality alone.
         assert!(cohort_stake * 3 <= (cohort_stake + others) + 3, "≤ 1/3 of the capped total");
+    }
+
+    // ── the 2026-08-11 commitment-gap closure ───────────────────────────────
+
+    /// A state in which every bookkeeping component is non-empty: a deposit,
+    /// a delegation, a fee-paying transfer and a full attestation quorum have
+    /// all been applied, and one equivocator is barred. This is the fixture
+    /// the two tests below share — a state where the pre-extension root would
+    /// have been blind to most of what follows.
+    fn state_with_live_bookkeeping() -> (Transition<OkVerifier>, CommittedState, Vec<Attestation>)
+    {
+        let (t, g, mut chains) = setup(8);
+        let deposit = PosTransaction::Deposit {
+            pubkey: vec![0xAB; 8],
+            amount_sat: staking::MIN_DEPOSIT_SAT,
+            randao_commitment: [0xCD; 32],
+            withdrawal_credentials: vec![0xEF; 4],
+        };
+        let delegate = PosTransaction::Delegate {
+            delegator: 900,
+            validator: 0,
+            amount_sat: delegation::MIN_DELEGATION_SAT,
+            eligible: true,
+        };
+        let fee = PosTransaction::Transfer { base_fee_sat: 1_000, priority_fee_sat: 500 };
+        let slot1 = SLOTS_PER_EPOCH + 1;
+        let b1 =
+            build_block(&t, &g, slot1, &[], &[deposit.clone(), fee.clone()], &mut chains);
+        let s1 = t.apply_block(&g, &b1, &[], &[deposit, fee]).unwrap();
+        let b2 =
+            build_block(&t, &s1, slot1 + 1, &[], std::slice::from_ref(&delegate), &mut chains);
+        let s2 = t.apply_block(&s1, &b2, &[], &[delegate]).unwrap();
+        let atts = full_epoch_attestations(&s2, *s1.head().as_bytes());
+        let b3 = build_block(&t, &s2, slot1 + 7, &atts, &[], &mut chains);
+        let mut st = t.apply_block(&s2, &b3, &atts, &[]).unwrap();
+        // One barred equivocator, so that component is non-empty too. (The
+        // committed bar is monotone; inserting here models a prior verdict.)
+        st.fc_equivocators.insert(7);
+        st.latest_messages.remove(&7);
+
+        // The fixture must actually be live, or the coverage below is voided.
+        assert!(!st.pending_votes.is_empty());
+        assert!(!st.latest_messages.is_empty());
+        assert!(!st.fc_equivocators.is_empty());
+        assert!(!st.deposit_history.is_empty());
+        assert!(!st.delegations.is_empty());
+        assert!(!st.pending_fee_rewards.is_empty());
+        assert!(!st.boundary_mixes.is_empty());
+        (t, st, atts)
+    }
+
+    /// Every consensus-relevant `CommittedState` field moves the root; every
+    /// deliberately-uncommitted field does not, and says why. This test is
+    /// the inventory from the 2026-08-11 gap closure, executable: if someone
+    /// adds a field to `CommittedState` and forgets `compute_root`, the
+    /// matching mutation added here (per the module docs) is what will catch
+    /// the next gap — and if they forget the mutation too, the reviewer has
+    /// this list to diff against the struct.
+    #[test]
+    fn every_committed_state_field_is_bound_by_the_root() {
+        let (_t, st, _) = state_with_live_bookkeeping();
+        let base = st.compute_root();
+
+        let mut moved = vec![base];
+        macro_rules! must_move {
+            ($what:expr, $m:expr) => {{
+                let mut g = st.clone();
+                #[allow(clippy::redundant_closure_call)]
+                ($m)(&mut g);
+                let r = g.compute_root();
+                assert_ne!(r, base, "{} must be bound by the state root", $what);
+                moved.push(r);
+            }};
+        }
+
+        // The epoch clock (committed via the running-mix entry key).
+        must_move!("epoch", |g: &mut CommittedState| g.epoch += 1);
+        // Registry columns, including the 2026-08-11 additions.
+        must_move!("validator stake", |g: &mut CommittedState| {
+            g.validators.get_mut(&0).unwrap().staked_sat += 1
+        });
+        must_move!("validator randao_commitment", |g: &mut CommittedState| {
+            g.validators.get_mut(&0).unwrap().randao_commitment[0] ^= 1
+        });
+        must_move!("validator withdrawable_epoch", |g: &mut CommittedState| {
+            g.validators.get_mut(&0).unwrap().withdrawable_epoch = 99
+        });
+        must_move!("validator withdrawal_credentials", |g: &mut CommittedState| {
+            g.validators.get_mut(&0).unwrap().withdrawal_credentials.push(0x01)
+        });
+        must_move!("reveals_used", |g: &mut CommittedState| {
+            *g.reveals_used.get_mut(&0).unwrap() += 1
+        });
+        // Beacon state.
+        must_move!("randao_mix", |g: &mut CommittedState| g.randao_mix[0] ^= 1);
+        must_move!("boundary_mixes", |g: &mut CommittedState| {
+            for (_, m) in g.boundary_mixes.iter_mut() {
+                m[0] ^= 1;
+            }
+        });
+        // Finality bookkeeping.
+        must_move!("finality_engine", |g: &mut CommittedState| {
+            g.finality_engine = finality::FinalityState::new(finality::Checkpoint {
+                epoch: 0,
+                root: [0xEE; 32],
+            })
+        });
+        must_move!("previous_justified", |g: &mut CommittedState| {
+            g.previous_justified.epoch += 1
+        });
+        must_move!("pending_votes (removal)", |g: &mut CommittedState| {
+            let k = *g.pending_votes.keys().next().unwrap();
+            g.pending_votes.remove(&k);
+        });
+        // Fork-choice bookkeeping.
+        must_move!("latest_messages", |g: &mut CommittedState| {
+            for (_, (slot, _)) in g.latest_messages.iter_mut() {
+                *slot += 1;
+            }
+        });
+        must_move!("fc_equivocators", |g: &mut CommittedState| {
+            g.fc_equivocators.insert(6);
+        });
+        // Staking queues and fees.
+        must_move!("deposit_history", |g: &mut CommittedState| {
+            g.deposit_history[0].amount_sat += 1
+        });
+        must_move!("delegations", |g: &mut CommittedState| {
+            g.delegations[0].amount_sat += 1
+        });
+        must_move!("pending_fee_rewards", |g: &mut CommittedState| {
+            for (_, amount) in g.pending_fee_rewards.iter_mut() {
+                *amount += 1;
+            }
+        });
+        // Participation.
+        must_move!("current_participation", |g: &mut CommittedState| {
+            let k = *g.current_participation.keys().next().unwrap();
+            let v = g.current_participation[&k];
+            g.current_participation.insert(k, !v);
+        });
+        must_move!("previous_participation", |g: &mut CommittedState| {
+            g.previous_participation.insert(999, true);
+        });
+        // Carried roots.
+        must_move!("taint_root", |g: &mut CommittedState| g.taint_root[0] ^= 1);
+        must_move!("coherence_accumulator_root", |g: &mut CommittedState| {
+            g.coherence_accumulator_root[0] ^= 1
+        });
+        must_move!("coherence_nullifier_root", |g: &mut CommittedState| {
+            g.coherence_nullifier_root[0] ^= 1
+        });
+
+        // Distinct mutations must commit distinctly — a collision would mean
+        // two different states share a root.
+        for i in 0..moved.len() {
+            for j in (i + 1)..moved.len() {
+                assert_ne!(moved[i], moved[j], "states {i} and {j} share a root");
+            }
+        }
+
+        // ── Deliberately NOT committed — each with its reconstruction
+        //    argument (module docs), pinned so a future change is a decision,
+        //    not an accident. ─────────────────────────────────────────────
+        // `slot`: bound by the header that carries the root; it cannot change
+        // without `head` changing.
+        let mut g = st.clone();
+        g.slot += 1;
+        assert_eq!(g.compute_root(), base, "slot is header-bound, not root-bound");
+        // `genesis_mix` / `genesis_cohort`: genesis constants — chain
+        // identity, immutable after genesis, like the genesis block id.
+        let mut g = st.clone();
+        g.genesis_mix[0] ^= 1;
+        assert_eq!(g.compute_root(), base, "genesis_mix is chain identity");
+        let mut g = st.clone();
+        g.genesis_cohort.push(3);
+        assert_eq!(g.compute_root(), base, "genesis_cohort is chain identity");
+        // `pubkey_index`: a derived index over the committed registry.
+        let mut g = st.clone();
+        g.pubkey_index.clear();
+        assert_eq!(g.compute_root(), base, "pubkey_index is derived from the registry");
+    }
+
+    /// Two nodes that reach the same state over different paths — buffered
+    /// out-of-order delivery, reversed attestation order inside the carrier
+    /// block, and explicit vs implicit epoch processing — commit the SAME
+    /// root, at a point where every bookkeeping component of the 2026-08-11
+    /// extension is non-empty. This is the §5.5 property re-proven over the
+    /// extended component list: before the extension this test would have
+    /// passed vacuously, because the root could not see most of the state it
+    /// now binds.
+    #[test]
+    fn convergent_paths_commit_identical_roots_with_bookkeeping_live() {
+        let (t, g, mut chains) = setup(8);
+        let deposit = PosTransaction::Deposit {
+            pubkey: vec![0xAB; 8],
+            amount_sat: staking::MIN_DEPOSIT_SAT,
+            randao_commitment: [0xCD; 32],
+            withdrawal_credentials: vec![0xEF; 4],
+        };
+        let delegate = PosTransaction::Delegate {
+            delegator: 900,
+            validator: 0,
+            amount_sat: delegation::MIN_DELEGATION_SAT,
+            eligible: true,
+        };
+        let fee = PosTransaction::Transfer { base_fee_sat: 1_000, priority_fee_sat: 500 };
+        let slot1 = SLOTS_PER_EPOCH + 1;
+        let b1 =
+            build_block(&t, &g, slot1, &[], &[deposit.clone(), fee.clone()], &mut chains);
+        let s1 = t.apply_block(&g, &b1, &[], &[deposit.clone(), fee.clone()]).unwrap();
+        let b2 =
+            build_block(&t, &s1, slot1 + 1, &[], std::slice::from_ref(&delegate), &mut chains);
+        let s2 = t.apply_block(&s1, &b2, &[], std::slice::from_ref(&delegate)).unwrap();
+        let atts = full_epoch_attestations(&s2, *s1.head().as_bytes());
+        let b3 = build_block(&t, &s2, slot1 + 7, &atts, &[], &mut chains);
+
+        // Node A: chain order, implicit epoch rollover inside apply_block.
+        let a = t.apply_block(&s2, &b3, &atts, &[]).unwrap();
+
+        // Node B: processed the empty genesis-epoch boundary EXPLICITLY, then
+        // applied the same blocks with b3's attestations delivered reversed.
+        let e1 = t.process_epoch(&g).unwrap();
+        let r1 = t.apply_block(&e1, &b1, &[], &[deposit, fee]).unwrap();
+        let r2 = t.apply_block(&r1, &b2, &[], &[delegate]).unwrap();
+        let mut reversed = atts.clone();
+        reversed.reverse();
+        let b = t.apply_block(&r2, &b3, &reversed, &[]).unwrap();
+
+        // Mid-epoch, with every extended component live — not after a
+        // boundary flushed the interesting state away.
+        assert!(!a.pending_votes.is_empty(), "fixture must exercise pending votes");
+        assert!(!a.latest_messages.is_empty(), "fixture must exercise fork-choice messages");
+        assert!(!a.deposit_history.is_empty(), "fixture must exercise the deposit queue");
+        assert!(!a.delegations.is_empty(), "fixture must exercise delegations");
+        assert!(!a.pending_fee_rewards.is_empty(), "fixture must exercise pending fees");
+
+        assert_eq!(a, b, "same chain, different paths: states must be identical");
+        assert_eq!(a.state_root(), b.state_root(), "…and so must the committed roots");
+
+        // And the roots keep agreeing across the boundary that consumes the
+        // pending components (votes tallied, fees compounded).
+        let a4 = t.process_epoch(&a).unwrap();
+        let b4 = t.process_epoch(&b).unwrap();
+        assert_eq!(a4, b4);
+        assert_eq!(a4.state_root(), b4.state_root());
     }
 }

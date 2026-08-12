@@ -70,6 +70,7 @@ RETIRED = [
 
 # Trechos que citam valores antigos DE PROPOSITO, como historico.
 EXEMPT = ("earlier draft", "an earlier version", "was wrong", "superseded",
+          "at the old", "used to be", "until 2026-08-11",
           "retired", "V2 nominal", "rascunho", "no longer", "went with")
 
 # Documentos que descrevem a cadeia Genesis-3 VIVA, onde os numeros antigos

@@ -92,8 +92,10 @@ pub use staking::{
     DepositReject, DepositTx, ExitReject, ExitTx, HybridKeyVerifier, QueuedDeposit, WithdrawReject,
 };
 pub use state_root::{
-    build_state_tree, state_root, verify_inclusion, ConsensusState, EutxoEntry, InclusionProof,
-    ParticipationRecord, RandaoMix, Smt,
+    build_state_tree, state_root, verify_inclusion, CheckpointRecord, ConsensusState,
+    DelegationRecord, DepositQueueRecord, EutxoEntry, FcEquivocatorRecord, FcMessageRecord,
+    FinalityRecord, InclusionProof, LeakRecord, ParticipationRecord, PendingFeeRecord,
+    PendingVoteRecord, RandaoMix, Smt,
 };
 pub use header::{BlockEnvelope, BlockHeaderV4, BlockId, Body, DecodeError, VERSION_G4};
 pub use interfaces::{
