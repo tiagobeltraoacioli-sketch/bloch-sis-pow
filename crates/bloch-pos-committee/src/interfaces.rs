@@ -297,6 +297,22 @@ pub enum TransitionError {
     /// finality — a block may never un-finalize anything (§6.6.2 makes the
     /// same demand of the shielded pool via `coherence_root`).
     FinalityRegression,
+    // ── Variants below were added by DEV-2's transition seam via the one
+    // sanctioned cheap extension point (`#[non_exhaustive]`, see module docs).
+    // Each is a distinct header-commitment failure that would otherwise hide
+    // inside a neighbouring variant and be undebuggable from logs.
+    /// Header `parent` is not the id of the block whose committed state was
+    /// supplied for validation.
+    WrongParent,
+    /// Header `body_root` does not match the Merkle root over the body's
+    /// transactions.
+    BodyRootMismatch,
+    /// Header `attestation_root` does not match the root over the attestation
+    /// quorum the body carries.
+    AttestationRootMismatch,
+    /// Header `coherence_root` does not carry the parent's shielded-pool
+    /// commitment forward (it is carried, never recomputed — §6.6.1).
+    CoherenceRootMismatch,
 }
 
 /// Why a deposit was rejected (§7.1, §4.1, §6.6.3).

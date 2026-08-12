@@ -59,8 +59,10 @@ pub mod genesis_cohort;
 pub mod finality;
 pub mod forkchoice;
 pub mod gossip;
+pub mod header;
 pub mod interfaces;
 pub mod params;
+pub mod produce;
 pub mod tokenomics_v4;
 pub mod rewards;
 pub mod sample;
@@ -68,6 +70,7 @@ pub mod staking;
 pub mod state_root;
 pub mod schedule;
 pub mod slashing;
+pub mod derive;
 
 pub use attestation::{Attestation, AttestationData, RejectReason, SignatureVerifier};
 pub use beacon::{mix_in, process_reveal, BeaconError, RandaoChain, RevealState};
@@ -90,11 +93,14 @@ pub use state_root::{
     build_state_tree, state_root, verify_inclusion, ConsensusState, EutxoEntry, InclusionProof,
     ParticipationRecord, RandaoMix, Smt,
 };
+pub use header::{BlockEnvelope, BlockHeaderV4, BlockId, Body, DecodeError, VERSION_G4};
 pub use interfaces::{
-    BlockHeaderV4, BlockId, FinalityGadget, ProposerDuties, RandomnessBeacon, SlashingRules,
-    StakingLifecycle, StateCommitment, StateReader, StateTransition,
+    FinalityGadget, ProposerDuties, RandomnessBeacon, SlashingRules, StakingLifecycle,
+    StateCommitment, StateReader, StateTransition,
 };
 pub use finality::{EpochOutcome, EpochVotes, FinalityError};
+pub use produce::{produce, ProduceError, ProducerRandao, ProposerSigner};
+pub use derive::{validate_block, ChainState, ParentState, RandaoRejection};
 
 // ── Names that exist in two modules — NOT re-exported flat ──────────────────
 //
@@ -105,6 +111,8 @@ pub use finality::{EpochOutcome, EpochVotes, FinalityError};
 //   `interfaces::Checkpoint`     vs `finality::Checkpoint`
 //   `interfaces::FinalityState`  vs `finality::FinalityState`
 //   `staking::ValidatorRecord`   vs `state_root::ValidatorRecord`
+//   `interfaces::BlockId`        vs `header::BlockId`
+//   `interfaces::BlockHeaderV4`  vs `header::BlockHeaderV4`
 //
 // The first two are the same concept declared twice: the PMO froze them as part
 // of the `FinalityGadget` boundary while the gadget author wrote concrete ones.
@@ -112,6 +120,16 @@ pub use finality::{EpochOutcome, EpochVotes, FinalityError};
 // staking's is the lifecycle record (activation/exit epochs, withdrawal
 // address), state_root's is what gets committed into the SMT. They may want
 // different names rather than one merged type.
+//
+// The last two are frozen-contract vs concrete again, with one deliberate
+// asymmetry: the *concrete* `header::` pair is what the flat re-export carries.
+// `interfaces::BlockId` is a transparent `pub [u8; 32]` tuple — anyone could
+// mint one from raw bytes, which is exactly the second-derivation-path defect
+// §5.4 forbids — while `header::BlockId` is opaque with `BlockId::of` as its
+// single constructor, and A2's source-scan property test enforces that.
+// Exporting the permissive type flat would hand every downstream caller the
+// forgeable one by default. The frozen trait signatures still name their own
+// `interfaces::` types, qualified.
 //
 // Resolving these is an integration decision, deliberately left visible.
 
