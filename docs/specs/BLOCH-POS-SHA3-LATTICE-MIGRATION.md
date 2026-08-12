@@ -100,7 +100,7 @@ has read §0 and still wants the migration designed and staffed.
   migration must not break, and the one new consensus rule the shielded pool
   forces on the staking design.
 - The premine vesting schedule (10,368,000-block cliff + 480 monthly tranches).
-  Premine outputs are, however, made **consensus-ineligible for staking** (§4.1).
+  Premine ineligibility is retired with the taint machinery — see §4.
 - Any L2/EVM change beyond re-pointing its anchor to the new finality signal.
 
 ### 1.3 What this document does not claim
@@ -172,61 +172,55 @@ they bite:
 
 ---
 
-## 4. Distribution, eligibility, and the anti-capture design
+## 4. Distribution and the anti-capture design — retired and replaced
 
-### 4.1 Consensus-enforced ineligibility
+> **This section described taint propagation, and taint no longer exists.**
+> It was written for a migration *in place*, where the founder's ~94% holding
+> sat on the chain being converted and had to be marked ineligible coin by coin.
+> Two later decisions removed its subject: Genesis-3 halts and Genesis-4 launches
+> from a snapshot (`BLOCH-TOKENOMICS-V4.md` §3.2), and the carryover crosses as
+> **one undifferentiated set with no exclusion list** (§1 of the same document).
+> There is no class of coin left to mark.
+>
+> Three mechanisms went with it: the taint set, the 300 M holder cap, and — the
+> one worth naming — the **exclusion list as an unaudited power**. Whoever wrote
+> that list would have decided who counts as founder, with nothing in the
+> protocol checking it. That risk did not get mitigated; it stopped existing.
 
-Promises are not mitigations. The following are **consensus rules**, verified
-by every node, and any block violating them is invalid:
+### 4.1 What answers concentration instead
 
-1. **Premine ineligibility.** Any output derived from the founder premine
-   (address hash `FOUNDER_ADDRESS_HASH`, `tokenomics_v2.rs:241`) and any output
-   descending from a vesting tranche is permanently ineligible as stake. A
-   deposit transaction spending such an output is invalid.
-2. **Treasury ineligibility.** The mined treasury balance (the ≈ 94% carryover
-   concentration of §0.1) is placed under an explicit, consensus-recognised
-   ineligibility list published in the Genesis-4 activation block. Moving those
-   coins does not launder eligibility: eligibility is tracked by **taint
-   propagation** over the UTXO graph, not by address.
-3. **Per-validator stake cap.** No single validator record may hold more than
-   `MAX_VALIDATOR_STAKE` (proposed: 1% of active stake). Excess is not slashed,
-   it is simply not counted.
-4. **Deposit ceiling per epoch.** The activation queue admits at most
-   `MAX_ACTIVATIONS_PER_EPOCH` (proposed: 4) validators per epoch, so no actor
-   can materialise a majority in a single epoch.
-5. **No shielding of tainted coins.** A Coherence shield transaction (transparent
-   → shielded) whose inputs are tainted is **invalid**, and deposits may only
-   spend transparent outputs (§7.1). Without this rule the shielded pool is a
-   taint launderer: shield 3.4 B tainted BLCH, unshield it into fresh notes with
-   no visible ancestry, and rules 1–2 evaporate. This is the single most
-   important interaction between keeping the ZK ledger and using taint-based
-   eligibility, and it is specified in full in §6.6.3.
+Not coin marking. Three things, in descending order of how much they actually
+do:
 
-**Honest limitation, stated in the spec and in every public artifact:** rules 3
-and 4 are Sybil-gameable. A holder with 94% of supply can split across
-thousands of validator records. Taint propagation (rules 1 and 2) is the only
-one of the four that actually binds, and it binds only if the taint set is
-defined at the transition and never re-opened. Rules 3 and 4 raise the cost and
-the visibility of capture; they do not prevent it.
+1. **The allocation itself.** The founder's new grant is 17% under a 10-year
+   cliff and 40-year linear vest — the strictest schedule on the chain, far
+   beyond any market benchmark.
+2. **Vesting on the Foundation buckets.** VC and team hold nothing liquid at
+   genesis; marketing releases a quarter; liquidity is liquid by function
+   (`BLOCH-TOKENOMICS-V4.md` §7B).
+3. **Gates measured on stake that is not insider stake.** G1–G4 exclude stake
+   whose beneficial owner is the Foundation, the founder, or Postern Labs —
+   including Foundation-delegated stake and the genesis validator set
+   (`BLOCH-ENTITY-STRUCTURE.md` §5.1, tokenomics §3.3).
 
-### 4.2 Distribution gate
+### 4.2 What that does not fix, stated plainly
 
-Because §4.1 is imperfect by construction, activation is gated on measured
-distribution, not on a calendar date. See §11.
+The carried-over balance is **liquid at genesis**, and the largest single
+address holds 3,546,175,400 BLCH — 70.4% of the circulating supply at slot 0.
+Gate G2 requires the largest holder under 25%, which this schedule does not
+reach until roughly **year five**.
 
-### 4.3 Where the untainted stake comes from
+An earlier draft cliffed the founder's entire position and bought a genesis
+where the founder held no spendable stake at all. Carrying the balance across
+liquid gave that up. The tokenomics document states the year-by-year figures
+(§4A); this document's job is only to record that the gates in §11 are what
+enforce it, and that they are not met at launch.
 
-If premine and treasury are both ineligible, the eligible float is roughly
-`circulating − treasury − premine` — a small number today. Two supply routes,
-both to be run during the hybrid phase (§10.3):
-
-- Continued PoW issuance to independent miners during the hybrid period (every
-  coinbase mined by a third party is untainted, stakeable float).
-- An explicit, published, time-boxed distribution program (mining incentives,
-  node-operator grants) executed **before** the transition, not after.
-
-The hybrid phase is therefore not a formality — it is the mechanism that
-creates a validator set at all. Its length is determined by §11, not by §12.
+One distinction stays available and is still undecided: **liquid is not the
+same as stakeable**. A carried-over balance can be spendable while remaining
+ineligible to stake. Nothing about carrying it across liquid decides that it
+votes, and that decision is what determines whether the gates are reachable
+before year five.
 
 ---
 
@@ -239,8 +233,8 @@ creates a validator set at all. Its length is determined by §11, not by §12.
 | `SLOT_DURATION_SECS` | **30** | Deliberately identical to today's PoW block target — see below |
 | `SLOTS_PER_EPOCH` | 32 | 16 min/epoch |
 | `EPOCHS_PER_CHECKPOINT` | 1 | Justification per epoch; finality ≈ 32 min |
-| `MIN_DEPOSIT_BLCH` | 100,000 | Sized so a validator set of ~1,000 is reachable from realistic untainted float |
-| `MAX_VALIDATOR_STAKE` | 1% of active stake | §4.1.3 |
+| `MIN_DEPOSIT_BLCH` | 100,000 | Sized so a validator set of ~1,000 is reachable from realistic float |
+| `MAX_VALIDATOR_STAKE` | 1% of active stake | 1% cap, resolved by fixed point — `delegation.rs` |
 | ~~`COMMITTEE_SIZE`~~ | **removed** | Replaced by partitioning — see §6.5.3 |
 | ~~`SLOT_SUBCOMMITTEE_SIZE`~~ | **removed** | Same |
 | Committee size | **derived: `ceil(N / 32)`** | The active set is partitioned, not sampled |
@@ -351,7 +345,6 @@ derives a block identifier from anything other than `BlockId::of(&header)`.
 - the validator registry (pubkeys, stake, activation/exit epochs, slashed flag),
 - the current and previous epoch attestation participation records,
 - the randao mix history for the last 2 epochs,
-- the taint set root (§4.1),
 - **the Coherence shielded-pool state**: the SHAKE-256 accumulator root and the
   nullifier-set root (§6.6). Today these live in an in-memory `ShieldedPool`
   (`main.rs:844`); under PoS they must be committed, because finality means
@@ -633,31 +626,34 @@ reorganisable after the transparent one is settled — the worst possible
 asymmetry, and precisely the class of divergence this chain has already been
 bitten by when consensus state lived outside the committed state.
 
-#### 6.6.3 Shielding is closed to tainted coins
+#### 6.6.3 Deposits must spend transparent outputs
 
 Stated as consensus rules, enforced by every node:
 
 ```
-INVALID  shield_tx  if any input is in the taint set (§4.1)
 INVALID  deposit_tx if any input is a shielded output
 ```
+
+The companion rule — that shielding a tainted coin is invalid — went with the
+taint set (§4). What remains is the direction that was always load-bearing on
+its own: **stake must be attributable**, so a validator's bond always traces to
+transparent coins.
 
 The first rule is enforceable because a shield transaction spends **transparent**
 inputs, whose ancestry is public — the privacy boundary is not violated by
 checking it. The second rule closes the reverse direction: stake must be
-attributable, so a validator's bond always traces to transparent, untainted
-coins.
+attributable, so a validator's bond always traces to transparent coins.
 
-Without both rules, §4.1 is decorative: the 94% concentration shields itself,
-unshields into notes with no ancestry, and stakes freely. **Keeping the ZK
-ledger and using taint-based eligibility are only compatible under this rule.**
+The two-class-coin cost this rule used to carry is gone with the taint set:
+no coin is marked, so none is second-class. The remaining constraint is narrow
+and uncontroversial — a shielded note has no `OutPoint` to bond, so it could not
+back a deposit in any case.
 
-The cost is honest and must be published: BLCH becomes, in a narrow sense, a
-**two-class coin** — tainted coins are transparent-only and non-staking. They
-remain fully spendable, transferable, and identical for every other purpose.
-Whether that is acceptable is a founder decision (§14.4), not an engineering
-one, and it interacts with exchange listing, which is separately blocked on PQ
-custody.
+A9's audit found this is not a retrofit at all: the shield bridge **does not
+exist yet**. `ShieldedTx` has no transparent fields and `check_spend`'s balance
+equation means value can neither enter nor leave the pool. So the rule is a
+day-one design constraint on a bridge that has still to be built, at no
+privacy cost and no migration cost.
 
 #### 6.6.4 Shared prover infrastructure
 
@@ -686,7 +682,7 @@ DepositTx {
 }
 ```
 
-Validity: inputs must be **transparent** (§6.6.3) and **untainted** (§4.1);
+Validity: inputs must be **transparent** (§6.6.3);
 amount within bounds; PoP valid under **both** halves of the suite; suite tag
 == `SUITE_MLDSA65_FALCON1024`. One key pair serves identity, proposal and
 attestation — there is no separate attestation key, because there is no
@@ -738,11 +734,9 @@ in the same commit, not later.
 >
 > What that changes: there is no hybrid period, no `TRANSITION_START`, no
 > DAG→linear seam to cross, and no upgrade partition — the old chain is not
-> continued, it is ended. The one thing that gets *harder* is §4.1: the taint
-> machinery was built because the live distribution could not be fixed. With a
-> fresh genesis and a new allocation, taint applies to the carried-over balances
-> only, and the concentration answer comes from the allocation itself (§5 of the
-> tokenomics spec) rather than from tracking coins.
+> continued, it is ended. §4.1's taint machinery goes with it: it was built
+> because the live distribution could not be fixed in place, and a fresh genesis
+> replaces coin-marking with the allocation and its vesting schedules.
 >
 > The text below is retained because the gates (§11), the rollback thinking
 > (§13) and the testing strategy (§12) still apply to launching a new chain.
@@ -799,7 +793,7 @@ phase exits without its exit criteria met and evidenced.
 |---|---|---|
 | **DEV-1 — Consensus core** | Slots/epochs, fork choice, finality, state transition, transition mechanism | LMD-GHOST + justification/finalization, `BlockHeaderV4`, DAG→linear seam, flag-day activation logic |
 | **DEV-2 — Cryptography, beacon & prover** | SHA-3 domain separation, hybrid-suite integration, RANDAO, sortition, epoch aggregation | Hash migration across the tree, constant-time Falcon-1024 signing path, beacon + sortition + full KAT suite, **the §6.5.1 proving-cost spike** |
-| **DEV-3 — Staking, economics, node, P2P & ZK-ledger continuity** | Deposit/exit/withdrawal, slashing, rewards, gossip, sync, RPC, wallet, Coherence state commitment | Two new tx types, taint tracking incl. the §6.6.3 shield rules, reward accounting, attestation gossip topics, RPC surface, sync from a finalized checkpoint, shielded roots in `state_root` |
+| **DEV-3 — Staking, economics, node, P2P & ZK-ledger continuity** | Deposit/exit/withdrawal, slashing, rewards, gossip, sync, RPC, wallet, Coherence state commitment | Two new tx types, the §6.6.3 transparent-input rule, reward accounting, attestation gossip topics, RPC surface, sync from a finalized checkpoint, shielded roots in `state_root` |
 
 Interfaces between the three are frozen at the end of Phase 1 as Rust traits
 with no implementations; every later phase codes against them.
@@ -865,7 +859,7 @@ aggregation go/no-go decision recorded** (§6.5.1).
 
 DEV-1: slots, epochs, LMD-GHOST, justification/finalization, `BlockHeaderV4`,
 state transition, DAG→linear seam. DEV-3: deposits, exits, slashing, rewards,
-taint tracking, gossip, RPC, sync-from-checkpoint. A3 runs devnets continuously
+gossip, RPC, sync-from-checkpoint. A3 runs devnets continuously
 from week 12.
 
 *Exit:* a 30-node devnet finalizes for 7 consecutive days including induced
@@ -910,7 +904,7 @@ activation and no "we'll fix it after the merge".
 
 | # | Gate | Threshold |
 |---|---|---|
-| G1 | **Untainted eligible stake** | ≥ 15% of circulating supply is eligible (untainted) and deposited |
+| G1 | **Independent eligible stake** | ≥ 15% of circulating supply is deposited by parties that are not the Foundation, the founder, or Postern Labs |
 | G2 | **Concentration** | No single entity controls > 25% of active stake; top-3 < 50% |
 | G3 | **Nakamoto coefficient** | ≥ 7 for block production and for finality |
 | G4 | **Validator count** | ≥ 200 active validators, ≥ 50 operated by parties unaffiliated with Postern Labs |
@@ -948,8 +942,7 @@ engineering.
   place the Coherence continuity test (§6.6.1) is meaningful.
 - **ZK-ledger tests (A1/A3):** shield before the transition, spend after;
   nullifier double-spend attempts across the seam; a shield transaction with a
-  tainted input must be rejected (§6.6.3); a deposit spending a shielded output
-  must be rejected; shielded roots present and finalized in `state_root`.
+  a deposit spending a shielded output must be rejected (§6.6.3); shielded roots present and finalized in `state_root`.
 - **Adversarial passes (A4):** one per phase, plus a dedicated long-range /
   weak-subjectivity analysis and a sortition-grinding analysis (§6.4).
 
@@ -990,11 +983,11 @@ engineering.
    schedule? The arrangement is fixed, so the answer here is a *security*
    question, not a design choice — and if it is P0, §6.2's suite escape hatch
    is the only lever, and pulling it requires reversing the constraint.
-4. **Taint set permanence and the two-class coin.** §4.1 plus §6.6.3 makes
-   tainted coins transparent-only and non-staking. Is that acceptable? It is
-   the price of keeping both the ZK ledger and taint-based eligibility, and it
-   interacts with fungibility and with exchange listing (already blocked on PQ
-   custody).
+4. ~~**Taint set permanence and the two-class coin.**~~ **Dissolved.** The
+   carryover crosses as one undifferentiated set, so no coin is marked and none
+   is second-class. What replaced the question is narrower and still open:
+   whether a carried-over balance that is *liquid* is also *stakeable* (§4.2).
+   That one decides whether the gates are reachable before year five.
 5. ~~**Weak subjectivity** — who signs the checkpoint in an ownerless system?~~
    **Answered by [ADR-036](../adr/ADR-036-retract-ownerless-adopt-foundation.md):**
    the ownerless premise is retracted and the Foundation publishes checkpoints.
