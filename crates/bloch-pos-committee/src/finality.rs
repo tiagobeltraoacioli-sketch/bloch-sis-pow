@@ -370,6 +370,23 @@ impl FinalityState {
     pub fn next_epoch(&self) -> u64 {
         self.next_epoch
     }
+
+    /// Every justified checkpoint this state holds, in epoch order.
+    ///
+    /// A read-only view for the state commitment (§5.5, 2026-08-11
+    /// extension): the committed finality record must cover the *whole* fold
+    /// state, and these fields are otherwise private by design. No hashing or
+    /// serialization happens here — the committed byte format has exactly one
+    /// definition, in `state_root`.
+    pub fn justified_checkpoints(&self) -> impl Iterator<Item = Checkpoint> + '_ {
+        self.justified.iter().map(|(epoch, root)| Checkpoint { epoch: *epoch, root: *root })
+    }
+
+    /// Cumulative inactivity leak per validator, in index order. Same purpose
+    /// and same rules as [`FinalityState::justified_checkpoints`].
+    pub fn leaked_stakes(&self) -> impl Iterator<Item = (u32, u64)> + '_ {
+        self.leaked.iter().map(|(v, s)| (*v, *s))
+    }
 }
 
 #[cfg(test)]

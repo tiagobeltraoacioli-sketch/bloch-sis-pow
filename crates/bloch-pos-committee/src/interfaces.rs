@@ -745,16 +745,43 @@ pub trait SlashingRules {
 /// rule requires to be committed. The list is closed: a consensus rule that
 /// needs a value not represented here must first add its component — visibly,
 /// in a spec change — rather than reading it from anywhere else.
+///
+/// That path was exercised exactly once, on 2026-08-11: the transition
+/// demonstrably read the finality bookkeeping, the RANDAO chain positions,
+/// the staking queues, pending fees and the fork-choice messages from state
+/// the list did not bind — the `expected_bits` shape, flagged (not smuggled)
+/// by the transition's author. The six `*_root` fields below the taint root
+/// are that extension; the registry component simultaneously grew its RANDAO
+/// chain, withdrawable-epoch and withdrawal-credential columns. Recorded in
+/// the migration doc §5.5 and `BLOCH-POS-INTERFACES.md` §2.7; as an
+/// interfaces change it carries the two-reviewer rule.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StateRoots {
     /// eUTXO set.
     pub utxo_root: [u8; 32],
-    /// Validator registry ([`ValidatorRecord`]s).
+    /// Validator registry ([`ValidatorRecord`]s — including, since
+    /// 2026-08-11, the RANDAO chain head + position, the withdrawable epoch
+    /// and the withdrawal credentials).
     pub registry_root: [u8; 32],
     /// Current + previous epoch attestation participation.
     pub participation_root: [u8; 32],
     /// Beacon mix history, last 2 epochs.
     pub randao_history_root: [u8; 32],
+    /// Justification/finality bookkeeping: the engine's checkpoint history,
+    /// current/previous-justified and finalized checkpoints, the
+    /// inactivity-leak ledger and the epoch clock.
+    pub finality_root: [u8; 32],
+    /// Epoch-boundary votes pending the next finality tally.
+    pub pending_votes_root: [u8; 32],
+    /// LMD-GHOST bookkeeping: latest message per validator and the
+    /// equivocator bar.
+    pub forkchoice_root: [u8; 32],
+    /// The permanent deposit/activation queue.
+    pub deposit_queue_root: [u8; 32],
+    /// The permanent delegation history.
+    pub delegation_root: [u8; 32],
+    /// Fee rewards accrued to proposers, pending the epoch boundary.
+    pub pending_fees_root: [u8; 32],
     /// The §4.1 taint set.
     pub taint_root: [u8; 32],
     /// Coherence SHAKE-256 accumulator root — **carried, never recomputed**:

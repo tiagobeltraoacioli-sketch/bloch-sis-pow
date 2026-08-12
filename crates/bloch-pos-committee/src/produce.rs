@@ -261,7 +261,9 @@ mod tests {
     use crate::beacon::RevealState;
     use crate::header::BlockId;
     use crate::interfaces::{ProposalReject, TransitionError};
-    use crate::state_root::{ParticipationRecord, RandaoMix, ValidatorRecord};
+    use crate::state_root::{
+        CheckpointRecord, FinalityRecord, ParticipationRecord, RandaoMix, ValidatorRecord,
+    };
     use crate::derive::{validate_block, ChainState};
     use sha3::{Digest, Sha3_256};
 
@@ -322,8 +324,15 @@ mod tests {
                 activation_epoch: 0,
                 exit_epoch: u64::MAX,
                 slashed: false,
+                // Carried by this seam (see ChainState docs): committed
+                // values, advanced by the transition, not here.
+                randao_commitment: [i as u8; 32],
+                reveals_used: 0,
+                withdrawable_epoch: u64::MAX,
+                withdrawal_credentials: Vec::new(),
             })
             .collect();
+        let genesis_cp = CheckpointRecord { epoch: 0, root: [0u8; 32] };
         let chain = ChainState {
             eutxos: Vec::new(),
             registry,
@@ -337,6 +346,20 @@ mod tests {
                 RandaoMix { epoch: 0, mix: SEED_MIX },
                 RandaoMix { epoch: 1, mix: PARENT_MIX },
             ],
+            finality: FinalityRecord {
+                justified: vec![genesis_cp],
+                current_justified: genesis_cp,
+                previous_justified: genesis_cp,
+                finalized: genesis_cp,
+                leaked: Vec::new(),
+                next_epoch: 1,
+            },
+            pending_votes: Vec::new(),
+            fc_messages: Vec::new(),
+            fc_equivocators: Vec::new(),
+            deposit_queue: Vec::new(),
+            delegations: Vec::new(),
+            pending_fees: Vec::new(),
             taint_root: [0x11; 32],
             coherence_accumulator_root: [0x12; 32],
             coherence_nullifier_root: [0x13; 32],

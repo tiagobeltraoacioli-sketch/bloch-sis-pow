@@ -342,13 +342,37 @@ derives a block identifier from anything other than `BlockId::of(&header)`.
 `state_root` commits to a SHA3-256 sparse Merkle tree over:
 
 - the eUTXO set,
-- the validator registry (pubkeys, stake, activation/exit epochs, slashed flag),
+- the validator registry (pubkeys, stake, activation/exit/withdrawable
+  epochs, slashed flag, RANDAO chain head + position, withdrawal
+  credentials),
 - the current and previous epoch attestation participation records,
 - the randao mix history for the last 2 epochs,
+- the justification/finality bookkeeping: the engine's checkpoint history,
+  the current/previous-justified and finalized checkpoints, the
+  inactivity-leak ledger and the epoch clock,
+- the epoch-boundary votes pending the next finality tally,
+- the LMD-GHOST bookkeeping (latest message per validator, equivocator bar),
+- the staking queues: the permanent deposit history and delegation history,
+- fee rewards accrued to proposers, pending the epoch boundary,
 - **the Coherence shielded-pool state**: the SHAKE-256 accumulator root and the
   nullifier-set root (§6.6). Today these live in an in-memory `ShieldedPool`
   (`main.rs:844`); under PoS they must be committed, because finality means
   nothing if the shielded state is not part of what gets finalized.
+
+> **Revision 2026-08-11 — the one extension of the closed list.** The original
+> list stopped after the randao history and the shielded roots. The transition
+> implementation honestly flagged (rather than smuggled) that its committed
+> state also carried finality bookkeeping, per-validator RANDAO chain
+> positions, deposit/delegation queues, pending fee rewards and fork-choice
+> latest messages — all consensus-relevant, none derivable from the committed
+> leaves, none reconstructible by a node syncing from a state root. Leaving
+> them out violated this section's own hard rule below, which is senior to the
+> freeze that closed the list. The bullets above are the closure of that gap;
+> `state_root.rs` documents the component tags and `transition.rs` documents
+> what deliberately remains outside the root (block id/slot: header-bound;
+> genesis constants: chain identity; pubkey index: derived) with the
+> reconstruction argument for each. Interfaces `StateRoots` extended to match
+> (two-reviewer rule applies).
 
 **Hard rule, learned from the difficulty defect:** every consensus-relevant
 value used to validate block *B* must be derivable from `B.parent`'s committed

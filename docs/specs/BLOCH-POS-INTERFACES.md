@@ -170,6 +170,22 @@ Attestations get their own tree, separate from transactions, so a finalized
 epoch's signatures can be pruned (§6.5.1) without disturbing the transaction
 commitment.
 
+**Extended once, 2026-08-11.** The transition implementation recorded here
+(rather than smuggled in) that its committed state held consensus-relevant
+values the closed list did not bind: finality bookkeeping, per-validator
+RANDAO chain positions, the deposit/delegation queues, pending fee rewards
+and fork-choice latest messages. §5.5's hard rule is senior to the freeze, so
+the list was opened along its own prescribed path — visibly, in a spec change
+— and now carries `finality_root`, `pending_votes_root`, `forkchoice_root`,
+`deposit_queue_root`, `delegation_root` and `pending_fees_root`; the registry
+component gained the RANDAO chain head/position, withdrawable-epoch and
+withdrawal-credential columns. What stays outside the root stays for a stated
+reconstruction reason (`transition.rs` module docs, pinned by test): the
+block id and slot are header-bound, the genesis constants are chain identity,
+the pubkey index is derived from the registry. As an interfaces change this
+carries the two-reviewer rule; the crate-side extension and its tests landed
+with the change.
+
 ---
 
 ## 3. Design decisions taken in the freeze

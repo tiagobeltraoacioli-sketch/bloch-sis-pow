@@ -5,14 +5,38 @@
 //! `state_root` commits, in one tree:
 //!
 //! - the eUTXO set,
-//! - the validator registry (pubkeys, stake, activation/exit epochs, slashed
-//!   flag),
+//! - the validator registry (pubkeys, stake, activation/exit/withdrawable
+//!   epochs, slashed flag, RANDAO chain head and position, withdrawal
+//!   credentials),
 //! - the current and previous epoch attestation participation records,
 //! - the randao mix history for the last 2 epochs,
+//! - the justification/finality bookkeeping: the engine's full checkpoint
+//!   history, the current/previous-justified and finalized checkpoints, the
+//!   inactivity-leak ledger and the epoch clock,
+//! - the epoch-boundary votes pending the next finality tally,
+//! - the LMD-GHOST bookkeeping: latest message per validator and the
+//!   equivocator bar,
+//! - the staking queues: the deposit history and the delegation history,
+//! - fee rewards accrued to proposers, pending the epoch boundary,
 //! - the taint set root (§4.1),
 //! - the Coherence shielded-pool state: the accumulator root and the
 //!   nullifier-set root (§6.6.2). Finality means nothing if the shielded
 //!   ledger is not part of what gets finalized.
+//!
+//! The list is closed. It was extended once, on 2026-08-11, and the reason is
+//! the reason the list exists at all: §5.5's hard rule ("every
+//! consensus-relevant value comes from the parent's *committed* state") is
+//! senior to the freeze that closed the list, and the transition demonstrably
+//! read the bookkeeping components above — finality roots at step 6, the
+//! RANDAO chain position at step 5, the queues and pending fees at every
+//! boundary — while the root did not bind them. Uncommitted
+//! consensus-relevant state is the `expected_bits` shape: a node that syncs
+//! by state root cannot reconstruct it, and two nodes that disagree in it
+//! validate differently while their roots claim agreement. The extension was
+//! recorded as a visible spec change (migration doc §5.5, interfaces
+//! §Boundary 7), not smuggled; "we need more state" without the
+//! cannot-be-reconstructed argument remains insufficient grounds to touch
+//! the list.
 //!
 //! ## The rule this module is shaped by
 //!
@@ -88,6 +112,16 @@ const TAG_RANDAO: u8 = 0x05;
 const TAG_TAINT_ROOT: u8 = 0x06;
 const TAG_COHERENCE_ACCUMULATOR: u8 = 0x07;
 const TAG_COHERENCE_NULLIFIERS: u8 = 0x08;
+// Added by the 2026-08-11 extension (see module docs). Tags are append-only:
+// reusing or renumbering one would silently re-key every leaf of the
+// component it named.
+const TAG_FINALITY: u8 = 0x09;
+const TAG_PENDING_VOTE: u8 = 0x0A;
+const TAG_FC_MESSAGE: u8 = 0x0B;
+const TAG_FC_EQUIVOCATOR: u8 = 0x0C;
+const TAG_DEPOSIT_QUEUE: u8 = 0x0D;
+const TAG_DELEGATION: u8 = 0x0E;
+const TAG_PENDING_FEE: u8 = 0x0F;
 
 fn sha3(parts: &[&[u8]]) -> [u8; 32] {
     let mut h = Sha3_256::new();
@@ -331,6 +365,23 @@ pub struct ValidatorRecord {
     pub exit_epoch: u64,
     /// Whether the validator has been slashed. Encoded strictly as 0x00/0x01.
     pub slashed: bool,
+    /// Head of the validator's SHAKE-256 RANDAO chain (§6.3), **as advanced**:
+    /// every accepted block moves its proposer's head one link down. The
+    /// transition reads it to judge the next reveal (step 5), which is
+    /// exactly the §5.5 test for "must be committed" — before the 2026-08-11
+    /// extension it mutated per block in local state only.
+    pub randao_commitment: [u8; 32],
+    /// How far down the chain the head is — the other half of the committed
+    /// [`crate::beacon::RevealState`] pair.
+    pub reveals_used: u32,
+    /// Epoch the bonded stake becomes withdrawable; `u64::MAX` until an exit
+    /// schedules it. Uncommitted, a node could release stake early without
+    /// any root disagreeing.
+    pub withdrawable_epoch: u64,
+    /// Where the stake returns on withdrawal. Opaque bytes (the address
+    /// format is the node's, per the interfaces open point) — opaque is fine,
+    /// uncommitted is not: a swapped destination must move the root.
+    pub withdrawal_credentials: Vec<u8>,
 }
 
 impl ValidatorRecord {
@@ -338,7 +389,8 @@ impl ValidatorRecord {
         self.index.to_le_bytes().to_vec()
     }
     fn serialize(&self) -> Vec<u8> {
-        let mut s = Vec::with_capacity(64 + self.pubkey.len());
+        let mut s =
+            Vec::with_capacity(120 + self.pubkey.len() + self.withdrawal_credentials.len());
         s.extend_from_slice(&self.index.to_le_bytes());
         // Length prefix: without it, (pubkey ‖ stake) and a one-byte-longer
         // pubkey with a shifted stake could serialize identically.
@@ -348,6 +400,13 @@ impl ValidatorRecord {
         s.extend_from_slice(&self.activation_epoch.to_le_bytes());
         s.extend_from_slice(&self.exit_epoch.to_le_bytes());
         s.push(self.slashed as u8);
+        s.extend_from_slice(&self.randao_commitment);
+        s.extend_from_slice(&self.reveals_used.to_le_bytes());
+        s.extend_from_slice(&self.withdrawable_epoch.to_le_bytes());
+        // Second variable-length field, second length prefix — same
+        // no-ambiguity argument as the pubkey's.
+        s.extend_from_slice(&(self.withdrawal_credentials.len() as u32).to_le_bytes());
+        s.extend_from_slice(&self.withdrawal_credentials);
         s
     }
 }
@@ -392,6 +451,261 @@ impl RandaoMix {
     }
 }
 
+// -- 2026-08-11 components (module docs: the one extension) ------------------
+
+/// One checkpoint as committed — epoch plus the root of its epoch's first
+/// block. The root is raw bytes, not a `BlockId`, for the same reason the
+/// finality module's own `Checkpoint` is: it is a value to compare, never an
+/// identity to mint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CheckpointRecord {
+    pub epoch: u64,
+    pub root: [u8; 32],
+}
+
+impl CheckpointRecord {
+    fn write_into(&self, s: &mut Vec<u8>) {
+        s.extend_from_slice(&self.epoch.to_le_bytes());
+        s.extend_from_slice(&self.root);
+    }
+}
+
+/// Cumulative inactivity leak charged to one validator, in satoshis.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LeakRecord {
+    pub validator: u32,
+    pub leaked_sat: u64,
+}
+
+/// The justification/finality bookkeeping, committed as one leaf under
+/// [`TAG_FINALITY`]. This is the full fold state of the finality engine plus
+/// the previous-justified checkpoint the frozen `FinalityView` carries — the
+/// values step 6 of the transition compares headers against, and the values
+/// surround-vote slashing is judged by. A single leaf (not per-checkpoint
+/// leaves) because the engine's state is only ever read and replaced whole;
+/// nothing proves one historical justification in isolation today. Splitting
+/// it later is a visible re-keying, not a silent one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FinalityRecord {
+    /// Every justified checkpoint the engine holds, any order — serialization
+    /// sorts by epoch, so the committed bytes are a function of the set.
+    pub justified: Vec<CheckpointRecord>,
+    /// Highest justified checkpoint.
+    pub current_justified: CheckpointRecord,
+    /// Justified checkpoint as of the previous epoch (Casper's second round).
+    pub previous_justified: CheckpointRecord,
+    /// Highest finalized checkpoint.
+    pub finalized: CheckpointRecord,
+    /// Inactivity-leak ledger, any order — serialization sorts by validator.
+    pub leaked: Vec<LeakRecord>,
+    /// Next epoch the engine will accept — the "dense, in-order" clock.
+    pub next_epoch: u64,
+}
+
+impl FinalityRecord {
+    fn serialize(&self) -> Vec<u8> {
+        // Canonicalise here, not in the builder: the committed bytes must be
+        // a function of the *content*, whichever order a caller assembled the
+        // vectors in (rule: insertion order cannot matter).
+        let mut justified = self.justified.clone();
+        justified.sort_by_key(|c| c.epoch);
+        let mut leaked = self.leaked.clone();
+        leaked.sort_by_key(|l| l.validator);
+
+        let mut s = Vec::with_capacity(48 + 40 * justified.len() + 12 * leaked.len() + 128);
+        // Count prefixes keep the two variable-length lists unambiguous.
+        s.extend_from_slice(&(justified.len() as u64).to_le_bytes());
+        for c in &justified {
+            c.write_into(&mut s);
+        }
+        self.current_justified.write_into(&mut s);
+        self.previous_justified.write_into(&mut s);
+        self.finalized.write_into(&mut s);
+        s.extend_from_slice(&(leaked.len() as u64).to_le_bytes());
+        for l in &leaked {
+            s.extend_from_slice(&l.validator.to_le_bytes());
+            s.extend_from_slice(&l.leaked_sat.to_le_bytes());
+        }
+        s.extend_from_slice(&self.next_epoch.to_le_bytes());
+        s
+    }
+}
+
+/// One epoch-boundary vote awaiting the finality tally, committed per entry
+/// under [`TAG_PENDING_VOTE`]. Keyed by `(validator, signing_root)` — exactly
+/// the transition's accumulation key, so the committed set is the set, not
+/// the arrival order. The signing root is computed by the attestation module
+/// and passed in opaque; this module never re-derives it (one derivation
+/// path).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingVoteRecord {
+    pub validator: u32,
+    pub signing_root: [u8; 32],
+    pub slot: u64,
+    pub head: [u8; 32],
+    pub source_epoch: u64,
+    pub source_root: [u8; 32],
+    pub target_epoch: u64,
+    pub target_root: [u8; 32],
+}
+
+impl PendingVoteRecord {
+    fn entry_key(&self) -> Vec<u8> {
+        let mut k = Vec::with_capacity(36);
+        k.extend_from_slice(&self.validator.to_le_bytes());
+        k.extend_from_slice(&self.signing_root);
+        k
+    }
+    fn serialize(&self) -> Vec<u8> {
+        let mut s = Vec::with_capacity(156);
+        s.extend_from_slice(&self.validator.to_le_bytes());
+        s.extend_from_slice(&self.signing_root);
+        s.extend_from_slice(&self.slot.to_le_bytes());
+        s.extend_from_slice(&self.head);
+        s.extend_from_slice(&self.source_epoch.to_le_bytes());
+        s.extend_from_slice(&self.source_root);
+        s.extend_from_slice(&self.target_epoch.to_le_bytes());
+        s.extend_from_slice(&self.target_root);
+        s
+    }
+}
+
+/// One validator's LMD-GHOST latest message, committed per entry under
+/// [`TAG_FC_MESSAGE`]. Fork choice does not validate blocks, but the message
+/// map lives in the committed state and feeds every weight computation; left
+/// uncommitted it would be a per-node opinion two roots could silently
+/// disagree on, and a state-synced node could not rebuild it at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FcMessageRecord {
+    pub validator: u32,
+    pub slot: u64,
+    pub root: [u8; 32],
+}
+
+impl FcMessageRecord {
+    fn entry_key(&self) -> Vec<u8> {
+        self.validator.to_le_bytes().to_vec()
+    }
+    fn serialize(&self) -> Vec<u8> {
+        let mut s = Vec::with_capacity(44);
+        s.extend_from_slice(&self.validator.to_le_bytes());
+        s.extend_from_slice(&self.slot.to_le_bytes());
+        s.extend_from_slice(&self.root);
+        s
+    }
+}
+
+/// One validator barred from fork-choice weight for equivocating, committed
+/// per entry under [`TAG_FC_EQUIVOCATOR`]. A separate component from the
+/// messages (not a marker byte on them) because the two sets are disjoint by
+/// invariant, and if that invariant ever broke the root should commit the
+/// contradiction rather than let last-write-wins hide it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FcEquivocatorRecord {
+    pub validator: u32,
+}
+
+impl FcEquivocatorRecord {
+    fn entry_key(&self) -> Vec<u8> {
+        self.validator.to_le_bytes().to_vec()
+    }
+    fn serialize(&self) -> Vec<u8> {
+        self.validator.to_le_bytes().to_vec()
+    }
+}
+
+/// One deposit in the permanent activation queue, committed per entry under
+/// [`TAG_DEPOSIT_QUEUE`]. Keyed by pubkey hash — unique by the
+/// one-deposit-per-key rule — so the committed queue is order-free; the
+/// activation fold sorts by (epoch, pubkey hash) itself and never by
+/// position.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DepositQueueRecord {
+    pub pubkey_hash: [u8; 32],
+    pub deposit_epoch: u64,
+    pub amount_sat: u128,
+}
+
+impl DepositQueueRecord {
+    fn entry_key(&self) -> Vec<u8> {
+        self.pubkey_hash.to_vec()
+    }
+    fn serialize(&self) -> Vec<u8> {
+        let mut s = Vec::with_capacity(56);
+        s.extend_from_slice(&self.pubkey_hash);
+        s.extend_from_slice(&self.deposit_epoch.to_le_bytes());
+        s.extend_from_slice(&self.amount_sat.to_le_bytes());
+        s
+    }
+}
+
+/// One delegation in the permanent history, committed per entry under
+/// [`TAG_DELEGATION`]. Keyed by **position** in the history, unlike the
+/// deposit queue: two byte-identical delegations (same delegator, validator,
+/// amount, epoch) are two bonds, so content cannot key them — and position
+/// is chain order, fixed by the blocks that carried the entries, not by any
+/// node's arrival order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DelegationRecord {
+    /// Position in the committed history (append order across the chain).
+    pub position: u64,
+    pub delegator: u32,
+    pub validator: u32,
+    pub amount_sat: u128,
+    pub requested_epoch: u64,
+    /// Epoch deactivation was requested, if any. Encoded 0x00, or 0x01 ‖
+    /// epoch — so `None` and `Some(0)` cannot collide.
+    pub deactivate_epoch: Option<u64>,
+    /// False when the §4.1 taint oracle refused the coins: the record is
+    /// committed precisely so the refusal is an auditable consensus fact.
+    pub eligible: bool,
+}
+
+impl DelegationRecord {
+    fn entry_key(&self) -> Vec<u8> {
+        self.position.to_le_bytes().to_vec()
+    }
+    fn serialize(&self) -> Vec<u8> {
+        let mut s = Vec::with_capacity(60);
+        s.extend_from_slice(&self.position.to_le_bytes());
+        s.extend_from_slice(&self.delegator.to_le_bytes());
+        s.extend_from_slice(&self.validator.to_le_bytes());
+        s.extend_from_slice(&self.amount_sat.to_le_bytes());
+        s.extend_from_slice(&self.requested_epoch.to_le_bytes());
+        match self.deactivate_epoch {
+            None => s.push(0x00),
+            Some(e) => {
+                s.push(0x01);
+                s.extend_from_slice(&e.to_le_bytes());
+            }
+        }
+        s.push(self.eligible as u8);
+        s
+    }
+}
+
+/// Fee rewards accrued to one proposer during the open epoch, waiting to
+/// compound at the boundary; committed per entry under [`TAG_PENDING_FEE`].
+/// Uncommitted, a boundary would pay validators amounts no root ever agreed
+/// on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingFeeRecord {
+    pub validator: u32,
+    pub amount_sat: u128,
+}
+
+impl PendingFeeRecord {
+    fn entry_key(&self) -> Vec<u8> {
+        self.validator.to_le_bytes().to_vec()
+    }
+    fn serialize(&self) -> Vec<u8> {
+        let mut s = Vec::with_capacity(20);
+        s.extend_from_slice(&self.validator.to_le_bytes());
+        s.extend_from_slice(&self.amount_sat.to_le_bytes());
+        s
+    }
+}
+
 /// Everything `state_root` commits, passed **by argument** — this struct is
 /// the §5.5 rule made into a type. A block validator builds it from the
 /// parent block's committed state and from nothing else; there is no way to
@@ -410,6 +724,20 @@ pub struct ConsensusState<'a> {
     pub previous_participation: &'a [ParticipationRecord],
     /// Randao mix history — the last 2 epochs.
     pub randao_mixes: &'a [RandaoMix],
+    /// Justification/finality bookkeeping (single leaf).
+    pub finality: &'a FinalityRecord,
+    /// Epoch-boundary votes pending the next finality tally.
+    pub pending_votes: &'a [PendingVoteRecord],
+    /// LMD-GHOST latest message per validator.
+    pub fc_messages: &'a [FcMessageRecord],
+    /// Validators barred from fork-choice weight.
+    pub fc_equivocators: &'a [FcEquivocatorRecord],
+    /// The permanent deposit/activation queue.
+    pub deposit_queue: &'a [DepositQueueRecord],
+    /// The permanent delegation history, positionally keyed.
+    pub delegations: &'a [DelegationRecord],
+    /// Fee rewards pending the epoch boundary.
+    pub pending_fees: &'a [PendingFeeRecord],
     /// Root of the taint set (§4.1), maintained by its own module.
     pub taint_root: [u8; 32],
     /// Coherence shielded pool: SHAKE-256 accumulator root (§6.6.2).
@@ -452,6 +780,26 @@ pub fn build_state_tree(state: &ConsensusState<'_>) -> Smt {
     }
     for r in state.randao_mixes {
         smt.insert(derive_key(TAG_RANDAO, &r.entry_key()), hash_value(&r.serialize()));
+    }
+    // The finality bookkeeping is one leaf (see FinalityRecord docs).
+    smt.insert(derive_key(TAG_FINALITY, &[]), hash_value(&state.finality.serialize()));
+    for v in state.pending_votes {
+        smt.insert(derive_key(TAG_PENDING_VOTE, &v.entry_key()), hash_value(&v.serialize()));
+    }
+    for m in state.fc_messages {
+        smt.insert(derive_key(TAG_FC_MESSAGE, &m.entry_key()), hash_value(&m.serialize()));
+    }
+    for e in state.fc_equivocators {
+        smt.insert(derive_key(TAG_FC_EQUIVOCATOR, &e.entry_key()), hash_value(&e.serialize()));
+    }
+    for d in state.deposit_queue {
+        smt.insert(derive_key(TAG_DEPOSIT_QUEUE, &d.entry_key()), hash_value(&d.serialize()));
+    }
+    for d in state.delegations {
+        smt.insert(derive_key(TAG_DELEGATION, &d.entry_key()), hash_value(&d.serialize()));
+    }
+    for f in state.pending_fees {
+        smt.insert(derive_key(TAG_PENDING_FEE, &f.entry_key()), hash_value(&f.serialize()));
     }
     // The three foreign roots are committed as single leaves under their own
     // tags. They are roots of trees other modules own; committing them here
@@ -619,15 +967,24 @@ mod tests {
 
     // -- full consensus-state commitment -------------------------------------
 
-    /// Owned backing storage for a [`ConsensusState`] fixture: eUTXOs,
-    /// validators, current/previous participation, randao mixes.
-    type Fx = (
-        Vec<EutxoEntry>,
-        Vec<ValidatorRecord>,
-        Vec<ParticipationRecord>,
-        Vec<ParticipationRecord>,
-        Vec<RandaoMix>,
-    );
+    /// Owned backing storage for a [`ConsensusState`] fixture — every
+    /// component non-empty, so a dropped `build_state_tree` loop would fail
+    /// the load-bearing test rather than commit an empty component silently.
+    #[derive(Clone)]
+    struct Fx {
+        eutxos: Vec<EutxoEntry>,
+        validators: Vec<ValidatorRecord>,
+        current: Vec<ParticipationRecord>,
+        previous: Vec<ParticipationRecord>,
+        randao: Vec<RandaoMix>,
+        finality: FinalityRecord,
+        pending_votes: Vec<PendingVoteRecord>,
+        fc_messages: Vec<FcMessageRecord>,
+        fc_equivocators: Vec<FcEquivocatorRecord>,
+        deposit_queue: Vec<DepositQueueRecord>,
+        delegations: Vec<DelegationRecord>,
+        pending_fees: Vec<PendingFeeRecord>,
+    }
 
     fn fixture() -> Fx {
         let eutxos: Vec<EutxoEntry> = (0..10u8)
@@ -648,6 +1005,10 @@ mod tests {
                 activation_epoch: 1,
                 exit_epoch: u64::MAX,
                 slashed: false,
+                randao_commitment: val(0x40 + i),
+                reveals_used: i as u32,
+                withdrawable_epoch: u64::MAX,
+                withdrawal_credentials: vec![0xC0 + i; 20],
             })
             .collect();
         let current: Vec<ParticipationRecord> = (0..4u32)
@@ -658,16 +1019,90 @@ mod tests {
             .collect();
         let randao =
             vec![RandaoMix { epoch: 41, mix: val(41) }, RandaoMix { epoch: 42, mix: val(42) }];
-        (eutxos, validators, current, previous, randao)
+        let finality = FinalityRecord {
+            justified: vec![
+                CheckpointRecord { epoch: 40, root: val(0x50) },
+                CheckpointRecord { epoch: 42, root: val(0x52) },
+            ],
+            current_justified: CheckpointRecord { epoch: 42, root: val(0x52) },
+            previous_justified: CheckpointRecord { epoch: 40, root: val(0x50) },
+            finalized: CheckpointRecord { epoch: 40, root: val(0x50) },
+            leaked: vec![LeakRecord { validator: 3, leaked_sat: 77 }],
+            next_epoch: 43,
+        };
+        let pending_votes: Vec<PendingVoteRecord> = (0..3u32)
+            .map(|i| PendingVoteRecord {
+                validator: i,
+                signing_root: val(0x60 + i as u8),
+                slot: 43 * 32 + i as u64,
+                head: val(0x70 + i as u8),
+                source_epoch: 42,
+                source_root: val(0x52),
+                target_epoch: 43,
+                target_root: val(0x71),
+            })
+            .collect();
+        let fc_messages = vec![
+            FcMessageRecord { validator: 0, slot: 1370, root: val(0x70) },
+            FcMessageRecord { validator: 1, slot: 1371, root: val(0x71) },
+        ];
+        let fc_equivocators = vec![FcEquivocatorRecord { validator: 2 }];
+        let deposit_queue = vec![DepositQueueRecord {
+            pubkey_hash: val(0x80),
+            deposit_epoch: 41,
+            amount_sat: 200_000 * 100_000_000,
+        }];
+        let delegations = vec![
+            DelegationRecord {
+                position: 0,
+                delegator: 900,
+                validator: 1,
+                amount_sat: 1_000 * 100_000_000,
+                requested_epoch: 42,
+                deactivate_epoch: None,
+                eligible: true,
+            },
+            DelegationRecord {
+                position: 1,
+                delegator: 900,
+                validator: 1,
+                amount_sat: 1_000 * 100_000_000,
+                requested_epoch: 42,
+                deactivate_epoch: Some(50),
+                eligible: false,
+            },
+        ];
+        let pending_fees = vec![PendingFeeRecord { validator: 1, amount_sat: 1_234 }];
+        Fx {
+            eutxos,
+            validators,
+            current,
+            previous,
+            randao,
+            finality,
+            pending_votes,
+            fc_messages,
+            fc_equivocators,
+            deposit_queue,
+            delegations,
+            pending_fees,
+        }
     }
 
     fn state(f: &Fx) -> ConsensusState<'_> {
         ConsensusState {
-            eutxos: &f.0,
-            validators: &f.1,
-            current_participation: &f.2,
-            previous_participation: &f.3,
-            randao_mixes: &f.4,
+            eutxos: &f.eutxos,
+            validators: &f.validators,
+            current_participation: &f.current,
+            previous_participation: &f.previous,
+            randao_mixes: &f.randao,
+            finality: &f.finality,
+            pending_votes: &f.pending_votes,
+            fc_messages: &f.fc_messages,
+            fc_equivocators: &f.fc_equivocators,
+            deposit_queue: &f.deposit_queue,
+            delegations: &f.delegations,
+            pending_fees: &f.pending_fees,
             taint_root: val(101),
             coherence_accumulator_root: val(102),
             coherence_nullifier_root: val(103),
@@ -682,11 +1117,20 @@ mod tests {
         let root_a = state_root(&state(&f));
 
         let mut g = f.clone();
-        g.0.reverse();
-        g.1.reverse();
-        g.2.reverse();
-        g.3.reverse();
-        g.4.reverse();
+        g.eutxos.reverse();
+        g.validators.reverse();
+        g.current.reverse();
+        g.previous.reverse();
+        g.randao.reverse();
+        // The single-leaf finality record canonicalises its internal lists.
+        g.finality.justified.reverse();
+        g.finality.leaked.reverse();
+        g.pending_votes.reverse();
+        g.fc_messages.reverse();
+        g.fc_equivocators.reverse();
+        g.deposit_queue.reverse();
+        g.delegations.reverse();
+        g.pending_fees.reverse();
         let root_b = state_root(&state(&g));
 
         assert_eq!(root_a, root_b);
@@ -713,20 +1157,71 @@ mod tests {
             }};
         }
 
-        mutated!(|g: &mut Fx| g.0[3].value += 1);
-        mutated!(|g: &mut Fx| g.0[3].vout += 1);
-        mutated!(|g: &mut Fx| g.0[3].script_hash[0] ^= 1);
-        mutated!(|g: &mut Fx| g.0[3].txid[31] ^= 1);
-        mutated!(|g: &mut Fx| g.0.pop().map(|_| ()).unwrap()); // removal
-        mutated!(|g: &mut Fx| g.1[2].stake += 1);
-        mutated!(|g: &mut Fx| g.1[2].pubkey[0] ^= 1);
-        mutated!(|g: &mut Fx| g.1[2].activation_epoch += 1);
-        mutated!(|g: &mut Fx| g.1[2].exit_epoch = 999);
-        mutated!(|g: &mut Fx| g.1[2].slashed = true);
-        mutated!(|g: &mut Fx| g.2[1].attested = !g.2[1].attested);
-        mutated!(|g: &mut Fx| g.3[1].attested = !g.3[1].attested);
-        mutated!(|g: &mut Fx| g.4[0].mix[5] ^= 1);
-        mutated!(|g: &mut Fx| g.4[0].epoch += 2);
+        mutated!(|g: &mut Fx| g.eutxos[3].value += 1);
+        mutated!(|g: &mut Fx| g.eutxos[3].vout += 1);
+        mutated!(|g: &mut Fx| g.eutxos[3].script_hash[0] ^= 1);
+        mutated!(|g: &mut Fx| g.eutxos[3].txid[31] ^= 1);
+        mutated!(|g: &mut Fx| g.eutxos.pop().map(|_| ()).unwrap()); // removal
+        mutated!(|g: &mut Fx| g.validators[2].stake += 1);
+        mutated!(|g: &mut Fx| g.validators[2].pubkey[0] ^= 1);
+        mutated!(|g: &mut Fx| g.validators[2].activation_epoch += 1);
+        mutated!(|g: &mut Fx| g.validators[2].exit_epoch = 999);
+        mutated!(|g: &mut Fx| g.validators[2].slashed = true);
+        mutated!(|g: &mut Fx| g.validators[2].randao_commitment[0] ^= 1);
+        mutated!(|g: &mut Fx| g.validators[2].reveals_used += 1);
+        mutated!(|g: &mut Fx| g.validators[2].withdrawable_epoch = 1_000);
+        mutated!(|g: &mut Fx| g.validators[2].withdrawal_credentials[0] ^= 1);
+        mutated!(|g: &mut Fx| g.current[1].attested = !g.current[1].attested);
+        mutated!(|g: &mut Fx| g.previous[1].attested = !g.previous[1].attested);
+        mutated!(|g: &mut Fx| g.randao[0].mix[5] ^= 1);
+        mutated!(|g: &mut Fx| g.randao[0].epoch += 2);
+        // Finality bookkeeping — every field of the single leaf.
+        mutated!(|g: &mut Fx| g.finality.justified[0].epoch += 1);
+        mutated!(|g: &mut Fx| g.finality.justified[0].root[0] ^= 1);
+        mutated!(|g: &mut Fx| g.finality.justified.pop().map(|_| ()).unwrap());
+        mutated!(|g: &mut Fx| g.finality.current_justified.root[0] ^= 1);
+        mutated!(|g: &mut Fx| g.finality.previous_justified.epoch += 1);
+        mutated!(|g: &mut Fx| g.finality.finalized.root[0] ^= 1);
+        mutated!(|g: &mut Fx| g.finality.leaked[0].leaked_sat += 1);
+        mutated!(|g: &mut Fx| g.finality.leaked[0].validator += 1);
+        mutated!(|g: &mut Fx| g.finality.leaked.push(LeakRecord { validator: 9, leaked_sat: 1 }));
+        mutated!(|g: &mut Fx| g.finality.next_epoch += 1);
+        // Pending epoch-boundary votes.
+        mutated!(|g: &mut Fx| g.pending_votes[1].validator += 10);
+        mutated!(|g: &mut Fx| g.pending_votes[1].signing_root[0] ^= 1);
+        mutated!(|g: &mut Fx| g.pending_votes[1].slot += 1);
+        mutated!(|g: &mut Fx| g.pending_votes[1].head[0] ^= 1);
+        mutated!(|g: &mut Fx| g.pending_votes[1].source_epoch += 1);
+        mutated!(|g: &mut Fx| g.pending_votes[1].source_root[0] ^= 1);
+        mutated!(|g: &mut Fx| g.pending_votes[1].target_epoch += 1);
+        mutated!(|g: &mut Fx| g.pending_votes[1].target_root[0] ^= 1);
+        mutated!(|g: &mut Fx| g.pending_votes.pop().map(|_| ()).unwrap());
+        // Fork-choice bookkeeping.
+        mutated!(|g: &mut Fx| g.fc_messages[0].slot += 1);
+        mutated!(|g: &mut Fx| g.fc_messages[0].root[0] ^= 1);
+        mutated!(|g: &mut Fx| g.fc_messages.pop().map(|_| ()).unwrap());
+        mutated!(|g: &mut Fx| g.fc_equivocators[0].validator += 1);
+        mutated!(|g: &mut Fx| g.fc_equivocators.pop().map(|_| ()).unwrap());
+        // Staking queues.
+        mutated!(|g: &mut Fx| g.deposit_queue[0].pubkey_hash[0] ^= 1);
+        mutated!(|g: &mut Fx| g.deposit_queue[0].deposit_epoch += 1);
+        mutated!(|g: &mut Fx| g.deposit_queue[0].amount_sat += 1);
+        mutated!(|g: &mut Fx| g.deposit_queue.pop().map(|_| ()).unwrap());
+        mutated!(|g: &mut Fx| g.delegations[0].position += 5);
+        mutated!(|g: &mut Fx| g.delegations[0].delegator += 1);
+        mutated!(|g: &mut Fx| g.delegations[0].validator += 1);
+        mutated!(|g: &mut Fx| g.delegations[0].amount_sat += 1);
+        mutated!(|g: &mut Fx| g.delegations[0].requested_epoch += 1);
+        // Option encoding: None, Some(0) and Some(50) must all be distinct.
+        mutated!(|g: &mut Fx| g.delegations[0].deactivate_epoch = Some(0));
+        mutated!(|g: &mut Fx| g.delegations[1].deactivate_epoch = None);
+        mutated!(|g: &mut Fx| g.delegations[1].deactivate_epoch = Some(51));
+        mutated!(|g: &mut Fx| g.delegations[0].eligible = false);
+        mutated!(|g: &mut Fx| g.delegations.pop().map(|_| ()).unwrap());
+        // Pending fees.
+        mutated!(|g: &mut Fx| g.pending_fees[0].validator += 1);
+        mutated!(|g: &mut Fx| g.pending_fees[0].amount_sat += 1);
+        mutated!(|g: &mut Fx| g.pending_fees.pop().map(|_| ()).unwrap());
 
         // Singleton roots.
         for i in 0..3 {
@@ -760,10 +1255,32 @@ mod tests {
         let base = state_root(&state(&f));
 
         let mut g = f.clone();
-        std::mem::swap(&mut g.2, &mut g.3);
+        std::mem::swap(&mut g.current, &mut g.previous);
         // current (even indices attested) and previous (all attested) differ,
         // so swapping them must move the root.
         assert_ne!(state_root(&state(&g)), base);
+    }
+
+    #[test]
+    fn same_natural_key_under_different_components_does_not_alias() {
+        // Validator index 1 appears as a registry key, an fc-message key and
+        // a pending-fee key in the fixture. The component tag is what keeps
+        // those three leaves apart; this pins that removing one of them
+        // changes the root even though the other two remain — i.e. they are
+        // three leaves, not one.
+        let f = fixture();
+        let base = state_root(&state(&f));
+
+        let mut g = f.clone();
+        g.fc_messages.retain(|m| m.validator != 1);
+        let without_msg = state_root(&state(&g));
+        assert_ne!(without_msg, base);
+
+        let mut h = f.clone();
+        h.pending_fees.retain(|p| p.validator != 1);
+        let without_fee = state_root(&state(&h));
+        assert_ne!(without_fee, base);
+        assert_ne!(without_fee, without_msg);
     }
 
     #[test]
@@ -774,7 +1291,7 @@ mod tests {
         let root = tree.root();
         assert_eq!(root, state_root(&s), "tree and root entry points must agree");
 
-        let v = &f.1[2];
+        let v = &f.validators[2];
         let k = derive_key(TAG_VALIDATOR, &v.entry_key());
         let vh = hash_value(&v.serialize());
         let proof = tree.prove(&k).expect("committed validator must be provable");
@@ -810,6 +1327,10 @@ mod tests {
                 activation_epoch: 0,
                 exit_epoch: u64::MAX,
                 slashed: false,
+                randao_commitment: [0; 32],
+                reveals_used: 0,
+                withdrawable_epoch: u64::MAX,
+                withdrawal_credentials: Vec::new(),
             })
             .collect();
         assert_eq!(total_effective_stake(&validators), 3u128 * u64::MAX as u128);

@@ -67,8 +67,9 @@ mod harness {
     use bloch_pos_committee::params::{DS_BLOCK, DS_PROPOSE};
     use bloch_pos_committee::schedule::{first_slot_of_epoch, last_slot_of_epoch};
     use bloch_pos_committee::state_root::{
-        state_root as compute_state_root, ConsensusState, EutxoEntry, ParticipationRecord,
-        RandaoMix, ValidatorRecord as SrValidatorRecord,
+        state_root as compute_state_root, CheckpointRecord, ConsensusState, EutxoEntry,
+        FinalityRecord, LeakRecord, ParticipationRecord, PendingVoteRecord, RandaoMix,
+        ValidatorRecord as SrValidatorRecord,
     };
     use bloch_pos_committee::{
         epoch_committee, epoch_of, is_epoch_boundary, process_reveal, proposer, Attestation,
@@ -295,10 +296,13 @@ mod harness {
 
     /// The committed state root, recomputed from components on every call —
     /// deliberately no cache (the §5.5 pattern ban: a stale memoized root is
-    /// exactly how `expected_bits` diverged). The block id, checkpoints and
-    /// pending votes are chain topology / transient tally input, not state
-    /// components, mirroring the closed `StateRoots` list which carries no
-    /// "head" field.
+    /// exactly how `expected_bits` diverged). The block id remains chain
+    /// topology, not a state component (it cannot be: it is the id of the
+    /// header that carries this root) — but since the 2026-08-11 §5.5
+    /// extension the finality bookkeeping, the pending boundary votes and the
+    /// per-validator RANDAO chain positions ARE components, and this harness
+    /// commits its real ones, so the convergence scenarios below exercise
+    /// them.
     pub fn root_of(s: &NodeState) -> [u8; 32] {
         let eutxos: Vec<EutxoEntry> = (0..4u8)
             .map(|i| EutxoEntry {
@@ -318,6 +322,45 @@ mod harness {
                 activation_epoch: 0,
                 exit_epoch: u64::MAX,
                 slashed: false,
+                randao_commitment: s
+                    .reveal_states
+                    .get(&r.index)
+                    .map(|rs| rs.commitment)
+                    .unwrap_or([0u8; 32]),
+                reveals_used: s
+                    .reveal_states
+                    .get(&r.index)
+                    .map(|rs| rs.reveals_used)
+                    .unwrap_or(0),
+                withdrawable_epoch: u64::MAX,
+                withdrawal_credentials: Vec::new(),
+            })
+            .collect();
+        let cp = |c: FCheckpoint| CheckpointRecord { epoch: c.epoch, root: c.root };
+        let finality = FinalityRecord {
+            justified: s.finality.justified_checkpoints().map(cp).collect(),
+            current_justified: cp(s.finality.current_justified()),
+            previous_justified: cp(s.prev_justified),
+            finalized: cp(s.finality.finalized()),
+            leaked: s
+                .finality
+                .leaked_stakes()
+                .map(|(validator, leaked_sat)| LeakRecord { validator, leaked_sat })
+                .collect(),
+            next_epoch: s.finality.next_epoch(),
+        };
+        let pending_votes: Vec<PendingVoteRecord> = s
+            .pending_votes
+            .iter()
+            .map(|(validator, d)| PendingVoteRecord {
+                validator: *validator,
+                signing_root: d.signing_root(),
+                slot: d.slot,
+                head: d.head,
+                source_epoch: d.source_epoch,
+                source_root: d.source_root,
+                target_epoch: d.target_epoch,
+                target_root: d.target_root,
             })
             .collect();
         let cur: Vec<ParticipationRecord> = s
@@ -350,6 +393,16 @@ mod harness {
             current_participation: &cur,
             previous_participation: &prev,
             randao_mixes: &mixes,
+            finality: &finality,
+            pending_votes: &pending_votes,
+            // This devnet harness has no LMD store, no staking transactions
+            // and no fee flow, so these components are genuinely empty here —
+            // committed as empty, not omitted.
+            fc_messages: &[],
+            fc_equivocators: &[],
+            deposit_queue: &[],
+            delegations: &[],
+            pending_fees: &[],
             taint_root: TAINT_ROOT,
             coherence_accumulator_root: COHERENCE_ACC_ROOT,
             coherence_nullifier_root: COHERENCE_NUL_ROOT,
