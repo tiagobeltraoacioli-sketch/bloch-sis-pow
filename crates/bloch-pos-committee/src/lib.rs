@@ -46,6 +46,7 @@ pub mod delegation;
 pub mod genesis_cohort;
 pub mod finality;
 pub mod forkchoice;
+pub mod gossip;
 pub mod interfaces;
 pub mod params;
 pub mod tokenomics_v4;
@@ -59,6 +60,10 @@ pub mod slashing;
 pub use attestation::{Attestation, AttestationData, RejectReason, SignatureVerifier};
 pub use beacon::{mix_in, process_reveal, BeaconError, RandaoChain, RevealState};
 pub use forkchoice::{BlockTree, LatestMessage, Store};
+pub use gossip::{
+    AttestationPool, BlockLookup, CommitteeLookup, GossipDecision, IgnoreReason,
+    ATTESTATION_WINDOW_SLOTS, MAX_EQUIVOCATIONS_PER_DUTY, MAX_PENDING_ATTESTATIONS,
+};
 pub use params::{COMMITTEE_SIZE, RANDAO_CHAIN_LENGTH, SLOTS_PER_EPOCH, SLOT_SUBCOMMITTEE_SIZE};
 pub use sample::{is_selected, sample, Role, Validator};
 pub use schedule::{epoch_schedule, proposer, EpochSchedule};
