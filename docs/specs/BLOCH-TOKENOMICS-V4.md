@@ -41,83 +41,124 @@ billion overflowed by 8%.
 
 **Founder total: 33.89%** — the carried-over balance plus the new grant.
 
+<figure style="margin:1.4em 0">
+<svg viewBox="0 0 690 356" width="100%" role="img" aria-label="Distribuicao do supply de 21 bilhoes de BLCH em sete destinos" style="max-width:690px;font-family:Charter,Georgia,serif">
+<title>Distribuição do supply — 21.000.000.000 BLCH</title>
+<path d="M 170.00 178.00 L 171.18 28.00 A 150 150 0 0 1 286.15 272.92 Z" fill="#2a78d6"/>
+<path d="M 170.00 178.00 L 284.65 274.73 A 150 150 0 0 1 133.84 323.58 Z" fill="#eb6834"/>
+<path d="M 170.00 178.00 L 131.56 322.99 A 150 150 0 0 1 25.01 216.44 Z" fill="#1baf7a"/>
+<path d="M 170.00 178.00 L 24.42 214.16 A 150 150 0 0 1 30.10 123.88 Z" fill="#eda100"/>
+<path d="M 170.00 178.00 L 30.97 121.69 A 150 150 0 0 1 88.63 51.99 Z" fill="#e87ba4"/>
+<path d="M 170.00 178.00 L 90.62 50.72 A 150 150 0 0 1 131.56 33.01 Z" fill="#008300"/>
+<path d="M 170.00 178.00 L 133.84 32.42 A 150 150 0 0 1 168.82 28.00 Z" fill="#4a3aa7"/>
+<text x="259.6" y="135.9" text-anchor="middle" dominant-baseline="middle" font-size="13" font-weight="700" fill="#ffffff">36.03%</text>
+<text x="200.5" y="272.2" text-anchor="middle" dominant-baseline="middle" font-size="13" font-weight="700" fill="#ffffff">17.97%</text>
+<text x="100.0" y="248.0" text-anchor="middle" dominant-baseline="middle" font-size="13" font-weight="700" fill="#ffffff">17.00%</text>
+<text x="71.2" y="171.8" text-anchor="middle" dominant-baseline="middle" font-size="13" font-weight="700" fill="#ffffff">10.00%</text>
+<text x="93.7" y="114.9" text-anchor="middle" dominant-baseline="middle" font-size="13" font-weight="700" fill="#ffffff">10.00%</text>
+<text x="372" y="24" font-size="10" fill="#5c6169" letter-spacing="0.09em">DESTINO</text>
+<text x="608" y="24" font-size="10" fill="#5c6169" letter-spacing="0.09em" text-anchor="end">BLCH</text>
+<text x="676" y="24" font-size="10" fill="#5c6169" letter-spacing="0.09em" text-anchor="end">%</text>
+<rect x="372" y="32" width="12" height="12" rx="3" fill="#2a78d6"/>
+<text x="392" y="42" font-size="12.5" fill="#14161a" dominant-baseline="middle">Validadores</text>
+<text x="608" y="42" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">7.566.115.200</text>
+<text x="676" y="42" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">36.03</text>
+<rect x="372" y="62" width="12" height="12" rx="3" fill="#eb6834"/>
+<text x="392" y="72" font-size="12.5" fill="#14161a" dominant-baseline="middle">Carryover</text>
+<text x="608" y="72" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">3.773.884.800</text>
+<text x="676" y="72" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">17.97</text>
+<rect x="372" y="92" width="12" height="12" rx="3" fill="#1baf7a"/>
+<text x="392" y="102" font-size="12.5" fill="#14161a" dominant-baseline="middle">Fundador — concessão</text>
+<text x="608" y="102" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">3.570.000.000</text>
+<text x="676" y="102" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">17.00</text>
+<rect x="372" y="122" width="12" height="12" rx="3" fill="#eda100"/>
+<text x="392" y="132" font-size="12.5" fill="#14161a" dominant-baseline="middle">VC</text>
+<text x="608" y="132" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">2.100.000.000</text>
+<text x="676" y="132" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">10.00</text>
+<rect x="372" y="152" width="12" height="12" rx="3" fill="#e87ba4"/>
+<text x="392" y="162" font-size="12.5" fill="#14161a" dominant-baseline="middle">Time</text>
+<text x="608" y="162" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">2.100.000.000</text>
+<text x="676" y="162" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">10.00</text>
+<rect x="372" y="182" width="12" height="12" rx="3" fill="#008300"/>
+<text x="392" y="192" font-size="12.5" fill="#14161a" dominant-baseline="middle">Liquidez</text>
+<text x="608" y="192" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">1.050.000.000</text>
+<text x="676" y="192" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">5.00</text>
+<rect x="372" y="212" width="12" height="12" rx="3" fill="#4a3aa7"/>
+<text x="392" y="222" font-size="12.5" fill="#14161a" dominant-baseline="middle">Marketing</text>
+<text x="608" y="222" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">840.000.000</text>
+<text x="676" y="222" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">4.00</text>
+<line x1="372" y1="240" x2="676" y2="240" stroke="#d5d9df"/>
+<text x="392" y="254" font-size="12.5" font-weight="700" fill="#14161a" dominant-baseline="middle">Total</text>
+<text x="608" y="254" font-size="12.5" font-weight="700" fill="#14161a" text-anchor="end" dominant-baseline="middle">21.000.000.000</text>
+<text x="676" y="254" font-size="12.5" font-weight="700" fill="#14161a" text-anchor="end" dominant-baseline="middle">100,00</text>
+</svg>
+<figcaption style="font-size:9.5pt;color:#5c6169;margin-top:.5em">
+Distribution of the 21,000,000,000 BLCH supply. Slices carry a direct label
+only where one fits; every figure is in the legend, which is also the table
+view — the two 10% buckets are equal by design, and a pie cannot show that as
+well as the number does.
+</figcaption>
+</figure>
+
+
 Validator emission runs for 40 years and is supplemented by transaction fees.
-**After the 100 B is fully emitted, validators are paid 100% from fees.**
+**After the 21 B is fully issued, validators are paid 100% from fees.**
 
 ---
 
-## 2. What the carryover actually contains — measured
+## 2. What the carryover actually contains — measured live
 
-From `carryover.tsv.gz` (413,743 UTXOs, SHA-256 pinned in-repo), aggregated by
-address hash. The set has exactly **five** addresses:
-
-| Address hash | BLCH | Share of carryover | UTXOs |
-|---|---:|---:|---:|
-| `e986db51…` (founder) | 3,294,337,200 | 94.79% | 392,183 |
-| `be7c81e1…` | 177,063,600 | 5.10% | 21,079 |
-| `5b4a5303…` | 3,158,400 | 0.09% | 376 |
-| `5b00d538…` | 470,400 | 0.01% | 56 |
-| `5d493bc4…` | 411,600 | 0.01% | 49 |
-| **Total** | **3,475,441,200** | 100% | 413,743 |
-
-**Non-founder total: 181,104,000 BLCH — 5.21%.** The founder's "the 5% others
-hold" is accurate to two significant figures.
-
-That figure is the **floor**, not the final number: it covers only the
-Genesis-1 carryover. Coins mined since Genesis-3 by third parties must be added
-at snapshot time. The chain stands at height **40,144**, so 337,209,600 BLCH
-have been emitted since Genesis-3 (40,144 × 8,400).
-
----
-
-## 3. The 300 M cap is close to binding — and moving
-
-Headroom against the measured carryover floor is 118,896,000 BLCH. But
-third-party miners accrue continuously.
-
-A measurement recorded at height 18,809 had non-founder holdings at ≈ 207 M
-against a carryover floor of 181.1 M, implying roughly **16% of emission has
-been going to third parties**. Carrying that rate forward:
+Not estimated. A read-only UTXO snapshot was taken on node4 at **height
+43,172** with `bloch-snapshot-utxo`, then aggregated by address:
 
 | | |
 |---|---|
-| Estimated non-founder holdings at h40,144 | ≈ 236 M BLCH |
-| Remaining headroom under the cap | ≈ 64 M BLCH |
-| Third-party accrual at 8,400 BLCH/block, 2,880 blocks/day, ~16% share | ≈ 4.0 M BLCH/day |
-| **Estimated time until the cap binds** | **≈ 2 weeks** |
+| UTXOs | 448,337 |
+| Addresses | 15 |
+| **Total carried over** | **3,773,884,800 BLCH** |
+| Snapshot root (SHAKE-256) | `280d604b32525f03…` |
+| Carryover digest (SHAKE-256) | `92918209a106f297…` |
 
-The 16% figure is an estimate derived from a single prior measurement, not a
-fresh audit — it should be re-measured against live balances before anything is
-frozen. But the order of magnitude is the point: **the cap is not comfortable
-headroom, it is a deadline.**
+**All of it crosses.** There is no founder line and no exclusion list: those
+coins were mined, on the same chain, under the same rules as everyone else's.
 
-Two consequences that need a decision now:
+The distribution inside the set is what it is, and is worth stating rather than
+leaving to be discovered:
 
-1. **The snapshot height is fixed at 80,000** — see §3.1.
-2. **No exclusion list and no cap.** Two mechanisms dissolve with the
-   single-set decision rather than being satisfied by it:
-   - the **taint set**, because there is no class of coin left to mark. §4.1's
-     premine ineligibility was written for a migration *in place*, where the
-     founder's holding sat on the chain being converted. With a fresh genesis
-     and one undifferentiated carryover it has no subject.
-   - the **300 M holder cap**, which existed to bound what legacy holders
-     received *while the founder was excluded*. With nobody excluded it would
-     either bind on everyone — scaling every balance down by 92% — or on no one.
+| | BLCH | Share of carryover |
+|---|---:|---:|
+| Largest single address | 3,546,175,400 | 93.96% |
+| The other 14 | 227,709,400 | 6.04% |
 
-   A third thing goes with them, and it is the one worth naming: §3 flagged the
-   exclusion list as **an unaudited power**, since whoever writes it decides who
-   counts as founder, and nothing in the protocol checks it. There is now no
-   list to write. That concern is not mitigated, it is gone.
+An earlier draft of this section reported 413,743 UTXOs across five addresses,
+from the Genesis-1 file rather than the live chain. Ten more addresses have
+accumulated balances by mining since Genesis-3, and the totals moved with them.
+Anything quoted from the older figures is stale.
 
-   What does **not** go is the arithmetic. Relabelling moves no balance: the
-   largest single address still holds 3,546,175,400 BLCH — 93.96% of the
-   carryover — liquid from slot 0. §4A is unchanged by this decision.
-2. **A rule is needed for the over-cap case.** The proposal here is
-   **pro-rata scale-down**: if measured non-founder holdings exceed 300 M, every
-   non-founder balance is multiplied by `300_000_000 / total_non_founder`. It is
-   neutral, needs no discretion, and it is the only rule that treats a holder's
-   position the same regardless of when they acquired it. A first-come or
-   by-address cut would not.
+---
+
+## 3. The cap, retired
+
+Earlier drafts capped carried-over balances at 300 M and excluded the founder
+from the carryover, and §3 tracked how close that cap was to binding. Both went
+with the single-set decision (§1): the cap existed to bound what legacy holders
+received *while the founder was excluded*, so with nobody excluded it would
+either bind on everyone — scaling every balance down by roughly 92% — or on no
+one.
+
+Three things follow, and the third is the one worth keeping:
+
+1. No pro-rata scale-down runs. Every holder keeps 100% of their position.
+2. The measurement that mattered — whether third-party mining would push the
+   non-founder total past 300 M before the terminal height — no longer decides
+   anything. It was going to be close: measured 227.7 M at height 43,172 against
+   a 300 M ceiling, growing about 4 M/day.
+3. **The exclusion list is gone, and with it an unaudited power.** An earlier
+   draft flagged that whoever writes the list decides who counts as founder, that
+   nothing in the protocol checks it, and that it should therefore be published
+   for challenge before the height passed. There is now no list to write. That
+   concern was not mitigated — it ceased to exist, which is the only one of this
+   document's risks that got resolved rather than traded.
 
 ### 3.1 Snapshot height — decided: 80,000
 
@@ -270,12 +311,12 @@ Stated plainly, because it affects parties who are not in the room:
 
 | | Today | After V4 |
 |---|---:|---:|
-| Non-founder coins | 181.1 M (carryover) | ≤ 300 M |
+| Coins carried over | 3,475,441,200 (G-1 file) | 3,773,884,800 (measured live) |
 | Non-founder **share of network** | 5.21% | **≤ 0.30%** |
 
 Holders keep their coins in absolute terms and lose roughly **17×** of their
 relative position. That is the arithmetic consequence of preserving absolute
-balances while multiplying total supply by ~27× (3.475 B → 100 B). It is a
+balances while the supply stays at 21 B. It is a
 legitimate choice — it is what "preserved in absolute terms" means — but it
 should be published in exactly these terms rather than as "your balance is
 preserved", which is true and misleading at the same time.
@@ -506,9 +547,9 @@ neither.
 
 **Consequence for the supply figure — this changes what "100 billion" means.**
 Burned fees are permanently destroyed, so total supply never reaches
-100,000,000,000. The correct statement is:
+21,000,000,000. The correct statement is:
 
-> 100,000,000,000 BLCH is the **maximum ever issued**. Circulating supply
+> 21,000,000,000 BLCH is the **maximum ever issued**. Circulating supply
 > settles at that figure minus everything burned during the 40-year emission
 > era, and is fixed thereafter.
 
@@ -664,13 +705,19 @@ BLCH/block, truncation residual under 0.2 BLCH over the whole schedule.
 
 ### 8.1 u64 headroom — must be addressed before any code lands
 
-At 8 decimal places, 100 B BLCH is **10^19 satoshis, which is 54.21% of
-`u64::MAX`**. Today's 21 B nominal is 11.38%.
+At 8 decimal places, 21 B BLCH is **2.1 × 10^18 satoshis — 11.38% of
+`u64::MAX`**, and it fits inside the signed `int64` the Go SDK uses for
+`Satoshis` (`sdk/go/models.go:16`).
 
-The supply itself fits. The danger is that **any addition of two large values
-overflows**: a supply-accounting check, a treasury-plus-allocation comparison,
-a sum over a large UTXO set. In debug builds that panics; in release builds it
-wraps silently, and a silently wrapped consensus value is a chain split.
+An earlier draft put the supply at 100 B, which is 10^19 satoshis: **54.21% of
+`u64::MAX`**, so the sum of two large balances approached the wrap point, and it
+**overflowed `int64` by 8%**, silently turning Go SDK aggregates negative.
+Returning to the V2 nominal removed both hazards at no cost — they were created
+by the supply figure, not by the design.
+
+The arithmetic stays `u128` regardless, because the danger was never the totals:
+it is the **products**. A balance times a basis-point figure, or epoch issuance
+times stake in the reward split, exceeds `u64` long before any balance does.
 
 Options:
 
