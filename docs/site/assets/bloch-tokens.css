@@ -1,0 +1,90 @@
+/* SPDX-License-Identifier: AGPL-3.0-or-later */
+/* Bloch Protocol — design tokens. The single source for color, type and
+   spacing across every Bloch surface. No webfonts, no imports, no URLs:
+   this file has zero external dependencies by rule, not by accident.
+   Every text/background pair here was measured against WCAG AA — the
+   numbers are in docs/site/BRAND-KIT.md. */
+
+:root {
+  /* ground & ink — light theme is the definition, dark overrides */
+  --ground:       #ffffff;
+  --surface:      #f1f4f3;
+  --surface-2:    #e6ecea;
+  --ink:          #0d1b17;
+  --ink-2:        #33463f;
+  --muted:        #5d6f68;   /* smallest ink allowed for text; 5.33:1 on ground */
+  --line:         #d5dedb;
+
+  /* accent — the brand's one voice. Spent on links, primary actions,
+     the mark, and the protocol's own "live/now" state. Nothing else. */
+  --accent:       #0e6e5a;
+  --accent-soft:  #e2f0ec;
+
+  /* quantum violet — the second voice, for the quantum/cryptography frame */
+  --violet:       #4b3fa8;
+  --violet-soft:  #ebe9f7;
+
+  /* semantic states — deliberately NOT green. See BRAND-KIT.md §2. */
+  --ok:           #1d5fae;   /* confirmed, finalized, verified */
+  --ok-soft:      #e3edf9;
+  --signal:       #b4630f;   /* attention — LARGE text & graphics only (4.44:1) */
+  --signal-text:  #8a4a06;   /* attention at body size (6.86:1 on ground) */
+  --signal-soft:  #fbeee0;
+  --err:          #a8362b;   /* failed, invalid, halted-in-error */
+  --err-soft:     #f9e6e3;
+
+  /* type — system stacks only; rationale in BRAND-KIT.md §3 */
+  --display: Charter, "Bitstream Charter", "Iowan Old Style", "Source Serif Pro", Georgia, serif;
+  --body: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+
+  /* rhythm */
+  --measure: 66ch;
+  --pad: clamp(1.25rem, 4vw, 3rem);
+  --radius-card: 18px;
+  --radius-table: 14px;
+  --radius-pill: 5px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --ground:       #0b1411;
+    --surface:      #101d19;
+    --surface-2:    #172b24;
+    --ink:          #eaf2ef;
+    --ink-2:        #c3d3cd;
+    --muted:        #8ea49c;
+    --line:         #22352e;
+    --accent:       #4fc0a4;
+    --accent-soft:  #102c25;
+    --violet:       #a89ef0;
+    --violet-soft:  #1b1930;
+    --ok:           #82b4ee;
+    --ok-soft:      #132238;
+    --signal:       #e0a05c;
+    --signal-text:  #e0a05c;  /* passes at body size in dark: 8.33:1 */
+    --signal-soft:  #2a1f12;
+    --err:          #ec8b7d;
+    --err-soft:     #33150f;
+  }
+}
+:root[data-theme="dark"] {
+  --ground:       #0b1411;
+  --surface:      #101d19;
+  --surface-2:    #172b24;
+  --ink:          #eaf2ef;
+  --ink-2:        #c3d3cd;
+  --muted:        #8ea49c;
+  --line:         #22352e;
+  --accent:       #4fc0a4;
+  --accent-soft:  #102c25;
+  --violet:       #a89ef0;
+  --violet-soft:  #1b1930;
+  --ok:           #82b4ee;
+  --ok-soft:      #132238;
+  --signal:       #e0a05c;
+  --signal-text:  #e0a05c;
+  --signal-soft:  #2a1f12;
+  --err:          #ec8b7d;
+  --err-soft:     #33150f;
+}

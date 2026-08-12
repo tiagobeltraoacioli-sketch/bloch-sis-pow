@@ -1,0 +1,18 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+<!-- Bloch Protocol mark, 24 px — the navigation / lockup size.
+     Construction: R = 10.2; equator ry = 0.375 R; state vector at 41.3° above
+     the horizontal, length 0.785 R; dot r = 0.19 R, its far edge just inside
+     the circle. When inlined in a page, swap the literal colors for the
+     accent and ink custom properties so the mark follows the theme tokens. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" role="img" aria-label="Bloch Protocol">
+  <style>
+    .s { stroke: #0e6e5a; } .v { stroke: #0d1b17; } .d { fill: #0e6e5a; }
+    @media (prefers-color-scheme: dark) {
+      .s { stroke: #4fc0a4; } .v { stroke: #eaf2ef; } .d { fill: #4fc0a4; }
+    }
+  </style>
+  <circle class="s" cx="12" cy="12" r="10.2" fill="none" stroke-width="1.5"/>
+  <ellipse class="s" cx="12" cy="12" rx="10.2" ry="3.8" fill="none" stroke-width="1.1" opacity="0.55"/>
+  <line class="v" x1="12" y1="12" x2="18" y2="6.7" stroke-width="1.6" stroke-linecap="round"/>
+  <circle class="d" cx="18" cy="6.7" r="1.95"/>
+</svg>
