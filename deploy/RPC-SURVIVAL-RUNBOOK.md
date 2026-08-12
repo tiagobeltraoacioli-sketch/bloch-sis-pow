@@ -2,14 +2,67 @@
 
 # RPC survival runbook — Genesis-3 halt at height 80,000
 
-**Status: PREPARATION ONLY. Nothing in production was changed while writing
-this.** Every command in §2 is read-only and was actually run; every command in
-§4–§6 is a proposed change and was NOT run. Execution is the founder's call.
+**Status: EXECUTED 2026-08-12 (founder instruction). Two of this document's
+findings were wrong and are corrected in §0 below — the plan as written could
+not have worked.** §2's measurements were read-only and stand except where §0
+supersedes them.
 
 Written 2026-08-11/12 UTC by agent A12. All facts below were measured on
 2026-08-12 between 02:35 and 02:42 UTC, not recalled from memory. Where a
 measurement contradicts prior notes or the task brief, the contradiction is
 called out explicitly.
+
+---
+
+## 0. What actually happened when this was executed (2026-08-12)
+
+Three things the preparation got wrong, all found by running it:
+
+**0.1 node4's disk was full, not 87%.** Measured at execution: `47G ... 100%`,
+**270 MB free** — and the chain data was **6.3 G**, not the 1.9 G this document
+recorded, so the projection to height 80,000 was ~13 G, not 3.5 G. The disk was
+not full of chain: `/home/ubuntu/bloch-fix/target` (9.2 G of build artifacts),
+`/var/log/syslog` (4.3 G in one un-rotated file) and the journal (1.7 G). The
+running binary is `/home/ubuntu/bloch-terminal-height`, a standalone file —
+verified with `readlink /proc/$(systemctl show bloch-g3 -p ExecMainPID --value)/exe`
+— so the build trees were safe to delete. **20 G free after cleanup (57%).**
+
+Recurrence was closed too, because a node that fills its disk stops following
+the chain and the whole plan rests on node4 reaching 80,000:
+`/etc/systemd/journald.conf.d/99-cap.conf` (`SystemMaxUse=500M`) and
+`/etc/logrotate.d/bloch-syslog-size` (rotate at 200 M, keep 3, `su root adm`).
+
+**0.2 `BLOCH_RPC_URL` cannot be an IP address.** A Pages Function is a Worker,
+and a Worker `fetch()` to a bare IP literal is answered by **Cloudflare itself**
+with 403 `error code: 1003` — it never reaches the origin. §4's Step B
+(`BLOCH_RPC_URL = http://136.244.82.226:16220/`) would have reproduced exactly
+the failure it was meant to fix, from the opposite direction: the old dashboard
+value was a *proxied hostname*, the proposed one a *raw IP*, and both are 1003.
+The upstream must be a hostname resolving DNS-only to the origin.
+
+Consequence: the port choice stopped mattering, and the listener moved to **:80**
+(`bloch-rpc-public.service`, socat `:80 → 127.0.0.1:16210`, ufw 80/tcp) because
+Workers only reach a fixed set of outbound ports and 16220 is not one.
+
+**0.3 `wrangler.toml`'s `[vars]` overrides the dashboard on every deploy.** This
+document's Step B says to edit the project's environment variables in the
+dashboard. That alone does nothing if a `wrangler pages deploy` follows — the
+config file wins. Both were set; the file is now the source of truth, in git,
+where the value is reviewable instead of invisible.
+
+**Where it stands.** `https://blochl1.com/rpc` answers real data (verified with
+`getblockcount`, `getdaginfo`, `getchainstats`, `getrecentblocks`). The explorer
+no longer depends on `g2rpc.posternpool.com`, the tier that dies with the pool.
+
+**The one open item, and it needs DNS write.** The live upstream is
+`http://136-244-82-226.sslip.io/` — a public wildcard-DNS service that resolves
+to the IP in its own name. It works, and it puts a third party in the resolution
+path of the RPC tier that has to outlive the pool for six months. The durable
+value is `http://rpc.blochl1.com/`, a **DNS-only (grey-cloud)** A record for
+136.244.82.226 in the `blochl1.com` zone (id `5a6516857f3d9fe9ac91c9c5b253b481`).
+That record was not created here because the available Cloudflare token carries
+`zone:read`, not DNS write. Once it exists: change the one line in
+`apps/explorer/wrangler.toml` and redeploy. Nothing else moves.
 
 ---
 
