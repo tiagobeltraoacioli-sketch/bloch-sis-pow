@@ -43,12 +43,16 @@
 //! documented here rather than hidden. The mitigations, none of which live in
 //! this file's code but all of which shape its API:
 //!
-//! - **The schedule is only *knowable* one epoch ahead.** The beacon mix that
-//!   seeds epoch `E` is fixed when epoch `E-1` closes (§6.3), so the exposure
-//!   window is bounded at ~16 minutes + one epoch, not the whole future. This
-//!   module will happily compute any epoch you hand it a mix for — the
-//!   one-epoch horizon is a property of *when the mix exists*, enforced by the
-//!   beacon, not by hiding a capability here.
+//! - **The schedule is only *knowable* a bounded distance ahead.** The beacon
+//!   mix that seeds epoch `E` is fixed when epoch
+//!   `E − 1 − MIN_SEED_LOOKAHEAD_EPOCHS` closes (the F6 look-ahead — see
+//!   [`crate::committees::MIN_SEED_LOOKAHEAD_EPOCHS`]), so the exposure window
+//!   is bounded at about two epochs (~32 min), not the whole future. The
+//!   look-ahead *widens* this window by one epoch relative to the pre-F6 rule;
+//!   what it buys is that no proposer of epoch `E − 1` can re-sort epoch `E`'s
+//!   duties by withholding reveals. This module will happily compute any epoch
+//!   you hand it a mix for — the horizon is a property of *when the mix
+//!   exists*, enforced by the beacon, not by hiding a capability here.
 //! - **A proposer is an index, not a network address.** Everything returned
 //!   here is a `u32` into the active validator registry. Mapping that index to
 //!   an IP requires deanonymising the validator's networking, which is what
@@ -189,10 +193,11 @@ impl EpochSchedule {
 
 /// Compute the proposer roster for `epoch` from the beacon mix that seeds it.
 ///
-/// `beacon_mix` must be the mix as fixed at the close of epoch `epoch - 1`
-/// (§6.3); passing any other mix produces a well-formed but wrong schedule,
-/// and nothing here can detect that — the binding of mix to epoch is the
-/// beacon's job, not the scheduler's.
+/// `beacon_mix` must be the seed selected by [`crate::committees::seed_mix`] —
+/// the mix as fixed at the close of epoch
+/// `epoch − 1 − MIN_SEED_LOOKAHEAD_EPOCHS` (finding F6). Passing any other mix
+/// produces a well-formed but wrong schedule, and nothing here can detect that
+/// — the binding of mix to epoch is the beacon's job, not the scheduler's.
 ///
 /// `None` only when the epoch's slot numbers are not representable in `u64`
 /// (an epoch ~5.4 × 10¹⁷ — unreachable in practice, but a consensus function

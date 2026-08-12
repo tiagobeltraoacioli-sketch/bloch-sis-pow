@@ -24,8 +24,31 @@
 > sorteios independentes por slot o punham em varios slots da mesma epoca) pela
 > mesma mudanca. **F3** (o teto de warm-up contornavel pela escapatoria de
 > liveness) foi corrigido com ativacao parcial. O **gap de bootstrap do genesis**
-> foi respondido com conjunto de validadores no genesis. Os achados medios —
-> F4 a F8 — continuam abertos, e o F4/F5 sobre taint perdeu o objeto.
+> foi respondido com conjunto de validadores no genesis. O F4/F5 sobre taint
+> perdeu o objeto.
+>
+> **Atualizacao 2026-08-11 (A6), F6–F8:**
+>
+> - **F6 — CORRIGIDO.** Look-ahead do seed implementado em `committees.rs`
+>   (`MIN_SEED_LOOKAHEAD_EPOCHS = 1`, `seed_epoch`/`seed_mix`/
+>   `seeded_epoch_committees`): a epoca N e semeada pelo mix fixado no
+>   fechamento de N−2, entao nenhum proposer de N−1 — inclusive os dos ultimos
+>   slots — consegue re-sortear a particao de N. O teste
+>   `withholding_in_the_tail_of_an_epoch_cannot_resort_the_next_epochs_partition`
+>   fixa a propriedade e tambem o residuo honesto: o vies de um bit por slot
+>   retido nao some, e deslocado uma epoca para frente (mesmo residuo que o
+>   Ethereum aceita).
+> - **F7 — SUPERFICIE ACEITA, quantificada.** Ver
+>   `BLOCH-POS-SORTITION-DOS.md`: com a particao o alvo por slot e ⌈N/32⌉
+>   (~7 com 200 validadores) e o knob `SLOT_SUBCOMMITTEE_SIZE` morreu; o
+>   look-ahead do F6 ALARGA a janela de aviso (nao encurta); mitigacao real =
+>   sentry + indice-nao-endereco (atrito, nao protecao); alavancas
+>   recomendadas p/ Fase 1 = inclusao tardia de atestacao e proposer boost.
+> - **F8 — AVALIADO, mudanca de parametro recomendada.** Ver
+>   `BLOCH-POS-STAKE-CHURN.md`: 900 bps por epoca de 16 min e o numeral da
+>   Solana num relogio ~180× mais rapido (zero → 1/3 em ~75 min, confirmado);
+>   proposta = 25 bps + piso de churn de 100k BLCH/epoca (zero → 1/3 em ~43 h),
+>   com o custo de liveness itemizado. Decisao do fundador; codigo intacto.
 
 
 ```

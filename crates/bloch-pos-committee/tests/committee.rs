@@ -1020,7 +1020,8 @@ fn empty_registry_does_not_divide_by_zero() {
 // ── particao de epoca (correcao do F1) ──────────────────────────────────────
 
 use bloch_pos_committee::committees::{
-    committee_for_slot, epoch_committees, is_supermajority, total_active_stake,
+    committee_for_slot, epoch_committees, is_supermajority, seed_epoch, seed_mix,
+    seeded_epoch_committees, total_active_stake, MIN_SEED_LOOKAHEAD_EPOCHS,
 };
 
 #[test]
@@ -1140,6 +1141,104 @@ fn quorum_is_exact_at_two_thirds_and_reachable() {
     let reachable: u128 = cs.iter().flatten().count() as u128 * 100_000;
     assert_eq!(reachable, total);
     assert!(is_supermajority(reachable, total));
+}
+
+// ── beacon seed look-ahead (F6 fix) ─────────────────────────────────────────
+
+/// Fold one deterministic pseudo-reveal per slot of `epoch` into `mix`,
+/// skipping the last `withheld_tail` slots — the adversary's only move (§6.3:
+/// reveal or withhold; a third outcome is a SHAKE-256 preimage attack, pinned
+/// by the beacon's own tests).
+fn close_of_epoch(mix: [u8; 32], epoch: u64, withheld_tail: u64) -> [u8; 32] {
+    let mut m = mix;
+    for s in 0..SLOTS_PER_EPOCH - withheld_tail {
+        let mut r = [0u8; 32];
+        r[..8].copy_from_slice(&(epoch * SLOTS_PER_EPOCH + s).to_le_bytes());
+        m = mix_in(&m, &r);
+    }
+    m
+}
+
+#[test]
+fn seed_epoch_arithmetic_and_missing_history() {
+    // The constant is consensus: moving it re-times every duty on the chain.
+    assert_eq!(MIN_SEED_LOOKAHEAD_EPOCHS, 1);
+    // Epochs with no usable boundary behind them fall back to the genesis mix.
+    assert_eq!(seed_epoch(0), None);
+    assert_eq!(seed_epoch(1), None);
+    // From then on: epoch N is seeded by the close of N − 2.
+    assert_eq!(seed_epoch(2), Some(0));
+    assert_eq!(seed_epoch(7), Some(5));
+
+    let genesis = [1u8; 32];
+    let closes = [[2u8; 32]]; // history holds only the close of epoch 0
+    assert_eq!(seed_mix(&genesis, &closes, 0), Some(genesis));
+    assert_eq!(seed_mix(&genesis, &closes, 1), Some(genesis));
+    assert_eq!(seed_mix(&genesis, &closes, 2), Some(closes[0]));
+    // Missing history must fail loudly, never fall back to a newer mix —
+    // a silent fallback would be F6 reintroduced in the error path.
+    assert_eq!(seed_mix(&genesis, &closes, 3), None);
+    let vs = uniform_set(100, 100_000);
+    assert!(seeded_epoch_committees(&genesis, &closes, 3, &vs).is_none());
+
+    // Epochs 0 and 1 share the genesis mix but still partition differently,
+    // because the epoch number is folded into the XOF seed.
+    assert_ne!(epoch_committees(&genesis, 0, &vs), epoch_committees(&genesis, 1, &vs));
+}
+
+#[test]
+fn withholding_in_the_tail_of_an_epoch_cannot_resort_the_next_epochs_partition() {
+    // The F6 attack: the proposers of the last t slots of epoch 3 choose
+    // reveal-or-withhold, grinding 2^t candidate mixes, trying to re-sort the
+    // partition of epoch 4 — the body whose votes justify and finalize.
+    //
+    // Two beacon histories, identical through the close of epoch 2, diverging
+    // only in epoch 3's tail: honest reveals everything, the adversary
+    // withholds the last 4 slots.
+    let genesis = [0u8; 32];
+    let vs = uniform_set(300, 100_000);
+
+    let mut closes_honest: Vec<[u8; 32]> = Vec::new();
+    let mut closes_withheld: Vec<[u8; 32]> = Vec::new();
+    let mut mh = genesis;
+    let mut mw = genesis;
+    for e in 0..=4u64 {
+        mh = close_of_epoch(mh, e, 0);
+        mw = close_of_epoch(mw, e, if e == 3 { 4 } else { 0 });
+        closes_honest.push(mh);
+        closes_withheld.push(mw);
+    }
+    assert_eq!(closes_honest[2], closes_withheld[2], "histories must agree before the attack");
+    assert_ne!(closes_honest[3], closes_withheld[3], "withholding must actually move the mix");
+
+    // THE PROPERTY: epoch 4's partition is identical in both histories. Its
+    // seed is the close of epoch 2 (look-ahead of 1), fixed before any of the
+    // adversary's epoch-3 slots existed.
+    let honest = seeded_epoch_committees(&genesis, &closes_honest, 4, &vs).unwrap();
+    let withheld = seeded_epoch_committees(&genesis, &closes_withheld, 4, &vs).unwrap();
+    assert_eq!(honest, withheld, "tail withholding re-sorted the next epoch — F6 is back");
+
+    // And the proposer roster for epoch 4 is equally immune: same seed rule.
+    let sh = epoch_schedule(&seed_mix(&genesis, &closes_honest, 4).unwrap(), 4, &vs).unwrap();
+    let sw = epoch_schedule(&seed_mix(&genesis, &closes_withheld, 4).unwrap(), 4, &vs).unwrap();
+    assert_eq!(sh, sw, "tail withholding re-sorted the proposer schedule");
+
+    // Teeth: under the pre-F6 rule (seed = close of epoch 3), the same
+    // withholding WOULD have re-sorted epoch 4. If this ever fails, the test
+    // above is vacuous and must be rewritten.
+    assert_ne!(
+        epoch_committees(&closes_honest[3], 4, &vs),
+        epoch_committees(&closes_withheld[3], 4, &vs),
+        "counterfactual lost its teeth: the old rule no longer differs"
+    );
+
+    // Honest residual, stated as a test: the bias is displaced, not erased.
+    // Epoch 5 is seeded by the close of epoch 3, so the withholding does move
+    // THAT partition — one bit per withheld slot, an epoch later, exactly the
+    // residual §6.3 prices in and Ethereum accepts under MIN_SEED_LOOKAHEAD.
+    let h5 = seeded_epoch_committees(&genesis, &closes_honest, 5, &vs).unwrap();
+    let w5 = seeded_epoch_committees(&genesis, &closes_withheld, 5, &vs).unwrap();
+    assert_ne!(h5, w5, "the residual vanished — something other than look-ahead changed");
 }
 
 #[test]

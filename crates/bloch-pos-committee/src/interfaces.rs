@@ -395,6 +395,12 @@ pub trait StateReader {
 
     /// Beacon mix at an earlier epoch boundary. Committed state keeps the
     /// last 2 epochs (§5.5); older epochs return `None`.
+    ///
+    /// Two is exactly `committees::MIN_SEED_LOOKAHEAD_EPOCHS + 1`, and it is a
+    /// floor, not a convenience: while epoch `N` is processed, duties for `N`
+    /// need the mix at the close of `N − 2` and duties for `N + 1` need the
+    /// close of `N − 1` (finding F6). Retention below that bound makes the
+    /// look-ahead uncomputable; shortening it is a consensus change.
     fn randao_mix_at(&self, epoch: u64) -> Option<[u8; 32]>;
 
     /// Justification/finality bookkeeping as of this state.
