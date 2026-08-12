@@ -411,6 +411,24 @@ Two consequences worth stating, because both surfaced as test failures:
 > genesis constants: chain identity; pubkey index: derived) with the
 > reconstruction argument for each. Interfaces `StateRoots` extended to match
 > (two-reviewer rule applies).
+>
+> **Revision 2026-08-12 — slashing, and the EVM commitment.** The extension
+> above was written while slashing was being wired in the same wave, so it did
+> not cover slashing's own bookkeeping. The *effects* of a slash on the registry
+> (the `slashed` flag, the reduced bond) were committed and therefore visible to
+> a state-syncing node; what was not committed was the **applied-evidence set**,
+> which is the whole anti-replay defence, and the **correlation window**, which
+> prices the next offence. Two nodes holding the same headers could reach
+> different verdicts on the same evidence — this section's hard rule, again.
+> Three components added: applied evidence, the window, and the per-delegator
+> slash-loss ledger (which a withdrawal nets out, so a disagreement would pay a
+> different amount for the same exit). The EVM execution commitment
+> (`BLOCH-L1-EVM-STATE-MODEL.md`) is a fourth, carried like the Coherence roots.
+>
+> What stayed out, with a test rather than a claim: the **ejected** set is
+> exactly `{v : registry[v].slashed}`, and the registry is already committed.
+> Committing it separately would commit one fact twice and give the copies room
+> to drift, in the structure whose entire purpose is that they cannot.
 
 **Hard rule, learned from the difficulty defect:** every consensus-relevant
 value used to validate block *B* must be derivable from `B.parent`'s committed

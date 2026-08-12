@@ -240,6 +240,47 @@ impl SlashingState {
         Self::default()
     }
 
+    /// The applied-evidence ids, for committing to the state root.
+    ///
+    /// Read-only and sorted (a `BTreeSet`), because the committed bytes must be
+    /// a function of the set and never of insertion order.
+    pub fn applied_ids(&self) -> impl Iterator<Item = &[u8; 32]> {
+        self.applied.iter()
+    }
+
+    /// The correlation window, `(epoch, slashed_sat)`, ascending by epoch.
+    pub fn window_entries(&self) -> impl Iterator<Item = (u64, u128)> + '_ {
+        self.window.iter().map(|(e, s)| (*e, *s))
+    }
+
+    /// The ejected set.
+    ///
+    /// **Deliberately not a committed component.** It is exactly
+    /// `{v : registry[v].slashed}` — `commit_offense` inserts here in the same
+    /// step the transition sets `slashed = true` on the record, and records are
+    /// never removed from the registry. The registry is already committed, so a
+    /// second leaf would commit the same fact twice and give the two copies
+    /// room to drift. A state-synced node rebuilds this set by reading the
+    /// registry; the equivalence is pinned by
+    /// `transition::tests::ejected_set_is_exactly_the_slashed_registry`.
+    pub fn ejected_ids(&self) -> impl Iterator<Item = &u32> {
+        self.ejected.iter()
+    }
+
+    /// Poke the committed sets directly. **Test-only**, and only so the
+    /// state-root coverage test can prove each component is bound by the root
+    /// without building a distinct real offence per component — the honest
+    /// paths are exercised by the slashing tests themselves.
+    #[cfg(test)]
+    pub(crate) fn poke_for_test(&mut self, applied: Option<[u8; 32]>, window: Option<(u64, u128)>) {
+        if let Some(id) = applied {
+            self.applied.insert(id);
+        }
+        if let Some((epoch, sat)) = window {
+            *self.window.entry(epoch).or_insert(0) += sat;
+        }
+    }
+
     /// Has this validator already been slashed and ejected?
     pub fn is_ejected(&self, validator: u32) -> bool {
         self.ejected.contains(&validator)

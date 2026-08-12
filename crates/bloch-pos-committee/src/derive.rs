@@ -103,6 +103,11 @@ pub struct ChainState {
     /// updating it is EVM execution, which happens in the node's transition,
     /// not in this seam.
     pub evm: EvmCommitment,
+    /// Slashing bookkeeping (§7.3), carried through this seam unchanged —
+    /// evidence is executed by the transition, never here.
+    pub applied_evidence: Vec<crate::state_root::AppliedEvidenceRecord>,
+    pub slash_window: Vec<crate::state_root::SlashWindowRecord>,
+    pub delegator_slash_losses: Vec<crate::state_root::DelegatorLossRecord>,
 }
 
 impl ChainState {
@@ -123,6 +128,9 @@ impl ChainState {
             deposit_queue: &self.deposit_queue,
             delegations: &self.delegations,
             pending_fees: &self.pending_fees,
+            applied_evidence: &self.applied_evidence,
+            slash_window: &self.slash_window,
+            delegator_slash_losses: &self.delegator_slash_losses,
             taint_root: self.taint_root,
             coherence_accumulator_root: self.coherence_accumulator_root,
             coherence_nullifier_root: self.coherence_nullifier_root,
@@ -642,6 +650,9 @@ mod coherence_tests {
             // Empty EVM segment: no accounts, no receipts, no gas. Written out
             // rather than defaulted so the next carried component breaks this
             // line and gets looked at.
+            applied_evidence: Vec::new(),
+            slash_window: Vec::new(),
+            delegator_slash_losses: Vec::new(),
             evm: EvmCommitment {
                 account_root: [0u8; 32],
                 receipts_root: [0u8; 32],

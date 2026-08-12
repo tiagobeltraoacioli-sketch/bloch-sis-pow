@@ -364,6 +364,9 @@ mod tests {
             taint_root: [0x11; 32],
             coherence_accumulator_root: [0x12; 32],
             coherence_nullifier_root: [0x13; 32],
+            applied_evidence: Vec::new(),
+            slash_window: Vec::new(),
+            delegator_slash_losses: Vec::new(),
             evm: EvmCommitment {
                 account_root: [0x14; 32],
                 receipts_root: [0x15; 32],

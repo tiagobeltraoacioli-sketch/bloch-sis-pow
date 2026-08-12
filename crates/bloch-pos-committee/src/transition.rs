@@ -78,16 +78,20 @@
 //! [`CommittedState::compute_root`] below is the single place the mapping
 //! from state to components is defined.
 //!
-//! **One gap reopened in the same wave and is still open.** Slashing was wired
-//! into the transition concurrently with the extension above, so its state —
-//! the applied-evidence id set, the correlation window, and the delegator
-//! slash-loss ledger — is *not* under a component, and the extension did not
-//! cover it. The slash's **effects** on the registry (the `slashed` flag, the
-//! reduced bond) ARE committed, so a state-synced node sees the outcome; what
-//! it cannot reconstruct is the replay-protection set, which is what stops the
-//! same evidence being applied twice. That is the §5.5 failure shape and it
-//! needs the same treatment — recorded here and in `BLOCH-POS-INTERFACES.md`
-//! rather than left to be discovered.
+//! **One gap reopened in the same wave, and closed on 2026-08-12.** Slashing
+//! was wired into the transition concurrently with the extension above, so its
+//! state fell outside it. The slash's *effects* on the registry were committed,
+//! so a state-synced node saw the outcome — but not the replay-protection set,
+//! which is what stops the same evidence being applied twice, nor the
+//! correlation window that prices the next offence. Two nodes could hold the
+//! same headers and reach different verdicts on the same evidence. It is now
+//! three components: `TAG_SLASH_APPLIED`, `TAG_SLASH_WINDOW` and
+//! `TAG_DELEGATOR_SLASH_LOSS`.
+//!
+//! The `ejected` set stayed out, on purpose and with a test: it is exactly
+//! `{v : registry[v].slashed}`, and the registry is already committed, so a
+//! second leaf would commit one fact twice and let the copies drift. See
+//! `tests::ejected_set_is_exactly_the_slashed_registry`.
 //!
 //! What remains **outside** the root by design stays outside for a stated
 //! reason, not by omission — each entry carries the reconstruction argument
@@ -136,7 +140,7 @@ use crate::schedule;
 use crate::slashing;
 use crate::staking::{self, QueuedDeposit};
 use crate::state_root::{
-    CheckpointRecord, ConsensusState, DelegationRecord, DepositQueueRecord, EvmCommitment, FcEquivocatorRecord, FcMessageRecord, FinalityRecord, LeakRecord, ParticipationRecord, PendingFeeRecord, PendingVoteRecord, RandaoMix, ValidatorRecord as CommittedValidatorRecord,
+    AppliedEvidenceRecord, CheckpointRecord, ConsensusState, DelegatorLossRecord, SlashWindowRecord, DelegationRecord, DepositQueueRecord, EvmCommitment, FcEquivocatorRecord, FcMessageRecord, FinalityRecord, LeakRecord, ParticipationRecord, PendingFeeRecord, PendingVoteRecord, RandaoMix, ValidatorRecord as CommittedValidatorRecord,
 };
 use crate::tokenomics_v4;
 use sha3::{Digest, Sha3_256};
@@ -732,6 +736,24 @@ impl CommittedState {
             })
             .collect();
 
+        // Slashing bookkeeping (§7.3). Built from the state machine's own
+        // accessors so there is one reading of what it holds.
+        let applied_evidence: Vec<AppliedEvidenceRecord> =
+            self.slashing.applied_ids().map(|id| AppliedEvidenceRecord { id: *id }).collect();
+        let slash_window: Vec<SlashWindowRecord> = self
+            .slashing
+            .window_entries()
+            .map(|(epoch, slashed_sat)| SlashWindowRecord { epoch, slashed_sat })
+            .collect();
+        let delegator_losses: Vec<DelegatorLossRecord> = self
+            .delegator_slash_losses
+            .iter()
+            .map(|(delegator, loss_sat)| DelegatorLossRecord {
+                delegator: *delegator,
+                loss_sat: *loss_sat,
+            })
+            .collect();
+
         crate::state_root::state_root(&ConsensusState {
             // The eUTXO set is owned by the node's transaction layer, which
             // this standalone crate cannot see (transactions are opaque);
@@ -748,6 +770,9 @@ impl CommittedState {
             deposit_queue: &deposit_queue,
             delegations: &delegations,
             pending_fees: &pending_fees,
+            applied_evidence: &applied_evidence,
+            slash_window: &slash_window,
+            delegator_slash_losses: &delegator_losses,
             taint_root: self.taint_root,
             coherence_accumulator_root: self.coherence_accumulator_root,
             coherence_nullifier_root: self.coherence_nullifier_root,
@@ -2575,6 +2600,19 @@ mod tests {
         must_move!("previous_participation", |g: &mut CommittedState| {
             g.previous_participation.insert(999, true);
         });
+        // Slashing bookkeeping (§7.3). The registry effects of a slash were
+        // already covered above; these are the three components that decide
+        // whether a slash may happen at all, and they went uncommitted until
+        // 2026-08-12.
+        must_move!("slashing applied-evidence set", |g: &mut CommittedState| {
+            g.slashing.poke_for_test(Some([0x5A; 32]), None)
+        });
+        must_move!("slashing correlation window", |g: &mut CommittedState| {
+            g.slashing.poke_for_test(None, Some((3, 1_000)))
+        });
+        must_move!("delegator_slash_losses", |g: &mut CommittedState| {
+            g.delegator_slash_losses.insert(4, 777);
+        });
         // Carried roots.
         must_move!("taint_root", |g: &mut CommittedState| g.taint_root[0] ^= 1);
         must_move!("coherence_accumulator_root", |g: &mut CommittedState| {
@@ -2761,6 +2799,43 @@ mod tests {
             good.header.coherence_root,
             "the coherence binding ignored the accumulator root"
         );
+    }
+
+
+    /// The `ejected` set is **not** a committed component, and this is why it
+    /// does not need to be: it is exactly `{v : registry[v].slashed}`.
+    ///
+    /// Without this test the omission is an assertion in a comment. With it,
+    /// the day the two stop agreeing — a code path that ejects without marking
+    /// the record, or removes a record — is the day this fails, and the choice
+    /// gets re-made deliberately instead of becoming a silent hole in
+    /// state-sync. (Committing both would be worse: two copies of one fact,
+    /// free to drift, in the structure whose whole purpose is that they cannot.)
+    #[test]
+    fn ejected_set_is_exactly_the_slashed_registry() {
+        let (t, g, mut chains) = setup(4);
+        let seed = g.seed_for_epoch(0);
+        let p1 = schedule::proposer(&seed, 1, &g.duty_roster()).unwrap();
+        let offender = (p1 + 1) % 4;
+
+        // Before: both empty.
+        assert_eq!(g.slashing.ejected_ids().count(), 0);
+        assert!(!g.validators.values().any(|r| r.slashed));
+
+        let ev = PosTransaction::SlashingEvidence(double_vote_evidence(offender));
+        let b1 = build_block(&t, &g, 1, &[], std::slice::from_ref(&ev), &mut chains);
+        let s1 = t.apply_block(&g, &b1, &[], std::slice::from_ref(&ev)).unwrap();
+
+        let ejected: BTreeSet<u32> = s1.slashing.ejected_ids().copied().collect();
+        let slashed: BTreeSet<u32> =
+            s1.validators.values().filter(|r| r.slashed).map(|r| r.index).collect();
+        assert!(!ejected.is_empty(), "the fixture must actually slash someone");
+        assert_eq!(ejected, slashed, "ejected and the slashed registry disagree");
+
+        // And the state root moves, because the registry side of the fact is
+        // committed — so a state-synced node sees the ejection even though the
+        // set itself is not a leaf.
+        assert_ne!(s1.compute_root(), g.compute_root());
     }
 
 }

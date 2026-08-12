@@ -411,6 +411,9 @@ mod harness {
             coherence_accumulator_root: COHERENCE_ACC_ROOT,
             coherence_nullifier_root: COHERENCE_NUL_ROOT,
             evm: EVM_COMMITMENT,
+            applied_evidence: &[],
+            slash_window: &[],
+            delegator_slash_losses: &[],
         })
     }
 

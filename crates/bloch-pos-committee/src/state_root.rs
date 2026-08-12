@@ -135,6 +135,20 @@ const TAG_PENDING_FEE: u8 = 0x0F;
 /// because reusing one silently re-keys every leaf of the component it named.
 const TAG_EVM_COMMITMENT: u8 = 0x10;
 
+// Slashing (§7.3), added 2026-08-12. The slash's *effects* on the registry (the
+// `slashed` flag, the reduced bond) were already committed through the
+// validator component; what was not, and had to be, is the bookkeeping that
+// decides whether a slash may happen at all — above all the applied-evidence
+// set, which is the entire anti-replay defence. A node that state-synced
+// without it could be handed the same evidence twice and would slash twice, or
+// could refuse to slash because its neighbour's set said otherwise: two nodes,
+// same headers, different verdicts. The §5.5 failure shape exactly.
+//
+// `ejected` is NOT here on purpose — see `slashing::SlashingState::ejected_ids`.
+const TAG_SLASH_APPLIED: u8 = 0x11;
+const TAG_SLASH_WINDOW: u8 = 0x12;
+const TAG_DELEGATOR_SLASH_LOSS: u8 = 0x13;
+
 
 fn sha3(parts: &[&[u8]]) -> [u8; 32] {
     let mut h = Sha3_256::new();
@@ -762,6 +776,72 @@ impl EvmCommitment {
     }
 }
 
+/// One spent piece of slashing evidence, committed so the same pair can never
+/// be applied twice ([`TAG_SLASH_APPLIED`]).
+///
+/// The id is the whole record: the component is a set, and set membership is
+/// the only fact it carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AppliedEvidenceRecord {
+    pub id: [u8; 32],
+}
+
+impl AppliedEvidenceRecord {
+    fn entry_key(&self) -> Vec<u8> {
+        self.id.to_vec()
+    }
+    fn serialize(&self) -> Vec<u8> {
+        self.id.to_vec()
+    }
+}
+
+/// Stake slashed in one epoch, inside the correlation window
+/// ([`TAG_SLASH_WINDOW`]). Uncommitted, two nodes would price the *next*
+/// correlated offence differently and disagree on the resulting bond.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SlashWindowRecord {
+    pub epoch: u64,
+    pub slashed_sat: u128,
+}
+
+impl SlashWindowRecord {
+    fn entry_key(&self) -> Vec<u8> {
+        self.epoch.to_le_bytes().to_vec()
+    }
+    fn serialize(&self) -> Vec<u8> {
+        let mut s = Vec::with_capacity(24);
+        s.extend_from_slice(&self.epoch.to_le_bytes());
+        s.extend_from_slice(&self.slashed_sat.to_le_bytes());
+        s
+    }
+}
+
+/// Cumulative slashing loss charged to one delegator account
+/// ([`TAG_DELEGATOR_SLASH_LOSS`]).
+///
+/// A separate ledger rather than an edit to the delegation records, because
+/// the delegation registry replays its warm-up history from those records and
+/// editing an amount would retroactively reshuffle every later admission under
+/// the shared churn budget. Committed because a withdrawal nets it out: a node
+/// that disagreed on the loss would pay a different amount for the same exit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DelegatorLossRecord {
+    pub delegator: u32,
+    pub loss_sat: u128,
+}
+
+impl DelegatorLossRecord {
+    fn entry_key(&self) -> Vec<u8> {
+        self.delegator.to_le_bytes().to_vec()
+    }
+    fn serialize(&self) -> Vec<u8> {
+        let mut s = Vec::with_capacity(20);
+        s.extend_from_slice(&self.delegator.to_le_bytes());
+        s.extend_from_slice(&self.loss_sat.to_le_bytes());
+        s
+    }
+}
+
 /// Everything `state_root` commits, passed **by argument** — this struct is
 /// the §5.5 rule made into a type. A block validator builds it from the
 /// parent block's committed state and from nothing else; there is no way to
@@ -803,6 +883,12 @@ pub struct ConsensusState<'a> {
     /// L1 EVM execution commitment, carried from the execution layer
     /// (`BLOCH-L1-EVM-STATE-MODEL.md`).
     pub evm: EvmCommitment,
+    /// Spent slashing evidence — the anti-replay set (§7.3).
+    pub applied_evidence: &'a [AppliedEvidenceRecord],
+    /// Per-epoch slashed stake inside the correlation window (§7.3).
+    pub slash_window: &'a [SlashWindowRecord],
+    /// Cumulative slashing losses per delegator account (§7.3).
+    pub delegator_slash_losses: &'a [DelegatorLossRecord],
 }
 
 /// How many **closed** epoch boundaries the committed beacon history retains,
@@ -921,6 +1007,18 @@ pub fn build_state_tree(state: &ConsensusState<'_>) -> Smt {
     // path; the spec (§2) opens the closed list by exactly one leaf and no
     // more.
     smt.insert(derive_key(TAG_EVM_COMMITMENT, &[]), hash_value(&state.evm.serialize()));
+    for e in state.applied_evidence {
+        smt.insert(derive_key(TAG_SLASH_APPLIED, &e.entry_key()), hash_value(&e.serialize()));
+    }
+    for w in state.slash_window {
+        smt.insert(derive_key(TAG_SLASH_WINDOW, &w.entry_key()), hash_value(&w.serialize()));
+    }
+    for d in state.delegator_slash_losses {
+        smt.insert(
+            derive_key(TAG_DELEGATOR_SLASH_LOSS, &d.entry_key()),
+            hash_value(&d.serialize()),
+        );
+    }
     smt
 }
 
@@ -1092,12 +1190,31 @@ mod tests {
         delegations: Vec<DelegationRecord>,
         pending_fees: Vec<PendingFeeRecord>,
         evm: EvmCommitment,
+        applied: Vec<AppliedEvidenceRecord>,
+        window: Vec<SlashWindowRecord>,
+        losses: Vec<DelegatorLossRecord>,
     }
 
     fn fixture() -> Fx {
         // Distinct non-zero values in all four EVM fields on purpose: with
         // zeros, a serialization that aliased two of them would still produce
         // equal roots and the aliasing test below would pass vacuously.
+        // Slashing bookkeeping, non-empty: a component whose fixture is empty
+        // is a component the coverage test cannot distinguish from an absent
+        // one. `validator: 1` deliberately collides with a registry key and an
+        // fc-message key — the component tag is what keeps the three apart.
+        let applied = vec![
+            AppliedEvidenceRecord { id: key(0xA1) },
+            AppliedEvidenceRecord { id: key(0xA2) },
+        ];
+        let window = vec![
+            SlashWindowRecord { epoch: 7, slashed_sat: 5_000_000_000 },
+            SlashWindowRecord { epoch: 8, slashed_sat: 1 },
+        ];
+        let losses = vec![
+            DelegatorLossRecord { delegator: 1, loss_sat: 42 },
+            DelegatorLossRecord { delegator: 9, loss_sat: 1_000 },
+        ];
         let evm = EvmCommitment {
             account_root: key(0xE0),
             receipts_root: key(0xE1),
@@ -1204,6 +1321,9 @@ mod tests {
             delegations,
             pending_fees,
             evm,
+            applied,
+            window,
+            losses,
         }
     }
 
@@ -1225,6 +1345,9 @@ mod tests {
             coherence_accumulator_root: val(102),
             coherence_nullifier_root: val(103),
             evm: f.evm,
+            applied_evidence: &f.applied,
+            slash_window: &f.window,
+            delegator_slash_losses: &f.losses,
         }
     }
 
