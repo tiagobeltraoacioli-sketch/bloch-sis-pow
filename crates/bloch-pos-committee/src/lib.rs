@@ -55,6 +55,7 @@ pub mod staking;
 pub mod state_root;
 pub mod schedule;
 pub mod slashing;
+pub mod transition;
 
 pub use attestation::{Attestation, AttestationData, RejectReason, SignatureVerifier};
 pub use beacon::{mix_in, process_reveal, BeaconError, RandaoChain, RevealState};
@@ -78,6 +79,10 @@ pub use interfaces::{
     StakingLifecycle, StateCommitment, StateReader, StateTransition,
 };
 pub use finality::{EpochOutcome, EpochVotes, FinalityError};
+pub use transition::{
+    block_id, proposal_signing_root, CommittedState, GenesisValidator, PosTransaction, Transition,
+    BLOCK_VERSION_V4,
+};
 
 // ── Names that exist in two modules — NOT re-exported flat ──────────────────
 //

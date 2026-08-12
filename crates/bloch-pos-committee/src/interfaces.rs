@@ -274,6 +274,14 @@ pub enum TransitionError {
     /// finality — a block may never un-finalize anything (§6.6.2 makes the
     /// same demand of the shielded pool via `coherence_root`).
     FinalityRegression,
+    /// Header `parent` is not the id of the block whose post-state was given
+    /// as `pre`. Added by DEV-1 under the sanctioned `#[non_exhaustive]`
+    /// extension rule (see the module docs on change control): `apply_block`
+    /// is defined as parent-state × block → child-state, so a block naming a
+    /// different parent must be a deterministic reject — silently applying it
+    /// to the wrong state is the block-identity failure shape (the
+    /// `pow_hash`/`block_hash` DAG-keying defect) moved one layer up.
+    WrongParent,
 }
 
 /// Why a deposit was rejected (§7.1, §4.1, §6.6.3).
