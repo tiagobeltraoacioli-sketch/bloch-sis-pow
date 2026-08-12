@@ -193,8 +193,8 @@ Building from source is the recommended path — you run the bytes you
 compiled, and the build is reproducible by design (see [REPRO.md](./REPRO.md)).
 The binaries below are a convenience, not the standard.
 
-Prebuilt `bloch` and `bloch-cli` for **Linux x86_64**, tag
-`genesis3-node-linux-20260805`:
+Prebuilt `bloch` and `bloch-cli` for **Linux x86_64**. The current release is
+`genesis3-node-emission-v3-floor60-20260810`:
 
 - GitHub releases: <https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow/releases>
 - GitLab releases: <https://gitlab.com/blochsispow-group/BlochSISPoW-project/-/releases>
@@ -206,8 +206,19 @@ build from source. Verify `SHA256SUMS` before running anything.
 **Take the latest non-superseded release.** Genesis-3 consensus flag-days
 make an older build diverge, not merely lag: the Emission V3 flag-day at
 local height 40,000 cut the block reward, and a binary built before that
-change forks off the network at that height rather than following it. The
-release list is ordered; the newest entry is the one the fleet runs.
+change forks off the network at that height rather than following it. Every
+release before `genesis3-node-emission-v3-floor60-20260810` is tagged
+`[SUPERSEDED]` in the release list for that reason — including
+`genesis3-node-linux-20260805`, which predates four consensus flag-days.
+
+**No published binary halts at 50,000 yet.** The terminal height was lowered
+to 50,000 on 2026-08-12; the newest release is from 2026-08-10 and therefore
+still carries 80,000. The fleet runs a build of `deploy/g3-terminal-50000`
+that has not been published. Until a release is cut from that branch, a node
+started from any downloadable binary will keep accepting blocks above 50,000
+and fork away from the network at the halt. If you are running a node through
+the halt, build from `deploy/g3-terminal-50000` or ask before relying on a
+downloaded build.
 
 ## Security
 
