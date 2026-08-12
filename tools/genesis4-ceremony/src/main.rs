@@ -3,6 +3,7 @@
 //! CLI for the Genesis-4 genesis ceremony. See lib.rs for what is built and
 //! why; see README.md for the runbook.
 
+use bloch_pos_committee::tokenomics_v4::SAT_PER_BLOCH;
 use genesis4_ceremony::*;
 use std::process::ExitCode;
 
@@ -99,7 +100,8 @@ fn run() -> Result<(), String> {
     std::fs::write(&hdr_path, header.serialize())
         .map_err(|e| format!("write {hdr_path}: {e}"))?;
 
-    let bloch = |sat: u128| format!("{}.{:08}", sat / 100_000_000, sat % 100_000_000);
+    // Display only; the divisor is the imported constant, not a restatement.
+    let bloch = |sat: u128| format!("{}.{:08}", sat / SAT_PER_BLOCH, sat % SAT_PER_BLOCH);
     println!("carryover artifact   : {carry_path}");
     println!("  digest (verified)  : {}", hex::encode(carry.digest));
     println!("  holders            : {}", carry.rows.len());
