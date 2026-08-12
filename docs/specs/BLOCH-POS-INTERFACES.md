@@ -2,6 +2,21 @@
 
 # Bloch PoS — Frozen Consensus Interfaces
 
+> **PARCIALMENTE SUPERADO — 2026-08-11.** Esta analise foi escrita contra o
+> estado do projeto naquele dia e depende de premissas que mudaram DEPOIS:
+>
+> - **a maquinaria de taint** — dissolvida: o carryover atravessa como um conjunto so, sem lista de exclusao, entao nao ha classe de moeda a marcar.
+> - **o comite amostrado (128 por epoca + 8 por slot)** — substituido por particao do conjunto ativo: o quorum amostrado nao tinha denominador coerente (achado F1).
+> - **o supply de 100 bilhoes** — revertido para 21 bilhoes, o nominal da V2.
+> - **a fase hibrida de PoW** — apagada: a Genesis-3 para na altura 80.000 e a Genesis-4 nasce de uma snapshot.
+>
+> O texto NAO foi reescrito, de proposito: o raciocinio que produziu cada
+> achado tem valor mesmo quando a premissa mudou, e reescrever apagaria a
+> trilha. Leia os achados; confira as premissas contra
+> `BLOCH-TOKENOMICS-V4.md` e `BLOCH-POS-SHA3-LATTICE-MIGRATION.md`, que sao
+> os normativos.
+
+
 ```
 Document:   BLOCH-POS-INTERFACES
 Status:     FROZEN — Phase-1 interface freeze (§9.2 of the migration design)

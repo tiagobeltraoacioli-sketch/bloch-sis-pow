@@ -1,5 +1,18 @@
 # Coherence under PoS — integration plan for the shielded pool (§6.6)
 
+> **PARCIALMENTE SUPERADO — 2026-08-11.** Esta analise foi escrita contra o
+> estado do projeto naquele dia e depende de premissas que mudaram DEPOIS:
+>
+> - **a maquinaria de taint** — dissolvida: o carryover atravessa como um conjunto so, sem lista de exclusao, entao nao ha classe de moeda a marcar.
+> - **a fase hibrida de PoW** — apagada: a Genesis-3 para na altura 80.000 e a Genesis-4 nasce de uma snapshot.
+>
+> O texto NAO foi reescrito, de proposito: o raciocinio que produziu cada
+> achado tem valor mesmo quando a premissa mudou, e reescrever apagaria a
+> trilha. Leia os achados; confira as premissas contra
+> `BLOCH-TOKENOMICS-V4.md` e `BLOCH-POS-SHA3-LATTICE-MIGRATION.md`, que sao
+> os normativos.
+
+
 > **Owner:** A9 (Coherence integration), Genesis-4 / Bell PoS migration.
 > **Inputs:** `BLOCH-POS-SHA3-LATTICE-MIGRATION.md` §6.6 (all four requirements),
 > `COHERENCE-C1.md` (frozen formats), the live code on `feat/pos-sha3-lattice`

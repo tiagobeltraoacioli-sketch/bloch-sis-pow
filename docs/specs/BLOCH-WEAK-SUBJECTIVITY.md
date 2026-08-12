@@ -2,6 +2,19 @@
 
 # Bloch — Weak subjectivity: checkpoint format, publication, and sync
 
+> **PARCIALMENTE SUPERADO — 2026-08-11.** Esta analise foi escrita contra o
+> estado do projeto naquele dia e depende de premissas que mudaram DEPOIS:
+>
+> - **a maquinaria de taint** — dissolvida: o carryover atravessa como um conjunto so, sem lista de exclusao, entao nao ha classe de moeda a marcar.
+> - **o comite amostrado (128 por epoca + 8 por slot)** — substituido por particao do conjunto ativo: o quorum amostrado nao tinha denominador coerente (achado F1).
+>
+> O texto NAO foi reescrito, de proposito: o raciocinio que produziu cada
+> achado tem valor mesmo quando a premissa mudou, e reescrever apagaria a
+> trilha. Leia os achados; confira as premissas contra
+> `BLOCH-TOKENOMICS-V4.md` e `BLOCH-POS-SHA3-LATTICE-MIGRATION.md`, que sao
+> os normativos.
+
+
 ```
 Document:  BLOCH-WEAK-SUBJECTIVITY
 Status:    DRAFT — for Phase 1 review; constants require KATs before freeze

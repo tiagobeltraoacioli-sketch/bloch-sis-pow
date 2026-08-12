@@ -2,6 +2,32 @@
 
 # Bloch PoS (Genesis-4 / Bell) — Threat Model
 
+> **PARCIALMENTE SUPERADO — 2026-08-11.** Esta analise foi escrita contra o
+> estado do projeto naquele dia e depende de premissas que mudaram DEPOIS:
+>
+> - **a maquinaria de taint** — dissolvida: o carryover atravessa como um conjunto so, sem lista de exclusao, entao nao ha classe de moeda a marcar.
+> - **o comite amostrado (128 por epoca + 8 por slot)** — substituido por particao do conjunto ativo: o quorum amostrado nao tinha denominador coerente (achado F1).
+> - **o supply de 100 bilhoes** — revertido para 21 bilhoes, o nominal da V2.
+> - **a alocacao de 53,7 bi para validadores** — hoje 9.036.115.200 (43,03%).
+> - **a concessao de 17% ao fundador** — reduzida para 10%, com a diferenca indo para validadores.
+> - **a fase hibrida de PoW** — apagada: a Genesis-3 para na altura 80.000 e a Genesis-4 nasce de uma snapshot.
+>
+> O texto NAO foi reescrito, de proposito: o raciocinio que produziu cada
+> achado tem valor mesmo quando a premissa mudou, e reescrever apagaria a
+> trilha. Leia os achados; confira as premissas contra
+> `BLOCH-TOKENOMICS-V4.md` e `BLOCH-POS-SHA3-LATTICE-MIGRATION.md`, que sao
+> os normativos.
+>
+> Dois achados deste documento **ja foram corrigidos** e os testes fixam a
+> correcao: **F1** (quorum de finalidade sem denominador coerente) pela particao
+> do conjunto ativo, e **F2** (validador honesto se auto-slashando, porque
+> sorteios independentes por slot o punham em varios slots da mesma epoca) pela
+> mesma mudanca. **F3** (o teto de warm-up contornavel pela escapatoria de
+> liveness) foi corrigido com ativacao parcial. O **gap de bootstrap do genesis**
+> foi respondido com conjunto de validadores no genesis. Os achados medios —
+> F4 a F8 — continuam abertos, e o F4/F5 sobre taint perdeu o objeto.
+
+
 ```
 Document:   BLOCH-POS-THREAT-MODEL
 Status:     DRAFT — adversarial review, Assistant A4

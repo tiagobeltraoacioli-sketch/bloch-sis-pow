@@ -1,5 +1,10 @@
 # BLOCH SHA-3 Migration Inventory — SHA-2 usage census
 
+> **Verificado em 2026-08-11.** Este documento nao depende de nenhuma das
+> premissas revistas naquele dia (taint, comite amostrado, supply de 100 bi,
+> fase hibrida). As conclusoes seguem valendo como escritas.
+
+
 **Owner:** A5 (SHA-3 migration) · **Branch:** `feat/pos-sha3-lattice` · **Date:** 2026-08-11
 **Companion to:** `BLOCH-POS-SHA3-LATTICE-MIGRATION.md` §6.1 (domain separation), §6.6 (Coherence is already SHA-3 native) · `BLOCH-TOKENOMICS-V4.md` §3.2 (chain halts at height 80,000)
 

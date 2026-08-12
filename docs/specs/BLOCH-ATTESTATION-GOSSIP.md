@@ -1,5 +1,18 @@
 # BLOCH-ATTESTATION-GOSSIP — Attestation propagation for Genesis-4 PoS
 
+> **PARCIALMENTE SUPERADO — 2026-08-11.** Esta analise foi escrita contra o
+> estado do projeto naquele dia e depende de premissas que mudaram DEPOIS:
+>
+> - **o comite amostrado (128 por epoca + 8 por slot)** — substituido por particao do conjunto ativo: o quorum amostrado nao tinha denominador coerente (achado F1).
+> - **a fase hibrida de PoW** — apagada: a Genesis-3 para na altura 80.000 e a Genesis-4 nasce de uma snapshot.
+>
+> O texto NAO foi reescrito, de proposito: o raciocinio que produziu cada
+> achado tem valor mesmo quando a premissa mudou, e reescrever apagaria a
+> trilha. Leia os achados; confira as premissas contra
+> `BLOCH-TOKENOMICS-V4.md` e `BLOCH-POS-SHA3-LATTICE-MIGRATION.md`, que sao
+> os normativos.
+
+
 > **Owner:** A11 (P2P & gossip). **Status:** draft for review.
 > **Inputs:** `BLOCH-POS-SHA3-LATTICE-MIGRATION.md` §5.1, §6.5, §6.5.2, G10;
 > `src/network/mod.rs` (current gossipsub layer); `src/network/sync_rr.rs`

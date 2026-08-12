@@ -1,5 +1,18 @@
 # Bloch — Ecosystem Migration Plan (Genesis-4 PoS)
 
+> **PARCIALMENTE SUPERADO — 2026-08-11.** Esta analise foi escrita contra o
+> estado do projeto naquele dia e depende de premissas que mudaram DEPOIS:
+>
+> - **a maquinaria de taint** — dissolvida: o carryover atravessa como um conjunto so, sem lista de exclusao, entao nao ha classe de moeda a marcar.
+> - **o supply de 100 bilhoes** — revertido para 21 bilhoes, o nominal da V2.
+>
+> O texto NAO foi reescrito, de proposito: o raciocinio que produziu cada
+> achado tem valor mesmo quando a premissa mudou, e reescrever apagaria a
+> trilha. Leia os achados; confira as premissas contra
+> `BLOCH-TOKENOMICS-V4.md` e `BLOCH-POS-SHA3-LATTICE-MIGRATION.md`, que sao
+> os normativos.
+
+
 **Status:** Draft for PMO review — Assistant A8 (ecosystem), 2026-08-11
 **Parents:** `BLOCH-POS-SHA3-LATTICE-MIGRATION.md` (§5.3 `BlockHeaderV4`, §4.1, §6.6.3, Appendix B) · `BLOCH-TOKENOMICS-V4.md` (§3.2 halt-and-relaunch, §6.3 validator revenue, §6.3.1 delegation, §8.1 u64 headroom) · ADR-036
 **Scope:** everything that consumes the chain — explorer, wallets (PWA / desktop / CLI), SDKs + OpenAPI, JSON-RPC surface, L2 + anchoring, pool/stratum/mining stack, snapshot & onboarding runbooks.

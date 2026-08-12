@@ -2,6 +2,18 @@
 
 # Falcon-1024 Online Signing Under PoS
 
+> **PARCIALMENTE SUPERADO — 2026-08-11.** Esta analise foi escrita contra o
+> estado do projeto naquele dia e depende de premissas que mudaram DEPOIS:
+>
+> - **o comite amostrado (128 por epoca + 8 por slot)** — substituido por particao do conjunto ativo: o quorum amostrado nao tinha denominador coerente (achado F1).
+>
+> O texto NAO foi reescrito, de proposito: o raciocinio que produziu cada
+> achado tem valor mesmo quando a premissa mudou, e reescrever apagaria a
+> trilha. Leia os achados; confira as premissas contra
+> `BLOCH-TOKENOMICS-V4.md` e `BLOCH-POS-SHA3-LATTICE-MIGRATION.md`, que sao
+> os normativos.
+
+
 **Answers:** `BLOCH-POS-SHA3-LATTICE-MIGRATION.md` §14.3 (open question) and the
 DEV-2 caveat in §6.2.
 **Author:** A6 (applied cryptography) · **Date:** 2026-08-11 · **Status:** finding, for A4/DEV-2 review
