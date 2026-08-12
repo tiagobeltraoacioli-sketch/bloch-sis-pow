@@ -46,6 +46,10 @@ RETIRED = [
     ("1,276 BLCH",       "flat (100 bi)",            "215 BLCH"),
     ("300,000,000",      "teto de holders aposentado", "sem teto"),
     ("2-year cliff",     "cliff do fundador antigo", "10-year cliff"),
+    ("new grant is 17%", "concessao do fundador antiga em prosa", "new grant is 10%"),
+    ("new 17% grant",    "concessao do fundador antiga em prosa", "new 10% grant"),
+    ("still open, and",  "decisao de stakeabilidade ja tomada",   "decidida 2026-08-11 (§4A.1)"),
+    ("still undecided: **liquid", "decisao de stakeabilidade ja tomada", "decidida 2026-08-11 (§4A.1)"),
 ]
 
 # Trechos que citam valores antigos DE PROPOSITO, como historico.

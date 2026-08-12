@@ -192,7 +192,7 @@ they bite:
 Not coin marking. Three things, in descending order of how much they actually
 do:
 
-1. **The allocation itself.** The founder's new grant is 17% under a 10-year
+1. **The allocation itself.** The founder's new grant is 10% under a 10-year
    cliff and 40-year linear vest — the strictest schedule on the chain, far
    beyond any market benchmark.
 2. **Vesting on the Foundation buckets.** VC and team hold nothing liquid at
@@ -216,11 +216,16 @@ liquid gave that up. The tokenomics document states the year-by-year figures
 (§4A); this document's job is only to record that the gates in §11 are what
 enforce it, and that they are not met at launch.
 
-One distinction stays available and is still undecided: **liquid is not the
-same as stakeable**. A carried-over balance can be spendable while remaining
-ineligible to stake. Nothing about carrying it across liquid decides that it
-votes, and that decision is what determines whether the gates are reachable
-before year five.
+One distinction stayed available until 2026-08-11 and is now closed: **a
+carried-over balance that is liquid is also stakeable** (founder decision,
+2026-08-11). Nothing in the admission path asks where a coin came from; a
+carryover-funded deposit or delegation is bounded by size alone, and two tests
+pin it (`staking.rs::carryover_liquid_balance_is_stakeable`,
+`tests/committee.rs::carryover_liquid_balance_delegates_as_stake`). What that
+does to the gates is stated with the gates (§11) and computed in
+`BLOCH-TOKENOMICS-V4.md` §4A.1: staked and compounded, the founder's
+carried-over balance holds ~94% of active stake and pro-rata rewards preserve
+that share, so G1/G2 move only when coins change hands.
 
 ---
 
@@ -920,6 +925,21 @@ G1–G4 are the honest statement of §0.1: **if the coins do not distribute, the
 migration does not happen.** That is the correct outcome, not a failure of the
 engineering.
 
+**Carryover stakeability (decided 2026-08-11) and what it does to G1–G4.** A
+carried-over balance that is liquid is also stakeable — the founder's
+included (§4.2). The arithmetic consequence, worked in
+`BLOCH-TOKENOMICS-V4.md` §4A.1: rewards are pro-rata, so stake shares are
+conserved under compounding. If the founder stakes the carried-over
+3,546,175,400 BLCH, independent stake is pinned at ~6.03% of active stake —
+and active stake never exceeds circulating supply, so it can never reach G1's
+15% of circulating: not by year five, not ever, from emission alone. If the
+founder keeps the balance out of stake voluntarily, the earliest arithmetic G1
+crossing is ≈ month 9 (bound, not forecast — the founder-operated genesis
+cohort earns much of the early emission). Neither behaviour is
+consensus-enforced. The decision therefore makes the previous sentence
+literal: the gates are the measurement that decides, and G1's arithmetic *is*
+"the coins must distribute".
+
 ---
 
 ## 12. Testing, verification, chaos
@@ -985,9 +1005,10 @@ engineering.
    is the only lever, and pulling it requires reversing the constraint.
 4. ~~**Taint set permanence and the two-class coin.**~~ **Dissolved.** The
    carryover crosses as one undifferentiated set, so no coin is marked and none
-   is second-class. What replaced the question is narrower and still open:
-   whether a carried-over balance that is *liquid* is also *stakeable* (§4.2).
-   That one decides whether the gates are reachable before year five.
+   is second-class. The narrower question that replaced it — whether a
+   carried-over balance that is *liquid* is also *stakeable* — was **decided
+   2026-08-11: it is** (§4.2, §11; the gate arithmetic it changes is in
+   `BLOCH-TOKENOMICS-V4.md` §4A.1).
 5. ~~**Weak subjectivity** — who signs the checkpoint in an ownerless system?~~
    **Answered by [ADR-036](../adr/ADR-036-retract-ownerless-adopt-foundation.md):**
    the ownerless premise is retracted and the Foundation publishes checkpoints.
