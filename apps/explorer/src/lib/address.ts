@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Client-side Bloch address validation + parsing.
 //
 // A Bloch address is  bloch1q<40-hex pubkey-hash><8-hex checksum>  (mainnet)

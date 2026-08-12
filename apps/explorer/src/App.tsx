@@ -1,4 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+import { useEffect, useState } from "react";
 import { useRouter, Link, matchRoute } from "./lib/router";
+import { rpcIsDegraded, activeRpcEndpoint } from "./lib/rpc";
 import { SearchBox } from "./components/search";
 import { Dashboard } from "./pages/Dashboard";
 import { Blocks } from "./pages/Blocks";
@@ -13,16 +16,14 @@ import { WalletPage } from "./pages/Wallet";
 import { LeaderboardPage } from "./pages/Leaderboard";
 import "./features.css";
 
-// Postern Labs triangle emblem (canonical mark) — full colour, self-theming.
+// The Bloch sphere — one qubit, every state. Canonical protocol mark,
+// self-theming via the brand tokens.
 const Logo = () => (
-  <svg className="logo" viewBox="0 0 120 120" fill="none" aria-label="Postern Labs">
-    <polygon points="60,14 104,92 16,92" fill="none" stroke="#D2955C" strokeWidth="3" strokeLinejoin="round" />
-    <line x1="60" y1="14" x2="60" y2="92" stroke="#3A4657" strokeWidth="2" />
-    <line x1="38" y1="53" x2="82" y2="53" stroke="#3A4657" strokeWidth="2" />
-    <circle cx="38" cy="92" r="4.5" fill="#D2955C" />
-    <circle cx="60" cy="92" r="4.5" fill="#D2955C" />
-    <circle cx="82" cy="92" r="4.5" fill="#D2955C" />
-    <circle cx="60" cy="14" r="6" fill="#E0A870" />
+  <svg className="logo" viewBox="0 0 26 26" fill="none" aria-label="Bloch Protocol">
+    <circle cx="13" cy="13" r="11.2" stroke="var(--accent)" strokeWidth="1.5" />
+    <ellipse cx="13" cy="13" rx="11.2" ry="4.2" stroke="var(--accent)" strokeWidth="1.1" opacity="0.55" />
+    <line x1="13" y1="13" x2="19.6" y2="7.2" stroke="var(--ink)" strokeWidth="1.6" strokeLinecap="round" />
+    <circle cx="19.6" cy="7.2" r="2.1" fill="var(--accent)" />
   </svg>
 );
 
@@ -65,6 +66,27 @@ function renderRoute(path: string) {
   );
 }
 
+// Surfaces the RPC client's own failover state (src/lib/rpc.ts). Reads the
+// exported getters on a slow tick — no extra network traffic.
+function RpcStatus() {
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    const t = setInterval(() => setTick((x) => x + 1), 10_000);
+    return () => clearInterval(t);
+  }, []);
+  const degraded = rpcIsDegraded();
+  const ep = activeRpcEndpoint();
+  const label = ep === "/rpc" ? "same-origin /rpc" : ep;
+  return (
+    <div className="rpc-status" title="Which JSON-RPC endpoint this session is pinned to">
+      <span className={"dot " + (degraded ? "warn" : "live")} />
+      <span>
+        RPC {degraded ? "degraded — failed over to" : "via"} <code>{label}</code>
+      </span>
+    </div>
+  );
+}
+
 export function App() {
   const { path } = useRouter();
   const isActive = (to: string) => (to === "/" ? path === "/" : path.startsWith(to));
@@ -85,6 +107,9 @@ export function App() {
                   {n.label}
                 </Link>
               ))}
+              <a href="https://posternlabs.com" className="ext" rel="noopener">
+                posternlabs.com ↗
+              </a>
             </nav>
             <div className="topbar-spacer" />
             <SearchBox />
@@ -99,18 +124,19 @@ export function App() {
           <div className="foot-lockup">
             <span className="foot-brand">
               <Logo />
-              <span className="wordmark">
-                <span className="wm-postern">postern</span>
-                <span className="wm-mid">·</span>
-                <span className="wm-labs">labs</span>
-              </span>
+              <span className="wordmark">Bloch Protocol</span>
             </span>
-            <span className="foot-tagline">Math, applied. For life.</span>
+            <span className="foot-tagline">
+              <a href="https://posternlabs.com" rel="noopener">Postern Labs</a> · nothing here is
+              investment advice
+            </span>
           </div>
           Independent reference explorer for the <strong>Bloch</strong> chain — a GhostDAG-Q,
-          post-quantum proof-of-work network. Not an official service; Bloch is ownerless/neutral.
-          Integer satoshis are the source of truth (1 BLOCH = 1e8 sat); “bloch” values are display-only.
-          BLCH is neutral native gas, never a value or investment claim.
+          post-quantum proof-of-work network. Genesis-3 ends by consensus rule at height 50,000;
+          this explorer serves its history in full. Not an official service; Bloch is
+          ownerless/neutral. Integer satoshis are the source of truth (1 BLOCH = 1e8 sat); “bloch”
+          values are display-only. BLCH is neutral native gas, never a value or investment claim.
+          <RpcStatus />
         </div>
       </footer>
     </div>

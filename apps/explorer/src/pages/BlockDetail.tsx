@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 import { rpc, rpcAllSettled } from "../lib/rpc";
 import { useAsync } from "../lib/hooks";
 import { Loading, ErrorBox, KV, Copyable } from "../components/ui";

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 import { useEffect, useState } from "react";
 import { rpc, rpcAllSettled } from "../lib/rpc";
 import { useAsync } from "../lib/hooks";
@@ -135,9 +136,9 @@ function WalletPanel({ address }: { address: string }) {
 
       {d.balanceSats === 0 && d.mined.length === 0 && (
         <div className="rail" style={{ marginTop: 16 }}>
-          <strong>Nothing found (yet).</strong> This address has no balance and mined no blocks in the last{" "}
-          {SCAN_DEPTH} bodied blocks the node returned. That's expected on a stalled or freshly-used address —
-          we won't invent activity. If you just started mining, blocks appear here once the chain advances.
+          <strong>Nothing found.</strong> This address has no balance and mined no blocks in the last{" "}
+          {SCAN_DEPTH} bodied blocks the node returned — we won't invent activity. Note that Genesis-3
+          ends at height 50,000; after the halt this scan is a fixed historical window, not a live feed.
         </div>
       )}
 
@@ -147,7 +148,6 @@ function WalletPanel({ address }: { address: string }) {
           <ChartCard title="Cumulative BLOCH mined" hint={`${d.mined.length} block${d.mined.length === 1 ? "" : "s"}`}>
             <LineChart
               points={points}
-              color="#D2955C"
               area
               step
               yFormat={(v) => v.toFixed(2)}

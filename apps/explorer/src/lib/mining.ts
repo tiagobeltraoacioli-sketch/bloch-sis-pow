@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Mining data layer — reuses the existing /rpc client + allowlisted read methods.
 // Nothing here fabricates data: every number traces to a live RPC response, and
 // callers surface a stalled/empty state honestly when the chain isn't advancing.
@@ -24,6 +25,7 @@ export interface NetParams {
   subsidySats: number;
   minerRewardSats: number; // miner's share of the subsidy
   freshestTs: number;
+  tipHeight: number; // highest recent block seen (0 when unknown)
   stalled: boolean;
   ok: boolean; // did any live source answer
 }
@@ -52,6 +54,7 @@ export async function fetchNetParams(): Promise<NetParams> {
   const minerRewardSats = num(pools.miner_share_sat) || subsidySats;
 
   const freshestTs = recent.length ? Math.max(...recent.map((b: any) => num(b.timestamp))) : 0;
+  const tipHeight = recent.length ? Math.max(...recent.map((b: any) => num(b.height))) : 0;
   const ageSecs = freshestTs ? Date.now() / 1000 - freshestTs : Infinity;
   const stalled = ageSecs > STALL_SECS;
   const ok = !!(r.chain || r.hash || r.pools || r.recent);
@@ -64,6 +67,7 @@ export async function fetchNetParams(): Promise<NetParams> {
     subsidySats,
     minerRewardSats,
     freshestTs,
+    tipHeight,
     stalled,
     ok,
   };
