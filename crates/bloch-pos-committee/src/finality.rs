@@ -86,11 +86,28 @@ pub struct Checkpoint {
 pub struct EpochVotes<'a> {
     /// The epoch these votes justify (the checkpoint's own epoch).
     pub epoch: u64,
-    /// The epoch committee, with effective stake as committed by the parent
-    /// block's state — the caller draws it via `epoch_committee()`. Stake
-    /// comes in from committed state; the *leak* adjustment is applied
+    /// **The whole active validator set** for this epoch, with effective stake
+    /// as committed by the parent block's state.
+    ///
+    /// Not a sample. This field used to say "the caller draws it via
+    /// `epoch_committee()`", which is the sampled k=128 draw, and that made the
+    /// quorum two thirds of a *sample's* stake — finding F1 reading 2, where a
+    /// ~30% adversary exceeds one third of the sample often enough to stall
+    /// finality roughly one epoch in five. Worse, the partition that was
+    /// written to fix exactly this had **no caller**: the fix existed as a
+    /// module and changed nothing (adversarial review G1, 2026-08-11).
+    ///
+    /// Under [`crate::committees::epoch_committees`] the epoch's committees
+    /// partition this set — every active validator lands in exactly one slot
+    /// committee and votes exactly once — so the union of an epoch's committees
+    /// *is* this field, the denominator is total active stake, and it is
+    /// reachable by construction. The field is named for what it must be, and
+    /// renaming it was deliberate: a compile error at every call site is
+    /// cheaper than a silently wrong denominator.
+    ///
+    /// Stake comes in from committed state; the *leak* adjustment is applied
     /// internally, because the leak is itself a function of the vote history.
-    pub committee: &'a [Validator],
+    pub active_set: &'a [Validator],
     /// Signature-verified epoch-boundary attestations.
     pub attestations: &'a [(u32, AttestationData)],
 }
@@ -192,7 +209,7 @@ impl FinalityState {
         // every iteration below is in fixed index order — determinism is not
         // allowed to depend on hasher seeds in a consensus path.
         let mut stake: BTreeMap<u32, u64> = BTreeMap::new();
-        for v in votes.committee {
+        for v in votes.active_set {
             let leaked = *self.leaked.get(&v.index).unwrap_or(&0);
             stake.insert(v.index, v.effective_stake.saturating_sub(leaked));
         }
@@ -305,7 +322,7 @@ impl FinalityState {
             // stake evaporates, so recovery time is bounded instead of
             // drifting with the size of the absent fraction.
             let t = (since_finality - INACTIVITY_LEAK_THRESHOLD_EPOCHS) as u128;
-            for v in votes.committee {
+            for v in votes.active_set {
                 if valid.contains_key(&v.index) {
                     continue; // cast a valid vote — spared, even on a losing target's epoch
                 }
@@ -395,7 +412,7 @@ mod tests {
         let atts = [vote(0, 1, root(1), genesis())];
         let mut st = FinalityState::new(genesis());
         let out = st
-            .process_epoch(&EpochVotes { epoch: 1, committee: &committee, attestations: &atts })
+            .process_epoch(&EpochVotes { epoch: 1, active_set: &committee, attestations: &atts })
             .unwrap();
         assert_eq!(out.justified, Some(Checkpoint { epoch: 1, root: root(1) }));
         assert!(st.is_justified(&Checkpoint { epoch: 1, root: root(1) }));
@@ -408,7 +425,7 @@ mod tests {
         let atts = [vote(0, 1, root(1), genesis())];
         let mut st = FinalityState::new(genesis());
         let out = st
-            .process_epoch(&EpochVotes { epoch: 1, committee: &committee, attestations: &atts })
+            .process_epoch(&EpochVotes { epoch: 1, active_set: &committee, attestations: &atts })
             .unwrap();
         assert_eq!(out.justified, None);
         assert_eq!(st.current_justified(), genesis());
@@ -423,7 +440,7 @@ mod tests {
             let atts = [vote(0, 1, root(1), genesis())];
             let mut st = FinalityState::new(genesis());
             let out = st
-                .process_epoch(&EpochVotes { epoch: 1, committee: &committee, attestations: &atts })
+                .process_epoch(&EpochVotes { epoch: 1, active_set: &committee, attestations: &atts })
                 .unwrap();
             assert_eq!(out.justified.is_some(), expect, "attesting={attesting}");
         }
@@ -438,7 +455,7 @@ mod tests {
         // checkpoint can still be abandoned.
         let a1 = [vote(0, 1, root(1), genesis())];
         let out1 = st
-            .process_epoch(&EpochVotes { epoch: 1, committee: &committee, attestations: &a1 })
+            .process_epoch(&EpochVotes { epoch: 1, active_set: &committee, attestations: &a1 })
             .unwrap();
         assert!(out1.justified.is_some());
         assert_eq!(out1.finalized, None);
@@ -449,7 +466,7 @@ mod tests {
         let cp1 = st.current_justified();
         let a2 = [vote(0, 2, root(2), cp1)];
         let out2 = st
-            .process_epoch(&EpochVotes { epoch: 2, committee: &committee, attestations: &a2 })
+            .process_epoch(&EpochVotes { epoch: 2, active_set: &committee, attestations: &a2 })
             .unwrap();
         assert_eq!(out2.finalized, Some(cp1));
         assert_eq!(st.finalized(), cp1);
@@ -461,13 +478,13 @@ mod tests {
         let mut st = FinalityState::new(genesis());
 
         // Epoch 1: nobody votes.
-        st.process_epoch(&EpochVotes { epoch: 1, committee: &committee, attestations: &[] })
+        st.process_epoch(&EpochVotes { epoch: 1, active_set: &committee, attestations: &[] })
             .unwrap();
         // Epoch 2 justifies with source = genesis (link 0 → 2): a valid
         // supermajority link, but NOT consecutive — nothing may finalize.
         let a2 = [vote(0, 2, root(2), genesis())];
         let out = st
-            .process_epoch(&EpochVotes { epoch: 2, committee: &committee, attestations: &a2 })
+            .process_epoch(&EpochVotes { epoch: 2, active_set: &committee, attestations: &a2 })
             .unwrap();
         assert!(out.justified.is_some());
         assert_eq!(out.finalized, None);
@@ -479,14 +496,14 @@ mod tests {
         let committee = [validator(0, 2), validator(1, 1)];
         let mut st = FinalityState::new(genesis());
         let a1 = [vote(0, 1, root(1), genesis())];
-        st.process_epoch(&EpochVotes { epoch: 1, committee: &committee, attestations: &a1 })
+        st.process_epoch(&EpochVotes { epoch: 1, active_set: &committee, attestations: &a1 })
             .unwrap();
 
         // Epoch 2 votes still sourcing genesis, but checkpoint 1 is now the
         // highest justified checkpoint — the uniform-link rule rejects them.
         let a2 = [vote(0, 2, root(2), genesis())];
         let out = st
-            .process_epoch(&EpochVotes { epoch: 2, committee: &committee, attestations: &a2 })
+            .process_epoch(&EpochVotes { epoch: 2, active_set: &committee, attestations: &a2 })
             .unwrap();
         assert_eq!(out.justified, None);
     }
@@ -498,7 +515,7 @@ mod tests {
         let atts = [vote(0, 1, root(1), bogus)];
         let mut st = FinalityState::new(genesis());
         let out = st
-            .process_epoch(&EpochVotes { epoch: 1, committee: &committee, attestations: &atts })
+            .process_epoch(&EpochVotes { epoch: 1, active_set: &committee, attestations: &atts })
             .unwrap();
         assert_eq!(out.justified, None);
     }
@@ -512,7 +529,7 @@ mod tests {
         let atts = [vote(0, 1, root(1), genesis()), vote(99, 1, root(1), genesis())];
         let mut st = FinalityState::new(genesis());
         let out = st
-            .process_epoch(&EpochVotes { epoch: 1, committee: &committee, attestations: &atts })
+            .process_epoch(&EpochVotes { epoch: 1, active_set: &committee, attestations: &atts })
             .unwrap();
         assert_eq!(out.justified, None);
     }
@@ -531,7 +548,7 @@ mod tests {
         ];
         let mut st = FinalityState::new(genesis());
         let out = st
-            .process_epoch(&EpochVotes { epoch: 1, committee: &committee, attestations: &atts })
+            .process_epoch(&EpochVotes { epoch: 1, active_set: &committee, attestations: &atts })
             .unwrap();
         assert_eq!(out.equivocators, vec![2]);
         // Without C, X has 200/300 — still exactly 2/3, justified; but Y must
@@ -556,7 +573,7 @@ mod tests {
         ];
         let mut st = FinalityState::new(genesis());
         let out = st
-            .process_epoch(&EpochVotes { epoch: 1, committee: &committee, attestations: &atts })
+            .process_epoch(&EpochVotes { epoch: 1, active_set: &committee, attestations: &atts })
             .unwrap();
         assert_eq!(out.justified, None);
         assert_eq!(out.equivocators, vec![0, 1, 2]);
@@ -571,7 +588,7 @@ mod tests {
         let atts = [v, v]; // gossip duplication
         let mut st = FinalityState::new(genesis());
         let out = st
-            .process_epoch(&EpochVotes { epoch: 1, committee: &committee, attestations: &atts })
+            .process_epoch(&EpochVotes { epoch: 1, active_set: &committee, attestations: &atts })
             .unwrap();
         assert!(out.equivocators.is_empty());
         assert_eq!(out.justified, Some(Checkpoint { epoch: 1, root: root(1) }));
@@ -586,14 +603,14 @@ mod tests {
         let mut st = FinalityState::new(genesis());
         for e in 1..=INACTIVITY_LEAK_THRESHOLD_EPOCHS {
             let atts = [vote(0, e, root(e as u8), genesis())];
-            st.process_epoch(&EpochVotes { epoch: e, committee: &committee, attestations: &atts })
+            st.process_epoch(&EpochVotes { epoch: e, active_set: &committee, attestations: &atts })
                 .unwrap();
             assert_eq!(st.leaked_of(1), 0, "no leak within the threshold (epoch {e})");
         }
         // First epoch strictly beyond the threshold leaks the absentees only.
         let e = INACTIVITY_LEAK_THRESHOLD_EPOCHS + 1;
         let atts = [vote(0, e, root(0x77), genesis())];
-        st.process_epoch(&EpochVotes { epoch: e, committee: &committee, attestations: &atts })
+        st.process_epoch(&EpochVotes { epoch: e, active_set: &committee, attestations: &atts })
             .unwrap();
         assert!(st.leaked_of(1) > 0);
         assert!(st.leaked_of(2) > 0);
@@ -613,7 +630,7 @@ mod tests {
             let src = st.current_justified();
             let atts = [vote(0, e, root(e as u8), src)];
             let out = st
-                .process_epoch(&EpochVotes { epoch: e, committee: &committee, attestations: &atts })
+                .process_epoch(&EpochVotes { epoch: e, active_set: &committee, attestations: &atts })
                 .unwrap();
             if out.finalized.is_some() {
                 recovered_at = Some(e);
@@ -640,14 +657,14 @@ mod tests {
         let committee = [validator(0, 10)];
         let mut st = FinalityState::new(genesis());
         for e in 1..=30u64 {
-            st.process_epoch(&EpochVotes { epoch: e, committee: &committee, attestations: &[] })
+            st.process_epoch(&EpochVotes { epoch: e, active_set: &committee, attestations: &[] })
                 .unwrap();
         }
         assert_eq!(st.leaked_of(0), 10);
         // Now a vote arrives from the fully-leaked validator: zero weight.
         let atts = [vote(0, 31, root(9), genesis())];
         let out = st
-            .process_epoch(&EpochVotes { epoch: 31, committee: &committee, attestations: &atts })
+            .process_epoch(&EpochVotes { epoch: 31, active_set: &committee, attestations: &atts })
             .unwrap();
         assert_eq!(out.justified, None);
     }
@@ -661,9 +678,9 @@ mod tests {
         let cp1 = Checkpoint { epoch: 1, root: root(1) };
         let a2 = [vote(0, 2, root(2), cp1)];
         let history = [
-            EpochVotes { epoch: 1, committee: &committee, attestations: &a1 },
-            EpochVotes { epoch: 2, committee: &committee, attestations: &a2 },
-            EpochVotes { epoch: 3, committee: &committee, attestations: &[] },
+            EpochVotes { epoch: 1, active_set: &committee, attestations: &a1 },
+            EpochVotes { epoch: 2, active_set: &committee, attestations: &a2 },
+            EpochVotes { epoch: 3, active_set: &committee, attestations: &[] },
         ];
 
         let mut incremental = FinalityState::new(genesis());
@@ -680,13 +697,13 @@ mod tests {
         let committee = [validator(0, 1)];
         let mut st = FinalityState::new(genesis());
         assert_eq!(
-            st.process_epoch(&EpochVotes { epoch: 3, committee: &committee, attestations: &[] }),
+            st.process_epoch(&EpochVotes { epoch: 3, active_set: &committee, attestations: &[] }),
             Err(FinalityError::OutOfOrderEpoch { got: 3, expected: 1 }),
         );
-        st.process_epoch(&EpochVotes { epoch: 1, committee: &committee, attestations: &[] })
+        st.process_epoch(&EpochVotes { epoch: 1, active_set: &committee, attestations: &[] })
             .unwrap();
         assert_eq!(
-            st.process_epoch(&EpochVotes { epoch: 1, committee: &committee, attestations: &[] }),
+            st.process_epoch(&EpochVotes { epoch: 1, active_set: &committee, attestations: &[] }),
             Err(FinalityError::OutOfOrderEpoch { got: 1, expected: 2 }),
         );
     }
@@ -699,8 +716,58 @@ mod tests {
         let atts = [vote(0, 1, root(1), genesis()), vote(1, 1, root(1), genesis())];
         let mut st = FinalityState::new(genesis());
         let out = st
-            .process_epoch(&EpochVotes { epoch: 1, committee: &committee, attestations: &atts })
+            .process_epoch(&EpochVotes { epoch: 1, active_set: &committee, attestations: &atts })
             .unwrap();
         assert_eq!(out.justified, Some(Checkpoint { epoch: 1, root: root(1) }));
     }
+}
+
+// ── Wiring to the partition ─────────────────────────────────────────────────
+
+/// Build [`EpochVotes`] from the epoch's **partition**, checking each attester
+/// against the committee of *its own slot*.
+///
+/// This is the function that connects [`crate::committees`] to this gadget.
+/// Without it the partition was a module with no caller: the fix for finding
+/// F1 existed, was tested, was written up as done — and changed nothing,
+/// because nothing invoked it (adversarial review G1, 2026-08-11). A
+/// correction that is not wired is not a correction.
+///
+/// Two things it enforces that a flat committee list cannot:
+///
+/// 1. **The denominator is the whole active set.** Justification needs two
+///    thirds of total active stake, not two thirds of a sample — the reading
+///    under which a ~30% adversary stalls finality roughly one epoch in five.
+/// 2. **Membership is slot-specific.** An attester must be in the committee of
+///    the slot it attests for, not merely somewhere in the epoch. Accepting a
+///    vote from the wrong slot's committee would let a validator vote in every
+///    slot it can reach, which is the double-vote hazard partitioning exists to
+///    remove.
+///
+/// Attestations failing either check are dropped here rather than passed on as
+/// "absent": an out-of-slot vote is a protocol violation, not a missed duty,
+/// and counting it as absence would leak stake from an honest validator whose
+/// vote merely arrived mislabelled.
+pub fn votes_from_partition<'a>(
+    epoch: u64,
+    active_set: &'a [Validator],
+    attestations: &'a [(u32, AttestationData)],
+    beacon_mix: &[u8; 32],
+    accepted: &'a mut Vec<(u32, AttestationData)>,
+) -> EpochVotes<'a> {
+    let committees = crate::committees::epoch_committees(beacon_mix, epoch, active_set);
+    let slots_per_epoch = crate::params::SLOTS_PER_EPOCH;
+
+    accepted.clear();
+    for (validator, data) in attestations {
+        let idx = (data.slot % slots_per_epoch) as usize;
+        let in_own_slot = committees
+            .get(idx)
+            .is_some_and(|c| c.binary_search(validator).is_ok());
+        if in_own_slot {
+            accepted.push((*validator, *data));
+        }
+    }
+
+    EpochVotes { epoch, active_set, attestations: accepted }
 }

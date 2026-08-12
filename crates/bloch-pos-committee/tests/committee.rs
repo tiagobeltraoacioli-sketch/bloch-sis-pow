@@ -1346,3 +1346,80 @@ fn the_cap_engages_once_independent_stake_arrives() {
     assert!(share <= COHORT_CAP_FLOOR_BPS + 1, "coorte em {share}bps");
     assert!(out.iter().map(|v| v.effective_stake as u128).sum::<u128>() > 0);
 }
+
+#[test]
+fn the_f1_attack_no_longer_works() {
+    // F1: com comite AMOSTRADO de 128 e quorum sobre o stake DO COMITE, um
+    // adversario com ~30% do stake da rede passa de 1/3 do comite por variancia
+    // amostral em cerca de uma epoca a cada cinco, e trava a finalidade.
+    //
+    // Sob particao isso deixa de existir por construcao: a uniao dos comites da
+    // epoca E o conjunto ativo, entao o denominador e o stake total da rede e a
+    // fatia do adversario no denominador e exatamente a fatia dele na rede —
+    // sem variancia para explorar.
+    use bloch_pos_committee::committees::{epoch_committees, total_active_stake};
+
+    let mut vs: Vec<Validator> = (0..300u32)
+        .map(|i| Validator { index: i, effective_stake: 100_000 })
+        .collect();
+    // Adversario com ~30% do stake espalhado em 128 registros.
+    for i in 0..128u32 {
+        vs.push(Validator { index: 1000 + i, effective_stake: 100_000 });
+    }
+    let adversary: std::collections::HashSet<u32> = (1000..1128).collect();
+    let total = total_active_stake(&vs);
+
+    // Sob particao, a fatia do adversario no DENOMINADOR e estavel em toda
+    // epoca — nao ha sorteio de onde ele possa sair melhor.
+    let adv_stake: u128 = vs.iter()
+        .filter(|v| adversary.contains(&v.index))
+        .map(|v| v.effective_stake as u128).sum();
+    let share = adv_stake * 10_000 / total;
+
+    for epoch in 0..40u64 {
+        let cs = epoch_committees(&MIX, epoch, &vs);
+        // Toda epoca: uniao == conjunto ativo, entao o denominador nao varia.
+        let seats: usize = cs.iter().map(|c| c.len()).sum();
+        assert_eq!(seats, vs.len(), "epoca {epoch}: a uniao deixou de ser o conjunto");
+        let adv_seats: usize = cs.iter().flatten().filter(|v| adversary.contains(v)).count();
+        assert_eq!(adv_seats, 128, "epoca {epoch}: assentos do adversario variaram");
+    }
+
+    // E a fatia dele fica abaixo de 1/3, entao ele nao trava nada — em NENHUMA
+    // epoca, nao "na maioria delas".
+    assert!(share < 3_333, "adversario com {share}bps do denominador");
+}
+
+#[test]
+fn out_of_slot_attestations_are_dropped_not_counted_absent() {
+    // O wiring so vale se ele conferir o comite DO SLOT, nao "algum comite da
+    // epoca". Um voto do slot errado seria voto em todo slot alcancavel, que e
+    // exatamente o risco de duplo voto que a particao existe para remover.
+    use bloch_pos_committee::committees::epoch_committees;
+    use bloch_pos_committee::finality::votes_from_partition;
+
+    let vs: Vec<Validator> = (0..200u32)
+        .map(|i| Validator { index: i, effective_stake: 100_000 })
+        .collect();
+    let epoch = 3u64;
+    let cs = epoch_committees(&MIX, epoch, &vs);
+
+    // Um validador do comite do slot 0, votando pelo slot 0 (valido) e pelo
+    // slot 1 (invalido — nao e o comite dele).
+    let v = cs[0][0];
+    let base = AttestationData {
+        slot: epoch * SLOTS_PER_EPOCH,
+        head: [1u8; 32],
+        source_epoch: epoch - 1, source_root: [2u8; 32],
+        target_epoch: epoch, target_root: [3u8; 32],
+    };
+    let wrong = AttestationData { slot: base.slot + 1, ..base };
+    let atts = vec![(v, base), (v, wrong)];
+
+    let mut buf = Vec::new();
+    let out = votes_from_partition(epoch, &vs, &atts, &MIX, &mut buf);
+    assert_eq!(out.attestations.len(), 1, "voto de slot alheio foi aceito");
+    assert_eq!(out.attestations[0].1.slot, base.slot);
+    // E o denominador continua sendo o conjunto ativo INTEIRO.
+    assert_eq!(out.active_set.len(), 200);
+}

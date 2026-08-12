@@ -18,11 +18,18 @@
 > `BLOCH-TOKENOMICS-V4.md` e `BLOCH-POS-SHA3-LATTICE-MIGRATION.md`, que sao
 > os normativos.
 >
-> Dois achados deste documento **ja foram corrigidos** e os testes fixam a
+> Dois achados deste documento ja foram corrigidos e os testes fixam a
 > correcao: **F1** (quorum de finalidade sem denominador coerente) pela particao
-> do conjunto ativo, e **F2** (validador honesto se auto-slashando, porque
-> sorteios independentes por slot o punham em varios slots da mesma epoca) pela
-> mesma mudanca. **F3** (o teto de warm-up contornavel pela escapatoria de
+> do conjunto ativo, e **F2** (validador honesto se auto-slashando) pela mesma
+> mudanca.
+>
+> **Correcao a este selo (2026-08-11, segunda revisao).** A frase acima esteve
+> errada por algumas horas. A particao existia como modulo, testada, mas **sem
+> um unico chamador** — o gadget de finalidade seguia documentando o comite
+> AMOSTRADO, e portanto F1 seguia aberto na pratica. Uma correcao que nao esta
+> ligada nao e uma correcao, e um selo dizendo o contrario e pior que nenhum
+> selo. Ligada em `finality::votes_from_partition`; F1 e F2 agora fechados de
+> verdade. **F3** (o teto de warm-up contornavel pela escapatoria de
 > liveness) foi corrigido com ativacao parcial. O **gap de bootstrap do genesis**
 > foi respondido com conjunto de validadores no genesis. Os achados medios —
 > F4 a F8 — continuam abertos, e o F4/F5 sobre taint perdeu o objeto.
