@@ -596,6 +596,37 @@ The honest limit: those metrics see the *operator* view, which is what consensus
 sees. They cannot see one beneficial owner standing behind several delegators,
 and no on-chain metric can.
 
+#### What a delegator risks — read this before delegating
+
+"Exposed to slashing, pro-rata" (rule 3 above) is not an abstraction. Wired
+end-to-end in the state transition
+(`transition.rs::apply_slashing_evidence` → `slashing.rs` → `delegation.rs::apply_slash`),
+it means concretely:
+
+- **If your operator provably equivocates — two signed headers for one slot,
+  a double vote, or a surround vote — you lose coins**, in the same
+  proportion as the operator's own bond. The base rate is
+  `SLASH_PROPOSER_EQUIV_BPS` / `SLASH_SURROUND_VOTE_BPS` (slashing.rs); when
+  many validators are slashed inside one `CORRELATION_WINDOW_EPOCHS` window
+  the rate is amplified by `CORRELATION_MULTIPLIER` up to **the entire
+  delegated amount** — coordinated attacks are priced to forfeit everything,
+  and your coins sit in that blast radius if you delegated to a participant.
+- **The loss applies to bonded coins in every lifecycle state except
+  withdrawn.** A delegation still warming up, or draining through cool-down,
+  is still bonded and still slashable. Only stake that has completed
+  cool-down before the evidence lands is out of reach — and cool-down takes
+  `COOLDOWN_EPOCHS` plus the churn-limited drain, by design.
+- **The loss is committed on-chain the moment the evidence transaction is
+  included**, in a per-account ledger
+  (`CommittedState::delegator_slash_loss_sat`); wallets net it out of your
+  bonded amount at withdrawal. There is no appeal path: evidence is two
+  signatures your operator provably made, re-verified by every node.
+- **You are not punished for the operator's mere downtime** — an offline
+  operator forfeits rewards (yours included), but only provable equivocation
+  burns principal. Choosing an operator is therefore a real decision: the
+  yield is priced by the risk that the operator's keys are mismanaged, and
+  that risk is yours by rule 3, on purpose.
+
 ### 6.3.2 Fee policy — decided: two eras
 
 | Era | Base fee | Priority fee |

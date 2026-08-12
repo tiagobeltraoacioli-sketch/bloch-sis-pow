@@ -68,7 +68,14 @@ impl AttestationData {
 }
 
 /// A signed attestation as it travels on the wire.
-#[derive(Clone, Debug)]
+///
+/// `PartialEq`/`Eq` exist because an attestation rides inside
+/// [`crate::interfaces::SlashingEvidence`], which rides inside the node's
+/// transaction type — and transaction types are compared in tests and dedup
+/// paths. Equality is structural (data, validator, signature bytes); it is
+/// NOT the anti-replay identity of evidence, which deliberately excludes
+/// signature bytes (`slashing::SlashingEvidence::id`).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Attestation {
     pub data: AttestationData,
     /// Index into the active validator registry.
