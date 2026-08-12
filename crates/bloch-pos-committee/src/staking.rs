@@ -78,9 +78,23 @@ pub const MLDSA65_SIG_BYTES: usize = 3309;
 /// to the values it scales.
 pub const SAT_PER_BLOCH: u128 = crate::tokenomics_v4::SAT_PER_BLOCH;
 
-/// Minimum deposit: 100,000 BLCH (§5.1) — sized so a validator set of ~1,000
-/// is reachable from the realistic independent float, not from a round number.
-pub const MIN_DEPOSIT_SAT: u128 = 100_000 * SAT_PER_BLOCH;
+/// Minimum deposit: 25,000 BLCH (founder decision, 2026-08-12; was 100,000
+/// under the 21 B supply).
+///
+/// Sized against Ethereum's bond as a fraction of supply: 32 ETH is 2.66e-7 of
+/// ETH's ~120.45 M supply, and the same fraction of the 100 B supply is
+/// ~26,567 BLCH. Rounded **down** to 25,000 — exactly `supply / 4,000,000` —
+/// on purpose: down is cheaper, and cheaper widens who *may* validate, which
+/// is the only direction a rounding choice on a bond should ever err. A pure
+/// x100/21 split of the old 100,000 floor would have landed at 476,190.47
+/// (not an integer, and 19x the Ethereum-equivalent bond), so this constant
+/// deliberately does NOT follow the split — it is re-derived from the
+/// benchmark instead.
+///
+/// Honest scope, from the CertiK brief: lowering the bond widens who MAY
+/// validate and does nothing about who DOES. It is not a fix for stake
+/// concentration and must not be described as one.
+pub const MIN_DEPOSIT_SAT: u128 = 25_000 * SAT_PER_BLOCH;
 
 /// Epochs between a deposit being included and it becoming eligible for the
 /// activation queue (§5.1: ~2.1 h). Exists so the validator set used by epoch

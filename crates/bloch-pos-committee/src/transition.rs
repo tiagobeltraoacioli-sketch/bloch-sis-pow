@@ -435,6 +435,23 @@ pub struct CommittedState {
     /// The node's execution layer computes it; this transition only commits
     /// it, exactly like the Coherence roots above.
     evm: EvmCommitment,
+    /// Cumulative issued supply in satoshis — the hard-cap invariant's
+    /// counter (2026-08-12), committed under `TAG_ISSUED_SUPPLY`.
+    ///
+    /// Seeded at genesis with `tokenomics_v4::GENESIS_ISSUED_SAT` (everything
+    /// but the validator emission exists from slot 0) and advanced only at
+    /// epoch boundaries, by the satoshis `close_epoch` actually credits —
+    /// which is less than the curve when validators miss attestations
+    /// (forfeited slices are never minted) or when `rewards::distribute`
+    /// truncates. That data-dependence is why the counter is committed
+    /// instead of derived from the epoch number: underivable-from-headers is
+    /// the §5.5 bar for state-root membership.
+    ///
+    /// Gross and monotone: fees move existing coins, whistleblower rewards
+    /// come out of slashed bonds, and burns never decrement the counter —
+    /// they widen the gap below the cap, and the invariant is one-sided
+    /// (`issued_sat <= TOTAL_SUPPLY_SAT`, enforced in `compute_post_state`).
+    issued_sat: u128,
 }
 
 impl CommittedState {
@@ -510,6 +527,7 @@ impl CommittedState {
             coherence_accumulator_root,
             coherence_nullifier_root,
             evm,
+            issued_sat: tokenomics_v4::GENESIS_ISSUED_SAT,
         };
         // Seed epoch 0's participation for the launch roster, so the
         // committed participation component is well-defined from block one.
@@ -777,6 +795,7 @@ impl CommittedState {
             coherence_accumulator_root: self.coherence_accumulator_root,
             coherence_nullifier_root: self.coherence_nullifier_root,
             evm: self.evm,
+            issued_sat: self.issued_sat,
         })
     }
 
@@ -1151,6 +1170,17 @@ impl CommittedState {
         for s in first_slot..first_slot + SLOTS_PER_EPOCH {
             epoch_issuance += tokenomics_v4::validator_reward_decay_sat(s);
         }
+        // The hard cap, applied at the source (2026-08-12): issuance is
+        // clamped to the remaining headroom, so emission STOPS at the cap
+        // instead of crossing it. The clamp never binds under the shipped
+        // curve — the 40-year decay sum is the allocation minus a pinned dust
+        // (`tokenomics_v4::EMISSION_DUST_SAT`) — but the cap must not depend
+        // on the curve staying that way: with the clamp, no curve edit can
+        // mint past `TOTAL_SUPPLY_SAT` without also getting past the
+        // `SupplyCapExceeded` check in `compute_post_state`, which reads the
+        // committed counter, not the curve.
+        let headroom = tokenomics_v4::TOTAL_SUPPLY_SAT.saturating_sub(st.issued_sat);
+        let epoch_issuance = if epoch_issuance > headroom { headroom } else { epoch_issuance };
         let total_stake: u128 = roster.iter().map(|v| v.effective_stake as u128).sum();
         if total_stake > 0 {
             for v in &roster {
@@ -1175,6 +1205,15 @@ impl CommittedState {
                 if payout.operator > 0 {
                     if let Some(rec) = st.validators.get_mut(&v.index) {
                         rec.staked_sat += payout.operator;
+                        // The committed counter advances by what was MINTED,
+                        // not by what the curve offered: forfeited slices and
+                        // distribute()'s truncation dust never become coins,
+                        // and a counter that overstated real issuance would
+                        // hit the cap early — wrong in the direction that
+                        // punishes honest validators. Bounded by
+                        // `epoch_issuance <= headroom`, so it cannot pass the
+                        // cap (pinned by `emission_stops_at_the_cap`).
+                        st.issued_sat += payout.operator;
                     }
                 }
             }
@@ -1379,6 +1418,25 @@ impl<V: SignatureVerifier> Transition<V> {
         let mut st = pre.clone();
         while st.epoch < block_epoch {
             st = st.close_epoch();
+        }
+
+        // 3c. THE HARD CAP IS A CONSENSUS INVARIANT (founder decision,
+        // 2026-08-12): a block whose committed cumulative issuance exceeds
+        // `TOTAL_SUPPLY_SAT` is invalid, on every node, with its own error.
+        // After the boundary roll and before anything expensive — it is one
+        // integer comparison. `close_epoch` clamps issuance to the remaining
+        // headroom, so this cannot fire on a state this transition produced;
+        // what it refuses is a PRE-state that already claims issuance beyond
+        // the cap (a forged snapshot, a corrupted state-sync payload, a
+        // foreign chain's state). Building on such a state would propagate
+        // the violation under an honest node's signature — refusing is the
+        // whole point of making the cap an invariant instead of a property
+        // the curve happens to have. The counter is committed
+        // (`TAG_ISSUED_SUPPLY`), so two nodes cannot disagree about how much
+        // has been issued while their roots agree — the §5.5 rule, applied
+        // to the cap itself.
+        if st.issued_sat > tokenomics_v4::TOTAL_SUPPLY_SAT {
+            return Err(TransitionError::SupplyCapExceeded);
         }
 
         let roster = st.duty_roster();
@@ -2838,4 +2896,143 @@ mod tests {
         assert_ne!(s1.compute_root(), g.compute_root());
     }
 
+    // ── The hard cap as a consensus invariant (2026-08-12) ──────────────────
+
+    /// A pre-state whose committed issuance exceeds the cap is refused — with
+    /// its own error, before any signature work. This is the case the check
+    /// exists for: the transition's own arithmetic clamps at the cap, so an
+    /// over-cap state can only arrive from outside (a forged snapshot, a
+    /// corrupted sync), and an honest node must refuse to extend it rather
+    /// than launder it under a valid block.
+    #[test]
+    fn block_on_a_state_beyond_the_cap_is_rejected() {
+        let (t, g, mut chains) = setup(4);
+        // The block itself is honest — built against the honest state...
+        let b1 = build_block(&t, &g, 1, &[], &[], &mut chains);
+        // ...but the state it is applied to claims one satoshi too many.
+        let mut over = g.clone();
+        over.issued_sat = tokenomics_v4::TOTAL_SUPPLY_SAT + 1;
+        assert_eq!(
+            t.compute_post_state(&over, &b1, &[], &[]).unwrap_err(),
+            TransitionError::SupplyCapExceeded,
+        );
+    }
+
+    /// Exactly at the cap is VALID: the invariant is `issued <= cap`, and a
+    /// chain that has emitted its entire supply keeps producing (fee-only)
+    /// blocks forever. An off-by-one here would halt the chain at the exact
+    /// moment the emission schedule completes.
+    #[test]
+    fn block_exactly_at_the_cap_is_accepted() {
+        let (t, g, mut chains) = setup(4);
+        let mut at_cap = g.clone();
+        at_cap.issued_sat = tokenomics_v4::TOTAL_SUPPLY_SAT;
+        let b1 = build_block(&t, &at_cap, 1, &[], &[], &mut chains);
+        let s1 = t.apply_block(&at_cap, &b1, &[], &[]).expect("at-cap block rejected");
+        assert_eq!(s1.issued_sat, tokenomics_v4::TOTAL_SUPPLY_SAT, "no issuance may follow");
+    }
+
+    /// Emission stops at the cap: an epoch boundary crossed with zero
+    /// headroom credits nothing, and a boundary crossed with less headroom
+    /// than the curve offers credits at most the headroom. Fees still flow —
+    /// the cap ends issuance, not the chain.
+    #[test]
+    fn emission_stops_at_the_cap() {
+        // Epoch 1, not 0: an epoch-0 attestation cannot exist (source epoch 0
+        // is not < target epoch 0), and without attestations nobody earns, so
+        // the assertion would be vacuous.
+        let slot_last = 2 * SLOTS_PER_EPOCH - 1;
+
+        // Zero headroom: the boundary must mint nothing at all.
+        let (t, g, mut chains) = setup(4);
+        let mut at_cap = t.process_epoch(&g).unwrap();
+        at_cap.issued_sat = tokenomics_v4::TOTAL_SUPPLY_SAT;
+        // Full participation, so every validator WOULD earn if headroom allowed.
+        let atts = full_epoch_attestations(&at_cap, *at_cap.head.as_bytes());
+        let b = build_block(&t, &at_cap, slot_last, &atts, &[], &mut chains);
+        let s = t.apply_block(&at_cap, &b, &atts, &[]).unwrap();
+        let bonded_before: u128 = at_cap.validators.values().map(|r| r.staked_sat).sum();
+        let rolled = t.process_epoch(&s).unwrap();
+        let bonded_after: u128 = rolled.validators.values().map(|r| r.staked_sat).sum();
+        assert_eq!(bonded_after, bonded_before, "issuance was minted past the cap");
+        assert_eq!(rolled.issued_sat, tokenomics_v4::TOTAL_SUPPLY_SAT);
+
+        // Partial headroom: the boundary credits at most the headroom, never
+        // the full curve amount, and lands at the cap or under it.
+        let (t2, g2, mut chains2) = setup(4);
+        let headroom: u128 = 1_000; // far below the epoch's curve issuance
+        let mut near_cap = t2.process_epoch(&g2).unwrap();
+        near_cap.issued_sat = tokenomics_v4::TOTAL_SUPPLY_SAT - headroom;
+        let atts2 = full_epoch_attestations(&near_cap, *near_cap.head.as_bytes());
+        let b2 = build_block(&t2, &near_cap, slot_last, &atts2, &[], &mut chains2);
+        let s2 = t2.apply_block(&near_cap, &b2, &atts2, &[]).unwrap();
+        let rolled2 = t2.process_epoch(&s2).unwrap();
+        assert!(
+            rolled2.issued_sat <= tokenomics_v4::TOTAL_SUPPLY_SAT,
+            "the boundary crossed the cap: {}",
+            rolled2.issued_sat
+        );
+        assert!(
+            rolled2.issued_sat > near_cap.issued_sat,
+            "with headroom left, the boundary must still mint"
+        );
+        // And the next block on that chain is still valid: the cap ends
+        // issuance, not the chain.
+        let b3 = build_block(&t2, &rolled2, slot_last + 2, &[], &[], &mut chains2);
+        assert!(t2.apply_block(&rolled2, &b3, &[], &[]).is_ok(), "chain must outlive emission");
+    }
+
+    /// No path in this crate can raise the cap. What a test CAN prove, it
+    /// proves; what only the type system proves, it names:
+    ///
+    /// - `TOTAL_SUPPLY_SAT` is a `const` — there is no setter, no config
+    ///   field, no genesis parameter that feeds it; the reference below is a
+    ///   compile-time constant expression, which is the proof.
+    /// - The transaction enum is matched EXHAUSTIVELY here with no wildcard
+    ///   arm, so adding a variant (the only in-protocol road to a mint or a
+    ///   cap change) fails this test's compilation and forces a human through
+    ///   this comment.
+    /// - Issuance is monotone and cap-bounded across boundaries (checked).
+    ///
+    /// Honest limit, stated as in the spec: this pins that no mechanism
+    /// INSIDE the protocol changes the cap. A hard fork adopted by every
+    /// operator can change any rule — the claim "impossible to alter" would
+    /// be false, and this test does not make it.
+    #[test]
+    fn no_in_protocol_path_can_raise_the_cap() {
+        // Const, pinned by value: 100 B BLCH at 8 decimals.
+        const CAP: u128 = tokenomics_v4::TOTAL_SUPPLY_SAT;
+        assert_eq!(CAP, 10_000_000_000_000_000_000);
+
+        // Exhaustive match, no `_` arm: every transaction the protocol can
+        // carry is enumerated, and none of them is a mint or a cap edit —
+        // Transfer moves existing coins and pays fees from them, Deposit and
+        // Delegate bond existing coins, Exit unbonds them, evidence burns.
+        let witness = PosTransaction::Exit { validator: 0 };
+        match &witness {
+            PosTransaction::Transfer { .. } => {}
+            PosTransaction::Deposit { .. } => {}
+            PosTransaction::Exit { .. } => {}
+            PosTransaction::Delegate { .. } => {}
+            PosTransaction::SlashingEvidence(_) => {}
+        }
+
+        // Monotone under blocks and boundaries, and never above the cap.
+        // Epoch 1, because epoch-0 attestations cannot exist (source 0 is not
+        // < target 0) and unattested validators earn nothing.
+        let (t, g, mut chains) = setup(4);
+        assert_eq!(g.issued_sat, tokenomics_v4::GENESIS_ISSUED_SAT);
+        let e1 = t.process_epoch(&g).unwrap();
+        assert_eq!(e1.issued_sat, g.issued_sat, "epoch 0 had no attesters, so no issuance");
+        let atts = full_epoch_attestations(&e1, *e1.head.as_bytes());
+        let b = build_block(&t, &e1, 2 * SLOTS_PER_EPOCH - 1, &atts, &[], &mut chains);
+        let s = t.apply_block(&e1, &b, &atts, &[]).unwrap();
+        assert_eq!(s.issued_sat, e1.issued_sat, "a block mid-epoch must not issue");
+        let rolled = t.process_epoch(&s).unwrap();
+        assert!(rolled.issued_sat >= s.issued_sat, "issuance regressed");
+        assert!(rolled.issued_sat <= CAP);
+        // The boundary with full participation actually minted something —
+        // otherwise the monotonicity above was checked vacuously.
+        assert!(rolled.issued_sat > s.issued_sat, "fixture minted nothing");
+    }
 }

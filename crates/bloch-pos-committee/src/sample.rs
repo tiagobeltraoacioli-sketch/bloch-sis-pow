@@ -110,7 +110,8 @@ pub fn sample(
         return out;
     }
 
-    // Cumulative stake in u128: 21e9 BLCH × 1e8 sat fits u64, but the running
+    // Cumulative stake in u128: 100e9 BLCH × 1e8 sat fits u64 (barely — 54%
+    // of u64::MAX, see tokenomics_v4's headroom asserts), but the running
     // sum of a large set does not comfortably, and overflow here would be a
     // consensus split.
     let mut cumulative: Vec<u128> = Vec::with_capacity(eligible.len());

@@ -34,7 +34,7 @@
 //!
 //! ## Honest note on decentralisation
 //!
-//! Delegation cuts both ways. It removes the 100,000 BLCH barrier to
+//! Delegation cuts both ways. It removes the 25,000 BLCH deposit barrier to
 //! participation — the minimum delegation is 10 BLCH — but it also lets a large
 //! operator accumulate other people's stake, and it lets one holder spread a
 //! position across many validators while keeping economic control. The
@@ -93,11 +93,27 @@ pub const WARMUP_RATE_BPS: u128 = 25;
 /// delegation is that staking should not require running a node.
 pub const MIN_DELEGATION_SAT: u128 = 10 * SAT_PER_BLOCH;
 
-/// The floor under the per-epoch churn budget: one validator's minimum
-/// deposit. See the floor rationale at the budget computation in
-/// [`Registry::resolve`] — it exists to guarantee a drain terminates, and it
-/// is sized so a young network can still onboard at a usable rate.
-pub const MIN_CHURN_SAT: u128 = crate::staking::MIN_DEPOSIT_SAT;
+/// The floor under the per-epoch churn budget: 500,000 BLCH (2026-08-12; was
+/// an alias of `MIN_DEPOSIT_SAT` = 100,000 under the 21 B supply).
+///
+/// Its own constant now, because the two quantities stopped moving together:
+/// the deposit minimum was re-derived from Ethereum's bond fraction (25,000 —
+/// see `staking::MIN_DEPOSIT_SAT`), while this floor is denominated in
+/// **wall-clock time**, and time does not redenominate. The floor is what
+/// bounds onboarding and drain speed whenever the proportional 25 bps budget
+/// is below it; had it stayed aliased to the new 25,000 minimum, the
+/// floor-bound phase of a bootstrap or a mass exit would take ~19x longer in
+/// hours than it did the day before the split — a real change to the F3
+/// liveness bill smuggled in by a unit change. 500,000 BLCH is the old
+/// floor's wall-clock value carried across the split (100,000 x 100/21 =
+/// 476,190.47, rounded up to the round figure), so every "hours to drain" and
+/// "days to double the set" number in [`WARMUP_RATE_BPS`]'s docs still holds
+/// to within ~5% — and the 5% error is in the faster-onboarding direction.
+///
+/// See the floor rationale at the budget computation in [`Registry::resolve`]
+/// — it exists to guarantee a drain terminates, and it is sized so a young
+/// network can still onboard at a usable rate.
+pub const MIN_CHURN_SAT: u128 = 500_000 * SAT_PER_BLOCH;
 
 /// Per-validator cap as a share of total active stake (§4.1: 1%).
 pub const MAX_VALIDATOR_STAKE_BPS: u128 = 100;
@@ -228,10 +244,10 @@ impl Registry {
                 // `deactivation_drains_gradually_and_completes`, which ran 200
                 // epochs and still found 937,812 sat stuck.
                 //
-                // Any positive floor guarantees termination. The floor is one
-                // VALIDATOR's worth of stake, not one delegation's: at 25 bps
-                // the proportional budget only exceeds 100,000 BLCH once the
-                // active set passes 40M BLCH, so on a young network a 10-BLCH
+                // Any positive floor guarantees termination. The floor is a
+                // wall-clock quantity, not one delegation's worth: at 25 bps
+                // the proportional budget only exceeds 500,000 BLCH once the
+                // active set passes 200M BLCH, so on a young network a 10-BLCH
                 // floor would be the binding constraint and would strangle
                 // onboarding — 10 BLCH per 16 minutes is not a network, it is
                 // a queue. (Ethereum's floor is the same idea at a different
@@ -239,7 +255,9 @@ impl Registry {
                 //
                 // It was `MIN_DELEGATION_SAT` while the rate was 900 bps, where
                 // the floor almost never bound. Lowering the rate 36x is what
-                // makes the floor load-bearing, so the two move together.
+                // makes the floor load-bearing, so the two move together — and
+                // the 2026-08-12 split moved the floor x5 so its wall-clock
+                // value stayed put (see MIN_CHURN_SAT).
                 let rate = total_active * WARMUP_RATE_BPS / 10_000;
                 if rate > MIN_CHURN_SAT { rate } else { MIN_CHURN_SAT }
             };

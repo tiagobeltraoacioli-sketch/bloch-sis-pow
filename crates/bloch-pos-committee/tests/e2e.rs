@@ -411,6 +411,9 @@ mod harness {
             coherence_accumulator_root: COHERENCE_ACC_ROOT,
             coherence_nullifier_root: COHERENCE_NUL_ROOT,
             evm: EVM_COMMITMENT,
+            // This devnet harness pays no issuance, so the counter stays at
+            // its genesis value for the whole run — committed, not omitted.
+            issued_sat: bloch_pos_committee::tokenomics_v4::GENESIS_ISSUED_SAT,
             applied_evidence: &[],
             slash_window: &[],
             delegator_slash_losses: &[],

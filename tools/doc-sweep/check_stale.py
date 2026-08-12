@@ -31,22 +31,45 @@ TOK = os.path.join(ROOT, "crates/bloch-pos-committee/src/tokenomics_v4.rs")
 
 # Superseded values, with what replaced them. Add a row whenever a constant
 # changes — that is the whole maintenance burden.
+#
+# 2026-08-12: o supply voltou a 100 bi como SPLIT PURO x100/21 do cronograma
+# de 21 bi. As linhas que tratavam "100,000,000,000", "10^19 satoshis" e
+# "54.21%" como valores velhos foram REMOVIDAS — esses agora sao os valores
+# vivos — e a era de 21 bi (2026-08-11 a 2026-08-12) entrou como aposentada.
 RETIRED = [
-    ("100,000,000,000",  "supply antigo",            "21,000,000,000"),
-    ("10^19 satoshis",   "supply antigo em sat",     "2.1 x 10^18"),
-    ("54.21%",           "fracao antiga de u64::MAX","11.38%"),
-    ("53,700,000,000",   "alocacao de validador v1", "9,036,115,200"),
-    ("7,566,115,200",    "alocacao de validador v2", "9,036,115,200"),
-    ("3,570,000,000",    "concessao do fundador 17%","2,100,000,000"),
+    ("21,000,000,000",   "supply da era 21 bi",      "100,000,000,000 (split x100/21)"),
+    ("2.1 x 10^18",      "supply em sat da era 21 bi", "10^19 satoshis"),
+    ("11.38%",           "fracao de u64::MAX da era 21 bi", "54.21%"),
+    ("3,773,884,800",    "carryover pre-split",      "17,970,880,000"),
+    ("3,546,175,400",    "maior endereco pre-split", "16,886,549,523"),
+    ("53,700,000,000",   "alocacao de validador v1", "43,029,120,000"),
+    ("7,566,115,200",    "alocacao de validador v2", "43,029,120,000"),
+    ("9,036,115,200",    "alocacao de validador da era 21 bi", "43,029,120,000"),
+    ("2,100,000,000",    "concessao do fundador da era 21 bi", "10,000,000,000"),
+    ("3,570,000,000",    "concessao do fundador 17%","10,000,000,000"),
     ("33.89%",           "total do fundador antigo", "26.89%"),
     ("36.03%",           "share de validador antigo","43.03%"),
-    ("5,181.54",         "decay ano 1 (100 bi)",     "871.90"),
-    ("5,450,564,151",    "emissao ano 1 (100 bi)",   "917,168,073"),
-    ("730.06",           "decay ano 1 (21 bi, 17%)", "871.90"),
-    ("6,387",            "halving R0 (100 bi)",      "1,075"),
-    ("1,276 BLCH",       "flat (100 bi)",            "215 BLCH"),
+    ("5,181.54",         "decay ano 1 (100 bi, rascunho de 08-10)", "4,151.90"),
+    ("5,450,564,151",    "emissao ano 1 (100 bi, rascunho de 08-10)", "4,367,467,018"),
+    ("871.90",           "decay ano 1 da era 21 bi", "4,151.90"),
+    ("917,168,073",      "emissao ano 1 da era 21 bi", "4,367,467,018"),
+    ("730.06",           "decay ano 1 (21 bi, 17%)", "4,151.90"),
+    ("6,387",            "halving R0 (100 bi, rascunho de 08-10)", "5,118"),
+    ("1,074.81",         "halving R0 da era 21 bi",  "5,118.16"),
+    ("1,276 BLCH",       "flat (100 bi, rascunho de 08-10)", "1,022 BLCH"),
+    ("214.75 BLCH",      "flat da era 21 bi",        "1,022.63 BLCH"),
+    ("215 BLCH",         "flat da era 21 bi",        "1,022 BLCH"),
+    ("residual zero",    "afirmacao impossivel sobre a curva de decay", "EMISSION_DUST_SAT = 176,880 sat"),
+    ("zero residual",    "afirmacao impossivel sobre a curva de decay", "EMISSION_DUST_SAT = 176,880 sat"),
     ("300,000,000",      "teto de holders aposentado", "sem teto"),
     ("2-year cliff",     "cliff do fundador antigo", "10-year cliff"),
+    # Bond e churn (2026-08-12): MIN_DEPOSIT 100.000 -> 25.000 BLCH (fracao de
+    # supply do bond da Ethereum, arredondado para baixo); MIN_CHURN deixou de
+    # ser alias e vale 500.000 BLCH (piso em tempo de parede). Autoridade:
+    # staking.rs / delegation.rs.
+    ("100,000 BLCH",     "deposito minimo da era 21 bi", "25,000 BLCH"),
+    ("bond of 100,000",  "deposito minimo da era 21 bi", "25,000 BLCH"),
+    ("MIN_CHURN_SAT (= MIN_DEPOSIT_SAT)", "piso de churn era alias", "MIN_CHURN_SAT = 500,000 BLCH"),
     # Concessao do fundador 17% -> 10% (2026-08-11). Frases estreitas de
     # proposito: "17% founder premine" segue CORRETO nos docs da V2/G3.
     ("new grant is 17%", "concessao do fundador antiga em prosa", "new grant is 10%"),
@@ -71,8 +94,13 @@ RETIRED = [
 
 # Trechos que citam valores antigos DE PROPOSITO, como historico.
 EXEMPT = ("earlier draft", "an earlier version", "was wrong", "superseded",
-          "at the old", "used to be", "until 2026-08-11",
-          "retired", "V2 nominal", "rascunho", "no longer", "went with")
+          "at the old", "used to be", "until 2026-08-11", "until 2026-08-12",
+          "retired", "V2 nominal", "rascunho", "no longer", "went with",
+          # A era 21 bi citada como historico (o split de 2026-08-12 e uma
+          # redenominacao — o valor antigo aparece legitimamente ao explicar
+          # a razao x100/21).
+          "21 b era", "era 21 bi", "pre-split", "was 100,000", "was 21 b",
+          "g3 measurement", "medido na g3", "da g3", "x100/21", "x 100/21")
 
 # Documentos que descrevem a cadeia Genesis-3 VIVA, onde os numeros antigos
 # sao os corretos, mais registros datados (releases, portal publico da G3) e
@@ -86,6 +114,8 @@ SKIP = ("tools/faucet/README.md", "tools/indexer/README.md",
         "TOKENOMICS_V2.md", "TOKENOMICS_V3.md", "CARRYOVER.md", "API.md",
         "PROJECT-STATUS.md", "/adr/", "/historical/", "/post-mortems/",
         "/releases/", "/portal/",
+        "FLEET-BRIEF-",                  # briefs sao registros DATADOS do dia
+
         "BLOCH-POS-STAKE-CHURN.md",      # registro da decisao 900->25
         "BLOCH-POS-THREAT-MODEL.md",     # selado; texto mantido de proposito
         "BLOCH-POS-THREAT-MODEL-2.md")   # idem

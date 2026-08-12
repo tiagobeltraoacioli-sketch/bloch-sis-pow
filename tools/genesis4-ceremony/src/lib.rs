@@ -57,9 +57,10 @@
 //! ## Arithmetic
 //!
 //! Every quantity is `u128`, imported from `bloch_pos_committee::tokenomics_v4`
-//! — the crate whose compile-time assertions pin the 21 B total and the
-//! validator remainder (spec §8.1). No allocation number is restated here:
-//! change the constants crate and this tool follows, or fails to compile.
+//! — the crate whose compile-time assertions pin the 100 B total (the pure
+//! x100/21 split of 2026-08-12) and the validator remainder (spec §8.1). No
+//! allocation number is restated here: change the constants crate and this
+//! tool follows, or fails to compile.
 
 use bloch_pos_committee::derive::coherence_binding;
 use bloch_pos_committee::params::SLOTS_PER_EPOCH;
@@ -539,9 +540,12 @@ pub fn liquidity_schedule() -> Schedule {
 /// - the carryover total must equal `CARRYOVER_TOTAL_BLOCH` **exactly**. The
 ///   cap is retired (§3 "The cap, retired"): the whole measured ledger comes
 ///   across, founder included, and the constants crate already balances the
-///   21 B supply around that exact figure. An artifact with any other total is
-///   either not the published record or was measured at a different height
-///   than the constants — both are ceremony-stopping, not scalable;
+///   100 B supply around that exact figure. Under the 2026-08-12 split the
+///   artifact carries POST-split satoshis (`tokenomics_v4::split_g3_sat` per
+///   balance, with the builder's stated dust rule making the rows sum to the
+///   pinned total). An artifact with any other total is either not the
+///   published record or was measured at a different height than the
+///   constants — both are ceremony-stopping, not scalable;
 /// - bucket addresses must be valid, mutually distinct, and absent from the
 ///   carryover set. Not a taint rule (that dissolved with the cap) — a loader
 ///   rule: every genesis address carries exactly one schedule, so an address
@@ -679,7 +683,7 @@ pub fn build_genesis(
     // the liquidity bucket, the only Foundation bucket fully liquid at slot 0.
     // Bonded stake is consensus state, not a spendable output, so the genesis
     // liquidity output is reduced by exactly the bonded amount: nothing is
-    // minted for the cohort and the 21 B accounting still closes.
+    // minted for the cohort and the 100 B accounting still closes.
     let liquidity_sat = v4::LIQUIDITY_BLOCH * v4::SAT_PER_BLOCH;
     if cohort_stake_sat > liquidity_sat {
         return Err(format!(
@@ -722,7 +726,7 @@ pub fn build_genesis(
 
     // The invariant this whole document exists to keep: genesis outputs plus
     // the cohort's bonded stake plus the 40-year validator emission is
-    // EXACTLY the 21 B total. Not "at most" — a supply invariant that is
+    // EXACTLY the 100 B total. Not "at most" — a supply invariant that is
     // nearly satisfied is not an invariant.
     let issued: u128 = genesis.outputs.iter().map(|o| o.value_sat).sum();
     let total = issued
@@ -1090,11 +1094,16 @@ mod tests {
     /// row is the measured largest address, 3,546,175,400 BLCH). Digest is a
     /// KAT generated with CPython's hashlib.shake_256 — the digest
     /// build_carryover.py would publish for these bytes.
+    // Post-split satoshis (2026-08-12): row `a` is the largest-address G3
+    // measurement under `split_g3_sat` (354,617,540,000,000,000 x 100/21,
+    // truncated), row `b` absorbs the remainder so the file sums to exactly
+    // `CARRYOVER_TOTAL_BLOCH` — the same close-the-total dust rule the real
+    // builder must state.
     const KAT2_TEXT: &str = concat!(
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\t354617540000000000\n",
-        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\t22770940000000000\n",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\t1688654952380952380\n",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\t108433047619047620\n",
     );
-    const KAT2_DIGEST: &str = "56fd34b03db649caccb277407577c66cb279269ff96e9ecb9b1269e60400eecf";
+    const KAT2_DIGEST: &str = "310669067dedad1c6a33e251cb0f424bdaf7ca2c7aa48331417b639bbc3845ce";
 
     /// The canonical empty-pool artifact — what the (provably empty) mainnet
     /// pool publishes.
@@ -1152,8 +1161,8 @@ mod tests {
         // digest defends): digest must change, so the published digest no
         // longer matches and the build refuses.
         let tampered = KAT2_TEXT
-            .replace("354617540000000000", "354617540000000001")
-            .replace("22770940000000000", "22770939999999999");
+            .replace("1688654952380952380", "1688654952380952381")
+            .replace("108433047619047620", "108433047619047619");
         let good = read_carryover(KAT2_TEXT).unwrap();
         let bad = read_carryover(&tampered).unwrap();
         assert_eq!(good.total_sat, bad.total_sat, "fixture must keep the total fixed");
@@ -1191,17 +1200,17 @@ mod tests {
         }
     }
 
-    // ── Supply: the sum is exactly 21,000,000,000 BLCH ─────────────────────
+    // ── Supply: the sum is exactly 100,000,000,000 BLCH ────────────────────
 
     #[test]
-    fn allocations_sum_to_exactly_21_billion() {
+    fn allocations_sum_to_exactly_100_billion() {
         let g = kat_genesis();
         let issued: u128 = g.outputs.iter().map(|o| o.value_sat).sum();
         let total = issued
             + g.cohort_stake_sat
             + v4::VALIDATOR_EMISSION_BLOCH * v4::SAT_PER_BLOCH;
         assert_eq!(total, v4::TOTAL_SUPPLY_SAT);
-        assert_eq!(total, 21_000_000_000 * 100_000_000); // spelled out
+        assert_eq!(total, 100_000_000_000 * 100_000_000); // spelled out
         // And the carryover entered whole — the cap is retired, nothing was
         // scaled and nothing was withheld.
         assert_eq!(g.carryover_issued_sat, v4::CARRYOVER_TOTAL_BLOCH * v4::SAT_PER_BLOCH);
@@ -1214,15 +1223,15 @@ mod tests {
         let sat = |bloch: u128| bloch * v4::SAT_PER_BLOCH;
         // §1 table, spelled out as literals on purpose: the test pins the
         // production values against silent drift in the constants crate.
-        assert_eq!(get("founder"), sat(2_100_000_000));
-        assert_eq!(get("vc"), sat(2_100_000_000));
-        assert_eq!(get("team"), sat(2_100_000_000));
-        assert_eq!(get("marketing"), sat(840_000_000));
+        assert_eq!(get("founder"), sat(10_000_000_000));
+        assert_eq!(get("vc"), sat(10_000_000_000));
+        assert_eq!(get("team"), sat(10_000_000_000));
+        assert_eq!(get("marketing"), sat(4_000_000_000));
         // Liquidity funds the cohort (§3.3.1): output + bonded stake is the
         // whole bucket.
-        assert_eq!(get("liquidity") + g.cohort_stake_sat, sat(1_050_000_000));
-        assert_eq!(v4::VALIDATOR_EMISSION_BLOCH, 9_036_115_200);
-        assert_eq!(v4::CARRYOVER_TOTAL_BLOCH, 3_773_884_800);
+        assert_eq!(get("liquidity") + g.cohort_stake_sat, sat(5_000_000_000));
+        assert_eq!(v4::VALIDATOR_EMISSION_BLOCH, 43_029_120_000);
+        assert_eq!(v4::CARRYOVER_TOTAL_BLOCH, 17_970_880_000);
     }
 
     #[test]
@@ -1231,7 +1240,7 @@ mod tests {
         // with any other total (one extra satoshi here) is not the record the
         // constants were balanced around. The ceremony stops — it never
         // scales, pads, or truncates.
-        let text = KAT2_TEXT.replace("22770940000000000", "22770940000000001");
+        let text = KAT2_TEXT.replace("108433047619047620", "108433047619047621");
         let carry = read_carryover(&text).unwrap();
         let digest = carry.digest;
         let err = build(&carry, &addrs(), &test_cohort(), &digest).unwrap_err();
@@ -1336,9 +1345,9 @@ mod tests {
             .iter()
             .map(|o| o.schedule.unlocked_sat(o.value_sat, 0))
             .sum();
-        let expected = 210_000_000 * v4::SAT_PER_BLOCH            // 25% of marketing
-            + 1_050_000_000 * v4::SAT_PER_BLOCH - g.cohort_stake_sat // liquidity net of stake
-            + g.carryover_issued_sat;                             // holders
+        let expected = 1_000_000_000 * v4::SAT_PER_BLOCH            // 25% of marketing
+            + 5_000_000_000 * v4::SAT_PER_BLOCH - g.cohort_stake_sat // liquidity net of stake
+            + g.carryover_issued_sat;                               // holders
         assert_eq!(liquid, expected);
         // The founder's GRANT holds no spendable stake at genesis — the
         // liquidity the founder does have at slot 0 is the carried-over
@@ -1390,8 +1399,8 @@ mod tests {
     #[test]
     fn cohort_is_funded_from_liquidity_and_the_accounting_closes() {
         // §3.3.1: bonded stake comes out of the liquidity output — nothing is
-        // minted for the cohort. 64 × MIN_DEPOSIT is 6.4 M BLCH of the
-        // 1.05 B bucket.
+        // minted for the cohort. 64 × MIN_DEPOSIT (25,000 BLCH, 2026-08-12)
+        // is 1.6 M BLCH of the 5 B bucket.
         let g = kat_genesis();
         assert_eq!(g.cohort_stake_sat, GENESIS_COHORT_FLOOR as u128 * MIN_DEPOSIT_SAT);
         let liquidity = g.outputs.iter().find(|o| o.bucket == "liquidity").unwrap();

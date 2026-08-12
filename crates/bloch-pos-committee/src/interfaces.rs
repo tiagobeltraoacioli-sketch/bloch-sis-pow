@@ -15,7 +15,8 @@
 //! >   that a "slot subcommittee" feeds fork choice only, read: every
 //! >   attestation is an epoch-committee vote, and every attestation feeds
 //! >   LMD-GHOST.
-//! > - **the 100 B supply** — reverted to 21 B, the V2 nominal. The `u128`
+//! > - **the 100 B supply** — reverted to 21 B on 2026-08-11, then re-decided
+//! >   at 100 B on 2026-08-12 as a pure x100/21 split. The `u128`
 //! >   arithmetic contract survives (the danger was always the products, not
 //! >   the totals); the "54% of `u64::MAX`" premise does not.
 //! > - **the taint machinery** — dissolved: the carryover crosses as one
@@ -316,6 +317,24 @@ pub enum TransitionError {
     /// carries the pool's roots unchanged; the pool itself is never
     /// re-rooted, §6.6.1).
     CoherenceRootMismatch,
+    /// The committed cumulative issuance would exceed the hard cap
+    /// (`tokenomics_v4::TOTAL_SUPPLY_SAT`) — founder decision, 2026-08-12:
+    /// the cap is a consensus invariant, not a property the emission curve
+    /// merely happens to respect.
+    ///
+    /// Unreachable through the transition's own arithmetic (epoch issuance is
+    /// clamped to the remaining headroom, so emission stops at the cap); it
+    /// fires when a supplied pre-state — a snapshot, a state-sync payload, a
+    /// foreign chain — already claims issuance beyond the cap. Refusing to
+    /// build on such a state, rather than propagating it, is the invariant.
+    ///
+    /// Honest strength of the guarantee: no mechanism inside the protocol can
+    /// raise the cap — no transaction variant mints outside the emission
+    /// schedule, no key or vote parameterises `TOTAL_SUPPLY_SAT`, and the
+    /// value is a `const` with no setter. A hard fork adopted by every
+    /// operator can change any rule including this one; "impossible to
+    /// change" would be false and is deliberately not the claim.
+    SupplyCapExceeded,
 }
 
 /// Why a deposit was rejected (§7.1, §4.1, §6.6.3).

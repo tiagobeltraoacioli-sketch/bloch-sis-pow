@@ -12,25 +12,70 @@
 //!
 //! ## The u64 hazard, front and centre
 //!
-//! 100 B BLCH at 8 decimals is 10^19 satoshis — **54.21% of `u64::MAX`**
-//! (today's 21 B nominal is 11.38%). The total fits in a `u64`, but the sum of
-//! any two large balances does not. Every quantity here is `u128`, and the
-//! compile-time assertions below fail the build if a future edit walks the
-//! supply back into the range where a single addition can wrap. A wrapped
-//! consensus value is a chain split, and release builds wrap silently.
+//! 100 B BLCH at 8 decimals is 10^19 satoshis — **54.21% of `u64::MAX`**. One
+//! balance fits a `u64`, but with only 1.84x of headroom: the sum of any two
+//! balances above half the supply wraps, and release builds wrap silently. A
+//! wrapped consensus value is a chain split. Every quantity here is therefore
+//! `u128`, every satoshi *sum* elsewhere in the crate is `u128`
+//! (`state_root::total_utxo_value`, `sample`'s cumulative array, the finality
+//! quorum comparison), and the compile-time assertions below pin both facts:
+//! the total still fits a single `u64`, and it is deep enough into the range
+//! that `u64` addition is not safe. If either assertion ever fires, the
+//! arithmetic width is being re-decided by accident — stop and re-read this.
+//!
+//! Known, accepted breakage: 10^19 does **not** fit the signed `int64` the Go
+//! SDK uses for `Satoshis` (`i64::MAX` is 9.22 x 10^18). That was one of the
+//! two stated reasons for the 2026-08-11 revert to 21 B; the 2026-08-12 split
+//! decision knowingly reintroduces it. The SDK must move to `uint64`/big.Int —
+//! flagged, not silently absorbed.
 
-/// Satoshis per BLCH. Unchanged from V2 — divisibility is preserved; the
-/// overflow question is answered with `u128`, not by dropping decimal places.
+/// Satoshis per BLCH. Unchanged across every revision — divisibility is
+/// preserved; the overflow question is answered with `u128`, not by dropping
+/// decimal places.
 pub const SAT_PER_BLOCH: u128 = 100_000_000;
+
+// ── The 2026-08-12 split ────────────────────────────────────────────────────
+//
+// Founder decision, 2026-08-12: total supply moves 21 B → 100 B as a **pure
+// split** of exactly 100/21 (x4.7619...). Every bucket scales by the same
+// ratio, every percentage is unchanged, nobody is diluted. Economically this
+// is a redenomination — any text that reads it as "more supply for holders"
+// is wrong. The compile-time assertions at the bottom prove bucket-by-bucket
+// that the ratio is exact.
+
+/// Split ratio numerator: the new supply.
+pub const SPLIT_NUMERATOR: u128 = 100;
+/// Split ratio denominator: the 2026-08-11 nominal the split multiplies.
+pub const SPLIT_DENOMINATOR: u128 = 21;
+
+/// A Genesis-3 satoshi amount under the split, truncating.
+///
+/// This is the function the carryover rebuild must apply per balance. It
+/// truncates: a balance not divisible by 21 loses up to 20/21 of a satoshi.
+/// The ceremony pins the artifact's TOTAL against
+/// [`CARRYOVER_TOTAL_BLOCH`] exactly, so the builder must state its dust rule
+/// (who absorbs the sub-satoshi remainders) and make the rows sum to the
+/// pinned figure — truncate-and-hope does not close the accounting.
+pub const fn split_g3_sat(g3_sat: u128) -> u128 {
+    g3_sat * SPLIT_NUMERATOR / SPLIT_DENOMINATOR
+}
 
 /// Fixed total supply. Hard-capped, unlike V2's perpetual tail.
 ///
-/// Back to the V2 nominal of 21 billion (founder decision, 2026-08-11), after a
-/// draft at 100 billion. The revert removes two hazards for free: the supply is
-/// 11.38% of `u64::MAX` instead of 54.21%, so the sum of two large balances no
-/// longer approaches the wrap point; and it fits in the signed `int64` the Go
-/// SDK uses for `Satoshis`, which 100 billion did not.
-pub const TOTAL_SUPPLY_BLOCH: u128 = 21_000_000_000;
+/// History, kept because auditors read history: a 100 B draft (2026-08-10) was
+/// reverted to the 21 B V2 nominal on 2026-08-11 — the revert bought u64/int64
+/// headroom for free — and re-decided at 100 B on 2026-08-12 as a pure split,
+/// this time with the headroom loss accepted and pinned below rather than
+/// discovered later. The cap is additionally a **consensus invariant**: the
+/// cumulative issued supply is a committed component of the state root
+/// (`state_root::TAG_ISSUED_SUPPLY`) and every node refuses a block whose
+/// committed issuance exceeds this constant
+/// (`TransitionError::SupplyCapExceeded`). Honest strength of that claim: no
+/// mechanism *inside* the protocol can raise the cap — no transaction variant,
+/// no key, no vote, no governance path; the value is a `const` with no setter.
+/// A hard fork adopted by every operator can change any rule, this one
+/// included, so "impossible to change" would be false and is not claimed.
+pub const TOTAL_SUPPLY_BLOCH: u128 = 100_000_000_000;
 pub const TOTAL_SUPPLY_SAT: u128 = TOTAL_SUPPLY_BLOCH * SAT_PER_BLOCH;
 
 // ── Allocations ─────────────────────────────────────────────────────────────
@@ -43,20 +88,20 @@ pub const TOTAL_SUPPLY_SAT: u128 = TOTAL_SUPPLY_BLOCH * SAT_PER_BLOCH;
 /// re-granted the full 17%, the decision settled at 10%). Combined, the
 /// founder holds 26.89% of supply — [`FOUNDER_TOTAL_BLOCH`] pins it. §4A of
 /// the tokenomics spec states what that does to the activation gates.
-pub const FOUNDER_BLOCH: u128 = 2_100_000_000; // 10%
+pub const FOUNDER_BLOCH: u128 = 10_000_000_000; // 10%
 /// Sold to funds; the Foundation is the counterparty. Nothing liquid at
 /// genesis — 12-month cliff, 24-month linear, fully vested at year 3.
-pub const VC_BLOCH: u128 = 2_100_000_000; // 10%
+pub const VC_BLOCH: u128 = 10_000_000_000; // 10%
 /// Held by the Foundation and granted to individuals. Nothing liquid at
 /// genesis — 18-month cliff, 36-month linear, fully vested at year 4.5. The
 /// cliff sits six months off the VC cliff so no two buckets share a month.
-pub const TEAM_BLOCH: u128 = 2_100_000_000; // 10%
-/// 25% (210,000,000) liquid at genesis for listing and launch spend; the rest
-/// linear over 24 months.
-pub const MARKETING_BLOCH: u128 = 840_000_000; //  4%
+pub const TEAM_BLOCH: u128 = 10_000_000_000; // 10%
+/// 25% (1,000,000,000) liquid at genesis for listing and launch spend; the
+/// rest linear over 24 months.
+pub const MARKETING_BLOCH: u128 = 4_000_000_000; //  4%
 /// 100% liquid at genesis — deployed to order books and AMM pools. The one
 /// bucket where full unlock is the function, not a concession.
-pub const LIQUIDITY_BLOCH: u128 = 1_050_000_000; //  5%
+pub const LIQUIDITY_BLOCH: u128 = 5_000_000_000; //  5%
 
 /// The four buckets the Foundation holds: 29.00% of supply.
 pub const FOUNDATION_HELD_BLOCH: u128 =
@@ -66,18 +111,23 @@ pub const FOUNDATION_HELD_BLOCH: u128 =
 /// marketing tranche. VC and team are entirely cliffed.
 ///
 /// This equals **25.0% of circulating supply at genesis** — exactly the G2
-/// threshold. Worth keeping as a constant rather than a paragraph: two holders
-/// account for the whole genesis float, and neither can change that by
-/// behaving differently. Only emission and independent stake dilute them.
+/// threshold, and unchanged by the split (a redenomination moves no ratio).
+/// Worth keeping as a constant rather than a paragraph: two holders account
+/// for the whole genesis float, and neither can change that by behaving
+/// differently. Only emission and independent stake dilute them.
 pub const FOUNDATION_LIQUID_AT_GENESIS_BLOCH: u128 =
     LIQUIDITY_BLOCH + MARKETING_BLOCH * MARKETING_TGE_NUMERATOR / MARKETING_TGE_DENOMINATOR;
 
 /// The carried-over ledger — **one balance set, no founder line**.
 ///
-/// Measured at height 43,172 across 448,337 UTXOs and 15 addresses. Every
-/// balance crosses as ordinary liquid balance, the founder's included: those
-/// coins were mined, on the same chain, under the same rules as everyone
-/// else's (founder decision, 2026-08-11).
+/// Measured on Genesis-3 at height 43,172 (448,337 UTXOs, 15 addresses) as
+/// 3,773,884,800 BLCH, and carried across under the split: x100/21 exactly,
+/// which this figure is (the G3 total is divisible by 21, so the scaled total
+/// is exact — no dust at the aggregate level; per-row dust is the builder's
+/// problem, see [`split_g3_sat`]). Every balance crosses as ordinary liquid
+/// balance, the founder's included: those coins were mined, on the same
+/// chain, under the same rules as everyone else's (founder decision,
+/// 2026-08-11).
 ///
 /// Liquid includes **stakeable**: a carried-over balance may fund deposits and
 /// delegations like any other coin (founder decision, 2026-08-11).
@@ -89,15 +139,21 @@ pub const FOUNDATION_LIQUID_AT_GENESIS_BLOCH: u128 =
 /// it. There is no **taint set**, because there is no class of coin to mark —
 /// §4.1's premine ineligibility was written for a migration in place, where the
 /// founder's pre-existing holding sat on the chain being converted. And there
-/// is no **holder cap**: the 300 M ceiling existed to bound what legacy holders
+/// is no **holder cap**: the ceiling existed to bound what legacy holders
 /// received *while the founder was excluded*, and with nobody excluded it would
 /// either bind on everyone or bind on no one.
 ///
-/// What does not dissolve is the arithmetic. Relabelling changes no balance:
-/// the largest single address still holds 3,546,175,400 BLCH, liquid from slot
-/// 0. §4A states what that does to the activation gates, and it states it the
-/// same way it did before this decision.
-pub const CARRYOVER_TOTAL_BLOCH: u128 = 3_773_884_800;
+/// What does not dissolve is the arithmetic. Relabelling changes no balance
+/// and the split changes no ratio: the largest single address still holds
+/// ~94% of the carryover, liquid from slot 0. §4A states what that does to
+/// the activation gates, and it states it the same way it did before either
+/// decision.
+///
+/// Re-measurement pending: Genesis-3 now halts at height **50,000**
+/// (2026-08-12; was 80,000), and the terminal snapshot re-pins this figure
+/// and [`LARGEST_CARRYOVER_ADDRESS_BLOCH`]. Until then both are the h43,172
+/// measurement under the split.
+pub const CARRYOVER_TOTAL_BLOCH: u128 = 17_970_880_000;
 
 /// Retired. The carryover is not capped — see [`CARRYOVER_TOTAL_BLOCH`].
 ///
@@ -113,6 +169,18 @@ pub const VALIDATOR_EMISSION_BLOCH: u128 = TOTAL_SUPPLY_BLOCH
     - TEAM_BLOCH
     - MARKETING_BLOCH
     - LIQUIDITY_BLOCH;
+pub const VALIDATOR_EMISSION_SAT: u128 = VALIDATOR_EMISSION_BLOCH * SAT_PER_BLOCH;
+
+/// Supply issued at slot 0: everything except the validator emission — the
+/// carryover and the five allocation buckets, vested or not (vesting locks
+/// spendability, it does not defer existence; the ceremony mints these
+/// outputs at genesis).
+///
+/// This is the value `CommittedState::genesis` seeds the committed
+/// cumulative-issuance counter with (`state_root::TAG_ISSUED_SUPPLY`), so the
+/// emission headroom the cap check works against starts at exactly
+/// [`VALIDATOR_EMISSION_SAT`].
+pub const GENESIS_ISSUED_SAT: u128 = TOTAL_SUPPLY_SAT - VALIDATOR_EMISSION_SAT;
 
 // ── Time ────────────────────────────────────────────────────────────────────
 
@@ -227,14 +295,37 @@ const _: () = assert!(
 );
 
 const _: () = assert!(
-    VALIDATOR_EMISSION_BLOCH == 9_036_115_200,
+    VALIDATOR_EMISSION_BLOCH == 43_029_120_000,
     "resto para validadores mudou — reveja a especificacao antes de aceitar"
 );
 
+// The split is PURE, proven bucket by bucket against the 2026-08-11 values:
+// new * 21 == old * 100, exactly. If any assertion here fires, some bucket was
+// scaled by a different ratio — which is a dilution, not a split.
+const _: () = assert!(TOTAL_SUPPLY_BLOCH * SPLIT_DENOMINATOR == 21_000_000_000 * SPLIT_NUMERATOR);
+const _: () = assert!(FOUNDER_BLOCH * SPLIT_DENOMINATOR == 2_100_000_000 * SPLIT_NUMERATOR);
+const _: () = assert!(VC_BLOCH * SPLIT_DENOMINATOR == 2_100_000_000 * SPLIT_NUMERATOR);
+const _: () = assert!(TEAM_BLOCH * SPLIT_DENOMINATOR == 2_100_000_000 * SPLIT_NUMERATOR);
+const _: () = assert!(MARKETING_BLOCH * SPLIT_DENOMINATOR == 840_000_000 * SPLIT_NUMERATOR);
+const _: () = assert!(LIQUIDITY_BLOCH * SPLIT_DENOMINATOR == 1_050_000_000 * SPLIT_NUMERATOR);
+const _: () =
+    assert!(CARRYOVER_TOTAL_BLOCH * SPLIT_DENOMINATOR == 3_773_884_800 * SPLIT_NUMERATOR);
+const _: () =
+    assert!(VALIDATOR_EMISSION_BLOCH * SPLIT_DENOMINATOR == 9_036_115_200 * SPLIT_NUMERATOR);
+
 /// Largest single carried-over address, for the concentration reporting in §4A.
-/// Not a consensus quantity and not a distinct class of coin — a measurement.
-pub const LARGEST_CARRYOVER_ADDRESS_BLOCH: u128 = 3_546_175_400;
+/// Not a consensus quantity and not a distinct class of coin — a measurement:
+/// 3,546,175,400 BLCH on Genesis-3 at h43,172, under the split, truncated to
+/// whole BLCH (the exact scaled value is 16,886,549,523.8095... — 3,546,175,400
+/// is not divisible by 21). Truncation loses under one BLCH of a reporting
+/// figure; the consensus quantity is each balance in the artifact, which the
+/// builder scales in satoshis.
+pub const LARGEST_CARRYOVER_ADDRESS_BLOCH: u128 = 16_886_549_523;
 const _: () = assert!(LARGEST_CARRYOVER_ADDRESS_BLOCH < CARRYOVER_TOTAL_BLOCH);
+const _: () = assert!(
+    LARGEST_CARRYOVER_ADDRESS_BLOCH == 3_546_175_400 * SPLIT_NUMERATOR / SPLIT_DENOMINATOR,
+    "a medida escalada nao bate com a medida G3 sob o split"
+);
 
 /// Founder carried-over balance plus the new grant: 26.89% of supply.
 pub const FOUNDER_TOTAL_BLOCH: u128 = LARGEST_CARRYOVER_ADDRESS_BLOCH + FOUNDER_BLOCH;
@@ -242,17 +333,30 @@ const _: () = assert!(FOUNDER_TOTAL_BLOCH * 10_000 / TOTAL_SUPPLY_BLOCH == 2688)
 
 const _: () = assert!(EMISSION_SLOTS == 42_076_800, "grade de tempo mudou");
 
-/// The reason every quantity above is `u128`: the supply does not fit in a
-/// `u64` with room to add. If a future edit lowers the supply enough that it
-/// would fit safely, this assertion is the place to reconsider — deliberately,
-/// not by accident.
-/// The 21-billion supply is 11.38% of `u64::MAX` and fits in a signed `int64`,
-/// so the wrap hazard that justified `u128` at 100 billion is gone. `u128` is
-/// kept anyway: the products are what overflow, not the totals — a balance
-/// times a basis-point figure, or issuance times stake in the reward split,
-/// exceeds `u64` long before any balance does.
-const _: () = assert!(TOTAL_SUPPLY_SAT < (u64::MAX as u128) / 8);
-const _: () = assert!(TOTAL_SUPPLY_SAT < i64::MAX as u128, "nao cabe no int64 do SDK Go");
+// ── The u64 headroom, pinned ────────────────────────────────────────────────
+//
+// Both directions are asserted on purpose. The first says a single balance
+// still fits the u64 columns that carry one bond or one output
+// (`state_root::EutxoEntry::value`, `ValidatorRecord::stake`,
+// `sample::Validator::effective_stake`). The second says the supply is past
+// the halfway point of u64 — the sum of two large balances CAN wrap — so
+// every satoshi sum must be u128, and any future edit that brings the supply
+// back under the safe line has to come here and re-decide the widths
+// deliberately instead of inheriting a hazard note that stopped being true.
+const _: () = assert!(
+    TOTAL_SUPPLY_SAT <= u64::MAX as u128,
+    "um saldo unico tem de caber em u64 — as colunas comprometidas sao u64"
+);
+const _: () = assert!(
+    TOTAL_SUPPLY_SAT * 2 > u64::MAX as u128,
+    "o supply saiu da zona de wrap de u64: reavalie as larguras de proposito"
+);
+// Known break, asserted so it cannot be forgotten: the Go SDK's signed int64
+// cannot carry sums at this scale. See the module docs.
+const _: () = assert!(
+    TOTAL_SUPPLY_SAT > i64::MAX as u128,
+    "se isto falhar, o int64 do SDK Go voltou a caber — atualize os docs"
+);
 
 // ── Vesting: team, VC, marketing, liquidity ─────────────────────────────────
 //
@@ -332,13 +436,14 @@ pub const fn insider_unlocked_sat(slot: u64) -> u128 {
 // some bucket sits at or above 25% in months 6, 12, 24, 36 and 48. With a
 // front-loaded curve validators pass 45% of circulating inside two years and
 // only months 6 and 12 breach — and that breach is the liquidity bucket, which
-// disperses to traders rather than acting as one entity.
+// disperses to traders rather than acting as one entity. All of those are
+// ratios, so the 2026-08-12 split moves none of them.
 //
 // The choice is open decision #2 in the spec. Both curves are provided; neither
 // is aliased as "the" reward, because picking one here would make a founder
 // decision look like an implementation detail.
 
-/// Flat: constant reward for 40 years, then fee-only.
+/// Flat: constant reward for 40 years, then fee-only. ~1,022.63 BLCH/slot.
 pub const fn validator_reward_flat_sat(slot: u64) -> u128 {
     if slot >= EMISSION_SLOTS {
         return 0;
@@ -350,8 +455,8 @@ pub const fn validator_reward_flat_sat(slot: u64) -> u128 {
 ///
 /// `R0` is derived so the ten periods sum to exactly the validator allocation:
 /// the geometric sum is `R0 · P · (2046/1024)`, so `R0 = alloc · 1024 / (P · 2046)`.
-/// Initial reward ≈ 6,387 BLCH/block, final period ≈ 6.24 BLCH/block, and the
-/// truncation residual over the whole 40 years is under 0.2 BLCH.
+/// Initial reward ≈ 5,118 BLCH/block, final period ≈ 5.0 BLCH/block, and the
+/// truncation residual over the whole 40 years is under 0.14 BLCH.
 pub const HALVING_PERIOD_SLOTS: u64 = 4 * SLOTS_PER_YEAR;
 pub const HALVINGS: u32 = 10;
 pub const INITIAL_REWARD_SAT: u128 =
@@ -374,21 +479,22 @@ pub const fn validator_reward_halving_sat(slot: u64) -> u128 {
 /// 1.5% floor), which is the model the market actually converged on; neither
 /// Ethereum nor Solana has a Bitcoin-style halving. Adapted to a hard cap: the
 /// reward declines by a fixed 10% each year and the whole 40-year schedule sums
-/// to exactly the validator allocation, so there is no floor and no tail.
+/// to the validator allocation minus [`EMISSION_DUST_SAT`] — see below for why
+/// that dust is irreducible.
 ///
 /// Why 10% and not something else — it is the only round rate that satisfies
-/// both live constraints at once:
+/// both live constraints at once, and the split changes neither (both are
+/// ratios of the same supply):
 ///
-/// - **Inflation target.** Year 1 emits 917,168,073 BLCH = **4.37% of total
-///   supply** (`annual_inflation_bps(0)` = 436), against the founder's
-///   "under 7%" requirement. Year 5 is 2.86%, year 10 is 1.69%.
-/// - **Decentralisation.** An 8%/year decline drops year 1 to 3.57% but is
-///   too flat: validators stop out-earning the insider unlock schedule and the
-///   25%-of-stake gate is breached at month 36. 12%/year passes the gate at
-///   5.19% in year 1. At the 21 B supply neither rate presses the 7% ceiling
-///   (both did at the superseded 100 B draft, where 12% sat at 6.48%); what
-///   decides between them now is the gate, and 10% clears it with margin on
-///   both sides.
+/// - **Inflation target.** Year 1 emits 4,367,467,018.77 BLCH = **4.36% of
+///   total supply** (`annual_inflation_bps(0)` = 436), against the founder's
+///   "under 7%" requirement. Year 5 is 2.86%, year 10 is 1.69%. Identical in
+///   basis points to the 21 B schedule this splits from — pinned by test.
+/// - **Decentralisation.** An 8%/year decline is too flat: validators stop
+///   out-earning the insider unlock schedule and the 25%-of-stake gate is
+///   breached at month 36. 12%/year passes the gate at 5.19% year-1 inflation.
+///   Neither rate presses the 7% ceiling; what decides between them is the
+///   gate, and 10% clears it with margin on both sides.
 ///
 /// Preferred over halving because a halving is a scheduled date on which every
 /// validator's revenue drops by half at once, and marginal operators leave
@@ -397,11 +503,29 @@ pub const fn validator_reward_halving_sat(slot: u64) -> u128 {
 ///
 /// Integer recurrence: `annual[n] = annual[n-1] * 9 / 10`, per-slot reward is
 /// `annual[n] / SLOTS_PER_YEAR`. `INITIAL_ANNUAL_SAT` was solved for by binary
-/// search under exactly this truncating arithmetic, so the 40-year sum lands on
-/// the allocation with **zero** residual rather than merely close to it.
+/// search under exactly this truncating arithmetic, as the largest value whose
+/// 40-year sum does not exceed the allocation.
 pub const DECAY_NUMERATOR: u128 = 9;
 pub const DECAY_DENOMINATOR: u128 = 10;
-pub const INITIAL_ANNUAL_SAT: u128 = 91_716_807_395_714_399;
+pub const INITIAL_ANNUAL_SAT: u128 = 436_746_701_877_842_399;
+
+/// Satoshis of the validator allocation the decay curve can never emit.
+///
+/// The 40-year sum is `Σ (annual_n / SPY) · SPY` — a multiple of
+/// `SLOTS_PER_YEAR` by construction — and the allocation is **not** a multiple
+/// of `SLOTS_PER_YEAR` (4,302,912,000,000,000,000 mod 1,051,920 = 176,880), so
+/// no choice of `INITIAL_ANNUAL_SAT` lands exactly. An earlier revision of
+/// this file claimed a zero residual; that claim was arithmetically impossible
+/// (the 21 B schedule's true residual was 889,200 sat) and is corrected here
+/// rather than repeated. 176,880 sat is 0.0018 BLCH, permanently unissued —
+/// which errs on the only acceptable side of a hard cap: under, never over.
+/// The compile-time assertion below pins it.
+pub const EMISSION_DUST_SAT: u128 = 176_880;
+
+const _: () = assert!(
+    validator_emitted_decay_by(EMISSION_SLOTS) + EMISSION_DUST_SAT == VALIDATOR_EMISSION_SAT,
+    "a soma de 40 anos da curva de decay mudou — recalcule INITIAL_ANNUAL_SAT"
+);
 
 pub const fn validator_reward_decay_sat(slot: u64) -> u128 {
     if slot >= EMISSION_SLOTS {

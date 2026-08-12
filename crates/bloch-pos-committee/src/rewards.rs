@@ -19,8 +19,9 @@
 //! without delegated stake, and pro-rata-to-all-stake rewards only make sense
 //! if stake can sit behind an operator without running one. That is a genuine
 //! addition to the PoS design, which until now had validators depositing
-//! directly with a 100,000 BLCH minimum — see §7 of this crate's notes and the
-//! open question in the tokenomics spec.
+//! directly with the `staking::MIN_DEPOSIT_SAT` minimum (25,000 BLCH since
+//! 2026-08-12) — see §7 of this crate's notes and the open question in the
+//! tokenomics spec.
 //!
 //! This differs from the migration design's earlier sketch (§7.4: "7/8 to
 //! attesters, 1/8 to proposer"), which is the Ethereum shape. Both are
@@ -164,5 +165,5 @@ pub fn nominal_yield_bps(annual_issuance_sat: u128, total_staked_sat: u128) -> u
 
 /// Minimum delegation, so dust delegations cannot bloat the reward pass.
 /// Far below the validator minimum: the point of delegation is that staking
-/// should not require 100,000 BLCH.
+/// should not require a full validator bond (25,000 BLCH).
 pub const MIN_DELEGATION_SAT: u128 = 10 * SAT_PER_BLOCH;
