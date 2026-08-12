@@ -40,7 +40,12 @@ use bloch_pos_committee::tokenomics_v4::{TOTAL_SUPPLY_SAT, VALIDATOR_EMISSION_BL
 const BLOCK_VERSION_V4: u32 = 0xB10C_0005;
 
 const NAME: &str = env!("CARGO_PKG_NAME");
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// `pkg-version (git-commit[+dirty])`, stamped by build.rs. The commit is the
+/// load-bearing part: the G8 release-integrity gate compares fleet, release
+/// and source through it (deploy/RELEASE-INTEGRITY.md). Never fall back to
+/// bare CARGO_PKG_VERSION — three identical "0.3.0-genesis2" strings on three
+/// different binaries is the exact failure this replaces.
+const VERSION: &str = env!("BLOCH_BUILD_VERSION");
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
