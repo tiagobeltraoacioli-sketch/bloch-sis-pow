@@ -85,15 +85,27 @@ use crate::sample::Validator;
 /// identifier type, and the only legitimate producer of a `BlockId` is
 /// [`StateCommitment::block_id`]. A2 owns the property test asserting no code
 /// path derives one from anything else.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct BlockId(pub [u8; 32]);
+/// **Re-export, not a declaration.** This module used to declare its own
+/// `pub struct BlockId(pub [u8; 32])` while `header.rs` declared an opaque one
+/// with a single constructor. Two identity types in one consensus crate is the
+/// very defect the paragraph above warns about, reproduced by the parallel
+/// workstreams that wrote the two files — caught by `single_derivation_path`
+/// at integration, 2026-08-11. There is now exactly one.
+pub use crate::header::BlockId;
 
 /// An (epoch, block) pair — the unit justification and finality operate on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Checkpoint {
     pub epoch: u64,
-    /// Id of the epoch's first block (the checkpoint block).
-    pub root: BlockId,
+    /// Root of the epoch's first block, as attested.
+    ///
+    /// Raw bytes and not a [`BlockId`] on purpose: a checkpoint root arrives
+    /// from an attestation on the wire, so it is a value to be *compared*
+    /// against an id this node derived itself (`BlockId::of(...).as_bytes()`),
+    /// never an identity to be minted from untrusted bytes. Typing it as
+    /// `BlockId` would force a `[u8; 32] -> BlockId` conversion into existence
+    /// and reopen exactly what the opaque type closes.
+    pub root: [u8; 32],
 }
 
 /// The finality bookkeeping carried in committed state.
@@ -111,36 +123,13 @@ pub struct FinalityState {
 
 // ─── Header and envelope (§5.3) ─────────────────────────────────────────────
 
-/// The Genesis-4 block header, exactly as §5.3 lays it out. 248 bytes.
-///
-/// What is *absent* is the point: no `bits` (deleting the order-dependent
-/// difficulty bug class), no `nonce`, no `timestamp` (derived from `slot` and
-/// genesis time), and `parent` is singular — the chain is linear (§5.2).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BlockHeaderV4 {
-    /// 0xB10C_0005.
-    pub version: u32,
-    pub parent: BlockId,
-    /// SHA3-256 SMT root over the components in [`StateRoots`].
-    pub state_root: [u8; 32],
-    /// SHA3-256 Merkle root of the block's transactions.
-    pub body_root: [u8; 32],
-    pub slot: u64,
-    /// Index into the active validator registry — an index, not a key, so the
-    /// header stays small and the schedule stays an on-chain fact.
-    pub proposer_index: u32,
-    /// SHAKE-256 preimage revealed for this slot (§6.3).
-    pub randao_reveal: [u8; 32],
-    /// Accumulated beacon after mixing this slot's reveal.
-    pub randao_mix: [u8; 32],
-    pub justified_root: BlockId,
-    pub finalized_root: BlockId,
-    /// Root over the attestation quorum carried in the body.
-    pub attestation_root: [u8; 32],
-    /// Coherence accumulator + nullifier commitment (§6.6.2). The shielded
-    /// pool is finalized state or it is not finalized at all.
-    pub coherence_root: [u8; 32],
-}
+/// **Re-export, not a declaration.** The header was declared twice — here as
+/// the frozen contract and in `header.rs` with the canonical 304-byte
+/// serialisation. The two disagreed on field types (`BlockId` vs `[u8; 32]`),
+/// so "the header" had no single encoding, which is the same hazard as having
+/// two block ids. `header.rs` wins because identity is derived from its bytes.
+pub use crate::header::BlockHeaderV4;
+
 
 /// Header plus the proposer's signature — the signature lives here, in the
 /// envelope, **not** in the header (§5.3): a 4.6 KB in-header signature would
@@ -297,12 +286,17 @@ pub enum TransitionError {
     /// finality — a block may never un-finalize anything (§6.6.2 makes the
     /// same demand of the shielded pool via `coherence_root`).
     FinalityRegression,
-    // ── Variants below were added by DEV-2's transition seam via the one
+    // ── Variants below were added by the transition/produce seam via the one
     // sanctioned cheap extension point (`#[non_exhaustive]`, see module docs).
     // Each is a distinct header-commitment failure that would otherwise hide
     // inside a neighbouring variant and be undebuggable from logs.
     /// Header `parent` is not the id of the block whose committed state was
     /// supplied for validation.
+    ///
+    /// `apply_block` is defined as parent-state x block -> child-state, so a
+    /// block naming a different parent must be a deterministic reject:
+    /// silently applying it to the wrong state is the block-identity failure
+    /// shape (the `pow_hash`/`block_hash` DAG-keying defect) moved one layer up.
     WrongParent,
     /// Header `body_root` does not match the Merkle root over the body's
     /// transactions.
@@ -311,7 +305,7 @@ pub enum TransitionError {
     /// quorum the body carries.
     AttestationRootMismatch,
     /// Header `coherence_root` does not carry the parent's shielded-pool
-    /// commitment forward (it is carried, never recomputed — §6.6.1).
+    /// commitment forward (it is carried, never recomputed - S6.6.1).
     CoherenceRootMismatch,
 }
 

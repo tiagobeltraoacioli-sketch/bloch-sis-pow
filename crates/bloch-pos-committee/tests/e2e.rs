@@ -139,39 +139,22 @@ mod harness {
         }
     }
 
-    // ── Canonical header hashing (stand-in for DEV-2's StateCommitment) ─────
+    // ── Canonical header hashing: DELEGATED to `header.rs` ─────────────────
     //
-    // Fixed field order, fixed little-endian widths — one serialization, so a
-    // signature and an identifier can never be computed over different bytes.
-    // Domain-separated exactly as §5.4/§6.1 demand: DS_BLOCK for identity,
-    // DS_PROPOSE for the proposer signature, so one can never be replayed as
-    // the other.
+    // This harness carried its own `header_bytes` / `block_id` /
+    // `proposal_signing_root` as a stand-in while `header.rs` was being
+    // written. It is gone. A test that derives block identity its OWN way
+    // cannot catch a divergence in the way production derives it — it would
+    // agree with itself and pass over exactly the bug it exists to find. The
+    // third copy of the canonical layout is precisely how the `pow_hash` /
+    // `block_hash` split happened on the live chain.
 
-    fn header_bytes(h: &BlockHeaderV4) -> Vec<u8> {
-        let mut b = Vec::with_capacity(304);
-        b.extend_from_slice(&h.version.to_le_bytes());
-        b.extend_from_slice(&h.parent.0);
-        b.extend_from_slice(&h.state_root);
-        b.extend_from_slice(&h.body_root);
-        b.extend_from_slice(&h.slot.to_le_bytes());
-        b.extend_from_slice(&h.proposer_index.to_le_bytes());
-        b.extend_from_slice(&h.randao_reveal);
-        b.extend_from_slice(&h.randao_mix);
-        b.extend_from_slice(&h.justified_root.0);
-        b.extend_from_slice(&h.finalized_root.0);
-        b.extend_from_slice(&h.attestation_root);
-        b.extend_from_slice(&h.coherence_root);
-        b
-    }
-
-    /// `SHA3-256(DS_BLOCK ‖ canonical header)` — the one and only block id.
     pub fn block_id(h: &BlockHeaderV4) -> BlockId {
-        BlockId(h3(&[&DS_BLOCK, &header_bytes(h)]))
+        BlockId::of(h)
     }
 
-    /// `SHA3-256(DS_PROPOSE ‖ canonical header)` — what the proposer signs.
     pub fn proposal_signing_root(h: &BlockHeaderV4) -> [u8; 32] {
-        h3(&[&DS_PROPOSE, &header_bytes(h)])
+        h.proposal_signing_root()
     }
 
     fn body_root_of(tx_ids: &[[u8; 32]]) -> [u8; 32] {
@@ -241,8 +224,23 @@ mod harness {
         pub prev_justified: FCheckpoint,
     }
 
+    /// Genesis is a block, so its id is derived from its header like any
+    /// other's — not invented from a label.
     pub fn genesis_id() -> BlockId {
-        BlockId(h3(&[b"E2E:GENESIS"]))
+        BlockId::of(&BlockHeaderV4 {
+            version: bloch_pos_committee::header::VERSION_G4,
+            parent: [0u8; 32],
+            state_root: [0u8; 32],
+            body_root: [0u8; 32],
+            slot: 0,
+            proposer_index: 0,
+            randao_reveal: [0u8; 32],
+            randao_mix: [0u8; 32],
+            justified_root: [0u8; 32],
+            finalized_root: [0u8; 32],
+            attestation_root: [0u8; 32],
+            coherence_root: [0u8; 32],
+        })
     }
 
     /// Build the genesis state for `n` validators whose RANDAO commitments
@@ -279,8 +277,8 @@ mod harness {
             checkpoints: BTreeMap::from([(0u64, g)]),
             // Genesis is justified and finalized by definition — finality
             // needs a root of trust to link from.
-            finality: FinState::new(FCheckpoint { epoch: 0, root: g.0 }),
-            prev_justified: FCheckpoint { epoch: 0, root: g.0 },
+            finality: FinState::new(FCheckpoint { epoch: 0, root: *g.as_bytes() }),
+            prev_justified: FCheckpoint { epoch: 0, root: *g.as_bytes() },
         }
     }
 
@@ -394,7 +392,7 @@ mod harness {
             self.seed_mixes.get(&epoch).copied()
         }
         fn finality(&self) -> IFinalityState {
-            let conv = |c: FCheckpoint| ICheckpoint { epoch: c.epoch, root: BlockId(c.root) };
+            let conv = |c: FCheckpoint| ICheckpoint { epoch: c.epoch, root: c.root };
             IFinalityState {
                 previous_justified: conv(self.prev_justified),
                 justified: conv(self.finality.current_justified()),
@@ -438,7 +436,7 @@ mod harness {
             // Parent linkage is fork-choice's job, not the transition's: the
             // frozen error enum deliberately has no "wrong parent" variant,
             // and the drivers below only apply blocks that extend the head.
-            assert_eq!(h.parent, pre.head, "driver must only apply blocks extending the head");
+            assert_eq!(&h.parent, pre.head.as_bytes(), "driver must only apply blocks extending the head");
             let epoch = epoch_of(h.slot);
             // Epoch accounting is split from block application on purpose
             // (`process_epoch` runs even when the boundary slot is empty);
@@ -477,7 +475,7 @@ mod harness {
             //    parent state's finality.
             let j = pre.finality.current_justified();
             let f = pre.finality.finalized();
-            if h.justified_root.0 != j.root || h.finalized_root.0 != f.root {
+            if h.justified_root != j.root || h.finalized_root != f.root {
                 return Err(TransitionError::FinalityRegression);
             }
 
@@ -612,15 +610,15 @@ mod harness {
         let f = pre.finality.finalized();
         let header = BlockHeaderV4 {
             version: BLOCK_VERSION,
-            parent: pre.head,
+            parent: *pre.head.as_bytes(),
             state_root,
             body_root: body_root_of(&[]),
             slot,
             proposer_index,
             randao_reveal: reveal,
             randao_mix: new_mix,
-            justified_root: BlockId(j.root),
-            finalized_root: BlockId(f.root),
+            justified_root: j.root,
+            finalized_root: f.root,
             attestation_root: attestation_root_of(atts),
             coherence_root: COHERENCE_NUL_ROOT,
         };
@@ -658,11 +656,11 @@ mod harness {
             .map(|v| {
                 let data = AttestationData {
                     slot,
-                    head: target.0,
+                    head: *target.as_bytes(),
                     source_epoch: src.epoch,
                     source_root: src.root,
                     target_epoch: e,
-                    target_root: target.0,
+                    target_root: *target.as_bytes(),
                 };
                 Attestation { data, validator: v, signature: stub_att_sign(v, &data.signing_root()) }
             })
@@ -806,7 +804,7 @@ mod harness {
                     continue;
                 }
                 let b = &deliveries[i];
-                if b.envelope.header.parent != st.head {
+                if &b.envelope.header.parent != st.head.as_bytes() {
                     continue; // parent not known yet — stays buffered
                 }
                 while epoch_of(b.envelope.header.slot) > st.current_epoch {
@@ -932,7 +930,7 @@ fn chain_advances_and_finalizes_across_epochs_with_all_honest() {
     // a single-producer-per-slot honest run.
     let mut head = harness::genesis_id();
     for b in &log.blocks {
-        assert_eq!(b.envelope.header.parent, head);
+        assert_eq!(&b.envelope.header.parent, head.as_bytes());
         head = block_id(&b.envelope.header);
     }
     assert_eq!(log.state.head, head);
@@ -947,7 +945,7 @@ fn chain_advances_and_finalizes_across_epochs_with_all_honest() {
     // The finalized checkpoint is a real block of this chain, not a phantom:
     // it is that epoch's first block.
     assert_eq!(
-        fin.finalized.root,
+        &fin.finalized.root,
         block_id(
             &log.blocks
                 .iter()
@@ -956,6 +954,7 @@ fn chain_advances_and_finalizes_across_epochs_with_all_honest() {
                 .envelope
                 .header
         )
+        .as_bytes()
     );
 }
 

@@ -71,6 +71,7 @@ pub mod state_root;
 pub mod schedule;
 pub mod slashing;
 pub mod derive;
+pub mod transition;
 
 pub use attestation::{Attestation, AttestationData, RejectReason, SignatureVerifier};
 pub use beacon::{mix_in, process_reveal, BeaconError, RandaoChain, RevealState};
@@ -101,6 +102,7 @@ pub use interfaces::{
 pub use finality::{EpochOutcome, EpochVotes, FinalityError};
 pub use produce::{produce, ProduceError, ProducerRandao, ProposerSigner};
 pub use derive::{validate_block, ChainState, ParentState, RandaoRejection};
+pub use transition::{CommittedState, GenesisValidator, PosTransaction, Transition};
 
 // ── Names that exist in two modules — NOT re-exported flat ──────────────────
 //
@@ -111,8 +113,11 @@ pub use derive::{validate_block, ChainState, ParentState, RandaoRejection};
 //   `interfaces::Checkpoint`     vs `finality::Checkpoint`
 //   `interfaces::FinalityState`  vs `finality::FinalityState`
 //   `staking::ValidatorRecord`   vs `state_root::ValidatorRecord`
-//   `interfaces::BlockId`        vs `header::BlockId`
-//   `interfaces::BlockHeaderV4`  vs `header::BlockHeaderV4`
+//
+// (`BlockId` and `BlockHeaderV4` were on this list too. They are not any more:
+// two block-identity types in one consensus crate is the `pow_hash` /
+// `block_hash` defect rebuilt from scratch, so `interfaces` now re-exports
+// `header`'s rather than declaring twins. Deciding that was not optional.)
 //
 // The first two are the same concept declared twice: the PMO froze them as part
 // of the `FinalityGadget` boundary while the gadget author wrote concrete ones.
