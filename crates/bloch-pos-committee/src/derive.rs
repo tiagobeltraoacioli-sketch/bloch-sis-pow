@@ -1,0 +1,505 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! Block validation under PoS — and the **shared derivation functions** the
+//! producer must use.
+//!
+//! ## The one rule that shapes this file
+//!
+//! Every `expected` value the validator checks a header field against is
+//! computed by a `pub` function in this module, and [`crate::produce`] stamps
+//! the header by calling **those same functions**. There is deliberately no
+//! value that the producer derives one way and the validator re-derives
+//! another: producer/validator divergence *inside a single node* is exactly
+//! what stopped this mainnet for 50 minutes at h28080 — the producer stamped a
+//! value, the same binary's validation path derived a different one, and the
+//! node rejected its own blocks. A reimplementation "that does the same thing"
+//! is the defect; sharing the function is the fix. (Same failure family as the
+//! 2026-08-08 `expected_bits` split, §5.5 of the migration design.)
+//!
+//! ## What this seam covers
+//!
+//! This module validates everything the committee layer owns: schedule,
+//! version, RANDAO reveal + mix, attestation quorum, body/attestation/state
+//! commitments, finality carry-over, and the proposer signature. What it does
+//! **not** do is execute transactions or advance the validator registry /
+//! finality bookkeeping — that is DEV-1's [`crate::interfaces::StateTransition`]
+//! implementation (`apply_block` / `process_epoch`), which will *consume* the
+//! helpers here. Transactions are opaque bytes to this crate (§1.2); they are
+//! committed by `body_root` and carried through the state root untouched.
+//!
+//! ## Purity
+//!
+//! Everything below is a pure function of a [`ParentState`] — the parent
+//! block's header and committed components — and the block being judged. No
+//! clocks, no caches, no interior mutability (§5.5).
+
+use crate::attestation::{validate as validate_attestation, Attestation, SignatureVerifier};
+use crate::beacon::{process_reveal, BeaconError, RevealState};
+use crate::header::{BlockEnvelope, BlockHeaderV4, VERSION_G4};
+use crate::interfaces::{ProposalReject, TransitionError};
+use crate::params::DS_BODY;
+use crate::sample::Validator;
+use crate::schedule;
+use crate::state_root::{
+    state_root, ConsensusState, EutxoEntry, ParticipationRecord, RandaoMix, ValidatorRecord,
+};
+use sha3::{Digest, Sha3_256};
+use std::collections::BTreeMap;
+
+// ────────────────────────────────────────────────────────────────────────────
+// Committed state as this seam models it
+// ────────────────────────────────────────────────────────────────────────────
+
+/// The committed consensus-state components of one block, owned.
+///
+/// This is the owned mirror of [`crate::state_root::ConsensusState`] (which
+/// borrows), so a parent state can be held, cloned, and turned into a child
+/// state by [`post_chain_state`]. The eUTXO set and the registry pass through
+/// this seam unchanged — updating them is transaction execution and lifecycle
+/// processing, DEV-1's transition — but they are *carried* here because the
+/// state root commits all components, and a root computed over a subset would
+/// not be the root the header must carry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChainState {
+    /// The eUTXO set (carried through this seam unchanged).
+    pub eutxos: Vec<EutxoEntry>,
+    /// The validator registry as committed (the SMT flavour of the record).
+    pub registry: Vec<ValidatorRecord>,
+    /// Attestation participation, current epoch.
+    pub current_participation: Vec<ParticipationRecord>,
+    /// Attestation participation, previous epoch.
+    pub previous_participation: Vec<ParticipationRecord>,
+    /// Beacon mix history: the accumulated mix as of the last processed block
+    /// of each of the last two epochs (§5.5 keeps exactly 2).
+    pub randao_mixes: Vec<RandaoMix>,
+    /// Taint-set root (§4.1), carried.
+    pub taint_root: [u8; 32],
+    /// Coherence accumulator root (§6.6.2), carried — never recomputed.
+    pub coherence_accumulator_root: [u8; 32],
+    /// Coherence nullifier-set root (§6.6.2), carried.
+    pub coherence_nullifier_root: [u8; 32],
+}
+
+impl ChainState {
+    /// The committed state root over all components — the value
+    /// `BlockHeaderV4::state_root` must equal. Delegates to the one SMT
+    /// implementation in [`crate::state_root`]; there is no second tree.
+    pub fn root(&self) -> [u8; 32] {
+        state_root(&ConsensusState {
+            eutxos: &self.eutxos,
+            validators: &self.registry,
+            current_participation: &self.current_participation,
+            previous_participation: &self.previous_participation,
+            randao_mixes: &self.randao_mixes,
+            taint_root: self.taint_root,
+            coherence_accumulator_root: self.coherence_accumulator_root,
+            coherence_nullifier_root: self.coherence_nullifier_root,
+        })
+    }
+}
+
+/// Everything block production and block validation may know: the parent
+/// block's header and the state committed at it. Nothing else exists as far as
+/// this module is concerned — no clock, no mempool view, no node-local state
+/// (§5.5). Producer and validator are handed the *same* `ParentState`, which
+/// is what makes "derive it the same way" checkable rather than aspirational.
+pub struct ParentState<'a> {
+    /// The parent block's header. Supplies the parent id, the parent slot,
+    /// the accumulated beacon mix, and the finality/coherence roots to carry.
+    pub header: &'a BlockHeaderV4,
+    /// The consensus-state components committed at the parent.
+    pub chain: &'a ChainState,
+    /// Per-validator committed RANDAO chain heads, sorted by validator index.
+    /// (Not part of the SMT yet — tracked alongside until DEV-1's registry
+    /// record grows its `randao_commitment` column.)
+    pub reveal_states: &'a [(u32, RevealState)],
+}
+
+impl ParentState<'_> {
+    /// Committed RANDAO chain head for one validator.
+    pub fn reveal_state_of(&self, validator: u32) -> Option<&RevealState> {
+        self.reveal_states
+            .binary_search_by_key(&validator, |(i, _)| *i)
+            .ok()
+            .map(|at| &self.reveal_states[at].1)
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Shared derivations — the producer stamps what these return, the validator
+// checks against what these return. One definition each.
+// ────────────────────────────────────────────────────────────────────────────
+
+/// The active validator set at `epoch`, in sampling form.
+///
+/// One definition of "active": activated at or before `epoch`, not yet exited,
+/// not slashed. The producer choosing its schedule and the validator checking
+/// it must agree on this set or they disagree on everything downstream.
+pub fn active_validators(registry: &[ValidatorRecord], epoch: u64) -> Vec<Validator> {
+    registry
+        .iter()
+        .filter(|v| v.activation_epoch <= epoch && epoch < v.exit_epoch && !v.slashed)
+        .map(|v| Validator { index: v.index, effective_stake: v.stake })
+        .collect()
+}
+
+/// The beacon mix that seeds sortition for `slot`'s epoch: the mix as of the
+/// close of the *previous* epoch, read from the parent's committed history —
+/// never from anyone's live accumulator (§6.3: the schedule of epoch E is
+/// fixed when E-1 closes, which is what bounds the grinding window).
+///
+/// Epoch 0 is seeded by the zero mix — a genesis constant, the same
+/// convention the beacon's own tests use for "no reveals yet". `None` means
+/// the parent's committed history does not cover the required epoch, in which
+/// case no schedule exists and no block can be validly produced or accepted.
+pub fn sortition_seed(parent: &ParentState<'_>, slot: u64) -> Option<[u8; 32]> {
+    let epoch = crate::epoch_of(slot);
+    if epoch == 0 {
+        return Some([0u8; 32]);
+    }
+    parent.chain.randao_mixes.iter().find(|m| m.epoch == epoch - 1).map(|m| m.mix)
+}
+
+/// The validator scheduled to propose at `slot`, per the parent's committed
+/// state. Composes [`sortition_seed`], [`active_validators`] and the one
+/// proposer draw in [`crate::schedule::proposer`] — this is a composition,
+/// not a reimplementation, so it *cannot* disagree with the schedule module.
+pub fn scheduled_proposer(parent: &ParentState<'_>, slot: u64) -> Option<u32> {
+    let seed = sortition_seed(parent, slot)?;
+    let active = active_validators(&parent.chain.registry, crate::epoch_of(slot));
+    schedule::proposer(&seed, slot, &active)
+}
+
+/// Why a reveal cannot advance the beacon from this parent state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RandaoRejection {
+    /// The proposer has no committed RANDAO chain head in the parent state.
+    UnknownValidatorChain,
+    /// The reveal fails against the committed head (or the chain is spent).
+    Beacon(BeaconError),
+}
+
+/// Verify `reveal` for `proposer` against the parent's committed chain head
+/// and fold it into the parent's accumulated mix. Returns the advanced
+/// per-validator state and the new global mix — the exact pair the child
+/// block commits (`randao_reveal` is checked by, `randao_mix` must equal,
+/// this function's output).
+///
+/// One call into [`crate::beacon::process_reveal`], with the previous mix
+/// pinned to the **parent header's** committed `randao_mix`. Pinning the
+/// input here (instead of letting each caller pick "the current mix") is the
+/// point: the h28080 stall was a producer and a validator in the same binary
+/// feeding the same function different inputs.
+pub fn randao_transition(
+    parent: &ParentState<'_>,
+    proposer: u32,
+    reveal: &[u8; 32],
+) -> Result<(RevealState, [u8; 32]), RandaoRejection> {
+    let committed = parent.reveal_state_of(proposer).ok_or(RandaoRejection::UnknownValidatorChain)?;
+    process_reveal(committed, &parent.header.randao_mix, reveal).map_err(RandaoRejection::Beacon)
+}
+
+/// The justified/finalized roots the child header must carry: the parent
+/// state's, unchanged. Advancing justification is epoch processing
+/// ([`crate::interfaces::StateTransition::process_epoch`], DEV-1); at this
+/// seam any deviation — regression *or* unauthorized advance — is rejected,
+/// because a block must never claim finality the transition did not compute.
+pub fn expected_finality(parent: &ParentState<'_>) -> ([u8; 32], [u8; 32]) {
+    (parent.header.justified_root, parent.header.finalized_root)
+}
+
+/// The coherence root the child header must carry: the parent's, verbatim.
+/// The shielded-pool accumulator is incremental and C1-frozen; re-rooting it
+/// at this seam would force re-shielding (§6.6.1), so it is carried, never
+/// recomputed.
+pub fn expected_coherence(parent: &ParentState<'_>) -> [u8; 32] {
+    parent.header.coherence_root
+}
+
+// ── Body commitments (DS_BODY domain, §6.1) ─────────────────────────────────
+//
+// Two Merkle trees, one domain tag, disjoint preimages: every hash starts
+// with DS_BODY, then a marker byte (leaf/node/empty), then the tree kind
+// (transactions vs attestations). Marker separation is what kills the classic
+// "internal node presented as a leaf" second-preimage trick; kind separation
+// is what keeps a transaction commitment from ever aliasing an attestation
+// commitment. Attestations get their own tree (not a shared one) so a
+// finalized epoch's signatures can be pruned without disturbing the
+// transaction commitment (§6.5.1).
+
+const MARK_LEAF: u8 = 0x00;
+const MARK_NODE: u8 = 0x01;
+const MARK_EMPTY: u8 = 0x02;
+const KIND_TX: u8 = 0x01;
+const KIND_ATTESTATION: u8 = 0x02;
+
+fn body_sha3(parts: &[&[u8]]) -> [u8; 32] {
+    let mut h = Sha3_256::new();
+    h.update(DS_BODY);
+    for p in parts {
+        h.update(p);
+    }
+    h.finalize().into()
+}
+
+/// Binary Merkle root with odd nodes promoted unchanged.
+///
+/// Promotion (instead of Bitcoin-style duplication of the last node) cannot
+/// introduce ambiguity here because leaves and internal nodes live in
+/// disjoint marked preimages — a promoted leaf can never be re-read as the
+/// node of some other tree. Duplication, by contrast, is exactly what made
+/// two distinct transaction lists share a root in CVE-2012-2459.
+fn merkle_root(kind: u8, mut level: Vec<[u8; 32]>) -> [u8; 32] {
+    if level.is_empty() {
+        // A *defined* empty-tree value, not all-zeros: "no transactions" must
+        // be a hash output the domain produced, not a magic constant another
+        // computation could accidentally emit.
+        return body_sha3(&[&[MARK_EMPTY], &[kind]]);
+    }
+    while level.len() > 1 {
+        let mut next = Vec::with_capacity(level.len().div_ceil(2));
+        for pair in level.chunks(2) {
+            if pair.len() == 2 {
+                next.push(body_sha3(&[&[MARK_NODE], &[kind], &pair[0], &pair[1]]));
+            } else {
+                next.push(pair[0]);
+            }
+        }
+        level = next;
+    }
+    level[0]
+}
+
+/// Merkle root committing the block's transactions — what
+/// `BlockHeaderV4::body_root` must equal. Transactions are opaque bytes to
+/// this crate; each leaf length-prefixes its bytes so `[b"ab", b"c"]` and
+/// `[b"a", b"bc"]` cannot commit identically.
+pub fn body_root(transactions: &[Vec<u8>]) -> [u8; 32] {
+    let leaves = transactions
+        .iter()
+        .map(|tx| {
+            body_sha3(&[&[MARK_LEAF], &[KIND_TX], &(tx.len() as u64).to_le_bytes(), tx])
+        })
+        .collect();
+    merkle_root(KIND_TX, leaves)
+}
+
+/// Canonical encoding of one attestation for the quorum commitment: the
+/// signed data (fixed widths, declaration order), the validator index, and
+/// the length-prefixed signature. The signature *is* committed — an
+/// attestation in a block is evidence, and evidence whose signature could be
+/// swapped without moving the root would not be evidence.
+fn attestation_leaf(att: &Attestation) -> [u8; 32] {
+    let mut bytes = Vec::with_capacity(128 + att.signature.len());
+    bytes.extend_from_slice(&att.data.slot.to_le_bytes());
+    bytes.extend_from_slice(&att.data.head);
+    bytes.extend_from_slice(&att.data.source_epoch.to_le_bytes());
+    bytes.extend_from_slice(&att.data.source_root);
+    bytes.extend_from_slice(&att.data.target_epoch.to_le_bytes());
+    bytes.extend_from_slice(&att.data.target_root);
+    bytes.extend_from_slice(&att.validator.to_le_bytes());
+    bytes.extend_from_slice(&(att.signature.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&att.signature);
+    body_sha3(&[&[MARK_LEAF], &[KIND_ATTESTATION], &bytes])
+}
+
+/// Root over the attestation quorum carried in the body — what
+/// `BlockHeaderV4::attestation_root` must equal.
+pub fn attestation_root(attestations: &[Attestation]) -> [u8; 32] {
+    merkle_root(KIND_ATTESTATION, attestations.iter().map(attestation_leaf).collect())
+}
+
+/// May `att` be included in a block at `block_slot` built on `parent`?
+///
+/// One definition, used twice: the producer *filters* its collected
+/// attestations with this exact predicate, and the validator *rejects* the
+/// block if any included attestation fails it. If the two sides used
+/// different predicates, the producer would routinely assemble blocks its own
+/// node refuses — the h28080 shape again, one layer up.
+///
+/// The committee is drawn from the same parent-committed seed and active set
+/// as everything else; inclusion is restricted to attestations from the
+/// block's own epoch because the parent's committed mix history is what makes
+/// older committees derivable, and it keeps exactly two epochs — an
+/// attestation this rule excludes is one whose committee a fresh node could
+/// not re-derive from the parent state alone (§5.5 fails closed).
+pub fn validate_included_attestation(
+    parent: &ParentState<'_>,
+    block_slot: u64,
+    att: &Attestation,
+    verifier: &dyn SignatureVerifier,
+) -> Result<(), crate::attestation::RejectReason> {
+    use crate::attestation::RejectReason;
+    if crate::epoch_of(att.data.slot) != crate::epoch_of(block_slot) {
+        // Cross-epoch inclusion: committee not derivable at this seam.
+        return Err(RejectReason::NotInCommittee);
+    }
+    let seed = sortition_seed(parent, att.data.slot).ok_or(RejectReason::NotInCommittee)?;
+    let active = active_validators(&parent.chain.registry, crate::epoch_of(block_slot));
+    let committee = crate::slot_subcommittee(&seed, att.data.slot, &active);
+    validate_attestation(att, &committee, block_slot, verifier)
+}
+
+/// The child block's committed consensus state: the parent's components with
+/// this seam's updates applied — beacon history advanced with `new_mix`,
+/// participation credited for the included quorum, everything else carried.
+///
+/// Deterministic by construction: participation is rebuilt through a
+/// `BTreeMap`, and the mix history is keyed by epoch, so two nodes (or the
+/// producer and validator inside one node) applying the same block to the
+/// same parent produce byte-identical components — and therefore, through
+/// [`ChainState::root`], bit-identical state roots.
+pub fn post_chain_state(
+    parent: &ParentState<'_>,
+    block_slot: u64,
+    new_mix: [u8; 32],
+    attestations: &[Attestation],
+) -> ChainState {
+    let mut post = parent.chain.clone();
+    let epoch = crate::epoch_of(block_slot);
+
+    // Beacon history: this epoch's entry becomes the new accumulated mix;
+    // exactly the last two epochs are kept (§5.5). Keyed by epoch and
+    // re-sorted, so the vector layout cannot depend on the parent's layout.
+    post.randao_mixes.retain(|m| m.epoch == epoch || m.epoch + 1 == epoch);
+    if let Some(entry) = post.randao_mixes.iter_mut().find(|m| m.epoch == epoch) {
+        entry.mix = new_mix;
+    } else {
+        post.randao_mixes.push(RandaoMix { epoch, mix: new_mix });
+    }
+    post.randao_mixes.sort_by_key(|m| m.epoch);
+
+    // Participation: credit every validator whose attestation this block
+    // carries. Rebuilt via BTreeMap so duplicate records or append order can
+    // never influence the committed result. `attested` is monotone within an
+    // epoch — an included attestation cannot be un-included.
+    let mut credited: BTreeMap<u32, bool> = post
+        .current_participation
+        .iter()
+        .map(|p| (p.validator_index, p.attested))
+        .collect();
+    for att in attestations {
+        credited.insert(att.validator, true);
+    }
+    post.current_participation = credited
+        .into_iter()
+        .map(|(validator_index, attested)| ParticipationRecord { validator_index, attested })
+        .collect();
+
+    post
+}
+
+/// The state root the child header must carry. Composition of
+/// [`post_chain_state`] and [`ChainState::root`] — exposed as one function so
+/// the producer cannot even *accidentally* root a differently-built state.
+pub fn post_state_root(
+    parent: &ParentState<'_>,
+    block_slot: u64,
+    new_mix: [u8; 32],
+    attestations: &[Attestation],
+) -> [u8; 32] {
+    post_chain_state(parent, block_slot, new_mix, attestations).root()
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// The validator
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Validate `envelope` as the child of `parent`. `Ok(())` means every header
+/// field agrees with what this module's shared derivations produce from the
+/// parent's committed state — which is also exactly how [`crate::produce`]
+/// builds a block, so a block produced and validated on the same node with
+/// the same `ParentState` cannot disagree with itself.
+///
+/// Check order (frozen — the reject a node reports is consensus-visible):
+///
+/// 1. parent linkage, slot monotonicity — structural, cheapest;
+/// 2. scheduled proposer, version, RANDAO reveal + mix — the proposal checks,
+///    in the [`crate::interfaces::ProposerDuties`] order;
+/// 3. each included attestation (membership before its signature, the
+///    DoS ordering [`crate::attestation::validate`] already fixes);
+/// 4. body / attestation / finality / coherence commitments;
+/// 5. the recomputed state root;
+/// 6. the proposer's hybrid signature **last** — it is the single most
+///    expensive check (≈4.6 KB hybrid verify), and everything above rejects
+///    garbage without paying for it.
+pub fn validate_block(
+    parent: &ParentState<'_>,
+    envelope: &BlockEnvelope,
+    verifier: &dyn SignatureVerifier,
+) -> Result<(), TransitionError> {
+    let header = &envelope.header;
+
+    // 1 — structure. A block that does not extend this parent, or does not
+    // advance the slot, is judged before any derivation runs.
+    if header.parent != *parent.header.id().as_bytes() {
+        return Err(TransitionError::WrongParent);
+    }
+    if header.slot <= parent.header.slot {
+        return Err(TransitionError::NonMonotonicSlot);
+    }
+
+    // 2 — proposal checks, in the frozen ProposerDuties order.
+    match scheduled_proposer(parent, header.slot) {
+        Some(expected) if expected == header.proposer_index => {}
+        _ => return Err(TransitionError::Proposal(ProposalReject::NotScheduledProposer)),
+    }
+    if header.version != VERSION_G4 {
+        return Err(TransitionError::Proposal(ProposalReject::WrongVersion));
+    }
+    // The reveal must open the proposer's committed chain head, and the mix
+    // the header carries must be the fold of that reveal into the parent's
+    // committed mix. Both come out of the one randao_transition call the
+    // producer also uses; a header stamping any other mix is equivalent to a
+    // bad reveal and reported as such.
+    let new_mix = match randao_transition(parent, header.proposer_index, &header.randao_reveal) {
+        Ok((_advanced, mix)) => mix,
+        Err(_) => return Err(TransitionError::Proposal(ProposalReject::BadRandaoReveal)),
+    };
+    if header.randao_mix != new_mix {
+        return Err(TransitionError::Proposal(ProposalReject::BadRandaoReveal));
+    }
+
+    // 3 — the attestation quorum, element by element. The index in the error
+    // is the body position, so a divergence is debuggable from logs.
+    for (i, att) in envelope.body.attestations.iter().enumerate() {
+        if validate_included_attestation(parent, header.slot, att, verifier).is_err() {
+            return Err(TransitionError::Attestation(i as u32));
+        }
+    }
+
+    // 4 — commitments over what the body actually carries, and the two
+    // carried roots.
+    if header.attestation_root != attestation_root(&envelope.body.attestations) {
+        return Err(TransitionError::AttestationRootMismatch);
+    }
+    if header.body_root != body_root(&envelope.body.transactions) {
+        return Err(TransitionError::BodyRootMismatch);
+    }
+    let (justified, finalized) = expected_finality(parent);
+    if header.justified_root != justified || header.finalized_root != finalized {
+        return Err(TransitionError::FinalityRegression);
+    }
+    if header.coherence_root != expected_coherence(parent) {
+        return Err(TransitionError::CoherenceRootMismatch);
+    }
+
+    // 5 — the recomputed post-state root, from the same post_state_root the
+    // producer stamped.
+    if header.state_root != post_state_root(parent, header.slot, new_mix, &envelope.body.attestations)
+    {
+        return Err(TransitionError::StateRootMismatch);
+    }
+
+    // 6 — the proposer's signature, last (cost ordering). One signing-root
+    // definition: BlockHeaderV4::proposal_signing_root, under DS_PROPOSE.
+    if !verifier.verify(
+        header.proposer_index,
+        &header.proposal_signing_root(),
+        &envelope.proposer_sig,
+    ) {
+        return Err(TransitionError::Proposal(ProposalReject::BadSignature));
+    }
+
+    Ok(())
+}

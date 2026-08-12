@@ -15,3 +15,13 @@ sha3 = { version = "0.10", default-features = false }
 
 [dev-dependencies]
 hex = "0.4"
+
+# The suite walks 8,192-step SHAKE-256 reveal chains and 256-deep SMTs, so an
+# unoptimized Keccak permutation puts tens of seconds on `cargo test`. Optimize
+# only the hash dependencies under dev; this crate's own code keeps full debug.
+# (Valid here because this crate is its own workspace root — see [workspace].)
+[profile.dev.package.sha3]
+opt-level = 3
+
+[profile.dev.package.keccak]
+opt-level = 3

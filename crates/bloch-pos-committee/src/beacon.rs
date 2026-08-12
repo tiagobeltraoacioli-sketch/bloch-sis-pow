@@ -144,6 +144,21 @@ impl RandaoChain {
         RANDAO_CHAIN_LENGTH - self.revealed
     }
 
+    /// Non-consuming view of the value [`Self::next_reveal`] would return.
+    ///
+    /// Exists for the block-production path ([`crate::produce`]): the producer
+    /// must *check* the candidate reveal against the committed [`RevealState`]
+    /// — and refuse to build at all if it does not open the commitment —
+    /// **before** anything is consumed, so a refused attempt leaves the chain
+    /// position untouched. Peeking has no protocol meaning; only
+    /// [`Self::next_reveal`] advances the position.
+    pub fn peek_reveal(&self) -> Option<[u8; 32]> {
+        if self.revealed >= RANDAO_CHAIN_LENGTH {
+            return None;
+        }
+        Some(self.values[RANDAO_CHAIN_LENGTH as usize - 1 - self.revealed as usize])
+    }
+
     /// Produce the next reveal — the preimage one step below the last value
     /// the network has seen — and advance.
     ///
@@ -152,12 +167,9 @@ impl RandaoChain {
     /// Reveals are consumed **per proposed slot**, not per elapsed slot — a
     /// slot this validator does not propose in touches nothing here.
     pub fn next_reveal(&mut self) -> Option<[u8; 32]> {
-        if self.revealed >= RANDAO_CHAIN_LENGTH {
-            return None;
-        }
-        let idx = RANDAO_CHAIN_LENGTH as usize - 1 - self.revealed as usize;
+        let reveal = self.peek_reveal()?;
         self.revealed += 1;
-        Some(self.values[idx])
+        Some(reveal)
     }
 }
 
