@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+<!-- Bloch Protocol site — brand page. Tokens and typography are the
+     founder-approved preview (bloch-site.html), verbatim. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Brand — Bloch Protocol</title>
+<meta name="description" content="The Bloch Protocol brand kit: palette, typography, the Bloch-sphere mark, and how to use them.">
+<link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<nav aria-label="Main"><div class="wrap">
+  <a class="logo" href="./">
+    <svg width="26" height="26" viewBox="0 0 26 26" aria-hidden="true">
+      <circle cx="13" cy="13" r="11.2" fill="none" stroke="var(--accent)" stroke-width="1.5"/>
+      <ellipse cx="13" cy="13" rx="11.2" ry="4.2" fill="none" stroke="var(--accent)" stroke-width="1.1" opacity="0.55"/>
+      <line x1="13" y1="13" x2="19.6" y2="7.2" stroke="var(--ink)" stroke-width="1.6" stroke-linecap="round"/>
+      <circle cx="19.6" cy="7.2" r="2.1" fill="var(--accent)"/>
+    </svg>
+    Bloch Protocol
+  </a>
+  <span class="navlinks">
+    <a href="protocol.html">Protocol</a>
+    <a href="migration.html">Migration</a>
+    <a href="supply.html">Supply</a>
+    <a href="brand.html" aria-current="page">Brand</a>
+    <a href="build.html">Build</a>
+    <a href="docs.html">Docs</a>
+    <a class="ext" href="https://blochl1.com">Explorer</a>
+  </span>
+</div></nav>
+
+<main id="main">
+
+<header class="pagehead"><div class="wrap">
+  <p class="eyebrow">Brand kit</p>
+  <h1>Bloch Protocol</h1>
+  <p class="lede">
+    White ground, one accent spent deliberately, and a serif that signals a project
+    which publishes specifications rather than slogans.
+  </p>
+</div></header>
+
+<section id="mark"><div class="wrap">
+  <div class="sec-head">
+    <p class="eyebrow">The mark</p>
+    <h2>A sphere, an equator, a state vector.</h2>
+    <p class="sub">
+      The Bloch sphere is the geometric picture of a single qubit &mdash; every possible
+      state on one surface. The mark is that picture reduced to three strokes. It is
+      drawn as inline SVG in protocol colors, so it inherits light and dark themes
+      without a second asset.
+    </p>
+  </div>
+  <div class="cards two">
+    <div class="card plain" style="align-items:center; padding-block:3rem">
+      <svg width="120" height="120" viewBox="0 0 26 26" role="img" aria-label="The Bloch Protocol mark: a circle with an elliptical equator and a state vector pointing to the upper right.">
+        <circle cx="13" cy="13" r="11.2" fill="none" stroke="var(--accent)" stroke-width="1.5"/>
+        <ellipse cx="13" cy="13" rx="11.2" ry="4.2" fill="none" stroke="var(--accent)" stroke-width="1.1" opacity="0.55"/>
+        <line x1="13" y1="13" x2="19.6" y2="7.2" stroke="var(--ink)" stroke-width="1.6" stroke-linecap="round"/>
+        <circle cx="19.6" cy="7.2" r="2.1" fill="var(--accent)"/>
+      </svg>
+      <p style="text-align:center">The mark at display size.</p>
+    </div>
+    <div class="card plain">
+      <span class="tag">Rules</span>
+      <h3>Three, only</h3>
+      <p>Keep the vector pointing up-right &mdash; it is a state, not a clock hand. Do not fill the sphere. Do not add a wordmark inside the circle; the name sits beside it, in the display serif.</p>
+      <pre><code>&lt;svg viewBox="0 0 26 26"&gt;
+  &lt;circle cx="13" cy="13" r="11.2" .../&gt;
+  &lt;ellipse cx="13" cy="13" rx="11.2" ry="4.2" .../&gt;
+  &lt;line x1="13" y1="13" x2="19.6" y2="7.2" .../&gt;
+  &lt;circle cx="19.6" cy="7.2" r="2.1" .../&gt;
+&lt;/svg&gt;</code></pre>
+    </div>
+  </div>
+</div></section>
+
+<section id="palette" class="alt"><div class="wrap">
+  <div class="sec-head">
+    <p class="eyebrow">Palette &mdash; light</p>
+    <h2>Six colors, each with a job.</h2>
+    <p class="sub">The neutrals carry a green bias so they read as chosen next to the emerald accent rather than as default grey.</p>
+  </div>
+  <div class="swatches">
+    <div class="sw"><div class="chip" style="background:#0e6e5a"></div><div class="meta"><strong>Emerald</strong>#0E6E5A &middot; accent</div></div>
+    <div class="sw"><div class="chip" style="background:#0d1b17"></div><div class="meta"><strong>Ink</strong>#0D1B17 &middot; text</div></div>
+    <div class="sw"><div class="chip" style="background:#4b3fa8"></div><div class="meta"><strong>Violet</strong>#4B3FA8 &middot; quantum</div></div>
+    <div class="sw"><div class="chip" style="background:#b4630f"></div><div class="meta"><strong>Amber</strong>#B4630F &middot; caution</div></div>
+    <div class="sw"><div class="chip" style="background:#f1f4f3;border-bottom:1px solid #d5dedb"></div><div class="meta"><strong>Surface</strong>#F1F4F3 &middot; sections</div></div>
+    <div class="sw"><div class="chip" style="background:#ffffff;border-bottom:1px solid #d5dedb"></div><div class="meta"><strong>Ground</strong>#FFFFFF &middot; page</div></div>
+  </div>
+
+  <div class="sec-head" style="margin-top:3rem">
+    <p class="eyebrow">Palette &mdash; dark</p>
+    <h2 style="font-size:1.4rem">The same six jobs, re-lit.</h2>
+    <p class="sub">Dark is not inverted light: the accent brightens to keep contrast, the grounds go deep green-black, and the soft tints become shadows of their hue.</p>
+  </div>
+  <div class="swatches">
+    <div class="sw"><div class="chip" style="background:#4fc0a4"></div><div class="meta"><strong>Emerald</strong>#4FC0A4 &middot; accent</div></div>
+    <div class="sw"><div class="chip" style="background:#eaf2ef;border-bottom:1px solid #d5dedb"></div><div class="meta"><strong>Ink</strong>#EAF2EF &middot; text</div></div>
+    <div class="sw"><div class="chip" style="background:#a89ef0"></div><div class="meta"><strong>Violet</strong>#A89EF0 &middot; quantum</div></div>
+    <div class="sw"><div class="chip" style="background:#e0a05c"></div><div class="meta"><strong>Amber</strong>#E0A05C &middot; caution</div></div>
+    <div class="sw"><div class="chip" style="background:#101d19"></div><div class="meta"><strong>Surface</strong>#101D19 &middot; sections</div></div>
+    <div class="sw"><div class="chip" style="background:#0b1411"></div><div class="meta"><strong>Ground</strong>#0B1411 &middot; page</div></div>
+  </div>
+</div></section>
+
+<section id="type"><div class="wrap">
+  <div class="sec-head">
+    <p class="eyebrow">Typography</p>
+    <h2>Three voices, zero webfonts.</h2>
+    <p class="sub">Every face is a system font stack &mdash; no font file is ever downloaded, from anywhere. The pages load with nothing but their own HTML and one stylesheet.</p>
+  </div>
+  <div class="typespec">
+    <div class="typerow"><span class="lbl">Display</span><span style="font-family:var(--display);font-size:1.6rem">Charter &mdash; a chain you can read the source of</span></div>
+    <div class="typerow"><span class="lbl">Body</span><span style="font-size:1.05rem">System sans &mdash; set at 17px, 66 characters, for pages people actually finish</span></div>
+    <div class="typerow"><span class="lbl">Data</span><span style="font-family:var(--mono);font-size:0.98rem">ML-DSA-65 &#8214; Falcon-1024 &middot; 21,000,000,000 &middot; height 50,000</span></div>
+  </div>
+  <div class="tablewrap" style="margin-top:2.5rem"><table>
+    <caption>Font stacks</caption>
+    <thead><tr><th scope="col">Role</th><th scope="col">Stack</th></tr></thead>
+    <tbody>
+      <tr><td>Display</td><td><code>Charter, "Bitstream Charter", "Iowan Old Style", "Source Serif Pro", Georgia, serif</code></td></tr>
+      <tr><td>Body</td><td><code>system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif</code></td></tr>
+      <tr><td>Data</td><td><code>ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace</code></td></tr>
+    </tbody>
+  </table></div>
+</div></section>
+
+<section id="voice" class="alt"><div class="wrap">
+  <div class="sec-head">
+    <p class="eyebrow">Voice</p>
+    <h2>The rule that writes every page.</h2>
+  </div>
+  <div class="cards">
+    <div class="card a">
+      <span class="tag">Do</span>
+      <h3>State the cost</h3>
+      <p>Every claimed benefit ships with its trade-off attached. A protocol page that only lists benefits is marketing.</p>
+    </div>
+    <div class="card b">
+      <span class="tag">Do</span>
+      <h3>Label every figure</h3>
+      <p>Measured and labelled as such, or planned and labelled as such. A number with no label is a rumor with typography.</p>
+    </div>
+    <div class="card c">
+      <span class="tag">Don&rsquo;t</span>
+      <h3>Promise dates or prices</h3>
+      <p>No launch dates, no price talk, no &ldquo;soon&rdquo;. Nothing on this site is investment advice, and the copy never forgets it.</p>
+    </div>
+  </div>
+</div></section>
+
+</main>
+
+<footer><div class="wrap">
+  <div>
+    <span class="logo" style="font-size:1rem">
+      <svg width="22" height="22" viewBox="0 0 26 26" aria-hidden="true">
+        <circle cx="13" cy="13" r="11.2" fill="none" stroke="var(--accent)" stroke-width="1.5"/>
+        <ellipse cx="13" cy="13" rx="11.2" ry="4.2" fill="none" stroke="var(--accent)" stroke-width="1.1" opacity="0.55"/>
+        <line x1="13" y1="13" x2="19.6" y2="7.2" stroke="var(--ink)" stroke-width="1.6" stroke-linecap="round"/>
+        <circle cx="19.6" cy="7.2" r="2.1" fill="var(--accent)"/>
+      </svg>
+      Bloch Protocol
+    </span>
+    <p style="margin-top:0.7rem">Postern Labs Ltda. Nothing here is investment advice.<br>Source code: AGPL-3.0-or-later.</p>
+  </div>
+  <p style="max-width:34ch">Every figure on this site is either measured and labelled as such, or planned and labelled as such.</p>
+</div></footer>
+
+</body>
+</html>
