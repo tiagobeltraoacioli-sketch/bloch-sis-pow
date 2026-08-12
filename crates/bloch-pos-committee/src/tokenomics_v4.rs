@@ -43,10 +43,33 @@ pub const TOTAL_SUPPLY_SAT: u128 = TOTAL_SUPPLY_BLOCH * SAT_PER_BLOCH;
 /// founder holds 33.89% of supply. §4 of the tokenomics spec states what that
 /// does to the activation gates.
 pub const FOUNDER_BLOCH: u128 = 3_570_000_000; // 17%
+/// Sold to funds; the Foundation is the counterparty. Nothing liquid at
+/// genesis — 12-month cliff, 24-month linear, fully vested at year 3.
 pub const VC_BLOCH: u128 = 2_100_000_000; // 10%
+/// Held by the Foundation and granted to individuals. Nothing liquid at
+/// genesis — 18-month cliff, 36-month linear, fully vested at year 4.5. The
+/// cliff sits six months off the VC cliff so no two buckets share a month.
 pub const TEAM_BLOCH: u128 = 2_100_000_000; // 10%
+/// 25% (210,000,000) liquid at genesis for listing and launch spend; the rest
+/// linear over 24 months.
 pub const MARKETING_BLOCH: u128 = 840_000_000; //  4%
+/// 100% liquid at genesis — deployed to order books and AMM pools. The one
+/// bucket where full unlock is the function, not a concession.
 pub const LIQUIDITY_BLOCH: u128 = 1_050_000_000; //  5%
+
+/// The four buckets the Foundation holds: 29.00% of supply.
+pub const FOUNDATION_HELD_BLOCH: u128 =
+    VC_BLOCH + TEAM_BLOCH + MARKETING_BLOCH + LIQUIDITY_BLOCH;
+
+/// Of those four, what is spendable at slot 0: all of liquidity plus the 25%
+/// marketing tranche. VC and team are entirely cliffed.
+///
+/// This equals **25.0% of circulating supply at genesis** — exactly the G2
+/// threshold. Worth keeping as a constant rather than a paragraph: two holders
+/// account for the whole genesis float, and neither can change that by
+/// behaving differently. Only emission and independent stake dilute them.
+pub const FOUNDATION_LIQUID_AT_GENESIS_BLOCH: u128 =
+    LIQUIDITY_BLOCH + MARKETING_BLOCH * MARKETING_TGE_NUMERATOR / MARKETING_TGE_DENOMINATOR;
 
 /// The carried-over ledger — **one balance set, no founder line**.
 ///

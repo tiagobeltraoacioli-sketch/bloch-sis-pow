@@ -1176,3 +1176,40 @@ fn genesis_is_still_unlimited_so_the_chain_can_start() {
     assert_eq!(r.total_active(), 10_000_000 * tk::SAT_PER_BLOCH);
     assert_eq!(r.validators().len(), 10);
 }
+
+#[test]
+fn each_foundation_bucket_is_pinned() {
+    let sat = tk::SAT_PER_BLOCH;
+    assert_eq!(tk::VC_BLOCH, 2_100_000_000);
+    assert_eq!(tk::TEAM_BLOCH, 2_100_000_000);
+    assert_eq!(tk::MARKETING_BLOCH, 840_000_000);
+    assert_eq!(tk::LIQUIDITY_BLOCH, 1_050_000_000);
+    assert_eq!(tk::FOUNDATION_HELD_BLOCH, 6_090_000_000);
+    assert_eq!(tk::FOUNDATION_HELD_BLOCH * 100 / tk::TOTAL_SUPPLY_BLOCH, 29);
+
+    // Liquido no genesis: so liquidez inteira e o quarto do marketing.
+    assert_eq!(tk::vc_vested_sat(0), 0, "VC nao pode ter nada liquido no genesis");
+    assert_eq!(tk::team_vested_sat(0), 0, "time nao pode ter nada liquido no genesis");
+    assert_eq!(tk::marketing_vested_sat(0), 210_000_000 * sat);
+    assert_eq!(tk::liquidity_vested_sat(0), 1_050_000_000 * sat);
+    assert_eq!(tk::FOUNDATION_LIQUID_AT_GENESIS_BLOCH, 1_260_000_000);
+
+    // Cada balde veste por inteiro, no prazo dele.
+    let y = tk::SLOTS_PER_YEAR;
+    assert_eq!(tk::vc_vested_sat(3 * y), tk::VC_BLOCH * sat, "VC no ano 3");
+    assert_eq!(tk::team_vested_sat(5 * y), tk::TEAM_BLOCH * sat, "time no ano 4,5");
+    assert_eq!(tk::marketing_vested_sat(2 * y), tk::MARKETING_BLOCH * sat);
+}
+
+#[test]
+fn two_holders_account_for_the_entire_genesis_float() {
+    // O numero do 7B: a fundacao fica com exatamente 25% do circulante no slot
+    // 0 e o carryover com os outros 75%. Nenhum dos dois consegue mudar isso
+    // se comportando diferente — so emissao e stake independente diluem.
+    let f = tk::FOUNDATION_LIQUID_AT_GENESIS_BLOCH;
+    let c = tk::CARRYOVER_TOTAL_BLOCH;
+    let circulating = f + c;
+    assert_eq!(circulating, 5_033_884_800);
+    assert_eq!(f * 1000 / circulating, 250, "fundacao = 25,0% do circulante");
+    assert_eq!(c * 1000 / circulating, 749, "carryover = 75,0% (truncado)");
+}

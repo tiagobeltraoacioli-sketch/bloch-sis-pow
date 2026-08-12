@@ -550,6 +550,67 @@ marketing = 41%) falls between Aptos (~32.5% team plus investors) and Celestia
 
 ---
 
+## 7B. The four Foundation buckets, one by one
+
+VC, team, marketing and liquidity are held by the Foundation
+(`BLOCH-ENTITY-STRUCTURE.md` §3). Together they are **6,090,000,000 BLCH —
+29.00% of supply**, of which **1,260,000,000 is liquid at genesis**.
+
+### VC / crypto hedge funds — 2,100,000,000 (10.00%)
+
+Sold to funds; the Foundation is the counterparty of the round. **Nothing is
+liquid at genesis**: 12-month cliff, then 24 months linear, fully vested at
+year 3. This is the allocation that makes the Phase-0 legal review blocking
+rather than precautionary — selling to investors with a return expectation is
+what moved BLCH toward the centre of the investment-contract test, and it is
+why ADR-036 retracted the ownerless thesis.
+
+### Development team — 2,100,000,000 (10.00%)
+
+Held by the Foundation and granted to individuals; once granted, individuals
+hold their own. **Nothing liquid at genesis**: 18-month cliff, then 36 months
+linear, fully vested at year 4.5. The cliff sits 6 months after the VC cliff on
+purpose — the *cliff wall*, several buckets unlocking in the same month, is the
+most cited failure mode in vesting design, so VC (12), team (18) and founder
+(120) never share a month.
+
+### Marketing — 840,000,000 (4.00%)
+
+**210,000,000 liquid at genesis** (25%), for listing fees and launch spend; the
+remaining 630,000,000 vests linearly over 24 months. The split follows ordinary
+practice: launch spend is immediate by nature, ongoing programmes are not.
+
+### Liquidity — 1,050,000,000 (5.00%)
+
+**100% liquid at genesis.** Deployed to exchange order books and AMM pools.
+Vesting a liquidity bucket defeats the purpose of having one, so this is the one
+allocation where full unlock is not a concession but the function.
+
+### Consolidated
+
+| Bucket | BLCH | Share | Liquid at genesis | Fully vested |
+|---|---:|---:|---:|---|
+| VC | 2,100,000,000 | 10.00% | 0 | year 3 |
+| Team | 2,100,000,000 | 10.00% | 0 | year 4.5 |
+| Marketing | 840,000,000 | 4.00% | 210,000,000 | year 2 |
+| Liquidity | 1,050,000,000 | 5.00% | 1,050,000,000 | genesis |
+| **Total** | **6,090,000,000** | **29.00%** | **1,260,000,000** | |
+
+### The number worth noticing
+
+Circulating supply at slot 0 is 5,033,884,800 BLCH — the carryover plus these
+1,260,000,000. So the Foundation's liquid holding is **exactly 25.0% of
+circulating at genesis**, sitting precisely on the G2 threshold, and the
+carryover is the other 75.0%.
+
+Two entities therefore account for the entire genesis float, and the
+concentration gates cannot be met by either of them changing behaviour — only
+by validator emission and independent stake diluting both. That is the same
+conclusion §4A reaches from the carryover side, arrived at from the Foundation
+side.
+
+---
+
 ## 7A. The unlock model, run against the PoS gates
 
 Modelling the schedules month by month, treating each bucket as a single
