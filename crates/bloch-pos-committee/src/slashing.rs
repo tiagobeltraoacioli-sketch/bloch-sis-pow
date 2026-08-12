@@ -39,12 +39,16 @@
 
 use crate::attestation::{Attestation, SignatureVerifier};
 use crate::delegation::{apply_slash, Delegation};
+use crate::interfaces::ProposalEnvelope;
 use crate::params::DS_SLASH;
 use sha3::{Digest, Sha3_256};
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Base penalty for proposer equivocation (double vote), in basis points.
-/// Appendix A: 5% + ejection.
+/// Base penalty for equivocation, in basis points. Appendix A
+/// (`SLASH_PROPOSER_EQUIV`): 5% + ejection. Two offences price off this one
+/// constant because both *are* equivocation — a proposer signing two headers
+/// for one slot, and an attester signing two votes for one target epoch — and
+/// the spec assigns them the same row.
 pub const SLASH_PROPOSER_EQUIV_BPS: u128 = 500;
 
 /// Base penalty for a surround vote, in basis points. Appendix A: 5% +
@@ -74,11 +78,19 @@ pub const CORRELATION_MULTIPLIER: u128 = 3;
 /// correlation becomes visible. Twice the withdrawal delay, next power of two.
 pub const CORRELATION_WINDOW_EPOCHS: u64 = 4_096;
 
-/// Which slashable offence the evidence proves. The two are mutually
-/// exclusive: a double vote requires equal target epochs, a surround requires
-/// strictly nested (hence unequal) ones.
+/// Which slashable offence the evidence proves. The offences are mutually
+/// exclusive per evidence: a double vote requires equal target epochs, a
+/// surround requires strictly nested (hence unequal) ones, and a proposer
+/// equivocation is a pair of headers, not attestations. Mirrors the closed
+/// [`crate::interfaces::Offence`] enum — an offence class is a consensus
+/// rule, and adding one post-genesis is a hard fork, not an enum extension.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SlashableOffense {
+    /// Two distinct signed headers for the same slot by the same proposer.
+    /// This is exactly what [`crate::produce::ProducerRandao`]'s single-use
+    /// reveal fence exists to make impossible by accident: the honest path to
+    /// it is "call produce twice for one slot", and produce refuses.
+    ProposerEquivocation,
     /// Two different attestations for the same target epoch.
     DoubleVote,
     /// One attestation's checkpoint span strictly surrounds the other's.
@@ -89,6 +101,8 @@ impl SlashableOffense {
     /// Base penalty for this offence, before correlation amplification.
     pub const fn base_penalty_bps(self) -> u128 {
         match self {
+            // Both are equivocation; the spec prices them on one row.
+            SlashableOffense::ProposerEquivocation => SLASH_PROPOSER_EQUIV_BPS,
             SlashableOffense::DoubleVote => SLASH_PROPOSER_EQUIV_BPS,
             SlashableOffense::SurroundVote => SLASH_SURROUND_VOTE_BPS,
         }
@@ -115,12 +129,23 @@ pub enum EvidenceError {
     BadSignature,
 }
 
-/// Two conflicting signed messages from one validator — the §7.3 evidence
-/// transaction payload.
-#[derive(Clone, Debug)]
+/// Two conflicting signed attestations from one validator — the attestation
+/// half of the §7.3 evidence payload. The wire/transaction shape that carries
+/// either this pair or a header pair is [`crate::interfaces::SlashingEvidence`];
+/// the [`From`] impl below is the one conversion between them.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SlashingEvidence {
     pub first: Attestation,
     pub second: Attestation,
+}
+
+impl From<SlashingEvidence> for crate::interfaces::SlashingEvidence {
+    fn from(ev: SlashingEvidence) -> Self {
+        crate::interfaces::SlashingEvidence::AttestationOffence {
+            first: ev.first,
+            second: ev.second,
+        }
+    }
 }
 
 impl SlashingEvidence {
@@ -195,7 +220,9 @@ pub struct SlashingOutcome {
 
 /// The slashing state machine: what has been applied, who is ejected, and how
 /// much stake was slashed in each recent epoch (the amplification input).
-#[derive(Clone, Debug, Default)]
+/// `PartialEq` because this is a component of the transition's committed
+/// state, and committed states are compared whole in the determinism tests.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SlashingState {
     /// Identities of applied evidence. Successful applications only — failed
     /// evidence is not recorded, so a forged submission cannot squat an id
@@ -285,6 +312,116 @@ impl SlashingState {
             }
         }
 
+        Ok(self.commit_offense(
+            id,
+            validator,
+            offense,
+            epoch,
+            delegations,
+            total_active_sat,
+            including_proposer,
+        ))
+    }
+
+    /// Verify and apply one proposer-equivocation evidence transaction: two
+    /// distinct signed headers for the same slot by the same proposer. Same
+    /// pipeline shape and error order as [`Self::process`]; the two share
+    /// [`Self::commit_offense`] so the penalty arithmetic, replay set,
+    /// ejection set and correlation window have exactly one definition.
+    ///
+    /// Deliberately does **not** check that the proposer was the slot's
+    /// scheduled proposer. Signing two conflicting headers for one slot is
+    /// provably hostile whether or not the schedule drew you — and checking
+    /// the schedule would need the seed of an arbitrarily old epoch, which
+    /// committed state does not retain (the 2-epoch mix window, §5.5).
+    ///
+    /// The identical-header case falls out structurally: one header equals
+    /// itself, so `BlockId::of` matches and the pair is `NotConflicting` —
+    /// re-gossiping your own block can never be made to look like
+    /// equivocation, the same property `offense()` gives attestations.
+    #[allow(clippy::too_many_arguments)]
+    pub fn process_proposer(
+        &mut self,
+        first: &ProposalEnvelope,
+        second: &ProposalEnvelope,
+        epoch: u64,
+        delegations: &[Delegation],
+        total_active_sat: u128,
+        including_proposer: u32,
+        verifier: &dyn SignatureVerifier,
+    ) -> Result<SlashingOutcome, EvidenceError> {
+        // 1. Structure: one signer, one slot, two different blocks.
+        if first.header.proposer_index != second.header.proposer_index {
+            return Err(EvidenceError::DifferentValidators);
+        }
+        if first.header.slot != second.header.slot
+            || crate::header::BlockId::of(&first.header) == crate::header::BlockId::of(&second.header)
+        {
+            return Err(EvidenceError::NotConflicting);
+        }
+
+        // 2. Anti-replay. Same construction as the attestation id: sorted
+        //    signing roots, signatures excluded. The proposal signing root is
+        //    under DS_PROPOSE while attestation roots are under DS_ATTEST, so
+        //    a header-pair id can never collide with an attestation-pair id
+        //    even though both live in one `applied` set.
+        let r1 = first.header.proposal_signing_root();
+        let r2 = second.header.proposal_signing_root();
+        let (lo, hi) = if r1 <= r2 { (r1, r2) } else { (r2, r1) };
+        let validator = first.header.proposer_index;
+        let mut h = Sha3_256::new();
+        h.update(DS_SLASH);
+        h.update(validator.to_le_bytes());
+        h.update(lo);
+        h.update(hi);
+        let id: [u8; 32] = h.finalize().into();
+        if self.applied.contains(&id) {
+            return Err(EvidenceError::AlreadyApplied);
+        }
+
+        // 3. Ejection: same rationale as `process` step 3.
+        if self.ejected.contains(&validator) {
+            return Err(EvidenceError::AlreadySlashed);
+        }
+
+        // 4. Signatures, last — the proposer really signed both headers.
+        for env in [first, second] {
+            if !verifier.verify(
+                validator,
+                &env.header.proposal_signing_root(),
+                &env.proposer_sig,
+            ) {
+                return Err(EvidenceError::BadSignature);
+            }
+        }
+
+        Ok(self.commit_offense(
+            id,
+            validator,
+            SlashableOffense::ProposerEquivocation,
+            epoch,
+            delegations,
+            total_active_sat,
+            including_proposer,
+        ))
+    }
+
+    /// Steps 5–7 of the pipeline, shared by both evidence forms: price the
+    /// offence, burn pro-rata, and commit. Private, infallible, and only
+    /// reachable after every check has passed — the checks stay with the
+    /// evidence forms because they differ, the consequences live here because
+    /// they must not.
+    #[allow(clippy::too_many_arguments)]
+    fn commit_offense(
+        &mut self,
+        id: [u8; 32],
+        validator: u32,
+        offense: SlashableOffense,
+        epoch: u64,
+        delegations: &[Delegation],
+        total_active_sat: u128,
+        including_proposer: u32,
+    ) -> SlashingOutcome {
         // 5. Price the offence from the window as it stood before this slash.
         let penalty_bps = self.penalty_bps(offense.base_penalty_bps(), epoch, total_active_sat);
 
@@ -302,14 +439,14 @@ impl SlashingState {
         let floor = epoch.saturating_sub(CORRELATION_WINDOW_EPOCHS - 1);
         self.window.retain(|e, _| *e >= floor);
 
-        Ok(SlashingOutcome {
+        SlashingOutcome {
             offense,
             penalty_bps,
             delegation_losses_sat,
             total_slashed_sat,
             whistleblower_reward_sat,
             including_proposer,
-        })
+        }
     }
 }
 
@@ -522,6 +659,105 @@ mod tests {
         // touched a second time.
         let other = surround(7);
         let r = st.process(&other, 11, &dels, TOTAL_ACTIVE, 99, &RootEchoVerifier);
+        assert_eq!(r.unwrap_err(), EvidenceError::AlreadySlashed);
+        assert_eq!(st.slashed_in_window(11), 5_000);
+    }
+
+    // ── proposer equivocation ───────────────────────────────────────────────
+
+    fn header(slot: u64, proposer: u32, distinguisher: u8) -> crate::header::BlockHeaderV4 {
+        crate::header::BlockHeaderV4 {
+            version: crate::header::VERSION_G4,
+            parent: [distinguisher; 32],
+            state_root: [0; 32],
+            body_root: [0; 32],
+            slot,
+            proposer_index: proposer,
+            randao_reveal: [1; 32],
+            randao_mix: [2; 32],
+            justified_root: [3; 32],
+            finalized_root: [4; 32],
+            attestation_root: [5; 32],
+            coherence_root: [6; 32],
+        }
+    }
+
+    /// "Signed" under [`RootEchoVerifier`]: signature = proposal signing root.
+    fn signed_header(slot: u64, proposer: u32, distinguisher: u8) -> ProposalEnvelope {
+        let h = header(slot, proposer, distinguisher);
+        ProposalEnvelope { proposer_sig: h.proposal_signing_root().to_vec(), header: h }
+    }
+
+    #[test]
+    fn proposer_equivocation_slashes_and_ejects() {
+        let dels = [delegation(1, 7, 100_000), delegation(2, 8, 100_000)];
+        let (a, b) = (signed_header(5, 7, 0xAA), signed_header(5, 7, 0xBB));
+        let mut st = SlashingState::new();
+        let out = st
+            .process_proposer(&a, &b, 10, &dels, TOTAL_ACTIVE, 42, &RootEchoVerifier)
+            .unwrap();
+        assert_eq!(out.offense, SlashableOffense::ProposerEquivocation);
+        assert_eq!(out.penalty_bps, SLASH_PROPOSER_EQUIV_BPS); // empty window: base only
+        assert_eq!(out.delegation_losses_sat, vec![5_000, 0]); // validator 8 untouched
+        assert_eq!(out.whistleblower_reward_sat, out.total_slashed_sat / WHISTLEBLOWER_QUOTIENT);
+        assert!(st.is_ejected(7));
+        assert!(!st.is_ejected(8));
+    }
+
+    #[test]
+    fn identical_headers_are_not_proposer_equivocation() {
+        // Re-gossiping your own block must never be punishable.
+        let a = signed_header(5, 7, 0xAA);
+        let mut st = SlashingState::new();
+        let r = st.process_proposer(&a, &a.clone(), 10, &[], TOTAL_ACTIVE, 42, &RootEchoVerifier);
+        assert_eq!(r.unwrap_err(), EvidenceError::NotConflicting);
+    }
+
+    #[test]
+    fn different_slot_headers_are_not_proposer_equivocation() {
+        // One proposer legitimately proposes in many slots over time.
+        let (a, b) = (signed_header(5, 7, 0xAA), signed_header(6, 7, 0xBB));
+        let mut st = SlashingState::new();
+        let r = st.process_proposer(&a, &b, 10, &[], TOTAL_ACTIVE, 42, &RootEchoVerifier);
+        assert_eq!(r.unwrap_err(), EvidenceError::NotConflicting);
+    }
+
+    #[test]
+    fn forged_proposer_evidence_is_rejected_and_id_not_burned() {
+        let a = signed_header(5, 7, 0xAA);
+        let mut b = signed_header(5, 7, 0xBB);
+        b.proposer_sig = vec![0u8; 32]; // not the signing root: forged
+        let dels = [delegation(1, 7, 100_000)];
+        let mut st = SlashingState::new();
+        let r = st.process_proposer(&a, &b, 10, &dels, TOTAL_ACTIVE, 42, &RootEchoVerifier);
+        assert_eq!(r.unwrap_err(), EvidenceError::BadSignature);
+        assert!(!st.is_ejected(7));
+        assert_eq!(st.slashed_in_window(10), 0);
+        // The honest version of the same pair still applies.
+        let b_ok = signed_header(5, 7, 0xBB);
+        assert!(st.process_proposer(&a, &b_ok, 10, &dels, TOTAL_ACTIVE, 42, &RootEchoVerifier).is_ok());
+    }
+
+    #[test]
+    fn proposer_evidence_replay_is_blocked_even_swapped() {
+        let dels = [delegation(1, 7, 100_000)];
+        let (a, b) = (signed_header(5, 7, 0xAA), signed_header(5, 7, 0xBB));
+        let mut st = SlashingState::new();
+        st.process_proposer(&a, &b, 10, &dels, TOTAL_ACTIVE, 42, &RootEchoVerifier).unwrap();
+        let r = st.process_proposer(&b, &a, 11, &dels, TOTAL_ACTIVE, 42, &RootEchoVerifier);
+        assert_eq!(r.unwrap_err(), EvidenceError::AlreadyApplied);
+        assert_eq!(st.slashed_in_window(11), 5_000); // recorded exactly once
+    }
+
+    #[test]
+    fn header_and_attestation_evidence_share_one_ejection_set() {
+        // A validator slashed for a double vote cannot be punished again by a
+        // later proposer-equivocation evidence — the stake was already burned.
+        let dels = [delegation(1, 7, 100_000)];
+        let mut st = SlashingState::new();
+        st.process(&double_vote(7), 10, &dels, TOTAL_ACTIVE, 42, &RootEchoVerifier).unwrap();
+        let (a, b) = (signed_header(5, 7, 0xAA), signed_header(5, 7, 0xBB));
+        let r = st.process_proposer(&a, &b, 11, &dels, TOTAL_ACTIVE, 42, &RootEchoVerifier);
         assert_eq!(r.unwrap_err(), EvidenceError::AlreadySlashed);
         assert_eq!(st.slashed_in_window(11), 5_000);
     }

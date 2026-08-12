@@ -135,7 +135,7 @@ pub use crate::header::BlockHeaderV4;
 /// envelope, **not** in the header (§5.3): a 4.6 KB in-header signature would
 /// ride along every header-sync and light-client path, so the signed object is
 /// kept at 248 B and only full validation pays for the hybrid verify.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProposalEnvelope {
     pub header: BlockHeaderV4,
     /// Hybrid ML-DSA-65 ‖ Falcon-1024, ≈ 4,589 B, opaque here — this crate
@@ -235,7 +235,13 @@ pub enum Offence {
 /// Evidence as it travels in a transaction: the two conflicting signed
 /// messages, carried whole so every node re-verifies both signatures rather
 /// than trusting the reporter.
-#[derive(Clone, Debug)]
+///
+/// This is the wire/transaction shape; the state machine that judges it is
+/// [`crate::slashing::SlashingState`], reached through the transition's
+/// `PosTransaction::SlashingEvidence` variant. (Deriving `PartialEq` was
+/// added when the wiring landed — a derive, not a signature change, so it is
+/// inside the freeze.)
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SlashingEvidence {
     ProposerEquivocation {
         first: ProposalEnvelope,

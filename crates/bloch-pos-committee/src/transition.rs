@@ -5,9 +5,9 @@
 //! Every module in this crate states one rule; until now nothing composed
 //! them. This module implements [`StateTransition`]: parent state × block →
 //! child state, calling into `schedule`, `beacon`, `committees`,
-//! `attestation`, `forkchoice`, `rewards` and `state_root` for `apply_block`,
-//! and into `finality`, `staking`, `delegation` and `genesis_cohort` for
-//! `process_epoch`. No consensus rule is *defined* here; this module only
+//! `attestation`, `forkchoice`, `rewards`, `slashing` and `state_root` for
+//! `apply_block`, and into `finality`, `staking`, `delegation` and
+//! `genesis_cohort` for `process_epoch`. No consensus rule is *defined* here; this module only
 //! decides in what order the existing rules run and what state they read.
 //!
 //! ## The three rules this module is written against
@@ -74,7 +74,10 @@
 //! **not** yet appear under a `StateRoots` component and therefore are not
 //! bound by the header's `state_root`: the finality bookkeeping, per-validator
 //! RANDAO chain positions (`reveals_used`), the deposit/delegation queues,
-//! pending fee rewards, and fork-choice latest messages. Extending the closed
+//! pending fee rewards, fork-choice latest messages, the slashing state
+//! (applied-evidence ids, correlation window) and the delegator slash-loss
+//! ledger — though the slash's *effects* on the registry (the `slashed` flag,
+//! the reduced bond) ARE committed via the registry component. Extending the closed
 //! component list is a visible spec change (interfaces §Boundary 7) that needs
 //! the two-reviewer rule; recorded in `BLOCH-POS-INTERFACES.md` as an open
 //! point rather than smuggled in here as an eighth leaf.
@@ -95,12 +98,14 @@ use crate::forkchoice::{LatestMessage, Store};
 use crate::genesis_cohort;
 use crate::interfaces::{
     BlockId, Checkpoint, FinalityState as FinalityView, ProposalEnvelope,
-    ProposalReject, StateReader, StateTransition, TransitionError, ValidatorRecord,
+    ProposalReject, SlashingEvidence, StateReader, StateTransition, TransitionError,
+    ValidatorRecord,
 };
 use crate::params::SLOTS_PER_EPOCH;
 use crate::rewards::{self, StakeAccount};
 use crate::sample::Validator;
 use crate::schedule;
+use crate::slashing;
 use crate::staking::{self, QueuedDeposit};
 use crate::state_root::{
     ConsensusState, ParticipationRecord, RandaoMix, ValidatorRecord as CommittedValidatorRecord,
@@ -159,6 +164,27 @@ pub enum PosTransaction {
         /// exists so the ineligibility is itself a committed, auditable fact.
         eligible: bool,
     },
+    /// A §7.3 evidence transaction: two conflicting signed messages proving
+    /// one validator equivocated (a header pair or an attestation pair —
+    /// [`crate::interfaces::SlashingEvidence`] is the frozen wire shape).
+    ///
+    /// Carried whole and **re-verified by every node** in
+    /// [`slashing::SlashingState::process`]/`process_proposer` — the reporter
+    /// is never trusted, so forged evidence cannot eject an honest validator
+    /// and a replayed pair (either order) is a deterministic reject. Unlike
+    /// every other transaction, its admission checks run *inside* the
+    /// transition, not at the mempool boundary: whether evidence is fresh is
+    /// a question about committed state (the applied-set), which only the
+    /// transition holds.
+    ///
+    /// The offence itself may be arbitrarily old: evidence stays prosecutable
+    /// for as long as the offender's stake is reachable, which is exactly
+    /// what the withdrawal delay (the weak-subjectivity margin, §7.2) exists
+    /// to guarantee. No committee-membership check is imposed on the two
+    /// messages, deliberately — old epochs' committees are no longer
+    /// derivable from retained state (2-epoch mix window), and a signed
+    /// conflict is hostile whether or not the signer was on duty.
+    SlashingEvidence(SlashingEvidence),
 }
 
 // ─── The committed state ────────────────────────────────────────────────────
@@ -210,7 +236,13 @@ pub struct CommittedState {
     /// state remains bit-identical to a from-scratch replay of the votes.
     finality_engine: finality::FinalityState,
     /// Justified checkpoint as of the *previous* epoch — required by the
-    /// frozen [`FinalityView`] (surround-vote slashing is judged against it).
+    /// frozen [`FinalityView`] (Casper's two-round rule relates the current
+    /// justification to this one). Honest scope note: the wired surround-vote
+    /// slashing does NOT read it — the Casper surround predicate
+    /// (`s1 < s2 ∧ t2 < t1`, `AttestationData::surrounds`) is a property of
+    /// the evidence pair alone, decidable with no history at all, which is
+    /// what lets old offences stay prosecutable after the epoch's context is
+    /// gone. This field is the finality bookkeeping, not a slashing input.
     previous_justified: Checkpoint,
     /// Epoch-boundary votes accumulated during the current epoch, keyed by
     /// `(validator, signing_root)` so the set — not the arrival order — is
@@ -244,6 +276,24 @@ pub struct CommittedState {
     /// duration. Mid-epoch compounding would let a fee-heavy block reshuffle
     /// the committees that are supposed to be judging it.
     pending_fee_rewards: BTreeMap<u32, u128>,
+    /// The slashing state machine (§7.3, slashing.rs): applied-evidence ids
+    /// (anti-replay), ejected validators, and the per-epoch slashed-stake
+    /// window that prices correlation amplification. Consensus state, derived
+    /// exclusively from evidence transactions in blocks — never from gossip,
+    /// which only *captures* candidate pairs (gossip.rs).
+    slashing: slashing::SlashingState,
+    /// Cumulative slashing losses per delegator account, in satoshis.
+    ///
+    /// A separate ledger, NOT a mutation of the delegation records: the
+    /// delegation registry replays its warm-up history from the committed
+    /// records ([`delegation::Registry::resolve`]), so editing a record's
+    /// amount would retroactively reshuffle every later admission under the
+    /// shared churn budget. The loss is committed here instead, and the
+    /// node's withdrawal surface nets it out
+    /// (`delegator_slash_loss_sat`). The delegated stake itself stops
+    /// counting the moment the operator is slashed, because the duty roster
+    /// skips slashed validators entirely.
+    delegator_slash_losses: BTreeMap<u32, u128>,
     /// Carried roots (§6.6.2): never recomputed by this transition.
     taint_root: [u8; 32],
     coherence_accumulator_root: [u8; 32],
@@ -316,6 +366,8 @@ impl CommittedState {
             pubkey_index,
             delegations: Vec::new(),
             pending_fee_rewards: BTreeMap::new(),
+            slashing: slashing::SlashingState::new(),
+            delegator_slash_losses: BTreeMap::new(),
             taint_root,
             coherence_accumulator_root,
             coherence_nullifier_root,
@@ -607,7 +659,152 @@ impl CommittedState {
                 });
                 Ok((0, 0))
             }
+            // Evidence needs the injected signature verifier, which lives on
+            // the Transition, not on the state — compute_post_state routes it
+            // to `apply_slashing_evidence` before this method is reached.
+            // Reaching this arm means a caller bypassed that seam; refusing
+            // beats silently accepting unverified evidence.
+            PosTransaction::SlashingEvidence(_) => Err(()),
         }
+    }
+
+    /// Verify and execute one §7.3 evidence transaction against this state.
+    ///
+    /// The verdict — structure, anti-replay, not-already-slashed, both
+    /// signatures — belongs to [`slashing::SlashingState`] (the single
+    /// definition, its unit tests pin every branch). What belongs *here* is
+    /// the consequence, because only this struct holds the accounts:
+    ///
+    /// - the operator's own bond absorbs its share of the penalty and the
+    ///   record is marked `slashed` — duties stop immediately (the duty
+    ///   roster filters on the flag) and the residue stays locked through
+    ///   the weak-subjectivity margin, never *shortening* an
+    ///   already-scheduled lock;
+    /// - each delegator's pro-rata loss is committed to the
+    ///   [`Self::delegator_slash_losses`] ledger (delegation.rs rule 3:
+    ///   exposure is what makes delegation a security signal). Bonded is
+    ///   slashable in every lifecycle state except withdrawn — a delegation
+    ///   still warming up or draining is still bonded coins; one past
+    ///   cool-down is not reachable and is masked out;
+    /// - the whistleblower's 1/32 accrues to the including proposer through
+    ///   [`Self::pending_fee_rewards`], compounding at the epoch boundary
+    ///   like every other in-epoch reward (effective stake stays frozen
+    ///   within the epoch). The rest of the penalty is burned by never being
+    ///   credited to anyone — the same burn-by-omission as the base fee.
+    fn apply_slashing_evidence(
+        &mut self,
+        evidence: &SlashingEvidence,
+        including_proposer: u32,
+        total_active_sat: u128,
+        verifier: &dyn SignatureVerifier,
+    ) -> Result<(), ()> {
+        let offender = match evidence {
+            SlashingEvidence::AttestationOffence { first, .. } => first.validator,
+            SlashingEvidence::ProposerEquivocation { first, .. } => first.header.proposer_index,
+        };
+        // No record, nothing to slash: evidence against an index that never
+        // registered proves nothing about this chain.
+        let Some(offender_rec) = self.validators.get(&offender) else {
+            return Err(());
+        };
+        let own_bond_sat = offender_rec.staked_sat;
+
+        // The exposure view apply_slash prices against: index 0 is a
+        // synthetic record for the operator's own bond (so operator and
+        // delegators are priced by the same arithmetic, in one call), the
+        // rest mirrors the committed delegation list in order, with
+        // withdrawn (post-cool-down) delegations masked ineligible — their
+        // coins have left the bond and are no longer reachable.
+        let registry = delegation::Registry::resolve(&self.delegations, self.epoch);
+        let mut exposure: Vec<Delegation> = Vec::with_capacity(self.delegations.len() + 1);
+        exposure.push(Delegation {
+            delegator: offender,
+            validator: offender,
+            amount_sat: own_bond_sat,
+            requested_epoch: 0,
+            deactivate_epoch: None,
+            eligible: true,
+        });
+        for d in &self.delegations {
+            let mut view = *d;
+            if registry.state_of(d) == delegation::StakeState::Inactive {
+                view.eligible = false;
+            }
+            exposure.push(view);
+        }
+
+        let outcome = match evidence {
+            SlashingEvidence::AttestationOffence { first, second } => {
+                let pair = slashing::SlashingEvidence {
+                    first: first.clone(),
+                    second: second.clone(),
+                };
+                self.slashing.process(
+                    &pair,
+                    self.epoch,
+                    &exposure,
+                    total_active_sat,
+                    including_proposer,
+                    verifier,
+                )
+            }
+            SlashingEvidence::ProposerEquivocation { first, second } => {
+                self.slashing.process_proposer(
+                    first,
+                    second,
+                    self.epoch,
+                    &exposure,
+                    total_active_sat,
+                    including_proposer,
+                    verifier,
+                )
+            }
+        }
+        .map_err(|_| ())?;
+
+        let epoch = self.epoch;
+        if let Some(rec) = self.validators.get_mut(&offender) {
+            rec.slashed = true;
+            rec.staked_sat = rec.staked_sat.saturating_sub(outcome.delegation_losses_sat[0]);
+            // Ejection: duties stop now. min(), because a validator already
+            // exiting must not have its exit pushed later by the slash.
+            if epoch < rec.exit_epoch {
+                rec.exit_epoch = epoch;
+            }
+            // The residue stays reachable through the weak-subjectivity
+            // margin, and a slash never *shortens* a scheduled lock
+            // (`u64::MAX` means no lock was scheduled at all).
+            let lock = epoch.saturating_add(staking::WITHDRAWAL_DELAY_EPOCHS);
+            rec.withdrawable_epoch = if rec.withdrawable_epoch == u64::MAX {
+                lock
+            } else {
+                rec.withdrawable_epoch.max(lock)
+            };
+        }
+        for (d, loss) in self
+            .delegations
+            .iter()
+            .zip(outcome.delegation_losses_sat.iter().skip(1))
+        {
+            if *loss > 0 {
+                *self.delegator_slash_losses.entry(d.delegator).or_insert(0) += *loss;
+            }
+        }
+        if outcome.whistleblower_reward_sat > 0 {
+            *self
+                .pending_fee_rewards
+                .entry(including_proposer)
+                .or_insert(0) += outcome.whistleblower_reward_sat;
+        }
+        Ok(())
+    }
+
+    /// Total slashing loss committed against one delegator account, in
+    /// satoshis. The number a wallet subtracts from the delegator's bonded
+    /// amounts at withdrawal — a delegator who chose a slashed operator finds
+    /// its loss here, not in a mutated delegation record.
+    pub fn delegator_slash_loss_sat(&self, delegator: u32) -> u128 {
+        self.delegator_slash_losses.get(&delegator).copied().unwrap_or(0)
     }
 
     // ── Epoch boundary ──────────────────────────────────────────────────────
@@ -629,7 +826,8 @@ impl CommittedState {
                 st.pending_votes.iter().map(|((v, _), d)| (*v, *d)).collect();
             // Roll the frozen view's previous_justified before the engine
             // moves: it is "the justified checkpoint as of the last epoch",
-            // exactly what surround-vote slashing judges against.
+            // the anchor of Casper's two-round finality rule. (Not a slashing
+            // input — see the field docs: the surround predicate is pairwise.)
             let old = st.finality_engine.current_justified();
             st.previous_justified = Checkpoint { epoch: old.epoch, root: old.root };
             // The votes go through `votes_from_partition`, not straight into
@@ -954,13 +1152,29 @@ impl<V: SignatureVerifier> Transition<V> {
         // 9. Fork-choice weight accumulation (forkchoice.rs).
         st.accumulate_forkchoice(&roster, attestations);
 
-        // 10. Transactions — cheap state-dependent rules only (see
-        //     PosTransaction docs for where the crypto checks live).
+        // 10. Transactions — cheap state-dependent rules, except slashing
+        //     evidence, which is routed here because it needs the injected
+        //     verifier (two hybrid verifies per evidence; evidence is rare
+        //     and a proposer including garbage evidence forfeits the whole
+        //     block, so the cost is not a spam surface). Invalid evidence is
+        //     a block reject, not a skip: every node re-judges it, so a
+        //     proposer cannot smuggle a no-op past nodes that judge harder.
         let total_active: u128 = roster.iter().map(|v| v.effective_stake as u128).sum();
         let mut base_fees: u128 = 0;
         let mut priority_fees: u128 = 0;
         for (i, tx) in transactions.iter().enumerate() {
-            match st.apply_transaction(tx, total_active) {
+            let applied = match tx {
+                PosTransaction::SlashingEvidence(ev) => st
+                    .apply_slashing_evidence(
+                        ev,
+                        header.proposer_index,
+                        total_active,
+                        &self.verifier,
+                    )
+                    .map(|()| (0, 0)),
+                _ => st.apply_transaction(tx, total_active),
+            };
+            match applied {
                 Ok((b, p)) => {
                     base_fees += b;
                     priority_fees += p;
@@ -1060,7 +1274,24 @@ mod tests {
         bloch * tokenomics_v4::SAT_PER_BLOCH
     }
 
+    /// Rejects exactly the marker byte-string `b"forged"`, accepts anything
+    /// else — enough to make one signature of an evidence pair verifiably
+    /// bad while every other signature in the block still passes.
+    struct MarkerVerifier;
+    impl SignatureVerifier for MarkerVerifier {
+        fn verify(&self, _v: u32, _root: &[u8; 32], sig: &[u8]) -> bool {
+            sig != b"forged"
+        }
+    }
+
     fn setup(n: u32) -> (Transition<OkVerifier>, CommittedState, Vec<RandaoChain>) {
+        setup_with(n, OkVerifier)
+    }
+
+    fn setup_with<V: SignatureVerifier>(
+        n: u32,
+        verifier: V,
+    ) -> (Transition<V>, CommittedState, Vec<RandaoChain>) {
         let mut chains = Vec::new();
         let mut vals = Vec::new();
         for i in 0..n {
@@ -1086,13 +1317,13 @@ mod tests {
             [0x22; 32],
             [0x33; 32],
         );
-        (Transition::new(OkVerifier), st, chains)
+        (Transition::new(verifier), st, chains)
     }
 
     /// Build a valid block at `slot` on top of `pre`, consuming the drawn
     /// proposer's next reveal — the same walk a real validator client does.
-    fn build_block(
-        t: &Transition<OkVerifier>,
+    fn build_block<V: SignatureVerifier>(
+        t: &Transition<V>,
         pre: &CommittedState,
         slot: u64,
         atts: &[Attestation],
@@ -1543,6 +1774,249 @@ mod tests {
         let s2 = t.process_epoch(&s1).unwrap();
         assert_eq!(s2.validator_record(p).unwrap().staked_sat, sat(200_000) + 1_000);
         assert!(s2.pending_fee_rewards.is_empty());
+    }
+
+    // ── slashing through the transition (§7.3) ──────────────────────────────
+
+    /// A double vote by `v`: two attestations, same target epoch, different
+    /// heads. Signatures are the OkVerifier/MarkerVerifier-passing kind.
+    fn double_vote_evidence(v: u32) -> SlashingEvidence {
+        let data = |head: u8| AttestationData {
+            slot: 32,
+            head: [head; 32],
+            source_epoch: 0,
+            source_root: [1; 32],
+            target_epoch: 1,
+            target_root: [head; 32],
+        };
+        SlashingEvidence::AttestationOffence {
+            first: Attestation { data: data(0xAA), validator: v, signature: vec![0u8; 8] },
+            second: Attestation { data: data(0xBB), validator: v, signature: vec![0u8; 8] },
+        }
+    }
+
+    /// A syntactically valid envelope for `slot` on `pre` (right proposer,
+    /// reveal, mix, finality roots) with a zero state root — for tests that
+    /// need `compute_post_state` to reach the transaction step and fail
+    /// there, where `build_block` would refuse to assemble the block at all.
+    fn probe_env(pre: &CommittedState, slot: u64, chains: &mut [RandaoChain]) -> ProposalEnvelope {
+        let roster = pre.duty_roster();
+        let seed = pre.seed_for_epoch(pre.epoch);
+        let p = schedule::proposer(&seed, slot, &roster).unwrap();
+        let reveal = chains[p as usize].next_reveal().unwrap();
+        let fin = pre.finality_view();
+        let header = BlockHeaderV4 {
+            version: BLOCK_VERSION_V4,
+            parent: *pre.head.as_bytes(),
+            state_root: [0u8; 32],
+            body_root: [0u8; 32],
+            slot,
+            proposer_index: p,
+            randao_reveal: reveal,
+            randao_mix: beacon::mix_in(&pre.randao_mix, &reveal),
+            justified_root: fin.justified.root,
+            finalized_root: fin.finalized.root,
+            attestation_root: [0u8; 32],
+            coherence_root: [0u8; 32],
+        };
+        ProposalEnvelope { header, proposer_sig: vec![0u8; 8] }
+    }
+
+    #[test]
+    fn evidence_transaction_slashes_operator_and_delegators_and_pays_whistleblower() {
+        let (t, g, mut chains) = setup(4);
+        let seed = g.seed_for_epoch(0);
+        // Pick an offender that is NOT the proposer of the evidence-carrying
+        // block, so the whistleblower's account is cleanly separable.
+        let p2 = schedule::proposer(&seed, 2, &g.duty_roster()).unwrap();
+        let offender = (p2 + 1) % 4;
+
+        // Block 1: a delegator bonds behind the future offender.
+        let delegate = PosTransaction::Delegate {
+            delegator: 900,
+            validator: offender,
+            amount_sat: delegation::MIN_DELEGATION_SAT,
+            eligible: true,
+        };
+        let b1 = build_block(&t, &g, 1, &[], std::slice::from_ref(&delegate), &mut chains);
+        let s1 = t.apply_block(&g, &b1, &[], std::slice::from_ref(&delegate)).unwrap();
+
+        // Block 2 carries the evidence transaction.
+        let ev = PosTransaction::SlashingEvidence(double_vote_evidence(offender));
+        let b2 = build_block(&t, &s1, 2, &[], std::slice::from_ref(&ev), &mut chains);
+        let s2 = t.apply_block(&s1, &b2, &[], std::slice::from_ref(&ev)).unwrap();
+        assert_eq!(p2, b2.header.proposer_index, "test premise: whistleblower is p2");
+
+        // Operator: 5% of the bond burned, record marked, ejected now, stake
+        // locked through the weak-subjectivity margin.
+        let own_loss = sat(200_000) * slashing::SLASH_PROPOSER_EQUIV_BPS / 10_000;
+        let rec = s2.validator_record(offender).unwrap();
+        assert!(rec.slashed);
+        assert_eq!(rec.staked_sat, sat(200_000) - own_loss);
+        assert_eq!(rec.exit_epoch, 0, "duties stop in the epoch of the slash");
+        assert_eq!(rec.withdrawable_epoch, staking::WITHDRAWAL_DELAY_EPOCHS);
+        assert!(
+            !s2.active_validators().iter().any(|v| v.index == offender),
+            "a slashed validator must leave the duty roster at once"
+        );
+
+        // Delegator: pro-rata loss (delegation.rs rule 3), committed to the
+        // ledger a wallet reads — still exposed even though the delegation
+        // was warming up, because bonded is slashable.
+        let del_loss = delegation::MIN_DELEGATION_SAT * slashing::SLASH_PROPOSER_EQUIV_BPS / 10_000;
+        assert_eq!(s2.delegator_slash_loss_sat(900), del_loss);
+        assert_eq!(s2.delegator_slash_loss_sat(901), 0, "other accounts untouched");
+
+        // Whistleblower: 1/32 of the total, accrued in-epoch...
+        let whistle = (own_loss + del_loss) / slashing::WHISTLEBLOWER_QUOTIENT;
+        assert_eq!(*s2.pending_fee_rewards.get(&p2).unwrap(), whistle);
+        assert_eq!(s2.validator_record(p2).unwrap().staked_sat, sat(200_000));
+        // ...and compounded into the bond only at the boundary (nobody
+        // attested, so issuance contributes nothing here).
+        let s3 = t.process_epoch(&s2).unwrap();
+        assert_eq!(s3.validator_record(p2).unwrap().staked_sat, sat(200_000) + whistle);
+        assert!(s3.pending_fee_rewards.is_empty());
+    }
+
+    #[test]
+    fn proposer_equivocation_evidence_slashes_through_the_transition() {
+        let (t, g, mut chains) = setup(4);
+        let p1 = schedule::proposer(&g.seed_for_epoch(0), 1, &g.duty_roster()).unwrap();
+        let offender = (p1 + 1) % 4;
+
+        // Two distinct headers signed for the same slot — the offence the
+        // produce.rs single-use reveal fence exists to prevent by accident.
+        let equivocate = |distinguisher: u8| ProposalEnvelope {
+            header: BlockHeaderV4 {
+                version: BLOCK_VERSION_V4,
+                parent: [distinguisher; 32],
+                state_root: [0; 32],
+                body_root: [0; 32],
+                slot: 77,
+                proposer_index: offender,
+                randao_reveal: [1; 32],
+                randao_mix: [2; 32],
+                justified_root: [3; 32],
+                finalized_root: [4; 32],
+                attestation_root: [5; 32],
+                coherence_root: [6; 32],
+            },
+            proposer_sig: vec![0u8; 8],
+        };
+        let ev = PosTransaction::SlashingEvidence(SlashingEvidence::ProposerEquivocation {
+            first: equivocate(0xAA),
+            second: equivocate(0xBB),
+        });
+        let b1 = build_block(&t, &g, 1, &[], std::slice::from_ref(&ev), &mut chains);
+        let s1 = t.apply_block(&g, &b1, &[], std::slice::from_ref(&ev)).unwrap();
+
+        let rec = s1.validator_record(offender).unwrap();
+        assert!(rec.slashed);
+        assert_eq!(
+            rec.staked_sat,
+            sat(200_000) - sat(200_000) * slashing::SLASH_PROPOSER_EQUIV_BPS / 10_000,
+        );
+        assert!(!s1.active_validators().iter().any(|v| v.index == offender));
+    }
+
+    #[test]
+    fn forged_evidence_rejects_the_block_and_slashes_nobody() {
+        // MarkerVerifier: every ordinary signature passes, `b"forged"` fails —
+        // so the block dies on exactly the evidence signature and nothing else.
+        let (t, g, mut chains) = setup_with(4, MarkerVerifier);
+        let env = probe_env(&g, 1, &mut chains);
+
+        let forged = {
+            let SlashingEvidence::AttestationOffence { first, mut second } =
+                double_vote_evidence(2)
+            else {
+                unreachable!()
+            };
+            second.signature = b"forged".to_vec();
+            PosTransaction::SlashingEvidence(SlashingEvidence::AttestationOffence {
+                first,
+                second,
+            })
+        };
+        assert_eq!(
+            t.compute_post_state(&g, &env, &[], std::slice::from_ref(&forged)).unwrap_err(),
+            TransitionError::Transaction(0),
+        );
+
+        // Same pair, honestly signed, same block context: applies and cuts —
+        // proving the reject above was the forgery and only the forgery.
+        let honest = PosTransaction::SlashingEvidence(double_vote_evidence(2));
+        let post = t
+            .compute_post_state(&g, &env, &[], std::slice::from_ref(&honest))
+            .unwrap();
+        assert!(post.validator_record(2).unwrap().slashed);
+    }
+
+    #[test]
+    fn innocent_pair_evidence_rejects_the_block() {
+        let (t, g, mut chains) = setup(4);
+        let env = probe_env(&g, 1, &mut chains);
+        // Different target epochs, no surround: honest voting across epochs.
+        let data = |source_epoch: u64, target_epoch: u64| AttestationData {
+            slot: target_epoch * 32,
+            head: [7; 32],
+            source_epoch,
+            source_root: [1; 32],
+            target_epoch,
+            target_root: [7; 32],
+        };
+        let innocent = PosTransaction::SlashingEvidence(SlashingEvidence::AttestationOffence {
+            first: Attestation { data: data(1, 2), validator: 2, signature: vec![0u8; 8] },
+            second: Attestation { data: data(2, 3), validator: 2, signature: vec![0u8; 8] },
+        });
+        assert_eq!(
+            t.compute_post_state(&g, &env, &[], std::slice::from_ref(&innocent)).unwrap_err(),
+            TransitionError::Transaction(0),
+        );
+    }
+
+    #[test]
+    fn evidence_against_an_unregistered_index_rejects_the_block() {
+        let (t, g, mut chains) = setup(4);
+        let env = probe_env(&g, 1, &mut chains);
+        let ev = PosTransaction::SlashingEvidence(double_vote_evidence(99));
+        assert_eq!(
+            t.compute_post_state(&g, &env, &[], std::slice::from_ref(&ev)).unwrap_err(),
+            TransitionError::Transaction(0),
+        );
+    }
+
+    #[test]
+    fn replayed_evidence_rejects_the_second_block_even_swapped() {
+        let (t, g, mut chains) = setup(4);
+        let p1 = schedule::proposer(&g.seed_for_epoch(0), 1, &g.duty_roster()).unwrap();
+        let offender = (p1 + 1) % 4;
+        let ev = PosTransaction::SlashingEvidence(double_vote_evidence(offender));
+        let b1 = build_block(&t, &g, 1, &[], std::slice::from_ref(&ev), &mut chains);
+        let s1 = t.apply_block(&g, &b1, &[], std::slice::from_ref(&ev)).unwrap();
+
+        // The same evidence in a later block: dead on arrival.
+        let env2 = probe_env(&s1, 2, &mut chains);
+        assert_eq!(
+            t.compute_post_state(&s1, &env2, &[], std::slice::from_ref(&ev)).unwrap_err(),
+            TransitionError::Transaction(0),
+        );
+        // Swapping the pair does not mint fresh evidence.
+        let swapped = {
+            let SlashingEvidence::AttestationOffence { first, second } =
+                double_vote_evidence(offender)
+            else {
+                unreachable!()
+            };
+            PosTransaction::SlashingEvidence(SlashingEvidence::AttestationOffence {
+                first: second,
+                second: first,
+            })
+        };
+        assert_eq!(
+            t.compute_post_state(&s1, &env2, &[], std::slice::from_ref(&swapped)).unwrap_err(),
+            TransitionError::Transaction(0),
+        );
     }
 
     #[test]

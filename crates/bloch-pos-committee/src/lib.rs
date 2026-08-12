@@ -110,9 +110,18 @@ pub use transition::{CommittedState, GenesisValidator, PosTransaction, Transitio
 // collision is a real design question, not a namespacing accident. Flattening
 // either side would pick a winner silently, so callers must qualify:
 //
-//   `interfaces::Checkpoint`     vs `finality::Checkpoint`
-//   `interfaces::FinalityState`  vs `finality::FinalityState`
-//   `staking::ValidatorRecord`   vs `state_root::ValidatorRecord`
+//   `interfaces::Checkpoint`       vs `finality::Checkpoint`
+//   `interfaces::FinalityState`    vs `finality::FinalityState`
+//   `staking::ValidatorRecord`     vs `state_root::ValidatorRecord`
+//   `interfaces::SlashingEvidence` vs `slashing::SlashingEvidence`
+//
+// The fourth pair is deliberate layering, not drift: `interfaces::` is the
+// frozen wire/transaction enum (header pair OR attestation pair — what rides
+// in `PosTransaction::SlashingEvidence` and what every node re-verifies), and
+// `slashing::` is the attestation-pair struct the state machine and gossip
+// capture path use. The single conversion between them is the `From` impl in
+// slashing.rs; the flat re-export carries `slashing::`'s because gossip
+// consumers see that one.
 //
 // (`BlockId` and `BlockHeaderV4` were on this list too. They are not any more:
 // two block-identity types in one consensus crate is the `pow_hash` /
