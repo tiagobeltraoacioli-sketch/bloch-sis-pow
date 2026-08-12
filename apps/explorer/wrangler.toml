@@ -2,12 +2,14 @@ name = "bloch-explorer"
 compatibility_date = "2024-11-01"
 pages_build_output_dir = "dist"
 
-# Cloudflare Pages project for explorer.posternlabs.com.
-# The /rpc Function forwards to a reachable read-only Genesis-2 node RPC.
-# Set BLOCH_RPC_URL in the Pages project (Settings → Environment variables),
-# e.g. https://g2-rpc.posternlabs.com/  — do NOT hardcode a node IP here.
+# Cloudflare Pages project for blochl1.com (live domain; the old
+# explorer.posternlabs.com name is retired).
+# The /rpc Function forwards to a reachable read-only Bloch node RPC.
+# Set BLOCH_RPC_URL in the Pages project (Settings → Environment variables) to
+# a NON-Cloudflare-proxied upstream — do NOT hardcode a node IP here, and see
+# functions/rpc.js for why a proxied hostname breaks (403 error 1003).
 #
-# Deploy (production → explorer.posternlabs.com once DNS is wired):
+# Deploy (production → blochl1.com):
 #   npm run build
 #   CLOUDFLARE_ACCOUNT_ID=4e44d592d0229f8faa3fdb2f139c611c \
 #     npx wrangler pages deploy dist --project-name bloch-explorer --branch main --commit-dirty=true
