@@ -45,7 +45,7 @@ So the ceremony requires, at minimum, **70 new hybrid keypairs** (5 bucket +
 keypairs if every validator gets its own withdrawal key. Row 5 requires
 nothing: carryover balances cross by address hash, and the keys that spend
 them are the same keys that spent them on Genesis-3. Their custody is out of
-scope here, with one exception noted in §5.4.
+scope here, with one exception noted in §5.1.
 
 ### What each address is for
 
@@ -235,7 +235,7 @@ year 50. For that horizon:
 7. **Launch:** validator boxes start with their hot keys; every cold shard
    is already where it will sit for years.
 
-### 5.4 The carryover exception worth naming
+### 5.1 The carryover exception worth naming
 
 The largest value at stake on day one is not any bucket: it is the carried-
 over founder balance (3,546,175,400 BLCH), liquid at slot 0, guarded by
@@ -274,4 +274,4 @@ work should be scheduled with the same seriousness as the ceremony itself.
 | Withdrawal | 1 | cold, sharded | cohort principal | first exit | §3.4 |
 | Validator | 64 | hot | slashable stake only | slot 0 | §3.3 |
 | RANDAO seeds | 64 | hot | proposal liveness | slot 0 reveal | §2, §3.3 |
-| G3 carryover | existing | varies | 3.77 B BLCH liquid | slot 0 | §5.4 — outside this doc, inside this risk |
+| G3 carryover | existing | varies | 3.77 B BLCH liquid | slot 0 | §5.1 — outside this doc, inside this risk |

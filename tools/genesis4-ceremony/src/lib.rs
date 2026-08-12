@@ -824,20 +824,34 @@ mod tests {
         out
     }
 
-    /// A canonical test cohort of `n` validators at minimum stake, each with a
-    /// REAL RANDAO commitment (a full 8,192-step `beacon::RandaoChain`), so
-    /// the fixture exercises the actual protocol object, not a mock.
+    /// RANDAO commitment for test validator `i` — the head of a REAL
+    /// 8,192-step `beacon::RandaoChain`, so the fixture exercises the actual
+    /// protocol object, not a mock. Computed once per process: walking 64
+    /// full chains is ~half a million SHAKE-256 calls, which debug builds
+    /// should not repeat per test.
+    fn test_c0(i: u32) -> [u8; 32] {
+        use std::sync::OnceLock;
+        static C0S: OnceLock<Vec<[u8; 32]>> = OnceLock::new();
+        C0S.get_or_init(|| {
+            (0..GENESIS_COHORT_FLOOR as u32)
+                .map(|i| {
+                    let seed: [u8; 32] = pseudo_bytes(2, i, 32).try_into().unwrap();
+                    RandaoChain::generate(seed).commitment()
+                })
+                .collect()
+        })[i as usize]
+    }
+
+    /// A canonical test cohort of `n` validators at minimum stake.
     fn cohort_text(n: usize) -> String {
         let mut s = String::new();
         for i in 0..n {
             let pk = pseudo_bytes(1, i as u32, HYBRID_PK_BYTES);
-            let seed: [u8; 32] = pseudo_bytes(2, i as u32, 32).try_into().unwrap();
-            let c0 = RandaoChain::generate(seed).commitment();
             s.push_str(&format!(
                 "{}\t{}\t{}\t{}\t{}\n",
                 i,
                 hex::encode(&pk),
-                hex::encode(c0),
+                hex::encode(test_c0(i as u32)),
                 MIN_DEPOSIT_SAT,
                 "77".repeat(32),
             ));
