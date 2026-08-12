@@ -342,6 +342,39 @@ newtype with no second constructor and no `From<PowHash>`.
 Assistant A2 owns a property test asserting that no code path in the tree
 derives a block identifier from anything other than `BlockId::of(&header)`.
 
+#### 5.4.1 The header must commit to what the block carries
+
+`block_id` covers the header, and the header must therefore cover the body —
+otherwise one identifier names more than one block. Three fields do that work,
+and **every one of them is checked in the state transition**, before the
+sortition draw and long before the hybrid signature verify:
+
+| Field | Checked against |
+|---|---|
+| `body_root` | Merkle root over the block's canonically-encoded transactions |
+| `attestation_root` | root over the ordered attestation list the body carries |
+| `coherence_root` | the binding over the **parent's** committed pool roots (§6.6.2) |
+
+**Recorded because it was missing.** Until 2026-08-12 these checks existed only
+in a second, uncalled validator; the transition the node runs verified none of
+them, and 178 green tests said nothing about it, because the test block builder
+stamped zeros into all three. What that cost is subtler than "arbitrary
+transactions execute" — the `state_root` check does catch a body that changes
+state differently — it is that the header stopped *committing to* the body, so
+one `block_id` could name two bodies, one honest and one mangled. Gossip the
+honest header with a mangled body and every node rejects the pair; a node that
+remembers rejections by id then refuses the honest body too.
+
+Two consequences worth stating, because both surfaced as test failures:
+
+- The attestation list is **ordered** and its root says so, so the same set of
+  attestations in a different order is a *different block*. What must stay
+  order-independent is the committed **state**, not the block.
+- A block's identity can differ while its committed state is identical (the
+  case above). `head` is bound by the header and never by the state root —
+  committing it would be circular — so "same state, different id" is a coherent
+  and expected outcome, not a divergence.
+
 ### 5.5 State commitment and determinism
 
 `state_root` commits to a SHA3-256 sparse Merkle tree over:

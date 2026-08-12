@@ -215,6 +215,107 @@ pub enum PosTransaction {
     SlashingEvidence(SlashingEvidence),
 }
 
+impl PosTransaction {
+    /// The canonical wire encoding of a consensus transaction — the bytes the
+    /// header's `body_root` is a Merkle root over.
+    ///
+    /// # Why this had to exist
+    ///
+    /// `derive::body_root` takes `&[Vec<u8>]` and has always been able to
+    /// compute a body root; the transition, which holds typed
+    /// `PosTransaction`s, had no way to produce those bytes. So the stack the
+    /// node actually runs **never checked `body_root` at all** — a header
+    /// could carry any value in that field and be accepted. What that costs is
+    /// not that arbitrary transactions execute (the `state_root` check at the
+    /// end catches a body that changes state differently), it is that the
+    /// header stops committing to the body: one `BlockId` could name two
+    /// different bodies, one valid and one garbage. An attacker gossips the
+    /// honest header with a mangled body, every node rejects the pair, and any
+    /// node that remembers rejections by block id then refuses the honest body
+    /// too. Identity that does not cover the payload is the same defect family
+    /// as `pow_hash`/`block_hash`, one layer down.
+    ///
+    /// # Scope, stated honestly
+    ///
+    /// The eUTXO value-transfer format is out of the migration's scope (§1.2),
+    /// so [`PosTransaction::Transfer`] is opaque *here* by design: consensus
+    /// at this layer needs only its fees, and they are what is encoded. When
+    /// the real transfer format lands it must supply its own canonical bytes
+    /// and this arm becomes a delegation to them — the discriminant tag makes
+    /// that a widening rather than a re-keying, because no other variant's
+    /// encoding shifts.
+    ///
+    /// # Rules the encoding obeys
+    ///
+    /// One-byte discriminant first, then fixed-width little-endian fields in
+    /// declaration order, with every variable-length field length-prefixed.
+    /// Together those give injectivity: no two distinct transactions share an
+    /// encoding, which is what makes the Merkle root over them meaningful. The
+    /// nested signed messages inside slashing evidence are folded in through
+    /// the roots they were *signed over* (`proposal_signing_root`,
+    /// `AttestationData::signing_root`) plus their signatures, rather than
+    /// re-serialised here — a second encoding of a header is exactly the kind
+    /// of duplicate derivation this crate exists to refuse.
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut b = Vec::new();
+        let put = |b: &mut Vec<u8>, bytes: &[u8]| {
+            b.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            b.extend_from_slice(bytes);
+        };
+        match self {
+            PosTransaction::Transfer { base_fee_sat, priority_fee_sat } => {
+                b.push(0x01);
+                b.extend_from_slice(&base_fee_sat.to_le_bytes());
+                b.extend_from_slice(&priority_fee_sat.to_le_bytes());
+            }
+            PosTransaction::Deposit {
+                pubkey,
+                amount_sat,
+                randao_commitment,
+                withdrawal_credentials,
+            } => {
+                b.push(0x02);
+                put(&mut b, pubkey);
+                b.extend_from_slice(&amount_sat.to_le_bytes());
+                b.extend_from_slice(randao_commitment);
+                put(&mut b, withdrawal_credentials);
+            }
+            PosTransaction::Exit { validator } => {
+                b.push(0x03);
+                b.extend_from_slice(&validator.to_le_bytes());
+            }
+            PosTransaction::Delegate { delegator, validator, amount_sat, eligible } => {
+                b.push(0x04);
+                b.extend_from_slice(&delegator.to_le_bytes());
+                b.extend_from_slice(&validator.to_le_bytes());
+                b.extend_from_slice(&amount_sat.to_le_bytes());
+                b.push(u8::from(*eligible));
+            }
+            PosTransaction::SlashingEvidence(ev) => {
+                b.push(0x05);
+                match ev {
+                    crate::interfaces::SlashingEvidence::ProposerEquivocation { first, second } => {
+                        b.push(0x01);
+                        for env in [first, second] {
+                            b.extend_from_slice(&env.header.proposal_signing_root());
+                            put(&mut b, &env.proposer_sig);
+                        }
+                    }
+                    crate::interfaces::SlashingEvidence::AttestationOffence { first, second } => {
+                        b.push(0x02);
+                        for att in [first, second] {
+                            b.extend_from_slice(&att.validator.to_le_bytes());
+                            b.extend_from_slice(&att.data.signing_root());
+                            put(&mut b, &att.signature);
+                        }
+                    }
+                }
+            }
+        }
+        b
+    }
+}
+
 // ─── The committed state ────────────────────────────────────────────────────
 
 /// One validator of the launch set, as published in the genesis block.
@@ -415,6 +516,21 @@ impl CommittedState {
     }
 
     /// Id of the block that produced this state.
+    /// Exactly the value a block's header must carry in `coherence_root`.
+    ///
+    /// An accessor and not two public fields on purpose: the header field is a
+    /// *binding* over both pool roots, and exposing the roots separately would
+    /// let a caller compose them — in the wrong order, or with one of them
+    /// stale — which is the composition the binding exists to make impossible.
+    /// The producer stamps this and the validator checks against it, so there
+    /// is one expression of the rule and both sides evaluate it.
+    pub fn coherence_root(&self) -> [u8; 32] {
+        crate::derive::coherence_binding(
+            &self.coherence_accumulator_root,
+            &self.coherence_nullifier_root,
+        )
+    }
+
     pub fn head(&self) -> BlockId {
         self.head
     }
@@ -1191,6 +1307,46 @@ impl<V: SignatureVerifier> Transition<V> {
             return Err(TransitionError::Proposal(ProposalReject::WrongVersion));
         }
 
+        // 3b. THE HEADER MUST COMMIT TO WHAT IT CARRIES.
+        //
+        // These three checks were absent from this stack entirely. They existed
+        // only in `derive::validate_block`, a parallel validator with no caller
+        // — so the code the node actually runs accepted any `body_root`,
+        // `attestation_root` or `coherence_root` whatsoever. Found at
+        // integration on 2026-08-12 while unifying the two stacks.
+        //
+        // What was at stake is subtler than "arbitrary transactions execute":
+        // step 12's `state_root` check does catch a body that changes state
+        // differently. What was lost is that the header stopped *committing to*
+        // the body, so one `BlockId` could name two different bodies. Gossip
+        // the honest header with a mangled body and every node rejects the
+        // pair; a node that caches rejections by block id then refuses the
+        // honest body too. Identity that does not cover the payload is the
+        // `pow_hash`/`block_hash` defect family one layer down.
+        //
+        // They sit here — after the two integer comparisons, before the
+        // sortition draw and long before the hybrid verify — because they are
+        // hashes over data already in hand, and the frozen error order is
+        // cheap-to-expensive. The functions are `derive`'s: one derivation
+        // path means the producer stamps and the validator checks by calling
+        // the same code, which is the whole anti-h28080 invariant `produce.rs`
+        // is built on.
+        let tx_bytes: Vec<Vec<u8>> =
+            transactions.iter().map(PosTransaction::canonical_bytes).collect();
+        if header.body_root != crate::derive::body_root(&tx_bytes) {
+            return Err(TransitionError::BodyRootMismatch);
+        }
+        if header.attestation_root != crate::derive::attestation_root(attestations) {
+            return Err(TransitionError::AttestationRootMismatch);
+        }
+        // Carried, never recomputed (§6.6.1): the pool is inert under PoS, so
+        // the header must reproduce the binding over the state the PARENT
+        // committed. Deriving it — rather than copying the parent's header
+        // field — is what makes it a check instead of a tautology.
+        if header.coherence_root != pre.coherence_root() {
+            return Err(TransitionError::CoherenceRootMismatch);
+        }
+
         // Roll epoch accounting over any empty boundary slots the chain
         // skipped. Identical to the caller invoking process_epoch itself —
         // close_epoch is the single definition of the boundary — so explicit
@@ -1486,15 +1642,21 @@ mod tests {
             version: BLOCK_VERSION_V4,
             parent: *pre.head.as_bytes(),
             state_root: [0u8; 32],
-            body_root: [0u8; 32],
+            // The commitment fields are STAMPED, from the same functions the
+            // validator checks with — the producer discipline of `produce.rs`.
+            // They used to be zeros here, and every test passed, which is
+            // precisely how nobody noticed the validator never checked them.
+            body_root: crate::derive::body_root(
+                &txs.iter().map(PosTransaction::canonical_bytes).collect::<Vec<_>>(),
+            ),
             slot,
             proposer_index: p,
             randao_reveal: reveal,
             randao_mix: mix,
             justified_root: fin.justified.root,
             finalized_root: fin.finalized.root,
-            attestation_root: [0u8; 32],
-            coherence_root: [0u8; 32],
+            attestation_root: crate::derive::attestation_root(atts),
+            coherence_root: pre.coherence_root(),
         };
         let probe = ProposalEnvelope { header, proposer_sig: vec![0u8; 8] };
         let post = t
@@ -1571,15 +1733,21 @@ mod tests {
             version: BLOCK_VERSION_V4,
             parent: *g.head.as_bytes(),
             state_root: [0u8; 32],
-            body_root: [0u8; 32],
+            body_root: crate::derive::body_root(&[]),
             slot: 1,
             proposer_index: wrong,
             randao_reveal: reveal,
             randao_mix: beacon::mix_in(&g.randao_mix, &reveal),
             justified_root: fin.justified.root,
             finalized_root: fin.finalized.root,
-            attestation_root: [0u8; 32],
-            coherence_root: [0u8; 32],
+            // Stamped for an empty body, not zeroed: the commitment checks run
+            // before the proposer draw, so a zeroed header would die at step 3b
+            // and this test would pass without ever reaching what it is about.
+            attestation_root: crate::derive::attestation_root(&[]),
+            coherence_root: crate::derive::coherence_binding(
+                &g.coherence_accumulator_root,
+                &g.coherence_nullifier_root,
+            ),
         };
         let env = ProposalEnvelope { header, proposer_sig: vec![0u8; 8] };
         assert_eq!(
@@ -1647,15 +1815,21 @@ mod tests {
                 version: BLOCK_VERSION_V4,
                 parent: *s1.head.as_bytes(),
                 state_root: [0u8; 32],
-                body_root: [0u8; 32],
+                body_root: crate::derive::body_root(&[]),
                 slot: 63,
                 proposer_index: p,
                 randao_reveal: reveal,
                 randao_mix: beacon::mix_in(&s1.randao_mix, &reveal),
                 justified_root: fin.justified.root,
                 finalized_root: fin.finalized.root,
-                attestation_root: [0u8; 32],
-                coherence_root: [0u8; 32],
+                // The block DOES carry the non-member attestation, so it must
+                // commit to it — otherwise the reject would be the commitment
+                // check, not the membership check this test is named for.
+                attestation_root: crate::derive::attestation_root(std::slice::from_ref(&att)),
+                coherence_root: crate::derive::coherence_binding(
+                    &s1.coherence_accumulator_root,
+                    &s1.coherence_nullifier_root,
+                ),
             };
             ProposalEnvelope { header, proposer_sig: vec![0u8; 8] }
         };
@@ -1785,12 +1959,30 @@ mod tests {
         assert_eq!(final_a, final_b);
         assert_eq!(final_a.state_root(), final_b.state_root());
 
-        // And the attestation order *within* the carrier block is
-        // immaterial: reversed list, same committed state (rule 2).
+        // And the attestation order *within* the carrier block is immaterial
+        // to the resulting STATE (rule 2), even though it is not immaterial to
+        // the block: since step 3b the header commits to the ordered list, so a
+        // reversed list is a different block and needs its own header. That is
+        // the correct split — the body is an ordered structure and its root
+        // says so, while the state must remain a function of the *set*. The
+        // reversal is carried through the builder rather than dropped, because
+        // it is exactly the property A2 found violated once (`Store::observe`
+        // kept the first message while its comment claimed order-independence).
         let mut reversed = atts.clone();
         reversed.reverse();
-        let final_c = t.apply_block(&r2, &b3, &reversed, &[]).unwrap();
-        assert_eq!(final_a, final_c);
+        // Re-stamp b3 for the reversed list rather than building afresh: a new
+        // build would consume the proposer's next reveal, and the whole point
+        // is to hold everything except the ordering constant.
+        let mut b3_rev = b3.clone();
+        b3_rev.header.attestation_root = crate::derive::attestation_root(&reversed);
+        b3_rev.header.state_root =
+            t.compute_post_state(&r2, &b3_rev, &reversed, &[]).unwrap().state_root();
+        let final_c = t.apply_block(&r2, &b3_rev, &reversed, &[]).unwrap();
+        assert_eq!(
+            final_a.state_root(),
+            final_c.state_root(),
+            "attestation order inside the body leaked into committed state"
+        );
     }
 
     #[test]
@@ -1939,7 +2131,20 @@ mod tests {
     /// reveal, mix, finality roots) with a zero state root — for tests that
     /// need `compute_post_state` to reach the transaction step and fail
     /// there, where `build_block` would refuse to assemble the block at all.
-    fn probe_env(pre: &CommittedState, slot: u64, chains: &mut [RandaoChain]) -> ProposalEnvelope {
+    /// A header for `slot` carrying no `state_root` — for tests that expect a
+    /// rejection *before* step 12 and so never need the post-state.
+    ///
+    /// It takes `txs` because the header commits to the body (step 3b): a probe
+    /// stamped for an empty body and then handed a transaction is now a
+    /// `BodyRootMismatch`, which is the check doing its job. That also means one
+    /// probe cannot serve two different tx lists — a caller comparing two bodies
+    /// needs a probe per body, which is the honest shape.
+    fn probe_env(
+        pre: &CommittedState,
+        slot: u64,
+        txs: &[PosTransaction],
+        chains: &mut [RandaoChain],
+    ) -> ProposalEnvelope {
         let roster = pre.duty_roster();
         let seed = pre.seed_for_epoch(pre.epoch);
         let p = schedule::proposer(&seed, slot, &roster).unwrap();
@@ -1949,15 +2154,17 @@ mod tests {
             version: BLOCK_VERSION_V4,
             parent: *pre.head.as_bytes(),
             state_root: [0u8; 32],
-            body_root: [0u8; 32],
+            body_root: crate::derive::body_root(
+                &txs.iter().map(PosTransaction::canonical_bytes).collect::<Vec<_>>(),
+            ),
             slot,
             proposer_index: p,
             randao_reveal: reveal,
             randao_mix: beacon::mix_in(&pre.randao_mix, &reveal),
             justified_root: fin.justified.root,
             finalized_root: fin.finalized.root,
-            attestation_root: [0u8; 32],
-            coherence_root: [0u8; 32],
+            attestation_root: crate::derive::attestation_root(&[]),
+            coherence_root: pre.coherence_root(),
         };
         ProposalEnvelope { header, proposer_sig: vec![0u8; 8] }
     }
@@ -2064,7 +2271,6 @@ mod tests {
         // MarkerVerifier: every ordinary signature passes, `b"forged"` fails —
         // so the block dies on exactly the evidence signature and nothing else.
         let (t, g, mut chains) = setup_with(4, MarkerVerifier);
-        let env = probe_env(&g, 1, &mut chains);
 
         let forged = {
             let SlashingEvidence::AttestationOffence { first, mut second } =
@@ -2078,6 +2284,16 @@ mod tests {
                 second,
             })
         };
+        // A probe per body: the header commits to what it carries, so the
+        // forged and honest bodies are different blocks. Each probe needs its
+        // own RANDAO chains — a probe consumes a reveal, and a second probe off
+        // the same chains would reveal the *next* link and die on
+        // `BadRandaoReveal` instead of reaching the evidence. `setup_with` is
+        // deterministic, so the two runs are the same chain from the same seed:
+        // same slot, same parent state, same proposer draw. Only the body
+        // differs, which is the comparison this test is making.
+        let (_, _, mut chains_forged) = setup_with(4, MarkerVerifier);
+        let env = probe_env(&g, 1, std::slice::from_ref(&forged), &mut chains_forged);
         assert_eq!(
             t.compute_post_state(&g, &env, &[], std::slice::from_ref(&forged)).unwrap_err(),
             TransitionError::Transaction(0),
@@ -2086,6 +2302,7 @@ mod tests {
         // Same pair, honestly signed, same block context: applies and cuts —
         // proving the reject above was the forgery and only the forgery.
         let honest = PosTransaction::SlashingEvidence(double_vote_evidence(2));
+        let env = probe_env(&g, 1, std::slice::from_ref(&honest), &mut chains);
         let post = t
             .compute_post_state(&g, &env, &[], std::slice::from_ref(&honest))
             .unwrap();
@@ -2095,7 +2312,6 @@ mod tests {
     #[test]
     fn innocent_pair_evidence_rejects_the_block() {
         let (t, g, mut chains) = setup(4);
-        let env = probe_env(&g, 1, &mut chains);
         // Different target epochs, no surround: honest voting across epochs.
         let data = |source_epoch: u64, target_epoch: u64| AttestationData {
             slot: target_epoch * 32,
@@ -2109,6 +2325,7 @@ mod tests {
             first: Attestation { data: data(1, 2), validator: 2, signature: vec![0u8; 8] },
             second: Attestation { data: data(2, 3), validator: 2, signature: vec![0u8; 8] },
         });
+        let env = probe_env(&g, 1, std::slice::from_ref(&innocent), &mut chains);
         assert_eq!(
             t.compute_post_state(&g, &env, &[], std::slice::from_ref(&innocent)).unwrap_err(),
             TransitionError::Transaction(0),
@@ -2118,8 +2335,8 @@ mod tests {
     #[test]
     fn evidence_against_an_unregistered_index_rejects_the_block() {
         let (t, g, mut chains) = setup(4);
-        let env = probe_env(&g, 1, &mut chains);
         let ev = PosTransaction::SlashingEvidence(double_vote_evidence(99));
+        let env = probe_env(&g, 1, std::slice::from_ref(&ev), &mut chains);
         assert_eq!(
             t.compute_post_state(&g, &env, &[], std::slice::from_ref(&ev)).unwrap_err(),
             TransitionError::Transaction(0),
@@ -2136,12 +2353,13 @@ mod tests {
         let s1 = t.apply_block(&g, &b1, &[], std::slice::from_ref(&ev)).unwrap();
 
         // The same evidence in a later block: dead on arrival.
-        let env2 = probe_env(&s1, 2, &mut chains);
+        let env2 = probe_env(&s1, 2, std::slice::from_ref(&ev), &mut chains);
         assert_eq!(
             t.compute_post_state(&s1, &env2, &[], std::slice::from_ref(&ev)).unwrap_err(),
             TransitionError::Transaction(0),
         );
-        // Swapping the pair does not mint fresh evidence.
+        // Swapping the pair does not mint fresh evidence. Different bytes, so
+        // a different body, so its own probe.
         let swapped = {
             let SlashingEvidence::AttestationOffence { first, second } =
                 double_vote_evidence(offender)
@@ -2153,8 +2371,10 @@ mod tests {
                 second: first,
             })
         };
+        let (_, _, mut chains_swapped) = setup(4);
+        let env3 = probe_env(&s1, 2, std::slice::from_ref(&swapped), &mut chains_swapped);
         assert_eq!(
-            t.compute_post_state(&s1, &env2, &[], std::slice::from_ref(&swapped)).unwrap_err(),
+            t.compute_post_state(&s1, &env3, &[], std::slice::from_ref(&swapped)).unwrap_err(),
             TransitionError::Transaction(0),
         );
     }
@@ -2438,7 +2658,16 @@ mod tests {
         let r2 = t.apply_block(&r1, &b2, &[], &[delegate]).unwrap();
         let mut reversed = atts.clone();
         reversed.reverse();
-        let b = t.apply_block(&r2, &b3, &reversed, &[]).unwrap();
+        // Since step 3b the header commits to the ordered attestation list, so
+        // the reversed delivery is a different block and needs its own root.
+        // Re-stamped rather than rebuilt so everything except the ordering is
+        // held constant — the claim under test is that ordering does not reach
+        // committed state, not that two different blocks agree.
+        let mut b3_rev = b3.clone();
+        b3_rev.header.attestation_root = crate::derive::attestation_root(&reversed);
+        b3_rev.header.state_root =
+            t.compute_post_state(&r2, &b3_rev, &reversed, &[]).unwrap().state_root();
+        let b = t.apply_block(&r2, &b3_rev, &reversed, &[]).unwrap();
 
         // Mid-epoch, with every extended component live — not after a
         // boundary flushed the interesting state away.
@@ -2448,14 +2677,90 @@ mod tests {
         assert!(!a.delegations.is_empty(), "fixture must exercise delegations");
         assert!(!a.pending_fee_rewards.is_empty(), "fixture must exercise pending fees");
 
-        assert_eq!(a, b, "same chain, different paths: states must be identical");
-        assert_eq!(a.state_root(), b.state_root(), "…and so must the committed roots");
+        // The COMMITTED state must be identical; `head` legitimately is not,
+        // because re-stamping the attestation root made b3_rev a different
+        // block with a different id. That is the distinction the extension
+        // draws on purpose: `head` is bound by the header, never by the root
+        // (committing it would be circular), so two blocks that commit the same
+        // state can differ in identity. Comparing whole `CommittedState`s here
+        // would be comparing that identity too, and would fail for a reason
+        // that has nothing to do with the property under test.
+        assert_eq!(
+            a.state_root(),
+            b.state_root(),
+            "same chain, different paths: the committed roots must be identical"
+        );
+        assert_eq!(a.epoch, b.epoch);
+        assert_eq!(a.validators, b.validators);
+        assert_eq!(a.pending_votes, b.pending_votes);
+        assert_eq!(a.latest_messages, b.latest_messages);
+        assert_eq!(a.pending_fee_rewards, b.pending_fee_rewards);
 
         // And the roots keep agreeing across the boundary that consumes the
         // pending components (votes tallied, fees compounded).
         let a4 = t.process_epoch(&a).unwrap();
         let b4 = t.process_epoch(&b).unwrap();
-        assert_eq!(a4, b4);
         assert_eq!(a4.state_root(), b4.state_root());
     }
+
+    /// **The regression test for step 3b.** Each of the three header
+    /// commitments must reject on its own, with its own error.
+    ///
+    /// Without this, the checks could be silently deleted and every other test
+    /// would still pass — which is exactly the state the crate was in until
+    /// 2026-08-12, when the stack the node runs checked none of them and 178
+    /// green tests said nothing about it. A check with no negative test is a
+    /// comment.
+    #[test]
+    fn header_must_commit_to_body_attestations_and_coherence() {
+        let (t, g, mut chains) = setup(4);
+        let deposit = PosTransaction::Exit { validator: 3 };
+        let good = build_block(&t, &g, 1, &[], std::slice::from_ref(&deposit), &mut chains);
+        // Control: it applies.
+        assert!(t.apply_block(&g, &good, &[], std::slice::from_ref(&deposit)).is_ok());
+
+        // A body the header does not name.
+        let mut b = good.clone();
+        b.header.body_root = [0xAB; 32];
+        assert_eq!(
+            t.compute_post_state(&g, &b, &[], std::slice::from_ref(&deposit)).unwrap_err(),
+            TransitionError::BodyRootMismatch,
+        );
+        // ...and the reverse direction: header untouched, body swapped. This is
+        // the case that matters, because it is the one an attacker controls.
+        let other = PosTransaction::Exit { validator: 2 };
+        assert_eq!(
+            t.compute_post_state(&g, &good, &[], std::slice::from_ref(&other)).unwrap_err(),
+            TransitionError::BodyRootMismatch,
+        );
+
+        let mut b = good.clone();
+        b.header.attestation_root = [0xCD; 32];
+        assert_eq!(
+            t.compute_post_state(&g, &b, &[], std::slice::from_ref(&deposit)).unwrap_err(),
+            TransitionError::AttestationRootMismatch,
+        );
+
+        let mut b = good.clone();
+        b.header.coherence_root = [0xEF; 32];
+        assert_eq!(
+            t.compute_post_state(&g, &b, &[], std::slice::from_ref(&deposit)).unwrap_err(),
+            TransitionError::CoherenceRootMismatch,
+        );
+
+        // The Coherence mirror is a real binding, not a copy of the parent's
+        // header field: a state whose pool roots differ must demand a different
+        // header value, even though the pool is inert.
+        let mut moved = g.clone();
+        moved.coherence_accumulator_root = [0x77; 32];
+        assert_ne!(
+            crate::derive::coherence_binding(
+                &moved.coherence_accumulator_root,
+                &moved.coherence_nullifier_root,
+            ),
+            good.header.coherence_root,
+            "the coherence binding ignored the accumulator root"
+        );
+    }
+
 }

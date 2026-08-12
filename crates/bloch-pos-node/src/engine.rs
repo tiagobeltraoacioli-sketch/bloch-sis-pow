@@ -260,7 +260,10 @@ impl Engine {
             justified_root: fin.justified.root,
             finalized_root: fin.finalized.root,
             attestation_root: derive::attestation_root(&atts),
-            coherence_root: [0u8; 32],
+            // Derived from the parent's committed pool roots, not zeroed. The
+            // transition checks this (step 3b) since 2026-08-12; a zeroed field
+            // was accepted before only because nothing checked it.
+            coherence_root: self.state.coherence_root(),
         };
 
         // The post-state, from the SAME function validation runs. The probe
@@ -307,8 +310,11 @@ impl Engine {
         if self.blocks.contains_key(&id) || self.canonical.contains(&id) {
             return;
         }
-        // Envelope-layer commitment checks Transition deliberately leaves to
-        // the node — one definition each, from derive::*.
+        // A cheap early reject before the block reaches the transition, using
+        // the same `derive::*` functions the transition checks with — one
+        // definition, called twice, not two definitions. The transition is the
+        // authority (step 3b); this only avoids paying for a state clone on a
+        // block that is obviously mismatched.
         if env.header.attestation_root != derive::attestation_root(&env.body.attestations)
             || env.header.body_root != derive::body_root(&env.body.transactions)
         {
