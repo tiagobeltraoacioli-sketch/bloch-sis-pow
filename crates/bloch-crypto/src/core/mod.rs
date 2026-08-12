@@ -435,7 +435,16 @@ pub const fn chain_requires_carryover(id: ChainId) -> bool {
 //      depend on a chain nobody is defending.
 
 /// Last valid height on the Genesis-3 mainnet. Blocks ABOVE this are invalid.
-pub const GENESIS3_TERMINAL_HEIGHT: u64 = 80_000;
+// LOWERED 80,000 -> 50,000 on 2026-08-12 (founder). This branch carries that
+// single change on top of the binary that is already running fleet-wide: a
+// three-day flag day is not the place to ship a month of untested work, so the
+// diff against the deployed tree is one constant and nothing else.
+//
+// The deploy window IS the risk. Every node must run this before the chain
+// reaches 50,000 (~3 days at the measured 21.6 s/block). A node still on the
+// 80,000 binary keeps accepting blocks above 50,000, and the moment one does,
+// the halt itself becomes the fork.
+pub const GENESIS3_TERMINAL_HEIGHT: u64 = 50_000;
 
 /// The terminal height for `id`, if that chain has one.
 ///

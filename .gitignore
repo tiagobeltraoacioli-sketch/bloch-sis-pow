@@ -37,3 +37,5 @@ desktop/src-tauri/gen/
 # build artifacts in any subcrate
 **/target/
 carryover.tsv
+
+.claude/worktrees/
