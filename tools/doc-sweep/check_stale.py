@@ -46,10 +46,26 @@ RETIRED = [
     ("1,276 BLCH",       "flat (100 bi)",            "215 BLCH"),
     ("300,000,000",      "teto de holders aposentado", "sem teto"),
     ("2-year cliff",     "cliff do fundador antigo", "10-year cliff"),
+    # Concessao do fundador 17% -> 10% (2026-08-11). Frases estreitas de
+    # proposito: "17% founder premine" segue CORRETO nos docs da V2/G3.
     ("new grant is 17%", "concessao do fundador antiga em prosa", "new grant is 10%"),
     ("new 17% grant",    "concessao do fundador antiga em prosa", "new 10% grant"),
+    ("grant is 17%",     "concessao do fundador antiga",          "10% (FOUNDER_BLOCH)"),
+    ("Founder 17%",      "concessao do fundador antiga",          "Founder grant 10%"),
+    ("53.7%",            "share de validador v1",                 "43.03%"),
+    # Stakeabilidade do carryover: decidida, nao mais em aberto.
     ("still open, and",  "decisao de stakeabilidade ja tomada",   "decidida 2026-08-11 (§4A.1)"),
     ("still undecided: **liquid", "decisao de stakeabilidade ja tomada", "decidida 2026-08-11 (§4A.1)"),
+    # Churn (2026-08-11): WARMUP_RATE_BPS 900 -> 25; piso MIN_DELEGATION_SAT
+    # -> MIN_CHURN_SAT (= MIN_DEPOSIT_SAT). Autoridade: delegation.rs.
+    ("WARMUP_RATE_BPS = 900", "taxa de churn antiga",  "WARMUP_RATE_BPS = 25"),
+    ("900 bps",          "taxa de churn antiga",       "25 bps"),
+    ("9% of active stake","taxa de churn antiga",      "0.25% (25 bps)"),
+    ("9% per epoch",     "taxa de churn antiga",       "0.25% (25 bps)"),
+    ("9%/epoch",         "taxa de churn antiga",       "0.25% (25 bps)"),
+    # Licenca (2026-08-11): crates PoS relicenciados. Autoridade:
+    # Cargo.toml de bloch-pos-committee + migracao spec §16.
+    ("MIT OR Apache-2.0","licenca antiga dos crates PoS", "AGPL-3.0-or-later"),
 ]
 
 # Trechos que citam valores antigos DE PROPOSITO, como historico.
@@ -57,9 +73,20 @@ EXEMPT = ("earlier draft", "an earlier version", "was wrong", "superseded",
           "retired", "V2 nominal", "rascunho", "no longer", "went with")
 
 # Documentos que descrevem a cadeia Genesis-3 VIVA, onde os numeros antigos
-# sao os corretos.
-SKIP = ("TOKENOMICS_V2.md", "TOKENOMICS_V3.md", "CARRYOVER.md", "API.md",
-        "PROJECT-STATUS.md", "/adr/", "/historical/", "/post-mortems/")
+# sao os corretos, mais registros datados (releases, portal publico da G3) e
+# analises seladas que citam o valor antigo DE PROPOSITO como objeto de estudo
+# (o selo no topo do documento cobre o que a isencao por linha nao alcanca).
+# `tools/faucet` e `tools/indexer` sao ferramentas da era G3 que declaram a
+# PROPRIA licenca, e ela realmente e MIT/Apache — a regra acima e sobre os crates
+# de PoS. Se essas duas devem seguir para AGPL e decisao de fundador/PMO em
+# aberto (2026-08-11); ate la a declaracao delas e verdadeira, nao stale.
+SKIP = ("tools/faucet/README.md", "tools/indexer/README.md",
+        "TOKENOMICS_V2.md", "TOKENOMICS_V3.md", "CARRYOVER.md", "API.md",
+        "PROJECT-STATUS.md", "/adr/", "/historical/", "/post-mortems/",
+        "/releases/", "/portal/",
+        "BLOCH-POS-STAKE-CHURN.md",      # registro da decisao 900->25
+        "BLOCH-POS-THREAT-MODEL.md",     # selado; texto mantido de proposito
+        "BLOCH-POS-THREAT-MODEL-2.md")   # idem
 
 
 def live_constants():

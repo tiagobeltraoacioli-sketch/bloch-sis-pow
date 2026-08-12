@@ -1,5 +1,12 @@
 # Bloch-SIS-PoW / Postern Labs — Project Evolution Plan (APPROVED)
 
+> **SUPERSEDED FRAMING — 2026-08-11.** Written 2026-07-09, before the
+> **retraction of the ownerless thesis** (ADR-036; two-entity foundation,
+> `docs/specs/BLOCH-ENTITY-STRUCTURE.md`) and before the Genesis-4 PoS
+> relaunch decision (halt at height 80,000). The "ownerless / not-a-security"
+> posture this plan leans on no longer describes the project; the product
+> strategy sections are unaffected. Kept unrewritten as the approved record.
+
 > **Approved by the founder 2026-07-09** — decisions **D1–D10 all accepted per the
 > recommendations**: D1 Postern Suite flagship (hygiene wedge); D2 run the Sage
 > estimator + canonical-regime flag; D3 grants (no user-KYC); D4 ePrint → then

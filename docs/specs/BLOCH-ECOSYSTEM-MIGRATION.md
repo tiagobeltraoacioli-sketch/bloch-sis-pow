@@ -5,6 +5,8 @@
 >
 > - **a maquinaria de taint** — dissolvida: o carryover atravessa como um conjunto so, sem lista de exclusao, entao nao ha classe de moeda a marcar.
 > - **o supply de 100 bilhoes** — revertido para 21 bilhoes, o nominal da V2.
+> - **o EVM como L2** — decisao do fundador (2026-08-11): o EVM roda na **base (L1)**, sem rollup; o `bloch-l2-evm` (chainId 8400) sera SUBSTITUIDO, nao migrado. O §5 inteiro (re-point do anchor, predicado de finalidade, unificacao de chain-id) descreve um caminho que ja nao e o plano — só o drenar-antes-do-halt continua valendo, porque o L2 vivo ainda tem usuarios ate a parada.
+> - **Ustav/Kirpich como tooling** — promovidos a objeto de CONSENSO (L1) na mesma decisao; consequencias em desenho na wave de 2026-08-11 (fleet brief).
 >
 > O texto NAO foi reescrito, de proposito: o raciocinio que produziu cada
 > achado tem valor mesmo quando a premissa mudou, e reescrever apagaria a
@@ -362,6 +364,17 @@ and Go to near zero).
 ---
 
 ## 5. L2 (`~/dev/bloch-protocol/l2`, chainId 8400) and `anchoring/`
+
+> **SUPERSEDED 2026-08-11 (founder decision — EVM at L1, no rollup).** This
+> section planned the survival of `bloch-l2-evm` across the relaunch by
+> re-pointing its anchor to finalized checkpoints. That is no longer the plan:
+> the EVM moves to the base layer and the L2 service is **replaced**, not
+> extended. What survives from this section: the finding that nothing in the
+> L2 stack verifies L1 consensus (still true, and now an argument for
+> retiring it), and the operational duty to **drain/settle the live L2 before
+> the height-80,000 halt** — the deposits already made are real and must exit.
+> The anchor re-point, finality predicate and chain-id unification work items
+> are dead. See the 2026-08-11 fleet brief.
 
 The survey's central finding is good news: **nothing in the L2 stack verifies
 L1 PoW** — no bits, no target, no pow_hash, no chainwork, not even in the SP1

@@ -1,5 +1,9 @@
 # Bloch RPC cookbook
 
+> **SUPERSEDED FRAMING — 2026-08-11.** Genesis-3 page; the "ownerless"
+> claims below were retracted (ADR-036, two-entity foundation) and Genesis-3
+> halts at height 80,000. See the note in [index](index.md).
+
 > **Honesty rails (full text in [index](index.md)):** unaudited mainnet-beta;
 > relaxed PoW (**k=4**) → work is **trivially forgeable**; small,
 > **51%-attackable** network. Bloch is **ownerless / neutral / agnostic**;

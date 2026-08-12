@@ -620,7 +620,7 @@ Four rules make delegation safe to add:
 
 | Rule | Value | Why |
 |---|---|---|
-| Warm-up / cool-down rate limit | 9% of active stake per epoch | Committees are stake-weighted, so instant activation is instant control. Matches Solana |
+| Warm-up / cool-down rate limit | `WARMUP_RATE_BPS` = 25 bps (0.25%) of active stake per epoch, floor `MIN_CHURN_SAT` | Committees are stake-weighted, so instant activation is instant control. Was 9% (Solana's numeral) until 2026-08-11; a Solana epoch is ~48 h and a Bloch epoch 16 min, so the same rate ran ~180x faster in wall-clock time — zero to a stalling third in 75 minutes. See `BLOCH-POS-STAKE-CHURN.md` |
 | Delegated stake counts toward the per-validator cap | 1% of active stake | Delegation must not be a route around §4.1 |
 | Delegators are exposed to slashing | pro-rata | Otherwise delegation is all yield and no risk, and nobody cares who they delegate to |
 | Tainted coins cannot delegate | — | §4.1 follows coins, not accounts; otherwise delegation launders eligibility |
@@ -638,12 +638,17 @@ first cut:
   safe to specify — clamping only lowers the total, which only lowers the cap,
   so it is monotone and converges — and the round count is fixed so every node
   stops at the same number.
-- **The rate limit needs a liveness escape.** A strict 9% budget deadlocks
-  forever on any single delegation larger than 9% of active stake, which on a
-  young network is most of them, and deadlocks at genesis where active stake is
-  zero. Genesis is unlimited, and thereafter the head of the queue always
-  progresses even if it exceeds the budget — bounding disruption to one record
-  per epoch while guaranteeing the queue drains.
+- **The rate limit needs a liveness escape — and the first one was a hole.** A
+  strict budget deadlocks forever on any single delegation larger than the
+  budget, which on a young network is most of them, and deadlocks at genesis
+  where active stake is zero. The first fix let the head of the queue through
+  **whole, whatever its size**, which bought liveness by selling the cap: one
+  large delegation activated entirely in a single epoch, exactly the "instant
+  activation is instant control" the limit exists to stop. It is now **partial
+  activation** — an oversized delegation enters in slices across epochs, so the
+  cap holds absolutely — plus a genesis exemption and the `MIN_CHURN_SAT` floor
+  that guarantees a drain terminates (a budget proportional to a shrinking total
+  decays geometrically and never reaches zero).
 
 **Decentralisation cuts both ways**, and this is now measurable rather than
 asserted: `Registry::top_share_bps` and `Registry::nakamoto_coefficient` compute

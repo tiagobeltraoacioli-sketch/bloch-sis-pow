@@ -6,7 +6,13 @@ JSON-RPC (`getutxos`), hands an **unsigned payment job** to an external signer,
 and broadcasts the signed transaction via `sendrawtransaction`. It ships a tiny
 web form and a JSON API, with per-address and per-IP rate limiting.
 
-> **License:** MIT OR Apache-2.0 (same permissive terms as the Bloch protocol).
+> **License:** MIT OR Apache-2.0 — a *different*, more permissive licence than
+> the protocol itself. This line used to claim "the same permissive terms as the
+> Bloch protocol", which was never true: the Genesis-3 node shipped
+> AGPL-3.0-or-later, and the Genesis-4 crates were relicensed to match on
+> 2026-08-11. Whether these two G3-era tools should follow is an open
+> founder/PMO call; the false claim is corrected here regardless, because a
+> wrong licence statement misleads whether or not the licence changes.
 
 ---
 

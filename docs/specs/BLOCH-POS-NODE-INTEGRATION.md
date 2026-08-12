@@ -328,8 +328,13 @@ plan-level facts:
   Coherence pool today. The node carries the accumulator/nullifier roots in
   committed state from day one (so finality covers the pool the moment a
   bridge exists) but ships no bridge.
-- **No L2 anchor changes** beyond exposing finalized checkpoints over RPC;
-  the L2 re-points to it on its own schedule (ecosystem doc).
+- ~~**No L2 anchor changes** beyond exposing finalized checkpoints over RPC;
+  the L2 re-points to it on its own schedule (ecosystem doc).~~ **Superseded
+  2026-08-11 (founder):** the EVM moves to **L1** and `bloch-l2-evm` is
+  replaced, not re-pointed; the checkpoint RPC stays (it has other
+  consumers), but the external-L2 re-point path is dead. Scoping of the
+  L1-EVM integration belongs to the 2026-08-11 wave (fleet brief), not this
+  plan.
 
 ---
 
@@ -465,13 +470,12 @@ Items resolved by the 2026-08-11 PMO rulings moved to §7 (decisions 7–10):
 epoch attestations feed LMD-GHOST (yes), `taint_root` reserved-zero with the
 KAT frozen over it, and the stale-prose seals. What remains open:
 
-1. **Is the carryover stakeable?** Both normative docs leave it open
-   (migration §4.2, tokenomics §4A): liquid ≠ stakeable, and the answer
-   decides whether gates G1–G4 are reachable before ~year five. **Founder
-   decision**, explicitly not the PMO's or this plan's. Per decision 9 the
-   code no longer blocks on it — eligibility policy arrives as a genesis-
-   manifest input — so what it gates is the *launch manifest*, not a DEV
-   milestone.
+1. ~~**Is the carryover stakeable?**~~ **Decided 2026-08-11 (founder): yes —
+   a carried-over balance that is liquid is also stakeable** (migration §4.2
+   and tokenomics §4A now carry the decision note; implementation with A5).
+   The per-decision-9 plumbing stands: eligibility policy arrives as a
+   genesis-manifest input, so the ruling lands in the launch manifest, not in
+   the deposit path.
 2. **Genesis Coherence state empty** (decision 6) — needs A9/founder
    confirmation that no shielded value can exist at the halt.
 3. **Transaction format.** `StateTransition::Transaction` must bind to a

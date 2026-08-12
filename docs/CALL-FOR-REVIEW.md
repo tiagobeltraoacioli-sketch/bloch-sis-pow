@@ -1,5 +1,12 @@
 # Reviewers & testers wanted: run a node, break the PoW, review the design
 
+> **SUPERSEDED FRAMING — 2026-08-11.** This Genesis-3-era page predates two
+> founder decisions: the **ownerless thesis was retracted** (ADR-036 — Bloch
+> now has an issuer and a two-entity foundation structure,
+> `docs/specs/BLOCH-ENTITY-STRUCTURE.md`), and Genesis-3 **halts at height
+> 80,000**, with Genesis-4 relaunching as PoS. Read "ownerless" claims below
+> as historical; do not repost this text without the ADR-036 rewrite.
+
 > This is the canonical, repo-persistent version of the "reviewers wanted"
 > call. Post it verbatim as a GitLab issue / Discussion (and to the external
 > channels: Bitcointalk Dev board, r/cryptography, an IACR ePrint) — keeping

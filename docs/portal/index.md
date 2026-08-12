@@ -1,5 +1,14 @@
 # Bloch Developer Portal
 
+> **SUPERSEDED FRAMING — 2026-08-11.** These portal pages describe the live
+> Genesis-3 chain and predate three founder decisions: the **ownerless thesis
+> was retracted** (ADR-036 — issuer + two-entity foundation,
+> `../specs/BLOCH-ENTITY-STRUCTURE.md`); Genesis-3 **halts at height 80,000**
+> and Genesis-4 relaunches as PoS; and the base layer gains a **native EVM
+> and the Ustav charter standard at L1** — so "no VM, no L2 model prescribed"
+> will stop being true at Genesis-4. Do not republish without the ADR-036
+> rewrite.
+
 > A neutral commons, an agnostic base, an open ecosystem. Anyone can build on
 > Bloch. Postern Labs is **one builder among many**, with **no special protocol
 > access and no gatekeeping power**.

@@ -2,6 +2,16 @@
 
 # Bloch PoS (Genesis-4 / Bell) — Threat Model, second pass
 
+> **Premissa de churn SUPERADA — 2026-08-11.** Este passe foi escrito com
+> `WARMUP_RATE_BPS = 900` e piso `MIN_DELEGATION_SAT`. Depois dele o fundador
+> aceitou a proposta de `BLOCH-POS-STAKE-CHURN.md`: hoje `WARMUP_RATE_BPS =
+> 25` e o piso e `MIN_CHURN_SAT` (= `MIN_DEPOSIT_SAT`, 100k BLCH) em
+> `delegation.rs`. O achado **G4** muda de natureza, nao desaparece: a
+> observacao estrutural (o piso domina a taxa em rede pequena) agora vale por
+> DESENHO na escala de 100k BLCH — custo de liveness aceito e itemizado no
+> doc de churn — e o numeral antigo (~111 BLCH) perdeu o objeto. A aritmetica
+> de "9%" no corpo descreve o valor antigo. Texto mantido como registro.
+
 ```
 Document:   BLOCH-POS-THREAT-MODEL-2
 Status:     DRAFT — adversarial review, Assistant A4 (re-review)

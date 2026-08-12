@@ -51,11 +51,13 @@
 >   look-ahead do F6 ALARGA a janela de aviso (nao encurta); mitigacao real =
 >   sentry + indice-nao-endereco (atrito, nao protecao); alavancas
 >   recomendadas p/ Fase 1 = inclusao tardia de atestacao e proposer boost.
-> - **F8 — AVALIADO, mudanca de parametro recomendada.** Ver
+> - **F8 — AVALIADO; DECIDIDO E APLICADO (2026-08-11).** Ver
 >   `BLOCH-POS-STAKE-CHURN.md`: 900 bps por epoca de 16 min e o numeral da
 >   Solana num relogio ~180× mais rapido (zero → 1/3 em ~75 min, confirmado);
 >   proposta = 25 bps + piso de churn de 100k BLCH/epoca (zero → 1/3 em ~43 h),
->   com o custo de liveness itemizado. Decisao do fundador; codigo intacto.
+>   com o custo de liveness itemizado. O fundador aceitou e o codigo mudou:
+>   `WARMUP_RATE_BPS = 25` e piso `MIN_CHURN_SAT` (= `MIN_DEPOSIT_SAT`) em
+>   `delegation.rs`. Toda menção a "9%" no corpo abaixo e o valor ANTIGO.
 
 
 ```

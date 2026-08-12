@@ -1052,7 +1052,8 @@ it succeeds.
 
 Decided by the founder on 2026-08-11. The question was forced by
 `bloch-crypto` being AGPL-3.0-or-later while the new PoS crates were declared
-MIT OR Apache-2.0: AGPL is viral, so the moment the Genesis-4 node links it for
+MIT OR Apache-2.0 (an earlier version of this section): AGPL is viral, so the
+moment the Genesis-4 node links it for
 ML-DSA/Falcon verification, the whole binary inherits AGPL regardless of what
 the leaf crates say. The two ways out were to take AGPL for the node, or to
 re-extract the PQ verify surface into a compatibly-licensed leaf. AGPL was

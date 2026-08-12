@@ -9,6 +9,7 @@
 > - **o comite amostrado (128 por epoca + 8 por slot)** — substituido por particao do conjunto ativo: o quorum amostrado nao tinha denominador coerente (achado F1).
 > - **o supply de 100 bilhoes** — revertido para 21 bilhoes, o nominal da V2.
 > - **a fase hibrida de PoW** — apagada: a Genesis-3 para na altura 80.000 e a Genesis-4 nasce de uma snapshot.
+> - **o "L2 anchor" como consumidor** — decisao do fundador (2026-08-11): EVM na base (L1), sem rollup; o `bloch-l2-evm` sera substituido, entao onde este doc lista "L2 anchor" como consumidor de `FinalityGadget`/checkpoints, leia o EVM nativo e demais consumidores internos.
 >
 > O texto NAO foi reescrito, de proposito: o raciocinio que produziu cada
 > achado tem valor mesmo quando a premissa mudou, e reescrever apagaria a
