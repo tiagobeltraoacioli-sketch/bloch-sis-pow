@@ -1,7 +1,29 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Formatting helpers. Integer satoshis are the source of truth (1 BLOCH = 1e8
 // sat); "bloch" values are display-only.
+//
+// AMOUNT ENCODING — canonical rule: docs/specs/BLOCH-SATOSHI-ENCODING.md
+// (restated as BLOCH-RPC-V4 R3). Satoshi fields arrive as decimal STRINGS
+// from a V4 node and as bare JSON numbers from a live Genesis-3 node, so every
+// reader here accepts both. Measured reason: Genesis-4 supply is 1e19 sat,
+// ~1110x Number.MAX_SAFE_INTEGER (9,007,199,254,740,991), so a satoshi value
+// that passes through a JS number is silently rounded. Never call Number() on
+// one — use toSats() to get an exact bigint, or fmtBloch()/fmtInt() to display.
 
 const SATS_PER_BLOCH = 100_000_000n;
+
+/**
+ * Parse a wire satoshi value (string | number | bigint) into an exact bigint.
+ * Returns 0n for null/undefined/garbage — this is a read-only explorer, so a
+ * bad field renders as zero rather than throwing the whole page away.
+ */
+export function toSats(v: string | number | bigint | null | undefined): bigint {
+  if (v === null || v === undefined) return 0n;
+  if (typeof v === "bigint") return v;
+  if (typeof v === "number") return Number.isFinite(v) ? BigInt(Math.round(v)) : 0n;
+  const s = v.trim();
+  return /^-?\d+$/.test(s) ? BigInt(s) : 0n;
+}
 
 export function fmtBloch(sats: number | string | bigint, maxFrac = 4): string {
   let s: bigint;
@@ -18,10 +40,30 @@ export function fmtBloch(sats: number | string | bigint, maxFrac = 4): string {
   return (neg ? "-" : "") + wholeStr + (frac ? "." + frac : "");
 }
 
-export function fmtInt(n: number | string): string {
-  const v = typeof n === "string" ? Number(n) : n;
-  if (!isFinite(v)) return "0";
-  return Math.round(v).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+/**
+ * Group-separate an integer. Also the raw-satoshi renderer (`… sat` subtitles),
+ * so it MUST have an exact path: routing a satoshi value through Number() is
+ * the corruption site this function used to be. bigint and integer-strings are
+ * formatted digit-for-digit; only genuinely fractional input falls back to
+ * Number(), and that is never a satoshi amount.
+ */
+export function fmtInt(n: number | string | bigint): string {
+  if (typeof n === "bigint") return group(n.toString());
+  if (typeof n === "string") {
+    const s = n.trim();
+    if (/^-?\d+$/.test(s)) return group(BigInt(s).toString());
+    const v = Number(s);
+    return isFinite(v) ? group(Math.round(v).toString()) : "0";
+  }
+  if (!isFinite(n)) return "0";
+  // Above 2^53 a number has already lost its low digits; show it exactly as the
+  // double actually is rather than pretending, and let callers pass a string.
+  if (Number.isSafeInteger(n)) return group(n.toString());
+  return group(BigInt(Math.round(n)).toString());
+}
+
+function group(s: string): string {
+  return s.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
 }
 
 export function fmtNum(n: number, digits = 2): string {

@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+<!-- Bloch Protocol site — docs page. Structure only, by design: every document
+     is reviewed by the founder before it is published here. No fake links. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Docs — Bloch Protocol</title>
+<meta name="description" content="The documentation index for Bloch Protocol. Documents appear here after fosettled 2026-08-12 — nothing is published unreviewed.">
+<link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<nav aria-label="Main"><div class="wrap">
+  <a class="logo" href="./">
+    <svg width="26" height="26" viewBox="0 0 26 26" aria-hidden="true">
+      <circle cx="13" cy="13" r="11.2" fill="none" stroke="var(--accent)" stroke-width="1.5"/>
+      <ellipse cx="13" cy="13" rx="11.2" ry="4.2" fill="none" stroke="var(--accent)" stroke-width="1.1" opacity="0.55"/>
+      <line x1="13" y1="13" x2="19.6" y2="7.2" stroke="var(--ink)" stroke-width="1.6" stroke-linecap="round"/>
+      <circle cx="19.6" cy="7.2" r="2.1" fill="var(--accent)"/>
+    </svg>
+    Bloch Protocol
+  </a>
+  <span class="navlinks">
+    <a href="protocol.html">Protocol</a>
+    <a href="migration.html">Migration</a>
+    <a href="supply.html">Supply</a>
+    <a href="brand.html">Brand</a>
+    <a href="build.html">Build</a>
+    <a href="docs.html" aria-current="page">Docs</a>
+    <a class="ext" href="https://blochl1.com">Explorer</a>
+  </span>
+</div></nav>
+
+<main id="main">
+
+<header class="pagehead"><div class="wrap">
+  <p class="eyebrow">Documentation</p>
+  <h1>Published after review, not before.</h1>
+  <p class="lede">
+    The repository holds specifications, threat models, decision records and
+    post-mortems. Each document appears here only after the founder has reviewed it
+    for publication &mdash; so this page is currently a table of contents for material
+    that exists but is not yet public. An empty slot below means exactly that, and
+    nothing more.
+  </p>
+</div></header>
+
+<section class="tight"><div class="wrap">
+  <div class="sec-head" style="margin-top:0">
+    <p class="eyebrow">Available now</p>
+    <h2>The institutional dossier.</h2>
+    <p style="color:var(--ink-2)">Version 2.0 &mdash; the complete technical and institutional account:
+      what is designed, what is built, what is actually running, and where those three are not the
+      same thing. It opens with a chapter recording every claim Edition 1 made that no longer
+      stands, and why.</p>
+  </div>
+  <ul class="doclist" style="margin-bottom:3rem">
+    <li>
+      <div>
+        <h3><a href="Bloch-SIS-PoW-Institutional-Dossier-EN.pdf">Institutional Dossier 2.0 &mdash; PDF</a></h3>
+        <p>Consensus, economics and supply, governance, cryptography and security, plus the
+           pre-audit dossier as an appendix. Served at the Edition&nbsp;1 URL so existing links
+           resolve to the current document.</p>
+      </div>
+    </li>
+    <li>
+      <div>
+        <h3><a href="Bloch-SIS-PoW-Institutional-Dossier-EN-Edition1-archived.pdf">Edition 1 &mdash; archived</a></h3>
+        <p>The superseded 2026 edition, kept because 2.0&rsquo;s opening chapter is a record of what
+           changed from it &mdash; and a record you cannot check against the original is not a record.</p>
+      </div>
+    </li>
+  </ul>
+
+  <div class="sec-head">
+    <p class="eyebrow">Index &mdash; under review</p>
+    <h2>What is coming, in what order it matters.</h2>
+  </div>
+  <ul class="doclist">
+    <li>
+      <div>
+        <h3>Tokenomics V4 specification</h3>
+        <p>Supply, allocations, vesting, the emission curve, and the activation gates &mdash; the source behind the <a href="supply.html">supply page</a>.</p>
+      </div>
+    </li>
+    <li>
+      <div>
+        <h3>Proof-of-stake design</h3>
+        <p>Slots, epochs, committees, the finality gadget, stake churn, and the threat models written against them.</p>
+      </div>
+    </li>
+    <li>
+      <div>
+        <h3>Migration &amp; carryover</h3>
+        <p>The terminal-height rule, the snapshot format, and how Genesis-3 balances become Genesis-4 balances.</p>
+      </div>
+    </li>
+    <li>
+      <div>
+        <h3>Coherence &mdash; the shielded pool</h3>
+        <p>SHAKE-256 commitments, nullifiers, the STARK proving scaffold, and the audit status (currently: unaudited).</p>
+      </div>
+    </li>
+    <li>
+      <div>
+        <h3>Merged mining (AuxPoW)</h3>
+        <p>How one unit of Bitcoin ASIC work secured both chains during Genesis-3, kept as historical record after the halt.</p>
+      </div>
+    </li>
+    <li>
+      <div>
+        <h3>Decision records &amp; post-mortems</h3>
+        <p>ADRs and incident write-ups. The failures are part of the record; publishing them is the point.</p>
+      </div>
+    </li>
+  </ul>
+  <div class="card plain wide" style="margin-top:2.5rem">
+    <span class="tag">Why this page is honest instead of full</span>
+    <p style="max-width:var(--measure)">
+      It would be easy to publish everything at once and impressive-looking. It would
+      also mean publishing documents whose numbers may still change. The rule here is
+      the same as everywhere on this site: nothing goes public before it is checked,
+      and gaps are labelled as gaps.
+    </p>
+  </div>
+</div></section>
+
+</main>
+
+<footer><div class="wrap">
+  <div>
+    <span class="logo" style="font-size:1rem">
+      <svg width="22" height="22" viewBox="0 0 26 26" aria-hidden="true">
+        <circle cx="13" cy="13" r="11.2" fill="none" stroke="var(--accent)" stroke-width="1.5"/>
+        <ellipse cx="13" cy="13" rx="11.2" ry="4.2" fill="none" stroke="var(--accent)" stroke-width="1.1" opacity="0.55"/>
+        <line x1="13" y1="13" x2="19.6" y2="7.2" stroke="var(--ink)" stroke-width="1.6" stroke-linecap="round"/>
+        <circle cx="19.6" cy="7.2" r="2.1" fill="var(--accent)"/>
+      </svg>
+      Bloch Protocol
+    </span>
+    <p style="margin-top:0.7rem">Postern Labs Ltda. &middot; AGPL-3.0-or-later</p>
+    <p style="margin-top:0.35rem;font-size:0.86rem">Source: <a href="https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow">GitHub</a> &middot; <a href="https://gitlab.com/blochsispow-group/bloch-pos">GitLab</a></p>
+  </div>
+  <p style="max-width:34ch">Every figure on this site is either measured and labelled as such, or planned and labelled as such.</p>
+</div>
+
+</body>
+</html>

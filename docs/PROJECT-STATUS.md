@@ -1,5 +1,13 @@
 # Bloch-SIS — project status (consolidation checkpoint)
 
+> **SUPERSEDED FRAMING — 2026-08-11.** This status describes the Genesis-3
+> PoW project. Since it was written: the **ownerless thesis was retracted**
+> (ADR-036 — issuer + two-entity foundation,
+> `docs/specs/BLOCH-ENTITY-STRUCTURE.md`), Genesis-3 **halts at height
+> 80,000** and Genesis-4 relaunches as PoS (Tokenomics V4), the PoS crates are
+> **AGPL-3.0-or-later**, and the EVM moves to **L1** (no L2). Read
+> "ownerless / commons / 17% premine" claims below as historical.
+
 Single source of truth for what exists, what's verified, and what's open.
 Bloch-SIS is a **post-quantum, pure-Proof-of-Work BlockDAG L1** whose PoW is a
 **SHAKE-256 hashcash with a Module-SIS structural gate** — the gate binds the
@@ -12,6 +20,30 @@ fully de-branded off ENTL.
 RPC/API only, every node a seed); the **products** — the OSes, wallet, explorer,
 attestation — are **Postern Labs** (owned, rebranded off "Bloch"). Anyone may
 build products on the open protocol; Postern is one builder among many.
+
+> ## Live network — Genesis-3 mainnet (status as of 2026-08-09)
+> Much of this document predates the **Genesis-3 relaunch (2026-07-29)**. The
+> live mainnet is **Genesis-3** (chain id `0xB10C_0004`): a carry-over restart
+> (opening balance = 413,743 UTXOs / 3,475,441,200 BLOCH — `docs/CARRYOVER.md`)
+> whose chain-selected PoW is **SHA-256d** — ASIC-mined and **merged-mineable
+> with Bitcoin** (AuxPoW, active since local h=8,500 —
+> `docs/MERGED-MINING.md`). Current consensus state:
+> - **Difficulty-from-ancestry flag-day, local h=30,030 — ACTIVE.** Expected
+>   difficulty is a pure function of the block's own ancestry (commit
+>   `1f7d328`); older builds reject today's blocks.
+> - **Emission V3 flag-day, local h=40,000 (ETA ~2026-08-12/13)** — block
+>   reward 8,400 → 2,600 BLOCH, halvings every 1,555,200 blocks
+>   (`docs/specs/TOKENOMICS_V3.md`, ADR-035). Armed in the fleet binary
+>   (release `genesis3-node-emission-v3-floor60-20260810`, sha256
+>   `dfc6962d…`, incl. the PISO-60 60-BLOCH V3 tail floor), inert until the
+>   height.
+> - **From-scratch sync is not supported** (pre-2026-08-05 block bodies no
+>   longer exist on the network); new nodes bootstrap from a datadir snapshot
+>   (`docs/SNAPSHOT-BOOTSTRAP.md`). A poisoned `known_peers.json` self-heals
+>   on boot since `c21e09d` (PEX address fix).
+> The k-regime story in the caveat below concerns the **Bloch-SIS lattice
+> reference PoW chain**, not Genesis-3's SHA-256d; the maturity caveats
+> (nascent, low-hashrate, 51%-attackable, unaudited) apply to both.
 
 > ## 🔴 Hard caveat — read first
 > The chain is designated **mainnet beta** — a designation, **not** a security
@@ -43,8 +75,26 @@ build products on the open protocol; Postern is one builder among many.
   (~M/k faster in the relaxed pre-activation regime), consensus-neutral (equivalence-tested).
 - **Hybrid signatures** — Falcon-1024 ‖ ML-DSA-65 (both must verify), tx + peer
   identity, seed-deterministic. SHAKE-256 hashing throughout.
-- **Tokenomics** — 21 B supply, 100 % miner emission, 17 % founder premine
-  (10-yr cliff + 40-yr monthly vesting), 30 s blocks.
+- **Tokenomics** — 21 B nominal supply (**not hard-capped**: perpetual
+  60 BLOCH/block V3 tail, Monero-style; nominal = 3.57 B founder premine +
+  17.43 B mining nominal), 100 % miner emission, 17 % founder premine
+  (10-yr cliff + 40-yr monthly vesting), 30 s blocks. **Emission V3**
+  flag-day fork at local height 40,000 (ETA ~Aug 12–13, 2026; chain height
+  30,293 measured 2026-08-09): block reward 8,400 → 2,600 BLOCH (−69 %),
+  halving interval 1,036,800 → 1,555,200 blocks (~1.5 yr @ 30 s); V3
+  schedule 2,600 / 1,300 / 650 / 325 / 162 / 81 then the perpetual 60 tail
+  (from V3 epoch 6, ~9 yr after the fork; the V2 floor of 100 governs
+  pre-fork history). The old V2 curve would have emitted 26.92 B over 100
+  years against the documented 17.43 B mining nominal (the bug). **V3
+  realigns emission with the documented nominals to within ~0.5%**
+  (measured 2026-08-09): carryover 3,475,441,200 + mined-since-G3
+  309,128,400 + future V3 emission over 100 yr 13,620,441,600 =
+  17,405,011,200 mining total vs the 17.43 B mining nominal; + premine
+  3,570,000,000 = 20,975,011,200 vs the 21 B total nominal. Figures are
+  floors, not caps: coinbases are paid per DAG block, and the mined side
+  grows at 8,400/coinbase until the fork (≈ 17.50 B mining total at the
+  fork). Source of truth:
+  `crates/bloch-crypto/src/core/tokenomics_v2.rs`.
 - Node boots, validates genesis, and mines end-to-end (`--mine`).
 
 ### Security

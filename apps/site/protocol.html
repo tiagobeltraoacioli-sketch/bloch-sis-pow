@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+<!-- Bloch Protocol site — protocol page. Every figure carries its repo source
+     in a comment next to it. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Protocol — Bloch Protocol</title>
+<meta name="description" content="What secures Bloch today under proof of work, what Coherence is, and how the Genesis-4 proof-of-stake design works.">
+<link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<nav aria-label="Main"><div class="wrap">
+  <a class="logo" href="./">
+    <svg width="26" height="26" viewBox="0 0 26 26" aria-hidden="true">
+      <circle cx="13" cy="13" r="11.2" fill="none" stroke="var(--accent)" stroke-width="1.5"/>
+      <ellipse cx="13" cy="13" rx="11.2" ry="4.2" fill="none" stroke="var(--accent)" stroke-width="1.1" opacity="0.55"/>
+      <line x1="13" y1="13" x2="19.6" y2="7.2" stroke="var(--ink)" stroke-width="1.6" stroke-linecap="round"/>
+      <circle cx="19.6" cy="7.2" r="2.1" fill="var(--accent)"/>
+    </svg>
+    Bloch Protocol
+  </a>
+  <span class="navlinks">
+    <a href="protocol.html" aria-current="page">Protocol</a>
+    <a href="migration.html">Migration</a>
+    <a href="supply.html">Supply</a>
+    <a href="brand.html">Brand</a>
+    <a href="build.html">Build</a>
+    <a href="docs.html">Docs</a>
+    <a class="ext" href="https://blochl1.com">Explorer</a>
+  </span>
+</div></nav>
+
+<main id="main">
+
+<header class="pagehead"><div class="wrap">
+  <p class="eyebrow">Protocol</p>
+  <h1>No elliptic curves on the critical path.</h1>
+  <p class="lede">
+    That single constraint decides most of the design: signature sizes, the shape of
+    the shielded pool, why hardware wallets do not work yet, and what a proof-of-stake
+    committee can and cannot aggregate.
+  </p>
+</div></header>
+
+<section id="signatures"><div class="wrap">
+  <div class="sec-head">
+    <p class="eyebrow">Signatures</p>
+    <h2>Two lattice schemes, both mandatory.</h2>
+    <p class="sub">
+      Every spend and every block is signed with ML-DSA-65 <em>and</em> Falcon-1024,
+      and a verifier requires both. An attack has to break two independent lattice
+      constructions at once &mdash; and the price is paid in bytes, on every transaction.
+    </p>
+  </div>
+  <div class="tablewrap"><table>
+    <caption>Hybrid signature sizes, upper bounds</caption>
+    <thead><tr><th scope="col">Quantity</th><th scope="col" class="num">Bloch (bytes)</th><th scope="col" class="num">Bitcoin ECDSA (bytes)</th></tr></thead>
+    <tbody>
+      <!-- Sizes: crates/bloch-crypto/src/core/mod.rs:316-330.
+           Public key = 4 + 1952 (ML-DSA-65) + 1793 (Falcon-1024) = 3,749.
+           Secret key = 4 + 4032 + 2305 = 6,341 (PRIVKEY_SIZE, mod.rs:329).
+           Signature = 4 + 3309 + 1462 = 4,775 (SIG_SIZE, mod.rs:330; Falcon is
+           variable-length, 1,462 is the pinned maximum). -->
+      <tr><td>Public key</td><td class="num">3,749</td><td class="num">33</td></tr>
+      <tr><td>Signature</td><td class="num">&le; 4,775</td><td class="num">&asymp; 64&ndash;72</td></tr>
+      <tr><td>Secret key</td><td class="num">6,341</td><td class="num">32</td></tr>
+    </tbody>
+  </table></div>
+  <div class="specrows" style="margin-top:2.5rem">
+    <div class="specrow">
+      <span class="lbl">ML-DSA-65</span>
+      <p>NIST FIPS 204, module-lattice based. The scheme most of the post-quantum ecosystem is standardising on.</p>
+    </div>
+    <div class="specrow">
+      <span class="lbl">Falcon-1024</span>
+      <p>NTRU-lattice based, compact signatures, a genuinely different mathematical assumption. Its floating-point signing path is the operational hard part &mdash; which is why it is paired, not solo.</p>
+    </div>
+    <div class="specrow">
+      <span class="lbl">What this excludes</span>
+      <p>No secp256k1, no BLS aggregation, no pairing-based anything. It also excludes today&rsquo;s hardware wallets: none implements either scheme. That is stated as a limitation, not hidden.</p>
+    </div>
+  </div>
+</div></section>
+
+<section id="consensus-now" class="alt"><div class="wrap">
+  <div class="sec-head">
+    <p class="eyebrow">Consensus today</p>
+    <h2>Genesis-3: proof of work, merged with Bitcoin.</h2>
+    <p class="sub">
+      <!-- SHA-256d, GhostDAG, AuxPoW active since local h=8,500:
+           docs/PROJECT-STATUS.md "Live network — Genesis-3 mainnet" block;
+           docs/MERGED-MINING.md. Target block time 30 s:
+           crates/bloch-crypto/src/core/mod.rs:262. -->
+      The live chain is SHA-256d over a GhostDAG, at a 30-second target, and it is
+      merged-mineable with Bitcoin &mdash; one unit of ASIC work can secure both chains.
+      It runs until height 50,000 and then stops, by rule.
+    </p>
+  </div>
+  <div class="cards">
+    <div class="card a">
+      <span class="tag">Work</span>
+      <h3>SHA-256d</h3>
+      <p>The same hash Bitcoin ASICs already compute. Post-quantum by Grover&rsquo;s bound: a quadratic speedup, priced in, not a break.</p>
+    </div>
+    <div class="card b">
+      <span class="tag">Merged mining</span>
+      <h3>AuxPoW</h3>
+      <!-- AuxPoW verifier: crates/bloch-crypto/src/core/auxpow.rs; activation
+           since local h=8,500: docs/PROJECT-STATUS.md. -->
+      <p>A Bitcoin miner embeds a Bloch commitment in its coinbase and one solved header pays both chains. Hashrate is borrowed, honestly labelled as borrowed.</p>
+    </div>
+    <div class="card c">
+      <span class="tag">The caveat</span>
+      <h3>51%-attackable today</h3>
+      <!-- docs/PROJECT-STATUS.md "Hard caveat" block. -->
+      <p>Low hashrate, few nodes, unaudited. Security here is a trajectory, not a present-tense claim &mdash; and the trajectory ends at height 50,000 anyway.</p>
+    </div>
+  </div>
+</div></section>
+
+<section id="consensus-next"><div class="wrap">
+  <div class="sec-head">
+    <p class="eyebrow">Consensus next</p>
+    <h2>Genesis-4: proof of stake, same signatures.</h2>
+    <p class="sub">
+      The design borrows the shape the market converged on &mdash; slots, epochs,
+      LMD-GHOST fork choice, a Casper-style finality gadget &mdash; and replaces the
+      cryptography underneath it. No BLS aggregation exists for lattice schemes, so the
+      committees are sized for explicit signatures.
+    </p>
+  </div>
+  <div class="specrows">
+    <div class="specrow">
+      <span class="lbl">Slot</span>
+      <!-- 30 s slots: crates/bloch-pos-committee/src/tokenomics_v4.rs:119-120
+           (SLOTS_PER_DAY = 2,880). -->
+      <p>30 seconds. 2,880 slots per day.</p>
+    </div>
+    <div class="specrow">
+      <span class="lbl">Epoch</span>
+      <!-- 32 slots/epoch: crates/bloch-pos-committee/src/params.rs:30. -->
+      <p>32 slots &mdash; 16 minutes.</p>
+    </div>
+    <div class="specrow">
+      <span class="lbl">Committees</span>
+      <!-- Committee of 128 votes at epoch boundary; per-slot subcommittee of 8
+           for LMD-GHOST weight: crates/bloch-pos-committee/src/finality.rs:5-11. -->
+      <p>A full epoch committee of 128 votes once per epoch and drives finality. A per-slot subcommittee of 8 exists only to give LMD-GHOST its fork-choice weight between boundaries.</p>
+    </div>
+    <div class="specrow">
+      <span class="lbl">Finality</span>
+      <!-- Justification at ≥ 2/3 of committee stake, exact integer comparison;
+           finalization on consecutive justification; inactivity leak after 4
+           epochs: crates/bloch-pos-committee/src/finality.rs:15-25. -->
+      <p>A checkpoint justifies at &ge; 2/3 of the committee&rsquo;s active stake (compared as 3&middot;attesting &ge; 2&middot;total &mdash; no rounding ambiguity) and finalises on consecutive justification. An inactivity leak starts after 4 stalled epochs.</p>
+    </div>
+    <div class="specrow">
+      <span class="lbl">Entry and exit</span>
+      <!-- Activation delay 8 epochs (~2.1 h), 4 activations/epoch, exit delay
+           32 epochs (~8.5 h): crates/bloch-pos-committee/src/staking.rs:121-137. -->
+      <p>Deposits wait 8 epochs (~2.1 h) before the activation queue, which admits 4 validators per epoch; exits take 32 epochs (~8.5 h). An attacker with unlimited coins still needs publicly visible queue traffic, for weeks, to take a majority.</p>
+    </div>
+    <div class="specrow">
+      <span class="lbl">Status</span>
+      <!-- Devnet stage M1/M2; explicitly missing pieces listed at
+           crates/bloch-pos-node/src/main.rs:3-13. -->
+      <p>Devnet. The node produces, attests and finalises across real processes &mdash; and has no persistent store, no gossip network, no transactions, no slashing pipeline and no RPC yet. Said plainly here so nobody has to discover it.</p>
+    </div>
+  </div>
+</div></section>
+
+<section id="privacy" class="alt"><div class="wrap">
+  <div class="sec-head">
+    <p class="eyebrow">Privacy</p>
+    <h2>Coherence: a shielded pool with no curves in it.</h2>
+    <p class="sub">
+      Zcash-style shielded pools rest on elliptic-curve zero-knowledge proofs, which is
+      exactly the assumption this chain refuses. Coherence rebuilds the pool from hashes.
+    </p>
+  </div>
+  <div class="cards">
+    <div class="card a">
+      <span class="tag">Commitments</span>
+      <h3>SHAKE-256 everywhere</h3>
+      <!-- Note commitments, hash-derived nullifiers, SHAKE-256 incremental tree:
+           crates/coherence-core/src/lib.rs:6,41-47. -->
+      <p>Note commitments, nullifiers and the incremental Merkle tree are all SHAKE-256 constructions. No trusted setup existed, so none can be betrayed.</p>
+    </div>
+    <div class="card b">
+      <span class="tag">Proofs</span>
+      <h3>STARK / FRI</h3>
+      <!-- SP1 (hash-STARK / FRI, Plonky3), raw FRI proof verified client-side,
+           never the Groth16 curve-SNARK wrapper:
+           crates/coherence-prover/README.md:4-5, script/src/main.rs:6,26. -->
+      <p>Spends are proven in a hash-based STARK (SP1/FRI) and verified as the raw FRI proof &mdash; never wrapped in a curve SNARK, which would reintroduce the assumption the pool exists to avoid.</p>
+    </div>
+    <div class="card c">
+      <span class="tag">The caveat</span>
+      <h3>No privacy claim yet</h3>
+      <p>Proofs are large, the prover is a scaffold, and the pool is unaudited. Until an audit says otherwise, Coherence is a design with tests, not an anonymity promise.</p>
+    </div>
+  </div>
+</div></section>
+
+</main>
+
+<footer><div class="wrap">
+  <div>
+    <span class="logo" style="font-size:1rem">
+      <svg width="22" height="22" viewBox="0 0 26 26" aria-hidden="true">
+        <circle cx="13" cy="13" r="11.2" fill="none" stroke="var(--accent)" stroke-width="1.5"/>
+        <ellipse cx="13" cy="13" rx="11.2" ry="4.2" fill="none" stroke="var(--accent)" stroke-width="1.1" opacity="0.55"/>
+        <line x1="13" y1="13" x2="19.6" y2="7.2" stroke="var(--ink)" stroke-width="1.6" stroke-linecap="round"/>
+        <circle cx="19.6" cy="7.2" r="2.1" fill="var(--accent)"/>
+      </svg>
+      Bloch Protocol
+    </span>
+    <p style="margin-top:0.7rem">Postern Labs Ltda. &middot; AGPL-3.0-or-later</p>
+    <p style="margin-top:0.35rem;font-size:0.86rem">Source: <a href="https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow">GitHub</a> &middot; <a href="https://gitlab.com/blochsispow-group/bloch-pos">GitLab</a></p>
+  </div>
+  <p style="max-width:34ch">Every figure on this site is either measured and labelled as such, or planned and labelled as such.</p>
+</div>
+
+</body>
+</html>

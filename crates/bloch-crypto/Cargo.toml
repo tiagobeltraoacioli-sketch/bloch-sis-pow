@@ -50,7 +50,14 @@ auxpow-rehearsal = []
 [dependencies]
 # Post-quantum signatures (hybrid ML-DSA-65 ‖ Falcon-1024) + seeded keygen.
 pqcrypto-mldsa     = "0.1"
-pqcrypto-falcon    = "0.4"
+# F1 (BLOCH-FALCON-ONLINE-SIGNING.md §3.2): default features ("avx2","neon")
+# dispatch Falcon SIGNING to PQClean's native floating-point variants — forbidden
+# for a PoS validator that signs on a public schedule. `default-features = false`
+# forces the `clean` variant: integer-only emulated IEEE-754, constant-time,
+# bit-exact on every platform. Guarded by the
+# `falcon_native_fp_variants_are_not_linked` tripwire test in crypto/mod.rs and
+# by scripts/falcon-clean-guard.sh in CI. Do not re-enable avx2/neon.
+pqcrypto-falcon    = { version = "0.4", default-features = false, features = ["std"] }
 pqcrypto-traits    = "0.3"
 pqcrypto-internals = "0.2"
 

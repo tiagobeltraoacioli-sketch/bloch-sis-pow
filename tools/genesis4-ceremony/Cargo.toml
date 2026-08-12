@@ -1,0 +1,25 @@
+[package]
+name = "genesis4-ceremony"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "Genesis-4 ceremony: assembles the Genesis-4 genesis block from the signed carryover artifact. Offline tool, UNAUDITED."
+publish = false
+
+# Standalone: NOT a member of the node workspace, the same posture as
+# crates/bloch-pos-committee and crates/coherence-prover. Nothing here can
+# affect the live validation path of the running chain.
+[workspace]
+
+[dependencies]
+# Single source of truth for every tokenomics number. The ceremony does not
+# restate a single allocation constant — it imports them, so the genesis it
+# assembles cannot drift from the constants the consensus code compiles in.
+bloch-pos-committee = { path = "../../crates/bloch-pos-committee" }
+# The C1-frozen shielded-pool accumulator (§6.6.1): the ceremony recomputes the
+# carried pool's accumulator root by replaying the leaves through the SAME
+# SHAKE-256 tree the node and the SP1 guest use — never a reimplementation,
+# which for a position-binding tree would be a consensus fork waiting to ship.
+coherence-core = { path = "../../crates/coherence-core" }
+sha3 = { version = "0.10", default-features = false }
+hex = "0.4"

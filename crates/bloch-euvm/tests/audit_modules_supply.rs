@@ -1,7 +1,12 @@
 //! Adversarial audit — lens: Module-compiler bypass (modules.rs), Supply-cap defect.
 //! Separate file so it does not touch src/ or another auditor's `audit_modules.rs`.
 //!
-//! FINDING (HIGH): `ModuleKind::Supply` compiles a validator whose `cap` gate
+//! FINDING (HIGH) — **FIXED 2026-08-11.** This file proved the defect; it now pins
+//! the fix. The attack below is byte-for-byte what it was; only the expected result
+//! changed, because rewriting the attack would discard the only evidence of what the
+//! hole was. Original finding, kept verbatim:
+//!
+//! `ModuleKind::Supply` compiles a validator whose `cap` gate
 //! compares a *redeemer-supplied* `requested` value to `cap` — a value with NO
 //! binding to the actual amount minted. When that program is used as the token's
 //! minting policy (which the module docs mandate: "its hash IS the token's
@@ -36,11 +41,18 @@ fn out(value: Value) -> ExtOutput {
     ExtOutput { value, validator_hash: [0u8; 32], datum: Val::Int(0) }
 }
 
-/// The Ustav Supply module claims (SupplyConfig::cap doc) to be the "fixed maximum
-/// amount authorizable by a single mint spend". This proves it is NOT: with cap =
-/// 1_000, an authorized issuer mints 1_000_000_000 in one shot — 1e6x the cap.
+/// The historical attack, refused. With cap = 1_000 an authorized issuer used to mint
+/// 1_000_000_000 in one shot — 1e6x the cap — by seeding a `requested` value in the
+/// redeemer that nothing bound to the real delta.
+///
+/// The emitter now reads `MINT_CTX_PRIOR_SUPPLY` and `MINT_CTX_DELTA`, so the gate is
+/// over TOTAL supply and the spender has no input to it. Note what *else* changed:
+/// the advertised property moved from "maximum per single mint spend" to "fixed
+/// maximum supply". A per-spend cap was never a supply cap — an issuer could always
+/// mint the cap again next block — so the doc claim and the code are now the same
+/// claim, which is the deeper repair.
 #[test]
-fn supply_module_cap_is_unenforced_unbounded_inflation_past_cap() {
+fn supply_module_cap_is_enforced_over_total_supply() {
     let issuer = b"issuer-pk".to_vec();
     let sig = b"issuer-sig".to_vec();
     let sighash = b"the-sighash".to_vec();
@@ -64,22 +76,55 @@ fn supply_module_cap_is_unenforced_unbounded_inflation_past_cap() {
         sighash: sighash.clone(),
     };
 
-    // Redeemer seeds the policy stack `[requested, sig]`. We set requested = 0 (any
-    // value <= cap works) — it is completely disconnected from `minted`/the delta.
+    // THE ATTACK, unchanged: seed the policy stack `[requested, sig]` with
+    // requested = 0, a value completely disconnected from `minted`/the delta.
     let mints = vec![MintRequest {
-        policy: supply_program,
+        policy: supply_program.clone(),
         redeemer: vec![Val::Int(0), Val::Bytes(sig.clone())],
         action: MintAction { asset_id: asset, delta: minted as i128 },
     }];
 
-    let v = MockVerifier { good: vec![(sighash, issuer, sig)] };
+    let v = MockVerifier { good: vec![(sighash, issuer, sig.clone())] };
 
-    // BUG: the mint of 1e9 units is AUTHORIZED even though cap == 1_000.
+    // The over-cap mint is now REFUSED. (`Assert` and not a quiet `false`: an
+    // over-cap mint is malformed, not merely unauthorized.)
     let res = validate_tx_with_mint(&tx, &mints, &MintCtx::default(), &v, 100_000);
     assert!(
-        res.is_ok(),
-        "BUG CONFIRMED: the Supply module authorized an over-cap mint (1e9 vs cap 1e3); \
-         got {res:?}"
+        res.is_err(),
+        "REGRESSION: the Supply module authorized an over-cap mint again (1e9 vs cap \
+         1e3) — the gate stopped reading MINT_CTX_DELTA/MINT_CTX_PRIOR_SUPPLY; got {res:?}"
+    );
+
+    // The refusal must be the CAP, not merely the arity pin tripping on the stale
+    // redeemer shape. Same mint with the honest seed `[sig]` — still refused.
+    let honest = vec![MintRequest {
+        policy: supply_program.clone(),
+        redeemer: vec![Val::Bytes(sig.clone())],
+        action: MintAction { asset_id: asset, delta: minted as i128 },
+    }];
+    assert!(
+        validate_tx_with_mint(&tx, &honest, &MintCtx::default(), &v, 100_000).is_err(),
+        "the cap must refuse an over-cap delta even with a well-formed redeemer"
+    );
+
+    // And a within-cap mint by the same issuer still succeeds, so the fix did not
+    // simply break the module. Without this, both assertions above would pass on a
+    // Supply program that authorizes nothing at all.
+    let small: u64 = 900;
+    let ok_tx = EuTx {
+        inputs: vec![],
+        outputs: vec![out(asset_val(asset, small))],
+        fee: 0,
+        sighash: b"the-sighash".to_vec(),
+    };
+    let ok_mints = vec![MintRequest {
+        policy: supply_program,
+        redeemer: vec![Val::Bytes(sig)],
+        action: MintAction { asset_id: asset, delta: small as i128 },
+    }];
+    assert!(
+        validate_tx_with_mint(&ok_tx, &ok_mints, &MintCtx::default(), &v, 100_000).is_ok(),
+        "a within-cap mint by the authorized issuer must still be allowed"
     );
 }
 

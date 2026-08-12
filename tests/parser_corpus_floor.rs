@@ -125,6 +125,7 @@ fn rand_block(r: &mut Rng) -> Vec<u8> {
         height: r.next(),
         pow_solution: vec![],
         shielded_transactions: shielded,
+        auxpow: None,
     };
     block.to_bitcoin_bytes()
 }
@@ -155,7 +156,7 @@ fn rand_netmsg(r: &mut Rng) -> Vec<u8> {
                 })
                 .collect(),
         },
-        4 => NetworkMessage::GetBlock { block_hash: r.arr32() },
+        4 => NetworkMessage::GetBlock { block_hash: r.arr32(), nonce: r.next() },
         _ => NetworkMessage::Version {
             version: r.next() as u32,
             user_agent: "bloch/floor".into(),

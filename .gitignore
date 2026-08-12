@@ -21,9 +21,6 @@ docs/*.tar
 scan/node_modules/
 scan/dist/
 scan/.astro/
-scan/node_modules/
-scan/dist/
-scan/.astro/
 loc-alpha.txt
 loc-beta-day0.txt
 
@@ -37,3 +34,17 @@ desktop/src-tauri/gen/
 # build artifacts in any subcrate
 **/target/
 carryover.tsv
+
+# PDF gerado a partir do .md pelo pipeline do spike — nao versionar
+docs/specs/*.pdf
+
+# Worktrees de agentes: repos git embutidos, nunca conteudo do projeto.
+.claude/worktrees/
+deploy/artifacts/
+
+# Orquestracao local de agentes: nao e artefato do protocolo.
+.claude/
+
+# Python bytecode (sdk/codegen, tools/*)
+__pycache__/
+*.pyc

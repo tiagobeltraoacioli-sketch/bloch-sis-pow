@@ -1,5 +1,9 @@
 # Build your first Bloch app
 
+> **SUPERSEDED FRAMING — 2026-08-11.** Genesis-3 page; the "ownerless"
+> claims below were retracted (ADR-036, two-entity foundation) and Genesis-3
+> halts at height 80,000. See the note in [index](index.md).
+
 > **Honesty rails (see [index](index.md) for the full text):** Bloch today is
 > **unaudited mainnet-beta**; relaxed PoW (**k=4**) makes work **trivially
 > forgeable**; the network is small and **51%-attackable**. Bloch is

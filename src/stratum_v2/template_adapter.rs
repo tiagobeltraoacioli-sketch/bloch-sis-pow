@@ -49,6 +49,16 @@ pub fn build_template_for_sv2(
         (data.height + 1, data.blue_score + 1)
     };
 
+    // TERMINAL HEIGHT — same guard as the V1 path in stratum/session.rs.
+    // accept_block refuses anything above it, so producing a template here
+    // would only hand a miner work that cannot be accepted.
+    if crate::core::is_past_terminal_height(height) {
+        return Err(TemplateBuildError::ChainEnded {
+            terminal: crate::core::terminal_height(crate::core::node_chain_id()).unwrap_or(0),
+            requested: height,
+        });
+    }
+
     // Explicit `Vec<Transaction>` annotation + `for` loop removes any
     // closure-inference ambiguity that plagues the `.iter().map().sum()`
     // version in this module (works in V1 only because V1's session.rs
@@ -65,11 +75,20 @@ pub fn build_template_for_sv2(
     // the template is for the NEXT block (`height`). At a retarget boundary
     // the validator demands the retargeted bits — a template carrying the
     // stale tip bits is rejected ("invalid difficulty") on every window
-    // boundary. Use the validator's single source of truth (shared with
-    // accept_block, the solo miner, V1 stratum, and getblocktemplate):
-    // off-boundary it equals the tip/current bits; at a boundary it applies
-    // the retarget.
-    let bits = crate::pow::genesis2_expected_bits(&ctx.store, height);
+    // boundary.
+    //
+    // FLAG-DAY core::DIFFICULTY_ANCESTRY_FORK_HEIGHT (gated inside the
+    // function): expected bits are a pure function of the EXACT parent set
+    // this template stamps (`tip.parents`) — the same slice, the same choke
+    // point, accept_block uses on submit. Even if this TipChanged event is
+    // stale by the time a share lands, the assembled block carries these
+    // parents, so validator agreement is by construction. FAIL CLOSED when
+    // the ancestry is unreadable: no template beats a doomed template.
+    let bits = {
+        let d = ctx.dag.read();
+        crate::pow::genesis2_expected_bits_for_parents(&ctx.store, &d, &tip.parents, height)
+            .map_err(|e| TemplateBuildError::BitsUnavailable(e.to_string()))?
+    };
 
     Ok(Template::build(
         tip.parents.clone(),
@@ -88,6 +107,10 @@ pub fn build_template_for_sv2(
 pub enum TemplateBuildError {
     #[error("tip block data missing from DAG — inconsistent state")]
     TipDataMissing,
+    #[error("expected bits not derivable from parent ancestry (fail-closed): {0}")]
+    BitsUnavailable(String),
+    #[error("chain reached its terminal height {terminal} — no further work (requested h={requested})")]
+    ChainEnded { terminal: u64, requested: u64 },
 }
 
 #[cfg(test)]

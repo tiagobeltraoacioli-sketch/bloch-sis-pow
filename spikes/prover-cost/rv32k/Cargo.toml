@@ -1,0 +1,11 @@
+[package]
+name = "rv32-keccak"
+version = "0.1.0"
+edition = "2021"
+[workspace]
+[dependencies]
+sha3 = { version = "0.10", default-features = false }
+[profile.release]
+opt-level = 3
+panic = "abort"
+lto = true

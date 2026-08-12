@@ -61,7 +61,9 @@ fn mk_block(height: u64, transactions: Vec<Transaction>) -> Block {
         blue_score: height,
         height,
         pow_solution: Vec::new(),
-        shielded_transactions: Vec::new(),    }
+        shielded_transactions: Vec::new(),
+        auxpow: None,
+    }
 }
 
 /// Coinbase-style tx: 1 input with prev_txid = zeros, outputs the block reward.

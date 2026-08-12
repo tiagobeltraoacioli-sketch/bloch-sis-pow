@@ -159,7 +159,9 @@ pub fn main() {
             match resp.get("error") {
                 Some(e) => err(&format!("RPC error: {}", e)),
                 None => {
-                    let sats = resp["satoshis"].as_u64().unwrap_or(0);
+                    // R3: satoshi amounts are decimal strings on the V4 wire,
+                    // numbers on the G3 wire — `sat_u64` reads both.
+                    let sats = crate::wallet::sat_u64(&resp["satoshis"]).unwrap_or(0);
                     let bloch = sats as f64 / 1e8;
                     let utxos = resp["utxo_count"].as_u64().unwrap_or(0);
 
@@ -199,7 +201,7 @@ pub fn main() {
                 }
             }
 
-            let avail = resp["satoshis"].as_u64().unwrap_or(0);
+            let avail = crate::wallet::sat_u64(&resp["satoshis"]).unwrap_or(0);
             let utxo_count = resp["utxo_count"].as_u64().unwrap_or(0);
             if avail < amount_sats + fee_sats {
                 err(&format!("Insufficient funds: have {:.8} BLOCH ({} UTXOs), need {:.8} BLOCH",
@@ -215,7 +217,7 @@ pub fn main() {
                     let txid_hex = u["txid"].as_str()?;
                     let txid = hex::decode(txid_hex).ok()?;
                     let idx  = u["index"].as_u64()? as u32;
-                    let val  = u["value"].as_u64()?;
+                    let val  = crate::wallet::sat_u64(&u["value"])?;
                     let spk  = hex::decode(u["script_pubkey"].as_str()?).ok()?;
                     Some((txid, idx, crate::core::TxOutput { value: val, script_pubkey: spk }))
                 })
@@ -348,7 +350,7 @@ pub fn main() {
                     Some(e) if !e.is_null() =>
                         label(&format!("index {}", index), &red(&format!("RPC error: {}", e))),
                     _ => {
-                        let sats = resp["satoshis"].as_u64().unwrap_or(0);
+                        let sats = crate::wallet::sat_u64(&resp["satoshis"]).unwrap_or(0);
                         total = total.saturating_add(sats);
                         label(&format!("index {}", index),
                             &format!("{:.8} BLOCH  {}{}{}", sats as f64 / 1e8, DIM, addr_str, RESET));

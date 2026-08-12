@@ -3,3 +3,7 @@ dist
 .wrangler
 *.local
 .DS_Store
+
+# TypeScript incremental build cache — build artifact, not source.
+# It changes on every build and was polluting every diff.
+tsconfig.tsbuildinfo

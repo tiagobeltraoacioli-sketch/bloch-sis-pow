@@ -33,6 +33,7 @@ pub fn block_with(header: BlockHeader, height: u64, pow_solution: Vec<i32>) -> B
         height,
         pow_solution,
         shielded_transactions: vec![],
+        auxpow: None,
     }
 }
 

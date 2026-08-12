@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 import { ReactNode, useState } from "react";
 import { Link } from "../lib/router";
 

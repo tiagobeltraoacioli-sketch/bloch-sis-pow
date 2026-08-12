@@ -1,9 +1,10 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 import { rpc, rpcAllSettled } from "../lib/rpc";
 import { useAsync } from "../lib/hooks";
 import { Loading, ErrorBox, KV, Copyable } from "../components/ui";
 import { Link } from "../lib/router";
 import { addressFromHashHex } from "../lib/sha3";
-import { fmtInt, fmtTime, timeAgo, short, fmtBloch } from "../lib/format";
+import { fmtInt, fmtTime, timeAgo, short, fmtBloch, toSats } from "../lib/format";
 
 function statusBadge(status: string) {
   const map: Record<string, string> = { pending: "gold", confirmed: "blue", final: "green", unknown: "gray" };
@@ -32,7 +33,9 @@ export function TxDetail({ txid }: { txid: string }) {
   const status = data!.status;
   const outputs = tx.outputs || [];
   const inputs = tx.inputs || [];
-  const outTotal = outputs.reduce((a: bigint, o: any) => a + BigInt(o.value), 0n);
+  // bigint sum; toSats (not BigInt) so a malformed field renders as 0 instead
+  // of throwing out of render, and so the wire string form is accepted.
+  const outTotal = outputs.reduce((a: bigint, o: any) => a + toSats(o.value), 0n);
   const isCoinbase = tx.coinbase;
 
   return (

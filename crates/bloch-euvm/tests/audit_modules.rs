@@ -5,7 +5,7 @@
 use bloch_euvm::modules::{
     compile_charter, ModuleKind, TokenCharter, TransferPolicyConfig, FIELD_SIGHASH,
 };
-use bloch_euvm::{blch, spend, Ctx, ExtOutput, SigVerifier, Val};
+use bloch_euvm::{blch, spend, Ctx, ExtOutput, SigVerifier, Val, VmError};
 
 const MSG: &[u8] = b"ustav-sighash";
 
@@ -28,7 +28,18 @@ fn ctx() -> Ctx {
     }
 }
 
-/// **CRITICAL — TransferPolicy freeze bypass via redeemer padding.**
+/// **CRITICAL — TransferPolicy freeze bypass via redeemer padding. FIXED 2026-08-11.**
+///
+/// This test proved the defect; it now pins the fix. The assertion was inverted
+/// (`Ok(true)` -> `Err(Assert)`) and nothing else about the attack was softened —
+/// the same frozen output, the same padded redeemer, the same verifier that accepts
+/// no signature. A test that proved a hole is the right place to prove it stays shut,
+/// and rewriting the attack would have thrown away the only evidence of what the
+/// hole was.
+///
+/// The fix is `Op::ExpectDepth`, emitted as the first op of every compiled module:
+/// the seed arity a validator was compiled for is now part of its program, hence
+/// part of its `validator_hash`, and cannot be renegotiated by the spender.
 ///
 /// `compile_transfer_policy` reads the `frozen` flag (the OUTPUT's datum, which the
 /// output-creator committed to) from the stack via a *fixed, top-relative* `Pick(2)`.
@@ -71,9 +82,10 @@ fn transfer_policy_freeze_is_bypassed_by_padding_the_redeemer() {
     );
     assert_eq!(honest, Ok(false), "control: honest frozen spend must be denied");
 
-    // ATTACK: pad the redeemer with a leading Int(0). This shifts the fixed Pick offsets
-    // so the "read frozen" Pick lands on this attacker-supplied 0 instead of the real
-    // datum, making `not_frozen == 1` and allowing the spend WITHOUT any authority sig.
+    // THE ATTACK, unchanged: pad the redeemer with a leading Int(0). This used to
+    // shift the fixed Pick offsets so the "read frozen" Pick landed on this
+    // attacker-supplied 0 instead of the real datum, making `not_frozen == 1` and
+    // allowing the spend WITHOUT any authority signature.
     let mut g2 = 100_000;
     let bypass = spend(
         &frozen_output,
@@ -86,9 +98,24 @@ fn transfer_policy_freeze_is_bypassed_by_padding_the_redeemer() {
 
     assert_eq!(
         bypass,
-        Ok(true),
-        "BYPASS CONFIRMED: a frozen TransferPolicy output was spent with no authority \
-         signature by padding the redeemer — the freeze control is defeated"
+        Err(VmError::Assert),
+        "REGRESSION: the padded redeemer was accepted again — the arity pin is gone \
+         or an emitter stopped leading with Op::ExpectDepth, and the freeze control \
+         is defeated once more"
     );
+
+    // And the pin is not a blanket ban on the value that was used to pad: the honest
+    // arity still runs, so the fix costs no legitimate spend. Without this second
+    // assertion the test above would also pass if the module had simply been broken.
+    let mut g3 = 100_000;
+    let honest_unfrozen = spend(
+        &ExtOutput { value: blch(1_000), validator_hash: cm.validator_hash, datum: Val::Int(0) },
+        &cm.program,
+        vec![Val::Bytes(b"any".to_vec())],
+        &ctx(),
+        &DenyAll,
+        &mut g3,
+    );
+    assert_eq!(honest_unfrozen, Ok(true), "an unfrozen output must still be spendable");
     let _ = FIELD_SIGHASH;
 }

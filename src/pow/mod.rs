@@ -524,3 +524,171 @@ mod tests {
         assert_eq!(t.as_bytes(), t2.as_bytes());
     }
 }
+
+/// Why the ancestry-incomplete cases below are ERRORS and not fallbacks.
+///
+/// The first version of the ancestry rule returned `Option<u32>` and both
+/// callers did `unwrap_or_else(|| genesis2_expected_bits(...))` — a SILENT
+/// fall-back to the legacy order-dependent value. That means one node can be
+/// on the new rule while its peer is on the old one with no signal anywhere,
+/// which is a consensus split by construction. It also silently DROPPED any
+/// parent missing from the DAG (`filter_map`), so a node with a partial view
+/// computed argmax over a SUBSET and confidently derived bits from the WRONG
+/// selected parent. Fail-closed is deliberate: a loud reject/refusal on the
+/// one node whose view is incomplete beats a quiet chain-wide fork.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExpectedBitsError {
+    /// Empty parents slice — only genesis has no parents and genesis is never
+    /// validated through this path.
+    NoParents,
+    /// A listed parent has no GhostDAG data on this node. Selecting the parent
+    /// from the remaining ones would silently pick the wrong selected parent,
+    /// so this is an error, not a filter.
+    ParentDataMissing(crate::consensus::BlockHash),
+    /// The selected parent's block body (which carries its header bits) is not
+    /// in local storage.
+    SelectedParentBlockMissing(crate::consensus::BlockHash),
+    /// The selected-parent walk could not reach `height - window` (pruned or
+    /// mid-IBD ancestry, or the claimed height is inconsistent with the
+    /// parents' heights).
+    AncestryIncomplete { want: u64, reached: u64 },
+}
+
+impl std::fmt::Display for ExpectedBitsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoParents => write!(f, "no parents supplied"),
+            Self::ParentDataMissing(h) =>
+                write!(f, "parent {} has no DAG data on this node", hex::encode(&h[..8])),
+            Self::SelectedParentBlockMissing(h) =>
+                write!(f, "selected parent {} body not in local storage", hex::encode(&h[..8])),
+            Self::AncestryIncomplete { want, reached } =>
+                write!(f, "selected-parent walk stopped at h={} before reaching h={}", reached, want),
+        }
+    }
+}
+
+/// SHA-256d expected `bits` for a block at `height` carrying exactly
+/// `parents` — the SINGLE choke point for every producer AND the validator.
+///
+/// ## Flag-day semantics
+///
+/// * `height <  DIFFICULTY_ANCESTRY_FORK_HEIGHT` — the legacy value
+///   ([`genesis2_expected_bits`]: `current_bits` meta + height-keyed
+///   timestamps), kept verbatim so settled history stays valid.
+/// * `height >= DIFFICULTY_ANCESTRY_FORK_HEIGHT` — a PURE FUNCTION of the
+///   block's own parent set and its selected-parent ancestry. No local
+///   mutable state, no silent fallback: if the ancestry cannot be read the
+///   caller gets an error and must fail closed (refuse to produce a template /
+///   reject the block with an explicit reason).
+///
+/// ## Why the legacy split-brain existed (incident 2026-08-09, h=28080)
+///
+/// The legacy path derives bits from `current_bits` (rewritten on EVERY
+/// accepted block) and `CF_TIMESTAMPS` (keyed by height alone — last-write-wins
+/// when a height has siblings). At the h=28080 boundary with TWO tips at
+/// 28079 the producer's own template flipped 0x1a0abb83 → 0x1a0abee4 the
+/// moment the second 28079 block landed (journal, 04:42:23 vs 04:43:09),
+/// while the ancestry rule — active in the validator via the flag-day, but
+/// NOT in the stratum template builder — expected 0x1a0ac909 over the same
+/// two-tip parent set. Every ASIC block was self-rejected and the chain sat
+/// still. The fix is not "make the fallbacks agree": it is that everyone who
+/// stamps or checks bits calls THIS function with THE SAME parents slice the
+/// block header carries.
+///
+/// The producer MUST pass the exact slice it will stamp into
+/// `header.parents`; the validator passes `block.header.parents`. Because the
+/// result is a pure function of that slice, WHEN each side reads the tip set
+/// no longer matters — a template built on a now-stale tip set still carries
+/// bits consistent with its own parents, which is all the validator checks.
+pub fn genesis2_expected_bits_for_parents(
+    store: &crate::storage::Storage,
+    dag: &crate::consensus::GhostDAG,
+    parents: &[crate::consensus::BlockHash],
+    height: u64,
+) -> Result<u32, ExpectedBitsError> {
+    genesis2_expected_bits_for_parents_gated(
+        store, dag, parents, height,
+        crate::core::DIFFICULTY_ANCESTRY_FORK_HEIGHT,
+    )
+}
+
+/// Test seam for [`genesis2_expected_bits_for_parents`]: identical logic with
+/// an explicit flag-day height, so the lab (tests/difficulty_ancestry_
+/// boundary_lab.rs) can exercise the ancestry rule on a short chain without
+/// building 30k blocks. Production code must call the un-suffixed wrapper.
+pub fn genesis2_expected_bits_for_parents_gated(
+    store: &crate::storage::Storage,
+    dag: &crate::consensus::GhostDAG,
+    parents: &[crate::consensus::BlockHash],
+    height: u64,
+    fork_height: u64,
+) -> Result<u32, ExpectedBitsError> {
+    if height < fork_height {
+        return Ok(genesis2_expected_bits(store, height));
+    }
+
+    if parents.is_empty() {
+        return Err(ExpectedBitsError::NoParents);
+    }
+
+    // Selected parent — EXACT mirror of `GhostDAG::select_parent`
+    // (consensus/mod.rs): argmax over (blue_work, blue_score, hash). The
+    // previous version compared (blue_work, hash) only, which can disagree
+    // with GhostDAG when blue_work ties but blue_score does not — the walk
+    // below follows GhostDAG's own `selected_parent` links, so the entry
+    // point must use GhostDAG's own rule. Unlike `select_parent`, a missing
+    // parent is an ERROR here (it treats missing as 0-work; we must not
+    // guess).
+    let mut best: Option<(crate::consensus::BlockHash, u128, u64)> = None;
+    for p in parents {
+        let d = dag.get_block_data(p)
+            .ok_or(ExpectedBitsError::ParentDataMissing(*p))?;
+        let cand = (*p, d.blue_work, d.blue_score);
+        best = Some(match best {
+            None => cand,
+            Some(b) => {
+                let ord = cand.1.cmp(&b.1)
+                    .then(cand.2.cmp(&b.2))
+                    .then(cand.0.cmp(&b.0));
+                if ord == std::cmp::Ordering::Greater { cand } else { b }
+            }
+        });
+    }
+    let sp = best.expect("parents checked non-empty").0;
+
+    // Bits in force = the selected parent's own header bits. Every block
+    // carries its bits, so no extra storage is needed.
+    let cur = store.get_block(&sp).ok().flatten()
+        .ok_or(ExpectedBitsError::SelectedParentBlockMissing(sp))?
+        .header.bits;
+
+    let window = crate::core::GENESIS2_RETARGET_WINDOW;
+    if height < window || height % window != 0 {
+        return Ok(cur);
+    }
+
+    // Retarget boundary: walk this block's selected-parent chain for the two
+    // window timestamps — never the height-keyed CF_TIMESTAMPS index, which
+    // is last-write-wins when a height has siblings.
+    let sp_data = dag.get_block_data(&sp)
+        .ok_or(ExpectedBitsError::ParentDataMissing(sp))?;
+    let last = sp_data.timestamp;
+
+    let target_height = height - window;
+    let mut data = sp_data;
+    while data.height > target_height {
+        let next = data.selected_parent.ok_or(
+            ExpectedBitsError::AncestryIncomplete { want: target_height, reached: data.height })?;
+        data = dag.get_block_data(&next).ok_or(
+            ExpectedBitsError::AncestryIncomplete { want: target_height, reached: data.height })?;
+    }
+    if data.height != target_height {
+        return Err(ExpectedBitsError::AncestryIncomplete {
+            want: target_height, reached: data.height,
+        });
+    }
+    let first = data.timestamp;
+
+    Ok(crate::core::retarget_bits_g2(cur, last.saturating_sub(first)))
+}

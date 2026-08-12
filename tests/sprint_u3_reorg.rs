@@ -79,7 +79,9 @@ fn mk_block(height: u64, transactions: Vec<Transaction>) -> Block {
         blue_score: height,
         height,
         pow_solution: Vec::new(),
-        shielded_transactions: Vec::new(),    }
+        shielded_transactions: Vec::new(),
+        auxpow: None,
+    }
 }
 
 fn mk_coinbase(addr_byte: u8, value: u64, height: u64) -> Transaction {

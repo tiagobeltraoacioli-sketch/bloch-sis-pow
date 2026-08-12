@@ -453,7 +453,7 @@ fn do_send(params: &[&str], rpc_host: &str, rpc_port: u16) {
     for u in &utxos_json {
         let txid = hex::decode(u["txid"].as_str().unwrap_or("")).unwrap_or_default();
         let idx = u["index"].as_u64().unwrap_or(0) as u32;
-        let value = u["value"].as_u64().unwrap_or(0);
+        let value = sat_u64(&u["value"]).unwrap_or(0);
         let spk = hex::decode(u["script_pubkey"].as_str().unwrap_or("")).unwrap_or_default();
         available_utxos.push((txid, idx, bloch::core::TxOutput { value, script_pubkey: spk }));
     }
@@ -697,6 +697,18 @@ fn read_password(prompt: &str) -> String {
         eprintln!("Failed to read password: {}", e);
         process::exit(1);
     })
+}
+
+/// Read a satoshi-denominated response field that may be a JSON number (V3
+/// nodes, and the live G3 fleet) or a decimal string (V4 rule R3,
+/// docs/specs/BLOCH-RPC-V4.md — amounts exceed both `i64::MAX` and JS
+/// `Number.MAX_SAFE_INTEGER`, so they travel as strings). Dual-tolerant so one
+/// CLI binary talks to both wires.
+fn sat_u64(v: &serde_json::Value) -> Option<u64> {
+    if let Some(n) = v.as_u64() {
+        return Some(n);
+    }
+    v.as_str().and_then(|s| s.trim().parse::<u64>().ok())
 }
 
 fn bloch_to_sats(s: &str) -> u64 {

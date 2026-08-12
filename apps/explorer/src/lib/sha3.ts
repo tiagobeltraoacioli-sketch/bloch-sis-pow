@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Minimal FIPS-202 SHA3-256 (Keccak-f[1600], 0x06 domain padding), BigInt lanes.
 // Used only to derive display addresses from 20-byte pubkey hashes — low volume,
 // so clarity beats micro-optimisation. Verified against the founder address:

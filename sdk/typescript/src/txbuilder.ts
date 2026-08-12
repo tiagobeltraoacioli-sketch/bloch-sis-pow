@@ -25,6 +25,7 @@
 import { addressToScriptPubkey } from "./address.js";
 import { selectCoins, type SelectableUtxo, type SelectCoinsOptions } from "./coinselect.js";
 import type { Address, Satoshis } from "./types.js";
+import { parseSats } from "./units.js";
 
 /** An input reference into a previous transaction output. */
 export interface UnsignedTxInput {
@@ -32,8 +33,14 @@ export interface UnsignedTxInput {
   prevTxid: string;
   /** Output index within the previous transaction. */
   prevIndex: number;
-  /** Value of the output being spent, in satoshis (needed for SIGHASH_ALL). */
-  value: Satoshis;
+  /**
+   * Value of the output being spent, in satoshis (needed for SIGHASH_ALL).
+   *
+   * `bigint`, not `Satoshis`: this is money math handed to a signer, and the
+   * supply cap 10^19 sat is ~1110x Number.MAX_SAFE_INTEGER, so a `number` here
+   * would silently round the amount that gets committed to a signature.
+   */
+  value: bigint;
   /** 40-hex P2PKH script_pubkey of the output being spent. */
   scriptPubkey: string;
   /** Sequence number (defaults to 0xffffffff). */
@@ -43,8 +50,8 @@ export interface UnsignedTxInput {
 export interface UnsignedTxOutput {
   /** Recipient P2PKH script_pubkey (40-hex, = 20-byte pubkey hash). */
   scriptPubkey: string;
-  /** Amount in satoshis. */
-  value: Satoshis;
+  /** Amount in satoshis. `bigint` — see {@link UnsignedTxInput.value}. */
+  value: bigint;
 }
 
 /**
@@ -115,29 +122,31 @@ const MAX_SEQUENCE = 0xffffffff;
  * WalletCore-backed {@link Signer}. Does not sign or broadcast.
  */
 export function buildTransaction(params: BuildTransactionParams): BuiltTransaction {
-  const amount = BigInt(params.amount);
-  const fee = BigInt(params.fee);
-  const dust = params.dustThreshold !== undefined ? BigInt(params.dustThreshold) : 0n;
+  // parseSats, not BigInt(): it rejects the already-corrupted `number` form
+  // (> 2^53) and anything past the supply cap instead of laundering it.
+  const amount = parseSats(params.amount);
+  const fee = parseSats(params.fee);
+  const dust = params.dustThreshold !== undefined ? parseSats(params.dustThreshold) : 0n;
 
   const selectOpts: SelectCoinsOptions = { target: amount, fee, dustThreshold: dust };
   const selection = selectCoins(params.utxos, selectOpts);
 
   const toScript = addressToScriptPubkey(params.to);
   const outputs: UnsignedTxOutput[] = [
-    { scriptPubkey: toScript, value: Number(amount) },
+    { scriptPubkey: toScript, value: amount },
   ];
 
   if (selection.change > 0n) {
     outputs.push({
       scriptPubkey: addressToScriptPubkey(params.changeAddress),
-      value: Number(selection.change),
+      value: selection.change,
     });
   }
 
   const inputs: UnsignedTxInput[] = selection.inputs.map((u: SelectableUtxo) => ({
     prevTxid: u.txid,
     prevIndex: u.index,
-    value: u.value,
+    value: parseSats(u.value),
     scriptPubkey: u.script_pubkey,
     sequence: MAX_SEQUENCE,
   }));

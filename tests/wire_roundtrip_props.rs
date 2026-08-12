@@ -91,6 +91,7 @@ fn block_with_shielded_wire_round_trips_for_random_values() {
             height: r.next(),
             pow_solution: vec![],
             shielded_transactions: shielded.clone(),
+            auxpow: None,
         };
         let bytes = block.to_bitcoin_bytes();
         let parsed = Block::from_bitcoin_bytes(&bytes).expect("valid block must parse");

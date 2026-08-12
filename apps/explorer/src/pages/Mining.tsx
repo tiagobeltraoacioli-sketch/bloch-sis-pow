@@ -1,12 +1,18 @@
-import { useMemo, useState, ReactNode } from "react";
+// SPDX-License-Identifier: AGPL-3.0-or-later
+import { useEffect, useMemo, useState, ReactNode } from "react";
 import { useAsync } from "../lib/hooks";
 import { Loading, ErrorBox, Copyable, Stat } from "../components/ui";
 import { fetchNetParams, HS_UNITS, POOL } from "../lib/mining";
+import { ChainPhaseBanner, useAdaptivePoll } from "../components/chainStatus";
+import { chainPhase } from "../lib/chain";
 import { parseBlochAddress, looksLikeBlochAddress } from "../lib/address";
-import { fmtBloch, fmtHashrate, fmtNum, fmtDuration, fmtInt, timeAgo } from "../lib/format";
+import { fmtBloch, fmtHashrate, fmtNum, fmtDuration, fmtInt } from "../lib/format";
 
 export function MiningPage() {
-  const { data: net, error, loading } = useAsync(fetchNetParams, [], 30000);
+  const { intervalMs, markTip } = useAdaptivePoll(30000);
+  const { data: net, error, loading } = useAsync(fetchNetParams, [intervalMs], intervalMs);
+  useEffect(() => markTip(net?.tipHeight), [net, markTip]);
+  const complete = net ? chainPhase(net.tipHeight, net.freshestTs) === "complete" : false;
 
   // calculator inputs
   const [hashInput, setHashInput] = useState("100");
@@ -28,7 +34,9 @@ export function MiningPage() {
     const totalHs = net.networkHs + userHs; // include the user in the pie
     const share = userHs / totalHs;
     const blocksPerDay = share * (86400 / net.blockTimeSecs);
-    const rewardBloch = net.minerRewardSats / 1e8;
+    // minerRewardSats is bigint; the per-day estimate is an explicitly lossy
+    // display figure, so the float conversion happens here and only here.
+    const rewardBloch = Number(net.minerRewardSats) / 1e8;
     const blochPerDay = blocksPerDay * rewardBloch;
     const secsPerBlock = blocksPerDay > 0 ? 86400 / blocksPerDay : Infinity;
     return { share, blocksPerDay, blochPerDay, rewardBloch, secsPerBlock };
@@ -59,21 +67,21 @@ export function MiningPage() {
 
       {net && (
         <>
-          {net.stalled && (
-            <div className="banner-stale" style={{ marginTop: 14 }}>
-              <span className="dot stale" />
-              <div>
-                <strong>Chain is stalled / difficulty is being tuned.</strong> The newest block is{" "}
-                {net.freshestTs ? timeAgo(net.freshestTs) : "unknown age"}. Estimates use the last known
-                difficulty and the {net.blockTimeSource === "measured" ? "measured" : "30s target"} block
-                time — treat them as theoretical until the chain advances again.
-              </div>
-            </div>
-          )}
+          <div style={{ marginTop: 14 }}>
+            <ChainPhaseBanner tipHeight={net.tipHeight} freshestTs={net.freshestTs}>
+              {complete
+                ? "Mining ended with it — the calculator below now describes the network's final parameters, for reference only."
+                : "Estimates below use the last known difficulty and block time — treat them as theoretical until blocks flow again."}
+            </ChainPhaseBanner>
+          </div>
 
           <div className="grid stat-grid" style={{ marginTop: 14 }}>
-            <Stat label="Network hashrate" value={fmtHashrate(net.networkHs)} sub="live estimate" />
-            <Stat label="Difficulty" value={fmtNum(net.difficulty, 0)} sub="current" />
+            <Stat
+              label="Network hashrate"
+              value={fmtHashrate(net.networkHs)}
+              sub={complete ? "final estimate" : "live estimate"}
+            />
+            <Stat label="Difficulty" value={fmtNum(net.difficulty, 0)} sub={complete ? "final" : "current"} />
             <Stat
               label="Block reward (miner)"
               value={fmtBloch(net.minerRewardSats, 4)}

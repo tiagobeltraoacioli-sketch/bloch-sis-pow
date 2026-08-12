@@ -1,0 +1,50 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# bloch-pos — the Genesis-4 node binary. A NEW binary, deliberately:
+# the Genesis-3 node (`bloch`, src/main.rs at the repo root) halts at height
+# 80,000 and its validation path is never touched by this work
+# (BLOCH-POS-NODE-INTEGRATION.md §0). This crate is standalone — its own
+# [workspace], exactly like crates/bloch-pos-committee and
+# crates/coherence-prover — so nothing here can enter the Genesis-3 build
+# graph, its Cargo.lock, or its binary.
+
+[package]
+name = "bloch-pos-node"
+version = "0.0.2-devnet"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "Bloch Genesis-4 Proof-of-Stake node. M1/M2 devnet stage: real processes producing, attesting, justifying and finalizing over a local TCP mesh, with append-only block-log persistence and replay-on-restart. Not mainnet-ready — see docs/specs/BLOCH-POS-NODE-INTEGRATION.md."
+publish = false
+
+# Standalone: NOT a member of the node workspace. The Genesis-3 node must not
+# gain this crate as a dependency, and this crate must not drag the Genesis-3
+# node's lockfile. Integration direction is one-way and by path: this binary
+# consumes the pure consensus crate (and later bloch-crypto), never the
+# reverse.
+#
+# LICENSE (BLOCH-POS-NODE-INTEGRATION.md §8.4 — RESOLVED 2026-08-11): the
+# founder decided the Genesis-4 node is born AGPL-3.0-or-later, like the
+# Genesis-3 node it succeeds. That ruling is what makes the bloch-crypto
+# dependency below legal: AGPL is viral and the whole binary inherits it,
+# which is now the declared license rather than a contradiction.
+[workspace]
+
+[[bin]]
+name = "bloch-pos"
+path = "src/main.rs"
+
+[dependencies]
+# The frozen consensus math (pure, sha3-only).
+bloch-pos-committee = { path = "../bloch-pos-committee" }
+# The hybrid ML-DSA-65 ‖ Falcon-1024 suite (M2: keys/ + KeyVerifier). Path
+# dependency, one-way; pulls the PQClean FFI tree, which is why this crate's
+# build stopped being instant at M2 — planned in the integration doc §6.
+bloch-crypto = { path = "../bloch-crypto" }
+sha3 = "0.10"
+
+# Same vendored fork the root workspace patches in (root Cargo.toml
+# [patch.crates-io]): bloch-crypto calls `with_seeded_rng`, which only exists
+# in the vendored pqcrypto-internals 0.2.11 fork. A standalone workspace does
+# not inherit the root's patch table, so it is restated here.
+[patch.crates-io]
+pqcrypto-internals = { path = "../pqcrypto-internals" }

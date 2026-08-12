@@ -116,7 +116,21 @@ sha3         = "0.10"
 pqcrypto-mldsa   = "0.1"
 # Sprint B6b: Falcon-1024 for hybrid PQ signatures (Falcon ‖ ML-DSA). Two
 # distinct lattice families (NTRU + Module-LWE/SIS) for defence in depth.
-pqcrypto-falcon  = "0.4"
+#
+# PoS finding F1 (BLOCH-FALCON-ONLINE-SIGNING.md §3.2): the crate's DEFAULT
+# features ("avx2", "neon") compile and runtime-dispatch Falcon signing to
+# PQClean's native floating-point variants (AVX2 doubles on x86_64,
+# `typedef double fpr` on aarch64). Under PoS the validator signs on a PUBLIC
+# schedule, so signing must use PQClean's `clean` variant only: integer-emulated
+# IEEE-754, constant-time by construction, bit-exact across platforms.
+# `default-features = false` forces `clean` on every target (the FP variants are
+# not even compiled). Cost: ~11.6 ms/signature vs ~0.46 ms native — irrelevant
+# in a 30 s slot. Cargo features are ADDITIVE across the workspace: re-enabling
+# defaults in ANY member silently restores native-FP dispatch everywhere, which
+# is why bloch-crypto carries a symbol-level tripwire test
+# (`falcon_native_fp_variants_are_not_linked`) and CI runs
+# scripts/falcon-clean-guard.sh. Do not re-enable avx2/neon here.
+pqcrypto-falcon  = { version = "0.4", default-features = false, features = ["std"] }
 pqcrypto-traits  = "0.3"
 pqcrypto-kyber   = "0.8"
 # Sprint T.1: direct dep on pqcrypto-internals so we can call `with_seeded_rng`

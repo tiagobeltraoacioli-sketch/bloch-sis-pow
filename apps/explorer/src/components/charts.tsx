@@ -1,17 +1,19 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 import { ReactNode, useId, useRef, useState } from "react";
 
 // Hand-rolled SVG charts — zero chart-lib dependency, keeps the bundle lean.
-// Responsive via viewBox + width:100%. Brand-styled: Amber Copper primary
-// series, gradient area fills, soft series glow, draw-on animation, and a
-// mempool.space-style crosshair + floating tooltip on the time-series charts.
+// Responsive via viewBox + width:100%. Brand-styled: emerald primary series
+// via theme tokens (so light/dark both work), gradient area fills, soft series
+// glow, draw-on animation, and a mempool.space-style crosshair + floating
+// tooltip on the time-series charts.
 // DATA is untouched — this file only renders what it is handed.
 
 const W = 640;
 const H = 220;
 const PAD = { t: 16, r: 18, b: 28, l: 52 };
 
-const BRASS = "#D2955C";
-const BRASS_HI = "#E0A870";
+const PRIMARY = "var(--accent)";
+const PRIMARY_HI = "var(--accent-strong)";
 
 function niceTicks(min: number, max: number, count = 4): number[] {
   if (min === max) return [min];
@@ -69,7 +71,7 @@ export interface LinePoint {
 
 export function LineChart({
   points,
-  color = BRASS,
+  color = PRIMARY,
   yFormat = (v) => String(Math.round(v)),
   xFormat = (v) => String(Math.round(v)),
   area = true,
@@ -191,7 +193,7 @@ export function LineChart({
           <g>
             <line x1={px(hp.x)} y1={PAD.t} x2={px(hp.x)} y2={baseY} stroke={color} strokeWidth={1} strokeOpacity={0.5} strokeDasharray="3 3" />
             <circle cx={px(hp.x)} cy={py(hp.y)} r={5.5} fill={color} fillOpacity={0.18} />
-            <circle cx={px(hp.x)} cy={py(hp.y)} r={3.2} fill={BRASS_HI} stroke="var(--bg)" strokeWidth={1.4} />
+            <circle cx={px(hp.x)} cy={py(hp.y)} r={3.2} fill={PRIMARY_HI} stroke="var(--bg)" strokeWidth={1.4} />
           </g>
         )}
 
@@ -211,7 +213,7 @@ export function LineChart({
 
 export function BarChart({
   bars,
-  color = BRASS,
+  color = PRIMARY,
   yFormat = (v) => String(Math.round(v)),
 }: {
   bars: { label: string; value: number; color?: string }[];
@@ -255,7 +257,7 @@ export function BarChart({
                 <text className="axis-label" x={x + w / 2} y={H - 10} textAnchor="middle">{b.label}</text>
               )}
               {hover === i && (
-                <text className="axis-label" x={x + w / 2} y={y - 6} textAnchor="middle" fill={BRASS_HI} style={{ fontSize: 11 }}>
+                <text className="axis-label" x={x + w / 2} y={y - 6} textAnchor="middle" fill={PRIMARY_HI} style={{ fontSize: 11 }}>
                   {yFormat(b.value)}
                 </text>
               )}
@@ -271,7 +273,9 @@ export function BarChart({
 export function ProportionBars({
   rows,
 }: {
-  rows: { label: string; value: number; pct: number; color: string; sub?: string }[];
+  // `value` is carried for callers' own bookkeeping and is NOT rendered (only
+  // `pct` drives the bar), so it accepts the satoshi wire union unconverted.
+  rows: { label: string; value: number | string | bigint; pct: number; color: string; sub?: string }[];
 }) {
   if (!rows.length) return <EmptyPlot note="No distribution data yet." />;
   const max = Math.max(...rows.map((r) => r.pct), 0.0001);

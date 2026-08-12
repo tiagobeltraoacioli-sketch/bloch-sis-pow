@@ -1,15 +1,26 @@
-// Cloudflare Pages Function: /rpc
+// Cloudflare Pages Function: /rpc  (blochl1.com, Pages project bloch-explorer)
 // ---------------------------------------------------------------------------
-// Read-only JSON-RPC passthrough to a Bloch (Genesis-2) node. Mirrors the
-// pattern of the posternlabs site's functions/rpc.js: an explicit read-only
-// method allowlist, a same-origin/CORS-tight surface, and no key ever exposed
-// to the browser. The upstream node RPC is READ-PUBLIC (no auth for reads); the
-// only thing this Function adds is the allowlist + shielding the node URL.
+// Read-only JSON-RPC passthrough to a Bloch node: an explicit read-only method
+// allowlist, a same-origin/CORS-tight surface, and no key ever exposed to the
+// browser. The upstream node RPC is READ-PUBLIC (no auth for reads); the only
+// thing this Function adds is the allowlist + shielding the node URL.
+//
+// This is the client's fallback endpoint (src/lib/rpc.ts tier 3) and the one
+// that survives the pool decommission by construction — it lives and dies
+// with the site itself.
 //
 // Config (Pages project env var, Settings → Environment variables):
-//   BLOCH_RPC_URL   e.g. https://g2-rpc.posternlabs.com/  (a reachable
-//                   read-only RPC forwarder to a Genesis-2 node's :16210).
-//                   Falls back to a sensible default if unset.
+//   BLOCH_RPC_URL   the upstream node RPC, e.g. http://<archival-node>:16210/.
+//                   MUST NOT be a Cloudflare-proxied hostname — a Worker
+//                   fetching a proxied host on the same account trips the 403
+//                   "error code: 1003" loop. Use a DNS-only hostname or a
+//                   direct origin.
+//                   If unset, this Function answers 503 EXPLICITLY rather than
+//                   silently trying a default that cannot work in production.
+//
+// NOTE (Genesis-4): the allowlist below is the Genesis-3 surface. At the V4
+// relaunch it must be rebuilt against docs/specs/BLOCH-RPC-V4.md — several
+// methods here die with PoW and the new staking/finality methods are absent.
 // ---------------------------------------------------------------------------
 
 const ALLOWED_METHODS = new Set([
@@ -53,7 +64,6 @@ const ALLOWED_METHODS = new Set([
   "getattestation",
 ]);
 
-const DEFAULT_RPC_URL = "http://127.0.0.1:16210/";
 const UPSTREAM_TIMEOUT_MS = 12000;
 
 const CORS = {
@@ -75,7 +85,20 @@ export async function onRequestOptions() {
 
 export async function onRequestPost(context) {
   const { request, env } = context;
-  const upstream = env.BLOCH_RPC_URL || DEFAULT_RPC_URL;
+  const upstream = env.BLOCH_RPC_URL;
+  if (!upstream) {
+    // Explicit, diagnosable failure — never a silent default. The client
+    // (src/lib/rpc.ts) treats 5xx as "endpoint down" and fails over.
+    return json(503, {
+      jsonrpc: "2.0",
+      id: null,
+      error: {
+        code: -32000,
+        message:
+          "RPC proxy not configured: set BLOCH_RPC_URL on the Pages project (Settings → Environment variables)",
+      },
+    });
+  }
 
   let body;
   try {

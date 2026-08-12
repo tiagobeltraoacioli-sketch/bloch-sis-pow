@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+<!-- Bloch Protocol site — build/participate page. Every figure carries its
+     repo source in a comment next to it. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Build — Bloch Protocol</title>
+<meta name="description" content="What running a Bloch validator will take, what delegation means, and what exists today — stated honestly.">
+<link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<nav aria-label="Main"><div class="wrap">
+  <a class="logo" href="./">
+    <svg width="26" height="26" viewBox="0 0 26 26" aria-hidden="true">
+      <circle cx="13" cy="13" r="11.2" fill="none" stroke="var(--accent)" stroke-width="1.5"/>
+      <ellipse cx="13" cy="13" rx="11.2" ry="4.2" fill="none" stroke="var(--accent)" stroke-width="1.1" opacity="0.55"/>
+      <line x1="13" y1="13" x2="19.6" y2="7.2" stroke="var(--ink)" stroke-width="1.6" stroke-linecap="round"/>
+      <circle cx="19.6" cy="7.2" r="2.1" fill="var(--accent)"/>
+    </svg>
+    Bloch Protocol
+  </a>
+  <span class="navlinks">
+    <a href="protocol.html">Protocol</a>
+    <a href="migration.html">Migration</a>
+    <a href="supply.html">Supply</a>
+    <a href="brand.html">Brand</a>
+    <a href="build.html" aria-current="page">Build</a>
+    <a href="docs.html">Docs</a>
+    <a class="ext" href="https://blochl1.com">Explorer</a>
+  </span>
+</div></nav>
+
+<main id="main">
+
+<header class="pagehead"><div class="wrap">
+  <p class="eyebrow">Participate</p>
+  <h1>What running a node will take.</h1>
+  <p class="lede">
+    Genesis-4 validators stake a bond, run duties on a 30-second clock, and share
+    slashing risk with anyone who delegates to them. The parameters below are in the
+    code today; the network is not. Both facts belong on the same page.
+  </p>
+</div></header>
+
+<section id="validate"><div class="wrap">
+  <div class="sec-head">
+    <p class="eyebrow">Validating</p>
+    <h2>The bond, the queue, the exit.</h2>
+  </div>
+  <div class="cards">
+    <div class="card a">
+      <span class="tag">Planned</span>
+      <h3>25,000 BLCH bond</h3>
+      <!-- MIN_DEPOSIT_SAT = 25,000 BLCH: crates/bloch-pos-committee/src/staking.rs:119.
+           Derivation: same fraction of supply as Ethereum's 32 ETH; the file's
+           own honest note (staking.rs:95-118) says borrowing the ratio is not
+           borrowing Ethereum's reasoning, and the ratio drifts. -->
+      <p>Roughly the fraction of supply Ethereum asks for with 32 ETH. It lowers who <em>may</em> validate; it does nothing about who <em>does</em> &mdash; a large holder can fund many validators, and the 1% cap binds per validator, not per owner.</p>
+    </div>
+    <div class="card b">
+      <span class="tag">Planned</span>
+      <h3>A visible queue</h3>
+      <!-- 8-epoch activation delay (~2.1 h), 4 activations/epoch, 32-epoch exit
+           (~8.5 h): staking.rs:121-137. -->
+      <p>Deposits activate through a public queue &mdash; 4 validators per epoch, after an ~2.1-hour delay; exits take ~8.5 hours. Taking over the set requires weeks of traffic everyone can watch.</p>
+    </div>
+    <div class="card b">
+      <span class="tag">Planned</span>
+      <h3>Delegation</h3>
+      <!-- Delegation and per-validator cap: crates/bloch-pos-committee/src/delegation.rs
+           (MAX_VALIDATOR_STAKE_BPS = 100, :118). -->
+      <p>Stake behind an operator without running hardware &mdash; and share their slashing risk, pro-rata. That exposure is the point: a delegator who cannot lose anything has no reason to choose operators carefully.</p>
+    </div>
+  </div>
+</div></section>
+
+<section id="today" class="alt"><div class="wrap">
+  <div class="sec-head">
+    <p class="eyebrow">What exists today</p>
+    <h2>A devnet node and a chain about to halt.</h2>
+  </div>
+  <div class="cards two">
+    <div class="card c">
+      <span class="tag">Not ready</span>
+      <h3>The PoS node is devnet</h3>
+      <!-- Devnet stage M1/M2, with the missing pieces listed by the node itself:
+           crates/bloch-pos-node/src/main.rs:3-13 — no RocksDB store, no libp2p
+           gossip, no transactions, no slashing-evidence pipeline, no
+           weak-subjectivity sync, no RPC. -->
+      <p>It produces, attests and finalises across real processes &mdash; a running devnet, not a diagram. It has <strong>no persistent store, no gossip network, no transactions, no slashing pipeline and no RPC</strong> yet. There is no Genesis-4 launch date, and anyone quoting one is guessing.</p>
+    </div>
+    <div class="card c">
+      <span class="tag">Ending by design</span>
+      <h3>Genesis-3 mining stops at 50,000</h3>
+      <!-- Terminal height: docs/FLEET-BRIEF-CERTIK-2026-08-12.md:79.
+           From-scratch sync unsupported; snapshot bootstrap:
+           docs/PROJECT-STATUS.md, docs/SNAPSHOT-BOOTSTRAP.md. -->
+      <p>The proof-of-work chain halts at height 50,000, so standing up new mining now buys days, not months. New nodes bootstrap from a datadir snapshot &mdash; from-scratch sync is no longer supported on the live network.</p>
+    </div>
+  </div>
+</div></section>
+
+<section id="hardware" class="alt"><div class="wrap">
+  <div class="sec-head">
+    <p class="eyebrow">Hardware</p>
+    <h2>What it actually takes to run one.</h2>
+    <p style="color:var(--ink-2)">The Genesis-3 column is <strong>measured on the live fleet</strong>, not
+      estimated &mdash; three boxes running the archival node today. The Genesis-4 column is a
+      projection from the same measurements plus the signature and bandwidth arithmetic, and it is
+      labelled as a projection because the proof-of-stake node has never run outside a devnet.</p>
+  </div>
+
+  <div class="tablewrap"><table>
+    <caption>Node requirements</caption>
+    <thead><tr><th>&nbsp;</th><th>Genesis-3 &mdash; measured</th><th>Genesis-4 validator &mdash; projected</th></tr></thead>
+    <tbody>
+      <!-- Medido 2026-08-12 nos boxes node4 e auxpow: nproc=2, free -g, ps -o rss/%cpu -->
+      <tr><td>CPU</td><td>2 cores. Observed 68% of one core on an archival node, 168% on the box that also mines</td><td>2 cores. Signing is 11.6&nbsp;ms per block &mdash; 0.04% of a 30&nbsp;s slot</td></tr>
+      <tr><td>RAM</td><td>831&nbsp;MB resident, archival. 1.7&nbsp;GB on the mining box. 4&nbsp;GB is comfortable</td><td>4&nbsp;GB</td></tr>
+      <tr><td>Disk</td><td>452&nbsp;MB at height 37,960; <strong>595&nbsp;MB projected at the halt</strong>, then it stops growing forever</td><td>25&nbsp;GB to start. Growth depends on transaction volume, which is why this is a floor and not a promise</td></tr>
+      <tr><td>Bandwidth</td><td>Modest &mdash; blocks are small and there is no state sync to serve</td><td>~54&nbsp;KB per block at 384 validators; ~139&nbsp;KB at 1,000. Under 1&nbsp;Mbps sustained either way</td></tr>
+      <tr><td>Network</td><td>One inbound TCP port for peering</td><td>Same. A validator that cannot be reached still attests, but slower</td></tr>
+      <tr><td>Uptime</td><td>None required &mdash; proof of work does not penalise absence</td><td><strong>This is the real change.</strong> A validator that is offline earns nothing and, after four epochs without finality, bleeds stake through the inactivity leak</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="cards" style="margin-top:2rem">
+    <div class="card a">
+      <span class="tag">Why so small</span>
+      <h3>The chain is young</h3>
+      <p>452&nbsp;MB is not an achievement of engineering &mdash; it is what 37,960 blocks weigh. A chain
+         with years of history behind it would ask for far more, and Genesis-4 will grow into that
+         over time.</p>
+    </div>
+    <div class="card b">
+      <span class="tag">The expensive part</span>
+      <h3>Signatures, not computation</h3>
+      <p>A hybrid ML-DSA-65 &#8214; Falcon-1024 signature is ~4.6&nbsp;KB and one verification costs
+         about 7.3&nbsp;million instructions. Bandwidth and verification scale with the validator
+         count, not with transaction volume &mdash; the opposite of most chains.</p>
+    </div>
+    <div class="card c">
+      <span class="tag">Not a recommendation</span>
+      <h3>These are floors</h3>
+      <p>Nothing here has been through a load test at a realistic validator count. The
+         proof-of-stake node has run four processes on one machine, which tells you it works and
+         tells you nothing about a thousand of them across the internet.</p>
+    </div>
+  </div>
+</div></section>
+
+<section id="source"><div class="wrap">
+  <div class="sec-head">
+    <p class="eyebrow">Source</p>
+    <h2>Copyleft, on purpose.</h2>
+    <p class="sub">
+      <!-- License: LICENSE at repo root; AGPL-3.0-or-later on the PoS crates
+           per docs/FLEET-BRIEF-CERTIK-2026-08-12.md and docs/PROJECT-STATUS.md. -->
+      The protocol implementation is licensed AGPL-3.0-or-later: anyone may run it,
+      study it, fork it &mdash; and anyone who operates a modified version for others
+      must publish their changes. For consensus software that is not idealism, it is
+      how everyone verifies they are running the same rules.
+    </p>
+  </div>
+  <div class="cards" style="margin-bottom:1.5rem">
+    <div class="card a">
+      <span class="tag">GitHub</span>
+      <h3><a href="https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow">bloch-sis-pow</a></h3>
+      <p>The node, the consensus crates and the proof-of-stake work, on branch
+         <code>integration/pos-modules</code>. Clone it, read it, build it &mdash; the numbers on this
+         site are the constants in that tree, and every one of them cites its file.</p>
+    </div>
+    <div class="card b">
+      <span class="tag">GitLab</span>
+      <h3><a href="https://gitlab.com/blochsispow-group/bloch-pos">blochsispow-group / bloch-pos</a></h3>
+      <p>The working mirror where the Genesis-4 branches are integrated. Same commits, and the
+         CI that gates them &mdash; including the guard that fails the build if Falcon signing
+         ever leaves the constant-time path.</p>
+    </div>
+    <div class="card c">
+      <span class="tag">What is not there yet</span>
+      <h3>Read before you judge the tree</h3>
+      <p>The proof-of-stake node runs on a devnet: no transactions, no peer-to-peer stack, no
+         public RPC. 30% of code files still carry no SPDX header. Neither is hidden, and
+         both are in the audit notes in <code>docs/</code>.</p>
+    </div>
+  </div>
+  <div class="card plain wide">
+    <span class="tag">Where the numbers on this site live</span>
+    <p style="max-width:none;font-family:var(--mono);font-size:0.85rem;line-height:1.9">
+      crates/bloch-pos-committee/src/tokenomics_v4.rs &mdash; supply, allocations, vesting, emission<br>
+      crates/bloch-pos-committee/src/staking.rs &mdash; bond, activation and exit delays<br>
+      crates/bloch-pos-committee/src/finality.rs &mdash; committees and the finality gadget<br>
+      crates/bloch-pos-committee/src/genesis_cohort.rs &mdash; the one-year taper<br>
+      crates/bloch-crypto/src/core/mod.rs &mdash; signature sizes and the terminal-height rule
+    </p>
+  </div>
+</div></section>
+
+</main>
+
+<footer><div class="wrap">
+  <div>
+    <span class="logo" style="font-size:1rem">
+      <svg width="22" height="22" viewBox="0 0 26 26" aria-hidden="true">
+        <circle cx="13" cy="13" r="11.2" fill="none" stroke="var(--accent)" stroke-width="1.5"/>
+        <ellipse cx="13" cy="13" rx="11.2" ry="4.2" fill="none" stroke="var(--accent)" stroke-width="1.1" opacity="0.55"/>
+        <line x1="13" y1="13" x2="19.6" y2="7.2" stroke="var(--ink)" stroke-width="1.6" stroke-linecap="round"/>
+        <circle cx="19.6" cy="7.2" r="2.1" fill="var(--accent)"/>
+      </svg>
+      Bloch Protocol
+    </span>
+    <p style="margin-top:0.7rem">Postern Labs Ltda. &middot; AGPL-3.0-or-later</p>
+    <p style="margin-top:0.35rem;font-size:0.86rem">Source: <a href="https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow">GitHub</a> &middot; <a href="https://gitlab.com/blochsispow-group/bloch-pos">GitLab</a></p>
+  </div>
+  <p style="max-width:34ch">Every figure on this site is either measured and labelled as such, or planned and labelled as such.</p>
+</div>
+
+</body>
+</html>

@@ -30,6 +30,7 @@ fn block_with(shielded: Vec<ShieldedTx>) -> Block {
         height: 1,
         pow_solution: vec![],
         shielded_transactions: shielded,
+        auxpow: None,
     }
 }
 

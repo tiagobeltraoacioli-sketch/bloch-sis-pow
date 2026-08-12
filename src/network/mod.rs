@@ -34,6 +34,42 @@ pub const TOPIC_BLOCKS: &str = "bloch/blocks/1";
 pub const TOPIC_TXS:    &str = "bloch/txs/1";
 pub const TOPIC_SYNC:   &str = "bloch/sync/1";
 
+// ── Ingest-drop visibility (orphan-deadlock fix, companion) ──────────────────
+//
+// Every inbound frame reaches the message processor through a bounded (1000)
+// mpsc channel via `try_send`, and a full channel used to drop the frame IN
+// SILENCE — including GetBlock RESPONSES the orphan pool was waiting on. The
+// drop stays (backpressure by shedding is the design; blocking the swarm loop
+// would be worse), but it must be VISIBLE: a counter + WARN so an operator can
+// correlate "orphan waits forever" with "ingest channel overflowed".
+static INGEST_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Total inbound frames dropped because the swarm→processor channel was full.
+pub fn ingest_drops_total() -> u64 {
+    INGEST_DROPS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Forward an inbound frame to the processor, counting + logging drops instead
+/// of discarding them silently. WARNs on the first drop and every 100th after
+/// (a storm that overflows a 1000-slot channel would otherwise flood the log).
+fn forward_to_processor(block_tx: &mpsc::Sender<NetworkMessage>, msg: NetworkMessage, source: &str) {
+    use tokio::sync::mpsc::error::TrySendError;
+    match block_tx.try_send(msg) {
+        Ok(())                       => {}
+        Err(TrySendError::Full(m))   => {
+            let n = INGEST_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n == 1 || n % 100 == 0 {
+                warn!("ingest channel FULL — dropped inbound [{}] from {} \
+                       (total dropped: {}; lost GetBlock replies are re-requested \
+                       by the orphan sweep)", m.kind_name(), source, n);
+            }
+        }
+        Err(TrySendError::Closed(m)) => {
+            warn!("ingest channel CLOSED — dropped inbound [{}] from {}", m.kind_name(), source);
+        }
+    }
+}
+
 // ── Messages ──────────────────────────────────────────────────────────────────
 
 /// Protocol version for forward compatibility and hard fork coordination.
@@ -483,6 +519,50 @@ struct BlochBehaviour {
 
 // ── Node ──────────────────────────────────────────────────────────────────────
 
+/// Yamux per-connection substream cap.
+///
+/// Must sit ABOVE `sync_rr::MAX_CONCURRENT_SYNC_STREAMS` (2048) or the
+/// transport vetoes the request-response layer: fecf29b raised the rr cap
+/// 100 → 2048 so sync bursts flow, but the swarm was still built with
+/// `yamux::Config::default`, whose yamux-0.13 backend caps a connection at
+/// 512 substreams — and yamux does NOT backpressure at that cap, it KILLS
+/// the whole connection (`connection.rs`: inbound over the cap →
+/// `Action::Terminate`, outbound → `ConnectionError::TooManyStreams`;
+/// logged as "maximum number of streams reached" followed by our
+/// "✗ disconnected"). A node catching up across the damaged-fork anticone
+/// opens a GetBlock burst, blows through 512, and the transport drops the
+/// very peer it was syncing from — observed on node4 as a 0↔3-peer
+/// connect/disconnect oscillation (15 connects / 15 disconnects / 12×
+/// "maximum number of streams" in 15 min).
+///
+/// 4096 = 2× the rr cap: room for all 2048 sync streams plus gossipsub,
+/// identify and ping substreams, with slack for streams in half-closed
+/// teardown. Memory stays bounded by the rr cap (sync frames are the only
+/// bulk payload; gossip is capped at 4 MiB per message elsewhere).
+///
+/// KNOWN TRADE-OFF (libp2p-yamux 0.47 API, verified in the crate source):
+/// `Config::set_max_num_streams` — or ANY setter — switches the muxer
+/// backend from yamux 0.13 to yamux 0.12 (`Config::set()` replaces
+/// `Config013` with `Config012::default()`; the crate's own test
+/// `config_set_switches_to_v012` pins this as intended). There is NO way to
+/// raise the 0.13 cap through the 0.47 public API. yamux 0.12 (cap default
+/// 8192, static 256 KiB windows, `WindowUpdateMode::OnRead` backpressure)
+/// was libp2p's production muxer for years and speaks the same wire
+/// protocol, so mixed 0.12/0.13 fleets interoperate — but a NOT-yet-updated
+/// remote still enforces 512 on ITS side of the connection, so the churn
+/// only fully stops once both endpoints run this build.
+const MAX_YAMUX_STREAMS: usize = 4096;
+
+/// Builder for the swarm's yamux config — passed to `with_tcp` /
+/// `with_websocket` in place of `yamux::Config::default` (the builder accepts
+/// any `FnOnce() -> Config`). See `MAX_YAMUX_STREAMS` for why and for the
+/// 0.13→0.12 backend consequence.
+fn yamux_config() -> yamux::Config {
+    let mut cfg = yamux::Config::default();
+    cfg.set_max_num_streams(MAX_YAMUX_STREAMS);
+    cfg
+}
+
 pub struct NetworkNode {
     pub peer_id: PeerId,
     pub config:  NetworkConfig,
@@ -593,6 +673,17 @@ impl NetworkNode {
             params.decay_to_zero = 0.01;
 
             // Score params for each topic
+            // P3/P3b MUST be disabled on a low-rate chain. TopicScoreParams::default()
+            // ships mesh_message_deliveries_weight = -1.0 with threshold = 20.0 and
+            // activation = 5s. Five seconds after a peer joins the mesh, gossipsub
+            // charges -1.0 × (20 − delivered)² × topic_weight. Bloch produces roughly
+            // one block every 26 s, so `delivered` is 0 and the peer takes -400 ×
+            // topic_weight — summed across blocks/txs/sync that is ≈ -400, i.e. exactly
+            // graylist_threshold. Every peer that grafted was therefore guaranteed to be
+            // pruned within seconds ("Prune peer with negative score"), the mesh could
+            // never hold anyone, publish() returned NoPeersSubscribedToTopic and the
+            // miner's blocks never propagated. These penalties are designed for
+            // high-throughput topics; they are actively harmful here.
             let block_topic_params = TopicScoreParams {
                 topic_weight: 0.5,
                 time_in_mesh_weight: 0.1,
@@ -601,6 +692,8 @@ impl NetworkNode {
                 first_message_deliveries_weight: 1.0,
                 first_message_deliveries_decay: 0.97,
                 first_message_deliveries_cap: 100.0,
+                mesh_message_deliveries_weight: 0.0,  // P3 off — see note above
+                mesh_failure_penalty_weight:    0.0,  // P3b off — same reason
                 invalid_message_deliveries_weight: -100.0, // harsh penalty for invalid blocks
                 invalid_message_deliveries_decay: 0.5,
                 ..Default::default()
@@ -616,6 +709,8 @@ impl NetworkNode {
                 first_message_deliveries_cap: 100.0,
                 invalid_message_deliveries_weight: -50.0,
                 invalid_message_deliveries_decay: 0.5,
+                mesh_message_deliveries_weight: 0.0,  // P3 off — see block_topic_params
+                mesh_failure_penalty_weight:    0.0,  // P3b off
                 ..Default::default()
             };
 
@@ -626,6 +721,8 @@ impl NetworkNode {
                 time_in_mesh_cap: 50.0,
                 invalid_message_deliveries_weight: -20.0,
                 invalid_message_deliveries_decay: 0.8,
+                mesh_message_deliveries_weight: 0.0,  // P3 off — see block_topic_params
+                mesh_failure_penalty_weight:    0.0,  // P3b off
                 ..Default::default()
             };
 
@@ -666,14 +763,14 @@ impl NetworkNode {
                 |keys: &identity::Keypair| -> Result<KyberConfig, std::convert::Infallible> {
                     Ok(KyberConfig::new(keys))
                 },
-                yamux::Config::default,
+                yamux_config,
             )
             .map_err(|e| NetworkError::StartFailed(e.to_string()))?
             .with_websocket(
                 |keys: &identity::Keypair| -> Result<KyberConfig, std::convert::Infallible> {
                     Ok(KyberConfig::new(keys))
                 },
-                yamux::Config::default,
+                yamux_config,
             )
             .await
             .map_err(|e| NetworkError::StartFailed(e.to_string()))?
@@ -854,7 +951,14 @@ impl NetworkNode {
         // the map stays bounded to blocks seen within the TTL.
         let mut recent_block_publishes: std::collections::HashMap<[u8; 32], std::time::Instant> =
             std::collections::HashMap::new();
-        const REGOSSIP_SUPPRESS_TTL: Duration = Duration::from_secs(10);
+        // Follow-up to 004c477 (which set 10s): the window MUST be >= gossipsub's
+        // `duplicate_cache_time` (30s, configured above). The message-id is a
+        // content hash, so a re-publish of the same block between 10s and 30s
+        // passed this filter only to be refused by gossipsub's duplicate cache
+        // anyway ("publish blocks [NewBlock]: Duplicate") — paying the bincode
+        // encode + SHA-256 of a multi-MB body per attempt and spamming the log.
+        // 10s < 30s made the 10–30s band pure waste; align the windows.
+        const REGOSSIP_SUPPRESS_TTL: Duration = Duration::from_secs(30);
         let mut heartbeat   = tokio::time::interval(Duration::from_secs(30));
         let mut save_peers  = tokio::time::interval(Duration::from_secs(60));
         // Sprint CC: periodic tip announce. Re-publishes the current
@@ -914,6 +1018,30 @@ impl NetworkNode {
                                         ).in_scope(|| {
                                             info!("← block h={} {}", height, hex::encode(&block_hash[..8]));
                                         });
+                                        // Re-gossip suppression, RECEIVE side (the half 004c477
+                                        // missed): gossipsub's duplicate cache holds messages we
+                                        // RECEIVED as well as ones we published, and the message-id
+                                        // is a content hash — so answering a legacy-gossip GetBlock
+                                        // for a block that arrived on the mesh within the last 30s
+                                        // is a GUARANTEED local `Err(Duplicate)`: gossipsub refuses
+                                        // the publish before it leaves the node, after we already
+                                        // paid the store read, the bincode encode and the SHA-256 of
+                                        // a multi-MB body. That is exactly the persisting
+                                        // "publish blocks [NewBlock]: Duplicate" storm: each DISTINCT
+                                        // block a syncing peer walks produces one distinct
+                                        // (message-id) doomed publish that the publish-side map never
+                                        // saw. Recording received blocks here makes the outbound
+                                        // filter skip them — behavior-identical (the publish could
+                                        // never have left the node; gossipsub itself already relayed
+                                        // the received message mesh-wide), it only deletes the
+                                        // wasted encode/hash work and the log spam. A block we MINE
+                                        // can never be in this map (its content hash is new), so own
+                                        // announcements are never suppressed. Pruned on insert, same
+                                        // as the publish side, so the map stays bounded even if no
+                                        // publish attempt runs for a while.
+                                        let now = Instant::now();
+                                        recent_block_publishes.retain(|_, t| now.duration_since(*t) < REGOSSIP_SUPPRESS_TTL);
+                                        recent_block_publishes.insert(*block_hash, now);
                                     }
                                     NetworkMessage::PeerTip { peer_id, blue_score, height } => {
                                         debug!("← tip from {} score={}", peer_id, blue_score);
@@ -947,15 +1075,23 @@ impl NetworkNode {
                                         track_peer_score(&mut peer_sync, propagation_source, *blue_score);
                                     }
                                     NetworkMessage::PeerRequest => {
-                                        let mut my_peers: Vec<String> = known_peers.iter().cloned().collect();
+                                        // PROPAGAÇÃO-CHURN fix: never put an entry on the wire
+                                        // that a compliant receiver must penalize. known_peers is
+                                        // kept canonical now, but a file written by an OLD binary
+                                        // survives until the startup prune — filter at the send
+                                        // seam too, so one stale entry can't graylist us
+                                        // (−100/frame at every receiver) for the whole session.
+                                        let mut my_peers: Vec<String> = known_peers.iter()
+                                            .filter(|a| is_valid_public_multiaddr(a, allow_private))
+                                            .cloned().collect();
                                         // PRINCIPLES.md #2 ("every node is a seed"): advertise our
                                         // OWN reachable address(es) — learned via identify's
                                         // observed_addr and stored as external addresses — so a node
                                         // that nobody knows can still be gossiped onward. Formatted
-                                        // exactly like the other PEX entries (append /p2p/<peer_id>);
-                                        // de-duplicated against known_peers.
+                                        // exactly like the other PEX entries (canonical single
+                                        // /p2p/<peer_id> suffix); de-duplicated against known_peers.
                                         for addr in swarm.external_addresses() {
-                                            let self_addr = format!("{}/p2p/{}", addr, peer_id_str);
+                                            let self_addr = canonical_peer_addr(addr, &self.peer_id);
                                             if !my_peers.contains(&self_addr) {
                                                 my_peers.push(self_addr);
                                             }
@@ -1037,35 +1173,69 @@ impl NetworkNode {
                                     }
                                     _ => {}
                                 }
-                                let _ = block_tx.try_send(msg);
+                                forward_to_processor(&block_tx, msg, "gossip");
                             }
                         }
                         SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                             info!("✓ connected: {}", peer_id);
-                            swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                            // DO NOT call gossipsub.add_explicit_peer() here.
+                            //
+                            // An "explicit peer" in gossipsub is a manually-pinned direct
+                            // link that is DELIBERATELY EXCLUDED from mesh construction.
+                            // libp2p-gossipsub 0.49.5 behaviour.rs:2224 filters mesh graft
+                            // candidates with `!explicit_peers.contains(peer)`, and :1395
+                            // answers an incoming GRAFT from an explicit peer by PRUNING it
+                            // on every topic ("we don't GRAFT to/from explicit peers").
+                            //
+                            // Marking EVERY connection explicit therefore made the mesh
+                            // permanently unbuildable: heartbeat logged
+                            // "Mesh low. Topic contains: 0" and "RANDOM PEERS: Got 0 peers"
+                            // forever, publish() returned NoPeersSubscribedToTopic, and the
+                            // miner's blocks never reached the network — every non-mining
+                            // node stalled while the producer kept extending alone.
+                            // Reproduced with two fresh nodes on localhost (2026-08-07).
                             peer_count += 1;
                             crate::metrics::set_peer_count(peer_count as i64);
                             peer_state.on_connect(peer_id, Instant::now());
-                            // FIX v0.5.1: Re-announce subscriptions to new peer.
-                            // gossipsub only announces subs on initial connect,
-                            // but peer_score can ghost peers from mesh. Force
-                            // re-broadcast of our subscribed topics so the new
-                            // peer adds us to its mesh for blocks/txs/sync.
-                            for t in [&block_t, &tx_t, &sync_t] {
-                                let _ = swarm.behaviour_mut().gossipsub.subscribe(t);
-                            }
+                            // NOTE: re-calling gossipsub.subscribe() here would be a no-op —
+                            // it returns Ok(false) and sends nothing when the topic is already
+                            // subscribed (it logs "Topic is already in the mesh"). gossipsub
+                            // already sends our subscription set on connection establishment,
+                            // so there is nothing to force.
                             // Save peer address for next startup.
-                            // Sprint P: also track listener peers (was a bug — only dialers
-                            // entered known_peers, so known_peers.json only grew with outbound
-                            // connections). Both sides get filtered through the validator so
-                            // we don't pollute known_peers with garbage.
+                            //
+                            // PROPAGAÇÃO-CHURN fix (2026-08-09), two parts:
+                            //
+                            // (a) Dialer: the dialed `address` already ENDS in
+                            //     `/p2p/<peer_id>` (bootstrap/PEX/known_peers
+                            //     entries all carry it), so the previous
+                            //     `format!("{}/p2p/{}", address, peer_id)`
+                            //     appended a second component — and one more on
+                            //     every later successful dial of the stored
+                            //     result. Mainnet files were measured with
+                            //     chains up to 15 components (885 bytes); past
+                            //     ~9 the string exceeds MAX_WIRE_ADDR_LEN and
+                            //     every PeerExchange carrying it graylists US
+                            //     at the receiver (−100/frame, −400 = graylist)
+                            //     → our blocks/tips blackholed with TCP up.
+                            //     `canonical_peer_addr` strips every P2p
+                            //     component and appends exactly one — it is
+                            //     idempotent, so re-observation never grows.
+                            //
+                            // (b) Listener: `send_back_addr` is the remote's
+                            //     EPHEMERAL socket (e.g. /tcp/55964), never its
+                            //     listen address — it is not dialable, so
+                            //     persisting it only filled known_peers with
+                            //     garbage (226 of node4's 265 entries) that
+                            //     wasted the receiver-side PEX_BATCH_LIMIT
+                            //     slots real peers needed. Reachable listeners
+                            //     are discovered via PEX self-advertise
+                            //     (identify observed_addr + quorum), not here.
                             let addr_to_remember = match &endpoint {
                                 libp2p::core::ConnectedPoint::Dialer { address, .. } => {
-                                    Some(format!("{}/p2p/{}", address, peer_id))
+                                    Some(canonical_peer_addr(address, &peer_id))
                                 }
-                                libp2p::core::ConnectedPoint::Listener { send_back_addr, .. } => {
-                                    Some(format!("{}/p2p/{}", send_back_addr, peer_id))
-                                }
+                                libp2p::core::ConnectedPoint::Listener { .. } => None,
                             };
                             if let Some(addr_str) = addr_to_remember {
                                 if is_valid_public_multiaddr(&addr_str, allow_private) {
@@ -1219,7 +1389,9 @@ impl NetworkNode {
                                     continue;
                                 }
                                 info!("mDNS discovered (LAN): {} at {}", peer_id, addr);
-                                swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                                // Same reason as the ConnectionEstablished arm above: an
+                                // explicit peer is excluded from the mesh. Just dial it and
+                                // let normal mesh maintenance graft it.
                                 if swarm.dial(addr).is_ok() { dialed += 1; }
                             }
                         }
@@ -1240,7 +1412,10 @@ impl NetworkNode {
                             // independent quorum of DISTINCT peers before trusting
                             // it as our external address — only then is it eligible
                             // for PEX self-advertise. Never trust one peer.
-                            let cand = format!("{}/p2p/{}", info.observed_addr, peer_id_str);
+                            // PROPAGAÇÃO-CHURN fix: canonical form (strip any
+                            // P2p the remote may have echoed, append ours once)
+                            // — same normalization as every other stored addr.
+                            let cand = canonical_peer_addr(&info.observed_addr, &self.peer_id);
                             if is_valid_public_multiaddr(&cand, allow_private)
                                 && (observed_by.len() < OBSERVED_ADDR_CAP
                                     || observed_by.contains_key(&info.observed_addr))
@@ -1286,7 +1461,7 @@ impl NetworkNode {
                                 // processes fetched blocks/headers unchanged.
                                 libp2p::request_response::Message::Response { request_id, response } => {
                                     inflight_pull.remove(&request_id);
-                                    let _ = block_tx.try_send(sync_rr::response_to_message(response));
+                                    forward_to_processor(&block_tx, sync_rr::response_to_message(response), "directed-pull");
                                 }
                             },
                             // Directed pull failed: peer doesn't speak
@@ -1379,7 +1554,7 @@ impl NetworkNode {
                     let current_height = dag.read().block_count() as u64;
                     info!("peers: {} | height: {}", peer_count, current_height);
                     let addrs: Vec<String> = known_peers.iter().cloned().collect();
-                    let _ = block_tx.try_send(NetworkMessage::PeerCount { count: peer_count, addresses: addrs });
+                    forward_to_processor(&block_tx, NetworkMessage::PeerCount { count: peer_count, addresses: addrs }, "heartbeat");
 
                     // Sprint P: emit aggregated PEX stats (every 60s, only if activity)
                     if let Some(line) = pex_stats.tick() {
@@ -1583,6 +1758,32 @@ async fn resolve_multiaddr(addr: &str) -> String {
         }
     }
     addr.to_string()
+}
+
+/// PROPAGAÇÃO-CHURN fix (2026-08-09): the ONE canonical string form of a
+/// peer's address for known_peers / PEX — transport components only, plus
+/// exactly one trailing `/p2p/<peer_id>`.
+///
+/// Every place that used to build a persistable address with
+/// `format!("{}/p2p/{}", observed, peer_id)` concatenated a NEW `/p2p/`
+/// component onto an address that (on the Dialer path) already ended in one.
+/// Each successful dial of the stored entry re-observed it and appended
+/// again — mainnet known_peers.json files were measured with chains up to
+/// 15 `/p2p/` components (885 bytes). Past ~9 components the string exceeds
+/// MAX_WIRE_ADDR_LEN, at which point every PeerExchange carrying it is a
+/// wire violation at the receiver: −100 app score per frame, graylist at
+/// −400, and the sender's blocks/tips are blackholed while TCP stays up —
+/// the 2026-08-09 non-convergence incident.
+///
+/// Stripping ALL P2p components before appending exactly one makes this
+/// function idempotent: re-observing a canonical address yields the same
+/// string forever.
+pub fn canonical_peer_addr(addr: &Multiaddr, peer_id: &PeerId) -> String {
+    let transport: Multiaddr = addr
+        .iter()
+        .filter(|p| !matches!(p, libp2p::multiaddr::Protocol::P2p(_)))
+        .collect();
+    format!("{}/p2p/{}", transport, peer_id)
 }
 
 #[derive(Debug, thiserror::Error)]

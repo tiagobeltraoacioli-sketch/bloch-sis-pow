@@ -46,7 +46,20 @@ Incremental **binary Merkle tree**, depth `D = 32`, nodes = SHAKE-256:
 node = SHAKE256_32( DOM_MT ‖ left ‖ right )      DOM_MT = b"bloch:coherence:mt:v1"
 ```
 The current root is the **anchor**; a spend proves membership against a recent
-anchor. Empty subtrees use a fixed `EMPTY_LEAF = SHAKE256_32(DOM_MT ‖ 0^0)`.
+anchor. Empty subtrees use a fixed `EMPTY_LEAF = SHAKE256_32(DOM_MT ‖ "empty-leaf")`.
+
+> **Corrected by C1.1 (2026-08-12).** This line read `SHAKE256_32(DOM_MT ‖ 0^0)`
+> and was wrong: the code has always computed `SHAKE256_32(DOM_MT ‖ "empty-leaf")`,
+> on every branch and inside the SP1 guest (finding F13). The **document** moved,
+> not the constant — it is baked into every anchor the pool has produced and into
+> the proving circuit, so changing it would invalidate existing anchors and every
+> proof against them in order to fix a sentence. See `COHERENCE-C1.1.md` §2.
+
+> **Amended by C1.1 (2026-08-12).** C1 named the global nullifier set as
+> consensus state but never defined its commitment (F9). `COHERENCE-C1.1.md`
+> defines it: a SHAKE-256 sparse Merkle tree over the nullifier keyspace under
+> `DOM_NFSET`, with non-membership proofs. That is an addition — nothing frozen
+> here moves.
 
 ## 2. The spend statement (what the ZK circuit proves)
 

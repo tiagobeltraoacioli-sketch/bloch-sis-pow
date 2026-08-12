@@ -202,6 +202,7 @@ fn tx_validity_is_invariant_to_dual_and_pow() {
         height: HEIGHT,
         pow_solution: vec![], // <-- the only field that differs
         shielded_transactions: vec![],
+        auxpow: None,
     };
     // (b) DUAL-AND block: same header/txs, SIS witness attached.
     let block_b = Block {
@@ -211,6 +212,7 @@ fn tx_validity_is_invariant_to_dual_and_pow() {
         height: HEIGHT,
         pow_solution: witness.clone(), // <-- the only field that differs
         shielded_transactions: vec![],
+        auxpow: None,
     };
 
     // ── (4) THE COMPAT INVARIANT ─────────────────────────────────────────────
@@ -264,6 +266,7 @@ fn tx_validity_is_invariant_to_dual_and_pow() {
         height: HEIGHT,
         pow_solution: corrupt_witness.clone(),
         shielded_transactions: vec![],
+        auxpow: None,
     };
     assert!(
         !dual_and_pow_ok(&block_c.header, &block_c.pow_solution, &sha_target, sis_bits),

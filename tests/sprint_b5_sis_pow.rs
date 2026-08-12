@@ -24,7 +24,9 @@ fn unmined_block() -> Block {
         blue_score:   0,
         height:       1,
         pow_solution: vec![],
-        shielded_transactions: Vec::new(),    }
+        shielded_transactions: Vec::new(),
+        auxpow: None,
+    }
 }
 
 #[test]

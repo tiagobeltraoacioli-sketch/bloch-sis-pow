@@ -90,6 +90,42 @@ trademark-gate:
   script:
     - bash scripts/ci-banned-words.sh
 
+# Falcon constant-time guard (PoS finding F1, BLOCH-FALCON-ONLINE-SIGNING.md
+# §3.2). BLOCKING: fails if the workspace's resolved features for
+# pqcrypto-falcon include "avx2" or "neon" — those dispatch Falcon SIGNING to
+# PQClean's native floating-point variants, forbidden for a validator that
+# signs on a public schedule. The declarations pin `default-features = false`
+# (clean = integer-only, constant-time), but Cargo features are additive, so a
+# single member re-enabling defaults would silently poison every binary; this
+# catches it at the graph level, and bloch-crypto's
+# `falcon_native_fp_variants_are_not_linked` test (in build-and-test) catches
+# it at the linked-binary level. Metadata-only — no build.
+falcon-clean-guard:
+  stage: check
+  script:
+    - bash scripts/falcon-clean-guard.sh
+  allow_failure: false
+
+# G8 release-integrity gate (BLOCH-POS-SHA3-LATTICE-MIGRATION.md §11).
+# BLOCKING: the published Genesis-3 release WAS the broken binary (f819e87f,
+# an abandoned branch) while the fixes lived only on the boxes — fresh nodes
+# froze at 10802 and nobody noticed the divergence until they did. This job
+# proves, on every pipeline: (1) both PoS workspaces resolve with --locked and
+# the committed lockfiles do not drift; (2) two clean builds of bloch-pos at
+# the same commit are bit-identical (same-path determinism — the path-scoped
+# caveat and the canonical /build rule are deploy/RELEASE-INTEGRITY.md §3);
+# (3) `bloch-pos --version` reports the exact commit being built, so a fleet
+# binary can always be traced to source. Runbook + measured baseline:
+# deploy/RELEASE-INTEGRITY.md. ~1 min: the PoS workspace is small by design.
+# The toolchain is pinned by crates/bloch-pos-node/rust-toolchain.toml; the
+# install line makes a fresh runner self-provision instead of failing.
+pos-release-integrity:
+  stage: check
+  script:
+    - rustup toolchain install "$(sed -n 's/^channel *= *"\(.*\)"/\1/p' crates/bloch-pos-node/rust-toolchain.toml)" --profile minimal || true
+    - bash scripts/pos-release-integrity.sh
+  allow_failure: false
+
 # Supply-chain — RUSTSEC advisories, permissive-license + no-git-dep policy.
 # BLOCKING: a supply-chain violation must fail the pipeline; see deny.toml.
 # S5: flipped from informational to blocking. The old comment's precondition

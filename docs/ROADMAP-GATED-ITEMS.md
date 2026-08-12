@@ -1,5 +1,21 @@
 # Roadmap — gated items register
 
+> **PARTIALLY SUPERSEDED — 2026-08-11.** This register was written for the
+> Genesis-3 PoW chain and pre-dates three founder decisions that retire whole
+> entries rather than their gates:
+>
+> - **The ownerless thesis is retracted** (ADR-036; two-entity foundation,
+>   `docs/specs/BLOCH-ENTITY-STRUCTURE.md`). Every "anchors to the ownerless
+>   base" framing below is stale.
+> - **Genesis-3 halts at height 80,000** and Genesis-4 relaunches as PoS —
+>   the k=8 PoW reactivation and FFG-BFT overlay items lose their object.
+> - **EVM runs at L1, no rollup** (2026-08-11): the "EVM L2 + wBLCH bridge"
+>   item is superseded — there is no separate EVM chain to bridge to.
+>   Downstream items that depended on it (PosternDex) re-gate on the L1 EVM.
+>
+> Text kept unrewritten on purpose; read entries against the fleet brief and
+> the Genesis-4 specs.
+
 **What this is.** The honest "cannot be fleet-finished" list. Every item here is
 blocked on something engineering *alone* cannot produce: a third-party audit,
 real confidential-compute hardware, a live network, legal/custody sign-off, or a

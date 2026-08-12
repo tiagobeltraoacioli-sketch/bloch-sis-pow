@@ -61,7 +61,9 @@ fn make_mined_block(parent: &Block, miner_spk: &[u8; 20]) -> Block {
         blue_score: parent.blue_score + 1,
         height:     parent.height + 1,
         pow_solution: Vec::new(),
-        shielded_transactions: Vec::new(),    }
+        shielded_transactions: Vec::new(),
+        auxpow: None,
+    }
 }
 
 /// PR-2 regression: `apply_block_utxo_mutations` MUST record UndoData

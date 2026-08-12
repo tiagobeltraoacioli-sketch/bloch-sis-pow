@@ -59,7 +59,9 @@ fn mk_block(h: u64, parent: [u8; 32]) -> Block {
         blue_score:   h.saturating_sub(1),
         height:       h,
         pow_solution: Vec::new(),
-        shielded_transactions: Vec::new(),    }
+        shielded_transactions: Vec::new(),
+        auxpow: None,
+    }
 }
 
 // ── Round-trip through storage preserves every field ─────────────
@@ -187,7 +189,9 @@ fn roundtrip_preserves_multi_parent_block() {
         blue_score:   4,
         height:       5,
         pow_solution: Vec::new(),
-        shielded_transactions: Vec::new(),    };
+        shielded_transactions: Vec::new(),
+        auxpow: None,
+    };
     let hash = block.block_hash();
 
     storage.put_block(&block).expect("put");

@@ -192,7 +192,9 @@ fn block_round_trip_coinbase_only() {
         blue_score: 0,
         height: 1,
         pow_solution: Vec::new(),
-        shielded_transactions: Vec::new(),    };
+        shielded_transactions: Vec::new(),
+        auxpow: None,
+    };
 
     let bytes = block.to_bitcoin_bytes();
     let parsed = Block::from_bitcoin_bytes(&bytes).expect("round trip");
@@ -229,7 +231,9 @@ fn block_round_trip_with_multiple_txs() {
         blue_score: 41,
         height: 42,
         pow_solution: Vec::new(),
-        shielded_transactions: Vec::new(),    };
+        shielded_transactions: Vec::new(),
+        auxpow: None,
+    };
 
     let bytes = block.to_bitcoin_bytes();
     let parsed = Block::from_bitcoin_bytes(&bytes).expect("round trip");
@@ -262,7 +266,9 @@ fn block_rejects_trailing_garbage() {
         blue_score: 0,
         height: 1,
         pow_solution: Vec::new(),
-        shielded_transactions: Vec::new(),    };
+        shielded_transactions: Vec::new(),
+        auxpow: None,
+    };
 
     let mut bytes = block.to_bitcoin_bytes();
     bytes.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]); // trailing
@@ -288,7 +294,9 @@ fn block_rejects_truncated_tx_list() {
         blue_score: 0,
         height: 1,
         pow_solution: Vec::new(),
-        shielded_transactions: Vec::new(),    };
+        shielded_transactions: Vec::new(),
+        auxpow: None,
+    };
 
     let bytes = block.to_bitcoin_bytes();
     let truncated = &bytes[..bytes.len() - 2];
@@ -314,7 +322,9 @@ fn block_round_trip_validates_pow_and_merkle() {
         blue_score: 4,
         height: 5,
         pow_solution: Vec::new(),
-        shielded_transactions: Vec::new(),    };
+        shielded_transactions: Vec::new(),
+        auxpow: None,
+    };
 
     let bytes = block.to_bitcoin_bytes();
     let parsed = Block::from_bitcoin_bytes(&bytes).unwrap();

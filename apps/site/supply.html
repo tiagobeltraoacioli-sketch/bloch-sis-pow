@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+<!-- Bloch Protocol site — supply page. Every figure carries its repo source in
+     a comment next to it. Constants: crates/bloch-pos-committee/src/tokenomics_v4.rs
+     (Tokenomics V4, spec docs/specs/BLOCH-TOKENOMICS-V4.md).
+
+     DELIBERATE OMISSION: a supply redenomination is settled 2026-08-12
+     (docs/FLEET-BRIEF-CERTIK-2026-08-12.md item 1) and is blocked on an open
+     arithmetic question. This page quotes ONLY the constants compiled into the
+     repo today — TOTAL_SUPPLY_BLOCH = 100,000,000,000 (tokenomics_v4.rs:33) —
+     and marks the total "settled 2026-08-12". Do not add the redenominated figures
+     here until the constants change. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Supply — Bloch Protocol</title>
+<meta name="description" content="100 billion BLCH, hard-capped, with every allocation, vesting schedule and the concentration figures stated plainly.">
+<link rel="stylesheet" href="assets/site.css">
+
+<style>
+  .pie-fig{margin:0 0 2.5rem;display:grid;grid-template-columns:minmax(240px,340px) 1fr;
+    gap:clamp(1.5rem,4vw,3rem);align-items:center}
+  @media (max-width:760px){.pie-fig{grid-template-columns:1fr}}
+  .pie-wrap{position:relative}
+  #pie{width:100%;height:auto;aspect-ratio:1;display:block}
+  .pie-center{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;
+    justify-content:center;pointer-events:none;text-align:center;padding:22%}
+  .pie-c-label{font-family:var(--mono);font-size:.62rem;letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}
+  .pie-c-value{font-family:var(--display);font-size:clamp(1rem,2.4vw,1.45rem);line-height:1.1;
+    letter-spacing:-.01em;font-variant-numeric:tabular-nums;margin:.25rem 0}
+  .pie-c-sub{font-size:.72rem;color:var(--muted)}
+  .pie-legend{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:.15rem}
+  .pie-legend li{display:grid;grid-template-columns:auto 1fr auto;gap:.7rem;align-items:baseline;
+    padding:.45rem .55rem;border-radius:7px;cursor:pointer;transition:background .12s ease}
+  .pie-legend li:hover,.pie-legend li[data-on="1"]{background:var(--surface)}
+  .pie-legend .sw{width:11px;height:11px;border-radius:3px;align-self:center}
+  .pie-legend .nm{font-size:.9rem}
+  .pie-legend .pc{font-family:var(--mono);font-size:.82rem;color:var(--muted);font-variant-numeric:tabular-nums}
+  .pie-legend li[data-on="1"] .pc{color:var(--ink)}
+  @media (prefers-reduced-motion:reduce){.pie-legend li{transition:none}}
+</style>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<nav aria-label="Main"><div class="wrap">
+  <a class="logo" href="./">
+    <svg width="26" height="26" viewBox="0 0 26 26" aria-hidden="true">
+      <circle cx="13" cy="13" r="11.2" fill="none" stroke="var(--accent)" stroke-width="1.5"/>
+      <ellipse cx="13" cy="13" rx="11.2" ry="4.2" fill="none" stroke="var(--accent)" stroke-width="1.1" opacity="0.55"/>
+      <line x1="13" y1="13" x2="19.6" y2="7.2" stroke="var(--ink)" stroke-width="1.6" stroke-linecap="round"/>
+      <circle cx="19.6" cy="7.2" r="2.1" fill="var(--accent)"/>
+    </svg>
+    Bloch Protocol
+  </a>
+  <span class="navlinks">
+    <a href="protocol.html">Protocol</a>
+    <a href="migration.html">Migration</a>
+    <a href="supply.html" aria-current="page">Supply</a>
+    <a href="brand.html">Brand</a>
+    <a href="build.html">Build</a>
+    <a href="docs.html">Docs</a>
+    <a class="ext" href="https://blochl1.com">Explorer</a>
+  </span>
+</div></nav>
+
+<main id="main">
+
+<header class="pagehead"><div class="wrap">
+  <p class="eyebrow">Supply &mdash; Tokenomics V4</p>
+  <h1>100 billion, hard-capped.</h1>
+  <p class="lede">
+    <!-- TOTAL_SUPPLY_BLOCH = 100,000,000,000, fixed (no perpetual tail):
+         crates/bloch-pos-committee/src/tokenomics_v4.rs:26-33.
+         Cap-as-consensus-invariant framing: docs/FLEET-BRIEF-CERTIK-2026-08-12.md item 2. -->
+    Genesis-4 fixes total supply at 100,000,000,000 BLCH. The cap is a consensus
+    invariant: every node refuses a block whose cumulative issuance would exceed it,
+    and no mechanism <em>inside the protocol</em> &mdash; no vote, no key, no governance
+    path &mdash; can raise it. Said precisely: a hard fork adopted by every operator can
+    change any rule; nothing short of that can change this one.
+  </p>
+  <p class="lede">
+    A redenomination of the unit is settled 2026-08-12 and is not final. If it happens it
+    will be a pure split &mdash; every balance multiplied by the same factor, every
+    percentage unchanged, nobody diluted. Until it is decided, this page quotes only
+    the constants compiled into the code today.
+  </p>
+</div></header>
+
+<section id="allocations"><div class="wrap">
+  <div class="sec-head">
+    <p class="eyebrow">Allocations</p>
+    <h2>Where all 100 billion go.</h2>
+    <p class="sub">The seven buckets sum to the cap exactly &mdash; the build fails if they do not.</p>
+    <!-- Compile-time sum assertion: tokenomics_v4.rs:217-227. -->
+  </div>
+
+  <!-- Pizza interativa. Canvas e nao SVG porque o hit-test e por angulo, que e
+       uma conta e nao um caminho; e os valores saem do MESMO array que a tabela
+       abaixo cita, para nao existir uma segunda fonte de verdade num grafico. -->
+  <figure class="pie-fig">
+    <div class="pie-wrap">
+      <canvas id="pie" width="620" height="620" role="img"
+        aria-label="Distribuicao do supply de 100 bilhoes de BLCH por alocacao."></canvas>
+      <div class="pie-center" id="pieCenter">
+        <span class="pie-c-label">Total supply</span>
+        <span class="pie-c-value">100,000,000,000</span>
+        <span class="pie-c-sub">BLCH &middot; hard cap</span>
+      </div>
+    </div>
+    <ul class="pie-legend" id="pieLegend"></ul>
+    <figcaption>Hover or tap a slice. Every figure is the compiled constant in
+      <code>tokenomics_v4.rs</code>; the seven add to exactly 100,000,000,000.</figcaption>
+  </figure>
+  <div class="tablewrap"><table>
+    <caption>Genesis-4 allocation &mdash; tokenomics_v4.rs, planned</caption>
+    <thead><tr><th scope="col">Allocation</th><th scope="col" class="num">BLCH</th><th scope="col" class="num">Share</th><th scope="col" style="width:30%"><span style="position:absolute;left:-999px">Relative size</span>&nbsp;</th></tr></thead>
+    <tbody>
+      <!-- VALIDATOR_EMISSION_BLOCH = 43,029,120,000 (remainder, pinned by
+           assertion at tokenomics_v4.rs:229-232). -->
+      <tr><td>Validator emission &mdash; 40 years</td><td class="num">43,029,120,000</td><td class="num">43.03%</td><td><div class="bar" style="width:100%" aria-hidden="true"></div></td></tr>
+      <!-- CARRYOVER_TOTAL_BLOCH = 17,970,880,000: tokenomics_v4.rs:100.
+           Measured at height 43,172, 448,337 UTXOs, 15 addresses: :75-77. -->
+      <tr><td>Carried over from Genesis-3</td><td class="num">17,970,880,000</td><td class="num">17.97%</td><td><div class="bar" style="width:41.8%" aria-hidden="true"></div></td></tr>
+      <!-- FOUNDER_BLOCH = 10,000,000,000: tokenomics_v4.rs:46. -->
+      <tr><td>Founder &mdash; 10-year cliff, 40-year vest</td><td class="num">10,000,000,000</td><td class="num">10.00%</td><td><div class="bar" style="width:23.2%" aria-hidden="true"></div></td></tr>
+      <!-- VC_BLOCH = 10,000,000,000: tokenomics_v4.rs:49. -->
+      <tr><td>Investors (VC)</td><td class="num">10,000,000,000</td><td class="num">10.00%</td><td><div class="bar" style="width:23.2%" aria-hidden="true"></div></td></tr>
+      <!-- TEAM_BLOCH = 10,000,000,000: tokenomics_v4.rs:53. -->
+      <tr><td>Team</td><td class="num">10,000,000,000</td><td class="num">10.00%</td><td><div class="bar" style="width:23.2%" aria-hidden="true"></div></td></tr>
+      <!-- LIQUIDITY_BLOCH = 5,000,000,000: tokenomics_v4.rs:59. -->
+      <tr><td>Liquidity</td><td class="num">5,000,000,000</td><td class="num">5.00%</td><td><div class="bar" style="width:11.6%" aria-hidden="true"></div></td></tr>
+      <!-- MARKETING_BLOCH = 4,000,000,000: tokenomics_v4.rs:56. -->
+      <tr><td>Marketing</td><td class="num">4,000,000,000</td><td class="num">4.00%</td><td><div class="bar" style="width:9.3%" aria-hidden="true"></div></td></tr>
+    </tbody>
+  </table></div>
+</div></section>
+
+<section id="vesting" class="alt"><div class="wrap">
+  <div class="sec-head">
+    <p class="eyebrow">Vesting</p>
+    <h2>Cliffs six months apart, on purpose.</h2>
+    <p class="sub">
+      The classic failure is the cliff wall &mdash; several buckets unlocking in the same
+      month. Founder, team and VC cliffs are staggered so unlocks arrive as a stream,
+      and every linear vest runs per-slot, with no monthly steps to game.
+    </p>
+    <!-- Stagger rationale and schedules: tokenomics_v4.rs:257-284;
+         per-slot linear instead of tranches: :141-153. -->
+  </div>
+  <div class="tablewrap"><table>
+    <caption>Unlock schedules &mdash; tokenomics_v4.rs, planned</caption>
+    <thead><tr><th scope="col">Bucket</th><th scope="col">Liquid at genesis</th><th scope="col">Cliff</th><th scope="col">Linear vest</th><th scope="col">Fully vested</th></tr></thead>
+    <tbody>
+      <!-- Founder: 10-year cliff + 40-year linear: tokenomics_v4.rs:128-139. -->
+      <tr><td>Founder</td><td>None</td><td class="num">10 years</td><td class="num">40 years</td><td class="num">year 50</td></tr>
+      <!-- Team: 18-month cliff + 36-month linear: tokenomics_v4.rs:272-277. -->
+      <tr><td>Team</td><td>None</td><td class="num">18 months</td><td class="num">36 months</td><td class="num">year 4.5</td></tr>
+      <!-- VC: 12-month cliff + 24-month linear: tokenomics_v4.rs:267-270. -->
+      <tr><td>Investors (VC)</td><td>None</td><td class="num">12 months</td><td class="num">24 months</td><td class="num">year 3</td></tr>
+      <!-- Marketing: 25% at TGE (210,000,000), rest 24-month linear:
+           tokenomics_v4.rs:54-56,279-284. -->
+      <tr><td>Marketing</td><td>25% &mdash; 210,000,000</td><td class="num">&mdash;</td><td class="num">24 months</td><td class="num">year 2</td></tr>
+      <!-- Liquidity: 100% at genesis, deliberately: tokenomics_v4.rs:57-59,313-317. -->
+      <tr><td>Liquidity</td><td>100%</td><td class="num">&mdash;</td><td class="num">&mdash;</td><td class="num">genesis</td></tr>
+      <!-- Carryover: ordinary liquid balance, stakeable: tokenomics_v4.rs:75-99. -->
+      <tr><td>Carryover</td><td>100% &mdash; ordinary liquid balance</td><td class="num">&mdash;</td><td class="num">&mdash;</td><td class="num">genesis</td></tr>
+    </tbody>
+  </table></div>
+</div></section>
+
+<section id="emission"><div class="wrap">
+  <div class="sec-head">
+    <p class="eyebrow">Emission</p>
+    <h2>Forty years of smooth disinflation, then fees only.</h2>
+    <p class="sub">
+      <!-- Recommended decay curve: 10%/year decline, sums exactly to the
+           validator allocation, no tail: tokenomics_v4.rs:371-418.
+           Inflation figures: annual_inflation_bps — year 1 = 4.37% of total
+           supply, year 5 = 2.86%, year 10 = 1.69%: tokenomics_v4.rs:383-385. -->
+      The recommended curve declines 10% per year with no halving dates &mdash; a halving
+      is a scheduled day on which every validator&rsquo;s revenue drops by half at once,
+      and marginal operators leave together. Annual issuance is 4.37% of total supply in
+      year one, 2.86% by year five, 1.69% by year ten, and the forty-year total lands on
+      the validator allocation with zero residual. After year forty, validators earn
+      fees only.
+    </p>
+  </div>
+  <div class="card plain wide">
+    <span class="tag">Why the curve matters more than the vesting</span>
+    <!-- Modelling conclusion: tokenomics_v4.rs:326-339. -->
+    <p style="max-width:var(--measure)">
+      Modelling the unlock schedule against the decentralisation gates showed that the
+      emission curve, not the vesting schedule, decides whether the &ldquo;no entity above
+      25% of active stake&rdquo; gate can ever be met. A flat curve leaves validators at
+      ~24% of circulating supply after ten years; the front-loaded curve passes 45%
+      inside two. That is why the curve was chosen by the gate, not by aesthetics.
+    </p>
+  </div>
+</div></section>
+
+<section id="concentration" class="alt"><div class="wrap">
+  <div class="sec-head">
+    <p class="eyebrow">Say it before you are asked</p>
+    <h2>The supply is concentrated.</h2>
+  </div>
+  <div class="card c wide">
+    <h3>The numbers, plainly</h3>
+    <!-- Largest carried-over address: 16,886,549,523 BLCH of 17,970,880,000
+         carryover (~94%): tokenomics_v4.rs:96-99,234-237.
+         Founder total incl. new grant = 26.89% of supply, pinned by assertion:
+         tokenomics_v4.rs:239-241. -->
+    <p style="max-width:var(--measure)">
+      The largest carried-over address holds 16,886,549,523 BLCH &mdash; roughly 94% of
+      the carryover &mdash; liquid from slot 0. It belongs to the founder, who mined it
+      on the same chain, under the same rules as everyone else. With the new vested
+      grant on top, the founder&rsquo;s combined position is 26.89% of total supply.
+      Relabelling changes no balance, so the number is stated here rather than
+      discovered later.
+    </p>
+    <h3 style="margin-top:1rem">What bounds it &mdash; and what does not</h3>
+    <p style="max-width:var(--measure)">
+      <!-- Cohort taper to one third within one year: genesis_cohort.rs:13,38,60-64.
+           Per-validator 1% cap: delegation.rs:118 (MAX_VALIDATOR_STAKE_BPS = 100).
+           Churn limit visibility: delegation.rs, docs/specs/BLOCH-POS-STAKE-CHURN.md. -->
+      Three rules push against it: a declining cap on the genesis validator cohort that
+      reaches one third of consensus weight within a year &mdash; below the
+      finality-stall threshold, so after year one the founder cannot halt Bloch alone;
+      a 1%-of-active-stake ceiling per validator; and a churn limit that makes any
+      large stake movement publicly visible for days before it lands. None of these can
+      see who is behind an address. Anyone telling you a protocol rule solves
+      concentration is selling something.
+    </p>
+  </div>
+</div></section>
+
+</main>
+
+<footer><div class="wrap">
+  <div>
+    <span class="logo" style="font-size:1rem">
+      <svg width="22" height="22" viewBox="0 0 26 26" aria-hidden="true">
+        <circle cx="13" cy="13" r="11.2" fill="none" stroke="var(--accent)" stroke-width="1.5"/>
+        <ellipse cx="13" cy="13" rx="11.2" ry="4.2" fill="none" stroke="var(--accent)" stroke-width="1.1" opacity="0.55"/>
+        <line x1="13" y1="13" x2="19.6" y2="7.2" stroke="var(--ink)" stroke-width="1.6" stroke-linecap="round"/>
+        <circle cx="19.6" cy="7.2" r="2.1" fill="var(--accent)"/>
+      </svg>
+      Bloch Protocol
+    </span>
+    <p style="margin-top:0.7rem">Postern Labs Ltda. &middot; AGPL-3.0-or-later</p>
+    <p style="margin-top:0.35rem;font-size:0.86rem">Source: <a href="https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow">GitHub</a> &middot; <a href="https://gitlab.com/blochsispow-group/bloch-pos">GitLab</a></p>
+  </div>
+  <p style="max-width:34ch">Every figure on this site is either measured and labelled as such, or planned and labelled as such.</p>
+</div>
+
+
+<script>
+(function(){
+  var c=document.getElementById('pie'); if(!c) return;
+  var ctx=c.getContext('2d'), DPR=Math.min(window.devicePixelRatio||1,2);
+  // Fonte unica: os mesmos numeros que a tabela abaixo cita.
+  var SEG=[
+    {n:'Validator emission',   v:43029120000, k:'--accent'},
+    {n:'Carried over from G3', v:17970880000, k:'--violet'},
+    {n:'Founder grant',        v:10000000000, k:'--signal'},
+    {n:'Ecosystem & investors',v:10000000000, k:'--accent'},
+    {n:'Team',                 v:10000000000, k:'--violet'},
+    {n:'Liquidity',            v: 5000000000, k:'--signal'},
+    {n:'Marketing',            v: 4000000000, k:'--accent'}
+  ];
+  var TOTAL=SEG.reduce(function(a,s){return a+s.v},0), hot=-1;
+  var fmt=function(n){return n.toLocaleString('en-US')};
+  function tone(i){
+    // Alterna luminosidade dentro de cada matiz para sete fatias legiveis sem
+    // inventar cor nova — a paleta da marca tem tres, nao sete.
+    var cs=getComputedStyle(document.documentElement).getPropertyValue(SEG[i].k).trim();
+    var step=[1,.72,.5][Math.floor(i/3)]||.5;
+    return {c:cs, a:step};
+  }
+  function size(){var w=c.clientWidth||420;c.width=w*DPR;c.height=w*DPR}
+  function draw(){
+    var W=c.width,H=c.height,cx=W/2,cy=H/2,R=Math.min(W,H)*0.46,r0=R*0.58;
+    ctx.clearRect(0,0,W,H);
+    var a=-Math.PI/2;
+    for(var i=0;i<SEG.length;i++){
+      var sw=SEG[i].v/TOTAL*Math.PI*2, t=tone(i), grow=(i===hot?R*0.045:0);
+      ctx.beginPath();
+      ctx.arc(cx,cy,R+grow,a+0.006,a+sw-0.006);
+      ctx.arc(cx,cy,r0,a+sw-0.006,a+0.006,true);
+      ctx.closePath();
+      ctx.globalAlpha=t.a; ctx.fillStyle=t.c; ctx.fill(); ctx.globalAlpha=1;
+      a+=sw;
+    }
+  }
+  function setHot(i){
+    if(i===hot) return; hot=i; draw();
+    var box=document.getElementById('pieCenter');
+    if(i<0){ box.children[0].textContent='Total supply';
+             box.children[1].textContent=fmt(TOTAL);
+             box.children[2].textContent='BLCH \u00b7 hard cap'; }
+    else   { box.children[0].textContent=SEG[i].n;
+             box.children[1].textContent=fmt(SEG[i].v);
+             box.children[2].textContent=(SEG[i].v/TOTAL*100).toFixed(2)+'% of supply'; }
+    Array.prototype.forEach.call(leg.children,function(li,j){
+      li.setAttribute('data-on', j===i?'1':'0'); });
+  }
+  var leg=document.getElementById('pieLegend');
+  SEG.forEach(function(s,i){
+    var t=tone(i);
+    var li=document.createElement('li');
+    li.setAttribute('tabindex','0');
+    li.innerHTML='<span class="sw" style="background:'+t.c+';opacity:'+t.a+'"></span>'+
+      '<span class="nm">'+s.n+'</span><span class="pc">'+(s.v/TOTAL*100).toFixed(2)+'%</span>';
+    li.addEventListener('mouseenter',function(){setHot(i)});
+    li.addEventListener('focus',function(){setHot(i)});
+    li.addEventListener('mouseleave',function(){setHot(-1)});
+    li.addEventListener('blur',function(){setHot(-1)});
+    leg.appendChild(li);
+  });
+  c.addEventListener('mousemove',function(e){
+    var b=c.getBoundingClientRect(), x=e.clientX-b.left-b.width/2, y=e.clientY-b.top-b.height/2;
+    var d=Math.sqrt(x*x+y*y), R=b.width*0.46, r0=R*0.58;
+    if(d<r0||d>R*1.06){ setHot(-1); return; }
+    var ang=Math.atan2(y,x)+Math.PI/2; if(ang<0) ang+=Math.PI*2;
+    var acc=0;
+    for(var i=0;i<SEG.length;i++){ acc+=SEG[i].v/TOTAL*Math.PI*2; if(ang<=acc){ setHot(i); return; } }
+  });
+  c.addEventListener('mouseleave',function(){setHot(-1)});
+  size(); draw();
+  window.addEventListener('resize',function(){size();draw()});
+  matchMedia('(prefers-color-scheme: dark)').addEventListener('change',draw);
+})();
+</script>
+</body>
+</html>

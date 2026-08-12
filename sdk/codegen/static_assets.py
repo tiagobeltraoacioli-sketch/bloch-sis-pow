@@ -143,21 +143,75 @@ PY_UNITS = '''\
 #
 # Unit helpers: satoshis <-> BLCH display, plus a light address-network guess.
 #
-# The integer satoshi value is the ONLY source of truth on-chain
+# The satoshi amount is the ONLY source of truth on-chain
 # (1 BLCH = 100_000_000 satoshis). The float `*_bloch` fields the node returns
 # are display-only and MUST NOT be used for accounting. These helpers keep the
-# truth as an int so no precision is lost.
+# truth as a Python int so no precision is lost.
+#
+# On the wire a satoshi amount is a DECIMAL STRING, not a JSON number: the
+# Genesis-4 supply cap is 10^19 sat, about 1110x JavaScript's exact-integer
+# limit of 2^53, so a JSON number is silently rounded by any IEEE-754 reader.
+# Python's json module happens to parse integers exactly, so Python was never
+# the victim — but it shares the wire, and `parse_sats` below accepts both the
+# string form and the legacy bare-int form.
+# See docs/specs/BLOCH-SATOSHI-ENCODING.md.
 
 from __future__ import annotations
 
 from decimal import Decimal
-from typing import Optional
+from typing import Optional, Union
 
 SATS_PER_BLOCH = 100_000_000
 BLOCH_DECIMALS = 8
 
+# Genesis-4 total supply in satoshis: 100,000,000,000 BLCH x 10^8. Mirrors
+# TOTAL_SUPPLY_SAT in crates/bloch-pos-committee/src/tokenomics_v4.rs.
+MAX_SATS = 10_000_000_000_000_000_000
+
 MAINNET_PREFIX = "bloch1q"
 TESTNET_PREFIX = "bloch1t"
+
+
+def parse_sats(value: Union[str, int]) -> int:
+    """Parse a wire satoshi amount into an exact int.
+
+    Accepts the canonical decimal string ("1688654952300000000") and the legacy
+    bare int emitted by Genesis-3 nodes. Rejects floats (a float has already
+    lost the value), negatives, non-canonical leading zeros, and anything above
+    the supply cap.
+    """
+    if isinstance(value, bool) or isinstance(value, float):
+        raise TypeError(
+            f"satoshi amounts must be a decimal string or int, not {type(value).__name__} "
+            "(a float has already lost precision)"
+        )
+    if isinstance(value, int):
+        text = str(value)
+    elif isinstance(value, str):
+        text = value
+    else:
+        raise TypeError(f"satoshi amounts must be a decimal string or int, not {type(value).__name__}")
+    if not text:
+        raise ValueError("empty satoshi amount")
+    if text.startswith("-"):
+        raise ValueError(f"negative satoshi amount rejected (amounts are unsigned): {text!r}")
+    if not text.isdigit():
+        raise ValueError(f"not a base-10 satoshi amount: {text!r}")
+    if len(text) > 1 and text[0] == "0":
+        raise ValueError(f"leading zeros are not canonical: {text!r}")
+    sats = int(text)
+    if sats > MAX_SATS:
+        raise ValueError(f"satoshi amount {text} exceeds the total supply {MAX_SATS}")
+    return sats
+
+
+def format_sats(sats: int) -> str:
+    """Render an int satoshi amount in the canonical wire form (decimal string)."""
+    if sats < 0:
+        raise ValueError("satoshi amounts are unsigned")
+    if sats > MAX_SATS:
+        raise ValueError(f"satoshi amount {sats} exceeds the total supply {MAX_SATS}")
+    return str(sats)
 
 
 def bloch_to_sats(bloch: str) -> int:
@@ -267,11 +321,14 @@ from .signer import Signer
 from .units import (
     SATS_PER_BLOCH,
     BLOCH_DECIMALS,
+    MAX_SATS,
     MAINNET_PREFIX,
     TESTNET_PREFIX,
     bloch_to_sats,
     sats_to_bloch,
     format_bloch,
+    parse_sats,
+    format_sats,
     address_network,
 )
 from . import models
@@ -287,11 +344,14 @@ __all__ = [
     "Signer",
     "SATS_PER_BLOCH",
     "BLOCH_DECIMALS",
+    "MAX_SATS",
     "MAINNET_PREFIX",
     "TESTNET_PREFIX",
     "bloch_to_sats",
     "sats_to_bloch",
     "format_bloch",
+    "parse_sats",
+    "format_sats",
     "address_network",
     "models",
     "__version__",
@@ -349,14 +409,18 @@ pip install -e sdk/python
 ## Usage
 
 ```python
-from blochclient import BlochClient, BlochRpcError, sats_to_bloch
+from blochclient import BlochClient, BlochRpcError, parse_sats, sats_to_bloch
 
 client = BlochClient("http://127.0.0.1:16210")
 
 height = client.get_block_count()
 info = client.get_network_info()          # -> NetworkInfo (TypedDict)
 bal = client.get_balance("bloch1q...")    # -> Balance
-print(sats_to_bloch(bal["satoshis"]), "BLCH")
+
+# Amounts arrive as DECIMAL STRINGS. parse_sats() gives you an exact int and
+# also accepts the legacy bare-int form from Genesis-3 nodes.
+sats = parse_sats(bal["satoshis"])
+print(sats_to_bloch(sats), "BLCH")
 
 try:
     client.get_transaction("deadbeef")     # bad hash
@@ -378,6 +442,20 @@ Bloch reports failures in two places and the client normalizes both into
   "result-error"`.
 
 Network / malformed-response problems raise `BlochTransportError`.
+
+### Amounts
+
+A satoshi amount is a **decimal string** on the wire, not a JSON number. The
+supply cap is 10^19 satoshis — about 1110x JavaScript's exact-integer limit of
+2^53 — so a JSON number is silently rounded by any IEEE-754 reader, and real
+Bloch balances are already ~187x past that limit. Python's `int` is
+arbitrary-precision, so Python was never the victim; it shares the wire.
+
+Run every amount through `parse_sats()` (accepts the string form and the legacy
+bare int from Genesis-3 nodes, returns an exact `int`, rejects negatives and
+anything above the cap) and `format_sats()` on the way out. The `*_bloch` float
+companions are display-only and lossy — never use them for accounting. Rule:
+`docs/specs/BLOCH-SATOSHI-ENCODING.md`.
 
 ### Writes and signing
 
@@ -464,18 +542,141 @@ func (e *TransportError) Error() string {
 }
 '''
 
+GO_SATOSHIS = '''\
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) Bloch community contributors
+// @generated (static asset) by sdk/codegen — do not edit by hand.
+//
+// The Satoshis wire codec: uint64 in memory, decimal string in JSON.
+
+package blochclient
+
+import (
+	"encoding/json"
+	"fmt"
+	"strconv"
+)
+
+// Satoshis is a satoshi amount (1 BLCH = 100_000_000 sat): an unsigned 64-bit
+// integer in memory, a **decimal string** on the JSON wire.
+//
+// Why a string, not just uint64: the Genesis-4 supply cap is 100,000,000,000
+// BLCH = 10^19 satoshis — 108% of int64's positive range and ~1110x
+// JavaScript's exact-integer limit 2^53 (9,007,199,254,740,991). A bare JSON
+// number above 2^53 is silently rounded by every IEEE-754 JSON reader, so
+// widening this SDK's integer would fix Go while leaving every JS consumer of
+// the same wire reading wrong balances. The amount therefore travels as a
+// decimal string ("satoshis": "10000000000000000000"); uint64 is the
+// in-memory consequence. See docs/specs/BLOCH-SATOSHI-ENCODING.md.
+//
+// Unmarshalling accepts the canonical string form and, from legacy Genesis-3
+// nodes only, a bare JSON integer. The legacy form is parsed from the raw
+// JSON token — never through a float64 — so this decoder loses no precision
+// either way; the hazard is other readers, not this one.
+type Satoshis uint64
+
+// MaxSats is the Genesis-4 total supply in satoshis:
+// 100,000,000,000 BLCH x 10^8 sat/BLCH. No valid amount can exceed it, and
+// the codec rejects anything above it in both directions. It mirrors
+// TOTAL_SUPPLY_SAT in crates/bloch-pos-committee/src/tokenomics_v4.rs — if
+// that constant moves, regenerate the SDKs.
+const MaxSats Satoshis = 10_000_000_000_000_000_000
+
+// MarshalJSON emits the canonical decimal-string form, e.g. "12345".
+func (s Satoshis) MarshalJSON() ([]byte, error) {
+	if s > MaxSats {
+		return nil, fmt.Errorf("satoshis %d exceeds the total supply %d", uint64(s), uint64(MaxSats))
+	}
+	return []byte(`"` + strconv.FormatUint(uint64(s), 10) + `"`), nil
+}
+
+// UnmarshalJSON accepts the canonical decimal string ("123") or, for legacy
+// Genesis-3 nodes, a bare JSON integer (123). It rejects negatives, signs,
+// non-integers, leading zeros, and anything above MaxSats. JSON null leaves
+// the value untouched (standard library convention).
+func (s *Satoshis) UnmarshalJSON(data []byte) error {
+	if string(data) == "null" {
+		return nil
+	}
+	if len(data) > 0 && data[0] == '"' {
+		var str string
+		if err := json.Unmarshal(data, &str); err != nil {
+			return fmt.Errorf("satoshis: %w", err)
+		}
+		v, err := ParseSatoshis(str)
+		if err != nil {
+			return err
+		}
+		*s = v
+		return nil
+	}
+	// Legacy bare-number form: parse the raw token, never via float64.
+	v, err := ParseSatoshis(string(data))
+	if err != nil {
+		return err
+	}
+	*s = v
+	return nil
+}
+
+// ParseSatoshis parses a canonical decimal satoshi string: base-10 digits
+// only, no sign, no leading zeros, at most MaxSats.
+func ParseSatoshis(str string) (Satoshis, error) {
+	if str == "" {
+		return 0, fmt.Errorf("satoshis: empty amount")
+	}
+	if str[0] == '-' {
+		return 0, fmt.Errorf("satoshis: negative amount %q rejected (amounts are unsigned)", str)
+	}
+	for i := 0; i < len(str); i++ {
+		if str[i] < '0' || str[i] > '9' {
+			return 0, fmt.Errorf("satoshis: %q is not a base-10 integer", str)
+		}
+	}
+	if len(str) > 1 && str[0] == '0' {
+		return 0, fmt.Errorf("satoshis: leading zeros in %q are not canonical", str)
+	}
+	u, err := strconv.ParseUint(str, 10, 64)
+	if err != nil {
+		// Digits are already validated, so the only failure left is range.
+		return 0, fmt.Errorf("satoshis: %q exceeds the total supply %d", str, uint64(MaxSats))
+	}
+	if Satoshis(u) > MaxSats {
+		return 0, fmt.Errorf("satoshis: %q exceeds the total supply %d", str, uint64(MaxSats))
+	}
+	return Satoshis(u), nil
+}
+
+// String returns the canonical decimal form (same digits as the wire).
+func (s Satoshis) String() string {
+	return strconv.FormatUint(uint64(s), 10)
+}
+
+// Uint64 returns the raw satoshi count.
+func (s Satoshis) Uint64() uint64 {
+	return uint64(s)
+}
+
+// Bloch formats the amount as a BLCH display string with 8 decimals.
+func (s Satoshis) Bloch() string {
+	return SatsToBloch(s)
+}
+'''
+
 GO_UNITS = '''\
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) Bloch community contributors
 //
 // Unit helpers: satoshis <-> BLCH display, plus a light address-network guess.
-// The integer satoshi value is the ONLY on-chain truth (1 BLCH = 100_000_000
-// satoshis); the float *_bloch fields are display-only.
+// The satoshi amount (Satoshis, uint64 / decimal string on the wire — see
+// satoshis.go) is the ONLY on-chain truth (1 BLCH = 100_000_000 satoshis);
+// the float *_bloch fields are display-only.
 
 package blochclient
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -489,33 +690,25 @@ const (
 	TestnetPrefix = "bloch1t"
 )
 
-// SatsToBloch formats integer satoshis as a BLCH display string with 8 decimals.
-func SatsToBloch(sats int64) string {
-	neg := sats < 0
-	if neg {
-		sats = -sats
-	}
-	whole := sats / SatsPerBloch
-	frac := sats % SatsPerBloch
-	s := fmt.Sprintf("%d.%08d", whole, frac)
-	if neg {
-		return "-" + s
-	}
-	return s
+// SatsToBloch formats a satoshi amount as a BLCH display string with 8 decimals.
+func SatsToBloch(sats Satoshis) string {
+	whole := uint64(sats) / SatsPerBloch
+	frac := uint64(sats) % SatsPerBloch
+	return fmt.Sprintf("%d.%08d", whole, frac)
 }
 
 // FormatBloch renders satoshis as e.g. "1.50000000 BLCH".
-func FormatBloch(sats int64) string {
+func FormatBloch(sats Satoshis) string {
 	return SatsToBloch(sats) + " BLCH"
 }
 
-// BlochToSats parses a human BLCH string (e.g. "1.5") into integer satoshis.
-// It rejects more than 8 decimal places and non-numeric input.
-func BlochToSats(bloch string) (int64, error) {
+// BlochToSats parses a human BLCH string (e.g. "1.5") into a satoshi amount.
+// It rejects negatives, more than 8 decimal places, non-numeric input, and
+// anything above the total supply (MaxSats).
+func BlochToSats(bloch string) (Satoshis, error) {
 	s := strings.TrimSpace(bloch)
-	neg := strings.HasPrefix(s, "-")
-	if neg {
-		s = s[1:]
+	if strings.HasPrefix(s, "-") {
+		return 0, fmt.Errorf("negative BLCH amount rejected (amounts are unsigned): %q", bloch)
 	}
 	whole, frac := s, ""
 	if i := strings.IndexByte(s, '.'); i >= 0 {
@@ -525,22 +718,22 @@ func BlochToSats(bloch string) (int64, error) {
 		return 0, fmt.Errorf("too many decimal places (max %d): %q", BlochDecimals, bloch)
 	}
 	frac = frac + strings.Repeat("0", BlochDecimals-len(frac))
-	var w, f int64
-	if whole != "" {
-		if _, err := fmt.Sscanf(whole, "%d", &w); err != nil {
-			return 0, fmt.Errorf("invalid BLCH amount: %q", bloch)
-		}
+	if whole == "" {
+		whole = "0"
 	}
-	if frac != "" {
-		if _, err := fmt.Sscanf(frac, "%d", &f); err != nil {
-			return 0, fmt.Errorf("invalid BLCH amount: %q", bloch)
-		}
+	w, err := strconv.ParseUint(whole, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid BLCH amount: %q", bloch)
 	}
-	sats := w*SatsPerBloch + f
-	if neg {
-		sats = -sats
+	f, err := strconv.ParseUint(frac, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid BLCH amount: %q", bloch)
 	}
-	return sats, nil
+	// w*SatsPerBloch + f with overflow/supply checks (MaxSats < 2^64).
+	if w > (uint64(MaxSats)-f)/SatsPerBloch {
+		return 0, fmt.Errorf("BLCH amount %q exceeds the total supply", bloch)
+	}
+	return Satoshis(w*SatsPerBloch + f), nil
 }
 
 // AddressNetwork is a cheap prefix guess: "mainnet", "testnet", or "". Use the
@@ -579,6 +772,238 @@ type Signer interface {
 	PublicKey() []byte
 	// Sign returns the hybrid signature over message.
 	Sign(message []byte) ([]byte, error)
+}
+'''
+
+GO_SATOSHIS_TEST = '''\
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) Bloch community contributors
+// @generated (static asset) by sdk/codegen — do not edit by hand.
+
+package blochclient
+
+import (
+	"encoding/json"
+	"testing"
+)
+
+// supplyCap is the Genesis-4 total supply, 100,000,000,000 BLCH at 8 decimals.
+const supplyCapDigits = "10000000000000000000"
+
+func TestSatoshisRoundTrip(t *testing.T) {
+	cases := []struct {
+		name  string
+		value Satoshis
+		json  string
+	}{
+		{"zero", 0, `"0"`},
+		{"one", 1, `"1"`},
+		{"one BLCH", 100_000_000, `"100000000"`},
+		{"js safe limit", 9_007_199_254_740_991, `"9007199254740991"`},
+		{"js safe limit + 2", 9_007_199_254_740_993, `"9007199254740993"`},
+		{"largest carryover address", 1_688_654_952_300_000_000, `"1688654952300000000"`},
+		{"past int64", 9_223_372_036_854_775_808, `"9223372036854775808"`},
+		{"supply cap", MaxSats, `"` + supplyCapDigits + `"`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			enc, err := json.Marshal(tc.value)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			if string(enc) != tc.json {
+				t.Fatalf("marshal = %s, want %s", enc, tc.json)
+			}
+			var back Satoshis
+			if err := json.Unmarshal(enc, &back); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if back != tc.value {
+				t.Fatalf("round-trip = %d, want %d", uint64(back), uint64(tc.value))
+			}
+		})
+	}
+}
+
+// The supply cap must survive a struct round-trip, not just a bare scalar.
+func TestSatoshisSupplyCapInStruct(t *testing.T) {
+	type balance struct {
+		Satoshis Satoshis `json:"satoshis"`
+	}
+	enc, err := json.Marshal(balance{Satoshis: MaxSats})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	want := `{"satoshis":"` + supplyCapDigits + `"}`
+	if string(enc) != want {
+		t.Fatalf("marshal = %s, want %s", enc, want)
+	}
+	var back balance
+	if err := json.Unmarshal(enc, &back); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if back.Satoshis != MaxSats {
+		t.Fatalf("round-trip = %d, want %d", uint64(back.Satoshis), uint64(MaxSats))
+	}
+	// 10^19 does not fit the int64 this type used to be; prove the new type
+	// carries it rather than saturating.
+	if uint64(back.Satoshis) <= 9_223_372_036_854_775_807 {
+		t.Fatalf("supply cap %d did not survive as a u64-range value", uint64(back.Satoshis))
+	}
+}
+
+func TestSatoshisRejectsNegative(t *testing.T) {
+	for _, bad := range []string{`"-1"`, `-1`, `"-10000000000000000000"`, `-9007199254740993`} {
+		var s Satoshis
+		if err := json.Unmarshal([]byte(bad), &s); err == nil {
+			t.Fatalf("unmarshal(%s) accepted a negative amount as %d", bad, uint64(s))
+		}
+	}
+}
+
+func TestSatoshisRejectsAboveSupply(t *testing.T) {
+	// One satoshi past the cap, and the largest u64 (which is 1.84x the cap).
+	for _, bad := range []string{`"10000000000000000001"`, `"18446744073709551615"`, `"99999999999999999999"`} {
+		var s Satoshis
+		if err := json.Unmarshal([]byte(bad), &s); err == nil {
+			t.Fatalf("unmarshal(%s) accepted %d, above the supply cap", bad, uint64(s))
+		}
+	}
+	if _, err := json.Marshal(MaxSats + 1); err == nil {
+		t.Fatal("marshal accepted an amount above the supply cap")
+	}
+}
+
+func TestSatoshisRejectsMalformed(t *testing.T) {
+	for _, bad := range []string{`""`, `"1.5"`, `"0x10"`, `"+1"`, `"007"`, `" 1"`, `"1 "`, `"1e19"`, `1.5`, `true`, `[]`} {
+		var s Satoshis
+		if err := json.Unmarshal([]byte(bad), &s); err == nil {
+			t.Fatalf("unmarshal(%s) accepted a malformed amount as %d", bad, uint64(s))
+		}
+	}
+}
+
+// Legacy Genesis-3 nodes emit satoshis as bare JSON numbers. Accept them, and
+// parse from the raw token so nothing passes through a float64.
+func TestSatoshisAcceptsLegacyNumberForm(t *testing.T) {
+	var s Satoshis
+	if err := json.Unmarshal([]byte(`1688654952300000000`), &s); err != nil {
+		t.Fatalf("legacy number form rejected: %v", err)
+	}
+	if uint64(s) != 1_688_654_952_300_000_000 {
+		t.Fatalf("legacy parse = %d, want 1688654952300000000", uint64(s))
+	}
+	// A value a float64 could not hold exactly still decodes exactly, because
+	// the decoder never builds a float64.
+	if err := json.Unmarshal([]byte(`9007199254740993`), &s); err != nil {
+		t.Fatalf("legacy number form rejected: %v", err)
+	}
+	if uint64(s) != 9_007_199_254_740_993 {
+		t.Fatalf("legacy parse = %d, want 9007199254740993 (float64 would give ...992)", uint64(s))
+	}
+}
+
+// TestSatoshisSurvivesJavaScript is the reason this type is a string on the
+// wire at all.
+//
+// The vectors below were MEASURED, not assumed, with node v22.16.0:
+//
+//	node -e 'console.log(JSON.stringify(JSON.parse(`{"v":9007199254740993}`)))'
+//	  -> {"v":9007199254740992}     // one satoshi lost, silently
+//	node -e 'console.log(JSON.stringify(JSON.parse(`{"v":"9007199254740993"}`)))'
+//	  -> {"v":"9007199254740993"}   // byte-identical
+//
+// JavaScript parses every JSON number into an IEEE-754 double, exact only up
+// to 2^53 - 1 = 9,007,199,254,740,991. The Genesis-4 supply cap is 10^19 sat,
+// about 1110x that limit, and single real balances are already ~187x past it.
+// So the numeric wire form is lossy for Bloch amounts no matter how wide the
+// Go integer is — which is why widening int64 to uint64 is the consequence of
+// the fix and not the fix itself.
+//
+// This test asserts our encoder emits exactly the bytes JavaScript gives back
+// unchanged, and pins the measured corruption of the numeric form.
+func TestSatoshisSurvivesJavaScript(t *testing.T) {
+	vectors := []struct {
+		sats Satoshis
+		// jsStringRoundTrip: JSON.stringify(JSON.parse(`{"v":"<digits>"}`)) in node.
+		jsStringRoundTrip string
+		// jsNumberRoundTrip: JSON.stringify(JSON.parse(`{"v":<digits>}`)) in node.
+		jsNumberRoundTrip string
+		numberIsCorrupted bool
+	}{
+		{
+			sats:              9_007_199_254_740_991,
+			jsStringRoundTrip: `{"v":"9007199254740991"}`,
+			jsNumberRoundTrip: `{"v":9007199254740991}`,
+			numberIsCorrupted: false, // exactly 2^53 - 1: the last exact integer
+		},
+		{
+			sats:              9_007_199_254_740_993,
+			jsStringRoundTrip: `{"v":"9007199254740993"}`,
+			jsNumberRoundTrip: `{"v":9007199254740992}`,
+			numberIsCorrupted: true,
+		},
+		{
+			sats:              9_999_999_999_999_999_999,
+			jsStringRoundTrip: `{"v":"9999999999999999999"}`,
+			jsNumberRoundTrip: `{"v":10000000000000000000}`,
+			numberIsCorrupted: true,
+		},
+		{
+			sats:              MaxSats,
+			jsStringRoundTrip: `{"v":"` + supplyCapDigits + `"}`,
+			jsNumberRoundTrip: `{"v":` + supplyCapDigits + `}`,
+			numberIsCorrupted: false, // 10^19 happens to be representable; 10^19-1 is not
+		},
+	}
+	type envelope struct {
+		V Satoshis `json:"v"`
+	}
+	for _, v := range vectors {
+		enc, err := json.Marshal(envelope{V: v.sats})
+		if err != nil {
+			t.Fatalf("marshal %d: %v", uint64(v.sats), err)
+		}
+		// Byte-for-byte: what we send is what JavaScript hands back untouched.
+		if string(enc) != v.jsStringRoundTrip {
+			t.Fatalf("encoded %s, JavaScript round-trips %s", enc, v.jsStringRoundTrip)
+		}
+		// And decoding what JavaScript produced returns the exact amount.
+		var back envelope
+		if err := json.Unmarshal([]byte(v.jsStringRoundTrip), &back); err != nil {
+			t.Fatalf("decode JS output: %v", err)
+		}
+		if back.V != v.sats {
+			t.Fatalf("JS round-trip changed %d into %d", uint64(v.sats), uint64(back.V))
+		}
+		// The numeric form: pin the measured loss so nobody "simplifies" the
+		// encoding back to a JSON number.
+		numeric := `{"v":` + v.sats.String() + `}`
+		corrupted := numeric != v.jsNumberRoundTrip
+		if corrupted != v.numberIsCorrupted {
+			t.Fatalf("numeric form %s vs measured JS %s: corruption = %v, expected %v",
+				numeric, v.jsNumberRoundTrip, corrupted, v.numberIsCorrupted)
+		}
+	}
+}
+
+func TestBlochToSatsBounds(t *testing.T) {
+	// The whole supply, in BLCH, parses to exactly the cap.
+	got, err := BlochToSats("100000000000.00000000")
+	if err != nil {
+		t.Fatalf("supply cap in BLCH rejected: %v", err)
+	}
+	if got != MaxSats {
+		t.Fatalf("BlochToSats = %d, want %d", uint64(got), uint64(MaxSats))
+	}
+	if SatsToBloch(MaxSats) != "100000000000.00000000" {
+		t.Fatalf("SatsToBloch(cap) = %q", SatsToBloch(MaxSats))
+	}
+	for _, bad := range []string{"-1", "100000000001", "1.000000001", "abc"} {
+		if _, err := BlochToSats(bad); err == nil {
+			t.Fatalf("BlochToSats(%q) was accepted", bad)
+		}
+	}
 }
 '''
 
@@ -680,6 +1105,23 @@ Bloch reports failures in two places; the client surfaces both as `*RPCError`:
 
 Network / malformed-response problems return `*TransportError`.
 
+### Amounts
+
+`Satoshis` is a `uint64` in memory and a **decimal string** on the wire
+(`satoshis.go`). It is not `int64`, and not a JSON number, for two separate
+reasons: the supply cap is 10^19 satoshis, which is 108% of `int64`'s positive
+range, and — the reason that actually drove the design — about 1110x
+JavaScript's exact-integer limit of 2^53, so a JSON number is silently rounded
+by every browser reading the same response. Real Bloch balances are already
+~187x past that limit.
+
+`MarshalJSON` emits the string form and rejects amounts above the cap;
+`UnmarshalJSON` accepts the string form and the legacy bare-number form from
+Genesis-3 nodes, parsing the raw token rather than a float. Use
+`ParseSatoshis`, `.Uint64()`, `.String()`, `SatsToBloch`, `BlochToSats`. The
+`*_bloch` float companions are display-only and lossy — never use them for
+accounting. Rule: `docs/specs/BLOCH-SATOSHI-ENCODING.md`.
+
 ### Writes and signing
 
 The only write is `SendRawTransaction(hex)`, which takes an **already-signed**
@@ -736,7 +1178,8 @@ Re-running is idempotent: same spec in, byte-identical clients out.
    schema). OpenAPI can't model JSON-RPC natively, so the real method surface
    lives in that extension.
 2. **Emits typed models** from the schemas:
-   - scalar schemas (`Hex32`, `Hex20`, `Address`, `Satoshis`) -> type aliases,
+   - scalar schemas (`Hex32`, `Hex20`, `Address`) -> type aliases,
+   - `Satoshis` -> a per-language codec, NOT an alias (see below),
    - object schemas -> Python `TypedDict`s / Go structs,
    - `oneOf`-of-objects -> a merged optional-field type (union shape),
    - `oneOf` with a `null` variant -> `Optional` / pointer,
@@ -752,12 +1195,36 @@ Re-running is idempotent: same spec in, byte-identical clients out.
    README, and a `@generated from docs/openapi.yaml` banner on the derived
    model/client files.
 
+6. **Runs `gofmt -w`** over the emitted Go files when the Go toolchain is on
+   PATH. The emitter writes single-space struct fields; gofmt column-aligns
+   them, so this keeps regeneration byte-identical to what is committed. When
+   `gofmt` is absent the output is still valid Go, just unaligned — the run
+   prints which happened.
+
+## Amounts are not a scalar alias
+
+`Satoshis` is the one schema that does not become a plain type alias. The
+Genesis-4 supply cap is 10^19 satoshis
+(`crates/bloch-pos-committee/src/tokenomics_v4.rs`) — 108% of `i64::MAX` and
+about 1110x JavaScript's exact-integer limit of 2^53 — so an amount travels the
+wire as a **decimal string** and each language binds its own codec:
+
+- Go: `type Satoshis uint64` with `MarshalJSON`/`UnmarshalJSON`, in
+  `satoshis.go` (+ `satoshis_test.go`, both static assets).
+- Python: `Satoshis = Union[str, int]` (the wire shape) with `parse_sats()` /
+  `format_sats()` in `units.py`.
+
+Do not "simplify" either back to a JSON number: it would fix nothing and break
+every JavaScript consumer silently. Rule and rationale:
+`docs/specs/BLOCH-SATOSHI-ENCODING.md`.
+
 ## Files
 
 - `generate.py` — the generator (stdlib + PyYAML only).
-- `static_assets.py` — verbatim scaffold (errors, unit helpers, the `Signer`
-  seam, packaging metadata, READMEs, licenses). Not spec-derived, so these carry
-  the SPDX header but not the `@generated` banner.
+- `static_assets.py` — verbatim scaffold (errors, unit helpers, the amount
+  codec + its tests, the `Signer` seam, packaging metadata, READMEs, licenses).
+  Not spec-derived, so these carry the SPDX header but not the `@generated`
+  banner.
 
 ## Signing seam
 

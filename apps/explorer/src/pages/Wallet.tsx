@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 import { useEffect, useState } from "react";
 import { rpc, rpcAllSettled } from "../lib/rpc";
 import { useAsync } from "../lib/hooks";
@@ -6,7 +7,7 @@ import { ChartCard, LineChart } from "../components/charts";
 import { Link } from "../lib/router";
 import { parseBlochAddress, looksLikeBlochAddress } from "../lib/address";
 import { fetchPoolAddresses, scanMinerBlocks, MinerBlock, PoolAddresses } from "../lib/mining";
-import { fmtBloch, fmtInt, timeAgo, short } from "../lib/format";
+import { fmtBloch, fmtInt, toSats, timeAgo, short } from "../lib/format";
 
 const LS_KEY = "bloch:wallet:addr";
 const SCAN_DEPTH = 40;
@@ -69,7 +70,8 @@ export function WalletPage() {
 }
 
 interface PanelData {
-  balanceSats: number;
+  /** bigint: a balance can exceed 2^53 sat (the largest carryover does, ~39x). */
+  balanceSats: bigint;
   utxoCount: number;
   poolRole: string | null;
   pools: PoolAddresses;
@@ -88,7 +90,7 @@ function WalletPanel({ address }: { address: string }) {
     const blocks = await scanMinerBlocks(SCAN_DEPTH, pools);
     const mined = blocks.filter((b) => b.miner && b.miner.toLowerCase() === address.toLowerCase());
     return {
-      balanceSats: info.balance_sats ?? bal.satoshis ?? 0,
+      balanceSats: toSats(info.balance_sats ?? bal.satoshis),
       utxoCount: info.utxo_count ?? bal.utxo_count ?? 0,
       poolRole: info.pool_role && info.pool_role !== "none" ? info.pool_role : null,
       pools,
@@ -100,12 +102,14 @@ function WalletPanel({ address }: { address: string }) {
   if (error && !data) return <div style={{ marginTop: 18 }}><ErrorBox error={error} /></div>;
   const d = data!;
 
-  const minedReward = d.mined.reduce((a, b) => a + b.rewardSats, 0);
+  // Sum in satoshis as bigint, and only convert to a float for the CHART axis
+  // (a plotted pixel coordinate is display, an accounting total is not).
+  const minedReward = d.mined.reduce((a, b) => a + b.rewardSats, 0n);
   const sorted = [...d.mined].sort((a, b) => a.height - b.height);
-  let cum = 0;
+  let cum = 0n;
   const points = sorted.map((b) => {
-    cum += b.rewardSats / 1e8;
-    return { x: b.height, y: cum, label: `h${b.height}` };
+    cum += b.rewardSats;
+    return { x: b.height, y: Number(cum) / 1e8, label: `h${b.height}` };
   });
 
   return (
@@ -133,11 +137,11 @@ function WalletPanel({ address }: { address: string }) {
         />
       </div>
 
-      {d.balanceSats === 0 && d.mined.length === 0 && (
+      {d.balanceSats === 0n && d.mined.length === 0 && (
         <div className="rail" style={{ marginTop: 16 }}>
-          <strong>Nothing found (yet).</strong> This address has no balance and mined no blocks in the last{" "}
-          {SCAN_DEPTH} bodied blocks the node returned. That's expected on a stalled or freshly-used address —
-          we won't invent activity. If you just started mining, blocks appear here once the chain advances.
+          <strong>Nothing found.</strong> This address has no balance and mined no blocks in the last{" "}
+          {SCAN_DEPTH} bodied blocks the node returned — we won't invent activity. Note that Genesis-3
+          ends at height 50,000; after the halt this scan is a fixed historical window, not a live feed.
         </div>
       )}
 
@@ -147,7 +151,6 @@ function WalletPanel({ address }: { address: string }) {
           <ChartCard title="Cumulative BLOCH mined" hint={`${d.mined.length} block${d.mined.length === 1 ? "" : "s"}`}>
             <LineChart
               points={points}
-              color="#D2955C"
               area
               step
               yFormat={(v) => v.toFixed(2)}

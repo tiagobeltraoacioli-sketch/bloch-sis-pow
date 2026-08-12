@@ -6,6 +6,22 @@ Contact: tiagobeltraoacioli@gmail.com
 
 Sole author and copyright holder: Tiago Beltrão de Azevedo Tenório Acioli
 
+Commit authorship
+-----------------
+
+The commit objects in this repository carry six different author strings —
+"Groundstate100", "Bloch-SIS PoW", "Bloch-SIS Protocol", "postern-pmo",
+"postern-build" — from the period when the project was named GroundState and
+from build and PMO automation running under the same person. They are all the
+same author, and `.mailmap` maps them to the canonical identity, so `git log`,
+`git shortlog` and `git blame` show one contributor.
+
+The old strings were left in the objects on purpose. Rewriting them would change
+every commit hash from the genesis commit onward, break existing clones, and
+turn the commit references cited throughout `docs/` into dangling pointers. The
+names in the objects are the record of what happened; `.mailmap` is how that
+record is read.
+
 The Bloch-SIS-PoW *protocol* (its consensus rules and specification) is an open,
 ownerless commons — anyone is free to implement it. *This implementation* — all
 source code in this repository — is the author's copyrighted work, licensed to

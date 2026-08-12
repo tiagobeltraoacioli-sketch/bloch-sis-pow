@@ -24,6 +24,11 @@ fn new_node_state() -> Arc<RwLock<NodeState>> {
         peer_count:     0,
         mempool_size:   0,
         is_syncing:     false,
+        // Fresh node: no peer tip has been seen or announced yet. These three
+        // are exactly the pre-IBD starting state this test exercises.
+        best_seen_blue_score:      0,
+        seen_first_tip:            false,
+        best_announced_blue_score: 0,
         peer_addresses: Vec::new(),
         version:        "test".to_string(),
     }))

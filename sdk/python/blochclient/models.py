@@ -16,7 +16,11 @@ from typing import TypedDict
 Hex32 = str
 Hex20 = str
 Address = str
-Satoshis = int
+# A satoshi amount as it appears ON THE WIRE: a decimal string in V4,
+# a bare int from legacy Genesis-3 nodes. Never do arithmetic on the raw
+# field — run it through units.parse_sats() first, which accepts both
+# forms and returns an exact Python int.
+Satoshis = Union[str, int]
 Height = int
 
 
@@ -205,24 +209,24 @@ class BroadcastResult(TypedDict, total=False):
 
 class FeeEstimate(TypedDict, total=False):
     """estimatefee — median fee of current mempool entries."""
-    feerate_sats: int
+    feerate_sats: Satoshis
     feerate_bloch: float
     mempool_size: int
     note: str
 
 class FeeEstimateAdvanced(TypedDict, total=False):
     """estimatefeeadvanced result."""
-    next_block_sats: int
-    medium_priority: int
-    slow_priority: int
-    mempool_median: int
+    next_block_sats: Satoshis
+    medium_priority: Satoshis
+    slow_priority: Satoshis
+    mempool_median: Satoshis
     mempool_size: int
     recommended_bloch: str
 
 class MempoolEntry(TypedDict, total=False):
     """getrawmempool verbose entry."""
     txid: Hex32
-    fee: int
+    fee: Satoshis
     fee_bloch: float
     time: int
 
@@ -239,10 +243,10 @@ class MempoolBucket(TypedDict, total=False):
 class MempoolStats(TypedDict, total=False):
     """getmempoolstats result."""
     size: int
-    total_fees: int
-    min_fee: int
-    max_fee: int
-    median_fee: int
+    total_fees: Satoshis
+    min_fee: Satoshis
+    max_fee: Satoshis
+    median_fee: Satoshis
     avg_fee: float
     buckets: List[MempoolBucket]
 
@@ -316,7 +320,7 @@ class TxInBlock(TypedDict, total=False):
     size_bytes: int
     inputs_count: int
     outputs_count: int
-    fee_sats: int
+    fee_sats: Satoshis
     is_coinbase: bool
 
 class TxsByBlock(TypedDict, total=False):
@@ -330,31 +334,31 @@ class TxsByBlock(TypedDict, total=False):
 class PoolReportEntry(TypedDict, total=False):
     """One protocol pool in getpools. Founder entry adds vesting fields; a pool with no configured address reports status "pending_phase_6"."""
     share_bps: Optional[int]
-    subsidy_per_block_sat: int
+    subsidy_per_block_sat: Satoshis
     address_hash_hex: Optional[Hex20]
     address: Optional[Address]
-    balance_sat: int
+    balance_sat: Satoshis
     balance_bloch: float
     utxo_count: int
     status: str
-    vesting_per_month_sat: int
-    vesting_amount_at_next_sat: int
+    vesting_per_month_sat: Satoshis
+    vesting_amount_at_next_sat: Satoshis
     vesting_active_at_next: bool
-    vesting_total_sat: int
+    vesting_total_sat: Satoshis
     vesting_months: int
 
 class Pools(TypedDict, total=False):
     """getpools — next-block subsidy split plus per-pool address/balance."""
     current_height: int
     next_block_height: int
-    subsidy_per_block_sat: int
+    subsidy_per_block_sat: Satoshis
     subsidy_per_block_bloch: float
-    miner_share_sat: int
+    miner_share_sat: Satoshis
     pools: PoolsPools
 
 class BlockTemplateTx(TypedDict, total=False):
     txid: Hex32
-    fee: int
+    fee: Satoshis
     data: str
 
 class BlockTemplate(TypedDict, total=False):
@@ -365,10 +369,10 @@ class BlockTemplate(TypedDict, total=False):
     bits: int
     cur_time: int
     parent_time: int
-    subsidy_sat: int
-    founder_vesting_sat: int
+    subsidy_sat: Satoshis
+    founder_vesting_sat: Satoshis
     founder_address_hash: Hex20
-    total_fees: int
+    total_fees: Satoshis
     transactions: List[BlockTemplateTx]
     residual_coeffs: List[int]
 

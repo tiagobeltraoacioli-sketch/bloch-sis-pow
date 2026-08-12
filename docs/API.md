@@ -298,6 +298,24 @@ iterate by height.
 Applications requiring strong finality should wait for 100+
 confirmations, matching the coinbase maturity rule.
 
+### Heights, supply and emission (Genesis-3 traps)
+
+- **`getblockcount` is NOT the chain height.** It counts **DAG blocks**
+  (side blocks included) and runs thousands above the selected-chain
+  height. The height that gates consensus flag-days (e.g. the Emission V3
+  fork at local 40,000) is `getdaginfo → tip_height` /
+  `getblocktemplate → height`.
+- **Emission heights are offset.** The reward schedule is keyed to
+  `emission_height = local_height + 413,743` (the carry-over source
+  height); `getblocktemplate` exposes `emission_height` directly. See
+  `docs/specs/TOKENOMICS_V3.md` for the live schedule (2,600 BLOCH/block
+  from local height 40,000, halving every 1,555,200 blocks, perpetual
+  100 BLOCH tail — supply is not hard-capped).
+- **`getsupplydistribution` omits the carry-over.** Its `total_sats`
+  covers only coins mined on Genesis-3. Existing supply = carry-over
+  opening balance (3,475,441,200 BLOCH exactly) **plus** that figure.
+  Totals in sats exceed 2^53 — use integers, never floats.
+
 ---
 
 ## Known issues in v0.5.9

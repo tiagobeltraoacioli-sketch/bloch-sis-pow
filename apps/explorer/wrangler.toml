@@ -2,12 +2,58 @@ name = "bloch-explorer"
 compatibility_date = "2024-11-01"
 pages_build_output_dir = "dist"
 
-# Cloudflare Pages project for explorer.posternlabs.com.
-# The /rpc Function forwards to a reachable read-only Genesis-2 node RPC.
-# Set BLOCH_RPC_URL in the Pages project (Settings → Environment variables),
-# e.g. https://g2-rpc.posternlabs.com/  — do NOT hardcode a node IP here.
+# Cloudflare Pages project for blochl1.com (live domain; the old
+# explorer.posternlabs.com name is retired).
+# The /rpc Function forwards to a reachable read-only Bloch node RPC.
+# BLOCH_RPC_URL must point at a NON-Cloudflare-proxied upstream — see
+# functions/rpc.js for why a proxied hostname breaks (403 error 1003).
 #
-# Deploy (production → explorer.posternlabs.com once DNS is wired):
+# It is set HERE, in git, rather than only in the dashboard. The earlier note
+# said not to hardcode a node address; that was written before there was a
+# permanent one, and the dashboard-only setting is what broke the site: it was
+# pointing at g2rpc.blochl1.com — a proxied cfargotunnel hostname — so /rpc
+# returned 1003 for a day and nobody could see the value that caused it. An
+# address in the repo is reviewable, diffable and deployed atomically with the
+# code that reads it. The archival node's IP is a public fact about a
+# read-only public RPC; there is nothing here to keep secret.
+#
+# Deploy (production → blochl1.com):
 #   npm run build
-#   CLOUDFLARE_ACCOUNT_ID=4e44d592d0229f8faa3fdb2f139c611c \
+#   CLOUDFLARE_ACCOUNT_ID=CLOUDFLARE_ACCOUNT_ID \
 #     npx wrangler pages deploy dist --project-name bloch-explorer --branch main --commit-dirty=true
+
+[vars]
+# The explorer's surviving RPC path. node4 (136.244.82.226) is the permanent
+# archival node — nothing on that box is decommissioned with the pool; it runs
+# one service whose only job is to be the archival public peer. Its RPC is
+# exposed on :80 by `bloch-rpc-public.service` (socat -> 127.0.0.1:16210).
+# See deploy/RPC-SURVIVAL-RUNBOOK.md.
+#
+# WHY A HOSTNAME AND NOT THE IP — measured, 2026-08-12. A Pages Function is a
+# Worker, and a Worker `fetch()` to a bare IP literal is answered by Cloudflare
+# itself with 403 "error code: 1003" (direct IP access not allowed); it never
+# reaches the origin. The runbook's original plan (BLOCH_RPC_URL = http://IP:port)
+# could not have worked, and neither could the previous dashboard value
+# (a Cloudflare-PROXIED hostname, which trips the same 1003 from the other
+# direction). The upstream must be a hostname that resolves DNS-only to the
+# origin.
+#
+# INTERIM VALUE. `136-244-82-226.sslip.io` is a public wildcard-DNS service that
+# resolves to the IP encoded in the name. It works and it is what keeps the
+# explorer alive today, but it puts a third party in the resolution path of the
+# one RPC tier meant to outlive the pool. The durable value is
+# `http://rpc.blochl1.com/` — a DNS-only (grey-cloud) A record for
+# 136.244.82.226 in the blochl1.com zone. That record could not be created from
+# here: the available Cloudflare token carries `zone:read`, not DNS write.
+# Once the record exists, change this line and redeploy; nothing else moves.
+#
+# Plain http:// is deliberate: the hop is Function -> origin (server side), so
+# there is no browser mixed-content problem. It is unencrypted, which for a
+# read-only public chain RPC means an observer learns which blocks were asked
+# about and an on-path attacker could lie to the explorer. Neither touches keys
+# or consensus. Closing it means a cloudflared tunnel on node4 — polish.
+#
+# NOTE: for Pages, this file's [vars] OVERRIDES the dashboard setting on every
+# `wrangler pages deploy`. Editing the dashboard alone does nothing if a deploy
+# follows. This was measured the hard way.
+BLOCH_RPC_URL = "http://136-244-82-226.sslip.io/"

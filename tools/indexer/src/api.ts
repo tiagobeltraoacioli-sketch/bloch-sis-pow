@@ -1,12 +1,20 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Small read-only HTTP API over the index store (Node stdlib http, no framework).
+//
+// Amounts leave here in exactly the form the node's Genesis-4 RPC uses: a
+// decimal STRING (`"balanceSats": "354617540000000000"`), never a JSON number —
+// see docs/specs/BLOCH-SATOSHI-ENCODING.md. The `*Bloch` companions are floats,
+// display-only and lossy by construction; they must not be used for accounting.
 
 import { createServer, type ServerResponse } from "node:http";
 import type { IndexStore } from "./store.js";
 import type { IndexerConfig } from "./config.js";
+import { formatSats, satsToBlochDisplay, bigintReplacer } from "./sats.js";
 
 function json(res: ServerResponse, status: number, body: unknown): void {
-  const s = JSON.stringify(body);
+  // bigintReplacer is a backstop: every amount below is already formatted, but
+  // a stray bigint would otherwise make JSON.stringify throw at request time.
+  const s = JSON.stringify(body, bigintReplacer);
   res.writeHead(status, { "content-type": "application/json", "content-length": Buffer.byteLength(s) });
   res.end(s);
 }
@@ -50,10 +58,11 @@ export function createReadApi(cfg: IndexerConfig, store: IndexStore) {
       const addr = decodeURIComponent(parts[1]);
       const sub = parts[2] ?? "balance";
       if (sub === "balance") {
+        const bal = store.getBalance(addr);
         json(res, 200, {
           address: addr,
-          balanceSats: store.getBalance(addr),
-          balanceBloch: store.getBalance(addr) / 1e8,
+          balanceSats: formatSats(bal), // canonical: decimal string
+          balanceBloch: satsToBlochDisplay(bal), // display only, lossy
           utxoCount: store.getUtxosForAddress(addr).length,
         });
         return;
@@ -63,13 +72,21 @@ export function createReadApi(cfg: IndexerConfig, store: IndexStore) {
           address: addr,
           utxos: store.getUtxosForAddress(addr).map(({ key, utxo }) => {
             const [txid, index] = key.split(":");
-            return { txid, index: Number(index), value: utxo.value, height: utxo.height };
+            return { txid, index: Number(index), value: formatSats(utxo.value), height: utxo.height };
           }),
         });
         return;
       }
       if (sub === "history") {
-        json(res, 200, { address: addr, history: store.getHistory(addr) });
+        json(res, 200, {
+          address: addr,
+          history: store.getHistory(addr).map((e) => ({
+            txid: e.txid,
+            height: e.height,
+            direction: e.direction,
+            amountSats: formatSats(e.amountSats),
+          })),
+        });
         return;
       }
     }
@@ -81,7 +98,13 @@ export function createReadApi(cfg: IndexerConfig, store: IndexStore) {
         json(res, 404, { error: "utxo not found or already spent" });
         return;
       }
-      json(res, 200, { txid: parts[1], index: Number(parts[2]), ...utxo });
+      json(res, 200, {
+        txid: parts[1],
+        index: Number(parts[2]),
+        address: utxo.address,
+        value: formatSats(utxo.value),
+        height: utxo.height,
+      });
       return;
     }
 

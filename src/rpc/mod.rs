@@ -61,6 +61,14 @@ pub struct NodeState {
     /// fresh-miner fork guard waits for this so a joining miner never mines a
     /// genesis fork in the window between "connected" and "evaluated a tip".
     pub seen_first_tip: bool,
+    /// Honest-RPC fix: highest blue_score announced by a CONNECTED peer,
+    /// refreshed by every maybe_release_ibd re-test (event-driven + 30s
+    /// nudge). UNTRUSTED wire hint — never gates consensus or the IBD latch;
+    /// it exists so `getnetworkinfo` can report `best_announced`/`behind_by`
+    /// and a lagging node SAYS it is lagging instead of just `syncing:false`.
+    /// Differs from `best_seen_blue_score` (lifetime max over any peer ever,
+    /// including long-gone ones): this one tracks currently-connected peers.
+    pub best_announced_blue_score: u64,
     pub peer_addresses: Vec<String>,
     pub version:        String,
 }
@@ -220,14 +228,43 @@ async fn handle_rpc(
             // the correct form across the `dispatch` await. Inert unless a
             // subscriber is installed (init lives in main.rs, not owned here).
             use tracing::Instrument;
-            let result = dispatch(method, params, &state)
+            // The dispatch arms below do their work INLINE and BLOCKING:
+            // parking_lot acquisitions on `node_state`/`dag` and synchronous
+            // RocksDB reads, none of which yield. Running that directly on a
+            // tokio worker means a writer holding `node_state` (main.rs:2303,
+            // :2352, :2910, :3080) parks the worker for as long as it holds the
+            // lock. With `#[tokio::main]` defaulting worker_threads to the core
+            // count — 2 on the production box — two stalled requests park the
+            // WHOLE runtime, so it stops accepting connections at all.
+            //
+            // Measured on the producer, 2026-08-09: getblockcount took 30.01s
+            // and 20.42s back to back while createauxblock returned in 0.01s.
+            // The pool proxy times out at 10s and retries ~1/s, so the accept
+            // queue filled (129 pending against a backlog of 128) and the node
+            // never recovered on its own — only a restart cleared it, which is
+            // why a watchdog was papering over this.
+            //
+            // Hand the whole dispatch to the blocking pool so worker threads
+            // stay free to accept and poll. `block_on` is legal here precisely
+            // because a spawn_blocking thread is not a runtime worker.
+            let d_state  = state.clone();
+            let d_method = method.to_string();
+            let d_params = params.cloned();
+            let d_handle = tokio::runtime::Handle::current();
+            let result = tokio::task::spawn_blocking(move || {
+                d_handle.block_on(dispatch(&d_method, d_params.as_ref(), &d_state))
+            })
                 .instrument(tracing::info_span!(
                     "rpc_request",
                     method,
                     client_ip = %client_ip,
                     id = %id,
                 ))
-                .await;
+                .await
+                .unwrap_or_else(|e| {
+                    log::error!("rpc dispatch task failed: {}", e);
+                    json!({ "error": "internal dispatch failure" })
+                });
             let elapsed = start.elapsed();
             let elapsed_ms = elapsed.as_millis();
             crate::metrics::observe_rpc_latency(method, elapsed.as_secs_f64());
@@ -280,6 +317,15 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 "peers":           s.peer_count,
                 "mempool":         s.mempool_size,
                 "syncing":         s.is_syncing,
+                // Honest-lag fields: `best_announced` is the highest blue_score
+                // any CONNECTED peer claims (untrusted hint); `behind_by` is how
+                // far our selected tip trails it. A node that gave up on an
+                // unreachable frontier used to report syncing:false and NOTHING
+                // else — operators and the explorer could not see real lag.
+                // behind_by > 0 with syncing:false means "released by the lag
+                // tolerance or gave up", not "provably at the network tip".
+                "best_announced":  s.best_announced_blue_score,
+                "behind_by":       s.best_announced_blue_score.saturating_sub(s.tip_blue_score),
                 "chain":           "bloch-sis",
                 "pruned_height":   pruned_h,
             })
@@ -437,8 +483,12 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             let addr_bytes = parse_address(addr);
             match addr_bytes {
                 Some(ab) => match state.store.get_balance(&ab) {
+                    // R3 (docs/specs/BLOCH-RPC-V4.md): satoshi amounts are
+                    // decimal STRINGS on the wire — V4's supply exceeds both
+                    // i64::MAX and JS Number.MAX_SAFE_INTEGER. Display-only
+                    // `*_bloch` floats stay JSON numbers (documented lossy).
                     Ok((sats, utxo_count)) => json!({
-                        "satoshis":   sats,
+                        "satoshis":   sats.to_string(),
                         "bloch":       sats as f64 / 1e8,
                         "utxo_count": utxo_count,
                         "address":    addr,
@@ -477,20 +527,21 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                         let full_count = utxos.len();
                         let iter = utxos.iter();
                         let list: Vec<Value> = match limit {
+                            // R3: `value` is a satoshi amount → decimal string.
                             Some(n) => iter.take(n).map(|(txid, idx, out)| json!({
                                 "txid": hex::encode(txid), "index": idx,
-                                "value": out.value, "script_pubkey": hex::encode(&out.script_pubkey),
+                                "value": out.value.to_string(), "script_pubkey": hex::encode(&out.script_pubkey),
                             })).collect(),
                             None => iter.map(|(txid, idx, out)| json!({
                                 "txid": hex::encode(txid), "index": idx,
-                                "value": out.value, "script_pubkey": hex::encode(&out.script_pubkey),
+                                "value": out.value.to_string(), "script_pubkey": hex::encode(&out.script_pubkey),
                             })).collect(),
                         };
                         json!({
                             "address":    addr,
                             "utxo_count": full_count,
                             "returned":   list.len(),
-                            "satoshis":   total,
+                            "satoshis":   total.to_string(),
                             "bloch":       total as f64 / 1e8,
                             "utxos":      list,
                         })
@@ -578,7 +629,8 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
         "estimatefee" => {
             let median = state.mempool.median_fee();
             json!({
-                "feerate_sats":  median,
+                // R3: satoshi amount → decimal string.
+                "feerate_sats":  median.to_string(),
                 "feerate_bloch":  median as f64 / 1e8,
                 "mempool_size":  state.mempool.size(),
                 "note":          "median fee of current mempool entries",
@@ -593,7 +645,8 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 let list: Vec<serde_json::Value> = entries.iter().map(|(txid, fee, added)| {
                     json!({
                         "txid":     hex::encode(txid),
-                        "fee":      fee,
+                        // R3: satoshi amount → decimal string.
+                        "fee":      fee.to_string(),
                         "fee_bloch": *fee as f64 / 1e8,
                         "time":     added,
                     })
@@ -683,7 +736,22 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             let bits = if matches!(crate::core::pow_algorithm(crate::core::node_chain_id()),
                                    crate::core::PowAlgorithm::Sha256d) {
                 // Both SHA-256d chains (Genesis-2 devnet, Genesis-3 mainnet).
-                crate::pow::genesis2_expected_bits(&state.store, height)
+                //
+                // FLAG-DAY core::DIFFICULTY_ANCESTRY_FORK_HEIGHT (gated inside
+                // the function): expected bits are a pure function of the EXACT
+                // `parents` this template serves — the same slice, the same
+                // choke point, accept_block validates on submitblock. This call
+                // site used the legacy order-dependent path unconditionally
+                // (the h=28080 producer-self-reject class of bug). FAIL CLOSED:
+                // no template beats a doomed template.
+                let d = state.dag.read();
+                match crate::pow::genesis2_expected_bits_for_parents(
+                    &state.store, &d, &parents, height,
+                ) {
+                    Ok(b) => b,
+                    Err(e) => return json!({ "error": format!(
+                        "expected bits not derivable from parent ancestry (fail-closed): {}", e) }),
+                }
             } else {
                 crate::pow::next_bits(
                     crate::core::GENESIS_BITS, crate::core::GENESIS_TIMESTAMP, parent_ts, height,
@@ -699,13 +767,23 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 total_fees = total_fees.saturating_add(fee);
                 json!({
                     "txid": hex::encode(tx.txid()),
-                    "fee":  fee,
+                    // R3: satoshi amount → decimal string.
+                    "fee":  fee.to_string(),
                     "data": hex::encode(tx.to_stratum_bytes(true)),
                 })
             }).collect();
 
-            let subsidy = crate::core::tokenomics_v2::block_subsidy_sat(height);
-            let founder_vesting = crate::core::tokenomics_v2::founder_vesting_delta_sat(height);
+            // CONSENSUS: subsidy/vesting are functions of the EMISSION height
+            // (local + CARRYOVER_SOURCE_HEIGHT on carry-over chains), exactly
+            // as validate_coinbase_value computes them. This call site used the
+            // LOCAL height — latent while both fell in the same 8,400 epoch,
+            // but from the Emission V3 flag-day (local 40,000) onward it would
+            // hand pools an 8,400-BLCH template that consensus rejects at
+            // 2,600. Same single-gated-function rule as the miner (main.rs)
+            // and stratum (jobs.rs) paths.
+            let emission_h = crate::core::emission_height(height);
+            let subsidy = crate::core::tokenomics_v2::block_subsidy_sat(emission_h);
+            let founder_vesting = crate::core::tokenomics_v2::founder_vesting_delta_sat(emission_h);
 
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -714,14 +792,20 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             json!({
                 "parents":              parents.iter().map(hex::encode).collect::<Vec<_>>(),
                 "height":               height,
+                // The emission height the subsidy was computed at, so external
+                // pool software can re-derive/verify the subsidy through
+                // tokenomics_v2::block_subsidy_sat without knowing the chain's
+                // carry-over offset.
+                "emission_height":      emission_h,
                 "blue_score":           blue_score,
                 "bits":                 bits,
                 "cur_time":             now,
                 "parent_time":          parent_ts,
-                "subsidy_sat":          subsidy,
-                "founder_vesting_sat":  founder_vesting,
+                // R3: satoshi amounts → decimal strings.
+                "subsidy_sat":          subsidy.to_string(),
+                "founder_vesting_sat":  founder_vesting.to_string(),
                 "founder_address_hash": hex::encode(crate::core::tokenomics_v2::founder_address_hash()),
-                "total_fees":           total_fees,
+                "total_fees":           total_fees.to_string(),
                 "transactions":         tx_entries,
                 // Honesty marker: the PoW regime this chain runs. Shares /
                 // blocks are SHAKE-256 hashcash difficulty with a small-k
@@ -786,7 +870,23 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 let max_bs = tips.iter().filter_map(|t| d.get_block_data(t)).map(|dd| dd.blue_score).max().unwrap_or(0);
                 (tips, max_h + 1, max_bs + 1)
             };
-            let bits = crate::pow::genesis2_expected_bits(&state.store, height);
+            // FLAG-DAY core::DIFFICULTY_ANCESTRY_FORK_HEIGHT (gated inside the
+            // function): pure function of the EXACT `parents` this candidate
+            // carries — same choke point as accept_block. Merged-mining
+            // candidates are real mainnet blocks (the pool commits this hash
+            // into the BTC coinbase), so a legacy-bits candidate here would be
+            // self-rejected exactly like the h=28080 stratum incident. FAIL
+            // CLOSED on unreadable ancestry.
+            let bits = {
+                let d = state.dag.read();
+                match crate::pow::genesis2_expected_bits_for_parents(
+                    &state.store, &d, &parents, height,
+                ) {
+                    Ok(b) => b,
+                    Err(e) => return json!({ "error": format!(
+                        "expected bits not derivable from parent ancestry (fail-closed): {}", e) }),
+                }
+            };
             let txs = state.mempool.get_for_block(2000);
             let total_fees: u64 = txs
                 .iter()
@@ -900,7 +1000,8 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                                     "timestamp":     timestamp,
                                     "confirmations": tip.saturating_sub(e.height),
                                     "direction":     e.direction_str(),
-                                    "amount_sats":   e.amount,
+                                    // R3: satoshi amount → decimal string.
+                                    "amount_sats":   e.amount.to_string(),
                                     "amount_bloch":   e.amount as f64 / 1e8,
                                 })
                             }).collect();
@@ -963,10 +1064,13 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             use crate::core::tokenomics_v2 as v2;
             let current_height = state.node_state.read().block_count;
             let next_height    = current_height.saturating_add(1);
-            let subsidy        = v2::block_subsidy_sat(next_height);
+            // Subsidy is a function of the EMISSION height (carry-over offset),
+            // same gated function as consensus — see validate_coinbase_value.
+            let next_emission_h = crate::core::emission_height(next_height);
+            let subsidy        = v2::block_subsidy_sat(next_emission_h);
             let (miner_subsidy, validator_subsidy, oracle_subsidy) =
                 v2::split_subsidy_sat(subsidy);
-            let founder_vesting = v2::founder_vesting_delta_sat(next_height);
+            let founder_vesting = v2::founder_vesting_delta_sat(next_emission_h);
             let vesting_per_month_sat: u64 = v2::founder_monthly_tranche_sat();
 
             let validator_pool = match v2::VALIDATOR_POOL_ADDRESS_HASH {
@@ -974,10 +1078,11 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                     let (balance, utxo_count) = state.store.get_balance(&h).unwrap_or((0, 0));
                     json!({
                         "share_bps":             v2::VALIDATOR_SHARE_BPS,
-                        "subsidy_per_block_sat": validator_subsidy,
+                        // R3: satoshi amounts → decimal strings.
+                        "subsidy_per_block_sat": validator_subsidy.to_string(),
                         "address_hash_hex":      hex::encode(h),
                         "address":               crate::crypto::address_from_hash(&h, false),
-                        "balance_sat":           balance,
+                        "balance_sat":           balance.to_string(),
                         "balance_bloch":          balance as f64 / 1e8,
                         "utxo_count":            utxo_count,
                         "status":                "active",
@@ -985,10 +1090,10 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 }
                 None => json!({
                     "share_bps":             v2::VALIDATOR_SHARE_BPS,
-                    "subsidy_per_block_sat": validator_subsidy,
+                    "subsidy_per_block_sat": validator_subsidy.to_string(),
                     "address_hash_hex":      null,
                     "address":               null,
-                    "balance_sat":           0,
+                    "balance_sat":           "0",
                     "balance_bloch":          0.0,
                     "utxo_count":            0,
                     "status":                "pending_phase_6",
@@ -1000,10 +1105,10 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                     let (balance, utxo_count) = state.store.get_balance(&h).unwrap_or((0, 0));
                     json!({
                         "share_bps":             v2::ORACLE_SHARE_BPS,
-                        "subsidy_per_block_sat": oracle_subsidy,
+                        "subsidy_per_block_sat": oracle_subsidy.to_string(),
                         "address_hash_hex":      hex::encode(h),
                         "address":               crate::crypto::address_from_hash(&h, false),
-                        "balance_sat":           balance,
+                        "balance_sat":           balance.to_string(),
                         "balance_bloch":          balance as f64 / 1e8,
                         "utxo_count":            utxo_count,
                         "status":                "active",
@@ -1011,10 +1116,10 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 }
                 None => json!({
                     "share_bps":             v2::ORACLE_SHARE_BPS,
-                    "subsidy_per_block_sat": oracle_subsidy,
+                    "subsidy_per_block_sat": oracle_subsidy.to_string(),
                     "address_hash_hex":      null,
                     "address":               null,
-                    "balance_sat":           0,
+                    "balance_sat":           "0",
                     "balance_bloch":          0.0,
                     "utxo_count":            0,
                     "status":                "pending_phase_6",
@@ -1026,14 +1131,15 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                     let (balance, utxo_count) = state.store.get_balance(&h).unwrap_or((0, 0));
                     json!({
                         "share_bps":                  null,
-                        "vesting_per_month_sat":      vesting_per_month_sat,
-                        "vesting_amount_at_next_sat": founder_vesting,
+                        // R3: satoshi amounts → decimal strings.
+                        "vesting_per_month_sat":      vesting_per_month_sat.to_string(),
+                        "vesting_amount_at_next_sat": founder_vesting.to_string(),
                         "vesting_active_at_next":     founder_vesting > 0,
-                        "vesting_total_sat":          v2::FOUNDER_PREMINE_TOTAL_SAT,
+                        "vesting_total_sat":          v2::FOUNDER_PREMINE_TOTAL_SAT.to_string(),
                         "vesting_months":             v2::FOUNDER_VESTING_MONTHS,
                         "address_hash_hex":           hex::encode(h),
                         "address":                    crate::crypto::address_from_hash(&h, false),
-                        "balance_sat":                balance,
+                        "balance_sat":                balance.to_string(),
                         "balance_bloch":               balance as f64 / 1e8,
                         "utxo_count":                 utxo_count,
                         "status":                     "active",
@@ -1041,14 +1147,14 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 }
                 None => json!({
                     "share_bps":                  null,
-                    "vesting_per_month_sat":      vesting_per_month_sat,
-                    "vesting_amount_at_next_sat": founder_vesting,
+                    "vesting_per_month_sat":      vesting_per_month_sat.to_string(),
+                    "vesting_amount_at_next_sat": founder_vesting.to_string(),
                     "vesting_active_at_next":     founder_vesting > 0,
-                    "vesting_total_sat":          v2::FOUNDER_PREMINE_TOTAL_SAT,
+                    "vesting_total_sat":          v2::FOUNDER_PREMINE_TOTAL_SAT.to_string(),
                     "vesting_months":             v2::FOUNDER_VESTING_MONTHS,
                     "address_hash_hex":           null,
                     "address":                    null,
-                    "balance_sat":                0,
+                    "balance_sat":                "0",
                     "balance_bloch":               0.0,
                     "utxo_count":                 0,
                     "status":                     "pending_phase_6",
@@ -1058,9 +1164,10 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             json!({
                 "current_height":         current_height,
                 "next_block_height":      next_height,
-                "subsidy_per_block_sat":  subsidy,
+                // R3: satoshi amounts → decimal strings.
+                "subsidy_per_block_sat":  subsidy.to_string(),
                 "subsidy_per_block_bloch": subsidy as f64 / 1e8,
-                "miner_share_sat":        miner_subsidy,
+                "miner_share_sat":        miner_subsidy.to_string(),
                 "pools": {
                     "validator_pool": validator_pool,
                     "oracle_pool":    oracle_pool,
@@ -1101,14 +1208,15 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                     let tiers: Vec<Value> = d.tiers.iter().map(|t| json!({
                         "label":          t.label,
                         "address_count":  t.address_count,
-                        "total_sats":     t.total_sats,
+                        // R3: satoshi amount → decimal string.
+                        "total_sats":     t.total_sats.to_string(),
                         "total_bloch":     t.total_bloch,
                         "pct_of_supply":  t.pct_of_supply,
                     })).collect();
                     json!({
                         "tiers":            tiers,
                         "total_addresses":  d.total_addresses,
-                        "total_sats":       d.total_sats,
+                        "total_sats":       d.total_sats.to_string(),
                         "total_bloch":       d.total_bloch,
                     })
                 }
@@ -1229,11 +1337,12 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             match crate::analytics::address_info(&state.store, &state.mempool, addr_str, &addr_hash) {
                 Ok(info) => json!({
                     "address":           info.address,
-                    "balance_sats":      info.balance_sats,
+                    // R3: satoshi amounts → decimal strings.
+                    "balance_sats":      info.balance_sats.to_string(),
                     "balance_bloch":      info.balance_bloch,
                     "utxo_count":        info.utxo_count,
-                    "pending_incoming":  info.pending_incoming,
-                    "pending_outgoing":  info.pending_outgoing,
+                    "pending_incoming":  info.pending_incoming.to_string(),
+                    "pending_outgoing":  info.pending_outgoing.to_string(),
                     "pool_role":         info.pool_role,
                 }),
                 Err(e) => json!({ "error": e }),
@@ -1243,10 +1352,11 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
         "estimatefeeadvanced" => {
             let fee = crate::analytics::estimate_fee_advanced(&state.mempool);
             json!({
-                "next_block_sats":  fee.next_block_sats,
-                "medium_priority":  fee.medium_priority,
-                "slow_priority":    fee.slow_priority,
-                "mempool_median":   fee.mempool_median,
+                // R3: satoshi amounts → decimal strings.
+                "next_block_sats":  fee.next_block_sats.to_string(),
+                "medium_priority":  fee.medium_priority.to_string(),
+                "slow_priority":    fee.slow_priority.to_string(),
+                "mempool_median":   fee.mempool_median.to_string(),
                 "mempool_size":     fee.mempool_size,
                 "recommended_bloch": format!("{:.8}", fee.medium_priority as f64 / 1e8),
             })
@@ -1260,10 +1370,12 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             })).collect();
             json!({
                 "size":        stats.size,
-                "total_fees":  stats.total_fees,
-                "min_fee":     stats.min_fee,
-                "max_fee":     stats.max_fee,
-                "median_fee":  stats.median_fee,
+                // R3: satoshi amounts → decimal strings (`avg_fee` is a
+                // documented-lossy float, so it stays a JSON number).
+                "total_fees":  stats.total_fees.to_string(),
+                "min_fee":     stats.min_fee.to_string(),
+                "max_fee":     stats.max_fee.to_string(),
+                "median_fee":  stats.median_fee.to_string(),
                 "avg_fee":     stats.avg_fee,
                 "buckets":     buckets,
             })
@@ -1341,7 +1453,8 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                                     "size_bytes":     size_bytes,
                                     "inputs_count":   tx.inputs.len(),
                                     "outputs_count":  tx.outputs.len(),
-                                    "fee_sats":       fee_sats,
+                                    // R3: satoshi amount → decimal string.
+                                    "fee_sats":       fee_sats.to_string(),
                                     "is_coinbase":    tx.is_coinbase(),
                                 })
                             }).collect();
@@ -1382,7 +1495,8 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                             json!({
                                 "address":               addr,
                                 "height":                height,
-                                "balance_sats":          balance,
+                                // R3: satoshi amount → decimal string.
+                                "balance_sats":          balance.to_string(),
                                 "balance_bloch":          balance as f64 / 1e8,
                                 "tx_count_up_to_height": tx_count,
                             })
@@ -1478,7 +1592,8 @@ fn format_tx(tx: &Transaction) -> Value {
         })).collect::<Vec<_>>(),
         "outputs":  tx.outputs.iter().enumerate().map(|(i, out)| json!({
             "index":         i,
-            "value":         out.value,
+            // R3 (docs/specs/BLOCH-RPC-V4.md): satoshi amount → decimal string.
+            "value":         out.value.to_string(),
             "bloch":          out.value as f64 / 1e8,
             "script_pubkey": hex::encode(&out.script_pubkey),
         })).collect::<Vec<_>>(),
@@ -1674,6 +1789,52 @@ pub(crate) fn euvm_admit_tx_standalone(
 //      look for the "parse_address" helper (around line 560+)
 //
 // ═════════════════════════════════════════════════════════════════════════════
+
+// ─────────────────────────────────────────────────────────────────────────────
+// V4 rule R3 (docs/specs/BLOCH-RPC-V4.md): every satoshi-denominated field is a
+// decimal STRING on the JSON-RPC wire. The V4 supply exceeds i64::MAX and is
+// ~1000× JavaScript's Number.MAX_SAFE_INTEGER, so a JSON number silently
+// corrupts large amounts in every browser client. Internally values stay u64.
+// `format_tx` is the shared output formatter behind getblock / gettransaction /
+// decoderawtransaction, so pinning it pins those three response shapes.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod r3_amount_encoding_tests {
+    use super::*;
+    use crate::core::{TxInput, TxOutput};
+
+    fn tx_with_output(value: u64) -> Transaction {
+        Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                prev_txid: [9u8; 32], prev_index: 0, script_sig: vec![], sequence: u32::MAX,
+            }],
+            outputs: vec![TxOutput { value, script_pubkey: vec![5u8; 20] }],
+            locktime: 0,
+        }
+    }
+
+    #[test]
+    fn tx_output_value_serializes_as_a_decimal_string() {
+        let v = format_tx(&tx_with_output(354_617_540_000_000_000));
+        let out = &v["outputs"][0];
+        assert!(out["value"].is_string(), "R3: `value` must be a JSON string, got {}", out["value"]);
+        assert_eq!(out["value"].as_str().unwrap(), "354617540000000000");
+        // The display-only float companion stays a JSON number (lossy by design).
+        assert!(out["bloch"].is_number(), "`bloch` stays a float");
+    }
+
+    #[test]
+    fn amounts_past_the_javascript_safe_integer_survive_the_wire() {
+        // A value above 2^53 round-trips exactly through the string form; the
+        // same value as a JSON number is what R3 exists to prevent.
+        let big = u64::MAX;
+        let v = format_tx(&tx_with_output(big));
+        let s = v["outputs"][0]["value"].as_str().expect("string amount");
+        assert_eq!(s.parse::<u64>().unwrap(), big);
+        assert!(big > 9_007_199_254_740_991, "test value must exceed MAX_SAFE_INTEGER");
+    }
+}
 
 /// Format a hashrate in H/s into human-readable units (H/s, KH/s, MH/s, GH/s, TH/s, PH/s, EH/s).
 fn format_hashrate(hs: f64) -> String {

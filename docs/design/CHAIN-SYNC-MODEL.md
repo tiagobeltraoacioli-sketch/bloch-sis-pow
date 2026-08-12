@@ -1,5 +1,10 @@
 # Bloch Chain-Synchronization Model — PMO Decision Doc
 
+> **Note, 2026-08-11.** Genesis-3 design record. The "ownerless" premise cited
+> below was retracted after this was written (ADR-036, two-entity foundation)
+> and Genesis-3 halts at height 80,000; the sync analysis itself stands as
+> history of the PoW chain.
+
 ## 1. Root-cause framing: three independent failure axes, only one of which is the incident
 
 The wedge ("nodes stall at different heights") is **not a bandwidth problem and not a tuning problem** — it is a *sync-control-plane trust and topology* problem. Separate the three axes cleanly, because the advisors that scored "low/medium fit" all mis-target the wrong axis:

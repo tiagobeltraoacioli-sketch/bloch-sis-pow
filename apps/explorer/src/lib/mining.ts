@@ -1,9 +1,11 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Mining data layer — reuses the existing /rpc client + allowlisted read methods.
 // Nothing here fabricates data: every number traces to a live RPC response, and
 // callers surface a stalled/empty state honestly when the chain isn't advancing.
 
 import { rpc, rpcAllSettled } from "./rpc";
 import { addressFromHashHex } from "./sha3";
+import { toSats } from "./format";
 
 // The Postern reference pool (Stratum). Bare address as the username — the pool
 // rejects `address.worker`, so NEVER append a worker suffix.
@@ -21,9 +23,13 @@ export interface NetParams {
   difficulty: number;
   blockTimeSecs: number; // effective value used for estimates
   blockTimeSource: "measured" | "target";
-  subsidySats: number;
-  minerRewardSats: number; // miner's share of the subsidy
+  // Satoshi amounts are bigint end-to-end: the wire form is a decimal string
+  // (RPC-V4 R3) and the supply cap is ~1110x Number.MAX_SAFE_INTEGER, so num()
+  // must never touch them.
+  subsidySats: bigint;
+  minerRewardSats: bigint; // miner's share of the subsidy
   freshestTs: number;
+  tipHeight: number; // highest recent block seen (0 when unknown)
   stalled: boolean;
   ok: boolean; // did any live source answer
 }
@@ -48,10 +54,11 @@ export async function fetchNetParams(): Promise<NetParams> {
   const usable = measured > 0.5 && measured < 3600;
   const blockTimeSecs = usable ? measured : TARGET_BLOCK_TIME;
 
-  const subsidySats = num(pools.subsidy_per_block_sat) || 0;
-  const minerRewardSats = num(pools.miner_share_sat) || subsidySats;
+  const subsidySats = toSats(pools.subsidy_per_block_sat);
+  const minerRewardSats = toSats(pools.miner_share_sat) || subsidySats;
 
   const freshestTs = recent.length ? Math.max(...recent.map((b: any) => num(b.timestamp))) : 0;
+  const tipHeight = recent.length ? Math.max(...recent.map((b: any) => num(b.height))) : 0;
   const ageSecs = freshestTs ? Date.now() / 1000 - freshestTs : Infinity;
   const stalled = ageSecs > STALL_SECS;
   const ok = !!(r.chain || r.hash || r.pools || r.recent);
@@ -64,6 +71,7 @@ export async function fetchNetParams(): Promise<NetParams> {
     subsidySats,
     minerRewardSats,
     freshestTs,
+    tipHeight,
     stalled,
     ok,
   };
@@ -77,8 +85,8 @@ export interface PoolAddresses {
   founder: string | null;
   validator: string | null;
   oracle: string | null;
-  minerShareSats: number;
-  subsidySats: number;
+  minerShareSats: bigint;
+  subsidySats: bigint;
 }
 
 export async function fetchPoolAddresses(): Promise<PoolAddresses> {
@@ -94,8 +102,8 @@ export async function fetchPoolAddresses(): Promise<PoolAddresses> {
     founder,
     validator,
     oracle,
-    minerShareSats: num(pools?.miner_share_sat),
-    subsidySats: num(pools?.subsidy_per_block_sat),
+    minerShareSats: toSats(pools?.miner_share_sat),
+    subsidySats: toSats(pools?.subsidy_per_block_sat),
   };
 }
 
@@ -104,7 +112,7 @@ export interface MinerBlock {
   height: number;
   timestamp: number;
   miner: string | null; // derived bloch1q… address of the coinbase miner output
-  rewardSats: number; // value of the miner output
+  rewardSats: bigint; // value of the miner output
   txCount: number;
 }
 
@@ -126,7 +134,7 @@ export async function scanMinerBlocks(limit: number, pools: PoolAddresses): Prom
         height: num(meta.height),
         timestamp: num(meta.timestamp),
         miner: null,
-        rewardSats: 0,
+        rewardSats: 0n,
         txCount: num(meta.tx_count),
       });
       return;
@@ -134,14 +142,17 @@ export async function scanMinerBlocks(limit: number, pools: PoolAddresses): Prom
     const txs = blk.transactions || [];
     const cb = txs.find((t: any) => t.coinbase) || txs[0];
     let miner: string | null = null;
-    let rewardSats = 0;
+    let rewardSats = 0n;
     if (cb && Array.isArray(cb.outputs)) {
+      // Coinbase output values are satoshis: parse exactly, sort as bigint.
+      // `b.value - a.value` on numbers was picking the miner output from
+      // already-rounded amounts.
       const candidates = cb.outputs
-        .map((o: any) => ({ addr: addressFromHashHex(o.script_pubkey), value: num(o.value) }))
-        .filter((c: any) => !!c.addr) as { addr: string; value: number }[];
+        .map((o: any) => ({ addr: addressFromHashHex(o.script_pubkey), value: toSats(o.value) }))
+        .filter((c: any) => !!c.addr) as { addr: string; value: bigint }[];
       const unknown = candidates.filter((c) => !pools.set.has(c.addr.toLowerCase()));
       const pool = unknown.length ? unknown : candidates;
-      const pick = pool.sort((a, b) => b.value - a.value)[0];
+      const pick = pool.sort((a, b) => (b.value === a.value ? 0 : b.value > a.value ? 1 : -1))[0];
       if (pick) {
         miner = pick.addr;
         rewardSats = pick.value;
@@ -162,7 +173,7 @@ export async function scanMinerBlocks(limit: number, pools: PoolAddresses): Prom
 export interface MinerRank {
   miner: string;
   blocks: number;
-  rewardSats: number;
+  rewardSats: bigint;
   lastHeight: number;
   lastTs: number;
   isFounder: boolean;
@@ -180,7 +191,7 @@ export function rankMiners(blocks: MinerBlock[], pools: PoolAddresses): MinerRan
       ({
         miner: b.miner,
         blocks: 0,
-        rewardSats: 0,
+        rewardSats: 0n,
         lastHeight: 0,
         lastTs: 0,
         isFounder: key === pools.founder,
@@ -198,6 +209,11 @@ export function rankMiners(blocks: MinerBlock[], pools: PoolAddresses): MinerRan
   return [...map.values()].sort((a, b) => b.blocks - a.blocks || b.lastHeight - a.lastHeight);
 }
 
+/**
+ * Coerce a display/metric field to a finite number. NEVER use this on a
+ * satoshi amount — it goes through IEEE-754 and the supply cap is ~1110x
+ * Number.MAX_SAFE_INTEGER. Use toSats() for money.
+ */
 function num(v: any): number {
   const n = typeof v === "string" ? Number(v) : v;
   return typeof n === "number" && isFinite(n) ? n : 0;

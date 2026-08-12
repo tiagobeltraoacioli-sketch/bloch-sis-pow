@@ -8,7 +8,7 @@
 
 import type { FaucetConfig } from "./config.js";
 import { isTestnetAddress, parseAddress } from "./address.js";
-import { RpcClient, RpcError, type Utxo } from "./rpc.js";
+import { RpcClient, RpcError, parseSats, type Utxo } from "./rpc.js";
 import type { PaymentJob, Signer } from "./signer.js";
 
 export interface DripSuccess {
@@ -35,14 +35,23 @@ export class Faucet {
     private readonly signer: Signer,
   ) {}
 
-  /** Greedy coin selection: enough UTXOs to cover amount + fee. */
-  private selectUtxos(utxos: Utxo[], target: number): { selected: Utxo[]; total: number } | null {
-    const sorted = [...utxos].sort((a, b) => b.value - a.value);
+  /**
+   * Greedy coin selection: enough UTXOs to cover amount + fee.
+   *
+   * All arithmetic is bigint. `Utxo.value` is the wire union `string | number`
+   * (RPC-V4 R3), so the previous `b.value - a.value` / `total += u.value` gave
+   * NaN and string concatenation respectively against a V4 node — and against a
+   * legacy node it silently rounded any amount past 2^53 sat.
+   */
+  private selectUtxos(utxos: Utxo[], target: bigint): { selected: Utxo[]; total: bigint } | null {
+    const parsed = utxos
+      .map((u) => ({ u, v: parseSats(u.value, "utxo value") }))
+      .sort((a, b) => (b.v === a.v ? 0 : b.v > a.v ? 1 : -1));
     const selected: Utxo[] = [];
-    let total = 0;
-    for (const u of sorted) {
+    let total = 0n;
+    for (const { u, v } of parsed) {
       selected.push(u);
-      total += u.value;
+      total += v;
       if (total >= target) return { selected, total };
     }
     return null;
@@ -74,7 +83,10 @@ export class Faucet {
       return { ok: false, error: "FAUCET_FUNDING_ADDRESS is not configured", code: "misconfigured" };
     }
 
-    const target = this.cfg.amountSats + this.cfg.feeSats;
+    // Config amounts are operator-set env ints; parseSats still range-checks
+    // them so a fat-fingered FAUCET_AMOUNT_SATS fails loudly, not silently.
+    const target = parseSats(this.cfg.amountSats, "FAUCET_AMOUNT_SATS") +
+      parseSats(this.cfg.feeSats, "FAUCET_FEE_SATS");
 
     // 3) Fetch funding UTXOs.
     let funding;
@@ -87,7 +99,9 @@ export class Faucet {
     if (!pick) {
       return {
         ok: false,
-        error: `faucet funding wallet has insufficient test BLCH (need ${target} sat, have ${funding.satoshis} sat)`,
+        error:
+          `faucet funding wallet has insufficient test BLCH ` +
+          `(need ${target} sat, have ${parseSats(funding.satoshis, "funding balance")} sat)`,
         code: "faucet_empty",
       };
     }

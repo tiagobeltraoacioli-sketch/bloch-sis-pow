@@ -1,0 +1,11 @@
+[package]
+name = "rv32-falcon-verify"
+version = "0.1.0"
+edition = "2021"
+[workspace]
+[dependencies]
+tide-fn-dsa-vrfy = { version = "0.4", features = ["no_avx2"] }
+[profile.release]
+opt-level = 3
+panic = "abort"
+lto = true

@@ -244,6 +244,33 @@ fn verify_mldsa65_only(pk_body: &[u8], message: &[u8], sig_body: &[u8]) -> bool 
     mldsa65::verify_detached_signature(&sig, message, &pk).is_ok()
 }
 
+/// Verify a raw (non-enveloped) ML-DSA-65 detached signature — the public
+/// counterpart of [`falcon::verify`] for the other half of the hybrid.
+///
+/// The Genesis-4 weak-subjectivity envelope verifier
+/// (`bloch-pos-committee::ws` via the node's `HybridKeyVerifier`
+/// implementation) receives the two hybrid halves already split at the fixed
+/// points and must verify each under its own primitive. Exported so that
+/// caller does not have to counterfeit a suite envelope to reach the ML-DSA
+/// body verifier — one primitive, one entry point per half. Exact-length
+/// bodies required; malformed input ⇒ `false`, never a panic (consensus
+/// rule).
+pub fn verify_mldsa65_raw(public_key_bytes: &[u8], message: &[u8], signature_bytes: &[u8]) -> bool {
+    verify_mldsa65_only(public_key_bytes, message, signature_bytes)
+}
+
+/// Split a suite-enveloped object (public key, secret key, or signature) into
+/// `(suite_id, body)`, or `None` if the bytes carry no valid envelope header.
+///
+/// Public for Genesis-4 node tooling that must re-frame enveloped objects
+/// into the raw halves the PoS committee crate consumes (weak-subjectivity
+/// checkpoint envelopes carry raw `mldsa ‖ falcon` bodies, not suite
+/// envelopes). Read-only view; exposing it here keeps the 4-byte header
+/// format defined in exactly one place.
+pub fn split_envelope(bytes: &[u8]) -> Option<(u16, &[u8])> {
+    parse_envelope(bytes)
+}
+
 pub fn address_from_pubkey(public_key: &[u8], testnet: bool) -> String {
     let hash = Sha3_256::digest(public_key);
     let mut payload = [0u8; 20];
@@ -398,10 +425,12 @@ mod tests {
 // The second signature of the hybrid ML-DSA-65 ‖ Falcon-1024 scheme: two
 // distinct lattice families (NTRU vs Module-LWE/SIS) for defence in depth — a
 // break of one assumption does not forge a signature. Falcon verification is
-// deterministic (integer), so it is consensus-safe; Falcon *signing* uses
-// floating-point Gaussian sampling and may differ across platforms, which is
-// fine for randomized signatures (only deterministic seed→sig reproducibility
-// is affected — see the B6 notes).
+// deterministic (integer), so it is consensus-safe. Falcon *signing* is pinned
+// to PQClean's `clean` variant (PoS finding F1, BLOCH-FALCON-ONLINE-SIGNING.md
+// §3.2): integer-only emulated IEEE-754 Gaussian sampling, constant-time by
+// construction and bit-exact across platforms — the native floating-point
+// variants (avx2/aarch64) are excluded via `default-features = false` and
+// guarded by the tripwire test + KAT below and scripts/falcon-clean-guard.sh.
 pub mod falcon {
     use pqcrypto_falcon::falcon1024;
     use pqcrypto_traits::sign::{PublicKey, SecretKey, DetachedSignature};
@@ -444,6 +473,148 @@ pub mod falcon {
             assert!(!verify(&pk, b"other message", &sig), "wrong message must fail");
             let mut bad = sig.clone(); bad[0] ^= 0x01;
             assert!(!verify(&pk, msg, &bad), "tampered sig must fail");
+        }
+
+        // ── F1 guard: the constant-time `clean` path must be the ONLY Falcon ──
+        // implementation in the binary (BLOCH-FALCON-ONLINE-SIGNING.md §3.2).
+        //
+        // `pqcrypto-falcon`'s DEFAULT features ("avx2", "neon") compile PQClean's
+        // native floating-point variants and runtime-dispatch signing to them
+        // (AVX2 doubles on x86_64, `typedef double fpr` on aarch64). A PoS
+        // validator signs on a publicly known schedule, so Falcon signing must
+        // run PQClean's `clean` variant: integer-emulated IEEE-754, constant-time
+        // by construction. The workspace therefore declares the crate with
+        // `default-features = false`.
+        //
+        // A Cargo.toml declaration alone is not proof — features are ADDITIVE,
+        // so any workspace member (or a future dependency) re-enabling the
+        // defaults silently restores native-FP dispatch for every build. This
+        // test inspects the test executable itself: when the avx2/neon features
+        // are off, the FP variants' C files are never compiled and their symbols
+        // (`PQCLEAN_FALCON1024_AVX2_*`, `PQCLEAN_FALCON1024_AARCH64_*`) cannot
+        // exist in the binary; when a feature is re-enabled, the dispatch code
+        // references them and the linker must keep them. Symbol ABSENCE is
+        // therefore a faithful tripwire, on every target, for "the constant-time
+        // path is the only path".
+        //
+        // The needles are assembled at runtime from fragments so the test's own
+        // string literals cannot produce a false positive in the scan.
+
+        /// Plain forward byte-substring scan (no regex/memmem dependency).
+        fn binary_contains(haystack: &[u8], needle: &[u8]) -> bool {
+            if needle.is_empty() || haystack.len() < needle.len() {
+                return false;
+            }
+            let first = needle[0];
+            let mut i = 0;
+            while i + needle.len() <= haystack.len() {
+                if haystack[i] == first && &haystack[i..i + needle.len()] == needle {
+                    return true;
+                }
+                i += 1;
+            }
+            false
+        }
+
+        #[test]
+        fn falcon_native_fp_variants_are_not_linked() {
+            let exe = std::env::current_exe().expect("current_exe");
+            let bytes = std::fs::read(&exe).expect("read test executable");
+
+            // Assembled at runtime — the concatenated needle never appears as a
+            // contiguous literal in this test's own rodata.
+            let sym = |variant: &str| format!("PQCLEAN_{}{}_{}_crypto_sign", "FALCON", "1024", variant);
+            let clean = sym("CLEAN");
+            let avx2 = sym("AVX2");
+            let aarch64 = sym("AARCH64");
+
+            // Control: the `clean` symbols MUST be visible. If this fails, the
+            // binary's symbol names are not observable (e.g. stripped test
+            // binary) and the absence checks below would be vacuous — fail
+            // loudly instead of false-passing.
+            assert!(
+                binary_contains(&bytes, clean.as_bytes()),
+                "control failed: `{clean}` not found in {} — symbol names are not \
+                 observable in this binary, so this guard cannot run (is the test \
+                 binary stripped?)",
+                exe.display()
+            );
+
+            // Tripwire: no native floating-point Falcon variant may be linked.
+            for fp in [&avx2, &aarch64] {
+                assert!(
+                    !binary_contains(&bytes, fp.as_bytes()),
+                    "NATIVE FLOATING-POINT Falcon implementation `{fp}` is linked \
+                     into the binary. Someone re-enabled pqcrypto-falcon's default \
+                     features (avx2/neon) somewhere in the workspace. Under PoS the \
+                     validator signs on a public schedule and must use PQClean's \
+                     integer-only constant-time `clean` variant exclusively — see \
+                     BLOCH-FALCON-ONLINE-SIGNING.md §3.2 and the pqcrypto-falcon \
+                     entries in Cargo.toml (`default-features = false`)."
+                );
+            }
+        }
+
+        // ── F1 KAT: seeded Falcon-1024 keygen + sign pinned byte-for-byte ────
+        //
+        // Purpose: prove the switch to the `clean` variant did NOT change the
+        // wire format or the produced bytes. PQClean requires all variants of a
+        // scheme to be KAT-compatible (same randombytes stream → same key/sig
+        // bytes), so these pins hold across `clean`/avx2/aarch64 AND across
+        // platforms — `clean` is bit-exact integer emulation. A dependency bump
+        // that changed the produced bytes (format break, sampler change, e.g. a
+        // silent move to FN-DSA semantics) fails here before it can hit
+        // consensus. NOTE: precisely because the variants are KAT-compatible,
+        // this test does NOT prove which variant runs — that is
+        // `falcon_native_fp_variants_are_not_linked`'s job. The two tests
+        // together are the guard.
+        //
+        // Seeded signing is REGRESSION PINNING ONLY: production Falcon signing
+        // must stay randomized (fresh salt per signature — the property that
+        // neutralizes the "Sleeping Falcon" FP-divergence attack, eprint
+        // 2024/1709). Never seed the RNG around a production signer.
+        #[test]
+        fn falcon_clean_seeded_kat_is_byte_stable_and_verifies() {
+            use sha3::{Digest, Sha3_256};
+
+            const KAT_SEED: [u8; 32] = [0xB1; 32];
+            const KAT_MSG: &[u8] = b"bloch-pos-falcon-clean-kat-v1";
+
+            // Pinned on pqcrypto-falcon 0.4.1, `clean` variant (aarch64 host;
+            // bit-exact on every platform by construction).
+            const KAT_PK_HASH: &str =
+                "afc79ea102992a5081b8172b55fb7c14e01ff2a74501a8577d1fe4df094c2375";
+            const KAT_SIG_HASH: &str =
+                "645bf4db96650515c016aa1f615b78ad4dac5985363abdfbb8a3e0fc4a5d2e24";
+            const KAT_SIG_LEN: usize = 1271;
+
+            let (pk, sk, sig) = {
+                let _guard = pqcrypto_internals::with_seeded_rng(&KAT_SEED);
+                let (pk, sk) = keypair();
+                let sig = sign(&sk, KAT_MSG).expect("seeded falcon sign");
+                (pk, sk, sig)
+            };
+            // Falcon signatures are variable-length in general; under a fixed
+            // randomness stream the length is fixed too, so pin it as well.
+            assert_eq!(sig.len(), KAT_SIG_LEN, "seeded Falcon signature length drifted");
+            assert_eq!(
+                hex::encode(Sha3_256::digest(&pk)),
+                KAT_PK_HASH,
+                "seeded Falcon-1024 public key drifted from the pinned KAT"
+            );
+            assert_eq!(
+                hex::encode(Sha3_256::digest(&sig)),
+                KAT_SIG_HASH,
+                "seeded Falcon-1024 signature drifted from the pinned KAT"
+            );
+
+            // Compatibility both ways: the pinned signature verifies, and a
+            // fresh (OS-randomness) signature under the same key verifies too —
+            // the format change surface is zero.
+            assert!(verify(&pk, KAT_MSG, &sig), "pinned KAT signature must verify");
+            let fresh = sign(&sk, KAT_MSG).expect("randomized falcon sign");
+            assert!(verify(&pk, KAT_MSG, &fresh), "randomized signature must verify");
+            assert_ne!(fresh, sig, "production signing must remain randomized (fresh salt)");
         }
     }
 }

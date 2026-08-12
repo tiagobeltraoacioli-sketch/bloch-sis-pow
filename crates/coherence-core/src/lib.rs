@@ -52,6 +52,213 @@ fn merkle_parent(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
     shake256_32(&[DOM_MT, left, right])
 }
 
+// ── Nullifier set (sparse Merkle tree, SHAKE-256) — C1.1 ─────────────────────
+//
+// C1 froze "the global nullifier set" as consensus state but never defined its
+// commitment; the set lived as a bare `HashSet` with no canonical root (finding
+// F9 of `BLOCH-COHERENCE-UNDER-POS.md`). Under PoS that gap becomes load
+// bearing: `state_root` must commit the set, so the set needs a root, and the
+// root must be a function of the *set* rather than of anyone's insertion order.
+//
+// Ratified in `docs/specs/COHERENCE-C1.1.md`. This is an addition to C1, not a
+// change to it: nothing C1 froze moves.
+
+/// Domain tag for the nullifier-set tree. Distinct from `DOM_MT` so a node of
+/// this tree can never be reinterpreted as a node of the commitment tree.
+const DOM_NFSET: &[u8] = b"bloch:coherence:nfset:v1";
+
+/// Depth of the nullifier-set tree: one level per bit of a nullifier.
+///
+/// The nullifier IS the key, so the tree spans the whole 256-bit keyspace and
+/// membership is positional — there is no ordering to agree on and no leaf
+/// index to assign. That is the difference from [`CommitmentTree`], where a
+/// note's *position* is consensus (it is bound into the nullifier, §1.3) and
+/// therefore insertion order is too.
+pub const NFSET_DEPTH: usize = 256;
+
+/// The leaf stored at an occupied key. Any fixed non-empty value works; this
+/// one is domain-separated so it cannot collide with a hash of anything else.
+fn nfset_present() -> [u8; 32] {
+    shake256_32(&[DOM_NFSET, b"present"])
+}
+
+fn nfset_parent(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+    shake256_32(&[DOM_NFSET, left, right])
+}
+
+/// `empty[d]` = root of an all-empty subtree of height `d`.
+fn nfset_empty_roots() -> [[u8; 32]; NFSET_DEPTH + 1] {
+    let mut e = [[0u8; 32]; NFSET_DEPTH + 1];
+    e[0] = shake256_32(&[DOM_NFSET, b"empty-leaf"]);
+    for d in 1..=NFSET_DEPTH {
+        e[d] = nfset_parent(&e[d - 1], &e[d - 1]);
+    }
+    e
+}
+
+/// Bit `d` of `key`, MSB first — the direction taken at depth `d` walking down
+/// from the root.
+fn nfset_bit(key: &[u8; 32], d: usize) -> bool {
+    (key[d / 8] >> (7 - (d % 8))) & 1 == 1
+}
+
+/// The spent-nullifier set and its canonical root.
+///
+/// A **sparse** Merkle tree keyed by the nullifier itself. Two properties are
+/// the reason for choosing it over the cheaper running hash `H(prev ‖ nf)`:
+///
+/// 1. **The root is a function of the set.** A running hash makes insertion
+///    order consensus, so two honest nodes that applied the same blocks in a
+///    different order — or that undid and redid a reorg — would commit
+///    different roots for identical state.
+/// 2. **Non-membership is provable.** What a spend verifier actually needs is
+///    "`nf` is *not* in the set as of this anchor", and a hash chain cannot
+///    show that. [`NullifierSet::non_membership_proof`] returns the sibling
+///    path; [`verify_non_membership`] checks it against a root, so a light
+///    client or a pruning proof (§6.6.4) can be convinced without the set.
+///
+/// Insert-only in normal operation (§6.6.1); [`NullifierSet::remove`] exists
+/// solely for reorg undo, driven by the block's recorded nullifiers.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NullifierSet {
+    /// Sorted for determinism: the root is computed by descending this slice,
+    /// so the traversal — and therefore the hashing — is a function of the set.
+    keys: Vec<[u8; 32]>,
+}
+
+impl NullifierSet {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Build from any iterator; duplicates collapse, order is irrelevant.
+    pub fn from_iter<I: IntoIterator<Item = [u8; 32]>>(it: I) -> Self {
+        let mut keys: Vec<[u8; 32]> = it.into_iter().collect();
+        keys.sort_unstable();
+        keys.dedup();
+        Self { keys }
+    }
+
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    pub fn contains(&self, nf: &[u8; 32]) -> bool {
+        self.keys.binary_search(nf).is_ok()
+    }
+
+    /// Insert `nf`. Returns false if it was already spent — which is the
+    /// double-spend check itself, so callers must not ignore it.
+    pub fn insert(&mut self, nf: [u8; 32]) -> bool {
+        match self.keys.binary_search(&nf) {
+            Ok(_) => false,
+            Err(i) => {
+                self.keys.insert(i, nf);
+                true
+            }
+        }
+    }
+
+    /// Remove `nf` — **reorg undo only**. The set is monotone in normal
+    /// operation; removing a nullifier that was not undone by a disconnected
+    /// block would resurrect a spent note.
+    pub fn remove(&mut self, nf: &[u8; 32]) -> bool {
+        match self.keys.binary_search(nf) {
+            Ok(i) => {
+                self.keys.remove(i);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &[u8; 32]> {
+        self.keys.iter()
+    }
+
+    /// The canonical root of the set.
+    ///
+    /// Computed by descending only where keys exist: an all-empty subtree
+    /// short-circuits to its precomputed root, so the cost is bounded by the
+    /// occupied paths rather than by the 2^256 keyspace.
+    pub fn root(&self) -> [u8; 32] {
+        let empty = nfset_empty_roots();
+        Self::subtree_root(&self.keys, 0, &empty)
+    }
+
+    /// Root of the subtree at depth `d` spanning exactly `keys` (a contiguous,
+    /// sorted slice of the keys that live under it).
+    fn subtree_root(keys: &[[u8; 32]], d: usize, empty: &[[u8; 32]; NFSET_DEPTH + 1]) -> [u8; 32] {
+        if keys.is_empty() {
+            return empty[NFSET_DEPTH - d];
+        }
+        if d == NFSET_DEPTH {
+            // A leaf: every key that reached here is the same key, since all
+            // 256 bits have been consumed.
+            return nfset_present();
+        }
+        // Sorted keys with a common prefix split on bit `d` into a zero-run
+        // then a one-run, so the split point is a partition, not a filter.
+        let split = keys.partition_point(|k| !nfset_bit(k, d));
+        let l = Self::subtree_root(&keys[..split], d + 1, empty);
+        let r = Self::subtree_root(&keys[split..], d + 1, empty);
+        nfset_parent(&l, &r)
+    }
+
+    /// Sibling path proving `nf` is **absent**, root-to-leaf order reversed to
+    /// leaf-to-root (index `d` is the sibling met at depth `NFSET_DEPTH-1-d`
+    /// on the way up), matching [`verify_non_membership`].
+    ///
+    /// Returns `None` if `nf` is present — a caller asking for a proof of a
+    /// spent nullifier has a bug, and a proof-shaped `None` is easier to
+    /// notice than an unusable proof.
+    pub fn non_membership_proof(&self, nf: &[u8; 32]) -> Option<Vec<[u8; 32]>> {
+        if self.contains(nf) {
+            return None;
+        }
+        let empty = nfset_empty_roots();
+        let mut path = Vec::with_capacity(NFSET_DEPTH);
+        let mut keys: &[[u8; 32]] = &self.keys;
+        for d in 0..NFSET_DEPTH {
+            let split = keys.partition_point(|k| !nfset_bit(k, d));
+            let (mine, sibling) = if nfset_bit(nf, d) {
+                (&keys[split..], &keys[..split])
+            } else {
+                (&keys[..split], &keys[split..])
+            };
+            path.push(Self::subtree_root(sibling, d + 1, &empty));
+            keys = mine;
+        }
+        path.reverse();
+        Some(path)
+    }
+}
+
+/// Check a non-membership proof: walking the empty leaf up through `path` under
+/// `nf`'s bits must reproduce `root`.
+pub fn verify_non_membership(nf: &[u8; 32], path: &[[u8; 32]], root: &[u8; 32]) -> bool {
+    if path.len() != NFSET_DEPTH {
+        return false;
+    }
+    let empty = nfset_empty_roots();
+    let mut node = empty[0];
+    for (i, sibling) in path.iter().enumerate() {
+        // `path` is leaf-to-root, so entry `i` is the sibling at depth
+        // `NFSET_DEPTH - 1 - i`.
+        let d = NFSET_DEPTH - 1 - i;
+        node = if nfset_bit(nf, d) {
+            nfset_parent(sibling, &node)
+        } else {
+            nfset_parent(&node, sibling)
+        };
+    }
+    node == *root
+}
+
 // ── Commitment tree (incremental, fixed depth, SHAKE-256) ─────────────────────
 
 /// Append-only Merkle accumulator of note commitments; the root is the anchor.
@@ -369,5 +576,133 @@ mod tests {
             check_spend(&extra_nf, &w),
             Err(SpendError::NullifierCountMismatch { public: 2, witness: 1 })
         );
+    }
+}
+
+#[cfg(test)]
+mod nfset_tests {
+    use super::*;
+
+    fn nf(b: u8) -> [u8; 32] {
+        let mut k = [0u8; 32];
+        k[0] = b;
+        k[31] = b ^ 0xFF;
+        k
+    }
+
+    /// The root is a function of the SET. This is the property a running hash
+    /// `H(prev ‖ nf)` cannot have, and the reason it was rejected: insertion
+    /// order would become consensus, so two nodes that applied the same blocks
+    /// in a different order — or undid and redid a reorg — would commit
+    /// different roots for identical state.
+    #[test]
+    fn root_depends_on_the_set_not_the_order() {
+        let a = NullifierSet::from_iter([nf(1), nf(2), nf(3)]);
+        let b = NullifierSet::from_iter([nf(3), nf(1), nf(2)]);
+        let c = NullifierSet::from_iter([nf(2), nf(2), nf(1), nf(3), nf(3)]);
+        assert_eq!(a.root(), b.root());
+        assert_eq!(a.root(), c.root(), "duplicates must collapse");
+
+        let mut d = NullifierSet::new();
+        for k in [nf(3), nf(1), nf(2)] {
+            assert!(d.insert(k));
+        }
+        assert_eq!(a.root(), d.root(), "incremental inserts must agree with a bulk build");
+    }
+
+    /// Every distinct set commits distinctly, including the empty one — which
+    /// must not be the zero root, or "no pool" and "an unset field" would be
+    /// indistinguishable in the state tree.
+    #[test]
+    fn distinct_sets_commit_distinctly() {
+        let empty = NullifierSet::new().root();
+        assert_ne!(empty, [0u8; 32]);
+        let one = NullifierSet::from_iter([nf(1)]).root();
+        let two = NullifierSet::from_iter([nf(1), nf(2)]).root();
+        assert_ne!(empty, one);
+        assert_ne!(one, two);
+    }
+
+    /// Insert reports the double-spend. The return value IS the check.
+    #[test]
+    fn reinserting_a_spent_nullifier_is_refused() {
+        let mut s = NullifierSet::new();
+        assert!(s.insert(nf(7)));
+        assert!(!s.insert(nf(7)));
+        assert_eq!(s.len(), 1);
+    }
+
+    /// Reorg undo restores the exact earlier root — the property that makes a
+    /// disconnect safe. Without it a reorg would leave the chain committing a
+    /// root no honest node could reproduce.
+    #[test]
+    fn removing_an_undone_nullifier_restores_the_earlier_root() {
+        let mut s = NullifierSet::from_iter([nf(1), nf(2)]);
+        let before = s.root();
+        assert!(s.insert(nf(9)));
+        assert_ne!(s.root(), before);
+        assert!(s.remove(&nf(9)));
+        assert_eq!(s.root(), before);
+    }
+
+    /// Non-membership verifies against the root, and stops verifying the
+    /// moment the nullifier is spent — which is the whole point: a spend
+    /// verifier proves `nf ∉ set` at the anchor.
+    #[test]
+    fn non_membership_proves_absence_and_only_absence() {
+        let mut s = NullifierSet::from_iter([nf(1), nf(2), nf(3)]);
+        let root = s.root();
+        let absent = nf(42);
+
+        let proof = s.non_membership_proof(&absent).expect("absent key has a proof");
+        assert_eq!(proof.len(), NFSET_DEPTH);
+        assert!(verify_non_membership(&absent, &proof, &root));
+
+        // The security-relevant negative: the proof must NOT verify for a key
+        // that IS in the set. (It *will* verify for other absent keys whose
+        // path meets the same siblings — in a sparse tree an all-empty path
+        // proves the whole region empty, so one proof legitimately covers many
+        // absent keys. That is a property of the structure, not a weakness:
+        // what a verifier concludes is "this key is absent", which is true for
+        // every key the proof covers.)
+        assert!(!verify_non_membership(&nf(1), &proof, &root), "a spent key verified as absent");
+        // Nor against a different root.
+        let other = NullifierSet::from_iter([nf(1)]).root();
+        assert!(!verify_non_membership(&absent, &proof, &other));
+
+        // Once spent, there is no proof of absence and the old one dies.
+        s.insert(absent);
+        assert!(s.non_membership_proof(&absent).is_none());
+        assert!(!verify_non_membership(&absent, &proof, &s.root()));
+    }
+
+    /// A tampered path is rejected. Without this the verifier could be
+    /// accepting any 256 hashes of the right length.
+    #[test]
+    fn tampered_paths_are_rejected() {
+        let s = NullifierSet::from_iter([nf(1), nf(2)]);
+        let root = s.root();
+        let absent = nf(200);
+        let good = s.non_membership_proof(&absent).unwrap();
+
+        for i in [0usize, 1, NFSET_DEPTH / 2, NFSET_DEPTH - 1] {
+            let mut bad = good.clone();
+            bad[i][0] ^= 1;
+            assert!(!verify_non_membership(&absent, &bad, &root), "tamper at {i} accepted");
+        }
+        let mut short = good.clone();
+        short.pop();
+        assert!(!verify_non_membership(&absent, &short, &root));
+    }
+
+    /// The nullifier-set tree and the commitment tree must never share a node
+    /// value for the same inputs — different domain tags, checked rather than
+    /// assumed.
+    #[test]
+    fn nfset_domain_is_separate_from_the_commitment_tree() {
+        let l = nf(1);
+        let r = nf(2);
+        assert_ne!(nfset_parent(&l, &r), merkle_parent(&l, &r));
+        assert_ne!(NullifierSet::new().root(), CommitmentTree::new().root());
     }
 }

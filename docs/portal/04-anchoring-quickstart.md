@@ -1,5 +1,11 @@
 # Anchoring quickstart (L2s / finality gadgets / notaries)
 
+> **SUPERSEDED FRAMING — 2026-08-11.** Genesis-3 page; the "ownerless"
+> claims below were retracted (ADR-036, two-entity foundation), Genesis-3
+> halts at height 80,000, and at Genesis-4 the base gains a native **EVM at
+> L1** — external-L2 anchoring stays possible, but it is no longer the
+> prescribed path for EVM workloads. See the note in [index](index.md).
+
 > **Honesty rails (full text in [index](index.md)):** unaudited mainnet-beta;
 > relaxed PoW (**k=4**) → work is **trivially forgeable**; small,
 > **51%-attackable** network. Bloch is **ownerless / neutral / agnostic**;

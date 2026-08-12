@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+<!-- Bloch Protocol site — home. Layout and copy follow the founder-approved
+     preview (bloch-site.html); every figure carries its repo source in a
+     comment next to it. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bloch Protocol — a post-quantum layer one</title>
+<meta name="description" content="Bloch is a layer-one chain whose every signature is lattice-based: ML-DSA-65 and Falcon-1024, verified together, on every block.">
+<link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<nav aria-label="Main"><div class="wrap">
+  <a class="logo" href="./">
+    <svg width="26" height="26" viewBox="0 0 26 26" aria-hidden="true">
+      <circle cx="13" cy="13" r="11.2" fill="none" stroke="var(--accent)" stroke-width="1.5"/>
+      <ellipse cx="13" cy="13" rx="11.2" ry="4.2" fill="none" stroke="var(--accent)" stroke-width="1.1" opacity="0.55"/>
+      <line x1="13" y1="13" x2="19.6" y2="7.2" stroke="var(--ink)" stroke-width="1.6" stroke-linecap="round"/>
+      <circle cx="19.6" cy="7.2" r="2.1" fill="var(--accent)"/>
+    </svg>
+    Bloch Protocol
+  </a>
+  <span class="navlinks">
+    <a href="protocol.html">Protocol</a>
+    <a href="migration.html">Migration</a>
+    <a href="supply.html">Supply</a>
+    <a href="brand.html">Brand</a>
+    <a href="#wallet">Wallet</a>
+    <a href="build.html">Build</a>
+    <a href="docs.html">Docs</a>
+    <a class="ext" href="https://blochl1.com">Explorer</a>
+  </span>
+</div></nav>
+
+<main id="main">
+
+<header class="hero"><div class="wrap">
+  <div>
+    <p class="eyebrow">Post-quantum layer one</p>
+    <h1>A chain built for after the qubit.</h1>
+    <p class="lede">
+      Every signature that secures Bloch is lattice-based: ML-DSA-65 and Falcon-1024,
+      verified together, on every block. No elliptic curves anywhere on the critical
+      path &mdash; not in consensus, not in the shielded pool.
+      <!-- Hybrid ML-DSA-65 ‖ Falcon-1024: crates/bloch-crypto/src/core/mod.rs:321-330 -->
+    </p>
+    <div class="heroactions">
+      <a class="btn btn-primary" href="migration.html">Read the migration plan</a>
+      <a class="btn btn-ghost" href="Bloch-SIS-PoW-Institutional-Dossier-EN.pdf">Institutional dossier 2.0</a>
+      <a class="btn btn-ghost" href="build.html">Run a node</a>
+    </div>
+  </div>
+  <figure class="hero-fig">
+    <canvas id="sphere" width="720" height="720" role="img"
+      aria-label="A lattice of points on a sphere, rotating slowly — the Bloch sphere the protocol is named for."></canvas>
+    <figcaption>the bloch sphere &mdash; one qubit, every state</figcaption>
+  </figure>
+</div></header>
+
+<div class="status"><div class="wrap">
+  <!-- Terminal height 50,000: docs/FLEET-BRIEF-CERTIK-2026-08-12.md:79
+       ("Genesis-3 halts at height 50,000, not 50,000 — lowered 2026-08-12").
+       The constant GENESIS3_TERMINAL_HEIGHT in crates/bloch-crypto/src/core/mod.rs:438
+       still reads 50,000 and is superseded by that decision. -->
+  <dl class="stat"><dt>Genesis-3 halts at</dt><dd>50,000</dd><div class="sub">consensus rule &mdash; blocks above it are invalid</div></dl>
+  <!-- Target block time 30 s: crates/bloch-crypto/src/core/mod.rs:262 (TARGET_BLOCK_TIME);
+       Genesis-4 slot time is also 30 s: crates/bloch-pos-committee/src/tokenomics_v4.rs:120 (SLOTS_PER_DAY = 2,880). -->
+  <dl class="stat"><dt>Block time</dt><dd>30<span style="font-size:1rem"> s</span></dd><div class="sub">protocol target, today and after</div></dl>
+  <!-- Hybrid signature: crates/bloch-crypto/src/core/mod.rs:321-330. -->
+  <dl class="stat"><dt>Signature</dt><dd style="font-size:1.05rem;font-family:var(--mono)">ML-DSA-65 &#8214; Falcon-1024</dd><div class="sub">both must verify</div></dl>
+  <!-- Fixed supply 100,000,000,000: crates/bloch-pos-committee/src/tokenomics_v4.rs:33
+       (TOTAL_SUPPLY_BLOCH, founder decision 2026-08-11). A redenomination is
+       settled 2026-08-12 and is deliberately NOT quoted here. -->
+  <dl class="stat"><dt>Fixed supply</dt><dd>100B</dd><div class="sub">hard cap, Genesis-4</div></dl>
+</div></div>
+
+<section id="what"><div class="wrap">
+  <div class="sec-head">
+    <p class="eyebrow">What it is</p>
+    <h2>Three commitments, and what each one costs.</h2>
+    <p class="sub">Stated with the trade-off attached, because a protocol page that only lists benefits is marketing.</p>
+  </div>
+  <div class="cards">
+    <div class="card a">
+      <span class="tag">Signatures</span>
+      <h3>Hybrid, not hedged</h3>
+      <p>ML-DSA-65 and Falcon-1024 both have to verify. Breaking one is not enough.</p>
+      <!-- Signature ≤ 4,775 bytes: crates/bloch-crypto/src/core/mod.rs:330 (SIG_SIZE). -->
+      <p><strong>The cost:</strong> up to 4,775 bytes per signature against Bitcoin&rsquo;s 64, and no hardware wallet implements either scheme.</p>
+    </div>
+    <div class="card b">
+      <span class="tag">Privacy</span>
+      <h3>Hash-based shielded pool</h3>
+      <!-- SHAKE-256 commitments and nullifiers: crates/coherence-core/src/lib.rs:6,41-47.
+           STARK/FRI proving (SP1, never a curve-SNARK wrapper): crates/coherence-prover/README.md:4-5. -->
+      <p>Coherence uses SHAKE-256 commitments and STARK proofs &mdash; no trusted setup, no elliptic-curve ZK.</p>
+      <p><strong>The cost:</strong> proofs are large, and the pool carries no privacy claim until it is audited.</p>
+    </div>
+    <div class="card c">
+      <span class="tag">Consensus</span>
+      <h3>Moving to proof of stake</h3>
+      <!-- Slots/epochs/LMD-GHOST/Casper-style finality: crates/bloch-pos-committee/src/lib.rs:21,
+           params.rs:30, finality.rs:3-25. Cohort taper clock: genesis_cohort.rs:13,63-64. -->
+      <p>Slots, epochs, LMD-GHOST, Casper-style finality &mdash; with the same post-quantum signatures.</p>
+      <p><strong>The cost:</strong> the validator set starts concentrated, and the rules that reduce that are on a one-year clock.</p>
+    </div>
+  </div>
+</div></section>
+
+<section id="road" class="alt"><div class="wrap">
+  <div class="sec-head">
+    <p class="eyebrow">Migration</p>
+    <h2>Genesis-3 ends. Genesis-4 starts from its snapshot.</h2>
+    <p class="sub">These are ordered steps, not a list &mdash; each one only begins when the one above it has finished.</p>
+  </div>
+  <ol class="phases">
+    <li>
+      <span class="marker">now</span>
+      <div class="phase-body">
+        <h3>Proof of work, running <span class="state now">live</span></h3>
+        <!-- SHA-256d + merged mining with Bitcoin (AuxPoW since local h=8,500):
+             docs/PROJECT-STATUS.md, "Live network — Genesis-3 mainnet" block. -->
+        <p>The chain produces blocks under SHA-256d with merged mining. Nothing about it changes until height 50,000.</p>
+      </div>
+    </li>
+    <li>
+      <span class="marker">height 50,000</span>
+      <div class="phase-body">
+        <h3>The chain halts <span class="state next">days away</span></h3>
+        <!-- Halt-as-consensus-rule: crates/bloch-crypto/src/core/mod.rs:415-438.
+             Height lowered to 50,000: docs/FLEET-BRIEF-CERTIK-2026-08-12.md:79-81. -->
+        <p>Blocks above 50,000 are invalid &mdash; it is a consensus rule compiled into every node, not a switch anyone throws. Mining revenue ends here. A signed snapshot of every balance is taken at that height.</p>
+      </div>
+    </li>
+    <li>
+      <span class="marker">the gap</span>
+      <div class="phase-body">
+        <h3>Months with no chain</h3>
+        <!-- "about six months later": crates/bloch-crypto/src/core/mod.rs:415-417. -->
+        <p>Balances sit in the snapshot; the explorer keeps serving history. This is the plan, not a failure &mdash; the time is for review before a chain restarts with different consensus.</p>
+      </div>
+    </li>
+    <li>
+      <span class="marker">genesis-4</span>
+      <div class="phase-body">
+        <h3>Proof of stake, from the snapshot</h3>
+        <p>Balances carry across untouched. No claim to file, no contract to interact with, nobody to send anything to. Anyone asking you to migrate tokens is stealing them.</p>
+      </div>
+    </li>
+  </ol>
+  <div class="heroactions">
+    <a class="btn btn-ghost" href="migration.html">The full migration plan</a>
+  </div>
+</div></section>
+
+<section id="wallet"><div class="wrap">
+  <div class="sec-head">
+    <p class="eyebrow">Wallet</p>
+    <h2>A wallet that signs with the chain&rsquo;s own cryptography.</h2>
+    <p style="color:var(--ink-2)">Installable from the browser. The hybrid ML-DSA-65 &#8214;
+      Falcon-1024 signing runs in WebAssembly on your device &mdash; the same construction the
+      chain verifies, not a classical key with a post-quantum label on it.</p>
+  </div>
+  <div class="cards">
+    <div class="card a">
+      <span class="tag">What it does</span>
+      <h3>Post-quantum signing, locally</h3>
+      <p>Keys are generated and used in your browser. Node access is read-only, over the public
+         RPC &mdash; no node runs in the page and no mining is possible from it.</p>
+    </div>
+    <div class="card b">
+      <span class="tag">Installable</span>
+      <h3>A PWA, not an app store</h3>
+      <p>Add it to your home screen and it works offline for everything that does not need the
+         chain. Nothing to approve, nobody to ask.</p>
+    </div>
+    <div class="card c">
+      <span class="tag">Unaudited</span>
+      <h3>Public beta &mdash; read this part</h3>
+      <p>No third-party security audit has been completed on the wallet or on the chain it talks
+         to. It hardens your setup; it does not make you anonymous, and endpoint traffic analysis
+         remains possible. Do not put in it more than you can lose.</p>
+    </div>
+  </div>
+  <div class="heroactions" style="margin-top:2rem">
+    <a class="btn btn-primary" href="apps/postern/">Open the wallet</a>
+    <a class="btn btn-ghost" href="build.html">Run a node instead</a>
+  </div>
+</div></section>
+
+<section id="honesty"><div class="wrap">
+  <div class="sec-head">
+    <p class="eyebrow">Say it before you are asked</p>
+    <h2>What this chain is not, yet.</h2>
+  </div>
+  <div class="cards">
+    <div class="card c">
+      <span class="tag">Security</span>
+      <h3>Unaudited, low-hashrate</h3>
+      <!-- docs/PROJECT-STATUS.md "Hard caveat" block: nascent, low-hashrate,
+           51%-attackable, unaudited. -->
+      <p>The network is nascent: few nodes, low hashrate, 51%-attackable. Mainnet is a designation, not a security claim.</p>
+    </div>
+    <div class="card c">
+      <span class="tag">Supply</span>
+      <h3>Concentrated</h3>
+      <!-- Largest carried-over address 16,886,549,523 BLCH of 17,970,880,000 total
+           (~94%): crates/bloch-pos-committee/src/tokenomics_v4.rs:100,236. -->
+      <p>Roughly 94% of the carried-over balance belongs to one holder &mdash; the founder, who mined it. The numbers are on the <a href="supply.html">supply page</a>, not in a footnote.</p>
+    </div>
+    <div class="card c">
+      <span class="tag">Genesis-4</span>
+      <h3>No launch date</h3>
+      <!-- Devnet stage: crates/bloch-pos-node/src/main.rs:3-13. -->
+      <p>The proof-of-stake node is devnet software. There is no Genesis-4 launch date, and anyone quoting one is guessing.</p>
+    </div>
+  </div>
+</div></section>
+
+</main>
+
+<footer><div class="wrap">
+  <div>
+    <span class="logo" style="font-size:1rem">
+      <svg width="22" height="22" viewBox="0 0 26 26" aria-hidden="true">
+        <circle cx="13" cy="13" r="11.2" fill="none" stroke="var(--accent)" stroke-width="1.5"/>
+        <ellipse cx="13" cy="13" rx="11.2" ry="4.2" fill="none" stroke="var(--accent)" stroke-width="1.1" opacity="0.55"/>
+        <line x1="13" y1="13" x2="19.6" y2="7.2" stroke="var(--ink)" stroke-width="1.6" stroke-linecap="round"/>
+        <circle cx="19.6" cy="7.2" r="2.1" fill="var(--accent)"/>
+      </svg>
+      Bloch Protocol
+    </span>
+    <p style="margin-top:0.7rem">Postern Labs Ltda. &middot; AGPL-3.0-or-later</p>
+    <p style="margin-top:0.35rem;font-size:0.86rem">Source: <a href="https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow">GitHub</a> &middot; <a href="https://gitlab.com/blochsispow-group/bloch-pos">GitLab</a></p>
+  </div>
+  <p style="max-width:34ch">Every figure on this site is either measured and labelled as such, or planned and labelled as such.</p>
+</div>
+
+<script src="assets/sphere.js"></script>
+</body>
+</html>

@@ -1,0 +1,19 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+<!-- Bloch Protocol symbol, 128 px and up — hero, docs covers, social images.
+     Detail appears with size: at this scale the sphere gains its vertical
+     meridian, which the 24 px and 16 px cuts deliberately drop. Same
+     construction: equator ry = 0.375 R, meridian rx = 0.375 R, state vector
+     at 41.3°, length 0.785 R, dot r = 0.19 R. Scales losslessly above 128. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128" role="img" aria-label="The Bloch sphere — symbol of Bloch Protocol">
+  <style>
+    .s { stroke: #0e6e5a; } .v { stroke: #0d1b17; } .d { fill: #0e6e5a; }
+    @media (prefers-color-scheme: dark) {
+      .s { stroke: #4fc0a4; } .v { stroke: #eaf2ef; } .d { fill: #4fc0a4; }
+    }
+  </style>
+  <circle class="s" cx="64" cy="64" r="54" fill="none" stroke-width="3"/>
+  <ellipse class="s" cx="64" cy="64" rx="54" ry="20.25" fill="none" stroke-width="2.2" opacity="0.55"/>
+  <ellipse class="s" cx="64" cy="64" rx="20.25" ry="54" fill="none" stroke-width="2.2" opacity="0.28"/>
+  <line class="v" x1="64" y1="64" x2="95.8" y2="36" stroke-width="3.2" stroke-linecap="round"/>
+  <circle class="d" cx="95.8" cy="36" r="10.25"/>
+</svg>

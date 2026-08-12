@@ -261,9 +261,16 @@ pre .fl{color:var(--brass);}
     <h2 id="connect-title">Point hashrate at the pool</h2>
     <p>Standard Stratum V1. Works with any SHA-256d miner. The one rule that trips people up: your username is your <b>bare</b> Bloch address — no worker suffix.</p>
 
+    <div class="warn" role="note" style="border-color:#c98a3f;background:rgba(201,138,63,.09);margin-top:1.4rem">
+      <span class="ic" aria-hidden="true">&#9935;</span>
+      <p><strong>Merged mining (AuxPoW) is live</strong> — activated at Bloch block <b>8,500</b>. Bloch runs the same double-SHA-256 as Bitcoin, so a single hash can secure both chains. Point a rig at the <b>merged pool</b> below to dual-mine; solo Bloch mining is unchanged. Rigs don't resolve DNS — <b>use the IP</b>.</p>
+    </div>
+
     <div class="connect-panel" style="margin-top:1.6rem">
       <dl class="kv">
-        <dt>Pool URL</dt><dd><span class="val">stratum+tcp://stratum.posternpool.com:3336</span></dd>
+        <dt>Solo pool</dt><dd><span class="val">stratum+tcp://stratum.posternpool.com:3336</span><br>
+          <span style="color:var(--muted)">by IP, if your miner has no DNS — </span><span class="val">stratum+tcp://192.248.190.123:3336</span></dd>
+        <dt>Merged pool</dt><dd><span class="val">stratum+tcp://45.76.89.225:3336</span> <span style="color:var(--muted)">— AuxPoW (Bloch + Bitcoin), IP only</span></dd>
         <dt>Username</dt><dd>your own bare <span class="val">bloch1q…</span> address <span style="color:var(--muted)">— NO worker suffix</span></dd>
         <dt>Password</dt><dd><span class="val">x</span> <span style="color:var(--muted)">(any value; ignored)</span></dd>
         <dt>Algorithm</dt><dd><span class="val">sha256d</span></dd>
@@ -281,7 +288,8 @@ pre .fl{color:var(--brass);}
           <div class="lbl">Bitcoin ASIC — Antminer / Whatsminer / Bitaxe (pool config)</div>
           <button class="copy-btn" data-copy="asic">Copy</button>
 <pre id="cb-asic"><span class="cm"># In the miner's web UI, add a pool:</span>
-URL      <span class="fl">stratum+tcp://stratum.posternpool.com:3336</span>
+URL      <span class="fl">stratum+tcp://192.248.190.123:3336</span>   <span class="cm"># solo Bloch — use the IP, rigs don't do DNS</span>
+         <span class="cm"># merged mining (Bloch + Bitcoin)? use stratum+tcp://45.76.89.225:3336</span>
 Worker   <span class="fl">bloch1qyour_own_address_here</span>   <span class="cm"># bare — NO .worker</span>
 Password <span class="fl">x</span></pre>
         </div>
@@ -362,6 +370,7 @@ Password <span class="fl">x</span></pre>
     <div class="foot-links">
       <a href="https://explorer.posternpool.com">Explorer ↗</a>
       <a href="#connect">Connect a miner</a>
+      <a href="/Bloch-Mining-Manual.pdf">Mining Manual (PDF) ↓</a>
     </div>
   </div>
   <span class="wordmark"><span class="wm-postern">postern</span><span class="wm-mid">·</span><span class="wm-labs">labs</span></span>
@@ -432,17 +441,30 @@ document.querySelectorAll('.copy-btn').forEach(function(b){
       // If nothing came back at all, the RPC isn't live — stay hidden.
       if(!dag && !hr && !pr) return;
 
-      var height = dag ? pick(dag,'blockCount','blockcount','tipHeight','height') : null;
-      var blue   = dag ? pick(dag,'blueScore','bluescore','virtualDaaScore') : null;
-      var diff   = dag ? pick(dag,'difficulty') : null;
-      var hashrate = (typeof hr === 'number' || typeof hr === 'string') ? hr : (hr ? pick(hr,'hashrate','hashesPerSecond') : null);
-      var miners = Array.isArray(pr) ? pr.length : (pr ? pick(pr,'connected','count') : null);
+      // O no devolve snake_case (block_count, tip_blue_score, hashrate_hs,
+      // peer_count). Os nomes camelCase ficam como fallback tolerante.
+      var height = dag ? pick(dag,'block_count','blockCount','blockcount','tipHeight','height') : null;
+      var blue   = dag ? pick(dag,'tip_blue_score','blueScore','bluescore','virtualDaaScore') : null;
+      var diff   = pick(hr||{},'current_difficulty') || (dag ? pick(dag,'difficulty') : null);
 
-      grid.appendChild(cell('Tip height', height!=null?fmt(Number(height)):null));
-      grid.appendChild(cell('Blue score', blue!=null?fmt(Number(blue)):null));
+      // gethashrate ja traz o valor formatado; so cai no numerico se faltar.
+      var hrHuman = hr ? pick(hr,'hashrate_human') : null;
+      var hrNum   = (typeof hr === 'number' || typeof hr === 'string')
+        ? hr : (hr ? pick(hr,'hashrate_hs','hashrate','hashesPerSecond') : null);
+
+      var miners = Array.isArray(pr) ? pr.length
+        : (pr ? pick(pr,'peer_count','connected','count') : null);
+
+      // Altura e blue score sao contagens exatas -- abreviar para "7.34K"
+      // esconde justamente o digito que o minerador quer conferir.
+      function exact(n){ return Number(n).toLocaleString('en-US'); }
+
+      grid.appendChild(cell('Tip height', height!=null?exact(height):null));
+      grid.appendChild(cell('Blue score', blue!=null?exact(blue):null));
       grid.appendChild(cell('Difficulty', diff!=null?fmt(Number(diff)):null));
-      grid.appendChild(cell('Network hashrate', hashrate!=null?(fmt(Number(hashrate))+' H/s'):null));
-      grid.appendChild(cell('Connected peers', miners!=null?fmt(Number(miners)):null));
+      grid.appendChild(cell('Network hashrate',
+        hrHuman!=null ? String(hrHuman) : (hrNum!=null ? fmt(Number(hrNum))+' H/s' : null)));
+      grid.appendChild(cell('Connected peers', miners!=null?exact(miners):null));
 
       note.textContent = 'Live from a read-only Bloch node · Genesis-2 · figures may be stalled while the chain is being stabilized.';
       section.style.display = 'block';

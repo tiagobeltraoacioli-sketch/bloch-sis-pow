@@ -1,6 +1,6 @@
 # BLOCH Tokenomics V2 — Specification
 
-**Status:** Genesis-locked, pre-commitment doctrine — supersedes V1
+**Status:** HISTORICAL — parameter values superseded by the deployed Genesis-3 chain (see notice below); retained for design history and doctrine
 **Version:** 2.0
 **Date:** 2026-05-01
 **Author:** BLOCH Founder
@@ -12,6 +12,31 @@
 > — Doutrina BLOCH, *Ensaio 2 — Pre-Commitment Doctrine*
 
 ---
+
+> **⚠️ HISTORICAL NOTICE (2026-08) — the numbers below are NOT the live chain.**
+> This document records the pre-Genesis-3 V2 *design* (150 s blocks,
+> 210,000-block halving, 800 M mining emission). The **deployed Genesis-3
+> mainnet** takes its consensus constants from
+> `crates/bloch-crypto/src/core/tokenomics_v2.rs`: 30 s blocks, 8,400 BLOCH
+> initial reward, 1,036,800-block halving, perpetual 100 BLOCH tail.
+> Furthermore, the **Emission V3 flag-day hard fork** at local height **40,000**
+> (Aug 2026; emission height 453,743 incl. carryover) cuts the block reward
+> 8,400 → **2,600 BLOCH** (−69%) and lengthens the halving interval to
+> **1,555,200 blocks** (~1.5 yr @ 30 s), with the schedule
+> 2,600 → 1,300 → 650 → 325 → 162 → 81 → perpetual 60 tail (from V3
+> epoch 6, ~9 yr after the fork; the V2 floor of 100 governs pre-fork
+> history). **V3 realigns emission with the documented nominals to within
+> ~0.5%** (measured 2026-08-09): carryover 3,475,441,200 + mined-since-G3
+> 309,128,400 + future V3 emission over 100 yr 13,620,441,600 =
+> 17,405,011,200 mining total vs the 17.43 B mining nominal; + premine
+> 3,570,000,000 = 20,975,011,200 vs the 21 B total nominal. (The
+> uncorrected V2 curve would have emitted 26.92 B over that window — the
+> bug the fork addresses.) Figures are floors, not caps: coinbases are paid
+> per DAG block and the mined side grows until the fork (≈ 17.50 B mining
+> total at the fork). The supply is **not hard-capped** (the tail is
+> perpetual). Current spec:
+> [`TOKENOMICS_V3.md`](./TOKENOMICS_V3.md) + `docs/adr/ADR-035-emission-v3-schedule.md`.
+> Read the rest of this file as design history only.
 
 ## 1. Preamble
 

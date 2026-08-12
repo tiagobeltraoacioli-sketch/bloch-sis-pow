@@ -1,13 +1,23 @@
-import { useState } from "react";
+// SPDX-License-Identifier: AGPL-3.0-or-later
+import { useEffect, useState } from "react";
 import { rpc } from "../lib/rpc";
 import { useAsync } from "../lib/hooks";
 import { Loading, ErrorBox } from "../components/ui";
+import { useAdaptivePoll } from "../components/chainStatus";
 import { Link } from "../lib/router";
 import { fmtInt, short, timeAgo, fmtTime, difficultyFromBits, fmtNum } from "../lib/format";
 
 export function Blocks() {
   const [count, setCount] = useState(50);
-  const { data, error, loading } = useAsync(() => rpc<any[]>("getrecentblocks", [count]), [count], 20000);
+  const { intervalMs, markTip } = useAdaptivePoll(20000);
+  const { data, error, loading } = useAsync(
+    () => rpc<any[]>("getrecentblocks", [count]),
+    [count, intervalMs],
+    intervalMs
+  );
+  useEffect(() => {
+    if (data?.length) markTip(Math.max(...data.map((b: any) => b.height || 0)));
+  }, [data, markTip]);
 
   return (
     <div className="container">

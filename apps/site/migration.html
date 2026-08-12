@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+<!-- Bloch Protocol site — migration page. Every figure carries its repo source
+     in a comment next to it. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Migration — Bloch Protocol</title>
+<meta name="description" content="Genesis-3 halts at height 50,000 by consensus rule. Genesis-4 relaunches as proof of stake from a signed snapshot. What happens to balances, and what to refuse.">
+<link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<nav aria-label="Main"><div class="wrap">
+  <a class="logo" href="./">
+    <svg width="26" height="26" viewBox="0 0 26 26" aria-hidden="true">
+      <circle cx="13" cy="13" r="11.2" fill="none" stroke="var(--accent)" stroke-width="1.5"/>
+      <ellipse cx="13" cy="13" rx="11.2" ry="4.2" fill="none" stroke="var(--accent)" stroke-width="1.1" opacity="0.55"/>
+      <line x1="13" y1="13" x2="19.6" y2="7.2" stroke="var(--ink)" stroke-width="1.6" stroke-linecap="round"/>
+      <circle cx="19.6" cy="7.2" r="2.1" fill="var(--accent)"/>
+    </svg>
+    Bloch Protocol
+  </a>
+  <span class="navlinks">
+    <a href="protocol.html">Protocol</a>
+    <a href="migration.html" aria-current="page">Migration</a>
+    <a href="supply.html">Supply</a>
+    <a href="brand.html">Brand</a>
+    <a href="build.html">Build</a>
+    <a href="docs.html">Docs</a>
+    <a class="ext" href="https://blochl1.com">Explorer</a>
+  </span>
+</div></nav>
+
+<main id="main">
+
+<header class="pagehead"><div class="wrap">
+  <p class="eyebrow">Migration</p>
+  <h1>The chain that stops on purpose.</h1>
+  <p class="lede">
+    Genesis-3 ends at a height written into consensus. Genesis-4 starts months later,
+    as proof of stake, from a signed snapshot of every balance. Between the two there
+    is deliberately nothing &mdash; and nothing is what you should do with your coins.
+  </p>
+</div></header>
+
+<div class="status"><div class="wrap">
+  <!-- 50,000: docs/FLEET-BRIEF-CERTIK-2026-08-12.md:79 (lowered from 50,000 on
+       2026-08-12; the 50,000 constant at crates/bloch-crypto/src/core/mod.rs:438
+       is superseded by that decision). -->
+  <dl class="stat"><dt>Last valid height</dt><dd>50,000</dd><div class="sub">blocks above it are invalid</div></dl>
+  <!-- Snapshot measured for carryover at height 43,172: 448,337 UTXOs across
+       15 addresses — crates/bloch-pos-committee/src/tokenomics_v4.rs:77. -->
+  <dl class="stat"><dt>UTXOs to carry</dt><dd>448,337</dd><div class="sub">measured at height 43,172</div></dl>
+  <!-- ~6 months: crates/bloch-crypto/src/core/mod.rs:415-417 ("Genesis-4
+       launches from that artifact about six months later"). -->
+  <dl class="stat"><dt>The gap</dt><dd>~6 <span style="font-size:1rem">months</span></dd><div class="sub">planned, no chain running</div></dl>
+  <dl class="stat"><dt>Your action</dt><dd>None</dd><div class="sub">balances carry automatically</div></dl>
+</div></div>
+
+<section id="phases"><div class="wrap">
+  <div class="sec-head">
+    <p class="eyebrow">The sequence</p>
+    <h2>Four phases, in order.</h2>
+    <p class="sub">Each one only begins when the one above it has finished.</p>
+  </div>
+  <ol class="phases">
+    <li>
+      <span class="marker">now</span>
+      <div class="phase-body">
+        <h3>Proof of work, running <span class="state now">live</span></h3>
+        <!-- SHA-256d + AuxPoW merged mining: docs/PROJECT-STATUS.md,
+             "Live network — Genesis-3 mainnet". -->
+        <p>The chain produces blocks under SHA-256d with merged mining. Nothing about it changes until height 50,000: transactions confirm, the explorer indexes, miners are paid.</p>
+      </div>
+    </li>
+    <li>
+      <span class="marker">height 50,000</span>
+      <div class="phase-body">
+        <h3>The chain halts <span class="state next">days away</span></h3>
+        <!-- Invalid-above-terminal as a consensus rule, and why "unwanted" is
+             not enough: crates/bloch-crypto/src/core/mod.rs:415-438. -->
+        <p>Blocks above 50,000 are <strong>invalid</strong> &mdash; a consensus rule compiled into every node, not a switch anyone throws. A chain does not stop because it was announced; if late blocks were merely unwanted, miners would keep producing them and the &ldquo;halt&rdquo; would be a fork nobody agreed to. Making them invalid is what actually ends the chain.</p>
+        <p>Mining revenue ends here. A signed snapshot of every balance is taken at this height.</p>
+      </div>
+    </li>
+    <li>
+      <span class="marker">the gap</span>
+      <div class="phase-body">
+        <h3>About six months with no chain</h3>
+        <!-- ~6 months and snapshot-digest-in-genesis: crates/bloch-crypto/src/core/mod.rs:415-435. -->
+        <p>Balances sit in the snapshot; the <a href="https://blochl1.com">explorer</a> keeps serving history. This is the plan, not a failure &mdash; the time is for review before a chain restarts with different consensus.</p>
+        <p>One consequence stated plainly: once mining stops, the old chain&rsquo;s history stops being evidence &mdash; proof-of-work security is bought with ongoing hashrate. That is why the canonical artifact is the signed snapshot, whose digest goes into the Genesis-4 genesis block, and not whatever chain has the most work afterwards.</p>
+      </div>
+    </li>
+    <li>
+      <span class="marker">genesis-4</span>
+      <div class="phase-body">
+        <h3>Proof of stake, from the snapshot</h3>
+        <!-- Carryover as ordinary liquid balance, one balance set:
+             crates/bloch-pos-committee/src/tokenomics_v4.rs:75-100. -->
+        <p>Every Genesis-3 balance crosses as an ordinary liquid balance &mdash; 448,337 UTXOs, carried automatically. Carried-over coins can be staked and delegated like any other coin.</p>
+      </div>
+    </li>
+  </ol>
+</div></section>
+
+<section id="refuse" class="alt"><div class="wrap">
+  <div class="sec-head">
+    <p class="eyebrow">Refuse these</p>
+    <h2>There is no migration action. None.</h2>
+    <p class="sub">The carryover is automatic, which makes every &ldquo;migration step&rdquo; someone offers you a theft attempt by definition.</p>
+  </div>
+  <div class="cards">
+    <div class="card c">
+      <span class="tag">Scam shape 1</span>
+      <h3>&ldquo;Claim your Genesis-4 tokens&rdquo;</h3>
+      <p>There is no claim to file. Balances carry across in the snapshot without any action from you.</p>
+    </div>
+    <div class="card c">
+      <span class="tag">Scam shape 2</span>
+      <h3>&ldquo;Send coins to the bridge&rdquo;</h3>
+      <p>There is no bridge, no contract to interact with, nobody to send anything to. Anyone asking you to move tokens to migrate them is stealing them.</p>
+    </div>
+    <div class="card c">
+      <span class="tag">Scam shape 3</span>
+      <h3>&ldquo;Launch is on this date&rdquo;</h3>
+      <!-- No launch date: crates/bloch-pos-node/src/main.rs:3-13 (devnet stage). -->
+      <p>There is no Genesis-4 launch date. The gap is measured in months and ends when review does &mdash; anyone quoting a date is guessing or baiting.</p>
+    </div>
+  </div>
+</div></section>
+
+</main>
+
+<footer><div class="wrap">
+  <div>
+    <span class="logo" style="font-size:1rem">
+      <svg width="22" height="22" viewBox="0 0 26 26" aria-hidden="true">
+        <circle cx="13" cy="13" r="11.2" fill="none" stroke="var(--accent)" stroke-width="1.5"/>
+        <ellipse cx="13" cy="13" rx="11.2" ry="4.2" fill="none" stroke="var(--accent)" stroke-width="1.1" opacity="0.55"/>
+        <line x1="13" y1="13" x2="19.6" y2="7.2" stroke="var(--ink)" stroke-width="1.6" stroke-linecap="round"/>
+        <circle cx="19.6" cy="7.2" r="2.1" fill="var(--accent)"/>
+      </svg>
+      Bloch Protocol
+    </span>
+    <p style="margin-top:0.7rem">Postern Labs Ltda. &middot; AGPL-3.0-or-later</p>
+    <p style="margin-top:0.35rem;font-size:0.86rem">Source: <a href="https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow">GitHub</a> &middot; <a href="https://gitlab.com/blochsispow-group/bloch-pos">GitLab</a></p>
+  </div>
+  <p style="max-width:34ch">Every figure on this site is either measured and labelled as such, or planned and labelled as such.</p>
+</div>
+
+</body>
+</html>

@@ -29,6 +29,107 @@ pub const AUXPOW_ACTIVATION_HEIGHT: u64 = 8500; // FLAG-DAY 2026-08-01 (G3 mainn
 #[cfg(feature = "auxpow-rehearsal")]
 pub const AUXPOW_ACTIVATION_HEIGHT: u64 = 0;
 
+/// FLAG-DAY: height at/above which `bits` is validated from the block's own
+/// selected-parent ancestry (`pow::genesis2_expected_bits_for_parents`) instead of
+/// from mutable local state.
+///
+/// The legacy path derived the expected difficulty from the `current_bits` meta
+/// key — rewritten on EVERY accepted block, including out-of-order backfill and
+/// fork-losers — and from `get_timestamp_at_height`, a column family keyed by
+/// height alone and therefore last-write-wins in a DAG. Two nodes on an
+/// IDENTICAL binary consequently disagreed purely because they accepted blocks
+/// in a different order, and every follower froze permanently at the first
+/// retarget boundary where its cache had diverged (measured at h=25020: served
+/// 0x1a265e4e, follower expected 0x1a26ac86). The chain effectively had one
+/// producer and no independent validator.
+///
+/// Below this height the legacy path is retained verbatim so settled history
+/// stays valid; at and above it, difficulty is a pure function of ancestry and
+/// arrival order cannot change the verdict. Coordinated fleet upgrade required
+/// BEFORE the chain reaches this height — same discipline as
+/// `AUXPOW_ACTIVATION_HEIGHT` and the earlier SHA-256d-LE fork.
+///
+/// Set to 27_600 on 2026-08-08 — a retarget boundary (460 × 60) roughly 230
+/// blocks above the tip at the time, which is ~100 minutes of build-and-deploy
+/// margin.
+///
+/// It was briefly 30_000, and that was wrong. The reasoning then was that a
+/// distant height buys room to upgrade the fleet without rushing the only
+/// block-producing node. What that missed: below the fork height the legacy
+/// order-dependent rule still applies, so every follower keeps freezing at
+/// every retarget boundary on the way there. 30_000 was ~2_900 blocks out —
+/// about 48 boundaries — and followers were observed dying at the first one
+/// each time (node4 at 27_120 = 452×60, miner-box at 25_440 = 424×60, both
+/// logging `invalid difficulty`). A follower's chance of crossing 48 boundaries
+/// is nil, so a distant flag-day is not a safety margin at all: it is a
+/// guarantee that no follower ever reaches the fix.
+///
+/// The real constraint is narrower than it looks — only the PRODUCER must be
+/// upgraded before the chain reaches this height, because it is the one
+/// stamping bits. Followers are restored from a producer datadir above the
+/// fork height afterwards, so their exposure to the legacy window is zero.
+/// Pick a height just far enough to deploy to the producer, and no further.
+// EMERGENCY 2026-08-09 05:2x: raised 27_600 -> 29_400 to restore block
+// production. At h=28_080 (468x60, a retarget boundary) with TWO open tips at
+// 28_079, the miner and the validator on the SAME node disagreed: the template
+// stamped bits 0x1a0abee4 and accept_block rejected that very block expecting
+// 0x1a0ac909. Deterministic, so every block the ASIC found was discarded and
+// the chain sat still for ~40 minutes.
+//
+// POST-MORTEM 2026-08-09 (frente ASSIMETRIA-DIFICULDADE) — the actual root
+// cause, established from the producer + node4 journals:
+//
+//   * The flag-day switch to the ancestry rule was wired into accept_block and
+//     the INTERNAL solo miner only. The four OTHER template producers —
+//     stratum V1 (session.rs, the ASIC path that actually mines), stratum V2
+//     (template_adapter.rs), getblocktemplate and createauxblock (rpc/mod.rs)
+//     — still called the LEGACY genesis2_expected_bits unconditionally. So at
+//     every height >= flag-day the producer stamped legacy bits and validated
+//     with ancestry bits.
+//   * Off retarget boundaries the two coincide, and at single-tip boundaries
+//     they also coincide — which is why 27_600 itself passed clean. The first
+//     boundary with TWO tips at boundary-1 exposed the split: the legacy value
+//     depends on CF_TIMESTAMPS[h-1], a height-keyed last-write-wins cell, so
+//     the producer's own template flipped 0x1a0abb83 -> 0x1a0abee4 the moment
+//     the second 28_079 block landed (journal 04:42:23 vs 04:43:09), while
+//     ancestry over the two-tip parent set gave 0x1a0ac909.
+//   * The ancestry rule itself was CONSISTENT across nodes: the producer's
+//     validator and node4's pre-stopgap binary both expected 0x1a0ac909 for
+//     block e5c2ad6a. The third opinion (0x1a0abb83) was node4's LEGACY value
+//     under the stopgap binary — the original order-dependent bug, which is
+//     why the stopgap left node4/miner-box permanently frozen at 28_079.
+//
+// FIX (this flag-day): every producer and the validator now route through ONE
+// height-gated choke point, pow::genesis2_expected_bits_for_parents, computed
+// over EXACTLY the parents slice the block header carries — a pure function of
+// consensus data, so arrival order and template timing cannot change the
+// verdict. Ancestry-incomplete cases FAIL CLOSED (refuse the template / reject
+// with an explicit reason) instead of silently falling back to the legacy
+// value; the silent fallback and the silent dropping of DAG-missing parents
+// were the two remaining ways for one side to be on the old rule while the
+// other was on the new one.
+//
+// Set to 30_030 — deliberately MID-WINDOW (30_030 = 500*60 + 30, enforced by
+// the const assert below), not a boundary: at activation the old and new rules
+// agree off-boundary (both yield the bits in force), so the switch itself
+// cannot fork; the first retarget under the unified rule lands at 30_060 with
+// the fleet already on it. Deploy discipline, in order of hardness:
+//   1. The PRODUCER must run this binary BEFORE the chain reaches 29_400 —
+//      the previous binary re-arms the broken asymmetric rule there and the
+//      h=28_080 halt repeats.
+//   2. Followers are restored from a producer datadir (standard runbook) and
+//      upgraded before 30_030. Between deploy and 30_030 the legacy rule is
+//      still in force, so an un-restored follower with diverged local state
+//      stays frozen until its datadir is replaced — expected, not a regression.
+pub const DIFFICULTY_ANCESTRY_FORK_HEIGHT: u64 = 30_030;
+
+// The flag-day must not sit ON a retarget boundary: activating exactly where
+// the two rules first diverge would make the switch itself the incident.
+const _: () = assert!(
+    DIFFICULTY_ANCESTRY_FORK_HEIGHT % GENESIS2_RETARGET_WINDOW != 0,
+    "DIFFICULTY_ANCESTRY_FORK_HEIGHT must be mid-window, never a retarget boundary"
+);
+
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 pub const MAINNET_PREFIX:        &str  = "bloch1q";
@@ -150,7 +251,8 @@ pub fn node_chain_id() -> ChainId {
 pub const GHOSTDAG_K:            usize = 10;
 // V2 tokenomics emission constants live in `tokenomics_v2` module:
 //   - INITIAL_BLOCK_REWARD_SAT (1905 BLOCH) — replaces V1 BLOCK_REWARD
-//   - TAIL_FLOOR_SAT (25 BLOCH) — perpetual mining reward post halving 7
+//   - TAIL_FLOOR_SAT (100 BLOCH) — V2 tail floor, legacy pre-fork branch only
+//   - EMISSION_V3_TAIL_FLOOR_SAT (60 BLOCH) — V3 perpetual tail (PISO-60)
 //   - HALVING_INTERVAL (210_000) — reused below; same value V1/V2
 //   - block_subsidy_sat(h), split_subsidy_sat(s), founder_vesting_delta_sat(h)
 // See docs/specs/TOKENOMICS_V2.md §3-§5 and ADR-028.
@@ -305,6 +407,61 @@ pub const fn chain_requires_carryover(id: ChainId) -> bool {
         // Genesis-3 exists for the same reason: a fresh chain whose opening
         // balances ARE the carried-over ledger. Same fail-closed rule.
         ChainId::Genesis3Mainnet => true,
+    }
+}
+
+// ── Genesis-3 terminal height: the chain stops ──────────────────────────────
+//
+// The Genesis-3 chain is being retired. A signed UTXO snapshot is taken at the
+// terminal height, and Genesis-4 launches from that artifact about six months
+// later (`docs/specs/BLOCH-TOKENOMICS-V4.md` §3.2).
+//
+// A chain does not stop because it was announced. If blocks above the terminal
+// height are merely *unwanted*, miners keep producing them and the "halt" is a
+// fork nobody agreed to. Making them **invalid** is what actually ends the
+// chain, and it has to be running on the fleet before the height arrives —
+// this is a flag day in reverse, with every flag-day hazard intact.
+//
+// Two consequences worth stating where the constant lives:
+//
+//   1. Anyone who does not upgrade keeps mining past the terminal height on a
+//      fork. That is tolerable only because the canonical artifact is the
+//      signed snapshot at this height, not whatever chain has the most work
+//      afterwards.
+//   2. Once mining stops, this chain's history stops being evidence. PoW
+//      security is bought with ongoing hashrate; with none, rewriting history
+//      below the terminal height costs almost nothing. The snapshot digest
+//      goes into the Genesis-4 genesis block precisely so the record does not
+//      depend on a chain nobody is defending.
+
+/// Last valid height on the Genesis-3 mainnet. Blocks ABOVE this are invalid.
+pub const GENESIS3_TERMINAL_HEIGHT: u64 = 80_000;
+
+/// The terminal height for `id`, if that chain has one.
+///
+/// Exhaustive with no wildcard arm, deliberately — the same fail-closed idiom
+/// as [`chain_requires_carryover`]. When a new chain-id is added this stops
+/// compiling until someone decides whether it terminates, instead of silently
+/// inheriting "runs forever".
+pub const fn terminal_height(id: ChainId) -> Option<u64> {
+    match id {
+        // Development and legacy chains are not being retired by this rule.
+        ChainId::Mainnet => None,
+        ChainId::Testnet => None,
+        ChainId::Genesis2Devnet => None,
+        // The chain being retired.
+        ChainId::Genesis3Mainnet => Some(GENESIS3_TERMINAL_HEIGHT),
+    }
+}
+
+/// Is `height` beyond the terminal height for this node's chain?
+///
+/// The terminal height itself is **valid** — it is the last block, and the
+/// height the snapshot is taken at. Only heights strictly above it are refused.
+pub fn is_past_terminal_height(height: u64) -> bool {
+    match terminal_height(node_chain_id()) {
+        Some(t) => height > t,
+        None => false,
     }
 }
 
@@ -2901,6 +3058,41 @@ mod chain_id_tests {
             outputs: vec![TxOutput { value: 42, script_pubkey: vec![9u8; 20] }],
             locktime: 0,
         }
+    }
+
+    #[test]
+    fn terminal_height_only_retires_genesis3() {
+        // Exhaustive by construction; this pins the intent so a future chain-id
+        // cannot quietly inherit a terminal height it was never meant to have.
+        assert_eq!(terminal_height(ChainId::Genesis3Mainnet), Some(80_000));
+        assert_eq!(terminal_height(ChainId::Mainnet), None);
+        assert_eq!(terminal_height(ChainId::Testnet), None);
+        assert_eq!(terminal_height(ChainId::Genesis2Devnet), None);
+    }
+
+    #[test]
+    fn the_terminal_height_itself_is_valid() {
+        // Off-by-one here would either lose the last block or admit one past
+        // the snapshot — and the snapshot is taken AT the terminal height.
+        let t = GENESIS3_TERMINAL_HEIGHT;
+        let past = |h: u64| match terminal_height(ChainId::Genesis3Mainnet) {
+            Some(x) => h > x,
+            None => false,
+        };
+        assert!(!past(t - 1));
+        assert!(!past(t), "a altura terminal e o ultimo bloco valido");
+        assert!(past(t + 1));
+        assert!(past(u64::MAX));
+    }
+
+    #[test]
+    fn terminal_height_is_still_ahead_of_the_live_chain() {
+        // The rule must ship INERT: at the time of writing the chain is near
+        // height 40,400, so every block validates exactly as before. If this
+        // ever fails, the constant was set at or below the tip and the release
+        // would retroactively invalidate live history.
+        assert!(GENESIS3_TERMINAL_HEIGHT > 40_424,
+            "altura terminal nao pode estar no passado da cadeia viva");
     }
 
     #[test]

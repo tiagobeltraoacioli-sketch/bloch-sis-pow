@@ -1,17 +1,20 @@
-import { useState } from "react";
-import { fetchDagWindow, STALL_THRESHOLD_SECS } from "../lib/chain";
+// SPDX-License-Identifier: AGPL-3.0-or-later
+import { useEffect, useState } from "react";
+import { fetchDagWindow } from "../lib/chain";
 import { useAsync } from "../lib/hooks";
 import { Loading, ErrorBox } from "../components/ui";
 import { InteractiveDag } from "../components/dagInteractive";
+import { ChainPhaseBanner, useAdaptivePoll } from "../components/chainStatus";
 import { Link } from "../lib/router";
-import { fmtInt, timeAgo } from "../lib/format";
+import { fmtInt } from "../lib/format";
 
 export function DagLivePage() {
   const [depth, setDepth] = useState(40);
-  const { data, error, loading } = useAsync(() => fetchDagWindow(depth), [depth], 12000);
+  const { intervalMs, markTip } = useAdaptivePoll(12000);
+  const { data, error, loading } = useAsync(() => fetchDagWindow(depth), [depth, intervalMs], intervalMs);
+  useEffect(() => markTip(data?.dag?.tip_height), [data, markTip]);
 
   const freshestTs = data ? Math.max(0, ...data.blocks.map((b) => b.timestamp || 0)) : 0;
-  const stalled = freshestTs ? Date.now() / 1000 - freshestTs > STALL_THRESHOLD_SECS : true;
 
   return (
     <div className="container">
@@ -36,17 +39,9 @@ export function DagLivePage() {
 
       {data && (
         <>
-          {stalled && (
-            <div className="banner-stale" style={{ marginBottom: 14 }}>
-              <span className="dot stale" />
-              <div>
-                <strong>Chain is stalled.</strong> {fmtInt(data.dag.tip_count)} open tips at height{" "}
-                {fmtInt(data.dag.tip_height)}; newest bodied block is{" "}
-                {freshestTs ? timeAgo(freshestTs) : "unknown age"}. The view stays live and degrades
-                gracefully — header-only tips render as a dashed fan rather than invented branches.
-              </div>
-            </div>
-          )}
+          <ChainPhaseBanner tipHeight={data.dag.tip_height} freshestTs={freshestTs}>
+            Header-only tips render as a dashed fan rather than invented branches.
+          </ChainPhaseBanner>
 
           <div className="grid stat-grid" style={{ marginBottom: 16 }}>
             <div className="card stat"><div className="label">Tip height</div><div className="value sm">{fmtInt(data.dag.tip_height)}</div></div>
@@ -63,9 +58,9 @@ export function DagLivePage() {
           />
 
           <div className="rail" style={{ marginTop: 16 }}>
-            <strong>What you're seeing.</strong> The <span style={{ color: "var(--gold)" }}>amber</span> node is
-            the selected tip; solid <span style={{ color: "var(--red)" }}>red</span> nodes are competing bodied
-            tips; <span style={{ color: "var(--blue)" }}>blue</span> nodes are merged history (shaded by blue
+            <strong>What you're seeing.</strong> The <span style={{ color: "var(--accent)" }}>emerald</span> node
+            is the selected tip; solid <span style={{ color: "var(--red)" }}>red</span> nodes are competing bodied
+            tips; <span style={{ color: "var(--violet)" }}>violet</span> nodes are merged history (shaded by blue
             score). Bold edges are selected-parent links. The node RPC doesn't expose the per-block blue/red
             mergeset classification, so we colour only by roles we can prove — nothing is invented.
           </div>

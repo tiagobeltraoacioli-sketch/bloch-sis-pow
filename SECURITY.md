@@ -2,10 +2,17 @@
 
 ## Status
 
-Bloch-SIS is **pre-mainnet**. The chain currently runs a **zero-security testnet**
-regime of the Module-SIS PoW (relaxed residual): it is trivially forgeable,
-unaudited, and has no live network. **Do not deploy it or attach value.** The
-security and privacy posture we are building toward — and its open gates — is in
+The live network is the **Genesis-3 mainnet** (chain-id `0xB10C_0004`, launched
+2026-07-29): standard **SHA-256d proof-of-work** (double SHA-256,
+Bitcoin-compatible, little-endian target compare from height 0), mined by real
+ASICs, with **Bitcoin merged mining (AuxPoW) active since height 8,500**.
+(Earlier versions of this policy described the retired Module-SIS/testnet
+chains; that regime no longer exists on the live network.) The network is
+**unaudited**, nascent, low-hashrate, and **51%-attackable** — running a live
+mainnet is a designation, not a security claim, and no security property is
+claimed. **No external security audit has been contracted to date**; if any
+other page or document suggests otherwise, this statement is the accurate
+one. The posture we are building toward — and its open gates — is in
 [`docs/THREAT-MODEL.md`](./docs/THREAT-MODEL.md) and [`ROADMAP.md`](./ROADMAP.md).
 
 ## Reporting a vulnerability
@@ -28,8 +35,9 @@ will not pursue reporters acting in good faith.
 
 ## In scope
 
-- Consensus (GhostDAG-Q, reorg), the Module-SIS PoW, hybrid Falcon‖ML-DSA
-  signatures, serialization/deserialization.
+- Consensus (GhostDAG, reorg), the SHA-256d PoW and AuxPoW (merged-mining)
+  verification, difficulty retargeting, hybrid Falcon‖ML-DSA signatures,
+  serialization/deserialization.
 - The Coherence privacy layer (shielded pool, spend proofs) and network-layer
   metadata privacy (Dandelion++).
 - Node, wallet, keystore, RPC, and the attestation layer (L1–L3).
@@ -39,8 +47,10 @@ will not pursue reporters acting in good faith.
 
 ## Out of scope
 
-- The **known** zero-security testnet PoW regime (forgeable by design — this is
-  the S1 hardness gate, not a bug).
+- The **known** low-hashrate exposure — the network being 51%-attackable with
+  modest rented SHA-256d hashrate is a documented, disclosed gap, not a bug
+  (a concrete exploit beyond it — e.g. accepting blocks below target, or
+  forging AuxPoW commitments without the work — is in scope).
 - Gaps already documented as unaudited / claim-gated in the threat model (the
   documented gap is not a new finding — but a concrete exploit of it is).
 - Denial of service requiring implausible resources; issues only in third-party

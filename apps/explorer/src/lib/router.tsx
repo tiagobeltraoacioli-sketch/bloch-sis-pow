@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 import { createContext, useContext, useEffect, useState, ReactNode, useCallback } from "react";
 
 // Minimal history-based router — no dependency. SPA fallback (_redirects)
