@@ -281,28 +281,20 @@ pub fn coherence_binding(accumulator_root: &[u8; 32], nullifier_root: &[u8; 32])
     h.finalize().into()
 }
 
-/// Commitment over the global nullifier set — the value
-/// `ChainState::coherence_nullifier_root` carries and `state_root` commits.
-///
-/// **INTERIM (see [`crate::params::DS_NFSET`]):** the set is canonicalised
-/// (sorted, deduplicated — it is a set; input order and multiplicity cannot
-/// influence consensus), the count is bound, and the whole is hashed flat:
-/// `SHA3-256(DS_NFSET ‖ LE64(n) ‖ nf_0 ‖ … ‖ nf_{n-1})` with `nf_i` strictly
-/// ascending. Sound as a carriage commitment (any change to the set changes
-/// the root); it does not support efficient non-membership proofs — the C1.1
-/// SMT (`BLOCH-COHERENCE-UNDER-POS.md` §2.3) is the intended replacement, and
-/// it must land before the Genesis-4 ceremony runs or the genesis identity
-/// changes under it.
-pub fn nullifier_set_root(nullifiers: &[[u8; 32]]) -> [u8; 32] {
-    let set: std::collections::BTreeSet<&[u8; 32]> = nullifiers.iter().collect();
-    let mut h = Sha3_256::new();
-    h.update(crate::params::DS_NFSET);
-    h.update((set.len() as u64).to_le_bytes());
-    for nf in set {
-        h.update(nf);
-    }
-    h.finalize().into()
-}
+// `nullifier_set_root` used to live here. It is gone, and its absence is the
+// point: the nullifier-set root is a **Coherence** object, and this crate's
+// posture toward Coherence is carried-never-recomputed (§6.6.1). Computing it
+// here — under a `BLCH4:` tag, with SHA3-256, in the consensus crate — was the
+// PoS layer reaching into the shielded pool's business, and it produced an
+// interim commitment that would have had to change before the ceremony,
+// changing the genesis identity with it.
+//
+// The ratified definition is `coherence_core::NullifierSet` (a SHAKE-256
+// sparse Merkle tree under `bloch:coherence:nfset:v1`, with non-membership
+// proofs), specified in `docs/specs/COHERENCE-C1.1.md`. Whoever supplies
+// `coherence_nullifier_root` — the genesis ceremony, and later the node's
+// Coherence engine — computes it there, with the same code the SP1 guest runs.
+
 
 /// The coherence root the child header must carry: the [`coherence_binding`]
 /// of the **parent's committed** accumulator and nullifier-set roots.
@@ -736,19 +728,4 @@ mod coherence_tests {
         );
     }
 
-    /// The nullifier-set commitment is a commitment to the SET: input order
-    /// and duplicates cannot move it, the count is bound, and any element
-    /// change moves it.
-    #[test]
-    fn nullifier_set_root_is_canonical_over_the_set() {
-        let a = [0x01u8; 32];
-        let b = [0x02u8; 32];
-        let c = [0x03u8; 32];
-        assert_eq!(nullifier_set_root(&[a, b, c]), nullifier_set_root(&[c, a, b]));
-        assert_eq!(nullifier_set_root(&[a, b, c]), nullifier_set_root(&[a, a, b, c, c]));
-        assert_ne!(nullifier_set_root(&[a, b]), nullifier_set_root(&[a, b, c]));
-        assert_ne!(nullifier_set_root(&[]), nullifier_set_root(&[a]));
-        // Count binding: the empty set commits to a real digest, not zeros.
-        assert_ne!(nullifier_set_root(&[]), [0u8; 32]);
-    }
 }

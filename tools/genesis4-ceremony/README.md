@@ -136,8 +136,9 @@ nullifier<TAB><64-hex nf>     # sorted ascending, the complete spent set
 Dropped leaves burn every unspent note; a dropped nullifier set revives every
 spent one; reordered leaves change every future nullifier. The ceremony
 replays the leaves through the C1-frozen `coherence-core` tree, commits the
-accumulator root, the nullifier-set root (interim `DS_NFSET` commitment —
-pending the C1.1 SMT rev), both counts and the artifact digest into
+accumulator root, the nullifier-set root (the ratified C1.1 sparse Merkle
+tree — `coherence_core::NullifierSet`, `COHERENCE-C1.1.md`), both counts and
+the artifact digest into
 `state_root`, and stamps `coherence_root` with the §6.6.2 mirror binding
 (`derive::coherence_binding`). The document's `coherence-accumulator-root` /
 `coherence-nullifier-root` lines are what the node's genesis loader feeds

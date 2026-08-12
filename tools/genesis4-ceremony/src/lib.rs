@@ -61,7 +61,7 @@
 //! validator remainder (spec §8.1). No allocation number is restated here:
 //! change the constants crate and this tool follows, or fails to compile.
 
-use bloch_pos_committee::derive::{coherence_binding, nullifier_set_root};
+use bloch_pos_committee::derive::coherence_binding;
 use bloch_pos_committee::params::SLOTS_PER_EPOCH;
 use bloch_pos_committee::staking::{HYBRID_PK_BYTES, MIN_DEPOSIT_SAT, SUITE_MLDSA65_FALCON1024};
 use bloch_pos_committee::tokenomics_v4 as v4;
@@ -247,11 +247,18 @@ impl CoherencePool {
         tree.root()
     }
 
-    /// The carried nullifier-set root — the interim `DS_NFSET` commitment
-    /// from `bloch-pos-committee` (single derivation path: the ceremony
-    /// imports the consensus function, it does not restate it).
+    /// The carried nullifier-set root: the **C1.1** SHAKE-256 sparse Merkle
+    /// tree over the nullifier keyspace (`COHERENCE-C1.1.md`), computed by the
+    /// same `coherence-core` code the node and the SP1 guest run — never a
+    /// reimplementation.
+    ///
+    /// This was an interim SHA3 commitment under a `BLCH4:` tag until the C1.1
+    /// rev was ratified on 2026-08-12. The interim value would have had to
+    /// change before the real ceremony, and because the root is a leaf of the
+    /// genesis `state_root`, changing it changes the genesis block id — which
+    /// is exactly the kind of late move a ceremony cannot absorb.
     pub fn nullifier_root(&self) -> [u8; 32] {
-        nullifier_set_root(&self.nullifiers)
+        coherence_core::NullifierSet::from_iter(self.nullifiers.iter().copied()).root()
     }
 }
 
@@ -1671,7 +1678,11 @@ mod tests {
         // Now even the empty pool is a hash output all the way up.
         let g = kat_genesis();
         assert_eq!(g.coherence_accumulator_root, CommitmentTree::new().root());
-        assert_eq!(g.coherence_nullifier_root, nullifier_set_root(&[]));
+        assert_eq!(
+            g.coherence_nullifier_root,
+            coherence_core::NullifierSet::new().root(),
+            "an empty pool must commit the C1.1 empty-set root, not zeros"
+        );
         let h = genesis_header(&g);
         assert_eq!(
             h.coherence_root,

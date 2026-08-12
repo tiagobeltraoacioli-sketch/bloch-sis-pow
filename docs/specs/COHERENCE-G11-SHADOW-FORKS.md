@@ -44,9 +44,17 @@ validator re-derives from parent-committed state.
    (`CommittedState::genesis`, `derive::validate_block`) until it does; the
    fork is only fully closed when a real loader consumes the ceremony
    document.
-4. The nullifier-set root is the **interim** `DS_NFSET` commitment
-   (`derive::nullifier_set_root`); the C1.1 SMT rev supersedes it. If C1.1
-   lands between fork runs, rerun the ceremony — the genesis identity changes.
+4. The nullifier-set root is the **ratified C1.1** commitment: a SHAKE-256
+   sparse Merkle tree over the nullifier keyspace under `DOM_NFSET`
+   (`coherence_core::NullifierSet`, `COHERENCE-C1.1.md`). This replaced an
+   interim SHA3 commitment on 2026-08-12; any genesis id from a rehearsal run
+   before that date must be regenerated, because the root is a leaf of the
+   genesis `state_root`.
+
+   Fork C gains a case from the rev: a **non-membership proof** taken at the
+   pre-halt anchor must still verify against the carried root after the
+   crossing. If it does not, leaf-level state moved even though the root
+   matched, and the spend path is broken in a way the root alone cannot show.
 
 ## Fork A — mainnet rehearsal (empty pool)
 

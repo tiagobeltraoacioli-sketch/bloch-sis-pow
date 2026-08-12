@@ -117,18 +117,6 @@ pub const DS_WSCKPT: [u8; 16] = *b"BLCH4:WSCKPT\0\0\0\0";
 /// Coherence already is, and this tag is on the "rest of the chain" side of
 /// that line.
 pub const DS_COHERENCE: [u8; 16] = *b"BLCH4:COHERE\0\0\0\0";
-/// Coherence nullifier-set commitment (§6.6.2, the root `state_root` carries
-/// under `TAG_COHERENCE_NULLIFIERS`).
-///
-/// **INTERIM DEFINITION — pending the C1.1 rev.** C1 froze the nullifier
-/// derivation and named "the global nullifier set" consensus state, but never
-/// defined the set's commitment (`BLOCH-COHERENCE-UNDER-POS.md` F9/§2.3
-/// proposes a SHAKE-256 SMT for non-membership proofs). Until that rev is
-/// ratified, [`crate::derive::nullifier_set_root`] commits the sorted set
-/// under this tag. Replacing it before launch changes the genesis identity —
-/// it must be settled before the ceremony runs, and the C1.1 rev is the place
-/// to settle it.
-pub const DS_NFSET: [u8; 16] = *b"BLCH4:NFSET\0\0\0\0\0";
 /// State SMT node domain (§6.1) — every hash in [`crate::state_root`] starts
 /// with this tag so a state-tree node can never collide with a block id, a
 /// transaction Merkle node, or any other SHA3 use in the protocol.
