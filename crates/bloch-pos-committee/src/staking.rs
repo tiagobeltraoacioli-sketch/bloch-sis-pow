@@ -125,7 +125,12 @@ pub trait HybridKeyVerifier {
 
 /// Verify a hybrid signature over `signing_root` for a hybrid pubkey,
 /// enforcing the fixed split points and the AND rule.
-fn verify_hybrid(
+///
+/// `pub(crate)` — not private — because the weak-subjectivity envelope
+/// ([`crate::ws`]) verifies the same hybrid arrangement over raw pubkeys, and
+/// a second copy of the AND-composition would be a second place for the OR
+/// bug to enter. One derivation path, called from both sites.
+pub(crate) fn verify_hybrid(
     pubkey: &[u8; HYBRID_PK_BYTES],
     signing_root: &[u8; 32],
     sig: &[u8],
