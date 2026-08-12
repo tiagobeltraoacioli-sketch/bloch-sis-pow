@@ -42,7 +42,7 @@ consensus-wired: `src/main.rs:2690-2711` gates block acceptance on
 returns **0 on Genesis3Mainnet** (active from genesis). The node builds it
 under `--features euvm` (off by default; `Dockerfile.euvm` builds with it).
 
-**Licensing note.** The `bloch-protocol` L2 sources carry MIT OR Apache-2.0
+**Licensing note.** The `bloch-protocol` L2 sources carry MIT OR Apache-2.0 — a different repository, and not the Genesis-4 licence (superseded here by AGPL-3.0-or-later, ADR-039)
 headers. Porting them into this AGPL-3.0-or-later repo is licence-compatible
 (permissive → AGPL), but every ported file gets a new
 `SPDX-License-Identifier: AGPL-3.0-or-later` header per the fleet rule.

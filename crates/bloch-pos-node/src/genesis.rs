@@ -23,6 +23,7 @@ use std::io;
 use std::path::Path;
 
 use bloch_pos_committee::header::{BlockHeaderV4, BlockId, VERSION_G4};
+use bloch_pos_committee::state_root::EvmCommitment;
 use bloch_pos_committee::transition::{CommittedState, GenesisValidator};
 use sha3::{Digest, Sha3_256};
 
@@ -168,6 +169,16 @@ impl Manifest {
             [0u8; 32],
             [0u8; 32],
             [0u8; 32],
+            // Empty EVM segment at genesis. Spelled out rather than defaulted
+            // so that adding a carried component breaks this call site and
+            // someone decides what genesis commits, instead of it silently
+            // becoming zero.
+            EvmCommitment {
+                account_root: [0u8; 32],
+                receipts_root: [0u8; 32],
+                gas_used: 0,
+                base_fee_per_gas: 0,
+            },
         )
     }
 
