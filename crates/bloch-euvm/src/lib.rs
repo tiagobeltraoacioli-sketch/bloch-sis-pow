@@ -116,6 +116,24 @@ pub enum Op {
     Dup,
     Drop,
     Swap,
+    /// **Assert the stack is exactly `n` deep**, without consuming anything.
+    ///
+    /// This exists because every fixed-offset [`Op::Pick`] in a compiled program is
+    /// *top-relative*, while the values it means to read (the datum, a specific
+    /// redeemer slot) sit at fixed positions from the **bottom**. `spend()` seeds the
+    /// stack `[datum] ++ redeemer` and imposes no length check, so a spender who pads
+    /// the redeemer with one extra leading value shifts every `Pick` offset by one and
+    /// the program silently reads an attacker-controlled slot instead of the one it
+    /// was compiled to read. That is not a bug in one module: it is a property of
+    /// top-relative addressing with an unconstrained seed, and it defeated the
+    /// TransferPolicy freeze gate (proven by `tests/audit_modules.rs`).
+    ///
+    /// Pinning the depth turns the assumption into a checked precondition. Emitted as
+    /// the first op of every compiled module, so a padded redeemer aborts before any
+    /// `Pick` runs, fail-closed. Because the assertion is *inside the program*, it is
+    /// part of [`validator_hash`] — the arity a validator was compiled for is part of
+    /// its identity and cannot be renegotiated by the spender.
+    ExpectDepth(u8),
     /// Copy the element `n` positions below the top to the top (`Pick(0)` == `Dup`).
     /// Like Bitcoin's `OP_PICK` — lets a validator reach redeemer values that sit
     /// under the datum (e.g. a pubkey/signature pair) without consuming them.
@@ -358,6 +376,11 @@ pub fn run(
                 st.push(a);
                 st.push(b);
             }
+            Op::ExpectDepth(n) => {
+                if st.len() != *n as usize {
+                    return Err(VmError::Assert);
+                }
+            }
             Op::Pick(n) => {
                 let idx = st.len().checked_sub(1 + *n as usize).ok_or(VmError::StackUnderflow)?;
                 let v = st[idx].clone();
@@ -492,6 +515,7 @@ pub fn encode_program(program: &[Op]) -> Vec<u8> {
             Op::Drop => o.push(0x11),
             Op::Swap => o.push(0x12),
             Op::Pick(n) => { o.push(0x13); o.push(*n); }
+            Op::ExpectDepth(n) => { o.push(0x14); o.push(*n); }
             Op::Add => o.push(0x20),
             Op::Sub => o.push(0x21),
             Op::Mul => o.push(0x22),

@@ -58,6 +58,7 @@
 //!   validator that asserts membership against a state root read from ctx" — is exact.
 //! - Unaudited reference. Designed ≠ built ≠ booted.
 
+use crate::minting::{MINT_CTX_DELTA, MINT_CTX_PRIOR_SUPPLY, MINT_CTX_SIGHASH};
 use crate::{validator_hash, Op};
 use sha2::{Digest, Sha256};
 
@@ -200,18 +201,51 @@ impl ModuleKind {
 /// Supply → minting policy. Stack seed `[datum, requested:Int, sig:Bytes]`.
 /// Asserts `requested <= cap`, then verifies the issuer signed the sighash.
 fn compile_supply(c: &SupplyConfig) -> Vec<Op> {
+    // ── HIGH severity fix, 2026-08-11 ────────────────────────────────────────
+    //
+    // The previous emitter gated on a `requested` value the SPENDER put in the
+    // redeemer, and compared *that* to `cap`. Nothing bound `requested` to the
+    // amount actually minted. Since this program's hash IS the token's asset id
+    // and policy id (`CompiledToken::policy_id`), the real delta lives in
+    // `ctx.fields[MINT_CTX_DELTA]` and the on-chain supply in
+    // `MINT_CTX_PRIOR_SUPPLY` — and the compiled program read NEITHER. With
+    // `cap = 1_000` an authorised issuer minted 1_000_000_000 in one spend,
+    // 1e6x the advertised cap, by seeding `requested = 0`. Proven by
+    // `tests/audit_modules_supply.rs`.
+    //
+    // The advertised property was "fixed maximum supply", so the gate must be
+    // over TOTAL supply, not per-spend: `prior + delta <= cap`. That is exactly
+    // `minting::fixed_supply_cap_policy`, whose contrast test in the same file
+    // showed the mint machinery was never at fault — only this emitter. The two
+    // are now the same check because a second way to express one rule is how
+    // they drift apart.
+    //
+    // `cap` is pushed unmodified (never `cap + 1`) — the F3/F5 overflow lesson
+    // from `fixed_supply_cap_policy`.
+    //
+    // Burns (negative delta) satisfy the cap for free, which is correct: a cap
+    // bounds issuance, not destruction.
     vec![
-        // cap gate: requested <= cap  ==  not(cap < requested)
-        Op::PushInt(c.cap as i128), // [d, req, sig, cap]
-        Op::Pick(2),                // copy req to top: [d, req, sig, cap, req]
-        Op::Lt,                     // (cap < req): [d, req, sig, (cap<req)]
-        Op::Not,                    // (req <= cap): [d, req, sig, ok]
-        Op::Verify,                 // assert within cap: [d, req, sig]
-        // issuer auth: VerifySig(sighash, issuer_pubkey, sig)
-        Op::CtxField(FIELD_SIGHASH),          // [d, req, sig, msg]
-        Op::PushBytes(c.issuer_pubkey.clone()), // [d, req, sig, msg, issuer]
-        Op::Pick(2),                          // copy sig: [.., issuer, sig]
-        Op::VerifySig,                        // -> [d, req, sig, verified]
+        // Redeemer seed is `[sig]` and nothing else. `requested` is GONE: a
+        // number the spender chooses cannot be an input to the rule that binds
+        // the spender.
+        Op::ExpectDepth(1),
+        // total-supply gate: prior + delta <= cap  ==  not(cap < prior + delta)
+        Op::PushInt(c.cap as i128),          // [sig, cap]
+        Op::CtxField(MINT_CTX_PRIOR_SUPPLY), // [sig, cap, prior]
+        Op::CtxField(MINT_CTX_DELTA),        // [sig, cap, prior, delta]
+        Op::Add,                             // [sig, cap, new_supply]
+        Op::Lt,                              // [sig, (cap < new_supply)]
+        Op::Not,                             // [sig, (new_supply <= cap)]
+        Op::Verify,                          // assert within cap: [sig]
+        // issuer auth. Consumed by Swap rather than copied by Pick: with the
+        // stack pinned at one element there is nothing to reach past, and a
+        // program with no fixed offsets cannot be shifted at all.
+        Op::CtxField(MINT_CTX_SIGHASH),         // [sig, msg]
+        Op::Swap,                               // [msg, sig]
+        Op::PushBytes(c.issuer_pubkey.clone()), // [msg, sig, issuer]
+        Op::Swap,                               // [msg, issuer, sig]
+        Op::VerifySig,                          // -> [verified]
     ]
 }
 
@@ -219,6 +253,11 @@ fn compile_supply(c: &SupplyConfig) -> Vec<Op> {
 /// Allowed iff `frozen == 0` OR the authority's signature verifies.
 fn compile_transfer_policy(c: &TransferPolicyConfig) -> Vec<Op> {
     vec![
+        // Seed is [frozen(datum), sig]. THIS pin is the freeze bypass fix: without
+        // it, one padding value shifted Pick(2) off the datum and onto an
+        // attacker-supplied slot, so a frozen output spent with no authority
+        // signature (tests/audit_modules.rs).
+        Op::ExpectDepth(2),
         // authority sig leg
         Op::CtxField(FIELD_SIGHASH),             // [frozen, sig, msg]
         Op::PushBytes(c.authority_pubkey.clone()), // [frozen, sig, msg, auth]
@@ -239,6 +278,8 @@ fn compile_transfer_policy(c: &TransferPolicyConfig) -> Vec<Op> {
 /// Passes iff `sha256d(witness) == ctx.fields[FIELD_KYC_ROOT]`.
 fn compile_kyc(_c: &KycConfig) -> Vec<Op> {
     vec![
+        // Seed is [datum, witness].
+        Op::ExpectDepth(2),
         Op::Sha256d,                 // [d, sha256d(witness)]
         Op::CtxField(FIELD_KYC_ROOT), // [d, leaf_hash, root]
         Op::Eq,                      // [d, (leaf_hash == root)]
@@ -249,6 +290,8 @@ fn compile_kyc(_c: &KycConfig) -> Vec<Op> {
 /// Asserts `height >= unlock_height` (read from ctx), then verifies the beneficiary sig.
 fn compile_vesting(c: &VestingConfig) -> Vec<Op> {
     vec![
+        // Seed is [datum, sig].
+        Op::ExpectDepth(2),
         // height gate: height >= unlock  ==  not(height < unlock)
         Op::CtxField(FIELD_HEIGHT),  // [d, sig, height]
         Op::PushInt(c.unlock_height), // [d, sig, height, unlock]
@@ -291,6 +334,13 @@ fn compile_governance(c: &GovernanceConfig) -> Vec<Op> {
     }
 
     let mut p = Vec::new();
+    // Seed is [datum, sig_1..sig_m] — arity depends on the signer count, so the
+    // pin does too. Every `Pick(depth)` below is computed from `m`, which makes
+    // this module the one where a shifted stack does the most damage: pad the
+    // redeemer and each signer's slot maps to the wrong value, so one attacker
+    // blob can be verified against several signers' keys. Guarded above:
+    // m <= 253, so `1 + m` fits a u8 with room to spare.
+    p.push(Op::ExpectDepth((1 + m) as u8));
     // acc := 0  →  invariant per iteration: stack = [datum, sig_1..sig_m, acc]
     p.push(Op::PushInt(0));
     for (i0, pk) in c.signers.iter().enumerate() {
@@ -317,6 +367,8 @@ fn compile_governance(c: &GovernanceConfig) -> Vec<Op> {
 /// BOTH the BTC (ECDSA) and the PQ signature must verify.
 fn compile_custody(c: &CustodyConfig) -> Vec<Op> {
     vec![
+        // Seed is [datum, ecdsa_sig, pq_sig].
+        Op::ExpectDepth(3),
         // ECDSA (BTC) leg — must pass
         Op::CtxField(FIELD_SIGHASH),        // [d, es, ps, msg]
         Op::PushBytes(c.btc_pubkey.clone()), // [d, es, ps, msg, btc]
@@ -472,6 +524,35 @@ mod tests {
     const MSG: &[u8] = b"ustav-sighash";
 
     /// Build a Ctx with the standard Ustav field layout.
+    /// Run a Supply program on the contract it actually has: a **minting policy**.
+    ///
+    /// Supply is not a spend validator and must not be exercised as one. Its stack
+    /// seed is the redeemer alone (no datum), and its gate reads the mint context —
+    /// `MINT_CTX_DELTA` and `MINT_CTX_PRIOR_SUPPLY`. The in-crate tests used to run
+    /// it through `run_module`, which prepends a datum and supplies the *spend*
+    /// context; that mismatch is the same confusion that let the cap gate read a
+    /// redeemer-supplied `requested` for so long. `CompiledToken::policy_id` and the
+    /// module docs are the authority: the hash of this program is the asset id.
+    fn run_supply_policy(
+        cm: &CompiledModule,
+        redeemer: Vec<Val>,
+        prior_supply: i128,
+        delta: i128,
+        v: &dyn SigVerifier,
+    ) -> Result<bool, VmError> {
+        let ctx = Ctx {
+            fields: vec![
+                Val::Bytes(MSG.to_vec()), // MINT_CTX_SIGHASH
+                Val::Int(delta),          // MINT_CTX_DELTA
+                Val::Int(0),              // MINT_CTX_HEIGHT
+                Val::Int(prior_supply),   // MINT_CTX_PRIOR_SUPPLY
+            ],
+            ..Default::default()
+        };
+        let mut gas = 100_000;
+        crate::run(&cm.program, redeemer, &ctx, v, &mut gas)
+    }
+
     fn ctx_with(height: i128, kyc_root: Vec<u8>) -> Ctx {
         Ctx {
             fields: vec![
@@ -609,26 +690,55 @@ mod tests {
     #[test]
     fn supply_mint_within_cap_and_signed() {
         let cm = &compile_charter(&demo_charter()).validators[0];
-        let ctx = ctx_with(0, vec![]);
         let issuer = b"issuer-pk".to_vec();
         let sig = b"issuer-sig".to_vec();
         let v = MockVerifier { good: vec![(MSG.to_vec(), issuer.clone(), sig.clone())] };
+        let no = MockVerifier { good: vec![] };
 
-        // within cap + valid issuer sig → true. redeemer = [requested, sig]
+        // The gate is over TOTAL supply, so it is the (prior, delta) pair that is
+        // tested, never a number the spender writes in the redeemer. demo cap is
+        // 1_000_000.
+        assert_eq!(run_supply_policy(cm, vec![Val::Bytes(sig.clone())], 0, 500_000, &v), Ok(true));
+        // Same delta, but on top of a supply that is already near the cap: the mint
+        // that was fine from zero is now over. This is the property the old emitter
+        // could not express at all, because it never saw prior supply.
         assert_eq!(
-            run_module(cm, Val::Int(0), vec![Val::Int(500_000), Val::Bytes(sig.clone())], &ctx, &v),
-            Ok(true)
-        );
-        // over cap → cap gate assertion fires
-        assert_eq!(
-            run_module(cm, Val::Int(0), vec![Val::Int(2_000_000), Val::Bytes(sig.clone())], &ctx, &v),
+            run_supply_policy(cm, vec![Val::Bytes(sig.clone())], 600_000, 500_000, &v),
             Err(VmError::Assert)
         );
-        // within cap but bad sig → false (unauthorized issuer)
-        let no = MockVerifier { good: vec![] };
+        // Single mint over the cap → cap gate asserts.
         assert_eq!(
-            run_module(cm, Val::Int(0), vec![Val::Int(500_000), Val::Bytes(sig)], &ctx, &no),
-            Ok(false)
+            run_supply_policy(cm, vec![Val::Bytes(sig.clone())], 0, 2_000_000, &v),
+            Err(VmError::Assert)
+        );
+        // Burns are always within cap: a cap bounds issuance, not destruction.
+        assert_eq!(run_supply_policy(cm, vec![Val::Bytes(sig.clone())], 900_000, -100, &v), Ok(true));
+        // Within cap but unauthorized issuer → false (not an abort: an unsigned mint
+        // is a rejected mint, not a malformed one).
+        assert_eq!(run_supply_policy(cm, vec![Val::Bytes(sig)], 0, 1, &no), Ok(false));
+    }
+
+    /// THE REGRESSION TEST for the HIGH finding. A redeemer value can no longer
+    /// influence the cap gate, because there is no such value: the seed is `[sig]`
+    /// and a padded redeemer is refused before any gate runs.
+    #[test]
+    fn supply_cap_cannot_be_bypassed_by_a_redeemer_supplied_amount() {
+        let cm = &compile_charter(&demo_charter()).validators[0];
+        let sig = b"issuer-sig".to_vec();
+        let v = MockVerifier { good: vec![(MSG.to_vec(), b"issuer-pk".to_vec(), sig.clone())] };
+
+        // The historical attack verbatim: seed `requested = 0` and mint 1e9 against a
+        // cap of 1e6. It used to be AUTHORIZED. The extra redeemer slot now trips the
+        // arity pin, and even if it did not, the gate reads the real delta.
+        assert_eq!(
+            run_supply_policy(cm, vec![Val::Int(0), Val::Bytes(sig.clone())], 0, 1_000_000_000, &v),
+            Err(VmError::Assert)
+        );
+        // And with the honest arity, the over-cap delta is still refused — so the
+        // rejection above is the cap doing its job, not merely the arity check.
+        assert_eq!(
+            run_supply_policy(cm, vec![Val::Bytes(sig)], 0, 1_000_000_000, &v),
+            Err(VmError::Assert)
         );
     }
 
@@ -977,16 +1087,15 @@ mod tests {
     #[test]
     fn supply_wrong_redeemer_type_fails_closed_with_type_error_not_panic() {
         let cm = &compile_charter(&demo_charter()).validators[0];
-        let ctx = ctx_with(0, vec![]);
         let no = MockVerifier { good: vec![] };
-        let res = run_module(
-            cm,
-            Val::Int(0),
-            vec![Val::Bytes(b"not-an-int".to_vec()), Val::Bytes(b"sig".to_vec())],
-            &ctx,
-            &no,
+        // The old version fed a Bytes where the emitter expected the `requested` Int.
+        // That slot no longer exists — the cap gate reads the mint context. What
+        // remains type-confusable is the signature slot, so that is what is pinned:
+        // an Int where VerifySig wants Bytes must surface a TypeError, never a panic.
+        assert_eq!(
+            run_supply_policy(cm, vec![Val::Int(7)], 0, 1, &no),
+            Err(VmError::TypeError("expected Bytes"))
         );
-        assert_eq!(res, Err(VmError::TypeError("expected Int")));
     }
 
     /// Fail-closed on a type-confused witness: the KYC witness must be `Bytes` (fed
@@ -1007,15 +1116,24 @@ mod tests {
         let ct = compile_charter(&demo_charter());
         let ctx = ctx_with(2_400, sha256d(b"member").to_vec());
         let v = MockVerifier { good: vec![] };
+        // Supply is checked separately below: it is a minting policy, so running it
+        // through `spend()` seeds it with a datum it does not take and the arity pin
+        // aborts before gas is the binding constraint. Testing it on the wrong
+        // contract is what let its cap gate stay broken.
         let redeemers: Vec<Vec<Val>> = vec![
-            vec![Val::Int(1), Val::Bytes(b"s".to_vec())],
             vec![Val::Bytes(b"s".to_vec())],
             vec![Val::Bytes(b"member".to_vec())],
             vec![Val::Bytes(b"s".to_vec())],
             vec![Val::Bytes(b"s1".to_vec()), Val::Bytes(b"s2".to_vec()), Val::Bytes(b"s3".to_vec())],
             vec![Val::Bytes(b"e".to_vec()), Val::Bytes(b"p".to_vec())],
         ];
-        for (cm, redeemer) in ct.validators.iter().zip(redeemers.into_iter()) {
+        {
+            let cm = &ct.validators[0];
+            let mut gas = 1;
+            let res = crate::run(&cm.program, vec![Val::Bytes(b"s".to_vec())], &ctx, &v, &mut gas);
+            assert_eq!(res, Err(VmError::OutOfGas), "supply: expected OutOfGas, got {res:?}");
+        }
+        for (cm, redeemer) in ct.validators.iter().skip(1).zip(redeemers.into_iter()) {
             let out = ExtOutput { value: blch(1000), validator_hash: cm.validator_hash, datum: Val::Int(0) };
             let mut gas = 1; // below even the cheapest single op in these programs
             let res = spend(&out, &cm.program, redeemer, &ctx, &v, &mut gas);
@@ -1046,18 +1164,43 @@ mod tests {
         // operand (PushBytes/Pick of a pubkey or sig) now costs +1 word over the old flat
         // model, so every signature-bearing module is a few gas dearer than the pre-F2
         // baseline — an exact, input-independent regression guard against stray ops.
+        // The `+ D` on every line is the arity pin (`Op::ExpectDepth`) that now leads
+        // every emitted program — one unit, charged once, named rather than folded
+        // into the totals so the next reader can see what it is.
+        const D: u64 = 1;
         let cases: Vec<(usize, Vec<Val>, u64)> = vec![
-            (0, vec![Val::Int(500_000), Val::Bytes(b"s".to_vec())], 1010), // supply
-            (1, vec![Val::Bytes(b"s".to_vec())], 1014),                    // transfer-policy
-            (2, vec![Val::Bytes(b"member".to_vec())], 63),                 // kyc-gate
-            (3, vec![Val::Bytes(b"s".to_vec())], 1010),                    // vesting
+            (1, vec![Val::Bytes(b"s".to_vec())], 1014 + D),                // transfer-policy
+            (2, vec![Val::Bytes(b"member".to_vec())], 63 + D),             // kyc-gate
+            (3, vec![Val::Bytes(b"s".to_vec())], 1010 + D),                // vesting
             (
                 4,
                 vec![Val::Bytes(b"s1".to_vec()), Val::Bytes(b"s2".to_vec()), Val::Bytes(b"s3".to_vec())],
-                1009 * 3 + 4, // governance, m=3
+                1009 * 3 + 4 + D, // governance, m=3
             ),
-            (5, vec![Val::Bytes(ecdsa_sig(b"btc-pk")), Val::Bytes(b"pqsig".to_vec())], 2011), // custody
+            (5, vec![Val::Bytes(ecdsa_sig(b"btc-pk")), Val::Bytes(b"pqsig".to_vec())], 2011 + D), // custody
         ];
+        {
+            // Supply on its real contract (see `run_supply_policy`). Two runs, same
+            // input: gas must be identical, and independent of the mint amounts.
+            let cm = &ct.validators[0];
+            let mut used = Vec::new();
+            for delta in [1i128, 999_999] {
+                let mctx = Ctx {
+                    fields: vec![
+                        Val::Bytes(MSG.to_vec()),
+                        Val::Int(delta),
+                        Val::Int(0),
+                        Val::Int(0),
+                    ],
+                    ..Default::default()
+                };
+                let mut gas = 1_000_000;
+                let _ = crate::run(&cm.program, vec![Val::Bytes(b"s".to_vec())], &mctx, &v, &mut gas);
+                used.push(1_000_000 - gas);
+            }
+            assert_eq!(used[0], used[1], "supply: gas must not depend on the mint amount");
+            assert_eq!(used[0], 1016, "supply: gas-cost formula regression");
+        }
         for (idx, redeemer, expected_gas) in cases {
             let cm = &ct.validators[idx];
             for _ in 0..2 {
@@ -1082,34 +1225,40 @@ mod tests {
                 modules: vec![ModuleKind::Supply(SupplyConfig { cap, issuer_pubkey: b"iss".to_vec() })],
             });
             let cm = &ct.validators[0];
-            let ctx = ctx_with(0, vec![]);
             let v = MockVerifier { good: vec![(MSG.to_vec(), b"iss".to_vec(), b"sig".to_vec())] };
+            let sig = || vec![Val::Bytes(b"sig".to_vec())];
 
+            // new_supply == cap passes (the gate is `<=`), reached from zero...
             assert_eq!(
-                run_module(cm, Val::Int(0), vec![Val::Int(cap as i128), Val::Bytes(b"sig".to_vec())], &ctx, &v),
+                run_supply_policy(cm, sig(), 0, cap as i128, &v),
                 Ok(true),
-                "cap={cap}: requested==cap should pass"
+                "cap={cap}: new_supply==cap should pass"
             );
+            // ...and reached incrementally, which is the case the per-spend gate
+            // could never see: prior already at cap-1, one more unit lands exactly on.
+            if cap > 0 {
+                assert_eq!(
+                    run_supply_policy(cm, sig(), cap as i128 - 1, 1, &v),
+                    Ok(true),
+                    "cap={cap}: prior+delta==cap should pass"
+                );
+            }
             if cap < u64::MAX {
                 assert_eq!(
-                    run_module(
-                        cm,
-                        Val::Int(0),
-                        vec![Val::Int(cap as i128 + 1), Val::Bytes(b"sig".to_vec())],
-                        &ctx,
-                        &v
-                    ),
+                    run_supply_policy(cm, sig(), 0, cap as i128 + 1, &v),
                     Err(VmError::Assert),
-                    "cap={cap}: requested==cap+1 should assert"
+                    "cap={cap}: new_supply==cap+1 must assert"
+                );
+                // The incremental overshoot too — one unit past a full supply.
+                assert_eq!(
+                    run_supply_policy(cm, sig(), cap as i128, 1, &v),
+                    Err(VmError::Assert),
+                    "cap={cap}: minting on top of a full supply must assert"
                 );
             }
         }
     }
 
-    /// Exhaustive property check over a safe-range (m=5, well under the u8-depth
-    /// wraparound) governance module: for every threshold `0..=5` and every subset
-    /// of the 5 signers supplying a valid signature, the gate passes iff
-    /// `count(valid) >= threshold` — the invariant the module's docs promise.
     #[test]
     fn property_governance_result_matches_signature_count_over_all_subsets() {
         let signers: Vec<Vec<u8>> = (0..5).map(|i| format!("g{i}").into_bytes()).collect();
