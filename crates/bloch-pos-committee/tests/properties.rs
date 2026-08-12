@@ -707,8 +707,10 @@ fn sampling_survives_stake_totals_beyond_u64() {
 
 #[test]
 fn registry_survives_the_full_supply_delegated() {
-    // The entire 100 B supply bonded across 150 delegations: resolution, the
-    // cap fixpoint, and the concentration metrics must all stay exact.
+    // The entire supply bonded across 150 delegations: resolution, the cap
+    // fixpoint, and the concentration metrics must all stay exact. At 21 B the
+    // total no longer approaches the u64 wrap point — the products still do,
+    // which is why the arithmetic stays u128.
     let per = tk::TOTAL_SUPPLY_BLOCH / 150; // BLCH each
     let ds: Vec<Delegation> = (0..150u32)
         .map(|i| Delegation {
@@ -722,7 +724,11 @@ fn registry_survives_the_full_supply_delegated() {
         .collect();
     let r = Registry::resolve(&ds, 0);
     assert_eq!(r.total_active(), per * tk::SAT_PER_BLOCH * 150);
-    assert!(r.total_active() > u64::MAX as u128 / 2, "test is not at supply scale");
+    assert_eq!(
+        r.total_active() / tk::SAT_PER_BLOCH,
+        tk::TOTAL_SUPPLY_BLOCH / 150 * 150,
+        "test is not at supply scale"
+    );
     let vs = r.validators();
     assert_eq!(vs.len(), 150);
     for v in &vs {

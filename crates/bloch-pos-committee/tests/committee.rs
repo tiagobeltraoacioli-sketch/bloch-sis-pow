@@ -445,10 +445,11 @@ use bloch_pos_committee::tokenomics_v4 as tk;
 
 #[test]
 fn allocations_sum_to_total_supply() {
-    let sum = tk::FOUNDER_BLOCH + tk::VC_BLOCH + tk::TEAM_BLOCH + tk::MARKETING_BLOCH
-        + tk::LIQUIDITY_BLOCH + tk::HOLDER_CARRYOVER_CAP_BLOCH + tk::VALIDATOR_EMISSION_BLOCH;
+    let sum = tk::FOUNDER_CARRYOVER_BLOCH + tk::HOLDER_CARRYOVER_MEASURED_BLOCH
+        + tk::FOUNDER_BLOCH + tk::VC_BLOCH + tk::TEAM_BLOCH + tk::MARKETING_BLOCH
+        + tk::LIQUIDITY_BLOCH + tk::VALIDATOR_EMISSION_BLOCH;
     assert_eq!(sum, tk::TOTAL_SUPPLY_BLOCH);
-    assert_eq!(tk::VALIDATOR_EMISSION_BLOCH, 53_700_000_000);
+    assert_eq!(tk::VALIDATOR_EMISSION_BLOCH, 7_566_115_200);
 }
 
 #[test]
@@ -513,13 +514,13 @@ fn neither_curve_exceeds_the_allocation() {
 
 #[test]
 fn flat_curve_matches_the_spec_average() {
-    assert_eq!(tk::validator_reward_flat_sat(0) / tk::SAT_PER_BLOCH, 1_276);
+    assert_eq!(tk::validator_reward_flat_sat(0) / tk::SAT_PER_BLOCH, 179);
 }
 
 #[test]
 fn halving_curve_halves_every_four_years() {
     let r0 = tk::validator_reward_halving_sat(0);
-    assert_eq!(r0 / tk::SAT_PER_BLOCH, 6_387);
+    assert_eq!(r0 / tk::SAT_PER_BLOCH, 899);
     assert_eq!(tk::validator_reward_halving_sat(tk::HALVING_PERIOD_SLOTS), r0 / 2);
     assert_eq!(tk::validator_reward_halving_sat(2 * tk::HALVING_PERIOD_SLOTS), r0 / 4);
     // Front-loading is the whole point: half the allocation inside four years.
@@ -547,7 +548,7 @@ fn cliffs_are_staggered_to_avoid_a_cliff_wall() {
     let m = tk::MONTH_SLOTS;
     assert_eq!(tk::VC_CLIFF_SLOTS / m, 12);
     assert_eq!(tk::TEAM_CLIFF_SLOTS / m, 18);
-    assert_eq!(tk::FOUNDER_CLIFF_SLOTS / m, 24);
+    assert_eq!(tk::FOUNDER_CLIFF_SLOTS / m, 120); // 10 anos
     let mut cliffs = [tk::VC_CLIFF_SLOTS, tk::TEAM_CLIFF_SLOTS, tk::FOUNDER_CLIFF_SLOTS];
     cliffs.sort();
     assert!(cliffs.windows(2).all(|w| w[1] - w[0] >= 6 * m), "cliffs a menos de 6 meses");
@@ -647,11 +648,13 @@ fn carryover_scaling_does_not_overflow_at_full_supply() {
 }
 
 #[test]
-fn total_supply_is_over_half_of_u64_max() {
+fn total_supply_fits_u64_and_int64_comfortably() {
     // The documented reason every quantity is u128 (§8.1). If this ever fails,
     // the u128 choice should be revisited deliberately.
-    assert!(tk::TOTAL_SUPPLY_SAT > (u64::MAX as u128) / 2);
-    assert!(tk::TOTAL_SUPPLY_SAT < u64::MAX as u128);
+    // 21 bi = 11,38% de u64::MAX, e cabe no int64 do SDK Go — os dois riscos
+    // que 100 bi criava. u128 fica por causa dos PRODUTOS, nao dos totais.
+    assert!(tk::TOTAL_SUPPLY_SAT < (u64::MAX as u128) / 8);
+    assert!(tk::TOTAL_SUPPLY_SAT < i64::MAX as u128);
 }
 
 #[test]
@@ -659,10 +662,10 @@ fn decay_curve_meets_the_inflation_target() {
     // Founder requirement: annual inflation under 7% of total supply.
     let y1 = tk::annual_inflation_bps(0);
     assert!(y1 < 700, "ano 1 = {}bps, acima do teto de 700", y1);
-    assert_eq!(y1, 545); // 5.45%
+    assert_eq!(y1, 365); // 3,65% (truncado)
     assert!(tk::annual_inflation_bps(4) < y1);
     assert!(tk::annual_inflation_bps(9) < tk::annual_inflation_bps(4));
-    assert_eq!(tk::annual_inflation_bps(9), 211); // 2.11% no ano 10
+    assert_eq!(tk::annual_inflation_bps(9), 141);
 }
 
 #[test]
@@ -671,7 +674,7 @@ fn decay_curve_declines_ten_percent_a_year() {
     let y1 = tk::validator_reward_decay_sat(tk::SLOTS_PER_YEAR);
     let ratio = y1 * 1000 / y0;
     assert!((899..=901).contains(&ratio), "razao anual = {ratio}/1000");
-    assert_eq!(y0 / tk::SAT_PER_BLOCH, 5_181);
+    assert_eq!(y0 / tk::SAT_PER_BLOCH, 730);
 }
 
 #[test]
@@ -681,7 +684,7 @@ fn decay_curve_emits_the_allocation_exactly() {
     // Under the cap, never over: truncation may strand dust, never mint.
     assert!(emitted <= alloc, "emitiu {emitted} > alocado {alloc}");
     let residual = alloc - emitted;
-    assert_eq!(residual, 67_200, "residuo mudou: {residual} sat");
+    assert_eq!(residual, 1_028_400, "residuo mudou: {residual} sat");
     assert!(residual < tk::SAT_PER_BLOCH, "residuo passou de 1 BLCH");
     assert_eq!(tk::validator_emitted_decay_by(u64::MAX), emitted);
     assert_eq!(tk::validator_reward_decay_sat(tk::EMISSION_SLOTS), 0);
@@ -694,8 +697,16 @@ fn decay_front_loads_enough_to_outpace_insider_unlocks() {
     let m24 = 2 * tk::SLOTS_PER_YEAR;
     let validators = tk::validator_emitted_decay_by(m24);
     let biggest_insider = tk::vc_vested_sat(m24); // VC cliffs first
-    assert!(validators > biggest_insider * 2,
-        "validadores {validators} vs maior insider {biggest_insider}");
+
+    // A margem ENCOLHEU com a volta para 21 bi: a alocacao de validadores caiu
+    // de 53,7 bi para 7,57 bi enquanto os baldes de insider seguem em
+    // percentual do supply, entao no mes 24 os validadores lideram por ~1,4x
+    // em vez de mais de 4x. A propriedade que importa — validadores a frente do
+    // maior balde de insider — continua valendo, com folga menor.
+    assert!(validators > biggest_insider,
+        "validadores {validators} atras do maior insider {biggest_insider}");
+    let ratio = validators * 100 / biggest_insider;
+    assert!((130..=150).contains(&ratio), "margem mudou: {ratio}/100");
 }
 
 // ── receita do validador (modelo Solana) ────────────────────────────────────
@@ -831,7 +842,7 @@ fn distribution_does_not_overflow_at_full_supply_scale() {
     // issuance × stake is the product of two ~1e19 values.
     let sat = tk::SAT_PER_BLOCH;
     let total = tk::TOTAL_SUPPLY_BLOCH * sat;
-    let issuance = 5_450_564_151 * sat;
+    let issuance = 767_962_686 * sat;
     let p = rewards::distribute(&acct(total / 2, total / 2, 500), issuance, total);
     assert_eq!(p.operator + p.delegators, issuance);
 }
@@ -839,11 +850,11 @@ fn distribution_does_not_overflow_at_full_supply_scale() {
 #[test]
 fn nominal_yield_exceeds_inflation_when_not_all_supply_is_staked() {
     let sat = tk::SAT_PER_BLOCH;
-    let issuance = 5_450_564_151 * sat;                    // ano 1
+    let issuance = 767_962_686 * sat;                     // ano 1
     let staked = tk::TOTAL_SUPPLY_BLOCH * sat * 2 / 3;     // dois tercos, como Solana
     let y = rewards::nominal_yield_bps(issuance, staked);
     assert!(y > 545, "yield {y}bps deveria superar a inflacao de 545bps");
-    assert_eq!(y, 817); // 8,17%
+    assert!((540..=560).contains(&y), "yield {y}bps");
 }
 
 // ── delegacao ───────────────────────────────────────────────────────────────

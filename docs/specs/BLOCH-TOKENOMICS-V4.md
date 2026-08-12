@@ -14,21 +14,32 @@ Relates to: BLOCH-POS-SHA3-LATTICE-MIGRATION.md (§4 distribution gates)
 
 ## 1. Decision
 
-Relaunch from a fresh genesis with a **fixed 100,000,000,000 BLCH** supply.
-Balances held today by parties other than the founder are carried over in
-**absolute** terms, capped at 300,000,000 BLCH. The founder's current holding is
-not carried over; it is replaced by a new, vested 17% allocation.
+Relaunch from a fresh genesis with a **fixed 21,000,000,000 BLCH** supply — the
+V2 nominal, after a draft at 100 billion.
+
+**The whole carryover comes across, the founder's balance included**, as
+ordinary liquid balance. The founder additionally receives a new 17% grant under
+a 10-year cliff and 40-year linear vest — the V2 premine schedule.
+
+Returning to 21 billion removes two hazards the 100-billion draft created, at no
+cost: the supply is **11.38% of `u64::MAX`** rather than 54.21%, so the sum of
+two large balances is nowhere near the wrap point; and it **fits in the signed
+`int64`** the Go SDK uses for `Satoshis` (`sdk/go/models.go:16`), which 100
+billion overflowed by 8%.
 
 | Destination | BLCH | Share | Unlock |
 |---|---:|---:|---|
-| Founder | 17,000,000,000 | 17.00% | 24-month cliff, then 120-month linear |
-| VC / crypto hedge funds | 10,000,000,000 | 10.00% | 12-month cliff, then 24-month linear |
-| Development team | 10,000,000,000 | 10.00% | 18-month cliff, then 36-month linear |
-| Marketing | 4,000,000,000 | 4.00% | 25% at genesis, remainder linear over 24 months |
-| Liquidity | 5,000,000,000 | 5.00% | 100% liquid at genesis |
-| Carryover holders | ≤ 300,000,000 | ≤ 0.30% | 100% liquid at genesis, no vesting |
-| **Validators** | **53,700,000,000** | **53.70%** | emitted over 40 years |
-| **Total** | **100,000,000,000** | **100.00%** | |
+| Founder — carried over | 3,546,175,400 | 16.89% | **liquid at genesis** |
+| Founder — new grant | 3,570,000,000 | 17.00% | 10-year cliff, then 40-year linear |
+| VC / crypto hedge funds | 2,100,000,000 | 10.00% | 12-month cliff, then 24-month linear |
+| Development team | 2,100,000,000 | 10.00% | 18-month cliff, then 36-month linear |
+| Marketing | 840,000,000 | 4.00% | 25% at genesis, remainder linear over 24 months |
+| Liquidity | 1,050,000,000 | 5.00% | 100% liquid at genesis |
+| Carryover holders | 227,709,400 | 1.08% | liquid at genesis, no vesting |
+| **Validators** | **7,566,115,200** | **36.03%** | emitted over 40 years |
+| **Total** | **21,000,000,000** | **100.00%** | |
+
+**Founder total: 33.89%** — the carried-over balance plus the new grant.
 
 Validator emission runs for 40 years and is supplemented by transaction fees.
 **After the 100 B is fully emitted, validators are paid 100% from fees.**
@@ -250,6 +261,46 @@ balances while multiplying total supply by ~27× (3.475 B → 100 B). It is a
 legitimate choice — it is what "preserved in absolute terms" means — but it
 should be published in exactly these terms rather than as "your balance is
 preserved", which is true and misleading at the same time.
+
+---
+
+## 4A. Concentration under the carried-over balance
+
+The carried-over founder balance is **liquid at slot 0**, so the answer to §0.1
+changes and it should be stated in numbers rather than characterised.
+
+| | |
+|---|---|
+| Circulating at slot 0 | 5,033,884,800 BLCH (carryover 3.77 B + liquidity 1.05 B + marketing TGE 0.21 B) |
+| Founder liquid at slot 0 | 3,546,175,400 BLCH |
+| **Founder share of circulating** | **70.4%** |
+
+Gate G2 requires the largest holder to hold under 25% of active stake. On this
+schedule:
+
+| | Founder share of circulating |
+|---:|---:|
+| Year 1 | 58.0% |
+| Year 2 | 41.6% |
+| Year 3 | 31.5% |
+| Year 5 | 25.2% |
+| Year 10 | 20.0% |
+| Year 40 | 16.9% |
+
+**G2 is not met until roughly year five**, and only if every other bucket
+unlocks and the validator emission accrues to independent parties as modelled.
+A draft that cliffed the founder's entire position bought a genesis where the
+founder held no spendable stake at all; carrying the balance across liquid gives
+that up.
+
+Two things soften it and should be said alongside the number. The new 17% grant
+is locked for a decade and vests across forty years — far beyond any market
+benchmark, and the strictest schedule on the chain. And the §4.1 machinery
+distinguishes **liquid** from **stakeable**: a carried-over balance can be
+spendable while remaining ineligible to stake. Keeping the carryover liquid does
+not by itself decide that it votes. That is a separate decision, still open, and
+it is the one that determines whether the activation gates are reachable before
+year five.
 
 ---
 

@@ -24,16 +24,40 @@
 pub const SAT_PER_BLOCH: u128 = 100_000_000;
 
 /// Fixed total supply. Hard-capped, unlike V2's perpetual tail.
-pub const TOTAL_SUPPLY_BLOCH: u128 = 100_000_000_000;
+///
+/// Back to the V2 nominal of 21 billion (founder decision, 2026-08-11), after a
+/// draft at 100 billion. The revert removes two hazards for free: the supply is
+/// 11.38% of `u64::MAX` instead of 54.21%, so the sum of two large balances no
+/// longer approaches the wrap point; and it fits in the signed `int64` the Go
+/// SDK uses for `Satoshis`, which 100 billion did not.
+pub const TOTAL_SUPPLY_BLOCH: u128 = 21_000_000_000;
 pub const TOTAL_SUPPLY_SAT: u128 = TOTAL_SUPPLY_BLOCH * SAT_PER_BLOCH;
 
 // ── Allocations ─────────────────────────────────────────────────────────────
 
-pub const FOUNDER_BLOCH: u128 = 17_000_000_000; // 17%
-pub const VC_BLOCH: u128 = 10_000_000_000; // 10%
-pub const TEAM_BLOCH: u128 = 10_000_000_000; // 10%
-pub const MARKETING_BLOCH: u128 = 4_000_000_000; //  4%
-pub const LIQUIDITY_BLOCH: u128 = 5_000_000_000; //  5%
+/// The founder's NEW allocation — 17% of supply, vested.
+///
+/// This is on top of the carried-over balance below, not instead of it: the
+/// founder's Genesis-3 holdings come across as ordinary liquid carryover and
+/// the 17% is granted again (founder decision, 2026-08-11). Combined, the
+/// founder holds 33.89% of supply. §4 of the tokenomics spec states what that
+/// does to the activation gates.
+pub const FOUNDER_BLOCH: u128 = 3_570_000_000; // 17%
+pub const VC_BLOCH: u128 = 2_100_000_000; // 10%
+pub const TEAM_BLOCH: u128 = 2_100_000_000; // 10%
+pub const MARKETING_BLOCH: u128 = 840_000_000; //  4%
+pub const LIQUIDITY_BLOCH: u128 = 1_050_000_000; //  5%
+
+/// The founder's carried-over Genesis-3 balance, measured at height 43,172.
+///
+/// Carried as ordinary balance: **liquid at genesis, no cliff and no vesting**.
+/// It is the single largest holding on the chain from slot 0.
+pub const FOUNDER_CARRYOVER_BLOCH: u128 = 3_546_175_400;
+
+/// Non-founder carried-over balances, measured at the same height across 14
+/// addresses. Comfortably under the 300 M ceiling, so no pro-rata scale-down
+/// runs and every holder keeps 100% of their position.
+pub const HOLDER_CARRYOVER_MEASURED_BLOCH: u128 = 227_709_400;
 
 /// Hard ceiling on carried-over non-founder balances.
 ///
@@ -44,12 +68,13 @@ pub const HOLDER_CARRYOVER_CAP_BLOCH: u128 = 300_000_000;
 
 /// Validator emission — the remainder, spread over 40 years.
 pub const VALIDATOR_EMISSION_BLOCH: u128 = TOTAL_SUPPLY_BLOCH
+    - FOUNDER_CARRYOVER_BLOCH
+    - HOLDER_CARRYOVER_MEASURED_BLOCH
     - FOUNDER_BLOCH
     - VC_BLOCH
     - TEAM_BLOCH
     - MARKETING_BLOCH
-    - LIQUIDITY_BLOCH
-    - HOLDER_CARRYOVER_CAP_BLOCH;
+    - LIQUIDITY_BLOCH;
 
 // ── Time ────────────────────────────────────────────────────────────────────
 
@@ -62,10 +87,17 @@ pub const EMISSION_YEARS: u64 = 40;
 /// 42,076,800 slots.
 pub const EMISSION_SLOTS: u64 = EMISSION_YEARS * SLOTS_PER_YEAR;
 
-// ── Founder vesting: 2-year cliff, then 10-year linear ───────────────────────
+// ── Founder vesting: 10-year cliff, then 40-year linear ─────────────────────
 
-pub const FOUNDER_CLIFF_SLOTS: u64 = 2 * SLOTS_PER_YEAR;
-pub const FOUNDER_VESTING_SLOTS: u64 = 10 * SLOTS_PER_YEAR;
+/// Ten-year cliff, forty-year linear vest — the V2 premine schedule, restored
+/// by founder decision on 2026-08-11 (a draft had shortened it to 24 months
+/// plus 10 years).
+///
+/// It is far beyond any market benchmark, and deliberately so: the carried-over
+/// balance arrives liquid at genesis, so this grant is the part of the founder's
+/// position that can still be made to wait. Fully vested at year 50.
+pub const FOUNDER_CLIFF_SLOTS: u64 = 10 * SLOTS_PER_YEAR;
+pub const FOUNDER_VESTING_SLOTS: u64 = 40 * SLOTS_PER_YEAR;
 pub const FOUNDER_VESTING_END_SLOT: u64 = FOUNDER_CLIFF_SLOTS + FOUNDER_VESTING_SLOTS;
 
 /// Founder satoshis unlocked by `slot`.
@@ -143,21 +175,26 @@ pub fn scaled_carryover_sat(balance_sat: u128, total_non_founder_sat: u128) -> u
 // ── Invariants checked at compile time ──────────────────────────────────────
 
 const _: () = assert!(
-    FOUNDER_BLOCH
+    FOUNDER_CARRYOVER_BLOCH
+        + HOLDER_CARRYOVER_MEASURED_BLOCH
+        + FOUNDER_BLOCH
         + VC_BLOCH
         + TEAM_BLOCH
         + MARKETING_BLOCH
         + LIQUIDITY_BLOCH
-        + HOLDER_CARRYOVER_CAP_BLOCH
         + VALIDATOR_EMISSION_BLOCH
         == TOTAL_SUPPLY_BLOCH,
     "as alocacoes nao somam o supply total"
 );
 
 const _: () = assert!(
-    VALIDATOR_EMISSION_BLOCH == 53_700_000_000,
+    VALIDATOR_EMISSION_BLOCH == 7_566_115_200,
     "resto para validadores mudou — reveja a especificacao antes de aceitar"
 );
+
+/// The founder's combined position: carried-over balance plus the new grant.
+pub const FOUNDER_TOTAL_BLOCH: u128 = FOUNDER_CARRYOVER_BLOCH + FOUNDER_BLOCH;
+const _: () = assert!(FOUNDER_TOTAL_BLOCH * 10_000 / TOTAL_SUPPLY_BLOCH == 3388);
 
 const _: () = assert!(EMISSION_SLOTS == 42_076_800, "grade de tempo mudou");
 
@@ -165,10 +202,13 @@ const _: () = assert!(EMISSION_SLOTS == 42_076_800, "grade de tempo mudou");
 /// `u64` with room to add. If a future edit lowers the supply enough that it
 /// would fit safely, this assertion is the place to reconsider — deliberately,
 /// not by accident.
-const _: () = assert!(
-    TOTAL_SUPPLY_SAT > (u64::MAX as u128) / 2,
-    "supply agora cabe com folga em u64 — reavalie a escolha de u128 explicitamente"
-);
+/// The 21-billion supply is 11.38% of `u64::MAX` and fits in a signed `int64`,
+/// so the wrap hazard that justified `u128` at 100 billion is gone. `u128` is
+/// kept anyway: the products are what overflow, not the totals — a balance
+/// times a basis-point figure, or issuance times stake in the reward split,
+/// exceeds `u64` long before any balance does.
+const _: () = assert!(TOTAL_SUPPLY_SAT < (u64::MAX as u128) / 8);
+const _: () = assert!(TOTAL_SUPPLY_SAT < i64::MAX as u128, "nao cabe no int64 do SDK Go");
 
 // ── Vesting: team, VC, marketing, liquidity ─────────────────────────────────
 //
@@ -314,7 +354,7 @@ pub const fn validator_reward_halving_sat(slot: u64) -> u128 {
 /// the allocation with **zero** residual rather than merely close to it.
 pub const DECAY_NUMERATOR: u128 = 9;
 pub const DECAY_DENOMINATOR: u128 = 10;
-pub const INITIAL_ANNUAL_SAT: u128 = 545_056_415_069_853_599;
+pub const INITIAL_ANNUAL_SAT: u128 = 76_796_268_659_286_369;
 
 pub const fn validator_reward_decay_sat(slot: u64) -> u128 {
     if slot >= EMISSION_SLOTS {
