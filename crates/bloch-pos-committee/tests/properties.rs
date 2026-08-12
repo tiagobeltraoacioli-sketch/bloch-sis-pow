@@ -708,9 +708,9 @@ fn sampling_survives_stake_totals_beyond_u64() {
 #[test]
 fn registry_survives_the_full_supply_delegated() {
     // The entire supply bonded across 150 delegations: resolution, the cap
-    // fixpoint, and the concentration metrics must all stay exact. At 21 B the
-    // total no longer approaches the u64 wrap point — the products still do,
-    // which is why the arithmetic stays u128.
+    // fixpoint, and the concentration metrics must all stay exact. At the
+    // 100 B split the TOTAL itself is 54% of u64::MAX — one more reason,
+    // besides the products, that the arithmetic is u128.
     let per = tk::TOTAL_SUPPLY_BLOCH / 150; // BLCH each
     let ds: Vec<Delegation> = (0..150u32)
         .map(|i| Delegation {
@@ -772,7 +772,7 @@ fn distribution_survives_full_supply_scale_inputs() {
             credits: rng.below(max_credits + 1),
             max_credits,
         };
-        let issuance = tk::INITIAL_ANNUAL_SAT; // year-1 issuance, ~5.45e17 sat
+        let issuance = tk::INITIAL_ANNUAL_SAT; // year-1 issuance, ~4.37e17 sat
         let p = rewards::distribute(&acct, issuance, total);
         assert_eq!(p.operator + p.delegators + p.forfeited, issuance * stake / total);
     }

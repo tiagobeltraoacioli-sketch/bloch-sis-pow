@@ -103,6 +103,10 @@ pub struct ChainState {
     /// updating it is EVM execution, which happens in the node's transition,
     /// not in this seam.
     pub evm: EvmCommitment,
+    /// Cumulative issued supply (`TAG_ISSUED_SUPPLY`, 2026-08-12). Carried
+    /// unchanged: issuance happens at epoch boundaries, which are the
+    /// transition's job, never this seam's.
+    pub issued_sat: u128,
     /// Slashing bookkeeping (§7.3), carried through this seam unchanged —
     /// evidence is executed by the transition, never here.
     pub applied_evidence: Vec<crate::state_root::AppliedEvidenceRecord>,
@@ -135,6 +139,7 @@ impl ChainState {
             coherence_accumulator_root: self.coherence_accumulator_root,
             coherence_nullifier_root: self.coherence_nullifier_root,
             evm: self.evm,
+            issued_sat: self.issued_sat,
         })
     }
 }
@@ -651,6 +656,8 @@ mod coherence_tests {
                 gas_used: 0,
                 base_fee_per_gas: 0,
             },
+            // Genesis-shaped, written out for the same break-this-line reason.
+            issued_sat: crate::tokenomics_v4::GENESIS_ISSUED_SAT,
         }
     }
 

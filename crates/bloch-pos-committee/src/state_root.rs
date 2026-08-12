@@ -19,6 +19,8 @@
 //! - the staking queues: the deposit history and the delegation history,
 //! - fee rewards accrued to proposers, pending the epoch boundary,
 //! - the taint set root (§4.1),
+//! - the cumulative issued supply — the hard-cap invariant's counter
+//!   ([`TAG_ISSUED_SUPPLY`], 2026-08-12),
 //! - the Coherence shielded-pool state: the accumulator root and the
 //!   nullifier-set root (§6.6.2). Finality means nothing if the shielded
 //!   ledger is not part of what gets finalized.
@@ -148,6 +150,24 @@ const TAG_EVM_COMMITMENT: u8 = 0x10;
 const TAG_SLASH_APPLIED: u8 = 0x11;
 const TAG_SLASH_WINDOW: u8 = 0x12;
 const TAG_DELEGATOR_SLASH_LOSS: u8 = 0x13;
+
+/// Cumulative issued supply in satoshis (2026-08-12): one singleton leaf, a
+/// `u128` serialized as 16 LE bytes. This is the counter the hard-cap
+/// consensus invariant reads (`tokenomics_v4::TOTAL_SUPPLY_SAT`; the
+/// transition refuses any block whose committed issuance exceeds it —
+/// `TransitionError::SupplyCapExceeded`).
+///
+/// Why it must be committed and cannot be derived: the amount actually minted
+/// per epoch depends on participation (a validator whose attestation never
+/// landed forfeits its slice — never minted) and on per-account truncation in
+/// `rewards::distribute`, so "how much has been issued" is a function of the
+/// whole chain history, not of the epoch number. Uncommitted, it is the §5.5
+/// failure shape verbatim: a state-synced node cannot reconstruct it, and two
+/// nodes that disagree in it enforce the cap differently while their roots
+/// claim agreement. Passes the module docs' cannot-be-reconstructed bar for
+/// extending the closed list; recorded as a visible revision in the migration
+/// doc §5.5 (same precedent as the slashing tags above) — not smuggled.
+const TAG_ISSUED_SUPPLY: u8 = 0x14;
 
 
 fn sha3(parts: &[&[u8]]) -> [u8; 32] {
@@ -883,6 +903,11 @@ pub struct ConsensusState<'a> {
     /// L1 EVM execution commitment, carried from the execution layer
     /// (`BLOCH-L1-EVM-STATE-MODEL.md`).
     pub evm: EvmCommitment,
+    /// Cumulative issued supply, in satoshis ([`TAG_ISSUED_SUPPLY`]). Gross
+    /// and monotone: burns (base-fee burn, slashing residue, inactivity leak)
+    /// never decrement it — they only widen the gap below the cap, and the
+    /// cap invariant is one-sided.
+    pub issued_sat: u128,
     /// Spent slashing evidence — the anti-replay set (§7.3).
     pub applied_evidence: &'a [AppliedEvidenceRecord],
     /// Per-epoch slashed stake inside the correlation window (§7.3).
@@ -1007,6 +1032,12 @@ pub fn build_state_tree(state: &ConsensusState<'_>) -> Smt {
     // path; the spec (§2) opens the closed list by exactly one leaf and no
     // more.
     smt.insert(derive_key(TAG_EVM_COMMITMENT, &[]), hash_value(&state.evm.serialize()));
+    // The issued-supply counter (2026-08-12): a fifth singleton, fixed-width
+    // 16-byte LE — the value the hard-cap invariant is checked against.
+    smt.insert(
+        derive_key(TAG_ISSUED_SUPPLY, &[]),
+        hash_value(&state.issued_sat.to_le_bytes()),
+    );
     for e in state.applied_evidence {
         smt.insert(derive_key(TAG_SLASH_APPLIED, &e.entry_key()), hash_value(&e.serialize()));
     }
@@ -1030,8 +1061,9 @@ pub fn state_root(state: &ConsensusState<'_>) -> [u8; 32] {
 
 /// Sum of all committed eUTXO values, in u128.
 ///
-/// Why u128: one output fits u64 (21e9 BLCH × 1e8 sat < 2^64), but a *sum*
-/// over an adversarially-chosen set does not — and a silent wrap here is not
+/// Why u128: one output fits u64 (100e9 BLCH × 1e8 sat = 10^19, 54% of
+/// `u64::MAX` — it fits, with 1.84x headroom and no more), but a *sum* of even
+/// two large outputs does not — and a silent wrap here is not
 /// a bug, it is a consensus split, the same class of failure `sample()`
 /// guards its cumulative-stake array against.
 pub fn total_utxo_value(eutxos: &[EutxoEntry]) -> u128 {
@@ -1345,6 +1377,10 @@ mod tests {
             coherence_accumulator_root: val(102),
             coherence_nullifier_root: val(103),
             evm: f.evm,
+            // Non-zero and asymmetric on purpose, like the EVM fields: a
+            // serialization that dropped or aliased the counter must move the
+            // root in the coverage test below.
+            issued_sat: crate::tokenomics_v4::GENESIS_ISSUED_SAT + 12_345,
             applied_evidence: &f.applied,
             slash_window: &f.window,
             delegator_slash_losses: &f.losses,
@@ -1465,14 +1501,18 @@ mod tests {
         mutated!(|g: &mut Fx| g.pending_fees[0].amount_sat += 1);
         mutated!(|g: &mut Fx| g.pending_fees.pop().map(|_| ()).unwrap());
 
-        // Singleton roots.
-        for i in 0..3 {
+        // Singleton roots and the issued-supply counter.
+        for i in 0..4 {
             let f2 = f.clone();
             let mut s = state(&f2);
             match i {
                 0 => s.taint_root[0] ^= 1,
                 1 => s.coherence_accumulator_root[0] ^= 1,
-                _ => s.coherence_nullifier_root[0] ^= 1,
+                2 => s.coherence_nullifier_root[0] ^= 1,
+                // One satoshi of issuance must move the root — this is the
+                // leaf the hard-cap invariant reads, and an uncommitted or
+                // truncated counter is the §5.5 failure for the cap itself.
+                _ => s.issued_sat += 1,
             }
             let r = state_root(&s);
             assert_ne!(r, base);

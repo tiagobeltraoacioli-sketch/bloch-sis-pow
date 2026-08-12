@@ -429,6 +429,27 @@ Two consequences worth stating, because both surfaced as test failures:
 > exactly `{v : registry[v].slashed}`, and the registry is already committed.
 > Committing it separately would commit one fact twice and give the copies room
 > to drift, in the structure whose entire purpose is that they cannot.
+>
+> **Revision 2026-08-12 (second) — the cumulative issued supply.** Founder
+> decision of the same day: the hard cap (`tokenomics_v4::TOTAL_SUPPLY_SAT`)
+> becomes a consensus invariant — every node refuses a block whose cumulative
+> issuance exceeds it (`TransitionError::SupplyCapExceeded`), and epoch
+> issuance is clamped to the remaining headroom so emission stops at the cap.
+> That requires one new committed component, tag `0x14`
+> (`state_root::TAG_ISSUED_SUPPLY`): the gross cumulative issued supply in
+> satoshis, seeded at genesis with everything but the validator emission and
+> advanced at epoch boundaries by what was actually minted. It passes this
+> section's cannot-be-reconstructed bar: minted amounts depend on
+> participation (forfeited slices are never minted) and on per-account
+> truncation in `rewards::distribute`, so the counter is a function of the
+> whole chain history, not of the epoch number — uncommitted, two nodes could
+> enforce the cap differently while their roots claim agreement. Honest
+> strength of the invariant, stated once here and repeated at every
+> enforcement site: no mechanism *inside* the protocol can raise the cap — no
+> transaction variant, no key, no vote; the value is a `const` with no setter
+> (pinned by `transition::tests::no_in_protocol_path_can_raise_the_cap`). A
+> hard fork adopted by every operator can change any rule, this one included;
+> "impossible to change" would be false and is not claimed.
 
 **Hard rule, learned from the difficulty defect:** every consensus-relevant
 value used to validate block *B* must be derivable from `B.parent`'s committed

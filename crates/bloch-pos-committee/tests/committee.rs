@@ -449,10 +449,12 @@ fn the_carryover_is_one_set_with_no_founder_line() {
     // mesma cadeia sob as mesmas regras. Some com isso o conjunto de taint (nao
     // ha classe de moeda a marcar) e o teto de holders (existia para limitar o
     // que legados recebiam ENQUANTO o fundador era excluido).
-    assert_eq!(tk::CARRYOVER_TOTAL_BLOCH, 3_773_884_800);
+    // Sob o split de 2026-08-12 (x100/21): 3.773.884.800 BLCH da G3.
+    assert_eq!(tk::CARRYOVER_TOTAL_BLOCH, 17_970_880_000);
     assert_eq!(tk::HOLDER_CARRYOVER_CAP_BLOCH, 0, "o teto foi aposentado");
-    // Renomear nao move saldo: o maior endereco continua onde estava.
-    assert_eq!(tk::LARGEST_CARRYOVER_ADDRESS_BLOCH, 3_546_175_400);
+    // Renomear nao move saldo, e o split nao move razao: o maior endereco
+    // continua com ~94% do carryover (3.546.175.400 BLCH da G3, escalado).
+    assert_eq!(tk::LARGEST_CARRYOVER_ADDRESS_BLOCH, 16_886_549_523);
     let share = tk::LARGEST_CARRYOVER_ADDRESS_BLOCH * 10_000 / tk::CARRYOVER_TOTAL_BLOCH;
     assert_eq!(share, 9396, "93,96% do carryover num endereco so");
 }
@@ -463,7 +465,7 @@ fn allocations_sum_to_total_supply() {
         + tk::TEAM_BLOCH + tk::MARKETING_BLOCH + tk::LIQUIDITY_BLOCH
         + tk::VALIDATOR_EMISSION_BLOCH;
     assert_eq!(sum, tk::TOTAL_SUPPLY_BLOCH);
-    assert_eq!(tk::VALIDATOR_EMISSION_BLOCH, 9_036_115_200);
+    assert_eq!(tk::VALIDATOR_EMISSION_BLOCH, 43_029_120_000);
 }
 
 #[test]
@@ -528,13 +530,13 @@ fn neither_curve_exceeds_the_allocation() {
 
 #[test]
 fn flat_curve_matches_the_spec_average() {
-    assert_eq!(tk::validator_reward_flat_sat(0) / tk::SAT_PER_BLOCH, 214);
+    assert_eq!(tk::validator_reward_flat_sat(0) / tk::SAT_PER_BLOCH, 1_022);
 }
 
 #[test]
 fn halving_curve_halves_every_four_years() {
     let r0 = tk::validator_reward_halving_sat(0);
-    assert_eq!(r0 / tk::SAT_PER_BLOCH, 1_074);
+    assert_eq!(r0 / tk::SAT_PER_BLOCH, 5_118);
     assert_eq!(tk::validator_reward_halving_sat(tk::HALVING_PERIOD_SLOTS), r0 / 2);
     assert_eq!(tk::validator_reward_halving_sat(2 * tk::HALVING_PERIOD_SLOTS), r0 / 4);
     // Front-loading is the whole point: half the allocation inside four years.
@@ -630,13 +632,20 @@ fn nothing_but_liquidity_marketing_and_holders_circulates_at_genesis() {
 }
 
 #[test]
-fn total_supply_fits_u64_and_int64_comfortably() {
-    // The documented reason every quantity is u128 (§8.1). If this ever fails,
-    // the u128 choice should be revisited deliberately.
-    // 21 bi = 11,38% de u64::MAX, e cabe no int64 do SDK Go — os dois riscos
-    // que 100 bi criava. u128 fica por causa dos PRODUTOS, nao dos totais.
-    assert!(tk::TOTAL_SUPPLY_SAT < (u64::MAX as u128) / 8);
-    assert!(tk::TOTAL_SUPPLY_SAT < i64::MAX as u128);
+fn total_supply_headroom_is_pinned_honestly() {
+    // The documented reason every quantity is u128 (§8.1), re-pinned for the
+    // 2026-08-12 split: 100 bi = 54,21% de u64::MAX. Um saldo unico cabe em
+    // u64 (com 1,84x de folga, e so), a soma de DOIS saldos grandes estoura —
+    // toda soma de satoshis e u128, e as asserts de compilacao em
+    // tokenomics_v4 pinam as duas direcoes. E o int64 do SDK Go NAO comporta
+    // o total — quebra conhecida e aceita na decisao do split, nao um
+    // acidente a descobrir depois.
+    assert!(tk::TOTAL_SUPPLY_SAT <= u64::MAX as u128, "um saldo tem de caber em u64");
+    assert!(tk::TOTAL_SUPPLY_SAT * 2 > u64::MAX as u128, "saiu da zona de wrap: reavalie");
+    assert!(tk::TOTAL_SUPPLY_SAT > i64::MAX as u128, "int64 do Go voltou a caber: atualize docs");
+    // A folga exata, para o dossie: u64::MAX / supply_sat = 1 (inteiro), ou
+    // seja, menos de 2x — nunca some dois saldos em u64.
+    assert_eq!((u64::MAX as u128) / tk::TOTAL_SUPPLY_SAT, 1);
 }
 
 #[test]
@@ -651,12 +660,32 @@ fn decay_curve_meets_the_inflation_target() {
 }
 
 #[test]
+fn the_split_left_the_inflation_schedule_untouched() {
+    // A prova de que o split de 2026-08-12 e puro tambem no TEMPO, nao so nas
+    // alocacoes: a inflacao anual em bps e IDENTICA a do cronograma de 21 bi
+    // em todos os 40 anos (verificado fora de banda; os dez primeiros ficam
+    // pinados aqui por valor). Se um recalculo futuro de INITIAL_ANNUAL_SAT
+    // mover um unico ano em um unico bps, isto acusa.
+    let pinned: [(u64, u128); 10] = [
+        (0, 436), (1, 393), (2, 353), (3, 318), (4, 286),
+        (5, 257), (6, 232), (7, 208), (8, 188), (9, 169),
+    ];
+    for (year, bps) in pinned {
+        assert_eq!(tk::annual_inflation_bps(year), bps, "ano {year} saiu do cronograma");
+    }
+    // E a meta do fundador vale em todos os anos, nao so no pico.
+    for year in 0..40 {
+        assert!(tk::annual_inflation_bps(year) < 700, "ano {year} acima de 7%");
+    }
+}
+
+#[test]
 fn decay_curve_declines_ten_percent_a_year() {
     let y0 = tk::validator_reward_decay_sat(0);
     let y1 = tk::validator_reward_decay_sat(tk::SLOTS_PER_YEAR);
     let ratio = y1 * 1000 / y0;
     assert!((899..=901).contains(&ratio), "razao anual = {ratio}/1000");
-    assert_eq!(y0 / tk::SAT_PER_BLOCH, 871);
+    assert_eq!(y0 / tk::SAT_PER_BLOCH, 4_151);
 }
 
 #[test]
@@ -666,7 +695,12 @@ fn decay_curve_emits_the_allocation_exactly() {
     // Under the cap, never over: truncation may strand dust, never mint.
     assert!(emitted <= alloc, "emitiu {emitted} > alocado {alloc}");
     let residual = alloc - emitted;
-    assert_eq!(residual, 889_200, "residuo mudou: {residual} sat");
+    // O residuo e IRREDUTIVEL (a soma de 40 anos e multipla de SLOTS_PER_YEAR
+    // e a alocacao nao e) — a afirmacao antiga de "residuo zero" era
+    // impossivel e foi corrigida em tokenomics_v4. Pinado por constante E por
+    // valor, para o dossie.
+    assert_eq!(residual, tk::EMISSION_DUST_SAT, "residuo mudou: {residual} sat");
+    assert_eq!(tk::EMISSION_DUST_SAT, 176_880);
     assert!(residual < tk::SAT_PER_BLOCH, "residuo passou de 1 BLCH");
     assert_eq!(tk::validator_emitted_decay_by(u64::MAX), emitted);
     assert_eq!(tk::validator_reward_decay_sat(tk::EMISSION_SLOTS), 0);
@@ -680,11 +714,10 @@ fn decay_front_loads_enough_to_outpace_insider_unlocks() {
     let validators = tk::validator_emitted_decay_by(m24);
     let biggest_insider = tk::vc_vested_sat(m24); // VC cliffs first
 
-    // A margem ENCOLHEU com a volta para 21 bi: a alocacao de validadores caiu
-    // de 53,7 bi para 7,57 bi enquanto os baldes de insider seguem em
-    // percentual do supply, entao no mes 24 os validadores lideram por ~1,4x
-    // em vez de mais de 4x. A propriedade que importa — validadores a frente do
-    // maior balde de insider — continua valendo, com folga menor.
+    // A margem e uma RAZAO, e o split de 2026-08-12 nao move razao nenhuma:
+    // validadores lideram o maior balde de insider por ~1,7x no mes 24, o
+    // mesmo que no supply de 21 bi. (A margem encolhera na volta para 21 bi
+    // porque a ALOCACAO relativa mudou naquela revisao; o split nao muda.)
     assert!(validators > biggest_insider,
         "validadores {validators} atras do maior insider {biggest_insider}");
     let ratio = validators * 100 / biggest_insider;
@@ -824,7 +857,7 @@ fn distribution_does_not_overflow_at_full_supply_scale() {
     // issuance × stake is the product of two ~1e19 values.
     let sat = tk::SAT_PER_BLOCH;
     let total = tk::TOTAL_SUPPLY_BLOCH * sat;
-    let issuance = 917_168_073 * sat;
+    let issuance = 4_367_467_018 * sat; // ano 1 sob o split
     let p = rewards::distribute(&acct(total / 2, total / 2, 500), issuance, total);
     assert_eq!(p.operator + p.delegators, issuance);
 }
@@ -832,10 +865,10 @@ fn distribution_does_not_overflow_at_full_supply_scale() {
 #[test]
 fn nominal_yield_exceeds_inflation_when_not_all_supply_is_staked() {
     let sat = tk::SAT_PER_BLOCH;
-    let issuance = 917_168_073 * sat;                     // ano 1
+    let issuance = 4_367_467_018 * sat;                    // ano 1 (436 bps)
     let staked = tk::TOTAL_SUPPLY_BLOCH * sat * 2 / 3;     // dois tercos, como Solana
     let y = rewards::nominal_yield_bps(issuance, staked);
-    assert!(y > 545, "yield {y}bps deveria superar a inflacao de 545bps");
+    assert!(y > 436, "yield {y}bps deveria superar a inflacao de 436bps");
     assert!((645..=665).contains(&y), "yield {y}bps");
 }
 
@@ -985,7 +1018,9 @@ fn deactivation_drains_gradually_and_completes() {
     // numa epoca so. Agora o cool-down e fatiado pelo mesmo orcamento de 9% do
     // warm-up, entao a saida drena e o teto vale nos DOIS sentidos — esvaziar o
     // conjunto rapido era tao perigoso quanto enche-lo.
-    let mut d = deleg(1, 10, 1_000_000, 0);
+    // 10M BLCH: bem acima do piso de churn de 500k BLCH/epoca (2026-08-12),
+    // para que a drenagem leve varias epocas e a monotonicidade seja visivel.
+    let mut d = deleg(1, 10, 10_000_000, 0);
     d.deactivate_epoch = Some(5);
     let at = |e: u64| Registry::resolve(&[d], e).stake_of(10);
 
@@ -1285,25 +1320,28 @@ fn warmup_cap_holds_even_for_an_oversized_delegation() {
     // F3: a escapatoria de liveness anterior admitia a cabeca da fila INTEIRA,
     // qualquer que fosse o tamanho — entao uma delegacao grande ativava de uma
     // vez e contornava o teto por epoca. Com fatiamento, ela entra em pedacos.
-    let incumbent = deleg(1, 10, 100_000_000, 0);
-    let whale = deleg(2, 20, 500_000_000, 1); // 5x o incumbente
+    // 1 bi BLCH de base: o orcamento proporcional (25 bps = 2,5M) fica acima
+    // do piso de 500k BLCH, entao o teste exercita a TAXA, nao o piso.
+    let incumbent = deleg(1, 10, 1_000_000_000, 0);
+    let whale = deleg(2, 20, 5_000_000_000, 1); // 5x o incumbente
     let ds = vec![incumbent, whale];
 
     let base = Registry::resolve(&ds, 0).total_active();
     let e1 = Registry::resolve(&ds, 1);
     let entered = e1.total_active() - base;
     // Teto lido da constante, nao restatado: um `9 / 100` aqui sobrevive a
-    // mudanca da taxa e passa a testar um limite que nao existe mais.
-    let cap = base * delegation::WARMUP_RATE_BPS / 10_000;
+    // mudanca da taxa e passa a testar um limite que nao existe mais. O piso
+    // entra pelo mesmo motivo — o orcamento real e max(taxa, piso).
+    let cap = (base * delegation::WARMUP_RATE_BPS / 10_000).max(delegation::MIN_CHURN_SAT);
     assert!(entered <= cap + 1, "entrou {entered}, teto era {cap} — F3 de volta");
     assert!(entered > 0, "nada entrou: deadlock, que e o bug que a escapatoria consertava");
 
     // Parcialmente ativa nao conta como admitida.
     assert_eq!(e1.state_of(&whale), StakeState::Activating);
 
-    // E eventualmente entra inteira: 100M -> 600M, seis vezes o conjunto.
+    // E eventualmente entra inteira: 1 bi -> 6 bi, seis vezes o conjunto.
     let done = Registry::resolve(&ds, epochs_to_grow_by(6.0) + 8);
-    assert_eq!(done.stake_of(20), 500_000_000 * tk::SAT_PER_BLOCH);
+    assert_eq!(done.stake_of(20), 5_000_000_000 * tk::SAT_PER_BLOCH);
     assert_eq!(done.state_of(&whale), StakeState::Active);
 }
 
@@ -1320,19 +1358,19 @@ fn genesis_is_still_unlimited_so_the_chain_can_start() {
 #[test]
 fn each_foundation_bucket_is_pinned() {
     let sat = tk::SAT_PER_BLOCH;
-    assert_eq!(tk::VC_BLOCH, 2_100_000_000);
-    assert_eq!(tk::TEAM_BLOCH, 2_100_000_000);
-    assert_eq!(tk::MARKETING_BLOCH, 840_000_000);
-    assert_eq!(tk::LIQUIDITY_BLOCH, 1_050_000_000);
-    assert_eq!(tk::FOUNDATION_HELD_BLOCH, 6_090_000_000);
+    assert_eq!(tk::VC_BLOCH, 10_000_000_000);
+    assert_eq!(tk::TEAM_BLOCH, 10_000_000_000);
+    assert_eq!(tk::MARKETING_BLOCH, 4_000_000_000);
+    assert_eq!(tk::LIQUIDITY_BLOCH, 5_000_000_000);
+    assert_eq!(tk::FOUNDATION_HELD_BLOCH, 29_000_000_000);
     assert_eq!(tk::FOUNDATION_HELD_BLOCH * 100 / tk::TOTAL_SUPPLY_BLOCH, 29);
 
     // Liquido no genesis: so liquidez inteira e o quarto do marketing.
     assert_eq!(tk::vc_vested_sat(0), 0, "VC nao pode ter nada liquido no genesis");
     assert_eq!(tk::team_vested_sat(0), 0, "time nao pode ter nada liquido no genesis");
-    assert_eq!(tk::marketing_vested_sat(0), 210_000_000 * sat);
-    assert_eq!(tk::liquidity_vested_sat(0), 1_050_000_000 * sat);
-    assert_eq!(tk::FOUNDATION_LIQUID_AT_GENESIS_BLOCH, 1_260_000_000);
+    assert_eq!(tk::marketing_vested_sat(0), 1_000_000_000 * sat);
+    assert_eq!(tk::liquidity_vested_sat(0), 5_000_000_000 * sat);
+    assert_eq!(tk::FOUNDATION_LIQUID_AT_GENESIS_BLOCH, 6_000_000_000);
 
     // Cada balde veste por inteiro, no prazo dele.
     let y = tk::SLOTS_PER_YEAR;
@@ -1349,7 +1387,7 @@ fn two_holders_account_for_the_entire_genesis_float() {
     let f = tk::FOUNDATION_LIQUID_AT_GENESIS_BLOCH;
     let c = tk::CARRYOVER_TOTAL_BLOCH;
     let circulating = f + c;
-    assert_eq!(circulating, 5_033_884_800);
+    assert_eq!(circulating, 23_970_880_000);
     assert_eq!(f * 1000 / circulating, 250, "fundacao = 25,0% do circulante");
     assert_eq!(c * 1000 / circulating, 749, "carryover = 75,0% (truncado)");
 }

@@ -373,6 +373,7 @@ mod tests {
                 gas_used: 0,
                 base_fee_per_gas: 1,
             },
+            issued_sat: crate::tokenomics_v4::GENESIS_ISSUED_SAT,
         };
         let parent_header = BlockHeaderV4 {
             version: VERSION_G4,

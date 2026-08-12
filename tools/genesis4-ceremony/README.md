@@ -24,8 +24,8 @@ changes the calculus:
 
 1. **No restated numbers.** This crate imports every constant and every
    vesting curve from `crates/bloch-pos-committee` — the tokenomics from
-   `tokenomics_v4.rs` (whose compile-time assertions pin the 21 B total and
-   the 9,036,115,200 validator remainder), the key and deposit parameters from
+   `tokenomics_v4.rs` (whose compile-time assertions pin the 100 B total — the pure x100/21
+   split of 2026-08-12 — and the 43,029,120,000 validator remainder), the key and deposit parameters from
    `staking.rs`, the cohort-floor inputs from `params.rs`. A Python ceremony
    would be a second copy of the tokenomics that could drift from the one
    consensus compiles in.
@@ -50,23 +50,25 @@ live validation path.
 
 | Output | BLCH | Schedule (consensus-enforced) |
 |---|---:|---|
-| Carryover holders | 3,773,884,800 — the whole measured ledger, founder included | fully liquid, from the signed artifact |
-| Founder (new grant) | 2,100,000,000 | 10-year cliff, 40-year linear |
-| VC | 2,100,000,000 | 12-month cliff, 24-month linear |
-| Team | 2,100,000,000 | 18-month cliff, 36-month linear |
-| Marketing | 840,000,000 | 25% at genesis, 24-month linear |
-| Liquidity | 1,050,000,000 − cohort stake | fully liquid |
-| Genesis cohort (bonded stake) | ≥ 64 × 100,000 minimum, out of liquidity | staked from slot 0, exit via the ordinary path |
+| Carryover holders | 17,970,880,000 — the whole measured ledger, founder included, post-split | fully liquid, from the signed artifact |
+| Founder (new grant) | 10,000,000,000 | 10-year cliff, 40-year linear |
+| VC | 10,000,000,000 | 12-month cliff, 24-month linear |
+| Team | 10,000,000,000 | 18-month cliff, 36-month linear |
+| Marketing | 4,000,000,000 | 25% at genesis, 24-month linear |
+| Liquidity | 5,000,000,000 − cohort stake | fully liquid |
+| Genesis cohort (bonded stake) | ≥ 64 × 25,000 minimum, out of liquidity | staked from slot 0, exit via the ordinary path |
 
-Plus the validator emission (9,036,115,200 over 40 years), so the accounting
-closes to **exactly** 21,000,000,000 BLCH — outputs + bonded cohort stake +
+Plus the validator emission (43,029,120,000 over 40 years), so the accounting
+closes to **exactly** 100,000,000,000 BLCH — outputs + bonded cohort stake +
 emission, not "at most". Each output's schedule is part of its leaf hash, so
 `state_root` — and therefore `block_id` — commits to the locks: a genesis
 without them is a visibly different chain, not a broken promise (§8.2's
 standard).
 
 The **carryover cap is retired** (§3): the artifact must total exactly
-3,773,884,800 BLCH — the measured ledger the constants were balanced around.
+17,970,880,000 BLCH — the measured G3 ledger under the split, the figure the
+constants were balanced around (per-balance `split_g3_sat`, with the
+builder's stated dust rule closing the total).
 The ceremony never scales, pads, or truncates; any other total stops it.
 
 ## The genesis validator cohort — §3.3
@@ -89,7 +91,7 @@ index<TAB>pubkey_hex<TAB>randao_c0_hex<TAB>stake_sat<TAB>withdrawal_hex
 - `randao_c0`: the head of the validator's 8,192-step SHAKE-256 RANDAO chain
   (`beacon.rs`), committed here because a validator without one can never
   propose.
-- `stake_sat`: ≥ `MIN_DEPOSIT_SAT` (100,000 BLCH), funded **from the
+- `stake_sat`: ≥ `MIN_DEPOSIT_SAT` (25,000 BLCH since 2026-08-12), funded **from the
   liquidity bucket** (§3.3.1) — the genesis liquidity output is reduced by
   the total bonded stake, so nothing is minted for the cohort.
 - `withdrawal`: 32-byte return address, fixed at genesis so a hot validator
@@ -211,7 +213,7 @@ cargo test
 ```
 
 The tests cover: the sum of allocations + bonded stake + emission is
-exactly 21,000,000,000 BLCH; the bucket values and schedules match the §1
+exactly 100,000,000,000 BLCH; the bucket values and schedules match the §1
 table (founder 10-year cliff / 40-year linear); no lock absent; slot-exact
 agreement between the carried schedules and the `tokenomics_v4` closed forms;
 the carryover digest KAT against CPython; refusal on digest mismatch,
