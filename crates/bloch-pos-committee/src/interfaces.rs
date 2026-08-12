@@ -2,6 +2,29 @@
 
 //! # Frozen consensus interfaces — the Phase-1 contract between workstreams
 //!
+//! > **PROSE PARTIALLY SUPERSEDED — 2026-08-11 (PMO ruling; signatures
+//! > unaffected).** The trait and type signatures below remain frozen exactly
+//! > as reviewed. The surrounding prose, however, was written against
+//! > premises that changed AFTER the freeze:
+//! >
+//! > - **the sampled committee (128 per epoch + 8 per slot)** — replaced by
+//! >   partitioning the active set (finding F1; see `committees.rs`). One
+//! >   attestation now does both jobs: it carries its slot's fork-choice
+//! >   weight AND accumulates toward the epoch's justification. Where prose
+//! >   below says only "epoch committee" votes feed [`FinalityGadget`] or
+//! >   that a "slot subcommittee" feeds fork choice only, read: every
+//! >   attestation is an epoch-committee vote, and every attestation feeds
+//! >   LMD-GHOST.
+//! > - **the 100 B supply** — reverted to 21 B, the V2 nominal. The `u128`
+//! >   arithmetic contract survives (the danger was always the products, not
+//! >   the totals); the "54% of `u64::MAX`" premise does not.
+//! > - **the taint machinery** — dissolved: the carryover crosses as one
+//! >   undifferentiated set. [`StateRoots::taint_root`] is retained as a
+//! >   reserved, all-zero slot (removing it would re-open the freeze);
+//! >   `Tainted` variants are never produced.
+//! > - **the hybrid PoW phase** — erased: Genesis-3 halts at height 80,000
+//! >   and Genesis-4 launches from a snapshot.
+//!
 //! §9.2 of the migration design: *"Interfaces between the three [developers]
 //! are frozen at the end of Phase 1 as Rust traits with no implementations;
 //! every later phase codes against them."* This module is that freeze. Each

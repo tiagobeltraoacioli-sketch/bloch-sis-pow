@@ -90,6 +90,42 @@ pub const fn cohort_cap_bps(epoch: u64) -> u128 {
 /// members happen to be largest: the cohort is one economic actor, so which of
 /// its own validators absorbs the reduction is meaningless, and a rule that
 /// picked would invite the founder to shuffle stake between them to choose.
+/// Why the cap is deferred, when it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CapStatus {
+    /// Genesis window: the cohort is still the whole set by design.
+    NotTapering,
+    /// Enforced. The cohort was scaled to this many satoshis, or was already under.
+    Enforced { cap_sat: u128 },
+    /// **Not enforced**, because there is not yet enough independent stake for
+    /// the rule to mean anything. See [`apply_cohort_cap`].
+    Deferred { independent_sat: u128 },
+}
+
+/// The minimum independent stake at which the one-third rule is meaningful:
+/// one validator's worth. Below this there is no one for the cohort to be
+/// one third *of*.
+pub const CAP_MEANINGFUL_AT_SAT: u128 = crate::staking::MIN_DEPOSIT_SAT;
+
+/// Status of the cap at `epoch`, without applying it.
+pub fn cap_status(validators: &[Validator], cohort: &[u32], epoch: u64) -> CapStatus {
+    let bps = cohort_cap_bps(epoch);
+    if bps >= 10_000 {
+        return CapStatus::NotTapering;
+    }
+    let total: u128 = validators.iter().map(|v| v.effective_stake as u128).sum();
+    let cohort_stake: u128 = validators
+        .iter()
+        .filter(|v| cohort.binary_search(&v.index).is_ok())
+        .map(|v| v.effective_stake as u128)
+        .sum();
+    let others = total - cohort_stake;
+    if others < CAP_MEANINGFUL_AT_SAT {
+        return CapStatus::Deferred { independent_sat: others };
+    }
+    CapStatus::Enforced { cap_sat: others * bps / (10_000 - bps) }
+}
+
 pub fn apply_cohort_cap(validators: &[Validator], cohort: &[u32], epoch: u64) -> Vec<Validator> {
     let total: u128 = validators.iter().map(|v| v.effective_stake as u128).sum();
     if total == 0 {
@@ -101,10 +137,28 @@ pub fn apply_cohort_cap(validators: &[Validator], cohort: &[u32], epoch: u64) ->
         .map(|v| v.effective_stake as u128)
         .sum();
 
-    let bps = cohort_cap_bps(epoch);
-    if bps >= 10_000 {
-        return validators.to_vec(); // genesis: the cohort is the whole set
+    // DEFERRAL, and it is load-bearing. The closed form below is a share of
+    // NON-COHORT stake, so with none of it the cap is zero and the whole cohort
+    // — which at a cold launch is the entire validator set — drops to zero
+    // effective stake and the chain stops.
+    //
+    // That is not hypothetical: integer truncation makes the taper bite at
+    // **epoch 5, about 1.3 hours after genesis**, where `10_000 - bps == 1` and
+    // the cap is `9999 x O`. With `O == 0` it is 0. A rule written to
+    // decentralise the chain would have killed it on day one — found by
+    // adversarial review, 2026-08-11.
+    //
+    // The deeper point is that the cap cannot manufacture decentralisation out
+    // of nothing. If no independent stake ever arrives, the honest options are
+    // to halt or to let the cohort keep its weight; halting silently is the
+    // worse one, because it hides the fact that nobody showed up. So the cap
+    // defers, and `cap_status` reports *why* — the shortfall becomes visible
+    // instead of becoming an outage.
+    match cap_status(validators, cohort, epoch) {
+        CapStatus::NotTapering | CapStatus::Deferred { .. } => return validators.to_vec(),
+        CapStatus::Enforced { .. } => {}
     }
+    let bps = cohort_cap_bps(epoch);
 
     // The cap is a share of the stake ACTIVE AFTER capping, so it cannot be
     // taken as a fraction of the pre-cap total: scaling the cohort down also

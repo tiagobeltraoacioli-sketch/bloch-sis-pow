@@ -2,6 +2,18 @@
 
 //! # bloch-pos-committee
 //!
+//! > **PROSE PARTIALLY SUPERSEDED — 2026-08-11 (PMO ruling; APIs unaffected).**
+//! > The description below was written against the **sampled** committee
+//! > design (128 per epoch + 8 per slot), which finding F1 replaced with a
+//! > **partition** of the active set — see `committees.rs`, which is the
+//! > current design and its own rationale. Under the partition, every active
+//! > validator serves in exactly one slot committee per epoch, and one
+//! > attestation does both jobs: its slot's fork-choice weight and its
+//! > epoch's justification vote. The sampled draw ([`slot_subcommittee`],
+//! > [`epoch_committee`], `sample::*`) remains in-tree as the record of the
+//! > analysis and for the sortition machinery it shares with the proposer
+//! > draw; it is not the committee mechanism the node composes.
+//!
 //! The committee layer of the Proof-of-Stake migration design
 //! (`docs/specs/BLOCH-POS-SHA3-LATTICE-MIGRATION.md`, §6.5.2):
 //!

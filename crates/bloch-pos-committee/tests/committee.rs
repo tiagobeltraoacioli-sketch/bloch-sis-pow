@@ -1239,10 +1239,13 @@ fn the_cap_reaches_one_third_at_one_year_and_holds() {
 #[test]
 fn a_founder_holding_everything_is_capped_to_a_third_after_a_year() {
     // A coorte com 90% do stake, um ano depois.
+    // Escala realista: o teto so vale quando ha pelo menos um deposito minimo
+    // (100.000 BLCH) de stake independente — abaixo disso ele defere, porque
+    // nao ha de quem a coorte seja um terco.
     let mut vs: Vec<Validator> = (0..64u32)
-        .map(|i| Validator { index: i, effective_stake: 1_000_000 })
+        .map(|i| Validator { index: i, effective_stake: 900_000_000_000_000 })
         .collect();
-    vs.extend((100..110u32).map(|i| Validator { index: i, effective_stake: 700_000 }));
+    vs.extend((100..110u32).map(|i| Validator { index: i, effective_stake: 7_000_000_000_000 }));
     let cohort: Vec<u32> = (0..64u32).collect();
 
     assert!(cohort_share_bps(&vs, &cohort) > 9_000, "o teste nao esta exercitando o teto");
@@ -1270,12 +1273,12 @@ fn at_genesis_nothing_is_capped_because_the_cohort_is_everything() {
 #[test]
 fn non_cohort_validators_are_never_touched() {
     let vs = vec![
-        Validator { index: 1, effective_stake: 9_000_000 },   // coorte
-        Validator { index: 50, effective_stake: 1_000_000 },  // independente
+        Validator { index: 1, effective_stake: 900_000_000_000_000 },  // coorte
+        Validator { index: 50, effective_stake: 100_000_000_000_000 }, // independente
     ];
     let capped = apply_cohort_cap(&vs, &[1], EPOCHS_PER_YEAR);
-    assert_eq!(capped[1].effective_stake, 1_000_000, "stake independente foi mexido");
-    assert!(capped[0].effective_stake < 9_000_000, "a coorte nao foi capada");
+    assert_eq!(capped[1].effective_stake, 100_000_000_000_000, "stake independente foi mexido");
+    assert!(capped[0].effective_stake < 900_000_000_000_000, "a coorte nao foi capada");
 }
 
 #[test]
@@ -1283,21 +1286,63 @@ fn the_cap_scales_the_cohort_pro_rata() {
     // Qual validador da coorte absorve a reducao nao pode importar: a coorte e
     // um ator economico so, e escolher convidaria a embaralhar stake entre eles.
     let vs = vec![
-        Validator { index: 1, effective_stake: 6_000_000 },
-        Validator { index: 2, effective_stake: 3_000_000 },
-        Validator { index: 50, effective_stake: 1_000_000 },
+        Validator { index: 1, effective_stake: 600_000_000_000_000 },
+        Validator { index: 2, effective_stake: 300_000_000_000_000 },
+        Validator { index: 50, effective_stake: 100_000_000_000_000 },
     ];
     let capped = apply_cohort_cap(&vs, &[1, 2], EPOCHS_PER_YEAR);
     // 2:1 antes, 2:1 depois.
     assert_eq!(capped[0].effective_stake / capped[1].effective_stake, 2);
-    assert!(capped[0].effective_stake < 6_000_000);
+    assert!(capped[0].effective_stake < 600_000_000_000_000);
 }
 
 #[test]
 fn a_cohort_already_under_the_cap_is_left_alone() {
     let vs = vec![
-        Validator { index: 1, effective_stake: 1_000_000 },
-        Validator { index: 50, effective_stake: 9_000_000 },
+        Validator { index: 1, effective_stake: 100_000_000_000_000 },
+        Validator { index: 50, effective_stake: 900_000_000_000_000 },
     ];
     assert_eq!(apply_cohort_cap(&vs, &[1], EPOCHS_PER_YEAR), vs);
+}
+
+#[test]
+fn the_cap_does_not_halt_a_cold_launch() {
+    // G2, achado por revisao adversarial: com truncagem inteira o taper morde
+    // na EPOCA 5 — ~1,3 h depois do genesis — e ali (10000-bps)==1, entao o teto
+    // e 9999*O. Sem stake independente, O=0, o teto e 0, e a coorte inteira
+    // (que num lancamento frio E a rede) ia a zero. A regra de descentralizacao
+    // mataria a cadeia no primeiro dia.
+    use bloch_pos_committee::genesis_cohort::{cap_status, CapStatus};
+    let vs: Vec<Validator> = (0..64u32)
+        .map(|i| Validator { index: i, effective_stake: 1_000_000_000_000 })
+        .collect();
+    let cohort: Vec<u32> = (0..64u32).collect();
+
+    for e in [5u64, 10, 100, EPOCHS_PER_YEAR, EPOCHS_PER_YEAR * 5] {
+        let out = apply_cohort_cap(&vs, &cohort, e);
+        let total: u128 = out.iter().map(|v| v.effective_stake as u128).sum();
+        assert!(total > 0, "epoca {e}: a coorte foi zerada e a cadeia para");
+        assert_eq!(out, vs, "epoca {e}: nao deveria capar sem stake independente");
+        assert!(matches!(cap_status(&vs, &cohort, e),
+                         CapStatus::Deferred { .. } | CapStatus::NotTapering));
+    }
+}
+
+#[test]
+fn the_cap_engages_once_independent_stake_arrives() {
+    use bloch_pos_committee::genesis_cohort::{cap_status, CapStatus};
+    let mut vs: Vec<Validator> = (0..64u32)
+        .map(|i| Validator { index: i, effective_stake: 1_000_000_000_000 })
+        .collect();
+    let cohort: Vec<u32> = (0..64u32).collect();
+
+    // Um deposito independente acima do minimo: a regra passa a valer.
+    vs.push(Validator { index: 999, effective_stake: 20_000_000_000_000 });
+    let st = cap_status(&vs, &cohort, EPOCHS_PER_YEAR);
+    assert!(matches!(st, CapStatus::Enforced { .. }), "deveria valer: {st:?}");
+
+    let out = apply_cohort_cap(&vs, &cohort, EPOCHS_PER_YEAR);
+    let share = cohort_share_bps(&out, &cohort);
+    assert!(share <= COHORT_CAP_FLOOR_BPS + 1, "coorte em {share}bps");
+    assert!(out.iter().map(|v| v.effective_stake as u128).sum::<u128>() > 0);
 }
