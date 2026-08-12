@@ -102,6 +102,11 @@ pub const DS_PROPOSE: [u8; 16] = *b"BLCH4:PROPOSE\0\0\0";
 /// the exit is "a hybrid-signed message" and every signed message gets its own
 /// tag; all tags are fixed 16 bytes, so no tag can prefix another.
 pub const DS_EXIT: [u8; 16] = *b"BLCH4:EXIT\0\0\0\0\0\0";
+/// Weak-subjectivity checkpoint digest domain
+/// (`BLOCH-WEAK-SUBJECTIVITY.md` §2.1). The checkpoint is signed and verified
+/// out of band, at boot — its digest must live in its own domain so a signed
+/// checkpoint can never be replayed as any in-protocol message, nor vice versa.
+pub const DS_WSCKPT: [u8; 16] = *b"BLCH4:WSCKPT\0\0\0\0";
 /// State SMT node domain (§6.1) — every hash in [`crate::state_root`] starts
 /// with this tag so a state-tree node can never collide with a block id, a
 /// transaction Merkle node, or any other SHA3 use in the protocol.

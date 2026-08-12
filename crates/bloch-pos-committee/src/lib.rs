@@ -72,6 +72,7 @@ pub mod schedule;
 pub mod slashing;
 pub mod derive;
 pub mod transition;
+pub mod ws;
 
 pub use attestation::{Attestation, AttestationData, RejectReason, SignatureVerifier};
 pub use beacon::{mix_in, process_reveal, BeaconError, RandaoChain, RevealState};
@@ -103,6 +104,12 @@ pub use finality::{EpochOutcome, EpochVotes, FinalityError};
 pub use produce::{produce, ProduceError, ProducerRandao, ProposerSigner};
 pub use derive::{validate_block, ChainState, ParentState, RandaoRejection};
 pub use transition::{CommittedState, GenesisValidator, PosTransaction, Transition};
+pub use ws::{
+    accept, anchor, boot_decision, cross_check, genesis_anchor, reconcile, verify_envelope,
+    Acceptance, BootDecision, CheckpointEnvelope, CrossCheck, EnvelopeOk, EnvelopeReject,
+    Reconciliation, Signer, SignerSet, WeakSubjectivityCheckpoint, WS_FRESH_EPOCHS,
+    WS_PERIOD_EPOCHS, WS_PUBLICATION_INTERVAL_EPOCHS,
+};
 
 // ── Names that exist in two modules — NOT re-exported flat ──────────────────
 //

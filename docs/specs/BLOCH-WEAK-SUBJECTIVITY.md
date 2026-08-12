@@ -73,7 +73,7 @@ schedule. It does not make it disappear.
 
 ---
 
-## 1. The weak subjectivity period — why 2,048 epochs is the number
+## 1. The weak subjectivity period — why 2,016 epochs is the number (was 2,048; corrected below)
 
 The window in which a node's own knowledge remains self-sufficient is bounded
 by how fast stake can leave.
@@ -87,11 +87,26 @@ history is suicidal: the surround/double-vote evidence (§7.3) burns 5% and
 ejects, and correlated-slashing amplification makes a coordinated attack burn
 far more. After withdrawal completes, signing a conflicting history is free.
 
-Therefore:
+> **CORRECTED 2026-08-11 (A7, implementation).** The equality below was wrong,
+> and the error had a sign: the period was too *long*, not conservative. A
+> validator still carries duties for `EXIT_DELAY_EPOCHS` after its exit is
+> included (`staking.rs::ValidatorRecord::assigned_duties_at` — an exit must
+> not dodge already-assigned duties), so a member of the committee that
+> finalized epoch `F` may have exited as early as `F − (EXIT_DELAY_EPOCHS − 1)`
+> and clears withdrawal at `F + WITHDRAWAL_DELAY_EPOCHS − EXIT_DELAY_EPOCHS
+> + 1`. With the period at the full withdrawal delay, a node still trusted its
+> own finality for 31 epochs (~8 h) during which every signer of it could
+> already be unslashable. The period is therefore **derived** in code
+> (`ws.rs::WS_PERIOD_EPOCHS`) as:
 
 ```
-WS_PERIOD_EPOCHS = WITHDRAWAL_DELAY_EPOCHS = 2,048   (≈ 22.8 days)
+WS_PERIOD_EPOCHS = WITHDRAWAL_DELAY_EPOCHS − EXIT_DELAY_EPOCHS = 2,016  (≈ 22.4 days)
 ```
+
+with one epoch of margin below the earliest possible full withdrawal;
+`ws.rs::tests::old_window_had_an_unslashable_hole` demonstrates the defect of
+the original constant against the real staking functions, and
+`corrected_window_leaves_no_gap` pins the fix.
 
 A node whose latest *own-witnessed* finalized checkpoint is younger than
 `WS_PERIOD_EPOCHS` can rely on it: any validator who could contradict it still
@@ -99,16 +114,39 @@ has stake at risk. A node whose knowledge is older than that **cannot trust its
 own database's finality markers as a defense against forged continuations** —
 the signers of everything it knows may already be gone.
 
-Two honest footnotes on this bound:
+Three honest footnotes on this bound:
 
-- **It is conservative, deliberately.** Exit churn is rate-limited, so in
+- ~~**It is conservative, deliberately.** Exit churn is rate-limited, so in
   practice ≥ 2/3 of a committee's stake cannot all clear withdrawal in one
-  period; the *real* safe window is usually longer. Ethereum computes a dynamic
-  weak-subjectivity period from churn for exactly this reason. We take no
-  credit for it: the constant bound is simpler to implement, simpler to
-  explain, and errs only toward asking for a checkpoint slightly more often
-  than strictly needed. A dynamic bound is a possible later refinement, not a
-  launch requirement.
+  period; the *real* safe window is usually longer.~~ **Falsified 2026-08-11,
+  both halves, on re-derivation against the crate.** (a) *Validator* exits are
+  not rate-limited anywhere: the churn budget (`WARMUP_RATE_BPS`, 25 bps since
+  2026-08-11) meters *delegation* warm-up and cool-down in `delegation.rs`,
+  and `MAX_ACTIVATIONS_PER_EPOCH` meters *entry* — nothing in `staking.rs`
+  meters exits, so the entire self-bonded set can exit in a single epoch and
+  clear withdrawal simultaneously. There is no churn credit to decline; on
+  the path that decides this bound there is nothing to take. (b) The constant
+  was not conservative — see the correction above: the duty/exit overlap made
+  it 31 epochs too long. Ethereum's dynamic churn-derived period remains a
+  possible refinement, but it would have to start from an exit queue that
+  does not currently exist.
+- **Delegated collateral leaves faster than validator keys become free** —
+  the footnote the 900 → 25 bps change (2026-08-11) re-prices. A long-range
+  forgery needs validator *keys*, and the period above guarantees their
+  owners are still slashable inside the window. But what those owners have at
+  risk decays on the delegation clock, which is much faster: delegation
+  cool-down is `COOLDOWN_EPOCHS = 32` (not the 2,048-epoch withdrawal delay),
+  and at 25 bps two thirds of an all-delegated set drains in ≈ 439 epochs
+  (`ln 3 / −ln(1 − 0.0025)`), so the collateral behind a validator's
+  weight-at-`F` can shrink to its self-bond in ≈ 471 epochs ≈ 5.2 days —
+  under a quarter of the window
+  (`ws.rs::tests::delegated_collateral_erodes_inside_the_window` measures
+  it). Signing a forged continuation then costs each conspirator ~5% of a
+  self-bond plus ejection: real, not free, but far below 5% of the weight
+  they carried. At the old 900 bps this erosion took ~12 h; the churn change
+  slowed it ~10×, strictly favorable — and still no credit is taken. Whether
+  delegation cool-down should scale toward the withdrawal delay is a
+  consensus-parameter question flagged for the founder, not decided here.
 - **The clock is an input.** "How old is my knowledge" is computed by comparing
   the last finalized slot against wall-clock time. A node whose clock can be
   set backward by an attacker can be convinced it is fresh when it is stale.
@@ -210,19 +248,22 @@ published checkpoint requires rewriting all of them at once, in public.
 
 ```
 WS_PUBLICATION_INTERVAL_EPOCHS = 256      (≈ 2.85 days)
-WS_FRESH_EPOCHS                = 1,024    (≈ 11.4 days — soft threshold, warn)
-WS_PERIOD_EPOCHS               = 2,048    (≈ 22.8 days — hard threshold, refuse)
+WS_FRESH_EPOCHS                = 1,008    (= WS_PERIOD/2, ≈ 11.2 days — soft threshold, warn)
+WS_PERIOD_EPOCHS               = 2,016    (≈ 22.4 days — hard threshold, refuse; §1 correction)
 ```
 
 The Foundation publishes a checkpoint for the latest finalized epoch that is a
 multiple of 256. Rationale for the numbers:
 
-- **256 vs the 2,048 window** gives an 8× margin: the signing ceremony can fail
-  or be skipped **seven consecutive times** before any previously published
-  checkpoint ages past the hard threshold. m-of-n ceremonies involving external
-  parties (§6) *will* occasionally slip; the cadence is chosen so that slippage
-  is an operations annoyance, never a liveness event for fresh sync.
-- **The soft threshold at half the period** (1,024) exists so that staleness is
+- **256 vs the 2,016 window** gives a ~7.8× margin: the signing ceremony can
+  fail or be skipped **six consecutive times** before any previously published
+  checkpoint ages past the hard threshold (the seventh miss is the liveness
+  event — this said "seven" when the window was the uncorrected 2,048;
+  `ws.rs::tests::publication_cadence_margin` pins the count). m-of-n
+  ceremonies involving external parties (§6) *will* occasionally slip; the
+  cadence is chosen so that slippage is an operations annoyance, never a
+  liveness event for fresh sync.
+- **The soft threshold at half the period** (1,008) exists so that staleness is
   surfaced while there is still ~11 days of margin to fix whatever is wrong,
   rather than discovered at the cliff edge.
 - Publication is also **event-driven** in two cases: (a) immediately after any
@@ -489,7 +530,7 @@ parameters:
 ### 6.4 Signer-set rotation
 
 A rotation (new `signer_set_id`) is announced at least `WS_PERIOD_EPOCHS`
-(≈ 22.8 days) in advance, as a handover statement signed by a quorum of the
+(≈ 22.4 days) in advance, as a handover statement signed by a quorum of the
 *outgoing* set, published on all channels, and shipped in a client release.
 During the overlap, clients accept either set; after `arrangement_valid_until`
 of the old set, only the new. Compromise of an individual key triggers an
@@ -513,7 +554,7 @@ document does is bound it, and the bounds are worth stating exactly:
 2. **The trust is periodic, not continuous, for anyone who stays online.** A
    node that comes back inside `WS_PERIOD_EPOCHS` never consults the
    Foundation at all. The population exposed to the signers is exactly: fresh
-   installs, and nodes offline longer than ~22.8 days.
+   installs, and nodes offline longer than ~22.4 days.
 3. **The trust is not new in kind — but it recurs, and that is the difference
    from PoW.** Genesis-4 itself launches from a founder-signed balance
    snapshot whose digest is embedded in the genesis block
@@ -547,9 +588,9 @@ document does is bound it, and the bounds are worth stating exactly:
 
 | Constant | Value | Anchor |
 |---|---|---|
-| `WS_PERIOD_EPOCHS` | 2,048 (= `WITHDRAWAL_DELAY_EPOCHS`, ≈ 22.8 d) | §1 |
-| `WS_FRESH_EPOCHS` | 1,024 (≈ 11.4 d, warn threshold) | §3 |
-| `WS_PUBLICATION_INTERVAL_EPOCHS` | 256 (≈ 2.85 d; 8× margin) | §3 |
+| `WS_PERIOD_EPOCHS` | 2,016 (= `WITHDRAWAL_DELAY_EPOCHS − EXIT_DELAY_EPOCHS`, ≈ 22.4 d; derived in `ws.rs`, §1 correction) | §1 |
+| `WS_FRESH_EPOCHS` | 1,008 (= `WS_PERIOD_EPOCHS / 2`, ≈ 11.2 d, warn threshold) | §3 |
+| `WS_PUBLICATION_INTERVAL_EPOCHS` | 256 (≈ 2.85 d; ~7.8× margin) | §3 |
 | `DS_WSCKPT` | `"BLCH4:WSCKPT"` + `0x00` padding to 16 B | §2.1 |
 | Signer set, Phase A | 2-of-3, ≥ 1 external | §6.1 |
 | Signer set, Phase B | 3-of-5, ≥ 2 external | §6.1 |
