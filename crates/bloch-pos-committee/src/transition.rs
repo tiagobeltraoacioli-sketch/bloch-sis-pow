@@ -136,9 +136,7 @@ use crate::schedule;
 use crate::slashing;
 use crate::staking::{self, QueuedDeposit};
 use crate::state_root::{
-    CheckpointRecord, ConsensusState, DelegationRecord, DepositQueueRecord, FcEquivocatorRecord,
-    FcMessageRecord, FinalityRecord, LeakRecord, ParticipationRecord, PendingFeeRecord,
-    PendingVoteRecord, RandaoMix, ValidatorRecord as CommittedValidatorRecord,
+    CheckpointRecord, ConsensusState, DelegationRecord, DepositQueueRecord, EvmCommitment, FcEquivocatorRecord, FcMessageRecord, FinalityRecord, LeakRecord, ParticipationRecord, PendingFeeRecord, PendingVoteRecord, RandaoMix, ValidatorRecord as CommittedValidatorRecord,
 };
 use crate::tokenomics_v4;
 use sha3::{Digest, Sha3_256};
@@ -328,6 +326,10 @@ pub struct CommittedState {
     taint_root: [u8; 32],
     coherence_accumulator_root: [u8; 32],
     coherence_nullifier_root: [u8; 32],
+    /// L1 EVM execution commitment, carried (`BLOCH-L1-EVM-STATE-MODEL.md`).
+    /// The node's execution layer computes it; this transition only commits
+    /// it, exactly like the Coherence roots above.
+    evm: EvmCommitment,
 }
 
 impl CommittedState {
@@ -342,6 +344,7 @@ impl CommittedState {
         taint_root: [u8; 32],
         coherence_accumulator_root: [u8; 32],
         coherence_nullifier_root: [u8; 32],
+        evm: EvmCommitment,
     ) -> Self {
         let mut registry = BTreeMap::new();
         let mut reveals_used = BTreeMap::new();
@@ -401,6 +404,7 @@ impl CommittedState {
             taint_root,
             coherence_accumulator_root,
             coherence_nullifier_root,
+            evm,
         };
         // Seed epoch 0's participation for the launch roster, so the
         // committed participation component is well-defined from block one.
@@ -632,6 +636,7 @@ impl CommittedState {
             taint_root: self.taint_root,
             coherence_accumulator_root: self.coherence_accumulator_root,
             coherence_nullifier_root: self.coherence_nullifier_root,
+            evm: self.evm,
         })
     }
 
@@ -1446,6 +1451,12 @@ mod tests {
             [0x11; 32],
             [0x22; 32],
             [0x33; 32],
+            EvmCommitment {
+                account_root: [0x44; 32],
+                receipts_root: [0x55; 32],
+                gas_used: 0,
+                base_fee_per_gas: 1,
+            },
         );
         (Transition::new(verifier), st, chains)
     }
@@ -2177,6 +2188,12 @@ mod tests {
             [0; 32],
             [0; 32],
             [0; 32],
+            EvmCommitment {
+                account_root: [0; 32],
+                receipts_root: [0; 32],
+                gas_used: 0,
+                base_fee_per_gas: 1,
+            },
         );
         let roster = st.duty_roster_at(genesis_cohort::COHORT_TAPER_EPOCHS);
         let cohort_stake =

@@ -800,6 +800,13 @@ pub struct StateRoots {
     pub coherence_accumulator_root: [u8; 32],
     /// Coherence nullifier-set root. Monotone forever, same continuity rule.
     pub coherence_nullifier_root: [u8; 32],
+    /// L1 EVM execution commitment — **carried, never recomputed**, the same
+    /// posture as the Coherence roots: the execution layer owns the keccak-256
+    /// MPT and the fee-market pair, this layer only commits them. Added by
+    /// `docs/specs/BLOCH-L1-EVM-STATE-MODEL.md` §2 — the visible spec change
+    /// the closed-list rule above demands. The list is now closed again at
+    /// eight components.
+    pub evm: crate::state_root::EvmCommitment,
 }
 
 /// The hashing boundary: block identity, body root, attestation root, state

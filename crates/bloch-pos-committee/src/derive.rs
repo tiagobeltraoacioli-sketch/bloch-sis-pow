@@ -41,9 +41,7 @@ use crate::params::DS_BODY;
 use crate::sample::Validator;
 use crate::schedule;
 use crate::state_root::{
-    state_root, ConsensusState, DelegationRecord, DepositQueueRecord, EutxoEntry,
-    FcEquivocatorRecord, FcMessageRecord, FinalityRecord, ParticipationRecord, PendingFeeRecord,
-    PendingVoteRecord, RandaoMix, ValidatorRecord,
+    ConsensusState, DelegationRecord, DepositQueueRecord, EutxoEntry, EvmCommitment, FcEquivocatorRecord, FcMessageRecord, FinalityRecord, ParticipationRecord, PendingFeeRecord, PendingVoteRecord, RandaoMix, ValidatorRecord, state_root,
 };
 use sha3::{Digest, Sha3_256};
 use std::collections::BTreeMap;
@@ -101,6 +99,10 @@ pub struct ChainState {
     pub coherence_accumulator_root: [u8; 32],
     /// Coherence nullifier-set root (§6.6.2), carried.
     pub coherence_nullifier_root: [u8; 32],
+    /// L1 EVM execution commitment (`BLOCH-L1-EVM-STATE-MODEL.md`), carried —
+    /// updating it is EVM execution, which happens in the node's transition,
+    /// not in this seam.
+    pub evm: EvmCommitment,
 }
 
 impl ChainState {
@@ -124,6 +126,7 @@ impl ChainState {
             taint_root: self.taint_root,
             coherence_accumulator_root: self.coherence_accumulator_root,
             coherence_nullifier_root: self.coherence_nullifier_root,
+            evm: self.evm,
         })
     }
 }
@@ -608,7 +611,7 @@ pub fn validate_block(
 #[cfg(test)]
 mod coherence_tests {
     use super::*;
-    use crate::state_root::{CheckpointRecord, FinalityRecord, RandaoMix};
+    use crate::state_root::{CheckpointRecord, EvmCommitment, FinalityRecord, RandaoMix};
 
     fn chain(acc: [u8; 32], nf: [u8; 32]) -> ChainState {
         ChainState {
@@ -640,6 +643,15 @@ mod coherence_tests {
             taint_root: [0u8; 32],
             coherence_accumulator_root: acc,
             coherence_nullifier_root: nf,
+            // Empty EVM segment: no accounts, no receipts, no gas. Written out
+            // rather than defaulted so the next carried component breaks this
+            // line and gets looked at.
+            evm: EvmCommitment {
+                account_root: [0u8; 32],
+                receipts_root: [0u8; 32],
+                gas_used: 0,
+                base_fee_per_gas: 0,
+            },
         }
     }
 

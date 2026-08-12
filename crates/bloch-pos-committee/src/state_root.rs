@@ -123,6 +123,19 @@ const TAG_DEPOSIT_QUEUE: u8 = 0x0D;
 const TAG_DELEGATION: u8 = 0x0E;
 const TAG_PENDING_FEE: u8 = 0x0F;
 
+/// The L1 EVM execution commitment (`docs/specs/BLOCH-L1-EVM-STATE-MODEL.md`).
+/// One singleton leaf, same posture as the taint and Coherence roots: the EVM
+/// state lives in its own commitment structure (a keccak-256 MPT, carried from
+/// the execution layer) and only its digest enters this tree. Per-account EVM
+/// state is deliberately NOT expanded into SMT leaves — see the spec, §2.
+///
+/// Numbered 0x10 and not 0x09: it was authored against 0x09 on the same day the
+/// S5.5 bookkeeping extension claimed 0x09-0x0F, and the two never saw each
+/// other. Renumbering is free now and never again — tags are append-only
+/// because reusing one silently re-keys every leaf of the component it named.
+const TAG_EVM_COMMITMENT: u8 = 0x10;
+
+
 fn sha3(parts: &[&[u8]]) -> [u8; 32] {
     let mut h = Sha3_256::new();
     h.update(DS_STATE);
@@ -706,6 +719,49 @@ impl PendingFeeRecord {
     }
 }
 
+/// The committed output of the L1 EVM execution layer for one block
+/// (`docs/specs/BLOCH-L1-EVM-STATE-MODEL.md` §2–§3).
+///
+/// **Carried, never recomputed here** — the same rule as the Coherence roots:
+/// this crate cannot run the EVM (transactions are opaque bytes to it, §1.2 of
+/// the migration design), so the execution layer computes these values and the
+/// transition carries them into the committed state. The two roots are
+/// keccak-256 Merkle-Patricia roots, not SHA3-SMT roots, on purpose: keccak is
+/// what every EVM proof consumer (`eth_getProof`, MPT light clients) speaks,
+/// keccak-256 is a hash (Grover-only quantum exposure, same margin as the rest
+/// of the SHA-3 family), and re-rooting an incrementally-maintained foreign
+/// structure inside this tree is exactly what the Coherence precedent rejects.
+///
+/// `gas_used` and `base_fee_per_gas` are committed for the §5.5 reason: the
+/// next block's base fee is *derived from* the parent's committed pair. A base
+/// fee read from node-local execution bookkeeping instead of committed state
+/// would be `expected_bits` all over again — an uncommitted retarget input,
+/// the exact shape of the 2026-08-08 consensus split.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EvmCommitment {
+    /// keccak-256 MPT root of the EVM account trie (address → nonce, balance,
+    /// code hash, storage root) after executing this block's EVM segment.
+    pub account_root: [u8; 32],
+    /// keccak-256 MPT root over this block's EVM receipts.
+    pub receipts_root: [u8; 32],
+    /// EVM gas consumed by this block's EVM segment.
+    pub gas_used: u64,
+    /// Base fee, in satoshi per gas, that this block's EVM transactions were
+    /// charged. Input to the next block's base-fee derivation.
+    pub base_fee_per_gas: u64,
+}
+
+impl EvmCommitment {
+    fn serialize(&self) -> Vec<u8> {
+        let mut s = Vec::with_capacity(80);
+        s.extend_from_slice(&self.account_root);
+        s.extend_from_slice(&self.receipts_root);
+        s.extend_from_slice(&self.gas_used.to_le_bytes());
+        s.extend_from_slice(&self.base_fee_per_gas.to_le_bytes());
+        s
+    }
+}
+
 /// Everything `state_root` commits, passed **by argument** — this struct is
 /// the §5.5 rule made into a type. A block validator builds it from the
 /// parent block's committed state and from nothing else; there is no way to
@@ -744,6 +800,9 @@ pub struct ConsensusState<'a> {
     pub coherence_accumulator_root: [u8; 32],
     /// Coherence shielded pool: nullifier-set root (§6.6.2).
     pub coherence_nullifier_root: [u8; 32],
+    /// L1 EVM execution commitment, carried from the execution layer
+    /// (`BLOCH-L1-EVM-STATE-MODEL.md`).
+    pub evm: EvmCommitment,
 }
 
 fn derive_key(component_tag: u8, entry_key: &[u8]) -> [u8; 32] {
@@ -814,6 +873,13 @@ pub fn build_state_tree(state: &ConsensusState<'_>) -> Smt {
         derive_key(TAG_COHERENCE_NULLIFIERS, &[]),
         hash_value(&state.coherence_nullifier_root),
     );
+    // The EVM commitment is the fourth carried foreign component — a single
+    // structured leaf, not per-account leaves. Expanding accounts here would
+    // commit the same state twice (once in the keccak MPT, once in this SMT)
+    // and make every EVM write cost a 256-level SHA3 path on top of its MPT
+    // path; the spec (§2) opens the closed list by exactly one leaf and no
+    // more.
+    smt.insert(derive_key(TAG_EVM_COMMITMENT, &[]), hash_value(&state.evm.serialize()));
     smt
 }
 
@@ -984,9 +1050,19 @@ mod tests {
         deposit_queue: Vec<DepositQueueRecord>,
         delegations: Vec<DelegationRecord>,
         pending_fees: Vec<PendingFeeRecord>,
+        evm: EvmCommitment,
     }
 
     fn fixture() -> Fx {
+        // Distinct non-zero values in all four EVM fields on purpose: with
+        // zeros, a serialization that aliased two of them would still produce
+        // equal roots and the aliasing test below would pass vacuously.
+        let evm = EvmCommitment {
+            account_root: key(0xE0),
+            receipts_root: key(0xE1),
+            gas_used: 21_000,
+            base_fee_per_gas: 7,
+        };
         let eutxos: Vec<EutxoEntry> = (0..10u8)
             .map(|i| EutxoEntry {
                 txid: key(i),
@@ -1086,6 +1162,7 @@ mod tests {
             deposit_queue,
             delegations,
             pending_fees,
+            evm,
         }
     }
 
@@ -1106,6 +1183,7 @@ mod tests {
             taint_root: val(101),
             coherence_accumulator_root: val(102),
             coherence_nullifier_root: val(103),
+            evm: f.evm,
         }
     }
 
@@ -1259,6 +1337,30 @@ mod tests {
         // current (even indices attested) and previous (all attested) differ,
         // so swapping them must move the root.
         assert_ne!(state_root(&state(&g)), base);
+    }
+
+    #[test]
+    fn evm_commitment_fields_do_not_alias() {
+        // account_root/receipts_root are both 32 bytes and gas_used/
+        // base_fee_per_gas are both u64, adjacent in the serialization — a
+        // combine that were commutative or misaligned would let two different
+        // execution outcomes commit identically.
+        let f = fixture();
+        let base = state_root(&state(&f));
+
+        let mut swapped_roots = state(&f);
+        std::mem::swap(
+            &mut swapped_roots.evm.account_root,
+            &mut swapped_roots.evm.receipts_root,
+        );
+        assert_ne!(state_root(&swapped_roots), base);
+
+        let mut swapped_u64s = state(&f);
+        std::mem::swap(
+            &mut swapped_u64s.evm.gas_used,
+            &mut swapped_u64s.evm.base_fee_per_gas,
+        );
+        assert_ne!(state_root(&swapped_u64s), base);
     }
 
     #[test]

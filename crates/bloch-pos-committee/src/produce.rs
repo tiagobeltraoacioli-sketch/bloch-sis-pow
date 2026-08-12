@@ -262,7 +262,8 @@ mod tests {
     use crate::header::BlockId;
     use crate::interfaces::{ProposalReject, TransitionError};
     use crate::state_root::{
-        CheckpointRecord, FinalityRecord, ParticipationRecord, RandaoMix, ValidatorRecord,
+        CheckpointRecord, EvmCommitment, FinalityRecord, ParticipationRecord, RandaoMix,
+        ValidatorRecord,
     };
     use crate::derive::{validate_block, ChainState};
     use sha3::{Digest, Sha3_256};
@@ -363,6 +364,12 @@ mod tests {
             taint_root: [0x11; 32],
             coherence_accumulator_root: [0x12; 32],
             coherence_nullifier_root: [0x13; 32],
+            evm: EvmCommitment {
+                account_root: [0x14; 32],
+                receipts_root: [0x15; 32],
+                gas_used: 0,
+                base_fee_per_gas: 1,
+            },
         };
         let parent_header = BlockHeaderV4 {
             version: VERSION_G4,

@@ -67,9 +67,7 @@ mod harness {
     use bloch_pos_committee::params::{DS_BLOCK, DS_PROPOSE};
     use bloch_pos_committee::schedule::{first_slot_of_epoch, last_slot_of_epoch};
     use bloch_pos_committee::state_root::{
-        state_root as compute_state_root, CheckpointRecord, ConsensusState, EutxoEntry,
-        FinalityRecord, LeakRecord, ParticipationRecord, PendingVoteRecord, RandaoMix,
-        ValidatorRecord as SrValidatorRecord,
+    CheckpointRecord, ConsensusState, EutxoEntry, EvmCommitment, FinalityRecord, LeakRecord, ParticipationRecord, PendingVoteRecord, RandaoMix, ValidatorRecord as SrValidatorRecord, state_root as compute_state_root,
     };
     use bloch_pos_committee::{
         epoch_committee, epoch_of, is_epoch_boundary, process_reveal, proposer, Attestation,
@@ -95,6 +93,12 @@ mod harness {
     const TAINT_ROOT: [u8; 32] = [0x11; 32];
     const COHERENCE_ACC_ROOT: [u8; 32] = [0x22; 32];
     const COHERENCE_NUL_ROOT: [u8; 32] = [0x33; 32];
+    const EVM_COMMITMENT: EvmCommitment = EvmCommitment {
+        account_root: [0x44; 32],
+        receipts_root: [0x55; 32],
+        gas_used: 0,
+        base_fee_per_gas: 1,
+    };
 
     // ── Deterministic crypto stubs ──────────────────────────────────────────
     //
@@ -406,6 +410,7 @@ mod harness {
             taint_root: TAINT_ROOT,
             coherence_accumulator_root: COHERENCE_ACC_ROOT,
             coherence_nullifier_root: COHERENCE_NUL_ROOT,
+            evm: EVM_COMMITMENT,
         })
     }
 
