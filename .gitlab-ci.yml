@@ -266,7 +266,7 @@ pow-screen:
 
 # PoW hardness estimate (S1) — manual, heavy: builds the SageMath +
 # lattice-estimator container and prints the parameter hardness table.
-# See docs/specs/POW-HARDNESS.md + deploy/pow-estimator/.
+# See legacy/specs/POW-HARDNESS.md + deploy/pow-estimator/.
 pow-estimator:
   stage: check
   before_script: []

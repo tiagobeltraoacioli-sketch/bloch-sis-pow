@@ -1,5 +1,15 @@
 # Bloch-SIS Protocol (BLOCH) — Security Self-Assessment
 
+> **Genesis-3-era document — sealed 2026-08-12.** Bloch's proof-of-work
+> chain halts by consensus rule at the terminal height (50,000) and
+> Genesis-4 relaunches as proof of stake; the ownerless thesis was
+> retracted (`docs/adr/ADR-036-retract-ownerless-adopt-foundation.md`).
+>
+> §4 (cryptographic primitives), §7 (memory safety) and §8 (wallet security)
+> stand. The executive comparison table, §3 (decentralization) and §5
+> (consensus protocol) are hashrate-framed and describe a chain that is
+> ending. This document also predates Genesis-2 and Genesis-3.
+
 **Document version:** 1.0
 **Last updated:** 2026-04-19
 **Scope:** Bloch-SIS Protocol (rebrand from GroundState `v0.5.9-rc1`, design preserved) compared against Bitcoin Core `29.x` (2026)

@@ -1,5 +1,14 @@
 # Bloch-SIS-PoW — principles
 
+> **Genesis-3-era document — sealed 2026-08-12.** Bloch's proof-of-work
+> chain halts by consensus rule at the terminal height (50,000) and
+> Genesis-4 relaunches as proof of stake; the ownerless thesis was
+> retracted (`docs/adr/ADR-036-retract-ownerless-adopt-foundation.md`).
+>
+> The preâmbulo and principles 2, 3, 6 and the honesty discipline in 8 stand.
+> Principle 1 ("ownerless") is retracted; the proof-of-work content of
+> principles 4, 5 and 7 describes a consensus that is ending.
+
 ## Preâmbulo
 
 > *A founding statement — the "why", in the author's voice. The articles that

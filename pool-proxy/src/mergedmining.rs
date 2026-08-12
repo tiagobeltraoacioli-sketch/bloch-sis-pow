@@ -5,7 +5,7 @@
 //! ZERO dependency on bloch-crypto (a design boundary). A test folds the coinbase
 //! branch to a full merkle root; the node-side `verify` is the authority.
 //!
-//! End-to-end (see docs/MERGED-MINING.md):
+//! End-to-end (see legacy/MERGED-MINING.md):
 //!   1. Bloch node `getblocktemplate` → the Bloch block identity `aux_block_hash`
 //!      to commit + Bloch `bits` (SCAFFOLD: needs the node to expose the hash);
 //!   2. BTC node `getblocktemplate` → the parent template ([`crate::btc_rpc`]);

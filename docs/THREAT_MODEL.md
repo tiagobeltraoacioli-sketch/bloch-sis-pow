@@ -1,5 +1,15 @@
 # Bloch-SIS Protocol (BLOCH) — Threat Model
 
+> **Genesis-3-era document — sealed 2026-08-12.** Bloch's proof-of-work
+> chain halts by consensus rule at the terminal height (50,000) and
+> Genesis-4 relaunches as proof of stake; the ownerless thesis was
+> retracted (`docs/adr/ADR-036-retract-ownerless-adopt-foundation.md`).
+>
+> §3 (network/transport), §4 (RPC), §5 (storage), §6 (wallet/keystore) and §8
+> (quantum adversary) stand and are cited by current work. §1 (consensus —
+> GhostDAG-Q, retargeting) and §7 (mining) do not. The current threat models
+> are `docs/specs/BLOCH-POS-THREAT-MODEL.md` and `-2.md`.
+
 **Document version:** 1.0
 **Last updated:** 2026-04-19
 **Codebase reference:** `gitlab.com/Entanglementlayer/bloch-layer@main` (rebranded from `groundstate888/groundstate@main` + Era 1 release `v0.5.9-rc1`, which is the source of the STRIDE analysis; BLOCH rebrand preserves the design unchanged, only renames identifiers)
@@ -152,7 +162,7 @@ A threat is labelled:
 | **Double-spend via chain reorg** | PARTIAL | GhostDAG selects the heaviest chain by `blue_work`. Immature coinbase spends are the main attack vector; see 1.4 below. Finality checkpoint exists (`finalized_height` meta key) that rejects reorgs below it — but the depth at which finality kicks in is not well-documented. |
 | **Coinbase malleability** (attacker produces two txids for same block) | MITIGATED | `Transaction::txid` for coinbase strips `script_sig` back to canonical `height:N` form. Test `vuln06_txid_malleability_fixed` verifies that extra trailing bytes don't produce a new txid. |
 | **Merkle root mismatch** (block claims different txs than it contains) | MITIGATED | `Block::merkle_root` recomputed during validation, compared against header. |
-| **Supply inflation beyond the emission schedule** | MITIGATED (per-block) | Each block's coinbase is capped at `miner_reward(h) + fees` and `treasury_reward(h)`. [2026-08 correction: there is **no** `MAX_SUPPLY` cap — the nominal supply is 21 **billion** BLOCH and the 100 BLOCH/block tail is perpetual; the invariant defended here is "coinbase pays exactly the scheduled subsidy" per `tokenomics_v2.rs::block_subsidy_sat` (Emission V3 from local h=40,000 — `docs/specs/TOKENOMICS_V3.md`), not a hard cap.] GAP: no global invariant enforces ∑ coinbase == expected total at the current height — a divergence would only be caught when supply distribution is sampled. Sprint O covers this. |
+| **Supply inflation beyond the emission schedule** | MITIGATED (per-block) | Each block's coinbase is capped at `miner_reward(h) + fees` and `treasury_reward(h)`. [2026-08 correction: there is **no** `MAX_SUPPLY` cap — the nominal supply is 21 **billion** BLOCH and the 100 BLOCH/block tail is perpetual; the invariant defended here is "coinbase pays exactly the scheduled subsidy" per `tokenomics_v2.rs::block_subsidy_sat` (Emission V3 from local h=40,000 — `legacy/specs/TOKENOMICS_V3.md`), not a hard cap.] GAP: no global invariant enforces ∑ coinbase == expected total at the current height — a divergence would only be caught when supply distribution is sampled. Sprint O covers this. |
 
 ### 1.3 Repudiation
 

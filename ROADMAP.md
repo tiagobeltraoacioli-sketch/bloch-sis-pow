@@ -1,5 +1,15 @@
 # Bloch-SIS — roadmap
 
+> **Genesis-3-era document — sealed 2026-08-12.** Bloch's proof-of-work
+> chain halts by consensus rule at the terminal height (50,000) and
+> Genesis-4 relaunches as proof of stake; the ownerless thesis was
+> retracted (`docs/adr/ADR-036-retract-ownerless-adopt-foundation.md`).
+>
+> The privacy track (P1–P5), S2 (audit), S4 (attestation), S5 (supply chain),
+> S6 (k-of-n custody), the governance section and "what we will NOT do" stand.
+> S1 (canonical PoW hardness) and S7 (an FFG-BFT overlay of miners weighted by
+> hashrate) lost their object; their research record is in `legacy/`.
+
 **North star: maximize security and privacy.** Everything below is ordered by how
 much it moves those two axes — not by how much new surface it adds. The project
 already has broad surface (node, the SIS-gated hashcash PoW, hybrid PQ signatures, attestation
@@ -30,8 +40,8 @@ privacy, and put the disclosure switch in the user's hands, not the protocol's.
 ### S1 — Canonical PoW security claim *(the central gate)*
 The default runs a relaxed testnet regime; the canonical verifier already exists
 (`bloch-sis-pow::verify`). **The hardness research is done** — three independent
-analyses (`docs/specs/POW-HARDNESS.md`, `deploy/pow-estimator/SCREEN-RESULTS.md`,
-`docs/research/POW-CANONICAL-frontier.md`) converge on one result: **a
+analyses (`legacy/specs/POW-HARDNESS.md`, `deploy/pow-estimator/SCREEN-RESULTS.md`,
+`legacy/research/POW-CANONICAL-frontier.md`) converge on one result: **a
 trapdoorless PoW cannot be both lattice-hard and mineable.** With no trapdoor,
 the core-SVP cost is simultaneously the attack cost and the honest mining cost;
 the estimator sweep shows every ≥100-bit point is unmineable (no short `s`

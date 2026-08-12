@@ -1,5 +1,15 @@
 # Bloch-SIS Protocol — Standalone Specification (v0.1, frozen-for-audit draft)
 
+> **Genesis-3-era document — sealed 2026-08-12.** Bloch's proof-of-work
+> chain halts by consensus rule at the terminal height (50,000) and
+> Genesis-4 relaunches as proof of stake; the ownerless thesis was
+> retracted (`docs/adr/ADR-036-retract-ownerless-adopt-foundation.md`).
+>
+> §1 (hybrid signature construction), §2 (keys and addresses), §4 (transaction
+> wire format) and §10 (crypto-agility) are reused by Genesis-4 and stand.
+> §3 (proof of work), §5 (block/header wire format), §7 (fork choice) and §8
+> (hard-fork map) describe a consensus that is ending. Index: `docs/README.md`.
+
 **Status: advisory / design-freeze draft. This is a PLAN and a description of the
 code as it exists, NOT a claim of security.** No cryptographic audit has been
 performed. Nothing here is "secure," "proven," "audited," or "quantum-safe." The
@@ -672,7 +682,7 @@ blocks (~1.5 yr, `EMISSION_V3_HALVING_INTERVAL`, counter restarts at the
 fork), schedule 2,600 → 1,300 → 650 → 325 → 162 → 81 then a perpetual
 60 BLOCH tail floor from V3 epoch 6 (~9 yr after the fork; the V2 floor
 of 100 governs pre-fork history; supply is **not hard-capped**; see
-`docs/specs/TOKENOMICS_V3.md`). **The coin is
+`legacy/specs/TOKENOMICS_V3.md`). **The coin is
 valueless by design** — emission parameters do not confer value or a security.
 
 ---

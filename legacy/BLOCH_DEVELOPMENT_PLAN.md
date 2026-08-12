@@ -5,7 +5,7 @@ identity is its proof-of-work: a SHAKE-256 hashcash with a Module-**SIS**
 (Short Integer Solution) structural gate. (Historical note: this plan's original
 framing — "Module-SIS lattice proof-of-work" as the security source — was
 corrected by the hardness research: PoW security is cumulative hash work, not
-lattice hardness; see `docs/research/POW-CANONICAL-frontier.md`.)
+lattice hardness; see `legacy/research/POW-CANONICAL-frontier.md`.)
 Forked from the
 Bloch-SIS Protocol (BLOCH) codebase. This document is the source of truth for
 how Bloch diverges from BLOCH. BLOCH is preserved untouched (local + GitLab);
@@ -64,7 +64,7 @@ The reference crate is vendored at `crates/bloch-sis-pow/` (v0.1.0, 43 tests,
 
 **Honest state** *(historical snapshot — since superseded by the hardness
 research: PoW security is hashcash cumulative work, not lattice hardness, and
-BKZ mining is a dead end; see `docs/research/POW-CANONICAL-frontier.md`)*:
+BKZ mining is a dead end; see `legacy/research/POW-CANONICAL-frontier.md`)*:
 - Hardness was **conjectured, not proven** at the time; the estimator research
   later showed no lattice-hard mineable parameterization exists.
 - At full-`M` parameters the brute-force solver **cannot mine**

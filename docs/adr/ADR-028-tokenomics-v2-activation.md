@@ -8,6 +8,16 @@
 **Supersedes:** None
 **Superseded by:** None
 
+> **Editorial note, 2026-08-12.** Two corrections to the header above, which
+> was never updated: this ADR **is superseded** — its emission curve by
+> ADR-035 (Emission V3), and the whole tokenomics model by V4
+> (`crates/bloch-pos-committee/src/tokenomics_v4.rs`,
+> `docs/specs/BLOCH-TOKENOMICS-V4.md`). And the tokenomics documents it
+> references were moved to `legacy/` when the repository flipped to proof of
+> stake; the paths below were rewritten to point at where the files actually
+> are, so §3.1 and §4 read `legacy/specs/…` where in 2026-05 they said
+> `docs/specs/…`. The decision itself is unchanged.
+
 ---
 
 ## 1. Context
@@ -42,13 +52,13 @@ This ADR records the decision to resolve the drift in favor of the ADR-specified
 
 - **D7.** Tail floor robustness. V1 tail behavior is "subsidy → 0". V2 specifies 25 BLOCH/block tail floor, perpetual. Monte Carlo trajectories in `BLOCH_Tokenomics_MonteCarlo.pdf` showed tail-floor models produce significantly more robust security budgets in adverse scenarios (ADR-010 §3.5 M5 selection rationale).
 
-- **D8.** Pre-mainnet timing window. The architectural decision in ADRs 010, 010-A, 010-Add-1 was made 2026-04-29. Implementing them takes ~4-6 days of focused work and must close before mainnet activation per `docs/MAINNET-DEV-CHECKLIST.md`. Postponing reconciliation increases risk that genesis ceremony proceeds with inconsistent specs.
+- **D8.** Pre-mainnet timing window. The architectural decision in ADRs 010, 010-A, 010-Add-1 was made 2026-04-29. Implementing them takes ~4-6 days of focused work and must close before mainnet activation per `legacy/MAINNET-DEV-CHECKLIST.md`. Postponing reconciliation increases risk that genesis ceremony proceeds with inconsistent specs.
 
 ## 3. Considered options
 
 ### 3.1 Option A — V1 → V2 transition ✅ SELECTED
 
-Implement the model specified in ADRs 010, 010-A, 010-Addendum-1. Rename V1 file to `TOKENOMICS_V1_SUPERSEDED.md` and place in `docs/specs/historical/`. Create new `docs/specs/TOKENOMICS_V2.md`. Refactor code per `docs/MIGRATION-TOKENOMICS-V1-TO-V2.md`.
+Implement the model specified in ADRs 010, 010-A, 010-Addendum-1. Rename V1 file to `TOKENOMICS_V1_SUPERSEDED.md` and place in `legacy/specs/historical/`. Create new `legacy/specs/TOKENOMICS_V2.md`. Refactor code per `legacy/MIGRATION-TOKENOMICS-V1-TO-V2.md`.
 
 **Pros:**
 - Aligns code with architectural decisions
@@ -59,7 +69,7 @@ Implement the model specified in ADRs 010, 010-A, 010-Addendum-1. Rename V1 file
 **Cons:**
 - 4-6 days of refactor work
 - Re-tests required for all consensus tests
-- Requires new founder address generation (ML-DSA-65 keystore) — already planned per `docs/MAINNET-DEV-CHECKLIST.md` §9
+- Requires new founder address generation (ML-DSA-65 keystore) — already planned per `legacy/MAINNET-DEV-CHECKLIST.md` §9
 
 ### 3.2 Option B — Keep V1, mark ADRs Superseded
 
@@ -95,13 +105,13 @@ The decision was made by the BLOCH Founder on 2026-05-01 with the following conf
 - Vesting payout: per-block coinbase output to founder address (per V2 §5.3)
 - No on-chain treasury (the 70/25/5 split has no separate treasury allocation; "BLOCH Labs treasury" exists only off-chain per ADR-023)
 - Tail floor 25 BLOCH/block perpetual confirmed
-- V1 file flagged as Superseded and archived in `docs/specs/historical/`
+- V1 file flagged as Superseded and archived in `legacy/specs/historical/`
 
 V2 is the genesis configuration for mainnet activation per ADR-023 Phase 1.
 
 ## 5. Implementation
 
-Per `docs/MIGRATION-TOKENOMICS-V1-TO-V2.md`. Ten steps in execution order:
+Per `legacy/MIGRATION-TOKENOMICS-V1-TO-V2.md`. Ten steps in execution order:
 
 1. Documentation flip (V1 → SUPERSEDED, V2 in place, ADR-028)
 2. Constants in `src/core/mod.rs`
@@ -131,12 +141,12 @@ Estimated 4–6 days focused engineering. No backward-compatibility constraints.
 - Genesis tools need re-validation against V2 difficulty calibration
 
 ### Neutral
-- Founder address generation timing unchanged (already planned per `docs/MAINNET-DEV-CHECKLIST.md` §9)
+- Founder address generation timing unchanged (already planned per `legacy/MAINNET-DEV-CHECKLIST.md` §9)
 - Mainnet activation timeline impact: small (4-6 days within an estimated 12-16 week pre-mainnet window)
 
 ## 7. Open questions
 
-The following are flagged in `docs/specs/TOKENOMICS_V2.md` §10 for resolution in a future ADR-010 revision (rev2). They do not block V2 activation:
+The following are flagged in `legacy/specs/TOKENOMICS_V2.md` §10 for resolution in a future ADR-010 revision (rev2). They do not block V2 activation:
 
 - ADR-010 §3.5 quotes "asymptotic inflation ~0.05%/year"; actual math is 0.526%/year. Order-of-magnitude difference suggests typo or different baseline in ADR-010.
 - ADR-010 mentions "endowment buffer (10% of fees)" and "emergency boost mode" but specific implementation is not yet present in code. To be added in Sprint 11+ work or an ADR-010-B.
@@ -144,12 +154,12 @@ The following are flagged in `docs/specs/TOKENOMICS_V2.md` §10 for resolution i
 
 ## 8. References
 
-- `docs/specs/TOKENOMICS_V2.md` — V2 specification (active)
-- `docs/specs/historical/TOKENOMICS_V1_SUPERSEDED.md` — V1 (archived)
-- `docs/MIGRATION-TOKENOMICS-V1-TO-V2.md` — engineering checklist
+- `legacy/specs/TOKENOMICS_V2.md` — V2 specification (active)
+- `legacy/specs/historical/TOKENOMICS_V1_SUPERSEDED.md` — V1 (archived)
+- `legacy/MIGRATION-TOKENOMICS-V1-TO-V2.md` — engineering checklist
 - `docs/adr/ADR-006-block-time.md` — 150s block time
 - `docs/adr/ADR-010-tokenomics-emission.md` — emission curve specification
 - `docs/adr/ADR-010-A-founder-premine.md` — 17% / 30-year vesting
 - `docs/adr/ADR-010-Addendum-1-oracle-pool.md` — 70/25/5 split
 - `docs/adr/ADR-018-oracle-network.md` — oracle compensation streams
-- `docs/MAINNET-DEV-CHECKLIST.md` — pre-mainnet engineering work
+- `legacy/MAINNET-DEV-CHECKLIST.md` — pre-mainnet engineering work

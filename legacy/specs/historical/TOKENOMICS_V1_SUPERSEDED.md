@@ -3,8 +3,8 @@
 > ⚠️ **THIS DOCUMENT IS SUPERSEDED.**
 >
 > V1 has been replaced by V2. See:
-> - `docs/specs/TOKENOMICS_V2.md` — the active specification
-> - `docs/MIGRATION-TOKENOMICS-V1-TO-V2.md` — engineering migration checklist
+> - `legacy/specs/TOKENOMICS_V2.md` — the active specification
+> - `legacy/MIGRATION-TOKENOMICS-V1-TO-V2.md` — engineering migration checklist
 > - `docs/adr/ADR-028-tokenomics-v2-activation.md` — architectural decision recording the transition
 >
 > **What V1 specified that V2 changed:**
@@ -22,7 +22,7 @@
 > This document is preserved as historical record only. **Do not** treat any constant or rule herein as binding.
 >
 > **Date of supersession:** 2026-05-01
-> **Superseding document:** `docs/specs/TOKENOMICS_V2.md` v2.0
+> **Superseding document:** `legacy/specs/TOKENOMICS_V2.md` v2.0
 
 ---
 
@@ -113,6 +113,6 @@ After approximately one year of mainnet operation, the chain transitions from su
 
 ## End of superseded specification
 
-V1 is preserved here as historical record. All future references to BLOCH tokenomics should cite `docs/specs/TOKENOMICS_V2.md`.
+V1 is preserved here as historical record. All future references to BLOCH tokenomics should cite `legacy/specs/TOKENOMICS_V2.md`.
 
 If you arrived here because of an external link, please update your reference to V2.

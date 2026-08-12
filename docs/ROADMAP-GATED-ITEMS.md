@@ -40,8 +40,8 @@ the gate). Cross-refs point at `ROADMAP.md` tracks (S/P/M) and `docs/`.
   preserved; publish the ePrint restating the reframed claim (hashcash cumulative
   work on the aux SHAKE-256 target + Module-SIS residual as a structural gate,
   NOT a lattice bit-security number); obtain third-party audit of the reframed
-  claim. Refs: `docs/specs/POW-HARDNESS.md`, `deploy/pow-estimator/`,
-  `docs/research/POW-CANONICAL-frontier.md`.
+  claim. Refs: `legacy/specs/POW-HARDNESS.md`, `deploy/pow-estimator/`,
+  `legacy/research/POW-CANONICAL-frontier.md`.
 
 - **Independent audit + fuzzing (S2)** — GATE: no external security review has
   been done; the audit gap has been open since day one. UNBLOCK: engage a

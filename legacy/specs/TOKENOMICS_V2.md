@@ -4,7 +4,7 @@
 **Version:** 2.0
 **Date:** 2026-05-01
 **Author:** BLOCH Founder
-**Supersedes:** `docs/specs/historical/TOKENOMICS_V1_SUPERSEDED.md`
+**Supersedes:** `legacy/specs/historical/TOKENOMICS_V1_SUPERSEDED.md`
 **Related ADRs:** ADR-006 (Block time + dual finality), ADR-010 (Tokenomics), ADR-010-A (Founder premine), ADR-010-Addendum-1 (Oracle pool), ADR-018 (Oracle network), ADR-028 (V1 → V2 transition)
 
 > *"Tudo o que pode ser parametrizado por governance pode ser corrompido por governance."*
@@ -42,7 +42,7 @@
 
 This document specifies the complete economic model of the Bloch-SIS Protocol (BLOCH) blockchain. Every parameter herein is **genesis-locked** — meaning the values are compiled into the Rust source code as `pub const` constants, become consensus rules at genesis block production, and can only be changed by hard fork. There is no on-chain governance mechanism that can alter these parameters. There is no voting. There is no DAO.
 
-V2 supersedes V1 (preserved as `docs/specs/historical/TOKENOMICS_V1_SUPERSEDED.md`). The reason for the V1 → V2 transition is documented in ADR-028. Briefly: V1 specified a 4% founder premine without on-chain vesting, with a 93/5/2 reward split and 10-second block time. V2 aligns the spec with the architecturally-decided model in ADRs 006, 010, 010-A, and 010-Addendum-1: 17% founder premine with on-chain vesting (10-year lock + 40-year linear, per ADR-033 §8), 70/25/5 reward split, and 150-second block time.
+V2 supersedes V1 (preserved as `legacy/specs/historical/TOKENOMICS_V1_SUPERSEDED.md`). The reason for the V1 → V2 transition is documented in ADR-028. Briefly: V1 specified a 4% founder premine without on-chain vesting, with a 93/5/2 reward split and 10-second block time. V2 aligns the spec with the architecturally-decided model in ADRs 006, 010, 010-A, and 010-Addendum-1: 17% founder premine with on-chain vesting (10-year lock + 40-year linear, per ADR-033 §8), 70/25/5 reward split, and 150-second block time.
 
 The numbers in this document are not proposals. They are commitments.
 
@@ -272,7 +272,7 @@ V2 tokenomics specifies only the existence and amount of this pool. Distribution
 ```rust
 //! src/core/tokenomics_v2.rs — V2 tokenomics constants
 //!
-//! Per docs/specs/TOKENOMICS_V2.md
+//! Per legacy/specs/TOKENOMICS_V2.md
 //! Genesis-locked. Mutation requires hard fork.
 
 // ── Total supply ─────────────────────────────────────────────────────
@@ -341,9 +341,9 @@ Violation of any consensus rule causes the block to be rejected by `accept_block
 
 ## 9. Migration from V1
 
-This document supersedes V1 (`docs/specs/historical/TOKENOMICS_V1_SUPERSEDED.md`). Migration is documented in:
+This document supersedes V1 (`legacy/specs/historical/TOKENOMICS_V1_SUPERSEDED.md`). Migration is documented in:
 
-- `docs/MIGRATION-TOKENOMICS-V1-TO-V2.md` (engineering checklist)
+- `legacy/MIGRATION-TOKENOMICS-V1-TO-V2.md` (engineering checklist)
 - `docs/adr/ADR-028-tokenomics-v2-activation.md` (architectural decision record)
 
 **No backward compatibility is required** because mainnet has not activated. V1 was specified but not deployed; V2 is the actual genesis configuration. Test networks running V1 will be torn down before V2 mainnet activation.

@@ -1,5 +1,14 @@
 # Bloch-SIS Protocol — Threat Model (audit-scoping draft)
 
+> **Genesis-3-era document — sealed 2026-08-12.** Bloch's proof-of-work
+> chain halts by consensus rule at the terminal height (50,000) and
+> Genesis-4 relaunches as proof of stake; the ownerless thesis was
+> retracted (`docs/adr/ADR-036-retract-ownerless-adopt-foundation.md`).
+>
+> §0 (Bloch protects chain-ordering integrity and liveness, not asset value)
+> and the trust-boundary/parsing analysis stand. The k=4 PoW regime, the
+> difficulty citations and the PoW-framed adversary classes do not.
+
 **Status: advisory / design-only. This is a PLAN and an honest self-assessment,
 NOT a claim of security.** No external cryptographic or security audit has been
 performed on any part of this codebase. Nothing here is "secure," "proven,"

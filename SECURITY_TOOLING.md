@@ -1,5 +1,15 @@
 # Security Tooling — Bloch-SIS-PoW
 
+> **Genesis-3-era document — sealed 2026-08-12.** Bloch's proof-of-work
+> chain halts by consensus rule at the terminal height (50,000) and
+> Genesis-4 relaunches as proof of stake; the ownerless thesis was
+> retracted (`docs/adr/ADR-036-retract-ownerless-adopt-foundation.md`).
+>
+> The scanner inventory and the tracked open-advisory set (hickory-proto,
+> yamux GHSA-vxx9-2994-q338) are current and consensus-independent. The scope
+> table's SHA-256d/GhostDAG rows, the PoW fuzz targets, and the description of
+> the EVM as an L2 scaffold are superseded (`docs/adr/ADR-040-evm-and-ustav-at-l1.md`).
+
 *How the code is scanned, what each tool catches, what it cannot, and how to run everything locally. As of 2026-07-22. Unaudited by a third party — automated scanning + an internal adversarial audit reduce but do not remove risk; consensus logic and cryptographic parameter choices require human + external review.*
 
 ## Scope — two codebases, different threat models

@@ -7,7 +7,7 @@
 | **Author** | Founder (custodial) |
 | **Scope** | Final internal audit of the BLOCH codebase before mainnet activation under founder custodial stewardship per ADR-023 Phase 1 |
 | **Position in lifecycle** | Runs after `STRESS-TEST-PLAN.md` campaign closes. Last engineering gate before genesis ceremony and mainnet activation. |
-| **Companion docs** | `docs/MAINNET-DEV-CHECKLIST.md`, `docs/STRESS-TEST-PLAN.md` |
+| **Companion docs** | `legacy/MAINNET-DEV-CHECKLIST.md`, `legacy/STRESS-TEST-PLAN.md` |
 
 ---
 

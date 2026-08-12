@@ -32,7 +32,7 @@ mainnet — but it doesn't scale:
 
 - Mainnet block production during the audit fortnight observed
   fork-explosion under mixed-CPU mining (see post-mortem
-  [2026-04-21-ibd-reorg.md](../docs/post-mortems/2026-04-21-ibd-reorg.md)
+  [2026-04-21-ibd-reorg.md](../../docs/post-mortems/2026-04-21-ibd-reorg.md)
   and the density table: ~20 concurrent blocks per height at one
   observed point).
 - SHA-256d at Bloch-SIS Protocol's block time (10s) is dominated by ASICs
@@ -346,7 +346,7 @@ steal the reward. Mitigation paths:
    long-term answer.
 
 The reference implementation documents option 1 in
-`docs/operations/stratum.md` and does not attempt to add TLS to the
+`legacy/operations/stratum.md` and does not attempt to add TLS to the
 V1 handler. Halfway-TLS is worse than no-TLS because it creates
 false confidence.
 

@@ -4,7 +4,7 @@
 **Status: candidate, UNAUDITED — review + test before deploying.**
 Branches: `fix/ghostdag-reachability` (index + Fast mode) →
 `feat/reachability-durable` (durable CF + rebuild migration + activation shape).
-Canonical ADR: `docs/BLOCH-UPGRADE-REACHABILITY.md`.
+Canonical ADR: `legacy/BLOCH-UPGRADE-REACHABILITY.md`.
 
 ## Verdict: COORDINATED SOFT-FORK (not a per-node DROP-IN)
 

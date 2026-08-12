@@ -7,7 +7,7 @@
 | **Author** | Founder (custodial) |
 | **Scope** | Stress test execution before mainnet activation |
 | **Position in lifecycle** | Phase 0 → Phase 1 transition; runs after `MAINNET-DEV-CHECKLIST.md` items close, before `INTERNAL-AUDIT-PLAN.md` execution |
-| **Companion docs** | `docs/MAINNET-DEV-CHECKLIST.md`, `docs/INTERNAL-AUDIT-PLAN.md` |
+| **Companion docs** | `legacy/MAINNET-DEV-CHECKLIST.md`, `legacy/INTERNAL-AUDIT-PLAN.md` |
 
 ---
 
@@ -243,7 +243,7 @@ Adversarial miner solves blocks but doesn't broadcast. Verify network still prog
 Attacker builds parallel chain from 1000 blocks ago. Verify checkpointing prevents acceptance even if attacker has more cumulative work.
 
 ### A5 — Stratum hijack
-Attacker MITMs a SV1 connection (cleartext). Verify the new SV2 path provides protection that V1 cannot. Document the V1 attack as known limitation in `docs/operations/stratum.md`.
+Attacker MITMs a SV1 connection (cleartext). Verify the new SV2 path provides protection that V1 cannot. Document the V1 attack as known limitation in `legacy/operations/stratum.md`.
 
 ---
 

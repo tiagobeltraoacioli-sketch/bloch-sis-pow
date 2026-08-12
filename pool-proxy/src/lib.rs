@@ -8,7 +8,7 @@ pub mod extranonce;
 pub mod rpc;
 /// Merged mining (AuxPoW): pull a parent Bitcoin template and, on a Bloch-target
 /// win, produce the AuxPoW blob the Bloch node accepts. SCAFFOLD (see
-/// docs/MERGED-MINING.md); format pinned to `bloch-crypto::core::auxpow`.
+/// legacy/MERGED-MINING.md); format pinned to `bloch-crypto::core::auxpow`.
 pub mod btc_rpc;
 /// Bitcoin block serialization primitives (vector-tested against the genesis
 /// block + BIP CompactSize/BIP141) for the merged-mining BTC-relay path.

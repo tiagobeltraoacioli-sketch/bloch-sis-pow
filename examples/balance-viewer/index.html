@@ -72,7 +72,7 @@
 "use strict";
 
 // Reusable JSON-RPC caller that handles Bloch's non-standard result.error quirk.
-// See docs/portal/01-build-your-first-bloch-app.md.
+// See legacy/portal/01-build-your-first-bloch-app.md.
 async function callRpc(endpoint, method, params, apiKey) {
   const headers = { "content-type": "application/json" };
   if (apiKey) headers["X-API-Key"] = apiKey;

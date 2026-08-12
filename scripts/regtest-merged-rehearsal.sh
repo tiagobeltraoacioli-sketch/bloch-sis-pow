@@ -20,7 +20,7 @@
 # LOCAL build accepts merged blocks. A mainnet artifact never sets that feature.
 # This script refuses to run against anything but a throwaway datadir.
 #
-# HONEST CAVEAT (see docs/MERGED-MINING.md): merged mining only secures Bloch
+# HONEST CAVEAT (see legacy/MERGED-MINING.md): merged mining only secures Bloch
 # with the fraction of BTC hashrate that opts in, and lets a big BTC miner
 # attack at ~zero marginal cost — a bootstrap lever, not a security guarantee.
 # NEVER exercise this on the live chain; regtest only.
