@@ -183,7 +183,7 @@ Placeholder copy (the honest version, on-brand):
 | 6 | Coherence (shielded pool) | `docs/specs/COHERENCE-C1.md`, `C1.1` | Carries the "no privacy claim until audited" caveat |
 | 7 | Weak subjectivity & checkpoints | `docs/specs/BLOCH-WEAK-SUBJECTIVITY.md` | Needed by node operators at Genesis-4 |
 | 8 | RPC v4 | `docs/specs/BLOCH-RPC-V4.md`, `docs/openapi.yaml` | Developer surface |
-| 9 | Builder portal | `docs/portal/01–04` | Written for the PoW chain — needs a migration pass before review, not just approval |
+| 9 | Builder portal | `legacy/portal/01–04` | Written for the PoW chain — needs a migration pass before review, not just approval |
 | 10 | Paper | `docs/papers/Acioli_2026_The_Cryptographic_Constitution.*` | Standalone; no dependency |
 
 Explicitly **not** queued: the EVM-at-L1 and Ustav-at-L1 specs

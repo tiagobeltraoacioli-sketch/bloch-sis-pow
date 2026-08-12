@@ -1,5 +1,14 @@
 # Security Policy
 
+> **Genesis-3-era document — sealed 2026-08-12.** Bloch's proof-of-work
+> chain halts by consensus rule at the terminal height (50,000) and
+> Genesis-4 relaunches as proof of stake; the ownerless thesis was
+> retracted (`docs/adr/ADR-036-retract-ownerless-adopt-foundation.md`).
+>
+> The reporting flow, disclosure timeline and development practices below are
+> current and unaffected. The **Status** section and the PoW/AuxPoW/difficulty
+> entries in scope describe the chain only for the blocks it has left.
+
 ## Status
 
 The live network is the **Genesis-3 mainnet** (chain-id `0xB10C_0004`, launched

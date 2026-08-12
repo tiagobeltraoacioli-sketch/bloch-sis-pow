@@ -1,5 +1,15 @@
 # Bloch-SIS — security & privacy threat model
 
+> **Genesis-3-era document — sealed 2026-08-12.** Bloch's proof-of-work
+> chain halts by consensus rule at the terminal height (50,000) and
+> Genesis-4 relaunches as proof of stake; the ownerless thesis was
+> retracted (`docs/adr/ADR-036-retract-ownerless-adopt-foundation.md`).
+>
+> The privacy table, the signature-forgery and hash-break rows, and the
+> "what is NOT protected" discipline stand. The cheap-PoW-forgery row, the
+> GhostDAG-Q reorg row and the malicious-miner adversary do not. The current
+> threat models are `docs/specs/BLOCH-POS-THREAT-MODEL.md` and `-2.md`.
+
 What Bloch-SIS protects, against whom, and — just as important — **what it does
 not protect**. Organized around the two motto axes: **security** and **privacy**.
 This is an honest, adversary-oriented companion to `ROADMAP.md` and
@@ -48,7 +58,7 @@ privacy — there is no privileged party that can deanonymize or freeze users.
 
 | Threat | Mitigation | Status / gate |
 |---|---|---|
-| **Cheap PoW forgery** (find solutions faster than intended work) | SHAKE-256 hashcash target (cumulative work) + non-trivial Module-SIS structural gate (`√k·β < q`, compile-time enforced) | ⚠️ **testnet regime is forgeable**; hardness research concluded PoW security is hash work, not lattice hardness (`docs/research/POW-CANONICAL-frontier.md`) — canonical gate params + no-shortcut proof = **S1** |
+| **Cheap PoW forgery** (find solutions faster than intended work) | SHAKE-256 hashcash target (cumulative work) + non-trivial Module-SIS structural gate (`√k·β < q`, compile-time enforced) | ⚠️ **testnet regime is forgeable**; hardness research concluded PoW security is hash work, not lattice hardness (`legacy/research/POW-CANONICAL-frontier.md`) — canonical gate params + no-shortcut proof = **S1** |
 | **Signature forgery** (incl. quantum) | Hybrid **Falcon-1024 ‖ ML-DSA-65** — both must verify (two lattice families) | ✅ implemented; **S2** audit pending |
 | **Hash break** (incl. quantum) | SHAKE-256 / SHA3 throughout (Grover-resistant margins) | ✅ implemented |
 | **Double-spend / reorg theft** | GhostDAG-Q + reorg re-validation (input existence, no double-spend, value conservation, coinbase maturity) | ✅ H1 fix + tests; **S2/S3** (audit + live multi-node) |

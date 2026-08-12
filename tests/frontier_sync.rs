@@ -8,7 +8,7 @@
 //! `PeerStateTable`, and delivery is simulated by inserting hashes into A.
 //!
 //! It asserts the two properties that motivated Phase 2
-//! (docs/design/CHAIN-SYNC-MODEL.md §2 Layer 3 / §3):
+//! (legacy/design/CHAIN-SYNC-MODEL.md §2 Layer 3 / §3):
 //!   1. A behind-node requests exactly the tips it lacks, converges, and its
 //!      IBD-release condition (frontier reconciled AND local blue_work parity)
 //!      flips true only after every advertised tip is present.

@@ -1,7 +1,7 @@
 # Bloch reference apps
 
 Small, self-contained, permissively-licensed apps that talk to a Bloch node's
-JSON-RPC. Companions to the [developer portal](../docs/portal/index.md).
+JSON-RPC. Companions to the [developer portal](../legacy/portal/index.md).
 
 > **⚠️ Honesty rails (binding).** Building on Bloch today is **EXPERIMENTAL**.
 > Unaudited mainnet-beta; relaxed PoW (**k=4**) makes work **trivially
@@ -32,7 +32,7 @@ JSON-RPC. Companions to the [developer portal](../docs/portal/index.md).
 - **All three share one JSON-RPC helper** that handles Bloch's non-standard
   **`result.error` quirk** (method-level failures arrive inside `result`, not as
   a top-level JSON-RPC `error`). See
-  [Build your first Bloch app](../docs/portal/01-build-your-first-bloch-app.md).
+  [Build your first Bloch app](../legacy/portal/01-build-your-first-bloch-app.md).
 - **Why the payment app only previews.** Bloch outputs are fixed **P2PKH** and a
   `script_sig` is a hybrid **Falcon-1024 ‖ ML-DSA-65** post-quantum signature.
   That signature must come from the reference signer (`bloch-cli` /

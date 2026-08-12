@@ -11,7 +11,7 @@ whose bugs are hard to catch in unit tests — the real test is a
 miner ASIC connecting and finding a block. Getting the design right
 on paper before writing code avoids costly rework.
 
-Based on the design approved in `gips/GIP-0002-stratum.md` and the
+Based on the design approved in `legacy/gips/GIP-0002-stratum.md` and the
 six design decisions confirmed at end-of-session on 2026-04-21:
 
 1. **Address validation:** strict — invalid Bech32 rejects the
@@ -43,7 +43,7 @@ Plus:
 ```
 src/main.rs                       -- CLI flags, spawn StratumServer task
 tests/sprint_aa_stratum.rs        -- integration tests
-docs/operations/stratum.md        -- operator-facing docs
+legacy/operations/stratum.md        -- operator-facing docs
 ```
 
 No changes to `src/consensus/`, `src/storage/`, `src/network/`,
@@ -509,7 +509,7 @@ Mock miner as a tokio TCP client. Three tests:
 A true end-to-end test (mine a block) needs PoW work, which is slow
 for a test. Skip for now — covered by real-ASIC testing post-deploy.
 
-## Docs — `docs/operations/stratum.md` (~200 lines)
+## Docs — `legacy/operations/stratum.md` (~200 lines)
 
 Operator-facing doc covering:
 - How to enable (`--stratum --stratum-mode solo`)
@@ -586,7 +586,7 @@ but doesn't advance selected tip. This is acceptable behavior.
 The miner receives `{"result": true}` (block accepted in some form)
 but in solo mode this is arguably a loss — we mined but didn't
 become the selected tip. **Document this edge case** in
-`docs/operations/stratum.md`. Pool mode (AA.2) will handle it
+`legacy/operations/stratum.md`. Pool mode (AA.2) will handle it
 differently via shares.
 
 ### extranonce1 collision
@@ -649,7 +649,7 @@ Exit criteria:
    c. Receive `mining.notify`
    d. Submit shares (even if below target — they get rejected
       cleanly, no panics, no state corruption)
-5. Operator docs published to `docs/operations/stratum.md`.
+5. Operator docs published to `legacy/operations/stratum.md`.
 6. README updated: "Mining" section mentions stratum support.
 
 **Not required for sprint close but desirable next day:**

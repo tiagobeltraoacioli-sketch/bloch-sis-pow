@@ -170,7 +170,7 @@ exactly.) [SOLID]
 - **100-bit crossing:** between `n512 q/128` (98.7) and `n512 q/192` (106.4) →
   ≈ (n=512, m=1024, β≈q/144). **128-bit crossing:** `n768 q/64` = 131.9. Both
   UNMINEABLE. These are the *impossibility frontier*, not candidate params.
-- This is exactly the tension `docs/specs/POW-HARDNESS.md` and
+- This is exactly the tension `legacy/specs/POW-HARDNESS.md` and
   `SCREEN-RESULTS.md` predicted, now confirmed with a dense estimator sweep.
 
 **Estimator caveat (carried from the repo, unchanged):** the estimator's SIS

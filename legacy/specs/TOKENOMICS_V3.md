@@ -5,7 +5,7 @@
 **Amended:** 2026-08-10 — owner decision: the V3 tail floor is **60 BLOCH/block entering at epoch 6** (epoch 5 pays the true halving value 81), not 100 at epoch 5 as first drafted. Implemented as a V3-specific floor (PISO-60; the V2 floor of 100 still governs all pre-fork history) and shipped in the mandatory release **`genesis3-node-emission-v3-floor60-20260810`** (`bloch` sha256 `dfc6962df85bd87a780a4a15ccf330dc08ae860dd9cf4e3ad647b5e9c79601a8`); all earlier binaries (incl. `6ffc5f12…`/`c21e09d`) are superseded.
 **Consensus source of truth:** `crates/bloch-crypto/src/core/tokenomics_v2.rs` (`block_subsidy_sat` and the `EMISSION_V3_*` constants — const-asserted and exhaustively tested)
 **Activation:** flag-day hard fork at **emission height 453,743 = node-local height 40,000** (commit `8538dea`)
-**Supersedes:** the emission curve of `docs/specs/TOKENOMICS_V2.md` (both its original 1B parameter set and the B3b 21B re-basing) — see ADR-035
+**Supersedes:** the emission curve of `legacy/specs/TOKENOMICS_V2.md` (both its original 1B parameter set and the B3b 21B re-basing) — see ADR-035
 
 > Every number in this document is read from the code constants or from the
 > const-asserts/tests that pin them. If this document and
@@ -183,8 +183,8 @@ document specifies.
 
 ## 7. Document lineage
 
-- `docs/specs/historical/TOKENOMICS_V1_SUPERSEDED.md` — V1 (never mainnet).
-- `docs/specs/TOKENOMICS_V2.md` — the original V2 spec (1B nominal, 1,905
+- `legacy/specs/historical/TOKENOMICS_V1_SUPERSEDED.md` — V1 (never mainnet).
+- `legacy/specs/TOKENOMICS_V2.md` — the original V2 spec (1B nominal, 1,905
   reward, 150 s blocks, 70/25/5). Its parameter set was re-based by the
   Bloch-SIS B3b revision (21B nominal, 8,400 reward, 30 s blocks, 100%
   miner) directly in `tokenomics_v2.rs`; the emission curve is now

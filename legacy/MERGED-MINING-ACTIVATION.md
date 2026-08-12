@@ -116,4 +116,4 @@ verification are mandatory.
 
 Merged mining secures Bloch only with the **fraction of BTC hashrate that opts
 in**, and lets a large BTC miner attack at ~zero marginal cost. It is a
-bootstrap lever, **not** a security guarantee. See `docs/MERGED-MINING.md`.
+bootstrap lever, **not** a security guarantee. See `legacy/MERGED-MINING.md`.

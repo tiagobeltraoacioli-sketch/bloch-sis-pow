@@ -5,7 +5,7 @@
 //! (dense head, then doubling gaps); `find_common_ancestor` resolves the
 //! highest shared block from a received locator. Both are pure and untrusted-
 //! input safe (the wire vec is bounded to MAX_WIRE_LOCATOR by P4 before it
-//! reaches here). See docs/design/CHAIN-SYNC-MODEL.md §2 Layer 3.
+//! reaches here). See legacy/design/CHAIN-SYNC-MODEL.md §2 Layer 3.
 
 use bloch::sync::locator::{build_locator, find_common_ancestor, MAX_LOCATOR_LEN};
 use std::collections::HashSet;

@@ -1,247 +1,238 @@
-# Bloch-SIS Protocol
+# Bloch Protocol
 
-> Post-quantum. Pure proof-of-work. Hashcash security, lattice signatures.
+> A post-quantum Layer 1. Hybrid lattice signatures on every consensus path.
+> Running proof of work today; proof of stake next.
 
-**Bloch-SIS** is a post-quantum **pure-Proof-of-Work BlockDAG Layer 1**. Its
-proof-of-work is a **cumulative-work hashcash on SHAKE-256 (Keccak)** with a
-**Module-SIS** (Short Integer Solution) **structural gate** — a non-trivial
-residual filter that binds each solution to a lattice form (the same algebraic
-family as its ML-DSA-65 signatures) but is **not** the security source: PoW
-security is cumulative hash work, post-quantum because Grover gives only a
-quadratic speedup. The genuinely lattice-based cryptography is in the
-signatures (hybrid Falcon-1024 ‖ ML-DSA-65). GhostDAG-Q consensus,
-libp2p networking, RocksDB storage. No BFT finality, no validator set, no
-treasury: finality is PoW depth, à la Bitcoin/Kaspa.
+**About the repository name.** The project is **Bloch Protocol**. The
+repositories are called `bloch-sis-pow` (GitHub) and `BlochSISPoW-project`
+(GitLab) because that is what the project was called when they were created,
+and those URLs are published. The names are historical; they are not being
+changed. If you cloned one of these, you are in the right place.
 
-Built on a mature post-quantum BlockDAG L1 codebase; the consensus, wallet,
-transport, and RPC subsystems carry over, with the proof-of-work, signatures,
-tokenomics, and finality model replaced.
-
-> ## ⚠️ Status: **mainnet beta** — unaudited, low-hashrate, 51%-attackable
-> The chain is designated **mainnet beta** — a designation, **not** a security
-> claim. **The live mainnet is Genesis-3** (chain id `0xB10C_0004`, SHA-256d
-> PoW, merged-mineable with Bitcoin — see "Run" below); the k-regime caveats
-> in the rest of this box concern the **Bloch-SIS lattice reference PoW**
-> chain, not Genesis-3's SHA-256d. The network-maturity caveats apply to
-> both. The **relaxed regime (k=4) currently applies** (the residual bound is
-> checked on a handful of coefficients → **work is trivially forgeable**). The
-> **k=8 security hardening** of the PoW's Module-SIS gate was **activated at
-> block 213,000 as a soft fork but reverted**: it multiplied mining difficulty
-> ~4096x and the current solo / low hashrate could not find blocks, so the
-> chain stalled. k=8 will **re-activate together with a matched difficulty
-> reduction** (so block time stays ~30s); **until then, no security is
-> claimed**. The PoW's security model is **hashcash cumulative work, not
-> lattice hardness** — estimator research showed a trapdoorless PoW cannot be
-> both lattice-hard and mineable (the regimes are disjoint; see
-> `docs/research/POW-CANONICAL-frontier.md`); the Module-SIS gate is a
-> structural filter (k=4 today; k=8 on re-activation). The network is **nascent: very
-> few nodes, low hashrate → 51%-attackable**. **Unaudited** — a third-party
-> audit is contracted but **not done**; the no-shortcut analysis for the
-> canonical gate parameters and the IACR ePrint pre-print are still
-> outstanding. The coin is **not a security and not an asset** — no token
-> sale, no listing, no price, **no value claim**; a **17% founder premine**
-> (10-year cliff, 40-year vesting) is disclosed. **Do not attach value. Not
-> for investment. Use at your own risk.**
+- GitHub: <https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow>
+- GitLab: <https://gitlab.com/blochsispow-group/BlochSISPoW-project>
 
 ---
 
-**Full status:** see [`docs/PROJECT-STATUS.md`](./docs/PROJECT-STATUS.md) — the
-single source of truth for what's built, verified, and open.
+## Read this first if you want to run a node on the live chain
 
-## Architecture
+The trunk of this repository is the **proof-of-stake** work. The chain that
+is live right now is **Genesis-3**, which is proof of work, and it is **not
+what the trunk builds**.
 
-| Layer | Technology |
-| --- | --- |
-| Consensus (PoW) | PHANTOM / GhostDAG-Q |
-| Proof-of-Work | **Bloch-SIS** — SHAKE-256 hashcash with a Module-SIS structural gate (`crates/bloch-sis-pow`) |
-| Finality | PoW depth (no BFT / no validator committee) |
-| Signatures | **Hybrid Falcon-1024 ‖ ML-DSA-65** (both must verify — two lattice families) |
-| Transport | ML-KEM-768 (Kyber) hybrid + ChaCha20-Poly1305; hybrid PQ peer identity |
-| Networking | libp2p gossipsub + IBD sync |
-| Storage | RocksDB |
-| Difficulty | ASERT-Lattice (per-block, 30 s target) |
+Genesis-3 halts by consensus rule at a terminal height, days away at the time
+of writing. To join it for the time it has left:
 
-Every consensus-critical primitive is post-quantum: the PoW (SHAKE-256
-hashcash — Grover-bounded — with a Module-SIS structural gate), the signatures
-(Falcon + ML-DSA), and the seed/aux hashing (SHAKE-256). There is no
-classical primitive on the consensus path.
+- **Run a published binary** — see [Prebuilt binaries](#prebuilt-binaries)
+  below. This is the shortest path and it is what the fleet runs.
+- **Or build from a Genesis-3 branch**, not from the trunk. `g3-integration`
+  is the Genesis-3 source line. Note before you use it: as of its last commit
+  (2026-08-09) it does **not** carry the terminal-height rule — the constant
+  `GENESIS3_TERMINAL_HEIGHT` does not exist on it, so a node built from it
+  would keep going past the terminal height and fork off the network. The
+  branch that carries the rule is **`deploy/g3-terminal-50000`**, which is
+  what the fleet builds from. If in doubt, run the published binary.
 
-## Tokenomics
+You will also need a datadir snapshot and the carryover file; a from-zero
+sync cannot complete (see [docs/SNAPSHOT-BOOTSTRAP.md](./docs/SNAPSHOT-BOOTSTRAP.md)
+and [docs/CARRYOVER.md](./docs/CARRYOVER.md)).
 
-| Parameter | Value |
-| --- | --- |
-| Nominal supply | 21,000,000,000 BLOCH (3.57 B founder premine + 17.43 B mining nominal) — **not hard-capped**: the tail is perpetual (see below) |
-| Emission | 100% to miner (no validator/oracle pools) |
-| Block reward | **2,600 BLOCH/block** since the Emission V3 fork at height 40,000 (8,400 before it) |
-| Halving | Every **1,555,200 blocks** (~1.5 years @ 30 s); counter restarted at the V3 fork |
-| Tail | **60 BLOCH/block**, perpetual, from V3 epoch 6 (~9 years after the fork; Monero-style disinflation — the V2 floor of 100 governs pre-fork history) |
-| Block time | 30 seconds |
-| Founder premine | 3,570,000,000 BLOCH (17%) — 10-year cliff, then 40-year **monthly** vesting on-chain |
-
-### Emission V3 (flag-day fork, ~August 12–13, 2026)
-
-A height-gated flag-day hard fork — **Emission V3** — activates at local
-height **40,000** (emission height 453,743 counting the 413,743 Genesis-1/2
-carryover UTXOs); at chain height 30,293 (measured 2026-08-09) that lands
-around **August 12–13, 2026**. It addresses an emission-curve bug: the V2
-schedule (8,400 BLOCH/block, halving every 1,036,800 blocks) would have
-emitted **26.92 B** BLOCH over 100 years, against a documented
-mining-emission nominal of 17.43 B. Emission V3 slows the curve:
-
-- **Block reward:** 8,400 → **2,600 BLOCH** (−69%). Miners receive 8,400
-  through height 39,999; the first 2,600 block is height 40,000.
-- **Halving interval:** 1,036,800 → **1,555,200 blocks** (~1.5 years @ 30 s).
-  The halving counter restarts at the fork.
-- **Schedule from the fork:** 2,600 → 1,300 → 650 → 325 → 162 → 81, then
-  the perpetual **60 BLOCH/block tail** (from V3 epoch 6, ~9 years after
-  the fork; epoch 5 pays the true halving value 81). The 60 floor is
-  V3-only (PISO-60); the legacy V2 floor of 100 still governs every
-  pre-fork coinbase.
-- **Emission accounting** (measured 2026-08-09; the mined-since-G3 figure
-  keeps growing at 8,400/coinbase until the fork):
-
-  | Component (mining side) | BLOCH |
-  | --- | --- |
-  | Genesis-1 carryover (413,743 UTXOs × 8,400) | 3,475,441,200 |
-  | Mined since Genesis-3 (36,801 coinbases × 8,400) | 309,128,400 |
-  | Future V3 emission, 100 years from the fork | 13,620,441,600 |
-  | **Mining total** (documented mining nominal: 17,430,000,000) | **17,405,011,200** |
-  | + Founder premine | 3,570,000,000 |
-  | **Total** (nominal total supply: 21,000,000,000) | **20,975,011,200** |
-
-  **Emission V3 realigns the emission schedule with the documented nominals
-  (17.43 B mining / 21 B total) to within ~0.5%.** These figures are floors,
-  not exact totals and not caps: coinbases are paid per DAG block, the
-  mined-side total keeps growing until the fork (≈ 17.50 B mining total at
-  the fork), and the 60 BLOCH tail is perpetual. Supply is **not
-  hard-capped**.
-
-Consensus source of truth: `crates/bloch-crypto/src/core/tokenomics_v2.rs`.
-Normative spec: [`docs/specs/TOKENOMICS_V3.md`](./docs/specs/TOKENOMICS_V3.md);
-decision record: [`docs/adr/ADR-035-emission-v3-schedule.md`](./docs/adr/ADR-035-emission-v3-schedule.md).
-Phase-by-phase design history is in
-[`BLOCH_DEVELOPMENT_PLAN.md`](./BLOCH_DEVELOPMENT_PLAN.md); economic doctrine in
-`docs/adr/`.
-
-> **Height-reading trap:** `getblockcount` counts **DAG blocks**, not chain
-> height (a BlockDAG accepts side blocks). The height that gates the V3 fork
-> is the selected-chain height — `getdaginfo → tip_height` /
-> `getblocktemplate → height`. The template also exposes `emission_height`
-> (= local height + 413,743) so external pools never recompute the offset.
+There is nothing to run on Genesis-4 yet. The proof-of-stake node is a devnet
+binary, not released software, and there is **no Genesis-4 launch date**.
 
 ---
+
+## What Bloch is
+
+A Layer 1 whose consensus-critical cryptography is post-quantum end to end:
+
+| Layer | What it uses | Cost of that choice |
+| --- | --- | --- |
+| Signatures | **Hybrid ML-DSA-65 ‖ Falcon-1024** — both must verify (`SUITE_MLDSA65_FALCON1024 = 0x0001`) | ~4.6 KB per signature, not recoverable from the message, and no hardware wallet implements it. MetaMask, Ledger and Trezor cannot sign a Bloch transaction. |
+| Hashing | SHAKE-256 / SHA-3 with domain separation | Slower than SHA-2 on hardware built for Bitcoin. |
+| Transport | ML-KEM-768 hybrid + ChaCha20-Poly1305 | Peer identity is hybrid; the underlying libp2p identity remains classical Ed25519. |
+| Shielded pool | SHAKE-256 commitments and nullifiers, SP1 raw FRI-STARK, no elliptic-curve ZK | Proofs are large and proving is expensive. The mainnet pool is provably empty — nothing has ever been shielded. |
+
+The trade the project makes is explicit: it gives up the entire existing
+wallet and tooling ecosystem in exchange for not having a quantum-vulnerable
+authorisation path. Every design question downstream of that — including
+whether to run an EVM at L1 — reopens the same trade.
+
+**The coin is not a security and not an asset.** No token sale, no listing,
+no price, no value claim. Supply is heavily concentrated: the founder holds
+roughly 94% of the carried-over balance, which is stakeable, so a naive
+Nakamoto coefficient is 1. Bounding mechanisms exist and are documented with
+what they do *not* reach — see `docs/audit/CERTIK-CENTRALIZATION.md` and
+`docs/specs/BLOCH-TOKENOMICS-V4.md` §4A. There is no framing that makes this
+number acceptable, and none is attempted here.
+
+**Unaudited.** A third-party audit is being prepared for, not completed. The
+pre-audit dossier is in `docs/audit/`.
+
+## Consensus today: Genesis-3, proof of work — ending
+
+Chain id `0xB10C_0004`, launched 2026-07-29 as a carryover restart.
+SHA-256d proof of work over a GhostDAG-Q BlockDAG, ~30 s target, Stratum V1
+for ASICs, merged-mineable with Bitcoin via AuxPoW since local height 8,500.
+
+It ends. Not by an operator stopping it — by a consensus rule: above the
+terminal height every node rejects every block, so the chain has no valid
+successor and stops producing. The signed snapshot for Genesis-4 is taken at
+that height.
+
+**The terminal height is 50,000** (founder decision, 2026-08-12, lowered from
+80,000). Be aware of a real discrepancy while reading this tree:
+
+- the deployed fleet builds from branch `deploy/g3-terminal-50000`, where
+  `crates/bloch-crypto/src/core/mod.rs` sets `GENESIS3_TERMINAL_HEIGHT =
+  50_000`;
+- on this branch the same constant still reads `80_000`
+  (`crates/bloch-crypto/src/core/mod.rs:438`), and a number of documents in
+  `docs/` and `legacy/` still say 80,000.
+
+The constant on the branch the fleet runs is what governs the chain. Do not
+take 80,000 from this tree as current.
+
+Everything specific to this era — mining, GhostDAG, AuxPoW, stratum,
+difficulty retargeting, tokenomics V1/V2/V3 — is in [`legacy/`](./legacy/),
+with [`legacy/README.md`](./legacy/README.md) explaining what in it remains
+true and what does not.
+
+## Consensus next: Genesis-4, proof of stake — not launched
+
+A **linear** chain of slots and epochs. GhostDAG is retired. Fork choice is
+LMD-GHOST; finality is Casper-style FFG over an epoch committee; the
+randomness beacon is RANDAO; signatures stay ML-DSA-65 ‖ Falcon-1024, with no
+BLS anywhere. Design of record:
+`docs/specs/BLOCH-POS-SHA3-LATTICE-MIGRATION.md`.
+
+Governance is **not** ownerless. That thesis was retracted in writing
+(`docs/adr/ADR-036-retract-ownerless-adopt-foundation.md`) in favour of a
+two-entity foundation structure. The founder allocates the genesis validator
+cohort and is bound by a consensus rule taking that cohort under one third
+within a year. This is a weaker decentralisation claim than the project made
+earlier, and it is the true one.
+
+Supply is fixed at `TOTAL_SUPPLY_BLOCH` in
+`crates/bloch-pos-committee/src/tokenomics_v4.rs` — read the constant; do not
+trust a supply number written in prose, including in this file. The cap is
+intended to become a consensus invariant every node checks. The honest
+strength of that claim: no mechanism *inside* the protocol can raise it — no
+vote, no key, no governance path. A hard fork adopted by every operator can
+change any rule, so "impossible to change" would be false.
+
+### designed ≠ built ≠ booted
+
+| Component | Designed | Built | Booted |
+| --- | --- | --- | --- |
+| Genesis-3 PoW node (`src/`, root package) | yes | yes | **yes — mainnet, until the terminal height** |
+| AuxPoW merged mining with Bitcoin | yes | yes | yes — since local height 8,500 |
+| eUTXO VM (`crates/bloch-euvm`) | yes | yes | yes — consensus-wired at Genesis-3 height 0 |
+| Coherence shielded pool (C1 frozen) | yes | verifier present | never used; the mainnet pool is provably empty |
+| PoS consensus core (`crates/bloch-pos-committee`) | yes | yes — 348 tests green, measured 2026-08-12 | no — unaudited, not wired into the Genesis-3 node |
+| PoS node (`crates/bloch-pos-node`) | yes | partial — M1/M2 | **devnet only**: real processes producing, attesting, justifying and finalising over a local TCP mesh. Not mainnet-ready. |
+| Tokenomics V4 | yes | constants + const-asserts in the crate | no — nothing has been issued under it |
+| Weak-subjectivity checkpoints | yes | no | no |
+| EVM at L1 | proposal; direction accepted (`docs/adr/ADR-040-evm-and-ustav-at-l1.md`) | **no code exists** — the authorization model is an open founder decision | no |
+| Ustav (PSTRN-1) charter at L1 | proposal | no — nothing wired | no |
+| Third-party audit | scoped | pre-audit dossier written | **not performed** |
+
+## Where things are
+
+```
+src/, crates/bloch-crypto, crates/bloch-sis-pow, crates/bloch-euvm, …
+                            the Genesis-3 node and its crates. Live on
+                            mainnet until the terminal height.
+crates/bloch-pos-committee  PoS consensus core. Standalone workspace —
+                            run cargo from inside the crate.
+crates/bloch-pos-node       Genesis-4 node binary. Standalone workspace, devnet.
+tools/genesis4-ceremony     Genesis-4 launch tooling.
+docs/                       Current documentation. Index: docs/README.md
+docs/specs/                 Normative PoS design.
+docs/adr/                   Decision records, including superseded ones.
+docs/audit/                 Pre-audit dossier and the two Era-1 audits.
+legacy/                     The Genesis-3 record. See legacy/README.md
+gips/                       The GIP process (GIP-0001, editors, template).
+```
+
+`bloch-pos-committee` and `bloch-pos-node` are deliberately **not** members of
+the root workspace. Nothing in the proof-of-stake work can enter the
+Genesis-3 build graph, its lockfile, or its binary.
 
 ## Build
 
 ```bash
-cargo build --release        # needs a C toolchain (clang/cmake) for rocksdb + blst
+cargo build --release        # needs a C toolchain (clang/cmake) for rocksdb
 ```
 
-Binaries in `target/release/`: `bloch` (full node), `bloch-wallet`,
-`bloch-cli`, `bloch-calibrate`, `bloch-mine-genesis`,
-`bloch-migrate-addr-history`.
+This builds the Genesis-3 node and its crates. Binaries land in
+`target/release/`: `bloch` (node), `bloch-cli`, `bloch-calibrate`, and
+`bloch-wallet` (which needs `--features bloch-crypto/wallet-cli`).
 
-### Prebuilt binaries (Linux x86_64)
-
-Building from source is recommended (you run the bytes you compiled). For a
-quick start, prebuilt `bloch` + `bloch-cli` for **Linux x86_64** are published:
-
-- GitHub releases: <https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow/releases> — always take the **latest, non-superseded** release
-- GitLab releases: <https://gitlab.com/blochsispow-group/BlochSISPoW-project/-/releases>
-
-**Always run the latest release.** Consensus flag-days make older builds
-actively diverge, not merely lag:
-
-- the **difficulty-from-ancestry flag-day (local height 30,030) is already
-  active** — expected difficulty is a pure function of the block's own
-  ancestry. Any build older than `genesis3-node-difficulty-choke-20260809`
-  (commit `1f7d328`) rejects the blocks the network produces today.
-- the **Emission V3 flag-day (local height 40,000, ETA ~2026-08-12/13)** cuts
-  the block reward 8,400 → 2,600 BLOCH. **Any binary built before commit
-  `8538dea` forks off the network at that height.** The mandatory release is
-  **[`genesis3-node-emission-v3-floor60-20260810`](https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow/releases/tag/genesis3-node-emission-v3-floor60-20260810)**
-  (`bloch` binary sha256
-  `dfc6962df85bd87a780a4a15ccf330dc08ae860dd9cf4e3ad647b5e9c79601a8`) — the
-  build the fleet runs, carrying Emission V3 with the 60-BLOCH V3 tail floor
-  (PISO-60), the difficulty choke point, and the PEX `known_peers` fix. All
-  earlier releases — including those shipping commit `c21e09d` (binary
-  `6ffc5f12…`) — are superseded.
-
-Requires **glibc ≥ 2.39** (Ubuntu 24.04+); on older distros build from source.
-Unpack and verify `SHA256SUMS` before running.
-
-> **Do not sync from scratch — it cannot complete.** Block bodies discarded
-> before the 2026-08-05 retention fix no longer exist anywhere on the network
-> (from-zero IBD stalls around block_count 26,474 and can never finish).
-> Upgrading the binary does not fix this. The supported path for a new node is
-> a **datadir snapshot** + the carry-over file — see
-> [docs/SNAPSHOT-BOOTSTRAP.md](./docs/SNAPSHOT-BOOTSTRAP.md) and
-> [docs/CARRYOVER.md](./docs/CARRYOVER.md). Since commit `c21e09d` a
-> poisoned/stale `known_peers.json` also self-heals on boot — no manual
-> deletion needed.
-
-## Run
-
-### Genesis-3 mainnet (the live network)
-
-The live mainnet chain is **Genesis-3** (`--genesis3`, chain id
-`0xB10C_0004`): a carry-over restart (2026-07-29) whose chain-selected PoW is
-**SHA-256d** — ASIC-mineable and **merged-mineable with Bitcoin** via AuxPoW
-since height 8,500 (see [docs/MERGED-MINING.md](./docs/MERGED-MINING.md)) —
-with Stratum V1 served for ASICs. Joining it requires the carry-over file and,
-in practice, a datadir snapshot:
-[docs/CARRYOVER.md](./docs/CARRYOVER.md) +
-[docs/SNAPSHOT-BOOTSTRAP.md](./docs/SNAPSHOT-BOOTSTRAP.md).
-
-### Bloch-SIS chain (reference PoW, solo mining)
+The proof-of-stake crates are separate workspaces and are not built by the
+above:
 
 ```bash
-./target/release/bloch --mine --data-dir ./bloch-data
+cargo build --release --manifest-path crates/bloch-pos-node/Cargo.toml
 ```
-
-The node validates the mined genesis, then mines Bloch-SIS blocks solo. This
-is the project's lattice-gated reference PoW chain described below — **not**
-the SHA-256d Genesis-3 mainnet. (On this chain Stratum V1/V2 pool mining is
-disabled: the hash-PoW share protocol has no field for the lattice solution
-vector — a SIS-native pool protocol is future work.)
-
-Default ports: `16110/tcp` (P2P), `16111/tcp` (WebSocket), `16210/tcp` (RPC).
 
 ## Test
 
 ```bash
-cargo test                    # full suite
-cargo test -p bloch-sis-pow   # the Bloch-SIS PoW reference crate
+cargo test                                        # Genesis-3 node workspace
+cd crates/bloch-pos-committee && cargo test       # PoS consensus core
+cd crates/bloch-pos-node      && cargo test       # PoS node
 ```
 
----
+The PoS crates each declare their own `[workspace]`, so `cargo test` from the
+repository root does **not** reach them. Run them from inside the crate.
 
-## The proof-of-work: SHAKE-256 hashcash with a Module-SIS gate
+## Prebuilt binaries
 
-Given a serialized header and nonce, a miner must find a short solution vector
-`s ∈ {-B,…,B}^N` such that `‖A·s − t‖_∞ < β` (a Module-SIS instance derived from
-the header via SHAKE-256) **and** an auxiliary SHAKE-256 hash of `s` meets the
-difficulty target. Verification is cheap. The Module-SIS residual is a fixed
-structural rejection filter — it binds the work to a lattice form but is not the
-difficulty knob and not the security source; block-production security is the
-cumulative hashcash work on the aux SHAKE-256 target
-(`docs/research/POW-CANONICAL-frontier.md`). See `crates/bloch-sis-pow/README.md`.
+Building from source is the recommended path — you run the bytes you
+compiled, and the build is reproducible by design (see [REPRO.md](./REPRO.md)).
+The binaries below are a convenience, not the standard.
 
-## License
+Prebuilt `bloch` and `bloch-cli` for **Linux x86_64**, tag
+`genesis3-node-linux-20260805`:
 
-MIT OR Apache-2.0.
+- GitHub releases: <https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow/releases>
+- GitLab releases: <https://gitlab.com/blochsispow-group/BlochSISPoW-project/-/releases>
+- Mirror: <https://posternlabs.com> — serves the same `bloch` and `bloch-cli`
+
+**Requires glibc ≥ 2.39** (Ubuntu 24.04 or newer). On older distributions,
+build from source. Verify `SHA256SUMS` before running anything.
+
+**Take the latest non-superseded release.** Genesis-3 consensus flag-days
+make an older build diverge, not merely lag: the Emission V3 flag-day at
+local height 40,000 cut the block reward, and a binary built before that
+change forks off the network at that height rather than following it. The
+release list is ordered; the newest entry is the one the fleet runs.
+
+## Security
+
+Report vulnerabilities privately — see [SECURITY.md](./SECURITY.md). The
+threat models are `docs/THREAT-MODEL.md`, `docs/THREAT_MODEL.md` and
+`docs/THREAT-MODEL-AUDIT.md` for the Genesis-3 era, and
+`docs/specs/BLOCH-POS-THREAT-MODEL.md` plus `-THREAT-MODEL-2.md` for the
+proof-of-stake design.
 
 ## License & Copyright
 
 Copyright (C) 2026 Tiago Beltrão de Azevedo Tenório Acioli.
 
-The Bloch-SIS-PoW **protocol** (its consensus rules and specification) is an open,
-ownerless commons — anyone may implement it. **This implementation** (all source
-in this repository) is the author's copyrighted work, licensed to the public under
-the **GNU Affero General Public License v3.0 or later** (`AGPL-3.0-or-later`); see
-[LICENSE](LICENSE) and [AUTHORS](AUTHORS). Any distributed fork — or any use of the
-software to provide a service over a network — must release its complete
-corresponding source under the same license. A commercial license without the AGPL
+The Bloch **protocol** — its consensus rules and specification — is open;
+anyone may implement it. **This implementation** is the author's copyrighted
+work, licensed to the public under the **GNU Affero General Public License
+v3.0 or later** (`AGPL-3.0-or-later`); see [LICENSE](LICENSE) and
+[AUTHORS](AUTHORS). Any distributed fork — or any use of the software to
+provide a service over a network — must release its complete corresponding
+source under the same license. A commercial license without the AGPL
 obligations is available from the author.
 
-"Bloch-SIS-PoW" and "Postern Labs" are trademarks of the author.
+One deliberate exception: `crates/bloch-sis-pow` stays `MIT OR Apache-2.0`.
+It is the reference implementation of the proof of work, published as a
+specification, and it dies with the Genesis-3 halt
+(`docs/adr/ADR-039-agpl-license-pos-crates.md`).
+
+"Bloch", "Bloch Protocol" and "Postern Labs" are trademarks of the author.

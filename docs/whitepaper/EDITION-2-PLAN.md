@@ -162,9 +162,9 @@ This is the only place GhostDAG, blue score, stratum, and the ASIC story now
 live. It must state plainly that everything in it is **booted history that
 ends at height 50,000**.
 Sources: Ed. 1 ch. 5–7, 15; `docs/PROJECT-STATUS.md` (superseded — use only
-with its 2026-08-11 header warning); `docs/MERGED-MINING.md`,
-`docs/MERGED-MINING-ACTIVATION.md`; `docs/CARRYOVER.md`;
-`docs/specs/TOKENOMICS_V3.md`, `docs/adr/ADR-035-emission-v3-schedule.md`;
+with its 2026-08-11 header warning); `legacy/MERGED-MINING.md`,
+`legacy/MERGED-MINING-ACTIVATION.md`; `docs/CARRYOVER.md`;
+`legacy/specs/TOKENOMICS_V3.md`, `docs/adr/ADR-035-emission-v3-schedule.md`;
 `docs/specs/BLOCH-POS-SHA3-LATTICE-MIGRATION.md` §2 (baseline table).
 
 ### Ch. 7 — The Halt at Height 50,000 and the Snapshot (NEW)
@@ -279,7 +279,7 @@ Sources: `docs/specs/BLOCH-TOKENOMICS-V4.md` (primary);
 `docs/audit/CERTIK-PRE-AUDIT-DOSSIER.md` §0.1, §1.2;
 `docs/announcements/GENESIS3-HALT-AND-POS.md` §5; `tokenomics_v4.rs` /
 `state_root.rs` tag `0x14` / `transition.rs` (as cited by the CertiK dossier);
-`docs/specs/historical/TOKENOMICS_V1_SUPERSEDED.md`, `TOKENOMICS_V2.md`,
+`legacy/specs/historical/TOKENOMICS_V1_SUPERSEDED.md`, `TOKENOMICS_V2.md`,
 `TOKENOMICS_V3.md` (lineage only).
 
 ### Ch. 17 — Concentration (NEW)
@@ -325,7 +325,7 @@ CertiK engagement posture — the pre-audit dossiers written so the auditor
 does not have to discover anything, including the "findings we found and
 fixed ourselves" and the open-gaps list; the external audit as the thing the
 pause exists for; G7/G8 as the security gates.
-Sources: Ed. 1 ch. 17; `docs/INTERNAL-AUDIT-PLAN.md`;
+Sources: Ed. 1 ch. 17; `legacy/INTERNAL-AUDIT-PLAN.md`;
 `docs/audit/CERTIK-PRE-AUDIT-DOSSIER.md`; `docs/audit/CERTIK-CENTRALIZATION.md`;
 `docs/audit/CERTIK-MARKET-TRANSPARENCY.md`; `docs/FLEET-BRIEF-CERTIK-2026-08-12.md`;
 `docs/SECURITY_SELF_ASSESSMENT.md`; `SECURITY.md`, `SECURITY_TOOLING.md`.

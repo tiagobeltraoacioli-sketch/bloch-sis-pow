@@ -39,7 +39,7 @@ const FINDINGS_SCHEMA = {
 
 const AUDIT_AREAS = [
   { key: 'S1-pow-params', label: 'assist:S1-pow-hardness',
-    prompt: 'Audit S1 (canonical PoW security claim). Read crates/bloch-sis-pow (verify/solver/params), docs/specs/POW-HARDNESS.md, deploy/pow-estimator. What k/β params exist, where is the relaxed testnet regime vs canonical, what is buildable now (param freeze plumbing, calibration harness, estimator runs) vs research-gated (the no-shortcut proof).' },
+    prompt: 'Audit S1 (canonical PoW security claim). Read crates/bloch-sis-pow (verify/solver/params), legacy/specs/POW-HARDNESS.md, deploy/pow-estimator. What k/β params exist, where is the relaxed testnet regime vs canonical, what is buildable now (param freeze plumbing, calibration harness, estimator runs) vs research-gated (the no-shortcut proof).' },
   { key: 'S2-fuzz', label: 'assist:S2-fuzzing',
     prompt: 'Audit S2 fuzzing surface. Identify the consensus engine, tx/block deserialization, PoW verify, and PEX entry points that need differential/continuous fuzzing. What fuzz harnesses (cargo-fuzz/libfuzzer/proptest) exist or are buildable now. The external audit itself is gated; the fuzz harnesses are buildable.' },
   { key: 'S3-multinode', label: 'assist:S3-multinode',

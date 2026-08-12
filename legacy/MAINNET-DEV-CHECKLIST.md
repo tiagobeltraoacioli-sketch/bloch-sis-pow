@@ -7,7 +7,7 @@
 | **Author** | Founder (custodial) |
 | **Scope** | Engineering work required before mainnet activation under founder custodial stewardship per ADR-023 Phase 1 |
 | **Out of scope** | Foundation work (ADR-023, 024, 026), external audit (Phase 3), CEX listing |
-| **Companion docs** | `docs/STRESS-TEST-PLAN.md`, `docs/INTERNAL-AUDIT-PLAN.md` |
+| **Companion docs** | `legacy/STRESS-TEST-PLAN.md`, `legacy/INTERNAL-AUDIT-PLAN.md` |
 
 ---
 
@@ -37,7 +37,7 @@ The corollary is that this checklist must be exhaustively closed before activati
 - ✅ SHA-256d Proof of Work
 - ✅ ML-DSA-65 (FIPS 204) transaction signatures
 - ✅ Hybrid PoW+PoS architecture (FFG activates at block 210k per ADR-011)
-- ⏳ Tokenomics 70/25/5 reward split — V1 (93/5/2) was implemented in commits `825e0a1`/`ac14295`; V2 spec locked in tag `v0.2.2-tokenomics-v2-spec` (ADR-028); code migration sequenced in `docs/MIGRATION-TOKENOMICS-V1-TO-V2.md` and lands in Sprint 2.1.D
+- ⏳ Tokenomics 70/25/5 reward split — V1 (93/5/2) was implemented in commits `825e0a1`/`ac14295`; V2 spec locked in tag `v0.2.2-tokenomics-v2-spec` (ADR-028); code migration sequenced in `legacy/MIGRATION-TOKENOMICS-V1-TO-V2.md` and lands in Sprint 2.1.D
 - ✅ ADR-005 era + Phragmén committee rotation (integer NUM=40 / DEN=100, no float in consensus)
 - ✅ Block time 150s, dual finality (soft 1 epoch / hard 2 epochs) per ADR-006
 - ✅ Bonding contract + slashing 5%/equivocation, 40%/inactivity per ADR-007
@@ -91,7 +91,7 @@ The corollary is that this checklist must be exhaustively closed before activati
 
 ### 5.1 Pending V1 work
 
-- 🟡 `docs/operations/stratum.md` outdated — still labelled `v0.6.0-alpha2` with `v0.6.0-final` TBD. Limitations section lists items that are addressed. Needs rewrite reflecting current state.
+- 🟡 `legacy/operations/stratum.md` outdated — still labelled `v0.6.0-alpha2` with `v0.6.0-final` TBD. Limitations section lists items that are addressed. Needs rewrite reflecting current state.
 - ⬜ Variable-difficulty share targets (Sprint AA.2 — pool mode) — out of mainnet activation scope; documented in `sprint-aa1-plan.md`
 - ⬜ extranonce.subscribe support — currently silently accepted but not honored. Acceptable for short-running miners; not a mainnet blocker.
 
@@ -160,8 +160,8 @@ Estimated effort: 12–16h focused work for the test suite plus CHECKME fixes co
 
 ### 6.5 Documentation missing
 
-- ⬜ `docs/operations/stratum-v2.md` — operator guide (parallel to V1 stratum.md), how to enable, how to configure ASIC firmware, troubleshooting common errors, certificate management, key rotation procedure
-- 🟡 `docs/gips/GIP-0003-stratum-v2.md` — currently v0.3 covering through Sprint 8 only. Sprint 9 (Mining) and Sprint 10 (TDP) marked TBD but code is implemented. Needs v0.4 update documenting what's actually implemented + Sprint 11 Interop scope.
+- ⬜ `legacy/operations/stratum-v2.md` — operator guide (parallel to V1 stratum.md), how to enable, how to configure ASIC firmware, troubleshooting common errors, certificate management, key rotation procedure
+- 🟡 `legacy/gips/GIP-0003-stratum-v2.md` — currently v0.3 covering through Sprint 8 only. Sprint 9 (Mining) and Sprint 10 (TDP) marked TBD but code is implemented. Needs v0.4 update documenting what's actually implemented + Sprint 11 Interop scope.
 - ⬜ Antminer S19/S21 quickstart card — single-page walkthrough for Bitmain stock firmware operator
 
 ### 6.6 Sprint 10-epsilon (V2 block acceptance — partially done)
@@ -235,8 +235,8 @@ Estimated effort: difficult to size without sub-sprint design work. Likely 200�
 ## 10. Documentation gaps (operator-facing)
 
 - ⬜ `docs/operations/getting-started.md` — minimum viable node deployment
-- ⬜ `docs/operations/stratum.md` — V1 operator guide refresh
-- ⬜ `docs/operations/stratum-v2.md` — V2 operator guide (does not exist)
+- ⬜ `legacy/operations/stratum.md` — V1 operator guide refresh
+- ⬜ `legacy/operations/stratum-v2.md` — V2 operator guide (does not exist)
 - ⬜ `docs/operations/observability.md` — Prometheus + Grafana setup, alert rules
 - ⬜ `docs/operations/troubleshooting.md` — common failure modes, log signatures, recovery procedures
 - ⬜ `docs/operator-quickstart.md` — single-page card for someone bringing up first node, target ≤30 minutes from binary download to live mining
@@ -250,7 +250,7 @@ Estimated effort: difficult to size without sub-sprint design work. Likely 200�
 | 4× SV2 CHECKMEs | 8–12h | YES |
 | SV2 integration test suite | 12–16h | YES |
 | SV2 Prometheus metrics | 4–6h | NO (operator quality of life) |
-| docs/operations/stratum-v2.md | 4h | YES (operator can't deploy without docs) |
+| legacy/operations/stratum-v2.md | 4h | YES (operator can't deploy without docs) |
 | GIP-0003 v0.3 → v0.4 update | 3h | NO (docs hygiene) |
 | Sprint 10-epsilon encoders verification | 4–6h | YES |
 | Two-node integration harness (Sprint EE) | 8–10h | NO (carryover, post-mainnet OK) |
@@ -281,7 +281,7 @@ This week:
 Next 30 days:
 4. Resolve all 4 SV2 CHECKMEs against real Bitaxe traffic
 5. Write SV2 integration test suite
-6. Update `docs/operations/stratum.md` and create `docs/operations/stratum-v2.md`
+6. Update `legacy/operations/stratum.md` and create `legacy/operations/stratum-v2.md`
 7. Update GIP-0003 to v0.4
 
 Next 60 days:

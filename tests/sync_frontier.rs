@@ -6,7 +6,7 @@
 //! functions are deliberately closure-parameterized over the DAG membership
 //! oracle (`has_block`), so they are exercised here against a plain in-memory
 //! `HashSet` — no real `GhostDAG`/PoW needed, matching the pure-function design
-//! in docs/design/CHAIN-SYNC-MODEL.md §3 (Phase 2).
+//! in legacy/design/CHAIN-SYNC-MODEL.md §3 (Phase 2).
 
 use bloch::sync::frontier::{advertise_tips, diff_missing, reconciled, FrontierState};
 use bloch::sync::MAX_ADVERTISED_TIPS;

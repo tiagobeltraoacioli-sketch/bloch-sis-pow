@@ -529,5 +529,5 @@ hours.
 | `docs/audit/AUDIT-2026-04-20_ERA1.md`, `docs/audit/groundstate_audit.md` | Prior internal audits of the predecessor codebase. |
 | `docs/SECURITY_SELF_ASSESSMENT.md` | Self-assessment vs Bitcoin Core; records zero external audits. |
 | `audit/CONSOLIDATED-SECURITY-REPORT.md` | Roll-up of every internal security review to date. |
-| `docs/INTERNAL-AUDIT-PLAN.md` | The internal review plan that names CertiK among candidate firms. |
+| `legacy/INTERNAL-AUDIT-PLAN.md` | The internal review plan that names CertiK among candidate firms. |
 | `REPRO.md`, `repro-manifest.sh`, `scripts/falcon-clean-guard.sh`, `deny.toml`, `audit.toml` | Build-integrity and supply-chain tooling. |

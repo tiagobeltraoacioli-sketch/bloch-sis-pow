@@ -23,7 +23,7 @@
 >     selection, AA.2 pool mode) which were planned but not
 >     numbered under BLOCH.
 >   - References to Era 1 release docs (`docs/releases/v0.6.0.md`,
->     `docs/operations/stratum.md`) which are themselves preserved
+>     `legacy/operations/stratum.md`) which are themselves preserved
 >     as Era 1 historical records elsewhere in this rebrand.
 >
 > **Under the Bloch-SIS Protocol (BLOCH) rebrand (April 2026)** this
@@ -37,7 +37,7 @@
 >      with BLOCH nomenclature; this Era 1 plan is reference, not
 >      execution path.
 >   4. The forward-looking sister document
->      `docs/implementation/sprint-aa1-plan.md` was rebranded
+>      `legacy/implementation/sprint-aa1-plan.md` was rebranded
 >      surgically (Phase 3.e.12.a) precisely BECAUSE it is a pure
 >      planning document with no shipped-code references; this
 >      pt3-plan keeps Era 1 continuity because it cross-references
@@ -287,7 +287,7 @@ Test scenarios:
 
 Already drafted:
 - `docs/releases/v0.6.0.md` — release notes
-- `docs/operations/stratum.md` — operator guide (marks v0.6.0-alpha2
+- `legacy/operations/stratum.md` — operator guide (marks v0.6.0-alpha2
   limitations, describes v0.6.0-final expected behavior)
 
 Update required on v0.6.0-final: remove "Known limitations" section

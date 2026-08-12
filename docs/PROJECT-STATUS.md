@@ -12,7 +12,7 @@ Single source of truth for what exists, what's verified, and what's open.
 Bloch-SIS is a **post-quantum, pure-Proof-of-Work BlockDAG L1** whose PoW is a
 **SHAKE-256 hashcash with a Module-SIS structural gate** — the gate binds the
 work to a lattice form; the security source is cumulative hash work, not
-lattice hardness (`docs/research/POW-CANONICAL-frontier.md`) — forked from and
+lattice hardness (`legacy/research/POW-CANONICAL-frontier.md`) — forked from and
 fully de-branded off ENTL.
 
 **Two layers** (see `PRINCIPLES.md` + `docs/POSTERN-LABS.md`): the protocol
@@ -27,13 +27,13 @@ build products on the open protocol; Postern is one builder among many.
 > (opening balance = 413,743 UTXOs / 3,475,441,200 BLOCH — `docs/CARRYOVER.md`)
 > whose chain-selected PoW is **SHA-256d** — ASIC-mined and **merged-mineable
 > with Bitcoin** (AuxPoW, active since local h=8,500 —
-> `docs/MERGED-MINING.md`). Current consensus state:
+> `legacy/MERGED-MINING.md`). Current consensus state:
 > - **Difficulty-from-ancestry flag-day, local h=30,030 — ACTIVE.** Expected
 >   difficulty is a pure function of the block's own ancestry (commit
 >   `1f7d328`); older builds reject today's blocks.
 > - **Emission V3 flag-day, local h=40,000 (ETA ~2026-08-12/13)** — block
 >   reward 8,400 → 2,600 BLOCH, halvings every 1,555,200 blocks
->   (`docs/specs/TOKENOMICS_V3.md`, ADR-035). Armed in the fleet binary
+>   (`legacy/specs/TOKENOMICS_V3.md`, ADR-035). Armed in the fleet binary
 >   (release `genesis3-node-emission-v3-floor60-20260810`, sha256
 >   `dfc6962d…`, incl. the PISO-60 60-BLOCH V3 tail floor), inert until the
 >   height.
@@ -55,7 +55,7 @@ build products on the open protocol; Postern is one builder among many.
 > together with a matched difficulty reduction** (so block time stays ~30s);
 > **until then, no security is claimed**. The PoW's security model is **hashcash
 > cumulative work, not lattice hardness** (a trapdoorless PoW cannot be
-> lattice-hard and mineable — `docs/research/POW-CANONICAL-frontier.md`); the
+> lattice-hard and mineable — `legacy/research/POW-CANONICAL-frontier.md`); the
 > SIS gate is a structural filter (k=4 today; k=8 on re-activation). The network is
 > **nascent: very few nodes, low hashrate → 51%-attackable**. **Unaudited** —
 > the third-party audit is contracted but **not done**; the no-shortcut proof
@@ -233,7 +233,7 @@ build products on the open protocol; Postern is one builder among many.
 
 | Track | Next |
 |---|---|
-| **Mainnet gate** | canonical small-`k` + leading-zeros gate params, no-shortcut/asymmetry proof, ePrint, third-party audit. Hardness research done (screen `deploy/pow-estimator/SCREEN-RESULTS.md` + frontier sweep `docs/research/POW-CANONICAL-frontier.md`): lattice-hard mining is structurally impossible for a trapdoorless PoW (secure and mineable regimes disjoint) — PoW security is hashcash cumulative work; the SIS gate is a non-trivial structural filter. `k` **frozen at 8** — the soft fork **activated at block 213,000 but was reverted**: it multiplied mining difficulty ~4096x and the current solo / low hashrate could not find blocks, so the chain stalled; the **relaxed regime (k=4) currently applies** (work trivially forgeable) and k=8 will **re-activate together with a matched difficulty reduction** (so block time stays ~30s); the “mainnet beta” designation is **not** a security claim and does not close this track. Remaining: k=8 re-activation with the difficulty fix, the no-shortcut proof, BDD cross-check, difficulty calibration, the ePrint, and the third-party audit (contracted, **not done**) |
+| **Mainnet gate** | canonical small-`k` + leading-zeros gate params, no-shortcut/asymmetry proof, ePrint, third-party audit. Hardness research done (screen `deploy/pow-estimator/SCREEN-RESULTS.md` + frontier sweep `legacy/research/POW-CANONICAL-frontier.md`): lattice-hard mining is structurally impossible for a trapdoorless PoW (secure and mineable regimes disjoint) — PoW security is hashcash cumulative work; the SIS gate is a non-trivial structural filter. `k` **frozen at 8** — the soft fork **activated at block 213,000 but was reverted**: it multiplied mining difficulty ~4096x and the current solo / low hashrate could not find blocks, so the chain stalled; the **relaxed regime (k=4) currently applies** (work trivially forgeable) and k=8 will **re-activate together with a matched difficulty reduction** (so block time stays ~30s); the “mainnet beta” designation is **not** a security claim and does not close this track. Remaining: k=8 re-activation with the difficulty fix, the no-shortcut proof, BDD cross-check, difficulty calibration, the ePrint, and the third-party audit (contracted, **not done**) |
 | **Coherence** | C2 remainder (SP1 prove/verify on the toolchain; submit/gossip entry point + reorg-tracking — land with the SP1 verifier), C3/C4 review + audit |
 | **Attestation** | wire `virtee/sev` on a real SEV-SNP host; mobile Key-Attestation/App-Attest verifier; live end-to-end demo |
 | **Mobile app** | ✅ lean cross-compile + ✅ UniFFI export + ✅ Android/iOS shell skeletons → next: build the shells on real SDKs (cargo-ndk / xcframework), the Postern Container impl, `bloch-core` split only if drift-risk demands |

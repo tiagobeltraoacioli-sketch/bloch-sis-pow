@@ -1,5 +1,16 @@
 # Bloch-SIS Protocol (BLOCH) API Quick Start
 
+> **Genesis-3-era document — sealed 2026-08-12.** Bloch's proof-of-work
+> chain halts by consensus rule at the terminal height (50,000) and
+> Genesis-4 relaunches as proof of stake; the ownerless thesis was
+> retracted (`docs/adr/ADR-036-retract-ownerless-adopt-foundation.md`).
+>
+> The transport, authentication, error-code and pagination conventions stand.
+> The "Heights, supply and emission (Genesis-3 traps)" section does not:
+> `getblocktemplate` is a mining RPC and the DAG-height-versus-chain-height
+> distinction has no meaning on a linear chain. Successor:
+> `docs/specs/BLOCH-RPC-V4.md`.
+
 **Version:** v0.5.9
 **Protocol:** JSON-RPC 2.0 over HTTP
 **Formal spec:** [`docs/openapi.yaml`](openapi.yaml) — renders at [`docs/api.html`](api.html)
@@ -308,7 +319,7 @@ confirmations, matching the coinbase maturity rule.
 - **Emission heights are offset.** The reward schedule is keyed to
   `emission_height = local_height + 413,743` (the carry-over source
   height); `getblocktemplate` exposes `emission_height` directly. See
-  `docs/specs/TOKENOMICS_V3.md` for the live schedule (2,600 BLOCH/block
+  `legacy/specs/TOKENOMICS_V3.md` for the live schedule (2,600 BLOCH/block
   from local height 40,000, halving every 1,555,200 blocks, perpetual
   100 BLOCH tail — supply is not hard-capped).
 - **`getsupplydistribution` omits the carry-over.** Its `total_sats`

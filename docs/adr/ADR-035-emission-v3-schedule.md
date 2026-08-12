@@ -2,8 +2,8 @@
 
 **Status:** Accepted — armed in the fleet binary, activates at local height 40,000
 **Date:** 2026-08-09
-**Related:** `docs/specs/TOKENOMICS_V3.md` (normative spec), ADR-028 (V2 activation), ADR-010 lineage (historical emission doctrine)
-**Supersedes:** the emission curve of ADR-028 / `docs/specs/TOKENOMICS_V2.md` from emission height 453,743 onward
+**Related:** `legacy/specs/TOKENOMICS_V3.md` (normative spec), ADR-028 (V2 activation), ADR-010 lineage (historical emission doctrine)
+**Supersedes:** the emission curve of ADR-028 / `legacy/specs/TOKENOMICS_V2.md` from emission height 453,743 onward
 **Code:** commits `8538dea` (V3 fork) + `a85b0e0` (PISO-60 tail floor) (`crates/bloch-crypto/src/core/tokenomics_v2.rs`)
 
 ---
@@ -22,7 +22,7 @@
 > `dfc6962df85bd87a780a4a15ccf330dc08ae860dd9cf4e3ad647b5e9c79601a8`).
 > The decision body below has been updated in place to the 60-floor
 > parameters; this note records that the change happened pre-activation and
-> why. `docs/specs/TOKENOMICS_V3.md` (amended) is the normative spec.
+> why. `legacy/specs/TOKENOMICS_V3.md` (amended) is the normative spec.
 
 ---
 

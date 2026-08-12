@@ -1,7 +1,7 @@
 # Module-SIS PoW — hardness analysis (S1)
 
 > **Status update (2026-07) — goal superseded.** The follow-up frontier
-> research (`docs/research/POW-CANONICAL-frontier.md`, dense estimator sweep)
+> research (`legacy/research/POW-CANONICAL-frontier.md`, dense estimator sweep)
 > established that the target this file works toward — a *mineable* instance
 > with a ≥2^100/2^128 lattice no-shortcut margin — **does not exist and cannot
 > exist for a trapdoorless PoW**: with no trapdoor, the core-SVP cost is both

@@ -7,7 +7,7 @@
 > blocks, 100% miner — `crates/bloch-crypto/src/core/tokenomics_v2.rs`),
 > and the emission curve is superseded by **Emission V3** (2,600 BLOCH
 > initial, 1.5-year halvings) from emission height 453,743 / local height
-> 40,000 — see [`docs/specs/TOKENOMICS_V3.md`](./specs/TOKENOMICS_V3.md)
+> 40,000 — see [`legacy/specs/TOKENOMICS_V3.md`](./specs/TOKENOMICS_V3.md)
 > and ADR-035. There is no V2 → V3 migration checklist: V3 is a single
 > height-gated flag-day fork, deployed by upgrading the node binary before
 > local height 40,000.
@@ -16,7 +16,7 @@
 |---|---|
 | **Status** | Historical (completed; superseded — see banner) |
 | **Date** | 2026-05-01 |
-| **Companion docs** | `docs/specs/TOKENOMICS_V2.md`, `docs/adr/ADR-028-tokenomics-v2-activation.md`, `docs/specs/historical/TOKENOMICS_V1_SUPERSEDED.md` |
+| **Companion docs** | `legacy/specs/TOKENOMICS_V2.md`, `docs/adr/ADR-028-tokenomics-v2-activation.md`, `legacy/specs/historical/TOKENOMICS_V1_SUPERSEDED.md` |
 | **Estimated effort** | 4–6 days focused engineering |
 
 ---
@@ -373,7 +373,7 @@ After this migration, a separate workflow regenerates the genesis block:
 6. Genesis block hash committed and tagged
 7. Sanity verification: clean fresh node sync past block 0, then 207,260, then 1,470,000
 
-This is **not** part of the V1 → V2 migration. Genesis ceremony is post-mainnet-dev-checklist work per `docs/MAINNET-DEV-CHECKLIST.md` §9.
+This is **not** part of the V1 → V2 migration. Genesis ceremony is post-mainnet-dev-checklist work per `legacy/MAINNET-DEV-CHECKLIST.md` §9.
 
 ---
 

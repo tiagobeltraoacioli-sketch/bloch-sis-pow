@@ -21,7 +21,7 @@ older builds actively diverge. Two consensus flag-days matter here:
   producer and validator. Builds older than commit `1f7d328`
   (`genesis3-node-difficulty-choke-20260809`) reject today's blocks.
 - **Emission V3, local h=40,000 (ETA ~2026-08-12/13)** — block reward
-  8,400 → 2,600 BLOCH (`docs/specs/TOKENOMICS_V3.md`). Any binary without
+  8,400 → 2,600 BLOCH (`legacy/specs/TOKENOMICS_V3.md`). Any binary without
   commit `8538dea` forks off the network at that height. The fleet runs the
   mandatory release `genesis3-node-emission-v3-floor60-20260810` (`bloch`
   sha256 `dfc6962d…`, incl. the PISO-60 60-BLOCH V3 tail floor); earlier

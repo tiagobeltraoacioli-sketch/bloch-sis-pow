@@ -9,7 +9,7 @@ This is the canonical ADR for replacing the two bounded (silently-approximating)
 GHOSTDAG ancestry walks with an exact interval-reachability index, and for making
 that index **durable** so it survives restarts. It supersedes the "DROP-IN /
 no-coordination" verdict in the earlier operations runbook (see the correction in
-§4 and `docs/operations/UPGRADE-ghostdag-reachability.md`).
+§4 and `legacy/operations/UPGRADE-ghostdag-reachability.md`).
 
 ---
 
