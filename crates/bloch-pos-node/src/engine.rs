@@ -86,6 +86,7 @@ pub struct Config {
     pub listen: u16,
     pub peers: Vec<String>,
     pub stop_at_slot: Option<u64>,
+    pub ws: crate::ws_boot::WsConfig,
 }
 
 fn now_ms() -> u64 {
@@ -118,6 +119,13 @@ struct Engine {
     needs_sync: bool,
     last_applied_ms: u64,
     booted_ms: u64,
+    /// The weak-subjectivity anchor this node booted under (epoch, root), and
+    /// whether it is the node's ONLY defense (it had no finality of its own).
+    /// `None` until `ws_boot::boot` has run.
+    ws_anchor: Option<(u64, [u8; 32])>,
+    ws_anchor_hard: bool,
+    /// A forward WS_CONFLICT is announced once, not every block.
+    ws_conflict_reported: bool,
 }
 
 impl Engine {
@@ -178,6 +186,74 @@ impl Engine {
             root = *id.as_bytes();
         }
         root
+    }
+
+    /// This node's OWN finalized root at `epoch`, or `None` if its finality
+    /// has not reached that epoch — exactly the input
+    /// [`ws::cross_check`](bloch_pos_committee::ws::cross_check) declares.
+    /// "Own" is load-bearing: the root comes from this node's replayed
+    /// canonical chain under the same checkpoint convention its attesters
+    /// vote, never from anything a peer or a publication asserted.
+    fn own_finalized_root_at(&self, epoch: u64) -> Option<[u8; 32]> {
+        (epoch <= self.state.finality().finalized.epoch).then(|| self.checkpoint_root(epoch))
+    }
+
+    /// Forward enforcement of the boot anchor (§5). Once this node's own
+    /// finality reaches the anchor's epoch, the two must agree.
+    ///
+    /// Two outcomes, and the difference is the whole structural limit on the
+    /// signers' power. A node that booted on its OWN finality treats a
+    /// contradiction as the WS_CONFLICT alarm and keeps running — a
+    /// checkpoint never reorganizes it. A node that had nothing of its own
+    /// (`anchor_is_hard`) has only the anchor between it and a forged
+    /// history, so a contradiction is fatal: it is following a chain that
+    /// disagrees with the one thing it trusted.
+    fn enforce_ws_anchor(&mut self) {
+        let Some((epoch, root)) = self.ws_anchor else { return };
+        if self.ws_conflict_reported {
+            return;
+        }
+        let Some(local) = self.own_finalized_root_at(epoch) else { return };
+        use bloch_pos_committee::ws::{cross_check, WeakSubjectivityCheckpoint, WS_FORMAT_VERSION};
+        // Only `epoch`/`block_root` are read by cross_check; the rest of the
+        // artifact is not re-litigated here (it was verified at boot).
+        let probe = WeakSubjectivityCheckpoint {
+            version: WS_FORMAT_VERSION,
+            network_id: 0,
+            genesis_root: [0u8; 32],
+            epoch,
+            block_root: root,
+            state_root: [0u8; 32],
+            validator_set_root: [0u8; 32],
+            issued_at: 0,
+            signer_set_id: 0,
+        };
+        if let bloch_pos_committee::ws::CrossCheck::Conflict { local_root, published_root } =
+            cross_check(Some(local), &probe)
+        {
+            self.ws_conflict_reported = true;
+            eprintln!(
+                "WS_CONFLICT at epoch {epoch}: this node finalized {} where its \
+                 weak-subjectivity anchor says {}.",
+                crate::codec::hex32(&local_root),
+                crate::codec::hex32(&published_root),
+            );
+            if self.ws_anchor_hard {
+                eprintln!(
+                    "FATAL: this node synced with no finality of its own — the anchor \
+                     was its only defense against a forged history, and the chain it \
+                     followed contradicts it. Stopping rather than serving a history \
+                     nothing vouches for. Re-check the checkpoint digest across \
+                     independent publication channels before restarting."
+                );
+                std::process::exit(1);
+            }
+            eprintln!(
+                "Own finality stands: NOT reorganizing (a checkpoint can never override \
+                 a running node's finality). Alert the operator and compare the \
+                 published digest across independent channels."
+            );
+        }
     }
 
     /// This validator's RANDAO chain, positioned at its committed reveal
@@ -496,6 +572,8 @@ impl Engine {
                             after.finalized.epoch,
                             crate::codec::hex8(&after.finalized.root)
                         );
+                        // New own finality may now reach the anchor's epoch.
+                        self.enforce_ws_anchor();
                     }
                 }
                 true
@@ -590,6 +668,8 @@ impl Engine {
                 self.head_slot_now(),
                 crate::codec::hex8(&self.state.state_root()),
             );
+            // A reorg can move the finalized root at the anchor's epoch.
+            self.enforce_ws_anchor();
         }
         true
     }
@@ -683,6 +763,9 @@ pub fn run(cfg: Config) -> io::Result<()> {
         needs_sync: false,
         last_applied_ms: now_ms(),
         booted_ms: now_ms(),
+        ws_anchor: None,
+        ws_anchor_hard: false,
+        ws_conflict_reported: false,
         manifest,
     };
 
@@ -704,6 +787,79 @@ pub fn run(cfg: Config) -> io::Result<()> {
         );
     }
     engine.head_slot.store(engine.state.slot(), Ordering::Relaxed);
+
+    // ── Weak subjectivity: may the node sync at all? (§4.2) ──
+    //
+    // Runs AFTER replay, because the question the boot decision asks — how old
+    // is this node's own finalized knowledge — is only answerable once the
+    // database has been replayed. Before this point the node has done nothing
+    // but read its own disk; it performs no duty and follows no peer until the
+    // gate says it may.
+    //
+    // The wall-clock epoch comes from the MANIFEST's slot clock, not from
+    // `ws::wallclock_epoch` (which assumes the mainnet 30 s cadence): a devnet
+    // running 500 ms slots would otherwise be judged 60× younger than it is,
+    // and the age compared against the window must be measured on the same
+    // clock the node's own epochs are numbered by. The NTP caveat of §1
+    // applies here verbatim — a clock set backward makes a stale node look
+    // fresh.
+    {
+        let genesis_ms = engine.manifest.genesis_time_ms;
+        let slot_ms = engine.manifest.slot_ms;
+        let wall_slot = now_ms().saturating_sub(genesis_ms) / slot_ms;
+        let wall_epoch = epoch_of(wall_slot);
+        let fin = engine.state.finality().finalized;
+        // Genesis is "finalized by definition", not knowledge this node
+        // witnessed. Only a finalized epoch above 0 is own finality — treating
+        // the genesis checkpoint as own finality would let every fresh node
+        // skip the gate, which is the whole point of the gate.
+        let has_local_finality = fin.epoch > 0;
+        let network_id = crate::ws_boot::network_id_of(&digest);
+        let genesis_root = *genesis_id.as_bytes();
+        // The genesis block IS the first weak-subjectivity anchor: trusting it
+        // is trusting the manifest this node already loaded to exist at all.
+        // This is what keeps a fresh devnet booting with no ceremony.
+        let g_anchor = bloch_pos_committee::ws::genesis_anchor(
+            network_id,
+            genesis_root,
+            engine.manifest.genesis_state().state_root(),
+            [0u8; 32], // no validator-set SMT root exposed at this milestone
+            genesis_ms / 1000,
+        );
+        let canonical = engine.canonical.clone();
+        let local_at: Vec<(u64, [u8; 32])> = (0..=fin.epoch)
+            .filter_map(|e| engine.own_finalized_root_at(e).map(|r| (e, r)))
+            .collect();
+        let outcome = crate::ws_boot::boot(
+            &cfg.ws,
+            &cfg.data_dir,
+            network_id,
+            &genesis_root,
+            &g_anchor,
+            wall_epoch,
+            has_local_finality,
+            (fin.epoch, fin.root),
+            |e| local_at.iter().find(|(k, _)| *k == e).map(|(_, r)| *r),
+            |root| canonical.contains(root),
+        )?;
+        match outcome {
+            Ok(ws) => {
+                for w in &ws.warnings {
+                    println!("{w}");
+                }
+                println!(
+                    "weak subjectivity: anchored at epoch {} ({}), {} own finality",
+                    ws.anchor_epoch,
+                    crate::codec::hex8(&ws.anchor_root),
+                    if ws.anchor_is_hard { "WITHOUT" } else { "with" },
+                );
+                engine.ws_anchor = Some((ws.anchor_epoch, ws.anchor_root));
+                engine.ws_anchor_hard = ws.anchor_is_hard;
+                engine.enforce_ws_anchor();
+            }
+            Err(msg) => return Err(io::Error::new(io::ErrorKind::PermissionDenied, msg)),
+        }
+    }
 
     // ── The slot loop ──
     let genesis_ms = engine.manifest.genesis_time_ms;
