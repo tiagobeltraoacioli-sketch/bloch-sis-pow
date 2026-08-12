@@ -78,9 +78,45 @@ pub const MLDSA65_SIG_BYTES: usize = 3309;
 /// to the values it scales.
 pub const SAT_PER_BLOCH: u128 = crate::tokenomics_v4::SAT_PER_BLOCH;
 
-/// Minimum deposit: 100,000 BLCH (§5.1) — sized so a validator set of ~1,000
-/// is reachable from the realistic independent float, not from a round number.
-pub const MIN_DEPOSIT_SAT: u128 = 100_000 * SAT_PER_BLOCH;
+/// Minimum deposit: **5,600 BLCH** — Ethereum's bond, expressed as the same
+/// fraction of supply.
+///
+/// Founder decision, 2026-08-12, for decentralisation. Ethereum asks 32 ETH of
+/// a ~120.5 M supply, i.e. `2.66e-7` of it; the same fraction of V4's
+/// 21,000,000,000 is 5,576.8 BLCH, rounded to 5,600 so the relationship is
+/// exact and quotable: **one validator per 3,750,000 BLCH of supply**
+/// (`TOTAL_SUPPLY_BLOCH / 5_600 == 3_750_000`).
+///
+/// This is an **18x cut** from the previous 100,000 BLCH, and the point of it
+/// is that 100,000 BLCH priced participation at a level almost nobody outside
+/// the founder could reach — a minimum that high is a centralisation mechanism
+/// no matter what the surrounding rules say.
+///
+/// **Honest note on the derivation.** 32 ETH was not chosen from Ethereum's
+/// supply; it came from committee sizing and signature aggregation, and the
+/// supply ratio is an accident of where the price and the issuance landed.
+/// Borrowing the ratio is a defensible way to pick a number — it lands the bond
+/// where a comparable chain's participation floor sits — but it is not
+/// borrowing Ethereum's reasoning, and the ratio drifts as ETH supply does.
+///
+/// **What this does not fix.** Lowering the floor widens who *may* participate;
+/// it does nothing about who *does*. The concentration measured in
+/// `BLOCH-TOKENOMICS-V4.md` §4A.1 is unchanged by this constant: a holder with
+/// 94% of the supply can now fund 18x more validators, not fewer. The bond is
+/// a floor on entry, never a ceiling on accumulation — the per-validator 1% cap
+/// (`delegation::MAX_VALIDATOR_STAKE_BPS`) and the genesis-cohort taper are
+/// what bound the top, and neither sees beneficial ownership.
+///
+/// **Open consequence, flagged not solved.** At 5,600 BLCH the supply admits
+/// 3,750,000 validators, while the network budget (gate G10,
+/// `BLOCH-POS-NETWORK-CAPACITY.md`) prices N = 4,096 at ~604 KB per slot
+/// *sustained*. Nothing in the design caps the validator count; today the
+/// activation queue (`MAX_ACTIVATIONS_PER_EPOCH` plus the churn budget) is the
+/// only brake, and it bounds the *rate*, not the total. A `MAX_VALIDATORS`, or
+/// Ethereum's consolidation route (a max effective balance, so large operators
+/// hold fewer keys), has to be decided before the set can grow into the range
+/// this constant opens.
+pub const MIN_DEPOSIT_SAT: u128 = 5_600 * SAT_PER_BLOCH;
 
 /// Epochs between a deposit being included and it becoming eligible for the
 /// activation queue (§5.1: ~2.1 h). Exists so the validator set used by epoch

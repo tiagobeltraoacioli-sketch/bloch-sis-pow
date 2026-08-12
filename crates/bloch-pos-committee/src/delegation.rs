@@ -93,11 +93,26 @@ pub const WARMUP_RATE_BPS: u128 = 25;
 /// delegation is that staking should not require running a node.
 pub const MIN_DELEGATION_SAT: u128 = 10 * SAT_PER_BLOCH;
 
-/// The floor under the per-epoch churn budget: one validator's minimum
-/// deposit. See the floor rationale at the budget computation in
-/// [`Registry::resolve`] — it exists to guarantee a drain terminates, and it
-/// is sized so a young network can still onboard at a usable rate.
-pub const MIN_CHURN_SAT: u128 = crate::staking::MIN_DEPOSIT_SAT;
+/// The floor under the per-epoch churn budget: 100,000 BLCH.
+///
+/// **Its own constant, deliberately unlinked from [`crate::staking::MIN_DEPOSIT_SAT`].**
+/// It was an alias while the two happened to be equal. When the bond dropped to
+/// 5,600 BLCH on 2026-08-12 the alias would have dragged the floor down with it
+/// — and that is backwards: the floor exists so a *young network can onboard at
+/// a usable wall-clock rate* when the proportional 25 bps budget is still tiny.
+/// Cutting it 18x would have slowed onboarding at exactly the moment the lower
+/// bond was meant to speed it up, which is the opposite of the decision's
+/// intent. Two different questions — "what does one validator cost?" and "how
+/// much stake may move per epoch?" — had been sharing one number.
+///
+/// Sized in wall-clock terms rather than in validators: 100,000 BLCH per
+/// 16-minute epoch. For reference Ethereum's floor is 4 validators per 6.4 min;
+/// scaled to this epoch length that is ~10 validators, and at 5,600 BLCH each
+/// this floor is ~18 — the same order, arrived at independently.
+///
+/// It also guarantees a drain terminates: a budget that is purely a fraction of
+/// a shrinking total decays geometrically and never reaches zero.
+pub const MIN_CHURN_SAT: u128 = 100_000 * crate::tokenomics_v4::SAT_PER_BLOCH;
 
 /// Per-validator cap as a share of total active stake (§4.1: 1%).
 pub const MAX_VALIDATOR_STAKE_BPS: u128 = 100;
