@@ -15,6 +15,8 @@ USAGE:
     genesis4-ceremony \\
         --carryover genesis4-carryover.tsv \\
         --carryover-shake256 <64-hex published digest> \\
+        --coherence genesis4-coherence.tsv \\
+        --coherence-shake256 <64-hex published digest> \\
         --cohort genesis4-cohort.tsv \\
         --founder <addr40> --vc <addr40> --team <addr40> \\
         --marketing <addr40> --liquidity <addr40> \\
@@ -23,6 +25,14 @@ USAGE:
 Reads the plain-text carryover artifact (addr<TAB>value_sat, sorted — the file
 build_carryover.py emits; gunzip it first if compressed), recomputes its
 SHAKE-256, and refuses to proceed unless it matches the published digest.
+
+Reads the Coherence shielded-pool artifact (§6.6.1): line 1
+`bloch-coherence-carryover<TAB>1`, then `leaf<TAB><hex cm>` lines in exact
+tree-position order, then `nullifier<TAB><hex nf>` lines sorted ascending.
+Leaf order is consensus (the nullifier binds the position), so the artifact
+crosses verbatim or the ceremony refuses. On the current mainnet the pool is
+provably empty and the artifact is the one-line header file — still required,
+still digest-checked: \"empty\" is an attested input, not an assumption.
 
 Reads the genesis validator cohort (tokenomics §3.3): one line per validator,
 index<TAB>pubkey<TAB>randao_c0<TAB>stake_sat<TAB>withdrawal, indices from 0,
@@ -61,6 +71,8 @@ fn run() -> Result<(), String> {
 
     let carry_path = arg(&args, "--carryover")?;
     let digest_hex = arg(&args, "--carryover-shake256")?;
+    let coherence_path = arg(&args, "--coherence")?;
+    let coherence_digest_hex = arg(&args, "--coherence-shake256")?;
     let cohort_path = arg(&args, "--cohort")?;
     let out_base = arg(&args, "--out")?;
     let addrs = BucketAddrs {
@@ -75,18 +87,25 @@ fn run() -> Result<(), String> {
         .ok()
         .and_then(|v| v.try_into().ok())
         .ok_or("--carryover-shake256 must be 64 hex chars (32 bytes)")?;
+    let expected_pool: [u8; 32] = hex::decode(coherence_digest_hex.trim())
+        .ok()
+        .and_then(|v| v.try_into().ok())
+        .ok_or("--coherence-shake256 must be 64 hex chars (32 bytes)")?;
 
-    if carry_path.ends_with(".gz") {
+    if carry_path.ends_with(".gz") || coherence_path.ends_with(".gz") {
         return Err("gunzip the artifact first — the ceremony hashes the plain bytes".into());
     }
     let text = std::fs::read_to_string(&carry_path)
         .map_err(|e| format!("cannot read {carry_path}: {e}"))?;
+    let coherence_text = std::fs::read_to_string(&coherence_path)
+        .map_err(|e| format!("cannot read {coherence_path}: {e}"))?;
     let cohort_text = std::fs::read_to_string(&cohort_path)
         .map_err(|e| format!("cannot read {cohort_path}: {e}"))?;
 
     let carry = read_carryover(&text)?;
+    let pool = read_coherence(&coherence_text)?;
     let cohort = read_cohort(&cohort_text)?;
-    let genesis = build_genesis(&carry, &addrs, &cohort, &expected)?;
+    let genesis = build_genesis(&carry, &addrs, &cohort, &expected, &pool, &expected_pool)?;
     let doc = render_document(&genesis);
     let doc_digest = document_digest(&doc);
     let header = genesis_header(&genesis);
@@ -106,6 +125,13 @@ fn run() -> Result<(), String> {
     println!("  digest (verified)  : {}", hex::encode(carry.digest));
     println!("  holders            : {}", carry.rows.len());
     println!("  issued             : {} BLCH (the whole measured ledger — cap retired)", bloch(genesis.carryover_issued_sat));
+    println!();
+    println!("coherence artifact   : {coherence_path}");
+    println!("  digest (verified)  : {}", hex::encode(genesis.coherence_digest));
+    println!("  leaves             : {} (positions 0..{}, carried verbatim)", genesis.coherence_leaf_count, genesis.coherence_leaf_count);
+    println!("  nullifiers         : {}", genesis.coherence_nullifier_count);
+    println!("  accumulator root   : {}", hex::encode(genesis.coherence_accumulator_root));
+    println!("  nullifier root     : {}", hex::encode(genesis.coherence_nullifier_root));
     println!();
     println!("genesis cohort       : {cohort_path}");
     println!("  validators         : {}", genesis.validators.len());

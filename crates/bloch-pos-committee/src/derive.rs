@@ -208,12 +208,75 @@ pub fn expected_finality(parent: &ParentState<'_>) -> ([u8; 32], [u8; 32]) {
     (parent.header.justified_root, parent.header.finalized_root)
 }
 
-/// The coherence root the child header must carry: the parent's, verbatim.
-/// The shielded-pool accumulator is incremental and C1-frozen; re-rooting it
-/// at this seam would force re-shielding (§6.6.1), so it is carried, never
-/// recomputed.
+/// The §6.6.2 header mirror: `SHA3-256(DS_COHERENCE ‖ accumulator_root ‖
+/// nullifier_root)` — the one encoding of the two committed Coherence roots
+/// that `BlockHeaderV4.coherence_root` carries.
+///
+/// This binds the header field to the same two values `state_root` commits as
+/// SMT leaves (`TAG_COHERENCE_ACCUMULATOR` / `TAG_COHERENCE_NULLIFIERS`), so
+/// the mirror can never drift from the committed state. It does **not**
+/// re-root the pool: the accumulator root is an input, computed once by the
+/// C1-frozen SHAKE-256 tree in `coherence-core` and carried as a value —
+/// §6.6.1's no-re-rooting rule is about that tree, not about how the header
+/// encodes its root.
+///
+/// The genesis ceremony (`tools/genesis4-ceremony`) stamps the genesis header
+/// with this same function over the carried pool's roots, which is what makes
+/// "carried verbatim" a chain anchored in a checkable commitment instead of an
+/// arbitrary constant.
+pub fn coherence_binding(accumulator_root: &[u8; 32], nullifier_root: &[u8; 32]) -> [u8; 32] {
+    let mut h = Sha3_256::new();
+    h.update(crate::params::DS_COHERENCE);
+    h.update(accumulator_root);
+    h.update(nullifier_root);
+    h.finalize().into()
+}
+
+/// Commitment over the global nullifier set — the value
+/// `ChainState::coherence_nullifier_root` carries and `state_root` commits.
+///
+/// **INTERIM (see [`crate::params::DS_NFSET`]):** the set is canonicalised
+/// (sorted, deduplicated — it is a set; input order and multiplicity cannot
+/// influence consensus), the count is bound, and the whole is hashed flat:
+/// `SHA3-256(DS_NFSET ‖ LE64(n) ‖ nf_0 ‖ … ‖ nf_{n-1})` with `nf_i` strictly
+/// ascending. Sound as a carriage commitment (any change to the set changes
+/// the root); it does not support efficient non-membership proofs — the C1.1
+/// SMT (`BLOCH-COHERENCE-UNDER-POS.md` §2.3) is the intended replacement, and
+/// it must land before the Genesis-4 ceremony runs or the genesis identity
+/// changes under it.
+pub fn nullifier_set_root(nullifiers: &[[u8; 32]]) -> [u8; 32] {
+    let set: std::collections::BTreeSet<&[u8; 32]> = nullifiers.iter().collect();
+    let mut h = Sha3_256::new();
+    h.update(crate::params::DS_NFSET);
+    h.update((set.len() as u64).to_le_bytes());
+    for nf in set {
+        h.update(nf);
+    }
+    h.finalize().into()
+}
+
+/// The coherence root the child header must carry: the [`coherence_binding`]
+/// of the **parent's committed** accumulator and nullifier-set roots.
+///
+/// Derived from `parent.chain`, not copied from `parent.header`: a value that
+/// is only ever copied forward is anchored in nothing but the genesis stamp,
+/// and validates nothing (the §5.5 "no value the validator cannot re-derive
+/// from committed state" rule). Because shielded-transaction application is
+/// inert at this seam — [`post_chain_state`] carries both roots unchanged —
+/// the parent's committed roots ARE the child's post-state roots, so this is
+/// simultaneously "carried, never re-rooted" (§6.6.1) and re-derivable.
+///
+/// When DEV-3 wires shielded application, [`post_chain_state`] starts
+/// updating the two roots and this function must take the block's shielded
+/// transactions and derive from the *post* state. Change the signature when
+/// that happens — both the producer ([`crate::produce`]) and the validator
+/// call this one function, so the compiler will hold them together through
+/// the change (the h28080 lesson, applied forward).
 pub fn expected_coherence(parent: &ParentState<'_>) -> [u8; 32] {
-    parent.header.coherence_root
+    coherence_binding(
+        &parent.chain.coherence_accumulator_root,
+        &parent.chain.coherence_nullifier_root,
+    )
 }
 
 // ── Body commitments (DS_BODY domain, §6.1) ─────────────────────────────────
@@ -502,4 +565,113 @@ pub fn validate_block(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod coherence_tests {
+    use super::*;
+    use crate::state_root::RandaoMix;
+
+    fn chain(acc: [u8; 32], nf: [u8; 32]) -> ChainState {
+        ChainState {
+            eutxos: Vec::new(),
+            registry: Vec::new(),
+            current_participation: Vec::new(),
+            previous_participation: Vec::new(),
+            randao_mixes: vec![RandaoMix { epoch: 0, mix: [0u8; 32] }],
+            taint_root: [0u8; 32],
+            coherence_accumulator_root: acc,
+            coherence_nullifier_root: nf,
+        }
+    }
+
+    fn header_with_coherence(coherence_root: [u8; 32]) -> BlockHeaderV4 {
+        BlockHeaderV4 {
+            version: VERSION_G4,
+            parent: [0u8; 32],
+            state_root: [0u8; 32],
+            body_root: [0u8; 32],
+            slot: 0,
+            proposer_index: 0,
+            randao_reveal: [0u8; 32],
+            randao_mix: [0u8; 32],
+            justified_root: [0u8; 32],
+            finalized_root: [0u8; 32],
+            attestation_root: [0u8; 32],
+            coherence_root,
+        }
+    }
+
+    /// The mirror is a function of the two roots and nothing else, and it is
+    /// injective over each input (no zero-absorption: an all-zero root pair
+    /// still produces a real digest — "empty pool" is a hash output, never
+    /// the magic constant `[0u8; 32]` the old genesis stamped).
+    #[test]
+    fn binding_depends_on_both_roots_and_is_never_zero() {
+        let a = coherence_binding(&[1u8; 32], &[2u8; 32]);
+        assert_eq!(a, coherence_binding(&[1u8; 32], &[2u8; 32]));
+        assert_ne!(a, coherence_binding(&[3u8; 32], &[2u8; 32]));
+        assert_ne!(a, coherence_binding(&[1u8; 32], &[4u8; 32]));
+        // Swapping the operands must not commute — acc and nf are different
+        // objects and the binding must tell them apart.
+        assert_ne!(
+            coherence_binding(&[1u8; 32], &[2u8; 32]),
+            coherence_binding(&[2u8; 32], &[1u8; 32])
+        );
+        assert_ne!(coherence_binding(&[0u8; 32], &[0u8; 32]), [0u8; 32]);
+    }
+
+    /// The child's coherence_root derives from the parent's **committed
+    /// state**, not from the parent's header field: a stale or corrupt header
+    /// value does not propagate. This is the difference between "carried" and
+    /// "validated" — the value the chain finalizes is re-derivable by every
+    /// node from state it can check.
+    #[test]
+    fn expected_coherence_derives_from_committed_state_not_the_parent_header() {
+        let chain = chain([0x12; 32], [0x13; 32]);
+        let honest = header_with_coherence(coherence_binding(&[0x12; 32], &[0x13; 32]));
+        let stale = header_with_coherence([0x08; 32]); // arbitrary junk stamp
+        let expected = coherence_binding(&[0x12; 32], &[0x13; 32]);
+        for header in [&honest, &stale] {
+            let parent = ParentState { header, chain: &chain, reveal_states: &[] };
+            assert_eq!(expected_coherence(&parent), expected);
+        }
+    }
+
+    /// Carriage invariant while shielded application is inert: whatever block
+    /// is applied, [`post_chain_state`] leaves both Coherence roots untouched
+    /// — so `expected_coherence` over the parent equals the binding of the
+    /// child's post-state roots, and the mirror stays consistent block after
+    /// block. The day this test fails is the day shielded application was
+    /// wired in — at which point `expected_coherence` must move to the post
+    /// state (see its doc).
+    #[test]
+    fn post_chain_state_carries_both_coherence_roots_unchanged() {
+        let parent_chain = chain([0xAA; 32], [0xBB; 32]);
+        let header = header_with_coherence(coherence_binding(&[0xAA; 32], &[0xBB; 32]));
+        let parent = ParentState { header: &header, chain: &parent_chain, reveal_states: &[] };
+        let post = post_chain_state(&parent, 1, [0xCC; 32], &[]);
+        assert_eq!(post.coherence_accumulator_root, [0xAA; 32]);
+        assert_eq!(post.coherence_nullifier_root, [0xBB; 32]);
+        assert_eq!(
+            expected_coherence(&parent),
+            coherence_binding(&post.coherence_accumulator_root, &post.coherence_nullifier_root),
+        );
+    }
+
+    /// The nullifier-set commitment is a commitment to the SET: input order
+    /// and duplicates cannot move it, the count is bound, and any element
+    /// change moves it.
+    #[test]
+    fn nullifier_set_root_is_canonical_over_the_set() {
+        let a = [0x01u8; 32];
+        let b = [0x02u8; 32];
+        let c = [0x03u8; 32];
+        assert_eq!(nullifier_set_root(&[a, b, c]), nullifier_set_root(&[c, a, b]));
+        assert_eq!(nullifier_set_root(&[a, b, c]), nullifier_set_root(&[a, a, b, c, c]));
+        assert_ne!(nullifier_set_root(&[a, b]), nullifier_set_root(&[a, b, c]));
+        assert_ne!(nullifier_set_root(&[]), nullifier_set_root(&[a]));
+        // Count binding: the empty set commits to a real digest, not zeros.
+        assert_ne!(nullifier_set_root(&[]), [0u8; 32]);
+    }
 }

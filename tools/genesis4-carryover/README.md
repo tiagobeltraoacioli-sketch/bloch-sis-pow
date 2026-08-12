@@ -5,6 +5,15 @@ opening balances: drop founder-controlled outputs, aggregate by address, apply
 the 300 M cap pro-rata if it binds, emit a deterministic TSV and a SHAKE-256
 commitment.
 
+**Scope: transparent balances only.** The Coherence shielded pool cannot cross
+through this artifact — a shielded note is a commitment at a consensus leaf
+position, not a balance, and it is not in the UTXO snapshot at all. The pool
+crosses through the separate Coherence artifact `tools/genesis4-ceremony`
+requires (`--coherence`, §6.6.1): tree leaves in position order plus the full
+nullifier set. On the current mainnet that artifact is the canonical empty
+file (the pool is provably empty), but it is a required, digest-checked input
+either way.
+
 ## Runbook, in order
 
 ```bash

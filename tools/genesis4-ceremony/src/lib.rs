@@ -25,6 +25,22 @@
 //!    would be a promise instead of a consensus rule. The cohort root is a
 //!    leaf of `state_root`, so the set is inside the chain's identity.
 //! 3. **The genesis header** (`BlockHeaderV4`, §5.3) and its `block_id`.
+//! 4. **The carried Coherence shielded pool** (§6.6.1) — the commitment-tree
+//!    leaves **in their exact Genesis-3 positions** and the full nullifier
+//!    set. A shielded note is not a balance: its nullifier binds its leaf
+//!    position (`nf = SHAKE256(DOM_NF ‖ nk ‖ rho ‖ LE64(position))`,
+//!    C1 §1.3), so leaf order is consensus and must cross verbatim — the
+//!    carryover TSV, which aggregates by address, cannot carry it. The
+//!    ceremony replays the leaves through the C1-frozen `coherence-core`
+//!    tree, commits the accumulator root and the nullifier-set root into
+//!    `state_root`, and stamps `coherence_root` with the §6.6.2 mirror
+//!    binding. Omitting either half is not a smaller genesis, it is a broken
+//!    one: dropped leaves burn every unspent note; a dropped nullifier set
+//!    revives every spent one. On the real Genesis-3 mainnet the pool is
+//!    provably empty (the verifier fails closed and no shield bridge exists),
+//!    so the mainnet artifact is the canonical empty file — but the ceremony
+//!    still requires it, fail-closed, because "empty" must be an attested
+//!    input, not an assumption.
 //!
 //! ## Why the carryover digest is embedded — §3.2.2, the load-bearing part
 //!
@@ -45,9 +61,11 @@
 //! validator remainder (spec §8.1). No allocation number is restated here:
 //! change the constants crate and this tool follows, or fails to compile.
 
+use bloch_pos_committee::derive::{coherence_binding, nullifier_set_root};
 use bloch_pos_committee::params::SLOTS_PER_EPOCH;
 use bloch_pos_committee::staking::{HYBRID_PK_BYTES, MIN_DEPOSIT_SAT, SUITE_MLDSA65_FALCON1024};
 use bloch_pos_committee::tokenomics_v4 as v4;
+use coherence_core::CommitmentTree;
 
 // ── Domain separation ───────────────────────────────────────────────────────
 // Fixed 16 bytes, right-padded with zeros, so no tag can be a prefix of
@@ -188,6 +206,132 @@ pub fn read_carryover(text: &str) -> Result<Carryover, String> {
     let digest =
         shake256_32_lines(rows.iter().map(|(a, v)| format!("{a}\t{v}\n")));
     Ok(Carryover { rows, digest, total_sat })
+}
+
+// ── Coherence shielded-pool artifact (§6.6.1) ───────────────────────────────
+
+/// First line of the coherence artifact — format name and version.
+pub const COHERENCE_ARTIFACT_HEADER: &str = "bloch-coherence-carryover\t1";
+
+/// The canonical empty-pool artifact: what the Genesis-3 mainnet publishes,
+/// since its pool is provably empty (verifier fail-closed, no shield bridge).
+pub const COHERENCE_EMPTY_ARTIFACT: &str = "bloch-coherence-carryover\t1\n";
+
+/// The parsed Coherence carryover: commitment-tree leaves **in position
+/// order** (line order IS the position — F8: the nullifier binds
+/// `LE64(position)`, so this ordering is consensus), the complete nullifier
+/// set, and the artifact's SHAKE-256 digest under the same convention as the
+/// carryover TSV.
+pub struct CoherencePool {
+    /// Note commitments, index = tree position. Duplicates are legal (the
+    /// tree does not deduplicate); order is consensus.
+    pub leaves: Vec<[u8; 32]>,
+    /// Every nullifier ever published on Genesis-3, strictly ascending.
+    /// Monotone by §6.6.1: dropping even one revives a spent note.
+    pub nullifiers: Vec<[u8; 32]>,
+    /// SHAKE-256 over the canonical artifact bytes.
+    pub digest: [u8; 32],
+}
+
+impl CoherencePool {
+    /// The carried accumulator root: the leaves replayed, in order, through
+    /// the C1-frozen SHAKE-256 tree (`coherence-core` — the same code the
+    /// node and the SP1 guest run, so a witness computed under Genesis-3
+    /// verifies against this root unchanged). For the empty artifact this is
+    /// the empty-tree root — a real SHAKE-256 digest, never `[0u8; 32]`.
+    pub fn accumulator_root(&self) -> [u8; 32] {
+        let mut tree = CommitmentTree::new();
+        for cm in &self.leaves {
+            tree.append(*cm);
+        }
+        tree.root()
+    }
+
+    /// The carried nullifier-set root — the interim `DS_NFSET` commitment
+    /// from `bloch-pos-committee` (single derivation path: the ceremony
+    /// imports the consensus function, it does not restate it).
+    pub fn nullifier_root(&self) -> [u8; 32] {
+        nullifier_set_root(&self.nullifiers)
+    }
+}
+
+/// Parse and canonically re-hash the Coherence artifact.
+///
+/// Strict for the same reason the carryover parser is — the digest is
+/// published and re-derived by every operator, so exactly one byte encoding
+/// of a given pool may parse:
+///
+/// - line 1 must be [`COHERENCE_ARTIFACT_HEADER`];
+/// - `leaf\t<64-lowercase-hex>` lines next, in tree-position order;
+/// - `nullifier\t<64-lowercase-hex>` lines last, strictly ascending (the
+///   canonical set encoding; implies no duplicates). A leaf after a
+///   nullifier is rejected — one section order, one encoding;
+/// - more nullifiers than leaves is rejected: every nullifier came from a
+///   spend of some appended note, so the set can never outgrow the tree.
+pub fn read_coherence(text: &str) -> Result<CoherencePool, String> {
+    let mut leaves: Vec<[u8; 32]> = Vec::new();
+    let mut nullifiers: Vec<[u8; 32]> = Vec::new();
+    let mut in_nullifiers = false;
+
+    for (i, line) in text.lines().enumerate() {
+        let n = i + 1;
+        if n == 1 {
+            if line != COHERENCE_ARTIFACT_HEADER {
+                return Err(format!(
+                    "coherence line 1: expected {COHERENCE_ARTIFACT_HEADER:?}, got {line:?}"
+                ));
+            }
+            continue;
+        }
+        let (kind, value) = line
+            .split_once('\t')
+            .ok_or_else(|| format!("coherence line {n}: expected leaf|nullifier<TAB>hex"))?;
+        let bytes: [u8; 32] = lower_hex(value, 32)
+            .and_then(|v| v.try_into().ok())
+            .ok_or_else(|| format!("coherence line {n}: value must be 64 lowercase-hex chars"))?;
+        match kind {
+            "leaf" => {
+                if in_nullifiers {
+                    return Err(format!(
+                        "coherence line {n}: leaf after nullifier — leaves come first, \
+                         in tree-position order; there is exactly one canonical encoding"
+                    ));
+                }
+                leaves.push(bytes);
+            }
+            "nullifier" => {
+                in_nullifiers = true;
+                if let Some(prev) = nullifiers.last() {
+                    if &bytes <= prev {
+                        return Err(format!(
+                            "coherence line {n}: nullifiers must be strictly ascending \
+                             (canonical set encoding, no duplicates)"
+                        ));
+                    }
+                }
+                nullifiers.push(bytes);
+            }
+            other => {
+                return Err(format!("coherence line {n}: unknown record kind {other:?}"));
+            }
+        }
+    }
+    if leaves.is_empty() && nullifiers.is_empty() && !text.starts_with(COHERENCE_ARTIFACT_HEADER) {
+        return Err("coherence artifact is empty — the empty pool is the one-line header file, \
+                    not a zero-byte file"
+            .into());
+    }
+    if nullifiers.len() > leaves.len() {
+        return Err(format!(
+            "coherence artifact has {} nullifiers but only {} leaves — every nullifier \
+             spends an appended note, so the set cannot outgrow the tree",
+            nullifiers.len(),
+            leaves.len(),
+        ));
+    }
+
+    let digest = shake256_32_lines(text.lines().map(|l| format!("{l}\n")));
+    Ok(CoherencePool { leaves, nullifiers, digest })
 }
 
 // ── Genesis validator cohort ────────────────────────────────────────────────
@@ -342,6 +486,20 @@ pub struct Genesis {
     /// output (§3.3.1: the cohort is funded from the Foundation's liquid
     /// holdings, and bonded stake cannot also be a spendable output).
     pub cohort_stake_sat: u128,
+    /// SHAKE-256 of the Coherence artifact (§6.6.1), committed like the
+    /// carryover digest: replacing the pool silently changes the `block_id`.
+    pub coherence_digest: [u8; 32],
+    /// Carried accumulator root — the value the Genesis-4 loader must feed
+    /// `CommittedState::genesis` as `coherence_accumulator_root`.
+    pub coherence_accumulator_root: [u8; 32],
+    /// Carried nullifier-set root — likewise, `coherence_nullifier_root`.
+    pub coherence_nullifier_root: [u8; 32],
+    /// Leaf count (the next append position on Genesis-4 — position
+    /// continuity is what keeps every future nullifier collision-free with
+    /// the carried ones).
+    pub coherence_leaf_count: u64,
+    /// Size of the carried nullifier set.
+    pub coherence_nullifier_count: u64,
 }
 
 /// The five bucket schedules, expressed from the tokenomics-v4 constants.
@@ -388,11 +546,18 @@ pub fn liquidity_schedule() -> Schedule {
 ///   deliberately not applied: at genesis the cohort IS the active set, and a
 ///   self-referential 1% cap would deadlock the bootstrap; `staking.rs` makes
 ///   the same argument for the deposit path.)
+/// - the Coherence artifact's recomputed digest must equal
+///   `expected_pool_digest`, the digest published when the Genesis-3 chain
+///   halted (§6.6.1 — the shielded pool is the one piece of the old ledger
+///   the carryover TSV cannot express, and it crosses fail-closed or not at
+///   all).
 pub fn build_genesis(
     carry: &Carryover,
     addrs: &BucketAddrs,
     cohort: &[GenesisValidator],
     expected_digest: &[u8; 32],
+    pool: &CoherencePool,
+    expected_pool_digest: &[u8; 32],
 ) -> Result<Genesis, String> {
     if &carry.digest != expected_digest {
         return Err(format!(
@@ -400,6 +565,16 @@ pub fn build_genesis(
              refusing to build a genesis from an artifact that is not the published record",
             hex::encode(carry.digest),
             hex::encode(expected_digest),
+        ));
+    }
+
+    if &pool.digest != expected_pool_digest {
+        return Err(format!(
+            "coherence digest mismatch: artifact recomputes to {}, expected {} — \
+             a genesis built from an unattested pool either burns unspent notes \
+             or revives spent ones; refusing",
+            hex::encode(pool.digest),
+            hex::encode(expected_pool_digest),
         ));
     }
 
@@ -531,6 +706,11 @@ pub fn build_genesis(
         carryover_digest: carry.digest,
         carryover_issued_sat: carry.total_sat,
         cohort_stake_sat,
+        coherence_digest: pool.digest,
+        coherence_accumulator_root: pool.accumulator_root(),
+        coherence_nullifier_root: pool.nullifier_root(),
+        coherence_leaf_count: pool.leaves.len() as u64,
+        coherence_nullifier_count: pool.nullifiers.len() as u64,
     };
 
     // The invariant this whole document exists to keep: genesis outputs plus
@@ -636,6 +816,15 @@ pub fn state_root(g: &Genesis) -> [u8; 32] {
         &issued.to_le_bytes(),
         &g.cohort_stake_sat.to_le_bytes(),
         &(v4::VALIDATOR_EMISSION_BLOCH * v4::SAT_PER_BLOCH).to_le_bytes(),
+        // The carried shielded pool (§6.6.1/§6.6.2): both roots, both counts,
+        // and the artifact digest. All fixed-width, appended after the
+        // existing fields — swapping the pool, reordering one leaf, or
+        // dropping one nullifier is a visibly different chain.
+        &g.coherence_digest,
+        &g.coherence_accumulator_root,
+        &g.coherence_nullifier_root,
+        &g.coherence_leaf_count.to_le_bytes(),
+        &g.coherence_nullifier_count.to_le_bytes(),
     ])
 }
 
@@ -693,9 +882,15 @@ impl HeaderV4 {
 
 /// Assemble the genesis header.
 ///
-/// - `parent`, `body_root`, checkpoint roots, `attestation_root` and
-///   `coherence_root` are all-zeros: no parent, empty body, genesis is its own
-///   finalised checkpoint, no attestations, empty shielded pool.
+/// - `parent`, `body_root`, checkpoint roots and `attestation_root` are
+///   all-zeros: no parent, empty body, genesis is its own finalised
+///   checkpoint, no attestations.
+/// - `coherence_root` is the §6.6.2 mirror binding of the **carried** pool
+///   roots, computed by the same `derive::coherence_binding` the validator
+///   re-derives at every child block. Never `[0u8; 32]`: even the empty pool
+///   commits to a real digest (the empty SHAKE-256 tree root under the
+///   binding), so "the pool is empty" is a checkable claim rather than a
+///   magic constant — and a non-empty carried pool is finalized from slot 0.
 /// - `randao_mix` is seeded by one §6 mixing step over the carryover digest,
 ///   so even the beacon chain's origin entropy is pinned to the artifact.
 ///   (The cohort's own RANDAO chains take over from slot 1: each member's
@@ -713,7 +908,10 @@ pub fn genesis_header(g: &Genesis) -> HeaderV4 {
         justified_root: [0u8; 32],
         finalized_root: [0u8; 32],
         attestation_root: [0u8; 32],
-        coherence_root: [0u8; 32],
+        coherence_root: coherence_binding(
+            &g.coherence_accumulator_root,
+            &g.coherence_nullifier_root,
+        ),
     }
 }
 
@@ -741,6 +939,24 @@ pub fn render_document(g: &Genesis) -> String {
     // The funding decision (§3.3.1) as data, so the loader can enforce that
     // the liquidity output plus the bonded stake reconstitutes the bucket.
     s.push_str("cohort-funding\tliquidity\n");
+    // The carried Coherence pool (§6.6.1): the two roots the loader must feed
+    // `CommittedState::genesis` verbatim, plus the counts and the artifact
+    // digest so an operator can re-derive both roots from the published
+    // artifact and refuse a document that disagrees.
+    s.push_str(&format!(
+        "coherence-artifact-shake256\t{}\n",
+        hex::encode(g.coherence_digest)
+    ));
+    s.push_str(&format!("coherence-leaves\t{}\n", g.coherence_leaf_count));
+    s.push_str(&format!("coherence-nullifiers\t{}\n", g.coherence_nullifier_count));
+    s.push_str(&format!(
+        "coherence-accumulator-root\t{}\n",
+        hex::encode(g.coherence_accumulator_root)
+    ));
+    s.push_str(&format!(
+        "coherence-nullifier-root\t{}\n",
+        hex::encode(g.coherence_nullifier_root)
+    ));
     for o in &g.outputs {
         // Allocation lines carry the bucket label; holder lines do not need
         // one (the kind IS the label). Both end with the same four consensus
@@ -873,10 +1089,29 @@ mod tests {
     );
     const KAT2_DIGEST: &str = "56fd34b03db649caccb277407577c66cb279269ff96e9ecb9b1269e60400eecf";
 
+    /// The canonical empty-pool artifact — what the (provably empty) mainnet
+    /// pool publishes.
+    fn empty_pool() -> CoherencePool {
+        read_coherence(COHERENCE_EMPTY_ARTIFACT).unwrap()
+    }
+
+    /// [`build_genesis`] with the empty pool attested — the fixture every
+    /// pre-existing test uses; pool-specific tests build their own artifacts.
+    fn build(
+        carry: &Carryover,
+        addrs: &BucketAddrs,
+        cohort: &[GenesisValidator],
+        expected_digest: &[u8; 32],
+    ) -> Result<Genesis, String> {
+        let pool = empty_pool();
+        let pool_digest = pool.digest;
+        build_genesis(carry, addrs, cohort, expected_digest, &pool, &pool_digest)
+    }
+
     fn kat_genesis() -> Genesis {
         let carry = read_carryover(KAT2_TEXT).unwrap();
         let expected: [u8; 32] = hex::decode(KAT2_DIGEST).unwrap().try_into().unwrap();
-        build_genesis(&carry, &addrs(), &test_cohort(), &expected).unwrap()
+        build(&carry, &addrs(), &test_cohort(), &expected).unwrap()
     }
 
     // ── Digest: cross-language agreement and fail-closed behaviour ─────────
@@ -900,7 +1135,7 @@ mod tests {
         let carry = read_carryover(KAT2_TEXT).unwrap();
         let mut wrong = carry.digest;
         wrong[0] ^= 1;
-        let err = build_genesis(&carry, &addrs(), &test_cohort(), &wrong).unwrap_err();
+        let err = build(&carry, &addrs(), &test_cohort(), &wrong).unwrap_err();
         assert!(err.contains("digest mismatch"), "{err}");
     }
 
@@ -916,7 +1151,7 @@ mod tests {
         let bad = read_carryover(&tampered).unwrap();
         assert_eq!(good.total_sat, bad.total_sat, "fixture must keep the total fixed");
         assert_ne!(good.digest, bad.digest);
-        assert!(build_genesis(&bad, &addrs(), &test_cohort(), &good.digest).is_err());
+        assert!(build(&bad, &addrs(), &test_cohort(), &good.digest).is_err());
     }
 
     #[test]
@@ -992,7 +1227,7 @@ mod tests {
         let text = KAT2_TEXT.replace("22770940000000000", "22770940000000001");
         let carry = read_carryover(&text).unwrap();
         let digest = carry.digest;
-        let err = build_genesis(&carry, &addrs(), &test_cohort(), &digest).unwrap_err();
+        let err = build(&carry, &addrs(), &test_cohort(), &digest).unwrap_err();
         assert!(err.contains("carryover total"), "{err}");
     }
 
@@ -1115,15 +1350,15 @@ mod tests {
 
         let mut dup = addrs();
         dup.vc = dup.founder.clone();
-        assert!(build_genesis(&carry, &dup, &cohort, &digest).is_err());
+        assert!(build(&carry, &dup, &cohort, &digest).is_err());
 
         let mut in_carry = addrs();
         in_carry.team = "aa".repeat(20); // present in the artifact
-        assert!(build_genesis(&carry, &in_carry, &cohort, &digest).is_err());
+        assert!(build(&carry, &in_carry, &cohort, &digest).is_err());
 
         let mut bad_hex = addrs();
         bad_hex.marketing = "zz".repeat(20);
-        assert!(build_genesis(&carry, &bad_hex, &cohort, &digest).is_err());
+        assert!(build(&carry, &bad_hex, &cohort, &digest).is_err());
     }
 
     // ── Genesis validator cohort (§3.3) ────────────────────────────────────
@@ -1138,9 +1373,9 @@ mod tests {
         let carry = read_carryover(KAT2_TEXT).unwrap();
         let digest = carry.digest;
         let short = read_cohort(&cohort_text(GENESIS_COHORT_FLOOR - 1)).unwrap();
-        let err = build_genesis(&carry, &addrs(), &short, &digest).unwrap_err();
+        let err = build(&carry, &addrs(), &short, &digest).unwrap_err();
         assert!(err.contains("floor"), "{err}");
-        assert!(build_genesis(&carry, &addrs(), &[], &digest).is_err());
+        assert!(build(&carry, &addrs(), &[], &digest).is_err());
         // The floor is the spec's 64 (2 attesters × 32 slots).
         assert_eq!(GENESIS_COHORT_FLOOR, 64);
     }
@@ -1175,7 +1410,7 @@ mod tests {
         let greedy = read_cohort(&text).unwrap();
         let carry = read_carryover(KAT2_TEXT).unwrap();
         let digest = carry.digest;
-        let err = build_genesis(&carry, &addrs(), &greedy, &digest).unwrap_err();
+        let err = build(&carry, &addrs(), &greedy, &digest).unwrap_err();
         assert!(err.contains("liquidity"), "{err}");
     }
 
@@ -1239,31 +1474,31 @@ mod tests {
         // Duplicate pubkey.
         let mut dup_pk = test_cohort();
         dup_pk[1].pubkey = dup_pk[0].pubkey.clone();
-        let err = build_genesis(&carry, &addrs(), &dup_pk, &digest).unwrap_err();
+        let err = build(&carry, &addrs(), &dup_pk, &digest).unwrap_err();
         assert!(err.contains("share a pubkey"), "{err}");
 
         // Duplicate RANDAO commitment (copy-pasted seed).
         let mut dup_c0 = test_cohort();
         dup_c0[1].randao_commitment = dup_c0[0].randao_commitment;
-        let err = build_genesis(&carry, &addrs(), &dup_c0, &digest).unwrap_err();
+        let err = build(&carry, &addrs(), &dup_c0, &digest).unwrap_err();
         assert!(err.contains("RANDAO commitment"), "{err}");
 
         // Missing commitment: a validator that can never propose.
         let mut no_c0 = test_cohort();
         no_c0[3].randao_commitment = [0u8; 32];
-        let err = build_genesis(&carry, &addrs(), &no_c0, &digest).unwrap_err();
+        let err = build(&carry, &addrs(), &no_c0, &digest).unwrap_err();
         assert!(err.contains("RANDAO"), "{err}");
 
         // Sub-minimum stake.
         let mut dust = test_cohort();
         dust[5].stake_sat = MIN_DEPOSIT_SAT - 1;
-        let err = build_genesis(&carry, &addrs(), &dust, &digest).unwrap_err();
+        let err = build(&carry, &addrs(), &dust, &digest).unwrap_err();
         assert!(err.contains("MIN_DEPOSIT_SAT"), "{err}");
 
         // Stake that cannot enter u64 sortition arithmetic.
         let mut wide = test_cohort();
         wide[6].stake_sat = u64::MAX as u128 + 1;
-        assert!(build_genesis(&carry, &addrs(), &wide, &digest).is_err());
+        assert!(build(&carry, &addrs(), &wide, &digest).is_err());
     }
 
     #[test]
@@ -1360,5 +1595,243 @@ mod tests {
         assert_eq!(read_cohort(&validator_lines).unwrap(), g.validators);
         // Digest of the document is stable.
         assert_eq!(document_digest(&doc), document_digest(&render_document(&g)));
+        // The Coherence carriage is in the document: both roots, both counts,
+        // and the artifact digest — what the loader copies into
+        // `CommittedState::genesis`.
+        assert!(doc.contains(&format!(
+            "coherence-accumulator-root\t{}",
+            hex::encode(g.coherence_accumulator_root)
+        )));
+        assert!(doc.contains(&format!(
+            "coherence-nullifier-root\t{}",
+            hex::encode(g.coherence_nullifier_root)
+        )));
+        assert!(doc.contains(&format!(
+            "coherence-artifact-shake256\t{}",
+            hex::encode(g.coherence_digest)
+        )));
+        assert!(doc.contains("coherence-leaves\t0"));
+        assert!(doc.contains("coherence-nullifiers\t0"));
+    }
+
+    // ── Coherence carriage (§6.6.1) — gate G11's seam, at unit scale ───────
+
+    /// A note commitment fixture (C1-frozen formats from coherence-core).
+    fn g3_note(v: u64, tag: u8) -> coherence_core::Note {
+        coherence_core::Note {
+            v,
+            pk_d: [tag; 32],
+            rho: [tag ^ 0x55; 32],
+            psi: [tag ^ 0xAA; 32],
+        }
+    }
+
+    /// Render a pool artifact the way the Genesis-3 exporter must: leaves in
+    /// tree-position order, nullifiers sorted ascending.
+    fn pool_artifact(leaves: &[[u8; 32]], nullifiers: &[[u8; 32]]) -> String {
+        let mut s = format!("{COHERENCE_ARTIFACT_HEADER}\n");
+        for cm in leaves {
+            s.push_str(&format!("leaf\t{}\n", hex::encode(cm)));
+        }
+        let mut nfs = nullifiers.to_vec();
+        nfs.sort();
+        for nf in &nfs {
+            s.push_str(&format!("nullifier\t{}\n", hex::encode(nf)));
+        }
+        s
+    }
+
+    fn genesis_with_pool(pool: &CoherencePool) -> Genesis {
+        let carry = read_carryover(KAT2_TEXT).unwrap();
+        let digest = carry.digest;
+        let pool_digest = pool.digest;
+        build_genesis(&carry, &addrs(), &test_cohort(), &digest, pool, &pool_digest).unwrap()
+    }
+
+    #[test]
+    fn coherence_digest_matches_python_convention() {
+        // Known answers from CPython's hashlib.shake_256 — same cross-language
+        // pin as the carryover artifact, so an operator can attest the pool
+        // with stock tooling.
+        assert_eq!(
+            hex::encode(empty_pool().digest),
+            "aeccc4ab433a08d20f122e3ed9581820aeb9f7fd70a918585091d9b6639d2947"
+        );
+        let text = pool_artifact(&[[0xaa; 32], [0xbb; 32]], &[[0xcc; 32]]);
+        assert_eq!(
+            hex::encode(read_coherence(&text).unwrap().digest),
+            "7ae164e762928b624fcc08bed389ca93ecaffb10f26660592a44df0b9a8bcca9"
+        );
+    }
+
+    #[test]
+    fn empty_pool_commits_a_real_root_never_the_zero_sentinel() {
+        // The old genesis stamped coherence_root = [0u8; 32] — a magic
+        // constant no derivation produces, so nothing could ever validate it.
+        // Now even the empty pool is a hash output all the way up.
+        let g = kat_genesis();
+        assert_eq!(g.coherence_accumulator_root, CommitmentTree::new().root());
+        assert_eq!(g.coherence_nullifier_root, nullifier_set_root(&[]));
+        let h = genesis_header(&g);
+        assert_eq!(
+            h.coherence_root,
+            coherence_binding(&g.coherence_accumulator_root, &g.coherence_nullifier_root)
+        );
+        assert_ne!(h.coherence_root, [0u8; 32]);
+    }
+
+    #[test]
+    fn leaf_order_is_consensus() {
+        // F8: nf = SHAKE256(DOM_NF ‖ nk ‖ rho ‖ LE64(position)) — the leaf
+        // ordering is consensus, so two artifacts with the same leaves in a
+        // different order are DIFFERENT chains, visibly.
+        let a = read_coherence(&pool_artifact(&[[0x01; 32], [0x02; 32]], &[])).unwrap();
+        let b = read_coherence(&pool_artifact(&[[0x02; 32], [0x01; 32]], &[])).unwrap();
+        assert_ne!(a.accumulator_root(), b.accumulator_root());
+        assert_ne!(
+            genesis_header(&genesis_with_pool(&a)).block_id(),
+            genesis_header(&genesis_with_pool(&b)).block_id()
+        );
+    }
+
+    #[test]
+    fn dropping_a_nullifier_is_a_different_chain() {
+        // The revive-a-spent-note attack, made visible: a pool artifact
+        // missing one published nullifier produces a different nullifier
+        // root, state_root and block_id — and an unattested artifact refuses.
+        let leaves = [[0x01u8; 32], [0x02; 32]];
+        let full = read_coherence(&pool_artifact(&leaves, &[[0x0a; 32], [0x0b; 32]])).unwrap();
+        let dropped = read_coherence(&pool_artifact(&leaves, &[[0x0a; 32]])).unwrap();
+        let g_full = genesis_with_pool(&full);
+        let g_dropped = genesis_with_pool(&dropped);
+        assert_ne!(g_full.coherence_nullifier_root, g_dropped.coherence_nullifier_root);
+        assert_ne!(state_root(&g_full), state_root(&g_dropped));
+        assert_ne!(
+            genesis_header(&g_full).block_id(),
+            genesis_header(&g_dropped).block_id()
+        );
+
+        // Fail-closed against the published digest (the §3.2.2 posture,
+        // applied to the pool).
+        let carry = read_carryover(KAT2_TEXT).unwrap();
+        let digest = carry.digest;
+        let err = build_genesis(&carry, &addrs(), &test_cohort(), &digest, &dropped, &full.digest)
+            .unwrap_err();
+        assert!(err.contains("coherence digest mismatch"), "{err}");
+    }
+
+    #[test]
+    fn shield_before_spend_after_crosses_the_seam() {
+        // G11 at unit scale: notes shielded on "Genesis-3", the chain halts,
+        // the pool crosses through the artifact, and on "Genesis-4":
+        //   (a) an old witness still proves membership against the carried
+        //       root (spend-after works, position intact);
+        //   (b) the full C1 spend statement accepts the old note against the
+        //       carried anchor;
+        //   (c) the spent note's nullifier is in the carried set (double-
+        //       spends stay rejectable);
+        //   (d) new appends continue at position = leaf_count, so no future
+        //       nullifier can collide with a carried one by position reuse.
+        let nk = [0x07u8; 32];
+        let mut g3 = CommitmentTree::new();
+        let spent = g3_note(500, 1);
+        let kept = g3_note(1_000, 2);
+        let spent_pos = g3.append(spent.commitment());
+        let kept_pos = g3.append(kept.commitment());
+        let spent_nf = spent.nullifier(&nk, spent_pos);
+        let kept_witness = g3.path(kept_pos).unwrap(); // computed pre-halt
+
+        // The halt: export the pool exactly as it stands.
+        let leaves = [spent.commitment(), kept.commitment()];
+        let pool = read_coherence(&pool_artifact(&leaves, &[spent_nf])).unwrap();
+        let g4 = genesis_with_pool(&pool);
+
+        // (a) old witness, carried root.
+        assert_eq!(g4.coherence_accumulator_root, g3.root());
+        assert!(coherence_core::verify_path(
+            &kept.commitment(),
+            kept_pos,
+            &kept_witness,
+            &g4.coherence_accumulator_root,
+        ));
+
+        // (b) the exact statement the SP1 circuit proves, against the carried
+        // anchor: spend `kept` into a new G4 note + fee.
+        let out = g3_note(900, 3);
+        let public = coherence_core::SpendPublic {
+            anchor: g4.coherence_accumulator_root,
+            nullifiers: vec![kept.nullifier(&nk, kept_pos)],
+            out_commitments: vec![out.commitment()],
+            fee: 100,
+        };
+        let witness = coherence_core::SpendWitness {
+            inputs: vec![coherence_core::SpendInput {
+                note: kept.clone(),
+                position: kept_pos,
+                path: kept_witness,
+                nk,
+            }],
+            outputs: vec![out],
+        };
+        assert_eq!(coherence_core::check_spend(&public, &witness), Ok(()));
+
+        // (c) the spent nullifier crossed — Genesis-4 can reject its replay.
+        assert!(pool.nullifiers.contains(&spent_nf));
+        assert_eq!(g4.coherence_nullifier_count, 1);
+
+        // (d) position continuity: the next append lands at leaf_count.
+        let mut g4_tree = CommitmentTree::new();
+        for cm in &pool.leaves {
+            g4_tree.append(*cm);
+        }
+        let new_note = g3_note(42, 9);
+        let new_pos = g4_tree.append(new_note.commitment());
+        assert_eq!(new_pos, g4.coherence_leaf_count);
+        assert!(coherence_core::verify_path(
+            &new_note.commitment(),
+            new_pos,
+            &g4_tree.path(new_pos).unwrap(),
+            &g4_tree.root(),
+        ));
+    }
+
+    #[test]
+    fn coherence_parser_is_strict() {
+        let hexa = "aa".repeat(32);
+        let hexb = "bb".repeat(32);
+        for (bad, why) in [
+            ("".to_string(), "zero-byte file"),
+            ("bloch-coherence-carryover\t2\n".to_string(), "wrong version"),
+            (format!("leaf\t{hexa}\n"), "missing header line"),
+            (
+                format!("{COHERENCE_ARTIFACT_HEADER}\nnullifier\t{hexa}\nleaf\t{hexb}\n"),
+                "leaf after nullifier",
+            ),
+            (
+                format!("{COHERENCE_ARTIFACT_HEADER}\nleaf\t{hexa}\nleaf\t{hexb}\nnullifier\t{hexb}\nnullifier\t{hexa}\n"),
+                "nullifiers not ascending",
+            ),
+            (
+                format!("{COHERENCE_ARTIFACT_HEADER}\nleaf\t{hexa}\nleaf\t{hexb}\nnullifier\t{hexa}\nnullifier\t{hexa}\n"),
+                "duplicate nullifier",
+            ),
+            (
+                format!("{COHERENCE_ARTIFACT_HEADER}\nleaf\t{}\n", "AA".repeat(32)),
+                "uppercase hex",
+            ),
+            (
+                format!("{COHERENCE_ARTIFACT_HEADER}\nnullifier\t{hexa}\n"),
+                "more nullifiers than leaves",
+            ),
+            (
+                format!("{COHERENCE_ARTIFACT_HEADER}\nnote\t{hexa}\n"),
+                "unknown record kind",
+            ),
+        ] {
+            assert!(read_coherence(&bad).is_err(), "accepted ({why}): {bad:?}");
+        }
+        // And the canonical empty artifact parses to the empty pool.
+        let p = empty_pool();
+        assert!(p.leaves.is_empty() && p.nullifiers.is_empty());
     }
 }

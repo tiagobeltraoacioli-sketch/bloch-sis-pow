@@ -119,18 +119,51 @@ chain in public. The tool is fail-closed in both directions: it recomputes
 the digest from the artifact bytes and refuses to build unless it matches the
 digest passed in from the published record.
 
+## The Coherence pool crosses as leaves, not balances — §6.6.1
+
+The carryover TSV aggregates by address; a shielded note cannot survive that
+way. Its nullifier binds its **leaf position** in the commitment tree
+(`nf = SHAKE256(DOM_NF ‖ nk ‖ rho ‖ LE64(position))`, C1 §1.3), so the pool
+crosses as a second artifact carrying the tree leaves **in exact position
+order** plus the complete nullifier set:
+
+```
+bloch-coherence-carryover<TAB>1
+leaf<TAB><64-hex cm>          # tree-position order — this order is consensus
+nullifier<TAB><64-hex nf>     # sorted ascending, the complete spent set
+```
+
+Dropped leaves burn every unspent note; a dropped nullifier set revives every
+spent one; reordered leaves change every future nullifier. The ceremony
+replays the leaves through the C1-frozen `coherence-core` tree, commits the
+accumulator root, the nullifier-set root (interim `DS_NFSET` commitment —
+pending the C1.1 SMT rev), both counts and the artifact digest into
+`state_root`, and stamps `coherence_root` with the §6.6.2 mirror binding
+(`derive::coherence_binding`). The document's `coherence-accumulator-root` /
+`coherence-nullifier-root` lines are what the node's genesis loader feeds
+`CommittedState::genesis`, verbatim.
+
+On the current mainnet the pool is **provably empty** (the verifier fails
+closed and no shield bridge exists), so the mainnet artifact is the one-line
+header file — still required, still digest-checked: "empty" is an attested
+input, not an assumption.
+
 ## Runbook
 
 ```bash
 # 0. inputs: the artifact from tools/genesis4-carryover and its PUBLISHED
 #    digest (from the halt announcement — not recomputed from the same file),
-#    plus the cohort file assembled per docs/specs/BLOCH-GENESIS-KEYS.md.
+#    the Coherence pool artifact and ITS published digest (for the empty
+#    mainnet pool: printf 'bloch-coherence-carryover\t1\n'), plus the cohort
+#    file assembled per docs/specs/BLOCH-GENESIS-KEYS.md.
 gunzip -k genesis4-carryover.tsv.gz   # ceremony reads plain bytes only
 
 # 1. assemble
 cargo run --release -- \
     --carryover genesis4-carryover.tsv \
     --carryover-shake256 <published 64-hex digest> \
+    --coherence genesis4-coherence.tsv \
+    --coherence-shake256 <published 64-hex digest> \
     --cohort genesis4-cohort.tsv \
     --founder <addr40> --vc <addr40> --team <addr40> \
     --marketing <addr40> --liquidity <addr40> \
@@ -161,9 +194,14 @@ posture `chain_requires_carryover` gives Genesis-3.
   entropy is pinned to the record. The cohort's own chains take over from
   slot 1 — each member's `c_0` is in its cohort leaf, already inside
   `state_root`.
-- Checkpoint roots, `body_root`, `attestation_root`, `coherence_root` are
-  all-zeros: genesis is its own finalized checkpoint, the body is empty, the
-  shielded pool starts empty.
+- Checkpoint roots, `body_root` and `attestation_root` are all-zeros:
+  genesis is its own finalized checkpoint, the body is empty, there are no
+  attestations.
+- `coherence_root` is **not** zeros: it is the §6.6.2 mirror binding of the
+  carried pool's accumulator and nullifier-set roots — the same
+  `derive::coherence_binding` every child-block validator re-derives. Even
+  the empty pool commits a real digest; "empty" is a hash output, never a
+  magic constant.
 
 ## Tests
 
@@ -171,7 +209,7 @@ posture `chain_requires_carryover` gives Genesis-3.
 cargo test
 ```
 
-Twenty tests covering: the sum of allocations + bonded stake + emission is
+The tests cover: the sum of allocations + bonded stake + emission is
 exactly 21,000,000,000 BLCH; the bucket values and schedules match the §1
 table (founder 10-year cliff / 40-year linear); no lock absent; slot-exact
 agreement between the carried schedules and the `tokenomics_v4` closed forms;
@@ -181,4 +219,11 @@ bucket-address collisions; the cohort — floor of 64 enforced, funded from
 liquidity with the accounting still closing, inside the block identity
 (stake, commitment, and count all move `block_id`), indices consumable by
 `apply_cohort_cap` end-to-end, malformed cohorts refused, parser strict; and
-that digest, locks and cohort are all bound into `block_id`.
+that digest, locks and cohort are all bound into `block_id`; and the
+Coherence carriage — cross-language digest KAT, the empty pool committing the
+real empty-tree root (never `[0u8; 32]`), leaf order as consensus (reordering
+moves `block_id`), a dropped nullifier being a visibly different chain, a
+strict parser, and a unit-scale shield-before/spend-after crossing: an old
+witness verifying against the carried root, the full C1 spend statement
+accepting against the carried anchor, the spent nullifier present after the
+seam, and new appends continuing at `position = leaf_count`.
