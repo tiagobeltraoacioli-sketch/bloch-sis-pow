@@ -4,7 +4,10 @@
 
 Document: CERTIK-PRE-AUDIT-DOSSIER
 Status: DRAFT for founder review — prepared before engagement, to be handed to CertiK
-Prepared: 2026-08-12, against commit `84ca42a` on branch `integration/pos-modules`
+Prepared: 2026-08-12, against branch `integration/pos-modules` at `470b608`
+Supersedes: the 2026-08-12 draft prepared at `84ca42a`, which predates the
+100-billion redenomination, the supply-cap consensus invariant and the halt
+height moving to 50,000
 Repository: `gitlab.com/blochsispow-group/bloch-pos` (private at time of writing — see check 20)
 License: AGPL-3.0-or-later (repo `LICENSE`; workspace `Cargo.toml:24`)
 
@@ -48,11 +51,51 @@ Verdicts used below:
 
 ---
 
+## 0.1 Decisions of record — what changed on 2026-08-12
+
+An auditor reading an earlier copy of this dossier will find different numbers.
+These are the changes, and the reason each is stated here rather than quietly
+folded in is that a document whose figures move without a record is worth
+nothing to an auditor.
+
+| Decision | Before | Now | Where it lives |
+|---|---|---|---|
+| Total supply | 21,000,000,000 (superseded) | **100,000,000,000** | `tokenomics_v4.rs` |
+| Method | — | Pure redenomination, ratio `100/21` applied to every allocation. Shares unchanged, nobody diluted. Compile-time assertions prove each bucket scaled by the same ratio. | `tokenomics_v4.rs` (`SPLIT_NUMERATOR`/`SPLIT_DENOMINATOR`) |
+| Supply cap | Constant respected by construction | **Consensus invariant.** Cumulative issued supply is a committed state component; a block whose pre-state exceeds the cap is rejected. | `state_root.rs` tag `0x14`; `transition.rs` (`SupplyCapExceeded`) |
+| Validator bond | 100,000 BLCH (superseded) | **25,000 BLCH** — Ethereum's 32 ETH as the same fraction of supply, rounded down | `staking.rs` |
+| Genesis-3 halt | height 80,000 | **height 50,000** | `crates/bloch-crypto/src/core/mod.rs` |
+
+Three consequences that are costs, not details, and that an auditor should see
+named rather than discover:
+
+1. **10^19 satoshis does not fit a signed 64-bit integer.** The supply is 54.2%
+   of `u64::MAX` and 108% of `i64::MAX`. Every quantity inside the consensus
+   crate is `u128` and unaffected. The Go SDK types `Satoshis` as `int64` and
+   **must migrate before Genesis-4 ships**; so must any exchange integration
+   that made the same choice. The compile-time assertion was inverted to state
+   this rather than deleted.
+2. **The emission curve had to be re-derived, not scaled.** It is denominated in
+   absolute satoshis, so leaving it unchanged would have cut year-one inflation
+   from 4.37% to 0.91% — a monetary policy change wearing the costume of a unit
+   change. Multiplying it by `100/21` instead *overshot* the allocation by
+   65,042,160 sat, because integer truncation inside the per-slot division does
+   not commute with scaling. The constant is now the largest value whose 40-year
+   sum stays under the allocation, found by binary search over the emitter's own
+   recurrence, leaving 176,880 sat unissued.
+3. **Per-address conversion cannot be exact.** `100/21` never divides a power of
+   ten, so no choice of decimal places makes individual balances scale exactly.
+   Conversion is floor division; the remainder is absorbed by the founder's
+   carried-over balance so the total closes at the cap. Bucket totals *are*
+   exact — every allocation is already a multiple of 21 million.
+
+---
+
 ## 1. The token-scan checklist, answered for an L1
 
 The WBNB model scan evaluates the 23 checks below (scored 22 passed,
 1 attention — the attention being major-holder ratio at 39.28%). File
-references are to this repository at commit `84ca42a`.
+references are to this repository at `470b608`.
 
 | # | Check | Applies to Bloch? | Verdict | Evidence |
 |---|---|---|---|---|
