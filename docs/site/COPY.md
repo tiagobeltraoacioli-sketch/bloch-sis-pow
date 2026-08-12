@@ -191,7 +191,7 @@ kind of fact projects usually leave implicit until it lands on someone.
 
 Two more honest costs of this step:
 
-- The halt height was lowered from 50,000 to 50,000 on 2026-08-12. The notice
+- The halt height was lowered from 80,000 to 50,000 on 2026-08-12. The notice
   period is therefore measured in **days, not months**. Holders lose nothing
   by short notice — balances are captured automatically — but miners planning
   around the earlier height lost planning time, and that is on us.

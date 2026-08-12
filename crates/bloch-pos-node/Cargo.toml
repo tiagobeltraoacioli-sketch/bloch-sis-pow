@@ -27,7 +27,9 @@ publish = false
 # Genesis-3 node it succeeds. That ruling is what makes the bloch-crypto
 # dependency below legal: AGPL is viral and the whole binary inherits it,
 # which is now the declared license rather than a contradiction.
-[workspace]
+#
+# Member of the root workspace since Genesis-4 became the trunk (see the same
+# note in bloch-pos-committee/Cargo.toml).
 
 [[bin]]
 name = "bloch-pos"

@@ -6,9 +6,10 @@ license = "AGPL-3.0-or-later"
 description = "Bloch PoS — per-slot fork-choice subcommittee and epoch finality committee: deterministic stake-weighted sampling, attestation types, and LMD-GHOST weight accumulation. UNAUDITED, not wired into the node."
 publish = false
 
-# Standalone: NOT a member of the node workspace, exactly like
-# crates/coherence-prover. Nothing here can affect the live validation path.
-[workspace]
+# Member of the root workspace since Genesis-4 became the trunk. It was
+# standalone while PoS could not affect the live PoW validation path; keeping it
+# standalone now would mean `cargo test --workspace` silently skips the entire
+# consensus layer — the opposite of what an audit needs.
 
 [dependencies]
 sha3 = { version = "0.10", default-features = false }

@@ -10,6 +10,12 @@ members = [
     "crates/bloch-euvm", "crates/bloch-ffg",  # eUTXO VM + FFG committee (optional, behind `euvm` feature)
     "crates/bloch-btc-wallet",
     "crates/bloch-pq-vault",   # non-custodial PQ-shield vault (P2WSH commit-delay-reveal + PQ clawback anchor)
+    # Genesis-4 proof-of-stake. These were developed as a separate workspace and
+    # were therefore invisible to `cargo check/test --workspace` at the root —
+    # the first command any reviewer runs tested the retired PoW node and none
+    # of the PoS consensus. They are members now so that stays impossible.
+    "crates/bloch-pos-committee",
+    "crates/bloch-pos-node",
 ]
 # coherence-prover (SP1 guest/script/service) + fuzz use heavy/nightly-only
 # toolchains; keep them out of the everyday workspace build.

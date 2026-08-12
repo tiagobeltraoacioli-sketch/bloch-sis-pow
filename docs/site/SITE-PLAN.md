@@ -19,7 +19,7 @@ still says otherwise, that is flagged, not followed.
 
 | Fact | Value | Source |
 |---|---|---|
-| Genesis-3 terminal height | **50,000** (lowered from 50,000 on 2026-08-12) | `docs/FLEET-BRIEF-CERTIK-2026-08-12.md` §Decisions item 4. `BLOCH-ECOSYSTEM-MIGRATION.md` and `BLOCH-TOKENOMICS-V4.md` §3.1 still say 50,000 — **stale, do not copy**. |
+| Genesis-3 terminal height | **50,000** (lowered from 80,000 on 2026-08-12) | `docs/FLEET-BRIEF-CERTIK-2026-08-12.md` §Decisions item 4. `BLOCH-ECOSYSTEM-MIGRATION.md` and `BLOCH-TOKENOMICS-V4.md` §3.1 still say 80,000 — **stale, do not copy**. |
 | Consensus after migration | Proof of stake (slots/epochs, LMD-GHOST, Casper-style finality, PQ signatures) | `crates/bloch-pos-committee/`, `docs/specs/BLOCH-POS-SHA3-LATTICE-MIGRATION.md` |
 | Total supply | **100,000,000,000 BLCH — published as "under review"**. The 100 B redenomination is **blocked by an open arithmetic problem and must not appear on the site.** | `crates/bloch-pos-committee/src/tokenomics_v4.rs:33` (`TOTAL_SUPPLY_BLOCH = 21_000_000_000`) |
 | Validator bond | The Ethereum fraction of supply (32 ETH ≈ 2.66e-7 of ETH supply). Under the 21 B denomination that is **25,000 BLCH** — `MIN_DEPOSIT_SAT = 5_600 * SAT_PER_BLOCH`. Published tied to the supply's "under review" flag. | `crates/bloch-pos-committee/src/staking.rs:119` |

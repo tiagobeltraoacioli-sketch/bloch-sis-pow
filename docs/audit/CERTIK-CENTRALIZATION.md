@@ -50,7 +50,7 @@ the measured commit:
    chain-wide rounding rule (direction and dust disposition) or two
    implementations will disagree at the satoshi level. None of this changes
    any percentage in this document: a pure split moves no share.
-2. **Genesis-3 terminal height 50,000 → 50,000.** The repo pins 50,000
+2. **Genesis-3 terminal height 80,000 → 50,000.** The repo pins 50,000
    (`crates/bloch-crypto/src/core/mod.rs:438`); the main checkout carries the
    50,000 edit uncommitted. §6 discusses what this reversal demonstrates.
 
@@ -294,7 +294,7 @@ L1 — who can change the rules):
 |---|---|---|
 | Write consensus rules (the node source) | Postern Labs Ltda (exists; founder-owned) | Nothing but operator adoption |
 | Deploy rules to the network | The fleet's operators — currently the founder's ~3 boxes | See §5: adoption ≈ founder consent today |
-| Set/move the terminal height | Demonstrated: founder moved it 50,000 → 50,000 on 2026-08-12 unilaterally | §6 |
+| Set/move the terminal height | Demonstrated: founder moved it 80,000 → 50,000 on 2026-08-12 unilaterally | §6 |
 | Sign the canonical snapshot | Founder / Postern Labs keys | Publication breadth is the only check (spec §3.2.2) |
 | Sign weak-subjectivity checkpoints | Foundation (per ADR-036) | Phased m-of-n with external-signer minimum, `BLOCH-WEAK-SUBJECTIVITY.md` §6 |
 | Allocate the genesis validator cohort | Founder (funds and operates it) | Consensus taper to ≤ 1/3 within a year, `genesis_cohort.rs` — cohort addresses only |
@@ -455,7 +455,7 @@ into the Genesis-4 genesis block (§3.2.2).
 **Where the analogy does NOT fail — the residual truth in the auditor's
 question, stated so they do not have to extract it:**
 
-- The date is set, and was **moved**, unilaterally: 50,000 → 50,000 on
+- The date is set, and was **moved**, unilaterally: 80,000 → 50,000 on
   2026-08-12, cutting public notice from ~2 weeks to ~4.4 days. The spec's
   own §3.1 argued the height should land before the (since-retired) cap
   bound and that shorter notice is *better* here because notice only enables

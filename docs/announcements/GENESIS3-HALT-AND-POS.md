@@ -22,7 +22,7 @@
 - Between the halt and the Genesis-4 launch there will be a period of
   **several months with no running chain**. The explorer at
   [blochl1.com](https://blochl1.com) stays online serving history.
-- On Genesis-4 the total supply is redenominated from 100,000,000,000 to
+- On Genesis-4 the total supply is redenominated from 21,000,000,000 to
   **100,000,000,000 BLCH as a pure split (×4.7619)**. Every balance is
   multiplied by the same factor; every percentage stays identical. Nobody
   gains, nobody is diluted. It is not new money.

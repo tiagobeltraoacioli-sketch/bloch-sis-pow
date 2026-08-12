@@ -435,7 +435,13 @@ pub const fn chain_requires_carryover(id: ChainId) -> bool {
 //      depend on a chain nobody is defending.
 
 /// Last valid height on the Genesis-3 mainnet. Blocks ABOVE this are invalid.
-pub const GENESIS3_TERMINAL_HEIGHT: u64 = 80_000;
+//
+// LOWERED 80,000 -> 50,000 on 2026-08-12 (founder decision), matching
+// deploy/g3-terminal-50000 — the tree the fleet's running binary was built
+// from. The trunk carried 80,000 until now, which meant anyone building a node
+// from this repository got one that keeps accepting blocks above 50,000: it
+// would not halt with the network, and the halt itself would become the fork.
+pub const GENESIS3_TERMINAL_HEIGHT: u64 = 50_000;
 
 /// The terminal height for `id`, if that chain has one.
 ///
@@ -3064,7 +3070,7 @@ mod chain_id_tests {
     fn terminal_height_only_retires_genesis3() {
         // Exhaustive by construction; this pins the intent so a future chain-id
         // cannot quietly inherit a terminal height it was never meant to have.
-        assert_eq!(terminal_height(ChainId::Genesis3Mainnet), Some(80_000));
+        assert_eq!(terminal_height(ChainId::Genesis3Mainnet), Some(50_000));
         assert_eq!(terminal_height(ChainId::Mainnet), None);
         assert_eq!(terminal_height(ChainId::Testnet), None);
         assert_eq!(terminal_height(ChainId::Genesis2Devnet), None);
