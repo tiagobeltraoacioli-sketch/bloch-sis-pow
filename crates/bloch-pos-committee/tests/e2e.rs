@@ -544,7 +544,7 @@ mod harness {
                 post.finality
                     .process_epoch(&EpochVotes {
                         epoch: e,
-                        committee: &committee,
+                        active_set: &committee,
                         attestations: &pre.pending_votes,
                     })
                     .expect("epochs are processed densely and in order");
