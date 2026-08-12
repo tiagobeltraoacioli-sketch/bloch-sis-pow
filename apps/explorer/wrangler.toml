@@ -19,7 +19,7 @@ pages_build_output_dir = "dist"
 #
 # Deploy (production → blochl1.com):
 #   npm run build
-#   CLOUDFLARE_ACCOUNT_ID=4e44d592d0229f8faa3fdb2f139c611c \
+#   CLOUDFLARE_ACCOUNT_ID=CLOUDFLARE_ACCOUNT_ID \
 #     npx wrangler pages deploy dist --project-name bloch-explorer --branch main --commit-dirty=true
 
 [vars]

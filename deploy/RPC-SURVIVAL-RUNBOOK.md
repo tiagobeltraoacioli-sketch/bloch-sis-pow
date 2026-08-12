@@ -2,6 +2,13 @@
 
 # RPC survival runbook — Genesis-3 halt at height 80,000
 
+> **Redacted for publication.** Host addresses by role, SSH key filenames, Cloudflare
+> account/zone/tunnel identifiers, per-box free disk and RAM, and firewall rule listings
+> were replaced with placeholders. None of them were secrets — together they were an
+> operational map of a three-box fleet, which is a different thing and not worth publishing.
+> The technique is intact; the inventory is not. Operators substitute their own.
+
+
 **Status: EXECUTED 2026-08-12 (founder instruction). Two of this document's
 findings were wrong and are corrected in §0 below — the plan as written could
 not have worked.** §2's measurements were read-only and stand except where §0
@@ -59,7 +66,7 @@ no longer depends on `g2rpc.posternpool.com`, the tier that dies with the pool.
 to the IP in its own name. It works, and it puts a third party in the resolution
 path of the RPC tier that has to outlive the pool for six months. The durable
 value is `http://rpc.blochl1.com/`, a **DNS-only (grey-cloud)** A record for
-136.244.82.226 in the `blochl1.com` zone (id `5a6516857f3d9fe9ac91c9c5b253b481`).
+136.244.82.226 in the `blochl1.com` zone (id `CLOUDFLARE_ZONE_ID`).
 That record was not created here because the available Cloudflare token carries
 `zone:read`, not DNS write. Once it exists: change the one line in
 `apps/explorer/wrangler.toml` and redeploy. Nothing else moves.
@@ -92,7 +99,7 @@ is roughly four days more runway than assumed. If hashrate rises, it shrinks.*
 | Hostname | Measured result | Verdict |
 |---|---|---|
 | `g2rpc.posternpool.com` | A 104.21.18.46 / 172.67.180.98 (Cloudflare-proxied) | **LIVE** — the only working public RPC. Answers `getblockcount` = 44,062+. |
-| `g2rpc.blochl1.com` | **NOT NXDOMAIN** — DNS-only CNAME → `3e88eb2e-2901-4030-b56f-73bfa7197663.cfargotunnel.com` | **Dead in practice**: browsers/curl cannot resolve it (`curl: (6)`), because a cfargotunnel CNAME only works when the record is Proxied. *Corrects the brief's "was NXDOMAIN".* |
+| `g2rpc.blochl1.com` | **NOT NXDOMAIN** — DNS-only CNAME → `TUNNEL_UUID.cfargotunnel.com` | **Dead in practice**: browsers/curl cannot resolve it (`curl: (6)`), because a cfargotunnel CNAME only works when the record is Proxied. *Corrects the brief's "was NXDOMAIN".* |
 | `rpc.blochl1.com` | NXDOMAIN | Not provisioned (matches A5's comment in `apps/explorer/src/lib/rpc.ts`). |
 | `g2rpc.posternlabs.com` | NXDOMAIN | Confirms: the public RPC is on posternpool.com, not posternlabs.com. |
 | `l2rpc.posternlabs.com` | A (proxied), live | L2 EVM devnet, unrelated to this runbook. |
@@ -101,7 +108,7 @@ is roughly four days more runway than assumed. If hashrate rises, it shrinks.*
 Key identity: the cfargotunnel target of `g2rpc.blochl1.com` is **the same
 tunnel ID as the miner-box's `cloudflared.service`** (verified by decoding the
 tunnel ID — only the ID, not the secret — from `/etc/cloudflared/token` on
-192.248.190.123). So someone already created that record aiming at the right
+RELAY_IP). So someone already created that record aiming at the right
 tunnel; it is dead only because it is DNS-only and (presumably) has no ingress
 route for that hostname.
 
@@ -142,15 +149,15 @@ during the sweep — the ±1 is propagation, not divergence).
 
 | Box | IP / key | Services (running) | Node RPC | Notes |
 |---|---|---|---|---|
-| **auxpow** | 45.76.89.225, `~/.ssh/edgevana_auxpow` | `bloch-auxpow` (node + solo stratum :3333, `--mine`), `bloch-merged-pool` (:3336), `bloch-pool-proxy`, `bitcoind-mainnet` | `127.0.0.1:16216` | ASIC hashrate lands here. Disk 81% (8.5 G free), g3-data 1.6 G, RAM 7.8 G shared with bitcoind. This box is the pool — most of it is what gets decommissioned. |
-| **miner-box / g3** | 192.248.190.123, `~/.ssh/edgevana_miner_new` | `bloch-g3` (node, RPC `127.0.0.1:16216`, P2P :16116), `bloch-gpu-miner`, `bloch-l2` + `cloudflared-l2` (l2rpc), **`cloudflared`** (tunnel `3e88eb2e-…` = g2rpc origin), **`bloch-rpc-bridge`** (socat `:8080 → 127.0.0.1:16226`), **`g2rpc-tunnel`** (ssh `-L 127.0.0.1:16226 → 45.76.89.225:16216`, key `/home/ubuntu/.ssh/g2rpc_tunnel`), 3× stratum passthrough | `127.0.0.1:16216` (own node — NOT what g2rpc serves) | Confirms the brief: public g2rpc = **auxpow's** node through a 3-box chain. |
-| **node4** | 136.244.82.226, `~/.ssh/edgevana_node4` | `bloch-g3` only — nothing else | `127.0.0.1:16210` | Archival public peer. P2P :16110 (+:16111). Data 1.9 G. Disk 87% (6.1 G free). ufw: default deny inbound; allows 22, 11434, 16110 only. Uptime 13 days. |
+| **auxpow** | PRODUCER_IP, `~/.ssh/PRODUCER_KEY` | `bloch-auxpow` (node + solo stratum :3333, `--mine`), `bloch-merged-pool` (:3336), `bloch-pool-proxy`, `bitcoind-mainnet` | `127.0.0.1:16216` | ASIC hashrate lands here. Disk 81% (8.5 G free), g3-data 1.6 G, RAM 7.8 G shared with bitcoind. This box is the pool — most of it is what gets decommissioned. |
+| **relay box** | RELAY_IP, `~/.ssh/RELAY_KEY` | `bloch-g3` (node, RPC `127.0.0.1:16216`, P2P :16116), `bloch-gpu-miner`, `bloch-l2` + `cloudflared-l2` (l2rpc), **`cloudflared`** (tunnel `TUNNEL_UUID…` = g2rpc origin), **`bloch-rpc-bridge`** (socat `:8080 → 127.0.0.1:16226`), **`g2rpc-tunnel`** (ssh `-L 127.0.0.1:16226 → PRODUCER_IP:16216`, key `~/.ssh/TUNNEL_KEY`), 3× stratum passthrough | `127.0.0.1:16216` (own node — NOT what g2rpc serves) | Confirms the brief: public g2rpc = **auxpow's** node through a 3-box chain. |
+| **node4** | 136.244.82.226, `~/.ssh/ARCHIVAL_KEY` | `bloch-g3` only — nothing else | `127.0.0.1:16210` | Archival public peer. P2P :16110 (+:16111). Data 1.9 G. Disk 87% (6.1 G free). ufw: default deny inbound; allows 22, 11434, 16110 only. Uptime 13 days. |
 
 **Today's g2rpc path** (every hop verified live):
 
 ```
 browser → g2rpc.posternpool.com (CF edge)
-        → cloudflared on miner-box (tunnel 3e88eb2e-…)
+        → cloudflared on miner-box (tunnel TUNNEL_UUID)
         → socat :8080 → 127.0.0.1:16226            [bloch-rpc-bridge.service]
         → ssh -L 16226 → auxpow 127.0.0.1:16216    [g2rpc-tunnel.service]
         → auxpow node RPC
@@ -222,7 +229,7 @@ preferred plan. DNS (§5) is optional polish, not a requirement.
 ### Step A — expose node4's RPC on :16220 (additive; touches only node4)
 
 ```bash
-ssh -i ~/.ssh/edgevana_node4 ubuntu@136.244.82.226
+ssh -i ~/.ssh/ARCHIVAL_KEY OPERATOR@ARCHIVAL_IP
 
 sudo tee /etc/systemd/system/bloch-rpc-public.service >/dev/null <<'EOF'
 [Unit]
@@ -280,7 +287,7 @@ the current build:
 ```bash
 cd ~/dev/BlochPOS/apps/explorer      # or the repo the site is deployed from
 npm run build
-CLOUDFLARE_ACCOUNT_ID=4e44d592d0229f8faa3fdb2f139c611c \
+CLOUDFLARE_ACCOUNT_ID=CLOUDFLARE_ACCOUNT_ID \
   npx wrangler pages deploy dist --project-name bloch-explorer --branch main --commit-dirty=true
 
 # verify:
@@ -309,7 +316,7 @@ NOT reuse the miner-box tunnel, that re-creates the relay-box dependency this
 runbook exists to remove.
 
 ```bash
-ssh -i ~/.ssh/edgevana_node4 ubuntu@136.244.82.226
+ssh -i ~/.ssh/ARCHIVAL_KEY OPERATOR@ARCHIVAL_IP
 # install cloudflared (same binary/method as the miner-box: /usr/local/bin/cloudflared)
 cloudflared tunnel login                       # or create the tunnel in Zero Trust dashboard
 cloudflared tunnel create bloch-archival-rpc
@@ -335,7 +342,7 @@ It already CNAMEs the miner-box tunnel (§2.1). Flipping it to Proxied and
 adding an ingress route would revive the *old* relay path, auxpow dependency
 and all. Do not invest in it; delete the record at decommission time
 (rollback: recreate the DNS-only CNAME to
-`3e88eb2e-2901-4030-b56f-73bfa7197663.cfargotunnel.com`).
+`TUNNEL_UUID.cfargotunnel.com`).
 
 ---
 

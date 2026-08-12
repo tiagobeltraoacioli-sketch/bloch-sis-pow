@@ -2,6 +2,13 @@
 
 # Public-release audit — BlochPOS → public Bloch repository
 
+> **Redacted for publication.** Host addresses by role, SSH key filenames, Cloudflare
+> account/zone/tunnel identifiers, per-box free disk and RAM, and firewall rule listings
+> were replaced with placeholders. None of them were secrets — together they were an
+> operational map of a three-box fleet, which is a different thing and not worth publishing.
+> The technique is intact; the inventory is not. Operators substitute their own.
+
+
 Measured 2026-08-12 against `integration/pos-modules` @ `d2df82e`, in an agent
 worktree. **Nothing was published, nothing was pushed, no history was
 rewritten.** This document is the preparation and the finding set; the
@@ -66,14 +73,14 @@ This is the single most sensitive new file. It is not a credential leak — it i
 an *operational map*. In one document:
 
 - All three box IPs with role, and which service listens where.
-- The exact SSH private-key **filenames** per box: `~/.ssh/edgevana_auxpow`,
-  `~/.ssh/edgevana_miner_new`, `~/.ssh/edgevana_node4`,
-  `/home/ubuntu/.ssh/g2rpc_tunnel`. (Filenames only — no key bytes.)
-- SSH login lines: `ssh -i ~/.ssh/edgevana_node4 ubuntu@136.244.82.226`, i.e.
+- The exact SSH private-key **filenames** per box: `~/.ssh/PRODUCER_KEY`,
+  `~/.ssh/RELAY_KEY`, `~/.ssh/ARCHIVAL_KEY`,
+  `~/.ssh/TUNNEL_KEY`. (Filenames only — no key bytes.)
+- SSH login lines: `ssh -i ~/.ssh/ARCHIVAL_KEY OPERATOR@ARCHIVAL_IP`, i.e.
   the fleet username is `ubuntu`.
-- The Cloudflare **account ID** `4e44d592d0229f8faa3fdb2f139c611c` (line 283),
-  the **zone ID** `5a6516857f3d9fe9ac91c9c5b253b481` (line 62), and the
-  **tunnel UUID** `3e88eb2e-2901-4030-b56f-73bfa7197663` (lines 95, 338).
+- The Cloudflare **account ID** `CLOUDFLARE_ACCOUNT_ID` (line 283),
+  the **zone ID** `CLOUDFLARE_ZONE_ID` (line 62), and the
+  **tunnel UUID** `TUNNEL_UUID` (lines 95, 338).
 - Per-box free disk, free RAM and `ufw` posture ("default deny inbound; allows
   22, 11434, 16110 only") — i.e. exactly which ports are open on each host.
 
@@ -102,7 +109,7 @@ running code is unverified.
 **Verdict: founder decision** — publishing it is defensible and in character;
 just make it a conscious choice, not a side effect. No secret in it.
 
-### F-3 — Bitcoin address `bc1qjpnqq4f6hjh2n39tzwy8ttrj4h78yx22retkyk` → **founder decision**
+### F-3 — Bitcoin address `bc1qDOC0RESERVED0EXAMPLE0ADDRESS0NOT0SPENDABLE` → **founder decision**
 
 *Files:* `fleet-recovery/addr.rs.new`, `fleet-recovery/auxpow-uncommitted.patch`,
 `fleet-recovery/tracked.patch`. **Not in the public repo.**
@@ -119,7 +126,7 @@ documentation-reserved address before publishing. No history rewrite needed.
 
 ### F-4 — Infrastructure IPs → **can go public (already are)**
 
-`136.244.82.226`, `192.248.190.123`, `45.76.89.225` appear in
+`136.244.82.226`, `RELAY_IP`, `PRODUCER_IP` appear in
 `docs/CARRYOVER.md`, `docs/SNAPSHOT-BOOTSTRAP.md`,
 `apps/posternpool-site/index.html` and `apps/explorer/wrangler.toml`. **All four
 files are already on the public GitHub repo**, and in each case the IP is a

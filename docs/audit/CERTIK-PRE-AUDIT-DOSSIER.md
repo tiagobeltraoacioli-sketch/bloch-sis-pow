@@ -108,7 +108,7 @@ references are to this repository at `470b608`.
 | 6 | Anti-whale modifiability | No privileged role can modify the caps in check 5: they are compile-time constants with no setter, no governance hook, no admin path (see check-23 grep). Changing them requires a code change every operator must adopt (a hard fork). | PASS (via substitute) | `crates/bloch-pos-committee/src/delegation.rs:90-110`; §1.3 grep table |
 | 7 | Honeypot (can buy, cannot sell) | No code path can block disposal: exit is self-signed, withdrawal needs no signature at all and has exactly three structural reject reasons (`NotExited`, `DelayNotElapsed`, `AlreadyWithdrawn`). Honest caveat: disposal is *market*-limited (no exchange listing, thin liquidity) — a fact for the listing conversation, not a protocol mechanism. | N/A — substitute holds | `crates/bloch-pos-committee/src/staking.rs:406-438`, `:470-479`, `:489-506` |
 | 8 | Self-destruct | No `selfdestruct` analogue, and no hidden kill switch (check-23 grep). One disclosed, deliberate exception must be named: Genesis-3 carries a **terminal-height consensus rule** — the chain halts at a fixed height for the Genesis-4 migration. It is public, one-time, and snapshot-preserving, not a concealed destruct path. See §5 for the height contradiction. | N/A — substitute holds, with disclosure | `docs/specs/BLOCH-TOKENOMICS-V4.md` §3.2; `docs/FLEET-BRIEF-2026-08-11.md` |
-| 9 | **Major holder concentration** | **Applies directly — the one check that maps one-to-one.** Measured: the largest single address holds **93.96%** of the carried-over supply (16,886,549,523 of 17,970,850,000 BLCH, snapshot at height 43,172, 15 addresses); **70.4%** of circulating at slot 0; if staked (it is stakeable, founder decision 2026-08-11), **94.0% of active stake — Nakamoto coefficient 1**. WBNB drew its only attention flag at 39.28%. | **FAIL** | `docs/specs/BLOCH-TOKENOMICS-V4.md` §2 (snapshot root `280d604b32525f03…`), §4A, §4A.1; `crates/bloch-pos-committee/src/tokenomics_v4.rs:236` (`LARGEST_CARRYOVER_ADDRESS_BLOCH`). Full treatment in §1.1 |
+| 9 | **Major holder concentration** | **Applies directly — the one check that maps one-to-one.** Measured: the largest single address holds **93.96%** of the carried-over supply (16,886,549,523 of 17,970,880,000 BLCH, snapshot at height 43,172, 15 addresses); **70.4%** of circulating at slot 0; if staked (it is stakeable, founder decision 2026-08-11), **94.0% of active stake — Nakamoto coefficient 1**. WBNB drew its only attention flag at 39.28%. | **FAIL** | `docs/specs/BLOCH-TOKENOMICS-V4.md` §2 (snapshot root `280d604b32525f03…`), §4A, §4A.1; `crates/bloch-pos-committee/src/tokenomics_v4.rs:236` (`LARGEST_CARRYOVER_ADDRESS_BLOCH`). Full treatment in §1.1 |
 | 10 | Mintable | No mint function, no privileged issuance: `PosTransaction` is a closed five-variant enum with no `Mint`; the only balance-increasing writes in the transition are the emission curve and fee compounding, both pure functions of slot/stake. Open gap: the decided block-level cap invariant is **not yet implemented** — see §1.2. | PASS (no privileged mint) — with an open gap on the cap invariant | `crates/bloch-pos-committee/src/transition.rs:175-220`, `:1152`, `:1177`, `:1186-1188`; `src/tokenomics_v4.rs:406-421` |
 | 11 | Blacklist | None. A crate-wide grep for blacklist/freeze/ban/censor machinery returns prose and retired-inert fields only (§1.3). The Genesis-3-era taint set is dismantled by named-zero constants so anything still consulting it fails loudly. (Token-level `Gate::Deny` exists in `bloch-euvm` — a regulated-asset primitive in a crate that is **not consensus-wired**; see §2.) | PASS | §1.3 grep table; `crates/bloch-pos-committee/src/staking.rs:247`; `src/tokenomics_v4.rs:106`; `crates/bloch-euvm/src/state.rs:558-575` |
 | 12 | Whitelist | None at chain level — no allowlist gates participation in transfer, staking, delegation, or block production beyond the public parameter thresholds. (`MembershipList` in `bloch-euvm` is token-scoped and not consensus-wired.) | PASS | §1.3 grep table; `crates/bloch-euvm/src/state.rs:520` |
@@ -138,7 +138,7 @@ Measured, not estimated (snapshot at Genesis-3 height 43,172 via
 `bloch-snapshot-utxo`, snapshot root SHAKE-256 `280d604b32525f03…`, carryover
 digest `92918209a106f297…` — `BLOCH-TOKENOMICS-V4.md` §2):
 
-- The carryover set is 17,970,850,000 BLCH across **15 addresses** and 448,337
+- The carryover set is 17,970,880,000 BLCH across **15 addresses** and 448,337
   UTXOs. The largest address holds 16,886,549,523 BLCH — **93.96% of the
   carryover** — and is the founder's.
 - At Genesis-4 slot 0, circulating supply is carryover + liquidity +
@@ -163,7 +163,7 @@ does *not* reach:
 
 And the arithmetic that closes the escape hatch (`BLOCH-TOKENOMICS-V4.md`
 §4A.1): rewards are pro-rata to stake, so compounding preserves stake
-*shares*. Independent parties hold 227,709,400 / 17,970,850,000 = **6.03%** of
+*shares*. Independent parties hold 227,709,400 / 17,970,880,000 = **6.03%** of
 the carryover; gate G1 requires ≥ 15% of circulating in independent hands.
 Therefore **G1 is unreachable by emission alone — not at year five, not at
 year forty. The only thing that moves it is coins changing hands.** If the

@@ -1,5 +1,12 @@
 # Fleet recovery — provenance of what is actually running
 
+> **Redacted for publication.** Host addresses by role, SSH key filenames, Cloudflare
+> account/zone/tunnel identifiers, per-box free disk and RAM, and firewall rule listings
+> were replaced with placeholders. None of them were secrets — together they were an
+> operational map of a three-box fleet, which is a different thing and not worth publishing.
+> The technique is intact; the inventory is not. Operators substitute their own.
+
+
 Captured 2026-08-11, before any deploy of the terminal-height rule.
 
 ## What the survey found
@@ -10,8 +17,8 @@ committed source tree**:
 | Box | Service | Binary | Source on the box |
 |---|---|---|---|
 | node4 `136.244.82.226` | `bloch-g3` | `~/bloch-regossip` | **none** |
-| auxpow `45.76.89.225` | `bloch-auxpow` | `~/BlochSISPoW-project/target/release/bloch` | `g3-integration` @ `006c658`, **9 files dirty** |
-| miner-box `192.248.190.123` | `bloch-g3` | `~/bloch-g3-flagday` | `~/bloch` on `g2/integrate` @ `6d16e34` (wrong branch, does not match the running binary) |
+| auxpow `PRODUCER_IP` | `bloch-auxpow` | `~/BlochSISPoW-project/target/release/bloch` | `g3-integration` @ `006c658`, **9 files dirty** |
+| miner-box `RELAY_IP` | `bloch-g3` | `~/bloch-g3-flagday` | `~/bloch` on `g2/integrate` @ `6d16e34` (wrong branch, does not match the running binary) |
 
 Both `bloch-regossip` and `bloch-g3-flagday` report `bloch 0.3.0-genesis2` and
 have different md5s. The version string carries no commit hash, so what is

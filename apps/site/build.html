@@ -54,8 +54,8 @@
   <div class="cards">
     <div class="card a">
       <span class="tag">Planned</span>
-      <h3>5,600 BLCH bond</h3>
-      <!-- MIN_DEPOSIT_SAT = 5,600 BLCH: crates/bloch-pos-committee/src/staking.rs:119.
+      <h3>25,000 BLCH bond</h3>
+      <!-- MIN_DEPOSIT_SAT = 25,000 BLCH: crates/bloch-pos-committee/src/staking.rs:119.
            Derivation: same fraction of supply as Ethereum's 32 ETH; the file's
            own honest note (staking.rs:95-118) says borrowing the ratio is not
            borrowing Ethereum's reasoning, and the ratio drifts. -->
@@ -100,6 +100,55 @@
            From-scratch sync unsupported; snapshot bootstrap:
            docs/PROJECT-STATUS.md, docs/SNAPSHOT-BOOTSTRAP.md. -->
       <p>The proof-of-work chain halts at height 50,000, so standing up new mining now buys days, not months. New nodes bootstrap from a datadir snapshot &mdash; from-scratch sync is no longer supported on the live network.</p>
+    </div>
+  </div>
+</div></section>
+
+<section id="hardware" class="alt"><div class="wrap">
+  <div class="sec-head">
+    <p class="eyebrow">Hardware</p>
+    <h2>What it actually takes to run one.</h2>
+    <p style="color:var(--ink-2)">The Genesis-3 column is <strong>measured on the live fleet</strong>, not
+      estimated &mdash; three boxes running the archival node today. The Genesis-4 column is a
+      projection from the same measurements plus the signature and bandwidth arithmetic, and it is
+      labelled as a projection because the proof-of-stake node has never run outside a devnet.</p>
+  </div>
+
+  <div class="tablewrap"><table>
+    <caption>Node requirements</caption>
+    <thead><tr><th>&nbsp;</th><th>Genesis-3 &mdash; measured</th><th>Genesis-4 validator &mdash; projected</th></tr></thead>
+    <tbody>
+      <!-- Medido 2026-08-12 nos boxes node4 e auxpow: nproc=2, free -g, ps -o rss/%cpu -->
+      <tr><td>CPU</td><td>2 cores. Observed 68% of one core on an archival node, 168% on the box that also mines</td><td>2 cores. Signing is 11.6&nbsp;ms per block &mdash; 0.04% of a 30&nbsp;s slot</td></tr>
+      <tr><td>RAM</td><td>831&nbsp;MB resident, archival. 1.7&nbsp;GB on the mining box. 4&nbsp;GB is comfortable</td><td>4&nbsp;GB</td></tr>
+      <tr><td>Disk</td><td>452&nbsp;MB at height 37,960; <strong>595&nbsp;MB projected at the halt</strong>, then it stops growing forever</td><td>25&nbsp;GB to start. Growth depends on transaction volume, which is why this is a floor and not a promise</td></tr>
+      <tr><td>Bandwidth</td><td>Modest &mdash; blocks are small and there is no state sync to serve</td><td>~54&nbsp;KB per block at 384 validators; ~139&nbsp;KB at 1,000. Under 1&nbsp;Mbps sustained either way</td></tr>
+      <tr><td>Network</td><td>One inbound TCP port for peering</td><td>Same. A validator that cannot be reached still attests, but slower</td></tr>
+      <tr><td>Uptime</td><td>None required &mdash; proof of work does not penalise absence</td><td><strong>This is the real change.</strong> A validator that is offline earns nothing and, after four epochs without finality, bleeds stake through the inactivity leak</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="cards" style="margin-top:2rem">
+    <div class="card a">
+      <span class="tag">Why so small</span>
+      <h3>The chain is young</h3>
+      <p>452&nbsp;MB is not an achievement of engineering &mdash; it is what 37,960 blocks weigh. A chain
+         with years of history behind it would ask for far more, and Genesis-4 will grow into that
+         over time.</p>
+    </div>
+    <div class="card b">
+      <span class="tag">The expensive part</span>
+      <h3>Signatures, not computation</h3>
+      <p>A hybrid ML-DSA-65 &#8214; Falcon-1024 signature is ~4.6&nbsp;KB and one verification costs
+         about 7.3&nbsp;million instructions. Bandwidth and verification scale with the validator
+         count, not with transaction volume &mdash; the opposite of most chains.</p>
+    </div>
+    <div class="card c">
+      <span class="tag">Not a recommendation</span>
+      <h3>These are floors</h3>
+      <p>Nothing here has been through a load test at a realistic validator count. The
+         proof-of-stake node has run four processes on one machine, which tells you it works and
+         tells you nothing about a thousand of them across the internet.</p>
     </div>
   </div>
 </div></section>

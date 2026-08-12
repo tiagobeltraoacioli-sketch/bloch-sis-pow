@@ -29,7 +29,7 @@ still says otherwise, that is flagged, not followed.
 
 **Consequence for the approved preview itself:** the preview HTML was written
 against the 100 B draft. Before it ships, its Supply table (100 B /
-43,029,120,000 / 17,970,850,000 / 10 B rows) and its Build card ("25,000 BLCH
+43,029,120,000 / 17,970,880,000 / 10 B rows) and its Build card ("25,000 BLCH
 bond") must be regenerated from `tokenomics_v4.rs` and `staking.rs` under the
 21 B denomination, with the "under review" mark. The design is approved; those
 numbers are not. See §5.
@@ -97,7 +97,7 @@ page.
 | Piece | Source |
 |---|---|
 | Total: **100,000,000,000 BLCH — marked "under review"** on the page itself, mono badge, amber `--signal` | `tokenomics_v4.rs:33` |
-| Allocation table (carryover 17,970,850,000 / 17.97%; founder grant 10,000,000,000 / 10%, 10-yr cliff + 40-yr vest; VC 10%; team 10%; marketing 4%; liquidity 5%; validators 43,029,120,000 / 43.03% over 40 yrs) | `tokenomics_v4.rs:33–116` constants; prose framing from `BLOCH-TOKENOMICS-V4.md` §1 table |
+| Allocation table (carryover 17,970,880,000 / 17.97%; founder grant 10,000,000,000 / 10%, 10-yr cliff + 40-yr vest; VC 10%; team 10%; marketing 4%; liquidity 5%; validators 43,029,120,000 / 43.03% over 40 yrs) | `tokenomics_v4.rs:33–116` constants; prose framing from `BLOCH-TOKENOMICS-V4.md` §1 table |
 | Founder total 26.89% (carryover largest address + grant) | `tokenomics_v4.rs:236–241` (`FOUNDER_TOTAL_BLOCH`, compile-time assert `== 2688` bps) |
 | Fixed cap as consensus invariant — stated at true strength ("no mechanism *inside* the protocol"; a universal hard fork can change any rule) | Brief 08-12 §Decisions item 2 (wording), V4 spec |
 | Concentration card (~94% of carryover, one holder; Nakamoto coefficient 1 if staked) | `BLOCH-TOKENOMICS-V4.md` §4A; brief 08-12 §2. Never softened — the preview card's wording is the model. |
@@ -257,7 +257,7 @@ founder-allocated genesis cohort):
 ### E. Stale numbers in the *approved preview* (must be fixed before any publish)
 
 - Supply section: "100 billion, fixed", the ×4.7619 redenomination paragraph,
-  and every row of the allocation table (43,029,120,000 / 17,970,850,000 /
+  and every row of the allocation table (43,029,120,000 / 17,970,880,000 /
   10 B / 5 B / 4 B) — **blocked**; regenerate from `tokenomics_v4.rs` at 21 B
   with the "under review" badge.
 - Build card "25,000 BLCH bond" → 25,000 BLCH (`staking.rs:119`), same

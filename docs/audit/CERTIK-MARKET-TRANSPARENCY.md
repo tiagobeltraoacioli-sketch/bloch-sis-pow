@@ -235,7 +235,7 @@ is invisible on-chain (`delegation.rs:80–84`, `genesis_cohort.rs:41–48`).
 The cohort cap binds only the genesis addresses — nothing prevents funding
 new validators outside the cohort. And the concentration these caps operate
 against is severe: the largest carried-over address holds 16,886,549,523 of
-17,970,850,000 BLCH — 93.97% of the carryover — and if staked would be ~94%
+17,970,880,000 BLCH — 93.97% of the carryover — and if staked would be ~94%
 of active stake, Nakamoto coefficient 1
 (`docs/specs/BLOCH-TOKENOMICS-V4.md` §4A/§4A.1;
 `tokenomics_v4.rs::LARGEST_CARRYOVER_ADDRESS_BLOCH`, line 236). §4A.1's

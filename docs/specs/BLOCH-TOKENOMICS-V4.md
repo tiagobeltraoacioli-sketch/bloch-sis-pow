@@ -32,7 +32,7 @@ billion overflowed by 8%.
 
 | Destination | BLCH | Share | Unlock |
 |---|---:|---:|---|
-| Carryover — the whole ledger | 17,970,850,000 | 17.97% | **liquid at genesis** |
+| Carryover — the whole ledger | 17,970,880,000 | 17.97% | **liquid at genesis** |
 | Founder — new grant | 10,000,000,000 | 10.00% | 10-year cliff, then 40-year linear |
 | VC / crypto hedge funds | 10,000,000,000 | 10.00% | 12-month cliff, then 24-month linear |
 | Development team | 10,000,000,000 | 10.00% | 18-month cliff, then 36-month linear |
@@ -120,7 +120,7 @@ Not estimated. A read-only UTXO snapshot was taken on node4 at **height
 |---|---|
 | UTXOs | 448,337 |
 | Addresses | 15 |
-| **Total carried over** | **17,970,850,000 BLCH** |
+| **Total carried over** | **17,970,880,000 BLCH** |
 | Snapshot root (SHAKE-256) | `280d604b32525f03…` |
 | Carryover digest (SHAKE-256) | `92918209a106f297…` |
 
@@ -370,7 +370,7 @@ Stated plainly, because it affects parties who are not in the room:
 
 | | Today | After V4 |
 |---|---:|---:|
-| Coins carried over | 3,475,441,200 (G-1 file) | 17,970,850,000 (measured live) |
+| Coins carried over | 3,475,441,200 (G-1 file) | 17,970,880,000 (measured live) |
 | Non-founder **share of network** | 5.21% | **≤ 0.30%** |
 
 Holders keep their coins in absolute terms and lose roughly **17×** of their
@@ -440,7 +440,7 @@ bound.** Rewards are pro-rata to stake (§6.3), so compounding preserves stake
 like everyone else, the independent share of active stake stays where it
 started —
 
-    227,709,400 / 17,970,850,000 = 6.03%
+    227,709,400 / 17,970,880,000 = 6.03%
 
 — at every horizon. Active stake can never exceed circulating supply, so
 independent stake can never exceed 6.03% of circulating either: **under this
@@ -466,7 +466,7 @@ realistic date is later. But it is measured in months, not in five years.
 
 **G2 (largest entity < 25% of active stake).** Measured against *active*
 stake, staking the carryover is strictly worse than the 70.4%-of-circulating
-figure above: at genesis the founder would hold 16,886,549,523 of 17,970,850,000
+figure above: at genesis the founder would hold 16,886,549,523 of 17,970,880,000
 staked — **94.0% of active stake**, a Nakamoto coefficient of 1. Under
 conserved shares that figure does not decay either.
 

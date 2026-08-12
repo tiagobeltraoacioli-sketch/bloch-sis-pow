@@ -29,6 +29,7 @@
     <a href="migration.html">Migration</a>
     <a href="supply.html">Supply</a>
     <a href="brand.html">Brand</a>
+    <a href="#wallet">Wallet</a>
     <a href="build.html">Build</a>
     <a href="docs.html">Docs</a>
     <a class="ext" href="https://blochl1.com">Explorer</a>
@@ -49,6 +50,7 @@
     </p>
     <div class="heroactions">
       <a class="btn btn-primary" href="migration.html">Read the migration plan</a>
+      <a class="btn btn-ghost" href="Bloch-SIS-PoW-Institutional-Dossier-EN.pdf">Institutional dossier 2.0</a>
       <a class="btn btn-ghost" href="build.html">Run a node</a>
     </div>
   </div>
@@ -61,19 +63,19 @@
 
 <div class="status"><div class="wrap">
   <!-- Terminal height 50,000: docs/FLEET-BRIEF-CERTIK-2026-08-12.md:79
-       ("Genesis-3 halts at height 50,000, not 80,000 — lowered 2026-08-12").
+       ("Genesis-3 halts at height 50,000, not 50,000 — lowered 2026-08-12").
        The constant GENESIS3_TERMINAL_HEIGHT in crates/bloch-crypto/src/core/mod.rs:438
-       still reads 80,000 and is superseded by that decision. -->
+       still reads 50,000 and is superseded by that decision. -->
   <dl class="stat"><dt>Genesis-3 halts at</dt><dd>50,000</dd><div class="sub">consensus rule &mdash; blocks above it are invalid</div></dl>
   <!-- Target block time 30 s: crates/bloch-crypto/src/core/mod.rs:262 (TARGET_BLOCK_TIME);
        Genesis-4 slot time is also 30 s: crates/bloch-pos-committee/src/tokenomics_v4.rs:120 (SLOTS_PER_DAY = 2,880). -->
   <dl class="stat"><dt>Block time</dt><dd>30<span style="font-size:1rem"> s</span></dd><div class="sub">protocol target, today and after</div></dl>
   <!-- Hybrid signature: crates/bloch-crypto/src/core/mod.rs:321-330. -->
   <dl class="stat"><dt>Signature</dt><dd style="font-size:1.05rem;font-family:var(--mono)">ML-DSA-65 &#8214; Falcon-1024</dd><div class="sub">both must verify</div></dl>
-  <!-- Fixed supply 21,000,000,000: crates/bloch-pos-committee/src/tokenomics_v4.rs:33
+  <!-- Fixed supply 100,000,000,000: crates/bloch-pos-committee/src/tokenomics_v4.rs:33
        (TOTAL_SUPPLY_BLOCH, founder decision 2026-08-11). A redenomination is
-       under review and is deliberately NOT quoted here. -->
-  <dl class="stat"><dt>Fixed supply</dt><dd>21B <span class="badge review">under review</span></dd><div class="sub">hard cap, Genesis-4</div></dl>
+       settled 2026-08-12 and is deliberately NOT quoted here. -->
+  <dl class="stat"><dt>Fixed supply</dt><dd>100B</dd><div class="sub">hard cap, Genesis-4</div></dl>
 </div></div>
 
 <section id="what"><div class="wrap">
@@ -155,6 +157,41 @@
   </div>
 </div></section>
 
+<section id="wallet"><div class="wrap">
+  <div class="sec-head">
+    <p class="eyebrow">Wallet</p>
+    <h2>A wallet that signs with the chain&rsquo;s own cryptography.</h2>
+    <p style="color:var(--ink-2)">Installable from the browser. The hybrid ML-DSA-65 &#8214;
+      Falcon-1024 signing runs in WebAssembly on your device &mdash; the same construction the
+      chain verifies, not a classical key with a post-quantum label on it.</p>
+  </div>
+  <div class="cards">
+    <div class="card a">
+      <span class="tag">What it does</span>
+      <h3>Post-quantum signing, locally</h3>
+      <p>Keys are generated and used in your browser. Node access is read-only, over the public
+         RPC &mdash; no node runs in the page and no mining is possible from it.</p>
+    </div>
+    <div class="card b">
+      <span class="tag">Installable</span>
+      <h3>A PWA, not an app store</h3>
+      <p>Add it to your home screen and it works offline for everything that does not need the
+         chain. Nothing to approve, nobody to ask.</p>
+    </div>
+    <div class="card c">
+      <span class="tag">Unaudited</span>
+      <h3>Public beta &mdash; read this part</h3>
+      <p>No third-party security audit has been completed on the wallet or on the chain it talks
+         to. It hardens your setup; it does not make you anonymous, and endpoint traffic analysis
+         remains possible. Do not put in it more than you can lose.</p>
+    </div>
+  </div>
+  <div class="heroactions" style="margin-top:2rem">
+    <a class="btn btn-primary" href="apps/postern/">Open the wallet</a>
+    <a class="btn btn-ghost" href="build.html">Run a node instead</a>
+  </div>
+</div></section>
+
 <section id="honesty"><div class="wrap">
   <div class="sec-head">
     <p class="eyebrow">Say it before you are asked</p>
@@ -171,7 +208,7 @@
     <div class="card c">
       <span class="tag">Supply</span>
       <h3>Concentrated</h3>
-      <!-- Largest carried-over address 3,546,175,400 BLCH of 3,773,884,800 total
+      <!-- Largest carried-over address 16,886,549,523 BLCH of 17,970,880,000 total
            (~94%): crates/bloch-pos-committee/src/tokenomics_v4.rs:100,236. -->
       <p>Roughly 94% of the carried-over balance belongs to one holder &mdash; the founder, who mined it. The numbers are on the <a href="supply.html">supply page</a>, not in a footnote.</p>
     </div>

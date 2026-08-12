@@ -71,7 +71,7 @@ document:
 
 | Measure | Value | Evidence |
 |---|---:|---|
-| Largest single address / carried-over set | **93.96618041970969%** (16,886,549,523 of 17,970,850,000 BLCH) | `tokenomics_v4.rs:100,236`; spec §2 |
+| Largest single address / carried-over set | **93.96618041970969%** (16,886,549,523 of 17,970,880,000 BLCH) | `tokenomics_v4.rs:100,236`; spec §2 |
 | Founder liquid at slot 0 / circulating at slot 0 | **70.44609761431171%** (of 23,970,850,000 BLCH) | spec §4A; `tokenomics_v4.rs:72-73` (Foundation float) |
 | Founder / active stake, if the carryover stakes | **93.97%**, Nakamoto coefficient **1** | spec §4A.1; staking is permitted: `staking.rs:601` test |
 | Founder total (carryover + new 10% grant) / total supply | **26.886549523809524%** | compile-pinned at 2688 bps, `tokenomics_v4.rs:240-241` |

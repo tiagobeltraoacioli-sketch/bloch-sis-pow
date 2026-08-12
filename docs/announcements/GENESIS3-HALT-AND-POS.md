@@ -164,7 +164,7 @@ The full allocation, in post-split terms:
 
 | Allocation | BLCH | Share | Terms |
 |---|---:|---:|---|
-| Carryover (all Genesis-3 balances) | 17,970,850,000 | 17.97% | liquid at genesis |
+| Carryover (all Genesis-3 balances) | 17,970,880,000 | 17.97% | liquid at genesis |
 | Validator emission | 43,029,120,000 | 43.03% | issued over 40 years |
 | Founder grant | 10,000,000,000 | 10% | 10-year cliff, then 40-year linear vest |
 | VC | 10,000,000,000 | 10% | vesting |

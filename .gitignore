@@ -44,3 +44,6 @@ docs/specs/*.pdf
 # Worktrees de agentes: repos git embutidos, nunca conteudo do projeto.
 .claude/worktrees/
 deploy/artifacts/
+
+# Orquestracao local de agentes: nao e artefato do protocolo.
+.claude/
