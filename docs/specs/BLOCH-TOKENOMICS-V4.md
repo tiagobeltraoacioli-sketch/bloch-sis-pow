@@ -14,8 +14,8 @@ Relates to: BLOCH-POS-SHA3-LATTICE-MIGRATION.md (§4 distribution gates)
 
 ## 1. Decision
 
-Relaunch from a fresh genesis with a **fixed 100,000,000,000 BLCH** supply — the
-V2 nominal, after a draft at 100 billion.
+Relaunch from a fresh genesis with a **fixed 100,000,000,000 BLCH** supply — a
+pure ×100/21 split of the V2 nominal, decided 2026-08-12.
 
 **The whole carryover comes across as one balance set, with no founder line.**
 Those coins were mined, on the same chain, under the same rules as everyone
@@ -24,11 +24,16 @@ liquid includes stakeable (decided 2026-08-11, §4A.1). The founder additionally
 receives a new 10% grant under a 10-year cliff and 40-year linear vest — the V2
 premine schedule, at 10% rather than the V2 17%.
 
-Returning to 100 billion removes two hazards the 100-billion draft created, at no
-cost: the supply is **54.21% of `u64::MAX`** rather than the earlier draft's 54.21%, so the sum of
-two large balances is nowhere near the wrap point; and it **fits in the signed
-`int64`** the Go SDK uses for `Satoshis` (`sdk/go/models.go:16`), which 100
-billion overflowed by 8%.
+100 billion costs two things, both accepted with eyes open and both now
+resolved rather than tolerated (see §8.1 and
+`docs/specs/BLOCH-SATOSHI-ENCODING.md`): at 8 decimals it is 10^19 satoshis,
+which is **54.21% of `u64::MAX`** — one balance fits a `u64`, the sum of two
+large ones can wrap, so every satoshi sum is `u128` — and it is **108.42% of
+`i64::MAX`**, so it does not fit a signed 64-bit integer at all. The fix was
+not to widen the Go SDK's integer: a satoshi amount is now a **decimal string**
+on the JSON wire, because 10^19 is also ~1110× JavaScript's exact-integer limit
+and a JSON number is lossy for Bloch balances in every browser regardless of
+what Go does.
 
 | Destination | BLCH | Share | Unlock |
 |---|---:|---:|---|
@@ -863,34 +868,41 @@ every 4 years, 10 halvings across the 40-year window.
 
 ## 8. Engineering hazards
 
-### 8.1 u64 headroom — must be addressed before any code lands
+### 8.1 Integer headroom — three separate limits, three separate answers
 
-At 8 decimal places, 21 B BLCH is **2.1 × 10^18 satoshis — 54.21% of
-`u64::MAX`**, and it fits inside the signed `int64` the Go SDK uses for
-`Satoshis` (`sdk/go/models.go:16`).
+At 8 decimal places the 100 B supply is **10^19 satoshis**. Measured against
+each boundary that matters:
 
-An earlier draft put the supply at 100 B, which is 10^19 satoshis: **54.21% of
-`u64::MAX`**, so the sum of two large balances approached the wrap point, and it
-**overflowed `int64` by 8%**, silently turning Go SDK aggregates negative.
-Returning to the V2 nominal removed both hazards at no cost — they were created
-by the supply figure, not by the design.
+| Limit | Value | 10^19 sat against it | Answer |
+|---|---:|---|---|
+| `u64::MAX` | 18,446,744,073,709,551,615 | **54.21%** — one balance fits, two can wrap when summed | every satoshi *sum* is `u128`; individual values stay `u64` |
+| `i64::MAX` | 9,223,372,036,854,775,807 | **108.42%** — does not fit at all | nothing signed carries an amount; the Go SDK's `Satoshis` is `uint64` |
+| JS `Number.MAX_SAFE_INTEGER` (2^53−1) | 9,007,199,254,740,991 | **1,110×** — and single real balances already exceed it ~187× | amounts are **decimal strings** on the JSON wire |
+
+The third row is the one that is easy to get wrong, and it does not depend on
+the supply figure: JavaScript would corrupt Bloch balances at this scale even
+under the old 21 B nominal, because the largest carryover address alone is 187×
+past its exact-integer limit. Widening the Go integer fixes Go and nothing
+else. The full rule and its rationale are in
+**`docs/specs/BLOCH-SATOSHI-ENCODING.md`**; the wire contract is
+`docs/openapi.yaml`.
 
 The arithmetic stays `u128` regardless, because the danger was never the totals:
 it is the **products**. A balance times a basis-point figure, or epoch issuance
 times stake in the reward split, exceeds `u64` long before any balance does.
 
-Options:
+Reducing to 6 decimals would drop the supply to 0.54% of `u64::MAX`, but it
+loses two orders of divisibility, changes every amount format, and does not
+touch the JavaScript limit at all — the 2^53 boundary is about the *wire*, not
+the width. Rejected.
 
-| Option | Effect | Cost |
-|---|---|---|
-| **Keep 8 decimals, move all accumulators to `u128`** (recommended) | Divisibility unchanged; overflow impossible in accounting paths | Audit of every summation over balances; `u64` stays for individual values |
-| Reduce to 6 decimals | Supply becomes 0.54% of `u64::MAX` | Loses two orders of divisibility; changes every address/amount format |
-
-Recommended: keep 8 decimals, `u128` for every accumulator, plus a
-`const _: () = assert!(...)` pinning the invariant so a future supply change
-cannot quietly re-enter the danger zone. This is the same discipline already
-applied in `crates/bloch-pos-committee/src/sample.rs`, where cumulative stake is
-`u128` for exactly this reason.
+Adopted: keep 8 decimals, `u128` for every accumulator, decimal-string amounts
+on the wire, plus `const _: () = assert!(...)` in
+`crates/bloch-pos-committee/src/tokenomics_v4.rs` pinning each boundary so a
+future supply change cannot quietly re-enter — or quietly appear to leave — the
+danger zone. This is the same discipline already applied in
+`crates/bloch-pos-committee/src/sample.rs`, where cumulative stake is `u128`
+for exactly this reason.
 
 ### 8.2 Genesis allocation outputs
 

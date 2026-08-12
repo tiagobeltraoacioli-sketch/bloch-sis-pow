@@ -67,19 +67,64 @@ export function unwrapResult(result: unknown, method: string): unknown {
   return result;
 }
 
+// ── Amounts ───────────────────────────────────────────────────────────────────
+//
+// AMOUNT ENCODING — canonical rule: docs/specs/BLOCH-SATOSHI-ENCODING.md
+// (restated as BLOCH-RPC-V4 R3). Satoshi fields are decimal STRINGS on the
+// V4 wire; live Genesis-3 nodes still send bare JSON numbers, so readers accept
+// both. Measured reason: Genesis-4 supply is 100,000,000,000 BLCH = 1e19 sat,
+// ~1110x Number.MAX_SAFE_INTEGER (9,007,199,254,740,991) — a satoshi value that
+// passes through a JS number is silently rounded to the nearest double.
+
+/** A satoshi amount exactly as it comes off the wire. Do NOT do math on it. */
+export type WireSats = string | number;
+
+/**
+ * Parse a wire satoshi amount into an exact bigint.
+ *
+ * Rejects negatives, non-integers, and the `number` form above
+ * Number.MAX_SAFE_INTEGER — such a number is not risky, it is ALREADY WRONG
+ * (JSON.parse rounded it before this code ever saw it), so accepting it would
+ * launder a corrupted amount into an exact-looking type.
+ */
+export function parseSats(v: WireSats | bigint, what = "satoshi value"): bigint {
+  let out: bigint;
+  if (typeof v === "bigint") {
+    out = v;
+  } else if (typeof v === "number") {
+    if (!Number.isInteger(v)) throw new RangeError(`${what} is not an integer: ${v}`);
+    if (!Number.isSafeInteger(v)) {
+      throw new RangeError(
+        `${what} ${v} exceeds Number.MAX_SAFE_INTEGER and is already corrupted by ` +
+          `IEEE-754 rounding; the node must send it as a decimal string (RPC-V4 R3)`,
+      );
+    }
+    out = BigInt(v);
+  } else {
+    const s = v.trim();
+    if (!/^-?\d+$/.test(s)) throw new RangeError(`invalid ${what}: ${JSON.stringify(v)}`);
+    out = BigInt(s);
+  }
+  if (out < 0n) throw new RangeError(`negative ${what}: ${out}`);
+  return out;
+}
+
 // ── Typed convenience wrappers ────────────────────────────────────────────────
 
 export interface Utxo {
   txid: string;
   index: number;
-  value: number;
+  /** Satoshis, wire form. Run through {@link parseSats} before any arithmetic. */
+  value: WireSats;
   script_pubkey: string;
 }
 
 export interface GetUtxosResult {
   address: string;
   utxo_count: number;
-  satoshis: number;
+  /** Satoshis, wire form. */
+  satoshis: WireSats;
+  /** Display-only float companion. LOSSY. */
   bloch: number;
   utxos: Utxo[];
 }
@@ -137,12 +182,22 @@ export class StubTransport implements JsonRpcTransport {
       }
       case "getutxos": {
         const addr = String(params[0] ?? "");
+        // Emits the canonical decimal-STRING form on purpose: the offline
+        // selftest then exercises the real V4 wire encoding instead of the
+        // legacy number form, which is where the arithmetic bugs hide.
+        const values = [5_000_000_000n, 5_000_000_000n];
         const utxos: Utxo[] = [
-          { txid: "aa".repeat(32), index: 0, value: 5_000_000_000, script_pubkey: "11".repeat(20) },
-          { txid: "bb".repeat(32), index: 1, value: 5_000_000_000, script_pubkey: "11".repeat(20) },
+          { txid: "aa".repeat(32), index: 0, value: values[0]!.toString(), script_pubkey: "11".repeat(20) },
+          { txid: "bb".repeat(32), index: 1, value: values[1]!.toString(), script_pubkey: "11".repeat(20) },
         ];
-        const satoshis = utxos.reduce((a, u) => a + u.value, 0);
-        return { address: addr, utxo_count: utxos.length, satoshis, bloch: satoshis / 1e8, utxos };
+        const satoshis = values.reduce((a, v) => a + v, 0n);
+        return {
+          address: addr,
+          utxo_count: utxos.length,
+          satoshis: satoshis.toString(),
+          bloch: Number(satoshis) / 1e8, // display-only, lossy by design
+          utxos,
+        };
       }
       case "sendrawtransaction": {
         this.broadcastCount += 1;

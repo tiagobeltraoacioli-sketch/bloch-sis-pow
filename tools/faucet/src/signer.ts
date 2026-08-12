@@ -23,6 +23,12 @@ export interface PaymentJob {
   feeSats: number;
   changeAddress: string;
   fundingAddress: string;
+  /**
+   * Prevouts to spend. Each `value` is a satoshi amount in WIRE form
+   * (`string | number`, RPC-V4 R3) and is passed through to the signer
+   * unmodified — the signer must parse it as an exact integer (bigint /
+   * big.Int / int), never as a float. See rpc.ts `parseSats`.
+   */
   selectedUtxos: Utxo[];
 }
 

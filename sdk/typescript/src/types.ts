@@ -10,11 +10,15 @@
 // `chain: "bloch-sis"`. Where the node and the spec disagree, the node wins.
 //
 // Numeric truth is always the integer satoshi field; the float `*_bloch`
-// / `bloch` fields are display-only (see units.ts). satoshi values large
-// enough to exceed Number.MAX_SAFE_INTEGER are rare on this chain today but,
-// to be safe, all satoshi-typed fields are surfaced as `number` exactly as the
-// node returns them in JSON. If you need bigint-safe accounting, re-parse with
-// a bigint-aware JSON reader.
+// / `bloch` fields are display-only and LOSSY (see units.ts).
+//
+// AMOUNT ENCODING — canonical rule: docs/specs/BLOCH-SATOSHI-ENCODING.md
+// (BLOCH-RPC-V4.md rule R3 restates it). Every satoshi-denominated field is
+// a decimal STRING on the V4 wire. Measured reason: Genesis-4 total supply is
+// 100,000,000,000 BLCH = 10^19 sat, while JavaScript's exact-integer ceiling is
+// Number.MAX_SAFE_INTEGER = 2^53 - 1 = 9,007,199,254,740,991 — the cap is ~1110x
+// past it, so any JSON parser that lands a satoshi value in an IEEE-754 double
+// silently corrupts it. Never route a satoshi value through `number`.
 
 /** 32-byte value as 64 lowercase hex chars. */
 export type Hex32 = string;
@@ -22,8 +26,20 @@ export type Hex32 = string;
 export type Hex20 = string;
 /** Bloch address string: `bloch1q…` (mainnet) / `bloch1t…` (testnet). */
 export type Address = string;
-/** Integer value in satoshis (1 BLOCH = 100_000_000 sat). This is the truth. */
-export type Satoshis = number;
+/**
+ * Integer value in satoshis (1 BLOCH = 100_000_000 sat). This is the truth.
+ *
+ * WIRE UNION, deliberately not `bigint`: V4 nodes emit the canonical decimal
+ * `string` (R3), live Genesis-3 nodes still emit a bare JSON `number`, and a
+ * reader must accept BOTH. `JSON.parse` can never hand you a `bigint`, so this
+ * is exactly what comes off the wire.
+ *
+ * Do NOT do arithmetic on a value of this type. Run it through
+ * {@link import("./units.js").parseSats} to get a `bigint` first — a satoshi
+ * value above 2^53 (and the supply cap is ~1110x past that) is already
+ * corrupt the moment it becomes a `number`.
+ */
+export type Satoshis = string | number;
 /** Selected-chain block height. */
 export type Height = number;
 
@@ -239,17 +255,18 @@ export interface BroadcastResult {
 
 // ── Fees ──────────────────────────────────────────────────────────────────
 export interface FeeEstimate {
-  feerate_sats: number;
+  feerate_sats: Satoshis;
+  /** Display-only float companion. LOSSY — never use for accounting. */
   feerate_bloch: number;
   mempool_size: number;
   note: string;
 }
 
 export interface FeeEstimateAdvanced {
-  next_block_sats: number;
-  medium_priority: number;
-  slow_priority: number;
-  mempool_median: number;
+  next_block_sats: Satoshis;
+  medium_priority: Satoshis;
+  slow_priority: Satoshis;
+  mempool_median: Satoshis;
   mempool_size: number;
   recommended_bloch: string;
 }
@@ -257,7 +274,8 @@ export interface FeeEstimateAdvanced {
 // ── Mempool ───────────────────────────────────────────────────────────────
 export interface MempoolEntry {
   txid: Hex32;
-  fee: number;
+  fee: Satoshis;
+  /** Display-only float companion. LOSSY — never use for accounting. */
   fee_bloch: number;
   time: number;
 }
@@ -273,10 +291,15 @@ export interface MempoolBucket {
 
 export interface MempoolStats {
   size: number;
-  total_fees: number;
-  min_fee: number;
-  max_fee: number;
-  median_fee: number;
+  total_fees: Satoshis;
+  min_fee: Satoshis;
+  max_fee: Satoshis;
+  median_fee: Satoshis;
+  /**
+   * Mean fee. A MEAN IS NOT AN INTEGER SATOSHI VALUE — the node computes it as
+   * a float, so it stays a `number` and is display-only, like the `*_bloch`
+   * companions. Sum `total_fees` if you need exact arithmetic.
+   */
   avg_fee: number;
   buckets: MempoolBucket[];
 }
@@ -357,7 +380,7 @@ export interface TxInBlock {
   size_bytes: number;
   inputs_count: number;
   outputs_count: number;
-  fee_sats: number;
+  fee_sats: Satoshis;
   is_coinbase: boolean;
 }
 

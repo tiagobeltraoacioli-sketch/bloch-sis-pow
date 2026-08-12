@@ -61,6 +61,19 @@ const MAX_SCRIPT_SIG_LEN: usize = 10_000;
 const LISTUTXOS_DEFAULT_LIMIT: usize = 100;
 const LISTUTXOS_MAX_LIMIT: usize = 1_000;
 
+/// Read a satoshi-denominated request field that may arrive as EITHER a JSON
+/// number (legacy V3 clients) or a decimal string (V4 rule R3,
+/// docs/specs/BLOCH-RPC-V4.md — the V4 supply exceeds both `i64::MAX` and
+/// JavaScript's `Number.MAX_SAFE_INTEGER`, so amounts travel as strings).
+/// Responses always EMIT the string form; requests stay dual-tolerant so
+/// existing wallets keep working.
+fn sat_u64(v: &Json) -> Option<u64> {
+    if let Some(n) = v.as_u64() {
+        return Some(n);
+    }
+    v.as_str().and_then(|s| s.trim().parse::<u64>().ok())
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // Witness wire codec (script_sig payload for eUTXO inputs)
 // ═════════════════════════════════════════════════════════════════════════════
@@ -568,7 +581,8 @@ pub(super) async fn rpc_buildtx(params: Option<&Json>, state: &super::AppState) 
     }
 
     let locktime = req.get("locktime").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-    let declared_fee = req.get("fee_sat").and_then(|v| v.as_u64());
+    // R3: accept the declared fee as a decimal string (V4) or a number (V3).
+    let declared_fee = req.get("fee_sat").and_then(sat_u64);
     let do_validate = req.get("validate").and_then(|v| v.as_bool()).unwrap_or(true);
     let chain_id = crate::core::node_chain_id();
 
@@ -613,13 +627,14 @@ pub(super) async fn rpc_buildtx(params: Option<&Json>, state: &super::AppState) 
         "txid":       hex::encode(built.tx.txid()),
         "raw_tx":     hex::encode(&raw),
         "size_bytes": raw.len(),
-        "fee_sat":    built.fee_sat,
+        // R3: satoshi amounts are decimal strings on the wire.
+        "fee_sat":    built.fee_sat.to_string(),
         "complete":   built.complete,
         "sighashes":  built.sighashes.iter().map(hex::encode).collect::<Vec<_>>(),
         "inputs": built.tx.inputs.iter().zip(&built.prevouts).map(|(inp, prev)| json!({
             "txid":      hex::encode(inp.prev_txid),
             "index":     inp.prev_index,
-            "value_sat": prev.value,
+            "value_sat": prev.value.to_string(),
             "type":      if is_eutxo_script(&prev.script_pubkey) { "eutxo" } else { "legacy" },
         })).collect::<Vec<_>>(),
         "note": "broadcast with sendrawtransaction(raw_tx)",
@@ -652,9 +667,10 @@ pub(super) async fn rpc_buildtx(params: Option<&Json>, state: &super::AppState) 
 /// Parse one output object: `{"address": ..., "value_sat": ...}` (legacy) or
 /// `{"value_sat": ..., "eutxo": {"validator_hash", "datum"?, "assets"?}}`.
 fn parse_output_json(o: &Json) -> Result<TxOutput, String> {
+    // R3: `value_sat` may arrive as a decimal string (V4) or a number (V3).
     let value = o
         .get("value_sat")
-        .and_then(|v| v.as_u64())
+        .and_then(sat_u64)
         .ok_or("missing/invalid value_sat")?;
     if let Some(addr) = o.get("address").and_then(|v| v.as_str()) {
         let a = crate::address::Address::parse(addr).map_err(|e| format!("bad address: {e}"))?;
@@ -734,7 +750,8 @@ pub(super) fn rpc_listutxos(params: Option<&Json>, state: &super::AppState) -> J
             list.push(json!({
                 "txid":           hex::encode(txid),
                 "index":          index,
-                "value_sat":      value,
+                // R3: satoshi amount → decimal string.
+                "value_sat":      value.to_string(),
                 "validator_hash": hex::encode(script.validator_hash),
                 "datum":          val_to_json(&script.datum),
                 "assets":         assets_to_json(&script.assets),
@@ -783,7 +800,8 @@ pub(super) fn rpc_getutxo(params: Option<&Json>, state: &super::AppState) -> Jso
                 "txid":           txid_hex,
                 "index":          index,
                 "type":           "eutxo",
-                "value_sat":      out.value,
+                // R3: satoshi amount → decimal string.
+                "value_sat":      out.value.to_string(),
                 "validator_hash": hex::encode(s.validator_hash),
                 "datum":          val_to_json(&s.datum),
                 "assets":         assets_to_json(&s.assets),
@@ -794,7 +812,7 @@ pub(super) fn rpc_getutxo(params: Option<&Json>, state: &super::AppState) -> Jso
                 "txid":          txid_hex,
                 "index":         index,
                 "type":          "eutxo_undecodable",
-                "value_sat":     out.value,
+                "value_sat":     out.value.to_string(),
                 "script_pubkey": hex::encode(&out.script_pubkey),
                 "decode_error":  e.to_string(),
             }),
@@ -807,7 +825,7 @@ pub(super) fn rpc_getutxo(params: Option<&Json>, state: &super::AppState) -> Jso
             "txid":          txid_hex,
             "index":         index,
             "type":          "legacy",
-            "value_sat":     out.value,
+            "value_sat":     out.value.to_string(),
             "address":       crate::crypto::address_from_hash(&h, false),
             "script_pubkey": hex::encode(&out.script_pubkey),
         })
@@ -817,7 +835,7 @@ pub(super) fn rpc_getutxo(params: Option<&Json>, state: &super::AppState) -> Jso
             "txid":          txid_hex,
             "index":         index,
             "type":          "unknown",
-            "value_sat":     out.value,
+            "value_sat":     out.value.to_string(),
             "script_pubkey": hex::encode(&out.script_pubkey),
         })
     }

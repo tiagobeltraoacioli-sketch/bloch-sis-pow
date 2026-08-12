@@ -4,7 +4,7 @@ import { useAsync } from "../lib/hooks";
 import { Loading, ErrorBox } from "../components/ui";
 import { ChartCard, LineChart, BarChart, ProportionBars } from "../components/charts";
 import { useAdaptivePoll } from "../components/chainStatus";
-import { difficultyFromBits, fmtNum, fmtDuration, fmtHashrate, fmtBloch, fmtInt } from "../lib/format";
+import { difficultyFromBits, fmtNum, fmtDuration, fmtHashrate, fmtBloch, fmtInt, toSats } from "../lib/format";
 import { totalSupplySat, CARRYOVER_TOTAL_SAT, CARRYOVER_UTXO_COUNT } from "../lib/chain";
 
 // Brand categorical ramp — theme-aware tokens defined in styles.css. Emerald
@@ -75,10 +75,18 @@ export function ChartsPage() {
   }));
 
   const pools = d.pools?.pools;
-  const subsidy = d.pools?.subsidy_per_block_sat || 1;
+  // Satoshi amounts as bigint; the share PERCENTAGE is a ratio, so it is scaled
+  // in bigint first and only then narrowed to a float for display.
+  const subsidy = toSats(d.pools?.subsidy_per_block_sat) || 1n;
+  const minerShare = toSats(d.pools?.miner_share_sat);
   const shareRows = pools
     ? [
-        { label: "Miner", value: d.pools.miner_share_sat, pct: (d.pools.miner_share_sat / subsidy) * 100, color: "var(--chart-1)" },
+        {
+          label: "Miner",
+          value: minerShare,
+          pct: Number((minerShare * 1_000_000n) / subsidy) / 10_000,
+          color: "var(--chart-1)",
+        },
       ]
     : [];
 

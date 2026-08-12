@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import { rpc } from "./rpc";
+import { toSats } from "./format";
 import type { DagBlock } from "../components/dag";
 
 /**
@@ -14,15 +15,15 @@ import type { DagBlock } from "../components/dag";
 export const CARRYOVER_TOTAL_SAT = 347_544_120_000_000_000n; // 3,475,441,200 BLOCH
 export const CARRYOVER_UTXO_COUNT = 413_743;
 
-/** Total supply = UTXO-set supply reported by the RPC + the carry-over set. */
+/**
+ * Total supply = UTXO-set supply reported by the RPC + the carry-over set.
+ *
+ * Accepts the decimal-string wire form (RPC-V4 R3) and the legacy bare number;
+ * the whole computation stays in bigint because this figure is the one most
+ * certain to exceed 2^53 sat (Genesis-4 supply is 1e19 sat, ~1110x that).
+ */
 export function totalSupplySat(rpcTotalSats: number | string | bigint | undefined): bigint {
-  let live: bigint;
-  try {
-    live = BigInt(typeof rpcTotalSats === "number" ? Math.round(rpcTotalSats) : (rpcTotalSats ?? 0));
-  } catch {
-    live = 0n;
-  }
-  return live + CARRYOVER_TOTAL_SAT;
+  return toSats(rpcTotalSats) + CARRYOVER_TOTAL_SAT;
 }
 
 export interface NetworkInfo {

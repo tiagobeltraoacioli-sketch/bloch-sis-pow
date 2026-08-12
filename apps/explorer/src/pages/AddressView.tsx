@@ -4,7 +4,7 @@ import { useAsync } from "../lib/hooks";
 import { Loading, ErrorBox, KV, Copyable } from "../components/ui";
 import { Stat } from "../components/ui";
 import { Link } from "../lib/router";
-import { fmtInt, fmtBloch, fmtTime, timeAgo, short } from "../lib/format";
+import { fmtInt, fmtBloch, toSats, fmtTime, timeAgo, short } from "../lib/format";
 
 export function AddressView({ addr }: { addr: string }) {
   const { data, error, loading } = useAsync(async () => {
@@ -22,7 +22,8 @@ export function AddressView({ addr }: { addr: string }) {
   const info = data!.info;
   const bal = data!.bal;
   const hist = data!.hist;
-  const balanceSats = info?.balance_sats ?? bal?.satoshis ?? 0;
+  // bigint: balances routinely exceed 2^53 sat on this chain.
+  const balanceSats = toSats(info?.balance_sats ?? bal?.satoshis);
   const utxoCount = info?.utxo_count ?? bal?.utxo_count ?? 0;
   const txs = hist?.transactions || [];
   const poolRole = info?.pool_role;

@@ -81,15 +81,17 @@ impl WalletClient {
     /// Get balance (confirmed + pending) for an address.
     pub async fn balance(&self, address: &Address) -> Result<Balance, WalletError> {
         let bal_response = self.call("getbalance", json!([address.to_string()])).await?;
+        // Satoshi amounts are decimal strings on the V4 wire (rule R3) and
+        // JSON numbers on the live G3 wire — `sat_u64` accepts both.
         let confirmed = bal_response.get("balance")
-            .and_then(|v| v.as_u64())
+            .and_then(super::sat_u64)
             .ok_or_else(|| WalletError::BadResponse("missing balance field".into()))?;
 
         // Get pending from getaddressinfo (Sprint B RPC)
         let addr_info = self.call("getaddressinfo", json!([address.to_string()])).await
             .unwrap_or_else(|_| json!({}));
-        let pending_in = addr_info.get("pending_incoming").and_then(|v| v.as_u64()).unwrap_or(0);
-        let pending_out = addr_info.get("pending_outgoing").and_then(|v| v.as_u64()).unwrap_or(0);
+        let pending_in = addr_info.get("pending_incoming").and_then(super::sat_u64).unwrap_or(0);
+        let pending_out = addr_info.get("pending_outgoing").and_then(super::sat_u64).unwrap_or(0);
 
         Ok(Balance {
             confirmed,
@@ -112,7 +114,8 @@ impl WalletClient {
                 .ok_or_else(|| WalletError::BadResponse("utxo missing txid".into()))?;
             let index = utxo_val.get("index").and_then(|v| v.as_u64())
                 .ok_or_else(|| WalletError::BadResponse("utxo missing index".into()))? as u32;
-            let value = utxo_val.get("value").and_then(|v| v.as_u64())
+            // R3: `value` is a satoshi amount — string or number on the wire.
+            let value = utxo_val.get("value").and_then(super::sat_u64)
                 .ok_or_else(|| WalletError::BadResponse("utxo missing value".into()))?;
 
             let txid_bytes = hex::decode(txid_hex)

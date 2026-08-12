@@ -5,8 +5,9 @@
   "description": "Reference reorg-safe address/UTXO/history indexer for Bloch. SCAFFOLD, unaudited, pre-production. Testnet-only reference.",
   "license": "MIT OR Apache-2.0",
   "type": "module",
+  "_engines_note": "Node >=21 is required, not >=18: recovering an oversized legacy satoshi literal exactly uses the JSON.parse reviver's source-text access (V8 10.9 / Node 21). On 18-20 that path throws instead of returning a rounded amount, which is the correct failure but is still a failure. See src/sats.ts and docs/specs/BLOCH-SATOSHI-ENCODING.md.",
   "engines": {
-    "node": ">=18"
+    "node": ">=21"
   },
   "bin": {
     "bloch-indexer": "dist/index.js"
@@ -16,7 +17,8 @@
     "typecheck": "tsc --noEmit",
     "start": "node dist/index.js",
     "dev": "tsc && node dist/index.js",
-    "selftest": "tsc && node dist/selftest.js"
+    "selftest": "tsc && node dist/selftest.js",
+    "test": "npm run selftest"
   },
   "devDependencies": {
     "typescript": "^5.4.0",

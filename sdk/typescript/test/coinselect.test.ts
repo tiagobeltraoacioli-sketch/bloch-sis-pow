@@ -59,8 +59,38 @@ test("buildTransaction assembles unsigned tx with change output", () => {
   });
   assert.equal(built.tx.inputs.length, 1);
   assert.equal(built.tx.outputs.length, 2); // recipient + change
-  assert.equal(built.tx.outputs[0]!.value, 100_000);
+  // Output values are bigint: this is the amount a signature commits to.
+  assert.equal(built.tx.outputs[0]!.value, 100_000n);
+  assert.equal(built.tx.inputs[0]!.value, 200_000n);
   assert.equal(built.sent, 100_000n);
   assert.equal(built.change, 99_000n);
   assert.equal(built.tx.version, 1);
+});
+
+test("selection and building work on the decimal-string wire form", () => {
+  // A V4 node sends satoshis as strings; selection must not care.
+  const strUtxos: SelectableUtxo[] = [
+    { txid: "dd".repeat(32), index: 0, value: "9007199254740993", script_pubkey: "00".repeat(20) },
+    { txid: "ee".repeat(32), index: 0, value: "1000", script_pubkey: "00".repeat(20) },
+  ];
+  const r = selectCoins(strUtxos, { target: 9_007_199_254_740_000n, fee: 0n });
+  assert.equal(r.inputs.length, 1);
+  // Exact to the satoshi — a number path would have made this ...992.
+  assert.equal(r.inputTotal, 9_007_199_254_740_993n);
+  assert.equal(r.change, 993n);
+});
+
+test("buildTransaction refuses an already-corrupted number amount", () => {
+  const to = encodeAddress("11".repeat(20), "mainnet");
+  assert.throws(
+    () =>
+      buildTransaction({
+        utxos: UTXOS,
+        to,
+        amount: 9_007_199_254_740_993, // > 2^53, silently rounded by JS already
+        fee: 1_000,
+        changeAddress: to,
+      }),
+    RangeError,
+  );
 });

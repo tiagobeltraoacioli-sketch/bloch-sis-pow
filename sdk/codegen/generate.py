@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 from collections import OrderedDict
 
@@ -53,14 +54,27 @@ SKIP_SCHEMAS = {
 }
 
 # Scalar schema aliases: (python_type, go_type).
+#
+# `Satoshis` is NOT a plain scalar. The Genesis-4 supply cap is 10^19 sat
+# (crates/bloch-pos-committee/src/tokenomics_v4.rs) — 108% of int64's positive
+# range and ~1000x JavaScript's 2^53 exact-integer limit — so the wire form is
+# a decimal string and each language binds its own codec:
+#   Go     -> the `Satoshis` type in satoshis.go (uint64 + string JSON)
+#   Python -> `Satoshis` = the wire union, with parse_sats() in units.py
+# Both are emitted from static assets, not from this table, so they are listed
+# in ALIAS_EMIT_SKIP below.
 SCALAR_ALIASES = OrderedDict(
     [
         ("Hex32", ("str", "string")),
         ("Hex20", ("str", "string")),
         ("Address", ("str", "string")),
-        ("Satoshis", ("int", "int64")),
+        ("Satoshis", ("Satoshis", "Satoshis")),
     ]
 )
+
+# Aliases whose declaration is hand-written (in a static asset or emitted with
+# a bespoke line) rather than generated as `type X = Y`.
+GO_ALIAS_EMIT_SKIP = {"Satoshis"}
 
 # Curated word splits so generated method names read well in each language.
 # Key = JSON-RPC method name (sent on the wire, unchanged).
@@ -301,6 +315,15 @@ def build_python_models(schemas):
     # Scalar aliases first.
     out.append("# ── Scalar aliases ─────────────────────────────────────────────────────────\n")
     for alias, (pyt, _got) in SCALAR_ALIASES.items():
+        if alias == "Satoshis":
+            out.append(
+                "# A satoshi amount as it appears ON THE WIRE: a decimal string in V4,\n"
+                "# a bare int from legacy Genesis-3 nodes. Never do arithmetic on the raw\n"
+                "# field — run it through units.parse_sats() first, which accepts both\n"
+                "# forms and returns an exact Python int.\n"
+                "Satoshis = Union[str, int]\n"
+            )
+            continue
         out.append(f"{alias} = {pyt}\n")
     out.append("Height = int\n")
     out.append("\n\n")
@@ -651,6 +674,10 @@ def build_go_models(schemas):
     out.append("package blochclient\n\n")
     out.append("// ── Scalar aliases ──────────────────────────────────────────────────────────\n\n")
     for alias, (_pyt, got) in SCALAR_ALIASES.items():
+        if alias in GO_ALIAS_EMIT_SKIP:
+            out.append(f"// {alias} is declared in {alias.lower()}.go (uint64 in memory, decimal\n")
+            out.append("// string on the wire). See docs/specs/BLOCH-SATOSHI-ENCODING.md.\n")
+            continue
         out.append(f"type {alias} = {got}\n")
     out.append("type Height = int64\n\n")
     out.append("// ── Models ──────────────────────────────────────────────────────────────────\n\n")
@@ -915,6 +942,8 @@ from static_assets import (  # noqa: E402
     PY_GITIGNORE,
     GO_ERRORS,
     GO_UNITS,
+    GO_SATOSHIS,
+    GO_SATOSHIS_TEST,
     GO_SIGNER,
     GO_DOC,
     GO_MOD,
@@ -929,6 +958,24 @@ def write(path, content):
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(content)
     return path
+
+
+def gofmt(paths):
+    """Best-effort `gofmt -w` over the emitted Go files.
+
+    The emitter writes single-space struct fields; gofmt column-aligns them.
+    Running it here keeps regeneration byte-identical to what is committed, so
+    a re-run never shows up as spurious diff. Skipped silently when the Go
+    toolchain is absent — the output is valid Go either way.
+    """
+    go_files = [p for p in paths if p.endswith(".go")]
+    if not go_files:
+        return False
+    try:
+        subprocess.run(["gofmt", "-w", *go_files], check=True, capture_output=True)
+    except (OSError, subprocess.CalledProcessError):
+        return False
+    return True
 
 
 def main():
@@ -963,6 +1010,8 @@ def main():
     written.append(write(os.path.join(GO_OUT, "client.go"), build_go_client(methods)))
     written.append(write(os.path.join(GO_OUT, "errors.go"), GO_ERRORS))
     written.append(write(os.path.join(GO_OUT, "units.go"), GO_UNITS))
+    written.append(write(os.path.join(GO_OUT, "satoshis.go"), GO_SATOSHIS))
+    written.append(write(os.path.join(GO_OUT, "satoshis_test.go"), GO_SATOSHIS_TEST))
     written.append(write(os.path.join(GO_OUT, "signer.go"), GO_SIGNER))
     written.append(write(os.path.join(GO_OUT, "doc.go"), GO_DOC))
     written.append(write(os.path.join(GO_OUT, "go.mod"), GO_MOD.replace("@VERSION@", version)))
@@ -974,12 +1023,15 @@ def main():
     # ── Codegen README ──
     written.append(write(os.path.join(HERE, "README.md"), CODEGEN_README))
 
+    formatted = gofmt(written)
+
     n_models = sum(1 for n in schemas if n not in SKIP_SCHEMAS and n not in SCALAR_ALIASES)
     print(f"Bloch SDK generator — spec: {SPEC_REL} (v{version})")
     print(f"  schemas: {len(schemas)} (skipped {len(SKIP_SCHEMAS)} envelope types)")
     print(f"  emitted models: {n_models} + {len(SYNTHETICS)} synthetic + {len(SCALAR_ALIASES)} scalar aliases")
     print(f"  methods: {len(methods)} typed wrappers per client")
     print(f"  wrote {len(written)} files under sdk/python/ and sdk/go/")
+    print("  gofmt: " + ("applied" if formatted else "skipped (gofmt not on PATH)"))
 
 
 if __name__ == "__main__":

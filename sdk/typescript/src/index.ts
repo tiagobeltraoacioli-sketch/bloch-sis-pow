@@ -19,6 +19,8 @@ export * from "./types.js";
 export {
   SATS_PER_BLOCH,
   BLOCH_DECIMALS,
+  MAX_SATS,
+  parseSats,
   blochToSats,
   satsToBloch,
   formatBloch,

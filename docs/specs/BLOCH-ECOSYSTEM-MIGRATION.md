@@ -163,12 +163,17 @@ exists and means **TEE attestation** (SEV-SNP report, `src/attestation/`).
 PoS attestation methods must not reuse the word bare — use
 `getepochattestations` or rename the TEE method in the V4 API bump.
 
-**Amount headroom (echo of tokenomics §8.1):** V4 maximum issued is
-100 B BLCH = **10^19 sats**, which exceeds both `i64::MAX` (9.22×10^18) and
-JavaScript's 2^53. Today's API emits sats as JSON numbers and the Go SDK types
-them `int64` (`sdk/go/models.go:16`). The V4 API must emit **aggregate**
-amounts (supply, pool totals, large balances) as strings. This is a wire-format
-decision that belongs in the OpenAPI spec, once, not per client.
+**Amount headroom (echo of tokenomics §8.1) — RESOLVED, see
+`docs/specs/BLOCH-SATOSHI-ENCODING.md`:** V4 maximum issued is 100 B BLCH =
+**10^19 sats**, which exceeds both `i64::MAX` (9.22×10^18, by 8.42%) and
+JavaScript's 2^53 (by ~1110×). Genesis-3's API emits sats as JSON numbers and
+the Go SDK typed them `int64`. The V4 API emits **every** satoshi-denominated
+field as a decimal string — not only aggregates: an "aggregates only" rule is a
+latent bug in every client that meets its first large single balance, and the
+largest carryover address is already 187× past 2^53 on its own. Decided once in
+the OpenAPI spec, not per client; the Go SDK's `Satoshis` became a `uint64`
+with a string codec (`sdk/go/satoshis.go`) as a consequence of the wire form,
+not as the fix.
 
 **Effort:** ~3–4 dev-weeks inside DEV-3's node work (the RPC layer is thin;
 the cost is the new state queries + the OpenAPI contract in §4).
@@ -344,10 +349,12 @@ Plan:
    `openapi.yaml:866-874`) is rewritten.
 2. **Regenerate** Python + Go — the codegen makes this cheap; the real work
    is the spec.
-3. **Fix amount types while the major is open**: `sdk/go/models.go:16` has
-   `type Satoshis = int64` — **overflows at V4's 10^19-sat max issued**;
-   Python is arbitrary-precision but the JSON wire isn't (2^53 in every JS
-   consumer, including the explorer). Aggregates become strings per §1.4.
+3. **Fix amount types while the major is open** — done: `sdk/go/models.go` no
+   longer aliases `Satoshis` to `int64` (which **overflowed at V4's 10^19-sat
+   max issued**); it is a `uint64` with a decimal-string JSON codec in
+   `sdk/go/satoshis.go`. Python is arbitrary-precision but the JSON wire isn't
+   (2^53 in every JS consumer, including the explorer), so *every*
+   satoshi-denominated field is a string per §1.4 — not just aggregates.
 4. **TypeScript by hand**: `types.ts` (fields at 38, 56, 90, 118, 121, 332
    reference `blue_score`/`bits`), `txbuilder.ts` (the
    `from_stratum_bytes` wire-format name survives — it's just the Bitcoin-
@@ -563,7 +570,7 @@ banner ("chain halted at 80,000; canonical record is the signed snapshot
 |---|---|---|
 | `gettaintstatus` slips → wallets can't pre-flight → users hit unexplained consensus rejections | §1.4/§3.4 | Treat the RPC as part of DEV-3's consensus deliverable, not a follow-up; A8 blocks wallet sign-off without it |
 | Commission disclosure under-built → §6.3's no-cap bet fails silently | §2.3 | MUST-level acceptance criteria on explorer + wallet delegation screens |
-| Amount overflow (10^19 sats vs int64 / 2^53) ships into V4 clients | §1.4/§4 | String aggregates decided once in OpenAPI; Go `Satoshis` type change; explorer BigInt |
+| Amount overflow (10^19 sats vs int64 / 2^53) ships into V4 clients | §1.4/§4 | CLOSED — all satoshi fields are decimal strings, decided once in OpenAPI (`BLOCH-SATOSHI-ENCODING.md`); Go `Satoshis` is `uint64` + string codec; explorer/TS BigInt |
 | Explorer dies with the pool (shared `g2rpc.posternpool.com`) | §2.4/§6 | Repoint before decommission; it is one constant |
 | L2 users stranded at the halt | §5.3 | Published drain deadline well before h 80,000 |
 | `getattestation` name collision produces two meanings of "attestation" in one API | §1.4 | Rename in the V4 major, document both |

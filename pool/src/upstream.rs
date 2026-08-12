@@ -19,6 +19,22 @@ use std::time::Duration;
 use bloch_crypto::core::Transaction;
 use serde_json::{json, Value};
 
+/// Read a satoshi-denominated template field.
+///
+/// V4 rule R3 (docs/specs/BLOCH-RPC-V4.md) makes every satoshi amount a
+/// decimal STRING on the wire — the V4 supply exceeds both `i64::MAX` and
+/// JavaScript's `Number.MAX_SAFE_INTEGER`. Live G3 nodes still send JSON
+/// numbers, so the pool accepts BOTH forms and one pool binary can mine
+/// against either wire. Anything else (float, null, garbage string) yields
+/// `None`, which the reward-bearing fields below turn into a hard error
+/// rather than a silent 0-sat coinbase.
+fn sat_u64(v: &Value) -> Option<u64> {
+    if let Some(n) = v.as_u64() {
+        return Some(n);
+    }
+    v.as_str().and_then(|s| s.trim().parse::<u64>().ok())
+}
+
 /// A block template as served by the node's `getblocktemplate`.
 #[derive(Clone, Debug)]
 pub struct BlockTemplate {
@@ -136,65 +152,7 @@ impl Upstream {
 
     pub fn get_block_template(&self) -> Result<BlockTemplate, String> {
         let v = self.call("getblocktemplate", json!([]))?;
-
-        let parents = v.get("parents").and_then(|p| p.as_array())
-            .ok_or("template missing parents")?
-            .iter()
-            .map(|h| {
-                let bytes = hex::decode(h.as_str().unwrap_or("")).map_err(|e| e.to_string())?;
-                let arr: [u8; 32] = bytes.try_into().map_err(|_| "parent not 32 bytes".to_string())?;
-                Ok(arr)
-            })
-            .collect::<Result<Vec<[u8; 32]>, String>>()?;
-
-        let founder_hash_hex = v.get("founder_address_hash").and_then(|f| f.as_str()).unwrap_or("");
-        let founder_bytes = hex::decode(founder_hash_hex).unwrap_or_default();
-        let mut founder_address_hash = [0u8; 20];
-        if founder_bytes.len() == 20 {
-            founder_address_hash.copy_from_slice(&founder_bytes);
-        }
-
-        // Any undecodable mempool tx fails the WHOLE template: silently
-        // dropping a tx while the coinbase still claims its fee would
-        // make every block attempt fail node validation forever, with
-        // miners' work silently wasted (advisor finding).
-        let mut transactions: Vec<Transaction> = Vec::new();
-        if let Some(arr) = v.get("transactions").and_then(|t| t.as_array()) {
-            for e in arr {
-                let hexstr = e.get("data").and_then(|d| d.as_str())
-                    .ok_or("template tx missing data")?;
-                let bytes = hex::decode(hexstr)
-                    .map_err(|e| format!("template tx hex: {}", e))?;
-                let tx = Transaction::from_stratum_bytes(&bytes)
-                    .map_err(|e| format!("template tx decode: {}", e))?;
-                transactions.push(tx);
-            }
-        }
-
-        // Compact bits must FIT u32 — `as u32` would truncate garbage
-        // into a plausible-looking difficulty.
-        let bits = v.get("bits").and_then(|x| x.as_u64()).ok_or("template missing bits")?;
-        let bits = u32::try_from(bits).map_err(|_| "template bits exceeds u32".to_string())?;
-
-        // Reward-bearing fields hard-error like height/bits: a renamed
-        // or missing field must NOT silently become a 0-sat coinbase.
-        let height = v.get("height").and_then(|x| x.as_u64()).ok_or("template missing height")?;
-        Ok(BlockTemplate {
-            parents,
-            height,
-            // Older nodes don't serve emission_height; fall back to the local
-            // height (correct only on chains without a carry-over offset —
-            // the divergence check in main.rs then degrades, it never lies).
-            emission_height:     v.get("emission_height").and_then(|x| x.as_u64()).unwrap_or(height),
-            blue_score:          v.get("blue_score").and_then(|x| x.as_u64()).unwrap_or(0),
-            bits,
-            cur_time:            v.get("cur_time").and_then(|x| x.as_u64()).ok_or("template missing cur_time")?,
-            subsidy_sat:         v.get("subsidy_sat").and_then(|x| x.as_u64()).ok_or("template missing subsidy_sat")?,
-            founder_vesting_sat: v.get("founder_vesting_sat").and_then(|x| x.as_u64()).unwrap_or(0),
-            founder_address_hash,
-            total_fees:          v.get("total_fees").and_then(|x| x.as_u64()).ok_or("template missing total_fees")?,
-            transactions,
-        })
+        parse_template(&v)
     }
 
     /// Canonical block hash at `height` (`getblockhash`), or None if
@@ -233,6 +191,70 @@ impl Upstream {
             Err(format!("submitblock: unexpected response {}", v))
         }
     }
+}
+
+/// Parse a `getblocktemplate` result. Split out of the HTTP call so the wire
+/// contract — including the V4 R3 string amounts — is testable without a node.
+fn parse_template(v: &Value) -> Result<BlockTemplate, String> {
+    let parents = v.get("parents").and_then(|p| p.as_array())
+        .ok_or("template missing parents")?
+        .iter()
+        .map(|h| {
+            let bytes = hex::decode(h.as_str().unwrap_or("")).map_err(|e| e.to_string())?;
+            let arr: [u8; 32] = bytes.try_into().map_err(|_| "parent not 32 bytes".to_string())?;
+            Ok(arr)
+        })
+        .collect::<Result<Vec<[u8; 32]>, String>>()?;
+
+    let founder_hash_hex = v.get("founder_address_hash").and_then(|f| f.as_str()).unwrap_or("");
+    let founder_bytes = hex::decode(founder_hash_hex).unwrap_or_default();
+    let mut founder_address_hash = [0u8; 20];
+    if founder_bytes.len() == 20 {
+        founder_address_hash.copy_from_slice(&founder_bytes);
+    }
+
+    // Any undecodable mempool tx fails the WHOLE template: silently
+    // dropping a tx while the coinbase still claims its fee would
+    // make every block attempt fail node validation forever, with
+    // miners' work silently wasted (advisor finding).
+    let mut transactions: Vec<Transaction> = Vec::new();
+    if let Some(arr) = v.get("transactions").and_then(|t| t.as_array()) {
+        for e in arr {
+            let hexstr = e.get("data").and_then(|d| d.as_str())
+                .ok_or("template tx missing data")?;
+            let bytes = hex::decode(hexstr)
+                .map_err(|e| format!("template tx hex: {}", e))?;
+            let tx = Transaction::from_stratum_bytes(&bytes)
+                .map_err(|e| format!("template tx decode: {}", e))?;
+            transactions.push(tx);
+        }
+    }
+
+    // Compact bits must FIT u32 — `as u32` would truncate garbage
+    // into a plausible-looking difficulty.
+    let bits = v.get("bits").and_then(|x| x.as_u64()).ok_or("template missing bits")?;
+    let bits = u32::try_from(bits).map_err(|_| "template bits exceeds u32".to_string())?;
+
+    // Reward-bearing fields hard-error like height/bits: a renamed
+    // or missing field must NOT silently become a 0-sat coinbase.
+    let height = v.get("height").and_then(|x| x.as_u64()).ok_or("template missing height")?;
+    Ok(BlockTemplate {
+        parents,
+        height,
+        // Older nodes don't serve emission_height; fall back to the local
+        // height (correct only on chains without a carry-over offset —
+        // the divergence check in main.rs then degrades, it never lies).
+        emission_height:     v.get("emission_height").and_then(|x| x.as_u64()).unwrap_or(height),
+        blue_score:          v.get("blue_score").and_then(|x| x.as_u64()).unwrap_or(0),
+        bits,
+        cur_time:            v.get("cur_time").and_then(|x| x.as_u64()).ok_or("template missing cur_time")?,
+        // Satoshi amounts: number (G3 wire) or decimal string (V4 R3).
+        subsidy_sat:         v.get("subsidy_sat").and_then(sat_u64).ok_or("template missing subsidy_sat")?,
+        founder_vesting_sat: v.get("founder_vesting_sat").and_then(sat_u64).unwrap_or(0),
+        founder_address_hash,
+        total_fees:          v.get("total_fees").and_then(sat_u64).ok_or("template missing total_fees")?,
+        transactions,
+    })
 }
 
 #[cfg(test)]
@@ -324,6 +346,62 @@ mod tests {
                      EMISSION_V3_INITIAL_REWARD_SAT, 1);
         let why = t.check_reward_consensus().expect_err("phantom vesting must be refused");
         assert!(why.contains("vesting"), "refusal names the divergent field: {}", why);
+    }
+
+    // ── V4 rule R3: satoshi amounts arrive as decimal strings ──────────
+
+    /// A template whose satoshi fields are decimal STRINGS (the V4 wire,
+    /// docs/specs/BLOCH-RPC-V4.md R3) parses to exactly the same struct as the
+    /// numeric G3 wire. Both must work: one pool binary mines against either.
+    fn template_json(subsidy: Value, vesting: Value, fees: Value) -> Value {
+        json!({
+            "parents":              [hex::encode([0x11u8; 32])],
+            "height":               42,
+            "emission_height":      42,
+            "blue_score":           42,
+            "bits":                 0x2100ffffu64,
+            "cur_time":             1_777_686_999u64,
+            "subsidy_sat":          subsidy,
+            "founder_vesting_sat":  vesting,
+            "founder_address_hash": hex::encode([0x77u8; 20]),
+            "total_fees":           fees,
+            "transactions":         [],
+        })
+    }
+
+    #[test]
+    fn string_and_number_amounts_parse_identically() {
+        let numeric = parse_template(&template_json(
+            json!(238_100_000_000u64), json!(7u64), json!(1_234u64))).expect("numeric wire");
+        let stringy = parse_template(&template_json(
+            json!("238100000000"), json!("7"), json!("1234"))).expect("V4 string wire");
+
+        assert_eq!(numeric.subsidy_sat, stringy.subsidy_sat);
+        assert_eq!(numeric.founder_vesting_sat, stringy.founder_vesting_sat);
+        assert_eq!(numeric.total_fees, stringy.total_fees);
+        assert_eq!(stringy.subsidy_sat, 238_100_000_000);
+        assert_eq!(stringy.total_fees, 1_234);
+    }
+
+    #[test]
+    fn string_amount_beyond_f64_and_i64_survives() {
+        // The whole point of R3: a value above 2^53 (and above i64::MAX once
+        // scaled) must not be corrupted. u64::MAX round-trips through the
+        // decimal-string form.
+        let t = parse_template(&template_json(
+            json!(u64::MAX.to_string()), json!("0"), json!("0"))).expect("huge string amount");
+        assert_eq!(t.subsidy_sat, u64::MAX);
+    }
+
+    #[test]
+    fn unparseable_amount_is_a_hard_error_not_a_zero_coinbase() {
+        // A garbage or float amount must fail the template, never degrade to
+        // a 0-sat coinbase that mines rejected blocks forever.
+        for bad in [json!("not-a-number"), json!(1.5f64), json!(null)] {
+            let e = parse_template(&template_json(bad.clone(), json!("0"), json!("0")))
+                .expect_err("bad subsidy must fail the template");
+            assert!(e.contains("subsidy_sat"), "error names the field: {e}");
+        }
     }
 
     #[test]

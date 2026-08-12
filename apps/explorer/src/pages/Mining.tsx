@@ -34,7 +34,9 @@ export function MiningPage() {
     const totalHs = net.networkHs + userHs; // include the user in the pie
     const share = userHs / totalHs;
     const blocksPerDay = share * (86400 / net.blockTimeSecs);
-    const rewardBloch = net.minerRewardSats / 1e8;
+    // minerRewardSats is bigint; the per-day estimate is an explicitly lossy
+    // display figure, so the float conversion happens here and only here.
+    const rewardBloch = Number(net.minerRewardSats) / 1e8;
     const blochPerDay = blocksPerDay * rewardBloch;
     const secsPerBlock = blocksPerDay > 0 ? 86400 / blocksPerDay : Infinity;
     return { share, blocksPerDay, blochPerDay, rewardBloch, secsPerBlock };

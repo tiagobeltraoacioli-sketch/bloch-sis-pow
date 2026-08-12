@@ -21,9 +21,6 @@ docs/*.tar
 scan/node_modules/
 scan/dist/
 scan/.astro/
-scan/node_modules/
-scan/dist/
-scan/.astro/
 loc-alpha.txt
 loc-beta-day0.txt
 
@@ -47,3 +44,7 @@ deploy/artifacts/
 
 # Orquestracao local de agentes: nao e artefato do protocolo.
 .claude/
+
+# Python bytecode (sdk/codegen, tools/*)
+__pycache__/
+*.pyc

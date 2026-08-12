@@ -49,6 +49,22 @@ pub use seed::SeedPhrase;
 pub use errors::WalletError;
 pub use disclosure::{DisclosureBundle, DisclosureEntry, VerifiedDisclosure, DisclosureError};
 
+/// Read a satoshi-denominated field out of a node JSON-RPC response.
+///
+/// V4 rule R3 (docs/specs/BLOCH-RPC-V4.md) puts every satoshi amount on the
+/// wire as a decimal STRING — the V4 supply exceeds `i64::MAX` and is far past
+/// JavaScript's `Number.MAX_SAFE_INTEGER`, so a JSON number cannot carry it.
+/// Live Genesis-3 nodes still send JSON numbers, so wallet code accepts BOTH
+/// and one binary talks to either wire. Returns `None` for anything else
+/// (float, null, non-numeric string) so callers keep their existing
+/// missing-field handling.
+pub fn sat_u64(v: &serde_json::Value) -> Option<u64> {
+    if let Some(n) = v.as_u64() {
+        return Some(n);
+    }
+    v.as_str().and_then(|s| s.trim().parse::<u64>().ok())
+}
+
 /// Local UTXO representation for wallet operations.
 #[derive(Debug, Clone)]
 pub struct Utxo {
@@ -271,6 +287,25 @@ impl Wallet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// V4 rule R3: satoshi amounts arrive as decimal strings; live G3 nodes
+    /// still send numbers. Wallet parsing must accept BOTH, exactly — including
+    /// values past 2^53, which is the whole reason the wire changed.
+    #[test]
+    fn sat_u64_reads_both_wires_exactly() {
+        assert_eq!(sat_u64(&serde_json::json!(8_400_000_000u64)), Some(8_400_000_000));
+        assert_eq!(sat_u64(&serde_json::json!("8400000000")), Some(8_400_000_000));
+        assert_eq!(sat_u64(&serde_json::json!(u64::MAX.to_string())), Some(u64::MAX));
+        assert_eq!(sat_u64(&serde_json::json!(" 42 ")), Some(42));
+
+        // Anything that is not an exact non-negative integer is None, so
+        // callers keep their missing-field handling instead of silently
+        // reading a corrupted amount.
+        assert_eq!(sat_u64(&serde_json::json!(1.5f64)), None);
+        assert_eq!(sat_u64(&serde_json::json!("-1")), None);
+        assert_eq!(sat_u64(&serde_json::json!("not-a-number")), None);
+        assert_eq!(sat_u64(&serde_json::Value::Null), None);
+    }
 
     #[test]
     fn sign_tx_script_sig_is_length_prefixed_and_verifies() {

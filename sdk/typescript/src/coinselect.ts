@@ -10,6 +10,7 @@
 // and fee — prefer FEWER, larger inputs, which largest-first naturally does.
 
 import type { Satoshis, Utxo } from "./types.js";
+import { parseSats } from "./units.js";
 
 export interface SelectableUtxo extends Utxo {
   /** value in satoshis (inherited from Utxo.value) */
@@ -63,25 +64,30 @@ export function selectCoins(
   if (fee < 0n) throw new RangeError("fee must be >= 0");
 
   const required = target + fee;
-  const sorted = [...utxos].sort((a, b) => {
-    // Largest value first; break ties deterministically by txid:index.
-    const bv = BigInt(b.value);
-    const av = BigInt(a.value);
-    if (bv !== av) return bv > av ? 1 : -1;
-    if (a.txid !== b.txid) return a.txid < b.txid ? -1 : 1;
-    return a.index - b.index;
-  });
+
+  // Parse every wire value ONCE, up front, into exact bigints. `Satoshis` is a
+  // `string | number` wire union (types.ts), and parseSats rejects the
+  // already-rounded `number` form rather than letting a corrupted amount decide
+  // which coins get spent.
+  const sorted = [...utxos]
+    .map((u) => ({ u, v: parseSats(u.value) }))
+    .sort((a, b) => {
+      // Largest value first; break ties deterministically by txid:index.
+      if (b.v !== a.v) return b.v > a.v ? 1 : -1;
+      if (a.u.txid !== b.u.txid) return a.u.txid < b.u.txid ? -1 : 1;
+      return a.u.index - b.u.index;
+    });
 
   const chosen: SelectableUtxo[] = [];
   let total = 0n;
-  for (const u of sorted) {
+  for (const { u, v } of sorted) {
     chosen.push(u);
-    total += BigInt(u.value);
+    total += v;
     if (total >= required) break;
   }
 
   if (total < required) {
-    const available = sorted.reduce((acc, u) => acc + BigInt(u.value), 0n);
+    const available = sorted.reduce((acc, e) => acc + e.v, 0n);
     throw new InsufficientFundsError(required, available);
   }
 

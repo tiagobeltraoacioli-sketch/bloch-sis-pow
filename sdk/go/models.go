@@ -13,7 +13,9 @@ package blochclient
 type Hex32 = string
 type Hex20 = string
 type Address = string
-type Satoshis = int64
+
+// Satoshis is declared in satoshis.go (uint64 in memory, decimal
+// string on the wire). See docs/specs/BLOCH-SATOSHI-ENCODING.md.
 type Height = int64
 
 // ── Models ──────────────────────────────────────────────────────────────────
@@ -30,10 +32,10 @@ type TxInput struct {
 }
 
 type TxOutput struct {
-	Index        int64   `json:"index,omitempty"`
-	Value        int64   `json:"value,omitempty"`
-	Bloch        float64 `json:"bloch,omitempty"`
-	ScriptPubkey string  `json:"script_pubkey,omitempty"`
+	Index        int64    `json:"index,omitempty"`
+	Value        Satoshis `json:"value,omitempty"`
+	Bloch        float64  `json:"bloch,omitempty"`
+	ScriptPubkey string   `json:"script_pubkey,omitempty"`
 }
 
 // Transaction — Decoded transaction (format_tx). decoderawtransaction adds `size`.
@@ -130,10 +132,10 @@ type TransactionLookup struct {
 }
 
 type Balance struct {
-	Satoshis  int64   `json:"satoshis,omitempty"`
-	Bloch     float64 `json:"bloch,omitempty"`
-	UtxoCount int64   `json:"utxo_count,omitempty"`
-	Address   string  `json:"address,omitempty"`
+	Satoshis  Satoshis `json:"satoshis,omitempty"`
+	Bloch     float64  `json:"bloch,omitempty"`
+	UtxoCount int64    `json:"utxo_count,omitempty"`
+	Address   string   `json:"address,omitempty"`
 }
 
 // AddressCount — getaddresscount — distinct on-chain wallets holding >= 1 UTXO.
@@ -144,48 +146,48 @@ type AddressCount struct {
 }
 
 type Utxo struct {
-	Txid         string `json:"txid,omitempty"`
-	Index        int64  `json:"index,omitempty"`
-	Value        int64  `json:"value,omitempty"`
-	ScriptPubkey string `json:"script_pubkey,omitempty"`
+	Txid         string   `json:"txid,omitempty"`
+	Index        int64    `json:"index,omitempty"`
+	Value        Satoshis `json:"value,omitempty"`
+	ScriptPubkey string   `json:"script_pubkey,omitempty"`
 }
 
 type UtxoList struct {
-	Address   string  `json:"address,omitempty"`
-	UtxoCount int64   `json:"utxo_count,omitempty"`
-	Satoshis  int64   `json:"satoshis,omitempty"`
-	Bloch     float64 `json:"bloch,omitempty"`
-	Utxos     []Utxo  `json:"utxos,omitempty"`
+	Address   string   `json:"address,omitempty"`
+	UtxoCount int64    `json:"utxo_count,omitempty"`
+	Satoshis  Satoshis `json:"satoshis,omitempty"`
+	Bloch     float64  `json:"bloch,omitempty"`
+	Utxos     []Utxo   `json:"utxos,omitempty"`
 }
 
 // AddressInfo — getaddressinfo result.
 type AddressInfo struct {
-	Address         string  `json:"address,omitempty"`
-	BalanceSats     int64   `json:"balance_sats,omitempty"`
-	BalanceBloch    float64 `json:"balance_bloch,omitempty"`
-	UtxoCount       int64   `json:"utxo_count,omitempty"`
-	PendingIncoming int64   `json:"pending_incoming,omitempty"`
-	PendingOutgoing int64   `json:"pending_outgoing,omitempty"`
-	PoolRole        *string `json:"pool_role,omitempty"`
+	Address         string   `json:"address,omitempty"`
+	BalanceSats     Satoshis `json:"balance_sats,omitempty"`
+	BalanceBloch    float64  `json:"balance_bloch,omitempty"`
+	UtxoCount       int64    `json:"utxo_count,omitempty"`
+	PendingIncoming Satoshis `json:"pending_incoming,omitempty"`
+	PendingOutgoing Satoshis `json:"pending_outgoing,omitempty"`
+	PoolRole        *string  `json:"pool_role,omitempty"`
 }
 
 // AddressBalanceAtHeight — getaddressbalance_at_height result.
 type AddressBalanceAtHeight struct {
-	Address           string  `json:"address,omitempty"`
-	Height            int64   `json:"height,omitempty"`
-	BalanceSats       int64   `json:"balance_sats,omitempty"`
-	BalanceBloch      float64 `json:"balance_bloch,omitempty"`
-	TxCountUpToHeight int64   `json:"tx_count_up_to_height,omitempty"`
+	Address           string   `json:"address,omitempty"`
+	Height            int64    `json:"height,omitempty"`
+	BalanceSats       Satoshis `json:"balance_sats,omitempty"`
+	BalanceBloch      float64  `json:"balance_bloch,omitempty"`
+	TxCountUpToHeight int64    `json:"tx_count_up_to_height,omitempty"`
 }
 
 type AddressHistoryEntry struct {
-	Txid          string  `json:"txid,omitempty"`
-	BlockHeight   int64   `json:"block_height,omitempty"`
-	Timestamp     int64   `json:"timestamp,omitempty"`
-	Confirmations int64   `json:"confirmations,omitempty"`
-	Direction     string  `json:"direction,omitempty"`
-	AmountSats    int64   `json:"amount_sats,omitempty"`
-	AmountBloch   float64 `json:"amount_bloch,omitempty"`
+	Txid          string   `json:"txid,omitempty"`
+	BlockHeight   int64    `json:"block_height,omitempty"`
+	Timestamp     int64    `json:"timestamp,omitempty"`
+	Confirmations int64    `json:"confirmations,omitempty"`
+	Direction     string   `json:"direction,omitempty"`
+	AmountSats    Satoshis `json:"amount_sats,omitempty"`
+	AmountBloch   float64  `json:"amount_bloch,omitempty"`
 }
 
 // ListTransactionsResult — listtransactions result.
@@ -226,28 +228,28 @@ type BroadcastResult struct {
 
 // FeeEstimate — estimatefee — median fee of current mempool entries.
 type FeeEstimate struct {
-	FeerateSats  int64   `json:"feerate_sats,omitempty"`
-	FeerateBloch float64 `json:"feerate_bloch,omitempty"`
-	MempoolSize  int64   `json:"mempool_size,omitempty"`
-	Note         string  `json:"note,omitempty"`
+	FeerateSats  Satoshis `json:"feerate_sats,omitempty"`
+	FeerateBloch float64  `json:"feerate_bloch,omitempty"`
+	MempoolSize  int64    `json:"mempool_size,omitempty"`
+	Note         string   `json:"note,omitempty"`
 }
 
 // FeeEstimateAdvanced — estimatefeeadvanced result.
 type FeeEstimateAdvanced struct {
-	NextBlockSats    int64  `json:"next_block_sats,omitempty"`
-	MediumPriority   int64  `json:"medium_priority,omitempty"`
-	SlowPriority     int64  `json:"slow_priority,omitempty"`
-	MempoolMedian    int64  `json:"mempool_median,omitempty"`
-	MempoolSize      int64  `json:"mempool_size,omitempty"`
-	RecommendedBloch string `json:"recommended_bloch,omitempty"`
+	NextBlockSats    Satoshis `json:"next_block_sats,omitempty"`
+	MediumPriority   Satoshis `json:"medium_priority,omitempty"`
+	SlowPriority     Satoshis `json:"slow_priority,omitempty"`
+	MempoolMedian    Satoshis `json:"mempool_median,omitempty"`
+	MempoolSize      int64    `json:"mempool_size,omitempty"`
+	RecommendedBloch string   `json:"recommended_bloch,omitempty"`
 }
 
 // MempoolEntry — getrawmempool verbose entry.
 type MempoolEntry struct {
-	Txid     string  `json:"txid,omitempty"`
-	Fee      int64   `json:"fee,omitempty"`
-	FeeBloch float64 `json:"fee_bloch,omitempty"`
-	Time     int64   `json:"time,omitempty"`
+	Txid     string   `json:"txid,omitempty"`
+	Fee      Satoshis `json:"fee,omitempty"`
+	FeeBloch float64  `json:"fee_bloch,omitempty"`
+	Time     int64    `json:"time,omitempty"`
 }
 
 // RawMempool — getrawmempool — compact (txids) or verbose (transactions) shape.
@@ -266,10 +268,10 @@ type MempoolBucket struct {
 // MempoolStats — getmempoolstats result.
 type MempoolStats struct {
 	Size      int64           `json:"size,omitempty"`
-	TotalFees int64           `json:"total_fees,omitempty"`
-	MinFee    int64           `json:"min_fee,omitempty"`
-	MaxFee    int64           `json:"max_fee,omitempty"`
-	MedianFee int64           `json:"median_fee,omitempty"`
+	TotalFees Satoshis        `json:"total_fees,omitempty"`
+	MinFee    Satoshis        `json:"min_fee,omitempty"`
+	MaxFee    Satoshis        `json:"max_fee,omitempty"`
+	MedianFee Satoshis        `json:"median_fee,omitempty"`
 	AvgFee    float64         `json:"avg_fee,omitempty"`
 	Buckets   []MempoolBucket `json:"buckets,omitempty"`
 }
@@ -305,18 +307,18 @@ type HashrateInfo struct {
 }
 
 type SupplyTier struct {
-	Label        string  `json:"label,omitempty"`
-	AddressCount int64   `json:"address_count,omitempty"`
-	TotalSats    int64   `json:"total_sats,omitempty"`
-	TotalBloch   float64 `json:"total_bloch,omitempty"`
-	PctOfSupply  float64 `json:"pct_of_supply,omitempty"`
+	Label        string   `json:"label,omitempty"`
+	AddressCount int64    `json:"address_count,omitempty"`
+	TotalSats    Satoshis `json:"total_sats,omitempty"`
+	TotalBloch   float64  `json:"total_bloch,omitempty"`
+	PctOfSupply  float64  `json:"pct_of_supply,omitempty"`
 }
 
 // SupplyDistribution — getsupplydistribution result.
 type SupplyDistribution struct {
 	Tiers          []SupplyTier `json:"tiers,omitempty"`
 	TotalAddresses int64        `json:"total_addresses,omitempty"`
-	TotalSats      int64        `json:"total_sats,omitempty"`
+	TotalSats      Satoshis     `json:"total_sats,omitempty"`
 	TotalBloch     float64      `json:"total_bloch,omitempty"`
 }
 
@@ -348,12 +350,12 @@ type BlockTimePercentiles struct {
 }
 
 type TxInBlock struct {
-	Txid         string `json:"txid,omitempty"`
-	SizeBytes    int64  `json:"size_bytes,omitempty"`
-	InputsCount  int64  `json:"inputs_count,omitempty"`
-	OutputsCount int64  `json:"outputs_count,omitempty"`
-	FeeSats      int64  `json:"fee_sats,omitempty"`
-	IsCoinbase   bool   `json:"is_coinbase,omitempty"`
+	Txid         string   `json:"txid,omitempty"`
+	SizeBytes    int64    `json:"size_bytes,omitempty"`
+	InputsCount  int64    `json:"inputs_count,omitempty"`
+	OutputsCount int64    `json:"outputs_count,omitempty"`
+	FeeSats      Satoshis `json:"fee_sats,omitempty"`
+	IsCoinbase   bool     `json:"is_coinbase,omitempty"`
 }
 
 // TxsByBlock — gettxsbyblock result.
@@ -367,35 +369,35 @@ type TxsByBlock struct {
 
 // PoolReportEntry — One protocol pool in getpools. Founder entry adds vesting fields; a pool with no configured address reports status "pending_phase_6".
 type PoolReportEntry struct {
-	ShareBps               *int64  `json:"share_bps,omitempty"`
-	SubsidyPerBlockSat     int64   `json:"subsidy_per_block_sat,omitempty"`
-	AddressHashHex         *string `json:"address_hash_hex,omitempty"`
-	Address                *string `json:"address,omitempty"`
-	BalanceSat             int64   `json:"balance_sat,omitempty"`
-	BalanceBloch           float64 `json:"balance_bloch,omitempty"`
-	UtxoCount              int64   `json:"utxo_count,omitempty"`
-	Status                 string  `json:"status,omitempty"`
-	VestingPerMonthSat     int64   `json:"vesting_per_month_sat,omitempty"`
-	VestingAmountAtNextSat int64   `json:"vesting_amount_at_next_sat,omitempty"`
-	VestingActiveAtNext    bool    `json:"vesting_active_at_next,omitempty"`
-	VestingTotalSat        int64   `json:"vesting_total_sat,omitempty"`
-	VestingMonths          int64   `json:"vesting_months,omitempty"`
+	ShareBps               *int64   `json:"share_bps,omitempty"`
+	SubsidyPerBlockSat     Satoshis `json:"subsidy_per_block_sat,omitempty"`
+	AddressHashHex         *string  `json:"address_hash_hex,omitempty"`
+	Address                *string  `json:"address,omitempty"`
+	BalanceSat             Satoshis `json:"balance_sat,omitempty"`
+	BalanceBloch           float64  `json:"balance_bloch,omitempty"`
+	UtxoCount              int64    `json:"utxo_count,omitempty"`
+	Status                 string   `json:"status,omitempty"`
+	VestingPerMonthSat     Satoshis `json:"vesting_per_month_sat,omitempty"`
+	VestingAmountAtNextSat Satoshis `json:"vesting_amount_at_next_sat,omitempty"`
+	VestingActiveAtNext    bool     `json:"vesting_active_at_next,omitempty"`
+	VestingTotalSat        Satoshis `json:"vesting_total_sat,omitempty"`
+	VestingMonths          int64    `json:"vesting_months,omitempty"`
 }
 
 // Pools — getpools — next-block subsidy split plus per-pool address/balance.
 type Pools struct {
 	CurrentHeight        int64       `json:"current_height,omitempty"`
 	NextBlockHeight      int64       `json:"next_block_height,omitempty"`
-	SubsidyPerBlockSat   int64       `json:"subsidy_per_block_sat,omitempty"`
+	SubsidyPerBlockSat   Satoshis    `json:"subsidy_per_block_sat,omitempty"`
 	SubsidyPerBlockBloch float64     `json:"subsidy_per_block_bloch,omitempty"`
-	MinerShareSat        int64       `json:"miner_share_sat,omitempty"`
+	MinerShareSat        Satoshis    `json:"miner_share_sat,omitempty"`
 	Pools                *PoolsPools `json:"pools,omitempty"`
 }
 
 type BlockTemplateTx struct {
-	Txid string `json:"txid,omitempty"`
-	Fee  int64  `json:"fee,omitempty"`
-	Data string `json:"data,omitempty"`
+	Txid string   `json:"txid,omitempty"`
+	Fee  Satoshis `json:"fee,omitempty"`
+	Data string   `json:"data,omitempty"`
 }
 
 // BlockTemplate — getblocktemplate — everything a SIS-aware pool needs to assemble a candidate block. `bits` is computed exactly as accept_block validates (ASERT-Lattice anchored at genesis, keyed on the parent timestamp).
@@ -406,10 +408,10 @@ type BlockTemplate struct {
 	Bits               int64             `json:"bits,omitempty"`
 	CurTime            int64             `json:"cur_time,omitempty"`
 	ParentTime         int64             `json:"parent_time,omitempty"`
-	SubsidySat         int64             `json:"subsidy_sat,omitempty"`
-	FounderVestingSat  int64             `json:"founder_vesting_sat,omitempty"`
+	SubsidySat         Satoshis          `json:"subsidy_sat,omitempty"`
+	FounderVestingSat  Satoshis          `json:"founder_vesting_sat,omitempty"`
 	FounderAddressHash string            `json:"founder_address_hash,omitempty"`
-	TotalFees          int64             `json:"total_fees,omitempty"`
+	TotalFees          Satoshis          `json:"total_fees,omitempty"`
 	Transactions       []BlockTemplateTx `json:"transactions,omitempty"`
 	ResidualCoeffs     []int64           `json:"residual_coeffs,omitempty"`
 }

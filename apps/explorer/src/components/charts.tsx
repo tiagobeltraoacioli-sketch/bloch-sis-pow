@@ -273,7 +273,9 @@ export function BarChart({
 export function ProportionBars({
   rows,
 }: {
-  rows: { label: string; value: number; pct: number; color: string; sub?: string }[];
+  // `value` is carried for callers' own bookkeeping and is NOT rendered (only
+  // `pct` drives the bar), so it accepts the satoshi wire union unconverted.
+  rows: { label: string; value: number | string | bigint; pct: number; color: string; sub?: string }[];
 }) {
   if (!rows.length) return <EmptyPlot note="No distribution data yet." />;
   const max = Math.max(...rows.map((r) => r.pct), 0.0001);

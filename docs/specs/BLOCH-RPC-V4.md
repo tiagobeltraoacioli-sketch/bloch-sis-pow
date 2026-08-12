@@ -50,9 +50,13 @@ and the L2 all fan out from it (ecosystem plan §8.1).
   NOT use the bare word: the consensus-vote feed is `getepochattestations`
   (§4). See §5.
 - **R3 — Amount encoding is decided once, in the OpenAPI file.** All
-  satoshi-denominated fields are decimal **strings** on the wire in V4. See §6
-  for the arithmetic, including which risk is resolved (Go `int64`) and which
-  is not (JavaScript 2^53).
+  satoshi-denominated fields are decimal **strings** on the wire in V4, without
+  exception. Two limits are in play and only one of them is about our types:
+  10^19 sat does not fit a signed `int64` (a Go SDK problem, fixable by
+  widening), and it is ~1110x JavaScript's 2^53 exact-integer limit (a *wire*
+  problem, not fixable by any receiving type). The string form is what closes
+  the second. Rule and rationale: `docs/specs/BLOCH-SATOSHI-ENCODING.md`;
+  arithmetic in §6.
 - **R4 — Standard JSON-RPC errors only.** The V3 convention of returning
   method-level failures as `result.error` strings with HTTP 200 is a defect
   every client special-cases (explorer `rpc.ts`, both generated SDKs carry a
@@ -324,40 +328,54 @@ Decision recorded here so it cannot be re-litigated by accident:
 4. The OpenAPI V4 file documents both meanings side-by-side, with a
    cross-reference on each, so generated SDK docs carry the distinction.
 
-## 6. Amount encoding — one risk resolved, one still live
+## 6. Amount encoding — both risks, and which one is the real one
 
-Numbers, measured:
+Full rule and rationale: **`docs/specs/BLOCH-SATOSHI-ENCODING.md`**. Summary,
+and a correction to what this section said before.
 
-- V4 supply cap: 100,000,000,000 BLCH = **2.1 × 10^18 sat**.
-- `i64::MAX` = 9.223 × 10^18 → the cap is **22.8%** of it (4.39× headroom).
-- The cap is hard (no tail — Tokenomics V4 §6.2 retired it) and base-fee burn
-  only ever lowers supply, so no future total can approach the boundary.
-- JavaScript's exact-integer limit 2^53 = 9,007,199,254,740,992 sat ≈
-  **90,071,992.5 BLCH** — and single real balances already exceed it ~39×
-  (the largest carryover address holds 3.546 B BLCH).
+Numbers, measured (`TOTAL_SUPPLY_SAT`,
+`crates/bloch-pos-committee/src/tokenomics_v4.rs`):
+
+- V4 supply cap: 100,000,000,000 BLCH = **10^19 sat**.
+- `u64::MAX` = 1.8447 × 10^19 → the cap is **54.21%** of it. One balance fits;
+  the sum of two large ones can wrap, which is why every satoshi *sum* in
+  consensus is `u128`.
+- `i64::MAX` = 9.2234 × 10^18 → the cap is **108.42%** of it. It does **not**
+  fit a signed 64-bit integer.
+- JavaScript's exact-integer limit 2^53 − 1 = 9,007,199,254,740,991 sat ≈
+  **90,071,992.5 BLCH** — the cap is **1,110×** that, and single real balances
+  already exceed it ~187× (the largest carryover address holds 16.887 B BLCH).
 
 Therefore:
 
-1. **Resolved — do not "fix" it back:** `sdk/go/models.go:16`
-   (`type Satoshis = int64`) overflowed only under the abandoned 100 B draft
-   (10^19 sat, 8.4% past `i64::MAX`). At the reverted 21 B cap it fits with
-   wide margin, permanently. The overflow warnings in
-   `BLOCH-ECOSYSTEM-MIGRATION.md` §1.4/§4.3/§8.3 are **superseded on the Go
-   side**; the type stays `int64`. (Consensus-internal arithmetic is a
-   separate matter: the frozen interfaces carry `u128` end-to-end,
-   interfaces doc §1.2 — that rule is about overflow-free *sums*, not wire
-   width, and also stands.)
-2. **Still live — the wire:** any JSON consumer that parses numbers as IEEE-754
-   doubles (every browser, including the explorer) silently corrupts amounts
-   above ~90 M BLCH. So in the V4 OpenAPI contract **every
-   satoshi-denominated field is a decimal string** (`"sat": "354617540000000000"`),
-   uniformly — balances, UTXO values, stakes, rewards, penalties, supply
-   figures. Uniformity is deliberate: a "only large fields are strings" rule
-   is a latent bug in every client that hits its first large value. The
-   display-only float `*_bloch` companions may remain, documented as lossy.
-3. Generated SDKs absorb this in codegen: Go parses the strings into `int64`
-   (fits, per 1), Python into `int`; the hand-written TypeScript SDK and the
-   explorer use `BigInt`.
+1. **Correction.** An earlier revision of this section said the Go `int64` was
+   safe "permanently". That was written against the 21 B nominal of
+   2026-08-11; the 2026-08-12 split to 100 B reinstated the overflow, and the
+   same paragraph's own headline figure ("100,000,000,000 BLCH = 2.1 × 10^18
+   sat") was the 21 B number under the 100 B label. `sdk/go/models.go` no
+   longer aliases `Satoshis` at all — see 3.
+2. **The wire is the real defect, and it is not a Go problem.** Any JSON
+   consumer that parses numbers as IEEE-754 doubles (every browser, including
+   the explorer) silently corrupts amounts above ~90 M BLCH. Widening the Go
+   integer would have fixed Go and left every JavaScript reader of the same
+   response reading a wrong balance with no error. So in the V4 OpenAPI
+   contract **every satoshi-denominated field is a decimal string**
+   (`"sat": "1688654952300000000"`), uniformly — balances, UTXO values, fees,
+   stakes, rewards, penalties, supply figures. Uniformity is deliberate: a
+   "only large fields are strings" rule is a latent bug in every client that
+   hits its first large value. The display-only float `*_bloch` companions may
+   remain, documented as lossy.
+3. **The string is the fix; the integer width is its consequence.** Go binds
+   `type Satoshis uint64` with a string codec (`sdk/go/satoshis.go`,
+   `sdk/go/satoshis_test.go`), Python an exact `int` via
+   `units.parse_sats`, the TypeScript SDK and the explorer `BigInt`. Readers
+   accept the legacy bare-number form from running Genesis-3 nodes and parse it
+   from the raw token, never through a float; writers emit only the string.
+   The overflow warnings in `BLOCH-ECOSYSTEM-MIGRATION.md` §1.4/§4.3/§8.3 are
+   **live again** and are discharged by this encoding, not by the type change
+   alone. (Consensus-internal arithmetic remains a separate matter: the frozen
+   interfaces carry `u128` end-to-end, interfaces doc §1.2 — that rule is about
+   overflow-free *sums*, not wire width, and also stands.)
 
 ## 7. Deployment surface — the public proxy allowlist
 

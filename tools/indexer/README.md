@@ -72,6 +72,47 @@ The self-test (`npm run selftest`) proves the key property: after a reorg that
 orphans a payment to "Carol", Carol's balance is `0`, her UTXO is gone, and she
 has **no stale history** — while the replacement payment to "Dave" is present.
 
+## Satoshi amounts are `bigint`, never `number`
+
+Normative rule: `docs/specs/BLOCH-SATOSHI-ENCODING.md`. **A satoshi amount is a
+decimal string on the JSON wire and a `bigint` in memory.**
+
+This is not a style preference. `JSON.parse` turns every JSON number into an
+IEEE-754 double, exact only to `Number.MAX_SAFE_INTEGER` = 9,007,199,254,740,991
+sat. Genesis-4's supply is 10^19 sat (1,110x that), and the largest single
+carried-over address already holds 354,617,540,000,000,000 sat — 39x past the
+limit. An indexer that exists to compute balances cannot hold them in a type that
+rounds them.
+
+Consequences, all implemented here:
+
+- `TxOutput.value`, `Utxo.value`, `HistoryEntry.amountSats`, `StoreState.balances`,
+  `UndoRecord.deltas` and `getBalance()` are `bigint`. Heights, indices,
+  timestamps and counts stay `number`.
+- All parsing goes through **one** helper, `parseSats` in `src/sats.ts`. It
+  accepts the canonical decimal string *and* the legacy bare-number form that the
+  live Genesis-3 fleet still emits, and rejects negatives, non-integers, and
+  anything above 10^19.
+- `HttpTransport` reads responses with `parseJsonExactIntegers`, not
+  `res.json()`: an oversized integer literal is recovered from its **raw source
+  text**, never through a double.
+- The read API emits amounts as decimal strings
+  (`"balanceSats": "354617540000000000"`). The `balanceBloch` companion is a
+  float, display-only and lossy — do not use it for accounting.
+- The JSON state file stores amounts as decimal strings (`bigint` is not
+  JSON-serializable — `JSON.stringify` throws on it). A state file written by the
+  older number-typed build still loads exactly, and is migrated to strings on the
+  next `persist()`.
+
+The self-test covers this end to end: a balance of 354,617,540,000,000,001 sat is
+indexed, persisted, reloaded, served over HTTP, and then reorged back to `0`. The
+`+1` is deliberate — 354,617,540,000,000,000 happens to be exactly representable
+as a double (spacing at that magnitude is 64), so only the `+1` distinguishes
+correct arithmetic from `number` arithmetic. Measured against the pre-migration
+code, that same scenario reports 354,617,540,000,000,000 (one satoshi silently
+lost), and reports `"0354617540000000000"` — a string concatenation — when fed
+the Genesis-4 wire form.
+
 ## Storage
 
 `JsonStore` (in `src/store.ts`) persists the whole index — tip, chain map, UTXO
@@ -95,7 +136,8 @@ cd tools/indexer
 npm install
 npm run typecheck    # tsc --noEmit
 npm run build        # tsc -> dist/
-npm run selftest     # offline reorg test (no node)
+npm test             # alias for selftest
+npm run selftest     # offline reorg + satoshi-encoding tests (no node)
 
 # Watch reorg handling against the built-in stub chain (no node needed):
 INDEXER_STUB=true INDEXER_POLL_MS=1000 npm start
@@ -108,10 +150,11 @@ INDEXER_RPC_URL=http://127.0.0.1:16210/ npm start
 
 - `GET /health`
 - `GET /status` — tip, blocksApplied, blocksRolledBack, reorgsHandled, counts.
-- `GET /address/:addr/balance`
-- `GET /address/:addr/utxos`
-- `GET /address/:addr/history`
-- `GET /utxo/:txid/:index`
+- `GET /address/:addr/balance` — `balanceSats` is a decimal **string**;
+  `balanceBloch` is a lossy display float.
+- `GET /address/:addr/utxos` — `value` is a decimal string.
+- `GET /address/:addr/history` — `amountSats` is a decimal string.
+- `GET /utxo/:txid/:index` — `value` is a decimal string.
 - `GET /block/:height` — the indexer's applied hash at that height.
 
 ## Known limitations

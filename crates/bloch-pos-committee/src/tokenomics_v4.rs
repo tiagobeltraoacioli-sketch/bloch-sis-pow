@@ -23,11 +23,17 @@
 //! that `u64` addition is not safe. If either assertion ever fires, the
 //! arithmetic width is being re-decided by accident — stop and re-read this.
 //!
-//! Known, accepted breakage: 10^19 does **not** fit the signed `int64` the Go
-//! SDK uses for `Satoshis` (`i64::MAX` is 9.22 x 10^18). That was one of the
-//! two stated reasons for the 2026-08-11 revert to 21 B; the 2026-08-12 split
-//! decision knowingly reintroduces it. The SDK must move to `uint64`/big.Int —
-//! flagged, not silently absorbed.
+//! Known breakage, since **resolved**: 10^19 does not fit the signed `int64`
+//! the Go SDK used for `Satoshis` (`i64::MAX` is 9.22 x 10^18). That was one
+//! of the two stated reasons for the 2026-08-11 revert to 21 B; the
+//! 2026-08-12 split decision knowingly reintroduced it, and it was fixed by
+//! changing the *wire form*, not just the width: a satoshi amount is a decimal
+//! **string** in JSON and a `uint64` in memory (`sdk/go/satoshis.go`,
+//! `docs/specs/BLOCH-SATOSHI-ENCODING.md`). Widening `int64` to `uint64` alone
+//! would have fixed Go and left every JavaScript consumer of the same JSON
+//! reading a silently rounded balance — 10^19 is ~1110x JavaScript's exact
+//! integer limit of 2^53, and real single balances are already 39x past it.
+//! The `i64::MAX` assertion below stays as the tripwire that raised this.
 
 /// Satoshis per BLCH. Unchanged across every revision — divisibility is
 /// preserved; the overflow question is answered with `u128`, not by dropping
@@ -351,8 +357,13 @@ const _: () = assert!(
     TOTAL_SUPPLY_SAT * 2 > u64::MAX as u128,
     "o supply saiu da zona de wrap de u64: reavalie as larguras de proposito"
 );
-// Known break, asserted so it cannot be forgotten: the Go SDK's signed int64
-// cannot carry sums at this scale. See the module docs.
+// The tripwire that surfaced the encoding decision: a signed int64 cannot
+// carry an amount at this scale. Discharged by the wire form — decimal string
+// in JSON, uint64 in memory (docs/specs/BLOCH-SATOSHI-ENCODING.md) — not by
+// widening a type. Kept asserted: if the supply ever drops back under
+// i64::MAX this fires, and whoever is here must re-read that spec before
+// concluding the encoding can be relaxed. It cannot: the JavaScript 2^53
+// limit binds ~1000x lower than i64::MAX and is unaffected by the supply.
 const _: () = assert!(
     TOTAL_SUPPLY_SAT > i64::MAX as u128,
     "se isto falhar, o int64 do SDK Go voltou a caber — atualize os docs"

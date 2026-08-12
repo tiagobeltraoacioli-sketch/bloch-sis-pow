@@ -9,8 +9,11 @@ info:
     described below is invoked by POSTing a JSON-RPC 2.0 envelope to the root
     `/` path. The node advertises itself as `chain: "bloch-sis"`, uses
     `bloch1q…` (mainnet) / `bloch1t…` (testnet) addresses, and reports monetary
-    values both as integer satoshis and as display-only `bloch` / `*_bloch`
-    floats (1 BLCH = 100 000 000 satoshis).
+    values both as satoshis and as display-only `bloch` / `*_bloch` floats
+    (1 BLCH = 100 000 000 satoshis). Satoshi amounts travel as **decimal
+    strings** on the wire (`"satoshis": "1688654952300000000"`); bare JSON
+    integers are the legacy Genesis-3 form only. See the `Satoshis` schema and
+    `docs/specs/BLOCH-SATOSHI-ENCODING.md` for why.
 
     ```bash
     curl -s -X POST http://127.0.0.1:16210/ \
@@ -192,6 +195,22 @@ paths:
               examples:
                 success:
                   value: { jsonrpc: "2.0", id: 1, result: 12345 }
+                balanceAmountsAreStrings:
+                  summary: Satoshi amounts are decimal strings, floats are display-only
+                  description: >-
+                    `satoshis` is a base-10 string because a JSON number above
+                    2^53 is silently rounded by every JavaScript reader, and
+                    real Bloch balances are ~187x past that limit. `bloch` is a
+                    lossy convenience float — never use it for accounting.
+                    See docs/specs/BLOCH-SATOSHI-ENCODING.md.
+                  value:
+                    jsonrpc: "2.0"
+                    id: 2
+                    result:
+                      satoshis: "1688654952300000000"
+                      bloch: 3546175400.0
+                      utxo_count: 1
+                      address: "bloch1q…"
                 methodError:
                   summary: Non-standard result.error quirk
                   value: { jsonrpc: "2.0", id: 1, result: { error: "invalid hash" } }
@@ -373,10 +392,22 @@ components:
       description: Bloch address — `bloch1q…` (mainnet) or `bloch1t…` (testnet), checksummed.
       example: "bloch1q…"
     Satoshis:
-      type: integer
-      format: int64
-      minimum: 0
-      description: Integer value in satoshis (1 BLCH = 100_000_000 sat). The authoritative amount.
+      description: >-
+        Satoshi amount (1 BLCH = 100_000_000 sat). The authoritative amount.
+        Canonical wire form is a base-10 string with no sign and no leading
+        zeros, range 0 ..= 10^19 (the Genesis-4 supply cap,
+        crates/bloch-pos-committee/src/tokenomics_v4.rs). A bare JSON integer
+        is the legacy Genesis-3 form only: 10^19 is 108% of i64::MAX and ~1110x
+        JavaScript's 2^53 exact-integer limit, so any IEEE-754 JSON reader
+        silently corrupts large numeric amounts. Writers MUST emit the string
+        form; readers MUST accept both and MUST NOT route the value through a
+        float. See docs/specs/BLOCH-SATOSHI-ENCODING.md.
+      oneOf:
+        - type: string
+          pattern: '^(0|[1-9][0-9]{0,19})$'
+        - type: integer
+          format: uint64
+          minimum: 0
 
     TxInput:
       type: object
@@ -642,7 +673,7 @@ components:
       type: object
       description: estimatefee — median fee of current mempool entries.
       properties:
-        feerate_sats: { type: integer }
+        feerate_sats: { $ref: '#/components/schemas/Satoshis' }
         feerate_bloch: { type: number }
         mempool_size: { type: integer }
         note: { type: string }
@@ -651,10 +682,10 @@ components:
       type: object
       description: estimatefeeadvanced result.
       properties:
-        next_block_sats: { type: integer }
-        medium_priority: { type: integer }
-        slow_priority: { type: integer }
-        mempool_median: { type: integer }
+        next_block_sats: { $ref: '#/components/schemas/Satoshis' }
+        medium_priority: { $ref: '#/components/schemas/Satoshis' }
+        slow_priority: { $ref: '#/components/schemas/Satoshis' }
+        mempool_median: { $ref: '#/components/schemas/Satoshis' }
         mempool_size: { type: integer }
         recommended_bloch: { type: string, description: Formatted BLCH string (8 decimals). }
 
@@ -663,7 +694,7 @@ components:
       description: getrawmempool verbose entry.
       properties:
         txid: { $ref: '#/components/schemas/Hex32' }
-        fee: { type: integer }
+        fee: { $ref: '#/components/schemas/Satoshis' }
         fee_bloch: { type: number }
         time: { type: integer }
 
@@ -694,10 +725,10 @@ components:
       description: getmempoolstats result.
       properties:
         size: { type: integer }
-        total_fees: { type: integer }
-        min_fee: { type: integer }
-        max_fee: { type: integer }
-        median_fee: { type: integer }
+        total_fees: { $ref: '#/components/schemas/Satoshis' }
+        min_fee: { $ref: '#/components/schemas/Satoshis' }
+        max_fee: { $ref: '#/components/schemas/Satoshis' }
+        median_fee: { $ref: '#/components/schemas/Satoshis' }
         avg_fee: { type: number }
         buckets:
           type: array
@@ -795,7 +826,7 @@ components:
         size_bytes: { type: integer }
         inputs_count: { type: integer }
         outputs_count: { type: integer }
-        fee_sats: { type: integer }
+        fee_sats: { $ref: '#/components/schemas/Satoshis' }
         is_coinbase: { type: boolean }
 
     TxsByBlock:
@@ -818,7 +849,7 @@ components:
           oneOf:
             - type: integer
             - type: "null"
-        subsidy_per_block_sat: { type: integer }
+        subsidy_per_block_sat: { $ref: '#/components/schemas/Satoshis' }
         address_hash_hex:
           oneOf:
             - $ref: '#/components/schemas/Hex20'
@@ -827,14 +858,14 @@ components:
           oneOf:
             - $ref: '#/components/schemas/Address'
             - type: "null"
-        balance_sat: { type: integer }
+        balance_sat: { $ref: '#/components/schemas/Satoshis' }
         balance_bloch: { type: number }
         utxo_count: { type: integer }
         status: { type: string, enum: [active, pending_phase_6] }
-        vesting_per_month_sat: { type: integer }
-        vesting_amount_at_next_sat: { type: integer }
+        vesting_per_month_sat: { $ref: '#/components/schemas/Satoshis' }
+        vesting_amount_at_next_sat: { $ref: '#/components/schemas/Satoshis' }
         vesting_active_at_next: { type: boolean }
-        vesting_total_sat: { type: integer }
+        vesting_total_sat: { $ref: '#/components/schemas/Satoshis' }
         vesting_months: { type: integer }
 
     Pools:
@@ -843,9 +874,9 @@ components:
       properties:
         current_height: { type: integer }
         next_block_height: { type: integer }
-        subsidy_per_block_sat: { type: integer }
+        subsidy_per_block_sat: { $ref: '#/components/schemas/Satoshis' }
         subsidy_per_block_bloch: { type: number }
-        miner_share_sat: { type: integer }
+        miner_share_sat: { $ref: '#/components/schemas/Satoshis' }
         pools:
           type: object
           properties:
@@ -857,7 +888,7 @@ components:
       type: object
       properties:
         txid: { $ref: '#/components/schemas/Hex32' }
-        fee: { type: integer }
+        fee: { $ref: '#/components/schemas/Satoshis' }
         data: { type: string, description: 'Hex-encoded transaction bytes (Bitcoin wire format, script_sig included).' }
 
     BlockTemplate:
@@ -875,10 +906,10 @@ components:
         bits: { type: integer }
         cur_time: { type: integer }
         parent_time: { type: integer }
-        subsidy_sat: { type: integer }
-        founder_vesting_sat: { type: integer }
+        subsidy_sat: { $ref: '#/components/schemas/Satoshis' }
+        founder_vesting_sat: { $ref: '#/components/schemas/Satoshis' }
         founder_address_hash: { $ref: '#/components/schemas/Hex20' }
-        total_fees: { type: integer }
+        total_fees: { $ref: '#/components/schemas/Satoshis' }
         transactions:
           type: array
           items: { $ref: '#/components/schemas/BlockTemplateTx' }

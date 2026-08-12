@@ -85,6 +85,23 @@ Bloch reports failures in two places; the client surfaces both as `*RPCError`:
 
 Network / malformed-response problems return `*TransportError`.
 
+### Amounts
+
+`Satoshis` is a `uint64` in memory and a **decimal string** on the wire
+(`satoshis.go`). It is not `int64`, and not a JSON number, for two separate
+reasons: the supply cap is 10^19 satoshis, which is 108% of `int64`'s positive
+range, and — the reason that actually drove the design — about 1110x
+JavaScript's exact-integer limit of 2^53, so a JSON number is silently rounded
+by every browser reading the same response. Real Bloch balances are already
+~187x past that limit.
+
+`MarshalJSON` emits the string form and rejects amounts above the cap;
+`UnmarshalJSON` accepts the string form and the legacy bare-number form from
+Genesis-3 nodes, parsing the raw token rather than a float. Use
+`ParseSatoshis`, `.Uint64()`, `.String()`, `SatsToBloch`, `BlochToSats`. The
+`*_bloch` float companions are display-only and lossy — never use them for
+accounting. Rule: `docs/specs/BLOCH-SATOSHI-ENCODING.md`.
+
 ### Writes and signing
 
 The only write is `SendRawTransaction(hex)`, which takes an **already-signed**

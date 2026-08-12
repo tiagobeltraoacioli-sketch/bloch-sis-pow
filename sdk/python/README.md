@@ -37,14 +37,18 @@ pip install -e sdk/python
 ## Usage
 
 ```python
-from blochclient import BlochClient, BlochRpcError, sats_to_bloch
+from blochclient import BlochClient, BlochRpcError, parse_sats, sats_to_bloch
 
 client = BlochClient("http://127.0.0.1:16210")
 
 height = client.get_block_count()
 info = client.get_network_info()          # -> NetworkInfo (TypedDict)
 bal = client.get_balance("bloch1q...")    # -> Balance
-print(sats_to_bloch(bal["satoshis"]), "BLCH")
+
+# Amounts arrive as DECIMAL STRINGS. parse_sats() gives you an exact int and
+# also accepts the legacy bare-int form from Genesis-3 nodes.
+sats = parse_sats(bal["satoshis"])
+print(sats_to_bloch(sats), "BLCH")
 
 try:
     client.get_transaction("deadbeef")     # bad hash
@@ -66,6 +70,20 @@ Bloch reports failures in two places and the client normalizes both into
   "result-error"`.
 
 Network / malformed-response problems raise `BlochTransportError`.
+
+### Amounts
+
+A satoshi amount is a **decimal string** on the wire, not a JSON number. The
+supply cap is 10^19 satoshis — about 1110x JavaScript's exact-integer limit of
+2^53 — so a JSON number is silently rounded by any IEEE-754 reader, and real
+Bloch balances are already ~187x past that limit. Python's `int` is
+arbitrary-precision, so Python was never the victim; it shares the wire.
+
+Run every amount through `parse_sats()` (accepts the string form and the legacy
+bare int from Genesis-3 nodes, returns an exact `int`, rejects negatives and
+anything above the cap) and `format_sats()` on the way out. The `*_bloch` float
+companions are display-only and lossy — never use them for accounting. Rule:
+`docs/specs/BLOCH-SATOSHI-ENCODING.md`.
 
 ### Writes and signing
 
