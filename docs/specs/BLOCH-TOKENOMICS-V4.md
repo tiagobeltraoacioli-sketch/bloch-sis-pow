@@ -298,6 +298,52 @@ validators** gives every slot at least two.
 **It must be replaceable.** Genesis validators exit through the ordinary path as
 independent stake arrives. Nothing in consensus privileges them after genesis.
 
+### 3.3.1 Who operates them, and the one-year rule
+
+**The founder funds and operates the genesis cohort** (founder decision,
+2026-08-11). There was no alternative that did not amount to the same thing:
+liquidity and marketing are the Foundation's, and the Foundation is the founder
+until the board exists.
+
+The commitment attached to it is that the start does not persist: **within one
+year the founder's consensus weight falls below one third**, and that is written
+as a consensus rule rather than a promise
+(`crates/bloch-pos-committee/src/genesis_cohort.rs`).
+
+**Why one third and not something rounder.** It is the share that can stall a
+two-thirds quorum. Above it the founder can freeze the chain unilaterally;
+below it the founder cannot. The rule says, in one number: *after year one, the
+founder cannot halt Bloch alone.* Note what it does not say — one third is the
+**liveness** threshold, not the safety one, which is two thirds. Falling under a
+third stops the founder stalling finality; it was never what stopped anyone
+finalising a bad state.
+
+**How it is enforced.** The cohort is a fixed set published in the genesis
+block, which can only shrink — members leave by exiting and nothing can be
+added. Their combined weight is capped, and the cap tapers linearly from the
+whole set at genesis to one third at one year, then holds:
+
+| Month | Cohort cap |
+|---:|---:|
+| 0 | 100.0% |
+| 3 | 83.3% |
+| 6 | 66.7% |
+| 9 | 50.0% |
+| **12** | **33.3%** |
+
+The taper is deliberate. A step from 100% to 33% on one epoch boundary would
+eject two thirds of the chain's consensus weight in sixteen minutes — the chain
+would stop the moment the rule bit. Tapering gives independent stake a year of
+steadily rising room instead of a single deadline.
+
+**Where enforcement stops, plainly.** The cap binds the *cohort*. Nothing
+prevents funding new validators after genesis under addresses that are not in
+it, and no on-chain rule can see beneficial ownership behind an address. Past
+the cohort, one third is a commitment verified externally — by the Foundation's
+reporting rule and by whoever is watching. The enforceable part is real and
+bounded; claiming more would be claiming that consensus can see through an
+address, and it cannot.
+
 ### What it must not pretend
 
 **Genesis-validator stake does not count toward gates G1–G4.** A Foundation-
@@ -770,9 +816,9 @@ vesting schedule that lives in a spreadsheet is not a vesting schedule.
 7. ~~Delegation~~ — **implemented**, §6.3.1, with the concentration gates now
    computed from the delegation set.
 8. ~~Fee burn versus "100% of fees"~~ — **decided**, §6.3.2.
-9. **Genesis validator set** (§3.3) — how many, funded from which bucket, and
-   who operates them. The count floor (64) and the exclusion from G1–G4 are
-   settled; the operators are not.
+9. ~~**Genesis validator set** — who operates them.~~ **Decided** (§3.3.1): the
+   founder funds and operates the cohort, under a consensus-enforced cap that
+   tapers to one third within a year.
 10. ~~The VC allocation against the ownerless thesis~~ — **resolved**: the
    ownerless thesis is retracted and a Solana-style foundation adopted
    ([ADR-036](../adr/ADR-036-retract-ownerless-adopt-foundation.md)). What

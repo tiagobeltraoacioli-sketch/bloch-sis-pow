@@ -1213,3 +1213,91 @@ fn two_holders_account_for_the_entire_genesis_float() {
     assert_eq!(f * 1000 / circulating, 250, "fundacao = 25,0% do circulante");
     assert_eq!(c * 1000 / circulating, 749, "carryover = 75,0% (truncado)");
 }
+
+// ── coorte de genesis e o teto declinante ───────────────────────────────────
+
+use bloch_pos_committee::genesis_cohort::{
+    apply_cohort_cap, cohort_cap_bps, cohort_share_bps, COHORT_CAP_FLOOR_BPS, EPOCHS_PER_YEAR,
+};
+
+#[test]
+fn the_cap_reaches_one_third_at_one_year_and_holds() {
+    assert_eq!(cohort_cap_bps(0), 10_000, "no genesis a coorte E o conjunto");
+    let half = cohort_cap_bps(EPOCHS_PER_YEAR / 2);
+    assert!((6_600..=6_700).contains(&half), "meio do ano: {half}bps");
+    assert_eq!(cohort_cap_bps(EPOCHS_PER_YEAR), COHORT_CAP_FLOOR_BPS);
+    assert_eq!(cohort_cap_bps(EPOCHS_PER_YEAR * 10), COHORT_CAP_FLOOR_BPS, "nao volta a subir");
+    // Monotonicamente decrescente — pressao continua, nao um degrau.
+    let mut prev = u128::MAX;
+    for e in (0..EPOCHS_PER_YEAR).step_by((EPOCHS_PER_YEAR / 40) as usize) {
+        let c = cohort_cap_bps(e);
+        assert!(c <= prev, "teto subiu na epoca {e}");
+        prev = c;
+    }
+}
+
+#[test]
+fn a_founder_holding_everything_is_capped_to_a_third_after_a_year() {
+    // A coorte com 90% do stake, um ano depois.
+    let mut vs: Vec<Validator> = (0..64u32)
+        .map(|i| Validator { index: i, effective_stake: 1_000_000 })
+        .collect();
+    vs.extend((100..110u32).map(|i| Validator { index: i, effective_stake: 700_000 }));
+    let cohort: Vec<u32> = (0..64u32).collect();
+
+    assert!(cohort_share_bps(&vs, &cohort) > 9_000, "o teste nao esta exercitando o teto");
+
+    let capped = apply_cohort_cap(&vs, &cohort, EPOCHS_PER_YEAR);
+    let share = cohort_share_bps(&capped, &cohort);
+    assert!(share <= COHORT_CAP_FLOOR_BPS + 1, "coorte ficou em {share}bps, acima de 1/3");
+
+    // E abaixo de 1/3 e exatamente o ponto em que ela deixa de poder travar
+    // um quorum de 2/3.
+    let total: u128 = capped.iter().map(|v| v.effective_stake as u128).sum();
+    let coh: u128 = capped.iter().filter(|v| v.index < 64).map(|v| v.effective_stake as u128).sum();
+    assert!(coh * 3 <= total, "a coorte ainda consegue travar a finalidade");
+}
+
+#[test]
+fn at_genesis_nothing_is_capped_because_the_cohort_is_everything() {
+    let vs: Vec<Validator> = (0..64u32)
+        .map(|i| Validator { index: i, effective_stake: 1_000_000 })
+        .collect();
+    let cohort: Vec<u32> = (0..64u32).collect();
+    assert_eq!(apply_cohort_cap(&vs, &cohort, 0), vs, "o genesis nao pode ser capado");
+}
+
+#[test]
+fn non_cohort_validators_are_never_touched() {
+    let vs = vec![
+        Validator { index: 1, effective_stake: 9_000_000 },   // coorte
+        Validator { index: 50, effective_stake: 1_000_000 },  // independente
+    ];
+    let capped = apply_cohort_cap(&vs, &[1], EPOCHS_PER_YEAR);
+    assert_eq!(capped[1].effective_stake, 1_000_000, "stake independente foi mexido");
+    assert!(capped[0].effective_stake < 9_000_000, "a coorte nao foi capada");
+}
+
+#[test]
+fn the_cap_scales_the_cohort_pro_rata() {
+    // Qual validador da coorte absorve a reducao nao pode importar: a coorte e
+    // um ator economico so, e escolher convidaria a embaralhar stake entre eles.
+    let vs = vec![
+        Validator { index: 1, effective_stake: 6_000_000 },
+        Validator { index: 2, effective_stake: 3_000_000 },
+        Validator { index: 50, effective_stake: 1_000_000 },
+    ];
+    let capped = apply_cohort_cap(&vs, &[1, 2], EPOCHS_PER_YEAR);
+    // 2:1 antes, 2:1 depois.
+    assert_eq!(capped[0].effective_stake / capped[1].effective_stake, 2);
+    assert!(capped[0].effective_stake < 6_000_000);
+}
+
+#[test]
+fn a_cohort_already_under_the_cap_is_left_alone() {
+    let vs = vec![
+        Validator { index: 1, effective_stake: 1_000_000 },
+        Validator { index: 50, effective_stake: 9_000_000 },
+    ];
+    assert_eq!(apply_cohort_cap(&vs, &[1], EPOCHS_PER_YEAR), vs);
+}

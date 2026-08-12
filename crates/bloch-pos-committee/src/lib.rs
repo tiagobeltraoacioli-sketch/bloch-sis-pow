@@ -43,6 +43,7 @@ pub mod attestation;
 pub mod beacon;
 pub mod committees;
 pub mod delegation;
+pub mod genesis_cohort;
 pub mod finality;
 pub mod forkchoice;
 pub mod interfaces;
