@@ -304,8 +304,11 @@ pub enum TransitionError {
     /// Header `attestation_root` does not match the root over the attestation
     /// quorum the body carries.
     AttestationRootMismatch,
-    /// Header `coherence_root` does not carry the parent's shielded-pool
-    /// commitment forward (it is carried, never recomputed - S6.6.1).
+    /// Header `coherence_root` is not the §6.6.2 mirror binding of the
+    /// parent's **committed** accumulator and nullifier-set roots
+    /// (`derive::expected_coherence` — derived from parent state, which
+    /// carries the pool's roots unchanged; the pool itself is never
+    /// re-rooted, §6.6.1).
     CoherenceRootMismatch,
 }
 

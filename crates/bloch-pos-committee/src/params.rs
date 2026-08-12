@@ -102,6 +102,28 @@ pub const DS_PROPOSE: [u8; 16] = *b"BLCH4:PROPOSE\0\0\0";
 /// the exit is "a hybrid-signed message" and every signed message gets its own
 /// tag; all tags are fixed 16 bytes, so no tag can prefix another.
 pub const DS_EXIT: [u8; 16] = *b"BLCH4:EXIT\0\0\0\0\0\0";
+/// Header `coherence_root` mirror binding (§6.6.2):
+/// `coherence_root = SHA3-256(DS_COHERENCE ‖ accumulator_root ‖ nullifier_root)`.
+///
+/// This tags the header *encoding* of the two Coherence roots, not anything
+/// inside the pool: the accumulator itself stays SHAKE-256 under the C1-frozen
+/// `bloch:coherence:*:v1` domains (`crates/coherence-core`), untouched by the
+/// BLCH4 sweep — §6.6 says the migration brings the rest of the chain to where
+/// Coherence already is, and this tag is on the "rest of the chain" side of
+/// that line.
+pub const DS_COHERENCE: [u8; 16] = *b"BLCH4:COHERE\0\0\0\0";
+/// Coherence nullifier-set commitment (§6.6.2, the root `state_root` carries
+/// under `TAG_COHERENCE_NULLIFIERS`).
+///
+/// **INTERIM DEFINITION — pending the C1.1 rev.** C1 froze the nullifier
+/// derivation and named "the global nullifier set" consensus state, but never
+/// defined the set's commitment (`BLOCH-COHERENCE-UNDER-POS.md` F9/§2.3
+/// proposes a SHAKE-256 SMT for non-membership proofs). Until that rev is
+/// ratified, [`crate::derive::nullifier_set_root`] commits the sorted set
+/// under this tag. Replacing it before launch changes the genesis identity —
+/// it must be settled before the ceremony runs, and the C1.1 rev is the place
+/// to settle it.
+pub const DS_NFSET: [u8; 16] = *b"BLCH4:NFSET\0\0\0\0\0";
 /// State SMT node domain (§6.1) — every hash in [`crate::state_root`] starts
 /// with this tag so a state-tree node can never collide with a block id, a
 /// transaction Merkle node, or any other SHA3 use in the protocol.
