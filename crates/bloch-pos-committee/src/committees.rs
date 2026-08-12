@@ -44,6 +44,13 @@
 //! sub-sampling would have to return and F1 with it. Aggregation would lift the
 //! ceiling, and the measured in-circuit cost (`spikes/prover-cost/RESULTS.md`)
 //! says that is research, not engineering.
+//!
+//! # Which mix seeds which epoch
+//!
+//! The partition for epoch `N` is seeded by the mix fixed at the close of
+//! epoch `N − 1 − `[`MIN_SEED_LOOKAHEAD_EPOCHS`] — see the constant's docs for
+//! the attack this closes (finding F6: trailing-slot withholding re-sorting
+//! the next epoch's partition) and the residual it does not.
 
 use crate::params::{DS_SORTITION, SLOTS_PER_EPOCH};
 use crate::sample::Validator;
@@ -56,7 +63,98 @@ use sha3::{
 /// partition can never coincide with a proposer draw.
 const ROLE_PARTITION: u8 = 0x03;
 
+// ────────────────────────────────────────────────────────────────────────────
+// Seed look-ahead (finding F6)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Seed look-ahead, in epochs (adversarial review, finding F6).
+///
+/// The partition for epoch `N` is seeded by the beacon mix as fixed at the
+/// **close of epoch `N − 1 − MIN_SEED_LOOKAHEAD_EPOCHS`** — with a look-ahead
+/// of one, the close of epoch `N − 2`. Ethereum's `MIN_SEED_LOOKAHEAD` is the
+/// same device at the same value, for the same reason.
+///
+/// **What it closes.** Without the look-ahead, epoch `N` was seeded by the mix
+/// at the close of epoch `N − 1`, so whoever proposed the last `t` slots of
+/// `N − 1` could choose reveal-or-withhold per slot, grind `2^t` candidate
+/// mixes, and pick the one whose epoch-`N` partition placed the most of their
+/// own validators where they wanted them — re-sorting the body that decides
+/// finality, not just one proposer slot. With the look-ahead, the seed for
+/// epoch `N` is already fixed before epoch `N − 1` begins: **no slot the
+/// adversary proposes in `N − 1` can influence `N`'s partition at all.**
+///
+/// **What it does not close — stated so nobody reads more into it.** The
+/// last-revealer bias is displaced, not eliminated: the trailing proposers of
+/// epoch `E` still bias the partition of epoch `E + 1 + MIN_SEED_LOOKAHEAD_EPOCHS`
+/// by the standard one bit per withheld slot (§6.3), at the price of the
+/// forfeited proposer rewards. That residual is inherent to RANDAO and is the
+/// same one Ethereum accepts. Raising the look-ahead does not shrink it; it
+/// only moves the target epoch further out.
+///
+/// **What it costs.** Duties become computable earlier: the schedule for epoch
+/// `N` is public from the close of `N − 2`, widening the F7 DoS warning window
+/// from one epoch to two (~32 min). That trade is deliberate — grinding the
+/// finality partition is strictly worse than a longer warning for a DoS
+/// surface that is public by design anyway (§6.4).
+pub const MIN_SEED_LOOKAHEAD_EPOCHS: u64 = 1;
+
+/// The epoch whose **closing** mix seeds `epoch`'s partition:
+/// `epoch − 1 − MIN_SEED_LOOKAHEAD_EPOCHS`.
+///
+/// `None` for the first `MIN_SEED_LOOKAHEAD_EPOCHS + 1` epochs, which have no
+/// usable boundary behind them and are seeded by the genesis mix instead
+/// (see [`seed_mix`]). Those early epochs still partition differently from
+/// each other because the epoch number is folded into the XOF seed.
+pub const fn seed_epoch(epoch: u64) -> Option<u64> {
+    epoch.checked_sub(MIN_SEED_LOOKAHEAD_EPOCHS + 1)
+}
+
+/// Select the mix that seeds `epoch`'s partition out of committed beacon
+/// history.
+///
+/// `boundary_mixes[e]` must be the accumulated mix at the **close** of epoch
+/// `e` — i.e. after the reveal of `e`'s last non-skipped slot was folded in.
+/// This slice-from-genesis shape is the reference form; a node only ever needs
+/// the last `MIN_SEED_LOOKAHEAD_EPOCHS + 1` boundary mixes at once (that is
+/// exactly the two-epoch retention `StateReader::randao_mix_at` commits to).
+///
+/// Returns `None` when the needed boundary mix is missing from the slice.
+/// Missing history is a caller bug and must fail loudly: silently falling
+/// back to a newer mix would reintroduce F6 in the fallback path.
+pub fn seed_mix(
+    genesis_mix: &[u8; 32],
+    boundary_mixes: &[[u8; 32]],
+    epoch: u64,
+) -> Option<[u8; 32]> {
+    match seed_epoch(epoch) {
+        None => Some(*genesis_mix),
+        Some(e) => boundary_mixes.get(e as usize).copied(),
+    }
+}
+
+/// [`epoch_committees`] with the F6 look-ahead applied — the safe entry point.
+///
+/// Callers that already hold the correct seed (because the beacon layer
+/// selected it) may call [`epoch_committees`] directly; every other caller
+/// should go through here so the mix-to-epoch binding is decided in exactly
+/// one place. `None` propagates [`seed_mix`]'s missing-history failure.
+pub fn seeded_epoch_committees(
+    genesis_mix: &[u8; 32],
+    boundary_mixes: &[[u8; 32]],
+    epoch: u64,
+    validators: &[Validator],
+) -> Option<Vec<Vec<u32>>> {
+    let mix = seed_mix(genesis_mix, boundary_mixes, epoch)?;
+    Some(epoch_committees(&mix, epoch, validators))
+}
+
 /// Partition the active set into one committee per slot of `epoch`.
+///
+/// `beacon_mix` must be the seed selected by [`seed_mix`] — the mix at the
+/// close of epoch `epoch − 1 − MIN_SEED_LOOKAHEAD_EPOCHS`, not the current
+/// mix. Passing a later mix reintroduces finding F6: the trailing proposers
+/// of the previous epoch regain the power to re-sort this epoch's partition
+/// by withholding reveals. [`seeded_epoch_committees`] does the selection.
 ///
 /// Returns `SLOTS_PER_EPOCH` committees, each sorted ascending, together
 /// covering every eligible validator exactly once. Committee `i` serves slot
@@ -139,6 +237,9 @@ pub fn epoch_committees(
 }
 
 /// The committee serving `slot` within its epoch.
+///
+/// Same seed contract as [`epoch_committees`]: `beacon_mix` is the F6-selected
+/// seed for the slot's epoch, not the current mix.
 pub fn committee_for_slot(
     beacon_mix: &[u8; 32],
     slot: u64,
