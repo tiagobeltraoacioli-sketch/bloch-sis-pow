@@ -10,10 +10,10 @@
 
 [package]
 name = "bloch-pos-node"
-version = "0.0.1-skeleton"
+version = "0.0.2-devnet"
 edition = "2021"
 license = "AGPL-3.0-or-later"
-description = "Bloch Genesis-4 Proof-of-Stake node. SKELETON: boots, self-checks frozen consensus parameters, and exits. No consensus loop, no networking, no storage yet."
+description = "Bloch Genesis-4 Proof-of-Stake node. M1/M2 devnet stage: real processes producing, attesting, justifying and finalizing over a local TCP mesh, with append-only block-log persistence and replay-on-restart. Not mainnet-ready — see docs/specs/BLOCH-POS-NODE-INTEGRATION.md."
 publish = false
 
 # Standalone: NOT a member of the node workspace. The Genesis-3 node must not
@@ -22,12 +22,11 @@ publish = false
 # consumes the pure consensus crate (and later bloch-crypto), never the
 # reverse.
 #
-# LICENSE BLOCKER (BLOCH-POS-NODE-INTEGRATION.md §8.4): bloch-crypto is
-# AGPL-3.0-or-later, and AGPL contaminates the whole binary. The `license`
-# above is only valid while this crate links nothing AGPL. The founder/PMO
-# ruling — ship the node AGPL, or re-extract the PQ verify surface under a
-# compatible license — must be recorded BEFORE a bloch-crypto dependency is
-# added here, not after.
+# LICENSE (BLOCH-POS-NODE-INTEGRATION.md §8.4 — RESOLVED 2026-08-11): the
+# founder decided the Genesis-4 node is born AGPL-3.0-or-later, like the
+# Genesis-3 node it succeeds. That ruling is what makes the bloch-crypto
+# dependency below legal: AGPL is viral and the whole binary inherits it,
+# which is now the declared license rather than a contradiction.
 [workspace]
 
 [[bin]]
@@ -35,8 +34,17 @@ name = "bloch-pos"
 path = "src/main.rs"
 
 [dependencies]
-# The frozen consensus math. The ONLY dependency of the skeleton, on purpose:
-# every later dependency (rocksdb, libp2p, bloch-crypto, tokio) lands in the
-# milestone that needs it, per BLOCH-POS-NODE-INTEGRATION.md §6, so the
-# dependency tree grows in reviewable steps instead of arriving all at once.
+# The frozen consensus math (pure, sha3-only).
 bloch-pos-committee = { path = "../bloch-pos-committee" }
+# The hybrid ML-DSA-65 ‖ Falcon-1024 suite (M2: keys/ + KeyVerifier). Path
+# dependency, one-way; pulls the PQClean FFI tree, which is why this crate's
+# build stopped being instant at M2 — planned in the integration doc §6.
+bloch-crypto = { path = "../bloch-crypto" }
+sha3 = "0.10"
+
+# Same vendored fork the root workspace patches in (root Cargo.toml
+# [patch.crates-io]): bloch-crypto calls `with_seeded_rng`, which only exists
+# in the vendored pqcrypto-internals 0.2.11 fork. A standalone workspace does
+# not inherit the root's patch table, so it is restated here.
+[patch.crates-io]
+pqcrypto-internals = { path = "../pqcrypto-internals" }
