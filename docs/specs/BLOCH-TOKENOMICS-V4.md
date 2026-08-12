@@ -272,11 +272,19 @@ validator joins through the ordinary deposit path.
 
 Three things this must satisfy, and one it must not pretend to.
 
-**It must be funded from a named bucket.** At genesis the only liquid supply is
-liquidity (5%), the marketing TGE tranche (25% of 4%) and the carryover holders
-(≤ 0.3%) — everything else is cliffed. Genesis validators therefore stake from
-the Foundation's holdings, and that has to be said plainly rather than shown as
-an unexplained line in the genesis file.
+**It must be funded from a named bucket.** Liquid supply at genesis is
+5,033,884,800 BLCH: the whole carryover (17.97%), liquidity (5%) and the
+marketing TGE tranche (1%). VC, team and the founder's new grant are entirely
+cliffed.
+
+That leaves two candidate sources, and the choice is not neutral. Genesis
+validators can stake from the **Foundation's** liquid holdings, or from the
+**carryover** — which in practice means the largest carried-over address, since
+it holds 93.96% of the set. Funding them from the carryover would put the
+founder's balance directly into consensus at slot 0, which is the §4.2 problem
+in its most concentrated form. Funding them from the Foundation keeps that door
+shut and is the assumption the rest of this section makes. Either way it has to
+be said plainly rather than shown as an unexplained line in the genesis file.
 
 **It must be large enough to be meaningful and small enough to be honest.** The
 partition in §6.5.3 cuts the active set into 32 committees, so a set below 32
@@ -365,27 +373,34 @@ year five.
 
 ## 5. What this does to the concentration problem
 
-This is the strongest argument for the relaunch, and it is worth stating.
+This section argued that the relaunch was the strongest answer to the
+concentration objection. Two later decisions changed the answer, and both
+weakened it — so the honest version replaces the argument rather than restating
+it.
 
 The PoS migration design opens (§0.1) with the objection that ~94% of supply
 sits at one address, so stake-weighted consensus would hand the chain to the
-founder. V4 changes that materially:
+founder. Where V4 now lands:
 
-| | Today | V4 at genesis | V4 after founder vesting completes |
+| | Genesis-3 today | V4 at genesis | V4 at year 50 |
 |---|---:|---:|---:|
-| Founder | 94.3% | **0%** (2-year cliff) | 17% |
-| Insiders total (founder + VC + team + marketing) | 94.3% | depends on §7 | 41% |
-| Validators (earned) | — | grows to 53.7% | 53.7% |
+| Founder — spendable | 94.3% | **16.89%** (carryover, liquid) | 33.89% |
+| Founder — locked | — | 17.00% (10-yr cliff, 40-yr vest) | 0% |
+| Insiders total | 94.3% | 25.0% liquid (Foundation) + 16.89% | 62.97% |
+| Validators (earned) | — | 0%, growing | 36.03% |
 
-With a 2-year cliff, the founder holds **no spendable stake at genesis**. That
-is a genuine, consensus-enforceable answer to §0.1 — far stronger than the
-taint-propagation machinery in §4.1 of the migration design, which exists
-precisely because the current distribution could not be fixed any other way.
+An earlier draft cliffed the founder's whole position and could claim **no
+spendable founder stake at genesis** — a consensus-enforced answer, and a much
+stronger one than this. Carrying the balance across liquid gave it up: the
+founder holds 16.89% of supply, spendable from slot 0, and 70.4% of what is
+actually circulating then.
 
-**But it depends entirely on §7.** If VC, team and marketing (24% combined)
-unlock at or near genesis, the concentration problem returns in a different
-costume: a 24% bloc against a validator allocation that starts at zero and
-takes years to accumulate. The gates G1–G4 would fail on day one.
+What remains true is narrower and still worth something. The relaunch takes the
+founder from 94.3% of supply to 16.89% spendable, which is a 5.6× reduction in
+concentration that no amount of coin-marking on the live chain could have
+achieved. And the new grant carries the strictest schedule on the chain — ten
+years locked, forty vesting, fully vested at year 50.
+
 
 ---
 
@@ -573,7 +588,7 @@ Schedules follow prevailing market practice for recent L1 launches.
 
 | Bucket | Genesis | Cliff | Linear | Total | Market basis |
 |---|---:|---:|---:|---:|---|
-| Founder | 0% | 24 mo | 120 mo | 12 yr | Far above market; a founder decision, not a benchmark |
+| Founder — new grant | 0% | **120 mo** (10 yr) | **480 mo** (40 yr) | 50 yr | The V2 premine schedule, restored. Far beyond any market benchmark and the strictest on the chain — deliberately, since the carried-over balance arrives liquid and this grant is the part that can still be made to wait |
 | VC / hedge funds | 0% | **12 mo** | 24 mo | 3 yr | 12-month cliff is the standard among recent L1s (Sui Series A and B both cliff at 12 months); investor vests typically run 2–3 years |
 | Team | 0% | **18 mo** | 36 mo | 4.5 yr | Institutional standard is 12-month cliff + 36-month linear; 18 months is "defensible and increasingly expected" where institutional investors participate, and it keeps the team cliff off the VC cliff month |
 | Marketing | **25%** | — | 24 mo | 2 yr | Listing and launch spend is commonly unlocked at TGE for launch momentum; ongoing programmes vest over ~24–25 months |
