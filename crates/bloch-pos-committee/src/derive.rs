@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Block validation under PoS — and the **shared derivation functions** the
-//! producer must use.
+//! The **shared derivation functions** producer and validator must both use.
 //!
 //! ## The one rule that shapes this file
 //!
-//! Every `expected` value the validator checks a header field against is
+//! Every `expected` value a validator checks a header field against is
 //! computed by a `pub` function in this module, and [`crate::produce`] stamps
 //! the header by calling **those same functions**. There is deliberately no
 //! value that the producer derives one way and the validator re-derives
@@ -16,16 +15,23 @@
 //! is the defect; sharing the function is the fix. (Same failure family as the
 //! 2026-08-08 `expected_bits` split, §5.5 of the migration design.)
 //!
-//! ## What this seam covers
+//! ## What this seam covers — derivations only, since 2026-08-12
 //!
-//! This module validates everything the committee layer owns: schedule,
-//! version, RANDAO reveal + mix, attestation quorum, body/attestation/state
-//! commitments, finality carry-over, and the proposer signature. What it does
-//! **not** do is execute transactions or advance the validator registry /
-//! finality bookkeeping — that is DEV-1's [`crate::interfaces::StateTransition`]
-//! implementation (`apply_block` / `process_epoch`), which will *consume* the
-//! helpers here. Transactions are opaque bytes to this crate (§1.2); they are
-//! committed by `body_root` and carried through the state root untouched.
+//! This module used to carry a `validate_block` as well: a second, complete,
+//! uncalled block validator with its own frozen error order. It is gone, and
+//! the comparison that justified deleting it is written out where it stood
+//! (search "deleted 2026-08-12"). Validation happens in exactly one place now,
+//! [`crate::transition::Transition::apply_block`], which is the seam the node
+//! binds.
+//!
+//! What remains here is the set of `pub` **derivation** functions: the seed,
+//! the active set, the proposer draw, the RANDAO fold, the finality
+//! carry-over, the Coherence binding, the two body Merkle roots, the
+//! attestation-inclusion predicate and the post-state root. Those are shared
+//! on purpose — [`crate::produce`] stamps a header with them and `transition`
+//! checks against them. Transactions are opaque bytes to this crate (§1.2);
+//! they are committed by `body_root` and carried through the state root
+//! untouched.
 //!
 //! ## Purity
 //!
@@ -35,8 +41,7 @@
 
 use crate::attestation::{validate as validate_attestation, Attestation, SignatureVerifier};
 use crate::beacon::{process_reveal, BeaconError, RevealState};
-use crate::header::{BlockEnvelope, BlockHeaderV4, VERSION_G4};
-use crate::interfaces::{ProposalReject, TransitionError};
+use crate::header::BlockHeaderV4;
 use crate::params::DS_BODY;
 use crate::sample::Validator;
 use crate::schedule;
@@ -112,6 +117,15 @@ pub struct ChainState {
     pub applied_evidence: Vec<crate::state_root::AppliedEvidenceRecord>,
     pub slash_window: Vec<crate::state_root::SlashWindowRecord>,
     pub delegator_slash_losses: Vec<crate::state_root::DelegatorLossRecord>,
+    /// L1 fee-market leaf (2026-08-12), carried unchanged: charging
+    /// transactions and moving the price are transaction execution, which this
+    /// seam does not do — but the leaf is carried, because the state root
+    /// commits all components and a root over a subset is not the root the
+    /// header must carry.
+    pub base_fee: crate::state_root::BaseFeeRecord,
+    /// Delegator fee-reward ledger, carried unchanged: it is filled at the
+    /// epoch boundary, which is the transition's job.
+    pub delegator_fee_rewards: Vec<crate::state_root::DelegatorFeeRecord>,
 }
 
 impl ChainState {
@@ -135,6 +149,8 @@ impl ChainState {
             applied_evidence: &self.applied_evidence,
             slash_window: &self.slash_window,
             delegator_slash_losses: &self.delegator_slash_losses,
+            base_fee: self.base_fee,
+            delegator_fee_rewards: &self.delegator_fee_rewards,
             taint_root: self.taint_root,
             coherence_accumulator_root: self.coherence_accumulator_root,
             coherence_nullifier_root: self.coherence_nullifier_root,
@@ -432,6 +448,20 @@ pub fn attestation_root(attestations: &[Attestation]) -> [u8; 32] {
 /// older committees derivable, and it keeps exactly two epochs — an
 /// attestation this rule excludes is one whose committee a fresh node could
 /// not re-derive from the parent state alone (§5.5 fails closed).
+///
+/// **KNOWN DIVERGENCE, recorded 2026-08-12, not fixed here.** "One definition,
+/// used twice" is true of this function's two callers, but this function and
+/// [`crate::transition`]'s step 8 do not draw the same committee: this one
+/// calls [`crate::slot_subcommittee`] (the sampled 8-validator draw), the
+/// transition calls [`crate::committees::committee_for_slot`] (the F1
+/// partition). The partition is the current design and the sampled draw is
+/// superseded — see the lib.rs banner — so a producer filtering with this
+/// predicate can drop attestations its own validator would have accepted, and
+/// keep ones it would refuse. It was masked while `derive::validate_block`
+/// existed, because that validator used this same superseded rule and so
+/// agreed with the producer perfectly while both disagreed with the node.
+/// Deleting the parallel validator is what exposed it. Fixing it is a change
+/// to `produce.rs`'s filter, on a seam this task did not open.
 pub fn validate_included_attestation(
     parent: &ParentState<'_>,
     block_slot: u64,
@@ -507,111 +537,72 @@ pub fn post_state_root(
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// The validator
+// The validator that used to live here — deleted 2026-08-12
 // ────────────────────────────────────────────────────────────────────────────
-
-/// Validate `envelope` as the child of `parent`. `Ok(())` means every header
-/// field agrees with what this module's shared derivations produce from the
-/// parent's committed state — which is also exactly how [`crate::produce`]
-/// builds a block, so a block produced and validated on the same node with
-/// the same `ParentState` cannot disagree with itself.
-///
-/// Check order (frozen — the reject a node reports is consensus-visible):
-///
-/// 1. parent linkage, slot monotonicity — structural, cheapest;
-/// 2. scheduled proposer, version, RANDAO reveal + mix — the proposal checks,
-///    in the [`crate::interfaces::ProposerDuties`] order;
-/// 3. each included attestation (membership before its signature, the
-///    DoS ordering [`crate::attestation::validate`] already fixes);
-/// 4. body / attestation / finality / coherence commitments;
-/// 5. the recomputed state root;
-/// 6. the proposer's hybrid signature **last** — it is the single most
-///    expensive check (≈4.6 KB hybrid verify), and everything above rejects
-///    garbage without paying for it.
-pub fn validate_block(
-    parent: &ParentState<'_>,
-    envelope: &BlockEnvelope,
-    verifier: &dyn SignatureVerifier,
-) -> Result<(), TransitionError> {
-    let header = &envelope.header;
-
-    // 1 — structure. A block that does not extend this parent, or does not
-    // advance the slot, is judged before any derivation runs.
-    if header.parent != *parent.header.id().as_bytes() {
-        return Err(TransitionError::WrongParent);
-    }
-    if header.slot <= parent.header.slot {
-        return Err(TransitionError::NonMonotonicSlot);
-    }
-
-    // 2 — proposal checks, in the frozen ProposerDuties order.
-    match scheduled_proposer(parent, header.slot) {
-        Some(expected) if expected == header.proposer_index => {}
-        _ => return Err(TransitionError::Proposal(ProposalReject::NotScheduledProposer)),
-    }
-    if header.version != VERSION_G4 {
-        return Err(TransitionError::Proposal(ProposalReject::WrongVersion));
-    }
-    // The reveal must open the proposer's committed chain head, and the mix
-    // the header carries must be the fold of that reveal into the parent's
-    // committed mix. Both come out of the one randao_transition call the
-    // producer also uses; a header stamping any other mix is equivalent to a
-    // bad reveal and reported as such.
-    let new_mix = match randao_transition(parent, header.proposer_index, &header.randao_reveal) {
-        Ok((_advanced, mix)) => mix,
-        Err(_) => return Err(TransitionError::Proposal(ProposalReject::BadRandaoReveal)),
-    };
-    if header.randao_mix != new_mix {
-        return Err(TransitionError::Proposal(ProposalReject::BadRandaoReveal));
-    }
-
-    // 3 — the attestation quorum, element by element. The index in the error
-    // is the body position, so a divergence is debuggable from logs.
-    for (i, att) in envelope.body.attestations.iter().enumerate() {
-        if validate_included_attestation(parent, header.slot, att, verifier).is_err() {
-            return Err(TransitionError::Attestation(i as u32));
-        }
-    }
-
-    // 4 — commitments over what the body actually carries, and the two
-    // carried roots.
-    if header.attestation_root != attestation_root(&envelope.body.attestations) {
-        return Err(TransitionError::AttestationRootMismatch);
-    }
-    if header.body_root != body_root(&envelope.body.transactions) {
-        return Err(TransitionError::BodyRootMismatch);
-    }
-    let (justified, finalized) = expected_finality(parent);
-    if header.justified_root != justified || header.finalized_root != finalized {
-        return Err(TransitionError::FinalityRegression);
-    }
-    if header.coherence_root != expected_coherence(parent) {
-        return Err(TransitionError::CoherenceRootMismatch);
-    }
-
-    // 5 — the recomputed post-state root, from the same post_state_root the
-    // producer stamped.
-    if header.state_root != post_state_root(parent, header.slot, new_mix, &envelope.body.attestations)
-    {
-        return Err(TransitionError::StateRootMismatch);
-    }
-
-    // 6 — the proposer's signature, last (cost ordering). One signing-root
-    // definition: BlockHeaderV4::proposal_signing_root, under DS_PROPOSE.
-    if !verifier.verify(
-        header.proposer_index,
-        &header.proposal_signing_root(),
-        &envelope.proposer_sig,
-    ) {
-        return Err(TransitionError::Proposal(ProposalReject::BadSignature));
-    }
-
-    Ok(())
-}
+//
+// `validate_block(parent, envelope, verifier) -> Result<(), TransitionError>`
+// stood here: a complete second block validator, with its own frozen error
+// order, **and no caller**. The node runs `transition::Transition::apply_block`
+// (`bloch-pos-node/src/engine.rs` binds that seam explicitly). Nothing outside
+// this crate's own tests ever called this one.
+//
+// Two validation stacks with divergent error orders is precisely the condition
+// that produced this week's defects: two block-identity functions, two state
+// -root derivations (`state_root::randao_window` exists because of it), and a
+// header that committed to nothing — that last one *because* the three
+// commitment checks lived only here, in the stack nobody ran, so the stack that
+// did run accepted any `body_root` at all for 178 green tests. A rule that
+// exists twice is a rule that is enforced once and believed twice.
+//
+// THE COMPARISON, so the deletion is not a deletion of coverage. Left column:
+// what `validate_block` checked. Right: where `transition` checks it.
+//
+//   parent linkage      → step 2, `header.parent != pre.head`. Same rule; the
+//                         transition compares against an id IT derived rather
+//                         than against a header field, which is stricter.
+//   slot monotonicity   → step 1, plus a rule this seam had no way to state:
+//                         a block in an epoch already processed past is also
+//                         `NonMonotonicSlot`.
+//   scheduled proposer  → step 4, via `schedule::proposer` off the same seed.
+//   version             → step 3.
+//   RANDAO reveal + mix → step 5, via `beacon::process_reveal`, and it ADVANCES
+//                         the committed chain head, which this seam could not.
+//   attestations        → step 8. Different committee rule, and the transition's
+//                         is the current one: `committees::committee_for_slot`
+//                         (the F1 partition) against this seam's
+//                         `slot_subcommittee` (the superseded sampled draw —
+//                         see the lib.rs banner). Plus a same-epoch bound.
+//   attestation_root    → step 3b, same `attestation_root` function.
+//   body_root           → step 3b, same `body_root` function.
+//   finality carry-over → step 6, against the committed finality ENGINE rather
+//                         than against the parent header's copied field.
+//   coherence_root      → step 3b, same `coherence_binding`.
+//   state_root          → step 12, over the state the transition actually
+//                         computed (registry, finality, fees and all), not over
+//                         a state whose components this seam carried unchanged.
+//   proposer signature  → step 7, moved EARLIER on purpose: one hybrid verify
+//                         before N attestation verifies is the cheap-first
+//                         order the transition's docs freeze.
+//
+// Nothing was checked here and only here. What WAS only here was two negative
+// tests — `WrongVersion` and proposer `BadSignature` had no regression test in
+// the transition, only in `produce.rs`'s tamper table against this function.
+// Those are migrated to `transition::tests` (`wrong_version_rejected`,
+// `bad_proposer_signature_rejected`); deleting a checker while dropping the
+// tests that prove the check exists is how a check becomes a comment.
+//
+// Everything ABOVE this comment stays: `active_validators`, `sortition_seed`,
+// `scheduled_proposer`, `randao_transition`, `expected_finality`,
+// `coherence_binding`, `expected_coherence`, `body_root`, `attestation_root`,
+// `validate_included_attestation`, `post_chain_state`, `post_state_root`. They
+// are the shared derivations — `produce.rs` stamps with them and `transition`
+// checks with them, and that sharing is the anti-h28080 invariant itself. Only
+// the parallel validator died.
 
 #[cfg(test)]
 mod coherence_tests {
     use super::*;
+    use crate::header::VERSION_G4;
     use crate::state_root::{CheckpointRecord, EvmCommitment, FinalityRecord, RandaoMix};
 
     fn chain(acc: [u8; 32], nf: [u8; 32]) -> ChainState {
@@ -650,6 +641,15 @@ mod coherence_tests {
             applied_evidence: Vec::new(),
             slash_window: Vec::new(),
             delegator_slash_losses: Vec::new(),
+            // Genesis-shaped fee market: the price floor, no usage behind it.
+            // Written out rather than defaulted, same break-this-line reason.
+            base_fee: crate::state_root::BaseFeeRecord {
+                base_fee_millisat_per_gas:
+                    crate::fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+                gas_used: 0,
+                tx_bytes: 0,
+            },
+            delegator_fee_rewards: Vec::new(),
             evm: EvmCommitment {
                 account_root: [0u8; 32],
                 receipts_root: [0u8; 32],

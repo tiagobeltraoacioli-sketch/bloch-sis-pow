@@ -184,6 +184,13 @@ pub struct ValidatorRecord {
     pub exit_epoch: u64,
     pub withdrawable_epoch: u64,
     pub slashed: bool,
+    /// Commission the operator charges on its delegators' rewards, in basis
+    /// points, capped at [`crate::rewards::MAX_COMMISSION_BPS`] where it is
+    /// *applied* (2026-08-12). Both revenue streams read it — epoch issuance
+    /// through `rewards::distribute` and producer fees through
+    /// `fee_market::distribute_producer_fees` — so it is committed state
+    /// (`state_root::ValidatorRecord::commission_bps`), never configuration.
+    pub commission_bps: u128,
 }
 
 /// The `DEPOSIT` transaction payload (§7.1).
@@ -335,6 +342,20 @@ pub enum TransitionError {
     /// operator can change any rule including this one; "impossible to
     /// change" would be false and is deliberately not the claim.
     SupplyCapExceeded,
+    /// The block's transactions consume more than `fee_market::BLOCK_GAS_LIMIT`
+    /// gas — the CPU/state backstop of the L1 fee market
+    /// (`BLOCH-L1-FEE-MARKET.md` §5).
+    ///
+    /// Separate from the byte cap below, and not merged into
+    /// `Transaction(i)`: the caps are properties of the *block*, not of any
+    /// one transaction in it, and blaming an arbitrary index would send whoever
+    /// reads the log looking at an innocent transaction.
+    BlockGasLimitExceeded,
+    /// The block's transaction payload exceeds
+    /// `fee_market::MAX_BLOCK_TX_BYTES` — the gossip-budget cap (§5), the one
+    /// that binds first for PQ-signature-heavy traffic and the one gate G10's
+    /// fleet measurement stands behind.
+    BlockByteLimitExceeded,
 }
 
 /// Why a deposit was rejected (§7.1, §4.1, §6.6.3).

@@ -41,6 +41,12 @@ pub struct ManifestValidator {
     pub randao_commitment: [u8; 32],
     pub pubkey: Vec<u8>,
     pub withdrawal_credentials: Vec<u8>,
+    /// Commission on delegators' rewards, in basis points. Published in the
+    /// manifest because it is a committed registry column (2026-08-12): the
+    /// epoch boundary splits both issuance and producer fees with it, so a
+    /// launch validator's rate has to be part of the genesis every node
+    /// agrees on, not a local setting.
+    pub commission_bps: u128,
 }
 
 pub struct Manifest {
@@ -69,6 +75,7 @@ impl Manifest {
             out.extend_from_slice(&v.randao_commitment);
             crate::codec::put_bytes(&mut out, &v.pubkey);
             crate::codec::put_bytes(&mut out, &v.withdrawal_credentials);
+            out.extend_from_slice(&v.commission_bps.to_le_bytes());
         }
         out.extend_from_slice(&(self.cohort.len() as u32).to_le_bytes());
         for c in &self.cohort {
@@ -100,6 +107,7 @@ impl Manifest {
                 randao_commitment: r.h32()?,
                 pubkey: r.bytes()?,
                 withdrawal_credentials: r.bytes()?,
+                commission_bps: r.u128()?,
             });
         }
         let nc = r.u32()? as usize;
@@ -159,6 +167,7 @@ impl Manifest {
                 staked_sat: v.stake_sat,
                 randao_commitment: v.randao_commitment,
                 withdrawal_credentials: v.withdrawal_credentials.clone(),
+                commission_bps: v.commission_bps,
             })
             .collect();
         CommittedState::genesis(
@@ -209,6 +218,10 @@ mod tests {
                     randao_commitment: [i as u8; 32],
                     pubkey: vec![i as u8; 16],
                     withdrawal_credentials: Vec::new(),
+                    // Distinct non-zero rates, so a decoder that dropped or
+                    // aliased the column would fail the round-trip below
+                    // instead of round-tripping three identical zeros.
+                    commission_bps: 250 * (i as u128 + 1),
                 })
                 .collect(),
             cohort: vec![0],
@@ -223,6 +236,10 @@ mod tests {
         assert_eq!(back.genesis_time_ms, m.genesis_time_ms);
         assert_eq!(back.slot_ms, m.slot_ms);
         assert_eq!(back.validators.len(), 3);
+        assert_eq!(
+            back.validators.iter().map(|v| v.commission_bps).collect::<Vec<_>>(),
+            m.validators.iter().map(|v| v.commission_bps).collect::<Vec<_>>(),
+        );
         assert_eq!(back.cohort, m.cohort);
         // Genesis identity and state are pure functions of the manifest.
         use bloch_pos_committee::interfaces::StateReader;

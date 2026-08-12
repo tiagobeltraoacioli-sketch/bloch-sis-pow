@@ -7,18 +7,19 @@
 //!
 //! ## Which composition seam this engine binds
 //!
-//! The pure crate ships **two** parallel producer/validator seams:
-//! `transition.rs` (`Transition` + `CommittedState` — epochs, finality,
-//! rewards, fork-choice accumulation) and `derive.rs`/`produce.rs`
-//! (`ParentState`/`ChainState`). Their committed state roots are **not**
-//! byte-compatible (they commit different beacon-mix windows), so a node must
-//! bind exactly one. This engine binds `Transition`/`CommittedState`, the
-//! seam that implements the frozen `StateTransition`/`StateReader` traits and
-//! composes finality; the header's body/attestation commitments — which
-//! `Transition` deliberately does not judge — are checked here through
-//! `derive::body_root`/`derive::attestation_root`, the single definitions of
-//! those roots. The unreconciled two-seam situation is flagged in the task
-//! report; do not "fix" it here by re-deriving anything.
+//! One, and now there is only one to bind. The pure crate used to ship a
+//! second, complete block validator — `derive::validate_block`, over
+//! `ParentState`/`ChainState`, with its own frozen error order and no caller.
+//! It was deleted on 2026-08-12 (the checklist comparison is in `derive.rs`
+//! where it stood); `derive` keeps only the shared derivation functions, which
+//! `produce.rs` stamps with and `transition` checks against.
+//!
+//! This engine binds `Transition`/`CommittedState`: the seam that implements
+//! the frozen `StateTransition`/`StateReader` traits, composes finality, and —
+//! since 2026-08-12 — judges the header's body/attestation/coherence
+//! commitments itself. The two `derive::*` root calls below are an early
+//! cheap reject before a state clone, not a second opinion: they are the same
+//! functions the transition checks with.
 //!
 //! ## Producer = validator, structurally
 //!

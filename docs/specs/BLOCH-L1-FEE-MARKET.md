@@ -2,7 +2,8 @@
 
 # BLOCH-L1-FEE-MARKET — one market, one unit, one price
 
-**Status:** proposed, wave 2026-08-11. Code authority:
+**Status:** proposed 2026-08-11; **wired into consensus 2026-08-12** (§6.1
+and §4.4 are no longer integration seams — see §8). Code authority:
 `crates/bloch-pos-committee/src/fee_market.rs` (constants and arithmetic),
 `crates/bloch-pos-committee/src/rewards.rs` (the fee split, decided
 2026-08-11, `BLOCH-TOKENOMICS-V4.md` §6.3.2), and
@@ -200,14 +201,18 @@ market on top; it is what `split_fees_at` sees as `priority_fee`.
 
 `BlockHeaderV4` (frozen by the single-derivation-path property test) does
 not carry a base fee, and this design does not add one. The base fee is
-**committed consensus state**: a leaf in the `state_root.rs` SMT under a new
-component tag (next free: `0x09`), holding
-`(base_fee_millisat_per_gas, parent_gas_used, parent_tx_bytes)`. Validation
-recomputes the expected value with `next_base_fee` from the parent's leaf
-and rejects a block whose transactions were priced against anything else.
-This keeps the header untouched and satisfies §5.5 derivability. **The
-component-tag list is a closed list owned by the state-root design; adding
-`0x09` is flagged as an integration decision, not performed by this wave.**
+**committed consensus state**: a leaf in the `state_root.rs` SMT under
+component tag `TAG_BASE_FEE` (`state_root::BaseFeeRecord`), holding
+`(base_fee_millisat_per_gas, gas_used, tx_bytes)` for the block that
+committed it. The child block's price is
+`CommittedState::next_base_fee()` — one call into `next_base_fee` over the
+parent's leaf, used by the producer to price its mempool and by the validator
+to charge every included transaction, so there is one expression of the rule.
+This keeps the header untouched and satisfies §5.5 derivability.
+
+**Wired 2026-08-12.** The tag is `0x15`, not the `0x09` this document
+originally reserved: tags are append-only and the S5.5 bookkeeping extension
+had claimed `0x09`–`0x0F` in the meantime.
 
 ### 4.5 The burn, and exactly what happens at the era boundary
 
@@ -316,10 +321,21 @@ moment fees become everything**, and delegation — the mechanism that lets
 stake exist without running hardware — would collapse at the fee-only
 boundary, forty years into an immutable schedule. Routing fees through the
 commission split keeps delegator economics alive in both eras
-(`delegation_survives_fee_only_era` pins it). **Integration change
-required:** `transition.rs` step 11 / the epoch-boundary compounding must
-apply `distribute_producer_fees` instead of crediting the operator record
-directly. Not wired this wave — transition is another workstream's surface.
+(`delegation_survives_fee_only_era` pins it).
+
+**Wired 2026-08-12.** `transition.rs`'s epoch boundary applies
+`distribute_producer_fees` over the producer's committed stake position:
+`self_stake` is the bond, `delegated_stake` comes from
+`delegation::Registry::resolve`, and `commission_bps` is a new **committed
+registry column** (`state_root::ValidatorRecord::commission_bps`, declared at
+deposit and published for the genesis cohort) — a rate read from anywhere but
+committed state would make two nodes compound different bonds from the same
+block. The delegators' side is split pro-rata by *activated* satoshis
+(`fee_market::split_delegator_fees`) into a committed ledger,
+`TAG_DELEGATOR_FEE_REWARD` — the earning mirror of the slash-loss ledger, and
+a ledger for the same reason: editing delegation records would reshuffle
+warm-up history. Truncation dust goes to the operator. Pinned end-to-end by
+`transition::tests::producer_fees_reach_delegators_through_the_commission_split`.
 
 ### 6.2 MEV: what the design does, and the honest bill for it
 
@@ -365,9 +381,23 @@ first AMM deployment. What this design does:
   and the constants, as `rewards.rs` is for the split.
 - The base-fee state leaf (tag `0x09`) is specified (§4.4), not added —
   the SMT component list is a closed list owned by the state-root design.
-- `transition.rs` step 11 not rewired to `distribute_producer_fees` (§6.1),
-  and `PosTransaction::Transfer` still carries declared satoshi fees rather
-  than `gas_used × price` — both are integration seams on another
-  workstream's surface, flagged rather than crossed.
+- ~~`transition.rs` step 11 not rewired~~ / ~~`Transfer` carries declared
+  fees~~ — **both done 2026-08-12** (§6.1, §4.4). `PosTransaction::Transfer`
+  is now `{ inputs, tx_bytes, tip_millisat_per_gas }`: gas is derived by
+  `intrinsic_gas` and priced at the committed base fee, so a transaction can
+  no longer name the satoshis it pays. That changed `canonical_bytes`, hence
+  `body_root`, hence block identity — a consensus change, pinned by
+  `transfer_encoding_is_gas_priced_not_declared`. The two per-block caps (§5)
+  are enforced with their own errors (`BlockGasLimitExceeded`,
+  `BlockByteLimitExceeded`).
+- **Still not wired:** issuance (`rewards::distribute` at the epoch boundary)
+  still credits the whole payout into the operator's bond with
+  `commission_bps: 0` and `delegated_stake: 0`. The forcing argument of §6.1
+  is about *fees*, and only fees were routed; issuance now has a committed
+  commission column available to it and does not read it. Deliberate scope,
+  recorded here rather than left to be discovered.
+- The class of `PosTransaction::Transfer` is fixed to `TxClass::Eutxo`. The
+  `EvmPq` / `EvmSecp256k1` / `Shielded` classes are priced (§3.2) but no
+  transaction variant carries them, because no such variant exists yet.
 - `SHIELDED_VERIFY_GAS_PROVISIONAL` unmeasured; activation-blocking (§3.2).
 - G10 restatement (§5) is stated here, not edited into the migration spec.

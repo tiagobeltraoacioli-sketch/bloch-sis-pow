@@ -450,6 +450,34 @@ Two consequences worth stating, because both surfaced as test failures:
 > (pinned by `transition::tests::no_in_protocol_path_can_raise_the_cap`). A
 > hard fork adopted by every operator can change any rule, this one included;
 > "impossible to change" would be false and is not claimed.
+>
+> **Revision 2026-08-12 (third) — the fee market, and the commission column.**
+> Wiring `BLOCH-L1-FEE-MARKET.md` into the transition adds two components and
+> one registry column, each against this section's own bar:
+>
+> - tag `0x15` (`state_root::TAG_BASE_FEE`): the base fee the block charged,
+>   in millisatoshi per gas, plus the block's gas and payload bytes. The
+>   **next** block's price is derived from this triple by
+>   `fee_market::next_base_fee`. Held in node-local execution bookkeeping
+>   instead, it is `expected_bits` with a different name — an uncommitted
+>   retarget input, which is the defect this whole section exists to prevent.
+> - tag `0x16` (`state_root::TAG_DELEGATOR_FEE_REWARD`): cumulative fee
+>   rewards per delegator account. The earning mirror of the slash-loss ledger
+>   and committed for the identical reason — a withdrawal pays it out, so
+>   nodes that disagreed on it would pay different amounts for the same exit.
+>   A ledger rather than an edit to the delegation records, because the
+>   delegation registry replays its warm-up history from those records.
+> - `ValidatorRecord.commission_bps`, appended to the committed registry
+>   serialization: the epoch boundary *splits revenue with it*
+>   (`fee_market::distribute_producer_fees`), so two nodes reading different
+>   rates would compound different bonds from the same block.
+>
+> The consensus change that comes with it is not a state-root change:
+> `PosTransaction::Transfer` stopped declaring its fee in satoshis and now
+> carries `{ inputs, tx_bytes, tip_millisat_per_gas }`, with gas derived by
+> `fee_market::intrinsic_gas` and priced at the committed base fee. That moves
+> `canonical_bytes`, hence `body_root`, hence block identity — flagged here
+> because it is a fork-relevant encoding change, not an internal refactor.
 
 **Hard rule, learned from the difficulty defect:** every consensus-relevant
 value used to validate block *B* must be derivable from `B.parent`'s committed

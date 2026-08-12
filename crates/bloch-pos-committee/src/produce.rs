@@ -5,8 +5,11 @@
 //! ## Producer and validator are the same arithmetic
 //!
 //! Every header field this module stamps comes out of a `pub` function in
-//! [`crate::derive`] — the *same* functions [`crate::derive::validate_block`]
-//! checks the field against. This is not stylistic reuse: at h28080 this
+//! [`crate::derive`] — the *same* functions the validator checks the field
+//! against. (Until 2026-08-12 the validator meant `derive::validate_block`, a
+//! second block validator with no caller; it is deleted, the node's validator
+//! is [`crate::transition`], and `derive` is now purely the shared
+//! derivations.) This is not stylistic reuse: at h28080 this
 //! mainnet stood still for 50 minutes because the block producer stamped a
 //! value one way while the validation path of the *same node* derived it
 //! another way, so the node rejected every block it built. The invariant this
@@ -149,9 +152,9 @@ impl ProducerRandao {
 /// Produce the block for `slot` on top of `parent`, as validator
 /// `proposer_index`.
 ///
-/// On success the returned envelope satisfies
-/// [`crate::derive::validate_block`] for the same `parent` and `verifier`
-/// — that equivalence is pinned by this module's tests, because it is the
+/// On success every derived field of the returned header is, by construction,
+/// exactly what the shared `derive::*` function returns for the same `parent`
+/// — pinned field by field by this module's tests, because it is the
 /// deliverable: a producer whose own validator refuses its blocks halts the
 /// chain (h28080).
 ///
@@ -180,7 +183,7 @@ pub fn produce(
 ) -> Result<BlockEnvelope, ProduceError> {
     // ── Refusals first: nothing below this block consumes or signs. ──
     //
-    // 1. Structure: the same monotonicity rule validate_block enforces.
+    // 1. Structure: the same monotonicity rule the transition enforces.
     if slot <= parent.header.slot {
         return Err(ProduceError::SlotNotAfterParent { slot, parent_slot: parent.header.slot });
     }
@@ -260,12 +263,11 @@ mod tests {
     use crate::attestation::AttestationData;
     use crate::beacon::RevealState;
     use crate::header::BlockId;
-    use crate::interfaces::{ProposalReject, TransitionError};
     use crate::state_root::{
-        CheckpointRecord, EvmCommitment, FinalityRecord, ParticipationRecord, RandaoMix,
-        ValidatorRecord,
+        BaseFeeRecord, CheckpointRecord, EvmCommitment, FinalityRecord, ParticipationRecord,
+        RandaoMix, ValidatorRecord,
     };
-    use crate::derive::{validate_block, ChainState};
+    use crate::derive::ChainState;
     use sha3::{Digest, Sha3_256};
 
     // ── Mock crypto: deterministic stand-in for the injected hybrid suite ──
@@ -331,6 +333,7 @@ mod tests {
                 reveals_used: 0,
                 withdrawable_epoch: u64::MAX,
                 withdrawal_credentials: Vec::new(),
+                commission_bps: 500,
             })
             .collect();
         let genesis_cp = CheckpointRecord { epoch: 0, root: [0u8; 32] };
@@ -367,6 +370,12 @@ mod tests {
             applied_evidence: Vec::new(),
             slash_window: Vec::new(),
             delegator_slash_losses: Vec::new(),
+            base_fee: BaseFeeRecord {
+                base_fee_millisat_per_gas: crate::fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+                gas_used: 0,
+                tx_bytes: 0,
+            },
+            delegator_fee_rewards: Vec::new(),
             evm: EvmCommitment {
                 account_root: [0x14; 32],
                 receipts_root: [0x15; 32],
@@ -457,26 +466,74 @@ mod tests {
         (chain, pheader, reveals, envelope, proposer)
     }
 
-    // ── THE test: producer and validator agree ──
+    // ── THE test: every stamped field IS the shared derivation ──
 
+    /// The h28080 regression test, restated after `derive::validate_block` was
+    /// deleted (2026-08-12).
+    ///
+    /// It used to read `assert_eq!(validate_block(&parent, &envelope, ..),
+    /// Ok(()))`. That phrasing needed a *second* validator to exist in order
+    /// to say anything — and a second validator is the defect, not the check:
+    /// the crate now has exactly one, `transition::apply_block`, which works
+    /// on `CommittedState` and cannot be handed this seam's `ParentState`.
+    ///
+    /// The invariant itself never needed one. What h28080 demands is that the
+    /// producer stamps nothing it computed for itself: every derived field
+    /// must equal what the shared `derive::*` function returns from the same
+    /// parent state. That is stated directly below, field by field, and it is
+    /// strictly the stronger statement — a validator returning `Ok` proves the
+    /// fields agree with *its* derivations, while this proves they agree with
+    /// the single set of derivations both sides call.
     #[test]
-    fn produced_block_passes_the_validators_check() {
+    fn every_produced_field_equals_the_shared_derivation() {
         let (chain, pheader, reveals, envelope, proposer) = produce_ok();
         let parent = ParentState { header: &pheader, chain: &chain, reveal_states: &reveals };
+        let h = &envelope.header;
 
-        // The deliverable: the block the producer assembles is accepted by
-        // the transition validator, same parent state, same verifier. This
-        // is the h28080 regression test — producer and validator inside one
-        // node must be the same arithmetic.
-        assert_eq!(validate_block(&parent, &envelope, &MockCrypto), Ok(()));
+        // Structure and schedule.
+        assert_eq!(h.version, VERSION_G4);
+        assert_eq!(h.parent, *parent.header.id().as_bytes());
+        assert_eq!(h.slot, SLOT);
+        assert_eq!(derive::scheduled_proposer(&parent, h.slot), Some(h.proposer_index));
 
-        // The bogus gossip attestation was filtered, the 4 valid ones kept.
+        // RANDAO: the reveal opens the committed head and the mix is its fold.
+        let (_advanced, mix) =
+            derive::randao_transition(&parent, h.proposer_index, &h.randao_reveal)
+                .expect("the stamped reveal must open the committed chain head");
+        assert_eq!(h.randao_mix, mix);
+
+        // Body commitments, over what the body actually carries.
+        assert_eq!(h.body_root, derive::body_root(&envelope.body.transactions));
+        assert_eq!(h.attestation_root, derive::attestation_root(&envelope.body.attestations));
+
+        // Carried roots and the post-state root.
+        let (justified, finalized) = derive::expected_finality(&parent);
+        assert_eq!((h.justified_root, h.finalized_root), (justified, finalized));
+        assert_eq!(h.coherence_root, derive::expected_coherence(&parent));
+        assert_eq!(
+            h.state_root,
+            derive::post_state_root(&parent, h.slot, mix, &envelope.body.attestations)
+        );
+
+        // The signature covers the one signing root, and verifies.
+        assert!(MockCrypto.verify(
+            h.proposer_index,
+            &h.proposal_signing_root(),
+            &envelope.proposer_sig
+        ));
+
+        // Every carried attestation satisfies the inclusion predicate — the
+        // bogus gossip one was filtered, the 4 valid ones kept.
+        for att in &envelope.body.attestations {
+            assert!(
+                derive::validate_included_attestation(&parent, h.slot, att, &MockCrypto).is_ok()
+            );
+        }
         assert_eq!(envelope.body.attestations.len(), 4);
         // Transactions carried verbatim.
         assert_eq!(envelope.body.transactions, txs());
         // And the header names the validator that built it.
-        assert_eq!(envelope.header.proposer_index, proposer);
-        assert_eq!(envelope.header.slot, SLOT);
+        assert_eq!(h.proposer_index, proposer);
     }
 
     // ── Refusals ──
@@ -688,100 +745,91 @@ mod tests {
     // ── The agreement is load-bearing: any drift is caught ──
 
     /// Tamper with each derived header field of a valid produced block and
-    /// assert the validator rejects with the matching reason. This is the
-    /// negative image of THE test above: it proves validate_block actually
-    /// checks every value produce stamps — so if either side ever diverges,
-    /// a test fails here rather than a mainnet halting at the next h28080.
+    /// assert the field no longer matches its derivation. The negative image
+    /// of the test above: it proves each `assert_eq!` there is load-bearing
+    /// rather than comparing something to itself.
+    ///
+    /// This used to run each mutation through `derive::validate_block` and
+    /// assert a specific `TransitionError`. The error *codes* are consensus,
+    /// and they now have exactly one owner — `transition.rs`, where they are
+    /// checked by that module's own negative tests (`wrong_parent_rejected`,
+    /// `wrong_proposer_rejected`, `wrong_version_rejected`,
+    /// `bad_randao_reveal_rejected`, `bad_proposer_signature_rejected`,
+    /// `header_must_commit_to_body_attestations_and_coherence`,
+    /// `state_root_mismatch_rejected`, `finality_regression_rejected`,
+    /// `non_member_attestation_rejected`). Asserting them here as well was the
+    /// second frozen error order; that is what got deleted, deliberately.
     #[test]
-    fn any_tampered_field_is_rejected_by_the_validator() {
+    fn any_tampered_field_stops_matching_its_derivation() {
         let (chain, pheader, reveals, envelope, _) = produce_ok();
         let parent = ParentState { header: &pheader, chain: &chain, reveal_states: &reveals };
 
-        let cases: Vec<(&str, Box<dyn Fn(&mut BlockEnvelope)>, TransitionError)> = vec![
-            (
-                "parent",
-                Box::new(|e| e.header.parent[0] ^= 1),
-                TransitionError::WrongParent,
-            ),
-            (
-                "slot regression",
-                Box::new(|e| e.header.slot = PARENT_SLOT),
-                TransitionError::NonMonotonicSlot,
-            ),
-            (
-                "proposer_index",
-                Box::new(|e| e.header.proposer_index ^= 1),
-                TransitionError::Proposal(ProposalReject::NotScheduledProposer),
-            ),
-            (
-                "version",
-                Box::new(|e| e.header.version = 0xB10C_0004),
-                TransitionError::Proposal(ProposalReject::WrongVersion),
-            ),
-            (
-                "randao_reveal",
-                Box::new(|e| e.header.randao_reveal[0] ^= 1),
-                TransitionError::Proposal(ProposalReject::BadRandaoReveal),
-            ),
-            (
-                "randao_mix",
-                Box::new(|e| e.header.randao_mix[0] ^= 1),
-                TransitionError::Proposal(ProposalReject::BadRandaoReveal),
-            ),
+        // `check` is exactly the conjunction the positive test asserts, as a
+        // predicate — so a mutation that some derivation stops accepting turns
+        // it false. One expression, two uses: the positive test cannot pass a
+        // field this cannot see.
+        let check = |e: &BlockEnvelope| -> bool {
+            let h = &e.header;
+            if h.version != VERSION_G4
+                || h.parent != *parent.header.id().as_bytes()
+                || h.slot <= parent.header.slot
+                || derive::scheduled_proposer(&parent, h.slot) != Some(h.proposer_index)
+            {
+                return false;
+            }
+            let Ok((_adv, mix)) =
+                derive::randao_transition(&parent, h.proposer_index, &h.randao_reveal)
+            else {
+                return false;
+            };
+            let (justified, finalized) = derive::expected_finality(&parent);
+            h.randao_mix == mix
+                && h.body_root == derive::body_root(&e.body.transactions)
+                && h.attestation_root == derive::attestation_root(&e.body.attestations)
+                && h.justified_root == justified
+                && h.finalized_root == finalized
+                && h.coherence_root == derive::expected_coherence(&parent)
+                && h.state_root
+                    == derive::post_state_root(&parent, h.slot, mix, &e.body.attestations)
+                && MockCrypto.verify(h.proposer_index, &h.proposal_signing_root(), &e.proposer_sig)
+                && e.body.attestations.iter().all(|att| {
+                    derive::validate_included_attestation(&parent, h.slot, att, &MockCrypto).is_ok()
+                })
+        };
+
+        assert!(check(&envelope), "the unmutated block must satisfy every derivation");
+
+        let cases: Vec<(&str, Box<dyn Fn(&mut BlockEnvelope)>)> = vec![
+            ("parent", Box::new(|e: &mut BlockEnvelope| e.header.parent[0] ^= 1)),
+            ("slot regression", Box::new(|e: &mut BlockEnvelope| e.header.slot = PARENT_SLOT)),
+            ("proposer_index", Box::new(|e: &mut BlockEnvelope| e.header.proposer_index ^= 1)),
+            ("version", Box::new(|e: &mut BlockEnvelope| e.header.version = 0xB10C_0004)),
+            ("randao_reveal", Box::new(|e: &mut BlockEnvelope| e.header.randao_reveal[0] ^= 1)),
+            ("randao_mix", Box::new(|e: &mut BlockEnvelope| e.header.randao_mix[0] ^= 1)),
             (
                 "attestation_root",
-                Box::new(|e| e.header.attestation_root[0] ^= 1),
-                TransitionError::AttestationRootMismatch,
+                Box::new(|e: &mut BlockEnvelope| e.header.attestation_root[0] ^= 1),
             ),
-            (
-                "body_root",
-                Box::new(|e| e.header.body_root[0] ^= 1),
-                TransitionError::BodyRootMismatch,
-            ),
-            (
-                "justified_root",
-                Box::new(|e| e.header.justified_root[0] ^= 1),
-                TransitionError::FinalityRegression,
-            ),
-            (
-                "finalized_root",
-                Box::new(|e| e.header.finalized_root[0] ^= 1),
-                TransitionError::FinalityRegression,
-            ),
-            (
-                "coherence_root",
-                Box::new(|e| e.header.coherence_root[0] ^= 1),
-                TransitionError::CoherenceRootMismatch,
-            ),
-            (
-                "state_root",
-                Box::new(|e| e.header.state_root[0] ^= 1),
-                TransitionError::StateRootMismatch,
-            ),
-            (
-                "proposer_sig",
-                Box::new(|e| e.proposer_sig[0] ^= 1),
-                TransitionError::Proposal(ProposalReject::BadSignature),
-            ),
+            ("body_root", Box::new(|e: &mut BlockEnvelope| e.header.body_root[0] ^= 1)),
+            ("justified_root", Box::new(|e: &mut BlockEnvelope| e.header.justified_root[0] ^= 1)),
+            ("finalized_root", Box::new(|e: &mut BlockEnvelope| e.header.finalized_root[0] ^= 1)),
+            ("coherence_root", Box::new(|e: &mut BlockEnvelope| e.header.coherence_root[0] ^= 1)),
+            ("state_root", Box::new(|e: &mut BlockEnvelope| e.header.state_root[0] ^= 1)),
+            ("proposer_sig", Box::new(|e: &mut BlockEnvelope| e.proposer_sig[0] ^= 1)),
             (
                 "smuggled attestation",
-                Box::new(|e| {
+                Box::new(|e: &mut BlockEnvelope| {
                     let mut extra = e.body.attestations[0].clone();
                     extra.signature = vec![0xFF; 8];
                     e.body.attestations.push(extra);
                 }),
-                TransitionError::Attestation(4),
             ),
         ];
 
-        for (name, tamper, expected) in cases {
+        for (name, tamper) in cases {
             let mut mutated = envelope.clone();
             tamper(&mut mutated);
-            assert_eq!(
-                validate_block(&parent, &mutated, &MockCrypto),
-                Err(expected),
-                "tampering `{name}` must be rejected with the matching reason"
-            );
+            assert!(!check(&mutated), "tampering `{name}` went undetected by the derivations");
         }
     }
 }

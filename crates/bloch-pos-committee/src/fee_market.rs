@@ -38,12 +38,18 @@
 //!
 //! ## What is deliberately NOT here
 //!
-//! Transaction parsing (transactions are opaque bytes to this crate, §1.2),
-//! the EVM's own opcode schedule (adopted 1:1 from Ethereum's live schedule by
-//! the spec, with the calldata term zeroed because envelope bytes are already
-//! charged here), and the base-fee state leaf (a `state_root.rs` component
-//! tag, specified in the spec §4.4 but not wired — the closed leaf list is an
-//! integration decision).
+//! Transaction parsing (transactions are opaque bytes to this crate, §1.2)
+//! and the EVM's own opcode schedule (adopted 1:1 from Ethereum's live
+//! schedule by the spec, with the calldata term zeroed because envelope bytes
+//! are already charged here).
+//!
+//! What used to be on this list and no longer is, as of 2026-08-12: the
+//! base-fee state leaf (`state_root::BaseFeeRecord` under `TAG_BASE_FEE`) and
+//! the wiring itself. `transition.rs` now derives each block's price from the
+//! parent's committed leaf, charges every transaction through [`charge`],
+//! enforces both per-block caps, and settles the producer's share through
+//! [`distribute_producer_fees`] at the epoch boundary. This module is still
+//! only the arithmetic — but the arithmetic is called now.
 
 use crate::rewards::{Payout, StakeAccount, BPS, MAX_COMMISSION_BPS};
 use crate::tokenomics_v4::{SAT_PER_BLOCH, TOTAL_SUPPLY_SAT};
@@ -258,12 +264,17 @@ const fn ceil_div(n: u128, d: u128) -> u128 {
 /// delegators from `epoch_issuance`, which `tokenomics_v4` sets to zero after
 /// `EMISSION_SLOTS` — at which point fees become validators' entire revenue
 /// (spec §6.3.2). If fees were credited raw to the operator (as
-/// `transition.rs` step 11 currently does), delegator revenue would go to
+/// `transition.rs` did until 2026-08-12), delegator revenue would go to
 /// exactly zero at the moment fees become everything, and the delegation
 /// design — the thing that lets stake exist without running a validator —
 /// would collapse at the fee-only boundary. Routing fees through the same
 /// commission split keeps delegation economically alive in both eras. The
-/// `delegation_survives_fee_only_era` test pins this.
+/// `delegation_survives_fee_only_era` test pins the arithmetic;
+/// `transition::tests::producer_fees_reach_delegators_through_the_commission_split`
+/// pins that the transition actually calls it.
+///
+/// This answers "how much do delegators get". [`split_delegator_fees`]
+/// answers "which delegator gets what".
 pub fn distribute_producer_fees(acct: &StakeAccount, producer_fee_sat: u128) -> Payout {
     let stake = acct.self_stake + acct.delegated_stake;
     if stake == 0 {
@@ -279,6 +290,75 @@ pub fn distribute_producer_fees(acct: &StakeAccount, producer_fee_sat: u128) -> 
         delegators: delegator_gross - commission,
         forfeited: 0,
     }
+}
+
+/// Split [`Payout::delegators`] across the individual delegator accounts that
+/// backed the operator, pro-rata by the satoshis each had **actually
+/// activated** — the same measure that gave the operator its consensus weight,
+/// so a delegator earns exactly on what it made count.
+///
+/// `stakes` is `(delegator, activated_sat)`; the return is `(delegator,
+/// reward_sat)` in the same order, plus the truncation remainder. Every
+/// division truncates, so the parts sum to at most the whole; the shortfall is
+/// returned rather than silently dropped, because a fee that vanishes is
+/// unbacked burn and the caller (the epoch boundary) must place it explicitly.
+/// Conservation is the property: `sum(parts) + remainder == delegators_sat`.
+///
+/// Deterministic by construction — one pass in the caller's order, which the
+/// transition takes from committed, data-keyed state.
+pub fn split_delegator_fees(
+    stakes: &[(u32, u128)],
+    delegators_sat: u128,
+) -> (Vec<(u32, u128)>, u128) {
+    let total: u128 = stakes.iter().map(|(_, s)| *s).sum();
+    if total == 0 || delegators_sat == 0 {
+        return (stakes.iter().map(|(d, _)| (*d, 0)).collect(), delegators_sat);
+    }
+    let mut paid: u128 = 0;
+    let parts: Vec<(u32, u128)> = stakes
+        .iter()
+        .map(|(d, s)| {
+            let share = delegators_sat * *s / total;
+            paid += share;
+            (*d, share)
+        })
+        .collect();
+    (parts, delegators_sat - paid)
+}
+
+// ── Block accounting: what the two caps are measured against ────────────────
+
+/// Gas and payload bytes owed by one transaction, and the fee it settles at a
+/// given price. The transition sums these across a block, checks them against
+/// the two caps (§5), and pays the producer out of the total.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TxCharge {
+    pub gas: u64,
+    pub tx_bytes: u64,
+    pub base_fee_sat: u128,
+    pub priority_fee_sat: u128,
+}
+
+/// Charge one transaction: gas from its class and size
+/// ([`intrinsic_gas`] — **derived, never declared**), then settled against the
+/// protocol's `base_fee_millisat_per_gas` and the sender's tip.
+///
+/// The declared-fee alternative is what this replaces, and it was not a
+/// modelling shortcut but a hole: a transaction that states its own satoshi
+/// fee lets a proposer include one claiming any number it likes and pay itself
+/// from a figure no rule constrains. Deriving gas from the class and pricing
+/// it at the committed base fee means the only user-set quantity left is the
+/// tip, which is what an ordering market is supposed to be.
+pub const fn charge(
+    class: TxClass,
+    tx_bytes: u64,
+    base_fee_millisat_per_gas: u128,
+    tip_millisat_per_gas: u128,
+) -> TxCharge {
+    let gas = intrinsic_gas(class, tx_bytes);
+    let (base_fee_sat, priority_fee_sat) =
+        fee_parts_sat(gas, base_fee_millisat_per_gas, tip_millisat_per_gas);
+    TxCharge { gas, tx_bytes, base_fee_sat, priority_fee_sat }
 }
 
 // ── Compile-time invariants ─────────────────────────────────────────────────
@@ -476,6 +556,57 @@ mod tests {
         // 90% of stake is delegated; at 5% commission delegators keep
         // 90% * 95% = 85.5% of the fee.
         assert_eq!(p.delegators, split.to_producer * 9 / 10 * 9_500 / BPS);
+    }
+
+    /// The per-account pass conserves: parts plus remainder equal the whole,
+    /// on inputs chosen so the division cannot come out even. A pro-rata split
+    /// that quietly loses satoshis is unbacked burn — the caller must be
+    /// handed the shortfall so it can place it deliberately.
+    #[test]
+    fn delegator_split_is_pro_rata_and_conserves_every_satoshi() {
+        // Three accounts on stakes that do not divide 1,000 evenly.
+        let stakes = [(7u32, 1u128), (2, 2), (9, 4)];
+        let (parts, dust) = split_delegator_fees(&stakes, 1_000);
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts.iter().map(|(_, r)| *r).sum::<u128>() + dust, 1_000);
+        assert!(dust > 0, "the fixture must actually exercise truncation");
+        // Order and identity preserved, and bigger stake earns more.
+        assert_eq!(parts[0].0, 7);
+        assert!(parts[2].1 > parts[1].1 && parts[1].1 > parts[0].1);
+
+        // No delegators at all: the whole amount comes back as remainder
+        // rather than evaporating.
+        let (empty, all) = split_delegator_fees(&[], 500);
+        assert!(empty.is_empty());
+        assert_eq!(all, 500);
+
+        // Zero stake recorded: same — a defined answer, nothing lost.
+        let (zeroed, all) = split_delegator_fees(&[(1, 0), (2, 0)], 500);
+        assert!(zeroed.iter().all(|(_, r)| *r == 0));
+        assert_eq!(all, 500);
+    }
+
+    /// `charge` is gas × price, with the gas derived — the property that makes
+    /// a declared fee inexpressible. Two transactions of the same shape cost
+    /// the same; a bigger one costs more; and the fee floor bites.
+    #[test]
+    fn charge_prices_shape_not_assertion() {
+        let a = charge(TxClass::Eutxo { inputs: 1 }, 512, MIN_BASE_FEE_MILLISAT_PER_GAS, 0);
+        let b = charge(TxClass::Eutxo { inputs: 1 }, 512, MIN_BASE_FEE_MILLISAT_PER_GAS, 0);
+        assert_eq!(a, b);
+        assert_eq!(a.gas, intrinsic_gas(TxClass::Eutxo { inputs: 1 }, 512));
+        assert_eq!(a.tx_bytes, 512);
+        assert!(a.base_fee_sat > 0, "no transaction is free, even at the floor");
+        assert_eq!(a.priority_fee_sat, 0);
+
+        let bigger = charge(TxClass::Eutxo { inputs: 4 }, 4_096, MIN_BASE_FEE_MILLISAT_PER_GAS, 0);
+        assert!(bigger.gas > a.gas && bigger.base_fee_sat > a.base_fee_sat);
+
+        // The tip is the only user-set price, and it is charged per gas like
+        // the base fee — not as a flat amount the sender names.
+        let tipped = charge(TxClass::Eutxo { inputs: 1 }, 512, MIN_BASE_FEE_MILLISAT_PER_GAS, 100);
+        assert_eq!(tipped.base_fee_sat, a.base_fee_sat);
+        assert_eq!(tipped.priority_fee_sat, ceil_div(a.gas as u128 * 100, MILLISAT_PER_SAT));
     }
 
     #[test]

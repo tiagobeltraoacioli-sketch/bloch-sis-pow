@@ -187,6 +187,10 @@ fn genesis_cmd(args: &[String]) {
                 .commitment(),
             pubkey: ks.pubkey.clone(),
             withdrawal_credentials: Vec::new(),
+            // Devnet: no delegation, so the rate is committed as zero. It is
+            // written here rather than defaulted, because the day a devnet
+            // grows delegators this line is where someone must choose.
+            commission_bps: 0,
         });
     }
     let manifest = genesis::Manifest {

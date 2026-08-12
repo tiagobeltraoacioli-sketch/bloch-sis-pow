@@ -18,6 +18,10 @@
 //!   equivocator bar,
 //! - the staking queues: the deposit history and the delegation history,
 //! - fee rewards accrued to proposers, pending the epoch boundary,
+//! - the L1 fee-market leaf: the price this block charged and the usage the
+//!   next block's controller reads ([`TAG_BASE_FEE`], 2026-08-12),
+//! - the per-delegator ledgers: cumulative slashing losses and cumulative fee
+//!   rewards ([`TAG_DELEGATOR_SLASH_LOSS`], [`TAG_DELEGATOR_FEE_REWARD`]),
 //! - the taint set root (§4.1),
 //! - the cumulative issued supply — the hard-cap invariant's counter
 //!   ([`TAG_ISSUED_SUPPLY`], 2026-08-12),
@@ -25,7 +29,16 @@
 //!   nullifier-set root (§6.6.2). Finality means nothing if the shielded
 //!   ledger is not part of what gets finalized.
 //!
-//! The list is closed. It was extended once, on 2026-08-11, and the reason is
+//! The list is closed, and each extension carries the same argument. The
+//! 2026-08-12 fee-market pair is the latest: `TAG_BASE_FEE` because the next
+//! block's price is *derived from* it — a price kept in node-local execution
+//! bookkeeping is `expected_bits` with a different name — and
+//! `TAG_DELEGATOR_FEE_REWARD` because a withdrawal pays it out, so two nodes
+//! disagreeing on it would pay different amounts for the same exit. Both
+//! clear the cannot-be-reconstructed bar; both are recorded here and in
+//! `BLOCH-L1-FEE-MARKET.md` §4.4/§6.1 rather than smuggled.
+//!
+//! It was first extended on 2026-08-11, and the reason is
 //! the reason the list exists at all: §5.5's hard rule ("every
 //! consensus-relevant value comes from the parent's *committed* state") is
 //! senior to the freeze that closed the list, and the transition demonstrably
@@ -168,6 +181,32 @@ const TAG_DELEGATOR_SLASH_LOSS: u8 = 0x13;
 /// extending the closed list; recorded as a visible revision in the migration
 /// doc §5.5 (same precedent as the slashing tags above) — not smuggled.
 const TAG_ISSUED_SUPPLY: u8 = 0x14;
+
+/// The L1 fee-market price leaf (2026-08-12): one singleton, holding the base
+/// fee this block's transactions were priced at plus the block's measured
+/// usage on both controller axes — exactly the §4.4 triple the fee-market
+/// spec defines (`BLOCH-L1-FEE-MARKET.md`; the spec drafted it as "tag 0x09"
+/// before the S5.5 extension claimed 0x09–0x0F — tags are append-only, so it
+/// lands here).
+///
+/// Why it must be committed: the next block's base fee is **derived from**
+/// this leaf by `fee_market::next_base_fee`. Read from node-local execution
+/// bookkeeping instead, it is `expected_bits` verbatim — an uncommitted
+/// retarget input, the exact shape of the 2026-08-08 consensus split. (The
+/// EVM segment's own pair inside [`EvmCommitment`] is carried from the
+/// execution layer and prices the EVM segment; this leaf is the L1 market's,
+/// computed by the transition itself.)
+const TAG_BASE_FEE: u8 = 0x15;
+
+/// Cumulative fee rewards credited to one delegator account (2026-08-12),
+/// the earning mirror of [`TAG_DELEGATOR_SLASH_LOSS`]: the epoch boundary
+/// routes each producer's fee share through the stake-origin + commission
+/// split (`fee_market::distribute_producer_fees`), and the delegators' side
+/// settles here rather than into the operator's bond. Same replay argument as
+/// the loss ledger — editing delegation records would reshuffle warm-up
+/// history — and same §5.5 argument: a withdrawal pays this out, so a node
+/// that disagreed on it would pay a different amount for the same exit.
+const TAG_DELEGATOR_FEE_REWARD: u8 = 0x16;
 
 
 fn sha3(parts: &[&[u8]]) -> [u8; 32] {
@@ -429,6 +468,13 @@ pub struct ValidatorRecord {
     /// format is the node's, per the interfaces open point) — opaque is fine,
     /// uncommitted is not: a swapped destination must move the root.
     pub withdrawal_credentials: Vec<u8>,
+    /// Commission the operator charges on its delegators' rewards, in basis
+    /// points (2026-08-12). Committed because the epoch boundary *pays with
+    /// it*: it decides the operator/delegator split of both issuance and fees
+    /// (`rewards::distribute`, `fee_market::distribute_producer_fees`). Read
+    /// from anywhere but committed state, two nodes would compound different
+    /// bonds from the same block — the §5.5 shape applied to revenue.
+    pub commission_bps: u128,
 }
 
 impl ValidatorRecord {
@@ -454,6 +500,10 @@ impl ValidatorRecord {
         // no-ambiguity argument as the pubkey's.
         s.extend_from_slice(&(self.withdrawal_credentials.len() as u32).to_le_bytes());
         s.extend_from_slice(&self.withdrawal_credentials);
+        // Appended last, after the final variable-length field: appending is
+        // the only edit to a committed serialization that cannot re-key an
+        // existing prefix by accident.
+        s.extend_from_slice(&self.commission_bps.to_le_bytes());
         s
     }
 }
@@ -862,6 +912,56 @@ impl DelegatorLossRecord {
     }
 }
 
+/// The committed L1 fee-market state ([`TAG_BASE_FEE`]): the base fee this
+/// block's transactions were charged, in millisatoshi per gas
+/// (`fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS` at genesis), and the block's
+/// own usage on the two controller axes. The **next** block's price is
+/// `fee_market::next_base_fee(base_fee_millisat_per_gas, BlockUsage {
+/// gas_used, tx_bytes })` — derived from this leaf and from nothing else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BaseFeeRecord {
+    /// Price charged in this block, millisatoshi per gas.
+    pub base_fee_millisat_per_gas: u128,
+    /// Gas consumed by this block's transactions (≤ `BLOCK_GAS_LIMIT`).
+    pub gas_used: u64,
+    /// Transaction payload bytes of this block (≤ `MAX_BLOCK_TX_BYTES`).
+    pub tx_bytes: u64,
+}
+
+impl BaseFeeRecord {
+    fn serialize(&self) -> Vec<u8> {
+        let mut s = Vec::with_capacity(32);
+        s.extend_from_slice(&self.base_fee_millisat_per_gas.to_le_bytes());
+        s.extend_from_slice(&self.gas_used.to_le_bytes());
+        s.extend_from_slice(&self.tx_bytes.to_le_bytes());
+        s
+    }
+}
+
+/// Cumulative fee rewards settled to one delegator account
+/// ([`TAG_DELEGATOR_FEE_REWARD`]) — the earning mirror of
+/// [`DelegatorLossRecord`], for the same reason: the delegation registry
+/// replays its history from the committed delegation records, so crediting a
+/// record's amount would retroactively reshuffle every later admission. The
+/// reward is committed here instead, and the withdrawal surface pays it out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DelegatorFeeRecord {
+    pub delegator: u32,
+    pub reward_sat: u128,
+}
+
+impl DelegatorFeeRecord {
+    fn entry_key(&self) -> Vec<u8> {
+        self.delegator.to_le_bytes().to_vec()
+    }
+    fn serialize(&self) -> Vec<u8> {
+        let mut s = Vec::with_capacity(20);
+        s.extend_from_slice(&self.delegator.to_le_bytes());
+        s.extend_from_slice(&self.reward_sat.to_le_bytes());
+        s
+    }
+}
+
 /// Everything `state_root` commits, passed **by argument** — this struct is
 /// the §5.5 rule made into a type. A block validator builds it from the
 /// parent block's committed state and from nothing else; there is no way to
@@ -914,6 +1014,11 @@ pub struct ConsensusState<'a> {
     pub slash_window: &'a [SlashWindowRecord],
     /// Cumulative slashing losses per delegator account (§7.3).
     pub delegator_slash_losses: &'a [DelegatorLossRecord],
+    /// The L1 fee-market price and this block's usage ([`TAG_BASE_FEE`]).
+    pub base_fee: BaseFeeRecord,
+    /// Cumulative fee rewards per delegator account
+    /// ([`TAG_DELEGATOR_FEE_REWARD`]).
+    pub delegator_fee_rewards: &'a [DelegatorFeeRecord],
 }
 
 /// How many **closed** epoch boundaries the committed beacon history retains,
@@ -1047,6 +1152,15 @@ pub fn build_state_tree(state: &ConsensusState<'_>) -> Smt {
     for d in state.delegator_slash_losses {
         smt.insert(
             derive_key(TAG_DELEGATOR_SLASH_LOSS, &d.entry_key()),
+            hash_value(&d.serialize()),
+        );
+    }
+    // The fee-market leaf (2026-08-12): the price the next block derives its
+    // own from. A sixth singleton, fixed-width serialization.
+    smt.insert(derive_key(TAG_BASE_FEE, &[]), hash_value(&state.base_fee.serialize()));
+    for d in state.delegator_fee_rewards {
+        smt.insert(
+            derive_key(TAG_DELEGATOR_FEE_REWARD, &d.entry_key()),
             hash_value(&d.serialize()),
         );
     }
@@ -1225,6 +1339,8 @@ mod tests {
         applied: Vec<AppliedEvidenceRecord>,
         window: Vec<SlashWindowRecord>,
         losses: Vec<DelegatorLossRecord>,
+        base_fee: BaseFeeRecord,
+        fee_rewards: Vec<DelegatorFeeRecord>,
     }
 
     fn fixture() -> Fx {
@@ -1275,6 +1391,7 @@ mod tests {
                 reveals_used: i as u32,
                 withdrawable_epoch: u64::MAX,
                 withdrawal_credentials: vec![0xC0 + i; 20],
+                commission_bps: 500 * i as u128,
             })
             .collect();
         let current: Vec<ParticipationRecord> = (0..4u32)
@@ -1339,6 +1456,19 @@ mod tests {
             },
         ];
         let pending_fees = vec![PendingFeeRecord { validator: 1, amount_sat: 1_234 }];
+        // Fee-market leaf: three distinct non-zero values so an aliasing or
+        // dropped field cannot hide behind zeros (the EVM-fixture argument).
+        let base_fee = BaseFeeRecord {
+            base_fee_millisat_per_gas: 12,
+            gas_used: 3_000_000,
+            tx_bytes: 65_536,
+        };
+        // Delegator 1 deliberately collides with a slash-loss key: the
+        // component tag is what keeps earning and losing apart.
+        let fee_rewards = vec![
+            DelegatorFeeRecord { delegator: 1, reward_sat: 55 },
+            DelegatorFeeRecord { delegator: 900, reward_sat: 4_321 },
+        ];
         Fx {
             eutxos,
             validators,
@@ -1356,6 +1486,8 @@ mod tests {
             applied,
             window,
             losses,
+            base_fee,
+            fee_rewards,
         }
     }
 
@@ -1384,6 +1516,8 @@ mod tests {
             applied_evidence: &f.applied,
             slash_window: &f.window,
             delegator_slash_losses: &f.losses,
+            base_fee: f.base_fee,
+            delegator_fee_rewards: &f.fee_rewards,
         }
     }
 
@@ -1409,6 +1543,7 @@ mod tests {
         g.deposit_queue.reverse();
         g.delegations.reverse();
         g.pending_fees.reverse();
+        g.fee_rewards.reverse();
         let root_b = state_root(&state(&g));
 
         assert_eq!(root_a, root_b);
@@ -1500,6 +1635,14 @@ mod tests {
         mutated!(|g: &mut Fx| g.pending_fees[0].validator += 1);
         mutated!(|g: &mut Fx| g.pending_fees[0].amount_sat += 1);
         mutated!(|g: &mut Fx| g.pending_fees.pop().map(|_| ()).unwrap());
+        // Fee-market bookkeeping (2026-08-12): the price leaf every next
+        // block's base fee is derived from, and the delegator earning ledger.
+        mutated!(|g: &mut Fx| g.base_fee.base_fee_millisat_per_gas += 1);
+        mutated!(|g: &mut Fx| g.base_fee.gas_used += 1);
+        mutated!(|g: &mut Fx| g.base_fee.tx_bytes += 1);
+        mutated!(|g: &mut Fx| g.fee_rewards[0].delegator += 1);
+        mutated!(|g: &mut Fx| g.fee_rewards[0].reward_sat += 1);
+        mutated!(|g: &mut Fx| g.fee_rewards.pop().map(|_| ()).unwrap());
 
         // Singleton roots and the issued-supply counter.
         for i in 0..4 {
@@ -1587,6 +1730,18 @@ mod tests {
         let without_fee = state_root(&state(&h));
         assert_ne!(without_fee, base);
         assert_ne!(without_fee, without_msg);
+
+        // Delegator 1 also appears in BOTH per-delegator ledgers — a slash
+        // loss and a fee reward. Earning and losing must be two leaves.
+        let mut k = f.clone();
+        k.fee_rewards.retain(|r| r.delegator != 1);
+        let without_reward = state_root(&state(&k));
+        assert_ne!(without_reward, base);
+        let mut l = f.clone();
+        l.losses.retain(|r| r.delegator != 1);
+        let without_loss = state_root(&state(&l));
+        assert_ne!(without_loss, base);
+        assert_ne!(without_reward, without_loss);
     }
 
     #[test]
@@ -1637,6 +1792,7 @@ mod tests {
                 reveals_used: 0,
                 withdrawable_epoch: u64::MAX,
                 withdrawal_credentials: Vec::new(),
+                commission_bps: 0,
             })
             .collect();
         assert_eq!(total_effective_stake(&validators), 3u128 * u64::MAX as u128);

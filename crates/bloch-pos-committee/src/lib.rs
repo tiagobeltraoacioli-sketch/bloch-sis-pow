@@ -93,10 +93,10 @@ pub use staking::{
     DepositReject, DepositTx, ExitReject, ExitTx, HybridKeyVerifier, QueuedDeposit, WithdrawReject,
 };
 pub use state_root::{
-    build_state_tree, state_root, verify_inclusion, CheckpointRecord, ConsensusState,
-    DelegationRecord, DepositQueueRecord, EutxoEntry, FcEquivocatorRecord, FcMessageRecord,
-    FinalityRecord, InclusionProof, LeakRecord, ParticipationRecord, PendingFeeRecord,
-    PendingVoteRecord, RandaoMix, Smt,
+    build_state_tree, state_root, verify_inclusion, BaseFeeRecord, CheckpointRecord,
+    ConsensusState, DelegationRecord, DelegatorFeeRecord, DepositQueueRecord, EutxoEntry,
+    FcEquivocatorRecord, FcMessageRecord, FinalityRecord, InclusionProof, LeakRecord,
+    ParticipationRecord, PendingFeeRecord, PendingVoteRecord, RandaoMix, Smt,
 };
 pub use header::{BlockEnvelope, BlockHeaderV4, BlockId, Body, DecodeError, VERSION_G4};
 pub use interfaces::{
@@ -104,12 +104,19 @@ pub use interfaces::{
     StateCommitment, StateReader, StateTransition,
 };
 pub use fee_market::{
-    distribute_producer_fees, fee_parts_sat, intrinsic_gas, next_base_fee, BlockUsage, TxClass,
-    BLOCK_GAS_LIMIT, MAX_BLOCK_TX_BYTES, MIN_BASE_FEE_MILLISAT_PER_GAS,
+    charge, distribute_producer_fees, fee_parts_sat, intrinsic_gas, next_base_fee,
+    split_delegator_fees, BlockUsage, TxCharge, TxClass, BLOCK_GAS_LIMIT, MAX_BLOCK_TX_BYTES,
+    MIN_BASE_FEE_MILLISAT_PER_GAS,
 };
 pub use finality::{EpochOutcome, EpochVotes, FinalityError};
 pub use produce::{produce, ProduceError, ProducerRandao, ProposerSigner};
-pub use derive::{validate_block, ChainState, ParentState, RandaoRejection};
+// `validate_block` used to be re-exported here. It was a second, uncalled
+// block validator; the node runs `transition::Transition::apply_block`, and
+// two validation stacks with divergent error orders is the condition that
+// produced this week's defects. Deleted 2026-08-12 — the comparison of the two
+// checklists is in `derive.rs` where the function stood. The derivations it
+// composed are still `pub` in `derive` and still shared with `produce`.
+pub use derive::{ChainState, ParentState, RandaoRejection};
 pub use transition::{CommittedState, GenesisValidator, PosTransaction, Transition};
 pub use ws::{
     accept, anchor, boot_decision, cross_check, genesis_anchor, reconcile, verify_envelope,

@@ -139,8 +139,9 @@ use crate::sample::Validator;
 use crate::schedule;
 use crate::slashing;
 use crate::staking::{self, QueuedDeposit};
+use crate::fee_market;
 use crate::state_root::{
-    AppliedEvidenceRecord, CheckpointRecord, ConsensusState, DelegatorLossRecord, SlashWindowRecord, DelegationRecord, DepositQueueRecord, EvmCommitment, FcEquivocatorRecord, FcMessageRecord, FinalityRecord, LeakRecord, ParticipationRecord, PendingFeeRecord, PendingVoteRecord, RandaoMix, ValidatorRecord as CommittedValidatorRecord,
+    AppliedEvidenceRecord, BaseFeeRecord, CheckpointRecord, ConsensusState, DelegatorFeeRecord, DelegatorLossRecord, SlashWindowRecord, DelegationRecord, DepositQueueRecord, EvmCommitment, FcEquivocatorRecord, FcMessageRecord, FinalityRecord, LeakRecord, ParticipationRecord, PendingFeeRecord, PendingVoteRecord, RandaoMix, ValidatorRecord as CommittedValidatorRecord,
 };
 use crate::tokenomics_v4;
 use sha3::{Digest, Sha3_256};
@@ -173,8 +174,31 @@ pub use crate::header::VERSION_G4 as BLOCK_VERSION_V4;
 /// not receive.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PosTransaction {
-    /// An opaque value transfer. Consensus here needs only the fees.
-    Transfer { base_fee_sat: u128, priority_fee_sat: u128 },
+    /// An opaque value transfer, priced by the L1 fee market: **gas × price**,
+    /// where the gas is derived (class + size, `fee_market::intrinsic_gas`)
+    /// and the price is the base fee this block's committed state fixes.
+    ///
+    /// This variant used to read `Transfer { base_fee_sat, priority_fee_sat }`
+    /// — a transaction that declared, in satoshis, what it felt like paying.
+    /// That is not a placeholder for a fee market, it is the absence of one:
+    /// nothing constrained the number, so a proposer could include a transfer
+    /// claiming any fee at all and compound it into its own bond. Changing the
+    /// variant changes `canonical_bytes`, therefore `body_root`, therefore the
+    /// block id — a consensus change, pinned by
+    /// `tests::transfer_encoding_is_gas_priced_not_declared`.
+    Transfer {
+        /// eUTXO inputs, each costing one hybrid verification. The class term
+        /// of the gas charge; nothing else about the transfer is consensus at
+        /// this layer (§1.2 — the value format stays out of scope).
+        inputs: u32,
+        /// Payload bytes this transaction makes every node carry and store.
+        /// The dominant gas term for PQ-signed traffic, and the quantity the
+        /// block's byte cap is measured against.
+        tx_bytes: u64,
+        /// The sender's tip, in millisatoshi per gas. The **only** user-set
+        /// price in the system: the base fee is the protocol's.
+        tip_millisat_per_gas: u128,
+    },
     /// Register a validator (§7.1). PoP/taint already checked at admission.
     Deposit {
         /// Suite-tagged hybrid public key (opaque bytes, per the interfaces).
@@ -183,6 +207,14 @@ pub enum PosTransaction {
         /// `c_0`, head of the SHAKE-256 reveal chain (§6.3).
         randao_commitment: [u8; 32],
         withdrawal_credentials: Vec<u8>,
+        /// Commission this operator will charge on its delegators' rewards,
+        /// in basis points. Declared at registration and committed with the
+        /// record, so a delegator picking an operator is picking a rate that
+        /// consensus agrees on — not one an operator asserts off-chain.
+        /// Uncapped by consensus, per `rewards::MAX_COMMISSION_BPS`'s
+        /// rationale: a cap is evaded by a front-end, a visible rate is
+        /// priced by delegators.
+        commission_bps: u128,
     },
     /// Voluntary exit (§7.2). Signature already checked at admission.
     Exit { validator: u32 },
@@ -243,11 +275,13 @@ impl PosTransaction {
     ///
     /// The eUTXO value-transfer format is out of the migration's scope (§1.2),
     /// so [`PosTransaction::Transfer`] is opaque *here* by design: consensus
-    /// at this layer needs only its fees, and they are what is encoded. When
-    /// the real transfer format lands it must supply its own canonical bytes
-    /// and this arm becomes a delegation to them — the discriminant tag makes
-    /// that a widening rather than a re-keying, because no other variant's
-    /// encoding shifts.
+    /// at this layer needs its **fee-market inputs** — the class term
+    /// (`inputs`), the size term (`tx_bytes`) and the tip — and those are what
+    /// is encoded. It does not encode a fee: the fee is derived, from these
+    /// and from the committed base fee. When the real transfer format lands it
+    /// must supply its own canonical bytes and this arm becomes a delegation
+    /// to them — the discriminant tag makes that a widening rather than a
+    /// re-keying, because no other variant's encoding shifts.
     ///
     /// # Rules the encoding obeys
     ///
@@ -267,22 +301,25 @@ impl PosTransaction {
             b.extend_from_slice(bytes);
         };
         match self {
-            PosTransaction::Transfer { base_fee_sat, priority_fee_sat } => {
+            PosTransaction::Transfer { inputs, tx_bytes, tip_millisat_per_gas } => {
                 b.push(0x01);
-                b.extend_from_slice(&base_fee_sat.to_le_bytes());
-                b.extend_from_slice(&priority_fee_sat.to_le_bytes());
+                b.extend_from_slice(&inputs.to_le_bytes());
+                b.extend_from_slice(&tx_bytes.to_le_bytes());
+                b.extend_from_slice(&tip_millisat_per_gas.to_le_bytes());
             }
             PosTransaction::Deposit {
                 pubkey,
                 amount_sat,
                 randao_commitment,
                 withdrawal_credentials,
+                commission_bps,
             } => {
                 b.push(0x02);
                 put(&mut b, pubkey);
                 b.extend_from_slice(&amount_sat.to_le_bytes());
                 b.extend_from_slice(randao_commitment);
                 put(&mut b, withdrawal_credentials);
+                b.extend_from_slice(&commission_bps.to_le_bytes());
             }
             PosTransaction::Exit { validator } => {
                 b.push(0x03);
@@ -330,6 +367,10 @@ pub struct GenesisValidator {
     pub staked_sat: u128,
     pub randao_commitment: [u8; 32],
     pub withdrawal_credentials: Vec<u8>,
+    /// Commission charged on delegators' rewards, in basis points. Published
+    /// in the genesis block like every other registry column, so a delegator
+    /// choosing an operator at launch is choosing a committed rate.
+    pub commission_bps: u128,
 }
 
 /// The committed post-state of one block — [`StateTransition::State`].
@@ -427,6 +468,29 @@ pub struct CommittedState {
     /// counting the moment the operator is slashed, because the duty roster
     /// skips slashed validators entirely.
     delegator_slash_losses: BTreeMap<u32, u128>,
+    /// Cumulative **fee** rewards settled to each delegator account, in
+    /// satoshis — the earning mirror of [`Self::delegator_slash_losses`], and
+    /// a ledger for exactly the same reason: crediting a delegation record's
+    /// amount would retroactively reshuffle every later warm-up admission
+    /// under the shared churn budget ([`delegation::Registry::resolve`] folds
+    /// the records from epoch zero). Filled at the epoch boundary by
+    /// [`fee_market::distribute_producer_fees`] plus
+    /// [`fee_market::split_delegator_fees`]; committed under
+    /// `TAG_DELEGATOR_FEE_REWARD`; read by the wallet surface
+    /// ([`Self::delegator_fee_reward_sat`]).
+    delegator_fee_rewards: BTreeMap<u32, u128>,
+    /// The L1 fee market's price, in millisatoshi per gas, that **this**
+    /// block's transactions were charged (spec §4.4). Committed, because the
+    /// next block's price is derived from it and from the usage below by
+    /// [`fee_market::next_base_fee`] — a price read from node-local
+    /// bookkeeping is `expected_bits` with a different name.
+    base_fee_millisat_per_gas: u128,
+    /// Gas this block's transactions consumed, and the payload bytes they
+    /// carried: the controller's two axes, and the two quantities the
+    /// per-block caps are checked against. Zero on a state produced by
+    /// `close_epoch` alone — a boundary is not a block and moves no price.
+    block_gas_used: u64,
+    block_tx_bytes: u64,
     /// Carried roots (§6.6.2): never recomputed by this transition.
     taint_root: [u8; 32],
     coherence_accumulator_root: [u8; 32],
@@ -484,6 +548,7 @@ impl CommittedState {
                     exit_epoch: u64::MAX,
                     withdrawable_epoch: u64::MAX,
                     slashed: false,
+                    commission_bps: v.commission_bps,
                 },
             );
             reveals_used.insert(v.index, 0);
@@ -523,6 +588,14 @@ impl CommittedState {
             pending_fee_rewards: BTreeMap::new(),
             slashing: slashing::SlashingState::new(),
             delegator_slash_losses: BTreeMap::new(),
+            delegator_fee_rewards: BTreeMap::new(),
+            // Genesis opens at the price floor, with no usage behind it: the
+            // first block's price is `next_base_fee(floor, {0, 0})`, which
+            // clamps back to the floor. A market that opened above its floor
+            // would be charging for congestion that never happened.
+            base_fee_millisat_per_gas: fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+            block_gas_used: 0,
+            block_tx_bytes: 0,
             taint_root,
             coherence_accumulator_root,
             coherence_nullifier_root,
@@ -651,6 +724,7 @@ impl CommittedState {
                 reveals_used: *self.reveals_used.get(&r.index).unwrap_or(&0),
                 withdrawable_epoch: r.withdrawable_epoch,
                 withdrawal_credentials: r.withdrawal_credentials.clone(),
+                commission_bps: r.commission_bps,
             })
             .collect();
         let current: Vec<ParticipationRecord> = self
@@ -771,6 +845,14 @@ impl CommittedState {
                 loss_sat: *loss_sat,
             })
             .collect();
+        let delegator_fee_rewards: Vec<DelegatorFeeRecord> = self
+            .delegator_fee_rewards
+            .iter()
+            .map(|(delegator, reward_sat)| DelegatorFeeRecord {
+                delegator: *delegator,
+                reward_sat: *reward_sat,
+            })
+            .collect();
 
         crate::state_root::state_root(&ConsensusState {
             // The eUTXO set is owned by the node's transaction layer, which
@@ -791,6 +873,12 @@ impl CommittedState {
             applied_evidence: &applied_evidence,
             slash_window: &slash_window,
             delegator_slash_losses: &delegator_losses,
+            base_fee: BaseFeeRecord {
+                base_fee_millisat_per_gas: self.base_fee_millisat_per_gas,
+                gas_used: self.block_gas_used,
+                tx_bytes: self.block_tx_bytes,
+            },
+            delegator_fee_rewards: &delegator_fee_rewards,
             taint_root: self.taint_root,
             coherence_accumulator_root: self.coherence_accumulator_root,
             coherence_nullifier_root: self.coherence_nullifier_root,
@@ -844,25 +932,45 @@ impl CommittedState {
 
     // ── Transactions ────────────────────────────────────────────────────────
 
-    /// Apply one transaction's state-dependent rules. Returns the
-    /// `(base_fee, priority_fee)` it contributes. `total_active_sat` is the
-    /// epoch's active stake, passed in because the per-validator cap is a
-    /// fraction of *committed* active stake (rule 1), not something this
-    /// method may re-derive from a moving intermediate.
+    /// Apply one transaction's state-dependent rules. Returns what it owes the
+    /// block ([`fee_market::TxCharge`] — gas, bytes and the two settled fee
+    /// parts). `total_active_sat` is the epoch's active stake, passed in
+    /// because the per-validator cap is a fraction of *committed* active stake
+    /// (rule 1), not something this method may re-derive from a moving
+    /// intermediate; `base_fee_millisat_per_gas` is this block's price, passed
+    /// in for the same reason — it is derived once, from the parent's
+    /// committed leaf, and every transaction in the block settles at it.
+    ///
+    /// Staking messages charge nothing at this layer: their own fee handling
+    /// belongs with the transfer format that carries them (§1.2), and inventing
+    /// a charge here would be inventing a price nobody specified.
     fn apply_transaction(
         &mut self,
         tx: &PosTransaction,
         total_active_sat: u128,
-    ) -> Result<(u128, u128), ()> {
+        base_fee_millisat_per_gas: u128,
+    ) -> Result<fee_market::TxCharge, ()> {
+        let free = fee_market::TxCharge {
+            gas: 0,
+            tx_bytes: 0,
+            base_fee_sat: 0,
+            priority_fee_sat: 0,
+        };
         match tx {
-            PosTransaction::Transfer { base_fee_sat, priority_fee_sat } => {
-                Ok((*base_fee_sat, *priority_fee_sat))
+            PosTransaction::Transfer { inputs, tx_bytes, tip_millisat_per_gas } => {
+                Ok(fee_market::charge(
+                    fee_market::TxClass::Eutxo { inputs: *inputs },
+                    *tx_bytes,
+                    base_fee_millisat_per_gas,
+                    *tip_millisat_per_gas,
+                ))
             }
             PosTransaction::Deposit {
                 pubkey,
                 amount_sat,
                 randao_commitment,
                 withdrawal_credentials,
+                commission_bps,
             } => {
                 let pubkey_hash: [u8; 32] = Sha3_256::digest(pubkey).into();
                 // A second deposit of a registered key is a top-up path
@@ -897,6 +1005,7 @@ impl CommittedState {
                         exit_epoch: u64::MAX,
                         withdrawable_epoch: u64::MAX,
                         slashed: false,
+                        commission_bps: *commission_bps,
                     },
                 );
                 self.reveals_used.insert(index, 0);
@@ -906,7 +1015,7 @@ impl CommittedState {
                     deposit_epoch: self.epoch,
                     amount_sat: *amount_sat,
                 });
-                Ok((0, 0))
+                Ok(free)
             }
             PosTransaction::Exit { validator } => {
                 let Some(rec) = self.validators.get_mut(validator) else {
@@ -927,7 +1036,7 @@ impl CommittedState {
                 rec.exit_epoch = exit_epoch;
                 rec.withdrawable_epoch =
                     exit_epoch.saturating_add(staking::WITHDRAWAL_DELAY_EPOCHS);
-                Ok((0, 0))
+                Ok(free)
             }
             PosTransaction::Delegate { delegator, validator, amount_sat, eligible } => {
                 let Some(rec) = self.validators.get(validator) else {
@@ -951,7 +1060,7 @@ impl CommittedState {
                     deactivate_epoch: None,
                     eligible: *eligible,
                 });
-                Ok((0, 0))
+                Ok(free)
             }
             // Evidence needs the injected signature verifier, which lives on
             // the Transition, not on the state — compute_post_state routes it
@@ -1101,6 +1210,37 @@ impl CommittedState {
         self.delegator_slash_losses.get(&delegator).copied().unwrap_or(0)
     }
 
+    /// Total fee reward settled to one delegator account, in satoshis — the
+    /// earning half of the pair above, and the number a wallet adds to the
+    /// delegator's withdrawable balance. Non-zero in both eras, which is the
+    /// whole point of routing fees through the commission split.
+    pub fn delegator_fee_reward_sat(&self, delegator: u32) -> u128 {
+        self.delegator_fee_rewards.get(&delegator).copied().unwrap_or(0)
+    }
+
+    /// The price this state's block charged, in millisatoshi per gas. The
+    /// **next** block's price is [`Self::next_base_fee`] — never this value
+    /// carried forward, and never a node-local number.
+    pub fn base_fee_millisat_per_gas(&self) -> u128 {
+        self.base_fee_millisat_per_gas
+    }
+
+    /// The price the child block must charge: the EIP-1559 controller applied
+    /// to this state's committed price and usage.
+    ///
+    /// One definition, two callers — the producer prices its mempool with it
+    /// and the validator charges every included transaction with it. A second
+    /// expression of this rule anywhere is h28080 with a fee attached.
+    pub fn next_base_fee(&self) -> u128 {
+        fee_market::next_base_fee(
+            self.base_fee_millisat_per_gas,
+            fee_market::BlockUsage {
+                gas_used: self.block_gas_used,
+                tx_bytes: self.block_tx_bytes,
+            },
+        )
+    }
+
     // ── Epoch boundary ──────────────────────────────────────────────────────
 
     /// Close the current epoch E and open E+1. Infallible and pure — it runs
@@ -1219,11 +1359,76 @@ impl CommittedState {
             }
         }
         // Fee rewards accrued during the epoch compound now, not per block —
-        // see the field docs: effective stake is frozen within an epoch.
+        // see the field docs: effective stake is frozen within an epoch — and
+        // they compound **through the delegation split**, not raw into the
+        // operator's bond.
+        //
+        // WHY THE SPLIT IS NOT OPTIONAL (spec §6.1). `rewards::distribute`
+        // above pays delegators out of `epoch_issuance`, which
+        // `tokenomics_v4` sets to zero after `EMISSION_SLOTS` — the exact
+        // moment fees become validators' entire revenue. Crediting
+        // `FeeSplit::to_producer` raw to the proposer's record (what this step
+        // did until 2026-08-12) therefore put delegator revenue at exactly
+        // zero at the fee-only boundary, and delegation — the mechanism that
+        // lets stake exist without running hardware — would have died forty
+        // years into an immutable schedule. Routing fees through the same
+        // stake-origin + commission arithmetic keeps it alive in both eras.
+        //
+        // The delegators' side settles into the committed
+        // `delegator_fee_rewards` ledger rather than into the delegation
+        // records, for the reason those records exist: the registry replays
+        // its warm-up history from them, so editing an amount would
+        // retroactively reshuffle every later admission under the churn
+        // budget. Truncation dust from the pro-rata pass goes to the operator
+        // — some account must hold it, and the operator is the one whose
+        // block earned the fee.
+        let fee_registry = delegation::Registry::resolve(&st.delegations, closing);
         let fees = std::mem::take(&mut st.pending_fee_rewards);
         for (idx, amount) in fees {
+            let Some(rec) = st.validators.get(&idx) else { continue };
+            let acct = StakeAccount {
+                // The bond as of the epoch's END, read from `self` — the
+                // pre-boundary state — not from `st`, which the issuance loop
+                // above has already credited. A fee earned during epoch E must
+                // be split by the stake position that held during E; splitting
+                // it by a bond that E's own issuance just inflated would make
+                // the operator's share depend on the order of two steps at the
+                // same boundary, which is exactly the kind of ordering
+                // dependence rule 2 exists to keep out of committed state.
+                self_stake: self.validators.get(&idx).map_or(rec.staked_sat, |r| r.staked_sat),
+                delegated_stake: fee_registry.stake_of(idx),
+                commission_bps: rec.commission_bps,
+                // Not scaled by credits: producing the block IS the
+                // performance, and there is nothing further to forfeit
+                // (fee_market::distribute_producer_fees' own rule).
+                credits: 1,
+                max_credits: 1,
+            };
+            let payout = fee_market::distribute_producer_fees(&acct, amount);
+            // Per-delegator shares, pro-rata by the satoshis each account had
+            // ACTUALLY activated — the same measure that gave the operator its
+            // consensus weight. Aggregated per account first, so a delegator
+            // holding two bonds behind one operator is one payee and the
+            // iteration order is a function of the data (rule 2).
+            let mut by_account: BTreeMap<u32, u128> = BTreeMap::new();
+            for d in &st.delegations {
+                if d.validator != idx {
+                    continue;
+                }
+                let activated = fee_registry.activated_sat(d);
+                if activated > 0 {
+                    *by_account.entry(d.delegator).or_insert(0) += activated;
+                }
+            }
+            let stakes: Vec<(u32, u128)> = by_account.into_iter().collect();
+            let (shares, dust) = fee_market::split_delegator_fees(&stakes, payout.delegators);
+            for (delegator, reward) in shares {
+                if reward > 0 {
+                    *st.delegator_fee_rewards.entry(delegator).or_insert(0) += reward;
+                }
+            }
             if let Some(rec) = st.validators.get_mut(&idx) {
-                rec.staked_sat += amount;
+                rec.staked_sat += payout.operator + dust;
             }
         }
 
@@ -1532,9 +1737,23 @@ impl<V: SignatureVerifier> Transition<V> {
         //     block, so the cost is not a spam surface). Invalid evidence is
         //     a block reject, not a skip: every node re-judges it, so a
         //     proposer cannot smuggle a no-op past nodes that judge harder.
+        // The block's price, derived from the PARENT's committed fee-market
+        // leaf and from nothing else (spec §4.4). Fixed before the first
+        // transaction is charged, so every transaction in a block settles at
+        // one price — and the producer computes it with the very same call
+        // (`CommittedState::next_base_fee`) when it prices its mempool.
+        //
+        // `pre`, not `st`: the roll to `st` only crosses empty epoch
+        // boundaries, and a boundary is not a block — it moves no price. Both
+        // read the same fields here, and reading the pre-state is what says
+        // so.
+        let base_fee = pre.next_base_fee();
+
         let total_active: u128 = roster.iter().map(|v| v.effective_stake as u128).sum();
         let mut base_fees: u128 = 0;
         let mut priority_fees: u128 = 0;
+        let mut block_gas: u64 = 0;
+        let mut block_bytes: u64 = 0;
         for (i, tx) in transactions.iter().enumerate() {
             let applied = match tx {
                 PosTransaction::SlashingEvidence(ev) => st
@@ -1544,26 +1763,60 @@ impl<V: SignatureVerifier> Transition<V> {
                         total_active,
                         &self.verifier,
                     )
-                    .map(|()| (0, 0)),
-                _ => st.apply_transaction(tx, total_active),
+                    .map(|()| fee_market::TxCharge {
+                        gas: 0,
+                        tx_bytes: 0,
+                        base_fee_sat: 0,
+                        priority_fee_sat: 0,
+                    }),
+                _ => st.apply_transaction(tx, total_active, base_fee),
             };
             match applied {
-                Ok((b, p)) => {
-                    base_fees += b;
-                    priority_fees += p;
+                Ok(charge) => {
+                    base_fees += charge.base_fee_sat;
+                    priority_fees += charge.priority_fee_sat;
+                    block_gas = block_gas.saturating_add(charge.gas);
+                    block_bytes = block_bytes.saturating_add(charge.tx_bytes);
                 }
                 Err(()) => return Err(TransitionError::Transaction(i as u32)),
             }
         }
 
+        // 10b. THE TWO PER-BLOCK CAPS (fee-market spec §5). A block exceeding
+        //      either is invalid, and each has its own error because "the
+        //      block was too big" and "the block was too expensive" are
+        //      different facts about a proposer's behaviour. They are checked
+        //      after the transactions are charged, because the charge is what
+        //      produces the two totals — and before the reward step, so an
+        //      over-cap block never pays anyone.
+        //
+        //      Neither total is taken from the header: a self-declared size is
+        //      not a cap, it is a request. Both are summed from the body the
+        //      header already commits to (step 3b), which is what makes the
+        //      caps checkable rather than advisory.
+        if block_gas > fee_market::BLOCK_GAS_LIMIT {
+            return Err(TransitionError::BlockGasLimitExceeded);
+        }
+        if block_bytes > fee_market::MAX_BLOCK_TX_BYTES {
+            return Err(TransitionError::BlockByteLimitExceeded);
+        }
+
         // 11. Rewards (rewards.rs): the block's fee split. The producer's
-        //     share accrues and compounds at the epoch boundary; the burned
-        //     share is burned by never being credited to anyone.
+        //     share accrues and compounds at the epoch boundary — where it now
+        //     goes through the operator/delegator commission split, see
+        //     `close_epoch` — and the burned share is burned by never being
+        //     credited to anyone.
         let split = rewards::split_fees_at(base_fees, priority_fees, header.slot);
         if split.to_producer > 0 {
             *st.pending_fee_rewards.entry(header.proposer_index).or_insert(0) +=
                 split.to_producer;
         }
+
+        // The fee-market leaf this block commits: the price it charged and the
+        // usage the next block's controller reads.
+        st.base_fee_millisat_per_gas = base_fee;
+        st.block_gas_used = block_gas;
+        st.block_tx_bytes = block_bytes;
 
         st.slot = header.slot;
         st.head = BlockId::of(header);
@@ -1678,6 +1931,10 @@ mod tests {
                 staked_sat: sat(200_000),
                 randao_commitment: chain.commitment(),
                 withdrawal_credentials: vec![i as u8; 4],
+                // A real, non-zero rate: with 0% commission the operator and
+                // delegator halves of the fee split are indistinguishable, and
+                // every commission assertion would pass vacuously.
+                commission_bps: 500,
             });
             chains.push(chain);
         }
@@ -2013,6 +2270,7 @@ mod tests {
             amount_sat: staking::MIN_DEPOSIT_SAT,
             randao_commitment: [0xCD; 32],
             withdrawal_credentials: vec![0xEF; 4],
+            commission_bps: 500,
         };
         let delegate = PosTransaction::Delegate {
             delegator: 900,
@@ -2111,6 +2369,7 @@ mod tests {
             amount_sat: staking::MIN_DEPOSIT_SAT,
             randao_commitment: [0xBB; 32],
             withdrawal_credentials: vec![0xCC; 4],
+            commission_bps: 500,
         };
         // Included during epoch 1.
         let b = build_block(&t, &g, 33, &[], std::slice::from_ref(&deposit), &mut chains);
@@ -2143,9 +2402,10 @@ mod tests {
             amount_sat: staking::MIN_DEPOSIT_SAT,
             randao_commitment: [0xDD; 32],
             withdrawal_credentials: vec![0xEE; 4],
+            commission_bps: 500,
         };
         let mut probe = st.clone();
-        assert_eq!(probe.apply_transaction(&dup, 0), Err(()));
+        assert_eq!(probe.apply_transaction(&dup, 0, fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS), Err(()));
     }
 
     #[test]
@@ -2166,29 +2426,349 @@ mod tests {
         assert!(st.active_validators().iter().any(|v| v.index == 0));
         // A second exit is rejected: the withdrawal clock must never reset.
         let mut probe = st.clone();
-        assert_eq!(probe.apply_transaction(&exit, 0), Err(()));
+        assert_eq!(probe.apply_transaction(&exit, 0, fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS), Err(()));
     }
 
+    /// One transfer, charged by the fee market rather than by its own say-so,
+    /// accruing in-epoch and compounding at the boundary.
+    ///
+    /// The numbers here used to be the ones the transaction declared
+    /// (`base_fee_sat: 1_000`). They are now *derived*, which is the change:
+    /// gas comes from the class and the size, the price comes from committed
+    /// state, and the transaction contributes only a tip. Every figure below is
+    /// recomputed from the fee-market functions rather than written as a
+    /// literal — a hard-coded 860 would pass for a while and then silently pin
+    /// a constant nobody meant to freeze.
     #[test]
-    fn fees_split_and_compound_only_at_the_boundary() {
+    fn fees_are_charged_by_the_market_and_compound_only_at_the_boundary() {
         let (t, g, mut chains) = setup(4);
-        let tx = PosTransaction::Transfer { base_fee_sat: 1_000, priority_fee_sat: 500 };
+        let tx = PosTransaction::Transfer { inputs: 1, tx_bytes: 512, tip_millisat_per_gas: 5 };
         let b = build_block(&t, &g, 1, &[], std::slice::from_ref(&tx), &mut chains);
         let s1 = t.apply_block(&g, &b, &[], std::slice::from_ref(&tx)).unwrap();
         let p = b.header.proposer_index;
 
+        // What the market says this transaction owes, at the price the parent
+        // state fixed for this block.
+        let price = g.next_base_fee();
+        assert_eq!(price, fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS, "an empty chain sits at the floor");
+        let charge = fee_market::charge(
+            fee_market::TxClass::Eutxo { inputs: 1 },
+            512,
+            price,
+            5,
+        );
+        let expected = rewards::split_fees_at(charge.base_fee_sat, charge.priority_fee_sat, 1);
+        assert!(expected.burned > 0, "era 1 must burn half the base fee");
+
         // During the epoch the fee accrues but the bond — and with it every
         // committee — is untouched.
-        let before = s1.validator_record(p).unwrap().staked_sat;
-        assert_eq!(before, sat(200_000));
-        // Emission-era split: half the base fee burns, priority is whole.
-        assert_eq!(*s1.pending_fee_rewards.get(&p).unwrap(), 1_000);
+        assert_eq!(s1.validator_record(p).unwrap().staked_sat, sat(200_000));
+        assert_eq!(*s1.pending_fee_rewards.get(&p).unwrap(), expected.to_producer);
+
+        // The block's committed usage is what the controller will read.
+        assert_eq!(s1.block_gas_used, charge.gas);
+        assert_eq!(s1.block_tx_bytes, 512);
+        assert_eq!(s1.base_fee_millisat_per_gas, price);
 
         // Nobody attested this epoch, so issuance is fully forfeited and the
-        // boundary compounds exactly the fee share.
+        // boundary compounds exactly the fee share. No delegators here, so the
+        // split hands the operator everything.
         let s2 = t.process_epoch(&s1).unwrap();
-        assert_eq!(s2.validator_record(p).unwrap().staked_sat, sat(200_000) + 1_000);
+        assert_eq!(
+            s2.validator_record(p).unwrap().staked_sat,
+            sat(200_000) + expected.to_producer
+        );
         assert!(s2.pending_fee_rewards.is_empty());
+    }
+
+    /// **The fee market is wired, and a transaction cannot name its own fee.**
+    ///
+    /// Two transfers identical in everything the market prices (class, size,
+    /// tip) must pay identically, and a bigger transaction must pay more —
+    /// which is only expressible because the fee is a function of the
+    /// transaction's *shape*, not a number it carries. Before this wave a
+    /// transfer declared `base_fee_sat` outright, so a proposer could include
+    /// one claiming any figure and compound it into its own bond.
+    #[test]
+    fn a_transaction_cannot_declare_its_own_fee() {
+        let (t, g, mut chains) = setup(4);
+        let small = PosTransaction::Transfer { inputs: 1, tx_bytes: 256, tip_millisat_per_gas: 0 };
+        let large = PosTransaction::Transfer { inputs: 4, tx_bytes: 4_096, tip_millisat_per_gas: 0 };
+
+        let b_small = build_block(&t, &g, 1, &[], std::slice::from_ref(&small), &mut chains);
+        let s_small = t.apply_block(&g, &b_small, &[], std::slice::from_ref(&small)).unwrap();
+
+        let (t2, g2, mut chains2) = setup(4);
+        let b_large = build_block(&t2, &g2, 1, &[], std::slice::from_ref(&large), &mut chains2);
+        let s_large = t2.apply_block(&g2, &b_large, &[], std::slice::from_ref(&large)).unwrap();
+
+        let paid = |s: &CommittedState| -> u128 {
+            s.pending_fee_rewards.values().sum()
+        };
+        assert!(paid(&s_small) > 0, "the price floor must make every transaction cost something");
+        assert!(
+            paid(&s_large) > paid(&s_small),
+            "four hybrid verifies and 16x the bytes must not cost the same as one and 256 B"
+        );
+        // And the gas the block committed is exactly the intrinsic charge — no
+        // transaction-supplied number enters it.
+        assert_eq!(
+            s_large.block_gas_used,
+            fee_market::intrinsic_gas(fee_market::TxClass::Eutxo { inputs: 4 }, 4_096)
+        );
+    }
+
+    /// The base fee is derived from the parent's committed leaf, by the one
+    /// controller, and a congested block raises the price for the next one.
+    #[test]
+    fn the_base_fee_moves_with_committed_usage_only() {
+        let (t, g, mut chains) = setup(4);
+        // A block at the byte target: the controller's neutral point on the
+        // byte axis, but well under target on gas — so the max-utilisation
+        // rule prices the byte axis and leaves the floor alone (it cannot
+        // fall below it anyway).
+        let tx = PosTransaction::Transfer { inputs: 1, tx_bytes: 8_192, tip_millisat_per_gas: 0 };
+        let b1 = build_block(&t, &g, 1, &[], std::slice::from_ref(&tx), &mut chains);
+        let s1 = t.apply_block(&g, &b1, &[], std::slice::from_ref(&tx)).unwrap();
+
+        // The next block's price is the controller over what s1 committed —
+        // and nothing else. Same function, same inputs, same answer.
+        assert_eq!(
+            s1.next_base_fee(),
+            fee_market::next_base_fee(
+                s1.base_fee_millisat_per_gas(),
+                fee_market::BlockUsage { gas_used: s1.block_gas_used, tx_bytes: s1.block_tx_bytes },
+            )
+        );
+
+        // Empty epoch boundaries move no price: a boundary is not a block.
+        let rolled = t.process_epoch(&s1).unwrap();
+        assert_eq!(rolled.base_fee_millisat_per_gas(), s1.base_fee_millisat_per_gas());
+        assert_eq!(rolled.next_base_fee(), s1.next_base_fee());
+
+        // A congested state raises it: forced through the committed leaf, so
+        // this exercises the transition's own derivation, not the controller
+        // in isolation.
+        let mut congested = s1.clone();
+        congested.block_gas_used = fee_market::BLOCK_GAS_LIMIT;
+        congested.block_tx_bytes = fee_market::MAX_BLOCK_TX_BYTES;
+        assert!(congested.next_base_fee() > congested.base_fee_millisat_per_gas());
+    }
+
+    /// The two per-block caps (fee-market spec §5) reject with their own
+    /// errors. Without this the caps would be constants nothing enforces —
+    /// which is what they were until 2026-08-12.
+    #[test]
+    fn the_two_block_caps_are_enforced() {
+        // Bytes bind first for signature-heavy traffic, so the byte cap is
+        // reachable with a transaction the gas cap still admits.
+        let (t, g, mut chains) = setup(4);
+        let fat = PosTransaction::Transfer {
+            inputs: 1,
+            tx_bytes: fee_market::MAX_BLOCK_TX_BYTES + 1,
+            tip_millisat_per_gas: 0,
+        };
+        let env = probe_env(&g, 1, std::slice::from_ref(&fat), &mut chains);
+        assert_eq!(
+            t.compute_post_state(&g, &env, &[], std::slice::from_ref(&fat)).unwrap_err(),
+            TransitionError::BlockByteLimitExceeded,
+        );
+
+        // The gas cap needs the verify term, not the byte term: many inputs,
+        // few bytes — which is exactly the shape the byte cap cannot see.
+        let (t2, g2, mut chains2) = setup(4);
+        let inputs = (fee_market::BLOCK_GAS_LIMIT / fee_market::HYBRID_VERIFY_GAS + 1) as u32;
+        let heavy = PosTransaction::Transfer { inputs, tx_bytes: 128, tip_millisat_per_gas: 0 };
+        let env2 = probe_env(&g2, 1, std::slice::from_ref(&heavy), &mut chains2);
+        assert_eq!(
+            t2.compute_post_state(&g2, &env2, &[], std::slice::from_ref(&heavy)).unwrap_err(),
+            TransitionError::BlockGasLimitExceeded,
+        );
+
+        // And a block at exactly the byte cap is VALID — an off-by-one here
+        // would make the cap unreachable and the byte axis dead.
+        let (t3, g3, mut chains3) = setup(4);
+        let at_cap = PosTransaction::Transfer {
+            inputs: 1,
+            tx_bytes: fee_market::MAX_BLOCK_TX_BYTES,
+            tip_millisat_per_gas: 0,
+        };
+        let b = build_block(&t3, &g3, 1, &[], std::slice::from_ref(&at_cap), &mut chains3);
+        assert!(t3.apply_block(&g3, &b, &[], std::slice::from_ref(&at_cap)).is_ok());
+    }
+
+    /// **The year-40 test, at the transition rather than in the arithmetic.**
+    ///
+    /// A block whose producer has delegators must credit those delegators from
+    /// its fee revenue — in both eras, but the era that matters is the one
+    /// where `epoch_issuance` is zero, because that is where crediting the fee
+    /// raw to the operator (what step 11 did until 2026-08-12) would have put
+    /// delegator revenue at exactly zero at the moment fees became everything.
+    #[test]
+    fn producer_fees_reach_delegators_through_the_commission_split() {
+        let (t, g, mut chains) = setup(4);
+        // A delegation behind validator 0, bonded during epoch 0 so it is
+        // warming up (partially activated under the churn budget) by epoch 1 —
+        // the epoch whose boundary settles the fee. Requested during E means
+        // it can only count from E+1, which is why the fee block cannot be in
+        // epoch 0.
+        let operator = 0u32;
+        let delegate = PosTransaction::Delegate {
+            delegator: 900,
+            validator: operator,
+            // Large next to a 200,000-BLOCH self-bond, so the delegator's
+            // stake-weighted share survives the pro-rata truncation.
+            amount_sat: sat(600_000),
+            eligible: true,
+        };
+        let b1 = build_block(&t, &g, 1, &[], std::slice::from_ref(&delegate), &mut chains);
+        let s1 = t.apply_block(&g, &b1, &[], std::slice::from_ref(&delegate)).unwrap();
+
+        // Find a slot in epoch 1 that the operator itself proposes: the fee
+        // accrues to the block's producer, so the producer must be the account
+        // the delegation sits behind. Derived from the rolled state, not
+        // guessed — the epoch-1 roster already counts the warming delegation.
+        let ctx = t.process_epoch(&s1).unwrap();
+        let roster = ctx.duty_roster();
+        let seed = ctx.seed_for_epoch(1);
+        assert!(
+            delegation::Registry::resolve(&ctx.delegations, 1).stake_of(operator) > 0,
+            "fixture premise: the delegation must be contributing stake by epoch 1"
+        );
+        let slot = (SLOTS_PER_EPOCH..2 * SLOTS_PER_EPOCH)
+            .find(|s| schedule::proposer(&seed, *s, &roster) == Some(operator))
+            .expect("the operator must lead some slot of the epoch");
+
+        // A fee-paying transfer in the operator's block, with a fat tip so the
+        // producer's share sits well above the pro-rata truncation floor.
+        let tx = PosTransaction::Transfer {
+            inputs: 2,
+            tx_bytes: 9_216,
+            tip_millisat_per_gas: 4_000,
+        };
+        let b2 = build_block(&t, &s1, slot, &[], std::slice::from_ref(&tx), &mut chains);
+        assert_eq!(b2.header.proposer_index, operator);
+        let s2 = t.apply_block(&s1, &b2, &[], std::slice::from_ref(&tx)).unwrap();
+        let accrued = *s2.pending_fee_rewards.get(&operator).unwrap();
+        assert!(accrued > 0);
+        let bond_before = s2.validator_record(operator).unwrap().staked_sat;
+
+        // The boundary settles it — through the split.
+        let st = t.process_epoch(&s2).unwrap();
+        let to_delegator = st.delegator_fee_reward_sat(900);
+        assert!(
+            to_delegator > 0,
+            "delegators earned nothing from producer fees — the split is not wired"
+        );
+        assert_eq!(st.delegator_fee_reward_sat(901), 0, "other accounts untouched");
+
+        // Conservation, and the exact arithmetic: the same `fee_market` call
+        // the transition made, over the same committed inputs.
+        let registry = delegation::Registry::resolve(&st.delegations, 1);
+        let payout = fee_market::distribute_producer_fees(
+            &StakeAccount {
+                self_stake: bond_before,
+                delegated_stake: registry.stake_of(operator),
+                commission_bps: 500,
+                credits: 1,
+                max_credits: 1,
+            },
+            accrued,
+        );
+        assert_eq!(payout.operator + payout.delegators, accrued, "the fee must not leak");
+        assert_eq!(to_delegator, payout.delegators, "delegators got something other than their share");
+        // Nobody attested epoch 1, so issuance is fully forfeited and the bond
+        // moved by exactly the operator's fee side.
+        assert_eq!(
+            st.validator_record(operator).unwrap().staked_sat,
+            bond_before + payout.operator,
+        );
+        assert!(st.pending_fee_rewards.is_empty());
+
+        // Commission is load-bearing, not decorative: at 0% the delegator's
+        // share is strictly larger, on the same inputs.
+        let uncharged = fee_market::distribute_producer_fees(
+            &StakeAccount { commission_bps: 0, ..StakeAccount {
+                self_stake: bond_before,
+                delegated_stake: registry.stake_of(operator),
+                commission_bps: 0,
+                credits: 1,
+                max_credits: 1,
+            } },
+            accrued,
+        );
+        assert!(uncharged.delegators > payout.delegators, "commission changed nothing");
+    }
+
+    // ── the checks migrated out of the deleted `derive::validate_block` ─────
+    //
+    // These two had NO negative test in this module. Their only regression
+    // coverage lived in `produce.rs`'s tamper table against
+    // `derive::validate_block` — a validator with no caller. Deleting that
+    // validator without moving these would have deleted the proof that the
+    // checks exist, which is how a check becomes a comment.
+
+    #[test]
+    fn wrong_version_rejected() {
+        let (t, g, mut chains) = setup(4);
+        let mut b = build_block(&t, &g, 1, &[], &[], &mut chains);
+        // The Genesis-3 tag: the version this chain is migrating away from,
+        // not an arbitrary number.
+        b.header.version = 0xB10C_0004;
+        assert_eq!(
+            t.apply_block(&g, &b, &[], &[]),
+            Err(TransitionError::Proposal(ProposalReject::WrongVersion)),
+        );
+    }
+
+    #[test]
+    fn bad_proposer_signature_rejected() {
+        // MarkerVerifier rejects exactly `b"forged"`, so the block dies on the
+        // proposer signature and on nothing else.
+        let (t, g, mut chains) = setup_with(4, MarkerVerifier);
+        let mut b = build_block(&t, &g, 1, &[], &[], &mut chains);
+        // Control: the honest signature passes this verifier.
+        assert!(t.apply_block(&g, &b, &[], &[]).is_ok());
+        b.proposer_sig = b"forged".to_vec();
+        assert_eq!(
+            t.apply_block(&g, &b, &[], &[]),
+            Err(TransitionError::Proposal(ProposalReject::BadSignature)),
+        );
+    }
+
+    /// The `Transfer` encoding is gas-priced, and the change is a **consensus**
+    /// change: `canonical_bytes` is what `body_root` is a Merkle root over, so
+    /// re-shaping the variant re-keys the block id of every block carrying one.
+    ///
+    /// Pinned two ways: the discriminant and width are fixed (a silent shift
+    /// would re-key transfers against a deployed chain), and no declared-fee
+    /// field survives — the encoding carries the market's *inputs*, and the fee
+    /// is derived from them plus committed state.
+    #[test]
+    fn transfer_encoding_is_gas_priced_not_declared() {
+        let tx = PosTransaction::Transfer { inputs: 3, tx_bytes: 1_024, tip_millisat_per_gas: 7 };
+        let bytes = tx.canonical_bytes();
+        // 1 discriminant + u32 inputs + u64 bytes + u128 tip.
+        assert_eq!(bytes.len(), 1 + 4 + 8 + 16);
+        assert_eq!(bytes[0], 0x01, "the Transfer discriminant is frozen");
+        assert_eq!(&bytes[1..5], &3u32.to_le_bytes());
+        assert_eq!(&bytes[5..13], &1_024u64.to_le_bytes());
+        assert_eq!(&bytes[13..], &7u128.to_le_bytes());
+
+        // Injectivity over each field: two transfers differing anywhere commit
+        // to different bodies, therefore different block ids.
+        let vary = |inputs, tx_bytes, tip| {
+            crate::derive::body_root(&[PosTransaction::Transfer {
+                inputs,
+                tx_bytes,
+                tip_millisat_per_gas: tip,
+            }
+            .canonical_bytes()])
+        };
+        let base = vary(3, 1_024, 7);
+        assert_ne!(base, vary(4, 1_024, 7));
+        assert_ne!(base, vary(3, 1_025, 7));
+        assert_ne!(base, vary(3, 1_024, 8));
     }
 
     // ── slashing through the transition (§7.3) ──────────────────────────────
@@ -2474,6 +3054,7 @@ mod tests {
             staked_sat: sat(9_000_000),
             randao_commitment: [0; 32],
             withdrawal_credentials: vec![0; 4],
+            commission_bps: 0,
         };
         vals.push(cohort_val.clone());
         for i in 1..3u32 {
@@ -2531,6 +3112,7 @@ mod tests {
             amount_sat: staking::MIN_DEPOSIT_SAT,
             randao_commitment: [0xCD; 32],
             withdrawal_credentials: vec![0xEF; 4],
+            commission_bps: 500,
         };
         let delegate = PosTransaction::Delegate {
             delegator: 900,
@@ -2538,7 +3120,7 @@ mod tests {
             amount_sat: delegation::MIN_DELEGATION_SAT,
             eligible: true,
         };
-        let fee = PosTransaction::Transfer { base_fee_sat: 1_000, priority_fee_sat: 500 };
+        let fee = PosTransaction::Transfer { inputs: 1, tx_bytes: 512, tip_millisat_per_gas: 5 };
         let slot1 = SLOTS_PER_EPOCH + 1;
         let b1 =
             build_block(&t, &g, slot1, &[], &[deposit.clone(), fee.clone()], &mut chains);
@@ -2671,6 +3253,22 @@ mod tests {
         must_move!("delegator_slash_losses", |g: &mut CommittedState| {
             g.delegator_slash_losses.insert(4, 777);
         });
+        // Validator commission — it decides how a boundary splits BOTH revenue
+        // streams, so a node that disagreed on it would compound a different
+        // bond from the same block.
+        must_move!("validator commission_bps", |g: &mut CommittedState| {
+            g.validators.get_mut(&0).unwrap().commission_bps += 1
+        });
+        // Fee market (2026-08-12): the price leaf the next block's controller
+        // reads, and the delegator earning ledger.
+        must_move!("base_fee_millisat_per_gas", |g: &mut CommittedState| {
+            g.base_fee_millisat_per_gas += 1
+        });
+        must_move!("block_gas_used", |g: &mut CommittedState| g.block_gas_used += 1);
+        must_move!("block_tx_bytes", |g: &mut CommittedState| g.block_tx_bytes += 1);
+        must_move!("delegator_fee_rewards", |g: &mut CommittedState| {
+            g.delegator_fee_rewards.insert(4, 888);
+        });
         // Carried roots.
         must_move!("taint_root", |g: &mut CommittedState| g.taint_root[0] ^= 1);
         must_move!("coherence_accumulator_root", |g: &mut CommittedState| {
@@ -2726,6 +3324,7 @@ mod tests {
             amount_sat: staking::MIN_DEPOSIT_SAT,
             randao_commitment: [0xCD; 32],
             withdrawal_credentials: vec![0xEF; 4],
+            commission_bps: 500,
         };
         let delegate = PosTransaction::Delegate {
             delegator: 900,
@@ -2733,7 +3332,7 @@ mod tests {
             amount_sat: delegation::MIN_DELEGATION_SAT,
             eligible: true,
         };
-        let fee = PosTransaction::Transfer { base_fee_sat: 1_000, priority_fee_sat: 500 };
+        let fee = PosTransaction::Transfer { inputs: 1, tx_bytes: 512, tip_millisat_per_gas: 5 };
         let slot1 = SLOTS_PER_EPOCH + 1;
         let b1 =
             build_block(&t, &g, slot1, &[], &[deposit.clone(), fee.clone()], &mut chains);

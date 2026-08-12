@@ -338,6 +338,9 @@ mod harness {
                     .unwrap_or(0),
                 withdrawable_epoch: u64::MAX,
                 withdrawal_credentials: Vec::new(),
+                // This devnet harness has no delegation, so the rate is
+                // committed as zero — committed, not omitted.
+                commission_bps: 0,
             })
             .collect();
         let cp = |c: FCheckpoint| CheckpointRecord { epoch: c.epoch, root: c.root };
@@ -417,6 +420,15 @@ mod harness {
             applied_evidence: &[],
             slash_window: &[],
             delegator_slash_losses: &[],
+            // No transactions in this harness, so the market never moves off
+            // its genesis floor — committed at the floor, not omitted.
+            base_fee: bloch_pos_committee::BaseFeeRecord {
+                base_fee_millisat_per_gas:
+                    bloch_pos_committee::MIN_BASE_FEE_MILLISAT_PER_GAS,
+                gas_used: 0,
+                tx_bytes: 0,
+            },
+            delegator_fee_rewards: &[],
         })
     }
 
@@ -444,6 +456,7 @@ mod harness {
                 exit_epoch: u64::MAX,
                 withdrawable_epoch: u64::MAX,
                 slashed: false,
+                commission_bps: 0,
             })
         }
         fn total_active_stake_sat(&self) -> u128 {
