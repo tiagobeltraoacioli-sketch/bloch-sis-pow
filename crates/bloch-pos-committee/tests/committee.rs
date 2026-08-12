@@ -859,6 +859,30 @@ fn delegation_activates_and_counts_as_validator_stake() {
     assert_eq!(r.validators().len(), 1);
 }
 
+/// Fixa a decisao do fundador de 2026-08-11: **saldo de carryover que e
+/// liquido e tambem stakeavel.** O maior endereco do carryover — o do fundador
+/// — entra inteiro como delegacao e vira stake ativo; nada no caminho de
+/// admissao pergunta de onde a moeda veio (eligible=true e o UNICO valor que o
+/// conjunto de taint vazio pode produzir para uma moeda carregada). Reverter a
+/// decisao exige reintroduzir um criterio de origem, e este teste e onde essa
+/// reintroducao quebra primeiro.
+#[test]
+fn carryover_liquid_balance_delegates_as_stake() {
+    let founder = deleg(0, 1, tk::LARGEST_CARRYOVER_ADDRESS_BLOCH, 0);
+    let others =
+        deleg(2, 3, tk::CARRYOVER_TOTAL_BLOCH - tk::LARGEST_CARRYOVER_ADDRESS_BLOCH, 0);
+    let r = Registry::resolve(&[founder, others], 0);
+    // O carryover inteiro pode estar em stake — nenhum sat e recusado.
+    assert_eq!(r.total_active(), tk::CARRYOVER_TOTAL_BLOCH * tk::SAT_PER_BLOCH);
+    assert_eq!(r.state_of(&founder), StakeState::Active);
+    // O que a decisao custa, medido em vez de narrado: com o carryover todo em
+    // stake, o maior operador detem ~94% do stake ativo — G2 (< 2.500 bps)
+    // vermelho e coeficiente de Nakamoto 1 ate as moedas mudarem de mao. A
+    // conta completa esta em BLOCH-TOKENOMICS-V4.md §4A.1 e §11 da migracao.
+    assert!(r.top_share_bps() > 9_000);
+    assert_eq!(r.nakamoto_coefficient(), 1);
+}
+
 #[test]
 fn dust_and_tainted_delegations_never_count() {
     let mut small = deleg(1, 10, 1, 0);

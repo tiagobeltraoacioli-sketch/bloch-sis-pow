@@ -6,13 +6,14 @@
 //!
 //! ## What is enforced here and why
 //!
-//! - **Deposits spend transparent, untainted inputs only** (§6.6.3, §4.1.5).
-//!   A validator's bond must be attributable: if shielded outputs could fund a
-//!   deposit, the 94% treasury concentration would shield itself, unshield
-//!   into notes with no visible ancestry, and stake freely — the taint rules
-//!   would be decorative. The check is cheap and it is the single most
-//!   important interaction between keeping the ZK ledger and taint-based
-//!   eligibility.
+//! - **Deposits spend transparent inputs only** (§6.6.3). A validator's bond
+//!   must be attributable: slashing and the concentration gates both need a
+//!   bond that traces to visible coins, so a deposit funded from the shielded
+//!   pool would be stake with no owner on record. This is an attributability
+//!   rule, not a coin-class rule — the §4.1 taint set it used to feed is
+//!   retired (the carryover crosses as one undifferentiated set), and a
+//!   carried-over balance that is liquid is also stakeable, the founder's
+//!   included (founder decision, 2026-08-11).
 //! - **Proof of possession under BOTH halves of the hybrid suite** (§6.2:
 //!   "AND, not OR"). The AND-composition lives in *this* crate, not in the
 //!   injected verifier, so a caller cannot accidentally weaken the hybrid to
@@ -78,7 +79,7 @@ pub const MLDSA65_SIG_BYTES: usize = 3309;
 pub const SAT_PER_BLOCH: u128 = crate::tokenomics_v4::SAT_PER_BLOCH;
 
 /// Minimum deposit: 100,000 BLCH (§5.1) — sized so a validator set of ~1,000
-/// is reachable from the realistic untainted float, not from a round number.
+/// is reachable from the realistic independent float, not from a round number.
 pub const MIN_DEPOSIT_SAT: u128 = 100_000 * SAT_PER_BLOCH;
 
 /// Epochs between a deposit being included and it becoming eligible for the
@@ -88,7 +89,7 @@ pub const MIN_DEPOSIT_SAT: u128 = 100_000 * SAT_PER_BLOCH;
 pub const ACTIVATION_DELAY_EPOCHS: u64 = 8;
 
 /// Validators admitted from the activation queue per epoch (§4.1.4). Four per
-/// epoch means even an attacker with unlimited untainted coins needs
+/// epoch means even an attacker with unlimited eligible coins needs
 /// `set_size / 4` epochs of publicly visible queue traffic to take a majority.
 pub const MAX_ACTIVATIONS_PER_EPOCH: usize = 4;
 
@@ -159,15 +160,21 @@ pub type Address = [u8; 32];
 
 /// What the deposit's inputs look like to consensus. The crate does not
 /// depend on the node's UTXO types; the caller resolves each spent output
-/// against the ledger and the §4.1 taint set and reports the two facts that
-/// matter here.
+/// against the ledger and reports the facts that matter here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DepositInput {
     /// False for shielded (Coherence) outputs. Deposits must be transparent
     /// (§6.6.3) — stake must be attributable.
     pub transparent: bool,
-    /// True if the output is in the §4.1 taint set (premine / treasury
-    /// descent, tracked over the UTXO graph, not by address).
+    /// Retained-inert. The §4.1 taint set this bit used to report is retired
+    /// (§4 of the migration design, rewritten): in Genesis-4 the set is
+    /// **empty** and no eligibility oracle may produce `true`. The carryover —
+    /// the founder's balance included — crosses liquid, and a liquid balance
+    /// is also stakeable (founder decision, 2026-08-11). The field and its
+    /// reject variant survive only because the admission interface is frozen
+    /// (`interfaces.rs`: "`Tainted` variants are never produced") and the
+    /// fail-closed direction must stay testable; repopulating the set would
+    /// resurrect the exclusion power §4 deliberately dissolved.
     pub tainted: bool,
 }
 
@@ -228,7 +235,10 @@ pub enum DepositReject {
     WrongSuite,
     /// An input is a shielded output (§6.6.3).
     ShieldedInput,
-    /// An input is in the §4.1 taint set.
+    /// An input the eligibility oracle reported as tainted. **Never produced
+    /// in Genesis-4** — the taint set is empty and a liquid carried-over
+    /// balance is stakeable (founder decision, 2026-08-11); see
+    /// [`DepositInput::tainted`] for why the variant survives.
     TaintedInput,
     /// Amount below [`MIN_DEPOSIT_SAT`].
     BelowMinimum,
@@ -570,6 +580,38 @@ mod tests {
         assert_eq!(
             validate_deposit(&tx, &inputs, MAX_STAKE, &accept_all()),
             Err(DepositReject::TaintedInput)
+        );
+    }
+
+    /// Fixes the founder decision of 2026-08-11: **a carried-over balance
+    /// that is liquid is also stakeable — the founder's included.** There is
+    /// no provenance dimension in the admission path: a deposit input carries
+    /// exactly two facts (transparent, tainted), the Genesis-4 taint set is
+    /// empty so the oracle can only ever report a carried-over coin as
+    /// untainted, and the only thing that can reject a carryover-funded
+    /// deposit is its SIZE against the per-validator cap — never its origin.
+    /// Reverting the decision requires reintroducing an origin check, and
+    /// this test is where that reintroduction must first break.
+    #[test]
+    fn carryover_liquid_balance_is_stakeable() {
+        // A carried-over UTXO exactly as the eligibility oracle must report
+        // it: transparent (an ordinary eUTXO) and untainted (the taint set is
+        // empty — there is no class of coin left to mark).
+        let carryover = vec![DepositInput { transparent: true, tainted: false }];
+
+        // Founder-scale is bounded by the cap alone. The whole carried-over
+        // founder balance cannot enter through ONE validator...
+        let whole_balance =
+            crate::tokenomics_v4::LARGEST_CARRYOVER_ADDRESS_BLOCH * SAT_PER_BLOCH;
+        assert_eq!(
+            validate_deposit(&deposit(whole_balance), &carryover, MAX_STAKE, &accept_all()),
+            Err(DepositReject::AboveMaximum),
+            "the rejection is about size, never about origin"
+        );
+        // ...but a cap-sized slice of it is admitted with no further question.
+        assert_eq!(
+            validate_deposit(&deposit(MAX_STAKE), &carryover, MAX_STAKE, &accept_all()),
+            Ok(())
         );
     }
 

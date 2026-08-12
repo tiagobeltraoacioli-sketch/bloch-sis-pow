@@ -23,9 +23,14 @@
 //! 3. **Delegators are exposed to slashing.** Pro-rata with the operator. If
 //!    they were not, delegation would be a free option: all of the yield, none
 //!    of the risk, and no reason to care who you delegate to.
-//! 4. **Tainted stake delegates to nothing.** The §4.1 ineligibility rules
-//!    follow the coins, not the account. Delegation is otherwise a laundering
-//!    route: tainted coins delegate, earn, and vote by proxy.
+//! 4. **Ineligible stake delegates to nothing — and in Genesis-4 nothing is
+//!    ineligible by origin.** The `eligible` bit is the fail-closed door the
+//!    retired §4.1 taint set used to feed. That set is empty: the carryover —
+//!    the founder's balance included — delegates like any other liquid coin,
+//!    because a carried-over balance that is liquid is also stakeable
+//!    (founder decision, 2026-08-11). The door stays because the transition
+//!    state machine carries the bit and the fail-closed direction must stay
+//!    testable, not because anything may set it false by provenance.
 //!
 //! ## Honest note on decentralisation
 //!
@@ -116,8 +121,12 @@ pub struct Delegation {
     pub requested_epoch: u64,
     /// Epoch deactivation was requested, if any.
     pub deactivate_epoch: Option<u64>,
-    /// False when the coins are tainted under §4.1 — the delegation is recorded
-    /// but never contributes stake.
+    /// Fail-closed eligibility bit; when false the delegation is recorded but
+    /// never contributes stake. **Always `true` by origin in Genesis-4**: the
+    /// §4.1 taint set that used to drive it is retired and empty, and a
+    /// carried-over balance that is liquid is also stakeable — the founder's
+    /// included (founder decision, 2026-08-11). No oracle may derive `false`
+    /// from where a coin came from.
     pub eligible: bool,
 }
 

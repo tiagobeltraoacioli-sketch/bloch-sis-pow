@@ -38,10 +38,11 @@ pub const TOTAL_SUPPLY_SAT: u128 = TOTAL_SUPPLY_BLOCH * SAT_PER_BLOCH;
 /// The founder's NEW allocation — 10% of supply, vested.
 ///
 /// This is on top of the carried-over balance below, not instead of it: the
-/// founder's Genesis-3 holdings come across as ordinary liquid carryover and
-/// the 17% is granted again (founder decision, 2026-08-11). Combined, the
-/// founder holds 33.89% of supply. §4 of the tokenomics spec states what that
-/// does to the activation gates.
+/// founder's Genesis-3 holdings come across as ordinary liquid carryover and a
+/// fresh grant is made on top (founder decision, 2026-08-11; an earlier draft
+/// re-granted the full 17%, the decision settled at 10%). Combined, the
+/// founder holds 26.89% of supply — [`FOUNDER_TOTAL_BLOCH`] pins it. §4A of
+/// the tokenomics spec states what that does to the activation gates.
 pub const FOUNDER_BLOCH: u128 = 2_100_000_000; // 10%
 /// Sold to funds; the Foundation is the counterparty. Nothing liquid at
 /// genesis — 12-month cliff, 24-month linear, fully vested at year 3.
@@ -77,6 +78,12 @@ pub const FOUNDATION_LIQUID_AT_GENESIS_BLOCH: u128 =
 /// balance crosses as ordinary liquid balance, the founder's included: those
 /// coins were mined, on the same chain, under the same rules as everyone
 /// else's (founder decision, 2026-08-11).
+///
+/// Liquid includes **stakeable**: a carried-over balance may fund deposits and
+/// delegations like any other coin (founder decision, 2026-08-11).
+/// `staking.rs::carryover_liquid_balance_is_stakeable` and
+/// `tests/committee.rs::carryover_liquid_balance_delegates_as_stake` pin it;
+/// the gate arithmetic it changes is in the tokenomics spec, §4A.1.
 ///
 /// Two mechanisms dissolve with that decision rather than being satisfied by
 /// it. There is no **taint set**, because there is no class of coin to mark —

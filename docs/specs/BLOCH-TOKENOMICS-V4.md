@@ -19,9 +19,10 @@ V2 nominal, after a draft at 100 billion.
 
 **The whole carryover comes across as one balance set, with no founder line.**
 Those coins were mined, on the same chain, under the same rules as everyone
-else's — so they are carried the same way, as ordinary liquid balance. The founder additionally receives a new 17% grant under
-a 10-year cliff and 40-year linear vest — the V2 premine schedule, at 10% rather
-than the V2 17%.
+else's — so they are carried the same way, as ordinary liquid balance, and
+liquid includes stakeable (decided 2026-08-11, §4A.1). The founder additionally
+receives a new 10% grant under a 10-year cliff and 40-year linear vest — the V2
+premine schedule, at 10% rather than the V2 17%.
 
 Returning to 21 billion removes two hazards the 100-billion draft created, at no
 cost: the supply is **11.38% of `u64::MAX`** rather than the earlier draft's 54.21%, so the sum of
@@ -410,14 +411,73 @@ A draft that cliffed the founder's entire position bought a genesis where the
 founder held no spendable stake at all; carrying the balance across liquid gives
 that up.
 
-Two things soften it and should be said alongside the number. The new 17% grant
-is locked for a decade and vests across forty years — far beyond any market
-benchmark, and the strictest schedule on the chain. And the §4.1 machinery
-distinguishes **liquid** from **stakeable**: a carried-over balance can be
-spendable while remaining ineligible to stake. Keeping the carryover liquid does
-not by itself decide that it votes. That is a separate decision, still open, and
-it is the one that determines whether the activation gates are reachable before
-year five.
+One thing softens it and should be said alongside the number: the new 10%
+grant is locked for a decade and vests across forty years — far beyond any
+market benchmark, and the strictest schedule on the chain. A second lever was
+formally open until 2026-08-11 — **liquid** was not the same as **stakeable**,
+and a carried-over balance could have been spendable while remaining
+ineligible to stake. It is open no longer:
+
+### 4A.1 Stakeable — decided 2026-08-11
+
+**A carried-over balance that is liquid is also stakeable.** Founder decision,
+2026-08-11. The carryover crosses as one undifferentiated set — the founder's
+balance included, because those coins were mined on the same chain under the
+same rules — and no provenance criterion survives anywhere in the admission
+path: a deposit or delegation funded from carryover is bounded by size
+(minimum, per-validator cap) and by nothing else. Two tests pin the decision
+so it cannot be reverted silently:
+`crates/bloch-pos-committee/src/staking.rs::carryover_liquid_balance_is_stakeable`
+and
+`crates/bloch-pos-committee/tests/committee.rs::carryover_liquid_balance_delegates_as_stake`.
+
+What the decision does to the activation gates is arithmetic, and it should be
+read before anyone quotes "year five" as a forecast.
+
+**G1 (independent eligible stake ≥ 15% of circulating) — the conserved-share
+bound.** Rewards are pro-rata to stake (§6.3), so compounding preserves stake
+*shares*: if the founder stakes the carried-over balance and re-stakes rewards
+like everyone else, the independent share of active stake stays where it
+started —
+
+    227,709,400 / 3,773,884,800 = 6.03%
+
+— at every horizon. Active stake can never exceed circulating supply, so
+independent stake can never exceed 6.03% of circulating either: **under this
+scenario G1 is not late, it is unreachable** — not at year five, not at year
+forty — from emission alone. (The 1% per-validator cap and the genesis-cohort
+cap do redirect rewards away from over-cap stake, but both are Sybil-bypassable
+by splitting, per their own documentation, so share conservation is the
+conservative assumption.) The only thing that moves G1 is coins changing
+hands.
+
+**The same bound if the founder abstains.** If the carried-over founder
+balance stays out of stake — permitted to enter, voluntarily kept out — the
+independents can capture the whole emission. Solving
+
+    227,709,400 + E(t) = 0.15 × (5,033,884,800 + E(t) + U(t))
+
+with year-one emission flow E(t) = 917,168,074·t (the decay curve's first
+year) and unlock flow U(t) = 315,000,000·t (the marketing tranche; VC and team
+are inside their cliffs) gives t ≈ 0.72 years — the earliest arithmetic G1
+crossing is **about month 9**. That is a bound, not a forecast: the genesis
+cohort is founder-operated and earns much of the early emission, so the
+realistic date is later. But it is measured in months, not in five years.
+
+**G2 (largest entity < 25% of active stake).** Measured against *active*
+stake, staking the carryover is strictly worse than the 70.4%-of-circulating
+figure above: at genesis the founder would hold 3,546,175,400 of 3,773,884,800
+staked — **94.0% of active stake**, a Nakamoto coefficient of 1. Under
+conserved shares that figure does not decay either.
+
+The honest summary. The decision removes the last consensus-enforced
+distinction between the founder's coins and anyone else's, and in exchange the
+gates stop being a schedule and become a measurement of behaviour: whether
+G1–G4 are met before year five — or ever — is now decided by whether the
+founder's carryover stakes and whether coins actually distribute, and
+consensus constrains neither. That is the same trade §3.3.1 made for the
+genesis cohort: the enforceable part is real and bounded, and the rest is a
+public commitment verified by measurement, not a rule.
 
 ---
 

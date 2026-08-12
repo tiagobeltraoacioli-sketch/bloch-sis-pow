@@ -260,13 +260,19 @@ deliberately does not guess.
 §7.1 ("deposits are accepted on the PoW chain during the hybrid phase") and
 much of §4.1's taint machinery predate the 2026-08-10 halt-and-relaunch
 decision (§8 superseded note; chain halts at 80,000, Genesis-4 launches ~6
-months later). With a fresh genesis, eligibility comes primarily from the
-allocation itself — vesting locks on founder/VC/team/marketing outputs —
-and taint applies at most to carried-over balances. The `StakeEligibility`
-boundary is neutral either way, but someone must decide: does the taint set
-survive into Genesis-4 at all, or do consensus-enforced vesting locks replace
-it (making `Tainted` mean "unvested allocation output")? `StateRoots` keeps
-`taint_root` pending that ruling.
+months later). The ruling this section left pending is now made (founder
+decision, 2026-08-11): **the taint set does not survive into Genesis-4, and it
+is not repurposed.** It starts empty and stays empty — a carried-over balance
+that is liquid is also stakeable, the founder's included, and the vesting
+locks on the founder/VC/team/marketing allocations are enforced as
+spendability of the genesis outputs, not as a coin class. For this contract
+that means: conforming `StakeEligibility` implementations never return
+`Tainted` (the variant stays, frozen and inert), `StateRoots::taint_root` is a
+reserved all-zero slot, and `DepositReject::TaintedInput` is unreachable in
+Genesis-4. The decision is pinned by
+`staking.rs::carryover_liquid_balance_is_stakeable` and
+`tests/committee.rs::carryover_liquid_balance_delegates_as_stake`; its gate
+arithmetic is `BLOCH-TOKENOMICS-V4.md` §4A.1.
 
 ### 4.7 Which committee's attestations count where
 
