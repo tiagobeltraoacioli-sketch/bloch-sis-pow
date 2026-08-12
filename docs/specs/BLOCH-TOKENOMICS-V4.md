@@ -20,10 +20,11 @@ V2 nominal, after a draft at 100 billion.
 **The whole carryover comes across as one balance set, with no founder line.**
 Those coins were mined, on the same chain, under the same rules as everyone
 else's — so they are carried the same way, as ordinary liquid balance. The founder additionally receives a new 17% grant under
-a 10-year cliff and 40-year linear vest — the V2 premine schedule.
+a 10-year cliff and 40-year linear vest — the V2 premine schedule, at 10% rather
+than the V2 17%.
 
 Returning to 21 billion removes two hazards the 100-billion draft created, at no
-cost: the supply is **11.38% of `u64::MAX`** rather than 54.21%, so the sum of
+cost: the supply is **11.38% of `u64::MAX`** rather than the earlier draft's 54.21%, so the sum of
 two large balances is nowhere near the wrap point; and it **fits in the signed
 `int64`** the Go SDK uses for `Satoshis` (`sdk/go/models.go:16`), which 100
 billion overflowed by 8%.
@@ -31,29 +32,32 @@ billion overflowed by 8%.
 | Destination | BLCH | Share | Unlock |
 |---|---:|---:|---|
 | Carryover — the whole ledger | 3,773,884,800 | 17.97% | **liquid at genesis** |
-| Founder — new grant | 3,570,000,000 | 17.00% | 10-year cliff, then 40-year linear |
+| Founder — new grant | 2,100,000,000 | 10.00% | 10-year cliff, then 40-year linear |
 | VC / crypto hedge funds | 2,100,000,000 | 10.00% | 12-month cliff, then 24-month linear |
 | Development team | 2,100,000,000 | 10.00% | 18-month cliff, then 36-month linear |
 | Marketing | 840,000,000 | 4.00% | 25% at genesis, remainder linear over 24 months |
 | Liquidity | 1,050,000,000 | 5.00% | 100% liquid at genesis |
-| **Validators** | **7,566,115,200** | **36.03%** | emitted over 40 years |
+| **Validators** | **9,036,115,200** | **43.03%** | emitted over 40 years |
 | **Total** | **21,000,000,000** | **100.00%** | |
 
-**Founder total: 33.89%** — the carried-over balance plus the new grant.
+**Founder total: 26.89%** — the carried-over balance plus the new grant. The
+grant was cut from 17% to 10% on 2026-08-11 and the 1,470,000,000 difference
+went to validators, the only reallocation so far that moved supply *away* from
+an insider bucket.
 
 <figure style="margin:1.4em 0">
 <svg viewBox="0 0 690 356" width="100%" role="img" aria-label="Distribuicao do supply de 21 bilhoes de BLCH em sete destinos" style="max-width:690px;font-family:Charter,Georgia,serif">
 <title>Distribuição do supply — 21.000.000.000 BLCH</title>
-<path d="M 170.00 178.00 L 171.18 28.00 A 150 150 0 0 1 286.15 272.92 Z" fill="#2a78d6"/>
-<path d="M 170.00 178.00 L 284.65 274.73 A 150 150 0 0 1 133.84 323.58 Z" fill="#eb6834"/>
-<path d="M 170.00 178.00 L 131.56 322.99 A 150 150 0 0 1 25.01 216.44 Z" fill="#1baf7a"/>
+<path d="M 170.00 178.00 L 171.18 28.00 A 150 150 0 0 1 234.68 313.34 Z" fill="#2a78d6"/>
+<path d="M 170.00 178.00 L 232.55 314.34 A 150 150 0 0 1 75.30 294.32 Z" fill="#eb6834"/>
+<path d="M 170.00 178.00 L 73.48 292.82 A 150 150 0 0 1 25.01 216.44 Z" fill="#1baf7a"/>
 <path d="M 170.00 178.00 L 24.42 214.16 A 150 150 0 0 1 30.10 123.88 Z" fill="#eda100"/>
 <path d="M 170.00 178.00 L 30.97 121.69 A 150 150 0 0 1 88.63 51.99 Z" fill="#e87ba4"/>
 <path d="M 170.00 178.00 L 90.62 50.72 A 150 150 0 0 1 131.56 33.01 Z" fill="#008300"/>
 <path d="M 170.00 178.00 L 133.84 32.42 A 150 150 0 0 1 168.82 28.00 Z" fill="#4a3aa7"/>
-<text x="259.6" y="135.9" text-anchor="middle" dominant-baseline="middle" font-size="13" font-weight="700" fill="#ffffff">36.03%</text>
-<text x="200.5" y="272.2" text-anchor="middle" dominant-baseline="middle" font-size="13" font-weight="700" fill="#ffffff">17.97%</text>
-<text x="100.0" y="248.0" text-anchor="middle" dominant-baseline="middle" font-size="13" font-weight="700" fill="#ffffff">17.00%</text>
+<text x="266.6" y="156.5" text-anchor="middle" dominant-baseline="middle" font-size="13" font-weight="700" fill="#ffffff">43.03%</text>
+<text x="157.5" y="276.2" text-anchor="middle" dominant-baseline="middle" font-size="13" font-weight="700" fill="#ffffff">17.97%</text>
+<text x="86.4" y="231.0" text-anchor="middle" dominant-baseline="middle" font-size="13" font-weight="700" fill="#ffffff">10.00%</text>
 <text x="71.2" y="171.8" text-anchor="middle" dominant-baseline="middle" font-size="13" font-weight="700" fill="#ffffff">10.00%</text>
 <text x="93.7" y="114.9" text-anchor="middle" dominant-baseline="middle" font-size="13" font-weight="700" fill="#ffffff">10.00%</text>
 <text x="372" y="24" font-size="10" fill="#5c6169" letter-spacing="0.09em">DESTINO</text>
@@ -61,16 +65,16 @@ billion overflowed by 8%.
 <text x="676" y="24" font-size="10" fill="#5c6169" letter-spacing="0.09em" text-anchor="end">%</text>
 <rect x="372" y="32" width="12" height="12" rx="3" fill="#2a78d6"/>
 <text x="392" y="42" font-size="12.5" fill="#14161a" dominant-baseline="middle">Validadores</text>
-<text x="608" y="42" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">7.566.115.200</text>
-<text x="676" y="42" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">36.03</text>
+<text x="608" y="42" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">9.036.115.200</text>
+<text x="676" y="42" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">43.03</text>
 <rect x="372" y="62" width="12" height="12" rx="3" fill="#eb6834"/>
 <text x="392" y="72" font-size="12.5" fill="#14161a" dominant-baseline="middle">Carryover</text>
 <text x="608" y="72" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">3.773.884.800</text>
 <text x="676" y="72" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">17.97</text>
 <rect x="372" y="92" width="12" height="12" rx="3" fill="#1baf7a"/>
 <text x="392" y="102" font-size="12.5" fill="#14161a" dominant-baseline="middle">Fundador — concessão</text>
-<text x="608" y="102" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">3.570.000.000</text>
-<text x="676" y="102" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">17.00</text>
+<text x="608" y="102" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">2.100.000.000</text>
+<text x="676" y="102" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">10.00</text>
 <rect x="372" y="122" width="12" height="12" rx="3" fill="#eda100"/>
 <text x="392" y="132" font-size="12.5" fill="#14161a" dominant-baseline="middle">VC</text>
 <text x="608" y="132" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">2.100.000.000</text>
@@ -95,8 +99,8 @@ billion overflowed by 8%.
 <figcaption style="font-size:9.5pt;color:#5c6169;margin-top:.5em">
 Distribution of the 21,000,000,000 BLCH supply. Slices carry a direct label
 only where one fits; every figure is in the legend, which is also the table
-view — the two 10% buckets are equal by design, and a pie cannot show that as
-well as the number does.
+view — three buckets sit at exactly 10% — a pie cannot show that as well as the
+number does, which is why the legend carries both.
 </figcaption>
 </figure>
 
@@ -384,10 +388,10 @@ founder. Where V4 now lands:
 
 | | Genesis-3 today | V4 at genesis | V4 at year 50 |
 |---|---:|---:|---:|
-| Founder — spendable | 94.3% | **16.89%** (carryover, liquid) | 33.89% |
-| Founder — locked | — | 17.00% (10-yr cliff, 40-yr vest) | 0% |
-| Insiders total | 94.3% | 25.0% liquid (Foundation) + 16.89% | 62.97% |
-| Validators (earned) | — | 0%, growing | 36.03% |
+| Founder — spendable | 94.3% | **16.89%** (carryover, liquid) | 26.89% |
+| Founder — locked | — | 10.00% (10-yr cliff, 40-yr vest) | 0% |
+| Insiders total | 94.3% | 25.0% liquid (Foundation) + 16.89% | 55.97% |
+| Validators (earned) | — | 0%, growing | 43.03% |
 
 An earlier draft cliffed the founder's whole position and could claim **no
 spendable founder stake at genesis** — a consensus-enforced answer, and a much
@@ -406,9 +410,9 @@ years locked, forty vesting, fully vested at year 50.
 
 ## 6. Emission
 
-- Validator allocation: **53,700,000,000 BLCH** over **40 years**.
+- Validator allocation: **9,036,115,200 BLCH** over **40 years**.
 - At 30 s slots: 42,076,800 slots in 40 years.
-- **Average 1,276 BLCH per block.**
+- **Average 215 BLCH per block.**
 
 ### 6.1 Curve — decided: 10% annual disinflation
 
@@ -417,25 +421,25 @@ decentralisation requirement from §7A, that pins the curve almost exactly.
 
 | Curve | Year-1 inflation | Decentralisation gate |
 |---|---:|---|
-| Flat, 1,276 BLCH/block | 1.34% | **Fails** — validators never outpace insider unlocks |
-| Halving every 4 years | 6.72% | Passes, but revenue halves on scheduled dates |
-| Decay, 8%/year decline | 4.45% | **Fails at month 36** — too flat |
-| **Decay, 10%/year decline** | **5.45%** | **Passes** |
-| Decay, 12%/year decline | 6.48% | Passes, but close to the 7% ceiling |
+| Flat, 215 BLCH/block | 1.08% | **Fails** — validators never outpace insider unlocks |
+| Halving every 4 years | 5.38% | Passes, but revenue halves on scheduled dates |
+| Decay, 8%/year decline | 3.56% | **Fails at month 36** — too flat |
+| **Decay, 10%/year decline** | **4.37%** | **Passes** |
+| Decay, 12%/year decline | 5.19% | Passes, but the shape, not the ceiling, is what rules it out |
 
 **Adopted: reward declines 10% per year**, constant within each year, summing
-to exactly the 53.7 B allocation across 40 years.
+to exactly the 9,036,115,200 allocation across 40 years.
 
 | Year | BLCH/block | Inflation (of total supply) |
 |---:|---:|---:|
-| 1 | 5,181.54 | 5.45% |
-| 5 | 3,399.61 | 3.58% |
-| 10 | 2,007.43 | 2.11% |
-| 20 | 699.95 | 0.74% |
-| 40 | 85.10 | 0.09% |
+| 1 | 871.90 | 4.37% |
+| 5 | 572.05 | 2.87% |
+| 10 | 337.79 | 1.69% |
+| 20 | 117.78 | 0.59% |
+| 40 | 14.32 | 0.07% |
 
-Truncation residual across the whole 40-year schedule: **67,200 sat
-(0.000672 BLCH)** — under the allocation, never over.
+Truncation residual across the whole 40-year schedule: **889,200 sat
+(0.0089 BLCH)** — under the allocation, never over.
 
 **The denominator is load-bearing.** These figures are issuance over **total
 supply**, which is how Solana and Ethereum report inflation. Measured against
@@ -491,12 +495,12 @@ explorer must surface the rate prominently.
 
 **Yield versus inflation.** These are different numbers and both get quoted. At
 year-1 issuance with two thirds of supply staked — Solana's rough ratio — the
-nominal staking yield is **8.17%**, against **5.45%** inflation. A staker's
+nominal staking yield is **6.55%**, against **4.37%** inflation. A staker's
 real position is what remains after dilution; a non-staker is diluted by the
-full 5.45%.
+full 4.37%.
 
-For reference, Bloch's year-1 inflation of 5.45% lands almost exactly on
-Solana's current 5.5–5.9%.
+For reference, Bloch's year-1 inflation of 4.37% sits just below Solana's
+current 5.5–5.9%.
 
 ### 6.3.1 Delegation — implemented (`crates/bloch-pos-committee/src/delegation.rs`)
 
@@ -588,7 +592,7 @@ Schedules follow prevailing market practice for recent L1 launches.
 
 | Bucket | Genesis | Cliff | Linear | Total | Market basis |
 |---|---:|---:|---:|---:|---|
-| Founder — new grant | 0% | **120 mo** (10 yr) | **480 mo** (40 yr) | 50 yr | The V2 premine schedule, restored. Far beyond any market benchmark and the strictest on the chain — deliberately, since the carried-over balance arrives liquid and this grant is the part that can still be made to wait |
+| Founder — new grant (10%) | 0% | **120 mo** (10 yr) | **480 mo** (40 yr) | 50 yr | The V2 premine schedule, restored. Far beyond any market benchmark and the strictest on the chain — deliberately, since the carried-over balance arrives liquid and this grant is the part that can still be made to wait |
 | VC / hedge funds | 0% | **12 mo** | 24 mo | 3 yr | 12-month cliff is the standard among recent L1s (Sui Series A and B both cliff at 12 months); investor vests typically run 2–3 years |
 | Team | 0% | **18 mo** | 36 mo | 4.5 yr | Institutional standard is 12-month cliff + 36-month linear; 18 months is "defensible and increasingly expected" where institutional investors participate, and it keeps the team cliff off the VC cliff month |
 | Marketing | **25%** | — | 24 mo | 2 yr | Listing and launch spend is commonly unlocked at TGE for launch momentum; ongoing programmes vest over ~24–25 months |
@@ -710,9 +714,8 @@ decides whether PoS can ever activate.** Open decision #2 in §9 is therefore
 not a free parameter — it is the most consequential number left in V4, and the
 recommendation is a front-loaded curve.
 
-Halving parameters, if adopted: initial reward **6,387 BLCH/block**, halving
-every 4 years, 10 halvings across the 40-year window, final period 6.24
-BLCH/block, truncation residual under 0.2 BLCH over the whole schedule.
+Halving parameters, if adopted: initial reward **1,075 BLCH/block**, halving
+every 4 years, 10 halvings across the 40-year window.
 
 ---
 

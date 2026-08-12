@@ -35,14 +35,14 @@ pub const TOTAL_SUPPLY_SAT: u128 = TOTAL_SUPPLY_BLOCH * SAT_PER_BLOCH;
 
 // ── Allocations ─────────────────────────────────────────────────────────────
 
-/// The founder's NEW allocation — 17% of supply, vested.
+/// The founder's NEW allocation — 10% of supply, vested.
 ///
 /// This is on top of the carried-over balance below, not instead of it: the
 /// founder's Genesis-3 holdings come across as ordinary liquid carryover and
 /// the 17% is granted again (founder decision, 2026-08-11). Combined, the
 /// founder holds 33.89% of supply. §4 of the tokenomics spec states what that
 /// does to the activation gates.
-pub const FOUNDER_BLOCH: u128 = 3_570_000_000; // 17%
+pub const FOUNDER_BLOCH: u128 = 2_100_000_000; // 10%
 /// Sold to funds; the Foundation is the counterparty. Nothing liquid at
 /// genesis — 12-month cliff, 24-month linear, fully vested at year 3.
 pub const VC_BLOCH: u128 = 2_100_000_000; // 10%
@@ -220,7 +220,7 @@ const _: () = assert!(
 );
 
 const _: () = assert!(
-    VALIDATOR_EMISSION_BLOCH == 7_566_115_200,
+    VALIDATOR_EMISSION_BLOCH == 9_036_115_200,
     "resto para validadores mudou — reveja a especificacao antes de aceitar"
 );
 
@@ -228,6 +228,10 @@ const _: () = assert!(
 /// Not a consensus quantity and not a distinct class of coin — a measurement.
 pub const LARGEST_CARRYOVER_ADDRESS_BLOCH: u128 = 3_546_175_400;
 const _: () = assert!(LARGEST_CARRYOVER_ADDRESS_BLOCH < CARRYOVER_TOTAL_BLOCH);
+
+/// Founder carried-over balance plus the new grant: 26.89% of supply.
+pub const FOUNDER_TOTAL_BLOCH: u128 = LARGEST_CARRYOVER_ADDRESS_BLOCH + FOUNDER_BLOCH;
+const _: () = assert!(FOUNDER_TOTAL_BLOCH * 10_000 / TOTAL_SUPPLY_BLOCH == 2688);
 
 const _: () = assert!(EMISSION_SLOTS == 42_076_800, "grade de tempo mudou");
 
@@ -387,7 +391,7 @@ pub const fn validator_reward_halving_sat(slot: u64) -> u128 {
 /// the allocation with **zero** residual rather than merely close to it.
 pub const DECAY_NUMERATOR: u128 = 9;
 pub const DECAY_DENOMINATOR: u128 = 10;
-pub const INITIAL_ANNUAL_SAT: u128 = 76_796_268_659_286_369;
+pub const INITIAL_ANNUAL_SAT: u128 = 91_716_807_395_714_399;
 
 pub const fn validator_reward_decay_sat(slot: u64) -> u128 {
     if slot >= EMISSION_SLOTS {

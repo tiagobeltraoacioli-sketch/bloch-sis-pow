@@ -463,7 +463,7 @@ fn allocations_sum_to_total_supply() {
         + tk::TEAM_BLOCH + tk::MARKETING_BLOCH + tk::LIQUIDITY_BLOCH
         + tk::VALIDATOR_EMISSION_BLOCH;
     assert_eq!(sum, tk::TOTAL_SUPPLY_BLOCH);
-    assert_eq!(tk::VALIDATOR_EMISSION_BLOCH, 7_566_115_200);
+    assert_eq!(tk::VALIDATOR_EMISSION_BLOCH, 9_036_115_200);
 }
 
 #[test]
@@ -528,13 +528,13 @@ fn neither_curve_exceeds_the_allocation() {
 
 #[test]
 fn flat_curve_matches_the_spec_average() {
-    assert_eq!(tk::validator_reward_flat_sat(0) / tk::SAT_PER_BLOCH, 179);
+    assert_eq!(tk::validator_reward_flat_sat(0) / tk::SAT_PER_BLOCH, 214);
 }
 
 #[test]
 fn halving_curve_halves_every_four_years() {
     let r0 = tk::validator_reward_halving_sat(0);
-    assert_eq!(r0 / tk::SAT_PER_BLOCH, 899);
+    assert_eq!(r0 / tk::SAT_PER_BLOCH, 1_074);
     assert_eq!(tk::validator_reward_halving_sat(tk::HALVING_PERIOD_SLOTS), r0 / 2);
     assert_eq!(tk::validator_reward_halving_sat(2 * tk::HALVING_PERIOD_SLOTS), r0 / 4);
     // Front-loading is the whole point: half the allocation inside four years.
@@ -644,10 +644,10 @@ fn decay_curve_meets_the_inflation_target() {
     // Founder requirement: annual inflation under 7% of total supply.
     let y1 = tk::annual_inflation_bps(0);
     assert!(y1 < 700, "ano 1 = {}bps, acima do teto de 700", y1);
-    assert_eq!(y1, 365); // 3,65% (truncado)
+    assert_eq!(y1, 436); // 4,36% (truncado)
     assert!(tk::annual_inflation_bps(4) < y1);
     assert!(tk::annual_inflation_bps(9) < tk::annual_inflation_bps(4));
-    assert_eq!(tk::annual_inflation_bps(9), 141);
+    assert_eq!(tk::annual_inflation_bps(9), 169);
 }
 
 #[test]
@@ -656,7 +656,7 @@ fn decay_curve_declines_ten_percent_a_year() {
     let y1 = tk::validator_reward_decay_sat(tk::SLOTS_PER_YEAR);
     let ratio = y1 * 1000 / y0;
     assert!((899..=901).contains(&ratio), "razao anual = {ratio}/1000");
-    assert_eq!(y0 / tk::SAT_PER_BLOCH, 730);
+    assert_eq!(y0 / tk::SAT_PER_BLOCH, 871);
 }
 
 #[test]
@@ -666,7 +666,7 @@ fn decay_curve_emits_the_allocation_exactly() {
     // Under the cap, never over: truncation may strand dust, never mint.
     assert!(emitted <= alloc, "emitiu {emitted} > alocado {alloc}");
     let residual = alloc - emitted;
-    assert_eq!(residual, 1_028_400, "residuo mudou: {residual} sat");
+    assert_eq!(residual, 889_200, "residuo mudou: {residual} sat");
     assert!(residual < tk::SAT_PER_BLOCH, "residuo passou de 1 BLCH");
     assert_eq!(tk::validator_emitted_decay_by(u64::MAX), emitted);
     assert_eq!(tk::validator_reward_decay_sat(tk::EMISSION_SLOTS), 0);
@@ -688,7 +688,7 @@ fn decay_front_loads_enough_to_outpace_insider_unlocks() {
     assert!(validators > biggest_insider,
         "validadores {validators} atras do maior insider {biggest_insider}");
     let ratio = validators * 100 / biggest_insider;
-    assert!((130..=150).contains(&ratio), "margem mudou: {ratio}/100");
+    assert!((160..=185).contains(&ratio), "margem mudou: {ratio}/100");
 }
 
 // ── receita do validador (modelo Solana) ────────────────────────────────────
@@ -824,7 +824,7 @@ fn distribution_does_not_overflow_at_full_supply_scale() {
     // issuance × stake is the product of two ~1e19 values.
     let sat = tk::SAT_PER_BLOCH;
     let total = tk::TOTAL_SUPPLY_BLOCH * sat;
-    let issuance = 767_962_686 * sat;
+    let issuance = 917_168_073 * sat;
     let p = rewards::distribute(&acct(total / 2, total / 2, 500), issuance, total);
     assert_eq!(p.operator + p.delegators, issuance);
 }
@@ -832,11 +832,11 @@ fn distribution_does_not_overflow_at_full_supply_scale() {
 #[test]
 fn nominal_yield_exceeds_inflation_when_not_all_supply_is_staked() {
     let sat = tk::SAT_PER_BLOCH;
-    let issuance = 767_962_686 * sat;                     // ano 1
+    let issuance = 917_168_073 * sat;                     // ano 1
     let staked = tk::TOTAL_SUPPLY_BLOCH * sat * 2 / 3;     // dois tercos, como Solana
     let y = rewards::nominal_yield_bps(issuance, staked);
     assert!(y > 545, "yield {y}bps deveria superar a inflacao de 545bps");
-    assert!((540..=560).contains(&y), "yield {y}bps");
+    assert!((645..=665).contains(&y), "yield {y}bps");
 }
 
 // ── delegacao ───────────────────────────────────────────────────────────────
