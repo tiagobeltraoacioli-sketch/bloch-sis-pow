@@ -525,15 +525,14 @@ impl CommittedState {
             .iter()
             .map(|(v, a)| ParticipationRecord { validator_index: *v, attested: *a })
             .collect();
-        // Boundary mixes (last 2) plus the running mix keyed by the current
-        // epoch: committing the running value is what binds each block's
-        // RANDAO reveal into the state root the header pins.
-        let mut mixes: Vec<RandaoMix> = self
+        // Which mixes are committed is decided in ONE place — see
+        // `state_root::randao_window` for why that is worth a function.
+        let boundaries: Vec<RandaoMix> = self
             .boundary_mixes
             .iter()
             .map(|(e, m)| RandaoMix { epoch: *e, mix: *m })
             .collect();
-        mixes.push(RandaoMix { epoch: self.epoch, mix: self.randao_mix });
+        let mixes = crate::state_root::randao_window(&boundaries, self.epoch, self.randao_mix);
 
         // Finality bookkeeping: the engine's full fold state plus the frozen
         // view's previous-justified checkpoint, in one leaf.
@@ -1051,7 +1050,7 @@ impl CommittedState {
         // 3. Fix the boundary mix that seeds epoch E+1, and retain exactly
         //    the last 2 boundaries (§5.5).
         st.boundary_mixes.insert(closing, st.randao_mix);
-        let keep_from = closing.saturating_sub(1);
+        let keep_from = closing.saturating_sub(crate::state_root::RANDAO_BOUNDARIES_RETAINED - 1);
         st.boundary_mixes.retain(|e, _| *e >= keep_from);
 
         // 4. Activation queue (staking.rs). Resolved by replaying the full

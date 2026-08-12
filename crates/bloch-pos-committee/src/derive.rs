@@ -462,16 +462,12 @@ pub fn post_chain_state(
     let mut post = parent.chain.clone();
     let epoch = crate::epoch_of(block_slot);
 
-    // Beacon history: this epoch's entry becomes the new accumulated mix;
-    // exactly the last two epochs are kept (§5.5). Keyed by epoch and
-    // re-sorted, so the vector layout cannot depend on the parent's layout.
-    post.randao_mixes.retain(|m| m.epoch == epoch || m.epoch + 1 == epoch);
-    if let Some(entry) = post.randao_mixes.iter_mut().find(|m| m.epoch == epoch) {
-        entry.mix = new_mix;
-    } else {
-        post.randao_mixes.push(RandaoMix { epoch, mix: new_mix });
-    }
-    post.randao_mixes.sort_by_key(|m| m.epoch);
+    // Beacon history. This seam used to apply its OWN retention rule here, one
+    // entry shorter than `transition`'s, so the two produced different state
+    // roots for the same block. There is one rule now and it lives in
+    // `state_root::randao_window`; the divergence and why transition's rule won
+    // are documented there.
+    post.randao_mixes = crate::state_root::randao_window(&post.randao_mixes, epoch, new_mix);
 
     // Participation: credit every validator whose attestation this block
     // carries. Rebuilt via BTreeMap so duplicate records or append order can

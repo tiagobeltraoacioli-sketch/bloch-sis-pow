@@ -805,6 +805,47 @@ pub struct ConsensusState<'a> {
     pub evm: EvmCommitment,
 }
 
+/// How many **closed** epoch boundaries the committed beacon history retains,
+/// on top of the running mix for the open epoch (§5.5).
+///
+/// Two, because `seed_for_epoch(E)` reads the boundary closed at `E-1` and the
+/// look-ahead needs the one before it; anything shorter makes a committee
+/// underivable from committed state, which is the §5.5 failure by another road.
+pub const RANDAO_BOUNDARIES_RETAINED: u64 = 2;
+
+/// **The** definition of which RANDAO mixes the state root commits.
+///
+/// It is a function because it used to be two rules. `transition` committed the
+/// retained boundaries *plus* the running mix (three entries from epoch 2 on);
+/// `derive` committed `{epoch-1, epoch}` (two). Same block, same parent, two
+/// different leaf sets, therefore two different state roots — the crate's
+/// founding rule ("one derivation path") is enforced for block identity by
+/// `header::single_derivation_path` and was, until now, not enforced at all for
+/// the state root. Found independently by two agents on 2026-08-12, from
+/// opposite ends: one auditing which fields were committed, one running a real
+/// devnet and finding `produce.rs` unusable by the node.
+///
+/// `transition`'s rule won: it retains strictly more, it is the one the node
+/// runs, and committing the running mix is what binds each block's RANDAO
+/// reveal into the root its header pins.
+///
+/// `history` is the closed boundaries in any order; `(epoch, running)` is the
+/// open epoch's accumulating mix. Output is sorted by epoch with one entry per
+/// epoch — a `history` that already carries `epoch` is overridden by `running`,
+/// because the open epoch's live value is the one that was revealed to.
+///
+/// Pinned by `tests/one_state_root.rs`.
+pub fn randao_window(history: &[RandaoMix], epoch: u64, running: [u8; 32]) -> Vec<RandaoMix> {
+    let keep_from = epoch.saturating_sub(RANDAO_BOUNDARIES_RETAINED);
+    let mut by_epoch: std::collections::BTreeMap<u64, [u8; 32]> = history
+        .iter()
+        .filter(|m| m.epoch >= keep_from && m.epoch < epoch)
+        .map(|m| (m.epoch, m.mix))
+        .collect();
+    by_epoch.insert(epoch, running);
+    by_epoch.into_iter().map(|(epoch, mix)| RandaoMix { epoch, mix }).collect()
+}
+
 fn derive_key(component_tag: u8, entry_key: &[u8]) -> [u8; 32] {
     sha3(&[&[MARK_KEY], &[component_tag], entry_key])
 }
