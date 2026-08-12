@@ -1,13 +1,17 @@
-import { useState } from "react";
-import { fetchDagWindow } from "../lib/chain";
+// SPDX-License-Identifier: AGPL-3.0-or-later
+import { useEffect, useState } from "react";
+import { fetchDagWindow, HALT_HEIGHT } from "../lib/chain";
 import { useAsync } from "../lib/hooks";
 import { Loading, ErrorBox } from "../components/ui";
 import { DagView } from "../components/dag";
+import { useAdaptivePoll } from "../components/chainStatus";
 import { fmtInt } from "../lib/format";
 
 export function DagPage() {
   const [depth, setDepth] = useState(40);
-  const { data, error, loading } = useAsync(() => fetchDagWindow(depth), [depth], 15000);
+  const { intervalMs, markTip } = useAdaptivePoll(15000);
+  const { data, error, loading } = useAsync(() => fetchDagWindow(depth), [depth, intervalMs], intervalMs);
+  useEffect(() => markTip(data?.dag?.tip_height), [data, markTip]);
 
   return (
     <div className="container">
@@ -42,9 +46,9 @@ export function DagPage() {
 
           <div className="rail" style={{ marginTop: 16 }}>
             <strong>What the colours mean.</strong> Blocks are coloured by the role the RPC lets us
-            prove: the <span style={{ color: "var(--brass-hi)" }}>selected tip</span> (amber), any bodied{" "}
+            prove: the <span style={{ color: "var(--accent)" }}>selected tip</span> (emerald), any bodied{" "}
             <span style={{ color: "var(--red)" }}>competing tip</span> (solid red), and{" "}
-            <span style={{ color: "var(--blue)" }}>merged history</span> (cool steel, shaded by blue score).
+            <span style={{ color: "var(--violet)" }}>merged history</span> (violet, shaded by blue score).
             Bold edges are selected-parent links; thin edges are merge-set links. The node does not
             expose the per-block blue/red mergeset classification, so we don't invent it.
             {data.ghostTips.length > 0 && (
@@ -53,9 +57,10 @@ export function DagPage() {
                 The <span style={{ color: "var(--red)" }}>dashed red</span> fan is{" "}
                 {fmtInt(data.ghostTips.length)} <strong>header-only tips</strong> — the node knows
                 these tip hashes but has no block body for them (bodies never arrived), so they can't
-                be placed on the DAG. That large open-tip count is the current stall near height{" "}
-                {fmtInt(data.dag.tip_height)}; once a consensus fix lands and the chain advances,
-                bodied tips will render as real coloured branches here.
+                be placed on the DAG.{" "}
+                {data.dag.tip_height >= HALT_HEIGHT
+                  ? "They are part of the final, permanent record of Genesis-3."
+                  : "They render as bodied, coloured branches if their bodies arrive."}
               </>
             )}
           </div>

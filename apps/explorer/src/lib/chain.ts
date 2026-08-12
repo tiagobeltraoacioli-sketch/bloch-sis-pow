@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 import { rpc } from "./rpc";
 import type { DagBlock } from "../components/dag";
 
@@ -110,5 +111,55 @@ export async function fetchDagWindow(depth: number): Promise<{
   };
 }
 
-// A block whose freshest tip timestamp is older than this is treated as stalled.
+// A block whose freshest tip timestamp is older than this is treated as quiet
+// (no recent production) while the chain is still below the halt height.
 export const STALL_THRESHOLD_SECS = 20 * 60;
+
+/**
+ * Genesis-3 ends by consensus rule at this height: blocks above it are invalid
+ * for every node, mining revenue stops, and a signed snapshot of all balances
+ * carries into Genesis-4. Reaching it is the PLAN, not a failure — the UI must
+ * never present it as an error state.
+ */
+export const HALT_HEIGHT = 50_000;
+
+/** Poll cadence once the chain is complete: history doesn't change every 15 s. */
+export const COMPLETE_POLL_MS = 10 * 60 * 1000;
+
+/**
+ * The three presentation states of the chain:
+ *   producing — blocks are arriving, height below the halt
+ *   quiet     — below the halt but nothing recent (factual, amber, not red)
+ *   complete  — tip reached HALT_HEIGHT: Genesis-3 finished as designed
+ */
+export type ChainPhase = "producing" | "quiet" | "complete";
+
+export function chainPhase(tipHeight: number, freshestTs: number): ChainPhase {
+  if (tipHeight >= HALT_HEIGHT) return "complete";
+  const age = freshestTs ? Date.now() / 1000 - freshestTs : Infinity;
+  return age > STALL_THRESHOLD_SECS ? "quiet" : "producing";
+}
+
+// Sticky "Genesis-3 is complete" flag so every page (even ones that don't fetch
+// a tip height) can start on the slow poll after a reload. localStorage is a
+// cache, never the source of truth — the RPC tip height is.
+const COMPLETE_LS_KEY = "bloch:g3:complete";
+
+export function isChainComplete(): boolean {
+  try {
+    return localStorage.getItem(COMPLETE_LS_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+/** Record an observed tip height; marks the chain complete once ≥ HALT_HEIGHT. */
+export function noteTipHeight(h: number | null | undefined): void {
+  if (typeof h === "number" && isFinite(h) && h >= HALT_HEIGHT) {
+    try {
+      localStorage.setItem(COMPLETE_LS_KEY, "1");
+    } catch {
+      /* private mode etc. — polling just stays fast */
+    }
+  }
+}

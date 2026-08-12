@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 import { useMemo, useState } from "react";
 import { useRouter } from "../lib/router";
 import { short } from "../lib/format";
@@ -81,9 +82,8 @@ export function DagView({
   const bsMin = Math.min(...bsList), bsMax = Math.max(...bsList);
   const blueShade = (bs: number) => {
     const t = (bs - bsMin) / (bsMax - bsMin || 1); // 0..1
-    // cool steel backbone: darker (old) → brighter (recent), kept calm on navy
-    const l = 34 + t * 24;
-    return `hsl(214 42% ${l}%)`;
+    // violet backbone: faded (old) → saturated (recent); theme-aware via tokens
+    return `color-mix(in srgb, var(--violet) ${Math.round(38 + t * 55)}%, var(--surface-2))`;
   };
 
   const edges: JSX.Element[] = [];
@@ -99,7 +99,7 @@ export function DagView({
           key={b.hash + "->" + ph}
           className="dag-edge"
           d={`M${x},${y} C${mx},${y} ${mx},${p.y} ${p.x},${p.y}`}
-          stroke={selected ? "#5E88C8" : "#2C3A55"}
+          stroke={selected ? "var(--violet)" : "var(--blue-dim)"}
           strokeWidth={selected ? 1.8 : 1}
           strokeOpacity={active ? (selected ? 0.85 : 0.5) : 0.12}
         />
@@ -114,8 +114,8 @@ export function DagView({
     let fill = blueShade(b.blue_score);
     let stroke = "transparent";
     let r = 7;
-    if (isSel) { fill = "#E0A870"; stroke = "#F6DCB8"; r = 9; }
-    else if (isTip) { fill = "#E0736A"; stroke = "#EFA79E"; r = 8; }
+    if (isSel) { fill = "var(--accent)"; stroke = "var(--accent-soft)"; r = 9; }
+    else if (isTip) { fill = "var(--red)"; stroke = "color-mix(in srgb, var(--red) 40%, var(--surface))"; r = 8; }
     const active = hover === null || hover === b.hash;
     nodes.push(
       <g
@@ -127,16 +127,16 @@ export function DagView({
         onMouseLeave={() => setHover(null)}
         onClick={() => navigate(`/block/${b.hash}`)}
       >
-        {/* backbone depth: soft halo under every node, amber hero glow on the selected tip */}
-        <circle r={r + (isSel ? 9 : 4)} fill={isSel ? "#E0A870" : fill} opacity={isSel ? 0.2 : 0.1} />
+        {/* backbone depth: soft halo under every node, emerald hero glow on the selected tip */}
+        <circle r={r + (isSel ? 9 : 4)} fill={isSel ? "var(--accent)" : fill} opacity={isSel ? 0.2 : 0.1} />
         <circle r={r} fill={fill} stroke={stroke} strokeWidth={2} />
         {hover === b.hash && (
           <g>
-            <rect x={-72} y={-r - 40} width={144} height={31} rx={6} fill="#1E2532" stroke="#37424F" />
-            <text x={0} y={-r - 26} textAnchor="middle" fill="#E3E7EA" style={{ fontSize: 9.5 }}>
+            <rect x={-72} y={-r - 40} width={144} height={31} rx={6} fill="var(--panel)" stroke="var(--border-hi)" />
+            <text x={0} y={-r - 26} textAnchor="middle" fill="var(--text)" style={{ fontSize: 9.5 }}>
               h{b.height} · bs{b.blue_score}
             </text>
-            <text x={0} y={-r - 15} textAnchor="middle" fill="#9AA7B4" style={{ fontSize: 8.5 }}>
+            <text x={0} y={-r - 15} textAnchor="middle" fill="var(--text-dim)" style={{ fontSize: 8.5 }}>
               {short(b.hash, 8, 8)}
             </text>
           </g>
@@ -162,7 +162,7 @@ export function DagView({
           <path
             className="dag-edge"
             d={`M${ax},${ay} C${(ax + fanX) / 2},${ay} ${(ax + fanX) / 2},${gy} ${fanX},${gy}`}
-            stroke="#E0736A"
+            stroke="var(--red)"
             strokeWidth={1}
             strokeOpacity={active ? 0.28 : 0.08}
             strokeDasharray="3 3"
@@ -175,9 +175,9 @@ export function DagView({
             onMouseLeave={() => setHover(null)}
             onClick={() => navigate(`/block/${h}`)}
           >
-            <circle r={5} fill="none" stroke="#E0736A" strokeWidth={1.6} strokeDasharray="2 2" />
+            <circle r={5} fill="none" stroke="var(--red)" strokeWidth={1.6} strokeDasharray="2 2" />
             {hover === h && (
-              <text x={10} y={3} textAnchor="start" fill="#9AA7B4" style={{ fontSize: 8.5 }}>
+              <text x={10} y={3} textAnchor="start" fill="var(--text-dim)" style={{ fontSize: 8.5 }}>
                 {short(h, 8, 6)} (header-only)
               </text>
             )}
@@ -187,7 +187,7 @@ export function DagView({
     });
     if (ghostTips.length > shown.length) {
       ghostEls.push(
-        <text key="ghmore" x={fanX} y={height - 8} textAnchor="middle" fill="#6B7787" style={{ fontSize: 9 }}>
+        <text key="ghmore" x={fanX} y={height - 8} textAnchor="middle" fill="var(--muted)" style={{ fontSize: 9 }}>
           +{ghostTips.length - shown.length} more
         </text>
       );
@@ -204,14 +204,14 @@ export function DagView({
         </svg>
       </div>
       <div className="legend" style={{ padding: "12px 16px", borderTop: "1px solid var(--border)" }}>
-        <span className="item"><span className="swatch" style={{ background: "#E0A870" }} /> selected tip</span>
-        <span className="item"><span className="swatch" style={{ background: "#E0736A" }} /> competing tip</span>
-        <span className="item"><span className="swatch" style={{ background: "hsl(214 42% 50%)" }} /> merged block (shade = blue score)</span>
-        <span className="item"><span className="swatch" style={{ background: "#5E88C8", height: 3, borderRadius: 2 }} /> selected-parent edge</span>
-        <span className="item"><span className="swatch" style={{ background: "#2C3A55", height: 2, borderRadius: 2 }} /> merge edge</span>
+        <span className="item"><span className="swatch" style={{ background: "var(--accent)" }} /> selected tip</span>
+        <span className="item"><span className="swatch" style={{ background: "var(--red)" }} /> competing tip</span>
+        <span className="item"><span className="swatch" style={{ background: "var(--violet)" }} /> merged block (shade = blue score)</span>
+        <span className="item"><span className="swatch" style={{ background: "var(--violet)", height: 3, borderRadius: 2 }} /> selected-parent edge</span>
+        <span className="item"><span className="swatch" style={{ background: "var(--blue-dim)", height: 2, borderRadius: 2 }} /> merge edge</span>
         {ghostTips.length > 0 && (
           <span className="item">
-            <span className="swatch" style={{ background: "transparent", border: "1.5px dashed #E0736A", borderRadius: "50%" }} /> header-only tip ({ghostTips.length})
+            <span className="swatch" style={{ background: "transparent", border: "1.5px dashed var(--red)", borderRadius: "50%" }} /> header-only tip ({ghostTips.length})
           </span>
         )}
       </div>

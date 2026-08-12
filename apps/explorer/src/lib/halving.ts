@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Emission schedule — V2 curve below the Emission V3 fork, V3 curve at/above it.
 //
 // TWO THINGS THAT ARE EASY TO GET WRONG:

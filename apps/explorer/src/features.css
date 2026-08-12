@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: AGPL-3.0-or-later */
 /* ============================================================================
    Feature components (mining calculator, wizard, live DAG, wallet, leaderboard)
    Additive layer — consumes the brand tokens from styles.css. Theme-aware via
@@ -170,9 +171,7 @@
 .idag-canvas {
   position: relative;
   overflow: hidden;
-  background:
-    radial-gradient(120% 90% at 50% -20%, color-mix(in srgb, var(--bg-glow) 70%, transparent), transparent 60%),
-    var(--surface);
+  background: var(--surface);
   touch-action: none;
   user-select: none;
 }
@@ -192,7 +191,7 @@
   background: var(--surface-3);
   border: 1px solid var(--border-hi);
   border-radius: 9px;
-  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.35);
+  box-shadow: var(--shadow-pop);
   font-family: var(--font-mono);
 }
 .idag-tip-h { font-size: 12px; color: var(--brass-hi); margin-bottom: 3px; }

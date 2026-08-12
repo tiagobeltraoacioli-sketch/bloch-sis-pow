@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Formatting helpers. Integer satoshis are the source of truth (1 BLOCH = 1e8
 // sat); "bloch" values are display-only.
 

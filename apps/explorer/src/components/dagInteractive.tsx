@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 import { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import { useRouter } from "../lib/router";
 import { short, timeAgo } from "../lib/format";

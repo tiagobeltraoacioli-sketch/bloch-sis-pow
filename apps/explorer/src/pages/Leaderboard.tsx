@@ -1,7 +1,11 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+import { useEffect } from "react";
 import { rpc, rpcAllSettled } from "../lib/rpc";
 import { useAsync } from "../lib/hooks";
 import { Loading, ErrorBox, Stat } from "../components/ui";
 import { ProportionBars } from "../components/charts";
+import { chainPhase } from "../lib/chain";
+import { useAdaptivePoll } from "../components/chainStatus";
 import { Link } from "../lib/router";
 import {
   fetchPoolAddresses,
@@ -11,13 +15,14 @@ import {
   MinerRank,
   PoolAddresses,
 } from "../lib/mining";
-import { fmtHashrate, fmtInt, fmtBloch, timeAgo, short } from "../lib/format";
+import { fmtHashrate, fmtInt, fmtBloch, fmtTime, timeAgo, short } from "../lib/format";
 
 const SCAN_DEPTH = 40;
 
 // Light live poll: network hashrate + newest block only (cheap). The heavy
 // per-block coinbase scan refreshes on its own slower cadence / manual re-scan.
 function LiveHeader() {
+  const { intervalMs, markTip } = useAdaptivePoll(15000);
   const { data } = useAsync(async () => {
     const r = await rpcAllSettled({
       chain: rpc<any>("getchainstats"),
@@ -25,20 +30,33 @@ function LiveHeader() {
       dag: rpc<any>("getdaginfo"),
     });
     return r;
-  }, [], 15000);
+  }, [intervalMs], intervalMs);
+  useEffect(() => markTip(data?.dag?.tip_height), [data, markTip]);
 
   const chain = data?.chain;
   const top = data?.recent?.[0];
   const dag = data?.dag;
+  const complete =
+    chainPhase(dag?.tip_height ?? top?.height ?? 0, top?.timestamp ?? 0) === "complete";
 
   return (
     <div className="grid stat-grid" style={{ marginTop: 14 }}>
-      <Stat label="Network hashrate" value={fmtHashrate(chain?.hashrate_hs ?? 0)} sub="live estimate" />
+      <Stat
+        label="Network hashrate"
+        value={complete ? "0 H/s" : fmtHashrate(chain?.hashrate_hs ?? 0)}
+        sub={complete ? "mining ended at the halt" : "live estimate"}
+      />
       <Stat label="Tip height" value={fmtInt(dag?.tip_height ?? top?.height ?? 0)} sub={`${fmtInt(dag?.tip_count ?? 0)} open tips`} />
       <Stat
-        label="Last block"
+        label={complete ? "Final block" : "Last block"}
         value={top ? "h" + fmtInt(top.height) : "—"}
-        sub={top?.timestamp ? timeAgo(top.timestamp) : "no recent block"}
+        sub={
+          top?.timestamp
+            ? complete
+              ? fmtTime(top.timestamp)
+              : timeAgo(top.timestamp)
+            : "no recent block"
+        }
       />
       <Stat label="Blocks 24h" value={fmtInt(chain?.blocks_last_24h ?? 0)} sub="node-reported" />
     </div>
@@ -102,8 +120,8 @@ export function LeaderboardPage() {
           {rows.length === 0 ? (
             <div className="rail">
               <strong>No attributable blocks in the window.</strong> The node returned no bodied blocks whose
-              coinbase we could resolve to a miner address right now — consistent with a stalled chain. Once
-              blocks flow again, miners appear here ranked by blocks found.
+              coinbase we could resolve to a miner address right now. If blocks flow, miners appear here
+              ranked by blocks found.
             </div>
           ) : (
             <>
