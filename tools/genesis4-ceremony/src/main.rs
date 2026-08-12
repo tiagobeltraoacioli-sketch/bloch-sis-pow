@@ -7,12 +7,14 @@ use genesis4_ceremony::*;
 use std::process::ExitCode;
 
 const USAGE: &str = "\
-genesis4-ceremony — assemble the Genesis-4 genesis block from the carryover artifact
+genesis4-ceremony — assemble the Genesis-4 genesis block from the carryover
+artifact and the genesis validator cohort
 
 USAGE:
     genesis4-ceremony \\
         --carryover genesis4-carryover.tsv \\
         --carryover-shake256 <64-hex published digest> \\
+        --cohort genesis4-cohort.tsv \\
         --founder <addr40> --vc <addr40> --team <addr40> \\
         --marketing <addr40> --liquidity <addr40> \\
         --out genesis4
@@ -21,8 +23,14 @@ Reads the plain-text carryover artifact (addr<TAB>value_sat, sorted — the file
 build_carryover.py emits; gunzip it first if compressed), recomputes its
 SHAKE-256, and refuses to proceed unless it matches the published digest.
 
+Reads the genesis validator cohort (tokenomics §3.3): one line per validator,
+index<TAB>pubkey<TAB>randao_c0<TAB>stake_sat<TAB>withdrawal, indices from 0,
+raw ML-DSA-65 ‖ Falcon-1024 pubkeys (no suite envelope), at least 64 members,
+funded from the liquidity bucket. The cohort is published in the block; the
+one-year declining cap binds exactly this set.
+
 Writes:
-    <out>.tsv           canonical genesis allocation document
+    <out>.tsv           canonical genesis allocation document (incl. cohort)
     <out>.tsv.shake256  its SHAKE-256 digest
     <out>.header.bin    canonical BlockHeaderV4 (little-endian, spec order)
 
@@ -52,6 +60,7 @@ fn run() -> Result<(), String> {
 
     let carry_path = arg(&args, "--carryover")?;
     let digest_hex = arg(&args, "--carryover-shake256")?;
+    let cohort_path = arg(&args, "--cohort")?;
     let out_base = arg(&args, "--out")?;
     let addrs = BucketAddrs {
         founder: arg(&args, "--founder")?,
@@ -71,9 +80,12 @@ fn run() -> Result<(), String> {
     }
     let text = std::fs::read_to_string(&carry_path)
         .map_err(|e| format!("cannot read {carry_path}: {e}"))?;
+    let cohort_text = std::fs::read_to_string(&cohort_path)
+        .map_err(|e| format!("cannot read {cohort_path}: {e}"))?;
 
     let carry = read_carryover(&text)?;
-    let genesis = build_genesis(&carry, &addrs, &expected)?;
+    let cohort = read_cohort(&cohort_text)?;
+    let genesis = build_genesis(&carry, &addrs, &cohort, &expected)?;
     let doc = render_document(&genesis);
     let doc_digest = document_digest(&doc);
     let header = genesis_header(&genesis);
@@ -91,8 +103,12 @@ fn run() -> Result<(), String> {
     println!("carryover artifact   : {carry_path}");
     println!("  digest (verified)  : {}", hex::encode(carry.digest));
     println!("  holders            : {}", carry.rows.len());
-    println!("  issued             : {} BLCH", bloch(genesis.carryover_issued_sat));
-    println!("  cap headroom unissued: {} BLCH", bloch(genesis.carryover_unissued_sat));
+    println!("  issued             : {} BLCH (the whole measured ledger — cap retired)", bloch(genesis.carryover_issued_sat));
+    println!();
+    println!("genesis cohort       : {cohort_path}");
+    println!("  validators         : {}", genesis.validators.len());
+    println!("  bonded stake       : {} BLCH (funded from liquidity, §3.3.1)", bloch(genesis.cohort_stake_sat));
+    println!("  cohort_root        : {}", hex::encode(cohort_root(&genesis)));
     println!();
     for o in genesis.outputs.iter().filter(|o| o.bucket != "holder") {
         println!(
