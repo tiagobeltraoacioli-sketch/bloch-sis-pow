@@ -1,0 +1,26 @@
+# Canonical author identity.
+#
+# Every commit in this repository is by one person. The name recorded in the
+# commit objects changed over time — the project was called GroundState before
+# it was called Bloch, and some commits were made by build and PMO automation
+# running under the same author. This file maps all of those to the canonical
+# identity, so `git log`, `git shortlog` and `git blame` show one contributor
+# instead of six.
+#
+# It is deliberately a mailmap and not a history rewrite. Rewriting would change
+# every commit hash from the genesis commit onward, break every clone, and
+# invalidate the dozens of commit references cited in docs/, ADRs and
+# post-mortems. The old names in the objects are the record of what actually
+# happened; this file is how the record is read, not an edit to it.
+#
+# Note the one thing it does not do: GitHub's web interface renders the raw
+# author from the commit object and does not consult .mailmap, so commits
+# already pushed keep displaying their original name there. Git itself, and
+# every tool that uses it, honours this file.
+
+Tiago Acioli <tiagobeltraoacioli@gmail.com> Groundstate100 <groundstate100@users.noreply.github.com>
+Tiago Acioli <tiagobeltraoacioli@gmail.com> Groundstate100 <founder@posternlabs.com>
+Tiago Acioli <tiagobeltraoacioli@gmail.com> Bloch-SIS PoW <bloch-sis-main@proton.me>
+Tiago Acioli <tiagobeltraoacioli@gmail.com> Bloch-SIS Protocol <protocol@bloch-sis>
+Tiago Acioli <tiagobeltraoacioli@gmail.com> postern-pmo <pmo@posternlabs.com>
+Tiago Acioli <tiagobeltraoacioli@gmail.com> postern-build <build@postern.local>
