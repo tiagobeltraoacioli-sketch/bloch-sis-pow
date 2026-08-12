@@ -27,6 +27,14 @@ this document is its design rationale and method-level disposition. Freeze the
 OpenAPI file early in the gap — explorer, three wallets, two generated SDKs
 and the L2 all fan out from it (ecosystem plan §8.1).
 
+> **Note, 2026-08-11 (after this draft).** The founder decided EVM runs **at
+> L1, with no rollup**, and Ustav becomes a consensus object — so every
+> reference below to "the L2" as a consumer (the anchor/bridge finality
+> predicate on `getchaininfo`, the fan-out above) is superseded: `bloch-l2-evm`
+> is being replaced, not re-pointed. The methods themselves stand; the L1-EVM
+> surface (eth-namespace or not, account-model queries) is a **new, unscoped
+> addition** to this document, owned by the 2026-08-11 wave.
+
 ---
 
 ## 0. Rules that shape every method

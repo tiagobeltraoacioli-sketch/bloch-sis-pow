@@ -41,13 +41,13 @@ Two entities, because a third has to earn its existence:
 
 | Allocation | Custody | Note |
 |---|---|---|
-| Founder 17% | Founder personally, or a holding company | Vesting is consensus-enforced either way; the wrapper is a tax question, not a protocol one |
+| Founder grant 10% | Founder personally, or a holding company | Vesting is consensus-enforced either way; the wrapper is a tax question, not a protocol one. (An earlier draft said 17%; cut 2026-08-11, difference to validators) |
 | VC 10% | **Foundation**, until sold | The Foundation is the counterparty of the round |
 | Team 10% | **Foundation**, distributed to individuals on grant | Individuals hold their own once granted |
 | Marketing 4% | **Foundation** | |
 | Liquidity 5% | **Foundation** | Deployed to exchanges and AMMs at genesis |
-| Carryover ≤ 0.3% | Holders themselves | Nobody's to hold |
-| Validators 53.7% | Nobody — emitted | Never in anyone's custody, which is the point |
+| Carryover 17.97% | Holders themselves — the founder's carried-over balance is ~16.89 points of it | Nobody else's to hold |
+| Validators 43.03% | Nobody — emitted | Never in anyone's custody, which is the point. (An earlier draft said 53.7%, a 100-billion-era figure) |
 
 The Foundation therefore holds **29% of supply** at genesis, most of it vesting.
 It is the largest single holder for the entire first decade. Everything in §5
@@ -127,7 +127,8 @@ converts it from a private decision into a public one.
    Singapore are the other common choices. A Brazilian founder and a Brazilian
    operating company make the tax treatment of a foreign non-profit a real
    question — controlled-foreign-company rules, transfer pricing on the grants,
-   and the founder's personal position on a 17% allocation. This needs Brazilian
+   and the founder's personal position on his allocation (the vested grant
+   plus the carried-over balance). This needs Brazilian
    and local counsel together, and the answer may change the structure rather
    than just its address.
 2. **Who actually sells to the funds** — the Foundation directly, or an SPV.

@@ -19,7 +19,7 @@ V2 nominal, after a draft at 100 billion.
 
 **The whole carryover comes across as one balance set, with no founder line.**
 Those coins were mined, on the same chain, under the same rules as everyone
-else's — so they are carried the same way, as ordinary liquid balance. The founder additionally receives a new 17% grant under
+else's — so they are carried the same way, as ordinary liquid balance. The founder additionally receives a new grant under
 a 10-year cliff and 40-year linear vest — the V2 premine schedule, at 10% rather
 than the V2 17%.
 
@@ -410,14 +410,20 @@ A draft that cliffed the founder's entire position bought a genesis where the
 founder held no spendable stake at all; carrying the balance across liquid gives
 that up.
 
-Two things soften it and should be said alongside the number. The new 17% grant
-is locked for a decade and vests across forty years — far beyond any market
-benchmark, and the strictest schedule on the chain. And the §4.1 machinery
-distinguishes **liquid** from **stakeable**: a carried-over balance can be
-spendable while remaining ineligible to stake. Keeping the carryover liquid does
-not by itself decide that it votes. That is a separate decision, still open, and
-it is the one that determines whether the activation gates are reachable before
-year five.
+Two things soften it and should be said alongside the number. The new founder
+grant is locked for a decade and vests across forty years — far beyond any
+market benchmark, and the strictest schedule on the chain. And the §4.1
+machinery distinguishes **liquid** from **stakeable**: a carried-over balance
+can be spendable while remaining ineligible to stake. Keeping the carryover
+liquid does not by itself decide that it votes.
+
+> **Decided 2026-08-11 (founder).** A carried-over balance that is liquid is
+> **also stakeable**. The liquid-vs-stakeable distinction stays available in
+> the machinery, but it is not applied against the carryover — so the gate
+> arithmetic in this section must be read with carried-over founder stake able
+> to activate from slot 0, subject only to the churn rate limit
+> (`WARMUP_RATE_BPS`, `delegation.rs`) and the §4.1 caps. Implementation is
+> with A5 on the 2026-08-11 wave.
 
 ---
 
@@ -560,7 +566,7 @@ Four rules make delegation safe to add:
 
 | Rule | Value | Why |
 |---|---|---|
-| Warm-up / cool-down rate limit | 9% of active stake per epoch | Committees are stake-weighted, so instant activation is instant control. Matches Solana |
+| Warm-up / cool-down rate limit | `WARMUP_RATE_BPS` of active stake per epoch (25 bps since 2026-08-11; the original 900 — Solana's numeral on a ~180× faster epoch clock — was retired, see `BLOCH-POS-STAKE-CHURN.md`) | Committees are stake-weighted, so instant activation is instant control |
 | Delegated stake counts toward the per-validator cap | 1% of active stake | Delegation must not be a route around §4.1 |
 | Delegators are exposed to slashing | pro-rata | Otherwise delegation is all yield and no risk, and nobody cares who they delegate to |
 | Tainted coins cannot delegate | — | §4.1 follows coins, not accounts; otherwise delegation launders eligibility |
@@ -578,12 +584,17 @@ first cut:
   safe to specify — clamping only lowers the total, which only lowers the cap,
   so it is monotone and converges — and the round count is fixed so every node
   stops at the same number.
-- **The rate limit needs a liveness escape.** A strict 9% budget deadlocks
-  forever on any single delegation larger than 9% of active stake, which on a
-  young network is most of them, and deadlocks at genesis where active stake is
-  zero. Genesis is unlimited, and thereafter the head of the queue always
-  progresses even if it exceeds the budget — bounding disruption to one record
-  per epoch while guaranteeing the queue drains.
+- **The rate limit needs a liveness escape — and the first escape was wrong.**
+  A strict budget deadlocks forever on any single delegation larger than one
+  epoch's budget (on a young network, most of them) and deadlocks at genesis,
+  where active stake is zero. The first cut let the head of the queue activate
+  **whole**, whatever its size; the threat model (F3) showed that escape
+  defeats the cap for exactly the large records it exists to slow. Superseded
+  2026-08-11 by **partial activation**: a large delegation activates in slices
+  across epochs, the cap holds absolutely, genesis stays unlimited, and the
+  budget gained a floor — `MIN_CHURN_SAT` (= `MIN_DEPOSIT_SAT`), which
+  replaced `MIN_DELEGATION_SAT` when the rate dropped to 25 bps — so a drain
+  terminates (`delegation.rs`).
 
 **Decentralisation cuts both ways**, and this is now measurable rather than
 asserted: `Registry::top_share_bps` and `Registry::nakamoto_coefficient` compute

@@ -4,8 +4,11 @@
 
 ```
 Document:   BLOCH-POS-STAKE-CHURN
-Status:     ASSESSMENT + PROPOSAL — parameter change recommended, not applied;
-            WARMUP_RATE_BPS is consensus and the change is a founder decision
+Status:     ACCEPTED AND APPLIED (founder decision, 2026-08-11) — the
+            recommendation below landed in delegation.rs: WARMUP_RATE_BPS
+            900 -> 25 and churn floor MIN_DELEGATION_SAT -> MIN_CHURN_SAT
+            (= MIN_DEPOSIT_SAT). The 900-bps figures in the body are the
+            OLD values, kept as the record of why they were retired
 Created:    2026-08-11
 Owner:      A6
 Responds:   BLOCH-POS-THREAT-MODEL.md §F8

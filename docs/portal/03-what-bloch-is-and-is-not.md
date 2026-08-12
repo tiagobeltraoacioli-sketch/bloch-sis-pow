@@ -1,5 +1,12 @@
 # What Bloch is / is NOT today
 
+> **SUPERSEDED FRAMING — 2026-08-11.** Genesis-3 page. Three claims below are
+> retracted: **"ownerless"** (ADR-036 — issuer + two-entity foundation);
+> **"prescribes no VM, no L2 model"** (founder decision: native **EVM at L1**,
+> no rollup, and **Ustav as a consensus object**); and the permanence of PoW
+> (Genesis-3 halts at height 80,000; Genesis-4 is PoS). See
+> [index](index.md).
+
 > **Honesty rails (full text in [index](index.md)):** unaudited mainnet-beta;
 > relaxed PoW (**k=4**) → work is **trivially forgeable**; small,
 > **51%-attackable** network. Bloch is **ownerless / neutral / agnostic**;

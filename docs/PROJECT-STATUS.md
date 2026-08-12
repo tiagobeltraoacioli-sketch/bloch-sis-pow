@@ -1,5 +1,13 @@
 # Bloch-SIS — project status (consolidation checkpoint)
 
+> **SUPERSEDED FRAMING — 2026-08-11.** This status describes the Genesis-3
+> PoW project. Since it was written: the **ownerless thesis was retracted**
+> (ADR-036 — issuer + two-entity foundation,
+> `docs/specs/BLOCH-ENTITY-STRUCTURE.md`), Genesis-3 **halts at height
+> 80,000** and Genesis-4 relaunches as PoS (Tokenomics V4), the PoS crates are
+> **AGPL-3.0-or-later**, and the EVM moves to **L1** (no L2). Read
+> "ownerless / commons / 17% premine" claims below as historical.
+
 Single source of truth for what exists, what's verified, and what's open.
 Bloch-SIS is a **post-quantum, pure-Proof-of-Work BlockDAG L1** whose PoW is a
 **SHAKE-256 hashcash with a Module-SIS structural gate** — the gate binds the

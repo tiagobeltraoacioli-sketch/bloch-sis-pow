@@ -101,7 +101,12 @@ has read §0 and still wants the migration designed and staffed.
   forces on the staking design.
 - The premine vesting schedule (10,368,000-block cliff + 480 monthly tranches).
   Premine ineligibility is retired with the taint machinery — see §4.
-- Any L2/EVM change beyond re-pointing its anchor to the new finality signal.
+- ~~Any L2/EVM change beyond re-pointing its anchor to the new finality
+  signal.~~ **Superseded 2026-08-11 (founder):** Bloch runs the EVM **at the
+  base layer**, with no rollup — `bloch-l2-evm` (chainId 8400) is being
+  replaced, not re-pointed — and the Ustav charter standard is promoted to a
+  consensus object. Both consequences are being designed on the 2026-08-11
+  wave (fleet brief); this document deliberately does not specify them.
 
 ### 1.3 What this document does not claim
 
@@ -192,9 +197,10 @@ they bite:
 Not coin marking. Three things, in descending order of how much they actually
 do:
 
-1. **The allocation itself.** The founder's new grant is 17% under a 10-year
-   cliff and 40-year linear vest — the strictest schedule on the chain, far
-   beyond any market benchmark.
+1. **The allocation itself.** The founder's new grant is 10% (cut from 17% on
+   2026-08-11, an earlier draft's figure) under a 10-year cliff and 40-year
+   linear vest — the strictest schedule on the chain, far beyond any market
+   benchmark.
 2. **Vesting on the Foundation buckets.** VC and team hold nothing liquid at
    genesis; marketing releases a quarter; liquidity is liquid by function
    (`BLOCH-TOKENOMICS-V4.md` §7B).
@@ -216,11 +222,17 @@ liquid gave that up. The tokenomics document states the year-by-year figures
 (§4A); this document's job is only to record that the gates in §11 are what
 enforce it, and that they are not met at launch.
 
-One distinction stays available and is still undecided: **liquid is not the
-same as stakeable**. A carried-over balance can be spendable while remaining
-ineligible to stake. Nothing about carrying it across liquid decides that it
-votes, and that decision is what determines whether the gates are reachable
-before year five.
+One distinction stays available in the machinery: **liquid is not the same as
+stakeable**. A carried-over balance can be spendable while remaining
+ineligible to stake, and nothing about carrying it across liquid decides by
+itself that it votes.
+
+> **Decided 2026-08-11 (founder).** A carried-over balance that is liquid is
+> **also stakeable**. The distinction above is not applied against the
+> carryover, so the gate arithmetic must be read with carried-over stake able
+> to activate from slot 0, rate-limited only by the churn budget
+> (`WARMUP_RATE_BPS`, floor `MIN_CHURN_SAT` — `delegation.rs`) and capped by
+> §4.1. Implementation is with A5 on the 2026-08-11 wave.
 
 ---
 
@@ -985,9 +997,10 @@ engineering.
    is the only lever, and pulling it requires reversing the constraint.
 4. ~~**Taint set permanence and the two-class coin.**~~ **Dissolved.** The
    carryover crosses as one undifferentiated set, so no coin is marked and none
-   is second-class. What replaced the question is narrower and still open:
-   whether a carried-over balance that is *liquid* is also *stakeable* (§4.2).
-   That one decides whether the gates are reachable before year five.
+   is second-class. ~~What replaced the question is narrower and still open:
+   whether a carried-over balance that is *liquid* is also *stakeable* (§4.2).~~
+   **Decided 2026-08-11 (founder):** liquid carryover is **also stakeable**
+   (§4.2 decision note; implementation with A5).
 5. ~~**Weak subjectivity** — who signs the checkpoint in an ownerless system?~~
    **Answered by [ADR-036](../adr/ADR-036-retract-ownerless-adopt-foundation.md):**
    the ownerless premise is retracted and the Foundation publishes checkpoints.
@@ -1031,7 +1044,7 @@ it succeeds.
 
 Decided by the founder on 2026-08-11. The question was forced by
 `bloch-crypto` being AGPL-3.0-or-later while the new PoS crates were declared
-MIT OR Apache-2.0: AGPL is viral, so the moment the Genesis-4 node links it for
+MIT OR Apache-2.0 (since retired): AGPL is viral, so the moment the Genesis-4 node links it for
 ML-DSA/Falcon verification, the whole binary inherits AGPL regardless of what
 the leaf crates say. The two ways out were to take AGPL for the node, or to
 re-extract the PQ verify surface into a compatibly-licensed leaf. AGPL was
@@ -1074,7 +1087,7 @@ crate to preserve a permissive licence nobody asked for. `bloch-pos-committee`,
 | ASIC fleet (S19j Pro, 100 TH/s) | No longer usable for Bloch; disposition decision needed |
 | Explorer (`blochl1.com`) | New header fields, finality display, DAG→linear seam |
 | Wallet / PWA | Deposit/exit UX, staking views |
-| L2 (`bloch-l2-evm`, chainId 8400) | Anchor to finalized checkpoints instead of PoW depth |
+| L2 (`bloch-l2-evm`, chainId 8400) | ~~Anchor to finalized checkpoints instead of PoW depth~~ **Superseded 2026-08-11: replaced by EVM at L1** (§1.2 note; fleet brief) |
 | SDKs (Python, Go), OpenAPI | Header schema, new RPCs |
 | Node operators | Mandatory upgrade; clean partition if they do not |
 | Snapshot / onboarding runbook | Sync-from-finalized-checkpoint replaces k=8 DAG snapshot |
