@@ -41,6 +41,7 @@ RETIRED = [
     ("33.89%",           "total do fundador antigo", "26.89%"),
     ("36.03%",           "share de validador antigo","43.03%"),
     ("5,181.54",         "decay ano 1 (100 bi)",     "871.90"),
+    ("5,450,564,151",    "emissao ano 1 (100 bi)",   "917,168,073"),
     ("730.06",           "decay ano 1 (21 bi, 17%)", "871.90"),
     ("6,387",            "halving R0 (100 bi)",      "1,075"),
     ("1,276 BLCH",       "flat (100 bi)",            "215 BLCH"),

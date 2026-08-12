@@ -55,6 +55,7 @@ pub mod attestation;
 pub mod beacon;
 pub mod committees;
 pub mod delegation;
+pub mod fee_market;
 pub mod genesis_cohort;
 pub mod finality;
 pub mod forkchoice;
@@ -98,6 +99,10 @@ pub use header::{BlockEnvelope, BlockHeaderV4, BlockId, Body, DecodeError, VERSI
 pub use interfaces::{
     FinalityGadget, ProposerDuties, RandomnessBeacon, SlashingRules, StakingLifecycle,
     StateCommitment, StateReader, StateTransition,
+};
+pub use fee_market::{
+    distribute_producer_fees, fee_parts_sat, intrinsic_gas, next_base_fee, BlockUsage, TxClass,
+    BLOCK_GAS_LIMIT, MAX_BLOCK_TX_BYTES, MIN_BASE_FEE_MILLISAT_PER_GAS,
 };
 pub use finality::{EpochOutcome, EpochVotes, FinalityError};
 pub use produce::{produce, ProduceError, ProducerRandao, ProposerSigner};

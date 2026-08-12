@@ -372,13 +372,16 @@ pub const fn validator_reward_halving_sat(slot: u64) -> u128 {
 /// Why 10% and not something else — it is the only round rate that satisfies
 /// both live constraints at once:
 ///
-/// - **Inflation target.** Year 1 emits 5,450,564,151 BLCH = **5.45% of total
-///   supply**, against the founder's "under 7%" requirement. Year 5 is 3.58%,
-///   year 10 is 2.11%.
-/// - **Decentralisation.** An 8%/year decline drops to 4.45% inflation but is
+/// - **Inflation target.** Year 1 emits 917,168,073 BLCH = **4.37% of total
+///   supply** (`annual_inflation_bps(0)` = 436), against the founder's
+///   "under 7%" requirement. Year 5 is 2.86%, year 10 is 1.69%.
+/// - **Decentralisation.** An 8%/year decline drops year 1 to 3.57% but is
 ///   too flat: validators stop out-earning the insider unlock schedule and the
-///   25%-of-stake gate is breached at month 36. 12%/year passes the gate but
-///   puts year 1 at 6.48%, uncomfortably close to the ceiling. 10% clears both.
+///   25%-of-stake gate is breached at month 36. 12%/year passes the gate at
+///   5.19% in year 1. At the 21 B supply neither rate presses the 7% ceiling
+///   (both did at the superseded 100 B draft, where 12% sat at 6.48%); what
+///   decides between them now is the gate, and 10% clears it with margin on
+///   both sides.
 ///
 /// Preferred over halving because a halving is a scheduled date on which every
 /// validator's revenue drops by half at once, and marginal operators leave
