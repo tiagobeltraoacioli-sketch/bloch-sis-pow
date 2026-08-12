@@ -166,6 +166,29 @@
       how everyone verifies they are running the same rules.
     </p>
   </div>
+  <div class="cards" style="margin-bottom:1.5rem">
+    <div class="card a">
+      <span class="tag">GitHub</span>
+      <h3><a href="https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow">bloch-sis-pow</a></h3>
+      <p>The node, the consensus crates and the proof-of-stake work, on branch
+         <code>integration/pos-modules</code>. Clone it, read it, build it &mdash; the numbers on this
+         site are the constants in that tree, and every one of them cites its file.</p>
+    </div>
+    <div class="card b">
+      <span class="tag">GitLab</span>
+      <h3><a href="https://gitlab.com/blochsispow-group/bloch-pos">blochsispow-group / bloch-pos</a></h3>
+      <p>The working mirror where the Genesis-4 branches are integrated. Same commits, and the
+         CI that gates them &mdash; including the guard that fails the build if Falcon signing
+         ever leaves the constant-time path.</p>
+    </div>
+    <div class="card c">
+      <span class="tag">What is not there yet</span>
+      <h3>Read before you judge the tree</h3>
+      <p>The proof-of-stake node runs on a devnet: no transactions, no peer-to-peer stack, no
+         public RPC. 30% of code files still carry no SPDX header. Neither is hidden, and
+         both are in the audit notes in <code>docs/</code>.</p>
+    </div>
+  </div>
   <div class="card plain wide">
     <span class="tag">Where the numbers on this site live</span>
     <p style="max-width:none;font-family:var(--mono);font-size:0.85rem;line-height:1.9">
@@ -191,10 +214,11 @@
       </svg>
       Bloch Protocol
     </span>
-    <p style="margin-top:0.7rem">Postern Labs Ltda. Nothing here is investment advice.<br>Source code: AGPL-3.0-or-later.</p>
+    <p style="margin-top:0.7rem">Postern Labs Ltda. &middot; AGPL-3.0-or-later</p>
+    <p style="margin-top:0.35rem;font-size:0.86rem">Source: <a href="https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow">GitHub</a> &middot; <a href="https://gitlab.com/blochsispow-group/bloch-pos">GitLab</a></p>
   </div>
   <p style="max-width:34ch">Every figure on this site is either measured and labelled as such, or planned and labelled as such.</p>
-</div></footer>
+</div>
 
 </body>
 </html>
