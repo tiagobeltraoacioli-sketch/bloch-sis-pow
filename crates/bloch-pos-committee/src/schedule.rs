@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Slot/epoch scheduling and proposer assignment (§5.1, §5.2 of the migration
 //! design).

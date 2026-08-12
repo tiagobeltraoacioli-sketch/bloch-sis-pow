@@ -1,0 +1,1363 @@
+diff --git a/pool-proxy/src/lib.rs b/pool-proxy/src/lib.rs
+index 593568e..5c4a251 100644
+--- a/pool-proxy/src/lib.rs
++++ b/pool-proxy/src/lib.rs
+@@ -9,6 +9,8 @@ pub mod rpc;
+ /// Merged mining (AuxPoW): pull a parent Bitcoin template and, on a Bloch-target
+ /// win, produce the AuxPoW blob the Bloch node accepts. SCAFFOLD (see
+ /// docs/MERGED-MINING.md); format pinned to `bloch-crypto::core::auxpow`.
++/// Payout-address parsing for the open (non-custodial) merged pool.
++pub mod addr;
+ pub mod btc_rpc;
+ /// Bitcoin block serialization primitives (vector-tested against the genesis
+ /// block + BIP CompactSize/BIP141) for the merged-mining BTC-relay path.
+diff --git a/pool-proxy/src/merged_engine.rs b/pool-proxy/src/merged_engine.rs
+index c05e90c..9e4f384 100644
+--- a/pool-proxy/src/merged_engine.rs
++++ b/pool-proxy/src/merged_engine.rs
+@@ -22,7 +22,11 @@ use crate::mergedmining::{build_merged_job, MergedClassification, MergedJob, Mer
+ use crate::rpc::{AuxBlockInfo, RpcClient};
+ use crate::types::PoolError;
+ 
+-/// Operator config for a merged-mining round.
++/// Operator config for a merged-mining round. In an OPEN pool these two payout
++/// fields are only the FALLBACK: a worker that declares its own addresses in the
++/// Stratum username (see [`crate::addr::parse_worker_username`]) gets a round
++/// built with [`MergedConfig::with_payout`], so its blocks pay itself and the
++/// pool never custodies a reward.
+ #[derive(Clone, Debug)]
+ pub struct MergedConfig {
+     /// Bloch payout address — the node's coinbase pays this (via `createauxblock`).
+@@ -33,6 +37,31 @@ pub struct MergedConfig {
+     pub coinbase_tag: Vec<u8>,
+ }
+ 
++impl MergedConfig {
++    /// This config with the payout targets replaced by one worker's own. A `None`
++    /// BTC script keeps the operator's (the worker declared only a Bloch address).
++    pub fn with_payout(&self, bloch_addr: &str, btc_script: Option<&[u8]>) -> Self {
++        Self {
++            pool_bloch_addr: bloch_addr.to_string(),
++            btc_payout_script: btc_script
++                .map(<[u8]>::to_vec)
++                .unwrap_or_else(|| self.btc_payout_script.clone()),
++            coinbase_tag: self.coinbase_tag.clone(),
++        }
++    }
++}
++
++/// One merged round: the two chains' work, plus the parent-BTC transactions the
++/// header commits to (needed verbatim to relay a BTC-target win — the block body
++/// must contain exactly the txs whose txids are in the job's merkle branch).
++#[derive(Clone, Debug)]
++pub struct MergedRound {
++    pub aux: AuxBlockInfo,
++    pub job: MergedJob,
++    /// Raw (witness-carrying) serializations of the template's non-coinbase txs.
++    pub btc_txs: Vec<Vec<u8>>,
++}
++
+ /// Encode `height` as a BIP34 coinbase scriptSig prefix: a length-prefixed,
+ /// minimally-encoded little-endian script number. bitcoind requires the
+ /// coinbase scriptSig to begin with this.
+@@ -90,16 +119,22 @@ fn varint(n: u64) -> Vec<u8> {
+ /// tx stays well-formed once the miner fills the extranonce. Returns
+ /// `(prefix_without_commitment, suffix)`.
+ ///
+-/// NOTE (scaffold): a single payout output, non-segwit serialization (the txid
+-/// the merkle tree uses). For the RARE BTC-target win that must be relayed to
+-/// bitcoind as a full block, the pool additionally needs the segwit witness
+-/// commitment output — see [`decide_submit`].
++/// `witness_commitment_spk` is the BIP141 `OP_RETURN aa21a9ed …` output script
++/// (`default_witness_commitment` from `getblocktemplate`). It is REQUIRED on any
++/// segwit-active chain: the relayed block carries the coinbase witness, and
++/// bitcoind rejects a block with witness data whose coinbase does not commit to
++/// it (`unexpected-witness`). Pass `None` only for a pre-segwit parent.
++///
++/// The serialization is the non-witness (txid) form — what the merkle tree and
++/// the AuxPoW fold; [`crate::btc_block::build_segwit_block_hex`] adds the witness
++/// to the relayed body only.
+ pub fn btc_coinbase_parts(
+     height: u64,
+     payout_script: &[u8],
+     coinbase_value: u64,
+     tag: &[u8],
+     extranonce_len: usize,
++    witness_commitment_spk: Option<&[u8]>,
+ ) -> (Vec<u8>, Vec<u8>) {
+     const COMMITMENT_LEN: usize = 44; // fabe6d6d ‖ hash(32) ‖ size(4) ‖ nonce(4)
+     let height_push = bip34_height_push(height);
+@@ -117,10 +152,17 @@ pub fn btc_coinbase_parts(
+ 
+     let mut suffix = Vec::new();
+     suffix.extend_from_slice(&0xffff_ffffu32.to_le_bytes()); // sequence
+-    suffix.extend_from_slice(&varint(1)); // vout count
++    let vout_count = 1 + u64::from(witness_commitment_spk.is_some());
++    suffix.extend_from_slice(&varint(vout_count)); // vout count
+     suffix.extend_from_slice(&coinbase_value.to_le_bytes()); // output value
+     suffix.extend_from_slice(&varint(payout_script.len() as u64)); // spk length
+     suffix.extend_from_slice(payout_script); // payout scriptPubKey
++    if let Some(wc) = witness_commitment_spk {
++        // BIP141 commitment output — zero value, OP_RETURN.
++        suffix.extend_from_slice(&0u64.to_le_bytes());
++        suffix.extend_from_slice(&varint(wc.len() as u64));
++        suffix.extend_from_slice(wc);
++    }
+     suffix.extend_from_slice(&0u32.to_le_bytes()); // locktime
+ 
+     (prefix, suffix)
+@@ -139,7 +181,10 @@ fn hex32_reversed(s: &str) -> Option<[u8; 32]> {
+     Some(a)
+ }
+ 
+-/// Assemble the [`MergedJob`] for one round from the two templates.
++/// Assemble the [`MergedJob`] for one round from the two templates. The coinbase
++/// carries the template's `default_witness_commitment` when the parent is segwit
++/// (bitcoind computes it over the template's tx set; the coinbase's own wtxid is
++/// defined as all-zeros, so it does not depend on our coinbase bytes).
+ pub fn build_round_job(
+     job_id: String,
+     aux: &AuxBlockInfo,
+@@ -148,8 +193,15 @@ pub fn build_round_job(
+     tag: &[u8],
+     extranonce_len: usize,
+ ) -> MergedJob {
+-    let (prefix, suffix) =
+-        btc_coinbase_parts(tmpl.height, payout_script, tmpl.coinbase_value, tag, extranonce_len);
++    let wc = tmpl.default_witness_commitment.as_deref().and_then(|h| hex::decode(h).ok());
++    let (prefix, suffix) = btc_coinbase_parts(
++        tmpl.height,
++        payout_script,
++        tmpl.coinbase_value,
++        tag,
++        extranonce_len,
++        wc.as_deref(),
++    );
+     let other_txids: Vec<[u8; 32]> = tmpl
+         .transactions
+         .iter()
+@@ -178,6 +230,10 @@ pub enum SubmitAction {
+     Share,
+     /// A Bloch-target win — submit the AuxPoW to the node.
+     Bloch { auxpow_hex: String },
++    /// A Bitcoin-target win that did NOT meet Bloch's target — relay the BTC
++    /// block only. Sending this to `submitauxblock` would just earn an
++    /// `InsufficientPow` (the common case on a regtest parent).
++    Btc { auxpow_hex: String },
+     /// A Bitcoin-target win — submit the AuxPoW to the node AND (scaffold) the
+     /// full BTC block to bitcoind.
+     BtcAndBloch { auxpow_hex: String },
+@@ -193,6 +249,10 @@ pub fn decide_submit(c: &MergedClassification) -> SubmitAction {
+             Some(b) => SubmitAction::Bloch { auxpow_hex: hex::encode(b) },
+             None => SubmitAction::Share, // defensive: no blob → treat as a share
+         },
++        MergedWin::Btc => match &c.auxpow_blob {
++            Some(b) => SubmitAction::Btc { auxpow_hex: hex::encode(b) },
++            None => SubmitAction::Share,
++        },
+         MergedWin::BtcAndBloch => match &c.auxpow_blob {
+             Some(b) => SubmitAction::BtcAndBloch { auxpow_hex: hex::encode(b) },
+             None => SubmitAction::Share,
+@@ -208,11 +268,14 @@ pub async fn create_round(
+     cfg: &MergedConfig,
+     job_id: String,
+     extranonce_len: usize,
+-) -> Result<(AuxBlockInfo, MergedJob), PoolError> {
++) -> Result<MergedRound, PoolError> {
++    // `cfg` here is already the WORKER's effective config, so the node builds a
++    // candidate whose coinbase pays that worker's Bloch address.
+     let aux = node.create_aux_block(&cfg.pool_bloch_addr).await?;
+     let tmpl = btc.get_block_template().await?;
+     let job = build_round_job(job_id, &aux, &tmpl, &cfg.btc_payout_script, &cfg.coinbase_tag, extranonce_len);
+-    Ok((aux, job))
++    let btc_txs = tmpl.transactions.iter().map(|(_, raw)| raw.clone()).collect();
++    Ok(MergedRound { aux, job, btc_txs })
+ }
+ 
+ /// Perform the submit(s) for a classified win. Returns the node's accepted block
+@@ -230,36 +293,49 @@ pub async fn submit_win(
+     btc: &BtcRpcClient,
+     aux_hash: &[u8; 32],
+     action: &SubmitAction,
++    btc_txs: &[Vec<u8>],
+ ) -> Result<Option<String>, PoolError> {
+     match action {
+         SubmitAction::Bloch { auxpow_hex } => Ok(Some(node.submit_aux_block(aux_hash, auxpow_hex).await?)),
++        SubmitAction::Btc { auxpow_hex } => {
++            relay_btc(btc, auxpow_hex, btc_txs).await;
++            Ok(None)
++        }
+         SubmitAction::BtcAndBloch { auxpow_hex } => {
+-            // Bloch side first (authoritative).
+-            let h = node.submit_aux_block(aux_hash, auxpow_hex).await?;
+-            // BTC side (best-effort relay) — reconstruct the block from the blob.
+-            if let Ok(blob) = hex::decode(auxpow_hex) {
+-                if let Some((_hash, header, coinbase)) =
+-                    crate::btc_block::header_and_coinbase_from_auxpow(&blob)
+-                {
+-                    // BIP144 segwit block: the coinbase carries its witness (the
+-                    // all-zero reserved value) so bitcoind can verify the witness
+-                    // commitment. Empty-block relay (no mempool txs); a non-empty
+-                    // relay would pass the template's raw txs as `other_txs`.
+-                    let block_hex = crate::btc_block::build_segwit_block_hex(&header, &coinbase, &[0u8; 32], &[])
+-                        .unwrap_or_else(|| crate::btc_block::build_block_hex(&header, &coinbase, &[]));
+-                    match btc.submit_block(&block_hex).await {
+-                        Ok(None) => log::info!("merged: BTC block relayed to bitcoind"),
+-                        Ok(Some(reason)) => log::warn!("merged: bitcoind rejected BTC block: {reason}"),
+-                        Err(e) => log::warn!("merged: submitblock failed: {e}"),
+-                    }
+-                }
+-            }
+-            Ok(Some(h))
++            // Bloch side first (authoritative), then the BTC relay regardless of
++            // what the node said — the two chains' acceptances are independent.
++            let bloch = node.submit_aux_block(aux_hash, auxpow_hex).await;
++            relay_btc(btc, auxpow_hex, btc_txs).await;
++            Ok(Some(bloch?))
+         }
+         SubmitAction::Share | SubmitAction::Nothing => Ok(None),
+     }
+ }
+ 
++/// Best-effort relay of a BTC-target win, rebuilt from the same blob handed to
++/// the node: parent header + the exact coinbase the miner hashed + the template's
++/// transactions (the header's merkle root commits to ALL of them, so the body
++/// must carry them verbatim — relaying only the coinbase would be
++/// `bad-txnmrklroot`).
++async fn relay_btc(btc: &BtcRpcClient, auxpow_hex: &str, btc_txs: &[Vec<u8>]) {
++    let Ok(blob) = hex::decode(auxpow_hex) else { return };
++    let Some((_hash, header, coinbase)) = crate::btc_block::header_and_coinbase_from_auxpow(&blob)
++    else {
++        return;
++    };
++    // BIP144 segwit block: the coinbase carries its witness (the all-zero
++    // reserved value), which bitcoind checks against the witness-commitment
++    // output `btc_coinbase_parts` put in that same coinbase.
++    let block_hex =
++        crate::btc_block::build_segwit_block_hex(&header, &coinbase, &[0u8; 32], btc_txs)
++            .unwrap_or_else(|| crate::btc_block::build_block_hex(&header, &coinbase, btc_txs));
++    match btc.submit_block(&block_hex).await {
++        Ok(None) => log::info!("merged: BTC block relayed to bitcoind ({} txs)", btc_txs.len() + 1),
++        Ok(Some(reason)) => log::warn!("merged: bitcoind rejected BTC block: {reason}"),
++        Err(e) => log::warn!("merged: submitblock failed: {e}"),
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -284,7 +360,7 @@ mod tests {
+         let payout = vec![0x76, 0xa9, 0x14]; // stub P2PKH prefix
+         let tag = b"bloch/pool";
+         let en_len = 8;
+-        let (prefix, suffix) = btc_coinbase_parts(5_600, &payout, 625_000_000, tag, en_len);
++        let (prefix, suffix) = btc_coinbase_parts(5_600, &payout, 625_000_000, tag, en_len, None);
+ 
+         // Reassemble the coinbase the miner would: prefix ‖ commitment(44) ‖ en ‖ suffix.
+         let commitment = crate::mergedmining::merge_mining_commitment([0x9A; 32]);
+@@ -317,6 +393,55 @@ mod tests {
+         assert_eq!(&tail[tail.len() - 4..], &0u32.to_le_bytes()); // locktime
+     }
+ 
++    /// The regression for `unexpected-witness`: on a segwit parent the coinbase
++    /// MUST carry the BIP141 commitment output, because the relayed block body
++    /// carries the coinbase witness. Two outputs, the second an OP_RETURN
++    /// aa21a9ed of zero value.
++    #[test]
++    fn segwit_parent_coinbase_carries_the_witness_commitment_output() {
++        let payout = crate::addr::btc_address_to_spk("bc1qjpnqq4f6hjh2n39tzwy8ttrj4h78yx22retkyk").unwrap();
++        let wc = crate::btc_block::witness_commitment_spk(&[]); // empty block
++        let (prefix, suffix) = btc_coinbase_parts(5_600, &payout, 625_000_000, b"tag", 8, Some(&wc));
++
++        let mut cb = prefix;
++        cb.extend_from_slice(&crate::mergedmining::merge_mining_commitment([0x9A; 32]));
++        cb.extend_from_slice(&[0u8; 8]);
++        cb.extend_from_slice(&suffix);
++
++        let ss_len = cb[41] as usize;
++        let tail = &cb[42 + ss_len..];
++        assert_eq!(&tail[0..4], &0xffff_ffffu32.to_le_bytes()); // sequence
++        assert_eq!(tail[4], 0x02, "two outputs: payout + witness commitment");
++        // out0: value ‖ len ‖ payout spk
++        assert_eq!(&tail[5..13], &625_000_000u64.to_le_bytes());
++        assert_eq!(tail[13] as usize, payout.len());
++        assert_eq!(&tail[14..14 + payout.len()], &payout[..]);
++        // out1: zero value ‖ len ‖ OP_RETURN commitment
++        let o1 = 14 + payout.len();
++        assert_eq!(&tail[o1..o1 + 8], &0u64.to_le_bytes(), "commitment output pays nothing");
++        assert_eq!(tail[o1 + 8] as usize, wc.len());
++        assert_eq!(&tail[o1 + 9..o1 + 9 + wc.len()], &wc[..]);
++        assert_eq!(&tail[tail.len() - 4..], &0u32.to_le_bytes()); // locktime
++    }
++
++    /// The template's `default_witness_commitment` must reach the coinbase — the
++    /// live bug was a job built without it, so every relayed block was rejected.
++    #[test]
++    fn build_round_job_threads_the_template_witness_commitment() {
++        let aux = AuxBlockInfo { hash: [0x9A; 32], bits: 0x20ff_ffff, height: 5_600, active: true };
++        let wc = crate::btc_block::witness_commitment_spk(&[]);
++        let mut tmpl = sample_template();
++        tmpl.default_witness_commitment = Some(hex::encode(&wc));
++        let job = build_round_job("m1".into(), &aux, &tmpl, &[0x51], b"tag", 8);
++        assert!(
++            job.coinbase_suffix.windows(wc.len()).any(|w| w == wc.as_slice()),
++            "coinbase suffix must contain the template's witness commitment"
++        );
++        // Without it (pre-segwit parent) the coinbase stays single-output.
++        let job2 = build_round_job("m2".into(), &aux, &sample_template(), &[0x51], b"tag", 8);
++        assert!(!job2.coinbase_suffix.windows(6).any(|w| w == [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed]));
++    }
++
+     #[test]
+     fn build_round_job_produces_a_serveable_committed_job() {
+         let aux = AuxBlockInfo { hash: [0x9A; 32], bits: 0x20ff_ffff, height: 5_600, active: true };
+@@ -345,6 +470,7 @@ mod tests {
+                 .expect("classifies");
+         let action = decide_submit(&c);
+         match c.win {
++            MergedWin::Btc => assert!(matches!(action, SubmitAction::Btc { .. })),
+             MergedWin::Bloch | MergedWin::BtcAndBloch => {
+                 // A win → a node-ready AuxPoW hex the submit_win path forwards.
+                 let hex = match &action {
+@@ -364,6 +490,11 @@ mod tests {
+         let mk = |win, blob: Option<Vec<u8>>| MergedClassification { win, hash: [0; 32], auxpow_blob: blob };
+         assert_eq!(decide_submit(&mk(MergedWin::Reject, None)), SubmitAction::Nothing);
+         assert_eq!(decide_submit(&mk(MergedWin::Share, None)), SubmitAction::Share);
++        // A BTC-only win must NOT reach submitauxblock (that is InsufficientPow).
++        assert_eq!(
++            decide_submit(&mk(MergedWin::Btc, Some(vec![0xbb]))),
++            SubmitAction::Btc { auxpow_hex: "bb".into() }
++        );
+         assert_eq!(
+             decide_submit(&mk(MergedWin::Bloch, Some(vec![1, 2, 3]))),
+             SubmitAction::Bloch { auxpow_hex: "010203".into() }
+diff --git a/pool-proxy/src/merged_serve.rs b/pool-proxy/src/merged_serve.rs
+index 72e148e..0191d8d 100644
+--- a/pool-proxy/src/merged_serve.rs
++++ b/pool-proxy/src/merged_serve.rs
+@@ -16,9 +16,10 @@ use serde_json::Value;
+ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+ use tokio::net::TcpStream;
+ 
+-use crate::merged_engine::{create_round, decide_submit, submit_win, MergedConfig, SubmitAction};
++use crate::addr::{parse_worker_username, WorkerPayout};
++use crate::merged_engine::{create_round, decide_submit, submit_win, MergedConfig, MergedRound, SubmitAction};
+ use crate::mergedmining::{classify_merged_share, merged_job_to_notify, MergedJob};
+-use crate::rpc::{AuxBlockInfo, RpcClient};
++use crate::rpc::RpcClient;
+ use crate::btc_rpc::BtcRpcClient;
+ use crate::types::PoolError;
+ use crate::validator::difficulty_to_target;
+@@ -46,8 +47,12 @@ pub struct MergedWorker {
+     share_diff: f64,
+     worker_target: [u8; 32],
+     authorized: bool,
++    /// Where THIS worker's rewards go, parsed from the Stratum username.
++    payout: Option<WorkerPayout>,
+     round: Option<MergedJob>,
+     aux_hash: Option<[u8; 32]>,
++    /// The parent-BTC transactions the current round's header commits to.
++    btc_txs: Vec<Vec<u8>>,
+ }
+ 
+ impl MergedWorker {
+@@ -57,8 +62,10 @@ impl MergedWorker {
+             share_diff,
+             worker_target: difficulty_to_target(share_diff),
+             authorized: false,
++            payout: None,
+             round: None,
+             aux_hash: None,
++            btc_txs: Vec::new(),
+         }
+     }
+ 
+@@ -68,6 +75,14 @@ impl MergedWorker {
+     pub fn has_round(&self) -> bool {
+         self.round.is_some()
+     }
++    /// This worker's declared payout targets (set by `mining.authorize`).
++    pub fn payout(&self) -> Option<&WorkerPayout> {
++        self.payout.as_ref()
++    }
++    /// The current round's parent-BTC transactions (for a BTC-target relay).
++    pub fn btc_txs(&self) -> &[Vec<u8>] {
++        &self.btc_txs
++    }
+     /// Total extranonce length (en1 + en2) the round's coinbase must reserve.
+     pub fn extranonce_total_len() -> usize {
+         EN1_LEN + EN2_SIZE
+@@ -75,9 +90,10 @@ impl MergedWorker {
+ 
+     /// Install a fresh round (from [`create_round`]); the loop then serves
+     /// [`Self::set_difficulty_line`] + [`Self::notify_line`].
+-    pub fn set_round(&mut self, aux: &AuxBlockInfo, job: MergedJob) {
+-        self.aux_hash = Some(aux.hash);
+-        self.round = Some(job);
++    pub fn set_round(&mut self, round: MergedRound) {
++        self.aux_hash = Some(round.aux.hash);
++        self.round = Some(round.job);
++        self.btc_txs = round.btc_txs;
+     }
+ 
+     /// `mining.set_difficulty` for this worker's share difficulty.
+@@ -105,9 +121,30 @@ impl MergedWorker {
+ 
+         match method {
+             "mining.subscribe" => WorkerReaction::Send(vec![self.subscribe_reply(&id)]),
++            // OPEN pool: the username DECLARES where this worker's rewards go.
++            // Refuse rather than serve jobs whose coinbase would pay someone
++            // else — a silent fallback to the operator's address is exactly the
++            // failure mode a non-custodial pool must not have.
+             "mining.authorize" => {
+-                self.authorized = true; // solo/merged: node owns payout addr, any worker ok
+-                WorkerReaction::Send(vec![ok_true(&id)])
++                let user = params.first().and_then(Value::as_str).unwrap_or("");
++                match parse_worker_username(user) {
++                    Some(p) => {
++                        log::info!(
++                            "merged: worker authorized — bloch={} btc={} label={}",
++                            p.bloch_addr,
++                            p.btc_script.as_deref().map_or("operator-fallback".into(), hex::encode),
++                            p.label.as_deref().unwrap_or("-"),
++                        );
++                        self.payout = Some(p);
++                        self.authorized = true;
++                        WorkerReaction::Send(vec![ok_true(&id)])
++                    }
++                    None => WorkerReaction::Send(vec![err(
++                        &id,
++                        24,
++                        "username must be <bloch-address>[.<btc-address>][.<label>]",
++                    )]),
++                }
+             }
+             "mining.submit" => self.handle_submit(&id, &params),
+             // Version-rolling negotiation: accept a permissive mask so ASICs proceed.
+@@ -164,7 +201,7 @@ impl MergedWorker {
+         match &action {
+             SubmitAction::Nothing => WorkerReaction::Send(vec![err(id, 23, "share above target")]),
+             SubmitAction::Share => WorkerReaction::Send(vec![ok_true(id)]),
+-            SubmitAction::Bloch { .. } | SubmitAction::BtcAndBloch { .. } => WorkerReaction::Win {
++            SubmitAction::Bloch { .. } | SubmitAction::Btc { .. } | SubmitAction::BtcAndBloch { .. } => WorkerReaction::Win {
+                 reply: ok_true(id),
+                 aux_hash: self.aux_hash.unwrap_or([0u8; 32]),
+                 action,
+@@ -227,8 +264,11 @@ pub async fn serve_merged(
+                     }
+                     WorkerReaction::Win { reply, aux_hash, action } => {
+                         send_line(&mut wr, &reply).await?;
+-                        match submit_win(&node, &btc, &aux_hash, &action).await {
+-                            Ok(Some(h)) => log::info!("merged: BLOCH BLOCK accepted by node: {h}"),
++                        match submit_win(&node, &btc, &aux_hash, &action, worker.btc_txs()).await {
++                            Ok(Some(h)) => log::info!(
++                                "merged: BLOCH BLOCK accepted by node: {h} (payout {})",
++                                worker.payout().map_or("?", |p| p.bloch_addr.as_str()),
++                            ),
+                             Ok(None)    => {}
+                             Err(e)      => log::warn!("merged: submit_win failed: {e}"),
+                         }
+@@ -253,9 +293,15 @@ async fn start_round(
+ ) -> Result<(), PoolError> {
+     *round_ctr += 1;
+     let job_id = format!("m{round_ctr:x}");
+-    let (aux, job) =
+-        create_round(node, btc, cfg, job_id, MergedWorker::extranonce_total_len()).await?;
+-    worker.set_round(&aux, job);
++    // Build the round against THIS worker's payout targets, falling back to the
++    // operator's config only for a part the worker did not declare.
++    let effective = match worker.payout() {
++        Some(p) => cfg.with_payout(&p.bloch_addr, p.btc_script.as_deref()),
++        None => cfg.clone(),
++    };
++    let round =
++        create_round(node, btc, &effective, job_id, MergedWorker::extranonce_total_len()).await?;
++    worker.set_round(round);
+     send_line(wr, &worker.set_difficulty_line()).await?;
+     if let Some(n) = worker.notify_line(true) {
+         send_line(wr, &n).await?;
+@@ -290,10 +336,12 @@ mod tests {
+         };
+         let job = build_round_job("m1".into(), &aux, &tmpl, &[0x51], b"tag", MergedWorker::extranonce_total_len());
+         w.authorized = true;
+-        w.set_round(&aux, job);
++        w.set_round(crate::merged_engine::MergedRound { aux, job, btc_txs: vec![] });
+         w
+     }
+ 
++    const TEST_USER: &str = "bloch1qe986db5149cff7499b282a048272a09aff0af4ff84242073.bc1qjpnqq4f6hjh2n39tzwy8ttrj4h78yx22retkyk";
++
+     #[test]
+     fn subscribe_advertises_extranonce() {
+         let mut w = MergedWorker::new([0xde, 0xad, 0xbe, 0xef], 1.0);
+@@ -308,12 +356,37 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn authorize_marks_authorized_and_replies_true() {
++    fn authorize_records_the_workers_own_payout_targets() {
+         let mut w = MergedWorker::new([0; 4], 1.0);
+         assert!(!w.is_authorized());
+-        let r = w.handle_line(r#"{"id":2,"method":"mining.authorize","params":["addr","x"]}"#);
++        let r = w.handle_line(&format!(
++            r#"{{"id":2,"method":"mining.authorize","params":["{TEST_USER}","x"]}}"#
++        ));
+         assert!(matches!(r, WorkerReaction::Send(l) if l[0].contains("\"result\":true")));
+         assert!(w.is_authorized());
++        let p = w.payout().expect("payout parsed from username");
++        assert_eq!(p.bloch_addr, "bloch1qe986db5149cff7499b282a048272a09aff0af4ff84242073");
++        assert_eq!(
++            hex::encode(p.btc_script.as_ref().unwrap()),
++            "0014906600553abcaea9c4ab138875ac72adfc72194a"
++        );
++    }
++
++    /// An open pool must not mine a stranger's coinbase into the operator's
++    /// wallet: no parseable Bloch address → no authorize, no jobs.
++    #[test]
++    fn authorize_without_a_bloch_address_is_refused() {
++        let mut w = MergedWorker::new([0; 4], 1.0);
++        let r = w.handle_line(r#"{"id":2,"method":"mining.authorize","params":["addr","x"]}"#);
++        match r {
++            WorkerReaction::Send(l) => {
++                assert!(l[0].contains("username must be"), "explains the grammar: {}", l[0]);
++                assert!(l[0].contains("\"result\":null"));
++            }
++            other => panic!("expected an error reply, got {other:?}"),
++        }
++        assert!(!w.is_authorized());
++        assert!(w.payout().is_none());
+     }
+ 
+     #[test]
+diff --git a/pool-proxy/src/mergedmining.rs b/pool-proxy/src/mergedmining.rs
+index ebd1b41..839edaa 100644
+--- a/pool-proxy/src/mergedmining.rs
++++ b/pool-proxy/src/mergedmining.rs
+@@ -274,6 +274,14 @@ pub enum MergedWin {
+     /// Meets Bitcoin's target: a real BTC block AND a Bloch block — submit the
+     /// BTC block to bitcoind and the AuxPoW to the Bloch node.
+     BtcAndBloch,
++    /// Meets Bitcoin's target but NOT Bloch's — relay the BTC block only.
++    ///
++    /// On mainnet this is unreachable (Bitcoin's target is orders of magnitude
++    /// harder than Bloch's, so meeting it implies meeting Bloch's). On regtest —
++    /// where the parent's target is trivial — it is the COMMON case, and the
++    /// distinction matters: submitting such a share to the Bloch node returns
++    /// `InsufficientPow` and burns an RPC round-trip per share.
++    Btc,
+     /// Meets Bloch's (looser) target but not Bitcoin's: a Bloch block via AuxPoW.
+     Bloch,
+     /// Meets the worker's vardiff target only: a valid share (accounting).
+@@ -290,7 +298,7 @@ pub struct MergedClassification {
+     /// Double-SHA256 of the reconstructed 80-byte parent Bitcoin header.
+     pub hash: [u8; 32],
+     /// The AuxPoW blob (`AuxPow::from_bytes` wire) — `Some` iff `win` is
+-    /// `Bloch` or `BtcAndBloch`.
++    /// `Bloch`, `Btc` or `BtcAndBloch`.
+     pub auxpow_blob: Option<Vec<u8>>,
+ }
+ 
+@@ -343,19 +351,20 @@ pub fn classify_merged_share(
+     let meets_bloch = meets(&hash, &bits_to_target(job.bloch_bits), true);
+     let meets_worker = meets(&hash, worker_target, true);
+ 
+-    let win = if meets_btc {
+-        MergedWin::BtcAndBloch
+-    } else if meets_bloch {
+-        MergedWin::Bloch
+-    } else if meets_worker {
+-        MergedWin::Share
+-    } else {
+-        MergedWin::Reject
++    // The two targets are INDEPENDENT: a parent hash can meet one, both, or
++    // neither. Never infer one from the other (see MergedWin::Btc).
++    let win = match (meets_btc, meets_bloch) {
++        (true, true) => MergedWin::BtcAndBloch,
++        (true, false) => MergedWin::Btc,
++        (false, true) => MergedWin::Bloch,
++        (false, false) if meets_worker => MergedWin::Share,
++        (false, false) => MergedWin::Reject,
+     };
+ 
+-    // Any Bloch-target win yields the AuxPoW the node accepts: the solved parent
+-    // header + the exact coinbase the miner built + the job's coinbase branch.
+-    let auxpow_blob = matches!(win, MergedWin::BtcAndBloch | MergedWin::Bloch)
++    // Any win yields the blob: the Bloch side needs it as the AuxPoW proof, and
++    // the BTC-only relay reconstructs the parent header + coinbase from the same
++    // bytes.
++    let auxpow_blob = matches!(win, MergedWin::BtcAndBloch | MergedWin::Btc | MergedWin::Bloch)
+         .then(|| assemble_auxpow_for_win(&header, &coinbase, &job.merkle_branch));
+ 
+     Ok(MergedClassification { win, hash, auxpow_blob })
+diff --git a/src/consensus/mod.rs b/src/consensus/mod.rs
+index 52228ca..ff9531c 100644
+--- a/src/consensus/mod.rs
++++ b/src/consensus/mod.rs
+@@ -559,7 +559,28 @@ pub enum ColoringMode {
+ /// to exercise `Fast` on a throwaway datadir; it is node-local and is NOT and
+ /// cannot be a substitute for setting this height. Until this constant changes,
+ /// every live node stays byte-for-byte on the `Legacy` coloring.
+-pub const CORRECTED_COLORING_ACTIVATION_HEIGHT: u64 = u64::MAX;
++///
++/// WS-A (2026-08-05): armed to a FUTURE flag-day height. The replay-snapshot
++/// proof (h18532) showed `Fast` is NOT byte-identical to `Legacy` — it diverges
++/// only in the `blues_anticone_sizes` metadata field (Legacy's bounded seed
++/// under-counts), with **zero** blue_score / mergeset / selected-chain / balance
++/// changes. Adopting the exact `Fast` coloring is therefore a consensus change
++/// and MUST be gated at a height ABOVE every already-mined block: history below
++/// the gate keeps its Legacy `GhostdagData` (no reorg, no balance recompute) and
++/// only blocks at/above the gate use the exact index-based coloring.
++///
++/// ⚠️ OPERATOR: re-confirm this value at flag-day BUILD time. It should sit at/near
++/// the chain tip when the binary is deployed so `Fast` activates promptly and the
++/// authoritative miner is not stranded on the heavy `Legacy` coloring of the wide
++/// damaged-fork anticone (which starves RPC/block-production under armed+mining).
++/// FLAG-DAY LOWERED 2026-08-06 from 40_000 → 21_430: the 40k value left the miner
++/// ~18k blocks (~6 days) of degraded Legacy operation. 21_430 was just above the
++/// live tip (~21_426) at deploy, so only NEW blocks (height ≥ H) use the O(k) index
++/// coloring — already-stored blocks keep their Legacy `GhostdagData` (no reorg, no
++/// balance recompute), and `Fast`≡`Legacy` in decisions (replay: 0 flips on 18,532
++/// real blocks) so a late sibling/reorg landing at a boundary height is consistent.
++/// All armed nodes SHOULD run the same H.
++pub const CORRECTED_COLORING_ACTIVATION_HEIGHT: u64 = 21_430;
+ 
+ pub struct GhostDAG {
+     pub k: usize,
+@@ -1216,90 +1237,126 @@ impl GhostDAG {
+         (mergeset_blues, mergeset_reds, blues_anticone_sizes)
+     }
+ 
+-    /// Fast, interval-index-backed twin of [`classify_mergeset`].
++    /// WS-B: compact, `O(k · mergeset)` GHOSTDAG coloring (Kaspa protocol).
+     ///
+-    /// This is a **line-for-line structural copy** of `classify_mergeset` — the
+-    /// same blue-set seeding via `past_blue_set` (with its `k*100` bound
+-    /// preserved verbatim), the same topological candidate order, the same
+-    /// whole-blue-set `blues_anticone_sizes` map shape — with exactly ONE
+-    /// difference: every "is X in the anticone of Y?" test routes through the
+-    /// O(1)/O(log n) reachability index instead of the bounded backwards BFS in
+-    /// `is_ancestor`.
++    /// Replaces the old whole-blue-set seed + per-candidate full-set scan — which
++    /// walked the ENTIRE selected chain (`past_blue_set_unbounded`, O(depth)) and
++    /// materialized every historical blue — with a BOUNDED selected-chain walk:
++    /// for each mergeset candidate we scan only each chain block's
++    /// `mergeset_blues`, stopping the instant a chain block is an ancestor of the
++    /// candidate (everything deeper is in the candidate's past, never its
++    /// anticone). The per-block `blues_anticone_sizes` map is now COMPACT — only
++    /// the blues this block adds and the sizes it bumps — and is read back for
++    /// later blocks via [`blue_anticone_size`](Self::blue_anticone_size).
+     ///
+-    /// Consequence: for any DAG on which the legacy bounded BFS never returns a
+-    /// false negative, this produces a BYTE-IDENTICAL `GhostdagData`. Where the
+-    /// legacy bound *did* bite, the two differ — and that difference is a
+-    /// consensus question (see [`ColoringMode`]), which is why this path is
+-    /// opt-in and the divergence is measured by the differential test rather
+-    /// than silently adopted.
++    /// Byte-identity note: the blue/red DECISIONS — hence `mergeset_blues`,
++    /// `blue_score`, and the selected chain — are identical to the exact
++    /// whole-set algorithm (validated against Legacy by `ghostdag_differential`).
++    /// The `blues_anticone_sizes` map SHAPE differs (compact vs whole-history);
++    /// that difference is exactly the gated-consensus metadata change activated
++    /// with the reachability index at [`CORRECTED_COLORING_ACTIVATION_HEIGHT`].
+     fn classify_mergeset_fast(
+         &self,
+         mergeset: &[BlockHash],
+         selected_parent: &BlockHash,
+     ) -> (Vec<BlockHash>, Vec<BlockHash>, HashMap<BlockHash, usize>) {
+-        // Seed from the EXACT (unbounded) blue lineage. This is the second half
+-        // of the correctness fix: the legacy seed (`past_blue_set`) truncates the
+-        // selected-chain walk at `k*100` and silently under-counts on deep DAGs.
+-        // The Fast path removes that bound so NO silent-approximation walk remains
+-        // reachable once Fast is active (the grep-enforceable acceptance goal).
+-        // Where the legacy bound never bit, this is byte-identical to the legacy
+-        // seed; where it did, this diverges — exactly the gated consensus change.
+-        let mut blue_set: HashSet<BlockHash> = self.past_blue_set_unbounded(selected_parent);
+-        blue_set.insert(*selected_parent);
+-
+-        let mut blues_anticone_sizes: HashMap<BlockHash, usize> = HashMap::new();
+-
+-        let mut mergeset_blues = Vec::new();
+-        let mut mergeset_reds = Vec::new();
+-
+-        for b in &blue_set {
+-            blues_anticone_sizes.insert(*b, 0);
+-        }
++        // Re-seeded semantics matching `classify_mergeset` (the consensus
++        // reference), but with its O(depth) whole-blue-set seed + per-candidate
++        // full scan replaced by the BOUNDED chain walk in
++        // `candidate_anticone_blues`. `cur_blues_anticone_sizes` is COMPACT: an
++        // entry exists only once a blue's (re-seeded) anticone count is set —
++        // `selected_parent`, this block's own mergeset blues, and any historical
++        // blue this block bumps. An absent blue counts as 0. This is exactly the
++        // whole-history map with its zero entries dropped, so it carries the SAME
++        // value on every key it keeps (validated by `ghostdag_differential`).
++        // The selected parent is seeded blue (size 0) and stripped from the
++        // returned `mergeset_blues` (blue_score = sp.blue_score + |blues| + 1).
++        let mut cur_mergeset_blues: Vec<BlockHash> = Vec::with_capacity(mergeset.len() + 1);
++        let mut cur_blues_anticone_sizes: HashMap<BlockHash, usize> = HashMap::new();
++        cur_mergeset_blues.push(*selected_parent);
++        cur_blues_anticone_sizes.insert(*selected_parent, 0);
++
++        let mut mergeset_reds: Vec<BlockHash> = Vec::new();
+ 
+         for &candidate in mergeset {
+-            let candidate_anticone_in_blue = blue_set.iter()
+-                .filter(|&b| self.is_in_anticone_fast(&candidate, b))
+-                .count();
++            // Every blue in the candidate's anticone (bounded selected-chain walk).
++            let anticone_blues =
++                self.candidate_anticone_blues(selected_parent, &cur_mergeset_blues, &candidate);
+ 
+-            if candidate_anticone_in_blue > self.k {
++            // Constraint (a): |anticone(candidate) ∩ blue_set| ≤ k.
++            if anticone_blues.len() > self.k {
+                 mergeset_reds.push(candidate);
+                 continue;
+             }
+-
+-            let mut constraint_b_ok = true;
+-            for (&blue_block, &current_anticone_size) in &blues_anticone_sizes {
+-                let in_anticone = self.is_in_anticone_fast(&candidate, &blue_block);
+-                if in_anticone && current_anticone_size + 1 > self.k {
+-                    constraint_b_ok = false;
+-                    break;
+-                }
+-            }
+-
+-            if !constraint_b_ok {
++            // Constraint (b): colouring the candidate blue must not push any blue
++            // it lands in the anticone of over k (re-seeded count, absent = 0).
++            let violates_b = anticone_blues
++                .iter()
++                .any(|b| *cur_blues_anticone_sizes.get(b).unwrap_or(&0) + 1 > self.k);
++            if violates_b {
+                 mergeset_reds.push(candidate);
+                 continue;
+             }
+ 
+-            mergeset_blues.push(candidate);
+-            blue_set.insert(candidate);
+-            blues_anticone_sizes.insert(candidate, candidate_anticone_in_blue);
+-
+-            for (&blue_block, anticone_size) in blues_anticone_sizes.iter_mut() {
+-                if blue_block != candidate && self.is_in_anticone_fast(&candidate, &blue_block) {
+-                    *anticone_size += 1;
+-                }
++            // Blue: record its own count and bump every blue in its anticone.
++            cur_mergeset_blues.push(candidate);
++            cur_blues_anticone_sizes.insert(candidate, anticone_blues.len());
++            for b in &anticone_blues {
++                *cur_blues_anticone_sizes.entry(*b).or_insert(0) += 1;
+             }
+         }
+ 
+-        (mergeset_blues, mergeset_reds, blues_anticone_sizes)
++        let mergeset_blues: Vec<BlockHash> =
++            cur_mergeset_blues.into_iter().filter(|b| b != selected_parent).collect();
++        (mergeset_blues, mergeset_reds, cur_blues_anticone_sizes)
+     }
+ 
+-    /// Anticone test via the reachability index. Semantically identical to
+-    /// [`is_in_anticone`] but backed by the unbounded interval index rather
+-    /// than the bounded BFS.
+-    fn is_in_anticone_fast(&self, a: &BlockHash, b: &BlockHash) -> bool {
+-        if a == b { return false; }
+-        !self.reach.is_dag_ancestor(a, b) && !self.reach.is_dag_ancestor(b, a)
++    /// Collect every blue in the candidate's anticone via a BOUNDED selected-chain
++    /// walk. Phase 0 scans the block-under-construction's own blues
++    /// (`selected_parent` + mergeset candidates already coloured blue). Phase 1
++    /// walks `selected_parent` and up, stopping the instant a chain block is an
++    /// ancestor of the candidate — everything deeper is in the candidate's past,
++    /// never its anticone. Each block belongs to exactly one mergeset, so there
++    /// are no duplicates. This replaces the old O(depth) `past_blue_set_unbounded`
++    /// seed + full-set scan while producing the identical anticone set.
++    fn candidate_anticone_blues(
++        &self,
++        selected_parent: &BlockHash,
++        cur_mergeset_blues: &[BlockHash],
++        candidate: &BlockHash,
++    ) -> Vec<BlockHash> {
++        let mut out: Vec<BlockHash> = Vec::new();
++
++        // Phase 0 — the under-construction block's own accumulated blues.
++        for &blue in cur_mergeset_blues {
++            if !self.reach.is_dag_ancestor(&blue, candidate)
++                && !self.reach.is_dag_ancestor(candidate, &blue)
++            {
++                out.push(blue);
++            }
++        }
++
++        // Phase 1 — selected_parent and up, until an ancestor of the candidate.
++        let mut chain = Some(*selected_parent);
++        while let Some(h) = chain {
++            if self.reach.is_dag_ancestor(&h, candidate) {
++                break;
++            }
++            let d = match self.store.get(&h) {
++                Some(d) => d,
++                None => break, // missing ancestor (shouldn't happen) — stop
++            };
++            for &blue in &d.mergeset_blues {
++                if !self.reach.is_dag_ancestor(&blue, candidate)
++                    && !self.reach.is_dag_ancestor(candidate, &blue)
++                {
++                    out.push(blue);
++                }
++            }
++            chain = d.selected_parent;
++        }
++
++        out
+     }
+ 
+     /// Compute |anticone(candidate) ∩ blue_set|
+@@ -1361,34 +1418,6 @@ impl GhostDAG {
+         blue
+     }
+ 
+-    /// Exact, UNBOUNDED twin of [`past_blue_set`]: walks the full selected-parent
+-    /// chain to genesis with no depth cap and no truncation warning. Used only by
+-    /// the `Fast` coloring path, where correctness (not bug-compatibility) is the
+-    /// goal. On any DAG where the legacy `k*100` bound never bit this returns the
+-    /// identical set; where it did, this returns the complete blue lineage the
+-    /// legacy walk dropped — the divergence the activation gate coordinates.
+-    ///
+-    /// Performance note: O(selected-chain depth) per classification, same shape
+-    /// as the legacy walk but without the early exit. The reachability index
+-    /// removes the dominant O(|mergeset|·|blue_set|·BFS) anticone cost; further
+-    /// reducing this seed walk to an incremental blues-anticone propagation
+-    /// (Kaspa-style) is a follow-up perf item, not a correctness gap.
+-    fn past_blue_set_unbounded(&self, block: &BlockHash) -> HashSet<BlockHash> {
+-        let mut blue = HashSet::new();
+-        let mut cur = Some(*block);
+-        while let Some(h) = cur {
+-            if let Some(data) = self.store.get(&h) {
+-                for mb in &data.mergeset_blues {
+-                    blue.insert(*mb);
+-                }
+-                cur = data.selected_parent;
+-            } else {
+-                break;
+-            }
+-        }
+-        blue
+-    }
+-
+     // ── Public query API ────────────────────────────────────────────────────
+ 
+     /// Best tip: highest blue_work, then blue_score, then hash
+@@ -1595,6 +1624,30 @@ mod tests {
+         h
+     }
+ 
++    /// WS-A: the corrected-coloring gate is armed to a FUTURE height. A Legacy
++    /// (production) DAG stays Legacy below the gate — so all already-mined
++    /// history keeps its coloring, no reorg / no balance recompute — and flips
++    /// to the exact index-based `Fast` coloring at/above it. Arming the gate also
++    /// turns on reachability-index maintenance from genesis so `Fast` is ready by
++    /// the activation height.
++    #[test]
++    fn corrected_coloring_gate_is_armed_at_future_height() {
++        assert_ne!(
++            CORRECTED_COLORING_ACTIVATION_HEIGHT, u64::MAX,
++            "WS-A: gate must be armed to a real future height, not disabled",
++        );
++        let dag = GhostDAG::with_default_k(); // Legacy constructor = production path
++        assert!(
++            dag.maintains_reachability_index(),
++            "an armed gate must maintain the reachability index from genesis",
++        );
++        let h = CORRECTED_COLORING_ACTIVATION_HEIGHT;
++        assert!(matches!(dag.effective_coloring(0), ColoringMode::Legacy));
++        assert!(matches!(dag.effective_coloring(h - 1), ColoringMode::Legacy));
++        assert!(matches!(dag.effective_coloring(h), ColoringMode::Fast));
++        assert!(matches!(dag.effective_coloring(h + 1), ColoringMode::Fast));
++    }
++
+     #[test]
+     fn genesis_blue_score_zero() {
+         let mut dag = GhostDAG::with_k(3);
+diff --git a/src/main.rs b/src/main.rs
+index b60ee6a..d9370d4 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -556,7 +556,11 @@ async fn main() {
+         store.put_meta("current_bits", &genesis_bits.to_le_bytes())
+             .expect("meta current_bits");
+         dag.write().add_genesis(hash, genesis.header.timestamp);
+-        if let Some(gdata) = dag.read().get_block_data(&hash).cloned() {
++        // Bind in a `let` so the read guard drops before the `dag.write()` inside
++        // (parking_lot RwLock is not reentrant — holding this read across the
++        // write deadlocks once the reachability gate is armed).
++        let gdata_opt = dag.read().get_block_data(&hash).cloned();
++        if let Some(gdata) = gdata_opt {
+             // Sprint Y (M-2): atomic put to CF_DAG + CF_DAG_INTEGRITY.
+             // Genesis anchors the hash-chain with an all-zero parent
+             // integrity; see `compute_integrity_hash` for the convention.
+@@ -727,7 +731,11 @@ async fn main() {
+         }
+ 
+         // Self-check the (loaded or rebuilt) index against the unbounded oracle.
+-        if let Err(e) = dag.read().reach_self_check_sample(2000, 0xB10C_5157) {
++        // Bind in a `let` so the read guard drops before the rebuild's
++        // `dag.write()` below (non-reentrant RwLock — holding it across the write
++        // would deadlock the very path that recovers from a bad index).
++        let self_check = dag.read().reach_self_check_sample(2000, 0xB10C_5157);
++        if let Err(e) = self_check {
+             if loaded_ok {
+                 warn!("loaded reachability failed self-check ({e}); rebuilding from CF_DAG");
+                 match dag.write().rebuild_reachability_from_store() {
+@@ -1751,7 +1759,12 @@ async fn main() {
+                         // Phase 1: fold the reachability delta into the same
+                         // atomic write when the index is maintained; live Legacy
+                         // path is byte-for-byte unchanged.
+-                        if let Some(ddata) = dag_m.read().get_block_data(&hash).cloned() {
++                        // Bind in a `let` first so the read guard drops before
++                        // `dag_m.write()` below — parking_lot RwLock is not
++                        // reentrant, and holding the read across the write
++                        // deadlocks once the reachability gate is armed.
++                        let ddata_opt = dag_m.read().get_block_data(&hash).cloned();
++                        if let Some(ddata) = ddata_opt {
+                             if dag_m.read().maintains_reachability_index() {
+                                 let (upserts, removals) = dag_m.write().reach_take_delta();
+                                 store_m.put_dag_with_integrity_and_reach(&hash, &ddata, &upserts, &removals).ok();
+@@ -2297,6 +2310,25 @@ fn accept_block(
+     // {} scope ensures the lock drops immediately.
+     let old_tip = { dag.read().selected_tip() };
+ 
++    // ── Early dedup ──────────────────────────────────────────────────
++    // A block already in the DAG needs no re-validation. Return the same
++    // "already in DAG" rejection `add_block` produces, but BEFORE tx
++    // validation — so a re-gossip / IBD re-request flood of known blocks
++    // stays cheap now that the finality gate below no longer rejects (and
++    // thereby short-circuits) below-finality blocks.
++    if dag.read().get_block_data(&block_hash).is_some() {
++        return Err(format!(
++            "consensus rejection: block already in DAG: {}",
++            hex::encode(block_hash)
++        ));
++    }
++
++    // finalized_height bounds both the difficulty re-validation just below and
++    // the disposition guard further down. Read it once, up front.
++    let finalized_height = store.get_meta("finalized_height").ok().flatten()
++        .and_then(|b| b.as_slice().try_into().ok().map(u64::from_le_bytes))
++        .unwrap_or(0);
++
+     // ── FIX VULN-01: Validate difficulty bits match expected ──────────
+     // ASERT-Lattice (B5c): expected bits are derived per-block from the
+     // parent timestamp + genesis anchor — miner and validator agree by
+@@ -2304,22 +2336,39 @@ fn accept_block(
+     // uses a FIXED difficulty (GENESIS2_BITS): the SIS ASERT path re-anchors to
+     // mainnet constants and interprets `bits` with SIS semantics, neither of
+     // which applies to a fresh SHA-256d chain — so it is bypassed here.
+-    let parent_ts = store.get_timestamp_at_height(block.height.saturating_sub(1))
+-        .ok().flatten().unwrap_or(core::GENESIS_TIMESTAMP);
+-    let expected_bits = if matches!(core::pow_algorithm(core::node_chain_id()),
+-                                    core::PowAlgorithm::Sha256d) {
+-        // Both SHA-256d chains (Genesis-2 devnet, Genesis-3 mainnet).
+-        genesis2_expected_bits(store, block.height)
+-    } else {
+-        pow::next_bits(
+-            core::GENESIS_BITS, core::GENESIS_TIMESTAMP, parent_ts, block.height,
+-        )
+-    };
+-    if block.header.bits != expected_bits {
+-        return Err(format!(
+-            "invalid difficulty: block bits 0x{:08x} != expected 0x{:08x}",
+-            block.header.bits, expected_bits
+-        ));
++    //
++    // FINALITY FLOOR (backfill dead-lock fix): expected_bits is re-derived from
++    // this block's ancestor history in `store` (retarget window). Below the
++    // finality checkpoint a *syncing* node's copy of that history may be
++    // pruned/incomplete, so the re-derivation yields the WRONG expected value
++    // and a FALSE "invalid difficulty". That false reject dead-locks backfill:
++    // the required below-finality fork-loser is re-requested and re-rejected
++    // forever, so a heavier block's mergeset never closes, the selected tip
++    // freezes, and IBD never releases (exactly what stranded followers at the
++    // damaged fork). A below-finality block is settled history — it already
++    // passed structural PoW in `validate_structure()` and can only ever be an
++    // inert fork-loser, NEVER the selected tip (enforced at the disposition
++    // guard below + the MAX_REORG_DEPTH == CHECKPOINT_DEPTH cap). So re-derive
++    // and check difficulty only ABOVE finality (assume-valid-below-checkpoint,
++    // matching the fork-loser retention policy documented at the guard below).
++    if block.height > finalized_height {
++        let parent_ts = store.get_timestamp_at_height(block.height.saturating_sub(1))
++            .ok().flatten().unwrap_or(core::GENESIS_TIMESTAMP);
++        let expected_bits = if matches!(core::pow_algorithm(core::node_chain_id()),
++                                        core::PowAlgorithm::Sha256d) {
++            // Both SHA-256d chains (Genesis-2 devnet, Genesis-3 mainnet).
++            genesis2_expected_bits(store, block.height)
++        } else {
++            pow::next_bits(
++                core::GENESIS_BITS, core::GENESIS_TIMESTAMP, parent_ts, block.height,
++            )
++        };
++        if block.header.bits != expected_bits {
++            return Err(format!(
++                "invalid difficulty: block bits 0x{:08x} != expected 0x{:08x}",
++                block.header.bits, expected_bits
++            ));
++        }
+     }
+ 
+     // ── FIX VULN-02: Validate height matches DAG position ────────────
+@@ -2344,18 +2393,20 @@ fn accept_block(
+         }
+     }
+ 
+-    // ── Finality checkpoint: reject deep reorgs ──────────────────────
+-    {
+-        let finalized_height = store.get_meta("finalized_height").ok().flatten()
+-            .and_then(|b| b.as_slice().try_into().ok().map(u64::from_le_bytes))
+-            .unwrap_or(0);
+-        if block.height <= finalized_height {
+-            return Err(format!(
+-                "finality: block h={} at or below finalized height {}",
+-                block.height, finalized_height
+-            ));
+-        }
+-    }
++    // ── Finality checkpoint ──────────────────────────────────────────
++    // A block at or below the finalized height is NOT rejected here. It may
++    // be a required GhostDAG mergeset member — a red/side "fork-loser" in a
++    // heavier block's past — and discarding its body is exactly what starved
++    // tip-selection and IBD: nodes advertised headers whose bodies no one
++    // retained ("body unavailable / an archival peer is needed"), so the
++    // selected tip froze while blue_score kept climbing. Finality is enforced
++    // where it matters instead — a below-finality block must never become the
++    // SELECTED tip — at the disposition guard below (and, redundantly, by the
++    // MAX_REORG_DEPTH cap in execute_reorg, since MAX_REORG_DEPTH ==
++    // CHECKPOINT_DEPTH: any flip landing at/below finalized_height is > that
++    // depth and already refused). Inert fork-losers are retained so the DAG
++    // stays complete and every advertised body is servable.
++    // (`finalized_height` was read up-front, above the difficulty check.)
+ 
+     // ── FIX VULN-04: Validate timestamp ──────────────────────────────
+     {
+@@ -2542,6 +2593,26 @@ fn accept_block(
+         _ => Disposition::Unexpected,
+     };
+ 
++    // ── Finality invariant: below-finality blocks stay inert ─────────
++    // A block at or below the finalized height is welcome in the DAG as a
++    // fork-loser (its body was retained above), but it must NEVER become the
++    // selected tip — that would rewrite finalized history. In practice an
++    // Extension cannot reach here below finality (it extends a tip already
++    // above it), and a Reorg flipping the tip below finality is over-deep and
++    // also refused by MAX_REORG_DEPTH; this guard makes the invariant explicit
++    // and independent of that constant. Roll the in-memory insertion back the
++    // same way the refused-reorg path does (nothing is persisted to CF_DAG
++    // yet; the body left in CF_BLOCKS is inert).
++    if block.height <= finalized_height
++        && matches!(disposition, Disposition::Extension | Disposition::Reorg)
++    {
++        dag.write().remove_block(&block_hash);
++        return Err(format!(
++            "finality: block h={} may not become the selected tip at or below finalized height {}",
++            block.height, finalized_height
++        ));
++    }
++
+     match disposition {
+         Disposition::ForkLoser => {
+             info!(
+@@ -2663,7 +2734,13 @@ fn accept_block(
+     // disposition above has been applied successfully. Every refusal path
+     // above rolled the in-memory insertion back and returned Err, so CF_DAG
+     // can never adopt a fork tip whose chain state was refused.
+-    if let Some(ddata) = dag.read().get_block_data(&block_hash).cloned() {
++    // NOTE: bind the cloned data in its own `let` so the `dag.read()` guard is
++    // released at the `;` — parking_lot's RwLock is NOT reentrant, so keeping a
++    // read guard alive across `dag.write()` below deadlocks (write parks waiting
++    // for the reader that this same thread holds). Harmless while Legacy left the
++    // index untouched; a hard hang once the reachability gate arms `dag.write()`.
++    let ddata_opt = dag.read().get_block_data(&block_hash).cloned();
++    if let Some(ddata) = ddata_opt {
+         // Sprint Y (M-2): atomic put to CF_DAG + CF_DAG_INTEGRITY.
+         // Phase 1: when the reachability index is maintained, fold its delta
+         // (which may span several blocks if this insert triggered a reindex)
+@@ -3682,6 +3759,155 @@ mod external_submission_tests {
+              with the real chain",
+         );
+     }
++
++    /// Root-cause regression for the red/side-block body-retention starvation
++    /// that froze tip-selection (selected tip stuck while blue_score climbed)
++    /// and stalled IBD ("body unavailable — an archival peer is needed").
++    ///
++    /// A block at or below the finalized height that is a *fork-loser* must be
++    /// ACCEPTED and RETAINED (body in CF_BLOCKS + entry in the DAG) so it can
++    /// serve as a GhostDAG mergeset member — it must NOT be rejected by the
++    /// finality checkpoint, and it must NOT move the selected tip. Pre-fix,
++    /// accept_block rejected it outright ("finality: ... at or below finalized
++    /// height"), so its body was never stored and no node could serve it.
++    #[tokio::test(flavor = "multi_thread")]
++    async fn below_finality_fork_loser_is_retained_not_rejected() {
++        let g_ts    = unix_now();
++        let genesis = mk_genesis(g_ts);
++        let node    = node_with_genesis(&genesis);
++        let gh      = genesis.block_hash();
++
++        // Real chain: genesis → r1 … r5, all through the real accept path.
++        let mut parent = gh;
++        let mut r1 = gh;
++        for i in 1..=5u64 {
++            let b = mk_block_at(&node, parent, i, g_ts + 30 * i, i);
++            accept(&node, &b).expect("real-chain block must be accepted");
++            if i == 1 { r1 = b.block_hash(); }
++            parent = b.block_hash();
++        }
++        let real_tip = parent;
++
++        // Simulate a finalized checkpoint at height 3 (as a live node sets once
++        // its tip is CHECKPOINT_DEPTH ahead).
++        node.store.put_meta("finalized_height", &3u64.to_le_bytes())
++            .expect("set finalized_height");
++
++        // A side block at height 2 (<= finalized 3): sibling of r2 (same parent
++        // r1, distinct nonce → distinct hash). It is a fork-loser — the real
++        // chain to r5 has far more blue work.
++        let fork = mk_block_at(&node, r1, 2, g_ts + 30 * 2, 987_654);
++        let fork_hash = fork.block_hash();
++        assert_ne!(fork_hash, real_tip);
++
++        let res = accept(&node, &fork);
++        assert!(
++            res.is_ok(),
++            "a below-finality FORK-LOSER must be accepted (retained as a \
++             mergeset member), not rejected by finality; got: {:?}", res,
++        );
++
++        // Retained: body servable + present in the DAG.
++        assert!(
++            node.store.get_block(&fork_hash).expect("body read").is_some(),
++            "below-finality fork-loser body must be RETAINED in CF_BLOCKS \
++             (else peers answer 'body unavailable')",
++        );
++        assert!(
++            node.dag.read().get_block_data(&fork_hash).is_some(),
++            "below-finality fork-loser must be present in the DAG",
++        );
++
++        // Inert: it must NOT move the selected tip (finality invariant intact).
++        assert_eq!(
++            node.dag.read().selected_tip(), Some(real_tip),
++            "a below-finality fork-loser must NOT become the selected tip",
++        );
++
++        // And re-submitting it is a cheap dedup no-op rejection, not a re-run.
++        let again = accept(&node, &fork);
++        assert!(
++            again.is_err() && again.unwrap_err().contains("already in DAG"),
++            "a block already in the DAG must be rejected by the early dedup",
++        );
++    }
++
++    /// Root-cause regression for the BACKFILL DEAD-LOCK that stranded followers
++    /// at the damaged fork. `accept_block` re-derives expected difficulty bits
++    /// from the block's ancestor history in `store`. On a *syncing* node that
++    /// history is pruned/incomplete below the finality checkpoint, so the
++    /// re-derivation yields the WRONG expected value → a FALSE "invalid
++    /// difficulty" reject. Because the rejected block is a required below-finality
++    /// fork-loser (a heavier block's mergeset member), it is re-requested and
++    /// re-rejected forever: the mergeset never closes, the selected tip freezes,
++    /// IBD never releases. Fix: skip the difficulty re-derivation at/below
++    /// `finalized_height` (assume-valid-below-checkpoint) — the block is settled
++    /// history that can only ever be an inert fork-loser. The check stays fully
++    /// enforced ABOVE finality, where the ancestor context is complete.
++    ///
++    /// NOTE: `accept()` calls `accept_block` directly (structural PoW/merkle are
++    /// validated upstream in the NewBlock handler, not here), so mutating
++    /// `header.bits` exercises exactly the accept_block difficulty gate.
++    #[tokio::test(flavor = "multi_thread")]
++    async fn below_finality_skips_difficulty_recheck() {
++        let g_ts    = unix_now();
++        let genesis = mk_genesis(g_ts);
++        let node    = node_with_genesis(&genesis);
++        let gh      = genesis.block_hash();
++
++        // Real chain: genesis → r1 … r5.
++        let mut parent = gh;
++        let mut r1 = gh;
++        let mut r3 = gh;
++        for i in 1..=5u64 {
++            let b = mk_block_at(&node, parent, i, g_ts + 30 * i, i);
++            accept(&node, &b).expect("real-chain block must be accepted");
++            if i == 1 { r1 = b.block_hash(); }
++            if i == 3 { r3 = b.block_hash(); }
++            parent = b.block_hash();
++        }
++        let real_tip = parent;
++
++        // Finalize at height 3.
++        node.store.put_meta("finalized_height", &3u64.to_le_bytes())
++            .expect("set finalized_height");
++
++        // (1) BELOW finality (h=2 ≤ 3): fork-loser sibling of r2 with the WRONG
++        // difficulty bits. Pre-fix this was rejected "invalid difficulty" and
++        // dead-locked backfill; post-fix the difficulty re-check is skipped
++        // below finality and the block is retained as an inert fork-loser.
++        let mut below = mk_block_at(&node, r1, 2, g_ts + 30 * 2, 111_222);
++        let good_bits = below.header.bits;
++        below.header.bits = good_bits ^ 0x0000_0001; // != expected
++        assert_ne!(below.header.bits, good_bits);
++        let below_hash = below.block_hash();
++        let res = accept(&node, &below);
++        assert!(
++            res.is_ok(),
++            "below-finality block must SKIP the difficulty re-check and be \
++             retained as a fork-loser; got: {:?}", res,
++        );
++        assert!(
++            node.dag.read().get_block_data(&below_hash).is_some(),
++            "below-finality fork-loser must be present in the DAG",
++        );
++        assert_eq!(
++            node.dag.read().selected_tip(), Some(real_tip),
++            "below-finality fork-loser must NOT move the selected tip",
++        );
++
++        // (2) ABOVE finality (h=4 > 3): sibling of r4 with WRONG bits. The
++        // difficulty check MUST still fire here — the floor only lifts the check
++        // below finality, never above it.
++        let mut above = mk_block_at(&node, r3, 4, g_ts + 30 * 4, 333_444);
++        above.header.bits ^= 0x0000_0001; // != expected
++        let res2 = accept(&node, &above);
++        assert!(
++            res2.is_err() && res2.as_ref().unwrap_err().contains("invalid difficulty"),
++            "above-finality block with wrong bits must STILL be rejected for \
++             difficulty; got: {:?}", res2,
++        );
++    }
+ }
+ 
+ // ─────────────────────────────────────────────────────────────────────────────
+diff --git a/src/network/mod.rs b/src/network/mod.rs
+index d0c9065..b07e846 100644
+--- a/src/network/mod.rs
++++ b/src/network/mod.rs
+@@ -844,6 +844,17 @@ impl NetworkNode {
+         let mut inflight_pull: std::collections::HashMap<
+             libp2p::request_response::OutboundRequestId, NetworkMessage> =
+             std::collections::HashMap::new();
++        // Re-gossip rate-limit. Serving a legacy-gossip `GetBlock` re-broadcasts the
++        // whole block to the mesh; external peers spamming `GetBlock` for the same
++        // blocks turned that into a `publish blocks [NewBlock]: Duplicate` storm that
++        // saturated the send path (and the request-response handler alongside it). We
++        // keep the FIRST publish of each block (gossipsub then relays it mesh-wide) and
++        // suppress re-publishes of the SAME block within a short window; a peer that
++        // missed the first broadcast re-requests after the window. Pruned on insert, so
++        // the map stays bounded to blocks seen within the TTL.
++        let mut recent_block_publishes: std::collections::HashMap<[u8; 32], std::time::Instant> =
++            std::collections::HashMap::new();
++        const REGOSSIP_SUPPRESS_TTL: Duration = Duration::from_secs(10);
+         let mut heartbeat   = tokio::time::interval(Duration::from_secs(30));
+         let mut save_peers  = tokio::time::interval(Duration::from_secs(60));
+         // Sprint CC: periodic tip announce. Re-publishes the current
+@@ -1031,18 +1042,30 @@ impl NetworkNode {
+                         }
+                         SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                             info!("✓ connected: {}", peer_id);
+-                            swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
++                            // DO NOT call gossipsub.add_explicit_peer() here.
++                            //
++                            // An "explicit peer" in gossipsub is a manually-pinned direct
++                            // link that is DELIBERATELY EXCLUDED from mesh construction.
++                            // libp2p-gossipsub 0.49.5 behaviour.rs:2224 filters mesh graft
++                            // candidates with `!explicit_peers.contains(peer)`, and :1395
++                            // answers an incoming GRAFT from an explicit peer by PRUNING it
++                            // on every topic ("we don't GRAFT to/from explicit peers").
++                            //
++                            // Marking EVERY connection explicit therefore made the mesh
++                            // permanently unbuildable: heartbeat logged
++                            // "Mesh low. Topic contains: 0" and "RANDOM PEERS: Got 0 peers"
++                            // forever, publish() returned NoPeersSubscribedToTopic, and the
++                            // miner's blocks never reached the network — every non-mining
++                            // node stalled while the producer kept extending alone.
++                            // Reproduced with two fresh nodes on localhost (2026-08-07).
+                             peer_count += 1;
+                             crate::metrics::set_peer_count(peer_count as i64);
+                             peer_state.on_connect(peer_id, Instant::now());
+-                            // FIX v0.5.1: Re-announce subscriptions to new peer.
+-                            // gossipsub only announces subs on initial connect,
+-                            // but peer_score can ghost peers from mesh. Force
+-                            // re-broadcast of our subscribed topics so the new
+-                            // peer adds us to its mesh for blocks/txs/sync.
+-                            for t in [&block_t, &tx_t, &sync_t] {
+-                                let _ = swarm.behaviour_mut().gossipsub.subscribe(t);
+-                            }
++                            // NOTE: re-calling gossipsub.subscribe() here would be a no-op —
++                            // it returns Ok(false) and sends nothing when the topic is already
++                            // subscribed (it logs "Topic is already in the mesh"). gossipsub
++                            // already sends our subscription set on connection establishment,
++                            // so there is nothing to force.
+                             // Save peer address for next startup.
+                             // Sprint P: also track listener peers (was a bug — only dialers
+                             // entered known_peers, so known_peers.json only grew with outbound
+@@ -1208,7 +1231,9 @@ impl NetworkNode {
+                                     continue;
+                                 }
+                                 info!("mDNS discovered (LAN): {} at {}", peer_id, addr);
+-                                swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
++                                // Same reason as the ConnectionEstablished arm above: an
++                                // explicit peer is excluded from the mesh. Just dial it and
++                                // let normal mesh maintenance graft it.
+                                 if swarm.dial(addr).is_ok() { dialed += 1; }
+                             }
+                         }
+@@ -1319,6 +1344,19 @@ impl NetworkNode {
+                         }
+                         continue;
+                     }
++                    // Re-gossip rate-limit (see `recent_block_publishes` decl): drop a
++                    // re-broadcast of a block already published within the TTL. The first
++                    // broadcast + gossipsub relay covers the mesh; this kills the
++                    // GetBlock-serving amplification storm without changing which blocks
++                    // propagate.
++                    if let NetworkMessage::NewBlock { block_hash, .. } = &msg {
++                        let now = std::time::Instant::now();
++                        recent_block_publishes.retain(|_, t| now.duration_since(*t) < REGOSSIP_SUPPRESS_TTL);
++                        if recent_block_publishes.contains_key(block_hash) {
++                            continue;
++                        }
++                        recent_block_publishes.insert(*block_hash, now);
++                    }
+                     let (topic, topic_name) = match &msg {
+                         NetworkMessage::NewBlock { .. }        => (block_t.clone(), "blocks"),
+                         NetworkMessage::NewTransaction { .. }  => (tx_t.clone(),    "txs"),
+diff --git a/src/network/sync_rr.rs b/src/network/sync_rr.rs
+index 8b28457..0e2374f 100644
+--- a/src/network/sync_rr.rs
++++ b/src/network/sync_rr.rs
+@@ -208,13 +208,26 @@ pub fn decode_frame<M: for<'de> Deserialize<'de>>(buf: &[u8]) -> io::Result<M> {
+ pub type Behaviour = request_response::Behaviour<BlochSyncCodec>;
+ pub type Event = request_response::Event<SyncRequest, SyncResponse>;
+ 
++/// Max concurrent request-response streams (inbound + outbound) the handler keeps
++/// open per connection before it drops new INBOUND streams with
++/// "Dropping inbound stream because we are at capacity". libp2p's default is 100,
++/// which a node catching up across the wide damaged-fork anticone blows past: the
++/// recursive missing-parent resolution (`GetBlock` per absent ancestor) opens a
++/// burst of streams, and once at capacity the peer's new-block deliveries AND its
++/// inbound peering handshake get dropped — the follower sits `syncing:false` at its
++/// snapshot tip and never converges. Raised well above the observed ~80 streams/s so
++/// sync bursts flow; DoS headroom is a non-issue on the small trusted fleet.
++const MAX_CONCURRENT_SYNC_STREAMS: usize = 2048;
++
+ /// Build the request-response behaviour for `/bloch/sync/1`. `Full` support =
+ /// this node both serves inbound pulls and issues outbound pulls.
+ pub fn new_behaviour() -> Behaviour {
+     Behaviour::with_codec(
+         BlochSyncCodec,
+         std::iter::once((SYNC_PROTOCOL, ProtocolSupport::Full)),
+-        RrConfig::default().with_request_timeout(Duration::from_secs(30)),
++        RrConfig::default()
++            .with_request_timeout(Duration::from_secs(30))
++            .with_max_concurrent_streams(MAX_CONCURRENT_SYNC_STREAMS),
+     )
+ }
+ 

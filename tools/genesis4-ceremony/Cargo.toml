@@ -2,7 +2,7 @@
 name = "genesis4-ceremony"
 version = "0.1.0"
 edition = "2021"
-license = "MIT OR Apache-2.0"
+license = "AGPL-3.0-or-later"
 description = "Genesis-4 ceremony: assembles the Genesis-4 genesis block from the signed carryover artifact. Offline tool, UNAUDITED."
 publish = false
 

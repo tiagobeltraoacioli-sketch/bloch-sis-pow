@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Stake delegation — the subsystem the Solana revenue model requires.
 //!
@@ -42,12 +42,57 @@ use crate::sample::Validator;
 use crate::tokenomics_v4::SAT_PER_BLOCH;
 
 /// Most of the active stake that may activate — or deactivate — in one epoch.
-/// 9%, matching Solana's warm-up/cool-down rate.
-pub const WARMUP_RATE_BPS: u128 = 900;
+///
+/// **0.25%.** This was 900 bps (9%) until 2026-08-11, taken from Solana's
+/// warm-up rate. The numeral was ported and the clock was not: a Solana epoch
+/// is ~48 hours, a Bloch epoch is 16 minutes, so the same percentage ran ~180x
+/// faster in wall-clock time. Zero to the one-third finality-stall threshold
+/// took `ln(1.5)/ln(1.09) = 4.7` epochs — **75 minutes**. No human process
+/// reacts to a public queue in 75 minutes, so the limit defended nothing.
+///
+/// A churn limit is denominated in wall-clock time, not epochs: what it buys
+/// is the interval during which a takeover-in-progress is visible in the
+/// activation queue, measured against how long detection and response take. At
+/// 25 bps that interval is `ln(1.5)/ln(1.0025) = 162` epochs, **~43 hours** —
+/// about two working days of a publicly visible hostile queue.
+///
+/// 25 is the knee of the curve, not a sacred number; `BLOCH-POS-STAKE-CHURN.md`
+/// has the full dial (100 bps -> 11 h, 50 -> 22 h, 10 -> 4.5 d, 5 -> Solana's
+/// actual wall-clock rate). Past roughly a day each further halving buys less
+/// security — the real barrier has shifted to acquiring the coins — while the
+/// liveness bill below keeps growing linearly.
+///
+/// **What this costs, stated plainly.** The budget is shared with cool-down,
+/// so every cost is symmetric. Honest onboarding slows ~36x (a participant
+/// bringing 10% of the active set: 18 min -> ~11 h). Doubling the active set
+/// goes from ~2 hours to **~3.1 days**, which for a young network hungry for
+/// stake is the largest real cost. And exit is equally slow: after a slashing
+/// scare or a key-compromise disclosure, a third of the set now takes ~43
+/// hours to drain instead of ~1 hour, staying bonded and slashable that whole
+/// time. Lowering the rate extends honest exposure exactly as much as it
+/// delays an attacker — that symmetry is the F3 lesson (emptying the set fast
+/// is as dangerous as filling it fast), not an oversight.
+///
+/// **What no rate limit buys.** Nothing here stops an attacker who has the
+/// coins. Beneficial ownership is invisible on-chain: the 1% per-validator cap
+/// is bypassed by splitting, and the operator-view metrics cannot see one
+/// owner behind many delegators. The rate buys visibility time, and only that.
+///
+/// Phase 2, flagged and deliberately not sized: an absolute cap
+/// (`clamp(total * 25bps, MIN, MAX)`) so attack time grows with the network as
+/// it does on Ethereum, instead of staying at 43 hours forever. Sizing `MAX`
+/// needs real staking data.
+pub const WARMUP_RATE_BPS: u128 = 25;
 
 /// Minimum a delegator may bond. Far below the validator minimum: the point of
 /// delegation is that staking should not require running a node.
 pub const MIN_DELEGATION_SAT: u128 = 10 * SAT_PER_BLOCH;
+
+/// The floor under the per-epoch churn budget: one validator's minimum
+/// deposit. See the floor rationale at the budget computation in
+/// [`Registry::resolve`] — it exists to guarantee a drain terminates, and it
+/// is sized so a young network can still onboard at a usable rate.
+pub const MIN_CHURN_SAT: u128 = crate::staking::MIN_DEPOSIT_SAT;
 
 /// Per-validator cap as a share of total active stake (§4.1: 1%).
 pub const MAX_VALIDATOR_STAKE_BPS: u128 = 100;
@@ -174,13 +219,20 @@ impl Registry {
                 // `deactivation_drains_gradually_and_completes`, which ran 200
                 // epochs and still found 937,812 sat stuck.
                 //
-                // Any positive floor guarantees termination. `MIN_DELEGATION_SAT`
-                // is the natural one: it is already the smallest unit of stake
-                // the system recognises, so a floor below it would be a budget
-                // that cannot admit or release anything. Ethereum solves the
-                // same problem the same way, with a minimum churn limit.
+                // Any positive floor guarantees termination. The floor is one
+                // VALIDATOR's worth of stake, not one delegation's: at 25 bps
+                // the proportional budget only exceeds 100,000 BLCH once the
+                // active set passes 40M BLCH, so on a young network a 10-BLCH
+                // floor would be the binding constraint and would strangle
+                // onboarding — 10 BLCH per 16 minutes is not a network, it is
+                // a queue. (Ethereum's floor is the same idea at a different
+                // unit: 4 validators per epoch.)
+                //
+                // It was `MIN_DELEGATION_SAT` while the rate was 900 bps, where
+                // the floor almost never bound. Lowering the rate 36x is what
+                // makes the floor load-bearing, so the two move together.
                 let rate = total_active * WARMUP_RATE_BPS / 10_000;
-                if rate > MIN_DELEGATION_SAT { rate } else { MIN_DELEGATION_SAT }
+                if rate > MIN_CHURN_SAT { rate } else { MIN_CHURN_SAT }
             };
 
             // PARTIAL ACTIVATION. A delegation larger than the epoch's budget

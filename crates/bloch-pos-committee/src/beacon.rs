@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Hash-based randomness beacon — RANDAO over SHAKE-256 preimage chains
 //! (§6.3 of the migration design).

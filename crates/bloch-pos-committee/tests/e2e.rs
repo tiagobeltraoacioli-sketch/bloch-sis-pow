@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! End-to-end devnet-in-a-test: N validators producing and finalizing real
 //! blocks over several epochs, with block production feeding the state

@@ -40,3 +40,7 @@ carryover.tsv
 
 # PDF gerado a partir do .md pelo pipeline do spike — nao versionar
 docs/specs/*.pdf
+
+# Worktrees de agentes: repos git embutidos, nunca conteudo do projeto.
+.claude/worktrees/
+deploy/artifacts/

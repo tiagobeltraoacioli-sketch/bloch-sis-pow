@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: MIT OR Apache-2.0
+# SPDX-License-Identifier: AGPL-3.0-or-later
 #
 # bloch-pos — the Genesis-4 node binary. A NEW binary, deliberately:
 # the Genesis-3 node (`bloch`, src/main.rs at the repo root) halts at height
@@ -12,7 +12,7 @@
 name = "bloch-pos-node"
 version = "0.0.1-skeleton"
 edition = "2021"
-license = "MIT OR Apache-2.0"
+license = "AGPL-3.0-or-later"
 description = "Bloch Genesis-4 Proof-of-Stake node. SKELETON: boots, self-checks frozen consensus parameters, and exits. No consensus loop, no networking, no storage yet."
 publish = false
 

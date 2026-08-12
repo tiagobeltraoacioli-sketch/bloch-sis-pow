@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Genesis-4 ceremony — assemble the Genesis-4 genesis block from the signed
 //! carryover artifact and the published genesis validator cohort.

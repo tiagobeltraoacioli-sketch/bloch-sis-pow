@@ -2,7 +2,7 @@
 name = "bloch-pos-committee"
 version = "0.1.0"
 edition = "2021"
-license = "MIT OR Apache-2.0"
+license = "AGPL-3.0-or-later"
 description = "Bloch PoS — per-slot fork-choice subcommittee and epoch finality committee: deterministic stake-weighted sampling, attestation types, and LMD-GHOST weight accumulation. UNAUDITED, not wired into the node."
 publish = false
 

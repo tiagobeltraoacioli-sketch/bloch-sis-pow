@@ -1,4 +1,4 @@
-<!-- SPDX-License-Identifier: MIT OR Apache-2.0 -->
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
 
 # Bloch — Migration to Proof-of-Stake (SHA-3 + Lattice)
 
@@ -1026,7 +1026,19 @@ engineering.
 
 ## 16. Copyright
 
-Released under MIT OR Apache-2.0, consistent with the reference node.
+Released under **AGPL-3.0-or-later**, the same licence as the Genesis-3 node
+it succeeds.
+
+Decided by the founder on 2026-08-11. The question was forced by
+`bloch-crypto` being AGPL-3.0-or-later while the new PoS crates were declared
+MIT OR Apache-2.0: AGPL is viral, so the moment the Genesis-4 node links it for
+ML-DSA/Falcon verification, the whole binary inherits AGPL regardless of what
+the leaf crates say. The two ways out were to take AGPL for the node, or to
+re-extract the PQ verify surface into a compatibly-licensed leaf. AGPL was
+chosen — it keeps one licence across the whole chain, it matches what shipped
+for Genesis-3, and it does not spend engineering effort splitting a crypto
+crate to preserve a permissive licence nobody asked for. `bloch-pos-committee`,
+`bloch-pos-node` and `tools/genesis4-ceremony` were relicensed to match.
 
 ---
 

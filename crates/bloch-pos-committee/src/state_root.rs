@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! The SHA3-256 sparse Merkle tree that commits the consensus state (§5.5).
 //!

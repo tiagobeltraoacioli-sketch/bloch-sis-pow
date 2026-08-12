@@ -1,4 +1,4 @@
-<!-- SPDX-License-Identifier: MIT OR Apache-2.0 -->
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
 
 # Bloch PoS — Node Integration Plan (Genesis-4 binary)
 
@@ -480,16 +480,17 @@ KAT frozen over it, and the stale-prose seals. What remains open:
    mostly intact, but pulls `bloch-crypto` into M1 instead of M2 — and with
    it the license blocker below. Needs a DEV-1/DEV-3 joint decision at M1
    start. **Blocks `apply_block` beyond fixtures.**
-4. **License — MILESTONE BLOCKER, decided before the dependency lands.**
-   Verified: `bloch-pos-committee` is MIT OR Apache-2.0 and depends only on
-   `sha3` — no conflict today. But `bloch-crypto` is AGPL-3.0-or-later, and
-   AGPL is viral: the moment `bloch-pos` links it for PQ signatures, the
-   whole binary cannot remain MIT/Apache. The decision is binary and must be
-   recorded **before** the milestone that first adds the dependency (M2, or
-   M1 if item 3 pulls it forward): either the Genesis-4 node is born AGPL —
-   like the Genesis-3 node it succeeds — or the PQ verify surface it needs
-   is re-extracted into a compatibly-licensed leaf crate. Founder/PMO; A6
-   verifies the release carries the recorded license.
+4. **License — RESOLVED 2026-08-11, no longer a blocker.**
+   `bloch-crypto` is AGPL-3.0-or-later and AGPL is viral, so the moment
+   `bloch-pos` links it for PQ signatures the whole binary inherits AGPL
+   whatever the leaf crates declare. The founder decided the node is born
+   AGPL-3.0-or-later, like the Genesis-3 node it succeeds, rather than
+   re-extracting the PQ verify surface into a permissive leaf crate.
+   `bloch-pos-committee`, `bloch-pos-node` and `tools/genesis4-ceremony` were
+   relicensed accordingly (SPDX headers and `Cargo.toml`). What this obliges,
+   stated plainly: anyone who runs a modified Genesis-4 node as a network
+   service must publish their modifications. A6 verifies the release carries
+   the recorded license.
 5. **Interface-doc open points** (`BLOCH-POS-INTERFACES.md` §4) remaining
    open, the ones that gate node milestones: 4.5 withdrawal-credential
    format (blocks DEV-3 deposits, M2), 4.2 delegator withdrawal-delay

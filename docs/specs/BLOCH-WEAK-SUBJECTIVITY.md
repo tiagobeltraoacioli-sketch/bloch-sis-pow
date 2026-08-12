@@ -1,4 +1,4 @@
-<!-- SPDX-License-Identifier: MIT OR Apache-2.0 -->
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
 
 # Bloch — Weak subjectivity: checkpoint format, publication, and sync
 
@@ -576,4 +576,4 @@ machine (§4.2) exercised at the three age boundaries.
 
 ## 9. Copyright
 
-Released under MIT OR Apache-2.0, consistent with the reference node.
+Released under **AGPL-3.0-or-later**, consistent with the reference node.

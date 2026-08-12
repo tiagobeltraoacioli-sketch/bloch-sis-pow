@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Properties the committee layer must hold for consensus not to split.
 
@@ -871,6 +871,16 @@ fn dust_and_tainted_delegations_never_count() {
     assert_eq!(r.state_of(&tainted), StakeState::Inactive);
 }
 
+/// Epocas para o conjunto ativo crescer por um fator, na taxa de warm-up
+/// vigente. Os testes de churn derivam o horizonte daqui em vez de fixar um
+/// numero: a taxa e um parametro de consenso que ja mudou uma vez (900 -> 25
+/// bps, 2026-08-11) e um horizonte fixo teria virado um teste que passa por
+/// motivo errado.
+fn epochs_to_grow_by(factor: f64) -> u64 {
+    let r = delegation::WARMUP_RATE_BPS as f64 / 10_000.0;
+    (factor.ln() / (1.0 + r).ln()).ceil() as u64
+}
+
 #[test]
 fn warmup_is_rate_limited_so_stake_cannot_seize_the_set_in_one_epoch() {
     // A large incumbent, then a whale that tries to activate everything at once.
@@ -878,12 +888,17 @@ fn warmup_is_rate_limited_so_stake_cannot_seize_the_set_in_one_epoch() {
     for i in 0..20u32 {
         ds.push(deleg(100 + i, 20, 10_000_000, 1));
     }
+    // Horizonte DERIVADO da constante, nao um numero magico: o conjunto
+    // precisa triplicar (100M incumbente -> 300M), o que a taxa de warm-up
+    // leva `ln(3)/ln(1+r)` epocas. Um 40 fixo aqui era so o valor que passava
+    // com 900 bps e escondia que o teste dependia da taxa.
+    let horizon = epochs_to_grow_by(3.0) + 8;
     let e1 = Registry::resolve(&ds, 1);
-    let e40 = Registry::resolve(&ds, 40);
-    assert!(e1.stake_of(20) < e40.stake_of(20),
-        "a baleia entrou inteira numa epoca so: {} vs {}", e1.stake_of(20), e40.stake_of(20));
+    let done = Registry::resolve(&ds, horizon);
+    assert!(e1.stake_of(20) < done.stake_of(20),
+        "a baleia entrou inteira numa epoca so: {} vs {}", e1.stake_of(20), done.stake_of(20));
     // And eventually it all lands.
-    assert_eq!(e40.stake_of(20), 200_000_000 * tk::SAT_PER_BLOCH);
+    assert_eq!(done.stake_of(20), 200_000_000 * tk::SAT_PER_BLOCH);
 }
 
 #[test]
@@ -1245,7 +1260,7 @@ fn withholding_in_the_tail_of_an_epoch_cannot_resort_the_next_epochs_partition()
 fn warmup_cap_holds_even_for_an_oversized_delegation() {
     // F3: a escapatoria de liveness anterior admitia a cabeca da fila INTEIRA,
     // qualquer que fosse o tamanho — entao uma delegacao grande ativava de uma
-    // vez e contornava o teto de 9%. Com fatiamento, ela entra em pedacos.
+    // vez e contornava o teto por epoca. Com fatiamento, ela entra em pedacos.
     let incumbent = deleg(1, 10, 100_000_000, 0);
     let whale = deleg(2, 20, 500_000_000, 1); // 5x o incumbente
     let ds = vec![incumbent, whale];
@@ -1253,15 +1268,17 @@ fn warmup_cap_holds_even_for_an_oversized_delegation() {
     let base = Registry::resolve(&ds, 0).total_active();
     let e1 = Registry::resolve(&ds, 1);
     let entered = e1.total_active() - base;
-    let cap = base * 9 / 100;
+    // Teto lido da constante, nao restatado: um `9 / 100` aqui sobrevive a
+    // mudanca da taxa e passa a testar um limite que nao existe mais.
+    let cap = base * delegation::WARMUP_RATE_BPS / 10_000;
     assert!(entered <= cap + 1, "entrou {entered}, teto era {cap} — F3 de volta");
     assert!(entered > 0, "nada entrou: deadlock, que e o bug que a escapatoria consertava");
 
     // Parcialmente ativa nao conta como admitida.
     assert_eq!(e1.state_of(&whale), StakeState::Activating);
 
-    // E eventualmente entra inteira.
-    let done = Registry::resolve(&ds, 400);
+    // E eventualmente entra inteira: 100M -> 600M, seis vezes o conjunto.
+    let done = Registry::resolve(&ds, epochs_to_grow_by(6.0) + 8);
     assert_eq!(done.stake_of(20), 500_000_000 * tk::SAT_PER_BLOCH);
     assert_eq!(done.state_of(&whale), StakeState::Active);
 }

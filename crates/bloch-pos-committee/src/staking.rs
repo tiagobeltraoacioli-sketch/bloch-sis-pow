@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Staking lifecycle — deposit, exit, withdrawal, and the activation queue
 //! (§7 of the migration design), with the §4.1 eligibility rules enforced at
