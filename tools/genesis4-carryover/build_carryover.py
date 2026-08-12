@@ -104,14 +104,22 @@ def write(result, out_path):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--utxo", required=True, help="snapshot do bloch-snapshot-utxo (.tsv ou .tsv.gz)")
-    ap.add_argument("--founder", required=True, help="hashes de endereco do fundador, separados por virgula")
-    ap.add_argument("--cap-bloch", type=int, default=300_000_000)
+    ap.add_argument("--founder", default="",
+                    help="enderecos a EXCLUIR, separados por virgula. Vazio por padrao: "
+                         "o carryover atravessa inteiro. Uma lista de exclusao e poder "
+                         "sem auditoria — quem a escreve decide quem fica de fora — e "
+                         "a decisao de 2026-08-11 foi nao ter nenhuma.")
+    ap.add_argument("--cap-bloch", type=int, default=0,
+                    help="0 = sem teto (padrao). O teto de 300M foi aposentado "
+                         "junto com a exclusao do fundador: ele existia para limitar "
+                         "o que legados recebiam enquanto o fundador era excluido.")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
     founder = {a.strip() for a in args.founder.split(",") if a.strip()}
     if not founder:
-        raise SystemExit("--founder vazio: a lista de taint tem de ser explicita")
+        print("nenhuma exclusao: o carryover inteiro atravessa, o saldo do")
+        print("fundador junto — ele minerou na mesma cadeia sob as mesmas regras.")
 
     r = build(args.utxo, founder, args.cap_bloch)
     digest = write(r, args.out)

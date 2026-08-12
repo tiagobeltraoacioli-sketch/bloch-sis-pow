@@ -17,8 +17,9 @@ Relates to: BLOCH-POS-SHA3-LATTICE-MIGRATION.md (§4 distribution gates)
 Relaunch from a fresh genesis with a **fixed 21,000,000,000 BLCH** supply — the
 V2 nominal, after a draft at 100 billion.
 
-**The whole carryover comes across, the founder's balance included**, as
-ordinary liquid balance. The founder additionally receives a new 17% grant under
+**The whole carryover comes across as one balance set, with no founder line.**
+Those coins were mined, on the same chain, under the same rules as everyone
+else's — so they are carried the same way, as ordinary liquid balance. The founder additionally receives a new 17% grant under
 a 10-year cliff and 40-year linear vest — the V2 premine schedule.
 
 Returning to 21 billion removes two hazards the 100-billion draft created, at no
@@ -29,13 +30,12 @@ billion overflowed by 8%.
 
 | Destination | BLCH | Share | Unlock |
 |---|---:|---:|---|
-| Founder — carried over | 3,546,175,400 | 16.89% | **liquid at genesis** |
+| Carryover — the whole ledger | 3,773,884,800 | 17.97% | **liquid at genesis** |
 | Founder — new grant | 3,570,000,000 | 17.00% | 10-year cliff, then 40-year linear |
 | VC / crypto hedge funds | 2,100,000,000 | 10.00% | 12-month cliff, then 24-month linear |
 | Development team | 2,100,000,000 | 10.00% | 18-month cliff, then 36-month linear |
 | Marketing | 840,000,000 | 4.00% | 25% at genesis, remainder linear over 24 months |
 | Liquidity | 1,050,000,000 | 5.00% | 100% liquid at genesis |
-| Carryover holders | 227,709,400 | 1.08% | liquid at genesis, no vesting |
 | **Validators** | **7,566,115,200** | **36.03%** | emitted over 40 years |
 | **Total** | **21,000,000,000** | **100.00%** | |
 
@@ -94,6 +94,24 @@ headroom, it is a deadline.**
 Two consequences that need a decision now:
 
 1. **The snapshot height is fixed at 80,000** — see §3.1.
+2. **No exclusion list and no cap.** Two mechanisms dissolve with the
+   single-set decision rather than being satisfied by it:
+   - the **taint set**, because there is no class of coin left to mark. §4.1's
+     premine ineligibility was written for a migration *in place*, where the
+     founder's holding sat on the chain being converted. With a fresh genesis
+     and one undifferentiated carryover it has no subject.
+   - the **300 M holder cap**, which existed to bound what legacy holders
+     received *while the founder was excluded*. With nobody excluded it would
+     either bind on everyone — scaling every balance down by 92% — or on no one.
+
+   A third thing goes with them, and it is the one worth naming: §3 flagged the
+   exclusion list as **an unaudited power**, since whoever writes it decides who
+   counts as founder, and nothing in the protocol checks it. There is now no
+   list to write. That concern is not mitigated, it is gone.
+
+   What does **not** go is the arithmetic. Relabelling moves no balance: the
+   largest single address still holds 3,546,175,400 BLCH — 93.96% of the
+   carryover — liquid from slot 0. §4A is unchanged by this decision.
 2. **A rule is needed for the over-cap case.** The proposal here is
    **pro-rata scale-down**: if measured non-founder holdings exceed 300 M, every
    non-founder balance is multiplied by `300_000_000 / total_non_founder`. It is

@@ -444,10 +444,24 @@ fn subcommittee_actually_carries_intra_epoch_weight() {
 use bloch_pos_committee::tokenomics_v4 as tk;
 
 #[test]
+fn the_carryover_is_one_set_with_no_founder_line() {
+    // O carryover inteiro atravessa, o saldo do fundador junto: foi minerado na
+    // mesma cadeia sob as mesmas regras. Some com isso o conjunto de taint (nao
+    // ha classe de moeda a marcar) e o teto de holders (existia para limitar o
+    // que legados recebiam ENQUANTO o fundador era excluido).
+    assert_eq!(tk::CARRYOVER_TOTAL_BLOCH, 3_773_884_800);
+    assert_eq!(tk::HOLDER_CARRYOVER_CAP_BLOCH, 0, "o teto foi aposentado");
+    // Renomear nao move saldo: o maior endereco continua onde estava.
+    assert_eq!(tk::LARGEST_CARRYOVER_ADDRESS_BLOCH, 3_546_175_400);
+    let share = tk::LARGEST_CARRYOVER_ADDRESS_BLOCH * 10_000 / tk::CARRYOVER_TOTAL_BLOCH;
+    assert_eq!(share, 9396, "93,96% do carryover num endereco so");
+}
+
+#[test]
 fn allocations_sum_to_total_supply() {
-    let sum = tk::FOUNDER_CARRYOVER_BLOCH + tk::HOLDER_CARRYOVER_MEASURED_BLOCH
-        + tk::FOUNDER_BLOCH + tk::VC_BLOCH + tk::TEAM_BLOCH + tk::MARKETING_BLOCH
-        + tk::LIQUIDITY_BLOCH + tk::VALIDATOR_EMISSION_BLOCH;
+    let sum = tk::CARRYOVER_TOTAL_BLOCH + tk::FOUNDER_BLOCH + tk::VC_BLOCH
+        + tk::TEAM_BLOCH + tk::MARKETING_BLOCH + tk::LIQUIDITY_BLOCH
+        + tk::VALIDATOR_EMISSION_BLOCH;
     assert_eq!(sum, tk::TOTAL_SUPPLY_BLOCH);
     assert_eq!(tk::VALIDATOR_EMISSION_BLOCH, 7_566_115_200);
 }
@@ -613,38 +627,6 @@ fn nothing_but_liquidity_marketing_and_holders_circulates_at_genesis() {
     let circulating_insiders = tk::insider_unlocked_sat(0);
     assert_eq!(circulating_insiders, tk::MARKETING_BLOCH * sat / 4);
     assert_eq!(tk::founder_vested_sat(0), 0);
-}
-
-#[test]
-fn carryover_below_cap_is_untouched() {
-    let sat = tk::SAT_PER_BLOCH;
-    // Measured floor: 181,104,000 BLCH across four non-founder addresses.
-    let total = 181_104_000 * sat;
-    assert_eq!(tk::scaled_carryover_sat(177_063_600 * sat, total), 177_063_600 * sat);
-    assert_eq!(tk::scaled_carryover_sat(411_600 * sat, total), 411_600 * sat);
-}
-
-#[test]
-fn carryover_over_cap_scales_pro_rata() {
-    let sat = tk::SAT_PER_BLOCH;
-    let total = 600_000_000 * sat; // twice the cap
-    // Every holder keeps exactly half.
-    assert_eq!(tk::scaled_carryover_sat(400_000_000 * sat, total), 200_000_000 * sat);
-    assert_eq!(tk::scaled_carryover_sat(2 * sat, total), sat);
-    // And the scaled total lands on the cap, not near it.
-    let a = tk::scaled_carryover_sat(400_000_000 * sat, total);
-    let b = tk::scaled_carryover_sat(200_000_000 * sat, total);
-    assert_eq!(a + b, tk::HOLDER_CARRYOVER_CAP_BLOCH * sat);
-}
-
-#[test]
-fn carryover_scaling_does_not_overflow_at_full_supply() {
-    // balance × cap is the product of two ~1e19 values: it overflows u64 by
-    // twenty orders of magnitude. This must stay in u128 and stay exact.
-    let sat = tk::SAT_PER_BLOCH;
-    let huge = tk::TOTAL_SUPPLY_BLOCH * sat;
-    let out = tk::scaled_carryover_sat(huge, huge);
-    assert_eq!(out, tk::HOLDER_CARRYOVER_CAP_BLOCH * sat);
 }
 
 #[test]

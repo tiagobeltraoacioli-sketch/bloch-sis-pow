@@ -48,28 +48,36 @@ pub const TEAM_BLOCH: u128 = 2_100_000_000; // 10%
 pub const MARKETING_BLOCH: u128 = 840_000_000; //  4%
 pub const LIQUIDITY_BLOCH: u128 = 1_050_000_000; //  5%
 
-/// The founder's carried-over Genesis-3 balance, measured at height 43,172.
+/// The carried-over ledger — **one balance set, no founder line**.
 ///
-/// Carried as ordinary balance: **liquid at genesis, no cliff and no vesting**.
-/// It is the single largest holding on the chain from slot 0.
-pub const FOUNDER_CARRYOVER_BLOCH: u128 = 3_546_175_400;
-
-/// Non-founder carried-over balances, measured at the same height across 14
-/// addresses. Comfortably under the 300 M ceiling, so no pro-rata scale-down
-/// runs and every holder keeps 100% of their position.
-pub const HOLDER_CARRYOVER_MEASURED_BLOCH: u128 = 227_709_400;
-
-/// Hard ceiling on carried-over non-founder balances.
+/// Measured at height 43,172 across 448,337 UTXOs and 15 addresses. Every
+/// balance crosses as ordinary liquid balance, the founder's included: those
+/// coins were mined, on the same chain, under the same rules as everyone
+/// else's (founder decision, 2026-08-11).
 ///
-/// Measured floor from `carryover.tsv.gz` is 181,104,000 BLCH across four
-/// non-founder addresses; third-party mining since Genesis-3 pushes the real
-/// figure up continuously, so this cap is expected to bind (§3 of the spec).
-pub const HOLDER_CARRYOVER_CAP_BLOCH: u128 = 300_000_000;
+/// Two mechanisms dissolve with that decision rather than being satisfied by
+/// it. There is no **taint set**, because there is no class of coin to mark —
+/// §4.1's premine ineligibility was written for a migration in place, where the
+/// founder's pre-existing holding sat on the chain being converted. And there
+/// is no **holder cap**: the 300 M ceiling existed to bound what legacy holders
+/// received *while the founder was excluded*, and with nobody excluded it would
+/// either bind on everyone or bind on no one.
+///
+/// What does not dissolve is the arithmetic. Relabelling changes no balance:
+/// the largest single address still holds 3,546,175,400 BLCH, liquid from slot
+/// 0. §4A states what that does to the activation gates, and it states it the
+/// same way it did before this decision.
+pub const CARRYOVER_TOTAL_BLOCH: u128 = 3_773_884_800;
+
+/// Retired. The carryover is not capped — see [`CARRYOVER_TOTAL_BLOCH`].
+///
+/// Kept as a named zero so that any code still consulting a cap fails loudly on
+/// the arithmetic instead of silently applying a ceiling that no longer exists.
+pub const HOLDER_CARRYOVER_CAP_BLOCH: u128 = 0;
 
 /// Validator emission — the remainder, spread over 40 years.
 pub const VALIDATOR_EMISSION_BLOCH: u128 = TOTAL_SUPPLY_BLOCH
-    - FOUNDER_CARRYOVER_BLOCH
-    - HOLDER_CARRYOVER_MEASURED_BLOCH
+    - CARRYOVER_TOTAL_BLOCH
     - FOUNDER_BLOCH
     - VC_BLOCH
     - TEAM_BLOCH
@@ -154,7 +162,9 @@ pub const fn validator_emitted_halving_by(slot: u64) -> u128 {
 
 // ── Carryover scale-down ────────────────────────────────────────────────────
 
-/// Scale one non-founder balance to fit under [`HOLDER_CARRYOVER_CAP_BLOCH`].
+/// Retired with the cap. Retained so the rule it encoded stays on the record:
+/// had a ceiling been kept, pro-rata was the only scale-down that treats a
+/// holder identically regardless of when the coins were acquired.
 ///
 /// Pro-rata, deterministic, no discretion: if measured non-founder holdings
 /// exceed the cap, every balance is multiplied by `cap / total`. It treats a
@@ -175,8 +185,7 @@ pub fn scaled_carryover_sat(balance_sat: u128, total_non_founder_sat: u128) -> u
 // ── Invariants checked at compile time ──────────────────────────────────────
 
 const _: () = assert!(
-    FOUNDER_CARRYOVER_BLOCH
-        + HOLDER_CARRYOVER_MEASURED_BLOCH
+    CARRYOVER_TOTAL_BLOCH
         + FOUNDER_BLOCH
         + VC_BLOCH
         + TEAM_BLOCH
@@ -192,9 +201,10 @@ const _: () = assert!(
     "resto para validadores mudou — reveja a especificacao antes de aceitar"
 );
 
-/// The founder's combined position: carried-over balance plus the new grant.
-pub const FOUNDER_TOTAL_BLOCH: u128 = FOUNDER_CARRYOVER_BLOCH + FOUNDER_BLOCH;
-const _: () = assert!(FOUNDER_TOTAL_BLOCH * 10_000 / TOTAL_SUPPLY_BLOCH == 3388);
+/// Largest single carried-over address, for the concentration reporting in §4A.
+/// Not a consensus quantity and not a distinct class of coin — a measurement.
+pub const LARGEST_CARRYOVER_ADDRESS_BLOCH: u128 = 3_546_175_400;
+const _: () = assert!(LARGEST_CARRYOVER_ADDRESS_BLOCH < CARRYOVER_TOTAL_BLOCH);
 
 const _: () = assert!(EMISSION_SLOTS == 42_076_800, "grade de tempo mudou");
 

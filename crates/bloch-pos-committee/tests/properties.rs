@@ -667,7 +667,7 @@ fn unlocked_supply_never_exceeds_total_supply() {
     // liquidity, the carryover cap, and validator emission under any curve —
     // must stay at or under the 100 B hard cap.
     let mut rng = Rng::new(0xB10C_0012);
-    let carry = tk::HOLDER_CARRYOVER_CAP_BLOCH * tk::SAT_PER_BLOCH;
+    let carry = tk::CARRYOVER_TOTAL_BLOCH * tk::SAT_PER_BLOCH;
     let curves: [fn(u64) -> u128; 3] = [
         tk::validator_emitted_flat_by,
         tk::validator_emitted_halving_by,
