@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Pinned toolchain for the `bloch-pos` release binary (G8 release-integrity
+# gate, docs/specs/BLOCH-POS-SHA3-LATTICE-MIGRATION.md §11).
+#
+# A reproducible binary needs a pinned compiler: rustc versions differ in
+# codegen, metadata hashes and symbol mangling, so "same source, same lock"
+# still diverges across toolchains. rustup resolves this file for any cargo
+# invocation at or below this directory, which covers the bloch-pos build AND
+# its path-dependency compile of ../bloch-pos-committee.
+#
+# Deliberately scoped to this crate, NOT the repo root: the Genesis-3 node at
+# the root is frozen (halts at 80,000; its build is never touched by PoS work,
+# BLOCH-POS-NODE-INTEGRATION.md §0), and a root pin would silently change what
+# the G3 fleet-recovery builds produce.
+#
+# Bump policy: bump the channel deliberately, in its own commit, and re-run
+# scripts/pos-release-integrity.sh — a toolchain bump is a release-integrity
+# event, not housekeeping.
+
+[toolchain]
+channel = "1.94.1"
+components = ["rustfmt", "clippy"]
