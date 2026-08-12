@@ -29,17 +29,36 @@
 //! own block panics loudly: that is the h28080 seam and it must never be
 //! shrugged past.
 //!
-//! ## Fork choice — honest scope
+//! ## Fork choice — LMD-GHOST
 //!
-//! Canonical is the highest-slot fully-valid chain this node knows
-//! (longest-valid-chain, adopted by replaying the branch from genesis). This
-//! is NOT the designed LMD-GHOST fork choice: the transition accumulates
-//! attestation weight in committed state, but no `forkchoice::Store` head
-//! walk is wired at the node level yet, so competing equal-length forks
-//! resolve by whoever extends first rather than by attested weight. Enough
-//! for a cooperative devnet; listed as missing for mainnet in the report.
+//! Canonical is whatever [`forkchoice::Store::head`] selects: walk from the
+//! **justified** checkpoint and take the heaviest child at every step, where
+//! weight is the total effective stake of validators whose *latest* message is
+//! that block or a descendant. `advance` then makes the canonical chain match
+//! that head, extending when the head descends from it and reorganising (by
+//! replaying from genesis — never trusting an unvalidated branch) when it does
+//! not.
+//!
+//! This replaces longest-valid-chain, which resolved competing forks by whoever
+//! extended first. That rule is not merely weaker, it is *wrong under PoS*: it
+//! lets a proposer with no attested support drag the chain by building fast,
+//! and it gives an attacker who can produce blocks a way to override a branch
+//! the honest majority has already voted for. Length is not the security
+//! statement in proof of stake; attested stake is.
+//!
+//! Two properties come from starting the walk at the justified checkpoint
+//! rather than at genesis: finalised history can never be reorganised out, and
+//! the walk is bounded by the unfinalised suffix instead of the whole chain.
+//!
+//! The store is **rebuilt from scratch on every head computation** rather than
+//! carried as mutable node state. That is the §5.5 posture applied where it is
+//! cheapest to get wrong: a cached fork-choice store is exactly the kind of
+//! node-local mutable state that made two honest nodes disagree in the
+//! `expected_bits` incident. Rebuilding is O(blocks x attestations) per call
+//! and, on a devnet, free; when it stops being free the fix is an incremental
+//! store with a test proving it equals the rebuild, not a cache with a comment.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -53,6 +72,7 @@ use bloch_pos_committee::header::{BlockEnvelope, BlockHeaderV4, BlockId, Body, V
 use bloch_pos_committee::interfaces::{ProposalEnvelope, StateReader, StateTransition};
 use bloch_pos_committee::schedule::first_slot_of_epoch;
 use bloch_pos_committee::transition::{CommittedState, PosTransaction, Transition};
+use bloch_pos_committee::forkchoice::{BlockTree, LatestMessage, Store as FcStore};
 use bloch_pos_committee::{committees, derive, epoch_of, schedule};
 
 use crate::genesis::{Manifest, GENESIS_MIX};
@@ -334,34 +354,97 @@ impl Engine {
         self.advance();
     }
 
-    /// Extend the canonical chain with any stored child of the head; when no
-    /// child exists, consider adopting a strictly longer stored branch
-    /// (replayed from genesis before adoption — never trusted unvalidated).
-    fn advance(&mut self) {
-        loop {
-            let head = *self.head_id().as_bytes();
-            // Lowest-slot stored child of the head first: deterministic, and
-            // the earliest child is what an honest chain would have built.
-            let child = self
-                .blocks
-                .values()
-                .filter(|e| e.header.parent == head && !self.canonical.contains(e.block_id().as_bytes()))
-                .min_by_key(|e| e.header.slot)
-                .cloned();
-            if let Some(env) = child {
-                if !self.apply_canonical(&env) {
-                    self.blocks.remove(env.block_id().as_bytes());
-                }
-                continue;
-            }
-            match self.best_reorg_path() {
-                Some((ancestor, branch)) => {
-                    if !self.do_reorg(ancestor, branch) {
-                        continue; // offending block removed; try again
+
+    // ── Fork choice: LMD-GHOST ──────────────────────────────────────────────
+
+    /// The LMD-GHOST head over every block this node has seen, canonical or
+    /// not.
+    ///
+    /// Rebuilt from scratch each call (see the module docs on why there is no
+    /// cached store). Deterministic despite the map iteration: `Store::observe`
+    /// keeps the highest-slot message per validator and bars any validator that
+    /// signed two different heads in one slot, so the resulting store is a
+    /// function of the message *set*, never of arrival order — the property
+    /// that was found violated in `forkchoice.rs` on 2026-08-11 and fixed
+    /// there. Sibling lists are sorted so the tie-break is stable too.
+    fn forkchoice_head(&self) -> [u8; 32] {
+        lmd_ghost_head(
+            &self.blocks,
+            self.pool.values(),
+            &self.state.active_validators(),
+            self.state.finality().justified.root,
+        )
+    }
+
+    /// The chain of stored blocks from `target` down to the nearest canonical
+    /// ancestor, ancestor-child first, together with that ancestor.
+    ///
+    /// `None` means the lineage is incomplete — the node is missing blocks and
+    /// must sync before it can judge the branch. Returning `None` rather than
+    /// guessing is the fail-closed half of the rule: a branch is adopted only
+    /// after being replayed and validated in full.
+    fn path_to_canonical(&self, target: [u8; 32]) -> Option<([u8; 32], Vec<BlockEnvelope>)> {
+        if self.canonical.contains(&target) {
+            return Some((target, Vec::new()));
+        }
+        let mut branch = Vec::new();
+        let mut cur = target;
+        // Bounded by the number of stored blocks: a cycle (which a malicious
+        // peer could otherwise induce) terminates instead of hanging.
+        for _ in 0..=self.blocks.len() {
+            match self.blocks.get(&cur) {
+                Some(env) => {
+                    branch.push(env.clone());
+                    cur = env.header.parent;
+                    if self.canonical.contains(&cur) {
+                        branch.reverse();
+                        return Some((cur, branch));
                     }
+                }
+                None => return None,
+            }
+        }
+        None
+    }
+
+    /// Make the canonical chain equal the LMD-GHOST head.
+    ///
+    /// Three cases, and the third is the one longest-chain could not express:
+    /// the head descends from the current head (extend), the head is on another
+    /// branch (reorg), or the head is an *ancestor* of the current head —
+    /// weight moved to a sibling and the chain must give blocks back. That last
+    /// case is a legitimate LMD-GHOST outcome and is handled by reorganising to
+    /// an empty branch.
+    fn advance(&mut self) {
+        // Bounded: every iteration either advances the canonical head or
+        // deletes an invalid block, and both are finite.
+        for _ in 0..=(self.blocks.len().saturating_mul(2) + 2) {
+            let target = self.forkchoice_head();
+            let head = *self.head_id().as_bytes();
+            if target == head {
+                return;
+            }
+            let Some((ancestor, branch)) = self.path_to_canonical(target) else {
+                // Missing lineage: ask the mesh, and keep the chain we have
+                // rather than adopting something we cannot validate.
+                self.needs_sync = true;
+                return;
+            };
+            if ancestor == head && !branch.is_empty() {
+                // Pure extension: apply in order, no replay needed.
+                let mut progressed = false;
+                for env in &branch {
+                    if !self.apply_canonical(env) {
+                        self.blocks.remove(env.block_id().as_bytes());
+                        break;
+                    }
+                    progressed = true;
+                }
+                if !progressed {
                     continue;
                 }
-                None => break,
+            } else if !self.do_reorg(ancestor, branch) {
+                continue; // offending block removed; recompute
             }
         }
     }
@@ -428,41 +511,6 @@ impl Engine {
                 false
             }
         }
-    }
-
-    /// The best stored branch strictly longer than the canonical head, with
-    /// complete lineage down to a canonical ancestor. Returns the ancestor id
-    /// and the branch (ancestor-child first).
-    fn best_reorg_path(&mut self) -> Option<([u8; 32], Vec<BlockEnvelope>)> {
-        let head_slot = self.head_slot_now();
-        let mut tips: Vec<&BlockEnvelope> = self
-            .blocks
-            .values()
-            .filter(|e| !self.canonical.contains(e.block_id().as_bytes()) && e.header.slot > head_slot)
-            .collect();
-        tips.sort_by_key(|e| std::cmp::Reverse(e.header.slot));
-        for tip in tips {
-            let mut branch = vec![tip.clone()];
-            let mut cur = tip.header.parent;
-            loop {
-                if self.canonical.contains(&cur) {
-                    branch.reverse();
-                    return Some((cur, branch));
-                }
-                match self.blocks.get(&cur) {
-                    Some(p) if !self.canonical.contains(p.block_id().as_bytes()) => {
-                        branch.push(p.clone());
-                        cur = p.header.parent;
-                    }
-                    _ => {
-                        // Lineage incomplete: ask the mesh for what we miss.
-                        self.needs_sync = true;
-                        break;
-                    }
-                }
-            }
-        }
-        None
     }
 
     /// Adopt `branch` (attached at canonical `ancestor`) by replaying the
@@ -739,5 +787,235 @@ pub fn run(cfg: Config) -> io::Result<()> {
                 return Err(io::Error::new(io::ErrorKind::BrokenPipe, "network channel closed"));
             }
         }
+    }
+}
+
+/// LMD-GHOST head over `blocks`, given the loose attestations in `pool`, the
+/// stake-weighted `validators`, and the `justified` root the walk starts from.
+///
+/// A free function of its inputs, not a method over node state, for the reason
+/// §5.5 gives: a consensus-relevant value must be derivable from arguments so
+/// it can be reasoned about and tested without standing up a node. It is also
+/// what makes the divergence from longest-chain testable at all — see
+/// `forkchoice_tests::weight_beats_length` at the bottom of this file.
+pub fn lmd_ghost_head<'a>(
+    blocks: &BTreeMap<[u8; 32], BlockEnvelope>,
+    pool: impl Iterator<Item = &'a Attestation>,
+    validators: &[bloch_pos_committee::sample::Validator],
+    justified: [u8; 32],
+) -> [u8; 32] {
+    let mut parents: HashMap<[u8; 32], [u8; 32]> = HashMap::new();
+    let mut children: HashMap<[u8; 32], Vec<[u8; 32]>> = HashMap::new();
+    for (id, env) in blocks {
+        parents.insert(*id, env.header.parent);
+        children.entry(env.header.parent).or_default().push(*id);
+    }
+    for kids in children.values_mut() {
+        kids.sort_unstable();
+    }
+
+    let mut fc = FcStore::new();
+    // Weight is the stake the CANONICAL state committed. A competing branch may
+    // commit a different validator set; using its numbers would let a branch
+    // vote itself heavier, so the fork choice reads one set — the one this node
+    // has validated — exactly as Ethereum weights by the justified state.
+    for v in validators {
+        fc.set_stake(v.index, v.effective_stake);
+    }
+    for env in blocks.values() {
+        for att in &env.body.attestations {
+            fc.observe(att.validator, LatestMessage { slot: att.data.slot, root: att.data.head });
+        }
+    }
+    // Attestations seen on the wire but not yet in any block count too: that is
+    // what makes the head responsive within a slot instead of one block behind.
+    for att in pool {
+        fc.observe(att.validator, LatestMessage { slot: att.data.slot, root: att.data.head });
+    }
+
+    let tree = BlockTree { parents: &parents };
+    fc.head(&tree, justified, &children)
+}
+
+#[cfg(test)]
+mod forkchoice_tests {
+    use super::*;
+    use bloch_pos_committee::sample::Validator;
+
+    fn header(parent: [u8; 32], slot: u64, marker: u8) -> BlockHeaderV4 {
+        BlockHeaderV4 {
+            version: VERSION_G4,
+            parent,
+            state_root: [marker; 32],
+            body_root: [0u8; 32],
+            slot,
+            proposer_index: 0,
+            randao_reveal: [0u8; 32],
+            randao_mix: [0u8; 32],
+            justified_root: [0u8; 32],
+            finalized_root: [0u8; 32],
+            attestation_root: [0u8; 32],
+            coherence_root: [0u8; 32],
+        }
+    }
+
+    fn attest(validator: u32, slot: u64, head: [u8; 32]) -> Attestation {
+        Attestation {
+            validator,
+            data: AttestationData {
+                slot,
+                head,
+                source_epoch: 0,
+                source_root: [0u8; 32],
+                target_epoch: 0,
+                target_root: head,
+            },
+            signature: Vec::new(),
+        }
+    }
+
+    /// Build `blocks` from `(parent, slot, marker, attestations)` tuples,
+    /// returning the map and each block's id in order.
+    fn chain_of(
+        specs: Vec<([u8; 32], u64, u8, Vec<Attestation>)>,
+    ) -> (BTreeMap<[u8; 32], BlockEnvelope>, Vec<[u8; 32]>) {
+        let mut blocks = BTreeMap::new();
+        let mut ids = Vec::new();
+        for (parent, slot, marker, atts) in specs {
+            let h = header(parent, slot, marker);
+            let id = *BlockId::of(&h).as_bytes();
+            blocks.insert(
+                id,
+                BlockEnvelope {
+                    header: h,
+                    proposer_sig: Vec::new(),
+                    body: Body { transactions: Vec::new(), attestations: atts },
+                },
+            );
+            ids.push(id);
+        }
+        (blocks, ids)
+    }
+
+    fn vals(n: u32) -> Vec<Validator> {
+        (0..n).map(|index| Validator { index, effective_stake: 100 }).collect()
+    }
+
+    /// **The reason this fork choice was changed.** A branch three blocks long
+    /// with one attester loses to a branch one block long with three.
+    ///
+    /// Under longest-valid-chain — what the node ran until now — the head is
+    /// the tip of the long branch, and a proposer who can produce blocks fast
+    /// overrides whatever the honest majority has voted for. Length is not the
+    /// security statement in proof of stake; attested stake is. Without this
+    /// test, swapping the implementations would be a claim rather than a
+    /// change: the cooperative devnet passes either way, because on a chain
+    /// with no forks the two rules agree.
+    #[test]
+    fn weight_beats_length() {
+        let g = [0x99u8; 32]; // the justified root the walk starts from
+
+        // Long branch: three blocks, one attester on the tip.
+        // Short branch: one block, three attesters.
+        let (mut blocks, long_ids) = chain_of(vec![
+            (g, 1, 1, vec![]),
+        ]);
+        let a1 = long_ids[0];
+        let (more, a_rest) = chain_of(vec![(a1, 2, 2, vec![])]);
+        blocks.extend(more);
+        let a2 = a_rest[0];
+        let (more, a_rest) = chain_of(vec![(a2, 3, 3, vec![])]);
+        blocks.extend(more);
+        let a3 = a_rest[0];
+
+        let (short, short_ids) = chain_of(vec![(g, 1, 9, vec![])]);
+        blocks.extend(short);
+        let b1 = short_ids[0];
+        assert_ne!(a1, b1, "the two branches must actually be siblings");
+
+        let validators = vals(4);
+        // Validator 0 attests the long tip; 1, 2 and 3 attest the short one.
+        let pool = vec![
+            attest(0, 3, a3),
+            attest(1, 1, b1),
+            attest(2, 1, b1),
+            attest(3, 1, b1),
+        ];
+
+        let head = lmd_ghost_head(&blocks, pool.iter(), &validators, g);
+        assert_eq!(
+            head, b1,
+            "fork choice followed length instead of attested weight — LMD-GHOST is not wired"
+        );
+
+        // And the converse, so the assertion above is not passing for some
+        // incidental reason: move the weight and the head moves with it.
+        let pool_flipped = vec![
+            attest(0, 3, a3),
+            attest(1, 3, a3),
+            attest(2, 3, a3),
+            attest(3, 1, b1),
+        ];
+        assert_eq!(lmd_ghost_head(&blocks, pool_flipped.iter(), &validators, g), a3);
+    }
+
+    /// The head is a function of the message *set*. Feeding the same
+    /// attestations in a different order must not move it — the property whose
+    /// violation in `Store::observe` made two honest nodes with identical
+    /// inputs compute different heads (found 2026-08-11).
+    #[test]
+    fn head_is_independent_of_attestation_order() {
+        let g = [0x99u8; 32];
+        let (mut blocks, ids) = chain_of(vec![(g, 1, 1, vec![])]);
+        let a1 = ids[0];
+        let (short, sids) = chain_of(vec![(g, 1, 9, vec![])]);
+        blocks.extend(short);
+        let b1 = sids[0];
+
+        let validators = vals(4);
+        let mut pool = vec![attest(0, 1, a1), attest(1, 1, b1), attest(2, 1, b1)];
+        let first = lmd_ghost_head(&blocks, pool.iter(), &validators, g);
+        pool.reverse();
+        let second = lmd_ghost_head(&blocks, pool.iter(), &validators, g);
+        assert_eq!(first, second);
+    }
+
+    /// Attestations from validators the canonical state does not know carry no
+    /// weight. Otherwise a branch could invent voters — the fork choice reads
+    /// one validator set, not the one each branch commits.
+    #[test]
+    fn unknown_validators_carry_no_weight() {
+        let g = [0x99u8; 32];
+        let (mut blocks, ids) = chain_of(vec![(g, 1, 1, vec![])]);
+        let a1 = ids[0];
+        let (short, sids) = chain_of(vec![(g, 1, 9, vec![])]);
+        blocks.extend(short);
+        let b1 = sids[0];
+
+        // Only validator 0 exists; it votes the long-branch block. Fifty
+        // invented voters back the other one.
+        let validators = vals(1);
+        let mut pool = vec![attest(0, 1, a1)];
+        pool.extend((100..150u32).map(|v| attest(v, 1, b1)));
+        assert_eq!(lmd_ghost_head(&blocks, pool.iter(), &validators, g), a1);
+    }
+
+    /// An equivocator is barred entirely, not counted for either side. With the
+    /// remaining honest stake tied, the tie-break is the larger root — the only
+    /// property that matters being that every node breaks it the same way.
+    #[test]
+    fn equivocator_weight_is_discarded() {
+        let g = [0x99u8; 32];
+        let (mut blocks, ids) = chain_of(vec![(g, 1, 1, vec![])]);
+        let a1 = ids[0];
+        let (short, sids) = chain_of(vec![(g, 1, 9, vec![])]);
+        blocks.extend(short);
+        let b1 = sids[0];
+
+        let validators = vals(2);
+        // Validator 1 signs both heads in the same slot; validator 0 backs a1.
+        let pool = vec![attest(0, 1, a1), attest(1, 1, a1), attest(1, 1, b1)];
+        let head = lmd_ghost_head(&blocks, pool.iter(), &validators, g);
+        assert_eq!(head, a1, "the equivocator was counted, or the honest vote was dropped");
     }
 }
