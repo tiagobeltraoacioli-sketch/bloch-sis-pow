@@ -206,7 +206,7 @@ do:
 ### 4.2 What that does not fix, stated plainly
 
 The carried-over balance is **liquid at genesis**, and the largest single
-address holds 3,546,175,400 BLCH — 70.4% of the circulating supply at slot 0.
+address holds 16,886,549,523 BLCH — 70.4% of the circulating supply at slot 0.
 Gate G2 requires the largest holder under 25%, which this schedule does not
 reach until roughly **year five**.
 
@@ -1026,7 +1026,7 @@ carried-over balance that is liquid is also stakeable — the founder's
 included (§4.2). The arithmetic consequence, worked in
 `BLOCH-TOKENOMICS-V4.md` §4A.1: rewards are pro-rata, so stake shares are
 conserved under compounding. If the founder stakes the carried-over
-3,546,175,400 BLCH, independent stake is pinned at ~6.03% of active stake —
+16,886,549,523 BLCH, independent stake is pinned at ~6.03% of active stake —
 and active stake never exceeds circulating supply, so it can never reach G1's
 15% of circulating: not by year five, not ever, from emission alone. If the
 founder keeps the balance out of stake voluntarily, the earliest arithmetic G1

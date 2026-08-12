@@ -20,7 +20,7 @@ This document is the Genesis-4 RPC surface: what dies with PoW, what changes
 meaning, and what is born with staking, delegation, commission and finality.
 It supersedes §1 of `BLOCH-ECOSYSTEM-MIGRATION.md` where the two differ — that
 survey was written before the taint machinery was dissolved and before the
-supply reverted to 21 billion, and this document folds both reversals in.
+supply reverted to 100 billion, and this document folds both reversals in.
 
 The OpenAPI V4 major (`docs/openapi.yaml`) is the normative wire contract;
 this document is its design rationale and method-level disposition. Freeze the
@@ -206,7 +206,7 @@ Rewritten from scratch against Tokenomics V4:
   marketing, liquidity, validator emission) with vested-vs-locked splits
   computed from the consensus vesting schedules, plus cumulative burned fees.
 - **Terminology is normative** (Tokenomics V4 §6.3.2): the headline figure is
-  `max_issued` = 21,000,000,000 BLCH; `circulating` = issued − burned − locked.
+  `max_issued` = 100,000,000,000 BLCH; `circulating` = issued − burned − locked.
   The two diverge from the first burned fee onward; the method must never
   label the cap "total supply".
 - The V3 implementation **omits the carryover balance** (known defect — it
@@ -328,7 +328,7 @@ Decision recorded here so it cannot be re-litigated by accident:
 
 Numbers, measured:
 
-- V4 supply cap: 21,000,000,000 BLCH = **2.1 × 10^18 sat**.
+- V4 supply cap: 100,000,000,000 BLCH = **2.1 × 10^18 sat**.
 - `i64::MAX` = 9.223 × 10^18 → the cap is **22.8%** of it (4.39× headroom).
 - The cap is hard (no tail — Tokenomics V4 §6.2 retired it) and base-fee burn
   only ever lowers supply, so no future total can approach the boundary.

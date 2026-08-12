@@ -193,7 +193,7 @@ market on top; it is what `split_fees_at` sees as `priority_fee`.
   overflow, not the totals). Compile-time assertions in `fee_market.rs` pin:
   byte-cap gas ≤ gas cap; targets are exact halves; `BLOCK_GAS_LIMIT ×
   MAX_BASE_FEE` and the controller's cross-multiplications fit `u128` with
-  the supply (`TOTAL_SUPPLY_SAT`, 11.38% of `u64::MAX`) as the anchor; the
+  the supply (`TOTAL_SUPPLY_SAT`, 54.21% of `u64::MAX`) as the anchor; the
   floor ≥ the change denominator.
 
 ### 4.4 Where the base fee lives — committed state, not the header
@@ -237,7 +237,7 @@ Measured against total supply, the way the tokenomics measures it
 (`annual_inflation_bps`):
 
 - **Era 1 gross:** the recommended decay curve peaks in year 1 at
-  `annual_inflation_bps(0)` = **436 bps = 4.36%** (917,168,073 BLCH =
+  `annual_inflation_bps(0)` = **436 bps = 4.36%** (4,367,467,014 BLCH =
   `INITIAL_ANNUAL_SAT`), then 286 bps in year 5, 169 bps in year 10.
 - **Era 1 net:** net = gross − burned, and burned ≥ 0 every slot, so
   **net ≤ 4.36% < the 7% target in every year, with 264 bps of margin

@@ -35,7 +35,7 @@ Banned everywhere on the site:
 - Any launch date for Genesis-4. There is none. If a date exists someday, it
   will appear here first, signed.
 - The supply figure "100 billion" in any form. The published figure is
-  21,000,000,000, marked *under review* (see Supply page note).
+  100,000,000,000, marked *under review* (see Supply page note).
 - Round numbers presented as measurements. Every figure is either **measured**
   (and says where and when) or **planned** (and says so).
 
@@ -191,7 +191,7 @@ kind of fact projects usually leave implicit until it lands on someone.
 
 Two more honest costs of this step:
 
-- The halt height was lowered from 80,000 to 50,000 on 2026-08-12. The notice
+- The halt height was lowered from 50,000 to 50,000 on 2026-08-12. The notice
   period is therefore measured in **days, not months**. Holders lose nothing
   by short notice — balances are captured automatically — but miners planning
   around the earlier height lost planning time, and that is on us.
@@ -252,13 +252,13 @@ exists it will be announced here and signed.
 ## Header
 
 **Eyebrow:** Supply
-**H2:** 21,000,000,000 BLCH, fixed — figure under review.
+**H2:** 100,000,000,000 BLCH, fixed — figure under review.
 **Intro:**
-Genesis-4 issues against a fixed total of 21,000,000,000 BLCH. **This figure
+Genesis-4 issues against a fixed total of 100,000,000,000 BLCH. **This figure
 is under review**: a redenomination of the unit — same percentages for every
 holder, more units per holder, economically a stock split and nothing else —
 is under consideration and is currently blocked on an open integer-arithmetic
-question in the implementation. Until that is resolved, 21,000,000,000 is the
+question in the implementation. Until that is resolved, 100,000,000,000 is the
 only number this site publishes. If the figure changes, every allocation below
 scales by the same factor and **nobody's share moves**. Any description of a
 redenomination as "more money" is wrong, and you should distrust whoever
@@ -273,7 +273,7 @@ mechanism can change it" is the claim, and it is checkable in the source.
 
 One more precision most projects skip: because a share of fees is burned
 during the emission era, circulating supply never actually reaches the cap.
-The correct sentence is "21,000,000,000 is the **maximum ever issued**", not
+The correct sentence is "100,000,000,000 is the **maximum ever issued**", not
 "the total supply" — the two diverge from the first burned fee onward.
 
 ## Allocation table
@@ -283,14 +283,14 @@ total under review as above.*
 
 | Allocation | BLCH | Share | Unlock |
 |---|---:|---:|---|
-| Validator emission — 40 years | 9,036,115,200 | 43.03% | emitted per slot, declining 10%/year |
-| Carried over from Genesis-3 | 3,773,884,800 | 17.97% | liquid at genesis |
-| Founder — new grant | 2,100,000,000 | 10.00% | 10-year cliff, then 40-year linear vest |
-| VC / crypto funds | 2,100,000,000 | 10.00% | 12-month cliff, then 24-month linear |
-| Team | 2,100,000,000 | 10.00% | 18-month cliff, then 36-month linear |
-| Liquidity | 1,050,000,000 | 5.00% | liquid at genesis |
-| Marketing | 840,000,000 | 4.00% | 25% at genesis, remainder over 24 months |
-| **Total** | **21,000,000,000** | **100.00%** | |
+| Validator emission — 40 years | 43,029,120,000 | 43.03% | emitted per slot, declining 10%/year |
+| Carried over from Genesis-3 | 17,970,850,000 | 17.97% | liquid at genesis |
+| Founder — new grant | 10,000,000,000 | 10.00% | 10-year cliff, then 40-year linear vest |
+| VC / crypto funds | 10,000,000,000 | 10.00% | 12-month cliff, then 24-month linear |
+| Team | 10,000,000,000 | 10.00% | 18-month cliff, then 36-month linear |
+| Liquidity | 5,000,000,000 | 5.00% | liquid at genesis |
+| Marketing | 4,000,000,000 | 4.00% | 25% at genesis, remainder over 24 months |
+| **Total** | **100,000,000,000** | **100.00%** | |
 
 *Carryover figures were measured on a live node at height 43,172 (448,337
 UTXOs across 15 addresses). The binding set is fixed by the signed snapshot at
@@ -299,7 +299,7 @@ height 50,000, so the final figures will differ slightly from these.*
 ## Card: Say it before you are asked — the supply is concentrated
 
 **93.96% of the carried-over balance sits at one address: the founder's,
-who mined it.** That is 3,546,175,400 of 3,773,884,800 BLCH measured at
+who mined it.** That is 16,886,549,523 of 17,970,850,000 BLCH measured at
 height 43,172. Counting the new grant, the founder's total allocation is
 26.89% of supply — 16.89% liquid at genesis plus 10% locked for a decade.
 
@@ -349,7 +349,7 @@ misleading, so here is both halves.
 
 ## Section: Emission
 
-9,036,115,200 BLCH to validators over 40 years, declining 10% per year —
+43,029,120,000 BLCH to validators over 40 years, declining 10% per year —
 roughly 872 BLCH per block in year one, 14 by year 40. Year-one issuance is
 4.37% of *total* supply.
 
@@ -491,7 +491,7 @@ so). The word "soon" is banned; a date exists or it does not.
 
 ## Card: Bond — planned
 
-Minimum validator deposit: **100,000 BLCH** in the current draft, explicitly
+Minimum validator deposit: **25,000 BLCH** in the current draft, explicitly
 under review — it may be lowered together with the supply-figure decision so
 that the bond stays a comparable fraction of supply to Ethereum's 32 ETH.
 
@@ -577,7 +577,7 @@ because a spec that hides its own history is advertising.
   Genesis-4 design: slots, finality, sortition, staking lifecycle, and the
   go/no-go gates. Opens with the design's single largest risk (stake
   concentration) rather than burying it, and states which gates are not met.
-- **Tokenomics V4** — DRAFT, parameters not frozen. The 21,000,000,000
+- **Tokenomics V4** — DRAFT, parameters not frozen. The 100,000,000,000
   allocation (figure under review), vesting, emission curve, and the measured
   concentration arithmetic — including the founder-unfavorable results, which
   are the part most worth reading.
@@ -717,7 +717,7 @@ defect behind it. A unit redenomination is under consideration; at one
 candidate figure, supply in base units consumes enough of the 64-bit integer
 range that balance sums approach overflow, and it exceeds the signed-64-bit
 type one of our own SDKs uses. Until the arithmetic is closed — wider
-accumulators audited end to end — the published figure stays 21,000,000,000.
+accumulators audited end to end — the published figure stays 100,000,000,000.
 A supply number is a consensus invariant; we would rather mark it "under
 review" than revise it after the fact.
 

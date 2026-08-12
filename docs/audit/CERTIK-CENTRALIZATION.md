@@ -39,7 +39,7 @@ the measured commit:
 
 1. **Total supply 21 B → 100 B as a pure split (×100/21).** The repo still
    pins 21 B (`crates/bloch-pos-committee/src/tokenomics_v4.rs:33`), with a
-   rationale block written for the revert (11.38% of `u64::MAX`; fits the Go
+   rationale block written for the revert (54.21% of `u64::MAX`; fits the Go
    SDK's signed `int64`, pinned at `tokenomics_v4.rs:255`). When the 100 B
    change lands, both retired hazards return: the supply becomes 54.21% of
    `u64::MAX` and **no longer fits `i64`** — the compile-time assertion at
@@ -50,7 +50,7 @@ the measured commit:
    chain-wide rounding rule (direction and dust disposition) or two
    implementations will disagree at the satoshi level. None of this changes
    any percentage in this document: a pure split moves no share.
-2. **Genesis-3 terminal height 80,000 → 50,000.** The repo pins 80,000
+2. **Genesis-3 terminal height 50,000 → 50,000.** The repo pins 50,000
    (`crates/bloch-crypto/src/core/mod.rs:438`); the main checkout carries the
    50,000 edit uncommitted. §6 discusses what this reversal demonstrates.
 
@@ -71,8 +71,8 @@ document:
 
 | Measure | Value | Evidence |
 |---|---:|---|
-| Largest single address / carried-over set | **93.96618041970969%** (3,546,175,400 of 3,773,884,800 BLCH) | `tokenomics_v4.rs:100,236`; spec §2 |
-| Founder liquid at slot 0 / circulating at slot 0 | **70.44609761431171%** (of 5,033,884,800 BLCH) | spec §4A; `tokenomics_v4.rs:72-73` (Foundation float) |
+| Largest single address / carried-over set | **93.96618041970969%** (16,886,549,523 of 17,970,850,000 BLCH) | `tokenomics_v4.rs:100,236`; spec §2 |
+| Founder liquid at slot 0 / circulating at slot 0 | **70.44609761431171%** (of 23,970,850,000 BLCH) | spec §4A; `tokenomics_v4.rs:72-73` (Foundation float) |
 | Founder / active stake, if the carryover stakes | **93.97%**, Nakamoto coefficient **1** | spec §4A.1; staking is permitted: `staking.rs:601` test |
 | Founder total (carryover + new 10% grant) / total supply | **26.886549523809524%** | compile-pinned at 2688 bps, `tokenomics_v4.rs:240-241` |
 | Independent (non-founder) share of the carryover | **6.033819580290315%** | spec §4A.1 |
@@ -91,7 +91,7 @@ it is a pure split; any document calling it dilution or distribution is wrong.
   emission alone**. Not late; unreachable.
 - If the founder voluntarily abstains from staking the carryover, the earliest
   arithmetic G1 crossing is **t ≈ 0.72 years (~month 9)** — solving
-  227,709,400 + 917,168,074·t = 0.15·(5,033,884,800 + 917,168,074·t +
+  227,709,400 + 917,168,074·t = 0.15·(23,970,850,000 + 917,168,074·t +
   315,000,000·t). A bound, not a forecast: the founder-operated genesis cohort
   earns much of the early emission, so the realistic date is later.
 - Neither behaviour is consensus-enforced. Whether the gates are ever met is
@@ -294,7 +294,7 @@ L1 — who can change the rules):
 |---|---|---|
 | Write consensus rules (the node source) | Postern Labs Ltda (exists; founder-owned) | Nothing but operator adoption |
 | Deploy rules to the network | The fleet's operators — currently the founder's ~3 boxes | See §5: adoption ≈ founder consent today |
-| Set/move the terminal height | Demonstrated: founder moved it 80,000 → 50,000 on 2026-08-12 unilaterally | §6 |
+| Set/move the terminal height | Demonstrated: founder moved it 50,000 → 50,000 on 2026-08-12 unilaterally | §6 |
 | Sign the canonical snapshot | Founder / Postern Labs keys | Publication breadth is the only check (spec §3.2.2) |
 | Sign weak-subjectivity checkpoints | Foundation (per ADR-036) | Phased m-of-n with external-signer minimum, `BLOCH-WEAK-SUBJECTIVITY.md` §6 |
 | Allocate the genesis validator cohort | Founder (funds and operates it) | Consensus taper to ≤ 1/3 within a year, `genesis_cohort.rs` — cohort addresses only |
@@ -418,7 +418,7 @@ migration design §11) becomes true, and no faster.
 **What an auditor will see:** a constant that makes the chain refuse all
 blocks above a fixed height —
 `crates/bloch-crypto/src/core/mod.rs:438` (`GENESIS3_TERMINAL_HEIGHT`,
-80,000 at the measured commit; 50,000 per the 2026-08-12 decision), enforced
+50,000 at the measured commit; 50,000 per the 2026-08-12 decision), enforced
 fail-closed in the accept path before any other validation
 (`src/main.rs:2533-2545`), in the miner (`src/main.rs:1820-1836`), and in
 both stratum template paths (`src/stratum/session.rs:102`,
@@ -455,7 +455,7 @@ into the Genesis-4 genesis block (§3.2.2).
 **Where the analogy does NOT fail — the residual truth in the auditor's
 question, stated so they do not have to extract it:**
 
-- The date is set, and was **moved**, unilaterally: 80,000 → 50,000 on
+- The date is set, and was **moved**, unilaterally: 50,000 → 50,000 on
   2026-08-12, cutting public notice from ~2 weeks to ~4.4 days. The spec's
   own §3.1 argued the height should land before the (since-retired) cap
   bound and that shorter notice is *better* here because notice only enables
@@ -509,7 +509,7 @@ Checked every deposit-shaped path in the PoS design:
 | Skynet check | Bloch answer | Section |
 |---|---|---|
 | Major holder concentration | **FAIL, measured and disclosed**: 93.966% of carryover / 70.446% of genesis circulating / 94.0% of active stake if staked (NC = 1); vs WBNB's 39.28% attention flag. Unchanged by the 100 B split. | §1 |
-| Mintable | No path beyond the curve; lifetime emission measured 889,200 sat *under* allocation; cap-invariant decision not yet code; "zero residual" rustdoc is false | §2 |
+| Mintable | No path beyond the curve; lifetime emission measured 176,880 sat *under* allocation; cap-invariant decision not yet code; the "zero residual" rustdoc was wrong and is corrected | §2 |
 | Blacklist | Retired by design; verified no producer of `Tainted` exists at this commit; guarantee is documentary until an emptiness invariant lands | §3 |
 | Whitelist | None for transfers; genesis cohort is a shrink-only *cap* list on the founder's own validators | §3 |
 | Hidden ownership | Nothing hidden; ownership real and concentrated; ADR-036 retracted renunciation in writing; two entities are one person until the §5.2 board exists | §4 |

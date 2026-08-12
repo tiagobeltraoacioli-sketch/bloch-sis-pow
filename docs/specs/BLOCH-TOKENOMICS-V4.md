@@ -14,7 +14,7 @@ Relates to: BLOCH-POS-SHA3-LATTICE-MIGRATION.md (§4 distribution gates)
 
 ## 1. Decision
 
-Relaunch from a fresh genesis with a **fixed 21,000,000,000 BLCH** supply — the
+Relaunch from a fresh genesis with a **fixed 100,000,000,000 BLCH** supply — the
 V2 nominal, after a draft at 100 billion.
 
 **The whole carryover comes across as one balance set, with no founder line.**
@@ -24,22 +24,22 @@ liquid includes stakeable (decided 2026-08-11, §4A.1). The founder additionally
 receives a new 10% grant under a 10-year cliff and 40-year linear vest — the V2
 premine schedule, at 10% rather than the V2 17%.
 
-Returning to 21 billion removes two hazards the 100-billion draft created, at no
-cost: the supply is **11.38% of `u64::MAX`** rather than the earlier draft's 54.21%, so the sum of
+Returning to 100 billion removes two hazards the 100-billion draft created, at no
+cost: the supply is **54.21% of `u64::MAX`** rather than the earlier draft's 54.21%, so the sum of
 two large balances is nowhere near the wrap point; and it **fits in the signed
 `int64`** the Go SDK uses for `Satoshis` (`sdk/go/models.go:16`), which 100
 billion overflowed by 8%.
 
 | Destination | BLCH | Share | Unlock |
 |---|---:|---:|---|
-| Carryover — the whole ledger | 3,773,884,800 | 17.97% | **liquid at genesis** |
-| Founder — new grant | 2,100,000,000 | 10.00% | 10-year cliff, then 40-year linear |
-| VC / crypto hedge funds | 2,100,000,000 | 10.00% | 12-month cliff, then 24-month linear |
-| Development team | 2,100,000,000 | 10.00% | 18-month cliff, then 36-month linear |
-| Marketing | 840,000,000 | 4.00% | 25% at genesis, remainder linear over 24 months |
-| Liquidity | 1,050,000,000 | 5.00% | 100% liquid at genesis |
-| **Validators** | **9,036,115,200** | **43.03%** | emitted over 40 years |
-| **Total** | **21,000,000,000** | **100.00%** | |
+| Carryover — the whole ledger | 17,970,850,000 | 17.97% | **liquid at genesis** |
+| Founder — new grant | 10,000,000,000 | 10.00% | 10-year cliff, then 40-year linear |
+| VC / crypto hedge funds | 10,000,000,000 | 10.00% | 12-month cliff, then 24-month linear |
+| Development team | 10,000,000,000 | 10.00% | 18-month cliff, then 36-month linear |
+| Marketing | 4,000,000,000 | 4.00% | 25% at genesis, remainder linear over 24 months |
+| Liquidity | 5,000,000,000 | 5.00% | 100% liquid at genesis |
+| **Validators** | **43,029,120,000** | **43.03%** | emitted over 40 years |
+| **Total** | **100,000,000,000** | **100.00%** | |
 
 **Founder total: 26.89%** — the carried-over balance plus the new grant. The
 grant was cut from 17% to 10% on 2026-08-11 and the 1,470,000,000 difference
@@ -47,8 +47,8 @@ went to validators, the only reallocation so far that moved supply *away* from
 an insider bucket.
 
 <figure style="margin:1.4em 0">
-<svg viewBox="0 0 690 356" width="100%" role="img" aria-label="Distribuicao do supply de 21 bilhoes de BLCH em sete destinos" style="max-width:690px;font-family:Charter,Georgia,serif">
-<title>Distribuição do supply — 21.000.000.000 BLCH</title>
+<svg viewBox="0 0 690 356" width="100%" role="img" aria-label="Distribuicao do supply de 100 bilhoes de BLCH em sete destinos" style="max-width:690px;font-family:Charter,Georgia,serif">
+<title>Distribuição do supply — 100.000.000.000 BLCH</title>
 <path d="M 170.00 178.00 L 171.18 28.00 A 150 150 0 0 1 234.68 313.34 Z" fill="#2a78d6"/>
 <path d="M 170.00 178.00 L 232.55 314.34 A 150 150 0 0 1 75.30 294.32 Z" fill="#eb6834"/>
 <path d="M 170.00 178.00 L 73.48 292.82 A 150 150 0 0 1 25.01 216.44 Z" fill="#1baf7a"/>
@@ -66,39 +66,39 @@ an insider bucket.
 <text x="676" y="24" font-size="10" fill="#5c6169" letter-spacing="0.09em" text-anchor="end">%</text>
 <rect x="372" y="32" width="12" height="12" rx="3" fill="#2a78d6"/>
 <text x="392" y="42" font-size="12.5" fill="#14161a" dominant-baseline="middle">Validadores</text>
-<text x="608" y="42" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">9.036.115.200</text>
+<text x="608" y="42" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">43.029.120.000</text>
 <text x="676" y="42" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">43.03</text>
 <rect x="372" y="62" width="12" height="12" rx="3" fill="#eb6834"/>
 <text x="392" y="72" font-size="12.5" fill="#14161a" dominant-baseline="middle">Carryover</text>
-<text x="608" y="72" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">3.773.884.800</text>
+<text x="608" y="72" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">17.970.850.000</text>
 <text x="676" y="72" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">17.97</text>
 <rect x="372" y="92" width="12" height="12" rx="3" fill="#1baf7a"/>
 <text x="392" y="102" font-size="12.5" fill="#14161a" dominant-baseline="middle">Fundador — concessão</text>
-<text x="608" y="102" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">2.100.000.000</text>
+<text x="608" y="102" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">10.000.000.000</text>
 <text x="676" y="102" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">10.00</text>
 <rect x="372" y="122" width="12" height="12" rx="3" fill="#eda100"/>
 <text x="392" y="132" font-size="12.5" fill="#14161a" dominant-baseline="middle">VC</text>
-<text x="608" y="132" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">2.100.000.000</text>
+<text x="608" y="132" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">10.000.000.000</text>
 <text x="676" y="132" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">10.00</text>
 <rect x="372" y="152" width="12" height="12" rx="3" fill="#e87ba4"/>
 <text x="392" y="162" font-size="12.5" fill="#14161a" dominant-baseline="middle">Time</text>
-<text x="608" y="162" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">2.100.000.000</text>
+<text x="608" y="162" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">10.000.000.000</text>
 <text x="676" y="162" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">10.00</text>
 <rect x="372" y="182" width="12" height="12" rx="3" fill="#008300"/>
 <text x="392" y="192" font-size="12.5" fill="#14161a" dominant-baseline="middle">Liquidez</text>
-<text x="608" y="192" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">1.050.000.000</text>
+<text x="608" y="192" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">5.000.000.000</text>
 <text x="676" y="192" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">5.00</text>
 <rect x="372" y="212" width="12" height="12" rx="3" fill="#4a3aa7"/>
 <text x="392" y="222" font-size="12.5" fill="#14161a" dominant-baseline="middle">Marketing</text>
-<text x="608" y="222" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">840.000.000</text>
+<text x="608" y="222" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">4.000.000.000</text>
 <text x="676" y="222" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">4.00</text>
 <line x1="372" y1="240" x2="676" y2="240" stroke="#d5d9df"/>
 <text x="392" y="254" font-size="12.5" font-weight="700" fill="#14161a" dominant-baseline="middle">Total</text>
-<text x="608" y="254" font-size="12.5" font-weight="700" fill="#14161a" text-anchor="end" dominant-baseline="middle">21.000.000.000</text>
+<text x="608" y="254" font-size="12.5" font-weight="700" fill="#14161a" text-anchor="end" dominant-baseline="middle">100.000.000.000</text>
 <text x="676" y="254" font-size="12.5" font-weight="700" fill="#14161a" text-anchor="end" dominant-baseline="middle">100,00</text>
 </svg>
 <figcaption style="font-size:9.5pt;color:#5c6169;margin-top:.5em">
-Distribution of the 21,000,000,000 BLCH supply. Slices carry a direct label
+Distribution of the 100,000,000,000 BLCH supply. Slices carry a direct label
 only where one fits; every figure is in the legend, which is also the table
 view — three buckets sit at exactly 10% — a pie cannot show that as well as the
 number does, which is why the legend carries both.
@@ -120,7 +120,7 @@ Not estimated. A read-only UTXO snapshot was taken on node4 at **height
 |---|---|
 | UTXOs | 448,337 |
 | Addresses | 15 |
-| **Total carried over** | **3,773,884,800 BLCH** |
+| **Total carried over** | **17,970,850,000 BLCH** |
 | Snapshot root (SHAKE-256) | `280d604b32525f03…` |
 | Carryover digest (SHAKE-256) | `92918209a106f297…` |
 
@@ -132,7 +132,7 @@ leaving to be discovered:
 
 | | BLCH | Share of carryover |
 |---|---:|---:|
-| Largest single address | 3,546,175,400 | 93.96% |
+| Largest single address | 16,886,549,523 | 93.96% |
 | The other 14 | 227,709,400 | 6.04% |
 
 An earlier draft of this section reported 413,743 UTXOs across five addresses,
@@ -165,7 +165,7 @@ Three things follow, and the third is the one worth keeping:
    concern was not mitigated — it ceased to exist, which is the only one of this
    document's risks that got resolved rather than traded.
 
-### 3.1 Snapshot height — decided: 80,000
+### 3.1 Snapshot height — decided: 50,000
 
 Measured at height **40,424**: non-founder holdings ≈ **236.8 M BLCH**, 79% of
 the cap, growing **≈ 3.97 M/day**. On the central estimate the cap binds around
@@ -181,7 +181,7 @@ collectively worthless, and a pure race.
 |---:|---:|---:|---:|---:|---:|
 | 60,000 | 6.8 | 100% | 100% | 100% | 98% |
 | 70,000 | 10.3 | 100% | 100% | 100% | 91% |
-| **80,000** | **13.7** | **100%** | **100%** | **95%** | 86% |
+| **50,000** | **13.7** | **100%** | **100%** | **95%** | 86% |
 | 86,000 | 15.8 | 100% | 100% | 92% | 83% |
 | 100,000 | 20.7 | 100% | 94% | 86% | 77% |
 
@@ -189,7 +189,7 @@ collectively worthless, and a pure race.
 16.4%, is derived from a single prior measurement rather than a fresh audit, so
 the table spans the plausible range.
 
-**80,000** gives about two weeks of notice — the recognisable norm for a
+**50,000** gives about two weeks of notice — the recognisable norm for a
 snapshot — on a round, legible number, and preserves every holder in full
 unless third-party mining is running well above the estimate.
 
@@ -206,7 +206,7 @@ to 70,000.
 
 ### 3.2 The chain halts at the snapshot
 
-**Height 80,000 is a terminal height, not just a measurement point.** The
+**Height 50,000 is a terminal height, not just a measurement point.** The
 current chain stops producing blocks there; Genesis-4 launches from the
 snapshot roughly six months later, after code review.
 
@@ -218,7 +218,7 @@ during exactly the six months it still has users, wallets and an explorer
 pointed at it. Halting removes both: nobody mines coins with no future, and
 nobody buys into a chain with no future.
 
-Two things must exist **before** height 80,000, which is about two weeks away.
+Two things must exist **before** height 50,000, which is about two weeks away.
 
 #### 3.2.1 The halt has to be a consensus rule
 
@@ -229,16 +229,16 @@ fork nobody agreed to.
 
 This is a flag day in reverse and it inherits every flag-day hazard this project
 has already lived through: the release must actually be the binary the fleet
-runs. Anyone who does not upgrade will keep mining past 80,000 on a fork; that
-is tolerable, but only if the canonical snapshot is fixed at 80,000 and said so
+runs. Anyone who does not upgrade will keep mining past 50,000 on a fork; that
+is tolerable, but only if the canonical snapshot is fixed at 50,000 and said so
 publicly.
 
 #### 3.2.2 After the halt, the chain's own history stops being evidence
 
 This is the non-obvious one. PoW security is bought with ongoing hashrate. The
-moment mining stops, the cost of rewriting history from below height 80,000
+moment mining stops, the cost of rewriting history from below height 50,000
 collapses toward zero — anyone with modest hashrate can produce an alternative
-chain ending at 80,000 with different balances, and after a few months of no
+chain ending at 50,000 with different balances, and after a few months of no
 honest mining, it may carry more accumulated work than the real one.
 
 Therefore the **signed snapshot artifact is canonical, not the chain**. At the
@@ -278,7 +278,7 @@ validator joins through the ordinary deposit path.
 Three things this must satisfy, and one it must not pretend to.
 
 **It must be funded from a named bucket.** Liquid supply at genesis is
-5,033,884,800 BLCH: the whole carryover (17.97%), liquidity (5%) and the
+23,970,850,000 BLCH: the whole carryover (17.97%), liquidity (5%) and the
 marketing TGE tranche (1%). VC, team and the founder's new grant are entirely
 cliffed.
 
@@ -370,7 +370,7 @@ Stated plainly, because it affects parties who are not in the room:
 
 | | Today | After V4 |
 |---|---:|---:|
-| Coins carried over | 3,475,441,200 (G-1 file) | 3,773,884,800 (measured live) |
+| Coins carried over | 3,475,441,200 (G-1 file) | 17,970,850,000 (measured live) |
 | Non-founder **share of network** | 5.21% | **≤ 0.30%** |
 
 Holders keep their coins in absolute terms and lose roughly **17×** of their
@@ -389,8 +389,8 @@ changes and it should be stated in numbers rather than characterised.
 
 | | |
 |---|---|
-| Circulating at slot 0 | 5,033,884,800 BLCH (carryover 3.77 B + liquidity 1.05 B + marketing TGE 0.21 B) |
-| Founder liquid at slot 0 | 3,546,175,400 BLCH |
+| Circulating at slot 0 | 23,970,850,000 BLCH (carryover 3.77 B + liquidity 1.05 B + marketing TGE 0.21 B) |
+| Founder liquid at slot 0 | 16,886,549,523 BLCH |
 | **Founder share of circulating** | **70.4%** |
 
 Gate G2 requires the largest holder to hold under 25% of active stake. On this
@@ -440,7 +440,7 @@ bound.** Rewards are pro-rata to stake (§6.3), so compounding preserves stake
 like everyone else, the independent share of active stake stays where it
 started —
 
-    227,709,400 / 3,773,884,800 = 6.03%
+    227,709,400 / 17,970,850,000 = 6.03%
 
 — at every horizon. Active stake can never exceed circulating supply, so
 independent stake can never exceed 6.03% of circulating either: **under this
@@ -455,7 +455,7 @@ hands.
 balance stays out of stake — permitted to enter, voluntarily kept out — the
 independents can capture the whole emission. Solving
 
-    227,709,400 + E(t) = 0.15 × (5,033,884,800 + E(t) + U(t))
+    227,709,400 + E(t) = 0.15 × (23,970,850,000 + E(t) + U(t))
 
 with year-one emission flow E(t) = 917,168,074·t (the decay curve's first
 year) and unlock flow U(t) = 315,000,000·t (the marketing tranche; VC and team
@@ -466,7 +466,7 @@ realistic date is later. But it is measured in months, not in five years.
 
 **G2 (largest entity < 25% of active stake).** Measured against *active*
 stake, staking the carryover is strictly worse than the 70.4%-of-circulating
-figure above: at genesis the founder would hold 3,546,175,400 of 3,773,884,800
+figure above: at genesis the founder would hold 16,886,549,523 of 17,970,850,000
 staked — **94.0% of active stake**, a Nakamoto coefficient of 1. Under
 conserved shares that figure does not decay either.
 
@@ -516,9 +516,9 @@ years locked, forty vesting, fully vested at year 50.
 
 ## 6. Emission
 
-- Validator allocation: **9,036,115,200 BLCH** over **40 years**.
+- Validator allocation: **43,029,120,000 BLCH** over **40 years**.
 - At 30 s slots: 42,076,800 slots in 40 years.
-- **Average 215 BLCH per block.**
+- **Average 1,022 BLCH per block.**
 
 ### 6.1 Curve — decided: 10% annual disinflation
 
@@ -527,22 +527,22 @@ decentralisation requirement from §7A, that pins the curve almost exactly.
 
 | Curve | Year-1 inflation | Decentralisation gate |
 |---|---:|---|
-| Flat, 215 BLCH/block | 1.08% | **Fails** — validators never outpace insider unlocks |
+| Flat, 1,022 BLCH/block | 1.08% | **Fails** — validators never outpace insider unlocks |
 | Halving every 4 years | 5.38% | Passes, but revenue halves on scheduled dates |
 | Decay, 8%/year decline | 3.56% | **Fails at month 36** — too flat |
 | **Decay, 10%/year decline** | **4.37%** | **Passes** |
 | Decay, 12%/year decline | 5.19% | Passes, but the shape, not the ceiling, is what rules it out |
 
 **Adopted: reward declines 10% per year**, constant within each year, summing
-to exactly the 9,036,115,200 allocation across 40 years.
+to exactly the 43,029,120,000 allocation across 40 years.
 
 | Year | BLCH/block | Inflation (of total supply) |
 |---:|---:|---:|
-| 1 | 871.90 | 4.37% |
-| 5 | 572.05 | 2.87% |
-| 10 | 337.79 | 1.69% |
-| 20 | 117.78 | 0.59% |
-| 40 | 14.32 | 0.07% |
+| 1 | 4,151.90 | 4.37% |
+| 5 | 2,724.05 | 2.87% |
+| 10 | 1,608.52 | 1.69% |
+| 20 | 560.86 | 0.59% |
+| 40 | 68.19 | 0.07% |
 
 Truncation residual across the whole 40-year schedule: **889,200 sat
 (0.0089 BLCH)** — under the allocation, never over.
@@ -614,7 +614,7 @@ Commission is meaningless without delegated stake, and pro-rata-to-all-stake
 rewards only make sense if stake can sit behind an operator without running
 one. **The Solana revenue model cannot be adopted without adding delegation**,
 which the PoS design does not currently have: validators deposit directly with
-a 100,000 BLCH minimum.
+a 25,000 BLCH minimum.
 
 Four rules make delegation safe to add:
 
@@ -708,9 +708,9 @@ neither.
 
 **Consequence for the supply figure — this changes what "100 billion" means.**
 Burned fees are permanently destroyed, so total supply never reaches
-21,000,000,000. The correct statement is:
+100,000,000,000. The correct statement is:
 
-> 21,000,000,000 BLCH is the **maximum ever issued**. Circulating supply
+> 100,000,000,000 BLCH is the **maximum ever issued**. Circulating supply
 > settles at that figure minus everything burned during the 40-year emission
 > era, and is fixed thereafter.
 
@@ -755,10 +755,10 @@ marketing = 41%) falls between Aptos (~32.5% team plus investors) and Celestia
 ## 7B. The four Foundation buckets, one by one
 
 VC, team, marketing and liquidity are held by the Foundation
-(`BLOCH-ENTITY-STRUCTURE.md` §3). Together they are **6,090,000,000 BLCH —
-29.00% of supply**, of which **1,260,000,000 is liquid at genesis**.
+(`BLOCH-ENTITY-STRUCTURE.md` §3). Together they are **29,000,000,000 BLCH —
+29.00% of supply**, of which **6,000,000,000 is liquid at genesis**.
 
-### VC / crypto hedge funds — 2,100,000,000 (10.00%)
+### VC / crypto hedge funds — 10,000,000,000 (10.00%)
 
 Sold to funds; the Foundation is the counterparty of the round. **Nothing is
 liquid at genesis**: 12-month cliff, then 24 months linear, fully vested at
@@ -767,7 +767,7 @@ rather than precautionary — selling to investors with a return expectation is
 what moved BLCH toward the centre of the investment-contract test, and it is
 why ADR-036 retracted the ownerless thesis.
 
-### Development team — 2,100,000,000 (10.00%)
+### Development team — 10,000,000,000 (10.00%)
 
 Held by the Foundation and granted to individuals; once granted, individuals
 hold their own. **Nothing liquid at genesis**: 18-month cliff, then 36 months
@@ -776,13 +776,13 @@ purpose — the *cliff wall*, several buckets unlocking in the same month, is th
 most cited failure mode in vesting design, so VC (12), team (18) and founder
 (120) never share a month.
 
-### Marketing — 840,000,000 (4.00%)
+### Marketing — 4,000,000,000 (4.00%)
 
-**210,000,000 liquid at genesis** (25%), for listing fees and launch spend; the
+**1,000,000,000 liquid at genesis** (25%), for listing fees and launch spend; the
 remaining 630,000,000 vests linearly over 24 months. The split follows ordinary
 practice: launch spend is immediate by nature, ongoing programmes are not.
 
-### Liquidity — 1,050,000,000 (5.00%)
+### Liquidity — 5,000,000,000 (5.00%)
 
 **100% liquid at genesis.** Deployed to exchange order books and AMM pools.
 Vesting a liquidity bucket defeats the purpose of having one, so this is the one
@@ -792,16 +792,16 @@ allocation where full unlock is not a concession but the function.
 
 | Bucket | BLCH | Share | Liquid at genesis | Fully vested |
 |---|---:|---:|---:|---|
-| VC | 2,100,000,000 | 10.00% | 0 | year 3 |
-| Team | 2,100,000,000 | 10.00% | 0 | year 4.5 |
-| Marketing | 840,000,000 | 4.00% | 210,000,000 | year 2 |
-| Liquidity | 1,050,000,000 | 5.00% | 1,050,000,000 | genesis |
-| **Total** | **6,090,000,000** | **29.00%** | **1,260,000,000** | |
+| VC | 10,000,000,000 | 10.00% | 0 | year 3 |
+| Team | 10,000,000,000 | 10.00% | 0 | year 4.5 |
+| Marketing | 4,000,000,000 | 4.00% | 1,000,000,000 | year 2 |
+| Liquidity | 5,000,000,000 | 5.00% | 5,000,000,000 | genesis |
+| **Total** | **29,000,000,000** | **29.00%** | **6,000,000,000** | |
 
 ### The number worth noticing
 
-Circulating supply at slot 0 is 5,033,884,800 BLCH — the carryover plus these
-1,260,000,000. So the Foundation's liquid holding is **exactly 25.0% of
+Circulating supply at slot 0 is 23,970,850,000 BLCH — the carryover plus these
+6,000,000,000. So the Foundation's liquid holding is **exactly 25.0% of
 circulating at genesis**, sitting precisely on the G2 threshold, and the
 carryover is the other 75.0%.
 
@@ -865,7 +865,7 @@ every 4 years, 10 halvings across the 40-year window.
 
 ### 8.1 u64 headroom — must be addressed before any code lands
 
-At 8 decimal places, 21 B BLCH is **2.1 × 10^18 satoshis — 11.38% of
+At 8 decimal places, 21 B BLCH is **2.1 × 10^18 satoshis — 54.21% of
 `u64::MAX`**, and it fits inside the signed `int64` the Go SDK uses for
 `Satoshis` (`sdk/go/models.go:16`).
 

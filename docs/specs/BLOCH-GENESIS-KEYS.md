@@ -49,13 +49,13 @@ scope here, with one exception noted in §5.1.
 
 ### What each address is for
 
-- **Founder grant (2,100,000,000 BLCH)** — nothing spendable before year 10,
+- **Founder grant (10,000,000,000 BLCH)** — nothing spendable before year 10,
   fully vested year 50. The key signs nothing for a decade.
-- **VC (2,100,000,000)** — cliffed 12 months, fully vested year 3.
-- **Team (2,100,000,000)** — cliffed 18 months, fully vested year 4.5.
-- **Marketing (840,000,000)** — 25% spendable at slot 0, rest over 24 months.
+- **VC (10,000,000,000)** — cliffed 12 months, fully vested year 3.
+- **Team (10,000,000,000)** — cliffed 18 months, fully vested year 4.5.
+- **Marketing (4,000,000,000)** — 25% spendable at slot 0, rest over 24 months.
   The one bucket key that must sign *early and routinely*.
-- **Liquidity (1,050,000,000 minus bonded cohort stake)** — fully liquid at
+- **Liquidity (5,000,000,000 minus bonded cohort stake)** — fully liquid at
   slot 0; deploys to order books and funds the cohort (§3.3.1).
 - **Validator keys** — hot consensus keys: propose blocks, attest, sign
   exits. Compromise loses at most the slashable bonded stake, never the
@@ -238,7 +238,7 @@ year 50. For that horizon:
 ### 5.1 The carryover exception worth naming
 
 The largest value at stake on day one is not any bucket: it is the carried-
-over founder balance (3,546,175,400 BLCH), liquid at slot 0, guarded by
+over founder balance (16,886,549,523 BLCH), liquid at slot 0, guarded by
 **Genesis-3 keys that already exist today** — generated long ago, under
 older procedures, on the old suite's tooling. Their exposure window is
 already open and cannot be shortened by anything in this document. The only

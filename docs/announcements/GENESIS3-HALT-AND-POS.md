@@ -22,7 +22,7 @@
 - Between the halt and the Genesis-4 launch there will be a period of
   **several months with no running chain**. The explorer at
   [blochl1.com](https://blochl1.com) stays online serving history.
-- On Genesis-4 the total supply is redenominated from 21,000,000,000 to
+- On Genesis-4 the total supply is redenominated from 100,000,000,000 to
   **100,000,000,000 BLCH as a pure split (×4.7619)**. Every balance is
   multiplied by the same factor; every percentage stays identical. Nobody
   gains, nobody is diluted. It is not new money.
@@ -130,7 +130,7 @@ During the pause:
 
 ## 5. The supply number changes. Your share does not.
 
-Genesis-4 redenominates the total supply from 21,000,000,000 to
+Genesis-4 redenominates the total supply from 100,000,000,000 to
 **100,000,000,000 BLCH**. This is a **pure split**: every balance, every
 allocation, and every protocol constant denominated in BLCH is multiplied by
 the same factor, 100/21 ≈ **4.7619**.
@@ -164,7 +164,7 @@ The full allocation, in post-split terms:
 
 | Allocation | BLCH | Share | Terms |
 |---|---:|---:|---|
-| Carryover (all Genesis-3 balances) | 17,970,880,000 | 17.97% | liquid at genesis |
+| Carryover (all Genesis-3 balances) | 17,970,850,000 | 17.97% | liquid at genesis |
 | Validator emission | 43,029,120,000 | 43.03% | issued over 40 years |
 | Founder grant | 10,000,000,000 | 10% | 10-year cliff, then 40-year linear vest |
 | VC | 10,000,000,000 | 10% | vesting |

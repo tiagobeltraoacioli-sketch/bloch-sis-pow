@@ -234,8 +234,8 @@ stake across many validators and keep economic control; beneficial ownership
 is invisible on-chain (`delegation.rs:80–84`, `genesis_cohort.rs:41–48`).
 The cohort cap binds only the genesis addresses — nothing prevents funding
 new validators outside the cohort. And the concentration these caps operate
-against is severe: the largest carried-over address holds 3,546,175,400 of
-3,773,884,800 BLCH — 93.97% of the carryover — and if staked would be ~94%
+against is severe: the largest carried-over address holds 16,886,549,523 of
+17,970,850,000 BLCH — 93.97% of the carryover — and if staked would be ~94%
 of active stake, Nakamoto coefficient 1
 (`docs/specs/BLOCH-TOKENOMICS-V4.md` §4A/§4A.1;
 `tokenomics_v4.rs::LARGEST_CARRYOVER_ADDRESS_BLOCH`, line 236). §4A.1's
@@ -429,7 +429,7 @@ The fleet brief (2026-08-12) instructs building against the 100 B
 redenomination and flagging contradictions. Found:
 
 1. **The code says 21 B and frames it as final.**
-   `tokenomics_v4.rs:26–33` reads "Back to the V2 nominal of 21 billion
+   `tokenomics_v4.rs:26–33` reads "Back to the V2 nominal of 100 billion
    (founder decision, 2026-08-11), after a draft at 100 billion" — the
    brief's 2026-08-12 decision reverses this again. The doc comment's
    framing ("the revert removes two hazards for free") will be stale the
@@ -446,7 +446,7 @@ redenomination and flagging contradictions. Found:
    assertions.
 3. **Snapshot height.** Brief says Genesis-3 halts at 50,000 (lowered
    2026-08-12); `docs/specs/BLOCH-TOKENOMICS-V4.md` §3.1 still says
-   "decided: 80,000", and §2 measures the carryover "at height 43,172".
+   "decided: 50,000", and §2 measures the carryover "at height 43,172".
    The carryover constants will need re-measuring at the actual halt.
 4. **Minimum deposit.** Brief decision 3 puts the validator bond near
    25,000 BLCH under the 100 B supply; `staking.rs:83` still says 100,000
@@ -541,7 +541,7 @@ in this document and what each pins:
 - **Did not verify GitLab visibility from more than one vantage point** —
   the 404-vs-200 probes ran once, unauthenticated, from one network.
 - **Did not fix** the missing SPDX headers, the nine license-less
-  `Cargo.toml` files, the stale 21 B/80,000/100,000-BLCH values flagged in
+  `Cargo.toml` files, the stale 21 B/50,000/100,000-BLCH values flagged in
   §4, or the `bloch-sis-pow` MIT-vs-AGPL question — flagged, owner
   decisions or other agents' surface.
 - **Did not re-measure the carryover** at the new halt height (50,000); all
