@@ -41,7 +41,8 @@ use crate::params::DS_BODY;
 use crate::sample::Validator;
 use crate::schedule;
 use crate::state_root::{
-    state_root, ConsensusState, EutxoEntry, ParticipationRecord, RandaoMix, ValidatorRecord,
+    state_root, ConsensusState, EutxoEntry, EvmCommitment, ParticipationRecord, RandaoMix,
+    ValidatorRecord,
 };
 use sha3::{Digest, Sha3_256};
 use std::collections::BTreeMap;
@@ -78,6 +79,10 @@ pub struct ChainState {
     pub coherence_accumulator_root: [u8; 32],
     /// Coherence nullifier-set root (§6.6.2), carried.
     pub coherence_nullifier_root: [u8; 32],
+    /// L1 EVM execution commitment (`BLOCH-L1-EVM-STATE-MODEL.md`), carried —
+    /// updating it is EVM execution, which happens in the node's transition,
+    /// not in this seam.
+    pub evm: EvmCommitment,
 }
 
 impl ChainState {
@@ -94,6 +99,7 @@ impl ChainState {
             taint_root: self.taint_root,
             coherence_accumulator_root: self.coherence_accumulator_root,
             coherence_nullifier_root: self.coherence_nullifier_root,
+            evm: self.evm,
         })
     }
 }

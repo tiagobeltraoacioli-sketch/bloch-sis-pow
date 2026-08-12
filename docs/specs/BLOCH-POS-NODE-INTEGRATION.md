@@ -238,7 +238,7 @@ schema below encodes the lesson as two rules:
 | `meta` | ascii string | schema version, network version, genesis digest, weak-subjectivity checkpoint consumed at boot | node |
 | `headers` | block_id 32B | `BlockHeaderV4`, canonical 248 B | consensus |
 | `bodies` | block_id 32B | proposer_sig + transactions + attestation quorum | consensus |
-| `state_roots` | block_id 32B | `StateRoots` (7×32 B) + `FinalityState` at that block | consensus |
+| `state_roots` | block_id 32B | `StateRoots` (7×32 B + the 80 B `EvmCommitment`, per `BLOCH-L1-EVM-STATE-MODEL.md` §2) + `FinalityState` at that block | consensus |
 | `state_nodes` | node hash 32B | SMT node, content-addressed — structural sharing means a block's state costs only its delta | consensus |
 | `registry` | epoch 8B BE | `Vec<ValidatorRecord>` at the epoch boundary (the registry only changes in `process_epoch`; intra-epoch reads resolve to the boundary snapshot) | consensus |
 | `participation` | epoch 8B BE ‖ validator 4B BE | `ParticipationRecord` (current + previous epoch are committed state; older is archival) | consensus |
