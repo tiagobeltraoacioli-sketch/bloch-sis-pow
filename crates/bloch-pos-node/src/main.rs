@@ -10,9 +10,10 @@
 //! What it is NOT yet — honestly, per the integration plan
 //! (`docs/specs/BLOCH-POS-NODE-INTEGRATION.md`): no RocksDB store, no libp2p
 //! gossip, no transactions (deposits/exits/transfers), no slashing-evidence
-//! pipeline, no weak-subjectivity sync, no RPC, no fork choice beyond a
-//! linear chain, no mainnet genesis manifest. See the module docs of
-//! `engine`, `net`, `store` for each limitation at its site.
+//! pipeline, no checkpoint-sync **state download** (the weak-subjectivity
+//! boot gate itself IS wired — `ws_boot`), no RPC, no mainnet genesis
+//! manifest. See the module docs of `engine`, `net`, `store`, `ws_boot` for
+//! each limitation at its site.
 //!
 //! ## Key hygiene
 //!
@@ -32,6 +33,7 @@ mod genesis;
 mod keys;
 mod net;
 mod store;
+mod ws_boot;
 
 use std::path::PathBuf;
 use std::process::exit;
@@ -43,7 +45,9 @@ use bloch_pos_committee::params::{
     DS_ATTEST, DS_BLOCK, DS_BODY, DS_DEPOSIT, DS_EXIT, DS_PROPOSE, DS_RANDAO, DS_SLASH,
     DS_SORTITION, DS_STATE, SLOTS_PER_EPOCH, SLOT_DURATION_SECS,
 };
-use bloch_pos_committee::tokenomics_v4::{SAT_PER_BLOCH, TOTAL_SUPPLY_SAT, VALIDATOR_EMISSION_BLOCH};
+use bloch_pos_committee::tokenomics_v4::{
+    FOUNDER_BLOCH, SAT_PER_BLOCH, TEAM_BLOCH, TOTAL_SUPPLY_SAT, VALIDATOR_EMISSION_BLOCH, VC_BLOCH,
+};
 
 const NAME: &str = env!("CARGO_PKG_NAME");
 /// `pkg-version (git-commit[+dirty])`, stamped by build.rs. The commit is the
@@ -94,8 +98,17 @@ fn print_help() {
                parts. Slot 0 starts <secs> from now (default 5).\n\
            bloch-pos run --data-dir <dir> --genesis <file> --listen <port>\n\
                          --peers <host:port,...> [--stop-at-slot <n>]\n\
+                         [--ws-checkpoint <file>] [--ws-signer-set <file>]\n\
                Run a validator node. <dir> must hold validator.key; chain\n\
                data persists in <dir> and is replayed on restart.\n\
+               --ws-checkpoint supplies a signed weak-subjectivity\n\
+               checkpoint envelope (BLOCH-WEAK-SUBJECTIVITY.md §4.1). A node\n\
+               with neither a fresh checkpoint nor fresh finality of its own\n\
+               REFUSES to sync — that is the mechanism, not a fault. This\n\
+               devnet build bakes no signer arrangement, so --ws-signer-set\n\
+               must accompany --ws-checkpoint. With neither flag the genesis\n\
+               anchor is the first checkpoint, which is why a fresh devnet\n\
+               boots with no ceremony.\n\
          \n\
          The integration plan is docs/specs/BLOCH-POS-NODE-INTEGRATION.md."
     );
@@ -217,12 +230,17 @@ fn run_cmd(args: &[String]) {
         .unwrap_or_default();
     let stop_at_slot = arg_value(args, "--stop-at-slot").and_then(|s| s.parse::<u64>().ok());
 
+    let ws = ws_boot::WsConfig {
+        checkpoint: arg_value(args, "--ws-checkpoint").map(PathBuf::from),
+        signer_set: arg_value(args, "--ws-signer-set").map(PathBuf::from),
+    };
     let cfg = engine::Config {
         data_dir: PathBuf::from(data_dir),
         genesis_path: PathBuf::from(genesis_path),
         listen,
         peers,
         stop_at_slot,
+        ws,
     };
     if let Err(e) = engine::run(cfg) {
         eprintln!("bloch-pos: {e}");
@@ -253,13 +271,34 @@ fn self_check() {
         }
     }
 
-    // BLOCH-TOKENOMICS-V4 §8.1: 21 B at 8 decimals sits far below u64 wrap.
+    // BLOCH-TOKENOMICS-V4 §8.1, both directions, as the crate pins them.
+    //
+    // This check used to read `TOTAL_SUPPLY_SAT < u64::MAX / 4` with the
+    // comment "21 B at 8 decimals sits far below u64 wrap". That was a
+    // restated number, and the 2026-08-12 pure ×100/21 split moved the supply
+    // to 100 B — deliberately past u64's halfway point, with the headroom
+    // loss accepted and pinned in `tokenomics_v4.rs`. The stale bound then
+    // panicked on every `bloch-pos run` and `selfcheck`. Assert the invariant
+    // the authority states, never a threshold chosen here: a single balance
+    // must still fit the committed u64 columns, and the supply being past the
+    // halfway point is what forces every satoshi *sum* to be u128.
     assert!(
-        TOTAL_SUPPLY_SAT < (u64::MAX as u128) / 4,
-        "total supply left the u64 headroom the V4 decision bought"
+        TOTAL_SUPPLY_SAT <= u64::MAX as u128,
+        "a single balance no longer fits the u64 columns the state root commits"
     );
-    // §1: validators get more than any single insider bucket.
-    assert!(VALIDATOR_EMISSION_BLOCH > 9_000_000_000, "validator allocation shrank");
+    assert!(
+        TOTAL_SUPPLY_SAT * 2 > u64::MAX as u128,
+        "supply left the u64 wrap zone — re-decide the accumulator widths on purpose"
+    );
+    // §1: validators get more than any single insider bucket. Compared
+    // against the buckets themselves, so a re-split cannot make this pass by
+    // arithmetic drift.
+    assert!(
+        VALIDATOR_EMISSION_BLOCH > FOUNDER_BLOCH
+            && VALIDATOR_EMISSION_BLOCH > VC_BLOCH
+            && VALIDATOR_EMISSION_BLOCH > TEAM_BLOCH,
+        "validator allocation fell below an insider bucket"
+    );
 
     // BLOCH-TOKENOMICS-V4 §3.3.1: cohort cap 100% → 33.33%, held after.
     assert_eq!(cohort_cap_bps(0), COHORT_CAP_START_BPS);

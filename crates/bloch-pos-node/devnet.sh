@@ -10,6 +10,19 @@
 # block log; logs land in <workdir>/node<i>/node.log. To exercise
 # restart-persistence, kill one node's PID (printed below) and re-run the
 # exact `bloch-pos run ...` line from its node.log header.
+#
+# Weak subjectivity (BLOCH-WEAK-SUBJECTIVITY.md §4.2) is enforced at boot, and
+# a devnet passes it via the GENESIS ANCHOR: an empty data dir on a young
+# genesis is the "trust-once" window, so no checkpoint flag is needed. Two
+# consequences worth knowing before they look like bugs:
+#   * A node starting with an EMPTY data dir against a genesis older than
+#     WS_PERIOD_EPOCHS (2,016 epochs — at 500 ms slots, ~9 h of wall time)
+#     refuses to sync and asks for --ws-checkpoint. Reusing a day-old
+#     <workdir>/genesis.blg is the way to hit this; delete the workdir and let
+#     this script mint a fresh genesis instead.
+#   * A node that was DOWN for more than that window refuses too, for the same
+#     reason and with the same recovery. Both refusals are the mechanism, not
+#     a fault.
 
 set -euo pipefail
 

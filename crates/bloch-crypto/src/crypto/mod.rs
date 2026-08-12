@@ -244,6 +244,33 @@ fn verify_mldsa65_only(pk_body: &[u8], message: &[u8], sig_body: &[u8]) -> bool 
     mldsa65::verify_detached_signature(&sig, message, &pk).is_ok()
 }
 
+/// Verify a raw (non-enveloped) ML-DSA-65 detached signature — the public
+/// counterpart of [`falcon::verify`] for the other half of the hybrid.
+///
+/// The Genesis-4 weak-subjectivity envelope verifier
+/// (`bloch-pos-committee::ws` via the node's `HybridKeyVerifier`
+/// implementation) receives the two hybrid halves already split at the fixed
+/// points and must verify each under its own primitive. Exported so that
+/// caller does not have to counterfeit a suite envelope to reach the ML-DSA
+/// body verifier — one primitive, one entry point per half. Exact-length
+/// bodies required; malformed input ⇒ `false`, never a panic (consensus
+/// rule).
+pub fn verify_mldsa65_raw(public_key_bytes: &[u8], message: &[u8], signature_bytes: &[u8]) -> bool {
+    verify_mldsa65_only(public_key_bytes, message, signature_bytes)
+}
+
+/// Split a suite-enveloped object (public key, secret key, or signature) into
+/// `(suite_id, body)`, or `None` if the bytes carry no valid envelope header.
+///
+/// Public for Genesis-4 node tooling that must re-frame enveloped objects
+/// into the raw halves the PoS committee crate consumes (weak-subjectivity
+/// checkpoint envelopes carry raw `mldsa ‖ falcon` bodies, not suite
+/// envelopes). Read-only view; exposing it here keeps the 4-byte header
+/// format defined in exactly one place.
+pub fn split_envelope(bytes: &[u8]) -> Option<(u16, &[u8])> {
+    parse_envelope(bytes)
+}
+
 pub fn address_from_pubkey(public_key: &[u8], testnet: bool) -> String {
     let hash = Sha3_256::digest(public_key);
     let mut payload = [0u8; 20];
