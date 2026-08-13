@@ -196,6 +196,32 @@ pub async fn start_rpc_server(
     }
 }
 
+/// Height of the selected tip — the number a confirmation count is relative to.
+///
+/// # Why this exists as a function
+///
+/// Three call sites computed confirmations as `node_state.block_count - height`,
+/// subtracting a block's **height** from the DAG's **block count**. In a chain
+/// those two numbers are the same and the bug is invisible; in a BlockDAG they
+/// are not, because parallel blocks are kept rather than orphaned. Measured on
+/// mainnet 2026-08-13: chain height 39,837, DAG block count 50,606 — an offset
+/// of 10,769.
+///
+/// The consequence was not a cosmetic off-by-N. `gettxstatus` calls anything
+/// with 100+ confirmations `final`, so **every mined transaction reported
+/// final immediately**, and an exchange gating deposits on that field would
+/// have credited at depth 1 while believing it waited. The failure was silent
+/// and in the direction that costs the integrator money.
+///
+/// One definition, called three times — not three call sites each free to pick
+/// a plausible-looking counter.
+fn selected_tip_height(state: &AppState) -> u64 {
+    let dag = state.dag.read();
+    dag.selected_tip()
+        .and_then(|h| dag.get_block_data(&h).map(|d| d.height))
+        .unwrap_or(0)
+}
+
 async fn handle_rpc(
     State(state): State<AppState>,
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
@@ -421,7 +447,11 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
         "getrecentblocks" => {
             let count = params.and_then(|p| p.get(0)).and_then(|v| v.as_u64()).unwrap_or(10)
                 .min(50); // cap at 50
-            let tip_height = state.node_state.read().block_count;
+            // The DAG's block count is not a height: it counts parallel blocks
+            // too, and on 2026-08-13 exceeded the chain height by 10,769. Using
+            // it here made the scan start ~10k heights above anything that
+            // exists and walk down through nothing.
+            let tip_height = selected_tip_height(&state).saturating_add(1);
             let mut blocks = Vec::new();
             // Iterate ALL heights until we find enough blocks (DAG may have gaps)
             for h in (0..tip_height).rev() {
@@ -452,7 +482,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             // O(1) lookup via CF_TX_INDEX
             match state.store.get_tx_location(&txid_bytes) {
                 Ok(Some((block_hash, height))) => {
-                    let tip = state.node_state.read().block_count;
+                    let tip = selected_tip_height(&state);
                     match state.store.get_block(&block_hash) {
                         Ok(Some(block)) => {
                             let tx = block.transactions.iter().find(|t| t.txid() == txid_bytes);
@@ -562,7 +592,16 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                     Err(_)  => json!({ "error": "deserialise failed" }),
                     Ok(tx)  => {
                         if tx.is_coinbase() { return json!({ "error": "coinbase not accepted" }); }
-                        let current_height = state.dag.read().block_count() as u64;
+                        // MUST be a height. This fed check_coinbase_maturity
+                        // (VULN-03) bound to the DAG's block COUNT, which on
+                        // 2026-08-13 exceeded the chain height by 10,769 — so
+                        // `current_height - coinbase_height` was inflated by the
+                        // same amount and EVERY coinbase looked mature on
+                        // admission, whatever the 100-block rule says. The
+                        // comment below this call still asserted the two were
+                        // equal; in a chain they are, in a BlockDAG they are not,
+                        // because parallel blocks are kept rather than orphaned.
+                        let current_height = selected_tip_height(&state);
                         // P0 (roadmap §1.2 / §2.5 #6): PQ signature verification is
                         // CPU-bound. Run it on the blocking pool so a flood of
                         // valid-but-expensive txs on this RPC can't stall the async
@@ -990,7 +1029,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                     }
                     match state.store.query_address_history(&addr_hash, start_height, end_height, limit, offset) {
                         Ok(entries) => {
-                            let tip = state.node_state.read().block_count;
+                            let tip = selected_tip_height(&state);
                             let total = state.store.count_address_history(&addr_hash, start_height, end_height).unwrap_or(0);
                             let txs: Vec<serde_json::Value> = entries.iter().map(|e| {
                                 let timestamp = state.store.get_block_timestamp_at_height(e.height).unwrap_or(None).unwrap_or(0);
@@ -1062,7 +1101,12 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
         // constants are still None.
         "getpools" => {
             use crate::core::tokenomics_v2 as v2;
-            let current_height = state.node_state.read().block_count;
+            // Must be a HEIGHT: it feeds `emission_height` and therefore the
+            // subsidy. Bound to the DAG block count, this reported the reward
+            // for a point 10,769 blocks further along the emission curve than
+            // the chain has actually reached — wrong today, and wrong by a
+            // whole era once a halving falls inside that gap.
+            let current_height = selected_tip_height(&state);
             let next_height    = current_height.saturating_add(1);
             // Subsidy is a function of the EMISSION height (carry-over offset),
             // same gated function as consensus — see validate_coinbase_value.
@@ -1303,7 +1347,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             // Check storage
             match state.store.get_tx_location(&txid_arr) {
                 Ok(Some((_block_hash, height))) => {
-                    let tip = state.node_state.read().block_count;
+                    let tip = selected_tip_height(&state);
                     let confirmations = tip.saturating_sub(height) + 1;
                     json!({
                         "status":        if confirmations >= 100 { "final" } else { "confirmed" },
@@ -1618,8 +1662,10 @@ fn validate_tx_for_mempool(tx: &Transaction, store: &Arc<Storage>, current_heigh
 
     // ── eUTXO VM admission (D6, feature `euvm`) ──────────────────────────
     // Height-gated exactly like accept_block's D2 hook (D4's plain height
-    // gate; callers pass `current_height` = dag block_count = the height the
-    // next block will carry, matching the D3 miner's `euvm_active(h + 1)`
+    // gate; callers pass `current_height` = the SELECTED-TIP HEIGHT. It used to
+    // say "= dag block_count", which is a different number in a DAG and was the
+    // bug: block_count counts parallel blocks too. Matches the D3 miner's
+    // `euvm_active(h + 1)`
     // guard). VM-touching txs route through the SAME `validate_node_tx` /
     // `EUVM_PER_TX_GAS` as block validation, so admission accepts exactly
     // what acceptance would; pure-legacy txs return `None` and fall through
