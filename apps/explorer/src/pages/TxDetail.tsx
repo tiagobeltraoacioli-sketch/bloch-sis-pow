@@ -112,7 +112,7 @@ export function TxDetail({ txid }: { txid: string }) {
 
       <div className="rail" style={{ marginTop: 22 }}>
         Finality is proof-of-work depth: 0 = in mempool, 1–99 = confirmed, 100+ = final (coinbase
-        maturity). On this experimental network that depth carries no strong security guarantee yet.
+        maturity).
       </div>
     </div>
   );

@@ -129,7 +129,7 @@ export function LeaderboardPage() {
                 <div className="rail" style={{ marginBottom: 14 }}>
                   <strong>Single active miner.</strong> Every attributed block in this window was mined by one
                   address{data.ranks[0].isFounder ? " (the founder)" : ""}. That's the honest current state of
-                  this small, experimental network — not a leaderboard of many competitors yet.
+                  the network — not a leaderboard of many competitors yet.
                 </div>
               )}
               <div className="card pad-lg">

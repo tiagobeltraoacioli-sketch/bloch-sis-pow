@@ -200,12 +200,6 @@ export function Dashboard() {
         <Link to="/blocks">View all blocks →</Link>
       </div>
 
-      <div className="rail" style={{ marginTop: 28 }}>
-        <strong>Experimental network.</strong> Bloch is unaudited and small; proof-of-work here is a
-        SHAKE-256 hashcash gate with a small-k Module-SIS structural check — not lattice bit-security.
-        Confirmation depth carries no strong security guarantee. This is an independent reference
-        explorer, the way mempool.space is to Bitcoin — Bloch has no official explorer.
-      </div>
     </div>
   );
 }
