@@ -474,16 +474,53 @@ impl Engine {
         // What this block will carry. Selected before the post-state, because
         // the post-state must be computed over exactly these — the header
         // commits to their body_root and every verifier recomputes from them.
-        let txs = self.select_transactions();
-        let tx_bytes: Vec<Vec<u8>> = txs.iter().map(PosTransaction::canonical_bytes).collect();
-        header.body_root = derive::body_root(&tx_bytes);
-
-        let probe = ProposalEnvelope { header: header.clone(), proposer_sig: Vec::new() };
-        let post = match self.tr_probe.compute_post_state(&self.state, &probe, &atts, &txs) {
-            Ok(p) => p,
-            Err(err) => {
-                eprintln!("[slot {slot}] produce refused: {err:?}");
-                return;
+        // Select, then DROP whatever the transition refuses — never abandon
+        // the block.
+        //
+        // # Why this loop exists
+        //
+        // Until 2026-08-13 a proposer computed the post-state over its whole
+        // selection and gave up if the transition said no. One transaction the
+        // mempool had admitted but consensus would refuse therefore stopped
+        // every proposer that picked it up, and the chain halted. It happened
+        // on the live testnet: a zero-input transfer submitted through the
+        // public RPC produced `produce refused: Transfer(0, NoInputs)` at
+        // proposer after proposer, and production stopped at slot 69 while
+        // every node stayed up and kept attesting.
+        //
+        // That is a denial of service costing one unauthenticated request, and
+        // it is the same shape as the Genesis-3 dust transaction that poisoned
+        // every block containing it. The mempool should not have admitted it —
+        // and admission is being tightened separately — but a proposer must
+        // not depend on that. Liveness cannot rest on the mempool being right;
+        // a block with fewer transactions is always better than no block.
+        //
+        // Each refusal drops exactly one transaction and retries, so the loop
+        // is bounded by the selection size and terminates: the empty selection
+        // always computes.
+        let mut txs = self.select_transactions();
+        let (post, tx_bytes) = loop {
+            let tx_bytes: Vec<Vec<u8>> =
+                txs.iter().map(PosTransaction::canonical_bytes).collect();
+            header.body_root = derive::body_root(&tx_bytes);
+            let probe = ProposalEnvelope { header: header.clone(), proposer_sig: Vec::new() };
+            match self.tr_probe.compute_post_state(&self.state, &probe, &atts, &txs) {
+                Ok(p) => break (p, tx_bytes),
+                Err(err) => {
+                    let Some(bad) = txs.pop() else {
+                        // Empty and still refused: the fault is not in any
+                        // transaction, so proposing is genuinely impossible.
+                        eprintln!("[slot {slot}] produce refused with no transactions: {err:?}");
+                        return;
+                    };
+                    eprintln!(
+                        "[slot {slot}] dropping a transaction the transition refuses ({err:?}); \
+                         proposing without it"
+                    );
+                    // Out of the mempool too, or the next proposer inherits the
+                    // same halt this loop just avoided.
+                    self.mempool.remove(&bad.canonical_bytes());
+                }
             }
         };
         header.state_root = post.state_root();
@@ -667,6 +704,33 @@ impl Engine {
         }
         if self.mempool.len() >= MEMPOOL_MAX {
             return Err("mempool is at capacity");
+        }
+        // Refuse the shapes consensus can never apply.
+        //
+        // Admission used to check duplicate-and-capacity only, so anything
+        // that decoded got in. One transaction consensus would never apply
+        // halted the live testnet: every proposer that selected it failed to
+        // produce, and the chain stopped at slot 69 with every node up and
+        // still attesting. Cost of the attack: one unauthenticated request.
+        //
+        // This is deliberately a STRUCTURAL check, not a full validity check.
+        // A complete answer means running the transition, which needs a
+        // candidate header this path has no reason to build. What it catches
+        // is the class that was actually exploited — a transfer that spends
+        // nothing or pays no one, which no state can make applicable.
+        //
+        // It does NOT catch a transfer whose signature is wrong, whose inputs
+        // do not exist, or which fails conservation. Those still reach the
+        // mempool and are dropped by the proposer, which is why the proposer's
+        // guard is the one that carries liveness and this one only reduces
+        // waste. Two checks, neither trusting the other.
+        if let PosTransaction::Transfer { inputs, outputs, .. } = &tx {
+            if inputs.is_empty() {
+                return Err("transfer has no inputs — it spends nothing and cannot apply");
+            }
+            if outputs.is_empty() {
+                return Err("transfer has no outputs — it pays no one and cannot apply");
+            }
         }
         let mut frame = vec![net::FRAME_TX];
         frame.extend_from_slice(&key);
