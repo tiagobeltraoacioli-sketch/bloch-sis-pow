@@ -17,10 +17,17 @@ RUN apt-get update && apt-get install -y \
 
 # Copy the whole workspace. `crates/` holds the vendored bloch-sis-pow path
 # dependency, so it MUST be present or the build fails to resolve it.
+#
+# The root Cargo.toml is a VIRTUAL manifest: cargo parses every path in its
+# `members` list before it builds anything, so a member whose directory is
+# missing is a hard error even when that member is not the build target. That
+# is why `tools/` is copied for a build of `--bin bloch`, which does not use
+# it. The Genesis-3 node itself is `legacy/genesis3-node/` — it was `src/` and
+# `tests/` at the root until Genesis-4 went live on 2026-08-13.
 COPY Cargo.toml Cargo.lock* ./
 COPY crates ./crates
-COPY src ./src
-COPY tests ./tests
+COPY legacy/genesis3-node ./legacy/genesis3-node
+COPY tools ./tools
 
 # Build the node binary (release, LTO per Cargo.toml profile). --locked forces
 # the committed Cargo.lock (fails on drift) — required for reproducibility.

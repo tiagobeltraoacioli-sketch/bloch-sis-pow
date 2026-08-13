@@ -1,7 +1,7 @@
 # Bloch Protocol
 
 > A post-quantum Layer 1. Hybrid lattice signatures on every consensus path.
-> Running proof of work today; proof of stake next.
+> Running **proof of stake** — Genesis-4, live since 2026-08-13.
 
 **About the repository name.** The project is **Bloch Protocol**. The
 repositories are called `bloch-sis-pow` (GitHub) and `BlochSISPoW-project`
@@ -16,29 +16,35 @@ changed. If you cloned one of these, you are in the right place.
 
 ## Read this first if you want to run a node on the live chain
 
-The trunk of this repository is the **proof-of-stake** work. The chain that
-is live right now is **Genesis-3**, which is proof of work, and it is **not
-what the trunk builds**.
+The live chain is **Genesis-4**, proof of stake. It started at
+**2026-08-13 21:31:19 UTC** and has been producing a block every 30 s and
+finalising every epoch since. The trunk of this repository builds it:
 
-Genesis-3 halts by consensus rule at a terminal height, days away at the time
-of writing. To join it for the time it has left:
+```bash
+cargo build --release -p bloch-pos-node   # -> target/release/bloch-pos
+```
 
-- **Run a published binary** — see [Prebuilt binaries](#prebuilt-binaries)
-  below. This is the shortest path and it is what the fleet runs.
-- **Or build from a Genesis-3 branch**, not from the trunk. `g3-integration`
-  is the Genesis-3 source line. Note before you use it: as of its last commit
-  (2026-08-09) it does **not** carry the terminal-height rule — the constant
-  `GENESIS3_TERMINAL_HEIGHT` does not exist on it, so a node built from it
-  would keep going past the terminal height and fork off the network. The
-  branch that carries the rule is **`deploy/g3-terminal-50000`**, which is
-  what the fleet builds from. If in doubt, run the published binary.
+**Genesis-3, the proof-of-work chain, is over.** It stopped at height
+**39,918**, and Genesis-4's opening ledger is the balance set carried across
+from that height. There is no Genesis-3 network left to join — a node you
+build and start today has no peers producing blocks and nothing to sync to.
+The Genesis-3 node is still here, still compiles, and is still the thing an
+auditor re-derives the opening ledger with; it lives at
+[`legacy/genesis3-node/`](./legacy/genesis3-node/) and is described under
+[Genesis-3](#consensus-before-genesis-3-proof-of-work--closed).
 
-You will also need a datadir snapshot and the carryover file; a from-zero
-sync cannot complete (see [docs/SNAPSHOT-BOOTSTRAP.md](./docs/SNAPSHOT-BOOTSTRAP.md)
-and [docs/CARRYOVER.md](./docs/CARRYOVER.md)).
-
-There is nothing to run on Genesis-4 yet. The proof-of-stake node is a devnet
-binary, not released software, and there is **no Genesis-4 launch date**.
+> **One number in this tree is not yet the final one.** The consensus constant
+> `GENESIS3_TERMINAL_HEIGHT` (`crates/bloch-crypto/src/core/mod.rs`) still
+> reads `50_000` on this branch. The chain actually stopped at 39,918, and the
+> commit that makes the halt a rule at that height rather than an operational
+> state — `f21dc6d`, "Genesis-3 terminal height is 39,918, the height it
+> stopped at" — is on the branch `deploy/g3-rpc-height-fix` and has **not**
+> been merged here. Merging it is a founder decision, because it changes a
+> consensus constant. Until it is merged, read 39,918 from
+> `CARRYOVER_MEASURED_HEIGHT` in
+> `crates/bloch-pos-committee/src/tokenomics_v4.rs`, which is the height the
+> live Genesis-4 genesis was actually built from, and do not take `50_000`
+> from this tree as the last word.
 
 ---
 
@@ -69,42 +75,63 @@ number acceptable, and none is attempted here.
 **Unaudited.** A third-party audit is being prepared for, not completed. The
 pre-audit dossier is in `docs/audit/`.
 
-## Consensus today: Genesis-3, proof of work — ending
+## Consensus before: Genesis-3, proof of work — closed
 
-Chain id `0xB10C_0004`, launched 2026-07-29 as a carryover restart.
-SHA-256d proof of work over a GhostDAG-Q BlockDAG, ~30 s target, Stratum V1
-for ASICs, merged-mineable with Bitcoin via AuxPoW since local height 8,500.
+Chain id `0xB10C_0004`, launched 2026-07-29 as a carryover restart, stopped
+2026-08-13 at height **39,918**. SHA-256d proof of work over a GhostDAG-Q
+BlockDAG, ~30 s target, Stratum V1 for ASICs, merged-mineable with Bitcoin via
+AuxPoW from local height 8,500.
 
-It ends. Not by an operator stopping it — by a consensus rule: above the
-terminal height every node rejects every block, so the chain has no valid
-successor and stops producing. The signed snapshot for Genesis-4 is taken at
-that height.
+It stopped 82 blocks short of the Emission V3 flag day at height 40,000, so
+the block reward ended at 8,400 BLOCH and never became 2,600. That fork was
+planned, tested, documented — and never happened.
 
-**The terminal height is 50,000** (founder decision, 2026-08-12, lowered from
-80,000). Be aware of a real discrepancy while reading this tree:
+The code did not go away. It is a normal workspace member at
+[`legacy/genesis3-node/`](./legacy/genesis3-node/) (binary `bloch`) and it
+still compiles, because Genesis-4's opening ledger *is* Genesis-3's output and
+an auditor asked to accept that ledger has to be able to re-derive it. What
+moved is its position: it used to be the **root package** of this workspace,
+so a bare `cargo build` produced the proof-of-work node and presented it as
+the repository's default output. That is no longer true or appropriate.
 
-- the deployed fleet builds from branch `deploy/g3-terminal-50000`, where
-  `crates/bloch-crypto/src/core/mod.rs` sets `GENESIS3_TERMINAL_HEIGHT =
-  50_000`;
-- on this branch the same constant still reads `80_000`
-  (`crates/bloch-crypto/src/core/mod.rs:438`), and a number of documents in
-  `docs/` and `legacy/` still say 80,000.
+**To reproduce a published Genesis-3 binary, do not build from
+`legacy/genesis3-node/` on this branch.** Check out the `genesis3-node-*` tag
+the release was cut from, or the branch `deploy/g3-terminal-50000`; on those
+refs the package still sits at the repository root exactly as it did when the
+binary was built, which is what `repro-manifest.sh` and [REPRO.md](./REPRO.md)
+assume. Moving a package changes no bytes of the program, but it does change
+paths, and reproducibility is checked against paths.
 
-The constant on the branch the fleet runs is what governs the chain. Do not
-take 80,000 from this tree as current.
+**Reading older documents.** Around 40 files under `docs/` — release notes,
+ADRs, threat models, post-mortems — cite paths of the form `src/consensus/…`
+or `src/main.rs:2077`. Those were correct when they were written and they have
+not been rewritten, deliberately: a release note is a record of what was true
+at a moment, and editing the record to match a later directory layout is how
+a project's history quietly stops matching its own artifacts. Read
+`src/X` in any Genesis-3-era document as `legacy/genesis3-node/src/X`.
+`git log --follow` resolves it automatically.
 
-Everything specific to this era — mining, GhostDAG, AuxPoW, stratum,
+Everything else specific to this era — mining, GhostDAG, AuxPoW, stratum,
 difficulty retargeting, tokenomics V1/V2/V3 — is in [`legacy/`](./legacy/),
 with [`legacy/README.md`](./legacy/README.md) explaining what in it remains
 true and what does not.
 
-## Consensus next: Genesis-4, proof of stake — not launched
+## Consensus today: Genesis-4, proof of stake — live
+
+**Live since 2026-08-13 21:31:19 UTC**, on 64 genesis validators across five
+servers, producing a block every 30 s and finalising every epoch. The opening
+ledger is the Genesis-3 balance set carried across from height 39,918.
 
 A **linear** chain of slots and epochs. GhostDAG is retired. Fork choice is
 LMD-GHOST; finality is Casper-style FFG over an epoch committee; the
 randomness beacon is RANDAO; signatures stay ML-DSA-65 ‖ Falcon-1024, with no
 BLS anywhere. Design of record:
 `docs/specs/BLOCH-POS-SHA3-LATTICE-MIGRATION.md`.
+
+Launching is not auditing. The chain running does not mean the consensus code
+has been reviewed by anyone outside this repository — see **Unaudited** above,
+and the 64-validator, five-server, one-allocator starting point under
+Governance below. Both are properties of the live network, not of a plan.
 
 Governance is **not** ownerless. That thesis was retracted in writing
 (`docs/adr/ADR-036-retract-ownerless-adopt-foundation.md`) in favour of a
@@ -125,13 +152,13 @@ change any rule, so "impossible to change" would be false.
 
 | Component | Designed | Built | Booted |
 | --- | --- | --- | --- |
-| Genesis-3 PoW node (`src/`, root package) | yes | yes | **yes — mainnet, until the terminal height** |
-| AuxPoW merged mining with Bitcoin | yes | yes | yes — since local height 8,500 |
-| eUTXO VM (`crates/bloch-euvm`) | yes | yes | yes — consensus-wired at Genesis-3 height 0 |
+| Genesis-3 PoW node (`legacy/genesis3-node/`) | yes | yes | **ran mainnet 2026-07-29 → h39,918; stopped** |
+| AuxPoW merged mining with Bitcoin | yes | yes | ran from local height 8,500 until the halt |
+| eUTXO VM (`crates/bloch-euvm`) | yes | yes | ran — consensus-wired at Genesis-3 height 0; **not** wired into Genesis-4 |
 | Coherence shielded pool (C1 frozen) | yes | verifier present | never used; the mainnet pool is provably empty |
-| PoS consensus core (`crates/bloch-pos-committee`) | yes | yes — 348 tests green, measured 2026-08-12 | no — unaudited, not wired into the Genesis-3 node |
-| PoS node (`crates/bloch-pos-node`) | yes | partial — M1/M2 | **devnet only**: real processes producing, attesting, justifying and finalising over a local TCP mesh. Not mainnet-ready. |
-| Tokenomics V4 | yes | constants + const-asserts in the crate | no — nothing has been issued under it |
+| PoS consensus core (`crates/bloch-pos-committee`) | yes | yes — 364 tests green, measured 2026-08-13 | **yes — live** |
+| PoS node (`crates/bloch-pos-node`) | yes | yes | **yes — mainnet since 2026-08-13 21:31:19 UTC**, 64 validators on five servers, justifying and finalising |
+| Tokenomics V4 | yes | constants + const-asserts in the crate | yes — it is the live emission |
 | Weak-subjectivity checkpoints | yes | no | no |
 | EVM at L1 | proposal; direction accepted (`docs/adr/ADR-040-evm-and-ustav-at-l1.md`) | **no code exists** — the authorization model is an open founder decision | no |
 | Ustav (PSTRN-1) charter at L1 | proposal | no — nothing wired | no |
@@ -139,61 +166,115 @@ change any rule, so "impossible to change" would be false.
 
 ## Where things are
 
+The repository root is a **virtual manifest** — it is a workspace, not a
+package. Nothing is the "default" build any more, which is the point: the root
+package used to be the Genesis-3 proof-of-work node.
+
 ```
-src/, crates/bloch-crypto, crates/bloch-sis-pow, crates/bloch-euvm, …
-                            the Genesis-3 node and its crates. Live on
-                            mainnet until the terminal height.
-crates/bloch-pos-committee  PoS consensus core. Standalone workspace —
-                            run cargo from inside the crate.
-crates/bloch-pos-node       Genesis-4 node binary. Standalone workspace, devnet.
-tools/genesis4-ceremony     Genesis-4 launch tooling.
-docs/                       Current documentation. Index: docs/README.md
-docs/specs/                 Normative PoS design.
-docs/adr/                   Decision records, including superseded ones.
-docs/audit/                 Pre-audit dossier and the two Era-1 audits.
-legacy/                     The Genesis-3 record. See legacy/README.md
-gips/                       The GIP process (GIP-0001, editors, template).
+GENESIS-4 — the live chain
+  crates/bloch-pos-committee  PoS consensus core. Frozen, audit-facing.
+  crates/bloch-pos-node       The `bloch-pos` binary the fleet runs.
+  tools/genesis4-ceremony     Assembled the live genesis block.
+
+SHARED — used by both eras
+  crates/bloch-crypto         Hybrid ML-DSA-65 ‖ Falcon-1024. On the
+                              Genesis-4 consensus path.
+  crates/bloch-sis-pow        Reference PoW; pulled in by bloch-crypto,
+  crates/coherence-core       and so is this. Neither is PoW-only, which
+                              is why they did not move under legacy/.
+  crates/pqcrypto-internals   Vendored fork ([patch.crates-io] at the root).
+  crates/bloch-btc-wallet, crates/bloch-pq-vault
+
+GENESIS-3 — closed, kept buildable for audit
+  legacy/genesis3-node/       The `bloch` node. Ran mainnet to h39,918.
+                              Was the root package until 2026-08-13.
+  crates/bloch-euvm, crates/bloch-ffg
+                              eUTXO VM + FFG committee, behind its `euvm`
+                              feature. Never wired into Genesis-4.
+  legacy/                     The written Genesis-3 record. legacy/README.md
+
+docs/                         Current documentation. Index: docs/README.md
+docs/specs/                   Normative PoS design.
+docs/adr/                     Decision records, including superseded ones.
+docs/audit/                   Pre-audit dossier and the two Era-1 audits.
+gips/                         The GIP process (GIP-0001, editors, template).
 ```
 
-`bloch-pos-committee` and `bloch-pos-node` are deliberately **not** members of
-the root workspace. Nothing in the proof-of-stake work can enter the
-Genesis-3 build graph, its lockfile, or its binary.
+Everything above except `crates/coherence-prover` and `fuzz` — both of which
+need nightly/SP1 toolchains — is a workspace member, so `cargo build
+--workspace` and `cargo test --workspace` reach all of it. This has not always
+been true: the PoS consensus crates and the genesis ceremony tool each carried
+a private `[workspace]` table, which made them invisible to exactly the
+command a reviewer runs first. If you add a crate, add it to `members`.
 
 ## Build
 
 ```bash
-cargo build --release        # needs a C toolchain (clang/cmake) for rocksdb
+cargo build --release -p bloch-pos-node   # the live Genesis-4 node
 ```
 
-This builds the Genesis-3 node and its crates. Binaries land in
-`target/release/`: `bloch` (node), `bloch-cli`, `bloch-calibrate`, and
-`bloch-wallet` (which needs `--features bloch-crypto/wallet-cli`).
-
-The proof-of-stake crates are separate workspaces and are not built by the
-above:
+Produces `target/release/bloch-pos`. Needs a C toolchain (clang/cmake).
 
 ```bash
-cargo build --release --manifest-path crates/bloch-pos-node/Cargo.toml
+cargo build --release --workspace         # everything, both eras
 ```
+
+Also produces the Genesis-3 binaries — `bloch`, `bloch-cli`,
+`bloch-calibrate`, and `bloch-wallet` (which needs
+`--features bloch-crypto/wallet-cli`). Building them is a compile check on a
+chain that has stopped; see the reproducibility note under
+[Genesis-3](#consensus-before-genesis-3-proof-of-work--closed) before using
+the result for anything that has to match a published release.
 
 ## Test
 
 ```bash
-cargo test                                        # Genesis-3 node workspace
-cd crates/bloch-pos-committee && cargo test       # PoS consensus core
-cd crates/bloch-pos-node      && cargo test       # PoS node
+cargo test --workspace                              # everything
+cargo test -p bloch-pos-committee -p bloch-pos-node # Genesis-4 consensus only
 ```
 
-The PoS crates each declare their own `[workspace]`, so `cargo test` from the
-repository root does **not** reach them. Run them from inside the crate.
+**`cargo test --workspace` is red, and was red before the workspace was
+reorganised.** Stated here rather than discovered by the next person who runs
+it. Measured 2026-08-13 on a clean checkout, `--release`:
+
+| Suite | Result |
+| --- | --- |
+| `bloch-pos-committee` — the live consensus core | **364 passed, 0 failed** (+2 doc-tests) |
+| `bloch-pos-node` | 90 passed, **1 failed** |
+| `genesis4-ceremony` | 10 passed, **18 failed** |
+| `bloch` (Genesis-3, retired) | 304 passed, **1 failed** |
+
+Every one of the 20 failures reproduces identically on `e17faef`, the commit
+before the reorganisation. The move introduced none of them.
+
+- The `bloch` failure is `pow::tests::k4_mined_block_rejected_at_canonical_height`,
+  a probabilistic assertion about the k=4→k=8 proof-of-work gate. It fails
+  identically on the commit before the reorganisation, so it is inherited, not
+  introduced — and it is a test of a chain that has stopped.
+- The `genesis4-ceremony` failures are **pre-existing and were simply never
+  run.** The crate used to declare its own `[workspace]`, which made
+  `cargo test --workspace` skip it; running it inside its old private
+  workspace at the previous commit produces the same 10/18 split. The tool
+  that assembled the live genesis block had failing tests and nothing
+  reported it. That is the whole argument for the membership change.
+- The `bloch-pos-node` failure is
+  `a_cold_node_builds_the_same_chain_from_genesis_without_a_donated_datadir`.
+
+None of these are consensus changes and none were fixed here — this commit
+moves files and fixes build wiring. Fixing them is separate work.
 
 ## Prebuilt binaries
+
+**These are Genesis-3 binaries, and Genesis-3 has stopped.** They are kept
+published because they are the artifacts an auditor replays the closed chain
+with, not because there is a network for them to join. There is no prebuilt
+Genesis-4 node yet; build `bloch-pos` from source.
 
 Building from source is the recommended path — you run the bytes you
 compiled, and the build is reproducible by design (see [REPRO.md](./REPRO.md)).
 The binaries below are a convenience, not the standard.
 
-Prebuilt `bloch` and `bloch-cli` for **Linux x86_64**. The current release is
+Prebuilt `bloch` and `bloch-cli` for **Linux x86_64**. The last release is
 `genesis3-node-terminal-50000-20260812`:
 
 - GitHub releases: <https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow/releases>
@@ -223,12 +304,15 @@ release before `genesis3-node-terminal-50000-20260812` is tagged
 `[SUPERSEDED]` in the release list for that reason — including
 `genesis3-node-linux-20260805`, which predates five consensus flag-days.
 
-**If you are running a node through the halt, this release is mandatory.**
-It is the first published binary that stops at 50,000; everything older still
-carries 80,000, keeps accepting blocks past the terminal height, and forks
-away from the network at the moment of the halt. The `bloch` in it is the
-exact binary the fleet runs — copied off a production node and verified
-against `/proc/<pid>/exe`, not rebuilt and assumed equal.
+This release was the one the fleet ran through the halt — the `bloch` in it
+was copied off a production node and verified against `/proc/<pid>/exe`, not
+rebuilt and assumed equal. It stops at 50,000; the chain in fact stopped at
+39,918, 82 blocks before the Emission V3 flag day, so the reward never
+stepped down and no binary ever needed the 39,918 rule to follow the network.
+That rule matters now for a different reason — it is what stops someone
+restarting a miner and extending a chain whose terminal snapshot has already
+been used — and it is not in any published release. See the note at the top
+of this file.
 
 ## Security
 

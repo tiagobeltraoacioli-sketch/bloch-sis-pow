@@ -243,9 +243,12 @@ build-and-test:
 lean-build:
   stage: test
   script:
-    - cargo build --no-default-features --lib
-    - "! cargo tree --no-default-features -e no-dev -i rocksdb >/dev/null 2>&1 && echo 'ok: no rocksdb in lean graph'"
-    - "! cargo tree --no-default-features -e no-dev -i libp2p  >/dev/null 2>&1 && echo 'ok: no libp2p in lean graph'"
+    # `-p bloch` is required now that the repo root is a virtual manifest:
+    # there is no root package for a bare `--lib` to resolve to. The package
+    # is the same one, at legacy/genesis3-node/.
+    - cargo build -p bloch --no-default-features --lib
+    - "! cargo tree -p bloch --no-default-features -e no-dev -i rocksdb >/dev/null 2>&1 && echo 'ok: no rocksdb in lean graph'"
+    - "! cargo tree -p bloch --no-default-features -e no-dev -i libp2p  >/dev/null 2>&1 && echo 'ok: no libp2p in lean graph'"
   allow_failure: true   # informational until verified on the new Linux runner
 
 # Postern Wallet core (separate build root) — golden byte-compat + UniFFI wrapper.

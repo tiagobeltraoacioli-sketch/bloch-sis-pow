@@ -94,7 +94,7 @@ log "workdir: $WORK  (KEEP_WORK=1 to preserve)"
 
 # ── 1. Build node (rehearsal) + proxy ────────────────────────────────────────
 log "building bloch node --features 'node auxpow-rehearsal' (activation lowered to 0)..."
-( cd "$REPO" && cargo build --release --features "node auxpow-rehearsal" --bin bloch )
+( cd "$REPO" && cargo build --release -p bloch --features "node auxpow-rehearsal" --bin bloch )
 log "building bloch-pool-proxy..."
 ( cd "$REPO/pool-proxy" && cargo build --release )
 PROXY_BIN="$REPO/pool-proxy/target/release/bloch-pool-proxy"

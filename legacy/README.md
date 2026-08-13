@@ -84,8 +84,35 @@ Three reasons, in descending order of how much they would cost to lose.
 Paths mirror where each document used to live under `docs/`, so a reference
 of the form `docs/X` from before this move reads as `legacy/X` now.
 
+**`genesis3-node/` is the exception: it is code, not a document.** On
+2026-08-13, when Genesis-4 went live, the Genesis-3 node moved here from the
+repository root. It had been the workspace's *root package*, which meant a
+bare `cargo build` produced the proof-of-work node and offered it as the
+repository's default output — a fair description of the project in July and a
+false one now. It is a plain workspace member at `legacy/genesis3-node/`
+today, it still compiles, and `cargo build --release --workspace` still
+produces `bloch`, `bloch-cli`, `bloch-calibrate` and `bloch-wallet`.
+
+Two things did not move with it, and deliberately: `crates/bloch-sis-pow` and
+`crates/coherence-core`. They read as proof-of-work crates and they are not
+exclusively that — `bloch-crypto`, which is on the **Genesis-4** consensus
+path, depends on both. Filing them under `legacy/` would have been a tidier
+directory and a false statement about the live chain's dependency graph.
+
+**Reproducing a published Genesis-3 binary: do not build from this path.**
+`REPRO.md` and `repro-manifest.sh` assume the package sits at the repository
+root, because it did when every published binary was cut. Check out the
+`genesis3-node-*` tag for the release you are verifying, or the branch
+`deploy/g3-terminal-50000`. The move changed no bytes of the program; it did
+change paths, and reproducibility is checked against paths.
+
+**The terminal height in this folder is stale in two directions.** Documents
+here say 80,000; the constant on the trunk says 50,000; the chain stopped at
+**39,918**. See the note at the top of the root `README.md`.
+
 | Path | What it is |
 | --- | --- |
+| `genesis3-node/` | **Code.** The Genesis-3 proof-of-work node — `src/`, its integration tests, and its examples. Ran mainnet from 2026-07-29 to height 39,918. Kept buildable because Genesis-4's opening ledger is this node's output. |
 | `MERGED-MINING.md`, `MERGED-MINING-ACTIVATION.md` | AuxPoW / merged mining with Bitcoin: the protocol and the flag-day runbook, including the honest note that merged mining only secures Bloch with the fraction of BTC hashrate that opts in. |
 | `MIGRATION-TOKENOMICS-V1-TO-V2.md` | The completed 2026-05 code migration off V1 tokenomics. Its embedded shell transcripts and before/after listings are preserved verbatim as a record of what was run; the `docs/specs/…` paths inside those fenced blocks are the paths *as they were then*, deliberately not rewritten. |
 | `MAINNET-DEV-CHECKLIST.md`, `STRESS-TEST-PLAN.md`, `INTERNAL-AUDIT-PLAN.md` | The 2026-05 pre-mainnet gate trilogy. Scoped to subsystems that are gone (Stratum V1/V2, DKG, BLS FFG). |

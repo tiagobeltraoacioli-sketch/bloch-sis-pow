@@ -6,10 +6,15 @@ license = "AGPL-3.0-or-later"
 description = "Genesis-4 ceremony: assembles the Genesis-4 genesis block from the signed carryover artifact. Offline tool, UNAUDITED."
 publish = false
 
-# Standalone: NOT a member of the node workspace, the same posture as
-# crates/bloch-pos-committee and crates/coherence-prover. Nothing here can
-# affect the live validation path of the running chain.
-[workspace]
+# Member of the root workspace. It used to carry its own `[workspace]`, on the
+# argument that "nothing here can affect the live validation path of the
+# running chain". That argument was about blast radius, and it was right about
+# blast radius — but the effect of a private workspace is that `cargo build
+# --workspace` and `cargo test --workspace` SKIP this crate entirely, so the
+# tool that assembled the live Genesis-4 genesis block was never built by CI.
+# bloch-pos-committee was moved back for the same reason. Blast radius is
+# controlled by the dependency direction (one-way, by path, into this crate
+# and never out of it), not by hiding the crate from the build.
 
 [dependencies]
 # Single source of truth for every tokenomics number. The ceremony does not

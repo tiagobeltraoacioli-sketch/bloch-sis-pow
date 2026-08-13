@@ -1,236 +1,43 @@
 [workspace]
 resolver = "2"
-# Bloch-SIS-PoW — the ownerless protocol / main blockchain. Node + the protocol
-# crates only. The Postern Labs products (wallets, messenger, OS, explorer, …)
+# Bloch Protocol — the ownerless protocol / main blockchain. Node + the
+# protocol crates only. The Postern Labs products (wallets, messenger, OS)
 # live in their own repo and depend on this one as a git dependency.
+#
+# This is a VIRTUAL manifest: the repo root is not itself a package. It used
+# to be — the root package was `bloch`, the Genesis-3 proof-of-work node — so
+# a bare `cargo build` at the root built the retired chain's binary and
+# presented it as the repo's default output. Genesis-4 (proof of stake) went
+# live on 2026-08-13 and Genesis-3 stopped at height 39,918; the layout now
+# says so. The PoW node is a normal member at legacy/genesis3-node.
 members = [
-    ".",                       # the bloch node (root package)
-    "crates/bloch-crypto",     # lean crypto/wallet/tx surface (extracted island)
+    # ── Genesis-4, proof of stake. THE LIVE CHAIN. ──
+    "crates/bloch-pos-committee",  # frozen consensus math (pure, sha3-only)
+    "crates/bloch-pos-node",       # the `bloch-pos` binary the fleet runs
+    "tools/genesis4-ceremony",     # assembled the live genesis block
+
+    # ── Shared protocol crates. Used by BOTH eras; not PoW-only. ──
+    # bloch-crypto is on the Genesis-4 consensus path (hybrid ML-DSA-65 ‖
+    # Falcon-1024), and it pulls bloch-sis-pow + coherence-core, which is why
+    # those two stay here rather than moving under legacy/.
+    "crates/bloch-crypto",
     "crates/bloch-sis-pow", "crates/coherence-core", "crates/pqcrypto-internals",
-    "crates/bloch-euvm", "crates/bloch-ffg",  # eUTXO VM + FFG committee (optional, behind `euvm` feature)
     "crates/bloch-btc-wallet",
     "crates/bloch-pq-vault",   # non-custodial PQ-shield vault (P2WSH commit-delay-reveal + PQ clawback anchor)
-    # Genesis-4 proof-of-stake. These were developed as a separate workspace and
-    # were therefore invisible to `cargo check/test --workspace` at the root —
-    # the first command any reviewer runs tested the retired PoW node and none
-    # of the PoS consensus. They are members now so that stays impossible.
-    "crates/bloch-pos-committee",
-    "crates/bloch-pos-node",
+
+    # ── Genesis-3, proof of work. CLOSED — kept buildable for audit. ──
+    "legacy/genesis3-node",    # the `bloch` binary; ran mainnet to h39,918
+    "crates/bloch-euvm", "crates/bloch-ffg",  # eUTXO VM + FFG committee (Genesis-3, behind its `euvm` feature)
 ]
 # coherence-prover (SP1 guest/script/service) + fuzz use heavy/nightly-only
 # toolchains; keep them out of the everyday workspace build.
-exclude = ["crates/coherence-prover", "fuzz"]
-
-[package]
-name = "bloch"
-version = "0.3.0-genesis2"
-edition = "2021"
-authors = ["Bloch-SIS Protocol"]
-description = "Bloch-SIS Protocol: post-quantum pure-PoW BlockDAG L1 — SHAKE-256 hashcash PoW with a Module-SIS structural gate, hybrid Falcon+ML-DSA signatures, GhostDAG-Q"
-license = "AGPL-3.0-or-later"
-repository  = "https://gitlab.com/bloch-protocol/bloch"
-
-[[bin]]
-name = "bloch"
-path = "src/main.rs"
-
-[[bin]]
-name = "bloch-wallet"
-path = "src/bin/bloch-wallet.rs"
-# Needs bloch-crypto's optional `wallet-cli` feature (clap + rpassword), which is
-# off by default so the crate still cross-compiles to wasm32 for the browser
-# wallet. Without this line a bare `cargo build` fails on THIS bin alone —
-# "could not find `cli` in `wallet`" — and takes the whole workspace build with
-# it, including `cargo test`. required-features makes cargo skip it instead.
-#   Build it with:  cargo build --bin bloch-wallet --features bloch-crypto/wallet-cli
-required-features = ["bloch-crypto/wallet-cli"]
-
-[[bin]]
-name = "bloch-cli"
-path = "src/bin/bloch-cli.rs"
-
-[[bin]]
-name = "bloch-calibrate"
-path = "src/bin/bloch-calibrate.rs"
-
-[lib]
-name = "bloch"
-path = "src/lib.rs"
-
-[features]
-# Bloch-SIS-Linux L3 attestation backends (off by default). Enabling requires
-# the matching platform/hardware; the default build stays clean + unattested.
-#   sev-snp — AMD SEV-SNP confidential VM (Linux). Wires the virtee/sev crate.
-#   mobile  — device-TEE verification (Android Key Attestation / iOS App Attest).
-default = ["node"]
-# Test-only: enables Dev-C's post-fork equivalence KAT (kat_hybrid_equivalence)
-# that asserts-equal to this bundle's published canonical (address/txid/sighash)
-# tuple. Empty marker feature; off by default.
-dev_a_frozen = []
-# `euvm` compiles in the native eUTXO contract VM + FFG committee-governed
-# activation (crates/bloch-euvm, crates/bloch-ffg). OFF BY DEFAULT and NOT wired
-# into accept_block yet — with the feature off these crates are not compiled into
-# the node, and behaviour is byte-for-byte unchanged. See crates/bloch-euvm/INTEGRATION.md.
-euvm = ["dep:bloch-euvm", "dep:bloch-ffg"]
-# `node` gates the heavy full-node modules (storage/consensus/mining/network/
-# rpc/…) and their exclusive deps (rocksdb, libp2p, axum, …) so the pure
-# wallet/crypto subset cross-compiles for mobile with `default-features = false`.
-node = [
-    "dep:rocksdb",
-    "dep:libp2p",
-    "dep:axum",
-    "dep:tower",
-    "dep:tower-http",
-    "dep:prometheus",
-    "dep:governor",
-    "dep:stratum-core",
-    "dep:reqwest",
-    "bloch-crypto/node",
-]
-# `auxpow-rehearsal` forwards bloch-crypto's REGTEST-ONLY marker feature, which
-# lowers AUXPOW_ACTIVATION_HEIGHT to 0 so a LOCAL, off-mainnet build accepts
-# merged-mined (AuxPoW) blocks — for the end-to-end regtest rehearsal
-# (scripts/regtest-merged-rehearsal.sh). A mainnet artifact NEVER sets it.
-auxpow-rehearsal = ["bloch-crypto/auxpow-rehearsal"]
-sev-snp = ["dep:sev"]
-mobile  = ["dep:x509-parser", "dep:ciborium"]
-# Coherence P1: verify shielded-spend FRI proofs with SP1 (heavy sp1-sdk dep,
-# off by default). Enables ShieldedVerifier::Sp1 + BLOCH_SHIELDED_VERIFY=sp1.
-sp1-verify = ["dep:sp1-sdk"]
-
-[dependencies]
-# Optional — only pulled with the `sp1-verify` feature (see [features]).
-sp1-sdk = { version = "4", optional = true }
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing = "0.1"
-blst = "0.3"
-serde-big-array = "0.5"
-tokio        = { version = "1",    features = ["full"] }
-futures      = "0.3"
-pin-project-lite = "0.2"
-serde        = { version = "1",    features = ["derive"] }
-serde_json   = "1"
-
-# FIX: bincode 1.x unmaintained → 2.x (breaking API, pinned compat feature)
-bincode      = { version = "2",    features = ["serde"] }
-
-sha2         = "0.10"
-sha2_v9      = { package = "sha2", version = "0.9", default-features = false }
-sha3         = "0.10"
-
-# FIX: pqcrypto-dilithium deprecated → pqcrypto-mldsa (official NIST name)
-pqcrypto-mldsa   = "0.1"
-# Sprint B6b: Falcon-1024 for hybrid PQ signatures (Falcon ‖ ML-DSA). Two
-# distinct lattice families (NTRU + Module-LWE/SIS) for defence in depth.
 #
-# PoS finding F1 (BLOCH-FALCON-ONLINE-SIGNING.md §3.2): the crate's DEFAULT
-# features ("avx2", "neon") compile and runtime-dispatch Falcon signing to
-# PQClean's native floating-point variants (AVX2 doubles on x86_64,
-# `typedef double fpr` on aarch64). Under PoS the validator signs on a PUBLIC
-# schedule, so signing must use PQClean's `clean` variant only: integer-emulated
-# IEEE-754, constant-time by construction, bit-exact across platforms.
-# `default-features = false` forces `clean` on every target (the FP variants are
-# not even compiled). Cost: ~11.6 ms/signature vs ~0.46 ms native — irrelevant
-# in a 30 s slot. Cargo features are ADDITIVE across the workspace: re-enabling
-# defaults in ANY member silently restores native-FP dispatch everywhere, which
-# is why bloch-crypto carries a symbol-level tripwire test
-# (`falcon_native_fp_variants_are_not_linked`) and CI runs
-# scripts/falcon-clean-guard.sh. Do not re-enable avx2/neon here.
-pqcrypto-falcon  = { version = "0.4", default-features = false, features = ["std"] }
-pqcrypto-traits  = "0.3"
-pqcrypto-kyber   = "0.8"
-# Sprint T.1: direct dep on pqcrypto-internals so we can call `with_seeded_rng`
-# from the pqcrypto-internals fork (see [patch.crates-io] at bottom). Upstream also
-# exposes this as `pub extern "C" fn PQCRYPTO_RUST_randombytes` — we depend on
-# the forked Rust API `with_seeded_rng` / `SeededRngGuard` which the upstream
-# crate does NOT provide. The fork is a strict superset of upstream 0.2.11.
-pqcrypto-internals = "0.2"
-hkdf             = "0.12"
-
-aes-gcm      = "0.10"
-chacha20poly1305 = "0.10"
-subtle       = "2.5"
-governor     = { version = "0.8", optional = true }
-prometheus   = { version = "0.14", optional = true }
-argon2       = "0.5"
-zeroize      = { version = "1",    features = ["derive"] }
-bip39        = "2"
-
-# FIX: rand 0.8.5 unsound → 0.9
-rand         = "0.9"
-
-rocksdb      = { version = "0.22", optional = true }
-
-# FIX: libp2p 0.53 → 0.56 (pulls ring 0.17+, fixes AES panic vulnerability)
-libp2p       = { version = "0.56", features = ["tcp", "noise", "yamux", "gossipsub", "mdns", "tokio", "dns", "websocket", "identify", "ping", "macros", "ed25519", "request-response"], optional = true }
-
-# FIX: jsonrpc-http-server uses net2+instant (unmaintained) → replace with axum
-axum         = { version = "0.8", optional = true }
-tower        = { version = "0.5", features = ["limit"], optional = true }
-tower-http   = { version = "0.6", features = ["cors", "trace", "timeout"], optional = true }
-
-clap         = { version = "4",    features = ["derive"] }
-rpassword    = "7"
-log          = "0.4"
-env_logger   = "0.11"
-hex          = "0.4"
-chrono       = { version = "0.4",  features = ["serde"] }
-thiserror    = "2"
-base64       = "0.22"
-async-trait  = "0.1"
-reqwest      = { version = "0.12", features = ["json", "rustls-tls"], default-features = false, optional = true }
-pbkdf2       = "0.12"
-hmac         = "0.12"
-parking_lot  = "0.12"
-bytes        = "1"
-
-# Sprint L — 256-bit arithmetic for retarget_bits consensus math.
-# Chose primitive-types (widely used in Substrate/Ethereum Rust ecosystem,
-# audited) over rolling our own [u64; 4] limb arithmetic.
-primitive-types = "0.13"
-
-# --- Stratum V2 (GIP-0003) ---
-# Umbrella crate re-exports all SRI low-level crates.
-# Solves "could not find binary_sv2 in super" compile error.
-stratum-core              = { version = "0.2", optional = true }
-
-secp256k1                 = { version = "0.29", features = ["rand-std"] }
-
-# Sprint B5: Bloch-SIS PoW (SHAKE-256 hashcash + Module-SIS gate). Vendored reference crate;
-# the pow adapter (src/pow) is the seam that migrates consensus off SHA-256d.
-bloch-sis-pow             = { path = "crates/bloch-sis-pow" }
-
-# Lean crypto/wallet/tx surface extracted from this node (crates/bloch-crypto).
-# The node re-exports its modules (types/crypto/core/address/wallet/hd_wallet/
-# util) so every `crate::core::…` path keeps working; downstream products depend
-# on bloch-crypto directly WITHOUT pulling the full node.
-bloch-crypto              = { path = "crates/bloch-crypto" }
-# Optional: only compiled when the `euvm` feature is enabled (off by default).
-bloch-euvm                = { path = "crates/bloch-euvm", optional = true }
-bloch-ffg                 = { path = "crates/bloch-ffg", optional = true }
-
-# Coherence C2: lean shielded-pool primitives (notes, commitments, nullifiers,
-# Merkle accumulator, spend statement). Shared source of truth for the node, the
-# SP1 guest prover (crates/coherence-prover), and the mobile wallet.
-coherence-core            = { path = "crates/coherence-core" }
-
-
-# Sprint B2 (no-BFT): DKG/BLS dependencies (gennaro-dkg, bls12_381, ff, group,
-# rand_chacha, rand_core) removed — FFG finality and the validator committee
-# were deleted. Bloch-SIS is pure PoW; no threshold/BLS crypto on the consensus
-# path. (Re-add only if a post-quantum finality gadget is ever introduced.)
-
-# ── L3 attestation backends (optional, feature-gated; see [features]) ──
-# `mobile` — verifier-side checks of Android Key Attestation / iOS App Attest.
-# Pure Rust; compiles on every host (end-to-end exercise needs real devices).
-x509-parser = { version = "0.18", features = ["verify"], optional = true }
-ciborium    = { version = "0.2", optional = true }
-
-# `sev-snp` — virtee/sev guest interface to /dev/sev-guest. The crate is
-# Linux-only, hence the target gate; on other hosts the provider honestly
-# reports "hardware not present" without pulling the dep at all.
-[target.'cfg(target_os = "linux")'.dependencies]
-sev = { version = "8", default-features = false, features = ["snp"], optional = true }
+# NOTHING ELSE IS EXCLUDED, AND NOTHING IS SILENTLY DROPPED. A crate that
+# carries its own `[workspace]` table is invisible to `cargo build/test
+# --workspace`, so the first command a reviewer runs would skip it. That is
+# how the entire PoS consensus once went untested at the root. If you add a
+# crate, add it to `members` — do not give it a private workspace.
+exclude = ["crates/coherence-prover", "fuzz"]
 
 [profile.release]
 opt-level      = 3
@@ -245,15 +52,6 @@ codegen-units  = 1
 # this from a consensus build profile.
 overflow-checks = true
 
-[dev-dependencies]
-tempfile = "3"
-# test-util enables tokio::test(start_paused) for the stratum session
-# lifetime tests (virtual clock through the 600s read-poll windows).
-tokio = { version = "1", features = ["full", "test-util"] }
-# Property-based invariant tests for GhostDAG consensus ordering
-# (determinism, parent-order independence, blue-score monotonicity).
-proptest = "1"
-
 # pqcrypto-internals fork VENDORED at crates/pqcrypto-internals (was a private
 # git dep that no clean build — Docker, Akash, CI — could fetch). It is a
 # drop-in modification of pqcrypto-internals 0.2.11 adding thread-local
@@ -262,4 +60,3 @@ proptest = "1"
 # self-contained and reproducible.
 [patch.crates-io]
 pqcrypto-internals = { path = "crates/pqcrypto-internals" }
-
