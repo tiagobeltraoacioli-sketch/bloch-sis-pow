@@ -23,7 +23,7 @@
 //! >   undifferentiated set. [`StateRoots::taint_root`] is retained as a
 //! >   reserved, all-zero slot (removing it would re-open the freeze);
 //! >   `Tainted` variants are never produced.
-//! > - **the hybrid PoW phase** — erased: Genesis-3 halts at height 80,000
+//! > - **the hybrid PoW phase** — erased: Genesis-3 halts at height 50,000
 //! >   and Genesis-4 launches from a snapshot.
 //!
 //! §9.2 of the migration design: *"Interfaces between the three [developers]

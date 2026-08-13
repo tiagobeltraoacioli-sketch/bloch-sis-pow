@@ -97,6 +97,12 @@ fn print_help() {
                Build a devnet genesis manifest from the keystores' public\n\
                parts. Slot 0 starts <secs> from now (default 5).\n\
            bloch-pos run --data-dir <dir> --genesis <file> --listen <port>\n\
+                         [--listen-addr <ip>]\n\
+               --listen-addr binds the mesh listener somewhere other than\n\
+               127.0.0.1, which is what a devnet spread across hosts needs.\n\
+               This transport has no authentication and no admission\n\
+               control, so a routable bind MUST be firewalled to the known\n\
+               peer addresses. Production is the libp2p stack, not this.\n\
                          --peers <host:port,...> [--stop-at-slot <n>]\n\
                          [--ws-checkpoint <file>] [--ws-signer-set <file>]\n\
                Run a validator node. <dir> must hold validator.key; chain\n\
@@ -242,6 +248,9 @@ fn run_cmd(args: &[String]) {
         data_dir: PathBuf::from(data_dir),
         genesis_path: PathBuf::from(genesis_path),
         listen,
+        // Loopback unless asked otherwise: this transport authenticates
+        // nothing, so a routable bind is a deliberate act plus a firewall.
+        listen_addr: arg_value(args, "--listen-addr").unwrap_or_else(|| "127.0.0.1".to_string()),
         peers,
         stop_at_slot,
         ws,

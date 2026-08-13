@@ -12,7 +12,7 @@
 //! silently switch networks (§3.1 refusal rule).
 //!
 //! What the devnet manifest does NOT yet carry, honestly: the signed
-//! height-80,000 carryover snapshot digest and balance set, the six
+//! height-50,000 carryover snapshot digest and balance set, the six
 //! consensus-vested allocation outputs, and the stake-eligibility policy
 //! (integration plan §3.4 / decision 9). This is a *devnet* genesis: a
 //! validator set and a clock. The mainnet manifest format is a superset that

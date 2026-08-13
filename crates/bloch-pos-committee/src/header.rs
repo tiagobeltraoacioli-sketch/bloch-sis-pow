@@ -44,7 +44,7 @@
 //! is fenced three ways:
 //!
 //! - **Historical only.** `block_hash()` identifies Genesis-3 blocks, whose
-//!   chain terminates at height 80,000. It must never validate or identify
+//!   chain terminates at height 50,000. It must never validate or identify
 //!   anything in Genesis-4; it survives solely so pre-transition blocks can
 //!   be re-verified.
 //! - **Type-level.** `block_hash()` returns a bare `[u8; 32]`; [`BlockId`]
@@ -597,7 +597,7 @@ mod tests {
     /// confused with the *legacy* Genesis-3 identity.
     ///
     /// Context: `Block::block_hash()` in `bloch-crypto/core/mod.rs:1476` is
-    /// the historical (Genesis-3, terminal height 80,000) identity. Two
+    /// the historical (Genesis-3, terminal height 50,000) identity. Two
     /// identity functions coexisting is exactly the `pow_hash`/`block_hash`
     /// configuration that stalled tip selection, so this test pins the fences:
     ///
@@ -692,7 +692,7 @@ mod tests {
             assert!(
                 !lower.contains("block_hash"),
                 "{fname}: reference to the legacy Genesis-3 block_hash() - it is historical \
-                 (chain ends at height 80,000) and must never touch Genesis-4 identity"
+                 (chain ends at height 50,000) and must never touch Genesis-4 identity"
             );
         }
 

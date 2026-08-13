@@ -132,10 +132,19 @@ fn serve_get_blocks(sock: &mut TcpStream, data_dir: &PathBuf, frame: &[u8]) {
     }
 }
 
-/// Start the mesh: listen on `listen_port`, dial every peer, feed decoded
-/// events into `events`. `head_slot` is read when (re)dialing to ask peers
-/// for everything after our head.
+/// Start the mesh: listen on `bind_addr:listen_port`, dial every peer, feed
+/// decoded events into `events`. `head_slot` is read when (re)dialing to ask
+/// peers for everything after our head.
+///
+/// `bind_addr` defaults to `127.0.0.1` at the call site and that default is
+/// the safe one. This transport has **no authentication, no admission control
+/// and no peer scoring** — `gossip.rs` is not wired here — so anything that
+/// can reach the port can feed it frames. Binding a routable address is
+/// therefore opt-in (`--listen-addr`), and when it is used the operator is
+/// responsible for restricting the port to known peers at the firewall. The
+/// production answer is the libp2p stack, not this.
 pub fn start(
+    bind_addr: &str,
     listen_port: u16,
     peer_addrs: Vec<String>,
     events: Sender<NetEvent>,
@@ -144,7 +153,7 @@ pub fn start(
 ) -> std::io::Result<Net> {
     // Inbound: accept, then per-connection: read frames; data frames go to
     // the engine, get-blocks is answered in place from the log.
-    let listener = TcpListener::bind(("127.0.0.1", listen_port))?;
+    let listener = TcpListener::bind((bind_addr, listen_port))?;
     {
         let events = events.clone();
         let data_dir = data_dir.clone();

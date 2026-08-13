@@ -85,6 +85,10 @@ pub struct Config {
     pub data_dir: PathBuf,
     pub genesis_path: PathBuf,
     pub listen: u16,
+    /// Address the mesh listener binds. `127.0.0.1` unless `--listen-addr`
+    /// says otherwise — see the warning on [`crate::net::start`] before
+    /// binding anything routable.
+    pub listen_addr: String,
     pub peers: Vec<String>,
     pub stop_at_slot: Option<u64>,
     pub ws: crate::ws_boot::WsConfig,
@@ -745,7 +749,14 @@ pub fn run(cfg: Config) -> io::Result<()> {
     let logged = store.read_all()?;
     let head_slot = Arc::new(AtomicU64::new(0));
     let (tx, rx) = mpsc::channel::<NetEvent>();
-    let net = net::start(cfg.listen, cfg.peers.clone(), tx, cfg.data_dir.clone(), head_slot.clone())?;
+    let net = net::start(
+        &cfg.listen_addr,
+        cfg.listen,
+        cfg.peers.clone(),
+        tx,
+        cfg.data_dir.clone(),
+        head_slot.clone(),
+    )?;
 
     let mut engine = Engine {
         state: genesis_state,
