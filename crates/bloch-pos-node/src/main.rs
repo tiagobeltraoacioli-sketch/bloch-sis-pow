@@ -252,7 +252,17 @@ fn genesis_cmd(args: &[String]) {
         slot_ms,
         validators,
         cohort: Vec::new(),
+        // `genesis` builds devnet manifests: no carried balances, no vested
+        // allocations. The mainnet manifest is assembled by a separate path
+        // that takes the signed Genesis-3 snapshot as input, because its
+        // inputs come from a ceremony and not from a command line.
+        carryover: None,
+        allocations: Vec::new(),
     };
+    if let Err(e) = manifest.check_supply() {
+        eprintln!("genesis: {e}");
+        exit(1);
+    }
     let bytes = manifest.encode();
     if let Err(e) = std::fs::write(&out, &bytes) {
         eprintln!("genesis: cannot write {out}: {e}");

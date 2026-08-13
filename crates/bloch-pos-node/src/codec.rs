@@ -51,6 +51,10 @@ impl<'a> Reader<'a> {
         Ok(s)
     }
 
+    pub fn u8(&mut self) -> Result<u8, DecodeErr> {
+        Ok(self.take(1)?[0])
+    }
+
     pub fn u16(&mut self) -> Result<u16, DecodeErr> {
         Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
     }

@@ -450,13 +450,13 @@ fn the_carryover_is_one_set_with_no_founder_line() {
     // ha classe de moeda a marcar) e o teto de holders (existia para limitar o
     // que legados recebiam ENQUANTO o fundador era excluido).
     // Sob o split de 2026-08-12 (x100/21): 3.773.884.800 BLCH da G3.
-    assert_eq!(tk::CARRYOVER_TOTAL_BLOCH, 17_970_880_000);
+    assert_eq!(tk::CARRYOVER_TOTAL_BLOCH, 18_122_600_000);
     assert_eq!(tk::HOLDER_CARRYOVER_CAP_BLOCH, 0, "o teto foi aposentado");
     // Renomear nao move saldo, e o split nao move razao: o maior endereco
     // continua com ~94% do carryover (3.546.175.400 BLCH da G3, escalado).
-    assert_eq!(tk::LARGEST_CARRYOVER_ADDRESS_BLOCH, 16_886_549_523);
+    assert_eq!(tk::LARGEST_CARRYOVER_ADDRESS_BLOCH, 17_023_029_380);
     let share = tk::LARGEST_CARRYOVER_ADDRESS_BLOCH * 10_000 / tk::CARRYOVER_TOTAL_BLOCH;
-    assert_eq!(share, 9396, "93,96% do carryover num endereco so");
+    assert_eq!(share, 9393, "93,93% do carryover num endereco so");
 }
 
 #[test]
@@ -465,7 +465,7 @@ fn allocations_sum_to_total_supply() {
         + tk::TEAM_BLOCH + tk::MARKETING_BLOCH + tk::LIQUIDITY_BLOCH
         + tk::VALIDATOR_EMISSION_BLOCH;
     assert_eq!(sum, tk::TOTAL_SUPPLY_BLOCH);
-    assert_eq!(tk::VALIDATOR_EMISSION_BLOCH, 43_029_120_000);
+    assert_eq!(tk::VALIDATOR_EMISSION_BLOCH, 42_877_400_000);
 }
 
 #[test]
@@ -530,13 +530,13 @@ fn neither_curve_exceeds_the_allocation() {
 
 #[test]
 fn flat_curve_matches_the_spec_average() {
-    assert_eq!(tk::validator_reward_flat_sat(0) / tk::SAT_PER_BLOCH, 1_022);
+    assert_eq!(tk::validator_reward_flat_sat(0) / tk::SAT_PER_BLOCH, 1_019);
 }
 
 #[test]
 fn halving_curve_halves_every_four_years() {
     let r0 = tk::validator_reward_halving_sat(0);
-    assert_eq!(r0 / tk::SAT_PER_BLOCH, 5_118);
+    assert_eq!(r0 / tk::SAT_PER_BLOCH, 5_100);
     assert_eq!(tk::validator_reward_halving_sat(tk::HALVING_PERIOD_SLOTS), r0 / 2);
     assert_eq!(tk::validator_reward_halving_sat(2 * tk::HALVING_PERIOD_SLOTS), r0 / 4);
     // Front-loading is the whole point: half the allocation inside four years.
@@ -653,10 +653,10 @@ fn decay_curve_meets_the_inflation_target() {
     // Founder requirement: annual inflation under 7% of total supply.
     let y1 = tk::annual_inflation_bps(0);
     assert!(y1 < 700, "ano 1 = {}bps, acima do teto de 700", y1);
-    assert_eq!(y1, 436); // 4,36% (truncado)
+    assert_eq!(y1, 435); // 4,35% (truncado)
     assert!(tk::annual_inflation_bps(4) < y1);
     assert!(tk::annual_inflation_bps(9) < tk::annual_inflation_bps(4));
-    assert_eq!(tk::annual_inflation_bps(9), 169);
+    assert_eq!(tk::annual_inflation_bps(9), 168);
 }
 
 #[test]
@@ -667,8 +667,8 @@ fn the_split_left_the_inflation_schedule_untouched() {
     // pinados aqui por valor). Se um recalculo futuro de INITIAL_ANNUAL_SAT
     // mover um unico ano em um unico bps, isto acusa.
     let pinned: [(u64, u128); 10] = [
-        (0, 436), (1, 393), (2, 353), (3, 318), (4, 286),
-        (5, 257), (6, 232), (7, 208), (8, 188), (9, 169),
+        (0, 435), (1, 391), (2, 352), (3, 317), (4, 285),
+        (5, 256), (6, 231), (7, 208), (8, 187), (9, 168),
     ];
     for (year, bps) in pinned {
         assert_eq!(tk::annual_inflation_bps(year), bps, "ano {year} saiu do cronograma");
@@ -685,7 +685,7 @@ fn decay_curve_declines_ten_percent_a_year() {
     let y1 = tk::validator_reward_decay_sat(tk::SLOTS_PER_YEAR);
     let ratio = y1 * 1000 / y0;
     assert!((899..=901).contains(&ratio), "razao anual = {ratio}/1000");
-    assert_eq!(y0 / tk::SAT_PER_BLOCH, 4_151);
+    assert_eq!(y0 / tk::SAT_PER_BLOCH, 4_137);
 }
 
 #[test]
@@ -700,7 +700,7 @@ fn decay_curve_emits_the_allocation_exactly() {
     // impossivel e foi corrigida em tokenomics_v4. Pinado por constante E por
     // valor, para o dossie.
     assert_eq!(residual, tk::EMISSION_DUST_SAT, "residuo mudou: {residual} sat");
-    assert_eq!(tk::EMISSION_DUST_SAT, 176_880);
+    assert_eq!(tk::EMISSION_DUST_SAT, 772_880);
     assert!(residual < tk::SAT_PER_BLOCH, "residuo passou de 1 BLCH");
     assert_eq!(tk::validator_emitted_decay_by(u64::MAX), emitted);
     assert_eq!(tk::validator_reward_decay_sat(tk::EMISSION_SLOTS), 0);
@@ -1387,9 +1387,9 @@ fn two_holders_account_for_the_entire_genesis_float() {
     let f = tk::FOUNDATION_LIQUID_AT_GENESIS_BLOCH;
     let c = tk::CARRYOVER_TOTAL_BLOCH;
     let circulating = f + c;
-    assert_eq!(circulating, 23_970_880_000);
-    assert_eq!(f * 1000 / circulating, 250, "fundacao = 25,0% do circulante");
-    assert_eq!(c * 1000 / circulating, 749, "carryover = 75,0% (truncado)");
+    assert_eq!(circulating, 24_122_600_000);
+    assert_eq!(f * 1000 / circulating, 248, "fundacao = 24,8% do circulante");
+    assert_eq!(c * 1000 / circulating, 751, "carryover = 75,1% (truncado)");
 }
 
 // ── coorte de genesis e o teto declinante ───────────────────────────────────

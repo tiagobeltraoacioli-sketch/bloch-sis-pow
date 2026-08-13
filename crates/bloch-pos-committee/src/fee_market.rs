@@ -514,14 +514,21 @@ mod tests {
 
     /// The founder's inflation requirement, checked against the recommended
     /// decay curve with the fee burn as pure subtraction: gross year-1
-    /// issuance is 436 bps of total supply (`annual_inflation_bps(0)`), the
+    /// issuance is 435 bps of total supply (`annual_inflation_bps(0)`), the
     /// burn can only lower the net figure, and after `EMISSION_SLOTS` both
     /// issuance and burn are zero — net inflation exactly 0.
+    ///
+    /// These moved down by one basis point on 2026-08-13 (436/286/169 before),
+    /// and the direction is the whole story: re-measuring the carryover
+    /// against the live ledger raised it, the validator emission is the
+    /// remainder of a fixed cap, so there is less left to issue and inflation
+    /// falls. A re-pin that raised these numbers would mean the cap had been
+    /// breached somewhere.
     #[test]
     fn net_inflation_stays_under_the_7_percent_target() {
-        assert_eq!(annual_inflation_bps(0), 436); // 4.36% year 1 — the peak
-        assert_eq!(annual_inflation_bps(4), 286);
-        assert_eq!(annual_inflation_bps(9), 169);
+        assert_eq!(annual_inflation_bps(0), 435); // 4.35% year 1 — the peak
+        assert_eq!(annual_inflation_bps(4), 285);
+        assert_eq!(annual_inflation_bps(9), 168);
         assert!(annual_inflation_bps(0) < 700, "meta do fundador: < 7%/ano");
         // During emission the base-fee burn is subtracted from gross issuance;
         // burned >= 0, so net <= gross on every slot of era 1.
