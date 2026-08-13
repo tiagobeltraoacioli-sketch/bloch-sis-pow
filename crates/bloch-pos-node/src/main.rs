@@ -94,6 +94,7 @@ fn main() {
         Some("keygen") => keygen(&args[1..]),
         Some("keygen-public") => keygen_public(&args[1..]),
         Some("genesis") => genesis_cmd(&args[1..]),
+        Some("genesis-mainnet") => genesis_mainnet(&args[1..]),
         Some("submit-tx") => submit_tx(&args[1..]),
         Some("run") => run_cmd(&args[1..]),
         Some(other) => {
@@ -468,6 +469,168 @@ fn keygen(args: &[String]) {
             exit(1);
         }
     }
+}
+
+/// `genesis-mainnet --cohort <cohort.tsv> --out <file> [--start-in <secs>]`
+///
+/// Assemble the mainnet manifest from the ceremony's **public halves only**.
+///
+/// The devnet `genesis` command reads keystores, which is exactly what must
+/// never leave the air-gapped machine. This reads the one file the ceremony is
+/// designed to carry out: index, public key, RANDAO commitment, and the three
+/// columns a human decided. No secret can reach this path because none is in
+/// its input.
+///
+/// The carryover commitment is built from the constants the terminal snapshot
+/// pinned, not from the snapshot file: assembling a manifest is a statement
+/// about which balance set this chain opens with, and the file itself is
+/// checked later, at node start, against exactly these four fields.
+fn genesis_mainnet(args: &[String]) {
+    use bloch_pos_committee::tokenomics_v4 as t;
+
+    let Some(cohort_path) = arg_value(args, "--cohort") else {
+        eprintln!("genesis-mainnet: --cohort <cohort.tsv> is required");
+        exit(2);
+    };
+    let Some(out) = arg_value(args, "--out") else {
+        eprintln!("genesis-mainnet: --out <file> is required");
+        exit(2);
+    };
+    let start_in: u64 = arg_value(args, "--start-in").and_then(|s| s.parse().ok()).unwrap_or(900);
+
+    let text = match std::fs::read_to_string(&cohort_path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("genesis-mainnet: cannot read {cohort_path}: {e}");
+            exit(1);
+        }
+    };
+
+    let hex = |s: &str, what: &str, row: usize| -> Vec<u8> {
+        if s.len() % 2 != 0 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+            eprintln!("genesis-mainnet: row {row}: {what} is not hex");
+            exit(1);
+        }
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    };
+
+    let mut validators = Vec::new();
+    for (n, line) in text.lines().enumerate().skip(1) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let c: Vec<&str> = line.split('\t').collect();
+        if c.len() < 6 {
+            eprintln!("genesis-mainnet: row {n}: expected 6 columns, found {}", c.len());
+            exit(1);
+        }
+        // Every field is refused rather than defaulted. A validator set is the
+        // one artifact nobody can correct later — once a chain runs from it,
+        // whatever it said is what happened.
+        let bad = |what: &str| -> ! {
+            eprintln!("genesis-mainnet: row {n}: {what}");
+            exit(1)
+        };
+        let index: u32 = c[0].trim().parse().unwrap_or_else(|_| bad("index is not a number"));
+        let pubkey = hex(c[1].trim(), "pubkey", n);
+        let randao = hex(c[2].trim(), "randao_commitment", n);
+        if randao.len() != 32 {
+            bad("randao_commitment is not 32 bytes");
+        }
+        let stake_sat: u128 = c[3].trim().parse().unwrap_or_else(|_| bad("stake_sat is empty or not a number — it is a decision, and the ceremony leaves it blank on purpose"));
+        if stake_sat < t::SAT_PER_BLOCH * 25_000 {
+            bad("stake_sat is below the 25,000 BLOCH minimum deposit");
+        }
+        let wc = hex(c[4].trim(), "withdrawal_credentials", n);
+        if wc.len() != 32 {
+            bad("withdrawal_credentials is not 32 bytes");
+        }
+        let commission_bps: u128 = c[5].trim().parse().unwrap_or_else(|_| bad("commission_bps is empty or not a number"));
+
+        let mut rc = [0u8; 32];
+        rc.copy_from_slice(&randao);
+        validators.push(genesis::ManifestValidator {
+            index,
+            stake_sat,
+            randao_commitment: rc,
+            pubkey,
+            withdrawal_credentials: wc,
+            commission_bps,
+        });
+    }
+    if validators.is_empty() {
+        eprintln!("genesis-mainnet: cohort has no validators");
+        exit(1);
+    }
+
+    // The five vested buckets, from the constants. Script hashes are the
+    // founder's carryover address under the same zero-extension rule the
+    // carryover uses — one ownership convention on the chain, not two.
+    let alloc = |purpose: u8, bloch: u128, unlock_epoch: u64| genesis::GenesisAllocation {
+        purpose,
+        script_hash: {
+            let mut h = [0u8; 32];
+            h[..20].copy_from_slice(&t::FOUNDER_WITHDRAWAL_H160);
+            h
+        },
+        amount_sat: bloch * t::SAT_PER_BLOCH,
+        unlock_epoch,
+    };
+    use genesis::alloc_purpose as ap;
+    let allocations = vec![
+        alloc(ap::FOUNDER, t::FOUNDER_BLOCH, 0),
+        alloc(ap::VC, t::VC_BLOCH, 0),
+        alloc(ap::TEAM, t::TEAM_BLOCH, 0),
+        alloc(ap::MARKETING, t::MARKETING_BLOCH, 0),
+        alloc(ap::LIQUIDITY, t::LIQUIDITY_BLOCH, 0),
+    ];
+
+    let cohort: Vec<u32> = validators.iter().map(|v| v.index).collect();
+    let manifest = genesis::Manifest {
+        genesis_time_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + start_in * 1000,
+        slot_ms: 30_000,
+        validators,
+        cohort,
+        // The entries are NOT here, and that is the design: they are ingested
+        // at node start from the snapshot file and checked against the four
+        // fields below. A manifest is the artifact every node hashes to decide
+        // which network it joined; a 54 MB balance set does not belong in it.
+        carryover_entries: Vec::new(),
+        carryover: Some(genesis::CarryoverCommitment {
+            digest: t::CARRYOVER_MEASURED_FILE_SHA256,
+            set_root: t::CARRYOVER_MEASURED_ROOT,
+            entry_count: t::CARRYOVER_MEASURED_UTXOS,
+            total_sat: t::CARRYOVER_TOTAL_BLOCH * t::SAT_PER_BLOCH,
+        }),
+        allocations,
+    };
+
+    // The check that makes this a claim rather than an assertion.
+    if let Err(e) = manifest.check_supply() {
+        eprintln!("genesis-mainnet: {e}");
+        exit(1);
+    }
+
+    let bytes = manifest.encode();
+    if let Err(e) = std::fs::write(&out, &bytes) {
+        eprintln!("genesis-mainnet: cannot write {out}: {e}");
+        exit(1);
+    }
+    use sha3::{Digest, Sha3_256};
+    let digest: [u8; 32] = Sha3_256::digest(&bytes).into();
+    println!(
+        "wrote {out}\n  validators : {}\n  carryover  : {} BLOCH ({} outputs)\n  allocations: {} buckets\n  issues     : {} BLOCH at genesis\n  digest     : {}",
+        manifest.validators.len(),
+        t::CARRYOVER_TOTAL_BLOCH,
+        t::CARRYOVER_MEASURED_UTXOS,
+        manifest.allocations.len(),
+        manifest.genesis_issued_sat() / t::SAT_PER_BLOCH,
+        hex_lower(&digest),
+    );
 }
 
 fn genesis_cmd(args: &[String]) {

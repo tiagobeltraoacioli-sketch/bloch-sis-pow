@@ -27,25 +27,30 @@ derives from `crates/bloch-pos-committee/src/tokenomics_v4.rs`.
 
 | bucket | BLOCH | % of supply | at genesis |
 |---|---:|---:|---|
-| carryover (holders) | 18,122,600,000 | 18.12% | liquid, ordinary balance |
+| carryover (holders) | 18,146,400,000 | 18.15% | liquid, ordinary balance |
 | founder | 10,000,000,000 | 10.00% | vested |
 | VC | 10,000,000,000 | 10.00% | 12-month cliff, 24-month linear |
 | team | 10,000,000,000 | 10.00% | 18-month cliff, 36-month linear |
 | marketing | 4,000,000,000 | 4.00% | 25% liquid, rest over 24 months |
 | liquidity | 5,000,000,000 | 5.00% | fully liquid |
-| validator emission | 42,877,400,000 | 42.87% | **not** a genesis output — issued over 40 years |
+| validator emission | 42,853,600,000 | 42.85% | **not** a genesis output — issued over 40 years |
 | **total** | **100,000,000,000** | **100.00%** | |
 
-Genesis issues **57,122,600,000 BLOCH** (`GENESIS_ISSUED_SAT` =
-5,712,260,000,000,000,000 sat). The remainder is the emission headroom the
+Genesis issues **57,146,400,000 BLOCH** (`GENESIS_ISSUED_SAT` =
+5,714,640,000,000,000,000 sat). The remainder is the emission headroom the
 cap check works against. `Manifest::check_supply()` refuses a manifest whose
 carryover plus allocations does not equal exactly that figure.
 
-The carryover figure is **provisional** until the terminal snapshot. It was
-18,122,600,000 at height 39,328 and grows with every Genesis-3 block. Whoever
-runs the ceremony re-measures and re-pins; the structure makes that mechanical
-(one constant, four compile-time assertions, one binary search for
-`INITIAL_ANNUAL_SAT`).
+The carryover figure is **final**. Genesis-3 stopped at height 39,918 on
+2026-08-13 and the terminal snapshot was taken there — 452,726 outputs across
+16 addresses, 3,810,744,000 BLOCH, set root `7c756ee8…`, file SHA-256
+`84ddbbac…`, produced independently on two nodes with byte-identical results.
+The constants are re-pinned to it: `INITIAL_ANNUAL_SAT` re-derived by binary
+search, year-one inflation 434 bps, concentration 93.94%.
+
+The chain never reached 50,000. The coins between 39,918 and that ceiling were
+never minted, so there is nothing to burn: validator emission is the remainder
+of a fixed cap, and a smaller carryover simply leaves more of it unissued.
 
 ## What must exist before the ceremony can run
 
@@ -119,6 +124,15 @@ assertions guard this; if any fires, the arithmetic moved and someone must
 decide, not silence it.
 
 ### T+0 — assemble the manifest
+
+    bloch-pos genesis-mainnet --cohort out/cohort.tsv --out mainnet.manifest
+
+Reads the ceremony's **public halves only** — the devnet `genesis` command
+reads keystores, which is exactly what must never leave the air-gapped
+machine. Every column is refused rather than defaulted: a blank `stake_sat`
+stops the assembly, because a validator set is the one artifact nobody can
+correct after a chain runs from it.
+
 
 Inputs: the snapshot commitment (digest, count, total), the 64 validators'
 public halves, the allocation table above, `genesis_time_ms`, `slot_ms` =

@@ -383,6 +383,17 @@ const _: () =
 /// was an artifact of mixing two measurements, not a change in who holds
 /// what. Measured together, concentration is **93.93%**: essentially
 /// unchanged, which is the true answer.
+/// The 20-byte hash160 of the address holding the carryover — the founder's.
+///
+/// Used as the withdrawal credential and allocation script for the launch
+/// cohort, zero-extended to 32 bytes exactly as carried outputs are. One
+/// ownership convention on the chain rather than two: a validator's exit and a
+/// carried balance land in the same place, in the same format.
+pub const FOUNDER_WITHDRAWAL_H160: [u8; 20] = [
+    0xe9, 0x86, 0xdb, 0x51, 0x49, 0xcf, 0xf7, 0x49, 0x9b, 0x28,
+    0x2a, 0x04, 0x82, 0x72, 0xa0, 0x9a, 0xff, 0x0a, 0xf4, 0xff,
+];
+
 ///
 /// The set has **16 distinct addresses**.
 pub const LARGEST_CARRYOVER_ADDRESS_BLOCH: u128 = 17_046_829_380;
