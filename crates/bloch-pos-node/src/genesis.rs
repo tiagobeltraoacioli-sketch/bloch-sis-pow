@@ -1578,7 +1578,7 @@ mod tests {
     fn the_measured_snapshot_closes_against_tokenomics() {
         use bloch_pos_committee::tokenomics_v4 as t;
         // The G3 total behind `CARRYOVER_TOTAL_BLOCH`, in G3 satoshis.
-        let g3_total_sat: u128 = 3_805_746_000 * t::SAT_PER_BLOCH;
+        let g3_total_sat: u128 = 3_810_744_000 * t::SAT_PER_BLOCH;
         assert_eq!(
             t::split_g3_sat(g3_total_sat),
             t::CARRYOVER_TOTAL_BLOCH * t::SAT_PER_BLOCH,
@@ -1589,13 +1589,12 @@ mod tests {
         // published root, count and post-split total, adds up to §3.
         let mut m = sample();
         m.carryover = Some(CarryoverCommitment {
-            // The SHAKE-256 root is published (`CARRYOVER_MEASURED_ROOT`); the
-            // SHA3-256 of the file's bytes is NOT — nothing has measured it,
-            // so this test cannot pin it and says so rather than inventing a
-            // number that would look measured. The ceremony fills it from the
-            // terminal snapshot; until then it is the one field of the four
-            // with no published value.
-            digest: [0u8; 32],
+            // Both are published now. The terminal snapshot was taken on two
+            // independently operated nodes and produced byte-identical files —
+            // same count, same total, same set root, same file digest. That
+            // agreement, not this tool's say-so, is what makes the numbers
+            // usable.
+            digest: t::CARRYOVER_MEASURED_FILE_SHA256,
             set_root: t::CARRYOVER_MEASURED_ROOT,
             entry_count: t::CARRYOVER_MEASURED_UTXOS,
             total_sat: t::CARRYOVER_TOTAL_BLOCH * t::SAT_PER_BLOCH,
@@ -1616,7 +1615,8 @@ mod tests {
         })
         .collect();
         m.check_supply().expect("carryover + the five buckets must equal GENESIS_ISSUED_SAT");
-        assert_eq!(t::CARRYOVER_MEASURED_UTXOS, 452_133);
+        assert_eq!(t::CARRYOVER_MEASURED_UTXOS, 452_726);
+        assert_eq!(t::CARRYOVER_MEASURED_HEIGHT, 39_918);
     }
 
     #[test]

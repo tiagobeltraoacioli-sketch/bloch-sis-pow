@@ -164,6 +164,7 @@ pub const FOUNDATION_LIQUID_AT_GENESIS_BLOCH: u128 =
 /// |---|---|---|---|---|---|
 /// | earlier | — | 43,172 | 448,337 | 3,773,884,800 | 17,970,880,000 |
 /// | 2026-08-13 | 39,328 | 50,042 | 452,133 | 3,805,746,000 | 18,122,600,000 |
+/// | **terminal** | **39,918** | **50,690** | **452,726** | **3,810,744,000** | **18,146,400,000** |
 ///
 /// The earlier row is the one this constant used to hold, and its label was
 /// wrong in a way worth recording rather than quietly fixing: it read
@@ -184,7 +185,7 @@ pub const FOUNDATION_LIQUID_AT_GENESIS_BLOCH: u128 =
 /// bucket to absorb it: it is unissued, so nothing is taken from anyone who
 /// already holds coins, and the alternative is taking it from an allocation
 /// that was promised as a percentage.
-pub const CARRYOVER_TOTAL_BLOCH: u128 = 18_122_600_000;
+pub const CARRYOVER_TOTAL_BLOCH: u128 = 18_146_400_000;
 
 /// SHAKE-256 root of the balance set the figure above was measured from, and
 /// the SHA-256 of the file itself. Published so the measurement is checkable
@@ -192,13 +193,20 @@ pub const CARRYOVER_TOTAL_BLOCH: u128 = 18_122_600_000;
 /// height and compares roots. Agreement across independent nodes is the
 /// evidence — a single tool's output is not.
 pub const CARRYOVER_MEASURED_ROOT: [u8; 32] = [
-    0x16, 0x2c, 0xb7, 0x63, 0x8d, 0xec, 0x70, 0xf4, 0xdf, 0x7f, 0x5f, 0x0b, 0x10, 0xcf, 0xe0, 0x57,
-    0x33, 0x39, 0xb0, 0xd2, 0xc5, 0x0e, 0xf7, 0x99, 0x23, 0x8d, 0x22, 0x90, 0x6d, 0x87, 0x14, 0xda,
+    0x7c, 0x75, 0x6e, 0xe8, 0xff, 0xff, 0x95, 0x29, 0xb4, 0x0c, 0x12, 0x4b, 0x36, 0xbd, 0x3e, 0x1a,
+    0x99, 0x34, 0xa1, 0x5f, 0x06, 0x3a, 0xff, 0xe5, 0x59, 0x69, 0x13, 0xfb, 0x85, 0x8e, 0xfb, 0xdf,
+];
+
+/// SHA3-256 of the snapshot FILE's bytes — integrity in transit, a different
+/// question from the set root above. The ceremony checks both.
+pub const CARRYOVER_MEASURED_FILE_SHA256: [u8; 32] = [
+    0x84, 0xdd, 0xbb, 0xac, 0x2a, 0xfd, 0xd5, 0xc7, 0x86, 0x18, 0x09, 0x6a, 0x7d, 0x4f, 0x66, 0xcf,
+    0x5b, 0x04, 0xa3, 0xe5, 0x75, 0x7a, 0x03, 0xfe, 0x90, 0x55, 0x0e, 0x50, 0x09, 0x61, 0x83, 0xf6,
 ];
 /// Height the snapshot behind [`CARRYOVER_MEASURED_ROOT`] was taken at.
-pub const CARRYOVER_MEASURED_HEIGHT: u64 = 39_328;
+pub const CARRYOVER_MEASURED_HEIGHT: u64 = 39_918;
 /// UTXO count in that snapshot.
-pub const CARRYOVER_MEASURED_UTXOS: u64 = 452_133;
+pub const CARRYOVER_MEASURED_UTXOS: u64 = 452_726;
 
 /// Retired. The carryover is not capped — see [`CARRYOVER_TOTAL_BLOCH`].
 ///
@@ -340,7 +348,7 @@ const _: () = assert!(
 );
 
 const _: () = assert!(
-    VALIDATOR_EMISSION_BLOCH == 42_877_400_000,
+    VALIDATOR_EMISSION_BLOCH == 42_853_600_000,
     "resto para validadores mudou — reveja a especificacao antes de aceitar"
 );
 
@@ -357,9 +365,9 @@ const _: () = assert!(LIQUIDITY_BLOCH * SPLIT_DENOMINATOR == 1_050_000_000 * SPL
 // what the ledger says it is, not what a draft said it would be. The split
 // stays exact on the new figure too — 3,805,746,000 is divisible by 21.
 const _: () =
-    assert!(CARRYOVER_TOTAL_BLOCH * SPLIT_DENOMINATOR == 3_805_746_000 * SPLIT_NUMERATOR);
+    assert!(CARRYOVER_TOTAL_BLOCH * SPLIT_DENOMINATOR == 3_810_744_000 * SPLIT_NUMERATOR);
 const _: () =
-    assert!(VALIDATOR_EMISSION_BLOCH * SPLIT_DENOMINATOR == 9_004_254_000 * SPLIT_NUMERATOR);
+    assert!(VALIDATOR_EMISSION_BLOCH * SPLIT_DENOMINATOR == 8_999_256_000 * SPLIT_NUMERATOR);
 
 /// Largest single carried-over address, for the concentration reporting in §4A.
 /// Not a consensus quantity and not a distinct class of coin — a measurement,
@@ -377,7 +385,7 @@ const _: () =
 /// unchanged, which is the true answer.
 ///
 /// The set has **16 distinct addresses**.
-pub const LARGEST_CARRYOVER_ADDRESS_BLOCH: u128 = 17_023_029_380;
+pub const LARGEST_CARRYOVER_ADDRESS_BLOCH: u128 = 17_046_829_380;
 const _: () = assert!(LARGEST_CARRYOVER_ADDRESS_BLOCH < CARRYOVER_TOTAL_BLOCH);
 // Pinned against the measurement in satoshis, not in whole BLOCH. The address
 // holds 3,574,836,169.97963769 BLCH; rounding that to whole BLOCH before
@@ -387,7 +395,7 @@ const _: () = assert!(LARGEST_CARRYOVER_ADDRESS_BLOCH < CARRYOVER_TOTAL_BLOCH);
 // re-derives it next.
 const _: () = assert!(
     LARGEST_CARRYOVER_ADDRESS_BLOCH
-        == 357_483_616_997_963_769 * SPLIT_NUMERATOR / SPLIT_DENOMINATOR / SAT_PER_BLOCH,
+        == 357_983_416_998_063_769 * SPLIT_NUMERATOR / SPLIT_DENOMINATOR / SAT_PER_BLOCH,
     "a medida escalada nao bate com a medida G3 sob o split"
 );
 
@@ -398,7 +406,7 @@ const _: () = assert!(
 /// smoothed — the number moving in this direction is exactly what §4A exists
 /// to report.
 pub const FOUNDER_TOTAL_BLOCH: u128 = LARGEST_CARRYOVER_ADDRESS_BLOCH + FOUNDER_BLOCH;
-const _: () = assert!(FOUNDER_TOTAL_BLOCH * 10_000 / TOTAL_SUPPLY_BLOCH == 2702);
+const _: () = assert!(FOUNDER_TOTAL_BLOCH * 10_000 / TOTAL_SUPPLY_BLOCH == 2704);
 
 const _: () = assert!(EMISSION_SLOTS == 42_076_800, "grade de tempo mudou");
 
@@ -581,7 +589,7 @@ pub const fn validator_reward_halving_sat(slot: u64) -> u128 {
 /// 40-year sum does not exceed the allocation.
 pub const DECAY_NUMERATOR: u128 = 9;
 pub const DECAY_DENOMINATOR: u128 = 10;
-pub const INITIAL_ANNUAL_SAT: u128 = 435_206_739_879_746_639;
+pub const INITIAL_ANNUAL_SAT: u128 = 434_965_169_252_191_762;
 
 /// Satoshis of the validator allocation the decay curve can never emit.
 ///
@@ -594,7 +602,7 @@ pub const INITIAL_ANNUAL_SAT: u128 = 435_206_739_879_746_639;
 /// rather than repeated. 176,880 sat is 0.0018 BLCH, permanently unissued —
 /// which errs on the only acceptable side of a hard cap: under, never over.
 /// The compile-time assertion below pins it.
-pub const EMISSION_DUST_SAT: u128 = 772_880;
+pub const EMISSION_DUST_SAT: u128 = 855_280;
 
 const _: () = assert!(
     validator_emitted_decay_by(EMISSION_SLOTS) + EMISSION_DUST_SAT == VALIDATOR_EMISSION_SAT,
