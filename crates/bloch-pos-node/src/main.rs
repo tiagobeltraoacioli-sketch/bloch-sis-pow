@@ -110,8 +110,15 @@ fn print_help() {
                peer addresses. Production is the libp2p stack, not this.\n\
                          --peers <host:port,...> [--stop-at-slot <n>]\n\
                          [--ws-checkpoint <file>] [--ws-signer-set <file>]\n\
+                         [--carryover <snapshot.tsv>]\n\
                Run a validator node. <dir> must hold validator.key; chain\n\
                data persists in <dir> and is replayed on restart.\n\
+               --carryover is the Genesis-3 balance snapshot\n\
+               (bloch-snapshot-utxo's TSV). Required exactly when the\n\
+               manifest carries a carryover commitment, and checked against\n\
+               all four of its fields — file digest, set root, count and\n\
+               total — before a single balance is admitted. A devnet\n\
+               manifest commits to none and the flag is then refused.\n\
                --ws-checkpoint supplies a signed weak-subjectivity\n\
                checkpoint envelope (BLOCH-WEAK-SUBJECTIVITY.md §4.1). A node\n\
                with neither a fresh checkpoint nor fresh finality of its own\n\
@@ -258,6 +265,7 @@ fn genesis_cmd(args: &[String]) {
         // inputs come from a ceremony and not from a command line.
         carryover: None,
         allocations: Vec::new(),
+        carryover_entries: Vec::new(),
     };
     if let Err(e) = manifest.check_supply() {
         eprintln!("genesis: {e}");
@@ -308,6 +316,9 @@ fn run_cmd(args: &[String]) {
         peers,
         stop_at_slot,
         ws,
+        // Required exactly when the manifest commits to a carryover; `run`
+        // refuses both mismatches rather than defaulting either way.
+        carryover_path: arg_value(args, "--carryover").map(PathBuf::from),
     };
     if let Err(e) = engine::run(cfg) {
         eprintln!("bloch-pos: {e}");
