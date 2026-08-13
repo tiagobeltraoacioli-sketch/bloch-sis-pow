@@ -356,6 +356,67 @@ pub enum TransitionError {
     /// that binds first for PQ-signature-heavy traffic and the one gate G10's
     /// fleet measurement stands behind.
     BlockByteLimitExceeded,
+    /// A value transfer in the body broke one of the eUTXO rules; the index
+    /// into the body list, and **which** rule.
+    ///
+    /// Not folded into `Transaction(i)`, and the reason is not dropped: these
+    /// are the rules that decide who may move 3.8 billion BLCH, and "the
+    /// transfer was invalid" in a log is indistinguishable between a node
+    /// running stale software and a node under attack. `ValueNotConserved`
+    /// and `BadSignature` in particular are the two facts an operator must be
+    /// able to read off a divergence without a debugger.
+    Transfer(u32, TransferReject),
+}
+
+/// Why a value transfer was refused by the state transition.
+///
+/// Every variant is a rule that, if it did not exist, would let someone take
+/// coins that are not theirs or create coins from nothing. They are listed in
+/// the order the transition checks them — cheapest first, so the hybrid
+/// verifications are the last thing an attacker can make a node do.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransferReject {
+    /// No inputs. A transfer that spends nothing funds nothing, and its id
+    /// would be a function of its outputs alone — two such transfers with the
+    /// same outputs would collide in the set.
+    NoInputs,
+    /// `tx_bytes` is smaller than the transaction's own canonical encoding.
+    ///
+    /// The declared size is what the fee market charges and what the block's
+    /// byte cap is measured against. Once a transfer carries real witnesses
+    /// (≈4.6 KB per input), a self-declared size that may sit *below* the
+    /// bytes every node must gossip and store would make both the charge and
+    /// the cap advisory. Declaring more than you use is allowed — you simply
+    /// pay for it.
+    UnderdeclaredSize,
+    /// The same outpoint appears twice in one transfer: a double spend that
+    /// would otherwise pass the per-input existence check on its first
+    /// occurrence and be silently deduplicated by the set.
+    DuplicateInput,
+    /// An input names an outpoint that is not in the unspent set — either it
+    /// never existed, or it was already spent (including by an earlier
+    /// transaction in this same block, which is how in-block double spends
+    /// surface).
+    UnknownInput,
+    /// The supplied public key is not the one the output's `script_hash`
+    /// commits to. Checked before the signature: it is one hash against one
+    /// expensive verification, and a wrong key cannot be made right by any
+    /// signature.
+    ScriptMismatch,
+    /// An input's signature does not verify under the supplied key over the
+    /// transfer's signing root. **The rule that stops anyone spending anyone
+    /// else's coins.**
+    BadSignature,
+    /// `sum(inputs) != sum(outputs) + fee`, where the fee is what the fee
+    /// market charges — never a number the transaction declares. Value is
+    /// neither created nor destroyed outside the emission schedule.
+    ValueNotConserved,
+    /// An output would take a key already present in the unspent set.
+    /// Unreachable without a SHA3-256 collision, and refused rather than
+    /// trusted to be unreachable: the overwrite would silently destroy the
+    /// existing output's value.
+    OutputExists,
 }
 
 /// Why a deposit was rejected (§7.1, §4.1, §6.6.3).

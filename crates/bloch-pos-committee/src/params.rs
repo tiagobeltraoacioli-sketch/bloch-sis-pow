@@ -83,6 +83,25 @@ pub const DS_STATE: [u8; 16] = *b"BLCH4:STATE\0\0\0\0\0";
 pub const DS_RANDAO: [u8; 16] = *b"BLCH4:RANDAO\0\0\0\0";
 /// Deposit message signing root (§7.1 proof of possession).
 pub const DS_DEPOSIT: [u8; 16] = *b"BLCH4:DEPOSIT\0\0\0";
+/// The signing root an eUTXO spend authorisation covers: the domain under
+/// which an output's owner authorises *this* transfer and no other.
+///
+/// Its own tag, and not `DS_BODY` or `DS_TXID`, for the reason every tag in
+/// this table exists: a spend authorisation must not be replayable as any
+/// other signed message, and a digest that identifies a transaction must not
+/// double as the digest a key signed. The preimage covers the spend points,
+/// the outputs, the declared size and the tip — everything except the
+/// witnesses, which cannot be inside a root they are produced over.
+pub const DS_SPEND: [u8; 16] = *b"BLCH4:SPEND\0\0\0\0\0";
+/// Transaction identity: `txid = SHA3-256(DS_TXID ‖ spend signing root)`.
+///
+/// Derived from the witness-free signing root, so a transaction's id — and
+/// therefore the keys of every output it creates — cannot be changed by
+/// anyone re-encoding its signatures. A txid taken over the full encoding
+/// would make an unrelated party able to re-key a payment already in flight,
+/// which is the malleability class that made Bitcoin's chained-transaction
+/// wallets unsafe before segwit.
+pub const DS_TXID: [u8; 16] = *b"BLCH4:TXID\0\0\0\0\0\0";
 /// Slashing evidence and voluntary-exit signing roots (§7.2, §7.3).
 pub const DS_SLASH: [u8; 16] = *b"BLCH4:SLASH\0\0\0\0\0";
 /// Proposer signature domain over the header.

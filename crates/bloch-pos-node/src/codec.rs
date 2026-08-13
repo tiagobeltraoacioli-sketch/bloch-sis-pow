@@ -176,6 +176,30 @@ pub fn hex32(b: &[u8; 32]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
+/// Lower-case hex of an arbitrary byte string.
+pub fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// Parse lower- or upper-case hex. Strict: an odd length or a non-hex digit
+/// is an error, never a silently truncated or zero-filled value — this parses
+/// outpoints, keys and signatures, where a quietly mangled byte is a
+/// transaction that spends the wrong coin or verifies against nothing.
+pub fn unhex(s: &str) -> Result<Vec<u8>, String> {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    if s.len() % 2 != 0 {
+        return Err(format!("odd-length hex ({} digits)", s.len()));
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let b = s.as_bytes();
+    for pair in b.chunks(2) {
+        let hi = (pair[0] as char).to_digit(16).ok_or_else(|| format!("bad hex digit {:?}", pair[0] as char))?;
+        let lo = (pair[1] as char).to_digit(16).ok_or_else(|| format!("bad hex digit {:?}", pair[1] as char))?;
+        out.push((hi * 16 + lo) as u8);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
