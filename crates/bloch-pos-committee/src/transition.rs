@@ -50,8 +50,13 @@
 //!    expensive verify, placed before the N attestation verifies.
 //! 8. `Attestation(i)` — in body order; membership (cheap) is checked before
 //!    each signature inside [`crate::attestation::validate`].
-//! 9. `Transaction(i)` — in body order; all checks here are cheap state
-//!    lookups.
+//! 9. `Transaction(i)` / `Transfer(i, reason)` — in body order. The staking
+//!    arms are cheap state lookups. A transfer runs its own frozen
+//!    cheapest-first order *within* the transaction (structure, size floor,
+//!    set membership, script hashes, conservation, then the hybrid
+//!    verifications last) — see [`CommittedState::apply_transfer`] — and
+//!    reports which rule it broke, because those rules decide who may move
+//!    coins and a bare index is not enough to debug a divergence over one.
 //! 10. `StateRootMismatch` — last, because the root only exists once the
 //!     whole transition has run.
 //!
@@ -130,8 +135,8 @@ use crate::forkchoice::{LatestMessage, Store};
 use crate::genesis_cohort;
 use crate::interfaces::{
     BlockId, Checkpoint, FinalityState as FinalityView, ProposalEnvelope,
-    ProposalReject, SlashingEvidence, StateReader, StateTransition, TransitionError,
-    ValidatorRecord,
+    ProposalReject, SlashingEvidence, StateReader, StateTransition, TransferReject,
+    TransitionError, ValidatorRecord,
 };
 use crate::params::SLOTS_PER_EPOCH;
 use crate::rewards::{self, StakeAccount};
@@ -163,37 +168,98 @@ pub use crate::header::VERSION_G4 as BLOCK_VERSION_V4;
 
 // ─── Transactions ───────────────────────────────────────────────────────────
 
-/// The transaction shapes this transition interprets. The eUTXO format is out
-/// of the migration's scope (§1.2), so value transfers are opaque here — only
-/// their fees are consensus inputs to this layer. Deposits, exits and
-/// delegations are the staking-lifecycle messages whose *state-dependent*
-/// rules this transition owns; their cryptographic admission checks (proof of
-/// possession, taint/transparency of inputs, hybrid signatures) run at the
-/// mempool boundary against DEV-3's `StakingLifecycle`/`StakeEligibility`
+/// One spent output, with the witness that authorises spending it.
+///
+/// The outpoint (`txid`, `vout`) names *which* coin; the witness proves the
+/// spender may move it. Both halves are carried in the same struct because a
+/// spend that reached consensus without its witness would be a spend nobody
+/// authorised, and there is no state in which one is meaningful without the
+/// other.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransferInput {
+    /// Id of the transaction that created the output being spent.
+    pub txid: [u8; 32],
+    /// Index of that output within its creating transaction.
+    pub vout: u32,
+    /// The hybrid public key whose SHA3-256 the output's `script_hash`
+    /// commits to. Carried in the witness, not in the state: the set stores
+    /// the *hash* of the key, so a ≈3.7 KB key only ever hits the wire when
+    /// the coin actually moves.
+    pub pubkey: Vec<u8>,
+    /// Hybrid signature over the transfer's signing root
+    /// ([`PosTransaction::spend_signing_root`]).
+    pub signature: Vec<u8>,
+}
+
+/// One created output: an amount, and the commitment to who may spend it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransferOutput {
+    /// Value in satoshis. `u64` per output, exactly as the committed
+    /// [`crate::state_root::EutxoEntry`] holds it; **sums are `u128`**, which
+    /// is the whole reason a 100-billion-BLCH supply at 8 decimals is
+    /// representable without the totals wrapping.
+    pub value: u64,
+    /// SHA3-256 of the locking script — here, of the spender's public key.
+    pub script_hash: [u8; 32],
+}
+
+/// The transaction shapes this transition interprets. Value transfers move
+/// real coins out of the committed unspent set and into new outputs; deposits,
+/// exits and delegations are the staking-lifecycle messages whose
+/// *state-dependent* rules this transition owns; their remaining cryptographic
+/// admission checks (proof of possession, taint/transparency of inputs) run at
+/// the mempool boundary against DEV-3's `StakingLifecycle`/`StakeEligibility`
 /// implementations, which `apply_block`'s frozen signature deliberately does
 /// not receive.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PosTransaction {
-    /// An opaque value transfer, priced by the L1 fee market: **gas × price**,
-    /// where the gas is derived (class + size, `fee_market::intrinsic_gas`)
-    /// and the price is the base fee this block's committed state fixes.
+    /// A value transfer against the committed eUTXO set, priced by the L1 fee
+    /// market: **gas × price**, where the gas is derived (class + size,
+    /// `fee_market::intrinsic_gas`) and the price is the base fee this block's
+    /// committed state fixes.
     ///
-    /// This variant used to read `Transfer { base_fee_sat, priority_fee_sat }`
-    /// — a transaction that declared, in satoshis, what it felt like paying.
-    /// That is not a placeholder for a fee market, it is the absence of one:
+    /// # Two revisions, and what each closed
+    ///
+    /// It first read `Transfer { base_fee_sat, priority_fee_sat }` — a
+    /// transaction that declared, in satoshis, what it felt like paying. That
+    /// is not a placeholder for a fee market, it is the absence of one:
     /// nothing constrained the number, so a proposer could include a transfer
-    /// claiming any fee at all and compound it into its own bond. Changing the
-    /// variant changes `canonical_bytes`, therefore `body_root`, therefore the
-    /// block id — a consensus change, pinned by
-    /// `tests::transfer_encoding_is_gas_priced_not_declared`.
+    /// claiming any fee at all and compound it into its own bond.
+    ///
+    /// It then read `Transfer { inputs: u32, tx_bytes, tip }` — three gas
+    /// terms with **no sender, no recipient and no amount**. The committed
+    /// state carried the 452,133-output opening ledger and the state root
+    /// committed to it, but no transaction could take a satoshi out of it: the
+    /// chain had balances and no payments. This revision is what makes the
+    /// ledger move, and it is where the authorisation rule lives — an output
+    /// is spendable by whoever produces the key its `script_hash` commits to,
+    /// and by nobody else.
+    ///
+    /// Each revision changes `canonical_bytes`, therefore `body_root`,
+    /// therefore the block id of every block carrying a transfer. That is a
+    /// consensus change and is pinned by
+    /// `tests::transfer_encoding_carries_value_not_only_gas`.
     Transfer {
-        /// eUTXO inputs, each costing one hybrid verification. The class term
-        /// of the gas charge; nothing else about the transfer is consensus at
-        /// this layer (§1.2 — the value format stays out of scope).
-        inputs: u32,
+        /// The outputs being spent, each with its own witness — and each
+        /// costing one hybrid verification, which is the class term of the gas
+        /// charge. The count is **derived from this list**: an input count a
+        /// transaction merely asserted would let it buy N verifications'
+        /// worth of node CPU at the price of one.
+        inputs: Vec<TransferInput>,
+        /// The outputs being created. Their keys are `(txid, vout)` where the
+        /// txid is [`PosTransaction::txid`] — derived, never carried, so a
+        /// transaction cannot name the location it writes to.
+        outputs: Vec<TransferOutput>,
         /// Payload bytes this transaction makes every node carry and store.
         /// The dominant gas term for PQ-signed traffic, and the quantity the
         /// block's byte cap is measured against.
+        ///
+        /// Declared rather than derived, so a transfer can pay for the
+        /// off-chain weight it imposes; but consensus refuses a declaration
+        /// **below** the transaction's own canonical length
+        /// ([`TransferReject::UnderdeclaredSize`]), because the alternative is
+        /// a witness-heavy transaction that pays for none of its witnesses and
+        /// counts for nothing against the block's byte cap.
         tx_bytes: u64,
         /// The sender's tip, in millisatoshi per gas. The **only** user-set
         /// price in the system: the base fee is the protocol's.
@@ -252,6 +318,85 @@ pub enum PosTransaction {
 }
 
 impl PosTransaction {
+    /// The digest each input's signature is taken over: everything the
+    /// transfer commits to **except the witnesses**.
+    ///
+    /// # Why the witnesses are excluded, and it is not a weakening
+    ///
+    /// A signature is produced over this root and then stored inside the
+    /// transaction. If the root covered the witnesses, it would have to cover
+    /// the signature being produced over it — no signer could ever compute the
+    /// value to sign. Excluding them is the only construction that terminates,
+    /// and it is the standard one (Bitcoin's sighash, Ethereum's RLP-minus-VRS).
+    ///
+    /// What that leaves unsigned is exactly the witness bytes, and every use
+    /// consensus makes of them is checked against something that *is* signed:
+    /// the pubkey against the output's committed `script_hash`, the signature
+    /// against this root. A third party may substitute neither without failing
+    /// one of those two checks.
+    ///
+    /// # What it covers, and why each field is in it
+    ///
+    /// - **the spend points** — otherwise a signature authorising the movement
+    ///   of one coin would authorise the movement of any coin;
+    /// - **the outputs, in order** — otherwise the destination and the amount
+    ///   could be rewritten in flight, which is the entire attack;
+    /// - **`tx_bytes` and the tip** — both set the fee, and the fee is the
+    ///   difference between what the inputs carry and what the outputs
+    ///   receive. An unsigned fee term is an unsigned deduction from the
+    ///   sender's own money.
+    ///
+    /// Lengths are prefixed and every field is fixed-width, so no two distinct
+    /// transfers share a preimage: a signature is a statement about one
+    /// transfer and cannot be reinterpreted as a statement about another.
+    ///
+    /// Non-transfer variants have no spend to authorise; this returns their
+    /// domain-tagged canonical bytes so the function is total, and nothing in
+    /// the transition asks them for one.
+    pub fn spend_signing_root(&self) -> [u8; 32] {
+        let mut h = Sha3_256::new();
+        h.update(crate::params::DS_SPEND);
+        match self {
+            PosTransaction::Transfer { inputs, outputs, tx_bytes, tip_millisat_per_gas } => {
+                h.update((inputs.len() as u32).to_le_bytes());
+                for i in inputs {
+                    h.update(i.txid);
+                    h.update(i.vout.to_le_bytes());
+                }
+                h.update((outputs.len() as u32).to_le_bytes());
+                for o in outputs {
+                    h.update(o.value.to_le_bytes());
+                    h.update(o.script_hash);
+                }
+                h.update(tx_bytes.to_le_bytes());
+                h.update(tip_millisat_per_gas.to_le_bytes());
+            }
+            other => h.update(other.canonical_bytes()),
+        }
+        h.finalize().into()
+    }
+
+    /// This transaction's id: `SHA3-256(DS_TXID ‖ spend_signing_root)`.
+    ///
+    /// Taken over the **witness-free** root, so the id — and with it the key
+    /// of every output the transfer creates — is fixed the moment the sender
+    /// decides what to send, and cannot be moved afterwards by anyone
+    /// re-encoding the signatures. A txid over the full encoding would let a
+    /// relay change where a payment lands in the set, breaking any transaction
+    /// already built to spend it; that is transaction malleability, and it is
+    /// designed out here rather than patched later.
+    ///
+    /// Distinct outputs cannot collide: the root covers the spend points, an
+    /// outpoint is consumed at most once, and a transfer with no inputs is
+    /// refused ([`TransferReject::NoInputs`]) — so no two applicable transfers
+    /// can share a preimage.
+    pub fn txid(&self) -> [u8; 32] {
+        let mut h = Sha3_256::new();
+        h.update(crate::params::DS_TXID);
+        h.update(self.spend_signing_root());
+        h.finalize().into()
+    }
+
     /// The canonical wire encoding of a consensus transaction — the bytes the
     /// header's `body_root` is a Merkle root over.
     ///
@@ -273,15 +418,20 @@ impl PosTransaction {
     ///
     /// # Scope, stated honestly
     ///
-    /// The eUTXO value-transfer format is out of the migration's scope (§1.2),
-    /// so [`PosTransaction::Transfer`] is opaque *here* by design: consensus
-    /// at this layer needs its **fee-market inputs** — the class term
-    /// (`inputs`), the size term (`tx_bytes`) and the tip — and those are what
-    /// is encoded. It does not encode a fee: the fee is derived, from these
-    /// and from the committed base fee. When the real transfer format lands it
-    /// must supply its own canonical bytes and this arm becomes a delegation
-    /// to them — the discriminant tag makes that a widening rather than a
-    /// re-keying, because no other variant's encoding shifts.
+    /// [`PosTransaction::Transfer`] now encodes the transfer itself — spend
+    /// points with their witnesses, created outputs, and the two fee-market
+    /// terms. It still does not encode a *fee*: the fee is derived, from the
+    /// class and size here plus the committed base fee, and is whatever the
+    /// inputs exceed the outputs by. It also does not encode a txid: that is
+    /// derived ([`PosTransaction::txid`]), because a transaction that named
+    /// its own id could name one already in the set.
+    ///
+    /// What stays out of scope is the general eUTXO *script* format (§1.2).
+    /// The locking condition committed by `script_hash` is fixed here at
+    /// "SHA3-256 of the spender's public key" — a pay-to-pubkey-hash and
+    /// nothing more. Datums, validators and multi-party scripts are a later
+    /// widening, and one that must not silently re-key: when they land they
+    /// need their own discriminant, not an extra optional field on this one.
     ///
     /// # Rules the encoding obeys
     ///
@@ -301,9 +451,23 @@ impl PosTransaction {
             b.extend_from_slice(bytes);
         };
         match self {
-            PosTransaction::Transfer { inputs, tx_bytes, tip_millisat_per_gas } => {
+            PosTransaction::Transfer { inputs, outputs, tx_bytes, tip_millisat_per_gas } => {
                 b.push(0x01);
-                b.extend_from_slice(&inputs.to_le_bytes());
+                // Counts are length prefixes like every other variable-length
+                // field here, so a truncated list cannot decode as a shorter
+                // valid one.
+                b.extend_from_slice(&(inputs.len() as u32).to_le_bytes());
+                for i in inputs {
+                    b.extend_from_slice(&i.txid);
+                    b.extend_from_slice(&i.vout.to_le_bytes());
+                    put(&mut b, &i.pubkey);
+                    put(&mut b, &i.signature);
+                }
+                b.extend_from_slice(&(outputs.len() as u32).to_le_bytes());
+                for o in outputs {
+                    b.extend_from_slice(&o.value.to_le_bytes());
+                    b.extend_from_slice(&o.script_hash);
+                }
                 b.extend_from_slice(&tx_bytes.to_le_bytes());
                 b.extend_from_slice(&tip_millisat_per_gas.to_le_bytes());
             }
@@ -387,11 +551,34 @@ impl PosTransaction {
         let mut r = TxReader { b: bytes, i: 0 };
         let tag = r.u8()?;
         let tx = match tag {
-            0x01 => PosTransaction::Transfer {
-                inputs: r.u32()?,
-                tx_bytes: r.u64()?,
-                tip_millisat_per_gas: r.u128()?,
-            },
+            0x01 => {
+                // Counts are read from untrusted bytes, so nothing is
+                // preallocated from them: a 4-billion-input header on a 40-byte
+                // payload must cost one failed read, not a 4-billion-element
+                // reservation. Each push is backed by bytes that were actually
+                // delivered, and a short list dies on `Truncated`.
+                let n_in = r.u32()?;
+                let mut inputs = Vec::new();
+                for _ in 0..n_in {
+                    inputs.push(TransferInput {
+                        txid: r.h32()?,
+                        vout: r.u32()?,
+                        pubkey: r.bytes()?,
+                        signature: r.bytes()?,
+                    });
+                }
+                let n_out = r.u32()?;
+                let mut outputs = Vec::new();
+                for _ in 0..n_out {
+                    outputs.push(TransferOutput { value: r.u64()?, script_hash: r.h32()? });
+                }
+                PosTransaction::Transfer {
+                    inputs,
+                    outputs,
+                    tx_bytes: r.u64()?,
+                    tip_millisat_per_gas: r.u128()?,
+                }
+            }
             0x02 => PosTransaction::Deposit {
                 pubkey: r.bytes()?,
                 amount_sat: r.u128()?,
@@ -455,6 +642,26 @@ impl core::fmt::Display for TxDecodeError {
             TxDecodeError::TrailingBytes => write!(f, "trailing bytes after transaction"),
         }
     }
+}
+
+/// Why one transaction in a block body was refused by the transition.
+///
+/// A named reason rather than `()`, because the transfer rules decide who may
+/// move coins and a bare unit told an operator nothing about *which* rule a
+/// diverging node applied differently. The staking arms keep a single reason:
+/// their detailed rejects (`DepositReject`, `ExitReject`) belong to the
+/// admission boundary that owns those checks, and inventing a second, subtly
+/// different taxonomy here is the duplicate-derivation habit this crate
+/// refuses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TxReject {
+    /// A value transfer broke one of the eUTXO rules.
+    Transfer(TransferReject),
+    /// A deposit, exit or delegation failed its state-dependent rule.
+    StakingRule,
+    /// Slashing evidence reached the plain transaction seam instead of
+    /// `apply_slashing_evidence`, which is the only path that verifies it.
+    MisroutedEvidence,
 }
 
 /// Little-endian reader mirroring the encoder's field order and widths.
@@ -664,15 +871,34 @@ pub struct CommittedState {
     /// including the 452,133 outputs the Genesis-3 snapshot carries.
     ///
     /// The set lives in the state because the state root commits to it. What
-    /// stays out of this crate is what transactions *mean* — they are still
-    /// opaque bytes here — but what they add up to is consensus, and consensus
-    /// is what this struct is.
+    /// stays out of this crate is the general script format; what an output is
+    /// worth and who may move it are consensus, and consensus is what this
+    /// struct is.
     ///
-    /// Honest scope: genesis seeds this and nothing spends from it yet.
-    /// `PosTransaction::Transfer` carries `inputs`, `tx_bytes` and a tip —
-    /// gas terms, with no sender, recipient or amount — so there is no value
-    /// movement to apply. This makes the carried ledger *exist and be
-    /// committed*; making it *move* is the transfer format's job.
+    /// **It moves now** (2026-08-13). The gap this doc used to record — genesis
+    /// seeds the set and nothing ever spends from it, because
+    /// `PosTransaction::Transfer` carried three gas terms with no sender,
+    /// recipient or amount — is closed: [`CommittedState::apply_transfer`]
+    /// consumes inputs and creates outputs under the authorisation and
+    /// conservation rules stated there. Genesis-4 no longer has balances that
+    /// nobody can spend.
+    ///
+    /// # The gap that is still open, named rather than left to be discovered
+    ///
+    /// **Bonding is not funded from this set.** `PosTransaction::Deposit` and
+    /// `Delegate` name an `amount_sat` and spend no output; `Exit` and the
+    /// withdrawal delay return no output either. So the chain holds two pools
+    /// — this one and the registry's bonded stake — and coins do not travel
+    /// between them: a deposit creates bonded stake without destroying
+    /// spendable coins, and fee rewards compound into bonds that this set
+    /// never funded.
+    ///
+    /// Conservation therefore holds **within** the transfer path (the fee is
+    /// exactly what leaves the set, pinned by test) and **not** across the two
+    /// pools. Closing it means giving deposits and withdrawals eUTXO inputs
+    /// and outputs, which is a change to the staking messages' wire shape and
+    /// to their admission rules, not to this field. Until then, no single
+    /// number in this state is "the supply".
     eutxos: BTreeMap<([u8; 32], u32), crate::state_root::EutxoEntry>,
 }
 
@@ -1115,12 +1341,17 @@ impl CommittedState {
     /// Staking messages charge nothing at this layer: their own fee handling
     /// belongs with the transfer format that carries them (§1.2), and inventing
     /// a charge here would be inventing a price nobody specified.
+    ///
+    /// `verifier` is threaded in because a transfer's authorisation is a
+    /// signature check, and the only thing that may decide whether an output
+    /// moves is whether its owner said so.
     fn apply_transaction(
         &mut self,
         tx: &PosTransaction,
         total_active_sat: u128,
         base_fee_millisat_per_gas: u128,
-    ) -> Result<fee_market::TxCharge, ()> {
+        verifier: &dyn SignatureVerifier,
+    ) -> Result<fee_market::TxCharge, TxReject> {
         let free = fee_market::TxCharge {
             gas: 0,
             tx_bytes: 0,
@@ -1128,14 +1359,9 @@ impl CommittedState {
             priority_fee_sat: 0,
         };
         match tx {
-            PosTransaction::Transfer { inputs, tx_bytes, tip_millisat_per_gas } => {
-                Ok(fee_market::charge(
-                    fee_market::TxClass::Eutxo { inputs: *inputs },
-                    *tx_bytes,
-                    base_fee_millisat_per_gas,
-                    *tip_millisat_per_gas,
-                ))
-            }
+            PosTransaction::Transfer { .. } => self
+                .apply_transfer(tx, base_fee_millisat_per_gas, verifier)
+                .map_err(TxReject::Transfer),
             PosTransaction::Deposit {
                 pubkey,
                 amount_sat,
@@ -1147,10 +1373,10 @@ impl CommittedState {
                 // A second deposit of a registered key is a top-up path
                 // decision the interface refuses to make implicitly.
                 if self.pubkey_index.contains_key(&pubkey_hash) {
-                    return Err(());
+                    return Err(TxReject::StakingRule);
                 }
                 if *amount_sat < staking::MIN_DEPOSIT_SAT {
-                    return Err(());
+                    return Err(TxReject::StakingRule);
                 }
                 // Per-validator cap: 1% of committed active stake, floored at
                 // the minimum deposit — a naive 1% cap at genesis (active
@@ -1158,7 +1384,7 @@ impl CommittedState {
                 let cap = (total_active_sat * delegation::MAX_VALIDATOR_STAKE_BPS / 10_000)
                     .max(staking::MIN_DEPOSIT_SAT);
                 if *amount_sat > cap {
-                    return Err(());
+                    return Err(TxReject::StakingRule);
                 }
                 // Next free index: a deterministic function of the registry,
                 // never of anything local.
@@ -1190,7 +1416,7 @@ impl CommittedState {
             }
             PosTransaction::Exit { validator } => {
                 let Some(rec) = self.validators.get_mut(validator) else {
-                    return Err(());
+                    return Err(TxReject::StakingRule);
                 };
                 // Active, not already exiting, not slashed (slashing has its
                 // own ejection path and must not share the voluntary one).
@@ -1198,7 +1424,7 @@ impl CommittedState {
                     || rec.activation_epoch > self.epoch
                     || rec.exit_epoch != u64::MAX
                 {
-                    return Err(());
+                    return Err(TxReject::StakingRule);
                 }
                 // Duties stop EXIT_DELAY_EPOCHS after the request — an exit
                 // must not dodge already-assigned duties — and the stake
@@ -1211,13 +1437,13 @@ impl CommittedState {
             }
             PosTransaction::Delegate { delegator, validator, amount_sat, eligible } => {
                 let Some(rec) = self.validators.get(validator) else {
-                    return Err(());
+                    return Err(TxReject::StakingRule);
                 };
                 if rec.slashed || rec.exit_epoch != u64::MAX {
-                    return Err(());
+                    return Err(TxReject::StakingRule);
                 }
                 if *amount_sat < delegation::MIN_DELEGATION_SAT {
-                    return Err(());
+                    return Err(TxReject::StakingRule);
                 }
                 self.delegations.push(Delegation {
                     delegator: *delegator,
@@ -1238,8 +1464,164 @@ impl CommittedState {
             // to `apply_slashing_evidence` before this method is reached.
             // Reaching this arm means a caller bypassed that seam; refusing
             // beats silently accepting unverified evidence.
-            PosTransaction::SlashingEvidence(_) => Err(()),
+            PosTransaction::SlashingEvidence(_) => Err(TxReject::MisroutedEvidence),
         }
+    }
+
+    /// Authorise, price and apply one value transfer against the committed
+    /// unspent set.
+    ///
+    /// This is the function that moves the ledger, and every line of it is
+    /// load-bearing. Three properties have to hold together, and none of them
+    /// implies the others:
+    ///
+    /// 1. **Only the owner spends.** Each input supplies a public key and a
+    ///    signature. The key must hash to the `script_hash` the *committed*
+    ///    output carries, and the signature must verify over the transfer's
+    ///    signing root. Checking only the hash would let anyone who can read
+    ///    the chain replay a key; checking only the signature would let anyone
+    ///    sign with a key of their own choosing.
+    /// 2. **Value is conserved.** `sum(inputs) == sum(outputs) + fee`, with the
+    ///    fee coming from the fee market — never from the transaction. A
+    ///    transfer that declares its own fee is the absence of a fee market
+    ///    (see the `fee_market::charge` rationale, and the two revisions
+    ///    recorded on [`PosTransaction::Transfer`]); a transfer whose outputs
+    ///    exceed its inputs is a mint outside the emission schedule, which is
+    ///    the one thing the 100-billion cap exists to make impossible.
+    /// 3. **Each output is spent at most once.** Enforced by removing inputs
+    ///    from the set as they are consumed, so a second spend — in this
+    ///    transaction or in any later one in the same block — finds nothing to
+    ///    spend and is refused.
+    ///
+    /// # The check order is consensus, and it is cheapest-first
+    ///
+    /// Structure, then set membership, then the script hashes, then
+    /// conservation, and only then the hybrid signatures — the one expensive
+    /// operation, deliberately last, exactly as
+    /// [`crate::attestation::validate`] puts committee membership before its
+    /// verification. An attacker spamming unfundable or malformed transfers
+    /// gets rejected on arithmetic, not on ≈7.3 M instructions per input.
+    ///
+    /// Because every check runs before any mutation, a refused transfer leaves
+    /// the state untouched — the caller rejects the whole block, but this
+    /// function is not what makes that safe.
+    fn apply_transfer(
+        &mut self,
+        tx: &PosTransaction,
+        base_fee_millisat_per_gas: u128,
+        verifier: &dyn SignatureVerifier,
+    ) -> Result<fee_market::TxCharge, TransferReject> {
+        let PosTransaction::Transfer { inputs, outputs, tx_bytes, tip_millisat_per_gas } = tx
+        else {
+            // Unreachable: the only caller matches the variant first. A
+            // consensus function does not panic on any input.
+            return Err(TransferReject::NoInputs);
+        };
+
+        // ── Structure ───────────────────────────────────────────────────────
+        if inputs.is_empty() {
+            return Err(TransferReject::NoInputs);
+        }
+        // The declared size must cover the transaction's own bytes: it is what
+        // the market charges and what the block's byte cap counts, and the
+        // witnesses are the bulk of a PQ-signed transfer.
+        if *tx_bytes < tx.canonical_bytes().len() as u64 {
+            return Err(TransferReject::UnderdeclaredSize);
+        }
+
+        // ── The spend points, and the set ───────────────────────────────────
+        //
+        // Collected before anything is consumed, so the duplicate check sees
+        // the transaction whole. A `BTreeSet` keyed by outpoint: order-free,
+        // like every other accumulation in this crate (rule 2).
+        let mut seen: BTreeSet<([u8; 32], u32)> = BTreeSet::new();
+        let mut spent_value: u128 = 0;
+        for i in inputs {
+            let key = (i.txid, i.vout);
+            if !seen.insert(key) {
+                return Err(TransferReject::DuplicateInput);
+            }
+            let Some(entry) = self.eutxos.get(&key) else {
+                return Err(TransferReject::UnknownInput);
+            };
+            // The key the output committed to, checked before the signature —
+            // one hash against one hybrid verification.
+            let key_hash: [u8; 32] = Sha3_256::digest(&i.pubkey).into();
+            if key_hash != entry.script_hash {
+                return Err(TransferReject::ScriptMismatch);
+            }
+            spent_value += entry.value as u128;
+        }
+
+        // ── The price, derived ──────────────────────────────────────────────
+        //
+        // The class term is the *actual* input count, not a number the
+        // transaction asserts: gas buys node CPU, and one hybrid verification
+        // per input is what this function is about to spend.
+        let charge = fee_market::charge(
+            fee_market::TxClass::Eutxo { inputs: inputs.len() as u32 },
+            *tx_bytes,
+            base_fee_millisat_per_gas,
+            *tip_millisat_per_gas,
+        );
+
+        // ── Conservation ────────────────────────────────────────────────────
+        //
+        // u128 throughout: each value is u64, but a sum of them is not, and
+        // the fee is priced in u128 already. Equality, not `>=` — a transfer
+        // that overpays has simply misdeclared its outputs, and silently
+        // sweeping the remainder to the proposer would be a fee nobody set.
+        let created: u128 = outputs.iter().map(|o| o.value as u128).sum();
+        let fee = charge.base_fee_sat + charge.priority_fee_sat;
+        if spent_value != created + fee {
+            return Err(TransferReject::ValueNotConserved);
+        }
+
+        // ── The output keys ─────────────────────────────────────────────────
+        //
+        // Derived from the witness-free root, so the transaction cannot choose
+        // where it writes. A collision with a live output would destroy that
+        // output's value; it needs a SHA3-256 collision to happen, and is
+        // refused rather than assumed away.
+        let txid = tx.txid();
+        for vout in 0..outputs.len() as u32 {
+            if self.eutxos.contains_key(&(txid, vout)) {
+                return Err(TransferReject::OutputExists);
+            }
+        }
+
+        // ── Authorisation: the expensive check, last ────────────────────────
+        //
+        // One signing root for the whole transfer, so N inputs cost N
+        // verifications and not N roots. The root excludes the witnesses (see
+        // `spend_signing_root`), which is what lets a signature exist at all.
+        let signing_root = tx.spend_signing_root();
+        for i in inputs {
+            if !verifier.verify_with_key(&i.pubkey, &signing_root, &i.signature) {
+                return Err(TransferReject::BadSignature);
+            }
+        }
+
+        // ── Apply ───────────────────────────────────────────────────────────
+        //
+        // Nothing above may fail from here, so the set never sees a half-applied
+        // transfer.
+        for i in inputs {
+            self.eutxos.remove(&(i.txid, i.vout));
+        }
+        for (vout, o) in outputs.iter().enumerate() {
+            let vout = vout as u32;
+            self.eutxos.insert(
+                (txid, vout),
+                crate::state_root::EutxoEntry {
+                    txid,
+                    vout,
+                    value: o.value,
+                    script_hash: o.script_hash,
+                },
+            );
+        }
+        Ok(charge)
     }
 
     /// Verify and execute one §7.3 evidence transaction against this state.
@@ -1387,6 +1769,32 @@ impl CommittedState {
     /// whole point of routing fees through the commission split.
     pub fn delegator_fee_reward_sat(&self, delegator: u32) -> u128 {
         self.delegator_fee_rewards.get(&delegator).copied().unwrap_or(0)
+    }
+
+    /// One unspent output, by outpoint — the lookup a wallet needs to build a
+    /// spend, and the one a mempool needs to price it.
+    ///
+    /// Read-only on purpose. The set is mutated in exactly one place
+    /// ([`Self::apply_transfer`]), under the authorisation and conservation
+    /// rules; a `&mut` accessor would be a second way to move coins, with no
+    /// rules attached.
+    pub fn utxo(&self, txid: &[u8; 32], vout: u32) -> Option<&crate::state_root::EutxoEntry> {
+        self.eutxos.get(&(*txid, vout))
+    }
+
+    /// Every unspent output, in outpoint order (the order the state root
+    /// commits them in).
+    pub fn utxos(&self) -> impl Iterator<Item = &crate::state_root::EutxoEntry> {
+        self.eutxos.values()
+    }
+
+    /// Total value in the unspent set, in satoshis.
+    ///
+    /// `u128`, because the set holds a 100-billion-BLCH supply at 8 decimals
+    /// and a `u64` sum of `u64` values would wrap somewhere inside it — the
+    /// same reason [`crate::state_root::total_utxo_value`] exists.
+    pub fn total_unspent_sat(&self) -> u128 {
+        self.eutxos.values().map(|e| e.value as u128).sum()
     }
 
     /// The price this state's block charged, in millisatoshi per gas. The
@@ -1982,8 +2390,9 @@ impl<V: SignatureVerifier> Transition<V> {
                         tx_bytes: 0,
                         base_fee_sat: 0,
                         priority_fee_sat: 0,
-                    }),
-                _ => st.apply_transaction(tx, total_active, base_fee),
+                    })
+                    .map_err(|()| TxReject::StakingRule),
+                _ => st.apply_transaction(tx, total_active, base_fee, &self.verifier),
             };
             match applied {
                 Ok(charge) => {
@@ -1992,7 +2401,12 @@ impl<V: SignatureVerifier> Transition<V> {
                     block_gas = block_gas.saturating_add(charge.gas);
                     block_bytes = block_bytes.saturating_add(charge.tx_bytes);
                 }
-                Err(()) => return Err(TransitionError::Transaction(i as u32)),
+                // The transfer rules keep their reason; everything else stays
+                // on the frozen `Transaction(i)` variant it always used.
+                Err(TxReject::Transfer(why)) => {
+                    return Err(TransitionError::Transfer(i as u32, why))
+                }
+                Err(_) => return Err(TransitionError::Transaction(i as u32)),
             }
         }
 
@@ -2080,10 +2494,43 @@ mod tx_codec_tests {
     /// changes the result.
     fn samples() -> Vec<PosTransaction> {
         vec![
+            // Two inputs with DIFFERENT witness lengths and two outputs with
+            // different values: a field-order, width or count mistake in
+            // either list changes the bytes, and swapping the pubkey and
+            // signature of an input changes them too.
             PosTransaction::Transfer {
-                inputs: 7,
+                inputs: vec![
+                    TransferInput {
+                        txid: [0x11; 32],
+                        vout: 7,
+                        pubkey: vec![0xA1; 3745],
+                        signature: vec![0xB2; 4589],
+                    },
+                    TransferInput {
+                        txid: [0x22; 32],
+                        vout: 0,
+                        pubkey: vec![0xC3; 17],
+                        signature: vec![0xD4; 5],
+                    },
+                ],
+                outputs: vec![
+                    TransferOutput { value: 1, script_hash: [0xE5; 32] },
+                    TransferOutput { value: u64::MAX, script_hash: [0xF6; 32] },
+                ],
                 tx_bytes: 1_234_567,
                 tip_millisat_per_gas: 987_654_321_000,
+            },
+            // The empty-list edges, which the count prefixes must survive.
+            PosTransaction::Transfer {
+                inputs: vec![TransferInput {
+                    txid: [0u8; 32],
+                    vout: u32::MAX,
+                    pubkey: Vec::new(),
+                    signature: Vec::new(),
+                }],
+                outputs: Vec::new(),
+                tx_bytes: 0,
+                tip_millisat_per_gas: 0,
             },
             PosTransaction::Deposit {
                 pubkey: vec![0xAB; 3745],
@@ -2226,6 +2673,144 @@ mod tests {
         bloch * tokenomics_v4::SAT_PER_BLOCH
     }
 
+    // ── A verifier that actually binds a signature to a key and a message ───
+    //
+    // `OkVerifier` says yes to everything, which is right for tests about
+    // composition and ordering and *fatal* for tests about who may spend a
+    // coin: under it, every signature test passes with the signature check
+    // deleted. The transfer tests below therefore run against `ToyVerifier`,
+    // whose `verify_with_key` accepts exactly one byte-string per (key,
+    // message) pair.
+    //
+    // It is not cryptography and does not pretend to be — it is a function
+    // with the one property the rules under test depend on: a signature is
+    // valid for one key over one root and for nothing else. That is enough to
+    // fail an implementation that checks the wrong root (say, one that
+    // included the witnesses, or omitted the outputs), that passes the wrong
+    // key, or that skips the check.
+    //
+    // The registry form (`verify`, used for proposer and attestation
+    // signatures) stays permissive, so a transfer test dies on the transfer
+    // and never on block plumbing.
+    fn toy_sign(pubkey: &[u8], root: &[u8; 32]) -> Vec<u8> {
+        let mut h = Sha3_256::new();
+        h.update(b"toy-spend-signature");
+        h.update((pubkey.len() as u32).to_le_bytes());
+        h.update(pubkey);
+        h.update(root);
+        h.finalize().to_vec()
+    }
+
+    struct ToyVerifier;
+    impl SignatureVerifier for ToyVerifier {
+        fn verify(&self, _v: u32, _root: &[u8; 32], _sig: &[u8]) -> bool {
+            true
+        }
+        fn verify_with_key(&self, pk: &[u8], root: &[u8; 32], sig: &[u8]) -> bool {
+            sig == toy_sign(pk, root).as_slice()
+        }
+    }
+
+    /// A spender's "key". Length varies with the tag so two owners never share
+    /// a script hash by accident.
+    fn owner_key(tag: u8) -> Vec<u8> {
+        vec![tag; 8 + tag as usize % 5]
+    }
+
+    /// The commitment an output carries to its owner: `SHA3-256(pubkey)`.
+    fn script_of(pubkey: &[u8]) -> [u8; 32] {
+        Sha3_256::digest(pubkey).into()
+    }
+
+    /// One opening-balance output: `value` satoshis locked to `owner`.
+    fn opening(tag: u8, vout: u32, value: u64, owner: &[u8]) -> crate::state_root::EutxoEntry {
+        crate::state_root::EutxoEntry {
+            txid: [tag; 32],
+            vout,
+            value,
+            script_hash: script_of(owner),
+        }
+    }
+
+    /// Sign every input of a transfer under `owner`'s key.
+    ///
+    /// Separate from construction so a test that edits a signed field can put
+    /// the signatures back. Without it, a test meaning to break conservation
+    /// would break the signature as well and pass for the wrong reason — which
+    /// is the failure mode that makes a negative test worthless.
+    fn resign(tx: &mut PosTransaction, owner: &[u8]) {
+        let root = tx.spend_signing_root();
+        if let PosTransaction::Transfer { inputs, .. } = tx {
+            for i in inputs.iter_mut() {
+                i.signature = toy_sign(owner, &root);
+            }
+        }
+    }
+
+    /// A conserving transfer that spends `entries` whole and pays the
+    /// remainder, after the market's fee, to `to_script`.
+    ///
+    /// The fee is computed with the **same** `fee_market::charge` call the
+    /// transition makes, at the price the caller passes — never a literal. A
+    /// fixture that hard-coded the fee would stop conserving the moment any
+    /// gas constant moved, and the test would report a conservation bug that
+    /// was really a stale number.
+    ///
+    /// `tx_bytes` is raised to the encoding's own length if the caller asked
+    /// for less, so a test aiming at some other rule cannot trip the size
+    /// floor by accident.
+    fn transfer_spending(
+        entries: &[crate::state_root::EutxoEntry],
+        owner: &[u8],
+        to_script: [u8; 32],
+        tx_bytes: u64,
+        tip: u128,
+        price: u128,
+    ) -> PosTransaction {
+        let inputs: Vec<TransferInput> = entries
+            .iter()
+            .map(|e| TransferInput {
+                txid: e.txid,
+                vout: e.vout,
+                pubkey: owner.to_vec(),
+                // A placeholder of the right LENGTH: the real signature goes
+                // in below, and the encoding's size must not change under it.
+                signature: vec![0u8; 32],
+            })
+            .collect();
+        let spent: u128 = entries.iter().map(|e| e.value as u128).sum();
+
+        // Size first: the charge depends on tx_bytes, so the floor has to be
+        // resolved before the fee, and the encoding's length does not depend
+        // on the VALUE of tx_bytes (it is a fixed-width field).
+        let probe = PosTransaction::Transfer {
+            inputs: inputs.clone(),
+            outputs: vec![TransferOutput { value: 0, script_hash: to_script }],
+            tx_bytes,
+            tip_millisat_per_gas: tip,
+        };
+        let tx_bytes = tx_bytes.max(probe.canonical_bytes().len() as u64);
+
+        let charge = fee_market::charge(
+            fee_market::TxClass::Eutxo { inputs: inputs.len() as u32 },
+            tx_bytes,
+            price,
+            tip,
+        );
+        let fee = charge.base_fee_sat + charge.priority_fee_sat;
+        assert!(spent >= fee, "fixture underfunded: {spent} sat cannot pay a {fee} sat fee");
+        let change = (spent - fee) as u64;
+
+        let mut tx = PosTransaction::Transfer {
+            inputs,
+            outputs: vec![TransferOutput { value: change, script_hash: to_script }],
+            tx_bytes,
+            tip_millisat_per_gas: tip,
+        };
+        resign(&mut tx, owner);
+        tx
+    }
+
     /// Rejects exactly the marker byte-string `b"forged"`, accepts anything
     /// else — enough to make one signature of an evidence pair verifiably
     /// bad while every other signature in the block still passes.
@@ -2240,12 +2825,23 @@ mod tests {
     }
 
     fn setup(n: u32) -> (Transition<OkVerifier>, CommittedState, Vec<RandaoChain>) {
-        setup_with(n, OkVerifier)
+        setup_with(n, OkVerifier, &[])
+    }
+
+    /// `setup`, plus an opening ledger — the fixture every transfer test needs,
+    /// because a transfer can only move coins that already exist. Paired with
+    /// [`ToyVerifier`] so spend authorisation is actually checked.
+    fn setup_funded(
+        n: u32,
+        opening_balances: &[crate::state_root::EutxoEntry],
+    ) -> (Transition<ToyVerifier>, CommittedState, Vec<RandaoChain>) {
+        setup_with(n, ToyVerifier, opening_balances)
     }
 
     fn setup_with<V: SignatureVerifier>(
         n: u32,
         verifier: V,
+        opening_balances: &[crate::state_root::EutxoEntry],
     ) -> (Transition<V>, CommittedState, Vec<RandaoChain>) {
         let mut chains = Vec::new();
         let mut vals = Vec::new();
@@ -2281,8 +2877,7 @@ mod tests {
                 gas_used: 0,
                 base_fee_per_gas: 1,
             },
-            // Devnet/test genesis: nobody holds anything.
-            &[],
+            opening_balances,
         );
         (Transition::new(verifier), st, chains)
     }
@@ -2736,7 +3331,15 @@ mod tests {
             commission_bps: 500,
         };
         let mut probe = st.clone();
-        assert_eq!(probe.apply_transaction(&dup, 0, fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS), Err(()));
+        assert_eq!(
+            probe.apply_transaction(
+                &dup,
+                0,
+                fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+                &OkVerifier
+            ),
+            Err(TxReject::StakingRule)
+        );
     }
 
     #[test]
@@ -2757,7 +3360,15 @@ mod tests {
         assert!(st.active_validators().iter().any(|v| v.index == 0));
         // A second exit is rejected: the withdrawal clock must never reset.
         let mut probe = st.clone();
-        assert_eq!(probe.apply_transaction(&exit, 0, fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS), Err(()));
+        assert_eq!(
+            probe.apply_transaction(
+                &exit,
+                0,
+                fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+                &OkVerifier
+            ),
+            Err(TxReject::StakingRule)
+        );
     }
 
     /// One transfer, charged by the fee market rather than by its own say-so,
@@ -2772,8 +3383,17 @@ mod tests {
     /// a constant nobody meant to freeze.
     #[test]
     fn fees_are_charged_by_the_market_and_compound_only_at_the_boundary() {
-        let (t, g, mut chains) = setup(4);
-        let tx = PosTransaction::Transfer { inputs: 1, tx_bytes: 512, tip_millisat_per_gas: 5 };
+        let owner = owner_key(0x31);
+        let coin = opening(0x71, 0, 100_000_000, &owner);
+        let (t, g, mut chains) = setup_funded(4, &[coin.clone()]);
+        let tx = transfer_spending(
+            std::slice::from_ref(&coin),
+            &owner,
+            script_of(&owner_key(0x32)),
+            512,
+            5,
+            g.next_base_fee(),
+        );
         let b = build_block(&t, &g, 1, &[], std::slice::from_ref(&tx), &mut chains);
         let s1 = t.apply_block(&g, &b, &[], std::slice::from_ref(&tx)).unwrap();
         let p = b.header.proposer_index;
@@ -2822,14 +3442,21 @@ mod tests {
     /// one claiming any figure and compound it into its own bond.
     #[test]
     fn a_transaction_cannot_declare_its_own_fee() {
-        let (t, g, mut chains) = setup(4);
-        let small = PosTransaction::Transfer { inputs: 1, tx_bytes: 256, tip_millisat_per_gas: 0 };
-        let large = PosTransaction::Transfer { inputs: 4, tx_bytes: 4_096, tip_millisat_per_gas: 0 };
+        let owner = owner_key(0x33);
+        let to = script_of(&owner_key(0x34));
+        // Four funded coins: one for the small transfer, four for the large —
+        // the input count is now the REAL list length, so "four verifies" has
+        // to mean four outputs actually being spent.
+        let coins: Vec<_> =
+            (0..4u32).map(|i| opening(0x72, i, 100_000_000, &owner)).collect();
 
+        let (t, g, mut chains) = setup_funded(4, &coins);
+        let small = transfer_spending(&coins[..1], &owner, to, 256, 0, g.next_base_fee());
         let b_small = build_block(&t, &g, 1, &[], std::slice::from_ref(&small), &mut chains);
         let s_small = t.apply_block(&g, &b_small, &[], std::slice::from_ref(&small)).unwrap();
 
-        let (t2, g2, mut chains2) = setup(4);
+        let (t2, g2, mut chains2) = setup_funded(4, &coins);
+        let large = transfer_spending(&coins, &owner, to, 4_096, 0, g2.next_base_fee());
         let b_large = build_block(&t2, &g2, 1, &[], std::slice::from_ref(&large), &mut chains2);
         let s_large = t2.apply_block(&g2, &b_large, &[], std::slice::from_ref(&large)).unwrap();
 
@@ -2853,12 +3480,21 @@ mod tests {
     /// controller, and a congested block raises the price for the next one.
     #[test]
     fn the_base_fee_moves_with_committed_usage_only() {
-        let (t, g, mut chains) = setup(4);
+        let owner = owner_key(0x35);
+        let coin = opening(0x73, 0, 100_000_000, &owner);
+        let (t, g, mut chains) = setup_funded(4, &[coin.clone()]);
         // A block at the byte target: the controller's neutral point on the
         // byte axis, but well under target on gas — so the max-utilisation
         // rule prices the byte axis and leaves the floor alone (it cannot
         // fall below it anyway).
-        let tx = PosTransaction::Transfer { inputs: 1, tx_bytes: 8_192, tip_millisat_per_gas: 0 };
+        let tx = transfer_spending(
+            std::slice::from_ref(&coin),
+            &owner,
+            script_of(&owner_key(0x36)),
+            8_192,
+            0,
+            g.next_base_fee(),
+        );
         let b1 = build_block(&t, &g, 1, &[], std::slice::from_ref(&tx), &mut chains);
         let s1 = t.apply_block(&g, &b1, &[], std::slice::from_ref(&tx)).unwrap();
 
@@ -2889,27 +3525,66 @@ mod tests {
     /// The two per-block caps (fee-market spec §5) reject with their own
     /// errors. Without this the caps would be constants nothing enforces —
     /// which is what they were until 2026-08-12.
+    ///
+    /// # What the size floor changed here, stated rather than hidden
+    ///
+    /// The gas half used to be built as "many inputs, few bytes" — a transfer
+    /// asserting thousands of inputs while declaring 128 bytes. That shape is
+    /// no longer expressible, and its disappearance is the point of
+    /// [`TransferReject::UnderdeclaredSize`]: an input now carries a real
+    /// witness, and a transaction may not declare a size below its own
+    /// encoding. With that floor in place, `inputs × HYBRID_VERIFY_GAS` cannot
+    /// outrun the byte cap for the eUTXO class — bytes bind first, exactly as
+    /// `fee_market`'s own `bytes_bind_before_gas` says they do.
+    ///
+    /// So the gas cap is reached the only way it still can be: by
+    /// **over**-declaring size, which is allowed (you pay for what you
+    /// declare). The gas check runs before the byte check in the frozen order,
+    /// which is what makes it observable. Honest consequence: for today's
+    /// transaction set the gas cap is a backstop for a class that does not
+    /// exist yet (`TxClass::Shielded`, `EvmPq`) rather than a live constraint
+    /// on transfers — and a backstop that is never exercised is precisely the
+    /// kind of check that rots, which is why it is still tested.
     #[test]
     fn the_two_block_caps_are_enforced() {
+        let owner = owner_key(0x37);
+        let to = script_of(&owner_key(0x38));
+        // Funded well above any fee these blocks can charge: the caps are what
+        // must reject them, not an unfundable transfer.
+        let coin = |tag: u8| opening(tag, 0, 21_000_000_000_000_000, &owner);
+
         // Bytes bind first for signature-heavy traffic, so the byte cap is
         // reachable with a transaction the gas cap still admits.
-        let (t, g, mut chains) = setup(4);
-        let fat = PosTransaction::Transfer {
-            inputs: 1,
-            tx_bytes: fee_market::MAX_BLOCK_TX_BYTES + 1,
-            tip_millisat_per_gas: 0,
-        };
+        let c1 = coin(0x74);
+        let (t, g, mut chains) = setup_funded(4, &[c1.clone()]);
+        let fat = transfer_spending(
+            std::slice::from_ref(&c1),
+            &owner,
+            to,
+            fee_market::MAX_BLOCK_TX_BYTES + 1,
+            0,
+            g.next_base_fee(),
+        );
         let env = probe_env(&g, 1, std::slice::from_ref(&fat), &mut chains);
         assert_eq!(
             t.compute_post_state(&g, &env, &[], std::slice::from_ref(&fat)).unwrap_err(),
             TransitionError::BlockByteLimitExceeded,
         );
 
-        // The gas cap needs the verify term, not the byte term: many inputs,
-        // few bytes — which is exactly the shape the byte cap cannot see.
-        let (t2, g2, mut chains2) = setup(4);
-        let inputs = (fee_market::BLOCK_GAS_LIMIT / fee_market::HYBRID_VERIFY_GAS + 1) as u32;
-        let heavy = PosTransaction::Transfer { inputs, tx_bytes: 128, tip_millisat_per_gas: 0 };
+        // The gas cap: a declared size whose byte term alone exceeds the gas
+        // limit. Derived from the constants, so a change to either moves this
+        // with it.
+        let c2 = coin(0x75);
+        let (t2, g2, mut chains2) = setup_funded(4, &[c2.clone()]);
+        let over_gas = fee_market::BLOCK_GAS_LIMIT / fee_market::GAS_PER_BYTE + 1;
+        let heavy = transfer_spending(
+            std::slice::from_ref(&c2),
+            &owner,
+            to,
+            over_gas,
+            0,
+            g2.next_base_fee(),
+        );
         let env2 = probe_env(&g2, 1, std::slice::from_ref(&heavy), &mut chains2);
         assert_eq!(
             t2.compute_post_state(&g2, &env2, &[], std::slice::from_ref(&heavy)).unwrap_err(),
@@ -2918,14 +3593,467 @@ mod tests {
 
         // And a block at exactly the byte cap is VALID — an off-by-one here
         // would make the cap unreachable and the byte axis dead.
-        let (t3, g3, mut chains3) = setup(4);
-        let at_cap = PosTransaction::Transfer {
-            inputs: 1,
-            tx_bytes: fee_market::MAX_BLOCK_TX_BYTES,
-            tip_millisat_per_gas: 0,
-        };
+        let c3 = coin(0x76);
+        let (t3, g3, mut chains3) = setup_funded(4, &[c3.clone()]);
+        let at_cap = transfer_spending(
+            std::slice::from_ref(&c3),
+            &owner,
+            to,
+            fee_market::MAX_BLOCK_TX_BYTES,
+            0,
+            g3.next_base_fee(),
+        );
         let b = build_block(&t3, &g3, 1, &[], std::slice::from_ref(&at_cap), &mut chains3);
         assert!(t3.apply_block(&g3, &b, &[], std::slice::from_ref(&at_cap)).is_ok());
+    }
+
+    /// The shape the gas half of the test above can no longer take: a transfer
+    /// that claims many inputs while declaring almost no bytes.
+    ///
+    /// Pinned as its own test because it is a **security** property, not a
+    /// test-construction detail. Without the size floor, one block could carry
+    /// thousands of ≈8.4 KB witnesses (a hybrid key plus a hybrid signature
+    /// per input) while contributing ~nothing to the byte cap the whole gossip
+    /// budget rests on — every node made to download and store tens of
+    /// megabytes for the price of a few hundred bytes.
+    #[test]
+    fn a_transfer_cannot_declare_fewer_bytes_than_it_carries() {
+        let owner = owner_key(0x39);
+        let coins: Vec<_> = (0..8u32).map(|i| opening(0x77, i, 1_000_000, &owner)).collect();
+        let (_t, g, _chains) = setup_funded(4, &coins);
+
+        let mut tx = transfer_spending(
+            &coins,
+            &owner,
+            script_of(&owner_key(0x3A)),
+            0, // asks for zero; the helper raises it to the encoding's length
+            0,
+            g.next_base_fee(),
+        );
+        let PosTransaction::Transfer { tx_bytes, .. } = &tx else { unreachable!() };
+        let honest = *tx_bytes;
+        assert!(honest > 128, "fixture premise: real witnesses cost real bytes");
+
+        // One byte short of honest is already refused — and the signatures are
+        // restored, so the reject is the size rule and not a stale witness.
+        if let PosTransaction::Transfer { tx_bytes, .. } = &mut tx {
+            *tx_bytes = honest - 1;
+        }
+        resign(&mut tx, &owner);
+        let mut probe = g.clone();
+        assert_eq!(
+            probe.apply_transfer(&tx, g.next_base_fee(), &ToyVerifier),
+            Err(TransferReject::UnderdeclaredSize),
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // The transfer moves value — the rules that decide who owns what
+    // ────────────────────────────────────────────────────────────────────────
+    //
+    // Until this wave `Transfer` carried `{ inputs: u32, tx_bytes, tip }`:
+    // three gas terms and no sender, recipient or amount. The committed state
+    // held the opening ledger and the state root committed to it, and no
+    // transaction could take a satoshi out of it. These tests are the proof
+    // that it can now, and — far more important — the proof of everything that
+    // still cannot happen.
+    //
+    // Each negative test below was run against a deliberately sabotaged
+    // implementation and observed to FAIL; a negative test that passes with
+    // its rule deleted proves nothing at all. The sabotage results are
+    // recorded on each test.
+
+    /// **Value moves, and it moves exactly where it was sent.**
+    ///
+    /// The set loses the spent outputs and gains the created ones, the
+    /// amounts are what the transaction said, the new outputs are locked to
+    /// the recipient, and the difference between what went in and what came
+    /// out is the fee — not a satoshi more or less.
+    ///
+    /// Sabotage: skipping the removal loop leaves the spent coin in the set
+    /// (`the spent output is still in the set`); skipping the insert loop
+    /// drops the payment (`the recipient was not paid`).
+    #[test]
+    fn a_transfer_moves_value_and_the_root_follows() {
+        let alice = owner_key(0x50);
+        let bob_script = script_of(&owner_key(0x51));
+        let coin_a = opening(0x80, 0, 60_000_000, &alice);
+        let coin_b = opening(0x80, 1, 40_000_000, &alice);
+        let (t, g, mut chains) = setup_funded(4, &[coin_a.clone(), coin_b.clone()]);
+
+        let price = g.next_base_fee();
+        let tx = transfer_spending(&[coin_a.clone(), coin_b.clone()], &alice, bob_script, 512, 2, price);
+        let PosTransaction::Transfer { outputs, .. } = &tx else { unreachable!() };
+        let paid = outputs[0].value;
+        let txid = tx.txid();
+
+        let b = build_block(&t, &g, 1, &[], std::slice::from_ref(&tx), &mut chains);
+        let s1 = t.apply_block(&g, &b, &[], std::slice::from_ref(&tx)).unwrap();
+
+        // The inputs are gone.
+        assert!(
+            !s1.eutxos.contains_key(&(coin_a.txid, coin_a.vout)),
+            "the spent output is still in the set"
+        );
+        assert!(!s1.eutxos.contains_key(&(coin_b.txid, coin_b.vout)));
+        // The output exists, at the derived key, with the right value and the
+        // recipient's lock.
+        let created = s1.eutxos.get(&(txid, 0)).expect("the recipient was not paid");
+        assert_eq!(created.value, paid);
+        assert_eq!(created.script_hash, bob_script);
+        assert_eq!(created.txid, txid, "the entry must key itself consistently");
+        assert_eq!(created.vout, 0);
+        assert_eq!(s1.eutxos.len(), 1, "two spent, one created");
+
+        // Conservation, checked from the outside: what left the set minus what
+        // entered it is exactly the fee the block charged.
+        let charge = fee_market::charge(
+            fee_market::TxClass::Eutxo { inputs: 2 },
+            512,
+            price,
+            2,
+        );
+        let before: u128 = (coin_a.value as u128) + (coin_b.value as u128);
+        let after: u128 = s1.eutxos.values().map(|e| e.value as u128).sum();
+        assert_eq!(
+            before - after,
+            charge.base_fee_sat + charge.priority_fee_sat,
+            "the coins that left the set are not the fee that was charged"
+        );
+
+        // And the ledger is under the state root. Isolated: the post-state with
+        // its unspent set put back must root differently, so this cannot pass
+        // on the strength of some other field having moved.
+        let mut reverted = s1.clone();
+        reverted.eutxos = g.eutxos.clone();
+        assert_ne!(
+            s1.compute_root(),
+            reverted.compute_root(),
+            "the unspent set is not bound by the state root"
+        );
+    }
+
+    /// **Conservation.** A transfer whose outputs plus fee do not equal its
+    /// inputs is refused, and refused with a reason of its own.
+    ///
+    /// Both directions matter and both are checked. Paying out more than was
+    /// spent is a mint outside the emission schedule — the one thing the
+    /// 100-billion cap exists to make impossible. Paying out less is not
+    /// generosity: the surplus would vanish from the accounted supply with
+    /// nothing recording it, and "value quietly disappeared" is how a ledger
+    /// stops being auditable.
+    ///
+    /// Sabotage: replacing the equality with `spent_value >= created + fee`
+    /// makes the underpaying half pass; deleting the check entirely makes both
+    /// halves pass and the overpay case actually MINTS — the post-state's
+    /// unspent total rises above the opening balance.
+    #[test]
+    fn a_transfer_that_does_not_conserve_value_is_refused() {
+        let alice = owner_key(0x52);
+        let to = script_of(&owner_key(0x53));
+        let coin = opening(0x81, 0, 50_000_000, &alice);
+        let (_t, g, _c) = setup_funded(4, &[coin.clone()]);
+        let price = g.next_base_fee();
+
+        let honest = transfer_spending(std::slice::from_ref(&coin), &alice, to, 512, 1, price);
+        // Control: the honest transfer is accepted, so the two mutants below
+        // fail on the amount and on nothing else.
+        assert!(g.clone().apply_transfer(&honest, price, &ToyVerifier).is_ok());
+
+        for delta in [1i64, -1] {
+            let mut bad = honest.clone();
+            if let PosTransaction::Transfer { outputs, .. } = &mut bad {
+                outputs[0].value = outputs[0].value.wrapping_add_signed(delta);
+            }
+            // Re-signed: the output value is inside the signing root, so an
+            // edited transfer carries a stale signature. Without this the test
+            // would pass on `BadSignature` and never reach conservation.
+            resign(&mut bad, &alice);
+            assert_eq!(
+                g.clone().apply_transfer(&bad, price, &ToyVerifier),
+                Err(TransferReject::ValueNotConserved),
+                "an output {delta} satoshi off must be refused",
+            );
+        }
+
+        // And through the block seam, so the named reason survives to the
+        // caller rather than being flattened into `Transaction(i)`.
+        let mut mint = honest.clone();
+        if let PosTransaction::Transfer { outputs, .. } = &mut mint {
+            outputs[0].value += 1_000_000;
+        }
+        resign(&mut mint, &alice);
+        let (t, g2, mut chains) = setup_funded(4, &[coin]);
+        let env = probe_env(&g2, 1, std::slice::from_ref(&mint), &mut chains);
+        assert_eq!(
+            t.compute_post_state(&g2, &env, &[], std::slice::from_ref(&mint)).unwrap_err(),
+            TransitionError::Transfer(0, TransferReject::ValueNotConserved),
+        );
+    }
+
+    /// **Double spend.** The same output spent twice in one block is refused —
+    /// whether the two spends are two transactions or two inputs of one.
+    ///
+    /// The in-block case is the one that matters: a node that only checked the
+    /// *parent* state's unspent set would accept both, because both look
+    /// fundable against the state the block started from. The set has to be
+    /// consumed as the block is applied, which is what makes the second spend
+    /// find nothing.
+    ///
+    /// Sabotage: moving the removal out of `apply_transfer` and into a pass
+    /// after the block's transactions are all applied makes the two-transaction
+    /// half pass — and the block then spends 50,000,000 satoshis twice while
+    /// paying out both times. Deleting the `seen` set makes the one-transaction
+    /// half pass, with the same doubling inside a single transfer.
+    #[test]
+    fn spending_one_output_twice_in_a_block_is_refused() {
+        let alice = owner_key(0x54);
+        let to = script_of(&owner_key(0x55));
+        let coin = opening(0x82, 0, 50_000_000, &alice);
+
+        // (a) Two transactions, same outpoint. They cannot be byte-identical
+        //     or the mempool/body would hold one — the tip differs, which
+        //     changes the signing root and so the txid too. Two genuinely
+        //     distinct transactions, both spending the same coin.
+        let (t, g, mut chains) = setup_funded(4, &[coin.clone()]);
+        let price = g.next_base_fee();
+        let first = transfer_spending(std::slice::from_ref(&coin), &alice, to, 512, 1, price);
+        let second = transfer_spending(std::slice::from_ref(&coin), &alice, to, 512, 2, price);
+        assert_ne!(first, second, "fixture premise: two distinct transactions");
+        let both = [first.clone(), second];
+        let env = probe_env(&g, 1, &both, &mut chains);
+        assert_eq!(
+            t.compute_post_state(&g, &env, &[], &both).unwrap_err(),
+            TransitionError::Transfer(1, TransferReject::UnknownInput),
+            "the second spend must find the coin already gone",
+        );
+        // The first one alone is fine — so the reject above is the double
+        // spend, not something wrong with the transaction itself. A fresh
+        // fixture, because `probe_env` already consumed the proposer's reveal
+        // and a RANDAO chain position is spendable exactly once.
+        let (t1, g1, mut chains1) = setup_funded(4, &[coin.clone()]);
+        let solo = build_block(&t1, &g1, 1, &[], std::slice::from_ref(&first), &mut chains1);
+        assert!(t1.apply_block(&g1, &solo, &[], std::slice::from_ref(&first)).is_ok());
+
+        // (b) One transaction naming the same outpoint twice. Caught by its
+        //     own rule: the set would silently deduplicate it, and the
+        //     transfer would appear to spend 100,000,000 satoshis of a
+        //     50,000,000-satoshi coin.
+        let (_t2, g2, _c2) = setup_funded(4, &[coin.clone()]);
+        let doubled = transfer_spending(&[coin.clone(), coin.clone()], &alice, to, 512, 1, price);
+        assert_eq!(
+            g2.clone().apply_transfer(&doubled, price, &ToyVerifier),
+            Err(TransferReject::DuplicateInput),
+        );
+    }
+
+    /// **An input that does not exist is refused** — and so is one that exists
+    /// but is not the one being claimed.
+    ///
+    /// Without this a transfer could conjure its own funding: name any
+    /// outpoint, pay yourself the amount, and the only thing standing between
+    /// an attacker and arbitrary coins would be the fee.
+    ///
+    /// Sabotage: replacing the `get` with a default 0-value entry turns the
+    /// reject into `ValueNotConserved`, and this assertion fails on the
+    /// reason — which is the point of naming the reasons.
+    #[test]
+    fn an_input_that_is_not_in_the_set_is_refused() {
+        let alice = owner_key(0x56);
+        let to = script_of(&owner_key(0x57));
+        let real = opening(0x83, 0, 50_000_000, &alice);
+        let (_t, g, _c) = setup_funded(4, &[real.clone()]);
+        let price = g.next_base_fee();
+
+        // A txid nobody ever created. Correctly signed and internally
+        // conserving, so the only thing wrong with it is that the coin it
+        // spends does not exist.
+        let ghost = crate::state_root::EutxoEntry { txid: [0xEE; 32], ..real.clone() };
+        let tx = transfer_spending(std::slice::from_ref(&ghost), &alice, to, 512, 1, price);
+        assert_eq!(
+            g.clone().apply_transfer(&tx, price, &ToyVerifier),
+            Err(TransferReject::UnknownInput),
+        );
+
+        // The right txid, the wrong index: an off-by-one in the outpoint key
+        // would make these two the same output.
+        let wrong_vout = crate::state_root::EutxoEntry { vout: 1, ..real.clone() };
+        let tx2 =
+            transfer_spending(std::slice::from_ref(&wrong_vout), &alice, to, 512, 1, price);
+        assert_eq!(
+            g.clone().apply_transfer(&tx2, price, &ToyVerifier),
+            Err(TransferReject::UnknownInput),
+        );
+
+        // Control: the real outpoint is spendable, so the two rejects are
+        // about the outpoint and not about the fixture.
+        let good = transfer_spending(std::slice::from_ref(&real), &alice, to, 512, 1, price);
+        assert!(g.clone().apply_transfer(&good, price, &ToyVerifier).is_ok());
+    }
+
+    /// **The test that stops anyone spending anyone else's coins.**
+    ///
+    /// Three ways to fail authorisation, because they are three different
+    /// mistakes and only one of them is caught by a naive implementation:
+    ///
+    /// 1. the right key, a signature that is not over this transfer — a
+    ///    signature lifted from another transaction, which is what "the root
+    ///    must cover the payment" is for;
+    /// 2. an attacker's own key, with a perfectly valid signature under it —
+    ///    valid crypto, wrong owner. Caught by the `script_hash` check, and by
+    ///    nothing else; an implementation that only verified the signature
+    ///    would hand the coin over;
+    /// 3. the victim's key with the attacker's signature — the ordinary forgery.
+    ///
+    /// Sabotage: deleting the `verify_with_key` call makes (1) and (3) pass;
+    /// deleting the `script_hash` comparison makes (2) pass, and the attacker
+    /// walks off with a coin they never owned. Both were observed.
+    #[test]
+    fn a_transfer_with_a_bad_signature_is_refused() {
+        let alice = owner_key(0x58);
+        let mallory = owner_key(0x59);
+        let to = script_of(&owner_key(0x5A));
+        let coin = opening(0x84, 0, 50_000_000, &alice);
+        let (_t, g, _c) = setup_funded(4, &[coin.clone()]);
+        let price = g.next_base_fee();
+
+        let honest = transfer_spending(std::slice::from_ref(&coin), &alice, to, 512, 1, price);
+        assert!(
+            g.clone().apply_transfer(&honest, price, &ToyVerifier).is_ok(),
+            "control: the owner's own signature must be accepted"
+        );
+
+        // (1) Alice's key, but a signature over a DIFFERENT transfer. The
+        //     bytes are a real signature; they just say something else.
+        let other = transfer_spending(std::slice::from_ref(&coin), &alice, to, 512, 9, price);
+        let stolen_sig = match &other {
+            PosTransaction::Transfer { inputs, .. } => inputs[0].signature.clone(),
+            _ => unreachable!(),
+        };
+        let mut replayed = honest.clone();
+        if let PosTransaction::Transfer { inputs, .. } = &mut replayed {
+            inputs[0].signature = stolen_sig;
+        }
+        assert_eq!(
+            g.clone().apply_transfer(&replayed, price, &ToyVerifier),
+            Err(TransferReject::BadSignature),
+            "a signature over another transfer must not authorise this one",
+        );
+
+        // (2) Mallory signs, with her own key, flawlessly — over exactly this
+        //     transfer. The signature verifies; the key is not the one the
+        //     output committed to.
+        let mut impersonated = honest.clone();
+        if let PosTransaction::Transfer { inputs, .. } = &mut impersonated {
+            inputs[0].pubkey = mallory.clone();
+        }
+        resign(&mut impersonated, &mallory);
+        assert!(
+            ToyVerifier.verify_with_key(
+                &mallory,
+                &impersonated.spend_signing_root(),
+                match &impersonated {
+                    PosTransaction::Transfer { inputs, .. } => &inputs[0].signature,
+                    _ => unreachable!(),
+                },
+            ),
+            "fixture premise: Mallory's signature really is valid under Mallory's key"
+        );
+        assert_eq!(
+            g.clone().apply_transfer(&impersonated, price, &ToyVerifier),
+            Err(TransferReject::ScriptMismatch),
+            "a valid signature under the wrong key must not move Alice's coin",
+        );
+
+        // (3) Alice's key, Mallory's signature: the plain forgery.
+        let root = honest.spend_signing_root();
+        let mut forged = honest.clone();
+        if let PosTransaction::Transfer { inputs, .. } = &mut forged {
+            inputs[0].signature = toy_sign(&mallory, &root);
+        }
+        assert_eq!(
+            g.clone().apply_transfer(&forged, price, &ToyVerifier),
+            Err(TransferReject::BadSignature),
+        );
+
+        // Nothing above moved a satoshi: every reject left the set untouched.
+        let mut probe = g.clone();
+        for bad in [&replayed, &impersonated, &forged] {
+            let _ = probe.apply_transfer(bad, price, &ToyVerifier);
+        }
+        assert_eq!(probe.eutxos, g.eutxos, "a refused transfer must not touch the set");
+    }
+
+    /// **A signed transfer in flight cannot be redirected, re-priced, or
+    /// re-pointed at a different coin.**
+    ///
+    /// The end-to-end statement of what the signing root is for. Anyone who
+    /// handles a transfer between the sender and the block — a peer, a relay,
+    /// the proposer itself — sees the whole transaction and could rewrite any
+    /// field in it. Each rewrite below is one they would want to make, and each
+    /// must invalidate the signature that was already produced.
+    ///
+    /// Sabotage: dropping the outputs from the signing-root preimage makes the
+    /// *recipient* and *amount* cases pass — a proposer could then reroute
+    /// every payment in its own block to itself, with the sender's genuine
+    /// signature still attached.
+    #[test]
+    fn a_signed_transfer_cannot_be_rewritten_in_flight() {
+        let alice = owner_key(0x5B);
+        let bob = script_of(&owner_key(0x5C));
+        let mallory_script = script_of(&owner_key(0x5D));
+        let coin = opening(0x85, 0, 50_000_000, &alice);
+        let (_t, g, _c) = setup_funded(4, &[coin.clone()]);
+        let price = g.next_base_fee();
+        let signed = transfer_spending(std::slice::from_ref(&coin), &alice, bob, 512, 1, price);
+        assert!(g.clone().apply_transfer(&signed, price, &ToyVerifier).is_ok());
+
+        // Each tamper keeps the signature Alice actually produced.
+        let mut tampered: Vec<(&str, PosTransaction)> = Vec::new();
+        let mut edit = signed.clone();
+        if let PosTransaction::Transfer { outputs, .. } = &mut edit {
+            outputs[0].script_hash = mallory_script;
+        }
+        tampered.push(("the payment redirected to another recipient", edit));
+        let mut edit = signed.clone();
+        if let PosTransaction::Transfer { outputs, .. } = &mut edit {
+            outputs[0].value -= 1;
+        }
+        tampered.push(("the amount reduced", edit));
+        let mut edit = signed.clone();
+        if let PosTransaction::Transfer { tip_millisat_per_gas, .. } = &mut edit {
+            *tip_millisat_per_gas += 1;
+        }
+        tampered.push(("the tip raised out of the sender's own coins", edit));
+        let mut edit = signed.clone();
+        if let PosTransaction::Transfer { tx_bytes, .. } = &mut edit {
+            *tx_bytes += 1;
+        }
+        tampered.push(("the declared size inflated", edit));
+
+        for (what, tx) in &tampered {
+            let got = g.clone().apply_transfer(tx, price, &ToyVerifier);
+            assert!(
+                matches!(
+                    got,
+                    Err(TransferReject::BadSignature) | Err(TransferReject::ValueNotConserved)
+                ),
+                "{what} was accepted: {got:?}",
+            );
+        }
+
+        // And the one rewrite that is NOT about the money: a tampered witness.
+        // The transaction still means the same payment, so it is still refused
+        // — by the signature, not by the id, which has not moved.
+        let mut witness = signed.clone();
+        if let PosTransaction::Transfer { inputs, .. } = &mut witness {
+            inputs[0].signature[0] ^= 0xFF;
+        }
+        assert_eq!(witness.txid(), signed.txid(), "a witness edit must not re-key the payment");
+        assert_eq!(
+            g.clone().apply_transfer(&witness, price, &ToyVerifier),
+            Err(TransferReject::BadSignature),
+        );
     }
 
     /// **The year-40 test, at the transition rather than in the arithmetic.**
@@ -2937,7 +4065,10 @@ mod tests {
     /// delegator revenue at exactly zero at the moment fees became everything.
     #[test]
     fn producer_fees_reach_delegators_through_the_commission_split() {
-        let (t, g, mut chains) = setup(4);
+        let spender = owner_key(0x3B);
+        let coins: Vec<_> =
+            (0..2u32).map(|i| opening(0x78, i, 100_000_000, &spender)).collect();
+        let (t, g, mut chains) = setup_funded(4, &coins);
         // A delegation behind validator 0, bonded during epoch 0 so it is
         // warming up (partially activated under the churn budget) by epoch 1 —
         // the epoch whose boundary settles the fee. Requested during E means
@@ -2972,11 +4103,15 @@ mod tests {
 
         // A fee-paying transfer in the operator's block, with a fat tip so the
         // producer's share sits well above the pro-rata truncation floor.
-        let tx = PosTransaction::Transfer {
-            inputs: 2,
-            tx_bytes: 9_216,
-            tip_millisat_per_gas: 4_000,
-        };
+        // Priced at the block's own base fee — `s1`'s child, not genesis's.
+        let tx = transfer_spending(
+            &coins,
+            &spender,
+            script_of(&owner_key(0x3C)),
+            9_216,
+            4_000,
+            s1.next_base_fee(),
+        );
         let b2 = build_block(&t, &s1, slot, &[], std::slice::from_ref(&tx), &mut chains);
         assert_eq!(b2.header.proposer_index, operator);
         let s2 = t.apply_block(&s1, &b2, &[], std::slice::from_ref(&tx)).unwrap();
@@ -3056,7 +4191,7 @@ mod tests {
     fn bad_proposer_signature_rejected() {
         // MarkerVerifier rejects exactly `b"forged"`, so the block dies on the
         // proposer signature and on nothing else.
-        let (t, g, mut chains) = setup_with(4, MarkerVerifier);
+        let (t, g, mut chains) = setup_with(4, MarkerVerifier, &[]);
         let mut b = build_block(&t, &g, 1, &[], &[], &mut chains);
         // Control: the honest signature passes this verifier.
         assert!(t.apply_block(&g, &b, &[], &[]).is_ok());
@@ -3067,39 +4202,242 @@ mod tests {
         );
     }
 
-    /// The `Transfer` encoding is gas-priced, and the change is a **consensus**
-    /// change: `canonical_bytes` is what `body_root` is a Merkle root over, so
-    /// re-shaping the variant re-keys the block id of every block carrying one.
+    /// The `Transfer` encoding carries the transfer, and the change is a
+    /// **consensus** change: `canonical_bytes` is what `body_root` is a Merkle
+    /// root over, so re-shaping the variant re-keys the block id of every block
+    /// carrying one.
     ///
-    /// Pinned two ways: the discriminant and width are fixed (a silent shift
-    /// would re-key transfers against a deployed chain), and no declared-fee
-    /// field survives — the encoding carries the market's *inputs*, and the fee
-    /// is derived from them plus committed state.
+    /// Pinned three ways: the discriminant and the field layout are fixed (a
+    /// silent shift would re-key transfers against a deployed chain); no
+    /// declared-fee field survives, because the fee is what the inputs exceed
+    /// the outputs by; and the encoding is injective over **every** field of
+    /// **every** input and output, which is what makes the body root a
+    /// commitment to the payment rather than to a summary of it.
     #[test]
-    fn transfer_encoding_is_gas_priced_not_declared() {
-        let tx = PosTransaction::Transfer { inputs: 3, tx_bytes: 1_024, tip_millisat_per_gas: 7 };
-        let bytes = tx.canonical_bytes();
-        // 1 discriminant + u32 inputs + u64 bytes + u128 tip.
-        assert_eq!(bytes.len(), 1 + 4 + 8 + 16);
-        assert_eq!(bytes[0], 0x01, "the Transfer discriminant is frozen");
-        assert_eq!(&bytes[1..5], &3u32.to_le_bytes());
-        assert_eq!(&bytes[5..13], &1_024u64.to_le_bytes());
-        assert_eq!(&bytes[13..], &7u128.to_le_bytes());
-
-        // Injectivity over each field: two transfers differing anywhere commit
-        // to different bodies, therefore different block ids.
-        let vary = |inputs, tx_bytes, tip| {
-            crate::derive::body_root(&[PosTransaction::Transfer {
-                inputs,
-                tx_bytes,
-                tip_millisat_per_gas: tip,
-            }
-            .canonical_bytes()])
+    fn transfer_encoding_carries_value_not_only_gas() {
+        let input = |txid: u8, vout: u32| TransferInput {
+            txid: [txid; 32],
+            vout,
+            pubkey: vec![0xA0; 3],
+            signature: vec![0xB0; 2],
         };
-        let base = vary(3, 1_024, 7);
-        assert_ne!(base, vary(4, 1_024, 7));
-        assert_ne!(base, vary(3, 1_025, 7));
-        assert_ne!(base, vary(3, 1_024, 8));
+        let out = |value: u64, sh: u8| TransferOutput { value, script_hash: [sh; 32] };
+        let tx = PosTransaction::Transfer {
+            inputs: vec![input(0x10, 3)],
+            outputs: vec![out(1_000, 0xC0)],
+            tx_bytes: 1_024,
+            tip_millisat_per_gas: 7,
+        };
+        let bytes = tx.canonical_bytes();
+
+        // Layout, field by field: tag, input count, the input (outpoint +
+        // length-prefixed witnesses), output count, the output, size, tip.
+        assert_eq!(bytes[0], 0x01, "the Transfer discriminant is frozen");
+        assert_eq!(&bytes[1..5], &1u32.to_le_bytes(), "input count");
+        assert_eq!(&bytes[5..37], &[0x10u8; 32], "txid");
+        assert_eq!(&bytes[37..41], &3u32.to_le_bytes(), "vout");
+        assert_eq!(&bytes[41..45], &3u32.to_le_bytes(), "pubkey length prefix");
+        assert_eq!(&bytes[45..48], &[0xA0u8; 3], "pubkey");
+        assert_eq!(&bytes[48..52], &2u32.to_le_bytes(), "signature length prefix");
+        assert_eq!(&bytes[52..54], &[0xB0u8; 2], "signature");
+        assert_eq!(&bytes[54..58], &1u32.to_le_bytes(), "output count");
+        assert_eq!(&bytes[58..66], &1_000u64.to_le_bytes(), "output value");
+        assert_eq!(&bytes[66..98], &[0xC0u8; 32], "output script hash");
+        assert_eq!(&bytes[98..106], &1_024u64.to_le_bytes(), "tx_bytes");
+        assert_eq!(&bytes[106..122], &7u128.to_le_bytes(), "tip");
+        assert_eq!(bytes.len(), 122, "no trailing field");
+
+        // Injectivity: mutate one field at a time and the body root must move.
+        // Every field, including the witnesses — the body root commits to what
+        // was gossiped, even though the SIGNING root deliberately does not.
+        let root = |t: &PosTransaction| crate::derive::body_root(&[t.canonical_bytes()]);
+        let base = root(&tx);
+        let mutants = [
+            PosTransaction::Transfer {
+                inputs: vec![input(0x11, 3)],
+                outputs: vec![out(1_000, 0xC0)],
+                tx_bytes: 1_024,
+                tip_millisat_per_gas: 7,
+            },
+            PosTransaction::Transfer {
+                inputs: vec![input(0x10, 4)],
+                outputs: vec![out(1_000, 0xC0)],
+                tx_bytes: 1_024,
+                tip_millisat_per_gas: 7,
+            },
+            PosTransaction::Transfer {
+                inputs: vec![input(0x10, 3), input(0x12, 0)],
+                outputs: vec![out(1_000, 0xC0)],
+                tx_bytes: 1_024,
+                tip_millisat_per_gas: 7,
+            },
+            PosTransaction::Transfer {
+                inputs: vec![TransferInput {
+                    pubkey: vec![0xA1; 3],
+                    ..input(0x10, 3)
+                }],
+                outputs: vec![out(1_000, 0xC0)],
+                tx_bytes: 1_024,
+                tip_millisat_per_gas: 7,
+            },
+            PosTransaction::Transfer {
+                inputs: vec![TransferInput {
+                    signature: vec![0xB1; 2],
+                    ..input(0x10, 3)
+                }],
+                outputs: vec![out(1_000, 0xC0)],
+                tx_bytes: 1_024,
+                tip_millisat_per_gas: 7,
+            },
+            PosTransaction::Transfer {
+                inputs: vec![input(0x10, 3)],
+                outputs: vec![out(1_001, 0xC0)],
+                tx_bytes: 1_024,
+                tip_millisat_per_gas: 7,
+            },
+            PosTransaction::Transfer {
+                inputs: vec![input(0x10, 3)],
+                outputs: vec![out(1_000, 0xC1)],
+                tx_bytes: 1_024,
+                tip_millisat_per_gas: 7,
+            },
+            PosTransaction::Transfer {
+                inputs: vec![input(0x10, 3)],
+                outputs: vec![out(1_000, 0xC0), out(0, 0xC0)],
+                tx_bytes: 1_024,
+                tip_millisat_per_gas: 7,
+            },
+            PosTransaction::Transfer {
+                inputs: vec![input(0x10, 3)],
+                outputs: vec![out(1_000, 0xC0)],
+                tx_bytes: 1_025,
+                tip_millisat_per_gas: 7,
+            },
+            PosTransaction::Transfer {
+                inputs: vec![input(0x10, 3)],
+                outputs: vec![out(1_000, 0xC0)],
+                tx_bytes: 1_024,
+                tip_millisat_per_gas: 8,
+            },
+        ];
+        for (i, m) in mutants.iter().enumerate() {
+            assert_ne!(base, root(m), "mutant {i} shares a body root with the original");
+        }
+
+        // Output ORDER is committed too: outputs are positionally keyed by
+        // vout, so swapping two of them sends the money to different places.
+        let a = PosTransaction::Transfer {
+            inputs: vec![input(0x10, 3)],
+            outputs: vec![out(1, 0xC0), out(2, 0xC1)],
+            tx_bytes: 1_024,
+            tip_millisat_per_gas: 7,
+        };
+        let b = PosTransaction::Transfer {
+            inputs: vec![input(0x10, 3)],
+            outputs: vec![out(2, 0xC1), out(1, 0xC0)],
+            tx_bytes: 1_024,
+            tip_millisat_per_gas: 7,
+        };
+        assert_ne!(root(&a), root(&b), "output order must be committed");
+        assert_ne!(a.txid(), b.txid(), "output order must change the txid");
+    }
+
+    /// The signing root covers everything a spender is agreeing to, and
+    /// **nothing** that a third party can change without invalidating the
+    /// transfer.
+    ///
+    /// The two halves are equally load-bearing. If the root did not move with
+    /// the outputs, a relay could redirect the money and the signature would
+    /// still verify — the entire attack. If it moved with the witnesses, no
+    /// signature could ever be computed, because the value to sign would
+    /// depend on the signature.
+    #[test]
+    fn the_signing_root_covers_the_payment_and_excludes_the_witnesses() {
+        let base = PosTransaction::Transfer {
+            inputs: vec![TransferInput {
+                txid: [0x40; 32],
+                vout: 1,
+                pubkey: vec![0xAA; 4],
+                signature: vec![0xBB; 4],
+            }],
+            outputs: vec![TransferOutput { value: 500, script_hash: [0xCC; 32] }],
+            tx_bytes: 700,
+            tip_millisat_per_gas: 3,
+        };
+        let r0 = base.spend_signing_root();
+
+        // Witness-only edits: same root, same txid — this is what "the id is
+        // not malleable" means, in one assertion.
+        let mut witness_edit = base.clone();
+        if let PosTransaction::Transfer { inputs, .. } = &mut witness_edit {
+            inputs[0].pubkey = vec![0x01; 3745];
+            inputs[0].signature = vec![0x02; 4589];
+        }
+        assert_eq!(witness_edit.spend_signing_root(), r0, "witnesses are outside the root");
+        assert_eq!(witness_edit.txid(), base.txid(), "witnesses must not move the txid");
+        assert_ne!(
+            witness_edit.canonical_bytes(),
+            base.canonical_bytes(),
+            "fixture premise: the two really are different transactions on the wire"
+        );
+
+        // Everything else moves it. Each of these is a way to steal or
+        // repurpose an authorisation if it were left unsigned.
+        let mut moved = vec![r0];
+        let mut check = |label: &str, t: PosTransaction| {
+            let r = t.spend_signing_root();
+            assert_ne!(r, r0, "{label} must be covered by the signing root");
+            moved.push(r);
+        };
+        check("the outpoint txid", {
+            let mut t = base.clone();
+            if let PosTransaction::Transfer { inputs, .. } = &mut t {
+                inputs[0].txid = [0x41; 32];
+            }
+            t
+        });
+        check("the outpoint index", {
+            let mut t = base.clone();
+            if let PosTransaction::Transfer { inputs, .. } = &mut t {
+                inputs[0].vout = 2;
+            }
+            t
+        });
+        check("the output value", {
+            let mut t = base.clone();
+            if let PosTransaction::Transfer { outputs, .. } = &mut t {
+                outputs[0].value = 501;
+            }
+            t
+        });
+        check("the recipient", {
+            let mut t = base.clone();
+            if let PosTransaction::Transfer { outputs, .. } = &mut t {
+                outputs[0].script_hash = [0xCD; 32];
+            }
+            t
+        });
+        check("the declared size", {
+            let mut t = base.clone();
+            if let PosTransaction::Transfer { tx_bytes, .. } = &mut t {
+                *tx_bytes = 701;
+            }
+            t
+        });
+        check("the tip", {
+            let mut t = base.clone();
+            if let PosTransaction::Transfer { tip_millisat_per_gas, .. } = &mut t {
+                *tip_millisat_per_gas = 4;
+            }
+            t
+        });
+        let unique: BTreeSet<[u8; 32]> = moved.iter().copied().collect();
+        assert_eq!(unique.len(), moved.len(), "two distinct transfers share a signing root");
+
+        // The txid is a domain-separated hash OF the signing root, not the
+        // root itself: a value that identifies a transaction must never be a
+        // value a key was asked to sign.
+        assert_ne!(base.txid(), r0);
     }
 
     // ── slashing through the transition (§7.3) ──────────────────────────────
@@ -3264,7 +4602,7 @@ mod tests {
     fn forged_evidence_rejects_the_block_and_slashes_nobody() {
         // MarkerVerifier: every ordinary signature passes, `b"forged"` fails —
         // so the block dies on exactly the evidence signature and nothing else.
-        let (t, g, mut chains) = setup_with(4, MarkerVerifier);
+        let (t, g, mut chains) = setup_with(4, MarkerVerifier, &[]);
 
         let forged = {
             let SlashingEvidence::AttestationOffence { first, mut second } =
@@ -3286,7 +4624,7 @@ mod tests {
         // deterministic, so the two runs are the same chain from the same seed:
         // same slot, same parent state, same proposer draw. Only the body
         // differs, which is the comparison this test is making.
-        let (_, _, mut chains_forged) = setup_with(4, MarkerVerifier);
+        let (_, _, mut chains_forged) = setup_with(4, MarkerVerifier, &[]);
         let env = probe_env(&g, 1, std::slice::from_ref(&forged), &mut chains_forged);
         assert_eq!(
             t.compute_post_state(&g, &env, &[], std::slice::from_ref(&forged)).unwrap_err(),
@@ -3437,9 +4775,15 @@ mod tests {
     /// all been applied, and one equivocator is barred. This is the fixture
     /// the two tests below share — a state where the pre-extension root would
     /// have been blind to most of what follows.
-    fn state_with_live_bookkeeping() -> (Transition<OkVerifier>, CommittedState, Vec<Attestation>)
+    fn state_with_live_bookkeeping() -> (Transition<ToyVerifier>, CommittedState, Vec<Attestation>)
     {
-        let (t, g, mut chains) = setup(8);
+        // Funded, and the transfer below actually spends: the unspent set is
+        // one of the components the root must bind, and a fixture where it sat
+        // empty (or untouched since genesis) would exercise that leaf
+        // vacuously.
+        let spender = owner_key(0x3D);
+        let coin = opening(0x79, 0, 100_000_000, &spender);
+        let (t, g, mut chains) = setup_funded(8, &[coin.clone()]);
         let deposit = PosTransaction::Deposit {
             pubkey: vec![0xAB; 8],
             amount_sat: staking::MIN_DEPOSIT_SAT,
@@ -3453,7 +4797,14 @@ mod tests {
             amount_sat: delegation::MIN_DELEGATION_SAT,
             eligible: true,
         };
-        let fee = PosTransaction::Transfer { inputs: 1, tx_bytes: 512, tip_millisat_per_gas: 5 };
+        let fee = transfer_spending(
+            std::slice::from_ref(&coin),
+            &spender,
+            script_of(&owner_key(0x3E)),
+            512,
+            5,
+            g.next_base_fee(),
+        );
         let slot1 = SLOTS_PER_EPOCH + 1;
         let b1 =
             build_block(&t, &g, slot1, &[], &[deposit.clone(), fee.clone()], &mut chains);
@@ -3651,7 +5002,9 @@ mod tests {
     /// now binds.
     #[test]
     fn convergent_paths_commit_identical_roots_with_bookkeeping_live() {
-        let (t, g, mut chains) = setup(8);
+        let spender = owner_key(0x3F);
+        let coin = opening(0x7A, 0, 100_000_000, &spender);
+        let (t, g, mut chains) = setup_funded(8, &[coin.clone()]);
         let deposit = PosTransaction::Deposit {
             pubkey: vec![0xAB; 8],
             amount_sat: staking::MIN_DEPOSIT_SAT,
@@ -3665,7 +5018,14 @@ mod tests {
             amount_sat: delegation::MIN_DELEGATION_SAT,
             eligible: true,
         };
-        let fee = PosTransaction::Transfer { inputs: 1, tx_bytes: 512, tip_millisat_per_gas: 5 };
+        let fee = transfer_spending(
+            std::slice::from_ref(&coin),
+            &spender,
+            script_of(&owner_key(0x40)),
+            512,
+            5,
+            g.next_base_fee(),
+        );
         let slot1 = SLOTS_PER_EPOCH + 1;
         let b1 =
             build_block(&t, &g, slot1, &[], &[deposit.clone(), fee.clone()], &mut chains);

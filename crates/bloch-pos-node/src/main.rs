@@ -107,10 +107,18 @@ fn print_help() {
                Print one TSV row of a keystore's PUBLIC halves — the only
                thing that leaves the air-gapped ceremony machine. Secret
                material is unreachable from this command.\n\
-           bloch-pos submit-tx --to <host:port> [--inputs n] [--tx-bytes n]\n\
+           bloch-pos submit-tx --to <host:port> --pubkey <hex>\n\
+                               --spend <txid-hex>:<vout> [--spend ...]\n\
+                               --pay <script-hash-hex>:<sat> [--pay ...]\n\
+                               [--signature <hex>] [--tx-bytes n]\n\
                                [--tip millisat-per-gas]\n\
                Send one Transfer to a running node, which gossips it on.\n\
-               No acknowledgement: confirmation is seeing it in a block.\n\
+               --pay order IS the output order (position = vout).\n\
+               WITHOUT --signature it prints the signing root and sends\n\
+               nothing: sign that digest elsewhere, then re-run with the\n\
+               SAME flags plus --signature. This tool never holds a\n\
+               spending key. No acknowledgement: confirmation is seeing\n\
+               it in a block.\n\
            bloch-pos genesis --keys <dir1,dir2,...> --out <file>\n\
                              [--slot-ms <ms>] [--start-in <secs>]\n\
                Build a devnet genesis manifest from the keystores' public\n\
@@ -171,7 +179,8 @@ fn print_help() {
     );
 }
 
-/// `submit-tx --to <host:port> [--inputs n] [--tx-bytes n] [--tip n]`
+/// `submit-tx --to <host:port> --spend <txid-hex>:<vout> --pubkey <hex>
+///  --pay <script-hash-hex>:<sat> [--signature <hex>] [--tx-bytes n] [--tip n]`
 ///
 /// Builds one `Transfer` and hands it to a node, which gossips it onward.
 /// Transfer is the only variant this emits on purpose: `Deposit` and
@@ -179,6 +188,23 @@ fn print_help() {
 /// not need and that would want key material to be meaningful, and evidence
 /// cannot travel this way at all — its canonical encoding is one-way (see
 /// `PosTransaction::from_canonical_bytes`).
+///
+/// # Why the flags changed shape
+///
+/// This used to read `--inputs n --tx-bytes n --tip n`: three numbers that
+/// described a transfer's *cost* and named no coin, no recipient and no
+/// amount, because that was all the variant carried. A transfer now moves
+/// value, so it needs the outpoints it spends, the key that unlocks them, and
+/// the outputs it creates.
+///
+/// # This tool does not hold keys and does not sign
+///
+/// With no `--signature` it prints the transfer's signing root and stops:
+/// that digest is what an external signer — the wallet, an HSM, an air-gapped
+/// machine — takes, and the resulting signature comes back in on
+/// `--signature`. A devnet convenience that generated a keypair here would be
+/// a keypair on an operator's shell history, and this crate has no business
+/// creating spending keys at all.
 fn submit_tx(args: &[String]) {
     let Some(to) = arg_value(args, "--to") else {
         eprintln!("submit-tx: --to <host:port> is required");
@@ -187,11 +213,128 @@ fn submit_tx(args: &[String]) {
     let num = |name: &str, default: u128| -> u128 {
         arg_value(args, name).and_then(|s| s.parse().ok()).unwrap_or(default)
     };
-    let tx = bloch_pos_committee::transition::PosTransaction::Transfer {
-        inputs: num("--inputs", 1) as u32,
-        tx_bytes: num("--tx-bytes", 250) as u64,
+    let bail = |m: String| -> ! {
+        eprintln!("submit-tx: {m}");
+        exit(2)
+    };
+
+    // --spend <txid-hex>:<vout>, repeatable.
+    let mut inputs = Vec::new();
+    let pubkey = match arg_value(args, "--pubkey").as_deref().map(codec::unhex) {
+        Some(Ok(k)) => k,
+        Some(Err(e)) => bail(format!("--pubkey: {e}")),
+        None => bail("--pubkey <hex> is required".into()),
+    };
+    for (i, a) in args.iter().enumerate() {
+        if a != "--spend" {
+            continue;
+        }
+        let Some(spec) = args.get(i + 1) else { bail("--spend needs <txid-hex>:<vout>".into()) };
+        let Some((txid_hex, vout)) = spec.rsplit_once(':') else {
+            bail(format!("--spend {spec}: expected <txid-hex>:<vout>"))
+        };
+        let txid = match codec::unhex(txid_hex) {
+            Ok(b) if b.len() == 32 => {
+                let mut a = [0u8; 32];
+                a.copy_from_slice(&b);
+                a
+            }
+            Ok(b) => bail(format!("--spend: txid is {} bytes, expected 32", b.len())),
+            Err(e) => bail(format!("--spend: {e}")),
+        };
+        let Ok(vout) = vout.parse::<u32>() else { bail(format!("--spend: bad vout {vout}")) };
+        inputs.push(bloch_pos_committee::transition::TransferInput {
+            txid,
+            vout,
+            pubkey: pubkey.clone(),
+            // Filled in below once the signing root is known; a signature can
+            // never cover itself.
+            signature: Vec::new(),
+        });
+    }
+    if inputs.is_empty() {
+        bail("at least one --spend <txid-hex>:<vout> is required".into());
+    }
+
+    // --pay <script-hash-hex>:<sat>, repeatable and ordered: the position IS
+    // the vout, so the order the flags are given in is consensus-visible.
+    let mut outputs = Vec::new();
+    for (i, a) in args.iter().enumerate() {
+        if a != "--pay" {
+            continue;
+        }
+        let Some(spec) = args.get(i + 1) else { bail("--pay needs <script-hash-hex>:<sat>".into()) };
+        let Some((sh_hex, value)) = spec.rsplit_once(':') else {
+            bail(format!("--pay {spec}: expected <script-hash-hex>:<sat>"))
+        };
+        let script_hash = match codec::unhex(sh_hex) {
+            Ok(b) if b.len() == 32 => {
+                let mut a = [0u8; 32];
+                a.copy_from_slice(&b);
+                a
+            }
+            Ok(b) => bail(format!("--pay: script hash is {} bytes, expected 32", b.len())),
+            Err(e) => bail(format!("--pay: {e}")),
+        };
+        let Ok(value) = value.parse::<u64>() else { bail(format!("--pay: bad value {value}")) };
+        outputs.push(bloch_pos_committee::transition::TransferOutput { value, script_hash });
+    }
+
+    // `tx_bytes` is INSIDE the signing root, so it has to be fixed before the
+    // root is printed and must not move afterwards — raising it to fit the
+    // encoding after signing would silently invalidate the signature that was
+    // produced over the smaller value. The default assumes one hybrid
+    // signature per input (`HYBRID_SIG_BYTES`) plus a generous envelope; an
+    // exact figure is what `--tx-bytes` is for.
+    let n_inputs = inputs.len() as u64;
+    let default_bytes = 1_024 + n_inputs * (bloch_pos_committee::fee_market::HYBRID_SIG_BYTES
+        + pubkey.len() as u64
+        + 64);
+    let mut tx = bloch_pos_committee::transition::PosTransaction::Transfer {
+        inputs,
+        outputs,
+        tx_bytes: num("--tx-bytes", default_bytes as u128) as u64,
         tip_millisat_per_gas: num("--tip", 1_000),
     };
+
+    let Some(sig_hex) = arg_value(args, "--signature") else {
+        // No signature: print what has to be signed and stop. The root does
+        // not depend on the signatures — which is exactly why it can be shown
+        // before they exist — but it DOES depend on every other field, so the
+        // same flags must be repeated verbatim on the signed run.
+        println!("{}", codec::hex(&tx.spend_signing_root()));
+        eprintln!(
+            "submit-tx: no --signature given; the line above is the signing root.\n\
+             Sign it with the key whose SHA3-256 the spent outputs commit to, then\n\
+             re-run with the SAME flags plus --signature <hex>. Changing any flag\n\
+             (including --tx-bytes and --tip) changes the root and voids the\n\
+             signature. Nothing was sent."
+        );
+        exit(0);
+    };
+    let signature = match codec::unhex(&sig_hex) {
+        Ok(s) => s,
+        Err(e) => bail(format!("--signature: {e}")),
+    };
+    if let bloch_pos_committee::transition::PosTransaction::Transfer { inputs, .. } = &mut tx {
+        for i in inputs.iter_mut() {
+            i.signature = signature.clone();
+        }
+    }
+    // Consensus refuses a declared size below the encoding
+    // (`TransferReject::UnderdeclaredSize`). Report it instead of "fixing" it:
+    // the fix is to re-sign at a larger --tx-bytes, and only the key holder
+    // can do that.
+    let encoded = tx.canonical_bytes().len() as u64;
+    if let bloch_pos_committee::transition::PosTransaction::Transfer { tx_bytes, .. } = &tx {
+        if *tx_bytes < encoded {
+            bail(format!(
+                "--tx-bytes {tx_bytes} is below this transaction's {encoded}-byte encoding; \
+                 a node would refuse it. Re-run the unsigned step with \
+                 --tx-bytes {encoded} (or more) and sign that root instead."
+            ));
+        }
+    }
     let bytes = tx.canonical_bytes();
     match bloch_pos_node_net_send(&to, &bytes) {
         Ok(()) => println!(
