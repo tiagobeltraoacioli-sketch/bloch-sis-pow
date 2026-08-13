@@ -1,17 +1,31 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Devnet networking: a TCP full mesh with length-prefixed frames.
+//! Transport selection, and the devnet TCP mesh.
 //!
-//! **This is not the production network layer.** The integration plan (§4)
-//! calls for the Genesis-3 libp2p/gossipsub stack copied-and-adapted with the
-//! 2026-08-07 mesh fixes and a new protocol prefix; that work is not done.
-//! What a devnet needs from the network is only: every node eventually sees
-//! every block and attestation, and a restarted node can ask a peer for the
-//! blocks it missed. A full mesh over localhost delivers exactly that with no
-//! relay logic (everyone sends to everyone, so nothing needs re-gossiping)
-//! and no peer scoring. The `gossip.rs` admission-control layer of the pure
-//! crate (AttestationPool, GossipDecision) is likewise NOT wired here — the
-//! engine does its own dedup + validity check on admission.
+//! Two transports live behind [`Net`]:
+//!
+//! - [`p2p`](crate::p2p) — **the production layer**: libp2p, gossipsub with
+//!   the 2026-08-07 mesh fixes, a Genesis-4-only protocol prefix, directed
+//!   paginated sync, and `gossip.rs` wired as admission control.
+//! - the devnet full mesh below — kept, unchanged, because a 64-validator
+//!   devnet across five hosts finalized on it and that result must stay
+//!   reproducible. Selected with `--transport devnet`, which is still the
+//!   default; `--transport libp2p` opts into the production stack.
+//!
+//! The engine talks to both through the same two calls — [`Net::broadcast`]
+//! with a typed frame, and [`Net::report`] with a verdict — so nothing in the
+//! consensus loop knows which transport it is running on.
+//!
+//! ## The devnet mesh, and what it is not
+//!
+//! **This is not the production network layer.** What a devnet needs from the
+//! network is only: every node eventually sees every block and attestation,
+//! and a restarted node can ask a peer for the blocks it missed. A full mesh
+//! over localhost delivers exactly that with no relay logic (everyone sends to
+//! everyone, so nothing needs re-gossiping) and no peer scoring. It has no
+//! authentication, no admission control, and it does not carry an [`Origin`],
+//! so `gossip.rs`'s verdicts have nowhere to go on this path — the engine
+//! still runs the pool, but a `Reject` costs the sender nothing here.
 //!
 //! Wire: `u32 LE frame length ‖ type byte ‖ payload`.
 //! Types: 0x01 block envelope, 0x02 attestation, 0x03 get-blocks{after_slot}.
@@ -41,18 +55,57 @@ pub const FRAME_GET_BLOCKS: u8 = 0x03;
 /// object and no second encoding exists to disagree with the first.
 pub const FRAME_TX: u8 = 0x04;
 
-/// What the engine receives from the mesh.
+pub use crate::p2p::{Origin, Verdict};
+
+/// What the engine receives from a transport.
 pub enum NetEvent {
     Block(BlockEnvelope),
-    Attestation(Attestation),
+    /// An attestation and where it came from. The [`Origin`] is what lets the
+    /// engine's `gossip.rs` decision reach gossipsub's
+    /// `report_message_validation_result`; on the devnet mesh it is
+    /// [`Origin::none`] and reporting is a no-op.
+    Attestation(Attestation, Origin),
     Transaction(bloch_pos_committee::transition::PosTransaction),
 }
 
-pub struct Net {
-    peers: Vec<Sender<Vec<u8>>>,
+/// The transport the engine holds. One of two, chosen at startup.
+pub enum Net {
+    Devnet(DevnetMesh),
+    Libp2p(crate::p2p::Handle),
 }
 
 impl Net {
+    /// Publish one frame (a `FRAME_*` type byte followed by its payload, no
+    /// length prefix). The devnet mesh sends it to every peer; libp2p routes
+    /// it by that type byte onto the matching gossip topic, or onto the
+    /// directed sync path for `FRAME_GET_BLOCKS`.
+    pub fn broadcast(&self, frame: Vec<u8>) {
+        match self {
+            Net::Devnet(m) => m.broadcast(frame),
+            Net::Libp2p(h) => h.broadcast(frame),
+        }
+    }
+
+    /// Hand a gossip message's verdict back to the transport.
+    ///
+    /// This is the other half of wiring `gossip.rs`: with gossipsub in
+    /// `validate_messages()` mode nothing is relayed until this is called, so
+    /// an attestation the pool has not judged is one this node does not
+    /// forward. The devnet mesh has no such notion and drops it.
+    pub fn report(&self, origin: &Origin, verdict: Verdict) {
+        match self {
+            Net::Devnet(_) => {}
+            Net::Libp2p(h) => h.report(origin, verdict),
+        }
+    }
+}
+
+/// The devnet TCP full mesh: one queue per peer.
+pub struct DevnetMesh {
+    peers: Vec<Sender<Vec<u8>>>,
+}
+
+impl DevnetMesh {
     /// Broadcast one frame (type byte + payload, no length prefix) to every
     /// peer. Slow/dead peers just accumulate a queue until reconnect.
     pub fn broadcast(&self, frame: Vec<u8>) {
@@ -124,7 +177,7 @@ fn decode_event(frame: &[u8]) -> Option<NetEvent> {
             let mut r = crate::codec::Reader::new(&frame[1..]);
             let att = crate::codec::decode_attestation(&mut r).ok()?;
             r.finish().ok()?;
-            Some(NetEvent::Attestation(att))
+            Some(NetEvent::Attestation(att, Origin::none()))
         }
         &FRAME_TX => {
             // Decoding here, at the edge, is deliberate: a frame that does not
@@ -144,7 +197,12 @@ fn serve_get_blocks(sock: &mut TcpStream, data_dir: &PathBuf, frame: &[u8]) {
         return;
     }
     let after = u64::from_le_bytes(frame[1..9].try_into().unwrap());
-    match crate::store::Store::blocks_after(data_dir, after) {
+    // Uncapped on this transport, deliberately: the devnet mesh has no
+    // pagination, so a restarting node's single request must be answered in
+    // full or it never catches up. That is one of the reasons this transport
+    // is not the production one — the production path pages
+    // (`p2p::MAX_SYNC_BLOCKS`) so no single answer can become a history dump.
+    match crate::store::Store::blocks_after(data_dir, after, usize::MAX) {
         Ok(blocks) => {
             for b in blocks {
                 let mut f = Vec::with_capacity(1 + b.len());
@@ -177,7 +235,7 @@ pub fn start(
     events: Sender<NetEvent>,
     data_dir: PathBuf,
     head_slot: Arc<AtomicU64>,
-) -> std::io::Result<Net> {
+) -> std::io::Result<DevnetMesh> {
     // Inbound: accept, then per-connection: read frames; data frames go to
     // the engine, get-blocks is answered in place from the log.
     let listener = TcpListener::bind((bind_addr, listen_port))?;
@@ -260,5 +318,5 @@ pub fn start(
         });
     }
 
-    Ok(Net { peers })
+    Ok(DevnetMesh { peers })
 }

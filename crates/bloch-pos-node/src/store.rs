@@ -146,21 +146,124 @@ impl Store {
         Ok(())
     }
 
-    /// Blocks with slot strictly greater than `after_slot` — the sync
-    /// response. Reads the log file fresh so a reader thread never touches
-    /// the append handle.
-    pub fn blocks_after(dir: &Path, after_slot: u64) -> io::Result<Vec<Vec<u8>>> {
-        let store = Store {
-            dir: dir.to_path_buf(),
-            // The handle is unused by read_all; open the log lazily instead.
-            log: File::open(dir.join("blocks.log"))?,
-        };
+    /// Encoded blocks with slot strictly greater than `after_slot`, in chain
+    /// order, at most `limit` of them — the answer to a `get-blocks`.
+    ///
+    /// Written as a **streaming scan**, not `read_all().filter()`, because the
+    /// caller that matters is a node syncing from genesis. Such a node asks
+    /// for slot 0, gets one capped page, asks for the next, and repeats until
+    /// it reaches the tip; the naive version decoded and re-encoded the entire
+    /// chain on every one of those requests, which turns serving a cold peer
+    /// into O(chain²) work and makes the from-genesis path technically
+    /// available but practically unusable. Here each frame costs a 4-byte
+    /// length read plus a fixed-size header parse until the window is found,
+    /// the bytes are copied verbatim (no decode/re-encode round trip — so what
+    /// the peer receives is byte-identical to what was logged), and the scan
+    /// stops as soon as `limit` blocks are in hand.
+    ///
+    /// Reads the log file fresh so a reader thread never touches the append
+    /// handle.
+    pub fn blocks_after(dir: &Path, after_slot: u64, limit: usize) -> io::Result<Vec<Vec<u8>>> {
+        let mut f = io::BufReader::new(File::open(dir.join("blocks.log"))?);
         let mut out = Vec::new();
-        for env in store.read_all()? {
-            if env.header.slot > after_slot {
-                out.push(crate::codec::encode_envelope(&env));
+        let mut len4 = [0u8; 4];
+        loop {
+            if out.len() >= limit {
+                break;
+            }
+            match f.read_exact(&mut len4) {
+                Ok(()) => {}
+                // A clean EOF is the end of the log; a partial one is the
+                // truncated trailing frame `read_all` also tolerates.
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e),
+            }
+            let len = u32::from_le_bytes(len4) as usize;
+            if len > crate::codec::MAX_FIELD_LEN {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "log frame over cap"));
+            }
+            let mut payload = vec![0u8; len];
+            match f.read_exact(&mut payload) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e),
+            }
+            // Only the header is parsed while skipping: the slot is all the
+            // filter needs, and the signatures/attestations behind it are the
+            // expensive part.
+            let hdr_len = bloch_pos_committee::header::BlockHeaderV4::ENCODED_LEN;
+            if payload.len() < hdr_len {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "log frame shorter than a header"));
+            }
+            let header = bloch_pos_committee::header::BlockHeaderV4::canonical_deserialize(
+                &payload[..hdr_len],
+            )
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "undecodable header in block log"))?;
+            if header.slot > after_slot {
+                out.push(payload);
             }
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The from-genesis path, at the store level: `after_slot = 0` must return
+    /// the chain from its beginning, and the cap must be a cap.
+    #[test]
+    fn blocks_after_serves_from_genesis_and_respects_the_cap() {
+        let dir = std::env::temp_dir().join(format!("bloch-pos-store-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, &[7u8; 32]).expect("open");
+
+        // Five blocks at slots 1..=5. Bodies are empty; only framing and the
+        // header slot are under test here.
+        let mut ids = Vec::new();
+        for slot in 1..=5u64 {
+            let env = sample_envelope(slot);
+            ids.push(crate::codec::encode_envelope(&env));
+            store.append(&env).expect("append");
+        }
+
+        let from_genesis = Store::blocks_after(&dir, 0, 100).expect("scan");
+        assert_eq!(from_genesis.len(), 5, "a cold peer asking from slot 0 gets the whole chain");
+        assert_eq!(from_genesis, ids, "served bytes are the logged bytes, verbatim");
+
+        let capped = Store::blocks_after(&dir, 0, 2).expect("scan");
+        assert_eq!(capped.len(), 2, "the cap bounds one answer");
+        assert_eq!(capped, ids[..2], "and it is the FIRST two, so paging makes progress");
+
+        let tail = Store::blocks_after(&dir, 3, 100).expect("scan");
+        assert_eq!(tail.len(), 2, "slot > after_slot, strictly");
+
+        let past_tip = Store::blocks_after(&dir, 99, 100).expect("scan");
+        assert!(past_tip.is_empty(), "a peer at the tip is told there is nothing more");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn sample_envelope(slot: u64) -> BlockEnvelope {
+        use bloch_pos_committee::header::{BlockHeaderV4, Body, VERSION_G4};
+        BlockEnvelope {
+            header: BlockHeaderV4 {
+                version: VERSION_G4,
+                parent: [1; 32],
+                state_root: [2; 32],
+                body_root: [3; 32],
+                slot,
+                proposer_index: 0,
+                randao_reveal: [4; 32],
+                randao_mix: [5; 32],
+                justified_root: [6; 32],
+                finalized_root: [7; 32],
+                attestation_root: [8; 32],
+                coherence_root: [9; 32],
+            },
+            proposer_sig: vec![0xAA; 32],
+            body: Body { transactions: Vec::new(), attestations: Vec::new() },
+        }
     }
 }

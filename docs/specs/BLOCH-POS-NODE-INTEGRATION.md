@@ -312,6 +312,69 @@ plan-level facts:
   in `meta`, fetch state at the checkpoint, then blocks forward. Fresh-fleet
   launch nodes sync from block 0 normally.
 
+### 4.1 Status (2026-08-13): the libp2p layer exists
+
+`crates/bloch-pos-node/src/p2p.rs`, selected with `--transport libp2p`. The
+devnet TCP mesh (`net.rs`) stays as the default so the 64-validator devnet
+result remains reproducible by running the same command. What landed:
+Genesis-4-only protocol ids (`/bloch-g4/meshsub/1.1.0`, `/bloch-g4/sync/1`,
+identify `/bloch-g4/1.0.0`, topics `bloch-g4/*`), both 2026-08-07 mesh fixes
+with a test that fails if P3/P3b are re-inherited, the yamux/request-response
+stream-cap alignment, `gossip.rs` wired as attestation admission control via
+`validate_messages()` + `report_message_validation_result`, and a directed,
+paginated `get-blocks`.
+
+Not done, and named where it lives: the **transport handshake is Noise, not
+the Genesis-3 Kyber768 upgrade** (consensus signatures are hybrid PQ either
+way; what is exposed is transport confidentiality against harvest-now-decrypt-
+later). No peer persistence, no PEX, no DNS seeds, no mDNS. Blocks and
+transactions are relayed on decodability rather than on full validity.
+
+### 4.2 Cold start: what an independent operator can verify, and what they must trust
+
+This section exists because an exchange evaluating a listing asked the
+question directly, and because the honest answer differs between the two
+chains. It is the answer to give, unedited.
+
+**Genesis-3: not possible, permanently.** `docs/CARRYOVER.md` states that
+syncing from genesis is unsupported and that a new node is bootstrapped from a
+producer-supplied datadir. Block bodies for red blocks prior to the retention
+fix `4c0ba0c` are gone from the whole network, so a from-scratch sync cannot be
+made to work later either. A node bootstrapped from a donated datadir has
+verified nothing, and its confirmation counts carry no security meaning. That
+is a correct reading and it is not fixable.
+
+**Genesis-4: possible by construction, with one named trust input.** A node
+starts with the genesis manifest and an empty data dir, requests blocks from
+peers over `/bloch-g4/sync/1` (paginated, from slot 0), and validates every
+block through the same `Transition::apply_block` the producer ran — signatures,
+state root, body root, attestation quorum. There is no datadir-donation path
+and no "recent blocks only" fast path. `tests/cold_start.rs` runs three real
+processes, starts the third one late with only its keystore on disk, and
+asserts it reaches the same block ids and the same post-state roots as a node
+that was there from the start, plus a byte-identical block log.
+
+The trust input is the long-range problem every proof-of-stake chain has: a
+validator set that has already withdrawn its stake can sign an alternative
+history at no cost, so "internally valid" is not the same as "the real chain".
+Weak subjectivity (`BLOCH-WEAK-SUBJECTIVITY.md`, enforced by `ws_boot`) is the
+answer, and it has exactly two regimes:
+
+| Chain age | What a fresh node needs | What it must trust |
+|---|---|---|
+| < `WS_PERIOD_EPOCHS` (2016 epochs ≈ **22.4 days** at 30 s slots) | the genesis manifest, nothing else | nothing — the genesis block is its own anchor |
+| ≥ `WS_PERIOD_EPOCHS` | a signed checkpoint (`--ws-checkpoint` + `--ws-signer-set`) | the checkpoint signers, for **one fact**: which finalized root is real at one epoch |
+
+A node past the window that is given no checkpoint **refuses to sync** and says
+so; it does not follow a peer quietly. In the second regime the checkpoint is
+32 bytes an operator can compare across independent publication channels — it
+is not state. Every block after the anchor is still downloaded and revalidated
+locally, and a checkpoint that contradicts finality this node reached on its
+own is raised as `WS_CONFLICT` and cannot reorganize it (`enforce_ws_anchor`).
+
+The distance between that and "copy the producer's database" is the entire
+answer to the exchange's objection.
+
 ---
 
 ## 5. What the node does NOT contain (scope fences)
