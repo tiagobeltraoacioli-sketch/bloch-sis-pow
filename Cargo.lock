@@ -1557,9 +1557,13 @@ dependencies = [
 name = "bloch-pos-node"
 version = "0.0.2-devnet"
 dependencies = [
+ "async-trait",
  "bloch-crypto",
  "bloch-pos-committee",
+ "futures",
+ "libp2p",
  "sha3 0.10.9",
+ "tokio",
 ]
 
 [[package]]

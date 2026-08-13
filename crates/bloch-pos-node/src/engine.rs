@@ -74,34 +74,58 @@ use bloch_pos_committee::interfaces::{ProposalEnvelope, StateReader, StateTransi
 use bloch_pos_committee::schedule::first_slot_of_epoch;
 use bloch_pos_committee::transition::{CommittedState, PosTransaction, Transition};
 use bloch_pos_committee::forkchoice::{BlockTree, LatestMessage, Store as FcStore};
+use bloch_pos_committee::gossip::{AttestationPool, GossipDecision};
 use bloch_pos_committee::{committees, derive, epoch_of, schedule};
 
 use crate::genesis::{Manifest, GENESIS_MIX};
 use crate::keys::{HybridVerifier, Keystore, ProbeVerifier};
-use crate::net::{self, NetEvent};
+use crate::net::{self, NetEvent, Origin, Verdict};
 use crate::rpc::{self, Admitted, Finality, Json, RpcCall, RpcError, RpcRequest, RpcResult};
 use crate::store::Store;
 
 /// Everything that reaches the consensus thread from outside it.
 ///
-/// One channel, two sources. The RPC arm is what lets a query be answered from
-/// *inside* the thread that owns the state, rather than from a copy kept
-/// alongside it — see [`crate::rpc::EngineBackend`] for why a shared snapshot
-/// was refused.
+/// One channel, three sources now: the two transports both feed `Net`, and the
+/// RPC feeds `Rpc`. Answering a query from *inside* the thread that owns the
+/// state — rather than from a copy kept alongside it — is why this wrapper
+/// exists; see [`crate::rpc::EngineBackend`].
 pub enum EngineEvent {
     Net(NetEvent),
     Rpc(RpcCall),
 }
 
+/// Which transport the node runs.
+///
+/// `Devnet` is still the default: a 64-validator devnet across five hosts
+/// finalized on it and that result must stay reproducible by running the same
+/// command. `Libp2p` is the production stack (see [`crate::p2p`]) and is what
+/// anything reachable from outside a firewall must use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Transport {
+    Devnet,
+    Libp2p,
+}
+
 pub struct Config {
     pub data_dir: PathBuf,
     pub genesis_path: PathBuf,
+    pub transport: Transport,
+    /// Devnet transport: the TCP port the full mesh listens on.
     pub listen: u16,
-    /// Address the mesh listener binds. `127.0.0.1` unless `--listen-addr`
-    /// says otherwise — see the warning on [`crate::net::start`] before
-    /// binding anything routable.
+    /// Devnet transport: the address the mesh listener binds. `127.0.0.1`
+    /// unless `--listen-addr` says otherwise — see the warning on
+    /// [`crate::net::start`] before binding anything routable.
     pub listen_addr: String,
+    /// Devnet transport: `host:port` peers.
     pub peers: Vec<String>,
+    /// libp2p transport: multiaddrs to listen on.
+    pub p2p_listen: Vec<String>,
+    /// libp2p transport: multiaddrs to dial (`/ip4/…/tcp/…/p2p/<peer-id>`).
+    pub p2p_peers: Vec<String>,
+    /// libp2p transport: connection ceiling.
+    pub max_peers: usize,
+    /// libp2p transport: zero the IP-colocation score penalty.
+    pub behind_proxy: bool,
     pub stop_at_slot: Option<u64>,
     pub ws: crate::ws_boot::WsConfig,
     /// The Genesis-3 balance snapshot, when the manifest commits to one. It is
@@ -165,8 +189,25 @@ struct Engine {
     chain: Vec<(u64, BlockId)>,
     /// Canonical ids (incl. genesis).
     canonical: BTreeSet<[u8; 32]>,
-    /// Attestation pool, keyed by content so duplicates collapse.
+    /// Attestations available to fork choice and to the next proposal, keyed
+    /// by content so duplicates collapse. This is the *aggregation* store.
     pool: BTreeMap<(u32, [u8; 32]), Attestation>,
+    /// The *admission* gate in front of `pool`:
+    /// [`AttestationPool`](bloch_pos_committee::gossip::AttestationPool) from
+    /// the pure crate — dedup, the equivocation cap, slashing-pair capture,
+    /// and the pending queue for attestations whose block has not landed yet.
+    ///
+    /// The two are different objects on purpose. `att_pool` decides *whether a
+    /// message may be believed and relayed* and answers in the three verbs
+    /// gossipsub understands; `pool` holds the attestations that survived, in
+    /// the shape fork choice and block production want. Before this was wired
+    /// the node did its own ad-hoc dedup-and-verify inline, and the whole
+    /// Hold verb — the one that keeps an attestation racing ahead of its block
+    /// from being scored as an offence — did not exist here at all.
+    att_pool: AttestationPool,
+    /// Wall-clock slot, refreshed by the slot loop. `att_pool` never reads a
+    /// clock (that is its determinism rule), so the node supplies one.
+    wall_slot: u64,
     /// Transactions waiting for a block, keyed by canonical bytes so a
     /// duplicate gossip collapses instead of being included twice.
     ///
@@ -506,6 +547,10 @@ impl Engine {
         }
         self.blocks.insert(id, env);
         self.advance();
+        // The block is queryable now, so attestations parked on it can be
+        // re-run. `advance()` first: an attestation released here votes on
+        // fork choice, and it should see the chain the block already moved.
+        self.release_held(id);
     }
 
 
@@ -824,33 +869,125 @@ impl Engine {
         true
     }
 
-    // ── Attestation admission ───────────────────────────────────────────────
+    // ── Attestation admission, through the pure crate's gossip policy ───────
 
-    fn on_attestation(&mut self, att: Attestation, wall_epoch: u64) {
-        let key = (att.validator, att.data.signing_root());
-        if self.pool.contains_key(&key) {
-            return;
-        }
+    /// Run one arriving attestation through
+    /// [`AttestationPool`](bloch_pos_committee::gossip::AttestationPool) and
+    /// report the resulting verdict to the transport.
+    ///
+    /// The mapping is the one `gossip.rs` states, and the type split is what
+    /// enforces it: `Accept` relays and feeds consensus, `Ignore` and `Hold`
+    /// drop in silence, and **only `Reject` may reach a peer penalty**. That
+    /// distinction is not a nicety — the 2026-08-07 mesh collapsed twice from
+    /// scoring honest peers, and the commonest honest event on this network
+    /// (an attestation arriving milliseconds before the block it votes for) is
+    /// precisely the one a naive implementation calls invalid.
+    fn on_attestation(&mut self, att: Attestation, origin: Origin, wall_epoch: u64) {
         let e = epoch_of(att.data.slot);
+        // Narrower than `gossip.rs`'s own two-epoch window, and for a reason
+        // that belongs to the node, not the policy: committee membership must
+        // come from committed state, and this node can only roll its canonical
+        // state *forward* (`rolled_to`). It therefore cannot derive the
+        // committee of an epoch already behind its head, so an attestation
+        // from one is unjudgeable rather than invalid — Ignore, never Reject.
+        // Reconstructing past-epoch committees (the pool would then accept the
+        // full 64-slot window) needs per-epoch seed/roster history, which is
+        // storage work, not policy work.
         if e != wall_epoch && e != wall_epoch + 1 {
-            return; // stale or far-future: never includable from here
-        }
-        if att.data.source_epoch >= att.data.target_epoch || att.data.target_epoch != e {
+            self.net.report(&origin, Verdict::Ignore);
             return;
         }
-        let rolled = self.rolled_to(e);
+        // `att_pool` is moved out for the call so the lookups below can borrow
+        // the chain immutably; it is put back before returning.
+        let mut pool = std::mem::take(&mut self.att_pool);
+        let decision = self.judge(&mut pool, att.clone(), e);
+        self.att_pool = pool;
+        self.apply_decision(att, decision, &origin);
+    }
+
+    /// One pass of the pure pipeline: window → checkpoint sanity → dedup and
+    /// equivocation cap → committee membership → blocks known → signature.
+    fn judge(&self, pool: &mut AttestationPool, att: Attestation, epoch: u64) -> GossipDecision {
+        let rolled = self.rolled_to(epoch);
         let roster = rolled.active_validators();
-        let seed = Self::seed_for(&rolled, e);
-        let committee = committees::committee_for_slot(&seed, att.data.slot, &roster);
-        if committee.binary_search(&att.validator).is_err() {
+        let seed = Self::seed_for(&rolled, epoch);
+        let committees_at = |slot: u64| committees::committee_for_slot(&seed, slot, &roster);
+        // "Do we have this block?" — canonical ids include genesis, which is
+        // synthesized and never stored as an envelope; `blocks` holds every
+        // structurally-valid block seen, canonical or not. A vote for a block
+        // on a losing branch is still a vote we can verify.
+        let known = |root: &[u8; 32]| self.canonical.contains(root) || self.blocks.contains_key(root);
+        pool.process(att, self.wall_slot, &committees_at, &known, &self.verifier)
+    }
+
+    fn apply_decision(&mut self, att: Attestation, decision: GossipDecision, origin: &Origin) {
+        match decision {
+            GossipDecision::Accept { slashing_candidate } => {
+                if let Some(ev) = slashing_candidate {
+                    // Captured, not processed. The slashing pipeline
+                    // (`SlashingState::process`, evidence transactions) is not
+                    // wired in this binary — saying so here beats a silent
+                    // drop that looks like nothing happened.
+                    eprintln!(
+                        "EQUIVOCATION captured: validator {} signed two attestations for slot {} \
+                         (slashing pipeline NOT wired — evidence is logged, not prosecuted)",
+                        ev.second.validator, ev.second.data.slot,
+                    );
+                }
+                self.pool.insert((att.validator, att.data.signing_root()), att);
+                self.net.report(origin, Verdict::Accept);
+            }
+            GossipDecision::Ignore(_) => self.net.report(origin, Verdict::Ignore),
+            GossipDecision::Hold { .. } => {
+                // Parked. NOT relayed: this node does not forward what it
+                // cannot yet validate. It is replayed by `release_held` when
+                // the block lands, and relayed then.
+                self.net.report(origin, Verdict::Ignore);
+            }
+            GossipDecision::Reject(reason) => {
+                eprintln!(
+                    "attestation from v{} REJECTED: {reason:?}",
+                    att.validator
+                );
+                self.net.report(origin, Verdict::Reject);
+            }
+        }
+    }
+
+    /// A block landed: replay every attestation that was waiting on it.
+    ///
+    /// Called after the block is queryable, which is what
+    /// [`AttestationPool::on_block`] requires — earlier and the waiters would
+    /// simply be re-held. Released Accepts are relayed here, since they were
+    /// deliberately not relayed while parked.
+    fn release_held(&mut self, root: [u8; 32]) {
+        if self.att_pool.pending_len() == 0 {
             return;
         }
-        use bloch_pos_committee::attestation::SignatureVerifier as _;
-        if !self.verifier.verify(att.validator, &att.data.signing_root(), &att.signature) {
-            eprintln!("attestation from v{} failed hybrid verify", att.validator);
-            return;
+        let mut pool = std::mem::take(&mut self.att_pool);
+        let released = {
+            let rolled_epoch = epoch_of(self.wall_slot);
+            let rolled = self.rolled_to(rolled_epoch);
+            let roster = rolled.active_validators();
+            let seed = Self::seed_for(&rolled, rolled_epoch);
+            let committees_at = |slot: u64| committees::committee_for_slot(&seed, slot, &roster);
+            let known =
+                |r: &[u8; 32]| self.canonical.contains(r) || self.blocks.contains_key(r);
+            pool.on_block(&root, self.wall_slot, &committees_at, &known, &self.verifier)
+        };
+        self.att_pool = pool;
+        for (att, decision) in released {
+            if let GossipDecision::Accept { .. } = decision {
+                let frame = net::att_frame(&att);
+                self.pool.insert((att.validator, att.data.signing_root()), att);
+                if self.live {
+                    // Relay now: it was held, so nobody downstream got it from
+                    // us. A duplicate publish is refused locally and costs
+                    // nothing.
+                    self.net.broadcast(frame);
+                }
+            }
         }
-        self.pool.insert(key, att);
     }
 
     // ── RPC service ─────────────────────────────────────────────────────────
@@ -1145,14 +1282,63 @@ pub fn run(cfg: Config) -> io::Result<()> {
     let logged = store.read_all()?;
     let head_slot = Arc::new(AtomicU64::new(0));
     let (tx, rx) = mpsc::channel::<EngineEvent>();
-    let net = net::start(
-        &cfg.listen_addr,
-        cfg.listen,
-        cfg.peers.clone(),
-        tx.clone(),
-        cfg.data_dir.clone(),
-        head_slot.clone(),
-    )?;
+    // The transports speak NetEvent and know nothing about the RPC; the engine
+    // consumes one channel. Rather than teach both transports the engine's
+    // event type — coupling the network layer to a queue it has no business
+    // knowing about — a forwarder wraps their events on the way in. One thread
+    // and one hop, and each side keeps the shape it was designed with.
+    let (net_tx, net_rx) = mpsc::channel::<NetEvent>();
+    {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            for ev in net_rx {
+                if tx.send(EngineEvent::Net(ev)).is_err() {
+                    return; // engine gone; nothing left to deliver to
+                }
+            }
+        });
+    }
+    let net = match cfg.transport {
+        Transport::Devnet => net::Net::Devnet(net::start(
+            &cfg.listen_addr,
+            cfg.listen,
+            cfg.peers.clone(),
+            tx.clone(),
+            cfg.data_dir.clone(),
+            head_slot.clone(),
+        )?),
+        Transport::Libp2p => {
+            let parse = |s: &str, what: &str| -> io::Result<crate::p2p::Multiaddr> {
+                s.parse().map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("{what} `{s}` is not a multiaddr: {e}"),
+                    )
+                })
+            };
+            let mut listen = Vec::new();
+            for a in &cfg.p2p_listen {
+                listen.push(parse(a, "--p2p-listen")?);
+            }
+            let mut peers = Vec::new();
+            for a in &cfg.p2p_peers {
+                peers.push(parse(a, "--p2p-peer")?);
+            }
+            let handle = crate::p2p::start(
+                crate::p2p::Config {
+                    listen,
+                    peers,
+                    data_dir: cfg.data_dir.clone(),
+                    max_peers: cfg.max_peers,
+                    behind_proxy: cfg.behind_proxy,
+                },
+                net_tx,
+                head_slot.clone(),
+            )?;
+            println!("p2p: node identity {}", handle.peer_id);
+            net::Net::Libp2p(handle)
+        }
+    };
 
     let mut engine = Engine {
         state: genesis_state,
@@ -1164,6 +1350,8 @@ pub fn run(cfg: Config) -> io::Result<()> {
         chain: vec![(0, genesis_id)],
         canonical: BTreeSet::from([*genesis_id.as_bytes()]),
         pool: BTreeMap::new(),
+        att_pool: AttestationPool::new(),
+        wall_slot: 0,
         mempool: BTreeMap::new(),
         store,
         net,
@@ -1325,6 +1513,13 @@ pub fn run(cfg: Config) -> io::Result<()> {
         let slot = (now - genesis_ms) / slot_ms;
         let slot_start = genesis_ms + slot * slot_ms;
         let wall_epoch = epoch_of(slot);
+        if slot != engine.wall_slot {
+            engine.wall_slot = slot;
+            // Drop everything the acceptance window has moved past. The pool
+            // reads no clock of its own, so this is the only thing that bounds
+            // it — without the call its `seen` map grows with uptime.
+            engine.att_pool.prune(slot);
+        }
 
         if let Some(stop) = cfg.stop_at_slot {
             if slot >= stop {
@@ -1382,8 +1577,8 @@ pub fn run(cfg: Config) -> io::Result<()> {
                 for ev in pending {
                     match ev {
                         EngineEvent::Net(NetEvent::Block(env)) => engine.ingest(env),
-                        EngineEvent::Net(NetEvent::Attestation(att)) => {
-                            engine.on_attestation(att, wall_epoch)
+                        EngineEvent::Net(NetEvent::Attestation(att, origin)) => {
+                            engine.on_attestation(att, origin, wall_epoch)
                         }
                         EngineEvent::Net(NetEvent::Transaction(tx)) => {
                             // Gossip has nobody to answer to; the verdict is the

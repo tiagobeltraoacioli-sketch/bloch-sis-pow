@@ -61,7 +61,11 @@ for i in $(seq 0 $((N - 1))); do
     PEERS="${PEERS:+$PEERS,}127.0.0.1:$((BASE_PORT + j))"
   done
   d="$WORKDIR/node$i"
-  CMD=("$BIN" run --data-dir "$d" --genesis "$GENESIS" --listen "$((BASE_PORT + i))" --peers "$PEERS")
+  # --transport devnet is the default, but it is written out here so this
+  # script keeps producing the run it has always produced even if the default
+  # is ever flipped to libp2p.
+  CMD=("$BIN" run --data-dir "$d" --genesis "$GENESIS" --transport devnet \
+       --listen "$((BASE_PORT + i))" --peers "$PEERS")
   [ -n "$STOP_AT" ] && CMD+=(--stop-at-slot "$STOP_AT")
   { echo "# ${CMD[*]}"; } > "$d/node.log"
   "${CMD[@]}" >> "$d/node.log" 2>&1 &

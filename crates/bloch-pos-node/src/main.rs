@@ -7,13 +7,23 @@
 //! a local TCP mesh, with real ML-DSA-65 ‖ Falcon-1024 hybrid signatures and
 //! append-only block-log persistence (restart = deterministic replay).
 //!
+//! Since 2026-08-13 it also has a production network layer (`p2p`): libp2p +
+//! gossipsub on Genesis-4-only protocol ids, carrying the Genesis-3 mesh
+//! fixes, with `gossip.rs` wired as attestation admission control and a
+//! directed, paginated block-sync path. A node started with an **empty data
+//! dir** syncs from genesis and validates every block itself — no datadir is
+//! ever donated. `--transport devnet` keeps the original TCP mesh, and is
+//! still the default.
+//!
 //! What it is NOT yet — honestly, per the integration plan
-//! (`docs/specs/BLOCH-POS-NODE-INTEGRATION.md`): no RocksDB store, no libp2p
-//! gossip, no transactions (deposits/exits/transfers), no slashing-evidence
-//! pipeline, no checkpoint-sync **state download** (the weak-subjectivity
-//! boot gate itself IS wired — `ws_boot`), no RPC, no mainnet genesis
-//! manifest. See the module docs of `engine`, `net`, `store`, `ws_boot` for
-//! each limitation at its site.
+//! (`docs/specs/BLOCH-POS-NODE-INTEGRATION.md`): no RocksDB store, no
+//! post-quantum transport handshake (the p2p layer uses Noise; consensus
+//! signatures are hybrid PQ regardless), no peer persistence or peer
+//! exchange, no deposits/exits, no slashing-evidence pipeline, no
+//! checkpoint-sync **state download** (the weak-subjectivity boot gate itself
+//! IS wired — `ws_boot`), no RPC, no mainnet genesis manifest. See the module
+//! docs of `engine`, `net`, `p2p`, `store`, `ws_boot` for each limitation at
+//! its site.
 //!
 //! ## Key hygiene
 //!
@@ -33,6 +43,7 @@ mod genesis;
 mod keys;
 mod net;
 mod rpc;
+mod p2p;
 mod store;
 mod ws_boot;
 
@@ -123,14 +134,35 @@ fn print_help() {
                              [--slot-ms <ms>] [--start-in <secs>]\n\
                Build a devnet genesis manifest from the keystores' public\n\
                parts. Slot 0 starts <secs> from now (default 5).\n\
-           bloch-pos run --data-dir <dir> --genesis <file> --listen <port>\n\
-                         [--listen-addr <ip>]\n\
+           bloch-pos run --data-dir <dir> --genesis <file>\n\
+                         [--transport devnet|libp2p]\n\
+               devnet (default) is the TCP full mesh: no authentication, no\n\
+               admission control, no relay logic. It is what the 64-validator\n\
+               devnet finalized on and it stays reproducible.\n\
+               libp2p is the production stack: gossipsub on Genesis-4-only\n\
+               protocol ids, gossip.rs admission control, directed paginated\n\
+               sync. Anything reachable from outside a firewall wants this.\n\
+         \n\
+             devnet transport:\n\
+                         --listen <port> [--listen-addr <ip>]\n\
+                         --peers <host:port,...>\n\
                --listen-addr binds the mesh listener somewhere other than\n\
                127.0.0.1, which is what a devnet spread across hosts needs.\n\
                This transport has no authentication and no admission\n\
                control, so a routable bind MUST be firewalled to the known\n\
-               peer addresses. Production is the libp2p stack, not this.\n\
-                         --peers <host:port,...> [--stop-at-slot <n>]\n\
+               peer addresses.\n\
+         \n\
+             libp2p transport:\n\
+                         [--p2p-listen <multiaddr>[,...]] (default\n\
+                          /ip4/0.0.0.0/tcp/16400)\n\
+                         [--p2p-peer <multiaddr>[,...]]\n\
+                         [--max-peers <n>] [--behind-proxy]\n\
+               Peers are dialled as /ip4/<host>/tcp/<port>/p2p/<peer-id>.\n\
+               The node prints its own peer id at startup. --behind-proxy\n\
+               zeroes the IP-colocation score penalty, which otherwise\n\
+               graylists a whole mesh that shares one proxy address.\n\
+         \n\
+                         [--stop-at-slot <n>]\n\
                          [--ws-checkpoint <file>] [--ws-signer-set <file>]\n\
                          [--carryover <snapshot.tsv>]\n\
                Run a validator node. <dir> must hold validator.key; chain\n\
@@ -166,6 +198,12 @@ fn print_help() {
                port to the clients that are meant to reach it; anything that\n\
                can open a socket to it can read the node's entire state and\n\
                submit transactions.\n\
+               A node started with an EMPTY data dir syncs from genesis: it\n\
+               downloads every block from peers and validates each one\n\
+               itself. No datadir is ever donated. While the chain is\n\
+               younger than the weak-subjectivity period that needs no\n\
+               checkpoint at all; past it, a fresh node requires\n\
+               --ws-checkpoint and says so rather than syncing blindly.\n\
                --ws-checkpoint supplies a signed weak-subjectivity\n\
                checkpoint envelope (BLOCH-WEAK-SUBJECTIVITY.md §4.1). A node\n\
                with neither a fresh checkpoint nor fresh finality of its own\n\
@@ -517,17 +555,37 @@ fn genesis_cmd(args: &[String]) {
 
 fn run_cmd(args: &[String]) {
     self_check();
-    let (Some(data_dir), Some(genesis_path), Some(listen)) = (
-        arg_value(args, "--data-dir"),
-        arg_value(args, "--genesis"),
-        arg_value(args, "--listen").and_then(|s| s.parse::<u16>().ok()),
-    ) else {
-        eprintln!("run: --data-dir, --genesis and --listen <port> are required");
+    let (Some(data_dir), Some(genesis_path)) =
+        (arg_value(args, "--data-dir"), arg_value(args, "--genesis"))
+    else {
+        eprintln!("run: --data-dir and --genesis are required");
         exit(2);
     };
-    let peers: Vec<String> = arg_value(args, "--peers")
-        .map(|s| s.split(',').filter(|p| !p.is_empty()).map(String::from).collect())
-        .unwrap_or_default();
+    // Devnet stays the default. The 64-validator devnet finalized on that
+    // transport, and the same command must keep producing the same run;
+    // opting into the production stack is an explicit act.
+    let transport = match arg_value(args, "--transport").as_deref() {
+        None | Some("devnet") => engine::Transport::Devnet,
+        Some("libp2p") => engine::Transport::Libp2p,
+        Some(other) => {
+            eprintln!("run: --transport must be `devnet` or `libp2p`, not `{other}`");
+            exit(2);
+        }
+    };
+    let listen = arg_value(args, "--listen").and_then(|s| s.parse::<u16>().ok());
+    if transport == engine::Transport::Devnet && listen.is_none() {
+        eprintln!("run: --listen <port> is required for the devnet transport");
+        exit(2);
+    }
+    let csv = |name: &str| -> Vec<String> {
+        arg_value(args, name)
+            .map(|s| s.split(',').filter(|p| !p.is_empty()).map(String::from).collect())
+            .unwrap_or_default()
+    };
+    let mut p2p_listen = csv("--p2p-listen");
+    if transport == engine::Transport::Libp2p && p2p_listen.is_empty() {
+        p2p_listen.push("/ip4/0.0.0.0/tcp/16400".to_string());
+    }
     let stop_at_slot = arg_value(args, "--stop-at-slot").and_then(|s| s.parse::<u64>().ok());
 
     let ws = ws_boot::WsConfig {
@@ -553,11 +611,16 @@ fn run_cmd(args: &[String]) {
     let cfg = engine::Config {
         data_dir: PathBuf::from(data_dir),
         genesis_path: PathBuf::from(genesis_path),
-        listen,
-        // Loopback unless asked otherwise: this transport authenticates
+        transport,
+        listen: listen.unwrap_or(0),
+        // Loopback unless asked otherwise: the devnet transport authenticates
         // nothing, so a routable bind is a deliberate act plus a firewall.
         listen_addr: arg_value(args, "--listen-addr").unwrap_or_else(|| "127.0.0.1".to_string()),
-        peers,
+        peers: csv("--peers"),
+        p2p_listen,
+        p2p_peers: csv("--p2p-peer"),
+        max_peers: arg_value(args, "--max-peers").and_then(|s| s.parse().ok()).unwrap_or(64),
+        behind_proxy: args.iter().any(|a| a == "--behind-proxy"),
         stop_at_slot,
         ws,
         // Required exactly when the manifest commits to a carryover; `run`
