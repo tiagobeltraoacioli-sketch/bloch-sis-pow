@@ -198,11 +198,19 @@ Prebuilt `bloch` and `bloch-cli` for **Linux x86_64**. The current release is
 
 - GitHub releases: <https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow/releases>
 - GitLab releases: <https://gitlab.com/blochsispow-group/BlochSISPoW-project/-/releases>
+- Mirror: <https://posternlabs.com/dl/bloch-genesis3-terminal-50000-linux-x86_64.tar.gz>
 
-Those two are the only places the binaries are published. posternlabs.com does
-**not** mirror them today — it is a single-page site that answers every path
-with its own index page, so a download link pointing there returns HTML that
-looks like a successful fetch and is not a binary.
+The mirror serves files only under `/dl/`, by full filename. Any other path on
+that host — `/bloch`, `/bloch-cli` — answers `200` with the site's own HTML
+page, so a wrong download URL there succeeds, produces a file, and gives you
+nothing to notice. Check `content-type: application/gzip` before trusting a
+download from the mirror.
+
+**`/dl/` also still holds four superseded node tarballs**, including one named
+`bloch-genesis3-linux-x86_64.tar.gz` — a name that reads like "the current
+one" and is not. None of the four halts at 50,000. Take the filename with
+`terminal-50000` in it, or use a release page, where superseded builds are
+labelled as such.
 
 **Requires glibc ≥ 2.39** (Ubuntu 24.04 or newer). On older distributions,
 build from source. Verify `SHA256SUMS` before running anything.
