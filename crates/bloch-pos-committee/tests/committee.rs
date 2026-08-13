@@ -200,10 +200,17 @@ fn epoch_committee_is_larger_than_the_slot_sample() {
 struct AlwaysValid;
 impl SignatureVerifier for AlwaysValid {
     fn verify(&self, _v: u32, _r: &[u8; 32], _s: &[u8]) -> bool { true }
+    /// Mirrors this mock's `verify`: a test double that accepted
+    /// spends more easily than attestations would hide the very
+    /// forgery the spend path must refuse.
+    fn verify_with_key(&self, _pk: &[u8], root: &[u8; 32], sig: &[u8]) -> bool {
+        self.verify(0, root, sig)
+    }
 }
 struct AlwaysInvalid;
 impl SignatureVerifier for AlwaysInvalid {
     fn verify(&self, _v: u32, _r: &[u8; 32], _s: &[u8]) -> bool { false }
+    fn verify_with_key(&self, _pk: &[u8], _r: &[u8; 32], _s: &[u8]) -> bool { false }
 }
 
 fn att(slot: u64, head: u8, validator: u32) -> Attestation {

@@ -126,6 +126,13 @@ impl bloch_pos_committee::attestation::SignatureVerifier for HybridVerifier {
             None => false,
         }
     }
+
+    /// Same suite, key supplied directly instead of looked up. Spending an
+    /// output must be exactly as hard to forge as attesting, so this is the
+    /// same call with the same both-halves check.
+    fn verify_with_key(&self, pubkey: &[u8], signing_root: &[u8; 32], signature: &[u8]) -> bool {
+        bloch_crypto::crypto::verify(pubkey, signing_root, signature)
+    }
 }
 
 /// Accept-everything verifier for the producer's own `compute_post_state`
@@ -137,6 +144,9 @@ pub struct ProbeVerifier;
 
 impl bloch_pos_committee::attestation::SignatureVerifier for ProbeVerifier {
     fn verify(&self, _v: u32, _root: &[u8; 32], _sig: &[u8]) -> bool {
+        true
+    }
+    fn verify_with_key(&self, _pk: &[u8], _root: &[u8; 32], _sig: &[u8]) -> bool {
         true
     }
 }

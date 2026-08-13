@@ -89,6 +89,21 @@ pub trait SignatureVerifier {
     /// Verify `signature` over `signing_root` for the given validator index.
     /// Must verify **both** halves of the hybrid suite.
     fn verify(&self, validator: u32, signing_root: &[u8; 32], signature: &[u8]) -> bool;
+
+    /// Verify `signature` over `signing_root` against a public key given
+    /// directly, rather than looked up by validator index.
+    ///
+    /// Spending an output needs this and the index form cannot serve it: an
+    /// eUTXO is owned by whoever can produce the key its `script_hash`
+    /// commits to, and that key is in no registry. The registry form answers
+    /// "did validator 17 sign this?"; this answers "did the owner of this
+    /// output sign this?", which is a different question about a different
+    /// key space.
+    ///
+    /// Must verify **both** halves of the hybrid suite, exactly as `verify`
+    /// does. An implementation that checks one half here and two there would
+    /// make spending cheaper to forge than attesting.
+    fn verify_with_key(&self, pubkey: &[u8], signing_root: &[u8; 32], signature: &[u8]) -> bool;
 }
 
 /// Why an attestation was rejected. Distinct variants because "invalid" alone

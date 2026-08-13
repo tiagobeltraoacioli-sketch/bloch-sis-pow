@@ -2174,6 +2174,9 @@ mod tests {
         fn verify(&self, _v: u32, _root: &[u8; 32], _sig: &[u8]) -> bool {
             true
         }
+        fn verify_with_key(&self, _pk: &[u8], _root: &[u8; 32], _sig: &[u8]) -> bool {
+            true
+        }
     }
 
     fn sat(bloch: u128) -> u128 {
@@ -2186,6 +2189,9 @@ mod tests {
     struct MarkerVerifier;
     impl SignatureVerifier for MarkerVerifier {
         fn verify(&self, _v: u32, _root: &[u8; 32], sig: &[u8]) -> bool {
+            sig != b"forged"
+        }
+        fn verify_with_key(&self, _pk: &[u8], _root: &[u8; 32], sig: &[u8]) -> bool {
             sig != b"forged"
         }
     }

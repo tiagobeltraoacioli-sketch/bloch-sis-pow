@@ -431,6 +431,12 @@ fn signing_root_and_validate_are_pure_and_field_sensitive() {
         fn verify(&self, _v: u32, _r: &[u8; 32], _s: &[u8]) -> bool {
             true
         }
+        /// Mirrors this mock's `verify`: a test double that accepted
+        /// spends more easily than attestations would hide the very
+        /// forgery the spend path must refuse.
+        fn verify_with_key(&self, _pk: &[u8], root: &[u8; 32], sig: &[u8]) -> bool {
+            self.verify(0, root, sig)
+        }
     }
     let mut rng = Rng::new(0xB10C_000A);
     for _ in 0..100 {

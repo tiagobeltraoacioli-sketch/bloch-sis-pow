@@ -289,6 +289,12 @@ mod tests {
         fn verify(&self, validator: u32, signing_root: &[u8; 32], signature: &[u8]) -> bool {
             signature == mock_sig(validator, signing_root).as_slice()
         }
+        /// Mirrors this mock's `verify`: a test double that accepted
+        /// spends more easily than attestations would hide the very
+        /// forgery the spend path must refuse.
+        fn verify_with_key(&self, _pk: &[u8], root: &[u8; 32], sig: &[u8]) -> bool {
+            self.verify(0, root, sig)
+        }
     }
 
     struct MockSigner(u32);
