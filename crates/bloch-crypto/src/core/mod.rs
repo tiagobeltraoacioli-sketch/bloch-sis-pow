@@ -444,7 +444,23 @@ pub const fn chain_requires_carryover(id: ChainId) -> bool {
 // reaches 50,000 (~3 days at the measured 21.6 s/block). A node still on the
 // 80,000 binary keeps accepting blocks above 50,000, and the moment one does,
 // the halt itself becomes the fork.
-pub const GENESIS3_TERMINAL_HEIGHT: u64 = 50_000;
+// FINAL, 2026-08-13. Genesis-3 stopped at 39,918 — production was halted
+// there, and this constant now says so.
+//
+// Why this matters rather than being bookkeeping: until this changed, the
+// chain had stopped because mining was switched off, not because consensus
+// refused. The rule still permitted blocks up to 40,000, so anyone restarting
+// a miner could have added 82 more — and the terminal snapshot taken at
+// 39,918, from which Genesis-4's entire carryover is built, would no longer
+// have described the chain's tip. The halt is a rule now, not an operational
+// state that a single restart could undo.
+//
+// It stopped 82 blocks before the Emission V3 flag day at height 40,000, so
+// the block reward ended at 8,400 BLOCH and never became 2,600. That fork was
+// planned, tested and documented, and never happened.
+//
+// The history: 80,000 -> 50,000 (2026-08-12) -> 39,918 (2026-08-13).
+pub const GENESIS3_TERMINAL_HEIGHT: u64 = 39_918;
 
 /// The terminal height for `id`, if that chain has one.
 ///
