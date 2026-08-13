@@ -898,8 +898,53 @@ pub struct CommittedState {
     /// pools. Closing it means giving deposits and withdrawals eUTXO inputs
     /// and outputs, which is a change to the staking messages' wire shape and
     /// to their admission rules, not to this field. Until then, no single
+
     /// number in this state is "the supply".
     eutxos: BTreeMap<([u8; 32], u32), crate::state_root::EutxoEntry>,
+}
+
+/// Does `key_hash` — SHA3-256 of a spender's public key — open an output
+/// locked by `script_hash`?
+///
+/// Two forms, because the chain opens with balances minted under a different
+/// convention and they have to be spendable by the people who hold them.
+///
+/// **Native.** All 32 bytes equal. This is the pay-to-pubkey-hash the format
+/// is specified as, and every output a Genesis-4 transaction creates uses it.
+///
+/// **Carried.** The last 12 bytes are zero and the first 20 match. A
+/// Genesis-3 address is `SHA3-256(pubkey)[..20]` — the *same hash of the same
+/// key*, truncated — so the carryover writes those 20 bytes into
+/// `script_hash[0..20]` and zeroes the rest. The holder proves ownership
+/// identically; only the comparison length differs.
+///
+/// # Why this function has to exist
+///
+/// Without it the entire opening ledger is frozen. A carried output could
+/// only be opened by a key whose SHA3-256 both matched the old 20 bytes AND
+/// ended in twelve zero bytes — 2^96 of work for the zeros alone. That is not
+/// a difficulty, it is an impossibility: 57,146,400,000 BLOCH, every carried
+/// balance and every vested allocation, unspendable forever, on a chain whose
+/// state root committed to them correctly the whole time.
+///
+/// # What it costs, stated
+///
+/// A carried output is protected by 160 bits of preimage resistance rather
+/// than 256. That is exactly the security those coins had on Genesis-3, and
+/// what Bitcoin gives its own outputs, so nothing is weakened by carrying
+/// them across — but the two tiers are real and the weaker one is the older
+/// one. It applies ONLY to outputs whose last 12 bytes are zero; native
+/// outputs keep the full 32-byte check.
+///
+/// A native output could in principle hash to something ending in twelve zero
+/// bytes and become checkable under both arms. The probability is 2^-96 per
+/// key, and both arms demand the same key, so it changes nothing about who
+/// can spend it.
+fn owns(key_hash: &[u8; 32], script_hash: &[u8; 32]) -> bool {
+    if key_hash == script_hash {
+        return true;
+    }
+    script_hash[20..] == [0u8; 12] && key_hash[..20] == script_hash[..20]
 }
 
 impl CommittedState {
@@ -1547,7 +1592,7 @@ impl CommittedState {
             // The key the output committed to, checked before the signature —
             // one hash against one hybrid verification.
             let key_hash: [u8; 32] = Sha3_256::digest(&i.pubkey).into();
-            if key_hash != entry.script_hash {
+            if !owns(&key_hash, &entry.script_hash) {
                 return Err(TransferReject::ScriptMismatch);
             }
             spent_value += entry.value as u128;
@@ -5326,5 +5371,62 @@ mod tests {
         // The boundary with full participation actually minted something —
         // otherwise the monotonicity above was checked vacuously.
         assert!(rolled.issued_sat > s.issued_sat, "fixture minted nothing");
+    }
+}
+
+#[cfg(test)]
+mod carried_ownership_tests {
+    use super::*;
+
+    fn h(bytes: &[u8]) -> [u8; 32] {
+        Sha3_256::digest(bytes).into()
+    }
+
+    /// A carried output — 20 bytes of the Genesis-3 hash, 12 zeros — must be
+    /// openable by the key that owned it there. Without this the entire
+    /// opening ledger is frozen.
+    #[test]
+    fn a_carried_output_opens_for_its_genesis3_owner() {
+        let pubkey = b"a hybrid public key stands in here";
+        let full = h(pubkey);
+        let mut carried = [0u8; 32];
+        carried[..20].copy_from_slice(&full[..20]);
+        assert!(owns(&full, &carried), "the holder of the same key must be able to spend");
+    }
+
+    #[test]
+    fn a_native_output_still_needs_all_32_bytes() {
+        let pubkey = b"a hybrid public key stands in here";
+        let full = h(pubkey);
+        assert!(owns(&full, &full));
+        let mut off_by_one_late = full;
+        off_by_one_late[31] ^= 1; // differs only past byte 20
+        assert!(
+            !owns(&full, &off_by_one_late),
+            "a native output must not fall back to the 20-byte comparison"
+        );
+    }
+
+    #[test]
+    fn a_different_key_opens_neither_form() {
+        let mine = h(b"my key");
+        let theirs = h(b"someone else's key");
+        let mut carried = [0u8; 32];
+        carried[..20].copy_from_slice(&mine[..20]);
+        assert!(!owns(&theirs, &carried), "a carried output is not a free-for-all");
+        assert!(!owns(&theirs, &mine));
+    }
+
+    /// The relaxed arm is gated on the twelve zero bytes and nothing else. A
+    /// script_hash with any non-zero tail gets the full check, so the weaker
+    /// tier cannot be entered by an output that did not come from the
+    /// carryover.
+    #[test]
+    fn the_relaxed_arm_needs_the_zero_tail() {
+        let mine = h(b"my key");
+        let mut almost = [0u8; 32];
+        almost[..20].copy_from_slice(&mine[..20]);
+        almost[31] = 1; // one byte of tail set
+        assert!(!owns(&mine, &almost));
     }
 }
