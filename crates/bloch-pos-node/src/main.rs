@@ -72,6 +72,7 @@ fn main() {
             println!("self-check passed");
         }
         Some("keygen") => keygen(&args[1..]),
+        Some("keygen-public") => keygen_public(&args[1..]),
         Some("genesis") => genesis_cmd(&args[1..]),
         Some("submit-tx") => submit_tx(&args[1..]),
         Some("run") => run_cmd(&args[1..]),
@@ -93,6 +94,10 @@ fn print_help() {
                Generate a THROWAWAY devnet validator keystore (hybrid\n\
                ML-DSA-65‖Falcon-1024 + RANDAO seed) at <dir>/validator.key.\n\
                Devnet only; production keys follow BLOCH-GENESIS-KEYS.md.\n\
+           bloch-pos keygen-public --dir <dir>\n\
+               Print one TSV row of a keystore's PUBLIC halves — the only
+               thing that leaves the air-gapped ceremony machine. Secret
+               material is unreachable from this command.\n\
            bloch-pos submit-tx --to <host:port> [--inputs n] [--tx-bytes n]\n\
                                [--tip millisat-per-gas]\n\
                Send one Transfer to a running node, which gossips it on.\n\
@@ -166,6 +171,52 @@ fn bloch_pos_node_net_send(addr: &str, bytes: &[u8]) -> std::io::Result<()> {
 
 fn arg_value(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
+}
+
+/// `keygen-public --dir <dir>` — one TSV row of a keystore's PUBLIC halves.
+///
+/// The carry-out half of the ceremony. An air-gapped machine holds the
+/// keystores forever; what leaves it is this row per validator, and nothing
+/// else. Reads the keystore and prints index, hybrid public key, and the
+/// RANDAO commitment — the head of the reveal chain, which is a commitment
+/// precisely so the seed behind it can stay on the machine.
+///
+/// The three columns it cannot know are left empty rather than defaulted:
+/// `stake_sat`, `withdrawal_credentials` and `commission_bps` are decisions,
+/// not derivations, and a genesis where nobody chose them is a genesis
+/// somebody will have to explain later.
+///
+/// Nothing here can print a secret: `Keystore`'s secret field is private and
+/// implements no `Debug`, so there is no path from this function to the key.
+fn keygen_public(args: &[String]) {
+    let Some(dir) = arg_value(args, "--dir") else {
+        eprintln!("keygen-public: --dir is required");
+        exit(2);
+    };
+    match keys::Keystore::load(&PathBuf::from(&dir)) {
+        Ok(ks) => {
+            let commitment =
+                bloch_pos_committee::beacon::RandaoChain::generate(ks.randao_seed).commitment();
+            println!(
+                "{}\t{}\t{}\t\t\t",
+                ks.index,
+                hex_lower(&ks.pubkey),
+                hex_lower(&commitment)
+            );
+        }
+        Err(e) => {
+            eprintln!("keygen-public: cannot read {dir}: {e}");
+            exit(1);
+        }
+    }
+}
+
+fn hex_lower(b: &[u8]) -> String {
+    let mut s = String::with_capacity(b.len() * 2);
+    for byte in b {
+        s.push_str(&format!("{byte:02x}"));
+    }
+    s
 }
 
 fn keygen(args: &[String]) {
