@@ -1396,6 +1396,49 @@ impl CommittedState {
         self.base_fee_millisat_per_gas
     }
 
+    // ── Read surface for the node's RPC layer ───────────────────────────────
+    //
+    // Added 2026-08-13 for `bloch-pos-node`'s JSON-RPC module. All three are
+    // *read-only projections of already-committed state*: they compute nothing
+    // a consensus rule does not already compute, and no transition behaviour
+    // changes. They exist because the fields they read are private — which is
+    // correct, since a mutable handle to the eUTXO set outside the transition
+    // is exactly the node-local mutable consensus state rule 2 forbids — and a
+    // query surface still has to be able to answer "what does this address
+    // hold". Borrowed (`&`) rather than cloned so a query cannot be mistaken
+    // for a state the caller may edit.
+
+    /// Number of validators in the committed registry — **every** record, not
+    /// just the active ones. [`StateReader::active_validators`] answers the
+    /// other question; a query surface needs both, because "3 of 10 active" and
+    /// "3 of 3 active" are different networks and one number cannot say which.
+    pub fn validator_count(&self) -> usize {
+        self.validators.len()
+    }
+
+    /// Every unspent output, in `(txid, vout)` order.
+    ///
+    /// Order is the map's, so it is a function of the data and not of insertion
+    /// history (rule 2) — which is what makes a paginated query stable across
+    /// two calls to two different nodes on the same state.
+    pub fn eutxos(&self) -> impl Iterator<Item = &crate::state_root::EutxoEntry> + '_ {
+        self.eutxos.values()
+    }
+
+    /// Sum of the values of every output locked to `script_hash`, in satoshis.
+    ///
+    /// `u128` and not `u64`: a single output fits u64 (the cap is 54.21% of
+    /// `u64::MAX`) but a *sum* of two large ones wraps, and this is a sum. That
+    /// is the arithmetic contract, and a balance query is precisely where
+    /// ignoring it would be invisible until the one address that overflows.
+    pub fn balance_sat(&self, script_hash: &[u8; 32]) -> u128 {
+        self.eutxos
+            .values()
+            .filter(|e| &e.script_hash == script_hash)
+            .map(|e| u128::from(e.value))
+            .sum()
+    }
+
     /// The price the child block must charge: the EIP-1559 controller applied
     /// to this state's committed price and usage.
     ///

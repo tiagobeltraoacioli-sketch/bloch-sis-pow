@@ -79,7 +79,19 @@ use bloch_pos_committee::{committees, derive, epoch_of, schedule};
 use crate::genesis::{Manifest, GENESIS_MIX};
 use crate::keys::{HybridVerifier, Keystore, ProbeVerifier};
 use crate::net::{self, NetEvent};
+use crate::rpc::{self, Admitted, Finality, Json, RpcCall, RpcError, RpcRequest, RpcResult};
 use crate::store::Store;
+
+/// Everything that reaches the consensus thread from outside it.
+///
+/// One channel, two sources. The RPC arm is what lets a query be answered from
+/// *inside* the thread that owns the state, rather than from a copy kept
+/// alongside it — see [`crate::rpc::EngineBackend`] for why a shared snapshot
+/// was refused.
+pub enum EngineEvent {
+    Net(NetEvent),
+    Rpc(RpcCall),
+}
 
 pub struct Config {
     pub data_dir: PathBuf,
@@ -92,6 +104,12 @@ pub struct Config {
     pub peers: Vec<String>,
     pub stop_at_slot: Option<u64>,
     pub ws: crate::ws_boot::WsConfig,
+    /// Address the JSON-RPC server binds, and its port. `127.0.0.1` unless
+    /// `--rpc-bind` says otherwise: the RPC authenticates nothing, so a
+    /// routable bind is an explicit act plus a firewall. `None` port disables
+    /// the server entirely.
+    pub rpc_bind: String,
+    pub rpc_port: Option<u16>,
 }
 
 fn now_ms() -> u64 {
@@ -586,15 +604,23 @@ impl Engine {
     /// per-sender accounting, no replacement policy. Re-broadcast only on
     /// first sight, so a transaction traverses the mesh once instead of
     /// echoing between every pair of peers.
-    fn on_transaction(&mut self, tx: PosTransaction) {
+    /// Returns what became of the transaction, so a caller that has someone to
+    /// answer to — the RPC — can say. The gossip path ignores the result: a
+    /// peer is not waiting on a verdict, and a duplicate arriving twice over a
+    /// full mesh is the normal case rather than a fault.
+    fn on_transaction(&mut self, tx: PosTransaction) -> Result<Admitted, &'static str> {
         let key = tx.canonical_bytes();
-        if self.mempool.contains_key(&key) || self.mempool.len() >= MEMPOOL_MAX {
-            return;
+        if self.mempool.contains_key(&key) {
+            return Ok(Admitted::Duplicate);
+        }
+        if self.mempool.len() >= MEMPOOL_MAX {
+            return Err("mempool is at capacity");
         }
         let mut frame = vec![net::FRAME_TX];
         frame.extend_from_slice(&key);
         self.mempool.insert(key, tx);
         self.net.broadcast(frame);
+        Ok(Admitted::New)
     }
 
     /// Transactions for the block this node is about to propose.
@@ -819,6 +845,216 @@ impl Engine {
         }
         self.pool.insert(key, att);
     }
+
+    // ── RPC service ─────────────────────────────────────────────────────────
+    //
+    // Answered on the consensus thread, between duties. Every method reads the
+    // committed state this thread owns, so no query can observe a half-applied
+    // block and no reader can be served a stale copy. The formatting lives in
+    // `rpc.rs` as free functions of their inputs; what is here is only the
+    // lookup — which block, which record, which outputs.
+
+    /// The slot the wall clock is in, by the manifest's own cadence.
+    ///
+    /// `max(1)` on the divisor because a zero `slot_ms` in a hand-edited
+    /// manifest must not turn a query into a division-by-zero panic. The slot
+    /// loop would reach the same division first, but "would panic elsewhere" is
+    /// not a reason for this path to panic here.
+    fn wall_slot(&self) -> u64 {
+        now_ms().saturating_sub(self.manifest.genesis_time_ms) / self.manifest.slot_ms.max(1)
+    }
+
+    /// Wall-clock seconds a slot corresponds to. Display only — derived from
+    /// the manifest's cadence, never a consensus field (the header has no time).
+    fn slot_timestamp_secs(&self, slot: u64) -> u64 {
+        self.manifest
+            .genesis_time_ms
+            .saturating_add(slot.saturating_mul(self.manifest.slot_ms))
+            / 1000
+    }
+
+    /// Canonical height of a block id — its position on the canonical chain,
+    /// genesis at 0. `None` for a block this node has stored but not adopted.
+    fn height_of(&self, id: &[u8; 32]) -> Option<u64> {
+        self.chain.iter().position(|(_, cid)| cid.as_bytes() == id).map(|p| p as u64)
+    }
+
+    /// Slot of a canonical block named by root, if this node has it canonical.
+    fn slot_of_canonical_root(&self, root: &[u8; 32]) -> Option<u64> {
+        self.chain.iter().find(|(_, id)| id.as_bytes() == root).map(|(s, _)| *s)
+    }
+
+    /// Where a block stands against this node's own checkpoints.
+    ///
+    /// The comparison is by slot against the checkpoint blocks' slots, not by
+    /// epoch: the checkpoint convention this node attests under puts the
+    /// checkpoint at the last block strictly *before* an epoch's first slot, so
+    /// "in a finalized epoch" and "at or below the finalized checkpoint" are
+    /// different sets and only the second is what finality actually covers.
+    fn finality_of(&self, slot: u64, canonical: bool) -> Finality {
+        if !canonical {
+            return Finality::NotCanonical;
+        }
+        let fin = self.state.finality();
+        if self.slot_of_canonical_root(&fin.finalized.root).is_some_and(|s| slot <= s) {
+            Finality::Finalized
+        } else if self.slot_of_canonical_root(&fin.justified.root).is_some_and(|s| slot <= s) {
+            Finality::Justified
+        } else {
+            Finality::Canonical
+        }
+    }
+
+    /// Canonical height of the finalized checkpoint — the height below which
+    /// this node's history is settled.
+    fn finalized_height(&self) -> Option<u64> {
+        self.height_of(&self.state.finality().finalized.root)
+    }
+
+    /// The genesis block as an envelope.
+    ///
+    /// Genesis is synthesised from the manifest and never stored in `blocks`
+    /// (`ingest` refuses slot 0), so a lookup that lands on it has nothing to
+    /// return. Rebuilding it from `Manifest::genesis_header` — the same
+    /// function `genesis_id` derives identity from — lets height 0 answer in
+    /// the ordinary block shape instead of being a special case clients must
+    /// handle.
+    fn genesis_envelope(&self) -> BlockEnvelope {
+        BlockEnvelope {
+            header: self.manifest.genesis_header(),
+            proposer_sig: Vec::new(),
+            body: Body { transactions: Vec::new(), attestations: Vec::new() },
+        }
+    }
+
+    /// Look up one block by id, genesis included.
+    fn envelope_by_id(&self, id: &[u8; 32]) -> Option<BlockEnvelope> {
+        if self.chain[0].1.as_bytes() == id {
+            return Some(self.genesis_envelope());
+        }
+        self.blocks.get(id).cloned()
+    }
+
+    fn block_reply(&self, env: &BlockEnvelope) -> Json {
+        let id = *env.block_id().as_bytes();
+        let canonical = self.canonical.contains(&id);
+        rpc::block_json(
+            env,
+            self.height_of(&id),
+            self.finality_of(env.header.slot, canonical),
+            self.slot_timestamp_secs(env.header.slot),
+        )
+    }
+
+    fn serve_rpc(&mut self, req: RpcRequest) -> RpcResult {
+        match req {
+            RpcRequest::ChainInfo => Ok(rpc::chain_info_json(
+                &self.state,
+                &self.head_id(),
+                self.chain.len() as u64 - 1,
+                self.finalized_height(),
+                self.wall_slot(),
+                self.state.validator_count(),
+                self.mempool.len(),
+                self.blocks.len(),
+            )),
+
+            RpcRequest::BlockCount => {
+                let fin = self.state.finality();
+                Ok(rpc::block_count_json(
+                    self.chain.len() as u64 - 1,
+                    self.head_slot_now(),
+                    self.finalized_height(),
+                    fin.justified.epoch,
+                    fin.finalized.epoch,
+                ))
+            }
+
+            RpcRequest::BlockBySlot(slot) => {
+                let Some((_, id)) = self.chain.iter().find(|(s, _)| *s == slot) else {
+                    // A slot with no canonical block is the ordinary PoS case —
+                    // a proposer missed its turn — and is reported as its own
+                    // code so a scanner advances instead of alerting.
+                    return Err(RpcError::new(
+                        rpc::SLOT_EMPTY,
+                        format!(
+                            "no canonical block at slot {slot} (head is at slot {}); \
+                             a slot with no block is a missed proposal, not an error",
+                            self.head_slot_now()
+                        ),
+                    ));
+                };
+                let id = *id.as_bytes();
+                let env = self.envelope_by_id(&id).ok_or_else(|| {
+                    RpcError::new(
+                        rpc::BLOCK_NOT_FOUND,
+                        format!("slot {slot} names a block this node no longer stores"),
+                    )
+                })?;
+                Ok(self.block_reply(&env))
+            }
+
+            RpcRequest::BlockById(id) => {
+                let env = self.envelope_by_id(&id).ok_or_else(|| {
+                    RpcError::new(
+                        rpc::BLOCK_NOT_FOUND,
+                        format!("no block {} is known to this node", crate::codec::hex32(&id)),
+                    )
+                })?;
+                Ok(self.block_reply(&env))
+            }
+
+            RpcRequest::Validator(index) => {
+                let rec = self.state.validator_record(index).ok_or_else(|| {
+                    RpcError::new(
+                        rpc::VALIDATOR_NOT_FOUND,
+                        format!(
+                            "validator {index} is not in the committed registry ({} registered)",
+                            self.state.validator_count()
+                        ),
+                    )
+                })?;
+                let effective = self
+                    .state
+                    .active_validators()
+                    .iter()
+                    .find(|v| v.index == index)
+                    .map(|v| v.effective_stake);
+                Ok(rpc::validator_json(&rec, effective, epoch_of(self.state.slot())))
+            }
+
+            RpcRequest::ValidatorCount => Ok(Json::obj(vec![
+                ("total", Json::u(self.state.validator_count() as u64)),
+                ("active", Json::u(self.state.active_validators().len() as u64)),
+                (
+                    "total_active_stake_sat",
+                    Json::sat(self.state.total_active_stake_sat()),
+                ),
+            ])),
+
+            RpcRequest::Balance(script_hash) => Ok(rpc::balance_json(&self.state, &script_hash)),
+
+            RpcRequest::Utxos { script_hash, limit } => {
+                Ok(rpc::utxos_json(&self.state, &script_hash, limit))
+            }
+
+            RpcRequest::SendRawTransaction(tx) => match self.on_transaction(tx.clone()) {
+                Ok(outcome) => Ok(rpc::submitted_json(&tx, outcome)),
+                Err(why) => Err(RpcError::new(
+                    rpc::MEMPOOL_FULL,
+                    format!("{why} ({MEMPOOL_MAX} entries); retry later — the \
+                             transaction was not judged invalid"),
+                )),
+            },
+
+            RpcRequest::MempoolInfo => Ok(rpc::mempool_info_json(
+                self.mempool.len(),
+                MEMPOOL_MAX,
+                self.mempool.keys().map(Vec::len).sum(),
+                self.state.next_base_fee(),
+            )),
+        }
+    }
 }
 
 // ── Entry point ─────────────────────────────────────────────────────────────
@@ -860,12 +1096,12 @@ pub fn run(cfg: Config) -> io::Result<()> {
 
     let logged = store.read_all()?;
     let head_slot = Arc::new(AtomicU64::new(0));
-    let (tx, rx) = mpsc::channel::<NetEvent>();
+    let (tx, rx) = mpsc::channel::<EngineEvent>();
     let net = net::start(
         &cfg.listen_addr,
         cfg.listen,
         cfg.peers.clone(),
-        tx,
+        tx.clone(),
         cfg.data_dir.clone(),
         head_slot.clone(),
     )?;
@@ -986,6 +1222,45 @@ pub fn run(cfg: Config) -> io::Result<()> {
         }
     }
 
+    // ── The JSON-RPC server ──
+    //
+    // Started HERE, after replay and after the weak-subjectivity gate, and the
+    // order is the point: until this line the engine is not reading its event
+    // channel, so a request arriving earlier would block a client for the whole
+    // of boot. It also means the node never answers a query before it has
+    // decided it is allowed to follow this chain at all — a node that served
+    // `getchaininfo` during boot would be publishing a head it had not yet
+    // earned the right to have.
+    if let Some(port) = cfg.rpc_port {
+        let backend = Arc::new(crate::rpc::EngineBackend::new(tx.clone()));
+        match crate::rpc::serve(&cfg.rpc_bind, port, backend) {
+            Ok(addr) => {
+                println!("JSON-RPC listening on http://{addr}");
+                if !addr.ip().is_loopback() {
+                    // Not a log line among log lines: this port has no
+                    // authentication and `sendrawtransaction` is a write.
+                    eprintln!(
+                        "WARNING: the RPC is bound to {}, which is not loopback. It has \
+                         NO authentication, NO rate limiting and NO authorisation — \
+                         anything that can reach this port can read the node's full \
+                         state and submit transactions. Restrict it at the firewall to \
+                         the clients that are meant to reach it.",
+                        addr.ip()
+                    );
+                }
+            }
+            Err(e) => {
+                // A node that was asked for an RPC and could not bind must not
+                // quietly run without one: the operator would find out from a
+                // client's timeouts.
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!("cannot bind the RPC to {}:{port}: {e}", cfg.rpc_bind),
+                ));
+            }
+        }
+    }
+
     // ── The slot loop ──
     let genesis_ms = engine.manifest.genesis_time_ms;
     let slot_ms = engine.manifest.slot_ms;
@@ -1058,9 +1333,21 @@ pub fn run(cfg: Config) -> io::Result<()> {
                 }
                 for ev in pending {
                     match ev {
-                        NetEvent::Block(env) => engine.ingest(env),
-                        NetEvent::Attestation(att) => engine.on_attestation(att, wall_epoch),
-                        NetEvent::Transaction(tx) => engine.on_transaction(tx),
+                        EngineEvent::Net(NetEvent::Block(env)) => engine.ingest(env),
+                        EngineEvent::Net(NetEvent::Attestation(att)) => {
+                            engine.on_attestation(att, wall_epoch)
+                        }
+                        EngineEvent::Net(NetEvent::Transaction(tx)) => {
+                            // Gossip has nobody to answer to; the verdict is the
+                            // RPC's concern, not a peer's.
+                            let _ = engine.on_transaction(tx);
+                        }
+                        EngineEvent::Rpc(call) => {
+                            let result = engine.serve_rpc(call.req);
+                            // A client that hung up between asking and being
+                            // answered is normal, not an error worth logging.
+                            let _ = call.reply.send(result);
+                        }
                     }
                 }
             }

@@ -33,6 +33,8 @@ use std::time::Duration;
 use bloch_pos_committee::attestation::Attestation;
 use bloch_pos_committee::header::BlockEnvelope;
 
+use crate::engine::EngineEvent;
+
 pub const FRAME_BLOCK: u8 = 0x01;
 pub const FRAME_ATT: u8 = 0x02;
 pub const FRAME_GET_BLOCKS: u8 = 0x03;
@@ -174,7 +176,7 @@ pub fn start(
     bind_addr: &str,
     listen_port: u16,
     peer_addrs: Vec<String>,
-    events: Sender<NetEvent>,
+    events: Sender<EngineEvent>,
     data_dir: PathBuf,
     head_slot: Arc<AtomicU64>,
 ) -> std::io::Result<Net> {
@@ -195,7 +197,7 @@ pub fn start(
                             if frame.first() == Some(&FRAME_GET_BLOCKS) {
                                 serve_get_blocks(&mut sock, &data_dir, &frame);
                             } else if let Some(ev) = decode_event(&frame) {
-                                if events.send(ev).is_err() {
+                                if events.send(EngineEvent::Net(ev)).is_err() {
                                     return;
                                 }
                             }
@@ -228,7 +230,7 @@ pub fn start(
                     match read_frame(&mut rsock) {
                         Ok(frame) => {
                             if let Some(ev) = decode_event(&frame) {
-                                if events.send(ev).is_err() {
+                                if events.send(EngineEvent::Net(ev)).is_err() {
                                     return;
                                 }
                             }

@@ -32,6 +32,7 @@ mod engine;
 mod genesis;
 mod keys;
 mod net;
+mod rpc;
 mod store;
 mod ws_boot;
 
@@ -50,6 +51,14 @@ use bloch_pos_committee::tokenomics_v4::{
 };
 
 const NAME: &str = env!("CARGO_PKG_NAME");
+
+/// Default JSON-RPC port. Deliberately NOT the Genesis-3 node's 16210: the
+/// migration plan keeps a G3 archive node serving the frozen V3 surface, and
+/// the two are expected to run on the same host during the changeover. Sharing
+/// a port would mean whichever bound first silently answered for the other
+/// chain — a client asking a V4 node for `getblockcount` and getting a PoW
+/// height is the kind of confusion that ends in a miscredited deposit.
+const DEFAULT_RPC_PORT: u16 = 16310;
 /// `pkg-version (git-commit[+dirty])`, stamped by build.rs. The commit is the
 /// load-bearing part: the G8 release-integrity gate compares fleet, release
 /// and source through it (deploy/RELEASE-INTEGRITY.md). Never fall back to
@@ -110,8 +119,31 @@ fn print_help() {
                peer addresses. Production is the libp2p stack, not this.\n\
                          --peers <host:port,...> [--stop-at-slot <n>]\n\
                          [--ws-checkpoint <file>] [--ws-signer-set <file>]\n\
+                         [--rpc-bind <ip>] [--rpc-port <n>|off]\n\
                Run a validator node. <dir> must hold validator.key; chain\n\
                data persists in <dir> and is replayed on restart.\n\
+               \n\
+               JSON-RPC 2.0 over HTTP is served on --rpc-bind:--rpc-port,\n\
+               default 127.0.0.1:16310 (`--rpc-port off` disables it). It\n\
+               answers for THIS node's own validated state — run your own\n\
+               node and query it rather than trusting someone else's.\n\
+                 Methods: getchaininfo, getblockcount, getblockbyslot,\n\
+                 getblockbyid, getvalidator, getvalidatorcount, getbalance,\n\
+                 getutxos (alias listunspent), sendrawtransaction,\n\
+                 getmempoolinfo. gettransaction and getnewaddress answer\n\
+                 with a permanent, explained refusal — there is no txid at\n\
+                 this layer and this node holds no wallet.\n\
+                 Finality: block responses carry `finalized: true|false`.\n\
+                 That boolean, not a confirmation count, is the settlement\n\
+                 guarantee — PoS has no depth-as-security.\n\
+               \n\
+               *** The RPC has NO AUTHENTICATION. *** No API key, no rate\n\
+               limit, no per-method authorisation, and sendrawtransaction is\n\
+               a write. The 127.0.0.1 default is what keeps that safe. If you\n\
+               bind a routable address with --rpc-bind, YOU MUST firewall the\n\
+               port to the clients that are meant to reach it; anything that\n\
+               can open a socket to it can read the node's entire state and\n\
+               submit transactions.\n\
                --ws-checkpoint supplies a signed weak-subjectivity\n\
                checkpoint envelope (BLOCH-WEAK-SUBJECTIVITY.md §4.1). A node\n\
                with neither a fresh checkpoint nor fresh finality of its own\n\
@@ -298,6 +330,22 @@ fn run_cmd(args: &[String]) {
         checkpoint: arg_value(args, "--ws-checkpoint").map(PathBuf::from),
         signer_set: arg_value(args, "--ws-signer-set").map(PathBuf::from),
     };
+
+    // RPC. A malformed --rpc-port is refused rather than silently falling back
+    // to the default: an operator who typed a port meant that port, and a node
+    // listening somewhere else is worse than one that did not start.
+    let rpc_port = match arg_value(args, "--rpc-port") {
+        None => Some(DEFAULT_RPC_PORT),
+        Some(s) if s == "off" || s == "0" => None,
+        Some(s) => match s.parse::<u16>() {
+            Ok(p) => Some(p),
+            Err(_) => {
+                eprintln!("run: --rpc-port must be a port number 1-65535, or `off` (got `{s}`)");
+                exit(2);
+            }
+        },
+    };
+
     let cfg = engine::Config {
         data_dir: PathBuf::from(data_dir),
         genesis_path: PathBuf::from(genesis_path),
@@ -308,6 +356,11 @@ fn run_cmd(args: &[String]) {
         peers,
         stop_at_slot,
         ws,
+        // Loopback unless asked otherwise, for the same reason as the mesh
+        // listener and one more: the RPC accepts `sendrawtransaction`, so an
+        // exposed port is a write surface, not only a read one.
+        rpc_bind: arg_value(args, "--rpc-bind").unwrap_or_else(|| "127.0.0.1".to_string()),
+        rpc_port,
     };
     if let Err(e) = engine::run(cfg) {
         eprintln!("bloch-pos: {e}");
