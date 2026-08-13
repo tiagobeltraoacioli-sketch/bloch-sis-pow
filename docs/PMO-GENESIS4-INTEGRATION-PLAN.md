@@ -591,7 +591,20 @@ guaranteed conflicts in a change-controlled file into one scheduled review.
 from the root, and its `[patch.crates-io]`
 (`crates/bloch-pos-node/Cargo.toml`) is ignored there too. So dependency
 resolution differs depending on which directory you build from. Both
-dep-adding items will trip over this. Decide now: member of the root workspace
+dep-adding items will trip over this.
+
+**Measured, this pass:** the committed root `Cargo.lock` contains **no**
+`bloch-pos-committee` and **no** `bloch-pos-node` entries. Running
+`cargo test -p bloch-pos-committee -p bloch-pos-node` from the repo root adds
+17 lines to it. So nobody has built the workspace from the root since these
+crates became members — which is precisely the condition
+`BLOCH-POS-GAPS.md` warned about when it made them members: *"the first
+command any reviewer runs tested the retired PoW node and none of the PoS
+consensus."* The lockfile drift is the proof that the fix is not yet load-
+bearing. (This pass reverted the lockfile rather than commit an unrelated
+change; landing it belongs in Phase 0.)
+
+Decide now: member of the root workspace
 (delete the inner lockfiles and the inner `[patch]`), or standalone (remove
 from root members). Note this also contradicts
 `BLOCH-POS-NODE-INTEGRATION.md` §0/§7.1, which still describes these crates as
