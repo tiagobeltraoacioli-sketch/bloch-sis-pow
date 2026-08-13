@@ -650,6 +650,30 @@ pub struct CommittedState {
     /// they widen the gap below the cap, and the invariant is one-sided
     /// (`issued_sat <= TOTAL_SUPPLY_SAT`, enforced in `compute_post_state`).
     issued_sat: u128,
+    /// The unspent-output set, keyed by `(txid, vout)` so iteration order is a
+    /// function of the data and never of insertion history (rule 2).
+    ///
+    /// # Why this is here now
+    ///
+    /// `compute_root` used to pass `eutxos: &[]` under a comment saying the
+    /// node's transaction layer owned the set and "supplies it here". No seam
+    /// existed for it to be supplied through, and nothing ever supplied
+    /// anything — so the balance component of the state root was committed
+    /// empty on every block since genesis. Genesis-4 had a `TAG_EUTXO` slot in
+    /// its schema and no balances in it: a chain where nobody holds anything,
+    /// including the 452,133 outputs the Genesis-3 snapshot carries.
+    ///
+    /// The set lives in the state because the state root commits to it. What
+    /// stays out of this crate is what transactions *mean* — they are still
+    /// opaque bytes here — but what they add up to is consensus, and consensus
+    /// is what this struct is.
+    ///
+    /// Honest scope: genesis seeds this and nothing spends from it yet.
+    /// `PosTransaction::Transfer` carries `inputs`, `tx_bytes` and a tip —
+    /// gas terms, with no sender, recipient or amount — so there is no value
+    /// movement to apply. This makes the carried ledger *exist and be
+    /// committed*; making it *move* is the transfer format's job.
+    eutxos: BTreeMap<([u8; 32], u32), crate::state_root::EutxoEntry>,
 }
 
 impl CommittedState {
@@ -665,6 +689,13 @@ impl CommittedState {
         coherence_accumulator_root: [u8; 32],
         coherence_nullifier_root: [u8; 32],
         evm: EvmCommitment,
+        // The balances this chain opens with: the Genesis-3 carryover plus the
+        // vested allocation outputs. Empty on a devnet, where nobody holds
+        // anything. Passed explicitly rather than defaulted, so a network that
+        // SHOULD carry balances cannot be launched without someone deciding to
+        // pass none — the failure mode that left `eutxos: &[]` in the root for
+        // the whole of Genesis-4's development.
+        opening_balances: &[crate::state_root::EutxoEntry],
     ) -> Self {
         let mut registry = BTreeMap::new();
         let mut reveals_used = BTreeMap::new();
@@ -735,6 +766,10 @@ impl CommittedState {
             coherence_nullifier_root,
             evm,
             issued_sat: tokenomics_v4::GENESIS_ISSUED_SAT,
+            eutxos: opening_balances
+                .iter()
+                .map(|e| ((e.txid, e.vout), e.clone()))
+                .collect(),
         };
         // Seed epoch 0's participation for the launch roster, so the
         // committed participation component is well-defined from block one.
@@ -988,11 +1023,13 @@ impl CommittedState {
             })
             .collect();
 
+        // Values, in key order — the map's ordering is the commitment's.
+        let eutxo_vec: Vec<crate::state_root::EutxoEntry> = self.eutxos.values().cloned().collect();
         crate::state_root::state_root(&ConsensusState {
-            // The eUTXO set is owned by the node's transaction layer, which
-            // this standalone crate cannot see (transactions are opaque);
-            // the node's implementation supplies it here.
-            eutxos: &[],
+            // The set the state carries. This read used to be `&[]` under a
+            // comment saying the node supplied it; nothing did, so every
+            // block since genesis committed an empty balance component.
+            eutxos: &eutxo_vec,
             validators: &validators,
             current_participation: &current,
             previous_participation: &previous,
@@ -2195,6 +2232,8 @@ mod tests {
                 gas_used: 0,
                 base_fee_per_gas: 1,
             },
+            // Devnet/test genesis: nobody holds anything.
+            &[],
         );
         (Transition::new(verifier), st, chains)
     }
@@ -3320,6 +3359,8 @@ mod tests {
                 gas_used: 0,
                 base_fee_per_gas: 1,
             },
+            // Devnet/test genesis: nobody holds anything.
+            &[],
         );
         let roster = st.duty_roster_at(genesis_cohort::COHORT_TAPER_EPOCHS);
         let cohort_stake =

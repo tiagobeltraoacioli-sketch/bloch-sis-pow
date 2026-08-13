@@ -326,7 +326,45 @@ impl Manifest {
                 gas_used: 0,
                 base_fee_per_gas: 0,
             },
+            &self.allocation_outputs(),
         )
+    }
+
+    /// The vested allocation outputs, as genesis eUTXOs.
+    ///
+    /// Deterministic from the manifest alone — every node synthesises the same
+    /// outputs from the same bytes, which is the property genesis lives or
+    /// dies by. The txid is a domain-separated digest over the allocation's
+    /// own fields rather than a counter, so reordering the manifest's
+    /// allocation list cannot silently change which output is which.
+    ///
+    /// The carryover is NOT here. Those entries come from the signed snapshot
+    /// file, which the node ingests and checks against
+    /// [`CarryoverCommitment`]; a 54 MB balance set does not belong inside the
+    /// file every node hashes to decide which network it joined.
+    pub fn allocation_outputs(&self) -> Vec<bloch_pos_committee::state_root::EutxoEntry> {
+        self.allocations
+            .iter()
+            .map(|a| {
+                let mut h = Sha3_256::new();
+                Digest::update(&mut h, b"BLCH4:genesis-alloc\0");
+                Digest::update(&mut h, [a.purpose]);
+                Digest::update(&mut h, a.script_hash);
+                Digest::update(&mut h, a.amount_sat.to_le_bytes());
+                Digest::update(&mut h, a.unlock_epoch.to_le_bytes());
+                let txid: [u8; 32] = h.finalize().into();
+                bloch_pos_committee::state_root::EutxoEntry {
+                    txid,
+                    vout: 0,
+                    // Values are u64 in the entry; an allocation above u64 is
+                    // a manifest that could not be committed truthfully, so it
+                    // is refused rather than truncated into a smaller number.
+                    value: u64::try_from(a.amount_sat)
+                        .expect("allocation exceeds u64 satoshis — see check_supply"),
+                    script_hash: a.script_hash,
+                }
+            })
+            .collect()
     }
 
     /// The registered public keys, indexed by validator index (dense from 0).
@@ -393,6 +431,60 @@ mod tests {
             },
         ];
         m
+    }
+
+    /// The check that would have caught the empty balance component: a
+    /// genesis carrying money must not commit the same root as one carrying
+    /// none.
+    ///
+    /// Before the eUTXO set reached `CommittedState`, `compute_root` passed
+    /// `&[]` and these two roots were identical — a chain with 20 billion
+    /// BLOCH in it was indistinguishable, at the state root, from a chain with
+    /// nothing. That is the whole bug in one assertion.
+    /// Cheap structural clone for the reorder test — `Manifest` is not
+    /// `Clone` in the crate, and making it so for a test would widen the
+    /// public surface for no other reason.
+    fn clone_of(m: &Manifest) -> Manifest {
+        Manifest::decode(&m.encode()).expect("a manifest we just encoded decodes")
+    }
+
+    #[test]
+    fn balances_change_the_genesis_state_root() {
+        use bloch_pos_committee::interfaces::StateReader;
+        let empty = sample();
+        let funded = mainnet_sample();
+        assert_ne!(
+            empty.genesis_state().state_root(),
+            funded.genesis_state().state_root(),
+            "a genesis holding allocations must not commit an empty ledger's root"
+        );
+    }
+
+    #[test]
+    fn allocation_outputs_are_deterministic_and_distinct() {
+        let m = mainnet_sample();
+        let a = m.allocation_outputs();
+        let b = m.allocation_outputs();
+        assert_eq!(a, b, "same manifest must synthesise the same outputs");
+        assert_eq!(a.len(), 2);
+        assert_ne!(a[0].txid, a[1].txid, "two allocations must not share a txid");
+        // Value survives the u128 -> u64 narrowing intact.
+        assert_eq!(u128::from(a[0].value), m.allocations[0].amount_sat);
+        assert_eq!(a[0].script_hash, m.allocations[0].script_hash);
+    }
+
+    /// Reordering the allocation list must not change what genesis commits:
+    /// the txid is derived from each allocation's own fields, not its position.
+    #[test]
+    fn allocation_order_does_not_change_the_outputs() {
+        let m = mainnet_sample();
+        let mut swapped = clone_of(&m);
+        swapped.allocations.reverse();
+        let mut a = m.allocation_outputs();
+        let mut b = swapped.allocation_outputs();
+        a.sort_by_key(|e| e.txid);
+        b.sort_by_key(|e| e.txid);
+        assert_eq!(a, b);
     }
 
     #[test]
