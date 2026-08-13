@@ -198,7 +198,11 @@ Prebuilt `bloch` and `bloch-cli` for **Linux x86_64**. The current release is
 
 - GitHub releases: <https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow/releases>
 - GitLab releases: <https://gitlab.com/blochsispow-group/BlochSISPoW-project/-/releases>
-- Mirror: <https://posternlabs.com> — serves the same `bloch` and `bloch-cli`
+
+Those two are the only places the binaries are published. posternlabs.com does
+**not** mirror them today — it is a single-page site that answers every path
+with its own index page, so a download link pointing there returns HTML that
+looks like a successful fetch and is not a binary.
 
 **Requires glibc ≥ 2.39** (Ubuntu 24.04 or newer). On older distributions,
 build from source. Verify `SHA256SUMS` before running anything.
