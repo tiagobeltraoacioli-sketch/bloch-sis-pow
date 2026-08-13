@@ -92,6 +92,13 @@ pub struct Config {
     pub peers: Vec<String>,
     pub stop_at_slot: Option<u64>,
     pub ws: crate::ws_boot::WsConfig,
+    /// The Genesis-3 balance snapshot, when the manifest commits to one. It is
+    /// a separate file rather than a manifest field because it is tens of
+    /// megabytes and the manifest is the thing every node hashes; the
+    /// manifest's `CarryoverCommitment` is what binds the two together.
+    /// Required exactly when the manifest carries a commitment — see the
+    /// refusals at the top of [`run`].
+    pub carryover_path: Option<PathBuf>,
 }
 
 fn now_ms() -> u64 {
@@ -824,7 +831,48 @@ impl Engine {
 // ── Entry point ─────────────────────────────────────────────────────────────
 
 pub fn run(cfg: Config) -> io::Result<()> {
-    let (manifest, digest) = Manifest::load(&cfg.genesis_path)?;
+    let (mut manifest, digest) = Manifest::load(&cfg.genesis_path)?;
+
+    // The opening ledger, before anything else touches the manifest. A
+    // manifest that commits to a carryover is not usable until the snapshot
+    // is in hand, and a snapshot offered to a manifest that commits to none
+    // is a category error — both are refusals rather than warnings, because
+    // the failure they prevent is a chain that starts, runs, and is wrong.
+    match (&manifest.carryover, &cfg.carryover_path) {
+        (Some(c), Some(path)) => {
+            let entries = c.entry_count;
+            let snap = manifest.ingest_carryover(path)?;
+            println!(
+                "carryover: {entries} outputs, {} sat carried (x100/21 of {} G3 sat, \
+                 {} sat of split remainder to the largest output); set root {}",
+                snap.total_sat,
+                snap.g3_total_sat,
+                snap.dust_sat,
+                crate::codec::hex8(&snap.set_root),
+            );
+        }
+        (Some(c), None) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "this genesis commits to a carryover of {} outputs ({} sat) but no \
+                     --carryover <snapshot.tsv> was given; starting without it would open \
+                     the chain with a zero balance for every holder",
+                    c.entry_count, c.total_sat,
+                ),
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--carryover was given but this genesis commits to no carryover; \
+                 the manifest's digest says nothing about that file, so nothing would \
+                 hold the balances it contains to anything",
+            ));
+        }
+        (None, None) => {}
+    }
+
     let keys = Keystore::load(&cfg.data_dir)?;
     let verifier = HybridVerifier::new(manifest.pubkeys());
 

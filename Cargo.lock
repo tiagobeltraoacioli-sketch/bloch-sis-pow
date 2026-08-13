@@ -1546,6 +1546,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloch-pos-committee"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "sha3 0.10.9",
+]
+
+[[package]]
+name = "bloch-pos-node"
+version = "0.0.2-devnet"
+dependencies = [
+ "bloch-crypto",
+ "bloch-pos-committee",
+ "sha3 0.10.9",
+]
+
+[[package]]
 name = "bloch-pq-vault"
 version = "0.0.1"
 dependencies = [
