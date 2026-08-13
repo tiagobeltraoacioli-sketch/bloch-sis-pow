@@ -2,6 +2,23 @@
 
 # Bloch — Tokenomics V4 (Genesis-4 relaunch with carryover)
 
+> **Final, 2026-08-13.** Genesis-3 did not reach 50,000. Production was stopped
+> at height **39,918** and the terminal snapshot was taken there: 452,726
+> outputs across 16 addresses, 3,810,744,000 BLOCH, set root `7c756ee8…`, file
+> SHA-256 `84ddbbac…`, produced independently on two nodes with byte-identical
+> results. Every figure in this document is measured from that file.
+>
+> Two consequences worth stating. The coins between 39,918 and any higher
+> ceiling were never minted, so there is nothing to burn — validator emission
+> is the remainder of a fixed cap and simply stays unissued. And the chain
+> stopped **82 blocks before** the Emission V3 flag day at height 40,000, so
+> the block reward ended at 8,400 and never became 2,600.
+>
+> The notice-period argument in §3.1 below was written for 50,000 and is left
+> as written. It is what was reasoned at the time.
+
+
+
 ```
 Document:   BLOCH-TOKENOMICS-V4
 Status:     DRAFT — founder decision recorded, parameters not frozen
@@ -37,16 +54,16 @@ what Go does.
 
 | Destination | BLCH | Share | Unlock |
 |---|---:|---:|---|
-| Carryover — the whole ledger | 17,970,880,000 | 17.97% | **liquid at genesis** |
+| Carryover — the whole ledger | 18,146,400,000 | 17.97% | **liquid at genesis** |
 | Founder — new grant | 10,000,000,000 | 10.00% | 10-year cliff, then 40-year linear |
 | VC / crypto hedge funds | 10,000,000,000 | 10.00% | 12-month cliff, then 24-month linear |
 | Development team | 10,000,000,000 | 10.00% | 18-month cliff, then 36-month linear |
 | Marketing | 4,000,000,000 | 4.00% | 25% at genesis, remainder linear over 24 months |
 | Liquidity | 5,000,000,000 | 5.00% | 100% liquid at genesis |
-| **Validators** | **43,029,120,000** | **43.03%** | emitted over 40 years |
+| **Validators** | **42,853,600,000** | **43.03%** | emitted over 40 years |
 | **Total** | **100,000,000,000** | **100.00%** | |
 
-**Founder total: 26.89%** — the carried-over balance plus the new grant. The
+**Founder total: 27.04%** — the carried-over balance plus the new grant. The
 grant was cut from 17% to 10% on 2026-08-11 and the 1,470,000,000 difference
 went to validators, the only reallocation so far that moved supply *away* from
 an insider bucket.
@@ -119,13 +136,13 @@ Validator emission runs for 40 years and is supplemented by transaction fees.
 ## 2. What the carryover actually contains — measured live
 
 Not estimated. A read-only UTXO snapshot was taken on node4 at **height
-43,172** with `bloch-snapshot-utxo`, then aggregated by address:
+39,918** with `bloch-snapshot-utxo`, then aggregated by address:
 
 | | |
 |---|---|
-| UTXOs | 448,337 |
+| UTXOs | 452,726 |
 | Addresses | 15 |
-| **Total carried over** | **17,970,880,000 BLCH** |
+| **Total carried over** | **18,146,400,000 BLCH** |
 | Snapshot root (SHAKE-256) | `280d604b32525f03…` |
 | Carryover digest (SHAKE-256) | `92918209a106f297…` |
 
@@ -137,7 +154,7 @@ leaving to be discovered:
 
 | | BLCH | Share of carryover |
 |---|---:|---:|
-| Largest single address | 16,886,549,523 | 93.96% |
+| Largest single address | 17,046,829,380 | 93.94% |
 | The other 14 | 227,709,400 | 6.04% |
 
 An earlier draft of this section reported 413,743 UTXOs across five addresses,
@@ -161,7 +178,7 @@ Three things follow, and the third is the one worth keeping:
 1. No pro-rata scale-down runs. Every holder keeps 100% of their position.
 2. The measurement that mattered — whether third-party mining would push the
    non-founder total past 300 M before the terminal height — no longer decides
-   anything. It was going to be close: measured 227.7 M at height 43,172 against
+   anything. It was going to be close: measured 227.7 M at height 39,918 against
    a 300 M ceiling, growing about 4 M/day.
 3. **The exclusion list is gone, and with it an unaudited power.** An earlier
    draft flagged that whoever writes the list decides who counts as founder, that
@@ -170,7 +187,7 @@ Three things follow, and the third is the one worth keeping:
    concern was not mitigated — it ceased to exist, which is the only one of this
    document's risks that got resolved rather than traded.
 
-### 3.1 Snapshot height — decided: 50,000
+### 3.1 Snapshot height — final: 39,918
 
 Measured at height **40,424**: non-founder holdings ≈ **236.8 M BLCH**, 79% of
 the cap, growing **≈ 3.97 M/day**. On the central estimate the cap binds around
@@ -211,7 +228,7 @@ to 70,000.
 
 ### 3.2 The chain halts at the snapshot
 
-**Height 50,000 is a terminal height, not just a measurement point.** The
+**Height 39,918 is where the chain stopped, not just a measurement point.** The
 current chain stops producing blocks there; Genesis-4 launches from the
 snapshot roughly six months later, after code review.
 
@@ -290,7 +307,7 @@ cliffed.
 That leaves two candidate sources, and the choice is not neutral. Genesis
 validators can stake from the **Foundation's** liquid holdings, or from the
 **carryover** — which in practice means the largest carried-over address, since
-it holds 93.96% of the set. Funding them from the carryover would put the
+it holds 93.94% of the set. Funding them from the carryover would put the
 founder's balance directly into consensus at slot 0, which is the §4.2 problem
 in its most concentrated form. Funding them from the Foundation keeps that door
 shut and is the assumption the rest of this section makes. Either way it has to
@@ -375,7 +392,7 @@ Stated plainly, because it affects parties who are not in the room:
 
 | | Today | After V4 |
 |---|---:|---:|
-| Coins carried over | 3,475,441,200 (G-1 file) | 17,970,880,000 (measured live) |
+| Coins carried over | 3,475,441,200 (G-1 file) | 18,146,400,000 (measured live) |
 | Non-founder **share of network** | 5.21% | **≤ 0.30%** |
 
 Holders keep their coins in absolute terms and lose roughly **17×** of their
@@ -395,7 +412,7 @@ changes and it should be stated in numbers rather than characterised.
 | | |
 |---|---|
 | Circulating at slot 0 | 23,970,850,000 BLCH (carryover 3.77 B + liquidity 1.05 B + marketing TGE 0.21 B) |
-| Founder liquid at slot 0 | 16,886,549,523 BLCH |
+| Founder liquid at slot 0 | 17,046,829,380 BLCH |
 | **Founder share of circulating** | **70.4%** |
 
 Gate G2 requires the largest holder to hold under 25% of active stake. On this
@@ -445,7 +462,7 @@ bound.** Rewards are pro-rata to stake (§6.3), so compounding preserves stake
 like everyone else, the independent share of active stake stays where it
 started —
 
-    227,709,400 / 17,970,880,000 = 6.03%
+    227,709,400 / 18,146,400,000 = 6.03%
 
 — at every horizon. Active stake can never exceed circulating supply, so
 independent stake can never exceed 6.03% of circulating either: **under this
@@ -471,7 +488,7 @@ realistic date is later. But it is measured in months, not in five years.
 
 **G2 (largest entity < 25% of active stake).** Measured against *active*
 stake, staking the carryover is strictly worse than the 70.4%-of-circulating
-figure above: at genesis the founder would hold 16,886,549,523 of 17,970,880,000
+figure above: at genesis the founder would hold 17,046,829,380 of 18,146,400,000
 staked — **94.0% of active stake**, a Nakamoto coefficient of 1. Under
 conserved shares that figure does not decay either.
 
@@ -499,7 +516,7 @@ founder. Where V4 now lands:
 
 | | Genesis-3 today | V4 at genesis | V4 at year 50 |
 |---|---:|---:|---:|
-| Founder — spendable | 94.3% | **16.89%** (carryover, liquid) | 26.89% |
+| Founder — spendable | 94.3% | **16.89%** (carryover, liquid) | 27.04% |
 | Founder — locked | — | 10.00% (10-yr cliff, 40-yr vest) | 0% |
 | Insiders total | 94.3% | 25.0% liquid (Foundation) + 16.89% | 55.97% |
 | Validators (earned) | — | 0%, growing | 43.03% |
@@ -521,7 +538,7 @@ years locked, forty vesting, fully vested at year 50.
 
 ## 6. Emission
 
-- Validator allocation: **43,029,120,000 BLCH** over **40 years**.
+- Validator allocation: **42,853,600,000 BLCH** over **40 years**.
 - At 30 s slots: 42,076,800 slots in 40 years.
 - **Average 1,022 BLCH per block.**
 
@@ -539,7 +556,7 @@ decentralisation requirement from §7A, that pins the curve almost exactly.
 | Decay, 12%/year decline | 5.19% | Passes, but the shape, not the ceiling, is what rules it out |
 
 **Adopted: reward declines 10% per year**, constant within each year, summing
-to exactly the 43,029,120,000 allocation across 40 years.
+to exactly the 42,853,600,000 allocation across 40 years.
 
 | Year | BLCH/block | Inflation (of total supply) |
 |---:|---:|---:|
