@@ -143,6 +143,12 @@ fn spawn_node(
             &format!("/ip4/127.0.0.1/tcp/{listen}"),
             "--p2p-peer",
             &peer_list,
+            // Three nodes on one machine: the RPC's default port is a single
+            // number, so leaving it on would have two of them fail to bind and
+            // exit. A real operator gives each node its own; the test does the
+            // same rather than disabling the server and testing less.
+            "--rpc-port",
+            &(listen + 1000).to_string(),
             "--stop-at-slot",
             &STOP_SLOT.to_string(),
         ])

@@ -124,12 +124,7 @@ fn sample_block(slot: u64, txs: usize) -> BlockEnvelope {
     }];
     let transactions = (0..txs)
         .map(|i| {
-            PosTransaction::Transfer {
-                inputs: 1,
-                tx_bytes: 250 + i as u64,
-                tip_millisat_per_gas: 1_000,
-            }
-            .canonical_bytes()
+            test_transfer(1, 250 + i as u64, 1_000).canonical_bytes()
         })
         .collect();
     BlockEnvelope { header, proposer_sig: vec![0u8; 4], body: Body { transactions, attestations } }
@@ -181,6 +176,31 @@ fn error_code(v: &Json) -> Option<i64> {
 }
 
 // ─── 1. Formatting, over real committed state ───────────────────────────────
+
+
+/// A transfer in the shape the consensus layer now takes: real spend points
+/// and real outputs, not the gas terms the variant carried before value
+/// moved. These tests exercise the RPC's framing of a transaction, not its
+/// validity, so the witness bytes are placeholders — nothing here submits to
+/// a state transition.
+fn test_transfer(inputs: u32, tx_bytes: u64, tip: u128) -> PosTransaction {
+    PosTransaction::Transfer {
+        inputs: (0..inputs)
+            .map(|i| bloch_pos_committee::transition::TransferInput {
+                txid: [i as u8; 32],
+                vout: i,
+                pubkey: vec![0xAB; 8],
+                signature: vec![0xCD; 8],
+            })
+            .collect(),
+        outputs: vec![bloch_pos_committee::transition::TransferOutput {
+            value: 1_000,
+            script_hash: [0xEE; 32],
+        }],
+        tx_bytes,
+        tip_millisat_per_gas: tip,
+    }
+}
 
 #[test]
 fn getchaininfo_reports_slot_epoch_head_root_and_both_checkpoints() {
@@ -431,7 +451,7 @@ fn getmempoolinfo_reports_size_capacity_and_the_next_price() {
 
 #[test]
 fn sendrawtransaction_reply_names_the_kind_and_disclaims_the_hash() {
-    let tx = PosTransaction::Transfer { inputs: 2, tx_bytes: 400, tip_millisat_per_gas: 5 };
+    let tx = test_transfer(2, 400, 5);
     let v = submitted_json(&tx, Admitted::New);
     assert_eq!(v.get("accepted"), Some(&Json::Bool(true)));
     assert_eq!(v.get("status").unwrap().as_str(), Some("accepted"));
@@ -484,7 +504,7 @@ fn every_method_routes_to_its_request() {
     call(b, &request("getmempoolinfo", "[]"));
     assert_eq!(spy.last(), Some(RpcRequest::MempoolInfo));
 
-    let tx = PosTransaction::Transfer { inputs: 1, tx_bytes: 250, tip_millisat_per_gas: 1_000 };
+    let tx = test_transfer(1, 250, 1_000);
     let hex: String = tx.canonical_bytes().iter().map(|b| format!("{b:02x}")).collect();
     call(b, &request("sendrawtransaction", &format!("[\"{hex}\"]")));
     assert_eq!(spy.last(), Some(RpcRequest::SendRawTransaction(tx)));
