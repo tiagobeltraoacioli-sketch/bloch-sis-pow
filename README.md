@@ -194,7 +194,7 @@ compiled, and the build is reproducible by design (see [REPRO.md](./REPRO.md)).
 The binaries below are a convenience, not the standard.
 
 Prebuilt `bloch` and `bloch-cli` for **Linux x86_64**. The current release is
-`genesis3-node-emission-v3-floor60-20260810`:
+`genesis3-node-terminal-50000-20260812`:
 
 - GitHub releases: <https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow/releases>
 - GitLab releases: <https://gitlab.com/blochsispow-group/BlochSISPoW-project/-/releases>
@@ -207,18 +207,16 @@ build from source. Verify `SHA256SUMS` before running anything.
 make an older build diverge, not merely lag: the Emission V3 flag-day at
 local height 40,000 cut the block reward, and a binary built before that
 change forks off the network at that height rather than following it. Every
-release before `genesis3-node-emission-v3-floor60-20260810` is tagged
+release before `genesis3-node-terminal-50000-20260812` is tagged
 `[SUPERSEDED]` in the release list for that reason — including
-`genesis3-node-linux-20260805`, which predates four consensus flag-days.
+`genesis3-node-linux-20260805`, which predates five consensus flag-days.
 
-**No published binary halts at 50,000 yet.** The terminal height was lowered
-to 50,000 on 2026-08-12; the newest release is from 2026-08-10 and therefore
-still carries 80,000. The fleet runs a build of `deploy/g3-terminal-50000`
-that has not been published. Until a release is cut from that branch, a node
-started from any downloadable binary will keep accepting blocks above 50,000
-and fork away from the network at the halt. If you are running a node through
-the halt, build from `deploy/g3-terminal-50000` or ask before relying on a
-downloaded build.
+**If you are running a node through the halt, this release is mandatory.**
+It is the first published binary that stops at 50,000; everything older still
+carries 80,000, keeps accepting blocks past the terminal height, and forks
+away from the network at the moment of the halt. The `bloch` in it is the
+exact binary the fleet runs — copied off a production node and verified
+against `/proc/<pid>/exe`, not rebuilt and assumed equal.
 
 ## Security
 
