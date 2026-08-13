@@ -355,6 +355,140 @@ impl PosTransaction {
         }
         b
     }
+
+    /// Inverse of [`canonical_bytes`](Self::canonical_bytes) for the four
+    /// user-submittable variants.
+    ///
+    /// A block body carries transactions as opaque bytes and `body_root`
+    /// commits to exactly those bytes, so a node that receives a block must
+    /// recover the same values the proposer encoded or it computes a different
+    /// post-state from the same block. That makes this function consensus, not
+    /// convenience: it has to be the exact inverse, and
+    /// `tests::canonical_bytes_round_trips` pins it against the encoder rather
+    /// than against a hand-written expectation.
+    ///
+    /// # Why `SlashingEvidence` is not decodable, and is not an oversight
+    ///
+    /// The evidence arm deliberately folds its nested messages in through the
+    /// roots they were *signed over* plus their signatures — it never
+    /// re-serialises the header or the attestation. A signing root is a hash;
+    /// nothing recovers the envelope from it. So evidence encoded this way is
+    /// one-way by construction, and this returns
+    /// [`TxDecodeError::EvidenceNotDecodable`] for tag `0x05` instead of
+    /// pretending otherwise.
+    ///
+    /// The consequence is worth stating plainly, because it bounds what the
+    /// slashing pipeline can be built on: evidence cannot reach a verifier
+    /// through `body.transactions`, since the verifier would have only hashes
+    /// to re-verify against. Evidence needs its own wire shape carrying the
+    /// two envelopes whole. Until that exists, the §7.3 path is unreachable
+    /// from the network however complete `slashing.rs` is.
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, TxDecodeError> {
+        let mut r = TxReader { b: bytes, i: 0 };
+        let tag = r.u8()?;
+        let tx = match tag {
+            0x01 => PosTransaction::Transfer {
+                inputs: r.u32()?,
+                tx_bytes: r.u64()?,
+                tip_millisat_per_gas: r.u128()?,
+            },
+            0x02 => PosTransaction::Deposit {
+                pubkey: r.bytes()?,
+                amount_sat: r.u128()?,
+                randao_commitment: r.h32()?,
+                withdrawal_credentials: r.bytes()?,
+                commission_bps: r.u128()?,
+            },
+            0x03 => PosTransaction::Exit { validator: r.u32()? },
+            0x04 => PosTransaction::Delegate {
+                delegator: r.u32()?,
+                validator: r.u32()?,
+                amount_sat: r.u128()?,
+                eligible: match r.u8()? {
+                    0 => false,
+                    1 => true,
+                    // Injectivity cuts both ways: if `true` had two encodings
+                    // the same transaction would have two body roots.
+                    other => return Err(TxDecodeError::NotCanonical(other)),
+                },
+            },
+            0x05 => return Err(TxDecodeError::EvidenceNotDecodable),
+            other => return Err(TxDecodeError::UnknownTag(other)),
+        };
+        // Trailing bytes would mean two encodings decode to one transaction,
+        // which breaks the injectivity `body_root` depends on.
+        if r.i != r.b.len() {
+            return Err(TxDecodeError::TrailingBytes);
+        }
+        Ok(tx)
+    }
+}
+
+/// Why a transaction's canonical bytes could not be decoded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TxDecodeError {
+    /// Ran out of input mid-field.
+    Truncated,
+    /// Discriminant this build does not know.
+    UnknownTag(u8),
+    /// Tag `0x05`: one-way by construction — see
+    /// [`PosTransaction::from_canonical_bytes`].
+    EvidenceNotDecodable,
+    /// A field carried a value with more than one encoding (e.g. a bool that
+    /// is neither 0 nor 1).
+    NotCanonical(u8),
+    /// Decoded a whole transaction and input remained.
+    TrailingBytes,
+}
+
+impl core::fmt::Display for TxDecodeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            TxDecodeError::Truncated => write!(f, "transaction truncated"),
+            TxDecodeError::UnknownTag(t) => write!(f, "unknown transaction tag {t:#04x}"),
+            TxDecodeError::EvidenceNotDecodable => write!(
+                f,
+                "slashing evidence is encoded one-way (signing roots, not envelopes) \
+                 and cannot be recovered from a block body"
+            ),
+            TxDecodeError::NotCanonical(v) => write!(f, "non-canonical field value {v}"),
+            TxDecodeError::TrailingBytes => write!(f, "trailing bytes after transaction"),
+        }
+    }
+}
+
+/// Little-endian reader mirroring the encoder's field order and widths.
+struct TxReader<'a> {
+    b: &'a [u8],
+    i: usize,
+}
+
+impl<'a> TxReader<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], TxDecodeError> {
+        let end = self.i.checked_add(n).ok_or(TxDecodeError::Truncated)?;
+        let s = self.b.get(self.i..end).ok_or(TxDecodeError::Truncated)?;
+        self.i = end;
+        Ok(s)
+    }
+    fn u8(&mut self) -> Result<u8, TxDecodeError> {
+        Ok(self.take(1)?[0])
+    }
+    fn u32(&mut self) -> Result<u32, TxDecodeError> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+    fn u64(&mut self) -> Result<u64, TxDecodeError> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+    fn u128(&mut self) -> Result<u128, TxDecodeError> {
+        Ok(u128::from_le_bytes(self.take(16)?.try_into().unwrap()))
+    }
+    fn h32(&mut self) -> Result<[u8; 32], TxDecodeError> {
+        Ok(self.take(32)?.try_into().unwrap())
+    }
+    fn bytes(&mut self) -> Result<Vec<u8>, TxDecodeError> {
+        let n = self.u32()? as usize;
+        Ok(self.take(n)?.to_vec())
+    }
 }
 
 // ─── The committed state ────────────────────────────────────────────────────
@@ -1855,6 +1989,115 @@ impl<V: SignatureVerifier> StateTransition for Transition<V> {
 // ────────────────────────────────────────────────────────────────────────────
 // Tests
 // ────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tx_codec_tests {
+    use super::*;
+
+    /// One of each decodable variant, with values chosen so a field-order or
+    /// width mistake cannot pass: every integer differs, and the two
+    /// length-prefixed byte fields have different lengths so swapping them
+    /// changes the result.
+    fn samples() -> Vec<PosTransaction> {
+        vec![
+            PosTransaction::Transfer {
+                inputs: 7,
+                tx_bytes: 1_234_567,
+                tip_millisat_per_gas: 987_654_321_000,
+            },
+            PosTransaction::Deposit {
+                pubkey: vec![0xAB; 3745],
+                amount_sat: 25_000 * 100_000_000,
+                randao_commitment: [0x5C; 32],
+                withdrawal_credentials: vec![0xCD; 32],
+                commission_bps: 1_250,
+            },
+            PosTransaction::Exit { validator: 63 },
+            PosTransaction::Delegate {
+                delegator: 11,
+                validator: 42,
+                amount_sat: 1_000 * 100_000_000,
+                eligible: true,
+            },
+            PosTransaction::Delegate {
+                delegator: 0,
+                validator: 0,
+                amount_sat: 0,
+                eligible: false,
+            },
+        ]
+    }
+
+    #[test]
+    fn canonical_bytes_round_trips() {
+        for tx in samples() {
+            let bytes = tx.canonical_bytes();
+            let back = PosTransaction::from_canonical_bytes(&bytes)
+                .expect("a transaction this crate encoded must decode");
+            assert_eq!(
+                back.canonical_bytes(),
+                bytes,
+                "re-encoding the decoded value must reproduce the same bytes, \
+                 or body_root disagrees between proposer and verifier"
+            );
+        }
+    }
+
+    #[test]
+    fn evidence_is_one_way_and_says_so() {
+        // Not a limitation to route around: the encoder folds nested messages
+        // in as signing roots, and a hash does not invert.
+        let mut b = vec![0x05, 0x01];
+        b.extend_from_slice(&[0u8; 32]);
+        b.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(
+            PosTransaction::from_canonical_bytes(&b),
+            Err(TxDecodeError::EvidenceNotDecodable)
+        );
+    }
+
+    #[test]
+    fn trailing_bytes_are_refused() {
+        // Two encodings decoding to one transaction would break the
+        // injectivity body_root leans on.
+        let mut b = PosTransaction::Exit { validator: 5 }.canonical_bytes();
+        b.push(0x00);
+        assert_eq!(PosTransaction::from_canonical_bytes(&b), Err(TxDecodeError::TrailingBytes));
+    }
+
+    #[test]
+    fn truncation_is_refused_not_defaulted() {
+        let full = samples()[1].canonical_bytes();
+        for cut in [0, 1, 5, full.len() - 1] {
+            assert_eq!(
+                PosTransaction::from_canonical_bytes(&full[..cut]),
+                Err(TxDecodeError::Truncated),
+                "a short read must fail, never zero-fill"
+            );
+        }
+    }
+
+    #[test]
+    fn non_canonical_bool_is_refused() {
+        let mut b = PosTransaction::Delegate {
+            delegator: 1,
+            validator: 2,
+            amount_sat: 3,
+            eligible: true,
+        }
+        .canonical_bytes();
+        *b.last_mut().unwrap() = 2;
+        assert_eq!(PosTransaction::from_canonical_bytes(&b), Err(TxDecodeError::NotCanonical(2)));
+    }
+
+    #[test]
+    fn unknown_tag_is_refused() {
+        assert_eq!(
+            PosTransaction::from_canonical_bytes(&[0xFF]),
+            Err(TxDecodeError::UnknownTag(0xFF))
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {

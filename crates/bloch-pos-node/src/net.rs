@@ -36,11 +36,16 @@ use bloch_pos_committee::header::BlockEnvelope;
 pub const FRAME_BLOCK: u8 = 0x01;
 pub const FRAME_ATT: u8 = 0x02;
 pub const FRAME_GET_BLOCKS: u8 = 0x03;
+/// Payload is one transaction's canonical bytes — the same bytes a block body
+/// carries, so what a peer gossips and what a proposer commits to are the same
+/// object and no second encoding exists to disagree with the first.
+pub const FRAME_TX: u8 = 0x04;
 
 /// What the engine receives from the mesh.
 pub enum NetEvent {
     Block(BlockEnvelope),
     Attestation(Attestation),
+    Transaction(bloch_pos_committee::transition::PosTransaction),
 }
 
 pub struct Net {
@@ -75,6 +80,20 @@ pub fn get_blocks_frame(after_slot: u64) -> Vec<u8> {
     f
 }
 
+/// Send one transaction to a running node and disconnect.
+///
+/// The node gossips it onward, so any peer is an equally good entry point.
+/// There is no acknowledgement: this transport has no request/response shape,
+/// and inventing one for a devnet injector would be inventing wire protocol.
+/// Confirmation is seeing the transaction land in a block.
+pub fn send_transaction(addr: &str, tx_bytes: &[u8]) -> std::io::Result<()> {
+    let mut sock = TcpStream::connect(addr)?;
+    let mut frame = Vec::with_capacity(1 + tx_bytes.len());
+    frame.push(FRAME_TX);
+    frame.extend_from_slice(tx_bytes);
+    write_frame(&mut sock, &frame)
+}
+
 fn write_frame(sock: &mut TcpStream, frame: &[u8]) -> std::io::Result<()> {
     let mut buf = Vec::with_capacity(4 + frame.len());
     buf.extend_from_slice(&(frame.len() as u32).to_le_bytes());
@@ -106,6 +125,14 @@ fn decode_event(frame: &[u8]) -> Option<NetEvent> {
             let att = crate::codec::decode_attestation(&mut r).ok()?;
             r.finish().ok()?;
             Some(NetEvent::Attestation(att))
+        }
+        &FRAME_TX => {
+            // Decoding here, at the edge, is deliberate: a frame that does not
+            // decode never reaches the mempool, so a proposer cannot be handed
+            // bytes it would later commit to and fail to reproduce.
+            bloch_pos_committee::transition::PosTransaction::from_canonical_bytes(&frame[1..])
+                .ok()
+                .map(NetEvent::Transaction)
         }
         _ => None,
     }

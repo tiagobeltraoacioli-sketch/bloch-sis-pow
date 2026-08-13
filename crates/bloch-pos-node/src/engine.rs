@@ -100,6 +100,32 @@ fn now_ms() -> u64 {
 
 const NO_TXS: [PosTransaction; 0] = [];
 
+/// Ceiling on mempool entries. Not a policy — a bound, so an unauthenticated
+/// devnet transport cannot turn into unbounded memory. Real admission control
+/// (fees, per-sender limits, eviction by price) is `gossip.rs` work.
+const MEMPOOL_MAX: usize = 4_096;
+
+/// Transactions a proposal will carry at most, independent of the consensus
+/// byte cap it is also checked against.
+const MAX_TXS_PER_BLOCK: usize = 256;
+
+/// Decode a block body's transactions.
+///
+/// A receiver MUST recompute the post-state from the same transactions the
+/// proposer committed to. Passing an empty slice here — which is what this
+/// node did until now — means every block carrying transactions either
+/// diverges or, since the body_root check landed, is rejected outright.
+fn body_transactions(env: &BlockEnvelope) -> Result<Vec<PosTransaction>, String> {
+    env.body
+        .transactions
+        .iter()
+        .map(|bytes| {
+            PosTransaction::from_canonical_bytes(bytes)
+                .map_err(|e| format!("undecodable transaction in block body: {e}"))
+        })
+        .collect()
+}
+
 struct Engine {
     manifest: Manifest,
     state: CommittedState,
@@ -116,6 +142,15 @@ struct Engine {
     canonical: BTreeSet<[u8; 32]>,
     /// Attestation pool, keyed by content so duplicates collapse.
     pool: BTreeMap<(u32, [u8; 32]), Attestation>,
+    /// Transactions waiting for a block, keyed by canonical bytes so a
+    /// duplicate gossip collapses instead of being included twice.
+    ///
+    /// Devnet mempool, and the limitations are the point: no fee ordering (it
+    /// is insertion-ordered), no per-sender limit, no eviction beyond
+    /// `MEMPOOL_MAX`, and admission checks only that the bytes decode. A
+    /// public network needs all four; `gossip.rs` in the pure crate is where
+    /// that belongs and it is still not wired.
+    mempool: BTreeMap<Vec<u8>, PosTransaction>,
     store: Store,
     net: net::Net,
     head_slot: Arc<AtomicU64>,
@@ -370,8 +405,15 @@ impl Engine {
         // The post-state, from the SAME function validation runs. The probe
         // verifier only skips signature checks (the state does not depend on
         // them); the block still faces the real verifier in apply_block.
+        // What this block will carry. Selected before the post-state, because
+        // the post-state must be computed over exactly these — the header
+        // commits to their body_root and every verifier recomputes from them.
+        let txs = self.select_transactions();
+        let tx_bytes: Vec<Vec<u8>> = txs.iter().map(PosTransaction::canonical_bytes).collect();
+        header.body_root = derive::body_root(&tx_bytes);
+
         let probe = ProposalEnvelope { header: header.clone(), proposer_sig: Vec::new() };
-        let post = match self.tr_probe.compute_post_state(&self.state, &probe, &atts, &NO_TXS) {
+        let post = match self.tr_probe.compute_post_state(&self.state, &probe, &atts, &txs) {
             Ok(p) => p,
             Err(err) => {
                 eprintln!("[slot {slot}] produce refused: {err:?}");
@@ -384,13 +426,15 @@ impl Engine {
         let env = BlockEnvelope {
             header,
             proposer_sig,
-            body: Body { transactions: Vec::new(), attestations: atts },
+            body: Body { transactions: tx_bytes, attestations: atts },
         };
         let id = env.block_id();
         println!(
-            "[slot {slot}] proposing block {} ({} attestations)",
+            "[slot {slot}] proposing block {} ({} attestations, {} txs, mempool {})",
             crate::codec::hex8(id.as_bytes()),
-            env.body.attestations.len()
+            env.body.attestations.len(),
+            env.body.transactions.len(),
+            self.mempool.len()
         );
         self.ingest(env);
         // h28080: a producer whose own node did not adopt its block is a
@@ -422,10 +466,14 @@ impl Engine {
             eprintln!("reject {}: body/attestation commitment mismatch", crate::codec::hex8(&id));
             return;
         }
-        if !env.body.transactions.is_empty() {
-            // The devnet's tx codec does not exist yet; a block carrying
-            // transactions is from a different build. Fail closed.
-            eprintln!("reject {}: transactions not supported at this milestone", crate::codec::hex8(&id));
+        // A block carrying transactions used to be rejected here, because the
+        // node had no tx codec and failing closed was the honest response. The
+        // codec exists now (`PosTransaction::from_canonical_bytes`), so the
+        // check that replaces it is decodability: bytes this build cannot read
+        // must not reach the transition, since the proposer's post-state would
+        // then be unreproducible.
+        if let Err(e) = body_transactions(&env) {
+            eprintln!("reject {}: {e}", crate::codec::hex8(&id));
             return;
         }
         if env.header.slot == 0 {
@@ -530,13 +578,63 @@ impl Engine {
         }
     }
 
+    /// Admit a transaction to the mempool and pass it on.
+    ///
+    /// Admission is deliberately thin here — the bytes already decoded at the
+    /// network edge, and that is the whole check. What is missing is named in
+    /// the `mempool` field's doc rather than half-built: no fee floor, no
+    /// per-sender accounting, no replacement policy. Re-broadcast only on
+    /// first sight, so a transaction traverses the mesh once instead of
+    /// echoing between every pair of peers.
+    fn on_transaction(&mut self, tx: PosTransaction) {
+        let key = tx.canonical_bytes();
+        if self.mempool.contains_key(&key) || self.mempool.len() >= MEMPOOL_MAX {
+            return;
+        }
+        let mut frame = vec![net::FRAME_TX];
+        frame.extend_from_slice(&key);
+        self.mempool.insert(key, tx);
+        self.net.broadcast(frame);
+    }
+
+    /// Transactions for the block this node is about to propose.
+    ///
+    /// Insertion order, bounded by both [`MAX_TXS_PER_BLOCK`] and the
+    /// consensus byte cap. Insertion order is not a fee market: a real
+    /// proposer sorts by what the transaction pays, and doing that here before
+    /// transfers carry a value format would be inventing an ordering over a
+    /// field nobody sets yet.
+    fn select_transactions(&self) -> Vec<PosTransaction> {
+        let mut out = Vec::new();
+        let mut bytes = 0u64;
+        for (encoded, tx) in self.mempool.iter() {
+            if out.len() >= MAX_TXS_PER_BLOCK {
+                break;
+            }
+            let n = encoded.len() as u64;
+            if bytes + n > bloch_pos_committee::fee_market::MAX_BLOCK_TX_BYTES {
+                break;
+            }
+            bytes += n;
+            out.push(tx.clone());
+        }
+        out
+    }
+
     /// Apply one block that extends the current head. True on success.
     fn apply_canonical(&mut self, env: &BlockEnvelope) -> bool {
         let id = env.block_id();
         let envelope =
             ProposalEnvelope { header: env.header.clone(), proposer_sig: env.proposer_sig.clone() };
         let before = self.state.finality();
-        match self.tr.apply_block(&self.state, &envelope, &env.body.attestations, &NO_TXS) {
+        let txs = match body_transactions(env) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("apply refused: {e}");
+                return false;
+            }
+        };
+        match self.tr.apply_block(&self.state, &envelope, &env.body.attestations, &txs) {
             Ok(post) => {
                 self.state = post;
                 self.canonical.insert(*id.as_bytes());
@@ -545,6 +643,11 @@ impl Engine {
                 self.last_applied_ms = now_ms();
                 for a in &env.body.attestations {
                     self.pool.remove(&(a.validator, a.data.signing_root()));
+                }
+                // Included is included — drop them from the mempool by the
+                // same bytes they were keyed under.
+                for encoded in &env.body.transactions {
+                    self.mempool.remove(encoded);
                 }
                 let cur_e = epoch_of(self.state.slot());
                 self.pool.retain(|_, a| epoch_of(a.data.slot) >= cur_e);
@@ -616,9 +719,11 @@ impl Engine {
                 header: env.header.clone(),
                 proposer_sig: env.proposer_sig.clone(),
             };
+            let txs = body_transactions(env)
+                .expect("a canonical block's body decoded when it was applied");
             st = self
                 .tr
-                .apply_block(&st, &envelope, &env.body.attestations, &NO_TXS)
+                .apply_block(&st, &envelope, &env.body.attestations, &txs)
                 .expect("canonical prefix replay cannot fail (it applied before)");
         }
         for env in &branch {
@@ -626,7 +731,14 @@ impl Engine {
                 header: env.header.clone(),
                 proposer_sig: env.proposer_sig.clone(),
             };
-            match self.tr.apply_block(&st, &envelope, &env.body.attestations, &NO_TXS) {
+            let txs = match body_transactions(env) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("reorg candidate rejected at slot {}: {e}", env.header.slot);
+                    return false;
+                }
+            };
+            match self.tr.apply_block(&st, &envelope, &env.body.attestations, &txs) {
                 Ok(post) => st = post,
                 Err(err) => {
                     eprintln!(
@@ -768,6 +880,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         chain: vec![(0, genesis_id)],
         canonical: BTreeSet::from([*genesis_id.as_bytes()]),
         pool: BTreeMap::new(),
+        mempool: BTreeMap::new(),
         store,
         net,
         head_slot,
@@ -947,6 +1060,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
                     match ev {
                         NetEvent::Block(env) => engine.ingest(env),
                         NetEvent::Attestation(att) => engine.on_attestation(att, wall_epoch),
+                        NetEvent::Transaction(tx) => engine.on_transaction(tx),
                     }
                 }
             }

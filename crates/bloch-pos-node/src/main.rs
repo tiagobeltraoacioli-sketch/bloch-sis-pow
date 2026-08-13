@@ -73,6 +73,7 @@ fn main() {
         }
         Some("keygen") => keygen(&args[1..]),
         Some("genesis") => genesis_cmd(&args[1..]),
+        Some("submit-tx") => submit_tx(&args[1..]),
         Some("run") => run_cmd(&args[1..]),
         Some(other) => {
             eprintln!("{NAME}: unknown command `{other}` (see --help)");
@@ -92,6 +93,10 @@ fn print_help() {
                Generate a THROWAWAY devnet validator keystore (hybrid\n\
                ML-DSA-65‖Falcon-1024 + RANDAO seed) at <dir>/validator.key.\n\
                Devnet only; production keys follow BLOCH-GENESIS-KEYS.md.\n\
+           bloch-pos submit-tx --to <host:port> [--inputs n] [--tx-bytes n]\n\
+                               [--tip millisat-per-gas]\n\
+               Send one Transfer to a running node, which gossips it on.\n\
+               No acknowledgement: confirmation is seeing it in a block.\n\
            bloch-pos genesis --keys <dir1,dir2,...> --out <file>\n\
                              [--slot-ms <ms>] [--start-in <secs>]\n\
                Build a devnet genesis manifest from the keystores' public\n\
@@ -118,6 +123,45 @@ fn print_help() {
          \n\
          The integration plan is docs/specs/BLOCH-POS-NODE-INTEGRATION.md."
     );
+}
+
+/// `submit-tx --to <host:port> [--inputs n] [--tx-bytes n] [--tip n]`
+///
+/// Builds one `Transfer` and hands it to a node, which gossips it onward.
+/// Transfer is the only variant this emits on purpose: `Deposit` and
+/// `Delegate` describe validator-set changes that a devnet's genesis set does
+/// not need and that would want key material to be meaningful, and evidence
+/// cannot travel this way at all — its canonical encoding is one-way (see
+/// `PosTransaction::from_canonical_bytes`).
+fn submit_tx(args: &[String]) {
+    let Some(to) = arg_value(args, "--to") else {
+        eprintln!("submit-tx: --to <host:port> is required");
+        exit(2);
+    };
+    let num = |name: &str, default: u128| -> u128 {
+        arg_value(args, name).and_then(|s| s.parse().ok()).unwrap_or(default)
+    };
+    let tx = bloch_pos_committee::transition::PosTransaction::Transfer {
+        inputs: num("--inputs", 1) as u32,
+        tx_bytes: num("--tx-bytes", 250) as u64,
+        tip_millisat_per_gas: num("--tip", 1_000),
+    };
+    let bytes = tx.canonical_bytes();
+    match bloch_pos_node_net_send(&to, &bytes) {
+        Ok(()) => println!(
+            "submitted {} bytes to {to} — it lands in a block or it does not; \
+             this transport does not acknowledge",
+            bytes.len()
+        ),
+        Err(e) => {
+            eprintln!("submit-tx: {e}");
+            exit(1);
+        }
+    }
+}
+
+fn bloch_pos_node_net_send(addr: &str, bytes: &[u8]) -> std::io::Result<()> {
+    net::send_transaction(addr, bytes)
 }
 
 fn arg_value(args: &[String], name: &str) -> Option<String> {
