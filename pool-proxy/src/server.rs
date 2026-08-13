@@ -125,6 +125,11 @@ impl ProxyServer {
 
         let mut next_id: u64 = 1;
 
+        // OUTSIDE the accept loop, which is the whole fix: one set of templates
+        // for the pool. Declared inside, each connection would build its own
+        // and share nothing — exactly what the per-worker refresh already did.
+        let merged_cache = std::sync::Arc::new(crate::merged_engine::TemplateCache::new());
+
         loop {
             tokio::select! {
                 _ = &mut shutdown => {
@@ -184,10 +189,11 @@ impl ProxyServer {
                         };
                         let refresh = std::time::Duration::from_secs(m.refresh_secs);
                         let diff = m.share_diff;
+                        let cache = merged_cache.clone();
                         tokio::spawn(async move {
                             let _guard = WorkerGuard::new(metrics.clone());
                             match crate::merged_serve::serve_merged(
-                                stream, id.0, node, btc, mcfg, diff, refresh,
+                                stream, id.0, node, btc, mcfg, diff, refresh, cache,
                             ).await {
                                 Ok(()) => log::info!("merged worker {} closed", id),
                                 Err(e) => log::info!("merged worker {} closed: {}", id, e),

@@ -5,7 +5,7 @@
 //! ZERO dependency on bloch-crypto (a design boundary). A test folds the coinbase
 //! branch to a full merkle root; the node-side `verify` is the authority.
 //!
-//! End-to-end (see legacy/MERGED-MINING.md):
+//! End-to-end (see docs/MERGED-MINING.md):
 //!   1. Bloch node `getblocktemplate` → the Bloch block identity `aux_block_hash`
 //!      to commit + Bloch `bits` (SCAFFOLD: needs the node to expose the hash);
 //!   2. BTC node `getblocktemplate` → the parent template ([`crate::btc_rpc`]);
@@ -274,6 +274,14 @@ pub enum MergedWin {
     /// Meets Bitcoin's target: a real BTC block AND a Bloch block — submit the
     /// BTC block to bitcoind and the AuxPoW to the Bloch node.
     BtcAndBloch,
+    /// Meets Bitcoin's target but NOT Bloch's — relay the BTC block only.
+    ///
+    /// On mainnet this is unreachable (Bitcoin's target is orders of magnitude
+    /// harder than Bloch's, so meeting it implies meeting Bloch's). On regtest —
+    /// where the parent's target is trivial — it is the COMMON case, and the
+    /// distinction matters: submitting such a share to the Bloch node returns
+    /// `InsufficientPow` and burns an RPC round-trip per share.
+    Btc,
     /// Meets Bloch's (looser) target but not Bitcoin's: a Bloch block via AuxPoW.
     Bloch,
     /// Meets the worker's vardiff target only: a valid share (accounting).
@@ -290,7 +298,7 @@ pub struct MergedClassification {
     /// Double-SHA256 of the reconstructed 80-byte parent Bitcoin header.
     pub hash: [u8; 32],
     /// The AuxPoW blob (`AuxPow::from_bytes` wire) — `Some` iff `win` is
-    /// `Bloch` or `BtcAndBloch`.
+    /// `Bloch`, `Btc` or `BtcAndBloch`.
     pub auxpow_blob: Option<Vec<u8>>,
 }
 
@@ -343,19 +351,20 @@ pub fn classify_merged_share(
     let meets_bloch = meets(&hash, &bits_to_target(job.bloch_bits), true);
     let meets_worker = meets(&hash, worker_target, true);
 
-    let win = if meets_btc {
-        MergedWin::BtcAndBloch
-    } else if meets_bloch {
-        MergedWin::Bloch
-    } else if meets_worker {
-        MergedWin::Share
-    } else {
-        MergedWin::Reject
+    // The two targets are INDEPENDENT: a parent hash can meet one, both, or
+    // neither. Never infer one from the other (see MergedWin::Btc).
+    let win = match (meets_btc, meets_bloch) {
+        (true, true) => MergedWin::BtcAndBloch,
+        (true, false) => MergedWin::Btc,
+        (false, true) => MergedWin::Bloch,
+        (false, false) if meets_worker => MergedWin::Share,
+        (false, false) => MergedWin::Reject,
     };
 
-    // Any Bloch-target win yields the AuxPoW the node accepts: the solved parent
-    // header + the exact coinbase the miner built + the job's coinbase branch.
-    let auxpow_blob = matches!(win, MergedWin::BtcAndBloch | MergedWin::Bloch)
+    // Any win yields the blob: the Bloch side needs it as the AuxPoW proof, and
+    // the BTC-only relay reconstructs the parent header + coinbase from the same
+    // bytes.
+    let auxpow_blob = matches!(win, MergedWin::BtcAndBloch | MergedWin::Btc | MergedWin::Bloch)
         .then(|| assemble_auxpow_for_win(&header, &coinbase, &job.merkle_branch));
 
     Ok(MergedClassification { win, hash, auxpow_blob })

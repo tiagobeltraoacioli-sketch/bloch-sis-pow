@@ -197,20 +197,103 @@ pub fn decide_submit(c: &MergedClassification) -> SubmitAction {
             Some(b) => SubmitAction::BtcAndBloch { auxpow_hex: hex::encode(b) },
             None => SubmitAction::Share,
         },
+        // RECONSTRUCTED 2026-08-13, and not the original. This arm existed
+        // only in an uncommitted working tree that was destroyed; what it did
+        // is not recoverable, so this is the most conservative reading of the
+        // variant's own documentation: meets Bitcoin's target but NOT Bloch's.
+        //
+        // Counted as a share, and nothing is submitted to the Bloch node —
+        // the safe direction, because a BTC-only win is by definition not a
+        // Bloch block and submitting one would be wrong. Any BTC relay this
+        // arm may once have performed is NOT wired here.
+        //
+        // Reachability bounds the cost: on mainnet Bitcoin's target is orders
+        // of magnitude harder than Bloch's, so meeting it implies meeting
+        // Bloch's and this arm is unreachable. On regtest it is the common
+        // case, so rehearsals lose the BTC relay until this is rebuilt
+        // deliberately.
+        MergedWin::Btc => SubmitAction::Share,
     }
 }
 
-/// Start a merged round: pull both templates and build the job to serve.
-/// (Async orchestration; the pure build is [`build_round_job`].)
+
+/// The two upstream templates, shared by every worker.
+///
+/// # Why this exists
+///
+/// The templates are a property of the chain tip, not of who is asking: at any
+/// moment there is one candidate Bloch block and one Bitcoin template, and
+/// every connected miner should be working on them. This serve path used to
+/// pull both **per connection** — each worker owned an `RpcClient` and its own
+/// refresh ticker — so N miners meant N independent `createauxblock` calls per
+/// refresh interval, each opening a fresh TCP connection because the RPC
+/// client sends `Connection: close`.
+///
+/// Fine with two miners, collapses with twenty. On 2026-08-13 the live pool
+/// held 88 concurrent RPC connections against a two-core node, every call
+/// timed out at 10 s, no worker received a job, and a 100+ TH/s ASIC sat idle
+/// waiting for work the node was answering in 34 ms when asked once. The node
+/// was never the problem; the fan-out was.
+pub struct TemplateCache {
+    inner: tokio::sync::Mutex<Option<(std::time::Instant, AuxBlockInfo, BtcTemplate)>>,
+}
+
+impl Default for TemplateCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TemplateCache {
+    pub fn new() -> Self {
+        Self { inner: tokio::sync::Mutex::new(None) }
+    }
+
+    /// Templates no older than `ttl`, fetching once if cold or stale.
+    ///
+    /// The freshness re-check after taking the lock is what does the work:
+    /// callers queued behind an in-flight fetch find it already satisfied and
+    /// return it, turning N simultaneous refreshes into one upstream call.
+    pub async fn get(
+        &self,
+        node: &RpcClient,
+        btc: &BtcRpcClient,
+        cfg: &MergedConfig,
+        ttl: std::time::Duration,
+    ) -> Result<(AuxBlockInfo, BtcTemplate), PoolError> {
+        let mut slot = self.inner.lock().await;
+        if let Some((at, aux, tmpl)) = slot.as_ref() {
+            if at.elapsed() < ttl {
+                return Ok((aux.clone(), tmpl.clone()));
+            }
+        }
+        // The lock is held across the fetch on purpose: serialising upstream
+        // calls is the entire point. A failed fetch leaves the previous entry
+        // in place, so a transient node error costs one stale round rather
+        // than starting a stampede.
+        let aux = node.create_aux_block(&cfg.pool_bloch_addr).await?;
+        let tmpl = btc.get_block_template().await?;
+        *slot = Some((std::time::Instant::now(), aux.clone(), tmpl.clone()));
+        Ok((aux, tmpl))
+    }
+}
+
+/// Start a merged round: take the shared templates and build this worker's job.
+///
+/// `job_id` and the extranonce stay per-worker — two miners must never search
+/// the same space — while the templates under them are shared. That split is
+/// the design: what is common to the tip is fetched once, what must differ per
+/// miner is built per miner.
 pub async fn create_round(
     node: &RpcClient,
     btc: &BtcRpcClient,
     cfg: &MergedConfig,
+    cache: &TemplateCache,
+    ttl: std::time::Duration,
     job_id: String,
     extranonce_len: usize,
 ) -> Result<(AuxBlockInfo, MergedJob), PoolError> {
-    let aux = node.create_aux_block(&cfg.pool_bloch_addr).await?;
-    let tmpl = btc.get_block_template().await?;
+    let (aux, tmpl) = cache.get(node, btc, cfg, ttl).await?;
     let job = build_round_job(job_id, &aux, &tmpl, &cfg.btc_payout_script, &cfg.coinbase_tag, extranonce_len);
     Ok((aux, job))
 }
@@ -356,6 +439,11 @@ mod tests {
             }
             MergedWin::Share => assert_eq!(action, SubmitAction::Share),
             MergedWin::Reject => assert_eq!(action, SubmitAction::Nothing),
+            // Matches the reconstructed arm in `decide_submit`: a BTC-only win
+            // is counted as a share and nothing goes to the Bloch node. This
+            // asserts the safe property rather than the original behaviour,
+            // which was lost with the working tree it lived in.
+            MergedWin::Btc => assert_eq!(action, SubmitAction::Share),
         }
     }
 

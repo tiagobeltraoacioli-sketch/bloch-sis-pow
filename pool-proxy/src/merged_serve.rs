@@ -192,6 +192,7 @@ pub async fn serve_merged(
     cfg: MergedConfig,
     share_diff: f64,
     refresh: Duration,
+    cache: std::sync::Arc<crate::merged_engine::TemplateCache>,
 ) -> Result<(), PoolError> {
     let _ = stream.set_nodelay(true);
     let (rd, mut wr) = stream.into_split();
@@ -207,7 +208,7 @@ pub async fn serve_merged(
             // Refresh the round (new BTC template + Bloch candidate) and re-notify.
             _ = ticker.tick() => {
                 if worker.is_authorized() {
-                    if let Err(e) = start_round(&node, &btc, &cfg, &mut worker, &mut wr, &mut round_ctr).await {
+                    if let Err(e) = start_round(&node, &btc, &cfg, &cache, refresh, &mut worker, &mut wr, &mut round_ctr).await {
                         log::warn!("merged: round refresh failed: {e}");
                     }
                 }
@@ -220,7 +221,7 @@ pub async fn serve_merged(
                         for l in &lines { send_line(&mut wr, l).await?; }
                         // Kick the first round right after authorize.
                         if worker.is_authorized() && !worker.has_round() {
-                            if let Err(e) = start_round(&node, &btc, &cfg, &mut worker, &mut wr, &mut round_ctr).await {
+                            if let Err(e) = start_round(&node, &btc, &cfg, &cache, refresh, &mut worker, &mut wr, &mut round_ctr).await {
                                 log::warn!("merged: initial round failed: {e}");
                             }
                         }
@@ -247,6 +248,8 @@ async fn start_round(
     node: &RpcClient,
     btc: &BtcRpcClient,
     cfg: &MergedConfig,
+    cache: &crate::merged_engine::TemplateCache,
+    ttl: Duration,
     worker: &mut MergedWorker,
     wr: &mut (impl AsyncWriteExt + Unpin),
     round_ctr: &mut u64,
@@ -254,7 +257,7 @@ async fn start_round(
     *round_ctr += 1;
     let job_id = format!("m{round_ctr:x}");
     let (aux, job) =
-        create_round(node, btc, cfg, job_id, MergedWorker::extranonce_total_len()).await?;
+        create_round(node, btc, cfg, cache, ttl, job_id, MergedWorker::extranonce_total_len()).await?;
     worker.set_round(&aux, job);
     send_line(wr, &worker.set_difficulty_line()).await?;
     if let Some(n) = worker.notify_line(true) {
