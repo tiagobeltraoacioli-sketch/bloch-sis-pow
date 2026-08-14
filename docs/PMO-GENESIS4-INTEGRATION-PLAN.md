@@ -2,6 +2,34 @@
 
 # Genesis-4 — Integration Plan for the Four Remaining Items
 
+> **Status as of 2026-08-14 — three of the four items have shipped.** This plan
+> was written on 2026-08-13, before Genesis-4 went live at 21:31:19 UTC that
+> day. Read it as the engineering record of how the launch was sequenced, not
+> as a list of outstanding work.
+>
+> | Item | Status |
+> |---|---|
+> | 1. PoS RPC | **Shipped.** `crates/bloch-pos-node/src/rpc.rs`; served on `--rpc-bind`:`--rpc-port`, default `127.0.0.1:16310`. Public read at `https://posternlabs.com/g4rpc`. |
+> | 2. `Transfer` with value | **Shipped.** `PosTransaction::Transfer` carries real `inputs` and `outputs` (`crates/bloch-pos-committee/src/transition.rs:242-262`). |
+> | 3. Carryover ingestion at genesis | **Shipped and executed.** `Manifest::ingest_carryover` (`crates/bloch-pos-node/src/genesis.rs`); the chain opened with 452,726 carried outputs totalling 18,146,400,000 BLOCH, measured at Genesis-3 chain height 39,918. |
+> | 4. Production network | **NOT shipped.** The live fleet still runs `Transport::Devnet` — a point-to-point TCP full mesh with a fixed peer list, no discovery and no authentication, which is why a third party cannot yet join the network. A libp2p module exists in-tree; it is not what the fleet runs. |
+>
+> Two things this plan does not cover that are now the binding limitations, and
+> that anyone reading it for current status must know:
+>
+> - **`Deposit` and `Delegate` are refused at every node's mempool**
+>   (`crates/bloch-pos-node/src/engine.rs:1900-1906`) because bonding is not yet
+>   funded from the UTXO set. Combined with item 4, there is **no permissionless
+>   path to becoming a validator today.**
+> - **All 64 Genesis-4 validators are operated by a single entity**, 93.94% of
+>   the carryover sits at one address, and 56,046,829,380 of the 57,146,400,000
+>   BLOCH issued at slot 0 is held by the founder (27.04% of the 100 B cap) and
+>   the Foundation (a further 29.00%). One operator can halt the chain and one
+>   holder can outvote every other. The Nakamoto coefficient is 1.
+>
+> Where this document says "devnet" it means the **transport**, which is
+> accurate. The chain, the network and the binary are **mainnet**.
+
 ```
 Document:   PMO-GENESIS4-INTEGRATION-PLAN
 Status:     PLAN — for DEV assignment; no production code written by this pass

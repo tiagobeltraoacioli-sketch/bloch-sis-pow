@@ -1,7 +1,9 @@
 # ADR-028: Tokenomics V2 Activation
 
 **Sprint:** 2.2 (urgent — pre-mainnet activation gate)
-**Status:** Accepted
+**Status:** **SUPERSEDED** — Superseded twice: its emission curve by ADR-035 (which itself never activated — see its status), and the whole tokenomics model by **V4** (`crates/bloch-pos-committee/src/tokenomics_v4.rs`). V2's 21 B nominal with a perpetual 100 BLOCH/block tail is replaced by a **hard cap of 100,000,000,000 BLCH with no tail**. The V2 activation height this ADR gates on belongs to a chain that stopped at 39,918. The chain this ADR governs — Genesis-3, proof of work — stopped permanently at height **39,918** on 2026-08-13. The live chain is **Genesis-4, proof of stake** (30 s slots, 32-slot epochs, finality by epoch, hybrid ML-DSA-65 ‖ Falcon-1024, no mining). The decision, context and consequences below are **not** rewritten: this is a decision log and what was decided, when, is the record. Read it as history, not as guidance.
+
+*Original status line, retained:* **Status:** Accepted
 **Date:** 2026-05-01
 **Author:** BLOCH Founder
 **Related:** ADR-010 (Tokenomics emission curve), ADR-010-A (Founder premine), ADR-010-Addendum-1 (Oracle pool), ADR-006 (Block time), ADR-018 (Oracle network)

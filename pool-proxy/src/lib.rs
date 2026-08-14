@@ -1,4 +1,12 @@
 //! bloch-pool-proxy — smart Stratum V1 proxy (extranonce partitioning).
+//!
+//! HISTORICAL — GENESIS-3. THERE IS NOTHING TO PROXY. This proxy sits between
+//! miners and the proof-of-work chain, which stopped permanently at height
+//! 39,918 on 2026-08-13. The live chain is **Genesis-4, proof of stake** (30 s
+//! slots, 32-slot epochs, finality by epoch): blocks come from a proposer
+//! schedule over staked validators, so there is no stratum, no hashrate, no
+//! share accounting and no merged mining anywhere in it. Kept as part of the
+//! Genesis-3 record, alongside `../pool/`. It is not what runs.
 pub mod types;
 pub mod codec;
 pub mod downstream;

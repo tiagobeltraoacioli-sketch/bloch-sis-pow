@@ -2,62 +2,86 @@
 
 # Bloch (BLCH) — Exchange Integration Specification
 
+> **The chain you integrate against is Genesis-4, proof of stake.** Genesis-3,
+> the proof-of-work chain, **stopped permanently at height 39,918 on
+> 2026-08-13**. Genesis-4 has been live since **21:31:19 UTC on 2026-08-13**:
+> 30 s slots, 32-slot epochs, finality by epoch. **Sections §2–§8 and §12–§13 of
+> this document are a measurement record of the halted Genesis-3 chain**, kept
+> because Genesis-4's opening ledger is derived from it and because the address
+> format, key material and balances carried across unchanged. They are not what
+> runs. The sections that describe the live chain are **§0, §1, §5, §9, §10 and
+> §11**.
+
 ```
 Document:   BLOCH-EXCHANGE-INTEGRATION
 Audience:   Exchange integration, custody and risk teams
 Status:     Partner document — NOT for publication. Deliver as a file.
-Measured:   2026-08-13, against the live Genesis-3 node
-Endpoints:  https://g2rpc.posternpool.com/  (direct node, read+write)
-            https://blochl1.com/rpc         (read-only public proxy, same node)
-Source:     src/rpc/mod.rs, crates/bloch-crypto/, crates/bloch-pos-committee/
+Measured:   Genesis-3 sections measured 2026-08-13 against the then-live
+            Genesis-3 node, before the halt. Genesis-4 sections revised
+            2026-08-14 against the source of the running node.
+Endpoints:  https://posternlabs.com/g4rpc   (Genesis-4, live, public read)
+            https://g2rpc.posternpool.com/  (Genesis-3 — chain halted)
+            https://blochl1.com/rpc         (Genesis-3 — chain halted)
+Source:     crates/bloch-pos-node/, crates/bloch-pos-committee/,
+            crates/bloch-crypto/ (Genesis-3), src/rpc/mod.rs (Genesis-3)
 ```
 
-Every Genesis-3 fact in this document was produced by calling the live node and
-recording what came back, not by transcribing an existing document. Where the
-live node disagrees with `docs/API.md` or `docs/openapi.yaml`, the live node
-wins and the disagreement is recorded in **§12**. Section **§13** lists what was
-*not* verified, so you know the edges of this document's authority.
+Every Genesis-3 fact in this document was produced by calling that node while it
+was still producing blocks, not by transcribing an existing document. Where it
+disagreed with `docs/API.md` or `docs/openapi.yaml`, it won, and the
+disagreement is recorded in **§12**. Section **§13** lists what was *not*
+verified, so you know the edges of this document's authority.
 
 ---
 
 ## 0. Read this first — three things that will change your plan
 
-**0.1 — The chain you would integrate against today stops in about two days.**
+**0.1 — Genesis-3 is over. Do not build against it.**
 
-Genesis-3 halts by consensus rule at **chain height 50,000**
-(`GENESIS3_TERMINAL_HEIGHT`, `crates/bloch-crypto/src/core/mod.rs:444`). Blocks
-above it are rejected outright (`src/main.rs:2537`). Measured at the time of
-writing:
+Genesis-3 stopped permanently at **chain height 39,918** on 2026-08-13. It
+produces no further blocks, and every RPC method in **§4** is a record of a
+chain that no longer advances. What carried forward is the *address format*, the
+*key material* and the *balances*, which crossed into Genesis-4 through the
+snapshot (**§10**).
 
-| Quantity | Measured value |
+| Quantity | Value |
 |---|---|
-| Selected-chain tip height (`getdaginfo → tip_height`) | **39,793** |
-| Terminal height | 50,000 |
-| Blocks remaining | 10,207 |
-| Measured mean block time | 20.04 s (`getchainstats`) |
-| Protocol target block time | 30 s |
-| **Implied time to halt** | **≈ 2.4 days** at the measured rate; ≈ 3.5 days if it relaxes to target |
+| Genesis-3 terminal chain height | **39,918** (`CARRYOVER_MEASURED_HEIGHT`, `crates/bloch-pos-committee/src/tokenomics_v4.rs:222`) |
+| Genesis-3 terminal block count (DAG) | 50,690 |
+| Carried outputs | **452,726** (`CARRYOVER_MEASURED_UTXOS`, same file:224) |
+| Genesis-4 start | **21:31:19 UTC, 2026-08-13** |
 
-Building a Genesis-3 deposit/withdrawal integration is therefore work with a
-two-day shelf life. What survives the halt is the *address format*, the *key
-material*, and the *balances* — those carry into Genesis-4 through the snapshot
-(**§10**). What does not survive is every RPC method in **§4**.
+Note the two numbers in the first two rows: **39,918 is a chain height and
+50,690 is a DAG block count, and they are not the same measurement.** Genesis-3
+was a DAG, so more blocks existed than the selected chain was tall. Older
+revisions of this document and of `tokenomics_v4.rs` quoted "height 43,172",
+which was in fact a *block count* mislabelled as a height — the chain was never
+43,172 blocks tall. The doc comment on `CARRYOVER_TOTAL_BLOCH`
+(`tokenomics_v4.rs:164-179`) records the error rather than quietly fixing it.
+Both measurements are now stated separately everywhere they appear.
 
-Our recommendation, stated plainly: **do not build a Genesis-3 integration.**
-Read §4 to understand the data model and to test against something real, and
-build against Genesis-4 when its RPC exists. §11 names exactly what is missing
-before that is possible.
+Our recommendation, stated plainly: **build against Genesis-4.** §11 states what
+exists on it today and what does not.
 
-**0.2 — `confirmations` from this node is not a confirmation count, and it is
-wrong in the dangerous direction.** It over-reports by roughly 10,700, so every
-transaction looks final the moment it is mined. Do not gate deposits on it. Full
-measurement and the correct substitute in **§5**.
+**0.2 — Under Genesis-4 there is no confirmation count, and asking for one is
+the wrong question.** Depth is not security on a chain with no difficulty: there
+is no work to price a reorg in. The guarantee is **Casper finality**, and the
+node hands you exactly one boolean for it. Credit on that boolean and on nothing
+else. **§5** states the rule and the code that implements it.
 
 **0.3 — No HSM on the market can hold these keys.** BLCH signing is
-ML-DSA-65 ‖ Falcon-1024. If you custody BLCH, you custody it with a software
-key. This is a consequence of being genuinely post-quantum, not a defect, but
-your custody team will hit it on day one. **§9** states the position without
-softening it.
+ML-DSA-65 ‖ Falcon-1024, on Genesis-4 as it was on Genesis-3. If you custody
+BLCH, you custody it with a software key. This is a consequence of being
+genuinely post-quantum, not a defect, but your custody team will hit it on day
+one. **§9** states the position without softening it.
+
+**0.4 — A third party cannot yet run a node on this network, and cannot yet
+stake.** The live transport is a point-to-point TCP full mesh with a fixed peer
+list, no discovery and no authentication, so there is no way to dial in; and
+`Deposit`/`Delegate` transactions are refused at every node's mempool
+(`crates/bloch-pos-node/src/engine.rs:1900-1906`) because bonding is not yet
+funded from the UTXO set. Read access is over the public endpoint. **§11.4**
+states what that means for decentralization, in figures.
 
 ---
 
@@ -65,35 +89,44 @@ softening it.
 
 This repository contains two chains. They share an address format and a supply,
 and nothing else. Keeping them apart is the single most important thing when
-reading any Bloch document, including the older ones.
+reading any Bloch document, including the older ones — and including the
+Genesis-3 sections of this one.
 
 | | **Genesis-3** | **Genesis-4** |
 |---|---|---|
-| Consensus | Proof of work (SHA-256d), DAG | Proof of stake, linear chain |
-| Status | **Live**, halting at height 50,000 | **Under construction** |
-| Chain ID | `0xB10C_0004` (`ChainId::Genesis3Mainnet`) | not yet assigned in code |
-| JSON-RPC | **Yes** — 37 live methods (§4) | **None. Does not exist.** (§11) |
-| Finality | Work depth only (§5) | Casper two-round justification (§5.4) |
-| Supply | ~3.6 B BLCH outstanding | 100 B hard cap after ×100/21 split (§10) |
-| Tx format | UTXO, hand-rolled wire codec (§7) | `PosTransaction`; **transfer format not yet defined** (§11) |
+| Consensus | Proof of work (SHA-256d), DAG | **Proof of stake**, linear chain |
+| Status | **Halted permanently** at height 39,918, 2026-08-13 | **Live** since 21:31:19 UTC, 2026-08-13 |
+| Chain ID / version | `0xB10C_0004` (`ChainId::Genesis3Mainnet`) | `0xB10C_0005` (`VERSION_G4`, in the block header) |
+| JSON-RPC | 37 methods (§4) — **the node they ran on no longer advances** | **Yes** (§11.1); public read at `https://posternlabs.com/g4rpc` |
+| Settlement rule | Work depth only, and there was little work (§5.6) | **Casper justification/finalisation by epoch** (§5) |
+| Supply | ~3.81 B BLCH at the halt | 100 B hard cap; 57,146,400,000 issued at slot 0 (§10.6) |
+| Tx format | UTXO, hand-rolled wire codec (§7) | `PosTransaction::Transfer`, with real inputs and outputs (§11.1) |
 
-Node self-report, measured:
+Genesis-4 blocks carry `version = 0xB10C0005`, which renders in JSON as
+`2970353669`. That is not a bug and must not be "fixed" to `4`: a client that
+recomputes `block_id` hashes the 304 header bytes *including* that field, so a
+friendlier value would be one it could not verify anything with
+(`crates/bloch-pos-node/src/rpc.rs:1258-1266`).
 
-```json
-{"network":"mainnet","chain":"bloch-sis","version":"0.3.0-genesis2",
- "protocol":1,"net_protocol":1,"peers":5,"syncing":false,"behind_by":0}
-```
-
-Note the `version` string still says `genesis2`. It is a stale label on a
-Genesis-3 node; do not parse it to detect the chain. Use `getblockhash [0]`,
-which returns the Genesis-3 genesis hash
-`c7522d0ef29fe67463be45a8095db7f5e23b9542dde867363ea3131647aff348`.
+The Genesis-3 node's self-report, recorded before the halt, is kept in §4 for
+the record. Its `version` string read `0.3.0-genesis2` — a stale label on a
+Genesis-3 node, and a good illustration of why you should not parse a version
+string to detect a chain.
 
 ---
 
 ## 2. Transport
 
-Single endpoint, `POST /`, JSON-RPC 2.0 envelope. Everything below was measured.
+> **Historical — Genesis-3.** §2, §3, §4, §6, §7 and §8 describe the halted
+> proof-of-work chain and the endpoints that served it. They are a measurement
+> record taken before 2026-08-13, kept because Genesis-4's opening ledger is
+> derived from that chain and because the address format (§6), the signing
+> scheme (§7.5–§7.6) and the dust and fee constants (§8) carried across. The
+> *endpoints and RPC methods* below did not carry across. For the live chain,
+> read §5, §10 and §11.
+
+Single endpoint, `POST /`, JSON-RPC 2.0 envelope. Everything below was measured
+on the Genesis-3 node while it was still producing blocks.
 
 | Property | Measured behaviour |
 |---|---|
@@ -195,9 +228,15 @@ normal object with `isvalid: false`.
 
 ## 4. Genesis-3 RPC method reference
 
-**37 methods are live.** All 40 names in the dispatch source were probed; the
-three `euvm_*` methods are compiled out (`--features euvm` is off) and answer
-`unknown method`.
+> **Historical — Genesis-3.** None of these methods serve a chain that still
+> advances. The chain behind them halted at height 39,918 on 2026-08-13. This
+> reference is kept as the provenance record of the balances Genesis-4 opened
+> with, and because §12 measures the repository's older documentation against
+> it. The live Genesis-4 method surface is §11.1.
+
+**37 methods were live** at the time of measurement. All 40 names in the
+dispatch source were probed; the three `euvm_*` methods were compiled out
+(`--features euvm` off) and answered `unknown method`.
 
 | Group | Methods |
 |---|---|
@@ -479,9 +518,124 @@ provider is active on this node.
 
 ---
 
-## 5. Finality — what the guarantee actually rests on
+## 5. Finality — what to credit a deposit on
 
-### 5.1 The `confirmations` field is broken, and it fails open
+### 5.1 The rule, in one line
+
+**Credit a deposit when the block carrying it is finalized. Do not wait a
+further number of blocks, and do not substitute anything else.**
+
+Under Genesis-4 there is no confirmation count, and there is no honest way to
+manufacture one. Depth is not security on a chain with no difficulty: nothing in
+the protocol prices a reorg in work, so "6 blocks" and "100 blocks" are the same
+statement — a statement about how long you waited, not about what it would cost
+to undo. The guarantee rests instead on **Casper justification and
+finalisation**: a finalised checkpoint cannot be reverted unless at least one
+third of the total active stake is slashed, which is a bonded, attributable,
+on-chain cost rather than a probabilistic one.
+
+The node states this itself, at the type that carries it. From
+`crates/bloch-pos-node/src/rpc.rs:1200-1216`, on `enum Finality`, under the
+heading *"This is the field an exchange credits a deposit on"*:
+
+> The integration question was "how many confirmations should we require, and
+> what does the guarantee rest on". Under PoS there is no answer in that
+> currency: depth is not security, and a chain with no difficulty cannot price a
+> reorg in work. […] So the honest replacement for "N confirmations" is exactly
+> one boolean: `Finality::Finalized`. […] Nothing is gained by waiting a further
+> number of blocks past finalisation, and nothing else substitutes for it.
+
+### 5.2 How to read it off the node
+
+Every block the node returns carries two fields for this, and they are the same
+judgement in two shapes (`rpc.rs:1293-1294`):
+
+| Field | Type | Use |
+|---|---|---|
+| `finalized` | boolean | **This is the one to branch on.** |
+| `finality` | string — `finalized` \| `justified` \| `canonical` \| `not_canonical` | The gradation, for display and for support tooling |
+
+The four states, verbatim from `Finality` (`rpc.rs:1224-1236`):
+
+| Value | Meaning |
+|---|---|
+| `finalized` | At or below the finalised checkpoint. Irreversible short of a one-third-of-stake slashing event. **Credit here.** |
+| `justified` | At or below the justified checkpoint, above the finalised one. One epoch from finality in the normal case; **still reversible.** |
+| `canonical` | On this node's canonical chain, not yet justified. Reorganisable by ordinary fork choice. |
+| `not_canonical` | Known to this node, not on its canonical chain. |
+
+`getchaininfo` carries the chain-level view (`rpc.rs:1144-1194`): `height`,
+`finalized_height`, `epoch`, `slot_in_epoch`, `slots_per_epoch`, the
+`justified` / `finalized` / `previous_justified` checkpoint objects, validator
+totals, `total_active_stake_sat`, and `wall_slot` / `behind_by_slots`.
+
+Two consequences your integration must handle:
+
+1. **`height` is not the guarantee, `finalized_height` is.** The source says so
+   directly: "an integrator reading only `height` is reading the number that is
+   *not* the guarantee" (`rpc.rs:1149-1151`). Gate on `finalized_height`, or on
+   the per-block `finalized` boolean.
+2. **This is *that node's* view.** Finality is computed from the chain the node
+   validated itself, which is exactly the property you want — the answer does
+   not depend on trusting the producer — but it also means a node that has
+   fallen behind reports its own staleness rather than an error. **Check
+   `behind_by_slots` before trusting any finality answer.** At a 30 s slot, a
+   `behind_by_slots` of 120 is an hour of lag.
+
+### 5.3 Timing
+
+| Parameter | Value | Source |
+|---|---|---|
+| Slot duration | **30 s** | `crates/bloch-pos-committee/src/params.rs`, `SLOT_DURATION_SECS` |
+| Slots per epoch | **32** → epoch = **16 min** | same, `SLOTS_PER_EPOCH` |
+| Rounds to finality | 2 (epoch N justifies; N+1 justifies on top; **N finalizes**) | `crates/bloch-pos-committee/src/finality.rs` |
+| **Typical time to finality** | **≈ 32 minutes** | derived |
+| **Worst case** | **≈ 48 minutes** for a block early in an epoch | derived |
+
+Budget for the worst case, not the typical one, and note that an inactivity leak
+(after 4 epochs, quadratic) extends it further if the validator set is not
+voting.
+
+### 5.4 The caveat that bounds the guarantee — read this with §5.1
+
+Casper finality is a real guarantee about **what two thirds of the stake has
+signed**. It is not a guarantee that the stake is distributed, and on Genesis-4
+today it is not:
+
+- **All 64 Genesis-4 validators are operated by a single entity.** There is no
+  independent validator. One operator can halt the chain.
+- **93.94% of the carryover sits at one address** — 17,046,829,380 of
+  18,146,400,000 BLOCH (`LARGEST_CARRYOVER_ADDRESS_BLOCH`,
+  `tokenomics_v4.rs:414`). Carried balances are **stakeable**, so if that
+  balance stakes, the **Nakamoto coefficient is 1**.
+- **56,046,829,380 of the 57,146,400,000 BLOCH issued at slot 0** is held by the
+  founder (27.04% of the 100 B cap, `FOUNDER_TOTAL_BLOCH`) and the Foundation
+  (a further 29.00%, across VC / team / marketing / liquidity buckets). That
+  leaves **1,099,570,620 BLOCH — 1.92% of genesis supply** in third-party hands.
+- **A third party cannot yet join.** The transport has a fixed peer list and no
+  discovery, and `Deposit`/`Delegate` are refused at the mempool
+  (`crates/bloch-pos-node/src/engine.rs:1900-1906`), so there is no
+  permissionless path to becoming a validator today.
+
+The short form, which we would rather write here than have you find it: **the
+security question under Genesis-4 is not hashrate, it is concentration.** One
+operator can halt the chain and one holder can outvote every other. §5.1's
+guarantee is worth exactly as much as the validator set behind it, and §11.4
+states the same thing in the same figures.
+
+We are not asking you to accept that as a permanent condition, and the validator
+emission (§10.6) exists to change it. We are asking you not to be surprised by
+it.
+
+---
+
+### 5.5 Historical — Genesis-3's `confirmations` field was broken, and it failed open
+
+> **Historical — Genesis-3.** §5.5 and §5.6 describe the halted proof-of-work
+> chain. They are kept because §12 measures the repository's older documentation
+> against them, and because an integrator who built against Genesis-3 needs to
+> know what that integration was actually resting on. Neither section describes
+> the live chain. **The live rule is §5.1: credit on `finalized`.**
 
 `gettransaction`, `gettxstatus` and `listtransactions` all compute:
 
@@ -506,95 +660,61 @@ So a transaction in the tip block — **one real confirmation** — reports:
 50,557 − 39,789 + 1 = 10,769 confirmations
 ```
 
-and since `final` is hardcoded at `>= 100`, its status is `"final"`. **Every
-transaction on this chain reports as final the instant it is mined.** The offset
-grows as the DAG widens, so it will not converge to correctness.
+and since `final` was hardcoded at `>= 100`, its status was `"final"`. **Every
+transaction on that chain reported as final the instant it was mined.** The
+offset grew as the DAG widened, so it was never going to converge to
+correctness.
 
-The failure direction is the dangerous one: an exchange gating deposits on
-`confirmations >= N` or `status == "final"` credits every deposit at depth 1.
+The failure direction was the dangerous one: an exchange gating deposits on
+`confirmations >= N` or `status == "final"` credited every deposit at depth 1.
 
-**Substitute.** Compute depth yourself:
+The substitute at the time was to compute depth in consistent units yourself
+(`getdaginfo.tip_height − gettransaction.block_height + 1`, cross-checked
+against `getblockhash [height]`). This is recorded because it is the defect
+`docs/API.md` and `docs/openapi.yaml` were measured against in §12 — **it is not
+advice for the live chain, which has no confirmation count at all (§5.1).**
 
-```
-real_confirmations = getdaginfo.tip_height − gettransaction.block_height + 1
-```
+### 5.6 Historical — Genesis-3 had no finality. It had work depth, and not much of it.
 
-Both operands come from the same units this way. Cross-check that
-`gettransaction.block_hash` is still the block at that height via
-`getblockhash [height]` — if it is not, the transaction was reorged out.
-
-### 5.2 Genesis-3 has no finality. It has work depth.
-
-There is no finality gadget on Genesis-3. What exists:
+There was no finality gadget on Genesis-3. What existed:
 
 - **Cumulative work.** Ordinary Nakamoto probabilistic settlement: a
-  competitor must out-work the chain from the fork point.
-- **A node-local reorg bound.** Each node refuses reorgs deeper than
+  competitor had to out-work the chain from the fork point.
+- **A node-local reorg bound.** Each node refused reorgs deeper than
   `CHECKPOINT_DEPTH = 1,000` blocks below its own tip, persisted as
   `finalized_height` (`src/main.rs:3016-3040`, gate at `:2853`). At 20 s blocks
-  that is ≈ 5.6 hours.
+  that was ≈ 5.6 hours.
 
-Be precise about what that bound is: it is an **assume-valid convenience
-policy**, applied independently by each node from its own local view. It is not
-a consensus rule and not agreement between nodes. Two nodes that see the network
-differently will refuse different reorgs. It stops a deep reorg from being
-*applied by that node*; it does not make the transaction irreversible, and it
-cannot, because nothing in the protocol has voted on it.
+Be precise about what that bound was: an **assume-valid convenience policy**,
+applied independently by each node from its own local view. It was not a
+consensus rule and not agreement between nodes. Two nodes that saw the network
+differently would refuse different reorgs. It stopped a deep reorg from being
+*applied by that node*; it did not make a transaction irreversible, and it could
+not, because nothing in the protocol had voted on it.
 
-### 5.3 What the work depth is actually worth here
+What the work depth was actually worth, stated as we stated it at the time:
 
-This is the part your risk team needs, and it is not flattering.
-
-- Measured network hashrate: **4.0 – 6.1 TH/s** (`gethashrate`). For scale, this
-  is on the order of a *single* modern SHA-256 ASIC. One Antminer-class unit
-  approaches the whole network.
-- `tip_count: 1` and `avg_txs_per_block ≈ 1.0008`: block production is
-  effectively **a single producer**, and the chain carries almost no
+- Measured network hashrate: **4.0 – 6.1 TH/s** (`gethashrate`) — on the order
+  of a *single* modern SHA-256 ASIC. One Antminer-class unit approached the
+  whole network.
+- `tip_count: 1` and `avg_txs_per_block ≈ 1.0008`: block production was
+  effectively **a single producer**, and the chain carried almost no
   transactions.
-- The chain is **merged-mined with Bitcoin** (AuxPoW; `nonce: 0` on recent
-  blocks). This is what makes the number defensible at all: the work is a
-  by-product of Bitcoin mining, so an attacker needs to out-mine the *Bloch
-  share* of a Bitcoin miner's output. It does **not** confer Bitcoin's security
-  budget, and it does not help if the merged miner is the adversary.
+- The chain was **merged-mined with Bitcoin** (AuxPoW; `nonce: 0` on late
+  blocks), which is what made the number defensible at all: the work was a
+  by-product of Bitcoin mining. It did **not** confer Bitcoin's security budget,
+  and it did not help if the merged miner was the adversary.
 
-Honest statement of the guarantee: **on Genesis-3, deposit safety rests on the
-concentration of block production, not on the cost of rewriting history.** The
-producer is not currently adversarial; the protocol does not stop it from being
-so. There is no economic finality to quote you.
+Honest statement of what that guarantee was: **on Genesis-3, deposit safety
+rested on the concentration of block production, not on the cost of rewriting
+history.** There was no economic finality to quote.
 
-### 5.4 Recommended confirmations
-
-Given §5.1–§5.3, and given the chain halts in ~2.4 days:
-
-| Deposit size | Recommendation |
-|---|---|
-| Any | **Do not credit automatically on Genesis-3.** |
-| If you must | ≥ 100 real confirmations (§5.1's corrected formula) ≈ 33 min, understanding this is a *liveness* wait, not a security threshold |
-| Coinbase-derived | 100 blocks minimum — this one is a real consensus rule (`COINBASE_MATURITY = 100`, `core/mod.rs:266`) |
-
-**Do not accept deposits within ~1,000 blocks of the terminal height 50,000.**
-Coins deposited near the halt cannot be withdrawn on Genesis-3 afterwards; they
-move only through the snapshot (§10).
-
-### 5.5 Genesis-4 changes the *kind* of guarantee
-
-Genesis-4 replaces depth with **Casper-style two-round finality**: a checkpoint
-is *justified* by a supermajority vote, and *finalized* when a second round
-justifies its successor. `gettxstatus` gains a status enum
-`pending | included | justified | finalized`, and `confirmations` is explicitly
-demoted to a display value with no security meaning
-(`docs/specs/BLOCH-RPC-V4.md` §0 R1, §3.1).
-
-This is a different kind of claim, not a stronger number. Depth is probabilistic
-and continuous; finalization is a discrete, attributable commitment — reverting
-a finalized checkpoint requires a supermajority of stake to have signed
-conflicting votes, which is detectable and slashable. **Credit on `finalized`,
-not on depth.**
-
-The honest caveat that belongs beside this: finality is only as decentralized as
-the validator set that votes, and the Genesis-4 validator set does not exist
-yet. See §11 for what remains unbuilt, and §13 for the fact that none of the
-Genesis-4 behaviour in this section was executed against a running node.
+**Why this section still matters to you.** The shape of that disclosure did not
+change when the consensus did — only its currency did. Genesis-4 replaces
+probabilistic depth with a discrete, attributable, slashable commitment (§5.1),
+which is a genuinely stronger *kind* of claim; but the concentration caveat
+carries straight across, from concentrated block production to concentrated
+stake. §5.4 states it in the figures that apply today.
 
 ---
 
@@ -961,14 +1081,16 @@ document than three weeks into an integration.
 
 ### 10.1 The mechanism
 
-Genesis-3 does not upgrade into Genesis-4. It **stops** at height 50,000, a
-snapshot of the UTXO set is taken at that height, every balance is multiplied by
-100/21, and Genesis-4 launches with those balances in its genesis state.
+Genesis-3 did not upgrade into Genesis-4. It **stopped**, permanently, at chain
+height **39,918** on 2026-08-13; a snapshot of the UTXO set was taken at that
+height; every balance was multiplied by 100/21; and Genesis-4 launched with
+those balances in its genesis state at 21:31:19 UTC the same day. **This has
+already happened.**
 
-There is no bridge, no swap contract, and no claim process. **Holders do
+There was no bridge, no swap contract, and no claim process. **Holders did
 nothing.** Balances appear at the same addresses, because Genesis-4 keeps the
-address format and key material of §6 and §7.6 unchanged. Your existing deposit
-addresses survive the migration.
+address format and key material of §6 and §7.6 unchanged. Deposit addresses
+issued on Genesis-3 survived the migration.
 
 ### 10.2 The conversion rule
 
@@ -993,16 +1115,18 @@ Verified arithmetic:
 | 21 sat | 100 sat | exact |
 | 840,000,000,000 sat (8,400 BLCH) | 4,000,000,000,000 sat (40,000 BLCH) | exact — the legacy coinbase amount |
 | 260,000,000,000 sat (2,600 BLCH) | 1,238,095,238,095 sat | 5/21 dropped |
-| Whole measured supply, 3,805,746,000 BLCH | **18,122,600,000 BLCH** | exact, zero aggregate dust |
+| **Terminal supply, 3,810,744,000 BLCH** | **18,146,400,000 BLCH** | exact, zero aggregate dust |
 
 Note the asymmetry: the 8,400-BLCH coinbase rows that dominate the ledger scale
 **exactly**, but Emission-V3-era rows (2,600 BLCH, and the 60-BLCH tail floor)
-do not. Those are the rows that will produce per-row dust in the real terminal
-snapshot.
+do not. Those are the rows that produced per-row dust in the terminal snapshot,
+and §10.5 is the rule that closes the resulting gap.
 
-> ⚠️ **`split_g3_sat` currently has zero callers.** Grep across the workspace
-> finds only its definition and prose references. The rule is specified and
-> unit-tested arithmetic; it has not yet been applied to a real snapshot.
+`split_g3_sat` is applied by the genesis builder — `genesis.rs:632` per row and
+`:666` on the aggregate, with the ceremony tool calling it at
+`tools/genesis4-ceremony/src/lib.rs:544` and `:1098`. An earlier revision of
+this document reported it as having zero callers; that was true when written and
+is no longer.
 
 **No dust threshold and no minimum balance.** The only value floor is a
 structural rejection of `value == 0` rows in the snapshot parser
@@ -1042,8 +1166,9 @@ prepend `bloch1q` plus the doubled-SHA3 checksum.
 > ⚠️ **The `carryover.tsv.gz` in this repository is the wrong file for your
 > purposes.** It is the **Genesis-1 → Genesis-3** carryover: 413,743 rows,
 > 5 distinct addresses, 3,475,441,200 BLCH total, all rows exactly 8,400 BLCH.
-> The **Genesis-3 → Genesis-4** snapshot does not exist yet — it is produced at
-> the halt. Same format, different contents. Likewise `docs/CARRYOVER.md` and
+> The **Genesis-3 → Genesis-4** snapshot is a different file, taken at the halt:
+> **452,726 outputs, 18,146,400,000 BLCH after the split, at chain height
+> 39,918.** Same format, different contents. Likewise `docs/CARRYOVER.md` and
 > `docs/SNAPSHOT-BOOTSTRAP.md` describe Genesis-3 bootstrapping, not this
 > migration.
 
@@ -1093,29 +1218,64 @@ This matters for the dust rule. Truncating per row loses satoshis, but
 `Manifest::check_supply()` (`crates/bloch-pos-node/src/genesis.rs:240-261`)
 refuses any manifest where `carryover.total_sat + Σ allocations ≠
 GENESIS_ISSUED_SAT` **exactly**. Someone must therefore absorb the accumulated
-remainder. The code comment states this requirement and says "truncate-and-hope
-does not close the accounting" — **and the rule is not implemented anywhere.**
+remainder.
 
-Practical consequence for you: whether a balance is split per-UTXO or summed
-per-address first changes the final satoshi. **Until the dust rule is published,
-a Genesis-4 opening balance cannot be predicted to the satoshi from a Genesis-3
-balance.** It can be predicted to well within a satoshi, which is immaterial for
-trading, but do not build an exact-match reconciliation test against it yet.
+**The rule is implemented, and it is deterministic.** At
+`crates/bloch-pos-node/src/genesis.rs:662-695`, the builder computes
+`split_g3_sat` of the *aggregate*, subtracts the sum of the per-row splits, and
+adds the whole remainder to **the single highest-value output, ties broken to
+the lowest `(txid, vout)`**. A sum of floors never exceeds the floor of the sum,
+so the remainder is always non-negative and the accounting closes exactly. The
+tie-break is a strict `>` over entries the parser has already forced into
+strictly ascending outpoint order — the source notes that a `>=` there would
+take the last maximum instead, "and two nodes disagreeing about where one
+satoshi landed is two state roots."
+
+Practical consequence for you: a Genesis-4 opening balance **is** predictable to
+the satoshi from a Genesis-3 balance — apply `split_g3_sat` per UTXO — with
+exactly one exception, the single largest output in the whole snapshot, which
+carries the aggregate remainder on top. An exact-match reconciliation test is
+now buildable; write it with that one row special-cased. An earlier revision of
+this document said the rule was unimplemented, which was true when written.
 
 ### 10.6 Supply figures
 
-| Quantity | Value |
-|---|---|
-| Genesis-4 hard cap (`TOTAL_SUPPLY_BLOCH`) | **100,000,000,000 BLCH** = 10^19 sat |
-| Carryover after the split (**provisional**) | 18,122,600,000 BLCH |
-| Genesis issued at launch (`GENESIS_ISSUED_SAT`) | 57,122,600,000 BLCH |
-| Validator emission over 40 years | 42,877,400,000 BLCH |
-| Founder / VC / Team / Marketing / Liquidity | 10 B / 10 B / 10 B / 4 B / 5 B BLCH |
+All figures below are the **terminal** ones, measured at the halt and pinned in
+`crates/bloch-pos-committee/src/tokenomics_v4.rs`. They are final.
 
-> ⚠️ **The carryover figure is provisional and will change.** It is pinned to a
-> measurement at height 39,328 and grows with every Genesis-3 block until the
-> halt. Re-pinning it is a launch-day ceremony step. Do not publish
-> 18,122,600,000 as final.
+| Quantity | Value | Pinned at |
+|---|---|---|
+| Genesis-4 hard cap (`TOTAL_SUPPLY_BLOCH`) | **100,000,000,000 BLCH** = 10^19 sat | `:84` |
+| Carryover after the ×100/21 split (`CARRYOVER_TOTAL_BLOCH`) | **18,146,400,000 BLCH** | `:188` |
+| — measured at Genesis-3 chain height | **39,918** (`CARRYOVER_MEASURED_HEIGHT`) | `:222` |
+| — over this many outputs | **452,726** (`CARRYOVER_MEASURED_UTXOS`) | `:224` |
+| — from this Genesis-3 total | 3,810,744,000 BLCH | — |
+| Issued at slot 0 (`GENESIS_ISSUED_SAT`) | **57,146,400,000 BLCH** | `:251` |
+| Validator emission over 40 years (`VALIDATOR_EMISSION_BLOCH`) | **42,853,600,000 BLCH** — unissued | `:233` |
+| Founder / VC / Team / Marketing / Liquidity | 10 B / 10 B / 10 B / 4 B / 5 B BLCH | — |
+
+> ⚠️ **Do not quote 17,970,880,000 BLCH or "height 43,172".** Those appear in
+> older revisions of our documents and of `tokenomics_v4.rs`'s own comments. The
+> figure was superseded, and the label was wrong twice over: **43,172 was a
+> block count, not a height** — Genesis-3 was a DAG, so it had more blocks than
+> the selected chain was tall, and the chain was never 43,172 blocks tall.
+> Anyone attempting to reproduce the measurement "at height 43,172" would have
+> been waiting for a height that yields a different number. The doc comment at
+> `tokenomics_v4.rs:164-179` records the error deliberately rather than quietly
+> fixing it. The correct pair is **height 39,918 / block count 50,690**.
+
+> ⚠️ **The carryover figure is no longer provisional.** It was pinned to a
+> pre-halt measurement (height 39,328) and grew with every Genesis-3 block until
+> the halt. The terminal re-pin has happened. 18,146,400,000 is final.
+
+> ⚠️ Raising the carryover to the terminal figure did **not** breach the cap.
+> `VALIDATOR_EMISSION_BLOCH` is the remainder of a fixed total, so every extra
+> BLCH of carryover is one less BLCH of future validator emission. Nothing was
+> taken from anyone who already held coins.
+
+> ⚠️ 10^19 sat is **54.21% of `u64::MAX`** and **1,110× JavaScript's 2^53**.
+> Genesis-4 emits satoshi amounts as **decimal strings**. Build your parser for
+> strings; §4.2's bare numbers were the legacy Genesis-3 form.
 
 > ⚠️ 10^19 sat is **54.21% of `u64::MAX`** and **1,110× JavaScript's 2^53**.
 > Genesis-4 will emit all satoshi amounts as **decimal strings**
@@ -1133,57 +1293,116 @@ trading, but do not build an exact-match reconciliation test against it yet.
 
 ## 11. Genesis-4: what exists and what does not
 
-Documented as it is, not as it is planned.
+Documented as it is, not as it is planned. **This section was rewritten on
+2026-08-14 against the source of the running node.** An earlier revision, written
+before the launch, described Genesis-4 as unbuilt and listed an RPC server, a
+transfer format and carryover ingestion among the things that did not exist.
+All three exist. The corrections are itemised in §11.2 rather than deleted,
+because an integrator who read the earlier revision needs to know which of its
+blockers were lifted.
 
 ### 11.1 What exists and works
 
-`crates/bloch-pos-committee/` — 26 modules of pure consensus mathematics, no
-I/O. `crates/bloch-pos-node/` — the `bloch-pos` binary, version
-**0.0.2-devnet**, with subcommands `selfcheck`, `keygen`, `genesis`,
-`submit-tx`, `run`.
+`crates/bloch-pos-committee/` — pure consensus mathematics, no I/O.
+`crates/bloch-pos-node/` — the `bloch-pos` binary, with subcommands `selfcheck`,
+`keygen`, `genesis`, `submit-tx`, `run`.
 
-Demonstrated today: N validator processes produce blocks, attest, justify and
-finalize over a local TCP mesh, with **real ML-DSA-65 ‖ Falcon-1024 signatures**,
-append-only block-log persistence, deterministic replay on restart, LMD-GHOST
-fork choice, and a weak-subjectivity boot gate.
+Live on mainnet since 21:31:19 UTC on 2026-08-13: 64 validator processes
+producing blocks, attesting, justifying and finalizing, with **real
+ML-DSA-65 ‖ Falcon-1024 signatures on every consensus path**, append-only
+block-log persistence with deterministic replay on restart, LMD-GHOST fork
+choice, and a weak-subjectivity boot gate.
 
-That is a working consensus core. It is not a network you can integrate with.
+**The JSON-RPC surface** (`crates/bloch-pos-node/src/rpc.rs`; served on
+`--rpc-bind`:`--rpc-port`, default `127.0.0.1:16310`, `--rpc-port off` to
+disable). Public read access is at **`https://posternlabs.com/g4rpc`**.
 
-### 11.2 What does not exist
+| Method | Returns |
+|---|---|
+| `getchaininfo` | head, `height`, **`finalized_height`**, epoch, slot-in-epoch, the justified/finalized/previous-justified checkpoints, validator totals, `total_active_stake_sat`, base fee, mempool depth, `wall_slot`, `behind_by_slots` |
+| `getblockcount` | height |
+| `getblockbyslot` / `getblockbyid` | one block, with `finality` and `finalized` (§5.2) |
+| `getvalidator` / `getvalidatorcount` | validator records and the set size |
+| `getbalance` | balance for a script hash |
+| `getutxos` / `listunspent` | paginated outputs for a script hash |
+| `sendrawtransaction` | canonical bytes in, mempool admission out |
+| `getmempoolinfo` | mempool state |
 
-Quoted verbatim from `crates/bloch-pos-node/src/main.rs:10-16`:
+Two methods **refuse on purpose**, and answer with a reason rather than
+`method not found` (`rpc.rs:815-830`) — the source's point being that "this node
+cannot do that, here is why, do not retry" is actionable where "no such method"
+would send you looking for a newer build:
 
-> What it is NOT yet — honestly, per the integration plan: **no RocksDB store,
-> no libp2p gossip, no transactions (deposits/exits/transfers), no
-> slashing-evidence pipeline, no checkpoint-sync state download**, **no RPC, no
-> mainnet genesis manifest.**
+| Method | Refusal |
+|---|---|
+| `gettransaction` | `no_transaction_index` — there is no txid at this layer to look up, and approximating one would be worse than the absence |
+| `getnewaddress` | `no_wallet` — a node RPC does not mint key material, and no address format is frozen |
 
-Named, in the order that blocks an exchange:
+**The transfer transaction format exists.** `PosTransaction::Transfer` carries
+`{ inputs: Vec<TransferInput>, outputs: Vec<TransferOutput>, tx_bytes,
+tip_millisat_per_gas }` (`crates/bloch-pos-committee/src/transition.rs:242-262`)
+— real inputs and real outputs, spending and creating. Its own doc comment
+records the two earlier shapes it replaced, both of which were gas terms with no
+sender, recipient or amount. Deposits and withdrawals are specifiable.
 
-| # | Missing | Impact on you |
+**Carryover ingestion exists**, through `Manifest::ingest_carryover`
+(`crates/bloch-pos-node/src/genesis.rs:182+`), checked against all four fields of
+`CarryoverCommitment` — file digest, set root, entry count and total — with the
+split and the dust rule applied per §10.2 and §10.5. Genesis-4 opened with the
+carried balances in it.
+
+### 11.2 What does not exist, and what changed since the pre-launch revision
+
+| # | Item | Status today |
 |---|---|---|
-| 1 | **JSON-RPC server.** No `getbalance`, no `sendrawtransaction`, no `getblock`. Grep for any HTTP framework in both PoS crates returns nothing. | **Total blocker.** Nothing to integrate against. |
-| 2 | **A value-transfer transaction format.** `PosTransaction::Transfer` carries `{ inputs, tx_bytes, tip_millisat_per_gas }` — a **gas/fee shape with no sender, no recipient, no amount, no signature.** The code says the transfer format is explicitly out of the migration's scope. | **Total blocker.** Deposits and withdrawals are not specifiable. |
-| 3 | **Carryover ingestion.** `Manifest::genesis_state()` seeds validators and allocation outputs only. `CarryoverCommitment` is encoded, decoded and supply-checked but **never used to create balances.** A Genesis-4 launched today would have zero carried balances. | Migration does not yet function. |
-| 4 | **Production networking.** Raw TCP with, in the source's words, "no authentication and no admission control". libp2p is the plan. | Not a public network. |
-| 5 | **Persistent store.** Append-only log, no RocksDB. | Not operable at scale. |
-| 6 | **Mainnet genesis manifest.** The `genesis` subcommand builds devnet manifests only. | No mainnet to join. |
-| 7 | **Emission curve not chosen.** Three candidates (flat, halving, decay) are implemented; the choice is an open decision. Decay is "recommended". | Yield and inflation figures are not final. |
-| 8 | **Slashing-evidence pipeline** and **checkpoint-sync state download**. | Finality guarantees are not yet enforceable end-to-end. |
+| 1 | JSON-RPC server | ✅ **Exists** (§11.1). Was listed as a total blocker before launch. |
+| 2 | Value-transfer transaction format | ✅ **Exists**, with inputs and outputs (§11.1). Was listed as a total blocker. |
+| 3 | Carryover ingestion | ✅ **Exists** and ran at genesis (§11.1). |
+| 4 | Mainnet genesis manifest | ✅ **Exists** — the chain launched from it. |
+| 5 | The ×100/21 split and the per-row dust rule | ✅ **Implemented and applied** (§10.2, §10.5). Both were reported unimplemented before launch. |
+| 6 | **A network a third party can join** | ❌ **Still missing, and this is the one that matters.** See below. |
+| 7 | **Permissionless staking** | ❌ **Still missing.** `Deposit` and `Delegate` are refused at every node's mempool. See below. |
+| 8 | RocksDB store | ❌ Persistence is an append-only block log with replay-on-boot, not a keyed state store. Boot cost is O(chain length). Correct, durable, and not yet what a large archival deployment wants. |
+| 9 | Slashing-evidence pipeline; checkpoint-sync state download | ❌ Still missing. Finality's economic guarantee (§5.1) rests on slashing being enforceable; the evidence pipeline that would make a violation punishable end-to-end is not built. **State this to your risk team.** |
+| 10 | Emission curve | Three curves are implemented (flat, halving, decay). Treat published yield and inflation figures as subject to that choice. |
+
+**On (6) — the transport.** The live fleet runs `Transport::Devnet`, and the
+default has not changed. Describe it as it is: **a point-to-point TCP full mesh
+with a fixed peer list, no discovery and no authentication.** Frames are
+`u32 LE length ‖ type byte ‖ payload`. It has no relay logic and no peer
+scoring, which is exactly why it works for a fixed set of known hosts and
+exactly why a third party cannot dial in. There is a libp2p module in the tree
+(`crates/bloch-pos-node/src/p2p.rs`, behind `--transport libp2p`) carrying the
+Genesis-3 gossipsub incident fixes. **It is not what the live fleet runs, and
+you should not plan around it until we tell you it is.**
+
+**On (7) — staking.** `Deposit` and `Delegate` are refused at mempool
+admission, at every node, with an explicit message
+(`crates/bloch-pos-node/src/engine.rs:1900-1906`):
+
+> deposits are not accepted: bonding is not yet funded from the UTXO set
+
+The exposure that refusal closes, in the source's words: a `Deposit` "names an
+amount, carries no signature, and spends no output". Until bonding is funded
+from the eUTXO set, accepting one would create bonded stake out of nothing.
+Transfers are open; staking is not. **There is no permissionless path to
+becoming a validator today.**
 
 A grep for `todo!()`, `unimplemented!()`, `FIXME` and `TODO` across the PoS
 crates returns **zero hits** — the gaps are recorded in module prose, not in
 markers, so a TODO scan **understates** what is missing. Take the table above,
 not the grep.
 
-> ⚠️ `crates/bloch-pos-committee/src/lib.rs:36-42` still declares itself
-> "UNAUDITED. Not wired into the node." The first half stands. The second is now
-> stale — the crate is a workspace member and a dependency of `bloch-pos-node`.
+> ⚠️ `crates/bloch-pos-committee/src/lib.rs` declares itself **UNAUDITED**. That
+> half stands and is load-bearing: no external audit has been completed on the
+> consensus crate that now runs mainnet. An older "Not wired into the node"
+> clause alongside it is stale — the crate is a workspace member and a
+> dependency of `bloch-pos-node`.
 
 ### 11.3 The finality gadget, as implemented
 
 `crates/bloch-pos-committee/src/finality.rs`. This is the mechanism behind the
-§5.5 claim.
+§5.1 claim.
 
 | Parameter | Value |
 |---|---|
@@ -1203,8 +1422,9 @@ finalizes**.
 deterministically shuffled (SHAKE-256) and cut into 32 committees, so every
 active validator votes exactly once per epoch and the quorum denominator is the
 total active stake with no sampling variance. This replaced an earlier sampled
-design after an adversarial finding. The superseded sampled functions and the
-`COMMITTEE_SIZE = 128` constant remain in-tree but are **not** the mechanism.
+design after an adversarial finding. `COMMITTEE_SIZE = 128` and
+`SLOT_SUBCOMMITTEE_SIZE = 8` are pinned at
+`crates/bloch-pos-committee/src/params.rs:17` and `:27`.
 
 One design note worth relaying to your risk team: the finality state is a **pure
 fold over vote history**, written that way deliberately after a 2026-08-08
@@ -1215,31 +1435,51 @@ the result is order-independent.
 > ⚠️ Do not cite `crates/bloch-ffg/` for any of this. It is a separate, static
 > 14-of-21 named-seat committee, marked "FOUNDATION. NOT wired into consensus."
 
-### 11.4 Decentralization at launch — stated plainly
+### 11.4 Decentralization today — stated plainly
 
 From our own migration runbook, and we would rather write it here than have you
-find it:
+find it. These are the figures as they stand on the live chain, not projections:
 
-- **93.93% of the carryover is a single address.** Measured independently in
-  §4.12: one address holds 3,578,666,569 BLCH.
-- **The initial validator set is 64 keys operated by one entity.** That is a
-  **Nakamoto coefficient of 1** at launch.
+| | |
+|---|---|
+| Validators | **64, all operated by a single entity.** There is no independent validator. **One operator can halt the chain.** |
+| Nakamoto coefficient | **1** |
+| Largest carryover address | **17,046,829,380 of 18,146,400,000 BLCH — 93.94%** (`LARGEST_CARRYOVER_ADDRESS_BLOCH`, `tokenomics_v4.rs:414`). Carried balances are **stakeable**, so if that balance stakes it alone decides finality. |
+| Founder holding | **27,046,829,380 BLCH — 27.04% of the 100 B cap** (`FOUNDER_TOTAL_BLOCH`, pinned by a compile-time assertion at 2704 bps, `tokenomics_v4.rs:434-435`) |
+| Foundation holding | a further **29.00%** — VC 10 B, team 10 B, marketing 4 B, liquidity 5 B |
+| Third-party float at genesis | **1,099,570,620 BLCH — 1.92%** of the 57,146,400,000 issued at slot 0 |
+| Permissionless entry | **None today.** Fixed peer list, no discovery, no authentication on the transport; `Deposit`/`Delegate` refused at the mempool (§11.2). |
 
 Casper finality is a real guarantee about *what a two-thirds majority of stake
-has signed*. It is not a guarantee that the stake is distributed. At launch it
-will not be. Any statement we make about finality should be read with that
-attached, and §5.5's guarantee is worth exactly as much as the validator set
-behind it.
+has signed*. It is not a guarantee that the stake is distributed, and today it is
+not. Any statement we make about finality should be read with that attached:
+**§5.1's guarantee is worth exactly as much as the validator set behind it.**
 
-We are not asking you to accept that as a permanent condition, and the emission
-schedule exists to change it. We are asking you not to be surprised by it.
+One precision note, so you do not over-read the table: the repository pins the
+*founder* at 27,046,829,380 BLCH. The remaining 29.00% is **Foundation**-held
+across five allocation buckets whose recipient script hashes are not in the
+repository. "Founder and Foundation together hold 56,046,829,380" is verified
+arithmetic; "one key holds 56 B" is not, and we are not asserting it.
+
+We are not asking you to accept any of this as a permanent condition — the
+42,853,600,000 BLCH validator emission (§10.6) exists to dilute it over 40
+years, and the transport and staking work in §11.2 exists to open entry. We are
+asking you not to be surprised by it.
 
 ---
 
-## 12. Divergences: repository documentation vs. the live node
+## 12. Divergences: repository documentation vs. the Genesis-3 node
 
-Every row was measured on 2026-08-13. This list is the answer to "your docs
-don't match your node".
+> **Historical — Genesis-3.** Every row below was measured on 2026-08-13
+> against the Genesis-3 node, before the halt. It is retained as the audit
+> record of where our published documentation diverged from our running code —
+> the kind of list an integrator is entitled to see, and one we would rather
+> keep than quietly drop when the chain it describes stopped. **Rows D1–D17
+> describe Genesis-3 RPC behaviour that no longer runs.** Rows D18–D25 concern
+> the migration and Genesis-4; their present status is given in the correction
+> column added below the tables.
+
+This list is the answer to "your docs don't match your node".
 
 ### 12.1 Methods
 
@@ -1284,6 +1524,20 @@ don't match your node".
 | D24 | The terminal height is enforced everywhere | `is_past_terminal_height` appears **zero times in `src/rpc/mod.rs`**. `getblocktemplate` and `createauxblock` keep issuing templates past height 50,000; the resulting blocks are then rejected by `accept_block`. **Merged miners will burn work at the halt** unless the pool checks height itself. | **High** (for miners, not for exchanges) |
 | D25 | `crates/bloch-pos-committee/src/lib.rs:36` — "Not wired into the node" | Stale; it is a workspace member and a dependency of `bloch-pos-node`. The "UNAUDITED" half stands. | Low |
 
+**Status of D18–D25 as of 2026-08-14**, since these are the rows an integrator
+would act on today:
+
+| # | Then | Now |
+|---|---|---|
+| D18 | Snapshot called "signed"; no signing mechanism | **Unchanged.** Trust still rests on independent reproduction of the SHAKE-256 set root, not on a signature. Describe it to your risk team as *hash-committed and independently reproducible*, never as *signed*. |
+| D19 | Three hash functions named for one commitment | **Resolved.** `CARRYOVER_MEASURED_FILE_SHA3_256` and `CARRYOVER_MEASURED_FILE_SHA256` are now separately named constants, and `CARRYOVER_MEASURED_ROOT` is the SHAKE-256 set root. The node had been refusing to start on a FILE-DIGEST mismatch because a SHA-256 value had been pasted into a SHA3-256 field; it was right to refuse. |
+| D20 | `split_g3_sat` had zero callers | **Resolved.** Applied per row and on the aggregate by the genesis builder (§10.2). |
+| D21 | Per-row dust rule undefined | **Resolved and implemented** — remainder to the highest-value output, ties to the lowest outpoint (§10.5). |
+| D22 | `Cargo.toml` said the halt was at 80,000 | **Superseded twice over.** The constant went to 50,000, and the chain in fact stopped at **39,918**. Do not use any of the three as a live figure. |
+| D23 | `tokenomics_v4.rs` comments stale vs. its constants | **Partly resolved.** The carryover comment now records both the terminal figures and the 43,172 block-count error (§10.6). The standing advice does not change: **quote the constants and the compile-time assertions, never the surrounding comments.** |
+| D24 | Terminal height not enforced in the RPC; miners would burn work | **Moot.** Genesis-3 no longer produces blocks and there is no mining on Genesis-4. |
+| D25 | "Not wired into the node" | **Resolved.** The UNAUDITED half still stands and is load-bearing (§11.2). |
+
 ### 12.5 Documentation status
 
 | # | Claim | Reality | Severity |
@@ -1317,25 +1571,39 @@ all 40 dispatch methods.
    valid transaction was serialized or accepted.
 3. **Fee, dust and size rules (§8).** Constants read from source; no
    transaction was submitted to observe enforcement.
-4. **The terminal-height halt (§0.1).** The constant and its four enforcement
-   sites are read from source. The chain has not reached 50,000, so the halt has
-   not been observed. The projection assumes the measured 20.04 s mean block
-   time holds.
-5. **Everything about Genesis-4 (§5.5, §11).** There is no Genesis-4 node to
-   call — there is no RPC server to call it with (§11.2). All of it is source
-   and specification reading. The finality parameters in §11.3 are read from
-   `finality.rs`; no epoch was observed justifying or finalizing on a live
-   network.
-6. **The Genesis-3 → Genesis-4 snapshot (§10).** **This file does not exist
-   yet** — it is produced at the halt. The format in §10.3 and the verification
-   in §10.4 were read from source and cross-checked against the *Genesis-1 →
-   Genesis-3* artifact shipped in this repository (`carryover.tsv.gz`, 413,743
-   rows, both published SHA-256 checksums verified). The §10.2 conversion
-   arithmetic was computed independently from the constants; it was **not**
-   executed through `split_g3_sat`, which has no callers.
-7. **Reorg behaviour (§5.2).** `CHECKPOINT_DEPTH` and the `finalized_height`
-   gate are read from source. No reorg was observed; `tip_count` was `1`
-   throughout, so no fork was visible during measurement.
+4. **The terminal-height halt (§0.1).** At measurement time the constant and its
+   four enforcement sites were read from source and the halt had not been
+   observed. **It has since happened, at height 39,918 — below the 50,000
+   constant, because the chain was stopped rather than left to reach it.** The
+   coins between 39,918 and that ceiling were never minted, which is why the
+   carryover is a measured figure and not a derived one.
+5. **Everything about Genesis-4 (§5, §10, §11).** At the time of the 2026-08-13
+   measurement there was no Genesis-4 chain to call. **Those sections were
+   revised on 2026-08-14 against the source of the now-running node, and they
+   are still source reading, not measurement.** The finality parameters are read
+   from `finality.rs` and `params.rs`; the RPC surface from `rpc.rs`; the
+   mempool refusal from `engine.rs`. **No epoch was observed justifying or
+   finalizing by the author of this document, and no RPC call was made against
+   `posternlabs.com/g4rpc`.** Before you credit anything, call the endpoint
+   yourself and confirm that `getchaininfo` returns a `finalized_height` that
+   advances. This is the largest unverified surface in the current revision and
+   we would rather name it than let it pass.
+6. **The Genesis-3 → Genesis-4 snapshot (§10).** The terminal snapshot was
+   taken at the halt; its figures are read from the pinned constants in
+   `tokenomics_v4.rs`, not from the file. The format in §10.3 and the
+   verification in §10.4 were read from source and cross-checked against the
+   *Genesis-1 → Genesis-3* artifact shipped in this repository
+   (`carryover.tsv.gz`, 413,743 rows, both published SHA-256 checksums
+   verified) — **note that this shipped file is the earlier migration and is
+   not the Genesis-3 → Genesis-4 snapshot.** The §10.2 conversion arithmetic
+   was computed independently from the constants. **The snapshot is not
+   signed** (§10.4); if you want assurance, ask us for the root through a
+   second channel and reproduce the file from an archive node.
+7. **Reorg behaviour (§5.6).** `CHECKPOINT_DEPTH` and the `finalized_height`
+   gate are read from Genesis-3 source. No reorg was observed; `tip_count` was
+   `1` throughout, so no fork was visible during measurement. **No reorg has
+   been observed on Genesis-4 either**, and none of §5.1's finality behaviour
+   has been exercised adversarially by us.
 8. **Rate limits (§3, §4.9).** The 60 reads/min and 5 writes/min defaults are
    from source and `docs/API.md`. They were not deliberately tripped — probing
    stayed well under them.
@@ -1351,24 +1619,62 @@ Measurements were taken from a single vantage point against a single node. All
 
 ## Appendix A — Quick reference
 
+### Genesis-4 — the live chain
+
 ```bash
-# Chain tip (use tip_height, NOT getblockcount)
-curl -sS -X POST https://g2rpc.posternpool.com/ -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"getdaginfo","params":[]}'
+# Chain state, including the number you gate deposits on.
+# Check `behind_by_slots` before trusting `finalized_height`.
+curl -sS -X POST https://posternlabs.com/g4rpc -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"getchaininfo","params":[]}'
 
-# Balance (parse "satoshis" as a big integer)
-curl -sS -X POST https://g2rpc.posternpool.com/ -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"getbalance","params":["bloch1q…"]}'
+# Balance for a script hash (amounts are decimal STRINGS — parse as big integers)
+curl -sS -X POST https://posternlabs.com/g4rpc -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"getbalance","params":["<script_hash_hex>"]}'
 
-# Real confirmations = getdaginfo.tip_height − gettransaction.block_height + 1
+# One block, with the deposit decision on it
+curl -sS -X POST https://posternlabs.com/g4rpc -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"getblockbyslot","params":[<slot>]}'
+
+# THE DEPOSIT RULE: credit when block.finalized == true. Nothing else.
+# There is no confirmation count on this chain, and waiting extra blocks
+# past finalisation buys nothing (§5.1).
+```
+
+| Constant | Value |
+|---|---|
+| Live chain | **Genesis-4, proof of stake**, since 21:31:19 UTC 2026-08-13 |
+| Block header version | `0xB10C_0005` — renders as `2970353669`; do not "fix" it to `4` |
+| Public read RPC | `https://posternlabs.com/g4rpc` |
+| Node RPC default bind | `127.0.0.1:16310` (`--rpc-port off` disables) |
+| Slot / epoch | 30 s / 32 slots = 16 min |
+| Committee size | 128 (slot subcommittee 8) |
+| Validators | 64, **all operated by one entity** |
+| Time to finality | ≈ 32 min typical, ≈ 48 min worst case |
+| Deposit rule | `finalized == true`. **Not a confirmation count.** |
+| Hard cap | 100,000,000,000 BLCH |
+| Issued at slot 0 | 57,146,400,000 BLCH |
+| Carryover | 18,146,400,000 BLCH, 452,726 outputs, at G3 height 39,918 |
+| Signing | ML-DSA-65 ‖ Falcon-1024, both halves verified. **No HSM can do this.** |
+| Amounts | decimal **strings** — 10^19 sat is 54.21% of `u64::MAX` |
+| Staking | `Deposit`/`Delegate` **refused at the mempool** |
+| Transport | TCP full mesh, fixed peer list, no discovery, no auth — you cannot join |
+
+### Genesis-3 — historical, chain halted
+
+```bash
+# These endpoints served a chain that stopped at height 39,918 on 2026-08-13.
+# Retained for provenance only. Do not build against them.
+#   https://g2rpc.posternpool.com/   (direct node)
+#   https://blochl1.com/rpc          (read-only proxy)
 ```
 
 | Constant | Value |
 |---|---|
 | Chain ID (Genesis-3 mainnet) | `0xB10C_0004` |
 | Genesis block hash | `c7522d0ef29fe67463be45a8095db7f5e23b9542dde867363ea3131647aff348` |
-| Terminal height | 50,000 (chain height) |
-| Address prefix | `bloch1q` mainnet / `bloch1t` testnet, 55 chars total |
+| **Terminal chain height (actual)** | **39,918** — the chain was stopped, not left to reach the 50,000 constant |
+| Terminal DAG block count | 50,690 |
+| Address prefix | `bloch1q` mainnet / `bloch1t` testnet, 55 chars total — **carried into Genesis-4 unchanged** |
 | Satoshi | 1 BLCH = 10^8 sat |
 | Dust | 546 sat |
 | Min relay fee | 1 sat/byte (bincode length) |

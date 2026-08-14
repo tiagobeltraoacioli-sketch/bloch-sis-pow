@@ -5,6 +5,28 @@ info:
   version: 0.6.0
   summary: Post-quantum-flavoured BlockDAG Layer 1 — JSON-RPC 2.0 interface
   description: |
+    ## HISTORICAL — this document describes the Genesis-3 RPC surface
+
+    **The chain behind this API stopped permanently at chain height 39,918 on
+    2026-08-13.** Genesis-3 was proof of work; it produces no further blocks and
+    the methods below serve a ledger that no longer advances.
+
+    **The live chain is Genesis-4, proof of stake**, running since 21:31:19 UTC
+    on 2026-08-13: 30 s slots, 32-slot epochs, Casper-style justification and
+    finalisation by epoch. Its public read endpoint is
+    **`https://posternlabs.com/g4rpc`** and its method surface is **different
+    from and smaller than** the one described here — see
+    `docs/integration/BLOCH-EXCHANGE-INTEGRATION.md` §11.1 for the current
+    method list and §5 for the settlement rule.
+
+    This specification is retained because Genesis-4's opening ledger is derived
+    from Genesis-3, because the address format and signing scheme carried across
+    unchanged, and because a client generated from it is the reference for
+    reading archived Genesis-3 data. **Do not generate a Genesis-4 integration
+    from this file.**
+
+    ---
+
     Bloch exposes a single HTTP endpoint that speaks JSON-RPC 2.0. Every method
     described below is invoked by POSTing a JSON-RPC 2.0 envelope to the root
     `/` path. The node advertises itself as `chain: "bloch-sis"`, uses
@@ -22,16 +44,43 @@ info:
     ```
 
     ## HONESTY / SECURITY DISCLOSURES (read before you rely on this)
-    - **Unaudited mainnet-beta.** This software has NOT completed an external
-      security audit. Run it expecting bugs and consensus surprises.
-    - **PoW is structurally weak.** The Module-SIS proof-of-work runs at a small
-      structural width (k = 4 below the SF-1 activation height). At k = 4 the
-      witness is **trivially forgeable** and the chain is **51%-attackable** —
-      the difficulty gate is not lattice bit-security. Do not treat confirmations
-      as economically final.
-    - **Ownerless base.** The base protocol is ownerless; there is no admin key
-      that can reverse transactions or freeze funds. Nothing here is a promise of
-      support, uptime, or recovery.
+    - **Unaudited.** This software has NOT completed an external security audit.
+      That was true of Genesis-3 and remains true of the Genesis-4 consensus
+      crate now running mainnet. Run it expecting bugs and consensus surprises.
+    - **`confirmations` in this API is not a settlement signal, and it fails
+      open.** It is computed as `DAG block_count − chain height + 1`, which
+      subtracts a selected-chain height from a DAG block count — a category
+      error that over-reported by roughly 10,700, so every transaction reported
+      as `final` the instant it was mined. Any client gating on
+      `confirmations >= N` or `status == "final"` credited at depth 1.
+    - **Under Genesis-4 there is no confirmation count at all.** Depth is not
+      security on a chain with no difficulty: nothing prices a reorg in work.
+      The settlement rule is **Casper finality** — the live node returns a
+      `finalized` boolean per block and a `finalized_height` on `getchaininfo`,
+      and that boolean is the whole rule. Waiting further blocks past
+      finalisation buys nothing, and nothing else substitutes for it.
+    - **The security question is concentration, not hashrate.** The
+      "51%-attackable at k = 4" disclosure that stood here described Genesis-3's
+      proof of work and was accurate for that chain. It is retired with that
+      chain, and this is what replaces it, at the same strength: **all 64
+      Genesis-4 validators are operated by a single entity; 93.94% of the
+      carryover (17,046,829,380 of 18,146,400,000 BLOCH) sits at a single
+      address, and carried balances are stakeable; and 56,046,829,380 of the
+      57,146,400,000 BLOCH issued at genesis is held by the founder (27.04% of
+      the 100 B cap) and the Foundation (a further 29.00%), leaving
+      1,099,570,620 BLOCH — 1.92% of genesis supply — in third-party hands.
+      One operator can halt the chain and one holder can outvote every other.**
+      The Nakamoto coefficient is 1.
+    - **A third party cannot yet join the Genesis-4 network or stake.** The live
+      transport is a point-to-point TCP full mesh with a fixed peer list, no
+      discovery and no authentication; and `Deposit`/`Delegate` transactions are
+      refused at every node's mempool because bonding is not yet funded from the
+      UTXO set. Read access is over the public endpoint above.
+    - **Not ownerless.** An earlier revision of this file described the base
+      protocol as ownerless with no admin key. That thesis was **retracted**; a
+      two-entity foundation structure replaced it, and the concentration figures
+      above are the honest statement of who holds what. Nothing here is a promise
+      of support, uptime, or recovery.
     - **BLCH is not a security.** BLCH is a utility/experimental network token,
       not an investment contract, share, or claim on anyone's revenue. No yield,
       dividend, or profit expectation is offered or implied.
@@ -131,9 +180,14 @@ info:
 
 servers:
   - url: http://127.0.0.1:16210
-    description: Default local node (loopback; bypasses auth + rate limits)
+    description: >-
+      Default local GENESIS-3 node (loopback; bypasses auth + rate limits). The
+      Genesis-3 chain is halted. The live Genesis-4 node serves JSON-RPC on
+      127.0.0.1:16310 by default with a different method surface, and its public
+      read endpoint is https://posternlabs.com/g4rpc — neither is described by
+      this document.
   - url: http://{host}:{port}
-    description: Custom node endpoint
+    description: Custom Genesis-3 node endpoint
     variables:
       host:
         default: 127.0.0.1
@@ -479,7 +533,7 @@ components:
           type: array
           items: { $ref: '#/components/schemas/Hex32' }
         chain_length: { type: integer }
-        k: { type: integer, description: 'GhostDAG k parameter (a small value today — see honesty note).' }
+        k: { type: integer, description: 'GhostDAG k parameter of the halted Genesis-3 DAG. Genesis-4 is a linear proof-of-stake chain and has no GhostDAG and no k.' }
 
     PeerInfo:
       type: object
@@ -546,7 +600,16 @@ components:
         block_hash: { $ref: '#/components/schemas/Hex32' }
         block_height: { type: integer }
         timestamp: { type: integer }
-        confirmations: { type: integer }
+        confirmations:
+          type: integer
+          description: >-
+            NOT A SETTLEMENT SIGNAL, and wrong in the dangerous direction.
+            Computed as `DAG block_count − chain height + 1`, subtracting a
+            selected-chain height from a DAG block count; it over-reported by
+            roughly 10,700, so every mined transaction read as final at depth 1.
+            Genesis-3 is halted, and Genesis-4 has no confirmation count at all —
+            its settlement rule is the `finalized` boolean. See the honesty
+            disclosures in `info.description`.
         transaction: { $ref: '#/components/schemas/Transaction' }
 
     Balance:
@@ -616,7 +679,12 @@ components:
         txid: { $ref: '#/components/schemas/Hex32' }
         block_height: { type: integer }
         timestamp: { type: integer }
-        confirmations: { type: integer }
+        confirmations:
+          type: integer
+          description: >-
+            NOT A SETTLEMENT SIGNAL. Same defective computation as
+            `TransactionLookup.confirmations` — see that field. Genesis-4's
+            settlement rule is the `finalized` boolean, not a depth.
         direction: { type: string, enum: [incoming, outgoing, self] }
         amount_sats: { $ref: '#/components/schemas/Satoshis' }
         amount_bloch: { type: number }
@@ -738,9 +806,22 @@ components:
       type: object
       description: gettxstatus result.
       properties:
-        status: { type: string, enum: [unknown, pending, confirmed, final] }
+        status:
+          type: string
+          enum: [unknown, pending, confirmed, final]
+          description: >-
+            `final` here is hardcoded at `confirmations >= 100`, and because
+            `confirmations` over-reported by roughly 10,700 this value read
+            `final` for every mined transaction immediately. It was never a
+            settlement signal. Genesis-4 replaces it with a per-block `finality`
+            string (`finalized` | `justified` | `canonical` | `not_canonical`)
+            and a `finalized` boolean; only `finalized` is safe to credit on.
         in_mempool: { type: boolean }
-        confirmations: { type: integer }
+        confirmations:
+          type: integer
+          description: >-
+            NOT A SETTLEMENT SIGNAL. Same defective computation as
+            `TransactionLookup.confirmations` — see that field.
         block_height: { type: integer, description: Present when confirmed/final. }
         txid: { $ref: '#/components/schemas/Hex32' }
 

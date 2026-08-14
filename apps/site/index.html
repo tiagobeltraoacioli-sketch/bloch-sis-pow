@@ -200,17 +200,20 @@
   <div class="cards">
     <div class="card c">
       <span class="tag">Security</span>
-      <h3>Unaudited, low-hashrate</h3>
-      <!-- docs/PROJECT-STATUS.md "Hard caveat" block: nascent, low-hashrate,
-           51%-attackable, unaudited. -->
-      <p>The network is nascent: few nodes, low hashrate, 51%-attackable. Mainnet is a designation, not a security claim.</p>
+      <h3>Unaudited, and run by one operator</h3>
+      <!-- Genesis-3 (proof of work) stopped permanently at height 39,918 on
+           2026-08-13; the "low hashrate / 51%-attackable" caveat that stood here
+           was its risk, not the live one. Genesis-4 constants:
+           crates/bloch-pos-committee/src/tokenomics_v4.rs. -->
+      <p>The network is unaudited, and the security question is no longer hashrate &mdash; it is concentration. All 64 Genesis-4 validators are operated by a single entity: one operator can halt the chain. A third party cannot yet join &mdash; the transport has a fixed peer list and no discovery, and bonding is refused at every node&rsquo;s mempool. Mainnet is a designation, not a security claim.</p>
     </div>
     <div class="card c">
       <span class="tag">Supply</span>
       <h3>Concentrated</h3>
-      <!-- Largest carried-over address 16,886,549,523 BLCH of 17,970,880,000 total
-           (~94%): crates/bloch-pos-committee/src/tokenomics_v4.rs:100,236. -->
-      <p>Roughly 94% of the carried-over balance belongs to one holder &mdash; the founder, who mined it. The numbers are on the <a href="supply.html">supply page</a>, not in a footnote.</p>
+      <!-- Largest carried-over address 17,046,829,380 BLOCH of 18,146,400,000
+           total (93.94%): crates/bloch-pos-committee/src/tokenomics_v4.rs
+           LARGEST_CARRYOVER_ADDRESS_BLOCH / CARRYOVER_TOTAL_BLOCH. -->
+      <p>93.94% of the carried-over balance belongs to one holder &mdash; the founder, who mined it &mdash; and carried balances are stakeable, so if that balance stakes the Nakamoto coefficient is 1. Counting the Foundation, 56.05&nbsp;B of the 57.15&nbsp;B BLOCH issued at genesis is held by the founder and the Foundation. The numbers are on the <a href="supply.html">supply page</a>, not in a footnote.</p>
     </div>
     <div class="card c">
       <span class="tag">Genesis-4</span>

@@ -1,12 +1,14 @@
 # bloch-euvm — FOUNDATION / step 1 of the native eUTXO contract VM (design §5-quater).
-# STANDALONE and NOT wired into node consensus. The empty [workspace] table keeps it
-# A node workspace member, but only an OPTIONAL dep behind the off-by-default
-# `euvm` feature — with the feature off it is not compiled into the node binary.
+# GENESIS-3-ERA. Designed for the proof-of-work chain that stopped at height 39,918
+# on 2026-08-13; NOT wired into Genesis-4 consensus, which is proof of stake.
+# It is a root-workspace member (so `cargo test --workspace` covers it), but only an
+# OPTIONAL dep of the Genesis-3 node behind the off-by-default `euvm` feature — with
+# the feature off it is not compiled into any node binary. Kept buildable for audit.
 [package]
 name = "bloch-euvm"
 version = "0.0.1"
 edition = "2021"
-description = "Minimal deterministic eUTXO validator VM for Bloch (foundation, not consensus-wired)"
+description = "HISTORICAL (Genesis-3-era): minimal deterministic eUTXO validator VM for Bloch — foundation, never consensus-wired, and not part of Genesis-4 (proof of stake). Kept buildable for audit."
 license = "AGPL-3.0-or-later"
 
 [dependencies]

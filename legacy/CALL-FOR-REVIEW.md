@@ -1,11 +1,20 @@
 # Reviewers & testers wanted: run a node, break the PoW, review the design
 
-> **SUPERSEDED FRAMING — 2026-08-11.** This Genesis-3-era page predates two
-> founder decisions: the **ownerless thesis was retracted** (ADR-036 — Bloch
-> now has an issuer and a two-entity foundation structure,
-> `docs/specs/BLOCH-ENTITY-STRUCTURE.md`), and Genesis-3 **halts at height
-> 80,000**, with Genesis-4 relaunching as PoS. Read "ownerless" claims below
-> as historical; do not repost this text without the ADR-036 rewrite.
+> **Historical — Genesis-3. Do not repost.** This describes the proof-of-work
+> chain that stopped permanently at height **39,918** on **2026-08-13**. The
+> live chain is **Genesis-4, proof of stake** (30 s slots, 32-slot epochs,
+> finality by epoch), live since 21:31:19 UTC that day. Kept because Genesis-4's
+> opening ledger is derived from Genesis-3. It is not what runs, and nothing
+> below is a live call for anything: there is no PoW to break, no mining to
+> test, and no node a third party can currently join (the transport has a fixed
+> peer list and no discovery).
+>
+> Two further corrections to the text below. The **ownerless thesis was
+> retracted** (ADR-036 — Bloch has an issuer and a two-entity foundation
+> structure, `docs/specs/BLOCH-ENTITY-STRUCTURE.md`). And the halt height cited
+> in the earlier version of this banner (80,000) was never reached; the
+> terminal-height rule was later lowered to 50,000 and the chain in fact stopped
+> at 39,918.
 
 > This is the canonical, repo-persistent version of the "reviewers wanted"
 > call. Post it verbatim as a GitLab issue / Discussion (and to the external
@@ -21,6 +30,15 @@ hybrid signatures. We are looking for people to test it and try to break it.
 not for buying anything.**
 
 ## ⚠️ Honest status first
+
+*(Written for Genesis-3. The unaudited / not-a-security / no-value statements
+still hold. The network claims do not: under Genesis-4 the security question is
+not hashrate but concentration — all 64 validators are run by one entity, 93.94%
+of the carryover sits at a single address, and 56.05 B of the 57.15 B BLOCH
+issued at genesis is held by the founder and the Foundation. One operator can
+halt the chain and one holder can outvote every other. The "17% founder premine"
+below is tokenomics V2; under Genesis-4 the founder holds 27.04% of the 100 B
+cap.)*
 
 This is **mainnet-beta, unaudited, experimental research software**. The coin
 is **worth nothing by design** — no token sale, no listing, no price, ever;

@@ -2,7 +2,7 @@
 name = "pqcrypto-internals"
 version = "0.2.11"
 edition = "2021"
-description = "bindings to common cryptography (GroundState fork — seeded RNG override)"
+description = "Vendored fork of pqcrypto-internals 0.2.11 (bindings to PQClean C code) with ONE change: PQCRYPTO_RUST_randombytes consults a thread-local seeded RNG before OS entropy, so ML-DSA-65/Falcon keygen is deterministic from a 32-byte seed. The root workspace patches crates-io to this path; bloch-crypto's Wallet::from_seed depends on it, which puts it under the live Genesis-4 signature path."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Groundstate100/pqcrypto-fork"
 

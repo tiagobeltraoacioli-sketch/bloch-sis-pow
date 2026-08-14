@@ -1,7 +1,9 @@
 # ADR-007: Bonding Contract, Slashing, and Participation Tracking
 
 **Sprint:** 2.1.D (bonding registry + tx types) / 2.1.E (slashing + eviction triggers)
-**Status:** Proposed (founder ratified 2026-04-29)
+**Status:** **SUPERSEDED** — The bonding model here (committee seats, operator UIDs, a 21-day unbonding period, `BondStatus` state machine) is **incompatible with** the staking that Genesis-4 actually implements: no seats, a `WITHDRAWAL_DELAY_EPOCHS` regime, deposits with proof of possession under both hybrid halves, and delegation with a churn budget (`crates/bloch-pos-committee/src/{staking,delegation,slashing}.rs`). Note also that on the live chain **`Deposit` and `Delegate` are refused at every node's mempool** because bonding is not funded from the UTXO set, so no bonding path of any design is open to a third party today. The chain this ADR governs — Genesis-3, proof of work — stopped permanently at height **39,918** on 2026-08-13. The live chain is **Genesis-4, proof of stake** (30 s slots, 32-slot epochs, finality by epoch, hybrid ML-DSA-65 ‖ Falcon-1024, no mining). The decision, context and consequences below are **not** rewritten: this is a decision log and what was decided, when, is the record. Read it as history, not as guidance.
+
+*Original status line, retained:* **Status:** Proposed (founder ratified 2026-04-29)
 **Date:** 2026-04-29
 **Author:** BLOCH Core
 **Related:** ADR-001 (FFG signature scheme), ADR-002-rev1 (DKG protocol family), ADR-005 (committee era + cap=1 + missed attestation definition), ADR-006 (block time + finality), ADR-009 (open — DKG/activation failure recovery), ADR-010 (tokenomics), ADR-011 (FFG activation block height — bonding lifecycle source of truth), ADR-012 (open — reward policy and counsel review)

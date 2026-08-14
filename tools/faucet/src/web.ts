@@ -43,8 +43,9 @@ export function renderForm(cfg: FaucetConfig): string {
     <ul>
       <li>Testnet-only. Test BLCH has <strong>NO value</strong> — it is a faucet for a zero-security testnet.</li>
       <li>BLCH is not a security; nobody makes any value or investment claim.</li>
-      <li>Bloch is ownerless and neutral; Postern Labs is one builder among many with no protocol privilege.</li>
-      <li>Base mainnet-beta is experimental: relaxed PoW (k=4) is trivially forgeable and 51%-attackable.</li>
+      <li>Historical &mdash; Genesis-3. This faucet targets the proof-of-work chain, which stopped permanently at height 39,918 on 2026-08-13. The live chain is Genesis-4, proof of stake.</li>
+      <li>Postern Labs is one builder among many with no protocol privilege.</li>
+      <li>Under Genesis-4 the security question is concentration, not hashrate: all 64 validators are run by one entity, 93.94% of the carryover sits at a single address, and 56.05&nbsp;B of the 57.15&nbsp;B BLOCH issued at genesis is held by the founder and the Foundation.</li>
       <li>Reference tool, untested against a live network.</li>
     </ul>
   </div>

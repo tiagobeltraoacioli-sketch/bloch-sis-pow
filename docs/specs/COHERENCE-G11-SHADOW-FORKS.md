@@ -2,6 +2,26 @@
 
 # G11 — Coherence continuity across the Genesis-4 seam: the three shadow forks
 
+> **Genesis-4 is live.** Bloch has been running under **proof of stake** since
+> 21:31:19 UTC on 2026-08-13, when Genesis-3 (proof of work) stopped
+> permanently at height **39,918**. 30 s slots, 32-slot epochs, Casper-style
+> justification/finalisation by epoch, hybrid ML-DSA-65 ‖ Falcon-1024
+> signatures on every consensus path. Nothing in this document that describes
+> mining, hashrate, difficulty, retargeting or proof-of-work depth describes
+> the current network.
+>
+> **The live security question is concentration, not hashrate.** All 64
+> validators are operated by a single entity; 93.94% of the carryover
+> (17,046,829,380 of 18,146,400,000 BLOCH) sits at one address and carried
+> balances are stakeable, so if that balance stakes the Nakamoto coefficient
+> is 1; and 56,046,829,380 of the 57,146,400,000 BLOCH issued at slot 0 is
+> held by the founder and the Foundation, leaving 1.92% of genesis supply in
+> third-party hands. One operator can halt the chain and one holder can outvote
+> every other. The live transport is a point-to-point TCP full mesh with a
+> fixed peer list, **no discovery and no authentication**, and
+> `Deposit`/`Delegate` are refused at every node's mempool — which is why a
+> third party cannot yet join the network or become a validator.
+
 > **Gate text** (`BLOCH-POS-SHA3-LATTICE-MIGRATION.md`, gate table): *"Shield-before /
 > spend-after passes on three shadow forks; nullifier set and accumulator
 > provably unbroken; shielded roots finalized (§6.6)."*
@@ -12,7 +32,9 @@
 
 ## What the seam is
 
-Genesis-3 halts at the terminal height (80,000). Genesis-4 launches ~6 months
+Genesis-3 **stopped permanently at height 39,918 on 2026-08-13** (this line was
+written against a planned terminal height of 80,000, which was never reached).
+Genesis-4 launched from that snapshot the same day, not ~6 months
 later from signed artifacts. Balances cross through the carryover TSV; the
 shielded pool **cannot** — a note is a commitment at a consensus leaf position
 (`nf = SHAKE256(DOM_NF ‖ nk ‖ rho ‖ LE64(position))`, C1 §1.3), so the pool
@@ -39,11 +61,15 @@ validator re-derives from parent-committed state.
    every published `nf`). If A3 prefers a node-side export, it is a ~50-line
    debug RPC (`getcoherencepool`) walking `CommitmentTree.leaves` and the
    nullifier `HashSet` — flag it `--debug-rpc`, never ship enabled.
-3. **The Genesis-4 node / genesis loader does not exist yet** (DEV-1). Steps
-   marked **[G4-loader]** run against `bloch-pos-committee` interfaces
-   (`CommittedState::genesis`, `derive::validate_block`) until it does; the
-   fork is only fully closed when a real loader consumes the ceremony
-   document.
+3. ~~**The Genesis-4 node / genesis loader does not exist yet** (DEV-1).~~
+   **Superseded 2026-08-13:** both exist. The loader is
+   `crates/bloch-pos-node/src/genesis.rs` (`BPOSMAN1` manifest, deterministic
+   block-0 and `CommittedState` synthesis, SHA3-256 manifest digest pinned
+   into the data dir) and the node is the binary running the live chain.
+   Steps marked **[G4-loader]** should now run against it. Note that
+   `derive::validate_block` no longer exists either — it was deleted
+   2026-08-12 and validation happens only in
+   `transition::Transition::apply_block`.
 4. The nullifier-set root is the **ratified C1.1** commitment: a SHAKE-256
    sparse Merkle tree over the nullifier keyspace under `DOM_NFSET`
    (`coherence_core::NullifierSet`, `COHERENCE-C1.1.md`). This replaced an

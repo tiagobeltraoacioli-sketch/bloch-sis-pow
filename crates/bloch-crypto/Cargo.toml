@@ -3,7 +3,7 @@ name = "bloch-crypto"
 version = "0.1.0-genesis"
 edition = "2021"
 authors = ["Bloch-SIS Protocol"]
-description = "Bloch-SIS Protocol: lean crypto / wallet / transaction surface (post-quantum signatures, HD wallet, tx construction) — the node's non-node island extracted so downstream products can depend on it without the full node"
+description = "Bloch: lean crypto / wallet / transaction surface (hybrid ML-DSA-65 + Falcon-1024 signatures, HD wallet, tx construction). Its `crypto` module is LIVE — every Genesis-4 proof-of-stake consensus signature is made and verified with it. Its `core` module is HISTORICAL: the Genesis-3 proof-of-work chain, stopped at height 39,918 on 2026-08-13, kept for audit and not on any live path."
 license = "AGPL-3.0-or-later"
 repository = "https://gitlab.com/bloch-protocol/bloch"
 

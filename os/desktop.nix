@@ -5,8 +5,13 @@
 # desktop, full-disk encryption, private-by-default networking (Tor), the Postern
 # Wallet, and the Postern Seal attestation — declaratively, on NixOS.
 #
-# Built on the ownerless Bloch-SIS-PoW protocol's tooling, but the OS is a Postern
-# Labs product; anyone may build their own privacy OS on the same open protocol.
+# Built on the Bloch-SIS-PoW protocol's tooling, but the OS is a Postern Labs
+# product; anyone may build their own privacy OS on the same open protocol.
+# ("Ownerless" was retracted — docs/adr/ADR-036-retract-ownerless-adopt-foundation.md.)
+#
+# The node it bundles is `bloch` (os/package.nix), the Genesis-3 proof-of-work
+# node whose chain stopped permanently at height 39,918 on 2026-08-13. The live
+# chain is Genesis-4, proof of stake; `bloch-pos` is not packaged for Nix.
 #
 # NOTE: a profile to ITERATE on a Nix host (`nix build .#desktop-iso`), not a
 # frozen distro. A true daily-driver needs curation (apps, updates, device
@@ -83,7 +88,7 @@
     ◆ Postern OS — Desktop · privacy daily-driver
     Encrypted disk · Tor · hardened · post-quantum wallet.
     Wallet:  bloch-wallet --help
-    A Postern Labs product on the ownerless Bloch-SIS-PoW protocol.
+    A Postern Labs product built on the Bloch-SIS-PoW protocol.
   '';
 
   time.timeZone = lib.mkDefault "UTC";

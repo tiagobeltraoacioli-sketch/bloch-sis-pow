@@ -11,11 +11,19 @@
 //! SHA3-256 digest is pinned into the data dir's `meta` so a node can never
 //! silently switch networks (§3.1 refusal rule).
 //!
-//! What the devnet manifest does NOT yet carry, honestly: the stake-eligibility
-//! policy (integration plan §3.4 / decision 9). This is a *devnet* genesis: a
-//! validator set and a clock. The mainnet shape is the same format with the
-//! carryover commitment and the vested allocations filled in — the balance set
-//! itself arrives out of band, through [`Manifest::ingest_carryover`].
+//! Two manifest shapes share this one format. The **test** shape (built by
+//! `bloch-pos genesis`) is a validator set and a clock: no carryover, no
+//! allocations. The **mainnet** shape (built by `bloch-pos genesis-mainnet`,
+//! and the one Genesis-4 launched from on 2026-08-13) adds the carryover
+//! commitment and the vested allocations — the balance set itself arrives out
+//! of band, through [`Manifest::ingest_carryover`], and is refused unless it
+//! reproduces all four committed fields.
+//!
+//! What no manifest shape carries, honestly: the stake-eligibility policy
+//! (integration plan §3.4 / decision 9). It is moot today — `Deposit` and
+//! `Delegate` are refused at every node's mempool (`engine::admissible`)
+//! because bonding is not yet funded from the UTXO set, so the validator set
+//! is exactly what genesis named.
 
 use std::fs;
 use std::io;

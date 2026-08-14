@@ -1,5 +1,15 @@
 # Postern OS — Reproducibility runbook (#2 pin inputs, #9 determinism)
 
+> **Historical — Genesis-3.** The claim ladder, the Nix mechanics and the
+> two-builder test below are era-independent and still correct. What is
+> Genesis-3-era is the *subject*: the `bloch` package these commands build is
+> the proof-of-work node, and that chain stopped permanently at height
+> **39,918** on 2026-08-13. The live chain is **Genesis-4, proof of stake**
+> (30 s slots, 32-slot epochs, finality by epoch), and its binary is
+> `bloch-pos` from `crates/bloch-pos-node` — which the flake does **not** yet
+> package, so nothing here reproduces it. Reproducing the live node is open
+> work. See [`README.md`](./README.md).
+
 Operator-facing companion to the audit plan. This file holds the EXACT host
 command sequences a human runs on the **aarch64 Linux Nix host** to (a) pin all
 Nix inputs (roadmap #2) and (b) measure determinism (roadmap #9). Agents cannot
@@ -22,9 +32,13 @@ the `repro` CI job) is prepared so these commands Just Work.
    sealed image boots on real confidential-computing hardware (SEV-SNP/TDX,
    `/dev/sev-guest` / `/dev/tdx_guest`). Until then attestation is aspirational.
 
-Throughout: the code is **unaudited**, the coin has **no value**, testnet is
-zero-security. A single-host `--rebuild --check` pass is necessary but NOT
-sufficient — it is not the two-builder test.
+Throughout: the code is **unaudited** and the coin has **no value**. The
+"testnet is zero-security" line this sentence used to carry is Genesis-3's and
+is retired with it — Genesis-4 is a **live mainnet**, still unaudited, whose
+disclosed exposure is concentration rather than hashrate (all 64 validators
+operated by one entity; 93.94% of the carryover at one stakeable address).
+See [`SECURITY.md`](./SECURITY.md). A single-host `--rebuild --check` pass is
+necessary but NOT sufficient — it is not the two-builder test.
 
 ## Platform caveat (why aarch64 vs x86_64 matters)
 

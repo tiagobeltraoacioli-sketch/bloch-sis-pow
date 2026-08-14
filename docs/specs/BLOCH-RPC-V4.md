@@ -2,9 +2,39 @@
 
 # Bloch — JSON-RPC Surface V4 (Genesis-4)
 
+> **Genesis-4 is live.** Bloch has been running under **proof of stake** since
+> 21:31:19 UTC on 2026-08-13, when Genesis-3 (proof of work) stopped
+> permanently at height **39,918**. 30 s slots, 32-slot epochs, Casper-style
+> justification/finalisation by epoch, hybrid ML-DSA-65 ‖ Falcon-1024
+> signatures on every consensus path. Nothing in this document that describes
+> mining, hashrate, difficulty, retargeting or proof-of-work depth describes
+> the current network.
+>
+> **The live security question is concentration, not hashrate.** All 64
+> validators are operated by a single entity; 93.94% of the carryover
+> (17,046,829,380 of 18,146,400,000 BLOCH) sits at one address and carried
+> balances are stakeable, so if that balance stakes the Nakamoto coefficient
+> is 1; and 56,046,829,380 of the 57,146,400,000 BLOCH issued at slot 0 is
+> held by the founder and the Foundation, leaving 1.92% of genesis supply in
+> third-party hands. One operator can halt the chain and one holder can outvote
+> every other. The live transport is a point-to-point TCP full mesh with a
+> fixed peer list, **no discovery and no authentication**, and
+> `Deposit`/`Delegate` are refused at every node's mempool — which is why a
+> third party cannot yet join the network or become a validator.
+
 ```
 Document:   BLOCH-RPC-V4
-Status:     DRAFT — for DEV-3 (owner of the RPC layer) and the OpenAPI V4 freeze
+Status:     PARTIALLY IMPLEMENTED, and serving. `crates/bloch-pos-node/src/
+            rpc.rs` implements JSON-RPC 2.0 over HTTP/1.1 on `std` only and
+            honours §0's R3 (decimal-string amounts), R4 (top-level error
+            object) and R5 (`commission_bps` on validator responses). It
+            serves ~11 methods, not the full surface described here.
+            Load-bearing gaps: **no authentication, no rate limiting, no TLS,
+            no keep-alive, no chunked transfer-encoding**; `--rpc-bind`
+            defaults to 127.0.0.1 for that reason. `gettransaction` and
+            `getnewaddress` return explicit refusals (no transaction index,
+            no wallet). The public read endpoint is
+            https://posternlabs.com/g4rpc.
 Created:    2026-08-11
 Author:     Assistant A5 (ecosystem)
 Parents:    BLOCH-ECOSYSTEM-MIGRATION.md §1 (measured V3 inventory; partially

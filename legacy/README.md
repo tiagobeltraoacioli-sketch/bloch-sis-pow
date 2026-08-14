@@ -3,12 +3,18 @@
 # `legacy/` — the Genesis-3 record
 
 This folder is the written record of **Genesis-3**: the proof-of-work chain
-Bloch ran from 2026-07-29 until it stopped itself. Genesis-3 does not fade
-out and it is not switched off by an operator — it ends by consensus rule at
-a terminal height, after which every node rejects every further block. The
-decided terminal height is **50,000** (founder decision, 2026-08-12, lowered
-from 80,000). Genesis-4 is proof of stake and launches separately, from a
-signed snapshot taken at that height.
+Bloch ran from 2026-07-29 until **2026-08-13**, when it stopped permanently at
+height **39,918** (`CARRYOVER_MEASURED_HEIGHT`,
+`crates/bloch-pos-committee/src/tokenomics_v4.rs`). It never reached the
+terminal-height rule that had been decided for it — **50,000** (founder
+decision, 2026-08-12, lowered from 80,000;
+`GENESIS3_TERMINAL_HEIGHT`, `crates/bloch-crypto/src/core/mod.rs:444`) — because
+the cut-over to Genesis-4 came first.
+
+**Genesis-4, proof of stake, has been live since 21:31:19 UTC on 2026-08-13**:
+30 s slots, 32-slot epochs, Casper-style justification/finalisation by epoch,
+opening from the snapshot of the balance set at height 39,918. Everything in
+this folder is history. Read it in the past tense.
 
 The documents here are not deprecated in the sense of "wrong". They are
 **closed**: they describe a machine that ran, in production, with real

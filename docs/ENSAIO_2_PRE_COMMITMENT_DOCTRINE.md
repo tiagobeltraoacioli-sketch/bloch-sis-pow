@@ -2,6 +2,44 @@
 
 ### *On the Architecture of Permanent Rules in a Network Society — A Schranken-Schranken Defense of the Cyberspace's Invisible Constitution*
 
+> **Editorial note, 2026-08-14 — two of this essay's factual premises have been
+> overtaken, and it is published unrewritten with the corrections stated here
+> rather than quietly amended.** The argument is a work of political and
+> constitutional theory and stands or falls on its reasoning; the facts it
+> borrowed from the protocol's design do not, and a reader is entitled to know
+> which is which.
+>
+> **First, the governance premise was retracted.** §XIV states that the protocol
+> "has no foundation at genesis" and that a Foundation would be incorporated
+> "by the community after mainnet launch — not by the founder." That is no
+> longer the design. The ownerless thesis was formally retracted
+> (`docs/adr/ADR-036-retract-ownerless-adopt-foundation.md`) and replaced by a
+> two-entity foundation structure. The same section's "seventeen percent of the
+> nominal supply allocated to the founder… not minted at genesis" is also
+> superseded: on the live chain the **founder holds 27.04% of the
+> 100,000,000,000 BLOCH cap — 27,046,829,380 — and the Foundation holds a
+> further 29.00%**, both issued at slot 0. Together that is **56,046,829,380 of
+> the 57,146,400,000 issued at genesis**, leaving **1.92%** in every other hand
+> combined. 93.94% of the carried-over ledger sits at a single address, and all
+> **64 validators are operated by one entity**, so **one operator can halt the
+> chain** and the Nakamoto coefficient is 1. An essay arguing that
+> pre-commitment forecloses capture must be read beside those numbers.
+>
+> **Second, the consensus premise changed.** This was written for a
+> proof-of-work chain. **Genesis-3 stopped permanently at height 39,918 on
+> 2026-08-13**, and the live chain is **Genesis-4, proof of stake** — 30-second
+> slots, 32-slot epochs, Casper-style finality by epoch. §III's remark that "the
+> chain with the most accumulated proof-of-work *or proof-of-stake*" is
+> canonical happens to survive the change; passages that assume mining as the
+> participation mechanism do not.
+>
+> Nothing else in the text has been altered. The core claim — that no in-protocol
+> authority can rewrite the rules — remains checkable in the source, and it is
+> worth noting precisely what it does and does not mean here: **"no privileged
+> entity in the consensus rules" is true, and it is not the same as "no
+> privileged entity."** Concentration of holdings and of operations does the work
+> that an admin key would do elsewhere.
+
 > *"Why do men join in society? The chief and main end, therefore, of men's uniting into commonwealths, and putting themselves under government, is the preservation of their property."*
 > — John Locke, *Second Treatise of Government*, §124 (1689)
 >

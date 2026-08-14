@@ -1,6 +1,7 @@
 # ADR-019 — Fork Governance Policy
 
-**Status:** Accepted
+**Status:** Accepted — **still in force**, but read the scope note.
+**Scope note (2026-08-14):** the upstream crates this policy governs were largely Genesis-3's (BLS12-381, the FFG stack). Genesis-4 links `bloch-pos-committee` (one dependency, `sha3`), `bloch-crypto` and, on the unused libp2p path, `libp2p`. The policy applies unchanged; the fork inventory it was written against does not. Genesis-3 (proof of work) stopped permanently at height 39,918 on 2026-08-13.
 **Date:** 2026-04-30
 **Sprint:** 2.1.C-rev1
 **Author:** BLOCH Founder

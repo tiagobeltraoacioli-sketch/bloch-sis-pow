@@ -3,7 +3,7 @@ version: "2.0"
 
 services:
   node:
-    image: bloch:v0.1.0  # TODO: publish to a registry you control — no official image (the protocol is ownerless)
+    image: bloch:v0.1.0  # TODO: publish to a registry you control — no official image is published
     expose:
       - port: 16210
         as: 80

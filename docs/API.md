@@ -1,15 +1,29 @@
 # Bloch-SIS Protocol (BLOCH) API Quick Start
 
-> **Genesis-3-era document — sealed 2026-08-12.** Bloch's proof-of-work
-> chain halts by consensus rule at the terminal height (50,000) and
-> Genesis-4 relaunches as proof of stake; the ownerless thesis was
-> retracted (`docs/adr/ADR-036-retract-ownerless-adopt-foundation.md`).
+> **Historical — Genesis-3.** This describes the proof-of-work chain that
+> stopped permanently at chain height **39,918** on 2026-08-13. The live chain
+> is **Genesis-4, proof of stake** (30 s slots, 32-slot epochs, finality by
+> epoch), running since 21:31:19 UTC on 2026-08-13. Kept because Genesis-4's
+> opening ledger is derived from Genesis-3. **It is not what runs.**
 >
-> The transport, authentication, error-code and pagination conventions stand.
-> The "Heights, supply and emission (Genesis-3 traps)" section does not:
-> `getblocktemplate` is a mining RPC and the DAG-height-versus-chain-height
-> distinction has no meaning on a linear chain. Successor:
+> Note the terminal height: the chain was **stopped at 39,918**, below the
+> 50,000 constant an earlier revision of this banner quoted as the halt point.
+> It never reached that ceiling.
+>
+> **The live public read endpoint is `https://posternlabs.com/g4rpc`**, on a
+> node whose method surface is different from and smaller than the one below.
+> The current integration reference is
+> `docs/integration/BLOCH-EXCHANGE-INTEGRATION.md`; the RPC successor spec is
 > `docs/specs/BLOCH-RPC-V4.md`.
+>
+> What still stands here: the transport, authentication, error-code and
+> pagination conventions, and the address format. What does not: the
+> "Confirmations" section — **Genesis-4 has no confirmation count and no depth
+> rule, its settlement rule is Casper finality** — and the "Heights, supply and
+> emission" section, whose figures are superseded and whose
+> DAG-height-versus-chain-height distinction has no meaning on a linear chain.
+> The ownerless thesis was retracted
+> (`docs/adr/ADR-036-retract-ownerless-adopt-foundation.md`).
 
 **Version:** v0.5.9
 **Protocol:** JSON-RPC 2.0 over HTTP
@@ -300,16 +314,61 @@ future release.
 For `getrecentblocks`, the max is 50 per call. For historical sweeps,
 iterate by height.
 
-### Confirmations
+### Confirmations — **do not use this as a settlement rule**
+
+> 🔴 **The advice this section used to give was wrong twice over, and it is
+> corrected here rather than deleted because integrators built against it.**
+
+What the Genesis-3 node reported:
 
 - `0` = in mempool, unconfirmed
 - `1..99` = `confirmed`
-- `>= 100` = `final` (coinbase maturity)
+- `>= 100` = `final`
 
-Applications requiring strong finality should wait for 100+
-confirmations, matching the coinbase maturity rule.
+**The first defect: the counter was broken and it failed open.** It was computed
+as `DAG block_count − chain height + 1`, subtracting a selected-chain height
+from a DAG block count — a category error that over-reported by roughly 10,700.
+A transaction in the tip block, at **one** real confirmation, reported ~10,769
+and was therefore already `final`. Every mined transaction read as final
+immediately, and the offset grew as the DAG widened. An exchange gating on
+`confirmations >= N` or `status == "final"` credited every deposit at depth 1.
+The earlier advice to "wait for 100+ confirmations" was inert against it — the
+counter was past 10,000 at depth 1.
 
-### Heights, supply and emission (Genesis-3 traps)
+**The second defect: under Genesis-4 the question has no answer in this
+currency.** There is no confirmation count, and manufacturing one would be
+dishonest. Depth is not security on a chain with no difficulty: nothing prices a
+reorg in work, so waiting more blocks tells you only how long you waited.
+
+**The rule on the live chain.** Genesis-4's settlement guarantee is **Casper
+justification and finalisation** — a finalised checkpoint cannot be reverted
+unless at least one third of the total active stake is slashed, which is a
+bonded, attributable, on-chain cost. The node returns:
+
+| Field | Where | Use |
+|---|---|---|
+| `finalized` | on every block | **Boolean. This is the whole rule. Credit here.** |
+| `finality` | on every block | `finalized` \| `justified` \| `canonical` \| `not_canonical` — the gradation, for display |
+| `finalized_height` | `getchaininfo` | the settled line; `height` is the number that is *not* the guarantee |
+| `behind_by_slots` | `getchaininfo` | check this first — a lagging node reports its own staleness, not an error |
+
+Nothing is gained by waiting further blocks past finalisation, and nothing else
+substitutes for it. Typical time to finality is ≈ 32 minutes (32-slot epochs at
+30 s, two rounds); worst case ≈ 48 minutes for a block early in an epoch. Source:
+`crates/bloch-pos-node/src/rpc.rs`, on `enum Finality` — "This is the field an
+exchange credits a deposit on".
+
+### Heights, supply and emission (Genesis-3 traps — superseded figures)
+
+> ⚠️ **The figures in this section are Genesis-3-era and superseded.** They are
+> kept as the record of how that chain's counters behaved. The Genesis-4 supply
+> constants are in `crates/bloch-pos-committee/src/tokenomics_v4.rs`: hard cap
+> **100,000,000,000 BLOCH**, carryover **18,146,400,000 BLOCH** measured at
+> Genesis-3 chain height **39,918** across **452,726** outputs, **57,146,400,000**
+> issued at slot 0, and **42,853,600,000** of unissued validator emission over 40
+> years. **Genesis-4's supply IS hard-capped** — the "not hard-capped, perpetual
+> tail" line below described Genesis-3's Emission V3 and is false for the live
+> chain.
 
 - **`getblockcount` is NOT the chain height.** It counts **DAG blocks**
   (side blocks included) and runs thousands above the selected-chain
@@ -323,8 +382,10 @@ confirmations, matching the coinbase maturity rule.
   from local height 40,000, halving every 1,555,200 blocks, perpetual
   100 BLOCH tail — supply is not hard-capped).
 - **`getsupplydistribution` omits the carry-over.** Its `total_sats`
-  covers only coins mined on Genesis-3. Existing supply = carry-over
-  opening balance (3,475,441,200 BLOCH exactly) **plus** that figure.
+  covers only coins mined on Genesis-3. Existing supply = the Genesis-1 →
+  Genesis-3 carry-over opening balance (3,475,441,200 BLOCH exactly) **plus**
+  that figure. Note this is the *earlier* migration, not the Genesis-3 →
+  Genesis-4 one — do not confuse the two.
   Totals in sats exceed 2^53 — use integers, never floats.
 
 ---

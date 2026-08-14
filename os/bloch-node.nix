@@ -1,5 +1,11 @@
 # NixOS module: run the Bloch-SIS node as a hardened systemd service.
 # Enable on any NixOS host with `services.bloch.enable = true;`.
+#
+# GENESIS-3. The package this module runs is `bloch` (os/package.nix), the
+# proof-of-work node whose chain stopped permanently at height 39,918 on
+# 2026-08-13 — so `mine = true` below produces a miner with no network to join.
+# The live chain is Genesis-4, proof of stake; its binary is `bloch-pos` and it
+# has no NixOS module here. Kept as part of the Genesis-3 record.
 { config, lib, pkgs, ... }:
 
 let

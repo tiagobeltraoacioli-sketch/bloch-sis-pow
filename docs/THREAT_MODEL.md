@@ -1,19 +1,32 @@
 # Bloch-SIS Protocol (BLOCH) — Threat Model
 
-> **Genesis-3-era document — sealed 2026-08-12.** Bloch's proof-of-work
-> chain halts by consensus rule at the terminal height (50,000) and
-> Genesis-4 relaunches as proof of stake; the ownerless thesis was
-> retracted (`docs/adr/ADR-036-retract-ownerless-adopt-foundation.md`).
+> **Historical — Genesis-3.** This describes the proof-of-work chain that
+> stopped permanently at height 39,918 on 2026-08-13. The live chain is
+> **Genesis-4, proof of stake** (30 s slots, 32-slot epochs, finality by
+> epoch), live since 21:31:19 UTC on 2026-08-13. Kept because Genesis-4's
+> opening ledger is derived from it. It is not what runs. The ownerless
+> thesis was retracted
+> (`docs/adr/ADR-036-retract-ownerless-adopt-foundation.md`).
 >
-> §3 (network/transport), §4 (RPC), §5 (storage), §6 (wallet/keystore) and §8
-> (quantum adversary) stand and are cited by current work. §1 (consensus —
-> GhostDAG-Q, retargeting) and §7 (mining) do not. The current threat models
-> are `docs/specs/BLOCH-POS-THREAT-MODEL.md` and `-2.md`.
+> §3.2 onward (network STRIDE), §4 (RPC), §5 (storage), §6 (wallet/keystore)
+> and §8 (quantum adversary) still describe reasoning that current work cites.
+> §1 (consensus — GhostDAG-Q, retargeting), §3.1 (the Kyber/libp2p transport)
+> and §7 (mining) describe machinery the live chain does not run. The current
+> threat models are `docs/specs/BLOCH-POS-THREAT-MODEL.md` and `-2.md`.
+>
+> **The live disclosure, for a reader today.** The security question under
+> Genesis-4 is not hashrate, it is concentration: all 64 validators are run by
+> one entity, 93.94% of the carryover sits at a single address, and 56.05 B of
+> the 57.15 B BLOCH issued at genesis is held by the founder and the
+> Foundation. One operator can halt the chain and one holder can outvote every
+> other. The live transport is a point-to-point TCP full mesh with a fixed peer
+> list, no discovery and no authentication, which is why a third party cannot
+> yet join the network.
 
-**Document version:** 1.0
-**Last updated:** 2026-04-19
-**Codebase reference:** `gitlab.com/Entanglementlayer/bloch-layer@main` (rebranded from `groundstate888/groundstate@main` + Era 1 release `v0.5.9-rc1`, which is the source of the STRIDE analysis; BLOCH rebrand preserves the design unchanged, only renames identifiers)
-**Status:** Internal self-assessment. NOT an external audit.
+**Document version:** 1.0 (Genesis-3 record; status banner updated 2026-08-14)
+**Last updated:** 2026-08-14 (banner and live-network claims only; the STRIDE body is the 2026-04-19 text)
+**Codebase reference:** `gitlab.com/Entanglementlayer/bloch-layer@main` (rebranded from `groundstate888/groundstate@main` + Era 1 release `v0.5.9-rc1`, which is the source of the STRIDE analysis; BLOCH rebrand preserves the design unchanged, only renames identifiers). This reference is to the **Genesis-3** codebase; the live proof-of-stake node is `crates/bloch-pos-node` in this repository, version string `0.1.0-mainnet`.
+**Status:** Internal self-assessment of a retired chain. NOT an external audit. No external audit has been performed on the live chain either.
 
 ---
 
@@ -36,24 +49,43 @@ Vulnerabilities found should be reported per `SECURITY.md`.
 
 ## System overview
 
-Bloch-SIS Protocol is a post-quantum BlockDAG Layer 1 implemented in Rust. The node
-binary (`bloch`) runs several subsystems in the same process:
+*Genesis-3 architecture, retired. Bloch-SIS Protocol **was** a post-quantum
+BlockDAG Layer 1 implemented in Rust; the node binary (`bloch`) ran the
+subsystems below in one process. The live Genesis-4 node is a different binary
+(`crates/bloch-pos-node`) with a proof-of-stake engine, a JSON-RPC server
+(`crates/bloch-pos-node/src/rpc.rs`), and append-only block-log persistence with
+deterministic replay. Read this table as a record, not as a description of what
+is deployed.*
 
-| Subsystem | Source location | LOC | Role |
+| Subsystem (Genesis-3) | Source location | LOC | Role |
 |---|---|---|---|
-| Core types | `src/core/mod.rs` | 511 | Block, Transaction, serialization, coinbase rules, retargeting |
-| Consensus | `src/consensus/mod.rs` | 743 | GhostDAG-Q (PHANTOM k=10) blue-set computation |
+| Core types | `src/core/mod.rs` | 511 | Block, Transaction, serialization, coinbase rules, difficulty retargeting — *retargeting is retired with PoW* |
+| Consensus | `src/consensus/mod.rs` | 743 | GhostDAG-Q (PHANTOM k=10) blue-set computation — *replaced by Casper-style epoch justification/finalisation* |
 | Mempool | `src/mempool/mod.rs` | 300 | Unconfirmed transaction pool |
-| Storage | `src/storage/` | 891 | RocksDB wrapper, UTXO set, address index |
-| Network | `src/network/` | 899 | libp2p swarm, gossipsub, PEX, peer management |
-| Transport | `src/transport/` | 1384 | Post-quantum hybrid session layer (Kyber768 + Ed25519 + ChaCha20-Poly1305) |
-| RPC | `src/rpc/mod.rs` | ~1000 | JSON-RPC HTTP API (32 methods) |
-| Crypto | `src/crypto/mod.rs` | 106 | ML-DSA-65 sign/verify wrapper |
+| Storage | `src/storage/` | 891 | RocksDB wrapper, UTXO set, address index — *the live node uses an append-only block log with deterministic replay* |
+| Network | `src/network/` | 899 | libp2p swarm, gossipsub, PEX, peer management — *not what the fleet runs; see the transport note below* |
+| Transport | `src/transport/` | 1384 | Post-quantum hybrid session layer (Kyber768 + Ed25519 + ChaCha20-Poly1305) — *never became the live transport; see §3.1* |
+| RPC | `src/rpc/mod.rs` | ~1000 | JSON-RPC HTTP API (32 methods) — *the live node has its own JSON-RPC server, `crates/bloch-pos-node/src/rpc.rs`* |
+| Crypto | `src/crypto/mod.rs` | 106 | ML-DSA-65 sign/verify wrapper — *the live consensus suite is **hybrid ML-DSA-65 ‖ Falcon-1024**, both halves verified on every consensus path* |
 | Wallet | `src/wallet/`, `src/hd_wallet/` | ~1500 | Keystore, encryption, transaction building |
 
 Total: ~4,800 LOC in safety-critical modules (core + consensus + mempool +
 network + storage + crypto + transport). No `unsafe` Rust is used anywhere in
 the codebase (`grep -r "unsafe" src/` returns zero hits outside comments).
+
+**What the live network actually runs, in one paragraph.** Genesis-4 is proof
+of stake: 30 s slots, 32 slots per epoch (16 min), `COMMITTEE_SIZE` 128 and
+`SLOT_SUBCOMMITTEE_SIZE` 8 (`crates/bloch-pos-committee/src/params.rs:17,27,30,34`),
+64 genesis validators all operated by one entity, hybrid ML-DSA-65 ‖
+Falcon-1024 on every consensus path, and Casper-style justification and
+finalisation **by epoch** (~32 min typical to finality, ~48 min worst case).
+The transport is **`Transport::Devnet`**: a point-to-point TCP full mesh with a
+fixed peer list, no discovery and no authentication, which is why a third party
+cannot yet join the network. A libp2p module exists in-tree but is not what the
+fleet runs. Deposit and Delegate transactions are refused at every node's
+mempool (`crates/bloch-pos-node/src/engine.rs:1900-1906`) because bonding is not
+yet funded from the UTXO set, so there is no permissionless path to becoming a
+validator today. Public read RPC: <https://posternlabs.com/g4rpc>.
 
 ### Trust boundaries
 
@@ -83,8 +115,14 @@ the codebase (`grep -r "unsafe" src/` returns zero hits outside comments).
 ```
 
 - **Internet (P2P)** — fully untrusted. Any peer can send arbitrary bytes.
-  The Kyber-hybrid transport authenticates peers and encrypts traffic, but
-  an authenticated peer is still an adversary if they choose to misbehave.
+  Under Genesis-3 the Kyber-hybrid transport was intended to authenticate peers
+  and encrypt traffic, with the caveat that an authenticated peer is still an
+  adversary if they choose to misbehave. **This is not the live posture.**
+  Genesis-4 runs `Transport::Devnet`: a point-to-point TCP full mesh with a
+  fixed peer list, no discovery and **no authentication**, which is why a third
+  party cannot yet join the network. The live boundary is therefore drawn by
+  the peer list, not by cryptography: anyone who can reach a node's TCP port
+  and is on its list is inside, and anyone else cannot participate at all.
 - **RPC surface** — HTTP JSON-RPC on port 16210. Bind address defaults to
   `127.0.0.1` (localhost only). Operators using `--rpc-public` expose this
   to the internet without authentication, on purpose or by mistake.
@@ -98,8 +136,29 @@ Ranked by impact of compromise:
 
 1. **Consensus correctness** — if an attacker can inflate supply, double-spend,
    or halt the chain, all economic value is at risk.
-2. **Founder keystore** — controls authority over the 170,000,000 BLOCH premine, vested on-chain over 30 years (12-month cliff at block 207,260 + linear release through block 6,220,700, per ADR-010-A and TOKENOMICS_V2.md §4). Genesis block contains 0 BLOCH to founder. The Era 1 GroundState chain had a different 5% / 1,050,000 GRND premine; that chain state is not carried forward. The earlier BLOCH design (V1, 4% / 40,000,800 BLOCH at genesis as a single coinbase output) was superseded by ADR-028 before any mainnet launch.
-3. **Validator pool address** — accumulates the 25% per-block validator allocation (consensus-enforced by the 70/25/5 split per ADR-028). Distribution to FFG validators per ADR-007 bonding/slashing schedule. **Oracle pool address** accumulates the 5% per-block oracle allocation, distributed pro-rata to PoBRS oracles per ADR-018.
+2. **Founder keystore** — *the figures in this item are Genesis-3-era and are
+   superseded.* It described authority over a 170,000,000 BLOCH premine vested
+   on-chain over 30 years (12-month cliff at block 207,260 + linear release
+   through block 6,220,700, per ADR-010-A and TOKENOMICS_V2.md §4), with the
+   genesis block containing 0 BLOCH to founder. The Era 1 GroundState chain had
+   a different 5% / 1,050,000 GRND premine; that chain state is not carried
+   forward. The earlier BLOCH design (V1, 4% / 40,000,800 BLOCH at genesis as a
+   single coinbase output) was superseded by ADR-028 before any mainnet launch.
+   **Under Genesis-4** the founder holds 27,046,829,380 BLOCH — 27.04% of the
+   hard cap, pinned at 2704 bps as `FOUNDER_TOTAL_BLOCH` — and the Foundation
+   holds a further 29.00% (VC 10 B, team 10 B, marketing 4 B, liquidity 5 B).
+   Together that is 56,046,829,380 of the 57,146,400,000 BLOCH issued at slot 0,
+   leaving 1,099,570,620 BLOCH (1.92% of genesis supply) in third-party hands.
+   Compromise of these keys is therefore not one asset among several — it is
+   control of the majority of stakeable supply.
+3. **Validator pool address** — *Genesis-3-era, superseded.* It accumulated the
+   25% per-block validator allocation (consensus-enforced by the 70/25/5 split
+   per ADR-028), for distribution to FFG validators per ADR-007
+   bonding/slashing, with an **oracle pool address** taking 5% per block for
+   PoBRS oracles per ADR-018. Under Genesis-4 there is no per-block 70/25/5
+   split: the supply is a 100,000,000,000 BLOCH hard cap
+   (`TOTAL_SUPPLY_BLOCH`), 57,146,400,000 was issued at slot 0, and the
+   remaining 42,853,600,000 is validator emission over 40 years, **unissued**.
 4. **Node availability** — seed/worker uptime affects network liveness.
 5. **User funds** — individual wallet keys; compromise is localized.
 6. **Node telemetry** — RPC data (`getpeers`, `getchainstats`) is public by
@@ -111,8 +170,9 @@ Ranked by impact of compromise:
 |---|---|---|
 | **Network attacker (passive)** | Reads all traffic on the wire | Yes |
 | **Network attacker (active MITM)** | Modifies, injects, drops packets | Yes |
-| **Malicious peer** | Full libp2p peer, can send arbitrary messages that survive basic parsing | Yes |
-| **Malicious miner** | Submits invalid blocks, attempts difficulty bypass, timestamp skew, etc. | Yes |
+| **Malicious peer** | Full libp2p peer, can send arbitrary messages that survive basic parsing | Yes — *as modelled for Genesis-3. On the live chain the peer list is fixed and unauthenticated, so this class is "anyone who can reach a listed node's TCP port", not "anyone who dials"* |
+| **Malicious miner** | Submits invalid blocks, attempts difficulty bypass, timestamp skew, etc. | **Genesis-3 only — there is no mining under Genesis-4** |
+| **Concentrated operator / holder** | Runs all 64 genesis validators, or holds the majority of stakeable supply; can censor, halt, or outvote | **Yes — the dominant live adversary.** No mechanism in this document constrains it; see the banner |
 | **Malicious RPC caller** | Can hit any RPC endpoint; if `--rpc-public`, from anywhere on internet | Yes |
 | **Insider / compromised operator** | Access to `founder.json` / `treasury.json` plus passwords | Partially — we assume operators protect their own keystores |
 | **Physical attacker** | Access to running hardware | Out of scope — assume OS isolation is intact |
@@ -140,6 +200,14 @@ A threat is labelled:
 
 ## 1. Consensus layer
 
+> **Genesis-3 only — retired.** Everything in §1 describes the proof-of-work
+> consensus that stopped at height 39,918. Proof of work, `bits`/difficulty
+> retargeting, coinbase subsidy rules and GhostDAG-Q fork choice are **not**
+> live rules. The live chain proposes one block per 30 s slot from a validator
+> set, and settles by Casper-style justification and finalisation **by epoch**
+> (32 slots = 16 min; ~32 min typical to finality, ~48 min worst case). Read
+> the rows below as the record of the chain whose ledger Genesis-4 inherited.
+
 **Source:** `src/core/mod.rs`, `src/consensus/mod.rs`, `src/main.rs`
 (`accept_block`, `validate_tx_in_block_with_maturity`).
 
@@ -159,10 +227,10 @@ A threat is labelled:
 | Threat | Status | Notes |
 |---|---|---|
 | **Double-spend via mempool race** | MITIGATED (Sprint N-min) | `mempool.rs` maintains a `spent: HashMap<(txid, vout), spender_txid>` index. `Mempool::add` rejects any tx whose inputs already appear in `spent`. |
-| **Double-spend via chain reorg** | PARTIAL | GhostDAG selects the heaviest chain by `blue_work`. Immature coinbase spends are the main attack vector; see 1.4 below. Finality checkpoint exists (`finalized_height` meta key) that rejects reorgs below it — but the depth at which finality kicks in is not well-documented. |
+| **Double-spend via chain reorg** | PARTIAL *(G3)* | GhostDAG selected the heaviest chain by `blue_work`. Immature coinbase spends were the main attack vector; see 1.4 below. A finality checkpoint existed (`finalized_height` meta key) rejecting reorgs below it, but the depth at which it kicked in was not well-documented. **Correction for the live chain: settlement is not work-depth.** Genesis-4 finalises by Casper-style justification/finalisation at epoch boundaries — a block is final when its epoch is finalised, roughly 32 min typically and 48 min worst case, not after N blocks of accumulated work. Depth-based reasoning about Bloch settlement is wrong today. |
 | **Coinbase malleability** (attacker produces two txids for same block) | MITIGATED | `Transaction::txid` for coinbase strips `script_sig` back to canonical `height:N` form. Test `vuln06_txid_malleability_fixed` verifies that extra trailing bytes don't produce a new txid. |
 | **Merkle root mismatch** (block claims different txs than it contains) | MITIGATED | `Block::merkle_root` recomputed during validation, compared against header. |
-| **Supply inflation beyond the emission schedule** | MITIGATED (per-block) | Each block's coinbase is capped at `miner_reward(h) + fees` and `treasury_reward(h)`. [2026-08 correction: there is **no** `MAX_SUPPLY` cap — the nominal supply is 21 **billion** BLOCH and the 100 BLOCH/block tail is perpetual; the invariant defended here is "coinbase pays exactly the scheduled subsidy" per `tokenomics_v2.rs::block_subsidy_sat` (Emission V3 from local h=40,000 — `legacy/specs/TOKENOMICS_V3.md`), not a hard cap.] GAP: no global invariant enforces ∑ coinbase == expected total at the current height — a divergence would only be caught when supply distribution is sampled. Sprint O covers this. |
+| **Supply inflation beyond the emission schedule** | MITIGATED (per-block) *(G3)* | Each Genesis-3 block's coinbase was capped at `miner_reward(h) + fees` and `treasury_reward(h)`. Under Genesis-3 there was **no** `MAX_SUPPLY` cap: nominal supply was 21 **billion** BLOCH with a perpetual 100 BLOCH/block tail, and the invariant defended here was "coinbase pays exactly the scheduled subsidy" per `tokenomics_v2.rs::block_subsidy_sat`, not a hard cap. **Superseded.** Genesis-4 has a hard cap of **100,000,000,000 BLOCH** (`TOTAL_SUPPLY_BLOCH`): 57,146,400,000 issued at slot 0 (of which 18,146,400,000 is the carryover from G3 height 39,918 across 452,726 outputs) and 42,853,600,000 of validator emission over 40 years, unissued. There is no perpetual tail. GAP (still true in kind): no global invariant re-derives ∑ issuance against the schedule at the current height — a divergence would only be caught when supply distribution is sampled. |
 
 ### 1.3 Repudiation
 
@@ -190,8 +258,16 @@ verifies or it does not.
 ### 1.6 Elevation of privilege
 
 Consensus has no privilege levels. A correctly signed transaction from any
-address is as authoritative as any other. The founder and treasury addresses
-have no special consensus power — they simply hold balances.
+address is as authoritative as any other. Under proof of work the founder and
+treasury addresses had no special consensus power — they simply held balances.
+
+**This no longer follows.** Under proof of stake, balance *is* consensus
+weight: carried balances are stakeable, so the address holding 93.94% of the
+carryover (17,046,829,380 of 18,146,400,000 BLOCH) would, if it stakes, give the
+chain a Nakamoto coefficient of 1. Separately, all 64 genesis validators are
+operated by one entity today, so the proposer and attester sets are a single
+party regardless of stake. "No privilege levels in the rules" is true and
+almost beside the point.
 
 ### 1.7 Known gaps (consensus)
 
@@ -281,9 +357,23 @@ production paths. This is correct.
 **Source:** `src/network/mod.rs`, `src/network/pex_validator.rs`,
 `src/transport/` (upgrade + stream).
 
-### 3.1 Transport (Sprint A2, now deployed)
+### 3.1 Transport (Sprint A2 — Genesis-3 design, never the live transport)
 
-The session layer uses a hybrid post-quantum handshake:
+> **Correction.** This section was written as "now deployed". It describes the
+> Genesis-3 Kyber-hybrid session layer. **The live Genesis-4 transport is
+> `Transport::Devnet`: a point-to-point TCP full mesh with a fixed peer list,
+> no discovery and no authentication, which is why a third party cannot yet
+> join the network.** There is no Kyber handshake, no libp2p identity
+> signature, and no session AEAD on the live wire. A libp2p module exists
+> in-tree but is not what the fleet runs. Concretely, for the live chain:
+> traffic between fleet nodes is unencrypted and unauthenticated on the wire,
+> so anyone positioned on the path can read and tamper with consensus messages
+> — the mitigation today is that the fleet is one operator's machines, not
+> cryptography. The design below stands as a design; it is not a deployed
+> control, and none of the MITIGATED verdicts in §3.2 that depend on it apply
+> to the live network.
+
+The Genesis-3 session layer used a hybrid post-quantum handshake:
 
 ```
 INITIATOR                                    RESPONDER
@@ -316,6 +406,12 @@ derive session keys (ss, t2)
 
 ### 3.2 STRIDE
 
+*Every verdict in this table is against the Genesis-3 libp2p + Kyber stack. On
+the live chain the transport is unauthenticated and the peer set is fixed, so
+peer spoofing, downgrade, replay and harvest-now/decrypt-later are **not
+mitigated** — they are unaddressed, and the only thing standing in their way is
+that all the peers belong to one operator.*
+
 | Threat | Status | Notes |
 |---|---|---|
 | **Peer spoofing** — connect claiming to be another peer | MITIGATED | libp2p identity public key is bound into both `t1` and `t2` transcripts; a fake peer cannot forge the Ed25519 signature over `t1` without the victim's identity secret. |
@@ -329,8 +425,14 @@ derive session keys (ss, t2)
 
 ### 3.3 Known gaps (network)
 
-- Only 1 production seed node. The deployment document describes this as a
-  temporary bootstrap state; adding more seeds reduces eclipse risk linearly.
+- **Live gap, stated first:** there is no peer authentication and no discovery
+  at all. The fixed-mesh transport means the network is not open — a third
+  party cannot join — and within the mesh there is nothing to stop an on-path
+  attacker from forging or altering messages. Closing this is a prerequisite
+  for anyone but the operator running a node.
+- Only 1 production seed node *(Genesis-3)*. The deployment document describes
+  this as a temporary bootstrap state; adding more seeds reduces eclipse risk
+  linearly.
 - `peerscore` tuning for Bloch-SIS Protocol-specific message types is left at libp2p
   defaults. Long-term we want a documented peer-scoring policy.
 - No DoS protection on the block-download path (`getblocks`/`getheaders` not
@@ -343,6 +445,11 @@ derive session keys (ss, t2)
 **Source:** `src/rpc/mod.rs`.
 
 ### 4.1 Exposure
+
+*Genesis-3 node figures. The live proof-of-stake node has its own JSON-RPC
+server (`crates/bloch-pos-node/src/rpc.rs`) reporting version `0.1.0-mainnet`,
+with a public read endpoint at <https://posternlabs.com/g4rpc>; its method set
+and auth story are not the 32 methods enumerated here.*
 
 - Default bind: `127.0.0.1:16210` (localhost only, safe)
 - Production deployment: `--rpc-public` which binds to `0.0.0.0:16210`
@@ -441,6 +548,14 @@ lands.
 
 ## 7. Mining
 
+> **Genesis-3 only — retired.** There is no mining on the live chain. Blocks
+> are proposed by validators, one per 30 s slot, and every mining-specific
+> threat below (reward substitution, selfish mining, time-warp on retarget)
+> ceased to have an object when proof of work stopped at height 39,918. The
+> analogous live threats — proposer censorship, equivocation, withholding — are
+> in `docs/specs/BLOCH-POS-THREAT-MODEL.md` and `-2.md`, and are all currently
+> concentrated in one operator, which is the point made in the banner.
+
 **Source:** `src/mining/` (not reviewed in full here), orchestrated by
 `src/main.rs`.
 
@@ -471,11 +586,12 @@ polynomial time. NIST's post-quantum cryptography standardization (FIPS
 
 | Component | Classical attack | Quantum attack (Shor) | PQ resistance |
 |---|---|---|---|
-| SHA-256 PoW | Brute force (2^128 expected for collision; 2^256 for preimage) | Grover halves exponent (2^64 / 2^128) | Acceptable; Grover is impractical for hash preimage at 256 bits |
+| SHA-256 PoW *(G3 only — retired)* | Brute force (2^128 expected for collision; 2^256 for preimage) | Grover halves exponent (2^64 / 2^128) | Acceptable; Grover is impractical for hash preimage at 256 bits. No longer part of the live system |
 | SHA3-256 address hash | Same as SHA-256 | Same | Acceptable |
-| ML-DSA-65 signatures | Sub-exponential (Module-LWE) | No known attack better than classical | PQ-secure |
-| Kyber768 KEM (transport) | Sub-exponential (Module-LWE) | No known attack better than classical | PQ-secure |
-| Ed25519 (transport identity/auth) | 2^128 security | Broken by Shor | **Intentional residual classical dependency** |
+| ML-DSA-65 signatures | Sub-exponential (Module-LWE) | No known attack better than classical | PQ-secure. **On the live chain this is one half of a hybrid: every consensus path verifies ML-DSA-65 ‖ Falcon-1024, both halves** |
+| Falcon-1024 signatures *(live, the other half)* | Sub-exponential (NTRU/SIS) | No known attack better than classical | PQ-secure; distinct lattice family, so a break in one half does not break the pair |
+| Kyber768 KEM (transport) *(G3 design; never deployed)* | Sub-exponential (Module-LWE) | No known attack better than classical | PQ-secure as a primitive, but not in the live path — the live transport has no key exchange at all |
+| Ed25519 (transport identity/auth) *(G3 design; never deployed)* | 2^128 security | Broken by Shor | Was an **intentional residual classical dependency**. Moot on the live wire, which authenticates nothing |
 
 ### 8.3 Why Ed25519 for transport identity
 
@@ -494,10 +610,14 @@ extensions. It is a deliberate engineering tradeoff, not an oversight.
 
 ### 8.4 Residual quantum risk
 
-- Ed25519 identity keys on any deployed nodes. Once Shor is practical, an
+- Ed25519 identity keys on Genesis-3 nodes. Once Shor is practical, an
   attacker who sees a node's PeerId can recover its identity secret. The
   consequence is limited: they can spoof that node in the P2P overlay but
-  cannot steal any BLOCH (transaction signatures are ML-DSA-65).
+  cannot steal any BLOCH (transaction signatures are ML-DSA-65, and on the live
+  chain hybrid ML-DSA-65 ‖ Falcon-1024). *Live note: this residual risk is not
+  the live one. The live transport carries no identity key to break, because it
+  authenticates peers not at all — an adversary on the path needs no quantum
+  computer to impersonate a node, only network position.*
 - Any address that has spent at least once and therefore revealed an
   ML-DSA-65 public key is exposed only to direct cryptanalysis of ML-DSA,
   which has no known quantum shortcut. This is better than Bitcoin, where
@@ -520,9 +640,14 @@ Out of primary scope for this document but worth listing:
 
 ## 10. Open questions tracked for external audit
 
+*Items 1, 3 and 4 below concern Genesis-3 subsystems the live chain does not
+run; they are kept as the record of what was open when the chain stopped. The
+live audit surface is the proof-of-stake engine, the hybrid signer, the epoch
+finality gadget and the (absent) transport authentication.*
+
 Items most likely to yield findings in a future third-party audit:
 
-1. **GhostDAG implementation correctness vs. the paper.** We implement
+1. **GhostDAG implementation correctness vs. the paper** *(G3)*. We implement
    PHANTOM/GhostDAG with k=10 against the Sompolinsky-Wyborski-Zohar 2021
    paper, cross-referencing `kaspanet/rusty-kaspa`. Divergences are likely
    but have not been independently verified.
@@ -562,3 +687,15 @@ authenticated transport, libp2p gossipsub), not from its name. Era 1
 historical artifacts (Sprint O 470.4 GRND supply gap, Docker image
 sha256 digest) are preserved as factual record with explicit "Era 1"
 qualification.
+
+**2026-08-14 — status correction.** The sentence above names the design as
+"PoW, ML-DSA-65, Kyber-authenticated transport, libp2p gossipsub". That was the
+Genesis-3 design and it is no longer what the system is. The live system is
+**proof of stake** (30 s slots, 32-slot epochs, Casper-style justification and
+finalisation by epoch), **hybrid ML-DSA-65 ‖ Falcon-1024** with both halves
+verified on every consensus path, and a **`Transport::Devnet` point-to-point TCP
+full mesh with a fixed peer list, no discovery and no authentication** — not
+Kyber, not libp2p gossipsub. This revision changed only the status banner, the
+live-network claims, the supply figures and the finality description; the
+Genesis-3 STRIDE analysis is left as written, in past tense where it made a
+present-tense claim about a chain that has stopped.

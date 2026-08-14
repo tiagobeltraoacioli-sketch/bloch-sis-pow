@@ -1,6 +1,8 @@
 # ADR-033 — Decentralization Model: Credible Neutrality vs. Compliance-First
 
-**Status:** Accepted — **Option C (compliance-first retained) + decentralization refinements** (founder decision 2026-07-07)
+**Status:** **SUPERSEDED** — **Retracted by ADR-036** (founder decision, 2026-08-10), which abandoned the ownerless thesis and adopted a Solana-style foundation. Its decentralisation reasoning is also written against a **proof-of-work** chain — miners, hashrate distribution, mining decentralisation — none of which applies. **The measured position on the live chain:** all 64 validators are operated by a single entity, 93.94% of the carried ledger sits at one address and is stakeable, 56,046,829,380 of the 57,146,400,000 BLOCH issued at genesis is founder- or Foundation-held, and a third party can neither join the network (fixed peer list, no discovery, no authentication) nor become a validator (`Deposit`/`Delegate` refused at every mempool). Bloch is not decentralised today by any metric in this ADR. The chain this ADR governs — Genesis-3, proof of work — stopped permanently at height **39,918** on 2026-08-13. The live chain is **Genesis-4, proof of stake** (30 s slots, 32-slot epochs, finality by epoch, hybrid ML-DSA-65 ‖ Falcon-1024, no mining). The decision, context and consequences below are **not** rewritten: this is a decision log and what was decided, when, is the record. Read it as history, not as guidance.
+
+*Original status line, retained:* **Status:** Accepted — **Option C (compliance-first retained) + decentralization refinements** (founder decision 2026-07-07)
 **Date:** 2026-07-07
 **Sprint:** (pre-genesis strategic decision; gates Phase 6)
 **Author:** BLOCH Founder

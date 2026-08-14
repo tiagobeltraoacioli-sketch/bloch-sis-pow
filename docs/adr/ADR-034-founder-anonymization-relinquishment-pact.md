@@ -1,6 +1,8 @@
 # ADR-034 — Founder Anonymization & Relinquishment Pact ("pacta rei heraclitiano")
 
-**Status:** Proposed (founder pre-commitment; activates at mainnet launch)
+**Status:** **SUPERSEDED** — **Retracted by ADR-036** (founder decision, 2026-08-10). The trigger written here — "activates at mainnet launch" — must not be read as live: mainnet launched (Genesis-4, 2026-08-13) and **this pact did not take effect**, because it had already been retracted three days earlier. The founder holds 27,046,829,380 BLCH and operates all 64 validators. No anonymisation and no relinquishment has occurred. The chain this ADR governs — Genesis-3, proof of work — stopped permanently at height **39,918** on 2026-08-13. The live chain is **Genesis-4, proof of stake** (30 s slots, 32-slot epochs, finality by epoch, hybrid ML-DSA-65 ‖ Falcon-1024, no mining). The decision, context and consequences below are **not** rewritten: this is a decision log and what was decided, when, is the record. Read it as history, not as guidance.
+
+*Original status line, retained:* **Status:** Proposed (founder pre-commitment; activates at mainnet launch)
 **Date:** 2026-07-07
 **Author:** BLOCH Founder (anonymous henceforth — see §5)
 **Related:** ADR-027 (Founder Commitment Instrument), ADR-023–027 (community handover), ADR-033 (decentralization model), ENSAIO_2 (Pre-Commitment Doctrine), *The Cryptographic Constitution*

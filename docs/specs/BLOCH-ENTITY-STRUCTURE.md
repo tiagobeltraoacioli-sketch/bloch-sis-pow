@@ -2,9 +2,35 @@
 
 # Bloch — two-entity structure
 
+> **Genesis-4 is live.** Bloch has been running under **proof of stake** since
+> 21:31:19 UTC on 2026-08-13, when Genesis-3 (proof of work) stopped
+> permanently at height **39,918**. 30 s slots, 32-slot epochs, Casper-style
+> justification/finalisation by epoch, hybrid ML-DSA-65 ‖ Falcon-1024
+> signatures on every consensus path. Nothing in this document that describes
+> mining, hashrate, difficulty, retargeting or proof-of-work depth describes
+> the current network.
+>
+> **The live security question is concentration, not hashrate.** All 64
+> validators are operated by a single entity; 93.94% of the carryover
+> (17,046,829,380 of 18,146,400,000 BLOCH) sits at one address and carried
+> balances are stakeable, so if that balance stakes the Nakamoto coefficient
+> is 1; and 56,046,829,380 of the 57,146,400,000 BLOCH issued at slot 0 is
+> held by the founder and the Foundation, leaving 1.92% of genesis supply in
+> third-party hands. One operator can halt the chain and one holder can outvote
+> every other. The live transport is a point-to-point TCP full mesh with a
+> fixed peer list, **no discovery and no authentication**, and
+> `Deposit`/`Delegate` are refused at every node's mempool — which is why a
+> third party cannot yet join the network or become a validator.
+
 ```
 Document:  BLOCH-ENTITY-STRUCTURE
-Status:    DRAFT — structure proposed, jurisdiction and board not decided
+Status:    DRAFT — structure proposed, jurisdiction and board **still not
+           decided** as of 2026-08-14, which now matters more than when this
+           was written: Genesis-4 launched on 2026-08-13 with the Foundation
+           holding 29,000,000,000 BLCH and no Foundation board in existence.
+           Until the board exists the Foundation is the founder, and the
+           reporting rule this document relies on has no independent party
+           behind it.
 Created:   2026-08-10
 Follows:   ADR-036 (ownerless thesis retracted, Solana model adopted)
 Relates:   BLOCH-TOKENOMICS-V4.md, BLOCH-POS-SHA3-LATTICE-MIGRATION.md
@@ -118,7 +144,8 @@ client-enforced external-signer minimum; 12-month review with a hard stop at
 Which addresses count as "founder" — and are therefore ineligible for the
 carryover and for staking — is decided by whoever writes the list. Nothing in
 the protocol checks it. Publishing the list with the snapshot announcement, far
-enough ahead that it can be argued with before height 80,000 passes, is what
+enough ahead that it could be argued with before the terminal height passed, was
+what
 converts it from a private decision into a public one.
 
 ## 6. Open — needs counsel, not a guess

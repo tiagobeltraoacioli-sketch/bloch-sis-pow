@@ -2,16 +2,47 @@
 
 # Bloch — Migration to Proof-of-Stake (SHA-3 + Lattice)
 
+> **Genesis-4 is live.** Bloch has been running under **proof of stake** since
+> 21:31:19 UTC on 2026-08-13, when Genesis-3 (proof of work) stopped
+> permanently at height **39,918**. 30 s slots, 32-slot epochs, Casper-style
+> justification/finalisation by epoch, hybrid ML-DSA-65 ‖ Falcon-1024
+> signatures on every consensus path. Nothing in this document that describes
+> mining, hashrate, difficulty, retargeting or proof-of-work depth describes
+> the current network.
+>
+> **The live security question is concentration, not hashrate.** All 64
+> validators are operated by a single entity; 93.94% of the carryover
+> (17,046,829,380 of 18,146,400,000 BLOCH) sits at one address and carried
+> balances are stakeable, so if that balance stakes the Nakamoto coefficient
+> is 1; and 56,046,829,380 of the 57,146,400,000 BLOCH issued at slot 0 is
+> held by the founder and the Foundation, leaving 1.92% of genesis supply in
+> third-party hands. One operator can halt the chain and one holder can outvote
+> every other. The live transport is a point-to-point TCP full mesh with a
+> fixed peer list, **no discovery and no authentication**, and
+> `Deposit`/`Delegate` are refused at every node's mempool — which is why a
+> third party cannot yet join the network or become a validator.
+
 **Project design document — "Genesis-4 / Bell"**
 
 ```
 Document:   BLOCH-POS-SHA3-LATTICE-MIGRATION
-Status:     DRAFT — design only, not approved, not scheduled
+Status:     IMPLEMENTED IN SUBSTANCE, and live. This was "design only, not
+            approved, not scheduled" when written. The design it describes is
+            what Genesis-4 runs: 30 s slots, 32-slot epochs, SHA3-256 domain
+            separation, hybrid ML-DSA-65 ‖ Falcon-1024, Casper finality by
+            epoch — live since 21:31:19 UTC on 2026-08-13. Where it differs
+            from the code, the code is authoritative:
+            crates/bloch-pos-committee (consensus) and crates/bloch-pos-node
+            (the binary the fleet runs). §8's hybrid PoW phase was dropped
+            (see its own superseded seal) and never happened.
 Type:       Standards Track (consensus) + Process (migration)
 Created:    2026-08-10
 Owner:      PMO, Postern Labs Ltda
 Track:      GIP-0003 (to be filed) / ADR-036 (to be filed)
-Supersedes: nothing yet — reverses ADR-033 §"ownerless PoW base" if adopted
+Supersedes: the Genesis-3 proof-of-work consensus in its entirety. ADR-033's
+            "ownerless PoW base" was reversed by ADR-036 (2026-08-10) and the
+            PoW chain stopped at height 39,918 (2026-08-13). "if adopted" is
+            no longer conditional: this design is what runs.
 ```
 
 > **Fixed inputs (founder constraints).** Two parts of the system are **not**
@@ -857,7 +888,9 @@ in the same commit, not later.
 
 > **SUPERSEDED 2026-08-10.** This section designed Genesis-4 as a flag-day fork
 > on the running chain, with a hybrid period, and explicitly rejected a fresh
-> genesis. The founder decided otherwise: the chain **halts** at height 80,000,
+> genesis. The founder decided otherwise: the chain **halts** at a terminal
+> height — planned as 80,000 when this was written, and in the event
+> **39,918**, reached on 2026-08-13,
 > a signed balance snapshot is taken, and Genesis-4 launches from it about six
 > months later after code review (`BLOCH-TOKENOMICS-V4.md` §3.2).
 >

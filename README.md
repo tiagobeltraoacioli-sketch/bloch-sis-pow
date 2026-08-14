@@ -24,6 +24,31 @@ finalising every epoch since. The trunk of this repository builds it:
 cargo build --release -p bloch-pos-node   # -> target/release/bloch-pos
 ```
 
+### Joining the live chain
+
+**Building the node is not the same as joining, and today you cannot join.**
+Stated here rather than left to be discovered, because the build command above
+reads like an invitation:
+
+- The live fleet runs `--transport devnet` (`crates/bloch-pos-node/src/net.rs`),
+  which is a **point-to-point TCP full mesh with a fixed peer list, no
+  discovery and no authentication**. There is no bootstrap a stranger can
+  dial. A libp2p/gossipsub transport exists in the tree
+  (`crates/bloch-pos-node/src/p2p.rs`, `--transport libp2p`) but it is **not**
+  what the live fleet runs and the default has not moved.
+- Becoming a validator is also closed: `Deposit` and `Delegate` are refused
+  at every node's mempool, because bonding is not yet funded from the
+  carried-over UTXO set.
+- What is open today: **reading the chain**, at
+  <https://posternlabs.com/g4rpc>, and **transfers**, which the mempool
+  accepts.
+
+One naming point, because it misreads easily: `Transport::Devnet` is the name
+of *the transport*, and for the transport it is accurate. The **network, the
+chain, the binary and the stage are mainnet** — Genesis-4 is a live chain
+carrying the real ledger. Do not read "devnet" anywhere in this tree as a
+statement about the chain.
+
 **Genesis-3, the proof-of-work chain, is over.** It stopped at height
 **39,918**, and Genesis-4's opening ledger is the balance set carried across
 from that height. There is no Genesis-3 network left to join — a node you
@@ -50,13 +75,15 @@ auditor re-derives the opening ledger with; it lives at
 
 ## What Bloch is
 
-A Layer 1 whose consensus-critical cryptography is post-quantum end to end:
+A Layer 1 whose **consensus-critical** cryptography is post-quantum end to end.
+Consensus-critical is the operative word: signatures, hashing and the shielded
+pool are post-quantum; the transport is not.
 
 | Layer | What it uses | Cost of that choice |
 | --- | --- | --- |
 | Signatures | **Hybrid ML-DSA-65 ‖ Falcon-1024** — both must verify (`SUITE_MLDSA65_FALCON1024 = 0x0001`) | ~4.6 KB per signature, not recoverable from the message, and no hardware wallet implements it. MetaMask, Ledger and Trezor cannot sign a Bloch transaction. |
 | Hashing | SHAKE-256 / SHA-3 with domain separation | Slower than SHA-2 on hardware built for Bitcoin. |
-| Transport | ML-KEM-768 hybrid + ChaCha20-Poly1305 | Peer identity is hybrid; the underlying libp2p identity remains classical Ed25519. |
+| Transport | **Not post-quantum, and on the live chain not encrypted at all.** | The Genesis-4 fleet runs `--transport devnet`: a plain TCP full mesh with a fixed peer list, **no authentication and no handshake** (`crates/bloch-pos-node/src/net.rs`). The libp2p layer in the tree (`--transport libp2p`) uses **Noise**, which is classical. There is no ML-KEM anywhere in `crates/bloch-pos-node`. The ML-KEM-768 + ChaCha20-Poly1305 hybrid transport was a **Genesis-3 / Era-1** property (see [FIRST_POST_QUANTUM_HANDSHAKE.md](./FIRST_POST_QUANTUM_HANDSHAKE.md)) and did not carry over. |
 | Shielded pool | SHAKE-256 commitments and nullifiers, SP1 raw FRI-STARK, no elliptic-curve ZK | Proofs are large and proving is expensive. The mainnet pool is provably empty — nothing has ever been shielded. |
 
 The trade the project makes is explicit: it gives up the entire existing
@@ -65,12 +92,34 @@ authorisation path. Every design question downstream of that — including
 whether to run an EVM at L1 — reopens the same trade.
 
 **The coin is not a security and not an asset.** No token sale, no listing,
-no price, no value claim. Supply is heavily concentrated: the founder holds
-roughly 94% of the carried-over balance, which is stakeable, so a naive
-Nakamoto coefficient is 1. Bounding mechanisms exist and are documented with
-what they do *not* reach — see `docs/audit/CERTIK-CENTRALIZATION.md` and
-`docs/specs/BLOCH-TOKENOMICS-V4.md` §4A. There is no framing that makes this
-number acceptable, and none is attempted here.
+no price, no value claim.
+
+**The security question under Genesis-4 is not hashrate, it is
+concentration.** Under proof of work the honest caveat was a low hashrate and
+a 51% attack. Proof of stake retires that caveat and replaces it with a
+sharper one, stated here at the same prominence:
+
+- **All 64 Genesis-4 validators are operated by a single entity.** There is
+  no independent validator. One operator can halt the chain.
+- **93.94% of the carryover sits at one address** — 17,046,829,380 of
+  18,146,400,000 BLOCH (`LARGEST_CARRYOVER_ADDRESS_BLOCH`). Carried balances
+  are stakeable, so if that balance stakes, the **Nakamoto coefficient is 1**.
+- **The founder holds 27.04% of the 100 B cap** at genesis (17,046,829,380
+  carried + a 10,000,000,000 grant = `FOUNDER_TOTAL_BLOCH`, pinned at
+  2704 bps). The Foundation holds a further **29.00%** (VC 10 B, team 10 B,
+  marketing 4 B, liquidity 5 B). Together that is **56,046,829,380 of the
+  57,146,400,000 BLOCH issued at slot 0** — leaving **1,099,570,620 BLOCH
+  (1.92% of genesis supply)** in third-party hands.
+- **A third party cannot yet join.** The live transport is a point-to-point
+  TCP full mesh with a fixed peer list, no discovery and no authentication,
+  and `Deposit`/`Delegate` are refused at every node's mempool because
+  bonding is not yet funded from the UTXO set. There is no permissionless
+  path to becoming a validator today. See [Joining](#joining-the-live-chain).
+
+Bounding mechanisms exist and are documented with what they do *not* reach —
+see `docs/audit/CERTIK-CENTRALIZATION.md` and
+`docs/specs/BLOCH-TOKENOMICS-V4.md` §4A. There is no framing that makes these
+numbers acceptable, and none is attempted here.
 
 **Unaudited.** A third-party audit is being prepared for, not completed. The
 pre-audit dossier is in `docs/audit/`.
@@ -119,14 +168,25 @@ true and what does not.
 ## Consensus today: Genesis-4, proof of stake — live
 
 **Live since 2026-08-13 21:31:19 UTC**, on 64 genesis validators across five
-servers, producing a block every 30 s and finalising every epoch. The opening
-ledger is the Genesis-3 balance set carried across from height 39,918.
+servers — **all 64 operated by a single entity** — producing a block every
+30 s and finalising every epoch. The opening ledger is the Genesis-3 balance
+set carried across from height 39,918.
 
 A **linear** chain of slots and epochs. GhostDAG is retired. Fork choice is
 LMD-GHOST; finality is Casper-style FFG over an epoch committee; the
 randomness beacon is RANDAO; signatures stay ML-DSA-65 ‖ Falcon-1024, with no
 BLS anywhere. Design of record:
 `docs/specs/BLOCH-POS-SHA3-LATTICE-MIGRATION.md`.
+
+Parameters, from `crates/bloch-pos-committee/src/params.rs` — read the
+constants, not this table:
+
+| Parameter | Value |
+| --- | --- |
+| Slot duration | 30 s (`SLOT_DURATION_SECS`) |
+| Slots per epoch | 32 (`SLOTS_PER_EPOCH`) |
+| Committee size | 128, subcommittee 8 (`COMMITTEE_SIZE`) |
+| Finality | Casper-style justification/finalisation, **by epoch** |
 
 Launching is not auditing. The chain running does not mean the consensus code
 has been reviewed by anyone outside this repository — see **Unaudited** above,
@@ -142,7 +202,20 @@ earlier, and it is the true one.
 
 Supply is fixed at `TOTAL_SUPPLY_BLOCH` in
 `crates/bloch-pos-committee/src/tokenomics_v4.rs` — read the constant; do not
-trust a supply number written in prose, including in this file. The cap is
+trust a supply number written in prose, including the table below. Every
+figure in it is a named constant in that file, and the file's const-asserts
+are what actually hold the arithmetic together:
+
+| Quantity | BLOCH | Constant |
+| --- | ---: | --- |
+| Hard cap | 100,000,000,000 | `TOTAL_SUPPLY_BLOCH` |
+| Issued at slot 0 | 57,146,400,000 | `GENESIS_ISSUED_SAT` (cap − validator emission) |
+| — of which carried from Genesis-3 | 18,146,400,000 | `CARRYOVER_TOTAL_BLOCH` (452,726 outputs, `CARRYOVER_MEASURED_UTXOS`) |
+| — of which founder grant | 10,000,000,000 | `FOUNDER_BLOCH` |
+| — of which Foundation-held | 29,000,000,000 | `FOUNDATION_HELD_BLOCH` (VC 10 B, team 10 B, marketing 4 B, liquidity 5 B) |
+| Validator emission, unissued, over 40 yr | 42,853,600,000 | `VALIDATOR_EMISSION_BLOCH` |
+
+The cap is
 intended to become a consensus invariant every node checks. The honest
 strength of that claim: no mechanism *inside* the protocol can raise it — no
 vote, no key, no governance path. A hard fork adopted by every operator can
@@ -157,9 +230,11 @@ change any rule, so "impossible to change" would be false.
 | eUTXO VM (`crates/bloch-euvm`) | yes | yes | ran — consensus-wired at Genesis-3 height 0; **not** wired into Genesis-4 |
 | Coherence shielded pool (C1 frozen) | yes | verifier present | never used; the mainnet pool is provably empty |
 | PoS consensus core (`crates/bloch-pos-committee`) | yes | yes — 366 tests green, measured 2026-08-13 | **yes — live** |
-| PoS node (`crates/bloch-pos-node`) | yes | yes | **yes — mainnet since 2026-08-13 21:31:19 UTC**, 64 validators on five servers, justifying and finalising |
+| PoS node (`crates/bloch-pos-node`) | yes | yes | **yes — mainnet since 2026-08-13 21:31:19 UTC**, 64 validators on five servers **all operated by one entity**, justifying and finalising |
 | Tokenomics V4 | yes | constants + const-asserts in the crate | yes — it is the live emission |
-| Weak-subjectivity checkpoints | yes | no | no |
+| Live network layer (`--transport devnet`) | yes | yes | **yes — this is what the fleet runs**: fixed-peer-list TCP full mesh, no discovery, **no authentication** |
+| Public network layer (`--transport libp2p`, gossipsub) | yes | yes — `crates/bloch-pos-node/src/p2p.rs` | **no** — not the default, not what the fleet runs; no third party can join today |
+| Weak-subjectivity checkpoints | yes | **boot gate wired** (`crates/bloch-pos-node/src/ws_boot.rs`, `--ws-checkpoint`) — but **no Phase A signer keys are baked into any build, including the fleet's**, and checkpoint-sync **state download** does not exist | boot gate runs; genesis anchor is the only checkpoint in practice |
 | EVM at L1 | proposal; direction accepted (`docs/adr/ADR-040-evm-and-ustav-at-l1.md`) | **no code exists** — the authorization model is an open founder decision | no |
 | Ustav (PSTRN-1) charter at L1 | proposal | no — nothing wired | no |
 | Third-party audit | scoped | pre-audit dossier written | **not performed** |
@@ -243,6 +318,12 @@ it. Measured 2026-08-13 on a clean checkout, `--release`:
 | `bloch-pos-node` | 93 passed, 0 failed — **but see the flake below** |
 | `genesis4-ceremony` | 10 passed, **18 failed** |
 | `bloch` (Genesis-3, retired) | 304 passed, **1 failed** |
+
+The two Genesis-4 rows were re-measured on **2026-08-14**, twice, and hold:
+`cargo test -p bloch-pos-committee -p bloch-pos-node` is **461 passed, 0
+failed, 1 ignored** — 459 test-binary cases plus 2 doc-tests. The flake below
+did not fire on either run. The other two rows are as measured 2026-08-13 and
+were not re-run here.
 
 Every one of these reproduces on `e17faef`, the commit before the
 reorganisation. The move introduced none of them. The `bloch-pos-node` entry

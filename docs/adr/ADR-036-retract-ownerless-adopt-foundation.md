@@ -2,7 +2,7 @@
 
 # ADR-036 — Retract the ownerless thesis; adopt a Solana-style foundation
 
-- **Status:** Accepted (founder decision, 2026-08-10)
+- **Status:** Accepted (founder decision, 2026-08-10) — **executed.** Genesis-4 launched on 2026-08-13 under the model this ADR adopted: the Foundation holds 29,000,000,000 BLCH (VC 10 B, team 10 B, marketing 4 B, liquidity 5 B) and the founder 27,046,829,380, together 56,046,829,380 of the 57,146,400,000 issued at slot 0. The Foundation board does not exist yet, so "the Foundation" is the founder in practice (`BLOCH-TOKENOMICS-V4.md` §3.3.1).
 - **Retracts:** ADR-033 (decentralisation model / ownerless base), ADR-034
   (founder anonymisation and relinquishment pact)
 - **Relates to:** `docs/specs/BLOCH-TOKENOMICS-V4.md`,

@@ -231,6 +231,19 @@ pre .fl{color:var(--brass);}
 
 <main class="wrap">
 
+  <!-- ============ STATUS BANNER ============
+       Genesis-3 (proof of work) stopped permanently at height 39,918 on
+       2026-08-13; Genesis-4 (proof of stake) has been live since 21:31:19 UTC
+       that day. Every mining instruction on this page addresses a chain that no
+       longer accepts work. The page is kept as a record rather than rewritten,
+       because what replaces a mining pool site is a comms decision, not an
+       edit. Do not remove this banner while the mining copy is still here. -->
+  <section aria-label="Status" style="border:2px solid var(--brass-hi,#c9a227);border-radius:10px;padding:1.1rem 1.3rem;margin:0 0 2rem;background:rgba(201,162,39,.08)">
+    <p style="margin:0 0 .6rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em">Historical &mdash; there is nothing to mine</p>
+    <p style="margin:0 0 .6rem">Bloch stopped being proof of work on <b>2026-08-13</b>. The Genesis-3 chain halted permanently at height <b>39,918</b>, and <b>Genesis-4, proof of stake</b>, has been live since 21:31:19&nbsp;UTC that day &mdash; 30&nbsp;s slots, 32-slot epochs, finality by epoch. There is no hashrate, no stratum and no pool. <b>Every endpoint, command and payout claim below is a record of a chain that no longer accepts work. Do not point a miner at it.</b></p>
+    <p style="margin:0">The security question is no longer hashrate, it is concentration: all 64 Genesis-4 validators are operated by a single entity, 93.94% of the carryover sits at one address, and 56.05&nbsp;B of the 57.15&nbsp;B BLOCH issued at genesis is held by the founder and the Foundation. One operator can halt the chain and one holder can outvote every other. A third party cannot yet join: the transport has a fixed peer list and no discovery, and bonding is refused at every node&rsquo;s mempool.</p>
+  </section>
+
   <!-- ============ HERO ============ -->
   <section class="hero" aria-labelledby="hero-title">
     <div>
@@ -263,7 +276,7 @@ pre .fl{color:var(--brass);}
 
     <div class="warn" role="note" style="border-color:#c98a3f;background:rgba(201,138,63,.09);margin-top:1.4rem">
       <span class="ic" aria-hidden="true">&#9935;</span>
-      <p><strong>Merged mining (AuxPoW) is live</strong> — activated at Bloch block <b>8,500</b>. Bloch runs the same double-SHA-256 as Bitcoin, so a single hash can secure both chains. Point a rig at the <b>merged pool</b> below to dual-mine; solo Bloch mining is unchanged. Rigs don't resolve DNS — <b>use the IP</b>.</p>
+      <p><strong>Merged mining (AuxPoW) ran on Genesis-3 and ended with it</strong> — activated at Bloch block <b>8,500</b>, stopped at block <b>39,918</b> on 2026-08-13. Bloch runs the same double-SHA-256 as Bitcoin, so a single hash can secure both chains. Point a rig at the <b>merged pool</b> below to dual-mine; solo Bloch mining is unchanged. Rigs don't resolve DNS — <b>use the IP</b>.</p>
     </div>
 
     <div class="connect-panel" style="margin-top:1.6rem">

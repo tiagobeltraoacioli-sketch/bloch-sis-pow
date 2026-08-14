@@ -1,5 +1,17 @@
 # Bloch SDK code generator
 
+> ## ⛔ Historical — Genesis-3.
+>
+> `docs/openapi.yaml`, and therefore every client this generator emits,
+> describes the **Genesis-3 proof-of-work JSON-RPC surface**. That chain stopped
+> permanently at height 39,918 on 2026-08-13. The live chain is **Genesis-4,
+> proof of stake**, whose RPC (`crates/bloch-pos-node/src/rpc.rs`, public read
+> endpoint `https://posternlabs.com/g4rpc`) exposes a different and much smaller
+> method set — `getblockbyslot`, `getvalidator`, `getvalidatorcount`,
+> `getchaininfo`, `listunspent`, … — and is **not** described by the spec this
+> generator reads. Regenerating produces Genesis-3 clients. Writing a Genesis-4
+> spec is the work that would change that; nothing here does it.
+
 **The spec drives the clients. Regenerate on any spec change.**
 
 `generate.py` reads the single source of truth — `docs/openapi.yaml` (OpenAPI
@@ -78,8 +90,12 @@ already-signed raw tx hex; each client exposes a `Signer` interface seam only.
 
 ## Rails
 
-SCAFFOLD / generated / unaudited / pre-production. Bloch is ownerless and
-neutral (no privileged access). Base is experimental mainnet-beta (k=4 trivially
-forgeable, 51%-attackable). BLCH is neutral protocol gas, NOT a security,
-worthless by design as anything but gas; 17% premine disclosed. Plans, not
-promises.
+SCAFFOLD / generated / unaudited / pre-production. No privileged access
+("ownerless" retracted — `docs/adr/ADR-036-retract-ownerless-adopt-foundation.md`).
+The generated clients target the retired Genesis-3 chain. Under the live
+Genesis-4 chain the security question is concentration, not hashrate: all 64
+validators are run by one entity, 93.94% of the carryover sits at a single
+address, and 56.05 B of the 57.15 B BLOCH issued at genesis is held by the
+founder and the Foundation. BLCH is neutral protocol gas, NOT a security; the
+"17% premine" is Genesis-3 tokenomics V2 — under Genesis-4 the founder holds
+27.04% of the 100 B cap. Plans, not promises.

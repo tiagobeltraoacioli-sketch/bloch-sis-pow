@@ -1,5 +1,15 @@
 # Release Process
 
+> **Historical runbook — proof-of-work era.** This describes the release flow
+> for the Bloch-SIS Protocol proof-of-work node (`v0.5.x`/`v0.6.x`), for a
+> chain that stopped permanently at height 39,918 on 2026-08-13. The live chain
+> is **Genesis-4, proof of stake**, and its node is `crates/bloch-pos-node`;
+> the surfaces named below (Docker Hub `blochlayer/bloch`, the Akash SDLs, the
+> GitHub Release page, the `v0.5.N` version line) are **not** the release path
+> for it. Kept as the record of how proof-of-work releases were cut; do not
+> follow it for a Genesis-4 release without confirming each surface still
+> exists and is still the intended one.
+
 This document is the operational runbook for cutting a new Bloch-SIS Protocol (BLOCH)
 release. It exists because the flow touches four surfaces — the source
 repo, the Docker Hub registry, the Akash SDL deployments, and the

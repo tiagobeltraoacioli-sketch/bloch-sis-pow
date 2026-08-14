@@ -13,17 +13,30 @@ RAILS = """\
 - **SCAFFOLD / generated / pre-production / UNAUDITED.** This client is
   machine-generated from `docs/openapi.yaml` and has not completed a security
   audit. Expect rough edges; pin a commit and review before production use.
-- **Bloch is ownerless and neutral.** There is no admin key, no privileged
-  access, and no company behind the base protocol. This SDK is community
-  tooling; it grants no special rights and makes no promises of support.
-- **Base is experimental mainnet-beta.** Proof-of-work runs at a small
-  structural width (k = 4 below the SF-1 activation height); at k = 4 the
-  witness is **trivially forgeable** and the chain is **51%-attackable**. Do
-  not treat confirmations as economically final.
+- **HISTORICAL — GENESIS-3.** This client targets the Genesis-3 proof-of-work
+  JSON-RPC surface, and that chain stopped permanently at height 39,918 on
+  2026-08-13. The live chain is **Genesis-4, proof of stake** (30 s slots,
+  32-slot epochs, finality by epoch), whose RPC exposes a different and much
+  smaller method set. Do not point this client at the live chain.
+- **This SDK grants no special rights** and makes no promises of support.
+  ("Ownerless / no company behind the base protocol" was retracted — see
+  `docs/adr/ADR-036-retract-ownerless-adopt-foundation.md`.)
+- **The security question is concentration, not hashrate.** The old caveat here
+  — k = 4, witness trivially forgeable, the chain 51%-attackable — described
+  Genesis-3 and was true of it. Under Genesis-4: **all 64 validators are run by
+  one entity**, **93.94% of the carryover sits at a single address**, and
+  **56.05 B of the 57.15 B BLOCH issued at genesis is held by the founder and
+  the Foundation**. One operator can halt the chain and one holder can outvote
+  every other. A third party cannot yet join — the transport is a
+  point-to-point TCP full mesh with a fixed peer list, no discovery and no
+  authentication, and `Deposit`/`Delegate` are refused at every node's mempool.
 - **BLCH is neutral protocol gas.** It is **NOT a security**, share, or claim
   on anyone's revenue — no yield, dividend, or profit is offered or implied.
-  BLCH is worthless by design as anything other than gas. A **17% premine is
-  disclosed**.
+  The "17% premine" is Genesis-3 tokenomics V2 and no longer describes the
+  supply: under Genesis-4 the founder holds **27.04% of the 100 B cap**
+  (`FOUNDER_TOTAL_BLOCH` in
+  `crates/bloch-pos-committee/src/tokenomics_v4.rs`) and the Foundation a
+  further **29.00%**.
 - **Plans, not promises.** Anything forward-looking here is a plan and may
   change or never ship.
 
@@ -308,12 +321,19 @@ PY_INIT = '''\
 #
 # blochclient — community Python client for the Bloch JSON-RPC surface.
 #
-# SCAFFOLD / generated / pre-production / UNAUDITED. Bloch is ownerless and
-# neutral; this SDK is permissively-licensed community tooling with no
-# privileged access. Base is experimental mainnet-beta (k=4 trivially
-# forgeable, 51%-attackable). BLCH is neutral protocol gas, NOT a security,
-# worthless by design as anything but gas; 17% premine disclosed. Plans, not
-# promises.
+# HISTORICAL — GENESIS-3. This client targets the Genesis-3 proof-of-work
+# JSON-RPC surface; that chain stopped permanently at height 39,918 on
+# 2026-08-13. The live chain is Genesis-4, proof of stake, whose RPC exposes a
+# different and much smaller method set.
+#
+# SCAFFOLD / generated / pre-production / UNAUDITED. Permissively-licensed
+# community tooling with no privileged access ("ownerless" retracted, ADR-036).
+# Under Genesis-4 the security question is concentration, not hashrate: all 64
+# validators are run by one entity, 93.94% of the carryover sits at a single
+# address, and 56.05 B of the 57.15 B BLOCH issued at genesis is held by the
+# founder and the Foundation. BLCH is neutral protocol gas, NOT a security; the
+# "17% premine" is Genesis-3 tokenomics V2 — under Genesis-4 the founder holds
+# 27.04% of the 100 B cap. Plans, not promises.
 
 from .client import BlochClient, DEFAULT_RPC_URL, DEFAULT_RPC_PORT
 from .errors import BlochRpcError, BlochTransportError
@@ -1016,11 +1036,19 @@ GO_DOC = '''\
 //
 // SCAFFOLD / generated / pre-production / UNAUDITED. It is generated from
 // docs/openapi.yaml by sdk/codegen/generate.py — the spec drives the client;
-// regenerate on any spec change. Bloch is ownerless and neutral; this SDK is
-// permissively-licensed community tooling with no privileged access. The base
-// is experimental mainnet-beta (k=4 trivially forgeable, 51%-attackable). BLCH
-// is neutral protocol gas, NOT a security, worthless by design as anything but
-// gas; a 17% premine is disclosed. Plans, not promises.
+// regenerate on any spec change.
+//
+// HISTORICAL — GENESIS-3. The spec describes the Genesis-3 proof-of-work
+// JSON-RPC surface; that chain stopped permanently at height 39,918 on
+// 2026-08-13. The live chain is Genesis-4, proof of stake, whose RPC exposes a
+// different and much smaller method set. Permissively-licensed community
+// tooling with no privileged access ("ownerless" retracted, ADR-036). Under
+// Genesis-4 the security question is concentration, not hashrate: all 64
+// validators are run by one entity, 93.94% of the carryover sits at a single
+// address, and 56.05 B of the 57.15 B BLOCH issued at genesis is held by the
+// founder and the Foundation. BLCH is neutral protocol gas, NOT a security;
+// the "17% premine" is Genesis-3 tokenomics V2 — under Genesis-4 the founder
+// holds 27.04% of the 100 B cap. Plans, not promises.
 //
 // Both Bloch failure shapes are surfaced: the standard top-level error object
 // (transport/auth: -32001/-32002) as *RPCError with Source "jsonrpc-error", and
@@ -1234,9 +1262,13 @@ already-signed raw tx hex; each client exposes a `Signer` interface seam only.
 
 ## Rails
 
-SCAFFOLD / generated / unaudited / pre-production. Bloch is ownerless and
-neutral (no privileged access). Base is experimental mainnet-beta (k=4 trivially
-forgeable, 51%-attackable). BLCH is neutral protocol gas, NOT a security,
-worthless by design as anything but gas; 17% premine disclosed. Plans, not
-promises.
+SCAFFOLD / generated / unaudited / pre-production. No privileged access
+("ownerless" retracted — `docs/adr/ADR-036-retract-ownerless-adopt-foundation.md`).
+The generated clients target the retired Genesis-3 chain. Under the live
+Genesis-4 chain the security question is concentration, not hashrate: all 64
+validators are run by one entity, 93.94% of the carryover sits at a single
+address, and 56.05 B of the 57.15 B BLOCH issued at genesis is held by the
+founder and the Foundation. BLCH is neutral protocol gas, NOT a security; the
+"17% premine" is Genesis-3 tokenomics V2 — under Genesis-4 the founder holds
+27.04% of the 100 B cap. Plans, not promises.
 '''

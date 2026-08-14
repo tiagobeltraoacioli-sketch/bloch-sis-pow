@@ -4,7 +4,11 @@
 
 ```
 Document:   BLOCH-POS-NODE-INTEGRATION
-Status:     DRAFT — plan for review; the skeleton it describes is in-tree
+Status:     EXECUTED, in part — the node this plans was built and Genesis-4 has
+            been live on it under proof of stake since 21:31:19 UTC on
+            2026-08-13. Read it as a plan with an outcome, not as a forecast.
+            What shipped, what shipped differently and what did not ship at
+            all is in the banner below and, per item, in BLOCH-POS-GAPS.md §3.
 Created:    2026-08-11
 Owner:      PMO
 Code:       crates/bloch-pos-node/  (binary: bloch-pos)
@@ -13,6 +17,26 @@ Relates:    BLOCH-POS-INTERFACES.md (frozen traits),
             BLOCH-WEAK-SUBJECTIVITY.md, BLOCH-ATTESTATION-GOSSIP.md
             (both partially superseded — read their seals first)
 ```
+
+> **Outcome, 2026-08-14.** `crates/bloch-pos-node` exists and runs the live
+> chain: `engine`, `genesis`, `store`, `net`, `p2p`, `rpc`, `keys`, `ws_boot`,
+> `codec`. Three departures from this plan are load-bearing and are corrected
+> where they appear below rather than only here:
+>
+> 1. **Persistence is not RocksDB.** `store.rs` is an append-only log of block
+>    envelopes plus a `meta` marker; restart replays through the same
+>    `Transition`. The §3.3 column families were not built.
+> 2. **The transport the fleet runs is the devnet TCP full mesh** — a fixed
+>    peer list, no discovery, no authentication. A libp2p/gossipsub layer
+>    exists behind `--transport libp2p` but is not what the live network uses.
+>    **A third party cannot join the network today.** Nothing in this document
+>    should be read as claiming a production network layer is in service.
+> 3. **`Deposit` and `Delegate` are refused at every node's mempool** because
+>    bonding is not funded from the UTXO set (`engine.rs:1901`). Transfers are
+>    open. The "every later validator joins through the ordinary deposit path"
+>    assumption below is therefore not yet operative.
+>
+> All 64 validators on the live chain are operated by a single entity.
 
 This document answers four questions: **where** the PoS consensus loop lives,
 **how** its state is persisted, **where** the boundary sits between the pure
@@ -26,8 +50,10 @@ running Genesis-4 node, without touching the chain that is about to halt.
 ## 0. The hard rule, restated as architecture
 
 **The Genesis-3 validation path does not change.** The chain the repo-root
-`src/main.rs` validates halts at height 80,000 (`BLOCH-TOKENOMICS-V4.md`
-§3.2); its one remaining consensus job is to stop correctly. Genesis-4 is a
+`src/main.rs` validated **stopped permanently at height 39,918 on 2026-08-13**
+(`BLOCH-TOKENOMICS-V4.md` §3.2) — not at the 80,000 this plan was written
+against, and not at the 50,000 that replaced it. Its one remaining consensus
+job was to stop correctly, and it has stopped. Genesis-4 is a
 **new binary built from a fresh genesis**, not a patch, not a feature flag,
 not a flag-day inside the old process. Any plan step that would require
 editing the Genesis-3 acceptance path is, by that fact alone, wrong.
@@ -43,12 +69,14 @@ The rule is made structural rather than disciplinary, three ways:
    `Cargo.lock`, and the root package never depends on it. Dependency flow is
    one-way and by path: `bloch-pos-node → bloch-pos-committee` (and later
    `→ bloch-crypto` for the hybrid verifier). Nothing flows back.
-3. **Separate database.** The Genesis-4 node opens its own RocksDB in its own
+3. **Separate database.** The Genesis-4 node opens its own store in its own
    default data dir and **refuses** to open a Genesis-3 database (§3.4). The
    two chains share no storage, so no schema change here can corrupt the
-   chain that must halt cleanly.
+   chain that must halt cleanly. *(Shipped: the refusal rule is enforced in
+   `store.rs::Store::open`. The store itself is an append-only block log, not
+   RocksDB — see §3.1.)*
 
-What Genesis-3 *does* need before height 80,000 — the terminal-height
+What Genesis-3 needed before it stopped — the terminal-height
 consensus rule and the signed snapshot artifact (§3.2.1–3.2.2 of the
 tokenomics doc) — is a **separate, minimal work item on the old tree**, owned
 outside this plan precisely so this plan never has a reason to touch that
@@ -209,6 +237,18 @@ Three composition rules, all downstream of the 2026-08-08 consensus split:
 
 ### 3.1 One database, fresh
 
+> **Shipped differently.** This section describes RocksDB. The node does not
+> use RocksDB. `crates/bloch-pos-node/src/store.rs` persists the **inputs** —
+> the genesis manifest digest plus every applied block envelope, framed
+> `u32 LE length ‖ envelope bytes`, appended with `write_all` + fsync — and
+> rebuilds state on boot by replaying them through the same `Transition` that
+> accepted them live. The reason is given at `store.rs:7-21`: `CommittedState`
+> has no serialization, and adding one privately here would have created a
+> second byte layout for committed state, which is the twin-derivation defect
+> this repo keeps paying for. The cost is stated rather than hidden: **boot is
+> O(chain length)**. The schema below is unbuilt work, not a description of
+> the running node.
+
 RocksDB with column families, same operational shape as the Genesis-3 node
 (the fleet knows how to run, back up and snapshot it) but a **new database in
 a new default data dir** (`~/.bloch-pos/genesis4`, overridable with
@@ -273,7 +313,8 @@ must not preclude it, and this one doesn't.
 The `genesis/` loader consumes one file (the "genesis manifest"), reviewed
 and published ahead of launch:
 
-- the **signed snapshot artifact digest** (the height-80,000 balance set —
+- the **signed snapshot artifact digest** (the terminal-height balance set —
+  h39,918, 452,726 outputs, 18,146,400,000 BLOCH after the ×100/21 split —
   the artifact is canonical, not the halted chain; the digest is embedded in
   the genesis block per tokenomics §3.2.2),
 - the carryover balance set itself (as `carryover.tsv`-style data, verified
@@ -316,7 +357,17 @@ plan-level facts:
 
 `crates/bloch-pos-node/src/p2p.rs`, selected with `--transport libp2p`. The
 devnet TCP mesh (`net.rs`) stays as the default so the 64-validator devnet
-result remains reproducible by running the same command. What landed:
+result remains reproducible by running the same command.
+
+> **And the default is what the live mainnet fleet runs.** The 64 Genesis-4
+> validators are on `--transport devnet`: a fixed peer list, no discovery, no
+> authentication, no peer scoring, no admission control. The libp2p layer
+> below **exists but is not in service**, and this section must not be read as
+> saying Bloch has a production network layer. It is why a third party cannot
+> connect a node to the network today. The name "devnet" is accurate about the
+> *transport*; the network, the chain and the binary are mainnet.
+
+What landed:
 Genesis-4-only protocol ids (`/bloch-g4/meshsub/1.1.0`, `/bloch-g4/sync/1`,
 identify `/bloch-g4/1.0.0`, topics `bloch-g4/*`), both 2026-08-07 mesh fixes
 with a test that fails if P3/P3b are re-inherited, the yamux/request-response

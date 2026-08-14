@@ -2,7 +2,38 @@
 
 # BLOCH-POS-NETWORK-CAPACITY — the G10 byte budget, with EVM at L1
 
-> **Owner:** A9 (network capacity). **Status:** draft for review.
+> **Genesis-4 is live.** Bloch has been running under **proof of stake** since
+> 21:31:19 UTC on 2026-08-13, when Genesis-3 (proof of work) stopped
+> permanently at height **39,918**. 30 s slots, 32-slot epochs, Casper-style
+> justification/finalisation by epoch, hybrid ML-DSA-65 ‖ Falcon-1024
+> signatures on every consensus path. Nothing in this document that describes
+> mining, hashrate, difficulty, retargeting or proof-of-work depth describes
+> the current network.
+>
+> **The live security question is concentration, not hashrate.** All 64
+> validators are operated by a single entity; 93.94% of the carryover
+> (17,046,829,380 of 18,146,400,000 BLOCH) sits at one address and carried
+> balances are stakeable, so if that balance stakes the Nakamoto coefficient
+> is 1; and 56,046,829,380 of the 57,146,400,000 BLOCH issued at slot 0 is
+> held by the founder and the Foundation, leaving 1.92% of genesis supply in
+> third-party hands. One operator can halt the chain and one holder can outvote
+> every other. The live transport is a point-to-point TCP full mesh with a
+> fixed peer list, **no discovery and no authentication**, and
+> `Deposit`/`Delegate` are refused at every node's mempool — which is why a
+> third party cannot yet join the network or become a validator.
+
+> **Owner:** A9 (network capacity). **Status:** draft for review; §4.5 and §7
+> re-swept 2026-08-14 against the shipped node.
+>
+> **What the live fleet actually runs (read before using any number here):**
+> Genesis-4 has been live under proof of stake since 21:31:19 UTC on
+> 2026-08-13, and its transport is **`--transport devnet`** — a point-to-point
+> TCP full mesh with a fixed peer list, no discovery and no authentication,
+> which is why a third party cannot yet join the network. A libp2p/gossipsub
+> layer exists in `crates/bloch-pos-node/src/p2p.rs` and is **not** the
+> transport in service. Every gossipsub budget below therefore applies to a
+> layer the fleet is not using, and G10 cannot be judged from the live network
+> as configured.
 > **Gate under analysis:** G10 (`BLOCH-POS-SHA3-LATTICE-MIGRATION.md` §11):
 > *"54 KB/block average and the epoch-boundary burst (≈ 588 KB) sustained on
 > the real fleet for ≥ 14 days: no gossip-mesh degradation, no yamux
@@ -324,13 +355,26 @@ attestations. **Open item, owner DEV-3, listed in §7's test matrix.**
 
 ### 4.5 What Genesis-4 actually has today — stated honestly
 
-`crates/bloch-pos-node` is a **skeleton with no networking at all**
-(its own Cargo.toml says so; the only dependency is the pure consensus
-crate). Nothing in this section is "done" for Genesis-4 — what is verified
-is that the *source* layer G4 will copy has all three fixes, and that the
-new policy crate repeats none of the root causes (it touches no socket, no
-`TopicScoreParams`, no yamux — it cannot). The copy-and-adapt step is where
-a regression would happen. Two mandatory guards for that step:
+~~`crates/bloch-pos-node` is a **skeleton with no networking at all**~~
+
+**Superseded 2026-08-13.** The node has two transports:
+
+- **`net.rs` — the devnet TCP full mesh, the default and what the live fleet
+  runs.** Fixed peer list, no discovery, no authentication, no peer scoring,
+  no admission control, and it carries no `Origin`, so `gossip.rs`'s verdicts
+  have nowhere to go on this path. **This is not a production network layer
+  and must not be described as one.**
+- **`p2p.rs` — libp2p + gossipsub, behind `--transport libp2p`.** It carries
+  all three 2026-08-07 fixes by construction: no `add_explicit_peer()`,
+  `TopicScoreParams` written field-by-field with no `..Default::default()`
+  tail (so an upstream field addition breaks the build rather than silently
+  re-arming P3), and `MAX_YAMUX_STREAMS` > `MAX_CONCURRENT_SYNC_STREAMS`
+  pinned by a `const` assertion. `score_params_have_no_p3` pins the second.
+
+So the copy-and-adapt step described below happened and the guards were
+built. What is still true is that **none of it is exercised by the live
+network**, because the fleet runs the devnet mesh. G10 remains unjudged. The
+two guards, as originally written:
 
 1. The §4.2 startup assertion (P3/P3b zero on every topic), written as code
    in M2, not as a checklist item.
@@ -416,11 +460,16 @@ in-process two-node harness affordance exists (`listen_report`,
 `mod.rs:604–612`, used by `tests/sprint_ee_convergence.rs`). The plan builds
 outward from that proven method instead of starting on the fleet.
 
-### L0 — localhost mesh soak (runs today, against the Genesis-3 binary)
+### L0 — localhost mesh soak
 
-The G4 network layer does not exist yet (§4.5); attestation-*sized* traffic
-can still be characterised now, because gossipsub does not care what the
-bytes mean.
+> **Re-scoped 2026-08-14.** This step was written as "runs today, against the
+> Genesis-3 binary" because the G4 network layer did not exist. It does now
+> (`p2p.rs`), so L0 should run against `bloch-pos --transport libp2p`. The
+> Genesis-3 binary is a dead chain's binary and is no longer a sensible
+> harness for characterising Genesis-4 traffic.
+
+Attestation-*sized* traffic can be characterised on a localhost mesh, because
+gossipsub does not care what the bytes mean.
 
 - **Setup:** 12 in-process or local-process nodes (the `listen_report`
   harness), default mesh params, the three existing topics.

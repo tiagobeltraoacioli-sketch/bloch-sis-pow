@@ -2,6 +2,20 @@
 
 # Public-release audit — BlochPOS → public Bloch repository
 
+> **Measured 2026-08-12, one day before the chain changed underneath it.** This
+> is a pre-publication decision record, not a description of the network. Its
+> **security findings stand as measured** — no secret was found across all 392
+> revisions, and the publish / do-not-publish verdicts are unaffected by
+> anything that happened after. What *has* changed: the proof-of-work chain
+> this repository was serving **stopped permanently at height 39,918 on
+> 2026-08-13**, and the live chain is **Genesis-4, proof of stake** (30 s
+> slots, 32-slot epochs, finality by epoch). So every sentence below that
+> speaks of a live mainnet producer, merged mining, stratum pool URLs, or
+> miner onboarding is describing a **dead chain's** operations. Those claims
+> are marked in place. The branch name `deploy/g3-terminal-50000` appears
+> throughout and is kept because it is the branch's actual name — **50,000 was
+> a planned terminal height the chain never reached.**
+
 > **Redacted for publication.** Host addresses by role, SSH key filenames, Cloudflare
 > account/zone/tunnel identifiers, per-box free disk and RAM, and firewall rule listings
 > were replaced with placeholders. None of them were secrets — together they were an
@@ -101,10 +115,15 @@ yet public, this is an ordinary edit — **no history rewrite is required.**
 
 Maps each box IP to the binary path running on it, the home directory layout
 (`~/bloch-regossip`, `~/BlochSISPoW-project/target/release/bloch`), and states
-plainly that a live mainnet producer runs an unidentifiable binary with dirty
-working tree. Honest engineering history, and the project's culture is to
-publish exactly this kind of thing. But it also advertises that the producer's
-running code is unverified.
+plainly that the **Genesis-3 mainnet producer, as it stood on 2026-08-12**, ran
+an unidentifiable binary with a dirty working tree. Honest engineering history,
+and the project's culture is to publish exactly this kind of thing. But it also
+advertises that that producer's running code was unverified.
+
+**Status note:** there is no PoW producer today — Genesis-3 stopped at height
+39,918 on 2026-08-13. The document is a record of a dead fleet, which lowers its
+operational sensitivity but does not make it inaccurate as history. It says
+nothing about the Genesis-4 validator fleet.
 
 **Verdict: founder decision** — publishing it is defensible and in character;
 just make it a conscious choice, not a side effect. No secret in it.
@@ -114,7 +133,8 @@ just make it a conscious choice, not a side effect. No secret in it.
 *Files:* `fleet-recovery/addr.rs.new`, `fleet-recovery/auxpow-uncommitted.patch`,
 `fleet-recovery/tracked.patch`. **Not in the public repo.**
 
-Used as the test vector for the merged-mining stratum worker-username parser,
+Used as the test vector for the Genesis-3 merged-mining stratum worker-username
+parser (merged mining ended with the PoW chain),
 paired with the founder Bloch address. A Bitcoin address is public by
 construction and cannot spend anything. The issue is **linkability**: publishing
 it next to the founder address ties a real BTC address to the project's payout
@@ -129,16 +149,25 @@ documentation-reserved address before publishing. No history rewrite needed.
 `136.244.82.226`, `RELAY_IP`, `PRODUCER_IP` appear in
 `docs/CARRYOVER.md`, `docs/SNAPSHOT-BOOTSTRAP.md`,
 `apps/posternpool-site/index.html` and `apps/explorer/wrangler.toml`. **All four
-files are already on the public GitHub repo**, and in each case the IP is a
-*published service endpoint*: `--peer /ip4/…/tcp/16116` bootstrap peers, and
-`stratum+tcp://…:3336` pool URLs that miners are told to use because rigs do not
-do DNS.
+files are already on the public GitHub repo**, and in each case the IP was a
+*published service endpoint* **of the Genesis-3 chain**: `--peer
+/ip4/…/tcp/16116` bootstrap peers, and `stratum+tcp://…:3336` pool URLs that
+miners were told to use because rigs do not do DNS. **None of this is live
+onboarding today** — Genesis-3 stopped at height 39,918 on 2026-08-13, there is
+no mining to point a rig at, and the Genesis-4 transport is a fixed-peer TCP
+mesh with no discovery and no authentication, so those bootstrap addresses admit
+nobody. The live public read endpoint is <https://posternlabs.com/g4rpc>.
 
 `apps/explorer/wrangler.toml` argues the point itself, in a comment already
 public: *"The archival node's IP is a public fact about a read-only public RPC;
 there is nothing here to keep secret."*
 
-**Verdict: can go public.** Removing them would break documented onboarding.
+**Verdict (unchanged): can go public.** They are already published and they are
+public service endpoints. The original reason given — "removing them would break
+documented onboarding" — **no longer holds**: the onboarding they support is for
+a chain that has stopped. The verdict now rests only on the fact that they are
+already public and non-secret; anyone maintaining that documentation should mark
+it historical rather than leave miners pointing rigs at a dead chain.
 
 ### F-5 — Founder address `bloch1qe986db…42073` → **can go public (already is)**
 
@@ -151,14 +180,29 @@ password is held by the founder only — the file itself is not in the repo and
 never was.
 
 **Verdict: can go public.** Note it makes supply concentration trivially
-auditable, which is the stated intent.
+auditable, which is the stated intent. Under Genesis-4 what it makes auditable
+is: founder 27,046,829,380 BLOCH = 27.04 % of the 100 B hard cap
+(`FOUNDER_TOTAL_BLOCH`, pinned at 2704 bps in `tokenomics_v4.rs`), Foundation a
+further 29.00 %, the two together holding 56,046,829,380 of the 57,146,400,000
+issued at genesis. (`tokenomics_v2.rs` named above is the **retired** Genesis-3
+schedule, not the live supply.)
 
 ### F-6 — `carryover.tsv.gz` (15.8 MB, tracked) → **can go public (already is)**
 
-The Genesis-1 → Genesis-3 opening-balance snapshot, ~413k UTXOs. It is balance
-data, and it does reveal the concentration. It is **already on the public repo**,
-and it is consensus input: without it a fresh node cannot reproduce the genesis
-state, which is the whole point of `REPRO.md`. Its `.sha256` sits beside it.
+The Genesis-1 → **Genesis-3** opening-balance snapshot, 413,743 UTXOs
+(3,475,441,200 BLOCH). It is balance data, and it does reveal the concentration.
+It is **already on the public repo**, and it is consensus input: without it a
+fresh node cannot reproduce the genesis state, which is the whole point of
+`REPRO.md`. Its `.sha256` sits beside it.
+
+**Do not confuse this with the Genesis-4 carryover**, which is a different
+measurement taken at Genesis-3 height **39,918**: **18,146,400,000 BLOCH over
+452,726 outputs** (`CARRYOVER_TOTAL_BLOCH`, `CARRYOVER_MEASURED_UTXOS`,
+`CARRYOVER_MEASURED_HEIGHT` in `crates/bloch-pos-committee/src/tokenomics_v4.rs`).
+That snapshot reveals concentration far more sharply: 93.94 % of it —
+17,046,829,380 BLOCH — sits at a single address. Publishing it is still the
+right call; the concentration is the thing the publication is supposed to make
+auditable.
 
 **Verdict: can go public.** Withdrawing it now would both be futile (already
 published) and break verifiability.
@@ -170,6 +214,10 @@ published) and break verifiability.
 the public repo**, and `deploy/artifacts/` is in `.gitignore` — it was committed
 before the ignore rule, on a branch that is not an ancestor of HEAD.
 `deploy/artifacts/bloch-snapshot-utxo` (9.7 MB) is the same story.
+
+*(The branch name is quoted as-is because that is what it is called. It does
+not mean the chain ended at 50,000 — that was a planned ceiling, superseded;
+Genesis-3 stopped at height **39,918** on 2026-08-13.)*
 
 **Verdict: do not publish that branch.** If `deploy/g3-terminal-50000` must be
 published, the binaries have to come out of *its* history first — that is a
@@ -348,9 +396,13 @@ Note `.claude/` supersedes the current `.claude/worktrees/` line and requires
 
 It is configured here as remote `github`. A second public home exists on GitLab:
 `https://gitlab.com/blochsispow-group/BlochSISPoW-project` (remote
-`upstream-gitlab`, API 200 → public, also linked from the site). The private
-PoS repo is `https://gitlab.com/blochsispow-group/bloch-pos` (remote `origin`,
-API **404** unauthenticated → private, as expected).
+`upstream-gitlab`, API 200 → public, also linked from the site). The PoS repo is
+`https://gitlab.com/blochsispow-group/bloch-pos` (remote `origin`), which
+**as measured on 2026-08-12** returned API **404** unauthenticated → private.
+Every visibility value in this section is a 2026-08-12 measurement; re-check
+before relying on any of them, and in particular do not assume the PoS repo is
+still private — publishing it is one of the decisions this document exists to
+tee up.
 
 State relative to local:
 

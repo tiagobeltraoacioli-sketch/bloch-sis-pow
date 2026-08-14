@@ -1,5 +1,12 @@
 # Postern OS — the attestation chain (immutable → measured → attested)
 
+> **Scope: the Genesis-3 image, and nothing on the live fleet.** The image at
+> the top of this chain is `attested-image`, built from `os/package.nix`, which
+> builds `bloch` — the proof-of-work node whose chain stopped permanently at
+> height 39,918 on 2026-08-13. The live chain is **Genesis-4, proof of stake**;
+> `bloch-pos` is not packaged for Nix, no live validator runs an attested image,
+> and no attestation described here is part of the running network.
+
 How the immutable/attestable profile (`os/attested.nix`) turns a reproducible OS
 into a *remotely provable* one, reusing the existing L1/L2/L3 layers. This is the
 **Postern Seal** attestation product — a Postern Labs product.

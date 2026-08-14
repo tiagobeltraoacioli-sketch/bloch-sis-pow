@@ -2,6 +2,27 @@
 
 # Bloch PoS (Genesis-4 / Bell) — Threat Model, second pass
 
+> ## The threat, stated first
+>
+> **The dominant risk on the live Genesis-4 network is concentration, not any
+> finding numbered in this document.** All 64 validators are operated by a
+> single entity; 93.94% of the carryover (17,046,829,380 of 18,146,400,000
+> BLOCH) sits at one address and carried balances are stakeable, so if that
+> balance stakes the Nakamoto coefficient is 1; and 56,046,829,380 of the
+> 57,146,400,000 BLOCH issued at slot 0 is held by the founder and the
+> Foundation, leaving 1.92% of genesis supply in third-party hands. One
+> operator can halt the chain and one holder can outvote every other.
+>
+> A third party cannot yet join: the live transport is a fixed-peer TCP mesh
+> with no discovery and no authentication, and `Deposit`/`Delegate` are refused
+> at every node's mempool. Genesis-3 (proof of work) stopped permanently at
+> height 39,918 on 2026-08-13; there is no hashrate in this threat model
+> because there is no mining.
+>
+> The findings below are a **design** review dated 2026-08-11, retained for
+> its reasoning. Several of its premises changed; the ones that changed are
+> annotated in place.
+
 > **Premissa de churn SUPERADA — 2026-08-11.** Este passe foi escrito com
 > `WARMUP_RATE_BPS = 900` e piso `MIN_DELEGATION_SAT`. Depois dele o fundador
 > aceitou a proposta de `BLOCH-POS-STAKE-CHURN.md`: hoje `WARMUP_RATE_BPS =
@@ -14,8 +35,11 @@
 
 ```
 Document:   BLOCH-POS-THREAT-MODEL-2
-Status:     DRAFT — adversarial review, Assistant A4 (re-review)
+Status:     PARTIALLY SUPERSEDED — adversarial re-review of the design as it
+            stood on 2026-08-11. G1 is closed (see below). Not a threat model
+            of the live network; the live risk is in the box above.
 Created:    2026-08-11
+Revised:    2026-08-14
 Owner:      A4 (Adversarial review & security)
 Predecessor: BLOCH-POS-THREAT-MODEL.md (partially superseded; read its seal first)
 Reviews:    crates/bloch-pos-committee/src/{committees,genesis_cohort,delegation,
@@ -33,15 +57,21 @@ path**, the **attacker cost**, and **what would close it**, tagged `[CONFIRMED]`
 wiring not present in this crate). Where a vector is clean I say so and stop,
 rather than pad it.
 
-The crate is still **UNAUDITED and not wired into the node** (`lib.rs` §Status).
+~~The crate is still **UNAUDITED and not wired into the node** (`lib.rs` §Status).
 That matters more than usual this pass: two of the corrections landed as modules
-that **nothing calls**, which is itself the headline finding.
+that **nothing calls**, which is itself the headline finding.~~
+
+**No longer true as of 2026-08-13.** `crates/bloch-pos-committee` is a direct
+path-dependency of `crates/bloch-pos-node`, the binary the Genesis-4 fleet
+runs; `lib.rs` §Status now reads "THIS IS THE LIVE CHAIN'S CONSENSUS". The
+crate remains **UNAUDITED** — that half of the sentence stands, and it matters
+more now that it is load-bearing rather than less.
 
 ## Severity index
 
 | # | Severity | Finding | Status |
 |---|----------|---------|--------|
-| G1 | **Critical** | The partition (F1/F2 fix) is dead code: `committees.rs` is unwired and unexported; the finality gadget still samples 128 and takes ⅔ of *committee* stake — F1 reading-2 (variance stall) is unclosed in the live path | CONFIRMED |
+| G1 | ~~**Critical**~~ **CLOSED** | The partition (F1/F2 fix) was dead code: `committees.rs` unwired, the finality gadget still sampling 128. **Wired on 2026-08-11 via `finality::votes_from_partition` (`finality.rs:768`)**; the quorum denominator is total active stake. Finding retained below as the record of why | CONFIRMED, then FIXED |
 | G2 | **High** | The genesis-cohort cap zeroes the whole chain when non-cohort stake `O` is zero or tiny — the closed form is right, the operational result is a self-inflicted halt ~1.3 h after genesis | CONFIRMED |
 | G3 | **Medium** | Partition is seeded from the same trailing-slot-grindable beacon mix as the proposer roster; it adds no seed-lookahead, so F6 persists over committee membership too | CONFIRMED (no lookahead in-crate); SPECULATION (magnitude, wiring absent) |
 | G4 | **Low/Medium** | Churn floor `MIN_DELEGATION_SAT` overrides the 9% rate below ~111 BLCH of active stake — the "no single-epoch control shift" invariant is proportional to network size; compounds G2 | CONFIRMED |
@@ -51,7 +81,12 @@ that **nothing calls**, which is itself the headline finding.
 
 ---
 
-## G1 — Critical: the partition that fixes F1/F2 is dead code; finality still samples 128
+## G1 — ~~Critical~~ **CLOSED**: the partition that fixes F1/F2 was dead code; finality still sampled 128
+
+> **Closed 2026-08-11.** `finality::votes_from_partition` (`finality.rs:768`)
+> is the caller that was missing; the justification quorum is taken over the
+> whole active set. The finding is kept in full because "a correction that is
+> not wired is not a correction" is the lesson, not the incident.
 
 **Attack / failure.** `committees.rs` is exactly the fix F1 asked for: partition
 the active set into `SLOTS_PER_EPOCH` committees so their union is the whole set,

@@ -1,5 +1,13 @@
 # Runtime hardening (Bloch-SIS-Linux L2)
 
+> **Historical — Genesis-3.** Every hardening below applies to the container
+> built from the root `Dockerfile`, i.e. `bloch`, the proof-of-work node for the
+> chain that stopped permanently at height 39,918 on 2026-08-13. The live chain
+> is **Genesis-4, proof of stake**; `bloch-pos` runs on the fleet as a systemd
+> unit, not in this container, so none of the container-tier controls here
+> describe the hardening of a live validator. Kept as part of the Genesis-3
+> record.
+
 L2 shrinks the node's attack surface. It has two tiers; this directory covers
 the **container tier** (deliverable + testable today). The **OS tier**
 (dm-verity immutable rootfs, measured boot) needs the bootable image build and

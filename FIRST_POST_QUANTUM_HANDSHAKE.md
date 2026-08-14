@@ -12,9 +12,18 @@
 > The event is preserved here unmodified because the dates, peer IDs,
 > hashes, addresses, Docker image tags, and log lines below are
 > historical facts about the predecessor chain. They are not
-> identifiers of the Bloch-SIS Protocol chain. Future post-quantum
-> handshakes on Bloch-SIS Protocol mainnet (post-Phase 6) will be
-> recorded as separate Era 2 milestones.
+> identifiers of the Bloch-SIS Protocol chain.
+>
+> **Nothing below describes any network that is running.** The GroundState
+> chain was reset; the Bloch-SIS / Genesis-3 proof-of-work chain that
+> followed it stopped permanently at height **39,918** on 2026-08-13. The
+> live chain today is **Genesis-4, proof of stake** (30 s slots, 32-slot
+> epochs, finality by epoch), live since 21:31:19 UTC on 2026-08-13. In
+> particular: the closing line "The network is live" is about GroundState
+> mainnet in April 2026, the `scan.groundstate.network` RPC endpoint and the
+> `groundstate77/groundstate` image are not endpoints of anything current,
+> and the mining commands will not connect you to a network. There is no
+> mining on Genesis-4.
 >
 > Original document follows verbatim.
 

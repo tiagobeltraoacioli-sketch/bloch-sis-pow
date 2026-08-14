@@ -1,3 +1,12 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# RETIRED. An ISOLATED Genesis-2 rehearsal app for the eUTXO VM, mining a
+# throwaway local chain. Genesis-2 and Genesis-3 are both closed — the
+# proof-of-work chain stopped permanently at height 39,918 on 2026-08-13 — and
+# `bloch-euvm` was never wired into consensus on either. The live chain is
+# GENESIS-4, PROOF OF STAKE; it does not mine and does not run this image.
+# Kept as part of the Genesis-3 record.
+# ══════════════════════════════════════════════════════════════════════════════
+
 app = "bloch-euvm-rehearsal"
 primary_region = "gru"
 

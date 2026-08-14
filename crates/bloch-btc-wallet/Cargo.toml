@@ -1,11 +1,13 @@
 # bloch-btc-wallet — FOUNDATION: derive standard Bitcoin addresses AND a companion
 # post-quantum keypair from ONE seed (a "quantum-ready" hybrid wallet identity).
-# STANDALONE (own [workspace]); not wired into the node.
+# A root-workspace member (it has no [workspace] of its own), but not wired into
+# any node: neither the Genesis-4 proof-of-stake node nor the retired Genesis-3
+# node depends on it. Unaudited.
 [package]
 name = "bloch-btc-wallet"
 version = "0.0.1"
 edition = "2021"
-description = "Postern wallet: BTC address derivation + companion ML-DSA/Falcon PQ key from one seed"
+description = "Postern wallet: BTC address derivation + companion ML-DSA/Falcon PQ key from one seed. FOUNDATION — standalone and tested, not wired into any node, unaudited. The BTC address remains classical secp256k1; the companion PQ key does not make a native BTC coin quantum-safe."
 license = "AGPL-3.0-or-later"
 
 [dependencies]

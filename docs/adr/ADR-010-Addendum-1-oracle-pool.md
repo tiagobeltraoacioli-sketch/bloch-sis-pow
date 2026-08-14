@@ -2,7 +2,9 @@
 
 **Date:** 2026-04-29
 **Author:** BLOCH Core
-**Status:** Approved (auto-approved if ADR-018 is approved)
+**Status:** **SUPERSEDED** — Superseded by **Tokenomics V4**, which has no oracle pool and no miner/validator/oracle split — there are no miners. See ADR-018's status for the oracle network itself. The chain this ADR governs — Genesis-3, proof of work — stopped permanently at height **39,918** on 2026-08-13. The live chain is **Genesis-4, proof of stake** (30 s slots, 32-slot epochs, finality by epoch, hybrid ML-DSA-65 ‖ Falcon-1024, no mining). The decision, context and consequences below are **not** rewritten: this is a decision log and what was decided, when, is the record. Read it as history, not as guidance.
+
+*Original status line, retained:* **Status:** Approved (auto-approved if ADR-018 is approved)
 **Affects:** ADR-010 sections 4.1, 4.2, 4.3 (constants and distribution logic)
 **Triggered by:** ADR-018 (Oracle Network)
 

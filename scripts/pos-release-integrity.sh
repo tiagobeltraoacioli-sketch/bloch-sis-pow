@@ -15,8 +15,9 @@
 #     binaries, all reporting the same version string.
 #
 # WHAT IT CHECKS (all blocking):
-#   1. Lockfiles are honest: both PoS workspaces resolve with --locked and the
-#      committed Cargo.locks do not drift during the build.
+#   1. Lockfiles are honest: the workspace resolves with --locked and the
+#      committed Cargo.lock does not drift during the build. (Scope caveat in
+#      §1 below — this checks the root lockfile, twice, not two lockfiles.)
 #   2. The build is deterministic where determinism is promised: two clean
 #      builds of bloch-pos from the same source path, same toolchain, same
 #      stamp produce bit-identical binaries. (Path-INdependence is measured
@@ -28,7 +29,9 @@
 #      against a fleet, which is how the G3 divergence stayed invisible.
 #
 # Usage: bash scripts/pos-release-integrity.sh    (from anywhere in the repo)
-# Runtime: ~1 minute (the PoS skeleton workspace is small by design).
+# Runtime: ~1 minute (the PoS crates are small by design; `bloch-pos` is the
+# binary the live Genesis-4 fleet runs, not a skeleton — it stopped being one
+# before the chain launched on 2026-08-13).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 REPO_ROOT="$(pwd)"
@@ -59,13 +62,28 @@ esac
 
 # ── 1. Lockfile honesty ──────────────────────────────────────────────────────
 # --locked fails if Cargo.lock would need any change; the git diff afterwards
-# catches a lockfile the build itself rewrote. Both PoS workspaces are
-# standalone (deliberately outside the G3 node workspace), so both are checked.
+# catches a lockfile the build itself rewrote.
+#
+# KNOWN WEAKNESS, stated because a blocking gate that overstates its scope is
+# worse than one that admits a hole. This block was written when both PoS
+# crates carried their own `[workspace]` table and each owned a real Cargo.lock.
+# They are ordinary members of the ROOT workspace now (root `Cargo.toml:15-16`),
+# and cargo walks up: BOTH invocations below resolve the root workspace and
+# check the ROOT lockfile. So this checks one lockfile twice, not two, and the
+# two committed files `crates/bloch-pos-{committee,node}/Cargo.lock` are dead —
+# cargo never reads them, and the fail messages below name files that an
+# engineer would then edit to no effect.
+#
+# What it still does honestly: the root lockfile — the one the release binary
+# actually resolves from — is proven to need no change. Not fixed here because
+# deleting the two dead lockfiles and collapsing this to a single root check is
+# a change to what a blocking gate does, which belongs in its own reviewed
+# commit and not in a documentation pass.
 ( cd "$COMMITTEE_DIR" && cargo metadata --format-version 1 --locked >/dev/null ) \
-  || fail "bloch-pos-committee Cargo.lock is stale — commit the lockfile change deliberately."
+  || fail "the root Cargo.lock is stale (resolved from bloch-pos-committee) — commit the lockfile change deliberately."
 ( cd "$NODE_DIR" && cargo metadata --format-version 1 --locked >/dev/null ) \
-  || fail "bloch-pos-node Cargo.lock is stale — commit the lockfile change deliberately."
-echo "lockfiles: ok (--locked resolves cleanly in both PoS workspaces)"
+  || fail "the root Cargo.lock is stale (resolved from bloch-pos-node) — commit the lockfile change deliberately."
+echo "lockfiles: ok (--locked resolves cleanly; see the note above on scope)"
 
 # ── 2. Deterministic double build ────────────────────────────────────────────
 # Same source path, two fresh target dirs. BLOCH_BUILD_COMMIT is passed

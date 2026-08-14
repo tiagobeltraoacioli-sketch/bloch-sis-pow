@@ -1,5 +1,15 @@
 //! # bloch-euvm — deterministic eUTXO validator VM (FOUNDATION, step 1)
 //!
+//! > **Genesis-3-era crate.** This was designed and built for the
+//! > proof-of-work chain, which stopped permanently at height 39,918 on
+//! > 2026-08-13. The live chain is **Genesis-4, proof of stake** (30 s slots,
+//! > 32-slot epochs, finality by epoch; consensus in
+//! > `crates/bloch-pos-committee`), and this VM is **not wired into it**. The
+//! > direction for contracts at L1 has since moved to an EVM
+//! > (`docs/adr/ADR-040-evm-and-ustav-at-l1.md`), for which no code exists
+//! > yet. Kept buildable for audit. Read every present-tense sentence below
+//! > about "the chain" as describing Genesis-3.
+//!
 //! This is the first, self-contained increment of the native contract VM designed
 //! in the validators/BaaS study (§5-quater). It is a **deterministic, gas-metered
 //! stack machine** that runs a *validator* program to decide whether an extended

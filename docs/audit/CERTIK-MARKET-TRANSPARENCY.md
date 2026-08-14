@@ -5,7 +5,24 @@
 **Scope:** the *Market*, *Transparency* and *General* categories of CertiK's
 Skynet token scan, answered for Bloch Genesis-4 (PoS) with file:line evidence.
 Companion dossiers cover Rugpull and Centralization. Written 2026-08-12
-against branch `integration/pos-modules`, worktree commit `84ca42a`.
+against branch `integration/pos-modules`, worktree commit `84ca42a`. **Revised
+2026-08-14 against the live chain**; corrections are marked in place.
+
+> **State of the world this revision is written against.** Genesis-3, the
+> proof-of-work chain, **stopped permanently at height 39,918 on 2026-08-13**
+> — it never reached the decided halt height of 50,000. **Genesis-4, proof of
+> stake, has been live since 21:31:19 UTC on 2026-08-13**: 30-second slots,
+> 32-slot epochs, Casper-style justification and finalisation by epoch, hybrid
+> ML-DSA-65 ‖ Falcon-1024 on every consensus path. Public read RPC:
+> `https://posternlabs.com/g4rpc`. Three consequences for this document:
+> **(a)** §1.4's concentration figures were measured at a *block count*
+> mislabelled as a height and are restated below at the terminal snapshot —
+> 93.94% instead of 93.97%, which is the same finding, not an improvement;
+> **(b)** the four contradictions of §4 are all resolved or overtaken, and
+> §4 records which; **(c)** the repeated caveat that "the node does not exist
+> yet" is false as written and is corrected — the node exists and runs a live
+> mainnet, but its transport is still the unauthenticated fixed-peer devnet
+> mesh, and `Deposit`/`Delegate` are refused at every node's mempool.
 
 **The framing caveat, stated once and up front** (from
 `docs/FLEET-BRIEF-CERTIK-2026-08-12.md`): Skynet's token scan is a bytecode
@@ -225,8 +242,11 @@ a hard fork means while the operator set is a monoculture. One integration
 seam deserves audit attention: `validate_deposit` takes the cap as a
 *parameter* (`max_stake_sat`, `staking.rs:271`) because the true cap lives
 in parent-committed state; a wrong caller could pass a weaker cap. The crate
-documents the required derivation (`staking.rs:258–266`); the node-side
-wiring does not exist yet and should be a named audit item.
+documents the required derivation (`staking.rs:258–266`). The node-side wiring
+of the deposit path is not exercised on the live chain at all, because
+`Deposit` is refused at the mempool; when that refusal is lifted, the caller's
+cap derivation becomes a named audit item and should be verified before the
+first real deposit, not after.
 
 **What neither cap reaches — stated plainly, because the modules themselves
 state it.** Both caps bind *operators*, not *owners*. One holder can split
@@ -234,17 +254,35 @@ stake across many validators and keep economic control; beneficial ownership
 is invisible on-chain (`delegation.rs:80–84`, `genesis_cohort.rs:41–48`).
 The cohort cap binds only the genesis addresses — nothing prevents funding
 new validators outside the cohort. And the concentration these caps operate
-against is severe: the largest carried-over address holds 16,886,549,523 of
-17,970,880,000 BLCH — 93.97% of the carryover — and if staked would be ~94%
-of active stake, Nakamoto coefficient 1
-(`docs/specs/BLOCH-TOKENOMICS-V4.md` §4A/§4A.1;
-`tokenomics_v4.rs::LARGEST_CARRYOVER_ADDRESS_BLOCH`, line 236). §4A.1's
+against is severe: at the **terminal** Genesis-3 snapshot (height **39,918**,
+452,726 outputs, 16 addresses) the largest carried-over address holds
+**17,046,829,380 of 18,146,400,000 BLOCH — 93.94% of the carryover** — and if
+staked would be ~94% of active stake, Nakamoto coefficient 1
+(`tokenomics_v4.rs::LARGEST_CARRYOVER_ADDRESS_BLOCH`,
+`::CARRYOVER_TOTAL_BLOCH`, `::CARRYOVER_MEASURED_HEIGHT`;
+`docs/specs/BLOCH-TOKENOMICS-V4.md` §4A/§4A.1). The original draft of this
+paragraph read "16,886,549,523 of 17,970,880,000 — 93.97%", measured at what
+it called height 43,172; **that was a block count mislabelled as a height, and
+the set was still growing until the chain halted.** The restatement corrects
+the measurement, **not the distribution**: 93.97% → 93.94% is noise on a 94%
+figure and must not be read as improvement. §4A.1's
 conserved-share arithmetic shows gate G1 (independent stake ≥ 15%) is
 unreachable by emission alone if that balance stakes and compounds. That
 number is the Centralization dossier's headline; it is repeated here because
 an anti-whale section that omitted the whale would be the softening the
 fleet brief forbids. The caps bound *how fast* and *through how many
 validators* the position acts; they do not and cannot bound the position.
+
+**On the live chain the caps are not yet operative, and that belongs in an
+anti-whale section.** All **64 Genesis-4 validators are operated by one
+entity**. A per-validator 1% cap and a cohort taper are rules about how a
+plural validator set behaves; the set is not plural, and no third party can
+make it plural today — the live transport is a fixed-peer TCP mesh with no
+discovery and no authentication, and `Deposit`/`Delegate` are refused at every
+node's mempool because bonding is not yet funded from the UTXO set
+(`crates/bloch-pos-node/src/engine.rs:1900-1907`), so no stake can be bonded by
+anyone. Read the caps in this section as **designed and built**, not as
+operative constraints on the network that exists.
 
 ---
 
@@ -302,6 +340,17 @@ Licensing, measured inside the repo:
 **Remediation is one action: publish the repository.** Everything else in
 this section is polish on top of that.
 
+> **Status of this measurement, 2026-08-14.** The probes above were run once,
+> unauthenticated, from one network, on 2026-08-12 — before Genesis-4
+> launched. This revision **did not re-run them** and therefore does not
+> assert the repository's current visibility in either direction. The check
+> must be re-run immediately before the dossier is handed over; a FAIL that
+> has silently become a PASS, or a PASS assumed from a stale probe, are both
+> the kind of thing an auditor finds in five minutes. What *is* asserted:
+> Genesis-4 is a live mainnet, and if the consensus code it runs is not
+> publicly readable, the transparency check fails for the live chain and not
+> merely for a pre-launch codebase.
+
 ---
 
 ## 3. General
@@ -336,11 +385,14 @@ audit-relevant analog:
    empty by rule, so the oracle has no discretionary power to exercise
    (§1.3).
 
-Both seams are *implemented by the node*, which is not written yet. The
-audit item is not this crate — it is verifying, at integration, that the
-node's implementations honour the purity contracts. There are no price
-oracles, no cross-chain calls, and no other outward dependency in the
-consensus rules.
+Both seams are *implemented by the node*. The original draft said the node "is
+not written yet"; **it is written and it runs a live mainnet**
+(`crates/bloch-pos-node/src/`, ~9,900 lines: engine, mempool, JSON-RPC,
+persistence, two transports). The audit item is therefore no longer deferred —
+it is verifying **now**, against running code, that the node's implementations
+honour the purity contracts, in particular that no `impl StakeEligibility`
+exists anywhere in the tree. There are no price oracles, no cross-chain calls,
+and no other outward dependency in the consensus rules.
 
 ### 3.2 Withdrawal function — **exists, and is provably inert as an attack
 surface**
@@ -415,47 +467,55 @@ pre-emptive classification:
 
 **Conclusion: no backdoor ownership recovery, demonstrated by exhaustive
 enumeration of value paths in the committee crate.** Standing caveat, same
-as §3.1: the crate is the consensus authority but not the whole node; the
-Genesis-4 node integration (transaction execution, state object) does not
-exist yet, and this conclusion must be re-verified against it — put it on
-the integration audit checklist rather than letting this dossier's answer
-be quoted past its scope.
+as §3.1, and now overdue rather than prospective: the crate is the consensus
+authority but not the whole node. The original draft said the Genesis-4 node
+integration "does not exist yet" — **it exists and it is live**, so this
+conclusion has been quoted past its scope every day since 2026-08-13 unless
+someone re-verified it against the node. It has not been re-verified here
+beyond reading the refusal paths. Treat this section's answer as scoped to
+`bloch-pos-committee` and put node-side re-verification at the top of the
+engagement, not on a future checklist.
 
 ---
 
 ## 4. Contradictions found while writing this dossier (flagged, not fixed)
 
-The fleet brief (2026-08-12) instructs building against the 100 B
-redenomination and flagging contradictions. Found:
+The fleet brief (2026-08-12) instructed building against the 100 B
+redenomination and flagging contradictions. All four are now resolved or
+overtaken; the entries are kept with their dispositions rather than deleted,
+because what an auditor learns from this section is that flagged items were
+tracked to a conclusion.
 
-1. **The code says 21 B and frames it as final.**
-   `tokenomics_v4.rs:26–33` reads "Back to the V2 nominal of 100 billion
-   (founder decision, 2026-08-11), after a draft at 100 billion" — the
-   brief's 2026-08-12 decision reverses this again. The doc comment's
-   framing ("the revert removes two hazards for free") will be stale the
-   moment the split lands.
-2. **The int64 assertion will fail the build at 100 B — and it is right to.**
-   `tokenomics_v4.rs:255`: `assert!(TOTAL_SUPPLY_SAT < i64::MAX as u128,
-   "nao cabe no int64 do SDK Go")`. At 100 B, `TOTAL_SUPPLY_SAT` = 10¹⁹ >
-   `i64::MAX` (9.22 × 10¹⁸), and is back at the old 54.21% of `u64::MAX` —
-   the wrap hazard the revert to the 21 B V2 nominal had removed (both
-   verified by arithmetic this session). The redenomination is *not* free
-   as the brief states: the Go SDK's signed-64 `Satoshis` type breaks, and
-   the assertion at line 254 (`< u64::MAX / 8`) fails too. Whoever lands the
-   split must change the SDK type (or the decimals), not just delete the
-   assertions.
-3. **Snapshot height.** Brief says Genesis-3 halts at 50,000 (lowered
-   2026-08-12); `docs/specs/BLOCH-TOKENOMICS-V4.md` §3.1 still says
-   "decided: 50,000", and §2 measures the carryover "at height 43,172".
-   The carryover constants will need re-measuring at the actual halt.
-4. **Minimum deposit.** Brief decision 3 puts the validator bond near
-   25,000 BLCH under the 100 B supply; `staking.rs:83` still says 100,000
-   BLCH. All duration/threshold arithmetic in §1.3–1.4 uses the current
-   constants and must be re-checked when that lands (the *fractions* —
-   25 bps, 1%, one third — are supply-invariant; the floors in BLCH are
-   not).
+1. ~~**The code says 21 B and frames it as final.**~~ **RESOLVED.**
+   `tokenomics_v4.rs` pins `TOTAL_SUPPLY_BLOCH = 100_000_000_000` with a
+   per-bucket compile-time assertion proving `new × 21 == old × 100`. The
+   framing was rewritten with the split; the history of the 21 B ↔ 100 B
+   reversals is preserved in the constant's own doc comment.
+2. ~~**The int64 assertion will fail the build at 100 B — and it is right
+   to.**~~ **RESOLVED, the honest way: the hazard was accepted and pinned,
+   not deleted.** At 100 B, `TOTAL_SUPPLY_SAT` = 10¹⁹ > `i64::MAX`
+   (9.22 × 10¹⁸) and is 54.2% of `u64::MAX`. Every consensus quantity in the
+   crate is `u128` and unaffected; the assertions were **inverted to state the
+   hazard** rather than removed, so a future edit that brings the supply back
+   under the safe line has to come to that file and re-decide the widths
+   deliberately. **The integrator consequence is live and current: any SDK or
+   exchange integration that types satoshis as a signed 64-bit integer will
+   overflow and must migrate.** This is the single most actionable line in
+   this dossier for an exchange.
+3. ~~**Snapshot height.**~~ **OVERTAKEN BY EVENTS.** Genesis-3 never reached
+   50,000. It stopped at **39,918** on 2026-08-13, and the carryover constants
+   were re-measured at that terminal snapshot — 452,726 outputs,
+   18,146,400,000 BLOCH, largest address 17,046,829,380 (93.94%). The
+   "at height 43,172" label the earlier documents carried was a **block
+   count**, not a height. §1.4 is restated accordingly.
+4. ~~**Minimum deposit.**~~ **RESOLVED.** The bond is 25,000 BLCH
+   (`staking.rs`), derived from Ethereum's 32-ETH fraction of supply and
+   rounded down. The fractions used throughout §1.3–1.4 (25 bps, 1%, one
+   third) are supply-invariant and were unaffected. Note that on the live
+   chain no deposit of any size can be made: `Deposit` is refused at the
+   mempool.
 
-None of these change a §1–§3 verdict: no verdict above depends on the
+None of these changed a §1–§3 verdict: no verdict above depends on the
 denomination.
 
 ---
@@ -535,17 +595,22 @@ in this document and what each pins:
 
 - **Did not run the Skynet scanner** — it cannot run against a chain
   (§ preamble), and no wrapped-BLCH contract exists to point it at.
-- **Did not audit the node/execution layer** — the Genesis-4 node
-  integration does not exist; §3.1–3.3 conclusions are scoped to
-  `bloch-pos-committee` and flagged for re-verification at integration.
+- **Did not audit the node/execution layer.** The original draft's reason —
+  "the Genesis-4 node integration does not exist" — is false as of the launch
+  and is corrected: the node exists, runs a live mainnet, and is unaudited by
+  this dossier and by anyone else. §3.1–3.3 conclusions remain scoped to
+  `bloch-pos-committee`; node-side verification is now overdue rather than
+  prospective.
 - **Did not verify GitLab visibility from more than one vantage point** —
   the 404-vs-200 probes ran once, unauthenticated, from one network.
 - **Did not fix** the missing SPDX headers, the nine license-less
-  `Cargo.toml` files, the stale 21 B/50,000/100,000-BLCH values flagged in
-  §4, or the `bloch-sis-pow` MIT-vs-AGPL question — flagged, owner
-  decisions or other agents' surface.
-- **Did not re-measure the carryover** at the new halt height (50,000); all
-  concentration figures are the height-43,172 measurement the constants
-  encode.
+  `Cargo.toml` files, or the `bloch-sis-pow` MIT-vs-AGPL question — flagged,
+  owner decisions or other agents' surface. (The stale 21 B / 50,000 /
+  100,000-BLCH values flagged in §4 have since been resolved in code; see §4.)
+- **Did not re-run the snapshot tool.** The concentration figures in this
+  revision are read from the constants pinned at the **terminal** height
+  39,918 and their published roots, not re-derived from a live node. The
+  original draft's figures were the provisional block-count-43,172
+  measurement; the difference is corrected in §1.4 and is not an improvement.
 - **Did not cover** Rugpull or Centralization checks beyond the
   cross-references — other agents' categories.

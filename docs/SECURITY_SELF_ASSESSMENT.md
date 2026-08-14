@@ -1,14 +1,28 @@
 # Bloch-SIS Protocol (BLOCH) — Security Self-Assessment
 
-> **Genesis-3-era document — sealed 2026-08-12.** Bloch's proof-of-work
-> chain halts by consensus rule at the terminal height (50,000) and
-> Genesis-4 relaunches as proof of stake; the ownerless thesis was
-> retracted (`docs/adr/ADR-036-retract-ownerless-adopt-foundation.md`).
+> **Historical — Genesis-3.** This describes the proof-of-work chain that
+> stopped permanently at height 39,918 on 2026-08-13. The live chain is
+> **Genesis-4, proof of stake** (30 s slots, 32-slot epochs, finality by
+> epoch). Kept because Genesis-4's opening ledger is derived from it. It is
+> not what runs.
 >
-> §4 (cryptographic primitives), §7 (memory safety) and §8 (wallet security)
-> stand. The executive comparison table, §3 (decentralization) and §5
-> (consensus protocol) are hashrate-framed and describe a chain that is
-> ending. This document also predates Genesis-2 and Genesis-3.
+> The document body was sealed 2026-08-12, before the halt, and it predates
+> Genesis-2 and Genesis-3 as well. §4 (cryptographic primitives), §7 (memory
+> safety) and §8 (wallet security) stand. The executive comparison table, §3
+> (decentralization) and §5 (consensus protocol) were hashrate-framed; the
+> rows and sections that made claims about the **live** network have been
+> corrected to Genesis-4, and the retired proof-of-work material is marked as
+> such rather than deleted. The ownerless thesis was retracted
+> (`docs/adr/ADR-036-retract-ownerless-adopt-foundation.md`).
+>
+> **The security claim that replaces the hashrate framing:** the security
+> question under Genesis-4 is not hashrate, it is **concentration**. All 64
+> validators are run by one entity, 93.94 % of the carryover sits at a single
+> address, and 56.05 B of the 57.15 B BLOCH issued at genesis is held by the
+> founder and the Foundation. **One operator can halt the chain and one holder
+> can outvote every other.** Everything §10 says about not putting meaningful
+> money in applies at least as strongly under Genesis-4 as it did under
+> Genesis-3.
 
 **Document version:** 1.0
 **Last updated:** 2026-04-19
@@ -34,7 +48,9 @@ post-quantum security is a real concern.
 
 **If you take one thing away from this document:** Bloch-SIS Protocol is a young
 project (less than 1 year of mainnet; one developer; zero external audits)
-doing something new (post-quantum BlockDAG). Bitcoin is a mature project
+doing something new — a post-quantum chain, a BlockDAG under Genesis-3 and a
+proof-of-stake chain under Genesis-4, and it changed consensus mechanism once
+already, in its first year, mid-life. Bitcoin is a mature project
 (16 years; hundreds of contributors; one recently-completed external audit
 that found nothing serious) doing something deeply understood (linear PoW
 chain). If all you care about is "is my money safe today," Bitcoin is the
@@ -53,15 +69,15 @@ and that gap is the reason this project exists.
 | **Independent implementations** | Bitcoin Core, btcd, bcoin, libbitcoin, Bitcoin Knots | 1 (Rust) | Bitcoin |
 | **Full-time contributors** | Dozens, paid by Brink / Chaincode / Spiral | 1 | Bitcoin |
 | **Lines of consensus-critical code** | ~50,000 LOC (C++) | ~4,800 LOC (Rust) | — (smaller = smaller attack surface but also less battle-tested) |
-| **Network hashrate (Apr 2026)** | ~1 ZH/s (10^21 H/s) | ~1–40 MH/s (10^6–10^7 H/s) | Bitcoin by 14–15 orders of magnitude |
-| **Cost of 51% attack** | Billions of USD | Dollars (laptop CPU) | Bitcoin |
-| **Independent node count** | ~20,000 reachable | ~5 (1 seed + ~4 workers, all operated by the founder) | Bitcoin |
+| **What secures the chain** | Hashrate: ~1 ZH/s (10^21 H/s) | **No hashrate — proof of stake since 2026-08-13.** 64 genesis validators, **all operated by one entity** | Bitcoin |
+| **Cost to halt or capture the chain** | Billions of USD, and publicly visible | **Zero.** The single operator of all 64 validators can stop finality by stopping its own processes; separately, 93.94% of the carryover sits at one address, and carried balances are stakeable, so a Nakamoto coefficient of 1 is reachable | Bitcoin |
+| **Independent node count** | ~20,000 reachable | 64 validator nodes, **all one operator; zero independent third parties.** The live transport is a fixed-peer TCP mesh with no discovery and no authentication, so a third party **cannot join at all** | Bitcoin |
 | **Memory-safe language** | No (C++) | Yes (Rust, zero `unsafe`) | BLOCH |
-| **Signature scheme** | ECDSA (secp256k1) | ML-DSA-65 (FIPS 204) | BLOCH (for quantum) |
-| **Transport encryption** | BIP324 (x25519, classical) | Kyber768 hybrid (PQ) | BLOCH |
+| **Signature scheme** | ECDSA (secp256k1) | **Hybrid ML-DSA-65 ‖ Falcon-1024** — both must verify, on every consensus path | BLOCH (for quantum) |
+| **Transport encryption** | BIP324 (x25519, classical) — on the network that actually runs | Kyber768 hybrid (PQ) **in the libp2p stack, which is not what the fleet runs**. The live Genesis-4 transport is a plaintext framed TCP mesh (`u32 LE length ‖ type ‖ payload`) with no authentication and no session encryption | **Bitcoin, as deployed** |
 | **Address hashing** | RIPEMD160(SHA-256) | SHA3-256 truncated | BLOCH (marginally) |
-| **Consensus protocol** | Nakamoto PoW (linear) | GhostDAG-Q / PHANTOM, k=10 | — (different tradeoffs) |
-| **Transaction finality** | Probabilistic (6 confirmations ≈ 60 min) | Probabilistic + checkpoint | Bitcoin (better-understood) |
+| **Consensus protocol** | Nakamoto PoW (linear) | **Proof of stake**: 30 s slots, 32 slots/epoch (16 min), Casper-style justification/finalisation, LMD-GHOST fork choice, COMMITTEE_SIZE 128, SLOT_SUBCOMMITTEE_SIZE 8 (`crates/bloch-pos-committee/src/params.rs`). *(Genesis-3 was GhostDAG-Q / PHANTOM k=10 — retired.)* | — (different tradeoffs) |
+| **Transaction finality** | Probabilistic (6 confirmations ≈ 60 min) | **Casper-style finality by epoch** — not confirmation depth. A block is justified at one epoch boundary and finalised at the next: **~32 min typical, ~48 min worst case.** **Do not count confirmations on BLOCH; wait for the finalised epoch.** Caveat: the finalising committee is drawn from a validator set entirely operated by one entity, so finality here means "one operator's 128 signatures", not independent economic finality | — (different meanings; Bitcoin's is independently produced) |
 | **Wallet recovery from seed** | BIP39 works correctly | Currently broken (Sprint S pending) | Bitcoin |
 | **Formal specification** | Scattered in BIPs, de facto "the code" | One README section | Bitcoin |
 | **Bug bounty program** | Discretionary rewards | Tracked under Sprint 13 Labs operationalization roadmap (post-mainnet) | — |
@@ -166,31 +182,64 @@ scrutiny, you will be disappointed.
 - **Cost of a 51% attack:** acquiring enough ASIC capacity would cost
   multiple billions of USD and be publicly visible
 
-### 3.2 Bloch-SIS Protocol
+### 3.2 BLOCH — Genesis-4 (live)
 
-- **Reachable nodes:** 1 seed (Njalla VPS) + ~5 Akash workers, all
-  currently controlled by the founder. Zero independent third-party nodes.
-- **Hashrate:** the seed mines ~1 MH/s on a single VPS core. Workers
-  contribute another ~5–40 MH/s.
+**The security question under Genesis-4 is not hashrate, it is
+concentration.** There is no hashrate at all: proof of work stopped at height
+39,918 on 2026-08-13 and the chain has run under proof of stake since
+21:31:19 UTC that day. What replaced the 51%-attack question is worse, not
+better:
+
+- **Validators:** 64 at genesis, **all operated by one entity**. Zero
+  independent third-party validators. One operator can halt the chain.
+- **Stake concentration:** **93.94 % of the carryover sits at a single
+  address** — 17,046,829,380 of 18,146,400,000 BLOCH
+  (`LARGEST_CARRYOVER_ADDRESS_BLOCH`, `tokenomics_v4.rs:414`). Carried
+  balances are **stakeable**, so if that balance stakes, the **Nakamoto
+  coefficient is 1** — one holder can outvote every other.
+- **Issued supply:** of the 57,146,400,000 BLOCH issued at slot 0, the
+  founder holds 27,046,829,380 = **27.04 %** of the 100 B cap
+  (`FOUNDER_TOTAL_BLOCH`, pinned at 2704 bps) and the Foundation a further
+  **29.00 %**. Founder and Foundation together hold 56,046,829,380, leaving
+  **1,099,570,620 BLOCH (1.92 %)** in third-party hands.
+- **No permissionless entry, two ways.** Deposit and Delegate transactions are
+  **refused at every node's mempool**
+  (`crates/bloch-pos-node/src/engine.rs:1900-1906`) because bonding is not yet
+  funded from the UTXO set — there is no path for an outsider to become a
+  validator. And the live transport is **a point-to-point TCP full mesh with a
+  fixed peer list, no discovery and no authentication, which is why a third
+  party cannot yet join the network** even as a listener.
 - **Implementations:** one (Rust). No alternative client.
-- **Geographic distribution:** seed in one datacenter; workers on one
-  Akash provider.
-- **Cost of a 51% attack today:** renting enough CPU on a commodity cloud
-  to match ~40 MH/s is negligible. A laptop CPU mining SHA-256 in software
-  does ~1 MH/s; a modest GPU mining rig would dwarf the entire network.
-  Buying a single second-hand SHA-256 ASIC would make the attacker the
-  dominant miner for the cost of a used car.
+- **Geographic distribution:** the 64-validator cohort runs across a handful
+  of hosts under one operator.
 
-**Honest framing:** Bloch-SIS Protocol is not decentralized. It is a single-operator
+**Honest framing:** BLOCH is not decentralized. It is a single-operator
 network running a protocol that could become decentralized if adopted, in
 the same sense Bitcoin was not decentralized in 2009 when Satoshi and Hal
 Finney mined most of the early blocks. The project's design is
 decentralization-compatible, but the deployment reality today is a
-one-person testnet with real money in it. Users should treat it
-accordingly.
+one-person network with real money in it. Users should treat it
+accordingly. Note that the proof-of-stake migration did **not** fix this — it
+changed the failure mode from "anyone with a used ASIC can outrun the chain"
+to "one entity is the chain".
 
-This gap is **the single largest security difference** between Bloch-SIS Protocol
+This gap is **the single largest security difference** between BLOCH
 and Bitcoin. It dwarfs every technical advantage listed below.
+
+### 3.3 Historical — Genesis-3 proof of work (retired)
+
+Kept as the record of what the hashrate-era numbers were, and false of the
+live chain:
+
+- **Reachable nodes:** 1 seed (Njalla VPS) + ~5 Akash workers, all
+  controlled by the founder. Zero independent third-party nodes.
+- **Hashrate:** the seed mined ~1 MH/s on a single VPS core. Workers
+  contributed another ~5–40 MH/s.
+- **Cost of a 51% attack then:** renting enough CPU on a commodity cloud
+  to match ~40 MH/s was negligible. A laptop CPU mining SHA-256 in software
+  does ~1 MH/s; a modest GPU mining rig would have dwarfed the entire network.
+  Buying a single second-hand SHA-256 ASIC would have made the attacker the
+  dominant miner for the cost of a used car.
 
 ---
 
@@ -263,11 +312,16 @@ comfortable.
 (Keccak, post-competition) and has no length-extension weakness, but this
 matters zero for address hashing. Essentially a tie.
 
-### 4.4 Proof-of-work
+### 4.4 Proof-of-work — no longer applicable to BLOCH
 
-Both chains use SHA-256. Identical primitive, identical quantum resistance
-profile (Grover halves the effective security, which for PoW means double
-the hashrate — still not a practical attack).
+*Historical (Genesis-3):* both chains used SHA-256. Identical primitive,
+identical quantum resistance profile (Grover halves the effective security,
+which for PoW means double the hashrate — still not a practical attack).
+
+**BLOCH has no proof-of-work today.** Genesis-4 is proof of stake, so the
+comparison collapses: Bitcoin's security rests on externally purchased
+hashrate that an attacker must out-buy, and BLOCH's rests on a stake
+distribution that one entity already controls. See §3.2.
 
 ---
 
@@ -284,11 +338,54 @@ the hashrate — still not a practical attack).
   observed at small scale; economically disincentivized at scale.
 - Block-withholding and empty-block attacks also well-studied.
 
-### 5.2 Bloch-SIS Protocol — GhostDAG-Q (PHANTOM k=10)
+### 5.2 BLOCH — Genesis-4 proof of stake (live)
+
+- **Slot/epoch schedule:** 30 s slots, **32 slots per epoch** (an epoch is
+  16 minutes) — `SLOT_DURATION_SECS`, `SLOTS_PER_EPOCH`,
+  `crates/bloch-pos-committee/src/params.rs`.
+- **Committee:** `COMMITTEE_SIZE = 128` voting at each epoch boundary for
+  justification and finality; `SLOT_SUBCOMMITTEE_SIZE = 8` per-slot sample
+  giving LMD-GHOST its fork-choice weight.
+- **Signatures on every consensus path:** hybrid **ML-DSA-65 ‖ Falcon-1024**,
+  both must verify. No BLS, no aggregation — 4,589 bytes per signature, which
+  is why the per-slot sample is 8 and not the whole set.
+- **Finality: Casper-style justification and finalisation, BY EPOCH.** A
+  checkpoint is justified at one epoch boundary and finalised at the next:
+  **~32 minutes typical, ~48 minutes worst case.** This is not confirmation
+  depth. **Counting confirmations is the wrong settlement rule on this
+  chain — wait for the finalised epoch.**
+- **Liveness backstop:** an inactivity leak switches on after
+  `INACTIVITY_LEAK_THRESHOLD_EPOCHS = 4` epochs without finality.
+- **Validator set:** 64 at genesis, all operated by one entity.
+
+**Verdict — read this next to §3.2.** Casper-style finality is a stronger
+*settlement* primitive than probabilistic PoW confirmation, and it is
+genuinely live. But finality is only as trustworthy as the set that produces
+it, and here that set is **one operator's 128 signatures**. The honest
+statement is that BLOCH's finality is an operational guarantee from a single
+party, not an economic guarantee from independent adversaries. A >1/3 stake
+absence halts finality and a >2/3 stake concentration decides it outright —
+and both thresholds are inside one entity's holdings today.
+
+**Specific unknowns in our implementation:**
+- No slashing-evidence pipeline exists. Equivocation is defined but there is
+  no live path that collects, proves and punishes it.
+- No checkpoint-sync state download; a node replays the append-only block log.
+- The live transport carries no `Origin` and no authentication, so gossip
+  admission verdicts have nowhere to land on that path — a rejected message
+  costs its sender nothing.
+- Committee sampling under extreme stake concentration falls back to index
+  order after `MAX_DRAWS_PER_SLOT = 4096` draws; the distribution that
+  triggers that fallback is close to the distribution the chain actually has.
+
+A real external audit would prioritize these. **No external audit has been
+completed.**
+
+### 5.3 Historical — GhostDAG-Q (PHANTOM k=10), Genesis-3, retired
 
 - Based on Sompolinsky-Wyborski-Zohar (2021) "PHANTOM GHOSTDAG: A Scalable
   Generalization of Nakamoto Consensus"
-- 150 second target block time — 4× faster than Bitcoin (V2 per ADR-006 and ADR-028; the V1 design specified 10s / 60× faster, superseded before mainnet)
+- 150 second target block time (V2 per ADR-006 and ADR-028; the V1 design specified 10s, superseded before mainnet). Genesis-3 as actually launched targeted 30 s blocks.
 - Ordering rule: selected parent = argmax(blue_work); blue set computed
   with k=10 anticone constraint
 - Reference implementation cross-checked against `kaspanet/rusty-kaspa`
@@ -296,22 +393,11 @@ the hashrate — still not a practical attack).
   Nakamoto because blocks mined in parallel by honest miners still
   contribute to `blue_work`
 - Finality: probabilistic, with a checkpoint mechanism at a depth stored
-  in the `finalized_height` meta key that rejects reorgs below it
-
-**Verdict:** GhostDAG is a **newer** protocol than Nakamoto and has had
-less academic scrutiny at adversarial scale. The core safety proof is
-published and peer-reviewed, but the engineering realities (timing
-attacks, memory-bounded parent selection, DAG topology manipulation) are
-less studied than Bitcoin's counterparts.
-
-**Specific unknowns in our implementation:**
-- Anticone computation cost under adversarial DAG topologies has not
-  been stress-tested
-- Blue-set recomputation on reorg has not been fuzzed
-- Parent-count bounds are implicit (via MAX_BLOCK_SIZE) rather than
-  explicit
-
-A real external audit would prioritize these.
+  in the `finalized_height` meta key that rejected reorgs below it. **This
+  is the retired model. It is not how the live chain settles.**
+- Open unknowns at the time of retirement: anticone cost under adversarial DAG
+  topologies never stress-tested, blue-set recomputation on reorg never fuzzed,
+  parent-count bounds implicit via MAX_BLOCK_SIZE rather than explicit.
 
 ---
 
@@ -423,17 +509,38 @@ with no adversary involved, just by trusting the mnemonic.
 - Transaction malleability (fixed by segwit)
 - Fee estimation failures leaving txs stuck
 
-### 9.2 Known operational hazards on Bloch-SIS Protocol
+### 9.2 Known operational hazards on BLOCH
 
-All of the above, plus:
+**Live, Genesis-4:**
 
-- **RPC public by default in production deployments.** The seed node runs
+- **One operator is the whole network.** Every validator process runs under one
+  entity; an operator mistake, a bad deploy, or a machine loss stops finality
+  for everyone. There is no second party to keep the chain moving.
+- **The transport has no authentication.** A fixed-peer plaintext TCP mesh with
+  no discovery, no admission control and no session encryption. Anyone who can
+  reach a peer's port and speak the frame format is indistinguishable from a
+  peer; the mesh's only protection today is that its peer list and its hosts
+  are private. Firewalling is load-bearing, not defence in depth.
+- **No slashing pipeline.** Equivocation by a validator is not punished by any
+  live mechanism.
+- **Deposits and delegations are refused at the mempool** because bonding is
+  not funded from the UTXO set. This is a deliberate node-side refusal that
+  closes a mint-stake-from-nothing path; it also means the validator set cannot
+  change permissionlessly, and it is **not** a consensus rule — a block that
+  already carries a deposit still applies it.
+- **Restart durability rests on the append-only block log** and deterministic
+  replay. There is no RocksDB and no checkpoint-sync state download, so a node
+  that loses its log resyncs by replaying from a peer.
+
+**Carried over from Genesis-3 and still worth stating:**
+
+- **RPC public by default in production deployments.** The seed node ran
   with `--rpc-public` for explorer access and has no rate limiting or
   authentication. A misuse of this flag on a node holding keys would be
   very bad. Operators must firewall.
-- **Workers running without `--miner-address`** produce unspendable
+- **Workers running without `--miner-address`** produced unspendable
   coinbase outputs (the suspected root of the Era 1 470 GRND supply gap; BLOCH genesis is regenerated cleanly so no equivalent gap).
-  Enforcement is a pending fix (Sprint O).
+  Moot under Genesis-4: there is no mining.
 - **Treasury and founder keys are in a single keystore file each**, not
   multisig. Compromise of either is catastrophic. Sprint M adds a startup
   integrity check.
@@ -461,9 +568,11 @@ Bloch-SIS Protocol is designed to resist.
 The technical choices are defensible and the implementation quality is
 better than most Layer 1 projects at similar age (Rust, zero unsafe,
 organized test suite, honest internal documentation of known gaps).
-The post-quantum thesis is serious and the Kyber-hybrid transport is
-one of the first production deployments of NIST-standardized PQ
-cryptography in a blockchain P2P layer.
+The post-quantum thesis is serious: hybrid ML-DSA-65 ‖ Falcon-1024 signing on
+every consensus path is a real deployment of NIST-standardized PQ
+cryptography. The Kyber-hybrid P2P transport is implemented but is **not**
+what the live fleet runs, so it should not be counted as a production
+deployment.
 
 The delta from "interesting technical project" to "production-grade
 cryptosystem" is measured in multiple person-years of hardening, external
@@ -471,20 +580,33 @@ audits, and adversarial scrutiny. None of that has happened yet.
 
 ### 10.3 If you are considering running a node
 
-Yes — we need more nodes. Running a node improves decentralization. Do
-not expose RPC publicly without a reverse proxy. Do not mine without
-`--miner-address`. Do not store large amounts in the wallet.
+**You cannot, today.** The live Genesis-4 transport is a fixed-peer TCP mesh
+with no discovery and no authentication, so there is no way for a third party
+to join the network; and deposits and delegations are refused at every node's
+mempool, so there is no way to become a validator. Opening both is unfinished
+work, not a policy. What you *can* do is read the chain over the public RPC at
+<https://posternlabs.com/g4rpc>. If you run a node against your own genesis:
+do not expose RPC publicly without a reverse proxy, and do not store large
+amounts in the wallet. *(Genesis-3 advice — "do not mine without
+`--miner-address`" — is retired; there is no mining.)*
 
 ### 10.4 If you are a security researcher
 
 Please. See `SECURITY.md` for disclosure process. The Era 1 BOUNTIES.md is deferred to Sprint 13 Labs operationalization roadmap;
 reward tiers. The areas most likely to yield findings are:
 
-- GhostDAG implementation edge cases under adversarial DAG topology
-- Mempool / block validation divergence (Sprint N-full)
-- RPC surface with `--rpc-public` (unauthenticated)
+- The Genesis-4 consensus path: slot/epoch accounting, LMD-GHOST fork choice,
+  justification and finalisation, and committee sampling under the extreme
+  stake concentration the chain actually has
+- The unauthenticated live transport (`crates/bloch-pos-node/src/net.rs`):
+  frame parsing, sync-request handling, resource exhaustion
+- The PoS mempool admission rules (`crates/bloch-pos-node/src/engine.rs`) —
+  one unapplicable transaction previously halted a testnet at slot 69
+- The PoS JSON-RPC surface (`crates/bloch-pos-node/src/rpc.rs`)
 - PQClean FFI boundary in `pqcrypto-*` wrappers
-- Kyber handshake transcript binding
+- *(Historical, Genesis-3:)* GhostDAG edge cases under adversarial DAG
+  topology, mempool/block validation divergence, `--rpc-public`, Kyber
+  handshake transcript binding
 
 ---
 
@@ -510,9 +632,17 @@ Ranked roadmap items that reduce the gap with Bitcoin:
    (consensus refactor) ships, budget permitting. Ballpark estimate
    from comparable engagements: $80k–$200k for a 2-month P2P + consensus
    review.
-9. **Grow independent node operators** — at least three independent
-   parties running workers, with deployment documentation sufficient
-   that a new operator can join the network in under an hour.
+9. **Make it possible for anyone else to participate at all.** Under
+   Genesis-4 this is two concrete pieces of unfinished work, not an adoption
+   problem: (a) a network layer a stranger can join — the live transport is a
+   fixed-peer mesh with no discovery and no authentication; (b) bonding funded
+   from the UTXO set, so Deposit and Delegate stop being refused at the
+   mempool. Only after both can "at least three independent parties running
+   validators" even be attempted. Deployment documentation is the easy part.
+10. **Reduce concentration.** No amount of engineering changes the fact that
+   one entity operates every validator and 93.94 % of the carryover sits at
+   one address. This is the largest security gap in the document and it is
+   closed by distribution decisions, not by code.
 
 See `SPRINTS.md` for full ordering.
 
@@ -522,18 +652,29 @@ See `SPRINTS.md` for full ordering.
 
 For readers who skipped to the end.
 
-**Where Bloch-SIS Protocol is clearly better than Bitcoin:**
-- Post-quantum signatures
-- Post-quantum transport confidentiality
+**Where BLOCH is clearly better than Bitcoin:**
+- Post-quantum signatures (hybrid ML-DSA-65 ‖ Falcon-1024 on every consensus
+  path)
 - Memory-safe implementation language
 - Smaller consensus-critical codebase (smaller attack surface)
+- Settlement primitive: epoch finality is stronger than probabilistic
+  confirmation depth — *as a mechanism*. See the next list for who produces it.
 
-**Where Bloch-SIS Protocol is clearly worse than Bitcoin:**
+**Where BLOCH is clearly worse than Bitcoin:**
 - Age and battle-testing (16 years vs <1 year)
-- External audits (1 major vs 0)
+- External audits (1 major vs **0 — none completed**)
 - Implementation diversity (5+ clients vs 1)
-- Hashrate and 51%-attack cost (~10^14 to 10^15 times cheaper to attack)
-- Decentralization (~20,000 reachable nodes vs ~5, all operated by us)
+- **Concentration.** Not hashrate — all 64 validators are run by one entity,
+  93.94 % of the carryover sits at a single address, and 56.05 B of the
+  57.15 B BLOCH issued at genesis is held by the founder and the Foundation.
+  One operator can halt the chain and one holder can outvote every other.
+  Bitcoin's equivalent number is a many-billion-dollar hardware purchase.
+- **Openness.** ~20,000 reachable Bitcoin nodes anyone can join, against a
+  fixed-peer mesh with no discovery and no authentication that a third party
+  **cannot join**, and a validator set no third party can enter because
+  deposits and delegations are refused at the mempool.
+- Transport as deployed (BIP324 on Bitcoin vs a plaintext, unauthenticated
+  TCP mesh on BLOCH — the PQ Kyber transport exists but is not what runs)
 - Wallet recovery (BIP39 works vs currently broken)
 - Formal specification (BIPs + code vs code only)
 - Hardware wallet and multisig ecosystem (extensive vs nonexistent)
@@ -541,8 +682,10 @@ For readers who skipped to the end.
 
 **Where it is roughly a wash:**
 - Hash function choice (SHA-256 vs SHA-256/SHA3)
-- Operational hazards common to any PoW chain
 - Mempool DoS defenses (both have them, both have edge cases)
+- *(The old "operational hazards common to any PoW chain" line no longer
+  applies — BLOCH is not a PoW chain. Its operational hazards are in §9.2 and
+  are not shared with Bitcoin.)*
 
 ---
 
@@ -550,6 +693,21 @@ For readers who skipped to the end.
 
 - **1.0 (2026-04-19):** Initial version. Compares against Bitcoin Core 29
   post-Quarkslab audit.
+- **1.1 (2026-08-14):** Genesis-4 correction pass. Genesis-3 proof-of-work
+  stopped permanently at height **39,918** on 2026-08-13 (the banner's earlier
+  "50,000" was a planned ceiling the chain never reached), and Genesis-4 has
+  run under proof of stake since 21:31:19 UTC that day. Corrected every claim
+  about the **live** network: the executive table's hashrate / 51%-cost /
+  node-count / consensus / finality / transport rows, §3 (decentralization),
+  §4.4, §5 (consensus), §9.2 (operational hazards), §10.3 (running a node) and
+  §12. **The most dangerous line fixed was the finality row**, which described
+  settlement as confirmation depth; BLOCH settles by Casper-style epoch
+  finality (~32 min typical, ~48 min worst case) and confirmation counting is
+  the wrong rule on this chain. No risk disclosure was deleted: the retired
+  51%-attack material is preserved as §3.3 and §5.3, and the disclosure that
+  replaces it — **concentration**, one operator running all 64 validators and
+  93.94 % of the carryover at one address — is stated at equal prominence.
+  Genesis-3-era technical description is preserved rather than rewritten.
 
 ---
 

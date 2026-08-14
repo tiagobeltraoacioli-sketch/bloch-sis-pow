@@ -2,14 +2,23 @@
 
 | Field             | Value                                                              |
 | ----------------- | ------------------------------------------------------------------ |
-| **Status**        | Proposed                                                           |
+| **Status**        | **SUPERSEDED** (was: Proposed) — see the note directly below this table |
 | **Date**          | 2026-05-01                                                         |
 | **Authors**       | Founder (custodial)                                                |
 | **Reviewers**     | (TBD — US securities counsel, Brazilian counsel, Swiss counsel)    |
 | **Supersedes**    | None                                                               |
-| **Superseded by** | None                                                               |
+| **Superseded by** | Genesis-4 (proof of stake, live since 2026-08-13) — see note below |
 | **Related ADRs**  | ADR-010-A (premine schedule), ADR-023 (Foundation Genesis Model), ADR-026 (Custody handover) |
 | **Reference doc** | `BLOCH-FGM-001 v1.0` §3 and §9                                      |
+
+
+> **Status note, 2026-08-14.** No such instrument is recorded as executed anywhere in this repository. It also inherits ADR-010-A's superseded premine schedule; the founder's actual position is `FOUNDER_TOTAL_BLOCH` = 27,046,829,380 BLCH, of which 17,046,829,380 is carried-over balance that is **liquid and stakeable from slot 0** and therefore covered by no lock at all. A reader must not infer from this ADR that the founder's position is contractually restrained.
+>
+> The decision, context and consequences below are **not** rewritten:
+> this is a decision log and what was decided, when, is the record.
+> Read it as history, not as guidance. Genesis-3 (proof of work) stopped
+> permanently at height **39,918** on 2026-08-13; the live chain is
+> **Genesis-4, proof of stake**.
 
 ---
 

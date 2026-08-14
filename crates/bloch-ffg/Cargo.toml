@@ -1,11 +1,14 @@
 # bloch-ffg — FOUNDATION of the static FFG committee (study §4-bis) + committee-
-# governed feature activation (§5-quater step 6). STANDALONE and NOT wired into node
-# consensus; the empty [workspace] table keeps it out of the node build.
+# governed feature activation (§5-quater step 6). GENESIS-3-ERA and SUPERSEDED: it was
+# a finality OVERLAY on the proof-of-work base that stopped at height 39,918 on
+# 2026-08-13. The live chain is Genesis-4, proof of stake, where finality is not an
+# overlay — it is Casper-style FFG over a rotating epoch committee in
+# crates/bloch-pos-committee/src/finality.rs. NOT wired into anything. Kept for audit.
 [package]
 name = "bloch-ffg"
 version = "0.0.1"
 edition = "2021"
-description = "Static FFG committee: 14-of-21 finality + committee-governed feature activation (foundation, not consensus-wired)"
+description = "HISTORICAL (Genesis-3-era, superseded): static 14-of-21 FFG committee + committee-governed feature activation, designed as an overlay on the proof-of-work base that stopped 2026-08-13. Genesis-4's finality is in bloch-pos-committee; nothing here is consensus-wired."
 license = "AGPL-3.0-or-later"
 
 [dependencies]

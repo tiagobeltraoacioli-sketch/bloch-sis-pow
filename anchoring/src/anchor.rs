@@ -92,11 +92,16 @@ impl Finality {
 
 /// The receipt for a submitted commitment: where and how deeply it is anchored.
 ///
-/// Note the honesty rail on the base chain itself: under the current
-/// **k=4 relaxed-PoW, low-hashrate regime the chain is trivially forgeable and
-/// 51%-attackable** (roadmap "Read this first"). Confirmations here are a
-/// *depth signal*, not a security guarantee, until the protocol track closes
-/// k=8 + audit + a proven multi-node network.
+/// Note the honesty rail on the base chain. This crate anchors to **Genesis-3,
+/// the proof-of-work chain, which stopped permanently at height 39,918 on
+/// 2026-08-13**; while it ran, its k=4 relaxed-PoW low-hashrate regime made
+/// work trivially forgeable and the chain 51%-attackable, so confirmations
+/// were a *depth signal*, not a security guarantee. The live chain is
+/// **Genesis-4, proof of stake**, where finality is Casper-style
+/// justification/finalisation by epoch rather than depth, and where the
+/// security question is concentration: all 64 validators are run by one
+/// entity, and 56.05 B of the 57.15 B BLOCH issued at genesis is held by the
+/// founder and the Foundation. This type has not been ported to it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Anchor {
     /// The transaction that carries the commitment.

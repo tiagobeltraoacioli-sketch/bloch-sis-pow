@@ -2,6 +2,26 @@
 
 # EVM at L1 — Reuse Audit
 
+> **Genesis-4 is live.** Bloch has been running under **proof of stake** since
+> 21:31:19 UTC on 2026-08-13, when Genesis-3 (proof of work) stopped
+> permanently at height **39,918**. 30 s slots, 32-slot epochs, Casper-style
+> justification/finalisation by epoch, hybrid ML-DSA-65 ‖ Falcon-1024
+> signatures on every consensus path. Nothing in this document that describes
+> mining, hashrate, difficulty, retargeting or proof-of-work depth describes
+> the current network.
+>
+> **The live security question is concentration, not hashrate.** All 64
+> validators are operated by a single entity; 93.94% of the carryover
+> (17,046,829,380 of 18,146,400,000 BLOCH) sits at one address and carried
+> balances are stakeable, so if that balance stakes the Nakamoto coefficient
+> is 1; and 56,046,829,380 of the 57,146,400,000 BLOCH issued at slot 0 is
+> held by the founder and the Foundation, leaving 1.92% of genesis supply in
+> third-party hands. One operator can halt the chain and one holder can outvote
+> every other. The live transport is a point-to-point TCP full mesh with a
+> fixed peer list, **no discovery and no authentication**, and
+> `Deposit`/`Delegate` are refused at every node's mempool — which is why a
+> third party cannot yet join the network or become a validator.
+
 *A1, wave of 2026-08-11. Companion to `docs/FLEET-BRIEF-2026-08-11.md` §"EVM at
 L1, no L2". This document answers, file by file, what of the existing execution
 codebases survives the move to EVM at the base layer, what becomes dead code,
@@ -144,6 +164,13 @@ Two additional facts make the retirement clean:
    "confirmation depth as a price on reorgs" stops being the security
    primitive. The bridge's most sophisticated machinery was compensating for a
    base property Genesis-4 removes.
+
+   **What replaces it, so this does not read as a net security gain.** The
+   reorg price is gone and a different exposure takes its place: finality on
+   Genesis-4 is a two-thirds quorum of a validator set whose 64 members are
+   **all operated by one entity**, over a ledger 93.94% of which sits at a
+   single stakeable address. Depth-based attacks are moot; the base is not
+   thereby safer, it has a different single point of failure.
 
 **Retirement accounting** (sources + tests, approximate):
 
@@ -356,7 +383,7 @@ execution at that.
 | `src/modules.rs` (Ustav compiler) | 1,171 | compiles charters **to eUTXO validator programs** | The charter *model* (`TokenCharter`, `charter_id`, module kinds) SURVIVES into Ustav-at-L1 — it is the natural consensus object; the compiler backend is DEAD and needs an EVM/native-rule backend | survives whole |
 | `src/kirpich.rs` + `kirpich/` | 3,840 | SPLIT: lanes A–C (conflicts/completeness/params — 16 of 23 rules) are pure charter-scalar checks, **VM-agnostic**; lane D (emitted-bytecode audit: gas ceilings, `Op::Pick` bounds, constant-tail verdicts, KRP-063's `validator_hash == BLCH`) reasons about eUTXO bytecode | Lanes A–C SURVIVE into Ustav-at-L1 essentially unchanged; lane D REWRITE against whatever Ustav-at-L1 validates. Note: `compile_charter_audited` is opt-in today — `compile_charter` un-audited is still reachable; Ustav-at-L1 as a consensus object makes the gate mandatory by construction, which is precisely the promotion's point | same split |
 | `src/harness.rs` | 826 | eUTXO block-acceptance model; contains the EUV1 section + `eutxo_state_root` | DEAD (superseded by real wiring) — but its SMT-over-block-effects pattern is a usable idea for committing EVM receipts/effects | alive |
-| node adapter `src/euvm/{mod,miner}.rs` + `main.rs` call sites | ~2,500 | eUTXO codec/validation/miner-mirror, consensus-wired on G3 | DEAD with the G3 chain halt (h 80,000) if G4 does not carry euvm | REWRITE for the PoS node either way (the G4 node is `bloch-pos-node`, which references euvm **zero** times today — both PoS crates have no euvm dependency at all) |
+| node adapter `src/euvm/{mod,miner}.rs` + `main.rs` call sites | ~2,500 | eUTXO codec/validation/miner-mirror, consensus-wired on G3 | DEAD — the G3 chain halted at h 39,918 on 2026-08-13 and G4 does not carry euvm | REWRITE for the PoS node either way (the G4 node is `bloch-pos-node`, which references euvm **zero** times today — both PoS crates have no euvm dependency at all) |
 
 A fact for the founder's version of this decision: euvm has real downstream
 consumers in this repo — `bloch-pq-vault` (Governance/Custody validators),

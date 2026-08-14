@@ -8,9 +8,11 @@
 Document:    ED2-ECONOMICS-GOVERNANCE
 Replaces:    Edition 1 chapters 4 (The Ownerless Commons),
              16 (Economics & Tokenomics), 19 (Governance & Roadmap)
-Status:      DRAFT for Edition 2 assembly — describes designs and code that
-             are NOT live; the running chain today is Genesis-3 (PoW),
-             scheduled to halt at a terminal height
+Status:      DRAFT for Edition 2 assembly. Revised 2026-08-14: the transition
+             this chapter anticipated has happened. Genesis-3 (PoW) stopped
+             permanently at height 39,918 on 2026-08-13; **Genesis-4 (PoS) has
+             been the live chain since 21:31:19 UTC that day**, and the
+             Tokenomics V4 constants described here are the live chain's
 Sources:     docs/adr/ADR-036-retract-ownerless-adopt-foundation.md
              docs/adr/ADR-034-founder-anonymization-relinquishment-pact.md
              docs/specs/BLOCH-ENTITY-STRUCTURE.md
@@ -24,24 +26,41 @@ Created:     2026-08-12
 ```
 
 **Reading rule, inherited from Edition 1 and applied without exception:
-designed ≠ built ≠ booted.** Everything in this chapter that concerns
-Genesis-4 — the Foundation, the allocations, the vesting, the emission curve,
-the validator bond, delegation — is at most *built*: constants, state
-transitions, and tests exist in a standalone crate that the running node does
-not reference (`crates/bloch-pos-committee/src/tokenomics_v4.rs` states this
-in its module header: "Nothing here is active"). None of it is booted. The
-entity structure is at most *designed*: `docs/specs/BLOCH-ENTITY-STRUCTURE.md`
-is marked DRAFT, and the Bloch Foundation does not exist as a legal person at
-the time of writing.
+designed ≠ built ≠ booted.** An earlier draft of this chapter said that
+everything in it concerning Genesis-4 — the allocations, the vesting, the
+emission curve, the validator bond, delegation — was "at most *built*" and
+"none of it is booted". **That is no longer true and is withdrawn.** The
+Tokenomics V4 constants, the vesting functions, the emission curve and the
+supply-cap consensus invariant are **booted**: they are the rules of a live
+mainnet, and the opening ledger was minted from them on 2026-08-13.
+
+What is *not* booted, and must keep its label:
+
+- **Delegation and the staking lifecycle are built and unusable.** `Deposit`
+  and `Delegate` transactions are refused at every node's mempool
+  (`crates/bloch-pos-node/src/engine.rs:1900-1907`) because bonding is not yet
+  funded from the eUTXO set, so no one — insider or otherwise — can currently
+  bond or delegate stake.
+- **The entity structure is at most *designed*.** `BLOCH-ENTITY-STRUCTURE.md`
+  is marked DRAFT and the Bloch Foundation does not exist as a legal person,
+  while holding 29% of supply in the live genesis allocation.
+- **Nothing here has been audited by a third party.**
+
+And the operating fact that governs how §3 should be read: **all 64 Genesis-4
+validators are operated by a single entity**, on a transport with a fixed peer
+list, no discovery and no authentication, so no third party can join.
 
 **Source-of-truth rule.** This chapter does not restate consensus constants;
 it cites the files that define them. Where a specification's prose and a
-compiled constant disagree — and at the time of writing they do in at least
-one place (the carryover total in `BLOCH-TOKENOMICS-V4.md` §1–§2 differs in
-its last five digits from `CARRYOVER_TOTAL_BLOCH` in `tokenomics_v4.rs`) —
-**the compiled constant governs**, because it is pinned by compile-time
-assertions that fail the build if the arithmetic drifts, and prose is pinned
-by nothing.
+compiled constant disagree — and they do in several places, because the
+specs were written before the terminal snapshot — **the compiled constant
+governs**, because it is pinned by compile-time assertions that fail the build
+if the arithmetic drifts, and prose is pinned by nothing. In particular the
+carryover is **18,146,400,000 BLOCH** measured at Genesis-3 height **39,918**
+across **452,726** outputs and 16 addresses (`CARRYOVER_TOTAL_BLOCH`,
+`CARRYOVER_MEASURED_HEIGHT`, `CARRYOVER_MEASURED_UTXOS`), not the provisional
+17,970,880,000 the specs quote "at height 43,172" — a figure whose height
+label was a **block count**, not a height.
 
 ---
 
@@ -178,9 +197,8 @@ The history is kept because auditors read history.
 
 Source of record: `docs/specs/BLOCH-TOKENOMICS-V4.md` (design and decisions)
 and `crates/bloch-pos-committee/src/tokenomics_v4.rs` (the constants,
-schedules, and compile-time invariants). Status: **built, not booted** — the
-constants take effect only if and when a Genesis-4 chain is produced from
-them.
+schedules, and compile-time invariants). Status: **booted** — Genesis-4 was
+produced from these constants on 2026-08-13 and enforces them.
 
 ### 2.1 The 100,000,000,000 figure is a redenomination, not new supply
 
@@ -213,20 +231,27 @@ the file, not here):
 
 | Bucket | Constant | Share | Unlock |
 |---|---|---:|---|
-| Carryover (the whole Genesis-3 ledger) | `CARRYOVER_TOTAL_BLOCH` | 17.97% | Liquid at genesis |
+| Carryover (the whole Genesis-3 ledger) | `CARRYOVER_TOTAL_BLOCH` | **18.15%** (18,146,400,000 BLOCH) | Liquid at genesis |
 | Founder — new grant | `FOUNDER_BLOCH` | 10% | 10-yr cliff, 40-yr linear (`founder_vested_sat`) |
 | VC / crypto funds | `VC_BLOCH` | 10% | 12-mo cliff, 24-mo linear (`vc_vested_sat`) |
 | Development team | `TEAM_BLOCH` | 10% | 18-mo cliff, 36-mo linear (`team_vested_sat`) |
 | Marketing | `MARKETING_BLOCH` | 4% | 25% at genesis, rest over 24 mo (`marketing_vested_sat`) |
 | Liquidity | `LIQUIDITY_BLOCH` | 5% | 100% liquid at genesis (`liquidity_vested_sat`) |
-| Validators | `VALIDATOR_EMISSION_BLOCH` | 43.03% | Emitted over 40 years — never in anyone's custody |
+| Validators | `VALIDATOR_EMISSION_BLOCH` | **42.85%** (42,853,600,000 BLOCH) | Emitted over 40 years — never in anyone's custody |
 
-A compile-time assertion pins the sum to `TOTAL_SUPPLY_BLOCH`. The Foundation
-holds the VC, team, marketing, and liquidity buckets — 29% of supply
-(`FOUNDATION_HELD_BLOCH`) — making it the largest single holder for the first
-decade (`BLOCH-ENTITY-STRUCTURE.md` §3). The founder's total position is the
-carried-over balance plus the new grant: 26.89% of supply
-(`FOUNDER_TOTAL_BLOCH`, pinned by assertion). The grant was cut from 17% to
+A compile-time assertion pins the sum to `TOTAL_SUPPLY_BLOCH`. Everything
+except the validator emission existed at slot 0: **57,146,400,000 BLOCH**
+(`GENESIS_ISSUED_SAT`). The Foundation holds the VC, team, marketing, and
+liquidity buckets — **29.00%** of supply (`FOUNDATION_HELD_BLOCH`). The
+founder's total position is the carried-over balance plus the new grant:
+**27.04% of supply — 27,046,829,380 BLOCH** (`FOUNDER_TOTAL_BLOCH`, pinned by
+assertion at 2704 bps; the earlier 26.89% was computed against the provisional
+carryover and is superseded). **Together the founder and the Foundation hold
+56,046,829,380 of the 57,146,400,000 issued at slot 0 — leaving 1,099,570,620
+BLOCH, 1.92% of genesis supply, in third-party hands.** Stated that way on
+purpose: the repository pins the founder figure, and does not pin recipient
+keys for the Foundation's four buckets, so "one key holds 56 B" would be
+unverified and is not claimed. The grant was cut from 17% to
 10% on 2026-08-11 with the difference reallocated to validators — the only
 reallocation to date that moved supply *away* from an insider bucket
 (`BLOCH-TOKENOMICS-V4.md` §1).
@@ -256,7 +281,9 @@ the grant is the part of the founder's position that can still be made to
 wait. It is not, however, the whole position, and Edition 1's description of
 the founder allocation as "structurally passive" **does not carry over**: it
 was true of a design in which the founder's entire position sat behind the
-cliff, and it is not true of V4, where 16.89% of supply is liquid at slot 0.
+cliff, and it is not true of V4, where **17.05% of total supply — the
+founder's entire 17,046,829,380-BLOCH carried balance — is liquid at slot 0**,
+and stakeable.
 That sentence from Edition 1 Chapter 16.3 must not be quoted as if it
 described V4.
 
@@ -271,8 +298,12 @@ under the allocation, never over; an earlier claim of a zero residual was
 arithmetically impossible and is corrected in the file rather than repeated).
 The code provides three curves (`validator_reward_flat_sat`,
 `validator_reward_halving_sat`, `validator_reward_decay_sat`) with the decay
-curve marked recommended; the spec records the 10% decay as decided. No curve
-is yet wired into a running consensus — that is a Genesis-4 act.
+curve marked recommended; the spec records the 10% decay as decided. An earlier
+draft ended "no curve is yet wired into a running consensus — that is a
+Genesis-4 act"; **Genesis-4 launched on 2026-08-13, so a curve is now the
+issuance rule of a live chain.** Note what that emission currently funds: the
+validator set receiving it is 64 validators operated by one entity, and no
+third party can enter it while deposits are refused at the mempool.
 
 Two register rules the spec imposes on any public figure, kept here:
 
@@ -322,16 +353,42 @@ auditor to discover has chosen its readers' side against itself.
 
 ### 3.1 The measurement
 
-Measured on Genesis-3 at height 43,172 and carried under the split
-(`tokenomics_v4.rs`, `LARGEST_CARRYOVER_ADDRESS_BLOCH` and
-`CARRYOVER_TOTAL_BLOCH`, both pinned by assertion): the largest single
-address holds **~94% of the carryover** — which is itself the entire
-circulating float apart from the Foundation's liquid tranche. The founder's
-carried-over balance is **~70.4% of everything circulating at slot 0**, and
-the Foundation's liquid holding is the other 25.0% — two holders account for
-the whole genesis float (`BLOCH-TOKENOMICS-V4.md` §4A, §7B). A re-measurement
-at the Genesis-3 terminal height (50,000, decided 2026-08-12; was 80,000)
-will re-pin both constants; until then the h43,172 figures govern.
+Measured on Genesis-3 at the **terminal** height **39,918** — 452,726 outputs,
+16 addresses — and carried under the split (`tokenomics_v4.rs`,
+`LARGEST_CARRYOVER_ADDRESS_BLOCH`, `CARRYOVER_TOTAL_BLOCH`,
+`CARRYOVER_MEASURED_HEIGHT`, `CARRYOVER_MEASURED_UTXOS`, all pinned by
+assertion, with the set root and both file digests published so the
+measurement is checkable rather than asserted):
+
+- The largest single address holds **17,046,829,380 of 18,146,400,000 BLOCH —
+  93.94% of the carryover**, which is itself the entire circulating float apart
+  from the Foundation's liquid tranche.
+- The founder's carried-over balance is **70.60% of everything circulating at
+  slot 0** (24,146,400,000 BLOCH = carryover + liquidity 5 B + marketing TGE
+  1 B); the Foundation's liquid holding is the other **24.85%**. Two holders
+  account for the whole genesis float (`BLOCH-TOKENOMICS-V4.md` §4A, §7B).
+- Across the whole genesis issuance: founder **27.04%** + Foundation
+  **29.00%** = **56,046,829,380 of 57,146,400,000 (98.08%)**, leaving
+  **1,099,570,620 BLOCH — 1.92%** — with everyone else.
+
+**A note on the earlier numbers, because they were published and must not be
+quietly replaced.** Previous drafts read "measured at height 43,172",
+17,970,880,000 BLOCH, largest address 16,886,549,523, concentration 93.96%,
+founder total 26.89%, founder 70.4% of circulating. Two things were wrong.
+**The height label was a block count** — the chain was never at height 43,172,
+and in a DAG heights and block counts differ by design, so nobody could have
+reproduced that measurement. **And the reading was provisional**, because
+Genesis-3 kept minting until it halted. The terminal figures above supersede
+them. **The correction is not an improvement**: 93.96% → 93.94% is noise on a
+94% number, and the founder's share of eventual supply moved *up*, 26.89% →
+27.04%. Nothing was distributed.
+
+**And the fact that outranks all of the above on a live chain: all 64
+Genesis-4 validators are operated by a single entity.** Coin concentration is
+what the numbers above measure. Operator concentration is total, and it is not
+conditional on anyone's staking decision. No third party can join the validator
+set today: the live transport has a fixed peer list with no discovery and no
+authentication, and `Deposit`/`Delegate` are refused at every node's mempool.
 
 ### 3.2 If the founder stakes: the §4A.1 arithmetic
 
@@ -351,8 +408,8 @@ anyone quotes a decentralisation date as a forecast:
 - **Gate G1 is unreachable from emission alone if the founder stakes.** G1
   requires independent eligible stake ≥ 15% of circulating supply
   (`BLOCH-POS-SHA3-LATTICE-MIGRATION.md` §4). Share conservation holds the
-  independent share of active stake at its starting point — 6.03% — at every
-  horizon, and active stake can never exceed circulating supply. Under this
+  independent share of active stake at its starting point — **6.06%**
+  (1,099,570,620 of 18,146,400,000) — at every horizon, and active stake can never exceed circulating supply. Under this
   scenario G1 is "not late, it is unreachable — not at year five, not at
   year forty — from emission alone. The only thing that moves G1 is coins
   changing hands" (§4A.1).
@@ -433,7 +490,13 @@ is a reporting rule, not a protocol rule, and it is labelled as such.
 
 The launch statement Edition 2 adopts, verbatim from the spec: **the chain
 starts centralised, by construction, and the gates measure the distance from
-there.**
+there.** Edition 2 must add what the spec could not know: **Genesis-4 launched
+on 2026-08-13 with none of G1–G4 met** — independent stake 0%, one entity
+operating 64 of 64 validators, Nakamoto coefficient 1, zero unaffiliated
+operators — and with no external audit. The gates were written as Go/No-Go
+conditions on the transition. They did not gate it. That is a governance
+finding and this chapter records it as one rather than continuing to describe
+the gates in the future tense.
 
 ---
 
@@ -530,8 +593,12 @@ concentration facts of §3 are unmoved by any bond value.
 
 ### 5.2 Delegation
 
-`crates/bloch-pos-committee/src/delegation.rs` — **built, not booted**, like
-everything else in the crate. Delegation exists because the adopted revenue
+`crates/bloch-pos-committee/src/delegation.rs` — **built, and not usable**.
+The rules are live consensus, but no delegation can be made: `Delegate`
+transactions are refused at every node's mempool
+(`crates/bloch-pos-node/src/engine.rs:1900-1907`) because bonding is not yet
+funded from the eUTXO set, so a delegation would create stake without spending
+coins. Delegation exists because the adopted revenue
 model (Solana's: pro-rata inflation rewards scaled by attestation credits,
 commission on delegated stake, 50% base-fee burn during emission, priority
 fees to the producer — `BLOCH-TOKENOMICS-V4.md` §6.3) is meaningless without
@@ -579,16 +646,21 @@ In the Edition 1 idiom, applied to everything above:
 | Item | Status | Meaning here |
 |---|---|---|
 | ADR-036 retraction; ADR-033/034 retracted | Decided and recorded | A documentation and governance act — in force as a matter of record |
-| Genesis-3 chain (PoW, SHA-256d, GhostDAG) | Booted | The live network today; scheduled to halt at the terminal height per `BLOCH-TOKENOMICS-V4.md` §3.2 |
-| Tokenomics V4 constants, split, vesting functions, emission curves, cap invariant | Built, not booted | Standalone crate, not referenced by the node; active only if a Genesis-4 genesis is produced from it |
-| Supply-cap enforcement (`SupplyCapExceeded`) | Built, not booted | Enforced by the PoS state transition, which no live chain runs |
-| Delegation, per-validator cap, churn limit, slashing wiring | Built, not booted | Implemented and tested in `bloch-pos-committee`; no live validator set exists |
-| Genesis validator cohort and declining cap | Built, not booted | `genesis_cohort.rs`; binds only a genesis that has not occurred |
-| Bloch Foundation, board, jurisdiction | Designed | DRAFT spec; no legal entity exists |
-| VC round | Designed | An allocation and vesting schedule in code; no counterparty exists yet to sign, no round closed |
-| Weak-subjectivity checkpoint regime (m-of-n) | Designed | Parameters adopted on paper in `BLOCH-WEAK-SUBJECTIVITY.md` §6 |
-| Phase-0 securities review | Not done — blocking | Reclassified from precautionary to blocking by ADR-036 |
-| Third-party audit of the PoS crate | Not done | Pre-audit dossier exists (`docs/audit/CERTIK-PRE-AUDIT-DOSSIER.md`); gates any launch |
+| Genesis-3 chain (PoW, SHA-256d, GhostDAG) | **Ended** | Stopped permanently at height 39,918 on 2026-08-13. Historical; the provenance of Genesis-4's opening ledger, not what runs |
+| Genesis-4 chain (PoS, 30 s slots, 32-slot epochs) | **Booted** | The live network since 21:31:19 UTC, 2026-08-13. Public read RPC `https://posternlabs.com/g4rpc` |
+| Tokenomics V4 constants, split, vesting functions, emission curve | **Booted** | The live chain's issuance and unlock rules; the opening ledger was minted from them |
+| Supply-cap enforcement (`SupplyCapExceeded`) | **Booted** | Enforced in validation by every node against the committed `TAG_ISSUED_SUPPLY` leaf (`transition.rs:2307-2311`) |
+| Transfers | **Booted** | Execute on the live chain; submitted via `sendrawtransaction` |
+| Deposits and delegations | Built, **refused** | Rejected at every node's mempool (`bloch-pos-node/src/engine.rs:1900-1907`) — bonding is not yet funded from the eUTXO set, so nobody can bond or delegate stake |
+| Per-validator cap, churn limit, slashing rules | Booted as rules; **not binding in practice** | The validator set they constrain is 64 records operated by one entity, and cannot become plural while deposits are refused |
+| Genesis validator cohort and declining cap | **Booted** | `genesis_cohort.rs`; the taper reduces one operator's share of a set containing no one else |
+| Network transport | **Devnet mesh in production** | `Transport::Devnet` is the fleet's transport and the default: fixed peer list, no discovery, no authentication — the reason a third party cannot join. A libp2p stack exists in-tree and is not what runs |
+| Distribution gates G1–G4 | **Not met — and did not gate the launch** | Observed today: independent stake 0%; 64 of 64 validators one entity; Nakamoto coefficient 1; 0 unaffiliated operators |
+| Bloch Foundation, board, jurisdiction | Designed | DRAFT spec; no legal entity exists — while holding 29.00% of supply in the live genesis allocation |
+| VC round | Designed | An allocation and vesting schedule in code and now on-chain; no counterparty exists yet to sign, no round closed |
+| Weak-subjectivity checkpoint regime (m-of-n) | Designed / partially built | Parameters adopted on paper (`BLOCH-WEAK-SUBJECTIVITY.md` §6); checkpoint format and verification exist, the fresh-node sync path that would consume them does not |
+| Phase-0 securities review | Not done — blocking | Reclassified from precautionary to blocking by ADR-036; the chain launched before it concluded |
+| Third-party audit of the PoS crate or the node | **Not done — and the chain launched anyway** | A pre-audit dossier exists (`docs/audit/CERTIK-PRE-AUDIT-DOSSIER.md`); it was written to gate a launch that did not wait for it. Gate G7 (external review of the Falcon online-signing path) was likewise unmet at launch |
 
 Nothing in this chapter is financial, legal, or investment advice; nothing in
 it is an offer; and no statement in it should be read as a claim about the

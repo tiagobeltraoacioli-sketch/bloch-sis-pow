@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Wire/disk codec for the Genesis-4 devnet node.
+//! Wire/disk codec for the Genesis-4 node — the live mainnet binary.
 //!
 //! The **header** bytes are never encoded here: they come from
 //! [`BlockHeaderV4::canonical_serialize`] / `canonical_deserialize`, the single
 //! derivation path the committee crate pins (§5.4). This module only frames
 //! what the pure crate deliberately leaves to the node: the envelope around
 //! the header (signature, attestation quorum, opaque transactions), the
-//! attestation wire form, and the devnet's genesis-manifest / keystore files.
+//! attestation wire form, and the genesis-manifest / keystore files.
 //!
 //! Everything is fixed-order, little-endian, length-prefixed — injective by
 //! construction, no serde, no reflection. `decode_*` functions are strict:
@@ -19,8 +19,11 @@ use bloch_pos_committee::attestation::{Attestation, AttestationData};
 use bloch_pos_committee::header::{BlockEnvelope, BlockHeaderV4, Body};
 
 /// Hard cap on any decoded length field, so a corrupt frame cannot ask for a
-/// multi-gigabyte allocation. Generous for a devnet block (12 validators ×
-/// ~4.7 KB attestation ≈ 56 KB).
+/// multi-gigabyte allocation. Generous for a live Genesis-4 block: even if a
+/// single block carried an attestation from every validator in the cohort,
+/// that is 64 × ~4.7 KB ≈ 300 KB — well under this ceiling. The constant is
+/// unchanged; only the worked example was stale (it read "a devnet block
+/// (12 validators × ~4.7 KB attestation ≈ 56 KB)", and the live cohort is 64).
 pub const MAX_FIELD_LEN: usize = 8 * 1024 * 1024;
 
 #[derive(Debug)]

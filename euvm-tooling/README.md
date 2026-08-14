@@ -8,10 +8,17 @@ API in ergonomic components so you never hand-write raw `Op` vectors or juggle
 contracts** — all runnable off-chain.
 
 > **Status of the underlying VM:** FOUNDATION / reference. `bloch-euvm` is a
-> standalone, tests-only library and is **NOT wired into node consensus**. Any real
-> activation is a coordinated, height-gated hard fork. Everything here exercises the
-> model off-chain — the fastest possible edit → assemble → simulate loop for contract
-> authors.
+> standalone, tests-only library and is **NOT wired into node consensus** — it was
+> not wired into Genesis-3's, and it is not wired into Genesis-4's. Everything here
+> exercises the model off-chain: the fastest possible edit → assemble → simulate
+> loop for contract authors.
+>
+> **Scope note.** `bloch-euvm` is a Genesis-3-era crate. Genesis-3, the
+> proof-of-work chain, stopped permanently at height 39,918 on 2026-08-13; the live
+> chain is **Genesis-4, proof of stake** (30 s slots, 32-slot epochs, finality by
+> epoch), where "a coordinated, height-gated hard fork" is not the activation model
+> either. Nothing here has been ported to Genesis-4, and no activation of it is
+> scheduled on any chain.
 
 ---
 

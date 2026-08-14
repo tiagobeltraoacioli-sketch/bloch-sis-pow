@@ -7,9 +7,10 @@
 //! (`spikes/prover-cost/RESULTS.md`): 7,274,849 RV32IM instructions per
 //! ML-DSA-65 ‖ Falcon-1024 verification, and a 4,589-byte signature.
 //!
-//! Nothing here is active. There is no activation height in this crate because
-//! the crate is not wired into the node; when it is, activation follows the
-//! height-gated flag-day idiom used by `STATE_ROOT_ACTIVATION_HEIGHT`.
+//! **Everything here is active.** There is no activation height in this crate
+//! because there is nothing to activate: the crate is the live Genesis-4
+//! node's consensus, and these values have been in force since slot 0 on
+//! 2026-08-13. Changing any of them is a hard fork, not a flag day.
 
 /// Full committee, voting once at each epoch boundary for justification and
 /// finality. At 4,589 B per signature this is ≈ 588 KB in the epoch-boundary
@@ -62,8 +63,10 @@ pub const INACTIVITY_LEAK_THRESHOLD_EPOCHS: u64 = 4;
 /// `stake * t / QUOTIENT` in the t-th epoch beyond the threshold, so the
 /// cumulative loss grows quadratically. 64 is sized for recovery in tens of
 /// epochs (≈ hours at 16 min/epoch), not days: with a 40%-absent set, the
-/// live 60% regains a 2/3 supermajority after ~6 leak epochs. Like every
-/// §5.1 value this is a Phase-1 proposal needing a KAT and a devnet sweep.
+/// live 60% regains a 2/3 supermajority after ~6 leak epochs. Honest status:
+/// like every §5.1 value this was a Phase-1 proposal, and it went live on
+/// 2026-08-13 without the KAT and the multi-node sweep that were meant to
+/// validate it. It is a consensus constant now — changing it is a hard fork.
 pub const INACTIVITY_LEAK_QUOTIENT: u128 = 64;
 
 /// Domain separation tags (§6.1). Fixed 16 bytes, right-padded with zeros, so

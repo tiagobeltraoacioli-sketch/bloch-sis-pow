@@ -197,7 +197,7 @@
     measurement; side channels remain open research. The provider still sees
     traffic shape and controls availability. On-device Postern editions remain
     the maximally sovereign option.
-    A Postern Labs product on the ownerless Bloch-SIS-PoW protocol.
+    A Postern Labs product built on the Bloch-SIS-PoW protocol.
   '';
 
   time.timeZone = lib.mkDefault "UTC";

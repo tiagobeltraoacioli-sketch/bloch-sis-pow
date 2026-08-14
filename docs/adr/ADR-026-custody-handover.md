@@ -2,14 +2,23 @@
 
 | Field             | Value                                                              |
 | ----------------- | ------------------------------------------------------------------ |
-| **Status**        | Proposed                                                           |
+| **Status**        | **SUPERSEDED** (was: Proposed) — see the note directly below this table |
 | **Date**          | 2026-05-01                                                         |
 | **Authors**       | Founder (custodial)                                                |
 | **Reviewers**     | (TBD — Swiss/SG counsel, IP counsel, security engineering)         |
 | **Supersedes**    | None                                                               |
-| **Superseded by** | None                                                               |
+| **Superseded by** | Genesis-4 (proof of stake, live since 2026-08-13) — see note below |
 | **Related ADRs**  | ADR-022 (signature curve), ADR-023 (Foundation Genesis Model), ADR-024 (Steward Council bootstrap), ADR-025 (decentralization metrics) |
 | **Reference doc** | `BLOCH-FGM-001 v1.0` §4 Phase 4                                     |
+
+
+> **Status note, 2026-08-14.** No custody handover has occurred. Genesis-4 launched with the founder operating all 64 validators and holding 27,046,829,380 BLCH; the receiving Foundation board does not exist. The signature-curve assumptions here (ADR-022, BLS12-381) do not apply to Genesis-4.
+>
+> The decision, context and consequences below are **not** rewritten:
+> this is a decision log and what was decided, when, is the record.
+> Read it as history, not as guidance. Genesis-3 (proof of work) stopped
+> permanently at height **39,918** on 2026-08-13; the live chain is
+> **Genesis-4, proof of stake**.
 
 ---
 

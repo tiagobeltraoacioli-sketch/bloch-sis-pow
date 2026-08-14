@@ -11,13 +11,16 @@
 //! (its byte layout would become consensus-adjacent, KAT territory), and
 //! smuggling a private encoder in here would create a second byte layout for
 //! committed state, the exact twin-derivation defect this repo keeps paying
-//! for. So the devnet persists the **inputs** instead: the genesis manifest
+//! for. So the node persists the **inputs** instead: the genesis manifest
 //! digest plus every applied block envelope, in chain order. Restart = replay
 //! through the same `Transition` that accepted the blocks live; determinism
 //! of the transition (pinned by the pure crate's tests) makes the replayed
 //! state bit-identical, and the node proves it by logging the head state root
-//! on boot. Cost, stated: boot is O(chain length). Fine for a devnet; the
-//! RocksDB layer with block-id-keyed state remains M-later work.
+//! on boot. Cost, stated: boot is O(chain length), and this is what the LIVE
+//! mainnet runs — every restart replays the whole chain from genesis, so boot
+//! time grows with the chain. Acceptable at Genesis-4's current length, not
+//! indefinitely; the RocksDB layer with block-id-keyed state remains M-later
+//! work and is the fix.
 //!
 //! Log frame: `u32 LE length ‖ envelope bytes` (codec::encode_envelope).
 //! Appends are single `write_all` calls followed by fsync, so a crash leaves

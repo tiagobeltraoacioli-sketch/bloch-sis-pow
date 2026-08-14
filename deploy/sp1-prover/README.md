@@ -1,5 +1,15 @@
 # Coherence SP1 prover on Fly.io
 
+> **Not live, on either chain.** Read every present tense below as a design.
+> The shielded pool is **inert on Genesis-4**: shielded-transaction application
+> is not wired into the state transition, and
+> `crates/bloch-pos-committee/src/derive.rs` carries an explicit invariant test
+> for that (`derive.rs:717-721`, "while shielded application is inert"). No
+> validator on the live chain consumes a proof from this service, and no
+> deployment of it is part of the live fleet. Genesis-3, the proof-of-work
+> chain, stopped permanently at height 39,918 on 2026-08-13 and never ran it
+> either.
+
 The GPU proving half of the shielded pool. A wallet POSTs `(public, witness)` to
 `/prove` and gets back a **raw FRI proof** (post-quantum) that the C1 spend
 statement (`check_spend`) held. The node verifies that FRI proof **locally** and

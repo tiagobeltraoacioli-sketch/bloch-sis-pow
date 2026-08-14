@@ -6,6 +6,9 @@
 Document:  SITE-PLAN
 Status:    PLAN — nothing here is published; publishing is the founder's call
 Created:   2026-08-12
+Updated:   2026-08-14 — facts of record corrected after the Genesis-4 launch
+           (Genesis-3 halted at 39,918; PoS live since 2026-08-13 21:31:19 UTC;
+           supply cap FINAL at 100 B). The plan's *structure* is unchanged.
 Direction: approved visual preview (white ground, emerald #0E6E5A, ink #0D1B17,
            violet #4B3FA8, amber #B4630F; Charter display / system sans body /
            mono data; canvas Bloch sphere; light+dark tokens already written)
@@ -19,20 +22,44 @@ still says otherwise, that is flagged, not followed.
 
 | Fact | Value | Source |
 |---|---|---|
-| Genesis-3 terminal height | **50,000** (lowered from 80,000 on 2026-08-12) | `docs/FLEET-BRIEF-CERTIK-2026-08-12.md` §Decisions item 4. `BLOCH-ECOSYSTEM-MIGRATION.md` and `BLOCH-TOKENOMICS-V4.md` §3.1 still say 80,000 — **stale, do not copy**. |
-| Consensus after migration | Proof of stake (slots/epochs, LMD-GHOST, Casper-style finality, PQ signatures) | `crates/bloch-pos-committee/`, `docs/specs/BLOCH-POS-SHA3-LATTICE-MIGRATION.md` |
-| Total supply | **100,000,000,000 BLCH — published as "under review"**. The 100 B redenomination is **blocked by an open arithmetic problem and must not appear on the site.** | `crates/bloch-pos-committee/src/tokenomics_v4.rs:33` (`TOTAL_SUPPLY_BLOCH = 21_000_000_000`) |
-| Validator bond | The Ethereum fraction of supply (32 ETH ≈ 2.66e-7 of ETH supply). Under the 21 B denomination that is **25,000 BLCH** — `MIN_DEPOSIT_SAT = 5_600 * SAT_PER_BLOCH`. Published tied to the supply's "under review" flag. | `crates/bloch-pos-committee/src/staking.rs:119` |
+| Genesis-3 terminal height | **39,918 — halted, permanently, on 2026-08-13.** Terminal DAG: 50,690 blocks. Planned ceilings of 80,000 and 50,000 appear in older documents; **neither was ever reached — do not copy either.** | `tokenomics_v4.rs:222` (`CARRYOVER_MEASURED_HEIGHT = 39_918`) |
+| Consensus today | **Proof of stake, LIVE since 21:31:19 UTC on 2026-08-13.** 30 s slots, 32 slots/epoch, `COMMITTEE_SIZE = 128`, `SLOT_SUBCOMMITTEE_SIZE = 8`, 64 genesis validators, LMD-GHOST fork choice, Casper justification/finalisation **by epoch**. | `crates/bloch-pos-committee/src/params.rs` |
+| Settlement rule | **Finality, not confirmation depth and not work depth.** Justification and finalisation are evaluated at epoch boundaries: **~32 min typical, ~48 min worst case.** Never publish a "N confirmations" rule for Genesis-4. | `crates/bloch-pos-committee/src/{finality,forkchoice}.rs`, `params.rs` |
+| Total supply | **100,000,000,000 BLOCH. Hard-capped. FINAL — not "under review".** The redenomination landed; there is no open arithmetic problem. Publish the figure plainly. | `tokenomics_v4.rs:84` (`TOTAL_SUPPLY_BLOCH = 100_000_000_000`) plus the compile-time assert at `:354-361` that the components sum to it |
+| Supply split | Issued at slot 0: **57,146,400,000**. Carryover **18,146,400,000** over 452,726 outputs. Validator emission **42,853,600,000** over 40 years, unissued. | `tokenomics_v4.rs:188, 224, 233-240, 251` |
+| Validator bond | **25,000 BLOCH** — `MIN_DEPOSIT_SAT = 25_000 * SAT_PER_BLOCH`. Founder decision 2026-08-12; re-derived from the Ethereum fraction of supply (32 ETH ≈ 2.66e-7 of ETH supply ⇒ ~26,567 BLOCH, rounded down to `supply / 4,000,000`). **Not** tied to any "under review" flag. Publish with the code's own caveat: lowering the bond widens who *may* validate and does nothing about who *does*. | `crates/bloch-pos-committee/src/staking.rs:97` |
 | Signature suite | `SUITE_MLDSA65_FALCON1024 = 0x0001`, both must verify | `crates/bloch-pos-committee/src/staking.rs:57`; brief 08-11 §Settled item 2 |
 | Governance | **Not ownerless.** Two-entity foundation structure. | `docs/specs/BLOCH-ENTITY-STRUCTURE.md`, `docs/adr/ADR-036-retract-ownerless-adopt-foundation.md` |
-| Concentration | Founder ~94% of carried-over balance; stakeable (decided 2026-08-11); stated plainly, never softened | `docs/specs/BLOCH-TOKENOMICS-V4.md` §4A; brief 08-12 §2 |
+| Concentration | **93.94%** of the carryover sits at one address (17,046,829,380 of 18,146,400,000). **Founder total 27.04% of the cap** (27,046,829,380; pinned at 2704 bps). **Foundation a further 29.00%** (VC 10 B, team 10 B, marketing 4 B, liquidity 5 B). Together **56,046,829,380 of the 57,146,400,000 issued**, leaving **1,099,570,620 BLOCH — 1.92% — third-party.** Stated plainly, never softened. | `tokenomics_v4.rs:414, 434-435, 97-113` |
+| Network openness | **A third party cannot join today.** The live transport is a point-to-point TCP full mesh with a fixed peer list, no discovery and no authentication. Deposit and Delegate are refused at every node's mempool, so there is no permissionless path to validating. | `crates/bloch-pos-node/src/{net.rs,main.rs}`; `engine.rs` (deposit/delegate refusal) |
+| Public read RPC | `https://posternlabs.com/g4rpc` — version `0.1.0-mainnet` | live endpoint |
+
+**Precision rule for the concentration figures:** write "founder and Foundation
+together" for the 56.05 B. **Never write "one key holds 56.05 B"** — only the
+founder's 27.04% is pinned in the repo.
+
+**The security caveat that must appear wherever the old PoW caveats did.** Every
+"51%-attackable", "low hashrate" or "zero-security testnet" line on the site is
+now stale. Do not delete them — replace each, in the same voice and the same
+position, with:
+
+> The security question under Genesis-4 is not hashrate, it is concentration:
+> all 64 validators are run by one entity, 93.94% of the carryover sits at a
+> single address, and 56.05 B of the 57.15 B BLOCH issued at genesis is held by
+> the founder and the Foundation. One operator can halt the chain and one holder
+> can outvote every other.
+
+Every "no external audit has been completed" statement stays, verbatim.
 
 **Consequence for the approved preview itself:** the preview HTML was written
-against the 100 B draft. Before it ships, its Supply table (100 B /
-43,029,120,000 / 17,970,880,000 / 10 B rows) and its Build card ("25,000 BLCH
-bond") must be regenerated from `tokenomics_v4.rs` and `staking.rs` under the
-21 B denomination, with the "under review" mark. The design is approved; those
-numbers are not. See §5.
+against the 100 B draft, and **100 B is now correct** — the block on publishing
+it is lifted. What must still be regenerated from `tokenomics_v4.rs` and
+`staking.rs` are the individual rows, which were drafted before the carryover
+was measured: the preview's `43,029,120,000` becomes **42,853,600,000** and its
+`17,970,880,000` becomes **18,146,400,000** (with bar widths recomputed). The
+bond card's 25,000 BLOCH is correct and ships without an "under review" mark.
+Drop the "under review" badge and the ×4.7619 redenomination paragraph
+entirely. See §5.
 
 ---
 
@@ -53,11 +80,11 @@ Protocol · Migration · Supply · Explorer · Brand · Build · Docs
 | Route | Page | One line |
 |---|---|---|
 | `/` | Protocol | Hero + sphere, status strip, the three commitments with their costs |
-| `/migration` | Migration | Halt at 50,000 → gap → Genesis-4 from snapshot; anti-scam warning |
-| `/supply` | Supply | 21 B (under review), allocation table, the concentration card |
-| `/explorer` | Explorer | The React app (rebranded), live until halt, archive mode after |
+| `/migration` | Migration | Halted at 39,918 → gap → Genesis-4 live from snapshot; anti-scam warning |
+| `/supply` | Supply | 100 B hard cap, allocation table, the concentration card |
+| `/explorer` | Explorer | The React app (rebranded); Genesis-3 pages in archive mode, Genesis-4 pages against the live PoS RPC |
 | `/brand` | Brand | Swatches, type spec, logo SVG, downloadable tokens |
-| `/build` | Build | Run a node today (PoW, until 50,000) + what validating will take |
+| `/build` | Build | What Genesis-4 validating takes, and the honest statement that it is not open yet |
 | `/docs` | Docs | Placeholder structure + review queue; nothing unreviewed ships |
 
 ---
@@ -73,8 +100,10 @@ page.
 | Piece | Source |
 |---|---|
 | Hero copy, sphere canvas, status strip layout | Approved preview (`bloch-site.html`) verbatim, minus stale numbers (§5) |
-| Status strip: current height, block time | Live RPC via the explorer's `/rpc` Function (`apps/explorer/functions/rpc.js`); after the halt, frozen values labelled "final" |
-| Status strip: "Halts at 50,000" | Brief 08-12 item 4 (until the halt-release constant lands in the PoW repo; then cite that) |
+| Status strip: current slot/epoch | Live Genesis-4 read RPC (`https://posternlabs.com/g4rpc`, version `0.1.0-mainnet`). Genesis-3 values are frozen and must be labelled "final", never "measured today" |
+| Status strip: "Genesis-3 halted at 39,918" | `tokenomics_v4.rs:222`. Label it **final**, not a future trigger — the halt already happened |
+| Status strip: block time | **30 s fixed slot**, labelled as the protocol constant (`params.rs`, `SLOT_DURATION_SECS`). Never a "trailing average" — PoS slots are fixed, not measured |
+| Status strip: settlement | "Final by epoch — ~32 min" (`params.rs`). Never "N confirmations" |
 | Signature card (hybrid, 4.6 KB cost, no hardware wallet) | Preview copy; suite constant `staking.rs:57`; brief 08-11 §Settled 2 |
 | Coherence card (SHAKE-256, STARK, no trusted setup, unaudited) | `docs/specs/COHERENCE-C1.md`, `COHERENCE-C1.1.md`; brief 08-11 §Settled 3 |
 | PoS card (slots, epochs, LMD-GHOST, Casper-style; concentrated start) | `crates/bloch-pos-committee/src/{forkchoice,finality,schedule}.rs`; `BLOCH-POS-SHA3-LATTICE-MIGRATION.md` |
@@ -85,8 +114,8 @@ page.
 
 | Piece | Source |
 |---|---|
-| Four-phase timeline (live → halt → gap → Genesis-4) | Preview `#road` section, with **50,000** everywhere |
-| Halt mechanics ("consensus rule compiled into every node") | `BLOCH-TOKENOMICS-V4.md` §3.2.1 (mechanism; its 50,000 figure is stale) |
+| Four-phase timeline (PoW → halt → gap → Genesis-4 live) | Preview `#road` section, with **39,918** everywhere, and every phase in the **past** tense except the last — all four have happened |
+| Halt mechanics ("consensus rule compiled into every node") | `BLOCH-TOKENOMICS-V4.md` §3.2.1 (mechanism only; both its 80,000 and the brief's 50,000 are stale — the chain stopped at 39,918) |
 | Snapshot: signed balance set, carryover crosses untouched | `BLOCH-TOKENOMICS-V4.md` §1; `BLOCH-ECOSYSTEM-MIGRATION.md` (mechanism only — heights stale) |
 | "No claim, no contract, anyone asking you to migrate tokens is stealing them" | Preview copy — keep verbatim; it is the single most important sentence on the site |
 | Ecosystem wind-down (exchanges/L2 drain, explorer archive banner) | `BLOCH-ECOSYSTEM-MIGRATION.md` §5, §Timeline table |
@@ -96,11 +125,12 @@ page.
 
 | Piece | Source |
 |---|---|
-| Total: **100,000,000,000 BLCH — marked "under review"** on the page itself, mono badge, amber `--signal` | `tokenomics_v4.rs:33` |
-| Allocation table (carryover 17,970,880,000 / 17.97%; founder grant 10,000,000,000 / 10%, 10-yr cliff + 40-yr vest; VC 10%; team 10%; marketing 4%; liquidity 5%; validators 43,029,120,000 / 43.03% over 40 yrs) | `tokenomics_v4.rs:33–116` constants; prose framing from `BLOCH-TOKENOMICS-V4.md` §1 table |
-| Founder total 26.89% (carryover largest address + grant) | `tokenomics_v4.rs:236–241` (`FOUNDER_TOTAL_BLOCH`, compile-time assert `== 2688` bps) |
+| Total: **100,000,000,000 BLOCH, hard-capped** — stated plainly. **No "under review" badge.** | `tokenomics_v4.rs:84` |
+| Allocation table (carryover **18,146,400,000** / 18.15%; founder grant 10,000,000,000 / 10%, 10-yr cliff + 40-yr vest; VC 10%; team 10%; marketing 4%; liquidity 5%; validators **42,853,600,000** / 42.85% over 40 yrs) | `tokenomics_v4.rs:84–240` constants; prose framing from `BLOCH-TOKENOMICS-V4.md` §1 table |
+| Issued at slot 0: **57,146,400,000** (everything except the unissued validator emission) | `tokenomics_v4.rs:251` (`GENESIS_ISSUED_SAT`) |
+| Founder total **27.04%** = 27,046,829,380 BLOCH (largest carryover address + grant) | `tokenomics_v4.rs:434–435` (`FOUNDER_TOTAL_BLOCH`, compile-time assert `== 2704` bps) |
 | Fixed cap as consensus invariant — stated at true strength ("no mechanism *inside* the protocol"; a universal hard fork can change any rule) | Brief 08-12 §Decisions item 2 (wording), V4 spec |
-| Concentration card (~94% of carryover, one holder; Nakamoto coefficient 1 if staked) | `BLOCH-TOKENOMICS-V4.md` §4A; brief 08-12 §2. Never softened — the preview card's wording is the model. |
+| Concentration card: **93.94%** of the carryover at one address; founder **27.04%** of cap and Foundation **29.00%**, together 56.05 B of the 57.15 B issued, leaving **1.92%** third-party; **Nakamoto coefficient 1** — all 64 validators run by one entity | `tokenomics_v4.rs:414, 434–435, 97–113`; `BLOCH-TOKENOMICS-V4.md` §4A. Never softened. Write "founder and Foundation together" — never "one key holds 56.05 B". |
 | Bounding mechanisms: genesis-cohort → one third within a year; per-validator 1%-of-active-stake cap; churn 25 bps | `genesis_cohort.rs` (header comment derives the one-third choice), `staking.rs:106,295–301` (cap is 1% of active stake, derived by caller), `WARMUP_RATE_BPS = 25` (brief 08-11 §Settled 6; constant in the crate) |
 | What the mechanisms do NOT reach (can't see beneficial ownership; G1 unreachable by emission alone) | `BLOCH-TOKENOMICS-V4.md` §4A.1 |
 | Fees: burn during emission, then 100% to validators | Brief 08-11 §Settled 4; `fee_market.rs` |
@@ -120,10 +150,11 @@ Two halves, honestly separated:
 
 | Piece | Source |
 |---|---|
-| **Today (until 50,000):** run a PoW node — current release, snapshot bootstrap, systemd | Live-site `run-a-node.html` content *audited against §4*, `docs/SNAPSHOT-BOOTSTRAP.md`; must add the halt ("mining revenue ends at 50,000") which the current guide omits entirely |
-| **Genesis-4 (planned):** bond 25,000 BLCH (Ethereum fraction; under review with the supply) | `staking.rs:119` |
+| **Do NOT publish a "run a PoW node" guide.** Proof of work ended at height 39,918; a mining guide would now send readers to hash against a chain that does not exist. The old `run-a-node.html` becomes an archived page with a halt banner, not a live instruction | `tokenomics_v4.rs:222`; §5.C below |
+| **Genesis-4 validating:** bond **25,000 BLOCH**, `MIN_DEPOSIT_SAT` — with the code's own caveat: lowering the bond widens who *may* validate and does nothing about who *does* | `staking.rs:97` |
 | Delegation + shared slashing exposure | `delegation.rs`; preview card copy |
-| "The node is devnet" card — no transactions, no p2p, no RPC, **no launch date** | Preview copy; `BLOCH-POS-NODE-INTEGRATION.md`, `BLOCH-POS-GAPS.md` |
+| **The limitation card — replaces the old "the node is devnet" card, whose four clauses are all now false.** The node has a JSON-RPC server, a real Transfer format with inputs and outputs, append-only persistence with deterministic replay, and a launch date that has passed. The true limitation to publish: **the live transport is a point-to-point TCP full mesh with a fixed peer list, no discovery and no authentication, which is why a third party cannot yet join the network; and Deposit and Delegate transactions are refused at every node's mempool because bonding is not yet funded from the UTXO set — so there is no permissionless path to validating today.** | `crates/bloch-pos-node/src/{net.rs,main.rs}`, `engine.rs`; `BLOCH-POS-NODE-INTEGRATION.md`, `BLOCH-POS-GAPS.md` |
+| Do not claim a production libp2p/gossipsub network layer. A libp2p module exists in-tree; it is **not** what the fleet runs | `crates/bloch-pos-node/src/main.rs` (`Transport::Devnet` is the default and the live setting) |
 
 ### 2.7 Docs (`/docs` — see §4)
 
@@ -145,13 +176,21 @@ Work items:
    explorer is a *protocol* property; Postern branding moves to a footer
    credit ("built by Postern Labs"), matching the entity structure.
 2. **Keep every existing page** (Dashboard, Blocks, Block/Tx/Address detail,
-   Charts, DAG, DAG live, Mining, Leaderboard, Wallet) — they are the live
-   product; only the skin changes now.
-3. **Halt awareness.** A banner component driven by height: below 50,000
-   nothing; at/after 50,000 it switches to archive mode — "chain halted at
-   height 50,000; the canonical record is the signed snapshot" (banner copy
-   per `BLOCH-ECOSYSTEM-MIGRATION.md` timeline table, height corrected).
-   Mining/DAG-live pages get a frozen-state treatment rather than an error.
+   Charts, DAG, DAG live, Mining, Leaderboard, Wallet) — but **they are no
+   longer "the live product."** They render Genesis-3, which stopped at height
+   39,918. The **DAG** and **Mining** pages in particular describe GhostDAG and
+   proof of work, neither of which exists on the live chain; they ship as
+   **archive views of a finished chain**, explicitly labelled, never as the
+   protocol's current state. The live product is the Genesis-4 view: slots,
+   epochs, the committee, and finality — which the explorer does not have yet
+   and must not fake with Genesis-3 pages.
+3. **Halt awareness — the halt already happened; this is not a trigger.** The
+   banner is not height-driven any more: Genesis-3 is permanently at 39,918, so
+   archive mode is the *only* mode for the Genesis-3 pages. Banner copy: "Chain
+   halted permanently at height 39,918 on 2026-08-13; the canonical record is
+   the signed snapshot. The live chain is Genesis-4, proof of stake." Mining and
+   DAG-live get a frozen-state treatment rather than an error. Any code that
+   compares live height against 50,000 must be deleted, not re-pointed.
 4. **Nav bridge.** The explorer header gains the site tabs (Protocol,
    Migration, …) so blochl1.com feels like one property, with Explorer as the
    active tab.
@@ -175,8 +214,8 @@ Placeholder copy (the honest version, on-brand):
 
 | # | Candidate | Repo source | Why this order |
 |---|---|---|---|
-| 1 | Migration & snapshot guide | `docs/SNAPSHOT-BOOTSTRAP.md` + `BLOCH-ECOSYSTEM-MIGRATION.md` (heights must be corrected to 50,000 first) | Time-critical: users need it before the halt |
-| 2 | Tokenomics V4 | `docs/specs/BLOCH-TOKENOMICS-V4.md` + `tokenomics_v4.rs` | Blocks the Supply page's "under review" flag being lifted |
+| 1 | Migration & snapshot guide | `docs/SNAPSHOT-BOOTSTRAP.md` + `BLOCH-ECOSYSTEM-MIGRATION.md` (heights must be corrected to **39,918** first, and the halt written in the past tense) | Time-critical: the halt has happened and users are already past it |
+| 2 | Tokenomics V4 | `docs/specs/BLOCH-TOKENOMICS-V4.md` + `tokenomics_v4.rs` | Carries the 100 B hard cap and the concentration figures; the "under review" flag is retired |
 | 3 | PoS design overview | `docs/specs/BLOCH-POS-SHA3-LATTICE-MIGRATION.md` | The "what comes next" reference |
 | 4 | Threat models | `docs/specs/BLOCH-POS-THREAT-MODEL.md`, `-2.md` | Audit-facing; pairs with the CertiK dossier |
 | 5 | Entity structure / governance | `docs/specs/BLOCH-ENTITY-STRUCTURE.md`, `ADR-036` | Replaces the retracted "ownerless" story publicly |
@@ -230,10 +269,10 @@ founder-allocated genesis cohort):
 
 - `index.html:596,615,643,647` ("perpetual tail of 60 BLCH/block", "supply grows forever, disinflationary, never hard-capped")
 - `index.html:693` ("We will keep saying this until it stops needing to be said: **Bloch is not hard-capped** … Anyone who tells you BLCH has a 'fixed supply' is wrong, including us if we ever slip.") — under V4 the fixed supply becomes a consensus invariant; this paragraph flips from safeguard to falsehood
-- `index.html:790,795–799` ("100 billion nominal, and not hard-capped", "A nominal, not a ceiling", "Hard cap: None", 100-year emission table) — the whole V3 forward schedule (halvings every 1.5 years, tail from ~9 years out) describes a future the chain will not have: it halts at 50,000
+- `index.html:790,795–799` ("100 billion nominal, and not hard-capped", "A nominal, not a ceiling", "Hard cap: None", 100-year emission table) — doubly false now. The whole V3 forward schedule (halvings every 1.5 years, tail from ~9 years out) describes a future the chain never had: it stopped at 39,918. And the 100 billion figure survives with the **opposite** meaning — under Genesis-4 it is a **hard cap**, not a nominal. "Hard cap: None" must become "Hard cap: 100,000,000,000 BLOCH"
 - `index.html:795` "3.57 B founder allocation" — the V2 locked premine; under V4 it is never emitted (replaced by the 10% grant + carryover-as-is)
-- `run-a-node.html:7,192–194` (mandatory V3 upgrade framing "before block height 40,000" with the long-run V3 schedule) — the V3 fork at 40,000 does activate, but only ~10,000 blocks run under it; presenting V3 as the chain's future is false. The guide nowhere mentions that mining revenue ends at 50,000 — the single most material fact for its audience
-- `SECURITY.md:18–29` (Genesis-3 described as *the* live network with no end; true only until the halt)
+- `run-a-node.html:7,192–194` (mandatory V3 upgrade framing "before block height 40,000" with the long-run V3 schedule) — **the V3 fork at 40,000 never activated: the chain stopped at 39,918, eighty-two blocks short.** Presenting V3 as the chain's future is false, and the guide as a whole now instructs readers to mine a chain that does not exist. It must be archived with a halt banner, not corrected in place
+- `SECURITY.md:18–29` (Genesis-3 described as *the* live network with no end) — **now simply false**: Genesis-3 is not the live network and has no successor described anywhere on the page. The live network is Genesis-4, proof of stake
 
 ### D. Other statements that no longer hold
 
@@ -242,13 +281,22 @@ founder-allocated genesis cohort):
   Protocol" (approved preview).
 - `index.html:475` "Relaunched from height zero on 29 July 2026, carrying
   every prior balance" — still true, but presented as the current chapter with
-  no successor; every present-tense "the chain" claim expires at 50,000.
+  no successor; every present-tense "the chain" claim has already expired — that
+  chapter closed at height 39,918 on 2026-08-13.
 - `index.html:936,941,967,972` operational guidance (flag-day 27,600 datadir
-  rules, sync-from-zero workaround, "mandatory build" release names) — will be
-  superseded by the halt release, which becomes the only mandatory build.
-- **Concentration silence**: neither site states that ~94% of carried-over
-  supply sits with one holder. Not a false sentence — a false impression; the
-  new Supply page fixes it and the old site should not outlive that fix.
+  rules, sync-from-zero workaround, "mandatory build" release names) — dead
+  guidance for a stopped chain; archive rather than update.
+- **Concentration silence**: neither site states that **93.94%** of carried-over
+  supply sits at one address, that the founder holds **27.04%** of the cap and
+  the Foundation a further **29.00%**, or that all 64 validators are run by one
+  entity. Not a false sentence — a false impression, and the most material one
+  on either property. The new Supply page fixes it and the old site should not
+  outlive that fix.
+- **Stale security caveats**: any "51%-attackable", "low hashrate" or
+  "zero-security testnet" line is now describing a chain that has stopped. Do
+  not simply delete it — substitute the concentration disclosure from §0 in the
+  same position and voice. A page that loses its risk paragraph reads as a page
+  with no risk.
 - Note: memory records a "no listing effort" claim needing rewrite; I did not
   find that string in the current `index.html` — it may already have been
   removed, or live in a PDF I did not extract. Flagged as unverified rather
@@ -256,16 +304,22 @@ founder-allocated genesis cohort):
 
 ### E. Stale numbers in the *approved preview* (must be fixed before any publish)
 
-- Supply section: "100 billion, fixed", the ×4.7619 redenomination paragraph,
-  and every row of the allocation table (43,029,120,000 / 17,970,880,000 /
-  10 B / 5 B / 4 B) — **blocked**; regenerate from `tokenomics_v4.rs` at 21 B
-  with the "under review" badge.
-- Build card "25,000 BLCH bond" → 25,000 BLCH (`staking.rs:119`), same
-  "Ethereum fraction" framing, tied to the same under-review flag.
-- Brand type-spec data line contains "43,029,120,000 · height 50,000" — the
-  height stays, the number gets replaced with a 21-B-denominated one.
-- Status strip height "37,731 measured today" — must be live or dated, never
-  baked in.
+- Supply section: **"100 billion, fixed" is now CORRECT and unblocked** — the
+  cap is final at 100,000,000,000 BLOCH. Delete the ×4.7619 redenomination
+  paragraph (it explains a conversion that no longer needs explaining) and drop
+  the "under review" badge entirely. Two allocation rows are stale and must be
+  regenerated from `tokenomics_v4.rs`: **43,029,120,000 → 42,853,600,000**
+  (validator emission) and **17,970,880,000 → 18,146,400,000** (carryover, now
+  measured at height 39,918 over 452,726 outputs), with bar widths recomputed.
+  The 10 B / 5 B / 4 B rows are correct.
+- Build card "25,000 BLCH bond" is **correct** (`staking.rs:97`), same
+  "Ethereum fraction" framing, and ships **without** an under-review flag.
+- Brand type-spec data line contains "43,029,120,000 · height 50,000" — **both**
+  are wrong: the number becomes 42,853,600,000 and the height becomes 39,918.
+- Status strip "37,731 measured today" — stale and mislabelled. Genesis-3's
+  height is now a frozen final value (39,918) and must be labelled **final**,
+  never "measured today". Genesis-4 figures come from the live read RPC
+  (`https://posternlabs.com/g4rpc`) or are labelled as protocol constants.
 
 ---
 
@@ -287,9 +341,12 @@ both domains.
   deploys that must agree on brand tokens will drift.
 - **Sequencing**: (1) rebrand + halt banner in the explorer; (2) site pages
   land with Docs as placeholder; (3) docs go live one-by-one as the founder
-  clears the §4 queue. Steps 1–2 should be live **before height 50,000** so
-  the halt is announced by the protocol's own site while the chain still
-  produces blocks (~days away — this is the schedule driver).
+  clears the §4 queue. **The old schedule driver is gone** — it was "ship
+  before the chain reaches the terminal height." The chain reached it on
+  2026-08-13. The driver now is that the live site still narrates a
+  proof-of-work chain that has stopped, which is the worst state to sit in:
+  every hour the correction is not published, the site is wrong about what the
+  protocol *is*.
 
 ### posternlabs.com — the company site (corrected, not replaced)
 
@@ -322,16 +379,24 @@ protocol's site is blochl1.com"; blochl1.com footer → "built by Postern Labs"
 - **Did not edit `~/dev/posternlabs-deploy`** — §5 is a list, as instructed.
 - **Did not build the site pages or rebrand the explorer** — this is the
   plan for that work, not the work.
-- **Did not write the 100 B supply anywhere** — 21 B "under review"
-  throughout, per the block on the redenomination arithmetic.
+- ~~**Did not write the 100 B supply anywhere** — 21 B "under review"
+  throughout, per the block on the redenomination arithmetic.~~
+  **Reversed 2026-08-14.** The block is lifted: the cap is final at
+  **100,000,000,000 BLOCH**, hard-capped, and this plan now states it in §0,
+  §1 and §2.3. The 21 B denomination is retired — never regenerate toward it.
 - Did not extract the PDFs (`Postern-Technical-Whitepaper.pdf`,
   `Postern-Two-Layers.pdf`, institutional decks) — their false claims are
   inferred from titles and the .md sources that generated them; a correction
   wave should grep the PDFs' text layers before withdrawing them.
 - Did not verify the "no listing effort" claim (§5.D, last item).
-- Did not correct the stale 50,000 heights inside
+- Did not correct the stale terminal heights inside
   `BLOCH-ECOSYSTEM-MIGRATION.md` / `BLOCH-TOKENOMICS-V4.md` — flagged here
-  for the doc-sweep owner (`tools/doc-sweep/check_stale.py` should pin
-  50,000).
+  for the doc-sweep owner. **`tools/doc-sweep/check_stale.py` must pin 39,918**
+  — the height the chain actually stopped at, sourced from
+  `tokenomics_v4.rs:222` (`CARRYOVER_MEASURED_HEIGHT`). An earlier revision of
+  this line told the sweeper to pin 50,000; that would have automated a number
+  the chain never reached. The sweeper should flag **both** 80,000 and 50,000 as
+  stale, and should also flag "not hard-capped", "perpetual tail" and
+  "21 billion" as false-for-Genesis-4.
 - Did not decide the EVM-at-L1 authorization question or anything else
   reserved to the founder; the Docs queue order in §4 is a proposal.

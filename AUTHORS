@@ -22,8 +22,12 @@ turn the commit references cited throughout `docs/` into dangling pointers. The
 names in the objects are the record of what happened; `.mailmap` is how that
 record is read.
 
-The Bloch-SIS-PoW *protocol* (its consensus rules and specification) is an open,
-ownerless commons — anyone is free to implement it. *This implementation* — all
+The Bloch *protocol* (its consensus rules and specification) is open — anyone is
+free to implement it. It is not ownerless: the "ownerless commons" framing this
+paragraph used to carry was retracted in writing
+(docs/adr/ADR-036-retract-ownerless-adopt-foundation.md) in favour of a
+two-entity foundation structure, and the sole copyright holder named above is
+unchanged. *This implementation* — all
 source code in this repository — is the author's copyrighted work, licensed to
 the public under the GNU Affero General Public License, version 3 or later
 (AGPL-3.0-or-later); see the LICENSE file. A separate commercial license without

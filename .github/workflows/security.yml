@@ -5,10 +5,20 @@
 # below is scoped to Genesis-3 code it says so; those exist for the audit trail
 # of Genesis-4's opening ledger, not because anything mines.
 #
-# GitHub mirror of the security stage in .gitlab-ci.yml. GitLab CI runs on a
+# GitHub mirror of the scanner jobs in .gitlab-ci.yml. GitLab CI runs on a
 # self-hosted aarch64 Linux runner; this runs on GitHub-hosted ubuntu-latest,
 # which already ships clang + cmake for the C-toolchain deps (rocksdb bindgen,
 # blst, pqcrypto/PQClean).
+#
+# "MIRROR" IS PARTIAL — do not read a green run here as a green GitLab run.
+# Four BLOCKING GitLab jobs have no counterpart in this file:
+#   * consensus-tests      (bloch-pos-committee + bloch-pos-node — the LIVE
+#                           Genesis-4 consensus; nothing in this file tests it)
+#   * pos-release-integrity (locked/deterministic/commit-stamped bloch-pos)
+#   * falcon-clean-guard    (Falcon signing pinned to the constant-time variant)
+#   * trademark-gate        (scripts/ci-banned-words.sh)
+# Everything this file does run is scanner-shaped, and — as marked per job —
+# most of it is scoped to retired Genesis-3 code.
 #
 # Gating philosophy (identical to GitLab):
 #   BLOCKING     — cargo-audit, cargo-deny, clippy-hardened. A known
@@ -136,8 +146,12 @@ jobs:
   # unit tests. Scoped to FFI-free crates (the node's C FFI — PQClean, rocksdb,
   # blst — cannot run under Miri). Non-blocking (needs nightly + rust-src).
   #
-  # GENESIS-3 SCOPE, stated rather than hidden: this runs the V2 emission tests
-  # of a chain that stopped. bloch-pos-committee is the better Miri target —
+  # SCOPE, stated rather than hidden: `bloch-crypto` IS shared with Genesis-4
+  # (the hybrid ML-DSA-65 ‖ Falcon-1024 signature path), but the `tokenomics`
+  # filter selects only `core/tokenomics_v2.rs` — the V2 emission of a chain
+  # that stopped. Genesis-4's emission is `tokenomics_v4` in
+  # bloch-pos-committee, which this job does not run.
+  # bloch-pos-committee is the better Miri target —
   # pure Rust, no FFI, and it is the live consensus — but its suite walks
   # 8,192-step SHAKE-256 reveal chains and 256-deep sparse Merkle trees, which
   # under the Miri interpreter is hours, not minutes. Putting it here without
@@ -161,11 +175,20 @@ jobs:
   # shallow input. NOT a coverage-exhausting campaign (that runs continuously in
   # OSS-Fuzz — see fuzz/oss-fuzz/). Non-blocking.
   #
-  # GENESIS-3 SCOPE. Every target below (block_parse, tx_parse, sha256d_pow,
-  # ghostdag_order, sig_verify) is a Genesis-3 surface. The Genesis-4 parser and
-  # P2P surfaces in bloch-pos-node have NO fuzz targets. That is a real gap in
-  # coverage of the live chain, and writing the harness is the work that closes
-  # it — not relabelling these.
+  # GENESIS-3 SCOPE. `fuzz/Cargo.toml` depends only on `bloch`, `bloch-sis-pow`
+  # and `coherence-core`; there is no `bloch-pos-*` dependency and no target for
+  # the Genesis-4 parser or P2P surfaces in bloch-pos-node. That is a real gap
+  # in coverage of the live chain, and writing the harness is the work that
+  # closes it — not relabelling these.
+  #
+  # AND IT DOES NOT CURRENTLY RUN AT ALL. `fuzz/Cargo.toml:21` is
+  # `bloch = { path = ".." }`, but the repo root became a VIRTUAL manifest when
+  # the PoW node moved to legacy/genesis3-node, so cargo cannot resolve the
+  # harness: "found a virtual manifest ... instead of a package manifest"
+  # (reproduce with `cd fuzz && cargo metadata`). This job is
+  # continue-on-error, so the failure has been silent. Fixing it is a one-line
+  # path change plus a real run — not a comment — and is left unfixed here
+  # rather than claimed.
   fuzz-smoke:
     name: cargo-fuzz smoke (report-only)
     runs-on: ubuntu-latest

@@ -1,5 +1,20 @@
 # @bloch/sdk — TypeScript client for Bloch
 
+> ## ⛔ Historical — Genesis-3. Read this before the status block below.
+>
+> **This client targets the Genesis-3 proof-of-work JSON-RPC surface, and that
+> chain stopped permanently at height 39,918 on 2026-08-13.** The live chain is
+> **Genesis-4, proof of stake** (30 s slots, 32-slot epochs, finality by epoch);
+> its public read RPC is `https://posternlabs.com/g4rpc`. Genesis-4 exposes a
+> different and much smaller method set (`getblockbyslot`, `getvalidator`,
+> `getvalidatorcount`, `getchaininfo`, `listunspent`, …), so most calls this SDK
+> makes — `getdaginfo`, `gethashrate`, `getblockbyheight`, `getblocktemplate`,
+> `getdifficultyhistory` — have no counterpart on it. Do not point this client
+> at the live chain and expect it to work.
+>
+> Kept because Genesis-4's opening ledger is derived from Genesis-3. It is not
+> what runs.
+
 A permissively-licensed (**MIT OR Apache-2.0**) community TypeScript client for
 the **Bloch** (Bloch-SIS-PoW) JSON-RPC surface: a typed JSON-RPC 2.0 client, the
 core read-method wrappers, address/unit helpers, and a coin-selection +
@@ -9,19 +24,29 @@ transaction-builder **scaffold** for Bloch's UTXO / P2PKH model.
 >
 > - **SCAFFOLD, pre-production, UNAUDITED.** This SDK is a community tool, not a
 >   finished product. APIs may change; do not depend on it for anything of value.
-> - **Bloch is ownerless and neutral.** This SDK is **community tooling with no
->   privileged access** to the protocol. It talks to the same public RPC any
->   third party uses. Postern Labs is one builder among many and holds no
->   protocol privilege.
-> - **The base is unaudited mainnet-beta and experimental.** The relaxed PoW
->   regime (**k=4**) means work is **trivially forgeable**; the network is
->   nascent, low-hashrate, and **51%-attackable**. Building here today is
->   experimental by definition. No security is claimed.
+> - **This SDK has no privileged access** to the protocol. It talks to the same
+>   public RPC any third party uses. ("Ownerless" was retracted — see
+>   `docs/adr/ADR-036-retract-ownerless-adopt-foundation.md`.)
+> - **The security question is concentration, not hashrate.** The old caveat
+>   here — relaxed PoW at k=4, work trivially forgeable, the network nascent,
+>   low-hashrate and 51%-attackable — described Genesis-3 and was true of it.
+>   Under Genesis-4 the risk is different and larger: **all 64 validators are
+>   run by one entity**, **93.94% of the carryover sits at a single address**,
+>   and **56.05 B of the 57.15 B BLOCH issued at genesis is held by the founder
+>   and the Foundation**. One operator can halt the chain and one holder can
+>   outvote every other. A third party cannot yet join: the transport is a
+>   point-to-point TCP full mesh with a fixed peer list, no discovery and no
+>   authentication, and `Deposit`/`Delegate` are refused at every node's
+>   mempool. No security is claimed.
 > - **BLCH is the native gas** (a neutral protocol utility for paying fees on
->   Bloch) — it is **NOT a value or investment claim**. On the current
->   zero-security regime it is **worth nothing by design**; a **17% founder
->   premine** (10-year cliff, 40-year vesting) is disclosed. Nobody promises it
->   will ever have value. **BLCH is not a security.**
+>   Bloch) — it is **NOT a value or investment claim**. Nobody promises it will
+>   ever have value. **BLCH is not a security.** The "17% founder premine
+>   (10-year cliff, 40-year vesting)" disclosed here is Genesis-3 tokenomics V2
+>   and no longer describes the supply: under Genesis-4 the founder holds
+>   **27.04% of the 100 B cap** (`FOUNDER_TOTAL_BLOCH`, pinned at 2704 bps in
+>   `crates/bloch-pos-committee/src/tokenomics_v4.rs`) and the Foundation a
+>   further **29.00%**, leaving **1,099,570,620 BLOCH (1.92% of genesis supply)**
+>   in third-party hands.
 > - **Plans, not promises.** Anything labelled *planned* below does not exist yet.
 
 ---

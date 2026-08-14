@@ -1,5 +1,19 @@
 # bloch-anchoring
 
+> ## ⛔ Historical — Genesis-3. Read this before the rails below.
+>
+> **This crate anchors to the Genesis-3 proof-of-work chain, which stopped
+> permanently at height 39,918 on 2026-08-13.** Its whole model — submit a
+> commitment, count PoW confirmations, treat depth as a finality signal — has no
+> counterpart on the live chain. **Genesis-4, proof of stake**, has been live
+> since 2026-08-13: 30 s slots, 32-slot epochs, and **Casper-style
+> justification/finalisation by epoch** (`Finality` in
+> `crates/bloch-pos-node/src/rpc.rs`), which is an explicit finality signal
+> rather than a depth heuristic. Nothing here has been ported to it.
+>
+> Kept because Genesis-4's opening ledger is derived from Genesis-3. It is not
+> what runs.
+
 **A reference L2 / anchoring & commitment framework for Bloch.**
 Submit a compact commitment, wait for PoW confirmations, retrieve and prove it
 by height or txid. Fork it to build an L2, a finality gadget (FFG), a notary, or
@@ -15,14 +29,20 @@ an RWA anchoring system.
 
 - **SCAFFOLD / reference implementation. Unaudited. Pre-production.** Do not ship
   this to mainnet value without your own review and hardening.
-- **Bloch is ownerless, neutral, and agnostic.** Anyone can build L2s, finality
-  gadgets, and RWA systems on it. **No category is reserved to anyone**, and
-  **Postern Labs holds no protocol privilege** — it is one builder among many.
-- **The base is experimental.** Mainnet-beta currently runs a **relaxed k=4 PoW
-  regime → work is trivially forgeable**, and the **low-hashrate network is
-  51%-attackable**. Confirmations are a *depth signal*, not a security
-  guarantee, until the protocol track closes k=8 + audit + a proven multi-node
-  network.
+- **No category is reserved to anyone** and **Postern Labs holds no protocol
+  privilege** in what you build. ("Ownerless" was retracted — see
+  `docs/adr/ADR-036-retract-ownerless-adopt-foundation.md`.)
+- **The base is experimental, and the risk has changed shape.** The old rail
+  here — relaxed k=4 PoW, work trivially forgeable, the low-hashrate network
+  51%-attackable, confirmations only a depth signal — described Genesis-3 and
+  was true of it. Under Genesis-4 the security question is not hashrate, it is
+  concentration: **all 64 validators are run by one entity**, **93.94% of the
+  carryover sits at a single address**, and **56.05 B of the 57.15 B BLOCH
+  issued at genesis is held by the founder and the Foundation**. One operator
+  can halt the chain and one holder can outvote every other. A third party
+  cannot yet join — the transport is a point-to-point TCP full mesh with a
+  fixed peer list, no discovery and no authentication, and `Deposit`/`Delegate`
+  are refused at every node's mempool.
 - **BLCH is neutral gas — not a security, with no value claim from anyone.** It
   pays fees; that is its only role here.
 - **RWA builders own their own legal and regulatory responsibility** (securities,

@@ -2,9 +2,35 @@
 
 # Bloch — Genesis-4 key and address requirements
 
+> **Genesis-4 is live.** Bloch has been running under **proof of stake** since
+> 21:31:19 UTC on 2026-08-13, when Genesis-3 (proof of work) stopped
+> permanently at height **39,918**. 30 s slots, 32-slot epochs, Casper-style
+> justification/finalisation by epoch, hybrid ML-DSA-65 ‖ Falcon-1024
+> signatures on every consensus path. Nothing in this document that describes
+> mining, hashrate, difficulty, retargeting or proof-of-work depth describes
+> the current network.
+>
+> **The live security question is concentration, not hashrate.** All 64
+> validators are operated by a single entity; 93.94% of the carryover
+> (17,046,829,380 of 18,146,400,000 BLOCH) sits at one address and carried
+> balances are stakeable, so if that balance stakes the Nakamoto coefficient
+> is 1; and 56,046,829,380 of the 57,146,400,000 BLOCH issued at slot 0 is
+> held by the founder and the Foundation, leaving 1.92% of genesis supply in
+> third-party hands. One operator can halt the chain and one holder can outvote
+> every other. The live transport is a point-to-point TCP full mesh with a
+> fixed peer list, **no discovery and no authentication**, and
+> `Deposit`/`Delegate` are refused at every node's mempool — which is why a
+> third party cannot yet join the network or become a validator.
+
 ```
 Document:   BLOCH-GENESIS-KEYS
-Status:     DRAFT — requirements and custody plan; NO production key exists yet
+Status:     PARTIALLY EXECUTED — Genesis-4 launched 2026-08-13 with a live
+            64-validator cohort, so production keys **do** exist and are in
+            use. This document is the requirements and custody plan they were
+            produced under; it is not a record of the ceremony that produced
+            them. Rule zero (no production key generated in an observable
+            context) remains in force: `keys.rs::keygen` produces throwaway
+            keys only.
 Created:    2026-08-11
 Relates to: BLOCH-TOKENOMICS-V4.md (§1, §3.3, §3.3.1, §7),
             BLOCH-POS-SHA3-LATTICE-MIGRATION.md (§6.2 hybrid suite, §6.3 RANDAO),
@@ -38,7 +64,7 @@ backwards from its inputs, this is everything that must exist:
 | 2 | Genesis-cohort validator keys | 64 (floor; the launch plan is exactly 64) | raw 3,745-byte hybrid public key per validator (no suite envelope) | 64 hybrid keypairs, warm/hot |
 | 3 | RANDAO commitments | 64 (one per validator) | 32-byte chain head `c_0` | 64 secret 32-byte seeds, hot beside each validator |
 | 4 | Withdrawal addresses for the cohort | 1–64 (see §3.4) | 32-byte address (`staking::Address`) per validator | 1–64 hybrid keypairs, cold |
-| 5 | Carryover holder addresses | 448,337 UTXOs / 15 addresses | already fixed by the signed artifact | the holders' **existing Genesis-3 keys** — nothing new is generated |
+| 5 | Carryover holder addresses | **452,726 UTXOs / 16 addresses** (terminal snapshot at h39,918; `CARRYOVER_MEASURED_UTXOS`) | already fixed by the signed artifact | the holders' **existing Genesis-3 keys** — nothing new is generated |
 
 So the ceremony requires, at minimum, **70 new hybrid keypairs** (5 bucket +
 64 validator + 1 shared withdrawal) and **64 RANDAO seeds**; at maximum 133

@@ -8,6 +8,18 @@
 //! a reference for coordination/testing on a network whose coin is
 //! worth nothing by design, solo mining is the default, and any pool
 //! nearing majority hashrate is a 51%-attack vector.
+//!
+//! HISTORICAL — GENESIS-3. The banner text this module renders describes the
+//! proof-of-work chain, which stopped permanently at height 39,918 on
+//! 2026-08-13. The live chain is Genesis-4, proof of stake — no mining, no
+//! hashrate, no pools — so the rendered "young / 51%-attackable" copy and the
+//! share-of-network estimate are a record of Genesis-3, not a statement about
+//! the live network. They are left as they were rather than rewritten, because
+//! this daemon serves a chain that no longer exists and faking a proof-of-stake
+//! dashboard would be worse than the gap. Under Genesis-4 the security question
+//! is concentration: all 64 validators are run by one entity, 93.94% of the
+//! carryover sits at a single address, and 56.05 B of the 57.15 B BLOCH issued
+//! at genesis is held by the founder and the Foundation.
 
 use std::sync::Arc;
 

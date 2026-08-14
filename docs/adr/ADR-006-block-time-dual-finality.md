@@ -1,7 +1,9 @@
 # ADR-006: Block Time and Dual Finality Exposure (Soft/Hard)
 
 **Sprint:** 2.2 (calibration) / 2.3 (RPC)
-**Status:** Proposed (revision 1 — 2 adjustments applied, ready for commit pre-2026-05-15)
+**Status:** **SUPERSEDED** — The soft/hard dual-finality exposure here is built on **PoW depth** as the soft signal and an FFG committee as the hard one. Genesis-4 has neither: there is no proof-of-work depth, and finality is Casper-style justification/finalisation **by epoch** over the whole active set, exposed as `pending | justified | finalized` (`rpc.rs` `Finality`). The 30 s block target survived as the 30 s **slot** (`SLOT_DURATION_SECS`), which is the only part of this ADR still visible in the live protocol. **Any integrator reading this ADR for confirmation rules must not use depth-based confirmation on Genesis-4** — depth is not a security measure on a PoS chain. The chain this ADR governs — Genesis-3, proof of work — stopped permanently at height **39,918** on 2026-08-13. The live chain is **Genesis-4, proof of stake** (30 s slots, 32-slot epochs, finality by epoch, hybrid ML-DSA-65 ‖ Falcon-1024, no mining). The decision, context and consequences below are **not** rewritten: this is a decision log and what was decided, when, is the record. Read it as history, not as guidance.
+
+*Original status line, retained:* **Status:** Proposed (revision 1 — 2 adjustments applied, ready for commit pre-2026-05-15)
 **Date:** 2026-04-29 (rev1 same day)
 **Author:** BLOCH Core
 **Related:** ADR-001 (FFG epoch=6), ADR-005 (committee era)

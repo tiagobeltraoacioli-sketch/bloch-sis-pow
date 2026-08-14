@@ -1,6 +1,8 @@
 # ADR-021 — Transport Layer Continuity Under BLOCH Rebrand
 
-- **Status:** Proposed
+**Status:** **SUPERSEDED** — This records a **Genesis-3** libp2p transport with a Kyber768 / ML-KEM-768 hybrid handshake. **It does not describe the live Genesis-4 network and must not be cited as evidence that one exists.** What the Genesis-4 fleet actually runs is `--transport devnet`: a point-to-point TCP full mesh with a **fixed peer list, no discovery and no authentication**, which is why a third party cannot yet join the network. A libp2p layer exists in `crates/bloch-pos-node/src/p2p.rs` behind `--transport libp2p`, it is not in service, and its handshake is **Noise, not post-quantum** (`crates/bloch-pos-node/src/main.rs:25`). Consensus signatures are hybrid PQ regardless of transport. The chain this ADR governs — Genesis-3, proof of work — stopped permanently at height **39,918** on 2026-08-13. The live chain is **Genesis-4, proof of stake** (30 s slots, 32-slot epochs, finality by epoch, hybrid ML-DSA-65 ‖ Falcon-1024, no mining). The decision, context and consequences below are **not** rewritten: this is a decision log and what was decided, when, is the record. Read it as history, not as guidance.
+
+*Original status line, retained:* - **Status:** Proposed
 - **Date:** 2026-04-30
 - **Author:** BLOCH Founder
 - **Sprint:** 2.1.C-rev1 (post Phase β Day 0)

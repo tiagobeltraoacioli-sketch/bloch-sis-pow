@@ -1,18 +1,22 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! The production network layer: libp2p + gossipsub, with the Genesis-3
-//! incident record carried over rather than re-learned.
+//! The libp2p network layer: libp2p + gossipsub, with the Genesis-3 incident
+//! record carried over rather than re-learned.
 //!
-//! `net.rs` is the devnet transport — a TCP full mesh with no relay logic, no
-//! scoring and no admission control. It proved the consensus (a 64-validator,
-//! 5-host devnet finalized on it), and it stays available behind
-//! `--transport devnet`. This module is what a public network needs instead.
+//! **Status, stated plainly: this is NOT what the live fleet runs.**
+//! `--transport devnet` is still the default and is what the 64-validator
+//! Genesis-4 cohort finalizes on today — `net.rs`, a fixed-peer TCP full mesh
+//! with no discovery, no relay logic, no scoring and no admission control.
+//! This module is what a network a third party could join needs instead, and
+//! it is available behind `--transport libp2p`; do not read it as evidence
+//! that Genesis-4 is open to outside peers, because it is not.
 //!
 //! ## What was ported, and from where
 //!
 //! Everything below that reads like an over-explained constant is a scar. The
 //! source is the Genesis-3 node's `src/network/mod.rs` + `src/network/sync_rr.rs`,
-//! which run on mainnet:
+//! which ran on the Genesis-3 mainnet until it stopped at height 39,918 on
+//! 2026-08-13 — these constants were paid for on a live chain:
 //!
 //! - **No `add_explicit_peer()`, ever** (2026-08-07 mesh defect (a)). An
 //!   "explicit peer" in gossipsub is DELIBERATELY EXCLUDED from mesh
@@ -674,8 +678,8 @@ pub struct Config {
 ///
 /// **This is a transport identity, not a validator key and not a spending
 /// key.** It authenticates a socket; it signs no block, no attestation and no
-/// value. Validator keys are produced by `keygen` for devnet and by the
-/// air-gapped ceremony of BLOCH-GENESIS-KEYS.md for anything real — never
+/// value. Validator keys are produced by `keygen` for throwaway/test use and
+/// by the air-gapped ceremony of BLOCH-GENESIS-KEYS.md for anything real — never
 /// here, never as a side effect of starting a node.
 fn load_or_create_identity(path: &std::path::Path) -> io::Result<identity::Keypair> {
     match std::fs::read(path) {

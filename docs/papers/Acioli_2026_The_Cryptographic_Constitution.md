@@ -1,5 +1,38 @@
 # The Cryptographic Constitution: Pre-Commitment, Repeated Games, and the Architecture of Civil Cooperation Without a Sovereign
 
+> **Editorial note — scope of this paper within this repository.** This is an
+> academic working paper on constitutional theory, first posted **April 2026**.
+> It argues a general normative thesis: that mutable in-protocol governance —
+> "whether by foundation, multisig, or stake-weighted vote" — is incompatible
+> with the constitutional ambitions of cryptographic protocols. **It is
+> scholarship, not a description of the Bloch network, and it must not be read
+> as a statement of the project's current governance.**
+>
+> Two developments postdate it and cut against its application to Bloch, and
+> are recorded here rather than left for a reader to discover. **(1)** The
+> ownerless thesis was **retracted in writing on 2026-08-10**
+> (`docs/adr/ADR-036-retract-ownerless-adopt-foundation.md`), which revokes
+> ADR-033 and ADR-034: Bloch has an identified issuer and a sponsoring
+> organisation, a Bloch Foundation is to be created holding 29.00% of supply,
+> and Postern Labs Ltda builds the software. **(2)** Bloch moved from proof of
+> work to **proof of stake** on 2026-08-13 — Genesis-3 stopped permanently at
+> height 39,918 and Genesis-4 has been live since 21:31:19 UTC that day.
+>
+> The paper's argument is unchanged by either fact; the project's position is.
+> Where this paper and the decision record disagree about what Bloch is, the
+> decision record governs.
+>
+> One thing the paper's own framework survives to say about the live network,
+> and it is not flattering: what binds today is not stake-weighted voting but
+> operator concentration — **all 64 Genesis-4 validators are run by a single
+> entity**, 93.94% of the carryover sits at one address, and 56.05 B of the
+> 57.15 B BLOCH issued at genesis is held by the founder and the Foundation.
+> The pre-commitments that *are* enforced by consensus — the supply cap
+> (`TransitionError::SupplyCapExceeded`), the vesting functions, the
+> genesis-cohort taper — hold because every node checks them; that is the
+> paper's mechanism, and it is real. What no consensus rule reaches is who
+> holds the coins and who runs the machines.
+
 ---
 
 **Tiago Beltrão de Azevedo Tenório Acioli** [^aff]

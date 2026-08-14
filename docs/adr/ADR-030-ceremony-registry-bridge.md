@@ -1,6 +1,8 @@
 # ADR-030 — DKG Ceremony → CommitteeRegistry Bridge
 
-**Status:** Accepted
+**Status:** **SUPERSEDED** — There is no DKG ceremony and no `CommitteeRegistry` under Genesis-4, so there is no bridge between them. The Genesis-4 validator set is published in the genesis manifest (`crates/bloch-pos-node/src/genesis.rs`). The chain this ADR governs — Genesis-3, proof of work — stopped permanently at height **39,918** on 2026-08-13. The live chain is **Genesis-4, proof of stake** (30 s slots, 32-slot epochs, finality by epoch, hybrid ML-DSA-65 ‖ Falcon-1024, no mining). The decision, context and consequences below are **not** rewritten: this is a decision log and what was decided, when, is the record. Read it as history, not as guidance.
+
+*Original status line, retained:* **Status:** Accepted
 **Date:** 2026-05-02
 **Sprint:** 2.1.C-rev2 (Phase δ)
 **Author:** BLOCH Founder

@@ -1,21 +1,36 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Justification and finality — the Casper-style gadget (§5.1, §6.5.2).
+//! Justification and finality — the Casper-style gadget (§5.1, §6.5.2). **This
+//! is the live Genesis-4 chain's finality**; it has run mainnet since
+//! 2026-08-13.
 //!
-//! One checkpoint per epoch (`EPOCHS_PER_CHECKPOINT = 1`). The **full epoch
-//! committee of 128** votes once at the epoch boundary; those votes — and only
-//! those — drive justification and finality. The per-slot subcommittee of 8
-//! exists purely to give LMD-GHOST intra-epoch fork-choice weight (§6.5.2) and
-//! must never be fed into this module: its members are not in the epoch
-//! committee for that epoch (different sortition role tag), so its votes are
-//! rejected here by the membership check rather than by caller discipline.
+//! > **The paragraph that used to sit here described the SAMPLED design, which
+//! > the node does not run.** It said "the full epoch committee of 128 votes
+//! > once at the epoch boundary" and "the per-slot subcommittee of 8 … must
+//! > never be fed into this module". Finding F1 replaced sampling with a
+//! > **partition** of the active set ([`crate::committees`]), and that is what
+//! > `bloch-pos-node` calls: `committees::committee_for_slot` per slot, fed to
+//! > this module through [`votes_from_partition`]. Under the partition there
+//! > is no separate 128-member epoch draw and no separate 8-member per-slot
+//! > draw — every active validator lands in exactly one slot committee per
+//! > epoch and its single attestation does both jobs, its slot's fork-choice
+//! > weight and its epoch's justification vote. Corrected here because a
+//! > reader lands on this module directly; see the seal at the top of
+//! > `lib.rs`, the `committees.rs` module doc, and the body of this module
+//! > (which was already written against the partition).
+//!
+//! One checkpoint per epoch (`EPOCHS_PER_CHECKPOINT = 1`). The votes that
+//! drive justification and finality — and the only ones — are the epoch's
+//! attestations from the partition, checked for membership here rather than by
+//! caller discipline.
 //!
 //! ## The rules
 //!
 //! - **Justification.** A checkpoint is justified when attestations carrying it
-//!   as `target`, from epoch-committee members, whose `source` is the currently
-//!   highest justified checkpoint, account for **≥ 2/3 of the committee's
-//!   active stake**. The comparison is `3·attesting ≥ 2·total` in `u128` — no
+//!   as `target`, from validators in the committee of the slot they attest for,
+//!   whose `source` is the currently highest justified checkpoint, account for
+//!   **≥ 2/3 of the WHOLE ACTIVE SET's stake** — not two thirds of a sample;
+//!   that reading was finding F1. The comparison is `3·attesting ≥ 2·total` in `u128` — no
 //!   division, no rounding ambiguity, so "exactly 2/3" justifies and
 //!   "2/3 − 1 satoshi" does not, identically on every node.
 //! - **Finality.** Consecutive justification: when the supermajority link
@@ -78,10 +93,13 @@ pub struct Checkpoint {
 /// signature-verified upstream (`attestation::validate`) — this module takes
 /// bare `(validator, data)` pairs precisely so it cannot be handed an
 /// unverified signature and mistake membership checking for authentication.
-/// Per-slot subcommittee attestations belong to `forkchoice::Store::observe`,
-/// never here; any that leak through are dropped by the committee-membership
-/// check because slot and epoch committees are drawn under different sortition
-/// role tags.
+/// Under the partition there is no separate "per-slot subcommittee" to keep
+/// out: one attestation serves both jobs, going to `forkchoice::Store::observe`
+/// for fork-choice weight and here for justification. What is still enforced is
+/// *slot-specific membership* — an attester must sit in the committee of the
+/// slot it attests for, which is what [`votes_from_partition`] checks, and a
+/// vote from any other slot's committee is dropped there before it reaches this
+/// struct.
 #[derive(Clone, Copy, Debug)]
 pub struct EpochVotes<'a> {
     /// The epoch these votes justify (the checkpoint's own epoch).

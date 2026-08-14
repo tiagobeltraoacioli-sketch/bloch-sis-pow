@@ -1,11 +1,61 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
-<!-- DRAFT — not published. Founder approval required before this text goes to
-     posternlabs.com. Dates and figures marked "measured" were taken from
-     https://blochl1.com/rpc on 2026-08-12; re-measure before publication. -->
+<!-- SUPERSEDED DRAFT — never published, and MUST NOT be published as written.
+     It was drafted 2026-08-12 in anticipation of a halt at height 50,000 and a
+     multi-month pause. Neither happened. See the correction block below; it is
+     the only part of this file that describes what occurred. -->
 
-# Genesis-3 ends at height 50,000. Genesis-4 will be proof-of-stake.
+# SUPERSEDED DRAFT — "Genesis-3 ends at height 50,000. Genesis-4 will be proof-of-stake."
 
-*Draft prepared 2026-08-12. All dates below are estimates and say so.*
+*Drafted 2026-08-12, never published. Genesis-3 stopped at height **39,918** on
+2026-08-13 and Genesis-4 went live the same day. The correction block below is
+the only current part of this file.*
+
+---
+
+> # ⚠ SUPERSEDED — read this first
+>
+> **This announcement was drafted on 2026-08-12 and was never published. It
+> describes a plan. The plan is not what happened, and every future-tense
+> sentence below is now wrong.** The draft is kept as a record of what was
+> written, not as a description of the network. Nothing in it may be published
+> or quoted as current.
+>
+> **What actually happened:**
+>
+> | This draft says | What occurred |
+> |---|---|
+> | Genesis-3 stops at height **50,000**, around 15 Aug 2026 | Genesis-3 stopped permanently at height **39,918** on **2026-08-13** — below the announced height |
+> | A pause of **several months / ~six months** with no chain | **No pause.** Genesis-4 opened the same day, **21:31:19 UTC, 2026-08-13** |
+> | "We will not commit to a Genesis-4 launch date until the code has been through review" | The chain launched **without external review**. **No third-party audit exists.** |
+> | "The PoS node is not released software… treat any 'Genesis-4 is live' claim as false" | **Genesis-4 is live.** Public read RPC: `https://posternlabs.com/g4rpc` |
+> | Carryover 17,970,880,000 BLCH (17.97%), measured "at height 43,172" | **18,146,400,000 BLOCH (18.15%)**, measured at the terminal height **39,918**, 452,726 outputs, 16 addresses. The old "height 43,172" was a **block count**, not a height |
+> | Validator emission 43,029,120,000 (43.03%) | **42,853,600,000 (42.85%)** |
+> | Founder holds "roughly 94%" of the crossing supply | **93.94%** — 17,046,829,380 of 18,146,400,000 BLOCH. Essentially unchanged; the correction is a re-measurement, not a distribution |
+>
+> **The disclosure this draft could not make, and which any future public text
+> must carry in its place:** the security question under Genesis-4 is not
+> hashrate, it is concentration. **All 64 validators are run by one entity**,
+> **93.94% of the carryover sits at a single address**, and **56.05 B of the
+> 57.15 B BLOCH issued at genesis is held by the founder and the Foundation**
+> — leaving 1,099,570,620 BLOCH, **1.92%**, with everyone else. One operator
+> can halt the chain and one holder can outvote every other. A third party
+> cannot currently join: the live transport has a fixed peer list with no
+> discovery and no authentication, and `Deposit`/`Delegate` are refused at
+> every node's mempool because bonding is not yet funded from the UTXO set.
+>
+> **What in this draft is still true and still worth saying:** balances crossed
+> automatically via the signed snapshot; there was no claim process, no swap
+> and no migration transaction, and **anyone who asks you to send coins or keys
+> to "migrate" is trying to steal from you**; post-halt Genesis-3 chain data is
+> cheap to fabricate and must not be trusted — the **signed snapshot artifact
+> is the canonical record**, reproducible against the root and file digests
+> pinned in `crates/bloch-pos-committee/src/tokenomics_v4.rs`; the
+> redenomination created no economic gain for anyone; and BLCH carries no
+> promise of value.
+
+---
+
+## The draft as written on 2026-08-12 (historical — not current)
 
 ## The short version
 
@@ -130,8 +180,10 @@ During the pause:
 
 ## 5. The supply number changes. Your share does not.
 
-Genesis-4 redenominates the total supply from 100,000,000,000 to
-**100,000,000,000 BLCH**. This is a **pure split**: every balance, every
+Genesis-4 redenominates the total supply from 21,000,000,000 to
+**100,000,000,000 BLCH**. *(The draft as circulated contained a copy bug here,
+reading "from 100,000,000,000 to 100,000,000,000"; the correct statement is
+21 B → 100 B at ×100/21, as this draft's own Telegram appendix has it.)* This is a **pure split**: every balance, every
 allocation, and every protocol constant denominated in BLCH is multiplied by
 the same factor, 100/21 ≈ **4.7619**.
 
@@ -162,10 +214,14 @@ supply will change over time as emission proceeds, exactly as it did under
 mining. The carried-over Genesis-3 supply is **17.97% of the eventual 100 B**.
 The full allocation, in post-split terms:
 
+*(Superseded — the two figures marked below were computed against a
+provisional carryover reading. Terminal values: carryover **18,146,400,000
+(18.15%)**, validator emission **42,853,600,000 (42.85%)**.)*
+
 | Allocation | BLCH | Share | Terms |
 |---|---:|---:|---|
-| Carryover (all Genesis-3 balances) | 17,970,880,000 | 17.97% | liquid at genesis |
-| Validator emission | 43,029,120,000 | 43.03% | issued over 40 years |
+| Carryover (all Genesis-3 balances) | ~~17,970,880,000~~ **18,146,400,000** | **18.15%** | liquid at genesis |
+| Validator emission | ~~43,029,120,000~~ **42,853,600,000** | **42.85%** | issued over 40 years |
 | Founder grant | 10,000,000,000 | 10% | 10-year cliff, then 40-year linear vest |
 | VC | 10,000,000,000 | 10% | vesting |
 | Team | 10,000,000,000 | 10% | vesting |
@@ -173,9 +229,15 @@ The full allocation, in post-split terms:
 | Marketing | 4,000,000,000 | 4% | — |
 
 **On concentration, because it should come from us and not be found:** the
-founder's carried-over balance is by far the largest — roughly 94% of the
-Genesis-3 supply crossing the snapshot — and, like every carried-over
-balance, it is liquid and stakeable in Genesis-4. The mechanisms that bound
+founder's carried-over balance is by far the largest — **93.94% of the
+Genesis-3 supply crossing the snapshot, 17,046,829,380 of 18,146,400,000
+BLOCH** — and, like every carried-over balance, it is liquid and stakeable in
+Genesis-4. Including the 10% grant the founder holds **27.04% of total
+supply**; the Foundation holds a further **29.00%**; together that is
+**56,046,829,380 of the 57,146,400,000 BLOCH issued at genesis**, leaving
+**1.92%** with everyone else. And on the live chain, **all 64 validators are
+operated by one entity**, with no permissionless way for anyone else to become
+one. The mechanisms that bound
 it over time (the founder grant's 10-year cliff and 40-year vest, the
 declining cap on the genesis validator cohort, per-validator stake limits)
 are published in the tokenomics specification, along with what each does and
@@ -235,6 +297,11 @@ people. That is the whole pitch. There is no other one.
 ---
 
 ## Appendix — Telegram short version (max 6 lines)
+
+**SUPERSEDED — do not send.** Written 2026-08-12 for a halt at 50,000 and a
+months-long pause; neither happened. Kept as the record of what was drafted.
+Any replacement must lead with the concentration disclosure in the correction
+block at the top of this file, not with a hashrate estimate.
 
 > Genesis-3 halts at height 50,000 — by design, enforced by consensus. At current hashrate that is around Aug 15, 2026 (estimate; the height is fixed, the date moves).
 > Mining ends there: hashrate on Bloch after 50,000 earns nothing.

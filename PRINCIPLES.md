@@ -1,13 +1,21 @@
 # Bloch-SIS-PoW — principles
 
-> **Genesis-3-era document — sealed 2026-08-12.** Bloch's proof-of-work
-> chain halts by consensus rule at the terminal height (50,000) and
-> Genesis-4 relaunches as proof of stake; the ownerless thesis was
-> retracted (`docs/adr/ADR-036-retract-ownerless-adopt-foundation.md`).
+> **Historical — Genesis-3.** This states the principles of the
+> proof-of-work chain that stopped permanently at height **39,918** on
+> 2026-08-13. The live chain is **Genesis-4, proof of stake** (30 s slots,
+> 32-slot epochs, finality by epoch), live since 21:31:19 UTC that day. Kept
+> because Genesis-4's opening ledger is derived from Genesis-3. It is not
+> what runs.
 >
-> The preâmbulo and principles 2, 3, 6 and the honesty discipline in 8 stand.
-> Principle 1 ("ownerless") is retracted; the proof-of-work content of
-> principles 4, 5 and 7 describes a consensus that is ending.
+> The preâmbulo, principle 6 and the honesty discipline in 8 stand.
+> Principle 1 ("ownerless") is **retracted**
+> (`docs/adr/ADR-036-retract-ownerless-adopt-foundation.md`). Principles 2 and
+> 3 — "every node is a seed", "anyone may run a node" — describe a property
+> the live network **does not have today**; each is annotated in place. The
+> proof-of-work content of principles 4, 5 and 7 describes a consensus that
+> has ended. Principle 8's "zero-security testnet" baseline is superseded:
+> Genesis-4 is a live mainnet, and the current disclosure is in
+> [`SECURITY.md`](./SECURITY.md).
 
 ## Preâmbulo
 
@@ -60,7 +68,19 @@ An open-source, **ownerless**, **post-quantum** Proof-of-Work crypto — public
 infrastructure whose value is the **private, attestable infrastructure people run
 on it**. These are the ideas, stated plainly and honestly.
 
-## 1. Ownerless — like Bitcoin
+> *Two words in that sentence no longer describe the project: **ownerless**
+> (retracted, ADR-036) and **Proof-of-Work** (Genesis-3, stopped at height
+> 39,918). **Post-quantum** stands — hybrid ML-DSA-65 ‖ Falcon-1024 is on
+> every Genesis-4 consensus path.*
+
+## 1. Ownerless — like Bitcoin *(RETRACTED)*
+
+> **This principle was retracted in writing**
+> (`docs/adr/ADR-036-retract-ownerless-adopt-foundation.md`) in favour of a
+> two-entity foundation structure. It is left standing because it is what the
+> project said, and because retracting a claim by deleting it is how a record
+> stops being one. Read the paragraph below as the abandoned position, not
+> the current one.
 
 No owner. No curator. No foundation. No official website, no official explorer.
 The protocol ships as software and a documented **RPC / API** surface — nothing
@@ -77,12 +97,31 @@ can bootstrap others. The network self-bootstraps from its participants, so it h
 **no central point to capture, censor, or switch off**. A project that depends on
 someone's servers is a company pretending to be decentralized; this one does not.
 
+> **Not true of the live network today, and stated here rather than left to
+> be discovered.** Genesis-4 runs on `--transport devnet`
+> (`crates/bloch-pos-node/src/net.rs`): a point-to-point TCP full mesh with a
+> **fixed peer list, no discovery and no authentication**. There is no PEX,
+> no self-bootstrap, and no address a stranger can dial. All 64 validators
+> are operated by a single entity on five servers, so there *is* a central
+> point that can switch the network off. This principle is the target, not a
+> description. A libp2p/gossipsub layer that would restore it exists in the
+> tree (`crates/bloch-pos-node/src/p2p.rs`) and is not what the fleet runs.
+
 ## 3. Permissionless — for nodes and for builders
 
 Anyone may run a node. Anyone may **build products on the open code** — Postern
 Labs is one builder among many, not the owner of the commons. The base is a
 neutral commons; commercial value lives at the edges, in products with owners.
 (See `docs/POSTERN-LABS.md` for the products ⟂ protocol boundary.)
+
+> **The "anyone may run a node" half is not true today.** The code is open
+> and anyone may build it, but there is no way to connect it to Genesis-4:
+> the transport has a fixed peer list and no discovery (principle 2 above),
+> and becoming a validator is closed on top of that — `Deposit` and
+> `Delegate` are refused at every node's mempool, because bonding is not yet
+> funded from the carried-over UTXO set. What is open to a third party today
+> is reading the chain (`https://posternlabs.com/g4rpc`) and submitting
+> transfers.
 
 ## 4. Post-quantum by default
 
@@ -135,6 +174,24 @@ is **not a security**: no expectation of profit derived from the efforts of a
 promoter. Whatever value a free market might one day assign is sought and promised
 by **no one**. On the zero-security testnet it is worth **nothing**, by design.
 
+> **Read the paragraph above with two corrections; it is the one paragraph in
+> this file a counterparty is most likely to act on.**
+>
+> 1. **The premise is retracted.** "Because the protocol is ownerless there is
+>    no promoter" no longer holds: the ownerless thesis was retracted
+>    (`docs/adr/ADR-036-retract-ownerless-adopt-foundation.md`) in favour of a
+>    two-entity foundation structure. The founder allocates the genesis
+>    validator cohort, all 64 validators are operated by a single entity, and
+>    the founder and the Foundation together hold 56.05 B of the 57.15 B BLOCH
+>    issued at genesis. **The no-promoter argument stated here is therefore not
+>    available as written.** The project still makes no value claim, pursues no
+>    listing and ran no token sale; what it can no longer claim is that no
+>    identifiable promoter exists. Nothing in this file is legal advice or a
+>    legal conclusion.
+> 2. **"Mining reward" and "zero-security testnet" are Genesis-3 terms.** There
+>    is no mining. Genesis-4 is a live mainnet; the token's function on it is
+>    validator emission and fees.
+
 **No token sale. No listing effort. No price. No roadmap-to-riches.** If you came
 for an asset, there isn't one here — the point is the *network* and the
 *privacy/security infrastructure*, not a ticker.
@@ -145,6 +202,16 @@ Today this is a **zero-security testnet** — unaudited, PoW parameters being
 re-derived, no live decentralized network yet. Every claim — for the protocol and
 for any product — is **audit-gated** and stated separately. No "100% private," no
 "useful mining," no pretending the foundation is the finished product.
+
+> **The discipline stands; the baseline it names does not.** As of 2026-08-13
+> this is a **live mainnet** — Genesis-4, proof of stake — not a
+> zero-security testnet, and there are no PoW parameters left to re-derive.
+> It is still **unaudited**, and it is still not a decentralised network:
+> all 64 validators are operated by one entity, 93.94% of the carryover sits
+> at one stakeable address, and no third party can join because the transport
+> has a fixed peer list and no discovery and bonding is closed at the
+> mempool. Applying principle 8 to the chain that actually runs produces
+> [`SECURITY.md`](./SECURITY.md); that is the current statement.
 
 ---
 

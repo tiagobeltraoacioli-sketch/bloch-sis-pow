@@ -1,7 +1,9 @@
 # ADR-002-rev1: DKG Protocol Family
 
 **Sprint:** 2.1.C
-**Status:** Proposed (ratified for commit pre-2026-05-15)
+**Status:** **SUPERSEDED** — Already superseded by ADR-002-rev2 in 2026-04-30, and the whole DKG/threshold-BLS line is superseded again by Genesis-4, which uses no BLS and no DKG. The chain this ADR governs — Genesis-3, proof of work — stopped permanently at height **39,918** on 2026-08-13. The live chain is **Genesis-4, proof of stake** (30 s slots, 32-slot epochs, finality by epoch, hybrid ML-DSA-65 ‖ Falcon-1024, no mining). The decision, context and consequences below are **not** rewritten: this is a decision log and what was decided, when, is the record. Read it as history, not as guidance.
+
+*Original status line, retained:* **Status:** Proposed (ratified for commit pre-2026-05-15)
 **SUPERSEDED BY:** ADR-002-rev2 (2026-04-30) — see rev2 section 3.3 for rationale
 **Date:** 2026-04-29
 **Author:** BLOCH Core

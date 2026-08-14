@@ -28,12 +28,20 @@ web form and a JSON API, with per-address and per-IP rate limiting.
   full pipeline is exercised offline (dry-run), but it has not been validated
   end-to-end against a live Bloch node/testnet. Do **not** read any claim that
   it "works end-to-end" — there is none.
-- **Bloch is ownerless and neutral.** Postern Labs is **one builder among many**
-  with **no protocol privilege**. This faucet confers no special status on
-  anyone.
-- The base is **experimental mainnet-beta**: the relaxed PoW regime (k=4) is
-  **trivially forgeable** and the network is **51%-attackable**. Nothing here is
-  secure.
+- **HISTORICAL — GENESIS-3.** This faucet targets the proof-of-work chain and
+  its testnet. That chain stopped permanently at height 39,918 on 2026-08-13.
+  The live chain is **Genesis-4, proof of stake** (30 s slots, 32-slot epochs,
+  finality by epoch), with a different and much smaller RPC method set. This
+  tool has not been ported to it.
+- **Postern Labs is one builder among many** with **no protocol privilege**;
+  this faucet confers no special status on anyone. ("Ownerless" was retracted —
+  see `docs/adr/ADR-036-retract-ownerless-adopt-foundation.md`.)
+- **Nothing here is secure, and the risk has changed shape.** The old rail —
+  relaxed PoW at k=4, trivially forgeable, the network 51%-attackable —
+  described Genesis-3 and was true of it. Under Genesis-4 the security question
+  is concentration: **all 64 validators are run by one entity**, **93.94% of the
+  carryover sits at a single address**, and **56.05 B of the 57.15 B BLOCH
+  issued at genesis is held by the founder and the Foundation**.
 
 ---
 

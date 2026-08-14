@@ -1,7 +1,9 @@
 # ADR-018: Oracle Network — Eligibility, Compensation, and Bidirectional ZK API
 
 **Sprint:** 2.4 (specification) / 3.0 (initial outreach) / 3.1+ (implementation)
-**Status:** Proposed (draft for review)
+**Status:** **SUPERSEDED** — The oracle network is specified against PoBRS, the FFG committee and the 70/25/5 miner/validator/oracle emission split — none of which exist under Genesis-4. Tokenomics V4 has no oracle bucket: the seven destinations are carryover, founder, VC, team, marketing, liquidity and validator emission (`crates/bloch-pos-committee/src/tokenomics_v4.rs`). **No oracle network is built, wired or running.** The chain this ADR governs — Genesis-3, proof of work — stopped permanently at height **39,918** on 2026-08-13. The live chain is **Genesis-4, proof of stake** (30 s slots, 32-slot epochs, finality by epoch, hybrid ML-DSA-65 ‖ Falcon-1024, no mining). The decision, context and consequences below are **not** rewritten: this is a decision log and what was decided, when, is the record. Read it as history, not as guidance.
+
+*Original status line, retained:* **Status:** Proposed (draft for review)
 **Date:** 2026-04-29
 **Author:** BLOCH Core
 **Related:** ADR-002 (PoBRS), ADR-005 (Committee), ADR-010 (Tokenomics — requires update), ADR-017 (Compliance Framework — pending)

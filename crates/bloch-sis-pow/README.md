@@ -1,5 +1,23 @@
 # Bloch-SIS-PoW — Reference Implementation
 
+> **Historical — proof-of-work era.** This crate is proof-of-work machinery.
+> Bloch's proof-of-work chain, **Genesis-3, stopped permanently at height
+> 39,918 on 2026-08-13**. The live chain is **Genesis-4, proof of stake** —
+> 30 s slots, 32-slot epochs, Casper-style finality by epoch, consensus in
+> `crates/bloch-pos-committee`. **Nothing in this crate secures the live
+> chain.** It remains a workspace member only because `bloch-crypto` (whose
+> `crypto` module *is* on the Genesis-4 signature path) still links it for the
+> Genesis-3 `core` module's residual-gate selector. Kept buildable for audit,
+> and because Genesis-4's opening ledger derives from the chain this era
+> produced. Read every present-tense sentence below — mining, difficulty,
+> hashrate, ASERT retargeting — as describing the proof-of-work era.
+>
+> **The live security question is not hashrate, it is concentration:** all 64
+> Genesis-4 validators are operated by one entity, 93.94% of the carryover
+> sits at a single address, and 56.05 B of the 57.15 B BLOCH issued at genesis
+> is held by the founder and the Foundation. One operator can halt the chain
+> and one holder can outvote every other.
+
 Proof-of-work for the **Bloch Protocol**: a **SHAKE-256 (Keccak)
 hashcash** with a **Module Short Integer Solution (Module-SIS)
 structural gate** on the algebraic structure shared with NIST FIPS 204

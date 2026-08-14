@@ -1,6 +1,8 @@
 # ADR-003: Minimum Committee Policy When Fewer Than 21 Candidates
 
-**Status:** Accepted
+**Status:** **SUPERSEDED** — The 21-validator FFG committee elected by **hashrate snapshot** does not exist under Genesis-4. Committees are a shuffled partition of the active stake-weighted validator set into 32 per-epoch committees (`crates/bloch-pos-committee/src/committees.rs`); there is no hashrate to snapshot. The chain this ADR governs — Genesis-3, proof of work — stopped permanently at height **39,918** on 2026-08-13. The live chain is **Genesis-4, proof of stake** (30 s slots, 32-slot epochs, finality by epoch, hybrid ML-DSA-65 ‖ Falcon-1024, no mining). The decision, context and consequences below are **not** rewritten: this is a decision log and what was decided, when, is the record. Read it as history, not as guidance.
+
+*Original status line, retained:* **Status:** Accepted
 **Date:** 2026-04-29
 **Deciders:** BLOCH Founder
 **Sprint:** 2.1 (CommitteeRegistry + Dual DKG)

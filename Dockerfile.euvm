@@ -1,3 +1,27 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# GENESIS-2/3 IMAGE — THE PROOF-OF-WORK NODE WITH THE eUTXO VM. NOT LIVE.
+#
+# This builds `bloch` (the proof-of-work node) with the `euvm` feature, for the
+# isolated eUVM rehearsal app in fly.euvm.toml. The proof-of-work chain stopped
+# permanently at height 39,918 on 2026-08-13; an image built from this file has
+# no network to join, and bloch-euvm was never wired into consensus on either
+# chain.
+#
+# THE LIVE CHAIN IS GENESIS-4, PROOF OF STAKE. Its binary is `bloch-pos`:
+#
+#     cargo build --release -p bloch-pos-node   # -> target/release/bloch-pos
+#
+# There is deliberately no container image for it here — the fleet installs
+# `bloch-pos` as a systemd unit from a signed release tarball
+# (`deploy/RELEASE-INTEGRITY.md`). Kept as part of the Genesis-3 record.
+#
+# NOTE, as on the main Dockerfile: this image does not currently build. `COPY
+# carryover.tsv` wants a file the repository stores compressed
+# (`carryover.tsv.gz`), and `COPY src ./src` / `COPY tests ./tests` want paths
+# that moved to legacy/genesis3-node/. Left as found rather than fixed blind —
+# fixing it would mean claiming a build nobody has run.
+# ══════════════════════════════════════════════════════════════════════════════
+
 # ─── Builder ─────────────────────────────────────────────────
 # Base images pinned by digest (reproducible-build prerequisite, L1). Update the
 # digest deliberately, never float the tag. See deploy/repro/README.md.

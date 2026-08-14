@@ -1,7 +1,22 @@
 //! bloch-pool — a REFERENCE, open-source mining pool for Bloch-SIS-PoW.
 //!
-//! READ THIS FIRST (the honest part)
-//! =================================
+//! HISTORICAL — GENESIS-3. THERE IS NOTHING TO MINE.
+//! =================================================
+//!
+//! This pool serves the proof-of-work chain, which stopped permanently at
+//! height 39,918 on 2026-08-13. The live chain is **Genesis-4, proof of
+//! stake** (30 s slots, 32-slot epochs, finality by epoch): blocks come from a
+//! proposer schedule over staked validators, so there is no hashrate, no share
+//! accounting and no pool in the picture at all. Kept as part of the Genesis-3
+//! record. Everything below is in the past tense.
+//!
+//! Under Genesis-4 the security question is not hashrate, it is concentration:
+//! all 64 validators are run by one entity, 93.94% of the carryover sits at a
+//! single address, and 56.05 B of the 57.15 B BLOCH issued at genesis is held
+//! by the founder and the Foundation.
+//!
+//! READ THIS FIRST (the honest part, as it stood on Genesis-3)
+//! ==========================================================
 //!
 //! * **This exists so there can be MANY pools, not one.** A pool that
 //!   controls >51% of network hashrate IS a 51%-attack vector and

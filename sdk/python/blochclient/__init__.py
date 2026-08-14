@@ -3,12 +3,19 @@
 #
 # blochclient — community Python client for the Bloch JSON-RPC surface.
 #
-# SCAFFOLD / generated / pre-production / UNAUDITED. Bloch is ownerless and
-# neutral; this SDK is permissively-licensed community tooling with no
-# privileged access. Base is experimental mainnet-beta (k=4 trivially
-# forgeable, 51%-attackable). BLCH is neutral protocol gas, NOT a security,
-# worthless by design as anything but gas; 17% premine disclosed. Plans, not
-# promises.
+# HISTORICAL — GENESIS-3. This client targets the Genesis-3 proof-of-work
+# JSON-RPC surface; that chain stopped permanently at height 39,918 on
+# 2026-08-13. The live chain is Genesis-4, proof of stake, whose RPC exposes a
+# different and much smaller method set.
+#
+# SCAFFOLD / generated / pre-production / UNAUDITED. Permissively-licensed
+# community tooling with no privileged access ("ownerless" retracted, ADR-036).
+# Under Genesis-4 the security question is concentration, not hashrate: all 64
+# validators are run by one entity, 93.94% of the carryover sits at a single
+# address, and 56.05 B of the 57.15 B BLOCH issued at genesis is held by the
+# founder and the Foundation. BLCH is neutral protocol gas, NOT a security; the
+# "17% premine" is Genesis-3 tokenomics V2 — under Genesis-4 the founder holds
+# 27.04% of the 100 B cap. Plans, not promises.
 
 from .client import BlochClient, DEFAULT_RPC_URL, DEFAULT_RPC_PORT
 from .errors import BlochRpcError, BlochTransportError

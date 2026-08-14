@@ -2,9 +2,23 @@
 
 # Genesis-4 migration — the ceremony
 
-The ordered steps that turn a halted Genesis-3 into a running Genesis-4, with
-what must be verified at each one and who performs it. Written 2026-08-13
-against measured state, not against a plan.
+> **Completed. This is now a record, not a plan.** Genesis-3 stopped
+> permanently at height 39,918 on 2026-08-13 (terminal DAG block count 50,690
+> — height and block count are different measurements in a DAG). **Genesis-4
+> has been live under proof of stake since 21:31:19 UTC on 2026-08-13**: 30 s
+> slots, 32 slots per epoch, `COMMITTEE_SIZE` 128, `SLOT_SUBCOMMITTEE_SIZE` 8,
+> 64 genesis validators, hybrid ML-DSA-65 ‖ Falcon-1024, Casper justification
+> and finalisation **by epoch** (~32 min typical, ~48 min worst case).
+> Finality, not confirmation depth, is the settlement rule. Public read RPC:
+> <https://posternlabs.com/g4rpc>, version `0.1.0-mainnet`.
+>
+> The steps below are written in the order they were performed. Where this
+> page originally said something was still missing, it now says what is
+> actually true today — see "What had to exist before the ceremony could run".
+
+The ordered steps that turned a halted Genesis-3 into a running Genesis-4, with
+what was verified at each one and who performed it. Written 2026-08-13 against
+measured state, not against a plan; annotated after the launch.
 
 ## What "migration" means here, precisely
 
@@ -18,7 +32,9 @@ Three things happen, and confusing them is how a migration goes wrong:
 3. **The launch.** Genesis-4 starts from a manifest that *carries* that
    snapshot. Without this step the snapshot is a file nobody reads.
 
-Steps 1 and 2 are done or nearly done. Step 3 is the one with code missing.
+All three are done. The halt landed at height 39,918 on 2026-08-13; the
+terminal snapshot was taken there; Genesis-4 launched from a manifest carrying
+it at 21:31:19 UTC the same day and has been producing and finalising since.
 
 ## The allocation table, verified
 
@@ -42,33 +58,65 @@ cap check works against. `Manifest::check_supply()` refuses a manifest whose
 carryover plus allocations does not equal exactly that figure.
 
 The carryover figure is **final**. Genesis-3 stopped at height 39,918 on
-2026-08-13 and the terminal snapshot was taken there — 452,726 outputs across
-16 addresses, 3,810,744,000 BLOCH, set root `7c756ee8…`, file SHA-256
+2026-08-13 (terminal DAG block count 50,690) and the terminal snapshot was
+taken there — 452,726 outputs across 16 addresses, **3,810,744,000 BLOCH
+measured on the Genesis-3 side**, set root `7c756ee8…`, file SHA-256
 `84ddbbac…`, produced independently on two nodes with byte-identical results.
 The constants are re-pinned to it: `INITIAL_ANNUAL_SAT` re-derived by binary
 search, year-one inflation 434 bps, concentration 93.94%.
 
-The chain never reached 50,000. The coins between 39,918 and that ceiling were
-never minted, so there is nothing to burn: validator emission is the remainder
-of a fixed cap, and a smaller carryover simply leaves more of it unissued.
+**3,810,744,000 and 18,146,400,000 are the same coins, not two measurements.**
+They are the two sides of the ×100/21 redenomination that took total supply
+from 21 B to 100 B: 3,810,744,000 × 100 / 21 = 18,146,400,000 exactly, with no
+aggregate dust (`SPLIT_NUMERATOR` / `SPLIT_DENOMINATOR`, asserted at compile
+time in `tokenomics_v4.rs`). The table above states Genesis-4 units; this
+paragraph states the Genesis-3 side of the same set. Nobody was diluted and no
+coin was created by the split.
 
-## What must exist before the ceremony can run
+The chain never reached 50,000 — the ceiling planned at the time, later
+lowered from 80,000 and never met. This is load-bearing for supply: the coins
+between 39,918 and that ceiling were never minted, so there is nothing to burn.
+Validator emission is the remainder of a fixed cap, so a smaller carryover
+simply leaves more of it unissued.
 
-None of these is optional, and each is verifiable rather than a matter of
-judgement:
+## What had to exist before the ceremony could run
 
-| # | piece | how to know it is done |
-|---|---|---|
-| 1 | Carryover ingestion | a genesis built from the snapshot commits a state root that differs from one built without it, and the ingested total equals the commitment |
-| 2 | `Transfer` moving value | a signed transfer moves an output; an unsigned or wrongly-signed one is refused; a double-spend is refused |
-| 3 | RPC | `getbalance` on a carried address returns the carried amount |
-| 4 | Production network | two nodes on different hosts form a gossipsub mesh and finalise |
+None of these was optional, and each is verifiable rather than a matter of
+judgement. Status as of 2026-08-14, after launch:
 
-Items 1–4 are in flight. Until 1 and 2 land, a launched Genesis-4 has balances
-that exist in the state root but that nobody can move — and until 1 lands, it
-has no balances at all.
+| # | piece | how to know it is done | status |
+|---|---|---|---|
+| 1 | Carryover ingestion | a genesis built from the snapshot commits a state root that differs from one built without it, and the ingested total equals the commitment | **exists** — `Manifest::ingest_carryover`, `crates/bloch-pos-node/src/genesis.rs`; it ran at genesis |
+| 2 | `Transfer` moving value | a signed transfer moves an output; an unsigned or wrongly-signed one is refused; a double-spend is refused | **exists** — a real transaction format with inputs and outputs, `crates/bloch-pos-committee/src/transition.rs:242-262` |
+| 3 | RPC | `getbalance` on a carried address returns the carried amount | **exists** — JSON-RPC server in `crates/bloch-pos-node/src/rpc.rs`; public read endpoint <https://posternlabs.com/g4rpc>, version `0.1.0-mainnet` |
+| 4 | A network a third party can join | a node not operated by the founder can connect, follow and finalise | **does not exist** — see below |
 
-## The ceremony, in order
+Items 1–3 landed and the chain launched on them. Item 4 did not, and the
+reason is specific rather than general.
+
+**The live transport is still `Transport::Devnet`**: a point-to-point TCP full
+mesh with a fixed peer list, no discovery and no authentication, which is why a
+third party cannot yet join the network (`crates/bloch-pos-node/src/net.rs`,
+selected in `main.rs`). This page previously described item 4 as "two nodes on
+different hosts form a gossipsub mesh"; **there is no gossipsub mesh and no
+libp2p layer on the live chain** — do not describe one as running.
+
+Compounding it, **`Deposit` and `Delegate` are refused at every node's
+mempool** (`crates/bloch-pos-node/src/engine.rs:1900-1906`) because bonding is
+not yet funded from the UTXO set. So even a third party who could reach the
+network could not bond stake and become a validator. All 64 genesis validators
+are run by one entity, and until both of those change, that cannot be diluted
+by anyone joining.
+
+Also absent, and worth stating rather than discovering: there is **no RocksDB**
+(persistence is append-only with deterministic replay), **no slashing-evidence
+pipeline**, and **no checkpoint-sync state download**.
+
+## The ceremony, in the order it was performed
+
+Kept in the original T-minus form because that is the order it happened in and
+the order a rehearsal would follow. It has already run: T+0 was 2026-08-13,
+and the chain has been live since 21:31:19 UTC that day.
 
 ### T−2 weeks — keys
 
@@ -88,8 +136,9 @@ worth nothing, so nothing is lost if the rehearsal leaks.
 
 ### T−0 — the halt
 
-Genesis-3 reaches its terminal height and stops. Every node refuses blocks
-above it; no coordination is required at the moment itself.
+Genesis-3 reached its terminal height — **39,918**, block count 50,690 — and
+stopped, permanently, on 2026-08-13. Every node refused blocks above it; no
+coordination was required at the moment itself.
 
 **Verify:** three independent nodes report the same tip at the terminal
 height. Not one node — agreement is the evidence.
@@ -127,12 +176,13 @@ decide, not silence it.
 
     bloch-pos genesis-mainnet --cohort out/cohort.tsv --out mainnet.manifest
 
-Reads the ceremony's **public halves only** — the devnet `genesis` command
-reads keystores, which is exactly what must never leave the air-gapped
-machine. Every column is refused rather than defaulted: a blank `stake_sat`
-stops the assembly, because a validator set is the one artifact nobody can
-correct after a chain runs from it.
-
+Reads the ceremony's **public halves only** — the shipped binary's other
+`genesis` command reads keystores, which is exactly what must never leave the
+air-gapped machine. (That command is named for the devnet *transport*, not for
+the chain: `Transport::Devnet` is what the live mainnet runs on today. The
+transport is devnet; the chain is not.) Every column is refused rather than
+defaulted: a blank `stake_sat` stops the assembly, because a validator set is
+the one artifact nobody can correct after a chain runs from it.
 
 Inputs: the snapshot commitment (digest, count, total), the 64 validators'
 public halves, the allocation table above, `genesis_time_ms`, `slot_ms` =
@@ -153,11 +203,20 @@ all nodes agreeing on one state root at a settled slot. Finality is the
 acceptance test, not block production — a chain that produces and never
 finalises is not running.
 
+This step completed at **21:31:19 UTC on 2026-08-13**, and Genesis-4 has run
+since. Justification and finalisation are **by epoch** — 32 slots of 30 s —
+so settlement is ~32 minutes typically and ~48 minutes worst case. Anyone
+integrating BLOCH waits for finality, not for a confirmation count.
+
 ## What the migration does not fix
 
 Stated here because a runbook that only lists successes is a sales document.
 
-- **Concentration.** 93.93% of the carryover is one address. The
+- **Concentration.** 93.94% of the carryover is one address —
+  17,046,829,380 BLOCH of 18,146,400,000. With the founder allocation that is
+  27,046,829,380, or 27.04% of the 100 B cap; the foundation buckets are a
+  further 29.00%. Together 56,046,829,380 of the 57,146,400,000 issued at slot
+  0, leaving 1,099,570,620 BLOCH — **1.92%** — in third-party hands. The
   genesis-cohort cap tapers the founder's *consensus weight* to one third over
   a year (`genesis_cohort.rs`), which is a real commitment expressed as a
   consensus rule. It does nothing to the holdings.
@@ -167,4 +226,8 @@ Stated here because a runbook that only lists successes is a sales document.
   new chain.
 - **Validator independence.** 64 keys operated by one entity is one operator.
   The Nakamoto coefficient is 1 until third parties run validators, and no
-  amount of key-splitting changes that.
+  amount of key-splitting changes that. Today they *cannot*: the live
+  transport is a point-to-point TCP full mesh with a fixed peer list, no
+  discovery and no authentication, and `Deposit`/`Delegate` are refused at
+  every node's mempool. Both must change before this number can move at all.
+- **Audit.** No external audit has been completed.

@@ -16,7 +16,7 @@
 //!
 //! ## Why there is no framework here
 //!
-//! The Genesis-3 node's RPC (`src/rpc/mod.rs` at the repo root) is axum + tower
+//! The Genesis-3 node's RPC (`legacy/genesis3-node/src/rpc/mod.rs`) was axum + tower
 //! + serde_json + tokio. This crate's dependency set is `bloch-pos-committee`,
 //! `bloch-crypto` and `sha3` — it has no async runtime at all, and `net.rs` is
 //! blocking `std::net` with one thread per connection. Pulling an async stack
@@ -48,7 +48,8 @@
 //! ## Authentication: there is none
 //!
 //! No API key, no rate limit, no per-method authorisation — unlike the
-//! Genesis-3 surface, which has all three (`src/rpc/auth.rs`). That is why
+//! Genesis-3 surface, which had all three
+//! (`legacy/genesis3-node/src/rpc/auth.rs`). That is why
 //! `--rpc-bind` defaults to `127.0.0.1` and why binding anything routable is an
 //! explicit act that the help text pairs with a firewall instruction. The
 //! bounds that *are* here are anti-exhaustion, not authorisation:
@@ -217,11 +218,15 @@ impl RpcError {
     /// that in every respect.
     ///
     /// Second, and it would block the method even if the first did not:
-    /// Genesis-4 has **no frozen address format**. `withdrawal_credentials` is
-    /// declared as opaque bytes precisely because the address format belongs to
-    /// a transaction layer that does not exist yet (recorded as an open point in
-    /// `BLOCH-POS-INTERFACES.md`). There is no string this method could return
-    /// that a later build would still honour.
+    /// Genesis-4 has **no frozen address encoding**. The transaction layer
+    /// itself does exist — transfers spend outpoints and pay 32-byte script
+    /// hashes, and `getbalance` / `getutxos` are keyed by that hash — but no
+    /// human-readable, checksummed encoding of it has been frozen, and
+    /// `withdrawal_credentials` is declared as opaque bytes for exactly that
+    /// reason (recorded as an open point in `BLOCH-POS-INTERFACES.md`).
+    /// Genesis-3's `bloch1q…` is a 20-byte hash160 form and is **not** a
+    /// Genesis-4 address. There is no string this method could return that a
+    /// later build would still honour.
     pub fn no_wallet() -> Self {
         Self::new(
             NO_WALLET,
@@ -1462,9 +1467,10 @@ pub fn balance_json(state: &CommittedState, script_hash: &[u8; 32]) -> Json {
 
 /// `getutxos` — the outputs themselves, paginated.
 ///
-/// `truncated` rather than a cursor: the honest thing for a devnet-stage
-/// surface is to say the page was cut, not to invent a pagination protocol the
-/// OpenAPI V4 freeze has not decided on.
+/// `truncated` rather than a cursor: the honest thing for a surface this young
+/// is to say the page was cut, not to invent a pagination protocol the OpenAPI
+/// V4 freeze has not decided on. A client that sees `truncated: true` has NOT
+/// been given the whole set and must not treat the page as a balance.
 pub fn utxos_json(state: &CommittedState, script_hash: &[u8; 32], limit: usize) -> Json {
     let matching: Vec<&EutxoEntry> =
         state.eutxos().filter(|e| &e.script_hash == script_hash).collect();

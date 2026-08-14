@@ -1,6 +1,8 @@
 # ADR-031 — Sprint 2.1.D Deferrals (Bonding Closure)
 
-**Status:** Accepted
+**Status:** **SUPERSEDED** — The bonding registry whose closure this records belongs to the Genesis-3 FFG design and is superseded by `crates/bloch-pos-committee/src/staking.rs` and `delegation.rs`. The deferrals it lists were never taken up. The chain this ADR governs — Genesis-3, proof of work — stopped permanently at height **39,918** on 2026-08-13. The live chain is **Genesis-4, proof of stake** (30 s slots, 32-slot epochs, finality by epoch, hybrid ML-DSA-65 ‖ Falcon-1024, no mining). The decision, context and consequences below are **not** rewritten: this is a decision log and what was decided, when, is the record. Read it as history, not as guidance.
+
+*Original status line, retained:* **Status:** Accepted
 **Date:** 2026-05-02
 **Sprint:** 2.1.D (closure)
 **Author:** BLOCH Founder

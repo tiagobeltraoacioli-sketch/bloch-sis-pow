@@ -1,3 +1,14 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# RETIRED. Fly.io config for a proof-of-work `bloch` node on the Genesis-era
+# TESTNET (`--testnet` below), part of the Fly fleet that exercised P2P/IBD for
+# the proof-of-work system. That system's mainnet, Genesis-3, stopped
+# permanently at height 39,918 on 2026-08-13, and neither it nor this testnet is
+# running. The live chain is GENESIS-4, PROOF OF STAKE; it is not deployed from
+# Fly or from this repository's Dockerfile — see `deploy/RELEASE-INTEGRITY.md`.
+# Kept unchanged as the deployment record; do not read a `--mine` flag below as
+# a description of what the network does now.
+# ══════════════════════════════════════════════════════════════════════════════
+
 # Follower node #2 on the Bloch-SIS network. Same image + chain as blochv-node,
 # but NOT mining — it bootstraps to node1's public P2P (dedicated IPv6, port
 # 16110) and syncs, so the network shows real peers and we can test gossip/IBD.

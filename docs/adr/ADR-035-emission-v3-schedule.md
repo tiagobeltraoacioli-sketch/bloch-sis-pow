@@ -1,6 +1,8 @@
 # ADR-035: Emission V3 — flag-day reward re-scale (8,400 → 2,600 BLOCH, 1.5-year halvings)
 
-**Status:** Accepted — armed in the fleet binary, activates at local height 40,000
+**Status:** **SUPERSEDED** — **IT NEVER ACTIVATED AND NEVER WILL.** Its flag day was local height **40,000**; Genesis-3 stopped permanently at **39,918** — **82 blocks short**. The block reward ended at 8,400 BLOCH and never became 2,600, the 1.5-year halving schedule never ran a single halving, and the PISO-60 tail floor was never reached. No block on any Bloch chain was ever paid under Emission V3. It is superseded outright by Tokenomics V4 (`crates/bloch-pos-committee/src/tokenomics_v4.rs`), which is hard-capped at 100,000,000,000 BLCH with no tail at all. The chain this ADR governs — Genesis-3, proof of work — stopped permanently at height **39,918** on 2026-08-13. The live chain is **Genesis-4, proof of stake** (30 s slots, 32-slot epochs, finality by epoch, hybrid ML-DSA-65 ‖ Falcon-1024, no mining). The decision, context and consequences below are **not** rewritten: this is a decision log and what was decided, when, is the record. Read it as history, not as guidance.
+
+*Original status line, retained:* **Status:** Accepted — armed in the fleet binary, activates at local height 40,000
 **Date:** 2026-08-09
 **Related:** `legacy/specs/TOKENOMICS_V3.md` (normative spec), ADR-028 (V2 activation), ADR-010 lineage (historical emission doctrine)
 **Supersedes:** the emission curve of ADR-028 / `legacy/specs/TOKENOMICS_V2.md` from emission height 453,743 onward

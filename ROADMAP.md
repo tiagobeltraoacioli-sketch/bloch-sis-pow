@@ -1,14 +1,23 @@
 # Bloch-SIS — roadmap
 
-> **Genesis-3-era document — sealed 2026-08-12.** Bloch's proof-of-work
-> chain halts by consensus rule at the terminal height (50,000) and
-> Genesis-4 relaunches as proof of stake; the ownerless thesis was
-> retracted (`docs/adr/ADR-036-retract-ownerless-adopt-foundation.md`).
+> **Historical — Genesis-3.** This describes the proof-of-work chain that
+> stopped permanently at height **39,918** on 2026-08-13. The live chain is
+> **Genesis-4, proof of stake** (30 s slots, 32-slot epochs, finality by
+> epoch), live since 21:31:19 UTC on 2026-08-13. Kept because Genesis-4's
+> opening ledger is derived from Genesis-3. It is not what runs. The
+> ownerless thesis was also retracted
+> (`docs/adr/ADR-036-retract-ownerless-adopt-foundation.md`).
 >
-> The privacy track (P1–P5), S2 (audit), S4 (attestation), S5 (supply chain),
-> S6 (k-of-n custody), the governance section and "what we will NOT do" stand.
-> S1 (canonical PoW hardness) and S7 (an FFG-BFT overlay of miners weighted by
-> hashrate) lost their object; their research record is in `legacy/`.
+> The privacy track (P1–P5), S2 (audit), S4 (attestation), S5 (supply chain)
+> and S6 (k-of-n custody) stand as intent. S1 (canonical PoW hardness) and S7
+> (an FFG-BFT overlay of miners weighted by hashrate) lost their object;
+> their research record is in `legacy/`. The **governance and economics**
+> section below is superseded on two points — the ownerless/miner-governance
+> thesis and the 17% premine — and is annotated in place. "What we will NOT
+> do" stands.
+>
+> For the live chain's actual security posture, read
+> [`SECURITY.md`](./SECURITY.md), not this file.
 
 **North star: maximize security and privacy.** Everything below is ordered by how
 much it moves those two axes — not by how much new surface it adds. The project
@@ -17,6 +26,11 @@ L1–L3, the Coherence privacy layer, an SP1 prover, four clients, two OSes). Wh
 it lacks is **depth**: proven hardness, a live network, audits, and privacy that
 actually runs. This roadmap closes that. No dates — priorities shift with audit
 findings and research.
+
+*(Of that list, "a live network" is no longer outstanding — Genesis-4 has been
+producing and finalising since 2026-08-13 — but it is live on a closed
+transport with a single operator, so read S3 below as still open in substance.
+"Audits" and "privacy that actually runs" remain outstanding as written.)*
 
 ## Positioning — privacy-first, compliance opt-in
 
@@ -29,9 +43,24 @@ sovereign freeze), which is technically incompatible with a shielded pool: a cha
 either sees-and-controls (surveillance) or it does not (privacy). We choose
 privacy, and put the disclosure switch in the user's hands, not the protocol's.
 
-> **Honest baseline.** The chain is a **zero-security testnet** (relaxed PoW
-> regime, unaudited, no real network). No privacy or security claim is adopted
-> until its specific gate below is cleared. See `docs/PROJECT-STATUS.md`.
+> **Honest baseline — as written, and as it stands today.**
+>
+> *As written (Genesis-3 era):* "The chain is a **zero-security testnet**
+> (relaxed PoW regime, unaudited, no real network)."
+>
+> *Today:* that is no longer the disclosure. Genesis-4 is a **live mainnet**
+> under proof of stake, carrying the ledger carried over from Genesis-3
+> height 39,918. It is still **unaudited**, and the honest caveat is no
+> longer hashrate but **concentration**: all 64 validators are operated by a
+> single entity, 93.94% of the carryover sits at one stakeable address, and
+> the founder and the Foundation together hold 56.05 B of the 57.15 B BLOCH
+> issued at genesis. One operator can halt the chain and one holder can
+> outvote every other. A third party cannot yet join — the transport has a
+> fixed peer list and no discovery, and `Deposit`/`Delegate` are refused at
+> the mempool. Full statement: [`SECURITY.md`](./SECURITY.md).
+>
+> No privacy or security claim is adopted until its specific gate below is
+> cleared. See also `docs/PROJECT-STATUS.md`.
 
 ---
 
@@ -65,9 +94,19 @@ of inherited findings M-2/M-3.)* Then Coherence (P2).
 
 ### S3 — Live multi-node network
 Deploy ≥3 seed nodes, wire `DEFAULT_SEEDS`, and prove consensus/reorg/gossip
-across nodes (today it's effectively a solo-node demo). Ship the in-process
-two-`NetworkNode` convergence harness (inherited Sprint EE) and add adversarial
-nodes (equivocation, invalid blocks, eclipse) to the matrix.
+across nodes (as written, it was effectively a solo-node demo). Ship the
+in-process two-`NetworkNode` convergence harness (inherited Sprint EE) and add
+adversarial nodes (equivocation, invalid blocks, eclipse) to the matrix.
+
+> **Where this actually stands.** Genesis-4 runs 64 validators across five
+> hosts and finalises, so "multi-node consensus proven" is done. What is
+> **not** done is the part that made this a decentralisation item: all 64 are
+> operated by one entity, and the live transport is a fixed-peer-list TCP
+> full mesh with no discovery and no authentication
+> (`crates/bloch-pos-node/src/net.rs`, `--transport devnet`, still the
+> default), so no third party can dial in. A libp2p/gossipsub layer exists in
+> the tree (`crates/bloch-pos-node/src/p2p.rs`) and is not what the fleet
+> runs. S3 is open.
 
 ### S4 — Attestation on real hardware
 Run the reproducible image in a real SEV-SNP/TDX confidential VM; produce a real
@@ -171,13 +210,24 @@ successor to the SP1/FRI spend path — adopt only after its own audit.
   mitigations → gates, and what is *not* protected). Whitepaper (consolidated
   design) still pending.
 
-## Governance & economics (unchanged principles)
+## Governance & economics (Genesis-3 era — two points superseded)
 
 - **GIP process** for any consensus-touching change (`gips/`); soft-forks
-  preferred; consensus breaks need explicit activation signaling.
-- **No inflation, no extra premine.** `MAX_SUPPLY` consensus-enforced from genesis;
-  the 17% founder allocation (10-yr lock + 40-yr vesting) is all that exists.
-- Governance lives with node operators/miners, not a discretionary foundation.
+  preferred; consensus breaks need explicit activation signaling. *(Stands.)*
+- ~~**No inflation, no extra premine.** `MAX_SUPPLY` consensus-enforced from
+  genesis; the 17% founder allocation (10-yr lock + 40-yr vesting) is all that
+  exists.~~ **Superseded by tokenomics V4.** The live cap is
+  100,000,000,000 BLOCH (`TOTAL_SUPPLY_BLOCH`), of which 57,146,400,000 was
+  issued at slot 0 and 42,853,600,000 remains as unissued validator emission
+  over 40 years. The founder holds 27.04% of the cap and the Foundation a
+  further 29.00%. Read
+  `crates/bloch-pos-committee/src/tokenomics_v4.rs`; the 17% figure describes
+  a supply schedule that no longer exists.
+- ~~Governance lives with node operators/miners, not a discretionary
+  foundation.~~ **Retracted** in writing
+  (`docs/adr/ADR-036-retract-ownerless-adopt-foundation.md`) in favour of a
+  two-entity foundation structure. There are no miners, and the founder
+  allocates the genesis validator cohort.
 
 ## What we will NOT do
 
@@ -186,16 +236,23 @@ successor to the SP1/FRI spend path — adopt only after its own audit.
   privacy-first chain. Compliance is opt-in disclosure by the user, at the edge —
   never enforced by consensus. *(This explicitly reverses the inherited Sprint 11
   compliance-first plan.)*
-- **No inflation / no premine** beyond the genesis 17%.
+- **No inflation** beyond the emission schedule pinned in the consensus
+  crate. *(The "no premine beyond the genesis 17%" wording this line carried
+  is Genesis-3's; see the superseded bullet above for the V4 allocation that
+  actually exists.)*
 - **No hard-fork feature** without a GIP + node-operator signaling.
 - **No misleading claims** — no "100% private", no "phone mining", no security
   claim before its gate (S1/S2/P2) clears.
 
-## The next three moves
+## The next three moves *(as prioritised in the Genesis-3 era)*
 
-1. **S1 — PoW hardness** *(research in flight)* → real security foundation.
-2. **P1 — node-side FRI verifier** → privacy that actually runs.
+1. ~~**S1 — PoW hardness** *(research in flight)* → real security
+   foundation.~~ **Dropped with proof of work.**
+2. **P1 — node-side FRI verifier** → privacy that actually runs. *(Still
+   open.)*
 3. **S3 — multi-node network** → consensus proven beyond a single node.
+   *(Consensus is proven across 64 validators; the open half is an open
+   transport and validators that are not all one operator — see S3.)*
 
 Deliberately *not* next: more clients / more surface. Breadth is done; the work
 now is **depth in security and privacy**.

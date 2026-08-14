@@ -1,7 +1,9 @@
 # ADR-011: FFG Activation Block Height
 
 **Sprint:** 2.1.C (constant) / 2.1.D (bonding lifecycle) / 2.1.E (reward split) / 2.2 (testnet validation)
-**Status:** Proposed (revision 1 — Monte Carlo re-run integrated, ready for commit pre-2026-05-15)
+**Status:** **SUPERSEDED** — FFG never activated. This ADR sets an activation height on a chain that stopped at 39,918 without ever reaching it, and its entire risk analysis (§5 R1, and the "pre-activation 51% attack vulnerability" consequence) is about **proof-of-work hashrate**, which no longer secures anything. **The risk that replaced it, at the same prominence:** the live risk is **concentration**, not hashrate — all 64 Genesis-4 validators are operated by a single entity, 93.94% of the carried ledger sits at one address and is stakeable, and 56,046,829,380 of the 57,146,400,000 BLOCH issued at genesis is held by the founder and the Foundation. One operator can halt the chain and one holder can outvote every other. The chain this ADR governs — Genesis-3, proof of work — stopped permanently at height **39,918** on 2026-08-13. The live chain is **Genesis-4, proof of stake** (30 s slots, 32-slot epochs, finality by epoch, hybrid ML-DSA-65 ‖ Falcon-1024, no mining). The decision, context and consequences below are **not** rewritten: this is a decision log and what was decided, when, is the record. Read it as history, not as guidance.
+
+*Original status line, retained:* **Status:** Proposed (revision 1 — Monte Carlo re-run integrated, ready for commit pre-2026-05-15)
 **Date:** 2026-04-29 (rev1 same day)
 **Author:** BLOCH Core
 **Related:** ADR-001 (FFG signature scheme), ADR-002-rev1 (DKG protocol family), ADR-005 (committee era), ADR-006 (block time + dual finality), ADR-007 (bonding contract), ADR-010 (tokenomics + emission curve), ADR-010-A (founder premine), ADR-013 (open — tiered slashing / boost capacity revision)
@@ -242,6 +244,21 @@ The fallback for step 2 (insufficient bonds at activation) is **chain-halt-pendi
 - **Whitepaper and integrator documentation must clearly distinguish pre-FFG and post-FFG security models.** "BLOCH has 30-minute hard finality" is true only for blocks ≥ 210,000. Marketing failure here = R5.
 
 ### 5.3 Open risks
+
+> **Editorial note, 2026-08-14 — none of R1–R5 is an open risk any more, and
+> one of them must not be left standing as a disclosure.** FFG never activated;
+> Genesis-3 stopped at 39,918 without reaching this ADR's activation height,
+> and Genesis-4 is proof of stake with no mining. **R1's 51%-with-low-hashrate
+> warning therefore describes nothing.** The risk that stands in its place, at
+> the same weight: **concentration.** All 64 Genesis-4 validators are operated
+> by a single entity; 93.94% of the carried ledger (17,046,829,380 of
+> 18,146,400,000 BLOCH) sits at one address and is stakeable, so the Nakamoto
+> coefficient is 1 if it stakes; 56,046,829,380 of the 57,146,400,000 BLOCH
+> issued at genesis is founder- or Foundation-held; and a third party can
+> neither join the network (fixed peer list, no discovery, no authentication)
+> nor become a validator (`Deposit`/`Delegate` refused at every mempool). One
+> operator can halt the chain. The list below is retained unedited as the
+> record of what was foreseen at the time.
 
 - **R1.** Pre-activation 51% attack with sustained low hashrate. Mitigation: initial reward calibrated for hashrate attractiveness; foundation-funded mining incentives if needed. Already an open consideration in ADR-010 (mining attractiveness ramp-up phase).
 - **R2.** Bug in `ffg_active_at` predicate or its consumers. A wrong activation gate (e.g., off-by-one) causes silent consensus divergence. Mitigation: predicate is a single function, used in <10 call sites, exhaustively tested with property tests including height = 0, 209_999, 210_000, 210_001.

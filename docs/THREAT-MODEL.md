@@ -1,14 +1,18 @@
 # Bloch-SIS — security & privacy threat model
 
-> **Genesis-3-era document — sealed 2026-08-12.** Bloch's proof-of-work
-> chain halts by consensus rule at the terminal height (50,000) and
-> Genesis-4 relaunches as proof of stake; the ownerless thesis was
-> retracted (`docs/adr/ADR-036-retract-ownerless-adopt-foundation.md`).
+> **Historical — Genesis-3.** This describes the proof-of-work chain that
+> stopped permanently at height 39,918 on 2026-08-13. The live chain is
+> **Genesis-4, proof of stake** (30 s slots, 32-slot epochs, finality by
+> epoch), live since 21:31:19 UTC on 2026-08-13. Kept because Genesis-4's
+> opening ledger is derived from it. It is not what runs. The ownerless
+> thesis was retracted
+> (`docs/adr/ADR-036-retract-ownerless-adopt-foundation.md`).
 >
 > The privacy table, the signature-forgery and hash-break rows, and the
 > "what is NOT protected" discipline stand. The cheap-PoW-forgery row, the
-> GhostDAG-Q reorg row and the malicious-miner adversary do not. The current
-> threat models are `docs/specs/BLOCH-POS-THREAT-MODEL.md` and `-2.md`.
+> GhostDAG-Q reorg row and the malicious-miner adversary describe a chain
+> that no longer produces blocks. The current threat models are
+> `docs/specs/BLOCH-POS-THREAT-MODEL.md` and `-2.md`.
 
 What Bloch-SIS protects, against whom, and — just as important — **what it does
 not protect**. Organized around the two motto axes: **security** and **privacy**.
@@ -17,11 +21,20 @@ This is an honest, adversary-oriented companion to `ROADMAP.md` and
 that closes it.
 
 > ## 🔴 Baseline — read first
-> The chain runs a **zero-security testnet** regime of the Module-SIS PoW
-> (relaxed residual). It is **trivially forgeable** and **unaudited**, with **no
-> live network**. Everything below describes the *intended* posture and its
-> current status; **no security or privacy guarantee holds today**. Do not attach
-> value.
+> **At the time this was written**, the chain ran a **zero-security testnet**
+> regime of the Module-SIS PoW (relaxed residual) — trivially forgeable and
+> unaudited. That regime is gone: the proof-of-work chain stopped at height
+> 39,918 and nothing below describes a live PoW network.
+>
+> **The live disclosure, for a reader today:** the security question under
+> Genesis-4 is not hashrate, it is concentration: all 64 validators are run by
+> one entity, 93.94% of the carryover sits at a single address, and 56.05 B of
+> the 57.15 B BLOCH issued at genesis is held by the founder and the
+> Foundation. One operator can halt the chain and one holder can outvote every
+> other. The live transport is a point-to-point TCP full mesh with a fixed peer
+> list, no discovery and no authentication, which is why a third party cannot
+> yet join the network. Nothing here is audited. Everything below describes the
+> *intended* posture of the Genesis-3 design and its status at the seal date.
 
 ## Positioning
 
@@ -29,6 +42,14 @@ Bloch-SIS is **privacy-first**: the protocol does not surveil, freeze, blacklist
 or KYC. Compliance is **opt-in at the edge** (view keys / selective disclosure),
 never enforced by consensus. So "the operator" is *not* in the trust base for
 privacy — there is no privileged party that can deanonymize or freeze users.
+
+**Scope note for the live chain.** That statement is about *consensus rules*,
+and it still holds: no rule grants anyone a freeze or disclosure power. It is
+not a statement about *operators*. Under Genesis-4 all 64 validators are run by
+one entity, so that entity today decides which transactions are proposed and
+can stop the chain by stopping its machines. Censorship-resistance and
+liveness are, right now, an operational promise from one party — not a
+protocol guarantee.
 
 ## Assets (what we protect)
 
@@ -45,8 +66,14 @@ privacy — there is no privileged party that can deanonymize or freeze users.
 ## Adversaries
 
 - **Network attacker** — MITM, eclipse, partition, spam, replay.
-- **Malicious miner** — withhold, selfish-mine, attempt cheap PoW forgery.
+- **Malicious miner** *(Genesis-3 only — there is no mining under Genesis-4)* —
+  withhold, selfish-mine, attempt cheap PoW forgery.
 - **Malicious / Byzantine node** — invalid blocks, equivocation, bad gossip.
+- **Concentrated operator / holder** *(the live Genesis-4 adversary)* — the one
+  entity that runs all 64 validators, and the addresses that hold the great
+  majority of stakeable supply. See the baseline box: this is the adversary
+  that actually matters today, and no cryptography in this document constrains
+  it.
 - **Chain analyst / passive surveillant** — links txs, amounts, IPs.
 - **Quantum adversary** — Shor/Grover against signatures + hashes (future).
 - **Supply-chain attacker** — tampered dependency, build, or release.
@@ -56,14 +83,22 @@ privacy — there is no privileged party that can deanonymize or freeze users.
 
 ## 🔐 Security threats
 
+*The rows below are the Genesis-3 posture. Rows marked **G3 only** describe
+mechanisms — proof of work, GhostDAG-Q, the libp2p gossip layer — that the live
+chain no longer runs; they are kept as the record of the chain whose ledger
+Genesis-4 inherited. The live threats are stake concentration, single-operator
+liveness and an unauthenticated fixed-mesh transport (see the baseline box).*
+
 | Threat | Mitigation | Status / gate |
 |---|---|---|
-| **Cheap PoW forgery** (find solutions faster than intended work) | SHAKE-256 hashcash target (cumulative work) + non-trivial Module-SIS structural gate (`√k·β < q`, compile-time enforced) | ⚠️ **testnet regime is forgeable**; hardness research concluded PoW security is hash work, not lattice hardness (`legacy/research/POW-CANONICAL-frontier.md`) — canonical gate params + no-shortcut proof = **S1** |
+| **Cheap PoW forgery** (find solutions faster than intended work) — **G3 only** | SHAKE-256 hashcash target (cumulative work) + non-trivial Module-SIS structural gate (`√k·β < q`, compile-time enforced) | ⚠️ the testnet regime **was** forgeable; hardness research concluded PoW security is hash work, not lattice hardness (`legacy/research/POW-CANONICAL-frontier.md`). Retired with proof of work — there is no PoW to forge on the live chain |
 | **Signature forgery** (incl. quantum) | Hybrid **Falcon-1024 ‖ ML-DSA-65** — both must verify (two lattice families) | ✅ implemented; **S2** audit pending |
 | **Hash break** (incl. quantum) | SHAKE-256 / SHA3 throughout (Grover-resistant margins) | ✅ implemented |
-| **Double-spend / reorg theft** | GhostDAG-Q + reorg re-validation (input existence, no double-spend, value conservation, coinbase maturity) | ✅ H1 fix + tests; **S2/S3** (audit + live multi-node) |
+| **Double-spend / reorg theft** — **G3 only** | GhostDAG-Q + reorg re-validation (input existence, no double-spend, value conservation, coinbase maturity) | ✅ H1 fix + tests at the seal date. Superseded: the live chain settles by Casper-style justification/finalisation **by epoch** (32 slots of 30 s = 16 min; ~32 min typical to finality, ~48 min worst case), not by accumulated work depth |
 | **Block/tx malleability** | block identity binds the merkle (incl. shielded via `os`-style body root) into the PoW preimage | ✅ H2 fix + merkle-binding |
-| **Eclipse / bad peers / spam** | PEX hygiene, min relay fee, bounded deser, gossip block-id binding | ✅ L2/L3/M1 fixes; **S3** adversarial-node matrix |
+| **Eclipse / bad peers / spam** — **G3 only** | PEX hygiene, min relay fee, bounded deser, gossip block-id binding | ✅ L2/L3/M1 fixes against the G3 libp2p/PEX stack. Not the live posture: Genesis-4 runs a point-to-point TCP full mesh with a fixed peer list, no discovery and no authentication, which is why a third party cannot yet join the network. Eclipse is moot while the peer list is fixed; the cost is that the network is closed and unauthenticated |
+| **Stake concentration** *(live, Genesis-4)* | none — no protocol mechanism caps a holder or an operator | ❌ **open, and the dominant risk.** All 64 validators are run by one entity; 93.94% of the carryover sits at one address (17,046,829,380 of 18,146,400,000 BLOCH); carried balances are stakeable, so if that balance stakes the Nakamoto coefficient is 1 |
+| **Validator signature forgery** *(live, Genesis-4)* | hybrid **ML-DSA-65 ‖ Falcon-1024** on every consensus path — both halves verified | ✅ implemented; unaudited |
 | **Malicious deser inputs** | bounded, EOF-safe parsing (capacity clamps) | ✅ M1 fix + fuzzing planned (**S2**) |
 | **Supply-chain tamper** | vendored deps, committed `Cargo.lock`, reproducible build (L1, verified digest) | ✅ L1; signed releases/SLSA = **S5** |
 | **Host compromise** | container hardening (L2) + attestation (L3): TEE + dm-verity `os_roothash` + image digest, checked by `verify()` | ✅ code+tests; real-hardware end-to-end = **S4** |
@@ -85,13 +120,23 @@ privacy — there is no privileged party that can deanonymize or freeze users.
 
 ## What is NOT protected (explicit)
 
-- **Today: nothing.** Zero-security testnet — forgeable PoW, unaudited, no
-  network. Coins are worthless by design.
+- **At the seal date: nothing.** Zero-security testnet — forgeable PoW,
+  unaudited, no network; coins were described as worthless by design.
+- **Today, on the live chain: not decentralisation, and not
+  censorship-resistance.** The security question under Genesis-4 is not
+  hashrate, it is concentration: all 64 validators are run by one entity,
+  93.94% of the carryover sits at a single address, and 56.05 B of the 57.15 B
+  BLOCH issued at genesis is held by the founder and the Foundation. One
+  operator can halt the chain and one holder can outvote every other. The
+  transport is an unauthenticated fixed-mesh, so a third party cannot even
+  join to observe as a peer. None of this is a bug being fixed on a deadline;
+  it is the current state, stated plainly.
 - **Metadata**, even after P1: origin IP + timing leak until **P3** ships. Shielded
   amounts without network privacy is **half a promise** — stated plainly.
-- **Unaudited paths**: PoW parameter hardness (S1), consensus/crypto (S2), the
-  shielded pool (P2), and the attestation chain on real hardware (S4) are all
-  **claim-gated** — no guarantee until each clears.
+- **Unaudited paths**: consensus/crypto (S2), the shielded pool (P2), and the
+  attestation chain on real hardware (S4) are all **claim-gated** — no
+  guarantee until each clears. (PoW parameter hardness, S1, is moot: proof of
+  work is retired.)
 - **The node operator's own OS/host** below the attested image, unless run in a
   TEE (S4).
 - **No "100% private" claim, ever, before C4.** No "phone mining" claim.

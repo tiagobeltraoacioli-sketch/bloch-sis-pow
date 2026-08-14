@@ -1,4 +1,14 @@
 #!/bin/bash
+# ══════════════════════════════════════════════════════════════════════════════
+# RETIRED — GENESIS-3. Deploys three proof-of-work `bloch` nodes to Akash. The
+# chain they join stopped permanently at height 39,918 on 2026-08-13, so this
+# script now provisions nodes with no network to reach. The live chain is
+# GENESIS-4, PROOF OF STAKE (30 s slots, 32-slot epochs, finality by epoch); its
+# binary is `bloch-pos` and the fleet installs it as a systemd unit from a
+# signed release tarball — see deploy/RELEASE-INTEGRITY.md. Kept as the
+# deployment record of a chain that ran.
+# ══════════════════════════════════════════════════════════════════════════════
+#
 # Bloch Protocol — Deploy 3 nodes to Akash
 # Usage: ./deploy.sh
 

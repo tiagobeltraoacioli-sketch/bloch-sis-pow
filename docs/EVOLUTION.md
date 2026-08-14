@@ -1,11 +1,57 @@
 # Bloch-SIS-PoW / Postern Labs — Project Evolution Plan (APPROVED)
 
-> **SUPERSEDED FRAMING — 2026-08-11.** Written 2026-07-09, before the
-> **retraction of the ownerless thesis** (ADR-036; two-entity foundation,
-> `docs/specs/BLOCH-ENTITY-STRUCTURE.md`) and before the Genesis-4 PoS
-> relaunch decision (halt at height 80,000). The "ownerless / not-a-security"
-> posture this plan leans on no longer describes the project; the product
-> strategy sections are unaffected. Kept unrewritten as the approved record.
+> **SUPERSEDED FRAMING — banner updated 2026-08-14.** Written 2026-07-09,
+> before the **retraction of the ownerless thesis** (ADR-036; two-entity
+> foundation, `docs/specs/BLOCH-ENTITY-STRUCTURE.md`) and before the Genesis-4
+> proof-of-stake relaunch. The "ownerless / not-a-security" posture this plan
+> leans on no longer describes the project; the product strategy sections are
+> unaffected. **Kept unrewritten as the approved record** — only this banner has
+> been corrected. Read the body as a July-2026 document, not as current fact.
+>
+> **What is true now, against which the body should be read:**
+>
+> - **Genesis-3 is over.** The proof-of-work chain stopped permanently at
+>   height **39,918** on 2026-08-13 (terminal DAG: 50,690 blocks). Earlier
+>   drafts of this banner named a halt at height 80,000, and other documents
+>   said 50,000; both were planned ceilings that were never reached. The chain
+>   did not halt at either.
+> - **Genesis-4 has been live under proof of stake since 21:31:19 UTC on
+>   2026-08-13** — 30 s slots, 32-slot epochs, a 128-validator committee,
+>   hybrid ML-DSA-65 ‖ Falcon-1024 with both halves verified, and Casper-style
+>   justification and finalisation evaluated by epoch. Finality, not
+>   confirmation depth and not work depth, is the settlement rule. Every
+>   proof-of-work assumption in the body below is historical.
+> - **The supply is hard-capped at 100,000,000,000 BLOCH**
+>   (`crates/bloch-pos-committee/src/tokenomics_v4.rs`). Anything in the body
+>   or in sibling documents describing a "21 billion nominal" supply, a
+>   "perpetual tail", or a supply that is "not hard-capped" is false for
+>   Genesis-4.
+> - **Allocation is not the old "17% premine" story.** The founder holds
+>   27,046,829,380 BLOCH = **27.04% of the cap** (pinned at 2704 bps by a
+>   compile-time assert on `FOUNDER_TOTAL_BLOCH`); the Foundation holds a
+>   further **29.00%** (VC 10 B, team 10 B, marketing 4 B, liquidity 5 B).
+> - **The live network is not open.** The fleet runs a point-to-point TCP full
+>   mesh with a fixed peer list, no discovery and no authentication, which is
+>   why a third party cannot yet join the network. Deposit and Delegate
+>   transactions are refused at every node's mempool
+>   (`crates/bloch-pos-node/src/engine.rs`), so there is no permissionless path
+>   to validating today.
+>
+> **§4's risk table is incomplete — do not read it as a complete risk list.**
+> It was written for a pre-launch proof-of-work project, and its top risks are
+> a leaked PAT, unaudited crypto, bus factor 1 and "known-broken PoW params".
+> It has **no entry for validator centralisation, for a Nakamoto coefficient of
+> 1, or for the 93.94% carryover concentration** — which is today the largest
+> risk to the chain. Stated here so the omission is not read as an absence:
+>
+> > The security question under Genesis-4 is not hashrate, it is concentration:
+> > all 64 validators are run by one entity, 93.94% of the carryover sits at a
+> > single address, and 56.05 B of the 57.15 B BLOCH issued at genesis is held
+> > by the founder and the Foundation. One operator can halt the chain and one
+> > holder can outvote every other.
+>
+> Risk #2's "unaudited crypto" entry stands unchanged and unsoftened: **no
+> external audit has been completed.**
 
 > **Approved by the founder 2026-07-09** — decisions **D1–D10 all accepted per the
 > recommendations**: D1 Postern Suite flagship (hygiene wedge); D2 run the Sage

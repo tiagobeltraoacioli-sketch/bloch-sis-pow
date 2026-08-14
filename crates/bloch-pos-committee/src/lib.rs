@@ -35,11 +35,26 @@
 //!
 //! ## Status
 //!
-//! **UNAUDITED. Not wired into the node.** This crate is not a member of the
-//! node workspace and is not a path-dependency of `bloch`, so the node's build
-//! and validation path are untouched — the same posture
-//! `crates/coherence-prover` takes. Activation, when it comes, is a
-//! height-gated flag day like `STATE_ROOT_ACTIVATION_HEIGHT`.
+//! **THIS IS THE LIVE CHAIN'S CONSENSUS.** `crates/bloch-pos-node` — the
+//! `bloch-pos` binary the Genesis-4 fleet runs — is a direct path-dependency
+//! of this crate, and both are members of the root workspace. Genesis-4 has
+//! been producing, attesting, justifying and finalizing blocks under these
+//! rules since 21:31:19 UTC on 2026-08-13, when Genesis-3 (proof of work)
+//! stopped permanently at height 39,918. There is no activation height and no
+//! flag day pending: the rules here are in force from slot 0.
+//!
+//! **UNAUDITED by any third party.** Nothing in here has been through an
+//! external security review. The tests in `tests/` and the in-module tests are
+//! the only evidence.
+//!
+//! **The live security question is concentration, not consensus math.** All 64
+//! Genesis-4 validators are operated by a single entity; 93.94% of the
+//! carryover sits at one address ([`tokenomics_v4::LARGEST_CARRYOVER_ADDRESS_BLOCH`]),
+//! and carried balances are stakeable, so if that balance stakes the Nakamoto
+//! coefficient is 1. One operator can halt the chain and one holder can
+//! outvote every other. [`genesis_cohort`] tapers a cap against exactly this,
+//! and reports [`genesis_cohort::CapStatus::Deferred`] while there is not yet
+//! enough independent stake for the rule to bind.
 //!
 //! ## The rule this crate is written to obey
 //!

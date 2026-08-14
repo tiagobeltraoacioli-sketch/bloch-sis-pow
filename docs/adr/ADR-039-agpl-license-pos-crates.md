@@ -3,7 +3,8 @@
 # ADR-039 — PoS crates licensed AGPL-3.0-or-later
 
 - **Status:** Accepted and applied (founder decision, 2026-08-11; commit
-  `e268838`)
+  `e268838`) — **in force.** The `bloch-pos` binary running Genesis-4 since
+  2026-08-13 is AGPL-3.0-or-later.
 - **Resolves:** `BLOCH-POS-NODE-INTEGRATION.md` §8.4 (the license blocker)
 - **Relates to:** `crates/bloch-crypto` (already AGPL-3.0-or-later),
   `crates/bloch-pos-committee`, `crates/bloch-pos-node`,

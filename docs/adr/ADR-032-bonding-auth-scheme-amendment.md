@@ -1,6 +1,8 @@
 # ADR-032 — Bonding Authorization Scheme: BLS-G2 → ML-DSA-65 Amendment
 
-**Status:** Accepted
+**Status:** **SUPERSEDED** — The direction it set — authorisation by ML-DSA-65 rather than BLS-G2 — is the direction Genesis-4 took and then went further: every consensus signature is **hybrid ML-DSA-65 ‖ Falcon-1024**, both halves ANDed. The specific `UnbondValidatorTx` / `WithdrawBondTx` types it amends do not exist on Genesis-4. The chain this ADR governs — Genesis-3, proof of work — stopped permanently at height **39,918** on 2026-08-13. The live chain is **Genesis-4, proof of stake** (30 s slots, 32-slot epochs, finality by epoch, hybrid ML-DSA-65 ‖ Falcon-1024, no mining). The decision, context and consequences below are **not** rewritten: this is a decision log and what was decided, when, is the record. Read it as history, not as guidance.
+
+*Original status line, retained:* **Status:** Accepted
 **Date:** 2026-05-02
 **Sprint:** 2.1.E (Day β)
 **Author:** BLOCH Founder

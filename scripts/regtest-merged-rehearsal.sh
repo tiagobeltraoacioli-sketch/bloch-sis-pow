@@ -1,4 +1,17 @@
 #!/usr/bin/env bash
+# ══════════════════════════════════════════════════════════════════════════════
+# HISTORICAL — GENESIS-3. This rehearses merged mining against the proof-of-work
+# chain that stopped permanently at height 39,918 on 2026-08-13. The live chain
+# is GENESIS-4, PROOF OF STAKE (30 s slots, 32-slot epochs, finality by epoch):
+# blocks come from a proposer schedule over staked validators, there is no
+# proof of work, no AuxPoW, and no Bitcoin parent chain anywhere in it. Kept
+# because Genesis-4's opening ledger is derived from Genesis-3. It is not what
+# runs, and running it teaches you nothing about the live network.
+#
+# Every reference below to "the live chain", "mainnet" or "production
+# difficulty" means the Genesis-3 mainnet as it stood before the halt.
+# ══════════════════════════════════════════════════════════════════════════════
+#
 # regtest-merged-rehearsal.sh — end-to-end MERGED-MINING (AuxPoW) rehearsal.
 #
 # Proves the whole BTC↔Bloch dual-mining loop OFF-MAINNET, on a throwaway
@@ -14,8 +27,11 @@
 #                                ▼
 #                        one SHA-256d hash secures BOTH
 #
-# WHY A REHEARSAL BUILD: merged mining is INERT on mainnet — the node rejects an
-# AuxPoW block below AUXPOW_ACTIVATION_HEIGHT (u64::MAX) fail-closed. The node
+# WHY A REHEARSAL BUILD: merged mining was INERT on the Genesis-3 mainnet at the
+# time this was written — the node rejects an AuxPoW block below
+# AUXPOW_ACTIVATION_HEIGHT fail-closed. (That gate was later set to 8500 —
+# crates/bloch-crypto/src/core/mod.rs:22, flag-day 2026-08-01 — so merged mining
+# did activate on Genesis-3, and stopped with it.) The node
 # MUST be built `--features auxpow-rehearsal`, which lowers that gate to 0 so a
 # LOCAL build accepts merged blocks. A mainnet artifact never sets that feature.
 # This script refuses to run against anything but a throwaway datadir.
@@ -23,7 +39,11 @@
 # HONEST CAVEAT (see legacy/MERGED-MINING.md): merged mining only secures Bloch
 # with the fraction of BTC hashrate that opts in, and lets a big BTC miner
 # attack at ~zero marginal cost — a bootstrap lever, not a security guarantee.
-# NEVER exercise this on the live chain; regtest only.
+# That was the Genesis-3 risk. Under Genesis-4 the security question is not
+# hashrate at all, it is concentration: all 64 validators are run by one entity,
+# 93.94% of the carryover sits at a single address, and 56.05 B of the 57.15 B
+# BLOCH issued at genesis is held by the founder and the Foundation.
+# Regtest only, and only against a Genesis-3 build.
 #
 # PREREQUISITES (on PATH):
 #   * cargo (builds the node + proxy from this checkout)

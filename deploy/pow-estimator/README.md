@@ -1,5 +1,12 @@
 # PoW hardness estimator
 
+> **Historical — Genesis-3.** This screens the parameters of the Module-SIS
+> lattice proof of work used by the chain that stopped permanently at height
+> 39,918 on 2026-08-13. The live chain is **Genesis-4, proof of stake** (30 s
+> slots, 32-slot epochs, finality by epoch) — it does no proof of work at all,
+> so no number produced here bears on the security of what runs today. Kept as
+> part of the Genesis-3 record.
+
 Turns the S1 analysis (`docs/specs/POW-HARDNESS.md`) into runnable numbers: a
 SageMath + lattice-estimator container that prints, for each PoW parameter
 candidate, the trivial-regime flag (`√m·β/q`) and `log2(attack cost)`.

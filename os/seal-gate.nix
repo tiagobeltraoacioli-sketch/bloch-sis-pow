@@ -19,7 +19,7 @@ rustPlatform.buildRustPackage {
 
   cargoLock = {
     lockFile = ../Cargo.lock;
-    # The workspace consumes the ownerless Bloch-SIS-PoW protocol as a git
+    # The workspace consumes the Bloch-SIS-PoW protocol as a git
     # dependency; pin its lockfile hash here on first `nix build` (the build
     # error prints the correct value):
     # outputHashes."bloch-crypto-0.1.0-genesis" = lib.fakeHash;

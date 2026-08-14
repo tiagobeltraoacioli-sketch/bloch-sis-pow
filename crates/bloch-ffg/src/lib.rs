@@ -1,5 +1,14 @@
 //! # bloch-ffg — static FFG committee + committee-governed activation (FOUNDATION)
 //!
+//! > **Genesis-3-era crate. Superseded, not used.** This was a 21-seat static
+//! > finality committee designed as an *overlay* on the proof-of-work base.
+//! > That base stopped permanently at height 39,918 on 2026-08-13. The live
+//! > chain is **Genesis-4, proof of stake**, where finality is not an overlay
+//! > at all: it is Casper-style FFG over a rotating epoch committee, in
+//! > `crates/bloch-pos-committee/src/finality.rs`, and nothing here is wired
+//! > into it. Kept buildable for audit. Read "the base PoW" below as
+//! > Genesis-3.
+//!
 //! Implements the **static finality committee** designed in the study (§4-bis) and
 //! the mechanism that makes it the **activation authority** for consensus upgrades
 //! such as the native eUTXO VM (§5-quater step 6): a feature turns on only when a
@@ -13,7 +22,8 @@
 //! - **Replacement only on exit:** a member who resigns / is long-offline / is
 //!   removed for fault opens a [`Vacancy`]; it is filled from a pre-vetted candidate
 //!   with a 14-of-remaining supermajority. If more than [`MAX_VACANCY`] seats are
-//!   vacant, finality **pauses** (the base PoW keeps running regardless).
+//!   vacant, finality **pauses** (the base PoW kept running regardless — this
+//!   was an overlay on Genesis-3, which has since stopped).
 //!
 //! > **Status: FOUNDATION. NOT wired into consensus.** Standalone + tests only.
 //! > Signature verification is a host callback ([`SigVerifier`]) so the real

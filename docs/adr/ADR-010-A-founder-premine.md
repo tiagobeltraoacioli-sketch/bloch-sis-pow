@@ -1,7 +1,9 @@
 # ADR-010-A: Founder Premine — 30-Year Locked Allocation
 
 **Sprint:** 2.2 (urgent — blocks genesis spec)
-**Status:** Proposed (draft for review)
+**Status:** **SUPERSEDED** — Superseded by **Tokenomics V4**. The founder's position under Genesis-4 is not the 17%/30-year premine decided here: it is a **10% (10,000,000,000 BLCH) new grant** under a 10-year cliff and 40-year linear vest (`FOUNDER_BLOCH`, `FOUNDER_CLIFF_SLOTS`, `FOUNDER_VESTING_SLOTS`), **plus** a carried-over Genesis-3 balance of 17,046,829,380 BLCH that is liquid and stakeable from slot 0 (ADR-037). Combined, `FOUNDER_TOTAL_BLOCH` = 27,046,829,380 — **27.04% of the 100 B cap, and 47.33% of the 57.15 B issued at genesis.** Anyone quoting this ADR's premine figures is quoting a superseded schedule for a chain that no longer runs. The chain this ADR governs — Genesis-3, proof of work — stopped permanently at height **39,918** on 2026-08-13. The live chain is **Genesis-4, proof of stake** (30 s slots, 32-slot epochs, finality by epoch, hybrid ML-DSA-65 ‖ Falcon-1024, no mining). The decision, context and consequences below are **not** rewritten: this is a decision log and what was decided, when, is the record. Read it as history, not as guidance.
+
+*Original status line, retained:* **Status:** Proposed (draft for review)
 **Date:** 2026-04-29
 **Author:** BLOCH Core
 **Related:** ADR-010 (Tokenomics and Emission Curve), ADR-012 (Validator/Oracle Pool — pending)

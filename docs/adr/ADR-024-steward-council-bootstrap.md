@@ -2,14 +2,23 @@
 
 | Field             | Value                                                              |
 | ----------------- | ------------------------------------------------------------------ |
-| **Status**        | Proposed                                                           |
+| **Status**        | **SUPERSEDED** (was: Proposed) — see the note directly below this table |
 | **Date**          | 2026-05-01                                                         |
 | **Authors**       | Founder (custodial)                                                |
 | **Reviewers**     | (TBD — US securities counsel, governance engineering team)         |
 | **Supersedes**    | None                                                               |
-| **Superseded by** | None                                                               |
+| **Superseded by** | Genesis-4 (proof of stake, live since 2026-08-13) — see note below |
 | **Related ADRs**  | ADR-011 (FFG BFT), ADR-018 (oracle network), ADR-022 (signature curve), ADR-023 (Foundation Genesis Model) |
 | **Reference doc** | `BLOCH-FGM-001 v1.0` §11                                            |
+
+
+> **Status note, 2026-08-14.** The Steward Council **does not exist**. Genesis-4 launched without it, and the ADRs it depends on (ADR-011 FFG, ADR-022 BLS) are themselves superseded by a proof-of-stake design with no FFG committee and no BLS. Nothing in this procedure has been executed.
+>
+> The decision, context and consequences below are **not** rewritten:
+> this is a decision log and what was decided, when, is the record.
+> Read it as history, not as guidance. Genesis-3 (proof of work) stopped
+> permanently at height **39,918** on 2026-08-13; the live chain is
+> **Genesis-4, proof of stake**.
 
 ---
 

@@ -1,9 +1,27 @@
-//! BLOCH Tokenomics V2 — Genesis-locked Constants and Helpers
+//! BLOCH Tokenomics V2 — Genesis-3 constants and helpers
+//!
+//! > **Historical — Genesis-3. SUPERSEDED.** These were the tokenomics of the
+//! > proof-of-work chain that stopped permanently at height 39,918 on
+//! > 2026-08-13: a 21 B nominal supply, a 17% (3.57 B) founder premine, and a
+//! > halving block subsidy paid to miners. **None of it is in force.** The
+//! > live chain is **Genesis-4, proof of stake**, whose tokenomics are
+//! > `crates/bloch-pos-committee/src/tokenomics_v4.rs`: a **100 B hard cap**,
+//! > 57,146,400,000 BLOCH issued at slot 0 (18,146,400,000 of it the carried
+//! > Genesis-3 ledger, scaled ×100/21), and 42,853,600,000 emitted to
+//! > validators over 40 years. There is no block subsidy and no halving.
+//! > Kept because Genesis-4's opening ledger is derived from the chain these
+//! > rules ran. **It is not what runs.**
+//! >
+//! > In particular: the 3.57 B "premine" below never reached Genesis-4 as a
+//! > premine. The founder's Genesis-3 balance crossed as ordinary liquid
+//! > carryover like everyone else's, and a separate 10 B grant was made on top
+//! > (founder decision, 2026-08-11) — see `tokenomics_v4::FOUNDER_TOTAL_BLOCH`,
+//! > 27.04% of the cap.
 //!
 //! Per `docs/specs/TOKENOMICS_V2.md`. Activated by ADR-028.
 //!
-//! These are CONSENSUS RULES. Mutation requires a hard fork. Genesis-locked
-//! values, frozen by the pre-commitment doctrine
+//! These WERE CONSENSUS RULES on Genesis-3. Mutation required a hard fork.
+//! Genesis-locked values, frozen by the pre-commitment doctrine
 //! (`docs/ENSAIO_2_PRE_COMMITMENT_DOCTRINE.md`).
 //!
 //! ## Halving semantics — important

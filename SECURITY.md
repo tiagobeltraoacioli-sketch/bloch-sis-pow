@@ -26,10 +26,30 @@ re-derive it. Report a Genesis-3 finding if it changes what that carried
 ledger should have been; a finding that only affects mining or block
 production on a chain nobody is producing on has no live impact.
 
-The live network is **unaudited**, and stake is heavily concentrated: the
-founder holds roughly 94% of the carried-over balance and it is stakeable, so
-a naive Nakamoto coefficient is 1. The genesis validator cohort was allocated
-by the founder and sits on five servers. Running a live mainnet is a
+**The security question under Genesis-4 is not hashrate, it is
+concentration.** Proof of work's caveat here used to be a low hashrate and a
+51% attack; that caveat is retired with the chain it applied to, and this is
+what replaces it:
+
+- **All 64 Genesis-4 validators are operated by a single entity**, on five
+  servers. There is no independent validator. One operator can halt the chain.
+- **93.94% of the carryover sits at one address** — 17,046,829,380 of
+  18,146,400,000 BLOCH (`LARGEST_CARRYOVER_ADDRESS_BLOCH` in
+  `crates/bloch-pos-committee/src/tokenomics_v4.rs`). Carried balances are
+  stakeable, so if that balance stakes, the **Nakamoto coefficient is 1**.
+- The founder holds **27.04%** of the 100 B cap at genesis
+  (`FOUNDER_TOTAL_BLOCH`, pinned at 2704 bps) and the Foundation a further
+  **29.00%** (`FOUNDATION_HELD_BLOCH`) — together **56,046,829,380 of the
+  57,146,400,000 BLOCH issued at slot 0**, leaving 1,099,570,620 BLOCH
+  (1.92%) in third-party hands.
+- **A third party cannot yet join.** The live transport is a point-to-point
+  TCP full mesh with a fixed peer list, no discovery and no authentication
+  (`crates/bloch-pos-node/src/net.rs`, `--transport devnet`, still the
+  default), and `Deposit`/`Delegate` are refused at every node's mempool
+  because bonding is not yet funded from the UTXO set. There is no
+  permissionless path to becoming a validator today.
+
+The live network is also **unaudited**. Running a live mainnet is a
 designation, not a security claim, and no security property is claimed.
 **No external security audit has been contracted to date**; if any other page
 or document suggests otherwise, this statement is the accurate one. The
@@ -79,10 +99,11 @@ will not pursue reporters acting in good faith.
 
 ## Out of scope
 
-- The **known** stake-concentration exposure — the founder holding roughly 94%
-  of a stakeable supply, and having allocated the genesis validator cohort, is
-  a documented, disclosed gap, not a bug (a concrete exploit beyond it — e.g.
-  a way to justify or finalise without an honest two-thirds, or to attest
+- The **known** concentration exposure disclosed under **Status** above — one
+  entity operating all 64 validators, 93.94% of the carryover at one
+  stakeable address, and the closed transport and closed bonding path — is a
+  documented, disclosed gap, not a bug (a concrete exploit beyond it — e.g. a
+  way to justify or finalise without an honest two-thirds, or to attest
   without being in the committee — is in scope).
 - The retired Genesis-3 chain's low-hashrate exposure. It was real while the
   chain was live and it is now moot: nothing mines it, and the canonical

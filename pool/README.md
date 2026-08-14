@@ -20,9 +20,18 @@ the procedural-custody workflow.
 This section is a hard project ethos, not marketing copy. Do not soften
 it when forking.
 
-* **Bloch is mainnet beta and UNAUDITED.** A security audit is
-  contracted but has not happened yet. The network is young and
-  51%-attackable. Treat everything here accordingly.
+* **Bloch is UNAUDITED.** A security audit is contracted but has not
+  happened yet. Treat everything here accordingly.
+* **The 51%-attackable rail below was Genesis-3's, and it is not the
+  live risk.** Under Genesis-4 the security question is not hashrate,
+  it is concentration: **all 64 validators are run by one entity**,
+  **93.94% of the carryover sits at a single address**, and **56.05 B
+  of the 57.15 B BLOCH issued at genesis is held by the founder and
+  the Foundation**. One operator can halt the chain and one holder can
+  outvote every other. A third party cannot yet join: the transport is
+  a point-to-point TCP full mesh with a fixed peer list, no discovery
+  and no authentication, and `Deposit`/`Delegate` are refused at every
+  node's mempool.
 * **The coin is not a security and not an asset.** There is no token
   sale and no listing. This pool **never custodies or sells the
   token** — it only *accounts* shares and lets miners point work at a

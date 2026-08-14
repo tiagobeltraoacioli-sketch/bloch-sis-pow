@@ -1,4 +1,14 @@
-# Fleet recovery — provenance of what is actually running
+# Fleet recovery — provenance of what was running on the Genesis-3 fleet
+
+> **Historical — Genesis-3, captured 2026-08-11.** The three boxes surveyed
+> below were proof-of-work nodes on the chain that stopped permanently at height
+> 39,918 on 2026-08-13. This is not an inventory of the live fleet. The live
+> chain is **Genesis-4, proof of stake** (30 s slots, 32-slot epochs, finality
+> by epoch); it runs `bloch-pos`, and the "one binary, commit hash compiled into
+> `--version`" fix this survey called for is what
+> `scripts/pos-release-integrity.sh` and `deploy/RELEASE-INTEGRITY.md` now
+> enforce for it. Kept because it is the provenance record of the ledger
+> Genesis-4 opened from — and because the lesson is the reason that gate exists.
 
 > **Redacted for publication.** Host addresses by role, SSH key filenames, Cloudflare
 > account/zone/tunnel identifiers, per-box free disk and RAM, and firewall rule listings

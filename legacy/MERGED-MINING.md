@@ -1,6 +1,16 @@
 # Merged Mining (AuxPoW) — dual-mine Bloch with Bitcoin
 
-Bloch is SHA-256d, exactly like Bitcoin, so **one hash can secure both chains at
+> **Historical — Genesis-3.** This describes the proof-of-work chain that
+> stopped permanently at height 39,918 on 2026-08-13. Merged mining activated on
+> it at height 8,500 (`AUXPOW_ACTIVATION_HEIGHT`,
+> `crates/bloch-crypto/src/core/mod.rs:22`) and ended with the chain. The live
+> chain is **Genesis-4, proof of stake** (30 s slots, 32-slot epochs, finality
+> by epoch): blocks come from a proposer schedule over staked validators, there
+> is no SHA-256d proof of work, no Bitcoin parent chain and nothing to
+> merge-mine. Kept because Genesis-4's opening ledger is derived from Genesis-3.
+> It is not what runs.
+
+Bloch was SHA-256d, exactly like Bitcoin, so **one hash can secure both chains at
 once**. A miner hashing a Bitcoin block whose coinbase commits to a Bloch block
 is — with the *same* hashes — also mining Bloch: they earn **BTC + BLCH** from a
 single effort. This is *merged mining* (AuxPoW), the strongest form of dual

@@ -1,5 +1,21 @@
 # Reproducible build (Bloch-SIS-Linux L1)
 
+> **Historical — Genesis-3.** The image built and hashed here is the root
+> `Dockerfile`, i.e. `bloch`, the proof-of-work node for the chain that stopped
+> permanently at height 39,918 on 2026-08-13. Nothing here covers the live
+> chain: **Genesis-4, proof of stake** ships `bloch-pos` as a signed release
+> tarball, and its build determinism is measured by
+> `scripts/pos-release-integrity.sh` and documented in
+> `deploy/RELEASE-INTEGRITY.md` — that is the reproducibility claim of record
+> for what runs today. Kept as part of the Genesis-3 record.
+>
+> `build.sh` passes the repo root as the build context with no `-f`, so it
+> builds the root `Dockerfile` — which, as that file's own header states, does
+> not currently build (its `COPY carryover.tsv` wants a file the repository
+> stores compressed). The reference digest below was measured before that
+> regression; it has not been re-measured since, so treat it as a record, not
+> as a digest you can reproduce today.
+
 Goal: **anyone can rebuild the node image from public source and get the same
 content digest** — so an operator (or a TEE attestation, L3) can prove the
 running node is exactly the audited code, with nothing injected.

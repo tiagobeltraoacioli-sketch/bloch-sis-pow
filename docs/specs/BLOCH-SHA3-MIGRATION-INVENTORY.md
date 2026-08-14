@@ -1,12 +1,26 @@
 # BLOCH SHA-3 Migration Inventory — SHA-2 usage census
 
+> **Historical — Genesis-3.** This describes the proof-of-work chain that
+> stopped permanently at height 39,918 on 2026-08-13. The live chain is
+> **Genesis-4, proof of stake** (30 s slots, 32-slot epochs, finality by
+> epoch). Kept because Genesis-4's opening ledger is derived from it. It is
+> not what runs.
+>
+> **The risk disclosure that goes with it.** Where this document warns about
+> hashrate, 51% cost or proof-of-work depth, that warning was addressed to a
+> reader of the Genesis-3 network and no longer applies. The live risk is
+> **concentration**: all 64 Genesis-4 validators are operated by a single
+> entity, 93.94% of the carried ledger sits at one address and is stakeable,
+> and 56,046,829,380 of the 57,146,400,000 BLOCH issued at genesis is held by
+> the founder and the Foundation. One operator can halt the chain.
+
 > **Verificado em 2026-08-11.** Este documento nao depende de nenhuma das
 > premissas revistas naquele dia (taint, comite amostrado, supply de 100 bi,
 > fase hibrida). As conclusoes seguem valendo como escritas.
 
 
 **Owner:** A5 (SHA-3 migration) · **Branch:** `feat/pos-sha3-lattice` · **Date:** 2026-08-11
-**Companion to:** `BLOCH-POS-SHA3-LATTICE-MIGRATION.md` §6.1 (domain separation), §6.6 (Coherence is already SHA-3 native) · `BLOCH-TOKENOMICS-V4.md` §3.2 (chain halts at height 80,000)
+**Companion to:** `BLOCH-POS-SHA3-LATTICE-MIGRATION.md` §6.1 (domain separation), §6.6 (Coherence is already SHA-3 native) · `BLOCH-TOKENOMICS-V4.md` §3.2 — **note:** the chain halted at height **39,918** on 2026-08-13. Every "80,000" in this census is the terminal height that was planned when it was written and was never reached; the PoW paths it marks HISTORICAL are dead as of 39,918, which is earlier, not later.
 
 ---
 

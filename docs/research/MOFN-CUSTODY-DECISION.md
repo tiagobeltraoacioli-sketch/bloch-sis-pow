@@ -1,5 +1,30 @@
 # Decision memo — M-of-N custody for Bloch-SIS-PoW
 
+> **Historical — written against the proof-of-work chain.** This memo is dated
+> **2026-07-10** and its §2 ("What Bloch's code actually supports **today**")
+> describes **Genesis-3**, the proof-of-work chain, which stopped permanently
+> at height **39,918 on 2026-08-13**. The live chain is **Genesis-4, proof of
+> stake** (30 s slots, 32-slot epochs, finality by epoch), whose transaction
+> set, script model and node are different code
+> (`crates/bloch-pos-committee`, `crates/bloch-pos-node`). **Do not read §2 as
+> a description of what the live chain supports** — in particular, the
+> Genesis-3 `script_sig` layout, the 10,000-byte cap, the `parse_script_sig`
+> path and the `src/main.rs` validation sites it cites are Genesis-3 code, and
+> the reference mining pool it plans for no longer has a chain to serve.
+>
+> What survives the transition intact, and is why the memo is kept: the
+> **cryptographic** argument. Bloch still requires **both** ML-DSA-65 and
+> Falcon-1024 to verify on every signature, so threshold/MPC signing remains
+> blocked on threshold Falcon; the seed-derived keygen that makes Shamir
+> sharing of a 32-byte seed the right shape is unchanged; and the conclusion —
+> that production PQ threshold signing does not exist in audited form and
+> anyone selling it as settled is overclaiming — stands. The **implementation
+> path** (a new output type, a raised script_sig cap, GIP-008) would have to be
+> re-derived against the Genesis-4 transaction set, not against the code cited
+> below. Custody of the founder and Foundation genesis keys is a separate,
+> currently unresolved question — see `docs/specs/BLOCH-GENESIS-KEYS.md`
+> (DRAFT) and `docs/audit/CERTIK-PRE-AUDIT-DOSSIER.md` §4 item 3.
+
 **To:** Founder
 **From:** Cryptography-architecture advisor
 **Date:** 2026-07-10

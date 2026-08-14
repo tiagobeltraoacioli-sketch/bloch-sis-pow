@@ -1,13 +1,19 @@
 # Bloch-SIS Protocol — Sprint History & Development Effort Log (Era 1: GroundState)
 
-> **Genesis-3-era document — sealed 2026-08-12.** Bloch's proof-of-work
-> chain halts by consensus rule at the terminal height (50,000) and
-> Genesis-4 relaunches as proof of stake; the ownerless thesis was
-> retracted (`docs/adr/ADR-036-retract-ownerless-adopt-foundation.md`).
+> **Historical — Era 1 and Genesis-3.** This is an effort log. The
+> proof-of-work chain it documents stopped permanently at height **39,918**
+> on 2026-08-13. The live chain is **Genesis-4, proof of stake** (30 s slots,
+> 32-slot epochs, finality by epoch), live since 21:31:19 UTC that day. Kept
+> because Genesis-4's opening ledger is derived from Genesis-3, and because
+> an effort log is a record. It is not what runs. The ownerless thesis was
+> also retracted (`docs/adr/ADR-036-retract-ownerless-adopt-foundation.md`).
 >
 > Parts I–III are an Era-1 effort record and stand as history. Part IV
-> (remaining sprints) and Part VIII (the Stratum V2 sprint series) plan mining
-> work that will not happen.
+> (remaining sprints) and Part VIII (the Stratum V2 sprint series) plan
+> mining work that will not happen. Nothing in this file — hashrate figures,
+> difficulty regimes, block times, supply allocations — describes the live
+> network; for that, read [`README.md`](./README.md) and
+> [`SECURITY.md`](./SECURITY.md).
 
 **Repository (current):** `gitlab.com/Entanglementlayer/bloch-layer`  
 **Repository (predecessor, Era 1):** `github.com/Groundstate100/groundstate` (suspended)

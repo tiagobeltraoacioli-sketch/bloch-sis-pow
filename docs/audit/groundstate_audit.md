@@ -1,5 +1,23 @@
 # ERA 1 — Pre-rebrand Code Audit (GroundState v0.5.14-sprintr)
 
+> **Historical audit — not the live network.** This is an audit of a
+> predecessor codebase. The live chain is **Genesis-4, proof of stake**
+> (30 s slots, 32-slot epochs, finality by epoch), live since 21:31:19 UTC on
+> **2026-08-13**; the proof-of-work chain that preceded it, **Genesis-3**,
+> stopped permanently at height **39,918** that same day. **No finding,
+> remediation status or "current" claim below applies to the code that runs
+> today**, and the proof-of-stake consensus crate and node have **never been
+> audited by a third party**.
+>
+> The live chain's risk disclosure, stated here so this document is not read as
+> carrying an older one: **the security question under Genesis-4 is not
+> hashrate, it is concentration. All 64 validators are run by one entity,
+> 93.94% of the carryover sits at a single address, and 56.05 B of the 57.15 B
+> BLOCH issued at genesis is held by the founder and the Foundation. One
+> operator can halt the chain and one holder can outvote every other.**
+>
+> Preserved as the record. Nothing below is rewritten.
+
 > **Note (April 2026 rebrand).** This document is the **original
 > private code audit** of the GroundState codebase, produced on
 > **2026-04-20** against commit `322fbaf` (then on branch `main`

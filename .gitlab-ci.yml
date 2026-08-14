@@ -90,6 +90,18 @@ consensus-tests:
 # unit tests. NOT the whole workspace: the node pulls in C FFI (PQClean, rocksdb,
 # blst) that Miri cannot execute, so Miri is scoped to the FFI-free crates/tests.
 # `cargo miri setup` needs the rust-src component (network); mark non-blocking.
+#
+# SCOPE, stated rather than hidden — the job name overstates it. `bloch-crypto`
+# IS shared with Genesis-4 (it carries the hybrid ML-DSA-65 ‖ Falcon-1024
+# signature path), but the `tokenomics` filter selects only
+# `core/tokenomics_v2.rs` — the V2 emission of the chain that stopped at height
+# 39,918. Genesis-4's emission is `tokenomics_v4` in bloch-pos-committee, which
+# is not run here, so no Genesis-4 consensus code goes under Miri in this job.
+# bloch-pos-committee is the better target — pure Rust, no FFI, and it is the
+# live consensus — but its suite walks 8,192-step SHAKE-256 reveal chains and
+# 256-deep sparse Merkle trees, which under the Miri interpreter is hours, not
+# minutes. Adding it without first carving out a bounded subset would give a job
+# that always times out, which is worse than an honest gap. It is a gap.
 miri-consensus:
   stage: test
   allow_failure: true
@@ -134,8 +146,10 @@ falcon-clean-guard:
 # BLOCKING: the published Genesis-3 release WAS the broken binary (f819e87f,
 # an abandoned branch) while the fixes lived only on the boxes — fresh nodes
 # froze at 10802 and nobody noticed the divergence until they did. This job
-# proves, on every pipeline: (1) both PoS workspaces resolve with --locked and
-# the committed lockfiles do not drift; (2) two clean builds of bloch-pos at
+# proves, on every pipeline: (1) the workspace resolves with --locked and the
+# committed lockfile does not drift — see the scope caveat in the script's §1,
+# which checks the ROOT lockfile twice rather than two lockfiles, now that both
+# PoS crates are root workspace members; (2) two clean builds of bloch-pos at
 # the same commit are bit-identical (same-path determinism — the path-scoped
 # caveat and the canonical /build rule are deploy/RELEASE-INTEGRITY.md §3);
 # (3) `bloch-pos --version` reports the exact commit being built, so a fleet
@@ -219,6 +233,20 @@ cargo-geiger:
 # OSS-Fuzz — see fuzz/oss-fuzz/). Needs the nightly toolchain + cargo-fuzz +
 # libFuzzer; the guard skips soft if nightly is unavailable on the runner.
 # Local: `cargo +nightly fuzz run <target> -- -max_total_time=30`.
+#
+# GENESIS-3 SCOPE. `fuzz/Cargo.toml` depends only on `bloch`, `bloch-sis-pow`
+# and `coherence-core`; there is no `bloch-pos-*` dependency and no target for
+# the Genesis-4 parser or P2P surfaces in bloch-pos-node. That is a real gap in
+# coverage of the live chain, and writing the harness is the work that closes
+# it — not relabelling these.
+#
+# AND IT DOES NOT CURRENTLY RUN AT ALL. `fuzz/Cargo.toml:21` is
+# `bloch = { path = ".." }`, but the repo root became a VIRTUAL manifest when
+# the PoW node moved to legacy/genesis3-node, so cargo cannot resolve the
+# harness: "found a virtual manifest ... instead of a package manifest"
+# (reproduce with `cd fuzz && cargo metadata`). The job is allow_failure, so
+# this has been failing silently. Fixing it is a one-line path change plus a
+# real run — not a comment — and it is left unfixed here rather than claimed.
 fuzz-smoke:
   stage: test
   before_script: []
@@ -253,17 +281,38 @@ secret-scan:
   allow_failure: true
 
 # Build + full test suite (the gate).
+#
+# SCOPE: this is the ROOT workspace, and since Genesis-4 became the trunk that
+# workspace INCLUDES the live chain — `crates/bloch-pos-committee` and
+# `crates/bloch-pos-node` are ordinary members (root `Cargo.toml:15-16`), so
+# `cargo test --workspace` runs the Genesis-4 consensus suites here as well as
+# the retired Genesis-3 tree at legacy/genesis3-node.
+#
+# That is deliberate and it is load-bearing. Both PoS crates used to carry
+# their own `[workspace]` table, which made them invisible to a root
+# `--workspace` run: the first command a reviewer types silently skipped the
+# entire proof-of-stake consensus. The root manifest now says so in a standing
+# note and forbids re-adding a private workspace. Do not "scope" this job back
+# to the retired tree.
+#
+# `consensus-tests` above still runs the two live crates FIRST and on their
+# own, so a consensus regression fails early and legibly instead of being found
+# 40 minutes into a full workspace build.
 build-and-test:
   stage: test
   script:
     - cargo build --all-targets
     - cargo test --workspace
-  # Memory-hard (Argon2) wallet tests + a testnet Module-SIS mining test.
+  # Memory-hard (Argon2) wallet tests + a Genesis-3 testnet Module-SIS mining
+  # test. Nothing on the live chain mines; that part exercises retired code.
   timeout: 60m
 
-# Lean mobile-facing build — the crypto/address/tx/wallet subset must compile
-# WITHOUT the node's heavy deps (rocksdb/libp2p, gated by the `node` feature), so
-# the Android/iOS cross-compile stays possible.
+# GENESIS-3 SCOPE. Lean mobile-facing build of the retired chain's crate — the
+# crypto/address/tx/wallet subset must compile WITHOUT the node's heavy deps
+# (rocksdb/libp2p, gated by the `node` feature), so the Android/iOS
+# cross-compile stays possible. `bloch` is the Genesis-3 node package at
+# legacy/genesis3-node/; the Genesis-4 binary is `bloch-pos` and has no
+# equivalent lean-build job.
 lean-build:
   stage: test
   script:
@@ -359,13 +408,19 @@ flake-lock-drift:
 # but NOT sufficient for the word "reproducible" — that is earned only by the
 # two-builder bit-for-bit compare (repro-manifest.sh + repro-compare.sh across
 # two independent hosts). Flip allow_failure -> false once that is green.
+#
+# GENESIS-3 SCOPE. Both outputs below come from ./os/package.nix, which builds
+# `bloch` — the retired proof-of-work node. `bloch-pos`, the binary the live
+# fleet runs, is not packaged for Nix at all (see the banner in flake.nix), so
+# no reproducibility claim made by this job covers the live chain. The live
+# chain's build determinism is measured by `pos-release-integrity` instead.
 repro:
   stage: nix
   tags:
     - bloch-nix-aarch64
   before_script: []
   script:
-    # (A) the node/wallet crate — native aarch64, highest-risk, cheapest.
+    # (A) the Genesis-3 node/wallet crate — native aarch64, highest-risk, cheapest.
     - nix build .#packages.aarch64-linux.bloch --rebuild --check --keep-failed -L
     # (B) the aarch64-native sealed image — repro-checked without emulation.
     - nix build .#packages.aarch64-linux.attested-image --rebuild --check --keep-failed -L
@@ -378,12 +433,24 @@ repro:
   allow_failure: true
   timeout: 120m
 
-# mainnet-guard (PLACEHOLDER — TODO, gated on Dev-A's `mainnet` feature landing).
-# Once Dev-A's `cargo test --features mainnet` guard is merged (the test that
-# refuses to build/run mainnet while security preconditions are unmet), enable
-# this job by removing the `when: never` rule and the guard below. Until then it
-# is inert so the pipeline neither runs nor fails on a feature that does not yet
-# exist.
+# mainnet-guard — STILL A NO-OP. `rules: when: never` and an `echo` for a
+# script, so this job has never run and gates nothing.
+#
+# The TODO below is stale in both directions, so state it plainly:
+#
+#   * The `mainnet` feature DOES now exist — `crates/bloch-crypto/Cargo.toml:42`
+#     (an empty marker feature) — and so does the guard it enables,
+#     `mainnet_release_guard::canonical_k_activation_height_is_set_for_mainnet`
+#     (`crates/bloch-crypto/src/core/mod.rs:3155-3169`). Nobody re-enabled this
+#     job when they landed, so nothing runs it in CI. Run it by hand with:
+#       cargo test -p bloch-crypto --features mainnet canonical_k_activation_height_is_set_for_mainnet
+#   * What it guards is a GENESIS-3 precondition (CANONICAL_K_ACTIVATION_HEIGHT
+#     is not still the placeholder). It has nothing to say about Genesis-4.
+#
+# Both mainnets shipped without this job ever running: Genesis-3 mainnet ran to
+# its halt at height 39,918, and Genesis-4 mainnet has been live under proof of
+# stake since 2026-08-13. Do not read a job named `mainnet-guard` as evidence
+# that a mainnet build is gated on anything.
 mainnet-guard:
   stage: check
   script:

@@ -1,7 +1,9 @@
 # ADR-005: Committee Era, Selection Function, and Rotation Criteria
 
 **Sprint:** 2.1.C / 2.1.D
-**Status:** Proposed (revision 1 — 6 corrections applied, ready for commit pre-2026-05-15)
+**Status:** **SUPERSEDED** — Committee eras, operator UIDs and the hashrate-based selection function do not exist under Genesis-4. Rotation is per-epoch partition of the active stake set. The chain this ADR governs — Genesis-3, proof of work — stopped permanently at height **39,918** on 2026-08-13. The live chain is **Genesis-4, proof of stake** (30 s slots, 32-slot epochs, finality by epoch, hybrid ML-DSA-65 ‖ Falcon-1024, no mining). The decision, context and consequences below are **not** rewritten: this is a decision log and what was decided, when, is the record. Read it as history, not as guidance.
+
+*Original status line, retained:* **Status:** Proposed (revision 1 — 6 corrections applied, ready for commit pre-2026-05-15)
 **Date:** 2026-04-29 (rev1 same day)
 **Author:** BLOCH Core
 **Related:** ADR-001 (FFG epoch=6, 21-of-21, supermajority 14), ADR-002 (PoBRS — *requires amendment*), ADR-003 (Refuse <21 — pre-condition for §4.4), ADR-004 (CommitteeRegistry enforce), ADR-009 (open — Emergency Reconfigure, see §4.5)

@@ -6,6 +6,12 @@
 Document:   BLOCH-POS-GAPS
 Status:     INVENTORY — findings, not fixes; each entry names an owner class
 Created:    2026-08-11
+Revised:    2026-08-14 — re-swept against the shipped node. A gap list is the
+            fastest-staling document in a repository, and this one was written
+            two days before Genesis-4 launched. Closed entries are marked
+            CLOSED with the code that closed them and are NOT deleted: an
+            auditor reading the 2026-08-11 sweep needs to see what became of
+            each finding.
 Owner:      PMO
 Method:     sweep of docs/specs/ and crates/bloch-pos-committee at the head of
             integration/pos-modules (post-f384292); file:line cited where code
@@ -21,11 +27,25 @@ nor implemented**. A fourth section lists defects in implemented code —
 things that exist and are wrong or divergent, which is a different kind of
 missing.
 
-The one-line summary, so nobody mistakes the state of the project: **the
-pure consensus crate is substantially built and tested; the node is a
-134-line skeleton; every I/O-shaped spec has zero corresponding code; and
-the two validation stacks inside the pure crate do not agree with each
-other.**
+> **The 2026-08-11 summary, and what happened to it.** This document opened:
+> *"the pure consensus crate is substantially built and tested; the node is a
+> 134-line skeleton; every I/O-shaped spec has zero corresponding code; and the
+> two validation stacks inside the pure crate do not agree with each other."*
+>
+> **Three of those four are no longer true.** Genesis-4 went live under proof
+> of stake at 21:31:19 UTC on 2026-08-13 and the node that runs it is
+> `crates/bloch-pos-node` — nine modules, ~8,000 lines: `engine`, `genesis`,
+> `store`, `net`, `p2p`, `rpc`, `keys`, `ws_boot`, `codec`. The second
+> validation stack was deleted on 2026-08-12 (`derive.rs:19-24`), leaving
+> `transition::apply_block` as the only validator.
+>
+> **The current one-line summary:** the chain is live and finalizing with real
+> hybrid signatures; the node persists by append-only block log and not
+> RocksDB; the transport the fleet actually runs is a fixed-peer TCP mesh with
+> no discovery and no authentication, so **no third party can join**; and
+> `Deposit`/`Delegate` are refused at every mempool, so **no third party can
+> become a validator**. All 64 validators are operated by one entity. The gaps
+> that remain are listed below and they are not cosmetic.
 
 ---
 
@@ -47,16 +67,16 @@ own claims.
 | `finality.rs` | Casper FFG: 2/3 justification without division, finalization, inactivity-leak arithmetic, `from_history` | 17 inline |
 | `state_root.rs` | fixed-depth SHA3-256 SMT, `build_state_tree`/`state_root`/`verify_inclusion`, manual serialization | 11 inline |
 | `header.rs` | `BlockHeaderV4` (fixed-width), `BlockId` single-constructor discipline + the `single_derivation_path` source-scanning test | 10 inline |
-| `derive.rs` + `produce.rs` | one block validation/production stack: `ParentState`/`ChainState`, `validate_block`, envelope assembly, single-use reveal enforcement (`ProducerRandao`) | 9 inline (produce) |
-| `transition.rs` | the other validation stack plus the state transition: `CommittedState`, `apply_block`, `process_epoch`, deposit/delegation queues, fee accounting, emission | 17 inline |
+| `derive.rs` + `produce.rs` | the **shared derivation functions** producer and validator both call, plus envelope assembly and single-use reveal enforcement (`ProducerRandao`). `derive::validate_block` was deleted 2026-08-12 — see GAP-2 | 9 inline (produce) |
+| `transition.rs` | **the** validation stack and the state transition: `CommittedState`, `apply_block`, `process_epoch`, deposit/delegation queues, fee accounting, emission | 17 inline |
 | `staking.rs` | deposits with proof-of-possession under both hybrid halves, exits, withdrawal delay, activation queue, §4.1 eligibility | 18 inline |
 | `delegation.rs` | delegation registry, warm-up/cool-down budget (`WARMUP_RATE_BPS`, `MIN_CHURN_SAT` — ADR-038), fixpoint per-validator cap, pro-rata slash, concentration metrics | via `tests/` |
 | `rewards.rs` | the Solana reward model: fee split with burn, pro-rata issuance with commission | via `tests/` |
-| `slashing.rs` | evidence validation (re-verifies both signatures), correlated amplification, whistleblower, anti-replay | 13 inline — **but orphaned, see GAP-3** |
+| `slashing.rs` | evidence validation (re-verifies both signatures), correlated amplification, whistleblower, anti-replay | 13 inline — wired into `transition.rs` since GAP-3 closed; no node-side pipeline feeds it |
 | `genesis_cohort.rs` | declining genesis-cohort cap with `Deferred` escape, wired into `transition.rs` | via `tests/committee.rs` |
 | `gossip.rs` | the *application* half of attestation gossip: accept/ignore/hold/reject verbs, 2-epoch window, equivocation cap, evidence capture — pure, no sockets | 15 inline |
 | `tokenomics_v4.rs` | V4 constants, vesting curves, three emission curves, compile-time supply invariants | via `tests/properties.rs` |
-| `interfaces.rs` | the seven frozen traits + `StateRoots` — zero implementations, by design | — |
+| `interfaces.rs` | the frozen traits + `StateRoots` (fourteen components since 2026-08-12, GAP-1) — zero implementations in this crate, by design | — |
 | `sample.rs`, `params.rs`, `lib.rs` | legacy sampled sortition (kept in-tree), constants, re-exports | — |
 
 Founder decisions already applied in code: churn re-rate (ADR-038,
@@ -64,17 +84,37 @@ Founder decisions already applied in code: churn re-rate (ADR-038,
 single-set liquid carryover (`tokenomics_v4.rs`, `CARRYOVER_TOTAL_BLOCH`
 doc).
 
-Also implemented: `crates/bloch-pos-node` — but only as the planned
+~~Also implemented: `crates/bloch-pos-node` — but only as the planned
 skeleton: one file, `src/main.rs` (~134 lines, version `0.0.1-skeleton`),
 parameter self-check, prints, exits. No consensus loop, no networking, no
-storage. That is exactly what `BLOCH-POS-NODE-INTEGRATION.md` §9 promised
-and nothing more.
+storage.~~
+
+**CLOSED, 2026-08-13.** `crates/bloch-pos-node` is the binary the live chain
+runs. Nine modules:
+
+| Module | What exists |
+|---|---|
+| `engine.rs` | the single-writer consensus loop: slot timer, proposal, attestation, fork choice, epoch processing, mempool admission |
+| `genesis.rs` | genesis manifest format, loader, deterministic block-0 + `CommittedState` synthesis, carryover ingest |
+| `store.rs` | persistence — an **append-only block log plus a `meta` marker**, not the §3.3 RocksDB column families. Restart is replay through the same `Transition`; boot is O(chain length). Stated here because §3 below promised RocksDB |
+| `net.rs` | the devnet TCP full mesh — **the default and what the live fleet runs** |
+| `p2p.rs` | libp2p + gossipsub behind `--transport libp2p`, carrying the 2026-08-07 mesh fixes; **not the fleet's transport today** |
+| `rpc.rs` | JSON-RPC 2.0 over HTTP/1.1, `std`-only, ~11 methods incl. `sendrawtransaction`; no auth, no rate limit, binds `127.0.0.1` by default |
+| `keys.rs` | keystore + the real ML-DSA-65 ‖ Falcon-1024 verifier/signer boundary |
+| `ws_boot.rs` | the weak-subjectivity **boot gate** (not checkpoint state download) |
+| `codec.rs` | envelope wire encoding shared by store and transports |
+
+**What the node still is not**, per `main.rs:23-35` — quoted rather than
+paraphrased because it is the maintained list: no RocksDB store, no
+post-quantum transport handshake (p2p uses Noise; consensus signatures are
+hybrid PQ regardless), no peer persistence or peer exchange, no
+slashing-evidence pipeline, and no checkpoint-sync state download.
 
 ---
 
 ## 2. Implemented, but defective or divergent (the found gaps)
 
-### GAP-1 — the committed-state list is incomplete, and the spec change is pending (known; DEV-1's registration)
+### GAP-1 — the committed-state list is incomplete — **CLOSED**
 
 `transition.rs:69-80` ("What is honestly not committed yet"): the following
 consensus-relevant fields of `CommittedState` are **not bound by the
@@ -83,6 +123,15 @@ positions (`reveals_used`, `transition.rs:197`), the deposit/delegation
 queues, pending fee rewards (`transition.rs:246`), and fork-choice latest
 messages. Extending the closed component list is a §Boundary-7 spec change
 under the two-reviewer rule.
+
+**CLOSED, 2026-08-12.** `interfaces.rs::StateRoots` now carries **fourteen**
+components, and the six that were missing are among them by name:
+`finality_root`, `pending_votes_root`, `forkchoice_root`, `deposit_queue_root`,
+`delegation_root`, `pending_fees_root` — plus the registry component grew its
+RANDAO chain head/position, withdrawable-epoch and withdrawal-credential
+columns, which covers `reveals_used`. The extension was made under the
+§Boundary-7 spec-change rule and is documented at `interfaces.rs:854-912`.
+The original finding, kept for the record:
 
 **Aggravating finding:** the comment says this is "recorded in
 `BLOCH-POS-INTERFACES.md` as an open point" — **it is not**. Grep for
@@ -94,7 +143,16 @@ interfaces doc, the two-reviewer process has nothing to review.
 (each component in, or explicitly ruled node-local) merges into the single
 StateRoots re-freeze.
 
-### GAP-2 — two block-validation stacks with divergent consensus-visible error orders
+### GAP-2 — two block-validation stacks with divergent error orders — **CLOSED**
+
+**CLOSED, 2026-08-12.** `derive::validate_block` was **deleted**. Validation
+now happens in exactly one place, `transition::Transition::apply_block`, which
+is the seam the node binds; `derive.rs` retains only the shared `pub`
+*derivation* functions that producer and validator both call, and
+`derive.rs:19-24` records the deletion and the comparison that justified it. A
+sibling defect found at the same time — two seams deriving the state root from
+different RANDAO windows — is pinned closed by
+`crates/bloch-pos-committee/tests/one_state_root.rs`. The original finding:
 
 `derive::validate_block` (`derive.rs:426-505`) and
 `transition::apply_block` (`transition.rs:840+`) are two independent
@@ -117,7 +175,18 @@ committed-state models (`derive::ParentState`/`ChainState` vs
 deletion or subordination of the other — an integration decision the
 node plan's M1/M3 must not inherit silently.
 
-### GAP-3 — slashing is orphan logic
+### GAP-3 — slashing is orphan logic — **CLOSED**
+
+**CLOSED.** `transition.rs:145` does `use crate::slashing`;
+`PosTransaction::SlashingEvidence(SlashingEvidence)` exists
+(`transition.rs:317`); `CommittedState` owns a `slashing::SlashingState`
+(`transition.rs:799`) and evidence is applied through
+`apply_slashing_evidence` (`transition.rs:1739`), including the pro-rata
+delegator loss. **Caveat that keeps this from being fully closed at the node
+layer:** `main.rs:27` still lists "no slashing-evidence pipeline" — the state
+transition accepts evidence, but nothing on the node gathers, gossips or
+submits it. Slashing is reachable from consensus and unreachable from
+operations. The original finding:
 
 `transition.rs` never imports `slashing` (verified: grep for
 `use crate::slashing` hits only `gossip.rs:45`), and `PosTransaction`
@@ -153,7 +222,12 @@ header and the per-probe FINDING comments need rewriting to describe the
 fixed state, and the probe convention needs a rule: a passing probe's
 comment must say it pins a fix.
 
-### GAP-5 — the frozen `StateRoots` and the concrete tree disagree
+### GAP-5 — the frozen `StateRoots` and the concrete tree disagree — **CLOSED**
+
+**CLOSED, 2026-08-12**, together with GAP-1: `StateRoots` and
+`state_root.rs`'s component tags were reconciled in the same change, and
+`tests/one_state_root.rs` exists specifically to keep a private derivation from
+growing back in either seam. The original finding:
 
 Frozen: `interfaces.rs:749-768` — `StateRoots` with **7** fields, one
 `participation_root`. Concrete: `state_root.rs` — **8** component tags
@@ -165,7 +239,16 @@ implementation anywhere in the repo**. `transition.rs:82-87` says so
 honestly: `block_id`/`proposal_signing_root` are free functions awaiting
 DEV-2's implementation, to be pinned equal by A1 KATs. Which leads to:
 
-### GAP-6 — there are no KATs at all
+### GAP-6 — there are no KATs at all — **STILL OPEN**
+
+**Re-verified 2026-08-14 and unchanged:** `crates/bloch-pos-committee/tests/`
+contains `committee.rs`, `e2e.rs`, `one_state_root.rs`, `properties.rs`,
+`schedule.rs` and no `kats/` directory; a repository-wide search for `*kat*`
+finds only `crates/bloch-sis-pow/src/kat.rs`, which belongs to the retired
+proof-of-work crate. **A chain is live with no known-answer vectors for any
+consensus byte layout.** That is the most consequential item on this page: a
+second implementation has nothing to check itself against, and the only
+tiebreaker for a commitment disagreement is the running binary.
 
 `tests/kats/` does not exist; no vector files exist anywhere in the crate
 (`find` for `*kat*`, `*vector*`, `*.json` under the crate: empty). The
@@ -206,23 +289,27 @@ path". Nothing has started.
 
 ## 3. Specified but not implemented
 
-The structural fact first: **everything allocated to the node has zero
+~~The structural fact first: **everything allocated to the node has zero
 lines of code.** `crates/bloch-pos-node/src/main.rs` is the entire node.
-None of node-plan M1, M2 or M3 has started — no `rules/`, no `store/`, no
-`genesis/`, no `net/`, no `rpc/`, no `mempool/`, no `keys/`. Consequently:
+None of node-plan M1, M2 or M3 has started.~~
 
-| Spec | Status of implementation |
-|---|---|
-| `BLOCH-POS-NODE-INTEGRATION.md` §3 (RocksDB schema, `StateReader`, refuse-foreign-db) | does not exist |
-| §3.4 genesis manifest format + loader (incl. the carryover-eligibility field ADR-037 now fixes the value of) | does not exist — and the manifest *format* itself is unspecified beyond the plan's bullet list |
-| `BLOCH-RPC-V4.md` | does not exist (no RPC code anywhere in Genesis-4; the crate has no serde by design, `state_root.rs:280`) |
-| `BLOCH-WEAK-SUBJECTIVITY.md` (checkpoint format, publication, checkpoint sync) | only the margin constant exists (`staking.rs:105`, `WITHDRAWAL_DELAY_EPOCHS`, tied into `slashing.rs:70`); checkpoint artifact/validation/sync do not exist; `FinalityState::new` accepts a trusted seed checkpoint with nothing validating provenance |
-| `BLOCH-ATTESTATION-GOSSIP.md` transport half (gossipsub topics, `TopicScoreParams`, token buckets, ingest channel) | does not exist — `gossip.rs:10-13` says so; only the pure policy half exists |
-| `BLOCH-FALCON-ONLINE-SIGNING.md` | not in this crate by design (signing/verifying injected via traits); the real path is `bloch-crypto`'s, allocated to DEV-2 keystore work in M2 — node-side code does not exist |
-| `BLOCH-POS-SORTITION-DOS.md` | assessment spec, "no code change proposed" — but its *node-side* mitigations (sentry posture, rate limiting) have no home until `net/` exists; the crate-side F6 look-ahead exists (`committees.rs:99`) and the spec itself notes it widens the F7 window |
-| `BLOCH-COHERENCE-UNDER-POS.md` | only the commitment surface: two carried opaque roots (`state_root.rs:415-418`, `derive.rs:77-80`, `TransitionError::CoherenceRootMismatch`). No accumulator, no nullifier machinery, no bridge in Genesis-4 code — the no-bridge part is by design (node plan §5), the carry pipeline is simply unbuilt |
-| `BLOCH-POS-STAKE-CHURN.md` Phase 2 (absolute churn cap) | flagged, deliberately unsized (`delegation.rs:81-84`) |
-| Interfaces doc §4.2 (delegator withdrawal-delay asymmetry), §4.5 (withdrawal-credential format), §4.8 (inactivity-leak constants + KAT) | decisions pending, then code; nothing exists |
+**Re-swept 2026-08-14.** Most of this section closed when the node shipped.
+The table below carries the original row and its current state side by side;
+the ones still marked **OPEN** are what an integrator should read.
+
+| Spec | 2026-08-11 | Now |
+|---|---|---|
+| `BLOCH-POS-NODE-INTEGRATION.md` §3 (RocksDB schema, `StateReader`, refuse-foreign-db) | does not exist | **PARTIAL.** `store.rs` exists and the refuse-foreign-db rule is enforced (`Store::open` rejects a dir whose `meta` names another genesis or schema). **The RocksDB column families do not exist** — persistence is an append-only log of block envelopes and restart is O(chain length) replay. `store.rs:7-21` states the reasoning. Still OPEN as specified |
+| §3.4 genesis manifest format + loader (incl. the carryover-eligibility field ADR-037 now fixes the value of) | does not exist | **CLOSED.** `genesis.rs` — `BPOSMAN1` manifest, loader, deterministic block-0 and `CommittedState` synthesis, SHA3-256 manifest digest pinned into the data dir, `Manifest::ingest_carryover` for the balance set |
+| `BLOCH-RPC-V4.md` | does not exist | **CLOSED for the read surface.** `rpc.rs` serves JSON-RPC 2.0 over HTTP/1.1 on `std` only, honouring R3 (decimal-string amounts), R4 (top-level error) and R5 (`commission_bps` on every validator response). ~11 methods; `sendrawtransaction` writes through the same admission path as gossip. **No authentication, no rate limit, no TLS** — `--rpc-bind` defaults to `127.0.0.1` for that reason. `gettransaction` and `getnewaddress` answer with explicit refusals (no tx index, no wallet) |
+| `BLOCH-WEAK-SUBJECTIVITY.md` (checkpoint format, publication, checkpoint sync) | only the margin constant exists | **PARTIAL.** The **boot gate** is wired end to end: `ws_boot.rs` + `bloch_pos_committee::ws` — 154-byte canonical envelope, m-of-n verification under the real hybrid suite, persisted `ws_latest.bin`, anti-rollback and conflict refusal, genesis anchor as first checkpoint. **Checkpoint-sync state download does not exist** (`main.rs:27`), and this build bakes no Phase A signer keys — the arrangement comes from `--ws-signer-set`. Still OPEN in part |
+| `BLOCH-ATTESTATION-GOSSIP.md` transport half (gossipsub topics, `TopicScoreParams`, token buckets, ingest channel) | does not exist | **BUILT BUT NOT IN USE.** `p2p.rs` implements it — gossipsub with explicitly-written `TopicScoreParams` (no `..Default::default()`), Genesis-4-only protocol ids, yamux stream caps, `gossip.rs` as admission control. It is behind `--transport libp2p`. **The live fleet runs `--transport devnet`**, the fixed-peer TCP mesh, which has no scoring, no admission control and no `Origin`, so gossip verdicts have nowhere to go on that path (`net.rs:19-28`) |
+| `BLOCH-FALCON-ONLINE-SIGNING.md` | node-side code does not exist | **CLOSED.** `keys.rs` — `HybridVerifier` over `bloch_crypto::crypto::verify` (ML-DSA-65 ‖ Falcon-1024, both halves ANDed) and a `Keystore` that signs proposal and attestation roots. Falcon signs through the constant-time `clean` path only |
+| `BLOCH-POS-SORTITION-DOS.md` | node-side mitigations have no home until `net/` exists | **OPEN.** `net/` and `p2p/` exist, but the sentry posture and per-peer rate limiting the spec asks for are not implemented on the devnet transport the fleet runs |
+| `BLOCH-COHERENCE-UNDER-POS.md` | only the commitment surface | **UNCHANGED — OPEN.** Two carried opaque roots and nothing behind them; no accumulator, no nullifier machinery, no bridge |
+| `BLOCH-POS-STAKE-CHURN.md` Phase 2 (absolute churn cap) | flagged, deliberately unsized | **UNCHANGED — OPEN** |
+| Interfaces doc §4.2, §4.5, §4.8 | decisions pending | §4.5 (withdrawal-credential format) is answered in practice — `FOUNDER_WITHDRAWAL_H160`, a 20-byte hash160 zero-extended to 32 — but the doc is not amended. §4.2 and §4.8 **OPEN** |
+| **Not on the original list, and the largest open item:** a permissionless path in | — | **OPEN.** `Deposit`/`Delegate` are refused at every mempool (`engine.rs:1901`) and the live transport has a fixed peer list with no discovery and no authentication. There is no way for a third party to run a node on this network or to become a validator |
 
 ---
 
@@ -247,8 +334,12 @@ Things the sweep surfaced that no document owns:
    bonding model (seats, UIDs, 21-day unbonding) is incompatible with the
    implemented staking (`WITHDRAWAL_DELAY_EPOCHS` regime, no seats), and
    ADR-002's DKG/threshold-BLS has no counterpart at all (each validator
-   signs individually with the hybrid). No document says these ADRs die
-   with the halt. A one-page supersession ADR would close it.
+   signs individually with the hybrid). **Partially addressed 2026-08-14:**
+   every affected ADR now carries a Status line saying it is superseded and
+   that the chain it addressed stopped at 39,918, so a reader can no longer
+   mistake one for current guidance. What is still missing is the positive
+   act — a supersession ADR that *decides* the replacement rather than
+   annotating the predecessor. Status lines are a warning, not a decision.
 4. **`CapStatus::Deferred`** (`genesis_cohort.rs:100-124`) — the cohort-cap
    escape clause born from the day-one-liveness bug (commit `dc64b3b`) is
    consensus behaviour absent from the tokenomics spec's cohort section.

@@ -1,10 +1,23 @@
 # Postern OS — a reproducible NixOS appliance with the node built in
 
+> **The node built in is Genesis-3 — the retired proof-of-work node.** Every
+> output of this directory (`iso`, `attested-image`, `mobile-image`,
+> `postern-desktop`) is built from `os/package.nix`, which builds `bloch`. The
+> proof-of-work chain stopped permanently at height 39,918 on 2026-08-13, so an
+> image built from here boots into a miner with no network to join. The live
+> chain is **Genesis-4, proof of stake** (30 s slots, 32-slot epochs, finality
+> by epoch) and its binary, `bloch-pos`, is **not packaged for Nix at all** —
+> see the banner in `flake.nix`. That is a stated gap, not an oversight to read
+> around: packaging `bloch-pos` and repointing these outputs is real work nobody
+> has done.
+>
+> "Ownerless" was also retracted — see
+> `docs/adr/ADR-036-retract-ownerless-adopt-foundation.md`.
+
 A Postern Labs product. A minimal, declarative NixOS image that boots straight
-into a running (mining) Bloch-SIS node. (The Bloch-SIS-PoW protocol is
-ownerless — anyone may build their own OS/products on it.) Because it's NixOS, the **same inputs produce the same image** —
-the reproducibility that L1 (the reproducible container build) and Coherence are
-built on, now at the OS level.
+into a running (mining) Bloch-SIS Genesis-3 node. Because it's NixOS, the
+**same inputs produce the same image** — the reproducibility that L1 (the
+reproducible container build) and Coherence are built on, now at the OS level.
 
 > **Postern OS vs Postern Desktop** — different tools, both kept:
 > - **Postern OS** (this) — a *whole operating system* you boot; the node is a
@@ -74,3 +87,11 @@ That turns "reproducible OS" into "reproducible *and* remotely-attestable OS".
   package) — minutes, cached afterwards.
 - Testnet is zero-security by design; no privacy/attestation claim until each is
   audited.
+- **This appliance does not run the live chain.** It packages the retired
+  Genesis-3 node only. Under Genesis-4 the security question is not hashrate,
+  it is concentration: all 64 validators are run by one entity, 93.94% of the
+  carryover sits at a single address, and 56.05 B of the 57.15 B BLOCH issued at
+  genesis is held by the founder and the Foundation. One operator can halt the
+  chain and one holder can outvote every other. A third party cannot yet join:
+  the transport has a fixed peer list and no discovery, and `Deposit`/`Delegate`
+  are refused at every node's mempool.

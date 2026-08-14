@@ -5,11 +5,20 @@ phone OS** (via [Mobile NixOS](https://github.com/nix-community/mobile-nixos))
 that ships the Postern Wallet as a first-class key vault. Same NixOS flake, same reproducibility,
 same post-quantum crypto — on a phone.
 
+> **Historical framing — Genesis-3.** The reasoning below is from the
+> proof-of-work era. That chain stopped permanently at height 39,918 on
+> 2026-08-13; the live chain is **Genesis-4, proof of stake** (30 s slots,
+> 32-slot epochs, finality by epoch), where nothing mines at all and blocks come
+> from a proposer schedule over staked validators. The wallet-only scope still
+> holds, for a different reason: a phone is a key vault, and validator duty is
+> not a phone workload. The image also packages `bloch` (Genesis-3), not
+> `bloch-pos` — see the banner in `flake.nix`.
+
 > **Scope: wallet only.** Phones can't mine the Bloch-SIS PoW competitively, so
-> Postern OS Mobile does **not** mine — PoW secures the chain from desktops/nodes.
-> The phone holds keys and signs (hybrid Falcon‖ML-DSA, addresses byte-identical
-> to the node). This matches the project's decision: *mobile = wallet, focus is
-> PoW*.
+> Postern OS Mobile does **not** mine — PoW secured the Genesis-3 chain from
+> desktops/nodes. The phone holds keys and signs (hybrid Falcon‖ML-DSA,
+> addresses byte-identical to the node). This matched the project's decision at
+> the time: *mobile = wallet, focus is PoW*.
 
 ## The Postern clients, clarified
 

@@ -1,5 +1,14 @@
 # Attestation deployment (L3) — bind the reproducible image to the TEE
 
+> **Historical — Genesis-3.** The image at the top of this binding chain is the
+> root `Dockerfile` image, i.e. `bloch`, the proof-of-work node for the chain
+> that stopped permanently at height 39,918 on 2026-08-13, and the node-side
+> verifier referenced below now lives at
+> `legacy/genesis3-node/src/attestation/`. The live chain is **Genesis-4, proof
+> of stake**; `bloch-pos` is not built into an attested image and no validator
+> in the live fleet is TEE-attested. Nothing here is a claim about the live
+> chain. Kept as part of the Genesis-3 record.
+
 This directory holds the image-side + policy-side of the attestation binding.
 Full design: `docs/specs/BLOCH-SIS-ATTESTATION.md`. Node-side verifier:
 `src/attestation/`.

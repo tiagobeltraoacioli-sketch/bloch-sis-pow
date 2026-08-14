@@ -2,14 +2,23 @@
 
 | Field             | Value                                                              |
 | ----------------- | ------------------------------------------------------------------ |
-| **Status**        | Proposed                                                           |
+| **Status**        | **SUPERSEDED** (was: Proposed) — see the note directly below this table |
 | **Date**          | 2026-05-01                                                         |
 | **Authors**       | Founder (custodial)                                                |
 | **Reviewers**     | (TBD — US securities counsel, EU MiCA counsel, Swiss/SG counsel)   |
 | **Supersedes**    | None                                                               |
-| **Superseded by** | None                                                               |
+| **Superseded by** | Genesis-4 (proof of stake, live since 2026-08-13) — see note below |
 | **Related ADRs**  | ADR-010 (tokenomics), ADR-010-A (premine schedule), ADR-011 (FFG governance), ADR-018 (oracle network) |
 | **Reference doc** | `BLOCH-FGM-001 v1.0` — Foundation Genesis Model (PDF)               |
+
+
+> **Status note, 2026-08-14.** Written before mainnet, and mainnet has launched: Genesis-4 went live 2026-08-13 with the Foundation holding 29,000,000,000 BLCH across four buckets (VC, team, marketing, liquidity) and the founder 27,046,829,380 — together 56,046,829,380 of the 57,146,400,000 issued at slot 0. **The board does not exist and the Foundation is the founder** until it does (`BLOCH-TOKENOMICS-V4.md` §3.3.1). This ADR is the model that was adopted, not a description of what has been executed. Read the allocations as live and the governance as unbuilt.
+>
+> The decision, context and consequences below are **not** rewritten:
+> this is a decision log and what was decided, when, is the record.
+> Read it as history, not as guidance. Genesis-3 (proof of work) stopped
+> permanently at height **39,918** on 2026-08-13; the live chain is
+> **Genesis-4, proof of stake**.
 
 ---
 

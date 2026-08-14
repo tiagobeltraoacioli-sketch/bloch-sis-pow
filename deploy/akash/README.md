@@ -1,6 +1,15 @@
 # Deploying a Bloch-SIS node on Akash
 
-Run a censorship-resistant Bloch-SIS full node on the [Akash](https://akash.network)
+> **Historical — Genesis-3.** This deploys `bloch`, the proof-of-work node for
+> the chain that stopped permanently at height 39,918 on 2026-08-13. Following
+> it end to end gets you a node with no network to join, and the SDLs in this
+> directory (including the `--mine` ones) are the deployment record of a chain
+> that ran. The live chain is **Genesis-4, proof of stake** (30 s slots,
+> 32-slot epochs, finality by epoch); its binary is `bloch-pos`, installed on
+> the fleet as a systemd unit from a signed release tarball — see
+> `deploy/RELEASE-INTEGRITY.md`. It is not what runs.
+
+Run a Bloch-SIS Genesis-3 full node on the [Akash](https://akash.network)
 decentralized cloud. Three steps: **build** the image, **push** it to a public
 registry, **deploy** the SDL.
 

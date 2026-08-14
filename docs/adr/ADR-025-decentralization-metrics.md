@@ -2,14 +2,23 @@
 
 | Field             | Value                                                              |
 | ----------------- | ------------------------------------------------------------------ |
-| **Status**        | Proposed                                                           |
+| **Status**        | **SUPERSEDED** (was: Proposed) — see the note directly below this table |
 | **Date**          | 2026-05-01                                                         |
 | **Authors**       | Founder (custodial)                                                |
 | **Reviewers**     | (TBD — engineering, US securities counsel)                         |
 | **Supersedes**    | None                                                               |
-| **Superseded by** | None                                                               |
+| **Superseded by** | Genesis-4 (proof of stake, live since 2026-08-13) — see note below |
 | **Related ADRs**  | ADR-011 (FFG BFT), ADR-023 (Foundation Genesis Model), ADR-024 (Steward Council bootstrap) |
 | **Reference doc** | `BLOCH-FGM-001 v1.0` §4 Phase 2                                     |
+
+
+> **Status note, 2026-08-14.** The metrics here are defined over **mining** decentralisation on a proof-of-work chain. Genesis-4 measures concentration over stake: `Registry::top_share_bps` and `Registry::nakamoto_coefficient` (`crates/bloch-pos-committee/src/delegation.rs`), the latter computed at the one-third stalling threshold rather than one half. **The honest reading of those metrics today:** they see the *operator* view, so 64 records operated by one entity read as 64 participants. Measured by beneficial owner, the Nakamoto coefficient of the live chain is **1**.
+>
+> The decision, context and consequences below are **not** rewritten:
+> this is a decision log and what was decided, when, is the record.
+> Read it as history, not as guidance. Genesis-3 (proof of work) stopped
+> permanently at height **39,918** on 2026-08-13; the live chain is
+> **Genesis-4, proof of stake**.
 
 ---
 

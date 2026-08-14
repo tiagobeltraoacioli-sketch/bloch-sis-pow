@@ -2,8 +2,18 @@
 
 # ADR-037 — A carried-over balance that is liquid is also stakeable
 
-- **Status:** Accepted (founder decision, 2026-08-11) — **consequences under
-  design**, see below
+- **Status:** Accepted (founder decision, 2026-08-11) — **in force on the
+  live chain.** Genesis-4 launched 2026-08-13 with the whole Genesis-3
+  ledger carried across as one undifferentiated, liquid, stakeable set:
+  452,726 outputs, 18,146,400,000 BLOCH, of which **93.94%
+  (17,046,829,380) sits at a single address**
+  (`LARGEST_CARRYOVER_ADDRESS_BLOCH`). The consequence this ADR names is
+  therefore live, not hypothetical: **if that balance stakes, the Nakamoto
+  coefficient is 1.** One qualification of fact, not of principle — today
+  nothing can stake at all, because `Deposit` and `Delegate` are refused at
+  every node's mempool while bonding is not funded from the UTXO set
+  (`crates/bloch-pos-node/src/engine.rs:1901`). The decision is in force;
+  the mechanism it authorises is not yet reachable.
 - **Resolves:** `BLOCH-POS-NODE-INTEGRATION.md` §8.1 (the open ruling), and the
   question left open by migration §4.2 and tokenomics §4A ("liquid ≠
   stakeable")

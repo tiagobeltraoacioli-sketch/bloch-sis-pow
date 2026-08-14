@@ -1,10 +1,34 @@
 # BLOCH-ATTESTATION-GOSSIP — Attestation propagation for Genesis-4 PoS
 
+> **Genesis-4 is live.** Bloch has been running under **proof of stake** since
+> 21:31:19 UTC on 2026-08-13, when Genesis-3 (proof of work) stopped
+> permanently at height **39,918**. 30 s slots, 32-slot epochs, Casper-style
+> justification/finalisation by epoch, hybrid ML-DSA-65 ‖ Falcon-1024
+> signatures on every consensus path. Nothing in this document that describes
+> mining, hashrate, difficulty, retargeting or proof-of-work depth describes
+> the current network.
+>
+> **The live security question is concentration, not hashrate.** All 64
+> validators are operated by a single entity; 93.94% of the carryover
+> (17,046,829,380 of 18,146,400,000 BLOCH) sits at one address and carried
+> balances are stakeable, so if that balance stakes the Nakamoto coefficient
+> is 1; and 56,046,829,380 of the 57,146,400,000 BLOCH issued at slot 0 is
+> held by the founder and the Foundation, leaving 1.92% of genesis supply in
+> third-party hands. One operator can halt the chain and one holder can outvote
+> every other. The live transport is a point-to-point TCP full mesh with a
+> fixed peer list, **no discovery and no authentication**, and
+> `Deposit`/`Delegate` are refused at every node's mempool — which is why a
+> third party cannot yet join the network or become a validator.
+
 > **PARCIALMENTE SUPERADO — 2026-08-11.** Esta analise foi escrita contra o
 > estado do projeto naquele dia e depende de premissas que mudaram DEPOIS:
 >
 > - **o comite amostrado (128 por epoca + 8 por slot)** — substituido por particao do conjunto ativo: o quorum amostrado nao tinha denominador coerente (achado F1).
-> - **a fase hibrida de PoW** — apagada: a Genesis-3 para na altura 80.000 e a Genesis-4 nasce de uma snapshot.
+> - **a fase hibrida de PoW** — apagada. **Correction (2026-08-14):** the
+>   height in this line was wrong and is now history. Genesis-3 stopped
+>   permanently at height **39,918** on 2026-08-13 — not 80,000 — and
+>   Genesis-4 launched from that snapshot under proof of stake at
+>   21:31:19 UTC the same day. It is live.
 >
 > O texto NAO foi reescrito, de proposito: o raciocinio que produziu cada
 > achado tem valor mesmo quando a premissa mudou, e reescrever apagaria a
@@ -13,10 +37,26 @@
 > os normativos.
 
 
-> **Owner:** A11 (P2P & gossip). **Status:** draft for review.
+> **Owner:** A11 (P2P & gossip). **Status:** BUILT, NOT IN SERVICE.
+>
+> The application half — accept/ignore/hold/reject verbs, the 2-epoch window,
+> the equivocation cap, evidence capture — is
+> `crates/bloch-pos-committee/src/gossip.rs` and is wired into the node. The
+> transport half is `crates/bloch-pos-node/src/p2p.rs`: libp2p + gossipsub on
+> Genesis-4-only protocol ids, `TopicScoreParams` written field-by-field with
+> no `..Default::default()` tail, yamux stream caps pinned by `const`
+> assertion, directed paginated sync. **It is behind `--transport libp2p` and
+> the live fleet does not use it.** What Genesis-4 actually runs is
+> `--transport devnet`: a point-to-point TCP full mesh with a fixed peer list,
+> **no discovery, no authentication, no peer scoring and no admission
+> control** — it carries no `Origin`, so the verdicts specified in this
+> document have nowhere to go on that path (`net.rs:19-28`). Nothing here
+> should be read as evidence that a production gossip layer is in service.
+>
 > **Inputs:** `BLOCH-POS-SHA3-LATTICE-MIGRATION.md` §5.1, §6.5, §6.5.2, G10;
-> `src/network/mod.rs` (current gossipsub layer); `src/network/sync_rr.rs`
-> (directed-pull layer). All line references are to the tree as of 2026-08-11.
+> `src/network/mod.rs` (the **Genesis-3** gossipsub layer, on a chain that
+> stopped at h39,918); `src/network/sync_rr.rs` (directed-pull layer). All
+> line references are to the tree as of 2026-08-11.
 
 ---
 

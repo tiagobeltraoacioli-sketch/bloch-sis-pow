@@ -1,6 +1,8 @@
 # ADR-002-rev2 — DKG Protocol Family
 
-**Status:** Accepted
+**Status:** **SUPERSEDED** — Genesis-4 uses **no BLS and no DKG**: each validator signs individually with hybrid ML-DSA-65 ‖ Falcon-1024. No DKG ceremony runs on the live chain and none is planned. The chain this ADR governs — Genesis-3, proof of work — stopped permanently at height **39,918** on 2026-08-13. The live chain is **Genesis-4, proof of stake** (30 s slots, 32-slot epochs, finality by epoch, hybrid ML-DSA-65 ‖ Falcon-1024, no mining). The decision, context and consequences below are **not** rewritten: this is a decision log and what was decided, when, is the record. Read it as history, not as guidance.
+
+*Original status line, retained:* **Status:** Accepted
 **Date:** 2026-04-30
 **Supersedes:** ADR-002-rev1 (2026-04-28)
 **Sprint:** 2.1.C-rev1 (Phase β onwards)

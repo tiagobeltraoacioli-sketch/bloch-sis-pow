@@ -1,28 +1,36 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Transport selection, and the devnet TCP mesh.
+//! Transport selection, and the `Transport::Devnet` TCP mesh.
 //!
 //! Two transports live behind [`Net`]:
 //!
-//! - [`p2p`](crate::p2p) — **the production layer**: libp2p, gossipsub with
-//!   the 2026-08-07 mesh fixes, a Genesis-4-only protocol prefix, directed
-//!   paginated sync, and `gossip.rs` wired as admission control.
-//! - the devnet full mesh below — kept, unchanged, because a 64-validator
-//!   devnet across five hosts finalized on it and that result must stay
-//!   reproducible. Selected with `--transport devnet`, which is still the
-//!   default; `--transport libp2p` opts into the production stack.
+//! - [`p2p`](crate::p2p) — the libp2p layer: gossipsub with the 2026-08-07
+//!   mesh fixes, a Genesis-4-only protocol prefix, directed paginated sync,
+//!   and `gossip.rs` wired as admission control.
+//! - the full mesh below — **this is what the live Genesis-4 fleet runs.**
+//!   The 64-validator cohort across five hosts finalized on it and still
+//!   does. Selected with `--transport devnet`, which is still the default;
+//!   `--transport libp2p` opts into the libp2p stack.
+//!
+//! The name is historical and the transport is exactly what the name says:
+//! **a point-to-point TCP full mesh over a fixed peer list, with no discovery
+//! and no authentication.** That is the reason a third party cannot yet join
+//! the network — not a policy, a missing mechanism. Do not read
+//! `--transport devnet` as "the chain is a devnet": Genesis-4 is a live
+//! mainnet, and this is the transport it runs on.
 //!
 //! The engine talks to both through the same two calls — [`Net::broadcast`]
 //! with a typed frame, and [`Net::report`] with a verdict — so nothing in the
 //! consensus loop knows which transport it is running on.
 //!
-//! ## The devnet mesh, and what it is not
+//! ## The mesh, and what it is not
 //!
-//! **This is not the production network layer.** What a devnet needs from the
-//! network is only: every node eventually sees every block and attestation,
-//! and a restarted node can ask a peer for the blocks it missed. A full mesh
-//! over localhost delivers exactly that with no relay logic (everyone sends to
-//! everyone, so nothing needs re-gossiping) and no peer scoring. It has no
+//! **This is not a public network layer, and it is running on mainnet.** What
+//! a fixed, single-operator fleet needs from the network is only: every node
+//! eventually sees every block and attestation, and a restarted node can ask a
+//! peer for the blocks it missed. A full mesh over a known peer list delivers
+//! exactly that with no relay logic (everyone sends to everyone, so nothing
+//! needs re-gossiping) and no peer scoring. It has no discovery, no
 //! authentication, no admission control, and it does not carry an [`Origin`],
 //! so `gossip.rs`'s verdicts have nowhere to go on this path — the engine
 //! still runs the pool, but a `Reject` costs the sender nothing here.
@@ -199,11 +207,13 @@ fn serve_get_blocks(sock: &mut TcpStream, data_dir: &PathBuf, frame: &[u8]) {
         return;
     }
     let after = u64::from_le_bytes(frame[1..9].try_into().unwrap());
-    // Uncapped on this transport, deliberately: the devnet mesh has no
-    // pagination, so a restarting node's single request must be answered in
-    // full or it never catches up. That is one of the reasons this transport
-    // is not the production one — the production path pages
+    // Uncapped on this transport, deliberately: this mesh has no pagination,
+    // so a restarting node's single request must be answered in full or it
+    // never catches up. That is one of the reasons this transport must not be
+    // exposed to a public network — the libp2p path pages
     // (`p2p::MAX_SYNC_BLOCKS`) so no single answer can become a history dump.
+    // The live fleet runs THIS transport, behind a firewall and a fixed peer
+    // list; that containment is what makes an uncapped answer acceptable.
     match crate::store::Store::blocks_after(data_dir, after, usize::MAX) {
         Ok(blocks) => {
             for b in blocks {
@@ -228,8 +238,10 @@ fn serve_get_blocks(sock: &mut TcpStream, data_dir: &PathBuf, frame: &[u8]) {
 /// and no peer scoring** — `gossip.rs` is not wired here — so anything that
 /// can reach the port can feed it frames. Binding a routable address is
 /// therefore opt-in (`--listen-addr`), and when it is used the operator is
-/// responsible for restricting the port to known peers at the firewall. The
-/// production answer is the libp2p stack, not this.
+/// responsible for restricting the port to known peers at the firewall — which
+/// is exactly how the live fleet runs it. The answer for a network anyone can
+/// join is the libp2p stack, not this; until that is the default, the peer set
+/// is fixed and no third party can join.
 pub fn start(
     bind_addr: &str,
     listen_port: u16,

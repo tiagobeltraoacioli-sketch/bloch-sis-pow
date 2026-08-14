@@ -14,15 +14,24 @@
 //!
 //! ## Status (binding honesty rails)
 //!
+//! **HISTORICAL — GENESIS-3.** This crate anchors to the proof-of-work chain
+//! that stopped permanently at height 39,918 on 2026-08-13. The live chain is
+//! **Genesis-4, proof of stake** (30 s slots, 32-slot epochs, Casper-style
+//! justification/finalisation **by epoch** rather than by depth). Nothing here
+//! has been ported to it.
+//!
 //! This is a **SCAFFOLD / reference implementation — unaudited and
-//! pre-production.** The base chain is **ownerless, neutral, and agnostic**:
-//! anyone can build L2s, finality gadgets (FFGs), and RWA systems — **no
-//! category is reserved and Postern Labs holds no privilege.** Base
-//! mainnet-beta currently runs a **relaxed k=4 PoW regime → work is trivially
-//! forgeable and the low-hashrate network is 51%-attackable**; treat everything
-//! here as **experimental**. **BLCH is neutral gas — not a security, with no
-//! value claim from anyone.** RWA builders own their **own legal and regulatory
-//! responsibility**.
+//! pre-production.** Anyone can build L2s, finality gadgets (FFGs), and RWA
+//! systems — **no category is reserved and Postern Labs holds no privilege**
+//! in what you build ("ownerless" was retracted, see ADR-036). The old rail
+//! here — relaxed k=4 PoW, work trivially forgeable, the low-hashrate network
+//! 51%-attackable — was true of Genesis-3. Under Genesis-4 the security
+//! question is concentration: **all 64 validators are run by one entity**,
+//! **93.94% of the carryover sits at a single address**, and **56.05 B of the
+//! 57.15 B BLOCH issued at genesis is held by the founder and the
+//! Foundation**. Treat everything here as **experimental**. **BLCH is neutral
+//! gas — not a security, with no value claim from anyone.** RWA builders own
+//! their **own legal and regulatory responsibility**.
 //!
 //! ## Shape of the crate
 //!

@@ -107,17 +107,20 @@
       <p>The same hash Bitcoin ASICs already compute. Post-quantum by Grover&rsquo;s bound: a quadratic speedup, priced in, not a break.</p>
     </div>
     <div class="card b">
-      <span class="tag">Merged mining</span>
+      <span class="tag">Merged mining &mdash; Genesis-3, ended</span>
       <h3>AuxPoW</h3>
-      <!-- AuxPoW verifier: crates/bloch-crypto/src/core/auxpow.rs; activation
-           since local h=8,500: docs/PROJECT-STATUS.md. -->
-      <p>A Bitcoin miner embeds a Bloch commitment in its coinbase and one solved header pays both chains. Hashrate is borrowed, honestly labelled as borrowed.</p>
+      <!-- AuxPoW verifier: crates/bloch-crypto/src/core/auxpow.rs; activated at
+           h=8,500 on Genesis-3 (crates/bloch-crypto/src/core/mod.rs:22) and
+           ended with that chain at h=39,918 on 2026-08-13. -->
+      <p>A Bitcoin miner embedded a Bloch commitment in its coinbase and one solved header paid both chains. This ran on Genesis-3 from height 8,500 until that chain stopped at 39,918. Genesis-4 is proof of stake: nothing is merge-mined and no hashrate is borrowed.</p>
     </div>
     <div class="card c">
       <span class="tag">The caveat</span>
-      <h3>51%-attackable today</h3>
-      <!-- docs/PROJECT-STATUS.md "Hard caveat" block. -->
-      <p>Low hashrate, few nodes, unaudited. Security here is a trajectory, not a present-tense claim &mdash; and the trajectory ends at height 50,000 anyway.</p>
+      <h3>One operator, one holder</h3>
+      <!-- The "51%-attackable today" caveat that stood here was Genesis-3's and
+           ended with that chain at h=39,918 on 2026-08-13. Genesis-4 figures:
+           crates/bloch-pos-committee/src/tokenomics_v4.rs. -->
+      <p>Unaudited, and concentrated. All 64 Genesis-4 validators are operated by a single entity, 93.94% of the carryover sits at one address, and 56.05&nbsp;B of the 57.15&nbsp;B BLOCH issued at genesis is held by the founder and the Foundation. One operator can halt the chain and one holder can outvote every other. Security here is a trajectory, not a present-tense claim.</p>
     </div>
   </div>
 </div></section>

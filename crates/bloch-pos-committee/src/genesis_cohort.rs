@@ -46,6 +46,23 @@
 //! reporting rule (`BLOCH-ENTITY-STRUCTURE.md` §5.1) and by whoever is
 //! watching. The enforceable part is real and bounded; claiming more would be
 //! claiming that consensus can see through an address, and it cannot.
+//!
+//! # What it is doing today: nothing, and that is reported
+//!
+//! On the live Genesis-4 chain the cap **does not bind**. All 64 validators
+//! are cohort members operated by one entity, so independent stake is zero —
+//! below [`CAP_MEANINGFUL_AT_SAT`] — and [`cap_status`] returns
+//! [`CapStatus::Deferred`], which [`apply_cohort_cap`] honours by returning the
+//! set unchanged. There is nothing for the founder to be one third *of*.
+//!
+//! This is not a loophole; it is the deferral doing its job, and it stays
+//! deferred until independent validators exist. Today they cannot: `Deposit`
+//! and `Delegate` are refused at every node's mempool because bonding is not
+//! yet funded from the UTXO set, and the live transport is a fixed peer list
+//! with no discovery, so **there is no permissionless path to becoming a
+//! validator at all**. Until both are closed, the one-third commitment is a
+//! rule waiting for a network, not a constraint currently in force. Read
+//! `CapStatus::Deferred { independent_sat: 0 }` as exactly that.
 
 use crate::params::SLOTS_PER_EPOCH;
 use crate::sample::Validator;

@@ -1,10 +1,33 @@
 # Bloch — Ecosystem Migration Plan (Genesis-4 PoS)
 
+> **Genesis-4 is live.** Bloch has been running under **proof of stake** since
+> 21:31:19 UTC on 2026-08-13, when Genesis-3 (proof of work) stopped
+> permanently at height **39,918**. 30 s slots, 32-slot epochs, Casper-style
+> justification/finalisation by epoch, hybrid ML-DSA-65 ‖ Falcon-1024
+> signatures on every consensus path. Nothing in this document that describes
+> mining, hashrate, difficulty, retargeting or proof-of-work depth describes
+> the current network.
+>
+> **The live security question is concentration, not hashrate.** All 64
+> validators are operated by a single entity; 93.94% of the carryover
+> (17,046,829,380 of 18,146,400,000 BLOCH) sits at one address and carried
+> balances are stakeable, so if that balance stakes the Nakamoto coefficient
+> is 1; and 56,046,829,380 of the 57,146,400,000 BLOCH issued at slot 0 is
+> held by the founder and the Foundation, leaving 1.92% of genesis supply in
+> third-party hands. One operator can halt the chain and one holder can outvote
+> every other. The live transport is a point-to-point TCP full mesh with a
+> fixed peer list, **no discovery and no authentication**, and
+> `Deposit`/`Delegate` are refused at every node's mempool — which is why a
+> third party cannot yet join the network or become a validator.
+
 > **PARCIALMENTE SUPERADO — 2026-08-11.** Esta analise foi escrita contra o
 > estado do projeto naquele dia e depende de premissas que mudaram DEPOIS:
 >
 > - **a maquinaria de taint** — dissolvida: o carryover atravessa como um conjunto so, sem lista de exclusao, entao nao ha classe de moeda a marcar.
-> - **o supply de 100 bilhoes** — revertido para 21 bilhoes, o nominal da V2.
+> - ~~**o supply de 100 bilhoes** — revertido para 21 bilhoes, o nominal da V2.~~
+>   **Superseded 2026-08-12:** the supply is **100,000,000,000 BLCH**
+>   (`TOTAL_SUPPLY_BLOCH`), re-decided as a pure x100/21 split. The revert
+>   to 21 B lasted one day.
 > - **o EVM como L2** — decisao do fundador (2026-08-11): o EVM roda na **base (L1)**, sem rollup; o `bloch-l2-evm` (chainId 8400) sera SUBSTITUIDO, nao migrado. O §5 inteiro (re-point do anchor, predicado de finalidade, unificacao de chain-id) descreve um caminho que ja nao e o plano — só o drenar-antes-do-halt continua valendo, porque o L2 vivo ainda tem usuarios ate a parada.
 > - **Ustav/Kirpich como tooling** — promovidos a objeto de CONSENSO (L1) na mesma decisao; consequencias em desenho na wave de 2026-08-11 (fleet brief).
 >
@@ -30,9 +53,13 @@ references. Where something is absent, its absence was verified too.
 Two decisions upstream of this document change its shape:
 
 1. **This is a relaunch, not an in-place fork.** §8 of the migration spec is
-   superseded: the current chain **halts at height 80,000**, a signed balance
-   snapshot becomes the canonical record, and Genesis-4 launches from it about
-   six months later (`BLOCH-TOKENOMICS-V4.md` §3.2). For the ecosystem this
+   superseded: the Genesis-3 chain **stopped permanently at height 39,918 on
+   2026-08-13** (this document was written expecting 80,000; every "80,000"
+   below is that plan, and the halt came earlier), the signed balance snapshot
+   taken there is the canonical record — set root `7c756ee8…`, file SHA-256
+   `84ddbbac…`, 452,726 outputs, 18,146,400,000 BLOCH after the ×100/21 split —
+   and **Genesis-4 launched from it the same day, at 21:31:19 UTC**, not six
+   months later (`BLOCH-TOKENOMICS-V4.md` §3.2). For the ecosystem this
    means there is **no DAG→linear seam for any consumer to handle** — the
    Appendix B rows that assumed a live transition ("DAG→linear seam",
    "hybrid-phase deposit UX on the PoW chain") collapse into something simpler
@@ -379,7 +406,8 @@ and Go to near zero).
 > extended. What survives from this section: the finding that nothing in the
 > L2 stack verifies L1 consensus (still true, and now an argument for
 > retiring it), and the operational duty to **drain/settle the live L2 before
-> the height-80,000 halt** — the deposits already made are real and must exit.
+> the halt** (which came at h 39,918 on 2026-08-13, not the 80,000 planned
+> here) — the deposits already made are real and must exit.
 > The anchor re-point, finality predicate and chain-id unification work items
 > are dead. See the 2026-08-11 fleet brief.
 
@@ -438,8 +466,15 @@ still match it. One test to port, not a mechanism.
 
 ### 5.3 Two decisions the migration forces
 
-1. **The dead-period problem.** Between the halt at 80,000 and the Genesis-4
-   launch there is **no L1 at all** for ~6 months. Any L2 state anchored to
+1. ~~**The dead-period problem.** Between the halt at 80,000 and the Genesis-4
+   launch there is **no L1 at all** for ~6 months.~~ **Overtaken by events:**
+   Genesis-3 stopped at 39,918 and Genesis-4 launched the same day
+   (2026-08-13), so there was no dead period. The paragraph below is the plan
+   that was made for one, and the settle-and-drain instruction it gives was
+   still the right instruction — it just had hours, not months, of runway.
+   Original text:
+
+   Between the halt and the Genesis-4 launch there is **no L1 at all**. Any L2 state anchored to
    the old chain must be settled and withdrawals drained **before** the halt;
    the L2 either pauses or runs unanchored (sequencer-trust only) during the
    gap. This needs an explicit operator decision and a published timeline —
@@ -477,13 +512,22 @@ simply dies" list; none of it gets a V4 port):
 | Deploy | `pool.fly.toml`, `pool.Dockerfile`, fleet units (`bloch-pool`, `bloch-asic`, merged pool `:3336`, solo `:3335/:3333`) | pool/ASIC infra | ops |
 | Hardware | Antminer S19j Pro (100 TH/s) + miner-box/auxpow-box roles | ASIC fleet | disposition decision (Appendix B) |
 
-**Sequencing is the only subtlety.** Mining is what *produces* the chain until
-the halt, and third-party PoW issuance until 80,000 is part of the non-founder
-allocation story (tokenomics §3.1). So:
+> **Executed, and differently. 2026-08-14.** Block production stopped at
+> **39,918** on 2026-08-13; there is no mining on Bloch. The halt was not
+> delivered as the consensus release described below — production was stopped
+> by the operator — which is exactly why `BLOCH-TOKENOMICS-V4.md` §3.2.2
+> applies with full force: **the signed snapshot is the canonical record of
+> Genesis-3, not the chain.** Every decommissioning step in this list is now a
+> retirement task, not a plan. Kept as written because the sequencing rationale
+> is the record.
 
-1. **Nothing above is turned off before height 80,000.** The halt release
-   (tokenomics §3.2.1 — blocks above 80,000 invalid) is the **last PoW
-   release**, and the pool/ASICs run right up to it.
+**Sequencing is the only subtlety.** Mining is what *produced* the chain until
+the halt, and third-party PoW issuance until the terminal height is part of the
+non-founder allocation story (tokenomics §3.1). So:
+
+1. **Nothing above was turned off before the terminal height.** The halt
+   release (tokenomics §3.2.1 — blocks above the terminal height invalid) is
+   the **last PoW release**, and the pool/ASICs run right up to it.
 2. **At the halt:** snapshot artifact produced and signed; pool, proxies,
    stratum endpoints, and ASIC fleet decommissioned; `stratum.posternpool.com`
    and the `:3333/:3335/:3336` services retired; posternpool-site gets a
@@ -551,16 +595,16 @@ tooling; `genesis4-carryover` already exists and is tested).
 
 | When | Ecosystem actions |
 |---|---|
-| **Before h 80,000** (~2 weeks) | Halt release on the fleet (last PoW release); taint/founder list published; explorer repointed off `g2rpc.posternpool.com`; L2 drained/settled + pause announced; snapshot tooling rehearsed |
+| **Before the terminal height** (planned ~2 weeks; in the event, the halt came at h 39,918 on 2026-08-13) | Halt release on the fleet (last PoW release); taint/founder list published; explorer repointed off `g2rpc.posternpool.com`; L2 drained/settled + pause announced; snapshot tooling rehearsed |
 | **At the halt** | Snapshot artifact signed + digest published wide; pool/stratum/ASIC decommission; pool site tombstoned; G3 explorer flipped to archive mode (static or frozen-RPC) |
-| **Gap (~6 months)** | V4 OpenAPI spec frozen → SDKs regenerated; RPC surface built (DEV-3); explorer V4 build; wallet staking/taint UX built against devnet/testnet; L2 finality predicate + chain-id decision; onboarding runbooks written |
-| **G4 launch** | Everything repoints to the new chain; Foundation begins checkpoint publication; new SDK majors released; old majors documented as archive clients |
+| ~~**Gap (~6 months)**~~ **There was no gap.** | Genesis-4 launched the same day as the halt (2026-08-13), so this column's work did not happen before launch — it is **outstanding against a live chain**. A JSON-RPC surface exists (`crates/bloch-pos-node/src/rpc.rs`, ~11 methods, no auth); the V4 OpenAPI freeze, SDK regeneration, explorer V4 build and wallet staking UX did not precede launch. |
+| **G4 launch — happened 2026-08-13, 21:31:19 UTC** | The chain is live. Foundation checkpoint publication has **not** begun: the node bakes no Phase A signer keys and takes the arrangement from `--ws-signer-set`. New SDK majors are not released. Consumers repointing at Genesis-4 should expect the ecosystem listed above to be incomplete. |
 
 ### 8.2 The archive is a component too
 
 The halted chain still has users' history in it. Minimum viable archive: one
 frozen archival node (read-only RPC) + the G3 explorer in archive mode with a
-banner ("chain halted at 80,000; canonical record is the signed snapshot
+banner ("chain halted at 39,918 on 2026-08-13; canonical record is the signed snapshot
 <digest>; balances carried into Genesis-4"). Cheap, and it is what makes the
 "your balance was preserved" claim auditable by anyone.
 
@@ -572,7 +616,7 @@ banner ("chain halted at 80,000; canonical record is the signed snapshot
 | Commission disclosure under-built → §6.3's no-cap bet fails silently | §2.3 | MUST-level acceptance criteria on explorer + wallet delegation screens |
 | Amount overflow (10^19 sats vs int64 / 2^53) ships into V4 clients | §1.4/§4 | CLOSED — all satoshi fields are decimal strings, decided once in OpenAPI (`BLOCH-SATOSHI-ENCODING.md`); Go `Satoshis` is `uint64` + string codec; explorer/TS BigInt |
 | Explorer dies with the pool (shared `g2rpc.posternpool.com`) | §2.4/§6 | Repoint before decommission; it is one constant |
-| L2 users stranded at the halt | §5.3 | Published drain deadline well before h 80,000 |
+| L2 users stranded at the halt | §5.3 | Published drain deadline well before the terminal height. **Not achieved as designed:** the halt came at h 39,918 without the two-week notice this row assumes |
 | `getattestation` name collision produces two meanings of "attestation" in one API | §1.4 | Rename in the V4 major, document both |
 
 ### 8.4 Effort summary

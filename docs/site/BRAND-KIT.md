@@ -2,6 +2,20 @@
 
 # Bloch Protocol — Brand Kit
 
+```
+Document:  BRAND-KIT
+Status:    ACTIVE — the design system is current and approved
+Updated:   2026-08-14
+Data note: the design content (palette, type scale, WCAG ratios, radius rules,
+           anti-pattern list) is unchanged and stands. The chain figures inside
+           the §4 component examples were refreshed after the Genesis-4 launch:
+           Genesis-3 stopped permanently at height 39,918 on 2026-08-13 and the
+           live chain is Genesis-4, proof of stake (30 s slots, 32-slot epochs,
+           finality by epoch, supply hard-capped at 100,000,000,000 BLOCH).
+Why it matters: the examples in §4 are copy-paste sources. Every stale number
+           left in them ships to production the first time someone pastes one.
+```
+
 This document is the visual contract for every Bloch Protocol surface: the site,
 the explorer, the docs, release pages, slides. It follows the founder-approved
 direction in the site preview and it is self-contained by rule: **no webfonts,
@@ -330,8 +344,8 @@ Cards are soft fills with no border and no shadow. A card states a commitment
 <div class="tablewrap"><table>
   <thead><tr><th>Allocation</th><th class="num-h">Genesis-4 (BLCH)</th><th class="num-h">Share</th><th style="width:32%"></th></tr></thead>
   <tbody>
-    <tr><td>Validator emission — 40 years</td><td class="num">43,029,120,000</td><td class="num">43.03%</td><td><div class="bar" style="width:100%"></div></td></tr>
-    <tr><td>Carried over from Genesis-3</td><td class="num">17,970,880,000</td><td class="num">17.97%</td><td><div class="bar" style="width:41.8%"></div></td></tr>
+    <tr><td>Validator emission — 40 years</td><td class="num">42,853,600,000</td><td class="num">42.85%</td><td><div class="bar" style="width:100%"></div></td></tr>
+    <tr><td>Carried over from Genesis-3</td><td class="num">18,146,400,000</td><td class="num">18.15%</td><td><div class="bar" style="width:42.3%"></div></td></tr>
   </tbody>
 </table></div>
 ```
@@ -352,6 +366,14 @@ td.num { font-family: var(--mono); font-variant-numeric: tabular-nums; text-alig
 
 Numbers right-aligned, mono, tabular. Bars are flat accent — one series, one
 color, no gradient. The wrapper scrolls; the page never scrolls sideways.
+
+The figures above are real, from `crates/bloch-pos-committee/src/tokenomics_v4.rs`
+(`VALIDATOR_EMISSION_BLOCH`, `CARRYOVER_TOTAL_BLOCH`), against the
+100,000,000,000 hard cap; the carryover was measured at Genesis-3 height 39,918
+over 452,726 outputs. Bar widths are the row's share of the largest row, not of
+the cap. **This example is a copy-paste source — regenerate the numbers from the
+constants rather than editing them by hand.** The earlier version of this table
+carried 43,029,120,000 and 17,970,880,000, which were pre-measurement drafts.
 
 ### State pill
 
@@ -383,9 +405,9 @@ protocol's own running state. Everything semantic uses the state ramps.
 
 ```html
 <div class="status"><div class="statgrid">
-  <dl class="stat"><dt>Genesis-3 height</dt><dd>37,731</dd><div class="sub">measured today</div></dl>
-  <dl class="stat"><dt>Halts at</dt><dd>50,000</dd><div class="sub">consensus rule</div></dl>
-  <dl class="stat"><dt>Block time</dt><dd>21.6<span class="unit"> s</span></dd><div class="sub">trailing average</div></dl>
+  <dl class="stat"><dt>Genesis-3 final height</dt><dd>39,918</dd><div class="sub">halted 2026-08-13</div></dl>
+  <dl class="stat"><dt>Consensus</dt><dd class="mono-dd">Proof of stake</dd><div class="sub">Genesis-4, live</div></dl>
+  <dl class="stat"><dt>Slot time</dt><dd>30<span class="unit"> s</span></dd><div class="sub">protocol constant</div></dl>
   <dl class="stat"><dt>Signature</dt><dd class="mono-dd">ML-DSA-65 ‖ Falcon-1024</dd><div class="sub">both must verify</div></dl>
 </div></div>
 ```
@@ -411,6 +433,29 @@ protocol's own running state. Everything semantic uses the state ramps.
 The strip's copy rule travels with it: **every figure is either measured and
 labelled as such, or planned and labelled as such.** A number with no label
 does not ship.
+
+**The previous version of this example broke that rule three times over, and it
+is worth recording why, because the strip is the most-pasted component here:**
+
+| Was | Why it failed the rule | Now |
+|---|---|---|
+| `Genesis-3 height / 37,731 / measured today` | "Measured today" was baked into a static file, so it was a lie the day after it was written — and the height is no longer moving at all | `Genesis-3 final height / 39,918 / halted 2026-08-13` — a frozen value labelled with the date it froze |
+| `Halts at / 50,000 / consensus rule` | A planned ceiling the chain never reached. It stopped at 39,918 | Replaced with the live consensus, since there is no future halt to announce |
+| `Block time / 21.6 s / trailing average` | A trailing average is a measurement of proof-of-work variance. Under proof of stake the slot is a **fixed 30 s protocol constant** — averaging it would invent variance that the protocol does not have | `Slot time / 30 s / protocol constant` |
+
+Two further rules for this component specifically:
+
+- **A live figure must come from the live source or not appear.** Genesis-4
+  values come from the public read RPC (`https://posternlabs.com/g4rpc`);
+  protocol constants come from `crates/bloch-pos-committee/src/params.rs`. Never
+  hard-code either into a template.
+- **Never publish a confirmation-depth stat for Genesis-4.** Settlement is by
+  epoch finality, not depth: a "12 confirmations" tile would describe a rule the
+  chain does not have. If the strip states settlement, it states
+  `Finality / by epoch / ~32 min`.
+
+The signature row is correct and stays: `ML-DSA-65 ‖ Falcon-1024`, both halves
+verified.
 
 ---
 

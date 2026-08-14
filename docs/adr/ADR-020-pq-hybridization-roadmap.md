@@ -1,6 +1,8 @@
 # ADR-020 — PQ Hybridization Roadmap
 
-- **Status:** Proposed
+**Status:** **SUPERSEDED** — The roadmap is organised around hybridising **BLS12-381**, which Genesis-4 does not use anywhere. The live chain signs every consensus message with hybrid ML-DSA-65 ‖ Falcon-1024 and has no elliptic-curve signature on any consensus path. **One line here must not be read as current:** the live network transport is **not** post-quantum — see ADR-021. The chain this ADR governs — Genesis-3, proof of work — stopped permanently at height **39,918** on 2026-08-13. The live chain is **Genesis-4, proof of stake** (30 s slots, 32-slot epochs, finality by epoch, hybrid ML-DSA-65 ‖ Falcon-1024, no mining). The decision, context and consequences below are **not** rewritten: this is a decision log and what was decided, when, is the record. Read it as history, not as guidance.
+
+*Original status line, retained:* - **Status:** Proposed
 - **Date:** 2026-04-30
 - **Author:** BLOCH Founder
 - **Sprint:** 2.1.C-rev1 (post Phase β Day 0)

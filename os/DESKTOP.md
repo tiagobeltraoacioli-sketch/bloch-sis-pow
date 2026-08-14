@@ -4,9 +4,15 @@ A Postern Labs product: the first real step from *"an OS that runs the node"*
 toward *"a Linux people daily-drive for privacy"* — the personalized-Linux vision
 (an Android/RedHat-style curated distro), built declaratively on NixOS.
 
-Built on the **ownerless Bloch-SIS-PoW protocol**'s tooling, but the OS is a
-Postern Labs product — and anyone may build their own privacy OS on the same open
-protocol.
+Built on the Bloch-SIS-PoW tooling, but the OS is a Postern Labs product — and
+anyone may build their own privacy OS on the same open protocol.
+
+> **The node it bundles is Genesis-3.** `postern-desktop` is built from
+> `os/package.nix`, which builds `bloch`, the proof-of-work node whose chain
+> stopped permanently at height 39,918 on 2026-08-13. The live chain is
+> **Genesis-4, proof of stake**; its binary `bloch-pos` is not packaged for Nix
+> — see the banner in `flake.nix`. "Ownerless" was retracted, see
+> `docs/adr/ADR-036-retract-ownerless-adopt-foundation.md`.
 
 ## What's in it (`os/desktop.nix`)
 

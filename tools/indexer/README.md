@@ -27,11 +27,22 @@ It persists to a simple embedded JSON store and exposes a small read API.
   No claim is made that it "works end-to-end against mainnet."
 - **Testnet-only reference.** Defaults encode addresses with the testnet
   `bloch1t…` prefix.
+- **HISTORICAL — GENESIS-3.** This indexer targets the proof-of-work chain's
+  RPC (`getblockbyheight`, `getdaginfo`, height-keyed reorg handling). That
+  chain stopped permanently at height 39,918 on 2026-08-13. The live chain is
+  **Genesis-4, proof of stake** — 30 s slots, 32-slot epochs, finality by epoch,
+  blocks addressed by **slot** rather than by height — so the reorg model here
+  does not apply to it, and this tool has not been ported.
 - **Test BLCH has NO value.** BLCH is **not a security**; nobody makes any value
-  or investment claim. The base is experimental mainnet-beta: relaxed PoW (k=4)
-  is trivially forgeable and the network is 51%-attackable.
-- **Bloch is ownerless and neutral.** Postern Labs is **one builder among many**
-  with **no protocol privilege**.
+  or investment claim. The old rail — relaxed PoW at k=4, trivially forgeable,
+  the network 51%-attackable — described Genesis-3. Under Genesis-4 the
+  security question is concentration: **all 64 validators are run by one
+  entity**, **93.94% of the carryover sits at a single address**, and **56.05 B
+  of the 57.15 B BLOCH issued at genesis is held by the founder and the
+  Foundation**.
+- **Postern Labs is one builder among many** with **no protocol privilege**.
+  ("Ownerless" was retracted — see
+  `docs/adr/ADR-036-retract-ownerless-adopt-foundation.md`.)
 
 Why this exists: the roadmap (§2.1 / Phase 0) notes that Bloch's existing
 address-history indexer **does not roll back on reorg**, which makes it

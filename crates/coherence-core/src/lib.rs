@@ -1,7 +1,16 @@
 //! Coherence shielded-pool primitives — the lean, portable core.
 //!
-//! Single source of truth shared by the node (`bloch::coherence` re-exports
-//! this), the SP1 guest prover (`crates/coherence-prover`), and the mobile
+//! > **Not live on Genesis-4.** These primitives were built for the Genesis-3
+//! > proof-of-work node (`legacy/genesis3-node`, which re-exports them as
+//! > `bloch::coherence`); that chain stopped permanently at height 39,918 on
+//! > 2026-08-13. The live chain is **Genesis-4, proof of stake**, and it has
+//! > **no shielded pool**: `bloch-pos-node` does not depend on this crate, and
+//! > no Genesis-4 transaction type is shielded. This crate reaches the live
+//! > build only transitively, as a dependency of `bloch-crypto`. Nothing here
+//! > has been audited.
+//!
+//! Single source of truth shared by the Genesis-3 node, the SP1 guest prover
+//! (`crates/coherence-prover`), and the mobile
 //! wallet. Implements the C1-frozen formats (`docs/specs/COHERENCE-C1.md`):
 //! SHAKE-256 note commitments, hash-derived nullifiers, a SHAKE-256 incremental
 //! Merkle accumulator, and `check_spend` — the exact statement the ZK circuit

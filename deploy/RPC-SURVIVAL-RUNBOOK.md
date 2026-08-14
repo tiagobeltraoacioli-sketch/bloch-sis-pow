@@ -1,7 +1,25 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
 
-# RPC survival runbook — Genesis-3 halt at height 80,000
+# RPC survival runbook — Genesis-3 halt (planned for height 80,000)
 
+> **Historical — Genesis-3, and overtaken by events.** This was written
+> 2026-08-11/12, when the Genesis-3 halt was expected at height **80,000**
+> around 2026-08-27/28. Neither happened. The terminal-height constant was
+> later lowered to **50,000** (`crates/bloch-crypto/src/core/mod.rs:444`), and
+> the chain in fact stopped permanently at height **39,918** on **2026-08-13**
+> (`crates/bloch-pos-committee/src/tokenomics_v4.rs` `CARRYOVER_MEASURED_HEIGHT`)
+> — below both figures — when Genesis-4 took over.
+>
+> **Genesis-4, proof of stake, has been live since 21:31:19 UTC on 2026-08-13**
+> (30 s slots, 32-slot epochs, finality by epoch). Its public read RPC is
+> `https://posternlabs.com/g4rpc`. So every "~6 months until Genesis-4",
+> "at today's hashrate", "the pool", "the halt is coming" and "today" below is
+> **as of 2026-08-12**, not now. The technique — how a Pages Function reaches an
+> origin, why a proxied hostname yields error 1003, how the archival RPC was
+> decoupled from the pool box — is why the document is kept. Its schedule,
+> heights and fleet state are not current, and none of its numbered steps should
+> be executed against the fleet today without re-measuring first.
+>
 > **Redacted for publication.** Host addresses by role, SSH key filenames, Cloudflare
 > account/zone/tunnel identifiers, per-box free disk and RAM, and firewall rule listings
 > were replaced with placeholders. None of them were secrets — together they were an
@@ -74,6 +92,10 @@ That record was not created here because the available Cloudflare token carries
 ---
 
 ## 1. The problem
+
+*(As written on 2026-08-12. Superseded — see the banner: the constant was
+later lowered to 50,000 and the chain actually stopped at 39,918 on
+2026-08-13, with Genesis-4 live the same day rather than in ~6 months.)*
 
 The Genesis-3 chain ends at `GENESIS3_TERMINAL_HEIGHT = 80_000`
 (`crates/bloch-crypto/src/core/mod.rs:438`; the height 80,000 block itself is

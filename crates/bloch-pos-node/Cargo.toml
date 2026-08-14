@@ -50,10 +50,13 @@ bloch-pos-committee = { path = "../bloch-pos-committee" }
 bloch-crypto = { path = "../bloch-crypto" }
 sha3 = "0.10"
 
-# The production network layer (src/p2p.rs). Same major version the Genesis-3
-# node runs (0.56), so the mesh fixes ported from it apply to the same
-# behaviour code — libp2p-gossipsub 0.49.x is where `behaviour.rs:2224` and
-# `:1395`, the two lines behind the 2026-08-07 mesh collapse, actually live.
+# The libp2p network layer (src/p2p.rs) — available behind `--transport libp2p`
+# and NOT what the live fleet runs; `--transport devnet` (a fixed-peer TCP full
+# mesh, no discovery, no authentication) is still the default. Same major
+# version the Genesis-3 node ran (0.56), so the mesh fixes ported from it apply
+# to the same behaviour code — libp2p-gossipsub 0.49.x is where
+# `behaviour.rs:2224` and `:1395`, the two lines behind the 2026-08-07 mesh
+# collapse, actually live.
 #
 # Feature choices worth stating: `noise` and NOT the Genesis-3 Kyber768
 # transport upgrade (see the honesty note in src/p2p.rs — consensus signatures

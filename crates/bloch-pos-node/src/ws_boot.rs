@@ -16,14 +16,17 @@
 //!    data dir. When none exists the **genesis anchor is the first
 //!    checkpoint** ([`ws::genesis_anchor`]): trusting it is trusting the
 //!    genesis manifest, the same trust every node of the network already
-//!    makes to exist at all — which is exactly why a fresh devnet still boots
-//!    with no flags.
+//!    makes to exist at all — which is exactly why a fresh network still
+//!    boots with no flags.
 //! 2. **`--ws-checkpoint <file>`**: a [`CheckpointEnvelope`] loaded from disk
 //!    and verified m-of-n under the real hybrid suite
 //!    ([`ws::verify_envelope`] through [`WsHybridVerifier`] →
-//!    `bloch_crypto`). This devnet build bakes no Phase A signer keys, so the
-//!    arrangement comes from `--ws-signer-set <file>`; a release build will
-//!    hard-code the §6 sets and the flag becomes an override.
+//!    `bloch_crypto`). **This build, including the one the live fleet runs,
+//!    bakes no Phase A signer keys**, so the arrangement comes from
+//!    `--ws-signer-set <file>` — meaning there is no published weak-subjectivity
+//!    signer set today and a newcomer's anchor is whatever file its operator
+//!    was handed. A later build hard-codes the §6 sets and the flag becomes an
+//!    override.
 //! 3. **Anti-rollback** ([`ws::accept`]): an envelope older than `ws_latest`
 //!    is logged and ignored; the same epoch with a different digest is
 //!    [`Acceptance::Conflict`] and refuses the boot loudly — a stolen old
@@ -46,7 +49,7 @@
 //! chain that contradicts its trust anchor; a node that booted on its own
 //! finality treats it as the WS_CONFLICT alarm, never a reorg.
 //!
-//! ## Honestly not wired (devnet stage)
+//! ## Honestly not wired — and this is the live mainnet build
 //!
 //! Checkpoint-sync state download (§4.3.2) does not exist — this node syncs
 //! by replaying full blocks from genesis, so a non-genesis anchor is a
@@ -90,11 +93,17 @@ impl HybridKeyVerifier for WsHybridVerifier {
     }
 }
 
-/// Devnet network id, derived from the genesis-manifest digest: each devnet
-/// is its own network, so a checkpoint from one can never verify on another
-/// (`WrongNetwork`/`WrongGenesisRoot` by construction). The mainnet manifest
-/// format — a superset that does not exist yet — will carry an explicit,
-/// published network id instead.
+/// Network id derived from the genesis-manifest digest: each manifest is its
+/// own network, so a checkpoint from one can never verify on another
+/// (`WrongNetwork`/`WrongGenesisRoot` by construction).
+///
+/// This is what the LIVE Genesis-4 mainnet uses too. The mainnet manifest
+/// format (built by `bloch-pos genesis-mainnet`) is a superset of the test one
+/// and it exists, but it does **not** carry an explicit, published network id —
+/// the id is still derived here from its digest. Stated because an earlier
+/// version of this comment said the mainnet format did not exist yet and would
+/// carry one; the first half stopped being true on 2026-08-13 and the second
+/// half is still pending.
 pub fn network_id_of(genesis_digest: &[u8; 32]) -> u32 {
     u32::from_le_bytes(genesis_digest[..4].try_into().unwrap())
 }
@@ -175,9 +184,11 @@ pub fn decode_envelope_file(bytes: &[u8]) -> Result<CheckpointEnvelope, DecodeEr
     Ok(CheckpointEnvelope { checkpoint, signatures })
 }
 
-/// Encode a signer arrangement (devnet aid — a release build hard-codes the
-/// §6 arrangements next to its pinned genesis, and this file form becomes a
-/// test fixture). Pubkeys are the RAW hybrid halves (`HYBRID_PK_BYTES`), the
+/// Encode a signer arrangement. This file form is how EVERY build, the live
+/// mainnet one included, learns its signer set today: no build hard-codes the
+/// §6 arrangements yet. When one does, it will carry them next to its pinned
+/// genesis and this file form becomes a test fixture.
+/// Pubkeys are the RAW hybrid halves (`HYBRID_PK_BYTES`), the
 /// form `ws::Signer` carries — not the 4-byte suite envelope.
 #[allow(dead_code)] // written by the release/ceremony side, read by the node.
 pub fn encode_signer_set_file(set: &SignerSet) -> Vec<u8> {
@@ -337,9 +348,9 @@ pub fn boot(
             .map_err(|e| bad(format!("{}: {e}", path.display())))?;
         let Some(set_path) = &cfg.signer_set else {
             return Err(bad(
-                "--ws-checkpoint given but no signer arrangement is known: this devnet \
-                 build bakes no Phase A keys, so pass --ws-signer-set <file> (release \
-                 builds will carry the arrangement of BLOCH-WEAK-SUBJECTIVITY.md §6)"
+                "--ws-checkpoint given but no signer arrangement is known: no build \
+                 bakes Phase A keys yet, so pass --ws-signer-set <file> (a later \
+                 build will carry the arrangement of BLOCH-WEAK-SUBJECTIVITY.md §6)"
                     .into(),
             ));
         };
@@ -489,8 +500,8 @@ pub fn boot(
                          is wrong, that is how evidence disappears.\n  \
                          local finalized root: {}\n  checkpoint root:      {}\n\
                          Either local history was forged while the node was away, or \
-                         the published checkpoint is wrong (or, at this devnet stage, \
-                         the checkpoint is simply beyond the local head and \
+                         the published checkpoint is wrong (or the checkpoint is \
+                         simply beyond the local head and \
                          header-sync-forward is not implemented). Resuming requires an \
                          explicit operator decision: compare both roots against \
                          operators you trust, then move the data dir aside by hand. \
@@ -559,8 +570,8 @@ fn where_checkpoints_come_from() -> String {
      2. Compare its 64-hex ws digest across AT LEAST TWO independent channels — \
      agreement across independent operators is the evidence, not the artifact's \
      say-so.\n  \
-     3. Restart with:  --ws-checkpoint <file>   (on devnet builds also \
-     --ws-signer-set <file>, since no signer arrangement is baked in)."
+     3. Restart with:  --ws-checkpoint <file>   (also --ws-signer-set <file>, \
+     since no build yet bakes a signer arrangement in)."
         .to_string()
 }
 

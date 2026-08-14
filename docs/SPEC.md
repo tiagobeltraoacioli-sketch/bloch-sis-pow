@@ -1,20 +1,39 @@
 # Bloch-SIS Protocol — Standalone Specification (v0.1, frozen-for-audit draft)
 
-> **Genesis-3-era document — sealed 2026-08-12.** Bloch's proof-of-work
-> chain halts by consensus rule at the terminal height (50,000) and
-> Genesis-4 relaunches as proof of stake; the ownerless thesis was
-> retracted (`docs/adr/ADR-036-retract-ownerless-adopt-foundation.md`).
+> **Historical — Genesis-3.** This describes the proof-of-work chain that
+> stopped permanently at height 39,918 on 2026-08-13. The live chain is
+> **Genesis-4, proof of stake** (30 s slots, 32-slot epochs, finality by
+> epoch). Kept because Genesis-4's opening ledger is derived from it. It is
+> not what runs.
 >
-> §1 (hybrid signature construction), §2 (keys and addresses), §4 (transaction
-> wire format) and §10 (crypto-agility) are reused by Genesis-4 and stand.
-> §3 (proof of work), §5 (block/header wire format), §7 (fork choice) and §8
-> (hard-fork map) describe a consensus that is ending. Index: `docs/README.md`.
+> Genesis-4 has been live under proof of stake since 21:31:19 UTC on
+> 2026-08-13. Genesis-3's terminal DAG held 50,690 blocks at height 39,918.
+> The ownerless thesis was retracted
+> (`docs/adr/ADR-036-retract-ownerless-adopt-foundation.md`); a two-entity
+> foundation structure replaced it.
+>
+> **What survives into Genesis-4:** §1 (hybrid signature construction), §2
+> (keys and addresses), §4 (transaction wire format) and §10 (crypto-agility).
+> **What is history only:** §3 (proof of work), §5.2–5.3 (mining header and
+> PoW preimage), §6 (P2P and transport as they were under Genesis-3), §7.1–7.2
+> (PoW block validity and GhostDAG fork choice) and §8 (the PoW hard-fork map).
+> §7.3 has been corrected because it stated a supply rule that is now false.
+> Index: `docs/README.md`.
 
-**Status: advisory / design-freeze draft. This is a PLAN and a description of the
-code as it exists, NOT a claim of security.** No cryptographic audit has been
-performed. Nothing here is "secure," "proven," "audited," or "quantum-safe." The
-coin has no value and is not a security; no revenue touches the token. This
-document is not legal or financial advice.
+**Status: historical record of the Genesis-3 protocol, NOT a claim of security.**
+It was written as an advisory / design-freeze draft describing the code as it
+stood; the consensus sections now describe a chain that has stopped. **No
+cryptographic audit has been performed. No external audit has been completed.**
+Nothing here is "secure," "proven," "audited," or "quantum-safe." This document
+is not legal or financial advice.
+
+> **The live risk is concentration.** The security question under Genesis-4 is
+> not hashrate, it is concentration: all 64 validators are run by one entity,
+> 93.94% of the carryover sits at a single address, and 56.05 B of the 57.15 B
+> BLOCH issued at genesis is held by the founder and the Foundation. One
+> operator can halt the chain and one holder can outvote every other. Every
+> "zero security" and "low hashrate" caveat below is a Genesis-3 caveat and has
+> been superseded by this one, not removed.
 
 This spec exists so an external auditor does not have to reverse-engineer intent
 from the source. Every normative statement is grounded in a cited `file:line` in
@@ -223,9 +242,16 @@ the wallet file. Note two non-unified notions of "derived key" coexist
 
 ---
 
-## 3. Proof-of-Work — Bloch-SIS-PoW (FROZEN structure, UNFROZEN security params)
+## 3. Proof-of-Work — Bloch-SIS-PoW (Genesis-3 only; HISTORICAL)
 
-**Crate:** `crates/bloch-sis-pow`. This is a **SHAKE-256 hashcash with a
+> **Scope: Genesis-3.** Nothing in §3 is a rule of the live chain. Bloch-SIS-PoW
+> produced blocks up to height 39,918 and stopped there on 2026-08-13.
+> Genesis-4 has no proof of work: blocks are produced by a committee-elected
+> proposer once per 30 s slot and settled by Casper-style justification and
+> finalisation at 32-slot epoch boundaries. Read §3 as the record of how the
+> ledger Genesis-4 inherited was mined, not as protocol.
+
+**Crate:** `crates/bloch-sis-pow`. This was a **SHAKE-256 hashcash with a
 Module-SIS structural gate.**
 
 > **SECURITY HONESTY (verbatim intent from `lib.rs:16-26`):** the PoW's security
@@ -287,12 +313,15 @@ diverge.
 
 | Regime | `k` | Constant | Structural rejection floor ≈ `k·log2(q/2β) = 3k` bits | Security |
 |---|---|---|---|---|
-| Testnet (pre-activation) | 4 | `TESTNET_RESIDUAL_COEFFS` (`lib.rs:115`) | ~2¹² | **ZERO by design** |
+| Pre-activation (Genesis-3) | 4 | `TESTNET_RESIDUAL_COEFFS` (`lib.rs:115`) | ~2¹² | **ZERO by design** |
 | Canonical (post-activation) | 8 | `CANONICAL_RESIDUAL_COEFFS` (`lib.rs:162`) | ~2²⁴ | candidate; still hashcash-only |
 | Full-`M` compat | 512 | `params::M` | — | **broken both ways** (see below) |
 
-- **k = 4 is explicitly ZERO security** (`lib.rs:109-115`). Testnet mining is
-  gated only by the relaxed residual plus an easy aux target.
+- **k = 4 was explicitly ZERO security** (`lib.rs:109-115`). Mining below the
+  activation height was gated only by the relaxed residual plus an easy aux
+  target. This is a statement about Genesis-3's structural gate; it is not the
+  live chain's risk. The live risk is the concentration disclosed at the top of
+  this document.
 - **Soft fork SF-1 (k: 4 → 8)** is a pure *tightening*: because the residual
   check inspects the first `k` coefficients, any `k=8`-valid solution is
   automatically `k=4`-valid (prefix subset) — old nodes accept new-rule blocks
@@ -314,18 +343,27 @@ k·β² < q²` is asserted at **compile time** for both k=4 and k=8, and via
 `debug_assert!` in `mine`/`verify_regime` for any runtime width. This keeps the
 gate structurally non-trivial; it is defensive engineering, not a security proof.
 
-**Activation height is a PLACEHOLDER.** `CANONICAL_K_ACTIVATION_HEIGHT =
-1_000_000` (`core/mod.rs`) is a clearly-future placeholder that **MUST be set
-to `current tip + safety margin` before any live SF-1 deploy**, with every mining
-node upgraded before the chain reaches it. There being no live mainnet, the
-constant deliberately STAYS at the placeholder; a named `PLACEHOLDER_ACTIVATION_HEIGHT`
-mirror plus a **CI guard** (`core/mod.rs`, test `mainnet_release_guard::
-canonical_k_activation_height_is_set_for_mainnet`, gated behind a `mainnet` cargo
-feature) fails a mainnet artifact whose height is still the placeholder, is
-`u64::MAX`, or is implausibly large. Default `--features node` builds do not
-compile the guard and keep the placeholder green; the guard bites only when a
-mainnet release is cut. (The compile-time `CANONICAL ≥ TESTNET` assert stays
-independent and valid.)
+**SF-1 never activated — the chain mined its whole life at k = 4.** This
+paragraph originally described `CANONICAL_K_ACTIVATION_HEIGHT = 1_000_000` as a
+placeholder to be set to `current tip + safety margin` before any live SF-1
+deploy. Two things have since changed, and the second one is decisive:
+
+- The constant was moved off the placeholder to
+  `CANONICAL_K_ACTIVATION_HEIGHT = 40_320` (`core/mod.rs:509`), with
+  `PLACEHOLDER_ACTIVATION_HEIGHT = 1_000_000` kept as a named mirror for the CI
+  guard (`mainnet_release_guard`, gated behind a `mainnet` cargo feature).
+- That fixed jump was then retired in favour of a difficulty-driven ramp gated
+  at `K_RULE_ACTIVATION_HEIGHT = 420_480` (`core/mod.rs`), and the selector
+  became `canonical_residual_coeffs(height, bits)` — **two arguments**, not the
+  single `height` this section and §5.3 describe. Below the gate the selector
+  returns `TESTNET_RESIDUAL_COEFFS` (k = 4) unconditionally.
+
+Genesis-3 stopped at height 39,918, below **both** gates. So SF-1 never fired,
+the k-ramp never fired, and every Genesis-3 block from genesis to the terminal
+height validated at k = 4 — the width this section labels ZERO security. That is
+a fact about the historical chain, not a live exposure: there is no live
+proof-of-work mainnet to activate anything on. (The compile-time
+`CANONICAL ≥ TESTNET` assert stays independent and valid.)
 
 ### 3.4 Domain separation (`shake.rs`)
 
@@ -478,9 +516,14 @@ BlockHeader { version:u32, parents:Vec<[u8;32]>, merkle_root:MerkleRoot,
 `MerkleRoot` is a `#[serde(transparent)]` newtype over `[u8;32]` — byte-identical
 on the wire to a bare array ("audit L-2"; `core/mod.rs:216-263`).
 
-### 5.2 The 80-byte MiningHeader (PoW projection)
+### 5.2 The 80-byte MiningHeader (PoW projection) — Genesis-3 only
 
-To let SHA-256d-style stratum tooling hash a fixed 80-byte structure, PoW is over
+> **Scope: Genesis-3.** §5.2 and §5.3 describe the mining projection and the SIS
+> instance. Genesis-4 has no mining header and no PoW witness; its block
+> identity is `SHA3-256(DS_BLOCK ‖ canonical header)` under the domain tags in
+> `crates/bloch-pos-committee/src/params.rs`. Historical record only.
+
+To let SHA-256d-style stratum tooling hash a fixed 80-byte structure, PoW was over
 a **projection** of the header (`core/mod.rs:275-387`):
 
 ```
@@ -509,8 +552,9 @@ bits` (`core/mod.rs:591-598`). The SIS crate derives its seed as
 `SHAKE256(SEED_DOMAIN ‖ preimage ‖ nonce_le)` with the **full u64** `header.nonce`
 supplied separately — the nonce must NOT appear in the preimage.
 
-`Block::validate_pow` verifies the block's `pow_solution` against this instance at
-`canonical_residual_coeffs(height)` (§3.3). `dag_hash = SHA3-256(full_bytes)` over
+`Block::validate_pow` verified the block's `pow_solution` against this instance at
+`canonical_residual_coeffs(height)` — the selector now takes `(height, bits)`,
+see §3.3. `dag_hash = SHA3-256(full_bytes)` over
 the complete header (all fields) is a **separate** identifier used for DAG
 indexing, not for PoW (`core/mod.rs:600-622`).
 
@@ -565,11 +609,22 @@ format; changing it is a hard fork.
 
 ---
 
-## 6. P2P wire format
+## 6. P2P wire format — Genesis-3 only (HISTORICAL)
 
-### 6.1 Application/gossip layer (`src/network/mod.rs`)
+> **Scope: Genesis-3. This is NOT the live network layer.** §6 describes the
+> Genesis-3 node's P2P stack. The live Genesis-4 fleet runs
+> `Transport::Devnet` (`crates/bloch-pos-node/src/net.rs`,
+> `main.rs:791-806`): **a point-to-point TCP full mesh with a fixed peer list,
+> no discovery and no authentication, which is why a third party cannot yet
+> join the network.** A libp2p module exists in-tree but is not what the fleet
+> runs. Do not read anything in §6 as a description of a production network
+> layer that exists today — neither the gossip mesh of §6.1 nor the
+> authenticated PQ handshake of §6.2 is live.
 
-Transport is **libp2p gossipsub + mDNS + identify** (`network/mod.rs:115-126`).
+### 6.1 Application/gossip layer (`src/network/mod.rs`) — Genesis-3
+
+Under Genesis-3 the transport was **libp2p gossipsub + mDNS + identify**
+(`network/mod.rs:115-126`). It is not the live transport; see the §6 scope note.
 `NETWORK_MAGIC = 0x424C5349` ("BLSI", `core/mod.rs:17`). Application messages
 (`network/mod.rs:44-73`) are a serde enum:
 
@@ -594,9 +649,16 @@ trust anchors — the block is re-hashed and PoW-verified). These application
 messages are **not themselves signed** at the app layer; their integrity rests on
 re-validation plus the transport layer below.
 
-### 6.2 PQ transport handshake (`src/transport/mod.rs`)
+### 6.2 PQ transport handshake (`src/transport/mod.rs`) — Genesis-3, NOT live
 
-A separate authenticated PQ transport exists (not the default libp2p path; see
+> **This handshake secures nothing today.** It is Genesis-3 code, it was never
+> the default path even there, and the live Genesis-4 fleet does not use it or
+> any other authenticated transport — the live transport is an unauthenticated
+> fixed-peer TCP mesh (§6 scope note). Describing Bloch as having an
+> authenticated post-quantum network layer would be false.
+
+A separate authenticated PQ transport exists in the Genesis-3 tree (not the
+default libp2p path; see
 §11 for the two parallel handshakes). `DOMAIN_MAGIC = "BLOCH-PQ-v1-handshake"`,
 `PQ_PROTOCOL_VERSION = 1` (`transport/mod.rs:86-89`). It is a **Kyber768 KEM +
 hybrid-signature-authenticated** handshake:
@@ -628,9 +690,15 @@ detail an auditor must pin down before scoping the network layer.
 
 ## 7. Consensus rules (re-derivable summary)
 
-### 7.1 Block validity (validator: `Block::validate_pow` + `src/main.rs` accept path)
+### 7.1 Block validity (validator: `Block::validate_pow` + `src/main.rs` accept path) — Genesis-3
 
-A block is valid iff:
+> **Scope: Genesis-3.** These were the validity rules of the proof-of-work
+> chain. Genesis-4 validates a slot-proposed block against the committee
+> schedule and the hybrid ML-DSA-65 ‖ Falcon-1024 proposer and attester
+> signatures; there is no `pow_solution`, no `bits`, and no ASERT difficulty in
+> a Genesis-4 block. Read the list below in the past tense.
+
+A Genesis-3 block was valid iff:
 
 1. **Wire well-formedness:** parses under §5.5 with no trailing garbage; bounded
    counts.
@@ -655,7 +723,14 @@ A block is valid iff:
 Genesis is pinned (`GENESIS_*`, `core/mod.rs:95-182`), including a testnet-regime
 `GENESIS_POW_SOLUTION` (zero security; the mainnet ceremony re-mines).
 
-### 7.2 Fork choice — GhostDAG (`src/consensus/mod.rs`)
+### 7.2 Fork choice — GhostDAG (`src/consensus/mod.rs`) — Genesis-3
+
+> **Scope: Genesis-3.** GhostDAG is not the live fork-choice rule. Genesis-4
+> orders blocks by slot with an LMD-GHOST-style fork choice weighted by
+> attestations from the per-slot subcommittee (`SLOT_SUBCOMMITTEE_SIZE = 8`),
+> and settles them by Casper-style justification and finalisation at epoch
+> boundaries. Genesis-3's terminal DAG contained 50,690 blocks at height
+> 39,918.
 
 - Parameter `GHOSTDAG_K = 10` (`core/mod.rs:18`; `GhostDAG::with_default_k`,
   `consensus/mod.rs:487-494`).
@@ -666,30 +741,81 @@ Genesis is pinned (`GENESIS_*`, `core/mod.rs:95-182`), including a testnet-regim
   fed by `work_from_bits`, §3.5).
 - Canonical head is the tip of maximal accumulated work; `is_ancestor` uses
   blue_score/height shortcuts (`consensus/mod.rs:282-299`).
-- **Finality/anti-reorg:** reorgs deeper than `CHECKPOINT_DEPTH = 1000` are
-  rejected; block bodies pruned below `tip − PRUNING_DEPTH = 10_000`
-  (`core/mod.rs:79-80`). Reorg re-validates inputs/no-double-spend/value/maturity
-  (`src/reorg.rs`).
+- **Anti-reorg (Genesis-3, work depth — NOT finality):** reorgs deeper than
+  `CHECKPOINT_DEPTH = 1000` were rejected; block bodies pruned below
+  `tip − PRUNING_DEPTH = 10_000` (`core/mod.rs:79-80`). Reorg re-validated
+  inputs/no-double-spend/value/maturity (`src/reorg.rs`). This is a **depth
+  heuristic over accumulated work**, not a finality rule: below 1000 blocks
+  nothing was settled, only progressively more expensive to undo.
 
-### 7.3 Emission (context)
+> **Finality under Genesis-4 — the live settlement rule.** Depth does not settle
+> anything on the live chain. **Finality, not confirmation depth and not work
+> depth, is the settlement rule.** Genesis-4 uses Casper-style justification and
+> finalisation evaluated **by epoch**: 32 slots of 30 s = one 16-minute epoch, a
+> committee of `COMMITTEE_SIZE = 128` voting at each epoch boundary, and a block
+> becomes final when the epochs above it are justified and finalised —
+> **typically ~32 minutes, ~48 minutes worst case**. A finalised block cannot be
+> reorganised without the committee equivocating; an unfinalised one carries no
+> settlement guarantee at any depth. Constants:
+> `crates/bloch-pos-committee/src/params.rs`. Nothing in §7.2 above defines
+> finality for the live chain.
+>
+> The honest caveat that travels with this: all 64 genesis validators are run by
+> **one entity**, so the >2/3 quorum that finalises is a single operator's
+> quorum. One operator can halt the chain. See the concentration disclosure at
+> the top of this document.
 
-Tokenomics (`tokenomics_v2.rs`): initial subsidy 8,400 BLOCH,
-`HALVING_INTERVAL = 1_036_800` (~1 yr @ 30 s) — this V2 curve governs only
-heights below the **Emission V3** flag-day fork at local height 40,000
-(emission height 453,743 incl. carryover). From the fork: subsidy
-2,600 BLOCH (`EMISSION_V3_INITIAL_REWARD_BLOCH`), halving every 1,555,200
-blocks (~1.5 yr, `EMISSION_V3_HALVING_INTERVAL`, counter restarts at the
-fork), schedule 2,600 → 1,300 → 650 → 325 → 162 → 81 then a perpetual
-60 BLOCH tail floor from V3 epoch 6 (~9 yr after the fork; the V2 floor
-of 100 governs pre-fork history; supply is **not hard-capped**; see
-`legacy/specs/TOKENOMICS_V3.md`). **The coin is
-valueless by design** — emission parameters do not confer value or a security.
+### 7.3 Emission and supply — CORRECTED
+
+**The live supply rule: 100,000,000,000 BLOCH, hard-capped.** Source:
+`crates/bloch-pos-committee/src/tokenomics_v4.rs:84`
+(`TOTAL_SUPPLY_BLOCH = 100_000_000_000`), with a compile-time assert that
+carryover + genesis allocations + validator emission sum to exactly that figure.
+The breakdown:
+
+| Component | BLOCH | Share of cap |
+|---|---|---|
+| Carried over from Genesis-3 (452,726 outputs at height 39,918) | 18,146,400,000 | 18.15% |
+| Genesis allocations (founder grant + Foundation) | 39,000,000,000 | 39.00% |
+| **Issued at slot 0** | **57,146,400,000** | **57.15%** |
+| Validator emission over 40 years (unissued) | 42,853,600,000 | 42.85% |
+| **Hard cap** | **100,000,000,000** | **100%** |
+
+> **This section previously said the opposite and it was wrong.** The retired
+> text described the Genesis-3 V2/V3 curve — initial subsidy 8,400 BLOCH,
+> `HALVING_INTERVAL = 1_036_800`, an Emission V3 fork at local height 40,000
+> dropping the subsidy to 2,600 BLOCH, and a **perpetual 60 BLOCH tail floor**
+> under which "supply is **not hard-capped**". None of that governs the live
+> chain. The V3 fork at 40,000 was never even reached: Genesis-3 halted at
+> 39,918. Any surviving text that says Bloch is "not hard-capped", "21 billion
+> nominal", or has a "perpetual tail" is false for Genesis-4. The Genesis-3
+> curve is preserved as history in `legacy/specs/TOKENOMICS_V3.md`.
+
+The cap is a consensus invariant of the Genesis-4 code, stated at its true
+strength: there is no mechanism *inside* the protocol that can raise it, and a
+universal hard fork can change any rule.
+
+**Concentration — the material fact about this supply.** The largest carryover
+address holds 17,046,829,380 BLOCH, **93.94% of the carryover**
+(`LARGEST_CARRYOVER_ADDRESS_BLOCH`, `tokenomics_v4.rs:414`). Founder total is
+27,046,829,380 BLOCH = **27.04% of the cap**, pinned by a compile-time assert at
+2704 bps (`FOUNDER_TOTAL_BLOCH`, `tokenomics_v4.rs:434-435`). The Foundation
+holds a further **29.00%** (VC 10 B, team 10 B, marketing 4 B, liquidity 5 B).
+Founder and Foundation together hold 56,046,829,380 of the 57,146,400,000 BLOCH
+issued at genesis, leaving **1,099,570,620 BLOCH — 1.92% — in third-party
+hands**. One holder can outvote every other. No external audit has been
+completed.
 
 ---
 
-## 8. What changing a field costs (hard-fork map)
+## 8. What changing a field costs (hard-fork map) — Genesis-3
 
-Changing any of the following is a **hard fork** (new genesis, incompatible
+> **Scope: Genesis-3.** This map priced changes to the proof-of-work chain. The
+> PoW rows are moot — that chain has stopped. The rows covering the signature
+> envelope, the address scheme and the sighash still price real changes,
+> because those surfaces carry into Genesis-4 (§1, §2, §4, §10).
+
+Changing any of the following was a **hard fork** (new genesis, incompatible
 chain): the PoW params `N/M/q/B/β` (`params.rs:5`); the three PoW domain labels
 (`lib.rs:183-194`); the mining-header 80-byte layout or `pow_hash`
 (`core/mod.rs:333-335, 456-457`); the block/header wire format
@@ -710,14 +836,17 @@ suite-committing address change (§2.1).
 | Tx wire format + txid | **Freeze candidate** | §4.2–4.3 |
 | Tx sighash (chain-id bound, v2) | **Freeze candidate — chain-id fix landed (§4.4)** | §4.4 |
 | Block/header wire format | **Freeze candidate** | §5 |
-| PoW structure (seed/expand/residual/aux) | **Freeze candidate** | §3 |
-| PoW canonical `(k, β)` | **NOT frozen** — research track | §3.1, §3.3 |
-| `CANONICAL_K_ACTIVATION_HEIGHT` | **NOT set** — placeholder | §3.3 |
-| P2P app messages | v1, small; freeze candidate | §6.1 |
-| PQ transport handshake | v1; two variants, needs consolidation | §6.2, §11 |
+| PoW structure (seed/expand/residual/aux) | **Moot** — Genesis-3 only | §3 |
+| PoW canonical `(k, β)` | **Moot** — never activated; chain ran at k = 4 | §3.1, §3.3 |
+| `CANONICAL_K_ACTIVATION_HEIGHT` | **Moot** — set to 40_320, then superseded by `K_RULE_ACTIVATION_HEIGHT = 420_480`; neither was reached | §3.3 |
+| P2P app messages | **Moot** — Genesis-3 gossip; not the live transport | §6.1 |
+| PQ transport handshake | **Not live** — no authenticated transport runs today | §6.2, §11 |
 
 An audit of an unfrozen surface is worth little; §9 is the checklist of what to
-freeze first (roadmap P0.1).
+freeze first (roadmap P0.1). The rows marked **Moot** belong to the stopped
+chain — they are recorded, not scoped for audit. The four freeze-candidate rows
+above them are the ones Genesis-4 inherits. **No external audit has been
+completed on any of them.**
 
 ---
 
@@ -768,6 +897,17 @@ live output uses it yet.
    second implementation.
 4. **Stale verify comment.** `main.rs:1788` says "Verify ML-DSA-65 signature";
    the call is the full hybrid AND-combiner (§4.5).
+5. **The k-selector took a second argument after this spec was written.** §3.3
+   and §5.3 describe `canonical_residual_coeffs(height)`; the code is
+   `canonical_residual_coeffs(height, bits)` (`core/mod.rs:589`), a
+   difficulty-driven ramp gated at `K_RULE_ACTIVATION_HEIGHT = 420_480`. Both
+   forms return k = 4 for every height Genesis-3 ever reached, so the historical
+   record in §3 is unaffected; the signature in the prose is not the code's.
+6. **This spec's own consensus sections outlived their chain.** §3, §5.2–5.3,
+   §6, §7.1–7.2 and §8 were written in the present tense about a live
+   proof-of-work network. That network stopped at height 39,918 on 2026-08-13.
+   They are now scoped as historical rather than deleted, because Genesis-4's
+   opening ledger is the ledger they describe.
 
 ---
 

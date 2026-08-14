@@ -2,6 +2,26 @@
 
 # Satoshi encoding — the rule, and why it is not the obvious one
 
+> **Genesis-4 is live.** Bloch has been running under **proof of stake** since
+> 21:31:19 UTC on 2026-08-13, when Genesis-3 (proof of work) stopped
+> permanently at height **39,918**. 30 s slots, 32-slot epochs, Casper-style
+> justification/finalisation by epoch, hybrid ML-DSA-65 ‖ Falcon-1024
+> signatures on every consensus path. Nothing in this document that describes
+> mining, hashrate, difficulty, retargeting or proof-of-work depth describes
+> the current network.
+>
+> **The live security question is concentration, not hashrate.** All 64
+> validators are operated by a single entity; 93.94% of the carryover
+> (17,046,829,380 of 18,146,400,000 BLOCH) sits at one address and carried
+> balances are stakeable, so if that balance stakes the Nakamoto coefficient
+> is 1; and 56,046,829,380 of the 57,146,400,000 BLOCH issued at slot 0 is
+> held by the founder and the Foundation, leaving 1.92% of genesis supply in
+> third-party hands. One operator can halt the chain and one holder can outvote
+> every other. The live transport is a point-to-point TCP full mesh with a
+> fixed peer list, **no discovery and no authentication**, and
+> `Deposit`/`Delegate` are refused at every node's mempool — which is why a
+> third party cannot yet join the network or become a validator.
+
 Status: normative for Genesis-4. Supersedes `BLOCH-RPC-V4.md` §6 point 1, which
 was written against the 21 B nominal and is now wrong on its central number.
 
@@ -98,7 +118,7 @@ Two things this rule does **not** claim:
 | Surface | File | Form |
 |---|---|---|
 | Contract | `docs/openapi.yaml` — `components.schemas.Satoshis` | `oneOf` [canonical string, legacy uint64], pattern `^(0\|[1-9][0-9]{0,19})$` |
-| Node RPC (Genesis-4) | `src/rpc/mod.rs` | emits strings |
+| Node RPC (Genesis-4) | `crates/bloch-pos-node/src/rpc.rs` | emits strings — `Json::sat` is the only way an amount leaves the module, pinned by `amounts_are_decimal_strings_not_json_numbers`. (`src/rpc/mod.rs` is the **Genesis-3** RPC and serves a chain that stopped at h39,918.) |
 | Go SDK | `sdk/go/satoshis.go` (generated from `sdk/codegen/static_assets.py`) | `type Satoshis uint64` + `MarshalJSON`/`UnmarshalJSON`/`ParseSatoshis` |
 | Go SDK tests | `sdk/go/satoshis_test.go` | round-trip, supply cap, negative, above-cap, legacy number, JavaScript vectors |
 | Python SDK | `sdk/python/blochclient/units.py` | `parse_sats` / `format_sats`, exact `int` |
@@ -116,9 +136,10 @@ comment, and both must be regenerated if it moves.
 Genesis-4 is a fresh chain, so there is no live consumer of the new wire to
 break. The migration cost lands entirely on tooling that also talks to the
 running Genesis-3 fleet — which is why readers are dual-tolerant (rule 5) and
-writers are not. When Genesis-3 halts (height 50,000, per the 2026-08-12 fleet
-brief), the legacy branch of every reader becomes dead code and should be
-deleted rather than left as a permanent "be liberal" clause.
+writers are not. **Genesis-3 has halted** — at height 39,918 on 2026-08-13, not
+the 50,000 the 2026-08-12 fleet brief planned — so the legacy branch of every
+reader **is** dead code now and should be deleted rather than left as a
+permanent "be liberal" clause.
 
 ## Test obligation
 

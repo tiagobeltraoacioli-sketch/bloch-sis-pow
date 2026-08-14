@@ -2,15 +2,55 @@
 
 # Bloch PoS (Genesis-4 / Bell) — Threat Model
 
+> ## The threat, stated first
+>
+> **The security question under Genesis-4 is not hashrate — there is no
+> mining — and it is not any finding numbered below. It is concentration.**
+>
+> - **All 64 validators are operated by a single entity.** There is no
+>   independent validator on the network. One operator can halt the chain.
+> - **93.94% of the carryover sits at one address** — 17,046,829,380 of
+>   18,146,400,000 BLOCH (`LARGEST_CARRYOVER_ADDRESS_BLOCH`). Carried balances
+>   are **stakeable** (ADR-037), so if that balance stakes, the **Nakamoto
+>   coefficient is 1**.
+> - **56,046,829,380 of the 57,146,400,000 BLOCH issued at slot 0 is held by
+>   the founder and the Foundation**, leaving 1,099,570,620 BLOCH — **1.92% of
+>   genesis supply** — in third-party hands. (Founder 27,046,829,380 is pinned
+>   as `FOUNDER_TOTAL_BLOCH`; the remaining 29 B is Foundation-held across four
+>   buckets. "Founder and Foundation together" is what the repo supports; "one
+>   key" is not.)
+> - **A third party cannot yet join.** The live transport is a point-to-point
+>   TCP full mesh with a fixed peer list, no discovery and no authentication;
+>   `Deposit` and `Delegate` are refused at every node's mempool because
+>   bonding is not funded from the UTXO set. There is no permissionless path
+>   to running a node or becoming a validator today.
+>
+> Every adversarial finding below is a finding about a protocol whose entire
+> validator set and effective stake are under one operator. Read them in that
+> order of importance.
+>
+> Genesis-3 (proof of work) stopped permanently at height **39,918** on
+> 2026-08-13; Genesis-4 has been live under proof of stake since 21:31:19 UTC
+> the same day. Nothing in this document about hashrate, mining or PoW depth
+> describes the current network.
+
 > **PARCIALMENTE SUPERADO — 2026-08-11.** Esta analise foi escrita contra o
 > estado do projeto naquele dia e depende de premissas que mudaram DEPOIS:
 >
 > - **a maquinaria de taint** — dissolvida: o carryover atravessa como um conjunto so, sem lista de exclusao, entao nao ha classe de moeda a marcar.
 > - **o comite amostrado (128 por epoca + 8 por slot)** — substituido por particao do conjunto ativo: o quorum amostrado nao tinha denominador coerente (achado F1).
-> - **o supply de 100 bilhoes** — revertido para 21 bilhoes, o nominal da V2.
-> - **a alocacao de 53,7 bi para validadores** — hoje 9.036.115.200 (43,03%).
+> - ~~**o supply de 100 bilhoes** — revertido para 21 bilhoes, o nominal da V2.~~
+>   **Superseded on 2026-08-12.** The supply is **100,000,000,000 BLCH**
+>   (`TOTAL_SUPPLY_BLOCH`), re-decided as a pure ×100/21 split of the 21 B
+>   nominal. The 2026-08-11 revert to 21 B lasted one day.
+> - ~~**a alocacao de 53,7 bi para validadores** — hoje 9.036.115.200 (43,03%).~~
+>   **Superseded.** The validator allocation is **42,853,600,000 BLOCH
+>   (42.85%)** — `VALIDATOR_EMISSION_BLOCH`.
 > - **a concessao de 17% ao fundador** — reduzida para 10%, com a diferenca indo para validadores.
-> - **a fase hibrida de PoW** — apagada: a Genesis-3 para na altura 80.000 e a Genesis-4 nasce de uma snapshot.
+> - ~~**a fase hibrida de PoW** — apagada: a Genesis-3 para na altura 80.000 e a Genesis-4 nasce de uma snapshot.~~
+>   **The hybrid PoW phase was indeed dropped, but the height is wrong:**
+>   Genesis-3 stopped at **39,918**, not 80,000, and Genesis-4 launched from
+>   that snapshot on **2026-08-13**, not six months later.
 >
 > O texto NAO foi reescrito, de proposito: o raciocinio que produziu cada
 > achado tem valor mesmo quando a premissa mudou, e reescrever apagaria a
@@ -62,8 +102,14 @@
 
 ```
 Document:   BLOCH-POS-THREAT-MODEL
-Status:     DRAFT — adversarial review, Assistant A4
+Status:     PARTIALLY SUPERSEDED — adversarial review of the design as it stood
+            on 2026-08-11, kept for its reasoning. It is NOT a threat model of
+            the live network: it predates the launch, and the dominant live
+            risk (single-operator validator set, single-address stake
+            majority) is stated in the box at the top of this file, not in the
+            numbered findings.
 Created:    2026-08-11
+Revised:    2026-08-14 (concentration lead added; false premises struck)
 Owner:      A4 (Adversarial review & security)
 Reviews:    BLOCH-POS-SHA3-LATTICE-MIGRATION.md, BLOCH-TOKENOMICS-V4.md,
             crates/bloch-pos-committee/src/{sample,attestation,forkchoice,
@@ -80,8 +126,22 @@ Each finding states: **the attack**, the **code path or spec section**, the
 crate — the beacon, the taint oracle, the state-transition function, all owned
 by DEV-1/2/3 and only present here as unimplemented traits).
 
-The crate is explicitly **UNAUDITED and not wired into the node** (`lib.rs`), so
-none of this is live. That is the right time to find it.
+> **This paragraph read, until 2026-08-14:** "The crate is explicitly
+> **UNAUDITED and not wired into the node** (`lib.rs`), so none of this is
+> live. That is the right time to find it."
+>
+> **Half of that is still true and half of it inverted.** The crate remains
+> **UNAUDITED by any third party**. It is no longer unwired: `bloch-pos-committee`
+> is an ordinary member of the root workspace (`Cargo.toml:15`), a dependency
+> of `bloch-pos-node`, and the consensus that has been producing and finalising
+> Genesis-4 blocks since 21:31:19 UTC on 2026-08-13. `lib.rs`'s own "Not wired
+> into the node" line has been corrected.
+>
+> So **every finding below is live**, and the comfort in "that is the right time
+> to find it" is withdrawn. This was written as a pre-deployment review and is
+> now a review of running consensus: a finding here is a finding against a chain
+> carrying real balances, and the window to fix one before launch has closed.
+> Read the severities accordingly.
 
 Two structural facts frame everything below:
 

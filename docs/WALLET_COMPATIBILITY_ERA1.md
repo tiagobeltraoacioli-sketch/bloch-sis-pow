@@ -4,9 +4,21 @@
 > the pre-rebrand chain that became Bloch-SIS Protocol (BLOCH) on 2026-04-26.
 >
 > Wallets, addresses (`grnd1q...`), and Docker images (`groundstate77/...`)
-> referenced here belong to ERA 1 and **do not apply to the current BLOCH
-> mainnet chain**. The BLOCH chain has a new genesis block
-> (`00000000a6afcfcd...eeb8b7`) and is incompatible with ERA 1 keys.
+> referenced here belong to ERA 1 and **do not apply to any chain that runs
+> today**. They are incompatible with every later chain's keys.
+>
+> **Where things actually stand, 2026-08-14.** The genesis hash
+> `00000000a6afcfcd...eeb8b7` cited in earlier versions of this banner as "the
+> current BLOCH mainnet chain" is a **Genesis-3** genesis — proof of work, and
+> that chain stopped permanently at height 39,918 on 2026-08-13. The live chain
+> is **Genesis-4, proof of stake**: 30 s slots, 32-slot epochs, Casper
+> justification and finalisation **by epoch** (~32 min typical, ~48 min worst
+> case), 64 genesis validators. Settlement is finality, not confirmation depth.
+> Public read RPC: <https://posternlabs.com/g4rpc>, version `0.1.0-mainnet`.
+>
+> **The live signature suite is a hybrid — ML-DSA-65 ‖ Falcon-1024, both must
+> verify** (`SUITE_MLDSA65_FALCON1024`). Anything below that describes a wallet
+> as ML-DSA-65 alone is describing Era 1, not the current one.
 >
 > Preserved as historical reference only.
 
@@ -18,20 +30,24 @@
 > notice issued on **2026-04-18 20:00 UTC** for **GroundState v0.5.3** on
 > the chain that operated under the GroundState project name. In April
 > 2026 the codebase was rebranded to **Bloch-SIS Protocol (BLOCH)** and
-> Phase 4 of the rebrand will regenerate founder and treasury keystores
-> against the new BLOCH chain (HRP `bloch1q`).
+> Phase 4 of the rebrand regenerated founder and treasury keystores
+> against the then-new BLOCH chain (HRP `bloch1q`). Two chains have run
+> since — Genesis-3, which halted at height 39,918 on 2026-08-13, and
+> Genesis-4, the proof-of-stake chain live from that date.
 >
 > The wallet format described below — ML-DSA-65 keypair + AES-256-GCM
 > + Argon2id encryption + JSON keystore + BIP39 seed phrase metadata —
-> carries forward to BLOCH **unchanged in design**. The keystore files
-> themselves do **not** carry forward: post-genesis-regen, all wallets
-> on the BLOCH chain start fresh, and the founder/treasury keystores
-> are regenerated to use BLOCH `bloch1q` addresses and the new genesis
-> chain state.
+> carried forward to BLOCH **in design**, with one change that matters and is
+> not visible from the Era 1 text: **the live suite is the hybrid
+> ML-DSA-65 ‖ Falcon-1024, not ML-DSA-65 alone.** A wallet holds and a
+> signature carries both halves, and both must verify. Read every
+> "ML-DSA-65 keypair" below as one half of what a current wallet holds.
+> The keystore files themselves do **not** carry forward: all wallets
+> started fresh on the BLOCH chain.
 >
-> The ML-DSA-65 deterministic-derivation limitation discussed below
-> still applies under BLOCH — it is a property of the signature scheme,
-> not of the chain.
+> The deterministic-derivation limitation discussed below still applies —
+> it is a property of the lattice signature scheme, not of the chain, and
+> adding Falcon-1024 alongside it does not lift it.
 >
 > The Docker image references (`groundstate77/groundstate:v0.5.3`),
 > URLs (`scan.groundstate.network`, `docs.groundstate.network`), and

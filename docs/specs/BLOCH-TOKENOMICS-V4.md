@@ -16,13 +16,22 @@
 >
 > The notice-period argument in §3.1 below was written for 50,000 and is left
 > as written. It is what was reasoned at the time.
-
+>
+> **Genesis-4 is live.** It has been producing blocks under proof of stake
+> since 21:31:19 UTC on 2026-08-13 — 30 s slots, 32-slot epochs, finality by
+> epoch, 64 genesis validators. Sections that read as forecasts of a launch
+> ("Genesis-4 launches roughly six months later", "the chain cannot start")
+> were written before it and are corrected in place below.
 
 
 ```
 Document:   BLOCH-TOKENOMICS-V4
-Status:     DRAFT — founder decision recorded, parameters not frozen
+Status:     ACTIVE — the parameters of the live Genesis-4 chain. Every figure
+            here is pinned by `crates/bloch-pos-committee/src/tokenomics_v4.rs`;
+            where the two disagree the constant wins and this file is the bug.
 Created:    2026-08-10
+Revised:    2026-08-14 (figures re-derived from the terminal h39,918 snapshot;
+            pre-split 21 B residues corrected)
 Supersedes: tokenomics_v2.rs (21 B nominal, uncapped tail) and ADR-035 emission V3
 Relates to: BLOCH-POS-SHA3-LATTICE-MIGRATION.md (§4 distribution gates)
 ```
@@ -54,13 +63,13 @@ what Go does.
 
 | Destination | BLCH | Share | Unlock |
 |---|---:|---:|---|
-| Carryover — the whole ledger | 18,146,400,000 | 17.97% | **liquid at genesis** |
+| Carryover — the whole ledger | 18,146,400,000 | 18.15% | **liquid at genesis** |
 | Founder — new grant | 10,000,000,000 | 10.00% | 10-year cliff, then 40-year linear |
 | VC / crypto hedge funds | 10,000,000,000 | 10.00% | 12-month cliff, then 24-month linear |
 | Development team | 10,000,000,000 | 10.00% | 18-month cliff, then 36-month linear |
 | Marketing | 4,000,000,000 | 4.00% | 25% at genesis, remainder linear over 24 months |
 | Liquidity | 5,000,000,000 | 5.00% | 100% liquid at genesis |
-| **Validators** | **42,853,600,000** | **43.03%** | emitted over 40 years |
+| **Validators** | **42,853,600,000** | **42.85%** | emitted over 40 years |
 | **Total** | **100,000,000,000** | **100.00%** | |
 
 **Founder total: 27.04%** — the carried-over balance plus the new grant. The
@@ -78,8 +87,8 @@ an insider bucket.
 <path d="M 170.00 178.00 L 30.97 121.69 A 150 150 0 0 1 88.63 51.99 Z" fill="#e87ba4"/>
 <path d="M 170.00 178.00 L 90.62 50.72 A 150 150 0 0 1 131.56 33.01 Z" fill="#008300"/>
 <path d="M 170.00 178.00 L 133.84 32.42 A 150 150 0 0 1 168.82 28.00 Z" fill="#4a3aa7"/>
-<text x="266.6" y="156.5" text-anchor="middle" dominant-baseline="middle" font-size="13" font-weight="700" fill="#ffffff">43.03%</text>
-<text x="157.5" y="276.2" text-anchor="middle" dominant-baseline="middle" font-size="13" font-weight="700" fill="#ffffff">17.97%</text>
+<text x="266.6" y="156.5" text-anchor="middle" dominant-baseline="middle" font-size="13" font-weight="700" fill="#ffffff">42.85%</text>
+<text x="157.5" y="276.2" text-anchor="middle" dominant-baseline="middle" font-size="13" font-weight="700" fill="#ffffff">18.15%</text>
 <text x="86.4" y="231.0" text-anchor="middle" dominant-baseline="middle" font-size="13" font-weight="700" fill="#ffffff">10.00%</text>
 <text x="71.2" y="171.8" text-anchor="middle" dominant-baseline="middle" font-size="13" font-weight="700" fill="#ffffff">10.00%</text>
 <text x="93.7" y="114.9" text-anchor="middle" dominant-baseline="middle" font-size="13" font-weight="700" fill="#ffffff">10.00%</text>
@@ -88,12 +97,12 @@ an insider bucket.
 <text x="676" y="24" font-size="10" fill="#5c6169" letter-spacing="0.09em" text-anchor="end">%</text>
 <rect x="372" y="32" width="12" height="12" rx="3" fill="#2a78d6"/>
 <text x="392" y="42" font-size="12.5" fill="#14161a" dominant-baseline="middle">Validadores</text>
-<text x="608" y="42" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">43.029.120.000</text>
-<text x="676" y="42" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">43.03</text>
+<text x="608" y="42" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">42.853.600.000</text>
+<text x="676" y="42" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">42.85</text>
 <rect x="372" y="62" width="12" height="12" rx="3" fill="#eb6834"/>
 <text x="392" y="72" font-size="12.5" fill="#14161a" dominant-baseline="middle">Carryover</text>
-<text x="608" y="72" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">17.970.850.000</text>
-<text x="676" y="72" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">17.97</text>
+<text x="608" y="72" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">18.146.400.000</text>
+<text x="676" y="72" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">18.15</text>
 <rect x="372" y="92" width="12" height="12" rx="3" fill="#1baf7a"/>
 <text x="392" y="102" font-size="12.5" fill="#14161a" dominant-baseline="middle">Fundador — concessão</text>
 <text x="608" y="102" font-size="12.5" fill="#3c4149" text-anchor="end" dominant-baseline="middle">10.000.000.000</text>
@@ -129,7 +138,10 @@ number does, which is why the legend carries both.
 
 
 Validator emission runs for 40 years and is supplemented by transaction fees.
-**After the 21 B is fully issued, validators are paid 100% from fees.**
+**After the 42,853,600,000 BLCH validator allocation is fully issued — i.e.
+once the 100 B cap is reached — validators are paid 100% from fees.** (This
+line read "after the 21 B is fully issued" until 2026-08-14: a residue of the
+pre-split nominal. The cap is 100 B; `TOTAL_SUPPLY_BLOCH`.)
 
 ---
 
@@ -138,13 +150,22 @@ Validator emission runs for 40 years and is supplemented by transaction fees.
 Not estimated. A read-only UTXO snapshot was taken on node4 at **height
 39,918** with `bloch-snapshot-utxo`, then aggregated by address:
 
-| | |
-|---|---|
-| UTXOs | 452,726 |
-| Addresses | 15 |
-| **Total carried over** | **18,146,400,000 BLCH** |
-| Snapshot root (SHAKE-256) | `280d604b32525f03…` |
-| Carryover digest (SHAKE-256) | `92918209a106f297…` |
+| | | Pinned at |
+|---|---|---|
+| Height | 39,918 — terminal; the chain produced no block above it | `CARRYOVER_MEASURED_HEIGHT` |
+| UTXOs | 452,726 | `CARRYOVER_MEASURED_UTXOS` |
+| Addresses | 16 | `tokenomics_v4.rs` (`LARGEST_CARRYOVER_ADDRESS_BLOCH` doc) |
+| **Total carried over** | **18,146,400,000 BLCH** | `CARRYOVER_TOTAL_BLOCH` |
+| Balance-set root (SHAKE-256) | `7c756ee8ffff9529…` | `CARRYOVER_MEASURED_ROOT` |
+| Snapshot file digest (SHA3-256) | `3d67246e94881a17…` | `CARRYOVER_MEASURED_FILE_SHA3_256` |
+| Snapshot file digest (SHA-256) | `84ddbbac2afdd5c7…` | `CARRYOVER_MEASURED_FILE_SHA256` |
+
+The two file digests are different hash functions over the same bytes and are
+not interchangeable: the loader hashes with SHA3-256, and `shasum -a 256`
+reproduces the SHA-256 row. A node started against a snapshot whose SHA3-256
+does not match refuses to boot. (This table carried a `280d604b…` root and a
+`92918209…` digest until 2026-08-14; those were from a pre-terminal snapshot
+and matched nothing the node checks.)
 
 **All of it crosses.** There is no founder line and no exclusion list: those
 coins were mined, on the same chain, under the same rules as everyone else's.
@@ -154,12 +175,26 @@ leaving to be discovered:
 
 | | BLCH | Share of carryover |
 |---|---:|---:|
-| Largest single address | 17,046,829,380 | 93.94% |
-| The other 14 | 227,709,400 | 6.04% |
+| Largest single address (the founder's) | 17,046,829,380 | **93.94%** |
+| The other 15, combined | 1,099,570,620 | 6.06% |
+
+Both rows are post-split figures measured from the same terminal snapshot;
+the largest is `LARGEST_CARRYOVER_ADDRESS_BLOCH` and the remainder is
+`CARRYOVER_TOTAL_BLOCH` minus it. Until 2026-08-14 the second row read
+"227,709,400", which was the *pre-split* (Genesis-3 scale) non-founder total
+sitting in a table of post-split numbers — it understated third-party holdings
+by 4.8×. Mixing the two scales is the single easiest error to make in this
+document; every figure below is post-split unless it says otherwise.
+
+**This is the concentration disclosure, and it is the security question under
+Genesis-4.** 93.94% of the carried ledger is one address, carried balances are
+stakeable (§4A.1), and all 64 genesis validators are operated by one entity. If
+that balance stakes, the Nakamoto coefficient is 1 — one holder can outvote
+every other, and one operator can halt the chain.
 
 An earlier draft of this section reported 413,743 UTXOs across five addresses,
-from the Genesis-1 file rather than the live chain. Ten more addresses have
-accumulated balances by mining since Genesis-3, and the totals moved with them.
+from the Genesis-1 file rather than the live chain. More addresses accumulated
+balances by mining over the life of Genesis-3, and the totals moved with them.
 Anything quoted from the older figures is stale.
 
 ---
@@ -189,7 +224,18 @@ Three things follow, and the third is the one worth keeping:
 
 ### 3.1 Snapshot height — final: 39,918
 
-Measured at height **40,424**: non-founder holdings ≈ **236.8 M BLCH**, 79% of
+> **Historical, and left as written.** Everything from here to the end of §3.1
+> is the notice-period argument made *before* the halt, when the target was
+> 50,000 and the 300 M holder cap still existed. Neither survived: the cap was
+> retired (§3) and the chain stopped at **39,918**, so no height in this
+> subsection was ever reached and no scale-down ever ran. It is kept because
+> the reasoning is part of the record, not because it describes anything.
+> Note also that "40,424" below is a **block count**, not a height — the two
+> differ in a DAG and were conflated in the source measurement; the chain's
+> maximum height was 39,918.
+
+Measured at block count **40,424**: non-founder holdings ≈ **236.8 M BLCH** (a
+Genesis-3-scale figure), 79% of
 the cap, growing **≈ 3.97 M/day**. On the central estimate the cap binds around
 height **86,300**, roughly 16 days out.
 
@@ -228,19 +274,22 @@ to 70,000.
 
 ### 3.2 The chain halts at the snapshot
 
-**Height 39,918 is where the chain stopped, not just a measurement point.** The
-current chain stops producing blocks there; Genesis-4 launches from the
-snapshot roughly six months later, after code review.
+**Height 39,918 is where the chain stopped, not just a measurement point.**
+Genesis-3 produced its last block there on 2026-08-13 and has produced none
+since. Genesis-4 launched from that snapshot the same day, at **21:31:19 UTC
+on 2026-08-13** — not "roughly six months later", which is what this section
+projected before the decision to launch immediately.
 
-This resolves the dead-period problem rather than mitigating it. Had the chain
-kept running, the 166 days between snapshot and launch would have meant
-4,016 M BLCH mined by people receiving nothing — and, worse, a rational miner
-switches off the day after the snapshot, leaving the network without hashrate
-during exactly the six months it still has users, wallets and an explorer
-pointed at it. Halting removes both: nobody mines coins with no future, and
-nobody buys into a chain with no future.
+The dead period the six-month plan created was therefore never lived through.
+Had the chain instead kept running between snapshot and launch, the coins mined
+in the gap would have gone to people receiving nothing at genesis, and a
+rational miner switches off the day after a snapshot anyway, leaving a network
+with users, wallets and an explorer pointed at it and no hashrate defending it.
+Halting removed both.
 
-Two things must exist **before** height 50,000, which is about two weeks away.
+The two requirements below were written as prerequisites for a future halt.
+Both are now history: Genesis-3 stopped and Genesis-4 was built from the signed
+terminal snapshot, whose digests are in §2.
 
 #### 3.2.1 The halt has to be a consensus rule
 
@@ -251,9 +300,18 @@ fork nobody agreed to.
 
 This is a flag day in reverse and it inherits every flag-day hazard this project
 has already lived through: the release must actually be the binary the fleet
-runs. Anyone who does not upgrade will keep mining past 50,000 on a fork; that
-is tolerable, but only if the canonical snapshot is fixed at 50,000 and said so
-publicly.
+runs. Anyone who does not upgrade keeps mining past the terminal height on a
+fork; that is tolerable, but only if the canonical snapshot is fixed at a stated
+height and said so publicly.
+
+**What actually happened.** Production was stopped at **39,918** rather than at
+an announced 50,000 flag day, so the terminal height was set by the operator
+stopping block production, not by a consensus rule refusing higher blocks. The
+consequence is the one §3.2.2 describes, and it is stated here rather than left
+to be inferred: **the canonical record of Genesis-3 is the signed snapshot in
+§2, not the chain.** Anyone reconciling balances must reconcile against the
+snapshot digests, and a Genesis-3 chain tip presented as evidence — including
+one longer than 39,918 — is not authority for anything.
 
 #### 3.2.2 After the halt, the chain's own history stops being evidence
 
@@ -270,11 +328,14 @@ enough that it cannot be quietly replaced — the same pattern already used for
 artifact, and the artifact's digest should appear in the Genesis-4 genesis
 block itself. A chain nobody is defending is not a record.
 
-**One trust point, named.** The taint list — which addresses count as founder —
-is set by the founder. Nothing in the protocol stops founder-controlled coins
-from being presented as third-party holdings and capturing part of the 300 M.
-The list should be published with the announcement so it can be argued with
-before the height passes, not after.
+**The trust point this used to name is gone, and a larger one is not.** This
+paragraph used to warn that the founder writes the taint list and could present
+founder-controlled coins as third-party holdings to capture part of the 300 M
+cap. There is no taint list and no cap (§3), so that specific power no longer
+exists. What replaces it is not smaller: **the whole carryover crosses
+undifferentiated, 93.94% of it to one address, and it is stakeable.** Nothing
+in consensus distinguishes those coins from anyone else's, which is exactly
+what §4A measures.
 
 ---
 
@@ -287,22 +348,36 @@ an existing, funded validator set. Halting Genesis-3 and launching Genesis-4
 from a snapshot deleted that phase. Genesis-4 has no PoW, and deposits are
 transactions — which need blocks, which need validators.
 
-**The chain cannot start.** This is not a subtle failure: without an initial
-validator set there is no proposer for slot 0.
+**Without an initial validator set the chain cannot start**: there is no
+proposer for slot 0. That was the gap; the fix below was built and shipped, and
+Genesis-4 started on it.
 
-### The fix: a genesis validator set
+### The fix: a genesis validator set — built, and live
 
 The genesis block carries an initial validator set the same way it carries the
 allocations — as consensus data, active from slot 0, with no deposit
-transaction required because there is no chain yet to carry one. Every later
-validator joins through the ordinary deposit path.
+transaction required because there is no chain yet to carry one. Genesis-4
+launched with **64** such validators (`crates/bloch-pos-node/src/genesis.rs`,
+`ManifestValidator`), and they are what has been proposing and attesting since
+21:31:19 UTC on 2026-08-13.
+
+Every later validator is meant to join through the ordinary deposit path.
+**That path is not open yet.** `Deposit` and `Delegate` transactions are
+refused at every node's mempool because bonding is not funded from the UTXO set
+(`crates/bloch-pos-node/src/engine.rs:1901`), and the live transport carries a
+fixed peer list with no discovery and no authentication, so a third party
+cannot connect a node in the first place. Until both change there is no
+permissionless route into the validator set, and the genesis cohort is the
+whole set.
 
 Three things this must satisfy, and one it must not pretend to.
 
 **It must be funded from a named bucket.** Liquid supply at genesis is
-23,970,850,000 BLCH: the whole carryover (17.97%), liquidity (5%) and the
-marketing TGE tranche (1%). VC, team and the founder's new grant are entirely
-cliffed.
+**24,146,400,000 BLCH**: the whole carryover (18,146,400,000 — 18.15% of the
+cap), liquidity (5,000,000,000 — 5%) and the marketing TGE tranche
+(1,000,000,000 — 1%). VC, team and the founder's new grant are entirely
+cliffed. (This read 23,970,850,000 until 2026-08-14, a figure built from the
+pre-terminal carryover.)
 
 That leaves two candidate sources, and the choice is not neutral. Genesis
 validators can stake from the **Foundation's** liquid holdings, or from the
@@ -378,11 +453,19 @@ can. The same reporting rule already written for the delegation program
 gates are measured on stake whose beneficial owner is not the Foundation, the
 founder, or Postern Labs.
 
-So the honest statement of the launch is: **the chain starts centralised, by
+So the honest statement of the launch is: **the chain started centralised, by
 construction, and the gates measure the distance from there.** A hybrid PoW
 phase would have bought a genuinely independent initial set; the halt bought a
 clean break instead. That was a defensible trade, but it was made without
 noticing this was part of the price.
+
+**Where that stands today (2026-08-14).** All **64** validators on the live
+chain are operated by a single entity; there is no independent validator, and
+the cohort taper has had one day to run. One operator can halt the chain. The
+taper above is a real consensus rule, but a rule that redistributes weight
+*within* a set nobody else can join yet redistributes nothing — the deposit
+path is closed at the mempool and the transport has no discovery (§3.3). The
+distance the gates measure is currently the whole distance.
 
 ---
 
@@ -390,17 +473,28 @@ noticing this was part of the price.
 
 Stated plainly, because it affects parties who are not in the room:
 
-| | Today | After V4 |
+| | Genesis-3, at the halt | Genesis-4 |
 |---|---:|---:|
-| Coins carried over | 3,475,441,200 (G-1 file) | 18,146,400,000 (measured live) |
-| Non-founder **share of network** | 5.21% | **≤ 0.30%** |
+| Coins carried | 3,810,744,000 (every coin in existence) | 18,146,400,000 (×100/21, same coins) |
+| Non-founder holdings | 230,909,830 | 1,099,570,620 |
+| Non-founder **share of all coins** | **6.06%** | **1.92%** of the 57,146,400,000 issued at slot 0 — **1.10%** of the 100 B cap |
 
-Holders keep their coins in absolute terms and lose roughly **17×** of their
-relative position. That is the arithmetic consequence of preserving absolute
-balances while the supply stays at 21 B. It is a
-legitimate choice — it is what "preserved in absolute terms" means — but it
-should be published in exactly these terms rather than as "your balance is
-preserved", which is true and misleading at the same time.
+Holders keep their coins in absolute terms, in the sense that every balance is
+multiplied by the same 100/21 and nobody is scaled down. What they lose is
+relative position, because the carryover is 18,146,400,000 of a
+100,000,000,000 cap:
+
+- against supply **issued at genesis**, an existing holder's share falls by
+  **≈3.2×** (the carryover is 31.75% of the 57,146,400,000 issued at slot 0);
+- against the **maximum ever issued**, by **≈5.5×** (18.15% of 100 B).
+
+That is the arithmetic consequence of preserving absolute balances while
+minting 81.85 B new coins around them. It is a legitimate choice — it is what
+"preserved in absolute terms" means — but it should be published in exactly
+these terms rather than as "your balance is preserved", which is true and
+misleading at the same time. (This table previously read "5.21% → ≤0.30%" and
+"roughly 17×", figures carried from the abandoned 300 M-cap design and the
+Genesis-1 file; they are not what the terminal snapshot says.)
 
 ---
 
@@ -411,9 +505,13 @@ changes and it should be stated in numbers rather than characterised.
 
 | | |
 |---|---|
-| Circulating at slot 0 | 23,970,850,000 BLCH (carryover 3.77 B + liquidity 1.05 B + marketing TGE 0.21 B) |
+| Circulating at slot 0 | **24,146,400,000 BLCH** (carryover 18.1464 B + liquidity 5 B + marketing TGE 1 B) |
 | Founder liquid at slot 0 | 17,046,829,380 BLCH |
-| **Founder share of circulating** | **70.4%** |
+| **Founder share of circulating** | **70.60%** |
+
+(The row above read "23,970,850,000 … (carryover 3.77 B + liquidity 1.05 B +
+marketing TGE 0.21 B)" until 2026-08-14 — three pre-split figures added to a
+post-split total. Corrected; the founder share moves 70.4% → 70.60%.)
 
 Gate G2 requires the largest holder to hold under 25% of active stake. On this
 schedule:
@@ -462,10 +560,10 @@ bound.** Rewards are pro-rata to stake (§6.3), so compounding preserves stake
 like everyone else, the independent share of active stake stays where it
 started —
 
-    227,709,400 / 18,146,400,000 = 6.03%
+    1,099,570,620 / 18,146,400,000 = 6.06%
 
 — at every horizon. Active stake can never exceed circulating supply, so
-independent stake can never exceed 6.03% of circulating either: **under this
+independent stake can never exceed 6.06% of circulating either: **under this
 scenario G1 is not late, it is unreachable** — not at year five, not at year
 forty — from emission alone. (The 1% per-validator cap and the genesis-cohort
 cap do redirect rewards away from over-cap stake, but both are Sybil-bypassable
@@ -477,20 +575,21 @@ hands.
 balance stays out of stake — permitted to enter, voluntarily kept out — the
 independents can capture the whole emission. Solving
 
-    227,709,400 + E(t) = 0.15 × (23,970,850,000 + E(t) + U(t))
+    1,099,570,620 + E(t) = 0.15 × (24,146,400,000 + E(t) + U(t))
 
-with year-one emission flow E(t) = 917,168,074·t (the decay curve's first
-year) and unlock flow U(t) = 315,000,000·t (the marketing tranche; VC and team
-are inside their cliffs) gives t ≈ 0.72 years — the earliest arithmetic G1
+with year-one emission flow E(t) = 4,349,651,692·t (the decay curve's first
+year — `INITIAL_ANNUAL_SAT` / 10^8) and unlock flow U(t) = 1,500,000,000·t (the
+marketing tranche, 3 B over 24 months; VC and team are inside their cliffs)
+gives t ≈ 0.73 years — the earliest arithmetic G1
 crossing is **about month 9**. That is a bound, not a forecast: the genesis
 cohort is founder-operated and earns much of the early emission, so the
 realistic date is later. But it is measured in months, not in five years.
 
 **G2 (largest entity < 25% of active stake).** Measured against *active*
-stake, staking the carryover is strictly worse than the 70.4%-of-circulating
-figure above: at genesis the founder would hold 17,046,829,380 of 18,146,400,000
-staked — **94.0% of active stake**, a Nakamoto coefficient of 1. Under
-conserved shares that figure does not decay either.
+stake, staking the carryover is strictly worse than the 70.60%-of-circulating
+figure above: if the carryover staked, the founder would hold 17,046,829,380 of
+18,146,400,000 staked — **93.94% of active stake**, a Nakamoto coefficient
+of 1. Under conserved shares that figure does not decay either.
 
 The honest summary. The decision removes the last consensus-enforced
 distinction between the founder's coins and anyone else's, and in exchange the
@@ -514,24 +613,40 @@ The PoS migration design opens (§0.1) with the objection that ~94% of supply
 sits at one address, so stake-weighted consensus would hand the chain to the
 founder. Where V4 now lands:
 
-| | Genesis-3 today | V4 at genesis | V4 at year 50 |
+All shares below are of the **100 B cap**, so the Genesis-3 column and the V4
+columns are on different denominators by construction — that is the point of
+the table, not an error in it.
+
+| | Genesis-3 at the halt | V4 at genesis | V4 at year 50 |
 |---|---:|---:|---:|
-| Founder — spendable | 94.3% | **16.89%** (carryover, liquid) | 27.04% |
+| Founder — spendable | 93.94% of all coins | **17.05%** of the cap (carryover, liquid) | 27.05% |
 | Founder — locked | — | 10.00% (10-yr cliff, 40-yr vest) | 0% |
-| Insiders total | 94.3% | 25.0% liquid (Foundation) + 16.89% | 55.97% |
-| Validators (earned) | — | 0%, growing | 43.03% |
+| Insiders total | 93.94% | 6.00% liquid (Foundation) + 17.05% + 33.00% cliffed | 56.05% |
+| Validators (earned) | — | 0%, growing | 42.85% |
 
 An earlier draft cliffed the founder's whole position and could claim **no
 spendable founder stake at genesis** — a consensus-enforced answer, and a much
 stronger one than this. Carrying the balance across liquid gave it up: the
-founder holds 16.89% of supply, spendable from slot 0, and 70.4% of what is
-actually circulating then.
+founder holds 17.05% of the cap, spendable from slot 0, and **70.60% of what is
+actually circulating** then.
 
 What remains true is narrower and still worth something. The relaunch takes the
-founder from 94.3% of supply to 16.89% spendable, which is a 5.6× reduction in
-concentration that no amount of coin-marking on the live chain could have
-achieved. And the new grant carries the strictest schedule on the chain — ten
-years locked, forty vesting, fully vested at year 50.
+founder from 93.94% of all coins to 17.05% of the cap spendable, a **5.5×**
+reduction in concentration that no amount of coin-marking on the live chain
+could have achieved. And the new grant carries the strictest schedule on the
+chain — ten years locked, forty vesting, fully vested at year 50.
+
+**What it does not do, stated at the same volume.** Measured against the supply
+that actually exists — the 57,146,400,000 BLCH issued at slot 0 — the founder
+holds 27,046,829,380 (47.33%) and the Foundation a further 29,000,000,000
+(50.75%). Together **56,046,829,380 of 57,146,400,000**, leaving
+**1,099,570,620 BLCH — 1.92% of genesis supply — in third-party hands.** The
+27.05%/29.00% figures elsewhere in this document are shares of the *cap*, most
+of which is unissued validator emission that does not exist yet and cannot
+vote. Both denominators are legitimate; quoting only the cap one is not.
+(Precision: the 29 B is Foundation-held across four buckets whose recipient
+script hashes are not in this repo. "Founder and Foundation together" is what
+the constants support; "one key holds 56 B" is not, and must not be written.)
 
 
 ---
@@ -540,7 +655,8 @@ years locked, forty vesting, fully vested at year 50.
 
 - Validator allocation: **42,853,600,000 BLCH** over **40 years**.
 - At 30 s slots: 42,076,800 slots in 40 years.
-- **Average 1,022 BLCH per block.**
+- **Average 1,018.46 BLCH per slot** (42,853,600,000 / 42,076,800), if the
+  curve were flat. The adopted curve is not flat; see §6.1.
 
 ### 6.1 Curve — decided: 10% annual disinflation
 
@@ -549,10 +665,10 @@ decentralisation requirement from §7A, that pins the curve almost exactly.
 
 | Curve | Year-1 inflation | Decentralisation gate |
 |---|---:|---|
-| Flat, 1,022 BLCH/block | 1.08% | **Fails** — validators never outpace insider unlocks |
+| Flat, 1,018.46 BLCH/slot | 1.03% | **Fails** — validators never outpace insider unlocks |
 | Halving every 4 years | 5.38% | Passes, but revenue halves on scheduled dates |
 | Decay, 8%/year decline | 3.56% | **Fails at month 36** — too flat |
-| **Decay, 10%/year decline** | **4.37%** | **Passes** |
+| **Decay, 10%/year decline** | **4.35%** | **Passes** |
 | Decay, 12%/year decline | 5.19% | Passes, but the shape, not the ceiling, is what rules it out |
 
 **Adopted: reward declines 10% per year**, constant within each year, summing
@@ -560,14 +676,23 @@ to exactly the 42,853,600,000 allocation across 40 years.
 
 | Year | BLCH/block | Inflation (of total supply) |
 |---:|---:|---:|
-| 1 | 4,151.90 | 4.37% |
-| 5 | 2,724.05 | 2.87% |
-| 10 | 1,608.52 | 1.69% |
-| 20 | 560.86 | 0.59% |
-| 40 | 68.19 | 0.07% |
+| 1 | 4,134.96 | 4.34% |
+| 5 | 2,712.95 | 2.85% |
+| 10 | 1,601.97 | 1.68% |
+| 20 | 558.57 | 0.58% |
+| 40 | 67.91 | 0.07% |
 
-Truncation residual across the whole 40-year schedule: **889,200 sat
-(0.0089 BLCH)** — under the allocation, never over.
+Every figure in the table above is `validator_reward_decay_sat(slot)` and
+`annual_inflation_bps(year)` evaluated directly, not a rounded restatement:
+`INITIAL_ANNUAL_SAT` = 434,965,169,252,191,762 sat, year-1 issuance
+4,349,651,692.52 BLCH = **4.34%** of the cap (`annual_inflation_bps(0)` = 434).
+The table read 4,151.90 / 4.37% until 2026-08-14 — the pre-split figures scaled
+by 100/21 rather than re-derived from the constant, which is why they were
+consistently ~0.4% high.
+
+Truncation residual across the whole 40-year schedule: **855,280 sat
+(0.0086 BLCH)** — `EMISSION_DUST_SAT`, pinned by a compile-time assertion.
+Under the allocation, never over.
 
 **The denominator is load-bearing.** These figures are issuance over **total
 supply**, which is how Solana and Ethereum report inflation. Measured against
@@ -623,11 +748,11 @@ explorer must surface the rate prominently.
 
 **Yield versus inflation.** These are different numbers and both get quoted. At
 year-1 issuance with two thirds of supply staked — Solana's rough ratio — the
-nominal staking yield is **6.55%**, against **4.37%** inflation. A staker's
+nominal staking yield is **6.52%**, against **4.34%** inflation. A staker's
 real position is what remains after dilution; a non-staker is diluted by the
-full 4.37%.
+full 4.34%.
 
-For reference, Bloch's year-1 inflation of 4.37% sits just below Solana's
+For reference, Bloch's year-1 inflation of 4.34% sits just below Solana's
 current 5.5–5.9%.
 
 ### 6.3.1 Delegation — implemented (`crates/bloch-pos-committee/src/delegation.rs`)
@@ -740,8 +865,8 @@ Any published supply number must use "maximum issued", not "total supply" —
 the two diverge from the first burned fee onward, and the gap only grows.
 
 **A cliff worth naming.** At the era boundary, validator revenue loses the
-year-40 emission (85.10 BLCH/block) and gains only the other half of the base
-fee. Unless fee revenue by year 40 is comparable to 85 BLCH/block, this is a
+year-40 emission (67.91 BLCH/slot) and gains only the other half of the base
+fee. Unless fee revenue by year 40 is comparable to 68 BLCH/slot, this is a
 step down in validator income, and it is inherent to any hard cap rather than
 to this fee policy — the perpetual tail in V2 existed precisely to avoid it.
 Whether fee revenue reaches that level by year 40 is unknowable now; what is
@@ -765,11 +890,14 @@ Schedules follow prevailing market practice for recent L1 launches.
 
 **Cliffs are staggered on purpose.** The most cited failure mode in vesting
 design is the *cliff wall* — several buckets beginning to unlock in the same
-month, concentrating sell pressure on one date. VC (12), team (18) and founder
-(24) are six months apart, so unlocks arrive as a stream.
+month, concentrating sell pressure on one date. VC (12) and team (18) are six
+months apart and the founder grant cliffs at **120**, so unlocks arrive as a
+stream. (This read "founder (24)"; the founder cliff is ten years, not two —
+`FOUNDER_CLIFF_SLOTS` = 10 × `SLOTS_PER_YEAR`.)
 
 **Where this sits against peers.** Insider share here (founder + VC + team +
-marketing = 41%) falls between Aptos (~32.5% team plus investors) and Celestia
+marketing = **34%** of the cap) falls between Aptos (~32.5% team plus investors)
+and Celestia
 (~53%). The VC allocation at 10% is below Sui's 14.1% for private investors.
 
 ---
@@ -801,7 +929,8 @@ most cited failure mode in vesting design, so VC (12), team (18) and founder
 ### Marketing — 4,000,000,000 (4.00%)
 
 **1,000,000,000 liquid at genesis** (25%), for listing fees and launch spend; the
-remaining 630,000,000 vests linearly over 24 months. The split follows ordinary
+remaining **3,000,000,000** vests linearly over 24 months (630,000,000 was the
+pre-split figure). The split follows ordinary
 practice: launch spend is immediate by nature, ongoing programmes are not.
 
 ### Liquidity — 5,000,000,000 (5.00%)
@@ -822,10 +951,15 @@ allocation where full unlock is not a concession but the function.
 
 ### The number worth noticing
 
-Circulating supply at slot 0 is 23,970,850,000 BLCH — the carryover plus these
-6,000,000,000. So the Foundation's liquid holding is **exactly 25.0% of
-circulating at genesis**, sitting precisely on the G2 threshold, and the
-carryover is the other 75.0%.
+Circulating supply at slot 0 is **24,146,400,000 BLCH** — the carryover plus
+these 6,000,000,000. So the Foundation's liquid holding is **24.85% of
+circulating at genesis**, a hair under the 25% G2 threshold, and the carryover
+is the other 75.15%.
+
+That 24.85% is not a design choice, it is a rounding accident: the figure was
+*exactly* 25.0% against the pre-terminal carryover, and re-measuring at h39,918
+moved it. Nothing about the position changed. Do not quote "under the G2
+threshold" as if it were a property of the allocation.
 
 Two entities therefore account for the entire genesis float, and the
 concentration gates cannot be met by either of them changing behaviour — only
@@ -839,6 +973,13 @@ side.
 
 Modelling the schedules month by month, treating each bucket as a single
 entity (worst case), against gate **G2 — no entity above 25% of active stake**:
+
+> **Units note.** The "Circulating (B)" column below is in **pre-split (21 B
+> nominal) billions** — this modelling predates the 2026-08-12 split. Multiply
+> by 100/21 for current units. Every percentage column is a ratio and is
+> therefore unchanged by the split, which is what the conclusion rests on, so
+> the analysis stands as written. It also predates the h39,918 re-measurement
+> of the carryover, which moves the float by under 1%.
 
 **With the flat emission curve:**
 
@@ -874,11 +1015,21 @@ stays under 25% from month 24 onward, and insiders peak near 45% rather than
 single entity.
 
 **Conclusion: the emission curve, not the vesting schedule, is the lever that
-decides whether PoS can ever activate.** Open decision #2 in §9 is therefore
-not a free parameter — it is the most consequential number left in V4, and the
-recommendation is a front-loaded curve.
+decides whether PoS can ever activate.** That was open decision #2 when this
+section was written; it is **decided** (§6.1, 10%/year smooth disinflation),
+and `validator_reward_decay_sat` is what the live chain runs. The
+recommendation recorded here was "a front-loaded curve" and the decay curve is
+the front-loaded family's smooth member — the halving column below is the
+rejected alternative, kept for the comparison, not a live option.
 
-Halving parameters, if adopted: initial reward **1,075 BLCH/block**, halving
+**And a caveat the modelling cannot carry.** Every row above assumes emission
+accrues to parties other than the founder. On the live chain all 64 validators
+are founder-operated, so early emission accrues to the same entity the gates
+measure. The curve decides whether G2 *can* be met; it does not make it met.
+
+Halving parameters, if adopted (not adopted — §6.1 chose the decay curve):
+initial reward **≈5,097 BLCH/slot** (`INITIAL_REWARD_SAT`; 1,075 was the
+pre-split figure), halving
 every 4 years, 10 halvings across the 40-year window.
 
 ---
@@ -934,8 +1085,11 @@ vesting schedule that lives in a spreadsheet is not a vesting schedule.
 
 1. ~~Vesting for VC, team, marketing, liquidity~~ — **decided**, §7.
 2. ~~Emission curve~~ — **decided**: 10%/year smooth disinflation (§6.1).
-3. Snapshot height, announced in advance (§3).
-4. Confirmation of pro-rata scale-down for the over-cap case (§3).
+3. ~~Snapshot height, announced in advance~~ — **settled by events**: the chain
+   stopped at 39,918 (§3.2) and the terminal snapshot is the record.
+4. ~~Confirmation of pro-rata scale-down for the over-cap case~~ — **moot**:
+   the 300 M holder cap was retired (§3), so no scale-down exists to confirm.
+   `HOLDER_CARRYOVER_CAP_BLOCH` is a named zero.
 5. Decimal places and the `u128` accumulator audit (§8.1).
 6. ADR retracting the perpetual-tail rationale (§6).
 7. ~~Delegation~~ — **implemented**, §6.3.1, with the concentration gates now

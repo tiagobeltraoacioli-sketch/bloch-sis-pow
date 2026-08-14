@@ -1,8 +1,35 @@
 # Coherence v0.2 — the Bloch-SIS privacy layer
 
+> **Genesis-4 is live.** Bloch has been running under **proof of stake** since
+> 21:31:19 UTC on 2026-08-13, when Genesis-3 (proof of work) stopped
+> permanently at height **39,918**. 30 s slots, 32-slot epochs, Casper-style
+> justification/finalisation by epoch, hybrid ML-DSA-65 ‖ Falcon-1024
+> signatures on every consensus path. Nothing in this document that describes
+> mining, hashrate, difficulty, retargeting or proof-of-work depth describes
+> the current network.
+>
+> **The live security question is concentration, not hashrate.** All 64
+> validators are operated by a single entity; 93.94% of the carryover
+> (17,046,829,380 of 18,146,400,000 BLOCH) sits at one address and carried
+> balances are stakeable, so if that balance stakes the Nakamoto coefficient
+> is 1; and 56,046,829,380 of the 57,146,400,000 BLOCH issued at slot 0 is
+> held by the founder and the Foundation, leaving 1.92% of genesis supply in
+> third-party hands. One operator can halt the chain and one holder can outvote
+> every other. The live transport is a point-to-point TCP full mesh with a
+> fixed peer list, **no discovery and no authentication**, and
+> `Deposit`/`Delegate` are refused at every node's mempool — which is why a
+> third party cannot yet join the network or become a validator.
+
 > Status: **design draft**. No privacy claim is adopted for mainnet until this
 > document is completed, externally reviewed, and its primitives are audited.
-> The current chain is a **zero-security testnet** and offers **no privacy**.
+>
+> **Corrected 2026-08-14.** This line read "the current chain is a
+> **zero-security testnet** and offers **no privacy**". The first half is false
+> and was materially misleading: Genesis-4 is a **live mainnet** carrying real
+> balances, and calling it a testnet understates what is at stake for anyone
+> reading this document before crediting a deposit. The second half stands —
+> **the chain offers no privacy**, because nothing in this design is built,
+> wired or audited.
 
 ## 0. What "Coherence" means
 

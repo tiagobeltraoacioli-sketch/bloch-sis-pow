@@ -5,10 +5,18 @@
 //! Spec: `docs/specs/BLOCH-TOKENOMICS-V4.md`. Supersedes `tokenomics_v2.rs`
 //! (21 B nominal, perpetual tail) and the ADR-035 emission V3 floor.
 //!
-//! **Nothing here is active.** These constants live in the standalone PoS crate
-//! and are not referenced by the node. Genesis-4 is a fresh chain, so there is
-//! no activation height to gate — the constants take effect only if and when a
-//! new genesis is produced from them.
+//! **Everything here is active, and it is the live chain's supply.** This said
+//! "Nothing here is active … not referenced by the node" until 2026-08-14. That
+//! was true while the PoS crate stood outside the node's workspace and no
+//! genesis had been produced from it. It stopped being true at 21:31:19 UTC on
+//! 2026-08-13: `bloch-pos-node/src/genesis.rs` imports this module and checks
+//! the genesis manifest against [`GENESIS_ISSUED_SAT`], and the ceremony minted
+//! the opening ledger from these figures.
+//!
+//! There is still no activation height, but for the opposite reason to the one
+//! given before: not because the constants are waiting to be used, but because
+//! they were used at slot 0 and a fresh chain has nothing to gate. Changing any
+//! of them now is a hard fork of a running mainnet, not an edit to a draft.
 //!
 //! ## The u64 hazard, front and centre
 //!
@@ -92,7 +100,7 @@ pub const TOTAL_SUPPLY_SAT: u128 = TOTAL_SUPPLY_BLOCH * SAT_PER_BLOCH;
 /// founder's Genesis-3 holdings come across as ordinary liquid carryover and a
 /// fresh grant is made on top (founder decision, 2026-08-11; an earlier draft
 /// re-granted the full 17%, the decision settled at 10%). Combined, the
-/// founder holds 26.89% of supply — [`FOUNDER_TOTAL_BLOCH`] pins it. §4A of
+/// founder holds 27.04% of the cap — [`FOUNDER_TOTAL_BLOCH`] pins it. §4A of
 /// the tokenomics spec states what that does to the activation gates.
 pub const FOUNDER_BLOCH: u128 = 10_000_000_000; // 10%
 /// Sold to funds; the Foundation is the counterparty. Nothing liquid at
@@ -126,11 +134,15 @@ pub const FOUNDATION_LIQUID_AT_GENESIS_BLOCH: u128 =
 
 /// The carried-over ledger — **one balance set, no founder line**.
 ///
-/// Measured on Genesis-3 at height 43,172 (448,337 UTXOs, 15 addresses) as
-/// 3,773,884,800 BLCH, and carried across under the split: x100/21 exactly,
-/// which this figure is (the G3 total is divisible by 21, so the scaled total
-/// is exact — no dust at the aggregate level; per-row dust is the builder's
-/// problem, see [`split_g3_sat`]). Every balance crosses as ordinary liquid
+/// Measured on Genesis-3 at its **terminal** height 39,918 — the height it
+/// stopped permanently at on 2026-08-13 — over 452,726 outputs and 16
+/// addresses, as 3,810,744,000 BLCH, and carried across under the split:
+/// x100/21 exactly, which this figure is (the G3 total is divisible by 21, so
+/// the scaled total is exact — no dust at the aggregate level; per-row dust is
+/// the builder's problem, see [`split_g3_sat`]). The height, count and root
+/// are pinned beside it in [`CARRYOVER_MEASURED_HEIGHT`],
+/// [`CARRYOVER_MEASURED_UTXOS`] and [`CARRYOVER_MEASURED_ROOT`]; the table
+/// below records the two earlier, superseded readings. Every balance crosses as ordinary liquid
 /// balance, the founder's included: those coins were mined, on the same
 /// chain, under the same rules as everyone else's (founder decision,
 /// 2026-08-11).
@@ -155,10 +167,11 @@ pub const FOUNDATION_LIQUID_AT_GENESIS_BLOCH: u128 =
 /// the activation gates, and it states it the same way it did before either
 /// decision.
 ///
-/// Re-measured 2026-08-13 against a live node, and **still provisional**:
-/// Genesis-3 halts at height 50,000 and keeps minting until it does, so this
-/// figure grows with every block. The terminal snapshot is what pins it, and
-/// nothing here should be treated as final before then.
+/// **Final, not provisional.** An earlier revision of this comment said the
+/// figure would keep growing because Genesis-3 was still minting. It is not:
+/// Genesis-3 stopped permanently on 2026-08-13 at height 39,918 (block_count
+/// 50,690), and the terminal row below is the snapshot the live Genesis-4
+/// genesis was built from. Nothing further can be added to the carryover.
 ///
 /// | when | height | block_count | UTXOs | Genesis-3 BLOCH | ×100/21 |
 /// |---|---|---|---|---|---|
@@ -170,17 +183,18 @@ pub const FOUNDATION_LIQUID_AT_GENESIS_BLOCH: u128 =
 /// wrong in a way worth recording rather than quietly fixing: it read
 /// "measured at height 43,172", but the chain has never been at that height —
 /// it was at 39,328 when this was re-measured, and 43,172 was the
-/// **block_count**. In a DAG those differ by design (50,042 blocks at height
-/// 39,328 today), so anyone reproducing the old measurement "at height
-/// 43,172" would have waited days for a height that produces a different
-/// number. Heights and block counts are now stated separately, both times.
+/// **block_count**. In a DAG those differ by design (50,690 blocks at the
+/// terminal height 39,918), so anyone reproducing the old measurement "at
+/// height 43,172" would have waited for a height the chain never reached.
+/// Heights and block counts are now stated separately, every time.
 ///
-/// The split stays exact: 3,805,746,000 is divisible by 21, so ×100/21 lands
-/// on a whole number with no aggregate dust, same as the previous figure.
+/// The split stays exact: 3,810,744,000 is divisible by 21, so ×100/21 lands
+/// on a whole number with no aggregate dust, same as the earlier figures.
 ///
 /// Raising this does not breach the cap. [`VALIDATOR_EMISSION_BLOCH`] is the
-/// remainder of a fixed total, so 151,720,000 BLOCH more carryover is
-/// 151,720,000 BLOCH less validator emission — the holders' ledger grows and
+/// remainder of a fixed total, so the 175,520,000 BLOCH by which the terminal
+/// carryover exceeds the first reading is 175,520,000 BLOCH less validator
+/// emission — the holders' ledger grows and
 /// the future issuance shrinks by exactly the same amount. That is the right
 /// bucket to absorb it: it is unissued, so nothing is taken from anyone who
 /// already holds coins, and the alternative is taking it from an allocation
@@ -376,28 +390,15 @@ const _: () = assert!(VC_BLOCH * SPLIT_DENOMINATOR == 2_100_000_000 * SPLIT_NUME
 const _: () = assert!(TEAM_BLOCH * SPLIT_DENOMINATOR == 2_100_000_000 * SPLIT_NUMERATOR);
 const _: () = assert!(MARKETING_BLOCH * SPLIT_DENOMINATOR == 840_000_000 * SPLIT_NUMERATOR);
 const _: () = assert!(LIQUIDITY_BLOCH * SPLIT_DENOMINATOR == 1_050_000_000 * SPLIT_NUMERATOR);
-// Re-pinned 2026-08-13 to the measured snapshot (h39,328): the carryover is
-// what the ledger says it is, not what a draft said it would be. The split
-// stays exact on the new figure too — 3,805,746,000 is divisible by 21.
+// Re-pinned 2026-08-13 to the TERMINAL snapshot (h39,918, the height
+// Genesis-3 stopped at): the carryover is what the ledger says it is, not what
+// a draft said it would be. The split stays exact on the final figure too —
+// 3,810,744,000 is divisible by 21.
 const _: () =
     assert!(CARRYOVER_TOTAL_BLOCH * SPLIT_DENOMINATOR == 3_810_744_000 * SPLIT_NUMERATOR);
 const _: () =
     assert!(VALIDATOR_EMISSION_BLOCH * SPLIT_DENOMINATOR == 8_999_256_000 * SPLIT_NUMERATOR);
 
-/// Largest single carried-over address, for the concentration reporting in §4A.
-/// Not a consensus quantity and not a distinct class of coin — a measurement,
-/// re-taken 2026-08-13 from the same snapshot as [`CARRYOVER_TOTAL_BLOCH`]
-/// (h39,328, root `162cb763…`): the address `e986db51…` holds
-/// 357,483,616,997,963,769 sat = 3,574,836,169.98 BLCH across 425,599 of the
-/// set's 452,133 outputs. Scaled ×100/21 and truncated to whole BLCH.
-///
-/// Both figures now come from one snapshot, which is the only way the ratio
-/// between them means anything. Updating the total against a fresh
-/// measurement while leaving this one at the older reading would have moved
-/// the reported concentration from 93.96% to 93.17% — a 0.8-point "drop" that
-/// was an artifact of mixing two measurements, not a change in who holds
-/// what. Measured together, concentration is **93.93%**: essentially
-/// unchanged, which is the true answer.
 /// The 20-byte hash160 of the address holding the carryover — the founder's.
 ///
 /// Used as the withdrawal credential and allocation script for the launch
@@ -409,14 +410,33 @@ pub const FOUNDER_WITHDRAWAL_H160: [u8; 20] = [
     0x2a, 0x04, 0x82, 0x72, 0xa0, 0x9a, 0xff, 0x0a, 0xf4, 0xff,
 ];
 
+/// Largest single carried-over address, for the concentration reporting in §4A.
+/// Not a consensus quantity and not a distinct class of coin — a measurement,
+/// taken from the SAME terminal snapshot as [`CARRYOVER_TOTAL_BLOCH`]
+/// ([`CARRYOVER_MEASURED_HEIGHT`] = 39,918, [`CARRYOVER_MEASURED_UTXOS`] =
+/// 452,726, root `7c756ee8…`): the address `e986db51…` — the founder's,
+/// [`FOUNDER_WITHDRAWAL_H160`] — holds 357,983,416,998,063,769 sat =
+/// 3,579,834,169.98 BLCH on Genesis-3. Scaled ×100/21 and truncated to whole
+/// BLOCH, that is the constant below.
 ///
 /// The set has **16 distinct addresses**.
+///
+/// Both figures come from one snapshot, which is the only way the ratio
+/// between them means anything: updating the total against a fresh
+/// measurement while leaving this one at an older reading moves the reported
+/// concentration by tenths of a point for no reason but the mismatch.
+///
+/// **Measured together, concentration is 93.94%** — 17,046,829,380 of
+/// 18,146,400,000 BLOCH. `tests/committee.rs` pins it at 9394 bps. Carried
+/// balances are stakeable, so if this one stakes the Nakamoto coefficient is
+/// 1: one holder can outvote every other. That, not hashrate, is Genesis-4's
+/// security question.
 pub const LARGEST_CARRYOVER_ADDRESS_BLOCH: u128 = 17_046_829_380;
 const _: () = assert!(LARGEST_CARRYOVER_ADDRESS_BLOCH < CARRYOVER_TOTAL_BLOCH);
 // Pinned against the measurement in satoshis, not in whole BLOCH. The address
-// holds 3,574,836,169.97963769 BLCH; rounding that to whole BLOCH before
-// scaling gives 17,023,029,376 and scaling the satoshi figure gives
-// 17,023,029,380. Four BLOCH of difference is nothing to the reporting, but a
+// holds 3,579,834,169.98063769 BLCH; rounding that to whole BLOCH before
+// scaling gives 17,046,829,376 and scaling the satoshi figure gives
+// 17,046,829,380. Four BLOCH of difference is nothing to the reporting, but a
 // constant that disagrees with its own derivation is a trap for whoever
 // re-derives it next.
 const _: () = assert!(
@@ -425,12 +445,20 @@ const _: () = assert!(
     "a medida escalada nao bate com a medida G3 sob o split"
 );
 
-/// Founder carried-over balance plus the new grant: 27.02% of supply.
+/// Founder carried-over balance plus the new grant: **27.04% of the 100 B
+/// cap** — 17,046,829,380 carried + 10,000,000,000 granted = 27,046,829,380,
+/// which the assertion below pins at 2704 bps.
 ///
-/// Up from 26.89%: the re-measured carryover is larger and the founder holds
-/// 93.93% of it, so their share of a fixed cap rises. Recorded rather than
-/// smoothed — the number moving in this direction is exactly what §4A exists
-/// to report.
+/// Up from 26.89%: the terminal carryover is larger than the first reading and
+/// the founder holds 93.94% of it, so their share of a fixed cap rises.
+/// Recorded rather than smoothed — the number moving in this direction is
+/// exactly what §4A exists to report.
+///
+/// For the full picture an exchange or auditor needs: the Foundation holds a
+/// further 29.00% ([`FOUNDATION_HELD_BLOCH`]), so founder + Foundation is
+/// 56,046,829,380 of the 57,146,400,000 BLOCH issued at slot 0
+/// ([`GENESIS_ISSUED_SAT`]) — leaving 1,099,570,620 BLOCH, 1.92% of genesis
+/// supply, in third-party hands.
 pub const FOUNDER_TOTAL_BLOCH: u128 = LARGEST_CARRYOVER_ADDRESS_BLOCH + FOUNDER_BLOCH;
 const _: () = assert!(FOUNDER_TOTAL_BLOCH * 10_000 / TOTAL_SUPPLY_BLOCH == 2704);
 
@@ -551,7 +579,8 @@ pub const fn insider_unlocked_sat(slot: u64) -> u128 {
 // is aliased as "the" reward, because picking one here would make a founder
 // decision look like an implementation detail.
 
-/// Flat: constant reward for 40 years, then fee-only. ~1,022.63 BLCH/slot.
+/// Flat: constant reward for 40 years, then fee-only. ~1,018.46 BLOCH/slot
+/// (42,853,600,000 / 42,076,800).
 pub const fn validator_reward_flat_sat(slot: u64) -> u128 {
     if slot >= EMISSION_SLOTS {
         return 0;
@@ -563,8 +592,16 @@ pub const fn validator_reward_flat_sat(slot: u64) -> u128 {
 ///
 /// `R0` is derived so the ten periods sum to exactly the validator allocation:
 /// the geometric sum is `R0 · P · (2046/1024)`, so `R0 = alloc · 1024 / (P · 2046)`.
-/// Initial reward ≈ 5,118 BLCH/block, final period ≈ 5.0 BLCH/block, and the
-/// truncation residual over the whole 40 years is under 0.14 BLCH.
+/// Initial reward ≈ 5,097.29 BLOCH/slot (`INITIAL_REWARD_SAT` = 509,728,521,739),
+/// final period (era 9, `>> 9`) ≈ 9.96 BLOCH/slot.
+///
+/// Both figures were quoted as 5,118 and 5.0 until 2026-08-14: they were
+/// derived from the 43,029,120,000 BLOCH validator allocation this file held
+/// before the carryover was re-measured against the terminal Genesis-3
+/// snapshot. `INITIAL_REWARD_SAT` is computed from
+/// [`VALIDATOR_EMISSION_BLOCH`], so the constant tracked the change and the
+/// comment did not. This model is not the live schedule — see the decay curve
+/// below — but a reader comparing schedules must be comparing real numbers.
 pub const HALVING_PERIOD_SLOTS: u64 = 4 * SLOTS_PER_YEAR;
 pub const HALVINGS: u32 = 10;
 pub const INITIAL_REWARD_SAT: u128 =
@@ -594,8 +631,8 @@ pub const fn validator_reward_halving_sat(slot: u64) -> u128 {
 /// both live constraints at once, and the split changes neither (both are
 /// ratios of the same supply):
 ///
-/// - **Inflation target.** Year 1 emits 4,367,467,018.77 BLCH = **4.36% of
-///   total supply** (`annual_inflation_bps(0)` = 436), against the founder's
+/// - **Inflation target.** Year 1 emits 4,349,651,692.52 BLOCH = **4.34% of
+///   total supply** (`annual_inflation_bps(0)` = 434), against the founder's
 ///   "under 7%" requirement. Year 5 is 2.86%, year 10 is 1.69%. Identical in
 ///   basis points to the 21 B schedule this splits from — pinned by test.
 /// - **Decentralisation.** An 8%/year decline is too flat: validators stop
@@ -621,13 +658,24 @@ pub const INITIAL_ANNUAL_SAT: u128 = 434_965_169_252_191_762;
 ///
 /// The 40-year sum is `Σ (annual_n / SPY) · SPY` — a multiple of
 /// `SLOTS_PER_YEAR` by construction — and the allocation is **not** a multiple
-/// of `SLOTS_PER_YEAR` (4,302,912,000,000,000,000 mod 1,051,920 = 176,880), so
-/// no choice of `INITIAL_ANNUAL_SAT` lands exactly. An earlier revision of
-/// this file claimed a zero residual; that claim was arithmetically impossible
-/// (the 21 B schedule's true residual was 889,200 sat) and is corrected here
-/// rather than repeated. 176,880 sat is 0.0018 BLCH, permanently unissued —
-/// which errs on the only acceptable side of a hard cap: under, never over.
-/// The compile-time assertion below pins it.
+/// of `SLOTS_PER_YEAR`, so no choice of `INITIAL_ANNUAL_SAT` lands exactly.
+/// [`VALIDATOR_EMISSION_SAT`] is 4,285,360,000,000,000,000, and
+/// 4,285,360,000,000,000,000 mod 1,051,920 = **855,280** — the value below.
+///
+/// Two earlier readings are recorded rather than quietly replaced, because
+/// each was right about a different schedule and the residual is the one number
+/// here that moves whenever the allocation does. A revision before that claimed
+/// a **zero** residual, which is arithmetically impossible for any
+/// `INITIAL_ANNUAL_SAT`. Then the 21 B schedule's true residual was 889,200 sat.
+/// Then this comment carried 176,880 sat, which is the residual of
+/// 4,302,912,000,000,000,000 — the 43,029,120,000 BLOCH allocation this file
+/// held before the carryover was re-measured against the terminal Genesis-3
+/// snapshot. The allocation is now 42,853,600,000 BLOCH, so the residual is
+/// 855,280 and the constant was updated while the prose was not. Corrected.
+///
+/// 855,280 sat is 0.0086 BLOCH, permanently unissued — which errs on the only
+/// acceptable side of a hard cap: under, never over. The compile-time
+/// assertion below pins it, and is what caught the drift.
 pub const EMISSION_DUST_SAT: u128 = 855_280;
 
 const _: () = assert!(

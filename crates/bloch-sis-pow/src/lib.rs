@@ -3,6 +3,13 @@
 // Bloch-SIS-PoW — Reference Implementation v0.1
 // =============================================
 //
+// HISTORICAL — PROOF-OF-WORK ERA. Bloch's proof-of-work chain (Genesis-3)
+// stopped permanently at height 39,918 on 2026-08-13. The live chain is
+// Genesis-4, PROOF OF STAKE — 30 s slots, 32-slot epochs, Casper-style
+// finality by epoch, consensus in crates/bloch-pos-committee. NOTHING IN THIS
+// CRATE SECURES THE LIVE CHAIN. Everything below describes the proof-of-work
+// era; read it in the past tense.
+//
 // Proof-of-Work for the Bloch Protocol: a SHAKE-256 (Keccak) hashcash
 // with a Module-SIS structural gate.
 //
@@ -61,8 +68,28 @@
 
 //! Bloch-SIS-PoW reference implementation.
 //!
-//! See the crate-level documentation comment in `src/lib.rs` for status
-//! and scope notes.
+//! > **Historical — proof-of-work era.** This crate is proof-of-work
+//! > machinery. Bloch's proof-of-work chain, Genesis-3, stopped permanently at
+//! > height 39,918 on 2026-08-13. The live chain is **Genesis-4, proof of
+//! > stake** (30 s slots, 32-slot epochs, Casper-style finality by epoch;
+//! > consensus in `crates/bloch-pos-committee`). **Nothing in this crate
+//! > secures the live chain.** It remains a workspace member only because
+//! > `bloch-crypto` — whose `crypto` module IS on the Genesis-4 signature path
+//! > — still links it for the Genesis-3 `core` module's residual-gate
+//! > selector. Kept buildable for audit and because Genesis-4's opening ledger
+//! > derives from the chain this era produced.
+//! >
+//! > Read every present-tense sentence below about mining, difficulty,
+//! > hashrate and ASERT retargeting as describing the proof-of-work era.
+//! >
+//! > **The live security question is not hashrate, it is concentration:** all
+//! > 64 Genesis-4 validators are operated by one entity, 93.94% of the
+//! > carryover sits at a single address, and 56.05 B of the 57.15 B BLOCH
+//! > issued at genesis is held by the founder and the Foundation. One operator
+//! > can halt the chain and one holder can outvote every other.
+//!
+//! See the crate-level documentation comment at the top of `src/lib.rs` for
+//! the security model, status and scope notes.
 
 extern crate alloc;
 

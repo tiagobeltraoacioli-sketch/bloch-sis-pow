@@ -1,3 +1,12 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# RETIRED. This builds `bloch-pool`, a mining pool for the Genesis-3 proof-of-
+# work chain, which stopped permanently at height 39,918 on 2026-08-13. There is
+# no hashrate to pool. The live chain is GENESIS-4, PROOF OF STAKE: blocks come
+# from a proposer schedule over staked validators — no mining, no stratum, no
+# pool, no payout split. Kept as part of the Genesis-3 record; see
+# `pool.fly.toml` and `pool/README.md`.
+# ══════════════════════════════════════════════════════════════════════════════
+
 # Postern-operated instance of the reference Bloch-SIS-PoW mining pool.
 # The pool is a STANDALONE cargo workspace (pool/) with path deps into crates/,
 # so both dirs must be in the build context. Base images pinned by digest,

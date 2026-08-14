@@ -11,6 +11,7 @@ Status:     DRAFT for Edition 2 assembly — supersedes Edition 1 chapters
             14 (ZK-Ledger Groundwork), 17 (Security Program),
             18 (Threat Model & Risk Factors)
 Prepared:   2026-08-12, against branch integration/pos-modules
+Revised:    2026-08-14, against the live Genesis-4 chain
 Repository: gitlab.com/blochsispow-group/bloch-pos (private at time of writing)
 License:    AGPL-3.0-or-later
 ```
@@ -19,13 +20,38 @@ License:    AGPL-3.0-or-later
 below: designed ≠ built ≠ booted.** Having a specification, having code that
 implements it, and having that code running as the consensus-enforced rule on
 a live network are three different states, and every capability in this
-document is labeled with which of the three it has reached. One label
-matters more in Edition 2 than it did in Edition 1: **Genesis-4, the
-proof-of-stake chain these chapters describe, has not launched.** The
-consensus crate is substantially built and tested; the node around it is a
-devnet skeleton (localhost TCP, no transactions, no RPC —
-`crates/bloch-pos-node/src/engine.rs:95`, `net.rs:147`). Nothing in this
-document is "booted" unless it says so, and most of it does not.
+document is labeled with which of the three it has reached.
+
+**The label that moved, and it moved the other way from what this document
+first said.** An earlier draft opened: *"Genesis-4, the proof-of-stake chain
+these chapters describe, has not launched … the node around it is a devnet
+skeleton."* **Both halves are now false and are withdrawn.** Genesis-3 stopped
+permanently at height 39,918 on 2026-08-13, and **Genesis-4 has been live under
+proof of stake since 21:31:19 UTC that day** — 30-second slots, 32-slot epochs,
+Casper-style justification and finalisation by epoch. The node is not a
+skeleton: it carries a mempool, a JSON-RPC surface (public read endpoint
+`https://posternlabs.com/g4rpc`), persistence, executing transfers, and two
+transports.
+
+What must be said in the same breath, every time, because "booted" on this
+chain is easy to over-read:
+
+- **64 of 64 validators are operated by a single entity.** There is no
+  independent validator; one operator can halt the chain.
+- **The live transport is `Transport::Devnet`** — a point-to-point TCP full
+  mesh with a **fixed peer list, no discovery and no authentication**
+  (`crates/bloch-pos-node/src/net.rs`). That is the mechanical reason a third
+  party cannot join. A libp2p stack exists in the tree; it is not what the
+  fleet runs, and this document does not claim a production network layer
+  exists.
+- **`Deposit` and `Delegate` are refused at every node's mempool**
+  (`crates/bloch-pos-node/src/engine.rs:1900-1907`), because bonding is not
+  yet funded from the eUTXO set — so nobody outside can bond stake.
+- **Nothing here has been audited by a third party**, and the chain launched
+  without the external review its own gates required (§6).
+
+The word "devnet" is accurate about the transport and about nothing else. It is
+not the network, the chain, the binary, or the project's stage.
 
 ---
 
@@ -226,7 +252,11 @@ protocol-level mitigations recommended alongside the pin — fixed-deadline
 publication (pad the one observable a remote attacker has, publication time,
 to a constant) and keygen-off-box (single-trace attacks published against
 Falcon target keygen) — are spec recommendations, not yet consensus rules
-(`BLOCH-FALCON-ONLINE-SIGNING.md` §5). Designed, not built.
+(`BLOCH-FALCON-ONLINE-SIGNING.md` §5). Designed, not built — **and the
+scheduled online signing they were written for is now happening on a live
+mainnet**, on 64 validators, every slot, so they are open exposures rather
+than future work. Gate G7 required external review of exactly this path before
+launch; the chain launched without it (§6).
 
 ### 2.4 A format boundary worth stating in an institutional document
 
@@ -316,8 +346,13 @@ Carried forward deliberately, in the same words the ratified spec uses
 (COHERENCE-C1.1.md §3):
 
 - **No privacy claim is made** until the planned external audit of the
-  Coherence stack (C4). The chain remains, in this respect, a zero-security
-  testnet.
+  Coherence stack (C4). Read that at full strength on a live mainnet: with
+  respect to privacy specifically, Bloch offers **no security guarantee at
+  all** — not a weak one — and no user should treat any part of this chain as
+  private. (Earlier drafts phrased this as "the chain remains a zero-security
+  testnet". The *stance* is unchanged and deliberately not softened; the word
+  "testnet" is withdrawn, because Genesis-4 is a mainnet carrying real
+  balances, which makes the disclosure more important rather than less.)
 - **The value bridge does not exist.** `shield_tx`/unshield is undefined;
   value cannot enter or leave the pool. A shielded pool with no inlet is a
   format and an accumulator, not a privacy feature.
@@ -329,9 +364,11 @@ Carried forward deliberately, in the same words the ratified spec uses
 Designed: the C1/C1.1 formats, frozen and ratified. Built: `coherence-core`
 (708 source lines, 12 tests, its only dependency `sha3`), the prover
 host-side stack, the genesis-ceremony carry logic. Booted: nothing — no live
-proof pipeline, no consensus-wired verifier, no committed timeline. Edition
-1's closing caution applies unchanged: this is a description of direction
-and precondition, not of a shipped feature.
+proof pipeline, no consensus-wired verifier, no committed timeline. The pool
+crossed the genesis seam as an attested **empty** artifact, so no shielded
+value moved and none exists. Edition 1's closing caution applies unchanged:
+this is a description of direction and precondition, not of a shipped
+feature.
 
 ---
 
@@ -453,9 +490,19 @@ where third-party review stands.
 
 ## 5. Threat Model, Updated for Proof of Stake
 
-Edition 1's threat model led with 51%-attackability at low hashrate. That
-risk died with the PoW chain; the risks that replaced it are not smaller,
-and several have no PoW analogue at all. The primary sources are the two
+Edition 1's threat model led with 51%-attackability at low hashrate. **That
+risk ended with the PoW chain on 2026-08-13, and what replaced it as the
+leading risk is concentration — which is larger, not smaller, and is a
+present-tense property of the live network.** Stated once, at the top, in the
+position the old caveat held:
+
+> The security question under Genesis-4 is not hashrate, it is concentration:
+> all 64 validators are run by one entity, 93.94% of the carryover sits at a
+> single address, and 56.05 B of the 57.15 B BLOCH issued at genesis is held
+> by the founder and the Foundation. One operator can halt the chain and one
+> holder can outvote every other.
+
+Several of the risks below have no PoW analogue at all. The primary sources are the two
 adversarial passes `docs/specs/BLOCH-POS-THREAT-MODEL.md` (F1–F13) and
 `BLOCH-POS-THREAT-MODEL-2.md` (G1–G4), kept deliberately unrewritten as a
 record, with status seals recording what each finding's fate was. The
@@ -485,11 +532,12 @@ not a correction**.
   seeded by the mix fixed at the close of N−2, with the honest residue
   stated — the one-bit-per-withheld-slot bias is displaced an epoch forward,
   not eliminated (the same residue Ethereum accepts).
-- **F7 (Medium) — accepted surface:** public sortition hands an attacker the
-  per-slot committee schedule one epoch ahead, making targeted DoS cheap.
-  Quantified in `BLOCH-POS-SORTITION-DOS.md`; mitigations (sentry nodes,
-  late attestation inclusion, proposer boost) are recommendations, not yet
-  rules. Accepted and disclosed, not closed.
+- **F7 (Medium) — accepted surface, now live:** public sortition hands an
+  attacker the per-slot committee schedule one epoch ahead, making targeted
+  DoS cheap. Quantified in `BLOCH-POS-SORTITION-DOS.md`; mitigations (sentry
+  nodes, late attestation inclusion, proposer boost) are recommendations, not
+  yet rules. Accepted and disclosed, not closed — and since 2026-08-13 it is an
+  exposure of a running network rather than of a design.
 - **F8 / stake-churn — decided and applied:** the warm-up rate was cut from
   900 to 25 bps/epoch with a churn floor (`WARMUP_RATE_BPS = 25`,
   `src/delegation.rs`), turning a zero-to-⅓ stake shift from ~75 minutes
@@ -538,33 +586,61 @@ not a correction**.
 6. **Stake concentration is consensus power directly.** Under PoW the
    founder's balance could not vote; hashrate was external and had to be
    bought. Under PoS the founder's carried-over balance is stakeable by
-   decision of record, and if staked while others abstain it is ~94% of
-   active stake — **a Nakamoto coefficient of 1**
-   (`docs/audit/CERTIK-PRE-AUDIT-DOSSIER.md` §1.1, measured, not
-   estimated). The consensus-coded bounds (genesis-cohort taper,
-   per-validator cap, churn rate) constrain the founder's *validator
-   weight*; they do not and cannot constrain the founder's *holdings*. Any
-   framing of those mechanisms as fixing concentration would be false, and
-   this dossier does not offer one.
-7. **Bootstrap liveness.** A fresh PoS genesis must produce block 1 with
+   decision of record: measured at the terminal Genesis-3 snapshot (height
+   39,918, 452,726 outputs, 16 addresses) it is **17,046,829,380 of
+   18,146,400,000 BLOCH — 93.94% of the carryover** — so if staked while
+   others abstain it is ~94% of active stake, **a Nakamoto coefficient of 1**
+   (`crates/bloch-pos-committee/src/tokenomics_v4.rs`, measured and pinned,
+   not estimated). Including the 10% grant the founder holds **27.04% of the
+   cap**; the Foundation holds **29.00%**; together **56,046,829,380 of the
+   57,146,400,000 issued at slot 0**, leaving **1.92%** with third parties.
+   The consensus-coded bounds (genesis-cohort taper, per-validator cap, churn
+   rate) constrain the founder's *validator weight*; they do not and cannot
+   constrain the founder's *holdings*. Any framing of those mechanisms as
+   fixing concentration would be false, and this dossier does not offer one.
+7. **Operator concentration, which on a live chain outranks all of the
+   above.** **All 64 Genesis-4 validators are operated by one entity.** This
+   is not a scenario conditional on staking behaviour; it is the state of the
+   network. One operator can stall finality and one operator can stop the
+   chain, and neither requires any mechanism in the protocol. Nor can the set
+   become plural by anyone else's choice: the live transport has a fixed peer
+   list with no discovery and no authentication, and `Deposit`/`Delegate` are
+   refused at every node's mempool, so no outside party can bond stake.
+8. **Bootstrap liveness.** A fresh PoS genesis must produce block 1 with
    whatever stake exists at slot 0 — the class of self-inflicted halt G2
    found. PoW chains bootstrap on any nonzero hashrate; PoS chains need a
    staked, attesting set from the first epoch.
-8. **Key ceremonies that do not exist yet.** No production Genesis-4 key
-   exists; the custody plan is DRAFT (`docs/specs/BLOCH-GENESIS-KEYS.md`).
-   The Genesis-3 keys guarding the liquid carryover were generated long ago
-   under unknown conditions and sit outside that plan, inside the risk.
+9. **Key custody, now with keys.** An earlier draft said "no production
+   Genesis-4 key exists". Genesis-4 launched, so a genesis manifest and 64
+   validator keys exist and are signing every slot. The custody plan is still
+   DRAFT (`docs/specs/BLOCH-GENESIS-KEYS.md`), and **this repository contains
+   no evidence about how the live keys were produced or are held** — the live
+   genesis manifest is not committed here. That is stated as an open question,
+   not resolved in either direction. The Genesis-3 keys guarding the liquid
+   carryover were generated long ago under unknown conditions and sit outside
+   that plan, inside the risk; those coins crossed the seam and are 93.94% of
+   the carryover.
 
 ### 5.3 What was retired with proof of work
 
 Stated for completeness, because a threat model that only adds is not being
 honest about the trade: rented-hashrate 51% attacks on a low-hashrate
-SHA-256d chain — Edition 1's leading risk — no longer apply. The successor
-question, "what does it cost to acquire a stake position that threatens
-consensus," currently has a degenerate answer: nothing needs acquiring,
-because the founder already holds it (item 6 above). Decentralization is
-measured by the G1–G11 gates, and **no gate has an observed value**,
-because the chain has not launched.
+SHA-256d chain — Edition 1's leading risk — ended with the chain on
+2026-08-13 and no longer apply. The successor question, "what does it cost to
+acquire a stake position that threatens consensus," has a degenerate answer:
+nothing needs acquiring, because the founder already holds it (item 6), and
+in any case nothing *can* be acquired, because deposits are refused (item 7).
+
+Decentralization is measured by the G1–G11 gates. An earlier draft ended this
+section "no gate has an observed value, because the chain has not launched."
+**The chain launched.** The gates now have observed values, and they are the
+worst possible ones: **G1 (independent stake ≥ 15% of circulating) = 0%**;
+**G2 (no entity above 25% of active stake)** fails against a set operated
+entirely by one entity; **G3 (Nakamoto coefficient ≥ 7) = 1**; **G4 (≥ 200
+validators, ≥ 50 unaffiliated) = 64 validators, 0 unaffiliated**. These were
+Go/No-Go conditions on the transition and the transition happened anyway. A
+threat model that reported them as "unmeasured" would be understating the
+risk, not overstating it.
 
 ---
 
@@ -582,22 +658,32 @@ today:
   real audit surface (four crates, ~37k source lines, 814 passing tests,
   measured not asserted), hands over the self-found findings of Section 4
   with commits and regression tests, and lists the open gaps it would not
-  want an auditor to discover first — including that the PoS node is a
-  devnet skeleton, that genesis keys do not exist, and that the repository
-  itself is private at time of writing.
-- **A defined external-review requirement before launch:** gate G7 requires
-  external review of exactly the highest-value target — the online
-  Falcon-1024 signing path of Section 2
-  (`docs/specs/BLOCH-FALCON-ONLINE-SIGNING.md`; CERTIK dossier §2).
+  want an auditor to discover first. Two of that list's entries have since
+  been corrected in the dossier itself and should not be quoted from older
+  copies: the PoS node is **not** a devnet skeleton (it runs a live mainnet,
+  though its transport is still the unauthenticated fixed-peer mesh and
+  deposits are refused at the mempool), and genesis keys **do** exist (they
+  are signing every slot; how they were produced and are held is not
+  evidenced in this repository).
+- **An external-review requirement that was not honoured.** Gate G7 required
+  external review of the highest-value target — the online Falcon-1024
+  signing path of Section 2
+  (`docs/specs/BLOCH-FALCON-ONLINE-SIGNING.md`; CERTIK dossier §2) — **before
+  launch. Genesis-4 launched on 2026-08-13 without it.** That path is now
+  signing on a public schedule, on 64 internet-facing machines, with value
+  bonded behind the keys, unreviewed.
 - **Two applicable checks that fail today and are written as FAIL:**
-  holder concentration (Nakamoto coefficient 1 if the founder stakes) and
-  open-source publication (the repo is private, and the decentralization
+  holder concentration (Nakamoto coefficient 1 — and 1 by operator count
+  regardless of staking, since one entity runs all 64 validators) and
+  open-source publication (the repository visibility probe in the CertiK
+  dossier dates from 2026-08-12 and has not been re-run; the decentralization
   ADR rests on publication before launch). No reframing is offered.
 
-The engagement, when it happens, would be the first external audit. Until it
-concludes: the hybrid signature composition is unreviewed by third parties,
-the Coherence stack makes no privacy claim (Section 3.3), activation of the
-contract VM remains gated on an audit that has not occurred, and anyone
-relying on this protocol for value at risk should weigh those gaps
-accordingly. Designed ≠ built ≠ booted — and separately from all three:
-**unaudited**.
+There has been **no external audit, and the chain is live**. Until one
+concludes: the consensus crate and the node are unreviewed by third parties,
+the hybrid signature composition is unreviewed by third parties, the Coherence
+stack makes no privacy claim at all (Section 3.3), activation of the contract
+VM remains gated on an audit that has not occurred, and anyone relying on this
+protocol for value at risk should weigh those gaps accordingly. Designed ≠
+built ≠ booted — and separately from all three: **unaudited, on a mainnet, by
+one operator**.

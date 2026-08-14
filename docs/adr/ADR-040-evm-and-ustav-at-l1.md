@@ -4,7 +4,13 @@
 
 - **Status:** Accepted in direction (founder decision, 2026-08-11) —
   **design and consequences under development**; the execution vehicle is
-  `docs/specs/BLOCH-L1-EXECUTION-PLAN.md`
+  `docs/specs/BLOCH-L1-EXECUTION-PLAN.md`.
+  **Not built (2026-08-14).** Genesis-4 launched on 2026-08-13 **without an
+  EVM and without Ustav at L1**. `crates/bloch-pos-node` references `euvm`
+  zero times and neither PoS crate has an euvm dependency; the header carries
+  an `EvmCommitment` that is **carried, never recomputed**
+  (`interfaces.rs` `StateRoots::evm`), i.e. a reserved slot, not an
+  execution layer. Nothing in this ADR is running.
 - **Relates to:** `docs/FLEET-BRIEF-2026-08-11.md` (the framing of record),
   `crates/bloch-euvm` (Ustav/Kirpich as they exist today),
   `bloch-l2-evm` (chainId 8400 — the service being replaced),

@@ -5,11 +5,50 @@
 Document: CERTIK-PRE-AUDIT-DOSSIER
 Status: DRAFT for founder review — prepared before engagement, to be handed to CertiK
 Prepared: 2026-08-12, against branch `integration/pos-modules` at `470b608`
+Revised: 2026-08-14, against the **live Genesis-4 chain**. Every figure and
+every status in this dossier was re-checked against the terminal Genesis-3
+snapshot and against `crates/bloch-pos-node/src/`; corrections are marked in
+place rather than folded in silently, because a dossier whose numbers move
+without a record is worth nothing to an auditor.
 Supersedes: the 2026-08-12 draft prepared at `84ca42a`, which predates the
 100-billion redenomination, the supply-cap consensus invariant and the halt
-height moving to 50,000
+height moving to 50,000 (which the chain never reached — see §0.0)
 Repository: `gitlab.com/blochsispow-group/bloch-pos` (private at time of writing — see check 20)
 License: AGPL-3.0-or-later (repo `LICENSE`; workspace `Cargo.toml:24`)
+
+---
+
+## 0.0 The state of the world this dossier is now written against
+
+**Genesis-3 has halted and Genesis-4 is live.** The proof-of-work chain
+stopped permanently at height **39,918** on 2026-08-13 — not at 50,000, the
+value decided on 2026-08-12 and quoted throughout the original draft.
+Genesis-4, proof of stake, has been producing and finalising since
+**21:31:19 UTC on 2026-08-13**: 30-second slots, 32-slot epochs, Casper-style
+justification and finalisation by epoch, hybrid ML-DSA-65 ‖ Falcon-1024
+signatures on every consensus path
+(`crates/bloch-pos-committee/src/params.rs`; `crates/bloch-pos-node/src/rpc.rs`
+`Finality`). Public read RPC: `https://posternlabs.com/g4rpc`.
+
+Three consequences an auditor should hold while reading the rest:
+
+1. **The concentration figures moved, and the height they were measured at was
+   wrong.** The original draft measured "at height 43,172". The chain was never
+   at that height: 43,172 was a **block count** mislabelled as a height, and in
+   a DAG the two differ by design. The terminal measurement is height
+   **39,918**, **452,726** outputs, **18,146,400,000 BLOCH** carryover
+   (`tokenomics_v4.rs` `CARRYOVER_MEASURED_HEIGHT`, `CARRYOVER_MEASURED_UTXOS`,
+   `CARRYOVER_TOTAL_BLOCH`, whose doc comment records this exact trap). Every
+   figure below is restated against the terminal snapshot. **The correction is
+   not an improvement**: concentration went from 93.96% of a mismeasured set to
+   **93.94%** of the real one. It is, to two decimal places, the same finding.
+2. **Two open gaps in §4 closed and are marked closed**; one — the claim that
+   the PoS node is a devnet skeleton — was **false by the time the chain
+   launched** and is corrected rather than removed.
+3. **Launching without the external audit and without the distribution gates
+   is itself a finding**, and this dossier now states it as one rather than
+   describing the gates as things standing between the code and a mainnet. See
+   §4 item 2 and §4 item 9.
 
 ---
 
@@ -64,7 +103,7 @@ nothing to an auditor.
 | Method | — | Pure redenomination, ratio `100/21` applied to every allocation. Shares unchanged, nobody diluted. Compile-time assertions prove each bucket scaled by the same ratio. | `tokenomics_v4.rs` (`SPLIT_NUMERATOR`/`SPLIT_DENOMINATOR`) |
 | Supply cap | Constant respected by construction | **Consensus invariant.** Cumulative issued supply is a committed state component; a block whose pre-state exceeds the cap is rejected. | `state_root.rs` tag `0x14`; `transition.rs` (`SupplyCapExceeded`) |
 | Validator bond | 100,000 BLCH (superseded) | **25,000 BLCH** — Ethereum's 32 ETH as the same fraction of supply, rounded down | `staking.rs` |
-| Genesis-3 halt | height 80,000 | **height 50,000** | `crates/bloch-crypto/src/core/mod.rs` |
+| Genesis-3 halt | height 80,000 → decided 50,000 | **the chain actually stopped at height 39,918**, 2026-08-13 | `crates/bloch-pos-committee/src/tokenomics_v4.rs` `CARRYOVER_MEASURED_HEIGHT` |
 
 Three consequences that are costs, not details, and that an auditor should see
 named rather than discover:
@@ -107,9 +146,9 @@ references are to this repository at `470b608`.
 | 5 | Anti-whale mechanism | No transfer/balance limits exist (in token-scan terms, none of the risk-flagged kind). Stake-side concentration bounds exist: per-validator cap of 1% of active stake, genesis-cohort declining cap, 25 bps churn. All three are honest about their limits: Sybil-bypassable by splitting, per their own doc comments. See §1.1. | N/A — substitute exists, with stated limits | `crates/bloch-pos-committee/src/delegation.rs:90`, `:103`; `src/genesis_cohort.rs:129-194`; `src/transition.rs:590`, `:857-858` |
 | 6 | Anti-whale modifiability | No privileged role can modify the caps in check 5: they are compile-time constants with no setter, no governance hook, no admin path (see check-23 grep). Changing them requires a code change every operator must adopt (a hard fork). | PASS (via substitute) | `crates/bloch-pos-committee/src/delegation.rs:90-110`; §1.3 grep table |
 | 7 | Honeypot (can buy, cannot sell) | No code path can block disposal: exit is self-signed, withdrawal needs no signature at all and has exactly three structural reject reasons (`NotExited`, `DelayNotElapsed`, `AlreadyWithdrawn`). Honest caveat: disposal is *market*-limited (no exchange listing, thin liquidity) — a fact for the listing conversation, not a protocol mechanism. | N/A — substitute holds | `crates/bloch-pos-committee/src/staking.rs:406-438`, `:470-479`, `:489-506` |
-| 8 | Self-destruct | No `selfdestruct` analogue, and no hidden kill switch (check-23 grep). One disclosed, deliberate exception must be named: Genesis-3 carries a **terminal-height consensus rule** — the chain halts at a fixed height for the Genesis-4 migration. It is public, one-time, and snapshot-preserving, not a concealed destruct path. See §5 for the height contradiction. | N/A — substitute holds, with disclosure | `docs/specs/BLOCH-TOKENOMICS-V4.md` §3.2; `docs/FLEET-BRIEF-2026-08-11.md` |
-| 9 | **Major holder concentration** | **Applies directly — the one check that maps one-to-one.** Measured: the largest single address holds **93.96%** of the carried-over supply (16,886,549,523 of 17,970,880,000 BLCH, snapshot at height 43,172, 15 addresses); **70.4%** of circulating at slot 0; if staked (it is stakeable, founder decision 2026-08-11), **94.0% of active stake — Nakamoto coefficient 1**. WBNB drew its only attention flag at 39.28%. | **FAIL** | `docs/specs/BLOCH-TOKENOMICS-V4.md` §2 (snapshot root `280d604b32525f03…`), §4A, §4A.1; `crates/bloch-pos-committee/src/tokenomics_v4.rs:236` (`LARGEST_CARRYOVER_ADDRESS_BLOCH`). Full treatment in §1.1 |
-| 10 | Mintable | No mint function, no privileged issuance: `PosTransaction` is a closed five-variant enum with no `Mint`; the only balance-increasing writes in the transition are the emission curve and fee compounding, both pure functions of slot/stake. Open gap: the decided block-level cap invariant is **not yet implemented** — see §1.2. | PASS (no privileged mint) — with an open gap on the cap invariant | `crates/bloch-pos-committee/src/transition.rs:175-220`, `:1152`, `:1177`, `:1186-1188`; `src/tokenomics_v4.rs:406-421` |
+| 8 | Self-destruct | No `selfdestruct` analogue, and no hidden kill switch (check-23 grep). One disclosed, deliberate exception must be named, and it has now happened: Genesis-3 carried a **terminal-height consensus rule** and **stopped permanently at height 39,918 on 2026-08-13**, with Genesis-4 opening from the signed snapshot. It was public, one-time, and snapshot-preserving, not a concealed destruct path. **Genesis-4 itself carries no terminal height** — `terminal_height()` is exhaustive with no wildcard arm, so a new chain-id cannot silently inherit one. | N/A — substitute holds, with disclosure | `crates/bloch-pos-committee/src/tokenomics_v4.rs` `CARRYOVER_MEASURED_HEIGHT`; `docs/specs/BLOCH-TOKENOMICS-V4.md` §3.2; `docs/FLEET-BRIEF-2026-08-11.md` |
+| 9 | **Major holder concentration** | **Applies directly — the one check that maps one-to-one, and the one that fails hardest.** Measured at the **terminal** Genesis-3 snapshot (height **39,918**, 452,726 outputs, 16 addresses): the largest single address holds **93.94%** of the carried-over supply (17,046,829,380 of 18,146,400,000 BLOCH). Carried balances are liquid **and stakeable** (founder decision 2026-08-11), so if that balance stakes the **Nakamoto coefficient is 1**. Independently of staking: all **64 live Genesis-4 validators are operated by one entity**, and of the 57,146,400,000 BLOCH issued at slot 0, **56,046,829,380 (98.08%)** is founder- or Foundation-held, leaving 1,099,570,620 (1.92%) with third parties. WBNB drew its only attention flag at 39.28%. | **FAIL** | `crates/bloch-pos-committee/src/tokenomics_v4.rs` (`LARGEST_CARRYOVER_ADDRESS_BLOCH`, `CARRYOVER_TOTAL_BLOCH`, `CARRYOVER_MEASURED_HEIGHT`, `FOUNDER_TOTAL_BLOCH`, `FOUNDATION_HELD_BLOCH`, `GENESIS_ISSUED_SAT`); `docs/specs/BLOCH-TOKENOMICS-V4.md` §4A, §4A.1. Full treatment in §1.1 |
+| 10 | Mintable | No mint function, no privileged issuance: `PosTransaction` is a closed five-variant enum with no `Mint`; the only balance-increasing writes in the transition are the emission curve and fee compounding, both pure functions of slot/stake. **The block-level cap invariant that the original draft listed as an open gap has since landed**: cumulative issued supply is a committed state leaf (`state_root.rs` `TAG_ISSUED_SUPPLY = 0x14`) and a block that would carry issuance past the cap is rejected with `TransitionError::SupplyCapExceeded` (`transition.rs:2311`, test at `:5254`). See §1.2. | PASS (no privileged mint; cap now enforced as a consensus invariant) | `crates/bloch-pos-committee/src/transition.rs:175-220`, `:2307-2311`, `:5254`; `src/state_root.rs:183`; `src/tokenomics_v4.rs` (`TOTAL_SUPPLY_BLOCH` doc comment) |
 | 11 | Blacklist | None. A crate-wide grep for blacklist/freeze/ban/censor machinery returns prose and retired-inert fields only (§1.3). The Genesis-3-era taint set is dismantled by named-zero constants so anything still consulting it fails loudly. (Token-level `Gate::Deny` exists in `bloch-euvm` — a regulated-asset primitive in a crate that is **not consensus-wired**; see §2.) | PASS | §1.3 grep table; `crates/bloch-pos-committee/src/staking.rs:247`; `src/tokenomics_v4.rs:106`; `crates/bloch-euvm/src/state.rs:558-575` |
 | 12 | Whitelist | None at chain level — no allowlist gates participation in transfer, staking, delegation, or block production beyond the public parameter thresholds. (`MembershipList` in `bloch-euvm` is token-scoped and not consensus-wired.) | PASS | §1.3 grep table; `crates/bloch-euvm/src/state.rs:520` |
 | 13 | Hidden ownership | No hidden control mechanism (§1.3 grep). Governance is explicitly **not** ownerless — the earlier "ownerless" claim was formally retracted — and the structure is disclosed: two entities, founder allocates the genesis validator cohort under a consensus-coded taper. Honest limit: beneficial ownership of the 14 non-founder carryover addresses is asserted, not provable on-chain — the tokenomics doc treats the whole non-founder remainder as "independent parties" without attribution. | PASS (disclosed, not hidden) — with the attribution caveat | `docs/adr/ADR-036-*`; `docs/specs/BLOCH-ENTITY-STRUCTURE.md`; `crates/bloch-pos-committee/src/genesis_cohort.rs:29-48` |
@@ -121,36 +160,98 @@ references are to this repository at `470b608`.
 | 19 | Ownership renunciation | Does not apply — no owner object to renounce. Role played by: the genesis-cohort consensus rule that tapers the founder-operated cohort's combined weight from 100% to below one third within one year (a shrink-only, publish-once set that is part of chain identity). Honest limit: unlike a renounced contract, the founder retains real control today — this row does not offset check 9's FAIL. | N/A — substitute exists, control today remains with the founder | `crates/bloch-pos-committee/src/genesis_cohort.rs:58-81`, `:129-194`; `src/transition.rs:2647-2648`; test `src/transition.rs:2408` |
 | 20 | **Open-source code** | Applies directly. Licensed AGPL-3.0-or-later throughout, and the decentralisation ADR rests on "code open-sourced *before* launch" — but **the repository is private at time of writing**, and no document commits to a publication date, URL, or process. The predecessor Genesis-3 repo and binaries are public; this one is not yet. | **FAIL** (today) — pass requires publication before engagement or a committed date | `LICENSE:1`; `Cargo.toml:24`; `docs/adr/ADR-039-agpl-license-pos-crates.md`; `docs/adr/ADR-033-decentralization-model.md:52` |
 | 21 | External calls | No consensus-time external calls: no oracles, no cross-contract calls, no network I/O inside validation. Role played by: dependency supply chain, governed by `cargo-deny`/`cargo-audit` config and a vendored, symbol-pinned PQ stack; the Coherence prover (SP1) runs client-side — nodes verify proofs, never call out. | N/A — substitute holds | `deny.toml`; `audit.toml`; `crates/bloch-crypto/src/crypto/mod.rs:492-529` (symbol tripwire); `crates/coherence-prover/README.md:4-5,44-53` |
-| 22 | Withdrawal function (owner can drain) | No contract balance and no function that drains one. Role played by: key custody for the genesis allocations — the Foundation custodies 29% of supply at genesis, and the custody plan (air-gap ceremony, sharding, exposure windows) is written but DRAFT, and **no production key exists yet** (§4). Institutional custody, not protocol code, is the real surface here. | N/A — substitute is a DRAFT plan, flagged as a gap | `docs/specs/BLOCH-GENESIS-KEYS.md` (status line); `docs/specs/BLOCH-ENTITY-STRUCTURE.md` §3; `docs/research/MOFN-CUSTODY-DECISION.md` |
+| 22 | Withdrawal function (owner can drain) | No contract balance and no function that drains one. Role played by: key custody for the genesis allocations — the Foundation custodies 29% of supply at genesis, and the custody plan (air-gap ceremony, sharding, exposure windows) is written but DRAFT. The original draft's line "no production key exists yet" **is no longer true**: Genesis-4 launched, so a genesis manifest and 64 validator keys exist and are in use. Whether they were produced under the DRAFT plan is not evidenced in this repository and this dossier does not assert it either way (§4 item 3). Institutional custody, not protocol code, is the real surface here. | N/A — substitute is a DRAFT plan against keys that now exist; flagged as a gap | `docs/specs/BLOCH-GENESIS-KEYS.md` (status line); `docs/specs/BLOCH-ENTITY-STRUCTURE.md` §3; `docs/research/MOFN-CUSTODY-DECISION.md` |
 | 23 | Backdoor ownership recovery | None. The crate-wide grep for owner/admin/sudo/master-key/override/emergency paths (§1.3) returns no control mechanism — every hit is prose, a frozen-interface artifact, or the retired taint set. | PASS | §1.3 grep table |
 
 Score, stated plainly: of the two checks that apply one-to-one, **both fail
 today** — concentration (9) and open-source publication (20). Of the
-remainder, the substitute mechanisms hold in code, with three carrying open
-caveats (10: cap invariant unimplemented; 14: G8 unmeasured; 22: custody plan
-DRAFT).
+remainder, the substitute mechanisms hold in code, with two carrying open
+caveats (14: G8 unmeasured; 22: custody plan DRAFT against keys that now
+exist). Check 10's caveat — the cap invariant — has closed since the earlier
+draft and is now enforced in validation.
+
+One thing the score does not capture, and an auditor should not have to infer:
+**the chain launched anyway.** The distribution gates G1–G4 were written as
+Go/No-Go conditions on the transition, none has ever had an observed value
+above zero, and Genesis-4 went live on 2026-08-13 without them being met and
+without the external audit this dossier was prepared for. That is a governance
+finding, not a code finding, and it is stated here rather than left for §4.
 
 ### 1.1 Concentration — the exact numbers, and what bounds them (check 9)
 
 This is the finding an auditor will lead with, so we lead with it.
 
-Measured, not estimated (snapshot at Genesis-3 height 43,172 via
-`bloch-snapshot-utxo`, snapshot root SHAKE-256 `280d604b32525f03…`, carryover
-digest `92918209a106f297…` — `BLOCH-TOKENOMICS-V4.md` §2):
+**Which snapshot every number below comes from.** All carryover figures are the
+**terminal** Genesis-3 measurement: **height 39,918**, **452,726** outputs,
+**16 addresses**, re-taken 2026-08-13 from a live node and pinned in code
+(`tokenomics_v4.rs` `CARRYOVER_MEASURED_HEIGHT`, `CARRYOVER_MEASURED_UTXOS`,
+`CARRYOVER_TOTAL_BLOCH`, `LARGEST_CARRYOVER_ADDRESS_BLOCH`, with
+`CARRYOVER_MEASURED_ROOT` and both file digests published so the measurement
+is checkable rather than asserted).
 
-- The carryover set is 17,970,880,000 BLCH across **15 addresses** and 448,337
-  UTXOs. The largest address holds 16,886,549,523 BLCH — **93.96% of the
-  carryover** — and is the founder's.
-- At Genesis-4 slot 0, circulating supply is carryover + liquidity +
-  marketing TGE; the founder's liquid balance is **70.4% of circulating**.
+The earlier draft of this dossier quoted a different set — 17,970,880,000 BLCH
+across 15 addresses and 448,337 UTXOs, "at height 43,172". Two things were
+wrong with it and both are stated rather than folded in. **The height label was
+wrong**: the chain was never at height 43,172; that figure was a *block count*,
+and in a DAG the two differ by design. **The measurement was provisional**:
+Genesis-3 kept minting until it halted, so the set grew. Both figures are
+restated here against the terminal snapshot, and the substantive answer does
+not move:
+
+| Measure | Earlier draft (block-count 43,172, provisional) | **Terminal (height 39,918)** |
+|---|---|---|
+| Carryover total | 17,970,880,000 BLOCH | **18,146,400,000 BLOCH** |
+| Outputs / addresses | 448,337 / 15 | **452,726 / 16** |
+| Largest single address | 16,886,549,523 BLOCH | **17,046,829,380 BLOCH** |
+| **Concentration** | 93.96% | **93.94%** |
+
+**This is not an improvement, and must not be read as one.** Two hundredths of
+a percentage point on a figure of 94% is measurement noise, not distribution.
+The largest single address holds essentially the same share of a slightly
+larger set, and it is the founder's.
+
+The rest of the finding, restated on the terminal numbers:
+
+- The carryover set is **18,146,400,000 BLOCH** across **16 addresses** and
+  452,726 UTXOs. The largest address holds **17,046,829,380 BLOCH — 93.94% of
+  the carryover** — and is the founder's.
 - The carried-over balance is liquid and therefore **stakeable** (founder
   decision 2026-08-11, pinned by
   `staking.rs::carryover_liquid_balance_is_stakeable` and
   `tests/committee.rs::carryover_liquid_balance_delegates_as_stake`). If it
-  stakes and others do not, the founder holds **94.0% of active stake — a
-  Nakamoto coefficient of 1**, computed at the one-third threshold.
+  stakes and others do not, the founder holds ~94% of active stake — a
+  **Nakamoto coefficient of 1**, computed at the one-third threshold.
 - Founder total across carryover plus the new 10% grant (10-year cliff,
-  40-year linear vest): **26.89% of eventual total supply**.
+  40-year linear vest): **27.04% of eventual total supply**
+  (27,046,829,380 BLOCH, compile-pinned at 2704 bps,
+  `tokenomics_v4.rs::FOUNDER_TOTAL_BLOCH`). Up from the 26.89% the earlier
+  draft quoted, because the re-measured carryover is larger and the founder
+  holds 93.94% of it — the number moved in the unflattering direction and is
+  recorded that way.
+- **Of the 57,146,400,000 BLOCH issued at slot 0** (`GENESIS_ISSUED_SAT` = cap
+  − validator emission), **27,046,829,380 is the founder's and 29,000,000,000
+  is the Foundation's** (`FOUNDATION_HELD_BLOCH`: VC 10 B, team 10 B,
+  marketing 4 B, liquidity 5 B). Together **56,046,829,380 of 57,146,400,000
+  — 98.08%** — leaving **1,099,570,620 BLOCH, 1.92% of genesis supply**, in
+  third-party hands. Stated precisely: this is *founder and Foundation
+  together*, across six allocation buckets. It is **not** one key, and this
+  dossier does not claim it is — the live genesis manifest is not committed to
+  this repository, so the recipient script hashes of the five non-carryover
+  buckets are not verifiable here.
+
+**And the finding the original draft could not yet state, because the chain had
+not launched: all 64 Genesis-4 validators are operated by a single entity.**
+There is no independent validator on the live network. One operator can stall
+finality and one operator can halt the chain. Nor can a third party join today:
+the live transport is a point-to-point TCP full mesh with a fixed peer list, no
+discovery and no authentication (`crates/bloch-pos-node/src/net.rs`), and
+`Deposit`/`Delegate` transactions are refused at every node's mempool because
+bonding is not yet funded from the UTXO set — a `Deposit` names an amount,
+spends no output, and would therefore mint stake from nothing
+(`crates/bloch-pos-node/src/engine.rs:1885-1907`). Until both are fixed there
+is **no permissionless path to becoming a validator**, which means the
+Nakamoto coefficient of the live chain is 1 by operator count regardless of
+what any holder does with their coins.
 
 The mechanisms that bound this, and — stated with equal weight — what each
 does *not* reach:
@@ -163,12 +264,20 @@ does *not* reach:
 
 And the arithmetic that closes the escape hatch (`BLOCH-TOKENOMICS-V4.md`
 §4A.1): rewards are pro-rata to stake, so compounding preserves stake
-*shares*. Independent parties hold 227,709,400 / 17,970,880,000 = **6.03%** of
-the carryover; gate G1 requires ≥ 15% of circulating in independent hands.
-Therefore **G1 is unreachable by emission alone — not at year five, not at
-year forty. The only thing that moves it is coins changing hands.** If the
-founder abstains from staking entirely, the earliest G1 crossing under
-first-year emission plus unlocks is ≈ month 9 — a bound, not a forecast.
+*shares*. On the terminal snapshot, independent parties hold
+1,099,570,620 / 18,146,400,000 = **6.06%** of the carryover (the earlier draft
+read 6.03% against the provisional set — again, the same finding); gate G1
+requires ≥ 15% of circulating in independent hands. Therefore **G1 is
+unreachable by emission alone — not at year five, not at year forty. The only
+thing that moves it is coins changing hands.** If the founder abstains from
+staking entirely, the earliest G1 crossing under first-year emission plus
+unlocks is ≈ month 9 — a bound, not a forecast.
+
+Two facts about the live chain make even that bound theoretical today: the
+64 validators are one operator's, and `Deposit`/`Delegate` are refused at the
+mempool, so **independent stake cannot currently be created at all**. G1's
+observed value is 0% and cannot move until bonding is funded from the UTXO set
+and the transport admits strangers.
 
 Verdict: FAIL, and it stays FAIL until the measured number changes. The
 protocol constrains the founder's *validator weight*; it does not and cannot
@@ -187,12 +296,19 @@ Three layers, in decreasing strength:
 2. **Divergence is caught indirectly.** A node minting off-curve computes a
    different `state_root` and forks itself off. Property tests pin the
    envelope (`tests/properties.rs:624`, `:665-681`).
-3. **The decided direct invariant does not exist yet.** The decision of
-   record (2026-08-12) is that every node refuses a block whose cumulative
-   issuance would exceed the cap. We grepped for it: there is **no
-   block-level cumulative-issuance check** in `tokenomics_v4.rs`,
-   `transition.rs`, or `produce.rs`. This is an open implementation gap (§4,
-   item 5).
+3. **The decided direct invariant now exists — this gap is closed.** The
+   decision of record (2026-08-12) was that every node refuses a block whose
+   cumulative issuance would exceed the cap. The earlier draft of this dossier
+   grepped for it and found nothing. It has since landed: cumulative issued
+   supply is a committed component of the state root
+   (`state_root.rs:183`, `TAG_ISSUED_SUPPLY = 0x14`; seeded at genesis from
+   `GENESIS_ISSUED_SAT`), and `compute_post_state` rejects the block with
+   `TransitionError::SupplyCapExceeded` when the committed counter would pass
+   `TOTAL_SUPPLY_SAT` (`transition.rs:2307-2311`, regression test at
+   `transition.rs:5254`). It is enforced in *validation*, in `u128`, against a
+   counter every node commits — so two nodes cannot disagree about how much
+   has been issued. The four verification points the Centralization dossier
+   listed for "when it lands" are the right ones for an auditor to re-check.
 
 The claim to make to an auditor, at its true strength and no stronger: *no
 mechanism inside the protocol can raise the supply* — no vote, no key, no
@@ -395,30 +511,66 @@ carries structural tests against the class itself
 
 ## 4. Open gaps — the list we would not want CertiK to discover first
 
-1. **The PoS node is a devnet skeleton.** `crates/bloch-pos-node` runs real
-   validators with real hybrid signatures over a localhost TCP mesh — and
-   that is all. **No transactions** (`engine.rs:95` `NO_TXS`; non-empty
-   bodies fail-closed rejected at `engine.rs:344-347`), **no libp2p**
-   (`std::net::TcpListener` bound to `127.0.0.1`, `net.rs:147`), **no RPC**
-   (no HTTP listener of any kind). The crate's own header lists the rest:
-   no RocksDB store, no slashing-evidence pipeline, no weak-subjectivity
-   sync, no fork choice beyond a linear chain, no mainnet genesis manifest
-   (`main.rs:10-15`). The consensus *crate* is substantially built; the
-   *node* around it is 2,313 lines of scaffolding.
-2. **G1–G11 are defined and none is measured.** The go/no-go gates
-   (`BLOCH-POS-SHA3-LATTICE-MIGRATION.md` §11) attach to a transition height
-   that is only reached after a hybrid phase that has not started; Genesis-4
-   has not launched, so no gate has an observed value. G1 additionally has an
-   arithmetic proof that it cannot be reached by emission alone (§1.1). The
-   measurement functions for G2/G3 exist in code
-   (`delegation.rs:279-307`) but their semantics are specified in no
-   document (`BLOCH-POS-GAPS.md` §4 item 1).
-3. **Genesis keys do not exist.** `BLOCH-GENESIS-KEYS.md` is explicit:
-   "NO production key exists yet." The custody plan (air-gap, sharding,
-   exposure windows, T−2-week validator keygen) is DRAFT. The carryover
-   exception is named in the doc itself: the Genesis-3 keys guarding the
-   3.77 B liquid carryover already exist, were generated long ago under
-   unknown conditions, and sit outside the plan, inside the risk.
+1. **The node is no longer a skeleton — but its network layer is, and that is
+   the gap.** The earlier draft of this dossier said "the PoS node is a devnet
+   skeleton … no transactions, no libp2p, no RPC, 2,313 lines of scaffolding."
+   **That statement is false as of the Genesis-4 launch and is corrected, not
+   deleted.** `crates/bloch-pos-node/src/` is now ~9,900 lines and carries a
+   JSON-RPC server (`rpc.rs`, 1,498 lines — `sendrawtransaction`,
+   `getmempoolinfo`, finality and chain reads), a mempool with a bounded
+   admission path (`engine.rs`, `MEMPOOL_MAX = 4_096`), transfers that execute
+   on the live chain, a libp2p stack with gossipsub and directed paginated
+   sync (`p2p.rs`, 1,657 lines), and persistence (`store.rs`). What is
+   genuinely missing, stated exactly:
+   - **The live transport is still `Transport::Devnet` and it is still the
+     default** (`engine.rs:104-107`, `main.rs:765`). It is a point-to-point
+     TCP full mesh with a fixed peer list, **no discovery and no
+     authentication** (`net.rs`), which is the mechanical reason a third
+     party cannot join the network today. `Transport::Libp2p` exists in the
+     tree; it is not what the fleet runs, and this dossier does not describe
+     a production network layer as existing.
+   - **`Deposit` and `Delegate` are refused at every node's mempool**
+     (`engine.rs:1900-1907`), because a deposit registers bonded stake
+     without spending any output — measured on 2026-08-13 at 25,000 BLOCH of
+     stake per unauthenticated request. The refusal is node-side policy, not
+     a consensus rule: a block that already carries a deposit still applies
+     it. Closing it properly means giving deposits and withdrawals eUTXO
+     inputs and outputs — a wire-format change needing a flag day. **Until
+     then there is no permissionless way to become a validator.**
+   - **Persistence is an append-only block log, not RocksDB**
+     (`store.rs:3-21`): restart is O(chain length) deterministic replay
+     through the same `Transition`. Deliberate and documented; a scaling
+     item, not a correctness one.
+   - No slashing-evidence detection/packaging pipeline in the node (the
+     rules and the evidence transaction exist in the committee crate).
+   - No weak-subjectivity fresh-sync path (format and verification exist).
+2. **G1–G11: the chain launched without them, and none has an observed value
+   above zero.** The go/no-go gates (`BLOCH-POS-SHA3-LATTICE-MIGRATION.md`
+   §11) were written as conditions on the transition. Genesis-4 launched on
+   2026-08-13 regardless. Their observed values today are not "unmeasured" in
+   the sense the earlier draft meant — they are measurably failed: G1
+   (independent stake ≥ 15% of circulating) is **0%**, because independent
+   stake cannot be created while `Deposit`/`Delegate` are refused; G2 (no
+   entity above 25% of active stake), G3 (Nakamoto coefficient ≥ 7) and G4
+   (≥ 200 validators, ≥ 50 unaffiliated) all fail against a set of **64
+   validators operated by one entity**. G1 additionally has an arithmetic
+   proof that it cannot be reached by emission alone (§1.1). The measurement
+   functions for G2/G3 exist in code (`delegation.rs`) but their semantics are
+   specified in no document (`BLOCH-POS-GAPS.md` §4 item 1). **An auditor
+   should treat "launched without meeting the launch gates" as the headline
+   governance finding of this dossier.**
+3. **Genesis keys now exist; the custody plan they were supposed to be
+   produced under is still DRAFT.** The earlier draft said "NO production key
+   exists yet." Genesis-4 is live, so a genesis manifest and 64 validator keys
+   necessarily exist and are signing. `BLOCH-GENESIS-KEYS.md`'s custody plan
+   (air-gap, sharding, exposure windows, T−2-week validator keygen) is DRAFT,
+   and **this repository contains no evidence about how the live keys were
+   actually produced or are held** — the live genesis manifest is not
+   committed here. This dossier states that as an unresolved question rather
+   than assuming either answer. The carryover exception is named in the doc
+   itself and is unchanged: the Genesis-3 keys guarding the liquid carryover
+   already existed, were generated long ago under unknown conditions, and sit
+   outside the plan, inside the risk.
 4. **EVM at L1 is a design.** Only the state-root leaf
    (`TAG_EVM_COMMITMENT`, `state_root.rs:136`) is implemented. There is no
    execution crate, no deposit/withdrawal transaction kinds, no gas limits
@@ -427,9 +579,11 @@ carries structural tests against the class itself
    (`BLOCH-L1-EVM-AUTHORIZATION.md`, recommendation recorded, nothing
    ratified). Ustav/Kirpich promotion to L1 is likewise a proposal with no
    code (`BLOCH-USTAV-L1.md`; `bloch-euvm` is not consensus-wired).
-5. **The decided supply-cap consensus invariant is unimplemented** (§1.2):
-   no block-level check rejects over-cap cumulative issuance; the cap holds
-   by construction and by state-root divergence only.
+5. ~~**The decided supply-cap consensus invariant is unimplemented.**~~
+   **CLOSED** (§1.2). The block-level check now exists in validation:
+   `TransitionError::SupplyCapExceeded`, `transition.rs:2307-2311`, against
+   the committed `TAG_ISSUED_SUPPLY` leaf. Left on the list, struck through,
+   so an auditor comparing drafts can see what moved.
 6. **Fee-era boundary wiring is incomplete.** `distribute_producer_fees`
    (`fee_market.rs:267-282`) — the fix that lets delegators keep earning
    once fees are the whole budget — is implemented and tested but **not yet
@@ -445,8 +599,13 @@ carries structural tests against the class itself
    opening it, while ADR-033 rests its decentralisation claim on "open-sourced
    before launch".
 9. **Zero external audits to date** (`SECURITY_SELF_ASSESSMENT.md`), one
-   primary developer, and a fleet operated by the founder. The prior internal
-   audits (ERA-1, GroundState) cover a predecessor codebase.
+   primary developer, and a fleet operated by the founder — **and the chain
+   launched in that state.** Genesis-4 has been live since 2026-08-13 with no
+   third-party audit of the consensus crate, the node, or the hybrid
+   signature composition. The prior internal audits (ERA-1, GroundState)
+   cover a predecessor codebase, and `audit/CONSOLIDATED-SECURITY-REPORT.md`
+   covers the proof-of-work tree, not this one. Sixty-four of sixty-four
+   validators are the founder's.
 10. **Known spec-vs-code drift is inventoried** in `BLOCH-POS-GAPS.md` —
     including the `CapStatus::Deferred` consensus behaviour absent from the
     spec, the stale §7A tables in the tokenomics doc, and the frozen
@@ -457,40 +616,43 @@ carries structural tests against the class itself
 
 ## 5. Contradictions flagged while preparing this dossier
 
-These are internal inconsistencies between decisions of record, documents,
-and code, found during preparation. They must be resolved before the dossier
-is sent, or sent with this section intact — an auditor will find them within
-hours.
+These were internal inconsistencies between decisions of record, documents,
+and code, found while preparing the 2026-08-12 draft. Their dispositions are
+recorded rather than the entries deleted, because the point of the section is
+that an auditor can see what was flagged and what happened to it.
 
-1. **Total supply: 21 B in code and docs vs 100 B decision of record.**
-   `tokenomics_v4.rs:33` pins `TOTAL_SUPPLY_BLOCH = 21_000_000_000`, with a
-   doc comment recording the founder's 2026-08-11 decision as a *revert* of
-   a 100 B draft; `BLOCH-TOKENOMICS-V4.md` §1 says the same. The 2026-08-12
-   decision of record reverses this again: 100 B as a pure split
-   (×4.7619, every percentage unchanged — a redenomination, not "more supply
-   for holders"). **The redenomination as specified cannot land in the
-   current representation**: at 8 decimal places, 100 B is 1.0 × 10¹⁹ sat,
-   which violates both compile-time assertions at `tokenomics_v4.rs:254-255`
-   (the 8× `u64` headroom bound and the `i64::MAX` bound that exists because
-   the Go SDK's `Satoshis` is a signed int64 — the very overflow the 21 B
-   revert was recorded as fixing). Landing 100 B requires reducing decimal
-   places, changing the satoshi representation, or accepting the loss of
-   headroom — a decision, not a find-and-replace. Concentration percentages
-   in §1.1 are denomination-independent and unaffected either way.
-2. **Genesis-3 terminal height: 50,000 decided, 50,000 everywhere.** The
-   2026-08-12 decision lowers the halt to height 50,000 (~4 days out at
-   decision time). Every committed artifact says 50,000 — `BLOCH-TOKENOMICS-V4.md`
-   §3.1/§3.2, the migration spec, the node-integration plan, the interfaces
-   doc, and five public portal pages; the value 50,000 appears in no height
-   context anywhere in `docs/`. §3.1's notice-period argument was also
-   written for 50,000. Until code and fleet actually enforce 50,000, the
-   snapshot height in this dossier's §1.1 measurements should be treated as
-   "the terminal height", not a number.
-3. **Validator bond.** The decision of record sets the bond near 25,000 BLCH
-   (Ethereum's fraction of supply under 100 B), down from 100,000. This
-   follows the supply decision and inherits contradiction 1. It widens who
-   *may* validate; it does nothing about who *does*, and this dossier does
-   not describe it as a concentration fix.
+1. ~~**Total supply: 21 B in code and docs vs 100 B decision of record.**~~
+   **RESOLVED.** `tokenomics_v4.rs` now pins
+   `TOTAL_SUPPLY_BLOCH = 100_000_000_000` with per-bucket compile-time
+   assertions proving `new × 21 == old × 100` for every allocation — a pure
+   split, no dilution. The headroom cost the contradiction warned about was
+   **accepted and pinned, not deleted**: 10¹⁹ sat is ~54.2% of `u64::MAX` and
+   ~108% of `i64::MAX`, every consensus quantity is `u128`, and the
+   assertions were inverted to state the hazard rather than removed. The
+   consequence for integrators stands: **any SDK or exchange integration that
+   types satoshis as a signed 64-bit integer will overflow and must migrate.**
+   Concentration percentages in §1.1 are denomination-independent and were
+   unaffected either way.
+2. ~~**Genesis-3 terminal height: 50,000 decided.**~~ **OVERTAKEN BY EVENTS.**
+   The chain did not reach 50,000. It stopped permanently at height **39,918**
+   on 2026-08-13, and the terminal snapshot taken there is what pins the
+   carryover constants (§0.0, §1.1). Any document in this repository still
+   saying the halt is at 50,000, or that a halt is forthcoming, is stale. The
+   original entry's advice was right for a reason worth keeping: the snapshot
+   height should be reasoned about as "the terminal height", and the number
+   attached to it should always be quoted with the artifact it came from.
+3. **Validator bond.** Unchanged and still true: the bond is 25,000 BLCH
+   (Ethereum's fraction of supply under 100 B), down from 100,000. It widens
+   who *may* validate; it does nothing about who *does*, and this dossier does
+   not describe it as a concentration fix. On the live chain it does neither
+   yet, because deposits are refused at the mempool (§4 item 1).
+4. **New, and the sharpest one: the launch preceded the gates and the audit.**
+   The migration design classifies G1–G4 (distribution) and G7 (external
+   review of the Falcon online-signing path) as conditions on activation.
+   Genesis-4 activated without any of them. Documents in this repository that
+   describe the gates as standing between the code and a mainnet are
+   describing a plan that was not followed, and this dossier says so rather
+   than letting an auditor discover the mismatch.
 
 ---
 
@@ -503,9 +665,13 @@ hours.
   counts and pass rates (§2 method note).
 - It does not claim the supply cap is unchangeable — only that no mechanism
   inside the protocol can change it, which is the strongest true statement.
-- It does not claim decentralisation. The chain starts centralised, by
-  construction; the gates measure the distance from there, and none has been
-  measured.
+- It does not claim decentralisation. The chain started centralised, by
+  construction, and **is centralised today**: 64 of 64 validators are one
+  operator's, no third party can join, and the gates that were supposed to
+  measure the distance from there were not met before launch.
+- It does not claim that the numbers in §1.1 improved. They were re-measured
+  at the terminal snapshot and they are, to two decimal places, what they
+  were.
 
 ---
 

@@ -1,8 +1,10 @@
 [workspace]
 resolver = "2"
-# Bloch Protocol — the ownerless protocol / main blockchain. Node + the
-# protocol crates only. The Postern Labs products (wallets, messenger, OS)
-# live in their own repo and depend on this one as a git dependency.
+# Bloch Protocol — the main blockchain. Node + the protocol crates only. The
+# Postern Labs products (wallets, messenger, OS) live in their own repo and
+# depend on this one as a git dependency. (This comment used to say
+# "ownerless protocol"; that thesis was retracted — see
+# docs/adr/ADR-036-retract-ownerless-adopt-foundation.md.)
 #
 # This is a VIRTUAL manifest: the repo root is not itself a package. It used
 # to be — the root package was `bloch`, the Genesis-3 proof-of-work node — so

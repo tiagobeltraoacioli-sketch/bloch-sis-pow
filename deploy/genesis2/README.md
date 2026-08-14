@@ -1,5 +1,15 @@
 # Genesis-2 fly deploy — status & runbook
 
+> **Historical — Genesis-2.** Genesis-2 was superseded by Genesis-3, which
+> itself stopped permanently at height 39,918 on 2026-08-13. The live chain is
+> **Genesis-4, proof of stake** (30 s slots, 32-slot epochs, finality by epoch);
+> its binary is `bloch-pos`, deployed as a systemd unit from a signed release
+> tarball, not from Fly — see `deploy/RELEASE-INTEGRITY.md`. Every `.fly.toml`
+> in this directory targets a proof-of-work chain that no longer exists; they
+> are kept as the deployment record, not as anything to run. The "BLOCKERS"
+> and "must clear before any deploy" sections below were never cleared and are
+> now moot.
+
 Scaffolding for redeploying the Fly fleet onto the **Genesis-2 devnet**
 (`ChainId::Genesis2Devnet`, SHA-256d PoW, carry-over ledger). Prepared by task
 (A): **flag + configs wired, nothing deployed.**

@@ -1,13 +1,35 @@
 # Bloch Developer Portal
 
-> **SUPERSEDED FRAMING — 2026-08-11.** These portal pages describe the live
-> Genesis-3 chain and predate three founder decisions: the **ownerless thesis
-> was retracted** (ADR-036 — issuer + two-entity foundation,
-> `docs/specs/BLOCH-ENTITY-STRUCTURE.md`); Genesis-3 **halts at height 80,000**
-> and Genesis-4 relaunches as PoS; and the base layer gains a **native EVM
-> and the Ustav charter standard at L1** — so "no VM, no L2 model prescribed"
-> will stop being true at Genesis-4. Do not republish without the ADR-036
-> rewrite.
+
+> **Historical — Genesis-3.** This describes the proof-of-work chain that
+> stopped permanently at height 39,918 on 2026-08-13. The live chain is
+> **Genesis-4, proof of stake** (30 s slots, 32-slot epochs, finality by epoch),
+> live since 21:31:19 UTC that day; its public read RPC is
+> `https://posternlabs.com/g4rpc` and it exposes a different, much smaller
+> method set than the one used below. Kept because Genesis-4's opening ledger is
+> derived from Genesis-3. It is not what runs.
+>
+> **The risk disclosure below is superseded, not withdrawn.** "Small,
+> low-hashrate, 51%-attackable" was Genesis-3's risk and was true of it. Under
+> Genesis-4 the security question is concentration: **all 64 validators are run
+> by one entity**, **93.94% of the carryover sits at a single address**, and
+> **56.05 B of the 57.15 B BLOCH issued at genesis is held by the founder and
+> the Foundation**. One operator can halt the chain and one holder can outvote
+> every other. A third party cannot yet join: the transport is a point-to-point
+> TCP full mesh with a fixed peer list, no discovery and no authentication, and
+> `Deposit`/`Delegate` are refused at every node's mempool. "Ownerless" was
+> retracted (ADR-036). Unaudited, not a security, no value claim: all still true.
+
+> **SUPERSEDED FRAMING — written 2026-08-11.** These portal pages describe
+> Genesis-3 as the live chain and predate three founder decisions: the
+> **ownerless thesis was retracted** (ADR-036 — issuer + two-entity foundation,
+> `docs/specs/BLOCH-ENTITY-STRUCTURE.md`); Genesis-3 halts and Genesis-4
+> relaunches as PoS; and the base layer gains a **native EVM and the Ustav
+> charter standard at L1** — so "no VM, no L2 model prescribed" stops being
+> true at Genesis-4. The halt height named in the original of this note
+> (80,000) was never reached: the rule was later lowered to 50,000 and the
+> chain in fact stopped at **39,918** on 2026-08-13. Do not republish without
+> the ADR-036 rewrite.
 
 > A neutral commons, an agnostic base, an open ecosystem. Anyone can build on
 > Bloch. Postern Labs is **one builder among many**, with **no special protocol

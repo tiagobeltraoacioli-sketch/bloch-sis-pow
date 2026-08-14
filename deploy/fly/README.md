@@ -1,7 +1,20 @@
 # Deploying a Bloch-SIS node on Fly.io
 
-Fly.io is the fastest path to a live node: it builds the repo `Dockerfile` and
-runs it directly — **no manual `docker push`, no public registry, no bidding**.
+> **Historical — Genesis-3.** This deploys `bloch`, the proof-of-work node for
+> the chain that stopped permanently at height 39,918 on 2026-08-13. Following
+> it end to end gets you a node with no network to join. The live chain is
+> **Genesis-4, proof of stake** (30 s slots, 32-slot epochs, finality by epoch);
+> its binary is `bloch-pos` and the fleet installs it as a systemd unit from a
+> signed release tarball, not from Fly and not from this repository's
+> `Dockerfile` — see `deploy/RELEASE-INTEGRITY.md`. Kept because Genesis-4's
+> opening ledger is derived from Genesis-3. It is not what runs.
+>
+> Note also that the `Dockerfile` this walkthrough builds does not currently
+> build (its `COPY carryover.tsv` wants a file the repo stores compressed).
+
+Fly.io was the fastest path to a Genesis-3 node: it builds the repo `Dockerfile`
+and runs it directly — **no manual `docker push`, no public registry, no
+bidding**.
 
 ## 1. Install + log in
 

@@ -2,11 +2,24 @@
 
 # Documentation index
 
+> **The live chain is Genesis-4, proof of stake**, running since **21:31:19 UTC
+> on 2026-08-13**: 30 s slots, 32-slot epochs, Casper-style justification and
+> finalisation by epoch, hybrid ML-DSA-65 ‖ Falcon-1024 on every consensus
+> path. **Genesis-3, the proof-of-work chain, stopped permanently at chain
+> height 39,918** on the same day — below the 50,000 constant several documents
+> still quote, because it was stopped rather than left to reach it. Public read
+> RPC: `https://posternlabs.com/g4rpc`.
+>
+> Anything in this repository that describes mining, hashrate, difficulty,
+> retargeting, miners as participants, GhostDAG or blue_score as the live
+> ordering, AuxPoW as live, or proof-of-work depth as finality is describing
+> **Genesis-3**. Much of it was true when written.
+
 Four kinds of document live here, and mixing them up is how people end up
 quoting a dead constant at an auditor:
 
 1. **[Current — proof of stake](#1-current--proof-of-stake)** — the design
-   Genesis-4 is being built to. Normative.
+   Genesis-4 runs. Normative.
 2. **[Decisions on record (ADRs)](#2-decisions-on-record-adrs)** — what was
    decided and when, *including the decisions that were later reversed*.
 3. **[Audit and security](#3-audit-and-security)** — what has been reviewed,
@@ -19,9 +32,28 @@ Two standing rules apply to everything below.
 - **Never restate a constant.** Cite the path. Where a document and the code
   disagree, the code is the truth. `tools/doc-sweep/check_stale.py` exists
   because five tokenomics revisions left stale numbers in prose.
-- **`designed ≠ built ≠ booted`.** Most of what is described here is
-  designed. Very little of the proof-of-stake work is booted, and none of it
-  on mainnet.
+- **`designed ≠ built ≠ booted`.** Most of what is described here is designed.
+  The proof-of-stake consensus core **is booted, and it is on mainnet**: 64
+  validators producing, attesting, justifying and finalising, with a JSON-RPC
+  server, a transfer transaction format carrying real inputs and outputs, and
+  append-only persistence with deterministic replay. What is **not** booted, and
+  matters most: the live transport is still a **point-to-point TCP full mesh
+  with a fixed peer list, no discovery and no authentication**, which is why a
+  third party cannot yet join; and `Deposit`/`Delegate` transactions are
+  **refused at every node's mempool**
+  (`crates/bloch-pos-node/src/engine.rs:1900-1906`) because bonding is not yet
+  funded from the UTXO set, so there is no permissionless path to validating.
+  Also absent: a RocksDB store, a slashing-evidence pipeline, checkpoint-sync
+  state download. A libp2p module exists in-tree; **it is not what the fleet
+  runs.**
+- **The risk to disclose is concentration, not hashrate.** All 64 validators are
+  operated by a single entity; 93.94% of the carryover (17,046,829,380 of
+  18,146,400,000 BLOCH) sits at one address and carried balances are stakeable;
+  and 56,046,829,380 of the 57,146,400,000 BLOCH issued at slot 0 is held by the
+  founder (27.04% of the 100 B cap) and the Foundation (a further 29.00%),
+  leaving 1,099,570,620 BLOCH — 1.92% — in third-party hands. One operator can
+  halt the chain and one holder can outvote every other. The Nakamoto
+  coefficient is 1. No external audit has been completed.
 
 ---
 
@@ -190,7 +222,7 @@ committee. None of these can be executed now.
 | ADR-003 | Minimum committee policy — the input is a hashrate snapshot. |
 | ADR-005 | Committee era rotation — seats are hashrate-weighted. |
 | ADR-006 | PoW block time (the dual-finality half may be re-derived). |
-| ADR-007 | Bonding and slashing keyed to FFG activation at height 210,000, on a chain that stops at 50,000. |
+| ADR-007 | Bonding and slashing keyed to FFG activation at height 210,000, on a chain that stopped at 39,918. |
 | ADR-011 | FFG activation at block 210,000 — never reached. |
 | ADR-030 | Bridge from the DKG ceremony into the hashrate-elected registry. |
 | ADR-031 | Sprint 2.1.D deferrals, scoped to `src/bonding/`. |
@@ -253,7 +285,8 @@ hashrate signalling, which no longer exists.
 - `SECURITY_SELF_ASSESSMENT.md` — Bloch versus Bitcoin Core across 13
   dimensions, 2026-04-19. Its cryptography, memory-safety and wallet sections
   hold; its spine ("cost of a 51% attack: dollars") is a hashrate statement
-  about a chain that is ending.
+  about a chain that has stopped. The live equivalent is not hashrate but
+  concentration — see the standing rules at the top of this index.
 - `SPEC.md` — the frozen-for-audit Genesis-3 protocol specification. §1, §2,
   §4 and §10 (signature construction, addresses, transaction wire format,
   crypto-agility) are reused by Genesis-4; §3, §5, §7 and §8 (proof of work,
@@ -286,5 +319,7 @@ form `docs/X` reads as `legacy/X` now.
 
 > Doc comments in `src/`, `crates/`, `deploy/` and `apps/` still cite the old
 > `docs/…` paths. Those trees were deliberately not edited — the Genesis-3
-> binary running on mainnet was built from them. Read `docs/…` in a code
-> comment as `legacy/…` where the file is not in `docs/` any more.
+> binary that ran on mainnet until the halt was built from them, and keeping
+> them readable is what makes Genesis-4's opening ledger auditable. Read
+> `docs/…` in a code comment as `legacy/…` where the file is not in `docs/` any
+> more.

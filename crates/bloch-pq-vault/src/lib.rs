@@ -1,5 +1,13 @@
 //! # bloch-pq-vault — a non-custodial, native, opt-in post-quantum *defensive vault*
 //!
+//! > **Nothing here is deployed, on either Bloch chain.** The Bitcoin-side
+//! > scripts are real and tested, but the Bloch-side anchor depends on
+//! > [`bloch_euvm`], a Genesis-3-era crate that was never wired into
+//! > consensus. The proof-of-work chain it was designed against stopped
+//! > permanently at height 39,918 on 2026-08-13; the live chain is
+//! > **Genesis-4, proof of stake**, which has no contract VM and no anchoring
+//! > path for this record. Unaudited. See HONEST LIMITS below.
+//!
 //! FOUNDATION. Implements the **achievable, honest** scope of
 //! `docs/specs/PQ-SHIELD-NONCUSTODIAL-NATIVE.md`: a **commit-delay-reveal P2WSH vault**
 //! on stock Bitcoin, plus a **PQ-gated clawback**, anchored on Bloch by a PQ-signed

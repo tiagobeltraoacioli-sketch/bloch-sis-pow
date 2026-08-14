@@ -1,7 +1,9 @@
 # ADR-010: Tokenomics, Emission Curve, and Endowment Buffer
 
 **Sprint:** 2.2 (calibration) / 2.3 (implementation) / 2.4 (integration)
-**Status:** Proposed (revision 1 — distribution split updated by ADR-010-Addendum-1; premine model finalized by ADR-010-A; ready for commit pre-2026-05-15)
+**Status:** **SUPERSEDED** — Superseded by **Tokenomics V4** — a fixed **100,000,000,000 BLCH** hard cap with no tail, 42,853,600,000 emitted to validators over 40 years on a 10%/year disinflation curve (`crates/bloch-pos-committee/src/tokenomics_v4.rs`, `docs/specs/BLOCH-TOKENOMICS-V4.md`). Every number in this ADR — the 1 B supply, the 70/25/5 miner/validator/oracle split, the endowment buffer, the boost mechanism — is superseded. There are no miners to pay a miner share to. The chain this ADR governs — Genesis-3, proof of work — stopped permanently at height **39,918** on 2026-08-13. The live chain is **Genesis-4, proof of stake** (30 s slots, 32-slot epochs, finality by epoch, hybrid ML-DSA-65 ‖ Falcon-1024, no mining). The decision, context and consequences below are **not** rewritten: this is a decision log and what was decided, when, is the record. Read it as history, not as guidance.
+
+*Original status line, retained:* **Status:** Proposed (revision 1 — distribution split updated by ADR-010-Addendum-1; premine model finalized by ADR-010-A; ready for commit pre-2026-05-15)
 **Date:** 2026-04-29 (rev1 same day)
 **Author:** BLOCH Core
 **Related:** ADR-001 (FFG epoch=6), ADR-005 (Committee era), ADR-006 (Block time), ADR-010-A (Founder Premine — 17%/30y), ADR-010-Addendum-1 (70/25/5 distribution including oracle pool), ADR-018 (Oracle Network)

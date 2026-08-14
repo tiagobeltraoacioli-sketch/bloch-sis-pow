@@ -1,10 +1,18 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! Merged-mining (AuxPoW) verification — dual-mine Bloch with Bitcoin.
 //!
-//! Bloch is SHA-256d, exactly like Bitcoin, so the SAME work can secure both:
-//! a miner hashes a Bitcoin block whose **coinbase carries a commitment to a
-//! Bloch block**. If that single hash meets Bloch's (own, lower) target, the
-//! AuxPoW proof lets Bloch accept the block — no extra hashing, no new ASICs.
+//! > **Historical — Genesis-3.** This describes the proof-of-work chain that
+//! > stopped permanently at height 39,918 on 2026-08-13. The live chain is
+//! > **Genesis-4, proof of stake** (30 s slots, 32-slot epochs, finality by
+//! > epoch), which has no mining, no hashrate and no AuxPoW at all. Kept
+//! > because Genesis-4's opening ledger is derived from the chain this
+//! > secured. **It is not what runs.** Merged mining was activated on
+//! > Genesis-3 at height 8,500 on 2026-08-01 and ended with that chain.
+//!
+//! Genesis-3 was SHA-256d, exactly like Bitcoin, so the SAME work could secure
+//! both: a miner hashed a Bitcoin block whose **coinbase carried a commitment
+//! to a Bloch block**. If that single hash met Bloch's (own, lower) target, the
+//! AuxPoW proof let Bloch accept the block — no extra hashing, no new ASICs.
 //!
 //! This is the standard Bitcoin/Namecoin `CAuxPow` check, faithful to that
 //! format so existing merge-mining pool tooling applies:
@@ -16,14 +24,23 @@
 //!      appearing exactly once, whose `aux_root` folds from this Bloch block
 //!      hash via the (single-chain) chain merkle branch.
 //!
-//! **NOT YET CONSENSUS-WIRED.** This is the verifier + its tests; accepting an
-//! AuxPoW block into the chain is a flag-day consensus change (an activation
-//! height), wired separately, exactly like the earlier SHA-256d-LE fork.
+//! This is the verifier + its tests. On Genesis-3 it WAS consensus-wired, by
+//! the flag-day activation height [`super::AUXPOW_ACTIVATION_HEIGHT`] = 8,500
+//! (2026-08-01), exactly like the earlier SHA-256d-LE fork. On Genesis-4 it is
+//! wired into nothing: proof of stake has no parent-chain work to inherit.
 //!
-//! Honest caveat: merged mining only secures Bloch with the FRACTION of BTC
-//! hashrate that opts in, and lets a large BTC miner attack at ~zero marginal
-//! cost — for a young chain this can worsen the 51% risk, not fix it. It is a
-//! bootstrap lever, not a security guarantee.
+//! Honest caveat, scoped to the era it applied to: on Genesis-3, merged mining
+//! only secured Bloch with the FRACTION of BTC hashrate that opted in, and let
+//! a large BTC miner attack at ~zero marginal cost — for a young chain that
+//! could worsen the 51% risk rather than fix it. It was a bootstrap lever, not
+//! a security guarantee.
+//!
+//! **That caveat is retired with the chain, and it is replaced, not deleted.**
+//! Genesis-4's security question is not hashrate, it is concentration: all 64
+//! validators are run by one entity, 93.94% of the carryover sits at a single
+//! address, and 56.05 B of the 57.15 B BLOCH issued at genesis is held by the
+//! founder and the Foundation. One operator can halt the chain and one holder
+//! can outvote every other.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

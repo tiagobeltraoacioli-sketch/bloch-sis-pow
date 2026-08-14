@@ -1,5 +1,23 @@
-//! Bloch-SIS Protocol — Core Types
-//! SHA-256d PoW · ML-DSA-65 signatures · GhostDAG
+//! Bloch — Genesis-3 core types.
+//!
+//! > **Historical — Genesis-3.** This module describes the proof-of-work chain
+//! > that stopped permanently at height 39,918 on 2026-08-13. The live chain
+//! > is **Genesis-4, proof of stake** (30 s slots, 32-slot epochs, finality by
+//! > epoch; consensus in `crates/bloch-pos-committee`). Kept because
+//! > Genesis-4's opening ledger is derived from it. **It is not what runs.**
+//! > Every present-tense sentence below about "the chain", mining, difficulty,
+//! > retargeting or miners describes Genesis-3 and should be read in the past
+//! > tense. Nothing here is on the Genesis-4 consensus path — `bloch-pos-node`
+//! > imports only `bloch_crypto::crypto`.
+//! >
+//! > The security caveats in this module are about hashrate and 51% attacks.
+//! > Those retired with the chain. **The live risk is concentration:** all 64
+//! > Genesis-4 validators are operated by one entity, 93.94% of the carryover
+//! > sits at a single address, and 56.05 B of the 57.15 B BLOCH issued at
+//! > genesis is held by the founder and the Foundation. One operator can halt
+//! > the chain and one holder can outvote every other.
+//!
+//! SHA-256d PoW · ML-DSA-65 signatures · GhostDAG — as they were on Genesis-3.
 
 use sha2::{Sha256, Digest};
 use sha3::Sha3_256;
@@ -434,7 +452,16 @@ pub const fn chain_requires_carryover(id: ChainId) -> bool {
 //      goes into the Genesis-4 genesis block precisely so the record does not
 //      depend on a chain nobody is defending.
 
-/// Last valid height on the Genesis-3 mainnet. Blocks ABOVE this are invalid.
+/// Consensus ceiling: the last height a Genesis-3 block could validly claim.
+/// Blocks ABOVE this are invalid.
+///
+/// **The chain never reached it.** Genesis-3 stopped permanently at height
+/// **39,918** on 2026-08-13 — 10,082 blocks below this ceiling — when
+/// Genesis-4 (proof of stake) went live and the fleet moved. This constant is
+/// the rule; 39,918 is what happened, and it is what
+/// `bloch_pos_committee::tokenomics_v4::CARRYOVER_MEASURED_HEIGHT` pins as the
+/// height Genesis-4's opening ledger was measured at. Do not read 50,000 as a
+/// Genesis-3 chain length.
 //
 // LOWERED 80,000 -> 50,000 on 2026-08-12 (founder decision), matching
 // deploy/g3-terminal-50000 — the tree the fleet's running binary was built
@@ -528,8 +555,10 @@ pub const K_RULE_ACTIVATION_HEIGHT: u64 = 420_480;
 /// hashrate → higher difficulty → higher k). Steps are ~8× apart because each
 /// +1 to k makes a valid candidate ~8× rarer, so the network needs ~8× the work
 /// to carry it without choking block production. These are the CALIBRATION KNOB:
-/// tune to the sustained-hashrate milestones you want to gate on. Current live
-/// work ≈ 4 (bits 0x203fffc0), so today's chain sits at k=4.
+/// tune to the sustained-hashrate milestones you want to gate on. Genesis-3's
+/// work sat at ≈ 4 (bits 0x203fffc0), so it ran at k=4 to the end. There is no
+/// "current" value: the proof-of-work chain stopped at height 39,918 on
+/// 2026-08-13 and Genesis-4 has no difficulty.
 pub const K_WORK_5: u128 = 32;
 pub const K_WORK_6: u128 = 256;
 pub const K_WORK_7: u128 = 2_048;

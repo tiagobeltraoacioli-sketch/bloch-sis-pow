@@ -3,7 +3,11 @@
 # ADR-038 — Warm-up churn rate lowered 900 → 25 bps, floor raised to `MIN_CHURN_SAT`
 
 - **Status:** Accepted and applied (founder decision, 2026-08-11; commit
-  `e268838`)
+  `e268838`) — **in the code the live chain runs.** `WARMUP_RATE_BPS` and
+  `MIN_CHURN_SAT` in `crates/bloch-pos-committee/src/delegation.rs` are
+  consensus constants of Genesis-4, live since 2026-08-13. Note that no
+  churn has been exercised: delegation is refused at every mempool while
+  bonding is not funded from the UTXO set.
 - **Responds to:** `BLOCH-POS-THREAT-MODEL.md` §F8;
   `docs/specs/BLOCH-POS-STAKE-CHURN.md` (A6's assessment and pricing — the
   analysis of record, not restated here)

@@ -1,4 +1,16 @@
-//! Bloch-SIS Protocol Wallet Library (v0.5.4 — Sprint C)
+//! Bloch Wallet Library (v0.5.4 — Sprint C)
+//!
+//! > **Scope, stated because it is easy to get wrong.** The KEY half of this
+//! > module is era-neutral and current: `generate`, `from_seed`,
+//! > `load_encrypted`, `save_encrypted`, `address`, `public_key` produce the
+//! > same hybrid ML-DSA-65 ‖ Falcon-1024 identity Genesis-4 verifies. The
+//! > TRANSACTION half is **Genesis-3**: [`Wallet::build_tx`] and
+//! > [`Wallet::sign_tx`] emit a `crate::core::Transaction`, the UTXO format
+//! > of the proof-of-work chain that stopped at height 39,918 on 2026-08-13.
+//! > **A Genesis-4 node will not accept it.** Genesis-4 transactions are
+//! > `bloch_pos_committee::transition::PosTransaction`, built and submitted by
+//! > `bloch-pos submit-tx`, which signs nothing itself and takes an external
+//! > signature. Do not present `build_tx` as a way to spend on the live chain.
 //!
 //! This module unifies the wallet functionality that was previously scattered
 //! across `main.rs` (CLI commands), `hd_wallet/`, and ad-hoc scripts.

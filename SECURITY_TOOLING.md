@@ -88,10 +88,10 @@ The native eUTXO contract VM had a dedicated internal adversarial audit (`crates
 
 ## What automated tooling CANNOT catch (needs human + third-party review)
 
-- **Consensus logic** — GhostDAG ordering correctness, reorg-depth safety, the height-gated fork mechanics.
-- **Cryptographic parameter choices** — the ML-DSA-65/Falcon-1024 hybrid construction, SHAKE-256 domain separation, the PoW difficulty regime.
+- **Consensus logic.** On the LIVE chain (Genesis-4): the slot/epoch state transition, LMD-GHOST fork choice, Casper-style FFG justification and finalisation, committee and proposer selection, the RANDAO beacon, and the slashing conditions. On the CLOSED chain (Genesis-3 — still in scope because Genesis-4's opening ledger is derived from it): GhostDAG ordering correctness, reorg-depth safety, the height-gated fork mechanics.
+- **Cryptographic parameter choices** — the ML-DSA-65/Falcon-1024 hybrid construction and SHAKE-256 domain separation (both on the live consensus path), and the Genesis-3 PoW difficulty regime (closed).
 - **The Rust↔EVM bridge** — the highest-risk component (message replay, cross-side signature verification, finality inheritance). See the bridge threat model.
-- **Economic/game-theoretic** properties at low hashrate (the chain is 51%-attackable today).
+- **Economic/game-theoretic properties.** Under Genesis-3 this line read "low hashrate — the chain is 51%-attackable today". Genesis-4 is proof of stake, so that caveat retires with the chain it applied to; what replaces it is **concentration**, and it is not a softer disclosure. All 64 Genesis-4 validators are operated by a **single entity**, so one operator can halt the chain. **93.94% of the carryover sits at one address** — 17,046,829,380 of 18,146,400,000 BLOCH (`LARGEST_CARRYOVER_ADDRESS_BLOCH` in `crates/bloch-pos-committee/src/tokenomics_v4.rs`) — and carried balances are stakeable, so if that balance stakes the **Nakamoto coefficient is 1**. The founder and the Foundation together hold 56,046,829,380 of the 57,146,400,000 BLOCH issued at slot 0. No tool in this document can see any of this; it is disclosed in [`SECURITY.md`](./SECURITY.md) and [`README.md`](./README.md).
 
 **A third-party audit is required before any consensus activation of the native-contract features.** Automated scanning is a floor, not a ceiling.
 

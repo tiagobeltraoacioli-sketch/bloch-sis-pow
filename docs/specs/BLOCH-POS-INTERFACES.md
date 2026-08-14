@@ -2,13 +2,40 @@
 
 # Bloch PoS — Frozen Consensus Interfaces
 
+> **Genesis-4 is live.** Bloch has been running under **proof of stake** since
+> 21:31:19 UTC on 2026-08-13, when Genesis-3 (proof of work) stopped
+> permanently at height **39,918**. 30 s slots, 32-slot epochs, Casper-style
+> justification/finalisation by epoch, hybrid ML-DSA-65 ‖ Falcon-1024
+> signatures on every consensus path. Nothing in this document that describes
+> mining, hashrate, difficulty, retargeting or proof-of-work depth describes
+> the current network.
+>
+> **The live security question is concentration, not hashrate.** All 64
+> validators are operated by a single entity; 93.94% of the carryover
+> (17,046,829,380 of 18,146,400,000 BLOCH) sits at one address and carried
+> balances are stakeable, so if that balance stakes the Nakamoto coefficient
+> is 1; and 56,046,829,380 of the 57,146,400,000 BLOCH issued at slot 0 is
+> held by the founder and the Foundation, leaving 1.92% of genesis supply in
+> third-party hands. One operator can halt the chain and one holder can outvote
+> every other. The live transport is a point-to-point TCP full mesh with a
+> fixed peer list, **no discovery and no authentication**, and
+> `Deposit`/`Delegate` are refused at every node's mempool — which is why a
+> third party cannot yet join the network or become a validator.
+
 > **PARCIALMENTE SUPERADO — 2026-08-11.** Esta analise foi escrita contra o
 > estado do projeto naquele dia e depende de premissas que mudaram DEPOIS:
 >
 > - **a maquinaria de taint** — dissolvida: o carryover atravessa como um conjunto so, sem lista de exclusao, entao nao ha classe de moeda a marcar.
 > - **o comite amostrado (128 por epoca + 8 por slot)** — substituido por particao do conjunto ativo: o quorum amostrado nao tinha denominador coerente (achado F1).
-> - **o supply de 100 bilhoes** — revertido para 21 bilhoes, o nominal da V2.
-> - **a fase hibrida de PoW** — apagada: a Genesis-3 para na altura 80.000 e a Genesis-4 nasce de uma snapshot.
+> - ~~**o supply de 100 bilhoes** — revertido para 21 bilhoes, o nominal da V2.~~
+>   **Superseded 2026-08-12:** the supply is **100,000,000,000 BLCH**
+>   (`TOTAL_SUPPLY_BLOCH`), re-decided as a pure x100/21 split. The revert
+>   to 21 B lasted one day.
+> - **a fase hibrida de PoW** — apagada. **Correction (2026-08-14):** the
+>   height in this line was wrong and is now history. Genesis-3 stopped
+>   permanently at height **39,918** on 2026-08-13 — not 80,000 — and
+>   Genesis-4 launched from that snapshot under proof of stake at
+>   21:31:19 UTC the same day. It is live.
 > - **o "L2 anchor" como consumidor** — decisao do fundador (2026-08-11): EVM na base (L1), sem rollup; o `bloch-l2-evm` sera substituido, entao onde este doc lista "L2 anchor" como consumidor de `FinalityGadget`/checkpoints, leia o EVM nativo e demais consumidores internos.
 >
 > O texto NAO foi reescrito, de proposito: o raciocinio que produziu cada
@@ -20,7 +47,13 @@
 
 ```
 Document:   BLOCH-POS-INTERFACES
-Status:     FROZEN — Phase-1 interface freeze (§9.2 of the migration design)
+Status:     FROZEN — Phase-1 interface freeze (§9.2 of the migration design),
+            and now load-bearing: these are the interfaces of a chain that is
+            live (Genesis-4, proof of stake, since 2026-08-13). Two changes
+            landed under the two-reviewer rule since the freeze:
+            `StateRoots` grew from 7 to 14 components (2026-08-12), and
+            `derive::validate_block` was deleted so validation happens only
+            in `transition::apply_block`.
 Created:    2026-08-11
 Code:       crates/bloch-pos-committee/src/interfaces.rs
 Relates to: BLOCH-POS-SHA3-LATTICE-MIGRATION.md, BLOCH-TOKENOMICS-V4.md
@@ -276,7 +309,9 @@ deliberately does not guess.
 
 §7.1 ("deposits are accepted on the PoW chain during the hybrid phase") and
 much of §4.1's taint machinery predate the 2026-08-10 halt-and-relaunch
-decision (§8 superseded note; chain halts at 80,000, Genesis-4 launches ~6
+decision (§8 superseded note; **the chain stopped at 39,918 on 2026-08-13 and
+Genesis-4 launched the same day** — this parenthesis was written expecting 80,000
+and ~6
 months later). The ruling this section left pending is now made (founder
 decision, 2026-08-11): **the taint set does not survive into Genesis-4, and it
 is not repurposed.** It starts empty and stays empty — a carried-over balance
