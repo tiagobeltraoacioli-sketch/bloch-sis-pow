@@ -28,52 +28,20 @@ fully de-branded off ENTL.
 RPC/API only, every node a seed); the **products** — the OSes, wallet, explorer,
 attestation — are **Postern Labs** (owned, rebranded off "Bloch"). Anyone may
 build products on the open protocol; Postern is one builder among many.
-
-> ## Genesis-3 mainnet — CLOSED (this section was written 2026-08-09, while it ran)
-> Genesis-3 stopped at height **39,918** on 2026-08-13. Read this section in
-> the past tense; the live network is Genesis-4, proof of stake. Much of the
-> rest of this document predates even the **Genesis-3 relaunch (2026-07-29)**.
-> Genesis-3 was (chain id `0xB10C_0004`) a carry-over restart
-> (opening balance = 413,743 UTXOs / 3,475,441,200 BLOCH — `docs/CARRYOVER.md`)
-> whose chain-selected PoW is **SHA-256d** — ASIC-mined and **merged-mineable
-> with Bitcoin** (AuxPoW, active since local h=8,500 —
-> `legacy/MERGED-MINING.md`). Current consensus state:
-> - **Difficulty-from-ancestry flag-day, local h=30,030 — ACTIVE.** Expected
->   difficulty is a pure function of the block's own ancestry (commit
->   `1f7d328`); older builds reject today's blocks.
-> - **Emission V3 flag-day, local h=40,000 (ETA ~2026-08-12/13)** — block
->   reward 8,400 → 2,600 BLOCH, halvings every 1,555,200 blocks
->   (`legacy/specs/TOKENOMICS_V3.md`, ADR-035). Armed in the fleet binary
->   (release `genesis3-node-emission-v3-floor60-20260810`, sha256
->   `dfc6962d…`, incl. the PISO-60 60-BLOCH V3 tail floor), inert until the
->   height.
-> - **From-scratch sync is not supported** (pre-2026-08-05 block bodies no
->   longer exist on the network); new nodes bootstrap from a datadir snapshot
->   (`docs/SNAPSHOT-BOOTSTRAP.md`). A poisoned `known_peers.json` self-heals
->   on boot since `c21e09d` (PEX address fix).
-> The k-regime story in the caveat below concerns the **Bloch-SIS lattice
-> reference PoW chain**, not Genesis-3's SHA-256d; the maturity caveats
-> (nascent, low-hashrate, 51%-attackable, unaudited) apply to both.
-
-> ## 🔴 Hard caveat — read first
-> The chain is designated **mainnet beta** — a designation, **not** a security
-> claim. The **relaxed regime (k=4) currently applies** (residual checked on a
-> few coefficients → **work is trivially forgeable**). The **k=8 hardening** of
-> the PoW's Module-SIS gate was **activated at block 213,000 as a soft fork but
-> reverted**: it multiplied mining difficulty ~4096x and the current solo / low
-> hashrate could not find blocks, so the chain stalled. k=8 will **re-activate
-> together with a matched difficulty reduction** (so block time stays ~30s);
-> **until then, no security is claimed**. The PoW's security model is **hashcash
-> cumulative work, not lattice hardness** (a trapdoorless PoW cannot be
-> lattice-hard and mineable — `legacy/research/POW-CANONICAL-frontier.md`); the
-> SIS gate is a structural filter (k=4 today; k=8 on re-activation). The network is
-> **nascent: very few nodes, low hashrate → 51%-attackable**. **Unaudited** —
-> the third-party audit is contracted but **not done**; the no-shortcut proof
-> and the IACR ePrint are still outstanding. The coin is **not a security and
-> not an asset** — no sale, no listing, no price, **no value claim**; the
-> **17% founder premine** is disclosed. Do **not** attach value; use at your
-> own risk. No privacy or attestation claim is adopted until its own audit
-> gate.
+> ## What replaced the status block that was here
+>
+> This document carried a status box asserting that the live mainnet was
+> Genesis-3, SHA-256d proof of work, "nascent, low hashrate, 51%-attackable",
+> with a k=8 Module-SIS re-activation pending and a 17% founder premine on a
+> 10-year cliff. Every one of those statements described a chain that stopped
+> at height 39,918, and none of them describes Genesis-4.
+>
+> The live chain is proof of stake. There is no hashrate, so there is no 51%
+> attack; there is no premine on a cliff, because Genesis-4's supply was issued
+> at height 0. The risks that do exist — one operator running all 64
+> validators, and 56,046,829,380 of the 57,146,400,000 BLOCH issued at genesis
+> sitting at a single script hash — are stated in the README and in
+> `SECURITY.md`, once each, where a reader will find them.
 
 ## ✅ Built + verified
 
