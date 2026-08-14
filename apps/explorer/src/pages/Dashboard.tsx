@@ -13,6 +13,7 @@ import { useAsync } from "../lib/hooks";
 import { Stat, Loading, ErrorBox } from "../components/ui";
 import { HalvingCard } from "../components/halving";
 import { ChainStatusCard, useAdaptivePoll } from "../components/chainStatus";
+import { Genesis4Card } from "../components/genesis4";
 import { EMISSION_V3_FORK_LOCAL_HEIGHT } from "../lib/halving";
 import { SearchBox } from "../components/search";
 import { DagView } from "../components/dag";
@@ -88,6 +89,8 @@ export function Dashboard() {
       <div className="search-hero" style={{ marginTop: 6, marginBottom: 22 }}>
         <SearchBox hero />
       </div>
+
+      <Genesis4Card />
 
       <ChainStatusCard
         tipHeight={tipHeight}

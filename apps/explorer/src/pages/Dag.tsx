@@ -6,6 +6,7 @@ import { Loading, ErrorBox } from "../components/ui";
 import { DagView } from "../components/dag";
 import { useAdaptivePoll } from "../components/chainStatus";
 import { fmtInt } from "../lib/format";
+import { ArchiveBanner } from "../components/archive";
 
 export function DagPage() {
   const [depth, setDepth] = useState(40);
@@ -15,6 +16,7 @@ export function DagPage() {
 
   return (
     <div className="container">
+      <ArchiveBanner what="This DAG view" />
       <div className="page-title">DAG visualization</div>
       <p className="muted" style={{ marginTop: -8, maxWidth: 760 }}>
         Bloch is a GhostDAG-Q chain — blocks reference multiple parents, so the ledger is a directed

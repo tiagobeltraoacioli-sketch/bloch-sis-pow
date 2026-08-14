@@ -485,3 +485,134 @@ footer.foot a:hover { color: var(--accent); }
 @media (prefers-reduced-motion: reduce) {
   * { animation: none !important; transition: none !important; }
 }
+
+/* ── Genesis-4 live card ─────────────────────────────────────────
+   The one card on the site that reads the new chain. It sits above the
+   Genesis-3 status so the first thing a reader learns is that the chain
+   continues — the history below it is history, not a stopped network. */
+.g4-card { margin-bottom: 22px; border-color: var(--accent); }
+.g4-head {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  gap: 14px; flex-wrap: wrap; margin-bottom: 18px;
+}
+.g4-badge {
+  display: inline-block; font-family: var(--font-mono); font-size: 11px;
+  letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--accent-strong); border: 1px solid var(--accent);
+  border-radius: 999px; padding: 3px 10px;
+}
+.g4-title { margin: 8px 0 0; font-size: 20px; line-height: 1.2; }
+.g4-sub { font-family: var(--font-mono); font-size: 11.5px; color: var(--muted); padding-top: 4px; }
+.g4-grid {
+  display: grid; gap: 14px;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+}
+.g4-stat { display: flex; flex-direction: column; gap: 4px; }
+.g4-k {
+  font-family: var(--font-mono); font-size: 10.5px; letter-spacing: 0.07em;
+  text-transform: uppercase; color: var(--muted);
+}
+.g4-v { font-size: 19px; font-variant-numeric: tabular-nums; }
+.g4-dim { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.g4-roots {
+  display: flex; gap: 20px; flex-wrap: wrap; margin-top: 16px;
+  font-family: var(--font-mono); font-size: 11.5px; color: var(--muted);
+}
+.g4-roots code { color: var(--ink-2); }
+.g4-note {
+  margin-top: 14px; font-size: 12.5px; line-height: 1.6;
+  color: var(--ink-2); max-width: 72ch;
+}
+
+/* ── Genesis-4 pages: balance lookup, validators, snapshot ─────── */
+.page-lede { color: var(--ink-2); font-size: 13.5px; line-height: 1.7; max-width: 74ch; margin: 0 0 22px; }
+.lookup { margin-bottom: 20px; }
+.lookup-label {
+  display: block; font-family: var(--font-mono); font-size: 10.5px;
+  letter-spacing: 0.07em; text-transform: uppercase; color: var(--muted); margin-bottom: 8px;
+}
+.lookup-row { display: flex; gap: 10px; flex-wrap: wrap; }
+.lookup-input {
+  flex: 1 1 320px; min-width: 0; padding: 10px 12px;
+  font-family: var(--font-mono); font-size: 13px;
+  color: var(--ink); background: var(--surface-2);
+  border: 1px solid var(--line); border-radius: 8px;
+}
+.lookup-input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+.lookup-go {
+  padding: 10px 18px; font-size: 13px; font-weight: 600; cursor: pointer;
+  color: var(--surface); background: var(--accent-strong);
+  border: 0; border-radius: 8px;
+}
+.lookup-go:disabled { opacity: 0.55; cursor: default; }
+.lookup-hint { margin-top: 12px; font-size: 12px; line-height: 1.6; color: var(--muted); max-width: 72ch; }
+
+.bal-head { display: flex; justify-content: space-between; gap: 20px; flex-wrap: wrap; align-items: flex-start; }
+.bal-value { font-size: 26px; font-variant-numeric: tabular-nums; margin-top: 4px; }
+.bal-count { font-size: 20px; font-variant-numeric: tabular-nums; margin-top: 4px; }
+.bal-side { text-align: right; }
+.bal-meta { margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--line); }
+.bal-hash {
+  display: block; margin-top: 5px; font-family: var(--font-mono);
+  font-size: 12px; color: var(--ink-2); word-break: break-all;
+}
+
+.snap-h2 { margin: 0 0 16px; font-size: 15px; }
+.snap-body { font-size: 13.5px; line-height: 1.7; color: var(--ink-2); max-width: 74ch; margin: 0; }
+.snap-digest { padding: 12px 0; border-bottom: 1px solid var(--line); }
+.snap-digest:last-of-type { border-bottom: 0; }
+.snap-hash {
+  display: block; margin: 5px 0 4px; font-family: var(--font-mono);
+  font-size: 12px; color: var(--ink); word-break: break-all;
+}
+.snap-note { display: block; font-size: 11.5px; line-height: 1.55; color: var(--muted); }
+
+.table-wrap { overflow-x: auto; }
+.tbl { width: 100%; border-collapse: collapse; font-size: 13px; }
+.tbl th {
+  text-align: left; padding: 8px 12px; font-family: var(--font-mono);
+  font-size: 10.5px; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--muted); border-bottom: 1px solid var(--line); white-space: nowrap;
+}
+.tbl td { padding: 8px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+.tbl tr:last-child td { border-bottom: 0; }
+.tbl .num { text-align: right; font-variant-numeric: tabular-nums; }
+.pill {
+  display: inline-block; padding: 2px 9px; border-radius: 999px;
+  font-family: var(--font-mono); font-size: 10.5px; letter-spacing: 0.05em;
+}
+.pill.ok { color: var(--ok); border: 1px solid currentColor; }
+.pill.bad { color: var(--danger); border: 1px solid currentColor; }
+.pill.quiet { color: var(--muted); border: 1px solid var(--line); }
+
+/* ── Archive banner ───────────────────────────────────────────────
+   Marks every Genesis-3 page. Amber, not red: the chain finishing was
+   the plan, not a failure. */
+.archive-banner {
+  display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap;
+  margin: 6px 0 20px; padding: 11px 14px;
+  border: 1px solid var(--line); border-left: 3px solid var(--signal);
+  border-radius: 8px; background: var(--surface-2);
+}
+.archive-tag {
+  font-family: var(--font-mono); font-size: 10.5px; letter-spacing: 0.07em;
+  text-transform: uppercase; color: var(--signal); white-space: nowrap;
+}
+.archive-text { font-size: 12.5px; line-height: 1.6; color: var(--ink-2); max-width: 74ch; }
+
+/* ── Genesis-4 search ─────────────────────────────────────────── */
+.search-input {
+  width: 100%; padding: 8px 12px; font-family: var(--font-mono); font-size: 13px;
+  color: var(--ink); background: var(--surface-2);
+  border: 1px solid var(--line); border-radius: 8px;
+}
+.search-input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--brass-glow); }
+.search.hero .search-input { padding: 13px 16px; font-size: 15px; }
+.search-go {
+  position: absolute; right: 5px; top: 50%; transform: translateY(-50%);
+  padding: 5px 13px; font-size: 12px; font-weight: 600; cursor: pointer;
+  color: var(--surface); background: var(--accent-strong); border: 0; border-radius: 6px;
+}
+.search-go:disabled { opacity: 0.55; cursor: default; }
+.search-err { margin-top: 6px; font-size: 11.5px; color: var(--signal); }
+.row-missed td { opacity: 0.62; }

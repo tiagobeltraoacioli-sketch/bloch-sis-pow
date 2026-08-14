@@ -2,18 +2,13 @@
 import { useEffect, useState } from "react";
 import { useRouter, Link, matchRoute } from "./lib/router";
 import { rpcIsDegraded, activeRpcEndpoint } from "./lib/rpc";
-import { SearchBox } from "./components/search";
-import { Dashboard } from "./pages/Dashboard";
-import { Blocks } from "./pages/Blocks";
-import { BlockDetail } from "./pages/BlockDetail";
-import { TxDetail } from "./pages/TxDetail";
-import { AddressView } from "./pages/AddressView";
-import { ChartsPage } from "./pages/Charts";
-import { DagPage } from "./pages/Dag";
-import { DagLivePage } from "./pages/DagLive";
-import { MiningPage } from "./pages/Mining";
-import { WalletPage } from "./pages/Wallet";
-import { LeaderboardPage } from "./pages/Leaderboard";
+import { G4Search } from "./components/g4search";
+import { g4rpc, G4_RPC } from "./lib/g4";
+import { G4Dashboard } from "./pages/G4Dashboard";
+import { G4BlockPage } from "./pages/G4Block";
+import { BalancePage } from "./pages/Balance";
+import { ValidatorsPage } from "./pages/Validators";
+import { SnapshotPage } from "./pages/Snapshot";
 import "./features.css";
 
 // The Bloch sphere — one qubit, every state. Canonical protocol mark,
@@ -27,41 +22,44 @@ const Logo = () => (
   </svg>
 );
 
+// Two chains, one explorer. Genesis-4 first because it is the live one; the
+// Genesis-3 entries stay because its history is the ledger Genesis-4 opened
+// with, and a reader who came looking for it must still find it.
 const NAV = [
-  { to: "/", label: "Dashboard" },
-  { to: "/blocks", label: "Blocks" },
-  { to: "/livedag", label: "Live DAG" },
-  { to: "/mining", label: "Mining" },
-  { to: "/wallet", label: "Wallet" },
-  { to: "/leaderboard", label: "Leaderboard" },
-  { to: "/charts", label: "Charts" },
+  { to: "/", label: "Chain" },
+  { to: "/balance", label: "Balance" },
+  { to: "/validators", label: "Validators" },
+  { to: "/snapshot", label: "Snapshot" },
 ];
 
 function renderRoute(path: string) {
-  if (path === "/" || path === "") return <Dashboard />;
-  if (path === "/blocks") return <Blocks />;
-  if (path === "/dag") return <DagPage />;
-  if (path === "/livedag") return <DagLivePage />;
-  if (path === "/mining") return <MiningPage />;
-  if (path === "/wallet") return <WalletPage />;
-  if (path === "/leaderboard") return <LeaderboardPage />;
-  if (path === "/charts") return <ChartsPage />;
+  if (path === "/" || path === "") return <G4Dashboard />;
+  if (path === "/balance") return <BalancePage />;
+  {
+    const mb = matchRoute(path, "/balance/:h");
+    if (mb) return <BalancePage initial={mb.h} key={"bal" + mb.h} />;
+  }
+  if (path === "/validators") return <ValidatorsPage />;
+  if (path === "/snapshot") return <SnapshotPage />;
 
-  let m = matchRoute(path, "/block/height/:h");
-  if (m) return <BlockDetail height={Number(m.h)} key={"bh" + m.h} />;
-  m = matchRoute(path, "/block/:hash");
-  if (m) return <BlockDetail hash={m.hash} key={"b" + m.hash} />;
-  m = matchRoute(path, "/tx/:txid");
-  if (m) return <TxDetail txid={m.txid} key={"t" + m.txid} />;
-  m = matchRoute(path, "/address/:addr");
-  if (m) return <AddressView addr={m.addr} key={"a" + m.addr} />;
+  const m = matchRoute(path, "/slot/:s");
+  if (m) return <G4BlockPage slot={Number(m.s)} key={"s" + m.s} />;
 
+  // Genesis-3 routes are gone, not broken-on-purpose: this explorer is the
+  // proof-of-stake chain now. The state proof of work ended in is published
+  // whole on /snapshot, which is what anyone following an old link is
+  // actually after.
   return (
     <div className="container">
-      <div className="page-title">Not found</div>
-      <p className="muted">
-        No route for <code>{path}</code>. <Link to="/">Back to dashboard</Link>.
-      </p>
+      <div className="card" style={{ marginTop: 24 }}>
+        <h1 className="page-title">Nothing at that address</h1>
+        <p className="page-lede">
+          No route for <code>{path}</code>. This explorer serves Genesis-4, the proof-of-stake
+          chain. If you came looking for Genesis-3 — the proof-of-work era that ended at height
+          39,918 — its terminal state is published in full on the{" "}
+          <Link to="/snapshot">snapshot page</Link>.
+        </p>
+      </div>
     </div>
   );
 }
@@ -69,19 +67,29 @@ function renderRoute(path: string) {
 // Surfaces the RPC client's own failover state (src/lib/rpc.ts). Reads the
 // exported getters on a slow tick — no extra network traffic.
 function RpcStatus() {
-  const [, setTick] = useState(0);
+  const [state, setState] = useState<"live" | "warn">("warn");
   useEffect(() => {
-    const t = setInterval(() => setTick((x) => x + 1), 10_000);
-    return () => clearInterval(t);
+    let stop = false;
+    const ping = async () => {
+      try {
+        await g4rpc("getchaininfo");
+        if (!stop) setState("live");
+      } catch {
+        if (!stop) setState("warn");
+      }
+    };
+    ping();
+    const t = setInterval(ping, 20_000);
+    return () => {
+      stop = true;
+      clearInterval(t);
+    };
   }, []);
-  const degraded = rpcIsDegraded();
-  const ep = activeRpcEndpoint();
-  const label = ep === "/rpc" ? "same-origin /rpc" : ep;
   return (
-    <div className="rpc-status" title="Which JSON-RPC endpoint this session is pinned to">
-      <span className={"dot " + (degraded ? "warn" : "live")} />
+    <div className="rpc-status" title="The Genesis-4 endpoint this page reads">
+      <span className={"dot " + state} />
       <span>
-        RPC {degraded ? "degraded — failed over to" : "via"} <code>{label}</code>
+        Genesis-4 RPC {state === "live" ? "via" : "not answering —"} <code>{G4_RPC}</code>
       </span>
     </div>
   );
@@ -112,7 +120,7 @@ export function App() {
               </a>
             </nav>
             <div className="topbar-spacer" />
-            <SearchBox />
+            <G4Search />
           </div>
         </div>
       </header>
@@ -131,9 +139,12 @@ export function App() {
               investment advice
             </span>
           </div>
-          Independent reference explorer for the <strong>Bloch</strong> chain — a GhostDAG-Q,
-          post-quantum proof-of-work network. Genesis-3 ends by consensus rule at height 50,000;
-          this explorer serves its history in full. Not an official service; Bloch is
+          Independent reference explorer for <strong>Bloch Genesis-4</strong> — a post-quantum
+          proof-of-stake chain, 64 genesis validators, 30-second slots, finality by epoch. It
+          opened carrying every balance from Genesis-3, the proof-of-work era that ended at height
+          39,918; that handover is published in full on the <Link to="/snapshot">snapshot</Link>.
+          Not an official service; Bloch is ownerless/neutral. Integer satoshis are the source of
+          truth (1 BLOCH = 1e8 sat). Not an official service; Bloch is
           ownerless/neutral. Integer satoshis are the source of truth (1 BLOCH = 1e8 sat); “bloch”
           values are display-only. BLCH is neutral native gas, never a value or investment claim.
           <RpcStatus />

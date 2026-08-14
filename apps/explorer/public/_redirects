@@ -1,4 +1,3 @@
 # SPA fallback — every non-asset, non-function path serves the app shell so
-# deep links (/block/..., /tx/..., /address/...) render client-side.
-# /rpc is a Pages Function and is matched before this rule.
+# deep links (/slot/..., /balance/...) render client-side.
 /*  /index.html  200

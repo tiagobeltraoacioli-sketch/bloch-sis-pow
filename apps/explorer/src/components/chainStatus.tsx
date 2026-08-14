@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
-// Chain-state presentation: Genesis-3 halts at height 50,000 by consensus
+// Chain-state presentation: Genesis-3 ended at height 39,918
 // rule, so the explorer has THREE states — producing, counting down to the
 // halt, and complete. "Complete" is the designed outcome and is rendered in
 // the calm accent tone, never as an error. After completion the explorer is a
@@ -94,7 +94,7 @@ export function ChainPhaseBanner({
 /**
  * The dashboard card. Three renders:
  *   complete  — Genesis-3 finished as planned; final block date, no clock
- *   countdown — blocks remaining to 50,000 (with a paused note when quiet)
+ *   countdown — blocks remaining to the halt (with a paused note when quiet)
  */
 export function ChainStatusCard({
   tipHeight,

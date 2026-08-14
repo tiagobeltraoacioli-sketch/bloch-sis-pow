@@ -16,6 +16,7 @@ import {
   PoolAddresses,
 } from "../lib/mining";
 import { fmtHashrate, fmtInt, fmtBloch, fmtTime, timeAgo, short } from "../lib/format";
+import { ArchiveBanner } from "../components/archive";
 
 const SCAN_DEPTH = 40;
 
@@ -98,6 +99,7 @@ export function LeaderboardPage() {
 
   return (
     <div className="container">
+      <ArchiveBanner what="This miner leaderboard" />
       <div className="page-title">Pool leaderboard</div>
       <p className="muted" style={{ marginTop: -8, maxWidth: 780 }}>
         Miners ranked by blocks found in the recent window, derived from each block's coinbase output.

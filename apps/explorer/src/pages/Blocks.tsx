@@ -6,6 +6,7 @@ import { Loading, ErrorBox } from "../components/ui";
 import { useAdaptivePoll } from "../components/chainStatus";
 import { Link } from "../lib/router";
 import { fmtInt, short, timeAgo, fmtTime, difficultyFromBits, fmtNum } from "../lib/format";
+import { ArchiveBanner } from "../components/archive";
 
 export function Blocks() {
   const [count, setCount] = useState(50);
@@ -21,6 +22,7 @@ export function Blocks() {
 
   return (
     <div className="container">
+      <ArchiveBanner what="This block list" />
       <div className="page-title">Blocks</div>
       <div className="row-actions" style={{ marginBottom: 14 }}>
         {[15, 30, 50].map((c) => (

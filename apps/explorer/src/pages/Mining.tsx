@@ -7,6 +7,7 @@ import { ChainPhaseBanner, useAdaptivePoll } from "../components/chainStatus";
 import { chainPhase } from "../lib/chain";
 import { parseBlochAddress, looksLikeBlochAddress } from "../lib/address";
 import { fmtBloch, fmtHashrate, fmtNum, fmtDuration, fmtInt } from "../lib/format";
+import { ArchiveBanner } from "../components/archive";
 
 export function MiningPage() {
   const { intervalMs, markTip } = useAdaptivePoll(30000);
@@ -55,6 +56,7 @@ export function MiningPage() {
 
   return (
     <div className="container">
+      <ArchiveBanner what="This mining view" />
       <div className="page-title">Mining calculator</div>
       <p className="muted" style={{ marginTop: -8, maxWidth: 760 }}>
         Estimate your blocks and BLOCH per day from the <strong>live</strong> network difficulty,

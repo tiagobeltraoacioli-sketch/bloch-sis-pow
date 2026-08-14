@@ -6,6 +6,7 @@ import { ChartCard, LineChart, BarChart, ProportionBars } from "../components/ch
 import { useAdaptivePoll } from "../components/chainStatus";
 import { difficultyFromBits, fmtNum, fmtDuration, fmtHashrate, fmtBloch, fmtInt, toSats } from "../lib/format";
 import { totalSupplySat, CARRYOVER_TOTAL_SAT, CARRYOVER_UTXO_COUNT } from "../lib/chain";
+import { ArchiveBanner } from "../components/archive";
 
 // Brand categorical ramp — theme-aware tokens defined in styles.css. Emerald
 // carries the primary series; violet / amber / slate fill the secondaries.
@@ -37,7 +38,8 @@ export function ChartsPage() {
     intervalMs
   );
 
-  if (loading && !data) return <div className="container"><Loading label="Loading analytics…" /></div>;
+  if (loading && !data) return <div className="container">
+      <ArchiveBanner what="These charts" /><Loading label="Loading analytics…" /></div>;
   if (error && !data) return <div className="container"><ErrorBox error={error} /></div>;
   const d = data!;
 
@@ -74,25 +76,15 @@ export function ChartsPage() {
     sub: `${t.address_count} addr`,
   }));
 
-  const pools = d.pools?.pools;
-  // Satoshi amounts as bigint; the share PERCENTAGE is a ratio, so it is scaled
-  // in bigint first and only then narrowed to a float for display.
-  const subsidy = toSats(d.pools?.subsidy_per_block_sat) || 1n;
-  const minerShare = toSats(d.pools?.miner_share_sat);
-  const shareRows = pools
-    ? [
-        {
-          label: "Miner",
-          value: minerShare,
-          pct: Number((minerShare * 1_000_000n) / subsidy) / 10_000,
-          color: "var(--chart-1)",
-        },
-      ]
-    : [];
 
   return (
     <div className="container">
       <div className="page-title">Charts &amp; analytics</div>
+      <p className="page-lede">
+        Genesis-3, the proof-of-work era, from its first block to its last at height 39,918. These
+        series are complete and no longer move. What the chain is doing now is on the{" "}
+        <a href="/">dashboard</a>.
+      </p>
 
       <div className="grid two-col">
         <ChartCard title="Difficulty history" hint={`${diffPoints.length} retarget points`}>
@@ -120,14 +112,13 @@ export function ChartsPage() {
           </div>
         </ChartCard>
 
-        <ChartCard title="Block subsidy split" hint={`${fmtBloch(subsidy, 0)} BLOCH / block`}>
-          <ProportionBars rows={shareRows} />
-          {pools && (
-            <div className="faint" style={{ fontSize: 12, marginTop: 8 }}>
-              Pure PoW — 100% of the block subsidy goes to the miner (no validators or oracles). Founder vesting:{" "}
-              {pools.founder?.vesting_active_at_next ? "active" : "inactive"} at next block.
-            </div>
-          )}
+        <ChartCard title="Where the subsidy went" hint="Genesis-3, closed">
+          <div className="faint" style={{ fontSize: 12.5, lineHeight: 1.6 }}>
+            Under proof of work the whole block subsidy went to the miner — there were no
+            validators and no oracles to split it with. That era is closed: Genesis-3 stopped at
+            height 39,918 and issues nothing further. Genesis-4 pays validators instead, and the
+            genesis cohort's share of it declines from the whole to a third across the first year.
+          </div>
         </ChartCard>
       </div>
 

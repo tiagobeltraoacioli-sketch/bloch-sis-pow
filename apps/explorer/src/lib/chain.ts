@@ -117,12 +117,18 @@ export async function fetchDagWindow(depth: number): Promise<{
 export const STALL_THRESHOLD_SECS = 20 * 60;
 
 /**
- * Genesis-3 ends by consensus rule at this height: blocks above it are invalid
- * for every node, mining revenue stops, and a signed snapshot of all balances
- * carries into Genesis-4. Reaching it is the PLAN, not a failure — the UI must
- * never present it as an error state.
+ * The height Genesis-3 actually ended at.
+ *
+ * The rule was written for 50,000 and the chain was stopped at 39,918 instead:
+ * hashrate was falling and waiting out 10,082 more blocks bought nothing the
+ * snapshot did not already have. The terminal state was taken here, verified on
+ * two independent nodes, and carried into Genesis-4 — so this, not 50,000, is
+ * the number every balance in the carryover was measured at.
+ *
+ * Reaching it was the PLAN, not a failure — the UI must never present it as an
+ * error state.
  */
-export const HALT_HEIGHT = 50_000;
+export const HALT_HEIGHT = 39_918;
 
 /** Poll cadence once the chain is complete: history doesn't change every 15 s. */
 export const COMPLETE_POLL_MS = 10 * 60 * 1000;

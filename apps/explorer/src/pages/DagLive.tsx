@@ -7,6 +7,7 @@ import { InteractiveDag } from "../components/dagInteractive";
 import { ChainPhaseBanner, useAdaptivePoll } from "../components/chainStatus";
 import { Link } from "../lib/router";
 import { fmtInt } from "../lib/format";
+import { ArchiveBanner } from "../components/archive";
 
 export function DagLivePage() {
   const [depth, setDepth] = useState(40);
@@ -18,6 +19,7 @@ export function DagLivePage() {
 
   return (
     <div className="container">
+      <ArchiveBanner what="This DAG view" />
       <div className="page-title">Live GhostDAG</div>
       <p className="muted" style={{ marginTop: -8, maxWidth: 780 }}>
         An explorable view of the DAG near the tip. Scroll or pinch to zoom, drag to pan, hover a node

@@ -8,6 +8,7 @@ import { Link } from "../lib/router";
 import { parseBlochAddress, looksLikeBlochAddress } from "../lib/address";
 import { fetchPoolAddresses, scanMinerBlocks, MinerBlock, PoolAddresses } from "../lib/mining";
 import { fmtBloch, fmtInt, toSats, timeAgo, short } from "../lib/format";
+import { ArchiveBanner } from "../components/archive";
 
 const LS_KEY = "bloch:wallet:addr";
 const SCAN_DEPTH = 40;
@@ -33,6 +34,7 @@ export function WalletPage() {
 
   return (
     <div className="container">
+      <ArchiveBanner what="This wallet scan" />
       <div className="page-title">Wallet dashboard</div>
       <p className="muted" style={{ marginTop: -8, maxWidth: 760 }}>
         Paste your <code>bloch1q…</code> address for a personal panel: balance, blocks you mined in the
@@ -141,7 +143,7 @@ function WalletPanel({ address }: { address: string }) {
         <div className="rail" style={{ marginTop: 16 }}>
           <strong>Nothing found.</strong> This address has no balance and mined no blocks in the last{" "}
           {SCAN_DEPTH} bodied blocks the node returned — we won't invent activity. Note that Genesis-3
-          ends at height 50,000; after the halt this scan is a fixed historical window, not a live feed.
+          ended at height 39,918; this scan is a fixed historical window, not a live feed.
         </div>
       )}
 
