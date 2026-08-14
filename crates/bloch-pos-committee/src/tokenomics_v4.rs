@@ -199,6 +199,21 @@ pub const CARRYOVER_MEASURED_ROOT: [u8; 32] = [
 
 /// SHA3-256 of the snapshot FILE's bytes — integrity in transit, a different
 /// question from the set root above. The ceremony checks both.
+///
+/// **SHA3-256, not SHA-256.** This held the SHA-256 until 2026-08-13, because
+/// the value was produced with `shasum -a 256` and pasted into a field the
+/// loader hashes with SHA3-256. The names are one character apart and the
+/// functions are unrelated. The node refused every start with a FILE-DIGEST
+/// mismatch and was right to: a check that accepted the wrong hash function
+/// would have been decoration.
+pub const CARRYOVER_MEASURED_FILE_SHA3_256: [u8; 32] = [
+    0x3d, 0x67, 0x24, 0x6e, 0x94, 0x88, 0x1a, 0x17, 0xd3, 0x02, 0xb4, 0x64, 0xf7, 0x9f, 0xee, 0x55,
+    0x88, 0x6d, 0x80, 0x68, 0x79, 0x4e, 0x76, 0xfe, 0xd4, 0x30, 0x81, 0x11, 0x7f, 0xbe, 0x30, 0x8d,
+];
+
+/// SHA-256 of the same file. Kept because it is what a reader reproduces with
+/// `shasum -a 256` / `sha256sum`, which is what an operator reaches for — and
+/// having both named makes the pair above impossible to confuse again.
 pub const CARRYOVER_MEASURED_FILE_SHA256: [u8; 32] = [
     0x84, 0xdd, 0xbb, 0xac, 0x2a, 0xfd, 0xd5, 0xc7, 0x86, 0x18, 0x09, 0x6a, 0x7d, 0x4f, 0x66, 0xcf,
     0x5b, 0x04, 0xa3, 0xe5, 0x75, 0x7a, 0x03, 0xfe, 0x90, 0x55, 0x0e, 0x50, 0x09, 0x61, 0x83, 0xf6,

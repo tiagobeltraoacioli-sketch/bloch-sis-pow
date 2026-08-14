@@ -1594,7 +1594,7 @@ mod tests {
             // same count, same total, same set root, same file digest. That
             // agreement, not this tool's say-so, is what makes the numbers
             // usable.
-            digest: t::CARRYOVER_MEASURED_FILE_SHA256,
+            digest: t::CARRYOVER_MEASURED_FILE_SHA3_256,
             set_root: t::CARRYOVER_MEASURED_ROOT,
             entry_count: t::CARRYOVER_MEASURED_UTXOS,
             total_sat: t::CARRYOVER_TOTAL_BLOCH * t::SAT_PER_BLOCH,
