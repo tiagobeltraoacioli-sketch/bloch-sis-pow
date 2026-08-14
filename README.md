@@ -56,7 +56,7 @@ A Layer 1 whose consensus-critical cryptography is post-quantum end to end:
 | --- | --- | --- |
 | Signatures | **Hybrid ML-DSA-65 ‖ Falcon-1024** — both must verify (`SUITE_MLDSA65_FALCON1024 = 0x0001`) | ~4.6 KB per signature, not recoverable from the message, and no hardware wallet implements it. MetaMask, Ledger and Trezor cannot sign a Bloch transaction. |
 | Hashing | SHAKE-256 / SHA-3 with domain separation | Slower than SHA-2 on hardware built for Bitcoin. |
-| Transport | ML-KEM-768 hybrid + ChaCha20-Poly1305 | Peer identity is hybrid; the underlying libp2p identity remains classical Ed25519. |
+| Transport | **Not post-quantum, and on the live chain not encrypted at all.** | The Genesis-4 fleet runs `--transport devnet`: a plain TCP full mesh with a fixed peer list, **no authentication and no handshake** (`crates/bloch-pos-node/src/net.rs`). The libp2p layer in the tree (`--transport libp2p`) uses **Noise**, which is classical. There is no ML-KEM anywhere in `crates/bloch-pos-node`. The ML-KEM-768 + ChaCha20-Poly1305 hybrid transport was a **Genesis-3 / Era-1** property (see [FIRST_POST_QUANTUM_HANDSHAKE.md](./FIRST_POST_QUANTUM_HANDSHAKE.md)) and did not carry over. |
 | Shielded pool | SHAKE-256 commitments and nullifiers, SP1 raw FRI-STARK, no elliptic-curve ZK | Proofs are large and proving is expensive. The mainnet pool is provably empty — nothing has ever been shielded. |
 
 The trade the project makes is explicit: it gives up the entire existing
