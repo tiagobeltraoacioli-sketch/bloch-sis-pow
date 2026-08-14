@@ -724,14 +724,7 @@ impl Engine {
         // mempool and are dropped by the proposer, which is why the proposer's
         // guard is the one that carries liveness and this one only reduces
         // waste. Two checks, neither trusting the other.
-        if let PosTransaction::Transfer { inputs, outputs, .. } = &tx {
-            if inputs.is_empty() {
-                return Err("transfer has no inputs — it spends nothing and cannot apply");
-            }
-            if outputs.is_empty() {
-                return Err("transfer has no outputs — it pays no one and cannot apply");
-            }
-        }
+        admissible(&tx)?;
         let mut frame = vec![net::FRAME_TX];
         frame.extend_from_slice(&key);
         self.mempool.insert(key, tx);
@@ -1713,6 +1706,63 @@ pub fn lmd_ghost_head<'a>(
     fc.head(&tree, justified, &children)
 }
 
+
+/// Whether the mempool will hold `tx` at all.
+///
+/// A free function, not a method, so it can be tested without standing up an
+/// engine — the checks are a pure function of the transaction and nothing
+/// else, and a rule that needs a running node to exercise is a rule that stops
+/// being exercised.
+///
+/// Deliberately STRUCTURAL, not a validity check. A complete answer means
+/// running the transition, which needs a candidate header this path has no
+/// reason to build. What it catches is the class that has actually been
+/// exploited or is currently exploitable.
+pub(crate) fn admissible(tx: &PosTransaction) -> Result<(), &'static str> {
+    match tx {
+        // Staking messages are refused outright until bonding is funded from
+        // the eUTXO set.
+        //
+        // `Deposit` carries no signature and spends no output: it names an
+        // `amount_sat` and the transition registers a validator holding it.
+        // `transition.rs` documents the gap ("a deposit creates bonded stake
+        // without destroying spendable coins"), which was tolerable while the
+        // two pools only ever met on a devnet. On a live chain behind a public
+        // endpoint it is stake minted from nothing — measured on 2026-08-13 at
+        // 25,000 BLOCH per unauthenticated request, roughly forty-six requests
+        // to a third of the active stake and stop finality, a hundred and
+        // eighty to two thirds and take the chain.
+        //
+        // This is a node-side refusal, not a consensus rule: a block that
+        // already carries a deposit still applies it. It closes the path anyone
+        // can reach and buys time to close the real one — giving deposits and
+        // withdrawals eUTXO inputs and outputs, which is a wire-format change
+        // and needs a flag day.
+        PosTransaction::Deposit { .. } => Err(
+            "deposits are not accepted: bonding is not yet funded from the UTXO set, \
+             so a deposit would create stake without spending coins",
+        ),
+        PosTransaction::Delegate { .. } => Err(
+            "delegations are not accepted: bonding is not yet funded from the UTXO set, \
+             so a delegation would create stake without spending coins",
+        ),
+        // One transaction consensus would never apply halted the live testnet:
+        // every proposer that selected it failed to produce, and the chain
+        // stopped at slot 69 with every node up and still attesting. Cost of
+        // the attack: one unauthenticated request.
+        PosTransaction::Transfer { inputs, outputs, .. } => {
+            if inputs.is_empty() {
+                return Err("transfer has no inputs — it spends nothing and cannot apply");
+            }
+            if outputs.is_empty() {
+                return Err("transfer has no outputs — it pays no one and cannot apply");
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod forkchoice_tests {
     use super::*;
@@ -1787,6 +1837,40 @@ mod forkchoice_tests {
     /// test, swapping the implementations would be a claim rather than a
     /// change: the cooperative devnet passes either way, because on a chain
     /// with no forks the two rules agree.
+    /// The exposure this closes: a `Deposit` names an amount, carries no
+    /// signature, and spends no output. Until bonding is funded from the eUTXO
+    /// set, admitting one is admitting stake minted from nothing.
+    #[test]
+    fn staking_messages_are_refused_until_bonding_is_funded() {
+        let deposit = PosTransaction::Deposit {
+            pubkey: vec![0u8; 32],
+            amount_sat: 25_000 * 100_000_000,
+            randao_commitment: [7u8; 32],
+            withdrawal_credentials: vec![1u8; 20],
+            commission_bps: 0,
+        };
+        let err = admissible(&deposit).expect_err("a deposit must not be admitted");
+        assert!(err.contains("not yet funded"), "the refusal must say why: {err}");
+
+        let delegate =
+            PosTransaction::Delegate { delegator: 0, validator: 0, amount_sat: 1, eligible: true };
+        assert!(admissible(&delegate).is_err(), "a delegation must not be admitted either");
+    }
+
+    /// The transfer guard that already existed, pinned so the refactor into a
+    /// free function cannot quietly drop it — this is the check that stopped
+    /// the one-request halt at slot 69.
+    #[test]
+    fn a_transfer_that_spends_nothing_is_refused() {
+        let empty = PosTransaction::Transfer {
+            inputs: vec![],
+            outputs: vec![bloch_pos_committee::transition::TransferOutput { value: 1, script_hash: [0u8; 32] }],
+            tx_bytes: 0,
+            tip_millisat_per_gas: 0,
+        };
+        assert!(admissible(&empty).is_err(), "a transfer with no inputs must not be admitted");
+    }
+
     #[test]
     fn weight_beats_length() {
         let g = [0x99u8; 32]; // the justified root the walk starts from
