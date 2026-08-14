@@ -42,8 +42,8 @@ mod engine;
 mod genesis;
 mod keys;
 mod net;
-mod rpc;
 mod p2p;
+mod rpc;
 mod store;
 mod ws_boot;
 
@@ -250,7 +250,9 @@ fn submit_tx(args: &[String]) {
         exit(2);
     };
     let num = |name: &str, default: u128| -> u128 {
-        arg_value(args, name).and_then(|s| s.parse().ok()).unwrap_or(default)
+        arg_value(args, name)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(default)
     };
     let bail = |m: String| -> ! {
         eprintln!("submit-tx: {m}");
@@ -268,7 +270,9 @@ fn submit_tx(args: &[String]) {
         if a != "--spend" {
             continue;
         }
-        let Some(spec) = args.get(i + 1) else { bail("--spend needs <txid-hex>:<vout>".into()) };
+        let Some(spec) = args.get(i + 1) else {
+            bail("--spend needs <txid-hex>:<vout>".into())
+        };
         let Some((txid_hex, vout)) = spec.rsplit_once(':') else {
             bail(format!("--spend {spec}: expected <txid-hex>:<vout>"))
         };
@@ -281,7 +285,9 @@ fn submit_tx(args: &[String]) {
             Ok(b) => bail(format!("--spend: txid is {} bytes, expected 32", b.len())),
             Err(e) => bail(format!("--spend: {e}")),
         };
-        let Ok(vout) = vout.parse::<u32>() else { bail(format!("--spend: bad vout {vout}")) };
+        let Ok(vout) = vout.parse::<u32>() else {
+            bail(format!("--spend: bad vout {vout}"))
+        };
         inputs.push(bloch_pos_committee::transition::TransferInput {
             txid,
             vout,
@@ -302,7 +308,9 @@ fn submit_tx(args: &[String]) {
         if a != "--pay" {
             continue;
         }
-        let Some(spec) = args.get(i + 1) else { bail("--pay needs <script-hash-hex>:<sat>".into()) };
+        let Some(spec) = args.get(i + 1) else {
+            bail("--pay needs <script-hash-hex>:<sat>".into())
+        };
         let Some((sh_hex, value)) = spec.rsplit_once(':') else {
             bail(format!("--pay {spec}: expected <script-hash-hex>:<sat>"))
         };
@@ -312,10 +320,15 @@ fn submit_tx(args: &[String]) {
                 a.copy_from_slice(&b);
                 a
             }
-            Ok(b) => bail(format!("--pay: script hash is {} bytes, expected 32", b.len())),
+            Ok(b) => bail(format!(
+                "--pay: script hash is {} bytes, expected 32",
+                b.len()
+            )),
             Err(e) => bail(format!("--pay: {e}")),
         };
-        let Ok(value) = value.parse::<u64>() else { bail(format!("--pay: bad value {value}")) };
+        let Ok(value) = value.parse::<u64>() else {
+            bail(format!("--pay: bad value {value}"))
+        };
         outputs.push(bloch_pos_committee::transition::TransferOutput { value, script_hash });
     }
 
@@ -326,9 +339,8 @@ fn submit_tx(args: &[String]) {
     // signature per input (`HYBRID_SIG_BYTES`) plus a generous envelope; an
     // exact figure is what `--tx-bytes` is for.
     let n_inputs = inputs.len() as u64;
-    let default_bytes = 1_024 + n_inputs * (bloch_pos_committee::fee_market::HYBRID_SIG_BYTES
-        + pubkey.len() as u64
-        + 64);
+    let default_bytes = 1_024
+        + n_inputs * (bloch_pos_committee::fee_market::HYBRID_SIG_BYTES + pubkey.len() as u64 + 64);
     let mut tx = bloch_pos_committee::transition::PosTransaction::Transfer {
         inputs,
         outputs,
@@ -393,7 +405,10 @@ fn bloch_pos_node_net_send(addr: &str, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 fn arg_value(args: &[String], name: &str) -> Option<String> {
-    args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
+    args.iter()
+        .position(|a| a == name)
+        .and_then(|i| args.get(i + 1))
+        .cloned()
 }
 
 /// `keygen-public --dir <dir>` — one TSV row of a keystore's PUBLIC halves.
@@ -460,8 +475,10 @@ fn keygen(args: &[String]) {
                 "wrote {dir}/validator.key (devnet, throwaway): validator {index}, \
                  pubkey sha3 {}, randao commitment {}",
                 codec::hex8(&pkh),
-                codec::hex8(&bloch_pos_committee::beacon::RandaoChain::generate(ks.randao_seed)
-                    .commitment())
+                codec::hex8(
+                    &bloch_pos_committee::beacon::RandaoChain::generate(ks.randao_seed)
+                        .commitment()
+                )
             );
         }
         Err(e) => {
@@ -496,7 +513,9 @@ fn genesis_mainnet(args: &[String]) {
         eprintln!("genesis-mainnet: --out <file> is required");
         exit(2);
     };
-    let start_in: u64 = arg_value(args, "--start-in").and_then(|s| s.parse().ok()).unwrap_or(900);
+    let start_in: u64 = arg_value(args, "--start-in")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(900);
 
     let text = match std::fs::read_to_string(&cohort_path) {
         Ok(t) => t,
@@ -511,7 +530,10 @@ fn genesis_mainnet(args: &[String]) {
             eprintln!("genesis-mainnet: row {row}: {what} is not hex");
             exit(1);
         }
-        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
     };
 
     let mut validators = Vec::new();
@@ -521,7 +543,10 @@ fn genesis_mainnet(args: &[String]) {
         }
         let c: Vec<&str> = line.split('\t').collect();
         if c.len() < 6 {
-            eprintln!("genesis-mainnet: row {n}: expected 6 columns, found {}", c.len());
+            eprintln!(
+                "genesis-mainnet: row {n}: expected 6 columns, found {}",
+                c.len()
+            );
             exit(1);
         }
         // Every field is refused rather than defaulted. A validator set is the
@@ -531,7 +556,10 @@ fn genesis_mainnet(args: &[String]) {
             eprintln!("genesis-mainnet: row {n}: {what}");
             exit(1)
         };
-        let index: u32 = c[0].trim().parse().unwrap_or_else(|_| bad("index is not a number"));
+        let index: u32 = c[0]
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| bad("index is not a number"));
         let pubkey = hex(c[1].trim(), "pubkey", n);
         let randao = hex(c[2].trim(), "randao_commitment", n);
         if randao.len() != 32 {
@@ -545,7 +573,10 @@ fn genesis_mainnet(args: &[String]) {
         if wc.len() != 32 {
             bad("withdrawal_credentials is not 32 bytes");
         }
-        let commission_bps: u128 = c[5].trim().parse().unwrap_or_else(|_| bad("commission_bps is empty or not a number"));
+        let commission_bps: u128 = c[5]
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| bad("commission_bps is empty or not a number"));
 
         let mut rc = [0u8; 32];
         rc.copy_from_slice(&randao);
@@ -642,9 +673,12 @@ fn genesis_cmd(args: &[String]) {
         eprintln!("genesis: --out <file> is required");
         exit(2);
     };
-    let slot_ms: u64 =
-        arg_value(args, "--slot-ms").and_then(|s| s.parse().ok()).unwrap_or(SLOT_DURATION_SECS * 1000);
-    let start_in: u64 = arg_value(args, "--start-in").and_then(|s| s.parse().ok()).unwrap_or(5);
+    let slot_ms: u64 = arg_value(args, "--slot-ms")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(SLOT_DURATION_SECS * 1000);
+    let start_in: u64 = arg_value(args, "--start-in")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
 
     let mut validators = Vec::new();
     for (i, dir) in keys_csv.split(',').enumerate() {
@@ -742,7 +776,12 @@ fn run_cmd(args: &[String]) {
     }
     let csv = |name: &str| -> Vec<String> {
         arg_value(args, name)
-            .map(|s| s.split(',').filter(|p| !p.is_empty()).map(String::from).collect())
+            .map(|s| {
+                s.split(',')
+                    .filter(|p| !p.is_empty())
+                    .map(String::from)
+                    .collect()
+            })
             .unwrap_or_default()
     };
     let mut p2p_listen = csv("--p2p-listen");
@@ -782,7 +821,9 @@ fn run_cmd(args: &[String]) {
         peers: csv("--peers"),
         p2p_listen,
         p2p_peers: csv("--p2p-peer"),
-        max_peers: arg_value(args, "--max-peers").and_then(|s| s.parse().ok()).unwrap_or(64),
+        max_peers: arg_value(args, "--max-peers")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(64),
         behind_proxy: args.iter().any(|a| a == "--behind-proxy"),
         stop_at_slot,
         ws,
@@ -818,7 +859,10 @@ fn self_check() {
         ("DS_EXIT", DS_EXIT),
     ];
     for (i, (na, ta)) in tags.iter().enumerate() {
-        assert!(ta.starts_with(b"BLCH4:"), "{na}: domain tag outside the BLCH4 namespace");
+        assert!(
+            ta.starts_with(b"BLCH4:"),
+            "{na}: domain tag outside the BLCH4 namespace"
+        );
         for (nb, tb) in tags.iter().skip(i + 1) {
             assert_ne!(ta, tb, "domain tags {na} and {nb} collide");
         }
@@ -856,7 +900,10 @@ fn self_check() {
     // BLOCH-TOKENOMICS-V4 §3.3.1: cohort cap 100% → 33.33%, held after.
     assert_eq!(cohort_cap_bps(0), COHORT_CAP_START_BPS);
     assert_eq!(cohort_cap_bps(COHORT_TAPER_EPOCHS), COHORT_CAP_FLOOR_BPS);
-    assert_eq!(cohort_cap_bps(10 * COHORT_TAPER_EPOCHS), COHORT_CAP_FLOOR_BPS);
+    assert_eq!(
+        cohort_cap_bps(10 * COHORT_TAPER_EPOCHS),
+        COHORT_CAP_FLOOR_BPS
+    );
 
     // Migration design §5.1: the slot cadence everything descends from.
     assert_eq!(SLOT_DURATION_SECS, 30);

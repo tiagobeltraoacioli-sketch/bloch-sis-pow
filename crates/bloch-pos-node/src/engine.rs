@@ -69,12 +69,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bloch_pos_committee::attestation::{Attestation, AttestationData};
 use bloch_pos_committee::beacon::{mix_in, RandaoChain};
+use bloch_pos_committee::forkchoice::{BlockTree, LatestMessage, Store as FcStore};
+use bloch_pos_committee::gossip::{AttestationPool, GossipDecision};
 use bloch_pos_committee::header::{BlockEnvelope, BlockHeaderV4, BlockId, Body, VERSION_G4};
 use bloch_pos_committee::interfaces::{ProposalEnvelope, StateReader, StateTransition};
 use bloch_pos_committee::schedule::first_slot_of_epoch;
 use bloch_pos_committee::transition::{CommittedState, PosTransaction, Transition};
-use bloch_pos_committee::forkchoice::{BlockTree, LatestMessage, Store as FcStore};
-use bloch_pos_committee::gossip::{AttestationPool, GossipDecision};
 use bloch_pos_committee::{committees, derive, epoch_of, schedule};
 
 use crate::genesis::{Manifest, GENESIS_MIX};
@@ -144,7 +144,10 @@ pub struct Config {
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
 }
 
 const NO_TXS: [PosTransaction; 0] = [];
@@ -181,7 +184,18 @@ struct Engine {
     tr: Transition<HybridVerifier>,
     tr_probe: Transition<ProbeVerifier>,
     verifier: HybridVerifier,
-    keys: Keystore,
+    /// The validator this node signs as, or `None` in observer mode.
+    ///
+    /// An observer follows the chain, applies every block and serves the RPC,
+    /// and signs nothing. It exists so the public endpoint does not have to be
+    /// a validator: restarting whatever serves the RPC takes minutes — the
+    /// node reingests the carryover, pays the cold state-root cost and replays
+    /// the chain — and during that window the endpoint is simply down.
+    ///
+    /// The alternative, pointing the endpoint at a spare copy of a validator's
+    /// keystore, is how you equivocate and get slashed. There is no safe
+    /// version of that, so there is this.
+    keys: Option<Keystore>,
     /// Every structurally-valid block seen, canonical or not, by id.
     /// Unpruned — fine for a devnet, listed as a limitation.
     blocks: BTreeMap<[u8; 32], BlockEnvelope>,
@@ -238,11 +252,17 @@ impl Engine {
     // ── Derivations over the canonical chain ────────────────────────────────
 
     fn head_id(&self) -> BlockId {
-        self.chain.last().expect("chain contains at least genesis").1
+        self.chain
+            .last()
+            .expect("chain contains at least genesis")
+            .1
     }
 
     fn head_slot_now(&self) -> u64 {
-        self.chain.last().expect("chain contains at least genesis").0
+        self.chain
+            .last()
+            .expect("chain contains at least genesis")
+            .0
     }
 
     /// Clone of the canonical state with epoch accounting rolled forward to
@@ -254,7 +274,10 @@ impl Engine {
         // only apply_block advances it, and apply_block rolls exactly there.
         let mut cur = epoch_of(st.slot());
         while cur < epoch {
-            st = self.tr.process_epoch(&st).expect("process_epoch is infallible");
+            st = self
+                .tr
+                .process_epoch(&st)
+                .expect("process_epoch is infallible");
             cur += 1;
         }
         st
@@ -315,11 +338,15 @@ impl Engine {
     /// history, so a contradiction is fatal: it is following a chain that
     /// disagrees with the one thing it trusted.
     fn enforce_ws_anchor(&mut self) {
-        let Some((epoch, root)) = self.ws_anchor else { return };
+        let Some((epoch, root)) = self.ws_anchor else {
+            return;
+        };
         if self.ws_conflict_reported {
             return;
         }
-        let Some(local) = self.own_finalized_root_at(epoch) else { return };
+        let Some(local) = self.own_finalized_root_at(epoch) else {
+            return;
+        };
         use bloch_pos_committee::ws::{cross_check, WeakSubjectivityCheckpoint, WS_FORMAT_VERSION};
         // Only `epoch`/`block_root` are read by cross_check; the rest of the
         // artifact is not re-litigated here (it was verified at boot).
@@ -334,8 +361,10 @@ impl Engine {
             issued_at: 0,
             signer_set_id: 0,
         };
-        if let bloch_pos_committee::ws::CrossCheck::Conflict { local_root, published_root } =
-            cross_check(Some(local), &probe)
+        if let bloch_pos_committee::ws::CrossCheck::Conflict {
+            local_root,
+            published_root,
+        } = cross_check(Some(local), &probe)
         {
             self.ws_conflict_reported = true;
             eprintln!(
@@ -367,14 +396,22 @@ impl Engine {
     /// proposed). Regenerated from the seed on every use: a reorg can drop
     /// our own blocks, so an incrementally-advanced local chain would drift
     /// from what the committed state expects the next reveal to open.
+    ///
+    /// Only ever called from the proposing path, which an observer never
+    /// reaches — hence the expect rather than an Option return threaded
+    /// through a caller that cannot be in this state.
     fn randao_positioned(&self) -> RandaoChain {
+        let keys = self
+            .keys
+            .as_ref()
+            .expect("randao_positioned is proposer-only");
         let mine = self.chain.iter().skip(1).filter(|(_, id)| {
             self.blocks
                 .get(id.as_bytes())
-                .is_some_and(|e| e.header.proposer_index == self.keys.index)
+                .is_some_and(|e| e.header.proposer_index == keys.index)
         });
         let count = mine.count();
-        let mut chain = RandaoChain::generate(self.keys.randao_seed);
+        let mut chain = RandaoChain::generate(keys.randao_seed);
         for _ in 0..count {
             chain.next_reveal();
         }
@@ -384,6 +421,11 @@ impl Engine {
     // ── Duties ──────────────────────────────────────────────────────────────
 
     fn attest(&mut self, slot: u64) {
+        // An observer holds no key and therefore has no duty.
+        let Some(keys) = self.keys.as_ref() else {
+            return;
+        };
+        let index = keys.index;
         let e = epoch_of(slot);
         if e == 0 {
             // Epoch 0's checkpoint is genesis — justified by definition;
@@ -394,7 +436,7 @@ impl Engine {
         let roster = rolled.active_validators();
         let seed = Self::seed_for(&rolled, e);
         let committee = committees::committee_for_slot(&seed, slot, &roster);
-        if committee.binary_search(&self.keys.index).is_err() {
+        if committee.binary_search(&index).is_err() {
             return;
         }
         let fin = rolled.finality();
@@ -406,9 +448,18 @@ impl Engine {
             target_epoch: e,
             target_root: self.checkpoint_root(e),
         };
-        let signature = self.keys.sign(&data.signing_root());
-        let att = Attestation { data, validator: self.keys.index, signature };
-        self.pool.insert((att.validator, att.data.signing_root()), att.clone());
+        let signature = self
+            .keys
+            .as_ref()
+            .expect("checked above")
+            .sign(&data.signing_root());
+        let att = Attestation {
+            data,
+            validator: index,
+            signature,
+        };
+        self.pool
+            .insert((att.validator, att.data.signing_root()), att.clone());
         self.net.broadcast(net::att_frame(&att));
         println!(
             "[slot {slot}] attested (epoch {e}, head {}, target {})",
@@ -418,11 +469,15 @@ impl Engine {
     }
 
     fn propose(&mut self, slot: u64) {
+        let Some(keys) = self.keys.as_ref() else {
+            return;
+        };
+        let index = keys.index;
         let e = epoch_of(slot);
         let rolled = self.rolled_to(e);
         let roster = rolled.active_validators();
         let seed = Self::seed_for(&rolled, e);
-        if schedule::proposer(&seed, slot, &roster) != Some(self.keys.index) {
+        if schedule::proposer(&seed, slot, &roster) != Some(index) {
             return;
         }
 
@@ -446,7 +501,9 @@ impl Engine {
 
         let randao = self.randao_positioned();
         let Some(reveal) = randao.peek_reveal() else {
-            eprintln!("[slot {slot}] RANDAO chain spent — cannot propose (re-commit path not wired)");
+            eprintln!(
+                "[slot {slot}] RANDAO chain spent — cannot propose (re-commit path not wired)"
+            );
             return;
         };
         let fin = rolled.finality();
@@ -456,7 +513,7 @@ impl Engine {
             state_root: [0u8; 32],
             body_root: derive::body_root(&[]),
             slot,
-            proposer_index: self.keys.index,
+            proposer_index: index,
             randao_reveal: reveal,
             randao_mix: mix_in(&rolled.randao_mix(), &reveal),
             justified_root: fin.justified.root,
@@ -500,11 +557,16 @@ impl Engine {
         // always computes.
         let mut txs = self.select_transactions();
         let (post, tx_bytes) = loop {
-            let tx_bytes: Vec<Vec<u8>> =
-                txs.iter().map(PosTransaction::canonical_bytes).collect();
+            let tx_bytes: Vec<Vec<u8>> = txs.iter().map(PosTransaction::canonical_bytes).collect();
             header.body_root = derive::body_root(&tx_bytes);
-            let probe = ProposalEnvelope { header: header.clone(), proposer_sig: Vec::new() };
-            match self.tr_probe.compute_post_state(&self.state, &probe, &atts, &txs) {
+            let probe = ProposalEnvelope {
+                header: header.clone(),
+                proposer_sig: Vec::new(),
+            };
+            match self
+                .tr_probe
+                .compute_post_state(&self.state, &probe, &atts, &txs)
+            {
                 Ok(p) => break (p, tx_bytes),
                 Err(err) => {
                     let Some(bad) = txs.pop() else {
@@ -525,11 +587,18 @@ impl Engine {
         };
         header.state_root = post.state_root();
 
-        let proposer_sig = self.keys.sign(&header.proposal_signing_root());
+        let proposer_sig = self
+            .keys
+            .as_ref()
+            .expect("checked above")
+            .sign(&header.proposal_signing_root());
         let env = BlockEnvelope {
             header,
             proposer_sig,
-            body: Body { transactions: tx_bytes, attestations: atts },
+            body: Body {
+                transactions: tx_bytes,
+                attestations: atts,
+            },
         };
         let id = env.block_id();
         println!(
@@ -547,7 +616,11 @@ impl Engine {
             id,
             "own produced block was not adopted by own transition (h28080 class)"
         );
-        let env = self.blocks.get(id.as_bytes()).expect("just ingested").clone();
+        let env = self
+            .blocks
+            .get(id.as_bytes())
+            .expect("just ingested")
+            .clone();
         self.net.broadcast(net::block_frame(&env));
     }
 
@@ -566,7 +639,10 @@ impl Engine {
         if env.header.attestation_root != derive::attestation_root(&env.body.attestations)
             || env.header.body_root != derive::body_root(&env.body.transactions)
         {
-            eprintln!("reject {}: body/attestation commitment mismatch", crate::codec::hex8(&id));
+            eprintln!(
+                "reject {}: body/attestation commitment mismatch",
+                crate::codec::hex8(&id)
+            );
             return;
         }
         // A block carrying transactions used to be rejected here, because the
@@ -589,7 +665,6 @@ impl Engine {
         // fork choice, and it should see the chain the block already moved.
         self.release_held(id);
     }
-
 
     // ── Fork choice: LMD-GHOST ──────────────────────────────────────────────
 
@@ -759,8 +834,10 @@ impl Engine {
     /// Apply one block that extends the current head. True on success.
     fn apply_canonical(&mut self, env: &BlockEnvelope) -> bool {
         let id = env.block_id();
-        let envelope =
-            ProposalEnvelope { header: env.header.clone(), proposer_sig: env.proposer_sig.clone() };
+        let envelope = ProposalEnvelope {
+            header: env.header.clone(),
+            proposer_sig: env.proposer_sig.clone(),
+        };
         let before = self.state.finality();
         let txs = match body_transactions(env) {
             Ok(t) => t,
@@ -769,7 +846,10 @@ impl Engine {
                 return false;
             }
         };
-        match self.tr.apply_block(&self.state, &envelope, &env.body.attestations, &txs) {
+        match self
+            .tr
+            .apply_block(&self.state, &envelope, &env.body.attestations, &txs)
+        {
             Ok(post) => {
                 self.state = post;
                 self.canonical.insert(*id.as_bytes());
@@ -845,7 +925,12 @@ impl Engine {
             .expect("ancestor is canonical");
         let prefix: Vec<BlockEnvelope> = self.chain[1..=cut]
             .iter()
-            .map(|(_, id)| self.blocks.get(id.as_bytes()).expect("canonical block stored").clone())
+            .map(|(_, id)| {
+                self.blocks
+                    .get(id.as_bytes())
+                    .expect("canonical block stored")
+                    .clone()
+            })
             .collect();
 
         let mut st = self.manifest.genesis_state();
@@ -873,7 +958,10 @@ impl Engine {
                     return false;
                 }
             };
-            match self.tr.apply_block(&st, &envelope, &env.body.attestations, &txs) {
+            match self
+                .tr
+                .apply_block(&st, &envelope, &env.body.attestations, &txs)
+            {
                 Ok(post) => st = post,
                 Err(err) => {
                     eprintln!(
@@ -899,7 +987,8 @@ impl Engine {
             self.chain.push((env.header.slot, id));
         }
         self.canonical = canonical;
-        self.head_slot.store(self.head_slot_now(), Ordering::Relaxed);
+        self.head_slot
+            .store(self.head_slot_now(), Ordering::Relaxed);
         self.last_applied_ms = now_ms();
         let cur_e = epoch_of(self.state.slot());
         self.pool.retain(|_, a| epoch_of(a.data.slot) >= cur_e);
@@ -973,7 +1062,8 @@ impl Engine {
         // synthesized and never stored as an envelope; `blocks` holds every
         // structurally-valid block seen, canonical or not. A vote for a block
         // on a losing branch is still a vote we can verify.
-        let known = |root: &[u8; 32]| self.canonical.contains(root) || self.blocks.contains_key(root);
+        let known =
+            |root: &[u8; 32]| self.canonical.contains(root) || self.blocks.contains_key(root);
         pool.process(att, self.wall_slot, &committees_at, &known, &self.verifier)
     }
 
@@ -991,7 +1081,8 @@ impl Engine {
                         ev.second.validator, ev.second.data.slot,
                     );
                 }
-                self.pool.insert((att.validator, att.data.signing_root()), att);
+                self.pool
+                    .insert((att.validator, att.data.signing_root()), att);
                 self.net.report(origin, Verdict::Accept);
             }
             GossipDecision::Ignore(_) => self.net.report(origin, Verdict::Ignore),
@@ -1002,10 +1093,7 @@ impl Engine {
                 self.net.report(origin, Verdict::Ignore);
             }
             GossipDecision::Reject(reason) => {
-                eprintln!(
-                    "attestation from v{} REJECTED: {reason:?}",
-                    att.validator
-                );
+                eprintln!("attestation from v{} REJECTED: {reason:?}", att.validator);
                 self.net.report(origin, Verdict::Reject);
             }
         }
@@ -1028,15 +1116,21 @@ impl Engine {
             let roster = rolled.active_validators();
             let seed = Self::seed_for(&rolled, rolled_epoch);
             let committees_at = |slot: u64| committees::committee_for_slot(&seed, slot, &roster);
-            let known =
-                |r: &[u8; 32]| self.canonical.contains(r) || self.blocks.contains_key(r);
-            pool.on_block(&root, self.wall_slot, &committees_at, &known, &self.verifier)
+            let known = |r: &[u8; 32]| self.canonical.contains(r) || self.blocks.contains_key(r);
+            pool.on_block(
+                &root,
+                self.wall_slot,
+                &committees_at,
+                &known,
+                &self.verifier,
+            )
         };
         self.att_pool = pool;
         for (att, decision) in released {
             if let GossipDecision::Accept { .. } = decision {
                 let frame = net::att_frame(&att);
-                self.pool.insert((att.validator, att.data.signing_root()), att);
+                self.pool
+                    .insert((att.validator, att.data.signing_root()), att);
                 if self.live {
                     // Relay now: it was held, so nobody downstream got it from
                     // us. A duplicate publish is refused locally and costs
@@ -1077,12 +1171,18 @@ impl Engine {
     /// Canonical height of a block id — its position on the canonical chain,
     /// genesis at 0. `None` for a block this node has stored but not adopted.
     fn height_of(&self, id: &[u8; 32]) -> Option<u64> {
-        self.chain.iter().position(|(_, cid)| cid.as_bytes() == id).map(|p| p as u64)
+        self.chain
+            .iter()
+            .position(|(_, cid)| cid.as_bytes() == id)
+            .map(|p| p as u64)
     }
 
     /// Slot of a canonical block named by root, if this node has it canonical.
     fn slot_of_canonical_root(&self, root: &[u8; 32]) -> Option<u64> {
-        self.chain.iter().find(|(_, id)| id.as_bytes() == root).map(|(s, _)| *s)
+        self.chain
+            .iter()
+            .find(|(_, id)| id.as_bytes() == root)
+            .map(|(s, _)| *s)
     }
 
     /// Where a block stands against this node's own checkpoints.
@@ -1097,9 +1197,15 @@ impl Engine {
             return Finality::NotCanonical;
         }
         let fin = self.state.finality();
-        if self.slot_of_canonical_root(&fin.finalized.root).is_some_and(|s| slot <= s) {
+        if self
+            .slot_of_canonical_root(&fin.finalized.root)
+            .is_some_and(|s| slot <= s)
+        {
             Finality::Finalized
-        } else if self.slot_of_canonical_root(&fin.justified.root).is_some_and(|s| slot <= s) {
+        } else if self
+            .slot_of_canonical_root(&fin.justified.root)
+            .is_some_and(|s| slot <= s)
+        {
             Finality::Justified
         } else {
             Finality::Canonical
@@ -1124,7 +1230,10 @@ impl Engine {
         BlockEnvelope {
             header: self.manifest.genesis_header(),
             proposer_sig: Vec::new(),
-            body: Body { transactions: Vec::new(), attestations: Vec::new() },
+            body: Body {
+                transactions: Vec::new(),
+                attestations: Vec::new(),
+            },
         }
     }
 
@@ -1199,7 +1308,10 @@ impl Engine {
                 let env = self.envelope_by_id(&id).ok_or_else(|| {
                     RpcError::new(
                         rpc::BLOCK_NOT_FOUND,
-                        format!("no block {} is known to this node", crate::codec::hex32(&id)),
+                        format!(
+                            "no block {} is known to this node",
+                            crate::codec::hex32(&id)
+                        ),
                     )
                 })?;
                 Ok(self.block_reply(&env))
@@ -1221,12 +1333,19 @@ impl Engine {
                     .iter()
                     .find(|v| v.index == index)
                     .map(|v| v.effective_stake);
-                Ok(rpc::validator_json(&rec, effective, epoch_of(self.state.slot())))
+                Ok(rpc::validator_json(
+                    &rec,
+                    effective,
+                    epoch_of(self.state.slot()),
+                ))
             }
 
             RpcRequest::ValidatorCount => Ok(Json::obj(vec![
                 ("total", Json::u(self.state.validator_count() as u64)),
-                ("active", Json::u(self.state.active_validators().len() as u64)),
+                (
+                    "active",
+                    Json::u(self.state.active_validators().len() as u64),
+                ),
                 (
                     "total_active_stake_sat",
                     Json::sat(self.state.total_active_stake_sat()),
@@ -1243,8 +1362,10 @@ impl Engine {
                 Ok(outcome) => Ok(rpc::submitted_json(&tx, outcome)),
                 Err(why) => Err(RpcError::new(
                     rpc::MEMPOOL_FULL,
-                    format!("{why} ({MEMPOOL_MAX} entries); retry later — the \
-                             transaction was not judged invalid"),
+                    format!(
+                        "{why} ({MEMPOOL_MAX} entries); retry later — the \
+                             transaction was not judged invalid"
+                    ),
                 )),
             },
 
@@ -1303,34 +1424,54 @@ pub fn run(cfg: Config) -> io::Result<()> {
         (None, None) => {}
     }
 
-    let keys = Keystore::load(&cfg.data_dir)?;
+    // No keystore in the data dir is not a misconfiguration — it selects
+    // observer mode. Any other read error still is, and is reported: a node
+    // that silently downgraded to observer because its key was unreadable
+    // would stop attesting and look healthy doing it.
+    let keys = match Keystore::load(&cfg.data_dir) {
+        Ok(k) => Some(k),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            println!(
+                "observer mode: no keystore in {}. This node follows the chain, applies \
+                 every block and serves the RPC. It does not propose and does not attest.",
+                cfg.data_dir.display()
+            );
+            None
+        }
+        Err(e) => return Err(e),
+    };
     let verifier = HybridVerifier::new(manifest.pubkeys());
 
     // Identity sanity: the keystore must be the validator the manifest says.
-    match manifest.validators.iter().find(|v| v.index == keys.index) {
-        Some(v) if v.pubkey == keys.pubkey => {}
-        _ => {
+    if let Some(keys) = keys.as_ref() {
+        match manifest.validators.iter().find(|v| v.index == keys.index) {
+            Some(v) if v.pubkey == keys.pubkey => {}
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "keystore does not match the genesis manifest's validator set",
+                ))
+            }
+        }
+        if RandaoChain::generate(keys.randao_seed).commitment()
+            != manifest.validators[keys.index as usize].randao_commitment
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "keystore does not match the genesis manifest's validator set",
-            ))
+                "local RANDAO chain does not open the manifest's committed head",
+            ));
         }
-    }
-    if RandaoChain::generate(keys.randao_seed).commitment()
-        != manifest.validators[keys.index as usize].randao_commitment
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "local RANDAO chain does not open the manifest's committed head",
-        ));
     }
 
     let store = Store::open(&cfg.data_dir, &digest)?;
     let genesis_state = manifest.genesis_state();
     let genesis_id = manifest.genesis_id();
     println!(
-        "bloch-pos devnet node — validator {}, genesis {} (state root {}), network digest {}",
-        keys.index,
+        "bloch-pos node — {}, genesis {} (state root {}), network digest {}",
+        match keys.as_ref() {
+            Some(k) => format!("validator {}", k.index),
+            None => "observer (no keystore, signs nothing)".to_string(),
+        },
         crate::codec::hex8(genesis_id.as_bytes()),
         crate::codec::hex8(&genesis_state.state_root()),
         crate::codec::hex8(&digest),
@@ -1440,7 +1581,9 @@ pub fn run(cfg: Config) -> io::Result<()> {
             engine.state.finality().finalized.epoch,
         );
     }
-    engine.head_slot.store(engine.state.slot(), Ordering::Relaxed);
+    engine
+        .head_slot
+        .store(engine.state.slot(), Ordering::Relaxed);
 
     // ── Weak subjectivity: may the node sync at all? (§4.2) ──
     //
@@ -1611,10 +1754,12 @@ pub fn run(cfg: Config) -> io::Result<()> {
 
         // Sync when behind or when a stored branch has holes. Rate-limited;
         // idempotent on the receiving side (dedup discards repeats).
-        let behind =
-            engine.state.slot() + 1 < slot && now.saturating_sub(engine.last_applied_ms) > 2 * slot_ms;
+        let behind = engine.state.slot() + 1 < slot
+            && now.saturating_sub(engine.last_applied_ms) > 2 * slot_ms;
         if (behind || engine.needs_sync) && now.saturating_sub(last_sync_req) > 2 * slot_ms {
-            engine.net.broadcast(net::get_blocks_frame(engine.state.slot()));
+            engine
+                .net
+                .broadcast(net::get_blocks_frame(engine.state.slot()));
             engine.needs_sync = false;
             last_sync_req = now;
         }
@@ -1653,7 +1798,10 @@ pub fn run(cfg: Config) -> io::Result<()> {
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "network channel closed"));
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "network channel closed",
+                ));
             }
         }
     }
@@ -1693,19 +1841,30 @@ pub fn lmd_ghost_head<'a>(
     }
     for env in blocks.values() {
         for att in &env.body.attestations {
-            fc.observe(att.validator, LatestMessage { slot: att.data.slot, root: att.data.head });
+            fc.observe(
+                att.validator,
+                LatestMessage {
+                    slot: att.data.slot,
+                    root: att.data.head,
+                },
+            );
         }
     }
     // Attestations seen on the wire but not yet in any block count too: that is
     // what makes the head responsive within a slot instead of one block behind.
     for att in pool {
-        fc.observe(att.validator, LatestMessage { slot: att.data.slot, root: att.data.head });
+        fc.observe(
+            att.validator,
+            LatestMessage {
+                slot: att.data.slot,
+                root: att.data.head,
+            },
+        );
     }
 
     let tree = BlockTree { parents: &parents };
     fc.head(&tree, justified, &children)
 }
-
 
 /// Whether the mempool will hold `tx` at all.
 ///
@@ -1750,7 +1909,9 @@ pub(crate) fn admissible(tx: &PosTransaction) -> Result<(), &'static str> {
         // every proposer that selected it failed to produce, and the chain
         // stopped at slot 69 with every node up and still attesting. Cost of
         // the attack: one unauthenticated request.
-        PosTransaction::Transfer { inputs, outputs, .. } => {
+        PosTransaction::Transfer {
+            inputs, outputs, ..
+        } => {
             if inputs.is_empty() {
                 return Err("transfer has no inputs — it spends nothing and cannot apply");
             }
@@ -1815,7 +1976,10 @@ mod forkchoice_tests {
                 BlockEnvelope {
                     header: h,
                     proposer_sig: Vec::new(),
-                    body: Body { transactions: Vec::new(), attestations: atts },
+                    body: Body {
+                        transactions: Vec::new(),
+                        attestations: atts,
+                    },
                 },
             );
             ids.push(id);
@@ -1824,7 +1988,12 @@ mod forkchoice_tests {
     }
 
     fn vals(n: u32) -> Vec<Validator> {
-        (0..n).map(|index| Validator { index, effective_stake: 100 }).collect()
+        (0..n)
+            .map(|index| Validator {
+                index,
+                effective_stake: 100,
+            })
+            .collect()
     }
 
     /// **The reason this fork choice was changed.** A branch three blocks long
@@ -1850,11 +2019,21 @@ mod forkchoice_tests {
             commission_bps: 0,
         };
         let err = admissible(&deposit).expect_err("a deposit must not be admitted");
-        assert!(err.contains("not yet funded"), "the refusal must say why: {err}");
+        assert!(
+            err.contains("not yet funded"),
+            "the refusal must say why: {err}"
+        );
 
-        let delegate =
-            PosTransaction::Delegate { delegator: 0, validator: 0, amount_sat: 1, eligible: true };
-        assert!(admissible(&delegate).is_err(), "a delegation must not be admitted either");
+        let delegate = PosTransaction::Delegate {
+            delegator: 0,
+            validator: 0,
+            amount_sat: 1,
+            eligible: true,
+        };
+        assert!(
+            admissible(&delegate).is_err(),
+            "a delegation must not be admitted either"
+        );
     }
 
     /// The transfer guard that already existed, pinned so the refactor into a
@@ -1864,11 +2043,17 @@ mod forkchoice_tests {
     fn a_transfer_that_spends_nothing_is_refused() {
         let empty = PosTransaction::Transfer {
             inputs: vec![],
-            outputs: vec![bloch_pos_committee::transition::TransferOutput { value: 1, script_hash: [0u8; 32] }],
+            outputs: vec![bloch_pos_committee::transition::TransferOutput {
+                value: 1,
+                script_hash: [0u8; 32],
+            }],
             tx_bytes: 0,
             tip_millisat_per_gas: 0,
         };
-        assert!(admissible(&empty).is_err(), "a transfer with no inputs must not be admitted");
+        assert!(
+            admissible(&empty).is_err(),
+            "a transfer with no inputs must not be admitted"
+        );
     }
 
     #[test]
@@ -1877,9 +2062,7 @@ mod forkchoice_tests {
 
         // Long branch: three blocks, one attester on the tip.
         // Short branch: one block, three attesters.
-        let (mut blocks, long_ids) = chain_of(vec![
-            (g, 1, 1, vec![]),
-        ]);
+        let (mut blocks, long_ids) = chain_of(vec![(g, 1, 1, vec![])]);
         let a1 = long_ids[0];
         let (more, a_rest) = chain_of(vec![(a1, 2, 2, vec![])]);
         blocks.extend(more);
@@ -1916,7 +2099,10 @@ mod forkchoice_tests {
             attest(2, 3, a3),
             attest(3, 1, b1),
         ];
-        assert_eq!(lmd_ghost_head(&blocks, pool_flipped.iter(), &validators, g), a3);
+        assert_eq!(
+            lmd_ghost_head(&blocks, pool_flipped.iter(), &validators, g),
+            a3
+        );
     }
 
     /// The head is a function of the message *set*. Feeding the same
@@ -1976,6 +2162,9 @@ mod forkchoice_tests {
         // Validator 1 signs both heads in the same slot; validator 0 backs a1.
         let pool = vec![attest(0, 1, a1), attest(1, 1, a1), attest(1, 1, b1)];
         let head = lmd_ghost_head(&blocks, pool.iter(), &validators, g);
-        assert_eq!(head, a1, "the equivocator was counted, or the honest vote was dropped");
+        assert_eq!(
+            head, a1,
+            "the equivocator was counted, or the honest vote was dropped"
+        );
     }
 }
