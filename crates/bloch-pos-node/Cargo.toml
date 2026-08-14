@@ -10,10 +10,10 @@
 
 [package]
 name = "bloch-pos-node"
-version = "0.0.2-devnet"
+version = "0.1.0-mainnet"
 edition = "2021"
 license = "AGPL-3.0-or-later"
-description = "Bloch Genesis-4 Proof-of-Stake node. M1/M2 devnet stage: real processes producing, attesting, justifying and finalizing over a local TCP mesh, with append-only block-log persistence and replay-on-restart. Not mainnet-ready — see docs/specs/BLOCH-POS-NODE-INTEGRATION.md."
+description = "Bloch Genesis-4 Proof-of-Stake node. Runs the live proof-of-stake mainnet, producing, attesting, justifying and finalizing over a local TCP mesh, with append-only block-log persistence and replay-on-restart. Not mainnet-ready — see docs/specs/BLOCH-POS-NODE-INTEGRATION.md."
 publish = false
 
 # Standalone: NOT a member of the node workspace. The Genesis-3 node must not

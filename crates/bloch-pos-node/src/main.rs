@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! # bloch-pos — the Genesis-4 node binary (devnet stage, M1/M2)
+//! # bloch-pos — the Genesis-4 node binary
+//!
+//! This binary runs the live proof-of-stake mainnet. It called itself a
+//! devnet-stage build until 2026-08-14 — which was true when written and
+//! false the moment Genesis-4 launched, and it was the first line anyone
+//! evaluating the software read.
 //!
 //! From the skeleton this grew into a node that actually runs: a devnet of N
 //! validator processes produces blocks, attests, justifies and finalizes over
@@ -106,7 +111,7 @@ fn main() {
 
 fn print_help() {
     println!(
-        "{NAME} {VERSION} — Bloch Genesis-4 Proof-of-Stake node (devnet stage)\n\
+        "{NAME} {VERSION} — Bloch Genesis-4 Proof-of-Stake node\n\
          \n\
          USAGE:\n\
            bloch-pos selfcheck\n\
