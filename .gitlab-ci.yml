@@ -1,4 +1,10 @@
-# Bloch-SIS Protocol — GitLab CI
+# Bloch Protocol — GitLab CI
+#
+# The chain this pipeline gates is GENESIS-4, PROOF OF STAKE, live since
+# 2026-08-13. Genesis-3 (proof of work) stopped at height 39,918 and its node
+# is at legacy/genesis3-node/; jobs that still exercise it are marked, and they
+# are there for the audit trail of Genesis-4's opening ledger, not because
+# anything mines.
 #
 # Runs on a self-hosted shell runner (tag: bloch-mac) using the host's Rust
 # toolchain + clang/cmake (rocksdb bindgen, blst, pqcrypto/PQClean build needs
@@ -45,20 +51,38 @@ clippy:
 # Hardened Clippy — BLOCKING, scoped to CONSENSUS-CRITICAL code only.
 # Denies panics (unwrap/expect) and unchecked arithmetic in consensus, emission
 # and tokenomics paths — a panic reachable from an untrusted block/tx is a DoS,
-# and an arithmetic overflow in emission is an inflation bug. See
-# scripts/hardened-clippy.sh for the exact scope + why --no-deps is required.
+# and an arithmetic overflow in emission is an inflation bug.
+#
+# CHANGED 2026-08-13, twice over. Its scope was Genesis-3 only — it had never
+# linted bloch-pos-committee, the consensus that is actually producing blocks.
+# Adding the live crates also revealed that the job could not have been green
+# on the retired ones either (59 findings in `bloch`, 22 in `bloch-crypto`), so
+# it was a blocking gate that blocked nothing because it always failed. It is
+# now a per-crate RATCHET: recorded baselines, and the build fails when a count
+# goes up. See scripts/hardened-clippy.sh for the baselines, why they are not
+# zero, and why --no-deps is required.
 clippy-hardened:
   stage: check
   script:
     - rustup component add clippy || true
     - bash scripts/hardened-clippy.sh
 
-# Property-based consensus invariants — determinism / parent-order independence
-# of GhostDAG colouring, emission monotonicity + value conservation, founder
-# vesting cap. Part of the workspace test run, called out here for visibility.
-consensus-proptest:
+# Consensus invariants, called out from the workspace run for visibility.
+#
+# The LIVE chain first: the whole Genesis-4 consensus crate and the node that
+# runs it. This job used to name only GhostDAG colouring and V2 emission — the
+# invariants of a chain that has stopped — which meant the pipeline had no job
+# whose name pointed at the consensus that is actually producing blocks.
+consensus-tests:
   stage: test
   script:
+    # Genesis-4 — LIVE.
+    - cargo test -p bloch-pos-committee
+    - cargo test -p bloch-pos-node
+    # Genesis-3 — closed. Property-based determinism / parent-order
+    # independence of GhostDAG colouring, and V2 emission monotonicity + value
+    # conservation. Retained because Genesis-4's opening ledger is the output
+    # of these rules.
     - cargo test -p bloch ghostdag_proptest
     - cargo test -p bloch-crypto --lib tokenomics
 
@@ -259,7 +283,10 @@ mobile-core:
     - cd mobile/core && cargo test --lib
   allow_failure: true   # informational until verified on the new Linux runner
 
-# PoW parameter screen (pure Python, no Sage) — trivial-regime + feasibility.
+# GENESIS-3 ARCHIVE. PoW parameter screen (pure Python, no Sage) — trivial-regime
+# + feasibility for the Module-SIS lattice PoW. Nothing on the live chain does
+# proof of work; this screens a retired chain's parameters and is kept as part
+# of its record.
 pow-screen:
   stage: check
   before_script: []
@@ -267,9 +294,9 @@ pow-screen:
     - python3 deploy/pow-estimator/screen.py
   allow_failure: true
 
-# PoW hardness estimate (S1) — manual, heavy: builds the SageMath +
-# lattice-estimator container and prints the parameter hardness table.
-# See legacy/specs/POW-HARDNESS.md + deploy/pow-estimator/.
+# GENESIS-3 ARCHIVE. PoW hardness estimate (S1) — manual, heavy: builds the
+# SageMath + lattice-estimator container and prints the parameter hardness
+# table. See legacy/specs/POW-HARDNESS.md + deploy/pow-estimator/.
 pow-estimator:
   stage: check
   before_script: []

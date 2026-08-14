@@ -1,28 +1,41 @@
 # Security Policy
 
-> **Genesis-3-era document — sealed 2026-08-12.** Bloch's proof-of-work
-> chain halts by consensus rule at the terminal height (50,000) and
-> Genesis-4 relaunches as proof of stake; the ownerless thesis was
-> retracted (`docs/adr/ADR-036-retract-ownerless-adopt-foundation.md`).
->
-> The reporting flow, disclosure timeline and development practices below are
-> current and unaffected. The **Status** section and the PoW/AuxPoW/difficulty
-> entries in scope describe the chain only for the blocks it has left.
+> **Updated 2026-08-13, the day the chain changed underneath this file.** The
+> reporting flow, disclosure timeline and development practices below are
+> current and were never era-specific. The **Status** section has been
+> rewritten: it described Genesis-3 proof-of-work as the live network, and
+> that stopped being true at 21:31:19 UTC on 2026-08-13.
 
 ## Status
 
-The live network is the **Genesis-3 mainnet** (chain-id `0xB10C_0004`, launched
-2026-07-29): standard **SHA-256d proof-of-work** (double SHA-256,
-Bitcoin-compatible, little-endian target compare from height 0), mined by real
-ASICs, with **Bitcoin merged mining (AuxPoW) active since height 8,500**.
-(Earlier versions of this policy described the retired Module-SIS/testnet
-chains; that regime no longer exists on the live network.) The network is
-**unaudited**, nascent, low-hashrate, and **51%-attackable** — running a live
-mainnet is a designation, not a security claim, and no security property is
-claimed. **No external security audit has been contracted to date**; if any
-other page or document suggests otherwise, this statement is the accurate
-one. The posture we are building toward — and its open gates — is in
-[`docs/THREAT-MODEL.md`](./docs/THREAT-MODEL.md) and [`ROADMAP.md`](./ROADMAP.md).
+The live network is **Genesis-4**, and it is **proof of stake**. It started at
+**2026-08-13 21:31:19 UTC** on 64 genesis validators across five servers,
+produces a block every 30 s, and finalises every epoch. Block version
+`0xB10C_0005`. Fork choice is LMD-GHOST, finality is Casper-style FFG over an
+epoch committee, and signatures on every consensus path are hybrid
+**ML-DSA-65 ‖ Falcon-1024** — no BLS anywhere. The code that runs it is
+`crates/bloch-pos-committee` (consensus) and `crates/bloch-pos-node` (the
+`bloch-pos` binary).
+
+**Genesis-3, the proof-of-work chain, is closed.** It ran from 2026-07-29 and
+stopped at height **39,918**; SHA-256d, ASIC-mined, with Bitcoin merged mining
+(AuxPoW) from height 8,500. Nothing produces blocks on it. Its node is kept
+buildable at `legacy/genesis3-node/` because Genesis-4's opening ledger is the
+balance set carried across from that height, and an auditor has to be able to
+re-derive it. Report a Genesis-3 finding if it changes what that carried
+ledger should have been; a finding that only affects mining or block
+production on a chain nobody is producing on has no live impact.
+
+The live network is **unaudited**, and stake is heavily concentrated: the
+founder holds roughly 94% of the carried-over balance and it is stakeable, so
+a naive Nakamoto coefficient is 1. The genesis validator cohort was allocated
+by the founder and sits on five servers. Running a live mainnet is a
+designation, not a security claim, and no security property is claimed.
+**No external security audit has been contracted to date**; if any other page
+or document suggests otherwise, this statement is the accurate one. The
+posture we are building toward — and its open gates — is in
+[`docs/THREAT-MODEL.md`](./docs/THREAT-MODEL.md) and [`ROADMAP.md`](./ROADMAP.md);
+both of those are Genesis-3-era documents and say so at the top.
 
 ## Reporting a vulnerability
 
@@ -44,9 +57,19 @@ will not pursue reporters acting in good faith.
 
 ## In scope
 
-- Consensus (GhostDAG, reorg), the SHA-256d PoW and AuxPoW (merged-mining)
-  verification, difficulty retargeting, hybrid Falcon‖ML-DSA signatures,
-  serialization/deserialization.
+- **Genesis-4 consensus** (`crates/bloch-pos-committee`): the state transition,
+  LMD-GHOST fork choice, FFG justification and finality, the epoch committee
+  and proposer schedule, the RANDAO beacon, staking (deposit, exit, withdrawal)
+  and slashing, the state root, and the tokenomics-V4 emission and supply cap.
+- The Genesis-4 node (`crates/bloch-pos-node`): block and attestation
+  handling, the P2P and RPC surfaces, keystore handling, and cold start.
+- Hybrid Falcon ‖ ML-DSA signatures and serialization/deserialization on any
+  consensus path.
+- **Genesis-3** (`legacy/genesis3-node/`, `crates/bloch-crypto`,
+  `crates/bloch-euvm`) only where a finding changes the carried-over ledger
+  Genesis-4 opened from — the balance set at height 39,918. GhostDAG ordering,
+  SHA-256d and AuxPoW verification, difficulty retargeting and reorg on a
+  chain that has stopped producing are historical, not live.
 - The Coherence privacy layer (shielded pool, spend proofs) and network-layer
   metadata privacy (Dandelion++).
 - Node, wallet, keystore, RPC, and the attestation layer (L1–L3).
@@ -56,10 +79,15 @@ will not pursue reporters acting in good faith.
 
 ## Out of scope
 
-- The **known** low-hashrate exposure — the network being 51%-attackable with
-  modest rented SHA-256d hashrate is a documented, disclosed gap, not a bug
-  (a concrete exploit beyond it — e.g. accepting blocks below target, or
-  forging AuxPoW commitments without the work — is in scope).
+- The **known** stake-concentration exposure — the founder holding roughly 94%
+  of a stakeable supply, and having allocated the genesis validator cohort, is
+  a documented, disclosed gap, not a bug (a concrete exploit beyond it — e.g.
+  a way to justify or finalise without an honest two-thirds, or to attest
+  without being in the committee — is in scope).
+- The retired Genesis-3 chain's low-hashrate exposure. It was real while the
+  chain was live and it is now moot: nothing mines it, and the canonical
+  artifact is the signed snapshot at height 39,918, not a chain anyone is
+  defending.
 - Gaps already documented as unaudited / claim-gated in the threat model (the
   documented gap is not a new finding — but a concrete exploit of it is).
 - Denial of service requiring implausible resources; issues only in third-party

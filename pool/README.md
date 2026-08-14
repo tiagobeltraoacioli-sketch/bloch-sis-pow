@@ -1,5 +1,12 @@
 # bloch-pool — reference mining pool for Bloch-SIS-PoW
 
+> **Genesis-3-era component. There is nothing to mine.** This pool serves the
+> proof-of-work chain, which stopped at height 39,918 on 2026-08-13. The live
+> chain is **Genesis-4, proof of stake**: blocks come from a proposer schedule
+> over staked validators, so there is no hashrate, no share accounting and no
+> pool in the picture at all. The same goes for `../pool-proxy/`. Kept as part
+> of the Genesis-3 record; read everything below in the past tense.
+
 A **reference, non-production** mining pool: SIS-native stratum dialect,
 PPLNS share accounting with a maturity-gated credit lifecycle, a
 journaled (restart-surviving) ledger, JSON-RPC upstream to a Bloch node,

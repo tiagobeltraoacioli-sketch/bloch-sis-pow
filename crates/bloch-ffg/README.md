@@ -1,5 +1,13 @@
 # bloch-ffg — static FFG committee + committee-governed activation (foundation)
 
+> **Genesis-3-era crate. Superseded, not used.** This was a 21-seat static
+> finality committee designed as an *overlay* on the proof-of-work base. That
+> base stopped at height 39,918 on 2026-08-13. The live chain is **Genesis-4,
+> proof of stake**, where finality is not an overlay at all: it is
+> Casper-style FFG over a rotating epoch committee, in
+> `crates/bloch-pos-committee/src/finality.rs`, and nothing here is wired into
+> it. Kept buildable for audit. Read "the base PoW" below as Genesis-3.
+
 The **static finality committee** from the validators/BaaS study (**§4-bis**) and the
 mechanism that makes it the **activation authority** for consensus upgrades — such as
 the native eUTXO VM in `bloch-euvm` (**§5-quater, step 6**).

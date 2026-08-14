@@ -1,5 +1,19 @@
 {
-  description = "Bloch-SIS — the node packaged for Nix + Postern OS, a reproducible NixOS appliance with the node built in";
+  description = "Bloch — the Genesis-3 proof-of-work node packaged for Nix + Postern OS, a reproducible NixOS appliance with that node built in";
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # WHICH NODE THIS FLAKE PACKAGES. Every output here — `bloch`, `default`,
+  # `iso`, `attested-image`, `mobile-image`, `postern-desktop` — is built from
+  # ./os/package.nix, which builds `bloch`: the **Genesis-3 proof-of-work
+  # node**. Genesis-3 stopped at height 39,918 on 2026-08-13.
+  #
+  # The live chain is Genesis-4, proof of stake, and its binary is `bloch-pos`
+  # (crates/bloch-pos-node). It is NOT packaged for Nix. `nix build` in this
+  # repository therefore builds the retired chain's node, and so do the OS
+  # images. That is a gap, stated rather than papered over: packaging bloch-pos
+  # and repointing `default` is real work that nobody has done and that nobody
+  # should fake with an untested derivation.
+  # ────────────────────────────────────────────────────────────────────────────
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.05";
   # Mobile NixOS powers Postern OS Mobile (phones). Not a flake — used via its

@@ -1,14 +1,15 @@
-# Security Tooling — Bloch-SIS-PoW
+# Security Tooling — Bloch Protocol
 
-> **Genesis-3-era document — sealed 2026-08-12.** Bloch's proof-of-work
-> chain halts by consensus rule at the terminal height (50,000) and
-> Genesis-4 relaunches as proof of stake; the ownerless thesis was
+> **Genesis-3-era document — sealed 2026-08-12, scope table corrected
+> 2026-08-13.** Genesis-4 (proof of stake) went live on 2026-08-13 and
+> Genesis-3 (proof of work) stopped at height 39,918; the ownerless thesis was
 > retracted (`docs/adr/ADR-036-retract-ownerless-adopt-foundation.md`).
 >
 > The scanner inventory and the tracked open-advisory set (hickory-proto,
 > yamux GHSA-vxx9-2994-q338) are current and consensus-independent. The scope
-> table's SHA-256d/GhostDAG rows, the PoW fuzz targets, and the description of
-> the EVM as an L2 scaffold are superseded (`docs/adr/ADR-040-evm-and-ustav-at-l1.md`).
+> table below now names the live PoS crates; the PoW fuzz targets and the
+> description of the EVM as an L2 scaffold are superseded
+> (`docs/adr/ADR-040-evm-and-ustav-at-l1.md`).
 
 *How the code is scanned, what each tool catches, what it cannot, and how to run everything locally. As of 2026-07-22. Unaudited by a third party — automated scanning + an internal adversarial audit reduce but do not remove risk; consensus logic and cryptographic parameter choices require human + external review.*
 
@@ -16,10 +17,12 @@
 
 | Layer | What | Where |
 |---|---|---|
-| **L1 core (Rust)** | Post-quantum pure-PoW BlockDAG node: **SHA-256d** proof-of-work (Genesis-2), hybrid **ML-DSA-65 ‖ Falcon-1024** signatures, SHAKE-256 commitments, **GhostDAG** (blue_score) ordering, libp2p networking, the **bloch-euvm** eUTXO contract VM. Consensus-critical infrastructure, not smart contracts. | `crates/*`, `src/*` (this repo) |
+| **L1 core (Rust) — LIVE** | Genesis-4, **proof of stake**: slots and epochs, LMD-GHOST fork choice, Casper-style FFG finality, RANDAO beacon, staking and slashing, SHA-3/SHAKE-256 state root, hybrid **ML-DSA-65 ‖ Falcon-1024** signatures on every consensus path (no BLS), libp2p networking. Consensus-critical infrastructure, not smart contracts. | `crates/bloch-pos-committee`, `crates/bloch-pos-node` |
+| **L1 core (Rust) — CLOSED** | Genesis-3, **proof of work**: SHA-256d, AuxPoW merged mining, **GhostDAG** (blue_score) ordering, the **bloch-euvm** eUTXO contract VM. Stopped at height 39,918; scanned because Genesis-4's opening ledger is derived from it, not because it runs. | `legacy/genesis3-node`, `crates/bloch-euvm`, `crates/bloch-ffg` |
+| **Shared crypto (Rust)** | Signature suite, addresses, hashing, the Module-SIS reference PoW puzzle. On the Genesis-4 consensus path via `bloch-crypto`; `bloch-sis-pow` is pulled in by it and is not a live consensus rule. | `crates/bloch-crypto`, `crates/bloch-sis-pow`, `crates/coherence-core` |
 | **EVM / L2** | **Not deployed Solidity.** The L2 is a Rust **revm-based scaffold** (design-only, testnet/zero-value): `l2/bloch-l2-{evm,sequencer,prover,anchor,bridge}` in the **products repo** (`bloch-protocol`). Scanned as Rust; the Solidity toolchain is configured for *when* real contracts exist. | `bloch-protocol/l2/*` |
 
-> **Correction to earlier design notes:** the live chain is **SHA-256d** (the Module-SIS lattice PoW is the other chain-id in the code, not the live PoW), and **Casper FFG was dropped** — finality is PoW depth + checkpoint reorg-depth protection, deterministic proof-gated validation. Docs here reflect the real code.
+> **Correction to earlier design notes, twice over.** The first correction said the live chain was **SHA-256d** rather than the Module-SIS lattice PoW, and that **Casper FFG was dropped** in favour of PoW depth. Both statements were true of Genesis-3 and neither is true now: the live chain is Genesis-4, there is no proof of work in it at all, and finality is Casper-style FFG over an epoch committee — the gadget that was dropped came back as the whole finality mechanism. Read the crate, not this paragraph.
 
 ## L1 Rust scanners
 
@@ -29,12 +32,28 @@
 | **cargo-deny** | Advisories + **license policy** (permissive only; AGPL allowed for the six first-party crates, copyleft denied for third-party deps) + banned/duplicate crates + untrusted registries | Same as audit for logic | `cargo deny check` |
 | **osv-scanner** | Same `Cargo.lock`, but the **OSV.dev** DB (RustSec **+ GHSA**) — catches GHSA-only advisories cargo-audit's RustSec-only feed misses | Logic bugs, novel vulns | `osv-scanner --lockfile=Cargo.lock` (install: `go install github.com/google/osv-scanner/cmd/osv-scanner@latest`; needs network for the DB — supplementary, not a blocking CI gate) |
 | **cargo-geiger** | `unsafe` usage across the dependency tree; flags increases | Whether the unsafe is *correct* | `cargo geiger` |
-| **Clippy (hardened)** | Panics in consensus paths (`unwrap`/`expect`), arithmetic side-effects, pedantic smells | Semantic/consensus correctness | `cargo clippy -p bloch-crypto -p bloch-euvm -- -W clippy::pedantic -W clippy::arithmetic_side_effects -D clippy::unwrap_used -D clippy::expect_used` |
+| **Clippy (hardened)** | Panics in consensus paths (`unwrap`/`expect`), arithmetic side-effects, pedantic smells. Covers the LIVE Genesis-4 crates (`bloch-pos-committee`, `bloch-pos-node`) and the closed Genesis-3 ones (`bloch`, `bloch-crypto`, `bloch-euvm`). A per-crate **ratchet**: baselines are recorded and the run fails when a count goes up | Semantic/consensus correctness | `./scripts/hardened-clippy.sh` (the script is the definition of the scope and the baselines; do not hand-roll the crate list) |
 | **Miri** | Undefined behaviour in the consensus + serialization test suites | Anything not exercised by a test | `cargo +nightly miri test` (consensus/serialization crates) |
 | **cargo-fuzz / libFuzzer** | Panics/UB/DoS on adversarial input to the P2P wire, PoW verifier, DAG ordering, signature parsing | Deep logic bugs, consensus splits | `cargo +nightly fuzz run <target>` (targets below) |
 | **proptest** | Property invariants (deterministic ordering, blue-score monotonicity, emission conservation) | Invariants nobody wrote | `cargo test` (property tests run in-suite) |
 
 **Fuzz targets** (`fuzz/fuzz_targets/`): `block_parse`, `netmsg_decode`, `handshake_decode`, `pow_decode`, `pow_verify`, `sha256d_pow`, `merkle_path`, `ghostdag_order`, `mempool_ops`, `sig_verify` — priority order: P2P deserialization (primary remote surface) → SHA-256d PoW verify → GhostDAG ordering → signature/attestation parsing. An **OSS-Fuzz** application (`fuzz/oss-fuzz/{project.yaml,build.sh,Dockerfile}`) reuses these so Google runs them continuously for free.
+
+> **Every one of those targets is a Genesis-3 surface, and Genesis-3 has stopped.** The Genesis-4 node's parsers and P2P surfaces (`crates/bloch-pos-node`) have **no fuzz targets at all**. The live chain's remote attack surface is, today, unfuzzed. Writing that harness is the work that closes the gap; relabelling the existing targets would not.
+
+### The hardened-clippy gate, measured (2026-08-13)
+
+The `clippy-hardened` job is described in both pipelines as BLOCKING. Until 2026-08-13 its scope was Genesis-3 only: it had never linted `bloch-pos-committee`, the consensus producing blocks. Pointing it at the live crates also established that it could not have passed on the retired ones either. Counts at commit `8167ceb`, on the pinned toolchain:
+
+| Crate | Findings | Era |
+|---|---|---|
+| `bloch` | 59 | Genesis-3 |
+| `bloch-crypto` | 22 | shared; on the Genesis-4 signature path |
+| `bloch-pos-node` | 27 | **Genesis-4, live** |
+| `bloch-pos-committee` | 9 | **Genesis-4, live consensus** |
+| `bloch-euvm` | 0 | Genesis-3 |
+
+None of the nine in the live consensus crate is a reachable crash: each is a `try_into()` after a length-checked `take(n)`, a slice of a header whose length was validated first, or a `keys().next()` under `len() >= cap > 0`. They are hand-proofs where the lint wants a type-level guarantee, which is exactly why they stay counted. The job is now a **per-crate ratchet** — the recorded number may fall, never rise — rather than a pass/fail gate that was red on every commit and therefore read by nobody.
 
 ## EVM / L2 scanners (configured for future Solidity)
 

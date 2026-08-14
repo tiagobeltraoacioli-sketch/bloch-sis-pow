@@ -1,3 +1,16 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# GENESIS-3 LOCAL TESTNET — THE PROOF-OF-WORK NODE. NOT THE LIVE CHAIN.
+#
+# Three `bloch` nodes on a private network, mining against each other. Genesis-3
+# stopped at height 39,918 on 2026-08-13; this composes a local proof-of-work
+# testnet, not a way to join anything. Kept as part of the Genesis-3 record.
+#
+# The live chain is Genesis-4, proof of stake, and its binary is `bloch-pos`
+# (`cargo build --release -p bloch-pos-node`). There is no compose file for it:
+# a validator needs a keystore and a genesis manifest, and handing those to a
+# throwaway container is not a pattern this project wants to publish. See
+# `docs/GENESIS4-MIGRATION-RUNBOOK.md` and `deploy/RELEASE-INTEGRITY.md`.
+# ══════════════════════════════════════════════════════════════════════════════
 version: "3.8"
 
 services:

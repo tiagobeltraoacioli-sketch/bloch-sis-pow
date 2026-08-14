@@ -156,7 +156,7 @@ change any rule, so "impossible to change" would be false.
 | AuxPoW merged mining with Bitcoin | yes | yes | ran from local height 8,500 until the halt |
 | eUTXO VM (`crates/bloch-euvm`) | yes | yes | ran — consensus-wired at Genesis-3 height 0; **not** wired into Genesis-4 |
 | Coherence shielded pool (C1 frozen) | yes | verifier present | never used; the mainnet pool is provably empty |
-| PoS consensus core (`crates/bloch-pos-committee`) | yes | yes — 364 tests green, measured 2026-08-13 | **yes — live** |
+| PoS consensus core (`crates/bloch-pos-committee`) | yes | yes — 366 tests green, measured 2026-08-13 | **yes — live** |
 | PoS node (`crates/bloch-pos-node`) | yes | yes | **yes — mainnet since 2026-08-13 21:31:19 UTC**, 64 validators on five servers, justifying and finalising |
 | Tokenomics V4 | yes | constants + const-asserts in the crate | yes — it is the live emission |
 | Weak-subjectivity checkpoints | yes | no | no |
@@ -239,13 +239,16 @@ it. Measured 2026-08-13 on a clean checkout, `--release`:
 
 | Suite | Result |
 | --- | --- |
-| `bloch-pos-committee` — the live consensus core | **364 passed, 0 failed** (+2 doc-tests) |
-| `bloch-pos-node` | 90 passed, **1 failed** |
+| `bloch-pos-committee` — the live consensus core | **366 passed, 0 failed, 1 ignored** (+2 doc-tests) |
+| `bloch-pos-node` | 93 passed, 0 failed — **but see the flake below** |
 | `genesis4-ceremony` | 10 passed, **18 failed** |
 | `bloch` (Genesis-3, retired) | 304 passed, **1 failed** |
 
-Every one of the 20 failures reproduces identically on `e17faef`, the commit
-before the reorganisation. The move introduced none of them.
+Every one of these reproduces on `e17faef`, the commit before the
+reorganisation. The move introduced none of them. The `bloch-pos-node` entry
+was counted as a failure when this table was first written; re-running it on
+2026-08-13 showed it is a flaky test harness, and it is described as such
+below.
 
 - The `bloch` failure is `pow::tests::k4_mined_block_rejected_at_canonical_height`,
   a probabilistic assertion about the k=4→k=8 proof-of-work gate. It fails
@@ -258,7 +261,18 @@ before the reorganisation. The move introduced none of them.
   that assembled the live genesis block had failing tests and nothing
   reported it. That is the whole argument for the membership change.
 - The `bloch-pos-node` failure is
-  `a_cold_node_builds_the_same_chain_from_genesis_without_a_donated_datadir`.
+  `a_cold_node_builds_the_same_chain_from_genesis_without_a_donated_datadir`,
+  and it is a **flake, not a failure** — diagnosed 2026-08-13. It failed on one
+  run and passed on the next from the same clean checkout. The cause is in the
+  test harness, not the node: `free_port()` asks the kernel for an ephemeral
+  port, and the RPC port is then derived as `listen + 1000` on a `u16`
+  (`crates/bloch-pos-node/tests/cold_start.rs:151`). macOS hands out ephemeral
+  ports from 49152–65535, so any draw above 64535 overflows — and
+  `overflow-checks = true` in the workspace profile turns that into a panic
+  rather than a wrap. Three nodes per run, roughly a 6% chance each, so about
+  one run in six dies before a node ever starts. The fix is to draw the RPC
+  port with `free_port()` too instead of deriving it by addition; it is left to
+  whoever owns that file.
 
 None of these are consensus changes and none were fixed here — this commit
 moves files and fixes build wiring. Fixing them is separate work.

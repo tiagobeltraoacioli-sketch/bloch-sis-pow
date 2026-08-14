@@ -1,3 +1,12 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# RETIRED. A mining pool for the Genesis-3 proof-of-work chain, which stopped at
+# height 39,918 on 2026-08-13. There is no hashrate to pool. The live chain is
+# Genesis-4, proof of stake: blocks come from a proposer schedule over staked
+# validators, and there is no mining, no pool, and no payout split to operate.
+# Kept as part of the Genesis-3 record. ("ownerless", below, was also retracted
+# — see docs/adr/ADR-036-retract-ownerless-adopt-foundation.md.)
+# ══════════════════════════════════════════════════════════════════════════════
+
 # Postern-operated instance of the reference Bloch-SIS-PoW mining pool.
 # Deploy with:  fly deploy --config pool.fly.toml
 # The protocol is ownerless — this is one independent pool on it (by Postern

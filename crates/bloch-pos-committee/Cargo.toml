@@ -3,7 +3,7 @@ name = "bloch-pos-committee"
 version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
-description = "Bloch PoS — per-slot fork-choice subcommittee and epoch finality committee: deterministic stake-weighted sampling, attestation types, and LMD-GHOST weight accumulation. UNAUDITED, not wired into the node."
+description = "Bloch Genesis-4 consensus core — the state transition, LMD-GHOST fork choice, FFG finality, epoch committees and proposer schedule, RANDAO, staking and slashing, and tokenomics V4. This is the live chain's consensus, running mainnet since 2026-08-13. UNAUDITED by any third party."
 publish = false
 
 # Member of the root workspace since Genesis-4 became the trunk. It was
@@ -20,7 +20,14 @@ hex = "0.4"
 # The suite walks 8,192-step SHAKE-256 reveal chains and 256-deep SMTs, so an
 # unoptimized Keccak permutation puts tens of seconds on `cargo test`. Optimize
 # only the hash dependencies under dev; this crate's own code keeps full debug.
-# (Valid here because this crate is its own workspace root — see [workspace].)
+#
+# INERT AS WRITTEN. This was valid while the crate was its own workspace root.
+# It is now a member of the root workspace, and cargo ignores `[profile.*]` in
+# anything but the workspace root — it warns and moves on. Kept, unchanged and
+# labelled, rather than moved: relocating it to the root Cargo.toml changes the
+# dev profile for every crate in the tree, which is a build-configuration
+# decision, not a documentation fix. `cargo test -p bloch-pos-committee` is
+# correspondingly slower than it was.
 [profile.dev.package.sha3]
 opt-level = 3
 

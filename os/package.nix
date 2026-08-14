@@ -38,11 +38,17 @@ rustPlatform.buildRustPackage {
   doCheck = false;
 
   meta = with lib; {
-    description = "Bloch-SIS post-quantum, pure-PoW BlockDAG node";
+    description = "Bloch Genesis-3 proof-of-work node (retired chain; kept for audit)";
     longDescription = ''
-      The Bloch-SIS node: SHAKE-256 hashcash Proof-of-Work with a Module-SIS
+      The Genesis-3 node: SHAKE-256 hashcash Proof-of-Work with a Module-SIS
       structural gate, hybrid Falcon+ML-DSA signatures, GhostDAG-Q consensus.
-      Testnet is zero-security by design — do not attach value.
+
+      THIS IS NOT THE LIVE CHAIN. Genesis-3 stopped at height 39,918 on
+      2026-08-13. The live chain is Genesis-4, proof of stake, whose binary is
+      `bloch-pos` (crates/bloch-pos-node) — it is not packaged for Nix yet, so
+      every Nix output in this repository, including the OS images, still
+      carries the retired proof-of-work node. Do not read this package as a
+      statement about what the network runs.
     '';
     license = with licenses; [ mit asl20 ];
     platforms = platforms.linux;

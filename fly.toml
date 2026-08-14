@@ -1,3 +1,15 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# RETIRED. Fly.io deployment for a proof-of-work `bloch` node, running as a
+# MINER. The chain it mines stopped at height 39,918 on 2026-08-13; the live
+# chain is Genesis-4, proof of stake, and it is not deployed from Fly or from
+# this repository's Dockerfile — see `deploy/RELEASE-INTEGRITY.md`.
+#
+# The same applies to every `blochv-node-*.fly.toml` and `pool.fly.toml` beside
+# it at the repo root. They are kept, unchanged, as the deployment record of a
+# chain that ran; do not read a `--mine` flag in any of them as a description
+# of what the network does now.
+# ══════════════════════════════════════════════════════════════════════════════
+
 # Fly.io deployment for a Bloch-SIS node.
 #
 # Fly builds the repo's Dockerfile and runs it — no manual `docker push`, no

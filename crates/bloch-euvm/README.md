@@ -1,5 +1,14 @@
 # bloch-euvm — native eUTXO contract VM (foundation)
 
+> **Genesis-3-era crate.** This was designed and built for the proof-of-work
+> chain, which stopped at height 39,918 on 2026-08-13. The live chain is
+> **Genesis-4, proof of stake**, and this VM is **not wired into it** — see
+> the "designed ≠ built ≠ booted" table in the root `README.md`. The direction
+> for contracts at L1 has since moved to an EVM
+> (`docs/adr/ADR-040-evm-and-ustav-at-l1.md`), for which no code exists yet.
+> Kept buildable for audit. Read every present-tense sentence below about
+> "the chain" as describing Genesis-3.
+
 A **deterministic, gas-metered eUTXO smart-contract VM** for Bloch — the first,
 self-contained increment of the native contract layer designed in the
 validators/BaaS study (**§5-quater**, "VM de contratos nativa").
@@ -11,7 +20,9 @@ validators/BaaS study (**§5-quater**, "VM de contratos nativa").
 
 ## Why eUTXO (not an EVM bolt-on)
 
-Bloch is a **UTXO + post-quantum + pure-PoW + ownerless** chain. The study evaluated
+Genesis-3 was a **UTXO + post-quantum + pure-PoW + ownerless** chain — all four
+words held when this was written; the PoW chain has since closed and the
+ownerless thesis was retracted (ADR-036). The study evaluated
 three models and chose **eUTXO** (Cardano/Ergo style): outputs carry a `validator`
 (a program) + `datum` (local state); spending runs the validator. It is UTXO-native,
 deterministic, parallel, PQ-friendly, and keeps the chain's character — unlike an

@@ -1,4 +1,9 @@
-# Bloch-SIS Protocol — Security scanners (GitHub Actions)
+# Bloch Protocol — Security scanners (GitHub Actions)
+#
+# The chain these scanners gate is GENESIS-4, PROOF OF STAKE, live since
+# 2026-08-13. Genesis-3 (proof of work) stopped at height 39,918. Where a job
+# below is scoped to Genesis-3 code it says so; those exist for the audit trail
+# of Genesis-4's opening ledger, not because anything mines.
 #
 # GitHub mirror of the security stage in .gitlab-ci.yml. GitLab CI runs on a
 # self-hosted aarch64 Linux runner; this runs on GitHub-hosted ubuntu-latest,
@@ -71,7 +76,13 @@ jobs:
   # clippy-hardened — BLOCKING, scoped to CONSENSUS-CRITICAL code only. Denies
   # panics (unwrap/expect) and unchecked arithmetic in consensus, emission and
   # tokenomics paths (a panic reachable from an untrusted block/tx is a DoS; an
-  # emission overflow is an inflation bug). See scripts/hardened-clippy.sh.
+  # emission overflow is an inflation bug).
+  #
+  # CHANGED 2026-08-13: its scope was Genesis-3 only and had never linted
+  # bloch-pos-committee, the live consensus. Adding the live crates showed the
+  # job could not have been green on the retired ones either, so it is now a
+  # per-crate RATCHET — recorded baselines, fails when a count goes up. See
+  # scripts/hardened-clippy.sh.
   clippy-hardened:
     name: clippy-hardened (blocking)
     runs-on: ubuntu-latest
@@ -124,6 +135,14 @@ jobs:
   # miri — UB / provenance / uninit-read on the pure-Rust consensus + emission
   # unit tests. Scoped to FFI-free crates (the node's C FFI — PQClean, rocksdb,
   # blst — cannot run under Miri). Non-blocking (needs nightly + rust-src).
+  #
+  # GENESIS-3 SCOPE, stated rather than hidden: this runs the V2 emission tests
+  # of a chain that stopped. bloch-pos-committee is the better Miri target —
+  # pure Rust, no FFI, and it is the live consensus — but its suite walks
+  # 8,192-step SHAKE-256 reveal chains and 256-deep sparse Merkle trees, which
+  # under the Miri interpreter is hours, not minutes. Putting it here without
+  # first carving out a bounded subset would give a job that always times out,
+  # which is worse than an honest gap. It is a gap.
   miri:
     name: miri-consensus (report-only)
     runs-on: ubuntu-latest
@@ -141,6 +160,12 @@ jobs:
   # each scanner-priority target for a bounded time to prove it does not fault on
   # shallow input. NOT a coverage-exhausting campaign (that runs continuously in
   # OSS-Fuzz — see fuzz/oss-fuzz/). Non-blocking.
+  #
+  # GENESIS-3 SCOPE. Every target below (block_parse, tx_parse, sha256d_pow,
+  # ghostdag_order, sig_verify) is a Genesis-3 surface. The Genesis-4 parser and
+  # P2P surfaces in bloch-pos-node have NO fuzz targets. That is a real gap in
+  # coverage of the live chain, and writing the harness is the work that closes
+  # it — not relabelling these.
   fuzz-smoke:
     name: cargo-fuzz smoke (report-only)
     runs-on: ubuntu-latest

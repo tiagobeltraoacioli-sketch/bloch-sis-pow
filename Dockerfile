@@ -1,3 +1,28 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# GENESIS-3 IMAGE — THE PROOF-OF-WORK NODE. NOT THE LIVE CHAIN.
+#
+# This file builds `bloch`, the Genesis-3 proof-of-work node. Genesis-3 stopped
+# at height 39,918 on 2026-08-13 and nothing produces blocks on it. An image
+# built from this Dockerfile has no network to join. It is kept because the
+# Genesis-3 node is how an auditor re-derives the balance set that Genesis-4
+# opened from, and because the Fly/Akash configs in this repo that reference it
+# are part of that record.
+#
+# THE LIVE CHAIN IS GENESIS-4, PROOF OF STAKE. Its binary is `bloch-pos`:
+#
+#     cargo build --release -p bloch-pos-node   # -> target/release/bloch-pos
+#
+# There is deliberately no container image for it here. The fleet installs
+# `bloch-pos` as a systemd unit from a signed release tarball — see
+# `deploy/RELEASE-INTEGRITY.md`, which is the release path of record. Do not
+# infer from this file that the project ships a proof-of-work container.
+#
+# NOTE: this image does not currently build. The `COPY carryover.tsv` below
+# wants a file the repository stores compressed (`carryover.tsv.gz`). That has
+# been true since before the migration and is left as found rather than fixed
+# blind — fixing it would mean claiming a build nobody has run.
+# ══════════════════════════════════════════════════════════════════════════════
+
 # ─── Builder ─────────────────────────────────────────────────
 # Base images pinned by digest (reproducible-build prerequisite, L1). Update the
 # digest deliberately, never float the tag. See deploy/repro/README.md.

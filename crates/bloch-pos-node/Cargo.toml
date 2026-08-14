@@ -1,26 +1,32 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 #
-# bloch-pos — the Genesis-4 node binary. A NEW binary, deliberately:
-# the Genesis-3 node (`bloch`, src/main.rs at the repo root) halts at height
-# 80,000 and its validation path is never touched by this work
-# (BLOCH-POS-NODE-INTEGRATION.md §0). This crate is standalone — its own
-# [workspace], exactly like crates/bloch-pos-committee and
-# crates/coherence-prover — so nothing here can enter the Genesis-3 build
-# graph, its Cargo.lock, or its binary.
+# bloch-pos — the Genesis-4 node binary, and the binary the live chain runs.
+#
+# A NEW binary, deliberately: it was written while the Genesis-3 proof-of-work
+# node (`bloch`, now at legacy/genesis3-node/) was still producing blocks, and
+# its validation path was never touched by this work
+# (BLOCH-POS-NODE-INTEGRATION.md §0). That separation was enforced by keeping
+# this crate standalone — its own [workspace] — so nothing here could enter the
+# Genesis-3 build graph, its Cargo.lock, or its binary.
+#
+# Both of those facts are now history. Genesis-3 stopped at height 39,918 on
+# 2026-08-13 (it never reached the 80,000 this comment used to cite, nor the
+# 50,000 it was later lowered to), Genesis-4 went live the same day, and this
+# crate is a normal member of the root workspace — see the note further down.
+# There is no longer a live PoW validation path to protect from it.
 
 [package]
 name = "bloch-pos-node"
 version = "0.0.2-devnet"
 edition = "2021"
 license = "AGPL-3.0-or-later"
-description = "Bloch Genesis-4 Proof-of-Stake node. M1/M2 devnet stage: real processes producing, attesting, justifying and finalizing over a local TCP mesh, with append-only block-log persistence and replay-on-restart. Not mainnet-ready — see docs/specs/BLOCH-POS-NODE-INTEGRATION.md."
+description = "Bloch Genesis-4 Proof-of-Stake node — the binary the live chain runs (mainnet since 2026-08-13). Produces, attests, justifies and finalizes; append-only block-log persistence with replay-on-restart. UNAUDITED — see docs/specs/BLOCH-POS-NODE-INTEGRATION.md."
 publish = false
 
-# Standalone: NOT a member of the node workspace. The Genesis-3 node must not
-# gain this crate as a dependency, and this crate must not drag the Genesis-3
-# node's lockfile. Integration direction is one-way and by path: this binary
-# consumes the pure consensus crate (and later bloch-crypto), never the
-# reverse.
+# Integration direction is one-way and by path: this binary consumes the pure
+# consensus crate (and bloch-crypto), never the reverse. That was originally
+# enforced by standing outside the node workspace entirely; it is now enforced
+# by the dependency graph alone, which is what it always meant.
 #
 # LICENSE (BLOCH-POS-NODE-INTEGRATION.md §8.4 — RESOLVED 2026-08-11): the
 # founder decided the Genesis-4 node is born AGPL-3.0-or-later, like the

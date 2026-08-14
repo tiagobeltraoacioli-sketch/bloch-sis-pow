@@ -1,15 +1,23 @@
 # Bloch-SIS — project status (consolidation checkpoint)
 
-> **SUPERSEDED FRAMING — 2026-08-11.** This status describes the Genesis-3
-> PoW project. Since it was written: the **ownerless thesis was retracted**
-> (ADR-036 — issuer + two-entity foundation,
-> `docs/specs/BLOCH-ENTITY-STRUCTURE.md`), Genesis-3 **halts at height
-> 80,000** and Genesis-4 relaunches as PoS (Tokenomics V4), the PoS crates are
+> **SUPERSEDED — this is no longer the project's status.** It is the Genesis-3
+> proof-of-work status document, kept as a record of where the project stood
+> before the migration. **Genesis-4 (proof of stake) has been the live chain
+> since 2026-08-13 21:31:19 UTC, and Genesis-3 stopped at height 39,918.**
+> Everything below that reads "the live mainnet is Genesis-3", "pure
+> Proof-of-Work", or forecasts the Emission V3 flag day at height 40,000 is
+> describing a chain that has stopped — the flag day was 82 blocks away when
+> production ended, and never happened.
+>
+> **For the current status read [`../README.md`](../README.md)** and the index
+> at [`./README.md`](./README.md). Also superseded since this was written: the
+> **ownerless thesis was retracted** (ADR-036 — issuer + two-entity
+> foundation, `docs/specs/BLOCH-ENTITY-STRUCTURE.md`), the PoS crates are
 > **AGPL-3.0-or-later**, and the EVM moves to **L1** (no L2). Read
 > "ownerless / commons / 17% premine" claims below as historical.
 
 Single source of truth for what exists, what's verified, and what's open.
-Bloch-SIS is a **post-quantum, pure-Proof-of-Work BlockDAG L1** whose PoW is a
+Bloch-SIS *was* a **post-quantum, pure-Proof-of-Work BlockDAG L1** whose PoW is a
 **SHAKE-256 hashcash with a Module-SIS structural gate** — the gate binds the
 work to a lattice form; the security source is cumulative hash work, not
 lattice hardness (`legacy/research/POW-CANONICAL-frontier.md`) — forked from and
@@ -21,9 +29,11 @@ RPC/API only, every node a seed); the **products** — the OSes, wallet, explore
 attestation — are **Postern Labs** (owned, rebranded off "Bloch"). Anyone may
 build products on the open protocol; Postern is one builder among many.
 
-> ## Live network — Genesis-3 mainnet (status as of 2026-08-09)
-> Much of this document predates the **Genesis-3 relaunch (2026-07-29)**. The
-> live mainnet is **Genesis-3** (chain id `0xB10C_0004`): a carry-over restart
+> ## Genesis-3 mainnet — CLOSED (this section was written 2026-08-09, while it ran)
+> Genesis-3 stopped at height **39,918** on 2026-08-13. Read this section in
+> the past tense; the live network is Genesis-4, proof of stake. Much of the
+> rest of this document predates even the **Genesis-3 relaunch (2026-07-29)**.
+> Genesis-3 was (chain id `0xB10C_0004`) a carry-over restart
 > (opening balance = 413,743 UTXOs / 3,475,441,200 BLOCH — `docs/CARRYOVER.md`)
 > whose chain-selected PoW is **SHA-256d** — ASIC-mined and **merged-mineable
 > with Bitcoin** (AuxPoW, active since local h=8,500 —
