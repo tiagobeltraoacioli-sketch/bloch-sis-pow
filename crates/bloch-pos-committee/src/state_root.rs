@@ -269,10 +269,79 @@ fn subtree_root(leaves: &[([u8; 32], [u8; 32])], depth: usize, empty: &[[u8; 32]
         let (key, value_hash) = &leaves[0];
         return leaf_hash(key, value_hash);
     }
+    if leaves.len() == 1 {
+        // A subtree holding exactly one leaf folds that leaf against the empty
+        // constant at every remaining level. Doing it here rather than by
+        // recursing is the same arithmetic in the same order — see
+        // `singleton_subtree_root` for why it is also the same value.
+        let (key, value_hash) = &leaves[0];
+        return singleton_subtree_root(key, value_hash, depth, empty);
+    }
     let split = leaves.partition_point(|(k, _)| bit(k, depth) == 0);
     let left = subtree_root(&leaves[..split], depth + 1, empty);
     let right = subtree_root(&leaves[split..], depth + 1, empty);
     node_hash(&left, &right)
+}
+
+/// Root of the subtree at `depth` that holds `key` as its only leaf.
+///
+/// Identical, hash for hash, to what [`subtree_root`] computes by recursing:
+/// at each level the leaf sits on the side its key bit selects and the other
+/// side is the empty constant one level down. The loop exists because the
+/// recursion costs `TREE_DEPTH - depth` calls per leaf, and with a real
+/// carryover set that is the whole cost of a root.
+///
+/// **Why this is memoized and [`Smt::root`] is not.** The module's rule is
+/// that no cached root may outlive the leaves it was computed from — a stale
+/// root is how `expected_bits` split consensus, and that rule stands. This
+/// cache does not weaken it: the key is the *entire input* `(key, value_hash,
+/// depth)` of a pure function, so a hit returns what a recomputation would
+/// return. There is no state to invalidate, and therefore no invalidation to
+/// forget. A leaf whose value changes hashes to a different `value_hash` and
+/// so lands on a different cache entry; a leaf whose neighbours change is
+/// looked up at a different `depth`.
+fn singleton_subtree_root(
+    key: &[u8; 32],
+    value_hash: &[u8; 32],
+    depth: usize,
+    empty: &[[u8; 32]],
+) -> [u8; 32] {
+    debug_assert!(depth <= TREE_DEPTH);
+    if let Some(hit) = SINGLETON_MEMO.with(|m| m.borrow().get(&(*key, *value_hash, depth)).copied())
+    {
+        return hit;
+    }
+    let mut h = leaf_hash(key, value_hash);
+    let mut d = TREE_DEPTH;
+    while d > depth {
+        d -= 1;
+        h = if bit(key, d) == 0 { node_hash(&h, &empty[d + 1]) } else { node_hash(&empty[d + 1], &h) };
+    }
+    SINGLETON_MEMO.with(|m| {
+        let mut m = m.borrow_mut();
+        // Bounded so uptime cannot turn the memo into a leak. Clearing is
+        // safe at any moment precisely because every entry is recomputable.
+        if m.len() >= SINGLETON_MEMO_MAX {
+            m.clear();
+        }
+        m.insert((*key, *value_hash, depth), h);
+    });
+    h
+}
+
+/// Entries kept in the singleton memo before it is cleared wholesale. Sized
+/// to hold a full carryover-scale leaf set (~4.5e5) with room to spare, at
+/// roughly 100 bytes per entry.
+const SINGLETON_MEMO_MAX: usize = 1_200_000;
+
+thread_local! {
+    /// Per-thread so the hot consensus loop never contends on a lock. Purity
+    /// makes duplication across threads a memory question, never a
+    /// correctness one: every thread that computes an entry computes the
+    /// same bytes.
+    static SINGLETON_MEMO: std::cell::RefCell<
+        std::collections::HashMap<([u8; 32], [u8; 32], usize), [u8; 32]>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
 /// A Merkle inclusion proof: the sibling hash at every depth, ordered from the
@@ -1202,6 +1271,88 @@ mod tests {
 
     fn val(n: u8) -> [u8; 32] {
         hash_value(&[n])
+    }
+
+    /// Reference walk: recurses one level at a time all the way to
+    /// `TREE_DEPTH`, with no shortcut and no memo. This is what
+    /// `subtree_root` did before the singleton fold was hoisted out, and it
+    /// is the definition the root must keep matching.
+    fn reference_subtree_root(
+        leaves: &[([u8; 32], [u8; 32])],
+        depth: usize,
+        empty: &[[u8; 32]],
+    ) -> [u8; 32] {
+        if leaves.is_empty() {
+            return empty[depth];
+        }
+        if depth == TREE_DEPTH {
+            let (key, value_hash) = &leaves[0];
+            return leaf_hash(key, value_hash);
+        }
+        let split = leaves.partition_point(|(k, _)| bit(k, depth) == 0);
+        let left = reference_subtree_root(&leaves[..split], depth + 1, empty);
+        let right = reference_subtree_root(&leaves[split..], depth + 1, empty);
+        node_hash(&left, &right)
+    }
+
+    /// Not an assertion about wall-clock, which varies by machine — it
+    /// prints, and exists so the carryover-scale cost is measurable in the
+    /// tree that ships. Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn carryover_scale_root_cost() {
+        let n = 452_726u32;
+        let mut smt = Smt::new();
+        for i in 0..n {
+            smt.insert(derive_key(TAG_EUTXO, &i.to_le_bytes()), hash_value(&i.to_le_bytes()));
+        }
+        let t0 = std::time::Instant::now();
+        let a = smt.root();
+        let cold = t0.elapsed();
+        let t1 = std::time::Instant::now();
+        let b = smt.root();
+        let warm = t1.elapsed();
+        assert_eq!(a, b);
+        println!("  folhas: {n}");
+        println!("  1a raiz (memo frio) : {cold:.2?}");
+        println!("  2a raiz (memo quente): {warm:.2?}");
+    }
+
+    #[test]
+    fn memoized_singleton_fold_matches_the_full_recursion() {
+        // Keys are spread by the real derivation, so leaves become singletons
+        // at realistic (shallow, uneven) depths — the case the shortcut is
+        // for. Several sizes, because the singleton depth depends on how many
+        // neighbours share a prefix.
+        for n in [1u32, 2, 3, 17, 64, 500] {
+            let mut smt = Smt::new();
+            let mut leaves: Vec<([u8; 32], [u8; 32])> = Vec::new();
+            for i in 0..n {
+                let k = derive_key(TAG_EUTXO, &i.to_le_bytes());
+                let v = hash_value(&i.to_le_bytes());
+                smt.insert(k, v);
+                leaves.push((k, v));
+            }
+            leaves.sort_by(|a, b| a.0.cmp(&b.0));
+            let want = reference_subtree_root(&leaves, 0, &empty_hashes());
+            assert_eq!(smt.root(), want, "memoized root diverged from the full recursion at n={n}");
+        }
+    }
+
+    #[test]
+    fn memo_survives_a_value_change_at_the_same_key() {
+        // The memo is keyed by the whole input, so re-inserting a different
+        // value under a key already cached must move the root. This is the
+        // failure a root cache would have: same key, stale answer.
+        let k = derive_key(TAG_EUTXO, b"k");
+        let mut smt = Smt::new();
+        smt.insert(k, hash_value(b"before"));
+        let before = smt.root();
+        smt.insert(k, hash_value(b"after"));
+        let after = smt.root();
+        assert_ne!(before, after, "a changed leaf value must change the root");
+        smt.insert(k, hash_value(b"before"));
+        assert_eq!(smt.root(), before, "restoring the value must restore the root");
     }
 
     #[test]
