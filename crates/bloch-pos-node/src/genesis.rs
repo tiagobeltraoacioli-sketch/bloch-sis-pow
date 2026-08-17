@@ -1105,6 +1105,17 @@ impl Manifest {
 mod tests {
     use super::*;
 
+    /// A validator pubkey shaped the way Genesis-4 requires: the 0x0001
+    /// envelope, then the ML-DSA-65 half, then the Falcon-1024 half. These
+    /// fixtures used sixteen filler bytes, which `Manifest::decode` now refuses
+    /// (CertiK BLP-02). The bytes are still filler — only the SHAPE is real,
+    /// which is all the decoder checks and all a round-trip test needs.
+    fn shaped_pubkey(seed: u8) -> Vec<u8> {
+        let mut v = vec![0xB1, 0x0C, 0x01, 0x00];
+        v.extend(std::iter::repeat(seed).take(1952 + 1793));
+        v
+    }
+
     fn sample() -> Manifest {
         Manifest {
             genesis_time_ms: 1_800_000_000_000,
@@ -1114,7 +1125,7 @@ mod tests {
                     index: i,
                     stake_sat: (i as u128 + 1) * 1_000,
                     randao_commitment: [i as u8; 32],
-                    pubkey: vec![i as u8; 16],
+                    pubkey: shaped_pubkey(i as u8),
                     withdrawal_credentials: Vec::new(),
                     // Distinct non-zero rates, so a decoder that dropped or
                     // aliased the column would fail the round-trip below
