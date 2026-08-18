@@ -608,14 +608,38 @@ impl Engine {
             env.body.transactions.len(),
             self.mempool.len()
         );
+        // Captured before `env` moves into ingest: if the transition refuses
+        // this block, these are the bytes to drop from the mempool.
+        let produced_txs: Vec<Vec<u8>> = env.body.transactions.clone();
+        let env_tx_count = produced_txs.len();
         self.ingest(env);
         // h28080: a producer whose own node did not adopt its block is a
-        // producer/validator split inside one process. Loud, immediately.
-        assert_eq!(
-            self.head_id(),
-            id,
-            "own produced block was not adopted by own transition (h28080 class)"
-        );
+        // producer/validator split inside one process. It must be LOUD — but it
+        // must not be fatal.
+        //
+        // This was `assert_eq!`, and a panic here was remotely reachable: the
+        // probe accepts any signature, the real verifier does not, so one
+        // transfer with a garbage signature made every proposer kill itself in
+        // its own slot. The signature check in `admissible` closes that
+        // particular door; this closes the CLASS. Any future divergence between
+        // what the probe priced and what the transition accepts now costs one
+        // missed slot and a log line, not a node.
+        //
+        // The transactions go too. Keeping them would rebuild the same block
+        // next slot and lose that one as well.
+        if self.head_id() != id {
+            eprintln!(
+                "[slot {slot}] REFUSED OWN BLOCK {} — the transition did not adopt what this \
+                 node just produced (h28080 class). Dropping its {} transaction(s) and \
+                 continuing; this slot is lost, the node is not.",
+                crate::codec::hex8(id.as_bytes()),
+                env_tx_count,
+            );
+            for encoded in &produced_txs {
+                self.mempool.remove(encoded);
+            }
+            return;
+        }
         let env = self
             .blocks
             .get(id.as_bytes())
@@ -1918,8 +1942,40 @@ pub(crate) fn admissible(tx: &PosTransaction) -> Result<(), &'static str> {
             if outputs.is_empty() {
                 return Err("transfer has no outputs — it pays no one and cannot apply");
             }
+            // THE SIGNATURE IS CHECKED HERE, BEFORE THE MEMPOOL, AND THIS IS WHY.
+            //
+            // The producer prices its own block with `ProbeVerifier`, whose
+            // verify_with_key returns true for anything (keys.rs). A Transfer's spend
+            // signature is checked THROUGH that injected verifier
+            // (transition.rs, "Authorisation: the expensive check, last"), so a
+            // transfer with a valid shape and a garbage signature passes the probe,
+            // goes into a proposed block, and is then refused by the real
+            // HybridVerifier during ingest. The head does not move, and the
+            // assert below used to turn that into a panic — one transaction, and
+            // every node that proposed it died in its own slot.
+            //
+            // Refusing at the mempool door is what stops it PROPAGATING. The
+            // signature is the expensive check and it is deliberately last, after
+            // the two free ones above.
+            let signing_root = tx.spend_signing_root();
+            for i in inputs {
+                if !bloch_crypto::crypto::verify(&i.pubkey, &signing_root, &i.signature) {
+                    return Err("transfer carries a signature that does not verify");
+                }
+            }
             Ok(())
         }
+        // Exit is UNAUTHENTICATED: its arm in transition.rs checks registry
+        // state and never touches a verifier, and this catch-all used to admit
+        // it. Sixty-four Exit messages would set exit_epoch on all sixty-four
+        // validators, and an exit cannot be revoked (`exit_epoch != u64::MAX`
+        // is refused), so the roster would empty and every bond lock for
+        // 2,080 epochs. Refused until the message carries a signature that
+        // binds it to the validator's own key.
+        PosTransaction::Exit { .. } => Err(
+            "exits are not accepted: the Exit message is not authenticated, \
+             so anyone could retire any validator irreversibly",
+        ),
         _ => Ok(()),
     }
 }
@@ -2166,5 +2222,73 @@ mod forkchoice_tests {
             head, a1,
             "the equivocator was counted, or the honest vote was dropped"
         );
+    }
+}
+
+#[cfg(test)]
+mod admission_authorisation {
+    use super::*;
+    use bloch_pos_committee::transition::{TransferInput, TransferOutput};
+
+    /// A transfer signed for real, and the same transfer with the signature
+    /// corrupted. Both must reach `admissible` — one accepted, one refused.
+    fn signed_transfer() -> (PosTransaction, Vec<u8>) {
+        let (pk, sk) = bloch_crypto::crypto::generate_keypair_from_seed(&[9u8; 32])
+            .expect("hybrid keypair from a fixed seed");
+        let mut tx = PosTransaction::Transfer {
+            inputs: vec![TransferInput {
+                txid: [0x11u8; 32],
+                vout: 0,
+                pubkey: pk.clone(),
+                signature: Vec::new(),
+            }],
+            outputs: vec![TransferOutput {
+                value: 1_000,
+                script_hash: [0x22u8; 32],
+            }],
+            tx_bytes: 0,
+            tip_millisat_per_gas: 0,
+        };
+        let root = tx.spend_signing_root();
+        let sig = bloch_crypto::crypto::sign(&sk, &root).expect("sign the spend root");
+        if let PosTransaction::Transfer { inputs, .. } = &mut tx {
+            inputs[0].signature = sig.clone();
+        }
+        (tx, sig)
+    }
+
+    #[test]
+    fn a_correctly_signed_transfer_is_still_admitted() {
+        // THE REGRESSION THAT WOULD MATTER MOST. A signature check that refuses
+        // everything stops the chain accepting any transfer at all — worse than
+        // the hole it closes.
+        let (tx, _) = signed_transfer();
+        assert!(
+            admissible(&tx).is_ok(),
+            "a validly signed transfer must still reach the mempool"
+        );
+    }
+
+    #[test]
+    fn a_garbage_signature_is_refused_before_the_mempool() {
+        let (mut tx, sig) = signed_transfer();
+        if let PosTransaction::Transfer { inputs, .. } = &mut tx {
+            // One flipped byte: the shape stays valid, the signature does not.
+            let mut bad = sig;
+            bad[0] ^= 0xFF;
+            inputs[0].signature = bad;
+        }
+        let err = admissible(&tx).expect_err("a bad signature must not be admitted");
+        assert!(
+            err.contains("signature"),
+            "the refusal must name the reason, got: {err}"
+        );
+    }
+
+    #[test]
+    fn an_unauthenticated_exit_is_refused() {
+        let err = admissible(&PosTransaction::Exit { validator: 0 })
+            .expect_err("Exit carries no signature and must not be admitted");
+        assert!(err.contains("not authenticated"), "got: {err}");
     }
 }
