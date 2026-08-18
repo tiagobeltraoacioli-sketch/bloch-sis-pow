@@ -817,7 +817,58 @@ pub fn cohort_root(g: &Genesis) -> [u8; 32] {
 /// the supply accounting. The Genesis-4 node's genesis loader must reproduce
 /// this commitment from the allocation document or refuse to start, the same
 /// fail-closed posture `chain_requires_carryover` gives Genesis-3.
+/// The consensus state root, from the **node's** derivation.
+///
+/// # Why this delegates instead of computing
+///
+/// This function used to build its own root: a flat SHA3-256 over a fixed
+/// field list. The node builds a sparse Merkle tree over component-tagged
+/// entries (`TAG_EUTXO` 0x01 … 0x16). Those are not two spellings of one
+/// construction — they are different objects that could never agree, so the
+/// ceremony was producing a genesis no node could verify and the node would
+/// have produced a genesis the ceremony could not confirm. Two teams, two
+/// well-tested implementations, two different chains, discovered on launch
+/// day.
+///
+/// The node's derivation wins because the node is what validates the chain. A
+/// ceremony root no node reproduces is a document, not a genesis.
+///
+/// The fields the flat hash covered that the state root does not — the
+/// carryover digest, the Coherence artifact digest, the leaf and nullifier
+/// counts — did not disappear; they moved to
+/// [`ceremony_input_digest`], which is named for what it is instead of
+/// impersonating the consensus object.
 pub fn state_root(g: &Genesis) -> [u8; 32] {
+    use bloch_pos_committee::interfaces::StateReader;
+    bloch_pos_committee::transition::CommittedState::genesis(
+        genesis_block_id(g),
+        GENESIS_MIX,
+        &node_validators(g),
+        &cohort_indices(g),
+        [0u8; 32], // taint dissolved (integration plan decision 8)
+        g.coherence_accumulator_root,
+        g.coherence_nullifier_root,
+        bloch_pos_committee::state_root::EvmCommitment {
+            account_root: [0u8; 32],
+            receipts_root: [0u8; 32],
+            gas_used: 0,
+            base_fee_per_gas: 0,
+        },
+        &node_outputs(g),
+    )
+    .state_root()
+}
+
+/// Digest over the ceremony's *inputs* — the artifacts and counts that
+/// produced this genesis.
+///
+/// Not the state root and not a substitute for it. It commits to things the
+/// consensus state does not carry: which carryover artifact was used, which
+/// Coherence artifact, and how many leaves and nullifiers came across.
+/// Publishing it is how a third party checks that the genesis they were handed
+/// was built from the artifacts they were shown, which the state root alone
+/// cannot answer.
+pub fn ceremony_input_digest(g: &Genesis) -> [u8; 32] {
     let issued: u128 = g.outputs.iter().map(|o| o.value_sat).sum();
     sha3_256(&[
         &DS_G4_STATE,

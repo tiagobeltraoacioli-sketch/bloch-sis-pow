@@ -26,7 +26,12 @@ use bloch_pos_committee::transition::GenesisValidator;
 // ─── Fixtures ───────────────────────────────────────────────────────────────
 
 fn entry(txid: u8, vout: u32, value: u64, script: u8) -> EutxoEntry {
-    EutxoEntry { txid: [txid; 32], vout, value, script_hash: [script; 32] }
+    EutxoEntry {
+        txid: [txid; 32],
+        vout,
+        value,
+        script_hash: [script; 32],
+    }
 }
 
 /// A committed genesis state with two validators and four outputs across two
@@ -123,11 +128,16 @@ fn sample_block(slot: u64, txs: usize) -> BlockEnvelope {
         signature: vec![0u8; 8],
     }];
     let transactions = (0..txs)
-        .map(|i| {
-            test_transfer(1, 250 + i as u64, 1_000).canonical_bytes()
-        })
+        .map(|i| test_transfer(1, 250 + i as u64, 1_000).canonical_bytes())
         .collect();
-    BlockEnvelope { header, proposer_sig: vec![0u8; 4], body: Body { transactions, attestations } }
+    BlockEnvelope {
+        header,
+        proposer_sig: vec![0u8; 4],
+        body: Body {
+            transactions,
+            attestations,
+        },
+    }
 }
 
 /// A backend that records the request and answers with a marker, so a routing
@@ -139,10 +149,16 @@ struct Spy {
 
 impl Spy {
     fn new() -> Arc<Self> {
-        Arc::new(Spy { seen: Mutex::new(Vec::new()), answer: Ok(Json::s("ok")) })
+        Arc::new(Spy {
+            seen: Mutex::new(Vec::new()),
+            answer: Ok(Json::s("ok")),
+        })
     }
     fn failing(err: RpcError) -> Arc<Self> {
-        Arc::new(Spy { seen: Mutex::new(Vec::new()), answer: Err(err) })
+        Arc::new(Spy {
+            seen: Mutex::new(Vec::new()),
+            answer: Err(err),
+        })
     }
     fn last(&self) -> Option<RpcRequest> {
         self.seen.lock().unwrap().last().cloned()
@@ -167,16 +183,17 @@ fn request(method: &str, params: &str) -> String {
 }
 
 fn error_code(v: &Json) -> Option<i64> {
-    v.get("error")?.get("code")?.as_u64().map(|u| u as i64).or_else(|| {
-        match v.get("error")?.get("code")? {
+    v.get("error")?
+        .get("code")?
+        .as_u64()
+        .map(|u| u as i64)
+        .or_else(|| match v.get("error")?.get("code")? {
             Json::Num(raw) => raw.parse().ok(),
             _ => None,
-        }
-    })
+        })
 }
 
 // ─── 1. Formatting, over real committed state ───────────────────────────────
-
 
 /// A transfer in the shape the consensus layer now takes: real spend points
 /// and real outputs, not the gas terms the variant carried before value
@@ -211,7 +228,10 @@ fn getchaininfo_reports_slot_epoch_head_root_and_both_checkpoints() {
     assert_eq!(v.get("slot").unwrap().as_u64(), Some(0));
     assert_eq!(v.get("epoch").unwrap().as_u64(), Some(0));
     assert_eq!(v.get("slot_in_epoch").unwrap().as_u64(), Some(0));
-    assert_eq!(v.get("block_id").unwrap().as_str(), Some(crate::codec::hex32(head.as_bytes()).as_str()));
+    assert_eq!(
+        v.get("block_id").unwrap().as_str(),
+        Some(crate::codec::hex32(head.as_bytes()).as_str())
+    );
     assert_eq!(
         v.get("state_root").unwrap().as_str(),
         Some(crate::codec::hex32(&st.state_root()).as_str())
@@ -219,14 +239,23 @@ fn getchaininfo_reports_slot_epoch_head_root_and_both_checkpoints() {
 
     // Genesis is justified and finalized by definition — finality needs a root
     // of trust, and epoch 0's checkpoint is it.
-    assert_eq!(v.get("justified").unwrap().get("epoch").unwrap().as_u64(), Some(0));
-    assert_eq!(v.get("finalized").unwrap().get("epoch").unwrap().as_u64(), Some(0));
+    assert_eq!(
+        v.get("justified").unwrap().get("epoch").unwrap().as_u64(),
+        Some(0)
+    );
+    assert_eq!(
+        v.get("finalized").unwrap().get("epoch").unwrap().as_u64(),
+        Some(0)
+    );
     assert_eq!(
         v.get("finalized").unwrap().get("root").unwrap().as_str(),
         Some(crate::codec::hex32(head.as_bytes()).as_str())
     );
 
-    assert_eq!(v.get("validators").unwrap().get("total").unwrap().as_u64(), Some(2));
+    assert_eq!(
+        v.get("validators").unwrap().get("total").unwrap().as_u64(),
+        Some(2)
+    );
     assert_eq!(v.get("wall_slot").unwrap().as_u64(), Some(12));
     assert_eq!(v.get("behind_by_slots").unwrap().as_u64(), Some(12));
     assert_eq!(v.get("mempool").unwrap().as_u64(), Some(3));
@@ -273,7 +302,10 @@ fn getblockbyslot_and_getblockbyid_share_one_block_shape() {
     // rather than with a plausible number.
     let orphan = block_json(&env, None, Finality::NotCanonical, 0);
     assert_eq!(orphan.get("height"), Some(&Json::Null));
-    assert_eq!(orphan.get("finality").unwrap().as_str(), Some("not_canonical"));
+    assert_eq!(
+        orphan.get("finality").unwrap().as_str(),
+        Some("not_canonical")
+    );
 }
 
 /// The field an exchange credits a deposit on. Under PoS the guarantee is
@@ -315,14 +347,22 @@ fn getblockcount_carries_the_finalized_height_beside_the_head() {
 #[test]
 fn getvalidator_reports_the_record_with_commission_and_lifecycle() {
     let st = state_with_balances();
-    let rec = st.validator_record(1).expect("validator 1 is in the genesis registry");
-    let effective =
-        st.active_validators().iter().find(|v| v.index == 1).map(|v| v.effective_stake);
+    let rec = st
+        .validator_record(1)
+        .expect("validator 1 is in the genesis registry");
+    let effective = st
+        .active_validators()
+        .iter()
+        .find(|v| v.index == 1)
+        .map(|v| v.effective_stake);
     let v = validator_json(&rec, effective, 0);
 
     assert_eq!(v.get("index").unwrap().as_u64(), Some(1));
     assert_eq!(v.get("state").unwrap().as_str(), Some("active"));
-    assert_eq!(v.get("own_stake_sat").unwrap().as_str(), Some("40000000000000"));
+    assert_eq!(
+        v.get("own_stake_sat").unwrap().as_str(),
+        Some("40000000000000")
+    );
     // R5: the rate rides on the response, because tokenomics leaves commission
     // uncapped on the bet that clients show it.
     assert_eq!(v.get("commission_bps").unwrap().as_str(), Some("1250"));
@@ -372,7 +412,10 @@ fn getbalance_sums_the_eutxo_set_for_one_script_hash() {
     let v = balance_json(&st, &[0xAB; 32]);
 
     // 9e18 + 9e18 + 500 — a sum that wraps u64 and does not wrap u128.
-    assert_eq!(v.get("balance_sat").unwrap().as_str(), Some("18000000000000000500"));
+    assert_eq!(
+        v.get("balance_sat").unwrap().as_str(),
+        Some("18000000000000000500")
+    );
     assert_eq!(v.get("utxo_count").unwrap().as_u64(), Some(3));
 
     let other = balance_json(&st, &[0xCD; 32]);
@@ -429,7 +472,10 @@ fn getutxos_lists_the_outputs_and_reports_truncation() {
     assert_eq!(entries.len(), 3);
     // Every returned output belongs to the requested script hash.
     for e in &entries {
-        assert_eq!(e.get("script_hash").unwrap().as_str(), Some(crate::codec::hex32(&[0xAB; 32]).as_str()));
+        assert_eq!(
+            e.get("script_hash").unwrap().as_str(),
+            Some(crate::codec::hex32(&[0xAB; 32]).as_str())
+        );
         assert!(e.get("txid").is_some() && e.get("vout").is_some());
     }
 
@@ -446,7 +492,10 @@ fn getmempoolinfo_reports_size_capacity_and_the_next_price() {
     assert_eq!(v.get("size").unwrap().as_u64(), Some(7));
     assert_eq!(v.get("max").unwrap().as_u64(), Some(4_096));
     assert_eq!(v.get("bytes").unwrap().as_u64(), Some(1_750));
-    assert_eq!(v.get("next_base_fee_millisat_per_gas").unwrap().as_str(), Some("1000"));
+    assert_eq!(
+        v.get("next_base_fee_millisat_per_gas").unwrap().as_str(),
+        Some("1000")
+    );
 }
 
 #[test]
@@ -456,10 +505,18 @@ fn sendrawtransaction_reply_names_the_kind_and_disclaims_the_hash() {
     assert_eq!(v.get("accepted"), Some(&Json::Bool(true)));
     assert_eq!(v.get("status").unwrap().as_str(), Some("accepted"));
     assert_eq!(v.get("kind").unwrap().as_str(), Some("transfer"));
-    assert_eq!(v.get("bytes").unwrap().as_u64(), Some(tx.canonical_bytes().len() as u64));
+    assert_eq!(
+        v.get("bytes").unwrap().as_u64(),
+        Some(tx.canonical_bytes().len() as u64)
+    );
     assert!(matches!(v.get("tx_hash"), Some(Json::Str(s)) if s.len() == 64));
     // The handle must not be mistaken for a consensus txid — there is none.
-    assert!(v.get("tx_hash_note").unwrap().as_str().unwrap().contains("not a consensus"));
+    assert!(v
+        .get("tx_hash_note")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .contains("not a consensus"));
 
     let dup = submitted_json(&tx, Admitted::Duplicate);
     assert_eq!(dup.get("status").unwrap().as_str(), Some("duplicate"));
@@ -483,7 +540,10 @@ fn every_method_routes_to_its_request() {
     call(b, &request("getblockbyslot", "[41290]"));
     assert_eq!(spy.last(), Some(RpcRequest::BlockBySlot(41_290)));
 
-    call(b, &request("getblockbyid", &format!("[\"{}\"]", "cd".repeat(32))));
+    call(
+        b,
+        &request("getblockbyid", &format!("[\"{}\"]", "cd".repeat(32))),
+    );
     assert_eq!(spy.last(), Some(RpcRequest::BlockById([0xCD; 32])));
 
     call(b, &request("getvalidator", "[7]"));
@@ -498,14 +558,21 @@ fn every_method_routes_to_its_request() {
     call(b, &request("getutxos", &format!("[\"{script}\"]")));
     assert_eq!(
         spy.last(),
-        Some(RpcRequest::Utxos { script_hash: [0xAB; 32], limit: UTXO_PAGE_DEFAULT })
+        Some(RpcRequest::Utxos {
+            script_hash: [0xAB; 32],
+            limit: UTXO_PAGE_DEFAULT
+        })
     );
 
     call(b, &request("getmempoolinfo", "[]"));
     assert_eq!(spy.last(), Some(RpcRequest::MempoolInfo));
 
     let tx = test_transfer(1, 250, 1_000);
-    let hex: String = tx.canonical_bytes().iter().map(|b| format!("{b:02x}")).collect();
+    let hex: String = tx
+        .canonical_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
     call(b, &request("sendrawtransaction", &format!("[\"{hex}\"]")));
     assert_eq!(spy.last(), Some(RpcRequest::SendRawTransaction(tx)));
 }
@@ -517,11 +584,23 @@ fn every_method_routes_to_its_request() {
 fn listunspent_is_the_same_request_as_getutxos() {
     let spy = Spy::new();
     let script = "ab".repeat(32);
-    call(spy.as_ref(), &request("getutxos", &format!("[\"{script}\", 5]")));
+    call(
+        spy.as_ref(),
+        &request("getutxos", &format!("[\"{script}\", 5]")),
+    );
     let a = spy.last();
-    call(spy.as_ref(), &request("listunspent", &format!("[\"{script}\", 5]")));
+    call(
+        spy.as_ref(),
+        &request("listunspent", &format!("[\"{script}\", 5]")),
+    );
     assert_eq!(a, spy.last());
-    assert_eq!(a, Some(RpcRequest::Utxos { script_hash: [0xAB; 32], limit: 5 }));
+    assert_eq!(
+        a,
+        Some(RpcRequest::Utxos {
+            script_hash: [0xAB; 32],
+            limit: 5
+        })
+    );
 }
 
 #[test]
@@ -538,10 +617,16 @@ fn named_params_work_as_well_as_positional() {
 fn getutxos_limit_is_clamped_rather_than_trusted() {
     let spy = Spy::new();
     let script = "ab".repeat(32);
-    call(spy.as_ref(), &request("getutxos", &format!("[\"{script}\", 99999999]")));
+    call(
+        spy.as_ref(),
+        &request("getutxos", &format!("[\"{script}\", 99999999]")),
+    );
     assert_eq!(
         spy.last(),
-        Some(RpcRequest::Utxos { script_hash: [0xAB; 32], limit: UTXO_PAGE_MAX }),
+        Some(RpcRequest::Utxos {
+            script_hash: [0xAB; 32],
+            limit: UTXO_PAGE_MAX
+        }),
         "an unbounded page size is a memory amplification on an unauthenticated port"
     );
 }
@@ -556,19 +641,43 @@ fn unsupported_capabilities_refuse_with_their_own_codes_and_reasons() {
 
     let v = call(spy.as_ref(), &request("gettransaction", r#"["ab"]"#));
     assert_eq!(error_code(&v), Some(NO_TRANSACTION_INDEX));
-    let msg = v.get("error").unwrap().get("message").unwrap().as_str().unwrap();
-    assert!(msg.contains("no id"), "the message must say why, not just no: {msg}");
-    assert!(msg.contains("do not retry"), "a permanent answer must say it is permanent");
-    assert!(spy.last().is_none(), "a refused method must never reach the node");
+    let msg = v
+        .get("error")
+        .unwrap()
+        .get("message")
+        .unwrap()
+        .as_str()
+        .unwrap();
+    assert!(
+        msg.contains("no id"),
+        "the message must say why, not just no: {msg}"
+    );
+    assert!(
+        msg.contains("do not retry"),
+        "a permanent answer must say it is permanent"
+    );
+    assert!(
+        spy.last().is_none(),
+        "a refused method must never reach the node"
+    );
 
     let v = call(spy.as_ref(), &request("getnewaddress", "[]"));
     assert_eq!(error_code(&v), Some(NO_WALLET));
-    let msg = v.get("error").unwrap().get("message").unwrap().as_str().unwrap();
+    let msg = v
+        .get("error")
+        .unwrap()
+        .get("message")
+        .unwrap()
+        .as_str()
+        .unwrap();
     assert!(
         msg.contains("never mint key material"),
         "the refusal must name the key-generation rule: {msg}"
     );
-    assert!(spy.last().is_none(), "a node RPC must not generate keys, ever");
+    assert!(
+        spy.last().is_none(),
+        "a node RPC must not generate keys, ever"
+    );
 }
 
 /// Bytes that are not a canonical transaction are refused **before** the node
@@ -580,7 +689,10 @@ fn sendrawtransaction_rejects_bytes_that_do_not_decode() {
     // Unknown discriminant.
     let v = call(spy.as_ref(), &request("sendrawtransaction", r#"["ff00"]"#));
     assert_eq!(error_code(&v), Some(TX_DECODE_FAILED));
-    assert!(spy.last().is_none(), "undecodable bytes must never reach the mempool");
+    assert!(
+        spy.last().is_none(),
+        "undecodable bytes must never reach the mempool"
+    );
 
     // Truncated mid-field: the tag is a valid Transfer, the fields are missing.
     let v = call(spy.as_ref(), &request("sendrawtransaction", r#"["0101"]"#));
@@ -593,7 +705,10 @@ fn sendrawtransaction_rejects_bytes_that_do_not_decode() {
     let mut trailing = PosTransaction::Exit { validator: 3 }.canonical_bytes();
     trailing.push(0);
     let hex: String = trailing.iter().map(|b| format!("{b:02x}")).collect();
-    let v = call(spy.as_ref(), &request("sendrawtransaction", &format!("[\"{hex}\"]")));
+    let v = call(
+        spy.as_ref(),
+        &request("sendrawtransaction", &format!("[\"{hex}\"]")),
+    );
     assert_eq!(error_code(&v), Some(TX_DECODE_FAILED));
     assert!(spy.last().is_none());
 
@@ -609,14 +724,25 @@ fn sendrawtransaction_rejects_bytes_that_do_not_decode() {
     let v = call(spy.as_ref(), &request("sendrawtransaction", r#"["zz"]"#));
     assert_eq!(error_code(&v), Some(-32602));
     let v = call(spy.as_ref(), &request("sendrawtransaction", r#"["010"]"#));
-    assert_eq!(error_code(&v), Some(-32602), "odd-length hex is not a partial decode");
+    assert_eq!(
+        error_code(&v),
+        Some(-32602),
+        "odd-length hex is not a partial decode"
+    );
     assert!(spy.last().is_none());
 
     // And a transaction that DOES decode reaches the node, so the tests above
     // are not passing because everything is refused.
     let good = PosTransaction::Exit { validator: 3 };
-    let hex: String = good.canonical_bytes().iter().map(|b| format!("{b:02x}")).collect();
-    call(spy.as_ref(), &request("sendrawtransaction", &format!("[\"{hex}\"]")));
+    let hex: String = good
+        .canonical_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    call(
+        spy.as_ref(),
+        &request("sendrawtransaction", &format!("[\"{hex}\"]")),
+    );
     assert_eq!(spy.last(), Some(RpcRequest::SendRawTransaction(good)));
 }
 
@@ -675,9 +801,18 @@ fn malformed_input_never_panics_and_always_answers_json_rpc() {
             v.to_string()
         );
         assert_eq!(v.get("jsonrpc").unwrap().as_str(), Some("2.0"));
-        assert!(v.get("result").is_none(), "R4: a failure must not carry a result");
         assert!(
-            !v.get("error").unwrap().get("message").unwrap().as_str().unwrap().is_empty(),
+            v.get("result").is_none(),
+            "R4: a failure must not carry a result"
+        );
+        assert!(
+            !v.get("error")
+                .unwrap()
+                .get("message")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .is_empty(),
             "every error must explain itself"
         );
     }
@@ -712,7 +847,10 @@ fn the_request_id_comes_back_unchanged_including_on_errors() {
 
     // An id past 2^53 must survive: it is a client's correlation key, and a
     // parser that routed it through a double would hand back a different one.
-    let v = call(b, r#"{"jsonrpc":"2.0","id":9007199254740993,"method":"getchaininfo"}"#);
+    let v = call(
+        b,
+        r#"{"jsonrpc":"2.0","id":9007199254740993,"method":"getchaininfo"}"#,
+    );
     assert_eq!(v.get("id"), Some(&Json::Num("9007199254740993".into())));
 
     // Absent id is echoed as null rather than invented.
@@ -750,7 +888,9 @@ fn an_unreachable_engine_is_reported_not_hung() {
     let (tx, rx) = mpsc::channel::<crate::engine::EngineEvent>();
     drop(rx);
     let backend = EngineBackend::new(tx);
-    let err = backend.call(RpcRequest::ChainInfo).expect_err("a dead engine must not look healthy");
+    let err = backend
+        .call(RpcRequest::ChainInfo)
+        .expect_err("a dead engine must not look healthy");
     assert_eq!(err.code, NODE_UNAVAILABLE);
     assert!(err.message.contains("shutting down"));
 }
@@ -770,7 +910,11 @@ fn json_strings_round_trip_through_escaping() {
     ] {
         let encoded = Json::s(original).to_string();
         let decoded = parse_json(&encoded).expect("our own output must parse");
-        assert_eq!(decoded.as_str(), Some(original), "round trip failed for {original:?}");
+        assert_eq!(
+            decoded.as_str(),
+            Some(original),
+            "round trip failed for {original:?}"
+        );
     }
 }
 
@@ -886,13 +1030,19 @@ fn http_that_is_not_a_json_rpc_post_is_answered_not_dropped() {
     // An over-large declared body is refused before it is read.
     let r = http(
         addr,
-        &format!("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n", MAX_BODY_BYTES + 1),
+        &format!(
+            "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n",
+            MAX_BODY_BYTES + 1
+        ),
     );
     assert!(r.starts_with("HTTP/1.1 413"), "got {r}");
 
     // Chunked encoding is not implemented and says so rather than parsing
     // chunk headers as JSON.
-    let r = http(addr, "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n");
+    let r = http(
+        addr,
+        "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+    );
     assert!(r.starts_with("HTTP/1.1 411"), "got {r}");
 
     // Every refusal still carries a JSON-RPC error body, so a client that only
@@ -927,7 +1077,11 @@ fn a_body_split_across_packets_is_reassembled() {
     let mut sock = TcpStream::connect(addr).unwrap();
     sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     sock.write_all(
-        format!("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n", body.len()).as_bytes(),
+        format!(
+            "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .as_bytes(),
     )
     .unwrap();
     // Deliberately dribble the body in two writes: a reader that assumed one

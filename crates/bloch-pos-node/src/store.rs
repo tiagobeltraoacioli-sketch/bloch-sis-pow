@@ -48,8 +48,7 @@ impl Store {
             Ok(bytes) => {
                 let ok = bytes.len() == 8 + 4 + 32
                     && &bytes[..8] == META_MAGIC
-                    && bytes[8..12]
-                        == bloch_pos_committee::header::VERSION_G4.to_le_bytes()
+                    && bytes[8..12] == bloch_pos_committee::header::VERSION_G4.to_le_bytes()
                     && &bytes[12..44] == genesis_digest;
                 if !ok {
                     return Err(io::Error::new(
@@ -76,7 +75,10 @@ impl Store {
             .append(true)
             .read(true)
             .open(dir.join("blocks.log"))?;
-        Ok(Store { dir: dir.to_path_buf(), log })
+        Ok(Store {
+            dir: dir.to_path_buf(),
+            log,
+        })
     }
 
     /// Append one applied block. One write, then fsync — the block is only
@@ -105,7 +107,10 @@ impl Store {
         while at + 4 <= bytes.len() {
             let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
             if len > crate::codec::MAX_FIELD_LEN {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "log frame over cap"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "log frame over cap",
+                ));
             }
             if at + 4 + len > bytes.len() {
                 eprintln!("store: dropping truncated trailing log frame (crash mid-append)");
@@ -180,27 +185,61 @@ impl Store {
             }
             let len = u32::from_le_bytes(len4) as usize;
             if len > crate::codec::MAX_FIELD_LEN {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "log frame over cap"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "log frame over cap",
+                ));
             }
-            let mut payload = vec![0u8; len];
-            match f.read_exact(&mut payload) {
+            // Read the HEADER only, then decide. The body — signatures and
+            // attestations, which are nearly all of a block's bytes — is read
+            // solely for the blocks the caller asked for, and seeked past for
+            // the rest.
+            //
+            // This used to read every payload in full and then discard the ones
+            // it did not want. The comment already said only the header was
+            // parsed; the code read the body anyway. On 2026-08-14 that turned
+            // an ordinary "anything after my head?" question into a full scan
+            // of the chain log, several times a minute, per peer: five nodes on
+            // one box read 19.9 GB out of a 31 MB file and stopped producing
+            // blocks. The chain was down for hours behind this line.
+            let hdr_len = bloch_pos_committee::header::BlockHeaderV4::ENCODED_LEN;
+            if len < hdr_len {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "log frame shorter than a header",
+                ));
+            }
+            let mut hdr = vec![0u8; hdr_len];
+            match f.read_exact(&mut hdr) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
                 Err(e) => return Err(e),
             }
-            // Only the header is parsed while skipping: the slot is all the
-            // filter needs, and the signatures/attestations behind it are the
-            // expensive part.
-            let hdr_len = bloch_pos_committee::header::BlockHeaderV4::ENCODED_LEN;
-            if payload.len() < hdr_len {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "log frame shorter than a header"));
-            }
-            let header = bloch_pos_committee::header::BlockHeaderV4::canonical_deserialize(
-                &payload[..hdr_len],
-            )
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "undecodable header in block log"))?;
+            let header =
+                bloch_pos_committee::header::BlockHeaderV4::canonical_deserialize(&hdr).map_err(
+                    |_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "undecodable header in block log",
+                        )
+                    },
+                )?;
+            let rest = len - hdr_len;
             if header.slot > after_slot {
+                let mut payload = hdr;
+                payload.resize(len, 0);
+                match f.read_exact(&mut payload[hdr_len..]) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                    Err(e) => return Err(e),
+                }
                 out.push(payload);
+            } else if rest > 0 {
+                // Skip without reading. A truncated trailing frame ends the log
+                // exactly as a short read would.
+                if f.seek_relative(rest as i64).is_err() {
+                    break;
+                }
             }
         }
         Ok(out)
@@ -210,6 +249,39 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Skipping must not corrupt what it returns.
+    ///
+    /// The regression this pins cost the chain hours of downtime: `blocks_after`
+    /// read every payload in full and then discarded the unwanted ones, so a
+    /// peer asking "anything after my head?" paid a full scan of the log. The
+    /// skip path now seeks past bodies instead, and this asserts the answers are
+    /// identical either way — the tail alone, and the whole log.
+    #[test]
+    fn blocks_after_skips_bodies_and_still_returns_them_intact() {
+        let dir = std::env::temp_dir().join(format!("bloch-pos-skip-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, &[7u8; 32]).expect("open");
+
+        let n = 40u64;
+        let mut ids = Vec::new();
+        for slot in 1..=n {
+            let env = sample_envelope(slot);
+            ids.push(crate::codec::encode_envelope(&env));
+            store.append(&env).expect("append");
+        }
+
+        // The hot path: a caller at the tip, where almost every frame is skipped.
+        let tail = Store::blocks_after(&dir, n - 3, 100).expect("scan");
+        assert_eq!(tail.len(), 3, "expected the last three blocks");
+        assert_eq!(tail, ids[(n as usize - 3)..], "skipped frames must not shift the ones returned");
+
+        // And the cold path still returns the log byte for byte.
+        let all = Store::blocks_after(&dir, 0, 1000).expect("scan");
+        assert_eq!(all, ids, "the full log must come back unchanged");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     /// The from-genesis path, at the store level: `after_slot = 0` must return
     /// the chain from its beginning, and the cap must be a cap.
@@ -229,18 +301,32 @@ mod tests {
         }
 
         let from_genesis = Store::blocks_after(&dir, 0, 100).expect("scan");
-        assert_eq!(from_genesis.len(), 5, "a cold peer asking from slot 0 gets the whole chain");
-        assert_eq!(from_genesis, ids, "served bytes are the logged bytes, verbatim");
+        assert_eq!(
+            from_genesis.len(),
+            5,
+            "a cold peer asking from slot 0 gets the whole chain"
+        );
+        assert_eq!(
+            from_genesis, ids,
+            "served bytes are the logged bytes, verbatim"
+        );
 
         let capped = Store::blocks_after(&dir, 0, 2).expect("scan");
         assert_eq!(capped.len(), 2, "the cap bounds one answer");
-        assert_eq!(capped, ids[..2], "and it is the FIRST two, so paging makes progress");
+        assert_eq!(
+            capped,
+            ids[..2],
+            "and it is the FIRST two, so paging makes progress"
+        );
 
         let tail = Store::blocks_after(&dir, 3, 100).expect("scan");
         assert_eq!(tail.len(), 2, "slot > after_slot, strictly");
 
         let past_tip = Store::blocks_after(&dir, 99, 100).expect("scan");
-        assert!(past_tip.is_empty(), "a peer at the tip is told there is nothing more");
+        assert!(
+            past_tip.is_empty(),
+            "a peer at the tip is told there is nothing more"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -263,7 +349,10 @@ mod tests {
                 coherence_root: [9; 32],
             },
             proposer_sig: vec![0xAA; 32],
-            body: Body { transactions: Vec::new(), attestations: Vec::new() },
+            body: Body {
+                transactions: Vec::new(),
+                attestations: Vec::new(),
+            },
         }
     }
 }

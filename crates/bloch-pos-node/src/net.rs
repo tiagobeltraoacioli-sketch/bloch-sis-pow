@@ -161,7 +161,10 @@ fn read_frame(sock: &mut TcpStream) -> std::io::Result<Vec<u8>> {
     sock.read_exact(&mut len4)?;
     let len = u32::from_le_bytes(len4) as usize;
     if len == 0 || len > crate::codec::MAX_FIELD_LEN {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bad frame length"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "bad frame length",
+        ));
     }
     let mut buf = vec![0u8; len];
     sock.read_exact(&mut buf)?;
@@ -172,9 +175,9 @@ fn read_frame(sock: &mut TcpStream) -> std::io::Result<Vec<u8>> {
 /// socket owner (it needs write access), not here.
 fn decode_event(frame: &[u8]) -> Option<NetEvent> {
     match frame.first()? {
-        &FRAME_BLOCK => {
-            crate::codec::decode_envelope(&frame[1..]).ok().map(NetEvent::Block)
-        }
+        &FRAME_BLOCK => crate::codec::decode_envelope(&frame[1..])
+            .ok()
+            .map(NetEvent::Block),
         &FRAME_ATT => {
             let mut r = crate::codec::Reader::new(&frame[1..]);
             let att = crate::codec::decode_attestation(&mut r).ok()?;
@@ -199,12 +202,22 @@ fn serve_get_blocks(sock: &mut TcpStream, data_dir: &PathBuf, frame: &[u8]) {
         return;
     }
     let after = u64::from_le_bytes(frame[1..9].try_into().unwrap());
-    // Uncapped on this transport, deliberately: the devnet mesh has no
-    // pagination, so a restarting node's single request must be answered in
-    // full or it never catches up. That is one of the reasons this transport
-    // is not the production one — the production path pages
-    // (`p2p::MAX_SYNC_BLOCKS`) so no single answer can become a history dump.
-    match crate::store::Store::blocks_after(data_dir, after, usize::MAX) {
+    // Capped, at the same page size the production path uses.
+    //
+    // This was `usize::MAX`, on the reasoning that this mesh has no pagination
+    // and so a restarting node must be answered in full. The request carries
+    // `after_slot` and the engine re-asks every two slots while it is behind —
+    // which is pagination, just spelled differently. Answering in full only
+    // meant every answer was the entire chain.
+    //
+    // On 2026-08-14 five nodes restarted together on one box. Each reported
+    // slot 0 while it replayed, each asked the others for everything after slot
+    // 0 every two slots, and each answer re-read and re-sent the whole 31 MB
+    // log. The box read gigabytes a minute out of that file, no node ever
+    // finished starting, and the chain stopped for hours. A cap is what lets a
+    // cold node catch up in pages instead of asking four peers to dump their
+    // history at it simultaneously.
+    match crate::store::Store::blocks_after(data_dir, after, crate::p2p::MAX_SYNC_BLOCKS) {
         Ok(blocks) => {
             for b in blocks {
                 let mut f = Vec::with_capacity(1 + b.len());
@@ -298,8 +311,11 @@ pub fn start(
                 });
             }
             // Ask for everything we missed, then drain the broadcast queue.
-            if write_frame(&mut wsock, &get_blocks_frame(head_slot.load(Ordering::Relaxed)))
-                .is_err()
+            if write_frame(
+                &mut wsock,
+                &get_blocks_frame(head_slot.load(Ordering::Relaxed)),
+            )
+            .is_err()
             {
                 continue;
             }

@@ -235,15 +235,30 @@ const G3_ADDRESS_HEX: usize = G3_ADDRESS_BYTES * 2;
 pub enum CarryoverError {
     Io(io::Error),
     /// A line that could not be parsed, with its 1-based number.
-    Line { line: u64, what: String },
+    Line {
+        line: u64,
+        what: String,
+    },
     /// The bytes are not the committed bytes.
-    Digest { found: [u8; 32], expected: [u8; 32] },
+    Digest {
+        found: [u8; 32],
+        expected: [u8; 32],
+    },
     /// The bytes parse, and describe a different set of outputs.
-    SetRoot { found: [u8; 32], expected: [u8; 32] },
+    SetRoot {
+        found: [u8; 32],
+        expected: [u8; 32],
+    },
     /// The right kind of file, the wrong number of outputs.
-    Count { found: u64, expected: u64 },
+    Count {
+        found: u64,
+        expected: u64,
+    },
     /// The right shape, the wrong money.
-    Total { found: u128, expected: u128 },
+    Total {
+        found: u128,
+        expected: u128,
+    },
     /// A snapshot was offered to a manifest that commits to none.
     NotCommitted,
 }
@@ -276,7 +291,11 @@ impl std::fmt::Display for CarryoverError {
                 "carryover ENTRY-COUNT mismatch: the file carries {found} outputs, \
                  the manifest commits to {expected} ({} {})",
                 found.abs_diff(*expected),
-                if found > expected { "too many" } else { "missing" },
+                if found > expected {
+                    "too many"
+                } else {
+                    "missing"
+                },
             ),
             CarryoverError::Total { found, expected } => write!(
                 f,
@@ -332,17 +351,29 @@ impl CarryoverSnapshot {
     /// wrong set), count, total.
     pub fn check_against(&self, c: &CarryoverCommitment) -> Result<(), CarryoverError> {
         if self.digest != c.digest {
-            return Err(CarryoverError::Digest { found: self.digest, expected: c.digest });
+            return Err(CarryoverError::Digest {
+                found: self.digest,
+                expected: c.digest,
+            });
         }
         if self.set_root != c.set_root {
-            return Err(CarryoverError::SetRoot { found: self.set_root, expected: c.set_root });
+            return Err(CarryoverError::SetRoot {
+                found: self.set_root,
+                expected: c.set_root,
+            });
         }
         let n = self.entries.len() as u64;
         if n != c.entry_count {
-            return Err(CarryoverError::Count { found: n, expected: c.entry_count });
+            return Err(CarryoverError::Count {
+                found: n,
+                expected: c.entry_count,
+            });
         }
         if self.total_sat != c.total_sat {
-            return Err(CarryoverError::Total { found: self.total_sat, expected: c.total_sat });
+            return Err(CarryoverError::Total {
+                found: self.total_sat,
+                expected: c.total_sat,
+            });
         }
         Ok(())
     }
@@ -516,7 +547,10 @@ pub fn read_carryover_snapshot<R: BufRead>(
         if line.len() > MAX_SNAPSHOT_LINE {
             return Err(CarryoverError::Line {
                 line: n,
-                what: format!("line is {} bytes, over the {MAX_SNAPSHOT_LINE} cap", line.len()),
+                what: format!(
+                    "line is {} bytes, over the {MAX_SNAPSHOT_LINE} cap",
+                    line.len()
+                ),
             });
         }
 
@@ -524,7 +558,10 @@ pub fn read_carryover_snapshot<R: BufRead>(
         let text = match std::str::from_utf8(body) {
             Ok(t) => t,
             Err(_) => {
-                return Err(CarryoverError::Line { line: n, what: "not UTF-8".into() });
+                return Err(CarryoverError::Line {
+                    line: n,
+                    what: "not UTF-8".into(),
+                });
             }
         };
         if text.ends_with('\r') {
@@ -545,9 +582,13 @@ pub fn read_carryover_snapshot<R: BufRead>(
         }
 
         let mut cols = text.split('\t');
-        let (Some(txid_s), Some(vout_s), Some(value_s), Some(script_s), None) =
-            (cols.next(), cols.next(), cols.next(), cols.next(), cols.next())
-        else {
+        let (Some(txid_s), Some(vout_s), Some(value_s), Some(script_s), None) = (
+            cols.next(),
+            cols.next(),
+            cols.next(),
+            cols.next(),
+            cols.next(),
+        ) else {
             return Err(CarryoverError::Line {
                 line: n,
                 what: format!(
@@ -992,7 +1033,8 @@ impl Manifest {
         keys.sort_unstable();
         for w in keys.windows(2) {
             assert_ne!(
-                w[0], w[1],
+                w[0],
+                w[1],
                 "duplicate genesis outpoint {}:{} — one of these two outputs would vanish \
                  into the state map",
                 crate::codec::hex32(w[0].0),
@@ -1239,7 +1281,11 @@ mod tests {
     fn the_address_is_zero_extended_to_the_right() {
         let s = read(SNAPSHOT).expect("fixture parses");
         let h = s.entries[0].script_hash;
-        assert_eq!(&h[..20], &[0xAA; 20], "the G3 hash160 must be the leading 20 bytes");
+        assert_eq!(
+            &h[..20],
+            &[0xAA; 20],
+            "the G3 hash160 must be the leading 20 bytes"
+        );
         assert_eq!(&h[20..], &[0u8; 12], "the trailing 12 bytes must be zero");
         // Explicitly not the left-padded arrangement, spelled out so the
         // wrong one cannot be introduced and still pass by symmetry.
@@ -1276,7 +1322,11 @@ mod tests {
     #[test]
     fn carryover_digests_match_the_published_conventions() {
         let s = read(SNAPSHOT).expect("fixture parses");
-        assert_eq!(crate::codec::hex32(&s.digest), SNAPSHOT_DIGEST, "SHA3-256 of the bytes");
+        assert_eq!(
+            crate::codec::hex32(&s.digest),
+            SNAPSHOT_DIGEST,
+            "SHA3-256 of the bytes"
+        );
         assert_eq!(
             crate::codec::hex32(&s.set_root),
             SNAPSHOT_SET_ROOT,
@@ -1331,7 +1381,10 @@ mod tests {
         );
         let s = read(text).expect("parses");
         assert_eq!(s.dust_sat, 1);
-        assert_eq!(s.entries[0].value, 53, "the lower outpoint of the tied pair takes it");
+        assert_eq!(
+            s.entries[0].value, 53,
+            "the lower outpoint of the tied pair takes it"
+        );
         assert_eq!(s.entries[1].value, 52, "the higher outpoint does not");
         assert_eq!(s.entries[2].value, 23);
 
@@ -1345,7 +1398,10 @@ mod tests {
         );
         let t = read(swapped).expect("parses");
         assert_eq!(t.entries[0].value, 23);
-        assert_eq!(t.entries[1].value, 53, "still the lowest outpoint among the tied maxima");
+        assert_eq!(
+            t.entries[1].value, 53,
+            "still the lowest outpoint among the tied maxima"
+        );
         assert_eq!(t.entries[2].value, 52);
     }
 
@@ -1376,7 +1432,10 @@ mod tests {
         let s = read(&text).expect("generated snapshot parses");
         assert_eq!(s.entries.len() as u64, N);
         assert_eq!(s.g3_total_sat, g3_total);
-        assert!(s.dust_sat > 0, "most rows must truncate for this test to mean anything");
+        assert!(
+            s.dust_sat > 0,
+            "most rows must truncate for this test to mean anything"
+        );
         let summed: u128 = s.entries.iter().map(|e| u128::from(e.value)).sum();
         assert_eq!(
             summed,
@@ -1398,7 +1457,9 @@ mod tests {
         let path = snapshot_file("good", SNAPSHOT);
         let mut m = sample();
         m.carryover = Some(snapshot_commitment());
-        let s = m.ingest_carryover(&path).expect("the committed file is accepted");
+        let s = m
+            .ingest_carryover(&path)
+            .expect("the committed file is accepted");
         assert_eq!(s.entries.len(), 4);
         assert_eq!(m.carryover_entries.len(), 4);
         let _ = fs::remove_file(&path);
@@ -1409,7 +1470,10 @@ mod tests {
     fn carryover_wrong_digest_is_refused() {
         let mut c = snapshot_commitment();
         c.digest[0] ^= 1;
-        let err = read(SNAPSHOT).unwrap().check_against(&c).expect_err("must refuse");
+        let err = read(SNAPSHOT)
+            .unwrap()
+            .check_against(&c)
+            .expect_err("must refuse");
         assert!(matches!(err, CarryoverError::Digest { .. }), "{err}");
         let msg = err.to_string();
         assert!(msg.contains("FILE-DIGEST mismatch"), "{msg}");
@@ -1426,7 +1490,10 @@ mod tests {
     fn carryover_wrong_set_root_is_refused() {
         let mut c = snapshot_commitment();
         c.set_root[31] ^= 1;
-        let err = read(SNAPSHOT).unwrap().check_against(&c).expect_err("must refuse");
+        let err = read(SNAPSHOT)
+            .unwrap()
+            .check_against(&c)
+            .expect_err("must refuse");
         assert!(matches!(err, CarryoverError::SetRoot { .. }), "{err}");
         let msg = err.to_string();
         assert!(msg.contains("SET-ROOT mismatch"), "{msg}");
@@ -1440,8 +1507,20 @@ mod tests {
     fn carryover_wrong_count_is_refused() {
         let mut c = snapshot_commitment();
         c.entry_count = 5;
-        let err = read(SNAPSHOT).unwrap().check_against(&c).expect_err("must refuse");
-        assert!(matches!(err, CarryoverError::Count { found: 4, expected: 5 }), "{err}");
+        let err = read(SNAPSHOT)
+            .unwrap()
+            .check_against(&c)
+            .expect_err("must refuse");
+        assert!(
+            matches!(
+                err,
+                CarryoverError::Count {
+                    found: 4,
+                    expected: 5
+                }
+            ),
+            "{err}"
+        );
         let msg = err.to_string();
         assert!(msg.contains("ENTRY-COUNT mismatch"), "{msg}");
         // By how much, and in which direction.
@@ -1455,11 +1534,17 @@ mod tests {
     fn carryover_wrong_total_is_refused() {
         let mut c = snapshot_commitment();
         c.total_sat += 100_000_000;
-        let err = read(SNAPSHOT).unwrap().check_against(&c).expect_err("must refuse");
+        let err = read(SNAPSHOT)
+            .unwrap()
+            .check_against(&c)
+            .expect_err("must refuse");
         assert!(matches!(err, CarryoverError::Total { .. }), "{err}");
         let msg = err.to_string();
         assert!(msg.contains("TOTAL mismatch"), "{msg}");
-        assert!(msg.contains("100000000"), "the message must say by how much: {msg}");
+        assert!(
+            msg.contains("100000000"),
+            "the message must say by how much: {msg}"
+        );
         assert!(msg.contains("poorer"), "{msg}");
     }
 
@@ -1490,7 +1575,13 @@ mod tests {
         }
         // And the same file without the bad line parses, so each case above
         // failed for its own reason and not because the fixture is broken.
-        assert_eq!(read(good).expect("the good line alone parses").entries.len(), 1);
+        assert_eq!(
+            read(good)
+                .expect("the good line alone parses")
+                .entries
+                .len(),
+            1
+        );
     }
 
     /// A repeated or out-of-order outpoint is refused. `CommittedState`
@@ -1501,12 +1592,18 @@ mod tests {
     fn duplicate_and_unsorted_outpoints_are_refused() {
         let line = "1111111111111111111111111111111111111111111111111111111111111111\t0\t5\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
         let dup = format!("{line}{line}");
-        assert!(matches!(read(&dup), Err(CarryoverError::Line { line: 2, .. })));
+        assert!(matches!(
+            read(&dup),
+            Err(CarryoverError::Line { line: 2, .. })
+        ));
 
         let descending = format!(
             "2222222222222222222222222222222222222222222222222222222222222222\t0\t5\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n{line}"
         );
-        assert!(matches!(read(&descending), Err(CarryoverError::Line { line: 2, .. })));
+        assert!(matches!(
+            read(&descending),
+            Err(CarryoverError::Line { line: 2, .. })
+        ));
     }
 
     /// A manifest with no commitment refuses a snapshot outright: nothing in
@@ -1515,7 +1612,9 @@ mod tests {
     fn a_devnet_manifest_refuses_a_snapshot() {
         let path = snapshot_file("uncommitted", SNAPSHOT);
         let mut m = sample();
-        let err = m.ingest_carryover(&path).expect_err("no commitment, no ingestion");
+        let err = m
+            .ingest_carryover(&path)
+            .expect_err("no commitment, no ingestion");
         assert!(matches!(err, CarryoverError::NotCommitted), "{err}");
         let _ = fs::remove_file(&path);
     }
@@ -1614,7 +1713,8 @@ mod tests {
             unlock_epoch: 0,
         })
         .collect();
-        m.check_supply().expect("carryover + the five buckets must equal GENESIS_ISSUED_SAT");
+        m.check_supply()
+            .expect("carryover + the five buckets must equal GENESIS_ISSUED_SAT");
         assert_eq!(t::CARRYOVER_MEASURED_UTXOS, 452_726);
         assert_eq!(t::CARRYOVER_MEASURED_HEIGHT, 39_918);
     }
@@ -1626,7 +1726,10 @@ mod tests {
         let b = m.allocation_outputs();
         assert_eq!(a, b, "same manifest must synthesise the same outputs");
         assert_eq!(a.len(), 2);
-        assert_ne!(a[0].txid, a[1].txid, "two allocations must not share a txid");
+        assert_ne!(
+            a[0].txid, a[1].txid,
+            "two allocations must not share a txid"
+        );
         // Value survives the u128 -> u64 narrowing intact.
         assert_eq!(u128::from(a[0].value), m.allocations[0].amount_sat);
         assert_eq!(a[0].script_hash, m.allocations[0].script_hash);
@@ -1652,7 +1755,11 @@ mod tests {
         let back = Manifest::decode(&m.encode()).expect("round trip");
         assert_eq!(back.carryover, m.carryover);
         assert_eq!(back.allocations, m.allocations);
-        assert_eq!(back.encode(), m.encode(), "re-encoding must be byte-identical");
+        assert_eq!(
+            back.encode(),
+            m.encode(),
+            "re-encoding must be byte-identical"
+        );
     }
 
     #[test]
@@ -1674,7 +1781,10 @@ mod tests {
         let flag_at = bytes.len() - 4 - 1;
         assert_eq!(bytes[flag_at], 0, "test targets the carryover flag");
         bytes[flag_at] = 2;
-        assert!(Manifest::decode(&bytes).is_err(), "a third flag value must be refused");
+        assert!(
+            Manifest::decode(&bytes).is_err(),
+            "a third flag value must be refused"
+        );
     }
 
     #[test]
@@ -1686,7 +1796,9 @@ mod tests {
         // A mainnet manifest that does not add up is refused, and the message
         // says by how much rather than just "invalid".
         let bad = mainnet_sample();
-        let err = bad.check_supply().expect_err("27.97 B is not the §3 figure");
+        let err = bad
+            .check_supply()
+            .expect_err("27.97 B is not the §3 figure");
         assert!(err.contains("tokenomics"), "{err}");
 
         // And one that does add up passes. Built from the constants, never
@@ -1706,7 +1818,8 @@ mod tests {
             amount_sat: rest,
             unlock_epoch: 0,
         }];
-        good.check_supply().expect("carryover + allocations must equal GENESIS_ISSUED_SAT");
+        good.check_supply()
+            .expect("carryover + allocations must equal GENESIS_ISSUED_SAT");
     }
 
     #[test]
@@ -1718,14 +1831,23 @@ mod tests {
         assert_eq!(back.slot_ms, m.slot_ms);
         assert_eq!(back.validators.len(), 3);
         assert_eq!(
-            back.validators.iter().map(|v| v.commission_bps).collect::<Vec<_>>(),
-            m.validators.iter().map(|v| v.commission_bps).collect::<Vec<_>>(),
+            back.validators
+                .iter()
+                .map(|v| v.commission_bps)
+                .collect::<Vec<_>>(),
+            m.validators
+                .iter()
+                .map(|v| v.commission_bps)
+                .collect::<Vec<_>>(),
         );
         assert_eq!(back.cohort, m.cohort);
         // Genesis identity and state are pure functions of the manifest.
         use bloch_pos_committee::interfaces::StateReader;
         assert_eq!(back.genesis_id(), m.genesis_id());
-        assert_eq!(back.genesis_state().state_root(), m.genesis_state().state_root());
+        assert_eq!(
+            back.genesis_state().state_root(),
+            m.genesis_state().state_root()
+        );
     }
 
     #[test]

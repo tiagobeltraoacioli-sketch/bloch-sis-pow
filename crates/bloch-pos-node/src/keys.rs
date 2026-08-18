@@ -54,7 +54,12 @@ impl Keystore {
         let (pubkey, secret) = bloch_crypto::crypto::generate_keypair();
         let mut randao_seed = [0u8; 32];
         os_random(&mut randao_seed)?;
-        let ks = Keystore { index, pubkey, secret, randao_seed };
+        let ks = Keystore {
+            index,
+            pubkey,
+            secret,
+            randao_seed,
+        };
         ks.save(dir)?;
         Ok(ks)
     }
@@ -90,7 +95,12 @@ impl Keystore {
         let secret = r.bytes().map_err(|_| bad("truncated keystore"))?;
         let randao_seed = r.h32().map_err(|_| bad("truncated keystore"))?;
         r.finish().map_err(|_| bad("trailing bytes in keystore"))?;
-        Ok(Keystore { index, pubkey, secret, randao_seed })
+        Ok(Keystore {
+            index,
+            pubkey,
+            secret,
+            randao_seed,
+        })
     }
 
     /// Sign a 32-byte consensus signing root with both halves of the hybrid
@@ -115,7 +125,9 @@ pub struct HybridVerifier {
 
 impl HybridVerifier {
     pub fn new(pubkeys: Vec<Vec<u8>>) -> Self {
-        HybridVerifier { pubkeys: std::sync::Arc::new(pubkeys) }
+        HybridVerifier {
+            pubkeys: std::sync::Arc::new(pubkeys),
+        }
     }
 }
 

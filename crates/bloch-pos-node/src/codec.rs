@@ -120,7 +120,11 @@ pub fn decode_attestation(r: &mut Reader<'_>) -> Result<Attestation, DecodeErr> 
     };
     let validator = r.u32()?;
     let signature = r.bytes()?;
-    Ok(Attestation { data, validator, signature })
+    Ok(Attestation {
+        data,
+        validator,
+        signature,
+    })
 }
 
 // ── Block envelope ──────────────────────────────────────────────────────────
@@ -143,8 +147,7 @@ pub fn encode_envelope(env: &BlockEnvelope) -> Vec<u8> {
 pub fn decode_envelope(buf: &[u8]) -> Result<BlockEnvelope, DecodeErr> {
     let mut r = Reader::new(buf);
     let hb = r.take(BlockHeaderV4::ENCODED_LEN)?;
-    let header =
-        BlockHeaderV4::canonical_deserialize(hb).map_err(|_| DecodeErr("bad header"))?;
+    let header = BlockHeaderV4::canonical_deserialize(hb).map_err(|_| DecodeErr("bad header"))?;
     let proposer_sig = r.bytes()?;
     let natt = r.u32()? as usize;
     if natt > 4096 {
@@ -163,7 +166,14 @@ pub fn decode_envelope(buf: &[u8]) -> Result<BlockEnvelope, DecodeErr> {
         transactions.push(r.bytes()?);
     }
     r.finish()?;
-    Ok(BlockEnvelope { header, proposer_sig, body: Body { transactions, attestations } })
+    Ok(BlockEnvelope {
+        header,
+        proposer_sig,
+        body: Body {
+            transactions,
+            attestations,
+        },
+    })
 }
 
 // ── Small helpers ───────────────────────────────────────────────────────────
@@ -193,8 +203,12 @@ pub fn unhex(s: &str) -> Result<Vec<u8>, String> {
     let mut out = Vec::with_capacity(s.len() / 2);
     let b = s.as_bytes();
     for pair in b.chunks(2) {
-        let hi = (pair[0] as char).to_digit(16).ok_or_else(|| format!("bad hex digit {:?}", pair[0] as char))?;
-        let lo = (pair[1] as char).to_digit(16).ok_or_else(|| format!("bad hex digit {:?}", pair[1] as char))?;
+        let hi = (pair[0] as char)
+            .to_digit(16)
+            .ok_or_else(|| format!("bad hex digit {:?}", pair[0] as char))?;
+        let lo = (pair[1] as char)
+            .to_digit(16)
+            .ok_or_else(|| format!("bad hex digit {:?}", pair[1] as char))?;
         out.push((hi * 16 + lo) as u8);
     }
     Ok(out)
@@ -236,7 +250,10 @@ mod tests {
         BlockEnvelope {
             header,
             proposer_sig: vec![0xDD; 4589],
-            body: Body { transactions: vec![vec![0xEE, 0xFF]], attestations: vec![att] },
+            body: Body {
+                transactions: vec![vec![0xEE, 0xFF]],
+                attestations: vec![att],
+            },
         }
     }
 
@@ -249,8 +266,14 @@ mod tests {
         assert_eq!(back.proposer_sig, env.proposer_sig);
         assert_eq!(back.body.transactions, env.body.transactions);
         assert_eq!(back.body.attestations.len(), 1);
-        assert_eq!(back.body.attestations[0].data, env.body.attestations[0].data);
-        assert_eq!(back.body.attestations[0].signature, env.body.attestations[0].signature);
+        assert_eq!(
+            back.body.attestations[0].data,
+            env.body.attestations[0].data
+        );
+        assert_eq!(
+            back.body.attestations[0].signature,
+            env.body.attestations[0].signature
+        );
         // Identity is preserved through the codec — same bytes, same id.
         assert_eq!(back.block_id(), env.block_id());
     }
@@ -259,7 +282,10 @@ mod tests {
     fn envelope_decode_rejects_trailing_bytes() {
         let mut bytes = encode_envelope(&sample_envelope());
         bytes.push(0);
-        assert!(decode_envelope(&bytes).is_err(), "encode(x) ‖ junk must not decode");
+        assert!(
+            decode_envelope(&bytes).is_err(),
+            "encode(x) ‖ junk must not decode"
+        );
     }
 
     #[test]

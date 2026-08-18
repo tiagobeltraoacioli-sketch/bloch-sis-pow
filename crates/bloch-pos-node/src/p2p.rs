@@ -397,7 +397,8 @@ pub fn decode_sync_request(buf: &[u8]) -> Result<SyncRequest, crate::codec::Deco
 pub fn encode_sync_response(resp: &SyncResponse) -> Vec<u8> {
     match resp {
         SyncResponse::Blocks { envelopes } => {
-            let mut out = Vec::with_capacity(5 + envelopes.iter().map(|e| e.len() + 4).sum::<usize>());
+            let mut out =
+                Vec::with_capacity(5 + envelopes.iter().map(|e| e.len() + 4).sum::<usize>());
             out.push(SYNC_TAG_BLOCKS);
             out.extend_from_slice(&(envelopes.len() as u32).to_le_bytes());
             for e in envelopes {
@@ -574,12 +575,18 @@ pub fn peer_score_params(behind_proxy: bool) -> PeerScoreParams {
         ..PeerScoreParams::default()
     };
     // Blocks carry the chain; a peer that lies about one is the worst kind.
-    params.topics.insert(IdentTopic::new(TOPIC_BLOCKS).hash(), topic_params(0.5, -100.0));
+    params.topics.insert(
+        IdentTopic::new(TOPIC_BLOCKS).hash(),
+        topic_params(0.5, -100.0),
+    );
     // Attestations are the highest-rate topic and the one `gossip.rs` judges.
+    params.topics.insert(
+        IdentTopic::new(TOPIC_ATTESTATIONS).hash(),
+        topic_params(0.4, -100.0),
+    );
     params
         .topics
-        .insert(IdentTopic::new(TOPIC_ATTESTATIONS).hash(), topic_params(0.4, -100.0));
-    params.topics.insert(IdentTopic::new(TOPIC_TXS).hash(), topic_params(0.3, -50.0));
+        .insert(IdentTopic::new(TOPIC_TXS).hash(), topic_params(0.3, -50.0));
     params
 }
 
@@ -716,29 +723,37 @@ pub fn start(
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<io::Result<()>>();
 
-    std::thread::Builder::new().name("bloch-p2p".into()).spawn(move || {
-        let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-            Ok(rt) => rt,
-            Err(e) => {
-                let _ = ready_tx.send(Err(e));
-                return;
-            }
-        };
-        rt.block_on(async move {
-            match build_swarm(&keypair, &cfg) {
-                Ok(swarm) => {
-                    let _ = ready_tx.send(Ok(()));
-                    run_swarm(swarm, cfg, cmd_rx, events, head_slot).await;
-                }
+    std::thread::Builder::new()
+        .name("bloch-p2p".into())
+        .spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
                 Err(e) => {
                     let _ = ready_tx.send(Err(e));
+                    return;
                 }
-            }
-        });
-    })?;
+            };
+            rt.block_on(async move {
+                match build_swarm(&keypair, &cfg) {
+                    Ok(swarm) => {
+                        let _ = ready_tx.send(Ok(()));
+                        run_swarm(swarm, cfg, cmd_rx, events, head_slot).await;
+                    }
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(e));
+                    }
+                }
+            });
+        })?;
 
     match ready_rx.recv() {
-        Ok(Ok(())) => Ok(Handle { cmd: cmd_tx, peer_id }),
+        Ok(Ok(())) => Ok(Handle {
+            cmd: cmd_tx,
+            peer_id,
+        }),
         Ok(Err(e)) => Err(e),
         Err(_) => Err(io::Error::other("p2p thread died before it started")),
     }
@@ -750,7 +765,8 @@ fn build_swarm(keypair: &identity::Keypair, cfg: &Config) -> io::Result<Swarm> {
     let gs_cfg = gossipsub_config().map_err(io::Error::other)?;
     let mut gs = gossipsub::Behaviour::new(MessageAuthenticity::Signed(keypair.clone()), gs_cfg)
         .map_err(|e| io::Error::other(format!("gossipsub: {e}")))?;
-    if let Err(e) = gs.with_peer_score(peer_score_params(cfg.behind_proxy), peer_score_thresholds()) {
+    if let Err(e) = gs.with_peer_score(peer_score_params(cfg.behind_proxy), peer_score_thresholds())
+    {
         // Non-fatal, but say it: with scoring off, every `Reject` this node
         // reports is log-only and a hostile peer pays nothing.
         eprintln!("p2p: peer scoring DISABLED ({e}) — rejections carry no penalty");
@@ -759,7 +775,11 @@ fn build_swarm(keypair: &identity::Keypair, cfg: &Config) -> io::Result<Swarm> {
     let max_peers = cfg.max_peers as u32;
     let mut swarm = SwarmBuilder::with_existing_identity(keypair.clone())
         .with_tokio()
-        .with_tcp(libp2p::tcp::Config::default(), noise::Config::new, yamux_config)
+        .with_tcp(
+            libp2p::tcp::Config::default(),
+            noise::Config::new,
+            yamux_config,
+        )
         .map_err(|e| io::Error::other(e.to_string()))?
         .with_dns()
         .map_err(|e| io::Error::other(e.to_string()))?
@@ -801,7 +821,9 @@ fn build_swarm(keypair: &identity::Keypair, cfg: &Config) -> io::Result<Swarm> {
             .map_err(|e| io::Error::other(format!("subscribe {t}: {e}")))?;
     }
     for addr in &cfg.listen {
-        swarm.listen_on(addr.clone()).map_err(|e| io::Error::other(e.to_string()))?;
+        swarm
+            .listen_on(addr.clone())
+            .map_err(|e| io::Error::other(e.to_string()))?;
     }
     Ok(swarm)
 }
@@ -846,7 +868,8 @@ struct Topics {
 impl Loop {
     fn note_block(&mut self, id: [u8; 32]) -> bool {
         let now = Instant::now();
-        self.recent_blocks.retain(|_, t| now.duration_since(*t) < REGOSSIP_SUPPRESS_TTL);
+        self.recent_blocks
+            .retain(|_, t| now.duration_since(*t) < REGOSSIP_SUPPRESS_TTL);
         self.recent_blocks.insert(id, now).is_none()
     }
 
@@ -897,8 +920,12 @@ async fn run_swarm(
     // written once and handed to every node in a fleet. Dialling yourself is
     // never useful and produces a permanent stream of dial errors, so drop it
     // here rather than making every operator maintain N different lists.
-    let peers: Vec<Multiaddr> =
-        cfg.peers.iter().filter(|a| !cfg.listen.contains(a)).cloned().collect();
+    let peers: Vec<Multiaddr> = cfg
+        .peers
+        .iter()
+        .filter(|a| !cfg.listen.contains(a))
+        .cloned()
+        .collect();
     for addr in &peers {
         if let Err(e) = swarm.dial(addr.clone()) {
             eprintln!("p2p: dial {addr}: {e}");
@@ -970,7 +997,9 @@ fn handle_command(swarm: &mut Swarm, st: &mut Loop, cmd: Command) {
             }
         }
         Command::Broadcast(frame) => {
-            let Some((&tag, payload)) = frame.split_first() else { return };
+            let Some((&tag, payload)) = frame.split_first() else {
+                return;
+            };
             match tag {
                 crate::net::FRAME_BLOCK => {
                     // Re-gossip suppression. A block this node produced has a
@@ -987,7 +1016,12 @@ fn handle_command(swarm: &mut Swarm, st: &mut Loop, cmd: Command) {
                     publish(swarm, st.topics.blocks.clone(), payload.to_vec(), "blocks");
                 }
                 crate::net::FRAME_ATT => {
-                    publish(swarm, st.topics.attestations.clone(), payload.to_vec(), "attestations");
+                    publish(
+                        swarm,
+                        st.topics.attestations.clone(),
+                        payload.to_vec(),
+                        "attestations",
+                    );
                 }
                 crate::net::FRAME_TX => {
                     publish(swarm, st.topics.txs.clone(), payload.to_vec(), "txs");
@@ -1044,9 +1078,15 @@ fn request_blocks(swarm: &mut Swarm, st: &Loop, after_slot: u64) {
     peers.sort_by_key(|p| {
         // Descending by observed head, then by PeerId so ties are stable and
         // the choice is not a function of HashMap iteration order.
-        (std::cmp::Reverse(st.peer_head.get(p).copied().unwrap_or(0)), p.to_bytes())
+        (
+            std::cmp::Reverse(st.peer_head.get(p).copied().unwrap_or(0)),
+            p.to_bytes(),
+        )
     });
-    let req = SyncRequest::GetBlocks { after_slot, limit: MAX_SYNC_BLOCKS as u32 };
+    let req = SyncRequest::GetBlocks {
+        after_slot,
+        limit: MAX_SYNC_BLOCKS as u32,
+    };
     for p in peers.into_iter().take(SYNC_FANOUT) {
         swarm.behaviour_mut().sync.send_request(&p, req.clone());
     }
@@ -1067,7 +1107,11 @@ fn handle_swarm_event(
         SwarmEvent::NewListenAddr { address, .. } => {
             println!("p2p: listening on {address}");
         }
-        SwarmEvent::ConnectionEstablished { peer_id, ref endpoint, .. } => {
+        SwarmEvent::ConnectionEstablished {
+            peer_id,
+            ref endpoint,
+            ..
+        } => {
             println!("p2p: connected {peer_id}");
             if let libp2p::core::ConnectedPoint::Dialer { address, .. } = endpoint {
                 st.dialed.insert(address.clone(), peer_id);
@@ -1085,10 +1129,18 @@ fn handle_swarm_event(
             let after = st.head_slot.load(Ordering::Relaxed);
             swarm.behaviour_mut().sync.send_request(
                 &peer_id,
-                SyncRequest::GetBlocks { after_slot: after, limit: MAX_SYNC_BLOCKS as u32 },
+                SyncRequest::GetBlocks {
+                    after_slot: after,
+                    limit: MAX_SYNC_BLOCKS as u32,
+                },
             );
         }
-        SwarmEvent::ConnectionClosed { peer_id, num_established, cause, .. } => {
+        SwarmEvent::ConnectionClosed {
+            peer_id,
+            num_established,
+            cause,
+            ..
+        } => {
             if num_established == 0 {
                 st.peer_head.remove(&peer_id);
                 // The cause is the whole diagnostic value of this line. A bare
@@ -1114,7 +1166,11 @@ fn handle_swarm_event(
                 trace(|| format!("dial failed ({peer_id:?}): {error}"));
             }
         }
-        SwarmEvent::IncomingConnectionError { error, send_back_addr, .. } => {
+        SwarmEvent::IncomingConnectionError {
+            error,
+            send_back_addr,
+            ..
+        } => {
             eprintln!("p2p: inbound connection from {send_back_addr} failed: {error}");
         }
         SwarmEvent::Behaviour(G4BehaviourEvent::Identify(identify::Event::Received {
@@ -1138,7 +1194,9 @@ fn handle_swarm_event(
             message,
             ..
         })) => match message {
-            request_response::Message::Request { request, channel, .. } => {
+            request_response::Message::Request {
+                request, channel, ..
+            } => {
                 serve_sync(st, resp_tx.clone(), request, channel);
             }
             request_response::Message::Response { response, .. } => {
@@ -1177,11 +1235,9 @@ fn handle_swarm_event(
                 }
             }
         },
-        SwarmEvent::Behaviour(G4BehaviourEvent::Sync(request_response::Event::OutboundFailure {
-            peer,
-            error,
-            ..
-        })) => {
+        SwarmEvent::Behaviour(G4BehaviourEvent::Sync(
+            request_response::Event::OutboundFailure { peer, error, .. },
+        )) => {
             // A peer that does not speak /bloch-g4/sync/1 is not a Genesis-4
             // node. Nothing to fall back to — deliberately: Genesis-3
             // compatibility is not a goal, it is the thing the prefix prevents.
@@ -1219,9 +1275,7 @@ fn on_gossip(
         match crate::codec::decode_envelope(&message.data) {
             Ok(env) => {
                 report(swarm, Verdict::Accept);
-                trace(|| {
-                    format!("← block slot {} from {source}", env.header.slot)
-                });
+                trace(|| format!("← block slot {} from {source}", env.header.slot));
                 let slot = env.header.slot;
                 let e = st.peer_head.entry(source).or_insert(0);
                 *e = (*e).max(slot);
@@ -1241,7 +1295,9 @@ fn on_gossip(
             Ok(att) => {
                 // No verdict yet. The engine decides through `gossip.rs` and
                 // calls `Handle::report`, which is what finally relays it.
-                let origin = Origin { inner: Some((message_id, source)) };
+                let origin = Origin {
+                    inner: Some((message_id, source)),
+                };
                 return st.emit(NetEvent::Attestation(att, origin));
             }
             Err(e) => {
@@ -1335,7 +1391,11 @@ mod tests {
         );
 
         let params = peer_score_params(false);
-        assert_eq!(params.topics.len(), 3, "all three Genesis-4 topics must be scored");
+        assert_eq!(
+            params.topics.len(),
+            3,
+            "all three Genesis-4 topics must be scored"
+        );
         for (topic, t) in &params.topics {
             assert_eq!(
                 t.mesh_message_deliveries_weight, 0.0,
@@ -1345,7 +1405,10 @@ mod tests {
                 t.mesh_failure_penalty_weight, 0.0,
                 "P3b is armed on {topic:?}"
             );
-            assert_eq!(t.mesh_message_deliveries_threshold, 0.0, "P3 threshold left set on {topic:?}");
+            assert_eq!(
+                t.mesh_message_deliveries_threshold, 0.0,
+                "P3 threshold left set on {topic:?}"
+            );
             assert!(
                 t.mesh_message_deliveries_activation.is_zero(),
                 "P3 activation left set on {topic:?}"
@@ -1375,7 +1438,10 @@ mod tests {
         assert_ne!(SYNC_PROTOCOL.as_ref(), "/bloch/sync/1");
         assert_ne!(IDENTIFY_PROTOCOL, "/bloch-sis/1.0.0");
         for t in [TOPIC_BLOCKS, TOPIC_ATTESTATIONS, TOPIC_TXS] {
-            assert!(t.starts_with("bloch-g4/"), "{t} is not in the Genesis-4 namespace");
+            assert!(
+                t.starts_with("bloch-g4/"),
+                "{t} is not in the Genesis-4 namespace"
+            );
         }
         // The prefix must be a real one and not the library default (which is
         // `/meshsub`, exactly what Genesis-3 negotiates). `Config` exposes no
@@ -1385,10 +1451,16 @@ mod tests {
             GOSSIP_PROTOCOL_PREFIX.starts_with("/bloch-g4"),
             "the gossipsub prefix left the Genesis-4 namespace"
         );
-        assert_ne!(GOSSIP_PROTOCOL_PREFIX, "/meshsub", "that is the default Genesis-3 speaks");
+        assert_ne!(
+            GOSSIP_PROTOCOL_PREFIX, "/meshsub",
+            "that is the default Genesis-3 speaks"
+        );
 
         let cfg = gossipsub_config().expect("config builds");
-        assert!(cfg.validate_messages(), "gossip.rs cannot gate relay without validate_messages");
+        assert!(
+            cfg.validate_messages(),
+            "gossip.rs cannot gate relay without validate_messages"
+        );
         assert_eq!(cfg.duplicate_cache_time(), DUPLICATE_CACHE_TIME);
         assert!(
             REGOSSIP_SUPPRESS_TTL >= cfg.duplicate_cache_time(),
@@ -1398,20 +1470,39 @@ mod tests {
 
     #[test]
     fn sync_frames_round_trip() {
-        let req = SyncRequest::GetBlocks { after_slot: 4242, limit: 64 };
-        assert_eq!(decode_sync_request(&encode_sync_request(&req)).unwrap(), req);
+        let req = SyncRequest::GetBlocks {
+            after_slot: 4242,
+            limit: 64,
+        };
+        assert_eq!(
+            decode_sync_request(&encode_sync_request(&req)).unwrap(),
+            req
+        );
 
-        let resp = SyncResponse::Blocks { envelopes: vec![vec![1, 2, 3], vec![], vec![9; 100]] };
-        assert_eq!(decode_sync_response(&encode_sync_response(&resp)).unwrap(), resp);
+        let resp = SyncResponse::Blocks {
+            envelopes: vec![vec![1, 2, 3], vec![], vec![9; 100]],
+        };
+        assert_eq!(
+            decode_sync_response(&encode_sync_response(&resp)).unwrap(),
+            resp
+        );
     }
 
     #[test]
     fn sync_frames_reject_trailing_bytes() {
-        let mut b = encode_sync_request(&SyncRequest::GetBlocks { after_slot: 1, limit: 1 });
+        let mut b = encode_sync_request(&SyncRequest::GetBlocks {
+            after_slot: 1,
+            limit: 1,
+        });
         b.push(0);
-        assert!(decode_sync_request(&b).is_err(), "encode(x) ‖ junk must not decode");
+        assert!(
+            decode_sync_request(&b).is_err(),
+            "encode(x) ‖ junk must not decode"
+        );
 
-        let mut b = encode_sync_response(&SyncResponse::Blocks { envelopes: vec![vec![7]] });
+        let mut b = encode_sync_response(&SyncResponse::Blocks {
+            envelopes: vec![vec![7]],
+        });
         b.push(0);
         assert!(decode_sync_response(&b).is_err());
     }
@@ -1456,7 +1547,10 @@ mod tests {
             // Non-trivial length so a page is not accidentally tiny, and
             // slot-dependent so every block has a distinct message id.
             proposer_sig: vec![(slot % 251) as u8; 96],
-            body: Body { transactions: Vec::new(), attestations: Vec::new() },
+            body: Body {
+                transactions: Vec::new(),
+                attestations: Vec::new(),
+            },
         }
     }
 
@@ -1519,7 +1613,13 @@ mod tests {
             head.clone(),
         )
         .expect("p2p starts");
-        Node { handle, rx, head, addr, _dir: dir }
+        Node {
+            handle,
+            rx,
+            head,
+            addr,
+            _dir: dir,
+        }
     }
 
     /// Collect events until `want` blocks have arrived or the deadline passes.
@@ -1566,10 +1666,14 @@ mod tests {
         let mut connected = false;
         while Instant::now() < deadline && !connected {
             attempt += 1;
-            a.handle.broadcast(crate::net::block_frame(&envelope(900 + attempt)));
+            a.handle
+                .broadcast(crate::net::block_frame(&envelope(900 + attempt)));
             connected = !collect_blocks(&b.rx, 1, 1).is_empty();
         }
-        assert!(connected, "the mesh never formed: no block ever reached the peer");
+        assert!(
+            connected,
+            "the mesh never formed: no block ever reached the peer"
+        );
 
         // Drain whatever else the retry loop put in flight, so the next
         // assertion is about the publishes it names and nothing else.
@@ -1598,7 +1702,11 @@ mod tests {
         // And it is bidirectional — b was never told about a, it only accepted
         // a's dial, and it must still be able to publish back.
         b.handle.broadcast(crate::net::block_frame(&envelope(500)));
-        assert_eq!(collect_blocks(&a.rx, 1, 20), vec![500], "reverse direction never delivered");
+        assert_eq!(
+            collect_blocks(&a.rx, 1, 20),
+            vec![500],
+            "reverse direction never delivered"
+        );
     }
 
     /// The exchange's question, at the transport layer: a node with an EMPTY
@@ -1612,7 +1720,11 @@ mod tests {
         let total = (MAX_SYNC_BLOCKS * 2 + 37) as u64;
         let server = node("cold-server", total, &[]);
         let cold = node("cold-client", 0, &[server.addr.clone()]);
-        assert_eq!(cold.head.load(Ordering::Relaxed), 0, "the cold node starts at genesis");
+        assert_eq!(
+            cold.head.load(Ordering::Relaxed),
+            0,
+            "the cold node starts at genesis"
+        );
 
         let mut got = collect_blocks(&cold.rx, total as usize, 60);
         got.sort_unstable();
@@ -1622,7 +1734,11 @@ mod tests {
             "a node asking from genesis got {} of {total} blocks — pagination stopped early",
             got.len()
         );
-        assert_eq!(got.first(), Some(&1), "the walk did not start at the first block");
+        assert_eq!(
+            got.first(),
+            Some(&1),
+            "the walk did not start at the first block"
+        );
         assert_eq!(got.last(), Some(&total), "the walk did not reach the tip");
         assert_eq!(got, (1..=total).collect::<Vec<_>>(), "a block was skipped");
     }
@@ -1650,8 +1766,17 @@ mod tests {
     fn verdict_maps_onto_gossipsub_verbs() {
         // Ignore must never become Reject: that mapping is how a mesh
         // graylists its honest peers.
-        assert!(matches!(MessageAcceptance::from(Verdict::Accept), MessageAcceptance::Accept));
-        assert!(matches!(MessageAcceptance::from(Verdict::Ignore), MessageAcceptance::Ignore));
-        assert!(matches!(MessageAcceptance::from(Verdict::Reject), MessageAcceptance::Reject));
+        assert!(matches!(
+            MessageAcceptance::from(Verdict::Accept),
+            MessageAcceptance::Accept
+        ));
+        assert!(matches!(
+            MessageAcceptance::from(Verdict::Ignore),
+            MessageAcceptance::Ignore
+        ));
+        assert!(matches!(
+            MessageAcceptance::from(Verdict::Reject),
+            MessageAcceptance::Reject
+        ));
     }
 }

@@ -82,7 +82,10 @@ fn tmp_root() -> PathBuf {
 }
 
 fn run_to_completion(args: &[&str]) -> String {
-    let out = Command::new(BIN).args(args).output().expect("spawn bloch-pos");
+    let out = Command::new(BIN)
+        .args(args)
+        .output()
+        .expect("spawn bloch-pos");
     assert!(
         out.status.success(),
         "bloch-pos {args:?} failed: {}",
@@ -105,24 +108,28 @@ fn free_port() -> u16 {
 fn applied(log: &str) -> BTreeMap<u64, (String, String)> {
     let mut out = BTreeMap::new();
     for line in log.lines() {
-        let Some(rest) = line.strip_prefix("[slot ") else { continue };
-        let Some((slot_s, rest)) = rest.split_once("] applied ") else { continue };
-        let Ok(slot) = slot_s.parse::<u64>() else { continue };
-        let Some((id, rest)) = rest.split_once(" by v") else { continue };
-        let Some((_, rest)) = rest.split_once("head root ") else { continue };
+        let Some(rest) = line.strip_prefix("[slot ") else {
+            continue;
+        };
+        let Some((slot_s, rest)) = rest.split_once("] applied ") else {
+            continue;
+        };
+        let Ok(slot) = slot_s.parse::<u64>() else {
+            continue;
+        };
+        let Some((id, rest)) = rest.split_once(" by v") else {
+            continue;
+        };
+        let Some((_, rest)) = rest.split_once("head root ") else {
+            continue;
+        };
         let root = rest.split(',').next().unwrap_or_default();
         out.insert(slot, (id.to_string(), root.to_string()));
     }
     out
 }
 
-fn spawn_node(
-    dir: &Path,
-    genesis: &Path,
-    listen: u16,
-    peers: &[u16],
-    log: &Path,
-) -> Child {
+fn spawn_node(dir: &Path, genesis: &Path, listen: u16, peers: &[u16], log: &Path) -> Child {
     let peer_list = peers
         .iter()
         .map(|p| format!("/ip4/127.0.0.1/tcp/{p}"))
@@ -283,7 +290,11 @@ fn a_cold_node_builds_the_same_chain_from_genesis_without_a_donated_datadir() {
 
     // 2. Where both nodes applied a block for the same slot, they must agree on
     //    which block it was AND on the state it produced.
-    let common: Vec<u64> = cold.keys().filter(|s| founder.contains_key(s)).copied().collect();
+    let common: Vec<u64> = cold
+        .keys()
+        .filter(|s| founder.contains_key(s))
+        .copied()
+        .collect();
     assert!(
         common.len() >= 2,
         "only {} slots in common — not enough to compare{}",
@@ -292,7 +303,8 @@ fn a_cold_node_builds_the_same_chain_from_genesis_without_a_donated_datadir() {
     );
     for slot in &common {
         assert_eq!(
-            cold[slot], founder[slot],
+            cold[slot],
+            founder[slot],
             "cold node and founder disagree at slot {slot}: the independently rebuilt state \
              is not the same state{}",
             ctx()

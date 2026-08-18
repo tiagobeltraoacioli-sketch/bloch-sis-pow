@@ -131,7 +131,9 @@ pub fn decode_checkpoint(bytes: &[u8]) -> Result<WeakSubjectivityCheckpoint, Dec
     };
     r.finish()?;
     if cp.canonical_serialize() != bytes {
-        return Err(DecodeErr("checkpoint: decoder disagrees with canonical_serialize"));
+        return Err(DecodeErr(
+            "checkpoint: decoder disagrees with canonical_serialize",
+        ));
     }
     Ok(cp)
 }
@@ -172,7 +174,10 @@ pub fn decode_envelope_file(bytes: &[u8]) -> Result<CheckpointEnvelope, DecodeEr
         signatures.push((index, r.bytes()?));
     }
     r.finish()?;
-    Ok(CheckpointEnvelope { checkpoint, signatures })
+    Ok(CheckpointEnvelope {
+        checkpoint,
+        signatures,
+    })
 }
 
 /// Encode a signer arrangement (devnet aid — a release build hard-codes the
@@ -223,7 +228,13 @@ pub fn decode_signer_set_file(bytes: &[u8]) -> Result<SignerSet, DecodeErr> {
     if threshold == 0 || threshold > signers.len() || min_external > threshold {
         return Err(DecodeErr("signer set: incoherent quorum shape"));
     }
-    Ok(SignerSet { id, signers, threshold, min_external, adopted_epoch })
+    Ok(SignerSet {
+        id,
+        signers,
+        threshold,
+        min_external,
+        adopted_epoch,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -247,8 +258,7 @@ pub fn load_latest(
         Err(e) => return Err(e),
     };
     let bad = |m: String| io::Error::new(io::ErrorKind::InvalidData, m);
-    let cp = decode_checkpoint(&bytes)
-        .map_err(|e| bad(format!("{}: {e}", path.display())))?;
+    let cp = decode_checkpoint(&bytes).map_err(|e| bad(format!("{}: {e}", path.display())))?;
     if cp.network_id != network_id || &cp.genesis_root != genesis_root {
         return Err(bad(format!(
             "{} belongs to a different network; refusing (delete it yourself if that is \
@@ -376,7 +386,10 @@ pub fn boot(
                     published = Some(cp);
                 }
                 CrossCheck::AheadOfLocal => published = Some(cp),
-                CrossCheck::Conflict { local_root, published_root } => {
+                CrossCheck::Conflict {
+                    local_root,
+                    published_root,
+                } => {
                     warnings.push(format!(
                         "########################################################\n\
                          WS_CONFLICT: the published checkpoint contradicts this \
@@ -605,7 +618,10 @@ mod tests {
     }
 
     fn no_flags() -> WsConfig {
-        WsConfig { checkpoint: None, signer_set: None }
+        WsConfig {
+            checkpoint: None,
+            signer_set: None,
+        }
     }
 
     // -- codecs -------------------------------------------------------------
@@ -634,7 +650,10 @@ mod tests {
         assert_eq!(back.signatures, env.signatures);
         let mut junk = bytes.clone();
         junk.push(0);
-        assert!(decode_envelope_file(&junk).is_err(), "encode(x) ‖ junk must not decode");
+        assert!(
+            decode_envelope_file(&junk).is_err(),
+            "encode(x) ‖ junk must not decode"
+        );
     }
 
     #[test]
@@ -642,8 +661,14 @@ mod tests {
         let set = SignerSet {
             id: 1,
             signers: vec![
-                Signer { pubkey: [1; HYBRID_PK_BYTES], external: false },
-                Signer { pubkey: [2; HYBRID_PK_BYTES], external: true },
+                Signer {
+                    pubkey: [1; HYBRID_PK_BYTES],
+                    external: false,
+                },
+                Signer {
+                    pubkey: [2; HYBRID_PK_BYTES],
+                    external: true,
+                },
             ],
             threshold: 2,
             min_external: 1,
@@ -696,9 +721,18 @@ mod tests {
         let set = SignerSet {
             id: 1,
             signers: vec![
-                Signer { pubkey: signers[0], external: false },
-                Signer { pubkey: signers[1], external: false },
-                Signer { pubkey: signers[2], external: true },
+                Signer {
+                    pubkey: signers[0],
+                    external: false,
+                },
+                Signer {
+                    pubkey: signers[1],
+                    external: false,
+                },
+                Signer {
+                    pubkey: signers[2],
+                    external: true,
+                },
             ],
             threshold: WS_PHASE_A_THRESHOLD,
             min_external: WS_PHASE_A_MIN_EXTERNAL,
@@ -805,8 +839,16 @@ mod tests {
         let dir = tmpdir("resume");
         // Fresh: age 0.
         let out = boot(
-            &no_flags(), &dir, NET, &GEN, &genesis_anchor(),
-            10, true, (10, [0x55; 32]), |_| None, |_| false,
+            &no_flags(),
+            &dir,
+            NET,
+            &GEN,
+            &genesis_anchor(),
+            10,
+            true,
+            (10, [0x55; 32]),
+            |_| None,
+            |_| false,
         )
         .unwrap()
         .expect("fresh own finality resumes");
@@ -814,8 +856,16 @@ mod tests {
 
         // Stale but inside the window: resumes with a prominent warning.
         let out = boot(
-            &no_flags(), &dir, NET, &GEN, &genesis_anchor(),
-            ws::WS_FRESH_EPOCHS + 5, true, (5, [0x55; 32]), |_| None, |_| false,
+            &no_flags(),
+            &dir,
+            NET,
+            &GEN,
+            &genesis_anchor(),
+            ws::WS_FRESH_EPOCHS + 5,
+            true,
+            (5, [0x55; 32]),
+            |_| None,
+            |_| false,
         )
         .unwrap()
         .expect("inside the window still resumes");
@@ -826,8 +876,16 @@ mod tests {
     fn beyond_window_refuses_without_a_fresh_checkpoint() {
         let dir = tmpdir("refuse-stale");
         let refusal = boot(
-            &no_flags(), &dir, NET, &GEN, &genesis_anchor(),
-            WS_PERIOD_EPOCHS + 7, true, (7, [0x55; 32]), |_| None, |_| false,
+            &no_flags(),
+            &dir,
+            NET,
+            &GEN,
+            &genesis_anchor(),
+            WS_PERIOD_EPOCHS + 7,
+            true,
+            (7, [0x55; 32]),
+            |_| None,
+            |_| false,
         )
         .unwrap()
         .expect_err("beyond the window with no checkpoint must refuse");
@@ -850,10 +908,16 @@ mod tests {
         // refusal (exercised end-to-end in ws_conflict_refuses_boot below).
         let mut equivocal = checkpoint(512);
         equivocal.block_root = [0xEE; 32];
-        assert_eq!(ws::accept(Some(&checkpoint(512)), &equivocal), Acceptance::Conflict);
+        assert_eq!(
+            ws::accept(Some(&checkpoint(512)), &equivocal),
+            Acceptance::Conflict
+        );
 
         // The stored artifact survives untouched.
-        assert_eq!(load_latest(&dir, NET, &GEN).unwrap().unwrap(), checkpoint(512));
+        assert_eq!(
+            load_latest(&dir, NET, &GEN).unwrap().unwrap(),
+            checkpoint(512)
+        );
     }
 
     /// End-to-end: a validly-signed envelope for the SAME epoch as the stored
@@ -871,7 +935,10 @@ mod tests {
         pubkey.copy_from_slice(&raw);
         let set = SignerSet {
             id: 9,
-            signers: vec![Signer { pubkey, external: true }],
+            signers: vec![Signer {
+                pubkey,
+                external: true,
+            }],
             threshold: 1,
             min_external: 1,
             adopted_epoch: 0,
@@ -880,24 +947,41 @@ mod tests {
         cp.signer_set_id = 9;
         let env = CheckpointEnvelope {
             checkpoint: cp,
-            signatures: vec![(0, strip(&bloch_crypto::crypto::sign(&sk, &cp.ws_digest()).unwrap()))],
+            signatures: vec![(
+                0,
+                strip(&bloch_crypto::crypto::sign(&sk, &cp.ws_digest()).unwrap()),
+            )],
         };
         let env_path = dir.join("env.bin");
         let set_path = dir.join("set.bin");
         fs::write(&env_path, encode_envelope_file(&env)).unwrap();
         fs::write(&set_path, encode_signer_set_file(&set)).unwrap();
 
-        let cfg = WsConfig { checkpoint: Some(env_path), signer_set: Some(set_path) };
+        let cfg = WsConfig {
+            checkpoint: Some(env_path),
+            signer_set: Some(set_path),
+        };
         let refusal = boot(
-            &cfg, &dir, NET, &GEN, &genesis_anchor(),
-            1, false, (0, GEN), |_| None, |_| false,
+            &cfg,
+            &dir,
+            NET,
+            &GEN,
+            &genesis_anchor(),
+            1,
+            false,
+            (0, GEN),
+            |_| None,
+            |_| false,
         )
         .unwrap()
         .expect_err("an equivocal same-epoch checkpoint must refuse the boot");
         assert!(refusal.contains("WS_CONFLICT"));
         assert!(refusal.contains("equivocal"));
         // The stored artifact was not overwritten.
-        assert_eq!(load_latest(&dir, NET, &GEN).unwrap().unwrap(), genesis_anchor());
+        assert_eq!(
+            load_latest(&dir, NET, &GEN).unwrap().unwrap(),
+            genesis_anchor()
+        );
     }
 
     /// A published checkpoint that contradicts OWN finality raises the alarm,
@@ -912,7 +996,10 @@ mod tests {
         pubkey.copy_from_slice(&raw);
         let set = SignerSet {
             id: 3,
-            signers: vec![Signer { pubkey, external: true }],
+            signers: vec![Signer {
+                pubkey,
+                external: true,
+            }],
             threshold: 1,
             min_external: 1,
             adopted_epoch: 0,
@@ -921,19 +1008,31 @@ mod tests {
         cp.signer_set_id = 3;
         let env = CheckpointEnvelope {
             checkpoint: cp,
-            signatures: vec![(0, strip(&bloch_crypto::crypto::sign(&sk, &cp.ws_digest()).unwrap()))],
+            signatures: vec![(
+                0,
+                strip(&bloch_crypto::crypto::sign(&sk, &cp.ws_digest()).unwrap()),
+            )],
         };
         let env_path = dir.join("env.bin");
         let set_path = dir.join("set.bin");
         fs::write(&env_path, encode_envelope_file(&env)).unwrap();
         fs::write(&set_path, encode_signer_set_file(&set)).unwrap();
-        let cfg = WsConfig { checkpoint: Some(env_path), signer_set: Some(set_path) };
+        let cfg = WsConfig {
+            checkpoint: Some(env_path),
+            signer_set: Some(set_path),
+        };
 
         // The node's own finalized root at epoch 64 differs from cp's.
         let own_root = [0x99; 32];
         let out = boot(
-            &cfg, &dir, NET, &GEN, &genesis_anchor(),
-            70, true, (70, own_root),
+            &cfg,
+            &dir,
+            NET,
+            &GEN,
+            &genesis_anchor(),
+            70,
+            true,
+            (70, own_root),
             move |e| if e <= 70 { Some(own_root) } else { None },
             |_| false,
         )
@@ -944,6 +1043,9 @@ mod tests {
         // Not admitted: the anchor is still the genesis anchor.
         assert_eq!(out.anchor_epoch, 0);
         assert!(!out.anchor_is_hard);
-        assert_eq!(load_latest(&dir, NET, &GEN).unwrap().unwrap(), genesis_anchor());
+        assert_eq!(
+            load_latest(&dir, NET, &GEN).unwrap().unwrap(),
+            genesis_anchor()
+        );
     }
 }

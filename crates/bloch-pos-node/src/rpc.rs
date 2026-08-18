@@ -152,7 +152,10 @@ pub struct RpcError {
 
 impl RpcError {
     pub fn new(code: i64, message: impl Into<String>) -> Self {
-        RpcError { code, message: message.into() }
+        RpcError {
+            code,
+            message: message.into(),
+        }
     }
 
     /// -32700: the body was not JSON.
@@ -285,7 +288,12 @@ impl Json {
     }
 
     pub fn obj(fields: Vec<(&str, Json)>) -> Json {
-        Json::Obj(fields.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
+        Json::Obj(
+            fields
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+        )
     }
 
     pub fn as_str(&self) -> Option<&str> {
@@ -397,7 +405,11 @@ struct Parser<'a> {
 
 /// Parse one JSON value from `text`, which must contain nothing else.
 pub fn parse_json(text: &str) -> Result<Json, &'static str> {
-    let mut p = Parser { b: text.as_bytes(), i: 0, depth: 0 };
+    let mut p = Parser {
+        b: text.as_bytes(),
+        i: 0,
+        depth: 0,
+    };
     p.ws();
     let v = p.value()?;
     p.ws();
@@ -591,7 +603,10 @@ impl<'a> Parser<'a> {
     }
 
     fn hex4(&mut self) -> Result<u32, &'static str> {
-        let bytes = self.b.get(self.i..self.i + 4).ok_or("truncated \\u escape")?;
+        let bytes = self
+            .b
+            .get(self.i..self.i + 4)
+            .ok_or("truncated \\u escape")?;
         let text = std::str::from_utf8(bytes).map_err(|_| "invalid \\u escape")?;
         let v = u32::from_str_radix(text, 16).map_err(|_| "invalid \\u escape")?;
         self.i += 4;
@@ -637,7 +652,9 @@ impl<'a> Parser<'a> {
             }
         }
         // Valid UTF-8 by construction: the slice is ASCII digits and signs.
-        Ok(Json::Num(String::from_utf8_lossy(&self.b[start..self.i]).into_owned()))
+        Ok(Json::Num(
+            String::from_utf8_lossy(&self.b[start..self.i]).into_owned(),
+        ))
     }
 
     fn digits(&mut self) -> usize {
@@ -692,7 +709,10 @@ pub enum RpcRequest {
     Validator(u32),
     ValidatorCount,
     Balance([u8; 32]),
-    Utxos { script_hash: [u8; 32], limit: usize },
+    Utxos {
+        script_hash: [u8; 32],
+        limit: usize,
+    },
     /// A transaction that **already decoded**.
     ///
     /// Decoding happens at this edge, not in the engine, for the same reason
@@ -736,7 +756,9 @@ pub struct EngineBackend {
 
 impl EngineBackend {
     pub fn new(engine: Sender<crate::engine::EngineEvent>) -> Self {
-        EngineBackend { engine: Mutex::new(engine) }
+        EngineBackend {
+            engine: Mutex::new(engine),
+        }
     }
 }
 
@@ -749,7 +771,10 @@ impl RpcBackend for EngineBackend {
             // itself is still fine, but saying so honestly beats unwrapping.
             Err(poisoned) => poisoned.into_inner().clone(),
         };
-        if sender.send(crate::engine::EngineEvent::Rpc(RpcCall { req, reply: tx })).is_err() {
+        if sender
+            .send(crate::engine::EngineEvent::Rpc(RpcCall { req, reply: tx }))
+            .is_err()
+        {
             return Err(RpcError::unavailable("node is shutting down"));
         }
         match rx.recv_timeout(ENGINE_TIMEOUT) {
@@ -781,16 +806,13 @@ fn want_u64(params: Option<&Json>, pos: usize, name: &str) -> Result<u64, RpcErr
     pick(params, pos, name)
         .ok_or_else(|| RpcError::invalid_params(format!("missing `{name}`")))?
         .as_u64()
-        .ok_or_else(|| {
-            RpcError::invalid_params(format!("`{name}` must be a non-negative integer"))
-        })
+        .ok_or_else(|| RpcError::invalid_params(format!("`{name}` must be a non-negative integer")))
 }
 
 fn want_u32(params: Option<&Json>, pos: usize, name: &str) -> Result<u32, RpcError> {
     let v = want_u64(params, pos, name)?;
-    u32::try_from(v).map_err(|_| {
-        RpcError::invalid_params(format!("`{name}` must fit in 32 bits (got {v})"))
-    })
+    u32::try_from(v)
+        .map_err(|_| RpcError::invalid_params(format!("`{name}` must fit in 32 bits (got {v})")))
 }
 
 fn want_hex32(params: Option<&Json>, pos: usize, name: &str) -> Result<[u8; 32], RpcError> {
@@ -944,12 +966,18 @@ pub fn handle_body(body: &str, backend: &dyn RpcBackend) -> String {
 
     if let Some(v) = request.get("jsonrpc") {
         if v.as_str() != Some("2.0") {
-            return envelope(id, Err(RpcError::invalid_request("`jsonrpc` must be \"2.0\"")));
+            return envelope(
+                id,
+                Err(RpcError::invalid_request("`jsonrpc` must be \"2.0\"")),
+            );
         }
     }
 
     let Some(method) = request.get("method").and_then(Json::as_str) else {
-        return envelope(id, Err(RpcError::invalid_request("`method` must be a string")));
+        return envelope(
+            id,
+            Err(RpcError::invalid_request("`method` must be a string")),
+        );
     };
 
     let params = request.get("params").filter(|p| !matches!(p, Json::Null));
@@ -968,11 +996,7 @@ pub fn handle_body(body: &str, backend: &dyn RpcBackend) -> String {
 /// operator passed `--rpc-bind`, and a routable bind must be firewalled to the
 /// clients that are meant to reach it. `sendrawtransaction` is a write, so an
 /// open port is not merely a read leak.
-pub fn serve(
-    bind_addr: &str,
-    port: u16,
-    backend: Arc<dyn RpcBackend>,
-) -> io::Result<SocketAddr> {
+pub fn serve(bind_addr: &str, port: u16, backend: Arc<dyn RpcBackend>) -> io::Result<SocketAddr> {
     let listener = TcpListener::bind((bind_addr, port))?;
     let local = listener.local_addr()?;
     let live = Arc::new(AtomicUsize::new(0));
@@ -1013,7 +1037,11 @@ fn serve_connection(sock: &mut TcpStream, backend: &dyn RpcBackend) {
             let _ = respond(sock, 200, &response);
         }
         Err(HttpError { status, message }) => {
-            let _ = respond(sock, status, &envelope(Json::Null, Err(RpcError::invalid_request(message))));
+            let _ = respond(
+                sock,
+                status,
+                &envelope(Json::Null, Err(RpcError::invalid_request(message))),
+            );
         }
     }
 }
@@ -1041,7 +1069,12 @@ fn read_request(sock: &mut TcpStream) -> Result<Vec<u8>, HttpError> {
             return Err(http_err(431, "request header too large"));
         }
         match sock.read(&mut chunk) {
-            Ok(0) => return Err(http_err(400, "connection closed before the request head ended")),
+            Ok(0) => {
+                return Err(http_err(
+                    400,
+                    "connection closed before the request head ended",
+                ))
+            }
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
             Err(_) => return Err(http_err(408, "timed out reading the request head")),
         }
@@ -1058,13 +1091,18 @@ fn read_request(sock: &mut TcpStream) -> Result<Vec<u8>, HttpError> {
 
     let mut content_length: Option<usize> = None;
     for line in lines {
-        let Some((name, value)) = line.split_once(':') else { continue };
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
         if name.trim().eq_ignore_ascii_case("content-length") {
             content_length = value.trim().parse::<usize>().ok();
         } else if name.trim().eq_ignore_ascii_case("transfer-encoding") {
             // Chunked bodies are not implemented. Saying so beats reading the
             // chunk headers as if they were JSON.
-            return Err(http_err(411, "chunked transfer-encoding is not supported; send Content-Length"));
+            return Err(http_err(
+                411,
+                "chunked transfer-encoding is not supported; send Content-Length",
+            ));
         }
     }
     let Some(len) = content_length else {
@@ -1079,7 +1117,12 @@ fn read_request(sock: &mut TcpStream) -> Result<Vec<u8>, HttpError> {
     body.truncate(len);
     while body.len() < len {
         match sock.read(&mut chunk) {
-            Ok(0) => return Err(http_err(400, "connection closed before the body was complete")),
+            Ok(0) => {
+                return Err(http_err(
+                    400,
+                    "connection closed before the body was complete",
+                ))
+            }
             Ok(n) => {
                 let want = len - body.len();
                 body.extend_from_slice(&chunk[..n.min(want)]);
@@ -1149,7 +1192,10 @@ pub fn chain_info_json(
         // The settled line, next to the head. See `Finality`: this is what
         // replaces a confirmation count, and an integrator reading only
         // `height` is reading the number that is *not* the guarantee.
-        ("finalized_height", finalized_height.map_or(Json::Null, Json::u)),
+        (
+            "finalized_height",
+            finalized_height.map_or(Json::Null, Json::u),
+        ),
         ("epoch", Json::u(epoch_of(slot))),
         ("slot_in_epoch", Json::u(slot % SLOTS_PER_EPOCH)),
         ("slots_per_epoch", Json::u(SLOTS_PER_EPOCH)),
@@ -1182,9 +1228,18 @@ pub fn chain_info_json(
                 ("active", Json::u(state.active_validators().len() as u64)),
             ]),
         ),
-        ("total_active_stake_sat", Json::sat(state.total_active_stake_sat())),
-        ("base_fee_millisat_per_gas", Json::sat(state.base_fee_millisat_per_gas())),
-        ("next_base_fee_millisat_per_gas", Json::sat(state.next_base_fee())),
+        (
+            "total_active_stake_sat",
+            Json::sat(state.total_active_stake_sat()),
+        ),
+        (
+            "base_fee_millisat_per_gas",
+            Json::sat(state.base_fee_millisat_per_gas()),
+        ),
+        (
+            "next_base_fee_millisat_per_gas",
+            Json::sat(state.next_base_fee()),
+        ),
         ("mempool", Json::u(mempool as u64)),
         ("blocks_known", Json::u(blocks_known as u64)),
         // Wall-clock slot and the gap to it: under PoS this is what "am I
@@ -1293,7 +1348,10 @@ pub fn block_json(
         ("finality", Json::s(finality.as_str())),
         ("finalized", Json::Bool(finality.is_final())),
         ("tx_count", Json::u(env.body.transactions.len() as u64)),
-        ("attestation_count", Json::u(env.body.attestations.len() as u64)),
+        (
+            "attestation_count",
+            Json::u(env.body.attestations.len() as u64),
+        ),
     ])
 }
 
@@ -1317,7 +1375,10 @@ pub fn block_count_json(
         ("height", Json::u(height)),
         ("slot", Json::u(slot)),
         ("epoch", Json::u(epoch_of(slot))),
-        ("finalized_height", finalized_height.map_or(Json::Null, Json::u)),
+        (
+            "finalized_height",
+            finalized_height.map_or(Json::Null, Json::u),
+        ),
         ("justified_epoch", Json::u(justified_epoch)),
         ("finalized_epoch", Json::u(finalized_epoch)),
     ])
@@ -1417,7 +1478,13 @@ pub fn validator_json(
 ) -> Json {
     use sha3::{Digest, Sha3_256};
     let pubkey_hash: [u8; 32] = Sha3_256::digest(&rec.pubkey).into();
-    let never = |e: u64| if e == u64::MAX { Json::Null } else { Json::u(e) };
+    let never = |e: u64| {
+        if e == u64::MAX {
+            Json::Null
+        } else {
+            Json::u(e)
+        }
+    };
     Json::obj(vec![
         ("index", Json::u(u64::from(rec.index))),
         ("pubkey_hash", Json::hex(&pubkey_hash)),
@@ -1452,7 +1519,10 @@ fn eutxo_json(e: &EutxoEntry) -> Json {
 
 /// `getbalance` — the summed value of every output locked to `script_hash`.
 pub fn balance_json(state: &CommittedState, script_hash: &[u8; 32]) -> Json {
-    let count = state.eutxos().filter(|e| &e.script_hash == script_hash).count();
+    let count = state
+        .eutxos()
+        .filter(|e| &e.script_hash == script_hash)
+        .count();
     Json::obj(vec![
         ("script_hash", Json::hex(script_hash)),
         ("balance_sat", Json::sat(state.balance_sat(script_hash))),
@@ -1466,8 +1536,10 @@ pub fn balance_json(state: &CommittedState, script_hash: &[u8; 32]) -> Json {
 /// surface is to say the page was cut, not to invent a pagination protocol the
 /// OpenAPI V4 freeze has not decided on.
 pub fn utxos_json(state: &CommittedState, script_hash: &[u8; 32], limit: usize) -> Json {
-    let matching: Vec<&EutxoEntry> =
-        state.eutxos().filter(|e| &e.script_hash == script_hash).collect();
+    let matching: Vec<&EutxoEntry> = state
+        .eutxos()
+        .filter(|e| &e.script_hash == script_hash)
+        .collect();
     let total = matching.len();
     let page: Vec<Json> = matching.iter().take(limit).map(|e| eutxo_json(e)).collect();
     Json::obj(vec![
@@ -1490,7 +1562,10 @@ pub fn mempool_info_json(
         ("size", Json::u(size as u64)),
         ("max", Json::u(max as u64)),
         ("bytes", Json::u(bytes as u64)),
-        ("next_base_fee_millisat_per_gas", Json::sat(next_base_fee_millisat_per_gas)),
+        (
+            "next_base_fee_millisat_per_gas",
+            Json::sat(next_base_fee_millisat_per_gas),
+        ),
     ])
 }
 
