@@ -17,7 +17,7 @@
 
 [package]
 name = "bloch-pos-node"
-version = "0.0.2-devnet"
+version = "0.1.0-mainnet"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Bloch Genesis-4 Proof-of-Stake node — the binary the live chain runs (mainnet since 2026-08-13). Produces, attests, justifies and finalizes; append-only block-log persistence with replay-on-restart. UNAUDITED — see docs/specs/BLOCH-POS-NODE-INTEGRATION.md."

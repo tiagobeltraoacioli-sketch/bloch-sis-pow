@@ -1555,7 +1555,7 @@ dependencies = [
 
 [[package]]
 name = "bloch-pos-node"
-version = "0.0.2-devnet"
+version = "0.1.0-mainnet"
 dependencies = [
  "async-trait",
  "bloch-crypto",
