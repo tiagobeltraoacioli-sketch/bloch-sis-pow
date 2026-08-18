@@ -1067,7 +1067,7 @@ fn handle_swarm_event(
         SwarmEvent::NewListenAddr { address, .. } => {
             println!("p2p: listening on {address}");
         }
-        SwarmEvent::ConnectionEstablished { peer_id, ref endpoint, .. } => {
+        SwarmEvent::ConnectionEstablished { peer_id, ref endpoint, num_established, .. } => {
             println!("p2p: connected {peer_id}");
             if let libp2p::core::ConnectedPoint::Dialer { address, .. } = endpoint {
                 st.dialed.insert(address.clone(), peer_id);
@@ -1082,11 +1082,27 @@ fn handle_swarm_event(
             // a node that comes back with a short log gets the rest from the
             // first peer it reaches, without waiting for the engine's sync
             // timer.
-            let after = st.head_slot.load(Ordering::Relaxed);
-            swarm.behaviour_mut().sync.send_request(
-                &peer_id,
-                SyncRequest::GetBlocks { after_slot: after, limit: MAX_SYNC_BLOCKS as u32 },
-            );
+            // ONE WALK PER PEER, NOT PER CONNECTION.
+            //
+            // libp2p keeps more than one connection to the same peer — when both
+            // sides dial, each ends up with an inbound and an outbound — and this
+            // event fires once per CONNECTION. Sending the request on every one
+            // started the whole sync walk twice against the same peer, so every
+            // block arrived twice and each duplicate spent a page of the
+            // MAX_PAGES_WITHOUT_PROGRESS budget. Measured on a two-node harness: a
+            // restarted node asking for slots 61..200 received 61..188 plus a
+            // second copy of 61..72, and never reached the tip.
+            //
+            // `num_established` counts connections to THIS peer including the one
+            // just opened, so `== 1` is the first. ConnectionClosed below already
+            // reads the same counter the other way round.
+            if num_established.get() == 1 {
+                let after = st.head_slot.load(Ordering::Relaxed);
+                swarm.behaviour_mut().sync.send_request(
+                    &peer_id,
+                    SyncRequest::GetBlocks { after_slot: after, limit: MAX_SYNC_BLOCKS as u32 },
+                );
+            }
         }
         SwarmEvent::ConnectionClosed { peer_id, num_established, cause, .. } => {
             if num_established == 0 {

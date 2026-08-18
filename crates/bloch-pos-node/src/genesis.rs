@@ -774,13 +774,62 @@ impl Manifest {
         if n > 1_000_000 {
             return Err(DecodeErr("validator count over cap"));
         }
+        // BLP-02 (CertiK, 2026-08-17). THE SUITE IS CHECKED HERE, AT INGESTION.
+        //
+        // `bloch_crypto::crypto::verify` dispatches on the suite carried INSIDE the
+        // public key. A registry key stamped SUITE_MLDSA65_ONLY (0x0002) is therefore
+        // verified with the ML-DSA half alone — and `HybridVerifier`, despite its
+        // name, hands the registered bytes straight to that dispatcher. Staking
+        // deposits already reject 0x0002; the manifest path did not, so the hybrid
+        // invariant rested on whoever assembled the file.
+        //
+        // Genesis-4's live manifest carries 64 keys, every one of them 0x0001 and
+        // 3,749 bytes (4 header + 1,952 ML-DSA-65 + 1,793 Falcon-1024), so nothing on
+        // the chain today is affected. This closes the door rather than reporting that
+        // nobody walked through it.
+        //
+        // Refusing here — at decode, before a key can reach a verifier — is what makes
+        // the rule hold for every consumer of a manifest, including ones not written
+        // yet.
+        fn check_hybrid_pubkey(pk: &[u8], index: u32) -> Result<(), DecodeErr> {
+            use bloch_crypto::crypto::{MLDSA_PUBKEY_LEN, SUITE_HEADER_LEN, SUITE_MLDSA65_FALCON1024};
+            if pk.len() < SUITE_HEADER_LEN {
+                let _ = index;
+                return Err(DecodeErr("validator pubkey shorter than its suite header"));
+            }
+            if pk[0] != 0xB1 || pk[1] != 0x0C {
+                return Err(DecodeErr("validator pubkey is not suite-enveloped"));
+            }
+            let suite = u16::from_le_bytes([pk[2], pk[3]]);
+            if suite != SUITE_MLDSA65_FALCON1024 {
+                // Named rather than numbered: "suite 0x0002" tells an operator nothing.
+                return Err(DecodeErr(
+                    "validator pubkey is not the hybrid ML-DSA-65 + Falcon-1024 suite — \
+                     Genesis-4 consensus signatures must verify on BOTH halves",
+                ));
+            }
+            // Both halves must be present. A body of exactly the ML-DSA length would
+            // carry no Falcon key at all while still claiming the hybrid suite.
+            if pk.len() <= SUITE_HEADER_LEN + MLDSA_PUBKEY_LEN {
+                return Err(DecodeErr(
+                    "validator pubkey claims the hybrid suite but carries no Falcon-1024 half",
+                ));
+            }
+            Ok(())
+        }
+
         let mut validators = Vec::with_capacity(n);
         for _ in 0..n {
+            let index = r.u32()?;
+            let stake_sat = r.u128()?;
+            let randao_commitment = r.h32()?;
+            let pubkey = r.bytes()?;
+            check_hybrid_pubkey(&pubkey, index)?;
             validators.push(ManifestValidator {
-                index: r.u32()?,
-                stake_sat: r.u128()?,
-                randao_commitment: r.h32()?,
-                pubkey: r.bytes()?,
+                index,
+                stake_sat,
+                randao_commitment,
+                pubkey,
                 withdrawal_credentials: r.bytes()?,
                 commission_bps: r.u128()?,
             });
@@ -1056,6 +1105,17 @@ impl Manifest {
 mod tests {
     use super::*;
 
+    /// A validator pubkey shaped the way Genesis-4 requires: the 0x0001
+    /// envelope, then the ML-DSA-65 half, then the Falcon-1024 half. These
+    /// fixtures used sixteen filler bytes, which `Manifest::decode` now refuses
+    /// (CertiK BLP-02). The bytes are still filler — only the SHAPE is real,
+    /// which is all the decoder checks and all a round-trip test needs.
+    fn shaped_pubkey(seed: u8) -> Vec<u8> {
+        let mut v = vec![0xB1, 0x0C, 0x01, 0x00];
+        v.extend(std::iter::repeat(seed).take(1952 + 1793));
+        v
+    }
+
     fn sample() -> Manifest {
         Manifest {
             genesis_time_ms: 1_800_000_000_000,
@@ -1065,7 +1125,7 @@ mod tests {
                     index: i,
                     stake_sat: (i as u128 + 1) * 1_000,
                     randao_commitment: [i as u8; 32],
-                    pubkey: vec![i as u8; 16],
+                    pubkey: shaped_pubkey(i as u8),
                     withdrawal_credentials: Vec::new(),
                     // Distinct non-zero rates, so a decoder that dropped or
                     // aliased the column would fail the round-trip below
@@ -1733,5 +1793,89 @@ mod tests {
         let mut bytes = sample().encode();
         bytes.push(0);
         assert!(Manifest::decode(&bytes).is_err());
+    }
+}
+
+#[cfg(test)]
+mod blp02_hybrid_suite {
+    use super::*;
+
+    // `Manifest` does not derive Debug, and it is not this test's business to
+    // make a consensus type derive one. So: is_ok/is_err plus a match for the
+    // message, never expect/expect_err.
+    fn decode_err(bytes: &[u8]) -> Option<&'static str> {
+        match Manifest::decode(bytes) {
+            Ok(_) => None,
+            Err(e) => Some(e.0),
+        }
+    }
+
+    fn hybrid_pk() -> Vec<u8> {
+        let mut v = vec![0xB1, 0x0C, 0x01, 0x00];
+        v.extend(std::iter::repeat(0x11).take(1952 + 1793));
+        v
+    }
+    fn mldsa_only_pk() -> Vec<u8> {
+        let mut v = vec![0xB1, 0x0C, 0x02, 0x00];
+        v.extend(std::iter::repeat(0x22).take(1952));
+        v
+    }
+    fn manifest_with(pk: Vec<u8>) -> Manifest {
+        Manifest {
+            genesis_time_ms: 1_800_000_000_000,
+            slot_ms: 30_000,
+            validators: vec![ManifestValidator {
+                index: 0,
+                stake_sat: 25_000 * 100_000_000,
+                randao_commitment: [0x44u8; 32],
+                pubkey: pk,
+                withdrawal_credentials: [0x55u8; 32].to_vec(),
+                commission_bps: 0,
+            }],
+            cohort: vec![0],
+            carryover: None,
+            allocations: vec![],
+            carryover_entries: vec![],
+        }
+    }
+
+    #[test]
+    fn mldsa_only_validator_key_is_refused_at_decode() {
+        let bytes = manifest_with(mldsa_only_pk()).encode();
+        let msg = decode_err(&bytes).expect("a 0x0002 validator key must not decode");
+        assert!(msg.contains("hybrid"), "the refusal must name the reason, got: {msg}");
+    }
+
+    #[test]
+    fn hybrid_validator_key_still_decodes() {
+        let bytes = manifest_with(hybrid_pk()).encode();
+        assert!(
+            Manifest::decode(&bytes).is_ok(),
+            "the hybrid suite is what Genesis-4 runs and must keep decoding"
+        );
+    }
+
+    #[test]
+    fn a_hybrid_claim_with_no_falcon_half_is_refused() {
+        // Right suite id, ML-DSA bytes only — the dangerous middle case.
+        let mut pk = vec![0xB1, 0x0C, 0x01, 0x00];
+        pk.extend(std::iter::repeat(0x33).take(1952));
+        let bytes = manifest_with(pk).encode();
+        assert!(
+            decode_err(&bytes).is_some(),
+            "a hybrid claim carrying no Falcon half must not decode"
+        );
+    }
+
+    #[test]
+    fn the_live_mainnet_manifest_still_decodes() {
+        // A check that refuses the running chain is worse than the gap it closes.
+        // This reads the published artefact, not a fixture this test built.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../genesis/mainnet.manifest");
+        let Ok(bytes) = std::fs::read(path) else { return };
+        match Manifest::decode(&bytes) {
+            Ok(m) => assert_eq!(m.validators.len(), 64, "the live set is 64 validators"),
+            Err(e) => panic!("the live Genesis-4 manifest must decode, got: {}", e.0),
+        }
     }
 }
