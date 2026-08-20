@@ -906,6 +906,22 @@ impl Engine {
                         after.justified.epoch,
                         after.finalized.epoch,
                     );
+                    // Snapshot on the epoch boundary. Not every block: the
+                    // encoding walks the whole eUTXO set (~452k entries at
+                    // genesis), so doing it per block would put that cost on
+                    // the hot path 120 times an epoch to save the same work
+                    // once. Once per 32 slots bounds a restart's replay to at
+                    // most one epoch — 16 minutes of chain instead of seven
+                    // hours — which is the whole point.
+                    //
+                    // A failed write is a warning, never fatal: the node is
+                    // fully functional without a snapshot, and the block log
+                    // above is the thing that must not fail.
+                    if epoch_of(env.header.slot) != epoch_of(env.header.slot.saturating_sub(1)) {
+                        if let Err(e) = self.store.save_snapshot(&self.state.encode_snapshot()) {
+                            eprintln!("snapshot: could not write at slot {}: {e}", env.header.slot);
+                        }
+                    }
                     if after.justified.epoch > before.justified.epoch {
                         println!(
                             "*** JUSTIFIED epoch {} ({})",
@@ -1588,10 +1604,50 @@ pub fn run(cfg: Config) -> io::Result<()> {
         manifest,
     };
 
+    // ── Snapshot: skip the part of the replay we can prove we already know. ──
+    //
+    // A snapshot is a **cache, never an authority**. It is loaded, its state
+    // root is recomputed from the decoded state, and that root is compared
+    // against the root the block header at that slot already commits to. A
+    // corrupt file, a truncated write, a tampered copy or a snapshot from
+    // another chain all fail that comparison and the node replays from genesis
+    // exactly as it does today. No consensus rule changes and nothing new goes
+    // on the wire, so there is no flag day.
+    //
+    // Why it is worth the code: replay was measured at 29 slots/min, and the
+    // rate decays as the eUTXO set grows. At height 12,050 that is about seven
+    // hours before a restarted node is useful, which on 2026-08-19 turned a
+    // half-hour security fix into a two-day roll-out.
+    let mut replay_from = 0usize;
+    if let Some(bytes) = engine.store.load_snapshot()? {
+        match adopt_snapshot(&bytes, &logged) {
+            Some((state, upto)) => {
+                engine.state = state;
+                replay_from = upto;
+                println!(
+                    "snapshot: adopted state at slot {} (root {} matches the header), \
+                     replaying {} block(s) instead of {}",
+                    engine.state.slot(),
+                    crate::codec::hex8(&engine.state.state_root()),
+                    logged.len() - upto,
+                    logged.len(),
+                );
+            }
+            None => {
+                // Loud, and then harmless: the node does the slow thing.
+                eprintln!(
+                    "snapshot: refused (does not match the chain in this data dir) — \
+                     discarding it and replaying from genesis"
+                );
+                let _ = engine.store.discard_snapshot();
+            }
+        }
+    }
+
     // ── Replay: restart returns to the same state, by re-running the same
     // transition over the same inputs. ──
-    let n_logged = logged.len();
-    for env in logged {
+    let n_logged = logged.len() - replay_from;
+    for env in logged.into_iter().skip(replay_from) {
         engine.ingest(env);
     }
     engine.live = true;
@@ -2290,5 +2346,177 @@ mod admission_authorisation {
         let err = admissible(&PosTransaction::Exit { validator: 0 })
             .expect_err("Exit carries no signature and must not be admitted");
         assert!(err.contains("not authenticated"), "got: {err}");
+    }
+}
+
+/// Decide whether a snapshot may be adopted, and if so return the state and
+/// how many logged blocks it lets the caller skip.
+///
+/// # The check, and why it is the whole story
+///
+/// Three things must line up before a byte of this state is used:
+///
+/// 1. The snapshot names a slot that appears in **this** node's block log. If
+///    it does not, the file describes a chain we do not have.
+/// 2. The header at that slot derives the block id the snapshot claims. The
+///    id is derived the only legal way — `BlockId::of` — and passed into the
+///    decoder, which compares rather than reconstructs; a snapshot from a
+///    sibling branch at the same slot dies here, before the eUTXO set is even
+///    allocated.
+/// 3. The state root recomputed from the decoded state equals the root that
+///    same header commits to. **This is the proof.** The header was signed by
+///    a proposer and attested by a committee, so the root in it is a claim the
+///    network already made; a snapshot that reproduces it is the state the
+///    network agreed on, whatever the file's provenance. A snapshot that does
+///    not is discarded, and no amount of it having been written by this node
+///    five minutes ago changes that.
+///
+/// Returning `None` is never fatal — it costs a replay, which is what the node
+/// did before this existed.
+fn adopt_snapshot(
+    bytes: &[u8],
+    logged: &[BlockEnvelope],
+) -> Option<(CommittedState, usize)> {
+    use bloch_pos_committee::header::BlockId;
+
+    // Peek at the slot without trusting anything else in the file: magic, then
+    // the u64 that `encode_snapshot` writes first.
+    if bytes.len() < 16 || &bytes[..8] != bloch_pos_committee::snapshot::SNAP_MAGIC {
+        return None;
+    }
+    let snap_slot = u64::from_le_bytes(bytes[8..16].try_into().ok()?);
+
+    // Genesis needs no snapshot, and adopting one for slot 0 would skip
+    // nothing while adding a way to get genesis wrong.
+    if snap_slot == 0 {
+        return None;
+    }
+
+    // (1) Find that slot in our own log. `position` rather than a search by
+    // height: the log is the chain this node actually holds.
+    let idx = logged.iter().position(|e| e.header.slot == snap_slot)?;
+    let header = &logged[idx].header;
+
+    // (2) Derive the id the one legal way and let the decoder compare.
+    let head = BlockId::of(header);
+    let state = CommittedState::decode_snapshot(bytes, head).ok()?;
+
+    // A decoded state that disagrees with the header about *which slot this
+    // is* would be a decoder bug rather than a bad file, but the check costs
+    // nothing and the alternative is a silent off-by-one in the skip count.
+    if state.slot() != snap_slot {
+        return None;
+    }
+
+    // (3) The proof: the root the network committed to at this height.
+    if state.state_root() != header.state_root {
+        return None;
+    }
+
+    // There is deliberately no separate "is this our network" test here: the
+    // root just matched a header out of *this* log, and `Store::open` already
+    // refused the data dir if it belonged to another genesis. A third check
+    // would only restate those two.
+
+    // Everything up to and including `idx` is now accounted for by the state.
+    Some((state, idx + 1))
+}
+
+#[cfg(test)]
+mod snapshot_adoption {
+    //! What [`adopt_snapshot`] must refuse.
+    //!
+    //! **Scope, stated rather than left to be discovered:** these cover the
+    //! refusals. The accepting path is not exercised here, because a
+    //! `CommittedState` at a slot above zero cannot be built from this crate —
+    //! the struct's fields are private to the committee crate and its only
+    //! public constructor is `genesis`, which is slot 0, which this function
+    //! refuses by design. The encode/decode round trip is pinned in
+    //! `bloch_pos_committee::transition::snapshot_round_trip`, and adoption
+    //! itself is proven by a node booting and printing the `snapshot: adopted`
+    //! line. That is a weaker guarantee than a test and is worth closing when
+    //! the committee crate grows a test-only state constructor.
+
+    use super::*;
+    use bloch_pos_committee::header::{BlockHeaderV4, VERSION_G4};
+
+    fn hdr(slot: u64, state_root: [u8; 32]) -> BlockHeaderV4 {
+        BlockHeaderV4 {
+            version: VERSION_G4,
+            parent: [0u8; 32],
+            state_root,
+            body_root: [0u8; 32],
+            slot,
+            proposer_index: 0,
+            randao_reveal: [0u8; 32],
+            randao_mix: [0u8; 32],
+            justified_root: [0u8; 32],
+            finalized_root: [0u8; 32],
+            attestation_root: [0u8; 32],
+            coherence_root: [0u8; 32],
+        }
+    }
+
+    fn env(slot: u64, state_root: [u8; 32]) -> BlockEnvelope {
+        BlockEnvelope {
+            header: hdr(slot, state_root),
+            proposer_sig: Vec::new(),
+            body: Body { transactions: Vec::new(), attestations: Vec::new() },
+        }
+    }
+
+    /// A snapshot whose slot is not in this node's log describes a chain we do
+    /// not have. It must not be adopted, however well-formed it is.
+    #[test]
+    fn a_slot_this_node_never_logged_is_refused() {
+        let mut bytes = bloch_pos_committee::snapshot::SNAP_MAGIC.to_vec();
+        bytes.extend_from_slice(&7_000u64.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 64]);
+        let log = vec![env(1, [1u8; 32]), env(2, [2u8; 32])];
+        assert!(adopt_snapshot(&bytes, &log).is_none());
+    }
+
+    /// Genesis needs no snapshot. Adopting one would skip nothing and add a
+    /// way to get genesis wrong.
+    #[test]
+    fn a_genesis_snapshot_is_refused() {
+        let mut bytes = bloch_pos_committee::snapshot::SNAP_MAGIC.to_vec();
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 64]);
+        let log = vec![env(0, [0u8; 32]), env(1, [1u8; 32])];
+        assert!(adopt_snapshot(&bytes, &log).is_none());
+    }
+
+    /// Anything that is not a snapshot, and anything too short to carry a
+    /// slot, is refused before a decode is attempted.
+    #[test]
+    fn a_file_that_is_not_a_snapshot_is_refused() {
+        let log = vec![env(1, [1u8; 32])];
+        assert!(adopt_snapshot(b"", &log).is_none());
+        assert!(adopt_snapshot(b"BPOSSNP1", &log).is_none()); // magic, no slot
+        assert!(adopt_snapshot(b"NOTASNAP________", &log).is_none());
+    }
+
+    /// The load-bearing one: a file that parses but whose state does not
+    /// reproduce the root the header commits to. Here the payload after the
+    /// slot is garbage, so the decode fails; the point of the test is that no
+    /// state escapes without the header having agreed to it.
+    #[test]
+    fn a_snapshot_that_does_not_match_the_header_is_refused() {
+        let mut bytes = bloch_pos_committee::snapshot::SNAP_MAGIC.to_vec();
+        bytes.extend_from_slice(&2u64.to_le_bytes());
+        bytes.extend_from_slice(&[0xAB; 256]);
+        let log = vec![env(1, [1u8; 32]), env(2, [2u8; 32])];
+        assert!(adopt_snapshot(&bytes, &log).is_none());
+    }
+
+    /// An empty log cannot support any snapshot — there is no header to check
+    /// one against.
+    #[test]
+    fn an_empty_log_adopts_nothing() {
+        let mut bytes = bloch_pos_committee::snapshot::SNAP_MAGIC.to_vec();
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 64]);
+        assert!(adopt_snapshot(&bytes, &[]).is_none());
     }
 }

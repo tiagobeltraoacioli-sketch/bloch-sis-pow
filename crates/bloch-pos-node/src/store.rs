@@ -146,6 +146,49 @@ impl Store {
         Ok(())
     }
 
+    /// Write a committed-state snapshot, replacing any previous one.
+    ///
+    /// Write-to-temp + rename, exactly like [`Store::rewrite`]: a crash leaves
+    /// either the old snapshot or the new one. A half-written snapshot would be
+    /// caught anyway — the decoder rejects truncation, and the state root is
+    /// checked on load — but "caught" here means paying a full replay, so it is
+    /// worth not producing one.
+    ///
+    /// The bytes come from `CommittedState::encode_snapshot`, in the pure
+    /// crate. The module note above warns against a private encoder *in this
+    /// file*, because that would be a second byte layout for committed state —
+    /// the twin-derivation defect this repo keeps paying for. There is still
+    /// exactly one layout; this function only files it.
+    pub fn save_snapshot(&self, bytes: &[u8]) -> io::Result<()> {
+        let tmp = self.dir.join("snapshot.bin.tmp");
+        {
+            let mut f = File::create(&tmp)?;
+            f.write_all(bytes)?;
+            f.sync_data()?;
+        }
+        fs::rename(&tmp, self.dir.join("snapshot.bin"))
+    }
+
+    /// The snapshot on disk, if there is one. A missing file is `Ok(None)`:
+    /// booting without a snapshot is the ordinary case, not an error.
+    pub fn load_snapshot(&self) -> io::Result<Option<Vec<u8>>> {
+        match fs::read(self.dir.join("snapshot.bin")) {
+            Ok(b) => Ok(Some(b)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Delete the snapshot. Called when one is refused, so a node does not
+    /// re-read and re-reject the same bad file on every boot.
+    pub fn discard_snapshot(&self) -> io::Result<()> {
+        match fs::remove_file(self.dir.join("snapshot.bin")) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Encoded blocks with slot strictly greater than `after_slot`, in chain
     /// order, at most `limit` of them — the answer to a `get-blocks`.
     ///
