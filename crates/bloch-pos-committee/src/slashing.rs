@@ -822,3 +822,27 @@ mod tests {
         assert_eq!(out.delegation_losses_sat, vec![5_000, 0]);
     }
 }
+
+// ── snapshot ─────────────────────────────────────────────────────────────────
+// Private fields, so the encoding belongs to the type. See `snapshot.rs`.
+
+impl SlashingState {
+    pub fn snap_write(&self, w: &mut crate::snapshot::W) {
+        w.len(self.applied.len());
+        for h in &self.applied { w.h32(h); }
+        w.len(self.ejected.len());
+        for v in &self.ejected { w.u32(*v); }
+        w.len(self.window.len());
+        for (e, s) in &self.window { w.u64(*e); w.u128(*s); }
+    }
+
+    pub fn snap_read(r: &mut crate::snapshot::R) -> Result<Self, crate::snapshot::SnapErr> {
+        let mut applied = std::collections::BTreeSet::new();
+        for _ in 0..r.len()? { applied.insert(r.h32()?); }
+        let mut ejected = std::collections::BTreeSet::new();
+        for _ in 0..r.len()? { ejected.insert(r.u32()?); }
+        let mut window = std::collections::BTreeMap::new();
+        for _ in 0..r.len()? { let e = r.u64()?; window.insert(e, r.u128()?); }
+        Ok(SlashingState { applied, ejected, window })
+    }
+}

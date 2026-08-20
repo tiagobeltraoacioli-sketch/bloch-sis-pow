@@ -74,6 +74,7 @@ pub mod slashing;
 pub mod derive;
 pub mod transition;
 pub mod ws;
+pub mod snapshot;
 
 pub use attestation::{Attestation, AttestationData, RejectReason, SignatureVerifier};
 pub use beacon::{mix_in, process_reveal, BeaconError, RandaoChain, RevealState};

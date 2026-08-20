@@ -5430,3 +5430,627 @@ mod carried_ownership_tests {
         assert!(!owns(&mine, &almost));
     }
 }
+
+// ── snapshot: the whole committed state, so a restart need not replay ────────
+//
+// See `snapshot.rs` for why this exists and what makes it safe. The short
+// version: this is a CACHE. `CommittedState::state_root()` is recomputed after
+// loading and checked against the root the block header already commits to, so
+// a snapshot that is corrupt, truncated, tampered with, or from another chain
+// is detected rather than trusted.
+//
+// Field order below is the declaration order of the struct. Keeping the two in
+// step is the only discipline this file asks for: a field added to the struct
+// and not added here would be silently dropped on load, and the state-root
+// check is what would catch it — loudly, at boot, instead of subtly, later.
+
+impl CommittedState {
+    /// Encode this state. Deterministic: `BTreeMap`/`BTreeSet` iterate in key
+    /// order, so two nodes holding the same state produce identical bytes.
+    pub fn encode_snapshot(&self) -> Vec<u8> {
+        use crate::snapshot::W;
+        let mut w = W::new();
+        w.0.extend_from_slice(crate::snapshot::SNAP_MAGIC);
+
+        w.u64(self.slot);
+        w.u64(self.epoch);
+        w.h32(self.head.as_bytes());
+
+        w.len(self.validators.len());
+        for (i, v) in &self.validators {
+            w.u32(*i);
+            w.u32(v.index);
+            w.bytes(&v.pubkey);
+            w.u128(v.staked_sat);
+            w.h32(&v.randao_commitment);
+            w.bytes(&v.withdrawal_credentials);
+            w.u64(v.activation_epoch);
+            w.u64(v.exit_epoch);
+            w.u64(v.withdrawable_epoch);
+            w.bool(v.slashed);
+            w.u128(v.commission_bps);
+        }
+
+        w.len(self.reveals_used.len());
+        for (k, v) in &self.reveals_used { w.u32(*k); w.u32(*v); }
+
+        w.h32(&self.randao_mix);
+        w.len(self.boundary_mixes.len());
+        for (k, v) in &self.boundary_mixes { w.u64(*k); w.h32(v); }
+        w.h32(&self.genesis_mix);
+        w.len(self.genesis_cohort.len());
+        for v in &self.genesis_cohort { w.u32(*v); }
+
+        self.finality_engine.snap_write(&mut w);
+        w.u64(self.previous_justified.epoch);
+        w.h32(&self.previous_justified.root);
+
+        w.len(self.pending_votes.len());
+        for ((v, r), a) in &self.pending_votes {
+            w.u32(*v); w.h32(r);
+            w.u64(a.slot); w.h32(&a.head);
+            w.u64(a.source_epoch); w.h32(&a.source_root);
+            w.u64(a.target_epoch); w.h32(&a.target_root);
+        }
+
+        w.len(self.latest_messages.len());
+        for (v, (s, r)) in &self.latest_messages { w.u32(*v); w.u64(*s); w.h32(r); }
+
+        w.len(self.fc_equivocators.len());
+        for v in &self.fc_equivocators { w.u32(*v); }
+
+        w.len(self.current_participation.len());
+        for (k, v) in &self.current_participation { w.u32(*k); w.bool(*v); }
+        w.len(self.previous_participation.len());
+        for (k, v) in &self.previous_participation { w.u32(*k); w.bool(*v); }
+
+        w.len(self.deposit_history.len());
+        for d in &self.deposit_history {
+            w.h32(&d.pubkey_hash); w.u64(d.deposit_epoch); w.u128(d.amount_sat);
+        }
+
+        w.len(self.pubkey_index.len());
+        for (h, i) in &self.pubkey_index { w.h32(h); w.u32(*i); }
+
+        w.len(self.delegations.len());
+        for d in &self.delegations {
+            w.u32(d.delegator); w.u32(d.validator); w.u128(d.amount_sat);
+            w.u64(d.requested_epoch); w.opt_u64(d.deactivate_epoch); w.bool(d.eligible);
+        }
+
+        w.len(self.pending_fee_rewards.len());
+        for (k, v) in &self.pending_fee_rewards { w.u32(*k); w.u128(*v); }
+
+        self.slashing.snap_write(&mut w);
+
+        w.len(self.delegator_slash_losses.len());
+        for (k, v) in &self.delegator_slash_losses { w.u32(*k); w.u128(*v); }
+        w.len(self.delegator_fee_rewards.len());
+        for (k, v) in &self.delegator_fee_rewards { w.u32(*k); w.u128(*v); }
+
+        w.u128(self.base_fee_millisat_per_gas);
+        w.u64(self.block_gas_used);
+        w.u64(self.block_tx_bytes);
+        w.h32(&self.taint_root);
+        w.h32(&self.coherence_accumulator_root);
+        w.h32(&self.coherence_nullifier_root);
+
+        w.h32(&self.evm.account_root);
+        w.h32(&self.evm.receipts_root);
+        w.u64(self.evm.gas_used);
+        w.u64(self.evm.base_fee_per_gas);
+
+        w.u128(self.issued_sat);
+
+        // The big one: ~452k entries at genesis and growing.
+        w.len(self.eutxos.len());
+        for ((txid, vout), e) in &self.eutxos {
+            w.h32(txid); w.u32(*vout);
+            w.h32(&e.txid); w.u32(e.vout); w.u64(e.value); w.h32(&e.script_hash);
+        }
+
+        w.0
+    }
+
+    /// Decode a state written by [`Self::encode_snapshot`].
+    ///
+    /// Reads in exactly the order the encoder writes; the two must be edited
+    /// together, and the round-trip test below is what fails if they drift.
+    ///
+    /// **This does not authenticate anything.** A state that decodes cleanly
+    /// may still be the wrong state — from another chain, another height, or a
+    /// tampered file. The caller's obligation is to recompute the state root
+    /// from the result and compare it against the root the header at
+    /// [`Self::slot`] already commits to, and to discard the snapshot and
+    /// replay if it differs. Decoding is a parse, not a proof.
+    ///
+    /// # Why `expected_head` is a parameter and not read from the file
+    ///
+    /// §5.4 allows exactly one way to derive a [`BlockId`] — `BlockId::of` on
+    /// a header — and a source-scanning test enforces that there is exactly
+    /// one construction site in the crate. A decoder that minted an id from 32
+    /// bytes on disk would be a second one, and the rule it would break is the
+    /// same rule that kept the Genesis-3 dual-identity defect out of
+    /// Genesis-4.
+    ///
+    /// So the caller derives the id the only legal way — it already holds the
+    /// header at this height — and passes it in. The 32 bytes in the file are
+    /// then *compared* against it rather than trusted. That is strictly
+    /// stronger than reconstructing: a snapshot belonging to a different
+    /// branch at the same slot is refused here, before the state root is even
+    /// computed, instead of being loaded and rejected later.
+    pub fn decode_snapshot(
+        bytes: &[u8],
+        expected_head: BlockId,
+    ) -> Result<Self, crate::snapshot::SnapErr> {
+        use crate::snapshot::{R, SnapErr, SNAP_MAGIC};
+
+        let mut r = R::new(bytes);
+        // Refuse anything that is not a snapshot before allocating for it.
+        if r.take_magic()? != *SNAP_MAGIC {
+            return Err(SnapErr("bad magic — not a snapshot, or a later version"));
+        }
+
+        let slot = r.u64()?;
+        let epoch = r.u64()?;
+        if r.h32()? != *expected_head.as_bytes() {
+            return Err(SnapErr("head is not the block the caller expected here"));
+        }
+        let head = expected_head;
+
+        let mut validators = BTreeMap::new();
+        for _ in 0..r.len()? {
+            let key = r.u32()?;
+            let v = ValidatorRecord {
+                index: r.u32()?,
+                pubkey: r.bytes()?,
+                staked_sat: r.u128()?,
+                randao_commitment: r.h32()?,
+                withdrawal_credentials: r.bytes()?,
+                activation_epoch: r.u64()?,
+                exit_epoch: r.u64()?,
+                withdrawable_epoch: r.u64()?,
+                slashed: r.bool()?,
+                commission_bps: r.u128()?,
+            };
+            validators.insert(key, v);
+        }
+
+        let mut reveals_used = BTreeMap::new();
+        for _ in 0..r.len()? {
+            let k = r.u32()?;
+            reveals_used.insert(k, r.u32()?);
+        }
+
+        let randao_mix = r.h32()?;
+        let mut boundary_mixes = BTreeMap::new();
+        for _ in 0..r.len()? {
+            let k = r.u64()?;
+            boundary_mixes.insert(k, r.h32()?);
+        }
+        let genesis_mix = r.h32()?;
+        let mut genesis_cohort = Vec::new();
+        for _ in 0..r.len()? {
+            genesis_cohort.push(r.u32()?);
+        }
+
+        let finality_engine = finality::FinalityState::snap_read(&mut r)?;
+        let previous_justified = Checkpoint {
+            epoch: r.u64()?,
+            root: r.h32()?,
+        };
+
+        let mut pending_votes = BTreeMap::new();
+        for _ in 0..r.len()? {
+            let v = r.u32()?;
+            let root = r.h32()?;
+            let a = AttestationData {
+                slot: r.u64()?,
+                head: r.h32()?,
+                source_epoch: r.u64()?,
+                source_root: r.h32()?,
+                target_epoch: r.u64()?,
+                target_root: r.h32()?,
+            };
+            pending_votes.insert((v, root), a);
+        }
+
+        let mut latest_messages = BTreeMap::new();
+        for _ in 0..r.len()? {
+            let v = r.u32()?;
+            let s = r.u64()?;
+            latest_messages.insert(v, (s, r.h32()?));
+        }
+
+        let mut fc_equivocators = BTreeSet::new();
+        for _ in 0..r.len()? {
+            fc_equivocators.insert(r.u32()?);
+        }
+
+        let mut current_participation = BTreeMap::new();
+        for _ in 0..r.len()? {
+            let k = r.u32()?;
+            current_participation.insert(k, r.bool()?);
+        }
+        let mut previous_participation = BTreeMap::new();
+        for _ in 0..r.len()? {
+            let k = r.u32()?;
+            previous_participation.insert(k, r.bool()?);
+        }
+
+        let mut deposit_history = Vec::new();
+        for _ in 0..r.len()? {
+            deposit_history.push(QueuedDeposit {
+                pubkey_hash: r.h32()?,
+                deposit_epoch: r.u64()?,
+                amount_sat: r.u128()?,
+            });
+        }
+
+        let mut pubkey_index = BTreeMap::new();
+        for _ in 0..r.len()? {
+            let h = r.h32()?;
+            pubkey_index.insert(h, r.u32()?);
+        }
+
+        let mut delegations = Vec::new();
+        for _ in 0..r.len()? {
+            delegations.push(Delegation {
+                delegator: r.u32()?,
+                validator: r.u32()?,
+                amount_sat: r.u128()?,
+                requested_epoch: r.u64()?,
+                deactivate_epoch: r.opt_u64()?,
+                eligible: r.bool()?,
+            });
+        }
+
+        let mut pending_fee_rewards = BTreeMap::new();
+        for _ in 0..r.len()? {
+            let k = r.u32()?;
+            pending_fee_rewards.insert(k, r.u128()?);
+        }
+
+        let slashing = slashing::SlashingState::snap_read(&mut r)?;
+
+        let mut delegator_slash_losses = BTreeMap::new();
+        for _ in 0..r.len()? {
+            let k = r.u32()?;
+            delegator_slash_losses.insert(k, r.u128()?);
+        }
+        let mut delegator_fee_rewards = BTreeMap::new();
+        for _ in 0..r.len()? {
+            let k = r.u32()?;
+            delegator_fee_rewards.insert(k, r.u128()?);
+        }
+
+        let base_fee_millisat_per_gas = r.u128()?;
+        let block_gas_used = r.u64()?;
+        let block_tx_bytes = r.u64()?;
+        let taint_root = r.h32()?;
+        let coherence_accumulator_root = r.h32()?;
+        let coherence_nullifier_root = r.h32()?;
+
+        let evm = EvmCommitment {
+            account_root: r.h32()?,
+            receipts_root: r.h32()?,
+            gas_used: r.u64()?,
+            base_fee_per_gas: r.u64()?,
+        };
+
+        let issued_sat = r.u128()?;
+
+        let n_eutxos = r.len()?;
+        let mut eutxos = BTreeMap::new();
+        for _ in 0..n_eutxos {
+            let txid = r.h32()?;
+            let vout = r.u32()?;
+            let e = crate::state_root::EutxoEntry {
+                txid: r.h32()?,
+                vout: r.u32()?,
+                value: r.u64()?,
+                script_hash: r.h32()?,
+            };
+            eutxos.insert((txid, vout), e);
+        }
+
+        // Trailing bytes mean the file is not what this decoder thinks it is —
+        // a longer encoding from a newer node, or a concatenation. Either way
+        // the parse is wrong even though every field so far read cleanly.
+        r.finish()?;
+
+        Ok(CommittedState {
+            slot,
+            epoch,
+            head,
+            validators,
+            reveals_used,
+            randao_mix,
+            boundary_mixes,
+            genesis_mix,
+            genesis_cohort,
+            finality_engine,
+            previous_justified,
+            pending_votes,
+            latest_messages,
+            fc_equivocators,
+            current_participation,
+            previous_participation,
+            deposit_history,
+            pubkey_index,
+            delegations,
+            pending_fee_rewards,
+            slashing,
+            delegator_slash_losses,
+            delegator_fee_rewards,
+            base_fee_millisat_per_gas,
+            block_gas_used,
+            block_tx_bytes,
+            taint_root,
+            coherence_accumulator_root,
+            coherence_nullifier_root,
+            evm,
+            issued_sat,
+            eutxos,
+        })
+    }
+}
+
+#[cfg(test)]
+mod snapshot_round_trip {
+    //! A snapshot is only useful if what comes back is what went in.
+    //!
+    //! The risk this guards is specific and quiet: a field added to
+    //! [`CommittedState`] and not added to [`CommittedState::encode_snapshot`]
+    //! is dropped on load, and a state that is *almost* right is worse than one
+    //! that fails loudly. So every field here is set to something that is not
+    //! its default — a collection left empty would round-trip perfectly whether
+    //! or not the encoder ever mentions it.
+
+    use super::*;
+    use crate::header::BlockHeaderV4;
+
+    fn fixture_head() -> BlockId {
+        BlockId::of(&BlockHeaderV4 {
+            version: BLOCK_VERSION_V4,
+            parent: [0u8; 32],
+            state_root: [0u8; 32],
+            body_root: [0u8; 32],
+            slot: 0,
+            proposer_index: 0,
+            randao_reveal: [0u8; 32],
+            randao_mix: [0x07; 32],
+            justified_root: [0u8; 32],
+            finalized_root: [0u8; 32],
+            attestation_root: [0u8; 32],
+            coherence_root: [0x33; 32],
+        })
+    }
+
+    fn state_with_every_field_set() -> CommittedState {
+        let vals = vec![GenesisValidator {
+            index: 0,
+            pubkey: vec![0xA1; 64],
+            staked_sat: 32_000_000_000,
+            randao_commitment: [0x01; 32],
+            withdrawal_credentials: vec![0xB2; 20],
+            commission_bps: 500,
+        }];
+        let mut st = CommittedState::genesis(
+            fixture_head(),
+            [0x07; 32],
+            &vals,
+            &[0],
+            [0x11; 32],
+            [0x22; 32],
+            [0x33; 32],
+            EvmCommitment {
+                account_root: [0x44; 32],
+                receipts_root: [0x55; 32],
+                gas_used: 0,
+                base_fee_per_gas: 1,
+            },
+            &[],
+        );
+
+        // Scalars: distinctive, and none of them a zero that a missing write
+        // would reproduce by accident.
+        st.slot = 12_050;
+        st.epoch = 376;
+        st.randao_mix = [0x5A; 32];
+        st.base_fee_millisat_per_gas = 1_234_567;
+        st.block_gas_used = 21_000;
+        st.block_tx_bytes = 260_079;
+        st.taint_root = [0x71; 32];
+        st.coherence_accumulator_root = [0x72; 32];
+        st.coherence_nullifier_root = [0x73; 32];
+        st.issued_sat = 57_146_400_000 * 100_000_000;
+        st.evm = EvmCommitment {
+            account_root: [0x81; 32],
+            receipts_root: [0x82; 32],
+            gas_used: 999,
+            base_fee_per_gas: 7,
+        };
+
+        // A second registry entry, so the map is not the one genesis wrote.
+        st.validators.insert(
+            9,
+            ValidatorRecord {
+                index: 9,
+                pubkey: vec![0xC3; 48],
+                staked_sat: 64_000_000_000,
+                randao_commitment: [0x02; 32],
+                withdrawal_credentials: vec![0xD4; 32],
+                activation_epoch: 3,
+                exit_epoch: u64::MAX,
+                withdrawable_epoch: u64::MAX,
+                slashed: true,
+                commission_bps: 250,
+            },
+        );
+
+        st.reveals_used.insert(9, 4);
+        st.boundary_mixes.insert(375, [0x63; 32]);
+        st.genesis_cohort = vec![0, 9];
+        st.previous_justified = Checkpoint { epoch: 374, root: [0x64; 32] };
+
+        st.pending_votes.insert(
+            (9, [0x65; 32]),
+            AttestationData {
+                slot: 12_049,
+                head: [0x66; 32],
+                source_epoch: 375,
+                source_root: [0x67; 32],
+                target_epoch: 376,
+                target_root: [0x68; 32],
+            },
+        );
+        st.latest_messages.insert(9, (12_049, [0x69; 32]));
+        st.fc_equivocators.insert(9);
+        st.current_participation.insert(9, true);
+        st.previous_participation.insert(0, false);
+
+        st.deposit_history.push(QueuedDeposit {
+            pubkey_hash: [0x6A; 32],
+            deposit_epoch: 370,
+            amount_sat: 32_000_000_000,
+        });
+        st.pubkey_index.insert([0x6B; 32], 9);
+
+        // Both Option arms of `deactivate_epoch`: the tag byte is the kind of
+        // thing that round-trips fine in one arm and not the other.
+        st.delegations.push(Delegation {
+            delegator: 5,
+            validator: 9,
+            amount_sat: 1_000_000,
+            requested_epoch: 371,
+            deactivate_epoch: None,
+            eligible: true,
+        });
+        st.delegations.push(Delegation {
+            delegator: 6,
+            validator: 0,
+            amount_sat: 2_000_000,
+            requested_epoch: 372,
+            deactivate_epoch: Some(380),
+            eligible: false,
+        });
+
+        st.pending_fee_rewards.insert(9, 4_242);
+        st.delegator_slash_losses.insert(5, 111);
+        st.delegator_fee_rewards.insert(6, 222);
+
+        st.eutxos.insert(
+            ([0x6C; 32], 1),
+            crate::state_root::EutxoEntry {
+                txid: [0x6C; 32],
+                vout: 1,
+                value: 1_240_000_00000000,
+                script_hash: [0x6D; 32],
+            },
+        );
+
+        st
+    }
+
+    #[test]
+    fn every_field_survives_the_round_trip() {
+        let before = state_with_every_field_set();
+        let bytes = before.encode_snapshot();
+        let after = CommittedState::decode_snapshot(&bytes, fixture_head()).expect("decodes");
+        assert_eq!(before, after, "a field is written but not read, or the reverse");
+    }
+
+    #[test]
+    fn encoding_is_deterministic() {
+        // Two encodes of equal states must be byte-identical, which is what
+        // makes snapshots comparable between nodes.
+        let a = state_with_every_field_set().encode_snapshot();
+        let b = state_with_every_field_set().encode_snapshot();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_snapshot_is_refused() {
+        assert!(CommittedState::decode_snapshot(b"", fixture_head()).is_err());
+        assert!(CommittedState::decode_snapshot(b"NOTASNAP rest", fixture_head()).is_err());
+    }
+
+    #[test]
+    fn truncation_is_detected_not_papered_over() {
+        // Every prefix of a valid snapshot must fail. The failure mode this
+        // rules out is a short read producing a *plausible* state — half the
+        // eUTXO set, say, which would be a silent loss of balances.
+        let bytes = state_with_every_field_set().encode_snapshot();
+        for cut in [8, 40, 200, bytes.len() - 1] {
+            assert!(
+                CommittedState::decode_snapshot(&bytes[..cut], fixture_head()).is_err(),
+                "prefix of {cut} bytes decoded as if it were whole"
+            );
+        }
+    }
+
+    #[test]
+    fn trailing_bytes_are_refused() {
+        let mut bytes = state_with_every_field_set().encode_snapshot();
+        bytes.push(0);
+        assert!(CommittedState::decode_snapshot(&bytes, fixture_head()).is_err());
+    }
+}
+
+#[cfg(test)]
+mod snapshot_head_binding {
+    //! The head check is the one thing the decoder refuses on its own.
+    //!
+    //! Everything else a snapshot could get wrong is caught later, by the
+    //! state-root comparison. This one is caught here because it is cheap and
+    //! because loading a sibling branch's state and *then* discovering it is
+    //! wrong means paying for the whole eUTXO set first.
+
+    use super::*;
+    use crate::header::BlockHeaderV4;
+
+    fn head_with_slot(slot: u64) -> BlockId {
+        BlockId::of(&BlockHeaderV4 {
+            version: BLOCK_VERSION_V4,
+            parent: [0u8; 32],
+            state_root: [0u8; 32],
+            body_root: [0u8; 32],
+            slot,
+            proposer_index: 0,
+            randao_reveal: [0u8; 32],
+            randao_mix: [0x07; 32],
+            justified_root: [0u8; 32],
+            finalized_root: [0u8; 32],
+            attestation_root: [0u8; 32],
+            coherence_root: [0x33; 32],
+        })
+    }
+
+    #[test]
+    fn a_snapshot_of_another_block_is_refused() {
+        let st = CommittedState::genesis(
+            head_with_slot(0),
+            [0x07; 32],
+            &[],
+            &[],
+            [0x11; 32],
+            [0x22; 32],
+            [0x33; 32],
+            EvmCommitment {
+                account_root: [0x44; 32],
+                receipts_root: [0x55; 32],
+                gas_used: 0,
+                base_fee_per_gas: 1,
+            },
+            &[],
+        );
+        let bytes = st.encode_snapshot();
+
+        // Same file, a head the caller derived from a different header: this
+        // is the sibling-branch case, and it must not load.
+        assert!(CommittedState::decode_snapshot(&bytes, head_with_slot(1)).is_err());
+        // And the matching head still loads, so the check is not vacuous.
+        assert!(CommittedState::decode_snapshot(&bytes, head_with_slot(0)).is_ok());
+    }
+}

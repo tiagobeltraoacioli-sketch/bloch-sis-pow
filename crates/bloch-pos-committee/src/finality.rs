@@ -788,3 +788,33 @@ pub fn votes_from_partition<'a>(
 
     EpochVotes { epoch, active_set, attestations: accepted }
 }
+
+// ── snapshot ─────────────────────────────────────────────────────────────────
+//
+// The encoding lives here rather than in `snapshot.rs` because these fields are
+// private, and they should stay private: a state that anyone can construct
+// field by field is a state nobody can reason about. Each type encodes itself.
+
+impl FinalityState {
+    pub fn snap_write(&self, w: &mut crate::snapshot::W) {
+        w.len(self.justified.len());
+        for (e, r) in &self.justified { w.u64(*e); w.h32(r); }
+        w.u64(self.current_justified.epoch);
+        w.h32(&self.current_justified.root);
+        w.u64(self.finalized.epoch);
+        w.h32(&self.finalized.root);
+        w.len(self.leaked.len());
+        for (v, s) in &self.leaked { w.u32(*v); w.u64(*s); }
+        w.u64(self.next_epoch);
+    }
+
+    pub fn snap_read(r: &mut crate::snapshot::R) -> Result<Self, crate::snapshot::SnapErr> {
+        let mut justified = std::collections::BTreeMap::new();
+        for _ in 0..r.len()? { let e = r.u64()?; justified.insert(e, r.h32()?); }
+        let current_justified = Checkpoint { epoch: r.u64()?, root: r.h32()? };
+        let finalized = Checkpoint { epoch: r.u64()?, root: r.h32()? };
+        let mut leaked = std::collections::BTreeMap::new();
+        for _ in 0..r.len()? { let v = r.u32()?; leaked.insert(v, r.u64()?); }
+        Ok(FinalityState { justified, current_justified, finalized, leaked, next_epoch: r.u64()? })
+    }
+}
