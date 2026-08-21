@@ -145,7 +145,7 @@ pub const LEAKED_ROSTER_ACTIVATION_EPOCH: u64 = u64::MAX;
 ///   state root is bit-identical across the gate slot itself, so nothing
 ///   changes outside the gate (rule 2).
 ///
-/// # Why the wire change is not shipped next to this constant yet
+/// # The genesis-principal decision, RECORDED (founder, 2026-08-21)
 ///
 /// The mainnet manifest bonds 25,000 BLOCH for each of its 64 validators —
 /// 1,600,000 BLOCH of principal that `Manifest::genesis_issued_sat()`
@@ -154,17 +154,21 @@ pub const LEAKED_ROSTER_ACTIVATION_EPOCH: u64 = u64::MAX;
 /// registry bonds with no eUTXO counterpart and no `issued_sat` contribution.
 /// All 64 withdrawal credentials are one address — the founder's carried
 /// H160, zero-padded to 32 bytes (pinned by test against the published
-/// manifest). Whether that principal is (1) recognised as retroactive
-/// emission (`issued_sat += 160e12` once, at the first boundary past the
-/// gate, shrinking future emission by 0.0037%), (2) re-backed by burning an
-/// equal amount of the founder's liquid coins, or (3) written off so a
-/// genesis withdrawal returns only the post-genesis accrual, is an economic
-/// decision that belongs to the founder. Shipping withdrawal code before that
-/// decision is made would hard-code one of the three by accident — so the
-/// gate is reserved here, inert, and the wire shapes follow the decision.
-/// (The post-genesis accrual itself is clean either way: epoch emission
-/// advances `issued_sat` when it credits a bond, and fee rewards are backed
-/// by coins the transfer path already destroyed.)
+/// manifest). Of the three possible resolutions — (1) retroactive emission,
+/// (2) founder re-backing by burn, (3) write-off — the founder chose **(3),
+/// the write-off**: a withdrawal pays only the post-genesis accrual, the
+/// unfunded principal never becomes spendable coin, and the shipped rule is
+/// one sentence — *a bond is withdrawable only to the extent it was funded*
+/// (`CommittedState::unbacked_principal_sat` / `withdrawable_sat` in
+/// `transition.rs`). Chosen for risk surface: it needs no consensus
+/// machinery — no one-shot boundary trigger, no retroactive counter, no burn
+/// mechanism G4 does not have — and it closes no doors: if that principal is
+/// ever wanted as coin, a voluntary funded deposit after the gate buys it
+/// back. The genesis bonds keep their FULL consensus weight; only the
+/// conversion to spendable coin is limited.
+/// (The post-genesis accrual itself is clean on both sides and needed no
+/// repair: epoch emission advances `issued_sat` when it credits a bond, and
+/// fee rewards are backed by coins the transfer path already destroyed.)
 ///
 /// # Choosing the epoch
 ///

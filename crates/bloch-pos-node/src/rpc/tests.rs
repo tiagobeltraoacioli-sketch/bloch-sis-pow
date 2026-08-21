@@ -358,11 +358,16 @@ fn getvalidator_reports_the_record_with_commission_and_lifecycle() {
     let rec = st.validator_record(1).expect("validator 1 is in the genesis registry");
     let effective =
         st.active_validators().iter().find(|v| v.index == 1).map(|v| v.effective_stake);
-    let v = validator_json(&rec, effective, 0);
+    let v = validator_json(&rec, effective, 0, st.withdrawable_sat(1));
 
     assert_eq!(v.get("index").unwrap().as_u64(), Some(1));
     assert_eq!(v.get("state").unwrap().as_str(), Some("active"));
     assert_eq!(v.get("own_stake_sat").unwrap().as_str(), Some("40000000000000"));
+    // A genesis registration: the 25,000-BLOCH principal was never funded, so
+    // the withdrawable figure is the bond MINUS it (founder decision,
+    // 2026-08-21) — 400,000 − 25,000 BLOCH. The gap between the two fields is
+    // the never-spendable residue this surface exists to make visible.
+    assert_eq!(v.get("withdrawable_sat").unwrap().as_str(), Some("37500000000000"));
     // R5: the rate rides on the response, because tokenomics leaves commission
     // uncapped on the bet that clients show it.
     assert_eq!(v.get("commission_bps").unwrap().as_str(), Some("1250"));

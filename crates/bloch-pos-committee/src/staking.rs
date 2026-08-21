@@ -70,6 +70,32 @@ pub const HYBRID_PK_BYTES: usize = MLDSA65_PK_BYTES + FALCON1024_PK_BYTES;
 /// a fixed split point allows exactly one.
 pub const MLDSA65_SIG_BYTES: usize = 3309;
 
+/// Bytes of the suite envelope every key and signature carries on the wire:
+/// `B1 0C` magic followed by the little-endian suite id
+/// (`bloch_crypto::crypto`'s envelope format, mirrored by the node's manifest
+/// decoder — `check_hybrid_pubkey` in `bloch-pos-node/src/genesis.rs`). The
+/// registry stores keys in this enveloped form, so a wire-shape rule about
+/// them belongs next to the suite constants, stated once.
+pub const WIRE_SUITE_HEADER_BYTES: usize = 4;
+
+/// Is `pk` an enveloped hybrid public key of exactly the one suite staking
+/// accepts?
+///
+/// Enforced by CONSENSUS on the funded deposit path (the
+/// `PosTransaction::FundedDeposit` arm in `transition.rs`), not only at
+/// decode boundaries: `SUITE_MLDSA65_ONLY` (0x0002) exists in the crypto
+/// layer as an escape hatch, and a registration under it would silently drop
+/// the hybrid property for that validator's entire consensus lifetime — the
+/// exact contraband this module's docs warn about. Exact length, so a key
+/// claiming the hybrid suite while carrying no Falcon half (the dangerous
+/// middle case the manifest decoder also refuses) cannot register either.
+pub fn is_wire_hybrid_pubkey(pk: &[u8]) -> bool {
+    pk.len() == WIRE_SUITE_HEADER_BYTES + HYBRID_PK_BYTES
+        && pk[0] == 0xB1
+        && pk[1] == 0x0C
+        && u16::from_le_bytes([pk[2], pk[3]]) == SUITE_MLDSA65_FALCON1024
+}
+
 // ---------------------------------------------------------------------------
 // Lifecycle constants (§5.1). All epochs; one epoch = 32 slots ≈ 16 min.
 // ---------------------------------------------------------------------------
@@ -218,6 +244,15 @@ pub struct DepositTx {
     /// Where the stake returns after withdrawal. See [`Address`] for why this
     /// is fixed here and not supplied at withdrawal time.
     pub withdrawal_addr: Address,
+    /// Commission the operator will charge on its delegators' rewards, in
+    /// basis points. Added 2026-08-21 with the funded-deposit wire shape:
+    /// the rate is registered by the deposit and committed with the record
+    /// (`ValidatorRecord::commission_bps` in the state root), so the PoP —
+    /// the validator key's own statement about its registration — must cover
+    /// it. A rate outside the signed root could be rewritten in flight, and a
+    /// delegator would be picking an operator whose rate the operator never
+    /// stated.
+    pub commission_bps: u128,
     /// Hybrid signature (≈4,589 B) over [`DepositTx::signing_root`], proving
     /// possession of BOTH private keys. Without it, an attacker could register
     /// a pubkey derived from someone else's (rogue-key) or register a key it
@@ -241,6 +276,7 @@ impl DepositTx {
         h.update(self.validator_pubkey);
         h.update(self.randao_commitment);
         h.update(self.withdrawal_addr);
+        h.update(self.commission_bps.to_le_bytes());
         h.finalize().into()
     }
 }
@@ -494,15 +530,42 @@ pub enum WithdrawReject {
 
 /// Validate a withdrawal at `current_epoch`.
 ///
-/// On success returns `(withdrawal_addr, amount_sat)` — the payout is fully
-/// determined by the committed record: the address from deposit time, the
-/// amount from the record (already reduced by any slashing). A withdrawal
-/// transaction carries no spending authority of its own, which is why there is
-/// no signature to verify here: after [`WITHDRAWAL_DELAY_EPOCHS`] the transfer
-/// to `withdrawal_addr` is the only thing that can happen to these coins.
+/// On success returns `(withdrawal_addr, withdrawable_sat)` — the payout is
+/// fully determined by the committed record: the address from deposit time,
+/// the amount from the record (already reduced by any slashing) **minus the
+/// unbacked principal**. A withdrawal transaction carries no spending
+/// authority of its own, which is why there is no signature to verify here:
+/// after [`WITHDRAWAL_DELAY_EPOCHS`] the transfer to `withdrawal_addr` is the
+/// only thing that can happen to these coins.
+///
+/// # Why the payout is not the whole bond (founder decision, 2026-08-21)
+///
+/// **A bond is withdrawable only to the extent it was funded.** The 64
+/// genesis registrations bond 25,000 BLOCH each — 1,600,000 BLOCH of
+/// principal that `Manifest::genesis_issued_sat()` never counted and no
+/// eUTXO output ever backed (pinned against the published manifest by
+/// `the_genesis_bond_principal_is_outside_the_issued_supply` in
+/// `bloch-pos-node/src/genesis.rs`). Paying that principal out would turn
+/// coins that were never issued into spendable coins. Of the three recorded
+/// resolutions (retroactive emission, founder re-backing by burn, write-off)
+/// the founder chose the write-off: this function subtracts the caller's
+/// `unbacked_principal_sat` — saturating, so a bond slashed below its
+/// unbacked principal withdraws nothing rather than wrapping — and the
+/// residue stays in the record forever: visible, committed, never spendable.
+///
+/// Until this revision the function returned `record.amount_sat` whole. That
+/// predates the decision, and reused verbatim it would have been the exact
+/// weapon the funded-stake flag day exists to disarm.
+///
+/// `unbacked_principal_sat` is a parameter, not a lookup, for the same reason
+/// `max_stake_sat` is on [`validate_deposit`]: whether a bond was funded is a
+/// fact about committed state (the deposit history and the flag-day epoch,
+/// derived by `CommittedState::unbacked_principal_sat` in `transition.rs`),
+/// and this crate's rules never read node-local state themselves.
 pub fn validate_withdrawal(
     record: &ValidatorRecord,
     current_epoch: u64,
+    unbacked_principal_sat: u128,
 ) -> Result<(Address, u128), WithdrawReject> {
     let Some(exit_epoch) = record.exit_epoch else {
         return Err(WithdrawReject::NotExited);
@@ -516,7 +579,7 @@ pub fn validate_withdrawal(
     if current_epoch < exit_epoch.saturating_add(WITHDRAWAL_DELAY_EPOCHS) {
         return Err(WithdrawReject::DelayNotElapsed);
     }
-    Ok((record.withdrawal_addr, record.amount_sat))
+    Ok((record.withdrawal_addr, record.amount_sat.saturating_sub(unbacked_principal_sat)))
 }
 
 // ---------------------------------------------------------------------------
@@ -559,6 +622,7 @@ mod tests {
             validator_pubkey: [7u8; HYBRID_PK_BYTES],
             randao_commitment: [1u8; 32],
             withdrawal_addr: [2u8; 32],
+            commission_bps: 500,
             // ML-DSA half (3309) + a plausible Falcon half (1280) ≈ 4,589 B.
             proof_of_possession: vec![0u8; MLDSA65_SIG_BYTES + 1280],
         }
@@ -814,21 +878,58 @@ mod tests {
         rec.exit_epoch = Some(100);
         // One epoch short of the weak-subjectivity margin: still bonded.
         assert_eq!(
-            validate_withdrawal(&rec, 100 + WITHDRAWAL_DELAY_EPOCHS - 1),
+            validate_withdrawal(&rec, 100 + WITHDRAWAL_DELAY_EPOCHS - 1, 0),
             Err(WithdrawReject::DelayNotElapsed)
         );
         // At the boundary the stake is payable, to the address fixed at
-        // deposit time and for the recorded amount.
+        // deposit time and for the recorded amount — whole, because this
+        // record's bond is fully backed (unbacked principal zero).
         assert_eq!(
-            validate_withdrawal(&rec, 100 + WITHDRAWAL_DELAY_EPOCHS),
+            validate_withdrawal(&rec, 100 + WITHDRAWAL_DELAY_EPOCHS, 0),
             Ok(([2u8; 32], MIN_DEPOSIT_SAT))
+        );
+    }
+
+    /// The founder decision of 2026-08-21, at the reference-rule level: a
+    /// bond is withdrawable only to the extent it was funded.
+    ///
+    /// The control half is the fully-backed twin above and repeated here:
+    /// same record, same epoch, unbacked principal zero, the whole bond pays.
+    /// Without it, the assertions below would also pass against a function
+    /// that simply paid zero to everyone.
+    #[test]
+    fn withdrawal_pays_only_the_backed_portion() {
+        let mut rec = record();
+        rec.exit_epoch = Some(0);
+        // The record has compounded rewards on top of an unfunded principal:
+        // a genesis-shaped bond.
+        let accrual = 7 * SAT_PER_BLOCH;
+        rec.amount_sat = MIN_DEPOSIT_SAT + accrual;
+
+        // Control: fully backed, everything pays.
+        assert_eq!(
+            validate_withdrawal(&rec, WITHDRAWAL_DELAY_EPOCHS, 0),
+            Ok(([2u8; 32], MIN_DEPOSIT_SAT + accrual))
+        );
+        // The decision: the unfunded principal is written off — only the
+        // post-genesis accrual becomes spendable.
+        assert_eq!(
+            validate_withdrawal(&rec, WITHDRAWAL_DELAY_EPOCHS, MIN_DEPOSIT_SAT),
+            Ok(([2u8; 32], accrual))
+        );
+        // Saturating: a bond slashed below its unbacked principal withdraws
+        // nothing — it never wraps into a giant payout.
+        rec.amount_sat = MIN_DEPOSIT_SAT / 2;
+        assert_eq!(
+            validate_withdrawal(&rec, WITHDRAWAL_DELAY_EPOCHS, MIN_DEPOSIT_SAT),
+            Ok(([2u8; 32], 0))
         );
     }
 
     #[test]
     fn withdrawal_without_exit_rejected() {
         let rec = record();
-        assert_eq!(validate_withdrawal(&rec, u64::MAX), Err(WithdrawReject::NotExited));
+        assert_eq!(validate_withdrawal(&rec, u64::MAX, 0), Err(WithdrawReject::NotExited));
     }
 
     #[test]
@@ -837,7 +938,7 @@ mod tests {
         rec.exit_epoch = Some(0);
         rec.withdrawn = true;
         assert_eq!(
-            validate_withdrawal(&rec, WITHDRAWAL_DELAY_EPOCHS),
+            validate_withdrawal(&rec, WITHDRAWAL_DELAY_EPOCHS, 0),
             Err(WithdrawReject::AlreadyWithdrawn)
         );
     }
@@ -855,8 +956,10 @@ mod tests {
         m3.withdrawal_addr[0] ^= 1;
         let mut m4 = base.clone();
         m4.validator_pubkey[0] ^= 1;
+        let mut m5 = base.clone();
+        m5.commission_bps += 1;
         let roots = [base.signing_root(), m1.signing_root(), m2.signing_root(),
-                     m3.signing_root(), m4.signing_root()];
+                     m3.signing_root(), m4.signing_root(), m5.signing_root()];
         for i in 0..roots.len() {
             for j in (i + 1)..roots.len() {
                 assert_ne!(roots[i], roots[j]);

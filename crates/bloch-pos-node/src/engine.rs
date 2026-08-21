@@ -74,8 +74,9 @@ use bloch_pos_committee::gossip::{AttestationPool, GossipDecision};
 use bloch_pos_committee::header::{BlockEnvelope, BlockHeaderV4, BlockId, Body, VERSION_G4};
 use bloch_pos_committee::interfaces::{ProposalEnvelope, StateReader, StateTransition};
 use bloch_pos_committee::schedule::first_slot_of_epoch;
+use bloch_pos_committee::staking;
 use bloch_pos_committee::transition::{CommittedState, PosTransaction, Transition};
-use bloch_pos_committee::{committees, derive, epoch_of, schedule};
+use bloch_pos_committee::{committees, derive, epoch_of, params, schedule};
 
 use crate::genesis::{Manifest, GENESIS_MIX};
 use crate::keys::{HybridVerifier, Keystore, ProbeVerifier};
@@ -823,7 +824,31 @@ impl Engine {
         // mempool and are dropped by the proposer, which is why the proposer's
         // guard is the one that carries liveness and this one only reduces
         // waste. Two checks, neither trusting the other.
-        admissible(&tx)?;
+        admissible(&tx, epoch_of(self.state.slot()))?;
+        // One check `admissible` cannot make, made here where the state
+        // lives: a SignedExit's signature verifies against the REGISTERED
+        // pubkey, which only the committed registry holds. Skipping it would
+        // reopen the slot-69 class for exits — the producer prices with
+        // ProbeVerifier, so a garbage-signed exit would be proposed and cost
+        // the proposer its block, on the strength of one unauthenticated
+        // request. Root derivation is `staking::ExitTx`'s, the same single
+        // definition the transition verifies against.
+        if let PosTransaction::SignedExit { validator, epoch, signature } = &tx {
+            use sha3::{Digest, Sha3_256};
+            let Some(rec) = self.state.validator_record(*validator) else {
+                return Err("signed exit names a validator that is not in the registry");
+            };
+            let root = staking::ExitTx {
+                pubkey_hash: Sha3_256::digest(&rec.pubkey).into(),
+                epoch: *epoch,
+                signature: Vec::new(),
+            }
+            .signing_root();
+            if !bloch_crypto::crypto::verify(&rec.pubkey, &root, signature) {
+                return Err("signed exit carries a signature that does not verify \
+                            against the registered key");
+            }
+        }
         let mut frame = vec![net::FRAME_TX];
         frame.extend_from_slice(&key);
         self.mempool.insert(key, tx);
@@ -1361,6 +1386,7 @@ impl Engine {
                     &rec,
                     effective,
                     epoch_of(self.state.slot()),
+                    self.state.withdrawable_sat(index),
                 ))
             }
 
@@ -1948,18 +1974,28 @@ pub fn lmd_ghost_head<'a>(
 /// Whether the mempool will hold `tx` at all.
 ///
 /// A free function, not a method, so it can be tested without standing up an
-/// engine — the checks are a pure function of the transaction and nothing
-/// else, and a rule that needs a running node to exercise is a rule that stops
-/// being exercised.
+/// engine — the checks are a pure function of the transaction and the
+/// caller's epoch, and a rule that needs a running node to exercise is a rule
+/// that stops being exercised. `current_epoch` is the epoch of this node's
+/// head (`epoch_of(state.slot())`): the funded staking shapes below are only
+/// admitted once the flag day has arrived, and refusing-early is the safe
+/// direction — a transaction admitted while the gate is open stays valid,
+/// while one admitted before it would be consensus-invalid in the next block
+/// and cost an honest proposer its slot.
 ///
-/// Deliberately STRUCTURAL, not a validity check. A complete answer means
-/// running the transition, which needs a candidate header this path has no
-/// reason to build. What it catches is the class that has actually been
-/// exploited or is currently exploitable.
-pub(crate) fn admissible(tx: &PosTransaction) -> Result<(), &'static str> {
+/// Deliberately STRUCTURAL plus self-contained signatures, not a validity
+/// check. A complete answer means running the transition, which needs a
+/// candidate header this path has no reason to build. What it catches is the
+/// class that has actually been exploited or is currently exploitable.
+/// (State-dependent pre-checks that need the registry — the SignedExit
+/// signature — live in `on_transaction`, next to the state they read.)
+pub(crate) fn admissible(tx: &PosTransaction, current_epoch: u64) -> Result<(), &'static str> {
     match tx {
-        // Staking messages are refused outright until bonding is funded from
-        // the eUTXO set.
+        // The LEGACY staking messages are refused unconditionally — before
+        // the flag day because bonding is not yet funded from the eUTXO set,
+        // and after it because consensus itself rejects them in block bodies
+        // (`apply_transaction`'s epoch dispatch, the rule that replaced this
+        // refusal as the actual protection).
         //
         // `Deposit` carries no signature and spends no output: it names an
         // `amount_sat` and the transition registers a validator holding it.
@@ -1971,11 +2007,12 @@ pub(crate) fn admissible(tx: &PosTransaction) -> Result<(), &'static str> {
         // to a third of the active stake and stop finality, a hundred and
         // eighty to two thirds and take the chain.
         //
-        // This is a node-side refusal, not a consensus rule: a block that
-        // already carries a deposit still applies it. It closes the path anyone
-        // can reach and buys time to close the real one — giving deposits and
-        // withdrawals eUTXO inputs and outputs, which is a wire-format change
-        // and needs a flag day.
+        // Until the flag day this is a node-side refusal, not a consensus
+        // rule: a block that already carries a deposit still applies it. It
+        // closes the path anyone can reach; the real closure is
+        // `params::FUNDED_STAKE_ACTIVATION_EPOCH`, behind which the funded
+        // shapes (0x06–0x08) are implemented and the legacy ones become
+        // consensus-invalid.
         PosTransaction::Deposit { .. } => Err(
             "deposits are not accepted: bonding is not yet funded from the UTXO set, \
              so a deposit would create stake without spending coins",
@@ -2026,11 +2063,84 @@ pub(crate) fn admissible(tx: &PosTransaction) -> Result<(), &'static str> {
         // validators, and an exit cannot be revoked (`exit_epoch != u64::MAX`
         // is refused), so the roster would empty and every bond lock for
         // 2,080 epochs. Refused until the message carries a signature that
-        // binds it to the validator's own key.
+        // binds it to the validator's own key — which is exactly what
+        // `SignedExit` below is.
         PosTransaction::Exit { .. } => Err(
             "exits are not accepted: the Exit message is not authenticated, \
              so anyone could retire any validator irreversibly",
         ),
+        // ── The funded staking shapes (flag day: params.rs) ─────────────────
+        //
+        // All three are gated on the head's epoch having REACHED the flag
+        // day, not merely on the constant being armed: between a fleet
+        // rebuild that lowers the constant and the gate epoch itself, these
+        // are still consensus-invalid in block bodies, and admitting one
+        // would hand the next proposer a guaranteed-refused block. With the
+        // shipped u64::MAX the comparison never passes, so today all three
+        // are refused — inert by construction.
+        PosTransaction::FundedDeposit { inputs, proof_of_possession, pubkey, .. } => {
+            if current_epoch < params::FUNDED_STAKE_ACTIVATION_EPOCH {
+                return Err(
+                    "funded deposits are not accepted before the funded-stake flag day \
+                     (params::FUNDED_STAKE_ACTIVATION_EPOCH)",
+                );
+            }
+            if inputs.is_empty() {
+                return Err("funded deposit has no inputs — it funds nothing and cannot apply");
+            }
+            // Signatures pre-verified with the REAL suite, for the same
+            // reason as the Transfer arm below: the producer prices its
+            // block with ProbeVerifier, which accepts anything, so a
+            // garbage-signed deposit that reaches the mempool would be
+            // proposed and then refused by every real verifier — one free
+            // request, one lost slot (the slot-69 class).
+            let signing_root = tx.spend_signing_root();
+            for i in inputs {
+                if !bloch_crypto::crypto::verify(&i.pubkey, &signing_root, &i.signature) {
+                    return Err("funded deposit carries a spend signature that does not verify");
+                }
+            }
+            // The PoP too — same producer-forfeits-block failure if skipped.
+            // The root derivation is the transition's own
+            // (`funded_deposit_pop_signing_root`), never a second expression
+            // of it here; None means the pubkey/credential shape is one the
+            // transition would refuse anyway.
+            let Some(pop_root) = tx.funded_deposit_pop_signing_root() else {
+                return Err(
+                    "funded deposit is malformed: the pubkey is not the enveloped hybrid \
+                     suite or the withdrawal credentials are not 32 bytes",
+                );
+            };
+            if !bloch_crypto::crypto::verify(pubkey, &pop_root, proof_of_possession) {
+                return Err("funded deposit carries a proof of possession that does not verify");
+            }
+            Ok(())
+        }
+        // Structurally fine past the gate; its signature needs the registry
+        // (the registered pubkey), so the state-aware pre-verification lives
+        // in `on_transaction`, next to the state it must read.
+        PosTransaction::SignedExit { .. } => {
+            if current_epoch < params::FUNDED_STAKE_ACTIVATION_EPOCH {
+                return Err(
+                    "signed exits are not accepted before the funded-stake flag day \
+                     (params::FUNDED_STAKE_ACTIVATION_EPOCH)",
+                );
+            }
+            Ok(())
+        }
+        // Carries nothing to verify — the payout is fully determined by
+        // committed state; whether anything is actually withdrawable is the
+        // transition's judgement (and the producer's probe drops a premature
+        // one at build time without losing the block).
+        PosTransaction::Withdraw { .. } => {
+            if current_epoch < params::FUNDED_STAKE_ACTIVATION_EPOCH {
+                return Err(
+                    "withdrawals are not accepted before the funded-stake flag day \
+                     (params::FUNDED_STAKE_ACTIVATION_EPOCH)",
+                );
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
@@ -2129,7 +2239,7 @@ mod forkchoice_tests {
             withdrawal_credentials: vec![1u8; 20],
             commission_bps: 0,
         };
-        let err = admissible(&deposit).expect_err("a deposit must not be admitted");
+        let err = admissible(&deposit, 0).expect_err("a deposit must not be admitted");
         assert!(
             err.contains("not yet funded"),
             "the refusal must say why: {err}"
@@ -2142,7 +2252,7 @@ mod forkchoice_tests {
             eligible: true,
         };
         assert!(
-            admissible(&delegate).is_err(),
+            admissible(&delegate, 0).is_err(),
             "a delegation must not be admitted either"
         );
     }
@@ -2162,7 +2272,7 @@ mod forkchoice_tests {
             tip_millisat_per_gas: 0,
         };
         assert!(
-            admissible(&empty).is_err(),
+            admissible(&empty, 0).is_err(),
             "a transfer with no inputs must not be admitted"
         );
     }
@@ -2319,7 +2429,7 @@ mod admission_authorisation {
         // the hole it closes.
         let (tx, _) = signed_transfer();
         assert!(
-            admissible(&tx).is_ok(),
+            admissible(&tx, 0).is_ok(),
             "a validly signed transfer must still reach the mempool"
         );
     }
@@ -2333,7 +2443,7 @@ mod admission_authorisation {
             bad[0] ^= 0xFF;
             inputs[0].signature = bad;
         }
-        let err = admissible(&tx).expect_err("a bad signature must not be admitted");
+        let err = admissible(&tx, 0).expect_err("a bad signature must not be admitted");
         assert!(
             err.contains("signature"),
             "the refusal must name the reason, got: {err}"
@@ -2342,8 +2452,134 @@ mod admission_authorisation {
 
     #[test]
     fn an_unauthenticated_exit_is_refused() {
-        let err = admissible(&PosTransaction::Exit { validator: 0 })
+        let err = admissible(&PosTransaction::Exit { validator: 0 }, 0)
             .expect_err("Exit carries no signature and must not be admitted");
         assert!(err.contains("not authenticated"), "got: {err}");
+    }
+
+    /// A funded deposit whose spend signature and PoP both verify under the
+    /// real hybrid suite — the fixture both halves of the flag-day tests
+    /// below share.
+    fn signed_funded_deposit() -> PosTransaction {
+        use bloch_pos_committee::staking;
+        let (owner_pk, owner_sk) = bloch_crypto::crypto::generate_keypair_from_seed(&[3u8; 32])
+            .expect("coin owner keypair");
+        let (val_pk, val_sk) = bloch_crypto::crypto::generate_keypair_from_seed(&[4u8; 32])
+            .expect("validator keypair");
+        assert!(
+            staking::is_wire_hybrid_pubkey(&val_pk),
+            "fixture broken: the real keygen must emit the enveloped hybrid form"
+        );
+        let mut tx = PosTransaction::FundedDeposit {
+            inputs: vec![TransferInput {
+                txid: [0x77u8; 32],
+                vout: 0,
+                pubkey: owner_pk,
+                signature: Vec::new(),
+            }],
+            change: vec![TransferOutput { value: 5, script_hash: [0x44u8; 32] }],
+            pubkey: val_pk.clone(),
+            amount_sat: 25_000 * 100_000_000,
+            randao_commitment: [0x55u8; 32],
+            withdrawal_credentials: vec![0x66u8; 32],
+            commission_bps: 500,
+            proof_of_possession: Vec::new(),
+            tx_bytes: 20_000,
+            tip_millisat_per_gas: 0,
+        };
+        // PoP first: the spend root covers it, so it must exist before the
+        // input signatures are produced — the exact ordering the transition's
+        // no-circularity argument states.
+        let pop_root = tx
+            .funded_deposit_pop_signing_root()
+            .expect("well-formed deposit has a PoP root");
+        let pop = bloch_crypto::crypto::sign(&val_sk, &pop_root).expect("sign the PoP root");
+        if let PosTransaction::FundedDeposit { proof_of_possession, .. } = &mut tx {
+            *proof_of_possession = pop;
+        }
+        let spend_root = tx.spend_signing_root();
+        let sig = bloch_crypto::crypto::sign(&owner_sk, &spend_root).expect("sign the spend root");
+        if let PosTransaction::FundedDeposit { inputs, .. } = &mut tx {
+            inputs[0].signature = sig;
+        }
+        tx
+    }
+
+    /// The funded shapes stay OUT of the mempool while the flag day has not
+    /// arrived — with the shipped u64::MAX gate that is every epoch, so
+    /// nothing new is reachable on the live chain (rule 1 of the flag day).
+    ///
+    /// The control half runs the SAME transactions at epoch u64::MAX — the
+    /// one epoch that satisfies `>= gate` without touching the constant — and
+    /// they pass, which proves the refusal above is the gate and not some
+    /// other rule quietly rejecting the new shapes.
+    #[test]
+    fn funded_shapes_wait_for_the_flag_day() {
+        let deposit = signed_funded_deposit();
+        let exit = PosTransaction::SignedExit { validator: 0, epoch: 0, signature: vec![1, 2, 3] };
+        let withdraw = PosTransaction::Withdraw { validator: 0 };
+
+        for tx in [&deposit, &exit, &withdraw] {
+            let err = admissible(tx, 0).expect_err("refused before the flag day");
+            assert!(err.contains("flag day"), "the refusal must say why: {err}");
+        }
+        // Control: with the gate reached, all three shapes pass this
+        // boundary (SignedExit's registry signature is checked one layer up,
+        // in on_transaction, where the state lives).
+        for tx in [&deposit, &exit, &withdraw] {
+            assert!(
+                admissible(tx, u64::MAX).is_ok(),
+                "the same shape must be admissible once the flag day arrives"
+            );
+        }
+    }
+
+    /// The slot-69 class, funded-deposit edition: a garbage spend signature
+    /// or a garbage PoP must die at the mempool door, because the producer's
+    /// ProbeVerifier would accept either and forfeit the proposer's block.
+    /// Control: the honestly-signed twin is admitted (previous test's
+    /// control half re-asserted here so each negative has its passing pair).
+    #[test]
+    fn a_funded_deposit_with_a_bad_signature_or_pop_is_refused() {
+        let good = signed_funded_deposit();
+        assert!(admissible(&good, u64::MAX).is_ok(), "control: the signed twin passes");
+
+        let mut bad_spend = good.clone();
+        if let PosTransaction::FundedDeposit { inputs, .. } = &mut bad_spend {
+            inputs[0].signature[0] ^= 0xFF;
+        }
+        let err = admissible(&bad_spend, u64::MAX).expect_err("bad spend signature");
+        assert!(err.contains("spend signature"), "got: {err}");
+
+        // A PoP mutated IN TRANSIT is caught as a spend-signature failure —
+        // the DS_SPEND root covers the PoP by design, so the coin owners'
+        // signatures no longer verify. This is the anti-mangled-body
+        // property, pinned here on purpose.
+        let mut mangled_pop = good.clone();
+        if let PosTransaction::FundedDeposit { proof_of_possession, .. } = &mut mangled_pop {
+            proof_of_possession[0] ^= 0xFF;
+        }
+        let err = admissible(&mangled_pop, u64::MAX).expect_err("mangled PoP");
+        assert!(err.contains("spend signature"), "got: {err}");
+
+        // A PoP that was garbage all along — the owners signed over it, so
+        // the spend signatures verify and the PoP check itself must be the
+        // one that refuses. This is the rogue-key door: coins honestly spent
+        // toward a validator key nobody controls.
+        let (owner_pk, owner_sk) = bloch_crypto::crypto::generate_keypair_from_seed(&[3u8; 32])
+            .expect("coin owner keypair");
+        let mut bad_pop = good.clone();
+        if let PosTransaction::FundedDeposit { proof_of_possession, inputs, .. } = &mut bad_pop {
+            *proof_of_possession = vec![0xEEu8; 4_775];
+            inputs[0].pubkey = owner_pk;
+            inputs[0].signature = Vec::new();
+        }
+        let root = bad_pop.spend_signing_root();
+        let sig = bloch_crypto::crypto::sign(&owner_sk, &root).expect("re-sign over garbage PoP");
+        if let PosTransaction::FundedDeposit { inputs, .. } = &mut bad_pop {
+            inputs[0].signature = sig;
+        }
+        let err = admissible(&bad_pop, u64::MAX).expect_err("garbage PoP signed over");
+        assert!(err.contains("possession"), "got: {err}");
     }
 }
