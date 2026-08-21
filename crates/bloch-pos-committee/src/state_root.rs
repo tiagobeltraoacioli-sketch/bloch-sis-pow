@@ -307,8 +307,7 @@ fn singleton_subtree_root(
     empty: &[[u8; 32]],
 ) -> [u8; 32] {
     debug_assert!(depth <= TREE_DEPTH);
-    if let Some(hit) = SINGLETON_MEMO.with(|m| m.borrow().get(&(*key, *value_hash, depth)).copied())
-    {
+    if let Some(hit) = memo_get(&(*key, *value_hash, depth)) {
         return hit;
     }
     let mut h = leaf_hash(key, value_hash);
@@ -317,31 +316,84 @@ fn singleton_subtree_root(
         d -= 1;
         h = if bit(key, d) == 0 { node_hash(&h, &empty[d + 1]) } else { node_hash(&empty[d + 1], &h) };
     }
-    SINGLETON_MEMO.with(|m| {
-        let mut m = m.borrow_mut();
-        // Bounded so uptime cannot turn the memo into a leak. Clearing is
-        // safe at any moment precisely because every entry is recomputable.
-        if m.len() >= SINGLETON_MEMO_MAX {
-            m.clear();
-        }
-        m.insert((*key, *value_hash, depth), h);
-    });
+    memo_put((*key, *value_hash, depth), h);
     h
 }
 
-/// Entries kept in the singleton memo before it is cleared wholesale. Sized
-/// to hold a full carryover-scale leaf set (~4.5e5) with room to spare, at
-/// roughly 100 bytes per entry.
-const SINGLETON_MEMO_MAX: usize = 1_200_000;
+/// Look a singleton up, promoting a hit from the previous generation.
+///
+/// Promotion is what makes the two generations worth having: an entry still in
+/// use is copied back into `hot` the first time it is read after a rotation, so
+/// the live working set survives every rotation from then on. Without it, a
+/// rotation would demote the whole set and the generation after would drop it.
+fn memo_get(key: &SingletonKey) -> Option<[u8; 32]> {
+    SINGLETON_MEMO.with(|m| {
+        let mut m = m.borrow_mut();
+        if let Some(hit) = m.hot.get(key).copied() {
+            return Some(hit);
+        }
+        let hit = m.cold.get(key).copied()?;
+        m.hot.insert(*key, hit);
+        Some(hit)
+    })
+}
+
+#[cfg(test)]
+fn memo_generation_sizes() -> (usize, usize) {
+    SINGLETON_MEMO.with(|m| {
+        let m = m.borrow();
+        (m.hot.len(), m.cold.len())
+    })
+}
+
+fn memo_put(key: SingletonKey, value: [u8; 32]) {
+    SINGLETON_MEMO.with(|m| {
+        let mut m = m.borrow_mut();
+        m.hot.insert(key, value);
+        if m.hot.len() >= SINGLETON_MEMO_GENERATION {
+            // Rotate, never clear. The old `hot` becomes `cold` and is still
+            // readable; only the generation before it is dropped.
+            m.cold = std::mem::take(&mut m.hot);
+        }
+    });
+}
+
+/// Entries one generation of the singleton memo holds before it rotates.
+///
+/// Sized above a full carryover-scale leaf set (~4.5e5) so the live set fits
+/// in one generation with room to spare, at roughly 100 bytes per entry. Two
+/// generations are held, so the memory bound is twice this.
+///
+/// **Why two generations and not one bounded map.** This used to be a single
+/// map that called `clear()` on reaching its limit. Correct — every entry is
+/// recomputable — but the cost of being right that way is a cliff: measured at
+/// Genesis-4's carryover size, a state root with a warm memo takes 1.2s and
+/// the same root with a cold one takes **51 seconds**. A wholesale clear
+/// therefore did not cost "a few misses", it cost a 40x block, at an
+/// unpredictable moment, on whichever node happened to fill first. Rotating
+/// drops at most the generation before last, and anything still in use is
+/// promoted back on its first read (see [`memo_get`]), so the working set is
+/// never dropped while it is working.
+const SINGLETON_MEMO_GENERATION: usize = 600_000;
+
+type SingletonKey = ([u8; 32], [u8; 32], usize);
+
+/// Two generations of the singleton memo. Contents never affect a result —
+/// every entry is a pure function of its key — so rotation is a performance
+/// decision end to end, with no consensus surface.
+#[derive(Default)]
+struct SingletonMemo {
+    hot: std::collections::HashMap<SingletonKey, [u8; 32]>,
+    cold: std::collections::HashMap<SingletonKey, [u8; 32]>,
+}
 
 thread_local! {
     /// Per-thread so the hot consensus loop never contends on a lock. Purity
     /// makes duplication across threads a memory question, never a
     /// correctness one: every thread that computes an entry computes the
     /// same bytes.
-    static SINGLETON_MEMO: std::cell::RefCell<
-        std::collections::HashMap<([u8; 32], [u8; 32], usize), [u8; 32]>,
-    > = std::cell::RefCell::new(std::collections::HashMap::new());
+    static SINGLETON_MEMO: std::cell::RefCell<SingletonMemo> =
+        std::cell::RefCell::new(SingletonMemo::default());
 }
 
 /// A Merkle inclusion proof: the sibling hash at every depth, ordered from the
@@ -1779,13 +1831,84 @@ mod tests {
         assert_eq!(a, a2);
         assert_eq!(b, b2);
 
+        // Third measurement: what a state root costs immediately AFTER the memo
+        // rotates. Under the old wholesale `clear()` this was the cold cost —
+        // the 51s cliff. With rotation the live set is still in the demoted
+        // generation and is promoted back on first read, so it should land
+        // near the warm number, not the cold one.
+        for i in 0..(SINGLETON_MEMO_GENERATION as u64) {
+            let mut k = [0u8; 32];
+            k[..8].copy_from_slice(&i.to_le_bytes());
+            k[9] = 0xFF; // junk namespace, cannot collide with a real leaf
+            memo_put((k, k, 0), k);
+        }
+        let t2 = std::time::Instant::now();
+        let c = state_root_with_eutxo_leaves(&view, &leaves);
+        let after_rotation = t2.elapsed();
+        assert_eq!(b, c);
+
         assert_eq!(a, b, "the measurement is only meaningful if both paths agree");
         println!("  entries ({N} eUTXOs): {from_entries:?}");
         println!("  kept leaves:          {from_leaves:?}");
+        println!("  kept leaves, just after a memo rotation: {after_rotation:?}");
         println!(
             "  saved per state root: {:.1}%",
             100.0 * (1.0 - from_leaves.as_secs_f64() / from_entries.as_secs_f64())
         );
+    }
+
+    /// Filling the memo must demote the previous generation, not delete it.
+    ///
+    /// The old code called `clear()`, so an entry written just before the
+    /// limit was gone the moment the limit was reached. That is what turned a
+    /// 1.2s state root into a 51s one at an unpredictable moment. Here the
+    /// entry survives, and reading it moves it back into the live generation.
+    #[test]
+    fn the_memo_rotates_instead_of_clearing() {
+        let key = |i: u64| {
+            let mut a = [0u8; 32];
+            a[..8].copy_from_slice(&i.to_le_bytes());
+            (a, a, 0usize)
+        };
+        let val = |i: u64| {
+            let mut a = [0u8; 32];
+            a[0] = 0xA5;
+            a[1..9].copy_from_slice(&i.to_le_bytes());
+            a
+        };
+
+        let early = key(0);
+        memo_put(early, val(0));
+        assert_eq!(memo_get(&early), Some(val(0)), "control: it was not even stored");
+
+        // Push past one generation, which must rotate exactly once.
+        for i in 1..=(SINGLETON_MEMO_GENERATION as u64) {
+            memo_put(key(i), val(i));
+        }
+
+        let (hot, cold) = memo_generation_sizes();
+        assert!(hot < SINGLETON_MEMO_GENERATION, "the live generation did not rotate");
+        assert!(cold >= SINGLETON_MEMO_GENERATION - 1, "the demoted generation was dropped");
+        assert!(
+            hot + cold <= 2 * SINGLETON_MEMO_GENERATION,
+            "two generations must stay inside the memory bound"
+        );
+
+        // The point of the change: an entry written before the rotation is
+        // still a hit. Under `clear()` this returned None.
+        assert_eq!(
+            memo_get(&early),
+            Some(val(0)),
+            "rotation dropped an entry that was still in use"
+        );
+
+        // And reading it promoted it back, so the next rotation cannot drop it.
+        let (hot_after, _) = memo_generation_sizes();
+        assert_eq!(hot_after, hot + 1, "a hit on the demoted generation must promote");
+
+        // Control: a key never written is still a miss, so the assertions above
+        // are not passing because the memo returns something for anything.
+        assert_eq!(memo_get(&key(u64::MAX)), None, "control: unknown key must miss");
     }
 
     fn state(f: &Fx) -> ConsensusState<'_> {
