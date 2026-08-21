@@ -39,8 +39,8 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -102,17 +102,56 @@ impl Net {
     }
 }
 
-/// The devnet TCP full mesh: one queue per peer.
+/// Depth of an inbound peer's broadcast queue before frames are dropped.
+///
+/// Bounded, unlike the outbound queues, because inbound connections are not
+/// something this node chose: a box with 104 of them (measured on Genesis-4
+/// mainnet, 2026-08-21) would let unbounded queues turn one stalled peer into
+/// this node's memory problem. A dropped frame is recoverable — the peer asks
+/// for what it missed with `FRAME_GET_BLOCKS` — so dropping is the safe end of
+/// this trade.
+const INBOUND_QUEUE_DEPTH: usize = 256;
+
+/// The devnet TCP mesh: one queue per peer we dialed, plus one per peer that
+/// dialed us.
 pub struct DevnetMesh {
     peers: Vec<Sender<Vec<u8>>>,
+    /// Broadcast queues for connections we did NOT dial.
+    ///
+    /// **Why this exists.** The module header describes a full mesh in which
+    /// "each side dials the other", and under that assumption broadcasting on
+    /// outbound connections alone reaches everyone. On Genesis-4 mainnet the
+    /// assumption is false: 49 of the 64 validators run on Fly, which accepts
+    /// no inbound TCP on the P2P ports — verified by scanning all 64 ports on
+    /// three of them, all closed. They dial out and are never dialed back.
+    ///
+    /// With no relay logic in this transport ("everyone sends to everyone, so
+    /// nothing needs re-gossiping"), a node nobody dials never receives a
+    /// single broadcast. Its only path to a new block is polling with
+    /// `FRAME_GET_BLOCKS`, so it runs permanently behind — which makes its
+    /// attestations land on a stale view (rejected as `NotInCommittee`) and
+    /// its proposals build on a stale parent. Those 49 validators held their
+    /// slots in the proposer schedule and could not produce a block that
+    /// stuck: ~94% of slots empty, and blocks arriving every 19 to 63 slots
+    /// against a design of one per slot.
+    ///
+    /// Pushing on inbound connections costs nothing — the socket is already
+    /// open and the peer is already reading it.
+    inbound: Arc<Mutex<Vec<SyncSender<Vec<u8>>>>>,
 }
 
 impl DevnetMesh {
     /// Broadcast one frame (type byte + payload, no length prefix) to every
-    /// peer. Slow/dead peers just accumulate a queue until reconnect.
+    /// peer, dialed or dialing.
     pub fn broadcast(&self, frame: Vec<u8>) {
         for p in &self.peers {
             let _ = p.send(frame.clone());
+        }
+        // `retain` both sends and prunes: a closed receiver is a connection
+        // whose writer thread has exited, and keeping its sender would leak one
+        // entry per reconnect for as long as the node runs.
+        if let Ok(mut inbound) = self.inbound.lock() {
+            inbound.retain(|p| !matches!(p.try_send(frame.clone()), Err(TrySendError::Disconnected(_))));
         }
     }
 }
@@ -194,7 +233,18 @@ fn decode_event(frame: &[u8]) -> Option<NetEvent> {
 }
 
 /// Serve one get-blocks request on `sock` from the local block log.
-fn serve_get_blocks(sock: &mut TcpStream, data_dir: &PathBuf, frame: &[u8]) {
+/// Answer a peer's `FRAME_GET_BLOCKS` on the socket it asked over.
+///
+/// Takes the shared write half rather than a `&mut TcpStream` because this is
+/// no longer the only writer: broadcasts go down inbound sockets too. Both
+/// sides lock around a WHOLE frame, so the two can interleave between frames
+/// and never inside one — a half-written frame followed by another writer's
+/// bytes is not a slow peer, it is a corrupt stream the peer cannot resync.
+///
+/// The lock is taken per frame, not held across the whole dump: a full history
+/// answer is hundreds of megabytes, and holding it throughout would stall every
+/// broadcast to this peer for the duration.
+fn serve_get_blocks(sock: &Arc<Mutex<TcpStream>>, data_dir: &PathBuf, frame: &[u8]) {
     if frame.len() != 9 {
         return;
     }
@@ -210,7 +260,8 @@ fn serve_get_blocks(sock: &mut TcpStream, data_dir: &PathBuf, frame: &[u8]) {
                 let mut f = Vec::with_capacity(1 + b.len());
                 f.push(FRAME_BLOCK);
                 f.extend_from_slice(&b);
-                if write_frame(sock, &f).is_err() {
+                let Ok(mut w) = sock.lock() else { return };
+                if write_frame(&mut w, &f).is_err() {
                     return;
                 }
             }
@@ -241,19 +292,48 @@ pub fn start(
     // Inbound: accept, then per-connection: read frames; data frames go to
     // the engine, get-blocks is answered in place from the log.
     let listener = TcpListener::bind((bind_addr, listen_port))?;
+    let inbound: Arc<Mutex<Vec<SyncSender<Vec<u8>>>>> = Arc::new(Mutex::new(Vec::new()));
     {
         let events = events.clone();
         let data_dir = data_dir.clone();
+        let inbound = inbound.clone();
         thread::spawn(move || {
             for conn in listener.incoming() {
-                let Ok(mut sock) = conn else { continue };
+                let Ok(sock) = conn else { continue };
+                // Reading and writing need separate handles: the reader blocks
+                // in `read_frame` for as long as the peer is quiet, and a
+                // broadcast must not wait behind it.
+                let Ok(rsock) = sock.try_clone() else { continue };
+                let wsock = Arc::new(Mutex::new(sock));
+
+                // One writer thread per connection, fed by a bounded queue, so
+                // a peer that stops reading fills its own queue and is dropped
+                // from there rather than blocking this node's broadcast loop.
+                let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(INBOUND_QUEUE_DEPTH);
+                {
+                    let wsock = wsock.clone();
+                    thread::spawn(move || {
+                        for frame in rx {
+                            let Ok(mut w) = wsock.lock() else { return };
+                            if write_frame(&mut w, &frame).is_err() {
+                                return; // dropping `rx` disconnects the sender,
+                                        // which `broadcast` prunes on its next pass
+                            }
+                        }
+                    });
+                }
+                if let Ok(mut reg) = inbound.lock() {
+                    reg.push(tx);
+                }
+
                 let events = events.clone();
                 let data_dir = data_dir.clone();
+                let mut rsock = rsock;
                 thread::spawn(move || loop {
-                    match read_frame(&mut sock) {
+                    match read_frame(&mut rsock) {
                         Ok(frame) => {
                             if frame.first() == Some(&FRAME_GET_BLOCKS) {
-                                serve_get_blocks(&mut sock, &data_dir, &frame);
+                                serve_get_blocks(&wsock, &data_dir, &frame);
                             } else if let Some(ev) = decode_event(&frame) {
                                 if events.send(EngineEvent::Net(ev)).is_err() {
                                     return;
@@ -320,5 +400,5 @@ pub fn start(
         });
     }
 
-    Ok(DevnetMesh { peers })
+    Ok(DevnetMesh { peers, inbound })
 }
