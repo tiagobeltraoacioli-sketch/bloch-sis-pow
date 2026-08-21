@@ -900,7 +900,103 @@ pub struct CommittedState {
     /// to their admission rules, not to this field. Until then, no single
 
     /// number in this state is "the supply".
-    eutxos: BTreeMap<([u8; 32], u32), crate::state_root::EutxoEntry>,
+    eutxos: EutxoSet,
+}
+
+/// The committed eUTXO set, and the Merkle leaves it contributes to the state
+/// root, in one value.
+///
+/// **Why one type and not two fields.** Keeping the leaves is what makes the
+/// state root cheap — see
+/// [`crate::state_root::build_state_tree_with_eutxo_leaves`] for the
+/// measurement. But a leaf map that can be updated independently of the
+/// entries is a cache that can go stale, and a stale leaf is a wrong state
+/// root, which is a consensus split — the exact failure the §5.5 rule exists
+/// to prevent. So the two are never separately reachable: `insert` and
+/// `remove` are the only mutators, each updates both halves, and no caller can
+/// touch one without the other. Drift is not guarded against here; it is
+/// unrepresentable.
+///
+/// The leaf itself comes from [`crate::state_root::eutxo_leaf`], the single
+/// definition shared with the from-scratch path, so a kept leaf and a
+/// recomputed one cannot disagree by construction.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EutxoSet {
+    entries: BTreeMap<([u8; 32], u32), crate::state_root::EutxoEntry>,
+    /// `entry key -> value hash`, one per entry, always exactly in step.
+    leaves: BTreeMap<[u8; 32], [u8; 32]>,
+}
+
+impl EutxoSet {
+    fn insert(&mut self, entry: crate::state_root::EutxoEntry) {
+        let (key, value_hash) = crate::state_root::eutxo_leaf(&entry);
+        self.leaves.insert(key, value_hash);
+        self.entries.insert((entry.txid, entry.vout), entry);
+    }
+
+    fn remove(&mut self, outpoint: &([u8; 32], u32)) {
+        if let Some(entry) = self.entries.remove(outpoint) {
+            let (key, _) = crate::state_root::eutxo_leaf(&entry);
+            self.leaves.remove(&key);
+        }
+    }
+
+    fn get(&self, outpoint: &([u8; 32], u32)) -> Option<&crate::state_root::EutxoEntry> {
+        self.entries.get(outpoint)
+    }
+
+    fn contains_key(&self, outpoint: &([u8; 32], u32)) -> bool {
+        self.entries.contains_key(outpoint)
+    }
+
+    fn values(&self) -> impl Iterator<Item = &crate::state_root::EutxoEntry> {
+        self.entries.values()
+    }
+
+    /// Only tests count the set; the consensus paths iterate it.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// The leaves this set contributes, ready for
+    /// [`crate::state_root::state_root_with_eutxo_leaves`].
+    ///
+    /// Debug builds re-derive every leaf here and compare. The type makes
+    /// drift unrepresentable, so this can only fire if someone adds a third
+    /// mutator and forgets the leaf half — which is exactly the edit that
+    /// would otherwise ship a wrong state root and split the chain. Every test
+    /// in this crate computes a state root, so every test runs this check.
+    ///
+    /// It is O(set) and re-hashes everything, i.e. it costs exactly what this
+    /// patch exists to avoid — deliberately, and `debug_assert` only. A node
+    /// built without optimisations was already unusable at this state size;
+    /// this makes it more so, and buys the invariant in every test run.
+    fn leaves(&self) -> &BTreeMap<[u8; 32], [u8; 32]> {
+        debug_assert_eq!(
+            self.leaves.len(),
+            self.entries.len(),
+            "kept eUTXO leaves drifted from the entries: a mutator updated one half only"
+        );
+        debug_assert!(
+            self.entries.values().all(|e| {
+                let (key, value_hash) = crate::state_root::eutxo_leaf(e);
+                self.leaves.get(&key) == Some(&value_hash)
+            }),
+            "a kept eUTXO leaf disagrees with the entry it was derived from"
+        );
+        &self.leaves
+    }
+}
+
+impl FromIterator<crate::state_root::EutxoEntry> for EutxoSet {
+    fn from_iter<I: IntoIterator<Item = crate::state_root::EutxoEntry>>(iter: I) -> Self {
+        let mut set = EutxoSet::default();
+        for e in iter {
+            set.insert(e);
+        }
+        set
+    }
 }
 
 /// Does `key_hash` — SHA3-256 of a spender's public key — open an output
@@ -1037,10 +1133,7 @@ impl CommittedState {
             coherence_nullifier_root,
             evm,
             issued_sat: tokenomics_v4::GENESIS_ISSUED_SAT,
-            eutxos: opening_balances
-                .iter()
-                .map(|e| ((e.txid, e.vout), e.clone()))
-                .collect(),
+            eutxos: opening_balances.iter().cloned().collect(),
         };
         // Seed epoch 0's participation for the launch roster, so the
         // committed participation component is well-defined from block one.
@@ -1322,13 +1415,15 @@ impl CommittedState {
             })
             .collect();
 
-        // Values, in key order — the map's ordering is the commitment's.
-        let eutxo_vec: Vec<crate::state_root::EutxoEntry> = self.eutxos.values().cloned().collect();
-        crate::state_root::state_root(&ConsensusState {
-            // The set the state carries. This read used to be `&[]` under a
-            // comment saying the node supplied it; nothing did, so every
-            // block since genesis committed an empty balance component.
-            eutxos: &eutxo_vec,
+        // The eUTXO component comes in as leaves the set already holds, not as
+        // a cloned vector of entries to re-serialize and re-hash. `&[]` below
+        // is not "no balances" — it is the field this path does not read; the
+        // balances arrive through `self.eutxos.leaves()` on the call itself.
+        // (It genuinely WAS `&[]` once, under a comment saying the node
+        // supplied it, and nothing did: every block from genesis committed an
+        // empty balance component. Hence the emphasis.)
+        crate::state_root::state_root_with_eutxo_leaves(&ConsensusState {
+            eutxos: &[],
             validators: &validators,
             current_participation: &current,
             previous_participation: &previous,
@@ -1354,7 +1449,7 @@ impl CommittedState {
             coherence_nullifier_root: self.coherence_nullifier_root,
             evm: self.evm,
             issued_sat: self.issued_sat,
-        })
+        }, self.eutxos.leaves())
     }
 
     // ── Fork-choice accumulation ────────────────────────────────────────────
@@ -1684,15 +1779,12 @@ impl CommittedState {
         }
         for (vout, o) in outputs.iter().enumerate() {
             let vout = vout as u32;
-            self.eutxos.insert(
-                (txid, vout),
-                crate::state_root::EutxoEntry {
-                    txid,
-                    vout,
-                    value: o.value,
-                    script_hash: o.script_hash,
-                },
-            );
+            self.eutxos.insert(crate::state_root::EutxoEntry {
+                txid,
+                vout,
+                value: o.value,
+                script_hash: o.script_hash,
+            });
         }
         Ok(charge)
     }

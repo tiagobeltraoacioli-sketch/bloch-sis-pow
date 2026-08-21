@@ -1139,14 +1139,63 @@ fn hash_value(serialized: &[u8]) -> [u8; 32] {
     sha3(&[&[MARK_VALUE], serialized])
 }
 
+/// The Merkle leaf one eUTXO contributes: its tree key, and the hash of its
+/// serialization.
+///
+/// The **single definition** of that pair. A caller that keeps eUTXO leaves
+/// incrementally (see `CommittedState`'s eUTXO set) and this module computing
+/// them from scratch must produce identical bytes or the two would commit
+/// different roots for the same state — so neither is allowed its own copy of
+/// this expression.
+pub fn eutxo_leaf(e: &EutxoEntry) -> ([u8; 32], [u8; 32]) {
+    (derive_key(TAG_EUTXO, &e.entry_key()), hash_value(&e.serialize()))
+}
+
 /// Build the full state SMT from a [`ConsensusState`].
 ///
 /// Exposed (rather than only [`state_root`]) so callers can generate
 /// inclusion proofs against the same tree the root came from.
 pub fn build_state_tree(state: &ConsensusState<'_>) -> Smt {
+    let leaves: BTreeMap<[u8; 32], [u8; 32]> = state.eutxos.iter().map(eutxo_leaf).collect();
+    build_state_tree_inner(state, &leaves)
+}
+
+/// [`build_state_tree`] with the eUTXO leaves handed in already computed.
+///
+/// Why this exists: `build_state_tree` re-serializes and re-hashes **every**
+/// eUTXO on every call, and a block calls it at least once. At Genesis-4's
+/// carryover size that is 452,726 entries — around 900,000 SHA3 hashes plus a
+/// full `BTreeMap` rebuild, per block. A `perf` profile of a replaying
+/// validator on 2026-08-21 put 50.7% of its CPU in the keccak permutation and
+/// another 9.2% in `Smt::insert`, for a state where all but a handful of those
+/// entries were byte-for-byte identical to the previous block.
+///
+/// The leaves a caller passes here must come from [`eutxo_leaf`] — that is why
+/// it is public. This function is not a cache and holds no state: it recomputes
+/// the tree, and therefore the root, from whatever leaves it is given, every
+/// time. The §5.5 rule ("no cached root may outlive the leaves it was computed
+/// from") is untouched; what is cached upstream is the *leaves*, each of which
+/// is a pure function of one entry.
+///
+/// `state.eutxos` is IGNORED here — `eutxo_leaves` replaces it. Pass an empty
+/// slice so a reader cannot mistake one for the other.
+pub fn build_state_tree_with_eutxo_leaves(
+    state: &ConsensusState<'_>,
+    eutxo_leaves: &BTreeMap<[u8; 32], [u8; 32]>,
+) -> Smt {
+    build_state_tree_inner(state, eutxo_leaves)
+}
+
+/// [`build_state_tree`] and [`build_state_tree_with_eutxo_leaves`] are the same
+/// tree; only where the eUTXO leaves come from differs. Written once so the two
+/// entry points cannot drift into committing different shapes.
+fn build_state_tree_inner(
+    state: &ConsensusState<'_>,
+    eutxo_leaves: &BTreeMap<[u8; 32], [u8; 32]>,
+) -> Smt {
     let mut smt = Smt::new();
-    for e in state.eutxos {
-        smt.insert(derive_key(TAG_EUTXO, &e.entry_key()), hash_value(&e.serialize()));
+    for (key, value_hash) in eutxo_leaves {
+        smt.insert(*key, *value_hash);
     }
     for v in state.validators {
         smt.insert(derive_key(TAG_VALIDATOR, &v.entry_key()), hash_value(&v.serialize()));
@@ -1240,6 +1289,17 @@ pub fn build_state_tree(state: &ConsensusState<'_>) -> Smt {
 /// pure function of the passed-in state.
 pub fn state_root(state: &ConsensusState<'_>) -> [u8; 32] {
     build_state_tree(state).root()
+}
+
+/// [`state_root`] over a state whose eUTXO leaves the caller already holds.
+///
+/// Same root, same rules; see [`build_state_tree_with_eutxo_leaves`] for why
+/// the leaves are worth keeping and why keeping them is not a cached root.
+pub fn state_root_with_eutxo_leaves(
+    state: &ConsensusState<'_>,
+    eutxo_leaves: &BTreeMap<[u8; 32], [u8; 32]>,
+) -> [u8; 32] {
+    build_state_tree_with_eutxo_leaves(state, eutxo_leaves).root()
 }
 
 /// Sum of all committed eUTXO values, in u128.
@@ -1640,6 +1700,92 @@ mod tests {
             base_fee,
             fee_rewards,
         }
+    }
+
+    /// Supplying the eUTXO leaves must commit exactly the root that computing
+    /// them from the entries commits. If these two ever disagree, a node on one
+    /// path and a node on the other split the chain — which is the whole risk
+    /// this optimisation takes on, so it is the thing to pin.
+    #[test]
+    fn supplied_eutxo_leaves_commit_the_same_root() {
+        let f = fixture();
+        assert!(!f.eutxos.is_empty(), "control: a fixture with no outputs would prove nothing");
+
+        let from_entries = state_root(&state(&f));
+        let leaves: BTreeMap<[u8; 32], [u8; 32]> = f.eutxos.iter().map(eutxo_leaf).collect();
+        let mut view = state(&f);
+        view.eutxos = &[];
+        let from_leaves = state_root_with_eutxo_leaves(&view, &leaves);
+
+        assert_eq!(
+            from_entries, from_leaves,
+            "the same eUTXO set committed two different roots depending on the path"
+        );
+
+        // Control: the balances genuinely reach the root, so the equality above
+        // is not two paths agreeing on a state they both ignored — the bug this
+        // component actually shipped with once.
+        let empty: BTreeMap<[u8; 32], [u8; 32]> = BTreeMap::new();
+        assert_ne!(
+            from_entries,
+            state_root_with_eutxo_leaves(&view, &empty),
+            "dropping every output left the root unchanged: the eUTXO component is not committed"
+        );
+    }
+
+    /// What the two paths cost at Genesis-4's real carryover size.
+    ///
+    /// `#[ignore]` because it allocates a 452,726-entry set and is a
+    /// measurement, not an assertion. Run it deliberately:
+    ///
+    /// ```text
+    /// cargo test -p bloch-pos-committee --release supplied_leaves_cost -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn supplied_leaves_cost_at_carryover_scale() {
+        const N: u32 = 452_726;
+        let f = fixture();
+        let eutxos: Vec<EutxoEntry> = (0..N)
+            .map(|i| {
+                let mut txid = [0u8; 32];
+                txid[..4].copy_from_slice(&i.to_le_bytes());
+                EutxoEntry { txid, vout: 0, value: 1_000 + i as u64, script_hash: [7u8; 32] }
+            })
+            .collect();
+
+        let mut view = state(&f);
+        let leaves: BTreeMap<[u8; 32], [u8; 32]> = eutxos.iter().map(eutxo_leaf).collect();
+
+        // Warm BOTH paths before timing either. The singleton memo is
+        // thread-local and persists across calls, so a cold first run and a
+        // warm second one is not a comparison of the two paths — it is a
+        // comparison of a cold cache with a warm one, which would flatter this
+        // patch by a wide margin. In production the memo is warm for both.
+        view.eutxos = &eutxos;
+        let a = state_root(&view);
+        view.eutxos = &[];
+        let b = state_root_with_eutxo_leaves(&view, &leaves);
+
+        view.eutxos = &eutxos;
+        let t0 = std::time::Instant::now();
+        let a2 = state_root(&view);
+        let from_entries = t0.elapsed();
+
+        view.eutxos = &[];
+        let t1 = std::time::Instant::now();
+        let b2 = state_root_with_eutxo_leaves(&view, &leaves);
+        let from_leaves = t1.elapsed();
+        assert_eq!(a, a2);
+        assert_eq!(b, b2);
+
+        assert_eq!(a, b, "the measurement is only meaningful if both paths agree");
+        println!("  entries ({N} eUTXOs): {from_entries:?}");
+        println!("  kept leaves:          {from_leaves:?}");
+        println!(
+            "  saved per state root: {:.1}%",
+            100.0 * (1.0 - from_leaves.as_secs_f64() / from_entries.as_secs_f64())
+        );
     }
 
     fn state(f: &Fx) -> ConsensusState<'_> {
