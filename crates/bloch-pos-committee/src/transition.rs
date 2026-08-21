@@ -2705,6 +2705,10 @@ impl CommittedState {
         .map_err(|_| ())?;
 
         let epoch = self.epoch;
+        // Read the offender's backed share BEFORE the slash consumes it: the
+        // whistleblower cap below is a function of what was coin-backed at the
+        // moment of the offence, and one line further down that number is gone.
+        let backed_before_slash = self.withdrawable_sat(offender);
         if let Some(rec) = self.validators.get_mut(&offender) {
             rec.slashed = true;
             rec.staked_sat = rec.staked_sat.saturating_sub(outcome.delegation_losses_sat[0]);
@@ -2732,11 +2736,44 @@ impl CommittedState {
                 *self.delegator_slash_losses.entry(d.delegator).or_insert(0) += *loss;
             }
         }
-        if outcome.whistleblower_reward_sat > 0 {
+        // The whistleblower reward may not exceed the BACKED share the slash
+        // actually consumed.
+        //
+        // Unbounded, it is a hole straight through the founder's rule that a
+        // genesis bond's principal never becomes spendable. The reward is a
+        // thirty-second of what was slashed and lands in `pending_fee_rewards`,
+        // which is accrual — and accrual IS withdrawable. So slashing an
+        // unbacked genesis bond converted principal that `issued_sat` never
+        // counted into withdrawable coins in somebody else's bond, with
+        // `issued_sat` never moving. A validator willing to be slashed (or a
+        // proposer colluding with one) could run that in a loop and mint past
+        // the supply cap. Found by the adversarial front as A7, against
+        // production code, before the gate ever armed.
+        //
+        // The cap is deliberately conservative: it counts only the backed
+        // share consumed from the OFFENDER'S OWN bond, not from delegated
+        // principal, because delegated backing is a surface this change does
+        // not settle. Under-paying a whistleblower is the safe direction —
+        // it destroys value that was never coins, which is what unbacked
+        // principal is. Over-paying creates coins, which is the whole defect.
+        //
+        // Gated, and this is not optional: with the flag day closed
+        // `unbacked_principal_sat` treats every bond as unbacked, so applying
+        // the cap unconditionally would zero every whistleblower reward on the
+        // live chain today — a consensus change outside its own flag day,
+        // which rule 1 forbids and which would fork the fleet on the next
+        // slash.
+        let reward = capped_whistleblower_reward(
+            outcome.whistleblower_reward_sat,
+            outcome.delegation_losses_sat[0],
+            backed_before_slash,
+            self.epoch >= crate::params::FUNDED_STAKE_ACTIVATION_EPOCH,
+        );
+        if reward > 0 {
             *self
                 .pending_fee_rewards
                 .entry(including_proposer)
-                .or_insert(0) += outcome.whistleblower_reward_sat;
+                .or_insert(0) += reward;
         }
         Ok(())
     }
@@ -3168,6 +3205,27 @@ impl CommittedState {
 
         st
     }
+}
+
+/// The whistleblower reward, capped at the backed share the slash consumed.
+///
+/// Pure and gate-explicit for the same reason `withdrawable_sat_gated` is: the
+/// shipped constant is `u64::MAX`, so a test that went through the caller could
+/// only ever exercise the pre-gate side. Both sides are reachable here without
+/// arming anything.
+///
+/// `funded_era == false` returns the raw reward unchanged — the pre-gate rule,
+/// byte for byte.
+fn capped_whistleblower_reward(
+    raw_reward_sat: u128,
+    operator_loss_sat: u128,
+    backed_before_slash_sat: u128,
+    funded_era: bool,
+) -> u128 {
+    if !funded_era {
+        return raw_reward_sat;
+    }
+    raw_reward_sat.min(operator_loss_sat.min(backed_before_slash_sat))
 }
 
 /// `roster` with each validator's accrued inactivity leak subtracted.
@@ -5688,6 +5746,43 @@ mod tests {
             coherence_root: pre.coherence_root(),
         };
         ProposalEnvelope { header, proposer_sig: vec![0u8; 8] }
+    }
+
+    /// The whistleblower reward may not turn unbacked principal into coins.
+    ///
+    /// Slashing an unbacked genesis bond used to credit a thirty-second of the
+    /// loss into `pending_fee_rewards` regardless — and accrual is withdrawable
+    /// under the founder's rule, while `issued_sat` never moved. A validator
+    /// willing to be slashed could run that in a loop and mint past the supply
+    /// cap. Found as A7 by the adversarial front, against production code,
+    /// before the gate ever armed.
+    #[test]
+    fn the_whistleblower_reward_cannot_exceed_the_backed_share() {
+        let raw = 1_000u128; // a thirty-second of 32,000
+        let loss = 32_000u128;
+
+        // Pre-gate: unchanged, byte for byte. This half is load-bearing — the
+        // cap must not alter the live chain outside its own flag day, and
+        // `unbacked_principal_sat` treats EVERY bond as unbacked while the
+        // gate is closed, so an ungated cap would zero every reward today.
+        assert_eq!(capped_whistleblower_reward(raw, loss, 0, false), raw);
+
+        // Post-gate, fully unbacked offender: nothing backed was consumed, so
+        // nothing may be paid. This is the hole.
+        assert_eq!(capped_whistleblower_reward(raw, loss, 0, true), 0);
+
+        // Post-gate, partially backed: the cap bites at what was backed.
+        assert_eq!(capped_whistleblower_reward(raw, loss, 400, true), 400);
+
+        // Control: a fully backed offender pays the full reward. Without this
+        // half the assertions above would pass just as well against a cap that
+        // always returned zero, which would break slashing rather than fix it.
+        assert_eq!(capped_whistleblower_reward(raw, loss, loss, true), raw);
+
+        // Control: the operator's own loss also bounds it — a reward larger
+        // than what left the offender's bond would be minting from the other
+        // direction.
+        assert_eq!(capped_whistleblower_reward(raw, 300, u128::MAX, true), 300);
     }
 
     #[test]
