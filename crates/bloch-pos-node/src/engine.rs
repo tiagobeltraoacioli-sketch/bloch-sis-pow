@@ -1382,6 +1382,8 @@ impl Engine {
                 Ok(rpc::utxos_json(&self.state, &script_hash, limit))
             }
 
+            RpcRequest::TxOut { txid, vout } => Ok(rpc::txout_json(&self.state, &txid, vout)),
+
             RpcRequest::SendRawTransaction(tx) => match self.on_transaction(tx.clone()) {
                 Ok(outcome) => Ok(rpc::submitted_json(&tx, outcome)),
                 Err(why) => Err(RpcError::new(

@@ -510,6 +510,42 @@ fn every_method_routes_to_its_request() {
     assert_eq!(spy.last(), Some(RpcRequest::SendRawTransaction(tx)));
 }
 
+/// `gettxout` routes one outpoint, and refuses what it cannot answer.
+///
+/// The refusals matter more than the happy path here. This method exists so a
+/// go/no-go check before the vesting-lock flag day can be a query instead of an
+/// assumption, and a check that silently accepts a malformed outpoint is worse
+/// than no check: it would answer about an output nobody asked about.
+#[test]
+fn gettxout_routes_an_outpoint_and_refuses_a_malformed_one() {
+    let spy = Spy::new();
+    let b = spy.as_ref();
+    let txid = "cd".repeat(32);
+
+    // Control: a well-formed call must reach the backend as the outpoint asked
+    // for. Without this half, the refusals below would pass against a method
+    // that refuses everything.
+    call(b, &request("gettxout", &format!("[\"{txid}\", 3]")));
+    assert_eq!(spy.last(), Some(RpcRequest::TxOut { txid: [0xCD; 32], vout: 3 }));
+
+    // vout defaults to 0 rather than erroring: an outpoint's index is almost
+    // always zero for the allocation outputs this was written for, and a
+    // required argument that is nearly always the same value invites being
+    // typed wrong.
+    call(b, &request("gettxout", &format!("[\"{txid}\"]")));
+    assert_eq!(spy.last(), Some(RpcRequest::TxOut { txid: [0xCD; 32], vout: 0 }));
+
+    let before = spy.last();
+    call(b, &request("gettxout", "[]"));
+    assert_eq!(spy.last(), before, "a missing txid must not reach the backend");
+    call(b, &request("gettxout", "[\"ab\"]"));
+    assert_eq!(spy.last(), before, "a short txid must not reach the backend");
+    call(b, &request("gettxout", &format!("[\"{txid}\", -1]")));
+    assert_eq!(spy.last(), before, "a negative vout must not reach the backend");
+    call(b, &request("gettxout", &format!("[\"{txid}\", 4294967296]")));
+    assert_eq!(spy.last(), before, "a vout past 32 bits must not reach the backend");
+}
+
 /// `listunspent` is the exchange-facing name for `getutxos`. Two names, one
 /// request — a second semantics for the second name is how a client ends up
 /// with two balances that disagree.

@@ -693,6 +693,24 @@ pub enum RpcRequest {
     ValidatorCount,
     Balance([u8; 32]),
     Utxos { script_hash: [u8; 32], limit: usize },
+    /// `gettxout` — is this ONE output still unspent?
+    ///
+    /// Exists because `listunspent` cannot answer it. That method takes a
+    /// script hash and a limit, has no cursor, and caps at `UTXO_PAGE_MAX`
+    /// (1,000). The founder's script hash holds 425,568 outputs on the live
+    /// chain, so 424,568 of them are unreachable through it: the same first
+    /// page comes back every time.
+    ///
+    /// That gap has a consequence beyond convenience. The vesting-lock flag day
+    /// has a go/no-go precondition — the founder and team allocation outpoints
+    /// must still be unspent when the rule arms, or the lock seeds nothing and
+    /// silently never exists for that bucket. The runbook asks an operator to
+    /// confirm that by RPC, and until this method existed no such query was
+    /// possible. A holder also could not audit their own position beyond an
+    /// aggregate balance and an arbitrary first thousand outputs.
+    ///
+    /// Read-only: no consensus surface, no flag day.
+    TxOut { txid: [u8; 32], vout: u32 },
     /// A transaction that **already decoded**.
     ///
     /// Decoding happens at this edge, not in the engine, for the same reason
@@ -841,6 +859,21 @@ pub fn route(method: &str, params: Option<&Json>) -> Result<RpcRequest, RpcError
         // comments on the two constructors for the full reasoning.
         "gettransaction" => return Err(RpcError::no_transaction_index()),
         "getnewaddress" => return Err(RpcError::no_wallet()),
+        "gettxout" => {
+            let txid = want_hex32(params, 0, "txid")?;
+            let vout = match pick(params, 1, "vout") {
+                None | Some(Json::Null) => 0,
+                Some(v) => {
+                    let n = v.as_u64().ok_or_else(|| {
+                        RpcError::invalid_params("`vout` must be a non-negative integer")
+                    })?;
+                    u32::try_from(n).map_err(|_| {
+                        RpcError::invalid_params("`vout` does not fit in 32 bits")
+                    })?
+                }
+            };
+            RpcRequest::TxOut { txid, vout }
+        }
         "getutxos" | "listunspent" => {
             let script_hash = want_hex32(params, 0, "script_hash")?;
             let limit = match pick(params, 1, "limit") {
@@ -1477,6 +1510,38 @@ pub fn utxos_json(state: &CommittedState, script_hash: &[u8; 32], limit: usize) 
         ("truncated", Json::Bool(total > page.len())),
         ("utxos", Json::Arr(page)),
     ])
+}
+
+/// `gettxout` — one outpoint, answered as present-or-absent.
+///
+/// `unspent` is stated as its own boolean rather than left implicit in whether
+/// `utxo` is null. An integrator reading a null field has to decide whether it
+/// means "spent", "never existed", or "this node does not know", and those are
+/// three different facts to act on. Here the first two are both `unspent:
+/// false` — this node's committed set does not contain it — and the third
+/// cannot arise, because the set is committed state, not a cache: if the node
+/// answered at all, it answered from the same eUTXO set its state root commits.
+///
+/// So a `false` is a real statement about the chain, and `at_slot` — the head
+/// this node answered from — is returned either way, so the answer can be
+/// pinned to a point on the chain rather than to the moment the call happened.
+pub fn txout_json(state: &CommittedState, txid: &[u8; 32], vout: u32) -> Json {
+    match state.utxo(txid, vout) {
+        Some(e) => Json::obj(vec![
+            ("txid", Json::hex(txid)),
+            ("vout", Json::u(vout as u64)),
+            ("unspent", Json::Bool(true)),
+            ("utxo", eutxo_json(e)),
+            ("at_slot", Json::u(state.slot())),
+        ]),
+        None => Json::obj(vec![
+            ("txid", Json::hex(txid)),
+            ("vout", Json::u(vout as u64)),
+            ("unspent", Json::Bool(false)),
+            ("utxo", Json::Null),
+            ("at_slot", Json::u(state.slot())),
+        ]),
+    }
 }
 
 /// `getmempoolinfo`.
