@@ -1405,6 +1405,11 @@ impl Engine {
 
 // ── Entry point ─────────────────────────────────────────────────────────────
 
+/// How often replay reports progress. Ten seconds is short enough that an
+/// operator watching a stalled fleet gets an answer quickly, and long enough
+/// that the log of a multi-hour replay stays readable.
+const REPLAY_PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
 pub fn run(cfg: Config) -> io::Result<()> {
     let (mut manifest, digest) = Manifest::load(&cfg.genesis_path)?;
 
@@ -1590,9 +1595,44 @@ pub fn run(cfg: Config) -> io::Result<()> {
 
     // ── Replay: restart returns to the same state, by re-running the same
     // transition over the same inputs. ──
+    //
+    // Progress is reported while this runs, and that is not a nicety. Replay
+    // re-applies the whole chain, and every block re-derives the state root
+    // over the full committed state — 0.59s per block at Genesis-4's carryover
+    // size, so a 12,200-block chain is hours. Throughout, the RPC does not
+    // answer and the node logs nothing, which makes "still working" and
+    // "wedged" indistinguishable from the outside. That ambiguity cost real
+    // hours of investigation on 2026-08-21: a validator was down and there was
+    // no way to tell whether it was progressing, stuck, or minutes from
+    // finishing. An operator needs a rate and a remainder to decide whether to
+    // wait or intervene, and neither existed.
     let n_logged = logged.len();
-    for env in logged {
+    if n_logged > 0 {
+        println!(
+            "replaying {n_logged} blocks from the log — the RPC stays silent until this finishes"
+        );
+    }
+    let replay_started = std::time::Instant::now();
+    let mut last_report = replay_started;
+    for (i, env) in logged.into_iter().enumerate() {
         engine.ingest(env);
+        // Time-based, not every-N-blocks: block cost varies by an order of
+        // magnitude with how many transactions a block carries, so a fixed
+        // count reports in bursts and then goes quiet exactly when the work is
+        // heaviest — the opposite of what an operator needs.
+        if last_report.elapsed() >= REPLAY_PROGRESS_INTERVAL {
+            let done = i + 1;
+            let elapsed = replay_started.elapsed().as_secs_f64();
+            let rate = if elapsed > 0.0 { done as f64 / elapsed } else { 0.0 };
+            let left = n_logged - done;
+            println!(
+                "replay {done}/{n_logged} ({:.1}%) — head slot {}, {rate:.1} blocks/s, ~{} min left",
+                100.0 * done as f64 / n_logged as f64,
+                engine.state.slot(),
+                if rate > 0.0 { (left as f64 / rate / 60.0).ceil() as u64 } else { 0 },
+            );
+            last_report = std::time::Instant::now();
+        }
     }
     engine.live = true;
     if n_logged > 0 {
