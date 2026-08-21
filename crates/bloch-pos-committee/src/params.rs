@@ -105,6 +105,50 @@ pub const INACTIVITY_LEAK_QUOTIENT: u128 = 64;
 /// treat "the fleet is on the new binary" as a precondition, not a hope.
 pub const LEAKED_ROSTER_ACTIVATION_EPOCH: u64 = u64::MAX;
 
+/// Flag-day epoch at which the deduplicated transfer format (`TransferV2`,
+/// wire tag `0x06`) becomes acceptable in blocks.
+///
+/// `u64::MAX` means INERT: every node ships the decoder and the apply path
+/// and none of it changes what a block may carry until this constant is
+/// lowered and the fleet is rebuilt together. Same idiom as
+/// `LEAKED_ROSTER_ACTIVATION_EPOCH` — a consensus rule arrives by flag day,
+/// never by whoever restarts first. The V1 format (tag `0x01`) stays valid
+/// forever; this gate only *adds* an encoding, it retires nothing.
+///
+/// # The defect this closes
+///
+/// A V1 transfer carries one full witness per input: txid 32 + vout 4 +
+/// pubkey 3,749 + signature 4,775 = 8,560 B, so `MAX_BLOCK_TX_BYTES`
+/// (262,144) fits ~30 inputs per block. A consolidation's inputs are almost
+/// always one owner's, and there is ONE signing root per transfer
+/// ([`crate::transition::PosTransaction::spend_signing_root`]) — so those 30
+/// witnesses are 30 copies of the same key carrying 30 proofs of the same
+/// statement, 30 hybrid verifications (145 µs each, measured 2026-08-21) to
+/// establish what one establishes. V2 carries a witness table with one
+/// (pubkey, signature) entry per owner and 40-byte inputs (txid + vout +
+/// key_index): a 30-input single-owner consolidation drops from ~256,800 B
+/// to ~9,700 B, ~6,300 inputs fit in a block, and verification is one hybrid
+/// check per owner. That matters because the dominant per-block cost is the
+/// state root, LINEAR in the UTXO set size (51 s cold / 0.59 s warm over
+/// today's 452,726-entry carryover) — consolidation is how the set shrinks,
+/// and this format is what makes consolidation cheap.
+///
+/// # Why a mixed fleet agrees before the flag day
+///
+/// A pre-activation block carrying `0x06` is rejected by BOTH binaries, for
+/// different proximate reasons and the same verdict: the old binary fails to
+/// decode the body (`TxDecodeError::UnknownTag(0x06)`), the new one decodes
+/// it and refuses it at the gate
+/// ([`crate::interfaces::TransferReject::FormatNotActive`]). Either way the
+/// block is invalid everywhere, so no honest proposer produces one and no
+/// fork opens. AFTER activation the two binaries diverge — the old one still
+/// rejects what the new one accepts — so "the fleet is on the new binary" is
+/// a precondition of lowering this, not a hope. The gate reads the COMMITTED
+/// epoch (`CommittedState::epoch`, already rolled to the block's epoch),
+/// never node-local state — the 2026-08-08 `expected_bits` fork is the
+/// standing reason.
+pub const TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH: u64 = u64::MAX;
+
 /// Domain separation tags (§6.1). Fixed 16 bytes, right-padded with zeros, so
 /// no tag can be a prefix of another.
 pub const DS_SORTITION: [u8; 16] = *b"BLCH4:SORTIT\0\0\0\0";

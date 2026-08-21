@@ -2020,6 +2020,21 @@ pub(crate) fn admissible(tx: &PosTransaction) -> Result<(), &'static str> {
             }
             Ok(())
         }
+        // TransferV2 (tag 0x06) ships INERT behind
+        // `params::TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH` (u64::MAX).
+        // Refused at the mempool door so a pre-activation node never gossips
+        // a transaction no block can carry — the catch-all below would have
+        // admitted it, every proposer that selected it would fail with
+        // `TransferReject::FormatNotActive`, and the invalid transaction
+        // would sit in mempools forever. When the flag day is set this arm
+        // must learn the epoch and admit the format after it (and verify the
+        // witness-table signatures the way the Transfer arm above does);
+        // until then a blanket refusal is exact, because pre-activation is
+        // the only era that exists.
+        PosTransaction::TransferV2 { .. } => Err(
+            "deduplicated transfers (tag 0x06) are not active: the format ships behind \
+             a flag day (TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH) that has not been set",
+        ),
         // Exit is UNAUTHENTICATED: its arm in transition.rs checks registry
         // state and never touches a verifier, and this catch-all used to admit
         // it. Sixty-four Exit messages would set exit_epoch on all sixty-four

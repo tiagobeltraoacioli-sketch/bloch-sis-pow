@@ -417,6 +417,29 @@ pub enum TransferReject {
     /// trusted to be unreachable: the overwrite would silently destroy the
     /// existing output's value.
     OutputExists,
+    /// A `TransferV2` (deduplicated-witness, tag `0x06`) arrived before
+    /// `params::TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH`. The format ships
+    /// inert; before the flag day a block carrying it is invalid on every
+    /// node — this is the new binary's half of the same verdict the old
+    /// binary reaches via `TxDecodeError::UnknownTag(0x06)`.
+    FormatNotActive,
+    /// A V2 input's `key_index` points past the end of the witness table.
+    /// Structural, checked per input before any hash or signature work.
+    BadKeyIndex,
+    /// Two V2 witness-table entries carry the same public key. Refused as
+    /// consensus, not lint: with duplicates allowed, the same logical
+    /// transfer would have many valid encodings differing only in unsigned
+    /// table bytes (the table is witness, outside the signing root), and a
+    /// relay could re-shape a transaction's body — and its `body_root` —
+    /// in flight.
+    DuplicateWitnessKey,
+    /// A V2 witness-table entry is referenced by no input. Refused for the
+    /// same reason as `DuplicateWitnessKey`: together the two checks restore
+    /// the V1 property that every witness byte is checked against something
+    /// committed (each pubkey against a spent output's `script_hash`, each
+    /// signature against the signing root). An unreferenced entry would be
+    /// free padding a relay could stuff inside the declared `tx_bytes`.
+    WitnessKeyUnused,
 }
 
 /// Why a deposit was rejected (§7.1, §4.1, §6.6.3).

@@ -121,7 +121,14 @@ pub const SHIELDED_VERIFY_GAS_PROVISIONAL: u64 = 25 * HYBRID_VERIFY_GAS;
 /// The transaction classes a block can carry, for intrinsic-gas purposes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TxClass {
-    /// eUTXO transfer: one hybrid verification per input.
+    /// eUTXO transfer: `inputs` is **the number of hybrid verifications the
+    /// node will actually run**, one gas term per real check — gas buys node
+    /// CPU. Under the V1 format that is one per input (each input carries
+    /// its own witness); under the deduplicated `TransferV2` (tag `0x06`,
+    /// inert until `params::TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH`) it is
+    /// one per witness-table entry — per owner — because a single signature
+    /// over the shared signing root authorises all of that owner's inputs.
+    /// Both callers derive the count from their lists; nothing asserts it.
     Eutxo { inputs: u32 },
     /// EVM transaction from a PQ (hybrid) account: one envelope verification.
     EvmPq,
