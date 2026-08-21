@@ -232,6 +232,46 @@ fn getchaininfo_reports_slot_epoch_head_root_and_both_checkpoints() {
     assert_eq!(v.get("mempool").unwrap().as_u64(), Some(3));
 }
 
+/// The supply-cap invariant is enforceable but was unobservable: `issued_sat`
+/// is a committed state-root component (`TAG_ISSUED_SUPPLY`) and the
+/// `SupplyCapExceeded` check reads it on every block, yet no RPC field carried
+/// it — so the funded-staking runbook's conservation phase ("a
+/// deposit-and-withdraw pair leaves issuance unchanged") had nothing to read.
+/// This pins the two fields that close that: the committed counter and the
+/// constant it is checked against, both as decimal strings (R3 — the values
+/// are above what a double represents).
+#[test]
+fn getchaininfo_exposes_the_committed_issuance_and_the_cap() {
+    use bloch_pos_committee::tokenomics_v4 as t;
+
+    let st = state_with_balances();
+    let head = st.head();
+    let v = chain_info_json(&st, &head, 0, Some(0), 12, 2, 3, 0);
+
+    // Control half: a genesis state carries exactly `GENESIS_ISSUED_SAT` —
+    // the value `CommittedState::genesis` seeds — so the field is the
+    // committed counter and not a re-derivation that could drift from it.
+    assert_eq!(
+        v.get("issued_supply_sat").unwrap().as_str(),
+        Some(t::GENESIS_ISSUED_SAT.to_string().as_str()),
+        "the RPC must report the committed issuance counter verbatim"
+    );
+    assert_eq!(
+        v.get("supply_cap_sat").unwrap().as_str(),
+        Some(t::TOTAL_SUPPLY_SAT.to_string().as_str()),
+        "the cap the counter is checked against ships in the same response"
+    );
+    // The pair must leave real headroom at genesis: everything except the
+    // validator emission is issued, so `cap - issued` is exactly the emission
+    // still to come. A response where these two were equal at slot 0 would
+    // mean emission can never mint anything.
+    assert_eq!(
+        t::TOTAL_SUPPLY_SAT - t::GENESIS_ISSUED_SAT,
+        t::VALIDATOR_EMISSION_SAT,
+        "genesis headroom is the validator emission, by definition"
+    );
+}
+
 #[test]
 fn getblockbyslot_and_getblockbyid_share_one_block_shape() {
     let env = sample_block(41_290, 2);
