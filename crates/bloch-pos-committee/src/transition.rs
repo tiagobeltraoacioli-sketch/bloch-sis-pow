@@ -1125,6 +1125,34 @@ impl CommittedState {
         self.duty_roster_at(self.epoch)
     }
 
+    /// The duty roster as **consensus weight**: [`Self::duty_roster_at`] with
+    /// each validator's accrued inactivity leak subtracted, once
+    /// [`crate::params::LEAKED_ROSTER_ACTIVATION_EPOCH`] binds.
+    ///
+    /// This is the roster the proposer draw and the committee partition must
+    /// read. `duty_roster_at` deliberately is not: it still feeds
+    /// `finality::process_epoch`, which subtracts the leak itself, and the
+    /// reward split, where absence is already priced as forfeited credits.
+    /// Leaking in both places would charge it twice.
+    ///
+    /// The leak is applied AFTER the cohort cap, matching the order finality
+    /// already uses — it receives `duty_roster_at`'s post-cap output and
+    /// subtracts from that. Same order, same numbers: this roster equals the
+    /// quorum weights validator for validator, which is the point. One
+    /// definition of what a leak is worth, two call paths reading it.
+    ///
+    /// A validator whose leak has reached its stake lands on zero and drops
+    /// out of `eligible` in both `sample` and `epoch_committees` — it stops
+    /// being drawn to propose and stops holding a committee seat, which is
+    /// exactly the liveness the leak was supposed to buy back.
+    fn consensus_roster_at(&self, epoch: u64) -> Vec<Validator> {
+        let roster = self.duty_roster_at(epoch);
+        if epoch < crate::params::LEAKED_ROSTER_ACTIVATION_EPOCH {
+            return roster;
+        }
+        with_leak_applied(roster, |index| self.finality_engine.leaked_of(index))
+    }
+
     /// The frozen finality view over the engine's state.
     fn finality_view(&self) -> FinalityView {
         let j = self.finality_engine.current_justified();
@@ -2127,7 +2155,7 @@ impl CommittedState {
         //    duty_roster_at (genesis_cohort.rs closed form — rule 3).
         st.epoch = next_epoch;
         st.pending_votes.clear();
-        let roster_next = st.duty_roster_at(next_epoch);
+        let roster_next = st.consensus_roster_at(next_epoch);
         st.previous_participation = std::mem::take(&mut st.current_participation);
         for v in &roster_next {
             st.current_participation.insert(v.index, false);
@@ -2147,6 +2175,23 @@ impl CommittedState {
 
         st
     }
+}
+
+/// `roster` with each validator's accrued inactivity leak subtracted.
+///
+/// Split out of [`CommittedState::consensus_roster_at`] so the arithmetic is
+/// testable without standing up a finality engine and starving it for the
+/// four-plus epochs it takes a leak to start accruing. Saturating: a leak that
+/// has reached the stake lands on zero and never wraps into a giant weight,
+/// which is the one way this could turn a dead validator into a dominant one.
+fn with_leak_applied(roster: Vec<Validator>, leaked_of: impl Fn(u32) -> u64) -> Vec<Validator> {
+    roster
+        .into_iter()
+        .map(|v| Validator {
+            index: v.index,
+            effective_stake: v.effective_stake.saturating_sub(leaked_of(v.index)),
+        })
+        .collect()
 }
 
 /// Narrow a `u128` stake to the `u64` the sampling layer carries. Saturating,
@@ -2170,7 +2215,11 @@ impl StateReader for CommittedState {
     }
 
     fn active_validators(&self) -> Vec<Validator> {
-        self.duty_roster()
+        // The node-side duty computations (attest, judge, propose) read this,
+        // so it carries the leak for the same reason step 4 does: the schedule
+        // a node acts on must be the schedule every other node validates it
+        // against.
+        self.consensus_roster_at(self.epoch)
     }
 
     fn validator_record(&self, index: u32) -> Option<ValidatorRecord> {
@@ -2311,7 +2360,10 @@ impl<V: SignatureVerifier> Transition<V> {
             return Err(TransitionError::SupplyCapExceeded);
         }
 
-        let roster = st.duty_roster();
+        // Consensus weight, not raw stake: the proposer draw below and the
+        // committee check at step 8 must both read the leak-adjusted roster,
+        // or an absent validator keeps its slot and its seat forever.
+        let roster = st.consensus_roster_at(st.epoch);
         let seed = st.seed_for_epoch(st.epoch);
 
         // 4. The proposer must be the validator drawn for this slot
@@ -5371,6 +5423,114 @@ mod tests {
         // The boundary with full participation actually minted something —
         // otherwise the monotonicity above was checked vacuously.
         assert!(rolled.issued_sat > s.issued_sat, "fixture minted nothing");
+    }
+
+    // ── The inactivity leak must reach the schedule, not only the quorum ────
+
+    /// The shipped default has to stay inert.
+    ///
+    /// Lowering this constant changes proposer selection and committee
+    /// membership on the next epoch, so a node still on the old value computes
+    /// a different schedule and forks. This test is a tripwire, not a property:
+    /// it is meant to fail the moment someone sets a real epoch, so that the
+    /// change is made together with a coordinated rebuild rather than shipped
+    /// quietly inside an unrelated release.
+    #[test]
+    fn leaked_roster_ships_inert() {
+        assert_eq!(
+            crate::params::LEAKED_ROSTER_ACTIVATION_EPOCH,
+            u64::MAX,
+            "binding the leaked roster is a flag day: set the epoch and roll the fleet together"
+        );
+    }
+
+    /// Before the flag day, nothing moves — even with a leak on the books.
+    #[test]
+    fn consensus_roster_matches_duty_roster_before_the_flag_day() {
+        let (_t, g, _c) = setup(4);
+        assert_eq!(
+            g.consensus_roster_at(g.epoch),
+            g.duty_roster_at(g.epoch),
+            "the gate is closed, so these must be the same roster"
+        );
+    }
+
+    /// A fully-leaked validator stops being drawn to propose and stops holding
+    /// a committee seat — the liveness the leak is supposed to buy back.
+    ///
+    /// The control half is what makes this worth running: the same validator,
+    /// on the same seed, with the leak NOT applied, both proposes and sits on
+    /// a committee. Without that half the assertions below would pass just as
+    /// well against a roster that had lost the validator for some unrelated
+    /// reason, which is the failure mode that makes a negative test worthless.
+    #[test]
+    fn a_fully_leaked_validator_leaves_the_schedule() {
+        let (_t, g, _c) = setup(4);
+        let absent = 1u32;
+        let unleaked = g.duty_roster_at(0);
+        let seed = g.seed_for_epoch(0);
+
+        // Control: with raw stake the absent validator is scheduled like anyone
+        // else. If this ever stops holding, the test below proves nothing.
+        let drawn_before: Vec<u32> =
+            (0..256).filter_map(|s| schedule::proposer(&seed, s, &unleaked)).collect();
+        assert!(
+            drawn_before.contains(&absent),
+            "control failed: the absent validator was never drawn even unleaked,              so the assertions below would be vacuous"
+        );
+        assert!(
+            crate::committees::epoch_committees(&seed, 0, &unleaked)
+                .iter()
+                .any(|c| c.contains(&absent)),
+            "control failed: the absent validator held no seat even unleaked"
+        );
+
+        // Leak it to the floor. Saturating: the leak exceeds the stake here on
+        // purpose, because a real leak keeps accruing past it.
+        let stake_of_absent =
+            unleaked.iter().find(|v| v.index == absent).unwrap().effective_stake;
+        let leaked = with_leak_applied(unleaked.clone(), |i| {
+            if i == absent {
+                stake_of_absent.saturating_mul(2)
+            } else {
+                0
+            }
+        });
+
+        assert_eq!(
+            leaked.iter().find(|v| v.index == absent).unwrap().effective_stake,
+            0,
+            "a leak past the stake must land on zero, never wrap"
+        );
+        for v in &leaked {
+            if v.index != absent {
+                assert_eq!(
+                    v.effective_stake,
+                    unleaked.iter().find(|u| u.index == v.index).unwrap().effective_stake,
+                    "a validator that never leaked must keep its exact weight"
+                );
+            }
+        }
+
+        assert!(
+            !(0..256)
+                .filter_map(|s| schedule::proposer(&seed, s, &leaked))
+                .any(|p| p == absent),
+            "a fully-leaked validator must never win a proposer draw"
+        );
+        assert!(
+            !crate::committees::epoch_committees(&seed, 0, &leaked)
+                .iter()
+                .any(|c| c.contains(&absent)),
+            "a fully-leaked validator must hold no committee seat"
+        );
+
+        // And the slots it used to take are not lost — they go to the live set,
+        // which is the entire point: empty slots become produced slots.
+        assert!(
+            (0..256).filter_map(|s| schedule::proposer(&seed, s, &leaked)).count() == 256,
+            "every slot must still draw a proposer from the surviving validators"
+        );
     }
 }
 

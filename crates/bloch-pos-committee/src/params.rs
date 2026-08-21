@@ -66,6 +66,45 @@ pub const INACTIVITY_LEAK_THRESHOLD_EPOCHS: u64 = 4;
 /// §5.1 value this is a Phase-1 proposal needing a KAT and a devnet sweep.
 pub const INACTIVITY_LEAK_QUOTIENT: u128 = 64;
 
+/// Flag-day epoch at which the inactivity leak starts reaching the **duty
+/// roster**, and not only the quorum denominator.
+///
+/// `u64::MAX` means INERT: every node ships the code and none of it changes a
+/// single committee or proposer draw until this constant is lowered and the
+/// fleet is rebuilt together. Same idiom as `STATE_ROOT_ACTIVATION_HEIGHT` —
+/// a consensus rule arrives by flag day, never by whoever restarts first.
+///
+/// # The defect this closes
+///
+/// The chain carried two disagreeing stake views. `finality::process_epoch`
+/// subtracts each validator's accrued leak before it measures the quorum, so
+/// the denominator shrinks to the set that is actually voting and finality
+/// heals itself. `CommittedState::duty_roster_at` never subtracted it — and
+/// the proposer draw (`schedule::proposer` → `sample`, weighted by
+/// `effective_stake`) and the committee partition (`committees::
+/// epoch_committees`, which admits every validator with `effective_stake > 0`)
+/// both read *that* roster. A validator the finality layer had already written
+/// off kept winning proposer draws and kept holding committee seats.
+///
+/// The asymmetry is the whole bug: **finality recovers on its own and block
+/// production never does.** Nothing feeds the leak back into the schedule, so
+/// a slot drawn for an absent validator stays empty for as long as the chain
+/// runs.
+///
+/// Measured on Genesis-4 mainnet, 2026-08-21: seven live validators held
+/// 6.19% of unleaked stake; blocks arrived every 19.2 slots against the 16.2
+/// that `1 / 0.0619` predicts — ~94% of slots drawn for validators that
+/// counted for nothing and produced nothing. `SLOT_DURATION_SECS` is 30, so
+/// the chain ran at roughly ten minutes a block while finalising every epoch.
+///
+/// # Choosing the epoch
+///
+/// Proposer selection and committee membership both change the moment this
+/// binds, so a node still on the old value computes a different schedule and
+/// forks. Set it far enough ahead that every validator is rebuilt first, and
+/// treat "the fleet is on the new binary" as a precondition, not a hope.
+pub const LEAKED_ROSTER_ACTIVATION_EPOCH: u64 = u64::MAX;
+
 /// Domain separation tags (§6.1). Fixed 16 bytes, right-padded with zeros, so
 /// no tag can be a prefix of another.
 pub const DS_SORTITION: [u8; 16] = *b"BLCH4:SORTIT\0\0\0\0";
