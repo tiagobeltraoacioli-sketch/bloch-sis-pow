@@ -571,7 +571,10 @@ fn cliffs_are_staggered_to_avoid_a_cliff_wall() {
     let m = tk::MONTH_SLOTS;
     assert_eq!(tk::VC_CLIFF_SLOTS / m, 12);
     assert_eq!(tk::TEAM_CLIFF_SLOTS / m, 18);
-    assert_eq!(tk::FOUNDER_CLIFF_SLOTS / m, 120); // 10 anos
+    // 24 meses desde a decisao do founder de 2026-08-21 (era 120, dez anos).
+    // O comentario acima ja dizia 24: era do rascunho que a decisao de 11/08
+    // tinha revertido, e ficou dessincronizado do valor fixado aqui.
+    assert_eq!(tk::FOUNDER_CLIFF_SLOTS / m, 24);
     let mut cliffs = [tk::VC_CLIFF_SLOTS, tk::TEAM_CLIFF_SLOTS, tk::FOUNDER_CLIFF_SLOTS];
     cliffs.sort();
     assert!(cliffs.windows(2).all(|w| w[1] - w[0] >= 6 * m), "cliffs a menos de 6 meses");

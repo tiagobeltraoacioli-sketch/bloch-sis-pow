@@ -261,17 +261,28 @@ pub const EMISSION_YEARS: u64 = 40;
 /// 42,076,800 slots.
 pub const EMISSION_SLOTS: u64 = EMISSION_YEARS * SLOTS_PER_YEAR;
 
-// ── Founder vesting: 10-year cliff, then 40-year linear ─────────────────────
+// ── Founder vesting: 2-year cliff, then 8-year linear ───────────────────────
 
-/// Ten-year cliff, forty-year linear vest — the V2 premine schedule, restored
-/// by founder decision on 2026-08-11 (a draft had shortened it to 24 months
-/// plus 10 years).
+/// Two-year cliff, eight-year linear vest — fully vested at year 10.
 ///
-/// It is far beyond any market benchmark, and deliberately so: the carried-over
-/// balance arrives liquid at genesis, so this grant is the part of the founder's
-/// position that can still be made to wait. Fully vested at year 50.
-pub const FOUNDER_CLIFF_SLOTS: u64 = 10 * SLOTS_PER_YEAR;
-pub const FOUNDER_VESTING_SLOTS: u64 = 40 * SLOTS_PER_YEAR;
+/// **Founder decision, 2026-08-21.** This supersedes the ten-year cliff and
+/// forty-year vest that had been restored on 2026-08-11 (which had itself
+/// reversed a draft shortening). The earlier schedule's stated reasoning was
+/// that it sat "far beyond any market benchmark, and deliberately so"; that
+/// reasoning is retired with it rather than left standing next to numbers it no
+/// longer describes.
+///
+/// What did NOT change, and is the more important half of the picture: the
+/// carried-over balance arrives **liquid at genesis** and is not governed by
+/// this schedule. `FOUNDER_TOTAL_BLOCH` is that carryover plus this grant, and
+/// only the grant waits. Reading these two constants as "the founder's position
+/// is locked for ten years" would be wrong in both directions — the grant is,
+/// the carryover never was.
+///
+/// Ten years still sits at the long end of market practice, where three to four
+/// is typical.
+pub const FOUNDER_CLIFF_SLOTS: u64 = 2 * SLOTS_PER_YEAR;
+pub const FOUNDER_VESTING_SLOTS: u64 = 8 * SLOTS_PER_YEAR;
 pub const FOUNDER_VESTING_END_SLOT: u64 = FOUNDER_CLIFF_SLOTS + FOUNDER_VESTING_SLOTS;
 
 /// Founder satoshis unlocked by `slot`.
