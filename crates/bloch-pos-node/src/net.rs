@@ -472,7 +472,6 @@ pub fn start(
                 sync_slots.fetch_sub(1, Ordering::AcqRel);
                 continue;
             }
-            let mut last_asked_at = head_slot.load(Ordering::Relaxed);
             let drop_slot = |held: &mut bool| {
                 if *held {
                     sync_slots.fetch_sub(1, Ordering::AcqRel);
@@ -489,22 +488,42 @@ pub fn start(
                         }
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {
-                        // The idle tick doubles as the sync pump: while this
-                        // dialer holds a slot, re-ask from wherever the engine
-                        // has got to. Each answer is one page, so this walks
-                        // the chain forward instead of demanding it at once.
-                        // When the head stops moving the peer answers an empty
-                        // page and the slot is released for someone else.
+                        // The idle tick is the sync pump: while this dialer
+                        // holds a slot, re-ask from wherever the engine has got
+                        // to. Each answer is one page, so this walks the chain
+                        // forward instead of demanding it at once, and a node
+                        // that falls behind later notices on the next tick.
+                        //
+                        // It asks on EVERY tick, not only when the head moved.
+                        // The first version released the slot the moment a tick
+                        // found the head unchanged, on the theory that an
+                        // unchanged head meant "caught up". Two things made
+                        // that wrong, and the canary showed both:
+                        //
+                        //   - Nothing re-acquired the slot. `held` went false
+                        //     and no path set it back inside the connection
+                        //     loop, so a stable TCP connection meant the node
+                        //     never asked again — it could only fall further
+                        //     behind, silently, forever.
+                        //   - Five seconds is shorter than the work. Applying
+                        //     one block costs ~0.9s of state root at this
+                        //     state size, so a 512-block page takes minutes.
+                        //     The head is *supposed* to look unchanged on the
+                        //     next tick. The release fired on the first tick
+                        //     essentially always, which turned the sync pump
+                        //     off after a single request.
+                        //
+                        // Asking unconditionally costs a request every five
+                        // seconds from at most SYNC_FANOUT peers, and an
+                        // already-caught-up node gets an empty page back. That
+                        // is the cheap end of the trade; the other end was a
+                        // validator attesting to a head it could no longer
+                        // advance, which is what this was measured doing.
                         if held {
                             let at = head_slot.load(Ordering::Relaxed);
-                            if at == last_asked_at {
+                            if write_frame(&mut wsock, &get_blocks_frame(at)).is_err() {
                                 drop_slot(&mut held);
-                            } else {
-                                last_asked_at = at;
-                                if write_frame(&mut wsock, &get_blocks_frame(at)).is_err() {
-                                    drop_slot(&mut held);
-                                    break;
-                                }
+                                break;
                             }
                         }
                     }
