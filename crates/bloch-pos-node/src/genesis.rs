@@ -1878,4 +1878,82 @@ mod blp02_hybrid_suite {
             Err(e) => panic!("the live Genesis-4 manifest must decode, got: {}", e.0),
         }
     }
+
+    /// The evidence behind the funded-staking flag day
+    /// (`params::FUNDED_STAKE_ACTIVATION_EPOCH`), pinned against the
+    /// published artefact so it cannot drift into folklore (measured
+    /// 2026-08-21, byte-level decode of `genesis/mainnet.manifest`).
+    ///
+    /// What it establishes, and why each half matters:
+    ///
+    /// 1. **The genesis bond principal is supply outside the issued
+    ///    accounting.** `genesis_issued_sat()` sums carryover plus
+    ///    allocations ONLY; the 64 × 25,000 BLOCH the manifest bonds — and
+    ///    that `CommittedState::genesis` writes into the registry — appear in
+    ///    no bucket and in no eUTXO output. A withdrawal path that pays those
+    ///    bonds out would therefore turn 1,600,000 BLOCH that were never
+    ///    issued into spendable coins, which is why the flag day waits on the
+    ///    founder's decision (see the constant's docs) instead of shipping a
+    ///    default.
+    /// 2. **Every genesis bond withdraws to one address** — the founder's
+    ///    carried H160, zero-padded to the carried-credential form. The
+    ///    economic decision is therefore a decision about one party's coins,
+    ///    not a negotiation across 64 operators.
+    /// 3. **Every allocation is liquid at genesis** (`unlock_epoch == 0`),
+    ///    which the vesting-lock front relies on: re-backing the bonds from
+    ///    founder funds (option 2) is only possible while those coins are
+    ///    spendable.
+    ///
+    /// If any assertion here starts failing, the manifest on disk is not the
+    /// chain this analysis was made against — stop and re-derive before
+    /// touching the flag day.
+    #[test]
+    fn the_genesis_bond_principal_is_outside_the_issued_supply() {
+        use bloch_pos_committee::tokenomics_v4 as t;
+
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../genesis/mainnet.manifest");
+        let Ok(bytes) = std::fs::read(path) else { return };
+        let m = Manifest::decode(&bytes).expect("the live manifest decodes");
+
+        // (1) The bonded pool: 64 registrations of exactly 25,000 BLOCH.
+        assert_eq!(m.validators.len(), 64);
+        let bonded: u128 = m.validators.iter().map(|v| v.stake_sat).sum();
+        for v in &m.validators {
+            assert_eq!(v.stake_sat, 25_000 * t::SAT_PER_BLOCH, "one launch bond size");
+        }
+        assert_eq!(bonded, 1_600_000 * t::SAT_PER_BLOCH, "1.6M BLOCH of principal");
+
+        // The issued pool: carryover + allocations land on GENESIS_ISSUED_SAT
+        // to the satoshi — which proves the bonded pool above is counted in
+        // NEITHER term, because adding it would overshoot by exactly `bonded`.
+        // (`check_supply` enforces the equality; this restates it next to the
+        // number it excludes.)
+        assert_eq!(m.genesis_issued_sat(), t::GENESIS_ISSUED_SAT);
+        m.check_supply().expect("the live manifest adds up");
+        assert!(bonded > 0, "control: the excluded pool is not vacuously empty");
+
+        // (2) One withdrawal credential across all 64: the founder's carried
+        // H160 (20 bytes), zero-padded — the carried-credential form
+        // `owner_opens` accepts.
+        let founder: [u8; 20] = [
+            0xe9, 0x86, 0xdb, 0x51, 0x49, 0xcf, 0xf7, 0x49, 0x9b, 0x28, 0x2a, 0x04, 0x82, 0x72,
+            0xa0, 0x9a, 0xff, 0x0a, 0xf4, 0xff,
+        ];
+        for v in &m.validators {
+            assert_eq!(v.withdrawal_credentials.len(), 32);
+            assert_eq!(v.withdrawal_credentials[..20], founder, "credential is the founder H160");
+            assert!(
+                v.withdrawal_credentials[20..].iter().all(|&b| b == 0),
+                "carried form: 12 zero bytes of padding"
+            );
+        }
+
+        // (3) All five allocation buckets are liquid at genesis, and they pay
+        // the same address the bonds withdraw to.
+        assert_eq!(m.allocations.len(), 5);
+        for a in &m.allocations {
+            assert_eq!(a.unlock_epoch, 0, "the live manifest vests nothing at the genesis layer");
+            assert_eq!(a.script_hash[..20], founder);
+        }
+    }
 }
