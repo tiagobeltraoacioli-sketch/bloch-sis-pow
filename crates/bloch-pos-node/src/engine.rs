@@ -1508,6 +1508,11 @@ pub fn run(cfg: Config) -> io::Result<()> {
 
     let logged = store.read_all()?;
     let head_slot = Arc::new(AtomicU64::new(0));
+    // Network events queued but not yet handled. The transport reads it to
+    // decide when to shed rather than queue — see `net::send_to_engine`. It is
+    // decremented below, after each event is actually processed, so "in flight"
+    // means exactly that and not "ever sent".
+    let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let (tx, rx) = mpsc::channel::<EngineEvent>();
     // The transports speak NetEvent and know nothing about the RPC; the engine
     // consumes one channel. Rather than teach both transports the engine's
@@ -1533,6 +1538,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
             tx.clone(),
             cfg.data_dir.clone(),
             head_slot.clone(),
+            inflight.clone(),
         )?),
         Transport::Libp2p => {
             let parse = |s: &str, what: &str| -> io::Result<crate::p2p::Multiaddr> {
@@ -1841,6 +1847,13 @@ pub fn run(cfg: Config) -> io::Result<()> {
                     pending.push(more);
                 }
                 for ev in pending {
+                    // Every `EngineEvent::Net` was counted into `inflight` by
+                    // the transport; releasing it here — after handling, not on
+                    // dequeue — is what makes the cap mean "work the engine has
+                    // not done yet".
+                    if matches!(ev, EngineEvent::Net(_)) {
+                        inflight.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                    }
                     match ev {
                         EngineEvent::Net(NetEvent::Block(env)) => engine.ingest(env),
                         EngineEvent::Net(NetEvent::Attestation(att, origin)) => {

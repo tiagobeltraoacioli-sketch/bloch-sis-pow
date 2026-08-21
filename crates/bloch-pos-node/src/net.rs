@@ -110,6 +110,43 @@ impl Net {
 /// this node's memory problem. A dropped frame is recoverable — the peer asks
 /// for what it missed with `FRAME_GET_BLOCKS` — so dropping is the safe end of
 /// this trade.
+/// How many peers may be answering our history request at the same time.
+///
+/// **Why this is not "all of them".** Every outbound dialer used to send
+/// `FRAME_GET_BLOCKS` the moment it connected, and `serve_get_blocks` answered
+/// UNCAPPED — the whole chain, in one burst, per peer. With a stale peer list
+/// where most entries were dead that went unnoticed for months. On 2026-08-21
+/// the list was corrected to 60 reachable peers and every one of them answered
+/// at once: 60 x 145 MB of block frames into a node that was still replaying
+/// and could not drain them. Twenty-two validators were OOM-killed at
+/// 7.9 GB on 8 GB machines, 55 seconds after boot, and Fly stopped them after
+/// ten restarts each.
+///
+/// Two peers is enough to make progress and to survive one of them being slow
+/// or lying; the rest stay connected and still deliver broadcasts, they just do
+/// not each dump a copy of history.
+const SYNC_FANOUT: usize = 2;
+
+/// Blocks in one `FRAME_GET_BLOCKS` answer.
+///
+/// The production transport already pages (`p2p::MAX_SYNC_BLOCKS`); this one
+/// answered `usize::MAX` under a comment calling that deliberate, because "a
+/// restarting node's single request must be answered in full or it never
+/// catches up". That reasoning holds only while nobody re-asks. The requester
+/// now re-asks from its new head while it holds a sync slot, so a bounded page
+/// costs a few more round trips and removes the burst that was taking nodes
+/// down.
+const SYNC_PAGE_BLOCKS: usize = 512;
+
+/// Network events queued for the engine before the transport starts shedding.
+///
+/// The engine consumes one channel on one thread, and during replay it does not
+/// consume at all — replay is hours at Genesis-4's state size. An unbounded
+/// queue in front of a consumer that is asleep is just a slower way to run out
+/// of memory. Blocks and attestations are both recoverable (asked for again,
+/// gossiped again), so shedding beats dying.
+const ENGINE_QUEUE_CAP: usize = 4096;
+
 const INBOUND_QUEUE_DEPTH: usize = 256;
 
 /// The devnet TCP mesh: one queue per peer we dialed, plus one per peer that
@@ -154,6 +191,35 @@ impl DevnetMesh {
             inbound.retain(|p| !matches!(p.try_send(frame.clone()), Err(TrySendError::Disconnected(_))));
         }
     }
+}
+
+/// Hand one network event to the engine, or drop it if the engine is behind.
+///
+/// The engine consumes on a single thread, and during replay it does not
+/// consume at all — hours, at Genesis-4's state size. An unbounded queue in
+/// front of a sleeping consumer is a slower way to run out of memory, which is
+/// exactly how twenty-two validators died on 2026-08-21.
+///
+/// Shedding is safe here in a way it would not be for a request/response
+/// protocol: a dropped block is asked for again by the sync pump, and a dropped
+/// attestation is re-gossiped by its author's next broadcast. Losing one costs
+/// a round trip. Keeping all of them costs the process.
+///
+/// Returns false when the engine is gone, so callers can stop their thread.
+fn send_to_engine(
+    events: &Sender<EngineEvent>,
+    inflight: &Arc<std::sync::atomic::AtomicUsize>,
+    ev: NetEvent,
+) -> bool {
+    if inflight.load(Ordering::Acquire) >= ENGINE_QUEUE_CAP {
+        return true; // shed, but the connection stays healthy
+    }
+    inflight.fetch_add(1, Ordering::AcqRel);
+    if events.send(EngineEvent::Net(ev)).is_err() {
+        inflight.fetch_sub(1, Ordering::AcqRel);
+        return false;
+    }
+    true
 }
 
 pub fn block_frame(env: &BlockEnvelope) -> Vec<u8> {
@@ -249,12 +315,14 @@ fn serve_get_blocks(sock: &Arc<Mutex<TcpStream>>, data_dir: &PathBuf, frame: &[u
         return;
     }
     let after = u64::from_le_bytes(frame[1..9].try_into().unwrap());
-    // Uncapped on this transport, deliberately: the devnet mesh has no
-    // pagination, so a restarting node's single request must be answered in
-    // full or it never catches up. That is one of the reasons this transport
-    // is not the production one — the production path pages
-    // (`p2p::MAX_SYNC_BLOCKS`) so no single answer can become a history dump.
-    match crate::store::Store::blocks_after(data_dir, after, usize::MAX) {
+    // Paged at `SYNC_PAGE_BLOCKS`. This used to answer `usize::MAX` — the whole
+    // chain in one burst — under a comment calling that deliberate, since "a
+    // restarting node's single request must be answered in full or it never
+    // catches up". That was true only while nobody re-asked. The dialer now
+    // re-asks from its new head for as long as it holds a sync slot, so the
+    // full history still arrives; it just no longer arrives as one allocation
+    // large enough to kill the receiver.
+    match crate::store::Store::blocks_after(data_dir, after, SYNC_PAGE_BLOCKS) {
         Ok(blocks) => {
             for b in blocks {
                 let mut f = Vec::with_capacity(1 + b.len());
@@ -288,6 +356,7 @@ pub fn start(
     events: Sender<EngineEvent>,
     data_dir: PathBuf,
     head_slot: Arc<AtomicU64>,
+    inflight: Arc<std::sync::atomic::AtomicUsize>,
 ) -> std::io::Result<DevnetMesh> {
     // Inbound: accept, then per-connection: read frames; data frames go to
     // the engine, get-blocks is answered in place from the log.
@@ -297,6 +366,7 @@ pub fn start(
         let events = events.clone();
         let data_dir = data_dir.clone();
         let inbound = inbound.clone();
+        let inflight = inflight.clone();
         thread::spawn(move || {
             for conn in listener.incoming() {
                 let Ok(sock) = conn else { continue };
@@ -328,6 +398,7 @@ pub fn start(
 
                 let events = events.clone();
                 let data_dir = data_dir.clone();
+                let inflight = inflight.clone();
                 let mut rsock = rsock;
                 thread::spawn(move || loop {
                     match read_frame(&mut rsock) {
@@ -335,7 +406,7 @@ pub fn start(
                             if frame.first() == Some(&FRAME_GET_BLOCKS) {
                                 serve_get_blocks(&wsock, &data_dir, &frame);
                             } else if let Some(ev) = decode_event(&frame) {
-                                if events.send(EngineEvent::Net(ev)).is_err() {
+                                if !send_to_engine(&events, &inflight, ev) {
                                     return;
                                 }
                             }
@@ -349,12 +420,19 @@ pub fn start(
 
     // Outbound: one dialer per peer with a frame queue; a reader thread on
     // the same socket receives the peer's sync responses.
+    //
+    // `sync_slots` is what keeps a corrected peer list from being a denial of
+    // service against ourselves: at most `SYNC_FANOUT` dialers may be asking
+    // for history at any moment, however many peers are configured.
+    let sync_slots = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut peers = Vec::new();
     for addr in peer_addrs {
         let (tx, rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = mpsc::channel();
         peers.push(tx);
         let events = events.clone();
         let head_slot = head_slot.clone();
+        let sync_slots = sync_slots.clone();
+        let inflight = inflight.clone();
         thread::spawn(move || loop {
             let Ok(sock) = TcpStream::connect(&addr) else {
                 thread::sleep(Duration::from_millis(300));
@@ -364,11 +442,12 @@ pub fn start(
             // Reader half: the peer answers our get-blocks on this socket.
             if let Ok(mut rsock) = wsock.try_clone() {
                 let events = events.clone();
+                let inflight = inflight.clone();
                 thread::spawn(move || loop {
                     match read_frame(&mut rsock) {
                         Ok(frame) => {
                             if let Some(ev) = decode_event(&frame) {
-                                if events.send(EngineEvent::Net(ev)).is_err() {
+                                if !send_to_engine(&events, &inflight, ev) {
                                     return;
                                 }
                             }
@@ -377,24 +456,62 @@ pub fn start(
                     }
                 });
             }
-            // Ask for everything we missed, then drain the broadcast queue.
-            if write_frame(&mut wsock, &get_blocks_frame(head_slot.load(Ordering::Relaxed)))
-                .is_err()
+            // Claim one of the `SYNC_FANOUT` sync slots before asking for
+            // history. A dialer that cannot claim one stays connected and keeps
+            // receiving broadcasts — it just does not add another concurrent
+            // copy of the chain to a node that may still be replaying.
+            let holds_slot = sync_slots
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                    (n < SYNC_FANOUT).then_some(n + 1)
+                })
+                .is_ok();
+            if holds_slot
+                && write_frame(&mut wsock, &get_blocks_frame(head_slot.load(Ordering::Relaxed)))
+                    .is_err()
             {
+                sync_slots.fetch_sub(1, Ordering::AcqRel);
                 continue;
             }
+            let mut last_asked_at = head_slot.load(Ordering::Relaxed);
+            let drop_slot = |held: &mut bool| {
+                if *held {
+                    sync_slots.fetch_sub(1, Ordering::AcqRel);
+                    *held = false;
+                }
+            };
+            let mut held = holds_slot;
             loop {
                 match rx.recv_timeout(Duration::from_secs(5)) {
                     Ok(frame) => {
                         if write_frame(&mut wsock, &frame).is_err() {
+                            drop_slot(&mut held);
                             break; // reconnect
                         }
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {
-                        // Keepalive-by-doing-nothing; TCP notices dead peers
-                        // on the next write.
+                        // The idle tick doubles as the sync pump: while this
+                        // dialer holds a slot, re-ask from wherever the engine
+                        // has got to. Each answer is one page, so this walks
+                        // the chain forward instead of demanding it at once.
+                        // When the head stops moving the peer answers an empty
+                        // page and the slot is released for someone else.
+                        if held {
+                            let at = head_slot.load(Ordering::Relaxed);
+                            if at == last_asked_at {
+                                drop_slot(&mut held);
+                            } else {
+                                last_asked_at = at;
+                                if write_frame(&mut wsock, &get_blocks_frame(at)).is_err() {
+                                    drop_slot(&mut held);
+                                    break;
+                                }
+                            }
+                        }
                     }
-                    Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        drop_slot(&mut held);
+                        return;
+                    }
                 }
             }
         });
