@@ -1221,6 +1221,20 @@ pub fn chain_info_json(
             ]),
         ),
         ("total_active_stake_sat", Json::sat(state.total_active_stake_sat())),
+        // The committed cumulative-issuance counter next to the constant it is
+        // checked against (`SupplyCapExceeded`, transition.rs). Exposed
+        // 2026-08-21 as a prerequisite of the funded-staking runbook
+        // (`params::FUNDED_STAKE_ACTIVATION_EPOCH`): its conservation phase
+        // verifies that a deposit-and-withdraw pair leaves issuance unchanged,
+        // which no client can verify while the counter never leaves the node.
+        // Reading both fields from one response also gives integrators the
+        // emission headroom (`cap - issued`) without a second constant to
+        // hard-code wrongly.
+        ("issued_supply_sat", Json::sat(state.issued_sat())),
+        (
+            "supply_cap_sat",
+            Json::sat(bloch_pos_committee::tokenomics_v4::TOTAL_SUPPLY_SAT),
+        ),
         ("base_fee_millisat_per_gas", Json::sat(state.base_fee_millisat_per_gas())),
         ("next_base_fee_millisat_per_gas", Json::sat(state.next_base_fee())),
         ("mempool", Json::u(mempool as u64)),

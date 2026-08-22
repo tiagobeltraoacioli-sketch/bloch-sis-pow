@@ -168,6 +168,74 @@ pub const TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH: u64 = 800;
 /// from the block's own header slot — never node-local state, which is what
 /// the 2026-08-08 `expected_bits` fork cost us.
 pub const BLOCK_BYTES_V2_ACTIVATION_EPOCH: u64 = 800;
+/// Flag-day epoch at which staking becomes **funded from the eUTXO set**:
+/// deposits spend real outputs, exits are signed, and a withdrawal returns
+/// the bond as a spendable output.
+///
+/// `u64::MAX` means INERT: every node ships this constant and nothing reads
+/// it into a consensus rule until it is lowered and the fleet is rebuilt
+/// together — the same idiom as [`LEAKED_ROSTER_ACTIVATION_EPOCH`] directly
+/// above, and for the same reason: the change it gates alters what a block
+/// may carry, so a node on the old value forks at the gate, not before it.
+///
+/// # The defect this gate closes
+///
+/// The chain holds two pools of value that never touch. `PosTransaction::
+/// Deposit` and `Delegate` name an `amount_sat` and spend no output — Deposit
+/// does not even carry a signature — and `Exit` plus the withdrawal delay
+/// return no output, so bonded stake is created without destroying spendable
+/// coins and can never become spendable coins again (the `eutxos` field docs
+/// in `transition.rs` state the gap in full: "Bonding is not funded from this
+/// set"). What stands between the live chain and a free 25,000-BLOCH bond
+/// today is `admissible()` in `bloch-pos-node/src/engine.rs` — a MEMPOOL
+/// refusal, explicitly "a node-side refusal, not a consensus rule: a block
+/// that already carries a deposit still applies it". A proposer running
+/// modified software can mint stake from nothing and every unmodified node
+/// will accept the block. The validator set is currently protected by
+/// operator agreement; this flag day replaces that agreement with a rule.
+///
+/// # What binds at the gate
+///
+/// From the first epoch `>=` this constant:
+///
+/// - funded staking messages (deposit variants that consume eUTXO inputs
+///   under the transfer path's equality conservation, a signed exit, and a
+///   withdrawal that pays the registered credential) become consensus-valid;
+/// - the legacy unfunded `Deposit` / `Delegate` / `Exit` discriminants become
+///   consensus-INVALID in block bodies — and it is that refusal, not the
+///   mempool's, that closes the modified-proposer path;
+/// - the 64 genesis registrations are grandfathered where they stand: the
+///   state root is bit-identical across the gate slot itself, so nothing
+///   changes outside the gate (rule 2).
+///
+/// # Why the wire change is not shipped next to this constant yet
+///
+/// The mainnet manifest bonds 25,000 BLOCH for each of its 64 validators —
+/// 1,600,000 BLOCH of principal that `Manifest::genesis_issued_sat()`
+/// (`bloch-pos-node/src/genesis.rs`) never counted: genesis issuance is
+/// carryover plus allocations only, and `CommittedState::genesis` seeds the
+/// registry bonds with no eUTXO counterpart and no `issued_sat` contribution.
+/// All 64 withdrawal credentials are one address — the founder's carried
+/// H160, zero-padded to 32 bytes (pinned by test against the published
+/// manifest). Whether that principal is (1) recognised as retroactive
+/// emission (`issued_sat += 160e12` once, at the first boundary past the
+/// gate, shrinking future emission by 0.0037%), (2) re-backed by burning an
+/// equal amount of the founder's liquid coins, or (3) written off so a
+/// genesis withdrawal returns only the post-genesis accrual, is an economic
+/// decision that belongs to the founder. Shipping withdrawal code before that
+/// decision is made would hard-code one of the three by accident — so the
+/// gate is reserved here, inert, and the wire shapes follow the decision.
+/// (The post-genesis accrual itself is clean either way: epoch emission
+/// advances `issued_sat` when it credits a bond, and fee rewards are backed
+/// by coins the transfer path already destroyed.)
+///
+/// # Choosing the epoch
+///
+/// New discriminants change block-body decoding, so a node on the old binary
+/// rejects the first post-gate block as a decode error rather than a rule.
+/// Same precondition as the constant above: every validator rebuilt first,
+/// "the fleet is on the new binary" as a fact, not a hope.
+pub const FUNDED_STAKE_ACTIVATION_EPOCH: u64 = u64::MAX;
 
 /// Domain separation tags (§6.1). Fixed 16 bytes, right-padded with zeros, so
 /// no tag can be a prefix of another.

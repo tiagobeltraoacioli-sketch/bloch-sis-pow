@@ -2450,6 +2450,24 @@ impl CommittedState {
             .sum()
     }
 
+    /// The committed cumulative-issuance counter, in satoshis — the number the
+    /// hard cap is enforced against (`SupplyCapExceeded` reads this exact
+    /// field in `compute_post_state`).
+    ///
+    /// Read-only projection under the same contract as the block above: the
+    /// field stays private because only the transition may advance it, but a
+    /// supply cap nobody can observe over RPC is a promise rather than a
+    /// check. Added 2026-08-21 as a prerequisite of the funded-staking flag
+    /// day (`params::FUNDED_STAKE_ACTIVATION_EPOCH`): the post-activation
+    /// runbook has to verify that a deposit-and-withdraw pair leaves this
+    /// counter unchanged — bond moves are moves of existing coins, never
+    /// issuance — and that verification is impossible if the counter never
+    /// leaves the node. `TOTAL_SUPPLY_SAT - issued_sat()` is the emission
+    /// headroom the boundary clamp works from.
+    pub fn issued_sat(&self) -> u128 {
+        self.issued_sat
+    }
+
     /// The price the child block must charge: the EIP-1559 controller applied
     /// to this state's committed price and usage.
     ///
@@ -6282,6 +6300,23 @@ mod tests {
             crate::params::LEAKED_ROSTER_ACTIVATION_EPOCH,
             u64::MAX,
             "binding the leaked roster is a flag day: set the epoch and roll the fleet together"
+        );
+    }
+
+    /// Same tripwire for the funded-staking gate — with one more tooth: this
+    /// gate must not be armed by ANY rebuild until the founder's decision on
+    /// the 1,600,000 BLOCH of unissued genesis bond principal is recorded
+    /// (the constant's docs in `params.rs` state the three options). Arming
+    /// it without that decision would ship whichever withdrawal semantics the
+    /// implementer happened to write, and that choice moves real coins on a
+    /// live mainnet.
+    #[test]
+    fn funded_stake_gate_ships_inert() {
+        assert_eq!(
+            crate::params::FUNDED_STAKE_ACTIVATION_EPOCH,
+            u64::MAX,
+            "funding the bonds is a flag day AND an economic decision: record the founder's \
+             choice, set the epoch, and roll the fleet together"
         );
     }
 
