@@ -247,6 +247,63 @@ const TAG_UNBACKED_PRINCIPAL: u8 = 0x17;
 /// genesis principal left the books as write-off, never as coin.
 const TAG_WRITTEN_OFF: u8 = 0x18;
 
+/// The LOW-WATER MARK of each bond that a slash has ever reduced, in
+/// satoshis (2026-08-22) — `min` over the whole history of `staked_sat`
+/// immediately after every stake reduction.
+///
+/// # Why a second map, and why it starts at the REBUILD and not at the flag
+/// day
+///
+/// The write-off owed at withdrawal is `U(t) = min(P, min_{s<=t} staked(s))`
+/// — the principal, floored by the smallest the bond has ever been. The
+/// maintenance fold on [`TAG_UNBACKED_PRINCIPAL`] computes exactly that
+/// *from the moment the entry exists*. The entry is created at the
+/// funded-staking activation boundary, so without this map the entire
+/// prefix of the minimum — every slash that landed BEFORE the flag day —
+/// is discarded, and `min(P, staked_now)` silently replaces it.
+///
+/// That substitution is not conservative. Worked example, the one measured
+/// on 2026-08-22: `P = 25,000`, a pre-gate slash burns 5,000 (the bond is
+/// 20,000, and 20,000 is all that is truly unissued), later rewards add
+/// 10,000 (the bond is 30,000, of which 10,000 is emitted coin the operator
+/// earned). `min(25,000, 30,000) = 25,000` pays 5,000. The right answer is
+/// 10,000. The write-off would confiscate 5,000 of ALREADY-EMITTED coin —
+/// precisely the amount the pre-gate slash burned, taken a second time.
+///
+/// So the recorder must be running before the first slash it needs to
+/// remember, which means UNGATED: the gate arrives too late to record what
+/// the gate itself must read. That is safe to ship without a second flag
+/// day only because the map is empty on the live chain (no validator has
+/// ever been slashed — measured 64/64 on 2026-08-22), and an empty map
+/// contributes NO leaves, so the root is byte-identical to the ungated
+/// binary's on every state that exists today.
+///
+/// Canonical form, and note it differs from [`TAG_UNBACKED_PRINCIPAL`]:
+/// **a zero-valued entry is meaningful and IS committed.** Absent means
+/// "never slashed, no floor recorded"; present-and-zero means "slashed to
+/// nothing, floor is zero". Collapsing the two would turn a bond slashed to
+/// zero into a bond with no history — which is the indeterminate class
+/// below, and would hand it a payout instead of a refusal.
+const TAG_STAKE_LOW_WATER: u8 = 0x19;
+
+/// The set of validators whose write-off CANNOT BE COMPUTED (2026-08-22):
+/// slashed, but with no low-water entry — slashed by a binary that predates
+/// the recorder above.
+///
+/// There is no defensible default for these. `staked_sat` or `0` as the
+/// floor understates the write-off and releases phantom principal as
+/// spendable coin; the registered principal `P` overstates it and confiscates
+/// emitted coin (the 5,000 of the worked example). A withdrawal here is
+/// therefore REFUSED (`TxReject::StakingRule`), deterministically, before any
+/// mutation: a stuck bond is recoverable by a future rule, a wrong payout is
+/// recoverable by nothing.
+///
+/// The class is empty on every state that exists today and can only be
+/// created by a slash landing during the mixed-fleet rollout window, which is
+/// why the 64/64 scan is re-run at the END of the rollout and not only at
+/// design time.
+const TAG_UNBACKED_INDETERMINATE: u8 = 0x1A;
+
 
 fn sha3(parts: &[&[u8]]) -> [u8; 32] {
     let mut h = Sha3_256::new();
@@ -1094,6 +1151,46 @@ impl UnbackedPrincipalRecord {
     }
 }
 
+/// The low-water mark of one validator's bond ([`TAG_STAKE_LOW_WATER`]) —
+/// the smallest `staked_sat` has been since the recorder started. Unlike
+/// [`UnbackedPrincipalRecord`], a zero value is a real record and is
+/// committed; see the tag's docs for why absent and zero must not collapse.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StakeLowWaterRecord {
+    pub validator: u32,
+    pub low_water_sat: u128,
+}
+
+impl StakeLowWaterRecord {
+    fn entry_key(&self) -> Vec<u8> {
+        self.validator.to_le_bytes().to_vec()
+    }
+    fn serialize(&self) -> Vec<u8> {
+        let mut s = Vec::with_capacity(20);
+        s.extend_from_slice(&self.validator.to_le_bytes());
+        s.extend_from_slice(&self.low_water_sat.to_le_bytes());
+        s
+    }
+}
+
+/// One validator in the indeterminate-write-off class
+/// ([`TAG_UNBACKED_INDETERMINATE`]): slashed before the low-water recorder
+/// existed, so no arithmetic can decide what its withdrawal owes. Membership
+/// alone is the fact; there is no value to carry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IndeterminateRecord {
+    pub validator: u32,
+}
+
+impl IndeterminateRecord {
+    fn entry_key(&self) -> Vec<u8> {
+        self.validator.to_le_bytes().to_vec()
+    }
+    fn serialize(&self) -> Vec<u8> {
+        self.validator.to_le_bytes().to_vec()
+    }
+}
+
 /// The committed L1 fee-market state ([`TAG_BASE_FEE`]): the base fee this
 /// block's transactions were charged, in millisatoshi per gas
 /// (`fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS` at genesis), and the block's
@@ -1210,6 +1307,15 @@ pub struct ConsensusState<'a> {
     /// Its leaf is committed only once non-zero, for the same pre-gate
     /// byte-identity reason.
     pub written_off_sat: u128,
+    /// Per-validator bond low-water marks ([`TAG_STAKE_LOW_WATER`],
+    /// 2026-08-22). Written from the REBUILD, not from the flag day — the
+    /// tag's docs say why. Empty on every state that exists today, and an
+    /// empty component contributes no leaves.
+    pub stake_low_water: &'a [StakeLowWaterRecord],
+    /// Validators whose write-off is indeterminate
+    /// ([`TAG_UNBACKED_INDETERMINATE`], 2026-08-22): slashed with no
+    /// low-water history. Empty today; a withdrawal by a member is refused.
+    pub unbacked_indeterminate: &'a [IndeterminateRecord],
 }
 
 /// How many **closed** epoch boundaries the committed beacon history retains,
@@ -1423,6 +1529,28 @@ fn build_state_tree_inner(
         smt.insert(
             derive_key(TAG_WRITTEN_OFF, &[]),
             hash_value(&state.written_off_sat.to_le_bytes()),
+        );
+    }
+    // The write-off HISTORY pair (2026-08-22), ungated — committed from the
+    // rebuild, unlike the pair above which only fills at the flag day. Same
+    // compatibility rule, and it holds for the same reason: both components
+    // are empty on every state the live chain has ever produced (no slash has
+    // ever been applied, measured 64/64), an empty component inserts nothing,
+    // and a tree with no extra leaves has the ungated binary's root to the
+    // byte. What must NOT be copied from the pair above is the "skip when
+    // zero" conditional — a zero low-water mark is a fact about a bond
+    // slashed to nothing, and dropping its leaf would make it indistinguishable
+    // from a bond that was never slashed at all.
+    for w in state.stake_low_water {
+        smt.insert(
+            derive_key(TAG_STAKE_LOW_WATER, &w.entry_key()),
+            hash_value(&w.serialize()),
+        );
+    }
+    for u in state.unbacked_indeterminate {
+        smt.insert(
+            derive_key(TAG_UNBACKED_INDETERMINATE, &u.entry_key()),
+            hash_value(&u.serialize()),
         );
     }
     smt
@@ -1697,6 +1825,8 @@ mod tests {
         fee_rewards: Vec<DelegatorFeeRecord>,
         unbacked: Vec<UnbackedPrincipalRecord>,
         written_off_sat: u128,
+        low_water: Vec<StakeLowWaterRecord>,
+        indeterminate: Vec<IndeterminateRecord>,
     }
 
     fn fixture() -> Fx {
@@ -1854,6 +1984,18 @@ mod tests {
             fee_rewards,
             unbacked,
             written_off_sat: 777,
+            // Non-empty on purpose, and the ZERO entry is deliberate: it is
+            // the value the pair above would have dropped as "canonically
+            // absent", and the coverage sweep below removes it to prove this
+            // component does not.
+            low_water: vec![
+                StakeLowWaterRecord { validator: 1, low_water_sat: 1_900_000_000_000 },
+                StakeLowWaterRecord { validator: 77, low_water_sat: 0 },
+            ],
+            indeterminate: vec![
+                IndeterminateRecord { validator: 3 },
+                IndeterminateRecord { validator: 88 },
+            ],
         }
     }
 
@@ -2043,6 +2185,8 @@ mod tests {
             delegator_fee_rewards: &f.fee_rewards,
             unbacked_principals: &f.unbacked,
             written_off_sat: f.written_off_sat,
+            stake_low_water: &f.low_water,
+            unbacked_indeterminate: &f.indeterminate,
         }
     }
 
@@ -2069,6 +2213,8 @@ mod tests {
         g.delegations.reverse();
         g.pending_fees.reverse();
         g.fee_rewards.reverse();
+        g.low_water.reverse();
+        g.indeterminate.reverse();
         let root_b = state_root(&state(&g));
 
         assert_eq!(root_a, root_b);
@@ -2175,6 +2321,15 @@ mod tests {
         mutated!(|g: &mut Fx| g.unbacked[0].unbacked_sat += 1);
         mutated!(|g: &mut Fx| g.unbacked.pop().map(|_| ()).unwrap());
         mutated!(|g: &mut Fx| g.written_off_sat += 1);
+        mutated!(|g: &mut Fx| g.low_water[0].low_water_sat += 1);
+        mutated!(|g: &mut Fx| g.low_water[0].validator += 1);
+        // THE ZERO-VALUED ENTRY MUST MOVE THE ROOT. `unbacked_principals`
+        // treats zero as canonically absent; this component must not, or a
+        // bond slashed to nothing becomes indistinguishable from a bond never
+        // slashed — which is the difference between a refusal and a payout.
+        mutated!(|g: &mut Fx| { g.low_water.retain(|w| w.low_water_sat != 0); });
+        mutated!(|g: &mut Fx| g.indeterminate[0].validator += 1);
+        mutated!(|g: &mut Fx| { g.indeterminate.pop().map(|_| ()).unwrap(); });
         // Zero is the ABSENT encoding for the written-off leaf, on purpose
         // (pre-gate byte-identity) — so zero and any non-zero value must
         // commit different roots, which the mutation above already proves,

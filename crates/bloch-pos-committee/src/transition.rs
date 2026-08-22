@@ -1197,6 +1197,53 @@ pub struct CommittedState {
     /// Cumulative unissued principal written off at withdrawals, committed
     /// under `TAG_WRITTEN_OFF` once non-zero. Monotone; audit surface only.
     written_off_sat: u128,
+    /// THE LOW-WATER MARK of every bond a slash has ever reduced — committed
+    /// under `TAG_STAKE_LOW_WATER` (state_root.rs, 2026-08-22), and written
+    /// UNGATED, from the rebuild.
+    ///
+    /// The write-off owed at withdrawal is `U(t) = min(P, min_{s<=t}
+    /// staked(s))`. [`Self::unbacked_sat`]'s maintenance fold computes that
+    /// running minimum perfectly — but only from the moment the entry exists,
+    /// and the entry is not created until the flag day. Everything the
+    /// minimum did BEFORE the flag day is therefore lost, and
+    /// [`Self::materialize_unbacked_principal`] would substitute `min(P,
+    /// staked_now)` for it. That substitution is a CONFISCATION, not a
+    /// rounding: a bond whose principal was 25,000, that a pre-gate slash cut
+    /// to 20,000 and that later rewards rebuilt to 30,000, has 10,000
+    /// satoshis of genuinely emitted coin inside it — and `min(25,000,
+    /// 30,000)` classifies 25,000 as phantom and pays 5,000. The missing
+    /// 5,000 is exactly what the pre-gate slash already burned, taken twice.
+    ///
+    /// So the recorder cannot be gated: the gate needs to READ a history the
+    /// gate itself would be too late to WRITE. Shipping it ungated is safe
+    /// without a second flag day only because of a measurement, not because
+    /// of a comment — 64 of 64 live validators carry no applied slash
+    /// (2026-08-22), so this map is empty everywhere, and an empty map
+    /// contributes no leaves and cannot move a root.
+    ///
+    /// Canonical form differs from [`Self::unbacked_sat`] on purpose: **a
+    /// zero entry is real and is kept.** Absent means "never slashed";
+    /// present-and-zero means "slashed to nothing". A bond slashed to zero
+    /// that lost its entry would read as never-slashed and be paid out.
+    stake_low_water: BTreeMap<u32, u128>,
+    /// Validators whose write-off CANNOT BE COMPUTED — committed under
+    /// `TAG_UNBACKED_INDETERMINATE` (state_root.rs, 2026-08-22).
+    ///
+    /// Populated at the activation boundary with every validator that is
+    /// `slashed` yet has no [`Self::stake_low_water`] entry: it was slashed
+    /// by a binary older than the recorder above. Three defaults were
+    /// available and all three are wrong in one direction or the other —
+    /// `staked_sat` and `0` as the floor UNDERSTATE the write-off and release
+    /// never-emitted principal as spendable coin; the registered principal
+    /// `P` OVERSTATES it and confiscates emitted coin. There is no fourth.
+    ///
+    /// So [`Self::apply_withdraw`] refuses, deterministically, before any
+    /// mutation. A stuck bond can be released by a future rule; a wrong
+    /// payout can be released by nothing. The class is empty on every state
+    /// that exists today and can only be created inside the mixed-fleet
+    /// rollout window — which is why the 64/64 scan is re-run at the END of
+    /// the rollout, not only at design time.
+    unbacked_indeterminate: BTreeSet<u32>,
     /// The justification/finality fold (finality.rs). Kept whole so this
     /// state remains bit-identical to a from-scratch replay of the votes.
     finality_engine: finality::FinalityState,
@@ -1576,6 +1623,8 @@ impl CommittedState {
             genesis_principal_sat,
             unbacked_sat: BTreeMap::new(),
             written_off_sat: 0,
+            stake_low_water: BTreeMap::new(),
+            unbacked_indeterminate: BTreeSet::new(),
             finality_engine: finality::FinalityState::new(finality::Checkpoint {
                 epoch: 0,
                 root: *genesis_block.as_bytes(),
@@ -1902,6 +1951,20 @@ impl CommittedState {
         // (It genuinely WAS `&[]` once, under a comment saying the node
         // supplied it, and nothing did: every block from genesis committed an
         // empty balance component. Hence the emphasis.)
+        let stake_low_water: Vec<crate::state_root::StakeLowWaterRecord> = self
+            .stake_low_water
+            .iter()
+            .map(|(validator, low_water_sat)| crate::state_root::StakeLowWaterRecord {
+                validator: *validator,
+                low_water_sat: *low_water_sat,
+            })
+            .collect();
+        let unbacked_indeterminate: Vec<crate::state_root::IndeterminateRecord> = self
+            .unbacked_indeterminate
+            .iter()
+            .map(|validator| crate::state_root::IndeterminateRecord { validator: *validator })
+            .collect();
+
         crate::state_root::state_root_with_eutxo_leaves(&ConsensusState {
             eutxos: &[],
             validators: &validators,
@@ -1931,6 +1994,8 @@ impl CommittedState {
             issued_sat: self.issued_sat,
             unbacked_principals: &unbacked_principals,
             written_off_sat: self.written_off_sat,
+            stake_low_water: &stake_low_water,
+            unbacked_indeterminate: &unbacked_indeterminate,
         }, self.eutxos.leaves())
     }
 
@@ -1995,12 +2060,53 @@ impl CommittedState {
     /// `verifier` is threaded in because a transfer's authorisation is a
     /// signature check, and the only thing that may decide whether an output
     /// moves is whether its owner said so.
+    /// Test-only convenience: [`Self::apply_transaction_gated`] at the real
+    /// flag day. `#[cfg(test)]` because after the boundary was threaded
+    /// through `compute_post_state_gated` this became the SECOND production
+    /// reader of `params::FUNDED_STAKE_ACTIVATION_EPOCH`, and two readers of
+    /// a flag day is one too many — keeping it compiled into the node would
+    /// leave a path where the frontier could drift out of step with the
+    /// block path's. The remaining production readers are
+    /// `compute_post_state` and `close_epoch`, one per layer.
+    #[cfg(test)]
     fn apply_transaction(
         &mut self,
         tx: &PosTransaction,
         total_active_sat: u128,
         base_fee_millisat_per_gas: u128,
         verifier: &dyn SignatureVerifier,
+    ) -> Result<fee_market::TxCharge, TxReject> {
+        self.apply_transaction_gated(
+            tx,
+            total_active_sat,
+            base_fee_millisat_per_gas,
+            verifier,
+            crate::params::FUNDED_STAKE_ACTIVATION_EPOCH,
+        )
+    }
+
+    /// [`Self::apply_transaction`] with the funded-staking flag day passed in
+    /// — the same parameterization `close_epoch_gated` already carries, and
+    /// for the same reason: the constant is `u64::MAX` until the founder arms
+    /// it, so the ONLY way to execute the post-flag-day rules through the
+    /// real block path is to hand the boundary in.
+    ///
+    /// This is a testing seam, not a policy knob. In production the boundary
+    /// arrives from `compute_post_state`, the single caller that reads
+    /// `params::FUNDED_STAKE_ACTIVATION_EPOCH` on this layer, and
+    /// the gate is still compared against `self.epoch` — COMMITTED state,
+    /// rolled to the block's epoch by `compute_post_state`'s boundary walk —
+    /// never a machine clock, never anything node-local. That is the standing
+    /// 2026-08-08 discipline and parameterizing the boundary does not bend
+    /// it: a `gate` argument makes the frontier reachable from a test, it
+    /// does not make the frontier node-local.
+    fn apply_transaction_gated(
+        &mut self,
+        tx: &PosTransaction,
+        total_active_sat: u128,
+        base_fee_millisat_per_gas: u128,
+        verifier: &dyn SignatureVerifier,
+        funded_stake_activation_epoch: u64,
     ) -> Result<fee_market::TxCharge, TxReject> {
         let free = fee_market::TxCharge {
             gas: 0,
@@ -2042,7 +2148,7 @@ impl CommittedState {
                 // Gate read from `self.epoch`: committed state already rolled
                 // to the block's own epoch by `compute_post_state`'s boundary
                 // walk, never anything node-local (the 2026-08-08 rule).
-                if self.epoch >= crate::params::FUNDED_STAKE_ACTIVATION_EPOCH {
+                if self.epoch >= funded_stake_activation_epoch {
                     return Err(TxReject::StakingRule);
                 }
                 let pubkey_hash: [u8; 32] = Sha3_256::digest(pubkey).into();
@@ -2094,7 +2200,7 @@ impl CommittedState {
                 // Retired at the flag day in favour of the SIGNED ExitV2: an
                 // exit anyone can submit for any validator is an irreversible
                 // griefing lever. Same gate discipline as the Deposit arm.
-                if self.epoch >= crate::params::FUNDED_STAKE_ACTIVATION_EPOCH {
+                if self.epoch >= funded_stake_activation_epoch {
                     return Err(TxReject::StakingRule);
                 }
                 let Some(rec) = self.validators.get_mut(validator) else {
@@ -2122,7 +2228,7 @@ impl CommittedState {
                 // amount and destroys no coin — the same phantom the
                 // write-off exists to contain. A funded delegation format is
                 // future work; until it exists, no new delegations.
-                if self.epoch >= crate::params::FUNDED_STAKE_ACTIVATION_EPOCH {
+                if self.epoch >= funded_stake_activation_epoch {
                     return Err(TxReject::StakingRule);
                 }
                 let Some(rec) = self.validators.get(validator) else {
@@ -2158,19 +2264,19 @@ impl CommittedState {
             // the constant is still `u64::MAX` (the `apply_transfer_v2`
             // testing pattern).
             PosTransaction::DepositFunded { .. } => {
-                if self.epoch < crate::params::FUNDED_STAKE_ACTIVATION_EPOCH {
+                if self.epoch < funded_stake_activation_epoch {
                     return Err(TxReject::StakingRule);
                 }
                 self.apply_deposit_funded(tx, total_active_sat, verifier).map(|()| free)
             }
             PosTransaction::ExitV2 { pubkey_hash, epoch, signature } => {
-                if self.epoch < crate::params::FUNDED_STAKE_ACTIVATION_EPOCH {
+                if self.epoch < funded_stake_activation_epoch {
                     return Err(TxReject::StakingRule);
                 }
                 self.apply_exit_v2(pubkey_hash, *epoch, signature, verifier).map(|()| free)
             }
             PosTransaction::Withdraw { validator } => {
-                if self.epoch < crate::params::FUNDED_STAKE_ACTIVATION_EPOCH {
+                if self.epoch < funded_stake_activation_epoch {
                     return Err(TxReject::StakingRule);
                 }
                 self.apply_withdraw(*validator).map(|()| free)
@@ -2648,6 +2754,34 @@ impl CommittedState {
         if let Some(rec) = self.validators.get_mut(&offender) {
             rec.slashed = true;
             rec.staked_sat = rec.staked_sat.saturating_sub(outcome.delegation_losses_sat[0]);
+            // THE LOW-WATER RECORDER (2026-08-22), UNGATED — the only site
+            // that writes `stake_low_water`, sitting on the only site that
+            // reduces `staked_sat`. `min` over the bond's whole history:
+            // rewards raise `staked_sat` and must NOT raise this, or the
+            // write-off would re-classify earned coin as phantom (the field
+            // docs work the number).
+            //
+            // Zero is stored, never elided: absent means "never slashed", and
+            // a bond slashed to nothing must not be able to impersonate one.
+            //
+            // HONEST SCOPE OF THE `min` INSIDE [`Self::fold_low_water`]:
+            // `slashing::process` ejects a validator on its first offence and
+            // refuses every later evidence against it (`EvidenceError::
+            // AlreadySlashed`), and this is the only site that reduces
+            // `staked_sat`. So on today's rules the fold runs AT MOST ONCE
+            // per validator, and `min` is indistinguishable from a plain
+            // assignment by any reachable sequence of blocks — a mutation to
+            // assignment survives the whole consensus suite, and saying it
+            // does is worth more than a test that pretends otherwise. The
+            // `min` is there for the second stake-reduction site that does
+            // not exist yet (partial slashing, a leak that bites principal),
+            // and it is pinned where it CAN be pinned: `fold_low_water` is a
+            // pure function with its own unit test that feeds it a second
+            // reduction directly.
+            let staked_after = rec.staked_sat;
+            let folded =
+                Self::fold_low_water(self.stake_low_water.get(&offender).copied(), staked_after);
+            self.stake_low_water.insert(offender, folded);
             // THE MAINTENANCE FOLD of the write-off rule (2026-08-22): after
             // every reduction of `staked_sat`, `unbacked = min(unbacked,
             // staked_sat)`. Direction is the decision: the penalty consumes
@@ -2947,6 +3081,36 @@ impl CommittedState {
     /// `issued_sat` is untouched by the whole operation, in both classes;
     /// the conservation tests pin that, cycle by cycle.
     ///
+    /// # What the supply cap does NOT protect here — say it out loud
+    ///
+    /// `issued_sat <= TOTAL_SUPPLY_SAT` (compute_post_state, step 3c) is a
+    /// ONE-SIDED invariant, and every bug this front exists to close
+    /// satisfies it:
+    ///
+    /// - It cannot see coin that exists without the counter ever advancing.
+    ///   The genesis opening ledger and the never-emitted bond principal are
+    ///   both in that class, so "the withdrawal did not move `issued_sat`" is
+    ///   not evidence that the withdrawal created nothing. Indeed NO staking
+    ///   path writes `issued_sat` at all outside the reward boundary, which
+    ///   makes "a deposit-and-withdraw cycle leaves `issued_sat` unchanged" a
+    ///   VACUOUS assertion — true against the fixed code and true against
+    ///   every broken version of it. The non-vacuous statement is two-sided
+    ///   value conservation, `total_unspent + sum(staked) - sum(unbacked) +
+    ///   written_off`, and that is what the conservation test asserts.
+    /// - It cannot see a write-off that is too LARGE. Confiscating emitted
+    ///   coin only widens the headroom under the cap. The cap is structurally
+    ///   incapable of catching the direction this front's `stake_low_water`
+    ///   term fixes.
+    /// - It cannot see the phantom whistleblower reward, because
+    ///   `pending_fee_rewards` MOVES existing coins in the model rather than
+    ///   emitting new ones — the counter stays put while the reward becomes
+    ///   spendable.
+    ///
+    /// The per-validator 1% cap (`Registry::cap_sat`) is equally one-sided
+    /// and equally blind here: it lowers CONSENSUS WEIGHT, and it constrains
+    /// neither the notional a phantom record may declare nor a single satoshi
+    /// leaving a bond as payout.
+    ///
     /// Permissionless (see the variant docs): the payout lands on the
     /// credential committed at registration, whoever cranks it. A payout of
     /// zero (fully-slashed bond, or pure write-off) is still a valid
@@ -2956,6 +3120,21 @@ impl CommittedState {
         let Some(rec) = self.validators.get(&validator) else {
             return Err(TxReject::StakingRule);
         };
+        // THE INDETERMINATE CLASS (2026-08-22), first and before every other
+        // rule so no branch below can reach a mutation on this bond. A
+        // validator lands here only by having been slashed before the
+        // low-water recorder existed, which makes `min(P, min staked)`
+        // uncomputable. Every available default errs: the current stake or 0
+        // as the floor releases never-emitted principal as spendable coin, the
+        // registered principal confiscates emitted coin. Refusing is the only
+        // choice that is wrong in neither direction, and it is REVERSIBLE —
+        // a stuck bond can be released by a rule written later, with the
+        // history in hand; a payout cannot be unpaid. Deterministic and
+        // replay-safe: membership is committed state, so every node refuses
+        // the same withdrawal forever.
+        if self.unbacked_indeterminate.contains(&validator) {
+            return Err(TxReject::StakingRule);
+        }
         // Withdrawable means the weak-subjectivity margin has passed —
         // `withdrawable_epoch` was set by an exit or a slash; `u64::MAX`
         // (never exited) fails this check for any real epoch.
@@ -3019,6 +3198,50 @@ impl CommittedState {
             self.written_off_sat += unbacked_entry;
         }
         Ok(())
+    }
+
+    /// The low-water fold: the smallest a bond has ever been, given whatever
+    /// floor was already recorded and the stake left after the reduction that
+    /// is happening now. `None` — no floor yet — means this reduction IS the
+    /// history, so the post-reduction stake is the floor.
+    ///
+    /// Pure, and separate from its call site, because the `min` cannot be
+    /// exercised from a block today: a validator is ejected on its first
+    /// offence and no second slash is admissible, so the recorder runs once
+    /// per validator and `min` collapses to assignment on every reachable
+    /// path. Feeding a second reduction to this function directly is the only
+    /// way to make that branch fail when it is broken, and its unit test does
+    /// exactly that.
+    fn fold_low_water(existing: Option<u128>, staked_after: u128) -> u128 {
+        match existing {
+            Some(floor) => floor.min(staked_after),
+            None => staked_after,
+        }
+    }
+
+    /// The recorded low-water mark of one bond, in satoshis, or `None` if no
+    /// slash has ever reduced it. `Some(0)` and `None` are DIFFERENT facts:
+    /// the first is a bond slashed to nothing, the second a bond never
+    /// slashed — see the field docs.
+    pub fn stake_low_water_sat(&self, validator: u32) -> Option<u128> {
+        self.stake_low_water.get(&validator).copied()
+    }
+
+    /// Whether this validator's write-off is indeterminate — slashed before
+    /// the low-water recorder existed, so a withdrawal is refused rather than
+    /// guessed. False for every validator on the live chain.
+    pub fn is_write_off_indeterminate(&self, validator: u32) -> bool {
+        self.unbacked_indeterminate.contains(&validator)
+    }
+
+    /// How many bonds are in the indeterminate class — the number an operator
+    /// needs on the RPC, because the alternative is a withdrawal that refuses
+    /// forever with no visible reason. Expected to be `0` for the entire life
+    /// of this chain; anything else means a slash landed on a node still
+    /// running a pre-recorder binary during the rollout, and the founder owes
+    /// a release rule (params.rs says so).
+    pub fn write_off_indeterminate_count(&self) -> usize {
+        self.unbacked_indeterminate.len()
     }
 
     /// Total slashing loss committed against one delegator account, in
@@ -3463,9 +3686,17 @@ impl CommittedState {
     ///   them (engine.rs `admissible` says so in as many words), so keying
     ///   the write-off on the genesis cohort alone would leave any such
     ///   phantom principal withdrawable;
-    /// - the entry is `min(principal, staked_sat)`: a bond already slashed
-    ///   below its principal has already burned the difference, and an
-    ///   entry above the bond could never be paid around anyway.
+    /// - the entry is `min(principal, LOW WATER)`, where the low water is the
+    ///   smallest the bond has ever been (`stake_low_water`, recorded ungated
+    ///   from the rebuild) and falls back to `staked_sat` for a bond no slash
+    ///   has ever touched — for which the two are identical, so every
+    ///   validator on the live chain materializes the same satoshi it would
+    ///   have without this term. It is NOT `min(principal, staked_sat)`: a
+    ///   bond that a pre-gate slash cut and later rewards rebuilt holds
+    ///   emitted coin above the burn, and min-ing against the CURRENT stake
+    ///   would reclassify that coin as phantom and confiscate it at
+    ///   withdrawal — the pre-gate burn charged a second time (25,000 /
+    ///   -5,000 / +10,000 pays 10,000 here and paid 5,000 before).
     ///
     /// Entries land only where non-zero (the map's canonical form). Funded
     /// deposits cannot be in the history yet: their discriminant is
@@ -3484,6 +3715,8 @@ impl CommittedState {
                 *legacy_deposit_principal.entry(*idx).or_insert(0) += d.amount_sat;
             }
         }
+        let mut materialized: BTreeMap<u32, u128> = BTreeMap::new();
+        let mut indeterminate: BTreeSet<u32> = BTreeSet::new();
         for (idx, rec) in &self.validators {
             let principal = self
                 .genesis_principal_sat
@@ -3491,11 +3724,38 @@ impl CommittedState {
                 .copied()
                 .unwrap_or(0)
                 .saturating_add(legacy_deposit_principal.get(idx).copied().unwrap_or(0));
-            let unbacked = principal.min(rec.staked_sat);
-            if unbacked > 0 {
-                self.unbacked_sat.insert(*idx, unbacked);
+            match self.stake_low_water.get(idx) {
+                // The bond's own history decides. Covers both "never slashed"
+                // (no entry, and the fallback below is the bond itself) and
+                // "slashed while the recorder was running".
+                Some(low) => {
+                    let unbacked = principal.min(*low);
+                    if unbacked > 0 {
+                        materialized.insert(*idx, unbacked);
+                    }
+                }
+                // No history. If the bond was never slashed there is nothing
+                // to remember and the current stake IS the minimum — the
+                // fallback that keeps every live validator materializing the
+                // number the ungated code materialized.
+                None if !rec.slashed => {
+                    let unbacked = principal.min(rec.staked_sat);
+                    if unbacked > 0 {
+                        materialized.insert(*idx, unbacked);
+                    }
+                }
+                // Slashed, but by a binary older than the recorder — the
+                // mixed-fleet window. Refuse rather than guess: see the
+                // `unbacked_indeterminate` field docs for the three defaults
+                // and the direction each one errs in. No `unbacked_sat` entry
+                // is written, because writing one would be the guess.
+                None => {
+                    indeterminate.insert(*idx);
+                }
             }
         }
+        self.unbacked_sat.extend(materialized);
+        self.unbacked_indeterminate.extend(indeterminate);
     }
 }
 
@@ -3590,6 +3850,35 @@ impl<V: SignatureVerifier> Transition<V> {
         attestations: &[Attestation],
         transactions: &[PosTransaction],
     ) -> Result<CommittedState, TransitionError> {
+        self.compute_post_state_gated(
+            pre,
+            envelope,
+            attestations,
+            transactions,
+            crate::params::FUNDED_STAKE_ACTIVATION_EPOCH,
+        )
+    }
+
+    /// [`Self::compute_post_state`] with the funded-staking flag day passed
+    /// in, threading it to both places that read it: the epoch-boundary walk
+    /// (`close_epoch_gated`, which is where the unissued-principal map is
+    /// materialized) and every transaction (`apply_transaction_gated`).
+    ///
+    /// Same standing as the other two `_gated` seams — a testing seam, not a
+    /// policy knob. It exists because the funded discriminants are
+    /// consensus-invalid while the constant is `u64::MAX`, so a test that
+    /// only calls the seam methods directly never proves the BLOCK path
+    /// accepts them, and until 2026-08-22 no test did. Production reaches
+    /// this through `compute_post_state`, whose single argument is the
+    /// constant.
+    pub fn compute_post_state_gated(
+        &self,
+        pre: &CommittedState,
+        envelope: &ProposalEnvelope,
+        attestations: &[Attestation],
+        transactions: &[PosTransaction],
+        funded_stake_activation_epoch: u64,
+    ) -> Result<CommittedState, TransitionError> {
         let header = &envelope.header;
 
         // 1. Slot must advance (double-apply of a block to its own
@@ -3660,7 +3949,7 @@ impl<V: SignatureVerifier> Transition<V> {
         // and implicit epoch processing cannot diverge.
         let mut st = pre.clone();
         while st.epoch < block_epoch {
-            st = st.close_epoch();
+            st = st.close_epoch_gated(funded_stake_activation_epoch);
         }
 
         // 3c. THE HARD CAP IS A CONSENSUS INVARIANT (founder decision,
@@ -3822,7 +4111,13 @@ impl<V: SignatureVerifier> Transition<V> {
                         priority_fee_sat: 0,
                     })
                     .map_err(|()| TxReject::StakingRule),
-                _ => st.apply_transaction(tx, total_active, base_fee, &self.verifier),
+                _ => st.apply_transaction_gated(
+                    tx,
+                    total_active,
+                    base_fee,
+                    &self.verifier,
+                    funded_stake_activation_epoch,
+                ),
             };
             match applied {
                 Ok(charge) => {
@@ -3879,6 +4174,35 @@ impl<V: SignatureVerifier> Transition<V> {
         st.slot = header.slot;
         st.head = BlockId::of(header);
         Ok(st)
+    }
+}
+
+impl<V: SignatureVerifier> Transition<V> {
+    /// [`StateTransition::apply_block`] with the funded-staking flag day
+    /// passed in — the full block path (header commitments, proposer draw,
+    /// RANDAO, attestations, transactions, state-root check), differing from
+    /// production only in where the boundary sits. The seam the conservation
+    /// test drives, so the deposit/exit/withdraw cycle it asserts over is the
+    /// one a real block would produce and not a hand-called method.
+    pub fn apply_block_gated(
+        &self,
+        pre: &CommittedState,
+        envelope: &ProposalEnvelope,
+        attestations: &[Attestation],
+        transactions: &[PosTransaction],
+        funded_stake_activation_epoch: u64,
+    ) -> Result<CommittedState, TransitionError> {
+        let post = self.compute_post_state_gated(
+            pre,
+            envelope,
+            attestations,
+            transactions,
+            funded_stake_activation_epoch,
+        )?;
+        if post.compute_root() != envelope.header.state_root {
+            return Err(TransitionError::StateRootMismatch);
+        }
+        Ok(post)
     }
 }
 
@@ -4538,6 +4862,54 @@ mod tests {
         let probe = ProposalEnvelope { header, proposer_sig: vec![0u8; 8] };
         let post = t
             .compute_post_state(pre, &probe, atts, txs)
+            .expect("builder produced an untransitionable block");
+        header.state_root = post.state_root();
+        ProposalEnvelope { header, proposer_sig: vec![0u8; 8] }
+    }
+
+    /// [`build_block`] with the funded-staking flag day passed in — the
+    /// producer half of `apply_block_gated`. Both halves must roll the
+    /// boundary with the SAME gate or the builder stamps a state root the
+    /// validator will not reproduce, which is exactly the divergence the
+    /// gated pair exists to make testable.
+    fn build_block_gated<V: SignatureVerifier>(
+        t: &Transition<V>,
+        pre: &CommittedState,
+        slot: u64,
+        atts: &[Attestation],
+        txs: &[PosTransaction],
+        chains: &mut [RandaoChain],
+        gate: u64,
+    ) -> ProposalEnvelope {
+        let mut ctx = pre.clone();
+        while ctx.epoch < crate::epoch_of(slot) {
+            ctx = ctx.close_epoch_gated(gate);
+        }
+        let roster = ctx.duty_roster();
+        let seed = ctx.seed_for_epoch(ctx.epoch);
+        let p = schedule::proposer(&seed, slot, &roster).expect("no eligible proposer");
+        let reveal = chains[p as usize].next_reveal().expect("chain spent");
+        let mix = beacon::mix_in(&ctx.randao_mix, &reveal);
+        let fin = ctx.finality_view();
+        let mut header = BlockHeaderV4 {
+            version: BLOCK_VERSION_V4,
+            parent: *pre.head.as_bytes(),
+            state_root: [0u8; 32],
+            body_root: crate::derive::body_root(
+                &txs.iter().map(PosTransaction::canonical_bytes).collect::<Vec<_>>(),
+            ),
+            slot,
+            proposer_index: p,
+            randao_reveal: reveal,
+            randao_mix: mix,
+            justified_root: fin.justified.root,
+            finalized_root: fin.finalized.root,
+            attestation_root: crate::derive::attestation_root(atts),
+            coherence_root: pre.coherence_root(),
+        };
+        let probe = ProposalEnvelope { header, proposer_sig: vec![0u8; 8] };
+        let post = t
+            .compute_post_state_gated(pre, &probe, atts, txs, gate)
             .expect("builder produced an untransitionable block");
         header.state_root = post.state_root();
         ProposalEnvelope { header, proposer_sig: vec![0u8; 8] }
@@ -7806,9 +8178,44 @@ mod tests {
             "post-boundary root moved: the boundary walk no longer matches the fleet's"
         );
         // And the write-off components really are empty pre-gate — the fact
-        // the byte-identity rests on.
+        // the byte-identity rests on. All FOUR of them: the two that fill at
+        // the flag day, and the two added ungated on 2026-08-22 (the
+        // low-water recorder and the indeterminate class), which are the ones
+        // that would fork the fleet at the REBUILD rather than at the flag
+        // day if they committed anything here.
         assert!(s.unbacked_sat.is_empty());
         assert_eq!(s.written_off_sat, 0);
+        assert!(s.stake_low_water.is_empty(), "the recorder committed a leaf pre-gate");
+        assert!(s.unbacked_indeterminate.is_empty(), "the class committed a leaf pre-gate");
+
+        // CONTROL, and the whole reason the two asserts above are not
+        // decoration: each new component MUST move the root once it is
+        // non-empty. A component that never changes the root would satisfy
+        // "byte-identical" for free — and would also mean the write-off
+        // history is not actually committed, so two nodes could disagree
+        // about a bond's floor while their roots agreed. That is the §5.5
+        // failure this whole file is built against.
+        let baseline = s.compute_root();
+        let mut with_floor = s.clone();
+        with_floor.stake_low_water.insert(0, sat(1));
+        assert_ne!(baseline, with_floor.compute_root(), "a low-water mark is not committed");
+        // Zero-valued too — the canonical form that differs from
+        // `unbacked_sat` on purpose.
+        let mut with_zero_floor = s.clone();
+        with_zero_floor.stake_low_water.insert(0, 0);
+        assert_ne!(
+            baseline,
+            with_zero_floor.compute_root(),
+            "a ZERO low-water mark is not committed: a bond slashed to nothing would read as              never-slashed on a node that resynced"
+        );
+        assert_ne!(
+            with_floor.compute_root(),
+            with_zero_floor.compute_root(),
+            "the low-water VALUE does not reach the root"
+        );
+        let mut with_class = s.clone();
+        with_class.unbacked_indeterminate.insert(0);
+        assert_ne!(baseline, with_class.compute_root(), "the class is not committed");
     }
 
     /// The activation boundary materializes the committed unissued-principal
@@ -7864,6 +8271,479 @@ mod tests {
         for i in 1..4u32 {
             assert_eq!(s2.unbacked_principal_sat(i), sat(200_000), "untouched entries stand");
         }
+    }
+
+    // ── the write-off's HISTORY: the low-water mark (2026-08-22) ───────────
+
+    /// A double vote by `v` under a distinguishing `tag`, so a second offence
+    /// by the same validator is a DIFFERENT evidence id and is not refused by
+    /// the applied-evidence dedup. Without this, "slash twice" tests silently
+    /// become "slash once".
+    fn double_vote_evidence_tagged(v: u32, tag: u8) -> SlashingEvidence {
+        let data = |head: u8| AttestationData {
+            slot: 32,
+            head: [head; 32],
+            source_epoch: 0,
+            source_root: [tag; 32],
+            target_epoch: 1,
+            target_root: [head; 32],
+        };
+        SlashingEvidence::AttestationOffence {
+            first: Attestation { data: data(0xAA), validator: v, signature: vec![0u8; 8] },
+            second: Attestation { data: data(0xBB), validator: v, signature: vec![0u8; 8] },
+        }
+    }
+
+    /// THE RECORDER. A slash — and only a slash — writes a bond's low-water
+    /// mark, and the mark is a MINIMUM: rewards that rebuild the bond must
+    /// not lift it, and a second, shallower slash must not lift it either.
+    ///
+    /// Control halves, each one the thing that fails if the recorder is
+    /// wrong in a different direction:
+    ///  - untouched validators keep `None`, not `Some(stake)` — "absent"
+    ///    and "recorded" have to stay distinguishable, because the
+    ///    indeterminate class is defined by the difference;
+    ///  - the reward boundary raises `staked_sat` and the mark holds;
+    ///  - the second slash lands ABOVE the first floor and the mark holds.
+    #[test]
+    fn a_slash_records_the_bonds_low_water_mark_and_nothing_else_moves_it() {
+        let (_t, g, _c) = setup(4);
+        let offender = 3u32;
+        let total_active: u128 = 4 * sat(200_000);
+
+        assert_eq!(
+            g.stake_low_water_sat(offender),
+            None,
+            "control failed: a fresh bond must have no recorded floor"
+        );
+
+        let mut st = g.clone();
+        st.apply_slashing_evidence(
+            &double_vote_evidence_tagged(offender, 0x01),
+            0,
+            total_active,
+            &OkVerifier,
+        )
+        .unwrap();
+        let first_floor = st.validator_record(offender).unwrap().staked_sat;
+        assert!(
+            first_floor < sat(200_000),
+            "control failed: the slash took nothing, the test would be vacuous"
+        );
+        assert_eq!(
+            st.stake_low_water_sat(offender),
+            Some(first_floor),
+            "the floor is the bond immediately after the penalty"
+        );
+        // Control: the other three are untouched and stay ABSENT.
+        for i in 0..3u32 {
+            assert_eq!(st.stake_low_water_sat(i), None, "a bystander gained a floor");
+        }
+
+        // Rewards rebuild the bond. The floor must not follow it up — if it
+        // did, the write-off would reclassify earned coin as phantom.
+        let fees = sat(50_000);
+        st.pending_fee_rewards.insert(offender, fees);
+        let mut st = st.close_epoch_gated(u64::MAX);
+        assert_eq!(
+            st.validator_record(offender).unwrap().staked_sat,
+            first_floor + fees,
+            "control failed: the fees did not compound, so nothing tested the direction"
+        );
+        assert_eq!(
+            st.stake_low_water_sat(offender),
+            Some(first_floor),
+            "a reward must never raise the low-water mark"
+        );
+
+        // AND THE CONTROL THAT CANNOT BE WRITTEN AS A BLOCK TEST, stated
+        // rather than faked: a second slash is inadmissible — the offender
+        // was ejected by the first and `slashing::process` answers
+        // `AlreadySlashed` — so no sequence of blocks makes the recorder run
+        // twice on one validator. That is asserted here, because it is the
+        // reason `min` has no reachable coverage, and it would stop being
+        // true the moment partial slashing lands.
+        assert_eq!(
+            st.apply_slashing_evidence(
+                &double_vote_evidence_tagged(offender, 0x02),
+                0,
+                total_active,
+                &OkVerifier,
+            ),
+            Err(()),
+            "a second slash became admissible: fold_low_water's min() now needs a block test"
+        );
+    }
+
+    /// The `min` in [`CommittedState::fold_low_water`], pinned where it is
+    /// reachable. The second call is the whole point: a fold that assigned
+    /// instead of min-ing would raise the floor back up when a later, shallower
+    /// reduction lands, and a raised floor is emitted coin reclassified as
+    /// phantom — the confiscation this front exists to stop, arriving by a
+    /// different road.
+    #[test]
+    fn the_low_water_fold_keeps_the_minimum_across_repeated_reductions() {
+        // First reduction: no history, the post-penalty stake is the floor.
+        assert_eq!(CommittedState::fold_low_water(None, sat(190_000)), sat(190_000));
+        // A LATER, SHALLOWER reduction must NOT raise the floor.
+        assert_eq!(
+            CommittedState::fold_low_water(Some(sat(190_000)), sat(240_000)),
+            sat(190_000),
+            "assignment instead of min: the floor followed the bond back up"
+        );
+        // Control: a deeper one does lower it, so the min is not a constant.
+        assert_eq!(
+            CommittedState::fold_low_water(Some(sat(190_000)), sat(100_000)),
+            sat(100_000)
+        );
+        // Zero is a floor like any other — never "absent".
+        assert_eq!(CommittedState::fold_low_water(Some(sat(190_000)), 0), 0);
+        assert_eq!(CommittedState::fold_low_water(None, 0), 0);
+    }
+
+    /// THE MEASURED CONFISCATION, and the fix. A slash lands BEFORE the flag
+    /// day and later rewards rebuild the bond above its registered principal.
+    /// The materialization must floor the write-off at the bond's low water,
+    /// not at its current stake: `min(P, staked_now)` calls emitted coin
+    /// phantom and confiscates exactly what the pre-gate slash already
+    /// burned, a second time.
+    ///
+    /// The shape is the one measured on 2026-08-22 (P = 25,000 there,
+    /// 200,000 in this fixture): principal P, a pre-gate burn, then rewards
+    /// carrying the bond back ABOVE P. The payout must be the rewards, to
+    /// the satoshi.
+    ///
+    /// Control halves:
+    ///  - the bond really does end above P, so `min(P, staked)` clamps and
+    ///    the two rules genuinely disagree (with the bond below P the test
+    ///    would pass under both);
+    ///  - a validator that was never slashed materializes the SAME number it
+    ///    materialized before this change — that is what the `unwrap_or`
+    ///    fallback is for, and it is what makes the fix a no-op on the live
+    ///    chain.
+    #[test]
+    fn a_pre_gate_slash_floors_the_write_off_instead_of_confiscating_emitted_coin() {
+        let (_t, g, _c) = setup(4);
+        let offender = 3u32;
+        let principal = sat(200_000);
+        let total_active: u128 = 4 * principal;
+
+        // Pre-gate slash: no unbacked map exists yet, only the low-water
+        // recorder runs.
+        let mut st = g.clone();
+        st.apply_slashing_evidence(
+            &double_vote_evidence_tagged(offender, 0x11),
+            0,
+            total_active,
+            &OkVerifier,
+        )
+        .unwrap();
+        assert!(st.unbacked_sat.is_empty(), "control failed: the map must not exist pre-gate");
+        let burned_to = st.validator_record(offender).unwrap().staked_sat;
+        assert!(burned_to < principal, "control failed: the slash took nothing");
+
+        // Emitted coin the operator genuinely earned, enough to carry the
+        // bond back OVER its registered principal.
+        let earned = principal;
+        st.pending_fee_rewards.insert(offender, earned);
+        let rebuilt = st.close_epoch_gated(u64::MAX);
+        let bond = rebuilt.validator_record(offender).unwrap().staked_sat;
+        assert_eq!(bond, burned_to + earned);
+        assert!(
+            bond > principal,
+            "control failed: the bond must end ABOVE P or min(P, staked) never clamps"
+        );
+
+        // Cross the flag day.
+        let s = rebuilt.close_epoch_gated(rebuilt.epoch + 1);
+        assert_eq!(
+            s.unbacked_principal_sat(offender),
+            burned_to,
+            "the write-off is floored at the low water, not at min(P, staked_now)"
+        );
+        // Spelled out: the broken rule would have recorded the whole
+        // principal, and the gap between the two IS the confiscation.
+        assert_eq!(
+            principal.min(bond),
+            principal,
+            "control failed: min(P, staked) does not clamp here after all"
+        );
+        assert!(
+            principal - burned_to > 0,
+            "control failed: nothing would have been confiscated"
+        );
+
+        let mut st = s;
+        {
+            let rec = st.validators.get_mut(&offender).unwrap();
+            rec.withdrawal_credentials = vec![0x9C; 32];
+            rec.withdrawable_epoch = st.epoch;
+        }
+        let issued_before = st.issued_sat;
+        st.apply_withdraw(offender).unwrap();
+
+        let txid = PosTransaction::Withdraw { validator: offender }.txid();
+        let out = st.utxo(&txid, 0).expect("the emitted coin must be payable");
+        assert_eq!(
+            out.value as u128, earned,
+            "the payout is exactly the coin emission counted — not one satoshi less"
+        );
+        assert_eq!(st.written_off_sat, burned_to, "only the surviving phantom is written off");
+        assert_eq!(st.issued_sat, issued_before);
+
+        // CONTROL: an untouched validator materializes what it always did.
+        assert_eq!(
+            st.unbacked_principal_sat(0),
+            principal,
+            "the fallback must reproduce min(P, staked) for a bond no slash ever touched"
+        );
+    }
+
+    /// THE INDETERMINATE CLASS. A bond slashed by a binary older than the
+    /// low-water recorder reaches the flag day with `slashed == true` and no
+    /// floor. No default is defensible — `staked_sat` or 0 as the floor
+    /// releases never-emitted principal as coin, `P` confiscates emitted coin
+    /// — so the withdrawal is REFUSED, before any mutation.
+    ///
+    /// Control halves:
+    ///  - the class is empty when every slash went through the recorder, and
+    ///    that validator withdraws its correct value;
+    ///  - the refused bond's state does not move by a single field, so the
+    ///    refusal is a refusal and not a half-applied withdrawal.
+    #[test]
+    fn a_slash_with_no_recorded_floor_refuses_the_withdrawal_instead_of_guessing() {
+        let (_t, g, _c) = setup(4);
+        let legacy = 1u32; // slashed by the OLD binary
+        let modern = 2u32; // slashed by this one
+        let principal = sat(200_000);
+        let total_active: u128 = 4 * principal;
+
+        let mut st = g.clone();
+        // What an old binary left behind: the flag and the reduced bond, and
+        // no floor anywhere. Written by hand because the old code is what
+        // produced it, and that code no longer exists to call.
+        {
+            let rec = st.validators.get_mut(&legacy).unwrap();
+            rec.slashed = true;
+            rec.staked_sat = sat(150_000);
+        }
+        assert_eq!(st.stake_low_water_sat(legacy), None, "control: no floor, by construction");
+        // And one slashed through the recorder, for the control half.
+        st.apply_slashing_evidence(
+            &double_vote_evidence_tagged(modern, 0x21),
+            0,
+            total_active,
+            &OkVerifier,
+        )
+        .unwrap();
+        let modern_floor = st.stake_low_water_sat(modern).expect("control: recorder ran");
+
+        assert!(
+            st.unbacked_indeterminate.is_empty(),
+            "control failed: the class must be empty before the boundary decides"
+        );
+        let mut st = st.close_epoch_gated(st.epoch + 1);
+
+        assert!(st.is_write_off_indeterminate(legacy), "a floorless slash must be flagged");
+        assert_eq!(
+            st.unbacked_principal_sat(legacy),
+            0,
+            "no write-off may be guessed for an indeterminate bond"
+        );
+        // Control: everyone else is decided, including the modern slash.
+        for i in [0u32, modern, 3] {
+            assert!(!st.is_write_off_indeterminate(i), "validator {i} wrongly flagged");
+        }
+        assert_eq!(st.unbacked_principal_sat(modern), modern_floor);
+
+        // The refusal, and that it is total.
+        {
+            let rec = st.validators.get_mut(&legacy).unwrap();
+            rec.withdrawal_credentials = vec![0x77; 32];
+            rec.withdrawable_epoch = st.epoch;
+        }
+        let before = st.clone();
+        assert_eq!(
+            st.apply_withdraw(legacy),
+            Err(TxReject::StakingRule),
+            "an indeterminate write-off must refuse, not guess"
+        );
+        assert_eq!(st, before, "a refused withdrawal must leave the state untouched");
+
+        // CONTROL: the bond WITH a floor pays its correct value through the
+        // very same call — so the refusal above is about the missing history
+        // and not about slashed bonds in general.
+        {
+            let rec = st.validators.get_mut(&modern).unwrap();
+            rec.withdrawal_credentials = vec![0x78; 32];
+            rec.withdrawable_epoch = st.epoch;
+        }
+        let staked = st.validator_record(modern).unwrap().staked_sat;
+        st.apply_withdraw(modern).unwrap();
+        assert_eq!(st.written_off_sat, staked.min(modern_floor));
+    }
+
+    /// (c) TWO-SIDED VALUE CONSERVATION THROUGH THE REAL BLOCK PATH — the
+    /// three funded discriminants accepted as transactions inside actual
+    /// blocks, header commitments and state-root check included, not called
+    /// as seam methods.
+    ///
+    /// # Why the obvious assertion was thrown away
+    ///
+    /// "A deposit-and-withdraw cycle must not change `issued_sat`" is VACUOUS
+    /// and was verified to be so by reading every write to the counter: no
+    /// staking path touches `issued_sat` outside the reward boundary, so that
+    /// assertion holds against the fixed code, against the broken code, and
+    /// against code with the write-off deleted entirely. It cannot fail, so
+    /// it proves nothing.
+    ///
+    /// What is asserted instead is a conservation identity with two sides:
+    ///
+    /// ```text
+    /// total_unspent + Σ staked − Σ unbacked + written_off
+    /// ```
+    ///
+    /// Every real satoshi appears exactly once (spendable, or bonded), every
+    /// phantom satoshi is subtracted exactly once (as unbacked while bonded,
+    /// as written-off after), and the sum must return to where it started. A
+    /// payout that is too large moves it up; a write-off that is too large
+    /// moves it down. `issued_sat` unchanged is still asserted — as a
+    /// control, and labelled as the weak half.
+    ///
+    /// Closes, in the same test, the gap that until 2026-08-22 left
+    /// `DepositFunded` / `ExitV2` / `Withdraw` with no block-path acceptance
+    /// coverage at all on the accept side.
+    #[test]
+    fn the_block_path_accepts_the_funded_lifecycle_and_conserves_value_on_both_sides() {
+        const GATE: u64 = 1;
+        let owner = owner_key(3);
+        let coin = opening(0x21, 0, sat_u64_test(staking::MIN_DEPOSIT_SAT), &owner);
+        let (t, g, mut chains) = setup_funded(4, &[coin]);
+
+        // The ledger sum, over every component that can hold value.
+        let conserved = |s: &CommittedState| -> i128 {
+            let staked: u128 = s.validators.values().map(|r| r.staked_sat).sum();
+            let unbacked: u128 = s.unbacked_sat.values().copied().sum();
+            s.total_unspent_sat() as i128 + staked as i128 - unbacked as i128
+                + s.written_off_sat as i128
+        };
+        // ── Block 0: an EMPTY block in epoch 1, whose boundary crosses the
+        //    flag day. The baseline is taken AFTER it, on purpose: crossing
+        //    the gate reclassifies the genesis cohort's 4 x 200,000 BLOCH of
+        //    registered principal from value to phantom, and that one-time
+        //    reclassification IS the founder's write-off decision, not a leak
+        //    — measuring across it would mean asserting that the decision
+        //    does not happen. What is under test is the funded lifecycle that
+        //    follows, so the window starts where the lifecycle does.
+        let slot0 = SLOTS_PER_EPOCH;
+        let b0 = build_block_gated(&t, &g, slot0, &[], &[], &mut chains, GATE);
+        let g = t.apply_block_gated(&g, &b0, &[], &[], GATE).expect("empty block");
+        assert_eq!(g.epoch, 1, "control failed: the gate was not crossed");
+        assert_eq!(
+            g.unbacked_principal_sat(0),
+            sat(200_000),
+            "control failed: the boundary did not materialize, the baseline is the wrong one"
+        );
+        let start = conserved(&g);
+        let issued_start = g.issued_sat;
+
+        // ── Block 1: the funded deposit. Consensus-invalid one epoch
+        //    earlier, which is the negative half at the end.
+        let credential = [0xD7; 32];
+        let mut deposit = PosTransaction::DepositFunded {
+            keys: vec![WitnessKey { pubkey: owner.clone(), signature: Vec::new() }],
+            inputs: vec![TransferInputV2 { txid: [0x21; 32], vout: 0, key_index: 0 }],
+            pubkey: vec![0xD7; 8],
+            amount_sat: staking::MIN_DEPOSIT_SAT,
+            randao_commitment: [0xD7; 32],
+            withdrawal_credentials: credential.to_vec(),
+            commission_bps: 0,
+        };
+        let root = deposit.funded_deposit_signing_root();
+        if let PosTransaction::DepositFunded { keys, .. } = &mut deposit {
+            keys[0].signature = toy_sign(&owner, &root);
+        }
+        let slot1 = slot0 + 1;
+        let b1 = build_block_gated(&t, &g, slot1, &[], std::slice::from_ref(&deposit), &mut chains, GATE);
+        let s1 = t
+            .apply_block_gated(&g, &b1, &[], std::slice::from_ref(&deposit), GATE)
+            .expect("a funded deposit must be acceptable in a real block after the gate");
+        assert_eq!(s1.validator_count(), 5, "the block registered the funded validator");
+        assert_eq!(s1.unbacked_principal_sat(4), 0, "a funded bond is born fully backed");
+        assert_eq!(conserved(&s1), start, "the deposit moved value, it must not create it");
+        assert_eq!(s1.issued_sat, issued_start, "control (weak half): deposit is not emission");
+
+        // ── Block 2: the exit, signed by the validator's own key. The
+        //    activation clock is not what this test is about, so the record
+        //    is made exit-eligible first — everything else runs through the
+        //    block path.
+        let mut s1 = s1;
+        s1.validators.get_mut(&4).unwrap().activation_epoch = 0;
+        let pubkey_hash: [u8; 32] = Sha3_256::digest([0xD7u8; 8]).into();
+        let exit_root = staking::ExitTx {
+            pubkey_hash,
+            epoch: s1.epoch,
+            signature: Vec::new(),
+        }
+        .signing_root();
+        let exit = PosTransaction::ExitV2 {
+            pubkey_hash,
+            epoch: s1.epoch,
+            signature: toy_sign(&[0xD7u8; 8], &exit_root),
+        };
+        let b2 = build_block_gated(&t, &s1, slot1 + 1, &[], std::slice::from_ref(&exit), &mut chains, GATE);
+        let s2 = t
+            .apply_block_gated(&s1, &b2, &[], std::slice::from_ref(&exit), GATE)
+            .expect("ExitV2 must be acceptable in a real block after the gate");
+        let withdrawable_at = s2.validator_record(4).unwrap().withdrawable_epoch;
+        assert!(withdrawable_at > s2.epoch, "control failed: the exit scheduled no delay");
+        assert_eq!(conserved(&s2), start, "an exit moves no value at all");
+
+        // ── Block 3: the withdrawal, at the first slot the lock allows.
+        let slot3 = withdrawable_at * SLOTS_PER_EPOCH;
+        let withdraw = PosTransaction::Withdraw { validator: 4 };
+        let b3 = build_block_gated(&t, &s2, slot3, &[], std::slice::from_ref(&withdraw), &mut chains, GATE);
+        let s3 = t
+            .apply_block_gated(&s2, &b3, &[], std::slice::from_ref(&withdraw), GATE)
+            .expect("Withdraw must be acceptable in a real block after the gate");
+
+        // THE IDENTITY, over the whole cycle.
+        assert_eq!(
+            conserved(&s3),
+            start,
+            "the deposit-exit-withdraw cycle must return every satoshi it took"
+        );
+        assert_eq!(s3.issued_sat, issued_start, "control (weak half): no emission anywhere");
+        assert_eq!(s3.written_off_sat, 0, "a funded bond writes nothing off");
+        // Control: the payout is REAL and exact — a cycle that paid nothing
+        // would satisfy the identity just as well.
+        let txid = PosTransaction::Withdraw { validator: 4 }.txid();
+        let out = s3.utxo(&txid, 0).expect("the funded bond must come back out");
+        assert_eq!(out.value as u128, staking::MIN_DEPOSIT_SAT);
+        assert_eq!(out.script_hash, credential);
+        assert_eq!(
+            s3.total_unspent_sat(),
+            g.total_unspent_sat(),
+            "control: the spendable set itself is back to its opening value"
+        );
+
+        // ── Negative half, on a FRESH genesis so it is genuinely pre-gate:
+        //    the same deposit in epoch 0 is consensus-invalid. Without it,
+        //    everything above would also pass against a build with the gate
+        //    deleted.
+        let coin2 = opening(0x21, 0, sat_u64_test(staking::MIN_DEPOSIT_SAT), &owner);
+        let (t2, g2, mut chains2) = setup_funded(4, &[coin2]);
+        assert_eq!(g2.epoch, 0, "control failed: the fresh state is not pre-gate");
+        assert!(matches!(
+            t2.compute_post_state_gated(
+                &g2,
+                &probe_env(&g2, 1, std::slice::from_ref(&deposit), &mut chains2),
+                &[],
+                std::slice::from_ref(&deposit),
+                GATE,
+            ),
+            Err(TransitionError::Transaction(0))
+        ), "a funded deposit must be consensus-invalid before the gate");
     }
 
     /// A validator registered by a LEGACY deposit — the modified-proposer

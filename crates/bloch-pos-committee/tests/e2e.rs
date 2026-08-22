@@ -427,6 +427,9 @@ mod harness {
             // written off (funded-staking write-off, 2026-08-22).
             unbacked_principals: &[],
             written_off_sat: 0,
+            // And no slash: no low-water marks, nothing indeterminate.
+            stake_low_water: &[],
+            unbacked_indeterminate: &[],
             applied_evidence: &[],
             slash_window: &[],
             delegator_slash_losses: &[],

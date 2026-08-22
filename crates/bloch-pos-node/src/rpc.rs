@@ -1242,6 +1242,17 @@ pub fn chain_info_json(
         // all 64 genesis bonds are withdrawn, with `issued_supply_sat`
         // unmoved by any of those withdrawals.
         ("written_off_sat", Json::sat(state.written_off_sat())),
+        // The stuck-bond counter (2026-08-22). Zero on every state this chain
+        // has produced, and it must stay zero: a non-zero value means a bond
+        // was slashed by a binary older than the low-water recorder, its
+        // write-off cannot be computed, and its `Withdraw` will be refused
+        // forever until a release rule is written. Published because a
+        // permanently-refusing withdrawal with no visible cause is
+        // indistinguishable, from outside, from a node that is simply broken.
+        (
+            "write_off_indeterminate",
+            Json::u(state.write_off_indeterminate_count() as u64),
+        ),
         ("base_fee_millisat_per_gas", Json::sat(state.base_fee_millisat_per_gas())),
         ("next_base_fee_millisat_per_gas", Json::sat(state.next_base_fee())),
         ("mempool", Json::u(mempool as u64)),

@@ -387,6 +387,10 @@ mod tests {
             // break-this-line reason.
             unbacked_principals: Vec::new(),
             written_off_sat: 0,
+            // No slash has ever been applied on this chain, so no bond has a
+            // low-water mark and no write-off is indeterminate.
+            stake_low_water: Vec::new(),
+            unbacked_indeterminate: Vec::new(),
             evm: EvmCommitment {
                 account_root: [0x14; 32],
                 receipts_root: [0x15; 32],

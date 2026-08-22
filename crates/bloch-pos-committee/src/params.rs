@@ -236,12 +236,55 @@ pub const BLOCK_BYTES_V2_ACTIVATION_EPOCH: u64 = 800;
 /// advances `issued_sat` when it credits a bond, and fee rewards are backed
 /// by coins the transfer path already destroyed.)
 ///
+/// # The part of the rule that is NOT behind this gate, and why
+///
+/// The write-off owed is `min(P, min over history of staked_sat)` — the
+/// principal, floored by the smallest the bond has ever been. `unbacked_sat`
+/// computes that running minimum correctly, but only from the moment its
+/// entry exists, and the entry is created at this gate. Everything the
+/// minimum did BEFORE the gate would be discarded, and `min(P, staked_now)`
+/// substituted for it — which CONFISCATES ALREADY-EMITTED COIN whenever a
+/// pre-gate slash burned principal and later rewards rebuilt the bond: with
+/// `P = 25,000`, a burn of 5,000 and rewards of 10,000, the correct payout is
+/// 10,000 and the substitution pays 5,000, taking the burn a second time.
+///
+/// So the RECORDER runs ungated, from the rebuild: `stake_low_water`
+/// (`TAG_STAKE_LOW_WATER`) is written by every slash, and the
+/// materialization at this gate reads it. The gate cannot record what the
+/// gate itself has to read. Shipping it ungated is safe without a second flag
+/// day because of a MEASUREMENT and not because of a comment — 64 of 64 live
+/// validators carry no applied slash and no delegation (2026-08-22) — so the
+/// map is empty everywhere, empty components commit no leaves, and every root
+/// is byte-identical to the ungated binary's
+/// (`transition::tests::pre_gate_roots_are_byte_identical_to_the_ungated_code`).
+/// The measurement is a release gate, not a design note: it is re-run at the
+/// END of the fleet rollout, because the one way the next paragraph's class
+/// can be born is a slash landing on a node still running the old binary.
+///
+/// A validator slashed with no recorded floor is INDETERMINATE
+/// (`TAG_UNBACKED_INDETERMINATE`): every available default is wrong in one
+/// direction (the current stake or zero releases never-emitted principal as
+/// coin; `P` confiscates emitted coin), so `Withdraw` refuses. A stuck bond
+/// is recoverable by a rule written later; a wrong payout is recoverable by
+/// nothing. **No such rule exists today** — if this class is ever non-empty,
+/// releasing it is a founder decision that needs writing, under pressure,
+/// with no history in hand.
+///
 /// # Choosing the epoch
 ///
 /// New discriminants change block-body decoding, so a node on the old binary
 /// rejects the first post-gate block as a decode error rather than a rule.
 /// Same precondition as the constant above: every validator rebuilt first,
 /// "the fleet is on the new binary" as a fact, not a hope.
+///
+/// AND THE VALUE MUST BE IN THE FUTURE. Arming this with an epoch at or below
+/// the chain's committed epoch does not "activate it immediately": every
+/// legacy `Deposit`, `Exit` and `Delegate` becomes consensus-invalid at once
+/// while the fleet is mid-rebuild, and the boundary that materializes
+/// `unbacked_sat` has already passed, so it never runs and no write-off is
+/// ever recorded. It fails in the safe direction — a bricked fleet, not a
+/// leak — but silently, and the margin must exceed the rollout's own
+/// duration, not merely the current epoch.
 pub const FUNDED_STAKE_ACTIVATION_EPOCH: u64 = u64::MAX;
 
 /// Domain separation tags (§6.1). Fixed 16 bytes, right-padded with zeros, so

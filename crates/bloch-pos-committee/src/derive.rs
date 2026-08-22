@@ -135,6 +135,14 @@ pub struct ChainState {
     /// carried unchanged: only a withdrawal — a transaction, the transition's
     /// job — advances it. Zero before the flag day.
     pub written_off_sat: u128,
+    /// Bond low-water marks (`TAG_STAKE_LOW_WATER`, 2026-08-22), carried
+    /// unchanged: only a slash — the transition's job — writes one. Empty on
+    /// every state the live chain has produced.
+    pub stake_low_water: Vec<crate::state_root::StakeLowWaterRecord>,
+    /// The indeterminate-write-off class (`TAG_UNBACKED_INDETERMINATE`,
+    /// 2026-08-22), carried unchanged: only the activation boundary — the
+    /// transition's job — can put a validator in it. Empty today.
+    pub unbacked_indeterminate: Vec<crate::state_root::IndeterminateRecord>,
 }
 
 impl ChainState {
@@ -167,6 +175,8 @@ impl ChainState {
             issued_sat: self.issued_sat,
             unbacked_principals: &self.unbacked_principals,
             written_off_sat: self.written_off_sat,
+            stake_low_water: &self.stake_low_water,
+            unbacked_indeterminate: &self.unbacked_indeterminate,
         })
     }
 }
@@ -666,6 +676,11 @@ mod coherence_tests {
             // break-this-line reason.
             unbacked_principals: Vec::new(),
             written_off_sat: 0,
+            // No bond has ever been slashed, so no low-water mark exists and
+            // nothing is indeterminate. Written out rather than defaulted,
+            // same break-this-line reason.
+            stake_low_water: Vec::new(),
+            unbacked_indeterminate: Vec::new(),
             evm: EvmCommitment {
                 account_root: [0u8; 32],
                 receipts_root: [0u8; 32],
