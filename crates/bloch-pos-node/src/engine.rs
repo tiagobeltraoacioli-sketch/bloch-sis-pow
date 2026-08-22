@@ -555,7 +555,7 @@ impl Engine {
         // Each refusal drops exactly one transaction and retries, so the loop
         // is bounded by the selection size and terminates: the empty selection
         // always computes.
-        let mut txs = self.select_transactions();
+        let mut txs = self.select_transactions(bloch_pos_committee::epoch_of(slot));
         let (post, tx_bytes) = loop {
             let tx_bytes: Vec<Vec<u8>> = txs.iter().map(PosTransaction::canonical_bytes).collect();
             header.body_root = derive::body_root(&tx_bytes);
@@ -838,7 +838,14 @@ impl Engine {
     /// proposer sorts by what the transaction pays, and doing that here before
     /// transfers carry a value format would be inventing an ordering over a
     /// field nobody sets yet.
-    fn select_transactions(&self) -> Vec<PosTransaction> {
+    ///
+    /// `epoch` is the epoch of the slot being produced, because the byte cap
+    /// is flag-day gated. Packing against the wrong era is not symmetric: the
+    /// old cap after activation only wastes capacity, but the new cap before
+    /// it builds a block every other node rejects — so the epoch comes from
+    /// the slot this proposer is building for, not from anything ambient.
+    fn select_transactions(&self, epoch: u64) -> Vec<PosTransaction> {
+        let cap = bloch_pos_committee::fee_market::max_block_tx_bytes(epoch);
         let mut out = Vec::new();
         let mut bytes = 0u64;
         for (encoded, tx) in self.mempool.iter() {
@@ -846,7 +853,7 @@ impl Engine {
                 break;
             }
             let n = encoded.len() as u64;
-            if bytes + n > bloch_pos_committee::fee_market::MAX_BLOCK_TX_BYTES {
+            if bytes + n > cap {
                 break;
             }
             bytes += n;

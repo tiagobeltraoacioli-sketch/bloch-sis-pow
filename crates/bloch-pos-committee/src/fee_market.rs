@@ -75,6 +75,42 @@ pub const BLOCK_GAS_LIMIT: u64 = 60_000_000;
 pub const BLOCK_GAS_TARGET: u64 = BLOCK_GAS_LIMIT / 2;
 pub const BLOCK_TX_BYTES_TARGET: u64 = MAX_BLOCK_TX_BYTES / 2;
 
+/// The post-flag-day payload cap: 512 KiB.
+///
+/// The V1 cap fits ~30 deduplicated-witness-free transfer inputs (8,560 B
+/// each); doubling it doubles every byte-bound count on the chain, and bytes
+/// are what bind — a payload-saturated block spends 8,388,608 of the 60 M gas
+/// cap, so gas has room for the raise and the `capacity_v2_still_gas_bound`
+/// assertion below pins that it still does.
+pub const MAX_BLOCK_TX_BYTES_V2: u64 = 524_288;
+pub const BLOCK_TX_BYTES_TARGET_V2: u64 = MAX_BLOCK_TX_BYTES_V2 / 2;
+
+/// The payload cap in force at `epoch`.
+///
+/// Every consensus site must ask through here rather than reading a constant,
+/// so that lowering [`crate::params::BLOCK_BYTES_V2_ACTIVATION_EPOCH`] moves
+/// the whole chain at once. `epoch` must be derived from the block's own
+/// header slot: a cap read from node-local state is how a fleet on one binary
+/// splits.
+pub const fn max_block_tx_bytes(epoch: u64) -> u64 {
+    if epoch < crate::params::BLOCK_BYTES_V2_ACTIVATION_EPOCH {
+        MAX_BLOCK_TX_BYTES
+    } else {
+        MAX_BLOCK_TX_BYTES_V2
+    }
+}
+
+/// The EIP-1559 byte target in force at `epoch`. Always half of
+/// [`max_block_tx_bytes`] at the same epoch — pinned by
+/// `target_is_half_the_cap_in_both_eras`.
+pub const fn block_tx_bytes_target(epoch: u64) -> u64 {
+    if epoch < crate::params::BLOCK_BYTES_V2_ACTIVATION_EPOCH {
+        BLOCK_TX_BYTES_TARGET
+    } else {
+        BLOCK_TX_BYTES_TARGET_V2
+    }
+}
+
 // ── Gas costing ─────────────────────────────────────────────────────────────
 
 /// Gas per payload byte. Ethereum's non-zero-calldata price, kept because it
@@ -203,14 +239,21 @@ pub struct BlockUsage {
 /// state). Skipped slots produce no block and therefore no update; the base
 /// fee carries over unchanged, which under-reacts to demand spikes during
 /// outages and is preferred to any clock-dependent rule.
-pub const fn next_base_fee(parent_base_fee: u128, parent: BlockUsage) -> u128 {
+pub const fn next_base_fee(parent_base_fee: u128, parent: BlockUsage, epoch: u64) -> u128 {
+    // The byte target is epoch-gated (`BLOCK_BYTES_V2_ACTIVATION_EPOCH`), so it
+    // is read here rather than named as a constant. `epoch` is the epoch the
+    // price will be CHARGED in, not the parent's: at the flag-day boundary the
+    // parent's usage was produced under the old cap, but the block this price
+    // applies to lives under the new one, and pricing it against the old target
+    // would read a legal 300 KiB block as 2.3x over target.
+    let byte_target = block_tx_bytes_target(epoch);
     // Which axis is more utilised: gas/GT >= bytes/BT  <=>  gas*BT >= bytes*GT.
-    let gas_cross = parent.gas_used as u128 * BLOCK_TX_BYTES_TARGET as u128;
+    let gas_cross = parent.gas_used as u128 * byte_target as u128;
     let bytes_cross = parent.tx_bytes as u128 * BLOCK_GAS_TARGET as u128;
     let (used, target) = if gas_cross >= bytes_cross {
         (parent.gas_used as u128, BLOCK_GAS_TARGET as u128)
     } else {
-        (parent.tx_bytes as u128, BLOCK_TX_BYTES_TARGET as u128)
+        (parent.tx_bytes as u128, byte_target as u128)
     };
 
     let base = clamp_base_fee(parent_base_fee);
@@ -381,6 +424,15 @@ const _: () = assert!(
 // Targets are exact halves — the controller's neutral point is well-defined.
 const _: () = assert!(BLOCK_GAS_TARGET * 2 == BLOCK_GAS_LIMIT);
 const _: () = assert!(BLOCK_TX_BYTES_TARGET * 2 == MAX_BLOCK_TX_BYTES);
+const _: () = assert!(BLOCK_TX_BYTES_TARGET_V2 * 2 == MAX_BLOCK_TX_BYTES_V2);
+/// The raise must not silently move the binding resource from bytes to gas:
+/// if a payload-saturated V2 block could exceed the gas cap, the byte cap
+/// would stop being the thing that limits a block and every capacity number
+/// derived from it would be wrong.
+const _: () = assert!(
+    MAX_BLOCK_TX_BYTES_V2 as u128 * GAS_PER_BYTE as u128 <= BLOCK_GAS_LIMIT as u128,
+    "a 512 KiB payload must still fit under BLOCK_GAS_LIMIT"
+);
 
 // Overflow headroom, as proofs:
 // (1) fee settlement: block gas x the maximum representable price fits u128;
@@ -421,13 +473,103 @@ mod tests {
         let b = next_base_fee(
             8_000,
             BlockUsage { gas_used: BLOCK_GAS_LIMIT, tx_bytes: 0 },
+            0,
         );
         assert_eq!(b, 9_000); // +1/8
     }
 
+    // ── The 512 KiB raise ───────────────────────────────────────────────
+    //
+    // The activation epoch is `u64::MAX`, so `epoch == u64::MAX` is the only
+    // reachable point of the V2 era and every test below uses it as such. The
+    // whole rest of this suite runs at epoch 0 and is the control: it passes
+    // unchanged, which is the claim that nothing moves before the flag day.
+
+    #[test]
+    fn v1_era_is_untouched_by_the_raise() {
+        // The control half. Both ends of the old era, including the last
+        // epoch before activation.
+        const ACT: u64 = crate::params::BLOCK_BYTES_V2_ACTIVATION_EPOCH;
+        for e in [0, 1, ACT - 1] {
+            assert_eq!(max_block_tx_bytes(e), 262_144, "cap moved at epoch {e}");
+            assert_eq!(block_tx_bytes_target(e), 131_072, "target moved at epoch {e}");
+        }
+    }
+
+    #[test]
+    fn v2_era_doubles_the_cap() {
+        const ACT: u64 = crate::params::BLOCK_BYTES_V2_ACTIVATION_EPOCH;
+        assert_eq!(max_block_tx_bytes(ACT), 524_288);
+        assert_eq!(block_tx_bytes_target(ACT), 262_144);
+        assert_eq!(max_block_tx_bytes(ACT.saturating_add(1)), 524_288);
+    }
+
+    #[test]
+    fn target_is_half_the_cap_in_both_eras() {
+        // The EIP-1559 invariant, which the raise must not break in either
+        // era: a block at target on both axes leaves the price alone.
+        const ACT: u64 = crate::params::BLOCK_BYTES_V2_ACTIVATION_EPOCH;
+        for e in [0, ACT - 1, ACT, ACT.saturating_add(1)] {
+            assert_eq!(block_tx_bytes_target(e) * 2, max_block_tx_bytes(e));
+        }
+    }
+
+    #[test]
+    fn the_cap_and_the_target_are_one_switch_not_two() {
+        // THE load-bearing test, and the reason `block_tx_bytes_target` is
+        // gated at all rather than left at 131,072.
+        //
+        // A 256 KiB block is exactly the OLD cap. In the old era that is a
+        // saturated block: twice its 131,072 target, so the controller raises
+        // the price, correctly, because the resource really is exhausted.
+        let saturated = BlockUsage { gas_used: 0, tx_bytes: 262_144 };
+        assert!(
+            next_base_fee(8_000, saturated, crate::params::BLOCK_BYTES_V2_ACTIVATION_EPOCH - 1)
+                > 8_000,
+            "a full block in the old era must get more expensive"
+        );
+
+        // The same block in the new era is exactly AT target — half of a
+        // 512 KiB cap — so the price must not move at all. Had the target
+        // stayed at 131,072 while the cap doubled, this block would still
+        // read as 2x over target and the chain would price a half-full block
+        // as congested, forever.
+        assert_eq!(
+            next_base_fee(8_000, saturated, crate::params::BLOCK_BYTES_V2_ACTIVATION_EPOCH),
+            8_000,
+            "a half-full block in the new era must be priced as at-target"
+        );
+    }
+
+    #[test]
+    fn a_saturated_v2_payload_still_fits_under_the_gas_cap() {
+        // Bytes must remain the binding resource after the raise. If a full
+        // V2 payload could exceed BLOCK_GAS_LIMIT, the byte cap would stop
+        // being what limits a block and every capacity figure derived from it
+        // would be wrong. (The const assertion pins this at compile time; this
+        // is the runtime statement of the same fact, with the numbers visible.)
+        let payload_gas =
+            max_block_tx_bytes(crate::params::BLOCK_BYTES_V2_ACTIVATION_EPOCH) * GAS_PER_BYTE;
+        assert_eq!(payload_gas, 8_388_608);
+        assert!(payload_gas < BLOCK_GAS_LIMIT, "{payload_gas} vs {BLOCK_GAS_LIMIT}");
+    }
+
+    #[test]
+    fn raising_the_block_cap_is_a_flag_day() {
+        // The tripwire does NOT forbid arming — it forbids arming the two
+        // switches at DIFFERENT epochs. A fleet running two rule sets is a
+        // partition, and the whole point of a flag day is that everyone
+        // changes at once.
+        assert_eq!(
+            crate::params::BLOCK_BYTES_V2_ACTIVATION_EPOCH,
+            crate::params::TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH,
+            "both consensus switches must activate at the SAME epoch"
+        );
+    }
+
     #[test]
     fn base_fee_falls_one_eighth_on_empty_block() {
-        let b = next_base_fee(8_000, BlockUsage { gas_used: 0, tx_bytes: 0 });
+        let b = next_base_fee(8_000, BlockUsage { gas_used: 0, tx_bytes: 0 }, 0);
         assert_eq!(b, 7_000); // -1/8
     }
 
@@ -436,6 +578,7 @@ mod tests {
         let b = next_base_fee(
             8_000,
             BlockUsage { gas_used: BLOCK_GAS_TARGET, tx_bytes: BLOCK_TX_BYTES_TARGET },
+            0,
         );
         assert_eq!(b, 8_000);
     }
@@ -448,6 +591,7 @@ mod tests {
         let b = next_base_fee(
             8_000,
             BlockUsage { gas_used: BLOCK_GAS_TARGET / 10, tx_bytes: MAX_BLOCK_TX_BYTES },
+            0,
         );
         assert_eq!(b, 9_000); // byte axis fully utilised: +1/8
     }
@@ -458,6 +602,7 @@ mod tests {
         let b = next_base_fee(
             MIN_BASE_FEE_MILLISAT_PER_GAS,
             BlockUsage { gas_used: 0, tx_bytes: 0 },
+            0,
         );
         assert_eq!(b, MIN_BASE_FEE_MILLISAT_PER_GAS);
         // A congested block moves the price by at least 1 even when the
@@ -465,12 +610,14 @@ mod tests {
         let b = next_base_fee(
             MIN_BASE_FEE_MILLISAT_PER_GAS,
             BlockUsage { gas_used: BLOCK_GAS_TARGET + 1, tx_bytes: 0 },
+            0,
         );
         assert_eq!(b, MIN_BASE_FEE_MILLISAT_PER_GAS + 1);
         // Ceiling: clamped, no overflow.
         let b = next_base_fee(
             MAX_BASE_FEE_MILLISAT_PER_GAS,
             BlockUsage { gas_used: BLOCK_GAS_LIMIT, tx_bytes: MAX_BLOCK_TX_BYTES },
+            0,
         );
         assert_eq!(b, MAX_BASE_FEE_MILLISAT_PER_GAS);
     }

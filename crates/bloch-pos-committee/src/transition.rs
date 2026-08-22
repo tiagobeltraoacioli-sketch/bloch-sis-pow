@@ -2386,12 +2386,26 @@ impl CommittedState {
     /// and the validator charges every included transaction with it. A second
     /// expression of this rule anywhere is h28080 with a fee attached.
     pub fn next_base_fee(&self) -> u128 {
+        self.next_base_fee_at(self.epoch)
+    }
+
+    /// The price this state charges for a block in `epoch`.
+    ///
+    /// The epoch is explicit because the EIP-1559 byte target is flag-day
+    /// gated and this state's own `epoch` is the WRONG one to use at the
+    /// boundary: `compute_post_state` prices from `pre`, which has not rolled
+    /// yet, so on the first block of the activation epoch `pre.epoch` is still
+    /// the old era. The consensus caller passes the epoch derived from the
+    /// block's header slot; [`Self::next_base_fee`] keeps the convenient form
+    /// for the producer and the RPC, where this state IS the one being priced.
+    pub fn next_base_fee_at(&self, epoch: u64) -> u128 {
         fee_market::next_base_fee(
             self.base_fee_millisat_per_gas,
             fee_market::BlockUsage {
                 gas_used: self.block_gas_used,
                 tx_bytes: self.block_tx_bytes,
             },
+            epoch,
         )
     }
 
@@ -2925,7 +2939,7 @@ impl<V: SignatureVerifier> Transition<V> {
         // boundaries, and a boundary is not a block — it moves no price. Both
         // read the same fields here, and reading the pre-state is what says
         // so.
-        let base_fee = pre.next_base_fee();
+        let base_fee = pre.next_base_fee_at(block_epoch);
 
         let total_active: u128 = roster.iter().map(|v| v.effective_stake as u128).sum();
         let mut base_fees: u128 = 0;
@@ -2981,7 +2995,7 @@ impl<V: SignatureVerifier> Transition<V> {
         if block_gas > fee_market::BLOCK_GAS_LIMIT {
             return Err(TransitionError::BlockGasLimitExceeded);
         }
-        if block_bytes > fee_market::MAX_BLOCK_TX_BYTES {
+        if block_bytes > fee_market::max_block_tx_bytes(block_epoch) {
             return Err(TransitionError::BlockByteLimitExceeded);
         }
 
@@ -4237,6 +4251,7 @@ mod tests {
             fee_market::next_base_fee(
                 s1.base_fee_millisat_per_gas(),
                 fee_market::BlockUsage { gas_used: s1.block_gas_used, tx_bytes: s1.block_tx_bytes },
+                s1.epoch,
             )
         );
 
@@ -4277,6 +4292,118 @@ mod tests {
     /// exist yet (`TxClass::Shielded`, `EvmPq`) rather than a live constraint
     /// on transfers — and a backstop that is never exercised is precisely the
     /// kind of check that rots, which is why it is still tested.
+    /// A2: the byte cap must come from the BLOCK's own epoch, not from a
+    /// constant and not from node-local state.
+    ///
+    /// Without this test the whole flag day is unpinned: reverting the gate at
+    /// `compute_post_state` to the raw `MAX_BLOCK_TX_BYTES` survives every
+    /// other test in this crate, and that revert is exactly the shape of the
+    /// 2026-08-08 `expected_bits` fork — a rule read from somewhere other than
+    /// the block being judged. It is not hypothetical: that revert reached
+    /// this branch once, and this test is what caught it.
+    #[test]
+    fn the_block_cap_gate_reads_the_epoch_from_the_blocks_own_header() {
+        const ACT: u64 = crate::params::BLOCK_BYTES_V2_ACTIVATION_EPOCH;
+        let Some(first_v2_slot) = ACT.checked_mul(crate::params::SLOTS_PER_EPOCH) else {
+            // Inert: no header slot can name the V2 era at all, which IS the
+            // transition-level statement of inertness. Nothing to exercise.
+            return;
+        };
+
+        // A payload over the V1 cap and under the V2 cap. The ONLY thing that
+        // can decide it is which era the block is in.
+        let over_v1 = fee_market::MAX_BLOCK_TX_BYTES + 1;
+        assert!(over_v1 <= fee_market::MAX_BLOCK_TX_BYTES_V2);
+
+        let owner = owner_key(0x41);
+        let to = script_of(&owner_key(0x42));
+
+        // In the V2 era it is accepted.
+        let c1 = opening(0x81, 0, 21_000_000_000_000_000, &owner);
+        let (t, g, mut chains) = setup_funded(4, std::slice::from_ref(&c1));
+        let fat = transfer_spending(
+            std::slice::from_ref(&c1), &owner, to, over_v1, 0, g.next_base_fee(),
+        );
+        let b = build_block(&t, &g, first_v2_slot, &[], std::slice::from_ref(&fat), &mut chains);
+        assert!(
+            t.apply_block(&g, &b, &[], std::slice::from_ref(&fat)).is_ok(),
+            "a block over the V1 cap must be VALID once the flag day has passed"
+        );
+
+        // THE CONTROL: the same payload, same size, in the V1 era — refused.
+        // Only the era differs between the two halves, so the verdict is about
+        // the era and nothing else.
+        let c2 = opening(0x82, 0, 21_000_000_000_000_000, &owner);
+        let (t2, g2, mut chains2) = setup_funded(4, std::slice::from_ref(&c2));
+        let fat2 = transfer_spending(
+            std::slice::from_ref(&c2), &owner, to, over_v1, 0, g2.next_base_fee(),
+        );
+        let env2 = probe_env(&g2, 1, std::slice::from_ref(&fat2), &mut chains2);
+        assert_eq!(
+            t2.compute_post_state(&g2, &env2, &[], std::slice::from_ref(&fat2)).unwrap_err(),
+            TransitionError::BlockByteLimitExceeded,
+            "the same block one epoch earlier must still be over the cap"
+        );
+    }
+
+    /// A2, the other half: the price the boundary block CHARGES must come
+    /// from the block's epoch, not from the parent state's.
+    ///
+    /// `compute_post_state` prices from `pre`, which has not rolled yet, so on
+    /// the first block of the activation epoch `pre.epoch` is still the old
+    /// era. Pricing from it would charge that block against a 131,072 target
+    /// under a 524,288 cap — a legal half-full block read as congested. This
+    /// asserts on the price the post state COMMITS, because asserting on the
+    /// two helper methods instead leaves the wiring free: reverting the call
+    /// to `pre.next_base_fee()` survives a test that only compares helpers.
+    #[test]
+    fn the_boundary_blocks_price_comes_from_the_block_epoch_not_the_parent() {
+        const ACT: u64 = crate::params::BLOCK_BYTES_V2_ACTIVATION_EPOCH;
+        let Some(first_v2_slot) = ACT.checked_mul(crate::params::SLOTS_PER_EPOCH) else {
+            return;
+        };
+
+        let owner = owner_key(0x43);
+        let to = script_of(&owner_key(0x44));
+        let c = opening(0x83, 0, 21_000_000_000_000_000, &owner);
+        let (t, g, mut chains) = setup_funded(4, std::slice::from_ref(&c));
+
+        // The parent: the last block of the old era, saturating the V1 cap.
+        // 256 KiB is twice the old target and exactly the new one, so it is
+        // the single payload that prices differently in the two eras.
+        let saturating = transfer_spending(
+            std::slice::from_ref(&c), &owner, to,
+            fee_market::MAX_BLOCK_TX_BYTES, 0, g.next_base_fee(),
+        );
+        let b1 = build_block(
+            &t, &g, first_v2_slot - 1, &[], std::slice::from_ref(&saturating), &mut chains,
+        );
+        let s1 = t
+            .apply_block(&g, &b1, &[], std::slice::from_ref(&saturating))
+            .expect("a block at exactly the V1 cap is valid in the old era");
+        assert_eq!(s1.epoch, ACT - 1, "parent must sit one epoch below the flag day");
+        assert_eq!(s1.block_tx_bytes, fee_market::MAX_BLOCK_TX_BYTES);
+
+        // The two candidate prices really differ — otherwise this proves
+        // nothing. `next_base_fee()` is the old-era answer, because s1's own
+        // epoch is the old era; that is exactly the value the wiring must NOT
+        // use for a block in the new one.
+        let old_era_price = s1.next_base_fee();
+        let new_era_price = s1.next_base_fee_at(ACT);
+        assert!(old_era_price > s1.base_fee_millisat_per_gas(), "old era: congested");
+        assert_eq!(new_era_price, s1.base_fee_millisat_per_gas(), "new era: at target");
+        assert_ne!(old_era_price, new_era_price);
+
+        // The boundary block itself. What it COMMITS is the price it charged.
+        let b2 = build_block(&t, &s1, first_v2_slot, &[], &[], &mut chains);
+        let s2 = t.apply_block(&s1, &b2, &[], &[]).expect("boundary block must apply");
+        assert_eq!(
+            s2.base_fee_millisat_per_gas(),
+            new_era_price,
+            "the boundary block must be priced against the epoch it lives in"
+        );
+    }
+
     #[test]
     fn the_two_block_caps_are_enforced() {
         let owner = owner_key(0x37);
@@ -6179,15 +6306,20 @@ mod tests {
     // block path correctly refuses everything. The gate itself is tested
     // end-to-end through `compute_post_state`.
 
-    /// The shipped default has to stay inert — the `leaked_roster_ships_inert`
-    /// tripwire, for this flag day.
+    /// Arming this format is a flag day. Once armed, the thing that must hold
+    /// is not "still inert" — it is that the epoch is in the FUTURE relative
+    /// to nothing this test can see, and that it moves together with the block
+    /// cap. So the tripwire checks the pairing (see
+    /// `raising_the_block_cap_is_a_flag_day`) and this test checks the only
+    /// property left that is checkable here: an armed epoch must be a real
+    /// one, and the fleet must be rebuilt before the chain reaches it.
     #[test]
-    fn transfer_v2_ships_inert() {
+    fn transfer_v2_activation_is_paired_with_the_block_cap() {
         assert_eq!(
             crate::params::TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH,
-            u64::MAX,
-            "activating the deduplicated transfer format is a flag day: \
-             set the epoch and roll the fleet together"
+            crate::params::BLOCK_BYTES_V2_ACTIVATION_EPOCH,
+            "both consensus switches must activate at the SAME epoch: a fleet \
+             running two different rule sets is a partition"
         );
     }
 
