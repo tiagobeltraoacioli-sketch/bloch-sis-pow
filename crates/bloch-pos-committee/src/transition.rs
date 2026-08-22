@@ -8144,6 +8144,50 @@ mod tests {
     /// bond's real value first (the whole point — otherwise slashing is free
     /// for the genesis cohort), so the post-slash `unbacked` equals the
     /// whole surviving bond, and only post-slash earnings are payable.
+    /// PROBE (epoch-discipline front, 2026-08-22): what a gate set in the
+    /// PAST actually does. The runbook assumes it bricks the fleet — fails
+    /// safe. It does not.
+    ///
+    /// `close_epoch_gated` materializes on a strict CROSSING
+    /// (`closing < gate && next >= gate`). A gate at or below the chain's
+    /// current epoch is never crossed, so `unbacked_sat` stays EMPTY, and a
+    /// withdrawal that pays `staked_sat - unbacked_sat` pays the whole
+    /// never-emitted genesis principal. Silent leak, not a brick.
+    #[test]
+    fn probe_a_gate_in_the_past_never_materializes_and_leaks() {
+        let (_t, g, _c) = setup(4);
+
+        // CONTROL: a gate in the FUTURE is crossed and materializes.
+        let crossed = g.close_epoch_gated(1);
+        assert!(
+            !crossed.unbacked_sat.is_empty(),
+            "control: a forward crossing must materialize the write-off map"
+        );
+
+        // The chain has already run past epoch 3 when someone picks gate = 2.
+        let mut late = g.clone();
+        late.epoch = 3;
+        let after = late.close_epoch_gated(2);
+        assert!(
+            after.unbacked_sat.is_empty(),
+            "a gate in the past is never crossed - the write-off map stays empty"
+        );
+
+        // And that empty map is the leak: the full unfunded bond reads as
+        // withdrawable.
+        let staked = after.validator_record(0).unwrap().staked_sat;
+        assert_eq!(
+            after.unbacked_principal_sat(0),
+            0,
+            "nothing is written off, so nothing is withheld"
+        );
+        assert_eq!(
+            staked,
+            sat(200_000),
+            "the whole never-emitted principal is payable"
+        );
+    }
+
     #[test]
     fn slash_below_principal_then_reaccumulate_pays_exactly_the_emitted_excess() {
         let (_t, g, _c) = setup(4);
