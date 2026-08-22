@@ -206,7 +206,7 @@ fn test_transfer(inputs: u32, tx_bytes: u64, tip: u128) -> PosTransaction {
 fn getchaininfo_reports_slot_epoch_head_root_and_both_checkpoints() {
     let st = state_with_balances();
     let head = st.head();
-    let v = chain_info_json(&st, &head, 0, Some(0), 12, 2, 3, 0);
+    let v = chain_info_json(&st, &head, 0, Some(0), 12, 2, 3, 0, &Default::default());
 
     assert_eq!(v.get("slot").unwrap().as_u64(), Some(0));
     assert_eq!(v.get("epoch").unwrap().as_u64(), Some(0));

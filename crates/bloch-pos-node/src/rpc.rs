@@ -1177,6 +1177,7 @@ pub fn chain_info_json(
     validators_total: usize,
     mempool: usize,
     blocks_known: usize,
+    queue: &crate::net::QueueStats,
 ) -> Json {
     let fin = state.finality();
     let slot = state.slot();
@@ -1230,6 +1231,32 @@ pub fn chain_info_json(
         // (R1), so the node states it.
         ("wall_slot", Json::u(wall_slot)),
         ("behind_by_slots", Json::u(wall_slot.saturating_sub(slot))),
+        // The inbound queue, per class. Additive: nothing above changed name,
+        // type or position.
+        //
+        // `shed` is the number this exists for. Until 2026-08-22 a full queue
+        // dropped events with no log, no verdict and no broken connection, and
+        // blocks and attestations shared one cap — so a flood of stale
+        // attestations could silently eat the room arriving blocks needed, and
+        // did, for weeks, on mainnet. A non-zero and CLIMBING `block.shed` is
+        // that failure, visible from outside the process this time. The
+        // counters are monotonic since boot, so read them as differences.
+        (
+            "queue",
+            Json::obj(vec![
+                ("block", queue_class_json(&queue.block)),
+                ("attestation", queue_class_json(&queue.attestation)),
+                ("transaction", queue_class_json(&queue.transaction)),
+            ]),
+        ),
+    ])
+}
+
+fn queue_class_json(c: &crate::net::ClassStats) -> Json {
+    Json::obj(vec![
+        ("queued", Json::u(c.items as u64)),
+        ("queued_bytes", Json::u(c.bytes as u64)),
+        ("shed", Json::u(c.shed)),
     ])
 }
 

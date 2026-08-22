@@ -79,7 +79,7 @@ use bloch_pos_committee::{committees, derive, epoch_of, schedule};
 
 use crate::genesis::{Manifest, GENESIS_MIX};
 use crate::keys::{HybridVerifier, Keystore, ProbeVerifier};
-use crate::net::{self, NetEvent, Origin, Verdict};
+use crate::net::{self, EngineQueue, NetEvent, Origin, Verdict};
 use crate::rpc::{self, Admitted, Finality, Json, RpcCall, RpcError, RpcRequest, RpcResult};
 use crate::store::Store;
 
@@ -90,7 +90,12 @@ use crate::store::Store;
 /// state — rather than from a copy kept alongside it — is why this wrapper
 /// exists; see [`crate::rpc::EngineBackend`].
 pub enum EngineEvent {
-    Net(NetEvent),
+    /// A network event and its reservation in [`EngineQueue`]. The permit
+    /// travels WITH the event and is dropped at the end of the match arm that
+    /// handles it, so the quota measures work not yet done rather than events
+    /// not yet dequeued — which is what the old hand-written counter claimed
+    /// to do and did not.
+    Net(NetEvent, net::Permit),
     Rpc(RpcCall),
 }
 
@@ -141,6 +146,39 @@ pub struct Config {
     /// the server entirely.
     pub rpc_bind: String,
     pub rpc_port: Option<u16>,
+}
+
+/// Forward libp2p's decoded events onto the engine channel, admitting each one
+/// into [`EngineQueue`] on the way.
+///
+/// **This hop is the libp2p path's only ceiling.** `p2p::Loop::emit` sends into
+/// an unbounded channel and counts nothing, so before this the production
+/// transport had no admission control at all — while the engine's
+/// hand-written decrement fired for its events anyway, subtracting from a
+/// counter nobody had incremented and wrapping it to ~2^64.
+///
+/// Admitting here rather than inside `p2p.rs` keeps that module speaking plain
+/// `NetEvent` — its tests read the raw events — and puts the quota on the one
+/// thread both transports already pass through. This thread does nothing but
+/// forward, so it is a hop and not a second queue in front of a sleeping
+/// consumer.
+///
+/// A free function and not a closure so it can be tested: see
+/// `libp2p_admission_tests`.
+fn forward_admitted(
+    net_rx: mpsc::Receiver<NetEvent>,
+    tx: mpsc::Sender<EngineEvent>,
+    queue: Arc<EngineQueue>,
+) {
+    for ev in net_rx {
+        let bytes = ev.wire_bytes();
+        let Some(permit) = EngineQueue::admit_event(&queue, &ev, bytes) else {
+            continue; // shed: counted, and logged if the limiter allows
+        };
+        if tx.send(EngineEvent::Net(ev, permit)).is_err() {
+            return; // engine gone; nothing left to deliver to
+        }
+    }
 }
 
 fn now_ms() -> u64 {
@@ -246,6 +284,11 @@ struct Engine {
     ws_anchor_hard: bool,
     /// A forward WS_CONFLICT is announced once, not every block.
     ws_conflict_reported: bool,
+    /// The inbound quota, read-only from here. Carried so `getchaininfo` can
+    /// report depth and shed counts: a counter only visible inside the process
+    /// is a counter nobody checks, and that invisibility is half of why silent
+    /// shedding hid a block-delivery failure for weeks.
+    queue: Arc<EngineQueue>,
 }
 
 /// Why a transaction was turned away at the door.
@@ -1335,6 +1378,7 @@ impl Engine {
                 self.state.validator_count(),
                 self.mempool.len(),
                 self.blocks.len(),
+                &self.queue.stats(),
             )),
 
             RpcRequest::BlockCount => {
@@ -1570,11 +1614,12 @@ pub fn run(cfg: Config) -> io::Result<()> {
 
     let logged = store.read_all()?;
     let head_slot = Arc::new(AtomicU64::new(0));
-    // Network events queued but not yet handled. The transport reads it to
-    // decide when to shed rather than queue — see `net::send_to_engine`. It is
-    // decremented below, after each event is actually processed, so "in flight"
-    // means exactly that and not "ever sent".
-    let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // Network events queued but not yet handled, metered separately per class
+    // — see `net::EngineQueue`. Blocks and attestations used to share one cap
+    // of 4096, which is how a flood of stale attestations silently ate the
+    // quota that arriving blocks needed and left 61 of 64 validators unable to
+    // deliver one.
+    let queue = Arc::new(EngineQueue::new());
     let (tx, rx) = mpsc::channel::<EngineEvent>();
     // The transports speak NetEvent and know nothing about the RPC; the engine
     // consumes one channel. Rather than teach both transports the engine's
@@ -1584,13 +1629,8 @@ pub fn run(cfg: Config) -> io::Result<()> {
     let (net_tx, net_rx) = mpsc::channel::<NetEvent>();
     {
         let tx = tx.clone();
-        std::thread::spawn(move || {
-            for ev in net_rx {
-                if tx.send(EngineEvent::Net(ev)).is_err() {
-                    return; // engine gone; nothing left to deliver to
-                }
-            }
-        });
+        let queue = queue.clone();
+        std::thread::spawn(move || forward_admitted(net_rx, tx, queue));
     }
     let net = match cfg.transport {
         Transport::Devnet => net::Net::Devnet(net::start(
@@ -1600,7 +1640,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
             tx.clone(),
             cfg.data_dir.clone(),
             head_slot.clone(),
-            inflight.clone(),
+            queue.clone(),
         )?),
         Transport::Libp2p => {
             let parse = |s: &str, what: &str| -> io::Result<crate::p2p::Multiaddr> {
@@ -1658,6 +1698,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         ws_anchor: None,
         ws_anchor_hard: false,
         ws_conflict_reported: false,
+        queue: queue.clone(),
         manifest,
     };
 
@@ -1909,19 +1950,17 @@ pub fn run(cfg: Config) -> io::Result<()> {
                     pending.push(more);
                 }
                 for ev in pending {
-                    // Every `EngineEvent::Net` was counted into `inflight` by
-                    // the transport; releasing it here — after handling, not on
-                    // dequeue — is what makes the cap mean "work the engine has
-                    // not done yet".
-                    if matches!(ev, EngineEvent::Net(_)) {
-                        inflight.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-                    }
+                    // No release step: each `Net` event carries its permit, and
+                    // binding it in the arm holds the quota until the arm ends
+                    // — after the work, not on dequeue. The version this
+                    // replaces subtracted here, before the `match`, under a
+                    // comment claiming the opposite.
                     match ev {
-                        EngineEvent::Net(NetEvent::Block(env)) => engine.ingest(env),
-                        EngineEvent::Net(NetEvent::Attestation(att, origin)) => {
+                        EngineEvent::Net(NetEvent::Block(env), _permit) => engine.ingest(env),
+                        EngineEvent::Net(NetEvent::Attestation(att, origin), _permit) => {
                             engine.on_attestation(att, origin, wall_epoch)
                         }
-                        EngineEvent::Net(NetEvent::Transaction(tx)) => {
+                        EngineEvent::Net(NetEvent::Transaction(tx), _permit) => {
                             // Gossip has nobody to answer to; the verdict is the
                             // RPC's concern, not a peer's.
                             let _ = engine.on_transaction(tx);
@@ -2874,7 +2913,7 @@ mod transfer_v2_end_to_end {
         // `_rx` drops here: nothing dials this node, and the accept loop
         // exits quietly on a closed channel.
         let head_slot = Arc::new(AtomicU64::new(0));
-        let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let queue = Arc::new(EngineQueue::new());
         let net = net::Net::Devnet(
             net::start(
                 "127.0.0.1",
@@ -2883,7 +2922,7 @@ mod transfer_v2_end_to_end {
                 events,
                 dir.clone(),
                 head_slot.clone(),
-                inflight,
+                queue.clone(),
             )
             .expect("bind the devnet transport on an ephemeral port"),
         );
@@ -2912,6 +2951,7 @@ mod transfer_v2_end_to_end {
             ws_anchor: None,
             ws_anchor_hard: false,
             ws_conflict_reported: false,
+            queue,
         }
     }
 
@@ -3100,5 +3140,134 @@ mod transfer_v2_end_to_end {
             "a full mempool SHOULD advise retrying: {}",
             e2.message
         );
+    }
+}
+
+#[cfg(test)]
+mod libp2p_admission_tests {
+    //! The production transport's admission, which nothing covered until the
+    //! mutation run: deleting the quota check from the forwarder left the whole
+    //! suite green, and that is precisely the state libp2p shipped in.
+
+    use super::*;
+    use crate::net::{Class, EngineQueue, NetEvent};
+    use bloch_pos_committee::attestation::{Attestation, AttestationData};
+    use bloch_pos_committee::header::{BlockEnvelope, BlockHeaderV4, Body};
+
+    fn envelope(slot: u64) -> BlockEnvelope {
+        BlockEnvelope {
+            header: BlockHeaderV4 {
+                version: 4,
+                parent: [0u8; 32],
+                state_root: [0u8; 32],
+                body_root: [0u8; 32],
+                slot,
+                proposer_index: 17,
+                randao_reveal: [0u8; 32],
+                randao_mix: [0u8; 32],
+                justified_root: [0u8; 32],
+                finalized_root: [0u8; 32],
+                attestation_root: [0u8; 32],
+                coherence_root: [0u8; 32],
+            },
+            proposer_sig: vec![7u8; 64],
+            body: Body { attestations: Vec::new(), transactions: Vec::new() },
+        }
+    }
+
+    fn attestation(slot: u64) -> NetEvent {
+        NetEvent::Attestation(
+            Attestation {
+                data: AttestationData {
+                    slot,
+                    head: [0u8; 32],
+                    source_epoch: 0,
+                    source_root: [0u8; 32],
+                    target_epoch: 0,
+                    target_root: [0u8; 32],
+                },
+                validator: 3,
+                signature: vec![9u8; 4_800],
+            },
+            crate::net::Origin::none(),
+        )
+    }
+
+    /// Drain the forwarder to completion over a fixed input.
+    fn forward(queue: &Arc<EngineQueue>, evs: Vec<NetEvent>) -> Vec<EngineEvent> {
+        let (net_tx, net_rx) = mpsc::channel::<NetEvent>();
+        let (tx, rx) = mpsc::channel::<EngineEvent>();
+        for e in evs {
+            net_tx.send(e).expect("the forwarder has not started yet");
+        }
+        drop(net_tx); // closing the input is what ends the loop
+        forward_admitted(net_rx, tx, queue.clone());
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(ev);
+        }
+        out
+    }
+
+    /// The motivating case again, on the production transport this time: with
+    /// the attestation quota saturated, a block still gets through.
+    #[test]
+    fn a_block_still_arrives_on_libp2p_while_attestations_are_saturated() {
+        let queue = Arc::new(EngineQueue::new());
+        let (att_items, _) = (2048usize, ());
+        let _flood: Vec<_> = (0..att_items)
+            .filter_map(|_| EngineQueue::admit(&queue, Class::Attestation, 4_929))
+            .collect();
+        assert_eq!(_flood.len(), att_items, "the attestation class must really be full");
+
+        let out = forward(&queue, vec![attestation(1), NetEvent::Block(envelope(25_750))]);
+        assert_eq!(out.len(), 1, "the attestation is shed, the block is not");
+        match &out[0] {
+            EngineEvent::Net(NetEvent::Block(env), _) => {
+                assert_eq!(env.header.slot, 25_750)
+            }
+            _ => panic!("the survivor must be the block"),
+        }
+        assert_eq!(queue.stats().attestation.shed, 1, "and the shed attestation is counted");
+    }
+
+    /// The CONTROL: the forwarder is a ceiling, not a funnel. Saturate BLOCKS
+    /// and the block it forwards must be shed and counted — otherwise the
+    /// libp2p path is the unbounded channel it used to be.
+    #[test]
+    fn the_libp2p_forwarder_sheds_and_counts_when_the_block_quota_is_full() {
+        let queue = Arc::new(EngineQueue::new());
+        let _full: Vec<_> = (0..1024usize)
+            .filter_map(|_| EngineQueue::admit(&queue, Class::Block, 700))
+            .collect();
+        assert_eq!(_full.len(), 1024, "the block class must really be full");
+
+        let out = forward(&queue, vec![NetEvent::Block(envelope(9))]);
+        assert!(out.is_empty(), "a block over the block quota must not reach the engine");
+        assert_eq!(queue.stats().block.shed, 1, "and it must leave a trace");
+    }
+
+    /// The forwarder must charge each event to its own class and to its real
+    /// size — it is the only place the libp2p path is measured, so an event
+    /// mis-sized here is a ceiling that is wrong by exactly that much.
+    #[test]
+    fn the_forwarder_charges_each_event_to_its_own_class_and_size() {
+        let queue = Arc::new(EngineQueue::new());
+        let block = NetEvent::Block(envelope(4));
+        let att = attestation(4);
+        let (bb, ab) = (block.wire_bytes(), att.wire_bytes());
+
+        let held = forward(&queue, vec![block, att]);
+        assert_eq!(held.len(), 2);
+        let s = queue.stats();
+        assert_eq!(s.block.items, 1, "one block on the block meter");
+        assert_eq!(s.block.bytes, bb, "charged its real wire size");
+        assert_eq!(s.attestation.items, 1, "one attestation on the attestation meter");
+        assert_eq!(s.attestation.bytes, ab);
+
+        drop(held);
+        let s = queue.stats();
+        assert_eq!(s.block.items + s.attestation.items, 0, "and the permits give it all back");
+        assert_eq!(s.block.bytes + s.attestation.bytes, 0);
     }
 }
