@@ -1235,6 +1235,13 @@ pub fn chain_info_json(
             "supply_cap_sat",
             Json::sat(bloch_pos_committee::tokenomics_v4::TOTAL_SUPPLY_SAT),
         ),
+        // The write-off audit counter (2026-08-22): cumulative never-emitted
+        // bond principal written to zero at withdrawals, next to the
+        // issuance counter it deliberately never touched. The runbook's
+        // end-state check: 160,000,000,000,000 sat (1,600,000 BLOCH) once
+        // all 64 genesis bonds are withdrawn, with `issued_supply_sat`
+        // unmoved by any of those withdrawals.
+        ("written_off_sat", Json::sat(state.written_off_sat())),
         ("base_fee_millisat_per_gas", Json::sat(state.base_fee_millisat_per_gas())),
         ("next_base_fee_millisat_per_gas", Json::sat(state.next_base_fee())),
         ("mempool", Json::u(mempool as u64)),
@@ -1406,6 +1413,9 @@ pub fn submitted_json(tx: &PosTransaction, outcome: Admitted) -> Json {
         PosTransaction::Deposit { .. } => "deposit",
         PosTransaction::Exit { .. } => "exit",
         PosTransaction::Delegate { .. } => "delegate",
+        PosTransaction::DepositFunded { .. } => "deposit_funded",
+        PosTransaction::ExitV2 { .. } => "exit_v2",
+        PosTransaction::Withdraw { .. } => "withdraw",
         PosTransaction::SlashingEvidence(_) => "slashing_evidence",
     };
     Json::obj(vec![

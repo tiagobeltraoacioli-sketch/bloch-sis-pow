@@ -382,6 +382,11 @@ mod tests {
                 tx_bytes: 0,
             },
             delegator_fee_rewards: Vec::new(),
+            // Pre-flag-day shape: no unissued-principal entries, nothing
+            // written off. Written out rather than defaulted, same
+            // break-this-line reason.
+            unbacked_principals: Vec::new(),
+            written_off_sat: 0,
             evm: EvmCommitment {
                 account_root: [0x14; 32],
                 receipts_root: [0x15; 32],

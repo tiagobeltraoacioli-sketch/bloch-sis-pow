@@ -208,6 +208,45 @@ const TAG_BASE_FEE: u8 = 0x15;
 /// that disagreed on it would pay a different amount for the same exit.
 const TAG_DELEGATOR_FEE_REWARD: u8 = 0x16;
 
+/// Unissued bond principal still inside one validator's bond, in satoshis
+/// (2026-08-22, the funded-staking flag day's write-off rule — founder
+/// decision recorded in `params::FUNDED_STAKE_ACTIVATION_EPOCH`'s docs).
+///
+/// The 64 genesis bonds — and any bond a legacy `Deposit` registered — name
+/// an `amount_sat` that no eUTXO was ever destroyed for and that
+/// `issued_sat` never counted. That principal must never become spendable
+/// coin: a withdrawal pays `staked_sat - unbacked_sat` and writes the rest
+/// off. The quantity is committed per validator index because it is what a
+/// withdrawal pays out of — a node that disagreed on it would pay a
+/// different amount for the same withdrawal, the §5.5 bar exactly.
+///
+/// It is a committed quantity and NOT an enum on the validator record, for
+/// two reasons. First, `ValidatorRecord`'s committed serialization is
+/// frozen: a new field there would re-key every validator leaf and change
+/// every historical root on replay. A separate map that is EMPTY before the
+/// flag day contributes no leaves, so every pre-gate root stays
+/// byte-identical. Second, only the gross remaining amount — not a class
+/// bit — survives slashing correctly: a bond slashed below its principal
+/// and re-grown by (emitted) rewards owes the holder exactly the emitted
+/// excess, which `min`-folding this number under every stake reduction
+/// computes and a boolean cannot.
+///
+/// Unforgeable because NO transaction writes it: the only writes are the
+/// one-time materialization at the activation boundary (a pure function of
+/// genesis data plus the committed deposit history) and the maintenance fold
+/// `unbacked = min(unbacked, staked_sat)` after a slash. A funded deposit
+/// destroys real outputs and by construction creates no entry here.
+///
+/// Canonical form: an entry exists iff its value is non-zero.
+const TAG_UNBACKED_PRINCIPAL: u8 = 0x17;
+
+/// Cumulative unissued principal written off at withdrawals, in satoshis
+/// (2026-08-22). A single leaf, committed only once non-zero — so every
+/// pre-gate root stays byte-identical — and monotone thereafter. Pure audit
+/// surface: it lets an operator verify over RPC that the 1,600,000 BLOCH of
+/// genesis principal left the books as write-off, never as coin.
+const TAG_WRITTEN_OFF: u8 = 0x18;
+
 
 fn sha3(parts: &[&[u8]]) -> [u8; 32] {
     let mut h = Sha3_256::new();
@@ -1033,6 +1072,28 @@ impl DelegatorLossRecord {
     }
 }
 
+/// Unissued principal remaining inside one validator's bond
+/// ([`TAG_UNBACKED_PRINCIPAL`]) — the amount a withdrawal writes off instead
+/// of paying. See the tag's docs for why this is a committed quantity, why it
+/// lives outside the validator record, and why no transaction can write it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnbackedPrincipalRecord {
+    pub validator: u32,
+    pub unbacked_sat: u128,
+}
+
+impl UnbackedPrincipalRecord {
+    fn entry_key(&self) -> Vec<u8> {
+        self.validator.to_le_bytes().to_vec()
+    }
+    fn serialize(&self) -> Vec<u8> {
+        let mut s = Vec::with_capacity(20);
+        s.extend_from_slice(&self.validator.to_le_bytes());
+        s.extend_from_slice(&self.unbacked_sat.to_le_bytes());
+        s
+    }
+}
+
 /// The committed L1 fee-market state ([`TAG_BASE_FEE`]): the base fee this
 /// block's transactions were charged, in millisatoshi per gas
 /// (`fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS` at genesis), and the block's
@@ -1140,6 +1201,15 @@ pub struct ConsensusState<'a> {
     /// Cumulative fee rewards per delegator account
     /// ([`TAG_DELEGATOR_FEE_REWARD`]).
     pub delegator_fee_rewards: &'a [DelegatorFeeRecord],
+    /// Unissued principal remaining per validator bond
+    /// ([`TAG_UNBACKED_PRINCIPAL`], 2026-08-22). Empty before the
+    /// funded-staking flag day — an empty component contributes no leaves,
+    /// which is what keeps every pre-gate root byte-identical.
+    pub unbacked_principals: &'a [UnbackedPrincipalRecord],
+    /// Cumulative written-off principal ([`TAG_WRITTEN_OFF`], 2026-08-22).
+    /// Its leaf is committed only once non-zero, for the same pre-gate
+    /// byte-identity reason.
+    pub written_off_sat: u128,
 }
 
 /// How many **closed** epoch boundaries the committed beacon history retains,
@@ -1332,6 +1402,27 @@ fn build_state_tree_inner(
         smt.insert(
             derive_key(TAG_DELEGATOR_FEE_REWARD, &d.entry_key()),
             hash_value(&d.serialize()),
+        );
+    }
+    // The write-off pair (2026-08-22): per-validator unissued principal, plus
+    // the cumulative written-off counter. Both components are empty/zero on
+    // every state before the funded-staking flag day, and — unlike the
+    // singletons above, which are committed unconditionally — the counter's
+    // leaf appears only once it is non-zero. That conditional is the flag-day
+    // compatibility rule itself: a binary carrying this code and one without
+    // it must commit byte-identical roots for every pre-gate state, or the
+    // fleet forks at the rebuild instead of at the flag day (pinned by
+    // `transition::tests::pre_gate_roots_are_byte_identical_to_the_ungated_code`).
+    for u in state.unbacked_principals {
+        smt.insert(
+            derive_key(TAG_UNBACKED_PRINCIPAL, &u.entry_key()),
+            hash_value(&u.serialize()),
+        );
+    }
+    if state.written_off_sat > 0 {
+        smt.insert(
+            derive_key(TAG_WRITTEN_OFF, &[]),
+            hash_value(&state.written_off_sat.to_le_bytes()),
         );
     }
     smt
@@ -1604,6 +1695,8 @@ mod tests {
         losses: Vec<DelegatorLossRecord>,
         base_fee: BaseFeeRecord,
         fee_rewards: Vec<DelegatorFeeRecord>,
+        unbacked: Vec<UnbackedPrincipalRecord>,
+        written_off_sat: u128,
     }
 
     fn fixture() -> Fx {
@@ -1732,6 +1825,14 @@ mod tests {
             DelegatorFeeRecord { delegator: 1, reward_sat: 55 },
             DelegatorFeeRecord { delegator: 900, reward_sat: 4_321 },
         ];
+        // Validator 1 deliberately collides with a registry key, a slash-loss
+        // key and a fee-reward key: the component tag is what keeps unissued
+        // principal apart from all three. Non-zero written-off counter so its
+        // conditional leaf is present and coverable.
+        let unbacked = vec![
+            UnbackedPrincipalRecord { validator: 1, unbacked_sat: 2_500_000_000_000 },
+            UnbackedPrincipalRecord { validator: 77, unbacked_sat: 9 },
+        ];
         Fx {
             eutxos,
             validators,
@@ -1751,6 +1852,8 @@ mod tests {
             losses,
             base_fee,
             fee_rewards,
+            unbacked,
+            written_off_sat: 777,
         }
     }
 
@@ -1938,6 +2041,8 @@ mod tests {
             delegator_slash_losses: &f.losses,
             base_fee: f.base_fee,
             delegator_fee_rewards: &f.fee_rewards,
+            unbacked_principals: &f.unbacked,
+            written_off_sat: f.written_off_sat,
         }
     }
 
@@ -2063,6 +2168,18 @@ mod tests {
         mutated!(|g: &mut Fx| g.fee_rewards[0].delegator += 1);
         mutated!(|g: &mut Fx| g.fee_rewards[0].reward_sat += 1);
         mutated!(|g: &mut Fx| g.fee_rewards.pop().map(|_| ()).unwrap());
+        // The write-off pair (2026-08-22): the amount a withdrawal pays is
+        // `staked - unbacked`, so an uncommitted or truncated entry here means
+        // two nodes pay different amounts for the same withdrawal.
+        mutated!(|g: &mut Fx| g.unbacked[0].validator += 1);
+        mutated!(|g: &mut Fx| g.unbacked[0].unbacked_sat += 1);
+        mutated!(|g: &mut Fx| g.unbacked.pop().map(|_| ()).unwrap());
+        mutated!(|g: &mut Fx| g.written_off_sat += 1);
+        // Zero is the ABSENT encoding for the written-off leaf, on purpose
+        // (pre-gate byte-identity) — so zero and any non-zero value must
+        // commit different roots, which the mutation above already proves,
+        // and zeroing it must equal never having committed it at all.
+        mutated!(|g: &mut Fx| g.written_off_sat = 0);
 
         // Singleton roots and the issued-supply counter.
         for i in 0..4 {

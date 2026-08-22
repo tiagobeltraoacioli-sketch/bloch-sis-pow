@@ -2210,6 +2210,64 @@ pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'s
             "exits are not accepted: the Exit message is not authenticated, \
              so anyone could retire any validator irreversibly",
         ),
+        // The funded-staking discriminants (tags 0x07/0x08/0x09): admitted
+        // from their flag day, refused before it — same wall-clock-epoch
+        // reasoning as the TransferV2 arm above (admission asks "can some
+        // FUTURE block apply this?", and every future block's epoch is >= the
+        // admitting node's wall epoch; consensus itself gates on the
+        // committed epoch in `apply_transaction`, never on anything here).
+        // Structural checks stay minimal on purpose: pre-gate the refusal is
+        // the whole rule, and post-gate the proposer's probe drops anything
+        // consensus refuses (the drop-and-retry loop in `propose`). The one
+        // non-negotiable is that DepositFunded's signatures are verified
+        // before gossip — the same ProbeVerifier blindness that motivated
+        // checking Transfer signatures at this door applies verbatim.
+        PosTransaction::DepositFunded { keys, inputs, .. } => {
+            if wall_epoch < bloch_pos_committee::params::FUNDED_STAKE_ACTIVATION_EPOCH {
+                return Err(
+                    "funded deposits (tag 0x07) are not active: the format ships behind \
+                     a flag day (FUNDED_STAKE_ACTIVATION_EPOCH) that this chain has not \
+                     reached",
+                );
+            }
+            if inputs.is_empty() {
+                return Err("funded deposit has no inputs — it bonds nothing and cannot apply");
+            }
+            if keys.is_empty() {
+                return Err("funded deposit carries no witness keys — nothing authorises it");
+            }
+            let signing_root = tx.funded_deposit_signing_root();
+            for k in keys {
+                if !bloch_crypto::crypto::verify(&k.pubkey, &signing_root, &k.signature) {
+                    return Err("funded deposit carries a signature that does not verify");
+                }
+            }
+            Ok(())
+        }
+        PosTransaction::ExitV2 { .. } => {
+            if wall_epoch < bloch_pos_committee::params::FUNDED_STAKE_ACTIVATION_EPOCH {
+                return Err(
+                    "signed exits (tag 0x08) are not active: the format ships behind a \
+                     flag day (FUNDED_STAKE_ACTIVATION_EPOCH) that this chain has not \
+                     reached",
+                );
+            }
+            // The signature needs the registered pubkey, which is committed
+            // state this stateless function does not hold; consensus verifies
+            // it (`apply_exit_v2`), and a garbage-signed exit dies in the
+            // proposer's probe like any other refusable transaction.
+            Ok(())
+        }
+        PosTransaction::Withdraw { .. } => {
+            if wall_epoch < bloch_pos_committee::params::FUNDED_STAKE_ACTIVATION_EPOCH {
+                return Err(
+                    "withdrawals (tag 0x09) are not active: the format ships behind a \
+                     flag day (FUNDED_STAKE_ACTIVATION_EPOCH) that this chain has not \
+                     reached",
+                );
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }

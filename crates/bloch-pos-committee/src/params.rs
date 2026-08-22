@@ -208,24 +208,31 @@ pub const BLOCK_BYTES_V2_ACTIVATION_EPOCH: u64 = 800;
 ///   state root is bit-identical across the gate slot itself, so nothing
 ///   changes outside the gate (rule 2).
 ///
-/// # Why the wire change is not shipped next to this constant yet
+/// # The founder's decision — OPTION 3, WRITE-OFF AT WITHDRAWAL (2026-08-22)
 ///
-/// The mainnet manifest bonds 25,000 BLOCH for each of its 64 validators —
-/// 1,600,000 BLOCH of principal that `Manifest::genesis_issued_sat()`
-/// (`bloch-pos-node/src/genesis.rs`) never counted: genesis issuance is
-/// carryover plus allocations only, and `CommittedState::genesis` seeds the
-/// registry bonds with no eUTXO counterpart and no `issued_sat` contribution.
-/// All 64 withdrawal credentials are one address — the founder's carried
-/// H160, zero-padded to 32 bytes (pinned by test against the published
-/// manifest). Whether that principal is (1) recognised as retroactive
-/// emission (`issued_sat += 160e12` once, at the first boundary past the
-/// gate, shrinking future emission by 0.0037%), (2) re-backed by burning an
-/// equal amount of the founder's liquid coins, or (3) written off so a
-/// genesis withdrawal returns only the post-genesis accrual, is an economic
-/// decision that belongs to the founder. Shipping withdrawal code before that
-/// decision is made would hard-code one of the three by accident — so the
-/// gate is reserved here, inert, and the wire shapes follow the decision.
-/// (The post-genesis accrual itself is clean either way: epoch emission
+/// The facts that forced a decision: the mainnet manifest bonds 25,000 BLOCH
+/// for each of its 64 validators — 1,600,000 BLOCH of principal that
+/// `Manifest::genesis_issued_sat()` (`bloch-pos-node/src/genesis.rs`) never
+/// counted: genesis issuance is carryover plus allocations only, and
+/// `CommittedState::genesis` seeds the registry bonds with no eUTXO
+/// counterpart and no `issued_sat` contribution. All 64 withdrawal
+/// credentials are one address — the founder's carried H160, zero-padded to
+/// 32 bytes (pinned by test against the published manifest). The three
+/// candidate rules were (1) retroactive emission, (2) re-backing by burning
+/// founder coins, (3) write-off. The founder chose **(3)**: a genesis
+/// withdrawal pays only the post-genesis accrual; the never-emitted
+/// principal is written to zero and never becomes coin.
+///
+/// The implementation (transition.rs, 2026-08-22, this crate): the
+/// per-validator committed quantity `unbacked_sat` (`TAG_UNBACKED_PRINCIPAL`)
+/// records how much of each bond was never emitted — materialized once, at
+/// this gate's activation boundary, from genesis data plus the committed
+/// deposit history; min-folded under every slash; paid around by `Withdraw`
+/// (`payout = staked_sat - unbacked_sat`); summed into `written_off_sat`
+/// (`TAG_WRITTEN_OFF`) when written off. A validator registered by
+/// `DepositFunded` destroyed real, already-issued coins and carries
+/// `unbacked_sat = 0`, so it withdraws principal AND rewards in full.
+/// (The post-genesis accrual is clean in both classes: epoch emission
 /// advances `issued_sat` when it credits a bond, and fee rewards are backed
 /// by coins the transfer path already destroyed.)
 ///
@@ -254,6 +261,12 @@ pub const DS_STATE: [u8; 16] = *b"BLCH4:STATE\0\0\0\0\0";
 pub const DS_RANDAO: [u8; 16] = *b"BLCH4:RANDAO\0\0\0\0";
 /// Deposit message signing root (§7.1 proof of possession).
 pub const DS_DEPOSIT: [u8; 16] = *b"BLCH4:DEPOSIT\0\0\0";
+/// Funded-deposit spend authorisation (2026-08-22): the domain each input
+/// owner of a `DepositFunded` signs under. Its own tag — not `DS_SPEND`,
+/// not `DS_DEPOSIT` — because the same outputs must not be spendable into a
+/// transfer by a signature that authorised a bond, and a bond authorisation
+/// must not double as a proof-of-possession; one signature, one meaning.
+pub const DS_FUND: [u8; 16] = *b"BLCH4:FUND\0\0\0\0\0\0";
 /// The signing root an eUTXO spend authorisation covers: the domain under
 /// which an output's owner authorises *this* transfer and no other.
 ///
