@@ -16,11 +16,16 @@
 //!
 //! Every arriving attestation resolves to exactly one of:
 //!
-//! - **Reject** — a provable protocol violation (non-member, bad signature,
-//!   malformed checkpoints). The node penalizes the forwarding peer.
-//! - **Ignore** — true but useless (duplicate, outside the window, over the
-//!   equivocation cap). Dropped silently, **never** penalized.
-//! - **Hold** — references a block root we have not imported yet.
+//! - **Reject** — a provable protocol violation (non-member *under a shared
+//!   derivation basis*, bad signature, malformed checkpoints). The node
+//!   penalizes the forwarding peer.
+//! - **Ignore** — true but useless, or unjudgeable from this node's chain
+//!   view (duplicate, outside the window, over the equivocation cap, a
+//!   basis this node cannot derive a committee from). Dropped silently,
+//!   **never** penalized.
+//! - **Hold** — references a block root we have not imported yet (either a
+//!   voted-for head racing its own gossip, or the target checkpoint of a
+//!   chain prefix this node has not caught up to).
 //!
 //! Hold is the load-bearing verb. An attestation for slot `s` votes for the
 //! head produced *in* slot `s`, so at every epoch boundary (and on every fast
@@ -89,6 +94,18 @@ pub enum IgnoreReason {
     /// This duty already produced its two distinct (slashable) attestations;
     /// further variants are noise.
     EquivocationLimit,
+    /// The attestation's declared basis (its target checkpoint) is a block we
+    /// KNOW but which is not our own checkpoint for that epoch: the attester
+    /// derived its committee from a different chain prefix — a real fork at
+    /// the epoch boundary. We cannot derive the committee it used, so a
+    /// membership verdict computed from OUR prefix would prove nothing;
+    /// mainnet measured exactly this on 2026-08-21 (nodes finalized epochs
+    /// apart, e772 vs e754, rejecting every honest attestation as
+    /// `NotInCommittee` and penalizing the peers that relayed them). Dropped
+    /// in silence, never penalized. If that branch wins fork choice the
+    /// post-reorg [`AttestationPool::replay_all`] revisits parked votes, and
+    /// the mesh re-sends live ones regardless.
+    UnjudgeableBasis,
 }
 
 /// The decision on one arriving attestation. The node maps this onto
@@ -115,19 +132,46 @@ pub enum GossipDecision {
     Hold { missing_root: [u8; 32] },
 }
 
-/// Committee membership, injected. The committee for a slot MUST be derived
-/// from committed state (`committees::committee_for_slot` over the finalized
-/// parent's registry and beacon mix, §5.5) — never from node-local mutable
-/// state; that rule exists because `expected_bits` read from local state
-/// split consensus on 2026-08-08. Returned sorted ascending, as
-/// `epoch_committees` already guarantees.
-pub trait CommitteeLookup {
-    fn committee(&self, slot: u64) -> Vec<u32>;
+/// What the injected committee derivation could conclude for one attestation.
+///
+/// The distinction this type carries is the fix for the 2026-08-21 mainnet
+/// failure: "not a member" and "I cannot evaluate this slot" used to collapse
+/// into one `Reject`, so a node whose head lagged derived a different
+/// committee and rejected — and penalized — every honest attester. A
+/// membership verdict is only *evidence* when both ends derived it from the
+/// same committed prefix, and the attestation declares its basis itself: its
+/// `target_root` is the checkpoint of its slot's epoch. The injector compares
+/// that declaration against its own checkpoint and answers `Binding` only on
+/// a match.
+#[derive(Clone, Debug)]
+pub enum CommitteeView {
+    /// Both ends derived membership from the same committed prefix (the
+    /// attestation's target root IS this node's checkpoint for that epoch).
+    /// The verdict is binding: a non-member is a provable violation, exactly
+    /// as before. Sorted ascending, as `epoch_committees` guarantees.
+    Binding(Vec<u32>),
+    /// This node does not share the attestation's basis and therefore cannot
+    /// derive the committee the attester used. The attestation may be
+    /// perfectly honest (the common case: this node is behind); nothing about
+    /// it is provable either way, so this must NEVER feed a peer penalty.
+    NotDerivable,
 }
 
-impl<F: Fn(u64) -> Vec<u32>> CommitteeLookup for F {
-    fn committee(&self, slot: u64) -> Vec<u32> {
-        self(slot)
+/// Committee membership, injected. A `Binding` committee MUST be derived from
+/// committed state (`committees::committee_for_slot` over the registry and
+/// beacon mix of the chain prefix the `target_root` names, §5.5) — never from
+/// node-local mutable state; that rule exists because `expected_bits` read
+/// from local state split consensus on 2026-08-08. And `Binding` may only be
+/// answered when `target_root` matches the injector's own checkpoint for the
+/// slot's epoch — a membership verdict over a *different* prefix is
+/// [`CommitteeView::NotDerivable`], not a rejection.
+pub trait CommitteeLookup {
+    fn committee(&self, slot: u64, target_root: &[u8; 32]) -> CommitteeView;
+}
+
+impl<F: Fn(u64, &[u8; 32]) -> CommitteeView> CommitteeLookup for F {
+    fn committee(&self, slot: u64, target_root: &[u8; 32]) -> CommitteeView {
+        self(slot, target_root)
     }
 }
 
@@ -167,6 +211,13 @@ struct DutyRecord {
 struct PendingEntry {
     att: Attestation,
     missing_root: [u8; 32],
+    /// `true` when the entry was parked with a [`CommitteeView::Binding`]
+    /// verdict already in hand (the boundary race: shared basis, block
+    /// milliseconds away); `false` when parked because the basis itself was
+    /// [`CommitteeView::NotDerivable`]. Eviction under pressure takes the
+    /// `false` band first — it is the band an attacker can fill by citing a
+    /// bogus unknown target root.
+    shared_basis: bool,
 }
 
 /// The attestation pool: dedup, equivocation capture, and the pending
@@ -205,9 +256,14 @@ impl AttestationPool {
     ///   1. slot window          → outside: Ignore (stale/skewed ≠ hostile)
     ///   2. checkpoint sanity    → source ≥ target: Reject (provably malformed)
     ///   3. dedup + equivocation cap → Ignore
-    ///   4. duty membership      → non-member: Reject (cannot be honest skew:
-    ///      membership is a deterministic function of committed state both
-    ///      sides can compute)
+    ///   4a. shared basis        → the injected view answers `Binding` only
+    ///      when the attestation's target root IS our checkpoint for its
+    ///      epoch; otherwise `NotDerivable`: unknown target → Hold (we are
+    ///      behind; re-judged when the block lands), known-but-different
+    ///      target → Ignore (a fork we cannot judge; never a penalty)
+    ///   4b. duty membership     → under a Binding view a non-member is a
+    ///      provable violation (both ends computed membership from the same
+    ///      committed prefix): Reject
     ///   5. head/target known?   → unknown: Hold
     ///   6. hybrid signature     → bad: Reject; good: Accept
     ///
@@ -268,12 +324,47 @@ impl AttestationPool {
             return GossipDecision::Ignore(IgnoreReason::Duplicate);
         }
 
-        // 4. Duty membership, from committed state. Binary search: committees
-        //    are sorted by construction (committees.rs sorts each committee).
-        //    A non-member cannot be honest timing skew — both ends compute
-        //    membership from the same finalized state — so this is a Reject.
-        if committees.committee(slot).binary_search(&att.validator).is_err() {
-            return GossipDecision::Reject(RejectReason::NotInCommittee);
+        // 4a. Shared basis. A slot's committee is a pure function of the
+        //     chain prefix up to its epoch's boundary, and the attestation
+        //     DECLARES that basis itself: its target root is the checkpoint
+        //     of its epoch. The injected view answers `Binding` only when
+        //     that declaration matches the node's own checkpoint — i.e. only
+        //     when both ends derived membership from the SAME committed
+        //     prefix. Without the match, a local membership verdict proves
+        //     nothing: mainnet measured nodes finalized epochs apart (e772 vs
+        //     e754, 2026-08-21) rejecting every honest attestation here and
+        //     penalizing the peers that relayed them.
+        match committees.committee(slot, &att.data.target_root) {
+            CommitteeView::Binding(committee) => {
+                // 4b. Duty membership, now binding. Binary search: committees
+                //     are sorted by construction (committees.rs sorts each
+                //     committee). Under a shared basis a non-member cannot be
+                //     honest timing skew — both ends computed membership from
+                //     the same committed prefix — so this stays a Reject,
+                //     exactly as before.
+                if committee.binary_search(&att.validator).is_err() {
+                    return GossipDecision::Reject(RejectReason::NotInCommittee);
+                }
+            }
+            CommitteeView::NotDerivable => {
+                // The bases differ; neither sub-case is provable hostility,
+                // so neither may feed a peer penalty.
+                //
+                // Target unknown: this node is BEHIND (the measured mainnet
+                // shape) — the sync pump will deliver that block, so park
+                // under it and re-judge on arrival; by then the checkpoint
+                // usually matches and the entry converges to Accept.
+                //
+                // Target known but on another prefix: a real fork at the
+                // boundary. The vote is unjudgeable here; drop in silence.
+                // The post-reorg `replay_all` re-runs parked entries if that
+                // branch later wins.
+                if !blocks.is_known(&att.data.target_root) {
+                    let missing = att.data.target_root;
+                    return self.hold(att, missing, false);
+                }
+                return GossipDecision::Ignore(IgnoreReason::UnjudgeableBasis);
+            }
         }
 
         // 5. Referenced blocks. The attestation votes for the head produced
@@ -284,7 +375,7 @@ impl AttestationPool {
         //    block just produced, and it races too.
         for root in [att.data.head, att.data.target_root] {
             if !blocks.is_known(&root) {
-                return self.hold(att, root);
+                return self.hold(att, root, true);
             }
         }
 
@@ -345,6 +436,46 @@ impl AttestationPool {
         out
     }
 
+    /// Re-judge EVERY parked attestation against a fresh chain view — the
+    /// post-reorg hook.
+    ///
+    /// [`Self::on_block`] releases only the waiters of one arriving root; a
+    /// reorg changes the answer for entries whose *basis* was underivable on
+    /// the old branch (their target may be the canonical checkpoint now), and
+    /// those are parked under roots no future `on_block` will name. Bounded
+    /// by the pool cap, each entry goes through the full pipeline again in
+    /// insertion order (deterministic); everything before the signature is
+    /// nanoseconds, and the hybrid verify is only paid for entries that pass
+    /// every other check. Entries still unjudgeable are simply re-parked.
+    pub fn replay_all(
+        &mut self,
+        current_slot: u64,
+        committees: &impl CommitteeLookup,
+        blocks: &impl BlockLookup,
+        verifier: &dyn SignatureVerifier,
+    ) -> Vec<(Attestation, GossipDecision)> {
+        let seqs: Vec<u64> = self.pending.keys().copied().collect();
+        let mut out = Vec::with_capacity(seqs.len());
+        for seq in seqs {
+            let entry = match self.pending.remove(&seq) {
+                Some(e) => e,
+                None => continue,
+            };
+            let key = (entry.att.data.slot, entry.att.validator, entry.att.data.signing_root());
+            self.pending_keys.remove(&key);
+            if let Some(set) = self.pending_by_root.get_mut(&entry.missing_root) {
+                set.remove(&seq);
+                if set.is_empty() {
+                    self.pending_by_root.remove(&entry.missing_root);
+                }
+            }
+            let att = entry.att;
+            let decision = self.process(att.clone(), current_slot, committees, blocks, verifier);
+            out.push((att, decision));
+        }
+        out
+    }
+
     /// Drop everything the acceptance window has moved past. Deterministic:
     /// the surviving state is a pure function of (state, `current_slot`).
     ///
@@ -387,18 +518,32 @@ impl AttestationPool {
     /// "reject new": under a flood the newest entries are the ones most
     /// likely to still matter, and determinism requires the evictee to be a
     /// function of state, not of memory pressure or timing.
-    fn hold(&mut self, att: Attestation, missing_root: [u8; 32]) -> GossipDecision {
+    fn hold(&mut self, att: Attestation, missing_root: [u8; 32], shared_basis: bool) -> GossipDecision {
         while self.pending.len() >= MAX_PENDING_ATTESTATIONS {
-            // Oldest first. `keys().next()` on a BTreeMap is the smallest
-            // sequence number ever still present — insertion order, exactly.
-            let oldest = *self.pending.keys().next().expect("non-empty: len >= cap > 0");
-            self.evict(oldest);
+            // Two-band eviction, oldest first within each band. Entries
+            // parked with an underivable basis go before entries parked
+            // under a shared basis: the first band is fillable by an
+            // attacker citing a bogus unknown target root, the second is
+            // the honest boundary race whose block is milliseconds away —
+            // a flood of the former must not eject the latter. Within a
+            // band, `find`/`keys().next()` over a BTreeMap walks ascending
+            // sequence numbers — insertion order, exactly, so eviction
+            // stays a deterministic function of state.
+            let victim = self
+                .pending
+                .iter()
+                .find(|(_, e)| !e.shared_basis)
+                .map(|(seq, _)| *seq)
+                .unwrap_or_else(|| {
+                    *self.pending.keys().next().expect("non-empty: len >= cap > 0")
+                });
+            self.evict(victim);
         }
         let seq = self.next_seq;
         self.next_seq += 1;
         self.pending_keys.insert((att.data.slot, att.validator, att.data.signing_root()));
         self.pending_by_root.entry(missing_root).or_default().insert(seq);
-        self.pending.insert(seq, PendingEntry { att, missing_root });
+        self.pending.insert(seq, PendingEntry { att, missing_root, shared_basis });
         GossipDecision::Hold { missing_root }
     }
 
@@ -445,9 +590,18 @@ mod tests {
     const CURRENT_SLOT: u64 = 100;
 
     /// Committee for every slot in these tests: validators 1..=8, sorted, as
-    /// `epoch_committees` would return them.
+    /// `epoch_committees` would return them — answered as `Binding`, i.e. the
+    /// arriving attestation's target root matches this node's own checkpoint
+    /// (the shared-basis case, which was the only case before 2026-08-21).
     fn committees() -> impl CommitteeLookup {
-        |_slot: u64| vec![1u32, 2, 3, 4, 5, 6, 7, 8]
+        |_slot: u64, _target: &[u8; 32]| CommitteeView::Binding(vec![1u32, 2, 3, 4, 5, 6, 7, 8])
+    }
+
+    /// The lagging-node view: this node's checkpoint does not match the
+    /// attestation's declared basis, so no committee is derivable — for any
+    /// slot. What a node epochs behind the attester computes.
+    fn not_derivable() -> impl CommitteeLookup {
+        |_slot: u64, _target: &[u8; 32]| CommitteeView::NotDerivable
     }
 
     /// Known-block views. `head_of(n)` is the root pattern used by `att`.
@@ -513,10 +667,16 @@ mod tests {
 
     #[test]
     fn non_member_is_rejected() {
+        // THE CONTROL for the shared-basis distinction: under a Binding view
+        // (the attestation's target root matches this node's checkpoint, so
+        // both ends derived the committee from the same committed prefix) a
+        // non-member is still a provable violation. The 2026-08-21 fix must
+        // NOT loosen this — a forger claiming a duty it does not hold, on a
+        // basis we share, is exactly what Reject exists for.
         let mut pool = AttestationPool::new();
         let blocks = default_known();
         // Validator 99 is not in any committee: membership is a deterministic
-        // function of committed state, so this cannot be honest skew.
+        // function of the shared committed prefix, so this cannot be honest skew.
         let d = pool.process(att(99, CURRENT_SLOT, 0xAA), CURRENT_SLOT, &committees(), &known(&blocks), &RootEchoVerifier);
         assert!(matches!(d, GossipDecision::Reject(RejectReason::NotInCommittee)));
     }
@@ -798,5 +958,149 @@ mod tests {
             expected.sort_unstable();
             assert_eq!(hashes, expected);
         }
+    }
+
+    // ── The 2026-08-21 shared-basis distinction ─────────────────────────────
+
+    #[test]
+    fn lagging_node_holds_attestation_it_cannot_judge_then_accepts_on_block() {
+        // THE mandated proof: a node BEHIND the attester (its checkpoint does
+        // not match the attestation's declared basis, and it does not even
+        // have the target block) must NOT reject the honest attestation — it
+        // parks it, and converges to Accept when the sync pump delivers the
+        // target and the basis becomes shared. This is the exact mainnet
+        // shape of 2026-08-21: v17 finalized e754 judging v2's votes based on
+        // e772, and called every one of them NotInCommittee.
+        let mut pool = AttestationPool::new();
+        let nothing_known = BTreeSet::new();
+        let a = att(1, CURRENT_SLOT, 0xAA); // target_root = 0x22, unknown here
+
+        let d = pool.process(a.clone(), CURRENT_SLOT, &not_derivable(), &known(&nothing_known), &RootEchoVerifier);
+        // Not Reject — Hold, parked under the DECLARED basis (the target).
+        assert!(
+            matches!(d, GossipDecision::Hold { missing_root } if missing_root == root(0x22)),
+            "a lagging node must hold, never reject, an attestation whose basis it cannot derive; got {d:?}"
+        );
+        assert_eq!(pool.pending_len(), 1);
+
+        // The sync pump delivers the target block; the node's checkpoint now
+        // matches the attestation's basis, so the view is Binding.
+        let caught_up = default_known();
+        let released = pool.on_block(&root(0x22), CURRENT_SLOT, &committees(), &known(&caught_up), &RootEchoVerifier);
+        assert_eq!(released.len(), 1);
+        assert!(is_accept(&released[0].1), "after catching up the held vote must Accept; got {:?}", released[0].1);
+        assert_eq!(pool.pending_len(), 0);
+
+        // And the final pool state is identical to the block-first ordering —
+        // the Hold verb's determinism contract, extended to the basis case.
+        let mut pool_b = AttestationPool::new();
+        assert!(is_accept(&pool_b.process(a, CURRENT_SLOT, &committees(), &known(&caught_up), &RootEchoVerifier)));
+        assert_eq!(pool.accepted_hashes(CURRENT_SLOT, 1), pool_b.accepted_hashes(CURRENT_SLOT, 1));
+    }
+
+    #[test]
+    fn known_target_on_a_different_prefix_is_ignored_never_penalized() {
+        // The other NotDerivable sub-case: we HAVE the target block, but it
+        // is not our checkpoint (a real fork at the boundary). Unjudgeable —
+        // silence, not a penalty, and nothing is parked (no arrival will
+        // change the answer; only a reorg can, via replay_all).
+        let mut pool = AttestationPool::new();
+        let blocks = default_known(); // 0x22 IS known here
+        let d = pool.process(att(1, CURRENT_SLOT, 0xAA), CURRENT_SLOT, &not_derivable(), &known(&blocks), &RootEchoVerifier);
+        assert!(matches!(d, GossipDecision::Ignore(IgnoreReason::UnjudgeableBasis)));
+        assert_eq!(pool.pending_len(), 0);
+        assert!(pool.accepted_hashes(CURRENT_SLOT, 1).is_empty());
+    }
+
+    #[test]
+    fn unjudgeable_flood_cannot_evict_shared_basis_holds_and_never_accepts() {
+        // Attack half of the (c) boundary: a flood citing bogus unknown
+        // target roots fills the pending pool, but (1) it never produces an
+        // Accept or a relay, (2) it cannot eject the honest boundary-race
+        // band (shared basis), and (3) it dies at the prune horizon.
+        let mut pool = AttestationPool::new();
+
+        // One honest boundary-race hold: shared basis (Binding view), target
+        // known, head 0xAA racing its own gossip.
+        let only_target = [root(0x22)].into_iter().collect::<BTreeSet<_>>();
+        let honest = att(1, CURRENT_SLOT, 0xAA);
+        assert!(matches!(
+            pool.process(honest, CURRENT_SLOT, &committees(), &known(&only_target), &RootEchoVerifier),
+            GossipDecision::Hold { missing_root } if missing_root == root(0xAA)
+        ));
+
+        // Flood: MAX_PENDING distinct attestations whose basis is not
+        // derivable and whose target we do not have.
+        let nothing = BTreeSet::new();
+        for i in 0..(MAX_PENDING_ATTESTATIONS as u64) {
+            let mut d0 = data(CURRENT_SLOT, 0xAA);
+            d0.head = {
+                let mut h = [0xF0u8; 32];
+                h[..8].copy_from_slice(&i.to_le_bytes());
+                h
+            };
+            let d = pool.process(signed(1, d0), CURRENT_SLOT, &not_derivable(), &known(&nothing), &RootEchoVerifier);
+            // Every flood frame is parked or dropped — never accepted,
+            // never rejected (no penalty ammunition for the attacker).
+            assert!(matches!(d, GossipDecision::Hold { .. }), "flood frame {i} got {d:?}");
+        }
+        assert_eq!(pool.pending_len(), MAX_PENDING_ATTESTATIONS);
+
+        // The honest shared-basis entry SURVIVED the flood: its block lands
+        // and it converges to Accept.
+        let caught_up = default_known();
+        let released = pool.on_block(&root(0xAA), CURRENT_SLOT, &committees(), &known(&caught_up), &RootEchoVerifier);
+        assert_eq!(released.len(), 1, "the shared-basis hold must outlive an unjudgeable flood");
+        assert!(is_accept(&released[0].1));
+
+        // And the flood itself expires at the window like any other parked
+        // entry — it occupies nothing forever.
+        pool.prune(CURRENT_SLOT + ATTESTATION_WINDOW_SLOTS + 1);
+        assert_eq!(pool.pending_len(), 0);
+        assert!(pool.pending_by_root.is_empty());
+        assert!(pool.pending_keys.is_empty());
+    }
+
+    #[test]
+    fn replay_all_rejudges_parked_entries_after_reorg() {
+        // A vote parked as basis-unjudgeable is keyed under a root that no
+        // on_block call may ever name again on the losing branch. replay_all
+        // is the post-reorg hook that re-runs everything against the adopted
+        // branch's view — where this vote is judgeable, and valid.
+        let mut pool = AttestationPool::new();
+        let nothing = BTreeSet::new();
+        let a = att(1, CURRENT_SLOT, 0xAA);
+        assert!(matches!(
+            pool.process(a, CURRENT_SLOT, &not_derivable(), &known(&nothing), &RootEchoVerifier),
+            GossipDecision::Hold { .. }
+        ));
+
+        // Reorg adopts the attester's branch: basis shared, blocks known.
+        let adopted = default_known();
+        let released = pool.replay_all(CURRENT_SLOT, &committees(), &known(&adopted), &RootEchoVerifier);
+        assert_eq!(released.len(), 1);
+        assert!(is_accept(&released[0].1));
+        assert_eq!(pool.pending_len(), 0);
+        assert_eq!(pool.accepted_hashes(CURRENT_SLOT, 1).len(), 1);
+    }
+
+    #[test]
+    fn forged_attestation_parked_as_unjudgeable_dies_at_release() {
+        // Holds — basis holds included — precede signature verification, so
+        // the forgery check must still land when the entry is finally
+        // judgeable: the (c) boundary is not loosened, only deferred.
+        let mut pool = AttestationPool::new();
+        let nothing = BTreeSet::new();
+        let mut a = att(1, CURRENT_SLOT, 0xAA);
+        a.signature = vec![0u8; 32]; // forged
+        assert!(matches!(
+            pool.process(a, CURRENT_SLOT, &not_derivable(), &known(&nothing), &RootEchoVerifier),
+            GossipDecision::Hold { .. }
+        ));
+        let caught_up = default_known();
+        let released = pool.on_block(&root(0x22), CURRENT_SLOT, &committees(), &known(&caught_up), &RootEchoVerifier);
+        assert_eq!(released.len(), 1);
+        assert!(matches!(released[0].1, GossipDecision::Reject(RejectReason::BadSignature)));
+        assert!(pool.accepted_hashes(CURRENT_SLOT, 1).is_empty());
     }
 }

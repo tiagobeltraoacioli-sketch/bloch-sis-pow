@@ -59,6 +59,7 @@
 //! and, on a devnet, free; when it stops being free the fix is an incremental
 //! store with a test proving it equals the rebuild, not a cache with a comment.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
 use std::path::PathBuf;
@@ -70,7 +71,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use bloch_pos_committee::attestation::{Attestation, AttestationData};
 use bloch_pos_committee::beacon::{mix_in, RandaoChain};
 use bloch_pos_committee::forkchoice::{BlockTree, LatestMessage, Store as FcStore};
-use bloch_pos_committee::gossip::{AttestationPool, GossipDecision};
+use bloch_pos_committee::gossip::{AttestationPool, CommitteeView, GossipDecision};
 use bloch_pos_committee::header::{BlockEnvelope, BlockHeaderV4, BlockId, Body, VERSION_G4};
 use bloch_pos_committee::interfaces::{ProposalEnvelope, StateReader, StateTransition};
 use bloch_pos_committee::schedule::first_slot_of_epoch;
@@ -246,6 +247,66 @@ struct Engine {
     ws_anchor_hard: bool,
     /// A forward WS_CONFLICT is announced once, not every block.
     ws_conflict_reported: bool,
+    /// Attestation-gossip verdict counters since boot — the observability
+    /// half of the 2026-08-21 shared-basis fix. On the devnet transport
+    /// `Net::report` is a no-op, so these counters (logged once per epoch)
+    /// are the only visible measure of what the policy decided; the success
+    /// criterion on a lagging fleet is `held`/`accepted` climbing while
+    /// `rejected` stays at ~0 between honest nodes.
+    att_stats: AttStats,
+}
+
+/// Counters for [`Engine::apply_decision`] outcomes. Plain totals since boot;
+/// rates are the log reader's job.
+#[derive(Clone, Copy, Debug, Default)]
+struct AttStats {
+    accepted: u64,
+    ignored: u64,
+    /// Ignores that were specifically `UnjudgeableBasis` — a known target on
+    /// a prefix this node does not share (fork at a boundary).
+    unjudgeable_basis: u64,
+    held: u64,
+    rejected: u64,
+    /// Rejects that were specifically `NotInCommittee` — under the shared-
+    /// basis gate these can only be real non-members now; a nonzero rate
+    /// between honest nodes would mean the gate has a hole.
+    rejected_not_in_committee: u64,
+}
+
+impl AttStats {
+    fn count(&mut self, d: &GossipDecision) {
+        use bloch_pos_committee::attestation::RejectReason;
+        use bloch_pos_committee::gossip::IgnoreReason;
+        match d {
+            GossipDecision::Accept { .. } => self.accepted += 1,
+            GossipDecision::Ignore(r) => {
+                self.ignored += 1;
+                if matches!(r, IgnoreReason::UnjudgeableBasis) {
+                    self.unjudgeable_basis += 1;
+                }
+            }
+            GossipDecision::Hold { .. } => self.held += 1,
+            GossipDecision::Reject(r) => {
+                self.rejected += 1;
+                if matches!(r, RejectReason::NotInCommittee) {
+                    self.rejected_not_in_committee += 1;
+                }
+            }
+        }
+    }
+
+    fn log_line(&self) -> String {
+        format!(
+            "att-gossip totals: accepted {} held {} ignored {} (unjudgeable-basis {}) \
+             rejected {} (not-in-committee {})",
+            self.accepted,
+            self.held,
+            self.ignored,
+            self.unjudgeable_basis,
+            self.rejected,
+            self.rejected_not_in_committee,
+        )
+    }
 }
 
 /// Why a transaction was turned away at the door.
@@ -273,6 +334,24 @@ impl Refusal {
     }
 }
 
+
+/// The transport verdict for one gossip decision — the whole "only Reject
+/// penalizes a peer" rule, in one place.
+///
+/// `Hold` and every `Ignore` map to `Verdict::Ignore`: gossipsub's Ignore
+/// drops the message without touching the peer's score, while `Reject` feeds
+/// P4 (invalid_message_deliveries, weight −100 on the attestation topic
+/// against a −400 graylist threshold — four frames graylist a peer). The
+/// 2026-08-21 mainnet failure was honest attestations reaching the Reject
+/// arm; nothing that can be produced by an honest, merely-desynchronized node
+/// may map here to Reject.
+fn verdict_for(decision: &GossipDecision) -> Verdict {
+    match decision {
+        GossipDecision::Accept { .. } => Verdict::Accept,
+        GossipDecision::Ignore(_) | GossipDecision::Hold { .. } => Verdict::Ignore,
+        GossipDecision::Reject(_) => Verdict::Reject,
+    }
+}
 
 impl Engine {
     // ── Derivations over the canonical chain ────────────────────────────────
@@ -1080,6 +1159,13 @@ impl Engine {
             // A reorg can move the finalized root at the anchor's epoch.
             self.enforce_ws_anchor();
         }
+        // Parked attestations were judged against the OLD branch. Entries
+        // whose basis was underivable there may be exactly the votes of the
+        // branch just adopted (their target root is our checkpoint now), and
+        // they are parked under roots no future arrival will release — only
+        // this call re-runs them. During boot replay the pool is empty and
+        // this is a no-op.
+        self.replay_parked();
         true
     }
 
@@ -1125,7 +1211,25 @@ impl Engine {
         let rolled = self.rolled_to(epoch);
         let roster = rolled.active_validators();
         let seed = Self::seed_for(&rolled, epoch);
-        let committees_at = |slot: u64| committees::committee_for_slot(&seed, slot, &roster);
+        // The shared-basis gate (2026-08-21). `rolled_to` rolls THIS node's
+        // canonical state, so the committee it derives is only meaningful for
+        // an attester whose chain prefix at the epoch boundary is the same as
+        // ours — and the attestation declares that prefix itself: its target
+        // root is, by the attester's own construction (`attest`), the
+        // checkpoint of its slot's epoch. Match ⇒ `Binding`, and membership
+        // verdicts are provable exactly as before. Mismatch ⇒ `NotDerivable`:
+        // the pool holds (target unknown: we are behind; the sync pump will
+        // deliver it) or ignores (known fork: unjudgeable) — but never
+        // rejects, because on the mainnet nodes measured epochs apart (e772
+        // vs e754) that Reject penalized every honest peer and starved every
+        // block of attestations.
+        let committees_at = |slot: u64, target: &[u8; 32]| -> CommitteeView {
+            if *target == self.checkpoint_root(epoch_of(slot)) {
+                CommitteeView::Binding(committees::committee_for_slot(&seed, slot, &roster))
+            } else {
+                CommitteeView::NotDerivable
+            }
+        };
         // "Do we have this block?" — canonical ids include genesis, which is
         // synthesized and never stored as an envelope; `blocks` holds every
         // structurally-valid block seen, canonical or not. A vote for a block
@@ -1136,6 +1240,13 @@ impl Engine {
     }
 
     fn apply_decision(&mut self, att: Attestation, decision: GossipDecision, origin: &Origin) {
+        self.att_stats.count(&decision);
+        // The verdict is decided by one function, before the match consumes
+        // the decision, so the "only Reject penalizes" rule is one testable
+        // place rather than four scattered `report` calls. Computed by
+        // reference: `Accept` can carry ~9 KB of slashing evidence and this
+        // runs on every arriving attestation.
+        let verdict = verdict_for(&decision);
         match decision {
             GossipDecision::Accept { slashing_candidate } => {
                 if let Some(ev) = slashing_candidate {
@@ -1151,18 +1262,18 @@ impl Engine {
                 }
                 self.pool
                     .insert((att.validator, att.data.signing_root()), att);
-                self.net.report(origin, Verdict::Accept);
+                self.net.report(origin, verdict);
             }
-            GossipDecision::Ignore(_) => self.net.report(origin, Verdict::Ignore),
+            GossipDecision::Ignore(_) => self.net.report(origin, verdict),
             GossipDecision::Hold { .. } => {
                 // Parked. NOT relayed: this node does not forward what it
                 // cannot yet validate. It is replayed by `release_held` when
                 // the block lands, and relayed then.
-                self.net.report(origin, Verdict::Ignore);
+                self.net.report(origin, verdict);
             }
             GossipDecision::Reject(reason) => {
                 eprintln!("attestation from v{} REJECTED: {reason:?}", att.validator);
-                self.net.report(origin, Verdict::Reject);
+                self.net.report(origin, verdict);
             }
         }
     }
@@ -1179,11 +1290,7 @@ impl Engine {
         }
         let mut pool = std::mem::take(&mut self.att_pool);
         let released = {
-            let rolled_epoch = epoch_of(self.wall_slot);
-            let rolled = self.rolled_to(rolled_epoch);
-            let roster = rolled.active_validators();
-            let seed = Self::seed_for(&rolled, rolled_epoch);
-            let committees_at = |slot: u64| committees::committee_for_slot(&seed, slot, &roster);
+            let committees_at = self.replay_committee_view();
             let known = |r: &[u8; 32]| self.canonical.contains(r) || self.blocks.contains_key(r);
             pool.on_block(
                 &root,
@@ -1194,7 +1301,42 @@ impl Engine {
             )
         };
         self.att_pool = pool;
+        self.absorb_released(released);
+    }
+
+    /// The committee view used when parked attestations are re-judged (block
+    /// arrival, reorg): the same shared-basis gate as [`Self::judge`], with
+    /// the seed and roster derived from the epoch OF EACH ENTRY'S SLOT —
+    /// parked entries can straddle an epoch boundary, and judging a slot with
+    /// another epoch's seed manufactures false non-members (the release-time
+    /// cousin of the 2026-08-08 `expected_bits` split). Cached per epoch:
+    /// `rolled_to` clones the state, and one release can replay many entries.
+    fn replay_committee_view(&self) -> impl Fn(u64, &[u8; 32]) -> CommitteeView + '_ {
+        let cache = RefCell::new(BTreeMap::new());
+        move |slot: u64, target: &[u8; 32]| -> CommitteeView {
+            let e = epoch_of(slot);
+            if *target != self.checkpoint_root(e) {
+                return CommitteeView::NotDerivable;
+            }
+            let mut cache = cache.borrow_mut();
+            let (seed, roster) = cache.entry(e).or_insert_with(|| {
+                let rolled = self.rolled_to(e);
+                let roster = rolled.active_validators();
+                (Self::seed_for(&rolled, e), roster)
+            });
+            CommitteeView::Binding(committees::committee_for_slot(seed, slot, roster))
+        }
+    }
+
+    /// Feed re-judged parked attestations back into consensus: Accepts join
+    /// the aggregation pool and are relayed (they were deliberately not
+    /// relayed while parked); everything else was already handled by the
+    /// pipeline (re-held, ignored, or rejected). No `net.report` here — the
+    /// forwarding peer's frame was already answered `Ignore` when it was
+    /// parked, and gossipsub cannot re-score a message after the fact.
+    fn absorb_released(&mut self, released: Vec<(Attestation, GossipDecision)>) {
         for (att, decision) in released {
+            self.att_stats.count(&decision);
             if let GossipDecision::Accept { .. } = decision {
                 let frame = net::att_frame(&att);
                 self.pool
@@ -1207,6 +1349,25 @@ impl Engine {
                 }
             }
         }
+    }
+
+    /// Re-judge EVERY parked attestation — the post-reorg hook. Entries
+    /// parked because their basis was underivable on the abandoned branch are
+    /// keyed under roots no future block arrival will name, so without this
+    /// call they would sit until the prune horizon even though the adopted
+    /// branch makes them judgeable (and usually valid).
+    fn replay_parked(&mut self) {
+        if self.att_pool.pending_len() == 0 {
+            return;
+        }
+        let mut pool = std::mem::take(&mut self.att_pool);
+        let released = {
+            let committees_at = self.replay_committee_view();
+            let known = |r: &[u8; 32]| self.canonical.contains(r) || self.blocks.contains_key(r);
+            pool.replay_all(self.wall_slot, &committees_at, &known, &self.verifier)
+        };
+        self.att_pool = pool;
+        self.absorb_released(released);
     }
 
     // ── RPC service ─────────────────────────────────────────────────────────
@@ -1658,6 +1819,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         ws_anchor: None,
         ws_anchor_hard: false,
         ws_conflict_reported: false,
+        att_stats: AttStats::default(),
         manifest,
     };
 
@@ -1846,6 +2008,13 @@ pub fn run(cfg: Config) -> io::Result<()> {
         let slot_start = genesis_ms + slot * slot_ms;
         let wall_epoch = epoch_of(slot);
         if slot != engine.wall_slot {
+            // Once per epoch, say what the gossip policy has been deciding —
+            // the observable for the 2026-08-21 shared-basis fix. Healthy
+            // desynchronized-but-honest fleets show `held` converting into
+            // `accepted` and `rejected (not-in-committee)` flat at ~0.
+            if epoch_of(slot) != epoch_of(engine.wall_slot) {
+                println!("[slot {slot}] {}", engine.att_stats.log_line());
+            }
             engine.wall_slot = slot;
             // Drop everything the acceptance window has moved past. The pool
             // reads no clock of its own, so this is the only thing that bounds
@@ -2825,7 +2994,7 @@ mod transfer_v2_end_to_end {
     /// HOLDS `entries` — the outputs the sweep spends. `epochs_past` places
     /// `genesis_time_ms` so the node's real wall epoch is at least that
     /// (+2 slots of margin so the epoch cannot regress mid-test).
-    fn engine_at_wall_epoch(epochs_past: u64, entries: &[EutxoEntry]) -> Engine {
+    pub(super) fn engine_at_wall_epoch(epochs_past: u64, entries: &[EutxoEntry]) -> Engine {
         let slot_ms = 500u64;
         let back_ms = epochs_past
             .saturating_mul(SLOTS_PER_EPOCH)
@@ -2912,6 +3081,7 @@ mod transfer_v2_end_to_end {
             ws_anchor: None,
             ws_anchor_hard: false,
             ws_conflict_reported: false,
+            att_stats: AttStats::default(),
         }
     }
 
@@ -3100,5 +3270,329 @@ mod transfer_v2_end_to_end {
             "a full mempool SHOULD advise retrying: {}",
             e2.message
         );
+    }
+}
+
+/// The 2026-08-21 shared-basis gate, on a REAL `Engine`.
+///
+/// `gossip.rs` proves the policy with an injected view; this proves the
+/// injection itself — that `judge` really answers `NotDerivable` when the
+/// attestation's declared basis is not this node's checkpoint, and really
+/// answers `Binding` when it is. Both halves are required: the whole change
+/// is worthless if the node hands the pool a `Binding` view it has no right
+/// to (honest peers rejected and penalized again), and equally worthless if
+/// it hands `NotDerivable` unconditionally (a blank cheque an attacker fills
+/// with forged duties).
+#[cfg(test)]
+mod attestation_basis_gate {
+    use super::transfer_v2_end_to_end::engine_at_wall_epoch;
+    use super::*;
+    use bloch_pos_committee::attestation::RejectReason;
+    use bloch_pos_committee::gossip::IgnoreReason;
+    use bloch_pos_committee::SLOTS_PER_EPOCH;
+
+    /// An attestation for `slot` naming `target_root` as its epoch
+    /// checkpoint, from a validator that is in NO committee of this
+    /// harness (its registry is empty, so every committee is empty).
+    fn att_at(slot: u64, target_root: [u8; 32]) -> Attestation {
+        let data = AttestationData {
+            slot,
+            head: [0xAA; 32],
+            source_epoch: 0,
+            source_root: [0x11; 32],
+            target_epoch: epoch_of(slot),
+            target_root,
+        };
+        Attestation {
+            data,
+            validator: 99,
+            signature: vec![0u8; 8],
+        }
+    }
+
+    /// A placeholder header at `slot`, distinct per slot. Only its identity
+    /// and its slot matter here: `checkpoint_root` walks the canonical
+    /// `(slot, id)` list and reads nothing else.
+    fn stub_header(slot: u64) -> BlockHeaderV4 {
+        BlockHeaderV4 {
+            version: VERSION_G4,
+            parent: [0u8; 32],
+            state_root: [0u8; 32],
+            body_root: [0u8; 32],
+            slot,
+            proposer_index: 0,
+            randao_reveal: [0u8; 32],
+            randao_mix: [0u8; 32],
+            justified_root: [0u8; 32],
+            finalized_root: [0u8; 32],
+            attestation_root: [0u8; 32],
+            coherence_root: [0u8; 32],
+        }
+    }
+
+    /// An engine whose canonical chain spans three epochs, so that the
+    /// checkpoints of neighbouring epochs are DIFFERENT roots — without that
+    /// the basis comparison could be off by an epoch and no test would
+    /// notice. Returns the engine and the checkpoint root of epoch 2.
+    fn engine_with_a_real_boundary() -> (Engine, [u8; 32]) {
+        let mut node = engine_at_wall_epoch(0, &[]);
+        // Blocks at slot 33 (epoch 1) and slot 65 (epoch 2): the checkpoint
+        // of epoch 2 is the last block strictly before slot 64 — the epoch-1
+        // block — while epoch 3's is the epoch-2 block.
+        for slot in [SLOTS_PER_EPOCH + 1, 2 * SLOTS_PER_EPOCH + 1] {
+            let header = stub_header(slot);
+            let id = BlockId::of(&header);
+            node.chain.push((slot, id));
+            node.canonical.insert(*id.as_bytes());
+        }
+        let checkpoint_e2 = node.checkpoint_root(2);
+        assert_ne!(
+            checkpoint_e2,
+            node.checkpoint_root(3),
+            "the fixture must give neighbouring epochs distinct checkpoints, \
+             or an off-by-one basis comparison would pass unnoticed"
+        );
+        (node, checkpoint_e2)
+    }
+
+    #[test]
+    fn a_lagging_node_holds_what_it_cannot_judge_and_still_rejects_a_true_non_member() {
+        let (mut node, checkpoint_e2) = engine_with_a_real_boundary();
+        let slot = 2 * SLOTS_PER_EPOCH + 2; // epoch 2, past the genesis case
+        node.wall_slot = slot;
+
+        // HALF ONE — the honest lagging case. The attester voted on a chain
+        // this node has not caught up to, so it names a checkpoint the node
+        // does not have. Before this change the node derived its own
+        // committee anyway, found validator 99 absent and answered
+        // Reject(NotInCommittee) — penalizing the peer that relayed it.
+        let mut pool = AttestationPool::new();
+        let ahead = att_at(slot, [0x77; 32]);
+        let decision = node.judge(&mut pool, ahead, epoch_of(slot));
+        assert!(
+            matches!(decision, GossipDecision::Hold { missing_root } if missing_root == [0x77; 32]),
+            "an attestation whose basis this node cannot derive must be HELD, not judged; got {decision:?}"
+        );
+        assert_eq!(pool.pending_len(), 1, "and it must actually be parked");
+
+        // HALF TWO — THE CONTROL. Same validator, same absence from the
+        // committee, but now the attestation declares THIS node's own
+        // checkpoint for exactly this epoch: the bases match, both ends
+        // derive the same committee from the same prefix, and the verdict is
+        // binding again. A forger claiming a duty on a shared basis is still
+        // rejected, and penalized.
+        let mut pool = AttestationPool::new();
+        let liar = att_at(slot, checkpoint_e2);
+        let decision = node.judge(&mut pool, liar, epoch_of(slot));
+        assert!(
+            matches!(decision, GossipDecision::Reject(RejectReason::NotInCommittee)),
+            "a non-member under a SHARED basis must still be rejected; got {decision:?}"
+        );
+        assert_eq!(pool.pending_len(), 0, "and a rejected frame must not occupy the pool");
+    }
+
+    /// A parked attestation must be re-judged against the checkpoint of ITS
+    /// OWN epoch, not of whatever epoch the wall clock happens to be in.
+    /// Parked entries straddle boundaries by construction (that is why they
+    /// were parked), and judging a slot with the wrong epoch's checkpoint
+    /// manufactures false "unjudgeable" — or, worse, false membership — the
+    /// release-time cousin of the 2026-08-08 `expected_bits` split.
+    #[test]
+    fn parked_entries_are_judged_against_their_own_epochs_checkpoint() {
+        let (mut node, checkpoint_e2) = engine_with_a_real_boundary();
+        // Wall clock in epoch 2, an entry still parked from epoch 1.
+        node.wall_slot = 2 * SLOTS_PER_EPOCH + 2;
+        let view = node.replay_committee_view();
+
+        let e1_slot = SLOTS_PER_EPOCH + 2;
+        let checkpoint_e1 = node.checkpoint_root(1);
+        assert_ne!(checkpoint_e1, checkpoint_e2, "the fixture's epochs must differ");
+        assert!(
+            matches!(view(e1_slot, &checkpoint_e1), CommitteeView::Binding(_)),
+            "an epoch-1 vote naming epoch 1's checkpoint shares our basis"
+        );
+        assert!(
+            matches!(view(2 * SLOTS_PER_EPOCH + 2, &checkpoint_e2), CommitteeView::Binding(_)),
+            "and so does an epoch-2 vote naming epoch 2's checkpoint"
+        );
+        assert!(
+            matches!(view(e1_slot, &checkpoint_e2), CommitteeView::NotDerivable),
+            "but an epoch-1 vote naming a DIFFERENT epoch's checkpoint does not"
+        );
+    }
+
+    /// `replay_parked` must actually re-run what is parked. Without it, an
+    /// entry held because its basis was underivable on the abandoned branch
+    /// sits under a root no block arrival will ever name, and only the prune
+    /// horizon frees it — the vote is stuck for two epochs even though the
+    /// adopted branch settles the question.
+    /// The verdict counters are the only visible measure of this policy on
+    /// the devnet transport, where `Net::report` is a no-op: without them an
+    /// operator cannot tell "no attestations arrived" from "every attestation
+    /// was rejected". Each verb must be counted, and the two diagnostic
+    /// sub-counters (`NotInCommittee` rejects, `UnjudgeableBasis` ignores)
+    /// with them — those are the two numbers that say whether the fix works.
+    /// (d) of the task, as a rule rather than a hope: nothing an honest,
+    /// merely-desynchronized node produces may map to `Verdict::Reject`.
+    /// On the attestation topic a Reject is −100 into P4 against a −400
+    /// graylist threshold, so four honest frames graylist the peer that
+    /// relayed them — the shape that collapsed this mesh twice in 2026.
+    #[test]
+    fn only_reject_reaches_a_peer_penalty() {
+        use bloch_pos_committee::gossip::IgnoreReason;
+        for ignore in [
+            IgnoreReason::OutsideWindow,
+            IgnoreReason::Duplicate,
+            IgnoreReason::EquivocationLimit,
+            IgnoreReason::UnjudgeableBasis,
+        ] {
+            assert!(
+                matches!(verdict_for(&GossipDecision::Ignore(ignore)), Verdict::Ignore),
+                "Ignore({ignore:?}) must not penalize the forwarding peer"
+            );
+        }
+        assert!(
+            matches!(
+                verdict_for(&GossipDecision::Hold { missing_root: [0u8; 32] }),
+                Verdict::Ignore
+            ),
+            "a parked attestation is the honest boundary/lag race — never a penalty"
+        );
+        assert!(matches!(
+            verdict_for(&GossipDecision::Accept { slashing_candidate: None }),
+            Verdict::Accept
+        ));
+        // THE CONTROL: a real violation still penalizes, or the node stops
+        // defending itself.
+        assert!(matches!(
+            verdict_for(&GossipDecision::Reject(RejectReason::NotInCommittee)),
+            Verdict::Reject
+        ));
+        assert!(matches!(
+            verdict_for(&GossipDecision::Reject(RejectReason::BadSignature)),
+            Verdict::Reject
+        ));
+    }
+
+    #[test]
+    fn every_verdict_is_counted_including_the_two_diagnostic_reasons() {
+        let (mut node, checkpoint_e2) = engine_with_a_real_boundary();
+        let slot = 2 * SLOTS_PER_EPOCH + 2;
+        node.wall_slot = slot;
+        let origin = Origin::none();
+
+        // A shared-basis non-member: a real Reject, and a NotInCommittee one.
+        let liar = att_at(slot, checkpoint_e2);
+        let decision = node.judge(&mut AttestationPool::new(), liar.clone(), epoch_of(slot));
+        node.apply_decision(liar, decision, &origin);
+        assert_eq!(node.att_stats.rejected, 1, "a Reject must be counted");
+        assert_eq!(
+            node.att_stats.rejected_not_in_committee, 1,
+            "and NotInCommittee counted as such — this is the mainnet log line that must go to ~0"
+        );
+
+        // A vote parked for a basis we lack: Hold, no penalty, counted.
+        let ahead = att_at(slot, [0x77; 32]);
+        let decision = node.judge(&mut node.att_pool.clone(), ahead.clone(), epoch_of(slot));
+        node.apply_decision(ahead, decision, &origin);
+        assert_eq!(node.att_stats.held, 1, "a Hold must be counted");
+        assert_eq!(node.att_stats.rejected, 1, "and must NOT have moved the reject counter");
+
+        // A vote on a prefix we know but do not share: Ignore, with the
+        // diagnostic sub-counter.
+        let other = [0x66u8; 32];
+        node.blocks.insert(
+            other,
+            BlockEnvelope {
+                header: stub_header(slot),
+                proposer_sig: Vec::new(),
+                body: Body { transactions: Vec::new(), attestations: Vec::new() },
+            },
+        );
+        let forked = att_at(slot, other);
+        let decision = node.judge(&mut AttestationPool::new(), forked.clone(), epoch_of(slot));
+        node.apply_decision(forked, decision, &origin);
+        assert_eq!(node.att_stats.ignored, 1, "an Ignore must be counted");
+        assert_eq!(node.att_stats.unjudgeable_basis, 1, "with its reason");
+
+        // And the line an operator reads carries all of it.
+        let line = node.att_stats.log_line();
+        assert!(line.contains("rejected 1 (not-in-committee 1)"), "got: {line}");
+        assert!(line.contains("held 1"), "got: {line}");
+        assert!(line.contains("unjudgeable-basis 1"), "got: {line}");
+    }
+
+    #[test]
+    fn replay_parked_re_judges_and_drains_what_the_new_view_can_judge() {
+        let (mut node, _checkpoint_e2) = engine_with_a_real_boundary();
+        let slot = 2 * SLOTS_PER_EPOCH + 2;
+        node.wall_slot = slot;
+        let foreign = [0x77u8; 32];
+
+        // Park one: it names a basis this node neither shares nor has.
+        let mut pool = AttestationPool::new();
+        let decision = node.judge(&mut pool, att_at(slot, foreign), epoch_of(slot));
+        assert!(matches!(decision, GossipDecision::Hold { .. }));
+        node.att_pool = pool;
+        assert_eq!(node.att_pool.pending_len(), 1);
+
+        // Nothing has changed: an entry we still cannot judge stays parked
+        // (replay must not be a blanket drop).
+        node.replay_parked();
+        assert_eq!(node.att_pool.pending_len(), 1, "an entry we still cannot judge stays parked");
+
+        // The branch arrives and the block is stored — on the losing side, so
+        // the basis is still not ours, but the question is now settled: the
+        // vote is unjudgeable rather than pending, and must leave the pool
+        // instead of occupying it until the prune horizon.
+        node.blocks.insert(
+            foreign,
+            BlockEnvelope {
+                header: stub_header(slot),
+                proposer_sig: Vec::new(),
+                body: Body { transactions: Vec::new(), attestations: Vec::new() },
+            },
+        );
+        node.replay_parked();
+        assert_eq!(
+            node.att_pool.pending_len(),
+            0,
+            "replay_parked must re-run parked entries, not leave them for the prune horizon"
+        );
+        assert_eq!(node.att_stats.unjudgeable_basis, 1, "and the re-judgement must be counted");
+    }
+
+    #[test]
+    fn a_known_block_on_another_prefix_is_ignored_not_rejected() {
+        // The second `NotDerivable` sub-case at node level: the target is a
+        // block we HAVE (it reached us on a losing branch) but it is not our
+        // checkpoint. Nothing about it is judgeable — silence, no penalty,
+        // and nothing parked, because no block arrival will change the
+        // answer (only a reorg can, through `replay_parked`).
+        let (mut node, _checkpoint_e2) = engine_with_a_real_boundary();
+        let slot = 2 * SLOTS_PER_EPOCH + 2;
+        node.wall_slot = slot;
+        let other = [0x77u8; 32];
+        // Make the fork block "known" the way a losing-branch block is:
+        // present in `blocks`, absent from `canonical`.
+        node.blocks.insert(
+            other,
+            BlockEnvelope {
+                header: stub_header(slot),
+                proposer_sig: Vec::new(),
+                body: Body {
+                    transactions: Vec::new(),
+                    attestations: Vec::new(),
+                },
+            },
+        );
+
+        let mut pool = AttestationPool::new();
+        let decision = node.judge(&mut pool, att_at(slot, other), epoch_of(slot));
+        assert!(
+            matches!(decision, GossipDecision::Ignore(IgnoreReason::UnjudgeableBasis)),
+            "a vote on a prefix we know but do not share is unjudgeable, not invalid; got {decision:?}"
+        );
+        assert_eq!(pool.pending_len(), 0);
     }
 }
