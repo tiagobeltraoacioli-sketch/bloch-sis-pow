@@ -248,6 +248,32 @@ struct Engine {
     ws_conflict_reported: bool,
 }
 
+/// Why a transaction was turned away at the door.
+///
+/// The distinction is load-bearing, not cosmetic: one of these means "ask me
+/// again in a moment" and the other means "these bytes will never be
+/// admitted, stop sending them". Collapsing both into one RPC code is how an
+/// operator ends up growing the mempool to fix a bad signature.
+#[derive(Debug, PartialEq, Eq)]
+enum Refusal {
+    /// The mempool is full. The transaction was NOT judged invalid.
+    AtCapacity,
+    /// `admissible` refused it on its merits. Retrying is pointless.
+    Invalid(&'static str),
+}
+
+impl Refusal {
+    /// The human-readable reason, for tests and logs. Callers that need to
+    /// ACT on the difference must match the variant, not read this string.
+    fn reason(&self) -> &'static str {
+        match self {
+            Refusal::AtCapacity => "mempool is at capacity",
+            Refusal::Invalid(why) => why,
+        }
+    }
+}
+
+
 impl Engine {
     // ── Derivations over the canonical chain ────────────────────────────────
 
@@ -555,7 +581,7 @@ impl Engine {
         // Each refusal drops exactly one transaction and retries, so the loop
         // is bounded by the selection size and terminates: the empty selection
         // always computes.
-        let mut txs = self.select_transactions();
+        let mut txs = self.select_transactions(bloch_pos_committee::epoch_of(slot));
         let (post, tx_bytes) = loop {
             let tx_bytes: Vec<Vec<u8>> = txs.iter().map(PosTransaction::canonical_bytes).collect();
             header.body_root = derive::body_root(&tx_bytes);
@@ -784,6 +810,7 @@ impl Engine {
         }
     }
 
+
     /// Admit a transaction to the mempool and pass it on.
     ///
     /// Admission is deliberately thin here — the bytes already decoded at the
@@ -796,13 +823,13 @@ impl Engine {
     /// answer to — the RPC — can say. The gossip path ignores the result: a
     /// peer is not waiting on a verdict, and a duplicate arriving twice over a
     /// full mesh is the normal case rather than a fault.
-    fn on_transaction(&mut self, tx: PosTransaction) -> Result<Admitted, &'static str> {
+    fn on_transaction(&mut self, tx: PosTransaction) -> Result<Admitted, Refusal> {
         let key = tx.canonical_bytes();
         if self.mempool.contains_key(&key) {
             return Ok(Admitted::Duplicate);
         }
         if self.mempool.len() >= MEMPOOL_MAX {
-            return Err("mempool is at capacity");
+            return Err(Refusal::AtCapacity);
         }
         // Refuse the shapes consensus can never apply.
         //
@@ -823,7 +850,17 @@ impl Engine {
         // mempool and are dropped by the proposer, which is why the proposer's
         // guard is the one that carries liveness and this one only reduces
         // waste. Two checks, neither trusting the other.
-        admissible(&tx)?;
+        //
+        // The epoch handed down is the WALL-CLOCK epoch, read here through
+        // the `wall_slot()` METHOD (the clock against the manifest's genesis)
+        // and never the `wall_slot` FIELD: the field is refreshed by the slot
+        // loop, and on the RPC path — which converges here through
+        // `serve_rpc`'s SendRawTransaction arm — nothing guarantees the loop
+        // has run this tick. Why wall and not the head's epoch is argued at
+        // the TransferV2 arm of `admissible` itself, next to the gate it
+        // feeds. Gossip (`NetEvent::Transaction`) and RPC both land in this
+        // one call, so one call site carries the whole decision.
+        admissible(&tx, epoch_of(self.wall_slot())).map_err(Refusal::Invalid)?;
         let mut frame = vec![net::FRAME_TX];
         frame.extend_from_slice(&key);
         self.mempool.insert(key, tx);
@@ -838,7 +875,14 @@ impl Engine {
     /// proposer sorts by what the transaction pays, and doing that here before
     /// transfers carry a value format would be inventing an ordering over a
     /// field nobody sets yet.
-    fn select_transactions(&self) -> Vec<PosTransaction> {
+    ///
+    /// `epoch` is the epoch of the slot being produced, because the byte cap
+    /// is flag-day gated. Packing against the wrong era is not symmetric: the
+    /// old cap after activation only wastes capacity, but the new cap before
+    /// it builds a block every other node rejects — so the epoch comes from
+    /// the slot this proposer is building for, not from anything ambient.
+    fn select_transactions(&self, epoch: u64) -> Vec<PosTransaction> {
+        let cap = bloch_pos_committee::fee_market::max_block_tx_bytes(epoch);
         let mut out = Vec::new();
         let mut bytes = 0u64;
         for (encoded, tx) in self.mempool.iter() {
@@ -846,7 +890,7 @@ impl Engine {
                 break;
             }
             let n = encoded.len() as u64;
-            if bytes + n > bloch_pos_committee::fee_market::MAX_BLOCK_TX_BYTES {
+            if bytes + n > cap {
                 break;
             }
             bytes += n;
@@ -1386,12 +1430,28 @@ impl Engine {
 
             RpcRequest::SendRawTransaction(tx) => match self.on_transaction(tx.clone()) {
                 Ok(outcome) => Ok(rpc::submitted_json(&tx, outcome)),
-                Err(why) => Err(RpcError::new(
+                // The two refusals are not the same fact and must not carry
+                // the same advice. "Retry later" is correct for a full
+                // mempool and actively harmful for a refused transaction:
+                // the founder's consolidation sweep submits hundreds of
+                // thousands of transfers through this method, and an
+                // operator told to retry bytes that can NEVER be admitted
+                // chases capacity while the real fault — an unverifiable
+                // signature, an empty witness table — goes unread. Before
+                // this, every refusal returned MEMPOOL_FULL with the words
+                // "the transaction was not judged invalid" appended, which
+                // for an invalid transaction was simply false.
+                Err(Refusal::AtCapacity) => Err(RpcError::new(
                     rpc::MEMPOOL_FULL,
                     format!(
-                        "{why} ({MEMPOOL_MAX} entries); retry later — the \
-                             transaction was not judged invalid"
+                        "mempool is at capacity ({MEMPOOL_MAX} entries); retry later — \
+                         the transaction was not judged invalid"
                     ),
+                )),
+                Err(Refusal::Invalid(why)) => Err(RpcError::new(
+                    rpc::TX_REFUSED,
+                    format!("{why} — this transaction cannot be admitted; retrying \
+                             the same bytes will not help"),
                 )),
             },
 
@@ -1948,15 +2008,23 @@ pub fn lmd_ghost_head<'a>(
 /// Whether the mempool will hold `tx` at all.
 ///
 /// A free function, not a method, so it can be tested without standing up an
-/// engine — the checks are a pure function of the transaction and nothing
-/// else, and a rule that needs a running node to exercise is a rule that stops
-/// being exercised.
+/// engine — the checks are a pure function of the transaction and the
+/// caller's `wall_epoch`, nothing else, and a rule that needs a running node
+/// to exercise is a rule that stops being exercised.
+///
+/// `wall_epoch` is the admitting node's WALL-CLOCK epoch
+/// (`epoch_of(self.wall_slot())` at the call site in `on_transaction`), and
+/// it exists for exactly one arm: the `TransferV2` flag-day gate below. It is
+/// in EPOCHS, not slots — `TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH`
+/// (params.rs:150) is an epoch, and a caller passing a raw slot would be
+/// early by `SLOTS_PER_EPOCH` (32×). The boundary test pins the unit by
+/// deriving both sides of the flag day from slots via `epoch_of`.
 ///
 /// Deliberately STRUCTURAL, not a validity check. A complete answer means
 /// running the transition, which needs a candidate header this path has no
 /// reason to build. What it catches is the class that has actually been
 /// exploited or is currently exploitable.
-pub(crate) fn admissible(tx: &PosTransaction) -> Result<(), &'static str> {
+pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'static str> {
     match tx {
         // Staking messages are refused outright until bonding is funded from
         // the eUTXO set.
@@ -2020,21 +2088,117 @@ pub(crate) fn admissible(tx: &PosTransaction) -> Result<(), &'static str> {
             }
             Ok(())
         }
-        // TransferV2 (tag 0x06) ships INERT behind
-        // `params::TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH` (u64::MAX).
-        // Refused at the mempool door so a pre-activation node never gossips
-        // a transaction no block can carry — the catch-all below would have
-        // admitted it, every proposer that selected it would fail with
-        // `TransferReject::FormatNotActive`, and the invalid transaction
-        // would sit in mempools forever. When the flag day is set this arm
-        // must learn the epoch and admit the format after it (and verify the
-        // witness-table signatures the way the Transfer arm above does);
-        // until then a blanket refusal is exact, because pre-activation is
-        // the only era that exists.
-        PosTransaction::TransferV2 { .. } => Err(
-            "deduplicated transfers (tag 0x06) are not active: the format ships behind \
-             a flag day (TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH) that has not been set",
-        ),
+        // TransferV2 (tag 0x06): admitted from its flag day, refused before
+        // it — the era decides, and WHICH era to read differs on the two
+        // sides of the mempool door.
+        //
+        // Consensus gates this format on COMMITTED state rolled to the
+        // block's own epoch (`apply_transaction`'s FormatNotActive arm,
+        // transition.rs:1706–1718) and must: deriving a consensus verdict
+        // from anything node-local is how the 2026-08-08 `expected_bits`
+        // fork happened. Admission is NOT consensus — it is node-local
+        // policy, and it answers a different question: "can some FUTURE
+        // block apply this?". Every block is proposed for a wall-clock slot
+        // (the slot loop, `run`), so every block that could carry this
+        // transaction has an epoch >= the admitting node's wall epoch; from
+        // wall epoch 800 onward no future block answers FormatNotActive.
+        // Reading the HEAD's epoch here instead would strand exactly the
+        // nodes the post-flag-day carryover sweep (426,194 inputs) must
+        // relay through: a syncing or lagging node has a head epochs behind
+        // the wall and would refuse the format after activation — the
+        // "admitted too late, never propagates" failure. The residue of the
+        // wall-clock choice is only boundary skew: a fast clock admits and
+        // gossips seconds before its peers activate. Peers refuse without
+        // penalty (the gossip path answers to nobody — `on_transaction`'s
+        // caller ignores the verdict), and a still-799 proposer that
+        // selects it probe-drops it from the mempool one transaction at a
+        // time instead of stalling (the drop-and-retry loop in `propose`,
+        // the slot-69 lesson). Early side costs one ejected, resendable
+        // transaction; late side costs the sweep. The asymmetry decides.
+        PosTransaction::TransferV2 {
+            keys,
+            inputs,
+            outputs,
+            ..
+        } => {
+            // The gate first, and pre-activation the refusal is today's,
+            // byte for byte: before epoch 800 this arm's behaviour is the
+            // CONTROL and must not move.
+            if wall_epoch < bloch_pos_committee::params::TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH {
+                return Err(
+                    "deduplicated transfers (tag 0x06) are not active: the format ships \
+                     behind a flag day (TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH) that this \
+                     chain has not reached",
+                );
+            }
+            // Cheap-first from here, mirroring the Transfer arm above and
+            // the consensus arm this one fronts for (`apply_transfer_v2`,
+            // transition.rs:2017–2130): structure, then table discipline,
+            // then — last and only then — signatures. This path is
+            // unauthenticated, so an invalid shape must cost zero hybrid
+            // verifications (~145 µs each, measured 2026-08-21).
+            if inputs.is_empty() {
+                return Err("transfer has no inputs — it spends nothing and cannot apply");
+            }
+            if outputs.is_empty() {
+                return Err("transfer has no outputs — it pays no one and cannot apply");
+            }
+            // An empty witness table would make the signature loop below
+            // pass VACUOUSLY — zero verifications, admitted, gossiped — so a
+            // shape consensus can never apply (every input must index into
+            // the table) would traverse the mesh for free. That is the
+            // mempool-stuffing class this function exists to refuse, and
+            // the check is load-bearing, not defensive.
+            if keys.is_empty() {
+                return Err(
+                    "deduplicated transfer carries no witness keys — nothing authorises it",
+                );
+            }
+            // Stateless mirror of the table disciplines consensus enforces
+            // and has mutation-proven (transition.rs:2043–2094 —
+            // DuplicateWitnessKey, BadKeyIndex, WitnessKeyUnused). The one
+            // V2 consensus check that CANNOT run here is ScriptMismatch: it
+            // reads the spent outputs' committed `script_hash`
+            // (transition.rs:2077), and this function is deliberately
+            // stateless. Like V1's unknown-input case, that class reaches
+            // the mempool and dies in the proposer's probe.
+            let mut distinct: BTreeSet<&[u8]> = BTreeSet::new();
+            for k in keys {
+                if !distinct.insert(k.pubkey.as_slice()) {
+                    return Err(
+                        "deduplicated transfer repeats a witness key — one entry per owner",
+                    );
+                }
+            }
+            let mut used = vec![false; keys.len()];
+            for i in inputs {
+                let Some(slot) = used.get_mut(i.key_index as usize) else {
+                    return Err("transfer input names a witness index outside the table");
+                };
+                *slot = true;
+            }
+            if used.iter().any(|u| !*u) {
+                return Err(
+                    "witness table carries an entry no input references — unpaid padding",
+                );
+            }
+            // THE SIGNATURES, LAST — same placement and same reason as the
+            // Transfer arm above, but ONE verification per TABLE ENTRY,
+            // never per input. That is the format's entire point and the
+            // exact economy consensus runs (`apply_transfer_v2`,
+            // "Authorisation: the expensive check, last — ONCE PER OWNER"):
+            // the signing root covers every spend point, so one signature
+            // per key authorises all of that key's inputs. Admitting an
+            // unverified table would hand an attacker free propagation of
+            // garbage that every proposer then pays to drop.
+            let signing_root = tx.spend_signing_root();
+            for k in keys {
+                if !bloch_crypto::crypto::verify(&k.pubkey, &signing_root, &k.signature) {
+                    return Err("transfer carries a signature that does not verify");
+                }
+            }
+            Ok(())
+        }
         // Exit is UNAUTHENTICATED: its arm in transition.rs checks registry
         // state and never touches a verifier, and this catch-all used to admit
         // it. Sixty-four Exit messages would set exit_epoch on all sixty-four
@@ -2144,7 +2308,7 @@ mod forkchoice_tests {
             withdrawal_credentials: vec![1u8; 20],
             commission_bps: 0,
         };
-        let err = admissible(&deposit).expect_err("a deposit must not be admitted");
+        let err = admissible(&deposit, 0).expect_err("a deposit must not be admitted");
         assert!(
             err.contains("not yet funded"),
             "the refusal must say why: {err}"
@@ -2157,7 +2321,7 @@ mod forkchoice_tests {
             eligible: true,
         };
         assert!(
-            admissible(&delegate).is_err(),
+            admissible(&delegate, 0).is_err(),
             "a delegation must not be admitted either"
         );
     }
@@ -2177,7 +2341,7 @@ mod forkchoice_tests {
             tip_millisat_per_gas: 0,
         };
         assert!(
-            admissible(&empty).is_err(),
+            admissible(&empty, 0).is_err(),
             "a transfer with no inputs must not be admitted"
         );
     }
@@ -2334,8 +2498,20 @@ mod admission_authorisation {
         // the hole it closes.
         let (tx, _) = signed_transfer();
         assert!(
-            admissible(&tx).is_ok(),
+            admissible(&tx, 0).is_ok(),
             "a validly signed transfer must still reach the mempool"
+        );
+        // V1 is EPOCH-INDEPENDENT, on both sides of the TransferV2 flag day
+        // (params.rs:150). Part of the pre-activation control: teaching the
+        // epoch to `admissible` must change nothing about the format the
+        // chain already runs on.
+        assert!(
+            admissible(
+                &tx,
+                bloch_pos_committee::params::TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH
+            )
+            .is_ok(),
+            "a V1 transfer must be admitted identically after the V2 flag day"
         );
     }
 
@@ -2348,7 +2524,7 @@ mod admission_authorisation {
             bad[0] ^= 0xFF;
             inputs[0].signature = bad;
         }
-        let err = admissible(&tx).expect_err("a bad signature must not be admitted");
+        let err = admissible(&tx, 0).expect_err("a bad signature must not be admitted");
         assert!(
             err.contains("signature"),
             "the refusal must name the reason, got: {err}"
@@ -2357,8 +2533,572 @@ mod admission_authorisation {
 
     #[test]
     fn an_unauthenticated_exit_is_refused() {
-        let err = admissible(&PosTransaction::Exit { validator: 0 })
+        let err = admissible(&PosTransaction::Exit { validator: 0 }, 0)
             .expect_err("Exit carries no signature and must not be admitted");
         assert!(err.contains("not authenticated"), "got: {err}");
+    }
+
+    // ── TransferV2 admission: the flag-day arm ──────────────────────────────
+    //
+    // Every rule below carries its control half in the same test, and each
+    // was proven by mutation on 2026-08-22 (session logged per test): the
+    // rule under test was disabled in `admissible`'s TransferV2 arm, the
+    // named test failed, the mutation was reverted, and the suite went green
+    // again. A test that survives the disabling of its own rule is
+    // decorative, and decorative tests are how this codebase already shipped
+    // one consensus regression.
+
+    use bloch_pos_committee::params::TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH as V2_FLAG_DAY;
+    use bloch_pos_committee::transition::{TransferInputV2, WitnessKey};
+
+    /// A `TransferV2` signed for real: `n` inputs owned by ONE key, one
+    /// witness-table entry — the single-owner many-input shape the format
+    /// exists for. The signing root covers spend points, outputs and the two
+    /// fee terms only (`fold_spend`, transition.rs), NOT the table — the
+    /// table is witness — so tests below may mutate the table afterwards
+    /// without invalidating the signature, which is exactly what the
+    /// discipline tests need (and mirrors what a malicious relay can do).
+    fn signed_transfer_v2(n: u32) -> PosTransaction {
+        let (pk, sk) = bloch_crypto::crypto::generate_keypair_from_seed(&[9u8; 32])
+            .expect("hybrid keypair from a fixed seed");
+        let inputs: Vec<TransferInputV2> = (0..n)
+            .map(|vout| TransferInputV2 {
+                txid: [0x11u8; 32],
+                vout,
+                key_index: 0,
+            })
+            .collect();
+        let mut tx = PosTransaction::TransferV2 {
+            keys: vec![WitnessKey {
+                pubkey: pk,
+                signature: Vec::new(),
+            }],
+            inputs,
+            outputs: vec![TransferOutput {
+                value: 1_000,
+                script_hash: [0x22u8; 32],
+            }],
+            tx_bytes: 0,
+            tip_millisat_per_gas: 0,
+        };
+        let root = tx.spend_signing_root();
+        let sig = bloch_crypto::crypto::sign(&sk, &root).expect("sign the spend root");
+        if let PosTransaction::TransferV2 { keys, .. } = &mut tx {
+            keys[0].signature = sig;
+        }
+        tx
+    }
+
+    /// The flag day itself, with the unit pinned: both epochs are DERIVED
+    /// FROM SLOTS via `epoch_of`, because the gate compares EPOCHS against
+    /// `TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH` (params.rs:150) and a call
+    /// site that handed it a raw wall SLOT would activate 32× early —
+    /// silently, since both are bare u64s.
+    ///
+    /// Mutation log (2026-08-22): gate `<` → `<=` — the admit half dies;
+    /// arm reverted to the old unconditional Err — the admit half dies;
+    /// gate deleted — the refuse half dies.
+    #[test]
+    fn v2_is_refused_the_epoch_before_the_flag_day_and_admitted_at_it() {
+        use bloch_pos_committee::SLOTS_PER_EPOCH;
+        let last_slot_before = V2_FLAG_DAY * SLOTS_PER_EPOCH - 1;
+        let first_slot_at = V2_FLAG_DAY * SLOTS_PER_EPOCH;
+        assert_eq!(epoch_of(last_slot_before), V2_FLAG_DAY - 1);
+        assert_eq!(epoch_of(first_slot_at), V2_FLAG_DAY);
+
+        let tx = signed_transfer_v2(4);
+        // CONTROL half — pre-activation IS today's behaviour, and today's
+        // refusal string, on the same transaction bytes.
+        let err = admissible(&tx, epoch_of(last_slot_before))
+            .expect_err("one epoch before the flag day the format must still be refused");
+        assert!(
+            err.contains("not active"),
+            "the pre-activation refusal must be today's, got: {err}"
+        );
+        // The change under test: the same bytes cross the door at 800.
+        assert!(
+            admissible(&tx, epoch_of(first_slot_at)).is_ok(),
+            "at the flag-day epoch a validly signed V2 must be admitted"
+        );
+    }
+
+    /// (b) of the task: the table signatures are verified AT ADMISSION, the
+    /// way the Transfer arm verifies per-input ones — otherwise an attacker
+    /// fills every mempool on the mesh with garbage for free after the flag
+    /// day, and every proposer pays to probe-drop it.
+    ///
+    /// Mutation log (2026-08-22): verify loop deleted from the V2 arm —
+    /// this test dies (the good-signature control half survives, proving
+    /// the death is the loop's).
+    #[test]
+    fn v2_signature_is_checked_before_the_mempool() {
+        let good = signed_transfer_v2(4);
+        assert!(
+            admissible(&good, V2_FLAG_DAY).is_ok(),
+            "control: the correctly signed sweep must be admitted"
+        );
+        let mut bad = good.clone();
+        if let PosTransaction::TransferV2 { keys, .. } = &mut bad {
+            // One flipped byte: shape and table stay valid, signature not.
+            keys[0].signature[0] ^= 0xFF;
+        }
+        let err = admissible(&bad, V2_FLAG_DAY)
+            .expect_err("a bad table signature must not be admitted");
+        assert!(err.contains("signature"), "got: {err}");
+    }
+
+    /// An empty witness table must be refused BY NAME. The signature loop
+    /// alone passes vacuously over `keys = []` (zero verifications); the
+    /// index-bounds check below it would still catch the shape (any input's
+    /// `key_index` misses an empty table), which is why this test pins the
+    /// REFUSAL MESSAGE and not just the refusal: it proves the dedicated
+    /// check fired, and keeps the two rules independent instead of one
+    /// silently load-bearing for the other.
+    ///
+    /// Mutation log (2026-08-22): `keys.is_empty()` check deleted — this
+    /// test dies on the message assertion (the shape is then refused as a
+    /// bad index, which is the wrong reason told to the wrong sender).
+    #[test]
+    fn v2_empty_witness_table_is_refused_not_vacuously_passed() {
+        let good = signed_transfer_v2(2);
+        assert!(
+            admissible(&good, V2_FLAG_DAY).is_ok(),
+            "control: the same transaction with its table populated is admitted"
+        );
+        let mut empty = good.clone();
+        if let PosTransaction::TransferV2 { keys, .. } = &mut empty {
+            keys.clear();
+        }
+        let err = admissible(&empty, V2_FLAG_DAY)
+            .expect_err("an empty witness table must not be admitted");
+        assert!(err.contains("no witness keys"), "got: {err}");
+    }
+
+    /// Stateless mirror of consensus's `DuplicateWitnessKey`
+    /// (transition.rs:2043–2052). The duplicate entry carries the SAME valid
+    /// signature and every entry is referenced, so only the duplicate rule
+    /// can be what refuses it — the control is the identical transaction
+    /// before the table was doubled.
+    ///
+    /// Mutation log (2026-08-22): duplicate check deleted — this test dies
+    /// (the doubled table verifies twice and is admitted).
+    #[test]
+    fn v2_duplicate_witness_key_is_refused() {
+        let good = signed_transfer_v2(2);
+        assert!(admissible(&good, V2_FLAG_DAY).is_ok(), "control");
+        let mut dup = good.clone();
+        if let PosTransaction::TransferV2 { keys, inputs, .. } = &mut dup {
+            let copy = keys[0].clone();
+            keys.push(copy);
+            // Both entries referenced, so WitnessKeyUnused cannot be the
+            // refusal; both signatures valid, so neither can the verify loop.
+            inputs[1].key_index = 1;
+        }
+        let err = admissible(&dup, V2_FLAG_DAY)
+            .expect_err("a repeated witness key must not be admitted");
+        assert!(err.contains("repeats a witness key"), "got: {err}");
+    }
+
+    /// Stateless mirror of consensus's `BadKeyIndex` (transition.rs:2071).
+    ///
+    /// Mutation log (2026-08-22): bounds refusal weakened to ignore
+    /// out-of-range indices — this test dies (entry 0 is still referenced by
+    /// input 0, coverage passes, the signature passes, admitted).
+    #[test]
+    fn v2_out_of_table_key_index_is_refused() {
+        let good = signed_transfer_v2(2);
+        assert!(admissible(&good, V2_FLAG_DAY).is_ok(), "control");
+        let mut bad = good.clone();
+        if let PosTransaction::TransferV2 { inputs, .. } = &mut bad {
+            // key_index is witness data outside the signing root
+            // (transition.rs, `TransferInputV2::key_index` doc), so this is
+            // a mutation a relay can make without touching the signature.
+            inputs[1].key_index = 7;
+        }
+        let err = admissible(&bad, V2_FLAG_DAY)
+            .expect_err("an input pointing outside the table must not be admitted");
+        assert!(err.contains("outside the table"), "got: {err}");
+    }
+
+    /// Stateless mirror of consensus's `WitnessKeyUnused`
+    /// (transition.rs:2088–2094): an unreferenced entry is relay-stuffable
+    /// padding. The control half re-points an input at the second entry —
+    /// same two keys, both signatures valid over the same root — and IS
+    /// admitted, proving the refusal was about the dangling entry and not
+    /// about carrying a second owner at all.
+    ///
+    /// Mutation log (2026-08-22): coverage check deleted — the refuse half
+    /// dies (both signatures verify and the padded table is admitted).
+    #[test]
+    fn v2_unreferenced_table_entry_is_refused() {
+        let good = signed_transfer_v2(2);
+        let root = good.spend_signing_root();
+        let (pk2, sk2) = bloch_crypto::crypto::generate_keypair_from_seed(&[10u8; 32])
+            .expect("second hybrid keypair");
+        let sig2 = bloch_crypto::crypto::sign(&sk2, &root).expect("second signature");
+
+        let mut padded = good.clone();
+        if let PosTransaction::TransferV2 { keys, .. } = &mut padded {
+            keys.push(WitnessKey {
+                pubkey: pk2,
+                signature: sig2,
+            });
+        }
+        let err = admissible(&padded, V2_FLAG_DAY)
+            .expect_err("a table entry no input references must not be admitted");
+        assert!(err.contains("no input references"), "got: {err}");
+
+        // CONTROL: reference the second entry and the same table passes.
+        // (Admission cannot know whose script_hash each input commits to —
+        // that is consensus's ScriptMismatch, which needs state; see the
+        // arm's comment.)
+        let mut both = padded.clone();
+        if let PosTransaction::TransferV2 { inputs, .. } = &mut both {
+            inputs[1].key_index = 1;
+        }
+        assert!(
+            admissible(&both, V2_FLAG_DAY).is_ok(),
+            "the identical table with every entry referenced must be admitted"
+        );
+    }
+
+    /// The V1 structural floor, carried over: a V2 that spends nothing or
+    /// pays no one is refused post-activation too, before any signature is
+    /// bought. Control is the untouched fixture.
+    ///
+    /// Mutation log (2026-08-22): `inputs.is_empty()` deleted — the
+    /// no-inputs half dies; `outputs.is_empty()` deleted — the no-outputs
+    /// half dies.
+    #[test]
+    fn v2_empty_inputs_or_outputs_are_refused() {
+        let good = signed_transfer_v2(2);
+        assert!(admissible(&good, V2_FLAG_DAY).is_ok(), "control");
+
+        let mut no_in = good.clone();
+        if let PosTransaction::TransferV2 { inputs, .. } = &mut no_in {
+            inputs.clear();
+        }
+        let err = admissible(&no_in, V2_FLAG_DAY)
+            .expect_err("a V2 with no inputs must not be admitted");
+        assert!(err.contains("no inputs"), "got: {err}");
+
+        let mut no_out = good.clone();
+        if let PosTransaction::TransferV2 { outputs, .. } = &mut no_out {
+            outputs.clear();
+        }
+        let err = admissible(&no_out, V2_FLAG_DAY)
+            .expect_err("a V2 with no outputs must not be admitted");
+        assert!(err.contains("no outputs"), "got: {err}");
+    }
+}
+
+/// (c) and (d) of the flag-day task, end to end on a REAL `Engine`: the
+/// single-owner many-input sweep enters by BOTH real entry paths — the RPC
+/// (`serve_rpc`'s SendRawTransaction arm, after the exact
+/// `from_canonical_bytes(canonical_bytes())` round-trip rpc.rs performs) and
+/// gossip (`on_transaction`, the body of the `NetEvent::Transaction` arm;
+/// both paths converge on that one function) — survives the mempool, and
+/// comes out of `select_transactions`, which IS the content of a proposal
+/// (`propose` packs exactly its return). Application at epoch ≥ 800 is
+/// proven by the transition suite (transition.rs, "TransferV2: deduplicated
+/// witnesses behind their own flag day"), which this harness deliberately
+/// does not duplicate: standing up a proposing validator here would re-test
+/// consensus to prove an admission property.
+///
+/// No mocked clock anywhere: the wall epoch is real `now_ms()` against a
+/// manifest whose `genesis_time_ms` is placed in the past — the same knob
+/// production uses — so `wall_slot()`/`epoch_of` run the very code the live
+/// node runs.
+#[cfg(test)]
+mod transfer_v2_end_to_end {
+    use super::*;
+    use bloch_pos_committee::params::TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH as V2_FLAG_DAY;
+    use bloch_pos_committee::state_root::{EutxoEntry, EvmCommitment};
+    use bloch_pos_committee::transition::{TransferInputV2, TransferOutput, WitnessKey};
+    use bloch_pos_committee::SLOTS_PER_EPOCH;
+    use sha3::{Digest, Sha3_256};
+
+    /// A real `Engine`: real `Store` on disk, real devnet transport bound to
+    /// an ephemeral port with zero peers (broadcast walks an empty peer
+    /// list, so gossiping an admitted transaction is a no-op instead of a
+    /// hang), observer mode (no keystore), and a genesis state that actually
+    /// HOLDS `entries` — the outputs the sweep spends. `epochs_past` places
+    /// `genesis_time_ms` so the node's real wall epoch is at least that
+    /// (+2 slots of margin so the epoch cannot regress mid-test).
+    fn engine_at_wall_epoch(epochs_past: u64, entries: &[EutxoEntry]) -> Engine {
+        let slot_ms = 500u64;
+        let back_ms = epochs_past
+            .saturating_mul(SLOTS_PER_EPOCH)
+            .saturating_add(2)
+            .saturating_mul(slot_ms);
+        let manifest = Manifest {
+            genesis_time_ms: now_ms().saturating_sub(back_ms),
+            slot_ms,
+            validators: Vec::new(),
+            cohort: Vec::new(),
+            carryover: None,
+            allocations: Vec::new(),
+            carryover_entries: Vec::new(),
+        };
+        let genesis_id = manifest.genesis_id();
+        // `CommittedState::genesis` directly rather than
+        // `manifest.genesis_state()`: the opening balances are the test's
+        // fixture, not a carryover snapshot with a commitment to honour.
+        let state = CommittedState::genesis(
+            genesis_id,
+            GENESIS_MIX,
+            &[],
+            &[],
+            [0u8; 32],
+            [0u8; 32],
+            [0u8; 32],
+            EvmCommitment {
+                account_root: [0u8; 32],
+                receipts_root: [0u8; 32],
+                gas_used: 0,
+                base_fee_per_gas: 0,
+            },
+            entries,
+        );
+        // Unique throwaway data dir per engine — two engines in one test
+        // must never share a store.
+        static DIR_SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "bloch-pos-v2-e2e-{}-{}",
+            std::process::id(),
+            DIR_SEQ.fetch_add(1, Ordering::Relaxed),
+        ));
+        std::fs::create_dir_all(&dir).expect("create the test data dir");
+        let store = Store::open(&dir, &[0u8; 32]).expect("open the test store");
+        let (events, _rx) = mpsc::channel::<EngineEvent>();
+        // `_rx` drops here: nothing dials this node, and the accept loop
+        // exits quietly on a closed channel.
+        let head_slot = Arc::new(AtomicU64::new(0));
+        let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let net = net::Net::Devnet(
+            net::start(
+                "127.0.0.1",
+                0, // ephemeral port: bind for real, listen to nobody
+                Vec::new(),
+                events,
+                dir.clone(),
+                head_slot.clone(),
+                inflight,
+            )
+            .expect("bind the devnet transport on an ephemeral port"),
+        );
+        let verifier = HybridVerifier::new(Vec::new());
+        Engine {
+            manifest,
+            state,
+            tr: Transition::new(verifier.clone()),
+            tr_probe: Transition::new(ProbeVerifier),
+            verifier,
+            keys: None,
+            blocks: BTreeMap::new(),
+            chain: vec![(0, genesis_id)],
+            canonical: BTreeSet::from([*genesis_id.as_bytes()]),
+            pool: BTreeMap::new(),
+            att_pool: AttestationPool::new(),
+            wall_slot: 0,
+            mempool: BTreeMap::new(),
+            store,
+            net,
+            head_slot,
+            live: true,
+            needs_sync: false,
+            last_applied_ms: now_ms(),
+            booted_ms: now_ms(),
+            ws_anchor: None,
+            ws_anchor_hard: false,
+            ws_conflict_reported: false,
+        }
+    }
+
+    /// The motivating shape, funded: `n` outputs of 8,400 BLCH (the
+    /// carryover denomination) under ONE key, and the V2 sweep spending all
+    /// of them through a ONE-entry witness table with one real hybrid
+    /// signature — the whole economy of the format. Returns the entries so
+    /// the engine's genesis can hold the very outputs being swept.
+    fn sweep_fixture(n: u32) -> (Vec<EutxoEntry>, PosTransaction) {
+        let (pk, sk) = bloch_crypto::crypto::generate_keypair_from_seed(&[42u8; 32])
+            .expect("hybrid keypair from a fixed seed");
+        let script_hash: [u8; 32] = Sha3_256::digest(&pk).into();
+        let entries: Vec<EutxoEntry> = (0..n)
+            .map(|vout| EutxoEntry {
+                txid: [0x33u8; 32],
+                vout,
+                value: 8_400 * 100_000_000, // 8,400 BLCH at 8 decimals
+                script_hash,
+            })
+            .collect();
+        let inputs: Vec<TransferInputV2> = entries
+            .iter()
+            .map(|e| TransferInputV2 {
+                txid: e.txid,
+                vout: e.vout,
+                key_index: 0,
+            })
+            .collect();
+        let mut tx = PosTransaction::TransferV2 {
+            keys: vec![WitnessKey {
+                pubkey: pk,
+                signature: Vec::new(),
+            }],
+            inputs,
+            outputs: vec![TransferOutput {
+                value: 1_000,
+                script_hash,
+            }],
+            // Admission is stateless and deliberately does not police the
+            // declared size — that is consensus's UnderdeclaredSize
+            // (transition.rs:2037), exercised by the transition suite.
+            tx_bytes: 0,
+            tip_millisat_per_gas: 0,
+        };
+        let root = tx.spend_signing_root();
+        let sig = bloch_crypto::crypto::sign(&sk, &root).expect("sign the spend root");
+        if let PosTransaction::TransferV2 { keys, .. } = &mut tx {
+            keys[0].signature = sig;
+        }
+        (entries, tx)
+    }
+
+    /// (c): after the flag day the sweep enters by RPC AND by gossip,
+    /// survives the mempool, and is what selection hands the proposer.
+    ///
+    /// Mutation log (2026-08-22): arm reverted to unconditional Err — dies
+    /// on every assertion below; call site handed `epoch_of(head)` instead
+    /// of the wall epoch — dies too, but only because this harness's head
+    /// sits at genesis; a cheap lagging-NODE test does not exist and that
+    /// limit is recorded at the arm's comment, not papered over here.
+    #[test]
+    fn v2_sweep_enters_by_rpc_and_gossip_and_comes_out_in_selection() {
+        let (entries, tx) = sweep_fixture(16);
+
+        // ── RPC path ────────────────────────────────────────────────────────
+        let mut rpc_node = engine_at_wall_epoch(V2_FLAG_DAY + 1, &entries);
+        let wall_epoch = epoch_of(rpc_node.wall_slot());
+        assert!(
+            wall_epoch >= V2_FLAG_DAY,
+            "harness: wall epoch must be past the flag day, got {wall_epoch}"
+        );
+        // The exact decode rpc.rs performs on `sendrawtransaction` bytes.
+        let bytes = tx.canonical_bytes();
+        let decoded = PosTransaction::from_canonical_bytes(&bytes)
+            .expect("the V2 canonical encoding must round-trip (the rpc.rs decode)");
+        assert_eq!(decoded, tx, "round-trip must reproduce the transaction");
+        let out = rpc_node.serve_rpc(RpcRequest::SendRawTransaction(decoded));
+        assert!(out.is_ok(), "sendrawtransaction must admit the sweep: {out:?}");
+        assert_eq!(rpc_node.mempool.len(), 1, "the sweep must sit in the mempool");
+
+        // ── Gossip path, on a FRESH engine ──────────────────────────────────
+        let mut gossip_node = engine_at_wall_epoch(V2_FLAG_DAY + 1, &entries);
+        assert_eq!(
+            gossip_node.on_transaction(tx.clone()),
+            Ok(Admitted::New),
+            "the gossip path must admit the sweep"
+        );
+        // Surviving the mempool: a second delivery collapses to Duplicate
+        // instead of being refused or double-inserted.
+        assert_eq!(
+            gossip_node.on_transaction(tx.clone()),
+            Ok(Admitted::Duplicate),
+            "a re-gossiped sweep must be a duplicate, not a refusal"
+        );
+        assert_eq!(gossip_node.mempool.len(), 1);
+
+        // ── ...and out into a proposal ──────────────────────────────────────
+        // `select_transactions(epoch)` is the proposal's content — `propose`
+        // packs exactly its return — and the epoch passed is the epoch of
+        // the slot being produced for, which for a live proposer is a wall
+        // slot: the same era admission just judged by.
+        let selected = gossip_node.select_transactions(epoch_of(gossip_node.wall_slot()));
+        assert_eq!(
+            selected,
+            vec![tx.clone()],
+            "the admitted sweep must be selected into the next proposal"
+        );
+        let selected_rpc = rpc_node.select_transactions(epoch_of(rpc_node.wall_slot()));
+        assert_eq!(selected_rpc, vec![tx]);
+    }
+
+    /// (d): before the flag day NOTHING changes — this is the photograph of
+    /// today's behaviour, taken with the same harness, the same transaction
+    /// bytes, and a manifest whose genesis is now (wall epoch 0). Both entry
+    /// paths refuse with today's message, the mempool stays empty, selection
+    /// stays empty.
+    ///
+    /// Mutation log (2026-08-22): flag-day gate deleted from the arm — this
+    /// test dies on every assertion; it is the half that keeps the
+    /// activation an activation instead of an unconditional opening.
+    #[test]
+    fn v2_sweep_is_refused_everywhere_before_the_flag_day() {
+        let (entries, tx) = sweep_fixture(16);
+        let mut node = engine_at_wall_epoch(0, &entries);
+        assert_eq!(
+            epoch_of(node.wall_slot()),
+            0,
+            "harness: a fresh genesis must put the wall clock in epoch 0"
+        );
+
+        // Gossip path: refused with today's string.
+        let err = node
+            .on_transaction(tx.clone())
+            .expect_err("pre-activation, the gossip path must refuse V2");
+        assert!(
+            err.reason().contains("deduplicated transfers (tag 0x06) are not active"),
+            "the refusal must be today's, byte for byte its opening clause: {}",
+            err.reason()
+        );
+
+        // RPC path: refused too, as an error the client sees.
+        let out = node.serve_rpc(RpcRequest::SendRawTransaction(tx.clone()));
+        assert!(
+            out.is_err(),
+            "pre-activation, sendrawtransaction must refuse V2: {out:?}"
+        );
+
+        // And nothing propagates: no mempool entry, nothing to select — the
+        // sweep does not exist to this era's node, exactly as today.
+        assert!(node.mempool.is_empty(), "the mempool must stay empty");
+        assert!(
+            node.select_transactions(0).is_empty(),
+            "selection must stay empty"
+        );
+
+        // THE POINT OF THE ERROR CODE: a refused transaction must not be
+        // reported as a full mempool. The founder's sweep submits hundreds of
+        // thousands of transfers through this method; "retry later" against
+        // bytes that can never be admitted sends the operator after capacity
+        // while the real fault goes unread.
+        let RpcResult::Err(e) = node.serve_rpc(RpcRequest::SendRawTransaction(tx.clone())) else {
+            panic!("a refused transaction must produce an RPC error");
+        };
+        assert_eq!(e.code, rpc::TX_REFUSED, "refused is not full: {e:?}");
+        assert!(
+            !e.message.contains("retry later"),
+            "a refused transaction must not be told to retry later: {}",
+            e.message
+        );
+
+        // THE CONTROL: a genuinely full mempool still reports MEMPOOL_FULL,
+        // and there "retry later" is the correct advice. Without this half,
+        // the assertion above could be satisfied by never reporting a full
+        // mempool at all.
+        let mut full = node;
+        for i in 0..MEMPOOL_MAX {
+            full.mempool.insert(vec![0xEE, (i >> 8) as u8, i as u8], tx.clone());
+        }
+        let RpcResult::Err(e2) = full.serve_rpc(RpcRequest::SendRawTransaction(tx.clone()))
+        else {
+            panic!("a full mempool must produce an RPC error");
+        };
+        assert_eq!(e2.code, rpc::MEMPOOL_FULL, "full is not refused: {e2:?}");
+        assert!(
+            e2.message.contains("retry later"),
+            "a full mempool SHOULD advise retrying: {}",
+            e2.message
+        );
     }
 }

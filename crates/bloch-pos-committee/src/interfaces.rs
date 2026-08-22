@@ -440,6 +440,26 @@ pub enum TransferReject {
     /// signature against the signing root). An unreferenced entry would be
     /// free padding a relay could stuff inside the declared `tx_bytes`.
     WitnessKeyUnused,
+    /// A V2 witness table is not in the one canonical order: strictly
+    /// ascending by public-key bytes. Refused for the same family of reason
+    /// as `DuplicateWitnessKey` and `WitnessKeyUnused`, taken to its
+    /// conclusion: the table and every `key_index` sit OUTSIDE the signing
+    /// root (`spend_signing_root` deliberately folds neither), so with the
+    /// order free a relay could permute the entries and remap the indices —
+    /// different `canonical_bytes`, same `txid` — and a byte-keyed mempool
+    /// (`bloch-pos-node/src/engine.rs`, `on_transaction` keys by
+    /// `canonical_bytes`) would hold permuted twins of one transfer as
+    /// distinct entries. One consensus order makes the encoding of a valid
+    /// transfer unique given its signature set, which is the segwit
+    /// resolution: canonicalise what lives outside the signed root instead
+    /// of teaching every byte-keyed cache to ignore it. Adjacent equality
+    /// stays `DuplicateWitnessKey` (the strict order subsumes the duplicate
+    /// check); only an inversion — which is also how a NON-adjacent
+    /// duplicate now surfaces — reports this variant. Activates with the
+    /// format itself: the check lives inside `apply_transfer_v2`, behind the
+    /// same `TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH` gate — no second flag
+    /// day.
+    WitnessTableNotCanonical,
 }
 
 /// Why a deposit was rejected (§7.1, §4.1, §6.6.3).
