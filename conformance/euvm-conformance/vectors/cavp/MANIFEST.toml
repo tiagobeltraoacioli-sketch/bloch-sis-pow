@@ -1,0 +1,37 @@
+# Provenance manifest for the committed NIST CAVP vector files (the ONLY corpus
+# small enough to commit — the GB-scale EVM/sBPF corpora are pinned+fetched, never
+# committed; see ../../../corpora/PINS.toml).
+#
+# Source: NIST Cryptographic Algorithm Validation Program (CAVP), public domain
+# (US government work). Fetched 2026-08-22 over HTTPS from csrc.nist.gov.
+#
+# Verify at any time:
+#   cd conformance/euvm-conformance/vectors/cavp && shasum -a 256 -c MANIFEST.sha256
+
+[source.sha]
+url = "https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Algorithm-Validation-Program/documents/shs/shabytetestvectors.zip"
+zip_sha256 = "929ef80b7b3418aca026643f6f248815913b60e01741a44bba9e118067f4c9b8"
+files = ["SHA256ShortMsg.rsp", "SHA256LongMsg.rsp"]
+
+[source.shake]
+url = "https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Algorithm-Validation-Program/documents/sha3/shakebytetestvectors.zip"
+zip_sha256 = "debfebc3157b3ceea002b84ca38476420389a3bf7e97dc5f53ea4689a16de4c7"
+files = ["SHAKE256ShortMsg.rsp", "SHAKE256LongMsg.rsp", "SHAKE256VariableOut.rsp"]
+
+# Files deliberately NOT imported, with reasons (report discipline: exclusions
+# are named, never silent):
+#   SHA256Monte.rsp    — EXCLUDED MONTE-NOT-EXPRESSIBLE: the Monte Carlo chain
+#                        iterates SINGLE SHA-256; the VM only exposes Sha256d
+#                        (double), so the chain cannot be driven through the
+#                        opcode without computing single-SHA host-side, which
+#                        would test the sha2 crate, not the VM.
+#   SHAKE256Monte.rsp  — EXCLUDED MONTE-NOT-EXPRESSIBLE: the SHAKE Monte chain
+#                        varies Outputlen per iteration; Op::Shake256 performs a
+#                        fixed 32-byte read (crates/bloch-euvm/src/lib.rs:424).
+#   SHAKE256VariableOut rows with Outputlen != 256
+#                      — EXCLUDED OUTPUTLEN-MISMATCH (1241 of 1246 rows); the 5
+#                        Outputlen=256 rows ARE run. Counted and asserted in
+#                        tests/cavp_shake256.rs.
+#   SHA-1/224/384/512(_224/_256), SHAKE128
+#                      — EXCLUDED NO-SUCH-OPCODE: the VM exposes no such
+#                        primitive.

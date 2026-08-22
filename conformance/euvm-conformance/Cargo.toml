@@ -1,0 +1,29 @@
+# euvm-conformance — CAVP known-answer conformance for the bloch-euvm hash opcodes.
+#
+# STANDALONE crate with its OWN [workspace] table, exactly like ../../euvm-tooling:
+# it is NOT swept into the node's root workspace, depends on bloch-euvm by path
+# only, and NOTHING here is reachable from the node's state-transition path
+# (bloch-pos-node / bloch-pos-committee do not know it exists). See
+# docs/specs/BLOCH-VM-DIFFERENTIAL-CONFORMANCE.md for why this front exists and
+# what it deliberately does NOT claim (it is NOT Ethereum or Solana conformance —
+# bloch-euvm has no external reference implementation, so the honest substitute
+# is (a) NIST CAVP KATs for the crypto the opcodes expose and (b) the mutation
+# campaign in ../mutation over the crate's own 331 tests).
+[package]
+name = "euvm-conformance"
+version = "0.0.1"
+edition = "2021"
+description = "NIST CAVP known-answer tests for the bloch-euvm Sha256d/Shake256 opcodes, run through the VM's real execution path"
+license = "AGPL-3.0-or-later"
+
+# Own workspace root — isolates this crate from the parent node workspace
+# (same idiom and same reason as euvm-tooling/Cargo.toml).
+[workspace]
+
+[dependencies]
+bloch-euvm = { path = "../../crates/bloch-euvm" }
+# sha2 is used ONLY to (1) anchor the linked primitive itself against the NIST
+# MDs and (2) compute the OUTER application of Sha256d from the NIST-given MD.
+# See src/lib.rs for the exact independence argument.
+sha2 = "0.10"
+hex = "0.4"

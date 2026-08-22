@@ -1,0 +1,76 @@
+# Pinned upstream reference corpora for the VM differential-conformance front
+# (docs/specs/BLOCH-VM-DIFFERENTIAL-CONFORMANCE.md §C1).
+#
+# The corpora are GB-scale and are NEVER committed — they are fetched at the
+# pinned commit by fetch-corpora.sh and verified against the SHA-256 manifests
+# in manifests/ (git's own object hashing pins content too, but the manifest is
+# defense-in-depth for tarball fetches and for corpora consumed outside git).
+# A conformance run whose corpus does not verify against its manifest MUST
+# refuse to report a rate (spec §5).
+#
+# Commits resolved via `git ls-remote` on 2026-08-22.
+
+[ethereum-tests]
+# Oracle for the FUTURE crates/bloch-l1-evm (milestone E2, revm @ CANCUN —
+# BLOCH-L1-EVM-REUSE-AUDIT.md:73). NOT applicable to bloch-euvm, which is not an
+# EVM (category error — spec §0). Harness C2 is BLOCKED until E2 has code.
+#
+# MEASURED at pin time (2026-08-22): the repo layout CHANGED upstream — at this
+# commit there is NO GeneralStateTests/ tree in the checkout; the maintained
+# fixtures ship as the prebuilt tarball `fixtures_general_state_tests.tgz`
+# (ethereum/tests is now legacy; generation moved to execution-spec-tests).
+# The tarball extracts to GeneralStateTests/ with 2717 entries / 2642 fixture
+# JSONs; EVERY one of the 2642 cases carries a Cancun post-section (2641 also
+# carry Prague) — so the Cancun-applicable corpus is the whole tarball.
+repo = "https://github.com/ethereum/tests.git"
+branch = "develop"
+commit = "c67e485ff8b5be9abc8ad15345ec21aa22e290d9"
+subset = "fixtures_general_state_tests.tgz"   # sparse-checkout of just this file
+tarball_sha256 = "82bc3cb1c23f48b2b8a2b3d9cb5d9b96ddf6c31683f75368173bee3b25a24274"
+cases = 2642
+license = "MIT"
+manifest = "manifests/ethereum-tests-c67e485f.sha256"   # per-file, over the EXTRACTED tree (committed)
+
+[anza-sbpf]
+# Differential oracle B1 for the FUTURE crates/bloch-sbpf (Front 1). The
+# upstream interpreter crate itself; small enough that its manifest is
+# generated at pin time and committed.
+repo = "https://github.com/anza-xyz/sbpf.git"
+branch = "main"
+commit = "2510663bb8d894e8e3094be351e4bb4b604f1f84"
+license = "Apache-2.0"
+manifest = "manifests/anza-sbpf-2510663b.sha256"
+
+[firedancer-test-vectors]
+# Fixture oracle B2 for the FUTURE crates/bloch-sbpf. Fixtures are protobuf
+# (org.solana.sealevel.v1, decoded by the future harness); compute-units are OUT
+# of the diff by design (BLOCH-SBPF-CORE D2: Bloch's cost table is its own).
+#
+# MEASURED CORRECTION (2026-08-22): the spec pinned `vm_interp` at branch HEAD
+# 68bb4af4 — but **vm_interp DOES NOT EXIST at that commit**. Upstream deleted
+# every VM-interpreter fixture in af5e637b "vm_interp: remove all vm interp
+# fixtures (#188)" on 2026-02-20. A sparse-checkout of `vm_interp` at HEAD
+# therefore yields an EMPTY directory, and a harness pointed at it would report
+# a conformance rate over zero fixtures — the precise failure mode the report
+# discipline in §5 exists to prevent. Verified by
+# `git ls-tree -r --name-only <commit> -- vm_interp`:
+#   68bb4af4 (HEAD)  ->      0 files
+#   395c84ae (af5e637b^) -> 108811 files
+# So B2 pins the LAST commit that still carries the corpus. It is a frozen,
+# no-longer-maintained snapshot: state that in every report that uses it.
+repo = "https://github.com/firedancer-io/test-vectors.git"
+branch = "main"
+commit = "395c84aeadf5d14a2c00223395179a123ceeb266"   # NOT HEAD — see above
+commit_date = "2026-02-20"
+subset = "vm_interp"
+fixtures = 108811
+license = "Apache-2.0"
+manifest = "manifests/firedancer-vm-interp-395c84ae.sha256"  # ~100k files; generated at first fetch, NOT fetched at pin time
+
+# Still present at HEAD 68bb4af4, and the candidate oracles if the frozen
+# vm_interp snapshot proves too stale for the ISA Front 1 actually ships:
+#   vm_serialization/fixtures  ~1000 files
+#   syscall/fixtures           ~7571 files (syscall surface; mostly out of the v0 subset)
+#   elf_loader/fixtures        ~1955 files (EXCL-ELF for v0 by filters/sbpf.toml)
+# Choosing between "frozen snapshot with the right shape" and "live corpus with
+# the wrong shape" is a Front 1 decision, to be made against the delivered ISA.

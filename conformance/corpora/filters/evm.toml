@@ -1,0 +1,18 @@
+# Applicability filter for the C2 harness (crates/bloch-l1-evm vs
+# ethereum/tests GeneralStateTests @ CANCUN). DATA, not code: every exclusion
+# carries a reason code, and the report prints exclusion counts per code —
+# silent skips are how divergence hides (spec §3/§5).
+#
+# STATUS: skeleton. crates/bloch-l1-evm has ZERO code (milestone E2); the
+# concrete fixture lists fill in when the harness first runs against a real
+# build. Reason codes are fixed now so reports are comparable from day one.
+
+[reason-codes]
+EXCL-FORK        = "fixture targets a fork other than the pinned CANCUN"
+EXCL-BLOB        = "EIP-4844 blob-tx fixture: Bloch L1 carries no blob sidecars; the harness asserts these REJECT (expected-reject, NOT a skip)"
+EXCL-FORMAT      = "fixture uses a filler feature the runner does not parse yet (named, counted, temporary)"
+DIVERGENT-BY-DESIGN = "Bloch deliberately differs (e.g. V4 fee routing vs basefee burn); REQUIRES an ADR/spec citation per entry"
+
+[divergent-by-design]
+# entries = [{ fixture = "...", citation = "ADR-040 / BLOCH-L1-EXECUTION-PLAN.md §..." }]
+entries = []

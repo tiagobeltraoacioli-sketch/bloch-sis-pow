@@ -1,0 +1,18 @@
+# Applicability filter for the C3 harness (crates/bloch-sbpf vs anza-xyz/sbpf
+# execution diff + firedancer vm_interp fixtures). DATA, not code; same report
+# discipline as filters/evm.toml.
+#
+# STATUS: skeleton. crates/bloch-sbpf has ZERO code (Front 1); the v0 subset is
+# deliberately narrow, so MOST vm_interp fixtures will be EXCLUDED — that is
+# the expected shape of the first honest report, not a failure (spec §risks).
+
+[reason-codes]
+EXCL-CALLX       = "fixture uses callx — forbidden in the Bloch v0 subset (BLOCH-SBPF-CORE)"
+EXCL-ELF         = "fixture requires an ELF loader — out of the v0 subset"
+EXCL-SYSCALL     = "fixture invokes a syscall surface the v0 subset does not define"
+EXCL-VERSION     = "fixture targets an sBPF ISA version outside the pinned one"
+EXCL-CU-ONLY     = "fixture's only assertion is compute-units. CUs are NEVER diffed against Solana: BLOCH-SBPF-CORE.md:287-299 fixes a cost table of Bloch consensus constants (SBPF_COST_*) that matches Solana at 1 CU per instruction but deliberately DIVERGES on syscalls (per-call base + per-byte terms, e.g. syscall_sha3 = 85 + ceil(len/2)) because of bloch-euvm's F2 lesson. So a CU diff would be empty on the boring rows and meaninglessly red on every syscall row, burying real semantic divergence. cu_used compares ONLY against Bloch's own golden vectors (BLOCH-SBPF-CORE.md:394, D2)"
+DIVERGENT-BY-DESIGN = "Bloch deliberately differs; REQUIRES a spec citation per entry"
+
+[divergent-by-design]
+entries = []
