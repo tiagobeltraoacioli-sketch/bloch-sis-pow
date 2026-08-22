@@ -8884,6 +8884,29 @@ mod tests {
             "with its history gone the same bond silently loses the genesis write-off"
         );
     }
+
+    /// The saturation in `withdrawable_sat_gated` is a consensus claim, not
+    /// decoration: slashing consumes the withdrawable accrual BEFORE the
+    /// notional principal, so a genesis bond slashed below 25,000 BLOCH must
+    /// read zero — a plain subtraction would underflow (a debug panic on a
+    /// consensus read path, a wrapped near-u128::MAX "withdrawable" in
+    /// release). This test exists because the 2026-08-22 mutation run proved
+    /// the rest of the suite survives that exact substitution.
+    #[test]
+    fn a_bond_slashed_below_its_unbacked_principal_reads_zero_not_underflow() {
+        let (_t, g, _c) = setup_funded(4, &[]);
+        let mut st = g.clone();
+        // A slash that ate through the accrual and into the principal.
+        st.validators.get_mut(&0).unwrap().staked_sat = GENESIS_UNFUNDED_PRINCIPAL_SAT - sat(1);
+        assert_eq!(st.withdrawable_sat_gated(0, 0), 0, "saturates at zero, never wraps");
+        // The SHIPPED gate derives the same unbacked principal for a
+        // history-less record, so the public accessor must saturate too.
+        assert_eq!(st.withdrawable_sat(0), 0);
+        // Control: one satoshi above the principal reads exactly one satoshi,
+        // so the zero above is saturation and not some unrelated short-circuit.
+        st.validators.get_mut(&0).unwrap().staked_sat = GENESIS_UNFUNDED_PRINCIPAL_SAT + 1;
+        assert_eq!(st.withdrawable_sat_gated(0, 0), 1);
+    }
 }
 
 #[cfg(test)]
