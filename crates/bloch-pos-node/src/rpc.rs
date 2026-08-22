@@ -1383,6 +1383,7 @@ pub fn submitted_json(tx: &PosTransaction, outcome: Admitted) -> Json {
     let hash: [u8; 32] = Sha3_256::digest(&bytes).into();
     let kind = match tx {
         PosTransaction::Transfer { .. } => "transfer",
+        PosTransaction::TransferV2 { .. } => "transfer_v2",
         PosTransaction::Deposit { .. } => "deposit",
         PosTransaction::Exit { .. } => "exit",
         PosTransaction::Delegate { .. } => "delegate",
