@@ -873,25 +873,10 @@ impl Engine {
         // request. Root derivation is `staking::ExitTx`'s, the same single
         // definition the transition verifies against.
         if let PosTransaction::SignedExit { validator, epoch, signature } = &tx {
-            use sha3::{Digest, Sha3_256};
-            let Some(rec) = self.state.validator_record(*validator) else {
-                return Err(Refusal::Invalid(
-                    "signed exit names a validator that is not in the registry",
-                ));
-            };
-            let root = staking::ExitTx {
-                pubkey_hash: Sha3_256::digest(&rec.pubkey).into(),
-                epoch: *epoch,
-                signature: Vec::new(),
-            }
-            .signing_root();
-            if !bloch_crypto::crypto::verify(&rec.pubkey, &root, signature) {
-                return Err(Refusal::Invalid(
-                    "signed exit carries a signature that does not verify \
-                     against the registered key",
-                ));
-            }
-        }        let mut frame = vec![net::FRAME_TX];
+            signed_exit_preverifies(&self.state, *validator, *epoch, signature)
+                .map_err(Refusal::Invalid)?;
+        }
+        let mut frame = vec![net::FRAME_TX];
         frame.extend_from_slice(&key);
         self.mempool.insert(key, tx);
         self.net.broadcast(frame);
@@ -2058,6 +2043,45 @@ pub fn lmd_ghost_head<'a>(
 /// class that has actually been exploited or is currently exploitable.
 /// (State-dependent pre-checks that need the registry — the SignedExit
 /// signature — live in `on_transaction`, next to the state they read.)
+/// The one admission check `admissible` cannot make, split out so it can be
+/// exercised without a running engine (the same seam discipline as
+/// `admissible` itself): a `SignedExit`'s signature verifies against the
+/// REGISTERED pubkey, which only the committed registry holds. Skipping it
+/// would reopen the slot-69 class for exits — the producer prices with
+/// `ProbeVerifier`, so a garbage-signed exit would be proposed and cost the
+/// proposer its block, on the strength of one unauthenticated request. Root
+/// derivation is `staking::ExitTx`'s, the same single definition the
+/// transition verifies against.
+///
+/// Honest reachability note: while `FUNDED_STAKE_ACTIVATION_EPOCH` ships as
+/// `u64::MAX`, `admissible` refuses every `SignedExit` before
+/// `on_transaction` reaches this call — the wiring only carries weight from
+/// the flag day on, which is exactly why the FUNCTION is what the tests pin
+/// (the 2026-08-22 mutation run proved the call site alone is untestable
+/// until arming).
+pub(crate) fn signed_exit_preverifies(
+    state: &CommittedState,
+    validator: u32,
+    epoch: u64,
+    signature: &[u8],
+) -> Result<(), &'static str> {
+    use sha3::{Digest, Sha3_256};
+    let Some(rec) = state.validator_record(validator) else {
+        return Err("signed exit names a validator that is not in the registry");
+    };
+    let root = staking::ExitTx {
+        pubkey_hash: Sha3_256::digest(&rec.pubkey).into(),
+        epoch,
+        signature: Vec::new(),
+    }
+    .signing_root();
+    if !bloch_crypto::crypto::verify(&rec.pubkey, &root, signature) {
+        return Err("signed exit carries a signature that does not verify \
+                    against the registered key");
+    }
+    Ok(())
+}
+
 pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'static str> {
     match tx {
         // The LEGACY staking messages are refused unconditionally — before
@@ -3036,6 +3060,90 @@ mod admission_authorisation {
         }
         let err = admissible(&bad_pop, u64::MAX).expect_err("garbage PoP signed over");
         assert!(err.contains("possession"), "got: {err}");
+    }
+
+    /// The registry half of the exit door, at its testable seam
+    /// (`signed_exit_preverifies` — the call site in `on_transaction` is
+    /// unreachable until the flag day arms, which the 2026-08-22 mutation
+    /// run proved by deleting it under a green suite). Control first: an
+    /// exit signed by the registered key over the `staking::ExitTx` root
+    /// passes. Negatives: an unregistered index, a flipped byte, and — the
+    /// case that makes this a REGISTRY check and not a self-contained one —
+    /// a perfectly valid signature by the WRONG key.
+    #[test]
+    fn a_signed_exit_preverifies_against_the_registered_key_only() {
+        use bloch_pos_committee::state_root::EvmCommitment;
+        use bloch_pos_committee::transition::GenesisValidator;
+        use sha3::{Digest, Sha3_256};
+
+        let (pk, sk) = bloch_crypto::crypto::generate_keypair_from_seed(&[8u8; 32])
+            .expect("registered validator keypair");
+        let vals = [GenesisValidator {
+            index: 0,
+            pubkey: pk.clone(),
+            staked_sat: 25_000 * 100_000_000,
+            randao_commitment: [0u8; 32],
+            withdrawal_credentials: vec![0u8; 32],
+            commission_bps: 0,
+        }];
+        let manifest = Manifest {
+            genesis_time_ms: 0,
+            slot_ms: 500,
+            validators: Vec::new(),
+            cohort: Vec::new(),
+            carryover: None,
+            allocations: Vec::new(),
+            carryover_entries: Vec::new(),
+        };
+        let state = CommittedState::genesis(
+            manifest.genesis_id(),
+            GENESIS_MIX,
+            &vals,
+            &[],
+            [0u8; 32],
+            [0u8; 32],
+            [0u8; 32],
+            EvmCommitment {
+                account_root: [0u8; 32],
+                receipts_root: [0u8; 32],
+                gas_used: 0,
+                base_fee_per_gas: 0,
+            },
+            &[],
+        );
+
+        let root = staking::ExitTx {
+            pubkey_hash: Sha3_256::digest(&pk).into(),
+            epoch: 0,
+            signature: Vec::new(),
+        }
+        .signing_root();
+        let sig = bloch_crypto::crypto::sign(&sk, &root).expect("sign the exit root");
+
+        // Control: the registered key's signature passes.
+        signed_exit_preverifies(&state, 0, 0, &sig)
+            .expect("the registered key's own exit must pre-verify");
+
+        // An index the registry does not hold.
+        let err = signed_exit_preverifies(&state, 1, 0, &sig)
+            .expect_err("an unregistered validator must be refused");
+        assert!(err.contains("not in the registry"), "got: {err}");
+
+        // One flipped byte.
+        let mut bad = sig.clone();
+        bad[0] ^= 0xFF;
+        let err = signed_exit_preverifies(&state, 0, 0, &bad)
+            .expect_err("a corrupted signature must be refused");
+        assert!(err.contains("does not verify"), "got: {err}");
+
+        // A valid signature by the WRONG key: only the registry can catch
+        // this, which is why the check lives beside the state.
+        let (_pk2, sk2) = bloch_crypto::crypto::generate_keypair_from_seed(&[9u8; 32])
+            .expect("impostor keypair");
+        let forged = bloch_crypto::crypto::sign(&sk2, &root).expect("impostor signs");
+        let err = signed_exit_preverifies(&state, 0, 0, &forged)
+            .expect_err("another key's signature must be refused");
+        assert!(err.contains("does not verify"), "got: {err}");
     }
 }
 
