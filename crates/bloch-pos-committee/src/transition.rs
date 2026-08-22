@@ -2386,12 +2386,26 @@ impl CommittedState {
     /// and the validator charges every included transaction with it. A second
     /// expression of this rule anywhere is h28080 with a fee attached.
     pub fn next_base_fee(&self) -> u128 {
+        self.next_base_fee_at(self.epoch)
+    }
+
+    /// The price this state charges for a block in `epoch`.
+    ///
+    /// The epoch is explicit because the EIP-1559 byte target is flag-day
+    /// gated and this state's own `epoch` is the WRONG one to use at the
+    /// boundary: `compute_post_state` prices from `pre`, which has not rolled
+    /// yet, so on the first block of the activation epoch `pre.epoch` is still
+    /// the old era. The consensus caller passes the epoch derived from the
+    /// block's header slot; [`Self::next_base_fee`] keeps the convenient form
+    /// for the producer and the RPC, where this state IS the one being priced.
+    pub fn next_base_fee_at(&self, epoch: u64) -> u128 {
         fee_market::next_base_fee(
             self.base_fee_millisat_per_gas,
             fee_market::BlockUsage {
                 gas_used: self.block_gas_used,
                 tx_bytes: self.block_tx_bytes,
             },
+            epoch,
         )
     }
 
@@ -2925,7 +2939,7 @@ impl<V: SignatureVerifier> Transition<V> {
         // boundaries, and a boundary is not a block — it moves no price. Both
         // read the same fields here, and reading the pre-state is what says
         // so.
-        let base_fee = pre.next_base_fee();
+        let base_fee = pre.next_base_fee_at(block_epoch);
 
         let total_active: u128 = roster.iter().map(|v| v.effective_stake as u128).sum();
         let mut base_fees: u128 = 0;
@@ -2981,7 +2995,7 @@ impl<V: SignatureVerifier> Transition<V> {
         if block_gas > fee_market::BLOCK_GAS_LIMIT {
             return Err(TransitionError::BlockGasLimitExceeded);
         }
-        if block_bytes > fee_market::MAX_BLOCK_TX_BYTES {
+        if block_bytes > fee_market::max_block_tx_bytes(block_epoch) {
             return Err(TransitionError::BlockByteLimitExceeded);
         }
 
@@ -4237,6 +4251,7 @@ mod tests {
             fee_market::next_base_fee(
                 s1.base_fee_millisat_per_gas(),
                 fee_market::BlockUsage { gas_used: s1.block_gas_used, tx_bytes: s1.block_tx_bytes },
+                s1.epoch,
             )
         );
 

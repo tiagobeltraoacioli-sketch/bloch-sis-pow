@@ -149,6 +149,26 @@ pub const LEAKED_ROSTER_ACTIVATION_EPOCH: u64 = u64::MAX;
 /// standing reason.
 pub const TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH: u64 = u64::MAX;
 
+/// Flag day for the 512 KiB block payload cap
+/// ([`crate::fee_market::MAX_BLOCK_TX_BYTES_V2`]).
+///
+/// From this epoch a block may carry 524,288 payload bytes instead of
+/// 262,144, and the EIP-1559 byte target moves with it — the two are one
+/// switch, never two. Splitting them would price a half-full block as
+/// congested: the controller reads utilisation as `tx_bytes / target`, so a
+/// doubled cap over an undoubled target makes 300 KiB — well under the new
+/// cap — read as 2.3x over target and push the base fee up on a block that is
+/// not scarce at all.
+///
+/// `u64::MAX` until the founder sets it. Below it every node computes the old
+/// cap and the old target, so a mixed fleet reaches one verdict on every
+/// block; at and above it they diverge on both, so **the fleet must be
+/// rebuilt before this constant is ever lowered**. Same idiom as
+/// [`LEAKED_ROSTER_ACTIVATION_EPOCH`], and the gate reads the epoch derived
+/// from the block's own header slot — never node-local state, which is what
+/// the 2026-08-08 `expected_bits` fork cost us.
+pub const BLOCK_BYTES_V2_ACTIVATION_EPOCH: u64 = u64::MAX;
+
 /// Domain separation tags (§6.1). Fixed 16 bytes, right-padded with zeros, so
 /// no tag can be a prefix of another.
 pub const DS_SORTITION: [u8; 16] = *b"BLCH4:SORTIT\0\0\0\0";
