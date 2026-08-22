@@ -231,6 +231,45 @@ pub struct TransferInputV2 {
     pub key_index: u32,
 }
 
+/// Rewrite a [`PosTransaction::TransferV2`] witness table into the one order
+/// consensus accepts — ascending by pubkey bytes — remapping every input's
+/// `key_index` through the same permutation. **The builder-side contract**
+/// for [`TransferReject::WitnessTableNotCanonical`]: a wallet assembles its
+/// table in any convenient order, calls this once, and the result is the
+/// canonical encoding.
+///
+/// Pure re-indexing, and provably signature-neutral: the table and the
+/// `key_index` fields sit outside [`PosTransaction::spend_signing_root`], so
+/// this changes neither the root, nor the txid, nor any signature's
+/// validity; and the charge is untouched because the class term of the fee
+/// is `keys.len()`, invariant under permutation. The one thing it changes is
+/// `canonical_bytes` — onto the unique encoding all nodes admit.
+///
+/// Degenerate inputs are passed through, not repaired: duplicate pubkeys
+/// stay adjacent duplicates (still [`TransferReject::DuplicateWitnessKey`] —
+/// the stable sort cannot merge them because which signature survives would
+/// be this function's invention), and a `key_index` already past the table
+/// is left as it is (still [`TransferReject::BadKeyIndex`]). Canonical form
+/// is about ORDER; the other table disciplines keep their own rejects.
+pub fn canonicalize_witness_table(keys: &mut Vec<WitnessKey>, inputs: &mut [TransferInputV2]) {
+    // Sort a permutation, not the table: the table entries are ~8.5 KB each
+    // (hybrid key + signature) and the remap needs old→new positions anyway.
+    let mut order: Vec<u32> = (0..keys.len() as u32).collect();
+    order.sort_by(|a, b| keys[*a as usize].pubkey.cmp(&keys[*b as usize].pubkey));
+    let mut new_index = vec![0u32; keys.len()];
+    for (new, old) in order.iter().enumerate() {
+        new_index[*old as usize] = new as u32;
+    }
+    let mut sorted: Vec<WitnessKey> =
+        order.iter().map(|old| keys[*old as usize].clone()).collect();
+    core::mem::swap(keys, &mut sorted);
+    for i in inputs.iter_mut() {
+        if let Some(n) = new_index.get(i.key_index as usize) {
+            i.key_index = *n;
+        }
+    }
+}
+
 /// One created output: an amount, and the commitment to who may spend it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TransferOutput {
@@ -1993,7 +2032,8 @@ impl CommittedState {
     ///
     /// # Frozen check order, cheapest first (consensus, like V1's)
     ///
-    /// Structure (no inputs, size floor), table discipline (duplicate keys),
+    /// Structure (no inputs, size floor), table discipline (strict pubkey
+    /// order, which subsumes duplicate keys),
     /// per-input set membership + index bounds + script hashes, table
     /// coverage (unused entries), the price, conservation, output-key
     /// collisions, and only then the hybrid verifications — **one per table
@@ -2038,15 +2078,46 @@ impl CommittedState {
             return Err(TransferReject::UnderdeclaredSize);
         }
 
-        // ── Table discipline: no duplicate keys ─────────────────────────────
+        // ── Table discipline: strictly ascending by pubkey bytes ────────────
         //
-        // A `BTreeSet` over the key bytes, order-free (rule 2). Without this,
-        // one logical transfer has many encodings differing only in unsigned
-        // witness bytes, and a relay can re-shape the body in flight.
-        let mut distinct: BTreeSet<&[u8]> = BTreeSet::new();
-        for k in keys {
-            if !distinct.insert(k.pubkey.as_slice()) {
-                return Err(TransferReject::DuplicateWitnessKey);
+        // One pass replaces the order-free `BTreeSet` dedup this arm shipped
+        // with: `keys` must be STRICTLY increasing by pubkey bytes. Strict
+        // order subsumes the duplicate check (a sorted table can only carry a
+        // duplicate adjacently), so nothing the old pass refused is admitted;
+        // adjacent equality keeps its old name (`DuplicateWitnessKey`), an
+        // inversion is the new `WitnessTableNotCanonical`. The discrimination
+        // matters: equality and disorder are different wallet bugs, and this
+        // enum exists so an operator can read a divergence off a log.
+        //
+        // Why the ORDER is consensus and not lint: the table and every
+        // `key_index` sit OUTSIDE `spend_signing_root` (its fold covers spend
+        // points, outputs, tx_bytes, tip — witnesses deliberately excluded,
+        // see the doc on that function), while the node's mempool is keyed by
+        // `canonical_bytes`, not txid (bloch-pos-node/src/engine.rs:800,
+        // `on_transaction`). Order-free tables therefore give one txid many
+        // valid encodings: a relay permutes `keys`, remaps the `key_index`es,
+        // and a byte-keyed mempool holds the permuted twin as a DISTINCT
+        // entry of the SAME transfer — churn, and wallet confusion, the exact
+        // malleability class segwit closed. With one canonical order the
+        // encoding of a valid transfer is unique given its signature set, so
+        // every byte-keyed structure downstream (mempool key, gossip frame,
+        // block packing by encoded length, post-apply removal by body bytes)
+        // is correct without being touched.
+        //
+        // Why there is NO new activation constant: this function is reachable
+        // only through the `TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH` gate in
+        // `apply_transaction`, so the order rule activates on the SAME flag
+        // day as the format itself. A second constant would be a second flag
+        // day for one format — a partition waiting to happen.
+        for pair in keys.windows(2) {
+            match pair[0].pubkey.cmp(&pair[1].pubkey) {
+                core::cmp::Ordering::Equal => {
+                    return Err(TransferReject::DuplicateWitnessKey);
+                }
+                core::cmp::Ordering::Greater => {
+                    return Err(TransferReject::WitnessTableNotCanonical);
+                }
+                core::cmp::Ordering::Less => {}
             }
         }
         // The owner-key hashes, computed ONCE — k hashes, not n. Whether each
@@ -3521,9 +3592,13 @@ mod tests {
 
     /// The V2 re-encoding of a signed V1 transfer: the witness of each
     /// input's first occurrence moves into the table — the SAME pubkey and
-    /// the SAME signature bytes, deduplicated, nothing re-signed. This is the
-    /// operation a relay or wallet performs after the flag day, and the
-    /// equivalence tests are about proving it changes no verified fact.
+    /// the SAME signature bytes, deduplicated, nothing re-signed — and the
+    /// table is then put into the one consensus order by
+    /// [`canonicalize_witness_table`] (first-occurrence order would be
+    /// [`TransferReject::WitnessTableNotCanonical`] whenever the V1 inputs
+    /// happen to reveal keys out of byte order). This is the operation a
+    /// relay or wallet performs after the flag day, and the equivalence
+    /// tests are about proving it changes no verified fact.
     fn v2_twin_of(v1: &PosTransaction) -> PosTransaction {
         let PosTransaction::Transfer { inputs, outputs, tx_bytes, tip_millisat_per_gas } = v1
         else {
@@ -3548,6 +3623,7 @@ mod tests {
                 key_index: idx as u32,
             });
         }
+        canonicalize_witness_table(&mut keys, &mut v2_inputs);
         PosTransaction::TransferV2 {
             keys,
             inputs: v2_inputs,
@@ -6607,6 +6683,255 @@ mod tests {
             two_verifies.gas > one_verify.gas,
             "control: per-input pricing must actually differ, or the equality \
              above says nothing"
+        );
+    }
+
+    /// **The permuted-twin refusal — why the table order is consensus.** The
+    /// table and the `key_index`es are outside the signing root, so a relay
+    /// can swap two entries and re-point the indices without touching one
+    /// signed byte: same root, same txid, DIFFERENT `canonical_bytes` — and
+    /// the mempool is keyed by `canonical_bytes` (engine.rs:800), so before
+    /// this rule the twin would sit next to the original as a distinct entry
+    /// of the same transfer. The test pins all three facts (root equal, txid
+    /// equal, bytes distinct) and then the refusal; the CONTROL is the same
+    /// spend points, same signatures, canonical order — applies and moves
+    /// both coins. Last, the twin is repaired by
+    /// [`canonicalize_witness_table`] alone — no re-sign — back to the exact
+    /// canonical bytes: order was the only thing wrong with it.
+    #[test]
+    fn a_permuted_witness_table_is_refused_and_shares_the_txid() {
+        // Two owners with an EXPLICIT byte order, so "permuted" is a fact
+        // established by the fixture, not by owner_key's internals.
+        let a = owner_key(0x70);
+        let b = owner_key(0x71);
+        let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+        let to = script_of(&owner_key(0x72));
+        let coin_lo = opening(0x90, 0, 50_000_000, &lo);
+        let coin_hi = opening(0x91, 0, 50_000_000, &hi);
+        let (_t, g, _c) = setup_funded(4, &[coin_lo.clone(), coin_hi.clone()]);
+        let price = g.next_base_fee();
+
+        let canonical = transfer_v2_raw(
+            &[coin_lo.clone(), coin_hi.clone()],
+            &[&lo, &hi],
+            &[0, 1],
+            to,
+            512,
+            1,
+            price,
+        );
+
+        // The relay's move, exactly: swap the entries, re-point the indices,
+        // re-sign NOTHING.
+        let mut permuted = canonical.clone();
+        if let PosTransaction::TransferV2 { keys, inputs, .. } = &mut permuted {
+            keys.swap(0, 1);
+            for i in inputs.iter_mut() {
+                i.key_index ^= 1;
+            }
+        }
+        // The mempool facts this rule exists for: one txid, two encodings.
+        assert_eq!(permuted.spend_signing_root(), canonical.spend_signing_root());
+        assert_eq!(permuted.txid(), canonical.txid());
+        assert_ne!(
+            permuted.canonical_bytes(),
+            canonical.canonical_bytes(),
+            "premise: the twin must be a DISTINCT encoding, or nothing below \
+             says anything about malleability"
+        );
+
+        assert_eq!(
+            g.clone().apply_transfer_v2(&permuted, price, &ToyVerifier),
+            Err(TransferReject::WitnessTableNotCanonical),
+        );
+
+        // Control: canonical order, same signatures — applies, coins move.
+        let mut post = g.clone();
+        assert!(
+            post.apply_transfer_v2(&canonical, price, &ToyVerifier).is_ok(),
+            "the canonical form must apply — otherwise the refusal above \
+             proves nothing about order"
+        );
+        assert!(post.utxo(&coin_lo.txid, 0).is_none());
+        assert!(post.utxo(&coin_hi.txid, 0).is_none());
+        assert!(post.utxo(&canonical.txid(), 0).is_some());
+
+        // Repairable without the owners: canonicalization alone restores the
+        // exact canonical bytes.
+        if let PosTransaction::TransferV2 { keys, inputs, .. } = &mut permuted {
+            canonicalize_witness_table(keys, inputs);
+        }
+        assert_eq!(permuted.canonical_bytes(), canonical.canonical_bytes());
+    }
+
+    /// **Discrimination between the two table faults.** Adjacent equality is
+    /// the DUPLICATE and must keep its name — `DuplicateWitnessKey` — while
+    /// an inversion is `WitnessTableNotCanonical`; a non-adjacent duplicate
+    /// necessarily contains an inversion and now surfaces as the latter.
+    /// The names matter for the same reason `TransferReject` is not one
+    /// opaque variant (interfaces.rs): the two rejects are different wallet
+    /// bugs read off a log. The control half is the same two spend points
+    /// under the deduplicated, ordered table, applying.
+    #[test]
+    fn duplicate_and_disorder_are_discriminated() {
+        let a = owner_key(0x73);
+        let b = owner_key(0x74);
+        let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+        let to = script_of(&owner_key(0x75));
+        let c1 = opening(0x92, 0, 50_000_000, &lo);
+        let c2 = opening(0x93, 0, 50_000_000, &lo);
+        let c3 = opening(0x94, 0, 50_000_000, &hi);
+        let (_t, g, _c) = setup_funded(4, &[c1.clone(), c2.clone(), c3.clone()]);
+        let price = g.next_base_fee();
+
+        // Adjacent equality: the duplicate, under its own name.
+        let dup = transfer_v2_raw(&[c1.clone(), c2.clone()], &[&lo, &lo], &[0, 1], to, 512, 1, price);
+        assert_eq!(
+            g.clone().apply_transfer_v2(&dup, price, &ToyVerifier),
+            Err(TransferReject::DuplicateWitnessKey),
+            "equality must NOT be misread as an order fault"
+        );
+
+        // Non-adjacent duplicate [lo, hi, lo]: the duplicate is not adjacent,
+        // but hi > lo IS an inversion — refused as the order fault.
+        let split = transfer_v2_raw(
+            &[c1.clone(), c3.clone(), c2.clone()],
+            &[&lo, &hi, &lo],
+            &[0, 1, 2],
+            to,
+            512,
+            1,
+            price,
+        );
+        assert_eq!(
+            g.clone().apply_transfer_v2(&split, price, &ToyVerifier),
+            Err(TransferReject::WitnessTableNotCanonical),
+        );
+
+        // Control: deduplicated AND ordered, same three coins — applies.
+        let clean = transfer_v2_raw(
+            &[c1.clone(), c2.clone(), c3.clone()],
+            &[&lo, &hi],
+            &[0, 0, 1],
+            to,
+            512,
+            1,
+            price,
+        );
+        assert!(g.clone().apply_transfer_v2(&clean, price, &ToyVerifier).is_ok());
+    }
+
+    /// **Uniqueness of the canonical encoding, and charge invariance.** For
+    /// any consensus-valid V2, `canonical_bytes` of a permuted twin fed
+    /// through [`canonicalize_witness_table`] equals the bytes of the
+    /// transfer BUILT in order — bit for bit, txid preserved, and the charge
+    /// is unchanged because the class term is `keys.len()`, invariant under
+    /// permutation. Three keys, rotated (not swapped), so the remap is a
+    /// real permutation and not its own inverse — an index remap bug that a
+    /// symmetric swap would hide (e.g. mapping new→old instead of old→new)
+    /// breaks a rotation.
+    #[test]
+    fn canonicalization_restores_the_unique_encoding() {
+        let mut ks = [owner_key(0x76), owner_key(0x77), owner_key(0x78)];
+        ks.sort();
+        let to = script_of(&owner_key(0x79));
+        let coins: Vec<_> = ks
+            .iter()
+            .enumerate()
+            .map(|(i, k)| opening(0x95 + i as u8, 0, 50_000_000, k))
+            .collect();
+        let (_t, g, _c) = setup_funded(4, &coins);
+        let price = g.next_base_fee();
+
+        let canonical = transfer_v2_raw(
+            &coins,
+            &[&ks[0], &ks[1], &ks[2]],
+            &[0, 1, 2],
+            to,
+            1024,
+            1,
+            price,
+        );
+
+        // Rotate: old table index j lands at (j + 2) % 3, and every input's
+        // key_index moves with it, so ownership is preserved.
+        let mut permuted = canonical.clone();
+        if let PosTransaction::TransferV2 { keys, inputs, .. } = &mut permuted {
+            keys.rotate_left(1);
+            for i in inputs.iter_mut() {
+                i.key_index = (i.key_index + 2) % 3;
+            }
+        }
+        // Premise: a genuinely distinct encoding of the same transfer.
+        assert_ne!(permuted.canonical_bytes(), canonical.canonical_bytes());
+        assert_eq!(permuted.txid(), canonical.txid());
+
+        if let PosTransaction::TransferV2 { keys, inputs, .. } = &mut permuted {
+            canonicalize_witness_table(keys, inputs);
+        }
+        // The whole transaction, equal — bytes, and therefore every field
+        // the charge derives from (keys.len(), tx_bytes, tip).
+        assert_eq!(permuted, canonical);
+
+        // And it is the encoding consensus admits, with the same charge and
+        // the same post-state as the built-ordered original.
+        let mut s1 = g.clone();
+        let charge1 = s1.apply_transfer_v2(&canonical, price, &ToyVerifier).unwrap();
+        let mut s2 = g.clone();
+        let charge2 = s2.apply_transfer_v2(&permuted, price, &ToyVerifier).unwrap();
+        assert_eq!(charge1, charge2);
+        assert_eq!(s1.eutxos, s2.eutxos);
+    }
+
+    /// **Tripwire: the order rule has NO flag day of its own.** There is no
+    /// new activation constant to pin, and that absence is the design: the
+    /// check lives inside `apply_transfer_v2`, reachable only through the
+    /// `TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH` gate in `apply_transaction`
+    /// — so pre-activation, a permuted V2 in a block dies at the GATE
+    /// (`FormatNotActive`), never at the order rule. The control at the
+    /// post-activation seam: the SAME transaction, applied directly, IS
+    /// refused by the order rule — proving the rule exists and sits strictly
+    /// behind the gate, i.e. it activates on the dedup flag day and no
+    /// other. Companion to `transfer_v2_activation_is_paired_with_the_block_cap`.
+    #[test]
+    fn the_order_rule_activates_on_the_dedup_flag_day_not_its_own() {
+        let a = owner_key(0x7A);
+        let b = owner_key(0x7B);
+        let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+        let to = script_of(&owner_key(0x7C));
+        let coin_lo = opening(0x98, 0, 50_000_000, &lo);
+        let coin_hi = opening(0x99, 0, 50_000_000, &hi);
+        let (t, g, mut chains) = setup_funded(4, &[coin_lo.clone(), coin_hi.clone()]);
+        let price = g.next_base_fee();
+
+        let canonical = transfer_v2_raw(
+            &[coin_lo.clone(), coin_hi.clone()],
+            &[&lo, &hi],
+            &[0, 1],
+            to,
+            512,
+            1,
+            price,
+        );
+        let mut permuted = canonical.clone();
+        if let PosTransaction::TransferV2 { keys, inputs, .. } = &mut permuted {
+            keys.swap(0, 1);
+            for i in inputs.iter_mut() {
+                i.key_index ^= 1;
+            }
+        }
+
+        // Block path, pre-flag-day: the gate speaks, not the order rule.
+        let env = probe_env(&g, 1, std::slice::from_ref(&permuted), &mut chains);
+        assert_eq!(
+            t.compute_post_state(&g, &env, &[], std::slice::from_ref(&permuted)).unwrap_err(),
+            TransitionError::Transfer(0, TransferReject::FormatNotActive),
+        );
+
+        // Post-activation seam: the same bytes die on the order rule.
+        assert_eq!(
+            g.clone().apply_transfer_v2(&permuted, price, &ToyVerifier),
+            Err(TransferReject::WitnessTableNotCanonical),
         );
     }
 }
