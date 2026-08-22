@@ -248,6 +248,32 @@ struct Engine {
     ws_conflict_reported: bool,
 }
 
+/// Why a transaction was turned away at the door.
+///
+/// The distinction is load-bearing, not cosmetic: one of these means "ask me
+/// again in a moment" and the other means "these bytes will never be
+/// admitted, stop sending them". Collapsing both into one RPC code is how an
+/// operator ends up growing the mempool to fix a bad signature.
+#[derive(Debug, PartialEq, Eq)]
+enum Refusal {
+    /// The mempool is full. The transaction was NOT judged invalid.
+    AtCapacity,
+    /// `admissible` refused it on its merits. Retrying is pointless.
+    Invalid(&'static str),
+}
+
+impl Refusal {
+    /// The human-readable reason, for tests and logs. Callers that need to
+    /// ACT on the difference must match the variant, not read this string.
+    fn reason(&self) -> &'static str {
+        match self {
+            Refusal::AtCapacity => "mempool is at capacity",
+            Refusal::Invalid(why) => why,
+        }
+    }
+}
+
+
 impl Engine {
     // ── Derivations over the canonical chain ────────────────────────────────
 
@@ -784,6 +810,7 @@ impl Engine {
         }
     }
 
+
     /// Admit a transaction to the mempool and pass it on.
     ///
     /// Admission is deliberately thin here — the bytes already decoded at the
@@ -796,13 +823,13 @@ impl Engine {
     /// answer to — the RPC — can say. The gossip path ignores the result: a
     /// peer is not waiting on a verdict, and a duplicate arriving twice over a
     /// full mesh is the normal case rather than a fault.
-    fn on_transaction(&mut self, tx: PosTransaction) -> Result<Admitted, &'static str> {
+    fn on_transaction(&mut self, tx: PosTransaction) -> Result<Admitted, Refusal> {
         let key = tx.canonical_bytes();
         if self.mempool.contains_key(&key) {
             return Ok(Admitted::Duplicate);
         }
         if self.mempool.len() >= MEMPOOL_MAX {
-            return Err("mempool is at capacity");
+            return Err(Refusal::AtCapacity);
         }
         // Refuse the shapes consensus can never apply.
         //
@@ -833,7 +860,7 @@ impl Engine {
         // the TransferV2 arm of `admissible` itself, next to the gate it
         // feeds. Gossip (`NetEvent::Transaction`) and RPC both land in this
         // one call, so one call site carries the whole decision.
-        admissible(&tx, epoch_of(self.wall_slot()))?;
+        admissible(&tx, epoch_of(self.wall_slot())).map_err(Refusal::Invalid)?;
         let mut frame = vec![net::FRAME_TX];
         frame.extend_from_slice(&key);
         self.mempool.insert(key, tx);
@@ -1403,12 +1430,28 @@ impl Engine {
 
             RpcRequest::SendRawTransaction(tx) => match self.on_transaction(tx.clone()) {
                 Ok(outcome) => Ok(rpc::submitted_json(&tx, outcome)),
-                Err(why) => Err(RpcError::new(
+                // The two refusals are not the same fact and must not carry
+                // the same advice. "Retry later" is correct for a full
+                // mempool and actively harmful for a refused transaction:
+                // the founder's consolidation sweep submits hundreds of
+                // thousands of transfers through this method, and an
+                // operator told to retry bytes that can NEVER be admitted
+                // chases capacity while the real fault — an unverifiable
+                // signature, an empty witness table — goes unread. Before
+                // this, every refusal returned MEMPOOL_FULL with the words
+                // "the transaction was not judged invalid" appended, which
+                // for an invalid transaction was simply false.
+                Err(Refusal::AtCapacity) => Err(RpcError::new(
                     rpc::MEMPOOL_FULL,
                     format!(
-                        "{why} ({MEMPOOL_MAX} entries); retry later — the \
-                             transaction was not judged invalid"
+                        "mempool is at capacity ({MEMPOOL_MAX} entries); retry later — \
+                         the transaction was not judged invalid"
                     ),
+                )),
+                Err(Refusal::Invalid(why)) => Err(RpcError::new(
+                    rpc::TX_REFUSED,
+                    format!("{why} — this transaction cannot be admitted; retrying \
+                             the same bytes will not help"),
                 )),
             },
 
@@ -2083,8 +2126,9 @@ pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'s
             // CONTROL and must not move.
             if wall_epoch < bloch_pos_committee::params::TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH {
                 return Err(
-                    "deduplicated transfers (tag 0x06) are not active: the format ships behind \
-                     a flag day (TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH) that has not been set",
+                    "deduplicated transfers (tag 0x06) are not active: the format ships \
+                     behind a flag day (TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH) that this \
+                     chain has not reached",
                 );
             }
             // Cheap-first from here, mirroring the Transfer arm above and
@@ -3003,8 +3047,9 @@ mod transfer_v2_end_to_end {
             .on_transaction(tx.clone())
             .expect_err("pre-activation, the gossip path must refuse V2");
         assert!(
-            err.contains("deduplicated transfers (tag 0x06) are not active"),
-            "the refusal must be today's, byte for byte its opening clause: {err}"
+            err.reason().contains("deduplicated transfers (tag 0x06) are not active"),
+            "the refusal must be today's, byte for byte its opening clause: {}",
+            err.reason()
         );
 
         // RPC path: refused too, as an error the client sees.
@@ -3020,6 +3065,40 @@ mod transfer_v2_end_to_end {
         assert!(
             node.select_transactions(0).is_empty(),
             "selection must stay empty"
+        );
+
+        // THE POINT OF THE ERROR CODE: a refused transaction must not be
+        // reported as a full mempool. The founder's sweep submits hundreds of
+        // thousands of transfers through this method; "retry later" against
+        // bytes that can never be admitted sends the operator after capacity
+        // while the real fault goes unread.
+        let RpcResult::Err(e) = node.serve_rpc(RpcRequest::SendRawTransaction(tx.clone())) else {
+            panic!("a refused transaction must produce an RPC error");
+        };
+        assert_eq!(e.code, rpc::TX_REFUSED, "refused is not full: {e:?}");
+        assert!(
+            !e.message.contains("retry later"),
+            "a refused transaction must not be told to retry later: {}",
+            e.message
+        );
+
+        // THE CONTROL: a genuinely full mempool still reports MEMPOOL_FULL,
+        // and there "retry later" is the correct advice. Without this half,
+        // the assertion above could be satisfied by never reporting a full
+        // mempool at all.
+        let mut full = node;
+        for i in 0..MEMPOOL_MAX {
+            full.mempool.insert(vec![0xEE, (i >> 8) as u8, i as u8], tx.clone());
+        }
+        let RpcResult::Err(e2) = full.serve_rpc(RpcRequest::SendRawTransaction(tx.clone()))
+        else {
+            panic!("a full mempool must produce an RPC error");
+        };
+        assert_eq!(e2.code, rpc::MEMPOOL_FULL, "full is not refused: {e2:?}");
+        assert!(
+            e2.message.contains("retry later"),
+            "a full mempool SHOULD advise retrying: {}",
+            e2.message
         );
     }
 }

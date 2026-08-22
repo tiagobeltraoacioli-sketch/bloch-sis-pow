@@ -141,6 +141,11 @@ pub const NO_WALLET: i64 = -32006;
 /// The slot carries no canonical block — a missed proposal, not an error state.
 pub const SLOT_EMPTY: i64 = -32007;
 
+/// The node refused a submitted transaction on its merits — it was judged
+/// invalid, not deferred. Distinct from [`MEMPOOL_FULL`] because the client's
+/// correct response is opposite: never resubmit these bytes.
+pub const TX_REFUSED: i64 = -32008;
+
 /// A JSON-RPC error object: a code a client can branch on and a message a human
 /// can act on. Both halves are required — a bare code makes an operator read
 /// this source file, and a bare message makes a client parse English.
