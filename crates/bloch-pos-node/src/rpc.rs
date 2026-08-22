@@ -1406,6 +1406,9 @@ pub fn submitted_json(tx: &PosTransaction, outcome: Admitted) -> Json {
         PosTransaction::Deposit { .. } => "deposit",
         PosTransaction::Exit { .. } => "exit",
         PosTransaction::Delegate { .. } => "delegate",
+        PosTransaction::FundedDeposit { .. } => "funded_deposit",
+        PosTransaction::SignedExit { .. } => "signed_exit",
+        PosTransaction::Withdraw { .. } => "withdraw",
         PosTransaction::SlashingEvidence(_) => "slashing_evidence",
     };
     Json::obj(vec![
@@ -1467,6 +1470,7 @@ pub fn validator_json(
     rec: &ValidatorRecord,
     effective_stake_sat: Option<u64>,
     current_epoch: u64,
+    withdrawable_sat: u128,
 ) -> Json {
     use sha3::{Digest, Sha3_256};
     let pubkey_hash: [u8; 32] = Sha3_256::digest(&rec.pubkey).into();
@@ -1477,6 +1481,14 @@ pub fn validator_json(
         ("pubkey_bytes", Json::u(rec.pubkey.len() as u64)),
         ("state", Json::s(validator_state(rec, current_epoch))),
         ("own_stake_sat", Json::sat(rec.staked_sat)),
+        // The funded portion of the bond — what a Withdraw would pay before
+        // its fee (`CommittedState::withdrawable_sat`; founder decision
+        // 2026-08-21: the unfunded genesis/legacy principal is written off at
+        // withdrawal). Reported beside `own_stake_sat` precisely because the
+        // two differ for every genesis validator: the gap between them IS the
+        // never-spendable residue, and an operator reading this surface must
+        // see it rather than discover it 2,048 epochs after exiting.
+        ("withdrawable_sat", Json::sat(withdrawable_sat)),
         (
             "effective_stake_sat",
             effective_stake_sat.map_or(Json::Null, |v| Json::sat(u128::from(v))),
