@@ -1,0 +1,36 @@
+[package]
+name = "bloch-evm-pq-precompile"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "AGPL-3.0-or-later"
+description = "BLOCH-L1-EVM-AUTHORIZATION §6.2 — the hybrid-verify precompile, INERT: nothing in the node depends on this crate"
+
+[lib]
+name = "bloch_evm_pq_precompile"
+path = "src/lib.rs"
+
+# A WORKSPACE MEMBER ON PURPOSE. The root Cargo.toml says it in as many words:
+# a crate carrying its own `[workspace]` table is invisible to
+# `cargo test --workspace`, and that is how the PoS consensus once went
+# untested. Membership is not wiring: no crate in the tree depends on this
+# one, `bloch-pos-node`'s dependency list is unchanged, and nothing here is
+# reachable from the state-transition path. Inertness is a dependency-graph
+# property, not a build-visibility one — hiding the crate would have bought
+# no extra safety and cost the review its tests.
+[dependencies]
+bloch-crypto        = { path = "../bloch-crypto" }
+bloch-pos-committee = { path = "../bloch-pos-committee" }
+sha3 = "0.10"
+
+[dev-dependencies]
+# Pins MAX_FALCON_SIG_BYTES against the library the fleet actually links.
+#
+# `default-features = false, features = ["std"]` is COPIED VERBATIM from
+# bloch-crypto/Cargo.toml and must stay that way: with resolver = "2", a
+# dev-dependency's features unify with the normal dependency graph, so writing
+# a bare `pqcrypto-falcon = "0.4"` here would switch the native
+# floating-point Falcon variants on for bloch-crypto too — breaking settled
+# decision 2 (BLOCH-FALCON-ONLINE-SIGNING.md §3.2) from a test manifest.
+pqcrypto-falcon = { version = "0.4", default-features = false, features = ["std"] }
+hex = "0.4"

@@ -25,6 +25,15 @@ members = [
     "crates/bloch-btc-wallet",
     "crates/bloch-pq-vault",   # non-custodial PQ-shield vault (P2WSH commit-delay-reveal + PQ clawback anchor)
 
+    # BLOCH-L1-EVM-AUTHORIZATION §6.2, INERT. A vehicle, not a wiring: no
+    # crate depends on it, it is unreachable from the state-transition path,
+    # and it adds nothing to params.rs or the closed component list. It is a
+    # MEMBER rather than a private workspace precisely because of the warning
+    # below — inertness is a dependency-graph property, and hiding the crate
+    # from `cargo test --workspace` would buy no safety and cost the review
+    # its tests.
+    "crates/bloch-evm-pq-precompile",
+
     # ── Genesis-3, proof of work. CLOSED — kept buildable for audit. ──
     "legacy/genesis3-node",    # the `bloch` binary; ran mainnet to h39,918
     "crates/bloch-euvm", "crates/bloch-ffg",  # eUTXO VM + FFG committee (Genesis-3, behind its `euvm` feature)
