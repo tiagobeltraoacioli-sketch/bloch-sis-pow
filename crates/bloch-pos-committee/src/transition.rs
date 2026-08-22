@@ -7841,10 +7841,29 @@ mod tests {
         }
         assert_eq!(s1.issued_sat, issued_before, "materialization is not emission");
 
-        // Idempotence by construction: the next boundary starts at the gate,
-        // does not cross it, and leaves the map exactly as it stands.
-        let s2 = s1.close_epoch_gated(1);
-        assert_eq!(s2.unbacked_sat, s1.unbacked_sat, "materialized twice");
+        // Exactly once, proven where it can actually go wrong. The shape a
+        // slash-then-re-earn leaves behind: the entry sits BELOW the bond,
+        // because the penalty burned phantom principal and later rewards
+        // rebuilt real, payable value on top. A materialization that fired on
+        // every post-gate boundary instead of only on the crossing would
+        // compute min(200,000, bond) and push the entry back UP to the whole
+        // bond — converting genuinely-earned rewards into phantom and
+        // confiscating them at withdrawal. (Perturbing with entry == bond
+        // instead passes vacuously: min() returns the same number either way,
+        // which is exactly how an earlier draft of this test lied, and what
+        // the mutation run caught.)
+        let mut perturbed = s1.clone();
+        perturbed.unbacked_sat.insert(0, sat(1_000));
+        perturbed.validators.get_mut(&0).unwrap().staked_sat = sat(5_000);
+        let s2 = perturbed.close_epoch_gated(1);
+        assert_eq!(
+            s2.unbacked_principal_sat(0),
+            sat(1_000),
+            "a post-crossing boundary must not re-materialize: the reduced entry stands"
+        );
+        for i in 1..4u32 {
+            assert_eq!(s2.unbacked_principal_sat(i), sat(200_000), "untouched entries stand");
+        }
     }
 
     /// A validator registered by a LEGACY deposit — the modified-proposer
