@@ -1580,6 +1580,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloch-sbpf"
+version = "0.0.1"
+dependencies = [
+ "sha3 0.10.9",
+]
+
+[[package]]
 name = "bloch-sis-pow"
 version = "0.1.0"
 dependencies = [

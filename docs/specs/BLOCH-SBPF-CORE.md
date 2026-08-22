@@ -415,3 +415,98 @@ never panic, never allocate unboundedly"; and differential-fuzz
 - **NOT scheduled here**: consensus wiring, state/account model, CPI,
   JIT, parallel execution. Each needs the founder to first reconcile
   this front with ADR-040/SR-2 (§0).
+
+---
+
+## 12. M0 amendments (Front 1 implementation review, 2026-08-22)
+
+The implementation review found the following under-specified points. Per
+M0 ("disagreements amend the spec, not the code"), they are pinned HERE so
+two independent implementations stay compatible. None widens scope.
+
+**A. Opcode byte encoding.** §2 lists mnemonics but no byte values. Pinned:
+the classic eBPF encoding as standardized in RFC 9669 — 8-byte LE slots
+`{op:u8, dst:4|src:4, off:i16 LE, imm:i32 LE}` (dst = low nibble); classes
+LD=0x00/LDX/ST/STX/ALU32=0x04/JMP=0x05/JMP32=0x06/ALU64=0x07; `lddw` =
+0x18 with a second slot whose op/dst/src/off MUST all be zero (imm carries
+the high 32 bits). `sdiv`/`smod` are the DIV/MOD opcodes with `off == 1`
+(RFC 9669 encoding); every other ALU opcode requires `off == 0`. Byte
+swap: ALU32-class END (`0xd4` = le, `0xdc` = be) with `imm ∈ {16,32,64}`.
+JMP32 is the conditional set only — a JMP32-class `ja` (0x06) is NOT
+whitelisted (recent RFC addition, absent from SBF). Jump target =
+`pc + 1 + off`, in slots.
+
+**B. Internal call convention.** §3 did not pin caller-saved state. Pinned
+to the rbpf/SBFv1 semantics: `call` to an internal function pushes a frame
+saving **r6–r9, the caller's r10, and the return pc**; the callee inherits
+all current register values; `exit` with a non-empty frame stack restores
+r6–r9 and r10 and resumes at the saved pc; `exit` at depth 1 terminates
+with `r0`. r10 for depth `d` (entry = depth 1) is
+`STACK_BASE + d * 4096`. `call` with `src == 1` is an internal call
+(imm = function-table id); `src == 0` is a syscall (imm = syscall id);
+any other src value fails verification.
+
+**C. Syscall ids are consensus constants.** §1's `load(container)` takes
+no registry, so the verifier resolves `call src=0` against the pinned v0
+id set, not against a runtime registry: `SYSCALL_ABORT = 1`,
+`SYSCALL_LOG = 2`, `SYSCALL_SHA3_256 = 3`. A registry missing a verified
+id at execute() time is the deterministic runtime fault
+`Fault::UnknownSyscall{id}`. `abort` costs a flat 100 CU (same base as
+`log`).
+
+**D. Canonical `Outcome` byte layout** (the D2 golden vectors hash exactly
+these bytes; all integers LE):
+
+```
+COST_TABLE_VERSION u32
+| tag u8                  # 0 = Ok, 1 = Fault
+| Ok:    r0 u64
+| Fault: kind u32 | pc u64 | extra
+|        kinds: 1 DivByZero | 2 SdivOverflow
+|               3 AccessViolation (extra: va u64, len u64, write u8)
+|               4 TextOverrun    | 5 CallDepthExceeded
+|               6 ComputeBudgetExceeded | 7 Aborted
+|               8 UnknownSyscall (extra: id u32)
+|               9 LogLimitExceeded
+| cu_used u64
+| log:  n u32, then per entry len u32 | bytes
+| heap: len u32 | bytes
+| stack: len u32 | bytes
+```
+
+On a fault, `heap` and `stack` are serialized EMPTY (total-fault
+semantics, §3 — memory effects are discarded); the log survives (it is
+observability, not a memory effect, and it is already CU-paid).
+
+**E. Byte-swap semantics.** `leN` = keep the low N bits, zero-extend
+(the VM is little-endian, so "to LE" is truncation); `beN` = byteswap the
+low N bits, zero-extend. `le64`/`be64` operate on the full register.
+KATs in the A1 series.
+
+**F. Loader bounds not in §4.** `rodata_len ≤ 524 288` (512 KiB, same
+ceiling as text) so `load()` allocation is bounded; `n_funcs ≤ 65 536`;
+duplicate function-table ids are `VerifyError::DuplicateFunction`;
+`entry_fn` must resolve in the table and may not point at an `lddw`
+second slot; container `version` field must be 0 for BSC-0; trailing
+bytes after `rodata` are rejected.
+
+**G. Register init.** Exactly §3: all zero except `r1 = 0x4_0000_0000`
+(INPUT base) and `r10 = STACK_BASE + 4096` (top of frame 1). The input
+length is NOT passed in a register in v0; programs learn it out of band
+(fixture contract) — revisit with the account model.
+
+**H. lddw cost.** `lddw` is one instruction in two slots: 1 CU total,
+charged at its first slot.
+
+**I. Log caps fault, not truncate.** `log` with `len > 1024` or a call
+that would push the per-execution total over 32 768 bytes is
+`Fault::LogLimitExceeded` (total-fault semantics; silent truncation would
+make `Outcome` depend on cap history). Charge-then-check order: the CU
+charge (`100 + len`, saturating) lands first, so `cu_used` includes the
+faulting call's charge, consistent with §6.
+
+**J. `smod` overflow row.** `smod`/`smod32` of `iN::MIN % -1` is **0** (the
+RFC 9669 answer), NOT a fault — only `sdiv` overflow faults (§3). Pinned
+because a naive Rust `%` would panic under the workspace's overflow-checks
+profile while C implementations return 0: exactly the cross-implementation
+divergence this spec exists to forbid. KAT in the A1 series.

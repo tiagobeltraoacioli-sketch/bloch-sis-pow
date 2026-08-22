@@ -649,9 +649,17 @@ version = "0.0.0"
 dependencies = [
  "bincode",
  "bloch",
+ "bloch-sbpf",
  "bloch-sis-pow",
  "coherence-core",
  "libfuzzer-sys",
+]
+
+[[package]]
+name = "bloch-sbpf"
+version = "0.0.1"
+dependencies = [
+ "sha3",
 ]
 
 [[package]]

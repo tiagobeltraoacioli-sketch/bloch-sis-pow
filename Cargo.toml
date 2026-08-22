@@ -23,6 +23,7 @@ members = [
     "crates/bloch-crypto",
     "crates/bloch-sis-pow", "crates/coherence-core", "crates/pqcrypto-internals",
     "crates/bloch-btc-wallet",
+    "crates/bloch-sbpf",   # sBPF-style execution core (foundation; standalone like bloch-euvm, NOT consensus-wired)
     "crates/bloch-pq-vault",   # non-custodial PQ-shield vault (P2WSH commit-delay-reveal + PQ clawback anchor)
 
     # ── Genesis-3, proof of work. CLOSED — kept buildable for audit. ──

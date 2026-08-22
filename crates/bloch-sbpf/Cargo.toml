@@ -1,0 +1,19 @@
+# bloch-sbpf — Front 1 of BLOCH-SBPF-CORE.md: deterministic sBPF-style
+# execution core (foundation). STANDALONE and NOT wired into node consensus —
+# the same posture bloch-euvm holds (see that crate's manifest). Wiring any VM
+# into L1 collides with ADR-040 and the SR-2 single-re-freeze rule and is a
+# founder decision, not a dependency edge someone adds in passing. This crate
+# must never appear in `cargo tree -i` output for bloch-pos-node or
+# bloch-pos-committee.
+[package]
+name = "bloch-sbpf"
+version = "0.0.1"
+edition = "2021"
+description = "Deterministic sBPF-style interpreter + load-time verifier for Bloch (foundation, not consensus-wired)"
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+# The ONLY runtime dependency, for the one v0 hash syscall (sha3_256, §7) and
+# the canonical-Outcome golden vectors (§10 D2). Spec §1 pins this: nothing
+# beyond sha3 + dev-deps may ever be added without amending BLOCH-SBPF-CORE.md.
+sha3 = "0.10"

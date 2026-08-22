@@ -18,7 +18,9 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-bloch = { path = ".." }
+# Root manifest became virtual (Genesis-4 layout); the `bloch` package moved.
+bloch = { path = "../legacy/genesis3-node" }
+bloch-sbpf = { path = "../crates/bloch-sbpf" }
 bloch-sis-pow = { path = "../crates/bloch-sis-pow" }
 coherence-core = { path = "../crates/coherence-core" }
 # P1 (roadmap §1b): the netmsg / handshake decode targets mirror the node's
@@ -29,6 +31,22 @@ bincode = { version = "2", features = ["serde"] }
 # Vendored PQ fork (same as the node) — [patch] applies from the build root.
 [patch.crates-io]
 pqcrypto-internals = { path = "../crates/pqcrypto-internals" }
+
+[[bin]]
+# BLOCH-SBPF-CORE.md §10: hostile containers into load() — reject or verify,
+# never panic, never allocate unboundedly.
+name = "sbpf_load"
+path = "fuzz_targets/sbpf_load.rs"
+test = false
+doc = false
+
+[[bin]]
+# BLOCH-SBPF-CORE.md §10: panic-freedom + double-run determinism of execute()
+# under verified-but-adversarial programs.
+name = "sbpf_exec"
+path = "fuzz_targets/sbpf_exec.rs"
+test = false
+doc = false
 
 [[bin]]
 name = "block_parse"
