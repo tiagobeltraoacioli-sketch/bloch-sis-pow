@@ -1595,6 +1595,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloch-svm"
+version = "0.0.1"
+dependencies = [
+ "bloch-pos-committee",
+ "hex",
+ "proptest",
+ "sha3 0.10.9",
+]
+
+[[package]]
 name = "block-buffer"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,0 +1,46 @@
+# bloch-svm — Front 2 of the SVM-shaped execution effort
+# (docs/specs/BLOCH-SVM-ACCOUNTS-SCHEDULER.md): the account model and the
+# deterministic parallel scheduler. STANDALONE SOFTWARE, NOT CONSENSUS-WIRED —
+# the same posture as bloch-euvm: a normal member of the root workspace (never
+# a private [workspace] table — see the root manifest's warning about crates
+# that silently drop out of `cargo test --workspace`) that neither
+# bloch-pos-node nor bloch-pos-committee depends on. A guard test in
+# src/lib.rs asserts that direction of dependency stays absent.
+#
+# Everything consensus-shaped here (TAG_SVM_ROOT in state_root.rs,
+# TxClass::Svm in fee_market.rs, SVM_ACTIVATION_EPOCH in params.rs, a new
+# PosTransaction variant) is spec §9 work for the single X1 re-freeze round
+# and is deliberately NOT in this crate.
+[package]
+name = "bloch-svm"
+version = "0.0.1"
+edition = "2021"
+description = "Bloch SVM-shaped execution plane, Front 2: declared-access account model + deterministic parallel (wave) scheduler. Standalone, pure, not consensus-wired. No SBF bytecode runs; native programs only (spec §0/§11)."
+license = "AGPL-3.0-or-later"
+publish = false
+
+[dependencies]
+# The ONLY production dependency, matching the bloch-pos-committee posture:
+# every hash in the crate is SHA3-256 under a 16-byte domain separator
+# (spec §3.1/§4.1/§5.1). No serde, no rand, no float-bearing maths crates —
+# a dependency's float is still a float (spec §2).
+sha3 = { version = "0.10", default-features = false }
+
+[dev-dependencies]
+# Cross-KAT ONLY (tree.rs): the SVM tree is a copy of the state_root.rs SMT
+# construction parameterised by domain separator, because DS_STATE is
+# hard-coded into every SHA3 call of the frozen consensus Smt
+# (state_root.rs:212, `h.update(DS_STATE)`) and parameterising it THERE would
+# touch a frozen consensus surface. The copy is tied to the original forever
+# by instantiating it with DS_STATE under dev and comparing roots on
+# randomized vectors. This is a DEV dependency on purpose: production
+# bloch-svm must never pull the consensus crate (and the reverse direction is
+# pinned absent by the lib.rs guard test).
+bloch-pos-committee = { path = "../bloch-pos-committee" }
+# Property-testing precedent: bloch-sis-pow and bloch-crypto already carry
+# proptest as a dev-dep. Used for the serial/parallel equivalence property
+# test (spec §8-1); the *pinned* determinism artifacts are separate static
+# KATs plus a seeded in-crate generator sweep, because proptest's default
+# entropy is good at finding bugs but is not a pin.
+proptest = "1"
+hex = "0.4"

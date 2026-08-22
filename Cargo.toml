@@ -28,6 +28,15 @@ members = [
     # ── Genesis-3, proof of work. CLOSED — kept buildable for audit. ──
     "legacy/genesis3-node",    # the `bloch` binary; ran mainnet to h39,918
     "crates/bloch-euvm", "crates/bloch-ffg",  # eUTXO VM + FFG committee (Genesis-3, behind its `euvm` feature)
+
+    # ── Standalone execution-plane software. NOT consensus-wired. ──
+    # bloch-svm is Front 2 of docs/specs/BLOCH-SVM-ACCOUNTS-SCHEDULER.md:
+    # account model + deterministic parallel scheduler. Same posture as
+    # bloch-euvm: a normal workspace member (see the warning below about
+    # private workspaces) that NO consensus crate depends on; the crate's own
+    # guard test pins that bloch-pos-node and bloch-pos-committee never grow
+    # a dependency on it.
+    "crates/bloch-svm",
 ]
 # coherence-prover (SP1 guest/script/service) + fuzz use heavy/nightly-only
 # toolchains; keep them out of the everyday workspace build.
