@@ -1595,6 +1595,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloch-vm-host"
+version = "0.0.1"
+dependencies = [
+ "bloch-euvm",
+ "serde_json",
+ "sha2 0.10.9",
+ "sha3 0.10.9",
+]
+
+[[package]]
 name = "block-buffer"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,0 +1,35 @@
+# bloch-vm-host — the execution-host services the eUTXO VM and the (spec-only)
+# SVM plane genuinely share: metering, crypto services, fault taxonomy, and the
+# stage/execute/commit lifecycle envelope. Spec: docs/specs/BLOCH-VM-HOST.md.
+#
+# STANDALONE and NOT consensus-wired, same posture as bloch-euvm. This crate
+# must NEVER become a dependency (direct or transitive) of bloch-pos-node or
+# bloch-pos-committee — a live 64-validator PoS chain runs from this repo, and
+# wiring any VM into L1 stays gated on ADR-040 + the SR-2 single-re-freeze rule
+# (BLOCH-L1-EXECUTION-PLAN.md). tests/dependency_firewall.rs enforces that
+# mechanically: the build goes red if the consensus crates ever reach this one.
+#
+# Dependency policy (BLOCH-VM-HOST §8): sha3 + sha2 only, pinned to the same
+# versions bloch-euvm uses so the two hashing sites cannot diverge by version
+# skew. Everything else is dev-dependencies. Deliberately NO pqcrypto: PQ
+# signature verification stays host-provided (euvm SigVerifier, lib.rs:98)
+# for the same purity/testability reason euvm chose.
+[package]
+name = "bloch-vm-host"
+version = "0.0.1"
+edition = "2021"
+description = "Shared deterministic execution-host services for Bloch VMs (Meter, HostCrypto, Fault, Engine envelope) — not consensus-wired"
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+sha2 = "0.10"
+sha3 = "0.10"
+
+[dev-dependencies]
+# Cross-VM KATs (BLOCH-VM-HOST §9.1): tests run real bloch-euvm programs
+# (Op::Shake256 / Op::Sha256d) and assert they agree byte-for-byte with
+# RustCryptoHost, so the in-VM and host hashing sites can never drift apart
+# silently. A dev-dependency creates no runtime edge in either direction.
+bloch-euvm = { path = "../bloch-euvm" }
+# tests/dependency_firewall.rs parses `cargo metadata` output.
+serde_json = "1"

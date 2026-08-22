@@ -25,6 +25,13 @@ members = [
     "crates/bloch-btc-wallet",
     "crates/bloch-pq-vault",   # non-custodial PQ-shield vault (P2WSH commit-delay-reveal + PQ clawback anchor)
 
+    # ── VM plane: software, NOT consensus (BLOCH-VM-HOST.md §8). ──
+    # Shared execution-host services (Meter, HostCrypto, Fault, Engine) for
+    # bloch-euvm and the future SVM crates. Must never be reachable from
+    # bloch-pos-node/bloch-pos-committee — bloch-vm-host's
+    # tests/dependency_firewall.rs makes that a red build, per ADR-040 + SR-2.
+    "crates/bloch-vm-host",
+
     # ── Genesis-3, proof of work. CLOSED — kept buildable for audit. ──
     "legacy/genesis3-node",    # the `bloch` binary; ran mainnet to h39,918
     "crates/bloch-euvm", "crates/bloch-ffg",  # eUTXO VM + FFG committee (Genesis-3, behind its `euvm` feature)
