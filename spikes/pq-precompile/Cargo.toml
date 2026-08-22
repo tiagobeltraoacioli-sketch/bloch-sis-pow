@@ -1,0 +1,27 @@
+[package]
+name = "pq-precompile-spike"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone spike — deliberately NOT a member of the node workspace, so it
+# cannot affect the node build and cannot be reached from the state-transition
+# path. See README.md and docs/specs/BLOCH-L1-EVM-PQ-PRECOMPILE.md.
+
+[workspace]
+
+[dependencies]
+# The chain's signature stack, unmodified. The precompile is thin over this.
+bloch-crypto = { path = "../../crates/bloch-crypto" }
+sha3 = "0.10"
+hex = "0.4"
+
+[[bin]]
+name = "pq-precompile-cost"
+path = "src/main.rs"
+
+# The node workspace patches `pqcrypto-internals` to its local fork (seeded
+# `randombytes` for deterministic keygen). A standalone spike must repeat the
+# patch or `bloch-crypto` does not compile.
+[patch.crates-io]
+pqcrypto-internals = { path = "../../crates/pqcrypto-internals" }
