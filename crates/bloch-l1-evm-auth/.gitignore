@@ -1,0 +1,4 @@
+# Nothing here is generated into the source tree. This file exists so a
+# stray build directory can never be staged with the crate.
+target/
+.target-auth/

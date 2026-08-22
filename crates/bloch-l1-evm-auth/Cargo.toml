@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+[package]
+name = "bloch-l1-evm-auth"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "PQ-typed EVM transaction envelope and hybrid-verify precompile logic (BLOCH-L1-EVM-PQ-TX §6.1/§6.2). INERT: not wired to consensus."
+
+# Dependencies: sha3 ONLY.
+#
+# No revm, no alloy, no k256/secp256k1, no bloch-crypto, no node crates, no
+# serde, no I/O, no clock. The verifier and the account->pubkey directory both
+# arrive through traits (see lib.rs), exactly as `staking.rs` takes its
+# verifier, and for the same two reasons: the crate stays testable without the
+# PQClean C stack, and the AND-composition lives HERE rather than in whatever
+# the caller injects.
+[dependencies]
+sha3 = { version = "0.10", default-features = false }
+
+# DEV-only. The gas calibration lives in `bloch-pos-committee::fee_market` and
+# this crate restates two of its constants (BLOCH-L1-EVM-PQ-TX §8.3 wants "one
+# calibration and one place to edit"). A dev-dependency lets a test ASSERT the
+# restated values still equal the originals without putting a consensus crate
+# into this crate's runtime dependency tree. Dev-dependencies do not propagate
+# to dependents and do not appear in any binary.
+[dev-dependencies]
+bloch-pos-committee = { path = "../bloch-pos-committee" }
