@@ -1,11 +1,26 @@
 # `state.rs` — committed non-per-UTXO state (sparse Merkle root) for Ustav
 
-Status: **reference / unaudited, not consensus-wired.** This note describes
-`crates/bloch-euvm/src/state.rs` as currently written. `lib.rs` does not declare `mod
-state;` — confirmed by `grep -n "^mod \|^pub mod " src/lib.rs`, which lists only
-`batcher` and `minting` — so the module sits unwired, exactly as `docs/euvm-batcher.md`
-and `docs/euvm-harness.md` describe for their own modules. Nothing in this note or the
+Status: **reference / unaudited, not consensus-wired.** Nothing in this note or the
 module changes live consensus.
+
+> **CORRECTION (this note was stale on two counts).**
+>
+> 1. It claimed `lib.rs` "does not declare `mod state;`" and lists only `batcher` and
+>    `minting`. That is **false today**: `src/lib.rs:779` declares `pub mod state;`
+>    (alongside `batcher`, `harness`, `kirpich`, `minting`, `modules`). The module is
+>    crate-wired and its tests run in the normal suite. It is still not *consensus*-
+>    wired — `bloch-euvm` is referenced zero times by `bloch-pos-node` and
+>    `bloch-pos-committee` — which is the claim that actually matters and remains true.
+> 2. The implementation it describes has since been **rewritten as an incremental
+>    SMT** (memoized node hashes, eager root), the allow/deny gates gained an
+>    identity-bound variant, and a compressed proof format was added. Roots and the
+>    existing `Proof` format are byte-identical and pinned
+>    (`tests/euvm_pinned_roots.rs`, `tests/smt_differential_oracle.rs`).
+>
+> The design description below is still accurate. For current status, the measured
+> instruction set, and what remains open, read
+> **`docs/specs/BLOCH-EUVM-GAP-MAP.md`**, which supersedes this note's "Honest
+> status" section.
 
 I independently re-verified the module against the *real* `lib.rs`, not just the
 dev's shim: in a scratch copy of the crate I added `mod state;` to `lib.rs` and ran
@@ -137,14 +152,20 @@ VM, nothing more.
 
 ## Honest status
 
-- **Reference only, not consensus-wired**, and today not even crate-wired:
-  `lib.rs` has no `mod state;`. Adding it is a one-line, separately reviewable edit —
-  the same posture `docs/euvm-batcher.md` and `docs/euvm-harness.md` describe for
-  their own modules, and consistent with `INTEGRATION.md`'s "plan → feature-gated
-  wiring → consensus tests → audit → hard fork" order. This review adds nothing to
-  that plan; it independently confirms the module compiles clean and all 17 tests
-  pass once wired against the real `lib.rs`, which the dev's own report only claimed
-  against a shim.
+- **Reference only, not consensus-wired.** (The earlier text here said the module was
+  "not even crate-wired" because `lib.rs` had no `mod state;`. That is out of date:
+  `src/lib.rs:779` declares `pub mod state;`. See the correction at the top.) What
+  remains true, and is the load-bearing claim: `bloch-euvm` is an optional dependency
+  behind an off-by-default `euvm` feature and is referenced **zero times** by
+  `bloch-pos-node` and `bloch-pos-committee`, so no line of it is reachable from the
+  node's state-transition path. `INTEGRATION.md`'s "plan → feature-gated wiring →
+  consensus tests → audit → hard fork" order is untouched by this module.
+- **The gates now have an identity-bound variant.** `gate_allows` alone does not bind
+  `proof.key` to the caller, and the two bypasses that follow from that are pinned as
+  working attacks in `tests/audit_stateproof.rs`. `gate_allows_bound` closes them for
+  callers that can supply an already-authenticated identity; see
+  `docs/specs/BLOCH-EUVM-GAP-MAP.md` §2.2 for the caller obligation that does *not*
+  go away.
 - **No lib.rs changes required or made.** `Val`, `Op`, `Ctx`, `run`, `SigVerifier` were
   already `pub`; this review re-confirms that (grep of `lib.rs`'s `pub` items) and
   confirms none of them needed to change.

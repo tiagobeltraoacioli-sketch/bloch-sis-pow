@@ -441,6 +441,26 @@ impl CompiledToken {
 
 /// Deterministically compile a [`TokenCharter`] into its [`CompiledToken`] validator
 /// set. Pure function of the charter: no clock, no float, no map iteration order.
+///
+/// # ⚠ Un-audited path — prefer [`compile_charter_audited`]
+///
+/// This function compiles **whatever it is handed**. It performs no charter-level
+/// sanity checking at all: an ambiguous minting policy, an unsatisfiable governance
+/// quorum (`threshold > signers.len()`), a permanently-locked custody leg, or a
+/// module whose emitted program is structurally corrupt all compile happily into
+/// validator hashes that then become an asset id ([`CompiledToken::policy_id`]) and
+/// the addresses of real outputs. Those are exactly the defect classes the
+/// [`crate::kirpich`] internal audit detects (see `src/kirpich.rs` and its four
+/// analyses: `completeness`, `conflicts`, `emitted`, `params`), and a charter that
+/// reaches production through this door has never been shown them.
+///
+/// The gate is deliberately **fail-closed but opt-in**: `kirpich.rs:16` records that
+/// it never blocks this function, so existing downstream consumers keep compiling.
+/// It is not `#[deprecated]` for that reason — the attribute would break their builds
+/// over a policy choice, and it remains the right primitive for a caller that runs
+/// [`crate::kirpich::kirpich_audit`] itself and wants the advisories rather than a
+/// yes/no. **New code should call [`compile_charter_audited`]**, which runs the audit
+/// first and refuses on any `Deny` finding, and only reach for this one deliberately.
 pub fn compile_charter(charter: &TokenCharter) -> CompiledToken {
     let mut validators = Vec::with_capacity(charter.modules.len());
 

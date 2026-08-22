@@ -105,3 +105,164 @@ fn attacker_constructed_membership_against_empty_root_fails() {
         "cannot mint membership against an empty committed root"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// THE FIX — `gate_allows_bound`. The four tests above are LEFT EXACTLY AS THEY WERE:
+// they pin what the unbound `gate_allows` does and does not promise, and they are
+// the CONTROL half for everything below. Each test here re-runs the *same attack*
+// against the bound API and shows it now fails, paired with a control showing the
+// legitimate caller still passes (so "it rejects everything" cannot masquerade as
+// a fix — the failure mode that makes a security test decorative).
+// ═══════════════════════════════════════════════════════════════════════════════
+
+use bloch_euvm::state::{gate_allows_bound, GateError};
+
+/// FIX for FINDING 1a — the made-up-identity deny-gate evasion now fails.
+#[test]
+fn bound_deny_gate_rejects_a_made_up_identity_but_admits_a_genuinely_clean_one() {
+    let mut deny = MembershipList::new();
+    deny.add(b"sanctioned:mallory");
+    let root = deny.root();
+
+    // ATTACK (the exact one `deny_gate_is_bypassable_with_a_made_up_identity` pins):
+    // mallory authenticates as herself but presents a non-membership proof about a
+    // key she invented. The unbound gate lets this through; the bound gate does not.
+    let evasion = deny.prove(b"whatever-i-invent-42");
+    assert!(
+        gate_allows(Gate::Deny, &root, &evasion),
+        "precondition: the unbound gate is still bypassable (control unchanged)"
+    );
+    assert_eq!(
+        gate_allows_bound(Gate::Deny, &root, &evasion, b"sanctioned:mallory"),
+        Err(GateError::KeyMismatch),
+        "bound deny-gate must refuse a proof that is not about the caller"
+    );
+
+    // CONTROL A — mallory proving about HERSELF is refused for the right reason:
+    // wrong polarity (she IS on the list), not a key mismatch.
+    let honest = deny.prove(b"sanctioned:mallory");
+    assert_eq!(
+        gate_allows_bound(Gate::Deny, &root, &honest, b"sanctioned:mallory"),
+        Err(GateError::WrongPolarity)
+    );
+
+    // CONTROL B — a genuinely clean party still passes. Without this half, a gate
+    // that simply returned Err always would look like a fix.
+    let clean = deny.prove(b"clean:yolanda");
+    assert_eq!(
+        gate_allows_bound(Gate::Deny, &root, &clean, b"clean:yolanda"),
+        Ok(())
+    );
+}
+
+/// FIX for FINDING 1b — relaying a member's KYC proof now fails.
+#[test]
+fn bound_allow_gate_rejects_a_relayed_member_proof_but_admits_the_member() {
+    let mut allow = MembershipList::new();
+    allow.add(b"kyc:alice");
+    let root = allow.root();
+    let alices_proof = allow.prove(b"kyc:alice");
+
+    // ATTACK: mallory relays alice's public proof. Unbound gate: passes (pinned by
+    // `allow_gate_kyc_bypass_by_relaying_a_members_proof`). Bound gate: KeyMismatch.
+    assert!(
+        gate_allows(Gate::Allow, &root, &alices_proof),
+        "precondition: the unbound gate is still relay-able (control unchanged)"
+    );
+    assert_eq!(
+        gate_allows_bound(Gate::Allow, &root, &alices_proof, b"kyc:mallory"),
+        Err(GateError::KeyMismatch),
+        "bound allow-gate must refuse a proof issued to a different identity"
+    );
+
+    // CONTROL A — alice, presenting her own proof under her own authenticated id,
+    // still passes. The binding must not break the legitimate path.
+    assert_eq!(
+        gate_allows_bound(Gate::Allow, &root, &alices_proof, b"kyc:alice"),
+        Ok(())
+    );
+
+    // CONTROL B — mallory presenting her OWN (valid non-membership) proof is
+    // refused as WrongPolarity: she is honestly not on the allow-list.
+    let mallorys_own = allow.prove(b"kyc:mallory");
+    assert_eq!(
+        gate_allows_bound(Gate::Allow, &root, &mallorys_own, b"kyc:mallory"),
+        Err(GateError::WrongPolarity)
+    );
+}
+
+/// The binding must be EXACT — no prefix, suffix, or truncation slack. A key check
+/// written as `starts_with` / `contains` (an easy mistake) would pass these ids.
+#[test]
+fn bound_gate_identity_match_is_exact_not_prefix_or_suffix() {
+    let mut allow = MembershipList::new();
+    allow.add(b"kyc:alice");
+    let root = allow.root();
+    let p = allow.prove(b"kyc:alice");
+
+    for impostor in [
+        &b"kyc:alic"[..],       // truncation
+        b"kyc:alice2",          // suffix extension
+        b"kyc:alicE",           // one-bit case flip
+        b"xkyc:alice",          // prefix extension
+        b"",                    // empty
+    ] {
+        assert_eq!(
+            gate_allows_bound(Gate::Allow, &root, &p, impostor),
+            Err(GateError::KeyMismatch),
+            "near-miss identity {impostor:?} must not satisfy the binding"
+        );
+    }
+    // control: the exact id passes
+    assert_eq!(gate_allows_bound(Gate::Allow, &root, &p, b"kyc:alice"), Ok(()));
+}
+
+/// Identity binding must not be able to RESCUE a cryptographically invalid proof:
+/// the two checks are independent, and a forged proof about your own real id still
+/// fails on the crypto.
+#[test]
+fn bound_gate_still_rejects_a_forged_proof_about_the_callers_own_identity() {
+    let mut allow = MembershipList::new();
+    allow.add(b"kyc:alice");
+    let root = allow.root();
+
+    // mallory is genuinely absent; she forges MEMBERSHIP for her own real id.
+    let mut forged = allow.prove(b"kyc:mallory");
+    assert_eq!(
+        gate_allows_bound(Gate::Allow, &root, &forged, b"kyc:mallory"),
+        Err(GateError::WrongPolarity),
+        "control: before forging, she fails on polarity"
+    );
+    forged.value = Some(vec![]); // claim the slot is occupied by her
+    assert_eq!(
+        gate_allows_bound(Gate::Allow, &root, &forged, b"kyc:mallory"),
+        Err(GateError::ProofInvalid),
+        "the identity binding must not paper over a broken proof"
+    );
+
+    // control: a genuine member's genuine proof under her own id still passes
+    assert_eq!(
+        gate_allows_bound(Gate::Allow, &root, &allow.prove(b"kyc:alice"), b"kyc:alice"),
+        Ok(())
+    );
+}
+
+/// A proof valid against a DIFFERENT root is refused even with a perfect identity
+/// match — root binding and identity binding are both required, neither substitutes.
+#[test]
+fn bound_gate_rejects_a_proof_from_another_lists_root() {
+    let mut real = MembershipList::new();
+    real.add(b"kyc:alice");
+    // An attacker-controlled list in which mallory IS a member.
+    let mut fake = MembershipList::new();
+    fake.add(b"kyc:mallory");
+
+    let p = fake.prove(b"kyc:mallory");
+    // control: against its own root, with matching identity, it is a valid pass
+    assert_eq!(gate_allows_bound(Gate::Allow, &fake.root(), &p, b"kyc:mallory"), Ok(()));
+    // attack: the same proof against the REAL list's root
+    assert_eq!(
+        gate_allows_bound(Gate::Allow, &real.root(), &p, b"kyc:mallory"),
+        Err(GateError::ProofInvalid)
+    );
+}

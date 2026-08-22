@@ -119,74 +119,146 @@ fn bit_at(h: &Hash, depth: usize) -> u8 {
 
 /// The empty-subtree ladder: `empty[256]` is the empty leaf; `empty[d]` is the hash
 /// of a fully-empty subtree rooted at depth `d`. An empty tree's root is `empty[0]`.
-fn empty_hashes() -> [Hash; TREE_DEPTH + 1] {
-    let mut e = [[0u8; 32]; TREE_DEPTH + 1];
-    e[TREE_DEPTH] = EMPTY_LEAF;
-    let mut d = TREE_DEPTH;
-    while d > 0 {
-        d -= 1;
-        e[d] = node_hash(&e[d + 1], &e[d + 1]);
-    }
-    e
+///
+/// Computed once per process (`OnceLock`): the ladder is 256 chained SHAKE-256
+/// calls, and the pre-refactor code recomputed it on EVERY `root()`/`prove()` call —
+/// measurable, pure waste, since the ladder is a compile-time-constant-in-spirit
+/// value the code cannot yet make a `const` (SHAKE-256 is not const-evaluable).
+fn empty_hashes() -> &'static [Hash; TREE_DEPTH + 1] {
+    static LADDER: std::sync::OnceLock<[Hash; TREE_DEPTH + 1]> = std::sync::OnceLock::new();
+    LADDER.get_or_init(|| {
+        let mut e = [[0u8; 32]; TREE_DEPTH + 1];
+        e[TREE_DEPTH] = EMPTY_LEAF;
+        let mut d = TREE_DEPTH;
+        while d > 0 {
+            d -= 1;
+            e[d] = node_hash(&e[d + 1], &e[d + 1]);
+        }
+        e
+    })
 }
 
-/// `entries` is sorted by key hash (big-endian), so at any `depth` the bit-0 keys
-/// form a contiguous prefix. Returns the split index (first bit-1 entry).
-fn partition(entries: &[(Hash, Hash)], depth: usize) -> usize {
-    entries.partition_point(|(kh, _)| bit_at(kh, depth) == 0)
+/// The path **prefix** identifying the subtree a key's path passes through at
+/// `depth`: bits `[0, depth)` of the key hash kept, bits `[depth, 256)` zeroed.
+/// `(depth, prefix)` is the canonical name of an internal node — stable across
+/// mutations, which is what makes it usable as a cache key (unlike the
+/// entry-slice ranges the pre-refactor recursion was shaped around).
+fn prefix_at(kh: &Hash, depth: usize) -> Hash {
+    let mut p = [0u8; 32];
+    let full = depth / 8;
+    p[..full].copy_from_slice(&kh[..full]);
+    if depth % 8 != 0 {
+        p[full] = kh[full] & (0xffu8 << (8 - depth % 8));
+    }
+    p
 }
 
-/// Hash of the subtree covering `entries` (already restricted to this subtree and
-/// sorted by key hash) rooted at `depth`. Empty ⇒ the empty-ladder value.
-fn subtree_hash(entries: &[(Hash, Hash)], depth: usize, empty: &[Hash; TREE_DEPTH + 1]) -> Hash {
-    if entries.is_empty() {
-        return empty[depth];
-    }
-    if depth == TREE_DEPTH {
-        // Key hashes are 256-bit and unique, so exactly one entry lands here.
-        return entries[0].1;
-    }
-    let split = partition(entries, depth);
-    let (l, r) = entries.split_at(split);
-    node_hash(
-        &subtree_hash(l, depth + 1, empty),
-        &subtree_hash(r, depth + 1, empty),
-    )
+/// `prefix` with bit `depth` set — the name of the right child of node
+/// `(depth, prefix)`. (The left child is `(depth + 1, prefix)` unchanged.)
+fn set_bit(mut prefix: Hash, depth: usize) -> Hash {
+    prefix[depth / 8] |= 1u8 << (7 - depth % 8);
+    prefix
 }
 
-/// Collect, top-down, the sibling hash on `target`'s path at each depth `0..DEPTH`.
-fn gen_siblings(
-    entries: &[(Hash, Hash)],
-    target: &Hash,
-    depth: usize,
-    empty: &[Hash; TREE_DEPTH + 1],
-    out: &mut Vec<Hash>,
-) {
-    if depth == TREE_DEPTH {
-        return;
-    }
-    let split = partition(entries, depth);
-    let (l, r) = entries.split_at(split);
-    if bit_at(target, depth) == 0 {
-        out.push(subtree_hash(r, depth + 1, empty));
-        gen_siblings(l, target, depth + 1, empty, out);
+/// Upper bound (inclusive) of the key-hash range covered by node `(depth, prefix)`:
+/// bits `[depth, 256)` set to 1. Lower bound is `prefix` itself.
+fn range_hi(mut prefix: Hash, depth: usize) -> Hash {
+    let full = depth / 8;
+    if depth % 8 != 0 {
+        prefix[full] |= 0xffu8 >> (depth % 8);
+        for b in &mut prefix[full + 1..] {
+            *b = 0xff;
+        }
     } else {
-        out.push(subtree_hash(l, depth + 1, empty));
-        gen_siblings(r, target, depth + 1, empty, out);
+        for b in &mut prefix[full..] {
+            *b = 0xff;
+        }
     }
+    prefix
+}
+
+/// Fold a single leaf up an otherwise-empty subtree from `TREE_DEPTH` to `depth`:
+/// the hash of a subtree at `depth` that contains exactly the one entry `(kh, leaf)`.
+/// `O(TREE_DEPTH - depth)` node hashes, no recursion, no cache required — this is
+/// the closed form the incremental engine uses for every single-entry subtree, so
+/// the node cache only ever holds one entry per *occupied* node-with-siblings
+/// instead of one per spine level (memory `O(n)`, not `O(n · 256)`).
+fn spine_hash(kh: &Hash, leaf: &Hash, depth: usize, empty: &[Hash; TREE_DEPTH + 1]) -> Hash {
+    let mut cur = *leaf;
+    let mut d = TREE_DEPTH;
+    while d > depth {
+        d -= 1;
+        cur = if bit_at(kh, d) == 0 {
+            node_hash(&cur, &empty[d + 1])
+        } else {
+            node_hash(&empty[d + 1], &cur)
+        };
+    }
+    cur
 }
 
 // ── the sparse Merkle tree ──────────────────────────────────────────────────────
 
 /// A canonical, deterministic sparse Merkle tree over `key -> value` byte maps.
 ///
-/// Determinism: the backing store is a `BTreeMap` (canonical ordering) and the root
+/// Determinism: the backing stores are `BTreeMap`s (canonical ordering) and the root
 /// is a pure function of the *set* of entries — two trees with the same entries have
-/// the same root no matter the insertion order (proved in tests).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// the same root no matter the insertion order (proved in tests, and byte-pinned
+/// against the pre-refactor implementation in `tests/euvm_pinned_roots.rs`).
+///
+/// ## Incremental engine (refactor of the original recompute-everything design)
+///
+/// The pre-refactor `root()` rebuilt the whole tree on every call: it re-hashed
+/// every key and leaf (`entries()`), then recursed every occupied path down all 256
+/// levels — `O(n · 256)` SHAKE-256 calls *per `root()` call*, and the `Registry` /
+/// `HolderSet` wrappers call `root()` after every mutation, making a build of n
+/// entries quadratic. This engine keeps the identical hash discipline (same
+/// `KEY`/`LEAF`/`NODE` tags, same ladder, same canonical entry order — the roots are
+/// byte-identical, see the KATs) but maintains state incrementally:
+///
+/// - `entries`: `key_hash -> leaf_hash`, the canonical sorted entry set. Leaf hashes
+///   are computed once per mutation, not once per `root()` call.
+/// - `cache`: memoized internal-node hashes keyed by the stable node name
+///   `(depth, prefix)`. A mutation of key `k` invalidates exactly the 256 nodes on
+///   `k`'s path (a node's hash can only change if its subtree contains the mutated
+///   leaf, and those are precisely the nodes whose prefix prefixes `key_hash(k)`).
+/// - `root_hash`: recomputed eagerly at the end of every mutation by re-walking the
+///   invalidated path with memo hits everywhere else — `O(256)` hashes per mutation
+///   amortized — so `root()` is a field read and needs no interior mutability
+///   (`&self` stays `Sync`, and `Eq`/`Clone` semantics stay value-like).
+///
+/// The cache is a `BTreeMap` (not `HashMap`) deliberately: this crate's determinism
+/// story is "no allocation- or iteration-order-dependent behaviour anywhere", and a
+/// BTreeMap keeps even the debug representation canonical. Persistence of the node
+/// cache / entry set to disk is deliberately NOT provided here — see
+/// docs/specs/BLOCH-EUVM-GAP-MAP.md ("what remains open") for the backing-store
+/// seam this design leaves.
+#[derive(Clone, Debug, Default)]
 pub struct SparseMerkleTree {
     map: BTreeMap<Vec<u8>, Vec<u8>>,
+    /// `key_hash -> leaf_hash`, kept in canonical (big-endian hash) order.
+    entries: BTreeMap<Hash, Hash>,
+    /// Memoized internal-node hashes by stable node name `(depth, prefix)`.
+    /// Holds only branching nodes and single-entry subtree TOPS (spine interiors
+    /// are recomputed by `spine_hash`'s closed form) — `O(n)` entries total.
+    cache: BTreeMap<(u16, Hash), Hash>,
+    /// The current root, maintained eagerly by `recompute_root` on every mutation.
+    /// `None` iff the tree is empty (the empty root is the ladder head, which is
+    /// not representable as a "computed" value at `Default`-construction time
+    /// because the ladder is lazily initialized).
+    root_hash: Option<Hash>,
 }
+
+/// Semantic equality: two trees are equal iff they commit to the same `key -> value`
+/// map. The node cache is mutation-history-dependent (a memo, not state) and MUST
+/// NOT participate — a derived `PartialEq` would call two semantically identical
+/// trees unequal just because they were built in different orders.
+impl PartialEq for SparseMerkleTree {
+    fn eq(&self, other: &Self) -> bool {
+        self.map == other.map
+    }
+}
+impl Eq for SparseMerkleTree {}
 
 /// A membership / non-membership proof for a single key, verifiable from a root.
 ///
@@ -215,12 +287,24 @@ impl SparseMerkleTree {
 
     /// Insert or overwrite `key -> value`; returns the previous value if any.
     pub fn insert(&mut self, key: &[u8], value: &[u8]) -> Option<Vec<u8>> {
-        self.map.insert(key.to_vec(), value.to_vec())
+        let kh = key_hash(key);
+        self.entries.insert(kh, leaf_hash(&kh, value));
+        let prev = self.map.insert(key.to_vec(), value.to_vec());
+        self.invalidate_path(&kh);
+        self.recompute_root();
+        prev
     }
 
     /// Remove `key`; returns the removed value if any.
     pub fn remove(&mut self, key: &[u8]) -> Option<Vec<u8>> {
-        self.map.remove(key)
+        let prev = self.map.remove(key);
+        if prev.is_some() {
+            let kh = key_hash(key);
+            self.entries.remove(&kh);
+            self.invalidate_path(&kh);
+            self.recompute_root();
+        }
+        prev
     }
 
     /// The value bound to `key`, if present.
@@ -243,33 +327,110 @@ impl SparseMerkleTree {
         self.map.is_empty()
     }
 
-    /// Build the sorted `(key_hash, leaf_hash)` entry list.
-    fn entries(&self) -> Vec<(Hash, Hash)> {
-        let mut v: Vec<(Hash, Hash)> = self
-            .map
-            .iter()
-            .map(|(k, val)| {
-                let kh = key_hash(k);
-                (kh, leaf_hash(&kh, val))
-            })
-            .collect();
-        v.sort_by(|a, b| a.0.cmp(&b.0));
-        v
+    /// Drop the memoized hash of every node on `kh`'s path — exactly the set of
+    /// nodes whose subtree contains the mutated leaf, hence exactly the set whose
+    /// hash may have changed. Nodes off the path keep their (still-correct) memos.
+    fn invalidate_path(&mut self, kh: &Hash) {
+        for d in 0..TREE_DEPTH {
+            self.cache.remove(&(d as u16, prefix_at(kh, d)));
+        }
     }
 
-    /// The 32-byte root committing to the whole map. Pure function of the entry set.
+    /// The hash of node `(depth, prefix)`, memoizing every branching node and
+    /// single-entry subtree top it computes. Recursion depth is bounded by
+    /// `TREE_DEPTH`; with warm memos a post-mutation recompute only descends the
+    /// invalidated path (`O(TREE_DEPTH)` work), everything else is a memo hit.
+    fn node(&mut self, depth: usize, prefix: Hash, empty: &[Hash; TREE_DEPTH + 1]) -> Hash {
+        let hi = range_hi(prefix, depth);
+        let mut in_range = self.entries.range(prefix..=hi);
+        let (first_kh, first_leaf) = match in_range.next() {
+            None => return empty[depth],
+            Some((k, l)) => (*k, *l),
+        };
+        if depth == TREE_DEPTH {
+            // 256-bit unique key hashes: exactly one entry can land on a full path.
+            return first_leaf;
+        }
+        if let Some(h) = self.cache.get(&(depth as u16, prefix)) {
+            return *h;
+        }
+        let single = in_range.next().is_none();
+        let h = if single {
+            spine_hash(&first_kh, &first_leaf, depth, empty)
+        } else {
+            let left = self.node(depth + 1, prefix, empty);
+            let right = self.node(depth + 1, set_bit(prefix, depth), empty);
+            node_hash(&left, &right)
+        };
+        self.cache.insert((depth as u16, prefix), h);
+        h
+    }
+
+    /// Recompute and store the root after a mutation (memo hits off the path).
+    fn recompute_root(&mut self) {
+        if self.entries.is_empty() {
+            self.root_hash = None;
+            return;
+        }
+        let empty = *empty_hashes();
+        let r = self.node(0, [0u8; 32], &empty);
+        self.root_hash = Some(r);
+    }
+
+    /// Read-only node hash for proof generation: ladder for empty, memo hit where
+    /// available, closed-form spine for single-entry subtrees, and a (rare — only
+    /// reachable if the memo was never built, which `recompute_root` prevents)
+    /// recursive recompute as the correctness backstop.
+    fn node_readonly(&self, depth: usize, prefix: Hash, empty: &[Hash; TREE_DEPTH + 1]) -> Hash {
+        let hi = range_hi(prefix, depth);
+        let mut in_range = self.entries.range(prefix..=hi);
+        let (first_kh, first_leaf) = match in_range.next() {
+            None => return empty[depth],
+            Some((k, l)) => (*k, *l),
+        };
+        if depth == TREE_DEPTH {
+            return first_leaf;
+        }
+        if let Some(h) = self.cache.get(&(depth as u16, prefix)) {
+            return *h;
+        }
+        if in_range.next().is_none() {
+            return spine_hash(&first_kh, &first_leaf, depth, empty);
+        }
+        let left = self.node_readonly(depth + 1, prefix, empty);
+        let right = self.node_readonly(depth + 1, set_bit(prefix, depth), empty);
+        node_hash(&left, &right)
+    }
+
+    /// The 32-byte root committing to the whole map. Pure function of the entry set
+    /// (byte-identical to the pre-refactor full recomputation — pinned by KATs).
+    /// `O(1)`: mutations maintain it eagerly.
     pub fn root(&self) -> Hash {
-        let empty = empty_hashes();
-        subtree_hash(&self.entries(), 0, &empty)
+        match self.root_hash {
+            Some(r) => r,
+            None => empty_hashes()[0],
+        }
     }
 
     /// A proof for `key`: membership if present, non-membership otherwise.
+    /// Walks the key's path once, reading each off-path sibling from the memo /
+    /// ladder / spine closed form — `O(TREE_DEPTH)` after any mutation, instead of
+    /// the pre-refactor full-tree recursion per call.
     pub fn prove(&self, key: &[u8]) -> Proof {
         let empty = empty_hashes();
-        let entries = self.entries();
         let target = key_hash(key);
         let mut siblings = Vec::with_capacity(TREE_DEPTH);
-        gen_siblings(&entries, &target, 0, &empty, &mut siblings);
+        let mut prefix = [0u8; 32];
+        for d in 0..TREE_DEPTH {
+            if bit_at(&target, d) == 0 {
+                // going left: sibling is the right child
+                siblings.push(self.node_readonly(d + 1, set_bit(prefix, d), empty));
+            } else {
+                // going right: sibling is the left child; extend own prefix
+                siblings.push(self.node_readonly(d + 1, prefix, empty));
+                prefix = set_bit(prefix, d);
+            }
+        }
         Proof {
             key: key.to_vec(),
             value: self.map.get(key).cloned(),
@@ -307,6 +468,124 @@ pub fn verify(root: &Hash, proof: &Proof) -> bool {
 }
 
 // ── Val bridge (so a validator can assert a root against ctx) ────────────────────
+
+// ── compressed proofs (audit finding #3: 8 KiB per proof, uncompressed) ─────────
+
+/// A **compressed** membership / non-membership proof.
+///
+/// A [`Proof`] carries 256 sibling hashes = 8 KiB, regardless of how many keys the
+/// tree actually holds — the size the reuse audit flags
+/// (docs/specs/BLOCH-L1-EVM-REUSE-AUDIT.md §7.1, finding 3: "Proofs are
+/// uncompressed: 256 × 32 B = 8 KiB each, with no empty-ladder run compression").
+///
+/// In a real tree that is almost all padding. A tree with `n` entries has roughly
+/// `log2(n)` levels where the sibling is a genuine subtree; every level below that
+/// has an *empty* sibling, and an empty sibling at depth `d` is not data — it is
+/// `empty_hashes()[d + 1]`, a value the verifier recomputes from nothing. So the
+/// proof only needs to say **which** levels are non-empty and supply those hashes.
+///
+/// Encoding: a 256-bit `present` bitmap (32 B, MSB-first, bit `d` = "level `d`'s
+/// sibling is non-empty") plus the non-empty hashes in depth order. A single-entry
+/// tree's proof goes from 8192 B to 32 B.
+///
+/// This is a **transport format only**. It is a new structure sitting beside
+/// [`Proof`]; nothing about roots, [`verify`], or the existing proof format changes,
+/// because those are committed identities (see `tests/euvm_pinned_roots.rs`).
+/// [`compress`]/[`expand`] round-trip byte-for-byte, proved in
+/// `tests/euvm_compressed_proofs.rs`, including the adversarial case of a *genuine*
+/// subtree hash that happens to equal an empty-ladder value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompressedProof {
+    pub key: Vec<u8>,
+    pub value: Option<Vec<u8>>,
+    /// Bit `d` (MSB-first over 32 bytes) set ⇔ `siblings[d] != empty_hashes()[d + 1]`.
+    pub present: [u8; 32],
+    /// The non-empty siblings, in ascending depth order. Length == popcount(present).
+    pub nodes: Vec<Hash>,
+}
+
+impl CompressedProof {
+    /// True iff this is a membership proof (the key was present).
+    pub fn is_membership(&self) -> bool {
+        self.value.is_some()
+    }
+    /// Serialized size in bytes of the witness part (bitmap + nodes) — what the
+    /// compression actually buys, comparable against `TREE_DEPTH * 32` = 8192.
+    pub fn witness_bytes(&self) -> usize {
+        32 + self.nodes.len() * 32
+    }
+}
+
+/// Compress a [`Proof`] by dropping every sibling that equals the empty-subtree
+/// ladder value for its depth (the verifier regenerates those).
+///
+/// Returns `None` for a structurally invalid proof (wrong sibling count) rather than
+/// producing a compressed form that could never expand — fail-closed, matching
+/// [`verify`]'s own length check.
+pub fn compress(proof: &Proof) -> Option<CompressedProof> {
+    if proof.siblings.len() != TREE_DEPTH {
+        return None;
+    }
+    let empty = empty_hashes();
+    let mut present = [0u8; 32];
+    let mut nodes = Vec::new();
+    for (d, sib) in proof.siblings.iter().enumerate() {
+        // A sibling at depth `d` is the hash of a subtree rooted at depth `d + 1`.
+        if *sib != empty[d + 1] {
+            present[d / 8] |= 1u8 << (7 - d % 8);
+            nodes.push(*sib);
+        }
+    }
+    Some(CompressedProof {
+        key: proof.key.clone(),
+        value: proof.value.clone(),
+        present,
+        nodes,
+    })
+}
+
+/// Expand a [`CompressedProof`] back into a full [`Proof`].
+///
+/// Returns `None` if the bitmap's popcount does not match `nodes.len()` — i.e. the
+/// witness is internally inconsistent. That check is what stops a truncated or padded
+/// `nodes` vector from silently expanding into a *different but well-formed* proof:
+/// without it, a short `nodes` list would shift every later sibling up a level and
+/// yield a proof that fails [`verify`] for a confusing reason instead of being
+/// refused here for the real one.
+pub fn expand(c: &CompressedProof) -> Option<Proof> {
+    let empty = empty_hashes();
+    let popcount: usize = c.present.iter().map(|b| b.count_ones() as usize).sum();
+    if popcount != c.nodes.len() {
+        return None;
+    }
+    let mut siblings = Vec::with_capacity(TREE_DEPTH);
+    let mut next = 0usize;
+    for d in 0..TREE_DEPTH {
+        let set = (c.present[d / 8] >> (7 - d % 8)) & 1 == 1;
+        if set {
+            siblings.push(c.nodes[next]);
+            next += 1;
+        } else {
+            siblings.push(empty[d + 1]);
+        }
+    }
+    Some(Proof {
+        key: c.key.clone(),
+        value: c.value.clone(),
+        siblings,
+    })
+}
+
+/// Verify a compressed proof against `root`: expand, then run the *unchanged*
+/// [`verify`]. Deliberately not a second folding implementation — a second copy of
+/// the fold is a second place for the two to drift, and the existing one is the
+/// pinned, byte-tested path.
+pub fn verify_compressed(root: &Hash, c: &CompressedProof) -> bool {
+    match expand(c) {
+        Some(p) => verify(root, &p),
+        None => false,
+    }
+}
 
 /// Move a root into a VM value, so a datum can carry it and a validator can compare
 /// it against a `ctx` field with the existing `Op::Eq` / `Op::Verify` opcodes.
@@ -573,6 +852,79 @@ pub fn gate_allows(gate: Gate, root: &Hash, proof: &Proof) -> bool {
     match gate {
         Gate::Allow => proof.is_membership(),
         Gate::Deny => !proof.is_membership(),
+    }
+}
+
+/// Why an identity-bound gate refused. Distinguishing the reasons matters: a
+/// `KeyMismatch` is an *attack signature* (someone relayed a proof that is not
+/// about them), while `ProofInvalid` / `WrongPolarity` are ordinary failures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GateError {
+    /// The proof does not verify against the committed root at all.
+    ProofInvalid,
+    /// The proof verifies and is about the right identity, but has the wrong
+    /// membership polarity for this gate (allow-listed check on a non-member, or a
+    /// deny-listed party proving membership).
+    WrongPolarity,
+    /// **The bypass this API exists to close.** The proof is valid but its `key` is
+    /// not the identity the caller authenticated — i.e. a relayed/borrowed proof.
+    KeyMismatch,
+}
+
+/// **Identity-bound gating — the fix for the relay/fabrication bypass.**
+///
+/// [`gate_allows`] answers only "is this proof internally consistent with the root,
+/// with the right polarity". It never binds `proof.key` to *who is transacting*, and
+/// two integration tests pin the consequences as working attacks:
+/// `tests/audit_stateproof.rs::allow_gate_kyc_bypass_by_relaying_a_members_proof`
+/// (a non-member replays a member's public proof and passes a KYC allow-gate) and
+/// `::deny_gate_is_bypassable_with_a_made_up_identity` (a sanctioned party proves
+/// non-membership of a key it invented on the spot, and the sanctions list is inert).
+///
+/// Both attacks have the same shape: the proof is about SOMEONE ELSE'S key, or about
+/// no one's. This function closes both by requiring the caller to pass the identity
+/// it **already authenticated by other means** (`authenticated_id`) and refusing
+/// unless `proof.key` is exactly that identity. The key check is done FIRST, before
+/// the cryptographic verification, so a relayed proof is rejected as `KeyMismatch`
+/// rather than being reported as a polarity problem — the caller can log the
+/// difference.
+///
+/// ## What "authenticated" must mean (the caller's obligation, unchanged)
+/// This function cannot authenticate anyone; it has no signature, no key, no host.
+/// `authenticated_id` MUST be an identity the caller established itself — in a
+/// validator program that is the redeemer pubkey that just passed [`crate::Op::VerifySig`]
+/// (the VM's host callback [`crate::SigVerifier`], lib.rs), not a self-declared field
+/// from the spender. Passing an attacker-supplied `authenticated_id` reintroduces the
+/// bypass one level up; there is no way for this crate to prevent that, which is
+/// exactly why the binding is an explicit parameter instead of a hidden default.
+///
+/// [`gate_allows`] is deliberately left in place and unchanged: it is the correct
+/// primitive when the identity binding genuinely happens elsewhere, downstream
+/// consumers exist, and the two bypass tests must keep passing as documentation of
+/// what the unbound API does and does not promise.
+pub fn gate_allows_bound(
+    gate: Gate,
+    root: &Hash,
+    proof: &Proof,
+    authenticated_id: &[u8],
+) -> Result<(), GateError> {
+    // Identity binding FIRST. Constant-time comparison is not required: `proof.key`
+    // and `authenticated_id` are both public data (an id on a public list and an id
+    // the caller already authenticated), so there is no secret to leak by timing.
+    if proof.key.as_slice() != authenticated_id {
+        return Err(GateError::KeyMismatch);
+    }
+    if !verify(root, proof) {
+        return Err(GateError::ProofInvalid);
+    }
+    let polarity_ok = match gate {
+        Gate::Allow => proof.is_membership(),
+        Gate::Deny => !proof.is_membership(),
+    };
+    if polarity_ok {
+        Ok(())
+    } else {
+        Err(GateError::WrongPolarity)
     }
 }
 
