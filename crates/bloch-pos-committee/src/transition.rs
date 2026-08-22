@@ -8261,6 +8261,45 @@ mod tests {
         assert_eq!(w.txid(), base.txid(), "re-encoded witnesses must not move the txid");
     }
 
+    /// PROBE (epoch-discipline front, 2026-08-22): the gate must read the
+    /// BLOCK'S committed epoch, not any clock the node happens to own.
+    ///
+    /// Every existing gate test passes a SATURATED gate — 0 or `u64::MAX` —
+    /// at which `x >= gate` is constant for every possible `x`. That makes
+    /// them blind to WHICH `x` is read. This one puts the gate in the MIDDLE
+    /// and parks `self.epoch` BELOW it while any wall clock is far above it,
+    /// so the two epoch sources disagree and only the committed one gives the
+    /// stated answer.
+    #[test]
+    fn probe_gate_reads_the_block_epoch_not_a_clock() {
+        let owner = owner_key(3);
+        let entry = opening(0x51, 0, staking::MIN_DEPOSIT_SAT as u64 + 1_000_000, &owner);
+        let (_t, g, _c) = setup_funded(4, std::slice::from_ref(&entry));
+        let price = fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS;
+        let deposit =
+            funded_deposit_spending(&[entry], &owner, staking::MIN_DEPOSIT_SAT, 0x77, price);
+        const GATE: u64 = 5;
+
+        // NEGATIVE: committed epoch 2 < gate 5 -> refused. A machine clock
+        // reports an epoch in the millions, which is >= 5, so a clock-reading
+        // gate would ACCEPT here.
+        let mut pre = g.clone();
+        pre.epoch = 2;
+        let mut st = pre.clone();
+        assert_eq!(
+            st.apply_transaction_gated(&deposit, 0, price, &ToyVerifier, GATE),
+            Err(TxReject::StakingRule),
+            "pre-gate BLOCK epoch must refuse the funded shape, whatever the node clock says"
+        );
+        assert_eq!(st, pre, "a refused transaction must leave the state untouched");
+
+        // CONTROL: same gate, same transaction, committed epoch 7 >= 5 -> lands.
+        let mut post = g.clone();
+        post.epoch = 7;
+        post.apply_transaction_gated(&deposit, 0, price, &ToyVerifier, GATE)
+            .expect("control: post-gate block epoch must accept the same transaction");
+    }
+
     /// Rule 1 of the flag day: with the shipped `u64::MAX` gate, none of the
     /// funded shapes can touch state — and the refusal leaves the state
     /// byte-identical. The control half applies THE SAME transaction through
