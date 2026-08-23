@@ -2125,13 +2125,23 @@ mod tests {
     /// (that walk hashes an internal node per internal node of the whole
     /// tree, ~200,000 of them, every single call).
     ///
-    /// The bound is deliberately loose. Eight leaves at a branching depth of
-    /// ~log2(50k) ≈ 16, each also folding its own 256-level singleton path,
-    /// measures at 4,201 hashes; the flat recomputation this replaced measures
-    /// at 72,644 for the same edit, and would at 452,726 leaves measure at
-    /// ~650,000. Eight thousand sits above the first with room for the tree
-    /// shape to shift and an order of magnitude below the second, so the test
-    /// states an asymptotic fact and not a machine's timing.
+    /// The bound is deliberately loose. All four numbers below are measured,
+    /// with this counter, on the same fixture:
+    ///
+    /// ```text
+    ///                        flat recomputation   incremental trie
+    ///   50,000 leaves                    75,115              4,201
+    ///  452,726 leaves                   655,363              3,455
+    /// ```
+    ///
+    /// The left column tracks the SIZE OF THE TREE; the right column tracks
+    /// the SIZE OF THE EDIT, which is the whole claim. (The right column
+    /// falls slightly as the tree grows because a deeper tree branches the
+    /// eight keys apart sooner, so each moved leaf's singleton fold is
+    /// shorter.) Eight thousand sits above the 50,000-leaf figure with room
+    /// for the tree shape to shift, and an order of magnitude below the
+    /// recomputation it replaced, so the test states an asymptotic fact and
+    /// not a machine's timing.
     #[test]
     fn a_small_update_costs_a_bounded_number_of_node_hashes() {
         let n = 50_000u32;
