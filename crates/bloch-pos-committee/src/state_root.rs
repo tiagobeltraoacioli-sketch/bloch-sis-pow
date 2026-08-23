@@ -2436,6 +2436,24 @@ mod tests {
     /// asymptotic claim is asserted, in hash counts, by
     /// [`tests::a_small_update_costs_a_bounded_number_of_node_hashes`].
     /// Run with `--release -- --ignored --nocapture`.
+    ///
+    /// # Two things this used to get wrong
+    ///
+    /// **The bulk-vs-leaf-by-leaf comparison printed the inverse of its own
+    /// claim.** Both builds ran on ONE thread, bulk first. `singleton_subtree_root`
+    /// is memoized in a THREAD-LOCAL, so the second build inherited a memo it
+    /// had not paid for and came out looking faster. The comment said the
+    /// incremental API "is the wrong tool for a cold load and this says by how
+    /// much"; the number underneath said the opposite. Each side now builds on
+    /// its OWN freshly spawned thread, with its own leaf map, so neither
+    /// borrows the other's warm anything.
+    ///
+    /// **`root()` was being timed as if it still cost something.** Two lines
+    /// were labelled "memo cold" and "memo warm". Since perf/smt made the tree
+    /// incremental, `Smt::root()` is `hash_of(&self.root, 0, ..)` — a match and
+    /// a field read, O(1), no hashing at all. It was also not even cold: the
+    /// `assert_eq!` above it had already called `smt.root()`. Both lines are
+    /// now labelled for what they measure.
     #[test]
     #[ignore]
     fn carryover_scale_incremental_cost() {
@@ -2444,32 +2462,70 @@ mod tests {
             (derive_key(TAG_EUTXO, &i.to_le_bytes()), hash_value(&i.to_le_bytes()))
         };
 
+        // Each build on its OWN freshly spawned thread. `singleton_subtree_root`
+        // memoizes in a thread-local, so two builds sharing a thread do not
+        // share a starting line — whichever ran second used to inherit the
+        // other's warm memo and win on that alone. Each thread also builds its
+        // own leaf map for the same reason.
+        fn cold<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+            std::thread::Builder::new()
+                .stack_size(256 << 20)
+                .spawn(f)
+                .expect("spawn measurement thread")
+                .join()
+                .expect("measurement thread panicked")
+        }
+        let leaves_of = move |n: u32| -> BTreeMap<[u8; 32], [u8; 32]> {
+            (0..n)
+                .map(|i| (derive_key(TAG_EUTXO, &i.to_le_bytes()), hash_value(&i.to_le_bytes())))
+                .collect()
+        };
+
         // Bulk, which is what a from-scratch load actually does
         // (`EutxoSet::from_iter`): one singleton fold per leaf.
+        let (build, root_bulk) = cold(move || {
+            let all = leaves_of(n);
+            let t0 = std::time::Instant::now();
+            let smt = Smt::from_leaf_map(&all);
+            let e = t0.elapsed();
+            (e, smt.root())
+        });
+
+        // The same set built one insertion at a time, for contrast: the
+        // incremental API is the wrong tool for a cold load and this now
+        // really does say by how much, rather than saying the reverse.
+        let (build_incremental, root_one_at_a_time) = cold(move || {
+            let all = leaves_of(n);
+            let t0b = std::time::Instant::now();
+            let mut one = Smt::new();
+            for (k, v) in &all {
+                one.insert(*k, *v);
+            }
+            let e = t0b.elapsed();
+            (e, one.root())
+        });
+        assert_eq!(
+            root_bulk, root_one_at_a_time,
+            "bulk and leaf-by-leaf must agree — and now they are compared \
+             across threads, so neither answer came from the other's memo"
+        );
+
+        // The live tree the edit below is applied to, on this thread.
         let all: BTreeMap<[u8; 32], [u8; 32]> = (0..n).map(leaf).collect();
-        let t0 = std::time::Instant::now();
         let mut smt = Smt::from_leaf_map(&all);
-        let build = t0.elapsed();
-
-        // And the same set built one insertion at a time, for contrast: the
-        // incremental API is the wrong tool for a cold load and this says by
-        // how much.
-        let t0b = std::time::Instant::now();
-        let mut one_at_a_time = Smt::new();
-        for (k, v) in &all {
-            one_at_a_time.insert(*k, *v);
-        }
-        let build_incremental = t0b.elapsed();
-        assert_eq!(one_at_a_time.root(), smt.root(), "bulk and incremental must agree");
-        drop(one_at_a_time);
-
-        let t1 = std::time::Instant::now();
         let a = smt.root();
-        let root_cold = t1.elapsed();
+        assert_eq!(a, root_bulk);
+
+        // `root()` is a match and a field read since the tree became
+        // incremental — O(1), no hashing. Timed twice only to show that, and
+        // labelled for what it is rather than for a memo it does not consult.
+        let t1 = std::time::Instant::now();
+        let r1 = smt.root();
+        let root_call_1 = t1.elapsed();
         let t2 = std::time::Instant::now();
-        let b = smt.root();
-        let root_warm = t2.elapsed();
-        assert_eq!(a, b);
+        let r2 = smt.root();
+        let root_call_2 = t2.elapsed();
+        assert_eq!(r1, r2);
 
         // Four spends and four creations: the shape of an ordinary block.
         // Counted as well as timed. The count is deterministic and immune to
@@ -2493,10 +2549,19 @@ mod tests {
         assert_ne!(a, c);
 
         println!("  leaves                    : {n}");
-        println!("  build (bulk)              : {build:.4?}");
-        println!("  build (leaf by leaf)      : {build_incremental:.4?}");
-        println!("  root() #1 (memo cold)     : {root_cold:.4?}");
-        println!("  root() #2 (memo warm)     : {root_warm:.4?}");
+        println!("  build (bulk)              : {build:.4?}   [own thread, cold memo]");
+        println!("  build (leaf by leaf)      : {build_incremental:.4?}   [own thread, cold memo]");
+        println!(
+            "  -> bulk is {:.2}x {} than leaf-by-leaf",
+            if build_incremental > build {
+                build_incremental.as_secs_f64() / build.as_secs_f64()
+            } else {
+                build.as_secs_f64() / build_incremental.as_secs_f64()
+            },
+            if build_incremental > build { "FASTER" } else { "SLOWER" }
+        );
+        println!("  root() call #1            : {root_call_1:.4?}   [O(1) field read, not a memo]");
+        println!("  root() call #2            : {root_call_2:.4?}   [same]");
         println!("  8-leaf edit               : {edit:.4?}");
         println!("  root() after the 8 edits  : {root_after_edit:.4?}");
         println!("  8-leaf edit + the root    : {edit_and_root:.4?}");
