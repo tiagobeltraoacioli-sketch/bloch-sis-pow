@@ -41,6 +41,14 @@ publish = false
 name = "bloch-pos"
 path = "src/main.rs"
 
+[features]
+# Phase timers for the end-to-end replay benchmark (src/replay_bench.rs).
+# OFF by default; with it off every span in engine.rs and in the committee
+# crate is a zero-sized value with no Drop and disappears at compile time.
+# The benchmark runs the SAME code either way — the feature only decides
+# whether the breakdown is available. Never enable it on a producing node.
+perf-timing = ["bloch-pos-committee/perf-timing"]
+
 [dependencies]
 # The frozen consensus math (pure, sha3-only).
 bloch-pos-committee = { path = "../bloch-pos-committee" }

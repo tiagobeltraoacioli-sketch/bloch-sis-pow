@@ -1510,6 +1510,8 @@ impl CommittedState {
     /// the bottom of this file exists to make that regression loud.
     fn compute_root(&self) -> [u8; 32] {
         ROOT_COMPUTATION_COUNT.with(|c| c.set(c.get().wrapping_add(1)));
+        // Instrumentation only; compiled out without `perf-timing`.
+        let _perf = crate::perf::span(crate::perf::Phase::StateRoot);
         let validators: Vec<CommittedValidatorRecord> = self
             .validators
             .values()
@@ -2521,6 +2523,8 @@ impl CommittedState {
     /// proposal must not become a lever over everyone's rewards or over the
     /// finality clock (the engine's leak ticks on empty epochs too).
     fn close_epoch(&self) -> CommittedState {
+        // Instrumentation only; compiled out without `perf-timing`.
+        let _perf = crate::perf::span(crate::perf::Phase::EpochBoundary);
         let mut st = self.clone();
         let closing = st.epoch;
         let roster = st.duty_roster_at(closing);
@@ -2914,7 +2918,11 @@ impl<V: SignatureVerifier> Transition<V> {
         // skipped. Identical to the caller invoking process_epoch itself —
         // close_epoch is the single definition of the boundary — so explicit
         // and implicit epoch processing cannot diverge.
-        let mut st = pre.clone();
+        let mut st = {
+            // Instrumentation only; compiled out without `perf-timing`.
+            let _perf = crate::perf::span(crate::perf::Phase::StateClone);
+            pre.clone()
+        };
         while st.epoch < block_epoch {
             st = st.close_epoch();
         }
