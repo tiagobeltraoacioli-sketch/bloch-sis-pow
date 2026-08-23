@@ -894,6 +894,35 @@ fn bench(cfg: BenchCfg) {
             samples.len(),
             med
         );
+        // The breakdown for THIS run, printed now rather than only in the
+        // summary. A 25-minute benchmark that prints its result once at the
+        // end loses everything if the box takes the process away — which is
+        // exactly what happened at 02:25 on 2026-08-23, four runs in.
+        if perf::ENABLED {
+            let mean_run: f64 =
+                samples.iter().map(|s| ms(s.total)).sum::<f64>() / samples.len() as f64;
+            let mut line = String::new();
+            let mut attributed = 0.0;
+            for i in 0..perf::N_PHASES {
+                let m = samples.iter().map(|s| ms(s.phases[i])).sum::<f64>()
+                    / samples.len() as f64;
+                attributed += m;
+                if m >= 0.05 {
+                    line.push_str(&format!(
+                        "{}={:.1}ms({:.0}%) ",
+                        perf::PHASE_NAMES[i],
+                        m,
+                        100.0 * m / mean_run
+                    ));
+                }
+            }
+            line.push_str(&format!(
+                "else={:.1}ms({:.0}%)",
+                mean_run - attributed,
+                100.0 * (mean_run - attributed) / mean_run
+            ));
+            println!("        mean {mean_run:.1} ms/block; {line}");
+        }
         per_run.push(samples);
     }
 
