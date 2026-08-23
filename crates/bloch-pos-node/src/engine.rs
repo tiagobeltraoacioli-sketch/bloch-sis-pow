@@ -408,6 +408,18 @@ mod state_cell {
 
 use state_cell::StateCell;
 
+/// The end-to-end replay benchmark (`src/engine/replay_bench.rs`).
+///
+/// A CHILD module of `engine`, and that is the whole reason it can exist:
+/// `Engine` and its fields are private to this module, so a benchmark in
+/// `tests/` could not drive `ingest`/`advance`/`apply_canonical` at all and
+/// would have had to reimplement them — measuring the reimplementation. A
+/// child module sees its ancestors' private items, so nothing here has to be
+/// widened for it. `cfg(test)`: not in the binary, asserts no consensus
+/// property, changes no behaviour.
+#[cfg(test)]
+mod replay_bench;
+
 struct Engine {
     manifest: Manifest,
     state: StateCell,
@@ -566,6 +578,11 @@ impl Engine {
     /// Shared rather than cloned. Every caller reads — roster, seed, finality
     /// view — and none mutates, which the `Arc` now enforces.
     fn rolled_to(&self, epoch: u64) -> Arc<CommittedState> {
+        // Instrumentation only; compiled out without `perf-timing`. This spans
+        // the whole call, memo HIT included, so the phase total reads as the
+        // effective cost of the duty view — which is the number the memo was
+        // built to move. On a hit the span is the lookup and nothing else.
+        let _perf = bloch_pos_committee::perf::span(bloch_pos_committee::perf::Phase::RolledTo);
         self.state.rolled_to(epoch, |st| {
             self.tr
                 .process_epoch(st)
@@ -1043,6 +1060,8 @@ impl Engine {
     }
 
     fn forkchoice_head(&self) -> [u8; 32] {
+        // Instrumentation only; compiled out without `perf-timing`.
+        let _perf = bloch_pos_committee::perf::span(bloch_pos_committee::perf::Phase::ForkChoice);
         lmd_ghost_head(
             &self.blocks,
             self.pool.values(),
@@ -1421,6 +1440,12 @@ impl Engine {
     /// through the real `apply_block` — nothing about what gets adopted
     /// changes; only where the fold starts does.
     fn do_reorg(&mut self, ancestor: [u8; 32], branch: Vec<BlockEnvelope>) -> bool {
+        // Instrumentation only; compiled out without `perf-timing`. Self time
+        // only — the `apply_block` calls below are attributed to their own
+        // phases, so this reads as "reorg overhead beyond re-execution". Note
+        // that since the fold now starts at the fork point, the replay this
+        // used to charge here is mostly gone rather than moved.
+        let _perf = bloch_pos_committee::perf::span(bloch_pos_committee::perf::Phase::Reorg);
         let cut = self
             .chain
             .iter()
@@ -3939,6 +3964,13 @@ mod perf_support {
             ws_anchor: None,
             ws_anchor_hard: false,
             ws_conflict_reported: false,
+            // A fresh engine has dropped nothing from an empty pool, so the
+            // running total is zero — the same value `boot`'s literal uses.
+            // Not a placeholder: `forkchoice_inputs` reads this as
+            // `pool.len() + this`, and starting it anywhere but 0 would
+            // offset the very first comparison against a pool that really is
+            // empty.
+            fc_covered_removals: 0,
         };
         (engine, TestDir(dir))
     }

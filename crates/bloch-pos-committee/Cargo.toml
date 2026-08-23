@@ -11,6 +11,13 @@ publish = false
 # standalone now would mean `cargo test --workspace` silently skips the entire
 # consensus layer — the opposite of what an audit needs.
 
+[features]
+# Phase timers for the replay benchmark (src/perf.rs). OFF by default and off
+# in every release the fleet runs: with the feature absent the span type is
+# zero-sized with no Drop and every call site disappears. Never enable it on a
+# node that is producing.
+perf-timing = []
+
 [dependencies]
 sha3 = { version = "0.10", default-features = false }
 
