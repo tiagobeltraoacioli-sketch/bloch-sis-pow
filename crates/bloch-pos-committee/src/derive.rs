@@ -126,6 +126,14 @@ pub struct ChainState {
     /// Delegator fee-reward ledger, carried unchanged: it is filled at the
     /// epoch boundary, which is the transition's job.
     pub delegator_fee_rewards: Vec<crate::state_root::DelegatorFeeRecord>,
+    /// Cumulative written-off principal (`TAG_WRITTEN_OFF`, 2026-08-22),
+    /// carried unchanged: only a withdrawal — a transaction, the transition's
+    /// job — advances it. Zero before the flag day.
+    pub written_off_sat: u128,
+    /// Bond low-water marks (`TAG_STAKE_LOW_WATER`, 2026-08-22), carried
+    /// unchanged: only a slash — the transition's job — writes one. Empty on
+    /// every state the live chain has produced.
+    pub stake_low_water: Vec<crate::state_root::StakeLowWaterRecord>,
 }
 
 impl ChainState {
@@ -156,6 +164,8 @@ impl ChainState {
             coherence_nullifier_root: self.coherence_nullifier_root,
             evm: self.evm,
             issued_sat: self.issued_sat,
+            written_off_sat: self.written_off_sat,
+            stake_low_water: &self.stake_low_water,
         })
     }
 }
@@ -650,6 +660,11 @@ mod coherence_tests {
                 tx_bytes: 0,
             },
             delegator_fee_rewards: Vec::new(),
+            // Pre-flag-day shape: nothing written off. Written out rather
+            // than defaulted, same break-this-line reason.
+            written_off_sat: 0,
+            // No bond has ever been slashed, so no low-water mark exists.
+            stake_low_water: Vec::new(),
             evm: EvmCommitment {
                 account_root: [0u8; 32],
                 receipts_root: [0u8; 32],

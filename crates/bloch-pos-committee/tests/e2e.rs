@@ -423,6 +423,11 @@ mod harness {
             // This devnet harness pays no issuance, so the counter stays at
             // its genesis value for the whole run — committed, not omitted.
             issued_sat: bloch_pos_committee::tokenomics_v4::GENESIS_ISSUED_SAT,
+            // Pre-flag-day shape: nothing written off (funded-staking
+            // write-off).
+            written_off_sat: 0,
+            // And no slash: no low-water marks.
+            stake_low_water: &[],
             applied_evidence: &[],
             slash_window: &[],
             delegator_slash_losses: &[],

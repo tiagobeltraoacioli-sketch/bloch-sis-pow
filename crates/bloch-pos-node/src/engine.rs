@@ -2611,7 +2611,7 @@ mod admission_authorisation {
 
     /// A transfer signed for real, and the same transfer with the signature
     /// corrupted. Both must reach `admissible` — one accepted, one refused.
-    fn signed_transfer() -> (PosTransaction, Vec<u8>) {
+    pub(super) fn signed_transfer() -> (PosTransaction, Vec<u8>) {
         let (pk, sk) = bloch_crypto::crypto::generate_keypair_from_seed(&[9u8; 32])
             .expect("hybrid keypair from a fixed seed");
         let mut tx = PosTransaction::Transfer {
@@ -2737,7 +2737,7 @@ mod admission_authorisation {
     /// A funded deposit whose spend signature and PoP both verify under the
     /// real hybrid suite — the fixture both halves of the flag-day tests
     /// below share.
-    fn signed_funded_deposit() -> PosTransaction {
+    pub(super) fn signed_funded_deposit() -> PosTransaction {
         use bloch_pos_committee::staking;
         let (owner_pk, owner_sk) = bloch_crypto::crypto::generate_keypair_from_seed(&[3u8; 32])
             .expect("coin owner keypair");
@@ -3180,7 +3180,7 @@ mod transfer_v2_end_to_end {
     /// HOLDS `entries` — the outputs the sweep spends. `epochs_past` places
     /// `genesis_time_ms` so the node's real wall epoch is at least that
     /// (+2 slots of margin so the epoch cannot regress mid-test).
-    fn engine_at_wall_epoch(epochs_past: u64, entries: &[EutxoEntry]) -> Engine {
+    pub(super) fn engine_at_wall_epoch(epochs_past: u64, entries: &[EutxoEntry]) -> Engine {
         let slot_ms = 500u64;
         let back_ms = epochs_past
             .saturating_mul(SLOTS_PER_EPOCH)
@@ -3454,6 +3454,355 @@ mod transfer_v2_end_to_end {
             e2.message.contains("retry later"),
             "a full mempool SHOULD advise retrying: {}",
             e2.message
+        );
+    }
+}
+
+/// THE CALL-SITE TESTS for the deposit door, on a REAL `Engine`.
+///
+/// Dev 3, 2026-08-23. Every other test of the deposit refusal calls
+/// `admissible()` directly. That is a test of the FUNCTION. It was
+/// demonstrated in this fleet on 2026-08-22 that deleting only the CALL to a
+/// validation makes a hostile input accepted while the validation itself
+/// stays intact and its unit test stays green — so the refusal that today
+/// holds the deposit door shut is only proven if it is exercised through
+/// `on_transaction`, the one function gossip (`NetEvent::Transaction`) and
+/// RPC (`serve_rpc`'s `SendRawTransaction` arm) both converge on.
+///
+/// The measurement these protect (2026-08-13): an unfunded `Deposit` is
+/// 25,000 BLOCH of stake per unauthenticated request, ~46 requests to a third
+/// of active stake and stopped finality, ~180 to two thirds.
+#[cfg(test)]
+mod funded_stake_entry_path {
+    use super::admission_authorisation::{signed_funded_deposit, signed_transfer};
+    use super::transfer_v2_end_to_end::engine_at_wall_epoch;
+    use super::*;
+    use bloch_pos_committee::params::FUNDED_STAKE_ACTIVATION_EPOCH as FUNDED_FLAG_DAY;
+    use bloch_pos_committee::params::TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH as V2_FLAG_DAY;
+
+    fn unfunded_deposit() -> PosTransaction {
+        PosTransaction::Deposit {
+            pubkey: vec![0xAB; 3_749],
+            amount_sat: 25_000 * 100_000_000,
+            randao_commitment: [0x5C; 32],
+            withdrawal_credentials: vec![0xCD; 32],
+            commission_bps: 500,
+        }
+    }
+
+    fn unfunded_delegation() -> PosTransaction {
+        PosTransaction::Delegate {
+            delegator: 0,
+            validator: 0,
+            amount_sat: 1_000 * 100_000_000,
+            eligible: true,
+        }
+    }
+
+    /// The door itself, not the doorman's opinion: an unfunded `Deposit`
+    /// offered to a real engine by BOTH real entry paths is refused, leaves
+    /// no mempool entry, and reaches no proposal.
+    ///
+    /// Delete the `admissible(&tx, epoch_of(self.wall_slot()))` call from
+    /// `on_transaction` and this test goes red while every
+    /// `admissible(&deposit, 0)` test in this file stays green. That is the
+    /// entire reason it exists.
+    ///
+    /// The CONTROL is a genuinely admissible transaction through the same
+    /// door on the same engine: without it, "the mempool is empty" would also
+    /// be satisfied by a harness that admits nothing at all.
+    #[test]
+    fn the_unfunded_deposit_dies_at_the_real_door_not_only_at_the_predicate() {
+        let deposit = unfunded_deposit();
+
+        // ── Gossip path ─────────────────────────────────────────────────────
+        let mut node = engine_at_wall_epoch(0, &[]);
+        let err = node
+            .on_transaction(deposit.clone())
+            .expect_err("the gossip door must refuse an unfunded deposit");
+        assert!(
+            err.reason()
+                .contains("bonding is not yet funded from the UTXO set"),
+            "the refusal must be today's, and must say why: {}",
+            err.reason()
+        );
+        assert!(node.mempool.is_empty(), "a refused deposit must not sit in the mempool");
+        assert!(
+            node.select_transactions(epoch_of(node.wall_slot())).is_empty(),
+            "a refused deposit must never reach a proposal"
+        );
+
+        // ── RPC path, same engine ───────────────────────────────────────────
+        let out = node.serve_rpc(RpcRequest::SendRawTransaction(deposit.clone()));
+        assert!(out.is_err(), "sendrawtransaction must refuse an unfunded deposit: {out:?}");
+        assert!(node.mempool.is_empty(), "the RPC door must not admit it either");
+
+        // ── The delegation half — same mint, one indirection away ───────────
+        let delegation = unfunded_delegation();
+        let err = node
+            .on_transaction(delegation.clone())
+            .expect_err("the gossip door must refuse an unfunded delegation");
+        assert!(
+            err.reason()
+                .contains("bonding is not yet funded from the UTXO set"),
+            "got: {}",
+            err.reason()
+        );
+        assert!(node.serve_rpc(RpcRequest::SendRawTransaction(delegation)).is_err());
+        assert!(node.mempool.is_empty());
+
+        // ── CONTROL: the door opens for something ───────────────────────────
+        let (transfer, _) = signed_transfer();
+        assert_eq!(
+            node.on_transaction(transfer.clone()),
+            Ok(Admitted::New),
+            "control: an honestly signed transfer must pass this same door"
+        );
+        assert_eq!(node.mempool.len(), 1, "control: the admitted transfer is in the mempool");
+        assert_eq!(
+            node.select_transactions(epoch_of(node.wall_slot())),
+            vec![transfer],
+            "control: and it is selected into the next proposal"
+        );
+    }
+
+    /// The funded replacement is refused at the real door too, for the OTHER
+    /// reason — the flag day — and the two refusals must not be confused:
+    /// the legacy shape is refused because it is unfunded, forever; the
+    /// funded shape is refused because the chain has not reached the gate.
+    ///
+    /// Its signatures are real (`signed_funded_deposit` signs with the hybrid
+    /// suite), so the gate — not a malformed fixture — is what refuses.
+    #[test]
+    fn the_funded_deposit_is_refused_at_the_real_door_before_the_flag_day() {
+        let mut node = engine_at_wall_epoch(0, &[]);
+        let dep = signed_funded_deposit();
+        // The fixture is otherwise admissible: past the gate this very
+        // transaction passes the predicate. Without this the test below could
+        // be passing on a broken signature.
+        assert!(
+            admissible(&dep, FUNDED_FLAG_DAY).is_ok(),
+            "fixture: the funded deposit must be admissible once the gate is reached"
+        );
+        let err = node
+            .on_transaction(dep.clone())
+            .expect_err("the real door must refuse a funded deposit before the flag day");
+        assert!(
+            err.reason().contains("flag day"),
+            "the refusal must name the flag day: {}",
+            err.reason()
+        );
+        assert!(node.mempool.is_empty(), "nothing funded may propagate before the gate");
+        assert!(node.serve_rpc(RpcRequest::SendRawTransaction(dep)).is_err());
+        assert!(node.mempool.is_empty());
+    }
+
+    /// The gate itself, and the half of it that has no gate: the legacy
+    /// unfunded `Deposit` and `Delegate` are refused at EVERY epoch — before
+    /// the V2 flag day, at it, before the funded flag day, at it, and at
+    /// `u64::MAX`, which is the largest epoch a node can ever hold. No
+    /// comparison anywhere in the arm can open them.
+    ///
+    /// The sweep is not vacuous: at those same epochs the FUNDED shapes flip
+    /// from refused to admitted, so the loop is measuring a real predicate.
+    #[test]
+    fn the_unfunded_shapes_are_refused_at_every_epoch_and_the_funded_ones_are_not() {
+        let deposit = unfunded_deposit();
+        let delegation = unfunded_delegation();
+        let funded = signed_funded_deposit();
+        let epochs = [
+            0u64,
+            1,
+            V2_FLAG_DAY.saturating_sub(1),
+            V2_FLAG_DAY,
+            V2_FLAG_DAY + 1,
+            FUNDED_FLAG_DAY.saturating_sub(1),
+            FUNDED_FLAG_DAY,
+            u64::MAX,
+        ];
+        for e in epochs {
+            for (what, tx) in [("deposit", &deposit), ("delegation", &delegation)] {
+                let Err(err) = admissible(tx, e) else {
+                    panic!("the unfunded {what} was admitted at epoch {e}");
+                };
+                assert!(
+                    err.contains("bonding is not yet funded from the UTXO set"),
+                    "epoch {e}, {what}: the reason must stay the funding one, got: {err}"
+                );
+            }
+        }
+        // Not vacuous: the funded shape IS gated, so the sweep above is
+        // reading a predicate that can change its mind — it simply never
+        // changes it for the unfunded shapes.
+        assert!(
+            admissible(&funded, 0).is_err(),
+            "control: the funded deposit is refused before the gate"
+        );
+        assert!(
+            admissible(&funded, FUNDED_FLAG_DAY).is_ok(),
+            "control: the funded deposit is admitted at the gate — the sweep is not vacuous"
+        );
+    }
+
+    /// The authorisation question, answered against the `Transfer` arm it
+    /// must match: a funded deposit's inputs are checked at the mempool door
+    /// by the SAME real-suite verification a transfer's are, not merely
+    /// named. Both arms refuse a flipped signature byte; both admit the
+    /// honest twin.
+    ///
+    /// This is the mempool half. The consensus half (the same check through
+    /// the injected verifier, plus `ScriptMismatch` before it) is pinned in
+    /// transition.rs.
+    #[test]
+    fn the_funded_deposit_door_checks_spends_exactly_as_the_transfer_door_does() {
+        let (transfer, _) = signed_transfer();
+        let deposit = signed_funded_deposit();
+
+        // Both honest twins pass their door.
+        assert!(admissible(&transfer, 0).is_ok(), "control: the signed transfer passes");
+        assert!(
+            admissible(&deposit, FUNDED_FLAG_DAY).is_ok(),
+            "control: the signed funded deposit passes past the gate"
+        );
+
+        // One flipped byte in the spend signature, both shapes.
+        let mut bad_transfer = transfer.clone();
+        if let PosTransaction::Transfer { inputs, .. } = &mut bad_transfer {
+            inputs[0].signature[0] ^= 0xFF;
+        }
+        assert!(
+            admissible(&bad_transfer, 0)
+                .expect_err("a transfer with a bad signature must be refused")
+                .contains("does not verify"),
+        );
+
+        let mut bad_deposit = deposit.clone();
+        if let PosTransaction::FundedDeposit { inputs, .. } = &mut bad_deposit {
+            inputs[0].signature[0] ^= 0xFF;
+        }
+        let err = admissible(&bad_deposit, FUNDED_FLAG_DAY)
+            .expect_err("a funded deposit with a bad spend signature must be refused");
+        assert!(err.contains("spend signature"), "got: {err}");
+
+        // And the shape neither door may admit: a deposit with no inputs is
+        // the legacy mint wearing the funded tag.
+        let mut inputless = deposit;
+        if let PosTransaction::FundedDeposit { inputs, .. } = &mut inputless {
+            inputs.clear();
+        }
+        let err = admissible(&inputless, FUNDED_FLAG_DAY)
+            .expect_err("a funded deposit that spends nothing must be refused");
+        assert!(err.contains("no inputs"), "got: {err}");
+    }
+
+    /// The form of the rogue-key attack the toy verifier in transition.rs
+    /// cannot express, run against the REAL hybrid suite: a payer spends its
+    /// own coin and names SOMEONE ELSE'S validator key, signing the proof of
+    /// possession with the only key it actually holds. Every signature in the
+    /// transaction verifies under its own key; the deposit is still refused,
+    /// because the PoP must verify under the key being REGISTERED.
+    ///
+    /// Without this the conservation tests would all pass while the bond was
+    /// unusable — coin destroyed, stake credited to a key nobody holds — and
+    /// the victim would be locked out of its own identity for good
+    /// (`pubkey_index` never admits a key twice). Delete the PoP check from
+    /// the `FundedDeposit` arm of `admissible` and this test goes red.
+    ///
+    /// Reachability, stated rather than hidden: while
+    /// `FUNDED_STAKE_ACTIVATION_EPOCH` is `u64::MAX` the flag-day arm refuses
+    /// every funded deposit before this check runs, so `admissible` — the
+    /// function `on_transaction` calls — is the deepest point this property
+    /// is reachable at from a node today. The consensus twin
+    /// (`possession_keeps_a_validator_key_from_being_squatted`) covers the
+    /// block path.
+    #[test]
+    fn a_funded_deposit_cannot_bond_coin_to_a_key_the_spender_does_not_hold() {
+        use bloch_pos_committee::staking;
+        use bloch_pos_committee::transition::{TransferInput, TransferOutput};
+
+        let (owner_pk, owner_sk) = bloch_crypto::crypto::generate_keypair_from_seed(&[3u8; 32])
+            .expect("coin owner keypair");
+        let (victim_pk, victim_sk) = bloch_crypto::crypto::generate_keypair_from_seed(&[77u8; 32])
+            .expect("the validator key being squatted");
+        let (_rogue_pk, rogue_sk) = bloch_crypto::crypto::generate_keypair_from_seed(&[78u8; 32])
+            .expect("the squatter's own key");
+        assert!(
+            staking::is_wire_hybrid_pubkey(&victim_pk),
+            "fixture: the registered key must be the enveloped hybrid form"
+        );
+        assert_ne!(victim_sk, rogue_sk, "fixture: two distinct holders");
+
+        // One deposit shape, registering `victim_pk`, with the PoP signed by
+        // whichever secret key is handed in — the ONLY difference between the
+        // attack and its control.
+        let deposit_with_pop_from = |pop_sk: &[u8]| -> PosTransaction {
+            let mut tx = PosTransaction::FundedDeposit {
+                inputs: vec![TransferInput {
+                    txid: [0x77u8; 32],
+                    vout: 0,
+                    pubkey: owner_pk.clone(),
+                    signature: Vec::new(),
+                }],
+                change: vec![TransferOutput { value: 5, script_hash: [0x44u8; 32] }],
+                pubkey: victim_pk.clone(),
+                amount_sat: 25_000 * 100_000_000,
+                randao_commitment: [0x55u8; 32],
+                withdrawal_credentials: vec![0x66u8; 32],
+                commission_bps: 500,
+                proof_of_possession: Vec::new(),
+                tx_bytes: 20_000,
+                tip_millisat_per_gas: 0,
+            };
+            // PoP first — the spend root covers it.
+            let pop_root = tx
+                .funded_deposit_pop_signing_root()
+                .expect("the fixture keeps the well-formed shape");
+            let pop = bloch_crypto::crypto::sign(pop_sk, &pop_root).expect("sign the PoP root");
+            if let PosTransaction::FundedDeposit { proof_of_possession, .. } = &mut tx {
+                *proof_of_possession = pop;
+            }
+            // Then the coin owner's spend signature, honestly, over the root
+            // that covers that PoP.
+            let spend_root = tx.spend_signing_root();
+            let sig =
+                bloch_crypto::crypto::sign(&owner_sk, &spend_root).expect("sign the spend root");
+            if let PosTransaction::FundedDeposit { inputs, .. } = &mut tx {
+                inputs[0].signature = sig;
+            }
+            tx
+        };
+
+        // CONTROL FIRST: the key's true holder signs the PoP and the deposit
+        // is admissible. Without this, the refusal below could be any of a
+        // dozen unrelated rules.
+        let honest = deposit_with_pop_from(&victim_sk);
+        assert!(
+            admissible(&honest, FUNDED_FLAG_DAY).is_ok(),
+            "control: the true holder's deposit must be admissible"
+        );
+
+        // THE ATTACK: identical bytes but for a PoP signed by a key the
+        // registry was never asked about. The squatter's signature is
+        // cryptographically perfect — it is simply not the victim's.
+        let squat = deposit_with_pop_from(&rogue_sk);
+        let err = admissible(&squat, FUNDED_FLAG_DAY)
+            .expect_err("coin must not bond to a key the payer does not hold");
+        assert!(
+            err.contains("possession"),
+            "the refusal must be the possession one, not an incidental rule: {err}"
+        );
+
+        // The spend half is untouched by the attack — the coins really were
+        // authorised — which is what makes this a REGISTRATION failure and
+        // proves the PoP check, not the spend check, is what refused.
+        let PosTransaction::FundedDeposit { inputs, .. } = &squat else { unreachable!() };
+        assert!(
+            bloch_crypto::crypto::verify(
+                &inputs[0].pubkey,
+                &squat.spend_signing_root(),
+                &inputs[0].signature,
+            ),
+            "the squatter's spend signature is valid — only possession failed"
         );
     }
 }
