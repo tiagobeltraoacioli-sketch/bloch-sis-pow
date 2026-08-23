@@ -941,12 +941,27 @@ impl Engine {
                         std::process::exit(1);
                     }
                     let after = self.state.finality();
+                    // The head root is FREE here, and it used to cost a whole
+                    // state-root computation.
+                    //
+                    // `apply_block` returns `Ok(post)` on exactly one
+                    // condition: `post.compute_root() == header.state_root`
+                    // (transition.rs step 12). `self.state` IS that `post`.
+                    // So the header field printed here is bit-for-bit the
+                    // value `self.state.state_root()` recomputed — the same
+                    // number, from the check that already ran, instead of a
+                    // second full walk of the state tree for a log line.
+                    //
+                    // A proposer paid this three times a slot: once stamping
+                    // its own header, once inside `apply_block`'s check, and
+                    // once here. This is the third one, deleted. The other
+                    // two are the producer=validator seam and must both stay.
                     println!(
                         "[slot {}] applied {} by v{} — head root {}, justified e{}, finalized e{}",
                         env.header.slot,
                         crate::codec::hex8(id.as_bytes()),
                         env.header.proposer_index,
-                        crate::codec::hex8(&self.state.state_root()),
+                        crate::codec::hex8(&env.header.state_root),
                         after.justified.epoch,
                         after.finalized.epoch,
                     );
@@ -1069,13 +1084,26 @@ impl Engine {
                 eprintln!("FATAL: block log rewrite failed: {e}");
                 std::process::exit(1);
             }
+            // Free for the same reason as `apply_canonical`'s: every block
+            // in `branch` passed `apply_block`, so the adopted head's header
+            // carries the post-state root already checked against it. Only a
+            // reorg to an EMPTY branch has no header to read it from, and
+            // only when the ancestor is genesis is it not in `blocks`.
+            let head_root = match branch.last() {
+                Some(env) => env.header.state_root,
+                None => self
+                    .blocks
+                    .get(&ancestor)
+                    .map(|env| env.header.state_root)
+                    .unwrap_or_else(|| self.state.state_root()),
+            };
             println!(
                 "REORG: adopted branch of {} blocks at ancestor {} (head slot {} -> {}), root {}",
                 branch.len(),
                 crate::codec::hex8(&ancestor),
                 old_head,
                 self.head_slot_now(),
-                crate::codec::hex8(&self.state.state_root()),
+                crate::codec::hex8(&head_root),
             );
             // A reorg can move the finalized root at the anchor's epoch.
             self.enforce_ws_anchor();
@@ -3099,6 +3127,308 @@ mod transfer_v2_end_to_end {
             e2.message.contains("retry later"),
             "a full mempool SHOULD advise retrying: {}",
             e2.message
+        );
+    }
+}
+
+/// A real, proposing `Engine`, for tests that must drive the actual block
+/// path rather than a stand-in.
+///
+/// One genesis validator whose hybrid key this node holds, so this node is
+/// the proposer AND the whole committee at every slot: `propose(slot)` always
+/// fires and the block it builds is validated by the real
+/// `Transition::apply_block` under the real ML-DSA-65 ‖ Falcon-1024 verifier.
+/// That is what makes a claim measured here a claim about production code.
+#[cfg(test)]
+mod perf_support {
+    use super::*;
+    use crate::genesis::ManifestValidator;
+    use bloch_pos_committee::beacon::RandaoChain;
+
+    const SAT_PER_BLOCH: u128 = 100_000_000;
+
+    /// Throwaway data dir, deleted when the returned guard drops.
+    pub(super) struct TestDir(pub PathBuf);
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Build the engine. `slot_ms` and `genesis_time_ms` are irrelevant to
+    /// every path exercised here — `propose`, `ingest` and `do_reorg` all take
+    /// the slot as an argument and read no clock — so the manifest's cadence
+    /// is set to something plausible and then not depended upon.
+    pub(super) fn proposing_engine() -> (Engine, TestDir) {
+        static DIR_SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "bloch-pos-perf-{}-{}",
+            std::process::id(),
+            DIR_SEQ.fetch_add(1, Ordering::Relaxed),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create the test data dir");
+
+        let ks = Keystore::generate(&dir, 0).expect("generate a devnet keystore");
+        let manifest = Manifest {
+            genesis_time_ms: now_ms(),
+            slot_ms: 1_000,
+            validators: vec![ManifestValidator {
+                index: 0,
+                stake_sat: 200_000 * SAT_PER_BLOCH,
+                randao_commitment: RandaoChain::generate(ks.randao_seed).commitment(),
+                pubkey: ks.pubkey.clone(),
+                withdrawal_credentials: Vec::new(),
+                commission_bps: 0,
+            }],
+            cohort: Vec::new(),
+            carryover: None,
+            allocations: Vec::new(),
+            carryover_entries: Vec::new(),
+        };
+        let genesis_id = manifest.genesis_id();
+        let state = manifest.genesis_state();
+        let store = Store::open(&dir, &[0u8; 32]).expect("open the test store");
+        let (events, _rx) = mpsc::channel::<EngineEvent>();
+        let head_slot = Arc::new(AtomicU64::new(0));
+        let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let net = net::Net::Devnet(
+            net::start(
+                "127.0.0.1",
+                0, // ephemeral port: bind for real, listen to nobody
+                Vec::new(),
+                events,
+                dir.clone(),
+                head_slot.clone(),
+                inflight,
+            )
+            .expect("bind the devnet transport on an ephemeral port"),
+        );
+        let verifier = HybridVerifier::new(manifest.pubkeys());
+        let engine = Engine {
+            manifest,
+            state,
+            tr: Transition::new(verifier.clone()),
+            tr_probe: Transition::new(ProbeVerifier),
+            verifier,
+            keys: Some(ks),
+            blocks: BTreeMap::new(),
+            chain: vec![(0, genesis_id)],
+            canonical: BTreeSet::from([*genesis_id.as_bytes()]),
+            pool: BTreeMap::new(),
+            att_pool: AttestationPool::new(),
+            wall_slot: 0,
+            mempool: BTreeMap::new(),
+            store,
+            net,
+            head_slot,
+            live: true,
+            needs_sync: false,
+            last_applied_ms: now_ms(),
+            booted_ms: now_ms(),
+            ws_anchor: None,
+            ws_anchor_hard: false,
+            ws_conflict_reported: false,
+        };
+        (engine, TestDir(dir))
+    }
+}
+
+/// **Win 3's proof.** A proposer used to compute the whole committed state
+/// root THREE times for one slot; it now computes it twice, and the two that
+/// remain are the two that carry a rule.
+///
+/// The three were: stamping the header (`propose`, from the probe's
+/// post-state), the transition's own step-12 check inside `apply_block`, and
+/// a third for the `applied …` log line. The first two are the
+/// producer=validator seam — the producer must commit a root and then face
+/// the same check every peer will run — so neither may go. The third was a
+/// display of a number the second had already proved equal to
+/// `header.state_root`, which the log now prints directly.
+///
+/// The assertion is a COUNT, not a duration: it fails on the old code and
+/// passes on the new one on any box, at any load. A timing test would only
+/// have said "faster on this machine today".
+#[cfg(test)]
+mod root_budget_tests {
+    use super::*;
+    use bloch_pos_committee::transition::root_computations;
+
+    #[test]
+    fn a_proposer_spends_two_state_roots_per_slot_not_three() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+
+        let before = root_computations();
+        engine.propose(1);
+        let spent = root_computations() - before;
+
+        assert_eq!(
+            engine.chain.len(),
+            2,
+            "the harness must actually have produced and adopted a block — \
+             a proposer that produced nothing would spend no roots and pass \
+             this test for the wrong reason"
+        );
+        assert_eq!(
+            spent, 2,
+            "one proposed slot must cost exactly two state-root computations: \
+             the header stamp and the transition's step-12 check. Three means \
+             the log line's root came back; one means a check went missing."
+        );
+
+        // And the value the log prints is still the head's real root — the
+        // whole basis for deleting the computation.
+        let head = engine
+            .blocks
+            .get(engine.head_id().as_bytes())
+            .expect("the adopted block is stored");
+        let recomputed_before = root_computations();
+        assert_eq!(
+            head.header.state_root,
+            engine.state.state_root(),
+            "the header root the log now prints must equal the recomputed \
+             state root, or the log is lying about the head"
+        );
+        assert_eq!(
+            root_computations() - recomputed_before,
+            1,
+            "the check above must itself cost exactly one root, or the \
+             counter is not counting what this test claims it counts"
+        );
+    }
+
+    /// The same budget over several consecutive slots, so a one-off cannot
+    /// pass: `n` proposed slots cost exactly `2n` roots.
+    #[test]
+    fn the_budget_holds_across_consecutive_slots() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        let before = root_computations();
+        for slot in 1..=5 {
+            engine.propose(slot);
+        }
+        assert_eq!(
+            engine.chain.len(),
+            6,
+            "five proposed slots must land five blocks on genesis"
+        );
+        assert_eq!(
+            root_computations() - before,
+            10,
+            "five slots must cost ten state-root computations, not fifteen"
+        );
+    }
+}
+
+/// What the deleted work actually cost, on a state the size the fleet runs.
+///
+/// `#[ignore]`d: it is a measurement, not an assertion, and it builds a
+/// Genesis-3-sized balance set (hundreds of thousands of outputs), which is
+/// seconds of setup no ordinary test run should pay. Run it with
+/// `cargo test --release -p bloch-pos-node -- --ignored --nocapture bench_`.
+///
+/// A devnet state roots in microseconds; mainnet's does not, and the number
+/// that matters is mainnet's. The size below is the Genesis-3 carryover's own
+/// output count, so the figure is the fleet's, not a toy's.
+#[cfg(test)]
+mod bench {
+    use super::*;
+    use bloch_pos_committee::state_root::{EutxoEntry, EvmCommitment};
+    use std::time::Instant;
+
+    /// The Genesis-3 carryover's output count, per `CARRYOVER-SNAPSHOT.md`.
+    const MAINNET_EUTXOS: u32 = 452_133;
+
+    fn mainnet_sized_state(n: u32) -> CommittedState {
+        let entries: Vec<EutxoEntry> = (0..n)
+            .map(|i| EutxoEntry {
+                txid: {
+                    let mut t = [0u8; 32];
+                    t[..4].copy_from_slice(&i.to_le_bytes());
+                    t
+                },
+                vout: i % 8,
+                value: 8_400 * 100_000_000,
+                script_hash: {
+                    let mut h = [0u8; 32];
+                    h[..4].copy_from_slice(&(i % 4096).to_le_bytes());
+                    h
+                },
+            })
+            .collect();
+        CommittedState::genesis(
+            BlockId::of(&BlockHeaderV4 {
+                version: VERSION_G4,
+                parent: [0u8; 32],
+                state_root: [0u8; 32],
+                body_root: [0u8; 32],
+                slot: 0,
+                proposer_index: 0,
+                randao_reveal: [0u8; 32],
+                randao_mix: [0u8; 32],
+                justified_root: [0u8; 32],
+                finalized_root: [0u8; 32],
+                attestation_root: [0u8; 32],
+                coherence_root: [0u8; 32],
+            }),
+            GENESIS_MIX,
+            &[],
+            &[],
+            [0u8; 32],
+            [0u8; 32],
+            [0u8; 32],
+            EvmCommitment {
+                account_root: [0u8; 32],
+                receipts_root: [0u8; 32],
+                gas_used: 0,
+                base_fee_per_gas: 0,
+            },
+            &entries,
+        )
+    }
+
+    fn median(mut v: Vec<u128>) -> u128 {
+        v.sort_unstable();
+        v[v.len() / 2]
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_state_root() {
+        let st = mainnet_sized_state(MAINNET_EUTXOS);
+        let mut samples = Vec::new();
+        for _ in 0..7 {
+            let t = Instant::now();
+            let _ = st.state_root();
+            samples.push(t.elapsed().as_micros());
+        }
+        println!(
+            "state_root over {MAINNET_EUTXOS} eUTXOs: median {} us (min {}, max {})",
+            median(samples.clone()),
+            samples.iter().min().unwrap(),
+            samples.iter().max().unwrap()
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_clone_and_process_epoch() {
+        let st = mainnet_sized_state(MAINNET_EUTXOS);
+        let tr = Transition::new(ProbeVerifier);
+        let mut clones = Vec::new();
+        let mut rolls = Vec::new();
+        for _ in 0..7 {
+            let t = Instant::now();
+            let c = st.clone();
+            clones.push(t.elapsed().as_micros());
+            let t = Instant::now();
+            let _ = tr.process_epoch(&c).expect("infallible");
+            rolls.push(t.elapsed().as_micros());
+        }
+        println!(
+            "clone over {MAINNET_EUTXOS} eUTXOs: median {} us; process_epoch: median {} us",
+            median(clones),
+            median(rolls)
         );
     }
 }
