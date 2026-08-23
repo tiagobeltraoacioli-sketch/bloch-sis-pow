@@ -90,12 +90,16 @@ use crate::store::Store;
 /// state — rather than from a copy kept alongside it — is why this wrapper
 /// exists; see [`crate::rpc::EngineBackend`].
 pub enum EngineEvent {
-    /// A network event and its reservation in [`EngineQueue`]. The permit
-    /// travels WITH the event and is dropped at the end of the match arm that
-    /// handles it, so the quota measures work not yet done rather than events
-    /// not yet dequeued — which is what the old hand-written counter claimed
-    /// to do and did not.
-    Net(NetEvent, net::Permit),
+    /// A network event welded to its reservation in [`EngineQueue`].
+    ///
+    /// One field, not two, and the permit inside it is unreachable: the only
+    /// way to get at the event is [`net::Admission::handle`], which releases
+    /// the quota after the handler returns. The previous shape,
+    /// `Net(NetEvent, net::Permit)`, made the right thing merely CUSTOMARY —
+    /// `drop(permit); engine.ingest(env)` compiled, restored release-on-dequeue
+    /// (the semantics this commit calls a lie), and passed every test. It no
+    /// longer compiles.
+    Net(net::Admission),
     Rpc(RpcCall),
 }
 
@@ -172,11 +176,83 @@ fn forward_admitted(
 ) {
     for ev in net_rx {
         let bytes = ev.wire_bytes();
-        let Some(permit) = EngineQueue::admit_event(&queue, &ev, bytes) else {
+        let Some(adm) = EngineQueue::admit_event_owned(&queue, ev, bytes) else {
             continue; // shed: counted, and logged if the limiter allows
         };
-        if tx.send(EngineEvent::Net(ev, permit)).is_err() {
+        if tx.send(EngineEvent::Net(adm)).is_err() {
             return; // engine gone; nothing left to deliver to
+        }
+    }
+}
+
+/// A test-only vantage point INSIDE `Engine::ingest`.
+///
+/// "The permit is still held while the work runs" cannot be observed from
+/// outside the handler: by the time `drain_pending` returns, a correct
+/// implementation and one that released on dequeue look identical — both read
+/// zero. So the reading has to be taken from within `ingest` itself, and the
+/// only way to do that without putting a test field on `Engine` (whose
+/// constructors are consensus code) is a thread-local the test installs and the
+/// node binary never compiles.
+#[cfg(test)]
+mod ingest_witness {
+    use super::*;
+    use std::cell::RefCell;
+    use std::sync::atomic::AtomicUsize;
+
+    thread_local! {
+        static WITNESS: RefCell<Option<(Arc<EngineQueue>, Arc<AtomicUsize>)>> =
+            const { RefCell::new(None) };
+    }
+
+    /// Watch `queue` for the duration of `f`, returning the block-item count
+    /// seen at the top of `Engine::ingest`, or `None` if `ingest` never ran.
+    pub(super) fn watching<R>(queue: &Arc<EngineQueue>, f: impl FnOnce() -> R) -> (R, Option<usize>) {
+        let seen = Arc::new(AtomicUsize::new(usize::MAX));
+        WITNESS.with(|w| *w.borrow_mut() = Some((queue.clone(), seen.clone())));
+        let out = f();
+        WITNESS.with(|w| *w.borrow_mut() = None);
+        let v = seen.load(Ordering::Acquire);
+        (out, (v != usize::MAX).then_some(v))
+    }
+
+    pub(super) fn record() {
+        WITNESS.with(|w| {
+            if let Some((q, seen)) = w.borrow().as_ref() {
+                seen.store(q.stats().block.items, Ordering::Release);
+            }
+        });
+    }
+}
+
+/// Handle one batch of dequeued events, in arrival order.
+///
+/// A free function taking `&mut Engine` rather than inline in `run`'s loop for
+/// one reason: `run` needs a live socket, a data directory and a validator key,
+/// so nothing inside it could be tested, and "the quota is still held while
+/// `ingest` runs" is exactly the property that has to be tested at this level
+/// rather than asserted in a comment. See
+/// `quota_holding_tests::the_quota_is_held_while_the_engine_does_the_work`.
+///
+/// Ordering is untouched: one channel, drained into one `Vec`, handled front to
+/// back. Splitting the queue by class would reorder attestations against blocks
+/// and so change which votes are in the pool when LMD-GHOST runs, which is a
+/// consensus change; splitting the ADMISSION TEST, which is what `EngineQueue`
+/// does, leaves this loop exactly as it was.
+fn drain_pending(engine: &mut Engine, pending: Vec<EngineEvent>, wall_epoch: u64) {
+    for ev in pending {
+        match ev {
+            // No release step, and no permit binding to mis-order: the
+            // `Admission` owns its reservation and hands it back after
+            // `on_net` returns. The version this replaces destructured the
+            // permit here, which made releasing early a one-word edit.
+            EngineEvent::Net(adm) => engine.on_net(adm, wall_epoch),
+            EngineEvent::Rpc(call) => {
+                let result = engine.serve_rpc(call.req);
+                // A client that hung up between asking and being answered is
+                // normal, not an error worth logging.
+                let _ = call.reply.send(result);
+            }
         }
     }
 }
@@ -193,7 +269,7 @@ const NO_TXS: [PosTransaction; 0] = [];
 /// Ceiling on mempool entries. Not a policy — a bound, so an unauthenticated
 /// devnet transport cannot turn into unbounded memory. Real admission control
 /// (fees, per-sender limits, eviction by price) is `gossip.rs` work.
-const MEMPOOL_MAX: usize = 4_096;
+pub(crate) const MEMPOOL_MAX: usize = 4_096;
 
 /// Transactions a proposal will carry at most, independent of the consensus
 /// byte cap it is also checked against.
@@ -717,9 +793,36 @@ impl Engine {
         self.net.broadcast(net::block_frame(&env));
     }
 
+    // ── Network events ─────────────────────────────────────────────────────
+
+    /// Handle one admitted network event with its quota still held.
+    ///
+    /// `Admission::handle` is the only way to reach the event, and it drops the
+    /// permit after this closure returns — so the quota measures work not yet
+    /// DONE, which is what the old hand-written counter claimed and did not do.
+    /// There is no binding here that a later edit could drop early; that is the
+    /// point of the type.
+    fn on_net(&mut self, adm: net::Admission, wall_epoch: u64) {
+        adm.handle(|ev| match ev {
+            NetEvent::Block(env) => self.ingest(env),
+            NetEvent::Attestation(att, origin) => self.on_attestation(att, origin, wall_epoch),
+            // Gossip has nobody to answer to; the verdict is the RPC's
+            // concern, not a peer's.
+            NetEvent::Transaction(tx) => {
+                let _ = self.on_transaction(tx);
+            }
+        })
+    }
+
     // ── Block ingestion: store, then advance canonical as far as possible ──
 
     fn ingest(&mut self, env: BlockEnvelope) {
+        // Tests install a witness here to read the queue from INSIDE the
+        // handler — the only vantage point from which "the permit is still
+        // held while the work runs" is observable at all. Compiled out of the
+        // node binary entirely.
+        #[cfg(test)]
+        ingest_witness::record();
         let id = *env.block_id().as_bytes();
         if self.blocks.contains_key(&id) || self.canonical.contains(&id) {
             return;
@@ -1949,30 +2052,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
                 while let Ok(more) = rx.try_recv() {
                     pending.push(more);
                 }
-                for ev in pending {
-                    // No release step: each `Net` event carries its permit, and
-                    // binding it in the arm holds the quota until the arm ends
-                    // — after the work, not on dequeue. The version this
-                    // replaces subtracted here, before the `match`, under a
-                    // comment claiming the opposite.
-                    match ev {
-                        EngineEvent::Net(NetEvent::Block(env), _permit) => engine.ingest(env),
-                        EngineEvent::Net(NetEvent::Attestation(att, origin), _permit) => {
-                            engine.on_attestation(att, origin, wall_epoch)
-                        }
-                        EngineEvent::Net(NetEvent::Transaction(tx), _permit) => {
-                            // Gossip has nobody to answer to; the verdict is the
-                            // RPC's concern, not a peer's.
-                            let _ = engine.on_transaction(tx);
-                        }
-                        EngineEvent::Rpc(call) => {
-                            let result = engine.serve_rpc(call.req);
-                            // A client that hung up between asking and being
-                            // answered is normal, not an error worth logging.
-                            let _ = call.reply.send(result);
-                        }
-                    }
-                }
+                drain_pending(&mut engine, pending, wall_epoch);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -2864,7 +2944,7 @@ mod transfer_v2_end_to_end {
     /// HOLDS `entries` — the outputs the sweep spends. `epochs_past` places
     /// `genesis_time_ms` so the node's real wall epoch is at least that
     /// (+2 slots of margin so the epoch cannot regress mid-test).
-    fn engine_at_wall_epoch(epochs_past: u64, entries: &[EutxoEntry]) -> Engine {
+    pub(super) fn engine_at_wall_epoch(epochs_past: u64, entries: &[EutxoEntry]) -> Engine {
         let slot_ms = 500u64;
         let back_ms = epochs_past
             .saturating_mul(SLOTS_PER_EPOCH)
@@ -3223,9 +3303,10 @@ mod libp2p_admission_tests {
         let out = forward(&queue, vec![attestation(1), NetEvent::Block(envelope(25_750))]);
         assert_eq!(out.len(), 1, "the attestation is shed, the block is not");
         match &out[0] {
-            EngineEvent::Net(NetEvent::Block(env), _) => {
-                assert_eq!(env.header.slot, 25_750)
-            }
+            EngineEvent::Net(adm) => match adm.peek() {
+                NetEvent::Block(env) => assert_eq!(env.header.slot, 25_750),
+                _ => panic!("the survivor must be the block"),
+            },
             _ => panic!("the survivor must be the block"),
         }
         assert_eq!(queue.stats().attestation.shed, 1, "and the shed attestation is counted");
@@ -3269,5 +3350,107 @@ mod libp2p_admission_tests {
         let s = queue.stats();
         assert_eq!(s.block.items + s.attestation.items, 0, "and the permits give it all back");
         assert_eq!(s.block.bytes + s.attestation.bytes, 0);
+    }
+}
+
+/// **N2, at the level where N2 lived.** The engine's own dequeue path must hold
+/// the quota until the handler is done.
+///
+/// The net-level test (`net::queue_tests::the_quota_is_held_while_the_work_runs`)
+/// pins `Admission::handle`. This one pins the CALL SITE — `drain_pending`, the
+/// function extracted out of `run`'s loop — because that is where the surviving
+/// mutation lived: `drop(permit); engine.ingest(env)` was a one-word edit
+/// against the old two-field variant, restored the release-on-dequeue semantics
+/// the commit message calls a lie, and passed all 520 tests.
+///
+/// It cannot pass now for two independent reasons, which is the point of having
+/// both: `EngineEvent::Net` carries a single opaque `Admission` with a private
+/// permit, so the mutation no longer compiles; and if someone reintroduced an
+/// early release inside `Admission::handle` — where it would still compile —
+/// this test reads 0 where it demands 1.
+#[cfg(test)]
+mod quota_holding_tests {
+    use super::*;
+    use bloch_pos_committee::header::{BlockEnvelope, BlockHeaderV4, Body};
+    use crate::net::Class;
+
+    /// The cheapest envelope `ingest` accepts, which is itself the finding:
+    /// two commitment roots over empty vectors — fixed constants an attacker
+    /// copies — and a non-zero slot. No signature is checked before this is
+    /// stored. See the note on `BLOCK_ITEMS_PER_CONN`.
+    fn cheap_block(slot: u64) -> BlockEnvelope {
+        BlockEnvelope {
+            header: BlockHeaderV4 {
+                version: bloch_pos_committee::header::VERSION_G4,
+                parent: [7u8; 32],
+                state_root: [0u8; 32],
+                body_root: derive::body_root(&[]),
+                slot,
+                proposer_index: 0,
+                randao_reveal: [0u8; 32],
+                randao_mix: [0u8; 32],
+                justified_root: [0u8; 32],
+                finalized_root: [0u8; 32],
+                attestation_root: derive::attestation_root(&[]),
+                coherence_root: [0u8; 32],
+            },
+            proposer_sig: vec![1u8; 32],
+            body: Body { attestations: Vec::new(), transactions: Vec::new() },
+        }
+    }
+
+    #[test]
+    fn the_quota_is_held_while_the_engine_does_the_work() {
+        let mut engine = transfer_v2_end_to_end::engine_at_wall_epoch(0, &[]);
+        let queue = engine.queue.clone();
+
+        let ev = NetEvent::Block(cheap_block(4));
+        let adm = EngineQueue::admit_event_owned(&queue, ev, 700)
+            .expect("an empty queue admits");
+        assert_eq!(queue.stats().block.items, 1, "queued, before any handling");
+
+        let (_, seen) = ingest_witness::watching(&queue, || {
+            drain_pending(&mut engine, vec![EngineEvent::Net(adm)], 0);
+        });
+
+        assert_eq!(
+            seen,
+            Some(1),
+            "the block quota must still be held at the top of ingest — reading 0 here is \\
+             exactly the release-on-dequeue semantics this commit calls a lie, and None \\
+             means ingest never ran at all"
+        );
+
+        // CONTROL: it is given back. Without this half, a permit that simply
+        // leaked would satisfy the assertion above and quietly shrink the quota
+        // for the life of the process — the shape of the original underflow.
+        let after = queue.stats().block;
+        assert_eq!(after.items, 0, "and returned once the handler is done");
+        assert_eq!(after.bytes, 0);
+
+        // And the work really happened: the block is in the engine.
+        assert_eq!(engine.blocks.len(), 1, "ingest must have stored the block");
+    }
+
+    /// The CONTROL for the control: an event the engine SHEDS must not leave
+    /// quota behind either. A test that only ever admits cannot tell a
+    /// balanced ledger from one that never gets tested on the refusal path.
+    #[test]
+    fn a_shed_block_leaves_no_quota_behind() {
+        let queue = Arc::new(EngineQueue::new());
+        let _full: Vec<_> = (0..1024usize)
+            .filter_map(|_| EngineQueue::admit(&queue, Class::Block, 700))
+            .collect();
+        assert_eq!(_full.len(), 1024);
+
+        let before = queue.stats().block;
+        assert!(
+            EngineQueue::admit_event_owned(&queue, NetEvent::Block(cheap_block(5)), 700).is_none(),
+            "a full block class must refuse"
+        );
+        let after = queue.stats().block;
+        assert_eq!(after.items, before.items, "a refusal must consume no item");
+        assert_eq!(after.bytes, before.bytes, "and no bytes");
+        assert_eq!(after.shed, before.shed + 1, "and must be counted");
     }
 }
