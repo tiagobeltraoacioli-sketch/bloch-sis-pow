@@ -93,7 +93,19 @@ pub const BLOCK_TX_BYTES_TARGET_V2: u64 = MAX_BLOCK_TX_BYTES_V2 / 2;
 /// header slot: a cap read from node-local state is how a fleet on one binary
 /// splits.
 pub const fn max_block_tx_bytes(epoch: u64) -> u64 {
-    if epoch < crate::params::BLOCK_BYTES_V2_ACTIVATION_EPOCH {
+    max_block_tx_bytes_at(epoch, crate::params::BLOCK_BYTES_V2_ACTIVATION_EPOCH)
+}
+
+/// [`max_block_tx_bytes`] with the flag day supplied instead of read.
+///
+/// The test seam described on [`crate::params::FlagDays`]. `max_block_tx_bytes`
+/// is this with the shipped constant, and consensus reaches it only that way —
+/// the parameter exists so a test can put a block on both sides of a flag day
+/// it chose, which is the only arrangement in which this comparison's answer
+/// depends on `epoch` at all. Ship this gate at `u64::MAX` and no test could
+/// observe whether `epoch` was the block's or the machine's.
+pub const fn max_block_tx_bytes_at(epoch: u64, flag_day: u64) -> u64 {
+    if epoch < flag_day {
         MAX_BLOCK_TX_BYTES
     } else {
         MAX_BLOCK_TX_BYTES_V2
@@ -104,7 +116,16 @@ pub const fn max_block_tx_bytes(epoch: u64) -> u64 {
 /// [`max_block_tx_bytes`] at the same epoch — pinned by
 /// `target_is_half_the_cap_in_both_eras`.
 pub const fn block_tx_bytes_target(epoch: u64) -> u64 {
-    if epoch < crate::params::BLOCK_BYTES_V2_ACTIVATION_EPOCH {
+    block_tx_bytes_target_at(epoch, crate::params::BLOCK_BYTES_V2_ACTIVATION_EPOCH)
+}
+
+/// [`block_tx_bytes_target`] with the flag day supplied instead of read — the
+/// companion seam to [`max_block_tx_bytes_at`]. The cap and the target move on
+/// ONE switch (see the constant's docs), so they take one flag day, and a test
+/// that moved only one of them would be testing a state mainnet can never be
+/// in.
+pub const fn block_tx_bytes_target_at(epoch: u64, flag_day: u64) -> u64 {
+    if epoch < flag_day {
         BLOCK_TX_BYTES_TARGET
     } else {
         BLOCK_TX_BYTES_TARGET_V2
@@ -240,13 +261,35 @@ pub struct BlockUsage {
 /// fee carries over unchanged, which under-reacts to demand spikes during
 /// outages and is preferred to any clock-dependent rule.
 pub const fn next_base_fee(parent_base_fee: u128, parent: BlockUsage, epoch: u64) -> u128 {
+    next_base_fee_gated(
+        parent_base_fee,
+        parent,
+        epoch,
+        crate::params::BLOCK_BYTES_V2_ACTIVATION_EPOCH,
+    )
+}
+
+/// [`next_base_fee`] with the byte-cap flag day supplied instead of read.
+///
+/// Threaded for the reason a half-threaded seam is worse than none: the cap
+/// and the target are ONE switch, so a `compute_post_state_gated` that gated
+/// the cap and left the price reading the shipped constant would put a test
+/// fixture in a state mainnet cannot reach — a 512 KiB cap priced against a
+/// 128 KiB target — and any assertion about the price in that fixture would be
+/// about the fixture, not about the chain.
+pub const fn next_base_fee_gated(
+    parent_base_fee: u128,
+    parent: BlockUsage,
+    epoch: u64,
+    block_bytes_v2_flag_day: u64,
+) -> u128 {
     // The byte target is epoch-gated (`BLOCK_BYTES_V2_ACTIVATION_EPOCH`), so it
     // is read here rather than named as a constant. `epoch` is the epoch the
     // price will be CHARGED in, not the parent's: at the flag-day boundary the
     // parent's usage was produced under the old cap, but the block this price
     // applies to lives under the new one, and pricing it against the old target
     // would read a legal 300 KiB block as 2.3x over target.
-    let byte_target = block_tx_bytes_target(epoch);
+    let byte_target = block_tx_bytes_target_at(epoch, block_bytes_v2_flag_day);
     // Which axis is more utilised: gas/GT >= bytes/BT  <=>  gas*BT >= bytes*GT.
     let gas_cross = parent.gas_used as u128 * byte_target as u128;
     let bytes_cross = parent.tx_bytes as u128 * BLOCK_GAS_TARGET as u128;

@@ -108,9 +108,15 @@ pub const LEAKED_ROSTER_ACTIVATION_EPOCH: u64 = u64::MAX;
 /// Flag-day epoch at which the deduplicated transfer format (`TransferV2`,
 /// wire tag `0x06`) becomes acceptable in blocks.
 ///
-/// `u64::MAX` means INERT: every node ships the decoder and the apply path
-/// and none of it changes what a block may carry until this constant is
-/// lowered and the fleet is rebuilt together. Same idiom as
+/// **ARMED at epoch 800, and epoch 800 is behind the chain** (mainnet was in
+/// epoch 815 on 2026-08-21). The paragraph that used to stand here said
+/// "`u64::MAX` means INERT" and described a gate that had already fired — the
+/// doc was written for the disarmed value and never revisited when the value
+/// changed, which is precisely the drift `HISTORICAL_FLAG_DAYS`' tripwire now
+/// refuses. A node built from this source applies the V2 rules from its next
+/// block; a node still on a pre-arming binary rejects those bodies as
+/// `UnknownTag(0x06)`. That is a live partition risk for as long as any
+/// unrebuilt node remains, not a future one. Same idiom as
 /// `LEAKED_ROSTER_ACTIVATION_EPOCH` — a consensus rule arrives by flag day,
 /// never by whoever restarts first. The V1 format (tag `0x01`) stays valid
 /// forever; this gate only *adds* an encoding, it retires nothing.
@@ -160,10 +166,13 @@ pub const TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH: u64 = 800;
 /// cap — read as 2.3x over target and push the base fee up on a block that is
 /// not scarce at all.
 ///
-/// `u64::MAX` until the founder sets it. Below it every node computes the old
-/// cap and the old target, so a mixed fleet reaches one verdict on every
-/// block; at and above it they diverge on both, so **the fleet must be
-/// rebuilt before this constant is ever lowered**. Same idiom as
+/// **ARMED at epoch 800**, paired with the constant above (pinned by
+/// `transfer_v2_activation_is_paired_with_the_block_cap`) and, like it, behind
+/// the chain — the "u64::MAX until the founder sets it" this paragraph used to
+/// open with described the disarmed value and outlived it. Below the flag day
+/// every node computes the old cap and the old target, so a mixed fleet
+/// reaches one verdict on every block; at and above it they diverge on both,
+/// so **the fleet must be rebuilt before this constant is ever lowered**. Same idiom as
 /// [`LEAKED_ROSTER_ACTIVATION_EPOCH`], and the gate reads the epoch derived
 /// from the block's own header slot — never node-local state, which is what
 /// the 2026-08-08 `expected_bits` fork cost us.
@@ -235,7 +244,172 @@ pub const BLOCK_BYTES_V2_ACTIVATION_EPOCH: u64 = 800;
 /// rejects the first post-gate block as a decode error rather than a rule.
 /// Same precondition as the constant above: every validator rebuilt first,
 /// "the fleet is on the new binary" as a fact, not a hope.
+///
+/// # An epoch already behind the chain does NOT brick the fleet
+///
+/// Written here because the opposite was believed, and believing it makes the
+/// mistake easy: "a gate in the past just fails to fire, so the failure
+/// direction is a stopped fleet" reads as safe, and would have been recorded
+/// next to this constant as the reason a short rebuild window is tolerable. It
+/// is not what the code does. There is no boot-time check anywhere in this
+/// crate that a flag day is still ahead of the chain; every gate is a plain
+/// `epoch < FLAG_DAY` against the block being judged. Set below the chain's
+/// current epoch, this gate is simply LIVE on the next block, silently, on
+/// rebuilt nodes only.
+///
+/// For this constant specifically, the write-off line the founder picks
+/// decides the size of the damage, and both directions are unsafe:
+///
+/// - a materialisation keyed to CROSSING the boundary (`closing < gate &&
+///   next >= gate`) never crosses a gate already behind the chain, so the map
+///   of unbacked principal stays empty and a genesis withdrawal pays the full
+///   registered bond — 25,000 BLOCH x 64 = **1,600,000 BLOCH** that
+///   `Manifest::genesis_issued_sat()` never counted as issued;
+/// - a rule keyed to "deposited at or after the gate" retroactively
+///   reclassifies deposits that already happened as funded, making legacy
+///   bonds withdrawable.
+///
+/// So the number that matters when arming this is not "how long before the
+/// fleet bricks" — nothing bricks — but **how many epochs the fleet has to
+/// finish rebuilding before the chain reaches the epoch**, and an epoch
+/// already behind the chain has zero. `HISTORICAL_FLAG_DAYS` and the tripwire
+/// test beside it are what make arming this a deliberate act rather than a
+/// one-character edit; see their docs for the per-gate consequences.
 pub const FUNDED_STAKE_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+// ── The flag-day seam ───────────────────────────────────────────────────────
+
+/// Every flag-day epoch this crate gates a consensus rule on, in one value.
+///
+/// # Why this type exists at all
+///
+/// The four constants above are what mainnet runs. This struct is what TESTS
+/// run, and the difference is the whole point.
+///
+/// A gate is a comparison, `epoch < FLAG_DAY`. Two things decide its verdict:
+/// the flag day, and **where the epoch came from**. The second is the one that
+/// forks chains — reading it from a machine clock, a config file, or any other
+/// node-local source is the 2026-08-08 `expected_bits` defect exactly, where
+/// nodes running byte-identical binaries disagreed because the rule was
+/// derived from mutable local state instead of from the block under judgement.
+/// So every gate in this crate must read the epoch of the BLOCK BEING JUDGED,
+/// and something must be able to catch it if one stops.
+///
+/// Nothing could, for the gates shipped at `u64::MAX`. A test can only observe
+/// where a comparison read its left operand if the comparison's answer can
+/// CHANGE with that operand — and `x < u64::MAX` is true for every `x` a
+/// `u64` can hold, so a disarmed gate returns the same verdict whether it read
+/// the block's epoch, the wall clock, or a random number. Measured on this
+/// branch, 2026-08-22: replacing `epoch` with a wall-clock epoch inside
+/// `CommittedState::consensus_roster_at` — the `LEAKED_ROSTER_ACTIVATION_EPOCH`
+/// gate, shipped disarmed — leaves the crate at **393 passing, 0 failing**.
+/// The same substitution at the `TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH` gate,
+/// which is ARMED at 800, kills two tests immediately. Same rule, same code
+/// shape, same discipline in the comments; the armed one is protected and the
+/// disarmed one is not, and nothing about the source distinguishes them.
+///
+/// **A rule that survives its own deactivation is not protected.** This type
+/// is how a disarmed gate gets tested anyway: the consensus path takes its
+/// flag days as a VALUE rather than reading the constants, production passes
+/// [`FlagDays::MAINNET`] and nothing else does, and a test passes a flag day
+/// in the middle of a range it can put the state on both sides of.
+///
+/// # The test convention this type is useless without
+///
+/// A seam alone does not kill the mutation — it only makes killing it
+/// possible. A test that threads a flag day of `0` or `u64::MAX` through this
+/// struct is exactly as blind as one that read the constant, because both
+/// comparisons are constant-valued again. The convention, and
+/// `gate_source_probe` below is its worked example:
+///
+/// 1. pick a flag day in the MIDDLE of the representable range — never `0`,
+///    never `u64::MAX`, and never a value the wall clock could plausibly
+///    equal (a wall-clock epoch at 30 s slots and 32 slots/epoch is ~1.86e6
+///    today and rises; the tests here use values under 100);
+/// 2. exercise the state at `GATE - 1` and at `GATE`, and assert the verdicts
+///    DIFFER. The negative half without the control half proves nothing: a
+///    gate that refuses everything passes the negative half.
+///
+/// Then, and only then, substituting any other epoch source for the block's
+/// own flips one of the two halves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FlagDays {
+    /// See [`TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH`].
+    pub transfer_witness_dedup: u64,
+    /// See [`BLOCK_BYTES_V2_ACTIVATION_EPOCH`].
+    pub block_bytes_v2: u64,
+    /// See [`LEAKED_ROSTER_ACTIVATION_EPOCH`].
+    pub leaked_roster: u64,
+    /// See [`FUNDED_STAKE_ACTIVATION_EPOCH`].
+    pub funded_stake: u64,
+}
+
+impl FlagDays {
+    /// The flag days mainnet runs. The ONLY value any non-test caller may
+    /// construct: every public entry point in `transition` passes this and
+    /// nothing else, so the `_gated` forms below are a test seam and never a
+    /// second configuration surface. A node that could be handed a different
+    /// `FlagDays` at runtime would have re-created, in a nicer type, the very
+    /// thing this seam exists to make impossible — a consensus rule that
+    /// depends on something other than the block.
+    pub const MAINNET: FlagDays = FlagDays {
+        transfer_witness_dedup: TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH,
+        block_bytes_v2: BLOCK_BYTES_V2_ACTIVATION_EPOCH,
+        leaked_roster: LEAKED_ROSTER_ACTIVATION_EPOCH,
+        funded_stake: FUNDED_STAKE_ACTIVATION_EPOCH,
+    };
+
+    /// The four flag days as a list, for the invariants that must hold of
+    /// every one of them without naming any.
+    pub const fn all(&self) -> [u64; 4] {
+        [self.transfer_witness_dedup, self.block_bytes_v2, self.leaked_roster, self.funded_stake]
+    }
+}
+
+/// Flag days that mainnet has ALREADY CROSSED, frozen as history.
+///
+/// `armed_flag_days_are_disarmed_or_deliberate` refuses any armed flag day
+/// that is not in this list. Arming a new one therefore costs a deliberate
+/// edit here, next to the rule below, instead of a one-character change to a
+/// constant that nothing checks.
+///
+/// # A FLAG DAY IN THE PAST DOES NOT BRICK THE FLEET. IT CHANGES CONSENSUS RETROACTIVELY.
+///
+/// This is written out because the opposite was believed, and the opposite is
+/// the dangerous belief: "a gate already in the past just fails to activate,
+/// so the worst case is a stopped fleet" reads as a safe direction and would
+/// have been recorded here as one. It is not the behaviour. Every gate in this
+/// crate is a plain `epoch < FLAG_DAY` comparison against the epoch of the
+/// block being judged, with no boot-time check that the epoch has not already
+/// passed. Ship a flag day below the chain's current epoch and the new rule is
+/// live on the NEXT block, with no boundary crossing, no announcement and no
+/// error — while every node still on the old binary applies the old rule to
+/// the same block. That is a silent partition, not a halt, and the direction
+/// of the damage depends entirely on which rule was gated:
+///
+/// - `TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH` in the past: `0x06` bodies
+///   become valid immediately on rebuilt nodes and stay `UnknownTag(0x06)`
+///   decode failures on the rest. The two halves of the fleet disagree about
+///   whether a block exists.
+/// - `BLOCK_BYTES_V2_ACTIVATION_EPOCH` in the past: rebuilt nodes accept
+///   512 KiB blocks the rest reject, and both halves also price every block
+///   differently, because the byte target moves with the cap.
+/// - `LEAKED_ROSTER_ACTIVATION_EPOCH` in the past: proposer draw and committee
+///   partition change for the same seed, so the two halves disagree about who
+///   was even allowed to propose. This is the worst of the four: it forks
+///   without any transaction having to be unusual.
+/// - `FUNDED_STAKE_ACTIVATION_EPOCH` in the past: whatever the funded-staking
+///   line ends up materialising at the gate crossing is materialised late or
+///   not at all, and any rule keyed to "deposited after the gate" retroactively
+///   reclassifies deposits that already happened. Sized on the fs-writeoff line
+///   at 25,000 BLOCH x 64 genesis bonds = **1,600,000 BLOCH** paid out against
+///   principal that `Manifest::genesis_issued_sat()` never counted as issued.
+///
+/// The window that matters is therefore not "how long until the fleet bricks"
+/// — nothing bricks — but **how long the fleet has to finish rebuilding before
+/// the chain reaches the epoch**, and a flag day already behind the chain has
+/// a window of zero.
+pub const HISTORICAL_FLAG_DAYS: [u64; 1] = [800];
 
 /// Domain separation tags (§6.1). Fixed 16 bytes, right-padded with zeros, so
 /// no tag can be a prefix of another.
@@ -316,3 +490,55 @@ pub const DS_COHERENCE: [u8; 16] = *b"BLCH4:COHERE\0\0\0\0";
 /// a predictable subset of the epoch committee.
 pub(crate) const ROLE_SLOT: u8 = 0x01;
 pub(crate) const ROLE_EPOCH: u8 = 0x02;
+
+#[cfg(test)]
+mod flag_day_tripwire {
+    use super::{FlagDays, HISTORICAL_FLAG_DAYS};
+
+    /// THE TRIPWIRE. Every flag day mainnet ships is either disarmed
+    /// (`u64::MAX`) or listed in [`HISTORICAL_FLAG_DAYS`] as one the chain has
+    /// already crossed.
+    ///
+    /// Lowering a constant to an epoch — any epoch — now fails the build until
+    /// someone also writes that epoch down here, and the doc on
+    /// `HISTORICAL_FLAG_DAYS` is what they have to read to do it. That is the
+    /// entire mechanism: a flag day cannot be armed by a one-character edit
+    /// that no test looks at, which is how `flagday/epoch-800` came to claim
+    /// an arming its code never performed.
+    ///
+    /// It deliberately does NOT assert "the epoch is in the future". Nothing
+    /// in this crate knows what epoch the chain is on — that is a fact about a
+    /// running network, not about the code — and a test that hard-coded one
+    /// would be stale the day after it was written. The floor that a real
+    /// arming needs (chain epoch at arming time, plus a fleet-rebuild window
+    /// in epochs) is a founder input; see the note in the task log. What this
+    /// test buys is that the input is REQUIRED before an arming compiles,
+    /// rather than optional after it ships.
+    #[test]
+    fn armed_flag_days_are_disarmed_or_deliberate() {
+        for (i, day) in FlagDays::MAINNET.all().into_iter().enumerate() {
+            assert!(
+                day == u64::MAX || HISTORICAL_FLAG_DAYS.contains(&day),
+                "flag day #{i} is armed at epoch {day}, which is not a crossed flag day. \
+                 Arming a gate is a fleet-wide, un-rollback-able act: add {day} to \
+                 HISTORICAL_FLAG_DAYS only once the fleet is rebuilt AND the epoch is \
+                 ahead of the chain - a flag day already behind the chain does not brick \
+                 the fleet, it silently partitions it (see HISTORICAL_FLAG_DAYS docs)."
+            );
+        }
+    }
+
+    /// `MAINNET` is the constants and nothing else. Pinned because the whole
+    /// safety argument for the `_gated` seam is "production passes exactly
+    /// this value": a `MAINNET` that drifted from the constants would make the
+    /// seam a second configuration surface instead of a test hook.
+    #[test]
+    fn mainnet_flag_days_are_the_shipped_constants() {
+        let f = FlagDays::MAINNET;
+        assert_eq!(f.transfer_witness_dedup, super::TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH);
+        assert_eq!(f.block_bytes_v2, super::BLOCK_BYTES_V2_ACTIVATION_EPOCH);
+        assert_eq!(f.leaked_roster, super::LEAKED_ROSTER_ACTIVATION_EPOCH);
+        assert_eq!(f.funded_stake, super::FUNDED_STAKE_ACTIVATION_EPOCH);
+        assert_eq!(f.all().len(), 4, "a new flag day must join all() or the tripwire skips it");
+    }
+}
