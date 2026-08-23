@@ -206,7 +206,11 @@ fn test_transfer(inputs: u32, tx_bytes: u64, tip: u128) -> PosTransaction {
 fn getchaininfo_reports_slot_epoch_head_root_and_both_checkpoints() {
     let st = state_with_balances();
     let head = st.head();
-    let v = chain_info_json(&st, &head, 0, Some(0), 12, 2, 3, 0);
+    // Handed in, as `Engine::head_state_root` hands it in — and pinned below
+    // against `st.state_root()`, so this test still fails if the field ever
+    // stops being the committed root of the state the rest of the object
+    // describes.
+    let v = chain_info_json(&st, &head, st.state_root(), 0, Some(0), 12, 2, 3, 0);
 
     assert_eq!(v.get("slot").unwrap().as_u64(), Some(0));
     assert_eq!(v.get("epoch").unwrap().as_u64(), Some(0));

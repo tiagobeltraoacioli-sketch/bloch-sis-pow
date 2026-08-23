@@ -1171,6 +1171,15 @@ fn respond(sock: &mut TcpStream, status: u16, body: &str) -> io::Result<()> {
 pub fn chain_info_json(
     state: &CommittedState,
     head: &BlockId,
+    // The committed root at `head`, HANDED IN rather than derived from
+    // `state`. It used to be `state.state_root()` on this line, which is a
+    // full walk of the committed state tree — 733 ms at Genesis-4's carryover
+    // size — run on the consensus thread once per caller. See
+    // `Engine::head_state_root` for why the head block's header already holds
+    // exactly this value and what happens at genesis, where there is no header
+    // to hold it. The value is unchanged for every input; only who computes it
+    // is.
+    state_root: [u8; 32],
     height: u64,
     finalized_height: Option<u64>,
     wall_slot: u64,
@@ -1191,7 +1200,7 @@ pub fn chain_info_json(
         ("epoch", Json::u(epoch_of(slot))),
         ("slot_in_epoch", Json::u(slot % SLOTS_PER_EPOCH)),
         ("slots_per_epoch", Json::u(SLOTS_PER_EPOCH)),
-        ("state_root", Json::hex(&state.state_root())),
+        ("state_root", Json::hex(&state_root)),
         (
             "justified",
             Json::obj(vec![
