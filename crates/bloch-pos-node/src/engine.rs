@@ -4093,9 +4093,33 @@ mod reorg_state_tests {
             "after giving the block back the head is the fork point"
         );
 
+        // Take the rival OUT of the block store while the canonical branch is
+        // built.
+        //
+        // Not tidiness — determinism. `propose` ends in `ingest`, which runs
+        // fork choice over every stored block; the rival and the new block are
+        // siblings with no attestations, so LMD-GHOST breaks a zero-weight tie
+        // by block id, and the id depends on this run's throwaway keystore.
+        // Left in, the fixture re-adopts the rival on some runs and the test
+        // then compares a state against itself. It was caught by the
+        // `assert_ne!` fixture guard below, which is the entire reason that
+        // guard is there.
+        let rival_id = *rival.block_id().as_bytes();
+        engine
+            .blocks
+            .remove(&rival_id)
+            .expect("the rival is stored until this line removes it");
+
         for slot in 3..3 + depth {
             engine.propose(slot);
         }
+
+        // Back in: the test needs it stored to reorg onto it.
+        engine.blocks.insert(rival_id, rival.clone());
+        assert!(
+            !engine.canonical.contains(&rival_id),
+            "the rival must be off the canonical chain when the fixture is handed over"
+        );
         assert_eq!(
             engine.chain.len() as u64,
             2 + depth,
