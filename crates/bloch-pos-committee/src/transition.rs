@@ -928,6 +928,29 @@ pub struct GenesisValidator {
     pub commission_bps: u128,
 }
 
+thread_local! {
+    /// How many times [`CommittedState::compute_root`] has run **on this
+    /// thread**.
+    ///
+    /// **Observability only.** No consensus rule reads it, nothing branches on
+    /// it, and it is never committed — it exists so a test can assert *how
+    /// many* state roots one slot costs, which is a claim timing cannot make
+    /// honestly on a loaded box.
+    ///
+    /// Per-thread and not a process-wide atomic for two reasons: the consensus
+    /// engine is one thread by construction (that is this node's whole
+    /// design), and `cargo test` runs each test on its own thread — a shared
+    /// counter would make the assertion a race against every other test in the
+    /// binary. A thread-local bump on a path that already hashes an entire
+    /// state tree is not measurable.
+    static ROOT_COMPUTATION_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The calling thread's [`ROOT_COMPUTATION_COUNT`]. Observability only.
+pub fn root_computations() -> u64 {
+    ROOT_COMPUTATION_COUNT.with(|c| c.get())
+}
+
 /// The committed post-state of one block — [`StateTransition::State`].
 ///
 /// A plain value: `Clone` + `PartialEq`, no interior mutability, no handles.
@@ -1499,6 +1522,7 @@ impl CommittedState {
     /// gap the 2026-08-11 extension closed, and the field-coverage test at
     /// the bottom of this file exists to make that regression loud.
     fn compute_root(&self) -> [u8; 32] {
+        ROOT_COMPUTATION_COUNT.with(|c| c.set(c.get().wrapping_add(1)));
         let validators: Vec<CommittedValidatorRecord> = self
             .validators
             .values()

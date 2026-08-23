@@ -59,7 +59,7 @@
 //! and, on a devnet, free; when it stops being free the fix is an incremental
 //! store with a test proving it equals the rebuild, not a cache with a comment.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -161,6 +161,29 @@ const MEMPOOL_MAX: usize = 4_096;
 /// byte cap it is also checked against.
 const MAX_TXS_PER_BLOCK: usize = 256;
 
+/// How many recently-applied canonical post-states are retained so a reorg
+/// can start from the fork point instead of from genesis.
+///
+/// **This is a memory budget, and on this fleet memory is the binding
+/// constraint** — the boxes are already one-validator-per-host because they
+/// run out of RAM. A `CommittedState` is dominated by its eUTXO set (the
+/// Genesis-3 carryover is ~452k outputs) and two states share nothing
+/// structurally: MEASURED at 128 MB resident each, `--release`, on a
+/// Genesis-3-sized set. That is why this is two and not thirty-two.
+///
+/// Two costs ONE extra copy, not two. The newest entry is the live state
+/// itself — `apply_canonical` files the very `Arc` it just installed, so that
+/// slot is shared and free — and the one behind it is the single real copy.
+/// A depth-1 reorg needs the head's PARENT, so one retained ancestor is the
+/// smallest window that buys anything at all, and this is it.
+///
+/// Two is chosen against the reorgs that happen — depth 1, occasionally 2 —
+/// and NOT as a guess at the worst case. Everything deeper falls back to the
+/// replay from genesis this node has always done, which is what makes a small
+/// window safe rather than merely cheap: the window is an optimisation with a
+/// correct slow path underneath it, never a limit on what can be reorganised.
+const REORG_STATE_WINDOW: usize = 2;
+
 /// Decode a block body's transactions.
 ///
 /// A receiver MUST recompute the post-state from the same transactions the
@@ -178,9 +201,216 @@ fn body_transactions(env: &BlockEnvelope) -> Result<Vec<PosTransaction>, String>
         .collect()
 }
 
+/// The canonical committed state, plus the memo of epoch-rolled copies of it.
+///
+/// # Why this is a type and not two fields on `Engine`
+///
+/// The memo is a cache in front of a consensus derivation, which is the class
+/// of thing that split this network before: `expected_bits` was node-local
+/// state that two honest binaries could disagree about. A rolled state judges
+/// attestations against a committee; hand back one rolled from a state that
+/// has since moved and the node accepts votes from the wrong committee while
+/// its peers reject them. So the invalidation must not be something a future
+/// caller can forget.
+///
+/// It cannot be forgotten here, because `state` is private to this module and
+/// [`StateCell::set`] is the ONLY way to write it — and `set` both bumps the
+/// generation and empties the memo. There is no assignment path that skips
+/// either. Reads go through `Deref`, so every existing `self.state.foo()`
+/// still reads the live state and nothing else.
+///
+/// # The memo key, and why it is complete
+///
+/// The key is `(generation, epoch)`, and that is exactly the set of inputs:
+///
+/// 1. `rolled_to(epoch)` is a pure function of `(state, epoch)`. Its whole
+///    body is "clone the state, then apply `process_epoch` until the open
+///    epoch reaches `epoch`". `Transition::process_epoch` is
+///    `Ok(pre.close_epoch())` — it does not touch the injected verifier, reads
+///    no clock, opens no file, and `CommittedState` is a plain value with no
+///    interior mutability (its own type doc says so). Same state, same epoch,
+///    same bytes out, always.
+/// 2. `generation` identifies the state value. It starts at zero and is
+///    incremented by `set`, which is the only writer; two different states
+///    therefore never share a generation within a process.
+/// 3. Nothing else is read. Not the chain, not the block store, not the pool,
+///    not the wall clock — the function's signature is the proof, since it
+///    takes only the epoch and the rolling closure.
+///
+/// So `(generation, epoch)` determines the result, which is what "sound key"
+/// means. `set` clearing the memo is belt AND braces: even the entry that
+/// could not be returned is not left lying around.
+///
+/// This is deliberately NOT the fork-choice store's posture (rebuilt every
+/// call, module docs above). The difference is that a fork-choice store
+/// accumulates across messages and can therefore *drift*; a rolled state is a
+/// deterministic function of one value this type owns and can watch change.
+mod state_cell {
+    use std::cell::RefCell;
+    use std::ops::Deref;
+    use std::sync::Arc;
+
+    use bloch_pos_committee::epoch_of;
+    use bloch_pos_committee::interfaces::StateReader;
+    use bloch_pos_committee::transition::CommittedState;
+
+    /// Rolled epochs retained. `on_attestation` refuses anything outside
+    /// `{wall_epoch, wall_epoch + 1}`, and the head is normally in one of
+    /// them, so the live working set is one or two entries; four is slack for
+    /// a node whose head lags its wall clock. The memo is dropped whole on
+    /// every applied block anyway, so this bounds a burst, not a lifetime.
+    const MEMO_CAP: usize = 4;
+
+    struct Entry {
+        generation: u64,
+        epoch: u64,
+        rolled: Arc<CommittedState>,
+    }
+
+    pub(super) struct StateCell {
+        state: Arc<CommittedState>,
+        /// Bumped by `set`, which is the only writer of `state`.
+        generation: u64,
+        memo: RefCell<Vec<Entry>>,
+    }
+
+    impl StateCell {
+        pub(super) fn new(state: CommittedState) -> Self {
+            StateCell {
+                state: Arc::new(state),
+                generation: 0,
+                memo: RefCell::new(Vec::new()),
+            }
+        }
+
+        /// Replace the canonical state. The only writer, and the reason the
+        /// memo key is sound: it moves the generation and drops the memo in
+        /// the same breath, so no caller can advance the state and leave a
+        /// rolled copy of the old one reachable.
+        pub(super) fn set(&mut self, state: CommittedState) {
+            self.state = Arc::new(state);
+            self.generation = self.generation.wrapping_add(1);
+            self.memo.get_mut().clear();
+        }
+
+        /// Same, for a state that is already shared — the reorg path builds
+        /// its post-states behind `Arc` so the snapshot ring can keep one
+        /// without a copy. Identical bookkeeping: generation moves, memo
+        /// empties. There is no writer that does less.
+        pub(super) fn set_arc(&mut self, state: Arc<CommittedState>) {
+            self.state = state;
+            self.generation = self.generation.wrapping_add(1);
+            self.memo.get_mut().clear();
+        }
+
+        /// The live state as a shared handle, for the one caller that must
+        /// keep it alive alongside the cell (the reorg snapshot ring).
+        /// Ordinary reads go through `Deref` and stay borrows.
+        pub(super) fn arc(&self) -> Arc<CommittedState> {
+            Arc::clone(&self.state)
+        }
+
+        /// Which state this is. Test surface — the memo key's identity half,
+        /// exposed so a test can pin that it moves when the state does.
+        #[cfg(test)]
+        pub(super) fn generation(&self) -> u64 {
+            self.generation
+        }
+
+        /// Plant an entry in the memo by hand. TEST ONLY, and only so a test
+        /// can prove the generation half of the key is load-bearing: an entry
+        /// planted under a stale generation must never be returned, and the
+        /// same entry planted under the live one must be, or the test that
+        /// asserts the first is passing vacuously.
+        #[cfg(test)]
+        pub(super) fn plant(&self, generation: u64, epoch: u64, rolled: CommittedState) {
+            self.memo.borrow_mut().push(Entry {
+                generation,
+                epoch,
+                rolled: Arc::new(rolled),
+            });
+        }
+
+        /// The canonical state with epoch accounting rolled forward to
+        /// `epoch`, memoized on `(generation, epoch)`.
+        ///
+        /// `roll` is `process_epoch`, passed in rather than reached for, so
+        /// this module cannot read anything but the state it owns — the
+        /// signature IS the argument that the key is complete.
+        ///
+        /// Returns `Arc` rather than a clone because the callers only read
+        /// (duty roster, seed, finality view). On a Genesis-3-sized state the
+        /// clone alone was tens of milliseconds, per attestation.
+        pub(super) fn rolled_to<F>(&self, epoch: u64, roll: F) -> Arc<CommittedState>
+        where
+            F: Fn(&CommittedState) -> CommittedState,
+        {
+            // The canonical state's open epoch is its head's epoch — only
+            // `apply_block` advances it, and it rolls exactly there. Asking
+            // for that epoch or an earlier one is the identity, which is what
+            // the uncached loop did too (its `while cur < epoch` never ran).
+            let base_epoch = epoch_of(self.state.slot());
+            if epoch <= base_epoch {
+                return Arc::clone(&self.state);
+            }
+
+            let mut memo = self.memo.borrow_mut();
+            if let Some(hit) = memo
+                .iter()
+                .find(|e| e.generation == self.generation && e.epoch == epoch)
+            {
+                return Arc::clone(&hit.rolled);
+            }
+
+            // Roll from the furthest already-rolled epoch below the target
+            // instead of from the state — sound because that is precisely
+            // what the loop would have produced on the way there:
+            // `rolled(n + 1) == process_epoch(rolled(n))` by construction.
+            let mut cur_epoch = base_epoch;
+            let mut cur = Arc::clone(&self.state);
+            if let Some(best) = memo
+                .iter()
+                .filter(|e| {
+                    e.generation == self.generation && e.epoch > cur_epoch && e.epoch < epoch
+                })
+                .max_by_key(|e| e.epoch)
+            {
+                cur_epoch = best.epoch;
+                cur = Arc::clone(&best.rolled);
+            }
+            while cur_epoch < epoch {
+                cur = Arc::new(roll(&cur));
+                cur_epoch += 1;
+                memo.push(Entry {
+                    generation: self.generation,
+                    epoch: cur_epoch,
+                    rolled: Arc::clone(&cur),
+                });
+            }
+            // Evict the lowest epochs first: they are the cheapest to rebuild
+            // (fewest rolls from the base) and the least likely to be asked
+            // for again, since the traffic walks forward.
+            while memo.len() > MEMO_CAP {
+                memo.remove(0);
+            }
+            cur
+        }
+    }
+
+    impl Deref for StateCell {
+        type Target = CommittedState;
+
+        fn deref(&self) -> &CommittedState {
+            &self.state
+        }
+    }
+}
+
+use state_cell::StateCell;
+
 struct Engine {
     manifest: Manifest,
-    state: CommittedState,
+    state: StateCell,
     tr: Transition<HybridVerifier>,
     tr_probe: Transition<ProbeVerifier>,
     verifier: HybridVerifier,
@@ -203,6 +433,16 @@ struct Engine {
     chain: Vec<(u64, BlockId)>,
     /// Canonical ids (incl. genesis).
     canonical: BTreeSet<[u8; 32]>,
+    /// Post-states of the most recently applied canonical blocks, oldest
+    /// first, keyed by block id — [`REORG_STATE_WINDOW`] of them.
+    ///
+    /// Keyed by block id and NOT by height, which is what makes it survive a
+    /// reorg without an invalidation rule: a block's post-state is a pure
+    /// function of the block and its ancestry, and the id commits to that
+    /// ancestry transitively, so an entry can never be "the right height on
+    /// the wrong branch". A block that leaves the canonical chain and later
+    /// returns has the same post-state both times.
+    recent_states: VecDeque<([u8; 32], Arc<CommittedState>)>,
     /// Attestations available to fork choice and to the next proposal, keyed
     /// by content so duplicates collapse. This is the *aggregation* store.
     pool: BTreeMap<(u32, [u8; 32]), Attestation>,
@@ -313,13 +553,32 @@ impl Engine {
             .0
     }
 
-    /// Clone of the canonical state with epoch accounting rolled forward to
-    /// `epoch` — the exact rolling `apply_block` performs internally, so the
-    /// duty view here can never disagree with validation.
-    fn rolled_to(&self, epoch: u64) -> CommittedState {
-        let mut st = self.state.clone();
-        // Invariant: the canonical state's open epoch is its head's epoch —
-        // only apply_block advances it, and apply_block rolls exactly there.
+    /// The canonical state with epoch accounting rolled forward to `epoch` —
+    /// the exact rolling `apply_block` performs internally, so the duty view
+    /// here can never disagree with validation.
+    ///
+    /// Memoized on `(state generation, epoch)` by [`StateCell`], whose docs
+    /// carry the argument that the key is complete. It has to be: this is
+    /// called once per ARRIVING ATTESTATION (`judge`), it used to clone a
+    /// Genesis-3-sized state and re-run `process_epoch` every time, and most
+    /// of those attestations name the same epoch as the one before.
+    ///
+    /// Shared rather than cloned. Every caller reads — roster, seed, finality
+    /// view — and none mutates, which the `Arc` now enforces.
+    fn rolled_to(&self, epoch: u64) -> Arc<CommittedState> {
+        self.state.rolled_to(epoch, |st| {
+            self.tr
+                .process_epoch(st)
+                .expect("process_epoch is infallible")
+        })
+    }
+
+    /// The uncached derivation, kept verbatim as the reference the memo is
+    /// tested against. Not on any live path — if it ever grows a caller,
+    /// something has gone wrong with the one above.
+    #[cfg(test)]
+    fn rolled_to_uncached(&self, epoch: u64) -> CommittedState {
+        let mut st = (*self.state).clone();
         let mut cur = epoch_of(st.slot());
         while cur < epoch {
             st = self
@@ -993,7 +1252,11 @@ impl Engine {
             .apply_block(&self.state, &envelope, &env.body.attestations, &txs)
         {
             Ok(post) => {
-                self.state = post;
+                self.state.set(post);
+                // Snapshot for the reorg path. Free: this is the state that
+                // was just built, kept by handle, not copied.
+                let snapshot = self.state.arc();
+                self.remember_state(*id.as_bytes(), snapshot);
                 self.canonical.insert(*id.as_bytes());
                 self.chain.push((env.header.slot, id));
                 self.head_slot.store(env.header.slot, Ordering::Relaxed);
@@ -1028,12 +1291,27 @@ impl Engine {
                         std::process::exit(1);
                     }
                     let after = self.state.finality();
+                    // The head root is FREE here, and it used to cost a whole
+                    // state-root computation.
+                    //
+                    // `apply_block` returns `Ok(post)` on exactly one
+                    // condition: `post.compute_root() == header.state_root`
+                    // (transition.rs step 12). `self.state` IS that `post`.
+                    // So the header field printed here is bit-for-bit the
+                    // value `self.state.state_root()` recomputed — the same
+                    // number, from the check that already ran, instead of a
+                    // second full walk of the state tree for a log line.
+                    //
+                    // A proposer paid this three times a slot: once stamping
+                    // its own header, once inside `apply_block`'s check, and
+                    // once here. This is the third one, deleted. The other
+                    // two are the producer=validator seam and must both stay.
                     println!(
                         "[slot {}] applied {} by v{} — head root {}, justified e{}, finalized e{}",
                         env.header.slot,
                         crate::codec::hex8(id.as_bytes()),
                         env.header.proposer_index,
-                        crate::codec::hex8(&self.state.state_root()),
+                        crate::codec::hex8(&env.header.state_root),
                         after.justified.epoch,
                         after.finalized.epoch,
                     );
@@ -1069,25 +1347,54 @@ impl Engine {
         }
     }
 
-    /// Adopt `branch` (attached at canonical `ancestor`) by replaying the
-    /// whole candidate chain from genesis through the same transition. True
-    /// if adopted; false if a branch block failed validation (it is removed).
-    fn do_reorg(&mut self, ancestor: [u8; 32], branch: Vec<BlockEnvelope>) -> bool {
+    /// Keep a canonical block's post-state for the reorg path. Oldest out
+    /// first; see [`REORG_STATE_WINDOW`] for why the window is small.
+    fn remember_state(&mut self, id: [u8; 32], state: Arc<CommittedState>) {
+        self.recent_states.push_back((id, state));
+        while self.recent_states.len() > REORG_STATE_WINDOW {
+            self.recent_states.pop_front();
+        }
+    }
+
+    /// The committed post-state of a canonical block: from the snapshot ring
+    /// if it is still retained, otherwise by replaying to it.
+    ///
+    /// The two are the same value, and that is not an assumption — a block's
+    /// post-state is `apply_block` folded over its ancestry from genesis, the
+    /// fold is deterministic (the pure crate's whole posture), and both
+    /// branches here name the same block. The snapshot is that answer already
+    /// computed once; the replay recomputes it. Retention is therefore a
+    /// speed decision with no consensus content, which is exactly the
+    /// property `reorg_state_tests` pins.
+    fn state_at_canonical(&self, id: [u8; 32]) -> Arc<CommittedState> {
+        if let Some((_, st)) = self.recent_states.iter().find(|(bid, _)| *bid == id) {
+            return Arc::clone(st);
+        }
+        Arc::new(self.replay_to(id))
+    }
+
+    /// Rebuild a canonical block's post-state from genesis, re-executing the
+    /// whole prefix through the same transition.
+    ///
+    /// This is what `do_reorg` used to do unconditionally, kept whole. It is
+    /// now the fallback for a reorg deeper than [`REORG_STATE_WINDOW`], and
+    /// it is also the reference the snapshot path is tested against — the
+    /// slow path staying correct is what lets the fast path be small.
+    fn replay_to(&self, id: [u8; 32]) -> CommittedState {
         let cut = self
             .chain
             .iter()
-            .position(|(_, id)| id.as_bytes() == &ancestor)
-            .expect("ancestor is canonical");
+            .position(|(_, cid)| cid.as_bytes() == &id)
+            .expect("replay target is canonical");
         let prefix: Vec<BlockEnvelope> = self.chain[1..=cut]
             .iter()
-            .map(|(_, id)| {
+            .map(|(_, cid)| {
                 self.blocks
-                    .get(id.as_bytes())
+                    .get(cid.as_bytes())
                     .expect("canonical block stored")
                     .clone()
             })
             .collect();
-
         let mut st = self.manifest.genesis_state();
         for env in &prefix {
             let envelope = ProposalEnvelope {
@@ -1101,6 +1408,29 @@ impl Engine {
                 .apply_block(&st, &envelope, &env.body.attestations, &txs)
                 .expect("canonical prefix replay cannot fail (it applied before)");
         }
+        st
+    }
+
+    /// Adopt `branch`, attached at canonical `ancestor`. True if adopted;
+    /// false if a branch block failed validation (it is removed).
+    ///
+    /// **From the fork point, not from genesis.** This used to rebuild the
+    /// genesis state and re-execute the entire canonical prefix on every
+    /// reorg at any depth, so giving one block back and taking one cost a
+    /// full replay of the chain. The branch is still validated block by block
+    /// through the real `apply_block` — nothing about what gets adopted
+    /// changes; only where the fold starts does.
+    fn do_reorg(&mut self, ancestor: [u8; 32], branch: Vec<BlockEnvelope>) -> bool {
+        let cut = self
+            .chain
+            .iter()
+            .position(|(_, id)| id.as_bytes() == &ancestor)
+            .expect("ancestor is canonical");
+
+        let base = self.state_at_canonical(ancestor);
+        // Post-states of the branch, so the ring is refilled for the branch
+        // that just won without recomputing anything.
+        let mut applied: Vec<([u8; 32], Arc<CommittedState>)> = Vec::with_capacity(branch.len());
         for env in &branch {
             let envelope = ProposalEnvelope {
                 header: env.header.clone(),
@@ -1113,11 +1443,12 @@ impl Engine {
                     return false;
                 }
             };
+            let pre: &CommittedState = applied.last().map_or(&*base, |(_, st)| st);
             match self
                 .tr
-                .apply_block(&st, &envelope, &env.body.attestations, &txs)
+                .apply_block(pre, &envelope, &env.body.attestations, &txs)
             {
-                Ok(post) => st = post,
+                Ok(post) => applied.push((*env.block_id().as_bytes(), Arc::new(post))),
                 Err(err) => {
                     eprintln!(
                         "reorg candidate {} invalid at slot {}: {err:?}",
@@ -1129,10 +1460,21 @@ impl Engine {
                 }
             }
         }
+        let st = applied
+            .last()
+            .map_or_else(|| Arc::clone(&base), |(_, st)| Arc::clone(st));
 
         // Adopt.
         let old_head = self.head_slot_now();
-        self.state = st;
+        self.state.set_arc(st);
+        // The ring described the branch that just lost. Rebuild it from the
+        // one that won: `ancestor` is canonical again by construction, and
+        // the branch's post-states were just computed above.
+        self.recent_states.clear();
+        self.remember_state(ancestor, base);
+        for (id, post) in applied {
+            self.remember_state(id, post);
+        }
         self.chain.truncate(cut + 1);
         let mut canonical: BTreeSet<[u8; 32]> =
             self.chain.iter().map(|(_, id)| *id.as_bytes()).collect();
@@ -1156,13 +1498,26 @@ impl Engine {
                 eprintln!("FATAL: block log rewrite failed: {e}");
                 std::process::exit(1);
             }
+            // Free for the same reason as `apply_canonical`'s: every block
+            // in `branch` passed `apply_block`, so the adopted head's header
+            // carries the post-state root already checked against it. Only a
+            // reorg to an EMPTY branch has no header to read it from, and
+            // only when the ancestor is genesis is it not in `blocks`.
+            let head_root = match branch.last() {
+                Some(env) => env.header.state_root,
+                None => self
+                    .blocks
+                    .get(&ancestor)
+                    .map(|env| env.header.state_root)
+                    .unwrap_or_else(|| self.state.state_root()),
+            };
             println!(
                 "REORG: adopted branch of {} blocks at ancestor {} (head slot {} -> {}), root {}",
                 branch.len(),
                 crate::codec::hex8(&ancestor),
                 old_head,
                 self.head_slot_now(),
-                crate::codec::hex8(&self.state.state_root()),
+                crate::codec::hex8(&head_root),
             );
             // A reorg can move the finalized root at the anchor's epoch.
             self.enforce_ws_anchor();
@@ -1723,7 +2078,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
     };
 
     let mut engine = Engine {
-        state: genesis_state,
+        state: StateCell::new(genesis_state),
         tr: Transition::new(verifier.clone()),
         tr_probe: Transition::new(ProbeVerifier),
         verifier,
@@ -1731,6 +2086,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         blocks: BTreeMap::new(),
         chain: vec![(0, genesis_id)],
         canonical: BTreeSet::from([*genesis_id.as_bytes()]),
+        recent_states: VecDeque::new(),
         pool: BTreeMap::new(),
         att_pool: AttestationPool::new(),
         wall_slot: 0,
@@ -3268,7 +3624,7 @@ mod transfer_v2_end_to_end {
         let verifier = HybridVerifier::new(Vec::new());
         Engine {
             manifest,
-            state,
+            state: StateCell::new(state),
             tr: Transition::new(verifier.clone()),
             tr_probe: Transition::new(ProbeVerifier),
             verifier,
@@ -3276,6 +3632,7 @@ mod transfer_v2_end_to_end {
             blocks: BTreeMap::new(),
             chain: vec![(0, genesis_id)],
             canonical: BTreeSet::from([*genesis_id.as_bytes()]),
+            recent_states: VecDeque::new(),
             pool: BTreeMap::new(),
             att_pool: AttestationPool::new(),
             wall_slot: 0,
@@ -3478,6 +3835,805 @@ mod transfer_v2_end_to_end {
             e2.message.contains("retry later"),
             "a full mempool SHOULD advise retrying: {}",
             e2.message
+        );
+    }
+}
+
+/// A real, proposing `Engine`, for tests that must drive the actual block
+/// path rather than a stand-in.
+///
+/// One genesis validator whose hybrid key this node holds, so this node is
+/// the proposer AND the whole committee at every slot: `propose(slot)` always
+/// fires and the block it builds is validated by the real
+/// `Transition::apply_block` under the real ML-DSA-65 ‖ Falcon-1024 verifier.
+/// That is what makes a claim measured here a claim about production code.
+#[cfg(test)]
+mod perf_support {
+    use super::*;
+    use crate::genesis::ManifestValidator;
+    use bloch_pos_committee::beacon::RandaoChain;
+
+    const SAT_PER_BLOCH: u128 = 100_000_000;
+
+    /// Throwaway data dir, deleted when the returned guard drops.
+    pub(super) struct TestDir(pub PathBuf);
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Build the engine. `slot_ms` and `genesis_time_ms` are irrelevant to
+    /// every path exercised here — `propose`, `ingest` and `do_reorg` all take
+    /// the slot as an argument and read no clock — so the manifest's cadence
+    /// is set to something plausible and then not depended upon.
+    pub(super) fn proposing_engine() -> (Engine, TestDir) {
+        static DIR_SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "bloch-pos-perf-{}-{}",
+            std::process::id(),
+            DIR_SEQ.fetch_add(1, Ordering::Relaxed),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create the test data dir");
+
+        let ks = Keystore::generate(&dir, 0).expect("generate a devnet keystore");
+        let manifest = Manifest {
+            genesis_time_ms: now_ms(),
+            slot_ms: 1_000,
+            validators: vec![ManifestValidator {
+                index: 0,
+                stake_sat: 200_000 * SAT_PER_BLOCH,
+                randao_commitment: RandaoChain::generate(ks.randao_seed).commitment(),
+                pubkey: ks.pubkey.clone(),
+                withdrawal_credentials: Vec::new(),
+                commission_bps: 0,
+            }],
+            cohort: Vec::new(),
+            carryover: None,
+            allocations: Vec::new(),
+            carryover_entries: Vec::new(),
+        };
+        let genesis_id = manifest.genesis_id();
+        let state = manifest.genesis_state();
+        let store = Store::open(&dir, &[0u8; 32]).expect("open the test store");
+        let (events, _rx) = mpsc::channel::<EngineEvent>();
+        let head_slot = Arc::new(AtomicU64::new(0));
+        let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let net = net::Net::Devnet(
+            net::start(
+                "127.0.0.1",
+                0, // ephemeral port: bind for real, listen to nobody
+                Vec::new(),
+                events,
+                dir.clone(),
+                head_slot.clone(),
+                inflight,
+            )
+            .expect("bind the devnet transport on an ephemeral port"),
+        );
+        let verifier = HybridVerifier::new(manifest.pubkeys());
+        let engine = Engine {
+            manifest,
+            state: StateCell::new(state),
+            tr: Transition::new(verifier.clone()),
+            tr_probe: Transition::new(ProbeVerifier),
+            verifier,
+            keys: Some(ks),
+            blocks: BTreeMap::new(),
+            chain: vec![(0, genesis_id)],
+            canonical: BTreeSet::from([*genesis_id.as_bytes()]),
+            recent_states: VecDeque::new(),
+            pool: BTreeMap::new(),
+            att_pool: AttestationPool::new(),
+            wall_slot: 0,
+            mempool: BTreeMap::new(),
+            store,
+            net,
+            head_slot,
+            live: true,
+            needs_sync: false,
+            last_applied_ms: now_ms(),
+            booted_ms: now_ms(),
+            ws_anchor: None,
+            ws_anchor_hard: false,
+            ws_conflict_reported: false,
+        };
+        (engine, TestDir(dir))
+    }
+}
+
+/// **Win 3's proof.** A proposer used to compute the whole committed state
+/// root THREE times for one slot; it now computes it twice, and the two that
+/// remain are the two that carry a rule.
+///
+/// The three were: stamping the header (`propose`, from the probe's
+/// post-state), the transition's own step-12 check inside `apply_block`, and
+/// a third for the `applied …` log line. The first two are the
+/// producer=validator seam — the producer must commit a root and then face
+/// the same check every peer will run — so neither may go. The third was a
+/// display of a number the second had already proved equal to
+/// `header.state_root`, which the log now prints directly.
+///
+/// The assertion is a COUNT, not a duration: it fails on the old code and
+/// passes on the new one on any box, at any load. A timing test would only
+/// have said "faster on this machine today".
+#[cfg(test)]
+mod root_budget_tests {
+    use super::*;
+    use bloch_pos_committee::transition::root_computations;
+
+    #[test]
+    fn a_proposer_spends_two_state_roots_per_slot_not_three() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+
+        let before = root_computations();
+        engine.propose(1);
+        let spent = root_computations() - before;
+
+        assert_eq!(
+            engine.chain.len(),
+            2,
+            "the harness must actually have produced and adopted a block — \
+             a proposer that produced nothing would spend no roots and pass \
+             this test for the wrong reason"
+        );
+        assert_eq!(
+            spent, 2,
+            "one proposed slot must cost exactly two state-root computations: \
+             the header stamp and the transition's step-12 check. Three means \
+             the log line's root came back; one means a check went missing."
+        );
+
+        // And the value the log prints is still the head's real root — the
+        // whole basis for deleting the computation.
+        let head = engine
+            .blocks
+            .get(engine.head_id().as_bytes())
+            .expect("the adopted block is stored");
+        let recomputed_before = root_computations();
+        assert_eq!(
+            head.header.state_root,
+            engine.state.state_root(),
+            "the header root the log now prints must equal the recomputed \
+             state root, or the log is lying about the head"
+        );
+        assert_eq!(
+            root_computations() - recomputed_before,
+            1,
+            "the check above must itself cost exactly one root, or the \
+             counter is not counting what this test claims it counts"
+        );
+    }
+
+    /// The same budget over several consecutive slots, so a one-off cannot
+    /// pass: `n` proposed slots cost exactly `2n` roots.
+    #[test]
+    fn the_budget_holds_across_consecutive_slots() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        let before = root_computations();
+        for slot in 1..=5 {
+            engine.propose(slot);
+        }
+        assert_eq!(
+            engine.chain.len(),
+            6,
+            "five proposed slots must land five blocks on genesis"
+        );
+        assert_eq!(
+            root_computations() - before,
+            10,
+            "five slots must cost ten state-root computations, not fifteen"
+        );
+    }
+}
+
+/// What the deleted work actually cost, on a state the size the fleet runs.
+///
+/// `#[ignore]`d: it is a measurement, not an assertion, and it builds a
+/// Genesis-3-sized balance set (hundreds of thousands of outputs), which is
+/// seconds of setup no ordinary test run should pay. Run it with
+/// `cargo test --release -p bloch-pos-node -- --ignored --nocapture bench_`.
+///
+/// A devnet state roots in microseconds; mainnet's does not, and the number
+/// that matters is mainnet's. The size below is the Genesis-3 carryover's own
+/// output count, so the figure is the fleet's, not a toy's.
+#[cfg(test)]
+mod bench {
+    use super::*;
+    use bloch_pos_committee::state_root::{EutxoEntry, EvmCommitment};
+    use std::time::Instant;
+
+    /// The Genesis-3 carryover's output count, per `CARRYOVER-SNAPSHOT.md`.
+    const MAINNET_EUTXOS: u32 = 452_133;
+
+    fn mainnet_sized_state(n: u32) -> CommittedState {
+        let entries: Vec<EutxoEntry> = (0..n)
+            .map(|i| EutxoEntry {
+                txid: {
+                    let mut t = [0u8; 32];
+                    t[..4].copy_from_slice(&i.to_le_bytes());
+                    t
+                },
+                vout: i % 8,
+                value: 8_400 * 100_000_000,
+                script_hash: {
+                    let mut h = [0u8; 32];
+                    h[..4].copy_from_slice(&(i % 4096).to_le_bytes());
+                    h
+                },
+            })
+            .collect();
+        CommittedState::genesis(
+            BlockId::of(&BlockHeaderV4 {
+                version: VERSION_G4,
+                parent: [0u8; 32],
+                state_root: [0u8; 32],
+                body_root: [0u8; 32],
+                slot: 0,
+                proposer_index: 0,
+                randao_reveal: [0u8; 32],
+                randao_mix: [0u8; 32],
+                justified_root: [0u8; 32],
+                finalized_root: [0u8; 32],
+                attestation_root: [0u8; 32],
+                coherence_root: [0u8; 32],
+            }),
+            GENESIS_MIX,
+            &[],
+            &[],
+            [0u8; 32],
+            [0u8; 32],
+            [0u8; 32],
+            EvmCommitment {
+                account_root: [0u8; 32],
+                receipts_root: [0u8; 32],
+                gas_used: 0,
+                base_fee_per_gas: 0,
+            },
+            &entries,
+        )
+    }
+
+    fn median(mut v: Vec<u128>) -> u128 {
+        v.sort_unstable();
+        v[v.len() / 2]
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_state_root() {
+        let st = mainnet_sized_state(MAINNET_EUTXOS);
+        let mut samples = Vec::new();
+        for _ in 0..7 {
+            let t = Instant::now();
+            let _ = st.state_root();
+            samples.push(t.elapsed().as_micros());
+        }
+        println!(
+            "state_root over {MAINNET_EUTXOS} eUTXOs: median {} us (min {}, max {})",
+            median(samples.clone()),
+            samples.iter().min().unwrap(),
+            samples.iter().max().unwrap()
+        );
+    }
+
+    /// The whole of Win 1, end to end: what one arriving attestation used to
+    /// cost `judge` before it could even look at a committee, and what it
+    /// costs now. `epoch` = head epoch is the identity roll (a bare clone
+    /// before, an `Arc` bump now); `epoch` = head epoch + 1 is the one that
+    /// also ran `process_epoch`.
+    #[test]
+    #[ignore]
+    fn bench_rolled_to() {
+        let st = mainnet_sized_state(MAINNET_EUTXOS);
+        let tr = Transition::new(ProbeVerifier);
+        let roll = |s: &CommittedState| tr.process_epoch(s).expect("infallible");
+
+        // BEFORE: the pre-change body, verbatim.
+        let uncached = |epoch: u64| {
+            let mut cur_state = st.clone();
+            let mut cur = epoch_of(cur_state.slot());
+            while cur < epoch {
+                cur_state = roll(&cur_state);
+                cur += 1;
+            }
+            cur_state
+        };
+        for target in [0u64, 1] {
+            let mut samples = Vec::new();
+            for _ in 0..7 {
+                let t = Instant::now();
+                let out = uncached(target);
+                samples.push(t.elapsed().as_micros());
+                std::hint::black_box(&out);
+            }
+            println!(
+                "BEFORE rolled_to(head_epoch + {target}): median {} us",
+                median(samples)
+            );
+        }
+
+        // AFTER: the memo. First call is the miss that pays; the rest are
+        // what the other attestations in the same flight actually see.
+        let cell = StateCell::new(st.clone());
+        for target in [0u64, 1] {
+            let t = Instant::now();
+            let out = cell.rolled_to(target, roll);
+            let miss = t.elapsed().as_micros();
+            std::hint::black_box(&out);
+            let mut samples = Vec::new();
+            for _ in 0..64 {
+                let t = Instant::now();
+                let out = cell.rolled_to(target, roll);
+                samples.push(t.elapsed().as_nanos());
+                std::hint::black_box(&out);
+            }
+            println!(
+                "AFTER  rolled_to(head_epoch + {target}): miss {miss} us, \
+                 hit median {} ns",
+                median(samples.iter().map(|n| *n as u128).collect::<Vec<_>>())
+            );
+        }
+    }
+
+    /// Resident bytes one Genesis-3-sized `CommittedState` costs — the price
+    /// of one slot in [`REORG_STATE_WINDOW`]. Read from the OS, not from
+    /// `size_of`, because the cost is the allocator's and not the struct's.
+    #[test]
+    #[ignore]
+    fn bench_state_footprint() {
+        fn rss_kb() -> u64 {
+            let out = std::process::Command::new("ps")
+                .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+                .output()
+                .expect("ps");
+            String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(0)
+        }
+        let base = mainnet_sized_state(MAINNET_EUTXOS);
+        let before = rss_kb();
+        let held: Vec<CommittedState> = (0..4).map(|_| base.clone()).collect();
+        let after = rss_kb();
+        println!(
+            "4 extra Genesis-3-sized states: RSS {before} kB -> {after} kB \
+             ({} MB each)",
+            (after.saturating_sub(before)) / 4 / 1024
+        );
+        std::hint::black_box(&held);
+    }
+
+    /// Win 2's shape: the base state a reorg starts from, computed the old
+    /// way (replay every canonical block from genesis) and the new way (a
+    /// retained snapshot), as the chain gets longer.
+    ///
+    /// Devnet-sized state, so the absolute numbers are small — the finding is
+    /// the SHAPE. The old cost grows with chain height and the new one does
+    /// not, which is the whole change; on a chain with a Genesis-3 carryover
+    /// every one of those `apply_block` calls also carries the state root
+    /// measured above.
+    #[test]
+    #[ignore]
+    fn bench_reorg_base_state() {
+        for height in [10u64, 30, 60] {
+            let (mut engine, _dir) = perf_support::proposing_engine();
+            for slot in 1..=height {
+                engine.propose(slot);
+            }
+            let parent = *engine.chain[engine.chain.len() - 2].1.as_bytes();
+            assert!(
+                engine.recent_states.iter().any(|(id, _)| *id == parent),
+                "the parent must be in the window for the AFTER measurement"
+            );
+
+            let mut old = Vec::new();
+            for _ in 0..5 {
+                let t = Instant::now();
+                let st = engine.replay_to(parent);
+                old.push(t.elapsed().as_micros());
+                std::hint::black_box(&st);
+            }
+            let mut new = Vec::new();
+            for _ in 0..5 {
+                let t = Instant::now();
+                let st = engine.state_at_canonical(parent);
+                new.push(t.elapsed().as_micros());
+                std::hint::black_box(&st);
+            }
+            println!(
+                "reorg base state at height {height}, depth 1: BEFORE (replay from genesis) \
+                 median {} us, AFTER (snapshot) median {} us",
+                median(old),
+                median(new)
+            );
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_clone_and_process_epoch() {
+        let st = mainnet_sized_state(MAINNET_EUTXOS);
+        let tr = Transition::new(ProbeVerifier);
+        let mut clones = Vec::new();
+        let mut rolls = Vec::new();
+        for _ in 0..7 {
+            let t = Instant::now();
+            let c = st.clone();
+            clones.push(t.elapsed().as_micros());
+            let t = Instant::now();
+            let _ = tr.process_epoch(&c).expect("infallible");
+            rolls.push(t.elapsed().as_micros());
+        }
+        println!(
+            "clone over {MAINNET_EUTXOS} eUTXOs: median {} us; process_epoch: median {} us",
+            median(clones),
+            median(rolls)
+        );
+    }
+}
+
+/// **Win 1's proof.** The memoized rolled state must be the SAME STATE the
+/// uncached derivation produces — not merely a state, and not a state that
+/// was right a block ago.
+///
+/// This is the change in this branch that could silently become a consensus
+/// change. A rolled state supplies the duty roster and the sortition seed, so
+/// serving a stale one makes this node judge attestations against a committee
+/// no other node is using: it accepts what peers reject and rejects what peers
+/// accept, from an honest binary, with no error anywhere. That is the shape of
+/// the `expected_bits` split of 2026-08-08, which is why the key is
+/// `(generation, epoch)` and why these tests exist in this form.
+///
+/// `rolled_to_uncached` is the pre-change body, kept verbatim, so "identical"
+/// here means identical to the code that shipped and not to a paraphrase of
+/// it. Comparison is by `PartialEq` over the whole `CommittedState` — every
+/// field, committed or not — rather than by state root, so a divergence in
+/// something the root does not cover still fails.
+#[cfg(test)]
+mod rolled_memo_tests {
+    use super::*;
+
+    /// Across forty proposed slots — which crosses an epoch boundary — and
+    /// for four target epochs at each of them, the memoized answer equals the
+    /// freshly-derived one.
+    ///
+    /// The state advances on every iteration, so this is the invalidation
+    /// path exercised forty times over: a memo that failed to notice a block
+    /// would be serving the previous slot's roster by the second assertion.
+    #[test]
+    fn the_memo_is_bit_identical_to_the_uncached_derivation() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        let mut crossed = false;
+        for slot in 1..=40u64 {
+            engine.propose(slot);
+            let base = epoch_of(engine.state.slot());
+            crossed |= base >= 1;
+            for target in base..=base + 3 {
+                let memoized = engine.rolled_to(target);
+                let fresh = engine.rolled_to_uncached(target);
+                assert_eq!(
+                    *memoized, fresh,
+                    "slot {slot}: the memoized roll to epoch {target} is not the state the \
+                     uncached derivation produces"
+                );
+                // Asked twice, the memo now HAS to answer from itself — and
+                // it must answer the same thing.
+                assert_eq!(
+                    *engine.rolled_to(target),
+                    fresh,
+                    "slot {slot}: the second, memo-served roll to epoch {target} diverged"
+                );
+            }
+        }
+        assert!(
+            crossed,
+            "the run must actually cross an epoch boundary, or this proves nothing about \
+             rolling across one"
+        );
+        assert_eq!(
+            engine.chain.len(),
+            41,
+            "forty proposed slots must land forty blocks on genesis"
+        );
+    }
+
+    /// A block moves the state, and the rolled view of the *same* epoch must
+    /// move with it.
+    ///
+    /// The `assert_ne!` is the half that makes this a test: if rolling to a
+    /// fixed epoch gave the same answer before and after a block, a memo
+    /// keyed on the epoch alone would be correct and there would be nothing
+    /// to prove.
+    #[test]
+    fn a_block_invalidates_the_rolled_view_of_the_same_epoch() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        for slot in 1..=3 {
+            engine.propose(slot);
+        }
+        let target = epoch_of(engine.state.slot()) + 1;
+
+        let before = engine.rolled_to(target).state_root();
+        let gen_before = engine.state.generation();
+
+        engine.propose(4);
+        assert_eq!(engine.chain.len(), 5, "slot 4 must have landed");
+        assert_ne!(
+            engine.state.generation(),
+            gen_before,
+            "an applied block must move the generation, or the key's identity half is inert"
+        );
+
+        let after = engine.rolled_to(target);
+        assert_ne!(
+            before,
+            after.state_root(),
+            "rolling to epoch {target} must give a different state once a block has landed — \
+             if it does not, this test cannot detect a stale memo"
+        );
+        assert_eq!(
+            *after,
+            engine.rolled_to_uncached(target),
+            "after the state moved, the memo must serve the NEW roll"
+        );
+    }
+
+    /// The generation half of the key is load-bearing, proved by planting a
+    /// wrong answer under it.
+    ///
+    /// First half: an entry for the right epoch carrying the wrong state, but
+    /// tagged with a generation that is not the live one, must be ignored —
+    /// this is exactly the entry a naive epoch-only key would have returned.
+    ///
+    /// Second half is the control, and without it the first proves nothing: a
+    /// memo that is never consulted at all would also pass. The identical
+    /// entry under the LIVE generation IS returned, so the lookup is real and
+    /// what rejected the first entry was the generation.
+    #[test]
+    fn a_stale_generation_is_never_served_and_a_live_one_is() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        for slot in 1..=3 {
+            engine.propose(slot);
+        }
+        let base = epoch_of(engine.state.slot());
+        let target = base + 1;
+        let control_target = base + 2;
+
+        let honest = engine.rolled_to_uncached(target);
+        // A state that is emphatically not the answer for `target`.
+        let poison = engine.rolled_to_uncached(base + 9);
+        assert_ne!(
+            poison.state_root(),
+            honest.state_root(),
+            "fixture: the planted state must differ from the honest one"
+        );
+
+        let live = engine.state.generation();
+        assert!(live > 0, "fixture: blocks must have moved the generation");
+
+        // ── the stale entry ────────────────────────────────────────────────
+        engine
+            .state
+            .plant(live.wrapping_sub(1), target, poison.clone());
+        assert_eq!(
+            *engine.rolled_to(target),
+            honest,
+            "a rolled state memoized against a DIFFERENT state was served — this is the \
+             wrong-committee bug the key exists to prevent"
+        );
+
+        // ── the control ───────────────────────────────────────────────────
+        engine.state.plant(live, control_target, poison.clone());
+        assert_eq!(
+            engine.rolled_to(control_target).state_root(),
+            poison.state_root(),
+            "an entry under the LIVE generation was not served, so the test above passed \
+             because nothing reads the memo rather than because the key rejected the entry"
+        );
+    }
+}
+
+/// **Win 2's proof.** A reorg that starts from a retained snapshot must land
+/// on exactly the state and the head that replaying from genesis lands on.
+///
+/// The retention window is an optimisation with a correct slow path
+/// underneath it, and both halves are tested here: that the fast path agrees
+/// with the slow one wherever it applies, and that a reorg deeper than the
+/// window really does fall through to the slow one rather than quietly
+/// serving something else. The `assert_eq!` on the hit/miss is what stops the
+/// second claim from being a comment.
+#[cfg(test)]
+mod reorg_state_tests {
+    use super::*;
+
+    /// A chain and a real competing branch, built with the node's own APIs
+    /// and nothing else: propose a rival on the fork point, hand it back with
+    /// a reorg to an empty branch (a legitimate LMD-GHOST outcome — weight
+    /// moved to a sibling and the chain gives blocks back), then outrun it by
+    /// `depth` canonical blocks. What is left is a stored, valid block whose
+    /// parent sits `depth` below the head.
+    fn forked(depth: u64) -> (Engine, perf_support::TestDir, [u8; 32], BlockEnvelope) {
+        let (mut engine, dir) = perf_support::proposing_engine();
+        engine.propose(1);
+        let fork_point = *engine.head_id().as_bytes();
+
+        engine.propose(2);
+        let rival = engine
+            .blocks
+            .get(engine.head_id().as_bytes())
+            .expect("the rival was just proposed and adopted")
+            .clone();
+        assert!(
+            engine.do_reorg(fork_point, Vec::new()),
+            "handing the rival back must succeed"
+        );
+        assert_eq!(
+            *engine.head_id().as_bytes(),
+            fork_point,
+            "after giving the block back the head is the fork point"
+        );
+
+        // Take the rival OUT of the block store while the canonical branch is
+        // built.
+        //
+        // Not tidiness — determinism. `propose` ends in `ingest`, which runs
+        // fork choice over every stored block; the rival and the new block are
+        // siblings with no attestations, so LMD-GHOST breaks a zero-weight tie
+        // by block id, and the id depends on this run's throwaway keystore.
+        // Left in, the fixture re-adopts the rival on some runs and the test
+        // then compares a state against itself. It was caught by the
+        // `assert_ne!` fixture guard below, which is the entire reason that
+        // guard is there.
+        let rival_id = *rival.block_id().as_bytes();
+        engine
+            .blocks
+            .remove(&rival_id)
+            .expect("the rival is stored until this line removes it");
+
+        for slot in 3..3 + depth {
+            engine.propose(slot);
+        }
+
+        // Back in: the test needs it stored to reorg onto it.
+        engine.blocks.insert(rival_id, rival.clone());
+        assert!(
+            !engine.canonical.contains(&rival_id),
+            "the rival must be off the canonical chain when the fixture is handed over"
+        );
+        assert_eq!(
+            engine.chain.len() as u64,
+            2 + depth,
+            "genesis, the fork point, and {depth} blocks above it"
+        );
+        (engine, dir, fork_point, rival)
+    }
+
+    /// At every canonical depth, in a shuffled order, the snapshot answer and
+    /// the replay answer are the same state — and the ring is holding exactly
+    /// the depths it claims to.
+    #[test]
+    fn the_snapshot_and_the_replay_agree_at_every_canonical_depth() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        for slot in 1..=6 {
+            engine.propose(slot);
+        }
+        assert_eq!(engine.chain.len(), 7);
+
+        // A deterministic shuffle, so no depth is only ever visited in the
+        // order the ring happens to like.
+        let mut order: Vec<usize> = (1..engine.chain.len()).collect();
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        for i in (1..order.len()).rev() {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let j = (seed >> 33) as usize % (i + 1);
+            order.swap(i, j);
+        }
+
+        for idx in order {
+            let id = *engine.chain[idx].1.as_bytes();
+            let depth = engine.chain.len() - 1 - idx;
+            let retained = engine.recent_states.iter().any(|(bid, _)| *bid == id);
+            assert_eq!(
+                retained,
+                depth < REORG_STATE_WINDOW,
+                "depth {depth}: the ring must retain exactly the last \
+                 {REORG_STATE_WINDOW} blocks — if it retained more, the deep \
+                 cases below would never exercise the replay fallback"
+            );
+            assert_eq!(
+                *engine.state_at_canonical(id),
+                engine.replay_to(id),
+                "depth {depth}: the snapshot and the replay-from-genesis \
+                 disagree about the same block's post-state"
+            );
+        }
+    }
+
+    /// A real reorg at depths on both sides of the retention window lands on
+    /// the state and head the pre-change path lands on.
+    ///
+    /// `expected` is computed with `replay_to` plus `apply_block` over the
+    /// branch, which IS the body `do_reorg` had before this change — so this
+    /// compares against the old code, not against a paraphrase of it.
+    #[test]
+    fn a_reorg_lands_where_replay_from_genesis_lands() {
+        let mut saw_hit = false;
+        let mut saw_fallback = false;
+        for depth in 1..=5u64 {
+            let (mut engine, _dir, fork_point, rival) = forked(depth);
+
+            let expected = {
+                let base = engine.replay_to(fork_point);
+                let envelope = ProposalEnvelope {
+                    header: rival.header.clone(),
+                    proposer_sig: rival.proposer_sig.clone(),
+                };
+                let txs = body_transactions(&rival).expect("the rival's body decodes");
+                engine
+                    .tr
+                    .apply_block(&base, &envelope, &rival.body.attestations, &txs)
+                    .expect("the rival is valid on its own parent")
+            };
+            assert_ne!(
+                *engine.state, expected,
+                "depth {depth}: fixture — the reorg must actually move the state, or this \
+                 test would pass without the reorg happening at all"
+            );
+
+            let hit = engine
+                .recent_states
+                .iter()
+                .any(|(id, _)| *id == fork_point);
+            if hit {
+                saw_hit = true;
+            } else {
+                saw_fallback = true;
+            }
+            assert_eq!(
+                hit,
+                depth < REORG_STATE_WINDOW as u64,
+                "depth {depth}: the fork point should be retained iff it is inside the window"
+            );
+
+            assert!(
+                engine.do_reorg(fork_point, vec![rival.clone()]),
+                "depth {depth}: the reorg must be adopted"
+            );
+            assert_eq!(
+                *engine.state, expected,
+                "depth {depth}: the reorg landed on a DIFFERENT state than replaying from \
+                 genesis would have — this is a consensus divergence, not a slow path"
+            );
+            assert_eq!(
+                engine.head_id(),
+                rival.block_id(),
+                "depth {depth}: the head must be the adopted branch tip"
+            );
+            assert_eq!(
+                engine.chain.len(),
+                3,
+                "depth {depth}: genesis, the fork point, the rival"
+            );
+            // The ring must now describe the branch that WON. A ring still
+            // holding the abandoned branch would make the next reorg start
+            // from a state on a chain this node no longer has.
+            for (id, st) in engine.recent_states.iter() {
+                assert_eq!(
+                    **st,
+                    engine.replay_to(*id),
+                    "depth {depth}: the ring kept a post-state that is not this block's"
+                );
+                assert!(
+                    engine.canonical.contains(id),
+                    "depth {depth}: the ring kept a block that is not canonical"
+                );
+            }
+        }
+        assert!(
+            saw_hit && saw_fallback,
+            "the sweep must exercise BOTH the retained snapshot and the replay fallback \
+             (hit: {saw_hit}, fallback: {saw_fallback})"
         );
     }
 }
