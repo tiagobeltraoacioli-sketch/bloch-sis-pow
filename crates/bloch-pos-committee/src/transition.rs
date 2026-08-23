@@ -3188,6 +3188,11 @@ impl CommittedState {
         if let Some(rec) = self.validators.get_mut(&validator) {
             rec.staked_sat = 0;
         }
+        // The bond's `stake_low_water` entry is deliberately NOT removed. It
+        // is history, not a balance: the record is terminal after this, no
+        // rule reads the entry again, and adding a second write site to the
+        // map — for a cleanup nothing needs — would buy state-size savings at
+        // the cost of another place the write-off's history can be lost.
         if unbacked_entry > 0 {
             // The write-off itself: the unissued remainder leaves the books
             // as an audit entry, never as coin. The full committed entry is
