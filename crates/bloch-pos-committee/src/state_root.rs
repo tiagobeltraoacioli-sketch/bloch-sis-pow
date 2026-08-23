@@ -66,11 +66,21 @@
 //! - [`state_root`] is a pure function of a [`ConsensusState`] the caller
 //!   passes in. There is no constructor that reads a database, a clock, or a
 //!   config file.
-//! - There is **no interior mutability and no cache anywhere in this module**
-//!   — not even a memoized root or a lazily-initialized table of empty-subtree
-//!   hashes. A cache is exactly the kind of node-local mutable state §5.5
-//!   bans; recomputing instead costs a few hundred SHA3 calls and buys the
-//!   property that two nodes given the same bytes cannot possibly disagree.
+//! - There is **no interior mutability and no global mutable state anywhere
+//!   in this module** — no `OnceLock`, no lazily-initialized table, nothing
+//!   that mutates behind a `&self`. Every value a caller can observe is
+//!   reached through a `&mut` it holds.
+//! - The tree *does* keep each node's subtree hash beside that node, and
+//!   [`Smt::root`] reads it rather than recomputing. That is not the cache
+//!   §5.5 bans, and the distinction is exact: the banned thing is a cached
+//!   answer that can outlive the input it was computed from. These nodes are
+//!   immutable, a node's hash is computed in its constructor from the very
+//!   children it is built with, and a mutation *rebuilds* the path from the
+//!   touched leaf to the root instead of editing it. There is no
+//!   invalidation step, therefore no invalidation to forget. The property
+//!   that matters — same leaf multiset, same root, whoever computes it and in
+//!   whatever order — is unchanged and pinned against the from-scratch
+//!   recursion by test. See [`Smt`]'s own docs for the full argument.
 //! - Insertion order cannot matter: a key's position in the tree is fixed by
 //!   the key itself, and the builder canonicalises through a `BTreeMap`. Two
 //!   nodes that hold the same state but iterated it in different orders — the
@@ -223,17 +233,41 @@ fn leaf_hash(key: &[u8; 32], value_hash: &[u8; 32]) -> [u8; 32] {
 }
 
 fn node_hash(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+    #[cfg(test)]
+    NODE_HASH_CALLS.with(|c| c.set(c.get() + 1));
     sha3(&[&[MARK_NODE], left, right])
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Counts [`node_hash`] invocations. Test-only, and it cannot change a
+    /// value: the counter is incremented beside the hash, never mixed into
+    /// it. It exists because the whole claim of the incremental tree is
+    /// *asymptotic* — a wall-clock assertion is a machine property, the
+    /// number of internal hashes a small update costs is the property
+    /// itself.
+    static NODE_HASH_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Run `f` and report how many internal node hashes it cost.
+#[cfg(test)]
+fn counting_node_hashes<T>(f: impl FnOnce() -> T) -> (T, u64) {
+    let before = NODE_HASH_CALLS.with(|c| c.get());
+    let out = f();
+    (out, NODE_HASH_CALLS.with(|c| c.get()) - before)
 }
 
 /// Hashes of the all-empty subtree at every depth. `empty[d]` is the root of
 /// an empty subtree whose top sits at depth `d`; `empty[TREE_DEPTH]` is the
 /// empty leaf slot.
 ///
-/// Recomputed on every call on purpose. These are pure constants and the
-/// obvious move is a `OnceLock` — but that is global mutable state, and §5.5
-/// bans the *pattern*, not just the instances that have already bitten us.
-/// 256 SHA3 calls are noise next to the tree walk itself.
+/// Still not a `OnceLock`: that is global mutable state, and §5.5 bans the
+/// *pattern*, not just the instances that have already bitten us. Each
+/// [`Smt`] computes this table once in its constructor and carries it as an
+/// ordinary field — eager, owned, no lazy initialisation, shared between
+/// clones by refcount because it is the same 257 constants in every tree that
+/// will ever exist. Recomputing it per mutation instead would cost 256 SHA3
+/// per inserted leaf, which is more than the leaf.
 fn empty_hashes() -> Vec<[u8; 32]> {
     let mut empty = vec![[0u8; 32]; TREE_DEPTH + 1];
     empty[TREE_DEPTH] = sha3(&[&[MARK_EMPTY]]);
@@ -396,6 +430,257 @@ thread_local! {
         std::cell::RefCell::new(SingletonMemo::default());
 }
 
+// -- The tree, materialised --------------------------------------------------
+//
+// [`subtree_root`] above is already a compressed binary trie walk: at every
+// depth a key-sorted slice is either empty, or holds exactly one leaf, or
+// splits. The three shapes below are those three cases, made into values so
+// the walk can be *kept* between calls instead of redone from a flat slice
+// every time. Nothing about the tree's definition changes — the hash of a
+// node is computed by the same `leaf_hash` / `node_hash` / `empty_hashes`
+// / `bit` primitives, in the same order, from the same key set.
+
+/// A non-empty subtree. Empty is `None`; there is no `Node::Empty`, so a
+/// missing subtree cannot be confused with a present one that happens to
+/// hash to the empty constant.
+///
+/// `Arc` and not `Box`: the nodes are immutable, and every mutation rebuilds
+/// only the path from the root to the touched leaf, so a clone of a tree
+/// shares every untouched subtree with its parent. That is what makes
+/// "the state after this block" cost the block's edits rather than the
+/// state's size.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Node {
+    Leaf(std::sync::Arc<LeafNode>),
+    Split(std::sync::Arc<SplitNode>),
+}
+
+/// A subtree holding exactly one key — [`subtree_root`]'s `leaves.len() == 1`
+/// case, with the fold it computes stored beside it.
+#[derive(Debug, PartialEq, Eq)]
+struct LeafNode {
+    key: [u8; 32],
+    value_hash: [u8; 32],
+    /// `singleton_subtree_root(key, value_hash, depth)`.
+    hash: [u8; 32],
+    /// The depth `hash` was computed at. A leaf's fold depends on where it
+    /// sits, and inserting a neighbour pushes it down while removing its last
+    /// neighbour pulls it up — so the depth is carried and checked rather
+    /// than assumed. Debug-only enforcement of the one invariant that could
+    /// silently produce a wrong root.
+    depth: u16,
+}
+
+/// A subtree holding two or more keys — [`subtree_root`]'s branching case.
+/// Either side may be empty (two keys that agree on the next bit both go
+/// left, and the right side is the empty constant); both empty is not
+/// representable in a well-formed tree and is asserted against.
+#[derive(Debug, PartialEq, Eq)]
+struct SplitNode {
+    left: Option<Node>,
+    right: Option<Node>,
+    /// `node_hash(hash_of(left, d + 1), hash_of(right, d + 1))`.
+    hash: [u8; 32],
+}
+
+/// The subtree hash of `node`, sitting at `depth`.
+///
+/// This is exactly `subtree_root`'s three-way return, read out of the node
+/// instead of recomputed: `empty[depth]` for the empty case, the stored
+/// singleton fold for the one-leaf case, the stored `node_hash` for the
+/// branching case.
+fn hash_of(node: &Option<Node>, depth: usize, empty: &[[u8; 32]]) -> [u8; 32] {
+    match node {
+        None => empty[depth],
+        Some(Node::Leaf(l)) => {
+            debug_assert_eq!(l.depth as usize, depth, "a leaf's stored fold is for another depth");
+            l.hash
+        }
+        Some(Node::Split(s)) => s.hash,
+    }
+}
+
+fn new_leaf(key: [u8; 32], value_hash: [u8; 32], depth: usize, empty: &[[u8; 32]]) -> Node {
+    Node::Leaf(std::sync::Arc::new(LeafNode {
+        key,
+        value_hash,
+        hash: singleton_subtree_root(&key, &value_hash, depth, empty),
+        depth: depth as u16,
+    }))
+}
+
+fn new_split(left: Option<Node>, right: Option<Node>, depth: usize, empty: &[[u8; 32]]) -> Node {
+    debug_assert!(left.is_some() || right.is_some(), "a split with no leaves under it");
+    let hash = node_hash(&hash_of(&left, depth + 1, empty), &hash_of(&right, depth + 1, empty));
+    Node::Split(std::sync::Arc::new(SplitNode { left, right, hash }))
+}
+
+/// Build the subtree at `depth` for a key-sorted slice — [`subtree_root`]
+/// with nodes retained instead of discarded.
+///
+/// Deliberately the same three cases, the same `partition_point`, the same
+/// recursion order. Read the two side by side: if they ever stop matching,
+/// the root moves, and the root moving is a chain split.
+fn build_subtree(
+    leaves: &[([u8; 32], [u8; 32])],
+    depth: usize,
+    empty: &[[u8; 32]],
+) -> Option<Node> {
+    if leaves.is_empty() {
+        return None;
+    }
+    if leaves.len() == 1 {
+        return Some(new_leaf(leaves[0].0, leaves[0].1, depth, empty));
+    }
+    debug_assert!(depth < TREE_DEPTH, "distinct 256-bit keys cannot survive 256 splits together");
+    let split = leaves.partition_point(|(k, _)| bit(k, depth) == 0);
+    let left = build_subtree(&leaves[..split], depth + 1, empty);
+    let right = build_subtree(&leaves[split..], depth + 1, empty);
+    Some(new_split(left, right, depth, empty))
+}
+
+/// Insert or overwrite one key, rebuilding only the path to it.
+///
+/// `added` reports a key that was not there (the caller keeps the count),
+/// `mutated` reports that anything at all changed — an insert of the value a
+/// key already holds returns the original nodes untouched, which is what
+/// makes "same leaves ⇒ same tree" hold pointer-for-pointer and not just
+/// hash-for-hash.
+fn node_insert(
+    node: Option<Node>,
+    depth: usize,
+    key: [u8; 32],
+    value_hash: [u8; 32],
+    empty: &[[u8; 32]],
+    added: &mut bool,
+    mutated: &mut bool,
+) -> Option<Node> {
+    match node {
+        None => {
+            *added = true;
+            *mutated = true;
+            Some(new_leaf(key, value_hash, depth, empty))
+        }
+        Some(Node::Leaf(l)) => {
+            if l.key == key {
+                if l.value_hash == value_hash {
+                    return Some(Node::Leaf(l));
+                }
+                *mutated = true;
+                Some(new_leaf(key, value_hash, depth, empty))
+            } else {
+                // Two keys, one subtree: it must branch. Push both down to
+                // the first depth at which their bits differ, exactly where
+                // `subtree_root`'s `partition_point` would separate them.
+                *added = true;
+                *mutated = true;
+                Some(split_apart(&l, key, value_hash, depth, empty))
+            }
+        }
+        Some(Node::Split(s)) => {
+            let mut left = s.left.clone();
+            let mut right = s.right.clone();
+            if bit(&key, depth) == 0 {
+                left = node_insert(left, depth + 1, key, value_hash, empty, added, mutated);
+            } else {
+                right = node_insert(right, depth + 1, key, value_hash, empty, added, mutated);
+            }
+            if !*mutated {
+                return Some(Node::Split(s));
+            }
+            Some(new_split(left, right, depth, empty))
+        }
+    }
+}
+
+/// Two distinct keys that currently share a subtree: build the chain of
+/// splits down to the first bit where they part.
+fn split_apart(
+    existing: &LeafNode,
+    key: [u8; 32],
+    value_hash: [u8; 32],
+    depth: usize,
+    empty: &[[u8; 32]],
+) -> Node {
+    debug_assert!(depth < TREE_DEPTH, "two distinct 256-bit keys must differ at some bit");
+    let side_existing = bit(&existing.key, depth);
+    let side_new = bit(&key, depth);
+    if side_existing == side_new {
+        let child = split_apart(existing, key, value_hash, depth + 1, empty);
+        if side_existing == 0 {
+            new_split(Some(child), None, depth, empty)
+        } else {
+            new_split(None, Some(child), depth, empty)
+        }
+    } else {
+        let kept = new_leaf(existing.key, existing.value_hash, depth + 1, empty);
+        let fresh = new_leaf(key, value_hash, depth + 1, empty);
+        if side_existing == 0 {
+            new_split(Some(kept), Some(fresh), depth, empty)
+        } else {
+            new_split(Some(fresh), Some(kept), depth, empty)
+        }
+    }
+}
+
+/// Remove one key, rebuilding only the path to it.
+fn node_remove(
+    node: Option<Node>,
+    depth: usize,
+    key: &[u8; 32],
+    empty: &[[u8; 32]],
+    removed: &mut bool,
+) -> Option<Node> {
+    match node {
+        None => None,
+        Some(Node::Leaf(l)) => {
+            if l.key == *key {
+                *removed = true;
+                None
+            } else {
+                Some(Node::Leaf(l))
+            }
+        }
+        Some(Node::Split(s)) => {
+            let mut left = s.left.clone();
+            let mut right = s.right.clone();
+            if bit(key, depth) == 0 {
+                left = node_remove(left, depth + 1, key, empty, removed);
+            } else {
+                right = node_remove(right, depth + 1, key, empty, removed);
+            }
+            if !*removed {
+                return Some(Node::Split(s));
+            }
+            collapse(left, right, depth, empty)
+        }
+    }
+}
+
+/// Re-form the node at `depth` after a removal below it.
+///
+/// The point of the collapse: `subtree_root` gives a subtree holding one key
+/// the *singleton fold from this depth*, not a split against an empty side.
+/// A tree that left the split standing would hash the same leaf differently
+/// from a tree that never held the removed key — same leaves, two roots,
+/// which is the one outcome this module exists to make impossible.
+fn collapse(
+    left: Option<Node>,
+    right: Option<Node>,
+    depth: usize,
+    empty: &[[u8; 32]],
+) -> Option<Node> {
+    let lone = match (&left, &right) {
+        (None, None) => return None,
+        (Some(Node::Leaf(l)), None) | (None, Some(Node::Leaf(l))) => Some((l.key, l.value_hash)),
+        _ => None,
+    };
+    match lone {
+        Some((key, value_hash)) => Some(new_leaf(key, value_hash, depth, empty)),
+        None => Some(new_split(left, right, depth, empty)),
+    }
+}
+
 /// A Merkle inclusion proof: the sibling hash at every depth, ordered from the
 /// root (depth 0) down to the leaf's sibling (depth 255).
 ///
@@ -410,82 +695,189 @@ pub struct InclusionProof {
 
 /// The sparse Merkle tree over the committed consensus state.
 ///
-/// This is a plain owned value with `&mut self` insertion — deliberate, and
-/// different from interior mutability: the caller sees every mutation in the
-/// type system, nothing mutates behind a `&self`, and there is no hidden
-/// root cache to go stale. [`Smt::root`] recomputes from the leaves every
-/// time, so it cannot disagree with the leaves.
+/// A plain owned value with `&mut self` mutation — deliberate, and different
+/// from interior mutability: the caller sees every mutation in the type
+/// system, and nothing mutates behind a `&self`.
 ///
-/// Leaves live in a `BTreeMap`, which iterates in key order regardless of
-/// insertion order. Together with the key-determined tree shape this gives
-/// the §5.5 property: same state ⇒ same root, full stop.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// Leaves are held in the key-determined trie above rather than in a flat
+/// map, which is what makes an update cost the update. Insertion order still
+/// cannot matter: a key's position is fixed by the key itself, so the same
+/// leaf set produces the same trie — the same shape, node for node — no
+/// matter what order it arrived in. This is the §5.5 property, and it is
+/// tested (`root_is_independent_of_the_mutation_sequence`).
+///
+/// ## The cached hashes, and why they are not the cache §5.5 bans
+///
+/// Every node stores its own subtree hash. That is a cache, and the module's
+/// rule is that no cached root may outlive the leaves it was computed from —
+/// a stale root is how `expected_bits` split the mainnet on 2026-08-08. The
+/// rule is not weakened here, because the cache cannot outlive its input:
+///
+/// - Nodes are **immutable**. A node's hash is computed in its constructor
+///   from the children it is built with and can never afterwards disagree
+///   with them, because neither can afterwards change.
+/// - A mutation does not update hashes in place; it **rebuilds** every node
+///   from the touched leaf up to the root. There is no invalidation step, so
+///   there is no invalidation to forget — the same argument that makes the
+///   singleton memo safe, applied to the tree.
+/// - The untouched subtrees are shared, not copied, and they are exactly the
+///   subtrees whose leaves did not change. A subtree whose leaves changed is
+///   on the rebuilt path by construction.
+///
+/// So [`Smt::root`] is O(1) and still cannot disagree with the leaves. The
+/// property that is *actually* load-bearing — same leaf multiset ⇒ same root
+/// — is pinned against the from-scratch recursion by
+/// `incremental_root_matches_the_flat_recursion`.
+#[derive(Clone, Debug)]
 pub struct Smt {
-    leaves: BTreeMap<[u8; 32], [u8; 32]>,
+    root: Option<Node>,
+    len: usize,
+    /// The empty-subtree constants (see [`empty_hashes`]). A field of the
+    /// value rather than a `OnceLock`: it is computed eagerly in the
+    /// constructor, is a pure function of nothing, and is shared by
+    /// refcount, so no global mutable state and no lazy initialisation are
+    /// introduced. Recomputing it per mutation instead would cost 256 SHA3
+    /// per inserted leaf — more than the leaf itself.
+    empty: std::sync::Arc<Vec<[u8; 32]>>,
+}
+
+/// Two trees are equal when they commit the same leaves. `empty` is excluded
+/// because it is the same constant table in every tree that exists.
+impl PartialEq for Smt {
+    fn eq(&self, other: &Self) -> bool {
+        self.len == other.len && self.root == other.root
+    }
+}
+impl Eq for Smt {}
+
+impl Default for Smt {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Smt {
     /// An empty tree. Its root is defined (see [`Smt::root`]) — a chain must
     /// be able to commit "no state yet" unambiguously at genesis.
     pub fn new() -> Self {
-        Self { leaves: BTreeMap::new() }
+        Self { root: None, len: 0, empty: std::sync::Arc::new(empty_hashes()) }
+    }
+
+    /// Build in bulk from a key-sorted leaf map. O(n) and one pass, for the
+    /// from-scratch paths; the per-block path clones an existing tree instead.
+    pub fn from_leaf_map(leaves: &BTreeMap<[u8; 32], [u8; 32]>) -> Self {
+        // BTreeMap iteration is already key-sorted, which `build_subtree`
+        // needs for the same reason `subtree_root` does.
+        let flat: Vec<([u8; 32], [u8; 32])> = leaves.iter().map(|(k, v)| (*k, *v)).collect();
+        let empty = std::sync::Arc::new(empty_hashes());
+        let root = build_subtree(&flat, 0, &empty);
+        Self { root, len: flat.len(), empty }
     }
 
     /// Insert or update the value hash at `key`. Last write wins; updating a
     /// key to the same value is a no-op on the root. Both are deterministic
-    /// functions of the final map contents, never of the call sequence.
+    /// functions of the final leaf set, never of the call sequence.
+    ///
+    /// Touches only the path from the root to `key` — for SHA3-distributed
+    /// keys that is ~log2(n) levels, not n.
     pub fn insert(&mut self, key: [u8; 32], value_hash: [u8; 32]) {
-        self.leaves.insert(key, value_hash);
+        let empty = std::sync::Arc::clone(&self.empty);
+        let (mut added, mut mutated) = (false, false);
+        let root = self.root.take();
+        self.root = node_insert(root, 0, key, value_hash, &empty, &mut added, &mut mutated);
+        if added {
+            self.len += 1;
+        }
+    }
+
+    /// Remove the leaf at `key`, if it is committed. Removing a key that is
+    /// not there is a no-op. The mirror of [`Smt::insert`]: a spent eUTXO
+    /// leaves the committed set, and the root must move exactly as if the
+    /// entry had never been inserted — which is what
+    /// `root_is_independent_of_the_mutation_sequence` checks.
+    pub fn remove(&mut self, key: &[u8; 32]) {
+        let empty = std::sync::Arc::clone(&self.empty);
+        let mut removed = false;
+        let root = self.root.take();
+        self.root = node_remove(root, 0, key, &empty, &mut removed);
+        if removed {
+            self.len -= 1;
+        }
+    }
+
+    /// The value hash committed at `key`, if any.
+    pub fn get(&self, key: &[u8; 32]) -> Option<[u8; 32]> {
+        let mut node = &self.root;
+        for d in 0..=TREE_DEPTH {
+            match node {
+                None => return None,
+                Some(Node::Leaf(l)) => {
+                    return if l.key == *key { Some(l.value_hash) } else { None };
+                }
+                Some(Node::Split(s)) => {
+                    node = if bit(key, d) == 0 { &s.left } else { &s.right };
+                }
+            }
+        }
+        None
     }
 
     /// Number of committed leaves.
     pub fn len(&self) -> usize {
-        self.leaves.len()
+        self.len
     }
 
     /// Whether the tree commits nothing.
     pub fn is_empty(&self) -> bool {
-        self.leaves.is_empty()
+        self.len == 0
     }
 
-    /// The committed root. Pure recomputation from the leaves — no memoized
-    /// value exists to be stale (§5.5: a cached root that survived a code
-    /// path that forgot to invalidate it is exactly how `expected_bits`
-    /// diverged).
+    /// The committed root, read off the root node — O(1).
+    ///
+    /// Not a memoized *recomputation* that could be skipped while the leaves
+    /// moved underneath it: the value returned is a field of the node the
+    /// leaves currently hang from, and any mutation replaced that node. See
+    /// the type's docs.
     pub fn root(&self) -> [u8; 32] {
-        let empty = empty_hashes();
-        // BTreeMap iteration is already key-sorted, which subtree_root needs.
-        let leaves: Vec<([u8; 32], [u8; 32])> =
-            self.leaves.iter().map(|(k, v)| (*k, *v)).collect();
-        subtree_root(&leaves, 0, &empty)
+        hash_of(&self.root, 0, &self.empty)
     }
 
     /// Inclusion proof for `key`, or `None` if the key is not committed.
     ///
-    /// The proof is generated by the same split walk as [`Smt::root`], so it
-    /// cannot structurally disagree with the root — there is one definition
-    /// of the tree shape, not two.
+    /// Walks the same nodes the root is built from, so it cannot structurally
+    /// disagree with it — there is one definition of the tree shape, not two.
+    /// Below the depth at which `key` becomes the only leaf in its subtree,
+    /// every sibling is the empty constant, which is precisely what
+    /// [`singleton_subtree_root`] folds against.
     pub fn prove(&self, key: &[u8; 32]) -> Option<InclusionProof> {
-        if !self.leaves.contains_key(key) {
-            return None;
-        }
-        let empty = empty_hashes();
-        let all: Vec<([u8; 32], [u8; 32])> =
-            self.leaves.iter().map(|(k, v)| (*k, *v)).collect();
         let mut siblings = Vec::with_capacity(TREE_DEPTH);
-        let mut slice: &[([u8; 32], [u8; 32])] = &all;
+        let mut node = &self.root;
         for d in 0..TREE_DEPTH {
-            let split = slice.partition_point(|(k, _)| bit(k, d) == 0);
-            if bit(key, d) == 0 {
-                siblings.push(subtree_root(&slice[split..], d + 1, &empty));
-                slice = &slice[..split];
-            } else {
-                siblings.push(subtree_root(&slice[..split], d + 1, &empty));
-                slice = &slice[split..];
+            match node {
+                None => return None,
+                Some(Node::Leaf(l)) => {
+                    if l.key != *key {
+                        return None;
+                    }
+                    for dd in d..TREE_DEPTH {
+                        siblings.push(self.empty[dd + 1]);
+                    }
+                    return Some(InclusionProof { siblings });
+                }
+                Some(Node::Split(s)) => {
+                    let (on_path, off_path) =
+                        if bit(key, d) == 0 { (&s.left, &s.right) } else { (&s.right, &s.left) };
+                    siblings.push(hash_of(off_path, d + 1, &self.empty));
+                    node = on_path;
+                }
             }
         }
-        debug_assert_eq!(slice.len(), 1);
-        Some(InclusionProof { siblings })
+        // Depth 256: unique 256-bit keys mean whatever is here is the single
+        // leaf that owns this path.
+        match node {
+            Some(Node::Leaf(l)) if l.key == *key => Some(InclusionProof { siblings }),
+            _ => None,
+        }
     }
 }
 
@@ -1209,46 +1601,52 @@ pub fn eutxo_leaf(e: &EutxoEntry) -> ([u8; 32], [u8; 32]) {
 /// inclusion proofs against the same tree the root came from.
 pub fn build_state_tree(state: &ConsensusState<'_>) -> Smt {
     let leaves: BTreeMap<[u8; 32], [u8; 32]> = state.eutxos.iter().map(eutxo_leaf).collect();
-    build_state_tree_inner(state, &leaves)
+    build_state_tree_inner(state, &Smt::from_leaf_map(&leaves))
 }
 
-/// [`build_state_tree`] with the eUTXO leaves handed in already computed.
+/// [`build_state_tree`] with the eUTXO component handed in as a tree the
+/// caller already holds.
 ///
 /// Why this exists: `build_state_tree` re-serializes and re-hashes **every**
 /// eUTXO on every call, and a block calls it at least once. At Genesis-4's
 /// carryover size that is 452,726 entries — around 900,000 SHA3 hashes plus a
-/// full `BTreeMap` rebuild, per block. A `perf` profile of a replaying
-/// validator on 2026-08-21 put 50.7% of its CPU in the keccak permutation and
-/// another 9.2% in `Smt::insert`, for a state where all but a handful of those
-/// entries were byte-for-byte identical to the previous block.
+/// full tree rebuild, per block. A `perf` profile of a replaying validator on
+/// 2026-08-21 put 50.7% of its CPU in the keccak permutation, for a state
+/// where all but a handful of those entries were byte-for-byte identical to
+/// the previous block.
 ///
-/// The leaves a caller passes here must come from [`eutxo_leaf`] — that is why
-/// it is public. This function is not a cache and holds no state: it recomputes
-/// the tree, and therefore the root, from whatever leaves it is given, every
-/// time. The §5.5 rule ("no cached root may outlive the leaves it was computed
-/// from") is untouched; what is cached upstream is the *leaves*, each of which
-/// is a pure function of one entry.
+/// This takes an [`Smt`] and not a leaf map on purpose. A map still has to be
+/// walked into a tree, which is the O(set) cost this exists to remove; a tree
+/// is *cloned*, which shares every untouched subtree by refcount and costs
+/// nothing. The caller then pays only for the leaves this block actually
+/// moved. See [`crate::transition::EutxoSet`] for the type that keeps it.
 ///
-/// `state.eutxos` is IGNORED here — `eutxo_leaves` replaces it. Pass an empty
+/// It holds no state of its own and caches nothing: it returns the tree that
+/// the given eUTXO tree plus this state's other components define, every
+/// time. The §5.5 rule ("no cached root may outlive the leaves it was
+/// computed from") is untouched — what the caller keeps is the *leaves*, in
+/// the structure that hashes them, and every hash in it was computed from the
+/// leaves hanging under it.
+///
+/// `state.eutxos` is IGNORED here — `eutxo_tree` replaces it. Pass an empty
 /// slice so a reader cannot mistake one for the other.
-pub fn build_state_tree_with_eutxo_leaves(
+pub fn build_state_tree_with_eutxo_tree(
     state: &ConsensusState<'_>,
-    eutxo_leaves: &BTreeMap<[u8; 32], [u8; 32]>,
+    eutxo_tree: &Smt,
 ) -> Smt {
-    build_state_tree_inner(state, eutxo_leaves)
+    build_state_tree_inner(state, eutxo_tree)
 }
 
-/// [`build_state_tree`] and [`build_state_tree_with_eutxo_leaves`] are the same
-/// tree; only where the eUTXO leaves come from differs. Written once so the two
-/// entry points cannot drift into committing different shapes.
-fn build_state_tree_inner(
-    state: &ConsensusState<'_>,
-    eutxo_leaves: &BTreeMap<[u8; 32], [u8; 32]>,
-) -> Smt {
-    let mut smt = Smt::new();
-    for (key, value_hash) in eutxo_leaves {
-        smt.insert(*key, *value_hash);
-    }
+/// [`build_state_tree`] and [`build_state_tree_with_eutxo_tree`] are the same
+/// tree; only where the eUTXO component comes from differs. Written once so the
+/// two entry points cannot drift into committing different shapes.
+///
+/// The eUTXO tree is *cloned* rather than re-inserted leaf by leaf: the clone
+/// shares every subtree, so the copy is a refcount and the only hashing this
+/// function does is for the components below, which are a few hundred leaves
+/// against the eUTXO set's hundreds of thousands.
+fn build_state_tree_inner(state: &ConsensusState<'_>, eutxo_tree: &Smt) -> Smt {
+    let mut smt = eutxo_tree.clone();
     for v in state.validators {
         smt.insert(derive_key(TAG_VALIDATOR, &v.entry_key()), hash_value(&v.serialize()));
     }
@@ -1343,15 +1741,15 @@ pub fn state_root(state: &ConsensusState<'_>) -> [u8; 32] {
     build_state_tree(state).root()
 }
 
-/// [`state_root`] over a state whose eUTXO leaves the caller already holds.
+/// [`state_root`] over a state whose eUTXO tree the caller already holds.
 ///
-/// Same root, same rules; see [`build_state_tree_with_eutxo_leaves`] for why
-/// the leaves are worth keeping and why keeping them is not a cached root.
-pub fn state_root_with_eutxo_leaves(
+/// Same root, same rules; see [`build_state_tree_with_eutxo_tree`] for why the
+/// tree is worth keeping and why keeping it is not a cached root.
+pub fn state_root_with_eutxo_tree(
     state: &ConsensusState<'_>,
-    eutxo_leaves: &BTreeMap<[u8; 32], [u8; 32]>,
+    eutxo_tree: &Smt,
 ) -> [u8; 32] {
-    build_state_tree_with_eutxo_leaves(state, eutxo_leaves).root()
+    build_state_tree_with_eutxo_tree(state, eutxo_tree).root()
 }
 
 /// Sum of all committed eUTXO values, in u128.
@@ -1428,6 +1826,322 @@ mod tests {
         println!("  folhas: {n}");
         println!("  1a raiz (memo frio) : {cold:.2?}");
         println!("  2a raiz (memo quente): {warm:.2?}");
+    }
+
+    /// A deterministic SplitMix64, so a failing randomized case is a case
+    /// anyone can reproduce from the seed printed with it.
+    fn splitmix(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// The root the tree MUST produce: the from-scratch recursion over a flat
+    /// key-sorted slice — the implementation that shipped before the tree was
+    /// materialised, kept here verbatim as the reference.
+    fn flat_root(leaves: &BTreeMap<[u8; 32], [u8; 32]>) -> [u8; 32] {
+        let flat: Vec<([u8; 32], [u8; 32])> = leaves.iter().map(|(k, v)| (*k, *v)).collect();
+        subtree_root(&flat, 0, &empty_hashes())
+    }
+
+    /// **The safety argument, as a test.**
+    ///
+    /// The incremental tree is a materialisation of `subtree_root`'s
+    /// recursion, so its root must equal that recursion's, leaf set for leaf
+    /// set. Checked over random sets at many sizes, plus the two degenerate
+    /// ones (empty, single leaf) and the case a trie is worst at: keys that
+    /// agree on a long prefix and part only near the bottom of the tree.
+    #[test]
+    fn incremental_root_matches_the_flat_recursion() {
+        // Empty and single-leaf, named rather than left to chance.
+        assert_eq!(Smt::new().root(), flat_root(&BTreeMap::new()), "the empty tree");
+        {
+            let mut one = Smt::new();
+            one.insert(key(7), val(7));
+            let mut want = BTreeMap::new();
+            want.insert(key(7), val(7));
+            assert_eq!(one.root(), flat_root(&want), "a single leaf");
+        }
+
+        // Random sets, sizes spanning the shallow and the branching regimes.
+        for n in [2usize, 3, 5, 17, 64, 255, 1000] {
+            let mut rng = 0xC0FF_EE00_u64 ^ (n as u64);
+            let mut smt = Smt::new();
+            let mut want: BTreeMap<[u8; 32], [u8; 32]> = BTreeMap::new();
+            for _ in 0..n {
+                let k = derive_key(TAG_EUTXO, &splitmix(&mut rng).to_le_bytes());
+                let v = hash_value(&splitmix(&mut rng).to_le_bytes());
+                smt.insert(k, v);
+                want.insert(k, v);
+            }
+            assert_eq!(smt.len(), want.len(), "leaf count diverged at n={n}");
+            assert_eq!(smt.root(), flat_root(&want), "root diverged at n={n}");
+        }
+    }
+
+    /// Keys built to be adversarial for a compressed trie: a common prefix so
+    /// long that the split lands in the last handful of levels, including
+    /// pairs that part only at bit 255 and therefore sit at the full depth.
+    ///
+    /// This is where a materialised trie can differ from the flat recursion —
+    /// a split left standing where the recursion would fold a singleton, or a
+    /// leaf hashed for the wrong depth. Both would move the root.
+    #[test]
+    fn shared_long_prefix_keys_match_the_flat_recursion() {
+        let base = derive_key(TAG_EUTXO, b"a very long shared prefix");
+        let flip = |bits: &[usize]| {
+            let mut k = base;
+            for &b in bits {
+                k[b / 8] ^= 1 << (7 - (b % 8));
+            }
+            k
+        };
+
+        // Every key agrees with `base` down to bit 240, so every split is in
+        // the bottom 16 levels; the 255 pair parts at the very last bit.
+        let keys: Vec<[u8; 32]> = vec![
+            base,
+            flip(&[255]),
+            flip(&[254]),
+            flip(&[254, 255]),
+            flip(&[248]),
+            flip(&[241]),
+            flip(&[240]),
+            flip(&[240, 255]),
+        ];
+
+        // Every non-empty subset, so every shape of "who is a singleton at
+        // what depth" in this family is exercised.
+        for mask in 1u32..(1 << keys.len()) {
+            let mut smt = Smt::new();
+            let mut want: BTreeMap<[u8; 32], [u8; 32]> = BTreeMap::new();
+            for (i, k) in keys.iter().enumerate() {
+                if mask & (1 << i) != 0 {
+                    let v = hash_value(&(i as u32).to_le_bytes());
+                    smt.insert(*k, v);
+                    want.insert(*k, v);
+                }
+            }
+            assert_eq!(smt.root(), flat_root(&want), "root diverged for subset {mask:#b}");
+        }
+    }
+
+    /// **Order must not matter — the §5.5 property, over mutations and not
+    /// just insertions.**
+    ///
+    /// A random sequence of inserts, updates and removals is applied, then
+    /// the same *final* leaf set is built in a different order and, again,
+    /// from scratch. All three must agree with the flat recursion. A trie
+    /// that failed to collapse a split after a removal, or that kept a leaf's
+    /// fold from the depth it used to sit at, diverges here and nowhere in a
+    /// build-only test.
+    #[test]
+    fn root_is_independent_of_the_mutation_sequence() {
+        for seed in 0..24u64 {
+            let mut rng = 0xDEAD_BEEF_u64 ^ seed;
+            // A small key space so removals actually hit, and so keys share
+            // prefixes with each other by collision rather than by luck.
+            let space: Vec<[u8; 32]> =
+                (0..40u32).map(|i| derive_key(TAG_EUTXO, &i.to_le_bytes())).collect();
+
+            let mut smt = Smt::new();
+            let mut want: BTreeMap<[u8; 32], [u8; 32]> = BTreeMap::new();
+            for step in 0..300 {
+                let k = space[(splitmix(&mut rng) as usize) % space.len()];
+                if splitmix(&mut rng) % 3 == 0 {
+                    smt.remove(&k);
+                    want.remove(&k);
+                } else {
+                    let v = hash_value(&splitmix(&mut rng).to_le_bytes());
+                    smt.insert(k, v);
+                    want.insert(k, v);
+                }
+                assert_eq!(smt.len(), want.len(), "leaf count diverged (seed {seed}, step {step})");
+                assert_eq!(
+                    smt.root(),
+                    flat_root(&want),
+                    "root diverged mid-sequence (seed {seed}, step {step})"
+                );
+            }
+
+            // Same final leaf set, built forwards and backwards from nothing.
+            let mut forward = Smt::new();
+            for (k, v) in &want {
+                forward.insert(*k, *v);
+            }
+            let mut reverse = Smt::new();
+            for (k, v) in want.iter().rev() {
+                reverse.insert(*k, *v);
+            }
+            assert_eq!(smt.root(), forward.root(), "the mutated tree disagreed with a fresh build");
+            assert_eq!(smt.root(), reverse.root(), "insertion order changed the root");
+            assert_eq!(smt.root(), Smt::from_leaf_map(&want).root(), "the bulk build disagreed");
+        }
+    }
+
+    /// Removing every key must land back on the empty root, not on some
+    /// residue of the tree that used to be there.
+    #[test]
+    fn removing_everything_returns_the_empty_root() {
+        let empty_root = Smt::new().root();
+        let mut smt = Smt::new();
+        let keys: Vec<[u8; 32]> =
+            (0..64u32).map(|i| derive_key(TAG_EUTXO, &i.to_le_bytes())).collect();
+        for (i, k) in keys.iter().enumerate() {
+            smt.insert(*k, hash_value(&(i as u32).to_le_bytes()));
+        }
+        assert_ne!(smt.root(), empty_root, "control: a populated tree is not the empty one");
+        for k in keys.iter().rev() {
+            smt.remove(k);
+        }
+        assert!(smt.is_empty());
+        assert_eq!(smt.root(), empty_root, "an emptied tree must equal a never-filled one");
+        // Removing an absent key is a no-op, on the root and on the count.
+        smt.remove(&keys[0]);
+        assert_eq!(smt.root(), empty_root);
+        assert_eq!(smt.len(), 0);
+    }
+
+    /// Proofs are generated by walking the same nodes the root is read from,
+    /// so they must verify against it — including for a key that is the only
+    /// leaf in its subtree (the singleton fold, where every sibling below the
+    /// branch point is the empty constant).
+    #[test]
+    fn proofs_verify_against_the_incremental_root_after_mutation() {
+        let mut rng = 0x5EED_u64;
+        let mut smt = Smt::new();
+        let mut want: BTreeMap<[u8; 32], [u8; 32]> = BTreeMap::new();
+        for _ in 0..500 {
+            let k = derive_key(TAG_EUTXO, &splitmix(&mut rng).to_le_bytes());
+            let v = hash_value(&splitmix(&mut rng).to_le_bytes());
+            smt.insert(k, v);
+            want.insert(k, v);
+        }
+        // Mutate: drop a third, rewrite a third.
+        let all: Vec<[u8; 32]> = want.keys().copied().collect();
+        for (i, k) in all.iter().enumerate() {
+            if i % 3 == 0 {
+                smt.remove(k);
+                want.remove(k);
+            } else if i % 3 == 1 {
+                let v = hash_value(&splitmix(&mut rng).to_le_bytes());
+                smt.insert(*k, v);
+                want.insert(*k, v);
+            }
+        }
+        let root = smt.root();
+        assert_eq!(root, flat_root(&want));
+        for (k, v) in &want {
+            let proof = smt.prove(k).expect("a committed key must be provable");
+            assert!(verify_inclusion(&root, k, v, &proof), "proof failed for a committed key");
+        }
+        for k in all.iter().step_by(3) {
+            assert!(smt.prove(k).is_none(), "a removed key must not be provable");
+        }
+    }
+
+    /// Carryover-scale cost of the two things a block actually does: build
+    /// the tree once, then commit a root after a handful of leaves moved.
+    ///
+    /// Prints rather than asserts — wall-clock is a machine property. The
+    /// asymptotic claim is asserted, in hash counts, by
+    /// [`tests::a_small_update_costs_a_bounded_number_of_node_hashes`].
+    /// Run with `--release -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn carryover_scale_incremental_cost() {
+        let n = 452_726u32;
+        let leaf = |i: u32| {
+            (derive_key(TAG_EUTXO, &i.to_le_bytes()), hash_value(&i.to_le_bytes()))
+        };
+
+        let t0 = std::time::Instant::now();
+        let mut smt = Smt::new();
+        for i in 0..n {
+            let (k, v) = leaf(i);
+            smt.insert(k, v);
+        }
+        let build = t0.elapsed();
+
+        let t1 = std::time::Instant::now();
+        let a = smt.root();
+        let root_cold = t1.elapsed();
+        let t2 = std::time::Instant::now();
+        let b = smt.root();
+        let root_warm = t2.elapsed();
+        assert_eq!(a, b);
+
+        // Four spends and four creations: the shape of an ordinary block.
+        let t3 = std::time::Instant::now();
+        for i in 0..4u32 {
+            smt.remove(&leaf(i * 7919).0);
+        }
+        for i in 0..4u32 {
+            let k = derive_key(TAG_EUTXO, &(n + i).to_le_bytes());
+            smt.insert(k, hash_value(&(n + i).to_le_bytes()));
+        }
+        let edit = t3.elapsed();
+        let t4 = std::time::Instant::now();
+        let c = smt.root();
+        let root_after_edit = t4.elapsed();
+        assert_ne!(a, c);
+
+        println!("  leaves                    : {n}");
+        println!("  build                     : {build:.4?}");
+        println!("  root() #1 (memo cold)     : {root_cold:.4?}");
+        println!("  root() #2 (memo warm)     : {root_warm:.4?}");
+        println!("  8-leaf edit               : {edit:.4?}");
+        println!("  root() after the 8 edits  : {root_after_edit:.4?}");
+    }
+
+    /// **The asymptotic claim, as a test.**
+    ///
+    /// Eight leaves change in a tree of 200,000. The root that follows must
+    /// cost a number of internal hashes proportional to the *edit*, not to
+    /// the tree — concretely, far less than one hash per leaf. Against the
+    /// flat-slice recomputation this fails by three orders of magnitude
+    /// (that walk hashes an internal node per internal node of the whole
+    /// tree, ~200,000 of them, every single call).
+    ///
+    /// The bound is deliberately loose. Eight leaves at a branching depth of
+    /// ~log2(50k) ≈ 16, each also folding its own 256-level singleton path,
+    /// measures at 4,201 hashes; the flat recomputation this replaced measures
+    /// at 72,644 for the same edit, and would at 452,726 leaves measure at
+    /// ~650,000. Eight thousand sits above the first with room for the tree
+    /// shape to shift and an order of magnitude below the second, so the test
+    /// states an asymptotic fact and not a machine's timing.
+    #[test]
+    fn a_small_update_costs_a_bounded_number_of_node_hashes() {
+        let n = 50_000u32;
+        let leaf = |i: u32| {
+            (derive_key(TAG_EUTXO, &i.to_le_bytes()), hash_value(&i.to_le_bytes()))
+        };
+        let mut smt = Smt::new();
+        for i in 0..n {
+            let (k, v) = leaf(i);
+            smt.insert(k, v);
+        }
+        let before = smt.root();
+
+        let (after, hashes) = counting_node_hashes(|| {
+            for i in 0..4u32 {
+                smt.remove(&leaf(i * 7919).0);
+            }
+            for i in 0..4u32 {
+                let k = derive_key(TAG_EUTXO, &(n + i).to_le_bytes());
+                smt.insert(k, hash_value(&(n + i).to_le_bytes()));
+            }
+            smt.root()
+        });
+        assert_ne!(before, after, "control: the edit must move the root");
+        println!("  8-leaf edit in a {n}-leaf tree: {hashes} internal node hashes");
+        assert!(
+            hashes < 8_000,
+            "an 8-leaf edit in a {n}-leaf tree cost {hashes} internal hashes: \
+             the root is being recomputed from the whole leaf set, not from the edit"
+        );
     }
 
     #[test]
@@ -1765,9 +2479,10 @@ mod tests {
 
         let from_entries = state_root(&state(&f));
         let leaves: BTreeMap<[u8; 32], [u8; 32]> = f.eutxos.iter().map(eutxo_leaf).collect();
+        let tree = Smt::from_leaf_map(&leaves);
         let mut view = state(&f);
         view.eutxos = &[];
-        let from_leaves = state_root_with_eutxo_leaves(&view, &leaves);
+        let from_leaves = state_root_with_eutxo_tree(&view, &tree);
 
         assert_eq!(
             from_entries, from_leaves,
@@ -1777,10 +2492,9 @@ mod tests {
         // Control: the balances genuinely reach the root, so the equality above
         // is not two paths agreeing on a state they both ignored — the bug this
         // component actually shipped with once.
-        let empty: BTreeMap<[u8; 32], [u8; 32]> = BTreeMap::new();
         assert_ne!(
             from_entries,
-            state_root_with_eutxo_leaves(&view, &empty),
+            state_root_with_eutxo_tree(&view, &Smt::new()),
             "dropping every output left the root unchanged: the eUTXO component is not committed"
         );
     }
@@ -1808,6 +2522,7 @@ mod tests {
 
         let mut view = state(&f);
         let leaves: BTreeMap<[u8; 32], [u8; 32]> = eutxos.iter().map(eutxo_leaf).collect();
+        let tree = Smt::from_leaf_map(&leaves);
 
         // Warm BOTH paths before timing either. The singleton memo is
         // thread-local and persists across calls, so a cold first run and a
@@ -1817,7 +2532,7 @@ mod tests {
         view.eutxos = &eutxos;
         let a = state_root(&view);
         view.eutxos = &[];
-        let b = state_root_with_eutxo_leaves(&view, &leaves);
+        let b = state_root_with_eutxo_tree(&view, &tree);
 
         view.eutxos = &eutxos;
         let t0 = std::time::Instant::now();
@@ -1826,7 +2541,7 @@ mod tests {
 
         view.eutxos = &[];
         let t1 = std::time::Instant::now();
-        let b2 = state_root_with_eutxo_leaves(&view, &leaves);
+        let b2 = state_root_with_eutxo_tree(&view, &tree);
         let from_leaves = t1.elapsed();
         assert_eq!(a, a2);
         assert_eq!(b, b2);
@@ -1843,14 +2558,14 @@ mod tests {
             memo_put((k, k, 0), k);
         }
         let t2 = std::time::Instant::now();
-        let c = state_root_with_eutxo_leaves(&view, &leaves);
+        let c = state_root_with_eutxo_tree(&view, &tree);
         let after_rotation = t2.elapsed();
         assert_eq!(b, c);
 
         assert_eq!(a, b, "the measurement is only meaningful if both paths agree");
         println!("  entries ({N} eUTXOs): {from_entries:?}");
-        println!("  kept leaves:          {from_leaves:?}");
-        println!("  kept leaves, just after a memo rotation: {after_rotation:?}");
+        println!("  kept tree:            {from_leaves:?}");
+        println!("  kept tree, just after a memo rotation: {after_rotation:?}");
         println!(
             "  saved per state root: {:.1}%",
             100.0 * (1.0 - from_leaves.as_secs_f64() / from_entries.as_secs_f64())

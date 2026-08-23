@@ -1117,13 +1117,13 @@ pub struct CommittedState {
     eutxos: EutxoSet,
 }
 
-/// The committed eUTXO set, and the Merkle leaves it contributes to the state
-/// root, in one value.
+/// The committed eUTXO set, and the Merkle subtree it contributes to the
+/// state root, in one value.
 ///
 /// **Why one type and not two fields.** Keeping the leaves is what makes the
 /// state root cheap — see
-/// [`crate::state_root::build_state_tree_with_eutxo_leaves`] for the
-/// measurement. But a leaf map that can be updated independently of the
+/// [`crate::state_root::build_state_tree_with_eutxo_tree`] for the
+/// measurement. But a leaf store that can be updated independently of the
 /// entries is a cache that can go stale, and a stale leaf is a wrong state
 /// root, which is a consensus split — the exact failure the §5.5 rule exists
 /// to prevent. So the two are never separately reachable: `insert` and
@@ -1131,27 +1131,35 @@ pub struct CommittedState {
 /// touch one without the other. Drift is not guarded against here; it is
 /// unrepresentable.
 ///
+/// **Why a tree and not a leaf map.** The map still had to be walked into a
+/// tree once per block, and that walk — not the leaf derivation — was the
+/// cost: at carryover scale it hashed every internal node of a 452,726-leaf
+/// tree to commit a block that moved eight of them. Holding the tree makes
+/// the walk incremental, because [`crate::state_root::Smt`] rebuilds only the
+/// path to a changed leaf and shares the rest.
+///
 /// The leaf itself comes from [`crate::state_root::eutxo_leaf`], the single
 /// definition shared with the from-scratch path, so a kept leaf and a
 /// recomputed one cannot disagree by construction.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct EutxoSet {
     entries: BTreeMap<([u8; 32], u32), crate::state_root::EutxoEntry>,
-    /// `entry key -> value hash`, one per entry, always exactly in step.
-    leaves: BTreeMap<[u8; 32], [u8; 32]>,
+    /// The subtree of `entry key -> value hash` leaves, one per entry, always
+    /// exactly in step.
+    tree: crate::state_root::Smt,
 }
 
 impl EutxoSet {
     fn insert(&mut self, entry: crate::state_root::EutxoEntry) {
         let (key, value_hash) = crate::state_root::eutxo_leaf(&entry);
-        self.leaves.insert(key, value_hash);
+        self.tree.insert(key, value_hash);
         self.entries.insert((entry.txid, entry.vout), entry);
     }
 
     fn remove(&mut self, outpoint: &([u8; 32], u32)) {
         if let Some(entry) = self.entries.remove(outpoint) {
             let (key, _) = crate::state_root::eutxo_leaf(&entry);
-            self.leaves.remove(&key);
+            self.tree.remove(&key);
         }
     }
 
@@ -1173,8 +1181,8 @@ impl EutxoSet {
         self.entries.len()
     }
 
-    /// The leaves this set contributes, ready for
-    /// [`crate::state_root::state_root_with_eutxo_leaves`].
+    /// The subtree this set contributes, ready for
+    /// [`crate::state_root::state_root_with_eutxo_tree`].
     ///
     /// Debug builds re-derive every leaf here and compare. The type makes
     /// drift unrepresentable, so this can only fire if someone adds a third
@@ -1186,20 +1194,20 @@ impl EutxoSet {
     /// patch exists to avoid — deliberately, and `debug_assert` only. A node
     /// built without optimisations was already unusable at this state size;
     /// this makes it more so, and buys the invariant in every test run.
-    fn leaves(&self) -> &BTreeMap<[u8; 32], [u8; 32]> {
+    fn tree(&self) -> &crate::state_root::Smt {
         debug_assert_eq!(
-            self.leaves.len(),
+            self.tree.len(),
             self.entries.len(),
-            "kept eUTXO leaves drifted from the entries: a mutator updated one half only"
+            "the kept eUTXO subtree drifted from the entries: a mutator updated one half only"
         );
         debug_assert!(
             self.entries.values().all(|e| {
                 let (key, value_hash) = crate::state_root::eutxo_leaf(e);
-                self.leaves.get(&key) == Some(&value_hash)
+                self.tree.get(&key) == Some(value_hash)
             }),
             "a kept eUTXO leaf disagrees with the entry it was derived from"
         );
-        &self.leaves
+        &self.tree
     }
 }
 
@@ -1629,14 +1637,16 @@ impl CommittedState {
             })
             .collect();
 
-        // The eUTXO component comes in as leaves the set already holds, not as
-        // a cloned vector of entries to re-serialize and re-hash. `&[]` below
+        // The eUTXO component comes in as the subtree the set already holds,
+        // not as a cloned vector of entries to re-serialize, re-hash and
+        // re-walk into a tree — cloning it shares every leaf this block did
+        // not touch. `&[]` below
         // is not "no balances" — it is the field this path does not read; the
-        // balances arrive through `self.eutxos.leaves()` on the call itself.
+        // balances arrive through `self.eutxos.tree()` on the call itself.
         // (It genuinely WAS `&[]` once, under a comment saying the node
         // supplied it, and nothing did: every block from genesis committed an
         // empty balance component. Hence the emphasis.)
-        crate::state_root::state_root_with_eutxo_leaves(&ConsensusState {
+        crate::state_root::state_root_with_eutxo_tree(&ConsensusState {
             eutxos: &[],
             validators: &validators,
             current_participation: &current,
@@ -1663,7 +1673,7 @@ impl CommittedState {
             coherence_nullifier_root: self.coherence_nullifier_root,
             evm: self.evm,
             issued_sat: self.issued_sat,
-        }, self.eutxos.leaves())
+        }, self.eutxos.tree())
     }
 
     // ── Fork-choice accumulation ────────────────────────────────────────────
@@ -3658,6 +3668,82 @@ mod tests {
         opening_balances: &[crate::state_root::EutxoEntry],
     ) -> (Transition<ToyVerifier>, CommittedState, Vec<RandaoChain>) {
         setup_with(n, ToyVerifier, opening_balances)
+    }
+
+    /// What a block-level state root costs at Genesis-4's real carryover
+    /// size, and what the `pre.clone()` in `apply_block` costs beside it.
+    ///
+    /// `#[ignore]`: it builds a 452,726-output ledger and is a measurement,
+    /// not an assertion. Run it deliberately, in release:
+    ///
+    /// ```text
+    /// cargo test --release -p bloch-pos-committee --lib \
+    ///     carryover_scale_block_cost -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn carryover_scale_block_cost() {
+        const N: u32 = 452_726;
+        let balances: Vec<crate::state_root::EutxoEntry> = (0..N)
+            .map(|i| {
+                let mut txid = [0u8; 32];
+                txid[..4].copy_from_slice(&i.to_le_bytes());
+                crate::state_root::EutxoEntry {
+                    txid,
+                    vout: 0,
+                    value: 1_000 + i as u64,
+                    script_hash: [7u8; 32],
+                }
+            })
+            .collect();
+
+        let t0 = std::time::Instant::now();
+        let (_t, mut st, _chains) = setup_funded(8, &balances);
+        let genesis_build = t0.elapsed();
+
+        // Warm first: the singleton memo is thread-local and persists, so a
+        // cold first call would be a comparison of caches, not of paths.
+        let warm = st.state_root();
+
+        let t1 = std::time::Instant::now();
+        let again = st.state_root();
+        let unchanged = t1.elapsed();
+        assert_eq!(warm, again);
+
+        // Four spends and four creations — the shape of an ordinary block.
+        let t2 = std::time::Instant::now();
+        for i in 0..4u32 {
+            let mut txid = [0u8; 32];
+            txid[..4].copy_from_slice(&(i * 7919).to_le_bytes());
+            st.eutxos.remove(&(txid, 0));
+        }
+        for i in 0..4u32 {
+            let mut txid = [0u8; 32];
+            txid[..4].copy_from_slice(&(N + i).to_le_bytes());
+            st.eutxos.insert(crate::state_root::EutxoEntry {
+                txid,
+                vout: 0,
+                value: 42,
+                script_hash: [9u8; 32],
+            });
+        }
+        let edit = t2.elapsed();
+        let t3 = std::time::Instant::now();
+        let moved = st.state_root();
+        let after_edit = t3.elapsed();
+        assert_ne!(warm, moved, "control: the edit must move the root");
+
+        let t4 = std::time::Instant::now();
+        let cloned = st.clone();
+        let pre_clone = t4.elapsed();
+        assert_eq!(cloned.state_root(), moved);
+
+        println!("  outputs                          : {N}");
+        println!("  genesis build (one-off)          : {genesis_build:.4?}");
+        println!("  state_root(), nothing changed    : {unchanged:.4?}");
+        println!("  8-output edit                    : {edit:.4?}");
+        println!("  state_root() after the 8 edits   : {after_edit:.4?}");
+        println!("  pre.clone() of the whole state   : {pre_clone:.4?}");
     }
 
     fn setup_with<V: SignatureVerifier>(
