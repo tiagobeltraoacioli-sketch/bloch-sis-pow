@@ -231,15 +231,18 @@ fn body_transactions(env: &BlockEnvelope) -> Result<Vec<PosTransaction>, String>
 ///    interior mutability (its own type doc says so). Same state, same epoch,
 ///    same bytes out, always.
 /// 2. `generation` identifies the state value. It starts at zero and is
-///    incremented by `set`, which is the only writer; two different states
-///    therefore never share a generation within a process.
+///    incremented by every writer of `state` — `set` and `set_arc`, and the
+///    module has no third — so two different states never share a generation
+///    within a process. What the argument needs is not "one writer" but "no
+///    writer that skips the bump", which is a property of the two that exist
+///    and must be re-checked if a third is ever added.
 /// 3. Nothing else is read. Not the chain, not the block store, not the pool,
 ///    not the wall clock — the function's signature is the proof, since it
 ///    takes only the epoch and the rolling closure.
 ///
 /// So `(generation, epoch)` determines the result, which is what "sound key"
-/// means. `set` clearing the memo is belt AND braces: even the entry that
-/// could not be returned is not left lying around.
+/// means. The writers clearing the memo is belt AND braces: even the entry
+/// that could not be returned is not left lying around.
 ///
 /// This is deliberately NOT the fork-choice store's posture (rebuilt every
 /// call, module docs above). The difference is that a fork-choice store
@@ -269,7 +272,13 @@ mod state_cell {
 
     pub(super) struct StateCell {
         state: Arc<CommittedState>,
-        /// Bumped by `set`, which is the only writer of `state`.
+        /// Bumped by every writer of `state`. There are exactly two — `set`
+        /// and `set_arc` — and they do identical bookkeeping: replace the
+        /// state, bump this, empty the memo. Two entry points because the
+        /// reorg path already holds its post-state behind an `Arc` (the
+        /// snapshot ring keeps one) and should not pay a copy to install it.
+        /// The memo key's soundness rests on there being NO writer that does
+        /// less than these two, not on there being only one.
         generation: u64,
         memo: RefCell<Vec<Entry>>,
     }
