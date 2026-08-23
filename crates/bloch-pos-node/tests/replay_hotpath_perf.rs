@@ -17,8 +17,11 @@
 //       -- --ignored --nocapture --test-threads=1
 //
 // NOTE ON THE MEMO: state_root.rs holds a THREAD-LOCAL two-generation memo of
-// singleton subtree roots. Its state dominates every number below, so each
-// measurement that needs a cold memo is run on its own freshly spawned thread.
+// singleton subtree roots. Its state dominates every number below, so any two
+// figures that are printed side by side and divided by each other are measured
+// on two SEPARATE freshly spawned threads (see `cold_thread`). Sharing a thread
+// between two rival builds hands the second one the first's cache and prints
+// the inverse of the claim; that happened here and was corrected 2026-08-23.
 
 use bloch_pos_committee::state_root::{
     build_state_tree, eutxo_leaf, state_root_with_eutxo_tree, BaseFeeRecord, CheckpointRecord,
@@ -165,116 +168,208 @@ fn cpu() -> String {
         .unwrap_or_else(|| "unknown".into())
 }
 
+// ── helpers ────────────────────────────────────────────────────────────────
+
+/// Run `f` on a thread that has never computed a state root, and hand back
+/// what it returns.
+///
+/// This is not decoration. `state_root.rs` keeps a THREAD-LOCAL two-generation
+/// memo of singleton subtree roots; whichever of two builds runs second on the
+/// same thread inherits the first's memo and is measured against a warm cache
+/// the first never had. Any two figures that are printed side by side and
+/// compared to each other must therefore come from two different fresh threads,
+/// or the comparison prints the inverse of what it claims. That is not
+/// hypothetical — it is the bug this file was corrected for on 2026-08-23, and
+/// the identical bug is still live in
+/// `bloch-pos-committee/src/state_root.rs::carryover_scale_incremental_cost`,
+/// whose bulk and leaf-by-leaf builds share one thread.
+fn cold_thread<T: Send + 'static>(name: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
+    std::thread::Builder::new()
+        .name(name.to_string())
+        .stack_size(256 << 20)
+        .spawn(f)
+        .expect("spawn")
+        .join()
+        .expect("measurement thread panicked")
+}
+
+/// The eUTXO leaf map at carryover scale. Rebuilt inside each measurement
+/// thread rather than shared, so no thread borrows another's warm anything.
+fn carryover_leaf_map() -> BTreeMap<[u8; 32], [u8; 32]> {
+    eutxos(CARRYOVER_N).iter().map(eutxo_leaf).collect()
+}
+
 // ── 1. the breakdown at carryover scale ────────────────────────────────────
 
-/// Full rebuild vs incremental, at n = 452,726. Runs on its own thread so the
-/// singleton memo starts empty.
+/// Every phase of a state root at n = 452,726, each phase on its own freshly
+/// spawned thread.
+///
+/// # What changed on 2026-08-23, and why
+///
+/// This measurement used to run its whole breakdown on one thread and then
+/// print `ratio (a) full rebuild / (d) incremental`. Both halves of that ratio
+/// were wrong:
+///
+///   * the second build inherited the first's singleton memo, so whichever ran
+///     second was timed against a cache it had not paid for, and
+///   * `Smt::root()` is O(1) since `perf/smt` — it reads a field off the root
+///     node. The old "root(), COLD memo" / "root(), WARM memo" pair was ported
+///     from the era when `root()` walked the leaf set, and after the port it was
+///     timing a struct field read and calling it a 51-second cold root.
+///
+/// Both are fixed below: every figure that is compared to another figure is
+/// measured on its own cold thread, and the phases are named for what they now
+/// actually do.
 #[test]
 #[ignore]
 fn perf_state_root_breakdown() {
-    std::thread::Builder::new()
-        .stack_size(64 << 20)
-        .spawn(breakdown)
-        .unwrap()
-        .join()
-        .unwrap();
-}
-
-fn breakdown() {
     header("state-root breakdown @ n = 452,726 (Genesis-4 carryover)");
-    let f = fixture();
-    let e = eutxos(CARRYOVER_N);
 
-    // (a) build_state_tree: re-serialize + re-hash every eUTXO into a leaf,
-    //     then insert all of them into a fresh BTreeMap. No root yet.
-    let t = Instant::now();
-    let tree_a = build_state_tree(&state(&f, &e));
-    let t_build_full = t.elapsed();
-    println!("  committed leaves: {} ({} eUTXO + {} other)", tree_a.len(), CARRYOVER_N, tree_a.len() as u32 - CARRYOVER_N);
-
-    // (b) the first root() — cold memo. This is the real cost of a state root
-    //     on a node that has just started.
-    let t = Instant::now();
-    let root_cold = tree_a.root();
-    let t_root_cold = t.elapsed();
-
-    // (c) the second root() over the identical tree — every singleton is a
-    //     memo hit. This is the floor for an UNCHANGED state.
-    let t = Instant::now();
-    let root_warm = tree_a.root();
-    let t_root_warm = t.elapsed();
-    assert_eq!(root_cold, root_warm);
-
-    // (d) the leaves kept incrementally, as CommittedState::eutxos does.
-    let leaves: BTreeMap<[u8; 32], [u8; 32]> = e.iter().map(eutxo_leaf).collect();
-    let empty: [EutxoEntry; 0] = [];
-    let tree_inc = Smt::from_leaf_map(&leaves);
-    let t = Instant::now();
-    let root_inc = state_root_with_eutxo_tree(&state(&f, &empty), &tree_inc);
-    let t_incremental = t.elapsed();
-    assert_eq!(root_inc, root_cold, "the two entry points must commit the same root");
-
-    // (e) the same call after a realistic block edits a handful of leaves:
-    //     4 outputs spent, 4 created. Everything else is byte-identical, so
-    //     everything else should be a memo hit.
-    let mut tree2 = tree_inc.clone();
-    let doomed: Vec<[u8; 32]> = leaves.keys().take(4).copied().collect();
-    for k in &doomed {
-        tree2.remove(k);
-    }
-    for i in 0..4u32 {
-        let (k, v) = eutxo_leaf(&EutxoEntry {
-            txid: h32(0xDEAD_0000u64 + i as u64),
-            vout: i,
-            value: 1_000,
-            script_hash: h32(0x5151 + i as u64),
+    // (a) the whole from-scratch path a cold-started node pays: derive every
+    //     leaf, bulk-build the eUTXO subtree, insert the other components.
+    let (root_full, t_build_full, t_root_1, t_root_2, n_leaves) =
+        cold_thread("full-rebuild", || {
+            let f = fixture();
+            let e = eutxos(CARRYOVER_N);
+            let t = Instant::now();
+            let tree = build_state_tree(&state(&f, &e));
+            let t_build_full = t.elapsed();
+            // `root()` twice. NOT a cold/warm memo pair — it is a field read,
+            // and the two figures exist to show that it is.
+            let t = Instant::now();
+            let r1 = tree.root();
+            let t_root_1 = t.elapsed();
+            let t = Instant::now();
+            let r2 = tree.root();
+            let t_root_2 = t.elapsed();
+            assert_eq!(r1, r2);
+            (r1, t_build_full, t_root_1, t_root_2, tree.len())
         });
-        tree2.insert(k, v);
-    }
-    let t = Instant::now();
-    let root_edited = state_root_with_eutxo_tree(&state(&f, &empty), &tree2);
-    let t_after_edit = t.elapsed();
-    assert_ne!(root_edited, root_cold);
 
-    // (f) isolate the BTreeMap rebuild that (d) pays: copy the leaves into a
-    //     fresh Smt and nothing else.
-    let t = Instant::now();
-    let mut smt = Smt::new();
-    for (k, v) in &leaves {
-        smt.insert(*k, *v);
-    }
-    let t_insert_only = t.elapsed();
+    // (b) and (c): the SAME eUTXO leaf set, built bulk and built leaf by leaf,
+    //     on two DIFFERENT cold threads. This is the comparison the old code
+    //     printed backwards.
+    let (root_bulk, t_bulk) = cold_thread("bulk", || {
+        let leaves = carryover_leaf_map();
+        let t = Instant::now();
+        let tree = Smt::from_leaf_map(&leaves);
+        let d = t.elapsed();
+        (tree.root(), d)
+    });
+    let (root_leafwise, t_leafwise) = cold_thread("leaf-by-leaf", || {
+        let leaves = carryover_leaf_map();
+        let t = Instant::now();
+        let mut tree = Smt::new();
+        for (k, v) in &leaves {
+            tree.insert(*k, *v);
+        }
+        let d = t.elapsed();
+        (tree.root(), d)
+    });
+    assert_eq!(root_bulk, root_leafwise, "bulk and leaf-by-leaf must commit the same tree");
 
-    // (g) the leaf derivation that (a) pays and (d) skips: eutxo_leaf over
-    //     every entry (2 SHA3 per entry).
-    let t = Instant::now();
-    let derived: Vec<([u8; 32], [u8; 32])> = e.iter().map(eutxo_leaf).collect();
-    let t_leaf_derivation = t.elapsed();
-    std::hint::black_box(&derived);
+    // (d) and (e): the steady state. A running node HOLDS the eUTXO tree, so
+    //     the per-block cost is a clone plus the components plus the block's
+    //     own edits — never a rebuild. Both are measured on one thread on
+    //     purpose: (e) follows (d) in the same block loop on a real node, and
+    //     the point of (e) is what the SECOND call costs, so its warmth is the
+    //     thing being measured rather than a leak between two rivals.
+    let (root_inc, t_incremental, t_after_edit, t_steady) = cold_thread("steady-state", || {
+        let f = fixture();
+        let empty: [EutxoEntry; 0] = [];
+        let leaves = carryover_leaf_map();
+        let tree = Smt::from_leaf_map(&leaves);
 
-    println!("  a) build_state_tree (full, leaves recomputed) : {:>10.1} ms", ms(t_build_full));
-    println!("  b) Smt::root(), COLD memo                     : {:>10.1} ms", ms(t_root_cold));
-    println!("  c) Smt::root(), WARM memo, unchanged state    : {:>10.1} ms", ms(t_root_warm));
-    println!("  d) state_root_with_eutxo_tree (warm)          : {:>10.1} ms", ms(t_incremental));
-    println!("  e) same, after 4 spends + 4 creates           : {:>10.1} ms", ms(t_after_edit));
-    println!("  f)   of which: Smt::insert loop (BTreeMap)    : {:>10.1} ms", ms(t_insert_only));
-    println!("  g)   of which (a) only: eutxo_leaf x n        : {:>10.1} ms", ms(t_leaf_derivation));
+        let t = Instant::now();
+        let root_inc = state_root_with_eutxo_tree(&state(&f, &empty), &tree);
+        let t_incremental = t.elapsed();
+
+        // A realistic block: 4 outputs spent, 4 created.
+        let edit = |tree: &Smt, gen: u64| {
+            let mut t2 = tree.clone();
+            for k in leaves.keys().skip(gen as usize * 4).take(4) {
+                t2.remove(k);
+            }
+            for i in 0..4u32 {
+                let (k, v) = eutxo_leaf(&EutxoEntry {
+                    txid: h32(0xDEAD_0000u64 + gen * 16 + i as u64),
+                    vout: i,
+                    value: 1_000,
+                    script_hash: h32(0x5151 + i as u64),
+                });
+                t2.insert(k, v);
+            }
+            t2
+        };
+
+        let t2 = edit(&tree, 0);
+        let t = Instant::now();
+        let root_edited = state_root_with_eutxo_tree(&state(&f, &empty), &t2);
+        let t_after_edit = t.elapsed();
+        assert_ne!(root_edited, root_inc);
+
+        // The same again, several blocks deep, for the figure a node in the
+        // middle of a replay actually pays.
+        const BLOCKS: u32 = 8;
+        let t = Instant::now();
+        let mut cur = t2;
+        for g in 1..=BLOCKS {
+            cur = edit(&cur, g as u64);
+            std::hint::black_box(state_root_with_eutxo_tree(&state(&f, &empty), &cur));
+        }
+        let t_steady = t.elapsed() / BLOCKS;
+
+        (root_inc, t_incremental, t_after_edit, t_steady)
+    });
+    assert_eq!(root_inc, root_full, "the two entry points must commit the same root");
+
+    // (f) the leaf derivation (a) pays and the steady state does not: two SHA3
+    //     per entry, over the whole set.
+    let t_leaf_derivation = cold_thread("leaf-derivation", || {
+        let e = eutxos(CARRYOVER_N);
+        let t = Instant::now();
+        let derived: Vec<([u8; 32], [u8; 32])> = e.iter().map(eutxo_leaf).collect();
+        let d = t.elapsed();
+        std::hint::black_box(&derived);
+        d
+    });
+
+    println!(
+        "  committed leaves: {} ({} eUTXO + {} other)",
+        n_leaves,
+        CARRYOVER_N,
+        n_leaves as u32 - CARRYOVER_N
+    );
+    println!("  each phase below ran on its OWN freshly spawned thread (cold singleton memo)");
+    println!();
+    println!("  a) build_state_tree, full from-scratch          : {:>10.1} ms", ms(t_build_full));
+    println!("  b) Smt::from_leaf_map, eUTXO only  [cold thread]: {:>10.1} ms", ms(t_bulk));
+    println!("  c) Smt::insert x n, eUTXO only     [cold thread]: {:>10.1} ms", ms(t_leafwise));
+    println!("  d) state_root_with_eutxo_tree, tree already held: {:>10.1} ms", ms(t_incremental));
+    println!("  e) same, after 4 spends + 4 creates             : {:>10.1} ms", ms(t_after_edit));
+    println!("  e') same, averaged over 8 consecutive blocks    : {:>10.1} ms", ms(t_steady));
+    println!("  f)   of which (a) only: eutxo_leaf x n          : {:>10.1} ms", ms(t_leaf_derivation));
+    println!();
+    println!("  Smt::root() #1 (a field read, not a walk)       : {:>10.4} ms", ms(t_root_1));
+    println!("  Smt::root() #2 (the same field read)            : {:>10.4} ms", ms(t_root_2));
     println!();
     println!(
-        "  full first root (a+b)                         : {:>10.1} ms",
-        ms(t_build_full + t_root_cold)
+        "  bulk vs leaf-by-leaf, both cold  (c / b)       : {:>10.2}x  \
+         => leaf-by-leaf is {} for a cold load",
+        t_leafwise.as_secs_f64() / t_bulk.as_secs_f64(),
+        if t_leafwise > t_bulk { "SLOWER — the wrong tool" } else { "faster" }
     );
     println!(
-        "  steady-state per block (e)                    : {:>10.1} ms",
-        ms(t_after_edit)
+        "  cold full rebuild (a) vs steady block (e')     : {:>10.1}x",
+        t_build_full.as_secs_f64() / t_steady.as_secs_f64()
     );
     println!(
-        "  ratio cold-first-root / steady-state          : {:>10.1}x",
-        (t_build_full + t_root_cold).as_secs_f64() / t_after_edit.as_secs_f64()
+        "  full first root (a), what a cold start pays   : {:>10.1} ms",
+        ms(t_build_full)
     );
     println!(
-        "  ratio (a) full rebuild / (d) incremental      : {:>10.2}x",
-        t_build_full.as_secs_f64() / t_incremental.as_secs_f64()
+        "  steady-state per block (e')                   : {:>10.1} ms",
+        ms(t_steady)
     );
 }
 
@@ -282,6 +377,11 @@ fn breakdown() {
 
 /// Cold-memo full rebuild at 50k / 100k / 200k / 452,726, each on its own
 /// thread so no measurement inherits another's memo.
+///
+/// The `root ms` column is expected to be ~0: since `perf/smt` the root is a
+/// field on the root node and `root()` reads it. It is kept, and not dropped,
+/// because a column that stops being ~0 is the first sign that someone
+/// reintroduced a walk.
 #[test]
 #[ignore]
 fn perf_rebuild_scaling() {
@@ -473,14 +573,15 @@ fn committed_state_per_block() {
     let t_clone = t.elapsed() / 5;
     drop(clones);
 
-    // (ii) the root, cold memo (this thread has computed none yet — except
-    //      whatever `genesis` itself did).
+    // (ii) the first `state_root()` after genesis. NOT a cold memo: `genesis`
+    //      built the whole eUTXO tree on this very thread, so every eUTXO
+    //      singleton is already memoized. What is cold here is only the few
+    //      hundred non-eUTXO component leaves this call inserts.
     let t = Instant::now();
     let r1 = st.state_root();
     let t_root_cold = t.elapsed();
 
-    // (iii) the root again, warm memo — the steady-state cost when nothing
-    //       changed.
+    // (iii) the same call again — the steady-state cost when nothing changed.
     let t = Instant::now();
     let r2 = st.state_root();
     let t_root_warm = t.elapsed();
@@ -493,8 +594,8 @@ fn committed_state_per_block() {
 
     println!("  CommittedState::genesis(452,726 balances) : {:>10.1} ms", ms(t_genesis));
     println!("  i)   pre.clone() per apply_block          : {:>10.1} ms", ms(t_clone));
-    println!("  ii)  StateReader::state_root, cold memo   : {:>10.1} ms", ms(t_root_cold));
-    println!("  iii) StateReader::state_root, warm memo   : {:>10.1} ms", ms(t_root_warm));
+    println!("  ii)  StateReader::state_root, 1st call    : {:>10.1} ms", ms(t_root_cold));
+    println!("  iii) StateReader::state_root, 2nd call    : {:>10.1} ms", ms(t_root_warm));
     println!("  iii) again                                : {:>10.1} ms", ms(t_root_warm2));
     println!(
         "  per-block floor (clone + warm root)       : {:>10.1} ms  => {:.2} blocks/s",
@@ -505,12 +606,17 @@ fn committed_state_per_block() {
 
 // ── 5. what an incremental path update WOULD cost, and the steady-state loop ──
 
-/// Two things:
-///   * the cost of touching a handful of leaves in an already-built `Smt`
-///     (`Smt::insert` only edits the BTreeMap — there is no incremental root),
-///   * the cost of the SHA3 work a real path-update root would do instead:
-///     `k` changed leaves x TREE_DEPTH node hashes.
-/// The gap between that and a warm `root()` is the size of the prize.
+/// The 8-leaf edit, against the arithmetic floor for one.
+///
+/// PORTED 2026-08-23. This was written before `perf/smt` and measured a PRIZE:
+/// back then `Smt::insert` only edited a leaf map and `root()` walked the whole
+/// set, so `root()/path-update` was the factor an incremental tree would win.
+/// That tree shipped. `insert` now rebuilds the path and folds it, and `root()`
+/// is a field read — so the same two numbers are no longer a prize, they are
+/// the DELIVERED cost against its theoretical floor. The labels say that now.
+///   * (a) 8 `Smt::insert` calls: the real incremental path update.
+///   * (b) the `root()` that follows: O(1), kept so the reader can see it is.
+///   * (c)/(d) raw SHA3 at the same shapes: the floor (a) is measured against.
 #[test]
 #[ignore]
 fn perf_incremental_path_vs_full_root() {
@@ -525,13 +631,14 @@ fn perf_incremental_path_vs_full_root() {
 fn incremental_path() {
     use sha3::{Digest, Sha3_256};
 
-    header("8-leaf edit: what it costs now vs what a path update would cost");
+    header("8-leaf edit: the delivered path update vs its SHA3 floor");
     let f = fixture();
     let e = eutxos(CARRYOVER_N);
     let mut tree = build_state_tree(&state(&f, &e));
-    let _ = tree.root(); // warm the memo
+    let _ = tree.root(); // the build already warmed the memo; this is O(1)
 
-    // (a) the BTreeMap edit itself: 4 removed + 4 added, done through insert.
+    // (a) the edit itself: 8 leaves written through `insert`, each rebuilding
+    //     and re-folding the path from the root to its leaf.
     let edits: Vec<([u8; 32], [u8; 32])> = (0..8u32)
         .map(|i| {
             eutxo_leaf(&EutxoEntry {
@@ -548,7 +655,8 @@ fn incremental_path() {
     }
     let t_insert8 = t.elapsed();
 
-    // (b) the root that must follow it — full Theta(n) walk, memo warm.
+    // (b) the root that follows it. O(1) since `perf/smt` — a field read off
+    //     the root node, NOT the Theta(n) walk this line used to time.
     let t = Instant::now();
     std::hint::black_box(tree.root());
     let t_root = t.elapsed();
@@ -594,12 +702,18 @@ fn incremental_path() {
     let t_path8_log = t.elapsed();
     std::hint::black_box(acc);
 
-    println!("  a) Smt::insert x8 (BTreeMap edit only)   : {:>12.4} ms", ms(t_insert8));
-    println!("  b) Smt::root() that must follow (warm)   : {:>12.4} ms", ms(t_root));
-    println!("  c) 8 leaves x 256 node hashes            : {:>12.4} ms", ms(t_path8));
-    println!("  d) 8 leaves x {log_depth} node hashes (compressed): {:>12.4} ms", ms(t_path8_log));
-    println!("  prize (b / c)  full-depth path update    : {:>12.0}x", ms(t_root) / ms(t_path8));
-    println!("  prize (b / d)  compressed path update    : {:>12.0}x", ms(t_root) / ms(t_path8_log));
+    println!("  a) Smt::insert x8 (the real path update) : {:>12.4} ms", ms(t_insert8));
+    println!("  b) Smt::root() after it (O(1) field read): {:>12.4} ms", ms(t_root));
+    println!("  c) floor: 8 leaves x 256 node hashes     : {:>12.4} ms", ms(t_path8));
+    println!("  d) floor: 8 leaves x {log_depth} node hashes       : {:>12.4} ms", ms(t_path8_log));
+    println!(
+        "  delivered / full-depth floor  (a / c)   : {:>12.2}x",
+        ms(t_insert8) / ms(t_path8)
+    );
+    println!(
+        "  delivered / compressed floor  (a / d)   : {:>12.2}x",
+        ms(t_insert8) / ms(t_path8_log)
+    );
 }
 
 /// A loop of warm `state_root()` calls on the real `CommittedState`, long
