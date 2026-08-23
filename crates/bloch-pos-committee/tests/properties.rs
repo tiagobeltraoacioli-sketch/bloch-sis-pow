@@ -966,3 +966,164 @@ fn epoch_boundary_is_exactly_where_the_epoch_increments() {
         );
     }
 }
+
+// ── The 2026-08-23 fork-choice rewrite: same head, different asymptotics ────
+//
+// `Store::head` stopped being `Store::weight` in a loop (O(V·D²)) and became a
+// bottom-up subtree accumulation (O(V+N+D)). Fork choice SELECTS THE HEAD, so
+// that is a performance change only for as long as the selected head is
+// bit-identical on every input — a faster algorithm that breaks one tie
+// differently is a hard fork, and this network has already been split once
+// (2026-08-08) by a change everyone was sure was local.
+//
+// `Store::head_reference` is the old algorithm, kept for no other purpose than
+// to be the oracle below.
+
+/// A random block DAG plus a random message set, shaped to hit every corner
+/// the two implementations could disagree on.
+struct Dag {
+    parents: HashMap<[u8; 32], [u8; 32]>,
+    children: HashMap<[u8; 32], Vec<[u8; 32]>>,
+    roots: Vec<[u8; 32]>,
+    genesis: [u8; 32],
+}
+
+fn random_dag(rng: &mut Rng, n_blocks: usize, width: u64) -> Dag {
+    let genesis = [0xAAu8; 32];
+    let mut roots = Vec::with_capacity(n_blocks);
+    let mut parents: HashMap<[u8; 32], [u8; 32]> = HashMap::new();
+    for i in 0..n_blocks {
+        let id = rng.bytes32();
+        // Parent is genesis, an earlier block, or — one time in sixteen — a
+        // block this node has never seen, which is how a real node's store
+        // looks mid-sync and which the two implementations must weigh the
+        // same way (the vote counts for the unknown root alone).
+        let parent = if i == 0 || rng.below(16) == 0 {
+            if i > 0 && rng.below(2) == 0 {
+                rng.bytes32() // dangling: never inserted as a block
+            } else {
+                genesis
+            }
+        } else {
+            roots[rng.below((i as u64).min(width)) as usize % i]
+        };
+        parents.insert(id, parent);
+        roots.push(id);
+    }
+    let mut children: HashMap<[u8; 32], Vec<[u8; 32]>> = HashMap::new();
+    for (id, parent) in &parents {
+        children.entry(*parent).or_default().push(*id);
+    }
+    for kids in children.values_mut() {
+        kids.sort_unstable();
+    }
+    Dag {
+        parents,
+        children,
+        roots,
+        genesis,
+    }
+}
+
+/// **The differential test.** Randomised DAGs — forks, ties, equivocators,
+/// votes for blocks this node does not have, and the justified root itself
+/// being the head — through both the new `Store::head` and the old
+/// `Store::head_reference`. Every head must match.
+///
+/// Ties are made common on purpose: half the runs give every validator the
+/// SAME stake, so sibling weights collide constantly and the tie-break
+/// (lexicographic max of `(weight, root)`, `kids[0]` seeding `best`) is what
+/// decides. That rule was copied across character for character; this is the
+/// test that says so.
+#[test]
+fn forkchoice_head_matches_the_reference_implementation() {
+    let mut rng = Rng::new(0x0806_2308_1CE4_E5B9);
+    for round in 0..400u64 {
+        let n_blocks = 1 + rng.below(40) as usize;
+        let dag = random_dag(&mut rng, n_blocks, 6);
+        let tree = BlockTree {
+            parents: &dag.parents,
+        };
+
+        let n_validators = 1 + rng.below(24) as u32;
+        // Half the rounds: identical stake, so siblings tie constantly.
+        let uniform = round % 2 == 0;
+        let mut store = Store::new();
+        for v in 0..n_validators {
+            let stake = if uniform { 100 } else { 1 + rng.below(1_000_000) };
+            store.set_stake(v, stake);
+        }
+        for v in 0..n_validators {
+            let votes = 1 + rng.below(3);
+            for _ in 0..votes {
+                // A vote for a block, for the genesis root, or for something
+                // never seen. Slots collide on purpose: two different roots in
+                // one slot is an equivocation and bars the validator, which is
+                // a code path the head must survive.
+                let target = match rng.below(8) {
+                    0 => rng.bytes32(),
+                    1 => dag.genesis,
+                    _ => dag.roots[rng.below(n_blocks as u64) as usize],
+                };
+                let slot = 1 + rng.below(4);
+                store.observe(v, LatestMessage { slot, root: target });
+            }
+        }
+
+        // Start the walk from genesis, from an interior block, and from a
+        // block with no children at all (where the head is the start).
+        let mut starts = vec![dag.genesis];
+        starts.push(dag.roots[rng.below(n_blocks as u64) as usize]);
+        starts.push(rng.bytes32());
+        for justified in starts {
+            assert_eq!(
+                store.head(&tree, justified, &dag.children),
+                store.head_reference(&tree, justified, &dag.children),
+                "round {round}: the fast fork choice picked a different head \
+                 than the implementation it replaced — this is a CONSENSUS \
+                 change, not a performance change"
+            );
+        }
+    }
+}
+
+/// The same differential, run against a hand-built chain whose weights are
+/// exactly tied all the way down, so the tie-break is the ONLY thing choosing.
+///
+/// The randomised test above can only claim it hits this; this one is it.
+#[test]
+fn a_fully_tied_tree_resolves_identically_in_both_implementations() {
+    let genesis = [0xAAu8; 32];
+    let mut parents = HashMap::new();
+    let mut children: HashMap<[u8; 32], Vec<[u8; 32]>> = HashMap::new();
+    let mut level = vec![genesis];
+    for depth in 0..8u8 {
+        let mut next = Vec::new();
+        for (i, parent) in level.iter().enumerate() {
+            for branch in 0..2u8 {
+                let mut id = [0u8; 32];
+                id[0] = depth;
+                id[1] = i as u8;
+                id[2] = branch;
+                parents.insert(id, *parent);
+                children.entry(*parent).or_default().push(id);
+                next.push(id);
+            }
+        }
+        for kids in children.values_mut() {
+            kids.sort_unstable();
+        }
+        level = next;
+        if level.len() > 16 {
+            level.truncate(16);
+        }
+    }
+    // Nobody votes: every weight is zero and every comparison is a tie.
+    let store = Store::new();
+    let tree = BlockTree { parents: &parents };
+    assert_eq!(
+        store.head(&tree, genesis, &children),
+        store.head_reference(&tree, genesis, &children),
+        "an all-zero-weight tree must resolve to the same head in both"
+    );
+}

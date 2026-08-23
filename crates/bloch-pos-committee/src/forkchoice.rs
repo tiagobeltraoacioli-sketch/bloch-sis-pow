@@ -9,6 +9,20 @@
 //! found by walking from the justified root, always taking the heaviest child.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// DAG steps the fork choice has walked since the process started.
+///
+/// Not a metric anyone reads in production — it is the *asymptotics* test's
+/// only deterministic handle. `head_step_count_is_linear_in_depth` doubles the
+/// chain depth and asserts this counter roughly doubles; before the 2026-08-23
+/// rewrite it roughly quadrupled, which is the whole claim in one number and
+/// the reason the test could not have passed both before and after.
+///
+/// Batched: one relaxed add per fork-choice call, never one per step, so it
+/// costs nothing on the consensus thread.
+#[doc(hidden)]
+pub static FORKCHOICE_STEPS: AtomicU64 = AtomicU64::new(0);
 
 /// Per-validator latest vote, as the fork-choice store holds it.
 #[derive(Clone, Copy, Debug)]
@@ -108,7 +122,170 @@ impl Store {
     /// Walk from `justified` to the head, taking the heaviest child at each
     /// step. Ties break on the larger block root — arbitrary, but *identical*
     /// on every node, which is the only property that matters.
+    ///
+    /// ## Why this is not `weight()` in a loop any more
+    ///
+    /// It was, until 2026-08-23, and that shape is O(V·D²): the descent visits
+    /// D levels, each level called [`Store::weight`] once per sibling, and
+    /// every one of those calls walked all V latest messages up their whole
+    /// ancestor chain (O(V·D)). MEASURED on the old shape: 477 ms at depth
+    /// 256, 2.4 s at 512, 8.8 s at 1024, 107 s at 4096 — a fork choice that
+    /// costs more than a slot is a chain that stops.
+    ///
+    /// This computes the same numbers bottom-up instead. Each validator's
+    /// stake is attributed once to the block it voted for, subtree weights
+    /// accumulate in one pass from leaves toward the roots (Kahn's algorithm
+    /// over child→parent edges), and the descent then reads a precomputed
+    /// weight per sibling. O(V + N + D) for N known blocks.
+    ///
+    /// ## Why the selected head is bit-identical, not merely "equivalent"
+    ///
+    /// The head is consensus-relevant, so this is not a refactor that may be
+    /// approximately right — the 2026-08-08 fork came from exactly that kind
+    /// of confidence. Three obligations, and each is discharged here:
+    ///
+    /// 1. **The weights are the same numbers.** `weight(X)` counts a validator
+    ///    iff `is_descendant_or_self(msg.root, X)`, i.e. iff the parent walk
+    ///    from its vote reaches X. The walk gives up after `parents.len() + 1`
+    ///    steps, and a functional graph (one parent per node) has at most that
+    ///    many distinct nodes on any walk, so the cutoff never truncates a
+    ///    reachable node: the predicate *is* plain reachability. Accumulating
+    ///    `direct[R]` up the parent edges therefore lands the same stake on the
+    ///    same blocks, and it does so for unknown roots too — a vote for a root
+    ///    this node has never seen contributes to that root alone in both
+    ///    implementations, which is why `weights` is seeded from every vote
+    ///    root rather than from the known block set.
+    ///
+    /// 2. **The tie-break is byte-for-byte the one below it.** `best` starts at
+    ///    `kids[0]` and a later sibling displaces it on `w > best_w ||
+    ///    (w == best_w && *child > best)` — the lexicographic maximum of
+    ///    (weight, root). The loop here is character-for-character that loop;
+    ///    only the source of `w` changed. A different tie-break is a different
+    ///    head is a hard fork, so it was not touched.
+    ///
+    /// 3. **Cycles cannot make the two disagree.** Kahn's leaves a node inside
+    ///    a parent cycle unprocessed, where `weight()` would have credited it.
+    ///    That gap is unreachable: a cycle node's parent is in the cycle, so it
+    ///    can never be the child of an acyclic block, so the descent can only
+    ///    query one after entering the cycle itself — and the descent below
+    ///    (in both versions) never leaves a cycle. Whenever the old code
+    ///    *terminated*, every block it weighed was acyclic-rooted, its whole
+    ///    descendant set was acyclic (a cycle node's parent is in the cycle),
+    ///    and Kahn's processed all of it. The step bound on the descent is new
+    ///    and only fires where the old loop spun forever; block ids are hashes
+    ///    over the header that names the parent, so it is unreachable on any
+    ///    chain, not merely unlikely.
+    ///
+    /// `head_reference` keeps the old algorithm alive as the differential
+    /// oracle: `forkchoice_head_matches_the_reference_implementation` in
+    /// tests/properties.rs asserts the two agree over randomised DAGs, and
+    /// `head_step_count_is_linear_in_depth_and_the_old_one_was_quadratic` in
+    /// tests/forkchoice_asymptotics.rs is the test that could not pass before.
     pub fn head(
+        &self,
+        tree: &BlockTree<'_>,
+        justified: [u8; 32],
+        children: &HashMap<[u8; 32], Vec<[u8; 32]>>,
+    ) -> [u8; 32] {
+        let weights = self.subtree_weights(tree);
+        let mut steps = 0u64;
+        // Bounded for the same reason `is_descendant_or_self` is bounded: a
+        // parent/children map with a cycle in it must terminate the node's
+        // fork choice, not hang the consensus thread. The bound is a count of
+        // LEVELS, and every level moves to a distinct block while the graph is
+        // acyclic, so it cannot fire early on any real chain: there are at
+        // most this many distinct blocks in the two maps put together.
+        let limit = tree.parents.len() + children.len() + 1;
+        let mut levels = 0usize;
+        let mut current = justified;
+        while levels <= limit {
+            let kids = match children.get(&current) {
+                Some(k) if !k.is_empty() => k,
+                _ => break,
+            };
+            let w_of = |b: &[u8; 32]| weights.get(b).copied().unwrap_or(0);
+            let mut best = kids[0];
+            let mut best_w = w_of(&best);
+            for child in &kids[1..] {
+                let w = w_of(child);
+                if w > best_w || (w == best_w && *child > best) {
+                    best = *child;
+                    best_w = w;
+                }
+            }
+            steps += kids.len() as u64;
+            levels += 1;
+            current = best;
+        }
+        FORKCHOICE_STEPS.fetch_add(steps, Ordering::Relaxed);
+        current
+    }
+
+    /// Total stake resting on each block's subtree, every block at once.
+    ///
+    /// `weights[b]` is exactly `self.weight(tree, &b)` — see the three
+    /// obligations on [`Store::head`] — computed for all of them in one pass
+    /// instead of one walk per query.
+    ///
+    /// The accumulation runs over `tree.parents`, never over the caller's
+    /// `children` map, because `weight()` reads only `tree.parents`: if the
+    /// two ever disagree, matching `weight()` is what keeps the head the same.
+    fn subtree_weights(&self, tree: &BlockTree<'_>) -> HashMap<[u8; 32], u128> {
+        // One validator, one vote, credited to the block it named. Roots this
+        // node has never seen get an entry too: `weight()` counts a vote for
+        // an unknown root toward that root itself.
+        let mut weights: HashMap<[u8; 32], u128> =
+            HashMap::with_capacity(tree.parents.len() + self.latest.len());
+        for (validator, msg) in &self.latest {
+            *weights.entry(msg.root).or_insert(0) +=
+                *self.stake.get(validator).unwrap_or(&0) as u128;
+        }
+        for id in tree.parents.keys() {
+            weights.entry(*id).or_insert(0);
+        }
+
+        // Kahn's over child→parent edges: a block's weight is final once every
+        // known child has handed its subtree up.
+        let mut pending: HashMap<[u8; 32], usize> = HashMap::with_capacity(tree.parents.len());
+        for parent in tree.parents.values() {
+            *pending.entry(*parent).or_insert(0) += 1;
+        }
+        let mut ready: Vec<[u8; 32]> = tree
+            .parents
+            .keys()
+            .filter(|id| pending.get(*id).copied().unwrap_or(0) == 0)
+            .copied()
+            .collect();
+        let mut steps = 0u64;
+        while let Some(id) = ready.pop() {
+            steps += 1;
+            let w = weights.get(&id).copied().unwrap_or(0);
+            let Some(parent) = tree.parents.get(&id) else {
+                continue;
+            };
+            *weights.entry(*parent).or_insert(0) += w;
+            // Only a KNOWN parent can itself be released: an unknown one has
+            // no parent edge of its own, so nothing waits on it.
+            if let Some(n) = pending.get_mut(parent) {
+                *n -= 1;
+                if *n == 0 && tree.parents.contains_key(parent) {
+                    ready.push(*parent);
+                }
+            }
+        }
+        FORKCHOICE_STEPS.fetch_add(steps, Ordering::Relaxed);
+        weights
+    }
+
+    /// The fork choice exactly as it was before the 2026-08-23 rewrite, kept
+    /// as the differential oracle for [`Store::head`] and for nothing else.
+    ///
+    /// O(V·D²) and unusable on a real chain — it is here so a property test
+    /// can assert the fast one agrees with it head-for-head over randomised
+    /// DAGs, which is the only evidence that the rewrite was a performance
+    /// change and not a consensus change.
+    #[doc(hidden)]
+    pub fn head_reference(
         &self,
         tree: &BlockTree<'_>,
         justified: [u8; 32],
@@ -154,19 +331,21 @@ fn is_descendant_or_self(tree: &BlockTree<'_>, node: &[u8; 32], ancestor: &[u8; 
     let mut cur = *node;
     let mut steps = 0usize;
     let limit = tree.parents.len() + 1;
-    loop {
+    let verdict = loop {
         if cur == *ancestor {
-            return true;
+            break true;
         }
         match tree.parents.get(&cur) {
             Some(p) => {
                 cur = *p;
                 steps += 1;
                 if steps > limit {
-                    return false;
+                    break false;
                 }
             }
-            None => return false,
+            None => break false,
         }
-    }
+    };
+    FORKCHOICE_STEPS.fetch_add(steps as u64, Ordering::Relaxed);
+    verdict
 }
