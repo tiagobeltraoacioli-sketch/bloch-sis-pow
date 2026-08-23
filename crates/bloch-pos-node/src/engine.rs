@@ -3921,6 +3921,7 @@ mod perf_support {
             recent_states: VecDeque::new(),
             pool: BTreeMap::new(),
             att_pool: AttestationPool::new(),
+            fc_covered_removals: 0,
             wall_slot: 0,
             mempool: BTreeMap::new(),
             store,
