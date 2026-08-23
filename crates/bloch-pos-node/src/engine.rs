@@ -168,8 +168,14 @@ const MAX_TXS_PER_BLOCK: usize = 256;
 /// constraint** — the boxes are already one-validator-per-host because they
 /// run out of RAM. A `CommittedState` is dominated by its eUTXO set (the
 /// Genesis-3 carryover is ~452k outputs) and two states share nothing
-/// structurally, so the window costs N whole copies resident, permanently.
-/// That is why it is two and not thirty-two.
+/// structurally: MEASURED at 128 MB resident each, `--release`, on a
+/// Genesis-3-sized set. That is why this is two and not thirty-two.
+///
+/// Two costs ONE extra copy, not two. The newest entry is the live state
+/// itself — `apply_canonical` files the very `Arc` it just installed, so that
+/// slot is shared and free — and the one behind it is the single real copy.
+/// A depth-1 reorg needs the head's PARENT, so one retained ancestor is the
+/// smallest window that buys anything at all, and this is it.
 ///
 /// Two is chosen against the reorgs that happen — depth 1, occasionally 2 —
 /// and NOT as a guess at the worst case. Everything deeper falls back to the
