@@ -332,26 +332,40 @@ pub const FUNDED_STAKE_ACTIVATION_EPOCH: u64 = u64::MAX;
 ///
 /// Then, and only then, substituting any other epoch source for the block's
 /// own flips one of the two halves.
+///
+/// # The fields are private, and that is the enforcement
+///
+/// "Production passes `MAINNET` and nothing else" is the entire safety
+/// argument for adding a parameter to a consensus function, and a comment
+/// saying so is not an argument — mutating the production call site to pass
+/// `FlagDays { leaked_roster: 900, ..MAINNET }` compiled and passed the whole
+/// suite when these fields were public (MUT-14, 2026-08-22). It had to: any
+/// flag day past the epochs a test fixture can reach behaves exactly like
+/// `u64::MAX`, so no behavioural test can distinguish one wrong future epoch
+/// from the disarmed value. The defence cannot be a test; it has to be the
+/// type. With the fields private to this module and the only constructors
+/// being [`FlagDays::MAINNET`] and a `#[cfg(test)]` builder, a non-test caller
+/// has no way to name any other value, and that mutation stops compiling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FlagDays {
     /// See [`TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH`].
-    pub transfer_witness_dedup: u64,
+    transfer_witness_dedup: u64,
     /// See [`BLOCK_BYTES_V2_ACTIVATION_EPOCH`].
-    pub block_bytes_v2: u64,
+    block_bytes_v2: u64,
     /// See [`LEAKED_ROSTER_ACTIVATION_EPOCH`].
-    pub leaked_roster: u64,
+    leaked_roster: u64,
     /// See [`FUNDED_STAKE_ACTIVATION_EPOCH`].
-    pub funded_stake: u64,
+    funded_stake: u64,
 }
 
 impl FlagDays {
-    /// The flag days mainnet runs. The ONLY value any non-test caller may
-    /// construct: every public entry point in `transition` passes this and
-    /// nothing else, so the `_gated` forms below are a test seam and never a
-    /// second configuration surface. A node that could be handed a different
-    /// `FlagDays` at runtime would have re-created, in a nicer type, the very
-    /// thing this seam exists to make impossible — a consensus rule that
-    /// depends on something other than the block.
+    /// The flag days mainnet runs, and — outside `#[cfg(test)]` — the only
+    /// `FlagDays` any caller can name. Every public entry point in
+    /// `transition` passes this and nothing else, so the `_gated` forms are a
+    /// test seam and never a second configuration surface. A node that could
+    /// be handed a different `FlagDays` at runtime would have re-created, in a
+    /// nicer type, the very thing this seam exists to make impossible: a
+    /// consensus rule that depends on something other than the block.
     pub const MAINNET: FlagDays = FlagDays {
         transfer_witness_dedup: TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH,
         block_bytes_v2: BLOCK_BYTES_V2_ACTIVATION_EPOCH,
@@ -363,6 +377,41 @@ impl FlagDays {
     /// every one of them without naming any.
     pub const fn all(&self) -> [u64; 4] {
         [self.transfer_witness_dedup, self.block_bytes_v2, self.leaked_roster, self.funded_stake]
+    }
+
+    /// See [`TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH`].
+    pub const fn transfer_witness_dedup(&self) -> u64 {
+        self.transfer_witness_dedup
+    }
+    /// See [`BLOCK_BYTES_V2_ACTIVATION_EPOCH`].
+    pub const fn block_bytes_v2(&self) -> u64 {
+        self.block_bytes_v2
+    }
+    /// See [`LEAKED_ROSTER_ACTIVATION_EPOCH`].
+    pub const fn leaked_roster(&self) -> u64 {
+        self.leaked_roster
+    }
+    /// See [`FUNDED_STAKE_ACTIVATION_EPOCH`].
+    pub const fn funded_stake(&self) -> u64 {
+        self.funded_stake
+    }
+
+    /// `MAINNET` with the transfer-format flag day and the block-byte flag day
+    /// both moved to `gate`.
+    ///
+    /// The two move together because consensus requires it
+    /// (`transfer_v2_activation_is_paired_with_the_block_cap`): a fixture that
+    /// armed one and not the other would exercise a state mainnet cannot be
+    /// in — a 512 KiB cap priced against a 128 KiB target, or the reverse.
+    #[cfg(test)]
+    pub(crate) const fn with_transfer_pair(gate: u64) -> FlagDays {
+        FlagDays { transfer_witness_dedup: gate, block_bytes_v2: gate, ..FlagDays::MAINNET }
+    }
+
+    /// `MAINNET` with the leak flag day moved to `gate`.
+    #[cfg(test)]
+    pub(crate) const fn with_leaked_roster(gate: u64) -> FlagDays {
+        FlagDays { leaked_roster: gate, ..FlagDays::MAINNET }
     }
 }
 
@@ -535,10 +584,10 @@ mod flag_day_tripwire {
     #[test]
     fn mainnet_flag_days_are_the_shipped_constants() {
         let f = FlagDays::MAINNET;
-        assert_eq!(f.transfer_witness_dedup, super::TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH);
-        assert_eq!(f.block_bytes_v2, super::BLOCK_BYTES_V2_ACTIVATION_EPOCH);
-        assert_eq!(f.leaked_roster, super::LEAKED_ROSTER_ACTIVATION_EPOCH);
-        assert_eq!(f.funded_stake, super::FUNDED_STAKE_ACTIVATION_EPOCH);
+        assert_eq!(f.transfer_witness_dedup(), super::TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH);
+        assert_eq!(f.block_bytes_v2(), super::BLOCK_BYTES_V2_ACTIVATION_EPOCH);
+        assert_eq!(f.leaked_roster(), super::LEAKED_ROSTER_ACTIVATION_EPOCH);
+        assert_eq!(f.funded_stake(), super::FUNDED_STAKE_ACTIVATION_EPOCH);
         assert_eq!(f.all().len(), 4, "a new flag day must join all() or the tripwire skips it");
     }
 }

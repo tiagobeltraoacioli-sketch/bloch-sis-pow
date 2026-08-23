@@ -1481,7 +1481,7 @@ impl CommittedState {
         flags: crate::params::FlagDays,
     ) -> Vec<Validator> {
         let roster = self.duty_roster_at(epoch);
-        if epoch < flags.leaked_roster {
+        if epoch < flags.leaked_roster() {
             return roster;
         }
         with_leak_applied(roster, |index| self.finality_engine.leaked_of(index))
@@ -1818,7 +1818,7 @@ impl CommittedState {
                 // binary's `UnknownTag(0x06)` decode failure are two roads to
                 // the same verdict on the same block, which is what keeps a
                 // mixed fleet on one chain until the flag day.
-                if self.epoch < flags.transfer_witness_dedup {
+                if self.epoch < flags.transfer_witness_dedup() {
                     return Err(TxReject::Transfer(TransferReject::FormatNotActive));
                 }
                 self.apply_transfer_v2(tx, base_fee_millisat_per_gas, verifier)
@@ -2566,7 +2566,7 @@ impl CommittedState {
                 tx_bytes: self.block_tx_bytes,
             },
             epoch,
-            flags.block_bytes_v2,
+            flags.block_bytes_v2(),
         )
     }
 
@@ -2585,11 +2585,34 @@ impl CommittedState {
     ///
     /// The boundary reads exactly one flag day today, and it reads it
     /// indirectly: step 5 opens E+1 by asking for `consensus_roster_at`, which
-    /// is where `leaked_roster` binds. That indirection is why the seam has to
-    /// reach in here rather than stopping at the roster method — the roster
-    /// the boundary commits (participation slots, the committee partition it
-    /// asserts over) is derived at the boundary, so a test that gated only the
-    /// roster call could not put a BOUNDARY on both sides of the flag day.
+    /// is where `leaked_roster` binds.
+    ///
+    /// # This parameter is INERT today, measured, not assumed
+    ///
+    /// Replacing the gated roster call in step 5 with the ungated one — i.e.
+    /// dropping `flags` on the floor here — leaves the whole crate green
+    /// (MUT-8, 2026-08-22). That is not a hole in the tests; it is a fact
+    /// about what the boundary commits. The leak-adjusted roster reaches
+    /// exactly two things at step 5, and neither is observable in committed
+    /// state: `current_participation` is keyed by validator INDEX, and
+    /// `with_leak_applied` reweights entries without removing any, so the key
+    /// set is identical either way; and the committee partition is recomputed,
+    /// asserted over, and thrown away — a stored partition would be a cache
+    /// (§5.5). The reward roster deliberately does NOT come through here: it
+    /// is `duty_roster_at(closing)`, un-leaked on purpose, because
+    /// `finality::process_epoch` subtracts the leak itself and leaking in both
+    /// places would charge it twice.
+    ///
+    /// It is threaded anyway, and the reason is the work this branch could not
+    /// do: both funded-staking write-off lines materialise at an epoch
+    /// boundary against `funded_stake`, and one of them was already shown to
+    /// leak 1,600,000 BLOCH when that materialisation is keyed to a boundary
+    /// CROSSING that a past flag day never performs. The moment a boundary
+    /// reads a flag day for anything it commits, this parameter stops being
+    /// inert — and the alternative, adding the parameter later, is a signature
+    /// change to the one function every epoch in the chain's history has gone
+    /// through. Written down rather than silently relied upon: as of this
+    /// commit, MUT-8 survives, and a reviewer who assumes otherwise is wrong.
     fn close_epoch_gated(&self, flags: crate::params::FlagDays) -> CommittedState {
         let mut st = self.clone();
         let closing = st.epoch;
@@ -3223,7 +3246,7 @@ impl<V: SignatureVerifier> Transition<V> {
         if block_gas > fee_market::BLOCK_GAS_LIMIT {
             return Err(TransitionError::BlockGasLimitExceeded);
         }
-        if block_bytes > fee_market::max_block_tx_bytes_at(block_epoch, flags.block_bytes_v2) {
+        if block_bytes > fee_market::max_block_tx_bytes_at(block_epoch, flags.block_bytes_v2()) {
             return Err(TransitionError::BlockByteLimitExceeded);
         }
 
@@ -7170,11 +7193,7 @@ mod tests {
     /// armed one and not the other would be testing a state mainnet cannot be
     /// in.
     fn gate_pair(gate: u64) -> crate::params::FlagDays {
-        crate::params::FlagDays {
-            transfer_witness_dedup: gate,
-            block_bytes_v2: gate,
-            ..crate::params::FlagDays::MAINNET
-        }
+        crate::params::FlagDays::with_transfer_pair(gate)
     }
 
     /// [`build_block`], threading `flags` exactly as `compute_post_state_gated`
@@ -7364,6 +7383,83 @@ mod tests {
         );
     }
 
+    /// **(b) The acceptance path carries the flag day into the PRICE, not just
+    /// into the cap.**
+    ///
+    /// The cap and the byte target are one switch, so a seam that gated the
+    /// cap and left the price reading the shipped constant would put a block
+    /// under a 512 KiB cap and price it against a 128 KiB target — a state
+    /// mainnet can never be in, and one in which every fee assertion is about
+    /// the fixture rather than the chain. `next_base_fee_at_gated` exists for
+    /// that reason and this test is what holds it: reverting it to read
+    /// `BLOCK_BYTES_V2_ACTIVATION_EPOCH` left the crate green before this test
+    /// existed (MUT-11, 2026-08-22).
+    ///
+    /// `the_boundary_blocks_price_comes_from_the_block_epoch_not_the_parent`
+    /// makes the neighbouring assertion — that the price comes from the
+    /// block's epoch rather than the parent's — and cannot make this one: it
+    /// runs through `compute_post_state`, where the threaded flag day and the
+    /// constant are the same number by construction.
+    ///
+    /// The payload is 256 KiB, twice the old target and exactly the new one:
+    /// the single size that is congested in one era and at target in the
+    /// other, so the two candidate prices are forced apart before the block
+    /// under test is built.
+    #[test]
+    fn the_acceptance_path_reads_the_price_flag_day_from_the_block_epoch() {
+        const GATE: u64 = 5;
+        let flags = gate_pair(GATE);
+        let first_v2_slot = GATE * SLOTS_PER_EPOCH;
+
+        let owner = owner_key(0x68);
+        let to = script_of(&owner_key(0x69));
+        let c = opening(0x8B, 0, 21_000_000_000_000_000, &owner);
+        let (t, g, mut chains) = setup_funded(4, std::slice::from_ref(&c));
+
+        // The parent: the last block under the gate, saturating the V1 cap.
+        let saturating = transfer_spending(
+            std::slice::from_ref(&c),
+            &owner,
+            to,
+            fee_market::MAX_BLOCK_TX_BYTES,
+            0,
+            g.next_base_fee(),
+        );
+        let b1 = build_block_gated(
+            &t,
+            &g,
+            first_v2_slot - 1,
+            &[],
+            std::slice::from_ref(&saturating),
+            &mut chains,
+            flags,
+        );
+        let s1 = t
+            .compute_post_state_gated(&g, &b1, &[], std::slice::from_ref(&saturating), flags)
+            .expect("a block at exactly the V1 cap is valid under the flag day");
+        assert_eq!(s1.epoch, GATE - 1, "the parent must sit one epoch below the flag day");
+        assert_eq!(s1.block_tx_bytes, fee_market::MAX_BLOCK_TX_BYTES);
+
+        // The two candidate prices must really differ, or the block below
+        // proves nothing about which one it used.
+        let under_gate = s1.next_base_fee_at_gated(GATE - 1, flags);
+        let at_gate = s1.next_base_fee_at_gated(GATE, flags);
+        assert!(under_gate > s1.base_fee_millisat_per_gas(), "under the gate: congested");
+        assert_eq!(at_gate, s1.base_fee_millisat_per_gas(), "at the gate: exactly at target");
+        assert_ne!(under_gate, at_gate);
+
+        // The boundary block commits the price it charged.
+        let b2 = build_block_gated(&t, &s1, first_v2_slot, &[], &[], &mut chains, flags);
+        let s2 = t
+            .compute_post_state_gated(&s1, &b2, &[], &[], flags)
+            .expect("the boundary block must apply");
+        assert_eq!(
+            s2.base_fee_millisat_per_gas(),
+            at_gate,
+            "the block must be priced against the byte target of the flag day it was judged under"
+        );
+    }
+
     /// **(a) The gate that ships DISARMED, tested anyway — the mutation this
     /// whole seam was built to kill.**
     ///
@@ -7382,10 +7478,7 @@ mod tests {
     #[test]
     fn the_leak_gate_reads_the_epoch_it_is_asked_about() {
         const GATE: u64 = 12;
-        let flags = crate::params::FlagDays {
-            leaked_roster: GATE,
-            ..crate::params::FlagDays::MAINNET
-        };
+        let flags = crate::params::FlagDays::with_leaked_roster(GATE);
 
         // Nobody attests, so nothing finalizes and the leak accrues from
         // epoch THRESHOLD+1 on. Walked with the gate ARMED, because the
@@ -7443,8 +7536,7 @@ mod tests {
     #[test]
     fn the_acceptance_path_draws_the_proposer_from_the_leak_adjusted_roster() {
         const GATE: u64 = 12;
-        let armed =
-            crate::params::FlagDays { leaked_roster: GATE, ..crate::params::FlagDays::MAINNET };
+        let armed = crate::params::FlagDays::with_leaked_roster(GATE);
 
         let (t, g, mut chains) = setup(4);
         let mut st = g.clone();
@@ -7498,8 +7590,7 @@ mod tests {
         // ahead of this block — the gate closed, the leak not subtracted, the
         // same proposer now correct. Only the flag day differs between the two
         // halves, which is what makes the verdict a statement about the gate.
-        let disarmed =
-            crate::params::FlagDays { leaked_roster: GATE + 1, ..crate::params::FlagDays::MAINNET };
+        let disarmed = crate::params::FlagDays::with_leaked_roster(GATE + 1);
         assert!(
             t.compute_post_state_gated(&st, &env, &[], &[], disarmed).is_ok(),
             "under the flag day the very same block must be valid"
