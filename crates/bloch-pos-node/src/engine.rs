@@ -262,6 +262,28 @@ mod state_cell {
     /// them, so the live working set is one or two entries; four is slack for
     /// a node whose head lags its wall clock. The memo is dropped whole on
     /// every applied block anyway, so this bounds a burst, not a lifetime.
+    ///
+    /// **It is also a memory budget, and it is the larger of the two this
+    /// module spends.** Each entry is a whole `CommittedState`, structurally
+    /// sharing nothing with the live one, so a full memo is `MEMO_CAP` extra
+    /// copies — the same unit [`REORG_STATE_WINDOW`] is counted in, four
+    /// times over. It is transient where the retention window is steady
+    /// state, but the peak is what an OOM kills on.
+    ///
+    /// MEASURED on this tree by `bench::bench_state_footprint` (`--release`,
+    /// Genesis-3-sized eUTXO set, RSS delta over four clones): **60 MB per
+    /// state**, so a full memo is ~240 MB and the two features together peak
+    /// around 300 MB per validator above the pre-change baseline.
+    ///
+    /// That 60 MB does NOT match the 128 MB in [`REORG_STATE_WINDOW`]'s doc.
+    /// Both are real measurements of the same quantity on different hosts
+    /// (this one is macOS/arm64); RSS for a heap this shape is an allocator
+    /// artifact as much as a data size. Neither number has been taken on an
+    /// Edgevana box, and on a fleet running EIGHT validators per host the
+    /// per-host multiple is what matters, so **measure there before trusting
+    /// either figure for capacity planning.** Recorded rather than
+    /// reconciled, because reconciling them here would mean picking one
+    /// without evidence.
     const MEMO_CAP: usize = 4;
 
     struct Entry {
