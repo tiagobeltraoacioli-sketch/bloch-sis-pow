@@ -464,10 +464,37 @@ struct LeafNode {
     /// `singleton_subtree_root(key, value_hash, depth)`.
     hash: [u8; 32],
     /// The depth `hash` was computed at. A leaf's fold depends on where it
-    /// sits, and inserting a neighbour pushes it down while removing its last
-    /// neighbour pulls it up — so the depth is carried and checked rather
-    /// than assumed. Debug-only enforcement of the one invariant that could
-    /// silently produce a wrong root.
+    /// sits — inserting a neighbour pushes it down, removing its last
+    /// neighbour pulls it up — so the depth is carried rather than assumed.
+    ///
+    /// **What checks this field, and what does not.** It is read in exactly
+    /// one place, [`hash_of`], and compared against the depth the caller
+    /// walked to under a `debug_assert!`. `debug_assert!` compiles to nothing
+    /// unless `debug-assertions` is on, and the workspace's
+    /// `[profile.release]` — the profile the fleet's consensus binary is
+    /// built with — leaves it off. (`overflow-checks` is forced on in that
+    /// profile for the mixed-profile reason recorded in the root
+    /// `Cargo.toml`; it does not imply `debug-assertions`, and turning
+    /// `debug-assertions` on there would arm every `debug_assert!` in the
+    /// node's whole dependency tree, trading a wrong-root risk for a
+    /// panic-on-a-validator risk in code this project does not own.)
+    ///
+    /// So on a producing validator this field is *carried and used*, never
+    /// *verified*: `hash_of` returns `l.hash` whatever `depth` says, and a
+    /// leaf whose fold was computed for a different depth than the one it
+    /// hangs at yields a wrong root with nothing raised. It is a debugging
+    /// aid in release, not a guard.
+    ///
+    /// The invariant is enforced instead where enforcement is free: the test
+    /// suite's `shape()` helper walks every node of the trie and checks both
+    /// this field and the stored fold against a recomputation, with ordinary
+    /// `assert_eq!`. Three tests run it —
+    /// `tree_shape_is_exactly_the_key_sets_trie`,
+    /// `rootonly_deep_prefix_removals` and
+    /// `root_is_independent_of_the_mutation_sequence`. A depth off-by-one in
+    /// `collapse` was confirmed (2026-08-23) to be caught by `shape()` as a
+    /// real assertion, and by the `debug_assert!` here only because tests are
+    /// built with debug assertions on.
     depth: u16,
 }
 
@@ -657,13 +684,63 @@ fn node_remove(
     }
 }
 
-/// Re-form the node at `depth` after a removal below it.
+/// Re-form the node at `depth` after a removal below it: a subtree that is
+/// down to one key becomes that key's leaf, folded from *this* depth, rather
+/// than a split left standing against an empty side.
 ///
-/// The point of the collapse: `subtree_root` gives a subtree holding one key
-/// the *singleton fold from this depth*, not a split against an empty side.
-/// A tree that left the split standing would hash the same leaf differently
-/// from a tree that never held the removed key — same leaves, two roots,
-/// which is the one outcome this module exists to make impossible.
+/// # Not the consensus surface — and the old comment claiming it was is wrong
+///
+/// The previous version of this doc claimed a tree that failed to collapse
+/// would hash the same leaf differently from one that never held the removed
+/// key — "same leaves, two roots". That is false, and measurably so. Two
+/// mutations were run against this module's suite on 2026-08-23:
+///
+/// - delete the collapse entirely (return `new_split(left, right, depth)`
+///   unconditionally), and
+/// - collapse only the `(Some(Leaf), None)` arm, leaving a lone right-hand
+///   survivor standing.
+///
+/// **Neither moved a single root.** Every root comparison in the suite still
+/// passed; the only failures were the structural assertions added the same
+/// day. The reason is arithmetic, not luck: [`singleton_subtree_root`] folds
+/// a lone leaf against `empty[d + 1]` at every level, so a leaf at depth
+/// `d + 1` under a split at depth `d` whose other side is empty hashes to
+/// `node_hash(fold(d + 1), empty[d + 1])`, and that *is* `fold(d)`.
+/// Uncollapsed and collapsed are the same 32 bytes, at every depth.
+///
+/// What the collapse actually buys is the tree's **shape**: without it every
+/// removal strands a chain of dead splits, the trie stops being a function of
+/// its leaf set, [`LeafNode::depth`] stops meaning what it says, and the
+/// structural sharing that makes an update cost the update decays. Those are
+/// memory and invariant problems, they are real, and the only thing that
+/// catches them is the test suite's `shape()` walk.
+///
+/// # Where a bug here IS a consensus bug: the depth arithmetic of the fold
+///
+/// What determines the root is which depth each leaf is folded from and which
+/// side of each split it hangs on: [`singleton_subtree_root`]'s loop, the
+/// `depth` handed to [`new_leaf`] by [`build_subtree`], [`node_insert`],
+/// [`split_apart`] and this function, and the `depth + 1` at which
+/// [`new_split`] reads its children. Six mutations across those sites were
+/// run in the same sweep; every one of them either moved the root outright or
+/// tripped the depth check in [`hash_of`] — which, note, is a
+/// `debug_assert!` and is therefore absent from the release build consensus
+/// actually runs (see [`LeafNode::depth`]).
+///
+/// # How thin the margin is
+///
+/// One test, in the worst measured case. A fold that is wrong *only* for a
+/// leaf which is a singleton at the full 256-bit depth — the regime two keys
+/// parting at bit 255 produce — was killed by exactly one pre-existing test,
+/// `shared_long_prefix_keys_match_the_flat_recursion`, and by nothing else in
+/// the module. Not by any `Smt::from_leaf_map` cross-check: the bulk builder
+/// folds through the same function, so it is wrong in the same way and
+/// agrees. The only independent witness at that depth is [`subtree_root`]'s
+/// flat recursion, which returns `leaf_hash` directly at `TREE_DEPTH` instead
+/// of going through the singleton fold. `rootonly_deep_prefix_removals`
+/// (2026-08-23) is the second witness, and it is a witness only because it
+/// checks the flat recursion too. Remove the flat oracle, or those two tests,
+/// and that bug reaches a validator.
 fn collapse(
     left: Option<Node>,
     right: Option<Node>,
@@ -1978,6 +2055,16 @@ mod tests {
             assert_eq!(smt.root(), forward.root(), "the mutated tree disagreed with a fresh build");
             assert_eq!(smt.root(), reverse.root(), "insertion order changed the root");
             assert_eq!(smt.root(), Smt::from_leaf_map(&want).root(), "the bulk build disagreed");
+            // Not only the root: the *nodes*. A root-only check passes a tree
+            // that stopped collapsing after removals (see `shape`), because
+            // an uncollapsed split hashes to the same 32 bytes as the leaf it
+            // should have become.
+            assert_eq!(
+                shape(&smt),
+                shape(&Smt::from_leaf_map(&want)),
+                "the mutated tree's shape diverged from a fresh build (seed {seed})"
+            );
+            assert_eq!(shape(&smt), shape(&forward), "insertion order changed the tree's shape");
         }
     }
 
@@ -2002,6 +2089,306 @@ mod tests {
         smt.remove(&keys[0]);
         assert_eq!(smt.root(), empty_root);
         assert_eq!(smt.len(), 0);
+    }
+
+    /// A key with exactly `bits` set, MSB-first: `bit(k, b) == 1` for every
+    /// `b` in `bits` and 0 everywhere else. Unlike [`key`], which pushes test
+    /// keys through the real derivation, this makes the trie a key set
+    /// produces *predictable by hand* — which is what a shape assertion needs
+    /// in order to be an assertion and not a restatement of the code.
+    fn bitkey(bits: &[usize]) -> [u8; 32] {
+        let mut k = [0u8; 32];
+        for &b in bits {
+            k[b / 8] |= 1 << (7 - (b % 8));
+        }
+        k
+    }
+
+    /// The trie's exact internal shape: the number of `Split` nodes, and the
+    /// depth of every `Leaf`, sorted.
+    ///
+    /// Walking it also *enforces* `LeafNode.depth` and the stored fold at
+    /// every node, not only at the nodes a root computation happens to read.
+    /// In the shipped code that invariant is a `debug_assert!` inside
+    /// [`hash_of`], which the release profile — the profile consensus runs —
+    /// compiles out; here it is a real assertion.
+    fn shape(smt: &Smt) -> (usize, Vec<usize>) {
+        fn walk(
+            node: &Option<Node>,
+            depth: usize,
+            empty: &[[u8; 32]],
+            splits: &mut usize,
+            leaves: &mut Vec<usize>,
+        ) {
+            match node {
+                None => {}
+                Some(Node::Leaf(l)) => {
+                    assert_eq!(
+                        l.depth as usize, depth,
+                        "a leaf carrying depth {} is hanging at depth {depth}",
+                        l.depth
+                    );
+                    assert_eq!(
+                        l.hash,
+                        singleton_subtree_root(&l.key, &l.value_hash, depth, empty),
+                        "a leaf's stored fold is not the singleton fold for depth {depth}"
+                    );
+                    leaves.push(depth);
+                }
+                Some(Node::Split(s)) => {
+                    assert!(
+                        s.left.is_some() || s.right.is_some(),
+                        "a split with nothing under it survived at depth {depth}"
+                    );
+                    assert_eq!(
+                        s.hash,
+                        node_hash(
+                            &hash_of(&s.left, depth + 1, empty),
+                            &hash_of(&s.right, depth + 1, empty)
+                        ),
+                        "a split's stored hash disagrees with its children at depth {depth}"
+                    );
+                    *splits += 1;
+                    walk(&s.left, depth + 1, empty, splits, leaves);
+                    walk(&s.right, depth + 1, empty, splits, leaves);
+                }
+            }
+        }
+        let (mut splits, mut leaves) = (0usize, Vec::new());
+        walk(&smt.root, 0, &smt.empty, &mut splits, &mut leaves);
+        leaves.sort_unstable();
+        (splits, leaves)
+    }
+
+    /// **The shape is part of the contract, not only the root.**
+    ///
+    /// Every other test in this file asserts the root hash, and the root hash
+    /// is a lossy witness of shape: the singleton fold of a leaf sitting at
+    /// depth `d + 1` against `empty[d + 1]` *is* the singleton fold at depth
+    /// `d`, so [`collapse`] can be deleted outright and no root in this file
+    /// moves — while every removal leaves a chain of dead splits behind, and
+    /// the leaf depths stop meaning what `LeafNode.depth` says they mean.
+    /// The same blindness covers the expand path: a `split_apart` that
+    /// descended one level too far would still have to be caught by a root,
+    /// and here it is caught by the count.
+    ///
+    /// The key sets below are built bit by bit so the trie can be worked out
+    /// on paper: a `Split` exists at exactly those prefixes shared by two or
+    /// more keys, and a `Leaf` sits at the depth where its key becomes the
+    /// only one left.
+    #[test]
+    fn tree_shape_is_exactly_the_key_sets_trie() {
+        // (name, keys, expected splits, expected sorted leaf depths)
+        let cases: Vec<(&str, Vec<[u8; 32]>, usize, Vec<usize>)> = vec![
+            ("the empty tree", vec![], 0, vec![]),
+            // One key: no branch anywhere, one leaf folded from the root.
+            ("a single leaf", vec![bitkey(&[7])], 0, vec![0]),
+            // Two keys parting at the very first bit: one split at depth 0,
+            // both leaves at depth 1.
+            ("parting at bit 0", vec![bitkey(&[]), bitkey(&[0])], 1, vec![1, 1]),
+            // Three keys. {A, C} go left at depth 0 and B goes right, so B is
+            // alone from depth 1. A and C agree on bits 1..=4 — a unary chain
+            // at depths 1,2,3,4 — and part at bit 5, putting both at depth 6.
+            // Splits: depths 0,1,2,3,4,5.
+            (
+                "one shallow branch and one four-level chain",
+                vec![bitkey(&[]), bitkey(&[0]), bitkey(&[5])],
+                6,
+                vec![1, 6, 6],
+            ),
+            // A deep common prefix: 100 shared bits is a 101-node unary chain
+            // (depths 0..=100) before the branch, leaves at depth 101.
+            (
+                "parting at bit 100",
+                vec![bitkey(&[]), bitkey(&[100])],
+                101,
+                vec![101, 101],
+            ),
+            // The last bit in the key space: 255 shared bits, so the split
+            // node sits at depth 255 and the leaves at the full TREE_DEPTH.
+            (
+                "parting at the last bit",
+                vec![bitkey(&[]), bitkey(&[255])],
+                256,
+                vec![TREE_DEPTH, TREE_DEPTH],
+            ),
+        ];
+
+        for (name, keys, want_splits, want_depths) in cases {
+            let map: BTreeMap<[u8; 32], [u8; 32]> =
+                keys.iter().enumerate().map(|(i, k)| (*k, val(i as u8))).collect();
+            assert_eq!(map.len(), keys.len(), "fixture keys must be distinct ({name})");
+
+            let bulk = Smt::from_leaf_map(&map);
+            assert_eq!(
+                shape(&bulk),
+                (want_splits, want_depths.clone()),
+                "bulk-built shape is not the key set's trie ({name})"
+            );
+
+            // The incremental path must land on the *same nodes*, not merely
+            // the same root: this is the expand path (`split_apart`).
+            let mut inc = Smt::new();
+            for (k, v) in &map {
+                inc.insert(*k, *v);
+            }
+            assert_eq!(shape(&inc), shape(&bulk), "insert built a different tree ({name})");
+            assert_eq!(inc.root(), bulk.root(), "insert built a different root ({name})");
+        }
+
+        // The collapse path, stated as a shape. Two keys sharing 100 bits
+        // stand on a 101-node chain; remove one and the survivor must be a
+        // lone leaf folded from depth 0 — the same node a tree that never
+        // held the removed key would have — with all 101 splits gone.
+        let a = bitkey(&[]);
+        let b = bitkey(&[100]);
+        let mut smt = Smt::new();
+        smt.insert(a, val(1));
+        smt.insert(b, val(2));
+        assert_eq!(shape(&smt), (101, vec![101, 101]), "control: the pair stands on a chain");
+        smt.remove(&b);
+        assert_eq!(
+            shape(&smt),
+            (0, vec![0]),
+            "a removal left dead splits behind instead of collapsing to a lone leaf"
+        );
+        let mut fresh = Smt::new();
+        fresh.insert(a, val(1));
+        assert_eq!(shape(&smt), shape(&fresh), "the collapsed tree is not the never-filled one");
+        assert_eq!(smt.root(), fresh.root());
+    }
+
+    /// **Removals under a deep common prefix — the regime the collapse
+    /// arithmetic is most likely to get wrong, and where getting it wrong is
+    /// a chain split.**
+    ///
+    /// Every key here agrees with every other down to bit 200, so removing
+    /// one unwinds a ~200-level unary chain and the survivor's fold has to
+    /// land at exactly the depth a from-scratch build would put it at. One
+    /// level off and the root is different 32 bytes while every leaf is the
+    /// same.
+    ///
+    /// The reference is built independently after *every* removal — a fresh
+    /// [`Smt::from_leaf_map`] of the survivors, cross-checked against the
+    /// flat recursion — and the removal orders are permuted exhaustively over
+    /// a five-key subfamily and randomly over all ten, because the property
+    /// that matters is that the root is a function of the surviving leaf set
+    /// and not of the path taken to it.
+    #[test]
+    fn rootonly_deep_prefix_removals() {
+        // Bits below 200 are shared by every key; the tails live at 201 and
+        // deeper, so the common prefix is 201 bits long and the family
+        // contains pairs that part immediately below it, in the middle, and
+        // at the very last bit.
+        let shared = [3usize, 17, 64, 129, 199];
+        let tails: [&[usize]; 10] = [
+            &[],
+            &[255],
+            &[254],
+            &[254, 255],
+            &[247],
+            &[240],
+            &[233, 255],
+            &[210],
+            &[201],
+            &[201, 255],
+        ];
+        let keys: Vec<[u8; 32]> = tails
+            .iter()
+            .map(|t| {
+                let mut bits = shared.to_vec();
+                bits.extend_from_slice(t);
+                bitkey(&bits)
+            })
+            .collect();
+        let value = |i: usize| hash_value(&(i as u32).to_le_bytes());
+        let all: BTreeMap<[u8; 32], [u8; 32]> =
+            keys.iter().enumerate().map(|(i, k)| (*k, value(i))).collect();
+        assert_eq!(all.len(), keys.len(), "fixture keys must be distinct");
+
+        // The fixture has to actually be deep, or this test is not testing
+        // what its name says.
+        let (splits, depths) = shape(&Smt::from_leaf_map(&all));
+        assert!(splits >= 201, "fixture is shallow: only {splits} splits");
+        assert!(depths.iter().all(|d| *d > 200), "fixture is shallow: leaves at {depths:?}");
+
+        // Check `survivors`' tree against an independently built reference.
+        // `Smt::from_leaf_map` recomputes the empty-constant table on every
+        // call, so a check costs ~256 hashes on top of the tree it builds;
+        // the order counts below are sized around that.
+        let check = |smt: &Smt, survivors: &BTreeMap<[u8; 32], [u8; 32]>, ctx: &str| {
+            let reference = Smt::from_leaf_map(survivors);
+            assert_eq!(smt.len(), survivors.len(), "leaf count diverged ({ctx})");
+            assert_eq!(smt.root(), reference.root(), "root diverged from a fresh build ({ctx})");
+            assert_eq!(shape(smt), shape(&reference), "shape diverged from a fresh build ({ctx})");
+        };
+
+        // -- Exhaustive: every order of removing four of the ten. -----------
+        let subfamily: Vec<usize> = (0..4).collect();
+        let factorial: usize = (1..=subfamily.len()).product();
+        let mut finals = Vec::new();
+        for n in 0..factorial {
+            let order = nth_permutation(n, &subfamily);
+            let mut smt = Smt::from_leaf_map(&all);
+            let mut survivors = all.clone();
+            for (step, &i) in order.iter().enumerate() {
+                smt.remove(&keys[i]);
+                survivors.remove(&keys[i]);
+                check(&smt, &survivors, &format!("order {order:?}, step {step}"));
+            }
+            // A second, differently-shaped reference on the final set: the
+            // flat recursion, which materialises no nodes at all.
+            assert_eq!(smt.root(), flat_root(&survivors), "root diverged from the recursion");
+            finals.push(smt.root());
+        }
+        assert!(
+            finals.windows(2).all(|w| w[0] == w[1]),
+            "removal order changed the surviving root — removal is not path-independent"
+        );
+
+        // -- Randomised: every order removes all ten, one at a time. --------
+        for seed in 0..8u64 {
+            let mut rng = 0x0DD1_5EED_u64 ^ seed;
+            let mut order: Vec<usize> = (0..keys.len()).collect();
+            // Fisher-Yates with the suite's splitmix.
+            for i in (1..order.len()).rev() {
+                order.swap(i, (splitmix(&mut rng) as usize) % (i + 1));
+            }
+            let mut smt = Smt::from_leaf_map(&all);
+            let mut survivors = all.clone();
+            for (step, &i) in order.iter().enumerate() {
+                smt.remove(&keys[i]);
+                survivors.remove(&keys[i]);
+                check(&smt, &survivors, &format!("seed {seed}, order {order:?}, step {step}"));
+            }
+            assert!(smt.is_empty());
+            assert_eq!(smt.root(), Smt::new().root(), "an emptied deep tree is not the empty tree");
+            assert_eq!(shape(&smt), (0, vec![]), "an emptied deep tree still holds nodes");
+        }
+
+        // -- Re-inserting a removed key must rebuild the chain it stood on. --
+        let mut smt = Smt::from_leaf_map(&all);
+        let before = shape(&smt);
+        smt.remove(&keys[3]);
+        assert_ne!(shape(&smt), before, "control: removing a key changed nothing");
+        smt.insert(keys[3], value(3));
+        assert_eq!(shape(&smt), before, "remove-then-reinsert did not restore the trie");
+        assert_eq!(smt.root(), Smt::from_leaf_map(&all).root());
+    }
+
+    /// The `n`-th permutation of `items` in factorial-number-system order —
+    /// a deterministic enumeration, so a failure names an order that can be
+    /// replayed.
+    fn nth_permutation(mut n: usize, items: &[usize]) -> Vec<usize> {
+        let mut pool = items.to_vec();
+        let mut out = Vec::with_capacity(pool.len());
+        while !pool.is_empty() {
+            let f: usize = (1..pool.len()).product();
+            let idx = n / f;
+            n %= f;
+            out.push(pool.remove(idx));
+        }
+        out
     }
 
     /// Proofs are generated by walking the same nodes the root is read from,
