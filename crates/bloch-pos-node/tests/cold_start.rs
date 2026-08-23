@@ -120,6 +120,7 @@ fn spawn_node(
     dir: &Path,
     genesis: &Path,
     listen: u16,
+    rpc: u16,
     peers: &[u16],
     log: &Path,
 ) -> Child {
@@ -147,8 +148,17 @@ fn spawn_node(
             // number, so leaving it on would have two of them fail to bind and
             // exit. A real operator gives each node its own; the test does the
             // same rather than disabling the server and testing less.
+            //
+            // Allocated by `free_port`, NOT derived as `listen + 1000`, which
+            // is what this used to do and is why the test failed roughly one
+            // run in five. `free_port` returns an OS-chosen EPHEMERAL port; on
+            // macOS that range is 49152-65535, so `listen + 1000` overflows
+            // u16 whenever the OS hands out anything above 64535 and the test
+            // panics with "attempt to add with overflow" before a single node
+            // starts. Three draws per run made that a ~17% failure rate that
+            // looked like flakiness and was arithmetic.
             "--rpc-port",
-            &(listen + 1000).to_string(),
+            &rpc.to_string(),
             "--stop-at-slot",
             &STOP_SLOT.to_string(),
         ])
@@ -192,6 +202,7 @@ fn a_cold_node_builds_the_same_chain_from_genesis_without_a_donated_datadir() {
     ]);
 
     let ports: Vec<u16> = (0..3).map(|_| free_port()).collect();
+    let rpc_ports: Vec<u16> = (0..3).map(|_| free_port()).collect();
     let all: Vec<u16> = ports.clone();
 
     let mut fleet = Fleet(Vec::new());
@@ -200,6 +211,7 @@ fn a_cold_node_builds_the_same_chain_from_genesis_without_a_donated_datadir() {
             &root.join(format!("d{i}")),
             &genesis,
             ports[i],
+            rpc_ports[i],
             &all,
             &root.join(format!("n{i}.log")),
         ));
@@ -224,6 +236,7 @@ fn a_cold_node_builds_the_same_chain_from_genesis_without_a_donated_datadir() {
         &cold_dir,
         &genesis,
         ports[2],
+        rpc_ports[2],
         &all,
         &root.join("n2.log"),
     ));
