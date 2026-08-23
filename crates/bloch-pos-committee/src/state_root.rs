@@ -2057,13 +2057,24 @@ mod tests {
             (derive_key(TAG_EUTXO, &i.to_le_bytes()), hash_value(&i.to_le_bytes()))
         };
 
+        // Bulk, which is what a from-scratch load actually does
+        // (`EutxoSet::from_iter`): one singleton fold per leaf.
+        let all: BTreeMap<[u8; 32], [u8; 32]> = (0..n).map(leaf).collect();
         let t0 = std::time::Instant::now();
-        let mut smt = Smt::new();
-        for i in 0..n {
-            let (k, v) = leaf(i);
-            smt.insert(k, v);
-        }
+        let mut smt = Smt::from_leaf_map(&all);
         let build = t0.elapsed();
+
+        // And the same set built one insertion at a time, for contrast: the
+        // incremental API is the wrong tool for a cold load and this says by
+        // how much.
+        let t0b = std::time::Instant::now();
+        let mut one_at_a_time = Smt::new();
+        for (k, v) in &all {
+            one_at_a_time.insert(*k, *v);
+        }
+        let build_incremental = t0b.elapsed();
+        assert_eq!(one_at_a_time.root(), smt.root(), "bulk and incremental must agree");
+        drop(one_at_a_time);
 
         let t1 = std::time::Instant::now();
         let a = smt.root();
@@ -2074,26 +2085,35 @@ mod tests {
         assert_eq!(a, b);
 
         // Four spends and four creations: the shape of an ordinary block.
+        // Counted as well as timed. The count is deterministic and immune to
+        // whatever else is running on the box, so it — not the wall clock —
+        // is the measurement that carries the asymptotic claim.
         let t3 = std::time::Instant::now();
-        for i in 0..4u32 {
-            smt.remove(&leaf(i * 7919).0);
-        }
-        for i in 0..4u32 {
-            let k = derive_key(TAG_EUTXO, &(n + i).to_le_bytes());
-            smt.insert(k, hash_value(&(n + i).to_le_bytes()));
-        }
-        let edit = t3.elapsed();
-        let t4 = std::time::Instant::now();
-        let c = smt.root();
-        let root_after_edit = t4.elapsed();
+        let ((c, edit), hashes) = counting_node_hashes(|| {
+            let t = std::time::Instant::now();
+            for i in 0..4u32 {
+                smt.remove(&leaf(i * 7919).0);
+            }
+            for i in 0..4u32 {
+                let k = derive_key(TAG_EUTXO, &(n + i).to_le_bytes());
+                smt.insert(k, hash_value(&(n + i).to_le_bytes()));
+            }
+            let edit = t.elapsed();
+            (smt.root(), edit)
+        });
+        let edit_and_root = t3.elapsed();
+        let root_after_edit = edit_and_root - edit;
         assert_ne!(a, c);
 
         println!("  leaves                    : {n}");
-        println!("  build                     : {build:.4?}");
+        println!("  build (bulk)              : {build:.4?}");
+        println!("  build (leaf by leaf)      : {build_incremental:.4?}");
         println!("  root() #1 (memo cold)     : {root_cold:.4?}");
         println!("  root() #2 (memo warm)     : {root_warm:.4?}");
         println!("  8-leaf edit               : {edit:.4?}");
         println!("  root() after the 8 edits  : {root_after_edit:.4?}");
+        println!("  8-leaf edit + the root    : {edit_and_root:.4?}");
+        println!("  INTERNAL NODE HASHES for that 8-leaf update + root: {hashes}");
     }
 
     /// **The asymptotic claim, as a test.**

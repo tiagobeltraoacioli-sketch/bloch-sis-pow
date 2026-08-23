@@ -1212,12 +1212,25 @@ impl EutxoSet {
 }
 
 impl FromIterator<crate::state_root::EutxoEntry> for EutxoSet {
+    /// Builds the subtree in **bulk**, not by repeated insertion.
+    ///
+    /// This matters and is not a micro-optimisation. Inserting one leaf at a
+    /// time costs each leaf its own 256-level singleton fold *and* re-folds
+    /// whichever neighbour it pushes down, so a from-scratch load pays the
+    /// fold about twice per entry; the bulk walk pays it exactly once, which
+    /// is what the flat recursion used to do. At Genesis-4's carryover size
+    /// (452,726 outputs) the difference is 150 s against 67 s — i.e. the
+    /// one-off cost of opening the chain, which this patch must not make
+    /// worse while making the per-block cost small.
     fn from_iter<I: IntoIterator<Item = crate::state_root::EutxoEntry>>(iter: I) -> Self {
-        let mut set = EutxoSet::default();
-        for e in iter {
-            set.insert(e);
-        }
-        set
+        let entries: BTreeMap<([u8; 32], u32), crate::state_root::EutxoEntry> =
+            iter.into_iter().map(|e| ((e.txid, e.vout), e)).collect();
+        // Same leaf derivation as `insert`, from the same single definition,
+        // so a bulk-built set and an incrementally-built one hold identical
+        // leaves — and therefore commit an identical root.
+        let leaves: BTreeMap<[u8; 32], [u8; 32]> =
+            entries.values().map(crate::state_root::eutxo_leaf).collect();
+        EutxoSet { entries, tree: crate::state_root::Smt::from_leaf_map(&leaves) }
     }
 }
 
