@@ -246,6 +246,28 @@ struct Engine {
     ws_anchor_hard: bool,
     /// A forward WS_CONFLICT is announced once, not every block.
     ws_conflict_reported: bool,
+    /// Loose attestations dropped from `pool` because the block that carried
+    /// them became canonical — a removal fork choice cannot see, since it also
+    /// reads every stored block's body.
+    ///
+    /// Monotone, and it exists only so [`Engine::forkchoice_inputs`] can tell
+    /// that kind of pool shrinkage apart from the epoch `retain`, which fork
+    /// choice very much can see. See the argument there.
+    fc_covered_removals: u64,
+}
+
+/// A fingerprint of the four values `lmd_ghost_head` reads, so `advance` can
+/// tell whether recomputing it could possibly return anything new.
+///
+/// Not a cache across calls — it is rebuilt from scratch inside each
+/// `advance`, because the completeness argument on
+/// [`Engine::forkchoice_inputs`] only holds for the duration of one.
+#[derive(PartialEq, Eq)]
+struct ForkChoiceInputs {
+    blocks: usize,
+    pool: u64,
+    justified: [u8; 32],
+    validators: Vec<bloch_pos_committee::sample::Validator>,
 }
 
 /// Why a transaction was turned away at the door.
@@ -728,6 +750,39 @@ impl Engine {
     /// function of the message *set*, never of arrival order — the property
     /// that was found violated in `forkchoice.rs` on 2026-08-11 and fixed
     /// there. Sibling lists are sorted so the tie-break is stable too.
+    /// Everything [`lmd_ghost_head`] reads, in a form cheap enough to compare
+    /// on every turn of `advance`'s loop.
+    ///
+    /// The two state inputs are compared by value. The two collection inputs
+    /// are compared by COUNT, and that is a complete comparison only because
+    /// of an invariant that holds inside `advance` and nowhere else: **within
+    /// one `advance` call, `blocks` and `pool` can only shrink.** Nothing on
+    /// that path inserts — `ingest` inserts the block before calling in,
+    /// `on_attestation` runs on a different event — so `apply_canonical`,
+    /// `do_reorg` and the invalid-block removal only ever take entries out. A
+    /// set that only loses elements is unchanged exactly when its size is.
+    ///
+    /// `fc_covered_removals` is added back to the pool count for the one kind
+    /// of shrinkage fork choice cannot observe: an attestation dropped because
+    /// the block carrying it became canonical is still counted, from that
+    /// block's body. Adding the running total keeps the sum invariant across
+    /// those and lets it fall — forcing a recompute — for the epoch `retain`,
+    /// which drops attestations no stored block carries.
+    ///
+    /// If a future edit inserts into either collection inside `advance`, this
+    /// stops being sound. That is why the invariant is written down here
+    /// rather than assumed. The neutrality half of the claim is pinned by
+    /// `an_attestation_its_block_carries_is_free_to_leave_the_pool`, which
+    /// also carries the control showing the epoch `retain` is NOT neutral.
+    fn forkchoice_inputs(&self) -> ForkChoiceInputs {
+        ForkChoiceInputs {
+            blocks: self.blocks.len(),
+            pool: self.pool.len() as u64 + self.fc_covered_removals,
+            justified: self.state.finality().justified.root,
+            validators: self.state.active_validators(),
+        }
+    }
+
     fn forkchoice_head(&self) -> [u8; 32] {
         lmd_ghost_head(
             &self.blocks,
@@ -777,10 +832,29 @@ impl Engine {
     /// case is a legitimate LMD-GHOST outcome and is handled by reorganising to
     /// an empty branch.
     fn advance(&mut self) {
+        // Fork choice is recomputed at the top of every iteration, and the
+        // last iteration exists only to confirm the head stopped moving. That
+        // confirmation is NOT free and it is NOT redundant: `apply_canonical`
+        // advances `self.state`, which moves the justified root and can move
+        // the active validator set, and it prunes `self.pool`. All three are
+        // fork-choice inputs, so the value really can change and the loop
+        // really is the convergence.
+        //
+        // What is skippable is the case where none of them moved, and
+        // `forkchoice_inputs` is what decides that. Reusing the previous
+        // answer there is not an approximation — `lmd_ghost_head` is a pure
+        // function of exactly those inputs (that is why §5.5 made it a free
+        // function), so equal inputs mean an equal head, bit for bit.
+        let mut memo: Option<(ForkChoiceInputs, [u8; 32])> = None;
         // Bounded: every iteration either advances the canonical head or
         // deletes an invalid block, and both are finite.
         for _ in 0..=(self.blocks.len().saturating_mul(2) + 2) {
-            let target = self.forkchoice_head();
+            let inputs = self.forkchoice_inputs();
+            let target = match &memo {
+                Some((seen, head)) if *seen == inputs => *head,
+                _ => self.forkchoice_head(),
+            };
+            memo = Some((inputs, target));
             let head = *self.head_id().as_bytes();
             if target == head {
                 return;
@@ -924,8 +998,21 @@ impl Engine {
                 self.chain.push((env.header.slot, id));
                 self.head_slot.store(env.header.slot, Ordering::Relaxed);
                 self.last_applied_ms = now_ms();
+                // Counted, because `advance` needs to tell this shrinkage
+                // apart from the `retain` four lines down. These attestations
+                // leave the loose pool and stay visible to fork choice, which
+                // observes every stored block's body as well as the pool, and
+                // `env` is one of the stored blocks. The `retain` below drops
+                // attestations nothing else carries — that one fork choice
+                // does see.
                 for a in &env.body.attestations {
-                    self.pool.remove(&(a.validator, a.data.signing_root()));
+                    if self
+                        .pool
+                        .remove(&(a.validator, a.data.signing_root()))
+                        .is_some()
+                    {
+                        self.fc_covered_removals += 1;
+                    }
                 }
                 // Included is included — drop them from the mempool by the
                 // same bytes they were keyed under.
@@ -1658,6 +1745,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         ws_anchor: None,
         ws_anchor_hard: false,
         ws_conflict_reported: false,
+        fc_covered_removals: 0,
         manifest,
     };
 
@@ -1960,6 +2048,46 @@ pub fn lmd_ghost_head<'a>(
     validators: &[bloch_pos_committee::sample::Validator],
     justified: [u8; 32],
 ) -> [u8; 32] {
+    let (fc, parents, children) = forkchoice_store(blocks, pool, validators);
+    let tree = BlockTree { parents: &parents };
+    fc.head(&tree, justified, &children)
+}
+
+/// [`lmd_ghost_head`] through the pre-2026-08-23 O(V·D²) fork choice.
+///
+/// The differential oracle, and nothing else:
+/// `head_matches_the_reference_implementation` feeds both this and
+/// [`lmd_ghost_head`] the same randomised
+/// DAGs and asserts the selected head is identical. Without it the rewrite of
+/// `Store::head` would be a claim about a consensus-relevant value rather than
+/// a tested property — and the 2026-08-08 fork is what that costs.
+/// Test-only: the binary must not carry an O(V·D²) fork choice it can reach.
+#[cfg(test)]
+pub fn lmd_ghost_head_reference<'a>(
+    blocks: &BTreeMap<[u8; 32], BlockEnvelope>,
+    pool: impl Iterator<Item = &'a Attestation>,
+    validators: &[bloch_pos_committee::sample::Validator],
+    justified: [u8; 32],
+) -> [u8; 32] {
+    let (fc, parents, children) = forkchoice_store(blocks, pool, validators);
+    let tree = BlockTree { parents: &parents };
+    fc.head_reference(&tree, justified, &children)
+}
+
+/// The fork-choice inputs, assembled: the store of latest messages, the parent
+/// map and the sibling lists. Shared by the two entry points above so they
+/// cannot drift — a differential test whose two sides observe different
+/// message sets proves nothing.
+#[allow(clippy::type_complexity)]
+fn forkchoice_store<'a>(
+    blocks: &BTreeMap<[u8; 32], BlockEnvelope>,
+    pool: impl Iterator<Item = &'a Attestation>,
+    validators: &[bloch_pos_committee::sample::Validator],
+) -> (
+    FcStore,
+    HashMap<[u8; 32], [u8; 32]>,
+    HashMap<[u8; 32], Vec<[u8; 32]>>,
+) {
     let mut parents: HashMap<[u8; 32], [u8; 32]> = HashMap::new();
     let mut children: HashMap<[u8; 32], Vec<[u8; 32]>> = HashMap::new();
     for (id, env) in blocks {
@@ -2001,8 +2129,7 @@ pub fn lmd_ghost_head<'a>(
         );
     }
 
-    let tree = BlockTree { parents: &parents };
-    fc.head(&tree, justified, &children)
+    (fc, parents, children)
 }
 
 /// Whether the mempool will hold `tx` at all.
@@ -2456,6 +2583,257 @@ mod forkchoice_tests {
             head, a1,
             "the equivocator was counted, or the honest vote was dropped"
         );
+    }
+
+    // ── The 2026-08-23 rewrite, checked from the node's own entry point ─────
+
+    /// splitmix64, so the randomised DAG below is reproducible and adds no
+    /// dependency (the committee crate's property suite uses the same one).
+    struct Rng(u64);
+
+    impl Rng {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            ((self.next_u64() as u128 * n as u128) >> 64) as u64
+        }
+    }
+
+    /// **The differential test at the node's boundary.** `Store::head` was
+    /// rewritten from O(V·D²) to a bottom-up accumulation; the committee
+    /// crate's `forkchoice_head_matches_the_reference_implementation` pins the
+    /// two against each other on synthetic parent maps, and this pins them on
+    /// what the node actually feeds it — real `BlockEnvelope`s, attestations
+    /// carried in block bodies as well as loose in the pool, and the parent
+    /// map and sibling lists built by `forkchoice_store`.
+    ///
+    /// Fork choice selects the head. If these two ever disagree the change is
+    /// a hard fork rather than a speed-up, which is the whole reason the old
+    /// algorithm was kept as `lmd_ghost_head_reference` instead of deleted.
+    #[test]
+    fn head_matches_the_reference_implementation() {
+        let mut rng = Rng(0x0806_2308_5EED_5EED);
+        let g = [0x99u8; 32];
+        for round in 0..120u64 {
+            // A random forest over genesis: every block picks an earlier block
+            // or genesis as its parent, so forks, long branches and single
+            // blocks all occur.
+            let n = 1 + rng.below(24) as usize;
+            let mut blocks: BTreeMap<[u8; 32], BlockEnvelope> = BTreeMap::new();
+            let mut ids: Vec<[u8; 32]> = Vec::new();
+            for i in 0..n {
+                let parent = if i == 0 || rng.below(4) == 0 {
+                    g
+                } else {
+                    ids[rng.below(i as u64) as usize]
+                };
+                // Some blocks carry attestations in the body — the half of the
+                // message set that never passes through the pool.
+                let n_atts = rng.below(3) as usize;
+                let atts: Vec<Attestation> = (0..n_atts)
+                    .map(|_| {
+                        let v = rng.below(8) as u32;
+                        let slot = 1 + rng.below(4);
+                        let head = if ids.is_empty() || rng.below(4) == 0 {
+                            g
+                        } else {
+                            ids[rng.below(ids.len() as u64) as usize]
+                        };
+                        attest(v, slot, head)
+                    })
+                    .collect();
+                let (one, one_id) = chain_of(vec![(parent, i as u64 + 1, i as u8, atts)]);
+                blocks.extend(one);
+                ids.push(one_id[0]);
+            }
+
+            // Loose attestations, including votes for blocks that do not
+            // exist and same-slot pairs that make a validator an equivocator.
+            let n_loose = rng.below(12) as usize;
+            let pool: Vec<Attestation> = (0..n_loose)
+                .map(|_| {
+                    let v = rng.below(8) as u32;
+                    let slot = 1 + rng.below(4);
+                    let head = match rng.below(6) {
+                        0 => [rng.next_u64() as u8; 32], // never seen
+                        1 => g,
+                        _ => ids[rng.below(ids.len() as u64) as usize],
+                    };
+                    attest(v, slot, head)
+                })
+                .collect();
+
+            // Uniform stake on half the rounds so sibling weights tie and the
+            // tie-break — not the arithmetic — decides the head.
+            let validators: Vec<Validator> = if round % 2 == 0 {
+                vals(8)
+            } else {
+                (0..8u32)
+                    .map(|index| Validator {
+                        index,
+                        effective_stake: 1 + rng.below(1_000_000),
+                    })
+                    .collect()
+            };
+
+            for justified in [g, ids[rng.below(ids.len() as u64) as usize]] {
+                assert_eq!(
+                    lmd_ghost_head(&blocks, pool.iter(), &validators, justified),
+                    lmd_ghost_head_reference(&blocks, pool.iter(), &validators, justified),
+                    "round {round}: the rewritten fork choice selected a \
+                     different head than the one it replaced"
+                );
+            }
+        }
+    }
+
+    /// **Why `apply_canonical` may drop an attestation from the pool without
+    /// forcing `advance` to recompute.** Fork choice observes every stored
+    /// block's body *and* the loose pool. An attestation that leaves the pool
+    /// because the block carrying it became canonical is therefore still
+    /// observed, from that block — the head cannot move.
+    ///
+    /// That is the entire justification for `fc_covered_removals` in
+    /// `Engine::forkchoice_inputs`. The second half of the test is the
+    /// control: an attestation no stored block carries is NOT free to drop,
+    /// which is why the epoch `retain` on the next line still invalidates the
+    /// memo.
+    #[test]
+    fn an_attestation_its_block_carries_is_free_to_leave_the_pool() {
+        let g = [0x99u8; 32];
+        let validators = vals(4);
+
+        // Two siblings. Validators 0 and 1 back `heavy`; validator 2 backs
+        // `light`. The attestations for `heavy` ride inside `heavy`'s body.
+        let (blocks_a, a_ids) = chain_of(vec![(g, 1, 1, Vec::new())]);
+        let light = a_ids[0];
+        let carried = vec![attest(0, 1, light), attest(1, 1, light)];
+        let (blocks_b, b_ids) = chain_of(vec![(g, 1, 9, carried.clone())]);
+        let mut blocks = blocks_a;
+        blocks.extend(blocks_b);
+        let carrier = b_ids[0];
+        // The carried votes name `light`, so `light` wins while they count.
+        let with_pool: Vec<Attestation> = carried.clone();
+        let without_pool: Vec<Attestation> = Vec::new();
+        assert_eq!(
+            lmd_ghost_head(&blocks, with_pool.iter(), &validators, g),
+            lmd_ghost_head(&blocks, without_pool.iter(), &validators, g),
+            "dropping from the pool an attestation the stored block {} still \
+             carries moved the head — `fc_covered_removals` would be unsound",
+            crate::codec::hex8(&carrier)
+        );
+
+        // Control, on a block set with NOTHING in any body: two siblings and
+        // one loose vote for the lexicographically smaller of them. With the
+        // vote it wins on weight; without it the pair is a zero-zero tie and
+        // the tie-break hands the head to the other one. So an attestation no
+        // stored block carries is emphatically NOT free to drop — which is why
+        // the epoch `retain` in `apply_canonical` still invalidates the memo.
+        let (mut bare, x_ids) = chain_of(vec![(g, 1, 0x11, Vec::new())]);
+        let (bare_b, y_ids) = chain_of(vec![(g, 1, 0x22, Vec::new())]);
+        bare.extend(bare_b);
+        let (smaller, larger) = if x_ids[0] < y_ids[0] {
+            (x_ids[0], y_ids[0])
+        } else {
+            (y_ids[0], x_ids[0])
+        };
+        let loose = vec![attest(0, 1, smaller)];
+        assert_eq!(
+            lmd_ghost_head(&bare, loose.iter(), &validators, g),
+            smaller,
+            "the loose vote did not carry its block"
+        );
+        assert_eq!(
+            lmd_ghost_head(&bare, [].iter(), &validators, g),
+            larger,
+            "the control is not controlling: dropping an uncarried \
+             attestation must be able to move the head, or the epoch `retain` \
+             would need no invalidation"
+        );
+    }
+
+    /// Wall-clock cost of one `lmd_ghost_head`, old shape against new, at the
+    /// depths the problem was measured at. `#[ignore]`d — it is a measurement,
+    /// not an assertion, and the reference takes minutes at depth 4,096.
+    ///
+    ///   cargo test --release -p bloch-pos-node -- --ignored --nocapture \
+    ///       perf_lmd_ghost_head_by_depth
+    #[test]
+    #[ignore]
+    fn perf_lmd_ghost_head_by_depth() {
+        use std::time::Instant;
+        let g = [0x99u8; 32];
+        let n_validators = 64u32;
+        let validators = vals(n_validators);
+
+        for depth in [256u64, 512, 1024, 4096] {
+            // A spine with a childless sibling at every level, so the descent
+            // runs the full depth and has a comparison to make each step.
+            let mut blocks: BTreeMap<[u8; 32], BlockEnvelope> = BTreeMap::new();
+            let mut spine: Vec<[u8; 32]> = Vec::new();
+            let mut parent = g;
+            for d in 0..depth {
+                let (two, ids) = chain_of(vec![
+                    (parent, d + 1, 0, Vec::new()),
+                    (parent, d + 1, 1, Vec::new()),
+                ]);
+                blocks.extend(two);
+                // The lexicographically larger sibling is the spine, so the
+                // tie-break cannot short-circuit the descent.
+                let (hi, _lo) = if ids[0] > ids[1] {
+                    (ids[0], ids[1])
+                } else {
+                    (ids[1], ids[0])
+                };
+                spine.push(hi);
+                parent = hi;
+            }
+            // Votes spread down the spine.
+            let pool: Vec<Attestation> = (0..n_validators)
+                .map(|v| {
+                    let d = (v as u64 * depth / n_validators as u64) as usize;
+                    attest(v, 1, spine[d.min(spine.len() - 1)])
+                })
+                .collect();
+
+            let t = Instant::now();
+            let new_head = lmd_ghost_head(&blocks, pool.iter(), &validators, g);
+            let new_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+            let t = Instant::now();
+            let old_head = lmd_ghost_head_reference(&blocks, pool.iter(), &validators, g);
+            let old_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+            // Split the surviving cost, because there are two of them and only
+            // one was rewritten: `forkchoice_store` rebuilds the parent map,
+            // the sibling lists and the whole message set on every call (O(N)
+            // in stored blocks, and it is what makes a REPLAY quadratic in
+            // chain length), and `Store::head` then walks it. Reporting the
+            // total alone would hide which one is left.
+            let t = Instant::now();
+            let (fc, parents, children) = forkchoice_store(&blocks, pool.iter(), &validators);
+            let build_ms = t.elapsed().as_secs_f64() * 1000.0;
+            let tree = BlockTree { parents: &parents };
+            let t = Instant::now();
+            let split_head = fc.head(&tree, g, &children);
+            let descend_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+            assert_eq!(new_head, old_head, "depth {depth}: heads differ");
+            assert_eq!(new_head, split_head, "depth {depth}: split path differs");
+            println!(
+                "depth {depth:5}  blocks {:6}  old {old_ms:10.2} ms   new {new_ms:8.3} ms   \
+                 speedup {:6.0}x   [of new: store-rebuild {build_ms:7.3} ms, \
+                 descent {descend_ms:7.3} ms]",
+                blocks.len(),
+                old_ms / new_ms.max(1e-9),
+            );
+        }
     }
 }
 
@@ -2912,6 +3290,7 @@ mod transfer_v2_end_to_end {
             ws_anchor: None,
             ws_anchor_hard: false,
             ws_conflict_reported: false,
+            fc_covered_removals: 0,
         }
     }
 
