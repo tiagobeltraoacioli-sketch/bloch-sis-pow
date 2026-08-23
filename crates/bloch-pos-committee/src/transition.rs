@@ -4452,6 +4452,340 @@ mod tests {
     use super::*;
     use crate::header::BlockHeaderV4;
 
+    /// PROBE 6 — the exploit is ONE block, not two. A `Delegate` included in
+    /// epoch E is `requested_epoch = E+1`: at E it is not even in the warm-up
+    /// queue, `activated_sat` is ZERO, and `state_of` reports `Activating` —
+    /// which `apply_slashing_evidence` does NOT mask (it masks only
+    /// `Inactive`). `apply_slash` then prices the full gross notional.
+    #[test]
+    fn probe_the_exploit_fits_in_a_single_block() {
+        let (_t, g, _c) = setup(4);
+        let total_active = 4 * sat(200_000);
+        let mut st = g.clone();
+        let phantom = sat(10_000_000);
+        st.apply_transaction_gated(
+            &PosTransaction::Delegate {
+                delegator: 99,
+                validator: 3,
+                amount_sat: phantom,
+                eligible: true,
+            },
+            total_active,
+            0,
+            &OkVerifier,
+            u64::MAX,
+        )
+        .expect("Delegate applies");
+        let reg = delegation::Registry::resolve(&st.delegations, st.epoch);
+        let d = st.delegations[0];
+        assert_eq!(reg.activated_sat(&d), 0, "control: not one satoshi is activated");
+        assert_eq!(reg.stake_of(3), 0, "control: the operator gained no weight");
+        assert_eq!(reg.state_of(&d), delegation::StakeState::Activating);
+        // Same epoch, same block: the evidence.
+        st.apply_slashing_evidence(
+            &double_vote_evidence_tagged(3, 0x99),
+            0,
+            total_active,
+            &OkVerifier,
+        )
+        .expect("evidence applies");
+        let reward = st.pending_fee_rewards.get(&0).copied().unwrap_or(0);
+        println!("PROBE6 same-block reward = {reward} sat from a 0-weight delegation");
+        assert_eq!(reward, 0, "EXTRACTION in ONE block: {reward} sat minted");
+    }
+
+    /// PROBE 5 — a value-conservation MODEL run against the real methods.
+    /// Track the bond's two halves independently (`phantom` = never-emitted
+    /// principal, `backed` = coin the reward boundary really moved) under the
+    /// rule the maintenance fold encodes — a penalty consumes BACKED value
+    /// first — and assert the withdrawal pays exactly `backed`, never more,
+    /// across every shape of (rewards, slash, gate) ordering.
+    #[test]
+    fn probe_the_write_off_never_pays_more_than_the_bond_actually_holds() {
+        let principal = sat(200_000);
+        let total_active = 4 * principal;
+        for slash_pre_gate in [true, false] {
+            for r1 in [0u128, sat(50_000), sat(500_000)] {
+                for r2 in [0u128, sat(50_000)] {
+                    let (_t, g, _c) = setup(4);
+                    let v = 3u32;
+                    let mut phantom = principal;
+                    let mut backed = 0u128;
+
+                    // r1: rewards before the slash.
+                    let mut st = g.clone();
+                    if r1 > 0 {
+                        st.pending_fee_rewards.insert(v, r1);
+                    }
+                    let mut st = st.close_epoch_gated(u64::MAX);
+                    let credited = st.validator_record(v).unwrap().staked_sat
+                        - (phantom + backed);
+                    backed += credited;
+
+                    let gate_now = |s: CommittedState| s.close_epoch_gated(s.epoch + 1);
+
+                    let mut st = if slash_pre_gate { st } else { gate_now(st) };
+
+                    // The slash.
+                    let before = st.validator_record(v).unwrap().staked_sat;
+                    st.apply_slashing_evidence(
+                        &double_vote_evidence_tagged(v, 0x5E),
+                        0,
+                        total_active,
+                        &OkVerifier,
+                    )
+                    .expect("evidence applies");
+                    let burn = before - st.validator_record(v).unwrap().staked_sat;
+                    let from_backed = burn.min(backed);
+                    backed -= from_backed;
+                    phantom -= burn - from_backed;
+
+                    // r2: rewards after the slash (fee rewards reach an
+                    // ejected record; the boundary has no roster filter).
+                    if r2 > 0 {
+                        st.pending_fee_rewards.insert(v, r2);
+                    }
+                    let held = st.validator_record(v).unwrap().staked_sat;
+                    let mut st = st.close_epoch_gated(u64::MAX);
+                    backed += st.validator_record(v).unwrap().staked_sat - held;
+
+                    let mut st = if slash_pre_gate { gate_now(st) } else { st };
+                    assert!(st.epoch >= 1);
+
+                    {
+                        let rec = st.validators.get_mut(&v).unwrap();
+                        rec.withdrawal_credentials = vec![0xAB; 32];
+                        rec.withdrawable_epoch = st.epoch;
+                    }
+                    let bond = st.validator_record(v).unwrap().staked_sat;
+                    assert_eq!(bond, phantom + backed, "model desync (pre={slash_pre_gate} r1={r1} r2={r2})");
+                    st.apply_withdraw(v).expect("withdraw");
+                    let txid = PosTransaction::Withdraw { validator: v }.txid();
+                    let paid = st.utxo(&txid, 0).map(|e| e.value as u128).unwrap_or(0);
+                    println!(
+                        "PROBE5 pre={slash_pre_gate} r1={r1} r2={r2} bond={bond} \
+                         phantom={phantom} backed={backed} paid={paid} \
+                         written_off={}",
+                        st.written_off_sat
+                    );
+                    assert!(
+                        paid <= backed,
+                        "EXTRACTION: paid {paid} > backed {backed} (pre={slash_pre_gate} r1={r1} r2={r2})"
+                    );
+                    assert_eq!(
+                        paid + st.written_off_sat,
+                        bond,
+                        "value is not conserved: paid + written_off != bond"
+                    );
+                }
+            }
+        }
+    }
+
+    // ══ ADVERSARIAL EXTRACTION PROBES (review 2026-08-22) ════════════════
+    // Discardable: written by the review worktree, not part of the front.
+
+    /// PROBE 1 — the two-block exploit, run against THIS branch.
+    /// Block 1: a legacy `Delegate` naming an arbitrary notional and
+    /// destroying nothing. Block 2 (next epoch, delegation still
+    /// `Activating` — zero consensus weight, zero yield): slashing evidence.
+    /// The whistleblower reward is priced against the phantom notional and
+    /// lands in `pending_fee_rewards`, compounds into the reporter's bond at
+    /// the boundary, and leaves as a SPENDABLE eUTXO through the write-off
+    /// front's own `apply_withdraw`.
+    #[test]
+    fn probe_phantom_delegation_becomes_spendable_coin_at_withdraw() {
+        let (_t, g, _c) = setup(4);
+        let principal = sat(200_000);
+        let total_active = 4 * principal;
+
+        // CONTROL: the chain holds no coin whatsoever.
+        assert_eq!(g.total_unspent_sat(), 0, "control: the ledger must open empty");
+        let issued_before = g.issued_sat();
+
+        // ── Block 1, epoch 0 ─────────────────────────────────────────────
+        let mut st = g.clone();
+        let phantom = sat(10_000_000); // 50x the whole genesis stake
+        st.apply_transaction_gated(
+            &PosTransaction::Delegate {
+                delegator: 99,
+                validator: 3,
+                amount_sat: phantom,
+                eligible: true,
+            },
+            total_active,
+            0,
+            &OkVerifier,
+            u64::MAX,
+        )
+        .expect("legacy Delegate is live on the chain today");
+
+        // ── Block 2, epoch 1 ─────────────────────────────────────────────
+        let mut st = st.close_epoch_gated(u64::MAX);
+        assert_eq!(st.epoch, 1);
+        let reg = delegation::Registry::resolve(&st.delegations, st.epoch);
+        let d = st.delegations[0];
+        // CONTROL: the delegation is still WARMING UP -- not fully admitted,
+        // and only a churn-budget slice of it carries any weight at all.
+        assert_eq!(
+            reg.state_of(&d),
+            delegation::StakeState::Activating,
+            "control: the delegation must not be fully admitted yet"
+        );
+        println!(
+            "PROBE1 notional {} sat, activated {} sat ({}%)",
+            phantom,
+            reg.stake_of(3),
+            reg.stake_of(3) * 100 / phantom
+        );
+        assert!(reg.stake_of(3) * 100 / phantom < 10, "control: <10% carries weight");
+
+        st.apply_slashing_evidence(
+            &double_vote_evidence_tagged(3, 0x77),
+            0, // whistleblower = validator 0
+            total_active,
+            &OkVerifier,
+        )
+        .expect("evidence applies");
+        let reward = st.pending_fee_rewards.get(&0).copied().unwrap_or(0);
+        println!("PROBE1 whistleblower reward = {reward} sat");
+        assert!(reward > 0, "no reward: the exploit is dead");
+
+        // Compound it into the reporter's bond.
+        let st = st.close_epoch_gated(u64::MAX);
+        let bond0 = st.validator_record(0).unwrap().staked_sat;
+        println!("PROBE1 reporter bond {} -> {}", principal, bond0);
+
+        // Cross the flag day and withdraw the reporter.
+        let mut st = st.close_epoch_gated(st.epoch + 1);
+        assert_eq!(
+            st.unbacked_principal_sat(0),
+            principal,
+            "the whole genesis principal must be classified phantom"
+        );
+        {
+            let rec = st.validators.get_mut(&0).unwrap();
+            rec.withdrawal_credentials = vec![0xAB; 32];
+            rec.exit_epoch = st.epoch;
+            rec.withdrawable_epoch = st.epoch;
+        }
+        st.apply_withdraw(0).expect("withdraw");
+        let txid = PosTransaction::Withdraw { validator: 0 }.txid();
+        let paid = st.utxo(&txid, 0).map(|e| e.value as u128).unwrap_or(0);
+        println!(
+            "PROBE1 EXTRACTED {paid} sat as spendable eUTXO; issued_sat {} -> {} (delta {})",
+            issued_before,
+            st.issued_sat(),
+            st.issued_sat() - issued_before
+        );
+        println!("PROBE1 total_unspent now = {}", st.total_unspent_sat());
+        assert_eq!(
+            paid, 0,
+            "EXTRACTION: {paid} sat of coin nobody ever emitted is now spendable"
+        );
+    }
+
+    /// PROBE 2 — withdraw twice, and withdraw after the output is spent.
+    #[test]
+    fn probe_a_bond_cannot_be_withdrawn_twice() {
+        let (_t, g, _c) = setup(4);
+        let mut st = g.close_epoch_gated(1);
+        assert!(st.epoch >= 1);
+        {
+            let rec = st.validators.get_mut(&0).unwrap();
+            rec.withdrawal_credentials = vec![0xAB; 32];
+            rec.withdrawable_epoch = st.epoch;
+        }
+        // Give the bond some emitted value so the payout is non-zero.
+        st.validators.get_mut(&0).unwrap().staked_sat += sat(1_000);
+        st.apply_withdraw(0).expect("first withdrawal");
+        let txid = PosTransaction::Withdraw { validator: 0 }.txid();
+        let first = st.utxo(&txid, 0).map(|e| e.value as u128).unwrap_or(0);
+        assert!(first > 0, "control: the first withdrawal must pay something");
+        assert_eq!(st.apply_withdraw(0), Err(TxReject::StakingRule), "second withdrawal");
+        // Spend the output and try again: the OutputExists guard is gone.
+        st.eutxos.remove(&(txid, 0));
+        assert_eq!(
+            st.apply_withdraw(0),
+            Err(TxReject::StakingRule),
+            "EXTRACTION: a spent withdrawal output lets the bond be withdrawn again"
+        );
+    }
+
+    /// PROBE 3 — a genesis bond slashed to ZERO loses its `unbacked_sat`
+    /// entry (canonical form). If anything can re-inflate `staked_sat`
+    /// afterwards, the bond withdraws as if it had always been funded.
+    #[test]
+    fn probe_a_bond_slashed_to_zero_cannot_be_refilled_and_withdrawn_as_funded() {
+        let (_t, g, _c) = setup(4);
+        let principal = sat(200_000);
+        let total_active = 4 * principal;
+        // Cross the gate first, so `unbacked_sat` exists.
+        let mut st = g.close_epoch_gated(1);
+        assert_eq!(st.unbacked_principal_sat(3), principal);
+        // Drive the bond to zero by hand — the shape a 100% penalty makes.
+        st.validators.get_mut(&3).unwrap().staked_sat = 0;
+        st.apply_slashing_evidence(
+            &double_vote_evidence_tagged(3, 0x33),
+            0,
+            total_active,
+            &OkVerifier,
+        )
+        .expect("evidence applies");
+        assert_eq!(st.unbacked_principal_sat(3), 0, "the entry is dropped at zero stake");
+        assert_eq!(st.stake_low_water_sat(3), Some(0), "and a zero floor is recorded");
+        // Now refill the bond with a fee reward (the boundary credits it with
+        // no roster check) and withdraw.
+        st.pending_fee_rewards.insert(3, sat(50_000));
+        let mut st = st.close_epoch_gated(u64::MAX);
+        let bond = st.validator_record(3).unwrap().staked_sat;
+        println!("PROBE3 refilled a zeroed genesis bond to {bond}");
+        {
+            let rec = st.validators.get_mut(&3).unwrap();
+            rec.withdrawal_credentials = vec![0xAB; 32];
+            rec.withdrawable_epoch = st.epoch;
+        }
+        st.apply_withdraw(3).expect("withdraw");
+        let txid = PosTransaction::Withdraw { validator: 3 }.txid();
+        let paid = st.utxo(&txid, 0).map(|e| e.value as u128).unwrap_or(0);
+        println!("PROBE3 paid {paid}");
+        assert_eq!(paid, 0, "a zeroed genesis bond paid {paid} after a refill");
+    }
+
+    /// PROBE 4 — saturate the notional. `apply_slash` computes
+    /// `amount_sat * penalty_bps / 10_000` with no bound on `amount_sat`,
+    /// and the tx decoder takes a full u128.
+    #[test]
+    fn probe_an_unbounded_delegation_notional_does_not_overflow_the_penalty() {
+        let (_t, g, _c) = setup(4);
+        let total_active = 4 * sat(200_000);
+        let mut st = g.clone();
+        st.apply_transaction_gated(
+            &PosTransaction::Delegate {
+                delegator: 99,
+                validator: 3,
+                amount_sat: u128::MAX / 2,
+                eligible: true,
+            },
+            total_active,
+            0,
+            &OkVerifier,
+            u64::MAX,
+        )
+        .expect("no upper bound on the notional");
+        let mut st = st.close_epoch_gated(u64::MAX);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            st.apply_slashing_evidence(
+                &double_vote_evidence_tagged(3, 0x44),
+                0,
+                total_active,
+                &OkVerifier,
+            )
+        }));
+        assert!(r.is_ok(), "PANIC in the block-application path from a u128 notional");
+    }
+
+
     /// The genesis id, derived rather than invented.
     ///
     /// The tests used to write `BlockId([0x60; 32])`. That is no longer
