@@ -63,6 +63,9 @@ pub mod gossip;
 pub mod header;
 pub mod interfaces;
 pub mod params;
+// Instrumentation only, and compiled out unless `perf-timing` is on — see
+// the module docs. No consensus rule reads it.
+pub mod perf;
 pub mod produce;
 pub mod tokenomics_v4;
 pub mod rewards;

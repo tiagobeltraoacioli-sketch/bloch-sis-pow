@@ -178,6 +178,18 @@ fn body_transactions(env: &BlockEnvelope) -> Result<Vec<PosTransaction>, String>
         .collect()
 }
 
+/// The end-to-end replay benchmark (`src/engine/replay_bench.rs`).
+///
+/// A CHILD module of `engine`, and that is the whole reason it can exist:
+/// `Engine` and its fields are private to this module, so a benchmark in
+/// `tests/` could not drive `ingest`/`advance`/`apply_canonical` at all and
+/// would have had to reimplement them — measuring the reimplementation. A
+/// child module sees its ancestors' private items, so nothing here has to be
+/// widened for it. `cfg(test)`: not in the binary, asserts no consensus
+/// property, changes no behaviour.
+#[cfg(test)]
+mod replay_bench;
+
 struct Engine {
     manifest: Manifest,
     state: CommittedState,
@@ -295,6 +307,8 @@ impl Engine {
     /// `epoch` — the exact rolling `apply_block` performs internally, so the
     /// duty view here can never disagree with validation.
     fn rolled_to(&self, epoch: u64) -> CommittedState {
+        // Instrumentation only; compiled out without `perf-timing`.
+        let _perf = bloch_pos_committee::perf::span(bloch_pos_committee::perf::Phase::RolledTo);
         let mut st = self.state.clone();
         // Invariant: the canonical state's open epoch is its head's epoch —
         // only apply_block advances it, and apply_block rolls exactly there.
@@ -729,6 +743,8 @@ impl Engine {
     /// that was found violated in `forkchoice.rs` on 2026-08-11 and fixed
     /// there. Sibling lists are sorted so the tie-break is stable too.
     fn forkchoice_head(&self) -> [u8; 32] {
+        // Instrumentation only; compiled out without `perf-timing`.
+        let _perf = bloch_pos_committee::perf::span(bloch_pos_committee::perf::Phase::ForkChoice);
         lmd_ghost_head(
             &self.blocks,
             self.pool.values(),
@@ -986,6 +1002,10 @@ impl Engine {
     /// whole candidate chain from genesis through the same transition. True
     /// if adopted; false if a branch block failed validation (it is removed).
     fn do_reorg(&mut self, ancestor: [u8; 32], branch: Vec<BlockEnvelope>) -> bool {
+        // Instrumentation only; compiled out without `perf-timing`. Self time
+        // only — the `apply_block` calls below are attributed to their own
+        // phases, so this reads as "reorg overhead beyond re-execution".
+        let _perf = bloch_pos_committee::perf::span(bloch_pos_committee::perf::Phase::Reorg);
         let cut = self
             .chain
             .iter()
