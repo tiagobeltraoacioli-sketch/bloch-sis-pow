@@ -716,7 +716,7 @@ mod tests {
         // signer's withdrawal has already cleared: the hole.
         let last_trusted_old = f + WITHDRAWAL_DELAY_EPOCHS - 1;
         assert!(
-            validate_withdrawal(&rec, last_trusted_old).is_ok(),
+            validate_withdrawal(&rec, last_trusted_old, 0).is_ok(),
             "inside the old window the committee can already be unslashable"
         );
     }
@@ -735,13 +735,13 @@ mod tests {
 
         // Last age the corrected rule still trusts: WS_PERIOD_EPOCHS − 1.
         assert_eq!(
-            validate_withdrawal(&rec, f + WS_PERIOD_EPOCHS - 1),
+            validate_withdrawal(&rec, f + WS_PERIOD_EPOCHS - 1, 0),
             Err(WithdrawReject::DelayNotElapsed)
         );
         // Even at the refusal boundary itself the stake is still bonded —
         // one epoch of margin below the earliest possible withdrawal.
         assert_eq!(
-            validate_withdrawal(&rec, f + WS_PERIOD_EPOCHS),
+            validate_withdrawal(&rec, f + WS_PERIOD_EPOCHS, 0),
             Err(WithdrawReject::DelayNotElapsed)
         );
         // Derivation sanity: the period plus the duty overlap never exceeds

@@ -411,6 +411,141 @@ pub enum PosTransaction {
         /// exists so the ineligibility is itself a committed, auditable fact.
         eligible: bool,
     },
+    /// Register a validator by **spending real coins** — the funded
+    /// replacement for [`PosTransaction::Deposit`], consensus-valid only from
+    /// [`crate::params::FUNDED_STAKE_ACTIVATION_EPOCH`] (2026-08-21).
+    ///
+    /// # What this closes
+    ///
+    /// The legacy `Deposit` names an `amount_sat`, spends no output and
+    /// carries no signature; the only thing refusing it on the live chain is
+    /// `admissible()` in the node — a mempool refusal its own comment calls
+    /// "not a consensus rule". A modified proposer could mint stake from
+    /// nothing and every unmodified node would accept the block. This variant
+    /// makes the bond cost coins: the inputs are spent under exactly the
+    /// transfer path's rules, and the equality
+    ///
+    /// ```text
+    /// Σ inputs  ==  amount_sat + Σ change + fee
+    /// ```
+    ///
+    /// is enforced with the transfer's own [`TransferReject::ValueNotConserved`]
+    /// — what leaves the eUTXO set is exactly what enters the bond plus the
+    /// fee, and `issued_sat` is never touched.
+    ///
+    /// # Two signature domains, two signers, deliberately
+    ///
+    /// - **`DS_SPEND`**, signed by the owners of the coins over
+    ///   [`PosTransaction::spend_signing_root`]: authorises the spend and —
+    ///   because the root covers the whole registration payload including the
+    ///   PoP — endorses exactly which validator the coins bond. Reused
+    ///   verbatim from `Transfer` ([`TransferInput`], same root construction):
+    ///   two ways to authorise a spend would be two surfaces to get one of
+    ///   them wrong.
+    /// - **`DS_DEPOSIT`**, signed by the validator key over
+    ///   [`crate::staking::DepositTx::signing_root`]: proves possession of
+    ///   BOTH halves of the hybrid key (anti rogue-key). It deliberately does
+    ///   NOT cover the inputs, so the hot validator key can never authorise
+    ///   coin movement — compromise of it must not reach the principal.
+    ///
+    /// # Capacity, with the numbers (measured 2026-08-21)
+    ///
+    /// A PQ witness is 3,749 B of enveloped pubkey + 4,775 B of hybrid
+    /// signature per input, and the PoP is another 4,775 B signature beside a
+    /// second copy of the 3,749 B key. A single-input, single-change funded
+    /// deposit encodes to ≈17.3 KB, so the 262,144-byte block cap admits
+    /// **15 deposits per block** (each extra input costs ≈8.6 KB more; two
+    /// inputs each → 10 per block). Gas does not bind first: two hybrid
+    /// verifications (2 × 72,748) plus ≈17.3 KB at 16 gas/byte is ≈427K gas,
+    /// so 15 deposits are ≈6.4M of the 60M limit. And the useful ceiling is
+    /// smaller than either cap: [`crate::staking::MAX_ACTIVATIONS_PER_EPOCH`]
+    /// admits 4 validators per epoch — the queue, not the block, is the
+    /// bottleneck, by design.
+    FundedDeposit {
+        /// The outputs funding the bond, each with its own witness — same
+        /// type, same rules, same gas class as a transfer's inputs.
+        inputs: Vec<TransferInput>,
+        /// Change back to the depositor. Keyed by this transaction's derived
+        /// txid, like transfer outputs.
+        change: Vec<TransferOutput>,
+        /// Suite-tagged hybrid public key. Consensus pins the suite to
+        /// `SUITE_MLDSA65_FALCON1024` ([`crate::staking::is_wire_hybrid_pubkey`]):
+        /// the ML-DSA-only escape hatch must not enter the registry.
+        pubkey: Vec<u8>,
+        /// The bond, in satoshis — the amount the conservation equality moves
+        /// from the eUTXO set into the registry.
+        amount_sat: u128,
+        /// `c_0`, head of the SHAKE-256 reveal chain (§6.3).
+        randao_commitment: [u8; 32],
+        /// Where the bond withdraws to — must be the 32-byte script-hash
+        /// form, fixed here and never by a later message ([`crate::staking::Address`]).
+        withdrawal_credentials: Vec<u8>,
+        /// Operator commission in basis points, committed with the record and
+        /// covered by BOTH signing roots (see `DS_DEPOSIT` above).
+        commission_bps: u128,
+        /// Hybrid signature by the validator key over the `DS_DEPOSIT` root.
+        /// Covered by the `DS_SPEND` root (it is computed first — no
+        /// circularity), so mutating it in transit breaks the input
+        /// signatures instead of producing a mangled-body DoS.
+        proof_of_possession: Vec<u8>,
+        /// Declared payload size — same rules, same
+        /// [`TransferReject::UnderdeclaredSize`] floor as a transfer.
+        tx_bytes: u64,
+        /// The depositor's tip; the base fee is the protocol's.
+        tip_millisat_per_gas: u128,
+    },
+    /// Voluntary exit, **signed** — the funded replacement for
+    /// [`PosTransaction::Exit`], consensus-valid only from the flag day.
+    ///
+    /// The legacy `Exit` is unauthenticated: anyone could retire any
+    /// validator irreversibly (the roster-emptying attack `admissible()`
+    /// documents). This one verifies a hybrid signature by the registered
+    /// key over [`crate::staking::ExitTx::signing_root`] (`DS_EXIT`), which
+    /// binds the epoch so a captured exit cannot be replayed from the future;
+    /// state effects are identical to the legacy arm (duties stop after
+    /// [`crate::staking::EXIT_DELAY_EPOCHS`], stake withdrawable after
+    /// [`crate::staking::WITHDRAWAL_DELAY_EPOCHS`] more). It settles no fee —
+    /// a locked bond reaches no spendable coin to pay one with — but its
+    /// bytes and gas still count against both block caps, so it cannot stuff
+    /// blocks for free; it is bounded at one per validator per lifetime by
+    /// the exit rules themselves.
+    SignedExit {
+        validator: u32,
+        /// Epoch the exit is intended for; signed, must not be in the future
+        /// of the including block's epoch.
+        epoch: u64,
+        /// Hybrid signature over the `DS_EXIT` root, verified against the
+        /// REGISTERED pubkey — never one carried in the message.
+        signature: Vec<u8>,
+    },
+    /// Pay out a withdrawable bond as a spendable output — permissionless and
+    /// unsigned, because every term is already fixed by committed state: the
+    /// destination was pinned at registration (`withdrawal_credentials`), the
+    /// clock by the exit, and the amount by the record. After the delay, this
+    /// transfer is the only thing that can happen to those coins, so a
+    /// signature would authorise nothing (the `validate_withdrawal`
+    /// rationale in `staking.rs`).
+    ///
+    /// # It pays the funded portion ONLY (founder decision, 2026-08-21)
+    ///
+    /// The payout is `staked_sat − unbacked_principal`, saturating at zero
+    /// ([`CommittedState::withdrawable_sat`]): a genesis bond's 25,000-BLOCH
+    /// principal was never issued and never funded, so it never becomes
+    /// spendable coin — only the post-genesis accrual does. The residue
+    /// remains in the record after the withdrawal: committed, visible in the
+    /// state root, and permanently unreachable. The fee comes out of the
+    /// payout itself, so even the fee is backed coin. Conservation:
+    ///
+    /// ```text
+    /// staked_before − staked_after  ==  payout + fee  ==  withdrawable
+    /// ```
+    ///
+    /// A second withdrawal finds `withdrawable == 0` and is refused — which
+    /// is also what keeps this variant's constant canonical bytes (tag +
+    /// index, hence one txid per validator forever) from ever colliding on an
+    /// output key. If re-bonding of an index is ever allowed, that derivation
+    /// must change first.
+    Withdraw { validator: u32 },
     /// A §7.3 evidence transaction: two conflicting signed messages proving
     /// one validator equivocated (a header pair or an attestation pair —
     /// [`crate::interfaces::SlashingEvidence`] is the frozen wire shape).
@@ -525,6 +660,66 @@ impl PosTransaction {
                     *tip_millisat_per_gas,
                 );
             }
+            PosTransaction::FundedDeposit {
+                inputs,
+                change,
+                pubkey,
+                amount_sat,
+                randao_commitment,
+                withdrawal_credentials,
+                commission_bps,
+                proof_of_possession,
+                tx_bytes,
+                tip_millisat_per_gas,
+            } => {
+                // The variant tag leads, unlike the Transfer arm (whose
+                // layout is frozen — re-keying it re-keys every txid on the
+                // chain). Cross-variant injectivity under the shared DS_SPEND
+                // domain then rests on: (1) this stream begins 0x07 (the
+                // variant's wire tag) while a Transfer stream begins with a
+                // 4-byte input count, (2) the
+                // structural lengths differ (this stream carries a
+                // length-prefixed 3,749 B key and a 4,775 B PoP mid-stream),
+                // and (3) a byte-identical pair would additionally need BOTH
+                // interpretations to be well-formed and applicable against
+                // the same committed set under the same keys. A signature
+                // over one shape is a statement about that shape only.
+                h.update([0x07u8]);
+                // Witness-free, exactly like the Transfer arm: spend points
+                // without their pubkeys/signatures — the root a signature is
+                // computed over cannot cover the signature being produced.
+                h.update((inputs.len() as u32).to_le_bytes());
+                for i in inputs {
+                    h.update(i.txid);
+                    h.update(i.vout.to_le_bytes());
+                }
+                h.update((change.len() as u32).to_le_bytes());
+                for o in change {
+                    h.update(o.value.to_le_bytes());
+                    h.update(o.script_hash);
+                }
+                // The registration payload IS covered — including the PoP.
+                // The PoP is computed over the DS_DEPOSIT root first, so
+                // there is no circularity; covering it here means a PoP
+                // mutated in transit breaks the input signatures (a
+                // deterministic reject) instead of producing a second body
+                // for the same txid — the mangled-body DoS family step 3b of
+                // compute_post_state exists to refuse.
+                h.update((pubkey.len() as u32).to_le_bytes());
+                h.update(pubkey);
+                h.update(amount_sat.to_le_bytes());
+                h.update(randao_commitment);
+                h.update((withdrawal_credentials.len() as u32).to_le_bytes());
+                h.update(withdrawal_credentials);
+                h.update(commission_bps.to_le_bytes());
+                h.update((proof_of_possession.len() as u32).to_le_bytes());
+                h.update(proof_of_possession);
+                // The fee terms, for the same reason as the Transfer arm: an
+                // unsigned fee term is an unsigned deduction from the
+                // depositor's own money.
+                h.update(tx_bytes.to_le_bytes());
+                h.update(tip_millisat_per_gas.to_le_bytes());
+            }
             other => h.update(other.canonical_bytes()),
         }
         h.finalize().into()
@@ -549,6 +744,59 @@ impl PosTransaction {
         h.update(crate::params::DS_TXID);
         h.update(self.spend_signing_root());
         h.finalize().into()
+    }
+
+    /// The `DS_DEPOSIT` root a [`PosTransaction::FundedDeposit`]'s proof of
+    /// possession must be signed over — [`crate::staking::DepositTx::signing_root`]
+    /// applied to this transaction's registration fields.
+    ///
+    /// One derivation path, two callers: the transition verifies the PoP with
+    /// it (`apply_funded_deposit`), and the node's mempool pre-verifies with
+    /// the same call (`admissible` in `bloch-pos-node/src/engine.rs`) so the
+    /// producer's `ProbeVerifier` cannot be fed a garbage PoP that costs an
+    /// honest proposer its own block — the slot-69 class. A second expression
+    /// of this root anywhere would be the duplicate-derivation habit this
+    /// crate refuses.
+    ///
+    /// `None` for every other variant, and for a `FundedDeposit` whose
+    /// pubkey is not the enveloped hybrid form or whose credentials are not
+    /// 32 bytes — the same shapes the transition refuses as `StakingRule`
+    /// before it ever asks for this root.
+    pub fn funded_deposit_pop_signing_root(&self) -> Option<[u8; 32]> {
+        let PosTransaction::FundedDeposit {
+            pubkey,
+            amount_sat,
+            randao_commitment,
+            withdrawal_credentials,
+            commission_bps,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        if !staking::is_wire_hybrid_pubkey(pubkey) {
+            return None;
+        }
+        // The reference DepositTx carries the RAW hybrid key (the registry
+        // and the wire carry it enveloped); the suite id comes from the
+        // envelope it was checked against above.
+        let raw: [u8; staking::HYBRID_PK_BYTES] =
+            pubkey[staking::WIRE_SUITE_HEADER_BYTES..].try_into().ok()?;
+        let addr: staking::Address = withdrawal_credentials.as_slice().try_into().ok()?;
+        Some(
+            staking::DepositTx {
+                suite: staking::SUITE_MLDSA65_FALCON1024,
+                amount_sat: *amount_sat,
+                validator_pubkey: raw,
+                randao_commitment: *randao_commitment,
+                withdrawal_addr: addr,
+                commission_bps: *commission_bps,
+                // The root cannot cover the signature computed over it; the
+                // field is unread by signing_root and empty by construction.
+                proof_of_possession: Vec::new(),
+            }
+            .signing_root(),
+        )
     }
 
     /// The canonical wire encoding of a consensus transaction — the bytes the
@@ -674,6 +922,53 @@ impl PosTransaction {
                 b.extend_from_slice(&validator.to_le_bytes());
                 b.extend_from_slice(&amount_sat.to_le_bytes());
                 b.push(u8::from(*eligible));
+            }
+            PosTransaction::FundedDeposit {
+                inputs,
+                change,
+                pubkey,
+                amount_sat,
+                randao_commitment,
+                withdrawal_credentials,
+                commission_bps,
+                proof_of_possession,
+                tx_bytes,
+                tip_millisat_per_gas,
+            } => {
+                // 0x07, not 0x06: the deduplicated transfer owns 0x06 (frozen
+                // by test, armed for epoch 800). One byte with two live
+                // meanings on the wire is the 2026-08-08 fork class.
+                b.push(0x07);
+                b.extend_from_slice(&(inputs.len() as u32).to_le_bytes());
+                for i in inputs {
+                    b.extend_from_slice(&i.txid);
+                    b.extend_from_slice(&i.vout.to_le_bytes());
+                    put(&mut b, &i.pubkey);
+                    put(&mut b, &i.signature);
+                }
+                b.extend_from_slice(&(change.len() as u32).to_le_bytes());
+                for o in change {
+                    b.extend_from_slice(&o.value.to_le_bytes());
+                    b.extend_from_slice(&o.script_hash);
+                }
+                put(&mut b, pubkey);
+                b.extend_from_slice(&amount_sat.to_le_bytes());
+                b.extend_from_slice(randao_commitment);
+                put(&mut b, withdrawal_credentials);
+                b.extend_from_slice(&commission_bps.to_le_bytes());
+                put(&mut b, proof_of_possession);
+                b.extend_from_slice(&tx_bytes.to_le_bytes());
+                b.extend_from_slice(&tip_millisat_per_gas.to_le_bytes());
+            }
+            PosTransaction::SignedExit { validator, epoch, signature } => {
+                b.push(0x08);
+                b.extend_from_slice(&validator.to_le_bytes());
+                b.extend_from_slice(&epoch.to_le_bytes());
+                put(&mut b, signature);
+            }
+            PosTransaction::Withdraw { validator } => {
+                b.push(0x09);
+                b.extend_from_slice(&validator.to_le_bytes());
             }
             PosTransaction::SlashingEvidence(ev) => {
                 b.push(0x05);
@@ -814,6 +1109,55 @@ impl PosTransaction {
                     tip_millisat_per_gas: r.u128()?,
                 }
             }
+            // The funded staking shapes (tags 0x07–0x09; flag day:
+            // `params::FUNDED_STAKE_ACTIVATION_EPOCH`). 0x06 was already
+            // spoken for — the deduplicated transfer above, frozen by test
+            // and armed for its own flag day — so the funded shapes take the
+            // next free tags; one byte, two live meanings is the 2026-08-08
+            // fork class at the decode layer. Note what is NOT here: no gate
+            // check. Decodability is permanent for every tag this build has
+            // ever known — historical blocks must re-decode on every replay —
+            // and validity is a transition rule (`apply_transaction`'s epoch
+            // dispatch), never a decode rule. The legacy tags 0x02–0x04 above
+            // stay decodable forever for the same reason, even after the gate
+            // makes them invalid in new block bodies.
+            0x07 => {
+                // Same no-preallocation posture as the Transfer arm: counts
+                // are untrusted bytes.
+                let n_in = r.u32()?;
+                let mut inputs = Vec::new();
+                for _ in 0..n_in {
+                    inputs.push(TransferInput {
+                        txid: r.h32()?,
+                        vout: r.u32()?,
+                        pubkey: r.bytes()?,
+                        signature: r.bytes()?,
+                    });
+                }
+                let n_change = r.u32()?;
+                let mut change = Vec::new();
+                for _ in 0..n_change {
+                    change.push(TransferOutput { value: r.u64()?, script_hash: r.h32()? });
+                }
+                PosTransaction::FundedDeposit {
+                    inputs,
+                    change,
+                    pubkey: r.bytes()?,
+                    amount_sat: r.u128()?,
+                    randao_commitment: r.h32()?,
+                    withdrawal_credentials: r.bytes()?,
+                    commission_bps: r.u128()?,
+                    proof_of_possession: r.bytes()?,
+                    tx_bytes: r.u64()?,
+                    tip_millisat_per_gas: r.u128()?,
+                }
+            }
+            0x08 => PosTransaction::SignedExit {
+                validator: r.u32()?,
+                epoch: r.u64()?,
+                signature: r.bytes()?,
+            },
+            0x09 => PosTransaction::Withdraw { validator: r.u32()? },
             other => return Err(TxDecodeError::UnknownTag(other)),
         };
         // Trailing bytes would mean two encodings decode to one transaction,
@@ -913,6 +1257,24 @@ impl<'a> TxReader<'a> {
 }
 
 // ─── The committed state ────────────────────────────────────────────────────
+
+/// The principal of one genesis registration: 25,000 BLOCH, in satoshis.
+///
+/// This is the amount [`CommittedState::unbacked_principal_sat`] writes off
+/// for a validator that has NO deposit-history entry — i.e. one seeded by
+/// [`CommittedState::genesis`], whose bond destroyed no eUTXO coins and
+/// advanced no `issued_sat` (founder decision, 2026-08-21: "a bond is
+/// withdrawable only to the extent it was funded"). The live chain's 64
+/// genesis bonds are each exactly this value, pinned against the published
+/// manifest by `the_genesis_bond_principal_is_outside_the_issued_supply`
+/// (`bloch-pos-node/src/genesis.rs`), which also asserts THIS constant equals
+/// the manifest's per-validator stake — so the write-off cannot drift from
+/// the artefact it was measured against.
+///
+/// Numerically equal to [`staking::MIN_DEPOSIT_SAT`] today, and deliberately
+/// NOT defined as it: the minimum deposit is a policy knob that may move;
+/// the genesis principal is a historical fact that may not.
+pub const GENESIS_UNFUNDED_PRINCIPAL_SAT: u128 = 25_000 * tokenomics_v4::SAT_PER_BLOCH;
 
 /// One validator of the launch set, as published in the genesis block.
 #[derive(Clone, Debug)]
@@ -1097,21 +1459,27 @@ pub struct CommittedState {
     /// conservation rules stated there. Genesis-4 no longer has balances that
     /// nobody can spend.
     ///
-    /// # The gap that is still open, named rather than left to be discovered
+    /// # The gap, and the flag day that closes it (2026-08-21)
     ///
-    /// **Bonding is not funded from this set.** `PosTransaction::Deposit` and
-    /// `Delegate` name an `amount_sat` and spend no output; `Exit` and the
-    /// withdrawal delay return no output either. So the chain holds two pools
-    /// — this one and the registry's bonded stake — and coins do not travel
-    /// between them: a deposit creates bonded stake without destroying
-    /// spendable coins, and fee rewards compound into bonds that this set
-    /// never funded.
+    /// **Bonding is not funded from this set — until
+    /// `params::FUNDED_STAKE_ACTIVATION_EPOCH`.** The legacy
+    /// `PosTransaction::Deposit` and `Delegate` name an `amount_sat` and
+    /// spend no output; `Exit` and the withdrawal delay return no output
+    /// either. So the pre-gate chain holds two pools — this one and the
+    /// registry's bonded stake — and coins do not travel between them: a
+    /// deposit creates bonded stake without destroying spendable coins, and
+    /// fee rewards compound into bonds that this set never funded.
     ///
-    /// Conservation therefore holds **within** the transfer path (the fee is
-    /// exactly what leaves the set, pinned by test) and **not** across the two
-    /// pools. Closing it means giving deposits and withdrawals eUTXO inputs
-    /// and outputs, which is a change to the staking messages' wire shape and
-    /// to their admission rules, not to this field. Until then, no single
+    /// From the gate epoch on, the wire closes it: `FundedDeposit` spends
+    /// outputs from this set into the bond under an exact conservation
+    /// equality, `Withdraw` pays the bond's FUNDED portion back into this set
+    /// (the unfunded genesis/legacy principal is written off at withdrawal —
+    /// founder decision, see `unbacked_principal_sat`), and the legacy
+    /// discriminants become consensus-invalid in block bodies.
+    ///
+    /// Pre-gate, conservation therefore holds **within** the transfer path
+    /// (the fee is exactly what leaves the set, pinned by test) and **not**
+    /// across the two pools. Until the gate is armed, no single
 
     /// number in this state is "the supply".
     eutxos: EutxoSet,
@@ -1720,9 +2088,14 @@ impl CommittedState {
     /// in for the same reason — it is derived once, from the parent's
     /// committed leaf, and every transaction in the block settles at it.
     ///
-    /// Staking messages charge nothing at this layer: their own fee handling
-    /// belongs with the transfer format that carries them (§1.2), and inventing
-    /// a charge here would be inventing a price nobody specified.
+    /// The LEGACY staking messages charge nothing at this layer: their own
+    /// fee handling belongs with the transfer format that carries them
+    /// (§1.2), and inventing a charge here would be inventing a price nobody
+    /// specified. The FUNDED staking messages (valid from the flag day) do
+    /// pay: a funded deposit is priced like a transfer plus one hybrid
+    /// verification for its PoP, a withdrawal's fee comes out of its payout,
+    /// and a signed exit settles zero but still counts its real bytes and gas
+    /// against both block caps so it cannot stuff blocks for free.
     ///
     /// `verifier` is threaded in because a transfer's authorisation is a
     /// signature check, and the only thing that may decide whether an output
@@ -1734,6 +2107,52 @@ impl CommittedState {
         base_fee_millisat_per_gas: u128,
         verifier: &dyn SignatureVerifier,
     ) -> Result<fee_market::TxCharge, TxReject> {
+        self.apply_transaction_gated(
+            tx,
+            total_active_sat,
+            base_fee_millisat_per_gas,
+            verifier,
+            crate::params::FUNDED_STAKE_ACTIVATION_EPOCH,
+        )
+    }
+
+    /// [`Self::apply_transaction`] with the funded-stake flag-day epoch
+    /// explicit — the testable inner form (the `with_leak_applied` idiom):
+    /// the shipped constant stays inert under its tripwire while tests
+    /// exercise BOTH sides of the gate by passing an epoch of their own.
+    ///
+    /// # The transition rule of the flag day (2026-08-21)
+    ///
+    /// `self.epoch` here is the block's post-boundary epoch —
+    /// `compute_post_state` rolls the boundary before any transaction
+    /// applies — so the dispatch below is a rule about the epoch of
+    /// INCLUSION:
+    ///
+    /// - from the gate epoch on, the legacy `Deposit` / `Exit` / `Delegate`
+    ///   discriminants are **consensus-invalid in a block body**. It is THIS
+    ///   refusal — every node rejecting the block — that closes the
+    ///   modified-proposer mint, not the mempool's `admissible()`, which a
+    ///   modified proposer never consults;
+    /// - before the gate epoch, the funded shapes are invalid instead, which
+    ///   with the shipped `u64::MAX` gate makes them inert by construction:
+    ///   no state root can change until the constant is lowered and the
+    ///   fleet rebuilt together (rule 1; `funded_stake_gate_ships_inert`).
+    ///
+    /// Post-gate delegation is deliberately a GAP, stated rather than hidden:
+    /// the legacy `Delegate` becomes invalid and no funded replacement ships
+    /// in this wave, so NEW delegations are impossible from the gate until a
+    /// funded delegate lands (its principal will follow the same "withdrawable
+    /// only to the extent funded" rule). Existing delegations keep their
+    /// weight — the registry fold over `delegations` is untouched.
+    fn apply_transaction_gated(
+        &mut self,
+        tx: &PosTransaction,
+        total_active_sat: u128,
+        base_fee_millisat_per_gas: u128,
+        verifier: &dyn SignatureVerifier,
+        funded_stake_gate_epoch: u64,
+    ) -> Result<fee_market::TxCharge, TxReject> {
+        let funded_era = self.epoch >= funded_stake_gate_epoch;
         let free = fee_market::TxCharge {
             gas: 0,
             tx_bytes: 0,
@@ -1767,6 +2186,11 @@ impl CommittedState {
                 withdrawal_credentials,
                 commission_bps,
             } => {
+                // Flag day: an unfunded deposit — no inputs, no signature,
+                // stake from nothing — is consensus-invalid from the gate on.
+                if funded_era {
+                    return Err(TxReject::StakingRule);
+                }
                 let pubkey_hash: [u8; 32] = Sha3_256::digest(pubkey).into();
                 // A second deposit of a registered key is a top-up path
                 // decision the interface refuses to make implicitly.
@@ -1813,6 +2237,11 @@ impl CommittedState {
                 Ok(free)
             }
             PosTransaction::Exit { validator } => {
+                // Flag day: the unauthenticated exit is consensus-invalid
+                // from the gate on — [`PosTransaction::SignedExit`] replaces it.
+                if funded_era {
+                    return Err(TxReject::StakingRule);
+                }
                 let Some(rec) = self.validators.get_mut(validator) else {
                     return Err(TxReject::StakingRule);
                 };
@@ -1834,6 +2263,12 @@ impl CommittedState {
                 Ok(free)
             }
             PosTransaction::Delegate { delegator, validator, amount_sat, eligible } => {
+                // Flag day: the unfunded delegation is consensus-invalid from
+                // the gate on. NO funded replacement ships in this wave — see
+                // the dispatch docs above for the stated gap.
+                if funded_era {
+                    return Err(TxReject::StakingRule);
+                }
                 let Some(rec) = self.validators.get(validator) else {
                     return Err(TxReject::StakingRule);
                 };
@@ -1856,6 +2291,177 @@ impl CommittedState {
                     eligible: *eligible,
                 });
                 Ok(free)
+            }
+            PosTransaction::FundedDeposit { .. } => {
+                // Inert until the flag day: with the shipped u64::MAX gate
+                // this reject is unconditional, so no pre-gate block body can
+                // carry a funded deposit and no pre-gate root can move.
+                if !funded_era {
+                    return Err(TxReject::StakingRule);
+                }
+                self.apply_funded_deposit(
+                    tx,
+                    total_active_sat,
+                    base_fee_millisat_per_gas,
+                    verifier,
+                )
+            }
+            PosTransaction::SignedExit { validator, epoch, signature } => {
+                if !funded_era {
+                    return Err(TxReject::StakingRule);
+                }
+                // State rules first (cheap lookups), signature last — the
+                // same rules and the same order as `staking::validate_exit`,
+                // the reference this arm follows: registered, active, not
+                // slashed (slashing has its own ejection path and must not
+                // share the voluntary one), not already exiting (the
+                // withdrawal clock must never reset), and the signed epoch
+                // must not be ahead of the including block's (a pre-signed
+                // future exit would decouple the clock from inclusion time).
+                let Some(rec) = self.validators.get(validator) else {
+                    return Err(TxReject::StakingRule);
+                };
+                if rec.slashed
+                    || rec.activation_epoch > self.epoch
+                    || rec.exit_epoch != u64::MAX
+                    || *epoch > self.epoch
+                {
+                    return Err(TxReject::StakingRule);
+                }
+                // One definition of the DS_EXIT root: `staking::ExitTx` —
+                // over the hash of the REGISTERED pubkey, so the message
+                // cannot substitute a key of its own. Verified through the
+                // injected verifier like every other suite-enveloped
+                // signature in the transition (the transfer path's
+                // `verify_with_key`).
+                let root = staking::ExitTx {
+                    pubkey_hash: Sha3_256::digest(&rec.pubkey).into(),
+                    epoch: *epoch,
+                    // Unread by signing_root — a root cannot cover the
+                    // signature computed over it.
+                    signature: Vec::new(),
+                }
+                .signing_root();
+                if !verifier.verify_with_key(&rec.pubkey, &root, signature) {
+                    return Err(TxReject::StakingRule);
+                }
+                // Effects identical to the legacy arm: duties stop after the
+                // exit delay, the stake stays slashable through the
+                // weak-subjectivity margin.
+                let exit_epoch = self.epoch.saturating_add(staking::EXIT_DELAY_EPOCHS);
+                let Some(rec) = self.validators.get_mut(validator) else {
+                    // Unreachable — checked above. Total anyway: a consensus
+                    // path must not panic on any input.
+                    return Err(TxReject::StakingRule);
+                };
+                rec.exit_epoch = exit_epoch;
+                rec.withdrawable_epoch =
+                    exit_epoch.saturating_add(staking::WITHDRAWAL_DELAY_EPOCHS);
+                // Settles no fee — a locked bond reaches no spendable coin —
+                // but the REAL bytes and gas count against both block caps:
+                // a message that consumed block space for free would be a
+                // stuffing vector outside the fee market's budget. One per
+                // validator per lifetime (exit_epoch never resets), so this
+                // is not an unpriced spam surface either.
+                let len = tx.canonical_bytes().len() as u64;
+                Ok(fee_market::TxCharge {
+                    gas: fee_market::intrinsic_gas(
+                        // One hybrid verification, priced as such.
+                        fee_market::TxClass::Eutxo { inputs: 1 },
+                        len,
+                    ),
+                    tx_bytes: len,
+                    base_fee_sat: 0,
+                    priority_fee_sat: 0,
+                })
+            }
+            PosTransaction::Withdraw { validator } => {
+                if !funded_era {
+                    return Err(TxReject::StakingRule);
+                }
+                let Some(rec) = self.validators.get(validator) else {
+                    return Err(TxReject::StakingRule);
+                };
+                // `withdrawable_epoch` is u64::MAX until an exit (or a
+                // slash) schedules it, so this one comparison is also the
+                // "must have exited" rule — the `staking::validate_withdrawal`
+                // reference states the split rejects.
+                if self.epoch < rec.withdrawable_epoch {
+                    return Err(TxReject::StakingRule);
+                }
+                // The credential must already be the 32-byte script-hash
+                // form. The genesis credentials are (founder H160 ‖ 12 zero
+                // bytes), which is exactly the CARRIED form `owns()` opens —
+                // pinned against the manifest by the genesis.rs test.
+                let Ok(script_hash) = <[u8; 32]>::try_from(rec.withdrawal_credentials.as_slice())
+                else {
+                    return Err(TxReject::StakingRule);
+                };
+                // The founder decision: pay the funded portion only. The
+                // unfunded principal stays in the record as a committed,
+                // never-spendable residue — the state root stays unambiguous
+                // because the residue is ordinary `staked_sat`, not a new
+                // column.
+                let withdrawable =
+                    self.withdrawable_sat_gated(*validator, funded_stake_gate_epoch);
+                // The fee comes OUT OF the payout: the only coins this
+                // message can reach are the ones it makes spendable, so even
+                // the fee must be backed. Tip is structurally zero — there is
+                // no field for one; inclusion priority for withdrawals is not
+                // an auction.
+                let len = tx.canonical_bytes().len() as u64;
+                let charge = fee_market::charge(
+                    // No witness to verify: the payout is fully determined by
+                    // committed state (see the variant docs).
+                    fee_market::TxClass::Eutxo { inputs: 0 },
+                    len,
+                    base_fee_millisat_per_gas,
+                    0,
+                );
+                let fee = charge.base_fee_sat + charge.priority_fee_sat;
+                // Strict: a withdrawal that cannot pay its fee AND move at
+                // least one satoshi is refused — which is also what makes a
+                // second withdrawal (withdrawable == 0 after the first) a
+                // deterministic reject rather than a zero-value output mill.
+                if withdrawable <= fee {
+                    return Err(TxReject::StakingRule);
+                }
+                let payout = withdrawable - fee;
+                // Explicit narrowing, NOT `sat_u64`: a saturated payout would
+                // pay less than the bond gave up and silently break the
+                // conservation equality below. Unreachable at the V4 supply
+                // (TOTAL_SUPPLY_SAT = 1e19 < u64::MAX), refused rather than
+                // assumed away.
+                let Ok(payout_u64) = u64::try_from(payout) else {
+                    return Err(TxReject::StakingRule);
+                };
+                // Withdraw's canonical bytes are constant per validator, so
+                // its txid is too; the single-shot rule above is what keeps
+                // this from colliding with its own earlier output. Refuse the
+                // collision anyway, like the transfer path does.
+                let txid = tx.txid();
+                if self.eutxos.contains_key(&(txid, 0)) {
+                    return Err(TxReject::Transfer(TransferReject::OutputExists));
+                }
+                // ── Apply. Conservation, the equality this arm enforces:
+                //    staked_before − staked_after == payout + fee == withdrawable
+                // The bond loses exactly `withdrawable`; the eUTXO set gains
+                // exactly `payout`; the fee settles through the fee split,
+                // backed by the bond coins just destroyed. `issued_sat` is
+                // untouched — a withdrawal moves existing value, it never
+                // issues (verifiable over RPC via `issued_supply_sat`).
+                let Some(rec) = self.validators.get_mut(validator) else {
+                    // Unreachable — checked above. Total anyway.
+                    return Err(TxReject::StakingRule);
+                };
+                rec.staked_sat = rec.staked_sat.saturating_sub(withdrawable);
+                self.eutxos.insert(crate::state_root::EutxoEntry {
+                    txid,
+                    vout: 0,
+                    value: payout_u64,
+                    script_hash,
+                });
+                Ok(charge)
             }
             // Evidence needs the injected signature verifier, which lives on
             // the Transition, not on the state — compute_post_state routes it
@@ -2227,6 +2833,228 @@ impl CommittedState {
         Ok(charge)
     }
 
+    /// Authorise, price and apply one funded deposit: spend real coins under
+    /// the transfer path's rules, register the validator under the staking
+    /// rules, and enforce that the two sides meet in an exact equality.
+    ///
+    /// Only reachable from the funded era (`apply_transaction_gated` refuses
+    /// the variant before the flag day), so nothing here runs on the live
+    /// chain until the gate is armed.
+    ///
+    /// # The check order is consensus, cheapest-first, and frozen
+    ///
+    /// 1. structure (non-empty inputs, size floor) — transfer rules, transfer
+    ///    rejects;
+    /// 2. registration statics (suite-pinned pubkey shape, 32-byte
+    ///    credential, unregistered key, minimum, cap) — `StakingRule`, all
+    ///    integer/byte comparisons;
+    /// 3. spend points against the committed set (duplicates, existence,
+    ///    ownership hash) — transfer rejects;
+    /// 4. price and conservation — arithmetic;
+    /// 5. change-output keys;
+    /// 6. the hybrid verifications, LAST: the input signatures over the
+    ///    `DS_SPEND` root, then the PoP over the `DS_DEPOSIT` root. Spam is
+    ///    rejected on arithmetic, never at ≈7.3M instructions per signature.
+    ///
+    /// Every check runs before any mutation, so a refused deposit leaves the
+    /// state untouched — the same posture as [`Self::apply_transfer`].
+    ///
+    /// # Conservation (the equality, stated once and enforced below)
+    ///
+    /// ```text
+    /// Σ inputs  ==  amount_sat + Σ change + fee
+    /// ```
+    ///
+    /// What leaves the eUTXO set is exactly the bond plus the change plus the
+    /// fee; the bond enters the registry at exactly `amount_sat`; and
+    /// `issued_sat` is never touched — a funded deposit moves existing coins,
+    /// it never issues. Same reject, same spirit as the transfer's
+    /// [`TransferReject::ValueNotConserved`]: equality, not `>=`, because an
+    /// overpaying deposit has misdeclared itself and a silent sweep to the
+    /// proposer would be a fee nobody set.
+    fn apply_funded_deposit(
+        &mut self,
+        tx: &PosTransaction,
+        total_active_sat: u128,
+        base_fee_millisat_per_gas: u128,
+        verifier: &dyn SignatureVerifier,
+    ) -> Result<fee_market::TxCharge, TxReject> {
+        let PosTransaction::FundedDeposit {
+            inputs,
+            change,
+            pubkey,
+            amount_sat,
+            randao_commitment,
+            withdrawal_credentials,
+            commission_bps,
+            proof_of_possession,
+            tx_bytes,
+            tip_millisat_per_gas,
+        } = tx
+        else {
+            // Unreachable: the only caller matches the variant first. A
+            // consensus function does not panic on any input.
+            return Err(TxReject::Transfer(TransferReject::NoInputs));
+        };
+
+        // ── 1. Structure: the transfer rules, verbatim ─────────────────────
+        // A deposit that spends nothing is the legacy mint this variant
+        // exists to replace; refused with the transfer's own reason.
+        if inputs.is_empty() {
+            return Err(TxReject::Transfer(TransferReject::NoInputs));
+        }
+        if *tx_bytes < tx.canonical_bytes().len() as u64 {
+            return Err(TxReject::Transfer(TransferReject::UnderdeclaredSize));
+        }
+
+        // ── 2. Registration statics ────────────────────────────────────────
+        // Suite pinned by consensus: only the enveloped hybrid form may
+        // register (staking.rs rationale — the ML-DSA-only escape hatch must
+        // not enter the registry through this door).
+        if !staking::is_wire_hybrid_pubkey(pubkey) {
+            return Err(TxReject::StakingRule);
+        }
+        // The credential must be the 32-byte script-hash form NOW, not at
+        // withdrawal: a malformed credential discovered 2,048 epochs later
+        // would strand the bond forever.
+        if withdrawal_credentials.len() != 32 {
+            return Err(TxReject::StakingRule);
+        }
+        let pubkey_hash: [u8; 32] = Sha3_256::digest(pubkey).into();
+        // Same three rules, same order, same rationales as the legacy arm:
+        // no re-registration, the minimum bond, the 1%-of-active-stake cap
+        // floored at the minimum (the genesis-bootstrap argument in
+        // staking.rs).
+        if self.pubkey_index.contains_key(&pubkey_hash) {
+            return Err(TxReject::StakingRule);
+        }
+        if *amount_sat < staking::MIN_DEPOSIT_SAT {
+            return Err(TxReject::StakingRule);
+        }
+        let cap = (total_active_sat * delegation::MAX_VALIDATOR_STAKE_BPS / 10_000)
+            .max(staking::MIN_DEPOSIT_SAT);
+        if *amount_sat > cap {
+            return Err(TxReject::StakingRule);
+        }
+
+        // ── 3. The spend points, against the committed set ─────────────────
+        // Identical mechanics to apply_transfer: whole-transaction duplicate
+        // check, existence, then the ownership hash — one hash before one
+        // hybrid verification.
+        let mut seen: BTreeSet<([u8; 32], u32)> = BTreeSet::new();
+        let mut spent_value: u128 = 0;
+        for i in inputs {
+            let key = (i.txid, i.vout);
+            if !seen.insert(key) {
+                return Err(TxReject::Transfer(TransferReject::DuplicateInput));
+            }
+            let Some(entry) = self.eutxos.get(&key) else {
+                return Err(TxReject::Transfer(TransferReject::UnknownInput));
+            };
+            let key_hash: [u8; 32] = Sha3_256::digest(&i.pubkey).into();
+            if !owns(&key_hash, &entry.script_hash) {
+                return Err(TxReject::Transfer(TransferReject::ScriptMismatch));
+            }
+            spent_value += entry.value as u128;
+        }
+
+        // ── 4. The price, derived — and the PoP is in the class term ───────
+        // `inputs + 1`: the PoP costs the node exactly one more hybrid
+        // verification, priced identically to an input's. Charging it through
+        // the class keeps ONE pricing function (`fee_market::charge`) instead
+        // of a bespoke gas formula for this variant.
+        let charge = fee_market::charge(
+            fee_market::TxClass::Eutxo { inputs: inputs.len() as u32 + 1 },
+            *tx_bytes,
+            base_fee_millisat_per_gas,
+            *tip_millisat_per_gas,
+        );
+
+        // ── Conservation ───────────────────────────────────────────────────
+        // The equality from the doc above. u128 throughout, like the
+        // transfer.
+        let returned: u128 = change.iter().map(|o| o.value as u128).sum();
+        let fee = charge.base_fee_sat + charge.priority_fee_sat;
+        if spent_value != *amount_sat + returned + fee {
+            return Err(TxReject::Transfer(TransferReject::ValueNotConserved));
+        }
+
+        // ── 5. The change-output keys ──────────────────────────────────────
+        let txid = tx.txid();
+        for vout in 0..change.len() as u32 {
+            if self.eutxos.contains_key(&(txid, vout)) {
+                return Err(TxReject::Transfer(TransferReject::OutputExists));
+            }
+        }
+
+        // ── 6. Authorisation, the expensive checks last ────────────────────
+        // The coin owners' signatures over the witness-free DS_SPEND root
+        // (which covers the registration payload AND the PoP — see
+        // spend_signing_root), through the same verifier seam as the
+        // transfer.
+        let signing_root = tx.spend_signing_root();
+        for i in inputs {
+            if !verifier.verify_with_key(&i.pubkey, &signing_root, &i.signature) {
+                return Err(TxReject::Transfer(TransferReject::BadSignature));
+            }
+        }
+        // The validator key's proof of possession over the DS_DEPOSIT root —
+        // a REGISTRATION rule (anti rogue-key), hence `StakingRule` and not a
+        // transfer reject: the coins' movement was already authorised above,
+        // this decides whether the registry may admit the key. `None` is
+        // unreachable here (shape checked at step 2), refused totally anyway.
+        let Some(pop_root) = tx.funded_deposit_pop_signing_root() else {
+            return Err(TxReject::StakingRule);
+        };
+        if !verifier.verify_with_key(pubkey, &pop_root, proof_of_possession) {
+            return Err(TxReject::StakingRule);
+        }
+
+        // ── Apply. Nothing below may fail. ─────────────────────────────────
+        for i in inputs {
+            self.eutxos.remove(&(i.txid, i.vout));
+        }
+        for (vout, o) in change.iter().enumerate() {
+            self.eutxos.insert(crate::state_root::EutxoEntry {
+                txid,
+                vout: vout as u32,
+                value: o.value,
+                script_hash: o.script_hash,
+            });
+        }
+        // Registration — field for field what the legacy arm wrote, so the
+        // activation queue, the roster filters and the epoch pipeline treat a
+        // funded validator identically to every earlier one. The
+        // deposit-history entry's epoch is >= the gate by construction (this
+        // arm only runs in the funded era), which is exactly what marks this
+        // bond as FUNDED for `unbacked_principal_sat`: nothing is written off
+        // at its withdrawal.
+        let index = self.validators.keys().next_back().map_or(0, |k| k + 1);
+        self.validators.insert(
+            index,
+            ValidatorRecord {
+                index,
+                pubkey: pubkey.clone(),
+                staked_sat: *amount_sat,
+                randao_commitment: *randao_commitment,
+                withdrawal_credentials: withdrawal_credentials.clone(),
+                activation_epoch: u64::MAX,
+                exit_epoch: u64::MAX,
+                withdrawable_epoch: u64::MAX,
+                slashed: false,
+                commission_bps: *commission_bps,
+            },
+        );
+        self.reveals_used.insert(index, 0);
+        self.pubkey_index.insert(pubkey_hash, index);
+        self.deposit_history.push(QueuedDeposit {
+            pubkey_hash,
+            deposit_epoch: self.epoch,
+            amount_sat: *amount_sat,
+        });
+        Ok(charge)
+    }
+
     /// Verify and execute one §7.3 evidence transaction against this state.
     ///
     /// The verdict — structure, anti-replay, not-already-slashed, both
@@ -2322,6 +3150,10 @@ impl CommittedState {
         .map_err(|_| ())?;
 
         let epoch = self.epoch;
+        // Read the offender's backed share BEFORE the slash consumes it: the
+        // whistleblower cap below is a function of what was coin-backed at the
+        // moment of the offence, and one line further down that number is gone.
+        let backed_before_slash = self.withdrawable_sat(offender);
         if let Some(rec) = self.validators.get_mut(&offender) {
             rec.slashed = true;
             rec.staked_sat = rec.staked_sat.saturating_sub(outcome.delegation_losses_sat[0]);
@@ -2349,11 +3181,44 @@ impl CommittedState {
                 *self.delegator_slash_losses.entry(d.delegator).or_insert(0) += *loss;
             }
         }
-        if outcome.whistleblower_reward_sat > 0 {
+        // The whistleblower reward may not exceed the BACKED share the slash
+        // actually consumed.
+        //
+        // Unbounded, it is a hole straight through the founder's rule that a
+        // genesis bond's principal never becomes spendable. The reward is a
+        // thirty-second of what was slashed and lands in `pending_fee_rewards`,
+        // which is accrual — and accrual IS withdrawable. So slashing an
+        // unbacked genesis bond converted principal that `issued_sat` never
+        // counted into withdrawable coins in somebody else's bond, with
+        // `issued_sat` never moving. A validator willing to be slashed (or a
+        // proposer colluding with one) could run that in a loop and mint past
+        // the supply cap. Found by the adversarial front as A7, against
+        // production code, before the gate ever armed.
+        //
+        // The cap is deliberately conservative: it counts only the backed
+        // share consumed from the OFFENDER'S OWN bond, not from delegated
+        // principal, because delegated backing is a surface this change does
+        // not settle. Under-paying a whistleblower is the safe direction —
+        // it destroys value that was never coins, which is what unbacked
+        // principal is. Over-paying creates coins, which is the whole defect.
+        //
+        // Gated, and this is not optional: with the flag day closed
+        // `unbacked_principal_sat` treats every bond as unbacked, so applying
+        // the cap unconditionally would zero every whistleblower reward on the
+        // live chain today — a consensus change outside its own flag day,
+        // which rule 1 forbids and which would fork the fleet on the next
+        // slash.
+        let reward = capped_whistleblower_reward(
+            outcome.whistleblower_reward_sat,
+            outcome.delegation_losses_sat[0],
+            backed_before_slash,
+            self.epoch >= crate::params::FUNDED_STAKE_ACTIVATION_EPOCH,
+        );
+        if reward > 0 {
             *self
                 .pending_fee_rewards
                 .entry(including_proposer)
-                .or_insert(0) += outcome.whistleblower_reward_sat;
+                .or_insert(0) += reward;
         }
         Ok(())
     }
@@ -2466,6 +3331,68 @@ impl CommittedState {
     /// headroom the boundary clamp works from.
     pub fn issued_sat(&self) -> u128 {
         self.issued_sat
+    }
+
+    /// How much of validator `index`'s bond was never funded by eUTXO coins
+    /// — the portion the founder's 2026-08-21 decision writes off at
+    /// withdrawal ("a bond is withdrawable only to the extent it was
+    /// funded"). Everything it reads is already-committed state, so the rule
+    /// adds NO column to the state root and no root changes while the gate is
+    /// closed (rule 1 of the flag day):
+    ///
+    /// - **no deposit-history entry** → the record was seeded by
+    ///   [`CommittedState::genesis`]: its principal destroyed no coins and
+    ///   was counted in no issuance ([`GENESIS_UNFUNDED_PRINCIPAL_SAT`],
+    ///   manifest-pinned) → write off exactly that principal;
+    /// - **deposited before the gate** → a legacy unfunded
+    ///   [`PosTransaction::Deposit`] minted the whole `amount_sat` from
+    ///   nothing → write off the whole amount;
+    /// - **deposited at or past the gate** → a [`PosTransaction::FundedDeposit`]
+    ///   destroyed real coins for it → nothing to write off.
+    ///
+    /// Everything ON TOP of the principal is clean on both sides already and
+    /// is never written off: epoch emission advances `issued_sat` when it
+    /// credits a bond (`close_epoch`), and fee rewards are backed by coins
+    /// the transfer path destroyed.
+    ///
+    /// The history lookup is sound because a pubkey deposits at most once
+    /// (`pubkey_index` makes a second deposit a deterministic reject) and the
+    /// history is kept forever (see the `deposit_history` field docs).
+    fn unbacked_principal_sat(&self, index: u32, funded_stake_gate_epoch: u64) -> u128 {
+        let Some(rec) = self.validators.get(&index) else {
+            return 0;
+        };
+        let pubkey_hash: [u8; 32] = Sha3_256::digest(&rec.pubkey).into();
+        match self.deposit_history.iter().find(|d| d.pubkey_hash == pubkey_hash) {
+            None => GENESIS_UNFUNDED_PRINCIPAL_SAT,
+            Some(d) if d.deposit_epoch < funded_stake_gate_epoch => d.amount_sat,
+            Some(_) => 0,
+        }
+    }
+
+    /// The satoshis validator `index` could withdraw today's rules permitting
+    /// — bonded stake minus the unbacked principal, saturating at zero.
+    ///
+    /// This is the amount [`PosTransaction::Withdraw`] pays (minus its fee)
+    /// and the number the RPC's validator surface reports, one definition for
+    /// both. Saturating: slashing consumes the withdrawable accrual BEFORE
+    /// the notional principal, so a slashed genesis validator can read zero
+    /// here while its record still shows a bonded residue — intentional (the
+    /// safe direction for conservation: a payout never exceeds what was
+    /// funded), not a bug.
+    pub fn withdrawable_sat(&self, index: u32) -> u128 {
+        self.withdrawable_sat_gated(index, crate::params::FUNDED_STAKE_ACTIVATION_EPOCH)
+    }
+
+    /// [`Self::withdrawable_sat`] with the gate epoch explicit — the testable
+    /// inner form, same idiom as `with_leak_applied`: the tripwire keeps the
+    /// shipped constant inert, and tests exercise both sides of the gate here
+    /// without arming anything.
+    fn withdrawable_sat_gated(&self, index: u32, funded_stake_gate_epoch: u64) -> u128 {
+        self.validators.get(&index).map_or(0, |r| {
+            r.staked_sat
+                .saturating_sub(self.unbacked_principal_sat(index, funded_stake_gate_epoch))
+        })
     }
 
     /// The price the child block must charge: the EIP-1559 controller applied
@@ -2737,6 +3664,27 @@ impl CommittedState {
 
         st
     }
+}
+
+/// The whistleblower reward, capped at the backed share the slash consumed.
+///
+/// Pure and gate-explicit for the same reason `withdrawable_sat_gated` is: the
+/// shipped constant is `u64::MAX`, so a test that went through the caller could
+/// only ever exercise the pre-gate side. Both sides are reachable here without
+/// arming anything.
+///
+/// `funded_era == false` returns the raw reward unchanged — the pre-gate rule,
+/// byte for byte.
+fn capped_whistleblower_reward(
+    raw_reward_sat: u128,
+    operator_loss_sat: u128,
+    backed_before_slash_sat: u128,
+    funded_era: bool,
+) -> u128 {
+    if !funded_era {
+        return raw_reward_sat;
+    }
+    raw_reward_sat.min(operator_loss_sat.min(backed_before_slash_sat))
 }
 
 /// `roster` with each validator's accrued inactivity leak subtracted.
@@ -3239,6 +4187,46 @@ mod tx_codec_tests {
                 tx_bytes: 0,
                 tip_millisat_per_gas: 0,
             },
+            // The funded staking shapes (0x07–0x09). Same value discipline as
+            // the transfer samples above: every integer differs and the four
+            // length-prefixed byte fields have four different lengths, so a
+            // swapped pair or a shifted width cannot round-trip.
+            PosTransaction::FundedDeposit {
+                inputs: vec![TransferInput {
+                    txid: [0x31; 32],
+                    vout: 9,
+                    pubkey: vec![0xA7; 3749],
+                    signature: vec![0xB8; 4775],
+                }],
+                change: vec![TransferOutput { value: 77, script_hash: [0xC9; 32] }],
+                pubkey: vec![0xDA; 3749],
+                amount_sat: 25_000 * 100_000_000,
+                randao_commitment: [0xEB; 32],
+                withdrawal_credentials: vec![0xFC; 32],
+                commission_bps: 750,
+                proof_of_possession: vec![0x1D; 4775],
+                tx_bytes: 17_300,
+                tip_millisat_per_gas: 12,
+            },
+            // And its empty-list edges.
+            PosTransaction::FundedDeposit {
+                inputs: Vec::new(),
+                change: Vec::new(),
+                pubkey: Vec::new(),
+                amount_sat: 0,
+                randao_commitment: [0u8; 32],
+                withdrawal_credentials: Vec::new(),
+                commission_bps: 0,
+                proof_of_possession: Vec::new(),
+                tx_bytes: 0,
+                tip_millisat_per_gas: 0,
+            },
+            PosTransaction::SignedExit {
+                validator: 21,
+                epoch: 4_096,
+                signature: vec![0x2E; 4775],
+            },
+            PosTransaction::Withdraw { validator: 63 },
         ]
     }
 
@@ -3289,6 +4277,59 @@ mod tx_codec_tests {
                 "a short read must fail, never zero-fill"
             );
         }
+    }
+
+    /// The funded shapes obey the same three codec laws as everything else —
+    /// asserted against a full-size sample so the cuts land inside real
+    /// fields, not only inside the header.
+    #[test]
+    fn funded_shapes_refuse_truncation_and_trailing_bytes() {
+        for tx in &samples()[8..] {
+            let full = tx.canonical_bytes();
+            for cut in [1, full.len() / 2, full.len() - 1] {
+                if cut < full.len() {
+                    assert_eq!(
+                        PosTransaction::from_canonical_bytes(&full[..cut]),
+                        Err(TxDecodeError::Truncated),
+                        "a short read of tag {:#04x} must fail, never zero-fill",
+                        full[0],
+                    );
+                }
+            }
+            let mut long = full.clone();
+            long.push(0x00);
+            assert_eq!(
+                PosTransaction::from_canonical_bytes(&long),
+                Err(TxDecodeError::TrailingBytes),
+                "two encodings must not decode to one tag-{:#04x} transaction",
+                full[0],
+            );
+        }
+        // Control for the slice above: samples()[8..] really are the funded
+        // shapes (the two TransferV2 samples sit at 6..8), or the loop
+        // asserted over nothing.
+        assert!(matches!(samples()[8], PosTransaction::FundedDeposit { .. }));
+        assert!(matches!(samples()[11], PosTransaction::Withdraw { .. }));
+    }
+
+    /// The funded wire tags, frozen — the exact counterpart of the V2 pin in
+    /// `transfer_v2_codec_survives_the_truncation_sweep`. 0x06 is the
+    /// deduplicated transfer's and is re-pinned here as the CONTROL: the a7
+    /// integration re-tagged the funded shapes to 0x07–0x09 precisely
+    /// because 0x06 was already spoken for, and one byte carrying two live
+    /// meanings on the wire is the 2026-08-08 fork class. Any change to any
+    /// of these four bytes is a flag-day event, not an edit.
+    #[test]
+    fn the_funded_wire_tags_are_frozen() {
+        let s = samples();
+        assert!(matches!(s[6], PosTransaction::TransferV2 { .. }));
+        assert_eq!(s[6].canonical_bytes()[0], 0x06, "TransferV2 keeps 0x06 (control)");
+        assert!(matches!(s[8], PosTransaction::FundedDeposit { .. }));
+        assert_eq!(s[8].canonical_bytes()[0], 0x07, "FundedDeposit is frozen at 0x07");
+        assert!(matches!(s[10], PosTransaction::SignedExit { .. }));
+        assert_eq!(s[10].canonical_bytes()[0], 0x08, "SignedExit is frozen at 0x08");
+        assert!(matches!(s[11], PosTransaction::Withdraw { .. }));
+        assert_eq!(s[11].canonical_bytes()[0], 0x09, "Withdraw is frozen at 0x09");
     }
 
     #[test]
@@ -3343,6 +4384,46 @@ mod tx_codec_tests {
         assert_eq!(
             PosTransaction::from_canonical_bytes(&trailing),
             Err(TxDecodeError::TrailingBytes),
+        );
+    }
+
+    /// The capacity claim in the `FundedDeposit` docs, pinned so it cannot go
+    /// stale: with the measured PQ witness (3,749 B enveloped pubkey, 4,775 B
+    /// hybrid signature — the first `samples()` funded deposit carries
+    /// exactly those), a single-input, single-change funded deposit is
+    /// ≈17.3 KB and the 262,144-byte block cap fits **15** of them. And the
+    /// byte cap binds FIRST: fifteen deposits' gas — two hybrid verifies each
+    /// (inputs + PoP) plus their bytes — stays far inside the gas limit, the
+    /// same bytes-bind-first shape as the transfer analysis in fee_market.rs.
+    #[test]
+    fn fifteen_single_input_funded_deposits_fit_a_block() {
+        let sample = &samples()[8];
+        assert!(matches!(sample, PosTransaction::FundedDeposit { .. }));
+        let len = sample.canonical_bytes().len() as u64;
+        assert_eq!(len, 17_273, "the size the capacity docs quote");
+        assert_eq!(
+            fee_market::MAX_BLOCK_TX_BYTES / len,
+            15,
+            "the per-block deposit count in the FundedDeposit docs went stale"
+        );
+        let gas_each =
+            fee_market::intrinsic_gas(fee_market::TxClass::Eutxo { inputs: 2 }, len);
+        assert!(
+            gas_each * 15 < fee_market::BLOCK_GAS_LIMIT / 4,
+            "gas must not be the binding cap for funded deposits"
+        );
+        // Re-measured for the epoch-800 512 KiB cap (BLOCK_BYTES_V2): the
+        // funded-stake gate can only arm at or after that flag day, so the
+        // capacity that matters operationally is THIS one — 30 per block,
+        // and the byte cap still binds first.
+        assert_eq!(
+            fee_market::MAX_BLOCK_TX_BYTES_V2 / len,
+            30,
+            "the post-epoch-800 per-block deposit count"
+        );
+        assert!(
+            gas_each * 30 < fee_market::BLOCK_GAS_LIMIT / 2,
+            "gas must not become the binding cap under the doubled byte cap"
         );
     }
 }
@@ -5454,6 +6535,43 @@ mod tests {
         ProposalEnvelope { header, proposer_sig: vec![0u8; 8] }
     }
 
+    /// The whistleblower reward may not turn unbacked principal into coins.
+    ///
+    /// Slashing an unbacked genesis bond used to credit a thirty-second of the
+    /// loss into `pending_fee_rewards` regardless — and accrual is withdrawable
+    /// under the founder's rule, while `issued_sat` never moved. A validator
+    /// willing to be slashed could run that in a loop and mint past the supply
+    /// cap. Found as A7 by the adversarial front, against production code,
+    /// before the gate ever armed.
+    #[test]
+    fn the_whistleblower_reward_cannot_exceed_the_backed_share() {
+        let raw = 1_000u128; // a thirty-second of 32,000
+        let loss = 32_000u128;
+
+        // Pre-gate: unchanged, byte for byte. This half is load-bearing — the
+        // cap must not alter the live chain outside its own flag day, and
+        // `unbacked_principal_sat` treats EVERY bond as unbacked while the
+        // gate is closed, so an ungated cap would zero every reward today.
+        assert_eq!(capped_whistleblower_reward(raw, loss, 0, false), raw);
+
+        // Post-gate, fully unbacked offender: nothing backed was consumed, so
+        // nothing may be paid. This is the hole.
+        assert_eq!(capped_whistleblower_reward(raw, loss, 0, true), 0);
+
+        // Post-gate, partially backed: the cap bites at what was backed.
+        assert_eq!(capped_whistleblower_reward(raw, loss, 400, true), 400);
+
+        // Control: a fully backed offender pays the full reward. Without this
+        // half the assertions above would pass just as well against a cap that
+        // always returned zero, which would break slashing rather than fix it.
+        assert_eq!(capped_whistleblower_reward(raw, loss, loss, true), raw);
+
+        // Control: the operator's own loss also bounds it — a reward larger
+        // than what left the offender's bond would be minting from the other
+        // direction.
+        assert_eq!(capped_whistleblower_reward(raw, 300, u128::MAX, true), 300);
+    }
+
     #[test]
     fn evidence_transaction_slashes_operator_and_delegators_and_pays_whistleblower() {
         let (t, g, mut chains) = setup(4);
@@ -6253,6 +7371,12 @@ mod tests {
         // carry is enumerated, and none of them is a mint or a cap edit —
         // Transfer moves existing coins and pays fees from them, Deposit and
         // Delegate bond existing coins, Exit unbonds them, evidence burns.
+        // The funded shapes (2026-08-21) keep the property BY equality:
+        // FundedDeposit destroys exactly what it bonds (ValueNotConserved
+        // otherwise), Withdraw creates exactly what the bond gives up minus
+        // the fee — and only the FUNDED portion at that — and SignedExit
+        // moves no value at all. Whoever adds a variant here must argue the
+        // same, in this comment, before the compiler lets the test build.
         let witness = PosTransaction::Exit { validator: 0 };
         match &witness {
             PosTransaction::Transfer { .. } => {}
@@ -6262,6 +7386,9 @@ mod tests {
             PosTransaction::Deposit { .. } => {}
             PosTransaction::Exit { .. } => {}
             PosTransaction::Delegate { .. } => {}
+            PosTransaction::FundedDeposit { .. } => {}
+            PosTransaction::SignedExit { .. } => {}
+            PosTransaction::Withdraw { .. } => {}
             PosTransaction::SlashingEvidence(_) => {}
         }
 
@@ -6303,20 +7430,22 @@ mod tests {
         );
     }
 
-    /// Same tripwire for the funded-staking gate — with one more tooth: this
-    /// gate must not be armed by ANY rebuild until the founder's decision on
-    /// the 1,600,000 BLOCH of unissued genesis bond principal is recorded
-    /// (the constant's docs in `params.rs` state the three options). Arming
-    /// it without that decision would ship whichever withdrawal semantics the
-    /// implementer happened to write, and that choice moves real coins on a
-    /// live mainnet.
+    /// Same tripwire for the funded-staking gate. The founder's decision on
+    /// the 1,600,000 BLOCH of unissued genesis bond principal is now
+    /// RECORDED (2026-08-21, write-off — see the constant's docs in
+    /// `params.rs`) and implemented behind this gate, so what remains before
+    /// arming is "only" the flag day itself: new discriminants change
+    /// block-body decoding, so an old binary rejects the first post-gate
+    /// block as a decode error — the entire fleet must be rebuilt BEFORE the
+    /// constant is lowered, and this test is what makes that a deliberate,
+    /// visible act instead of a quiet edit inside an unrelated release.
     #[test]
     fn funded_stake_gate_ships_inert() {
         assert_eq!(
             crate::params::FUNDED_STAKE_ACTIVATION_EPOCH,
             u64::MAX,
-            "funding the bonds is a flag day AND an economic decision: record the founder's \
-             choice, set the epoch, and roll the fleet together"
+            "funding the bonds is a flag day: set the epoch and roll the fleet together \
+             (the founder's write-off decision of 2026-08-21 is already implemented behind it)"
         );
     }
 
@@ -6968,6 +8097,815 @@ mod tests {
             g.clone().apply_transfer_v2(&permuted, price, &ToyVerifier),
             Err(TransferReject::WitnessTableNotCanonical),
         );
+    }
+    // ── Funded staking: the eUTXO-backed bond lifecycle (flag day) ──────────
+
+    /// A validator pubkey shaped the way consensus demands: the `B1 0C`
+    /// envelope, the 0x0001 hybrid suite id, and exactly
+    /// [`staking::HYBRID_PK_BYTES`] of body.
+    fn wire_validator_key(tag: u8) -> Vec<u8> {
+        let mut v = vec![0xB1, 0x0C, 0x01, 0x00];
+        v.extend(std::iter::repeat(tag).take(staking::HYBRID_PK_BYTES));
+        v
+    }
+
+    /// A conserving funded deposit bonding `amount_sat` out of `entries`,
+    /// change back to the owner, toy-signed. The fee is computed with the
+    /// SAME `fee_market::charge` call the transition makes (class
+    /// `inputs + 1` — the PoP), so the fixture keeps conserving when a gas
+    /// constant moves. PoP is produced BEFORE the input signatures because
+    /// the spend root covers it — the same ordering a real wallet must use.
+    fn funded_deposit_spending(
+        entries: &[crate::state_root::EutxoEntry],
+        owner: &[u8],
+        amount_sat: u128,
+        val_key_tag: u8,
+        price: u128,
+    ) -> PosTransaction {
+        let inputs: Vec<TransferInput> = entries
+            .iter()
+            .map(|e| TransferInput {
+                txid: e.txid,
+                vout: e.vout,
+                pubkey: owner.to_vec(),
+                // Right length: toy signatures are 32 B, so the encoding's
+                // size — and with it the fee — is fixed before signing.
+                signature: vec![0u8; 32],
+            })
+            .collect();
+        let spent: u128 = entries.iter().map(|e| e.value as u128).sum();
+        let mut tx = PosTransaction::FundedDeposit {
+            inputs,
+            change: vec![TransferOutput { value: 0, script_hash: script_of(owner) }],
+            pubkey: wire_validator_key(val_key_tag),
+            amount_sat,
+            randao_commitment: [0xAB; 32],
+            withdrawal_credentials: vec![0xCD; 32],
+            commission_bps: 500,
+            proof_of_possession: vec![0u8; 32],
+            tx_bytes: 0,
+            tip_millisat_per_gas: 0,
+        };
+        let len = tx.canonical_bytes().len() as u64;
+        let charge = fee_market::charge(
+            fee_market::TxClass::Eutxo { inputs: entries.len() as u32 + 1 },
+            len,
+            price,
+            0,
+        );
+        let fee = charge.base_fee_sat + charge.priority_fee_sat;
+        assert!(
+            spent >= amount_sat + fee,
+            "fixture underfunded: {spent} sat cannot bond {amount_sat} and pay {fee}"
+        );
+        let change_value = (spent - amount_sat - fee) as u64;
+        if let PosTransaction::FundedDeposit { tx_bytes, change, .. } = &mut tx {
+            *tx_bytes = len;
+            change[0].value = change_value;
+        }
+        resign_funded(&mut tx, owner);
+        tx
+    }
+
+    /// Re-sign a funded deposit after a test edited it: fresh PoP over the
+    /// DS_DEPOSIT root, then fresh input signatures over the DS_SPEND root
+    /// that covers that PoP. Same rationale as [`resign`]: a test that means
+    /// to break conservation must not break the signatures as well and pass
+    /// for the wrong reason.
+    fn resign_funded(tx: &mut PosTransaction, owner: &[u8]) {
+        let pop_root = tx
+            .funded_deposit_pop_signing_root()
+            .expect("fixture must keep the well-formed pubkey/credential shape");
+        if let PosTransaction::FundedDeposit { proof_of_possession, pubkey, .. } = tx {
+            *proof_of_possession = toy_sign(pubkey, &pop_root);
+        }
+        let root = tx.spend_signing_root();
+        if let PosTransaction::FundedDeposit { inputs, .. } = tx {
+            for i in inputs.iter_mut() {
+                i.signature = toy_sign(owner, &root);
+            }
+        }
+    }
+
+    /// The spend root binds the registration payload and the fee terms, and
+    /// deliberately does NOT bind the witnesses — the mirror of
+    /// `deposit_signing_root_binds_every_field` (staking.rs) for the funded
+    /// wire shape. The witness half is the control: without it, "every edit
+    /// moves the root" would also pass for a root over the full encoding,
+    /// which is precisely the malleable-txid construction this root exists
+    /// to rule out.
+    #[test]
+    fn funded_deposit_spend_root_binds_everything_but_the_witnesses() {
+        let owner = owner_key(3);
+        let entry = opening(0x51, 0, staking::MIN_DEPOSIT_SAT as u64 + 1_000_000, &owner);
+        let base = funded_deposit_spending(
+            &[entry],
+            &owner,
+            staking::MIN_DEPOSIT_SAT,
+            0x77,
+            fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+        );
+        let root = base.spend_signing_root();
+
+        // Every signed field moves the root.
+        let mut edits: Vec<PosTransaction> = Vec::new();
+        for k in 0..8 {
+            let mut e = base.clone();
+            if let PosTransaction::FundedDeposit {
+                inputs,
+                change,
+                pubkey,
+                amount_sat,
+                randao_commitment,
+                withdrawal_credentials,
+                commission_bps,
+                proof_of_possession,
+                tx_bytes,
+                tip_millisat_per_gas,
+            } = &mut e
+            {
+                match k {
+                    0 => inputs[0].vout ^= 1,
+                    1 => change[0].value ^= 1,
+                    2 => pubkey[4] ^= 1,
+                    3 => *amount_sat ^= 1,
+                    4 => randao_commitment[0] ^= 1,
+                    5 => withdrawal_credentials[0] ^= 1,
+                    6 => *commission_bps ^= 1,
+                    7 => {
+                        proof_of_possession[0] ^= 1;
+                        *tx_bytes ^= 1;
+                        *tip_millisat_per_gas ^= 1;
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            edits.push(e);
+        }
+        for (k, e) in edits.iter().enumerate() {
+            assert_ne!(
+                e.spend_signing_root(),
+                root,
+                "edit {k} did not move the spend root — that field is unsigned"
+            );
+        }
+
+        // Control: the witnesses do NOT move it (the root must be computable
+        // before the signatures exist), and the txid stays put with them.
+        let mut w = base.clone();
+        if let PosTransaction::FundedDeposit { inputs, .. } = &mut w {
+            inputs[0].pubkey = owner_key(9);
+            inputs[0].signature = vec![0xFF; 64];
+        }
+        assert_eq!(w.spend_signing_root(), root, "a witness edit must not move the root");
+        assert_eq!(w.txid(), base.txid(), "re-encoded witnesses must not move the txid");
+    }
+
+    /// Rule 1 of the flag day: with the shipped `u64::MAX` gate, none of the
+    /// funded shapes can touch state — and the refusal leaves the state
+    /// byte-identical. The control half applies THE SAME transaction through
+    /// the gated inner form with the gate at epoch 0 and it lands, which
+    /// proves the refusal above is the gate and not some other rule.
+    #[test]
+    fn funded_shapes_are_consensus_invalid_before_the_flag_day() {
+        let owner = owner_key(3);
+        let entry = opening(0x51, 0, staking::MIN_DEPOSIT_SAT as u64 + 1_000_000, &owner);
+        let (_t, g, _c) = setup_funded(4, std::slice::from_ref(&entry));
+        let price = fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS;
+        let deposit = funded_deposit_spending(&[entry], &owner, staking::MIN_DEPOSIT_SAT, 0x77, price);
+
+        for tx in [
+            deposit.clone(),
+            PosTransaction::SignedExit { validator: 0, epoch: 0, signature: vec![1] },
+            PosTransaction::Withdraw { validator: 0 },
+        ] {
+            let mut st = g.clone();
+            assert_eq!(
+                // The REAL dispatch, real constant: this is the arm
+                // compute_post_state runs for every block on the live chain.
+                st.apply_transaction(&tx, 0, price, &ToyVerifier),
+                Err(TxReject::StakingRule),
+                "a funded shape must be consensus-invalid while the gate is closed"
+            );
+            assert_eq!(st, g, "a refused transaction must leave the state untouched");
+        }
+
+        // Control: same deposit, gate armed at epoch 0 — it applies.
+        let mut st = g.clone();
+        st.apply_transaction_gated(&deposit, 0, price, &ToyVerifier, 0)
+            .expect("the identical transaction must apply once the gate is open");
+        assert_ne!(st, g, "the control half must actually change state");
+    }
+
+    /// The other side of the flag day: from the gate epoch on, the legacy
+    /// unfunded discriminants are consensus-invalid in block bodies — THE
+    /// refusal that closes the modified-proposer mint. Control: the same
+    /// messages under the shipped (closed) gate still apply, which is also
+    /// what keeps every pre-gate block replayable.
+    #[test]
+    fn legacy_staking_shapes_become_invalid_at_the_flag_day() {
+        let (_t, g, _c) = setup(4);
+        let price = fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS;
+        let legacy = [
+            PosTransaction::Deposit {
+                pubkey: vec![0xAA; 8],
+                amount_sat: staking::MIN_DEPOSIT_SAT,
+                randao_commitment: [0xBB; 32],
+                withdrawal_credentials: vec![0xCC; 4],
+                commission_bps: 500,
+            },
+            PosTransaction::Exit { validator: 0 },
+            PosTransaction::Delegate {
+                delegator: 9,
+                validator: 0,
+                amount_sat: delegation::MIN_DELEGATION_SAT,
+                eligible: true,
+            },
+        ];
+        for tx in &legacy {
+            // Control first: pre-gate (the shipped constant) they apply.
+            let mut st = g.clone();
+            st.apply_transaction(tx, 0, price, &OkVerifier)
+                .expect("control failed: the legacy shape must still apply pre-gate");
+            // Post-gate they are invalid, and the state stays untouched.
+            let mut st = g.clone();
+            assert_eq!(
+                st.apply_transaction_gated(tx, 0, price, &OkVerifier, 0),
+                Err(TxReject::StakingRule),
+                "a legacy staking shape must be consensus-invalid past the gate"
+            );
+            assert_eq!(st, g);
+        }
+    }
+
+    /// The deposit half of the conservation contract:
+    /// `Σ inputs == amount + Σ change + fee`, enforced exactly — and the bond
+    /// that appears in the registry is backed satoshi-for-satoshi by coins
+    /// that left the committed set, with `issued_sat` untouched.
+    #[test]
+    fn funded_deposit_moves_coins_into_the_bond_and_conserves_value() {
+        let owner = owner_key(3);
+        let entry = opening(0x51, 0, staking::MIN_DEPOSIT_SAT as u64 + 1_000_000, &owner);
+        let (t, g, _c) = setup_funded(4, std::slice::from_ref(&entry));
+        let price = fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS;
+        let amount = staking::MIN_DEPOSIT_SAT;
+        let tx = funded_deposit_spending(&[entry], &owner, amount, 0x77, price);
+
+        let pool_before: u128 = g.eutxos.values().map(|e| e.value as u128).sum();
+        let mut st = g.clone();
+        let charge = st
+            .apply_transaction_gated(&tx, 0, price, &ToyVerifier, 0)
+            .expect("a conserving, honestly signed deposit must apply");
+        let fee = charge.base_fee_sat + charge.priority_fee_sat;
+        assert!(fee > 0, "fixture vacuous: a zero fee cannot distinguish the equality");
+
+        // The equality, measured on the committed set: exactly amount + fee
+        // left it (the change came back).
+        let pool_after: u128 = st.eutxos.values().map(|e| e.value as u128).sum();
+        assert_eq!(pool_before - pool_after, amount + fee);
+        // The bond holds exactly the amount, queued like any legacy deposit.
+        let rec = st.validators.get(&4).expect("the deposit must register index 4");
+        assert_eq!(rec.staked_sat, amount);
+        assert_eq!(rec.activation_epoch, u64::MAX, "queued, not scheduled");
+        assert_eq!(rec.withdrawal_credentials, vec![0xCD; 32]);
+        // The change output landed under the derived txid.
+        assert!(st.eutxos.contains_key(&(tx.txid(), 0)));
+        // A bond move is a move: nothing was issued.
+        assert_eq!(st.issued_sat, g.issued_sat, "a funded deposit must not touch issuance");
+        // Its history entry is stamped with the including epoch, which (>= the
+        // gate by construction) is what marks the bond FUNDED for withdrawal.
+        assert_eq!(st.deposit_history.last().unwrap().amount_sat, amount);
+        assert_eq!(st.deposit_history.last().unwrap().deposit_epoch, 0);
+        assert_eq!(st.withdrawable_sat_gated(4, 0), amount, "a funded bond is fully withdrawable");
+
+        // The negative half: one satoshi of imbalance, signatures HONESTLY
+        // re-produced over the edited content, and the equality itself
+        // refuses.
+        let mut off = tx.clone();
+        if let PosTransaction::FundedDeposit { change, .. } = &mut off {
+            change[0].value += 1;
+        }
+        resign_funded(&mut off, &owner);
+        let mut st2 = g.clone();
+        assert_eq!(
+            st2.apply_transaction_gated(&off, 0, price, &ToyVerifier, 0),
+            Err(TxReject::Transfer(TransferReject::ValueNotConserved)),
+            "one satoshi out of balance must be refused by conservation, not by a signature"
+        );
+        assert_eq!(st2, g);
+
+        // And the funded validator walks the SAME activation pipeline as
+        // every legacy one: eligible after the delay, admitted by the queue.
+        let mut walked = st.clone();
+        while walked.epoch < staking::ACTIVATION_DELAY_EPOCHS + 1 {
+            walked = t.process_epoch(&walked).unwrap();
+        }
+        assert_eq!(
+            walked.validators.get(&4).unwrap().activation_epoch,
+            staking::ACTIVATION_DELAY_EPOCHS,
+            "a funded deposit activates through the unchanged epoch pipeline"
+        );
+    }
+
+    /// Signature and registration negatives, each with its passing twin in
+    /// the test above (the honestly-signed deposit that applied).
+    #[test]
+    fn funded_deposit_signature_and_registration_negatives() {
+        let owner = owner_key(3);
+        let entry = opening(0x51, 0, staking::MIN_DEPOSIT_SAT as u64 + 1_000_000, &owner);
+        let (_t, g, _c) = setup_funded(4, std::slice::from_ref(&entry));
+        let price = fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS;
+        let good = funded_deposit_spending(&[entry], &owner, staking::MIN_DEPOSIT_SAT, 0x77, price);
+
+        // Control, restated locally: the honest twin applies.
+        let mut st = g.clone();
+        st.apply_transaction_gated(&good, 0, price, &ToyVerifier, 0).expect("control");
+
+        // A corrupted input signature: refused by the transfer's own rule.
+        let mut bad_sig = good.clone();
+        if let PosTransaction::FundedDeposit { inputs, .. } = &mut bad_sig {
+            bad_sig_flip(&mut inputs[0].signature);
+        }
+        let mut st = g.clone();
+        assert_eq!(
+            st.apply_transaction_gated(&bad_sig, 0, price, &ToyVerifier, 0),
+            Err(TxReject::Transfer(TransferReject::BadSignature)),
+        );
+
+        // A thief's key: hashes to the wrong script, refused before any
+        // verification runs — even though the thief signed honestly with the
+        // key it presented.
+        let thief = owner_key(13); // same length as owner_key(3), so the size floor stays satisfied
+        let mut stolen = good.clone();
+        if let PosTransaction::FundedDeposit { inputs, .. } = &mut stolen {
+            inputs[0].pubkey = thief.clone();
+        }
+        resign_funded(&mut stolen, &thief);
+        let mut st = g.clone();
+        assert_eq!(
+            st.apply_transaction_gated(&stolen, 0, price, &ToyVerifier, 0),
+            Err(TxReject::Transfer(TransferReject::ScriptMismatch)),
+        );
+
+        // A garbage PoP the owners signed over: the coins' movement is
+        // authorised, the REGISTRATION is what refuses — the rogue-key door.
+        let mut rogue = good.clone();
+        if let PosTransaction::FundedDeposit { proof_of_possession, .. } = &mut rogue {
+            *proof_of_possession = vec![0xEE; 32];
+        }
+        // Re-sign the INPUTS only (over the root covering the garbage PoP);
+        // deliberately not resign_funded, which would fix the PoP too.
+        let root = rogue.spend_signing_root();
+        if let PosTransaction::FundedDeposit { inputs, .. } = &mut rogue {
+            for i in inputs.iter_mut() {
+                i.signature = toy_sign(&owner, &root);
+            }
+        }
+        let mut st = g.clone();
+        assert_eq!(
+            st.apply_transaction_gated(&rogue, 0, price, &ToyVerifier, 0),
+            Err(TxReject::StakingRule),
+            "a deposit whose PoP does not verify must not register"
+        );
+
+        // The ML-DSA-only escape hatch, smuggled in the envelope: refused as
+        // a registration rule before any signature is checked.
+        let mut half_suite = good.clone();
+        if let PosTransaction::FundedDeposit { pubkey, .. } = &mut half_suite {
+            pubkey[2] = 0x02;
+        }
+        let mut st = g.clone();
+        assert_eq!(
+            st.apply_transaction_gated(&half_suite, 0, price, &ToyVerifier, 0),
+            Err(TxReject::StakingRule),
+            "only the hybrid suite may enter the registry"
+        );
+    }
+
+    /// One flipped byte that keeps the length — split out so the borrow on
+    /// the enum field ends before the assertion.
+    fn bad_sig_flip(sig: &mut [u8]) {
+        sig[0] ^= 0xFF;
+    }
+
+    /// The founder decision of 2026-08-21, end to end: a genesis bond
+    /// withdraws ONLY its post-genesis accrual; the 25,000-BLOCH principal
+    /// stays in the record as a committed, never-spendable residue. The
+    /// control half is a validator with the SAME numbers whose bond IS funded
+    /// (a deposit-history entry at a post-gate epoch): it withdraws principal
+    /// plus accrual. Without the control, the assertions on validator 0 would
+    /// pass just as well against a Withdraw that short-paid everyone.
+    #[test]
+    fn genesis_withdrawal_pays_only_the_post_genesis_accrual() {
+        let (_t, g, _c) = setup_funded(4, &[]);
+        let price = fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS;
+        let accrual = sat(7);
+
+        let mut st = g.clone();
+        for v in [0u32, 1] {
+            let rec = st.validators.get_mut(&v).unwrap();
+            // A genesis-shaped position: unfunded principal plus accrued
+            // rewards, exited and past the weak-subjectivity margin.
+            rec.staked_sat = GENESIS_UNFUNDED_PRINCIPAL_SAT + accrual;
+            rec.exit_epoch = 0;
+            rec.withdrawable_epoch = 0;
+            rec.withdrawal_credentials = vec![0xE0 + v as u8; 32];
+        }
+        // Validator 1 is the funded twin: its history says real coins backed
+        // the whole principal (deposit_epoch 0 >= gate 0 ⇒ funded).
+        let funded_hash: [u8; 32] =
+            Sha3_256::digest(&st.validators.get(&1).unwrap().pubkey).into();
+        st.deposit_history.push(QueuedDeposit {
+            pubkey_hash: funded_hash,
+            deposit_epoch: 0,
+            amount_sat: GENESIS_UNFUNDED_PRINCIPAL_SAT + accrual,
+        });
+
+        let issued_before = st.issued_sat;
+
+        // The genesis bond: payout = accrual − fee, residue = the principal.
+        let wd0 = PosTransaction::Withdraw { validator: 0 };
+        let charge = st
+            .apply_transaction_gated(&wd0, 0, price, &ToyVerifier, 0)
+            .expect("an exited genesis bond with accrual must withdraw");
+        let fee = charge.base_fee_sat + charge.priority_fee_sat;
+        assert!(fee > 0 && fee < accrual, "fixture vacuous if the fee is 0 or eats the accrual");
+        let out = st.eutxos.get(&(wd0.txid(), 0)).expect("the withdrawal must create an output");
+        assert_eq!(out.value as u128, accrual - fee, "only the accrual, minus the fee");
+        assert_eq!(out.script_hash, [0xE0; 32], "paid to the registered credential");
+        assert_eq!(
+            st.validators.get(&0).unwrap().staked_sat,
+            GENESIS_UNFUNDED_PRINCIPAL_SAT,
+            "the unfunded principal stays in the record — committed, never spendable"
+        );
+
+        // The funded twin: SAME numbers, whole bond pays.
+        let wd1 = PosTransaction::Withdraw { validator: 1 };
+        let charge = st
+            .apply_transaction_gated(&wd1, 0, price, &ToyVerifier, 0)
+            .expect("control: the funded twin must withdraw");
+        let fee1 = charge.base_fee_sat + charge.priority_fee_sat;
+        let out = st.eutxos.get(&(wd1.txid(), 0)).expect("control output");
+        assert_eq!(
+            out.value as u128,
+            GENESIS_UNFUNDED_PRINCIPAL_SAT + accrual - fee1,
+            "control: a funded bond withdraws principal AND accrual"
+        );
+        assert_eq!(st.validators.get(&1).unwrap().staked_sat, 0);
+
+        // Conservation phase of the runbook: two withdrawals, zero issuance.
+        assert_eq!(st.issued_sat, issued_before, "a withdrawal moves value, never issues it");
+
+        // Single-shot: the residue is not withdrawable (withdrawable == 0 <=
+        // fee), on both the written-off bond and the emptied one.
+        for wd in [&wd0, &wd1] {
+            let before = st.clone();
+            assert_eq!(
+                st.apply_transaction_gated(wd, 0, price, &ToyVerifier, 0),
+                Err(TxReject::StakingRule),
+                "a second withdrawal must be a deterministic reject"
+            );
+            assert_eq!(st, before);
+        }
+    }
+
+    /// The clock and the eligibility rejects around Withdraw, each with the
+    /// twin that passes one epoch (or one fact) later.
+    #[test]
+    fn withdrawal_respects_the_weak_subjectivity_clock() {
+        let (_t, g, _c) = setup_funded(4, &[]);
+        let price = fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS;
+        let wd = PosTransaction::Withdraw { validator: 0 };
+
+        // Never exited: withdrawable_epoch is u64::MAX, refused.
+        let mut st = g.clone();
+        assert_eq!(
+            st.apply_transaction_gated(&wd, 0, price, &ToyVerifier, 0),
+            Err(TxReject::StakingRule),
+            "a bonded validator that never exited must not withdraw"
+        );
+
+        // Exited but one epoch inside the margin: still refused; at the
+        // boundary epoch itself: pays. The two halves share every other fact.
+        let mut st = g.clone();
+        {
+            let rec = st.validators.get_mut(&0).unwrap();
+            rec.staked_sat = GENESIS_UNFUNDED_PRINCIPAL_SAT + sat(7);
+            rec.exit_epoch = 0;
+            rec.withdrawable_epoch = 1;
+            rec.withdrawal_credentials = vec![0xE7; 32];
+        }
+        assert_eq!(
+            st.apply_transaction_gated(&wd, 0, price, &ToyVerifier, 0),
+            Err(TxReject::StakingRule),
+            "the weak-subjectivity margin must hold to the epoch"
+        );
+        st.epoch = 1;
+        st.apply_transaction_gated(&wd, 0, price, &ToyVerifier, 0)
+            .expect("control: at the boundary the same withdrawal pays");
+    }
+
+    /// SignedExit: the signature decides, the roster consequences follow the
+    /// legacy arm exactly, and a replayed or future-dated message is refused.
+    #[test]
+    fn signed_exit_requires_the_registered_keys_signature() {
+        let (_t, g, _c) = setup_funded(4, &[]);
+        let price = fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS;
+        let rec_pubkey = g.validators.get(&0).unwrap().pubkey.clone();
+        let root = staking::ExitTx {
+            pubkey_hash: Sha3_256::digest(&rec_pubkey).into(),
+            epoch: 0,
+            signature: Vec::new(),
+        }
+        .signing_root();
+
+        // Control: signed by the registered key, the exit lands with the
+        // legacy arm's exact schedule.
+        let good = PosTransaction::SignedExit {
+            validator: 0,
+            epoch: 0,
+            signature: toy_sign(&rec_pubkey, &root),
+        };
+        let mut st = g.clone();
+        let charge = st.apply_transaction_gated(&good, 0, price, &ToyVerifier, 0).expect("control");
+        assert_eq!(st.validators.get(&0).unwrap().exit_epoch, staking::EXIT_DELAY_EPOCHS);
+        assert_eq!(
+            st.validators.get(&0).unwrap().withdrawable_epoch,
+            staking::EXIT_DELAY_EPOCHS + staking::WITHDRAWAL_DELAY_EPOCHS
+        );
+        // Free of fee, but not free of the caps: real bytes, real gas.
+        assert_eq!(charge.base_fee_sat + charge.priority_fee_sat, 0);
+        assert_eq!(charge.tx_bytes, good.canonical_bytes().len() as u64);
+        assert!(charge.gas > 0);
+        // A second exit must not reset the clock — same rule as legacy.
+        assert_eq!(
+            st.apply_transaction_gated(&good, 0, price, &ToyVerifier, 0),
+            Err(TxReject::StakingRule)
+        );
+
+        // A signature by anyone else is refused, state untouched.
+        let forged = PosTransaction::SignedExit {
+            validator: 0,
+            epoch: 0,
+            signature: toy_sign(&owner_key(9), &root),
+        };
+        let mut st = g.clone();
+        assert_eq!(
+            st.apply_transaction_gated(&forged, 0, price, &ToyVerifier, 0),
+            Err(TxReject::StakingRule),
+            "an exit not signed by the validator's own key must be refused"
+        );
+        assert_eq!(st, g);
+
+        // A future-dated exit is refused even correctly signed — the clock
+        // must not be decoupled from inclusion time.
+        let future_root = staking::ExitTx {
+            pubkey_hash: Sha3_256::digest(&rec_pubkey).into(),
+            epoch: 5,
+            signature: Vec::new(),
+        }
+        .signing_root();
+        let future = PosTransaction::SignedExit {
+            validator: 0,
+            epoch: 5,
+            signature: toy_sign(&rec_pubkey, &future_root),
+        };
+        let mut st = g.clone();
+        assert_eq!(
+            st.apply_transaction_gated(&future, 0, price, &ToyVerifier, 0),
+            Err(TxReject::StakingRule),
+            "a pre-signed future exit must be refused at inclusion"
+        );
+    }
+
+    /// The public accessor under the SHIPPED gate: every genesis bond reads
+    /// its stake minus the manifest principal, and the number is exactly what
+    /// the RPC surface reports. (The armed-gate arithmetic is covered by the
+    /// withdrawal tests above through the gated form.)
+    #[test]
+    fn withdrawable_sat_writes_off_the_genesis_principal_under_the_shipped_gate() {
+        let (_t, g, _c) = setup(4);
+        // Fixture bonds are 200,000 BLOCH; the write-off is 25,000.
+        assert_eq!(g.withdrawable_sat(0), sat(200_000) - GENESIS_UNFUNDED_PRINCIPAL_SAT);
+        // An unknown index reads zero rather than panicking.
+        assert_eq!(g.withdrawable_sat(999), 0);
+    }
+
+    /// THE attack the write-off invites, refused by name: relabel a genesis
+    /// bond as funded by re-depositing under its registered pubkey, so the
+    /// history lookup finds a post-gate entry and the 25,000-BLOCH write-off
+    /// evaporates. It dies at registration — `pubkey_index` makes a second
+    /// deposit of a registered key a deterministic reject — and the pinned
+    /// half is that the write-off DID NOT MOVE. The control twin is the
+    /// byte-for-byte same deposit under a fresh key: it registers, and its
+    /// bond is fully withdrawable (unbacked = 0), proving the reject was
+    /// about the key reuse and nothing else in the transaction.
+    #[test]
+    fn a_genesis_bond_cannot_be_relabelled_funded_by_reusing_its_pubkey() {
+        let owner = owner_key(3);
+        let entry = opening(0x51, 0, staking::MIN_DEPOSIT_SAT as u64 + 1_000_000, &owner);
+        let (_t, g, _c) = setup_funded(4, std::slice::from_ref(&entry));
+        let price = fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS;
+
+        // Give validator 0 the wire-form key a real manifest would carry —
+        // registry AND derived index together, exactly as `genesis` seeds
+        // them — so the attack reaches the pubkey rule instead of dying on
+        // the fixture's 8-byte toy key at the suite-shape check.
+        let mut st = g.clone();
+        let wire = wire_validator_key(0x77);
+        let old_hash: [u8; 32] = Sha3_256::digest(&st.validators.get(&0).unwrap().pubkey).into();
+        st.pubkey_index.remove(&old_hash);
+        st.validators.get_mut(&0).unwrap().pubkey = wire.clone();
+        st.pubkey_index.insert(Sha3_256::digest(&wire).into(), 0);
+
+        // The write-off, before: no history entry, so the full genesis
+        // principal is unbacked.
+        let unbacked_before = st.validators.get(&0).unwrap().staked_sat
+            - st.withdrawable_sat_gated(0, 0);
+        assert_eq!(unbacked_before, GENESIS_UNFUNDED_PRINCIPAL_SAT);
+
+        // The attack: a conserving, honestly signed funded deposit whose
+        // validator key is the genesis validator's registered key (same tag
+        // 0x77 ⇒ same wire bytes).
+        let attack =
+            funded_deposit_spending(&[entry.clone()], &owner, staking::MIN_DEPOSIT_SAT, 0x77, price);
+        let before = st.clone();
+        assert_eq!(
+            st.apply_transaction_gated(&attack, 0, price, &ToyVerifier, 0),
+            Err(TxReject::StakingRule),
+            "a second deposit of a registered key must be a deterministic reject"
+        );
+        assert_eq!(st, before, "a refused deposit must leave the state untouched");
+        // The pinned half: the write-off did not move — no history entry was
+        // created, so the genesis principal is exactly as unbacked as before.
+        assert_eq!(
+            st.validators.get(&0).unwrap().staked_sat - st.withdrawable_sat_gated(0, 0),
+            GENESIS_UNFUNDED_PRINCIPAL_SAT,
+            "the attack must not shrink the unbacked principal"
+        );
+
+        // Control twin: the same deposit under a FRESH key registers, and
+        // its bond carries no write-off at all.
+        let honest =
+            funded_deposit_spending(&[entry], &owner, staking::MIN_DEPOSIT_SAT, 0x78, price);
+        st.apply_transaction_gated(&honest, 0, price, &ToyVerifier, 0)
+            .expect("control: the fresh-key twin must register");
+        assert_eq!(
+            st.withdrawable_sat_gated(4, 0),
+            staking::MIN_DEPOSIT_SAT,
+            "control: a funded bond is fully withdrawable — unbacked = 0"
+        );
+    }
+
+    /// The full funded life cycle against one ledger: deposit → signed exit
+    /// → withdrawal, with conservation asserted at every hop. The invariant
+    /// is `eUTXO pool + bonded stake`, which may fall ONLY by the two fees
+    /// (the exit is deliberately fee-settled at zero), and `issued_sat`,
+    /// which may not move at all — coin enters the stake by leaving the
+    /// eUTXO set and re-enters the eUTXO set by leaving the stake, and no
+    /// hop may create or destroy a satoshi outside the fee split.
+    #[test]
+    fn funded_round_trip_conserves_value_and_never_issues() {
+        let owner = owner_key(3);
+        let entry = opening(0x51, 0, staking::MIN_DEPOSIT_SAT as u64 + 1_000_000, &owner);
+        let (_t, g, _c) = setup_funded(4, std::slice::from_ref(&entry));
+        let price = fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS;
+        let amount = staking::MIN_DEPOSIT_SAT;
+
+        let pool = |st: &CommittedState| -> u128 {
+            st.eutxos.values().map(|e| e.value as u128).sum()
+        };
+        let bonded = |st: &CommittedState| -> u128 {
+            st.validators.values().map(|r| r.staked_sat).sum()
+        };
+
+        let mut st = g.clone();
+        let (pool0, bonded0, issued0) = (pool(&st), bonded(&st), st.issued_sat);
+
+        // ── Deposit: coin leaves the set, the bond gains exactly `amount`.
+        let dep = funded_deposit_spending(&[entry], &owner, amount, 0x77, price);
+        let charge = st
+            .apply_transaction_gated(&dep, 0, price, &ToyVerifier, 0)
+            .expect("the deposit must apply");
+        let fee_d = charge.base_fee_sat + charge.priority_fee_sat;
+        assert!(fee_d > 0, "fixture vacuous with a zero deposit fee");
+        assert_eq!(pool(&st), pool0 - amount - fee_d);
+        assert_eq!(bonded(&st), bonded0 + amount);
+
+        // ── Signed exit: schedules the clocks, moves NO value.
+        // Activation is hand-rolled here — the queue's own pipeline is
+        // proven in `funded_deposit_moves_coins_into_the_bond_...`.
+        st.validators.get_mut(&4).unwrap().activation_epoch = 0;
+        let rec_pubkey = st.validators.get(&4).unwrap().pubkey.clone();
+        let root = staking::ExitTx {
+            pubkey_hash: Sha3_256::digest(&rec_pubkey).into(),
+            epoch: 0,
+            signature: Vec::new(),
+        }
+        .signing_root();
+        let exit = PosTransaction::SignedExit {
+            validator: 4,
+            epoch: 0,
+            signature: toy_sign(&rec_pubkey, &root),
+        };
+        let (pool1, bonded1) = (pool(&st), bonded(&st));
+        let charge = st
+            .apply_transaction_gated(&exit, 0, price, &ToyVerifier, 0)
+            .expect("the signed exit must apply");
+        assert_eq!(charge.base_fee_sat + charge.priority_fee_sat, 0, "an exit settles no fee");
+        assert_eq!(pool(&st), pool1, "an exit moves no coin");
+        assert_eq!(bonded(&st), bonded1, "an exit unbonds nothing by itself");
+
+        // ── Withdrawal, at the scheduled epoch: the whole funded bond comes
+        // back as one output, minus only the withdrawal fee.
+        let wd_epoch = st.validators.get(&4).unwrap().withdrawable_epoch;
+        assert_eq!(
+            wd_epoch,
+            staking::EXIT_DELAY_EPOCHS + staking::WITHDRAWAL_DELAY_EPOCHS,
+            "the two delays compose"
+        );
+        st.epoch = wd_epoch;
+        let wd = PosTransaction::Withdraw { validator: 4 };
+        let charge = st
+            .apply_transaction_gated(&wd, 0, price, &ToyVerifier, 0)
+            .expect("the withdrawal must pay");
+        let fee_w = charge.base_fee_sat + charge.priority_fee_sat;
+        assert!(fee_w > 0 && fee_w < amount, "fixture vacuous if the fee is 0 or eats the bond");
+        let out = st.eutxos.get(&(wd.txid(), 0)).expect("the payout output");
+        assert_eq!(out.value as u128, amount - fee_w, "a funded bond withdraws in full");
+        assert_eq!(out.script_hash, [0xCD; 32], "paid to the registered credential");
+
+        // ── The ledger, end to end: the two fees are the ONLY leak, and
+        // nothing was issued anywhere in the cycle.
+        assert_eq!(bonded(&st), bonded0, "the bond came all the way back out");
+        assert_eq!(pool(&st), pool0 - fee_d - fee_w);
+        assert_eq!(
+            pool(&st) + bonded(&st),
+            pool0 + bonded0 - fee_d - fee_w,
+            "conservation: the cycle burns exactly its fees"
+        );
+        assert_eq!(st.issued_sat, issued0, "no hop of the cycle may issue");
+    }
+
+    /// The write-off is DERIVED from `deposit_history`, not stored: a funded
+    /// bond is funded because its history entry says so, and the field docs
+    /// promise the history is kept forever. This test makes that coupling
+    /// executable — erase a funded validator's entry and the derivation
+    /// silently reclassifies the bond as genesis-class, 25,000 BLOCH written
+    /// off. Any future pruning of the history must confront this test by
+    /// name; "the history is the input, not a cache to prune" is load-bearing
+    /// for coins now, not only for activation order.
+    #[test]
+    fn the_write_off_derivation_depends_on_history_immortality() {
+        let owner = owner_key(3);
+        // Bond ABOVE the genesis principal so the reclassified number is
+        // distinguishable from zero (MIN_DEPOSIT_SAT is exactly the genesis
+        // bond size, so a minimum bond would read 0 either way).
+        let amount = staking::MIN_DEPOSIT_SAT + sat(1_000);
+        let entry = opening(0x51, 0, amount as u64 + 1_000_000, &owner);
+        let (_t, g, _c) = setup_funded(4, std::slice::from_ref(&entry));
+        let price = fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS;
+        assert!(amount > GENESIS_UNFUNDED_PRINCIPAL_SAT);
+
+        let mut st = g.clone();
+        let dep = funded_deposit_spending(&[entry], &owner, amount, 0x77, price);
+        // Enough committed active stake that the 1% per-validator cap clears
+        // the above-minimum bond — the cap itself is another test's subject.
+        let active = sat(3_000_000);
+        st.apply_transaction_gated(&dep, active, price, &ToyVerifier, 0).expect("deposit");
+        assert_eq!(st.withdrawable_sat_gated(4, 0), amount, "control: funded, no write-off");
+
+        // The hypothetical prune — exactly what the field docs forbid.
+        let hash = st.deposit_history.last().unwrap().pubkey_hash;
+        st.deposit_history.retain(|d| d.pubkey_hash != hash);
+        assert_eq!(
+            st.withdrawable_sat_gated(4, 0),
+            amount - GENESIS_UNFUNDED_PRINCIPAL_SAT,
+            "with its history gone the same bond silently loses the genesis write-off"
+        );
+    }
+
+    /// The saturation in `withdrawable_sat_gated` is a consensus claim, not
+    /// decoration: slashing consumes the withdrawable accrual BEFORE the
+    /// notional principal, so a genesis bond slashed below 25,000 BLOCH must
+    /// read zero — a plain subtraction would underflow (a debug panic on a
+    /// consensus read path, a wrapped near-u128::MAX "withdrawable" in
+    /// release). This test exists because the 2026-08-22 mutation run proved
+    /// the rest of the suite survives that exact substitution.
+    #[test]
+    fn a_bond_slashed_below_its_unbacked_principal_reads_zero_not_underflow() {
+        let (_t, g, _c) = setup_funded(4, &[]);
+        let mut st = g.clone();
+        // A slash that ate through the accrual and into the principal.
+        st.validators.get_mut(&0).unwrap().staked_sat = GENESIS_UNFUNDED_PRINCIPAL_SAT - sat(1);
+        assert_eq!(st.withdrawable_sat_gated(0, 0), 0, "saturates at zero, never wraps");
+        // The SHIPPED gate derives the same unbacked principal for a
+        // history-less record, so the public accessor must saturate too.
+        assert_eq!(st.withdrawable_sat(0), 0);
+        // Control: one satoshi above the principal reads exactly one satoshi,
+        // so the zero above is saturation and not some unrelated short-circuit.
+        st.validators.get_mut(&0).unwrap().staked_sat = GENESIS_UNFUNDED_PRINCIPAL_SAT + 1;
+        assert_eq!(st.withdrawable_sat_gated(0, 0), 1);
     }
 }
 
