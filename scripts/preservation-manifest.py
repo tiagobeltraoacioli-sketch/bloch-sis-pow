@@ -449,6 +449,36 @@ def _body_of(src: str, needle: str):
     return None
 
 
+def check_perf_feature_off(root: Path, rep: Report):
+    """`perf-timing` must stay off by default.
+
+    The armed build put phase timers behind a feature that is absent in every
+    release the fleet runs, so the spans compile away.  An integration that
+    lists it under `default` puts `Instant::now()` on the consensus thread of
+    64 producing nodes — a preservation failure that no test would notice
+    because every test would still pass, only slower.
+    """
+    g = "D2. structural pins (call shape)"
+    ok = True
+    detail = []
+    for crate in (COMMITTEE, NODE):
+        p = root / crate / "Cargo.toml"
+        if not p.is_file():
+            rep.add(g, "perf-timing stays off by default", False, f"MISSING {crate}/Cargo.toml")
+            return
+        txt = p.read_text()
+        if "perf-timing" not in txt:
+            detail.append(f"{crate}: feature absent")
+            continue
+        m = re.search(r'^\s*default\s*=\s*\[([^\]]*)\]', txt, re.M)
+        if m and "perf-timing" in m.group(1):
+            ok = False
+            detail.append(f"{crate}: ARMED in `default`")
+        else:
+            detail.append(f"{crate}: opt-in")
+    rep.add(g, "perf-timing stays off by default", ok, "; ".join(detail))
+
+
 def check_root_components(root: Path, rep: Report):
     g = "D2. structural pins (call shape)"
     p = root / f"{COMMITTEE}/src/state_root.rs"
@@ -710,7 +740,9 @@ def main():
     ap.add_argument("--worktree", required=True)
     ap.add_argument("--label", default=None)
     ap.add_argument("--no-cargo", action="store_true",
-                    help="static gates only; the report is marked INCOMPLETE")
+                    help="static gates only. CANNOT PRODUCE A PASS: exits 3 (INCOMPLETE) "
+                         "even when every static gate holds. Static gates match symbols, "
+                         "files and test names by pattern; they do not type-check.")
     ap.add_argument("--target-dir", default=None)
     args = ap.parse_args()
 
@@ -728,6 +760,7 @@ def main():
     check_symbols(root, rep)
     check_structural(root, rep)
     check_root_components(root, rep)
+    check_perf_feature_off(root, rep)
     if not args.no_cargo:
         check_cargo(root, rep, present, args.target_dir)
     else:
@@ -741,7 +774,7 @@ def main():
         print("!! THE VERIFIER EXECUTED ZERO GATES. This report means NOTHING.")
         print("!" * 70)
         return 2
-    expected_min = 3 + 2 + len(SUITES) + len(PERF_SYMBOLS) + len(STRUCTURAL_PINS) + 2
+    expected_min = 3 + 2 + len(SUITES) + len(PERF_SYMBOLS) + len(STRUCTURAL_PINS) + 3
     if not args.no_cargo:
         expected_min += 3  # build + tripwire-run + workspace-green
     if len(gates) < expected_min:
@@ -755,6 +788,22 @@ def main():
         for g, item, _, detail in rep.failures:
             print(f"  - [{g}] {item}: {detail}")
         return 1
+    if args.no_cargo:
+        print("\n" + "!" * 70)
+        print("!! RESULT: INCOMPLETE — static gates hold, but NOTHING WAS COMPILED.")
+        print("!! --no-cargo CANNOT produce a PASS, by construction.")
+        print("!!")
+        print("!! Static gates match symbols, files and test names by PATTERN. They do")
+        print("!! not type-check, so they cannot see a call that no longer matches its")
+        print("!! callee. On 2026-08-24 this exact mode reported 42/42 PASS on a tree")
+        print("!! whose --bin target did not compile: rpc/tests.rs passed 8 arguments to")
+        print("!! chain_info_json, which takes 9 since ae4cffbb. That --bin target is")
+        print("!! where replay_bench lives, so the benchmark proving the state-root work")
+        print("!! survived the merge could not be BUILT, while this report said PASS.")
+        print("!!")
+        print("!! Re-run WITHOUT --no-cargo before calling anything preserved.")
+        print("!" * 70)
+        return 3
     print("\nRESULT: PASS — every gate in the preservation manifest holds")
     return 0
 
