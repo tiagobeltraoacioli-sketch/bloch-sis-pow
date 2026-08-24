@@ -80,10 +80,11 @@ both branches are children of it in both engines. The downward walk sees both
 branches perfectly. The latch was never engaged.
 
 **The real mechanism is a fourth one, and it is WEIGHT asymmetry.**
-`forkchoice_head` (`engine.rs:1152-1156`) passes `self.state.active_validators()`
-— the stake table of the node's OWN head state — into LMD-GHOST. And
-`close_epoch` does `rec.staked_sat += payout.operator` with
-`credits: u64::from(attested)` (`transition.rs:2617-2637`). So every epoch
+`forkchoice_head` (`engine.rs:1229-1238` on this branch) passes
+`&self.state.active_validators()` — the stake table of the node's OWN head
+state — into `lmd_ghost_head`. And `close_epoch` does
+`rec.staked_sat += payout.operator` (`transition.rs:2678` and `:2762`) with
+`credits: u64::from(attested)`. So every epoch
 boundary inflates exactly those validators that participated on the branch that
 node applied. Measured at 8.27%. Same blocks, same DAG, same anchor, opposite
 winner: each node weighs its own branch more heavily.
@@ -100,6 +101,11 @@ depth. So restoring attestation flow may be sufficient on its own, and
 rewriting the fork-choice stake table would be a far deeper consensus change.
 The deciding measurement is the n=8 arm against the corrected binary; it is
 recorded with the proof scenarios.
+
+Worth recording, because it is the same class: `state.active_validators()` is
+`consensus_roster_at`, so fork-choice WEIGHT is coupled to the leak as well.
+Committee membership is decoupled from stake by the fix in section 1; weight is
+not, and deliberately is not being touched today.
 
 Walking down from the justified checkpoint remains correct LMD-GHOST
 regardless, and forcing fork choice outside the justified subtree would trade a
