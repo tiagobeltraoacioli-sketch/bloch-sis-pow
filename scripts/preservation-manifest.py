@@ -138,12 +138,42 @@ STRUCTURAL_PINS = [
     ("the eUTXO set hands out a tree, not a leaf map",
      f"{COMMITTEE}/src/transition.rs",
      r'\bfn\s+tree\s*\(&self\)\s*->\s*&(?:crate::)?state_root::Smt', True),
+    # The gate itself.  This project has already paid for a flag day that read
+    # the wrong quantity; the leaked-roster gate must compare a BLOCK-DERIVED
+    # epoch, never a wall clock.
+    ("the leaked-roster gate compares an epoch parameter",
+     f"{COMMITTEE}/src/transition.rs",
+     r'if\s+epoch\s*<\s*(?:crate::)?params::LEAKED_ROSTER_ACTIVATION_EPOCH', True),
+    ("no consensus roster is derived from the wall clock",
+     f"{NODE}/src/engine.rs",
+     r'consensus_roster_at\s*\(\s*epoch_of\s*\(\s*self\.wall_slot', False),
 ]
 
 TRIPWIRE = "leaked_roster_armed_epoch_matches_the_runbook"
 TRIPWIRE_FILE = f"{COMMITTEE}/src/transition.rs"
 
 ARMED_EPOCH = 1400
+
+# Every component tag the armed build's state root commits, inside
+# `build_state_tree_inner`.  An integration may only ADD tags.  Losing one is a
+# SILENT consensus change: the root stops binding a field and nothing fails to
+# compile.
+#
+# This guards the exact failure the collision inventory found: `state_root.rs`
+# merges clean while `transition.rs` conflicts, so a resolver working
+# file-by-file can drop half of the `ConsensusState` literal and never see a
+# marker in the file that defines the leaves.
+#
+# Counted by TAG, not by `smt.insert` call site: 22751083 folded the eUTXO
+# insert LOOP into `eutxo_tree.clone()`, so the armed build has 21 inserts
+# where the merge base had 22 while committing the same 21 tags.  A call-site
+# count would have made that look like a regression and, worse, would have
+# passed a tree that added two tags while dropping one.
+ROOT_COMPONENT_TAGS = ['TAG_BASE_FEE', 'TAG_COHERENCE_ACCUMULATOR', 'TAG_COHERENCE_NULLIFIERS', 'TAG_DELEGATION', 'TAG_DELEGATOR_FEE_REWARD', 'TAG_DELEGATOR_SLASH_LOSS', 'TAG_DEPOSIT_QUEUE', 'TAG_EVM_COMMITMENT', 'TAG_FC_EQUIVOCATOR', 'TAG_FC_MESSAGE', 'TAG_FINALITY', 'TAG_ISSUED_SUPPLY', 'TAG_PARTICIPATION_CURRENT', 'TAG_PARTICIPATION_PREVIOUS', 'TAG_PENDING_FEE', 'TAG_PENDING_VOTE', 'TAG_RANDAO', 'TAG_SLASH_APPLIED', 'TAG_SLASH_WINDOW', 'TAG_TAINT_ROOT', 'TAG_VALIDATOR']
+
+# The eUTXO subtree is committed by cloning the retained tree, not by a tag.
+EUTXO_COMMIT_PIN = r'let mut smt = eutxo_tree\.clone\(\)'
+
 
 # ─────────────────────────────── reporting ──────────────────────────────────
 
@@ -356,6 +386,90 @@ def check_constants(root: Path, rep: Report):
         armed = v.replace("_", "").strip() != "u64::MAX"
         rep.add(g, "FUNDED_STAKE_ACTIVATION_EPOCH inert", not armed,
                 f"found `{v}` — must be u64::MAX; arming is the founder's decision, not a merge's")
+
+
+MANIFEST_FILE = "genesis/mainnet.manifest"
+
+def check_flag_day_is_ahead(root: Path, rep: Report):
+    """The armed epoch must not already be in the past.
+
+    Measured, not assumed.  The live manifest carries `genesis_time_ms` and
+    `slot_ms`, so the WALL epoch is computable here without touching a node.
+    The chain's own epoch can only ever be <= the wall epoch (a slot with no
+    block still burns wall time but does not advance the chain past it), so
+    `ARMED_EPOCH > wall_epoch` is a conservative proof that the flag day is
+    still ahead of the fleet.
+
+    This exists because the project has already shipped a constant armed at an
+    epoch that had already gone by: the write-off never fired and 1,600,000
+    BLCH stayed spendable.
+    """
+    g = "A. consensus constants"
+    p = root / MANIFEST_FILE
+    if not p.is_file():
+        rep.add(g, "the armed flag day is still in the future", False,
+                f"cannot measure: {MANIFEST_FILE} MISSING")
+        return
+    b = p.read_bytes()[:24]
+    if len(b) < 24 or b[:8] != b"BPOSMAN1":
+        rep.add(g, "the armed flag day is still in the future", False,
+                "cannot measure: manifest magic is not BPOSMAN1")
+        return
+    gms = int.from_bytes(b[8:16], "little")
+    slot_ms = int.from_bytes(b[16:24], "little") or 30_000
+    now_ms = int(time.time() * 1000)
+    wall_slot = max(0, (now_ms - gms) // slot_ms)
+    wall_epoch = wall_slot // 32
+    boundary = gms + ARMED_EPOCH * 32 * slot_ms
+    hours = (boundary - now_ms) / 3_600_000
+    rep.add(g, "the armed flag day is still in the future",
+            ARMED_EPOCH > wall_epoch,
+            f"wall epoch {wall_epoch} (slot {wall_slot}); epoch {ARMED_EPOCH} lands "
+            f"{time.strftime('%Y-%m-%d %H:%M:%SZ', time.gmtime(boundary / 1000))} "
+            f"({hours:+.1f} h) — the chain epoch is <= the wall epoch, so this bounds it")
+
+
+def _body_of(src: str, needle: str):
+    i = src.find(needle)
+    if i == -1:
+        return None
+    j = src.find("{", i)
+    if j == -1:
+        return None
+    d = 0
+    k = j
+    while k < len(src):
+        if src[k] == "{":
+            d += 1
+        elif src[k] == "}":
+            d -= 1
+            if d == 0:
+                return src[j:k]
+        k += 1
+    return None
+
+
+def check_root_components(root: Path, rep: Report):
+    g = "D2. structural pins (call shape)"
+    p = root / f"{COMMITTEE}/src/state_root.rs"
+    if not p.is_file():
+        rep.add(g, "the state root still commits every component", False, "state_root.rs MISSING")
+        return
+    body = _body_of(strip_comments(p.read_text()), "fn build_state_tree_inner")
+    if body is None:
+        rep.add(g, "the state root still commits every component", False,
+                "build_state_tree_inner NOT FOUND — the one place fields map to committed leaves")
+        return
+    found = set(re.findall(r'\bTAG_[A-Z0-9_]+', body))
+    missing = sorted(set(ROOT_COMPONENT_TAGS) - found)
+    added = sorted(found - set(ROOT_COMPONENT_TAGS))
+    rep.add(g, "the state root still commits every component", not missing,
+            (f"{len(found)} tag(s); MISSING {', '.join(missing)}" if missing
+             else f"all {len(ROOT_COMPONENT_TAGS)} armed tag(s) present"
+                  + (f"; adds {', '.join(added)}" if added else "")))
+    rep.add(g, "the eUTXO subtree is still committed by the retained tree",
+            bool(re.search(EUTXO_COMMIT_PIN, body)),
+            "22751083 folded the eUTXO loop into a clone of the retained Smt")
 
 
 def check_tripwire_source(root: Path, rep: Report):
@@ -608,10 +722,12 @@ def main():
 
     rep = Report(label)
     check_constants(root, rep)
+    check_flag_day_is_ahead(root, rep)
     check_tripwire_source(root, rep)
     present = check_suites_source(root, rep)
     check_symbols(root, rep)
     check_structural(root, rep)
+    check_root_components(root, rep)
     if not args.no_cargo:
         check_cargo(root, rep, present, args.target_dir)
     else:
@@ -625,7 +741,7 @@ def main():
         print("!! THE VERIFIER EXECUTED ZERO GATES. This report means NOTHING.")
         print("!" * 70)
         return 2
-    expected_min = 2 + 2 + len(SUITES) + len(PERF_SYMBOLS) + len(STRUCTURAL_PINS)
+    expected_min = 3 + 2 + len(SUITES) + len(PERF_SYMBOLS) + len(STRUCTURAL_PINS) + 2
     if not args.no_cargo:
         expected_min += 3  # build + tripwire-run + workspace-green
     if len(gates) < expected_min:
