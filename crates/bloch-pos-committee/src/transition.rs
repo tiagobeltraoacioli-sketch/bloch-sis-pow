@@ -1547,7 +1547,7 @@ impl CommittedState {
         #[allow(unused_mut)]
         let mut seed = seed;
         #[cfg(test)]
-        if crate::params::rehearsal::MUTATE_SEED.load(std::sync::atomic::Ordering::Relaxed) {
+        if crate::params::rehearsal::MUTATE_SEED.with(std::cell::Cell::get) {
             seed[0] ^= 0x01;
         }
         seed
@@ -3937,7 +3937,15 @@ mod tests {
     // how LONG a run takes and not what it produces — which is what makes a
     // bit-for-bit chain comparison meaningful on a box under load.
 
-    /// `MUTATE_SEED` is a process global and cargo runs tests in parallel.
+    /// Kept, but no longer load-bearing: `MUTATE_SEED` is now a THREAD-LOCAL
+    /// (`params::rehearsal`), so a mutation cannot reach any test but the one
+    /// that set it. It used to be a process global, and this mutex was the
+    /// only guard — which serialised the two A/B tests against each other and
+    /// left the crate's other ~260 tests reading a corrupted consensus seed
+    /// whenever the tripwire held the flag up. Removing the mutex is safe;
+    /// it is left in place so the two A/B runs stay serialised against each
+    /// other for timing stability, and because deleting a lock is a separate
+    /// change from the one that made it unnecessary.
     static AB_HOOKS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Everything one node believed after one slot. Eight fields; `assert_eq!`
@@ -3956,8 +3964,7 @@ mod tests {
     }
 
     fn ab_run(mutate: bool, slots: u64, n: u32) -> Vec<AbRecord> {
-        use std::sync::atomic::Ordering::Relaxed;
-        crate::params::rehearsal::MUTATE_SEED.store(mutate, Relaxed);
+        crate::params::rehearsal::MUTATE_SEED.with(|c| c.set(mutate));
 
         let (t, g, mut chains) = setup(n);
         let mut st = g;
@@ -3981,7 +3988,7 @@ mod tests {
                 partition: crate::committees::epoch_committees(&seed, epoch, &roster),
             });
         }
-        crate::params::rehearsal::MUTATE_SEED.store(false, Relaxed);
+        crate::params::rehearsal::MUTATE_SEED.with(|c| c.set(false));
         out
     }
 

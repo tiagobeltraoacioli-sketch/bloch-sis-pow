@@ -320,8 +320,6 @@ pub const BLOCK_BYTES_V2_ACTIVATION_EPOCH: u64 = 800;
 #[cfg(test)]
 pub mod rehearsal {
     use std::cell::Cell;
-    use std::sync::atomic::AtomicBool;
-    pub static MUTATE_SEED: AtomicBool = AtomicBool::new(false);
 
     /// Restores the pre-2026-08-24 `effective_stake > 0` filter that ran
     /// *before* the Fisher-Yates shuffle in `committees::epoch_committees` —
@@ -351,6 +349,31 @@ pub mod rehearsal {
     pub static HOOK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     thread_local! {
+        /// Plant a one-bit difference in every seed, so the A/B chain
+        /// comparator can be shown to go red on a difference that is really
+        /// there.
+        ///
+        /// **Thread-local, and it must stay that way.** This was an
+        /// `AtomicBool` — a PROCESS global — guarded by an `AB_HOOKS` mutex
+        /// that only the two A/B tests take. That mutex serialises those two
+        /// against each other and does nothing for the other ~260 tests in
+        /// this crate, every one of which reads `seed_for_epoch` and none of
+        /// which take it. So while the comparator's tripwire held the flag
+        /// up, any test running beside it computed a corrupted consensus
+        /// seed. Observed 2026-08-24: a full `cargo test -p
+        /// bloch-pos-committee` failed with
+        /// `the_rule_reads_a_boundary_the_state_still_retains ... block
+        /// rejected: Proposal(NotScheduledProposer)` — a test with no
+        /// connection to the mutation, reddened by it.
+        ///
+        /// That is worse than a flaky test. A mutation switch that leaks into
+        /// unrelated tests produces false REDs, which get "fixed", and false
+        /// GREENs wherever the planted difference happens to land somewhere
+        /// the assertions do not look. Thread-local makes the leak
+        /// impossible: `cargo test` gives each test its own thread, so a
+        /// mutation cannot escape the test that set it.
+        pub static MUTATE_SEED: Cell<bool> = const { Cell::new(false) };
+
         /// Test-only mutation of the **rule itself**: force the seed
         /// look-ahead back to ZERO — the pre-fix arithmetic, in which epoch
         /// `E` is seeded by the close of `E − 1`.
