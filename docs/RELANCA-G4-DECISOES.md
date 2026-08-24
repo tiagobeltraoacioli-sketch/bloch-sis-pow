@@ -177,6 +177,30 @@ test is that the pair fails to justify its own root and is reabsorbed. The 4/4
 arm still has a use, but its question is "do both halves weigh with the same
 ruler", not "do they converge".
 
+**This does NOT retract the measurement that found the weight bias, and both
+facts have to stand together.** That run was made against a binary built from
+the seed anchor ALONE — `pmo/leak-zero`, which carries
+`MIN_QUORUM_DENOMINATOR`, was not in it. Its data show the mechanism above did
+not operate: `fin=e0`, `just=e0` on all eight nodes, nothing justified beyond
+genesis on either side. With no floor and no accrued leak, the denominator is
+the full active stake and a 50% half holds 50% < 2/3, so neither half could
+justify — which is exactly what was observed. The halves shared an identical
+justified checkpoint, held all of each other's blocks, and still picked
+opposite winners. That is the 8.27% weight bias, measured, and it was reached
+independently by an in-process experiment. The paragraph above retires the 4/4
+arm as an ACCEPTANCE criterion from the moment the floor ships; it does not
+touch the earlier finding.
+
+**A consequence worth stating, because it is the accepted residual made
+concrete.** Once the floor and leak recovery ship, a 50/50 partition behaves
+WORSE than it does today, not better: as the leak drains the denominator, 2/3
+of the floored denominator falls to 1/3 of the original stake, so each half
+crosses its own quorum and justifies its own root. Two justified checkpoints at
+the same epoch on different branches, and the floor is prophylactic — it does
+not undo them. That is precisely the residual the founder accepted when he
+chose 1/2 over 3/4 (bounded divergence, not a unique justified root), stated
+here in the form an operator will actually meet it.
+
 ## 7. Where the un-gated seed change came from
 
 The removal of the `seed_for_epoch` flag day was an instruction from the
