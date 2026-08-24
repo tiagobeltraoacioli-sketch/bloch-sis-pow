@@ -191,16 +191,14 @@ impl FinalityState {
         Ok(state)
     }
 
-    /// Fold one epoch of votes into the state.
-    ///
-    /// Order inside this function matters and is part of consensus:
-    /// 1. tally votes with **pre-epoch** leak-adjusted stakes (this epoch's
-    ///    leak must not influence this epoch's own quorum),
-    /// 2. justify / finalize,
-    /// 3. tick the leak using the **post-vote** finalized epoch, so the epoch
-    ///    that restores finality does not also punish its participants.
     /// `true` only in a test build with the mutation switch on. Constant
-    /// `false` everywhere else, so the branch above folds away in a release.
+    /// `false` everywhere else, so the branch it guards folds away in a
+    /// release.
+    ///
+    /// It sat spliced into the MIDDLE of `process_epoch`'s doc comment, which
+    /// left that function documented by two sentences about a test hook and
+    /// this helper documented by three numbered steps it has nothing to do
+    /// with. Moved out, so both comments say what they are about.
     #[inline]
     fn denominator_ignores_leak() -> bool {
         #[cfg(test)]
@@ -239,6 +237,14 @@ impl FinalityState {
         false
     }
 
+    /// Fold one epoch of votes into the state.
+    ///
+    /// Order inside this function matters and is part of consensus:
+    /// 1. tally votes with **pre-epoch** leak-adjusted stakes (this epoch's
+    ///    leak must not influence this epoch's own quorum),
+    /// 2. justify / finalize,
+    /// 3. tick the leak using the **post-vote** finalized epoch, so the epoch
+    ///    that restores finality does not also punish its participants.
     pub fn process_epoch(&mut self, votes: &EpochVotes<'_>) -> Result<EpochOutcome, FinalityError> {
         if votes.epoch != self.next_epoch {
             return Err(FinalityError::OutOfOrderEpoch {
@@ -1341,10 +1347,16 @@ mod tests {
         }
         let admitted = atts.len();
 
-        // Now the boundary tally, against the UNLEAKED roster — the real
-        // production function, the real seed, the real partition filter.
+        // Now the boundary tally, the real production function, the real
+        // seed, the real partition filter. `partition_set = &duty` is the
+        // PRE-FIX wiring: before cde4c51d, `votes_from_partition` derived
+        // committee membership from the same (unleaked) roster it used for
+        // weight, so `close_epoch` partitioned differently from step 8. This
+        // call reproduces that, and is the mutation for the boundary-tally
+        // fix — flip the third argument to `&consensus` and the drop
+        // disappears (the control at the end of this test does exactly that).
         let mut accepted = Vec::new();
-        let ev = votes_from_partition(epoch, &duty, &atts, &seed, &mut accepted);
+        let ev = votes_from_partition(epoch, &duty, &duty, &atts, &seed, &mut accepted);
         let survived = ev.attestations.len();
         println!(
             "ROSTER SPLIT: step 8 admitted {admitted} honest attestations; the boundary \
@@ -1367,17 +1379,33 @@ mod tests {
              split does not block finality and this finding is refuted"
         );
 
-        // The control: feed step 8's own roster to the boundary and the same
-        // votes justify immediately. The divergence is the roster, nothing else.
+        // THE CONTROL, which is also the FIX (cde4c51d). Membership from the
+        // leaked roster — the one step 8 admitted against — and weight from
+        // the unleaked `active_set`, so `process_epoch` subtracts the leak
+        // exactly once rather than twice. Same votes, same seed, same
+        // everything else: they justify immediately.
         let mut accepted2 = Vec::new();
-        let ev2 = votes_from_partition(epoch, &consensus, &atts, &seed, &mut accepted2);
+        let ev2 = votes_from_partition(epoch, &duty, &consensus, &atts, &seed, &mut accepted2);
         assert_eq!(ev2.attestations.len(), admitted, "control: same roster keeps every vote");
         let mut st2 = FinalityState::new(genesis());
         let out2 = st2.process_epoch(&ev2).unwrap();
         assert_eq!(
             out2.justified,
             Some(Checkpoint { epoch, root: target }),
-            "control: with ONE roster on both sides the identical votes justify"
+            "control: with membership taken from the roster that admitted the votes, the \
+             identical votes justify"
+        );
+        // And the weight must be the UNLEAKED stake minus the leak once, not
+        // twice: `active_set` is `duty`, so validator 7 is worth 0 (its whole
+        // stake has leaked) and every other validator is worth its full
+        // STAKE_EACH. Passing `&consensus` as `active_set` too would look
+        // identical here — validator 7 saturates at 0 either way — and would
+        // silently halve every PARTIALLY leaked validator on a real fleet.
+        assert_eq!(
+            ev2.active_set.iter().filter(|v| v.effective_stake == STAKE_EACH).count(),
+            64,
+            "the boundary must weigh the UNLEAKED roster; process_epoch subtracts the leak \
+             itself, and feeding it a pre-leaked roster charges partial leaks twice"
         );
         println!(
             "CONTROL: the identical votes, tallied against the roster that admitted them, \
@@ -1481,11 +1509,12 @@ mod tests {
 pub fn votes_from_partition<'a>(
     epoch: u64,
     active_set: &'a [Validator],
+    partition_set: &[Validator],
     attestations: &'a [(u32, AttestationData)],
     beacon_mix: &[u8; 32],
     accepted: &'a mut Vec<(u32, AttestationData)>,
 ) -> EpochVotes<'a> {
-    let committees = crate::committees::epoch_committees(beacon_mix, epoch, active_set);
+    let committees = crate::committees::epoch_committees(beacon_mix, epoch, partition_set);
     let slots_per_epoch = crate::params::SLOTS_PER_EPOCH;
 
     accepted.clear();

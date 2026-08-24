@@ -36,6 +36,9 @@
 >
 > **Atualizacao 2026-08-11 (A6), F6–F8:**
 >
+> - **F6 — o registro abaixo esteve FALSO de 2026-08-11 a 2026-08-24.**
+>   Ver a correcao ao final desta entrada antes de confiar nela.
+>
 > - **F6 — CORRIGIDO.** Look-ahead do seed implementado em `committees.rs`
 >   (`MIN_SEED_LOOKAHEAD_EPOCHS = 1`, `seed_epoch`/`seed_mix`/
 >   `seeded_epoch_committees`): a epoca N e semeada pelo mix fixado no
@@ -43,6 +46,38 @@
 >   slots — consegue re-sortear a particao de N. O teste
 >   `withholding_in_the_tail_of_an_epoch_cannot_resort_the_next_epochs_partition`
 >   fixa a propriedade e tambem o residuo honesto: o vies de um bit por slot
+>
+> **CORRECAO 2026-08-24 (forca-tarefa da particao).** A entrada F6 acima
+> descreve codigo que existia e nao era CHAMADO. `MIN_SEED_LOOKAHEAD_EPOCHS`,
+> `seed_epoch` e `seed_mix` estavam em `committees.rs`, documentados e com a
+> retencao de boundary mixes dimensionada para eles (`RANDAO_BOUNDARIES_RETAINED
+> = 2`) — mas os DOIS leitores de producao liam `E-1`, nao `E-2`:
+> `CommittedState::seed_for_epoch` lia `boundary_mixes[epoch - 1]` e
+> `Engine::seed_for` lia `randao_mix_at(epoch - 1)`. A constante era exercitada
+> apenas por um teste que afirmava `MIN_SEED_LOOKAHEAD_EPOCHS == 1`, isto e, que
+> um literal e igual a si mesmo. **O binario implantado nunca teve o look-ahead,
+> e portanto nunca teve a mitigacao de F6, durante os 13 dias em que este
+> documento afirmou o contrario.**
+>
+> O custo nao foi so o F6 nao mitigado. Com look-ahead ZERO, a semente da epoca
+> `E` depende do mix fechado em `E-1`, que cada no ROLA A PARTIR DA PROPRIA
+> CABECA (`close_epoch` grava `boundary_mixes[closing] = randao_mix`). Dois nos
+> em cabecas diferentes fabricam mixes diferentes para a MESMA epoca e
+> particionam o mesmo roster de forma diferente — sem fork nenhum, bastando
+> estar atrasado. Medido em laboratorio: dois nos na MESMA cadeia, um deles um
+> prefixo estrito do outro, divergiram em 6 de 32 slots com 12 de 14 membros
+> trocados.
+>
+> **Estado a partir de 2026-08-24:** o look-ahead esta de fato ligado. Os dois
+> leitores passam por `committees::seed_epoch` (`transition.rs` seed_for_epoch)
+> e por `MIN_SEED_LOOKAHEAD_EPOCHS` (`engine.rs` seed_for_attestation), e a
+> semente do julgamento de atestacao vem da ANCESTRALIDADE do atestador
+> (`ancestral_boundary_mix`), nao da cabeca local. F6 so pode ser lido como
+> mitigado a partir do binario que carregar essas mudancas.
+>
+> **Licao de processo:** este documento registrou como CORRIGIDO uma mitigacao
+> que nenhum caminho de producao invocava. Uma entrada de modelo de ameacas so
+> vale se apontar para o CHAMADOR, nao para a definicao.
 >   retido nao some, e deslocado uma epoca para frente (mesmo residuo que o
 >   Ethereum aceita).
 > - **F7 — SUPERFICIE ACEITA, quantificada.** Ver

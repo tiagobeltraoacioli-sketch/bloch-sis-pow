@@ -367,13 +367,14 @@ impl Generator {
         st
     }
 
-    /// `Engine::seed_for`, reproduced.
+    /// `Engine::seed_for`, which is itself `CommittedState::seed_for_epoch`.
+    ///
+    /// This used to open-code `randao_mix_at(epoch - 1)`. That was a THIRD
+    /// copy of the seed rule, and it silently kept running at look-ahead zero
+    /// after the other two were fixed — so the benchmark would have measured
+    /// a chain the node does not produce.
     fn seed_for(rolled: &CommittedState, epoch: u64) -> [u8; 32] {
-        if epoch == 0 {
-            GENESIS_MIX
-        } else {
-            rolled.randao_mix_at(epoch - 1).unwrap_or(GENESIS_MIX)
-        }
+        rolled.seed_for_epoch(epoch)
     }
 
     /// `Engine::checkpoint_root`, reproduced.

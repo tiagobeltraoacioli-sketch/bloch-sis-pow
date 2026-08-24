@@ -1243,9 +1243,24 @@ fn close_of_epoch(mix: [u8; 32], epoch: u64, withheld_tail: u64) -> [u8; 32] {
     m
 }
 
+/// The library's own arithmetic. **This file cannot tell you the rule is
+/// WIRED** — it links the crate and calls the pure functions, and every
+/// assertion here passed for the whole period during which both production
+/// readers (`transition.rs::seed_for_epoch`, the node's `Engine::seed_for`)
+/// open-coded `epoch - 1` and never called `seed_epoch` at all.
+///
+/// The test that `seed_epoch` is exercised by the block path lives where the
+/// block path lives:
+/// `transition.rs::tests::production_reads_the_boundary_seed_epoch_names_and_not_the_later_one`,
+/// and the anti-partition property it buys is
+/// `transition.rs::tests::a_fork_born_inside_the_previous_epoch_cannot_move_this_epochs_partition`.
 #[test]
 fn seed_epoch_arithmetic_and_missing_history() {
     // The constant is consensus: moving it re-times every duty on the chain.
+    //
+    // NOTE this line asserts a constant equals its own literal, which proves
+    // only that nobody edited it — not that anything reads it. Kept as a
+    // change-detector (it is a flag-day-grade value), not as evidence.
     assert_eq!(MIN_SEED_LOOKAHEAD_EPOCHS, 1);
     // Epochs with no usable boundary behind them fall back to the genesis mix.
     assert_eq!(seed_epoch(0), None);
@@ -1605,7 +1620,7 @@ fn out_of_slot_attestations_are_dropped_not_counted_absent() {
     let atts = vec![(v, base), (v, wrong)];
 
     let mut buf = Vec::new();
-    let out = votes_from_partition(epoch, &vs, &atts, &MIX, &mut buf);
+    let out = votes_from_partition(epoch, &vs, &vs, &atts, &MIX, &mut buf);
     assert_eq!(out.attestations.len(), 1, "voto de slot alheio foi aceito");
     assert_eq!(out.attestations[0].1.slot, base.slot);
     // E o denominador continua sendo o conjunto ativo INTEIRO.

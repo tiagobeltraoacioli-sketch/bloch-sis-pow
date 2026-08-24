@@ -693,13 +693,94 @@ impl Engine {
         st
     }
 
-    /// The sortition/partition seed for `epoch`, per the transition's own
-    /// rule: the boundary mix of `epoch - 1`, genesis mix for epoch 0.
+    /// The sortition/partition seed for `epoch` — **the transition's own
+    /// function**, not a copy of its expression.
+    ///
+    /// It used to be a re-derivation here:
+    /// `if epoch == 0 { GENESIS_MIX } else { rolled.randao_mix_at(epoch - 1)
+    /// .unwrap_or(GENESIS_MIX) }`. That is byte-for-byte what
+    /// [`CommittedState::seed_for_epoch`] evaluates — `randao_mix_at` is
+    /// `boundary_mixes.get`, and `Manifest::genesis_state` passes the very
+    /// `GENESIS_MIX` constant in as the state's `genesis_mix` — so this is a
+    /// refactor and not a change. It is worth making because the two are the
+    /// duty view and the consensus authority for the SAME quantity: a node
+    /// that proposes off one and is validated against the other produces
+    /// blocks its own transition rejects. The look-ahead lives in that one
+    /// function now, so a second copy here would have been a consensus rule
+    /// the node silently did not take.
+    ///
+    /// # The anchor, and when this is the right function to call
+    ///
+    /// `rolled` is this node's own head rolled forward. That is CORRECT for
+    /// the node's own duties — `propose` and `attest` build on the node's
+    /// head, so the head IS the parent the transition will evaluate against,
+    /// and producer and validator cannot disagree. It is WRONG for judging
+    /// somebody else's attestation, which belongs to whatever branch its
+    /// author was on. Use [`Self::seed_for_attestation`] there.
     fn seed_for(rolled: &CommittedState, epoch: u64) -> [u8; 32] {
-        if epoch == 0 {
-            GENESIS_MIX
-        } else {
-            rolled.randao_mix_at(epoch - 1).unwrap_or(GENESIS_MIX)
+        rolled.seed_for_epoch(epoch)
+    }
+
+    /// The committed mix at the close of epoch `epoch - 1`, read off the
+    /// ANCESTRY of `from` rather than off this node's head.
+    ///
+    /// Walks selected-parent from `from` to the last block strictly before
+    /// `first_slot_of_epoch(epoch)` and returns that block's
+    /// `header.randao_mix`. That field is consensus-checked (the transition
+    /// refuses a block whose mix is not `mix_in(parent_mix, reveal)`), and
+    /// `close_epoch` records `boundary_mixes[c] = randao_mix` at the instant
+    /// `c` closes — so the last block below `first_slot_of(c + 1)` carries
+    /// exactly the boundary mix of `c`. No state is cloned and `process_epoch`
+    /// is not run.
+    ///
+    /// `None` means "this node cannot see that far back on that branch" —
+    /// the block is missing. That is an UNJUDGEABLE input, never an invalid
+    /// one, and the caller must treat it as such.
+    fn ancestral_boundary_mix(&self, from: &[u8; 32], epoch: u64) -> Option<[u8; 32]> {
+        let first = first_slot_of_epoch(epoch)?;
+        let genesis = *self.chain[0].1.as_bytes();
+        let mut cur = *from;
+        // Bounded by the stored block count: every step moves strictly to a
+        // parent, and `blocks` is finite, so a cycle cannot spin forever.
+        for _ in 0..=self.blocks.len() {
+            if cur == genesis {
+                return Some(GENESIS_MIX);
+            }
+            let env = self.blocks.get(&cur)?;
+            if env.header.slot < first {
+                return Some(env.header.randao_mix);
+            }
+            cur = env.header.parent;
+        }
+        None
+    }
+
+    /// The sortition seed for an attestation, anchored to the ATTESTATION's
+    /// own branch instead of this node's head.
+    ///
+    /// `target_root` is, by this node's own checkpoint convention, the last
+    /// block strictly before the first slot of `epoch` on the attester's
+    /// branch. So the seed is the boundary mix of `epoch - 1 - L` read from
+    /// that block's ancestry, which is precisely what
+    /// [`CommittedState::seed_for_epoch`] would compute when the attestation's
+    /// slot is validated inside a block on that branch.
+    ///
+    /// This is the fix for the 2026-08-24 `NotInCommittee` flood. The old code
+    /// judged every arriving attestation against a committee derived from how
+    /// much of the chain THIS node had downloaded, so an honest vote from a
+    /// validator that really was in the committee was answered with a peer
+    /// penalty. Two nodes on the same branch now derive the same committee for
+    /// the same attestation no matter how far apart their heads are.
+    ///
+    /// `None` = unjudgeable from what this node holds. The caller must Ignore,
+    /// never Reject: `gossip.rs` justifies its `NotInCommittee` Reject with
+    /// "both ends compute membership from the same finalized state", and a
+    /// node that cannot reach the branch is not in a position to make that
+    /// claim about anybody.
+    fn seed_for_attestation(&self, target_root: &[u8; 32], epoch: u64) -> Option<[u8; 32]> {
+        match epoch.checked_sub(committees::MIN_SEED_LOOKAHEAD_EPOCHS) {
+            None => Some(GENESIS_MIX),
+            Some(src) => self.ancestral_boundary_mix(target_root, src),
         }
     }
 
@@ -1677,8 +1758,59 @@ impl Engine {
     fn judge(&self, pool: &mut AttestationPool, att: Attestation, epoch: u64) -> GossipDecision {
         let rolled = self.rolled_to(epoch);
         let roster = rolled.active_validators();
-        let seed = Self::seed_for(&rolled, epoch);
-        let committees_at = |slot: u64| committees::committee_for_slot(&seed, slot, &roster);
+        // THE SEED COMES FROM THE ATTESTATION'S BRANCH, not from this node's
+        // head. If we cannot reach that branch we cannot derive the committee,
+        // and an attestation we cannot judge is Ignored — never Rejected, and
+        // therefore never scored against the peer that relayed it. A syncing
+        // node used to Reject its way through every attestation on the network
+        // and graylist the very peers feeding it blocks.
+        //
+        // TWO different "no seed" cases, and collapsing them loses votes:
+        //
+        //   * the target block is one we simply have not received yet. That
+        //     is the ORDINARY epoch-boundary race the pool already handles by
+        //     PARKING the attestation (`gossip.rs` step 5) and replaying it
+        //     when the block lands. Ignoring it instead would silently drop
+        //     the first slots' votes of every epoch — the very fork-choice
+        //     weight this whole change exists to preserve. So we let the pool
+        //     reach step 5 and hold, with a membership lookup that admits
+        //     rather than rejects: we do not know the committee, and "do not
+        //     know" must not read as "not a member". The real committee check
+        //     runs on release, off the real seed.
+        //
+        //   * the target block IS known but its ancestry is not reachable
+        //     from what this node stores (a pruned or partially-synced view).
+        //     Nothing will arrive to unpark it, so parking would only burn one
+        //     of the 256 pending slots. Ignore, and score nobody.
+        //
+        // The cost of the first case is that a non-member can occupy a pending
+        // slot until its target arrives. The pool is hard-bounded at
+        // MAX_PENDING_ATTESTATIONS with FIFO eviction and per-peer token
+        // buckets upstream, so that is bounded churn, not unbounded memory —
+        // and it is a strictly better trade than dropping every boundary vote.
+        let known_root =
+            |root: &[u8; 32]| self.canonical.contains(root) || self.blocks.contains_key(root);
+        let seed = match self.seed_for_attestation(&att.data.target_root, epoch) {
+            Some(seed) => Some(seed),
+            None if !known_root(&att.data.target_root) => None,
+            None => {
+                return GossipDecision::Ignore(
+                    bloch_pos_committee::gossip::IgnoreReason::Unjudgeable,
+                )
+            }
+        };
+        let committees_at = |slot: u64| match seed {
+            Some(seed) => committees::committee_for_slot(&seed, slot, &roster),
+            // Unjudgeable-but-parkable: admit, so step 5 parks on the missing
+            // target instead of step 4 rejecting on a committee we cannot
+            // compute. Every index in the roster, ascending — `committee` is
+            // consumed by `binary_search`, so it must stay sorted.
+            None => {
+                let mut all: Vec<u32> = roster.iter().map(|v| v.index).collect();
+                all.sort_unstable();
+                all
+            }
+        };
         // "Do we have this block?" — canonical ids include genesis, which is
         // synthesized and never stored as an envelope; `blocks` holds every
         // structurally-valid block seen, canonical or not. A vote for a block
@@ -1735,7 +1867,24 @@ impl Engine {
             let rolled_epoch = epoch_of(self.wall_slot);
             let rolled = self.rolled_to(rolled_epoch);
             let roster = rolled.active_validators();
-            let seed = Self::seed_for(&rolled, rolled_epoch);
+            // Anchored to the BLOCK THAT JUST ARRIVED, not to this node's
+            // head. Everything released by this call was parked waiting for
+            // `root`, so `root` is on the released attestation's own branch
+            // (it is either its head or its target, and the target is an
+            // ancestor of the head), and the boundary mix read off `root`'s
+            // ancestry is the one that branch's transition will use.
+            //
+            // KNOWN GAP, deliberately not papered over: `on_block` re-runs
+            // the whole pipeline through ONE `CommitteeLookup` closure that
+            // sees only a slot, so a single seed serves every attestation
+            // released in this batch. That is right whenever they are on one
+            // branch, which is the case that actually occurs (they were all
+            // waiting on the same root); it is wrong if a future caller
+            // batches roots. Fixing it properly means letting the lookup see
+            // the attestation, which is a `gossip.rs` signature change.
+            let seed = self
+                .seed_for_attestation(&root, rolled_epoch)
+                .unwrap_or_else(|| rolled.seed_for_epoch(rolled_epoch));
             let committees_at = |slot: u64| committees::committee_for_slot(&seed, slot, &roster);
             let known = |r: &[u8; 32]| self.canonical.contains(r) || self.blocks.contains_key(r);
             pool.on_block(
@@ -5200,5 +5349,211 @@ mod head_root_tests {
             [0u8; 32],
             "the genesis answer must not be the default-initialised root"
         );
+    }
+}
+
+/// **The anchor defect, on one fixture.**
+///
+/// The consensus AUTHORITY for the seed is
+/// [`CommittedState::seed_for_epoch`], evaluated by `apply_block` on the state
+/// the block is applied against — its parent's, because step 2 refuses any
+/// other (`WrongParent`). That is ancestry, and two nodes applying the same
+/// block to the same parent cannot disagree about it.
+///
+/// The node's DUTY view evaluates the same function on `rolled_to(epoch)`,
+/// which is this node's OWN head rolled forward. When the head is not the
+/// judged block's parent — a node three blocks behind, a node whose head sits
+/// on a sibling branch — the duty view and the authority part company, and the
+/// node rejects honest votes as `NotInCommittee` while every rule it is
+/// applying is the right rule.
+///
+/// The fixture below moves ONLY the head, on ONE branch, with no fork and no
+/// disagreement about any block, and shows the seed and the partition move
+/// with it. That is the whole defect: the anchor, not the expression.
+///
+/// It needs no flag day to fix — the target value is the one consensus already
+/// defines — which is why it is deliberately NOT bundled with the look-ahead
+/// gate this branch also carries.
+#[cfg(test)]
+mod duty_view_anchor {
+    use super::*;
+    use crate::genesis::ManifestValidator;
+    use bloch_pos_committee::SLOTS_PER_EPOCH;
+    use bloch_pos_committee::beacon::RandaoChain;
+
+    const SAT_PER_BLOCH: u128 = 100_000_000;
+
+    struct Dir(PathBuf);
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A devnet engine whose REGISTRY holds `n` validators while this node
+    /// holds the key for index 0 only.
+    ///
+    /// `perf_support::proposing_engine` registers one validator, and one
+    /// validator is not enough for this test: `epoch_committees` partitions
+    /// the roster, and the only permutation of a one-element roster is the
+    /// identity, so its partition is the same for every seed. The first
+    /// version of this test asserted the partition moved, and its own fixture
+    /// guard failed — which is the guard doing its job rather than a
+    /// comparator that quietly proves nothing.
+    ///
+    /// The other `n - 1` validators never sign: they exist to give the
+    /// partition something to permute. Production is therefore sparse — node 0
+    /// proposes only in the slots it is drawn for — which is what a real
+    /// validator's view looks like anyway.
+    fn engine_with_registry(n: u32) -> (Engine, Dir) {
+        static DIR_SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = Dir(std::env::temp_dir().join(format!(
+            "bloch-anchor-{}-{}",
+            std::process::id(),
+            DIR_SEQ.fetch_add(1, Ordering::Relaxed)
+        )));
+        let _ = std::fs::remove_dir_all(&dir.0);
+        std::fs::create_dir_all(&dir.0).expect("create the test data dir");
+
+        let keys: Vec<Keystore> = (0..n)
+            .map(|i| {
+                Keystore::generate(&dir.0.join(format!("v{i}")), i)
+                    .expect("generate a devnet keystore")
+            })
+            .collect();
+        let manifest = Manifest {
+            genesis_time_ms: now_ms(),
+            slot_ms: 1_000,
+            validators: keys
+                .iter()
+                .map(|ks| ManifestValidator {
+                    index: ks.index,
+                    stake_sat: 200_000 * SAT_PER_BLOCH,
+                    randao_commitment: RandaoChain::generate(ks.randao_seed).commitment(),
+                    pubkey: ks.pubkey.clone(),
+                    withdrawal_credentials: Vec::new(),
+                    commission_bps: 0,
+                })
+                .collect(),
+            cohort: Vec::new(),
+            carryover: None,
+            allocations: Vec::new(),
+            carryover_entries: Vec::new(),
+        };
+        let genesis_id = manifest.genesis_id();
+        let state = manifest.genesis_state();
+        let store = Store::open(&dir.0, &[0u8; 32]).expect("open the test store");
+        let (events, _rx) = mpsc::channel::<EngineEvent>();
+        let head_slot = Arc::new(AtomicU64::new(0));
+        let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let net = net::Net::Devnet(
+            net::start(
+                "127.0.0.1",
+                0,
+                Vec::new(),
+                events,
+                dir.0.clone(),
+                head_slot.clone(),
+                inflight,
+            )
+            .expect("bind the devnet transport on an ephemeral port"),
+        );
+        let verifier = HybridVerifier::new(manifest.pubkeys());
+        let ks0 = Keystore::load(&dir.0.join("v0")).expect("re-load validator 0");
+        let engine = Engine {
+            manifest,
+            state: StateCell::new(state),
+            tr: Transition::new(verifier.clone()),
+            tr_probe: Transition::new(ProbeVerifier),
+            verifier,
+            keys: Some(ks0),
+            blocks: BTreeMap::new(),
+            chain: vec![(0, genesis_id)],
+            canonical: BTreeSet::from([*genesis_id.as_bytes()]),
+            recent_states: VecDeque::new(),
+            pool: BTreeMap::new(),
+            att_pool: AttestationPool::new(),
+            wall_slot: 0,
+            mempool: BTreeMap::new(),
+            store,
+            net,
+            head_slot,
+            live: true,
+            needs_sync: false,
+            last_applied_ms: now_ms(),
+            booted_ms: now_ms(),
+            ws_anchor: None,
+            ws_anchor_hard: false,
+            ws_conflict_reported: false,
+            fc_covered_removals: 0,
+        };
+        (engine, dir)
+    }
+
+    #[test]
+    fn giving_three_blocks_back_moves_the_duty_view_seed_and_the_partition() {
+        let (mut engine, _dir) = engine_with_registry(8);
+        // Sparse production: this node proposes only in the slots it is drawn
+        // for, so the loop runs until the HEAD is in epoch 2 rather than for a
+        // fixed block count.
+        for slot in 1..=(SLOTS_PER_EPOCH * 3) {
+            engine.propose(slot);
+        }
+        let head_epoch = epoch_of(engine.state.slot());
+        assert!(
+            head_epoch >= 2,
+            "the head only reached epoch {head_epoch}; the fixture needs epoch 2"
+        );
+        assert!(
+            engine.chain.len() >= 5,
+            "only {} blocks were produced — too few to give three back",
+            engine.chain.len() - 1
+        );
+
+        let e = head_epoch + 1;
+        let rolled = engine.rolled_to(e);
+        let seed_caught_up = Engine::seed_for(&rolled, e);
+        let partition_caught_up =
+            committees::epoch_committees(&seed_caught_up, e, &rolled.active_validators());
+
+        // Give three blocks back. Same branch, same rules, same everything —
+        // three blocks less of it. This is what "a node that is behind" is.
+        let ancestor = *engine.chain[engine.chain.len() - 4].1.as_bytes();
+        let before = engine.chain.len();
+        assert!(
+            engine.do_reorg(ancestor, Vec::new()),
+            "handing three blocks back on the node's own branch must succeed"
+        );
+        assert_eq!(engine.chain.len(), before - 3);
+
+        let rolled_behind = engine.rolled_to(e);
+        let seed_behind = Engine::seed_for(&rolled_behind, e);
+        let partition_behind =
+            committees::epoch_committees(&seed_behind, e, &rolled_behind.active_validators());
+
+        assert_ne!(
+            seed_caught_up, seed_behind,
+            "THE DEFECT: the duty-view seed for epoch {e} changed because this node's HEAD \
+             moved, on a branch nobody disputes"
+        );
+        assert_ne!(
+            partition_caught_up, partition_behind,
+            "the seed moved but the partition did not — widen the fixture, because as \
+             written this test would not notice the bug it exists to show"
+        );
+
+        // The number that matters for the flood: how many of the epoch's 32
+        // committees changed membership because this node's head moved.
+        let moved = partition_caught_up
+            .iter()
+            .zip(partition_behind.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+        println!(
+            "duty-view anchor: giving 3 blocks back changed {moved} of {} slot committees \
+             in epoch {e}, on one undisputed branch",
+            partition_caught_up.len()
+        );
+        assert!(moved > 0);
     }
 }
