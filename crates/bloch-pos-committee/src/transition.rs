@@ -6401,18 +6401,18 @@ mod tests {
 
     /// The shipped default has to stay inert.
     ///
-    /// Lowering this constant changes proposer selection and committee
-    /// membership on the next epoch, so a node still on the old value computes
-    /// a different schedule and forks. This test is a tripwire, not a property:
-    /// it is meant to fail the moment someone sets a real epoch, so that the
-    /// change is made together with a coordinated rebuild rather than shipped
-    /// quietly inside an unrelated release.
+    /// Until the constant was armed this test pinned `u64::MAX` (inert).
+    /// Arming flips its job, not its nature: it is still a tripwire — now
+    /// against a SECOND silent change of the epoch, which would be a new flag
+    /// day needing its own fleet rollout, announcement and runbook. The value
+    /// here must equal the one recorded in `docs/LEAKED-ROSTER-FLAG-DAY.md`
+    /// and in the release notes of the armed build.
     #[test]
-    fn leaked_roster_ships_inert() {
+    fn leaked_roster_armed_epoch_matches_the_runbook() {
         assert_eq!(
             crate::params::LEAKED_ROSTER_ACTIVATION_EPOCH,
-            u64::MAX,
-            "binding the leaked roster is a flag day: set the epoch and roll the fleet together"
+            1400,
+            "the armed epoch must match docs/LEAKED-ROSTER-FLAG-DAY.md; changing it again is a new flag day"
         );
     }
 

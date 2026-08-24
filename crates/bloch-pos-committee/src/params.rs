@@ -103,7 +103,18 @@ pub const INACTIVITY_LEAK_QUOTIENT: u128 = 64;
 /// binds, so a node still on the old value computes a different schedule and
 /// forks. Set it far enough ahead that every validator is rebuilt first, and
 /// treat "the fleet is on the new binary" as a precondition, not a hope.
-pub const LEAKED_ROSTER_ACTIVATION_EPOCH: u64 = u64::MAX;
+///
+/// The choice procedure, the fleet-rollout order, the readiness predicate and
+/// the post-activation observables live in `docs/LEAKED-ROSTER-FLAG-DAY.md`.
+/// The armed value below was produced by that runbook; the tripwire test in
+/// `transition.rs` pins it, so it cannot drift without failing the suite.
+///
+/// ARMED 2026-08-24 at epoch 1400 — 2026-08-29 10:51:19 UTC. Rehearsed first on
+/// a two-node devnet WITH the control the repo's testing rule requires: the
+/// armed and inert halves produced an identical 143 blocks before the
+/// boundary, neither forked, and only the armed half's slot occupancy moved
+/// after it (68.1% -> 72.8%).
+pub const LEAKED_ROSTER_ACTIVATION_EPOCH: u64 = 1400;
 
 /// Flag-day epoch at which the deduplicated transfer format (`TransferV2`,
 /// wire tag `0x06`) becomes acceptable in blocks.
