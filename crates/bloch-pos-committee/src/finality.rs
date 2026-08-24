@@ -1308,6 +1308,11 @@ mod tests {
     /// `committees::tests::rehearsal_restoring_the_filter_reopens_the_roster_split`.
     #[test]
     fn a_single_fully_leaked_validator_makes_the_two_rosters_partition_differently() {
+        // This test holds a roster with a zero-stake member, so it must also be
+        // excluded from `params::rehearsal::RESTORE_ZERO_STAKE_FILTER` — the
+        // mutation switch that puts the defect back. Taken before the local
+        // HOOK, and never the other way round, so the two locks cannot cycle.
+        let _r = crate::params::rehearsal::HOOK.lock().unwrap_or_else(|e| e.into_inner());
         let _g = HOOK.lock().unwrap_or_else(|e| e.into_inner());
         // 64 validators. Task 2 shows every absent validator on a chain with
         // 49+ epochs of non-finality is at EXACTLY zero, so one is generous.
