@@ -240,6 +240,17 @@ pub mod rehearsal {
     use std::sync::atomic::AtomicBool;
     pub static MUTATE_SEED: AtomicBool = AtomicBool::new(false);
 
+    /// Restores the pre-2026-08-24 `effective_stake > 0` filter that ran
+    /// *before* the Fisher-Yates shuffle in `committees::epoch_committees` —
+    /// i.e. puts the roster-split defect back, so the tests that pin the fix
+    /// can be shown to go red. Read only through
+    /// `committees::mutation_restores_zero_stake_filter`.
+    pub static RESTORE_ZERO_STAKE_FILTER: AtomicBool = AtomicBool::new(false);
+
+    /// Serializes every test that flips a switch in this module. The switches
+    /// are process-global and `cargo test` runs test functions on threads, so
+    /// without this a mutation test would silently corrupt an unrelated one.
+    pub static HOOK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }
 
 /// Domain separation tags (§6.1). Fixed 16 bytes, right-padded with zeros, so
