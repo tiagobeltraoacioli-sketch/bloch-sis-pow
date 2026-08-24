@@ -5249,21 +5249,140 @@ mod head_root_tests {
 #[cfg(test)]
 mod duty_view_anchor {
     use super::*;
+    use crate::genesis::ManifestValidator;
+    use bloch_pos_committee::SLOTS_PER_EPOCH;
+    use bloch_pos_committee::beacon::RandaoChain;
+
+    const SAT_PER_BLOCH: u128 = 100_000_000;
+
+    struct Dir(PathBuf);
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A devnet engine whose REGISTRY holds `n` validators while this node
+    /// holds the key for index 0 only.
+    ///
+    /// `perf_support::proposing_engine` registers one validator, and one
+    /// validator is not enough for this test: `epoch_committees` partitions
+    /// the roster, and the only permutation of a one-element roster is the
+    /// identity, so its partition is the same for every seed. The first
+    /// version of this test asserted the partition moved, and its own fixture
+    /// guard failed — which is the guard doing its job rather than a
+    /// comparator that quietly proves nothing.
+    ///
+    /// The other `n - 1` validators never sign: they exist to give the
+    /// partition something to permute. Production is therefore sparse — node 0
+    /// proposes only in the slots it is drawn for — which is what a real
+    /// validator's view looks like anyway.
+    fn engine_with_registry(n: u32) -> (Engine, Dir) {
+        static DIR_SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = Dir(std::env::temp_dir().join(format!(
+            "bloch-anchor-{}-{}",
+            std::process::id(),
+            DIR_SEQ.fetch_add(1, Ordering::Relaxed)
+        )));
+        let _ = std::fs::remove_dir_all(&dir.0);
+        std::fs::create_dir_all(&dir.0).expect("create the test data dir");
+
+        let keys: Vec<Keystore> = (0..n)
+            .map(|i| {
+                Keystore::generate(&dir.0.join(format!("v{i}")), i)
+                    .expect("generate a devnet keystore")
+            })
+            .collect();
+        let manifest = Manifest {
+            genesis_time_ms: now_ms(),
+            slot_ms: 1_000,
+            validators: keys
+                .iter()
+                .map(|ks| ManifestValidator {
+                    index: ks.index,
+                    stake_sat: 200_000 * SAT_PER_BLOCH,
+                    randao_commitment: RandaoChain::generate(ks.randao_seed).commitment(),
+                    pubkey: ks.pubkey.clone(),
+                    withdrawal_credentials: Vec::new(),
+                    commission_bps: 0,
+                })
+                .collect(),
+            cohort: Vec::new(),
+            carryover: None,
+            allocations: Vec::new(),
+            carryover_entries: Vec::new(),
+        };
+        let genesis_id = manifest.genesis_id();
+        let state = manifest.genesis_state();
+        let store = Store::open(&dir.0, &[0u8; 32]).expect("open the test store");
+        let (events, _rx) = mpsc::channel::<EngineEvent>();
+        let head_slot = Arc::new(AtomicU64::new(0));
+        let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let net = net::Net::Devnet(
+            net::start(
+                "127.0.0.1",
+                0,
+                Vec::new(),
+                events,
+                dir.0.clone(),
+                head_slot.clone(),
+                inflight,
+            )
+            .expect("bind the devnet transport on an ephemeral port"),
+        );
+        let verifier = HybridVerifier::new(manifest.pubkeys());
+        let ks0 = Keystore::load(&dir.0.join("v0")).expect("re-load validator 0");
+        let engine = Engine {
+            manifest,
+            state: StateCell::new(state),
+            tr: Transition::new(verifier.clone()),
+            tr_probe: Transition::new(ProbeVerifier),
+            verifier,
+            keys: Some(ks0),
+            blocks: BTreeMap::new(),
+            chain: vec![(0, genesis_id)],
+            canonical: BTreeSet::from([*genesis_id.as_bytes()]),
+            recent_states: VecDeque::new(),
+            pool: BTreeMap::new(),
+            att_pool: AttestationPool::new(),
+            wall_slot: 0,
+            mempool: BTreeMap::new(),
+            store,
+            net,
+            head_slot,
+            live: true,
+            needs_sync: false,
+            last_applied_ms: now_ms(),
+            booted_ms: now_ms(),
+            ws_anchor: None,
+            ws_anchor_hard: false,
+            ws_conflict_reported: false,
+            fc_covered_removals: 0,
+        };
+        (engine, dir)
+    }
 
     #[test]
     fn giving_three_blocks_back_moves_the_duty_view_seed_and_the_partition() {
-        let (mut engine, _dir) = perf_support::proposing_engine();
-        for slot in 1..=70u64 {
+        let (mut engine, _dir) = engine_with_registry(8);
+        // Sparse production: this node proposes only in the slots it is drawn
+        // for, so the loop runs until the HEAD is in epoch 2 rather than for a
+        // fixed block count.
+        for slot in 1..=(SLOTS_PER_EPOCH * 3) {
             engine.propose(slot);
         }
-        assert_eq!(
-            engine.chain.len(),
-            71,
-            "the fixture needs a dense chain into epoch 2"
+        let head_epoch = epoch_of(engine.state.slot());
+        assert!(
+            head_epoch >= 2,
+            "the head only reached epoch {head_epoch}; the fixture needs epoch 2"
+        );
+        assert!(
+            engine.chain.len() >= 5,
+            "only {} blocks were produced — too few to give three back",
+            engine.chain.len() - 1
         );
 
-        let e = epoch_of(engine.state.slot()) + 1;
-        assert_eq!(e, 3, "the head must be in epoch 2 so the next epoch is 3");
+        let e = head_epoch + 1;
         let rolled = engine.rolled_to(e);
         let seed_caught_up = Engine::seed_for(&rolled, e);
         let partition_caught_up =
@@ -5272,11 +5391,12 @@ mod duty_view_anchor {
         // Give three blocks back. Same branch, same rules, same everything —
         // three blocks less of it. This is what "a node that is behind" is.
         let ancestor = *engine.chain[engine.chain.len() - 4].1.as_bytes();
+        let before = engine.chain.len();
         assert!(
             engine.do_reorg(ancestor, Vec::new()),
             "handing three blocks back on the node's own branch must succeed"
         );
-        assert_eq!(engine.chain.len(), 68);
+        assert_eq!(engine.chain.len(), before - 3);
 
         let rolled_behind = engine.rolled_to(e);
         let seed_behind = Engine::seed_for(&rolled_behind, e);
@@ -5293,5 +5413,19 @@ mod duty_view_anchor {
             "the seed moved but the partition did not — widen the fixture, because as \
              written this test would not notice the bug it exists to show"
         );
+
+        // The number that matters for the flood: how many of the epoch's 32
+        // committees changed membership because this node's head moved.
+        let moved = partition_caught_up
+            .iter()
+            .zip(partition_behind.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+        println!(
+            "duty-view anchor: giving 3 blocks back changed {moved} of {} slot committees \
+             in epoch {e}, on one undisputed branch",
+            partition_caught_up.len()
+        );
+        assert!(moved > 0);
     }
 }
