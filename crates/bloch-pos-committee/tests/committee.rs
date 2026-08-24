@@ -1620,7 +1620,7 @@ fn out_of_slot_attestations_are_dropped_not_counted_absent() {
     let atts = vec![(v, base), (v, wrong)];
 
     let mut buf = Vec::new();
-    let out = votes_from_partition(epoch, &vs, &atts, &MIX, &mut buf);
+    let out = votes_from_partition(epoch, &vs, &vs, &atts, &MIX, &mut buf);
     assert_eq!(out.attestations.len(), 1, "voto de slot alheio foi aceito");
     assert_eq!(out.attestations[0].1.slot, base.slot);
     // E o denominador continua sendo o conjunto ativo INTEIRO.
