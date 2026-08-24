@@ -151,3 +151,55 @@ untouched today — rewriting the fork-choice stake table is a far deeper change
 roster split never operates there. A green n=8 run is NOT evidence for the
 roster unification. The only proof of section 1 that exists is the in-process
 test with its mutation switch.
+
+## 6. The acceptance criterion as first written is unsatisfiable
+
+The proposed criterion was "the divided n=8 arm must come back CONVERGED". It
+cannot, and not because anything is broken.
+
+`MIN_QUORUM_DENOMINATOR` is 1/2 of unleaked active stake, and the constant's own
+documentation gives the consequence: the condition for `p < 1/2` is `3p >= 1`,
+i.e. **`p >= 1/3`**. A set holding at least a third of the original stake still
+justifies on its own. That is the designed behaviour and the residual the
+founder accepted when he chose 1/2 over 3/4 (bounding divergence to at most
+three disjoint one-third sets, rather than making the justified root unique).
+
+The divided arm was 4 against 4. Each half holds 50%, and 50% >= 33.3%, so each
+half justifies its own root — with the corrected binary, with the broken one,
+with any binary. And since the floor is prophylactic rather than curative, once
+justified each half stays anchored there. Reading that DIVERGED as "the weight
+fix failed" would be a wrong conclusion drawn from an experiment that has only
+one possible outcome.
+
+The criterion that does discriminate: the minority must be **below 1/3**. In
+n=8 the first split the floor actually blocks is **6 against 2** (25%), and the
+test is that the pair fails to justify its own root and is reabsorbed. The 4/4
+arm still has a use, but its question is "do both halves weigh with the same
+ruler", not "do they converge".
+
+## 7. Where the un-gated seed change came from
+
+The removal of the `seed_for_epoch` flag day was an instruction from the
+integration coordinator, on the premise that a coordinated stop makes a flag
+day unnecessary. **The premise was wrong**: boot replay re-validates the state
+root, so a new fold rule does not match the historical log. If the relaunch
+preserves history, that gate has to come back. The origin of the fault is that
+instruction, not the developer who carried it out.
+
+The coordinator's recommendation to the founder is to preserve history and gate
+both rules, on an argument worth recording because it is the strongest one:
+the chain is split across 12 branches, so a new genesis forces a choice of
+which branch's balances become the opening balances — a permanent and
+unauditable choice — whereas preserving history keeps it reversible.
+
+## 8. Open, not closed
+
+- Severity of the mid-epoch slashing divergence: NOT assessed. The dev who
+  found it stalled before answering.
+- Formal coverage statement for the item-1 tests: NOT obtained, same reason.
+- Fork-choice weight fix: design confirmed (snapshot the ROSTER per checkpoint,
+  not the CommittedState — `lmd_ghost_head` already takes `&[Validator]`, so
+  there is no replay and the 22.2x stands), but NOT written. It changes which
+  head an honest node picks and needs the founder's explicit go.
+- `b96a633e`'s justified-latch comment is on `pmo10/particao-repro`, not on this
+  branch. Left as a noted debt.
