@@ -1516,6 +1516,15 @@ impl CommittedState {
     /// partition asks for `closing + 1` after it, when `{closing − 1,
     /// closing}` is.
     pub fn seed_for_epoch(&self, epoch: u64) -> [u8; 32] {
+        // In a shipped binary this is exactly
+        // `1 + committees::MIN_SEED_LOOKAHEAD_EPOCHS`. In a test build it is
+        // the same value unless a test has reverted the look-ahead on this
+        // thread (`params::rehearsal::with_lookahead_zero`), which is how the
+        // anti-partition tests are shown to go red against the pre-fix rule
+        // without editing a line of source.
+        #[cfg(test)]
+        let back = 1 + crate::params::rehearsal::effective_lookahead();
+        #[cfg(not(test))]
         let back = 1 + crate::committees::MIN_SEED_LOOKAHEAD_EPOCHS;
         let Some(src) = epoch.checked_sub(back) else {
             return Self::rehearsal_mutate(self.genesis_mix);
@@ -7839,6 +7848,818 @@ mod tests {
             g.clone().apply_transfer_v2(&permuted, price, &ToyVerifier),
             Err(TransferReject::WitnessTableNotCanonical),
         );
+    }
+
+    // ── The seed: what the look-ahead buys, and what the ANCHOR buys ────────
+    //
+    // Two different fixes live in this tree and they are not the same fix.
+    //
+    // * The F6 LOOK-AHEAD moves which boundary the seed reads, from the close
+    //   of `E-1` to the close of `E-2`. It is a rule change, and the reader
+    //   is still anchored to the reading node's own head.
+    // * The ANCHOR (`Engine::seed_for_attestation`) changes where the seed is
+    //   read FROM: the attestation's own branch, walked back through
+    //   consensus-checked `header.randao_mix` fields, instead of this node's
+    //   head rolled speculatively forward.
+    //
+    // The look-ahead widens a window. The anchor removes the node's head from
+    // the derivation altogether. `lag_tolerance_measured_in_slots_and_epochs`
+    // prices the first; `the_anchor_never_disagrees_at_any_lag` prices the
+    // second. Everything here runs through the REAL readers on real states
+    // from the real transition — a library function nobody calls proves
+    // nothing about a live chain, which is how mainnet split with the F6
+    // property test already green.
+    mod seed_lookahead {
+        use super::*;
+        use crate::header::BlockHeaderV4 as Hdr;
+
+        /// A block at every slot from 1 to `slots`, minus `skipped`, with each
+        /// epoch's full attestation quorum carried by its last slot.
+        ///
+        /// The quorum is not decoration: without it nothing justifies, the
+        /// inactivity leak arms after a few epochs, and `consensus_roster_at`
+        /// starts moving stake. A roster that drifts would repartition the
+        /// committee for a reason that is not the seed, and every measurement
+        /// below would be reading the leak instead of the thing under test.
+        struct Chain {
+            /// Head state after each slot; `states[0]` is genesis. A skipped
+            /// slot repeats its predecessor, so the index is the slot number.
+            states: Vec<CommittedState>,
+            /// Every block header this chain produced, by block id — the
+            /// node's `blocks` map, which is what the anchor walks.
+            headers: BTreeMap<[u8; 32], Hdr>,
+            /// Block id produced at each slot, where one was.
+            root_at: BTreeMap<u64, [u8; 32]>,
+            genesis_root: [u8; 32],
+            genesis_mix: [u8; 32],
+        }
+
+        fn chain(n: u32, slots: u64, skipped: &[u64]) -> Chain {
+            let (t, g, mut chains) = setup(n);
+            let genesis_root = *g.head.as_bytes();
+            let genesis_mix = g.genesis_mix;
+            let mut states = Vec::with_capacity(slots as usize + 1);
+            let mut headers = BTreeMap::new();
+            let mut root_at = BTreeMap::new();
+            let mut st = g.clone();
+            states.push(g);
+            let mut epoch_first_root = [0u8; 32];
+            for slot in 1..=slots {
+                if skipped.contains(&slot) {
+                    states.push(st.clone());
+                    continue;
+                }
+                let epoch = crate::epoch_of(slot);
+                let last_of_epoch = slot % SLOTS_PER_EPOCH == SLOTS_PER_EPOCH - 1;
+                // Epoch 0 has no attestations to carry: source 0 is not < target 0.
+                let atts = if last_of_epoch && epoch >= 1 {
+                    full_epoch_attestations(&st, epoch_first_root)
+                } else {
+                    Vec::new()
+                };
+                let b = build_block(&t, &st, slot, &atts, &[], &mut chains);
+                st = t
+                    .apply_block(&st, &b, &atts, &[])
+                    .expect("the fixture's own block must transition");
+                let id = *st.head.as_bytes();
+                headers.insert(id, b.header);
+                root_at.insert(slot, id);
+                if slot % SLOTS_PER_EPOCH == 0 {
+                    epoch_first_root = id;
+                }
+                states.push(st.clone());
+            }
+            Chain { states, headers, root_at, genesis_root, genesis_mix }
+        }
+
+        impl Chain {
+            /// The blocks a node whose head is at `head_slot` holds. The
+            /// anchor reads this map and nothing else — which is the whole
+            /// point of it.
+            fn blocks_up_to(&self, head_slot: u64) -> BTreeMap<[u8; 32], Hdr> {
+                self.root_at
+                    .iter()
+                    .filter(|(s, _)| **s <= head_slot)
+                    .filter_map(|(_, id)| self.headers.get(id).map(|h| (*id, *h)))
+                    .collect()
+            }
+
+            /// The checkpoint root of `epoch`: the latest block strictly
+            /// BEFORE the epoch's first slot — the convention `target_root`
+            /// carries, and therefore what an attestation for `epoch` anchors
+            /// to.
+            fn checkpoint_root(&self, epoch: u64) -> [u8; 32] {
+                let first = epoch * SLOTS_PER_EPOCH;
+                self.root_at
+                    .range(..first)
+                    .next_back()
+                    .map(|(_, id)| *id)
+                    .unwrap_or(self.genesis_root)
+            }
+        }
+
+        /// `Engine::ancestral_boundary_mix`, reproduced against a plain header
+        /// map: walk selected-parent from `from` to the last block strictly
+        /// below the first slot of `epoch` and take its `randao_mix`.
+        ///
+        /// `None` = the branch is unreachable from what this node holds. The
+        /// node must Ignore, never Reject — a node that cannot reach the
+        /// branch is not in a position to claim anybody is out of committee.
+        fn ancestral_boundary_mix(
+            blocks: &BTreeMap<[u8; 32], Hdr>,
+            genesis_root: [u8; 32],
+            genesis_mix: [u8; 32],
+            from: &[u8; 32],
+            epoch: u64,
+        ) -> Option<[u8; 32]> {
+            let first = epoch * SLOTS_PER_EPOCH;
+            let mut cur = *from;
+            for _ in 0..=blocks.len() {
+                if cur == genesis_root {
+                    return Some(genesis_mix);
+                }
+                let h = blocks.get(&cur)?;
+                if h.slot < first {
+                    return Some(h.randao_mix);
+                }
+                cur = h.parent;
+            }
+            None
+        }
+
+        /// `Engine::seed_for_attestation`, reproduced.
+        fn seed_for_attestation(
+            c: &Chain,
+            blocks: &BTreeMap<[u8; 32], Hdr>,
+            target_root: &[u8; 32],
+            epoch: u64,
+        ) -> Option<[u8; 32]> {
+            match epoch.checked_sub(committees::MIN_SEED_LOOKAHEAD_EPOCHS) {
+                None => Some(c.genesis_mix),
+                Some(src) => {
+                    ancestral_boundary_mix(blocks, c.genesis_root, c.genesis_mix, target_root, src)
+                }
+            }
+        }
+
+        /// `Engine::rolled_to`, in this crate's terms: the head state rolled
+        /// forward through `process_epoch` until its open epoch is `epoch`.
+        /// Byte for byte the loop the node runs — `process_epoch` is
+        /// `close_epoch` and nothing else.
+        fn rolled_to(st: &CommittedState, epoch: u64) -> CommittedState {
+            let mut cur = st.clone();
+            while cur.epoch < epoch {
+                cur = cur.close_epoch();
+            }
+            cur
+        }
+
+        /// The seed an ALREADY-ROLLED state yields for `epoch` under an
+        /// arbitrary look-ahead. Look-ahead 1 is the shipped rule; 0 is the
+        /// pre-fix rule, kept so one run can price both without recompiling.
+        /// Pinned against the production reader in
+        /// `the_model_of_the_reader_matches_the_reader` — without that pin
+        /// every number this module prints is fiction.
+        fn seed_of_rolled(rolled: &CommittedState, epoch: u64, lookahead: u64) -> [u8; 32] {
+            match epoch.checked_sub(lookahead + 1) {
+                None => rolled.genesis_mix,
+                Some(e) => rolled.boundary_mixes.get(&e).copied().unwrap_or(rolled.genesis_mix),
+            }
+        }
+
+        fn seed_from_head(st: &CommittedState, epoch: u64, lookahead: u64) -> [u8; 32] {
+            seed_of_rolled(&rolled_to(st, epoch), epoch, lookahead)
+        }
+
+        fn committees_of(st: &CommittedState, epoch: u64, lookahead: u64) -> Vec<Vec<u32>> {
+            let rolled = rolled_to(st, epoch);
+            let roster = rolled.consensus_roster_at(epoch);
+            let seed = seed_of_rolled(&rolled, epoch, lookahead);
+            committees::epoch_committees(&seed, epoch, &roster)
+        }
+
+        fn hex8(b: &[u8; 32]) -> String {
+            b[..4].iter().map(|x| format!("{x:02x}")).collect()
+        }
+
+        // ── control: the model equals the shipped reader ────────────────────
+
+        #[test]
+        fn the_model_of_the_reader_matches_the_reader() {
+            let c = chain(8, 5 * SLOTS_PER_EPOCH + 3, &[]);
+            for target in 0..=6u64 {
+                for head in [0u64, 31, 64, 95, 128, 160, 163] {
+                    let st = &c.states[head as usize];
+                    if st.epoch > target {
+                        continue;
+                    }
+                    let rolled = rolled_to(st, target);
+                    assert_eq!(
+                        seed_of_rolled(&rolled, target, committees::MIN_SEED_LOOKAHEAD_EPOCHS),
+                        rolled.seed_for_epoch(target),
+                        "the module's model of seed_for_epoch has drifted from the reader \
+                         (target {target}, head slot {head})"
+                    );
+                }
+            }
+        }
+
+        // ── THE ANCHOR ─────────────────────────────────────────────────────
+
+        /// **The property that distinguishes the anchor from the look-ahead:
+        /// at NO lag does an anchored node derive a WRONG committee.** It
+        /// either derives the right one or reports the branch unreachable —
+        /// and unreachable means Ignore, never Reject.
+        ///
+        /// That is the whole disease. The old reader answered an honest vote
+        /// from a validator that really was in the committee with a peer
+        /// penalty, because it judged the vote against a committee derived
+        /// from how much of the chain the JUDGE had downloaded. A node cannot
+        /// be wrong about someone else's duty by being behind if its own head
+        /// is not an input.
+        ///
+        /// The control is the third column: the head-anchored rule must be
+        /// shown to actually DISAGREE at some lag, or the comparison is
+        /// vacuous and this test proves nothing about the anchor.
+        #[test]
+        fn the_anchor_never_disagrees_at_any_lag() {
+            const TARGET: u64 = 5;
+            let lead_slot = TARGET * SLOTS_PER_EPOCH + 3;
+            let c = chain(8, lead_slot, &[]);
+            let leader = &c.states[lead_slot as usize];
+            assert_eq!(leader.epoch, TARGET);
+
+            // What an attestation for epoch TARGET carries: the checkpoint
+            // root of TARGET, which is the last block below its first slot.
+            let target_root = c.checkpoint_root(TARGET);
+            assert_eq!(
+                c.root_at.get(&(TARGET * SLOTS_PER_EPOCH - 1)),
+                Some(&target_root),
+                "control: with a dense chain the checkpoint of TARGET is the last block of \
+                 TARGET-1"
+            );
+
+            // Truth: the seed the TRANSITION will use when that attestation is
+            // validated inside a block on this branch. The anchor and the
+            // head-anchored reader at the SHIPPED look-ahead are both measured
+            // against it.
+            let truth = leader.seed_for_epoch(TARGET);
+            // The pre-fix rule is measured against ITS OWN caught-up answer,
+            // not against `truth`. Measuring it against `truth` would answer
+            // "does look-ahead 0 differ from look-ahead 1", which is a
+            // question about the rule change and not about lag, and would mark
+            // a perfectly self-consistent base node WRONG at zero lag.
+            let truth0 = seed_from_head(leader, TARGET, 0);
+
+            eprintln!(
+                "\nANCHOR-LAG target epoch {TARGET}, leader head slot {lead_slot}, attestation \
+                 target_root {} (slot {})",
+                hex8(&target_root),
+                TARGET * SLOTS_PER_EPOCH - 1
+            );
+            eprintln!(
+                "  {:>9} {:>5} {:>4} | {:^12} | {:^12} | {:^12}",
+                "head slot", "epoch", "lag", "ANCHOR", "HEAD la=1", "HEAD la=0"
+            );
+            eprintln!(
+                "  (each column is compared against a CAUGHT-UP node running the same rule, so                  a WRONG is lag doing the damage and not the rule change.)"
+            );
+
+            let mut rows: Vec<u64> = vec![lead_slot];
+            for h in (0..=TARGET).rev() {
+                let last = h * SLOTS_PER_EPOCH + SLOTS_PER_EPOCH - 1;
+                if last <= lead_slot {
+                    rows.push(last);
+                }
+                rows.push(h * SLOTS_PER_EPOCH);
+            }
+            rows.sort_unstable();
+            rows.dedup();
+            rows.reverse();
+
+            let mut anchor_wrong = 0usize;
+            let mut anchor_unjudgeable = 0usize;
+            let mut head1_wrong = 0usize;
+            let mut head0_wrong = 0usize;
+            for &head in &rows {
+                let st = &c.states[head as usize];
+                let blocks = c.blocks_up_to(head);
+                let a = seed_for_attestation(&c, &blocks, &target_root, TARGET);
+                let h1 = seed_from_head(st, TARGET, 1);
+                let h0 = seed_from_head(st, TARGET, 0);
+                let a_verdict = match a {
+                    None => {
+                        anchor_unjudgeable += 1;
+                        "UNJUDGEABLE"
+                    }
+                    Some(s) if s == truth => "AGREE",
+                    Some(_) => {
+                        anchor_wrong += 1;
+                        "WRONG"
+                    }
+                };
+                if h1 != truth {
+                    head1_wrong += 1;
+                }
+                if h0 != truth0 {
+                    head0_wrong += 1;
+                }
+                eprintln!(
+                    "  {:>9} {:>5} {:>4} | {:^12} | {:^12} | {:^12}",
+                    head,
+                    st.epoch,
+                    TARGET as i64 - st.epoch as i64,
+                    a_verdict,
+                    if h1 == truth { "AGREE" } else { "WRONG" },
+                    if h0 == truth0 { "AGREE" } else { "WRONG" },
+                );
+            }
+            eprintln!(
+                "\nANCHOR-LAG SUMMARY over {} head positions: anchor WRONG {anchor_wrong}, \
+                 anchor UNJUDGEABLE {anchor_unjudgeable}; head-anchored WRONG {head1_wrong} at \
+                 look-ahead 1 and {head0_wrong} at look-ahead 0.\n\
+                 WRONG is a false NotInCommittee Reject and a peer penalty. UNJUDGEABLE is an \
+                 Ignore and costs the peer nothing.\n",
+                rows.len()
+            );
+
+            // THE PROPERTY.
+            assert_eq!(
+                anchor_wrong, 0,
+                "the anchor must never derive a committee that differs from the transition's; \
+                 {anchor_wrong} of {} head positions did",
+                rows.len()
+            );
+            // CONTROL — without a head-anchored failure somewhere, the
+            // property above is satisfied by a rule that does nothing.
+            assert!(
+                head1_wrong > 0,
+                "control: the head-anchored reader must be shown to actually get the committee \
+                 WRONG at some lag, or this test is not comparing anything"
+            );
+            assert!(
+                head0_wrong >= head1_wrong,
+                "control: the pre-fix look-ahead must be at least as wrong as the fixed one"
+            );
+        }
+
+        /// The seam the anchor lives or dies on, and which nothing else pins:
+        /// **the mix the anchor reads out of a block HEADER must be the mix
+        /// `close_epoch` writes into `boundary_mixes`.**
+        ///
+        /// `judge` (gossip admission) reads the first; step 8 of
+        /// `compute_post_state` (block inclusion) reads the second. If they
+        /// can differ, a node relays attestations it will then refuse to
+        /// build on, and the anchor has replaced one split with another.
+        ///
+        /// Checked on a chain with EMPTY EPOCHS in it, because that is where
+        /// the two definitions could come apart: the anchor walks to the last
+        /// block below the boundary, which for an empty epoch sits one or
+        /// more epochs further back, while `close_epoch` still writes an
+        /// entry for the empty epoch.
+        #[test]
+        fn the_anchors_header_mix_is_the_transitions_boundary_mix() {
+            // Epoch 3 (slots 96..=127) is left ENTIRELY empty.
+            let empty: Vec<u64> = (3 * SLOTS_PER_EPOCH..4 * SLOTS_PER_EPOCH).collect();
+            let last = 6 * SLOTS_PER_EPOCH;
+            let c = chain(8, last, &empty);
+            let head = &c.states[last as usize];
+            assert_eq!(head.epoch, 6);
+            assert!(
+                c.root_at.range(3 * SLOTS_PER_EPOCH..4 * SLOTS_PER_EPOCH).next().is_none(),
+                "control: epoch 3 must really be empty, or the hard case is untested"
+            );
+
+            let blocks = c.blocks_up_to(last);
+            for epoch in 2..=6u64 {
+                let target_root = c.checkpoint_root(epoch);
+                let anchored = seed_for_attestation(&c, &blocks, &target_root, epoch)
+                    .expect("the whole chain is held, so nothing is unjudgeable");
+                // The transition's own answer, from a state on that branch
+                // whose open epoch is `epoch`.
+                let on_branch = rolled_to(&c.states[(epoch * SLOTS_PER_EPOCH) as usize], epoch);
+                let transitional = on_branch.seed_for_epoch(epoch);
+                eprintln!(
+                    "ANCHOR-SEAM epoch {epoch}: anchor {} vs transition {}",
+                    hex8(&anchored),
+                    hex8(&transitional)
+                );
+                assert_eq!(
+                    anchored, transitional,
+                    "epoch {epoch}: the gossip judge and the block-inclusion check must derive \
+                     the SAME seed, or a node relays what it will then refuse to build on"
+                );
+            }
+        }
+
+        // ── What the LOOK-AHEAD buys, measured rather than estimated ────────
+
+        /// `rolled_to(T)` closes every epoch from the node's own open epoch to
+        /// `T-1`, and each `close_epoch` writes
+        /// `boundary_mixes[closing] = st.randao_mix` — the mix frozen at that
+        /// node's head. So a rolled entry for epoch `e` is the TRUE close of
+        /// `e` if and only if the node holds every block of `e`. Let `C` be
+        /// the last epoch the node holds COMPLETE. The seed for `T` reads the
+        /// boundary at `T - 1 - lookahead`, so a head-anchored node agrees
+        /// with a caught-up one iff
+        ///
+        ///     T - 1 - lookahead <= C
+        ///
+        /// One epoch of block history per unit of look-ahead, and nothing
+        /// else. The test prints the boundary rather than asserting a guess.
+        #[test]
+        fn lag_tolerance_measured_in_slots_and_epochs() {
+            const TARGET: u64 = 5;
+            let lead_slot = TARGET * SLOTS_PER_EPOCH + 3;
+            let c = chain(8, lead_slot, &[]);
+            let states = &c.states;
+            let leader = &states[lead_slot as usize];
+            assert_eq!(leader.epoch, TARGET, "the leader must be inside the target epoch");
+
+            // ── The SECOND fabrication channel, measured before anything else
+            //
+            // `rolled_to` does not only fabricate boundary mixes. Every
+            // `close_epoch` it runs also PAYS REWARDS, so a node rolling from
+            // an old head invents stake the chain never issued and its
+            // `consensus_roster_at` differs from a caught-up node's by more
+            // than the seed. Neither the look-ahead NOR the anchor closes
+            // this: `judge` still takes its roster from `rolled_to`.
+            let lead_roster = rolled_to(leader, TARGET).consensus_roster_at(TARGET);
+            let stale_roster = rolled_to(&states[0], TARGET).consensus_roster_at(TARGET);
+            eprintln!(
+                "\nROSTER-CHANNEL: rolling from genesis vs from the leader's head gives {} \
+                 rosters for epoch {TARGET} (leader stake {:?}, rolled-from-genesis stake \
+                 {:?}). Uniform genesis stakes hide the consequence; a live roster does not. \
+                 This channel is NOT what the seed fix closes.",
+                if lead_roster != stale_roster { "DIFFERENT" } else { "identical" },
+                lead_roster.first().map(|v| v.effective_stake),
+                stale_roster.first().map(|v| v.effective_stake),
+            );
+            assert_ne!(
+                lead_roster, stale_roster,
+                "if the roster no longer drifts under rolling, the warning above is stale — \
+                 check whether close_epoch still pays rewards"
+            );
+
+            eprintln!(
+                "\nSEED-LAG target epoch {TARGET}, leader head slot {lead_slot}. `own` = each \
+                 node's own rolled roster (what it really judges with); `shared` = the leader's \
+                 roster, which isolates the seed."
+            );
+            eprintln!(
+                "  {:>9} {:>5} {:>4} | {:^34} | {:^34}",
+                "head slot", "epoch", "lag", "LOOK-AHEAD 1 (fixed)", "LOOK-AHEAD 0 (base)"
+            );
+
+            let mut rows: Vec<u64> = Vec::new();
+            for h in (0..=TARGET).rev() {
+                let last = h * SLOTS_PER_EPOCH + SLOTS_PER_EPOCH - 1;
+                if last <= lead_slot {
+                    rows.push(last);
+                }
+                rows.push(h * SLOTS_PER_EPOCH);
+            }
+            rows.sort_unstable();
+            rows.reverse();
+
+            let comm_with = |st: &CommittedState, lookahead: u64, roster: &[Validator]| {
+                committees::epoch_committees(
+                    &seed_from_head(st, TARGET, lookahead),
+                    TARGET,
+                    roster,
+                )
+            };
+            let lead_seed1 = seed_from_head(leader, TARGET, 1);
+            let lead_seed0 = seed_from_head(leader, TARGET, 0);
+            let lead_own1 = committees_of(leader, TARGET, 1);
+            let lead_own0 = committees_of(leader, TARGET, 0);
+            let lead_sh1 = comm_with(leader, 1, &lead_roster);
+            let lead_sh0 = comm_with(leader, 0, &lead_roster);
+
+            for &head in rows.iter() {
+                let st = &states[head as usize];
+                let s1 = seed_from_head(st, TARGET, 1);
+                let s0 = seed_from_head(st, TARGET, 0);
+                let own1 = committees_of(st, TARGET, 1);
+                let own0 = committees_of(st, TARGET, 0);
+                let sh1 = comm_with(st, 1, &lead_roster);
+                let sh0 = comm_with(st, 0, &lead_roster);
+                let d = |a: &Vec<Vec<u32>>, b: &Vec<Vec<u32>>| {
+                    a.iter().zip(b).filter(|(x, y)| x != y).count()
+                };
+                eprintln!(
+                    "  {:>9} {:>5} {:>4} | {} {:<7} own {:>2}/32 shared {:>2}/32 | \
+                     {} {:<7} own {:>2}/32 shared {:>2}/32",
+                    head,
+                    st.epoch,
+                    TARGET as i64 - st.epoch as i64,
+                    hex8(&s1),
+                    if s1 == lead_seed1 { "AGREE" } else { "DIVERGE" },
+                    d(&own1, &lead_own1),
+                    d(&sh1, &lead_sh1),
+                    hex8(&s0),
+                    if s0 == lead_seed0 { "AGREE" } else { "DIVERGE" },
+                    d(&own0, &lead_own0),
+                    d(&sh0, &lead_sh0),
+                );
+                // On a shared roster the seed is the ONLY input left, so seed
+                // agreement and committee agreement must coincide. If they
+                // ever came apart the table would be reporting something
+                // other than the seed.
+                assert_eq!(
+                    s1 == lead_seed1,
+                    sh1 == lead_sh1,
+                    "head slot {head}, look-ahead 1: seed and shared-roster committee disagree \
+                     about whether they agree"
+                );
+                assert_eq!(
+                    s0 == lead_seed0,
+                    sh0 == lead_sh0,
+                    "head slot {head}, look-ahead 0: seed and shared-roster committee disagree \
+                     about whether they agree"
+                );
+            }
+
+            // The exact boundary, swept slot by slot rather than estimated.
+            let floor = |lookahead: u64| -> u64 {
+                let lead_seed = seed_from_head(leader, TARGET, lookahead);
+                let mut lowest = lead_slot;
+                for head in (0..=lead_slot).rev() {
+                    if seed_from_head(&states[head as usize], TARGET, lookahead) == lead_seed {
+                        lowest = head;
+                    } else {
+                        break;
+                    }
+                }
+                lowest
+            };
+            let f1 = floor(1);
+            let f0 = floor(0);
+            eprintln!(
+                "\nSEED-LAG BOUNDARY (leader head slot {lead_slot}, target epoch {TARGET}):\n  \
+                 look-ahead 1 (fixed): agrees down to head slot {f1} -> tolerates {} slots of \
+                 lag\n  \
+                 look-ahead 0 (base) : agrees down to head slot {f0} -> tolerates {} slots of \
+                 lag\n  \
+                 GAIN: {} slots = {} epoch of block history = {} minutes at 30 s/slot, on top \
+                 of the {} minutes the base rule already had.\n",
+                lead_slot - f1,
+                lead_slot - f0,
+                f0 - f1,
+                (f0 - f1) / SLOTS_PER_EPOCH,
+                (f0 - f1) * 30 / 60,
+                (lead_slot - f0) * 30 / 60,
+            );
+
+            assert!(
+                f1 < f0,
+                "the look-ahead must tolerate MORE lag than the base rule; measured fixed floor \
+                 {f1} vs base floor {f0}"
+            );
+            assert!(f1 > 0, "a fix that tolerates unbounded lag is not this fix");
+            assert_eq!(
+                f0 - f1,
+                SLOTS_PER_EPOCH,
+                "one unit of look-ahead must buy exactly one epoch of block history, no more"
+            );
+            assert_eq!(
+                f0,
+                (TARGET - 1) * SLOTS_PER_EPOCH + SLOTS_PER_EPOCH - 1,
+                "the base rule's floor must be the LAST SLOT of epoch TARGET-1: it needs that \
+                 epoch complete and nothing more"
+            );
+            assert_eq!(
+                f1,
+                (TARGET - 2) * SLOTS_PER_EPOCH + SLOTS_PER_EPOCH - 1,
+                "the fixed rule's floor must be the LAST SLOT of epoch TARGET-2"
+            );
+        }
+
+        // ── The anti-partition property, and the mutation that must kill it ─
+
+        /// Two states share history to the close of `E-2`, then diverge
+        /// through the whole of `E-1` — one chain produces every slot, the
+        /// other withholds three. They must still partition `E` identically,
+        /// or every cross-branch attestation is `NotInCommittee` and fork
+        /// choice can never weigh the two branches against each other.
+        ///
+        /// **This test is run BOTH WAYS in one execution**, which is the only
+        /// form of mutation evidence that survives being read by a third
+        /// party: with the shipped look-ahead the seeds must MATCH, and with
+        /// the look-ahead reverted to zero on this thread
+        /// (`params::rehearsal::with_lookahead_zero`) they must DIFFER. A
+        /// green run therefore proves both that the rule holds and that the
+        /// test can tell when it does not. If the mutated half ever starts
+        /// matching, this test fails and says so — it cannot rot into a
+        /// tautology.
+        #[test]
+        fn nothing_in_the_previous_epoch_can_move_an_epochs_seed() {
+            const E: u64 = 4;
+            let head_slot = E * SLOTS_PER_EPOCH;
+            // Withheld slots, all inside E-1 (epoch 3 = slots 96..=127).
+            let withheld = [101u64, 109, 118];
+            for w in withheld {
+                assert_eq!(crate::epoch_of(w), E - 1, "the divergence must live in E-1");
+            }
+
+            let ca = chain(8, head_slot, &[]);
+            let cb = chain(8, head_slot, &withheld);
+            let a = &ca.states[head_slot as usize];
+            let b = &cb.states[head_slot as usize];
+            assert_eq!(a.epoch, E);
+            assert_eq!(b.epoch, E);
+
+            // Control 1 — the history really is shared to the close of E-2.
+            assert_eq!(
+                a.boundary_mixes.get(&(E - 2)),
+                b.boundary_mixes.get(&(E - 2)),
+                "control: the two branches must agree on the close of E-2, or they never shared \
+                 the history this property is about"
+            );
+            // Control 2 — E-1 really did diverge. Without this the property
+            // is satisfied by two identical chains, which is no test at all.
+            assert_ne!(
+                a.boundary_mixes.get(&(E - 1)),
+                b.boundary_mixes.get(&(E - 1)),
+                "control: withholding three slots of E-1 must move the close of E-1, or the \
+                 property below is vacuous"
+            );
+            assert_ne!(
+                a.head.as_bytes(),
+                b.head.as_bytes(),
+                "control: the two branches must be different chains"
+            );
+
+            // THE PROPERTY, through the shipped reader.
+            let seed_a = a.seed_for_epoch(E);
+            let seed_b = b.seed_for_epoch(E);
+            eprintln!(
+                "SEED-IMMUNITY epoch {E}: close(E-2) {} == {} ; close(E-1) {} != {} ; \
+                 seed(E) {} vs {}",
+                hex8(a.boundary_mixes.get(&(E - 2)).unwrap()),
+                hex8(b.boundary_mixes.get(&(E - 2)).unwrap()),
+                hex8(a.boundary_mixes.get(&(E - 1)).unwrap()),
+                hex8(b.boundary_mixes.get(&(E - 1)).unwrap()),
+                hex8(&seed_a),
+                hex8(&seed_b),
+            );
+            assert_eq!(
+                seed_a, seed_b,
+                "SEED-IMMUNITY: two chains sharing history to the close of epoch {} must derive \
+                 the SAME seed for epoch {E}. They do not, so something that happened during \
+                 epoch {} moved it — that is the partition.",
+                E - 2,
+                E - 1,
+            );
+
+            // The consequence on the wire: the roster is partitioned
+            // identically, slot for slot.
+            let roster = a.consensus_roster_at(E);
+            assert_eq!(roster, b.consensus_roster_at(E), "control: same roster on both branches");
+            let first = E * SLOTS_PER_EPOCH;
+            for s in first..first + SLOTS_PER_EPOCH {
+                assert_eq!(
+                    committees::committee_for_slot(&seed_a, s, &roster),
+                    committees::committee_for_slot(&seed_b, s, &roster),
+                    "SEED-IMMUNITY: slot {s} of epoch {E} is judged against a different \
+                     committee on the two branches"
+                );
+            }
+
+            // ── THE MUTATION, in-tree and in the same run ───────────────────
+            //
+            // Revert the look-ahead to zero on this thread and the SAME
+            // states must now yield DIFFERENT seeds, because the reader is
+            // back to the close of E-1 — the boundary control 2 just proved
+            // diverged. A mutation that does not change the outcome is not a
+            // mutation, and the test says so in those words.
+            let (mut_a, mut_b) = crate::params::rehearsal::with_lookahead_zero(|| {
+                (a.seed_for_epoch(E), b.seed_for_epoch(E))
+            });
+            eprintln!(
+                "SEED-IMMUNITY MUTANT (look-ahead 0): seed(E) {} vs {} — must DIFFER",
+                hex8(&mut_a),
+                hex8(&mut_b)
+            );
+            assert_ne!(
+                mut_a, mut_b,
+                "the mutation did not bite: with the look-ahead reverted to zero the reader \
+                 must take the close of epoch {}, which the two branches disagree about. If \
+                 these still match, the assertion above is not measuring the seed and this \
+                 test is worthless.",
+                E - 1,
+            );
+            // And the mutant must actually differ from the shipped answer on
+            // at least one branch, or the two rules are indistinguishable
+            // here and the fixture is too weak.
+            assert!(
+                mut_a != seed_a || mut_b != seed_b,
+                "the mutant seed equals the shipped seed on both branches: this fixture cannot \
+                 tell the two rules apart"
+            );
+            // The switch must be off again — a leaked mutation would silently
+            // corrupt every test that runs after this one on this thread.
+            assert_eq!(
+                a.seed_for_epoch(E),
+                seed_a,
+                "with_lookahead_zero leaked: the rule is still mutated after it returned"
+            );
+        }
+
+        /// Pins the SHIPPED READER against the two candidate boundaries on a
+        /// state where they differ, and names which one it took.
+        ///
+        /// `assert_eq!(MIN_SEED_LOOKAHEAD_EPOCHS, 1)` — which is what
+        /// `tests/committee.rs` does — compares a constant with its own
+        /// literal and cannot fail for any reason a reader would care about.
+        /// This one runs both ways in one execution, like the test above.
+        #[test]
+        fn the_shipped_reader_takes_the_older_boundary_not_the_newer() {
+            let c = chain(8, 4 * SLOTS_PER_EPOCH + 1, &[]);
+            let st = &c.states[(4 * SLOTS_PER_EPOCH + 1) as usize];
+            assert_eq!(st.epoch, 4);
+            let older = *st.boundary_mixes.get(&2).expect("retention holds {E-2, E-1}");
+            let newer = *st.boundary_mixes.get(&3).expect("retention holds {E-2, E-1}");
+            assert_ne!(older, newer, "control: the two candidates must differ");
+
+            let seed = st.seed_for_epoch(4);
+            assert_eq!(
+                seed, older,
+                "CommittedState::seed_for_epoch must read the close of E-2 (the F6 look-ahead). \
+                 It read {}, and the close of E-1 is {} — a reader that took the newer boundary \
+                 has reverted the fix.",
+                hex8(&seed),
+                hex8(&newer),
+            );
+
+            // The mutant must take the newer one. If it does not, this test
+            // cannot distinguish the two rules and proves nothing.
+            let mutant = crate::params::rehearsal::with_lookahead_zero(|| st.seed_for_epoch(4));
+            assert_eq!(
+                mutant, newer,
+                "with the look-ahead reverted the reader must take the close of E-1; it took {}",
+                hex8(&mutant)
+            );
+        }
+
+        // ── What the fix does to the chain itself ──────────────────────────
+
+        /// `seed_for_epoch` feeds `schedule::proposer` as well as the
+        /// partition, so a binary with the look-ahead builds a DIFFERENT
+        /// chain from the same genesis than one without. This finds the first
+        /// slot at which it does.
+        ///
+        /// Both rules are evaluated on the SAME states, which is the only way
+        /// to ask "where do they first disagree" — past that slot the two
+        /// binaries are on different chains and nothing is comparable.
+        ///
+        /// The answer is EPOCH 1, not epoch 2, and the reason is worth
+        /// stating because it is easy to get wrong: `seed_epoch(1)` is `None`
+        /// under the look-ahead so the fixed rule takes the genesis mix,
+        /// while the base rule takes `boundary_mixes[0]` — the close of epoch
+        /// 0, which is NOT the genesis mix once epoch 0 has produced a single
+        /// block. Only epoch 0 is common ground.
+        #[test]
+        fn the_two_rules_first_draw_a_different_proposer_at() {
+            let last = 4 * SLOTS_PER_EPOCH;
+            let c = chain(8, last, &[]);
+            let mut first_diff: Option<(u64, u32, u32)> = None;
+            let mut per_epoch: BTreeMap<u64, usize> = BTreeMap::new();
+            for slot in 1..=last {
+                let epoch = crate::epoch_of(slot);
+                let ctx = rolled_to(&c.states[(slot - 1) as usize], epoch);
+                let roster = ctx.duty_roster();
+                let p1 = schedule::proposer(&seed_of_rolled(&ctx, epoch, 1), slot, &roster)
+                    .expect("eligible proposer");
+                let p0 = schedule::proposer(&seed_of_rolled(&ctx, epoch, 0), slot, &roster)
+                    .expect("eligible proposer");
+                if p1 != p0 {
+                    *per_epoch.entry(epoch).or_insert(0) += 1;
+                    if first_diff.is_none() {
+                        first_diff = Some((slot, p1, p0));
+                    }
+                }
+            }
+            let (slot, p1, p0) = first_diff.expect("the two rules must differ somewhere");
+            eprintln!(
+                "PROPOSER-DIVERGENCE: first differing slot {slot} (epoch {}), fixed draws {p1}, \
+                 base draws {p0}; differing slots per epoch {per_epoch:?}",
+                crate::epoch_of(slot)
+            );
+            assert_eq!(
+                per_epoch.get(&0),
+                None,
+                "epoch 0 must be identical under both rules: seed_epoch(0) is None either way, \
+                 so both fall back to the genesis mix"
+            );
+            assert_eq!(
+                crate::epoch_of(slot),
+                1,
+                "the two rules must first diverge in epoch 1 — epoch 1 is NOT common ground, \
+                 because the base rule seeds it from the close of epoch 0 while the look-ahead \
+                 seeds it from the genesis mix"
+            );
+        }
     }
 }
 
