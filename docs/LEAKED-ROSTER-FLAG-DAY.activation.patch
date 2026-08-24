@@ -1,0 +1,53 @@
+diff --git a/crates/bloch-pos-committee/src/params.rs b/crates/bloch-pos-committee/src/params.rs
+index 0518817..ae91a63 100644
+--- a/crates/bloch-pos-committee/src/params.rs
++++ b/crates/bloch-pos-committee/src/params.rs
+@@ -103,7 +103,12 @@ pub const INACTIVITY_LEAK_QUOTIENT: u128 = 64;
+ /// binds, so a node still on the old value computes a different schedule and
+ /// forks. Set it far enough ahead that every validator is rebuilt first, and
+ /// treat "the fleet is on the new binary" as a precondition, not a hope.
+-pub const LEAKED_ROSTER_ACTIVATION_EPOCH: u64 = u64::MAX;
++///
++/// The choice procedure, the fleet-rollout order, the readiness predicate and
++/// the post-activation observables live in `docs/LEAKED-ROSTER-FLAG-DAY.md`.
++/// The armed value below was produced by that runbook; the tripwire test in
++/// `transition.rs` pins it, so it cannot drift without failing the suite.
++pub const LEAKED_ROSTER_ACTIVATION_EPOCH: u64 = __ACTIVATION_EPOCH__;
+ 
+ /// Domain separation tags (§6.1). Fixed 16 bytes, right-padded with zeros, so
+ /// no tag can be a prefix of another.
+diff --git a/crates/bloch-pos-committee/src/transition.rs b/crates/bloch-pos-committee/src/transition.rs
+index d289839..069ad8b 100644
+--- a/crates/bloch-pos-committee/src/transition.rs
++++ b/crates/bloch-pos-committee/src/transition.rs
+@@ -5519,20 +5519,20 @@ mod tests {
+ 
+     // ── The inactivity leak must reach the schedule, not only the quorum ────
+ 
+-    /// The shipped default has to stay inert.
++    /// The armed value has to match the one the flag-day runbook announced.
+     ///
+-    /// Lowering this constant changes proposer selection and committee
+-    /// membership on the next epoch, so a node still on the old value computes
+-    /// a different schedule and forks. This test is a tripwire, not a property:
+-    /// it is meant to fail the moment someone sets a real epoch, so that the
+-    /// change is made together with a coordinated rebuild rather than shipped
+-    /// quietly inside an unrelated release.
++    /// Until the constant was armed this test pinned `u64::MAX` (inert).
++    /// Arming flips its job, not its nature: it is still a tripwire — now
++    /// against a SECOND silent change of the epoch, which would be a new flag
++    /// day needing its own fleet rollout, announcement and runbook. The value
++    /// here must equal the one recorded in `docs/LEAKED-ROSTER-FLAG-DAY.md`
++    /// and in the release notes of the armed build.
+     #[test]
+-    fn leaked_roster_ships_inert() {
++    fn leaked_roster_armed_epoch_matches_the_runbook() {
+         assert_eq!(
+             crate::params::LEAKED_ROSTER_ACTIVATION_EPOCH,
+-            u64::MAX,
+-            "binding the leaked roster is a flag day: set the epoch and roll the fleet together"
++            __ACTIVATION_EPOCH__,
++            "the armed epoch must match docs/LEAKED-ROSTER-FLAG-DAY.md; changing it again is a new flag day"
+         );
+     }
+ 

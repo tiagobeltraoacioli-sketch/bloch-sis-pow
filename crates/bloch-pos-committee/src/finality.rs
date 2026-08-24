@@ -61,7 +61,10 @@
 //! per epoch, hence at most one can ever be finalized per epoch, on any input.
 
 use crate::attestation::AttestationData;
-use crate::params::{INACTIVITY_LEAK_QUOTIENT, INACTIVITY_LEAK_THRESHOLD_EPOCHS};
+use crate::params::{
+    INACTIVITY_LEAK_QUOTIENT, INACTIVITY_LEAK_RECOVERY_QUOTIENT,
+    INACTIVITY_LEAK_THRESHOLD_EPOCHS, MIN_QUORUM_DENOMINATOR_DEN, MIN_QUORUM_DENOMINATOR_NUM,
+};
 use crate::sample::Validator;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -214,6 +217,46 @@ impl FinalityState {
     /// 2. justify / finalize,
     /// 3. tick the leak using the **post-vote** finalized epoch, so the epoch
     ///    that restores finality does not also punish its participants.
+    /// `true` only in a test build with the mutation switch on. Constant
+    /// `false` everywhere else, so the branch above folds away in a release.
+    #[inline]
+    fn denominator_ignores_leak() -> bool {
+        #[cfg(test)]
+        {
+            return tests_hook::IGNORE_LEAK_IN_DENOMINATOR.load(std::sync::atomic::Ordering::Relaxed);
+        }
+        #[cfg(not(test))]
+        false
+    }
+
+    /// Mutation switch: reproduce the PRE-FIX denominator, with no floor. The
+    /// two tests that document the 2026-08-24 false quorum set it, so the
+    /// disease stays reproducible from this repository after the cure landed.
+    /// Constant `false` in a release build.
+    #[inline]
+    fn denominator_floor_disabled() -> bool {
+        #[cfg(test)]
+        {
+            return tests_hook::DISABLE_DENOMINATOR_FLOOR.load(std::sync::atomic::Ordering::Relaxed);
+        }
+        #[cfg(not(test))]
+        false
+    }
+
+    /// Mutation switch: reproduce the PRE-FIX accumulator, which had exactly
+    /// one write path and never came back down. Same purpose as
+    /// [`Self::denominator_floor_disabled`]. Constant `false` in a release
+    /// build.
+    #[inline]
+    fn leak_recovery_disabled() -> bool {
+        #[cfg(test)]
+        {
+            return tests_hook::DISABLE_LEAK_RECOVERY.load(std::sync::atomic::Ordering::Relaxed);
+        }
+        #[cfg(not(test))]
+        false
+    }
+
     pub fn process_epoch(&mut self, votes: &EpochVotes<'_>) -> Result<EpochOutcome, FinalityError> {
         if votes.epoch != self.next_epoch {
             return Err(FinalityError::OutOfOrderEpoch {
@@ -238,13 +281,31 @@ impl FinalityState {
         // absent stake leaks, and the leak comes straight out of the total
         // this quorum is measured against. See
         // `a_partitioned_minority_finalizes_because_the_leak_shrinks_the_denominator`.
+        //
+        // THE FLOOR. There was a guard for `total_active == 0` and none for
+        // "total_active is small", and small is where the chain broke: at
+        // 6.25% of the original stake a 4-of-64 partition reaches two thirds
+        // of what is left. The denominator may not fall below
+        // `MIN_QUORUM_DENOMINATOR_NUM/DEN` of the UNLEAKED total, so the
+        // smallest set the leak can ever rescue is a third of the original
+        // stake — which is the set the leak exists for — and no set below
+        // that can justify however long it waits. See the constant's docs for
+        // what the floor does and does not guarantee.
+        let unleaked_total: u128 =
+            votes.active_set.iter().map(|v| v.effective_stake as u128).sum();
+        let leak_adjusted: u128 = stake.values().map(|s| *s as u128).sum();
         let total_active: u128 = if Self::denominator_ignores_leak() {
             // Mutation hook, `cfg(test)` only: the counterfactual denominator,
             // unadjusted. The test above must FLIP to "never finalizes" when
             // this is on, or it is not measuring the mechanism it names.
-            votes.active_set.iter().map(|v| v.effective_stake as u128).sum()
+            unleaked_total
+        } else if Self::denominator_floor_disabled() {
+            // Mutation hook, `cfg(test)` only: the arithmetic mainnet ran on
+            // 2026-08-24, kept runnable so the incident stays reproducible.
+            leak_adjusted
         } else {
-            stake.values().map(|s| *s as u128).sum()
+            let floor = unleaked_total * MIN_QUORUM_DENOMINATOR_NUM / MIN_QUORUM_DENOMINATOR_DEN;
+            leak_adjusted.max(floor)
         };
 
         // ── 1. Collect valid votes ─────────────────────────────────────────
@@ -347,7 +408,8 @@ impl FinalityState {
         // ended. Strictly *after* the threshold — 4 epochs of non-finality is
         // tolerated intact (§5.1).
         let since_finality = votes.epoch.saturating_sub(self.finalized.epoch);
-        if since_finality > INACTIVITY_LEAK_THRESHOLD_EPOCHS {
+        let leaking = since_finality > INACTIVITY_LEAK_THRESHOLD_EPOCHS;
+        if leaking {
             // Linear-in-time per-epoch bite ⇒ quadratic cumulative loss, the
             // classic Casper shape: the longer the stall, the faster absent
             // stake evaporates, so recovery time is bounded instead of
@@ -366,6 +428,65 @@ impl FinalityState {
                 let bite = ((remaining as u128 * t) / INACTIVITY_LEAK_QUOTIENT).max(1) as u64;
                 let bite = bite.min(remaining);
                 *self.leaked.entry(v.index).or_insert(0) += bite;
+            }
+        }
+
+        // ── 4. Leak recovery ───────────────────────────────────────────────
+        if !Self::leak_recovery_disabled() {
+            //
+            // THIS IS THE ZEROING THE RELAUNCH NEEDS. `leaked` used to have a
+            // single write path (`+= bite`) with no decay, no reset and no
+            // removal, and the denominator subtracts it — so a partition's
+            // collapsed quorum was permanent, and would have been inherited
+            // by the relaunch, because the node's storage is a block log that
+            // is REPLAYED (`bloch-pos-node/src/store.rs`) and `CommittedState`
+            // has no constructor that reads a database. There is no stored
+            // value for a migration to edit; the accumulator only exists as
+            // the output of this fold, so this is the only place it can be
+            // cleared identically on 64 machines.
+            //
+            // WHO recovers, and why it is NOT "everybody when finality is
+            // healthy". That was the first shape of this rule and it
+            // DEADLOCKS: recovery would be gated on finality, finality is
+            // gated on a denominator the leak has collapsed, and a chain that
+            // has not finalized in 110 epochs — which is what production
+            // shows — could never begin to recover. The rule has to be able
+            // to fire DURING a stall or it cannot end one.
+            //
+            // So the debt is discharged per validator, by participation:
+            //   - while the chain is leaking, a validator that cast a valid
+            //     vote this epoch recovers; one that did not, leaks (above).
+            //     The two are exclusive by construction — same `valid` set,
+            //     opposite branch — so no validator is charged and credited
+            //     in one epoch.
+            //   - once the chain is finalizing again, everyone recovers,
+            //     including validators still returning.
+            // This is the Altair shape (participate → score down, absent →
+            // score up) and it is the shape that makes the accumulator a
+            // debt rather than a ratchet.
+            //
+            // Rate: `max(leaked / QUOTIENT, 1)`. The `max(·, 1)` floor makes
+            // it terminate rather than asymptote, exactly as `max(·, 1)` does
+            // on the way up. Entries are REMOVED at zero, not left sitting at
+            // zero, so a fully recovered state is bit-identical to one that
+            // never leaked — §5.5 again: the state is a pure function of the
+            // history, and "0" and "absent" must not be two spellings of one
+            // fact.
+            let mut drained: Vec<u32> = Vec::new();
+            for v in votes.active_set {
+                if leaking && !valid.contains_key(&v.index) {
+                    continue; // absent during a stall: it leaked, it does not recover
+                }
+                if let Some(leaked) = self.leaked.get_mut(&v.index) {
+                    let back = (*leaked / INACTIVITY_LEAK_RECOVERY_QUOTIENT).max(1).min(*leaked);
+                    *leaked -= back;
+                    if *leaked == 0 {
+                        drained.push(v.index);
+                    }
+                }
+            }
+            for index in drained {
+                self.leaked.remove(&index);
             }
         }
 
@@ -832,6 +953,11 @@ mod tests {
     #[test]
     fn the_leak_only_ever_grows() {
         let _g = HOOK.lock().unwrap_or_else(|e| e.into_inner());
+        // Pre-fix arithmetic on purpose — this test is the record of WHY the
+        // relaunch needed a zeroing at all. The post-fix behaviour (the
+        // accumulator comes back down) is
+        // `the_leak_recovers_once_finality_is_healthy_again`.
+        legacy_arithmetic(true);
         let committee: Vec<Validator> = (0..64u32).map(|i| validator(i, STAKE_EACH)).collect();
         let mut st = FinalityState::new(genesis());
         let mut prev = 0u64;
@@ -853,12 +979,307 @@ mod tests {
             );
             prev = now;
         }
+        legacy_arithmetic(false);
         assert!(prev > 0, "validator 40 was absent for 40 epochs and leaked nothing");
         println!(
             "leak permanence: after 40 epochs an absent validator has lost {:.4}% of its stake, \
              and no code path gives any of it back",
             prev as f64 / STAKE_EACH as f64 * 100.0
         );
+    }
+
+    // ── THE FOURTH ENSAIO ───────────────────────────────────────────────
+    // A clean devnet inherits NO leak, so every other scenario in this
+    // repository can go green while mainnet comes back up broken. This one
+    // starts from an accumulated leak, which is the state the relaunch
+    // actually begins in.
+
+    /// Replay the 2026-08-24 partition under the arithmetic mainnet ran, and
+    /// hand back the leak accumulator it produced. This is not a fixture: it
+    /// is the same fold, driven by the same votes, and it is how the node
+    /// itself arrives at this state — `bloch-pos-node`'s storage is an
+    /// append-only BLOCK LOG and `CommittedState` has no constructor that
+    /// reads a database, so on every boot the leak is re-derived by replaying
+    /// exactly this.
+    fn mainnet_leak_after(epochs: u64) -> BTreeMap<u32, u64> {
+        // Only the RECOVERY is switched off — that is the pre-fix accumulator,
+        // the thing whose absence the relaunch inherits. The denominator floor
+        // stays on deliberately, because it makes this replay a node with
+        // CONTINUOUS non-finality: production reports 53-56 and 90-110 epoch
+        // delays, and those are nodes that never reached quorum, not the one
+        // node that self-justified. (With the floor off the 4-node partition
+        // justifies at epoch 25, which resets the leak clock and turns the
+        // schedule into a slower sawtooth — that node leaks less, so modelling
+        // the stalled majority is both the common case and the conservative
+        // one for the roster split.)
+        tests_hook::DISABLE_LEAK_RECOVERY.store(true, std::sync::atomic::Ordering::Relaxed);
+        let committee: Vec<Validator> = (0..64u32).map(|i| validator(i, STAKE_EACH)).collect();
+        let mut st = FinalityState::new(genesis());
+        for e in 1..=epochs {
+            let src = st.current_justified();
+            let atts: Vec<(u32, AttestationData)> =
+                (0..4u32).map(|v| vote(v, e, root(e as u8), src)).collect();
+            st.process_epoch(&EpochVotes { epoch: e, active_set: &committee, attestations: &atts })
+                .unwrap();
+        }
+        assert_eq!(
+            st.finalized().epoch,
+            0,
+            "the generator must model a node in CONTINUOUS non-finality; it finalized"
+        );
+        tests_hook::DISABLE_LEAK_RECOVERY.store(false, std::sync::atomic::Ordering::Relaxed);
+        st.leaked.clone()
+    }
+
+    /// **The relaunch, with the disease already in the state.**
+    ///
+    /// Phase 1 — mainnet as it is: 60 of 64 validators unreachable for 56
+    /// epochs, the delay production actually reports. Under the shipped
+    /// arithmetic the 4-node partition finalizes alone and 60 validators are
+    /// leaked to EXACTLY zero.
+    ///
+    /// Phase 2 — the relaunch as it was planned: all 64 nodes stop, take the
+    /// same storage, take a fixed binary, restart together, and every one of
+    /// the 64 validators comes back and votes honestly for the same root. It
+    /// must be shown that this STILL does not finalize, because the leak came
+    /// back with the storage. That is the whole point of this scenario.
+    ///
+    /// Phase 3 — the same relaunch with the accumulator able to recover.
+    /// Finality must return, the accumulator must reach zero, and the
+    /// denominator must be the full unleaked total again.
+    #[test]
+    fn the_fourth_ensaio_a_relaunch_that_inherits_the_leak() {
+        let _g = HOOK.lock().unwrap_or_else(|e| e.into_inner());
+        let committee: Vec<Validator> = (0..64u32).map(|i| validator(i, STAKE_EACH)).collect();
+        let unleaked_total = STAKE_EACH as u128 * 64;
+
+        // ── Phase 1 ────────────────────────────────────────────────────────
+        // 56 epochs: the middle of production's reported 53-56 band.
+        let inherited = mainnet_leak_after(56);
+        let zeroed: Vec<u32> =
+            inherited.iter().filter(|(_, l)| **l == STAKE_EACH).map(|(v, _)| *v).collect();
+        assert_eq!(
+            zeroed.len(),
+            60,
+            "phase 1: after 56 epochs the 60 unreachable validators must be at EXACTLY zero, \
+             which is the precondition the e1400 roster split needs"
+        );
+        let surviving: u128 =
+            committee.iter().map(|v| (v.effective_stake - inherited.get(&v.index).copied().unwrap_or(0)) as u128).sum();
+        println!(
+            "PHASE 1 (mainnet today): 60 of 64 validators leaked to EXACTLY zero after 56 \
+             epochs. The leak-adjusted denominator is {:.2}% of the unleaked total.",
+            surviving as f64 / unleaked_total as f64 * 100.0
+        );
+
+        // ── Phase 2 ────────────────────────────────────────────────────────
+        // The relaunch WITHOUT the zeroing: same accumulator, everyone back,
+        // everyone honest, everyone voting for one root.
+        let mut no_zeroing = FinalityState::new(genesis());
+        no_zeroing.leaked = inherited.clone();
+        tests_hook::DISABLE_LEAK_RECOVERY.store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut ever_justified = None;
+        for e in 1..=40u64 {
+            let src = no_zeroing.current_justified();
+            let atts: Vec<(u32, AttestationData)> =
+                (0..64u32).map(|v| vote(v, e, root(e as u8), src)).collect();
+            let out = no_zeroing
+                .process_epoch(&EpochVotes {
+                    epoch: e,
+                    active_set: &committee,
+                    attestations: &atts,
+                })
+                .unwrap();
+            if out.justified.is_some() {
+                ever_justified = Some(e);
+                break;
+            }
+        }
+        tests_hook::DISABLE_LEAK_RECOVERY.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            ever_justified, None,
+            "phase 2: the relaunch finalized at epoch {ever_justified:?} WITHOUT the accumulator \
+             being cleared — then the storage does not carry the disease and the zeroing is \
+             not needed. Check this before believing the rest."
+        );
+        println!(
+            "PHASE 2 (relaunch, accumulator NOT cleared): all 64 validators back, all honest, \
+             all voting one root — and 40 epochs later the chain has justified NOTHING. The \
+             storage brought the collapsed denominator back with it."
+        );
+
+        // ── Phase 3 ────────────────────────────────────────────────────────
+        // Identical relaunch, accumulator now able to recover.
+        let mut healed = FinalityState::new(genesis());
+        healed.leaked = inherited.clone();
+        let mut justified_at = None;
+        let mut finalized_at = None;
+        let mut drained_at = None;
+        for e in 1..=400u64 {
+            let src = healed.current_justified();
+            let atts: Vec<(u32, AttestationData)> =
+                (0..64u32).map(|v| vote(v, e, root(e as u8), src)).collect();
+            let out = healed
+                .process_epoch(&EpochVotes {
+                    epoch: e,
+                    active_set: &committee,
+                    attestations: &atts,
+                })
+                .unwrap();
+            if out.justified.is_some() && justified_at.is_none() {
+                justified_at = Some(e);
+            }
+            if out.finalized.is_some() && finalized_at.is_none() {
+                finalized_at = Some(e);
+            }
+            if healed.leaked.is_empty() && drained_at.is_none() {
+                drained_at = Some(e);
+                break;
+            }
+        }
+        let j = justified_at.expect("phase 3: the relaunch must justify");
+        let f = finalized_at.expect("phase 3: the relaunch must finalize");
+        let d = drained_at.expect("phase 3: the accumulator must reach zero");
+        assert!(healed.leaked.is_empty(), "the accumulator must be EMPTY, not merely small");
+        // Bit-identical to a state that never leaked: entries removed, not
+        // left sitting at zero (§5.5).
+        assert_eq!(
+            healed.leaked,
+            BTreeMap::new(),
+            "a fully recovered accumulator must be indistinguishable from one that never leaked"
+        );
+        for v in &committee {
+            assert_eq!(
+                healed.leaked_of(v.index),
+                0,
+                "validator {} still carries leak after the accumulator drained",
+                v.index
+            );
+        }
+        println!(
+            "PHASE 3 (relaunch, accumulator recovers): justified at epoch {j}, finalized at \
+             epoch {f}, accumulator fully drained at epoch {d} — denominator back to 100% of \
+             the unleaked total, and every one of the 64 validators has its full weight and \
+             its committee seat back."
+        );
+
+        // ── The property the relaunch is FOR ───────────────────────────────
+        // With the accumulator healed and the floor in place, run the 2026-08-24
+        // partition again from the recovered state. It must not self-justify.
+        let mut post = healed.clone();
+        let mut minority_justified = None;
+        let start = post.next_epoch;
+        for e in start..start + 120 {
+            let src = post.current_justified();
+            let atts: Vec<(u32, AttestationData)> =
+                (0..4u32).map(|v| vote(v, e, root((e % 251) as u8), src)).collect();
+            let out = post
+                .process_epoch(&EpochVotes {
+                    epoch: e,
+                    active_set: &committee,
+                    attestations: &atts,
+                })
+                .unwrap();
+            if out.justified.is_some() {
+                minority_justified = Some(e);
+                break;
+            }
+        }
+        assert_eq!(
+            minority_justified, None,
+            "THE RELAUNCH DOES NOT HOLD: a 4-of-64 partition justified alone at epoch \
+             {minority_justified:?} on the healed chain. The floor is not doing its job."
+        );
+        println!(
+            "AFTER: the identical 4-of-64 partition that justified at epoch 25 before the fix \
+             cannot justify at all in 120 epochs. A minority no longer finalizes alone."
+        );
+    }
+
+    /// The leak still WORKS. Two properties that must survive the fix, or the
+    /// fix has quietly turned a liveness mechanism into a no-op.
+    #[test]
+    fn the_leak_still_buys_liveness_back_after_the_fix() {
+        let _g = HOOK.lock().unwrap_or_else(|e| e.into_inner());
+        // A 60/40 stall — a MAJORITY present, which is what the leak exists
+        // for. It must still recover, and the absentees must still pay.
+        let committee =
+            [validator(0, 60_000_000), validator(1, 20_000_000), validator(2, 20_000_000)];
+        let mut st = FinalityState::new(genesis());
+        let mut recovered = None;
+        for e in 1..=60u64 {
+            let src = st.current_justified();
+            let atts = [vote(0, e, root(e as u8), src)];
+            let out = st
+                .process_epoch(&EpochVotes { epoch: e, active_set: &committee, attestations: &atts })
+                .unwrap();
+            if out.finalized.is_some() {
+                recovered = Some(e);
+                break;
+            }
+        }
+        let e = recovered.expect(
+            "THE FIX BROKE THE LEAK: a 60/40 stall no longer recovers. The floor is above the \
+             fraction the leak is supposed to rescue, and that is a founder decision, not a \
+             side effect — report it as one.",
+        );
+        assert!(st.leaked_of(1) > 0 && st.leaked_of(2) > 0, "the absentees must still pay");
+        assert_eq!(st.leaked_of(0), 0, "a validly voting member must never leak");
+        println!(
+            "LEAK STILL WORKS: 60/40 stall recovered at epoch {e}; the absent 40% paid \
+             {} and {} satoshis.",
+            st.leaked_of(1),
+            st.leaked_of(2)
+        );
+    }
+
+    /// The post-fix half of `the_leak_only_ever_grows`: the accumulator does
+    /// come back down, and it comes down for the validator that PARTICIPATES,
+    /// including while the chain is still stalled — which is the only reason
+    /// a chain 110 epochs into non-finality can ever climb out.
+    #[test]
+    fn the_leak_recovers_once_the_validator_participates_even_during_a_stall() {
+        let _g = HOOK.lock().unwrap_or_else(|e| e.into_inner());
+        let committee: Vec<Validator> = (0..64u32).map(|i| validator(i, STAKE_EACH)).collect();
+        let mut st = FinalityState::new(genesis());
+        // 30 epochs with validator 40 absent: it accrues a leak, and the
+        // chain does not finalize, so it is still leaking at the end.
+        for e in 1..=30u64 {
+            let src = st.current_justified();
+            let atts: Vec<(u32, AttestationData)> =
+                (0..4u32).map(|v| vote(v, e, root(e as u8), src)).collect();
+            st.process_epoch(&EpochVotes { epoch: e, active_set: &committee, attestations: &atts })
+                .unwrap();
+        }
+        let peak = st.leaked_of(40);
+        assert!(peak > 0, "control: validator 40 must have accrued a leak to recover from");
+        assert_eq!(st.finalized().epoch, 0, "control: the chain must still be stalled");
+
+        // Validator 40 comes back. Nothing else changes — the chain is still
+        // not finalizing. Its debt must start falling anyway.
+        let mut prev = peak;
+        for e in 31..=60u64 {
+            let src = st.current_justified();
+            let mut atts: Vec<(u32, AttestationData)> =
+                (0..4u32).map(|v| vote(v, e, root(e as u8), src)).collect();
+            atts.push(vote(40, e, root(e as u8), src));
+            st.process_epoch(&EpochVotes { epoch: e, active_set: &committee, attestations: &atts })
+                .unwrap();
+            let now = st.leaked_of(40);
+            assert!(
+                now < prev || now == 0,
+                "epoch {e}: validator 40 voted and its leak did not fall ({prev} -> {now}); \
+                 recovery gated on finality would deadlock a stalled chain forever"
+            );
+            prev = now;
+        }
+        assert!(prev < peak, "validator 40's debt must be strictly smaller than its peak");
+        println!(
+            "RECOVERY DURING A STALL: validator 40's leak fell from {peak} to {prev} over 30 \
+             epochs of participation, with the chain never finalizing once."
+        );
+        // Meanwhile a validator that stayed away kept paying.
+        assert!(st.leaked_of(41) > st.leaked_of(40), "the still-absent validator must owe more");
     }
 
     const STAKE_EACH: u64 = 1_000_000_000;
@@ -869,7 +1290,162 @@ mod tests {
     /// 64 validators, only 4 reachable and voting. Returns the epoch at which
     /// the 4 first justify (None if never within the horizon) and the
     /// percentage of TOTAL network stake the leak destroyed by then.
+    /// **The leak does not only shrink the denominator — it re-shuffles the
+    /// COMMITTEE, and the two call paths do not shuffle the same way.**
+    ///
+    /// `transition.rs` holds two rosters for one epoch:
+    ///
+    /// - `compute_post_state` step 8 (~line 2963/3035) admits an attestation
+    ///   against `committee_for_slot(&seed, slot, &roster)` where `roster =
+    ///   st.consensus_roster_at(st.epoch)` — the **leaked** roster.
+    /// - `close_epoch` (~line 2500) tallies the epoch against
+    ///   `votes_from_partition(closing, &roster, ...)` where `roster =
+    ///   st.duty_roster_at(closing)` — the **unleaked** roster.
+    ///
+    /// `with_leak_applied` (transition.rs:2782) does not drop a fully-leaked
+    /// validator, it sets `effective_stake = 0`. `committees::epoch_committees`
+    /// then filters `effective_stake > 0` **before** the Fisher-Yates shuffle,
+    /// so the two rosters shuffle lists of different LENGTH — 64 vs 63 — and
+    /// a Fisher-Yates over a different length is a different permutation
+    /// everywhere, not a permutation with one element removed.
+    ///
+    /// Consequence: attestations the block admitted are dropped at the
+    /// boundary tally, the numerator collapses, and nothing finalizes. The
+    /// only thing that would have said so is a `debug_assert_eq!`
+    /// (transition.rs ~2557), and `[profile.release]` in the workspace
+    /// `Cargo.toml` sets `overflow-checks` but **not** `debug-assertions` —
+    /// so on the binary mainnet runs, it is not there.
+    #[test]
+    fn a_single_fully_leaked_validator_makes_the_two_rosters_partition_differently() {
+        let _g = HOOK.lock().unwrap_or_else(|e| e.into_inner());
+        // 64 validators. Task 2 shows every absent validator on a chain with
+        // 49+ epochs of non-finality is at EXACTLY zero, so one is generous.
+        let duty: Vec<Validator> = (0..64u32).map(|i| validator(i, STAKE_EACH)).collect();
+        let consensus: Vec<Validator> = duty
+            .iter()
+            .map(|v| Validator {
+                index: v.index,
+                // exactly what transition::with_leak_applied produces
+                effective_stake: if v.index == 7 { 0 } else { v.effective_stake },
+            })
+            .collect();
+
+        let seed = [0x5Au8; 32];
+        let epoch = 1u64;
+        let step8 = crate::committees::epoch_committees(&seed, epoch, &consensus);
+        let boundary = crate::committees::epoch_committees(&seed, epoch, &duty);
+        assert_ne!(step8, boundary, "the two rosters must partition differently");
+
+        // Every validator attests honestly, in the slot STEP 8 would admit it
+        // for. Perfect participation: 63 of 64 voting, the 64th (index 7)
+        // has no seat under the leaked roster at all.
+        let src = genesis();
+        let target = root(1);
+        let mut atts: Vec<(u32, AttestationData)> = Vec::new();
+        for (slot_idx, members) in step8.iter().enumerate() {
+            for v in members {
+                atts.push((
+                    *v,
+                    AttestationData {
+                        slot: epoch * crate::params::SLOTS_PER_EPOCH + slot_idx as u64,
+                        head: target,
+                        source_epoch: src.epoch,
+                        source_root: src.root,
+                        target_epoch: epoch,
+                        target_root: target,
+                    },
+                ));
+            }
+        }
+        let admitted = atts.len();
+
+        // Now the boundary tally, against the UNLEAKED roster — the real
+        // production function, the real seed, the real partition filter.
+        let mut accepted = Vec::new();
+        let ev = votes_from_partition(epoch, &duty, &atts, &seed, &mut accepted);
+        let survived = ev.attestations.len();
+        println!(
+            "ROSTER SPLIT: step 8 admitted {admitted} honest attestations; the boundary \
+             kept {survived} ({:.1}%). One validator at zero stake was enough.",
+            survived as f64 / admitted as f64 * 100.0
+        );
+        assert!(
+            survived * 3 < admitted,
+            "the boundary kept {survived} of {admitted} — if most votes survive, the two \
+             partitions are close enough that this is not the mechanism"
+        );
+
+        // And therefore: no quorum, from a network in which every reachable
+        // validator voted honestly for the same root.
+        let mut st = FinalityState::new(genesis());
+        let out = st.process_epoch(&ev).unwrap();
+        assert_eq!(
+            out.justified, None,
+            "63 of 64 validators voted for one root and it JUSTIFIED — then the roster \
+             split does not block finality and this finding is refuted"
+        );
+
+        // The control: feed step 8's own roster to the boundary and the same
+        // votes justify immediately. The divergence is the roster, nothing else.
+        let mut accepted2 = Vec::new();
+        let ev2 = votes_from_partition(epoch, &consensus, &atts, &seed, &mut accepted2);
+        assert_eq!(ev2.attestations.len(), admitted, "control: same roster keeps every vote");
+        let mut st2 = FinalityState::new(genesis());
+        let out2 = st2.process_epoch(&ev2).unwrap();
+        assert_eq!(
+            out2.justified,
+            Some(Checkpoint { epoch, root: target }),
+            "control: with ONE roster on both sides the identical votes justify"
+        );
+        println!(
+            "CONTROL: the identical votes, tallied against the roster that admitted them, \
+             justify at epoch {epoch}. The bug is the two rosters, not the votes."
+        );
+    }
+
+    /// The guard that would have caught the above is a `debug_assert_eq!`, and
+    /// the profile mainnet runs compiles it out. Pinned so nobody has to take
+    /// the Cargo.toml on faith.
+    #[test]
+    fn the_only_guard_on_the_roster_split_is_absent_from_a_release_build() {
+        assert!(
+            cfg!(debug_assertions),
+            "this test build has debug assertions off"
+        );
+        let manifest = include_str!("../../../Cargo.toml");
+        let release = manifest
+            .split("[profile.release]")
+            .nth(1)
+            .expect("workspace Cargo.toml must have [profile.release]")
+            .split("\n[")
+            .next()
+            .unwrap();
+        assert!(
+            !release.contains("debug-assertions"),
+            "[profile.release] now sets debug-assertions; if it is TRUE the guard is live \
+             and this test should be replaced by the assertion itself"
+        );
+    }
+
     fn run_partition(mutated: bool) -> (Option<u64>, f64) {
+        // The pre-fix arithmetic, deliberately: this function is the RECORD of
+        // what mainnet ran on 2026-08-24, so it must keep running it after the
+        // floor and the recovery landed. Both switches are `cfg(test)` and
+        // both are reset before this returns.
+        legacy_arithmetic(true);
+        let out = run_partition_inner(mutated);
+        legacy_arithmetic(false);
+        out
+    }
+
+    /// Turn the two 2026-08-25 corrections off (`true`) or back on (`false`).
+    fn legacy_arithmetic(on: bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        tests_hook::DISABLE_DENOMINATOR_FLOOR.store(on, Relaxed);
+        tests_hook::DISABLE_LEAK_RECOVERY.store(on, Relaxed);
+    }
+
+    fn run_partition_inner(mutated: bool) -> (Option<u64>, f64) {
         let committee: Vec<Validator> = (0..64u32).map(|i| validator(i, STAKE_EACH)).collect();
         let mut st = FinalityState::new(genesis());
         let horizon = if mutated { 120 } else { 60 };
@@ -951,5 +1527,10 @@ pub fn votes_from_partition<'a>(
 #[cfg(test)]
 mod tests_hook {
     use std::sync::atomic::AtomicBool;
+    /// Counterfactual: drop the leak out of the denominator entirely.
     pub(super) static IGNORE_LEAK_IN_DENOMINATOR: AtomicBool = AtomicBool::new(false);
+    /// Reproduce the pre-fix denominator: leak-adjusted, no floor.
+    pub(super) static DISABLE_DENOMINATOR_FLOOR: AtomicBool = AtomicBool::new(false);
+    /// Reproduce the pre-fix accumulator: monotonic, never recovers.
+    pub(super) static DISABLE_LEAK_RECOVERY: AtomicBool = AtomicBool::new(false);
 }
