@@ -449,19 +449,16 @@ pub fn attestation_root(attestations: &[Attestation]) -> [u8; 32] {
 /// attestation this rule excludes is one whose committee a fresh node could
 /// not re-derive from the parent state alone (§5.5 fails closed).
 ///
-/// **KNOWN DIVERGENCE, recorded 2026-08-12, not fixed here.** "One definition,
-/// used twice" is true of this function's two callers, but this function and
-/// [`crate::transition`]'s step 8 do not draw the same committee: this one
-/// calls [`crate::slot_subcommittee`] (the sampled 8-validator draw), the
-/// transition calls [`crate::committees::committee_for_slot`] (the F1
-/// partition). The partition is the current design and the sampled draw is
-/// superseded — see the lib.rs banner — so a producer filtering with this
-/// predicate can drop attestations its own validator would have accepted, and
-/// keep ones it would refuse. It was masked while `derive::validate_block`
-/// existed, because that validator used this same superseded rule and so
-/// agreed with the producer perfectly while both disagreed with the node.
-/// Deleting the parallel validator is what exposed it. Fixing it is a change
-/// to `produce.rs`'s filter, on a seam this task did not open.
+/// **Divergence recorded 2026-08-12, FIXED 2026-08-22.** This function used
+/// to draw the committee with [`crate::slot_subcommittee`] (the superseded
+/// sampled 8-validator draw) while [`crate::transition`]'s step 8 draws with
+/// [`crate::committees::committee_for_slot`] (the F1 partition) — so a
+/// producer filtering with this predicate could drop attestations the
+/// transition accepts and keep ones it refuses. Harmless while gossip pools
+/// were empty; the shared-basis gossip fix (2026-08-21) fills the pools, so
+/// the mismatch would have made proposers assemble blocks the whole network
+/// rejects (`TransitionError::Attestation`). Both sides now draw the F1
+/// partition from the same parent-committed seed and active set.
 pub fn validate_included_attestation(
     parent: &ParentState<'_>,
     block_slot: u64,
@@ -475,7 +472,7 @@ pub fn validate_included_attestation(
     }
     let seed = sortition_seed(parent, att.data.slot).ok_or(RejectReason::NotInCommittee)?;
     let active = active_validators(&parent.chain.registry, crate::epoch_of(block_slot));
-    let committee = crate::slot_subcommittee(&seed, att.data.slot, &active);
+    let committee = crate::committees::committee_for_slot(&seed, att.data.slot, &active);
     validate_attestation(att, &committee, block_slot, verifier)
 }
 
