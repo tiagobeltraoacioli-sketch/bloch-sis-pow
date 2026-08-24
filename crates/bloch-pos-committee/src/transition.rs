@@ -1489,6 +1489,27 @@ impl CommittedState {
     /// delegations request from the *next* epoch), so recomputation cannot
     /// disagree with itself — and a cached roster is exactly the §5.5 pattern
     /// this crate bans.
+    ///
+    /// # This function owns the membership predicate
+    ///
+    /// Since `committees::epoch_committees` stopped filtering on stake
+    /// (2026-08-24), **the index set this function returns IS committee
+    /// membership.** The predicate is `!slashed && activation_epoch <= epoch
+    /// && epoch < exit_epoch` — the same three clauses
+    /// `derive::active_validators` applies to the registry, which is what lets
+    /// four independent roster producers agree on one partition. Anything
+    /// added to it here — in particular any stake threshold — silently
+    /// un-agrees them, because `derive` has neither delegation, nor the cohort
+    /// cap, nor the leak to compare against. Stake belongs in the
+    /// `effective_stake` field, which decides weight; not in the filter, which
+    /// decides membership.
+    ///
+    /// # Caveat: the index set is NOT frozen for the epoch
+    ///
+    /// The stake is, but the membership is not: `apply_slashing_evidence` sets
+    /// `slashed` mid-epoch, so a validator can leave this roster between two
+    /// blocks of the same epoch and re-sort the partition under votes already
+    /// admitted. See the comment on the `debug_assert_eq!` in `close_epoch`.
     fn duty_roster_at(&self, epoch: u64) -> Vec<Validator> {
         // Delegated stake resolved by the delegation module's own fold; its
         // per-validator cap uses the fixed-point form (rule 3 — the cap is
@@ -1534,9 +1555,19 @@ impl CommittedState {
     /// definition of what a leak is worth, two call paths reading it.
     ///
     /// A validator whose leak has reached its stake lands on zero and drops
-    /// out of `eligible` in both `sample` and `epoch_committees` — it stops
-    /// being drawn to propose and stops holding a committee seat, which is
-    /// exactly the liveness the leak was supposed to buy back.
+    /// out of `eligible` in `sample` — it stops being drawn to propose, and
+    /// its empty slots go to the live set, which is the liveness the leak was
+    /// supposed to buy back.
+    ///
+    /// It does **not** stop holding a committee seat, and that is deliberate
+    /// since 2026-08-24. `committees::epoch_committees` no longer filters on
+    /// stake: membership is a pure function of (seed, epoch, index set), so
+    /// this roster and [`Self::duty_roster_at`] — which differ only in stake,
+    /// never in index set — partition identically, and the inclusion check at
+    /// step 8 can no longer disagree with the boundary tally about who was in
+    /// which committee. The seat a fully-leaked validator keeps is inert: it
+    /// carries zero weight into both the quorum numerator and denominator.
+    /// Read `epoch_committees`' docs before changing either roster.
     fn consensus_roster_at(&self, epoch: u64) -> Vec<Validator> {
         let roster = self.duty_roster_at(epoch);
         if epoch < crate::params::LEAKED_ROSTER_ACTIVATION_EPOCH {
@@ -2618,11 +2649,44 @@ impl CommittedState {
                 &st.seed_for_epoch(closing),
                 &mut accepted,
             );
+            // DELIBERATELY STILL A `debug_assert!`, and this is the one place
+            // in the crate where that is a decision rather than an omission.
+            //
+            // The brief for the 2026-08-24 roster unification asked for this to
+            // become a `consensus_invariant!` so it would survive into the
+            // release binary. It must not, because **untrusted input can drive
+            // it**, and an unconditional panic here would therefore be a
+            // remotely triggerable halt:
+            //
+            //   `apply_slashing_evidence` sets `rec.slashed = true` and
+            //   `rec.exit_epoch = epoch` the moment a valid `SlashingEvidence`
+            //   transaction is applied — mid-epoch. `duty_roster_at` filters on
+            //   exactly that predicate, so the roster's INDEX SET shrinks
+            //   between one block of the epoch and the next. Step 8 of every
+            //   later block then partitions a 63-member set while the votes
+            //   already in `pending_votes` were admitted against the 64-member
+            //   one, and this boundary tally partitions the 63-member set too.
+            //   A Fisher-Yates over a different length is a different
+            //   permutation everywhere, so those earlier votes are dropped here
+            //   — legitimately, by the rule as written — and the counts differ.
+            //   Anyone who can get valid equivocation evidence included can
+            //   cause it.
+            //
+            // Removing the `effective_stake > 0` filter from
+            // `epoch_committees` closed the LEAK half of this divergence (the
+            // two rosters now carry the same index set whatever the leak does).
+            // It does not close the SLASHING half, which is a membership change
+            // in committed state, not a stake change — fixing that means
+            // freezing the epoch's roster at its first slot, which is a
+            // consensus rule change and needs its own flag day and rollout.
+            // Until that lands, this stays a test-build guard, and the
+            // divergence is pinned by
+            // `mid_epoch_slashing_changes_the_roster_index_set_within_one_epoch`.
             debug_assert_eq!(
                 epoch_votes.attestations.len(),
                 votes.len(),
                 "boundary partition dropped votes that the inclusion check at step 8 admitted - \
-                 the two filters have diverged"
+                 the two filters have diverged (or a mid-epoch slash moved the roster)"
             );
             // Out-of-order is unreachable: this is the only call site and it
             // feeds epochs densely by construction. A total no-op on Err
@@ -2803,10 +2867,24 @@ impl CommittedState {
         //    state and covers every eligible validator exactly once.
         let partition =
             committees::epoch_committees(&st.seed_for_epoch(next_epoch), next_epoch, &roster_next);
-        debug_assert_eq!(
+        // UNCONDITIONAL, not a `debug_assert!` — see `crate::consensus_invariant`
+        // for why the release profile compiles those out and why halting beats
+        // diverging.
+        //
+        // Why this condition is internal and cannot be driven by untrusted
+        // input: both sides come from ONE value, `roster_next`, which is
+        // derived from already-validated committed state. The left side is the
+        // size of `epoch_committees`' own output over that roster; the right is
+        // that roster's length. Nothing a block, a transaction or a peer can
+        // carry appears on either side — the only way they can differ is if
+        // `epoch_committees` stops covering its input exactly once, which is a
+        // code bug in this crate. (`.len()`, not a stake filter: since
+        // 2026-08-24 membership is the whole index set, weight-zero included.)
+        consensus_invariant!(
+            partition.iter().map(Vec::len).sum::<usize>() == roster_next.len(),
+            "epoch partition must cover the roster exactly once: {} seats over {} validators",
             partition.iter().map(Vec::len).sum::<usize>(),
-            roster_next.iter().filter(|v| v.effective_stake > 0).count(),
-            "epoch partition must cover the eligible set exactly once"
+            roster_next.len()
         );
 
         st
@@ -6622,8 +6700,18 @@ mod tests {
         );
     }
 
-    /// A fully-leaked validator stops being drawn to propose and stops holding
-    /// a committee seat — the liveness the leak is supposed to buy back.
+    /// A fully-leaked validator stops being drawn to propose — the liveness the
+    /// leak is supposed to buy back — while **keeping its committee seat**.
+    ///
+    /// The second half was the opposite assertion until 2026-08-24, and the
+    /// change is the point of the roster unification: committee membership is
+    /// now a pure function of (seed, epoch, index set), so the leaked and
+    /// unleaked rosters partition identically and the inclusion check at step 8
+    /// can no longer disagree with the boundary tally about who sits where. The
+    /// seat that stays is inert — zero weight in both the quorum numerator and
+    /// the denominator — so nothing about finality is bought back by evicting
+    /// it, whereas evicting it cost the chain every attestation in the epoch.
+    /// See `committees::epoch_committees`' docs.
     ///
     /// The control half is what makes this worth running: the same validator,
     /// on the same seed, with the leak NOT applied, both proposes and sits on
@@ -6685,11 +6773,19 @@ mod tests {
                 .any(|p| p == absent),
             "a fully-leaked validator must never win a proposer draw"
         );
+        // The seat SURVIVES the leak, and the partition is bit-identical to the
+        // unleaked one. This is the assertion the 2026-08-21 defect needed and
+        // did not have.
+        let leaked_partition = crate::committees::epoch_committees(&seed, 0, &leaked);
         assert!(
-            !crate::committees::epoch_committees(&seed, 0, &leaked)
-                .iter()
-                .any(|c| c.contains(&absent)),
-            "a fully-leaked validator must hold no committee seat"
+            leaked_partition.iter().any(|c| c.contains(&absent)),
+            "a fully-leaked validator must keep its (inert) committee seat — evicting it is \
+             what made the two rosters partition differently"
+        );
+        assert_eq!(
+            leaked_partition,
+            crate::committees::epoch_committees(&seed, 0, &unleaked),
+            "the leaked and unleaked rosters must partition identically"
         );
 
         // And the slots it used to take are not lost — they go to the live set,
@@ -6697,6 +6793,127 @@ mod tests {
         assert!(
             (0..256).filter_map(|s| schedule::proposer(&seed, s, &leaked)).count() == 256,
             "every slot must still draw a proposer from the surviving validators"
+        );
+    }
+
+    /// The partition-coverage guard must be in the **release** binary.
+    ///
+    /// The workspace `[profile.release]` sets `overflow-checks = true` and does
+    /// not set `debug-assertions`, so it defaults to `false` and every
+    /// `debug_assert!` is compiled out of the binary mainnet runs — which is
+    /// why the one guard on the 2026-08-21 roster split found nothing. This
+    /// pins the replacement: the coverage check goes through
+    /// `consensus_invariant!`, that macro is gated on no `cfg` at all, and it
+    /// really does panic. Source-scanned rather than taken on faith, because
+    /// the failure mode is a guard that exists in the tree and not in the
+    /// binary, which no ordinary test can tell apart.
+    #[test]
+    fn the_partition_coverage_guard_survives_into_a_release_build() {
+        let src = include_str!("transition.rs");
+        let needle = "epoch partition must cover the roster exactly once";
+        let at = src.find(needle).expect("the coverage guard's message moved");
+        let window = &src[at.saturating_sub(500)..at];
+        assert!(
+            window.contains("consensus_invariant!("),
+            "the coverage guard is no longer a consensus_invariant! — if it went back to \
+             debug_assert! it is absent from every release build"
+        );
+
+        // The macro itself must not be gated on anything.
+        let lib = include_str!("lib.rs");
+        let body = lib
+            .split("macro_rules! consensus_invariant")
+            .nth(1)
+            .expect("the macro moved out of lib.rs")
+            .split("\npub(crate) use")
+            .next()
+            .unwrap();
+        assert!(
+            !body.contains("cfg!") && !body.contains("#[cfg") && !body.contains("debug_assert"),
+            "consensus_invariant! has grown a cfg gate; it is a release-profile check or it \
+             is nothing"
+        );
+
+        // And it fires. Caught, so the suite stays green while proving it.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let fired = std::panic::catch_unwind(|| {
+            consensus_invariant!(1 + 1 == 3, "planted violation, {} != {}", 2, 3);
+        });
+        std::panic::set_hook(prev);
+        assert!(fired.is_err(), "consensus_invariant! did not panic on a false condition");
+    }
+
+    /// **The divergence the roster unification does NOT close, pinned so it is
+    /// not mistaken for closed.**
+    ///
+    /// Removing the `effective_stake > 0` filter from `epoch_committees` makes
+    /// the partition invariant under *stake* changes, which is what the leak
+    /// is. It cannot make it invariant under *membership* changes, and
+    /// `apply_slashing_evidence` performs one MID-EPOCH: it sets
+    /// `slashed = true` and `exit_epoch = epoch` the moment valid evidence is
+    /// applied, and `duty_roster_at` filters on exactly that.
+    ///
+    /// So within one epoch the roster's INDEX SET can shrink between two
+    /// blocks. Attestations admitted by step 8 against the 64-member partition
+    /// are then tallied at the boundary against the 63-member one, which is a
+    /// different Fisher-Yates permutation everywhere — the same mechanism as
+    /// the leak defect, from a different cause, and reachable by anyone who can
+    /// get valid equivocation evidence included.
+    ///
+    /// This is why the guard in `close_epoch` is deliberately still a
+    /// `debug_assert!` and NOT a `consensus_invariant!`: an unconditional panic
+    /// there would be a remotely triggerable halt. Closing it properly means
+    /// freezing the epoch's roster at its first slot — a consensus rule change
+    /// with its own flag day, out of scope for the 2026-08-24 unification.
+    #[test]
+    fn mid_epoch_slashing_changes_the_roster_index_set_within_one_epoch() {
+        let (_t, g, _c) = setup(8);
+        let seed = g.seed_for_epoch(g.epoch);
+        let before = g.duty_roster_at(g.epoch);
+        assert_eq!(before.len(), 8);
+
+        // Exactly what `apply_slashing_evidence` writes, minus the evidence
+        // plumbing — the unit seam, the same pattern `with_leak_applied` is
+        // tested at.
+        let mut after_state = g.clone();
+        {
+            let rec = after_state.validators.get_mut(&3).unwrap();
+            rec.slashed = true;
+            rec.exit_epoch = after_state.epoch;
+        }
+        let after = after_state.duty_roster_at(after_state.epoch);
+
+        assert_eq!(after.len(), 7, "a slash must remove the record from the duty roster");
+        assert!(!after.iter().any(|v| v.index == 3));
+
+        // Control: the leak, which changes only stake, does NOT move the
+        // partition. If this half ever fails, the unification has regressed and
+        // the assertion below is measuring the wrong thing.
+        let leaked = with_leak_applied(before.clone(), |i| if i == 3 { u64::MAX } else { 0 });
+        assert_eq!(
+            committees::epoch_committees(&seed, g.epoch, &leaked),
+            committees::epoch_committees(&seed, g.epoch, &before),
+            "control: a pure stake change must not move the partition"
+        );
+
+        // The membership change, however, does.
+        let p_before = committees::epoch_committees(&seed, g.epoch, &before);
+        let p_after = committees::epoch_committees(&seed, g.epoch, &after);
+        assert_ne!(
+            p_before, p_after,
+            "if a mid-epoch slash stopped re-sorting the partition, this residual is closed \
+             and the debug_assert in close_epoch can be promoted to consensus_invariant!"
+        );
+        let moved = p_before
+            .iter()
+            .zip(p_after.iter())
+            .map(|(a, b)| a.iter().filter(|v| **v != 3 && b.binary_search(*v).is_err()).count())
+            .sum::<usize>();
+        println!(
+            "MID-EPOCH SLASH: one validator removed from an 8-member roster moved {moved} of \
+             the remaining 7 into a different slot. Stake changes are invariant; membership \
+             changes are not."
         );
     }
 

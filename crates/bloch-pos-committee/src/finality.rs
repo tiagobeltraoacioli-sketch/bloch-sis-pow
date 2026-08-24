@@ -860,34 +860,43 @@ mod tests {
     /// Serializes the tests that touch the process-global mutation switch.
     static HOOK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// 64 validators, only 4 reachable and voting. Returns the epoch at which
-    /// the 4 first justify (None if never within the horizon) and the
-    /// percentage of TOTAL network stake the leak destroyed by then.
-    /// **The leak does not only shrink the denominator — it re-shuffles the
-    /// COMMITTEE, and the two call paths do not shuffle the same way.**
+    /// **REGRESSION — this test used to prove the defect; it now pins the fix.**
+    ///
+    /// Until 2026-08-24 it asserted `assert_ne!` on the two partitions and
+    /// `justified == None`, and it was right to: the leak did not only shrink
+    /// the denominator, it re-shuffled the COMMITTEE, and the two call paths
+    /// did not shuffle the same way.
     ///
     /// `transition.rs` holds two rosters for one epoch:
     ///
-    /// - `compute_post_state` step 8 (~line 2963/3035) admits an attestation
-    ///   against `committee_for_slot(&seed, slot, &roster)` where `roster =
+    /// - `compute_post_state` step 8 admits an attestation against
+    ///   `committee_for_slot(&seed, slot, &roster)` where `roster =
     ///   st.consensus_roster_at(st.epoch)` — the **leaked** roster.
-    /// - `close_epoch` (~line 2500) tallies the epoch against
-    ///   `votes_from_partition(closing, &roster, ...)` where `roster =
-    ///   st.duty_roster_at(closing)` — the **unleaked** roster.
+    /// - `close_epoch` tallies the epoch against `votes_from_partition(closing,
+    ///   &roster, ...)` where `roster = st.duty_roster_at(closing)` — the
+    ///   **unleaked** roster.
     ///
-    /// `with_leak_applied` (transition.rs:2782) does not drop a fully-leaked
-    /// validator, it sets `effective_stake = 0`. `committees::epoch_committees`
-    /// then filters `effective_stake > 0` **before** the Fisher-Yates shuffle,
-    /// so the two rosters shuffle lists of different LENGTH — 64 vs 63 — and
-    /// a Fisher-Yates over a different length is a different permutation
-    /// everywhere, not a permutation with one element removed.
+    /// `with_leak_applied` does not drop a fully-leaked validator, it sets
+    /// `effective_stake = 0`. `committees::epoch_committees` then filtered
+    /// `effective_stake > 0` **before** the Fisher-Yates shuffle, so the two
+    /// rosters shuffled lists of different LENGTH — 64 vs 63 — and a
+    /// Fisher-Yates over a different length is a different permutation
+    /// everywhere, not a permutation with one element removed. Attestations the
+    /// block admitted were dropped at the boundary tally, the numerator
+    /// collapsed, and nothing finalized: 63 of 64 honest validators voting one
+    /// root, the boundary keeping 4 of them, justification `None`.
     ///
-    /// Consequence: attestations the block admitted are dropped at the
-    /// boundary tally, the numerator collapses, and nothing finalizes. The
-    /// only thing that would have said so is a `debug_assert_eq!`
-    /// (transition.rs ~2557), and `[profile.release]` in the workspace
-    /// `Cargo.toml` sets `overflow-checks` but **not** `debug-assertions` —
-    /// so on the binary mainnet runs, it is not there.
+    /// **The filter is gone.** Committee membership is now a pure function of
+    /// (seed, epoch, index set); stake decides weight only. The two rosters
+    /// carry the same index set and therefore partition identically, whatever
+    /// the leak does — see `committees::epoch_committees`'s docs for why that
+    /// was chosen over dropping the leaked validator on both paths. So every
+    /// assertion below is the mirror of the one it replaces, and the
+    /// measurement printout is kept so the number that used to be 6.3% is on
+    /// the record next to the number that replaced it.
+    ///
+    /// The mutation that shows this can still go red lives in
+    /// `committees::tests::rehearsal_restoring_the_filter_reopens_the_roster_split`.
     #[test]
     fn a_single_fully_leaked_validator_makes_the_two_rosters_partition_differently() {
         let _g = HOOK.lock().unwrap_or_else(|e| e.into_inner());
@@ -907,11 +916,15 @@ mod tests {
         let epoch = 1u64;
         let step8 = crate::committees::epoch_committees(&seed, epoch, &consensus);
         let boundary = crate::committees::epoch_committees(&seed, epoch, &duty);
-        assert_ne!(step8, boundary, "the two rosters must partition differently");
+        assert_eq!(
+            step8, boundary,
+            "the leaked and unleaked rosters must now partition IDENTICALLY — this is the \
+             assertion that used to be assert_ne!, and flipping it is the whole fix"
+        );
 
-        // Every validator attests honestly, in the slot STEP 8 would admit it
-        // for. Perfect participation: 63 of 64 voting, the 64th (index 7)
-        // has no seat under the leaked roster at all.
+        // Every validator attests honestly, in the slot STEP 8 admits it for.
+        // Perfect participation: 64 of 64 voting — index 7 keeps its seat now,
+        // it just carries no weight.
         let src = genesis();
         let target = root(1);
         let mut atts: Vec<(u32, AttestationData)> = Vec::new();
@@ -931,6 +944,7 @@ mod tests {
             }
         }
         let admitted = atts.len();
+        assert_eq!(admitted, 64, "the fully-leaked validator must still hold a seat");
 
         // Now the boundary tally, against the UNLEAKED roster — the real
         // production function, the real seed, the real partition filter.
@@ -938,28 +952,30 @@ mod tests {
         let ev = votes_from_partition(epoch, &duty, &atts, &seed, &mut accepted);
         let survived = ev.attestations.len();
         println!(
-            "ROSTER SPLIT: step 8 admitted {admitted} honest attestations; the boundary \
-             kept {survived} ({:.1}%). One validator at zero stake was enough.",
+            "ROSTER UNIFIED: step 8 admitted {admitted} honest attestations; the boundary \
+             kept {survived} ({:.1}%). Before 2026-08-24 this read 4 of 63 (6.3%).",
             survived as f64 / admitted as f64 * 100.0
         );
-        assert!(
-            survived * 3 < admitted,
-            "the boundary kept {survived} of {admitted} — if most votes survive, the two \
-             partitions are close enough that this is not the mechanism"
+        assert_eq!(
+            survived, admitted,
+            "the boundary kept {survived} of {admitted} — the two partitions have diverged \
+             again and the defect is back"
         );
 
-        // And therefore: no quorum, from a network in which every reachable
+        // And therefore: quorum, from a network in which every reachable
         // validator voted honestly for the same root.
         let mut st = FinalityState::new(genesis());
         let out = st.process_epoch(&ev).unwrap();
         assert_eq!(
-            out.justified, None,
-            "63 of 64 validators voted for one root and it JUSTIFIED — then the roster \
-             split does not block finality and this finding is refuted"
+            out.justified,
+            Some(Checkpoint { epoch, root: target }),
+            "all 64 validators voted for one root and it did NOT justify — the \
+             roster split is back, or something else now blocks finality"
         );
 
-        // The control: feed step 8's own roster to the boundary and the same
-        // votes justify immediately. The divergence is the roster, nothing else.
+        // The control: feed step 8's own roster to the boundary. It must give
+        // the same answer, because the whole point is that there is no longer
+        // a "step 8 roster" and a "boundary roster" as far as membership goes.
         let mut accepted2 = Vec::new();
         let ev2 = votes_from_partition(epoch, &consensus, &atts, &seed, &mut accepted2);
         assert_eq!(ev2.attestations.len(), admitted, "control: same roster keeps every vote");
@@ -968,11 +984,11 @@ mod tests {
         assert_eq!(
             out2.justified,
             Some(Checkpoint { epoch, root: target }),
-            "control: with ONE roster on both sides the identical votes justify"
+            "control: the leaked roster must justify the same checkpoint as the unleaked one"
         );
         println!(
-            "CONTROL: the identical votes, tallied against the roster that admitted them, \
-             justify at epoch {epoch}. The bug is the two rosters, not the votes."
+            "CONTROL: the identical votes justify at epoch {epoch} against EITHER roster. \
+             There is one partition now, not two."
         );
     }
 

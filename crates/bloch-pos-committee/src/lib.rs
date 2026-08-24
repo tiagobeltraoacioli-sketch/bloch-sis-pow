@@ -51,6 +51,56 @@
 //! is no cached set, no clock, and no interior mutability anywhere in the
 //! sampling or fork-choice path.
 
+// ────────────────────────────────────────────────────────────────────────────
+// Consensus invariants that survive `--release`
+// ────────────────────────────────────────────────────────────────────────────
+
+/// An internal consensus invariant, checked in **every** profile.
+///
+/// # Why this is not a `debug_assert!`
+///
+/// The workspace `[profile.release]` sets `overflow-checks = true` and does
+/// **not** set `debug-assertions`, so it defaults to `false`: every
+/// `debug_assert!` in this crate is compiled out of the binary mainnet runs.
+/// The roster-split defect of 2026-08-21 had exactly one guard — a
+/// `debug_assert_eq!` in `transition::close_epoch` — and that guard was not in
+/// the binary. It found nothing, because it was not there.
+///
+/// # Why a panic is the right outcome
+///
+/// A panic in the consensus path **halts this node** instead of letting it
+/// diverge silently. On a coordinated 64-validator fleet a halted node is
+/// diagnosable in minutes and recoverable by restart; a diverged node poisons
+/// finality for everyone and is precisely what produced the defect this macro
+/// was written for. Loud and stopped beats quiet and wrong.
+///
+/// # The rule for using it
+///
+/// **Only for conditions that can fire on an internal code bug and on nothing
+/// else** — both sides derived from already-validated committed state, never
+/// from attacker-supplied input. A `consensus_invariant!` reachable from
+/// untrusted input is a remotely triggerable halt, i.e. a DoS. Every call site
+/// must state, in a comment, why its condition is internal. If you cannot
+/// write that comment, the check belongs in the block-validation path
+/// returning `Err`, not here.
+///
+/// Deliberately a dedicated macro rather than `assert!` so the checks are
+/// greppable (`rg consensus_invariant`) and their intent is explicit, and
+/// rather than `debug-assertions = true` on the whole release profile, which
+/// would turn on every `debug_assert!` in every dependency, change
+/// performance, and give a blast radius nobody has measured.
+macro_rules! consensus_invariant {
+    ($cond:expr, $($arg:tt)+) => {
+        if !$cond {
+            panic!(
+                "CONSENSUS INVARIANT VIOLATED (this node is halting rather than diverging): {}",
+                format_args!($($arg)+)
+            );
+        }
+    };
+}
+pub(crate) use consensus_invariant;
+
 pub mod attestation;
 pub mod beacon;
 pub mod committees;

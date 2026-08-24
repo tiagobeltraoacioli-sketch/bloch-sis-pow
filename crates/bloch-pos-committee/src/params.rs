@@ -82,9 +82,20 @@ pub const INACTIVITY_LEAK_QUOTIENT: u128 = 64;
 /// heals itself. `CommittedState::duty_roster_at` never subtracted it — and
 /// the proposer draw (`schedule::proposer` → `sample`, weighted by
 /// `effective_stake`) and the committee partition (`committees::
-/// epoch_committees`, which admits every validator with `effective_stake > 0`)
-/// both read *that* roster. A validator the finality layer had already written
-/// off kept winning proposer draws and kept holding committee seats.
+/// epoch_committees`) both read *that* roster. A validator the finality layer
+/// had already written off kept winning proposer draws and kept holding
+/// committee seats.
+///
+/// **Corrected 2026-08-24, and this is what makes the flag day safe to keep
+/// armed.** `epoch_committees` used to admit "every validator with
+/// `effective_stake > 0`", and that filter ran *before* the shuffle — so the
+/// leaked and unleaked rosters partitioned differently the moment the leak
+/// zeroed anybody, and the boundary tally dropped attestations the block had
+/// admitted. The filter is gone: committee MEMBERSHIP is now a pure function
+/// of (seed, epoch, index set) and stake decides WEIGHT only, so what this
+/// flag day changes is the proposer draw and the quorum weights — never the
+/// partition. See `committees::epoch_committees`'s docs for the full
+/// reasoning.
 ///
 /// The asymmetry is the whole bug: **finality recovers on its own and block
 /// production never does.** Nothing feeds the leak back into the schedule, so
@@ -228,6 +239,7 @@ pub const BLOCK_BYTES_V2_ACTIVATION_EPOCH: u64 = 800;
 pub mod rehearsal {
     use std::sync::atomic::AtomicBool;
     pub static MUTATE_SEED: AtomicBool = AtomicBool::new(false);
+
 }
 
 /// Domain separation tags (§6.1). Fixed 16 bytes, right-padded with zeros, so

@@ -161,8 +161,88 @@ pub fn seeded_epoch_committees(
 /// `i` of the epoch: its members carry that slot's fork-choice weight, and
 /// their votes accumulate toward the epoch's justification.
 ///
-/// Validators with zero effective stake are excluded entirely — ineligible
-/// under §4.1, exited, or slashed.
+/// # Membership is a pure function of the index set — stake decides WEIGHT only
+///
+/// Every validator in `validators` gets a seat. There is **no stake filter**
+/// here, and the absence is load-bearing rather than an oversight: it is what
+/// makes the partition *leak-invariant*, so no call path can change the
+/// committees by holding a different variant of the same roster.
+///
+/// Until 2026-08-24 this function filtered `effective_stake > 0` **before** the
+/// Fisher-Yates shuffle. A shuffle's XOF draws are length-dependent, so a list
+/// of 64 and a list of 63 are not "the same permutation minus one element" —
+/// they are entirely different permutations. `transition.rs` holds two rosters
+/// for one epoch (`consensus_roster_at`, leak-applied, and `duty_roster_at`,
+/// not), and `with_leak_applied` uses `saturating_sub`, which *keeps* a
+/// fully-leaked validator at `effective_stake = 0` rather than dropping it. So
+/// the moment the inactivity leak zeroed anybody, the two rosters reached this
+/// function at different lengths, the inclusion check at step 8 of
+/// `compute_post_state` and the boundary tally in `close_epoch` partitioned
+/// differently, and attestations the block had *admitted* were dropped at the
+/// tally. Measured: 63 of 64 honest validators voting the same root, the
+/// boundary keeping 4 of them (6.3%), justification `None`. Pinned by
+/// `finality::tests::a_single_fully_leaked_validator_makes_the_two_rosters_partition_differently`.
+///
+/// Why the filter was removed rather than the leaked validator dropped on both
+/// paths — the four reasons, in the order that decided it:
+///
+/// 1. **The filter had no other live effect.** `duty_roster_at`
+///    (transition.rs) already excludes slashed, pre-activation and exited
+///    records; they never reach this function. Dropping leaked-to-zero
+///    validators was the filter's *only* remaining behaviour — i.e. it existed
+///    only to cause this bug.
+/// 2. **Leak-invariance by construction.** The leaked and unleaked rosters
+///    carry the same index set and differ only in stake. With no filter, the
+///    permutation cannot see the difference, so the two call paths cannot
+///    diverge no matter which variant each one happens to hold.
+/// 3. **The alternative touches quorum arithmetic.** Dropping the zeroed
+///    validator on both paths would require the finality path to apply the
+///    leak too — but `finality::process_epoch` re-subtracts its own `leaked`
+///    map from whatever roster it is handed, so feeding it a leak-applied
+///    roster double-charges the quorum denominator. More risk, less coverage,
+///    in the exact arithmetic that decides finality.
+/// 4. **It fixes the class, not the instance.** `derive::active_validators`
+///    is a fourth roster producer: registry stake only, no delegation, no
+///    cohort cap, no leak, and no zero-stake filter. No amount of leak
+///    bookkeeping can make it agree with `transition.rs`, because it has no
+///    leak information at all. With the filter gone, all four producers
+///    compute the same membership predicate — `activation_epoch <= epoch
+///    && epoch < exit_epoch && !slashed` — and therefore the same partition.
+///
+/// That last point is not theoretical. A FIFTH divergent view was measured on
+/// 2026-08-24: an 8.27% weight asymmetry between the stake table
+/// `forkchoice_head` feeds LMD-GHOST (the node's OWN head state) and the
+/// `staked_sat` that `close_epoch` inflates for validators that attested on the
+/// branch that node happened to apply. It is real, it is out of scope here, and
+/// it is the same shape as this defect: a consensus quantity derived from a
+/// node-local view of which roster is the roster. Every producer this crate can
+/// make agree by construction, it should — which is the argument for making
+/// membership a function of the index set and nothing else.
+///
+/// **A zero-weight member holds an INERT seat.** Quorum is stake-weighted over
+/// the whole active set (`finality`'s `total_active`), so a zero-stake member
+/// contributes 0 to the numerator and 0 to the denominator. The liveness the
+/// inactivity leak buys back comes from the shrinking denominator and from
+/// proposer selection (`schedule::sample` is stake-weighted and still never
+/// draws a zero-stake validator) — never from committee membership. Being in a
+/// committee is permission to be counted, not weight.
+///
+/// **The residual, stated rather than filtered.** A validator with genuinely
+/// zero stake — not merely leaked to zero — would now take an inert seat. Every
+/// runtime path that can create a validator record forbids that state:
+/// `staking::validate_deposit` and the `Deposit` handler both reject below
+/// `MIN_DEPOSIT_SAT` (25,000 BLCH); `staked_sat` thereafter only ever grows,
+/// except in `apply_slashing_evidence`, which sets `slashed = true` in the same
+/// statement and so removes the record from every roster; and
+/// `genesis_cohort::apply_cohort_cap` cannot scale a member to zero, because
+/// `s_i * cap / S` needs `s_i * cap < S`, and with `s_i >= MIN_DEPOSIT_SAT`
+/// (2.5e12 sat) and `cap >= MIN_DEPOSIT_SAT / 2` (the deferral floor) the
+/// numerator is >= 3.1e24 while `S` is bounded by the whole V4 supply, 1e19.
+/// The one remaining producer is a hand-written genesis config, which does not
+/// check `staked_sat` — an operator error, not an attacker-reachable state, and
+/// its whole effect is one inert zero-weight seat. It is deliberately NOT
+/// filtered here: a stake predicate in this function is what the four producers
+/// cannot share, which is finding 4 above rebuilt.
 ///
 /// Sizes differ by at most one. Members are assigned by count, not by stake,
 /// which is safe because `MAX_VALIDATOR_STAKE` already caps any single
@@ -178,11 +258,9 @@ pub fn epoch_committees(
     // Canonicalise before anything else. The order the caller happened to hold
     // the registry in must never reach the result — the same rule the sampler
     // learned the hard way.
-    let mut eligible: Vec<u32> = validators
-        .iter()
-        .filter(|v| v.effective_stake > 0)
-        .map(|v| v.index)
-        .collect();
+    // NO STAKE FILTER — see the "Membership is a pure function of the index
+    // set" section above. Nothing in this function reads `effective_stake`.
+    let mut eligible: Vec<u32> = validators.iter().map(|v| v.index).collect();
     eligible.sort_unstable();
     eligible.dedup();
 
