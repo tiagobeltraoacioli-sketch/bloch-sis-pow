@@ -66,6 +66,88 @@ pub const INACTIVITY_LEAK_THRESHOLD_EPOCHS: u64 = 4;
 /// §5.1 value this is a Phase-1 proposal needing a KAT and a devnet sweep.
 pub const INACTIVITY_LEAK_QUOTIENT: u128 = 64;
 
+/// Divisor of the per-epoch **recovery** of the inactivity leak, once finality
+/// is healthy again: `leaked -= max(leaked / QUOTIENT, 1)` on every epoch that
+/// is *not* leaking. This is the whole answer to "the relaunch inherits a
+/// collapsed denominator".
+///
+/// # Why the accumulator had to become recoverable
+///
+/// Before this constant, `FinalityState::leaked` had **exactly one write
+/// path** — `+= bite` — with no decay, no reset and no removal anywhere in the
+/// crate. The quorum denominator subtracts that accumulator, so the
+/// denominator shrank monotonically and never came back: once enough stake had
+/// leaked, a handful of nodes — one, even — held two thirds of what remained
+/// and finalized entirely alone. That is the ratchet behind the 2026-08-24
+/// incident, where three nodes finalized epoch 986 under three different roots
+/// and no amount of arriving blocks could reunify them.
+///
+/// # Why it lives HERE and not in a migration
+///
+/// `CommittedState` has no constructor that reads a database
+/// (`transition.rs`, struct docs) and the node's storage is an **append-only
+/// block log**: restart means replaying every block through the same
+/// `Transition` (`bloch-pos-node/src/store.rs` module docs). So the leak is
+/// not a value sitting in storage that an operator can edit before the
+/// relaunch — it is re-derived from the block log on every boot. A one-shot
+/// storage migration has nothing to migrate, and zeroing "at load" would make
+/// a node disagree with its own replay, which is the `expected_bits` defect
+/// class this repo has already paid for twice. The only place the accumulator
+/// can be changed deterministically on 64 machines is inside the fold, which
+/// is where this is.
+///
+/// # The rate, and the sawtooth it buys
+///
+/// 16 means a healthy epoch returns 1/16 of the outstanding leak, so the
+/// accumulator halves about every 11 epochs and drains completely in a bounded
+/// number (the `max(·, 1)` floor guarantees termination). It is deliberately
+/// SLOWER than accrual: recovery must not instantly undo the very leak that
+/// bought the recovery. It does not remove that tension — a validator set that
+/// is permanently short of a supermajority will oscillate between leaking and
+/// recovering rather than stalling forever, and the honest fix for stake that
+/// is never coming back is EJECTION from the registry, not a perpetual leak.
+/// That is a validator-set change and deliberately not in this fold.
+pub const INACTIVITY_LEAK_RECOVERY_QUOTIENT: u64 = 16;
+
+/// The quorum denominator may never fall below this fraction of the
+/// **unleaked** active stake: `MIN_QUORUM_DENOMINATOR_NUM /
+/// MIN_QUORUM_DENOMINATOR_DEN`. One half.
+///
+/// `process_epoch` already guarded `total_active == 0`. It had no guard for
+/// "total_active is small", and small is where the damage is: at 6.25% of the
+/// original stake a 4-of-64 partition reaches two thirds of what is left and
+/// justifies its own branch (`finality::tests::
+/// a_partitioned_minority_finalizes_because_the_leak_shrinks_the_denominator`
+/// measures it: epoch 25, after 92.2% of network stake has leaked).
+///
+/// # What the floor is worth, exactly
+///
+/// Write `p` for the present fraction of the ORIGINAL active stake. Once the
+/// absent stake has fully leaked, the 2/3 test is `3p ≥ 2·max(p, 1/2)`, which
+/// for `p < 1/2` is `3p ≥ 1`, i.e. **`p ≥ 1/3`**. So:
+///
+/// - a set holding **at least a third** of the original stake can still be
+///   rescued by the leak — which is the entire reason the leak exists, and the
+///   §5.1 recovery property is unchanged (pinned by
+///   `inactivity_leak_recovers_finality`, whose 60/40 stall still recovers on
+///   the same epoch it always did);
+/// - a set holding **less than a third** can never justify, no matter how long
+///   it waits. The 2026-08-24 partitions were 4 of 64.
+///
+/// # The residual, stated rather than glossed
+///
+/// A floor of one half admits at most three pairwise-disjoint sets of exactly
+/// one third each, so it bounds the divergence from "any handful of nodes" to
+/// "at most three ways" — it does not make the justified root unique. Full
+/// uniqueness needs a minimum recovering fraction strictly above one half,
+/// i.e. a floor above 3/4, at the price of never recovering from an outage of
+/// more than half the stake. Which of those two the chain wants is a founder
+/// decision about safety versus liveness, not an implementation detail, and
+/// it is one constant away.
+pub const MIN_QUORUM_DENOMINATOR_NUM: u128 = 1;
+/// Denominator of [`MIN_QUORUM_DENOMINATOR_NUM`].
+pub const MIN_QUORUM_DENOMINATOR_DEN: u128 = 2;
+
 /// Flag-day epoch at which the inactivity leak starts reaching the **duty
 /// roster**, and not only the quorum denominator.
 ///
