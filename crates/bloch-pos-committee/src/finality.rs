@@ -863,6 +863,143 @@ mod tests {
     /// 64 validators, only 4 reachable and voting. Returns the epoch at which
     /// the 4 first justify (None if never within the horizon) and the
     /// percentage of TOTAL network stake the leak destroyed by then.
+    /// **The leak does not only shrink the denominator — it re-shuffles the
+    /// COMMITTEE, and the two call paths do not shuffle the same way.**
+    ///
+    /// `transition.rs` holds two rosters for one epoch:
+    ///
+    /// - `compute_post_state` step 8 (~line 2963/3035) admits an attestation
+    ///   against `committee_for_slot(&seed, slot, &roster)` where `roster =
+    ///   st.consensus_roster_at(st.epoch)` — the **leaked** roster.
+    /// - `close_epoch` (~line 2500) tallies the epoch against
+    ///   `votes_from_partition(closing, &roster, ...)` where `roster =
+    ///   st.duty_roster_at(closing)` — the **unleaked** roster.
+    ///
+    /// `with_leak_applied` (transition.rs:2782) does not drop a fully-leaked
+    /// validator, it sets `effective_stake = 0`. `committees::epoch_committees`
+    /// then filters `effective_stake > 0` **before** the Fisher-Yates shuffle,
+    /// so the two rosters shuffle lists of different LENGTH — 64 vs 63 — and
+    /// a Fisher-Yates over a different length is a different permutation
+    /// everywhere, not a permutation with one element removed.
+    ///
+    /// Consequence: attestations the block admitted are dropped at the
+    /// boundary tally, the numerator collapses, and nothing finalizes. The
+    /// only thing that would have said so is a `debug_assert_eq!`
+    /// (transition.rs ~2557), and `[profile.release]` in the workspace
+    /// `Cargo.toml` sets `overflow-checks` but **not** `debug-assertions` —
+    /// so on the binary mainnet runs, it is not there.
+    #[test]
+    fn a_single_fully_leaked_validator_makes_the_two_rosters_partition_differently() {
+        let _g = HOOK.lock().unwrap_or_else(|e| e.into_inner());
+        // 64 validators. Task 2 shows every absent validator on a chain with
+        // 49+ epochs of non-finality is at EXACTLY zero, so one is generous.
+        let duty: Vec<Validator> = (0..64u32).map(|i| validator(i, STAKE_EACH)).collect();
+        let consensus: Vec<Validator> = duty
+            .iter()
+            .map(|v| Validator {
+                index: v.index,
+                // exactly what transition::with_leak_applied produces
+                effective_stake: if v.index == 7 { 0 } else { v.effective_stake },
+            })
+            .collect();
+
+        let seed = [0x5Au8; 32];
+        let epoch = 1u64;
+        let step8 = crate::committees::epoch_committees(&seed, epoch, &consensus);
+        let boundary = crate::committees::epoch_committees(&seed, epoch, &duty);
+        assert_ne!(step8, boundary, "the two rosters must partition differently");
+
+        // Every validator attests honestly, in the slot STEP 8 would admit it
+        // for. Perfect participation: 63 of 64 voting, the 64th (index 7)
+        // has no seat under the leaked roster at all.
+        let src = genesis();
+        let target = root(1);
+        let mut atts: Vec<(u32, AttestationData)> = Vec::new();
+        for (slot_idx, members) in step8.iter().enumerate() {
+            for v in members {
+                atts.push((
+                    *v,
+                    AttestationData {
+                        slot: epoch * crate::params::SLOTS_PER_EPOCH + slot_idx as u64,
+                        head: target,
+                        source_epoch: src.epoch,
+                        source_root: src.root,
+                        target_epoch: epoch,
+                        target_root: target,
+                    },
+                ));
+            }
+        }
+        let admitted = atts.len();
+
+        // Now the boundary tally, against the UNLEAKED roster — the real
+        // production function, the real seed, the real partition filter.
+        let mut accepted = Vec::new();
+        let ev = votes_from_partition(epoch, &duty, &atts, &seed, &mut accepted);
+        let survived = ev.attestations.len();
+        println!(
+            "ROSTER SPLIT: step 8 admitted {admitted} honest attestations; the boundary \
+             kept {survived} ({:.1}%). One validator at zero stake was enough.",
+            survived as f64 / admitted as f64 * 100.0
+        );
+        assert!(
+            survived * 3 < admitted,
+            "the boundary kept {survived} of {admitted} — if most votes survive, the two \
+             partitions are close enough that this is not the mechanism"
+        );
+
+        // And therefore: no quorum, from a network in which every reachable
+        // validator voted honestly for the same root.
+        let mut st = FinalityState::new(genesis());
+        let out = st.process_epoch(&ev).unwrap();
+        assert_eq!(
+            out.justified, None,
+            "63 of 64 validators voted for one root and it JUSTIFIED — then the roster \
+             split does not block finality and this finding is refuted"
+        );
+
+        // The control: feed step 8's own roster to the boundary and the same
+        // votes justify immediately. The divergence is the roster, nothing else.
+        let mut accepted2 = Vec::new();
+        let ev2 = votes_from_partition(epoch, &consensus, &atts, &seed, &mut accepted2);
+        assert_eq!(ev2.attestations.len(), admitted, "control: same roster keeps every vote");
+        let mut st2 = FinalityState::new(genesis());
+        let out2 = st2.process_epoch(&ev2).unwrap();
+        assert_eq!(
+            out2.justified,
+            Some(Checkpoint { epoch, root: target }),
+            "control: with ONE roster on both sides the identical votes justify"
+        );
+        println!(
+            "CONTROL: the identical votes, tallied against the roster that admitted them, \
+             justify at epoch {epoch}. The bug is the two rosters, not the votes."
+        );
+    }
+
+    /// The guard that would have caught the above is a `debug_assert_eq!`, and
+    /// the profile mainnet runs compiles it out. Pinned so nobody has to take
+    /// the Cargo.toml on faith.
+    #[test]
+    fn the_only_guard_on_the_roster_split_is_absent_from_a_release_build() {
+        assert!(
+            cfg!(debug_assertions),
+            "this test build has debug assertions off"
+        );
+        let manifest = include_str!("../../../Cargo.toml");
+        let release = manifest
+            .split("[profile.release]")
+            .nth(1)
+            .expect("workspace Cargo.toml must have [profile.release]")
+            .split("\n[")
+            .next()
+            .unwrap();
+        assert!(
+            !release.contains("debug-assertions"),
+            "[profile.release] now sets debug-assertions; if it is TRUE the guard is live \
+             and this test should be replaced by the assertion itself"
+        );
+    }
+
     fn run_partition(mutated: bool) -> (Option<u64>, f64) {
         let committee: Vec<Validator> = (0..64u32).map(|i| validator(i, STAKE_EACH)).collect();
         let mut st = FinalityState::new(genesis());
