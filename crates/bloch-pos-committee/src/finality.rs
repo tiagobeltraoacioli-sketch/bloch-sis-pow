@@ -196,6 +196,18 @@ impl FinalityState {
     /// 2. justify / finalize,
     /// 3. tick the leak using the **post-vote** finalized epoch, so the epoch
     ///    that restores finality does not also punish its participants.
+    /// `true` only in a test build with the mutation switch on. Constant
+    /// `false` everywhere else, so the branch above folds away in a release.
+    #[inline]
+    fn denominator_ignores_leak() -> bool {
+        #[cfg(test)]
+        {
+            return tests_hook::IGNORE_LEAK_IN_DENOMINATOR.load(std::sync::atomic::Ordering::Relaxed);
+        }
+        #[cfg(not(test))]
+        false
+    }
+
     pub fn process_epoch(&mut self, votes: &EpochVotes<'_>) -> Result<EpochOutcome, FinalityError> {
         if votes.epoch != self.next_epoch {
             return Err(FinalityError::OutOfOrderEpoch {
@@ -214,7 +226,20 @@ impl FinalityState {
             stake.insert(v.index, v.effective_stake.saturating_sub(leaked));
         }
         // u128 accumulator: 128 members × u64::MAX stake overflows u64.
-        let total_active: u128 = stake.values().map(|s| *s as u128).sum();
+        //
+        // THE DENOMINATOR IS LEAK-ADJUSTED. That is what lets a partitioned
+        // minority finalize its own branch: peers it cannot hear are absent,
+        // absent stake leaks, and the leak comes straight out of the total
+        // this quorum is measured against. See
+        // `a_partitioned_minority_finalizes_because_the_leak_shrinks_the_denominator`.
+        let total_active: u128 = if Self::denominator_ignores_leak() {
+            // Mutation hook, `cfg(test)` only: the counterfactual denominator,
+            // unadjusted. The test above must FLIP to "never finalizes" when
+            // this is on, or it is not measuring the mechanism it names.
+            votes.active_set.iter().map(|v| v.effective_stake as u128).sum()
+        } else {
+            stake.values().map(|s| *s as u128).sum()
+        };
 
         // ── 1. Collect valid votes ─────────────────────────────────────────
         // A vote counts only if all of these hold; anything else makes the
@@ -737,6 +762,130 @@ mod tests {
             .unwrap();
         assert_eq!(out.justified, Some(Checkpoint { epoch: 1, root: root(1) }));
     }
+    /// **The false quorum, with numbers.**
+    ///
+    /// The quorum denominator is LEAK-ADJUSTED (`total_active` above). A node
+    /// that can only hear `k` of the 64 validators counts the other `64 - k`
+    /// as absent; absent stake leaks; the leak is subtracted from the very
+    /// total the 2/3 test is measured against. So the denominator shrinks
+    /// until it fits inside the minority the node can still hear, and that
+    /// minority finalizes its own branch — with no bug in the finality code
+    /// and no disagreement about any rule.
+    ///
+    /// This is why every partition in the 2026-08-24 incident finalized the
+    /// same epoch on a different root. Divergent finality is a CONSEQUENCE of
+    /// the partition, not an independent fault.
+    ///
+    /// The leak is also PERMANENT: `leaked` has exactly one write path in this
+    /// file (`+= bite`), no decay and no reset, so a validator's stake never
+    /// comes back. That is what makes this a relaunch question and not just an
+    /// incident question.
+    #[test]
+    fn a_partitioned_minority_finalizes_because_the_leak_shrinks_the_denominator() {
+        let _g = HOOK.lock().unwrap_or_else(|e| e.into_inner());
+        let (epoch, destroyed_pct) = run_partition(false);
+        let epoch = epoch.expect(
+            "a 4-of-64 partition must eventually self-finalize — if it never does, the \
+             leak-adjusted denominator is not the mechanism and this analysis is wrong",
+        );
+
+        // 4 of 64 is 6.25% of the validators. It must NOT be able to justify
+        // while the denominator is intact.
+        assert!(
+            epoch > INACTIVITY_LEAK_THRESHOLD_EPOCHS,
+            "the minority justified at epoch {epoch}, at or before the leak threshold — \
+             it would have to have done that WITHOUT the leak, which contradicts 4/64 < 2/3"
+        );
+        println!(
+            "FALSE QUORUM: 4 of 64 validators (6.25%) first justified at epoch {epoch} of \
+             non-finality, after the leak destroyed {destroyed_pct:.1}% of total network stake"
+        );
+    }
+
+    /// **The mutation.** Take the leak back out of the denominator and rerun
+    /// the identical scenario. The minority must now NEVER finalize. If it
+    /// still does, the test above is passing for some other reason and proves
+    /// nothing about the leak.
+    #[test]
+    fn without_the_leak_in_the_denominator_the_minority_never_finalizes() {
+        let _g = HOOK.lock().unwrap_or_else(|e| e.into_inner());
+        tests_hook::IGNORE_LEAK_IN_DENOMINATOR.store(true, std::sync::atomic::Ordering::Relaxed);
+        let (epoch, _) = run_partition(true);
+        tests_hook::IGNORE_LEAK_IN_DENOMINATOR.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            epoch, None,
+            "MUTATION DID NOT BITE: with an unadjusted denominator a 4-of-64 minority still \
+             justified at epoch {epoch:?}. Either the hook is not wired or the finalization \
+             in the sibling test is not caused by the leak."
+        );
+        println!("MUTATION: with the leak removed from the denominator, 4 of 64 never justified");
+    }
+
+    /// The cumulative leak never decreases — there is no decay and no reset,
+    /// which is the whole reason a relaunch inherits it.
+    #[test]
+    fn the_leak_only_ever_grows() {
+        let _g = HOOK.lock().unwrap_or_else(|e| e.into_inner());
+        let committee: Vec<Validator> = (0..64u32).map(|i| validator(i, STAKE_EACH)).collect();
+        let mut st = FinalityState::new(genesis());
+        let mut prev = 0u64;
+        for e in 1..=40u64 {
+            let src = st.current_justified();
+            let atts: Vec<(u32, AttestationData)> =
+                (0..4u32).map(|v| vote(v, e, root(e as u8), src)).collect();
+            st.process_epoch(&EpochVotes {
+                epoch: e,
+                active_set: &committee,
+                attestations: &atts,
+            })
+            .unwrap();
+            let now = st.leaked_of(40);
+            assert!(
+                now >= prev,
+                "epoch {e}: leaked_of(40) went DOWN, {prev} -> {now}; if the leak can heal, \
+                 the relaunch argument changes"
+            );
+            prev = now;
+        }
+        assert!(prev > 0, "validator 40 was absent for 40 epochs and leaked nothing");
+        println!(
+            "leak permanence: after 40 epochs an absent validator has lost {:.4}% of its stake, \
+             and no code path gives any of it back",
+            prev as f64 / STAKE_EACH as f64 * 100.0
+        );
+    }
+
+    const STAKE_EACH: u64 = 1_000_000_000;
+
+    /// Serializes the tests that touch the process-global mutation switch.
+    static HOOK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// 64 validators, only 4 reachable and voting. Returns the epoch at which
+    /// the 4 first justify (None if never within the horizon) and the
+    /// percentage of TOTAL network stake the leak destroyed by then.
+    fn run_partition(mutated: bool) -> (Option<u64>, f64) {
+        let committee: Vec<Validator> = (0..64u32).map(|i| validator(i, STAKE_EACH)).collect();
+        let mut st = FinalityState::new(genesis());
+        let horizon = if mutated { 120 } else { 60 };
+        for e in 1..=horizon {
+            let src = st.current_justified();
+            let atts: Vec<(u32, AttestationData)> =
+                (0..4u32).map(|v| vote(v, e, root(e as u8), src)).collect();
+            let out = st
+                .process_epoch(&EpochVotes {
+                    epoch: e,
+                    active_set: &committee,
+                    attestations: &atts,
+                })
+                .unwrap();
+            if out.justified.is_some() {
+                let destroyed: u64 = (0..64u32).map(|v| st.leaked_of(v)).sum();
+                let total = STAKE_EACH as u128 * 64;
+                return (Some(e), destroyed as f64 / total as f64 * 100.0);
+            }
+        }
+        (None, 0.0)
+    }
 }
 
 // ── Wiring to the partition ─────────────────────────────────────────────────
@@ -787,4 +936,13 @@ pub fn votes_from_partition<'a>(
     }
 
     EpochVotes { epoch, active_set, attestations: accepted }
+
+}
+
+/// Mutation switch for the leak-denominator test. `cfg(test)`, so it cannot
+/// exist in a shipped binary.
+#[cfg(test)]
+mod tests_hook {
+    use std::sync::atomic::AtomicBool;
+    pub(super) static IGNORE_LEAK_IN_DENOMINATOR: AtomicBool = AtomicBool::new(false);
 }

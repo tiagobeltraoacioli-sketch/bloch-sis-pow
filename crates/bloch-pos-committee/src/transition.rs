@@ -1426,19 +1426,60 @@ impl CommittedState {
     /// The beacon mix that seeds sortition and partition for `epoch`: the mix
     /// fixed at the close of epoch `epoch - 1` (§6.3), so the schedule is
     /// knowable exactly one epoch ahead and no earlier.
-    fn seed_for_epoch(&self, epoch: u64) -> [u8; 32] {
-        if epoch == 0 {
-            return self.genesis_mix;
-        }
-        match self.boundary_mixes.get(&(epoch - 1)) {
+    ///
+    /// # The look-ahead
+    ///
+    /// `back = 1 + `[`crate::committees::MIN_SEED_LOOKAHEAD_EPOCHS`],
+    /// unconditionally — there is no flag day. See
+    /// [`crate::params`]'s note on the removed
+    /// `ANCESTRY_SEED_ACTIVATION_EPOCH` for why the gate went away with the
+    /// coordinated relaunch, and why that is not a precedent.
+    ///
+    /// `back = 2` is what closes finding F6: at `back = 1` the seed for epoch
+    /// `E` is the mix at the close of `E − 1`, so the trailing proposers of
+    /// `E − 1` can re-sort `E`'s partition by withholding a reveal — they see
+    /// the schedule their own reveal produces before they have to publish it.
+    ///
+    /// **The retention already covers it.** While epoch `E` is open the last
+    /// closed epoch is `E − 1`, and `close_epoch` keeps
+    /// [`crate::state_root::RANDAO_BOUNDARIES_RETAINED`]` = 2` boundaries —
+    /// `{E − 2, E − 1}`. `back = 2` reads `E − 2`, which is retained. So this
+    /// needs NO change to the retention window, and therefore none to the
+    /// state root (`state_root::randao_window` folds exactly those retained
+    /// boundaries into the tree). The two other callers are covered too: the
+    /// close-epoch vote partition asks for `closing` before step 3 inserts,
+    /// when `{closing − 2, closing − 1}` is retained, and the next-epoch
+    /// partition asks for `closing + 1` after it, when `{closing − 1,
+    /// closing}` is.
+    pub fn seed_for_epoch(&self, epoch: u64) -> [u8; 32] {
+        let back = 1 + crate::committees::MIN_SEED_LOOKAHEAD_EPOCHS;
+        let Some(src) = epoch.checked_sub(back) else {
+            return Self::rehearsal_mutate(self.genesis_mix);
+        };
+        Self::rehearsal_mutate(match self.boundary_mixes.get(&src) {
             Some(m) => *m,
             // Unreachable by the retention invariant (the current epoch's
             // seed is always among the last 2 boundaries), but a consensus
             // function is not allowed to panic on any input, so the total
             // fallback is the genesis mix rather than an unwrap.
             None => self.genesis_mix,
-        }
+        })
     }
+
+    /// The A/B comparator's tripwire: a planted one-bit difference the
+    /// rehearsal turns on to prove the comparator goes red when the halves
+    /// really do disagree. Identity in any build that is not a test build.
+    #[inline]
+    fn rehearsal_mutate(seed: [u8; 32]) -> [u8; 32] {
+        #[allow(unused_mut)]
+        let mut seed = seed;
+        #[cfg(test)]
+        if crate::params::rehearsal::MUTATE_SEED.load(std::sync::atomic::Ordering::Relaxed) {
+            seed[0] ^= 0x01;
+        }
+        seed
+    }
+
 
     /// The duty roster for `epoch`: active registry records plus activated
     /// delegated stake, with the genesis-cohort cap applied last.
@@ -3699,6 +3740,160 @@ mod tests {
         fn verify_with_key(&self, _pk: &[u8], _root: &[u8; 32], sig: &[u8]) -> bool {
             sig != b"forged"
         }
+    }
+
+    // ── The deterministic chain comparator, and its tripwire ───────────────
+    //
+    // Real `build_block` (the producer's own walk), real `apply_block` (every
+    // validation step, including the proposer draw at step 4 and the committee
+    // filter at step 8), real `close_epoch`, real state roots. What is
+    // replaced is the DRIVER: slots are stepped by a `for`, the RANDAO chains
+    // come from fixed seeds, and nothing reads a clock. A run is a pure
+    // function of (validator count, mutation flag), so machine load can change
+    // how LONG a run takes and not what it produces — which is what makes a
+    // bit-for-bit chain comparison meaningful on a box under load.
+
+    /// `MUTATE_SEED` is a process global and cargo runs tests in parallel.
+    static AB_HOOKS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Everything one node believed after one slot. Eight fields; `assert_eq!`
+    /// on the struct is what makes "all eight are compared" true by
+    /// construction instead of by a checklist that can fall out of date.
+    #[derive(PartialEq, Eq, Debug, Clone)]
+    struct AbRecord {
+        slot: u64,
+        epoch: u64,
+        head: [u8; 32],
+        state_root: [u8; 32],
+        seed: [u8; 32],
+        randao_mix: [u8; 32],
+        proposer: Option<u32>,
+        partition: Vec<Vec<u32>>,
+    }
+
+    fn ab_run(mutate: bool, slots: u64, n: u32) -> Vec<AbRecord> {
+        use std::sync::atomic::Ordering::Relaxed;
+        crate::params::rehearsal::MUTATE_SEED.store(mutate, Relaxed);
+
+        let (t, g, mut chains) = setup(n);
+        let mut st = g;
+        let mut out = Vec::new();
+        for slot in 1..=slots {
+            let b = build_block(&t, &st, slot, &[], &[], &mut chains);
+            st = t
+                .apply_block(&st, &b, &[], &[])
+                .expect("the producer and the validator must agree within one run");
+            let epoch = st.epoch;
+            let seed = st.seed_for_epoch(epoch);
+            let roster = st.duty_roster();
+            out.push(AbRecord {
+                slot,
+                epoch,
+                head: *st.head.as_bytes(),
+                state_root: st.state_root(),
+                seed,
+                randao_mix: st.randao_mix,
+                proposer: schedule::proposer(&seed, slot, &roster),
+                partition: crate::committees::epoch_committees(&seed, epoch, &roster),
+            });
+        }
+        crate::params::rehearsal::MUTATE_SEED.store(false, Relaxed);
+        out
+    }
+
+    /// Compare two runs by LOGICAL SLOT NUMBER, never by position in a
+    /// sequence of blocks. Returns (content differences, fields compared).
+    fn ab_diff(a: &[AbRecord], b: &[AbRecord]) -> (usize, usize) {
+        let (mut d, mut fields) = (0usize, 0usize);
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert_eq!(x.slot, y.slot, "the comparator lost slot alignment");
+            fields += 8;
+            if x != y {
+                d += 1;
+            }
+        }
+        (d, fields)
+    }
+
+    /// The `back` arithmetic in `seed_for_epoch` and the boundary epoch
+    /// `committees::seed_epoch` names are the same arithmetic. If either side
+    /// is edited alone, this fails.
+    #[test]
+    fn the_lookahead_matches_the_committee_crates_seed_epoch() {
+        let back = 1 + crate::committees::MIN_SEED_LOOKAHEAD_EPOCHS;
+        for e in 0u64..4_000 {
+            assert_eq!(
+                e.checked_sub(back),
+                crate::committees::seed_epoch(e),
+                "epoch {e}: the transition's boundary epoch and the committee crate's disagree"
+            );
+        }
+    }
+
+    /// **The retention claim, tested rather than argued.**
+    ///
+    /// The whole "no state-root change" argument rests on
+    /// `RANDAO_BOUNDARIES_RETAINED = 2` already holding `E − 2` while `E` is
+    /// open. If that were false the rule would silently fall back to the
+    /// genesis mix — reachable arithmetic, not an unreachable branch.
+    #[test]
+    fn the_rule_reads_a_boundary_the_state_still_retains() {
+        let (t, g, mut chains) = setup(8);
+        let mut st = g;
+        let mut checked = 0;
+        for slot in 1..=(crate::SLOTS_PER_EPOCH * 4) {
+            let b = build_block(&t, &st, slot, &[], &[], &mut chains);
+            st = t.apply_block(&st, &b, &[], &[]).expect("block rejected");
+            let e = st.epoch;
+            if e >= 2 {
+                let src = e - (1 + crate::committees::MIN_SEED_LOOKAHEAD_EPOCHS);
+                assert!(
+                    st.randao_mix_at(src).is_some(),
+                    "epoch {e} is open and boundary {src} — the seed the rule needs — has \
+                     already been evicted; the look-ahead WOULD need a retention change and \
+                     therefore a state-root change"
+                );
+                assert_eq!(
+                    st.seed_for_epoch(e),
+                    st.randao_mix_at(src).unwrap(),
+                    "the seed did not come from the retained boundary it claims"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 64, "only {checked} slots reached the rule");
+    }
+
+    /// The driver is deterministic: same inputs, same chain, bit for bit.
+    /// Without this the mutation below would be meaningless — a comparator
+    /// that reddens at everything would pass it.
+    #[test]
+    fn two_identical_runs_produce_an_identical_chain() {
+        let _g = AB_HOOKS.lock().unwrap_or_else(|e| e.into_inner());
+        let slots = crate::SLOTS_PER_EPOCH * 2;
+        let a = ab_run(false, slots, 8);
+        let b = ab_run(false, slots, 8);
+        let (d, fields) = ab_diff(&a, &b);
+        println!("DETERMINISM: {slots} slots, {fields} fields compared, {d} differences");
+        assert_eq!(d, 0, "the driver is not deterministic; no comparison below means anything");
+    }
+
+    /// **The comparator's tripwire.** Plant a one-bit difference in the seed
+    /// and require the comparator to go red. A comparator that cannot see a
+    /// planted difference is not comparing anything — which is how a whole
+    /// suite was once found passing empty.
+    #[test]
+    fn the_comparator_bites_a_planted_difference() {
+        let _g = AB_HOOKS.lock().unwrap_or_else(|e| e.into_inner());
+        let slots = crate::SLOTS_PER_EPOCH * 2;
+        let clean = ab_run(false, slots, 8);
+        let mutated = ab_run(true, slots, 8);
+        let (d, fields) = ab_diff(&clean, &mutated);
+        println!(
+            "MUTATION: {fields} fields compared, {d} differences (0 would mean the \
+             comparator is blind)"
+        );
+        assert!(d > 0, "the comparator did not see a one-bit seed difference");
     }
 
     fn setup(n: u32) -> (Transition<OkVerifier>, CommittedState, Vec<RandaoChain>) {
