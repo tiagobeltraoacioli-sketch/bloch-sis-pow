@@ -252,3 +252,20 @@ Checked on this branch: `denominator_ignores_leak` appears once, and there are
 no duplicated `fn`/`const`/`static` identifiers in `finality.rs`. That is a
 grep, not a compiler — see the status section of the handover for what has and
 has not actually been built.
+
+## 10. A narrowed, not closed, gap in the duty view
+
+`rolled_to(e)` only rolls FORWARD. If a parked attestation's epoch is behind
+`self.state`'s, it returns the current state, so the roster is the current
+epoch's index set rather than that epoch's. The SEED is still correctly
+anchored through the ancestry walk, so membership is derived with the right
+seed but a possibly-later index set.
+
+This is strictly better than what it replaced, which used the wall epoch's seed
+AND roster. Section 1 narrows it further: once membership is a function of the
+index set, the only thing that moves it is activations and exits. It is not
+closed. Closing it needs per-epoch roster history, which is storage work rather
+than policy work — the same family as the `handle_attestation` epoch gate,
+which drops attestations outside `{wall_epoch, wall_epoch+1}` before the gossip
+layer sees them and so bounds how much of the two-epoch window any of this can
+recover.
