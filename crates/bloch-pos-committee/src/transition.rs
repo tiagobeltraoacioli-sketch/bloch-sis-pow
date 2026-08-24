@@ -151,6 +151,7 @@ use crate::state_root::{
 use crate::tokenomics_v4;
 use sha3::{Digest, Sha3_256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The Genesis-4 block version (§5.3), re-exported so this module's readers
 /// see the same constant the header encoder stamps.
@@ -949,6 +950,69 @@ thread_local! {
 /// The calling thread's [`ROOT_COMPUTATION_COUNT`]. Observability only.
 pub fn root_computations() -> u64 {
     ROOT_COMPUTATION_COUNT.with(|c| c.get())
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// The boundary-partition divergence detector (unconditional, NON-FATAL)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Times the epoch-boundary tally dropped attestations that the inclusion
+/// check at step 8 had already admitted, since this process started.
+///
+/// **Present in the release binary.** No `cfg`, no `debug_assert!`. The
+/// workspace `[profile.release]` sets `overflow-checks` and not
+/// `debug-assertions`, so the `debug_assert_eq!` that was the only guard on
+/// the 2026-08-21 roster split was absent from every binary mainnet ran — the
+/// defect was invisible in production for the whole time it was live. This
+/// counter is the thing that makes it visible.
+///
+/// Process-wide rather than thread-local, following
+/// [`crate::forkchoice::FORKCHOICE_STEPS`]: an operator scraping a node wants
+/// one number for the process, and the tests that read it assert it *moved*
+/// rather than an exact value, so a concurrent test cannot race them.
+#[doc(hidden)]
+pub static BOUNDARY_VOTE_DROPS: AtomicU64 = AtomicU64::new(0);
+
+/// Record and report one boundary-partition divergence. **Never panics, never
+/// touches consensus state, and never changes the returned post-state.**
+///
+/// # Why this is a detector and not a `consensus_invariant!`
+///
+/// A panic here would halt the node, which is the right trade for a condition
+/// that can only fire on an internal code bug — and this one cannot make that
+/// claim. `apply_slashing_evidence` sets `slashed = true` and
+/// `exit_epoch = epoch` MID-EPOCH, and `duty_roster_at` filters on exactly
+/// that predicate, so the roster's index set legitimately shrinks between two
+/// blocks of one epoch. Votes admitted against the wider partition are then
+/// tallied against the narrower one and dropped, by the rule as written.
+/// Anyone who can get valid equivocation evidence included can cause it, so an
+/// unconditional panic at this site would be a remotely triggerable halt of
+/// every node that applied the same block. See
+/// `mid_epoch_slashing_changes_the_roster_index_set_within_one_epoch`.
+///
+/// So the requirement behind the guard — *production must be able to SEE this,
+/// which today it cannot* — is met without the fatality: an unconditional,
+/// loud, structured, rate-limited line on stderr plus a counter. The
+/// `debug_assert_eq!` at the call site stays, because in a test build the
+/// condition IS a bug and should stop the run.
+///
+/// Rate-limited by power-of-two backoff rather than by a clock: this crate has
+/// no time source and must not acquire one (§5.5), and a replaying node can
+/// close thousands of epochs in seconds. The first eight are printed, then
+/// every doubling, so a live divergence is never silent and a backfill can
+/// never drown the log.
+#[cold]
+fn report_boundary_vote_drop(closing: u64, admitted: usize, tallied: usize) {
+    let n = BOUNDARY_VOTE_DROPS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 8 || n.is_power_of_two() {
+        eprintln!(
+            "BLOCH-CONSENSUS-DIVERGENCE boundary_partition_dropped_votes \
+             epoch={closing} admitted={admitted} tallied={tallied} dropped={} occurrences={n} \
+             note=the inclusion check at step 8 and the boundary tally partitioned different \
+             rosters; expected only after a mid-epoch slashing, a bug otherwise",
+            admitted.saturating_sub(tallied)
+        );
+    }
 }
 
 /// The committed post-state of one block — [`StateTransition::State`].
@@ -2682,6 +2746,14 @@ impl CommittedState {
             // Until that lands, this stays a test-build guard, and the
             // divergence is pinned by
             // `mid_epoch_slashing_changes_the_roster_index_set_within_one_epoch`.
+            // The unconditional half of the guard: present in the release
+            // binary, never fatal. See `report_boundary_vote_drop` for why
+            // fatal is wrong here and what would have to change to make it
+            // right. Runs BEFORE the debug_assert so a test build records the
+            // occurrence before it stops.
+            if epoch_votes.attestations.len() != votes.len() {
+                report_boundary_vote_drop(closing, votes.len(), epoch_votes.attestations.len());
+            }
             debug_assert_eq!(
                 epoch_votes.attestations.len(),
                 votes.len(),
@@ -3916,6 +3988,15 @@ mod tests {
     /// genesis mix — reachable arithmetic, not an unreachable branch.
     #[test]
     fn the_rule_reads_a_boundary_the_state_still_retains() {
+        // `seed_for_epoch` goes through `rehearsal_mutate`, which reads the
+        // process-global `MUTATE_SEED`; `randao_mix_at` does not. So this test
+        // is a READER of that global and must be excluded from the A/B
+        // rehearsal, or it compares a mutated seed against an unmutated mix and
+        // fails by exactly one bit of byte 0. Observed 2026-08-24: left[0]=144,
+        // right[0]=145. Pre-existing race, made visible by adding tests that
+        // changed the harness's interleaving. Flipping a global is only safe
+        // if every reader takes the same lock.
+        let _g = AB_HOOKS.lock().unwrap_or_else(|e| e.into_inner());
         let (t, g, mut chains) = setup(8);
         let mut st = g;
         let mut checked = 0;
@@ -6720,6 +6801,9 @@ mod tests {
     /// reason, which is the failure mode that makes a negative test worthless.
     #[test]
     fn a_fully_leaked_validator_leaves_the_schedule() {
+        // Holds a roster with a zero-stake member, so it must be excluded from
+        // `RESTORE_ZERO_STAKE_FILTER` (see `committees::tests`).
+        let _h = crate::params::rehearsal::HOOK.lock().unwrap_or_else(|e| e.into_inner());
         let (_t, g, _c) = setup(4);
         let absent = 1u32;
         let unleaked = g.duty_roster_at(0);
@@ -6796,6 +6880,83 @@ mod tests {
         );
     }
 
+    /// The boundary-divergence DETECTOR fires, and it is in the release
+    /// binary.
+    ///
+    /// Drives the real `close_epoch` over a real mid-epoch slash: votes are
+    /// admitted against the 8-member partition, validator 3 is then removed
+    /// from the roster exactly the way `apply_slashing_evidence` removes it,
+    /// and the boundary tallies against the 7-member partition. The counter
+    /// must move. The `debug_assert_eq!` beside it must ALSO still fire in a
+    /// test build, so the close is run under `catch_unwind` — a test build is
+    /// supposed to stop on this, production is supposed to log it and carry on.
+    #[test]
+    fn the_boundary_divergence_detector_fires_on_a_mid_epoch_slash() {
+        use std::panic::AssertUnwindSafe;
+        use std::sync::atomic::Ordering::Relaxed;
+        let _h = crate::params::rehearsal::HOOK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let (_t, g, _c) = setup(8);
+        let mut st = g.clone();
+        st.epoch = 1;
+
+        // Exactly what step 8 would have admitted: every member of the epoch's
+        // partition, voting in its own slot, off the real seed and the real
+        // roster.
+        let seed = st.seed_for_epoch(1);
+        let roster = st.duty_roster_at(1);
+        let partition = committees::epoch_committees(&seed, 1, &roster);
+        for (i, members) in partition.iter().enumerate() {
+            for v in members {
+                let d = AttestationData {
+                    slot: SLOTS_PER_EPOCH + i as u64,
+                    head: [0x11; 32],
+                    source_epoch: 0,
+                    source_root: *g.head.as_bytes(),
+                    target_epoch: 1,
+                    target_root: [0x11; 32],
+                };
+                st.pending_votes.insert((*v, d.signing_root()), d);
+            }
+        }
+        assert_eq!(st.pending_votes.len(), 8, "fixture must actually carry votes");
+
+        // The mid-epoch slash, written the way apply_slashing_evidence writes
+        // it — the unit seam, so the test does not need valid PQ evidence.
+        {
+            let rec = st.validators.get_mut(&3).unwrap();
+            rec.slashed = true;
+            rec.exit_epoch = 1;
+        }
+
+        let before = BOUNDARY_VOTE_DROPS.load(Relaxed);
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let closed = std::panic::catch_unwind(AssertUnwindSafe(|| st.close_epoch()));
+        std::panic::set_hook(prev);
+
+        assert!(
+            BOUNDARY_VOTE_DROPS.load(Relaxed) > before,
+            "the boundary dropped votes and the unconditional detector did not count it — \
+             production would be blind to this again"
+        );
+        assert!(
+            closed.is_err(),
+            "the debug_assert beside the detector must still stop a TEST build; if it stopped \
+             firing, a test run can no longer tell this apart from a healthy boundary"
+        );
+
+        // And the detector really is unconditional at the call site.
+        let src = include_str!("transition.rs");
+        let at = src.find("report_boundary_vote_drop(closing,").expect("the call site moved");
+        let window = &src[at.saturating_sub(300)..at];
+        assert!(
+            !window.contains("#[cfg(") && !window.contains("debug_assert"),
+            "the detector call has grown a cfg gate or moved inside a debug_assert; it is a \
+             release-profile check or it is nothing"
+        );
+    }
+
     /// The partition-coverage guard must be in the **release** binary.
     ///
     /// The workspace `[profile.release]` sets `overflow-checks = true` and does
@@ -6868,6 +7029,8 @@ mod tests {
     /// with its own flag day, out of scope for the 2026-08-24 unification.
     #[test]
     fn mid_epoch_slashing_changes_the_roster_index_set_within_one_epoch() {
+        // Same reason as above: the control half builds a fully-leaked roster.
+        let _h = crate::params::rehearsal::HOOK.lock().unwrap_or_else(|e| e.into_inner());
         let (_t, g, _c) = setup(8);
         let seed = g.seed_for_epoch(g.epoch);
         let before = g.duty_roster_at(g.epoch);
