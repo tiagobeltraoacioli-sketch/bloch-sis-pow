@@ -30,6 +30,15 @@ F6 look-ahead, the seed for epoch `N` is fixed at the close of epoch `N − 2`,
 so a given slot's committee is public **16 to 32 minutes** before the slot
 opens (pre-F6 it was 0.5 to 16 minutes).
 
+> **Correction, 2026-08-24.** The sentence above described the intended rule,
+> not the shipped one. Until 2026-08-24 no production path read the F6
+> look-ahead: both `CommittedState::seed_for_epoch` and `Engine::seed_for` took
+> the boundary at `N − 1`. So the deployed warning window was the **pre-F6 0.5
+> to 16 minutes**, not 16 to 32 — the DoS exposure this document priced was
+> understated for as long as the claim stood. The wider window becomes real
+> only with the binary that actually routes both readers through
+> `committees::seed_epoch`.
+
 ## What the attack buys, priced
 
 An attacker who can knock 6–7 known machines offline for one 30-second slot:
