@@ -65,15 +65,45 @@ what this defect did. Both sides of the compared condition are derived from
 already-validated committed state, not from attacker-supplied input, so this is
 not a remotely-triggerable denial of service.
 
-## 3. Fork choice is NOT patched
+## 3. Fork choice is NOT patched — but NOT for the reason we first gave
 
-Two forked nodes fed all blocks from both branches do not converge, because
-`head()` starts at `state.finality().justified.root` and walks only downward.
-That is a consequence of the refused attestation, not an independent defect:
-with no accepted attestation the tally never includes the other branch, so the
-`cp.epoch > current_justified.epoch` advance never fires. Walking down from the
-justified checkpoint is correct LMD-GHOST; forcing fork choice outside the
-justified subtree would trade a liveness bug for a safety bug.
+The first explanation on this branch was that fork choice is latched inside the
+justified subtree: `head()` starts at `state.finality().justified.root` and
+walks only downward, so a node that justified a point on its own branch can
+never select a block outside that subtree. A comment in `engine.rs` (commit
+`b96a633e`) states this as fact.
+
+**It was measured and it is FALSE.** In both experiments — the in-process test
+and the 8-node devnet — nothing beyond genesis was ever justified: `just=e0`,
+`fin=e0`, on both sides. The justified checkpoint IS genesis in both nodes, and
+both branches are children of it in both engines. The downward walk sees both
+branches perfectly. The latch was never engaged.
+
+**The real mechanism is a fourth one, and it is WEIGHT asymmetry.**
+`forkchoice_head` (`engine.rs:1152-1156`) passes `self.state.active_validators()`
+— the stake table of the node's OWN head state — into LMD-GHOST. And
+`close_epoch` does `rec.staked_sat += payout.operator` with
+`credits: u64::from(attested)` (`transition.rs:2617-2637`). So every epoch
+boundary inflates exactly those validators that participated on the branch that
+node applied. Measured at 8.27%. Same blocks, same DAG, same anchor, opposite
+winner: each node weighs its own branch more heavily.
+
+The block does not die anywhere. `blocks_known=137` against `height=89` — 48
+blocks received, stored, never selected — with `behind_by_slots` 0-2. It arrives
+and fork choice does not pick it.
+
+Why we still do not patch fork choice or the stake table: with n=4, where the
+committee is everyone and `NotInCommittee=0`, the network heals through a
+120-slot fork DESPITE the weight bias — live attestations dominate the 8.27%.
+The boundary between healing and not healing is the COMMITTEE, not the fork
+depth. So restoring attestation flow may be sufficient on its own, and
+rewriting the fork-choice stake table would be a far deeper consensus change.
+The deciding measurement is the n=8 arm against the corrected binary; it is
+recorded with the proof scenarios.
+
+Walking down from the justified checkpoint remains correct LMD-GHOST
+regardless, and forcing fork choice outside the justified subtree would trade a
+liveness bug for a safety bug.
 
 ## 4. What the flag day still is
 
