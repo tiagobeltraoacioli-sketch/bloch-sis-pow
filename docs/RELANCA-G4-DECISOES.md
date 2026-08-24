@@ -227,3 +227,28 @@ unauditable choice — whereas preserving history keeps it reversible.
   head an honest node picks and needs the founder's explicit go.
 - `b96a633e`'s justified-latch comment is on `pmo10/particao-repro`, not on this
   branch. Left as a noted debt.
+
+## 9. In this repository, a clean merge is not a working merge
+
+`git merge` reported "Automatic merge went well" for two branches that both
+carried the same `finality.rs` material from `9c39fb75`, and the result did not
+compile:
+
+```
+error[E0592]: duplicate definitions with name `denominator_ignores_leak`
+```
+
+One branch had MOVED the function out of `process_epoch`'s doc comment (a
+correct cleanup — it had been wedged inside the comment, leaving `process_epoch`
+documented by two sentences about a test hook); the other left it where it was.
+To git those are two insertions at two different places, so it kept both. Clean
+merge, two copies, and the doc comment now attached to the duplicate.
+
+**Compile before trusting a merge.** This is exactly the class of failure a
+green `git merge` hides, and on 2026-08-24 a branch was declared delivered while
+not compiling for precisely this reason.
+
+Checked on this branch: `denominator_ignores_leak` appears once, and there are
+no duplicated `fn`/`const`/`static` identifiers in `finality.rs`. That is a
+grep, not a compiler — see the status section of the handover for what has and
+has not actually been built.
