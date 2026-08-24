@@ -1427,17 +1427,13 @@ impl CommittedState {
     /// fixed at the close of epoch `epoch - 1` (§6.3), so the schedule is
     /// knowable exactly one epoch ahead and no earlier.
     ///
-    /// # The look-ahead, and the flag day that turns it on
+    /// # The look-ahead
     ///
-    /// `back` is `1` below [`crate::params::ANCESTRY_SEED_ACTIVATION_EPOCH`]
-    /// and `1 + `[`crate::committees::MIN_SEED_LOOKAHEAD_EPOCHS`] at and above
-    /// it. Below the flag day this function is the pre-change expression byte
-    /// for byte, so a mixed fleet reaches one verdict on every block; the
-    /// constant is `u64::MAX` on this branch and arming it is the founder's
-    /// call. The gate reads the `epoch` ARGUMENT — the epoch whose duties are
-    /// being derived, which every caller takes from the block's own committed
-    /// state — never a node-local clock. Same shape as
-    /// [`Self::consensus_roster_at`], for the same 2026-08-08 reason.
+    /// `back = 1 + `[`crate::committees::MIN_SEED_LOOKAHEAD_EPOCHS`],
+    /// unconditionally — there is no flag day. See
+    /// [`crate::params`]'s note on the removed
+    /// `ANCESTRY_SEED_ACTIVATION_EPOCH` for why the gate went away with the
+    /// coordinated relaunch, and why that is not a precedent.
     ///
     /// `back = 2` is what closes finding F6: at `back = 1` the seed for epoch
     /// `E` is the mix at the close of `E − 1`, so the trailing proposers of
@@ -1448,25 +1444,15 @@ impl CommittedState {
     /// closed epoch is `E − 1`, and `close_epoch` keeps
     /// [`crate::state_root::RANDAO_BOUNDARIES_RETAINED`]` = 2` boundaries —
     /// `{E − 2, E − 1}`. `back = 2` reads `E − 2`, which is retained. So this
-    /// flag day needs NO change to the retention window, and therefore none to
-    /// the state root (`state_root::randao_window` folds exactly those
-    /// retained boundaries into the tree). It changes the seed VALUE and
-    /// nothing else. The two other callers are covered too: the close-epoch
-    /// vote partition asks for `closing` before step 3 inserts, when
-    /// `{closing − 2, closing − 1}` is retained, and the next-epoch partition
-    /// asks for `closing + 1` after it, when `{closing − 1, closing}` is.
-    ///
-    /// **The flag-day boundary.** A block whose own epoch is exactly the
-    /// activation epoch `A` uses the NEW rule, and its input is
-    /// `boundary_mixes[A − 2]` — a mix fixed one full epoch before the switch
-    /// and retained across it. There is no bootstrap case at the boundary and
-    /// no window in which the new rule is uncomputable.
+    /// needs NO change to the retention window, and therefore none to the
+    /// state root (`state_root::randao_window` folds exactly those retained
+    /// boundaries into the tree). The two other callers are covered too: the
+    /// close-epoch vote partition asks for `closing` before step 3 inserts,
+    /// when `{closing − 2, closing − 1}` is retained, and the next-epoch
+    /// partition asks for `closing + 1` after it, when `{closing − 1,
+    /// closing}` is.
     pub fn seed_for_epoch(&self, epoch: u64) -> [u8; 32] {
-        let back = if epoch < Self::ancestry_seed_activation() {
-            1
-        } else {
-            1 + crate::committees::MIN_SEED_LOOKAHEAD_EPOCHS
-        };
+        let back = 1 + crate::committees::MIN_SEED_LOOKAHEAD_EPOCHS;
         let Some(src) = epoch.checked_sub(back) else {
             return Self::rehearsal_mutate(self.genesis_mix);
         };
@@ -1494,22 +1480,6 @@ impl CommittedState {
         seed
     }
 
-    /// The activation epoch in force. In a release build this is the constant
-    /// and nothing else: the override is `cfg(test)` and cannot be compiled
-    /// into a shipped binary. An env var or a config knob here would be a way
-    /// for one operator to fork the network by restarting.
-    #[inline]
-    fn ancestry_seed_activation() -> u64 {
-        #[cfg(test)]
-        {
-            let v = crate::params::rehearsal::ACTIVATION_OVERRIDE
-                .load(std::sync::atomic::Ordering::Relaxed);
-            if v != u64::MAX {
-                return v;
-            }
-        }
-        crate::params::ANCESTRY_SEED_ACTIVATION_EPOCH
-    }
 
     /// The duty roster for `epoch`: active registry records plus activated
     /// delegated stake, with the genesis-cohort cap applied last.
@@ -3772,27 +3742,18 @@ mod tests {
         }
     }
 
-    // ── The seed look-ahead flag day: A/B rehearsal with a control ─────────
+    // ── The deterministic chain comparator, and its tripwire ───────────────
     //
-    // The claim is "the armed and the inert half are BIT-IDENTICAL before the
-    // flag day, and only diverge after it". A wall-clock devnet cannot support
-    // that claim: on a loaded box each half misses whichever slots the
-    // scheduler starves it of, the two halves miss different ones, and the
-    // comparator reports scheduling noise as consensus divergence. Loosening
-    // the comparator to absorb that noise is the defect that lets a suite pass
-    // empty — so the comparator is not loosened; the clock is removed.
-    //
-    // What runs below is the REAL rule under test: real `build_block` (the
-    // producer's own walk), real `apply_block` (every validation step,
-    // including the proposer draw at step 4 and the committee filter at step
-    // 8), real `close_epoch`, real state roots. What is replaced is the
-    // driver: slots are stepped by a `for`, the RANDAO chains come from fixed
-    // seeds, and nothing reads a clock. A run is a pure function of
-    // (validator count, activation epoch, mutation flag). Machine load can
-    // change how LONG a run takes; it cannot change what a run produces.
+    // Real `build_block` (the producer's own walk), real `apply_block` (every
+    // validation step, including the proposer draw at step 4 and the committee
+    // filter at step 8), real `close_epoch`, real state roots. What is
+    // replaced is the DRIVER: slots are stepped by a `for`, the RANDAO chains
+    // come from fixed seeds, and nothing reads a clock. A run is a pure
+    // function of (validator count, mutation flag), so machine load can change
+    // how LONG a run takes and not what it produces — which is what makes a
+    // bit-for-bit chain comparison meaningful on a box under load.
 
-    /// `ACTIVATION_OVERRIDE`/`MUTATE_SEED` are process globals and cargo runs
-    /// tests in parallel threads. Only the tests below touch them.
+    /// `MUTATE_SEED` is a process global and cargo runs tests in parallel.
     static AB_HOOKS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Everything one node believed after one slot. Eight fields; `assert_eq!`
@@ -3810,14 +3771,8 @@ mod tests {
         partition: Vec<Vec<u32>>,
     }
 
-    /// One deterministic run of the chain. `activation` goes into the
-    /// test-only override, which is the ONLY way an armed value enters this
-    /// rehearsal — `params::ANCESTRY_SEED_ACTIVATION_EPOCH` stays `u64::MAX`
-    /// in the source tree, and `the_flag_day_is_not_armed_on_this_branch`
-    /// pins that.
-    fn ab_run(activation: u64, mutate: bool, slots: u64, n: u32) -> Vec<AbRecord> {
+    fn ab_run(mutate: bool, slots: u64, n: u32) -> Vec<AbRecord> {
         use std::sync::atomic::Ordering::Relaxed;
-        crate::params::rehearsal::ACTIVATION_OVERRIDE.store(activation, Relaxed);
         crate::params::rehearsal::MUTATE_SEED.store(mutate, Relaxed);
 
         let (t, g, mut chains) = setup(n);
@@ -3842,21 +3797,15 @@ mod tests {
                 partition: crate::committees::epoch_committees(&seed, epoch, &roster),
             });
         }
-
-        crate::params::rehearsal::ACTIVATION_OVERRIDE.store(u64::MAX, Relaxed);
         crate::params::rehearsal::MUTATE_SEED.store(false, Relaxed);
         out
     }
 
     /// Compare two runs by LOGICAL SLOT NUMBER, never by position in a
-    /// sequence of blocks. Returns `(content differences, fields compared)`
-    /// over the slots strictly below `before`.
-    fn ab_diff(a: &[AbRecord], b: &[AbRecord], before: u64) -> (usize, usize) {
+    /// sequence of blocks. Returns (content differences, fields compared).
+    fn ab_diff(a: &[AbRecord], b: &[AbRecord]) -> (usize, usize) {
         let (mut d, mut fields) = (0usize, 0usize);
         for (x, y) in a.iter().zip(b.iter()) {
-            if x.slot >= before {
-                continue;
-            }
             assert_eq!(x.slot, y.slot, "the comparator lost slot alignment");
             fields += 8;
             if x != y {
@@ -3866,18 +3815,11 @@ mod tests {
         (d, fields)
     }
 
-    /// The branch must ship INERT. Arming is the founder's call, on a runbook,
-    /// at an epoch that is strictly in the future when it is written.
-    #[test]
-    fn the_flag_day_is_not_armed_on_this_branch() {
-        assert_eq!(crate::params::ANCESTRY_SEED_ACTIVATION_EPOCH, u64::MAX);
-    }
-
     /// The `back` arithmetic in `seed_for_epoch` and the boundary epoch
     /// `committees::seed_epoch` names are the same arithmetic. If either side
     /// is edited alone, this fails.
     #[test]
-    fn the_armed_lookahead_matches_the_committee_crates_seed_epoch() {
+    fn the_lookahead_matches_the_committee_crates_seed_epoch() {
         let back = 1 + crate::committees::MIN_SEED_LOOKAHEAD_EPOCHS;
         for e in 0u64..4_000 {
             assert_eq!(
@@ -3890,18 +3832,12 @@ mod tests {
 
     /// **The retention claim, tested rather than argued.**
     ///
-    /// The spec for this flag day rests on "`RANDAO_BOUNDARIES_RETAINED = 2`
-    /// already holds `E − 2` while `E` is open, so the look-ahead needs no
-    /// retention change and therefore no state-root change". If that were
-    /// false the armed rule would silently fall back to the genesis mix — a
-    /// fallback that IS reachable arithmetic, not an unreachable branch. So it
-    /// is checked on a real chain rather than asserted in a doc comment.
+    /// The whole "no state-root change" argument rests on
+    /// `RANDAO_BOUNDARIES_RETAINED = 2` already holding `E − 2` while `E` is
+    /// open. If that were false the rule would silently fall back to the
+    /// genesis mix — reachable arithmetic, not an unreachable branch.
     #[test]
-    fn the_armed_rule_reads_a_boundary_the_state_still_retains() {
-        let _g = AB_HOOKS.lock().unwrap_or_else(|e| e.into_inner());
-        use std::sync::atomic::Ordering::Relaxed;
-        crate::params::rehearsal::ACTIVATION_OVERRIDE.store(2, Relaxed);
-
+    fn the_rule_reads_a_boundary_the_state_still_retains() {
         let (t, g, mut chains) = setup(8);
         let mut st = g;
         let mut checked = 0;
@@ -3913,133 +3849,51 @@ mod tests {
                 let src = e - (1 + crate::committees::MIN_SEED_LOOKAHEAD_EPOCHS);
                 assert!(
                     st.randao_mix_at(src).is_some(),
-                    "epoch {e} is open and boundary {src} — the seed the armed rule needs — \
-                     has already been evicted; the look-ahead WOULD need a retention change \
-                     and therefore a state-root change"
+                    "epoch {e} is open and boundary {src} — the seed the rule needs — has \
+                     already been evicted; the look-ahead WOULD need a retention change and \
+                     therefore a state-root change"
                 );
                 assert_eq!(
                     st.seed_for_epoch(e),
                     st.randao_mix_at(src).unwrap(),
-                    "the armed seed did not come from the retained boundary it claims"
+                    "the seed did not come from the retained boundary it claims"
                 );
                 checked += 1;
             }
         }
-        assert!(checked > 64, "only {checked} slots reached the armed rule");
-        crate::params::rehearsal::ACTIVATION_OVERRIDE.store(u64::MAX, Relaxed);
+        assert!(checked > 64, "only {checked} slots reached the rule");
     }
 
-    /// **The A/B with the control.**
+    /// The driver is deterministic: same inputs, same chain, bit for bit.
+    /// Without this the mutation below would be meaningless — a comparator
+    /// that reddens at everything would pass it.
     #[test]
-    fn the_halves_are_identical_before_the_flag_day_and_diverge_after() {
+    fn two_identical_runs_produce_an_identical_chain() {
         let _g = AB_HOOKS.lock().unwrap_or_else(|e| e.into_inner());
-        const ACTIVATION: u64 = 2;
-        let boundary = crate::schedule::first_slot_of_epoch(ACTIVATION).unwrap();
-        let slots = boundary + crate::SLOTS_PER_EPOCH;
-
-        let inert = ab_run(u64::MAX, false, slots, 8);
-        let armed = ab_run(ACTIVATION, false, slots, 8);
-
-        let (d, fields) = ab_diff(&inert, &armed, boundary);
-        println!(
-            "A/B BEFORE the flag day: {} slots compared, {fields} fields, {d} differences",
-            boundary - 1
-        );
-        assert_eq!(
-            d, 0,
-            "NOT INERT: the halves differ BEFORE the flag day, which means arming this \
-             constant would fork the fleet on the way to the boundary rather than at it"
-        );
-
-        let after: usize = inert
-            .iter()
-            .zip(armed.iter())
-            .filter(|(x, y)| x.slot >= boundary && x != y)
-            .count();
-        let after_total = inert.iter().filter(|x| x.slot >= boundary).count();
-        println!("A/B AFTER  the flag day: {after} of {after_total} slot-records differ");
-        assert!(
-            after > 0,
-            "the flag day changed nothing — the gate is not reaching the seed"
-        );
-
-        // And the divergence is the RIGHT one, recomputed from the recorded
-        // observables rather than by asking the code under test again: the
-        // mix at the CLOSE of epoch `c` is the running mix after the last
-        // block of `c`, so it is the `randao_mix` of the highest-slot record
-        // whose epoch is `c`. The armed seed for `E` must be that value at
-        // `c = E - 2`; the inert seed must be it at `c = E - 1`.
-        let close_of = |run: &[AbRecord], c: u64| -> Option<[u8; 32]> {
-            run.iter().filter(|r| r.epoch == c).next_back().map(|r| r.randao_mix)
-        };
-        let mut armed_checked = 0;
-        for (x, y) in inert.iter().zip(armed.iter()) {
-            if y.epoch < 2 {
-                continue;
-            }
-            if let Some(m) = close_of(&armed, y.epoch - 2) {
-                assert_eq!(
-                    y.seed, m,
-                    "armed slot {}: the seed is not the boundary mix of epoch {}",
-                    y.slot,
-                    y.epoch - 2
-                );
-                armed_checked += 1;
-            }
-            if let Some(m) = close_of(&inert, x.epoch - 1) {
-                assert_eq!(
-                    x.seed, m,
-                    "inert slot {}: the seed is not the boundary mix of epoch {}",
-                    x.slot,
-                    x.epoch - 1
-                );
-            }
-        }
-        assert!(
-            armed_checked > 0,
-            "the armed rule was never reached — the rehearsal proved nothing"
-        );
-        println!("ancestry check: {armed_checked} armed slot-records traced to their E-2 boundary");
+        let slots = crate::SLOTS_PER_EPOCH * 2;
+        let a = ab_run(false, slots, 8);
+        let b = ab_run(false, slots, 8);
+        let (d, fields) = ab_diff(&a, &b);
+        println!("DETERMINISM: {slots} slots, {fields} fields compared, {d} differences");
+        assert_eq!(d, 0, "the driver is not deterministic; no comparison below means anything");
     }
 
-    /// **The comparator's own tripwire.**
-    ///
-    /// Plant a one-bit difference in the seed of ONE half and re-run the exact
-    /// comparison the test above passes. It must go red BEFORE the boundary. A
-    /// comparator that cannot see a planted difference is not comparing
-    /// anything — which is how a whole suite was found passing empty.
-    ///
-    /// The second half of the tripwire is the one that is usually missing: a
-    /// comparator that reports red at EVERYTHING would also pass the first
-    /// assertion. So the clean run is repeated and required to reproduce
-    /// itself exactly.
+    /// **The comparator's tripwire.** Plant a one-bit difference in the seed
+    /// and require the comparator to go red. A comparator that cannot see a
+    /// planted difference is not comparing anything — which is how a whole
+    /// suite was once found passing empty.
     #[test]
     fn the_comparator_bites_a_planted_difference() {
         let _g = AB_HOOKS.lock().unwrap_or_else(|e| e.into_inner());
-        const ACTIVATION: u64 = 2;
-        let boundary = crate::schedule::first_slot_of_epoch(ACTIVATION).unwrap();
-        let slots = boundary - 1;
-
-        let clean = ab_run(u64::MAX, false, slots, 8);
-        let mutated = ab_run(u64::MAX, true, slots, 8);
-        let (d, fields) = ab_diff(&clean, &mutated, boundary);
+        let slots = crate::SLOTS_PER_EPOCH * 2;
+        let clean = ab_run(false, slots, 8);
+        let mutated = ab_run(true, slots, 8);
+        let (d, fields) = ab_diff(&clean, &mutated);
         println!(
-            "MUTATION: {fields} fields compared before the flag day, {d} differences \
-             (0 would mean the comparator is blind)"
+            "MUTATION: {fields} fields compared, {d} differences (0 would mean the \
+             comparator is blind)"
         );
-        assert!(
-            d > 0,
-            "the comparator did not see a one-bit seed difference planted before the \
-             boundary — it is not comparing anything and the A/B proves nothing"
-        );
-
-        let clean_again = ab_run(u64::MAX, false, slots, 8);
-        let (d2, _) = ab_diff(&clean, &clean_again, boundary);
-        assert_eq!(
-            d2, 0,
-            "two identical runs differ in {d2} slot-records — the driver is not \
-             deterministic and neither the A/B nor this mutation means anything"
-        );
+        assert!(d > 0, "the comparator did not see a one-bit seed difference");
     }
 
     fn setup(n: u32) -> (Transition<OkVerifier>, CommittedState, Vec<RandaoChain>) {

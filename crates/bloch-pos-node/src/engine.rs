@@ -705,23 +705,83 @@ impl Engine {
     /// refactor and not a change. It is worth making because the two are the
     /// duty view and the consensus authority for the SAME quantity: a node
     /// that proposes off one and is validated against the other produces
-    /// blocks its own transition rejects. Behind
-    /// [`bloch_pos_committee::params::ANCESTRY_SEED_ACTIVATION_EPOCH`] the
-    /// authority's expression changes, and a second copy here would have been
-    /// a flag day the node silently did not take.
+    /// blocks its own transition rejects. The look-ahead lives in that one
+    /// function now, so a second copy here would have been a consensus rule
+    /// the node silently did not take.
     ///
-    /// # What this does NOT fix
+    /// # The anchor, and when this is the right function to call
     ///
-    /// The ANCHOR. `rolled` is this node's own head rolled forward, while the
-    /// authority evaluates the same function on the state the block is
-    /// applied against — its parent's. When the node's head is not the
-    /// block's parent the two disagree, which is the `NotInCommittee` flood:
-    /// honest votes judged against a committee the judge derived from its own
-    /// download progress. Fixing that is anchoring the duty view to the
-    /// ancestry of the thing being judged, and it needs no flag day; it is not
-    /// in this change.
+    /// `rolled` is this node's own head rolled forward. That is CORRECT for
+    /// the node's own duties — `propose` and `attest` build on the node's
+    /// head, so the head IS the parent the transition will evaluate against,
+    /// and producer and validator cannot disagree. It is WRONG for judging
+    /// somebody else's attestation, which belongs to whatever branch its
+    /// author was on. Use [`Self::seed_for_attestation`] there.
     fn seed_for(rolled: &CommittedState, epoch: u64) -> [u8; 32] {
         rolled.seed_for_epoch(epoch)
+    }
+
+    /// The committed mix at the close of epoch `epoch - 1`, read off the
+    /// ANCESTRY of `from` rather than off this node's head.
+    ///
+    /// Walks selected-parent from `from` to the last block strictly before
+    /// `first_slot_of_epoch(epoch)` and returns that block's
+    /// `header.randao_mix`. That field is consensus-checked (the transition
+    /// refuses a block whose mix is not `mix_in(parent_mix, reveal)`), and
+    /// `close_epoch` records `boundary_mixes[c] = randao_mix` at the instant
+    /// `c` closes — so the last block below `first_slot_of(c + 1)` carries
+    /// exactly the boundary mix of `c`. No state is cloned and `process_epoch`
+    /// is not run.
+    ///
+    /// `None` means "this node cannot see that far back on that branch" —
+    /// the block is missing. That is an UNJUDGEABLE input, never an invalid
+    /// one, and the caller must treat it as such.
+    fn ancestral_boundary_mix(&self, from: &[u8; 32], epoch: u64) -> Option<[u8; 32]> {
+        let first = first_slot_of_epoch(epoch)?;
+        let genesis = *self.chain[0].1.as_bytes();
+        let mut cur = *from;
+        // Bounded by the stored block count: every step moves strictly to a
+        // parent, and `blocks` is finite, so a cycle cannot spin forever.
+        for _ in 0..=self.blocks.len() {
+            if cur == genesis {
+                return Some(GENESIS_MIX);
+            }
+            let env = self.blocks.get(&cur)?;
+            if env.header.slot < first {
+                return Some(env.header.randao_mix);
+            }
+            cur = env.header.parent;
+        }
+        None
+    }
+
+    /// The sortition seed for an attestation, anchored to the ATTESTATION's
+    /// own branch instead of this node's head.
+    ///
+    /// `target_root` is, by this node's own checkpoint convention, the last
+    /// block strictly before the first slot of `epoch` on the attester's
+    /// branch. So the seed is the boundary mix of `epoch - 1 - L` read from
+    /// that block's ancestry, which is precisely what
+    /// [`CommittedState::seed_for_epoch`] would compute when the attestation's
+    /// slot is validated inside a block on that branch.
+    ///
+    /// This is the fix for the 2026-08-24 `NotInCommittee` flood. The old code
+    /// judged every arriving attestation against a committee derived from how
+    /// much of the chain THIS node had downloaded, so an honest vote from a
+    /// validator that really was in the committee was answered with a peer
+    /// penalty. Two nodes on the same branch now derive the same committee for
+    /// the same attestation no matter how far apart their heads are.
+    ///
+    /// `None` = unjudgeable from what this node holds. The caller must Ignore,
+    /// never Reject: `gossip.rs` justifies its `NotInCommittee` Reject with
+    /// "both ends compute membership from the same finalized state", and a
+    /// node that cannot reach the branch is not in a position to make that
+    /// claim about anybody.
+    fn seed_for_attestation(&self, target_root: &[u8; 32], epoch: u64) -> Option<[u8; 32]> {
+        match epoch.checked_sub(committees::MIN_SEED_LOOKAHEAD_EPOCHS) {
+            None => Some(GENESIS_MIX),
+            Some(src) => self.ancestral_boundary_mix(target_root, src),
+        }
     }
 
     /// Checkpoint root of `epoch` on the canonical chain: the latest block
@@ -1698,7 +1758,15 @@ impl Engine {
     fn judge(&self, pool: &mut AttestationPool, att: Attestation, epoch: u64) -> GossipDecision {
         let rolled = self.rolled_to(epoch);
         let roster = rolled.active_validators();
-        let seed = Self::seed_for(&rolled, epoch);
+        // THE SEED COMES FROM THE ATTESTATION'S BRANCH, not from this node's
+        // head. If we cannot reach that branch we cannot derive the committee,
+        // and an attestation we cannot judge is Ignored — never Rejected, and
+        // therefore never scored against the peer that relayed it. A syncing
+        // node used to Reject its way through every attestation on the network
+        // and graylist the very peers feeding it blocks.
+        let Some(seed) = self.seed_for_attestation(&att.data.target_root, epoch) else {
+            return GossipDecision::Ignore(bloch_pos_committee::gossip::IgnoreReason::Unjudgeable);
+        };
         let committees_at = |slot: u64| committees::committee_for_slot(&seed, slot, &roster);
         // "Do we have this block?" — canonical ids include genesis, which is
         // synthesized and never stored as an envelope; `blocks` holds every

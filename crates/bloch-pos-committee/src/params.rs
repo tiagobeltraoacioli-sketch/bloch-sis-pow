@@ -180,78 +180,53 @@ pub const TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH: u64 = 800;
 /// the 2026-08-08 `expected_bits` fork cost us.
 pub const BLOCK_BYTES_V2_ACTIVATION_EPOCH: u64 = 800;
 
-/// Flag day for the F6 seed look-ahead: the epoch at which the sortition and
-/// partition seed moves from the close of `E − 1` to the close of
-/// `E − 1 − `[`crate::committees::MIN_SEED_LOOKAHEAD_EPOCHS`].
+/// **The F6 seed look-ahead is UNCONDITIONAL.** There is no flag day.
 ///
-/// `u64::MAX` means INERT. Below this epoch
-/// [`crate::transition::CommittedState::seed_for_epoch`] evaluates the
-/// pre-change expression byte for byte, so a mixed fleet reaches one verdict
-/// on every block and no fork opens. Same idiom as
-/// [`LEAKED_ROSTER_ACTIVATION_EPOCH`]; the gate reads the `epoch` ARGUMENT of
-/// that function — the epoch whose duties are being derived, taken by every
-/// caller from the block's own committed state — never a node-local clock or
-/// a rolled counter. Arming a gate in the PAST is how 1,600,000 BLCH once
-/// escaped a write-off that never fired, so any value ever written here must
-/// be STRICTLY in the future at the moment it is written.
+/// `CommittedState::seed_for_epoch` seeds epoch `E` from the mix at the close
+/// of `E − 1 − `[`crate::committees::MIN_SEED_LOOKAHEAD_EPOCHS`], always. It
+/// was written behind an inert `ANCESTRY_SEED_ACTIVATION_EPOCH` gate first,
+/// and the gate was REMOVED on the founder's instruction (2026-08-24): the
+/// relaunch is a coordinated convergence — one storage state installed on all
+/// 64 validators, all restarted together — so there is no live network for a
+/// gradual rollout to split, which is the only thing the gate bought. Deleting
+/// it also deletes the way it could go wrong: an activation epoch armed in the
+/// past, which is how 1,600,000 BLCH once escaped a write-off that never
+/// fired.
 ///
-/// # What this closes, and what it leaves open
+/// **What this means for anyone reading later.** The rule is now implicit in
+/// the binary rather than dated in a constant, so "which seed rule does this
+/// chain run" is answered by the release, not by the state. Any FUTURE change
+/// to `seed_for_epoch` on a live network needs a gate again — this note is not
+/// a precedent for changing consensus without one.
 ///
-/// It closes F6 — proposer grinding. At `back = 1` the seed for epoch `E` is
-/// the mix at the close of `E − 1`, so the trailing proposers of `E − 1` see
-/// the partition their own reveal produces before they have to publish it and
-/// can re-sort `E` by withholding.
+/// # What the look-ahead closes
 ///
-/// It ALSO covers the dominant case of a second, unrelated defect, and the
-/// reason is worth stating precisely because it is easy to over- or
-/// under-claim. The consensus authority for the seed is this function,
-/// evaluated by `apply_block` on the state the block is applied against — its
-/// parent's, since step 2 refuses any other parent. That is ancestry and it is
-/// sound. The NODE's duty view (`bloch-pos-node/src/engine.rs`) evaluates the
-/// same function on `rolled_to(E)`: its OWN head, rolled forward. The two
-/// agree only while the node's head is the judged block's parent.
+/// F6, proposer grinding: at `back = 1` the seed for `E` is the mix at the
+/// close of `E − 1`, so the trailing proposers of `E − 1` see the partition
+/// their own reveal produces before they must publish it, and can re-sort `E`
+/// by withholding.
 ///
-/// At `back = 1` that anchor is maximally fragile, because the seed for `E` is
-/// the mix at the close of `E − 1` — a value still ACCUMULATING while the
-/// node's head sits inside `E − 1`. A node three blocks behind rolls a partial
-/// `E − 1` closed and fixes a different boundary mix, so it derives a
-/// different committee from its own download progress and answers honest votes
-/// with `NotInCommittee`. That is the 2026-08-24 flood.
+/// It also removes the sub-epoch-lag case of the duty-view ANCHOR defect,
+/// because the `E − 2` mix is frozen before `E − 1` begins. It is a mitigation
+/// of that defect, not a fix; the fix is anchoring the duty view to the
+/// ancestry of the thing being judged (`bloch-pos-node/src/engine.rs`).
 ///
-/// At `back = 2` the seed for `E` is the mix at the close of `E − 2`, FROZEN
-/// before `E − 1` began. Lag inside `E − 1` no longer moves it, and the
-/// commonest form of the defect disappears. What survives: a node more than
-/// one epoch behind (it rolls `E − 2` closed out of a partial epoch and fixes
-/// the wrong boundary), and a node whose head is on a sibling branch. So this
-/// flag day is a real mitigation and NOT a fix. The fix is anchoring the duty
-/// view to the ancestry of the thing being judged, which needs no flag day at
-/// all because the value it must compute is the one consensus already defines.
-/// Ship that separately; do not let this constant stand in for it.
-///
-/// # Cost at the boundary: none
+/// # It costs nothing at the seam
 ///
 /// `close_epoch` retains [`crate::state_root::RANDAO_BOUNDARIES_RETAINED`]` =
-/// 2` boundaries, so while epoch `E` is open the state holds `{E − 2, E −
-/// 1}`. The new rule reads `E − 2`, which is already there. No retention
-/// change, and therefore no state-root change — `state_root::randao_window`
-/// folds exactly the retained boundaries into the tree. A block whose epoch
-/// is exactly the activation epoch `A` uses the new rule and reads
-/// `boundary_mixes[A − 2]`, a mix fixed a full epoch before the switch and
-/// retained across it. There is no bootstrap case at the boundary.
-pub const ANCESTRY_SEED_ACTIVATION_EPOCH: u64 = u64::MAX;
+/// 2` boundaries, so while `E` is open the state holds `{E − 2, E − 1}`. The
+/// rule reads `E − 2`, already there. No retention change, and therefore no
+/// state-root change — `state_root::randao_window` folds exactly the retained
+/// boundaries into the tree. Pinned by
+/// `the_rule_reads_a_boundary_the_state_still_retains`.
 
-/// Test-only rehearsal hooks. `cfg(test)` throughout, so none of this can
-/// exist in a shipped binary — which is why the A/B rehearsal can run an
-/// ARMED half without an armed value ever entering the source tree.
+/// Test-only rehearsal hook. `cfg(test)`, so it cannot exist in a shipped
+/// binary. Flips one bit of every seed, so the deterministic chain comparator
+/// can be shown to go red on a planted difference — a comparator that cannot
+/// see one is not comparing anything.
 #[cfg(test)]
 pub mod rehearsal {
-    use std::sync::atomic::{AtomicBool, AtomicU64};
-
-    /// `u64::MAX` = defer to [`super::ANCESTRY_SEED_ACTIVATION_EPOCH`].
-    pub static ACTIVATION_OVERRIDE: AtomicU64 = AtomicU64::new(u64::MAX);
-    /// Flip one bit of every seed. The A/B comparator's own tripwire: a
-    /// comparator that cannot see a planted difference is not comparing
-    /// anything.
+    use std::sync::atomic::AtomicBool;
     pub static MUTATE_SEED: AtomicBool = AtomicBool::new(false);
 }
 

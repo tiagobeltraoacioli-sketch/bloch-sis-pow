@@ -89,6 +89,16 @@ pub enum IgnoreReason {
     /// This duty already produced its two distinct (slashable) attestations;
     /// further variants are noise.
     EquivocationLimit,
+    /// The node cannot derive the committee for this attestation, because it
+    /// cannot reach the branch the attestation names. Not a claim about the
+    /// attestation — a statement about what this node holds.
+    ///
+    /// This is the honest verdict for a node that is behind or syncing, and it
+    /// exists so that condition can never be mistaken for a violation. The
+    /// `NotInCommittee` Reject below is justified by "both ends compute
+    /// membership from the same finalized state"; a node that cannot reach the
+    /// branch has no standing to make that claim about anyone.
+    Unjudgeable,
 }
 
 /// The decision on one arriving attestation. The node maps this onto
