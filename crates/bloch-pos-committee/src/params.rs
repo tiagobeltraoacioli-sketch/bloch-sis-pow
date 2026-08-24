@@ -180,6 +180,81 @@ pub const TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH: u64 = 800;
 /// the 2026-08-08 `expected_bits` fork cost us.
 pub const BLOCK_BYTES_V2_ACTIVATION_EPOCH: u64 = 800;
 
+/// Flag day for the F6 seed look-ahead: the epoch at which the sortition and
+/// partition seed moves from the close of `E − 1` to the close of
+/// `E − 1 − `[`crate::committees::MIN_SEED_LOOKAHEAD_EPOCHS`].
+///
+/// `u64::MAX` means INERT. Below this epoch
+/// [`crate::transition::CommittedState::seed_for_epoch`] evaluates the
+/// pre-change expression byte for byte, so a mixed fleet reaches one verdict
+/// on every block and no fork opens. Same idiom as
+/// [`LEAKED_ROSTER_ACTIVATION_EPOCH`]; the gate reads the `epoch` ARGUMENT of
+/// that function — the epoch whose duties are being derived, taken by every
+/// caller from the block's own committed state — never a node-local clock or
+/// a rolled counter. Arming a gate in the PAST is how 1,600,000 BLCH once
+/// escaped a write-off that never fired, so any value ever written here must
+/// be STRICTLY in the future at the moment it is written.
+///
+/// # What this closes, and what it leaves open
+///
+/// It closes F6 — proposer grinding. At `back = 1` the seed for epoch `E` is
+/// the mix at the close of `E − 1`, so the trailing proposers of `E − 1` see
+/// the partition their own reveal produces before they have to publish it and
+/// can re-sort `E` by withholding.
+///
+/// It ALSO covers the dominant case of a second, unrelated defect, and the
+/// reason is worth stating precisely because it is easy to over- or
+/// under-claim. The consensus authority for the seed is this function,
+/// evaluated by `apply_block` on the state the block is applied against — its
+/// parent's, since step 2 refuses any other parent. That is ancestry and it is
+/// sound. The NODE's duty view (`bloch-pos-node/src/engine.rs`) evaluates the
+/// same function on `rolled_to(E)`: its OWN head, rolled forward. The two
+/// agree only while the node's head is the judged block's parent.
+///
+/// At `back = 1` that anchor is maximally fragile, because the seed for `E` is
+/// the mix at the close of `E − 1` — a value still ACCUMULATING while the
+/// node's head sits inside `E − 1`. A node three blocks behind rolls a partial
+/// `E − 1` closed and fixes a different boundary mix, so it derives a
+/// different committee from its own download progress and answers honest votes
+/// with `NotInCommittee`. That is the 2026-08-24 flood.
+///
+/// At `back = 2` the seed for `E` is the mix at the close of `E − 2`, FROZEN
+/// before `E − 1` began. Lag inside `E − 1` no longer moves it, and the
+/// commonest form of the defect disappears. What survives: a node more than
+/// one epoch behind (it rolls `E − 2` closed out of a partial epoch and fixes
+/// the wrong boundary), and a node whose head is on a sibling branch. So this
+/// flag day is a real mitigation and NOT a fix. The fix is anchoring the duty
+/// view to the ancestry of the thing being judged, which needs no flag day at
+/// all because the value it must compute is the one consensus already defines.
+/// Ship that separately; do not let this constant stand in for it.
+///
+/// # Cost at the boundary: none
+///
+/// `close_epoch` retains [`crate::state_root::RANDAO_BOUNDARIES_RETAINED`]` =
+/// 2` boundaries, so while epoch `E` is open the state holds `{E − 2, E −
+/// 1}`. The new rule reads `E − 2`, which is already there. No retention
+/// change, and therefore no state-root change — `state_root::randao_window`
+/// folds exactly the retained boundaries into the tree. A block whose epoch
+/// is exactly the activation epoch `A` uses the new rule and reads
+/// `boundary_mixes[A − 2]`, a mix fixed a full epoch before the switch and
+/// retained across it. There is no bootstrap case at the boundary.
+pub const ANCESTRY_SEED_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+/// Test-only rehearsal hooks. `cfg(test)` throughout, so none of this can
+/// exist in a shipped binary — which is why the A/B rehearsal can run an
+/// ARMED half without an armed value ever entering the source tree.
+#[cfg(test)]
+pub mod rehearsal {
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+
+    /// `u64::MAX` = defer to [`super::ANCESTRY_SEED_ACTIVATION_EPOCH`].
+    pub static ACTIVATION_OVERRIDE: AtomicU64 = AtomicU64::new(u64::MAX);
+    /// Flip one bit of every seed. The A/B comparator's own tripwire: a
+    /// comparator that cannot see a planted difference is not comparing
+    /// anything.
+    pub static MUTATE_SEED: AtomicBool = AtomicBool::new(false);
+}
+
 /// Domain separation tags (§6.1). Fixed 16 bytes, right-padded with zeros, so
 /// no tag can be a prefix of another.
 pub const DS_SORTITION: [u8; 16] = *b"BLCH4:SORTIT\0\0\0\0";

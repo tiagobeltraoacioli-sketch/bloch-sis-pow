@@ -693,14 +693,35 @@ impl Engine {
         st
     }
 
-    /// The sortition/partition seed for `epoch`, per the transition's own
-    /// rule: the boundary mix of `epoch - 1`, genesis mix for epoch 0.
+    /// The sortition/partition seed for `epoch` — **the transition's own
+    /// function**, not a copy of its expression.
+    ///
+    /// It used to be a re-derivation here:
+    /// `if epoch == 0 { GENESIS_MIX } else { rolled.randao_mix_at(epoch - 1)
+    /// .unwrap_or(GENESIS_MIX) }`. That is byte-for-byte what
+    /// [`CommittedState::seed_for_epoch`] evaluates — `randao_mix_at` is
+    /// `boundary_mixes.get`, and `Manifest::genesis_state` passes the very
+    /// `GENESIS_MIX` constant in as the state's `genesis_mix` — so this is a
+    /// refactor and not a change. It is worth making because the two are the
+    /// duty view and the consensus authority for the SAME quantity: a node
+    /// that proposes off one and is validated against the other produces
+    /// blocks its own transition rejects. Behind
+    /// [`bloch_pos_committee::params::ANCESTRY_SEED_ACTIVATION_EPOCH`] the
+    /// authority's expression changes, and a second copy here would have been
+    /// a flag day the node silently did not take.
+    ///
+    /// # What this does NOT fix
+    ///
+    /// The ANCHOR. `rolled` is this node's own head rolled forward, while the
+    /// authority evaluates the same function on the state the block is
+    /// applied against — its parent's. When the node's head is not the
+    /// block's parent the two disagree, which is the `NotInCommittee` flood:
+    /// honest votes judged against a committee the judge derived from its own
+    /// download progress. Fixing that is anchoring the duty view to the
+    /// ancestry of the thing being judged, and it needs no flag day; it is not
+    /// in this change.
     fn seed_for(rolled: &CommittedState, epoch: u64) -> [u8; 32] {
-        if epoch == 0 {
-            GENESIS_MIX
-        } else {
-            rolled.randao_mix_at(epoch - 1).unwrap_or(GENESIS_MIX)
-        }
+        rolled.seed_for_epoch(epoch)
     }
 
     /// Checkpoint root of `epoch` on the canonical chain: the latest block
@@ -5199,6 +5220,78 @@ mod head_root_tests {
             engine.head_state_root(),
             [0u8; 32],
             "the genesis answer must not be the default-initialised root"
+        );
+    }
+}
+
+/// **The anchor defect, on one fixture.**
+///
+/// The consensus AUTHORITY for the seed is
+/// [`CommittedState::seed_for_epoch`], evaluated by `apply_block` on the state
+/// the block is applied against — its parent's, because step 2 refuses any
+/// other (`WrongParent`). That is ancestry, and two nodes applying the same
+/// block to the same parent cannot disagree about it.
+///
+/// The node's DUTY view evaluates the same function on `rolled_to(epoch)`,
+/// which is this node's OWN head rolled forward. When the head is not the
+/// judged block's parent — a node three blocks behind, a node whose head sits
+/// on a sibling branch — the duty view and the authority part company, and the
+/// node rejects honest votes as `NotInCommittee` while every rule it is
+/// applying is the right rule.
+///
+/// The fixture below moves ONLY the head, on ONE branch, with no fork and no
+/// disagreement about any block, and shows the seed and the partition move
+/// with it. That is the whole defect: the anchor, not the expression.
+///
+/// It needs no flag day to fix — the target value is the one consensus already
+/// defines — which is why it is deliberately NOT bundled with the look-ahead
+/// gate this branch also carries.
+#[cfg(test)]
+mod duty_view_anchor {
+    use super::*;
+
+    #[test]
+    fn giving_three_blocks_back_moves_the_duty_view_seed_and_the_partition() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        for slot in 1..=70u64 {
+            engine.propose(slot);
+        }
+        assert_eq!(
+            engine.chain.len(),
+            71,
+            "the fixture needs a dense chain into epoch 2"
+        );
+
+        let e = epoch_of(engine.state.slot()) + 1;
+        assert_eq!(e, 3, "the head must be in epoch 2 so the next epoch is 3");
+        let rolled = engine.rolled_to(e);
+        let seed_caught_up = Engine::seed_for(&rolled, e);
+        let partition_caught_up =
+            committees::epoch_committees(&seed_caught_up, e, &rolled.active_validators());
+
+        // Give three blocks back. Same branch, same rules, same everything —
+        // three blocks less of it. This is what "a node that is behind" is.
+        let ancestor = *engine.chain[engine.chain.len() - 4].1.as_bytes();
+        assert!(
+            engine.do_reorg(ancestor, Vec::new()),
+            "handing three blocks back on the node's own branch must succeed"
+        );
+        assert_eq!(engine.chain.len(), 68);
+
+        let rolled_behind = engine.rolled_to(e);
+        let seed_behind = Engine::seed_for(&rolled_behind, e);
+        let partition_behind =
+            committees::epoch_committees(&seed_behind, e, &rolled_behind.active_validators());
+
+        assert_ne!(
+            seed_caught_up, seed_behind,
+            "THE DEFECT: the duty-view seed for epoch {e} changed because this node's HEAD \
+             moved, on a branch nobody disputes"
+        );
+        assert_ne!(
+            partition_caught_up, partition_behind,
+            "the seed moved but the partition did not — widen the fixture, because as \
+             written this test would not notice the bug it exists to show"
         );
     }
 }
