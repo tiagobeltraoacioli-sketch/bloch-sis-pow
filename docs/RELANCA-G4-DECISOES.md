@@ -49,21 +49,33 @@ partition, the blocks and the state roots are identical. The fix is a provable
 no-op on a healthy chain. That is scenario 3 of the proof, and it is the
 regression that protects the relaunch.
 
-## 2. The guard has to exist in the shipped binary
+## 2. The guard: the requirement stands, the panic does NOT
 
-The one check that would have caught this was a `debug_assert_eq!` in
-`close_epoch`. Workspace `[profile.release]` sets `overflow-checks = true` and
-does **not** set `debug-assertions`, so on the binary mainnet runs it was not
-there. It is now an unconditional consensus invariant rather than a blanket
-`debug-assertions = true`, which would enable every debug assert in every
-dependency and change performance for a much larger blast radius.
+The brief asked for the `debug_assert_eq!` in `close_epoch` to become an
+unconditional `assert!`, so it would survive into the release binary
+(`[profile.release]` sets `overflow-checks` but not `debug-assertions`, so
+today it is simply not there).
 
-A panic in the consensus path HALTS this node instead of letting it diverge
-silently. On a 64-validator coordinated fleet a halted node is diagnosable and
-recoverable; a diverged node poisons finality for everyone, which is precisely
-what this defect did. Both sides of the compared condition are derived from
-already-validated committed state, not from attacker-supplied input, so this is
-not a remotely-triggerable denial of service.
+**That was refuted, and the refutation is correct.** Untrusted input can drive
+that assertion, so an unconditional panic would be a remotely triggerable halt:
+
+`apply_slashing_evidence` sets `rec.slashed = true` and `rec.exit_epoch = epoch`
+the moment a valid `SlashingEvidence` transaction is applied — MID-EPOCH.
+`duty_roster_at` filters on exactly that predicate, so the roster's INDEX SET
+shrinks between one block of an epoch and the next. Votes admitted at step 8
+against the 64-member partition are then dropped by the 63-member partition at
+the boundary — legitimately, by the rule as written — and the counts differ.
+Anyone who can get valid equivocation evidence included can cause it.
+
+What ships instead: the site carries an unconditional, NON-fatal detector —
+present in release, no `cfg` — that emits a structured diagnostic (closing
+epoch, vote counts, delta) plus a counter. Untrusted input can make it FIRE, so
+it must not be fatal; but production must be able to SEE this divergence, and
+today it cannot. The `debug_assert_eq!` and a test pinning the slashing
+divergence stay alongside it.
+
+The coverage guard in the same function, which untrusted input cannot drive,
+DID become an unconditional `consensus_invariant!`.
 
 ## 3. Fork choice is NOT patched — but NOT for the reason we first gave
 
@@ -116,3 +128,26 @@ liveness bug for a safety bug.
 `LEAKED_ROSTER_ACTIVATION_EPOCH = 1400` stays armed, with its tripwire. Item 1
 is what makes keeping it armed safe: before it, the flag day fired straight
 into the partition bug.
+
+## 5. Known debts, deliberately not paid today
+
+**The slashing half of the roster split.** Removing the pre-shuffle filter
+closed the LEAK half: the leaked and unleaked rosters now carry the same index
+set whatever the leak does. It does NOT close the slashing half, because there
+the index set changes through committed membership, not through stake. A
+mid-epoch slash still re-partitions the epoch and drops the votes admitted
+before it. **This is live on mainnet today — it is not behind the epoch-1400
+gate.** The fix is to freeze the epoch's roster at its first slot, which is a
+consensus rule change; on a coordinated relaunch it would need no flag day, but
+it does need proof, and it is not proven today.
+
+**Fork-choice weight is still coupled to the leak.** `forkchoice_head` passes
+`&self.state.active_validators()`, which IS `consensus_roster_at`. Committee
+MEMBERSHIP is decoupled from stake by section 1; WEIGHT is not. Deliberately
+untouched today — rewriting the fork-choice stake table is a far deeper change.
+
+**The 8-node devnet cannot exercise section 1 at all.** It reaches epoch ~3 and
+`consensus_roster_at` returns the unleaked roster while `epoch < 1400`, so the
+roster split never operates there. A green n=8 run is NOT evidence for the
+roster unification. The only proof of section 1 that exists is the in-process
+test with its mutation switch.
