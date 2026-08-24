@@ -1424,14 +1424,27 @@ impl CommittedState {
     // ── Derivations from committed state (rule 1: no other source exists) ──
 
     /// The beacon mix that seeds sortition and partition for `epoch`: the mix
-    /// fixed at the close of epoch `epoch - 1` (§6.3), so the schedule is
-    /// knowable exactly one epoch ahead and no earlier.
+    /// fixed at the close of epoch
+    /// [`crate::committees::seed_epoch`]`(epoch)` — with the look-ahead at
+    /// one, the close of `epoch - 2` (§6.3).
+    ///
+    /// The previous sentence here read "the mix fixed at the close of epoch
+    /// `epoch - 1` ... so the schedule is knowable exactly one epoch ahead
+    /// and no earlier". That is no longer true and was the load-bearing lie:
+    /// **the schedule for `E` is knowable from the close of `E - 2`, i.e. two
+    /// epochs ahead**, and nothing that happens during `E - 1` can move it.
+    /// The wider F7 warning window is the price the look-ahead's own docs
+    /// price in ([`crate::committees::MIN_SEED_LOOKAHEAD_EPOCHS`]).
     ///
     /// # The look-ahead
     ///
-    /// `back = 1 + `[`crate::committees::MIN_SEED_LOOKAHEAD_EPOCHS`],
-    /// unconditionally — there is no flag day. See
-    /// [`crate::params`]'s note on the removed
+    /// The epoch arithmetic is NOT restated here. It is
+    /// [`crate::committees::seed_epoch`], called directly, so this reader,
+    /// the node's duty view and `committees::seed_mix` cannot drift apart
+    /// from each other — the constant used to be defined, documented and
+    /// never called, which is how both production readers ran at look-ahead
+    /// zero while the library said otherwise. Unconditional: there is no flag
+    /// day. See [`crate::params`]'s note on the removed
     /// `ANCESTRY_SEED_ACTIVATION_EPOCH` for why the gate went away with the
     /// coordinated relaunch, and why that is not a precedent.
     ///
@@ -1452,16 +1465,26 @@ impl CommittedState {
     /// partition asks for `closing + 1` after it, when `{closing − 1,
     /// closing}` is.
     pub fn seed_for_epoch(&self, epoch: u64) -> [u8; 32] {
-        let back = 1 + crate::committees::MIN_SEED_LOOKAHEAD_EPOCHS;
-        let Some(src) = epoch.checked_sub(back) else {
+        let Some(src) = crate::committees::seed_epoch(epoch) else {
+            // Epochs 0 and 1 have no boundary far enough back. They still
+            // partition differently from each other, because the epoch number
+            // is folded into the XOF seed alongside the mix.
             return Self::rehearsal_mutate(self.genesis_mix);
         };
         Self::rehearsal_mutate(match self.boundary_mixes.get(&src) {
             Some(m) => *m,
-            // Unreachable by the retention invariant (the current epoch's
-            // seed is always among the last 2 boundaries), but a consensus
-            // function is not allowed to panic on any input, so the total
-            // fallback is the genesis mix rather than an unwrap.
+            // Unreachable by the retention invariant (see above: while epoch
+            // `E` is open the retained set is exactly `{E-2, E-1}` and `E-2`
+            // is what is asked for here), but a consensus function is not
+            // allowed to panic on any input, so the total fallback is the
+            // genesis mix rather than an unwrap.
+            //
+            // NOT a safe default. If this branch is ever reachable, two nodes
+            // with different retention histories seed differently and partition
+            // differently — the exact class of defect this function was
+            // rewritten to close. `the_rule_reads_a_boundary_the_state_still_retains`
+            // is what keeps it unreachable; if that test ever fails, this
+            // fallback is the bug, not the cushion.
             None => self.genesis_mix,
         })
     }
@@ -3815,19 +3838,230 @@ mod tests {
         (d, fields)
     }
 
-    /// The `back` arithmetic in `seed_for_epoch` and the boundary epoch
-    /// `committees::seed_epoch` names are the same arithmetic. If either side
-    /// is edited alone, this fails.
+    /// **`seed_epoch` is EXERCISED by production, not merely defined.**
+    ///
+    /// It was dead for the whole life of the crate: `MIN_SEED_LOOKAHEAD_EPOCHS`
+    /// was declared, documented at length, asserted equal to its own literal
+    /// by `tests/committee.rs`, and called by nothing on the block path. Both
+    /// production readers open-coded `epoch - 1`.
+    ///
+    /// Asserting `seed_for_epoch` *calls* `seed_epoch` is not testable and
+    /// would be tautological anyway. What IS testable is the observable
+    /// consequence: on a state carrying two DIFFERENT retained boundaries,
+    /// the seed must be the one at `E-2` and must NOT be the one at `E-1`.
+    /// Point any reader back at `E-1` — or make `seed_epoch` return
+    /// `epoch - 1` — and this fails.
     #[test]
-    fn the_lookahead_matches_the_committee_crates_seed_epoch() {
-        let back = 1 + crate::committees::MIN_SEED_LOOKAHEAD_EPOCHS;
-        for e in 0u64..4_000 {
-            assert_eq!(
-                e.checked_sub(back),
-                crate::committees::seed_epoch(e),
-                "epoch {e}: the transition's boundary epoch and the committee crate's disagree"
-            );
+    fn production_reads_the_boundary_seed_epoch_names_and_not_the_later_one() {
+        let (_t, mut st, _c) = setup(4);
+        // Two distinct, recognisable boundaries, and a third value in the
+        // running mix so a reader that grabbed `randao_mix` instead is caught
+        // too.
+        let at_e_minus_2 = [0xA1u8; 32];
+        let at_e_minus_1 = [0xB2u8; 32];
+        st.epoch = 9;
+        st.randao_mix = [0xC3u8; 32];
+        st.boundary_mixes.clear();
+        st.boundary_mixes.insert(7, at_e_minus_2);
+        st.boundary_mixes.insert(8, at_e_minus_1);
+
+        assert_eq!(crate::committees::seed_epoch(9), Some(7));
+        assert_eq!(
+            st.seed_for_epoch(9),
+            at_e_minus_2,
+            "the seed for epoch 9 must be the boundary closed at 7 — the one \
+             `committees::seed_epoch(9)` names"
+        );
+        assert_ne!(
+            st.seed_for_epoch(9),
+            at_e_minus_1,
+            "THE OLD BUG: the reader went back one epoch, not two, so anything \
+             that happened during epoch 8 moved epoch 9's partition"
+        );
+        assert_ne!(st.seed_for_epoch(9), st.randao_mix, "the seed is a closed boundary, not the running mix");
+
+        // And the early epochs, where `checked_sub` underflows.
+        assert_eq!(crate::committees::seed_epoch(0), None);
+        assert_eq!(crate::committees::seed_epoch(1), None);
+        let mut g = st.clone();
+        g.genesis_mix = [0xEEu8; 32];
+        assert_eq!(g.seed_for_epoch(0), [0xEEu8; 32], "epoch 0 is seeded by the genesis mix");
+        assert_eq!(g.seed_for_epoch(1), [0xEEu8; 32], "epoch 1 has no boundary two back either");
+        // Distinct partitions all the same, because the epoch number is in
+        // the XOF seed — otherwise epochs 0 and 1 would share a committee.
+        let roster = g.duty_roster_at(0);
+        assert_ne!(
+            crate::committees::epoch_committees(&g.seed_for_epoch(0), 0, &roster),
+            crate::committees::epoch_committees(&g.seed_for_epoch(1), 1, &roster),
+            "epochs 0 and 1 share a seed; only the epoch number keeps them apart"
+        );
+    }
+
+    /// **Question 4, answered in code: the fixed binary produces a DIFFERENT
+    /// chain from the same genesis, and it starts diverging at EPOCH 1.**
+    ///
+    /// `seed_for_epoch` feeds `schedule::proposer` (step 4 of
+    /// `compute_post_state`), so moving the seed moves the proposer schedule,
+    /// so the two binaries build different chains. No correct seed fix can
+    /// avoid that; a "same chain, block for block" test on a healthy network
+    /// is asking for the fix not to have happened.
+    ///
+    /// Where it starts is the part worth pinning, because the obvious guess
+    /// is wrong. `seed_epoch` returns `None` for epochs 0 AND 1, so it is
+    /// tempting to say both are unchanged. They are not: under the OLD rule
+    /// epoch 1 read `boundary_mixes[0]` — the mix at the CLOSE of epoch 0,
+    /// with 32 slots of reveals folded in — not the genesis mix. So:
+    ///
+    /// * epoch 0: old and new both use the genesis mix. IDENTICAL.
+    /// * epoch 1: old used `boundary_mixes[0]`, new uses the genesis mix.
+    ///   DIVERGES, one epoch earlier than "from epoch 2 onward" suggests.
+    #[test]
+    fn the_new_rule_diverges_from_the_old_one_at_epoch_1_not_epoch_2() {
+        const N: u32 = 16;
+        let spe = crate::SLOTS_PER_EPOCH;
+        let (t, mut st, mut chains) = setup(N);
+        // The old rule, verbatim, as it stood before this change.
+        let old_rule = |st: &CommittedState, epoch: u64| -> [u8; 32] {
+            if epoch == 0 {
+                st.genesis_mix
+            } else {
+                st.boundary_mixes.get(&(epoch - 1)).copied().unwrap_or(st.genesis_mix)
+            }
+        };
+
+        // Epoch 0: both rules read the genesis mix, so every proposer in
+        // epoch 0 is the same under both binaries.
+        assert_eq!(st.seed_for_epoch(0), old_rule(&st, 0), "epoch 0 must be untouched");
+
+        let mut first_divergent_slot = None;
+        for slot in 1..=(spe * 3) {
+            let b = build_block(&t, &st, slot, &[], &[], &mut chains);
+            st = t.apply_block(&st, &b, &[], &[]).expect("block rejected");
+            let e = st.epoch;
+            let roster = st.consensus_roster_at(e);
+            let p_new = schedule::proposer(&st.seed_for_epoch(e), slot, &roster);
+            let p_old = schedule::proposer(&old_rule(&st, e), slot, &roster);
+            if p_new != p_old && first_divergent_slot.is_none() {
+                first_divergent_slot = Some((slot, e));
+            }
         }
+        let (slot, epoch) = first_divergent_slot
+            .expect("the two rules never drew a different proposer — the fix is not wired");
+        assert_eq!(
+            epoch, 1,
+            "the schedules first diverged in epoch {epoch} (slot {slot}); the claim under \
+             test is that divergence begins in epoch 1, because the OLD rule seeded epoch 1 \
+             from boundary_mixes[0] and the new one seeds it from the genesis mix"
+        );
+        println!(
+            "PROPOSER DIVERGENCE: first differing draw at slot {slot} (epoch {epoch}); \
+             epoch 0 is identical under both rules"
+        );
+    }
+
+    /// **The anti-partition property, and the whole point of the fix.**
+    ///
+    /// Two chains that share every block up to the close of epoch `E-2` but
+    /// DIVERGE during `E-1` must derive the SAME committee partition for `E`.
+    ///
+    /// At look-ahead zero they do not, and that is the partition: the two
+    /// branches close `E-1` with different mixes, so they partition `E`
+    /// differently the instant they split, each answers the other's
+    /// attestations with `NotInCommittee`, those votes never enter the pool,
+    /// `lmd_ghost_head` reads weight only from the pool, and fork choice never
+    /// crosses. The healing window is zero.
+    ///
+    /// The divergence here is the cheapest real one: branch B skips one slot
+    /// of `E-1`, so one reveal less is folded into the mix. Same rules, same
+    /// validators, same genesis — one branch is simply missing a block, which
+    /// is what a fork IS.
+    ///
+    /// The two `assert_ne!`s on the witnesses are load-bearing: without them
+    /// this test would pass just as well on two identical chains, which is
+    /// how a suite ends up green and empty.
+    #[test]
+    fn a_fork_born_inside_the_previous_epoch_cannot_move_this_epochs_partition() {
+        const N: u32 = 16;
+        let spe = crate::SLOTS_PER_EPOCH;
+        // Fork target: epoch 3. It is born in epoch 2 (= E-1) and both
+        // branches share everything through the close of epoch 1 (= E-2).
+        let e: u64 = 3;
+        let skipped = spe * (e - 1) + 5; // a slot strictly inside E-1
+
+        // Each branch is replayed from genesis: `RandaoChain` is not `Clone`
+        // (it is the validator's secret), so a shared-prefix fixture would
+        // have to share mutable chains between branches.
+        let run = |skip: Option<u64>| -> CommittedState {
+            let (t, mut st, mut chains) = setup(N);
+            for slot in 1..=(spe * e) {
+                if Some(slot) == skip {
+                    continue;
+                }
+                let b = build_block(&t, &st, slot, &[], &[], &mut chains);
+                st = t.apply_block(&st, &b, &[], &[]).expect("block rejected");
+            }
+            st
+        };
+        let a = run(None);
+        let b = run(Some(skipped));
+
+        assert_eq!(a.epoch, e, "branch A did not reach epoch {e}");
+        assert_eq!(b.epoch, e, "branch B did not reach epoch {e}");
+
+        // ── Witnesses: the branches really did diverge, inside E-1 only ────
+        assert_eq!(
+            a.randao_mix_at(e - 2),
+            b.randao_mix_at(e - 2),
+            "the fixture is wrong: the branches diverged BEFORE the close of \
+             epoch {} — this test would then prove nothing about a fork born \
+             inside E-1",
+            e - 2
+        );
+        assert_ne!(
+            a.randao_mix_at(e - 1),
+            b.randao_mix_at(e - 1),
+            "the fixture is empty: the branches closed epoch {} with the SAME \
+             mix, so there is no fork here and every assertion below is \
+             vacuous",
+            e - 1
+        );
+        assert_ne!(
+            a.head.as_bytes(),
+            b.head.as_bytes(),
+            "the fixture is empty: same head on both branches"
+        );
+
+        // ── The property ──────────────────────────────────────────────────
+        assert_eq!(
+            a.seed_for_epoch(e),
+            b.seed_for_epoch(e),
+            "THE PARTITION: a fork born inside epoch {} moved epoch {e}'s SEED. \
+             With look-ahead zero it does, and from that instant the two \
+             branches cannot validate each other's attestations at all.",
+            e - 1
+        );
+        let roster_a = a.duty_roster_at(e);
+        let roster_b = b.duty_roster_at(e);
+        assert_eq!(roster_a.len(), roster_b.len(), "the rosters diverged; widen the fixture");
+        assert_eq!(
+            crate::committees::epoch_committees(&a.seed_for_epoch(e), e, &roster_a),
+            crate::committees::epoch_committees(&b.seed_for_epoch(e), e, &roster_b),
+            "THE PARTITION: the two branches derive DIFFERENT committees for \
+             epoch {e}, so each rejects the other's votes as NotInCommittee and \
+             fork choice can never cross"
+        );
+
+        // The guard against a fixture that cannot see a difference at all:
+        // a DIFFERENT seed on this roster must move the partition, or the
+        // equality above is satisfied by a partition that never moves.
+        let mut other = a.seed_for_epoch(e);
+        other[0] ^= 0x01;
+        assert_ne!(
+            crate::committees::epoch_committees(&a.seed_for_epoch(e), e, &roster_a),
+            crate::committees::epoch_committees(&other, e, &roster_a),
+            "this roster partitions identically under different seeds, so the \
+             equality asserted above proves nothing — widen N"
+        );
     }
 
     /// **The retention claim, tested rather than argued.**

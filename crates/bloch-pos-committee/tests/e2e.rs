@@ -33,6 +33,23 @@
 //! `StateTransition` and against on-chain facts (headers, roots, finality),
 //! so they survive the swap unchanged.
 //!
+//! ## WARNING: this harness MODELS THE OLD SEED RULE
+//!
+//! `harness::NodeState` keeps its own `seed_mixes` map, stores the mix closed
+//! at epoch `e` under key `e + 1`, and reads `seed_mixes[current_epoch]` — i.e.
+//! it seeds epoch `E` from the close of `E - 1`, **look-ahead zero**. That was
+//! right when it was written and is no longer the rule: the production reader
+//! (`transition.rs::seed_for_epoch`) now goes through
+//! `committees::seed_epoch`, which names `E - 2`.
+//!
+//! This file stays green either way, because it never calls the production
+//! transition — it is the pre-DEV-1 reference harness (see the SWAP POINT
+//! notes above) and is self-consistent with its own model. Read it as a model
+//! of the protocol shape, NOT as evidence about the shipped seed rule. When
+//! the DEV-1 swap point is finally taken, `seed_mixes` must move to the
+//! `E - 2` rule in the same commit, or the swap will fail at the first
+//! epoch-1 proposer draw.
+//!
 //! ## Determinism contract
 //!
 //! No clock, no threads, no RNG. Every "random" value derives from fixed

@@ -180,45 +180,45 @@ pub const TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH: u64 = 800;
 /// the 2026-08-08 `expected_bits` fork cost us.
 pub const BLOCK_BYTES_V2_ACTIVATION_EPOCH: u64 = 800;
 
-/// **The F6 seed look-ahead is UNCONDITIONAL.** There is no flag day.
-///
-/// `CommittedState::seed_for_epoch` seeds epoch `E` from the mix at the close
-/// of `E − 1 − `[`crate::committees::MIN_SEED_LOOKAHEAD_EPOCHS`], always. It
-/// was written behind an inert `ANCESTRY_SEED_ACTIVATION_EPOCH` gate first,
-/// and the gate was REMOVED on the founder's instruction (2026-08-24): the
-/// relaunch is a coordinated convergence — one storage state installed on all
-/// 64 validators, all restarted together — so there is no live network for a
-/// gradual rollout to split, which is the only thing the gate bought. Deleting
-/// it also deletes the way it could go wrong: an activation epoch armed in the
-/// past, which is how 1,600,000 BLCH once escaped a write-off that never
-/// fired.
-///
-/// **What this means for anyone reading later.** The rule is now implicit in
-/// the binary rather than dated in a constant, so "which seed rule does this
-/// chain run" is answered by the release, not by the state. Any FUTURE change
-/// to `seed_for_epoch` on a live network needs a gate again — this note is not
-/// a precedent for changing consensus without one.
-///
-/// # What the look-ahead closes
-///
-/// F6, proposer grinding: at `back = 1` the seed for `E` is the mix at the
-/// close of `E − 1`, so the trailing proposers of `E − 1` see the partition
-/// their own reveal produces before they must publish it, and can re-sort `E`
-/// by withholding.
-///
-/// It also removes the sub-epoch-lag case of the duty-view ANCHOR defect,
-/// because the `E − 2` mix is frozen before `E − 1` begins. It is a mitigation
-/// of that defect, not a fix; the fix is anchoring the duty view to the
-/// ancestry of the thing being judged (`bloch-pos-node/src/engine.rs`).
-///
-/// # It costs nothing at the seam
-///
-/// `close_epoch` retains [`crate::state_root::RANDAO_BOUNDARIES_RETAINED`]` =
-/// 2` boundaries, so while `E` is open the state holds `{E − 2, E − 1}`. The
-/// rule reads `E − 2`, already there. No retention change, and therefore no
-/// state-root change — `state_root::randao_window` folds exactly the retained
-/// boundaries into the tree. Pinned by
-/// `the_rule_reads_a_boundary_the_state_still_retains`.
+// **The F6 seed look-ahead is UNCONDITIONAL.** There is no flag day.
+//
+// `CommittedState::seed_for_epoch` seeds epoch `E` from the mix at the close
+// of `E − 1 − `[`crate::committees::MIN_SEED_LOOKAHEAD_EPOCHS`], always. It
+// was written behind an inert `ANCESTRY_SEED_ACTIVATION_EPOCH` gate first,
+// and the gate was REMOVED on the founder's instruction (2026-08-24): the
+// relaunch is a coordinated convergence — one storage state installed on all
+// 64 validators, all restarted together — so there is no live network for a
+// gradual rollout to split, which is the only thing the gate bought. Deleting
+// it also deletes the way it could go wrong: an activation epoch armed in the
+// past, which is how 1,600,000 BLCH once escaped a write-off that never
+// fired.
+//
+// **What this means for anyone reading later.** The rule is now implicit in
+// the binary rather than dated in a constant, so "which seed rule does this
+// chain run" is answered by the release, not by the state. Any FUTURE change
+// to `seed_for_epoch` on a live network needs a gate again — this note is not
+// a precedent for changing consensus without one.
+//
+// # What the look-ahead closes
+//
+// F6, proposer grinding: at `back = 1` the seed for `E` is the mix at the
+// close of `E − 1`, so the trailing proposers of `E − 1` see the partition
+// their own reveal produces before they must publish it, and can re-sort `E`
+// by withholding.
+//
+// It also removes the sub-epoch-lag case of the duty-view ANCHOR defect,
+// because the `E − 2` mix is frozen before `E − 1` begins. It is a mitigation
+// of that defect, not a fix; the fix is anchoring the duty view to the
+// ancestry of the thing being judged (`bloch-pos-node/src/engine.rs`).
+//
+// # It costs nothing at the seam
+//
+// `close_epoch` retains [`crate::state_root::RANDAO_BOUNDARIES_RETAINED`]` =
+// 2` boundaries, so while `E` is open the state holds `{E − 2, E − 1}`. The
+// rule reads `E − 2`, already there. No retention change, and therefore no
+// state-root change — `state_root::randao_window` folds exactly the retained
+// boundaries into the tree. Pinned by
+// `the_rule_reads_a_boundary_the_state_still_retains`.
 
 /// Test-only rehearsal hook. `cfg(test)`, so it cannot exist in a shipped
 /// binary. Flips one bit of every seed, so the deterministic chain comparator

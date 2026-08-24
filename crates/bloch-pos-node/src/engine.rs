@@ -1764,10 +1764,53 @@ impl Engine {
         // therefore never scored against the peer that relayed it. A syncing
         // node used to Reject its way through every attestation on the network
         // and graylist the very peers feeding it blocks.
-        let Some(seed) = self.seed_for_attestation(&att.data.target_root, epoch) else {
-            return GossipDecision::Ignore(bloch_pos_committee::gossip::IgnoreReason::Unjudgeable);
+        //
+        // TWO different "no seed" cases, and collapsing them loses votes:
+        //
+        //   * the target block is one we simply have not received yet. That
+        //     is the ORDINARY epoch-boundary race the pool already handles by
+        //     PARKING the attestation (`gossip.rs` step 5) and replaying it
+        //     when the block lands. Ignoring it instead would silently drop
+        //     the first slots' votes of every epoch — the very fork-choice
+        //     weight this whole change exists to preserve. So we let the pool
+        //     reach step 5 and hold, with a membership lookup that admits
+        //     rather than rejects: we do not know the committee, and "do not
+        //     know" must not read as "not a member". The real committee check
+        //     runs on release, off the real seed.
+        //
+        //   * the target block IS known but its ancestry is not reachable
+        //     from what this node stores (a pruned or partially-synced view).
+        //     Nothing will arrive to unpark it, so parking would only burn one
+        //     of the 256 pending slots. Ignore, and score nobody.
+        //
+        // The cost of the first case is that a non-member can occupy a pending
+        // slot until its target arrives. The pool is hard-bounded at
+        // MAX_PENDING_ATTESTATIONS with FIFO eviction and per-peer token
+        // buckets upstream, so that is bounded churn, not unbounded memory —
+        // and it is a strictly better trade than dropping every boundary vote.
+        let known_root =
+            |root: &[u8; 32]| self.canonical.contains(root) || self.blocks.contains_key(root);
+        let seed = match self.seed_for_attestation(&att.data.target_root, epoch) {
+            Some(seed) => Some(seed),
+            None if !known_root(&att.data.target_root) => None,
+            None => {
+                return GossipDecision::Ignore(
+                    bloch_pos_committee::gossip::IgnoreReason::Unjudgeable,
+                )
+            }
         };
-        let committees_at = |slot: u64| committees::committee_for_slot(&seed, slot, &roster);
+        let committees_at = |slot: u64| match seed {
+            Some(seed) => committees::committee_for_slot(&seed, slot, &roster),
+            // Unjudgeable-but-parkable: admit, so step 5 parks on the missing
+            // target instead of step 4 rejecting on a committee we cannot
+            // compute. Every index in the roster, ascending — `committee` is
+            // consumed by `binary_search`, so it must stay sorted.
+            None => {
+                let mut all: Vec<u32> = roster.iter().map(|v| v.index).collect();
+                all.sort_unstable();
+                all
+            }
+        };
         // "Do we have this block?" — canonical ids include genesis, which is
         // synthesized and never stored as an envelope; `blocks` holds every
         // structurally-valid block seen, canonical or not. A vote for a block
@@ -1824,7 +1867,24 @@ impl Engine {
             let rolled_epoch = epoch_of(self.wall_slot);
             let rolled = self.rolled_to(rolled_epoch);
             let roster = rolled.active_validators();
-            let seed = Self::seed_for(&rolled, rolled_epoch);
+            // Anchored to the BLOCK THAT JUST ARRIVED, not to this node's
+            // head. Everything released by this call was parked waiting for
+            // `root`, so `root` is on the released attestation's own branch
+            // (it is either its head or its target, and the target is an
+            // ancestor of the head), and the boundary mix read off `root`'s
+            // ancestry is the one that branch's transition will use.
+            //
+            // KNOWN GAP, deliberately not papered over: `on_block` re-runs
+            // the whole pipeline through ONE `CommitteeLookup` closure that
+            // sees only a slot, so a single seed serves every attestation
+            // released in this batch. That is right whenever they are on one
+            // branch, which is the case that actually occurs (they were all
+            // waiting on the same root); it is wrong if a future caller
+            // batches roots. Fixing it properly means letting the lookup see
+            // the attestation, which is a `gossip.rs` signature change.
+            let seed = self
+                .seed_for_attestation(&root, rolled_epoch)
+                .unwrap_or_else(|| rolled.seed_for_epoch(rolled_epoch));
             let committees_at = |slot: u64| committees::committee_for_slot(&seed, slot, &roster);
             let known = |r: &[u8; 32]| self.canonical.contains(r) || self.blocks.contains_key(r);
             pool.on_block(
