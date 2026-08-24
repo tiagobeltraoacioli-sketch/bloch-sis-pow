@@ -923,11 +923,12 @@ mod tests {
 pub fn votes_from_partition<'a>(
     epoch: u64,
     active_set: &'a [Validator],
+    partition_set: &[Validator],
     attestations: &'a [(u32, AttestationData)],
     beacon_mix: &[u8; 32],
     accepted: &'a mut Vec<(u32, AttestationData)>,
 ) -> EpochVotes<'a> {
-    let committees = crate::committees::epoch_committees(beacon_mix, epoch, active_set);
+    let committees = crate::committees::epoch_committees(beacon_mix, epoch, partition_set);
     let slots_per_epoch = crate::params::SLOTS_PER_EPOCH;
 
     accepted.clear();

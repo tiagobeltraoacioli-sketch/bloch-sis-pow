@@ -2605,6 +2605,7 @@ impl CommittedState {
         let mut st = self.clone();
         let closing = st.epoch;
         let roster = st.duty_roster_at(closing);
+        let partition_set = st.consensus_roster_at(closing);
 
         // 1. Justification and finality (finality.rs). Epoch 0's checkpoint
         //    is the genesis root of trust — already justified and finalized —
@@ -2637,6 +2638,7 @@ impl CommittedState {
             let epoch_votes = finality::votes_from_partition(
                 closing,
                 &roster,
+                &partition_set,
                 &votes,
                 &st.seed_for_epoch(closing),
                 &mut accepted,
@@ -6931,6 +6933,125 @@ mod tests {
         assert!(
             (0..256).filter_map(|s| schedule::proposer(&seed, s, &leaked)).count() == 256,
             "every slot must still draw a proposer from the surviving validators"
+        );
+    }
+
+    /// **THE HAZARD ARMED FOR EPOCH 1400.** The partition that decides which
+    /// attestations a BLOCK may carry and the partition that decides which
+    /// attestations COUNT at the boundary tally are derived from two different
+    /// rosters:
+    ///
+    ///   - `compute_post_state` step 8 reads `consensus_roster_at` — leak
+    ///     applied once `LEAKED_ROSTER_ACTIVATION_EPOCH` binds,
+    ///   - `close_epoch` reads `duty_roster_at` — leak never applied.
+    ///
+    /// `epoch_committees` drops every validator with zero effective stake
+    /// BEFORE it shuffles, so the moment one validator's accrued leak reaches
+    /// its stake the two rosters have different LENGTHS, the Fisher-Yates walk
+    /// consumes the XOF differently, and the two partitions share nothing. A
+    /// vote the block was allowed to carry is then silently discarded at the
+    /// tally, and justification stops on every honest node.
+    ///
+    /// The only existing guard is a `debug_assert_eq!` — compiled out of the
+    /// release binaries the fleet actually runs.
+    ///
+    /// This test asserts the CORRECT behaviour: a set of attestations that the
+    /// inclusion filter admits, carrying a supermajority of live stake, must
+    /// justify the epoch it targets.
+    #[test]
+    fn boundary_tally_counts_the_votes_the_block_was_allowed_to_carry() {
+        let flag = crate::params::LEAKED_ROSTER_ACTIVATION_EPOCH;
+        let (_t, mut st, _c) = setup(4);
+
+        // Leak validators 2 and 3 to EXACTLY zero and leave 0 and 1 whole, by
+        // folding epochs whose active set is only the absent pair: nothing
+        // votes, nothing justifies, so the leak accrues without bound while
+        // the live pair — never named in the fold — never leaks at all. Ends
+        // with the engine's cursor on the flag-day epoch, so the boundary
+        // below is the epoch the flag arms.
+        let absent: Vec<Validator> =
+            st.duty_roster_at(0).into_iter().filter(|v| v.index >= 2).collect();
+        for e in 1..flag {
+            let _ = st.finality_engine.process_epoch(&finality::EpochVotes {
+                epoch: e,
+                active_set: &absent,
+                attestations: &[],
+            });
+        }
+        st.epoch = flag;
+
+        let inclusion = st.consensus_roster_at(flag);
+        let boundary = st.duty_roster_at(flag);
+
+        // Control 1: the leak really did reach the stake. Without this the
+        // rosters would be equal and everything below would pass vacuously.
+        for v in [2u32, 3] {
+            assert_eq!(
+                inclusion.iter().find(|x| x.index == v).unwrap().effective_stake,
+                0,
+                "control failed: validator {v} is not leaked to zero, so the two \
+                 rosters cannot differ in length and this test proves nothing"
+            );
+            assert!(
+                boundary.iter().find(|x| x.index == v).unwrap().effective_stake > 0,
+                "control failed: the unleaked roster already lost validator {v}"
+            );
+        }
+        // Control 2: the live pair kept every satoshi, so the quorum below is
+        // a real supermajority and not an artefact of a shrunken denominator.
+        for v in [0u32, 1] {
+            assert_eq!(
+                inclusion.iter().find(|x| x.index == v).unwrap().effective_stake,
+                boundary.iter().find(|x| x.index == v).unwrap().effective_stake,
+                "control failed: live validator {v} leaked"
+            );
+        }
+
+        // Every live validator attests, in the slot of the committee that the
+        // INCLUSION roster puts it in — i.e. exactly the attestations step 8
+        // admits into a block. Two of two live validators is 100% of live
+        // stake: any tally that drops even one of them cannot reach 2/3.
+        let seed = st.seed_for_epoch(flag);
+        let src = st.finality_engine.current_justified();
+        let target_root = [0xAB; 32];
+        let admitted = committees::epoch_committees(&seed, flag, &inclusion);
+        let mut carried = 0usize;
+        for (idx, c) in admitted.iter().enumerate() {
+            for v in c {
+                let data = AttestationData {
+                    slot: flag * SLOTS_PER_EPOCH + idx as u64,
+                    head: target_root,
+                    source_epoch: src.epoch,
+                    source_root: src.root,
+                    target_epoch: flag,
+                    target_root,
+                };
+                // The same seam step 8 writes through, so the boundary sees
+                // precisely what an accepted block would have left behind.
+                assert_eq!(
+                    committees::committee_for_slot(&seed, data.slot, &inclusion)
+                        .binary_search(v)
+                        .is_ok(),
+                    true,
+                    "test bug: built a vote step 8 would itself refuse"
+                );
+                st.pending_votes.insert((*v, data.signing_root()), data);
+                carried += 1;
+            }
+        }
+        assert_eq!(carried, 2, "control failed: expected both live validators to attest");
+
+        let post = st.close_epoch();
+        assert_eq!(
+            post.finality_engine.current_justified().epoch,
+            flag,
+            "epoch {flag} did not justify: the boundary tally partitioned the votes \
+             off a DIFFERENT roster than the inclusion check at step 8 did, so \
+             attestations the block was entitled to carry were silently dropped. \
+             close_epoch reads duty_roster_at (unleaked); step 8 reads \
+             consensus_roster_at (leaked). Once any validator's leak reaches its \
+             stake the two rosters differ in length and epoch_committees shuffles \
+             them into unrelated partitions."
         );
     }
 
