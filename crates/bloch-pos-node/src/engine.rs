@@ -4636,6 +4636,405 @@ mod root_budget_tests {
     }
 }
 
+/// **WP11 — the `select_transactions` byte-cap `break`.** A measurement, not
+/// a fix. `select_transactions` (engine.rs) walks the mempool — a
+/// `BTreeMap<Vec<u8>, _>` keyed by canonical bytes, so byte-lexicographic
+/// over the ENCODING, not insertion order — and on the first transaction
+/// whose bytes would overflow the block byte cap it does `break`, not
+/// `continue`. A single transaction that (a) encodes larger than
+/// `MAX_BLOCK_TX_BYTES` and (b) sorts before every other entry therefore
+/// ends selection at the first step and empties the proposal.
+///
+/// The encoding makes (b) free to arrange: a `Transfer` is `0x01`, then
+/// `inputs.len() as u32 LE`, then the inputs (each beginning with a 32-byte
+/// `txid` the sender picks). A one-input transfer (`01 01 00 00 00 …`) sorts
+/// before every two-input one (`01 02 00 00 00 …`), and among one-input
+/// transfers the order is the `txid` — so `txid = [0u8;32]` sorts first.
+/// Size (a) comes from the OUTPUT list, which the encoding places AFTER the
+/// inputs and which `admissible` only checks is non-empty: thousands of
+/// outputs under one real, correctly-signed input pass admission and blow
+/// past the cap.
+#[cfg(test)]
+mod wp11_select_break {
+    use super::*;
+    use bloch_pos_committee::fee_market::MAX_BLOCK_TX_BYTES;
+    use bloch_pos_committee::transition::{TransferInput, TransferOutput};
+
+    /// One real hybrid keypair, fixed seed so the test is deterministic.
+    fn keypair() -> (Vec<u8>, Vec<u8>) {
+        bloch_crypto::crypto::generate_keypair_from_seed(&[7u8; 32])
+            .expect("hybrid keypair from a fixed seed")
+    }
+
+    /// A correctly-signed one-input `Transfer` with `txid = [fill; 32]` and
+    /// `n_outputs` outputs. With `fill = 0` it sorts before any transfer with
+    /// a non-zero leading txid byte; `n_outputs` sets its encoded size.
+    /// Signs for real, so it also passes `admissible`.
+    fn signed_transfer(fill: u8, n_outputs: usize) -> PosTransaction {
+        let (pk, sk) = keypair();
+        let script_hash: [u8; 32] = {
+            use sha3::{Digest, Sha3_256};
+            Sha3_256::digest(&pk).into()
+        };
+        let outputs: Vec<TransferOutput> = (0..n_outputs)
+            .map(|i| TransferOutput {
+                value: 1_000 + i as u64,
+                script_hash,
+            })
+            .collect();
+        let mut tx = PosTransaction::Transfer {
+            inputs: vec![TransferInput {
+                txid: [fill; 32],
+                vout: 0,
+                pubkey: pk,
+                signature: Vec::new(),
+            }],
+            outputs,
+            tx_bytes: 0,
+            tip_millisat_per_gas: 0,
+        };
+        let root = tx.spend_signing_root();
+        let sig = bloch_crypto::crypto::sign(&sk, &root).expect("sign the spend root");
+        if let PosTransaction::Transfer { inputs, .. } = &mut tx {
+            inputs[0].signature = sig;
+        }
+        tx
+    }
+
+    /// **#1 — REPRODUCE.** One oversized transfer that sorts first, plus five
+    /// ordinary transfers that would all have fit, and `select_transactions`
+    /// returns EMPTY. The control removes the oversized one and gets all five,
+    /// proving they would have fit — the emptiness is the `break`, nothing
+    /// else.
+    #[test]
+    fn one_oversized_first_sorting_transfer_empties_the_selection() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+
+        // The poison: sorts first (txid all-zero), and larger than the cap.
+        let poison = signed_transfer(0x00, 8_000);
+        let poison_bytes = poison.canonical_bytes();
+        assert!(
+            poison_bytes.len() as u64 > MAX_BLOCK_TX_BYTES,
+            "harness: the poison transfer must exceed the block byte cap \
+             ({} bytes vs cap {})",
+            poison_bytes.len(),
+            MAX_BLOCK_TX_BYTES,
+        );
+
+        // Five ordinary transfers, each tiny, each sorting AFTER the poison
+        // (leading txid byte non-zero). Together far under the cap.
+        let ordinary: Vec<PosTransaction> = (1..=5u8)
+            .map(|k| signed_transfer(0x10 * k, 1))
+            .collect();
+        let ordinary_total: u64 = ordinary
+            .iter()
+            .map(|t| t.canonical_bytes().len() as u64)
+            .sum();
+        assert!(
+            ordinary_total < MAX_BLOCK_TX_BYTES,
+            "harness: the ordinary transfers must all fit ({} bytes vs cap {})",
+            ordinary_total,
+            MAX_BLOCK_TX_BYTES,
+        );
+
+        // Load the mempool: poison + the five ordinary ones.
+        engine
+            .mempool
+            .insert(poison_bytes.clone(), poison.clone());
+        for t in &ordinary {
+            engine.mempool.insert(t.canonical_bytes(), t.clone());
+        }
+        assert_eq!(engine.mempool.len(), 6, "harness: six entries loaded");
+
+        // Confirm the poison really is the first key the BTreeMap yields.
+        let first_key = engine.mempool.keys().next().expect("non-empty").clone();
+        assert_eq!(
+            first_key, poison_bytes,
+            "harness: the poison must sort first, or the test proves nothing"
+        );
+
+        // THE MEASUREMENT: selection is EMPTY, though five would have fit.
+        let selected = engine.select_transactions(0);
+        assert!(
+            selected.is_empty(),
+            "CONFIRMED-or-DEMOLISHED: with a first-sorting oversized transfer, \
+             select_transactions returned {} transactions; the hypothesis \
+             predicts 0",
+            selected.len(),
+        );
+
+        // THE CONTROL: drop the poison and the same five are selected — they
+        // always fit; the `break` on the poison is the whole cause.
+        engine.mempool.remove(&poison_bytes);
+        let selected_after = engine.select_transactions(0);
+        assert_eq!(
+            selected_after.len(),
+            5,
+            "control: without the poison, all five ordinary transfers select"
+        );
+    }
+
+    /// **#2 — REACHABILITY.** The exact poison runs through `admissible`
+    /// (the one gate both the RPC and gossip paths converge on) and is
+    /// ACCEPTED: one real self-generated keypair, one correct signature over
+    /// a txid that need not exist, and thousands of outputs. No funds, no
+    /// existing UTXO, no size check. Cost: one unauthenticated request.
+    #[test]
+    fn the_poison_is_admissible_with_a_self_generated_key_and_no_funds() {
+        let poison = signed_transfer(0x00, 8_000);
+        // wall_epoch is only read by the TransferV2 arm; a V1 Transfer is
+        // judged identically at every epoch, so 0 is representative.
+        let verdict = admissible(&poison, 0);
+        assert!(
+            verdict.is_ok(),
+            "REACHABLE: admissible must accept the poison (self-signed, \
+             nonexistent input, oversized) — it rejected with {verdict:?}"
+        );
+    }
+
+    /// **#1(b) — PRODUCED-BUT-EMPTY, settled.** The founder's correction:
+    /// does this drop a SLOT (no block) or only empty the block? Drive the
+    /// real proposer with only the poison in the mempool. A block IS produced
+    /// and adopted (chain grows), it carries ZERO transactions, and the
+    /// poison is STILL in the mempool afterward — never selected, so never
+    /// reached by `propose`'s drop-and-retry guard. This is a
+    /// transaction-inclusion halt, not a production halt.
+    #[test]
+    fn the_proposer_still_produces_a_block_and_it_is_empty() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+
+        let poison = signed_transfer(0x00, 8_000);
+        let poison_bytes = poison.canonical_bytes();
+        engine.mempool.insert(poison_bytes.clone(), poison);
+        let chain_before = engine.chain.len();
+
+        engine.propose(1);
+
+        assert_eq!(
+            engine.chain.len(),
+            chain_before + 1,
+            "PRODUCED: a block was still proposed and adopted — the slot is \
+             NOT dropped"
+        );
+        let head = engine
+            .blocks
+            .get(engine.head_id().as_bytes())
+            .expect("the adopted block is stored");
+        assert_eq!(
+            head.body.transactions.len(),
+            0,
+            "EMPTY: the produced block carries zero transactions"
+        );
+        assert!(
+            engine.mempool.contains_key(&poison_bytes),
+            "PERMANENT: the poison was never selected, so propose's \
+             drop-and-retry never saw it — it is still in the mempool"
+        );
+    }
+
+    /// **The LIVE cap, not the museum one.** `max_block_tx_bytes` is
+    /// flag-day gated: 262,144 B below `BLOCK_BYTES_V2_ACTIVATION_EPOCH`
+    /// (= 800, params.rs:308) and 524,288 B from it (fee_market.rs:65/85).
+    /// Genesis-4 mainnet is at **epoch 1033**, measured from a node on
+    /// 2026-08-25 — past the epoch-800 activation, so the cap a real
+    /// proposer packs against TODAY is 512 KiB and a 256 KiB-sized poison
+    /// would not trigger anything on the fleet.
+    ///
+    /// The epoch is stated because an earlier revision of this test said
+    /// "mainnet is past epoch 1400" and derived the era from
+    /// `ACTIVATION + 600`, which lands exactly on 1400 — a DIFFERENT flag
+    /// day, still 367 epochs out and unfired. The arithmetic happened to
+    /// pick the one number that reads as "the pending flag day has already
+    /// passed". What the conclusion actually rests on is `1033 >= 800`, so
+    /// the era is derived from the activation constant and the observed
+    /// height, and the cap is read from `max_block_tx_bytes` rather than
+    /// hard-coded.
+    #[test]
+    fn the_same_poison_empties_selection_at_the_live_post_flag_day_cap() {
+        use bloch_pos_committee::fee_market::max_block_tx_bytes;
+        use bloch_pos_committee::params::BLOCK_BYTES_V2_ACTIVATION_EPOCH;
+
+        /// The epoch Genesis-4 mainnet was observed at, 2026-08-25.
+        /// Not a threshold — a witness that the live chain is past the
+        /// activation. Any later reading keeps this test honest; a reading
+        /// BELOW 800 would invalidate its premise, which is why the
+        /// relationship is asserted rather than assumed.
+        const MAINNET_EPOCH_OBSERVED: u64 = 1_033;
+
+        assert!(
+            MAINNET_EPOCH_OBSERVED >= BLOCK_BYTES_V2_ACTIVATION_EPOCH,
+            "premise: the observed mainnet epoch ({MAINNET_EPOCH_OBSERVED}) \
+             must be past the byte-cap activation ({})",
+            BLOCK_BYTES_V2_ACTIVATION_EPOCH,
+        );
+        let live_epoch = MAINNET_EPOCH_OBSERVED;
+        let cap = max_block_tx_bytes(live_epoch);
+        assert_eq!(
+            cap, 524_288,
+            "harness: at the observed mainnet epoch the cap must be the \
+             512 KiB one"
+        );
+
+        let (mut engine, _dir) = perf_support::proposing_engine();
+
+        // 16,000 outputs × 40 B ≈ 640 KB — over the LIVE cap, and still far
+        // under the 8 MiB frame limit (codec.rs MAX_FIELD_LEN), so it fits
+        // on the wire and reaches the mempool intact.
+        let poison = signed_transfer(0x00, 16_000);
+        let poison_bytes = poison.canonical_bytes();
+        assert!(
+            poison_bytes.len() as u64 > cap,
+            "harness: the poison must exceed the LIVE cap ({} vs {cap})",
+            poison_bytes.len(),
+        );
+        assert!(
+            poison_bytes.len() < 8 * 1024 * 1024,
+            "harness: the poison must still fit one wire frame ({} B)",
+            poison_bytes.len(),
+        );
+        // It is admissible at the live epoch too — same three checks.
+        assert!(
+            admissible(&poison, live_epoch).is_ok(),
+            "the poison must be admissible at the live epoch"
+        );
+
+        let ordinary: Vec<PosTransaction> =
+            (1..=5u8).map(|k| signed_transfer(0x10 * k, 1)).collect();
+        engine.mempool.insert(poison_bytes.clone(), poison);
+        for t in &ordinary {
+            engine.mempool.insert(t.canonical_bytes(), t.clone());
+        }
+        assert_eq!(
+            engine.mempool.keys().next().expect("non-empty"),
+            &poison_bytes,
+            "harness: the poison must sort first"
+        );
+
+        let selected = engine.select_transactions(live_epoch);
+        assert!(
+            selected.is_empty(),
+            "at the LIVE cap, selection returned {} transactions; the \
+             hypothesis predicts 0",
+            selected.len(),
+        );
+
+        // Control at the same epoch: the five always fit.
+        engine.mempool.remove(&poison_bytes);
+        assert_eq!(
+            engine.select_transactions(live_epoch).len(),
+            5,
+            "control: without the poison all five select at the live cap"
+        );
+    }
+
+    /// **REACHABILITY, measured per entry path — and the RPC door is SHUT
+    /// at the live cap.**
+    ///
+    /// `sendrawtransaction` takes the canonical bytes as HEX (rpc.rs
+    /// `route`, the "sendrawtransaction" arm) and the HTTP body is capped at
+    /// `rpc::MAX_BODY_BYTES` = 1 MiB, rejected with 413 on Content-Length
+    /// alone, before the body is read (rpc.rs:1111). To trip the byte cap a
+    /// transaction must EXCEED it, so at the live cap every possible poison
+    /// is at least 524,289 binary bytes = at least 1,048,578 hex characters
+    /// — already more than the whole body allowance, before the JSON
+    /// envelope. That is an inequality over the two constants, so it holds
+    /// for EVERY poison and not merely for the witness built below.
+    ///
+    /// Gossip is the open door: `net.rs:268` admits any frame up to
+    /// `codec::MAX_FIELD_LEN` = 8 MiB, and `on_transaction` re-broadcasts the
+    /// full canonical bytes to every peer, so one delivery poisons the mesh.
+    ///
+    /// Sizes are MEASURED, never computed. A hybrid signature is
+    /// VARIABLE-LENGTH (Falcon-1024 is randomised), so two encodings of the
+    /// "same" transaction differ by a byte or two; an earlier revision of
+    /// this test derived the per-output cost from two samples, read that
+    /// jitter as part of the per-output term, and built a poison that missed
+    /// the cap. Everything below is sized by growing a real transaction
+    /// until a real measurement clears the bound.
+    #[test]
+    fn rpc_body_cap_shuts_the_rpc_door_at_the_live_cap_but_not_gossip() {
+        use bloch_pos_committee::fee_market::max_block_tx_bytes;
+        use bloch_pos_committee::params::BLOCK_BYTES_V2_ACTIVATION_EPOCH;
+
+        // The activation epoch itself is the first era with the new cap, and
+        // mainnet (epoch 1033, measured 2026-08-25) is inside it.
+        let live_cap = max_block_tx_bytes(BLOCK_BYTES_V2_ACTIVATION_EPOCH);
+        let old_cap = max_block_tx_bytes(0);
+        assert_eq!((live_cap, old_cap), (524_288, 262_144), "the two caps");
+
+        // THE CATEGORICAL CLAIM, over constants only: any transaction big
+        // enough to trip the live cap is too big to be sent as hex through
+        // the RPC body limit. No witness can escape this.
+        assert!(
+            2 * (live_cap as usize + 1) > crate::rpc::MAX_BODY_BYTES,
+            "RPC hex of the SMALLEST possible live-cap poison ({}) must \
+             exceed MAX_BODY_BYTES ({})",
+            2 * (live_cap as usize + 1),
+            crate::rpc::MAX_BODY_BYTES,
+        );
+
+        // A witness, grown by measurement until it really clears a bound.
+        // Each output costs value(8) + script_hash(32) = 40 B.
+        let grow_past = |bound: u64| -> (usize, usize) {
+            let mut n = (bound as usize / 40) + 8;
+            loop {
+                let len = signed_transfer(0x00, n).canonical_bytes().len();
+                if len as u64 > bound {
+                    return (n, len);
+                }
+                n += ((bound as usize + 1 - len).div_ceil(40)).max(1);
+            }
+        };
+
+        let (n, bin) = grow_past(live_cap);
+        let hex = bin * 2;
+        println!(
+            "live-cap poison: {n} outputs, {bin} B binary, {hex} hex chars \
+             (live cap {live_cap}, MAX_BODY_BYTES {}, MAX_FIELD_LEN {})",
+            crate::rpc::MAX_BODY_BYTES,
+            crate::codec::MAX_FIELD_LEN,
+        );
+        assert!(bin as u64 > live_cap, "the witness must exceed the live cap");
+        // THE RPC DOOR: shut.
+        assert!(
+            hex > crate::rpc::MAX_BODY_BYTES,
+            "RPC cannot carry it: {hex} hex chars vs body cap {}",
+            crate::rpc::MAX_BODY_BYTES,
+        );
+        // THE GOSSIP DOOR: open, with 16x room.
+        assert!(
+            bin < crate::codec::MAX_FIELD_LEN,
+            "gossip must carry it: {bin} B vs frame cap {}",
+            crate::codec::MAX_FIELD_LEN,
+        );
+        // And it is admitted, therefore re-broadcast to every peer.
+        assert!(
+            admissible(&signed_transfer(0x00, n), BLOCK_BYTES_V2_ACTIVATION_EPOCH).is_ok(),
+            "the poison must be admissible at the live epoch"
+        );
+
+        // THE CONTROL, and the reason this is a flag-day story: under the OLD
+        // 256 KiB cap the same attack fits the 1 MiB body comfortably, so
+        // before epoch 800 this WAS reachable by one unauthenticated HTTP
+        // request. The flag day that doubled the cap is what closed the RPC
+        // door — incidentally, not by design.
+        let (n_old, bin_old) = grow_past(old_cap);
+        println!(
+            "old-cap poison: {n_old} outputs, {bin_old} B binary, {} hex chars \
+             — fits the 1 MiB body",
+            bin_old * 2
+        );
+        assert!(bin_old as u64 > old_cap);
+        assert!(
+            bin_old * 2 < crate::rpc::MAX_BODY_BYTES,
+            "under the old cap the RPC door was OPEN: {} hex chars vs {}",
+            bin_old * 2,
+            crate::rpc::MAX_BODY_BYTES,
+        );
+    }
+
+}
+
 /// What the deleted work actually cost, on a state the size the fleet runs.
 ///
 /// `#[ignore]`d: it is a measurement, not an assertion, and it builds a
