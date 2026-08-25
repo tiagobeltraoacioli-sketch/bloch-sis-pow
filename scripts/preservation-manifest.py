@@ -422,13 +422,19 @@ RUNBOOK = "docs/LEAKED-ROSTER-FLAG-DAY.md"
 def check_runbook(root: Path, rep: Report):
     """The runbook the armed constant points at must exist and agree with it.
 
-    `params.rs` says "The choice procedure ... live in
+    `params.rs:109` says "The choice procedure ... live in
     docs/LEAKED-ROSTER-FLAG-DAY.md. The armed value below was produced by that
     runbook", and the tripwire's own doc says the value "must equal the one
-    recorded in" it. At ab9ca4e1 — the commit on 64 nodes — that file did not
-    exist, so both references pointed at nothing and the tripwire pinned the
-    constant against a document no one could read. It was committed to
-    deploy/armado-e1400 as 04ee1888 during this review.
+    recorded in" it.
+
+    The chronology, from git:
+
+        ab9ca4e1  2026-08-24 05:14 UTC  arms 1400 AND writes that sentence
+        04ee1888  2026-08-24 21:34 UTC  first commits the runbook — 16.3 h LATER
+
+    So when the claim was written the document it cites did not exist in the
+    repo. Both references pointed at nothing, and the tripwire pinned the
+    constant against a document no one could read.
 
     Written to FAIL on a missing file rather than skip: a pin that evaporates
     with its subject is the defect this whole script exists to refuse.
