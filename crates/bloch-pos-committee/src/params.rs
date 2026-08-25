@@ -310,77 +310,24 @@ pub const BLOCK_BYTES_V2_ACTIVATION_EPOCH: u64 = 800;
 pub mod rehearsal {
     use std::cell::Cell;
 
+    // THREAD-LOCAL, not `static AtomicBool`. `cargo test` runs every #[test]
+    // on its own thread inside ONE process, so a process-global seed mutation
+    // set by the A/B rehearsal is read by every other test running in
+    // parallel. That is not hypothetical: it is what made
+    // `the_new_rule_diverges_from_the_old_one_at_epoch_1_not_epoch_2` fail
+    // with `left: [6, 7, 7, 7, ...]` — a seed with one bit flipped, asserted
+    // at epoch 0 before a single block is applied — and what made
+    // `the_rule_reads_a_boundary_the_state_still_retains` fail with
+    // `Proposal(NotScheduledProposer)`, because a mutated seed draws a
+    // different proposer. Both pass under `--test-threads 1` and fail in
+    // parallel, which is the signature.
+    //
+    // The `AB_HOOKS` mutex in transition.rs serializes the A/B tests against
+    // EACH OTHER and does nothing for the tests that never take it. A
+    // per-thread cell needs no cooperation from anyone: a switch cannot reach
+    // a test that did not set it.
     thread_local! {
-        /// Plant a one-bit difference in every seed, so the A/B chain
-        /// comparator can be shown to go red on a difference that is really
-        /// there.
-        ///
-        /// **Thread-local, and it must stay that way.** This was an
-        /// `AtomicBool` — a PROCESS global — guarded by an `AB_HOOKS` mutex
-        /// that only the two A/B tests take. That mutex serialises those two
-        /// against each other and does nothing for the other ~260 tests in
-        /// this crate, every one of which reads `seed_for_epoch` and none of
-        /// which take it. So while the comparator's tripwire held the flag
-        /// up, any test running beside it computed a corrupted consensus
-        /// seed. Observed 2026-08-24: a full `cargo test -p
-        /// bloch-pos-committee` failed with
-        /// `the_rule_reads_a_boundary_the_state_still_retains ... block
-        /// rejected: Proposal(NotScheduledProposer)` — a test with no
-        /// connection to the mutation, reddened by it.
-        ///
-        /// That is worse than a flaky test. A mutation switch that leaks into
-        /// unrelated tests produces false REDs, which get "fixed", and false
-        /// GREENs wherever the planted difference happens to land somewhere
-        /// the assertions do not look. Thread-local makes the leak
-        /// impossible: `cargo test` gives each test its own thread, so a
-        /// mutation cannot escape the test that set it.
         pub static MUTATE_SEED: Cell<bool> = const { Cell::new(false) };
-
-        /// Test-only mutation of the **rule itself**: force the seed
-        /// look-ahead back to ZERO — the pre-fix arithmetic, in which epoch
-        /// `E` is seeded by the close of `E − 1`.
-        ///
-        /// `MUTATE_SEED` above flips a bit of the seed's VALUE, which shows a
-        /// comparator can see a difference. It cannot show that a reader
-        /// which reverted to `E − 1` gets caught, because a bit-flip and a
-        /// reverted look-ahead are not the same mutation. This one reverts
-        /// the look-ahead, so the anti-partition tests can be run both ways
-        /// by a third party with nothing but `cargo test` — no source edit,
-        /// no script, no narration.
-        ///
-        /// Thread-local, not an atomic, and deliberately: `cargo test` runs
-        /// tests in parallel on separate threads and `seed_for_epoch` is on
-        /// almost every path in the crate. A process-global switch would flip
-        /// the consensus rule under every test running beside it. Set it with
-        /// [`with_lookahead_zero`], which restores it on the way out.
-        pub static LOOKAHEAD_ZERO: Cell<bool> = const { Cell::new(false) };
-    }
-
-    /// Run `f` with the seed look-ahead forced to zero on this thread, then
-    /// restore it — including on the unwind path, so a failing assertion
-    /// inside `f` cannot leave the rule mutated for the rest of the thread.
-    #[cfg(test)]
-    pub fn with_lookahead_zero<R>(f: impl FnOnce() -> R) -> R {
-        struct Restore;
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                LOOKAHEAD_ZERO.with(|c| c.set(false));
-            }
-        }
-        LOOKAHEAD_ZERO.with(|c| c.set(true));
-        let _r = Restore;
-        f()
-    }
-
-    /// The look-ahead this build's readers must use: the shipped constant,
-    /// unless a test has mutated the rule on this thread.
-    #[cfg(test)]
-    pub fn effective_lookahead() -> u64 {
-        if LOOKAHEAD_ZERO.with(Cell::get) {
-            0
-        } else {
-            crate::committees::MIN_SEED_LOOKAHEAD_EPOCHS
-        }
     }
 }
 

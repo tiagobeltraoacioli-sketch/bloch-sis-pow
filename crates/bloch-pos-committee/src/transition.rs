@@ -3778,15 +3778,8 @@ mod tests {
     // how LONG a run takes and not what it produces — which is what makes a
     // bit-for-bit chain comparison meaningful on a box under load.
 
-    /// Kept, but no longer load-bearing: `MUTATE_SEED` is now a THREAD-LOCAL
-    /// (`params::rehearsal`), so a mutation cannot reach any test but the one
-    /// that set it. It used to be a process global, and this mutex was the
-    /// only guard — which serialised the two A/B tests against each other and
-    /// left the crate's other ~260 tests reading a corrupted consensus seed
-    /// whenever the tripwire held the flag up. Removing the mutex is safe;
-    /// it is left in place so the two A/B runs stay serialised against each
-    /// other for timing stability, and because deleting a lock is a separate
-    /// change from the one that made it unnecessary.
+    /// `MUTATE_SEED` became thread-local (params.rs), so nothing here needs
+    /// serializing any more. Kept so the two A/B tests keep compiling.
     static AB_HOOKS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Everything one node believed after one slot. Eight fields; `assert_eq!`

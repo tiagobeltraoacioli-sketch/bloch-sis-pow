@@ -203,7 +203,7 @@ impl FinalityState {
     fn denominator_ignores_leak() -> bool {
         #[cfg(test)]
         {
-            return tests_hook::IGNORE_LEAK_IN_DENOMINATOR.load(std::sync::atomic::Ordering::Relaxed);
+            return tests_hook::IGNORE_LEAK_IN_DENOMINATOR.with(std::cell::Cell::get);
         }
         #[cfg(not(test))]
         false
@@ -217,10 +217,24 @@ impl FinalityState {
     fn denominator_floor_disabled() -> bool {
         #[cfg(test)]
         {
-            return tests_hook::DISABLE_DENOMINATOR_FLOOR.load(std::sync::atomic::Ordering::Relaxed);
+            return tests_hook::DISABLE_DENOMINATOR_FLOOR.with(std::cell::Cell::get);
         }
         #[cfg(not(test))]
         false
+    }
+
+    /// The quorum floor fraction. The shipped constants unless a test is
+    /// measuring what a different floor would cost; see `FLOOR_OVERRIDE`.
+    /// Constant-folds to the constants in a release build.
+    #[inline]
+    fn quorum_floor_fraction() -> (u128, u128) {
+        #[cfg(test)]
+        {
+            if let Some(f) = tests_hook::FLOOR_OVERRIDE.with(std::cell::Cell::get) {
+                return f;
+            }
+        }
+        (MIN_QUORUM_DENOMINATOR_NUM, MIN_QUORUM_DENOMINATOR_DEN)
     }
 
     /// Mutation switch: reproduce the PRE-FIX accumulator, which had exactly
@@ -231,7 +245,7 @@ impl FinalityState {
     fn leak_recovery_disabled() -> bool {
         #[cfg(test)]
         {
-            return tests_hook::DISABLE_LEAK_RECOVERY.load(std::sync::atomic::Ordering::Relaxed);
+            return tests_hook::DISABLE_LEAK_RECOVERY.with(std::cell::Cell::get);
         }
         #[cfg(not(test))]
         false
@@ -292,7 +306,8 @@ impl FinalityState {
             // 2026-08-24, kept runnable so the incident stays reproducible.
             leak_adjusted
         } else {
-            let floor = unleaked_total * MIN_QUORUM_DENOMINATOR_NUM / MIN_QUORUM_DENOMINATOR_DEN;
+            let (num, den) = Self::quorum_floor_fraction();
+            let floor = unleaked_total * num / den;
             leak_adjusted.max(floor)
         };
 
@@ -897,7 +912,6 @@ mod tests {
     /// incident question.
     #[test]
     fn a_partitioned_minority_finalizes_because_the_leak_shrinks_the_denominator() {
-        let _g = HOOK.lock().unwrap_or_else(|e| e.into_inner());
         let (epoch, destroyed_pct) = run_partition(false);
         let epoch = epoch.expect(
             "a 4-of-64 partition must eventually self-finalize — if it never does, the \
@@ -923,10 +937,9 @@ mod tests {
     /// nothing about the leak.
     #[test]
     fn without_the_leak_in_the_denominator_the_minority_never_finalizes() {
-        let _g = HOOK.lock().unwrap_or_else(|e| e.into_inner());
-        tests_hook::IGNORE_LEAK_IN_DENOMINATOR.store(true, std::sync::atomic::Ordering::Relaxed);
+        tests_hook::IGNORE_LEAK_IN_DENOMINATOR.with(|c| c.set(true));
         let (epoch, _) = run_partition(true);
-        tests_hook::IGNORE_LEAK_IN_DENOMINATOR.store(false, std::sync::atomic::Ordering::Relaxed);
+        tests_hook::IGNORE_LEAK_IN_DENOMINATOR.with(|c| c.set(false));
         assert_eq!(
             epoch, None,
             "MUTATION DID NOT BITE: with an unadjusted denominator a 4-of-64 minority still \
@@ -940,7 +953,6 @@ mod tests {
     /// which is the whole reason a relaunch inherits it.
     #[test]
     fn the_leak_only_ever_grows() {
-        let _g = HOOK.lock().unwrap_or_else(|e| e.into_inner());
         // Pre-fix arithmetic on purpose — this test is the record of WHY the
         // relaunch needed a zeroing at all. The post-fix behaviour (the
         // accumulator comes back down) is
@@ -1000,7 +1012,7 @@ mod tests {
         // schedule into a slower sawtooth — that node leaks less, so modelling
         // the stalled majority is both the common case and the conservative
         // one for the roster split.)
-        tests_hook::DISABLE_LEAK_RECOVERY.store(true, std::sync::atomic::Ordering::Relaxed);
+        tests_hook::DISABLE_LEAK_RECOVERY.with(|c| c.set(true));
         let committee: Vec<Validator> = (0..64u32).map(|i| validator(i, STAKE_EACH)).collect();
         let mut st = FinalityState::new(genesis());
         for e in 1..=epochs {
@@ -1015,7 +1027,7 @@ mod tests {
             0,
             "the generator must model a node in CONTINUOUS non-finality; it finalized"
         );
-        tests_hook::DISABLE_LEAK_RECOVERY.store(false, std::sync::atomic::Ordering::Relaxed);
+        tests_hook::DISABLE_LEAK_RECOVERY.with(|c| c.set(false));
         st.leaked.clone()
     }
 
@@ -1037,7 +1049,6 @@ mod tests {
     /// denominator must be the full unleaked total again.
     #[test]
     fn the_fourth_ensaio_a_relaunch_that_inherits_the_leak() {
-        let _g = HOOK.lock().unwrap_or_else(|e| e.into_inner());
         let committee: Vec<Validator> = (0..64u32).map(|i| validator(i, STAKE_EACH)).collect();
         let unleaked_total = STAKE_EACH as u128 * 64;
 
@@ -1065,7 +1076,7 @@ mod tests {
         // everyone honest, everyone voting for one root.
         let mut no_zeroing = FinalityState::new(genesis());
         no_zeroing.leaked = inherited.clone();
-        tests_hook::DISABLE_LEAK_RECOVERY.store(true, std::sync::atomic::Ordering::Relaxed);
+        tests_hook::DISABLE_LEAK_RECOVERY.with(|c| c.set(true));
         let mut ever_justified = None;
         for e in 1..=40u64 {
             let src = no_zeroing.current_justified();
@@ -1083,7 +1094,7 @@ mod tests {
                 break;
             }
         }
-        tests_hook::DISABLE_LEAK_RECOVERY.store(false, std::sync::atomic::Ordering::Relaxed);
+        tests_hook::DISABLE_LEAK_RECOVERY.with(|c| c.set(false));
         assert_eq!(
             ever_justified, None,
             "phase 2: the relaunch finalized at epoch {ever_justified:?} WITHOUT the accumulator \
@@ -1184,11 +1195,111 @@ mod tests {
         );
     }
 
+    /// **How much of the fleet must come back before finality does — the
+    /// price of the quorum floor, measured on the partition we actually
+    /// had.**
+    ///
+    /// THIS IS RECORDED DATA, NOT A RULE. The shipped floor is
+    /// `MIN_QUORUM_DENOMINATOR_NUM/DEN = 1/2`, chosen by the founder on
+    /// 2026-08-25 with the residual in front of him: 1/2 puts the minimum
+    /// recovering fraction at 1/3, which admits up to three pairwise-disjoint
+    /// justifying sets and therefore does NOT make the justified root unique.
+    /// He took liveness over uniqueness. This test does not argue with that
+    /// and does not change it — it exists so that if the question is ever
+    /// reopened, the cost of the other answer is a number he can read rather
+    /// than an argument he has to referee.
+    ///
+    /// The scenario is the relaunch: start from the leak the 2026-08-24
+    /// partition actually accrued, bring `k` of the 64 validators back, and
+    /// ask the smallest `k` for which finality returns.
+    #[test]
+    fn how_much_of_the_fleet_must_return_before_finality_does() {
+        let committee: Vec<Validator> = (0..64u32).map(|i| validator(i, STAKE_EACH)).collect();
+        let inherited = mainnet_leak_after(56);
+
+        // Smallest k in 1..=64 whose return restores finality within 200
+        // epochs, under a given floor. Validators 0..4 are the ones that
+        // never leaked — the partition's own group — so they come back first,
+        // which is the realistic and the FAVOURABLE ordering for recovery.
+        let smallest_k_that_heals = |num: u128, den: u128| -> Option<u32> {
+            for k in 1..=64u32 {
+                tests_hook::FLOOR_OVERRIDE.with(|c| c.set(Some((num, den))));
+                let mut st = FinalityState::new(genesis());
+                st.leaked = inherited.clone();
+                let mut healed = false;
+                for e in 1..=200u64 {
+                    let src = st.current_justified();
+                    let atts: Vec<(u32, AttestationData)> =
+                        (0..k).map(|v| vote(v, e, root((e % 251) as u8), src)).collect();
+                    let out = st
+                        .process_epoch(&EpochVotes {
+                            epoch: e,
+                            active_set: &committee,
+                            attestations: &atts,
+                        })
+                        .unwrap();
+                    if out.finalized.is_some() {
+                        healed = true;
+                        break;
+                    }
+                }
+                tests_hook::FLOOR_OVERRIDE.with(|c| c.set(None));
+                if healed {
+                    return Some(k);
+                }
+            }
+            None
+        };
+
+        let half = smallest_k_that_heals(1, 2).expect("1/2 must heal for some k");
+        let three_quarters = smallest_k_that_heals(3, 4).expect("3/4 must heal for some k");
+
+        // The shipped rule must be the more permissive one, or the constant
+        // and this measurement disagree about what 1/2 means.
+        assert!(
+            half < three_quarters,
+            "a lower floor must not require MORE of the fleet to return ({half} vs \
+             {three_quarters}) — the algebra or the implementation is wrong"
+        );
+        assert_eq!(
+            (MIN_QUORUM_DENOMINATOR_NUM, MIN_QUORUM_DENOMINATOR_DEN),
+            (1, 2),
+            "the shipped floor is the founder's 1/2 (2026-08-25); this test measures \
+             alternatives, it does not install them"
+        );
+
+        println!(
+            "PRICE OF THE FLOOR, on the partition of 2026-08-24 (60 of 64 leaked to zero):\n  \
+             floor 1/2 (SHIPPED, founder's decision): finality returns once {half} of 64 \
+             validators are back ({:.1}% of stake)\n  \
+             floor 3/4 (measured, NOT shipped):       finality returns once \
+             {three_quarters} of 64 validators are back ({:.1}% of stake)\n  \
+             So between {half} and {} returning validators, 1/2 heals the chain and 3/4 \
+             does not. Below {half}, neither does.",
+            half as f64 / 64.0 * 100.0,
+            three_quarters as f64 / 64.0 * 100.0,
+            three_quarters - 1
+        );
+
+        // And the fact that decides the relaunch either way: the group that
+        // was actually live during the partition — 4 of 64 — heals under
+        // NEITHER floor. The relaunch does not depend on the floor; it
+        // depends on validators coming back.
+        assert!(
+            half > 4,
+            "4 of 64 healed the chain on its own — then the floor is not blocking the \
+             minority that finalized alone on 2026-08-24, and the fix does not work"
+        );
+        println!(
+            "  The 4-of-64 group that finalized alone on 2026-08-24 heals under NEITHER \
+             floor. The relaunch depends on validators returning, not on this constant."
+        );
+    }
+
     /// The leak still WORKS. Two properties that must survive the fix, or the
     /// fix has quietly turned a liveness mechanism into a no-op.
     #[test]
     fn the_leak_still_buys_liveness_back_after_the_fix() {
-        let _g = HOOK.lock().unwrap_or_else(|e| e.into_inner());
         // A 60/40 stall — a MAJORITY present, which is what the leak exists
         // for. It must still recover, and the absentees must still pay.
         let committee =
@@ -1227,7 +1338,6 @@ mod tests {
     /// a chain 110 epochs into non-finality can ever climb out.
     #[test]
     fn the_leak_recovers_once_the_validator_participates_even_during_a_stall() {
-        let _g = HOOK.lock().unwrap_or_else(|e| e.into_inner());
         let committee: Vec<Validator> = (0..64u32).map(|i| validator(i, STAKE_EACH)).collect();
         let mut st = FinalityState::new(genesis());
         // 30 epochs with validator 40 absent: it accrues a leak, and the
@@ -1272,9 +1382,6 @@ mod tests {
 
     const STAKE_EACH: u64 = 1_000_000_000;
 
-    /// Serializes the tests that touch the process-global mutation switch.
-    static HOOK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// 64 validators, only 4 reachable and voting. Returns the epoch at which
     /// the 4 first justify (None if never within the horizon) and the
     /// percentage of TOTAL network stake the leak destroyed by then.
@@ -1305,7 +1412,6 @@ mod tests {
     /// so on the binary mainnet runs, it is not there.
     #[test]
     fn a_single_fully_leaked_validator_makes_the_two_rosters_partition_differently() {
-        let _g = HOOK.lock().unwrap_or_else(|e| e.into_inner());
         // 64 validators. Task 2 shows every absent validator on a chain with
         // 49+ epochs of non-finality is at EXACTLY zero, so one is generous.
         let duty: Vec<Validator> = (0..64u32).map(|i| validator(i, STAKE_EACH)).collect();
@@ -1347,8 +1453,14 @@ mod tests {
         }
         let admitted = atts.len();
 
-        // Now the boundary tally, against the UNLEAKED roster — the real
-        // production function, the real seed, the real partition filter.
+        // Now the boundary tally, the real production function, the real
+        // seed, the real partition filter. `partition_set = &duty` is the
+        // PRE-FIX wiring: before cde4c51d, `votes_from_partition` derived
+        // committee membership from the same (unleaked) roster it used for
+        // weight, so `close_epoch` partitioned differently from step 8. This
+        // call reproduces that, and is the mutation for the boundary-tally
+        // fix — flip the third argument to `&consensus` and the drop
+        // disappears (the control at the end of this test does exactly that).
         let mut accepted = Vec::new();
         let ev = votes_from_partition(epoch, &duty, &duty, &atts, &seed, &mut accepted);
         let survived = ev.attestations.len();
@@ -1373,17 +1485,33 @@ mod tests {
              split does not block finality and this finding is refuted"
         );
 
-        // The control: feed step 8's own roster to the boundary and the same
-        // votes justify immediately. The divergence is the roster, nothing else.
+        // THE CONTROL, which is also the FIX (cde4c51d). Membership from the
+        // leaked roster — the one step 8 admitted against — and weight from
+        // the unleaked `active_set`, so `process_epoch` subtracts the leak
+        // exactly once rather than twice. Same votes, same seed, same
+        // everything else: they justify immediately.
         let mut accepted2 = Vec::new();
-        let ev2 = votes_from_partition(epoch, &consensus, &consensus, &atts, &seed, &mut accepted2);
+        let ev2 = votes_from_partition(epoch, &duty, &consensus, &atts, &seed, &mut accepted2);
         assert_eq!(ev2.attestations.len(), admitted, "control: same roster keeps every vote");
         let mut st2 = FinalityState::new(genesis());
         let out2 = st2.process_epoch(&ev2).unwrap();
         assert_eq!(
             out2.justified,
             Some(Checkpoint { epoch, root: target }),
-            "control: with ONE roster on both sides the identical votes justify"
+            "control: with membership taken from the roster that admitted the votes, the \
+             identical votes justify"
+        );
+        // And the weight must be the UNLEAKED stake minus the leak once, not
+        // twice: `active_set` is `duty`, so validator 7 is worth 0 (its whole
+        // stake has leaked) and every other validator is worth its full
+        // STAKE_EACH. Passing `&consensus` as `active_set` too would look
+        // identical here — validator 7 saturates at 0 either way — and would
+        // silently halve every PARTIALLY leaked validator on a real fleet.
+        assert_eq!(
+            ev2.active_set.iter().filter(|v| v.effective_stake == STAKE_EACH).count(),
+            64,
+            "the boundary must weigh the UNLEAKED roster; process_epoch subtracts the leak \
+             itself, and feeding it a pre-leaked roster charges partial leaks twice"
         );
         println!(
             "CONTROL: the identical votes, tallied against the roster that admitted them, \
@@ -1428,9 +1556,8 @@ mod tests {
 
     /// Turn the two 2026-08-25 corrections off (`true`) or back on (`false`).
     fn legacy_arithmetic(on: bool) {
-        use std::sync::atomic::Ordering::Relaxed;
-        tests_hook::DISABLE_DENOMINATOR_FLOOR.store(on, Relaxed);
-        tests_hook::DISABLE_LEAK_RECOVERY.store(on, Relaxed);
+        tests_hook::DISABLE_DENOMINATOR_FLOOR.with(|c| c.set(on));
+        tests_hook::DISABLE_LEAK_RECOVERY.with(|c| c.set(on));
     }
 
     fn run_partition_inner(mutated: bool) -> (Option<u64>, f64) {
@@ -1514,167 +1641,32 @@ pub fn votes_from_partition<'a>(
 /// exist in a shipped binary.
 #[cfg(test)]
 mod tests_hook {
-    use std::sync::atomic::AtomicBool;
-    /// Counterfactual: drop the leak out of the denominator entirely.
-    pub(super) static IGNORE_LEAK_IN_DENOMINATOR: AtomicBool = AtomicBool::new(false);
-    /// Reproduce the pre-fix denominator: leak-adjusted, no floor.
-    pub(super) static DISABLE_DENOMINATOR_FLOOR: AtomicBool = AtomicBool::new(false);
-    /// Reproduce the pre-fix accumulator: monotonic, never recovers.
-    pub(super) static DISABLE_LEAK_RECOVERY: AtomicBool = AtomicBool::new(false);
-}
+    use std::cell::Cell;
 
-#[cfg(test)]
-mod pmo_lab_arithmetic {
-    use super::*;
-
-    const G: [u8; 32] = [0xAA; 32];
-    fn genesis() -> Checkpoint { Checkpoint { epoch: 0, root: G } }
-    fn root(n: u8) -> [u8; 32] { [n; 32] }
-    fn validator(index: u32, effective_stake: u64) -> Validator {
-        Validator { index, effective_stake }
-    }
-    fn vote(v: u32, epoch: u64, target: [u8; 32], source: Checkpoint) -> (u32, AttestationData) {
-        (v, AttestationData {
-            slot: epoch * crate::params::SLOTS_PER_EPOCH,
-            head: target,
-            source_epoch: source.epoch,
-            source_root: source.root,
-            target_epoch: epoch,
-            target_root: target,
-        })
-    }
-
-    /// CORRECTION 2026-08-24: the 47.53/52.47 figure below is the split
-    /// AFTER 42 epochs of partition, measured on the MINORITY's own chain -
-    /// not the split at genesis. At genesis the devnet is 80/20:
-    /// `bloch-pos genesis` assigns `(i % 3 + 1) * 200_000 BLOCH` (main.rs:707),
-    /// so nodes 0..5 hold 2,400k BLOCH and nodes 6,7 hold 600k.
-    ///
-    /// The two sides were measured from both chains at once, which is what
-    /// exposed it:
-    ///     v6 seen from side A: 20,000,000,000,000  (exactly genesis)
-    ///     v6 seen from side B: 87,748,075,889,696  (+339%)
-    /// On A's chain the minority produced nothing and earned nothing. On its
-    /// OWN chain it produced everything and collected every reward.
-    ///
-    /// **So there are TWO amplifiers, not one.** The leak shrinks the
-    /// denominator, and block rewards inflate the isolated side's own
-    /// numerator. A partitioned minority mints itself into a majority on its
-    /// own branch: 20% -> 52.47% in 42 epochs, a 4.4x inflation.
-    ///
-    /// **This is why no fixed floor is a complete fix.** The floor is a
-    /// fraction of the CURRENT active set, and the current active set is
-    /// exactly what the isolated branch is inflating. To clear the bar the
-    /// minority needs 1.7x at a 1/2 floor and 2.5x at 3/4; it reached 4.4x.
-    /// A higher floor buys TIME, proportional to how long the inflation takes
-    /// - it does not close the hole. Closing it means anchoring the
-    /// denominator to the stake set as of the last FINALIZED checkpoint,
-    /// which a branch cannot mint its way past because the bar stops moving
-    /// at the last point both sides agreed on.
-    ///
-    /// The laboratory's post-partition stake split, measured off a running devnet.
-    ///
-    /// The lab calls it a "6/2 split" and that is a count of NODES, not of
-    /// stake. `keygen` hands out wildly unequal bonds - v7 carries 8.5x v0 -
-    /// so the two nodes everyone called "the minority" actually hold
-    /// **52.47%** of the network and the six-node side holds 47.53%.
-    ///
-    /// That is what made the floor look useless. A floor of 1/2 caps how far
-    /// the leak may shrink the denominator, so the smallest self-justifying
-    /// set becomes `2/3 x 1/2 = 1/3` of the original stake. BOTH sides clear
-    /// one third, so BOTH still justify, and two conflicting finalized
-    /// checkpoints is exactly the safety violation the floor was added to
-    /// prevent.
-    ///
-    /// The general rule this pins: two DISJOINT sets can both justify unless
-    /// `2/3 x floor > 1/2`, i.e. unless **floor > 3/4**. A floor of 1/2 is not
-    /// a weak version of the fix, it is a floor that permits the failure.
-    const LAB_STAKES: [u64; 8] = [
-        20_640_910_790_427,  // v0
-        42_266_641_023_599,  // v1
-        31_251_803_874_886,  // v2  (residual of the measured total)
-        44_632_922_615_884,  // v3
-        49_318_461_489_431,  // v4
-        50_318_661_489_430,  // v5
-        87_748_075_889_696,  // v6  measured
-        175_496_151_779_451, // v7  measured
-    ];
-
-    /// Two disjoint sets both justify under a 1/2 floor, and only one does
-    /// under 3/4. This is the calibration argument, run rather than asserted.
-    #[test]
-    fn a_half_floor_lets_two_disjoint_sides_both_justify() {
-        let total: u128 = LAB_STAKES.iter().map(|s| *s as u128).sum();
-        let b: u128 = LAB_STAKES[6..].iter().map(|s| *s as u128).sum();
-        let a = total - b;
-        // Smallest self-justifying set = 2/3 x floor, in units of `total`.
-        let clears = |num: u128, den: u128, side: u128| side * 3 * den >= 2 * num * total;
-        println!(
-            "LAB STAKE SPLIT: A={:.2}%  B={:.2}%",
-            a as f64 / total as f64 * 100.0,
-            b as f64 / total as f64 * 100.0
-        );
-        assert!(clears(1, 2, a) && clears(1, 2, b), "1/2 floor: both sides justify - the observed devnet behaviour");
-        assert!(!clears(3, 4, a), "3/4 floor must exclude the 47.53% side");
-        assert!(clears(3, 4, b), "3/4 floor must still admit a real stake majority");
-        println!("floor 1/2 -> A and B BOTH justify (two finalized roots).  floor 3/4 -> only B.");
-        // WHAT THIS TEST IS, AND WHAT IT IS NOT.
-        //
-        // The three assertions above are parameterised: they hold whatever the
-        // shipped constant is, because they pass the floor in explicitly. They
-        // are a MEASUREMENT of what each floor would buy on the stake split
-        // this devnet actually had, and they stay true forever.
-        //
-        // There used to be a fourth assertion here, on the shipped constant,
-        // demanding it be at or above 3/4. It was removed, and the reason is
-        // the point of this comment: it turned a founder's decision into a red
-        // build. The owner chose a floor of 1/2 on 2026-08-24, was shown the
-        // argument for 3/4 and the price of it, and reaffirmed 1/2 - trading
-        // uniqueness of the justified root for the ability to recover finality
-        // after losing more than half the stake. A test may hold the record of
-        // that decision. It may not overrule it.
-        //
-        // The measurement stands as the case a future owner would need to
-        // reopen the question: at 1/2 both sides of the observed split justify,
-        // so two conflicting roots can finalize; at 3/4 only the majority does,
-        // at the cost of never recovering from an outage above half the stake.
-        // See `the_quorum_floor_is_the_one_the_owner_chose` for the pin.
-    }
-
-    /// The laboratory's exact split, checked against the floor.
-    ///
-    /// 8 validators, a 6/2 partition, the minority alone. If the floor binds
-    /// at this shape, 2 of 8 must NEVER justify however long they wait: the
-    /// denominator cannot fall below half the unleaked total, so a quorum
-    /// costs 2/3 x 1/2 = 1/3 of the original stake and the minority holds
-    /// only 1/4. This is the arithmetic the devnet run is supposed to obey,
-    /// and the devnet DID still diverge - so this test exists to say which of
-    /// the two is wrong.
-    #[test]
-    fn the_labs_two_of_eight_minority_cannot_justify_with_the_floor() {
-        let all: Vec<Validator> = (0..8u32).map(|i| validator(i, 1_000_000_000)).collect();
-        let mut st = FinalityState::new(genesis());
-        let mut justified_at: Option<u64> = None;
-        for e in 1..=60u64 {
-            let src = st.current_justified();
-            let atts: Vec<(u32, AttestationData)> =
-                (6..8u32).map(|v| vote(v, e, root(e as u8), src)).collect();
-            let out = st
-                .process_epoch(&EpochVotes { epoch: e, active_set: &all, attestations: &atts })
-                .unwrap();
-            if out.justified.is_some() && justified_at.is_none() {
-                justified_at = Some(e);
-            }
-        }
-        println!(
-            "LAB SHAPE 2-of-8: justified_at={:?}  leaked_of(0)={}  leaked_of(6)={}",
-            justified_at, st.leaked_of(0), st.leaked_of(6)
-        );
-        assert_eq!(
-            justified_at, None,
-            "2 of 8 justified at {:?} DESPITE the floor - the floor does not bind at the \
-             laboratory's shape, which is why the devnet still diverged",
-            justified_at
-        );
+    // THREAD-LOCAL, not `static AtomicBool`, and the difference is not
+    // stylistic. `cargo test` runs every #[test] on its own thread inside ONE
+    // process, so a process-global switch set by a finality test is read by
+    // every transition test running in parallel — tests that drive real
+    // chains through `apply_block` and whose verdicts then depend on which
+    // unrelated test happened to be mid-flight. That is a nondeterministic,
+    // load-dependent failure in tests that have nothing to do with the leak,
+    // and it cost a full-crate run to find: `the_rule_reads_a_boundary_the_
+    // state_still_retains` failed under the full suite and passed when run
+    // alone. A per-thread cell makes the isolation structural, so the switch
+    // cannot reach a test that did not set it, and no mutex is needed to get
+    // that guarantee.
+    thread_local! {
+        /// Counterfactual: drop the leak out of the denominator entirely.
+        pub(super) static IGNORE_LEAK_IN_DENOMINATOR: Cell<bool> = const { Cell::new(false) };
+        /// Reproduce the pre-fix denominator: leak-adjusted, no floor.
+        pub(super) static DISABLE_DENOMINATOR_FLOOR: Cell<bool> = const { Cell::new(false) };
+        /// Reproduce the pre-fix accumulator: monotonic, never recovers.
+        pub(super) static DISABLE_LEAK_RECOVERY: Cell<bool> = const { Cell::new(false) };
+        /// Override the quorum floor with `(num, den)`, for measuring what a
+        /// DIFFERENT floor would cost. `None` = use the shipped constants,
+        /// which are the founder's 1/2 and are what every non-measuring test
+        /// and every shipped binary reads.
+        pub(super) static FLOOR_OVERRIDE: Cell<Option<(u128, u128)>> =
+            const { Cell::new(None) };
     }
 }
