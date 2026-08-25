@@ -203,7 +203,7 @@ impl FinalityState {
     fn denominator_ignores_leak() -> bool {
         #[cfg(test)]
         {
-            return tests_hook::IGNORE_LEAK_IN_DENOMINATOR.load(std::sync::atomic::Ordering::Relaxed);
+            return tests_hook::IGNORE_LEAK_IN_DENOMINATOR.with(std::cell::Cell::get);
         }
         #[cfg(not(test))]
         false
@@ -217,7 +217,7 @@ impl FinalityState {
     fn denominator_floor_disabled() -> bool {
         #[cfg(test)]
         {
-            return tests_hook::DISABLE_DENOMINATOR_FLOOR.load(std::sync::atomic::Ordering::Relaxed);
+            return tests_hook::DISABLE_DENOMINATOR_FLOOR.with(std::cell::Cell::get);
         }
         #[cfg(not(test))]
         false
@@ -231,7 +231,7 @@ impl FinalityState {
     fn leak_recovery_disabled() -> bool {
         #[cfg(test)]
         {
-            return tests_hook::DISABLE_LEAK_RECOVERY.load(std::sync::atomic::Ordering::Relaxed);
+            return tests_hook::DISABLE_LEAK_RECOVERY.with(std::cell::Cell::get);
         }
         #[cfg(not(test))]
         false
@@ -924,9 +924,9 @@ mod tests {
     #[test]
     fn without_the_leak_in_the_denominator_the_minority_never_finalizes() {
         let _g = HOOK.lock().unwrap_or_else(|e| e.into_inner());
-        tests_hook::IGNORE_LEAK_IN_DENOMINATOR.store(true, std::sync::atomic::Ordering::Relaxed);
+        tests_hook::IGNORE_LEAK_IN_DENOMINATOR.with(|c| c.set(true));
         let (epoch, _) = run_partition(true);
-        tests_hook::IGNORE_LEAK_IN_DENOMINATOR.store(false, std::sync::atomic::Ordering::Relaxed);
+        tests_hook::IGNORE_LEAK_IN_DENOMINATOR.with(|c| c.set(false));
         assert_eq!(
             epoch, None,
             "MUTATION DID NOT BITE: with an unadjusted denominator a 4-of-64 minority still \
@@ -1000,7 +1000,7 @@ mod tests {
         // schedule into a slower sawtooth — that node leaks less, so modelling
         // the stalled majority is both the common case and the conservative
         // one for the roster split.)
-        tests_hook::DISABLE_LEAK_RECOVERY.store(true, std::sync::atomic::Ordering::Relaxed);
+        tests_hook::DISABLE_LEAK_RECOVERY.with(|c| c.set(true));
         let committee: Vec<Validator> = (0..64u32).map(|i| validator(i, STAKE_EACH)).collect();
         let mut st = FinalityState::new(genesis());
         for e in 1..=epochs {
@@ -1015,7 +1015,7 @@ mod tests {
             0,
             "the generator must model a node in CONTINUOUS non-finality; it finalized"
         );
-        tests_hook::DISABLE_LEAK_RECOVERY.store(false, std::sync::atomic::Ordering::Relaxed);
+        tests_hook::DISABLE_LEAK_RECOVERY.with(|c| c.set(false));
         st.leaked.clone()
     }
 
@@ -1065,7 +1065,7 @@ mod tests {
         // everyone honest, everyone voting for one root.
         let mut no_zeroing = FinalityState::new(genesis());
         no_zeroing.leaked = inherited.clone();
-        tests_hook::DISABLE_LEAK_RECOVERY.store(true, std::sync::atomic::Ordering::Relaxed);
+        tests_hook::DISABLE_LEAK_RECOVERY.with(|c| c.set(true));
         let mut ever_justified = None;
         for e in 1..=40u64 {
             let src = no_zeroing.current_justified();
@@ -1083,7 +1083,7 @@ mod tests {
                 break;
             }
         }
-        tests_hook::DISABLE_LEAK_RECOVERY.store(false, std::sync::atomic::Ordering::Relaxed);
+        tests_hook::DISABLE_LEAK_RECOVERY.with(|c| c.set(false));
         assert_eq!(
             ever_justified, None,
             "phase 2: the relaunch finalized at epoch {ever_justified:?} WITHOUT the accumulator \
@@ -1272,7 +1272,9 @@ mod tests {
 
     const STAKE_EACH: u64 = 1_000_000_000;
 
-    /// Serializes the tests that touch the process-global mutation switch.
+    /// Kept from dev9's original, now belt-and-braces: the switches became
+    /// thread-local (see `mod tests_hook`), so nothing needs serializing any
+    /// more. Removing it would be a wider diff than it is worth.
     static HOOK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// 64 validators, only 4 reachable and voting. Returns the epoch at which
@@ -1450,9 +1452,8 @@ mod tests {
 
     /// Turn the two 2026-08-25 corrections off (`true`) or back on (`false`).
     fn legacy_arithmetic(on: bool) {
-        use std::sync::atomic::Ordering::Relaxed;
-        tests_hook::DISABLE_DENOMINATOR_FLOOR.store(on, Relaxed);
-        tests_hook::DISABLE_LEAK_RECOVERY.store(on, Relaxed);
+        tests_hook::DISABLE_DENOMINATOR_FLOOR.with(|c| c.set(on));
+        tests_hook::DISABLE_LEAK_RECOVERY.with(|c| c.set(on));
     }
 
     fn run_partition_inner(mutated: bool) -> (Option<u64>, f64) {
@@ -1536,11 +1537,26 @@ pub fn votes_from_partition<'a>(
 /// exist in a shipped binary.
 #[cfg(test)]
 mod tests_hook {
-    use std::sync::atomic::AtomicBool;
-    /// Counterfactual: drop the leak out of the denominator entirely.
-    pub(super) static IGNORE_LEAK_IN_DENOMINATOR: AtomicBool = AtomicBool::new(false);
-    /// Reproduce the pre-fix denominator: leak-adjusted, no floor.
-    pub(super) static DISABLE_DENOMINATOR_FLOOR: AtomicBool = AtomicBool::new(false);
-    /// Reproduce the pre-fix accumulator: monotonic, never recovers.
-    pub(super) static DISABLE_LEAK_RECOVERY: AtomicBool = AtomicBool::new(false);
+    use std::cell::Cell;
+
+    // THREAD-LOCAL, not `static AtomicBool`, and the difference is not
+    // stylistic. `cargo test` runs every #[test] on its own thread inside ONE
+    // process, so a process-global switch set by a finality test is read by
+    // every transition test running in parallel — tests that drive real
+    // chains through `apply_block` and whose verdicts then depend on which
+    // unrelated test happened to be mid-flight. That is a nondeterministic,
+    // load-dependent failure in tests that have nothing to do with the leak,
+    // and it cost a full-crate run to find: `the_rule_reads_a_boundary_the_
+    // state_still_retains` failed under the full suite and passed when run
+    // alone. A per-thread cell makes the isolation structural, so the switch
+    // cannot reach a test that did not set it, and no mutex is needed to get
+    // that guarantee.
+    thread_local! {
+        /// Counterfactual: drop the leak out of the denominator entirely.
+        pub(super) static IGNORE_LEAK_IN_DENOMINATOR: Cell<bool> = const { Cell::new(false) };
+        /// Reproduce the pre-fix denominator: leak-adjusted, no floor.
+        pub(super) static DISABLE_DENOMINATOR_FLOOR: Cell<bool> = const { Cell::new(false) };
+        /// Reproduce the pre-fix accumulator: monotonic, never recovers.
+        pub(super) static DISABLE_LEAK_RECOVERY: Cell<bool> = const { Cell::new(false) };
+    }
 }
