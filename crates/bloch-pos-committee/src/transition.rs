@@ -2977,7 +2977,32 @@ fn with_leak_applied(roster: Vec<Validator>, leaked_of: impl Fn(u32) -> u64) -> 
             index: v.index,
             effective_stake: v.effective_stake.saturating_sub(leaked_of(v.index)),
         })
+        // KEEPING the zeroed record is load-bearing, not incidental. Committee
+        // membership is a function of (seed, epoch, index set), so the leaked
+        // and unleaked rosters partition identically only while they carry the
+        // SAME index set. Dropping the record here re-opens the 2026-08-24
+        // roster split from the other side, and the committee-level tests would
+        // not see it, because they build both rosters as fixtures rather than
+        // through these call sites. Pinned by
+        // `the_two_call_sites_agree_on_the_index_set_with_a_real_leak`.
+        .filter(|v| !mutation_leak_drops_zeroed() || v.effective_stake > 0)
         .collect()
+}
+
+/// **MUTATION SWITCH.** `true` makes [`with_leak_applied`] drop a fully-leaked
+/// validator instead of keeping it at zero — the defect, from the other door.
+///
+/// Constant `false` in every build that is not a test build, so the branch
+/// folds away and the switch cannot exist in a shipped binary.
+#[inline]
+fn mutation_leak_drops_zeroed() -> bool {
+    #[cfg(test)]
+    {
+        return crate::params::rehearsal::LEAK_DROPS_ZEROED
+            .load(std::sync::atomic::Ordering::Relaxed);
+    }
+    #[cfg(not(test))]
+    false
 }
 
 /// Narrow a `u128` stake to the `u64` the sampling layer carries. Saturating,
@@ -6781,6 +6806,168 @@ mod tests {
         );
     }
 
+    /// **The call-site test.** The two rosters `transition.rs` actually holds
+    /// must agree on their INDEX SET, with a leak that was accrued by the real
+    /// fold rather than fabricated.
+    ///
+    /// Why this exists on top of the committee-level tests: those build the
+    /// leaked and unleaked rosters as FIXTURES shaped like what
+    /// `with_leak_applied` produces, and so they prove `epoch_committees` is
+    /// leak-invariant — the core claim — but not that these two call sites feed
+    /// it the same index set. Make `with_leak_applied` drop the zeroed record
+    /// and every one of those tests stays green while the split is back. This
+    /// one goes red, which is the whole point of writing it.
+    ///
+    /// The leak here is REAL: it is accrued by driving `process_epoch` over
+    /// epochs in which nobody attests, which is the only way a leak comes into
+    /// existence anywhere in this system. Fabricating the accumulator would
+    /// have made the fixture prove itself.
+    #[test]
+    fn the_two_call_sites_agree_on_the_index_set_with_a_real_leak() {
+        let _h = crate::params::rehearsal::HOOK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::params::rehearsal::LEAK_DROPS_ZEROED
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+
+        let (_t, mut g, _c) = setup(8);
+        let seed = g.seed_for_epoch(0);
+
+        // Accrue a real leak: epoch after epoch in which nobody attests. The
+        // engine's own rule decides when the bite starts and how big it is.
+        let mut zeroed = None;
+        for epoch in 1..400u64 {
+            let roster = g.duty_roster_at(0);
+            let mut accepted = Vec::new();
+            let votes = finality::votes_from_partition(epoch, &roster, &[], &seed, &mut accepted);
+            if g.finality_engine.process_epoch(&votes).is_err() {
+                break;
+            }
+            if let Some(v) = roster
+                .iter()
+                .find(|v| g.finality_engine.leaked_of(v.index) >= v.effective_stake)
+            {
+                zeroed = Some(v.index);
+                break;
+            }
+        }
+        let zeroed = zeroed.expect(
+            "the fold never drove anybody to zero, so this test would be vacuous -              the leak rule or its threshold changed",
+        );
+
+        // Open the gate. Below it `consensus_roster_at` short-circuits to the
+        // unleaked roster and the comparison below could not fail either way.
+        let epoch = crate::params::LEAKED_ROSTER_ACTIVATION_EPOCH;
+        g.epoch = epoch;
+
+        let duty = g.duty_roster_at(epoch);
+        let consensus = g.consensus_roster_at(epoch);
+
+        // Non-vacuity, both halves: the gate is really open, and somebody is
+        // really at zero on the consensus side.
+        assert_ne!(
+            consensus, duty,
+            "control failed: the two rosters are identical value-for-value, so the \
+             leak never reached consensus_roster_at and the assertion below is vacuous"
+        );
+        assert_eq!(
+            consensus.iter().find(|v| v.index == zeroed).map(|v| v.effective_stake),
+            Some(0),
+            "control failed: the fully-leaked validator is not at zero on the consensus side"
+        );
+
+        let duty_set: Vec<u32> = duty.iter().map(|v| v.index).collect();
+        let consensus_set: Vec<u32> = consensus.iter().map(|v| v.index).collect();
+        assert_eq!(
+            consensus_set, duty_set,
+            "THE ROSTER SPLIT IS BACK: consensus_roster_at and duty_roster_at no longer \
+             carry the same index set, so epoch_committees will shuffle lists of different \
+             length and the boundary tally will drop votes step 8 admitted"
+        );
+
+        // And the consequence the index set exists to buy: identical partitions.
+        assert_eq!(
+            crate::committees::epoch_committees(&seed, epoch, &consensus),
+            crate::committees::epoch_committees(&seed, epoch, &duty),
+            "same index set but different partitions - epoch_committees read stake again"
+        );
+    }
+
+    /// **MUTATION.** Put the split back through `with_leak_applied` and watch
+    /// the call-site test go red:
+    ///
+    /// ```text
+    /// cargo test -p bloch-pos-committee --lib \
+    ///   transition::tests::rehearsal_dropping_the_leaked_record_reopens_the_split \
+    ///   -- --nocapture
+    /// ```
+    #[test]
+    fn rehearsal_dropping_the_leaked_record_reopens_the_split() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let _h = crate::params::rehearsal::HOOK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Control: mutation off, the pinning assertion holds. Without this a
+        // panic below could be coming from anywhere.
+        crate::params::rehearsal::LEAK_DROPS_ZEROED.store(false, Relaxed);
+        assert!(
+            std::panic::catch_unwind(call_site_index_sets_agree).is_ok(),
+            "control failed: the call-site assertion does not hold even unmutated"
+        );
+
+        crate::params::rehearsal::LEAK_DROPS_ZEROED.store(true, Relaxed);
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // the failure IS the result
+        let red = std::panic::catch_unwind(call_site_index_sets_agree);
+        std::panic::set_hook(prev);
+        crate::params::rehearsal::LEAK_DROPS_ZEROED.store(false, Relaxed);
+
+        let msg = red
+            .err()
+            .map(|e| {
+                e.downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_default()
+            })
+            .expect(
+                "MUTATION DID NOT GO RED: with_leak_applied was made to drop the fully-leaked \
+                 record and the two call sites still agreed on the index set. Either the \
+                 switch is no longer wired into with_leak_applied, or the assertion is vacuous.",
+            );
+        println!("MUTATION WENT RED, as it must. First failure:\n  {msg}");
+    }
+
+    /// The body of the call-site assertion, factored out so the mutation test
+    /// can run the identical code under `catch_unwind`.
+    fn call_site_index_sets_agree() {
+        let (_t, mut g, _c) = setup(8);
+        let seed = g.seed_for_epoch(0);
+        let mut zeroed = None;
+        for epoch in 1..400u64 {
+            let roster = g.duty_roster_at(0);
+            let mut accepted = Vec::new();
+            let votes = finality::votes_from_partition(epoch, &roster, &[], &seed, &mut accepted);
+            if g.finality_engine.process_epoch(&votes).is_err() {
+                break;
+            }
+            if let Some(v) = roster
+                .iter()
+                .find(|v| g.finality_engine.leaked_of(v.index) >= v.effective_stake)
+            {
+                zeroed = Some(v.index);
+                break;
+            }
+        }
+        assert!(zeroed.is_some(), "the fold never drove anybody to zero");
+        let epoch = crate::params::LEAKED_ROSTER_ACTIVATION_EPOCH;
+        g.epoch = epoch;
+        let duty: Vec<u32> = g.duty_roster_at(epoch).iter().map(|v| v.index).collect();
+        let consensus: Vec<u32> =
+            g.consensus_roster_at(epoch).iter().map(|v| v.index).collect();
+        assert_eq!(
+            consensus, duty,
+            "THE ROSTER SPLIT IS BACK: the two call sites carry different index sets"
+        );
+    }
+
     /// A fully-leaked validator stops being drawn to propose — the liveness the
     /// leak is supposed to buy back — while **keeping its committee seat**.
     ///
@@ -6947,13 +7134,26 @@ mod tests {
         );
 
         // And the detector really is unconditional at the call site.
+        //
+        // Comments are stripped before the window is judged. Without that, the
+        // explanatory comment directly above the call — which necessarily says
+        // the words "debug_assert", because explaining why this is NOT one is
+        // its entire job — trips the assertion. That is how this test failed
+        // the first time it was ever run: a false red, on prose.
         let src = include_str!("transition.rs");
         let at = src.find("report_boundary_vote_drop(closing,").expect("the call site moved");
-        let window = &src[at.saturating_sub(300)..at];
+        let code: String = src[at.saturating_sub(600)..at]
+            .lines()
+            .map(|l| match l.find("//") {
+                Some(i) => &l[..i],
+                None => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
-            !window.contains("#[cfg(") && !window.contains("debug_assert"),
+            !code.contains("#[cfg(") && !code.contains("debug_assert"),
             "the detector call has grown a cfg gate or moved inside a debug_assert; it is a \
-             release-profile check or it is nothing"
+             release-profile check or it is nothing. Code before the call site:\n{code}"
         );
     }
 

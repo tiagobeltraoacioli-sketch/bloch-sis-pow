@@ -329,6 +329,21 @@ pub mod rehearsal {
     /// `committees::mutation_restores_zero_stake_filter`.
     pub static RESTORE_ZERO_STAKE_FILTER: AtomicBool = AtomicBool::new(false);
 
+    /// Makes `transition::with_leak_applied` REMOVE a validator whose leak has
+    /// eaten its whole stake, instead of keeping it at `effective_stake = 0`.
+    ///
+    /// This is the defect coming back through the other door. The 2026-08-24
+    /// fix removed the `effective_stake > 0` filter from `epoch_committees`, so
+    /// membership is a function of (seed, epoch, index set) and the two rosters
+    /// partition identically **as long as they carry the same index set**. If
+    /// `with_leak_applied` ever drops the zeroed record, `consensus_roster_at`
+    /// and `duty_roster_at` stop agreeing on that set, and the split is back —
+    /// with the committee-level tests still green, because those build both
+    /// rosters as fixtures rather than through the call sites.
+    ///
+    /// Read only through `transition::mutation_leak_drops_zeroed`.
+    pub static LEAK_DROPS_ZEROED: AtomicBool = AtomicBool::new(false);
+
     /// Serializes every test that flips a switch in this module. The switches
     /// are process-global and `cargo test` runs test functions on threads, so
     /// without this a mutation test would silently corrupt an unrelated one.
