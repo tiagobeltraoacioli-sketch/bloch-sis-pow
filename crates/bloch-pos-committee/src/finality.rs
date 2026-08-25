@@ -1618,12 +1618,27 @@ mod pmo_lab_arithmetic {
         assert!(!clears(3, 4, a), "3/4 floor must exclude the 47.53% side");
         assert!(clears(3, 4, b), "3/4 floor must still admit a real stake majority");
         println!("floor 1/2 -> A and B BOTH justify (two finalized roots).  floor 3/4 -> only B.");
-        assert!(
-            MIN_QUORUM_DENOMINATOR_NUM * 4 >= MIN_QUORUM_DENOMINATOR_DEN * 3,
-            "MIN_QUORUM_DENOMINATOR is {}/{}; anything at or below 3/4 lets two disjoint sets \
-             finalize conflicting checkpoints - measured on the devnet, not argued",
-            MIN_QUORUM_DENOMINATOR_NUM, MIN_QUORUM_DENOMINATOR_DEN
-        );
+        // WHAT THIS TEST IS, AND WHAT IT IS NOT.
+        //
+        // The three assertions above are parameterised: they hold whatever the
+        // shipped constant is, because they pass the floor in explicitly. They
+        // are a MEASUREMENT of what each floor would buy on the stake split
+        // this devnet actually had, and they stay true forever.
+        //
+        // There used to be a fourth assertion here, on the shipped constant,
+        // demanding it be at or above 3/4. It was removed, and the reason is
+        // the point of this comment: it turned a founder's decision into a red
+        // build. The owner chose a floor of 1/2 on 2026-08-24, was shown the
+        // argument for 3/4 and the price of it, and reaffirmed 1/2 - trading
+        // uniqueness of the justified root for the ability to recover finality
+        // after losing more than half the stake. A test may hold the record of
+        // that decision. It may not overrule it.
+        //
+        // The measurement stands as the case a future owner would need to
+        // reopen the question: at 1/2 both sides of the observed split justify,
+        // so two conflicting roots can finalize; at 3/4 only the majority does,
+        // at the cost of never recovering from an outage above half the stake.
+        // See `the_quorum_floor_is_the_one_the_owner_chose` for the pin.
     }
 
     /// The laboratory's exact split, checked against the floor.
