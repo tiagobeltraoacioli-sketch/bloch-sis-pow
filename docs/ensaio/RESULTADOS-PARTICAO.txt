@@ -1,0 +1,62 @@
+ENSAIO DA PARTICAO — Genesis-4 PoS. Tres corridas, mesmo script, mesma
+topologia (8 nos, split 6/2 por NO, ~23 epocas de particao, cura no fio sem
+reiniciar nada). A unica variavel e o binario.
+
+  scripts/lab/particao.sh <binario> live
+
+CENSO DE PRODUTORES VISTO PELO NO n6 (slots 1..160) — a evidencia mais direta
+de em qual cadeia o no minoritario esta:
+
+  corrida 1  sem floor    2 produtores,  32 blocos, v6=15 v7=17   <- cadeia PROPRIA
+  corrida 2  floor 1/2    2 produtores,  23 blocos, v6=10 v7=13   <- cadeia PROPRIA
+  corrida 3  floor 3/4    6 produtores, 135 blocos, v0..v5        <- cadeia DA MAIORIA
+
+Nas corridas 1 e 2 os oito nos NAO concordam. Na corrida 3 os OITO reportam o
+mesmo censo, identico byte a byte.
+
+FINALIDADE
+  corrida 2 (floor 1/2): maioria fin_root=6f1d624bc10bff3c
+                         minoria fin_root=4d5bab894af8ab33   <- CONFLITANTE
+  corrida 3 (floor 3/4): maioria fin_root=13ab49783f6245f7 e42
+                         n6      fin_root=0125a1fe8892ba72 e21
+                         e 0125a1fe8892ba72 e EXATAMENTE a raiz que a maioria
+                         finalizou na fase 1. Mesma finalidade, so atrasada.
+                         NAO ha duas historias.
+
+O MECANISMO, medido e nao argumentado
+  fim da particao, floor 3/4:  n6 just=0 fin=0 root=9953da73 (a GENESE)
+  A minoria NUNCA adquiriu checkpoint justificado proprio. Sem ancora propria,
+  a cadeia da maioria descende da ancora dela, e na cura:
+
+    REORG: adopted branch of 513 blocks at ancestor 9953da73
+           (head slot 764 -> 603), root 5dae3c08
+
+  Com floor 1/2 e sem floor, a minoria justificava na epoca 22 e a partir dai
+  forkchoice_head (engine.rs:1148) ancora LMD-GHOST na raiz justificada
+  PROPRIA — nenhuma das cadeias descende da ancora da outra e nenhuma pode ser
+  escolhida, com qualquer peso.
+
+ANCORA (seed_for_attestation): NotInCommittee = 0 em TODOS os nos nas tres
+corridas com o binario corrigido, contra 90 (maioria) e 253-256 (minoria) na
+linha de base.
+
+O QUE NAO FECHOU
+  n6 terminou em height=634 contra 1262, behind_by_slots=33, blocks_known=1460.
+  Ele RECEBE tudo e APLICA devagar: medido 2 blocos/8s enquanto blocks_known
+  subia 18/8s. Adotou a historia certa e nao conseguiu acompanhar o relogio.
+  Slots de 500 ms com a maquina carregada; a mainnet tem 30 s, 60x mais folga.
+  E problema de vivacidade/desempenho, nao de seguranca — nao ha duas
+  historias em lugar nenhum da corrida 3.
+  Os outros 7 de 8, incluindo o n7 (o outro no "minoritario"), fecharam
+  identicos: head 1396, height 1262, e42/e41, mesma raiz.
+
+LIMITE HONESTO DO FLOOR
+  O floor e uma fracao do conjunto ativo ATUAL, e o lado isolado INFLA o
+  proprio stake com as recompensas da propria ramificacao (medido: v6 vale
+  20.000.000.000.000 na cadeia de A e 87.748.075.889.696 na propria, +339%;
+  20% -> 52,47% em 42 epocas, 4,4x). Para vencer a barra a minoria precisa
+  inflar 1,7x com floor 1/2 e 2,5x com 3/4. Ela conseguiu 4,4x em 42 epocas.
+  Ou seja: 3/4 SEGUROU uma particao de 23 epocas e COMPRA TEMPO — nao fecha o
+  buraco para uma particao arbitrariamente longa. Fechar exige ancorar o
+  denominador ao conjunto de stake do ultimo checkpoint FINALIZADO, que uma
+  ramificacao nao consegue cunhar alem. Decisao de projeto, nao aterrissada.
