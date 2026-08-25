@@ -4237,6 +4237,276 @@ mod root_budget_tests {
     }
 }
 
+/// **WP11 — the `select_transactions` byte-cap `break`.** A measurement, not
+/// a fix. `select_transactions` (engine.rs) walks the mempool — a
+/// `BTreeMap<Vec<u8>, _>` keyed by canonical bytes, so byte-lexicographic
+/// over the ENCODING, not insertion order — and on the first transaction
+/// whose bytes would overflow the block byte cap it does `break`, not
+/// `continue`. A single transaction that (a) encodes larger than
+/// `MAX_BLOCK_TX_BYTES` and (b) sorts before every other entry therefore
+/// ends selection at the first step and empties the proposal.
+///
+/// The encoding makes (b) free to arrange: a `Transfer` is `0x01`, then
+/// `inputs.len() as u32 LE`, then the inputs (each beginning with a 32-byte
+/// `txid` the sender picks). A one-input transfer (`01 01 00 00 00 …`) sorts
+/// before every two-input one (`01 02 00 00 00 …`), and among one-input
+/// transfers the order is the `txid` — so `txid = [0u8;32]` sorts first.
+/// Size (a) comes from the OUTPUT list, which the encoding places AFTER the
+/// inputs and which `admissible` only checks is non-empty: thousands of
+/// outputs under one real, correctly-signed input pass admission and blow
+/// past the cap.
+#[cfg(test)]
+mod wp11_select_break {
+    use super::*;
+    use bloch_pos_committee::fee_market::MAX_BLOCK_TX_BYTES;
+    use bloch_pos_committee::transition::{TransferInput, TransferOutput};
+
+    /// One real hybrid keypair, fixed seed so the test is deterministic.
+    fn keypair() -> (Vec<u8>, Vec<u8>) {
+        bloch_crypto::crypto::generate_keypair_from_seed(&[7u8; 32])
+            .expect("hybrid keypair from a fixed seed")
+    }
+
+    /// A correctly-signed one-input `Transfer` with `txid = [fill; 32]` and
+    /// `n_outputs` outputs. With `fill = 0` it sorts before any transfer with
+    /// a non-zero leading txid byte; `n_outputs` sets its encoded size.
+    /// Signs for real, so it also passes `admissible`.
+    fn signed_transfer(fill: u8, n_outputs: usize) -> PosTransaction {
+        let (pk, sk) = keypair();
+        let script_hash: [u8; 32] = {
+            use sha3::{Digest, Sha3_256};
+            Sha3_256::digest(&pk).into()
+        };
+        let outputs: Vec<TransferOutput> = (0..n_outputs)
+            .map(|i| TransferOutput {
+                value: 1_000 + i as u64,
+                script_hash,
+            })
+            .collect();
+        let mut tx = PosTransaction::Transfer {
+            inputs: vec![TransferInput {
+                txid: [fill; 32],
+                vout: 0,
+                pubkey: pk,
+                signature: Vec::new(),
+            }],
+            outputs,
+            tx_bytes: 0,
+            tip_millisat_per_gas: 0,
+        };
+        let root = tx.spend_signing_root();
+        let sig = bloch_crypto::crypto::sign(&sk, &root).expect("sign the spend root");
+        if let PosTransaction::Transfer { inputs, .. } = &mut tx {
+            inputs[0].signature = sig;
+        }
+        tx
+    }
+
+    /// **#1 — REPRODUCE.** One oversized transfer that sorts first, plus five
+    /// ordinary transfers that would all have fit, and `select_transactions`
+    /// returns EMPTY. The control removes the oversized one and gets all five,
+    /// proving they would have fit — the emptiness is the `break`, nothing
+    /// else.
+    #[test]
+    fn one_oversized_first_sorting_transfer_empties_the_selection() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+
+        // The poison: sorts first (txid all-zero), and larger than the cap.
+        let poison = signed_transfer(0x00, 8_000);
+        let poison_bytes = poison.canonical_bytes();
+        assert!(
+            poison_bytes.len() as u64 > MAX_BLOCK_TX_BYTES,
+            "harness: the poison transfer must exceed the block byte cap \
+             ({} bytes vs cap {})",
+            poison_bytes.len(),
+            MAX_BLOCK_TX_BYTES,
+        );
+
+        // Five ordinary transfers, each tiny, each sorting AFTER the poison
+        // (leading txid byte non-zero). Together far under the cap.
+        let ordinary: Vec<PosTransaction> = (1..=5u8)
+            .map(|k| signed_transfer(0x10 * k, 1))
+            .collect();
+        let ordinary_total: u64 = ordinary
+            .iter()
+            .map(|t| t.canonical_bytes().len() as u64)
+            .sum();
+        assert!(
+            ordinary_total < MAX_BLOCK_TX_BYTES,
+            "harness: the ordinary transfers must all fit ({} bytes vs cap {})",
+            ordinary_total,
+            MAX_BLOCK_TX_BYTES,
+        );
+
+        // Load the mempool: poison + the five ordinary ones.
+        engine
+            .mempool
+            .insert(poison_bytes.clone(), poison.clone());
+        for t in &ordinary {
+            engine.mempool.insert(t.canonical_bytes(), t.clone());
+        }
+        assert_eq!(engine.mempool.len(), 6, "harness: six entries loaded");
+
+        // Confirm the poison really is the first key the BTreeMap yields.
+        let first_key = engine.mempool.keys().next().expect("non-empty").clone();
+        assert_eq!(
+            first_key, poison_bytes,
+            "harness: the poison must sort first, or the test proves nothing"
+        );
+
+        // THE MEASUREMENT: selection is EMPTY, though five would have fit.
+        let selected = engine.select_transactions(0);
+        assert!(
+            selected.is_empty(),
+            "CONFIRMED-or-DEMOLISHED: with a first-sorting oversized transfer, \
+             select_transactions returned {} transactions; the hypothesis \
+             predicts 0",
+            selected.len(),
+        );
+
+        // THE CONTROL: drop the poison and the same five are selected — they
+        // always fit; the `break` on the poison is the whole cause.
+        engine.mempool.remove(&poison_bytes);
+        let selected_after = engine.select_transactions(0);
+        assert_eq!(
+            selected_after.len(),
+            5,
+            "control: without the poison, all five ordinary transfers select"
+        );
+    }
+
+    /// **#2 — REACHABILITY.** The exact poison runs through `admissible`
+    /// (the one gate both the RPC and gossip paths converge on) and is
+    /// ACCEPTED: one real self-generated keypair, one correct signature over
+    /// a txid that need not exist, and thousands of outputs. No funds, no
+    /// existing UTXO, no size check. Cost: one unauthenticated request.
+    #[test]
+    fn the_poison_is_admissible_with_a_self_generated_key_and_no_funds() {
+        let poison = signed_transfer(0x00, 8_000);
+        // wall_epoch is only read by the TransferV2 arm; a V1 Transfer is
+        // judged identically at every epoch, so 0 is representative.
+        let verdict = admissible(&poison, 0);
+        assert!(
+            verdict.is_ok(),
+            "REACHABLE: admissible must accept the poison (self-signed, \
+             nonexistent input, oversized) — it rejected with {verdict:?}"
+        );
+    }
+
+    /// **#1(b) — PRODUCED-BUT-EMPTY, settled.** The founder's correction:
+    /// does this drop a SLOT (no block) or only empty the block? Drive the
+    /// real proposer with only the poison in the mempool. A block IS produced
+    /// and adopted (chain grows), it carries ZERO transactions, and the
+    /// poison is STILL in the mempool afterward — never selected, so never
+    /// reached by `propose`'s drop-and-retry guard. This is a
+    /// transaction-inclusion halt, not a production halt.
+    #[test]
+    fn the_proposer_still_produces_a_block_and_it_is_empty() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+
+        let poison = signed_transfer(0x00, 8_000);
+        let poison_bytes = poison.canonical_bytes();
+        engine.mempool.insert(poison_bytes.clone(), poison);
+        let chain_before = engine.chain.len();
+
+        engine.propose(1);
+
+        assert_eq!(
+            engine.chain.len(),
+            chain_before + 1,
+            "PRODUCED: a block was still proposed and adopted — the slot is \
+             NOT dropped"
+        );
+        let head = engine
+            .blocks
+            .get(engine.head_id().as_bytes())
+            .expect("the adopted block is stored");
+        assert_eq!(
+            head.body.transactions.len(),
+            0,
+            "EMPTY: the produced block carries zero transactions"
+        );
+        assert!(
+            engine.mempool.contains_key(&poison_bytes),
+            "PERMANENT: the poison was never selected, so propose's \
+             drop-and-retry never saw it — it is still in the mempool"
+        );
+    }
+
+    /// **The LIVE cap, not the museum one.** `max_block_tx_bytes` is
+    /// flag-day gated: 262,144 B below epoch 800 and 524,288 B from it
+    /// (fee_market.rs:65/85, params.rs:308). Genesis-4 mainnet is past epoch
+    /// 1400, so the cap a real proposer packs against TODAY is 512 KiB and a
+    /// 256 KiB-sized poison would not trigger anything on the fleet. This
+    /// test sizes the poison against the post-activation cap and drives
+    /// selection at a post-activation epoch, so the claim is about the chain
+    /// that is running rather than the era it launched in.
+    #[test]
+    fn the_same_poison_empties_selection_at_the_live_post_flag_day_cap() {
+        use bloch_pos_committee::fee_market::max_block_tx_bytes;
+        use bloch_pos_committee::params::BLOCK_BYTES_V2_ACTIVATION_EPOCH;
+
+        // A mainnet-shaped epoch: past the byte-cap flag day.
+        let live_epoch = BLOCK_BYTES_V2_ACTIVATION_EPOCH + 600;
+        let cap = max_block_tx_bytes(live_epoch);
+        assert_eq!(
+            cap, 524_288,
+            "harness: the post-flag-day cap must be the 512 KiB one"
+        );
+
+        let (mut engine, _dir) = perf_support::proposing_engine();
+
+        // 16,000 outputs × 40 B ≈ 640 KB — over the LIVE cap, and still far
+        // under the 8 MiB frame limit (codec.rs MAX_FIELD_LEN), so it fits
+        // on the wire and reaches the mempool intact.
+        let poison = signed_transfer(0x00, 16_000);
+        let poison_bytes = poison.canonical_bytes();
+        assert!(
+            poison_bytes.len() as u64 > cap,
+            "harness: the poison must exceed the LIVE cap ({} vs {cap})",
+            poison_bytes.len(),
+        );
+        assert!(
+            poison_bytes.len() < 8 * 1024 * 1024,
+            "harness: the poison must still fit one wire frame ({} B)",
+            poison_bytes.len(),
+        );
+        // It is admissible at the live epoch too — same three checks.
+        assert!(
+            admissible(&poison, live_epoch).is_ok(),
+            "the poison must be admissible at the live epoch"
+        );
+
+        let ordinary: Vec<PosTransaction> =
+            (1..=5u8).map(|k| signed_transfer(0x10 * k, 1)).collect();
+        engine.mempool.insert(poison_bytes.clone(), poison);
+        for t in &ordinary {
+            engine.mempool.insert(t.canonical_bytes(), t.clone());
+        }
+        assert_eq!(
+            engine.mempool.keys().next().expect("non-empty"),
+            &poison_bytes,
+            "harness: the poison must sort first"
+        );
+
+        let selected = engine.select_transactions(live_epoch);
+        assert!(
+            selected.is_empty(),
+            "at the LIVE cap, selection returned {} transactions; the \
+             hypothesis predicts 0",
+            selected.len(),
+        );
+
+        // Control at the same epoch: the five always fit.
+        engine.mempool.remove(&poison_bytes);
+        assert_eq!(
+            engine.select_transactions(live_epoch).len(),
+            5,
+            "control: without the poison all five select at the live cap"
+        );
+    }
+}
+
 /// What the deleted work actually cost, on a state the size the fleet runs.
 ///
 /// `#[ignore]`d: it is a measurement, not an assertion, and it builds a
