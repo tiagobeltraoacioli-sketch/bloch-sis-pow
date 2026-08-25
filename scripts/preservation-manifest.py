@@ -154,6 +154,11 @@ TRIPWIRE_FILE = f"{COMMITTEE}/src/transition.rs"
 
 ARMED_EPOCH = 1400
 
+# Floor for any gate that reports a NEGATIVE ("I found no X"). ab9ca4e1 has 47
+# .rs files under the two consensus crates; a scan that sees far fewer is
+# looking at the wrong tree, and its silence means nothing.
+MIN_SOURCES_SCANNED = 20
+
 # Every component tag the armed build's state root commits, inside
 # `build_state_tree_inner`.  An integration may only ADD tags.  Losing one is a
 # SILENT consensus change: the root stops binding a field and nothing fails to
@@ -592,19 +597,29 @@ def check_no_conflict_markers(root: Path, rep: Report):
     would call an unresolved tree preserved.
     """
     g = "D2. structural pins (call shape)"
-    bad = []
+    bad, scanned = [], 0
     for crate in (COMMITTEE, NODE):
         d = root / crate
         if not d.is_dir():
             continue
         for q in sorted(d.rglob("*.rs")):
+            scanned += 1
             txt = q.read_text(errors="replace")
             for marker in ("<<<<<<< ", ">>>>>>> "):
                 if any(l.startswith(marker) for l in txt.splitlines()):
                     bad.append(str(q.relative_to(root)))
                     break
+    # "I found no markers" is only news if there was something to look in.
+    # Without this the gate reported "clean" on a tree with no sources at all,
+    # which is the vacuous pass the rest of this file exists to refuse.
+    if scanned < MIN_SOURCES_SCANNED:
+        rep.add(g, "no unresolved conflict markers", False,
+                f"only {scanned} source file(s) under the two consensus crates — "
+                f"expected at least {MIN_SOURCES_SCANNED}; this gate scanned nothing worth scanning")
+        return
     rep.add(g, "no unresolved conflict markers", not bad,
-            "; ".join(sorted(set(bad))) if bad else "clean across both consensus crates")
+            "; ".join(sorted(set(bad))) if bad
+            else f"clean across {scanned} source files in both consensus crates")
 
 
 def check_root_components(root: Path, rep: Report):
