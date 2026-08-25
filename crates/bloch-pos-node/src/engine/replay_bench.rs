@@ -33,23 +33,49 @@
 //!
 //! # Why this lives in `src/engine/` under `cfg(test)`
 //!
-//! `Engine` and every one of its fields are private to `engine`, and
-//! `bloch-pos-node` has no `[lib]` target — only a `[[bin]]`. An integration
-//! test in `tests/` therefore cannot reach `ingest` at all, and the only
-//! alternative is to reimplement the replay loop against the public committee
-//! API. That would measure the reimplementation: no `forkchoice_head`, no
-//! `advance` retry loop, no `path_to_canonical` — three of the costs under
+//! `Engine` and every one of its fields are private to `engine` — and that is
+//! still true now that `bloch-pos-node` has a `[lib]` target. The lib exports
+//! `pub mod engine`; it does not export `Engine`. An integration test in
+//! `tests/` therefore still cannot reach `ingest`, and the only alternative
+//! would be to reimplement the replay loop against the public committee API.
+//! That would measure the reimplementation: no `forkchoice_head`, no `advance`
+//! retry loop, no `path_to_canonical` — three of the costs under
 //! investigation. A CHILD module of `engine` sees its parent's private items,
 //! so this file drives the real thing and **nothing in production code had to
-//! be made more visible for it**. It costs one `#[cfg(test)] mod` line in
-//! `engine.rs` and nothing in the shipped binary.
+//! be made more visible for it**, not when it was written and not by the
+//! lib/bin split. It costs one `#[cfg(test)] mod` line in `engine.rs` and
+//! nothing in the shipped binary.
+//!
+//! What the split DID change is which harness these tests live in. `engine` is
+//! declared in `src/lib.rs`, so `replay_bench` is compiled into the **lib**
+//! test binary. It used to be in the bin one, back when `main.rs` declared the
+//! modules. The selector below moved with it — see the warning under
+//! "Running it".
 //!
 //! # Running it
 //!
 //! ```text
 //! cargo test --release -p bloch-pos-node --features perf-timing \
-//!     --bin bloch-pos replay_bench -- --ignored --nocapture --test-threads=1
+//!     --lib replay_bench -- --ignored --nocapture --test-threads=1
 //! ```
+//!
+//! **`--lib`, not `--bin bloch-pos`.** This line said `--bin bloch-pos` from
+//! 5e44725d until the lib/bin split, and that was correct for exactly as long
+//! as `main.rs` declared `mod engine;`. It is not correct now, and the way it
+//! fails is silent: **a `cargo test` whose target selector matches nothing
+//! still exits 0 and prints `ok`.** A sibling branch already hit the mirror
+//! image of this — 8869b5e8, *"declared 3, ran 0 <-- SUITE RAN EMPTY"*, a
+//! `--lib` selector against a crate that had no lib. Same shape, same silence,
+//! opposite direction.
+//!
+//! `scripts/preservation-manifest.py` carries the same selector for this file
+//! and already said `--lib` (from 49dfdd02) — which was the empty-suite bug on
+//! this branch until the split, and is the correct selector after it.
+//!
+//! These three tests are also `#[ignore]`d, so selecting the right target but
+//! omitting `--ignored` likewise reports `ok` having measured nothing. If a run
+//! finishes fast and says `0 passed`, it measured nothing: read the count,
+//! never the word `ok`.
 //!
 //! Without `--features perf-timing` the same test runs and reports wall time
 //! with an empty breakdown — which is the control that shows the timers are

@@ -42,15 +42,16 @@
 //! `main.rs` is the composition root (PMO change-controlled; §9.4 two-reviewer
 //! rule once integration review starts).
 
-mod codec;
-mod engine;
-mod genesis;
-mod keys;
-mod net;
-mod p2p;
-mod rpc;
-mod store;
-mod ws_boot;
+// The node's modules are declared ONCE, in src/lib.rs, and this binary is a
+// consumer of that library like any other — the same way the cargo-fuzz
+// targets consume it. Re-declaring `mod codec;` here would build a second,
+// private copy of the whole node into the binary: double the compile time,
+// and two distinct `codec::DecodeErr` types that do not unify.
+//
+// Only the modules this composition root actually touches are imported; the
+// binary never reaches into `p2p`, `rpc` or `store` directly (it configures
+// them through `engine::Config` and `engine::run`).
+use bloch_pos_node::{codec, engine, genesis, keys, net, ws_boot};
 
 use std::path::PathBuf;
 use std::process::exit;
