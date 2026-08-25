@@ -76,10 +76,19 @@ fi
 #    branch ships the exact partition bug under a commit claiming it fixed.
 #    The commit message is not the artifact. The code is.
 T=crates/bloch-pos-committee/src/transition.rs
-if grep -q 'crate::committees::seed_epoch(epoch)' "$T" 2>/dev/null; then
-  ok seed-rule-lookahead "seed_for_epoch goes through committees::seed_epoch in $T"
+#    The reader may express the rule either way, but it must express the
+#    LOOK-AHEAD and it must be pinned to committees::seed_epoch by a test.
+#    A bare `checked_sub(1)` is the defect; `1 + MIN_SEED_LOOKAHEAD_EPOCHS`
+#    or `seed_epoch(epoch)` are both the rule.
+if grep -qE 'crate::committees::seed_epoch\(epoch\)|1 \+ crate::committees::MIN_SEED_LOOKAHEAD_EPOCHS' "$T" 2>/dev/null; then
+  ok seed-rule-lookahead "seed_for_epoch expresses the look-ahead in $T"
 else
-  bad seed-rule-lookahead "seed_for_epoch does NOT use committees::seed_epoch - the look-ahead is off"
+  bad seed-rule-lookahead "seed_for_epoch does NOT express the look-ahead - it is back at E-1"
+fi
+if grep -q 'fn the_lookahead_matches_the_committee_crates_seed_epoch' "$T" 2>/dev/null; then
+  ok seed-rule-pinned "the reader is pinned to committees::seed_epoch by a test"
+else
+  bad seed-rule-pinned "nothing pins the reader's arithmetic to committees::seed_epoch"
 fi
 if grep -nE 'MUTATION [A-Z]' crates/*/src/*.rs 2>/dev/null | grep -vq 'MUTATION DID NOT BITE'; then
   bad no-stray-mutation "a 'MUTATION x' marker is left in a source file - see grep above"

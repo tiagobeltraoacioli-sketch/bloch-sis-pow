@@ -1465,7 +1465,22 @@ impl CommittedState {
     /// partition asks for `closing + 1` after it, when `{closing − 1,
     /// closing}` is.
     pub fn seed_for_epoch(&self, epoch: u64) -> [u8; 32] {
-        let Some(src) = crate::committees::seed_epoch(epoch) else {
+        // In a shipped binary this is exactly
+        // `committees::seed_epoch(epoch)` — `1 + MIN_SEED_LOOKAHEAD_EPOCHS`
+        // back — and `the_lookahead_matches_the_committee_crates_seed_epoch`
+        // pins the two to the same arithmetic over 4,000 epochs, so this is
+        // not a second definition of the rule.
+        //
+        // In a TEST build the same value, unless a test has reverted the
+        // look-ahead on this thread with
+        // `params::rehearsal::with_lookahead_zero`. That is what lets a third
+        // party run the anti-partition tests against the PRE-FIX rule with
+        // nothing but `cargo test` — no source edit, no script, no narration.
+        #[cfg(test)]
+        let back = 1 + crate::params::rehearsal::effective_lookahead();
+        #[cfg(not(test))]
+        let back = 1 + crate::committees::MIN_SEED_LOOKAHEAD_EPOCHS;
+        let Some(src) = epoch.checked_sub(back) else {
             // Epochs 0 and 1 have no boundary far enough back. They still
             // partition differently from each other, because the epoch number
             // is folded into the XOF seed alongside the mix.
@@ -4064,6 +4079,93 @@ mod tests {
             "this roster partitions identically under different seeds, so the \
              equality asserted above proves nothing — widen N"
         );
+    }
+
+    /// **The mutation proof for the anti-partition property.**
+    ///
+    /// `a_fork_born_inside_the_previous_epoch_cannot_move_this_epochs_partition`
+    /// asserts that a fork born inside `E-1` leaves epoch `E`'s seed alone.
+    /// A green there means nothing on its own: it would also be green if the
+    /// fixture could not produce a difference at all. This runs the SAME
+    /// fixture with the look-ahead reverted to ZERO — the pre-fix rule — and
+    /// requires the property to BREAK.
+    ///
+    /// Green here and green there is the contradiction that would mean the
+    /// fixture is inert. Red here is what makes the other test evidence.
+    ///
+    /// Uses `params::rehearsal::with_lookahead_zero`, which is thread-local
+    /// and restores itself on unwind, so this cannot leak the mutated rule
+    /// into any test running beside it.
+    #[test]
+    fn the_antipartition_property_breaks_under_the_pre_fix_rule() {
+        const N: u32 = 16;
+        let spe = crate::SLOTS_PER_EPOCH;
+        let e: u64 = 3;
+        let skipped = spe * (e - 1) + 5; // a slot strictly inside E-1
+
+        crate::params::rehearsal::with_lookahead_zero(|| {
+            let run = |skip: Option<u64>| -> CommittedState {
+                let (t, mut st, mut chains) = setup(N);
+                for slot in 1..=(spe * e) {
+                    if Some(slot) == skip {
+                        continue;
+                    }
+                    let b = build_block(&t, &st, slot, &[], &[], &mut chains);
+                    st = t.apply_block(&st, &b, &[], &[]).expect("block rejected");
+                }
+                st
+            };
+            let a = run(None);
+            let b = run(Some(skipped));
+
+            // Same two witnesses the positive test uses, so a vacuous fixture
+            // cannot satisfy this one either.
+            assert_eq!(
+                a.randao_mix_at(e - 2),
+                b.randao_mix_at(e - 2),
+                "fixture diverged before the close of epoch {} - proves nothing",
+                e - 2
+            );
+            assert_ne!(
+                a.randao_mix_at(e - 1),
+                b.randao_mix_at(e - 1),
+                "fixture is empty: both branches closed epoch {} with the same mix",
+                e - 1
+            );
+
+            assert_ne!(
+                a.seed_for_epoch(e),
+                b.seed_for_epoch(e),
+                "MUTATION DID NOT BITE: with the look-ahead at ZERO, a fork born inside \
+                 epoch {} MUST move epoch {e}'s seed - that is the whole defect. If it \
+                 does not, then a_fork_born_inside_the_previous_epoch_cannot_move_this_\
+                 epochs_partition is not measuring the look-ahead and its green is empty.",
+                e - 1
+            );
+        });
+
+        // And the rule is restored for whatever runs next on this thread.
+        assert_eq!(
+            crate::params::rehearsal::effective_lookahead(),
+            crate::committees::MIN_SEED_LOOKAHEAD_EPOCHS,
+            "with_lookahead_zero leaked the mutated rule past its own scope"
+        );
+    }
+
+    /// The `back` arithmetic in `seed_for_epoch` and the boundary epoch
+    /// `committees::seed_epoch` names are the same arithmetic. If either side
+    /// is edited alone, this fails. It is what keeps the reader above from
+    /// being a SECOND definition of the look-ahead rule.
+    #[test]
+    fn the_lookahead_matches_the_committee_crates_seed_epoch() {
+        let back = 1 + crate::committees::MIN_SEED_LOOKAHEAD_EPOCHS;
+        for e in 0u64..4_000 {
+            assert_eq!(
+                e.checked_sub(back),
+                crate::committees::seed_epoch(e),
+                "epoch {e}: the transition's boundary epoch and the committee crate's disagree"
+            );
+        }
     }
 
     /// **The retention claim, tested rather than argued.**

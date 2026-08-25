@@ -328,6 +328,52 @@ pub mod rehearsal {
     // a test that did not set it.
     thread_local! {
         pub static MUTATE_SEED: Cell<bool> = const { Cell::new(false) };
+
+        /// Test-only mutation of the **rule itself**: force the seed
+        /// look-ahead back to ZERO — the pre-fix arithmetic, in which epoch
+        /// `E` is seeded by the close of `E − 1`.
+        ///
+        /// `MUTATE_SEED` above flips a bit of the seed's VALUE, which shows a
+        /// comparator can see a difference. It cannot show that a reader
+        /// which reverted to `E − 1` gets caught, because a bit-flip and a
+        /// reverted look-ahead are not the same mutation. This one reverts
+        /// the look-ahead, so the anti-partition tests can be run both ways
+        /// by a third party with nothing but `cargo test` — no source edit,
+        /// no script, no narration.
+        ///
+        /// Thread-local, not an atomic, and deliberately: `cargo test` runs
+        /// tests in parallel on separate threads and `seed_for_epoch` is on
+        /// almost every path in the crate. A process-global switch would flip
+        /// the consensus rule under every test running beside it. Set it with
+        /// [`with_lookahead_zero`], which restores it on the way out.
+        pub static LOOKAHEAD_ZERO: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Run `f` with the seed look-ahead forced to zero on this thread, then
+    /// restore it — including on the unwind path, so a failing assertion
+    /// inside `f` cannot leave the rule mutated for the rest of the thread.
+    #[cfg(test)]
+    pub fn with_lookahead_zero<R>(f: impl FnOnce() -> R) -> R {
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                LOOKAHEAD_ZERO.with(|c| c.set(false));
+            }
+        }
+        LOOKAHEAD_ZERO.with(|c| c.set(true));
+        let _r = Restore;
+        f()
+    }
+
+    /// The look-ahead this build's readers must use: the shipped constant,
+    /// unless a test has mutated the rule on this thread.
+    #[cfg(test)]
+    pub fn effective_lookahead() -> u64 {
+        if LOOKAHEAD_ZERO.with(Cell::get) {
+            0
+        } else {
+            crate::committees::MIN_SEED_LOOKAHEAD_EPOCHS
+        }
     }
 }
 
