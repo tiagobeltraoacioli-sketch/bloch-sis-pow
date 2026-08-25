@@ -269,3 +269,58 @@ than policy work — the same family as the `handle_attestation` epoch gate,
 which drops attestations outside `{wall_epoch, wall_epoch+1}` before the gossip
 layer sees them and so bounds how much of the two-epoch window any of this can
 recover.
+
+## 11. Correction of an attribution I got wrong
+
+I relayed the "`Ignore` replaced a `Hold`" finding to the gossip developer as a
+regression that developer had introduced, and told them to fix it. **That was
+false.** The reviewer had read the developer's BASE, not their tree, because
+their work was still uncommitted — blocked in the build-token queue all night.
+In their tree `judge` no longer decides Hold-vs-Ignore at all: it hands the pool
+a `CommitteeView` and the pool splits on exactly the right axis — `Hold` while
+the target root has not arrived, `Ignore` only when the target is known and the
+ancestry walk still fails. The same applies to the `release_held` anchor
+finding. The finding is real, it is in the base, and the commit under review IS
+the fix. Three separate reviewers read a stale tree for the same reason.
+
+The lesson is not about that developer. It is that **an unlanded fix costs more
+than it saves**: every audit run against a branch whose fix cannot compile
+burns effort re-discovering something already solved, and each of those reports
+reached me as fact.
+
+## 12. Two rules about evidence, learned the hard way today
+
+**A mutation switch read from inside a consensus function must be
+thread-local.** All five were process-global `AtomicBool`s guarded by a mutex
+that the two tests flipping them take and the other ~260 do not, while `cargo
+test` runs them in parallel. Since they are read from inside
+`epoch_committees`, `with_leak_applied` and `seed_for_epoch`, a green suite was
+a property of the thread scheduler. False reds AND false greens.
+
+**Reverting a mutation with `mv file.rs.bak file.rs` restores the original
+mtime**, so cargo skips recompilation and silently runs the mutant. Always
+`touch` after restoring. Same family as section 9.
+
+## 13. The limit of mutation keys, and the frozen vector
+
+Mutation keys only flip rules that HAVE a key. A fourth rule changed tomorrow
+without a gate passes green, because no key exists for it — and that is exactly
+the class of error that cost this entire operation: **three consensus changes
+passed a suite of hundreds of tests because every test builds the chain with
+the same binary that validates it.**
+
+Only a **frozen vector** catches that: a `blocks.log` recorded by an earlier
+binary and versioned in the repository. It works precisely because it PREDATES
+the change — it does not need to know what changed. Budgeted at ~6 MB
+versioned, and the 6 MB should not be the argument against it.
+
+Mutation keys fix the known case. The frozen vector fixes the unknown one,
+which is the one that always gets us. **Recommended for adoption.**
+
+## 14. A known limit of the call-site test
+
+`the_two_call_sites_agree_on_the_index_set_with_a_real_leak` reaches epoch 1400
+by assignment (`g.epoch = epoch`), not by transitioning there — reaching it
+honestly costs 1,400 epochs of blocks. The leak itself IS real, accrued through
+`process_epoch` over epochs nobody attests, with a guard that fails the test if
+the fold never drove anybody to zero. Recorded as a known limit, not a defect.
