@@ -10,7 +10,7 @@ BENCH=/private/tmp/pmo-copilot/wp7-syncmeasure/bench
 BIN=/private/tmp/pmo-copilot/wp7-syncmeasure/bench/bloch-pos-wp7
 FIX=$BENCH/fixture3
 LABEL=$1; CAP=$2; RUN=$3
-OUT=$BENCH/out/$LABEL.$RUN
+OUT=$BENCH/out3/$LABEL.$RUN
 BENCH_MS=${BENCH_MS:-250}
 SPORT=$((17100 + RANDOM % 300))
 CPORT=$((17500 + RANDOM % 300))

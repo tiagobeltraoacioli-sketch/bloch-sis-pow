@@ -11,7 +11,8 @@ import glob, os, re, statistics, sys
 
 LINE = re.compile(
     r"syncbench t_ms=(\d+) head=(\d+) blocks=(\d+) ticks=(\d+) events=(\d+) "
-    r"shedblk=(\d+) shedgos=(\d+) blkbytes=(\d+) gosbytes=(\d+)")
+    r"shedblk=(\d+) shedatt=(\d+) shedtx=(\d+) qblk=(\d+) qatt=(\d+) qtx=(\d+) "
+    r"skipped=(\d+) maxjump=(\d+) proposed=(\d+) attested=(\d+) latemax=(\d+)")
 
 def samples(path):
     out = []

@@ -118,7 +118,7 @@ use sha3::{Digest, Sha3_256};
 use super::{now_ms, Engine, StateCell};
 use crate::genesis::{Manifest, ManifestValidator, GENESIS_MIX};
 use crate::keys::{HybridVerifier, Keystore, ProbeVerifier};
-use crate::net;
+use crate::net::{self, EngineQueue};
 use crate::store::Store;
 
 // ── knobs ───────────────────────────────────────────────────────────────────
@@ -623,7 +623,7 @@ fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
     let genesis_id = manifest.genesis_id();
     let verifier = HybridVerifier::new(manifest.pubkeys());
     let head_slot = Arc::new(AtomicU64::new(0));
-    let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let queue = Arc::new(EngineQueue::new());
     let (tx, rx) = std::sync::mpsc::channel();
     // The receiver is leaked on purpose: dropping it would make the mesh's
     // sender fail, and nothing in this benchmark reads a network event anyway.
@@ -631,7 +631,7 @@ fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
     // Loopback, ephemeral port, no peers. Nothing in this file dials, listens
     // for, or sends anything to any network.
     let net = net::Net::Devnet(
-        net::start("127.0.0.1", 0, Vec::new(), tx, dir.to_path_buf(), head_slot.clone(), inflight)
+        net::start("127.0.0.1", 0, Vec::new(), tx, dir.to_path_buf(), head_slot.clone(), queue.clone())
             .expect("loopback devnet transport"),
     );
     Engine {
@@ -663,6 +663,7 @@ fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
         ws_anchor_hard: false,
         ws_conflict_reported: false,
         fc_covered_removals: 0,
+        queue,
         manifest,
     }
 }

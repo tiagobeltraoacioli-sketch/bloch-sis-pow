@@ -210,7 +210,7 @@ fn getchaininfo_reports_slot_epoch_head_root_and_both_checkpoints() {
     // against `st.state_root()`, so this test still fails if the field ever
     // stops being the committed root of the state the rest of the object
     // describes.
-    let v = chain_info_json(&st, &head, st.state_root(), 0, Some(0), 12, 2, 3, 0);
+    let v = chain_info_json(&st, &head, st.state_root(), 0, Some(0), 12, 2, 3, 0, &Default::default());
 
     assert_eq!(v.get("slot").unwrap().as_u64(), Some(0));
     assert_eq!(v.get("epoch").unwrap().as_u64(), Some(0));

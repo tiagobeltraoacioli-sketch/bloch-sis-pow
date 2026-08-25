@@ -79,8 +79,7 @@ use bloch_pos_committee::{committees, derive, epoch_of, schedule};
 
 use crate::genesis::{Manifest, GENESIS_MIX};
 use crate::keys::{HybridVerifier, Keystore, ProbeVerifier};
-// /* WP7-FIXUP: WP3 5c69b4eb does not compile — it changed net::broadcast's signature and left five call sites (and one on_transaction call) unconverted. These labels are for drop LOGGING only and touch no consensus path. */
-use crate::net::{self, Charge, EngineBudget, NetEvent, Origin, Verdict};
+use crate::net::{self, EngineQueue, NetEvent, Origin, Provenance, Verdict};
 use crate::rpc::{self, Admitted, Finality, Json, RpcCall, RpcError, RpcRequest, RpcResult};
 use crate::store::Store;
 
@@ -91,93 +90,17 @@ use crate::store::Store;
 /// state — rather than from a copy kept alongside it — is why this wrapper
 /// exists; see [`crate::rpc::EngineBackend`].
 pub enum EngineEvent {
-    /// A network event, and the byte reservation it holds against
-    /// [`EngineBudget`]. The [`Charge`] is carried WITH the event so the engine
-    /// refunds exactly what the transport reserved, without measuring anything
-    /// a second time — see [`crate::net::Charge`].
-    Net(NetEvent, Charge),
+    /// A network event welded to its reservation in [`EngineQueue`].
+    ///
+    /// One field, not two, and the permit inside it is unreachable: the only
+    /// way to get at the event is [`net::Admission::handle`], which releases
+    /// the quota after the handler returns. The previous shape,
+    /// `Net(NetEvent, net::Permit)`, made the right thing merely CUSTOMARY —
+    /// `drop(permit); engine.ingest(env)` compiled, restored release-on-dequeue
+    /// (the semantics this commit calls a lie), and passed every test. It no
+    /// longer compiles.
+    Net(net::Admission),
     Rpc(RpcCall),
-}
-
-/// Events one tick of the slot loop may take off the engine channel.
-///
-/// **What this bounds.** The drain used to be `while let Ok(more) =
-/// rx.try_recv() { pending.push(more) }` — it emptied the whole channel before
-/// returning to slot duties. A node being fed a steady stream (a peer serving
-/// it a 512-block sync page, or 64 validators attesting) therefore postponed
-/// attesting and proposing for as long as the stream lasted, which on a node
-/// applying blocks at ~0.6 s each is minutes.
-///
-/// **This value is a guess and is meant to be measured.** The measurement, not
-/// the reasoning here, decides it. Override it without rebuilding by setting
-/// `BLOCH_MAX_EVENTS_PER_TICK`; `BLOCH_MAX_EVENTS_PER_TICK=0` restores the old
-/// unbounded drain exactly, which is the control arm of that experiment.
-///
-/// The reasoning it is a guess FROM: a smaller bound does not cost throughput
-/// the way it looks like it should. `recv_timeout` only waits when the channel
-/// is EMPTY, so a backed-up channel is drained `MAX_ENGINE_EVENTS_PER_TICK`
-/// events per loop iteration with only a handful of cheap slot-duty
-/// comparisons between iterations — not one batch per 500 ms tick. What the
-/// bound really buys is a ceiling on how long duties are postponed, and what it
-/// costs is that ceiling times the per-event handling cost. At the replay cost
-/// of 0.59 s per block, 32 blocks is still ~19 s of postponed duties, so if the
-/// benchmark measures live ingest anywhere near that, this number should come
-/// down rather than up.
-///
-/// NOTE for whoever measures: boot replay does NOT pass through this channel
-/// (it is a plain loop over the block log), so this bound cannot affect restart
-/// replay at all. Only live and sync ingest reach it.
-pub const MAX_ENGINE_EVENTS_PER_TICK: usize = 32;
-
-/// The bound in force, read once per process.
-///
-/// `BLOCH_MAX_EVENTS_PER_TICK` overrides [`MAX_ENGINE_EVENTS_PER_TICK`], and
-/// `0` means unbounded — the pre-WP3 behaviour, kept reachable so the two arms
-/// of the measurement are the same binary.
-fn max_engine_events_per_tick() -> usize {
-    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| match std::env::var("BLOCH_MAX_EVENTS_PER_TICK") {
-        Err(_) => MAX_ENGINE_EVENTS_PER_TICK,
-        Ok(v) => match v.trim().parse::<usize>() {
-            Ok(0) => {
-                println!("engine: BLOCH_MAX_EVENTS_PER_TICK=0 — the drain is UNBOUNDED this run");
-                usize::MAX
-            }
-            Ok(n) => {
-                println!("engine: draining at most {n} events per tick (BLOCH_MAX_EVENTS_PER_TICK)");
-                n
-            }
-            Err(_) => {
-                eprintln!(
-                    "engine: BLOCH_MAX_EVENTS_PER_TICK={v:?} is not a number — \
-                     using {MAX_ENGINE_EVENTS_PER_TICK}"
-                );
-                MAX_ENGINE_EVENTS_PER_TICK
-            }
-        },
-    })
-}
-
-/// Take `first` plus up to `max - 1` more events off the channel.
-///
-/// A free function of its inputs so the bound can be tested at any value
-/// without a node, a clock or an environment variable — including
-/// `usize::MAX`, which must behave exactly like the unbounded drain it
-/// replaces.
-fn drain_pending(
-    rx: &mpsc::Receiver<EngineEvent>,
-    first: EngineEvent,
-    max: usize,
-) -> Vec<EngineEvent> {
-    let mut pending = Vec::with_capacity(max.min(64));
-    pending.push(first);
-    while pending.len() < max {
-        match rx.try_recv() {
-            Ok(more) => pending.push(more),
-            Err(_) => break,
-        }
-    }
-    pending
 }
 
 /// Which transport the node runs.
@@ -229,6 +152,207 @@ pub struct Config {
     pub rpc_port: Option<u16>,
 }
 
+/// Forward libp2p's decoded events onto the engine channel, admitting each one
+/// into [`EngineQueue`] on the way.
+///
+/// **This hop is the libp2p path's only ceiling.** `p2p::Loop::emit` sends into
+/// an unbounded channel and counts nothing, so before this the production
+/// transport had no admission control at all — while the engine's
+/// hand-written decrement fired for its events anyway, subtracting from a
+/// counter nobody had incremented and wrapping it to ~2^64.
+///
+/// Admitting here rather than inside `p2p.rs` keeps that module speaking plain
+/// `NetEvent` — its tests read the raw events — and puts the quota on the one
+/// thread both transports already pass through. This thread does nothing but
+/// forward, so it is a hop and not a second queue in front of a sleeping
+/// consumer.
+///
+/// A free function and not a closure so it can be tested: see
+/// `libp2p_admission_tests`.
+fn forward_admitted(
+    net_rx: mpsc::Receiver<NetEvent>,
+    tx: mpsc::Sender<EngineEvent>,
+    queue: Arc<EngineQueue>,
+) {
+    for ev in net_rx {
+        let bytes = ev.wire_bytes();
+        let Some(adm) = EngineQueue::admit_event_owned(&queue, ev, bytes) else {
+            continue; // shed: counted, and logged if the limiter allows
+        };
+        if tx.send(EngineEvent::Net(adm)).is_err() {
+            return; // engine gone; nothing left to deliver to
+        }
+    }
+}
+
+/// A test-only vantage point INSIDE `Engine::ingest`.
+///
+/// "The permit is still held while the work runs" cannot be observed from
+/// outside the handler: by the time `drain_pending` returns, a correct
+/// implementation and one that released on dequeue look identical — both read
+/// zero. So the reading has to be taken from within `ingest` itself, and the
+/// only way to do that without putting a test field on `Engine` (whose
+/// constructors are consensus code) is a thread-local the test installs and the
+/// node binary never compiles.
+#[cfg(test)]
+mod ingest_witness {
+    use super::*;
+    use std::cell::RefCell;
+    use std::sync::atomic::AtomicUsize;
+
+    thread_local! {
+        static WITNESS: RefCell<Option<(Arc<EngineQueue>, Arc<AtomicUsize>)>> =
+            const { RefCell::new(None) };
+    }
+
+    /// Watch `queue` for the duration of `f`, returning the block-item count
+    /// seen at the top of `Engine::ingest`, or `None` if `ingest` never ran.
+    pub(super) fn watching<R>(queue: &Arc<EngineQueue>, f: impl FnOnce() -> R) -> (R, Option<usize>) {
+        let seen = Arc::new(AtomicUsize::new(usize::MAX));
+        WITNESS.with(|w| *w.borrow_mut() = Some((queue.clone(), seen.clone())));
+        let out = f();
+        WITNESS.with(|w| *w.borrow_mut() = None);
+        let v = seen.load(Ordering::Acquire);
+        (out, (v != usize::MAX).then_some(v))
+    }
+
+    pub(super) fn record() {
+        WITNESS.with(|w| {
+            if let Some((q, seen)) = w.borrow().as_ref() {
+                seen.store(q.stats().block.items, Ordering::Release);
+            }
+        });
+    }
+}
+
+/// Handle one batch of dequeued events, in arrival order.
+///
+/// A free function taking `&mut Engine` rather than inline in `run`'s loop for
+/// one reason: `run` needs a live socket, a data directory and a validator key,
+/// so nothing inside it could be tested, and "the quota is still held while
+/// `ingest` runs" is exactly the property that has to be tested at this level
+/// rather than asserted in a comment. See
+/// `quota_holding_tests::the_quota_is_held_while_the_engine_does_the_work`.
+///
+/// Ordering is untouched: one channel, drained into one `Vec`, handled front to
+/// back. Splitting the queue by class would reorder attestations against blocks
+/// and so change which votes are in the pool when LMD-GHOST runs, which is a
+/// consensus change; splitting the ADMISSION TEST, which is what `EngineQueue`
+/// does, leaves this loop exactly as it was.
+/// Events one tick of the slot loop may take off the engine channel.
+///
+/// **What this bounds.** The drain used to be `while let Ok(more) =
+/// rx.try_recv() { pending.push(more) }` — it emptied the whole channel before
+/// returning to slot duties. A node being fed a steady stream (a peer serving
+/// it a 512-block sync page, or 64 validators attesting) therefore postponed
+/// attesting and proposing for as long as the stream lasted, which on a node
+/// applying blocks at ~0.6 s each is minutes per tick.
+///
+/// **This value is a GUESS and is meant to be measured. The measurement, not
+/// this comment, decides it.** Override it without rebuilding by setting
+/// `BLOCH_MAX_EVENTS_PER_TICK`; `BLOCH_MAX_EVENTS_PER_TICK=0` restores the
+/// old unbounded drain exactly, which is the control arm of that experiment.
+///
+/// The reasoning it is a guess FROM, offered so the measurement can contradict
+/// something specific:
+///
+///   - A smaller bound does NOT cost throughput the way it looks like it
+///     should. `recv_timeout` only waits when the channel is EMPTY, so a
+///     backed-up channel is drained `MAX_ENGINE_EVENTS_PER_TICK` events per
+///     LOOP ITERATION, with only a few cheap comparisons between iterations —
+///     not one batch per 500 ms tick. The "4 events/tick = 8 events/s" ceiling
+///     that made 4 look catastrophic assumes the loop sleeps between batches,
+///     and it does not. Expect the sync rate with and without the bound to come
+///     out close; if it does not, this model is wrong and the number should
+///     follow the measurement.
+///   - What the bound actually buys is a ceiling on how long duties are
+///     postponed, and it costs that ceiling times the per-event handling cost.
+///     At the replay cost of 0.59 s per block, 32 blocks is still ~19 s of
+///     postponed duties — so if live ingest is anywhere near replay cost, this
+///     number should come DOWN, not up. A bound on elapsed time rather than on
+///     a count would express that directly and is the change to make next.
+///   - Interaction with the inbound quota is real: bounding the drain slows the
+///     rate at which permits are given back, so under a flood the classes fill
+///     sooner and the transport sheds sooner. That is the trade — shed a
+///     recoverable frame, keep the slot.
+///
+/// NOTE for whoever measures: boot replay does NOT pass through this channel
+/// (it is a plain loop over the block log), so this bound cannot affect restart
+/// replay at all. Only live and sync ingest reach it.
+pub const MAX_ENGINE_EVENTS_PER_TICK: usize = 32;
+
+/// The bound in force, read once per process.
+///
+/// `BLOCH_MAX_EVENTS_PER_TICK` overrides [`MAX_ENGINE_EVENTS_PER_TICK`], and
+/// `0` means unbounded — the pre-WP3 behaviour, kept reachable so both arms of
+/// the measurement are the same binary. It is announced on stdout when it is
+/// not the default, because a benchmark run whose bound nobody can see in the
+/// log is a benchmark of an unknown.
+fn max_engine_events_per_tick() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| match std::env::var("BLOCH_MAX_EVENTS_PER_TICK") {
+        Err(_) => MAX_ENGINE_EVENTS_PER_TICK,
+        Ok(v) => match v.trim().parse::<usize>() {
+            Ok(0) => {
+                println!("engine: BLOCH_MAX_EVENTS_PER_TICK=0 — the drain is UNBOUNDED this run");
+                usize::MAX
+            }
+            Ok(n) => {
+                println!("engine: draining at most {n} event(s) per tick (BLOCH_MAX_EVENTS_PER_TICK)");
+                n
+            }
+            Err(_) => {
+                eprintln!(
+                    "engine: BLOCH_MAX_EVENTS_PER_TICK={v:?} is not a number — \
+                     using {MAX_ENGINE_EVENTS_PER_TICK}"
+                );
+                MAX_ENGINE_EVENTS_PER_TICK
+            }
+        },
+    })
+}
+
+/// Take `first` plus up to `max - 1` more events off the channel.
+///
+/// Separated from [`drain_pending`], which HANDLES them, so the bound can be
+/// tested at any value without a node, a clock or an environment variable —
+/// including `usize::MAX`, which must behave exactly like the unbounded drain
+/// it replaces. `max` is never zero: `first` has already been taken off the
+/// channel and dropping it would lose an event AND its permit's meaning.
+fn take_pending(
+    rx: &mpsc::Receiver<EngineEvent>,
+    first: EngineEvent,
+    max: usize,
+) -> Vec<EngineEvent> {
+    let mut pending = Vec::with_capacity(max.min(64));
+    pending.push(first);
+    while pending.len() < max {
+        match rx.try_recv() {
+            Ok(more) => pending.push(more),
+            Err(_) => break,
+        }
+    }
+    pending
+}
+
+fn drain_pending(engine: &mut Engine, pending: Vec<EngineEvent>, wall_epoch: u64) {
+    for ev in pending {
+        match ev {
+            // No release step, and no permit binding to mis-order: the
+            // `Admission` owns its reservation and hands it back after
+            // `on_net` returns. The version this replaces destructured the
+            // permit here, which made releasing early a one-word edit.
+            EngineEvent::Net(adm) => engine.on_net(adm, wall_epoch),
+            EngineEvent::Rpc(call) => {
+                let result = engine.serve_rpc(call.req);
+                // A client that hung up between asking and being answered is
+                // normal, not an error worth logging.
+                let _ = call.reply.send(result);
+            }
+        }
+    }
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -241,7 +365,7 @@ const NO_TXS: [PosTransaction; 0] = [];
 /// Ceiling on mempool entries. Not a policy — a bound, so an unauthenticated
 /// devnet transport cannot turn into unbounded memory. Real admission control
 /// (fees, per-sender limits, eviction by price) is `gossip.rs` work.
-const MEMPOOL_MAX: usize = 4_096;
+pub(crate) const MEMPOOL_MAX: usize = 4_096;
 
 /// Transactions a proposal will carry at most, independent of the consensus
 /// byte cap it is also checked against.
@@ -623,6 +747,11 @@ struct Engine {
     /// that kind of pool shrinkage apart from the epoch `retain`, which fork
     /// choice very much can see. See the argument there.
     fc_covered_removals: u64,
+    /// The inbound quota, read-only from here. Carried so `getchaininfo` can
+    /// report depth and shed counts: a counter only visible inside the process
+    /// is a counter nobody checks, and that invisibility is half of why silent
+    /// shedding hid a block-delivery failure for weeks.
+    queue: Arc<EngineQueue>,
 }
 
 /// A fingerprint of the four values `lmd_ghost_head` reads, so `advance` can
@@ -1037,13 +1166,26 @@ impl Engine {
         };
         self.pool
             .insert((att.validator, att.data.signing_root()), att.clone());
-        // Own attestation.
-        self.net.broadcast(net::att_frame(&att), net::Provenance::Originated);
-        println!(
-            "[slot {slot}] attested (epoch {e}, head {}, target {})",
-            crate::codec::hex8(&data.head),
-            crate::codec::hex8(&data.target_root)
-        );
+        // ORIGINATED: this node signed it three lines up.
+        let published = self.net.broadcast(net::att_frame(&att), Provenance::Originated);
+        // The old line printed "attested" unconditionally, including when the
+        // broadcast had been discarded — an operator reading it had no way to
+        // tell a cast vote from a vote that never left the process.
+        if published {
+            println!(
+                "[slot {slot}] attested (epoch {e}, head {}, target {})",
+                crate::codec::hex8(&data.head),
+                crate::codec::hex8(&data.target_root)
+            );
+        } else {
+            eprintln!(
+                "[slot {slot}] ATTESTATION NOT PUBLISHED (epoch {e}, head {}, target {}) — \
+                 it is in this node's own pool and nowhere else; the transport logged why. \
+                 This vote does not count toward anyone else's fork choice.",
+                crate::codec::hex8(&data.head),
+                crate::codec::hex8(&data.target_root)
+            );
+        }
     }
 
     fn propose(&mut self, slot: u64) {
@@ -1223,13 +1365,76 @@ impl Engine {
             .get(id.as_bytes())
             .expect("just ingested")
             .clone();
-        // Own proposal.
-        self.net.broadcast(net::block_frame(&env), net::Provenance::Originated);
+        // ORIGINATED, and the reason part (B) of this work package exists: this
+        // is the block this node built and signed, and it exists nowhere else.
+        // The transport logs the type, length and reason; this line names the
+        // slot and the block, which the transport cannot know.
+        if !self.net.broadcast(net::block_frame(&env), Provenance::Originated) {
+            eprintln!(
+                "[slot {slot}] OWN BLOCK {} NOT PUBLISHED — it was produced, signed and \
+                 stored, and no peer received it. This slot is lost, the node is not; \
+                 the transport logged the reason above.",
+                crate::codec::hex8(id.as_bytes()),
+            );
+        }
+    }
+
+    // ── Network events ─────────────────────────────────────────────────────
+
+    /// Handle one admitted network event with its quota still held.
+    ///
+    /// `Admission::handle` is the only way to reach the event, and it drops the
+    /// permit after this closure returns — so the quota measures work not yet
+    /// DONE, which is what the old hand-written counter claimed and did not do.
+    /// There is no binding here that a later edit could drop early; that is the
+    /// point of the type.
+    /// One line per epoch naming everything this node failed to publish, and
+    /// nothing at all when it published everything.
+    ///
+    /// The per-event lines in `net.rs` say what was lost as it happens; a
+    /// relayed loss is deliberately not one line per event, so without this
+    /// there is no total anywhere an operator can reach. The adopted inbound
+    /// quota makes the same argument for its own counters and answers it
+    /// through `getchaininfo`; the outbound counters are not in that response
+    /// yet (see the report — changing the RPC's shape is a wider decision than
+    /// this work package), so for now the periodic line is the reading.
+    fn report_broadcast_drops(&self, epoch: u64) {
+        let d = self.net.drops();
+        let (own_lost, own_partial) = (d.originated_lost(), d.originated_partial());
+        let (relay_lost, relay_partial) = (d.relayed_lost(), d.relayed_partial());
+        let malformed = d.malformed();
+        if own_lost | own_partial | relay_lost | relay_partial | malformed == 0 {
+            return;
+        }
+        println!(
+            "[epoch {epoch}] BROADCAST LOSSES since boot: our own {own_lost} lost, \
+             {own_partial} partial; relayed {relay_lost} lost, {relay_partial} partial; \
+             {malformed} malformed. Our own losses are proposals and votes this node \
+             produced and no peer received."
+        );
+    }
+
+    fn on_net(&mut self, adm: net::Admission, wall_epoch: u64) {
+        adm.handle(|ev| match ev {
+            NetEvent::Block(env) => self.ingest(env),
+            NetEvent::Attestation(att, origin) => self.on_attestation(att, origin, wall_epoch),
+            // Gossip has nobody to answer to; the verdict is the RPC's
+            // concern, not a peer's.
+            NetEvent::Transaction(tx) => {
+                let _ = self.on_transaction(tx, Provenance::Relayed);
+            }
+        })
     }
 
     // ── Block ingestion: store, then advance canonical as far as possible ──
 
     fn ingest(&mut self, env: BlockEnvelope) {
+        // Tests install a witness here to read the queue from INSIDE the
+        // handler — the only vantage point from which "the permit is still
+        // held while the work runs" is observable at all. Compiled out of the
+        // node binary entirely.
+        #[cfg(test)]
+        ingest_witness::record();
         let id = *env.block_id().as_bytes();
         if self.blocks.contains_key(&id) || self.canonical.contains(&id) {
             return;
@@ -1430,7 +1635,17 @@ impl Engine {
     /// answer to — the RPC — can say. The gossip path ignores the result: a
     /// peer is not waiting on a verdict, and a duplicate arriving twice over a
     /// full mesh is the normal case rather than a fault.
-    fn on_transaction(&mut self, tx: PosTransaction) -> Result<Admitted, Refusal> {
+    /// `prov` is the ONE thing this function cannot work out for itself.
+    /// Gossip and the RPC both land here (see the argument at the `admissible`
+    /// call below), and the two have opposite answers: a transaction a peer
+    /// gossiped is a relay, a transaction a local user submitted is this node's
+    /// own publication and the user has been told it was accepted. Tagging the
+    /// call site either way would be wrong half the time, so the caller says.
+    fn on_transaction(
+        &mut self,
+        tx: PosTransaction,
+        prov: Provenance,
+    ) -> Result<Admitted, Refusal> {
         let key = tx.canonical_bytes();
         if self.mempool.contains_key(&key) {
             return Ok(Admitted::Duplicate);
@@ -1471,10 +1686,8 @@ impl Engine {
         let mut frame = vec![net::FRAME_TX];
         frame.extend_from_slice(&key);
         self.mempool.insert(key, tx);
-        // Both gossip and the RPC land here, and WP3 meant to thread the
-        // provenance in from the caller but did not finish it; `Relayed` is
-        // the conservative label (sparse logging) pending that.
-        self.net.broadcast(frame, net::Provenance::Relayed);
+        // Provenance comes from the caller — see this function's doc.
+        self.net.broadcast(frame, prov);
         Ok(Admitted::New)
     }
 
@@ -1935,8 +2148,10 @@ impl Engine {
                 if self.live {
                     // Relay now: it was held, so nobody downstream got it from
                     // us. A duplicate publish is refused locally and costs
-                    // nothing.
-                    self.net.broadcast(frame, net::Provenance::Relayed);
+                    // nothing. RELAYED — this attestation is someone else's,
+                    // and its author re-gossips it — so a drop here is counted
+                    // and logged on the doubling schedule, not per event.
+                    self.net.broadcast(frame, Provenance::Relayed);
                 }
             }
         }
@@ -2069,6 +2284,7 @@ impl Engine {
                 self.state.validator_count(),
                 self.mempool.len(),
                 self.blocks.len(),
+                &self.queue.stats(),
             )),
 
             RpcRequest::BlockCount => {
@@ -2162,7 +2378,11 @@ impl Engine {
 
             RpcRequest::TxOut { txid, vout } => Ok(rpc::txout_json(&self.state, &txid, vout)),
 
-            RpcRequest::SendRawTransaction(tx) => match self.on_transaction(tx.clone()) {
+            // ORIGINATED: a local user submitted this and has been told it
+            // was accepted, so this node is its publisher, not a relay.
+            RpcRequest::SendRawTransaction(tx) => match self
+                .on_transaction(tx.clone(), Provenance::Originated)
+            {
                 Ok(outcome) => Ok(rpc::submitted_json(&tx, outcome)),
                 // The two refusals are not the same fact and must not carry
                 // the same advice. "Retry later" is correct for a full
@@ -2304,12 +2524,12 @@ pub fn run(cfg: Config) -> io::Result<()> {
 
     let logged = store.read_all()?;
     let head_slot = Arc::new(AtomicU64::new(0));
-    // BYTES of network events queued but not yet handled — not events. The
-    // transport reads it to decide when to shed rather than queue; see
-    // `net::send_to_engine`. It is refunded below, after each event is actually
-    // processed and not on dequeue, so "in flight" means exactly that and not
-    // "ever sent".
-    let budget = EngineBudget::new();
+    // Network events queued but not yet handled, metered separately per class
+    // — see `net::EngineQueue`. Blocks and attestations used to share one cap
+    // of 4096, which is how a flood of stale attestations silently ate the
+    // quota that arriving blocks needed and left 61 of 64 validators unable to
+    // deliver one.
+    let queue = Arc::new(EngineQueue::new());
     let (tx, rx) = mpsc::channel::<EngineEvent>();
     // The transports speak NetEvent and know nothing about the RPC; the engine
     // consumes one channel. Rather than teach both transports the engine's
@@ -2319,22 +2539,8 @@ pub fn run(cfg: Config) -> io::Result<()> {
     let (net_tx, net_rx) = mpsc::channel::<NetEvent>();
     {
         let tx = tx.clone();
-        let budget = budget.clone();
-        std::thread::spawn(move || {
-            for ev in net_rx {
-                // Through the same charge/shed helper the devnet mesh uses.
-                // Before this, libp2p events were queued UNCHARGED and then
-                // refunded on the way out by a drain that decremented for every
-                // `EngineEvent::Net` it saw — so on the libp2p transport the
-                // counter ran below zero and wrapped to `usize::MAX` on the
-                // first event. Nothing read it on that path, so it was latent;
-                // charging here makes the budget mean the same thing on both
-                // transports, and the `Charge` makes the refund match.
-                if !net::send_to_engine(&tx, &budget, ev) {
-                    return; // engine gone; nothing left to deliver to
-                }
-            }
-        });
+        let queue = queue.clone();
+        std::thread::spawn(move || forward_admitted(net_rx, tx, queue));
     }
     let net = match cfg.transport {
         Transport::Devnet => net::Net::Devnet(net::start(
@@ -2344,7 +2550,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
             tx.clone(),
             cfg.data_dir.clone(),
             head_slot.clone(),
-            budget.clone(),
+            queue.clone(),
         )?),
         Transport::Libp2p => {
             let parse = |s: &str, what: &str| -> io::Result<crate::p2p::Multiaddr> {
@@ -2404,6 +2610,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         ws_anchor_hard: false,
         ws_conflict_reported: false,
         fc_covered_removals: 0,
+        queue: queue.clone(),
         manifest,
     };
 
@@ -2617,6 +2824,9 @@ pub fn run(cfg: Config) -> io::Result<()> {
     let mut last_attested: u64 = engine.state.slot();
     let mut last_built: u64 = engine.state.slot();
     let mut last_sync_req: u64 = 0;
+    // `u64::MAX` so the first pass through the loop reports (and stays silent
+    // when there is nothing to report), rather than skipping epoch 0.
+    let mut last_drop_report: u64 = u64::MAX;
 
     loop {
         let now = now_ms();
@@ -2627,6 +2837,10 @@ pub fn run(cfg: Config) -> io::Result<()> {
         let slot = (now - genesis_ms) / slot_ms;
         let slot_start = genesis_ms + slot * slot_ms;
         let wall_epoch = epoch_of(slot);
+        if wall_epoch != last_drop_report {
+            last_drop_report = wall_epoch;
+            engine.report_broadcast_drops(wall_epoch);
+        }
         if slot != engine.wall_slot {
             // Measured BEFORE the assignment, and skipping the first pass,
             // whose `wall_slot` is still the replayed head rather than a slot
@@ -2685,7 +2899,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         if (behind || engine.needs_sync) && now.saturating_sub(last_sync_req) > 2 * slot_ms {
             engine
                 .net
-                .broadcast(net::get_blocks_frame(engine.state.slot()), net::Provenance::Originated);
+                .broadcast(net::get_blocks_frame(engine.state.slot()), Provenance::Originated);
             engine.needs_sync = false;
             last_sync_req = now;
         }
@@ -2698,45 +2912,11 @@ pub fn run(cfg: Config) -> io::Result<()> {
         let wait = next_deadline.saturating_sub(now_ms()).clamp(1, 500);
         match rx.recv_timeout(Duration::from_millis(wait)) {
             Ok(ev) => {
-                // BOUNDED, where this used to drain the channel dry. See
-                // `MAX_ENGINE_EVENTS_PER_TICK`. The interaction with the byte
-                // budget is real and worth naming: bounding the drain slows the
-                // refund rate, so under a flood the budget fills sooner and the
-                // transport sheds sooner. That is the trade being made — shed a
-                // recoverable frame, keep the slot.
-                let pending = drain_pending(&rx, ev, max_engine_events_per_tick());
+                // BOUNDED, where this used to empty the channel before slot
+                // duties could run again. See `MAX_ENGINE_EVENTS_PER_TICK`.
+                let pending = take_pending(&rx, ev, max_engine_events_per_tick());
                 bench_events += pending.len() as u64;
-                for ev in pending {
-                    match ev {
-                        EngineEvent::Net(net_ev, charge) => {
-                            // `charge` is bound to a NAME and dropped explicitly
-                            // AFTER the handler runs. Two reasons: the budget
-                            // must mean "work the engine has not done yet", not
-                            // "work it has not dequeued yet"; and a binding
-                            // named `_` would drop immediately, refunding before
-                            // the work — a one-character difference with the
-                            // whole property in it.
-                            match net_ev {
-                                NetEvent::Block(env) => engine.ingest(env),
-                                NetEvent::Attestation(att, origin) => {
-                                    engine.on_attestation(att, origin, wall_epoch)
-                                }
-                                NetEvent::Transaction(tx) => {
-                                    // Gossip has nobody to answer to; the
-                                    // verdict is the RPC's concern, not a peer's.
-                                    let _ = engine.on_transaction(tx);
-                                }
-                            }
-                            drop(charge);
-                        }
-                        EngineEvent::Rpc(call) => {
-                            let result = engine.serve_rpc(call.req);
-                            // A client that hung up between asking and being
-                            // answered is normal, not an error worth logging.
-                            let _ = call.reply.send(result);
-                        }
-                    }
-                }
+                drain_pending(&mut engine, pending, wall_epoch);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -2748,28 +2928,32 @@ pub fn run(cfg: Config) -> io::Result<()> {
         }
 
         // One machine-readable sample per interval, inert unless the knob is
-        // set. `shed` is reported PER CLASS because a shed block and a shed
-        // attestation are not the same event: the first is a hole the sync pump
-        // must re-request, the second is a vote the mesh will re-gossip. The
-        // in-flight byte figures are here for the same reason — the cost of a
-        // slower drain is the budget filling, and this is where it would show.
+        // set. Shedding is reported PER CLASS, through WP3's own
+        // `EngineQueue::stats`, because a shed block and a shed attestation are
+        // not the same event: the first is a hole the sync pump must
+        // re-request, the second is a vote the mesh will re-gossip. Occupancy
+        // is here for the same reason — the cost of a slower drain is the quota
+        // filling, and this is where it would show if it did.
         bench_ticks += 1;
         if bench_interval_ms > 0
             && bench_last.elapsed() >= Duration::from_millis(bench_interval_ms)
         {
+            let q = queue.stats();
             println!(
                 "syncbench t_ms={} head={} blocks={} ticks={} events={} \
-shedblk={} shedgos={} blkbytes={} gosbytes={} \
+shedblk={} shedatt={} shedtx={} qblk={} qatt={} qtx={} \
 skipped={} maxjump={} proposed={} attested={} latemax={}",
                 bench_started.elapsed().as_millis(),
                 engine.state.slot(),
                 engine.chain.len() - 1,
                 bench_ticks,
                 bench_events,
-                budget.shed(net::Class::Block),
-                budget.shed(net::Class::Gossip),
-                budget.in_flight(net::Class::Block),
-                budget.in_flight(net::Class::Gossip),
+                q.block.shed,
+                q.attestation.shed,
+                q.transaction.shed,
+                q.block.items,
+                q.attestation.items,
+                q.transaction.items,
                 bench_skipped,
                 bench_max_jump,
                 bench_proposed,
@@ -3950,7 +4134,7 @@ mod transfer_v2_end_to_end {
     /// HOLDS `entries` — the outputs the sweep spends. `epochs_past` places
     /// `genesis_time_ms` so the node's real wall epoch is at least that
     /// (+2 slots of margin so the epoch cannot regress mid-test).
-    fn engine_at_wall_epoch(epochs_past: u64, entries: &[EutxoEntry]) -> Engine {
+    pub(super) fn engine_at_wall_epoch(epochs_past: u64, entries: &[EutxoEntry]) -> Engine {
         let slot_ms = 500u64;
         let back_ms = epochs_past
             .saturating_mul(SLOTS_PER_EPOCH)
@@ -3999,7 +4183,7 @@ mod transfer_v2_end_to_end {
         // `_rx` drops here: nothing dials this node, and the accept loop
         // exits quietly on a closed channel.
         let head_slot = Arc::new(AtomicU64::new(0));
-        let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let queue = Arc::new(EngineQueue::new());
         let net = net::Net::Devnet(
             net::start(
                 "127.0.0.1",
@@ -4008,7 +4192,7 @@ mod transfer_v2_end_to_end {
                 events,
                 dir.clone(),
                 head_slot.clone(),
-                inflight,
+                queue.clone(),
             )
             .expect("bind the devnet transport on an ephemeral port"),
         );
@@ -4039,6 +4223,7 @@ mod transfer_v2_end_to_end {
             ws_anchor_hard: false,
             ws_conflict_reported: false,
             fc_covered_removals: 0,
+            queue,
         }
     }
 
@@ -4122,14 +4307,14 @@ mod transfer_v2_end_to_end {
         // ── Gossip path, on a FRESH engine ──────────────────────────────────
         let mut gossip_node = engine_at_wall_epoch(V2_FLAG_DAY + 1, &entries);
         assert_eq!(
-            gossip_node.on_transaction(tx.clone()),
+            gossip_node.on_transaction(tx.clone(), Provenance::Relayed),
             Ok(Admitted::New),
             "the gossip path must admit the sweep"
         );
         // Surviving the mempool: a second delivery collapses to Duplicate
         // instead of being refused or double-inserted.
         assert_eq!(
-            gossip_node.on_transaction(tx.clone()),
+            gossip_node.on_transaction(tx.clone(), Provenance::Relayed),
             Ok(Admitted::Duplicate),
             "a re-gossiped sweep must be a duplicate, not a refusal"
         );
@@ -4171,7 +4356,7 @@ mod transfer_v2_end_to_end {
 
         // Gossip path: refused with today's string.
         let err = node
-            .on_transaction(tx.clone())
+            .on_transaction(tx.clone(), Provenance::Relayed)
             .expect_err("pre-activation, the gossip path must refuse V2");
         assert!(
             err.reason().contains("deduplicated transfers (tag 0x06) are not active"),
@@ -4291,7 +4476,7 @@ mod perf_support {
         let store = Store::open(&dir, &[0u8; 32]).expect("open the test store");
         let (events, _rx) = mpsc::channel::<EngineEvent>();
         let head_slot = Arc::new(AtomicU64::new(0));
-        let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let queue = Arc::new(EngineQueue::new());
         let net = net::Net::Devnet(
             net::start(
                 "127.0.0.1",
@@ -4300,7 +4485,7 @@ mod perf_support {
                 events,
                 dir.clone(),
                 head_slot.clone(),
-                inflight,
+                queue.clone(),
             )
             .expect("bind the devnet transport on an ephemeral port"),
         );
@@ -4337,6 +4522,7 @@ mod perf_support {
             // offset the very first comparison against a pool that really is
             // empty.
             fc_covered_removals: 0,
+            queue,
         };
         (engine, TestDir(dir))
     }
@@ -4624,14 +4810,14 @@ mod bench {
         let before = |st: &CommittedState| -> u128 {
             let t = Instant::now();
             let root = st.state_root();
-            let v = crate::rpc::chain_info_json(st, &head, root, 0, Some(0), 0, 1, 0, 1);
+            let v = crate::rpc::chain_info_json(st, &head, root, 0, Some(0), 0, 1, 0, 1, &Default::default());
             let us = t.elapsed().as_micros();
             std::hint::black_box(v);
             us
         };
         let after = |st: &CommittedState| -> u128 {
             let t = Instant::now();
-            let v = crate::rpc::chain_info_json(st, &head, header_root, 0, Some(0), 0, 1, 0, 1);
+            let v = crate::rpc::chain_info_json(st, &head, header_root, 0, Some(0), 0, 1, 0, 1, &Default::default());
             let us = t.elapsed().as_micros();
             std::hint::black_box(v);
             us
@@ -4671,10 +4857,10 @@ mod bench {
         // Byte-identical, which is what makes this transport-only. Asserted
         // rather than printed: a bench that quietly changed the answer would
         // be measuring the wrong thing to begin with.
-        let a = crate::rpc::chain_info_json(&st, &head, header_root, 0, Some(0), 0, 1, 0, 1);
+        let a = crate::rpc::chain_info_json(&st, &head, header_root, 0, Some(0), 0, 1, 0, 1, &Default::default());
         let b = {
             let root = st.state_root();
-            crate::rpc::chain_info_json(&st, &head, root, 0, Some(0), 0, 1, 0, 1)
+            crate::rpc::chain_info_json(&st, &head, root, 0, Some(0), 0, 1, 0, 1, &Default::default())
         };
         assert_eq!(
             a.to_string(),
@@ -5575,7 +5761,7 @@ mod duty_view_anchor {
         let store = Store::open(&dir.0, &[0u8; 32]).expect("open the test store");
         let (events, _rx) = mpsc::channel::<EngineEvent>();
         let head_slot = Arc::new(AtomicU64::new(0));
-        let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let queue = Arc::new(EngineQueue::new());
         let net = net::Net::Devnet(
             net::start(
                 "127.0.0.1",
@@ -5584,7 +5770,7 @@ mod duty_view_anchor {
                 events,
                 dir.0.clone(),
                 head_slot.clone(),
-                inflight,
+                queue.clone(),
             )
             .expect("bind the devnet transport on an ephemeral port"),
         );
@@ -5616,6 +5802,7 @@ mod duty_view_anchor {
             ws_anchor_hard: false,
             ws_conflict_reported: false,
             fc_covered_removals: 0,
+            queue,
         };
         (engine, dir)
     }
@@ -5685,5 +5872,321 @@ mod duty_view_anchor {
             partition_caught_up.len()
         );
         assert!(moved > 0);
+    }
+}
+
+
+#[cfg(test)]
+mod libp2p_admission_tests {
+    //! The production transport's admission, which nothing covered until the
+    //! mutation run: deleting the quota check from the forwarder left the whole
+    //! suite green, and that is precisely the state libp2p shipped in.
+
+    use super::*;
+    use crate::net::{Class, EngineQueue, NetEvent};
+    use bloch_pos_committee::attestation::{Attestation, AttestationData};
+    use bloch_pos_committee::header::{BlockEnvelope, BlockHeaderV4, Body};
+
+    fn envelope(slot: u64) -> BlockEnvelope {
+        BlockEnvelope {
+            header: BlockHeaderV4 {
+                version: 4,
+                parent: [0u8; 32],
+                state_root: [0u8; 32],
+                body_root: [0u8; 32],
+                slot,
+                proposer_index: 17,
+                randao_reveal: [0u8; 32],
+                randao_mix: [0u8; 32],
+                justified_root: [0u8; 32],
+                finalized_root: [0u8; 32],
+                attestation_root: [0u8; 32],
+                coherence_root: [0u8; 32],
+            },
+            proposer_sig: vec![7u8; 64],
+            body: Body { attestations: Vec::new(), transactions: Vec::new() },
+        }
+    }
+
+    fn attestation(slot: u64) -> NetEvent {
+        NetEvent::Attestation(
+            Attestation {
+                data: AttestationData {
+                    slot,
+                    head: [0u8; 32],
+                    source_epoch: 0,
+                    source_root: [0u8; 32],
+                    target_epoch: 0,
+                    target_root: [0u8; 32],
+                },
+                validator: 3,
+                signature: vec![9u8; 4_800],
+            },
+            crate::net::Origin::none(),
+        )
+    }
+
+    /// Drain the forwarder to completion over a fixed input.
+    fn forward(queue: &Arc<EngineQueue>, evs: Vec<NetEvent>) -> Vec<EngineEvent> {
+        let (net_tx, net_rx) = mpsc::channel::<NetEvent>();
+        let (tx, rx) = mpsc::channel::<EngineEvent>();
+        for e in evs {
+            net_tx.send(e).expect("the forwarder has not started yet");
+        }
+        drop(net_tx); // closing the input is what ends the loop
+        forward_admitted(net_rx, tx, queue.clone());
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(ev);
+        }
+        out
+    }
+
+    /// The motivating case again, on the production transport this time: with
+    /// the attestation quota saturated, a block still gets through.
+    #[test]
+    fn a_block_still_arrives_on_libp2p_while_attestations_are_saturated() {
+        let queue = Arc::new(EngineQueue::new());
+        let (att_items, _) = (2048usize, ());
+        let _flood: Vec<_> = (0..att_items)
+            .filter_map(|_| EngineQueue::admit(&queue, Class::Attestation, 4_929))
+            .collect();
+        assert_eq!(_flood.len(), att_items, "the attestation class must really be full");
+
+        let out = forward(&queue, vec![attestation(1), NetEvent::Block(envelope(25_750))]);
+        assert_eq!(out.len(), 1, "the attestation is shed, the block is not");
+        match &out[0] {
+            EngineEvent::Net(adm) => match adm.peek() {
+                NetEvent::Block(env) => assert_eq!(env.header.slot, 25_750),
+                _ => panic!("the survivor must be the block"),
+            },
+            _ => panic!("the survivor must be the block"),
+        }
+        assert_eq!(queue.stats().attestation.shed, 1, "and the shed attestation is counted");
+    }
+
+    /// The CONTROL: the forwarder is a ceiling, not a funnel. Saturate BLOCKS
+    /// and the block it forwards must be shed and counted — otherwise the
+    /// libp2p path is the unbounded channel it used to be.
+    #[test]
+    fn the_libp2p_forwarder_sheds_and_counts_when_the_block_quota_is_full() {
+        let queue = Arc::new(EngineQueue::new());
+        let _full: Vec<_> = (0..1024usize)
+            .filter_map(|_| EngineQueue::admit(&queue, Class::Block, 700))
+            .collect();
+        assert_eq!(_full.len(), 1024, "the block class must really be full");
+
+        let out = forward(&queue, vec![NetEvent::Block(envelope(9))]);
+        assert!(out.is_empty(), "a block over the block quota must not reach the engine");
+        assert_eq!(queue.stats().block.shed, 1, "and it must leave a trace");
+    }
+
+    /// The forwarder must charge each event to its own class and to its real
+    /// size — it is the only place the libp2p path is measured, so an event
+    /// mis-sized here is a ceiling that is wrong by exactly that much.
+    #[test]
+    fn the_forwarder_charges_each_event_to_its_own_class_and_size() {
+        let queue = Arc::new(EngineQueue::new());
+        let block = NetEvent::Block(envelope(4));
+        let att = attestation(4);
+        let (bb, ab) = (block.wire_bytes(), att.wire_bytes());
+
+        let held = forward(&queue, vec![block, att]);
+        assert_eq!(held.len(), 2);
+        let s = queue.stats();
+        assert_eq!(s.block.items, 1, "one block on the block meter");
+        assert_eq!(s.block.bytes, bb, "charged its real wire size");
+        assert_eq!(s.attestation.items, 1, "one attestation on the attestation meter");
+        assert_eq!(s.attestation.bytes, ab);
+
+        drop(held);
+        let s = queue.stats();
+        assert_eq!(s.block.items + s.attestation.items, 0, "and the permits give it all back");
+        assert_eq!(s.block.bytes + s.attestation.bytes, 0);
+    }
+}
+
+/// **N2, at the level where N2 lived.** The engine's own dequeue path must hold
+/// the quota until the handler is done.
+///
+/// The net-level test (`net::queue_tests::the_quota_is_held_while_the_work_runs`)
+/// pins `Admission::handle`. This one pins the CALL SITE — `drain_pending`, the
+/// function extracted out of `run`'s loop — because that is where the surviving
+/// mutation lived: `drop(permit); engine.ingest(env)` was a one-word edit
+/// against the old two-field variant, restored the release-on-dequeue semantics
+/// the commit message calls a lie, and passed all 520 tests.
+///
+/// It cannot pass now for two independent reasons, which is the point of having
+/// both: `EngineEvent::Net` carries a single opaque `Admission` with a private
+/// permit, so the mutation no longer compiles; and if someone reintroduced an
+/// early release inside `Admission::handle` — where it would still compile —
+/// this test reads 0 where it demands 1.
+#[cfg(test)]
+mod quota_holding_tests {
+    use super::*;
+    use bloch_pos_committee::header::{BlockEnvelope, BlockHeaderV4, Body};
+    use crate::net::Class;
+
+    /// The cheapest envelope `ingest` accepts, which is itself the finding:
+    /// two commitment roots over empty vectors — fixed constants an attacker
+    /// copies — and a non-zero slot. No signature is checked before this is
+    /// stored. See the note on `BLOCK_ITEMS_PER_CONN`.
+    fn cheap_block(slot: u64) -> BlockEnvelope {
+        BlockEnvelope {
+            header: BlockHeaderV4 {
+                version: bloch_pos_committee::header::VERSION_G4,
+                parent: [7u8; 32],
+                state_root: [0u8; 32],
+                body_root: derive::body_root(&[]),
+                slot,
+                proposer_index: 0,
+                randao_reveal: [0u8; 32],
+                randao_mix: [0u8; 32],
+                justified_root: [0u8; 32],
+                finalized_root: [0u8; 32],
+                attestation_root: derive::attestation_root(&[]),
+                coherence_root: [0u8; 32],
+            },
+            proposer_sig: vec![1u8; 32],
+            body: Body { attestations: Vec::new(), transactions: Vec::new() },
+        }
+    }
+
+    #[test]
+    fn the_quota_is_held_while_the_engine_does_the_work() {
+        let mut engine = transfer_v2_end_to_end::engine_at_wall_epoch(0, &[]);
+        let queue = engine.queue.clone();
+
+        let ev = NetEvent::Block(cheap_block(4));
+        let adm = EngineQueue::admit_event_owned(&queue, ev, 700)
+            .expect("an empty queue admits");
+        assert_eq!(queue.stats().block.items, 1, "queued, before any handling");
+
+        let (_, seen) = ingest_witness::watching(&queue, || {
+            drain_pending(&mut engine, vec![EngineEvent::Net(adm)], 0);
+        });
+
+        assert_eq!(
+            seen,
+            Some(1),
+            "the block quota must still be held at the top of ingest — reading 0 here is \\
+             exactly the release-on-dequeue semantics this commit calls a lie, and None \\
+             means ingest never ran at all"
+        );
+
+        // CONTROL: it is given back. Without this half, a permit that simply
+        // leaked would satisfy the assertion above and quietly shrink the quota
+        // for the life of the process — the shape of the original underflow.
+        let after = queue.stats().block;
+        assert_eq!(after.items, 0, "and returned once the handler is done");
+        assert_eq!(after.bytes, 0);
+
+        // And the work really happened: the block is in the engine.
+        assert_eq!(engine.blocks.len(), 1, "ingest must have stored the block");
+    }
+
+    /// The CONTROL for the control: an event the engine SHEDS must not leave
+    /// quota behind either. A test that only ever admits cannot tell a
+    /// balanced ledger from one that never gets tested on the refusal path.
+    #[test]
+    fn a_shed_block_leaves_no_quota_behind() {
+        let queue = Arc::new(EngineQueue::new());
+        let _full: Vec<_> = (0..1024usize)
+            .filter_map(|_| EngineQueue::admit(&queue, Class::Block, 700))
+            .collect();
+        assert_eq!(_full.len(), 1024);
+
+        let before = queue.stats().block;
+        assert!(
+            EngineQueue::admit_event_owned(&queue, NetEvent::Block(cheap_block(5)), 700).is_none(),
+            "a full block class must refuse"
+        );
+        let after = queue.stats().block;
+        assert_eq!(after.items, before.items, "a refusal must consume no item");
+        assert_eq!(after.bytes, before.bytes, "and no bytes");
+        assert_eq!(after.shed, before.shed + 1, "and must be counted");
+    }
+}
+
+/// Tests for the DRAIN BOUND — part (C).
+///
+/// They exercise `take_pending` directly rather than through the slot loop,
+/// because the property is about how many events leave the channel per tick and
+/// nothing else: no node, no clock, no environment variable. That is also what
+/// lets the same test run at the bound a benchmark chooses, including the
+/// unbounded value, which must behave exactly like the drain it replaces.
+#[cfg(test)]
+mod drain_bound_tests {
+    use super::*;
+
+    /// An event that costs nothing to build and carries no quota, so these
+    /// tests measure the bound and not the queue.
+    fn event() -> EngineEvent {
+        let (reply, _rx) = mpsc::channel();
+        EngineEvent::Rpc(RpcCall { req: RpcRequest::ChainInfo, reply })
+    }
+
+    /// `first` plus `n` more on the channel.
+    fn loaded(n: usize) -> (mpsc::Sender<EngineEvent>, mpsc::Receiver<EngineEvent>) {
+        let (tx, rx) = mpsc::channel();
+        for _ in 0..n {
+            tx.send(event()).expect("the receiver is alive");
+        }
+        (tx, rx)
+    }
+
+    /// The bound is a bound: a channel with more in it than the tick allows
+    /// leaves the rest for the next tick, so slot duties run in between.
+    #[test]
+    fn take_pending_stops_at_the_bound() {
+        let (_tx, rx) = loaded(9);
+        let taken = take_pending(&rx, event(), 4);
+        assert_eq!(taken.len(), 4, "the tick took more than its bound");
+        assert_eq!(rx.try_iter().count(), 9, "the remainder must stay queued for the next tick");
+    }
+
+    /// A bound of 1 still makes progress. An off-by-one here would return an
+    /// empty batch and lose `first` — an event already taken off the channel,
+    /// whose quota permit would be released without the work ever being done.
+    #[test]
+    fn a_bound_of_one_still_takes_the_event_already_in_hand() {
+        let (_tx, rx) = loaded(3);
+        let taken = take_pending(&rx, event(), 1);
+        assert_eq!(taken.len(), 1, "a bound of 1 must still handle the event it was handed");
+        assert_eq!(rx.try_iter().count(), 3);
+    }
+
+    /// The control arm of the measurement: `BLOCH_MAX_EVENTS_PER_TICK=0` maps
+    /// to `usize::MAX`, and at that value this must be the old unbounded drain
+    /// exactly — everything, in one tick.
+    #[test]
+    fn take_pending_is_unbounded_at_usize_max() {
+        let (_tx, rx) = loaded(500);
+        let taken = take_pending(&rx, event(), usize::MAX);
+        assert_eq!(taken.len(), 501, "the unbounded arm must empty the channel");
+        assert_eq!(rx.try_iter().count(), 0);
+    }
+
+    /// A bound larger than the backlog is not a wait: `try_recv` ends the batch
+    /// as soon as the channel is empty, so a quiet node is never delayed by a
+    /// generous bound.
+    #[test]
+    fn a_bound_larger_than_the_backlog_does_not_block() {
+        let (_tx, rx) = loaded(2);
+        let taken = take_pending(&rx, event(), 4096);
+        assert_eq!(taken.len(), 3, "an empty channel must end the batch immediately");
+    }
+
+    /// The shipped default, pinned. Not because 32 is proven — it is a guess,
+    /// and `MAX_ENGINE_EVENTS_PER_TICK`'s doc says so — but because changing it
+    /// must be a deliberate edit rather than a side effect, and because the
+    /// benchmark's two arms are "this value" and "unbounded".
+    #[test]
+    fn the_default_bound_is_a_bound() {
+        assert!(
+            MAX_ENGINE_EVENTS_PER_TICK > 0 && MAX_ENGINE_EVENTS_PER_TICK < usize::MAX,
+            "the default must actually bound something"
+        );
+        assert_eq!(MAX_ENGINE_EVENTS_PER_TICK, 32);
     }
 }

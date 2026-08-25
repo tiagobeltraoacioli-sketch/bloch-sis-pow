@@ -140,6 +140,29 @@ pub fn encode_envelope(env: &BlockEnvelope) -> Vec<u8> {
     out
 }
 
+/// How much a DECLARED count may pre-allocate before any of the bytes behind it
+/// have been read.
+///
+/// This is the amplification that sits BEFORE the engine queue and is therefore
+/// invisible to it: `decode_event` runs on the reader thread, ahead of
+/// `send_to_engine`, so nothing has been charged to any quota yet. A ~10-byte
+/// frame declaring `ntx = 65_536` used to reach `Vec::with_capacity(65_536)`,
+/// reserve 1.57 MB of pointers, and only then fail on the missing data —
+/// roughly 150,000x amplification for the cost of one frame, repeatable as fast
+/// as a socket can carry it.
+///
+/// The count checks above are kept: they are the CORRECTNESS bound and reject
+/// absurd frames outright. This is the ALLOCATION bound, and it must be small
+/// enough that lying about the count buys nothing. 256 covers a real block
+/// (`MAX_TXS_PER_BLOCK`, and a 64-validator committee) so the honest path still
+/// reserves once; beyond it the vector simply grows as the data actually
+/// arrives, which an attacker cannot cause without sending the data.
+const DECODE_RESERVE_CAP: usize = 256;
+
+fn reserve_for(declared: usize) -> usize {
+    declared.min(DECODE_RESERVE_CAP)
+}
+
 pub fn decode_envelope(buf: &[u8]) -> Result<BlockEnvelope, DecodeErr> {
     let mut r = Reader::new(buf);
     let hb = r.take(BlockHeaderV4::ENCODED_LEN)?;
@@ -150,7 +173,7 @@ pub fn decode_envelope(buf: &[u8]) -> Result<BlockEnvelope, DecodeErr> {
     if natt > 4096 {
         return Err(DecodeErr("too many attestations"));
     }
-    let mut attestations = Vec::with_capacity(natt);
+    let mut attestations = Vec::with_capacity(reserve_for(natt));
     for _ in 0..natt {
         attestations.push(decode_attestation(&mut r)?);
     }
@@ -158,7 +181,7 @@ pub fn decode_envelope(buf: &[u8]) -> Result<BlockEnvelope, DecodeErr> {
     if ntx > 65_536 {
         return Err(DecodeErr("too many transactions"));
     }
-    let mut transactions = Vec::with_capacity(ntx);
+    let mut transactions = Vec::with_capacity(reserve_for(ntx));
     for _ in 0..ntx {
         transactions.push(r.bytes()?);
     }
@@ -266,5 +289,51 @@ mod tests {
     fn envelope_decode_rejects_truncation() {
         let bytes = encode_envelope(&sample_envelope());
         assert!(decode_envelope(&bytes[..bytes.len() - 1]).is_err());
+    }
+
+    /// A DECLARED count must not be able to reserve memory before the data
+    /// behind it has been read.
+    ///
+    /// This amplification sits BEFORE the engine queue and is invisible to it:
+    /// `decode_event` runs on the reader thread ahead of `send_to_engine`, so
+    /// no quota has been charged yet. `Vec::with_capacity(65_536)` for
+    /// `Vec<u8>` is 1.57 MB of pointers reserved for a ~10-byte frame — about
+    /// 150,000x, repeatable as fast as a socket delivers.
+    ///
+    /// Honest about what it checks: this pins the RESERVATION POLICY, not the
+    /// allocator. This crate has no library target, so a test binary with a
+    /// counting `#[global_allocator]` is not available to observe the bytes
+    /// directly. `reserve_for` is the whole policy, and it is one expression.
+    #[test]
+    fn a_declared_count_cannot_pre_allocate_before_its_data_arrives() {
+        assert_eq!(reserve_for(65_536), DECODE_RESERVE_CAP, "the ntx cap of the codec");
+        assert_eq!(reserve_for(4_096), DECODE_RESERVE_CAP, "and the natt cap");
+        assert!(
+            DECODE_RESERVE_CAP <= 256,
+            "a bound big enough to be worth lying about is not a bound"
+        );
+
+        // CONTROL: an honest block still reserves exactly once. A policy of
+        // "never reserve" would pass the assertions above and make every real
+        // decode grow by doubling.
+        assert_eq!(reserve_for(0), 0);
+        assert_eq!(reserve_for(64), 64, "a full committee's attestations, in one go");
+        assert_eq!(reserve_for(256), 256, "and MAX_TXS_PER_BLOCK transactions");
+    }
+
+    /// The count checks stay: they are the correctness bound, and a frame that
+    /// lies must still be REJECTED, not merely allocated modestly for.
+    #[test]
+    fn a_lying_count_is_still_rejected() {
+        let mut buf = encode_envelope(&sample_envelope());
+        // The envelope encodes header, sig, natt, attestations, ntx, txs. With
+        // an empty body the last four bytes are `ntx`; overwrite them with a
+        // count no data follows.
+        let n = buf.len();
+        buf[n - 4..].copy_from_slice(&65_000u32.to_le_bytes());
+        assert!(decode_envelope(&buf).is_err(), "a count with no data behind it must fail");
+
+        buf[n - 4..].copy_from_slice(&70_000u32.to_le_bytes());
+        assert!(decode_envelope(&buf).is_err(), "and one over the codec cap must fail outright");
     }
 }
