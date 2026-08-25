@@ -2805,6 +2805,42 @@ pub fn run(cfg: Config) -> io::Result<()> {
         }
     }
 
+    // ── WP7 sync-throughput instrument ──
+    //
+    // `BLOCH_SYNC_BENCH_MS` only; the drain bound itself is WP3's
+    // `BLOCH_MAX_EVENTS_PER_TICK` and is deliberately NOT re-implemented here —
+    // the point of the measurement is the real candidate, not a stand-in.
+    //
+    // A periodic line rather than a start/stop stopwatch: a single before/after
+    // pair over the process would fold in boot, the dial and the first sync
+    // round trip, none of which are the drain loop's throughput. A curve lets
+    // the steady state be read off the interior and the transient discarded.
+    let bench_interval_ms: u64 = std::env::var("BLOCH_SYNC_BENCH_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    let bench_started = std::time::Instant::now();
+    let mut bench_last = bench_started;
+    let mut bench_ticks: u64 = 0;
+    let mut bench_events: u64 = 0;
+    // ── Slot-duty starvation ──
+    //
+    // The loop attests and proposes ONLY between ticks. A tick that runs long
+    // therefore does not merely delay a duty, it skips every slot that began
+    // and ended inside it — the node produces nothing for those slots and they
+    // are indistinguishable, from outside, from a validator that is down.
+    // `bench_skipped` counts exactly those slots: the wall clock advanced by
+    // more than one slot between two consecutive passes of the loop.
+    let mut bench_skipped: u64 = 0;
+    let mut bench_max_jump: u64 = 0;
+    let mut bench_proposed: u64 = 0;
+    let mut bench_attested: u64 = 0;
+    // How late a proposal was, relative to the slot's own proposal deadline.
+    // Late is survivable; skipped is not, and the two are separated here
+    // rather than folded into one latency figure.
+    let mut bench_late_max: u64 = 0;
+    let mut bench_seen_slot: Option<u64> = None;
+
     // ── The slot loop ──
     let genesis_ms = engine.manifest.genesis_time_ms;
     let slot_ms = engine.manifest.slot_ms;
@@ -2829,6 +2865,15 @@ pub fn run(cfg: Config) -> io::Result<()> {
             engine.report_broadcast_drops(wall_epoch);
         }
         if slot != engine.wall_slot {
+            // Measured BEFORE the assignment, and skipping the first pass,
+            // whose `wall_slot` is still the replayed head rather than a slot
+            // this loop has seen.
+            if let Some(prev) = bench_seen_slot {
+                let jump = slot.saturating_sub(prev);
+                bench_skipped += jump.saturating_sub(1);
+                bench_max_jump = bench_max_jump.max(jump);
+            }
+            bench_seen_slot = Some(slot);
             engine.wall_slot = slot;
             // Drop everything the acceptance window has moved past. The pool
             // reads no clock of its own, so this is the only thing that bounds
@@ -2860,11 +2905,14 @@ pub fn run(cfg: Config) -> io::Result<()> {
         if !in_grace && slot > last_attested {
             engine.attest(slot);
             last_attested = slot;
+            bench_attested += 1;
         }
         let propose_at = slot_start + slot_ms / 3;
         if !in_grace && now >= propose_at && slot > last_built {
             engine.propose(slot);
             last_built = slot;
+            bench_proposed += 1;
+            bench_late_max = bench_late_max.max(now.saturating_sub(propose_at));
         }
 
         // Sync when behind or when a stored branch has holes. Rate-limited;
@@ -2890,6 +2938,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
                 // BOUNDED, where this used to empty the channel before slot
                 // duties could run again. See `MAX_ENGINE_EVENTS_PER_TICK`.
                 let pending = take_pending(&rx, ev, max_engine_events_per_tick());
+                bench_events += pending.len() as u64;
                 drain_pending(&mut engine, pending, wall_epoch);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -2899,6 +2948,42 @@ pub fn run(cfg: Config) -> io::Result<()> {
                     "network channel closed",
                 ));
             }
+        }
+
+        // One machine-readable sample per interval, inert unless the knob is
+        // set. Shedding is reported PER CLASS, through WP3's own
+        // `EngineQueue::stats`, because a shed block and a shed attestation are
+        // not the same event: the first is a hole the sync pump must
+        // re-request, the second is a vote the mesh will re-gossip. Occupancy
+        // is here for the same reason — the cost of a slower drain is the quota
+        // filling, and this is where it would show if it did.
+        bench_ticks += 1;
+        if bench_interval_ms > 0
+            && bench_last.elapsed() >= Duration::from_millis(bench_interval_ms)
+        {
+            let q = queue.stats();
+            println!(
+                "syncbench t_ms={} head={} blocks={} ticks={} events={} \
+shedblk={} shedatt={} shedtx={} qblk={} qatt={} qtx={} \
+skipped={} maxjump={} proposed={} attested={} latemax={}",
+                bench_started.elapsed().as_millis(),
+                engine.state.slot(),
+                engine.chain.len() - 1,
+                bench_ticks,
+                bench_events,
+                q.block.shed,
+                q.attestation.shed,
+                q.transaction.shed,
+                q.block.items,
+                q.attestation.items,
+                q.transaction.items,
+                bench_skipped,
+                bench_max_jump,
+                bench_proposed,
+                bench_attested,
+                bench_late_max,
+            );
+            bench_last = std::time::Instant::now();
         }
     }
 }

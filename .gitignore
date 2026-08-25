@@ -48,3 +48,4 @@ deploy/artifacts/
 # Python bytecode (sdk/codegen, tools/*)
 __pycache__/
 *.pyc
+target-wp7/
