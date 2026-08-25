@@ -38,14 +38,14 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use bloch_pos_committee::attestation::Attestation;
-use bloch_pos_committee::header::BlockEnvelope;
+use bloch_pos_committee::header::{BlockEnvelope, BlockHeaderV4};
 
 use crate::engine::EngineEvent;
 
@@ -81,10 +81,22 @@ impl Net {
     /// length prefix). The devnet mesh sends it to every peer; libp2p routes
     /// it by that type byte onto the matching gossip topic, or onto the
     /// directed sync path for `FRAME_GET_BLOCKS`.
-    pub fn broadcast(&self, frame: Vec<u8>) {
+    /// Returns false when the frame reached NO peer at all. The transports
+    /// log and count the loss themselves — see [`BroadcastDrops`] — so a
+    /// caller that has nothing to add may ignore the result; a caller that
+    /// can name what was lost (the proposer knows its slot) should say so.
+    pub fn broadcast(&self, frame: Vec<u8>, prov: Provenance) -> bool {
         match self {
-            Net::Devnet(m) => m.broadcast(frame),
-            Net::Libp2p(h) => h.broadcast(frame),
+            Net::Devnet(m) => m.broadcast(frame, prov),
+            Net::Libp2p(h) => h.broadcast(frame, prov),
+        }
+    }
+
+    /// Counters for frames this node failed to put on the wire.
+    pub fn drops(&self) -> &Arc<BroadcastDrops> {
+        match self {
+            Net::Devnet(m) => &m.drops,
+            Net::Libp2p(h) => h.drops(),
         }
     }
 
@@ -138,14 +150,338 @@ const SYNC_FANOUT: usize = 2;
 /// down.
 const SYNC_PAGE_BLOCKS: usize = 512;
 
-/// Network events queued for the engine before the transport starts shedding.
+// ── The engine's byte budget ────────────────────────────────────────────────
+//
+// **What this replaces, and why.** The queue in front of the engine used to be
+// bounded at 4096 EVENTS. An event is not a unit of memory: on this transport
+// a frame may be anything up to `codec::MAX_FIELD_LEN` (8 MiB), and a block
+// carrying a full quorum is ~300 KB of hybrid signatures on an ordinary slot.
+// 4096 events is therefore a bound of 1.2 GB in the ordinary case and 32 GiB
+// in the worst one — on 8 GB machines. It did not bound anything that matters.
+// That is the queue 60 peers dumped 145 MB pages into on 2026-08-21, and
+// twenty-two validators were OOM-killed at 7.9 GB.
+//
+// The budget below is in BYTES, which is the quantity the kernel kills for.
+//
+// **Total: 32 MiB.** Chosen against the machine that died, not against a
+// throughput target: 32 MiB is 0.4% of an 8 GB box, so the queue can no longer
+// be a material contributor to an OOM however many peers are shouting. It is
+// also enough to keep the engine fed — the engine drains at its own speed
+// (0.59 s per block during replay at Genesis-4's state size, so under two
+// blocks a second), and 32 MiB is ~100 ordinary blocks of runway, far more
+// than a slow consumer can use before the next page is asked for again.
+//
+// A shed frame is recoverable: a block is re-requested by the sync pump, an
+// attestation is re-gossiped by its author. Shedding costs a round trip;
+// queueing costs the process.
+
+/// Bytes of block traffic the engine may owe at once.
 ///
-/// The engine consumes one channel on one thread, and during replay it does not
-/// consume at all — replay is hours at Genesis-4's state size. An unbounded
-/// queue in front of a consumer that is asleep is just a slower way to run out
-/// of memory. Blocks and attestations are both recoverable (asked for again,
-/// gossiped again), so shedding beats dying.
-const ENGINE_QUEUE_CAP: usize = 4096;
+/// **Blocks get their own budget** so that a flood of attestations cannot shed
+/// them. This is the half of the incident this constant is aimed at: with one
+/// shared budget, anything cheap to produce and expensive to ignore can fill
+/// the queue and blocks are what gets dropped.
+///
+/// KNOWN LIMITATION, stated plainly: separate budgets stop an attestation
+/// flood from *shedding* blocks. They do NOT stop it from *delaying* them —
+/// both classes still travel one FIFO channel to one consumer, so a block
+/// queued behind 5,000 attestations still waits for those attestations to be
+/// handled. Fixing that needs a second channel or a priority queue at the
+/// engine, which is a larger change than this one and is not made here.
+pub const BLOCK_BYTE_BUDGET: usize = 24 * 1024 * 1024;
+
+/// Bytes of attestation and transaction traffic the engine may owe at once.
+pub const GOSSIP_BYTE_BUDGET: usize = 8 * 1024 * 1024;
+
+/// Charged to every queued event on top of its payload.
+///
+/// Two reasons. The decoded form of an event is bigger than its wire form (a
+/// `Vec` per signature, per transaction, per attestation), so the payload
+/// alone understates what the queue actually retains. And without it a stream
+/// of near-empty events would be free, which would put the old unbounded-count
+/// hole back under a new name: with it, the gossip budget admits at most
+/// `GOSSIP_BYTE_BUDGET / 256` = 32,768 events however small they are.
+const PER_EVENT_OVERHEAD_BYTES: usize = 256;
+
+/// Which budget an event is charged against.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Class {
+    Block,
+    Gossip,
+}
+
+impl Class {
+    fn of(ev: &NetEvent) -> Self {
+        match ev {
+            NetEvent::Block(_) => Class::Block,
+            NetEvent::Attestation(..) | NetEvent::Transaction(_) => Class::Gossip,
+        }
+    }
+
+    fn cap(self) -> usize {
+        match self {
+            Class::Block => BLOCK_BYTE_BUDGET,
+            Class::Gossip => GOSSIP_BYTE_BUDGET,
+        }
+    }
+}
+
+/// Bytes of network events handed to the engine and not yet handled.
+///
+/// Shared by every reader thread on both transports, which is the point: the
+/// budget is a property of this node's memory, not of one connection, so 60
+/// peers cannot each be under the cap and the node over it.
+#[derive(Default, Debug)]
+pub struct EngineBudget {
+    block_bytes: AtomicUsize,
+    gossip_bytes: AtomicUsize,
+    shed_blocks: AtomicU64,
+    shed_gossip: AtomicU64,
+    refund_underflows: AtomicU64,
+}
+
+impl EngineBudget {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    fn cell(&self, class: Class) -> &AtomicUsize {
+        match class {
+            Class::Block => &self.block_bytes,
+            Class::Gossip => &self.gossip_bytes,
+        }
+    }
+
+    /// Bytes currently owed for `class`.
+    pub fn in_flight(&self, class: Class) -> usize {
+        self.cell(class).load(Ordering::Acquire)
+    }
+
+    /// Events shed for want of budget, since boot.
+    pub fn shed(&self, class: Class) -> u64 {
+        match class {
+            Class::Block => self.shed_blocks.load(Ordering::Relaxed),
+            Class::Gossip => self.shed_gossip.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Refunds that tried to release more than was owed. Zero on a correct
+    /// build, and observable rather than fatal — see [`Charge::drop`].
+    pub fn refund_underflows(&self) -> u64 {
+        self.refund_underflows.load(Ordering::Relaxed)
+    }
+
+    /// Reserve `bytes` against `class`, or refuse.
+    ///
+    /// The reservation is ONE atomic read-modify-write, not a load followed by
+    /// an add. With a load-then-add, every reader thread that observed room
+    /// added its own frame on top of it — 104 inbound connections could each
+    /// pass the same check and overshoot the cap by 104 frames. `fetch_update`
+    /// makes the check and the reservation the same operation.
+    pub fn charge(self: &Arc<Self>, class: Class, bytes: usize) -> Option<Charge> {
+        self.cell(class)
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                let next = n.checked_add(bytes)?;
+                (next <= class.cap()).then_some(next)
+            })
+            .ok()?;
+        Some(Charge { budget: self.clone(), class, bytes })
+    }
+
+    fn note_shed(&self, class: Class) {
+        match class {
+            Class::Block => self.shed_blocks.fetch_add(1, Ordering::Relaxed),
+            Class::Gossip => self.shed_gossip.fetch_add(1, Ordering::Relaxed),
+        };
+    }
+}
+
+/// The receipt for bytes reserved in an [`EngineBudget`]; refunds them on drop.
+///
+/// **This type is the whole correctness argument for the budget.** The charge
+/// and the refund must be the same number, and the only way to guarantee that
+/// is to never compute it twice: `bytes` is measured once, at
+/// [`send_to_engine`], and carried alongside the event it paid for. The engine
+/// refunds by dropping this value, not by measuring anything.
+///
+/// It also makes the refund unconditional. Every path that loses an event —
+/// the channel being closed on shutdown, the engine thread ending with a queue
+/// still in it, a `SendError` handing the event back — drops the `Charge` with
+/// it and returns the bytes. An `inflight` that leaks on those paths wedges the
+/// queue shut permanently, and there is no path here that can leak.
+pub struct Charge {
+    budget: Arc<EngineBudget>,
+    class: Class,
+    bytes: usize,
+}
+
+impl Charge {
+    /// What this event reserved. Exactly what its drop will return.
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+impl std::fmt::Debug for Charge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Charge({:?}, {} B)", self.class, self.bytes)
+    }
+}
+
+impl Drop for Charge {
+    fn drop(&mut self) {
+        let bytes = self.bytes;
+        // Saturating, and counted. Under-flowing an unsigned counter would set
+        // it near `usize::MAX` and shut the queue for the lifetime of the
+        // process — a wedged validator, from an accounting slip. This cannot
+        // happen while every `Charge` comes from `charge()` and drops once, but
+        // "cannot happen" is not a reason to make the failure unrecoverable,
+        // and `debug_assert!` is not an option: this fleet builds with
+        // `overflow-checks` and WITHOUT `debug-assertions`, so a debug
+        // assertion is not in the binary at all.
+        let prev = self
+            .budget
+            .cell(self.class)
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| Some(n.saturating_sub(bytes)))
+            .unwrap_or(0);
+        if prev < bytes {
+            self.budget.refund_underflows.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// What one queued event costs the budget.
+///
+/// Structural, and computed WITHOUT re-encoding: the size of an event is read
+/// off the lengths it already carries. It is called exactly once per event, by
+/// [`send_to_engine`]; the refund never calls it. Both transports use this one
+/// function, so "what a block costs" has a single definition.
+pub fn event_bytes(ev: &NetEvent) -> usize {
+    /// `AttestationData` (8 + 32 + 8 + 32 + 8 + 32) plus the u32 validator index.
+    const ATT_FIXED_BYTES: usize = 120 + 4;
+    let att = |a: &Attestation| ATT_FIXED_BYTES + a.signature.len();
+    PER_EVENT_OVERHEAD_BYTES
+        + match ev {
+            NetEvent::Block(env) => {
+                BlockHeaderV4::ENCODED_LEN
+                    + env.proposer_sig.len()
+                    + env.body.transactions.iter().map(|t| t.len()).sum::<usize>()
+                    + env.body.attestations.iter().map(att).sum::<usize>()
+            }
+            NetEvent::Attestation(a, _) => att(a),
+            // The only variant whose size is not already lying about in a
+            // length field. Transactions are mempool-rate, not gossip-rate, so
+            // one encode on the inbound path is a cost worth paying to keep a
+            // single size function.
+            NetEvent::Transaction(tx) => tx.canonical_bytes().len(),
+        }
+}
+
+// ── Broadcast provenance and drop accounting ────────────────────────────────
+
+/// Whether a frame being published is this node's own work or someone else's.
+///
+/// The distinction exists because the consequences are not the same. A relayed
+/// frame that this node fails to forward is still in the network: its author
+/// published it, other peers carry it, and the mesh routes around the loss. A
+/// frame this node ORIGINATED — the block it just built and signed, the
+/// attestation it just cast, the history it is asking for — exists nowhere
+/// else. If this node fails to put it on the wire, it is gone, the slot is
+/// lost, and until now that happened with `let _ = ...` and no log line at all.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Provenance {
+    /// Produced by this node. Every failure is logged, individually.
+    Originated,
+    /// Forwarding someone else's. Failures are counted, and logged sparsely.
+    Relayed,
+}
+
+/// Frames this node failed to put on the wire, by provenance.
+///
+/// Read through [`Net::drops`]. Counters rather than a log-only story because
+/// an operator needs to be able to ask "is this node publishing?" and get a
+/// number, and because a test can assert on a number.
+#[derive(Default, Debug)]
+pub struct BroadcastDrops {
+    originated_lost: AtomicU64,
+    originated_partial: AtomicU64,
+    relayed_lost: AtomicU64,
+    relayed_partial: AtomicU64,
+}
+
+impl BroadcastDrops {
+    /// Frames of our own that reached no peer at all.
+    pub fn originated_lost(&self) -> u64 {
+        self.originated_lost.load(Ordering::Relaxed)
+    }
+    /// Frames of our own that reached some peers and not others.
+    pub fn originated_partial(&self) -> u64 {
+        self.originated_partial.load(Ordering::Relaxed)
+    }
+    /// Relayed frames that reached no peer at all.
+    pub fn relayed_lost(&self) -> u64 {
+        self.relayed_lost.load(Ordering::Relaxed)
+    }
+    /// Relayed frames that reached some peers and not others.
+    pub fn relayed_partial(&self) -> u64 {
+        self.relayed_partial.load(Ordering::Relaxed)
+    }
+
+    /// The frame reached nobody.
+    pub(crate) fn lost(&self, prov: Provenance, frame: &[u8], reason: &str, refused: usize) {
+        let tag = frame.first().copied().unwrap_or(0);
+        let len = frame.len();
+        match prov {
+            Provenance::Originated => {
+                let n = self.originated_lost.fetch_add(1, Ordering::Relaxed) + 1;
+                // EVERY one of these, always. This line is the difference
+                // between "we lost a proposal" and a silent empty slot.
+                eprintln!(
+                    "net: LOST OUR OWN FRAME type 0x{tag:02x} len {len} B: {reason} \
+                     ({refused} peer(s) refused it, 0 accepted) — \
+                     {n} originated frame(s) lost since boot"
+                );
+            }
+            Provenance::Relayed => {
+                let n = self.relayed_lost.fetch_add(1, Ordering::Relaxed) + 1;
+                // Rate-limited by count, not by clock: the 1st, 2nd, 4th, 8th …
+                // A relay drop is a normal consequence of a slow peer and a
+                // line per event would be the whole log during a flood, but
+                // going entirely silent is what this work package exists to
+                // stop. Doubling keeps the volume constant per order of
+                // magnitude and the count exact.
+                if n.is_power_of_two() {
+                    eprintln!(
+                        "net: dropped a RELAYED frame type 0x{tag:02x} len {len} B: {reason} \
+                         ({refused} peer(s) refused it, 0 accepted) — \
+                         {n} relayed frame(s) lost since boot"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The frame reached some peers but not all of them.
+    pub(crate) fn partial(&self, prov: Provenance, frame: &[u8], accepted: usize, refused: usize) {
+        let tag = frame.first().copied().unwrap_or(0);
+        let len = frame.len();
+        let (cell, what) = match prov {
+            Provenance::Originated => (&self.originated_partial, "OUR OWN"),
+            Provenance::Relayed => (&self.relayed_partial, "a relayed"),
+        };
+        let n = cell.fetch_add(1, Ordering::Relaxed) + 1;
+        // Partial delivery is not a lost frame — the mesh may still carry it —
+        // so this is rate-limited on both paths. It is logged at all because
+        // "our block reached 3 of 60 peers" is the shape of the 2026-08-21
+        // incident and nothing in this node could see it.
+        if n.is_power_of_two() {
+            eprintln!(
+                "net: {what} frame type 0x{tag:02x} len {len} B reached {accepted} peer(s), \
+                 {refused} refused it — {n} partial broadcast(s) since boot"
+            );
+        }
+    }
+}
 
 const INBOUND_QUEUE_DEPTH: usize = 256;
 
@@ -175,21 +511,71 @@ pub struct DevnetMesh {
     /// Pushing on inbound connections costs nothing — the socket is already
     /// open and the peer is already reading it.
     inbound: Arc<Mutex<Vec<SyncSender<Vec<u8>>>>>,
+    /// Frames this mesh could not put on any wire. See [`BroadcastDrops`].
+    drops: Arc<BroadcastDrops>,
 }
 
 impl DevnetMesh {
     /// Broadcast one frame (type byte + payload, no length prefix) to every
     /// peer, dialed or dialing.
-    pub fn broadcast(&self, frame: Vec<u8>) {
+    ///
+    /// Returns false when the frame reached NO peer. Every send here used to be
+    /// `let _ = p.send(...)`: a node whose peers had all gone away, or which had
+    /// none, published its own blocks into a closed sender and said nothing.
+    /// The result is now counted and — for frames this node originated —
+    /// logged, every time.
+    pub fn broadcast(&self, frame: Vec<u8>, prov: Provenance) -> bool {
+        let mut accepted = 0usize;
+        let mut refused = 0usize;
         for p in &self.peers {
-            let _ = p.send(frame.clone());
+            match p.send(frame.clone()) {
+                Ok(()) => accepted += 1,
+                // The dialer thread for this peer has exited. It respawns on
+                // reconnect, so the sender stays in the list; the frame is
+                // simply gone.
+                Err(_) => refused += 1,
+            }
         }
         // `retain` both sends and prunes: a closed receiver is a connection
         // whose writer thread has exited, and keeping its sender would leak one
         // entry per reconnect for as long as the node runs.
         if let Ok(mut inbound) = self.inbound.lock() {
-            inbound.retain(|p| !matches!(p.try_send(frame.clone()), Err(TrySendError::Disconnected(_))));
+            inbound.retain(|p| match p.try_send(frame.clone()) {
+                Ok(()) => {
+                    accepted += 1;
+                    true
+                }
+                // A full queue is a peer that is not reading fast enough. It
+                // keeps its slot — it is alive — but this frame is lost to it,
+                // and that is the loss the old code could not see.
+                Err(TrySendError::Full(_)) => {
+                    refused += 1;
+                    true
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    refused += 1;
+                    false
+                }
+            });
         }
+        if accepted == 0 {
+            let reason = if refused == 0 {
+                "no peer is connected"
+            } else {
+                "every peer refused it (queue full or connection gone)"
+            };
+            self.drops.lost(prov, &frame, reason, refused);
+            return false;
+        }
+        if refused > 0 {
+            self.drops.partial(prov, &frame, accepted, refused);
+        }
+        true
+    }
+
+    /// Counters for frames this mesh failed to put on the wire.
+    pub fn drops(&self) -> &Arc<BroadcastDrops> {
+        &self.drops
     }
 }
 
@@ -205,21 +591,25 @@ impl DevnetMesh {
 /// attestation is re-gossiped by its author's next broadcast. Losing one costs
 /// a round trip. Keeping all of them costs the process.
 ///
+/// The size is measured HERE, once, and travels with the event as a [`Charge`].
+/// Nothing downstream measures it again: the engine refunds by dropping the
+/// charge, so the number returned is by construction the number reserved.
+///
 /// Returns false when the engine is gone, so callers can stop their thread.
-fn send_to_engine(
+pub(crate) fn send_to_engine(
     events: &Sender<EngineEvent>,
-    inflight: &Arc<std::sync::atomic::AtomicUsize>,
+    budget: &Arc<EngineBudget>,
     ev: NetEvent,
 ) -> bool {
-    if inflight.load(Ordering::Acquire) >= ENGINE_QUEUE_CAP {
+    let class = Class::of(&ev);
+    let Some(charge) = budget.charge(class, event_bytes(&ev)) else {
+        budget.note_shed(class);
         return true; // shed, but the connection stays healthy
-    }
-    inflight.fetch_add(1, Ordering::AcqRel);
-    if events.send(EngineEvent::Net(ev)).is_err() {
-        inflight.fetch_sub(1, Ordering::AcqRel);
-        return false;
-    }
-    true
+    };
+    // On `SendError` the event — and the charge inside it — is handed back and
+    // dropped here, which refunds the reservation. No manual undo, and no path
+    // that forgets one.
+    events.send(EngineEvent::Net(ev, charge)).is_ok()
 }
 
 pub fn block_frame(env: &BlockEnvelope) -> Vec<u8> {
@@ -356,7 +746,7 @@ pub fn start(
     events: Sender<EngineEvent>,
     data_dir: PathBuf,
     head_slot: Arc<AtomicU64>,
-    inflight: Arc<std::sync::atomic::AtomicUsize>,
+    budget: Arc<EngineBudget>,
 ) -> std::io::Result<DevnetMesh> {
     // Inbound: accept, then per-connection: read frames; data frames go to
     // the engine, get-blocks is answered in place from the log.
@@ -366,7 +756,7 @@ pub fn start(
         let events = events.clone();
         let data_dir = data_dir.clone();
         let inbound = inbound.clone();
-        let inflight = inflight.clone();
+        let budget = budget.clone();
         thread::spawn(move || {
             for conn in listener.incoming() {
                 let Ok(sock) = conn else { continue };
@@ -398,7 +788,7 @@ pub fn start(
 
                 let events = events.clone();
                 let data_dir = data_dir.clone();
-                let inflight = inflight.clone();
+                let budget = budget.clone();
                 let mut rsock = rsock;
                 thread::spawn(move || loop {
                     match read_frame(&mut rsock) {
@@ -406,7 +796,7 @@ pub fn start(
                             if frame.first() == Some(&FRAME_GET_BLOCKS) {
                                 serve_get_blocks(&wsock, &data_dir, &frame);
                             } else if let Some(ev) = decode_event(&frame) {
-                                if !send_to_engine(&events, &inflight, ev) {
+                                if !send_to_engine(&events, &budget, ev) {
                                     return;
                                 }
                             }
@@ -432,7 +822,7 @@ pub fn start(
         let events = events.clone();
         let head_slot = head_slot.clone();
         let sync_slots = sync_slots.clone();
-        let inflight = inflight.clone();
+        let budget = budget.clone();
         thread::spawn(move || loop {
             let Ok(sock) = TcpStream::connect(&addr) else {
                 thread::sleep(Duration::from_millis(300));
@@ -442,12 +832,12 @@ pub fn start(
             // Reader half: the peer answers our get-blocks on this socket.
             if let Ok(mut rsock) = wsock.try_clone() {
                 let events = events.clone();
-                let inflight = inflight.clone();
+                let budget = budget.clone();
                 thread::spawn(move || loop {
                     match read_frame(&mut rsock) {
                         Ok(frame) => {
                             if let Some(ev) = decode_event(&frame) {
-                                if !send_to_engine(&events, &inflight, ev) {
+                                if !send_to_engine(&events, &budget, ev) {
                                     return;
                                 }
                             }
@@ -536,5 +926,5 @@ pub fn start(
         });
     }
 
-    Ok(DevnetMesh { peers, inbound })
+    Ok(DevnetMesh { peers, inbound, drops: Arc::new(BroadcastDrops::default()) })
 }

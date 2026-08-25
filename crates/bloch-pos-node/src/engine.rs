@@ -79,7 +79,7 @@ use bloch_pos_committee::{committees, derive, epoch_of, schedule};
 
 use crate::genesis::{Manifest, GENESIS_MIX};
 use crate::keys::{HybridVerifier, Keystore, ProbeVerifier};
-use crate::net::{self, NetEvent, Origin, Verdict};
+use crate::net::{self, Charge, EngineBudget, NetEvent, Origin, Provenance, Verdict};
 use crate::rpc::{self, Admitted, Finality, Json, RpcCall, RpcError, RpcRequest, RpcResult};
 use crate::store::Store;
 
@@ -90,8 +90,93 @@ use crate::store::Store;
 /// state — rather than from a copy kept alongside it — is why this wrapper
 /// exists; see [`crate::rpc::EngineBackend`].
 pub enum EngineEvent {
-    Net(NetEvent),
+    /// A network event, and the byte reservation it holds against
+    /// [`EngineBudget`]. The [`Charge`] is carried WITH the event so the engine
+    /// refunds exactly what the transport reserved, without measuring anything
+    /// a second time — see [`crate::net::Charge`].
+    Net(NetEvent, Charge),
     Rpc(RpcCall),
+}
+
+/// Events one tick of the slot loop may take off the engine channel.
+///
+/// **What this bounds.** The drain used to be `while let Ok(more) =
+/// rx.try_recv() { pending.push(more) }` — it emptied the whole channel before
+/// returning to slot duties. A node being fed a steady stream (a peer serving
+/// it a 512-block sync page, or 64 validators attesting) therefore postponed
+/// attesting and proposing for as long as the stream lasted, which on a node
+/// applying blocks at ~0.6 s each is minutes.
+///
+/// **This value is a guess and is meant to be measured.** The measurement, not
+/// the reasoning here, decides it. Override it without rebuilding by setting
+/// `BLOCH_MAX_EVENTS_PER_TICK`; `BLOCH_MAX_EVENTS_PER_TICK=0` restores the old
+/// unbounded drain exactly, which is the control arm of that experiment.
+///
+/// The reasoning it is a guess FROM: a smaller bound does not cost throughput
+/// the way it looks like it should. `recv_timeout` only waits when the channel
+/// is EMPTY, so a backed-up channel is drained `MAX_ENGINE_EVENTS_PER_TICK`
+/// events per loop iteration with only a handful of cheap slot-duty
+/// comparisons between iterations — not one batch per 500 ms tick. What the
+/// bound really buys is a ceiling on how long duties are postponed, and what it
+/// costs is that ceiling times the per-event handling cost. At the replay cost
+/// of 0.59 s per block, 32 blocks is still ~19 s of postponed duties, so if the
+/// benchmark measures live ingest anywhere near that, this number should come
+/// down rather than up.
+///
+/// NOTE for whoever measures: boot replay does NOT pass through this channel
+/// (it is a plain loop over the block log), so this bound cannot affect restart
+/// replay at all. Only live and sync ingest reach it.
+pub const MAX_ENGINE_EVENTS_PER_TICK: usize = 32;
+
+/// The bound in force, read once per process.
+///
+/// `BLOCH_MAX_EVENTS_PER_TICK` overrides [`MAX_ENGINE_EVENTS_PER_TICK`], and
+/// `0` means unbounded — the pre-WP3 behaviour, kept reachable so the two arms
+/// of the measurement are the same binary.
+fn max_engine_events_per_tick() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| match std::env::var("BLOCH_MAX_EVENTS_PER_TICK") {
+        Err(_) => MAX_ENGINE_EVENTS_PER_TICK,
+        Ok(v) => match v.trim().parse::<usize>() {
+            Ok(0) => {
+                println!("engine: BLOCH_MAX_EVENTS_PER_TICK=0 — the drain is UNBOUNDED this run");
+                usize::MAX
+            }
+            Ok(n) => {
+                println!("engine: draining at most {n} events per tick (BLOCH_MAX_EVENTS_PER_TICK)");
+                n
+            }
+            Err(_) => {
+                eprintln!(
+                    "engine: BLOCH_MAX_EVENTS_PER_TICK={v:?} is not a number — \
+                     using {MAX_ENGINE_EVENTS_PER_TICK}"
+                );
+                MAX_ENGINE_EVENTS_PER_TICK
+            }
+        },
+    })
+}
+
+/// Take `first` plus up to `max - 1` more events off the channel.
+///
+/// A free function of its inputs so the bound can be tested at any value
+/// without a node, a clock or an environment variable — including
+/// `usize::MAX`, which must behave exactly like the unbounded drain it
+/// replaces.
+fn drain_pending(
+    rx: &mpsc::Receiver<EngineEvent>,
+    first: EngineEvent,
+    max: usize,
+) -> Vec<EngineEvent> {
+    let mut pending = Vec::with_capacity(max.min(64));
+    pending.push(first);
+    while pending.len() < max {
+        match rx.try_recv() {
+            Ok(more) => pending.push(more),
+            Err(_) => break,
+        }
+    }
+    pending
 }
 
 /// Which transport the node runs.
@@ -2213,11 +2298,12 @@ pub fn run(cfg: Config) -> io::Result<()> {
 
     let logged = store.read_all()?;
     let head_slot = Arc::new(AtomicU64::new(0));
-    // Network events queued but not yet handled. The transport reads it to
-    // decide when to shed rather than queue — see `net::send_to_engine`. It is
-    // decremented below, after each event is actually processed, so "in flight"
-    // means exactly that and not "ever sent".
-    let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // BYTES of network events queued but not yet handled — not events. The
+    // transport reads it to decide when to shed rather than queue; see
+    // `net::send_to_engine`. It is refunded below, after each event is actually
+    // processed and not on dequeue, so "in flight" means exactly that and not
+    // "ever sent".
+    let budget = EngineBudget::new();
     let (tx, rx) = mpsc::channel::<EngineEvent>();
     // The transports speak NetEvent and know nothing about the RPC; the engine
     // consumes one channel. Rather than teach both transports the engine's
@@ -2227,9 +2313,18 @@ pub fn run(cfg: Config) -> io::Result<()> {
     let (net_tx, net_rx) = mpsc::channel::<NetEvent>();
     {
         let tx = tx.clone();
+        let budget = budget.clone();
         std::thread::spawn(move || {
             for ev in net_rx {
-                if tx.send(EngineEvent::Net(ev)).is_err() {
+                // Through the same charge/shed helper the devnet mesh uses.
+                // Before this, libp2p events were queued UNCHARGED and then
+                // refunded on the way out by a drain that decremented for every
+                // `EngineEvent::Net` it saw — so on the libp2p transport the
+                // counter ran below zero and wrapped to `usize::MAX` on the
+                // first event. Nothing read it on that path, so it was latent;
+                // charging here makes the budget mean the same thing on both
+                // transports, and the `Charge` makes the refund match.
+                if !net::send_to_engine(&tx, &budget, ev) {
                     return; // engine gone; nothing left to deliver to
                 }
             }
@@ -2243,7 +2338,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
             tx.clone(),
             cfg.data_dir.clone(),
             head_slot.clone(),
-            inflight.clone(),
+            budget.clone(),
         )?),
         Transport::Libp2p => {
             let parse = |s: &str, what: &str| -> io::Result<crate::p2p::Multiaddr> {
@@ -2549,27 +2644,35 @@ pub fn run(cfg: Config) -> io::Result<()> {
         let wait = next_deadline.saturating_sub(now_ms()).clamp(1, 500);
         match rx.recv_timeout(Duration::from_millis(wait)) {
             Ok(ev) => {
-                let mut pending = vec![ev];
-                while let Ok(more) = rx.try_recv() {
-                    pending.push(more);
-                }
+                // BOUNDED, where this used to drain the channel dry. See
+                // `MAX_ENGINE_EVENTS_PER_TICK`. The interaction with the byte
+                // budget is real and worth naming: bounding the drain slows the
+                // refund rate, so under a flood the budget fills sooner and the
+                // transport sheds sooner. That is the trade being made — shed a
+                // recoverable frame, keep the slot.
+                let pending = drain_pending(&rx, ev, max_engine_events_per_tick());
                 for ev in pending {
-                    // Every `EngineEvent::Net` was counted into `inflight` by
-                    // the transport; releasing it here — after handling, not on
-                    // dequeue — is what makes the cap mean "work the engine has
-                    // not done yet".
-                    if matches!(ev, EngineEvent::Net(_)) {
-                        inflight.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-                    }
                     match ev {
-                        EngineEvent::Net(NetEvent::Block(env)) => engine.ingest(env),
-                        EngineEvent::Net(NetEvent::Attestation(att, origin)) => {
-                            engine.on_attestation(att, origin, wall_epoch)
-                        }
-                        EngineEvent::Net(NetEvent::Transaction(tx)) => {
-                            // Gossip has nobody to answer to; the verdict is the
-                            // RPC's concern, not a peer's.
-                            let _ = engine.on_transaction(tx);
+                        EngineEvent::Net(net_ev, charge) => {
+                            // `charge` is bound to a NAME and dropped explicitly
+                            // AFTER the handler runs. Two reasons: the budget
+                            // must mean "work the engine has not done yet", not
+                            // "work it has not dequeued yet"; and a binding
+                            // named `_` would drop immediately, refunding before
+                            // the work — a one-character difference with the
+                            // whole property in it.
+                            match net_ev {
+                                NetEvent::Block(env) => engine.ingest(env),
+                                NetEvent::Attestation(att, origin) => {
+                                    engine.on_attestation(att, origin, wall_epoch)
+                                }
+                                NetEvent::Transaction(tx) => {
+                                    // Gossip has nobody to answer to; the
+                                    // verdict is the RPC's concern, not a peer's.
+                                    let _ = engine.on_transaction(tx, Provenance::Relayed);
+                                }
+                            }
+                            drop(charge);
                         }
                         EngineEvent::Rpc(call) => {
                             let result = engine.serve_rpc(call.req);
