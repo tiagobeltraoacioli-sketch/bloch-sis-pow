@@ -4505,6 +4505,111 @@ mod wp11_select_break {
             "control: without the poison all five select at the live cap"
         );
     }
+
+    /// **REACHABILITY, measured per entry path — and the RPC door is SHUT
+    /// at the live cap.**
+    ///
+    /// `sendrawtransaction` takes the canonical bytes as HEX (rpc.rs
+    /// `route`, the "sendrawtransaction" arm) and the HTTP body is capped at
+    /// `rpc::MAX_BODY_BYTES` = 1 MiB, rejected with 413 on Content-Length
+    /// alone, before the body is read (rpc.rs:1111). To trip the byte cap a
+    /// transaction must EXCEED it, so at the live cap every possible poison
+    /// is at least 524,289 binary bytes = at least 1,048,578 hex characters
+    /// — already more than the whole body allowance, before the JSON
+    /// envelope. That is an inequality over the two constants, so it holds
+    /// for EVERY poison and not merely for the witness built below.
+    ///
+    /// Gossip is the open door: `net.rs:268` admits any frame up to
+    /// `codec::MAX_FIELD_LEN` = 8 MiB, and `on_transaction` re-broadcasts the
+    /// full canonical bytes to every peer, so one delivery poisons the mesh.
+    ///
+    /// Sizes are MEASURED, never computed. A hybrid signature is
+    /// VARIABLE-LENGTH (Falcon-1024 is randomised), so two encodings of the
+    /// "same" transaction differ by a byte or two; an earlier revision of
+    /// this test derived the per-output cost from two samples, read that
+    /// jitter as part of the per-output term, and built a poison that missed
+    /// the cap. Everything below is sized by growing a real transaction
+    /// until a real measurement clears the bound.
+    #[test]
+    fn rpc_body_cap_shuts_the_rpc_door_at_the_live_cap_but_not_gossip() {
+        use bloch_pos_committee::fee_market::max_block_tx_bytes;
+        use bloch_pos_committee::params::BLOCK_BYTES_V2_ACTIVATION_EPOCH;
+
+        let live_cap = max_block_tx_bytes(BLOCK_BYTES_V2_ACTIVATION_EPOCH);
+        let old_cap = max_block_tx_bytes(0);
+        assert_eq!((live_cap, old_cap), (524_288, 262_144), "the two caps");
+
+        // THE CATEGORICAL CLAIM, over constants only: any transaction big
+        // enough to trip the live cap is too big to be sent as hex through
+        // the RPC body limit. No witness can escape this.
+        assert!(
+            2 * (live_cap as usize + 1) > crate::rpc::MAX_BODY_BYTES,
+            "RPC hex of the SMALLEST possible live-cap poison ({}) must \
+             exceed MAX_BODY_BYTES ({})",
+            2 * (live_cap as usize + 1),
+            crate::rpc::MAX_BODY_BYTES,
+        );
+
+        // A witness, grown by measurement until it really clears a bound.
+        // Each output costs value(8) + script_hash(32) = 40 B.
+        let grow_past = |bound: u64| -> (usize, usize) {
+            let mut n = (bound as usize / 40) + 8;
+            loop {
+                let len = signed_transfer(0x00, n).canonical_bytes().len();
+                if len as u64 > bound {
+                    return (n, len);
+                }
+                n += ((bound as usize + 1 - len).div_ceil(40)).max(1);
+            }
+        };
+
+        let (n, bin) = grow_past(live_cap);
+        let hex = bin * 2;
+        println!(
+            "live-cap poison: {n} outputs, {bin} B binary, {hex} hex chars \
+             (live cap {live_cap}, MAX_BODY_BYTES {}, MAX_FIELD_LEN {})",
+            crate::rpc::MAX_BODY_BYTES,
+            crate::codec::MAX_FIELD_LEN,
+        );
+        assert!(bin as u64 > live_cap, "the witness must exceed the live cap");
+        // THE RPC DOOR: shut.
+        assert!(
+            hex > crate::rpc::MAX_BODY_BYTES,
+            "RPC cannot carry it: {hex} hex chars vs body cap {}",
+            crate::rpc::MAX_BODY_BYTES,
+        );
+        // THE GOSSIP DOOR: open, with 16x room.
+        assert!(
+            bin < crate::codec::MAX_FIELD_LEN,
+            "gossip must carry it: {bin} B vs frame cap {}",
+            crate::codec::MAX_FIELD_LEN,
+        );
+        // And it is admitted, therefore re-broadcast to every peer.
+        assert!(
+            admissible(&signed_transfer(0x00, n), BLOCK_BYTES_V2_ACTIVATION_EPOCH).is_ok(),
+            "the poison must be admissible at the live epoch"
+        );
+
+        // THE CONTROL, and the reason this is a flag-day story: under the OLD
+        // 256 KiB cap the same attack fits the 1 MiB body comfortably, so
+        // before epoch 800 this WAS reachable by one unauthenticated HTTP
+        // request. The flag day that doubled the cap is what closed the RPC
+        // door — incidentally, not by design.
+        let (n_old, bin_old) = grow_past(old_cap);
+        println!(
+            "old-cap poison: {n_old} outputs, {bin_old} B binary, {} hex chars \
+             — fits the 1 MiB body",
+            bin_old * 2
+        );
+        assert!(bin_old as u64 > old_cap);
+        assert!(
+            bin_old * 2 < crate::rpc::MAX_BODY_BYTES,
+            "under the old cap the RPC door was OPEN: {} hex chars vs {}",
+            bin_old * 2,
+            crate::rpc::MAX_BODY_BYTES,
+        );
+    }
+
 }
 
 /// What the deleted work actually cost, on a state the size the fleet runs.
