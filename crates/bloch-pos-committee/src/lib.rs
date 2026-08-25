@@ -116,6 +116,12 @@ pub mod params;
 // Instrumentation only, and compiled out unless `perf-timing` is on — see
 // the module docs. No consensus rule reads it.
 pub mod perf;
+// The relaunch proof harness (scenarios 1-4 + their mutations). Test-only:
+// the module carries a mutation switch that flips committee membership back
+// to the pre-fix behaviour, and that switch must not be able to exist in a
+// shipped binary. Entry point: `scripts/prova-relanca.sh`.
+#[cfg(test)]
+mod prova;
 pub mod produce;
 pub mod tokenomics_v4;
 pub mod rewards;
