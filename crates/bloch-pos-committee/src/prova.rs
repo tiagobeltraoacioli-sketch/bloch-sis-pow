@@ -94,18 +94,28 @@ static HOOK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 pub fn partition_step8(seed: &[u8; 32], epoch: u64, consensus_roster: &[Validator]) -> Vec<Vec<u32>> {
     if mutation::PRE_FIX_FILTER.load(Relaxed) {
         // BROKEN — and this is not a re-implementation of the broken code, it
-        // IS the broken code: today's production function, called on today's
-        // production input.
-        return committees::epoch_committees(seed, epoch, consensus_roster);
+        // IS the broken code: the production function with the pre-shuffle
+        // filter put back through the production mutation switch.
+        //
+        // REWIRED ON INTEGRATION, and the reason matters. This branch used to
+        // just call `epoch_committees`, because at the time that function still
+        // filtered `effective_stake > 0` before the shuffle. Dev A's fix
+        // removed that filter, so the plain call stopped being broken — and
+        // every disease and mutation assertion in this module went green-side
+        // up, i.e. RED, reporting that the mechanism did not exist. The switch
+        // is how the defect is reached now that the defect is gone from the
+        // shipped path. `RESTORE_ZERO_STAKE_FILTER` is thread-local, so this
+        // cannot leak into a test running beside it.
+        use std::sync::atomic::Ordering::Relaxed as R;
+        crate::params::rehearsal::RESTORE_ZERO_STAKE_FILTER.store(true, R);
+        let broken = committees::epoch_committees(seed, epoch, consensus_roster);
+        crate::params::rehearsal::RESTORE_ZERO_STAKE_FILTER.store(false, R);
+        return broken;
     }
-    // THE CONTRACT (pending Dev A). Same production function, stakes
-    // normalised so the pre-shuffle filter cannot remove anyone — which is
-    // what deleting the filter does. Membership = f(seed, epoch, index set).
-    let by_index: Vec<Validator> = consensus_roster
-        .iter()
-        .map(|v| Validator { index: v.index, effective_stake: 1 })
-        .collect();
-    committees::epoch_committees(seed, epoch, &by_index)
+    // THE CONTRACT, now Dev A's shipped behaviour rather than a model of it:
+    // the production function, called on the production input, with no filter
+    // in front of the shuffle. Membership = f(seed, epoch, index set).
+    committees::epoch_committees(seed, epoch, consensus_roster)
 }
 
 /// The partition the **epoch boundary** tallies against. Unconditional: this

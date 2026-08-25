@@ -8844,6 +8844,206 @@ mod tests {
                  seeds it from the genesis mix"
             );
         }
+
+        // ── The duplicate proposer: one slot, two proposers, no partition ───
+
+        /// **Mainnet slot 32297 (epoch 1009) reproduced: two proposers, one
+        /// slot, and neither node is isolated.**
+        ///
+        /// Two nodes hold the SAME block set — every block of both branches,
+        /// asserted below — and still derive different proposers for the same
+        /// slot. That is the shape of the live incident: `getblockbyid`
+        /// answered in both directions, so the split was never a partition.
+        /// Possession is irrelevant because the schedule is read off the
+        /// node's own HEAD and nothing else.
+        ///
+        /// # Why the existing partition test does not cover this
+        ///
+        /// `nothing_in_the_previous_epoch_can_move_an_epochs_seed` stops at
+        /// `committees::committee_for_slot`. Since 2026-08-24 that partition's
+        /// membership is a pure function of `(seed, epoch, index set)` and
+        /// cannot see stake at all. The PROPOSER draw (`sample::sample`) is
+        /// stake-WEIGHTED and additionally filters `effective_stake > 0`, so
+        /// it reads two inputs the partition is blind to. A green partition
+        /// test therefore says nothing about the proposer — which is exactly
+        /// how mainnet produced two blocks for one slot with that test green.
+        ///
+        /// # The call chain is the transition's own
+        ///
+        /// Step 4 of `compute_post_state` (transition.rs) is:
+        ///
+        /// ```text
+        /// let roster = st.consensus_roster_at(st.epoch);
+        /// let seed   = st.seed_for_epoch(st.epoch);
+        /// match schedule::proposer(&seed, header.slot, &roster) { ... }
+        /// ```
+        ///
+        /// The three calls below are those three, in that order, on states the
+        /// real transition produced. `Engine::propose` composes the identical
+        /// three — `rolled.active_validators()` IS
+        /// `consensus_roster_at(self.epoch)` — which is why producer and
+        /// validator agree on each branch and only the branches disagree.
+        #[test]
+        fn one_slot_must_not_have_two_proposers_across_a_fork_in_the_previous_epoch() {
+            // The rule under test ships INERT behind ANCESTRY_SEED_ACTIVATION_EPOCH;
+            // open it for this thread so the property is not dead code.
+            let _gates = crate::params::rehearsal::gates_open_guard();
+
+            const E: u64 = 4;
+            let head_slot = E * SLOTS_PER_EPOCH;
+            // The divergence lives ENTIRELY inside E-1 (epoch 3 = slots 96..=127).
+            let withheld = [101u64, 109, 118];
+            for w in withheld {
+                assert_eq!(crate::epoch_of(w), E - 1, "the divergence must live in E-1");
+            }
+
+            let ca = chain(8, head_slot, &[]);
+            let cb = chain(8, head_slot, &withheld);
+            let a = &ca.states[head_slot as usize];
+            let b = &cb.states[head_slot as usize];
+            assert_eq!(a.epoch, E);
+            assert_eq!(b.epoch, E);
+
+            // ── NOT A PARTITION: both nodes hold every block of both branches
+            //
+            // The live incident's defining feature. If this test modelled the
+            // split as missing data it would be reproducing a different bug.
+            let only_a = ca.blocks_up_to(head_slot);
+            let only_b = cb.blocks_up_to(head_slot);
+            let mut held = only_a.clone();
+            held.extend(only_b.clone());
+            assert!(
+                held.len() > only_a.len() && held.len() > only_b.len(),
+                "control: the union must be strictly larger than either branch, or the two \
+                 nodes are not holding anything of each other's"
+            );
+            for (id, _) in only_a.iter().chain(only_b.iter()) {
+                assert!(
+                    held.contains_key(id),
+                    "control: both nodes must be able to answer getblockbyid for every block \
+                     of both branches — the live incident was NOT an isolation"
+                );
+            }
+
+            // ── Controls on the fork's shape ────────────────────────────────
+            assert_eq!(
+                a.boundary_mixes.get(&(E - 2)),
+                b.boundary_mixes.get(&(E - 2)),
+                "control: the branches must share history to the close of E-2"
+            );
+            assert_ne!(
+                a.boundary_mixes.get(&(E - 1)),
+                b.boundary_mixes.get(&(E - 1)),
+                "control: E-1 must really have diverged, or the property is vacuous"
+            );
+            assert_ne!(
+                a.head.as_bytes(),
+                b.head.as_bytes(),
+                "control: the two branches must be different chains"
+            );
+
+            // ── Input 1 of 2: the ROSTER. Measured, never assumed ───────────
+            //
+            // `sample` filters `effective_stake > 0` and weights by stake, so
+            // the roster is a live input to the draw even when the committee
+            // partition cannot see it. If the branches disagree here, the seed
+            // gate alone cannot fix the duplicate proposer, and this test must
+            // say so rather than pass for the wrong reason.
+            let roster_a = a.consensus_roster_at(E);
+            let roster_b = b.consensus_roster_at(E);
+            let stake_a: u128 = roster_a.iter().map(|v| v.effective_stake as u128).sum();
+            let stake_b: u128 = roster_b.iter().map(|v| v.effective_stake as u128).sum();
+            eprintln!(
+                "\nROSTER CHANNEL at epoch {E}: A has {} entries / {stake_a} sat, \
+                 B has {} entries / {stake_b} sat — {}",
+                roster_a.len(),
+                roster_b.len(),
+                if roster_a == roster_b { "IDENTICAL" } else { "DIFFERENT" },
+            );
+            assert_eq!(
+                roster_a, roster_b,
+                "the ROSTER differs across the fork, so the seed is not the only input to the \
+                 proposer draw and arming ANCESTRY_SEED_ACTIVATION_EPOCH cannot on its own \
+                 stop a slot having two proposers. Report this instead of pinning the seed."
+            );
+
+            // ── Input 2 of 2: the SEED, through the shipped reader ──────────
+            let seed_a = a.seed_for_epoch(E);
+            let seed_b = b.seed_for_epoch(E);
+            eprintln!(
+                "SEED CHANNEL at epoch {E}: close(E-2) {} == {} ; close(E-1) {} != {} ; \
+                 seed(E) {} vs {}",
+                hex8(a.boundary_mixes.get(&(E - 2)).unwrap()),
+                hex8(b.boundary_mixes.get(&(E - 2)).unwrap()),
+                hex8(a.boundary_mixes.get(&(E - 1)).unwrap()),
+                hex8(b.boundary_mixes.get(&(E - 1)).unwrap()),
+                hex8(&seed_a),
+                hex8(&seed_b),
+            );
+
+            // ── THE PROPERTY: one proposer per slot, on both branches ───────
+            let first = E * SLOTS_PER_EPOCH;
+            let mut split: Vec<(u64, Option<u32>, Option<u32>)> = Vec::new();
+            for s in first..first + SLOTS_PER_EPOCH {
+                let pa = schedule::proposer(&seed_a, s, &roster_a);
+                let pb = schedule::proposer(&seed_b, s, &roster_b);
+                if pa != pb {
+                    split.push((s, pa, pb));
+                }
+            }
+            assert!(
+                split.is_empty(),
+                "DUPLICATE PROPOSER: {} of {SLOTS_PER_EPOCH} slots of epoch {E} draw a \
+                 different proposer on the two branches, so each branch's node proposes and \
+                 each block is valid against its own parent — mainnet slot 32297, exactly. \
+                 First few: {:?}",
+                split.len(),
+                &split[..split.len().min(4)],
+            );
+
+            // ── THE MUTATION, in the same run ───────────────────────────────
+            //
+            // Revert the look-ahead to zero on this thread — i.e. put back the
+            // rule the fleet runs TODAY, where the seed for E is the close of
+            // E-1, the boundary the control above proved diverged. The same
+            // states must now hand the same slot two proposers. A mutation
+            // that does not change the outcome is not a mutation.
+            let (mut_seed_a, mut_seed_b) = crate::params::rehearsal::with_lookahead_zero(|| {
+                (a.seed_for_epoch(E), b.seed_for_epoch(E))
+            });
+            let mut mutant_split: Vec<(u64, Option<u32>, Option<u32>)> = Vec::new();
+            for s in first..first + SLOTS_PER_EPOCH {
+                let pa = schedule::proposer(&mut_seed_a, s, &roster_a);
+                let pb = schedule::proposer(&mut_seed_b, s, &roster_b);
+                if pa != pb {
+                    mutant_split.push((s, pa, pb));
+                }
+            }
+            eprintln!(
+                "MUTANT (look-ahead 0 = the rule the fleet runs today): seed(E) {} vs {}; \
+                 {} of {SLOTS_PER_EPOCH} slots have TWO proposers. First few: {:?}",
+                hex8(&mut_seed_a),
+                hex8(&mut_seed_b),
+                mutant_split.len(),
+                &mutant_split[..mutant_split.len().min(4)],
+            );
+            assert!(
+                !mutant_split.is_empty(),
+                "the mutation did not bite: with the look-ahead reverted to zero the reader \
+                 takes the close of epoch {}, which the two branches disagree about. If every \
+                 slot still draws one proposer, the assertion above is not measuring the \
+                 proposer and this test is worthless.",
+                E - 1,
+            );
+            // The switch must be off again — a leaked mutation would silently
+            // corrupt every test that runs after this one on this thread.
+            assert_eq!(
+                a.seed_for_epoch(E),
+                seed_a,
+                "with_lookahead_zero leaked: the rule is still mutated after it returned"
+            );
+        }
+
     }
 }
 
