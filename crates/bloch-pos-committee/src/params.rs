@@ -144,9 +144,9 @@ pub const INACTIVITY_LEAK_RECOVERY_QUOTIENT: u64 = 16;
 /// more than half the stake. Which of those two the chain wants is a founder
 /// decision about safety versus liveness, not an implementation detail, and
 /// it is one constant away.
-pub const MIN_QUORUM_DENOMINATOR_NUM: u128 = 1;
+pub const MIN_QUORUM_DENOMINATOR_NUM: u128 = 3;
 /// Denominator of [`MIN_QUORUM_DENOMINATOR_NUM`].
-pub const MIN_QUORUM_DENOMINATOR_DEN: u128 = 2;
+pub const MIN_QUORUM_DENOMINATOR_DEN: u128 = 4;
 
 /// Flag-day epoch at which the inactivity leak starts reaching the **duty
 /// roster**, and not only the quorum denominator.

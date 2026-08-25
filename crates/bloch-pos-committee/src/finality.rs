@@ -1350,7 +1350,7 @@ mod tests {
         // Now the boundary tally, against the UNLEAKED roster — the real
         // production function, the real seed, the real partition filter.
         let mut accepted = Vec::new();
-        let ev = votes_from_partition(epoch, &duty, &atts, &seed, &mut accepted);
+        let ev = votes_from_partition(epoch, &duty, &duty, &atts, &seed, &mut accepted);
         let survived = ev.attestations.len();
         println!(
             "ROSTER SPLIT: step 8 admitted {admitted} honest attestations; the boundary \
@@ -1376,7 +1376,7 @@ mod tests {
         // The control: feed step 8's own roster to the boundary and the same
         // votes justify immediately. The divergence is the roster, nothing else.
         let mut accepted2 = Vec::new();
-        let ev2 = votes_from_partition(epoch, &consensus, &atts, &seed, &mut accepted2);
+        let ev2 = votes_from_partition(epoch, &consensus, &consensus, &atts, &seed, &mut accepted2);
         assert_eq!(ev2.attestations.len(), admitted, "control: same roster keeps every vote");
         let mut st2 = FinalityState::new(genesis());
         let out2 = st2.process_epoch(&ev2).unwrap();
@@ -1521,4 +1521,117 @@ mod tests_hook {
     pub(super) static DISABLE_DENOMINATOR_FLOOR: AtomicBool = AtomicBool::new(false);
     /// Reproduce the pre-fix accumulator: monotonic, never recovers.
     pub(super) static DISABLE_LEAK_RECOVERY: AtomicBool = AtomicBool::new(false);
+}
+
+#[cfg(test)]
+mod pmo_lab_arithmetic {
+    use super::*;
+
+    const G: [u8; 32] = [0xAA; 32];
+    fn genesis() -> Checkpoint { Checkpoint { epoch: 0, root: G } }
+    fn root(n: u8) -> [u8; 32] { [n; 32] }
+    fn validator(index: u32, effective_stake: u64) -> Validator {
+        Validator { index, effective_stake }
+    }
+    fn vote(v: u32, epoch: u64, target: [u8; 32], source: Checkpoint) -> (u32, AttestationData) {
+        (v, AttestationData {
+            slot: epoch * crate::params::SLOTS_PER_EPOCH,
+            head: target,
+            source_epoch: source.epoch,
+            source_root: source.root,
+            target_epoch: epoch,
+            target_root: target,
+        })
+    }
+
+    /// The laboratory's REAL stake split, measured off a running devnet.
+    ///
+    /// The lab calls it a "6/2 split" and that is a count of NODES, not of
+    /// stake. `keygen` hands out wildly unequal bonds - v7 carries 8.5x v0 -
+    /// so the two nodes everyone called "the minority" actually hold
+    /// **52.47%** of the network and the six-node side holds 47.53%.
+    ///
+    /// That is what made the floor look useless. A floor of 1/2 caps how far
+    /// the leak may shrink the denominator, so the smallest self-justifying
+    /// set becomes `2/3 x 1/2 = 1/3` of the original stake. BOTH sides clear
+    /// one third, so BOTH still justify, and two conflicting finalized
+    /// checkpoints is exactly the safety violation the floor was added to
+    /// prevent.
+    ///
+    /// The general rule this pins: two DISJOINT sets can both justify unless
+    /// `2/3 x floor > 1/2`, i.e. unless **floor > 3/4**. A floor of 1/2 is not
+    /// a weak version of the fix, it is a floor that permits the failure.
+    const LAB_STAKES: [u64; 8] = [
+        20_640_910_790_427,  // v0
+        42_266_641_023_599,  // v1
+        31_251_803_874_886,  // v2  (residual of the measured total)
+        44_632_922_615_884,  // v3
+        49_318_461_489_431,  // v4
+        50_318_661_489_430,  // v5
+        87_748_075_889_696,  // v6  measured
+        175_496_151_779_451, // v7  measured
+    ];
+
+    /// Two disjoint sets both justify under a 1/2 floor, and only one does
+    /// under 3/4. This is the calibration argument, run rather than asserted.
+    #[test]
+    fn a_half_floor_lets_two_disjoint_sides_both_justify() {
+        let total: u128 = LAB_STAKES.iter().map(|s| *s as u128).sum();
+        let b: u128 = LAB_STAKES[6..].iter().map(|s| *s as u128).sum();
+        let a = total - b;
+        // Smallest self-justifying set = 2/3 x floor, in units of `total`.
+        let clears = |num: u128, den: u128, side: u128| side * 3 * den >= 2 * num * total;
+        println!(
+            "LAB STAKE SPLIT: A={:.2}%  B={:.2}%",
+            a as f64 / total as f64 * 100.0,
+            b as f64 / total as f64 * 100.0
+        );
+        assert!(clears(1, 2, a) && clears(1, 2, b), "1/2 floor: both sides justify - the observed devnet behaviour");
+        assert!(!clears(3, 4, a), "3/4 floor must exclude the 47.53% side");
+        assert!(clears(3, 4, b), "3/4 floor must still admit a real stake majority");
+        println!("floor 1/2 -> A and B BOTH justify (two finalized roots).  floor 3/4 -> only B.");
+        assert!(
+            MIN_QUORUM_DENOMINATOR_NUM * 4 >= MIN_QUORUM_DENOMINATOR_DEN * 3,
+            "MIN_QUORUM_DENOMINATOR is {}/{}; anything at or below 3/4 lets two disjoint sets \
+             finalize conflicting checkpoints - measured on the devnet, not argued",
+            MIN_QUORUM_DENOMINATOR_NUM, MIN_QUORUM_DENOMINATOR_DEN
+        );
+    }
+
+    /// The laboratory's exact split, checked against the floor.
+    ///
+    /// 8 validators, a 6/2 partition, the minority alone. If the floor binds
+    /// at this shape, 2 of 8 must NEVER justify however long they wait: the
+    /// denominator cannot fall below half the unleaked total, so a quorum
+    /// costs 2/3 x 1/2 = 1/3 of the original stake and the minority holds
+    /// only 1/4. This is the arithmetic the devnet run is supposed to obey,
+    /// and the devnet DID still diverge - so this test exists to say which of
+    /// the two is wrong.
+    #[test]
+    fn the_labs_two_of_eight_minority_cannot_justify_with_the_floor() {
+        let all: Vec<Validator> = (0..8u32).map(|i| validator(i, 1_000_000_000)).collect();
+        let mut st = FinalityState::new(genesis());
+        let mut justified_at: Option<u64> = None;
+        for e in 1..=60u64 {
+            let src = st.current_justified();
+            let atts: Vec<(u32, AttestationData)> =
+                (6..8u32).map(|v| vote(v, e, root(e as u8), src)).collect();
+            let out = st
+                .process_epoch(&EpochVotes { epoch: e, active_set: &all, attestations: &atts })
+                .unwrap();
+            if out.justified.is_some() && justified_at.is_none() {
+                justified_at = Some(e);
+            }
+        }
+        println!(
+            "LAB SHAPE 2-of-8: justified_at={:?}  leaked_of(0)={}  leaked_of(6)={}",
+            justified_at, st.leaked_of(0), st.leaked_of(6)
+        );
+        assert_eq!(
+            justified_at, None,
+            "2 of 8 justified at {:?} DESPITE the floor - the floor does not bind at the \
+             laboratory's shape, which is why the devnet still diverged",
+            justified_at
+        );
+    }
 }
