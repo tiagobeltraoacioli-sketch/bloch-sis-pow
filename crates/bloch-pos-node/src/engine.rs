@@ -79,7 +79,8 @@ use bloch_pos_committee::{committees, derive, epoch_of, schedule};
 
 use crate::genesis::{Manifest, GENESIS_MIX};
 use crate::keys::{HybridVerifier, Keystore, ProbeVerifier};
-use crate::net::{self, Charge, EngineBudget, NetEvent, Origin, Provenance, Verdict};
+// /* WP7-FIXUP: WP3 5c69b4eb does not compile — it changed net::broadcast's signature and left five call sites (and one on_transaction call) unconverted. These labels are for drop LOGGING only and touch no consensus path. */
+use crate::net::{self, Charge, EngineBudget, NetEvent, Origin, Verdict};
 use crate::rpc::{self, Admitted, Finality, Json, RpcCall, RpcError, RpcRequest, RpcResult};
 use crate::store::Store;
 
@@ -1036,7 +1037,8 @@ impl Engine {
         };
         self.pool
             .insert((att.validator, att.data.signing_root()), att.clone());
-        self.net.broadcast(net::att_frame(&att));
+        // Own attestation.
+        self.net.broadcast(net::att_frame(&att), net::Provenance::Originated);
         println!(
             "[slot {slot}] attested (epoch {e}, head {}, target {})",
             crate::codec::hex8(&data.head),
@@ -1221,7 +1223,8 @@ impl Engine {
             .get(id.as_bytes())
             .expect("just ingested")
             .clone();
-        self.net.broadcast(net::block_frame(&env));
+        // Own proposal.
+        self.net.broadcast(net::block_frame(&env), net::Provenance::Originated);
     }
 
     // ── Block ingestion: store, then advance canonical as far as possible ──
@@ -1468,7 +1471,10 @@ impl Engine {
         let mut frame = vec![net::FRAME_TX];
         frame.extend_from_slice(&key);
         self.mempool.insert(key, tx);
-        self.net.broadcast(frame);
+        // Both gossip and the RPC land here, and WP3 meant to thread the
+        // provenance in from the caller but did not finish it; `Relayed` is
+        // the conservative label (sparse logging) pending that.
+        self.net.broadcast(frame, net::Provenance::Relayed);
         Ok(Admitted::New)
     }
 
@@ -1930,7 +1936,7 @@ impl Engine {
                     // Relay now: it was held, so nobody downstream got it from
                     // us. A duplicate publish is refused locally and costs
                     // nothing.
-                    self.net.broadcast(frame);
+                    self.net.broadcast(frame, net::Provenance::Relayed);
                 }
             }
         }
@@ -2569,6 +2575,25 @@ pub fn run(cfg: Config) -> io::Result<()> {
         }
     }
 
+    // ── WP7 sync-throughput instrument ──
+    //
+    // `BLOCH_SYNC_BENCH_MS` only; the drain bound itself is WP3's
+    // `BLOCH_MAX_EVENTS_PER_TICK` and is deliberately NOT re-implemented here —
+    // the point of the measurement is the real candidate, not a stand-in.
+    //
+    // A periodic line rather than a start/stop stopwatch: a single before/after
+    // pair over the process would fold in boot, the dial and the first sync
+    // round trip, none of which are the drain loop's throughput. A curve lets
+    // the steady state be read off the interior and the transient discarded.
+    let bench_interval_ms: u64 = std::env::var("BLOCH_SYNC_BENCH_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    let bench_started = std::time::Instant::now();
+    let mut bench_last = bench_started;
+    let mut bench_ticks: u64 = 0;
+    let mut bench_events: u64 = 0;
+
     // ── The slot loop ──
     let genesis_ms = engine.manifest.genesis_time_ms;
     let slot_ms = engine.manifest.slot_ms;
@@ -2631,7 +2656,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         if (behind || engine.needs_sync) && now.saturating_sub(last_sync_req) > 2 * slot_ms {
             engine
                 .net
-                .broadcast(net::get_blocks_frame(engine.state.slot()));
+                .broadcast(net::get_blocks_frame(engine.state.slot()), net::Provenance::Originated);
             engine.needs_sync = false;
             last_sync_req = now;
         }
@@ -2651,6 +2676,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
                 // transport sheds sooner. That is the trade being made — shed a
                 // recoverable frame, keep the slot.
                 let pending = drain_pending(&rx, ev, max_engine_events_per_tick());
+                bench_events += pending.len() as u64;
                 for ev in pending {
                     match ev {
                         EngineEvent::Net(net_ev, charge) => {
@@ -2669,7 +2695,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
                                 NetEvent::Transaction(tx) => {
                                     // Gossip has nobody to answer to; the
                                     // verdict is the RPC's concern, not a peer's.
-                                    let _ = engine.on_transaction(tx, Provenance::Relayed);
+                                    let _ = engine.on_transaction(tx);
                                 }
                             }
                             drop(charge);
@@ -2690,6 +2716,32 @@ pub fn run(cfg: Config) -> io::Result<()> {
                     "network channel closed",
                 ));
             }
+        }
+
+        // One machine-readable sample per interval, inert unless the knob is
+        // set. `shed` is reported PER CLASS because a shed block and a shed
+        // attestation are not the same event: the first is a hole the sync pump
+        // must re-request, the second is a vote the mesh will re-gossip. The
+        // in-flight byte figures are here for the same reason — the cost of a
+        // slower drain is the budget filling, and this is where it would show.
+        bench_ticks += 1;
+        if bench_interval_ms > 0
+            && bench_last.elapsed() >= Duration::from_millis(bench_interval_ms)
+        {
+            println!(
+                "syncbench t_ms={} head={} blocks={} ticks={} events={} \
+shedblk={} shedgos={} blkbytes={} gosbytes={}",
+                bench_started.elapsed().as_millis(),
+                engine.state.slot(),
+                engine.chain.len() - 1,
+                bench_ticks,
+                bench_events,
+                budget.shed(net::Class::Block),
+                budget.shed(net::Class::Gossip),
+                budget.in_flight(net::Class::Block),
+                budget.in_flight(net::Class::Gossip),
+            );
+            bench_last = std::time::Instant::now();
         }
     }
 }
