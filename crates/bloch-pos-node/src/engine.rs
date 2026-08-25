@@ -279,6 +279,29 @@ mod ingest_witness {
 /// NOTE for whoever measures: boot replay does NOT pass through this channel
 /// (it is a plain loop over the block log), so this bound cannot affect restart
 /// replay at all. Only live and sync ingest reach it.
+///
+/// # The risk this bound carries, which is not a throughput risk
+///
+/// Measure for FORKS, not only for blocks per second.
+///
+/// The duty path below this loop is guarded by `in_grace` — the first two slots
+/// after boot — and by nothing else. There is no "am I caught up?" test before
+/// `attest(slot)` or `propose(slot)`. So the postponement this bound removes
+/// was doing double duty: while a node drained a whole sync page before
+/// returning to its duties, it was also DECLINING to propose on a head it had
+/// not finished advancing. Bounding the drain lets a node that is still behind
+/// reach `propose` with events for its own parent still sitting in the channel,
+/// and build on a stale parent instead of building nothing.
+///
+/// This is not hypothetical arithmetic — `tests/cold_start.rs` (three real
+/// processes over libp2p) failed twice at the default bound with two nodes
+/// holding different blocks at a common slot, and passed at
+/// `BLOCH_MAX_EVENTS_PER_TICK=0`. It then passed 3/3 at BOTH values on an
+/// unloaded machine, so the failures track machine load rather than this
+/// constant and the bound is NOT convicted. But the mechanism above is real
+/// whatever that test does, and "a slot spent on nothing" and "a slot spent on
+/// a fork" are not the same cost. If this bound is lowered, the honest fix that
+/// goes with it is a synced-check on the duty path, not a smaller number.
 pub const MAX_ENGINE_EVENTS_PER_TICK: usize = 32;
 
 /// The bound in force, read once per process.
@@ -6055,9 +6078,15 @@ mod drain_bound_tests {
     #[test]
     fn take_pending_stops_at_the_bound() {
         let (_tx, rx) = loaded(9);
+        // 10 events exist: `first` in hand plus 9 queued. A bound of 4 takes
+        // `first` and 3 more, so 6 stay queued for the next tick. Getting this
+        // arithmetic wrong is how the first version of this test asserted 9 and
+        // could never have passed — it was caught by re-running the suite on
+        // the RESTORED tree after the mutation proofs, which is the only step
+        // that distinguishes "my fix works" from "my test never ran green".
         let taken = take_pending(&rx, event(), 4);
         assert_eq!(taken.len(), 4, "the tick took more than its bound");
-        assert_eq!(rx.try_iter().count(), 9, "the remainder must stay queued for the next tick");
+        assert_eq!(rx.try_iter().count(), 6, "the remainder must stay queued for the next tick");
     }
 
     /// A bound of 1 still makes progress. An off-by-one here would return an
