@@ -397,6 +397,37 @@ def check_constants(root: Path, rep: Report):
 
 
 MANIFEST_FILE = "genesis/mainnet.manifest"
+RUNBOOK = "docs/LEAKED-ROSTER-FLAG-DAY.md"
+
+
+def check_runbook(root: Path, rep: Report):
+    """The runbook the armed constant points at must exist and agree with it.
+
+    `params.rs` says "The choice procedure ... live in
+    docs/LEAKED-ROSTER-FLAG-DAY.md. The armed value below was produced by that
+    runbook", and the tripwire's own doc says the value "must equal the one
+    recorded in" it. At ab9ca4e1 — the commit on 64 nodes — that file did not
+    exist, so both references pointed at nothing and the tripwire pinned the
+    constant against a document no one could read. It was committed to
+    deploy/armado-e1400 as 04ee1888 during this review.
+
+    Written to FAIL on a missing file rather than skip: a pin that evaporates
+    with its subject is the defect this whole script exists to refuse.
+    """
+    g = "A. consensus constants"
+    p = root / RUNBOOK
+    if not p.is_file():
+        rep.add(g, "the runbook the constant cites exists", False,
+                f"{RUNBOOK} MISSING — params.rs and the tripwire both cite it by name")
+        rep.add(g, "the runbook records the armed epoch", False, "unresolvable: no runbook")
+        return
+    txt = p.read_text()
+    rep.add(g, "the runbook the constant cites exists", True, f"{RUNBOOK}, {len(txt)} bytes")
+    hits = re.findall(r'\b1[_ ]?400\b', txt)
+    rep.add(g, "the runbook records the armed epoch", bool(hits),
+            f"names {ARMED_EPOCH} {len(hits)} time(s)" if hits
+            else f"the runbook never names {ARMED_EPOCH} — it does not record this flag day")
+
 
 def check_flag_day_is_ahead(root: Path, rep: Report):
     """The armed epoch must not already be in the past.
@@ -864,6 +895,7 @@ def main():
     rep = Report(label)
     check_constants(root, rep)
     check_flag_day_is_ahead(root, rep)
+    check_runbook(root, rep)
     check_tripwire_source(root, rep)
     present = check_suites_source(root, rep)
     check_symbols(root, rep)
@@ -885,7 +917,7 @@ def main():
         print("!! THE VERIFIER EXECUTED ZERO GATES. This report means NOTHING.")
         print("!" * 70)
         return 2
-    expected_min = 3 + 2 + len(SUITES) + len(PERF_SYMBOLS) + len(STRUCTURAL_PINS) + 5
+    expected_min = 5 + 2 + len(SUITES) + len(PERF_SYMBOLS) + len(STRUCTURAL_PINS) + 5
     if not args.no_cargo:
         expected_min += 3  # build + tripwire-run + workspace-green
     if len(gates) < expected_min:
