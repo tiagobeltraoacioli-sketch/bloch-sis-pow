@@ -897,7 +897,6 @@ mod tests {
     /// incident question.
     #[test]
     fn a_partitioned_minority_finalizes_because_the_leak_shrinks_the_denominator() {
-        let _g = HOOK.lock().unwrap_or_else(|e| e.into_inner());
         let (epoch, destroyed_pct) = run_partition(false);
         let epoch = epoch.expect(
             "a 4-of-64 partition must eventually self-finalize — if it never does, the \
@@ -923,7 +922,6 @@ mod tests {
     /// nothing about the leak.
     #[test]
     fn without_the_leak_in_the_denominator_the_minority_never_finalizes() {
-        let _g = HOOK.lock().unwrap_or_else(|e| e.into_inner());
         tests_hook::IGNORE_LEAK_IN_DENOMINATOR.with(|c| c.set(true));
         let (epoch, _) = run_partition(true);
         tests_hook::IGNORE_LEAK_IN_DENOMINATOR.with(|c| c.set(false));
@@ -940,7 +938,6 @@ mod tests {
     /// which is the whole reason a relaunch inherits it.
     #[test]
     fn the_leak_only_ever_grows() {
-        let _g = HOOK.lock().unwrap_or_else(|e| e.into_inner());
         // Pre-fix arithmetic on purpose — this test is the record of WHY the
         // relaunch needed a zeroing at all. The post-fix behaviour (the
         // accumulator comes back down) is
@@ -1037,7 +1034,6 @@ mod tests {
     /// denominator must be the full unleaked total again.
     #[test]
     fn the_fourth_ensaio_a_relaunch_that_inherits_the_leak() {
-        let _g = HOOK.lock().unwrap_or_else(|e| e.into_inner());
         let committee: Vec<Validator> = (0..64u32).map(|i| validator(i, STAKE_EACH)).collect();
         let unleaked_total = STAKE_EACH as u128 * 64;
 
@@ -1188,7 +1184,6 @@ mod tests {
     /// fix has quietly turned a liveness mechanism into a no-op.
     #[test]
     fn the_leak_still_buys_liveness_back_after_the_fix() {
-        let _g = HOOK.lock().unwrap_or_else(|e| e.into_inner());
         // A 60/40 stall — a MAJORITY present, which is what the leak exists
         // for. It must still recover, and the absentees must still pay.
         let committee =
@@ -1227,7 +1222,6 @@ mod tests {
     /// a chain 110 epochs into non-finality can ever climb out.
     #[test]
     fn the_leak_recovers_once_the_validator_participates_even_during_a_stall() {
-        let _g = HOOK.lock().unwrap_or_else(|e| e.into_inner());
         let committee: Vec<Validator> = (0..64u32).map(|i| validator(i, STAKE_EACH)).collect();
         let mut st = FinalityState::new(genesis());
         // 30 epochs with validator 40 absent: it accrues a leak, and the
@@ -1272,11 +1266,6 @@ mod tests {
 
     const STAKE_EACH: u64 = 1_000_000_000;
 
-    /// Kept from dev9's original, now belt-and-braces: the switches became
-    /// thread-local (see `mod tests_hook`), so nothing needs serializing any
-    /// more. Removing it would be a wider diff than it is worth.
-    static HOOK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// 64 validators, only 4 reachable and voting. Returns the epoch at which
     /// the 4 first justify (None if never within the horizon) and the
     /// percentage of TOTAL network stake the leak destroyed by then.
@@ -1307,7 +1296,6 @@ mod tests {
     /// so on the binary mainnet runs, it is not there.
     #[test]
     fn a_single_fully_leaked_validator_makes_the_two_rosters_partition_differently() {
-        let _g = HOOK.lock().unwrap_or_else(|e| e.into_inner());
         // 64 validators. Task 2 shows every absent validator on a chain with
         // 49+ epochs of non-finality is at EXACTLY zero, so one is generous.
         let duty: Vec<Validator> = (0..64u32).map(|i| validator(i, STAKE_EACH)).collect();
