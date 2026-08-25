@@ -194,7 +194,7 @@ use libp2p::{identify, identity, noise, yamux, PeerId, StreamProtocol, SwarmBuil
 pub use libp2p::Multiaddr;
 
 use crate::engine::{EngineEvent, ENGINE_EVENT_QUEUE_CAP};
-use crate::net::{IngressOutcome, NetEvent};
+use crate::net::{IngressOutcome, NetEvent, ENGINE_QUEUE_BYTE_CAP};
 
 // ── Protocol identity: a Genesis-4 node must never speak to a Genesis-3 one ──
 
@@ -286,9 +286,9 @@ const MAX_CONCURRENT_SYNC_SERVES: usize = 4;
 /// Response framing before the first envelope: tag plus envelope count.
 const SYNC_RESPONSE_HEADER_BYTES: usize = 1 + 4;
 
-/// Broadcasts waiting for the swarm loop. Each is capped at
-/// [`MAX_GOSSIP_BYTES`] plus its engine-only frame tag.
-const MAX_PENDING_BROADCASTS: usize = 8;
+/// Broadcasts waiting for the swarm loop. The byte cap below constrains their
+/// aggregate allocation; this count cap bounds even a queue of tiny frames.
+const MAX_PENDING_BROADCASTS: usize = ENGINE_EVENT_QUEUE_CAP;
 
 /// Validation reports waiting for the swarm loop. Keeping this at least one
 /// engine batch means a full batch can return its gossip decisions without
@@ -297,6 +297,17 @@ const MAX_PENDING_REPORTS: usize = ENGINE_EVENT_QUEUE_CAP;
 
 /// The engine frame carries one routing byte outside the gossipsub payload.
 const MAX_BROADCAST_COMMAND_BYTES: usize = MAX_GOSSIP_BYTES + 1;
+
+/// Bytes retained in engine-to-swarm publication work.
+///
+/// Input and output have separate budgets, but each direction is finite. The
+/// same cap keeps their memory posture legible to an operator.
+const BROADCAST_QUEUE_BYTE_CAP: usize = ENGINE_QUEUE_BYTE_CAP;
+
+struct BroadcastCommand {
+    frame: Vec<u8>,
+    queued_bytes: usize,
+}
 
 /// A blocking read's response, retaining its permit until libp2p confirms the
 /// bytes were flushed or reports the inbound request failed.
@@ -660,7 +671,9 @@ pub fn gossipsub_config() -> Result<gossipsub::Config, String> {
 pub struct Handle {
     /// Publication work is lossy under pressure: dropping gossip or a sync
     /// request is recoverable, while blocking the consensus thread is not.
-    broadcasts: tokio::sync::mpsc::Sender<Vec<u8>>,
+    broadcasts: tokio::sync::mpsc::Sender<BroadcastCommand>,
+    /// Aggregate allocation held by queued broadcasts.
+    broadcast_bytes: Arc<AtomicUsize>,
     /// Keep validation outcomes independent of publication pressure, since
     /// `validate_messages()` holds attestations until it receives one.
     reports: tokio::sync::mpsc::Sender<(Origin, Verdict)>,
@@ -673,8 +686,21 @@ impl Handle {
     /// Publish one engine frame. Routing is by the leading `net::FRAME_*`
     /// byte, so the engine's call sites are identical on both transports.
     pub fn broadcast(&self, frame: Vec<u8>) {
-        if frame.len() <= MAX_BROADCAST_COMMAND_BYTES {
-            let _ = self.broadcasts.try_send(frame);
+        let queued_bytes = frame.capacity();
+        if frame.len() > MAX_BROADCAST_COMMAND_BYTES
+            || !reserve_broadcast_bytes(&self.broadcast_bytes, queued_bytes)
+        {
+            return;
+        }
+        if self
+            .broadcasts
+            .try_send(BroadcastCommand {
+                frame,
+                queued_bytes,
+            })
+            .is_err()
+        {
+            self.broadcast_bytes.fetch_sub(queued_bytes, Ordering::AcqRel);
         }
     }
 
@@ -747,7 +773,9 @@ pub fn start(
     let peer_id = PeerId::from(keypair.public());
 
     let (broadcast_tx, broadcast_rx) =
-        tokio::sync::mpsc::channel::<Vec<u8>>(MAX_PENDING_BROADCASTS);
+        tokio::sync::mpsc::channel::<BroadcastCommand>(MAX_PENDING_BROADCASTS);
+    let broadcast_bytes = Arc::new(AtomicUsize::new(0));
+    let swarm_broadcast_bytes = broadcast_bytes.clone();
     let (report_tx, report_rx) =
         tokio::sync::mpsc::channel::<(Origin, Verdict)>(MAX_PENDING_REPORTS);
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<io::Result<()>>();
@@ -769,6 +797,7 @@ pub fn start(
                         cfg,
                         broadcast_rx,
                         report_rx,
+                        swarm_broadcast_bytes,
                         events,
                         head_slot,
                         inflight,
@@ -785,6 +814,7 @@ pub fn start(
     match ready_rx.recv() {
         Ok(Ok(())) => Ok(Handle {
             broadcasts: broadcast_tx,
+            broadcast_bytes,
             reports: report_tx,
             peer_id,
         }),
@@ -923,8 +953,9 @@ impl Loop {
 async fn run_swarm(
     mut swarm: Swarm,
     cfg: Config,
-    mut broadcast_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    mut broadcast_rx: tokio::sync::mpsc::Receiver<BroadcastCommand>,
     mut report_rx: tokio::sync::mpsc::Receiver<(Origin, Verdict)>,
+    broadcast_bytes: Arc<AtomicUsize>,
     events: EngineSender<EngineEvent>,
     head_slot: Arc<AtomicU64>,
     inflight: Arc<AtomicUsize>,
@@ -992,7 +1023,10 @@ async fn run_swarm(
             }
             frame = broadcast_rx.recv() => {
                 match frame {
-                    Some(frame) => handle_broadcast(&mut swarm, &mut st, frame),
+                    Some(BroadcastCommand { frame, queued_bytes }) => {
+                        handle_broadcast(&mut swarm, &mut st, frame);
+                        broadcast_bytes.fetch_sub(queued_bytes, Ordering::AcqRel);
+                    }
                     None => return, // engine dropped the handle
                 }
             }
@@ -1019,6 +1053,15 @@ async fn run_swarm(
             }
         }
     }
+}
+
+fn reserve_broadcast_bytes(inflight: &AtomicUsize, bytes: usize) -> bool {
+    bytes <= BROADCAST_QUEUE_BYTE_CAP
+        && inflight
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes).filter(|total| *total <= BROADCAST_QUEUE_BYTE_CAP)
+            })
+            .is_ok()
 }
 
 fn peer_id_of(addr: &Multiaddr) -> Option<PeerId> {
@@ -1569,22 +1612,27 @@ mod tests {
     fn handle_sheds_broadcasts_without_displacing_validation_reports() {
         let (broadcasts, mut broadcast_rx) = tokio::sync::mpsc::channel(1);
         let (reports, mut report_rx) = tokio::sync::mpsc::channel(1);
+        let broadcast_bytes = Arc::new(AtomicUsize::new(0));
         let handle = Handle {
             broadcasts,
+            broadcast_bytes: broadcast_bytes.clone(),
             reports,
             peer_id: PeerId::random(),
         };
 
         handle.broadcast(vec![crate::net::FRAME_TX, 1]);
         handle.broadcast(vec![crate::net::FRAME_TX, 2]);
-        assert_eq!(
-            broadcast_rx.try_recv().expect("first broadcast"),
-            vec![crate::net::FRAME_TX, 1]
-        );
+        let BroadcastCommand {
+            frame,
+            queued_bytes,
+        } = broadcast_rx.try_recv().expect("first broadcast");
+        assert_eq!(frame, vec![crate::net::FRAME_TX, 1]);
         assert!(matches!(
             broadcast_rx.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
         ));
+        assert_eq!(broadcast_bytes.load(Ordering::Acquire), queued_bytes);
+        broadcast_bytes.fetch_sub(queued_bytes, Ordering::AcqRel);
 
         let origin = Origin {
             inner: Some((MessageId::from("test"), PeerId::random())),
@@ -1599,6 +1647,7 @@ mod tests {
             broadcast_rx.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
         ));
+        assert_eq!(broadcast_bytes.load(Ordering::Acquire), 0);
     }
 
     // ── Two live swarms on localhost ────────────────────────────────────────
