@@ -324,3 +324,28 @@ by assignment (`g.epoch = epoch`), not by transitioning there — reaching it
 honestly costs 1,400 epochs of blocks. The leak itself IS real, accrued through
 `process_epoch` over epochs nobody attests, with a guard that fails the test if
 the fold never drove anybody to zero. Recorded as a known limit, not a defect.
+
+## 15. The gate that would have caught all of it
+
+```
+cargo test --workspace --no-run
+```
+
+It compiles every test target without running anything. It catches the orphaned
+`AtomicBool` in a `#[cfg(test)]` module (which a release build compiles happily
+— the failure mode that does not show), an `E0063` in an integration test, a
+helper called with the wrong arity — all at once, in seconds, without executing
+a single test.
+
+**Mandatory before any commit that claims a test result.** Not one of the three
+false deliveries of 2026-08-24 would have survived it. If there is CI, it
+belongs there too.
+
+Two things static reading cannot settle, so they still need this gate: method
+resolution on a typed receiver, and type mismatches inside `assert_eq!`. Both
+need type inference.
+
+And a scope note worth keeping, because it changed what a headline number
+meant: `#[ignore]`d tests are NOT in a plain `cargo test` run. A suite reported
+as "550 passed" never included the ignored performance tests. That is scope, not
+fraud — but it was read as though the benchmark had passed, and it had not run.
