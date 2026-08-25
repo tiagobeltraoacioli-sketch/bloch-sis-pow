@@ -230,13 +230,21 @@ fuzz-smoke:
         exit 0
       fi
     - cargo install cargo-fuzz --locked 2>/dev/null || true
+    # BUILD EVERY TARGET FIRST, and fail on it. From the Genesis-4 trunk switch
+    # until 2026-08-25 this job could not build a single target: fuzz/Cargo.toml
+    # took `bloch` from the repo root, the root became a VIRTUAL manifest, and
+    # `cargo metadata` on the fuzz crate failed outright. `allow_failure: true`
+    # meant the pipeline stayed green through all of it while fuzz/corpus/ kept
+    # eleven populated directories on disk. A link failure is not a fuzzing
+    # result and must never again be reported as one.
+    - cargo +nightly fuzz build
     - |
       for t in block_parse tx_parse sha256d_pow ghostdag_order sig_verify; do
         echo "== fuzz smoke: $t =="
         cargo +nightly fuzz run "$t" -- -max_total_time=20 -runs=100000
       done
   allow_failure: true
-  timeout: 30m
+  timeout: 40m
 
 # Secret scanning — catch committed credentials (e.g. a leaked token) before they
 # reach history. Best practice given the project's own PAT-rotation lesson.

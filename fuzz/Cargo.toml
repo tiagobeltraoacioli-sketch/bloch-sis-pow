@@ -18,7 +18,15 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-bloch = { path = ".." }
+# The Genesis-3 proof-of-work node. It was the ROOT package of this repo,
+# which is why this line used to read `path = ".."`. Genesis-4 became the
+# trunk on 2026-08-13, the root turned into a VIRTUAL manifest, and this
+# path stopped resolving — `cargo metadata` on the fuzz crate failed
+# outright ("found a virtual manifest ... instead of a package manifest"),
+# so every target in this file was unbuildable. `fuzz-smoke` is
+# `allow_failure: true`, so CI stayed green and the populated corpus dirs
+# kept it looking like a running program. It was not one.
+bloch = { path = "../legacy/genesis3-node" }
 bloch-sis-pow = { path = "../crates/bloch-sis-pow" }
 coherence-core = { path = "../crates/coherence-core" }
 # P1 (roadmap §1b): the netmsg / handshake decode targets mirror the node's
@@ -105,3 +113,4 @@ name = "sig_verify"
 path = "fuzz_targets/sig_verify.rs"
 test = false
 doc = false
+

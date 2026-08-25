@@ -42,6 +42,33 @@ cargo +nightly fuzz run sig_verify   -- -max_total_time=300
 
 Reproduce a crash: `cargo +nightly fuzz run <target> fuzz/artifacts/...`.
 
+## Harness repair, 2026-08-25 — this harness was DEAD for the whole Genesis-4 era
+
+Everything below the repair note was, until this date, describing a program that
+could not build.
+
+`fuzz/Cargo.toml` took the node by `bloch = { path = ".." }`. When Genesis-4
+became the trunk the repo root turned into a **virtual manifest** and the
+`bloch` package moved to `legacy/genesis3-node`, so that path stopped naming a
+package. `cargo metadata` on this crate then failed outright:
+
+```
+error: failed to get `bloch` as a dependency of package `bloch-fuzz v0.0.0`
+Caused by: found a virtual manifest at `.../Cargo.toml` instead of a package manifest
+```
+
+That is a resolution failure, which means **no target in this file could be
+built** — not the five `fuzz-smoke` names, not the other six. Two things hid it:
+`.gitlab-ci.yml`'s `fuzz-smoke` job is `allow_failure: true`, so the pipeline
+stayed green; and `fuzz/corpus/` holds eleven populated directories, so the tree
+kept looking like a running fuzzing program on disk.
+
+Fix: `bloch = { path = "../legacy/genesis3-node" }`. That package still declares
+`[lib] name = "bloch"`, so every `bloch::...` import in the existing targets
+resolves unchanged. `fuzz-smoke` now runs `cargo +nightly fuzz build` (all
+targets) *before* it runs anything, because a link failure is not a fuzzing
+result and must never again be reported as one.
+
 ## Execution status (last local run: 2026-07-22, nightly + cargo-fuzz 0.12.0, macOS x86_64, AddressSanitizer)
 
 The four scanner-priority surfaces were **built and executed** locally — no
