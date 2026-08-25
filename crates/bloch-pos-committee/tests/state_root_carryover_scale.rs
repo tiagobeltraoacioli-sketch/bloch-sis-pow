@@ -309,6 +309,8 @@ fn state<'a>(f: &'a Fixture, e: &'a [EutxoEntry]) -> ConsensusState<'a> {
             tx_bytes: 0,
         },
         delegator_fee_rewards: &[],
+        // Never frozen in a fixture: the roster-freeze gate is inert.
+        frozen_bonds: &[],
     }
 }
 

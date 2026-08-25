@@ -218,6 +218,29 @@ const TAG_BASE_FEE: u8 = 0x15;
 /// that disagreed on it would pay a different amount for the same exit.
 const TAG_DELEGATOR_FEE_REWARD: u8 = 0x16;
 
+/// The **epoch-frozen bond** of a validator slashed during the open epoch
+/// (2026-08-25), one entry per such validator.
+///
+/// Committed for the ordinary §5.5 reason and for one extra: it decides who
+/// may propose. Above
+/// [`crate::params::ROSTER_FREEZE_ACTIVATION_EPOCH`],
+/// `CommittedState::duty_roster_at` keeps a validator slashed mid-epoch in the
+/// epoch's roster, at the bond it carried when the epoch opened, so a slash
+/// stops duties at the NEXT boundary the way every other roster mutator
+/// already does. That bond is not recoverable from anything else the state
+/// holds — `staked_sat` has already been debited, and the slashing correlation
+/// window records a per-EPOCH total, not a per-validator one — so it is a
+/// committed fact or it is a node-local guess, and a node-local guess about
+/// who proposes is `expected_bits` with a different name.
+///
+/// **Empty in every epoch in which nobody was slashed**, and `close_epoch`
+/// clears it at every boundary. An empty component inserts no leaves, so the
+/// root is byte-identical to a chain that never carried the field at all —
+/// which is precisely what lets the existing block log replay under a binary
+/// that ships this rule inert. Pinned by
+/// `an_empty_frozen_bond_component_does_not_move_the_root`.
+const TAG_EPOCH_FROZEN_BOND: u8 = 0x17;
+
 
 fn sha3(parts: &[&[u8]]) -> [u8; 32] {
     let mut h = Sha3_256::new();
@@ -1552,6 +1575,43 @@ impl DelegatorFeeRecord {
     }
 }
 
+/// One validator's own bond as of the first slot of the OPEN epoch, retained
+/// because that validator was slashed during it ([`TAG_EPOCH_FROZEN_BOND`]).
+///
+/// Keyed by validator index and NOT by epoch: the component describes the open
+/// epoch only and is cleared at every boundary, so an epoch column would be a
+/// second copy of `CommittedState::epoch` with room to drift from it. The
+/// epoch is carried in the VALUE instead, where it binds the leaf to the epoch
+/// that produced it without becoming a second addressing dimension — a state
+/// that somehow carried a stale entry then commits to a different byte string
+/// than one that froze the same bond in the current epoch.
+///
+/// `bond_sat` is `u128`, matching the registry's arithmetic contract rather
+/// than the `u64` the sampling layer narrows to: the freeze must reproduce
+/// `duty_roster_at`'s input exactly, and narrowing here and again there would
+/// be two saturations instead of one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrozenBondRecord {
+    pub validator: u32,
+    /// The epoch this freeze belongs to — the open epoch when the slash landed.
+    pub epoch: u64,
+    /// The validator's own bond before the slash debited it, in satoshis.
+    pub bond_sat: u128,
+}
+
+impl FrozenBondRecord {
+    fn entry_key(&self) -> Vec<u8> {
+        self.validator.to_le_bytes().to_vec()
+    }
+    fn serialize(&self) -> Vec<u8> {
+        let mut s = Vec::with_capacity(28);
+        s.extend_from_slice(&self.validator.to_le_bytes());
+        s.extend_from_slice(&self.epoch.to_le_bytes());
+        s.extend_from_slice(&self.bond_sat.to_le_bytes());
+        s
+    }
+}
+
 /// Everything `state_root` commits, passed **by argument** — this struct is
 /// the §5.5 rule made into a type. A block validator builds it from the
 /// parent block's committed state and from nothing else; there is no way to
@@ -1609,6 +1669,13 @@ pub struct ConsensusState<'a> {
     /// Cumulative fee rewards per delegator account
     /// ([`TAG_DELEGATOR_FEE_REWARD`]).
     pub delegator_fee_rewards: &'a [DelegatorFeeRecord],
+    /// Bonds frozen for the open epoch because their owner was slashed during
+    /// it ([`TAG_EPOCH_FROZEN_BOND`]). **Empty unless a slash landed in the
+    /// open epoch**, and empty always below
+    /// [`crate::params::ROSTER_FREEZE_ACTIVATION_EPOCH`] — an empty slice
+    /// inserts no leaves, so it cannot move a root computed before the field
+    /// existed.
+    pub frozen_bonds: &'a [FrozenBondRecord],
 }
 
 /// How many **closed** epoch boundaries the committed beacon history retains,
@@ -1807,6 +1874,17 @@ fn build_state_tree_inner(state: &ConsensusState<'_>, eutxo_tree: &Smt) -> Smt {
         smt.insert(
             derive_key(TAG_DELEGATOR_FEE_REWARD, &d.entry_key()),
             hash_value(&d.serialize()),
+        );
+    }
+    // The epoch-frozen bonds (2026-08-25). Loops over an EMPTY slice in every
+    // epoch with no slash and in every epoch below the roster-freeze gate, and
+    // an empty loop inserts nothing — which is the whole reason the existing
+    // chain still replays to the same roots under a binary that carries this
+    // component.
+    for b in state.frozen_bonds {
+        smt.insert(
+            derive_key(TAG_EPOCH_FROZEN_BOND, &b.entry_key()),
+            hash_value(&b.serialize()),
         );
     }
     smt
@@ -2800,6 +2878,7 @@ mod tests {
         losses: Vec<DelegatorLossRecord>,
         base_fee: BaseFeeRecord,
         fee_rewards: Vec<DelegatorFeeRecord>,
+        frozen_bonds: Vec<FrozenBondRecord>,
     }
 
     fn fixture() -> Fx {
@@ -2821,6 +2900,15 @@ mod tests {
         let losses = vec![
             DelegatorLossRecord { delegator: 1, loss_sat: 42 },
             DelegatorLossRecord { delegator: 9, loss_sat: 1_000 },
+        ];
+        // Non-empty for the same reason as the three above: a component whose
+        // fixture is empty is a component the coverage test below cannot tell
+        // apart from one that was never wired in. `validator: 1` collides with
+        // a registry key, a loss key and an fc-message key on purpose — the
+        // component tag is the only thing keeping the four apart.
+        let frozen_bonds = vec![
+            FrozenBondRecord { validator: 1, epoch: 43, bond_sat: 100_000_000_001 },
+            FrozenBondRecord { validator: 3, epoch: 43, bond_sat: 7 },
         ];
         let evm = EvmCommitment {
             account_root: key(0xE0),
@@ -2947,6 +3035,7 @@ mod tests {
             losses,
             base_fee,
             fee_rewards,
+            frozen_bonds,
         }
     }
 
@@ -3135,6 +3224,7 @@ mod tests {
             delegator_slash_losses: &f.losses,
             base_fee: f.base_fee,
             delegator_fee_rewards: &f.fee_rewards,
+            frozen_bonds: &f.frozen_bonds,
         }
     }
 
@@ -3161,6 +3251,7 @@ mod tests {
         g.delegations.reverse();
         g.pending_fees.reverse();
         g.fee_rewards.reverse();
+        g.frozen_bonds.reverse();
         let root_b = state_root(&state(&g));
 
         assert_eq!(root_a, root_b);
@@ -3260,6 +3351,14 @@ mod tests {
         mutated!(|g: &mut Fx| g.fee_rewards[0].delegator += 1);
         mutated!(|g: &mut Fx| g.fee_rewards[0].reward_sat += 1);
         mutated!(|g: &mut Fx| g.fee_rewards.pop().map(|_| ()).unwrap());
+        // The epoch-frozen bonds (2026-08-25). Every column, plus a removal:
+        // this leaf decides who is allowed to propose for the rest of an
+        // epoch, so a serialization that aliased two of its columns would let
+        // two different rosters commit to one root.
+        mutated!(|g: &mut Fx| g.frozen_bonds[0].validator += 1);
+        mutated!(|g: &mut Fx| g.frozen_bonds[0].epoch += 1);
+        mutated!(|g: &mut Fx| g.frozen_bonds[0].bond_sat += 1);
+        mutated!(|g: &mut Fx| g.frozen_bonds.pop().map(|_| ()).unwrap());
 
         // Singleton roots and the issued-supply counter.
         for i in 0..4 {
@@ -3286,6 +3385,69 @@ mod tests {
                 assert_ne!(roots[i], roots[j], "distinct states {i} and {j} share a root");
             }
         }
+    }
+
+    /// **THE REPLAY GUARANTEE, at the leaf level.** An empty
+    /// `frozen_bonds` component must commit to exactly the root a state
+    /// without the component at all commits to.
+    ///
+    /// This is what makes the roster-freeze flag day safe to ship INERT. The
+    /// founder chose to preserve the existing chain rather than cut a new
+    /// genesis, so every historical block is re-validated on boot against the
+    /// `state_root` its header already carries. A new component that moved the
+    /// root by merely EXISTING would fail that check at height 1 — and boot
+    /// goes through `Engine::ingest`, which rejects and returns, so 64 nodes
+    /// would park at an old height in silence.
+    ///
+    /// The proof is a comparison, not an argument: build the root with the
+    /// component empty, build it again from a tree walked without the
+    /// component's loop at all, and require the bytes to be equal. The
+    /// non-vacuity half matters as much — the same fixture with a NON-empty
+    /// component must differ, or this test would pass against a component that
+    /// was never wired into the tree in the first place.
+    #[test]
+    fn an_empty_frozen_bond_component_does_not_move_the_root() {
+        let mut f = fixture();
+
+        // The state as it will be in every epoch of the existing chain and in
+        // every epoch below the gate: nobody slashed, nothing frozen.
+        f.frozen_bonds = Vec::new();
+        let with_empty = state_root(&state(&f));
+
+        // The claim is "an empty component inserts NOTHING", so measure the
+        // leaves rather than argue about them. `build_state_tree` starts from
+        // an empty tree and the only way a leaf enters is `smt.insert`, so a
+        // tree with no leaf under this tag IS the tree a binary without the
+        // component builds.
+        let tree_empty = build_state_tree(&state(&f));
+        let probe = FrozenBondRecord { validator: 2, epoch: 43, bond_sat: 1 };
+        let probe_key = derive_key(TAG_EPOCH_FROZEN_BOND, &probe.entry_key());
+        assert_eq!(
+            tree_empty.get(&probe_key),
+            None,
+            "an empty epoch-frozen-bond component still put a leaf in the tree - every \
+             historical block would fail its state_root check on replay and the fleet \
+             would park silently at an old height"
+        );
+
+        // Non-vacuity, and the leaf-count half of the same claim: the
+        // component IS wired into the tree, and it contributes exactly one
+        // leaf per record and none for none. Without this the assertion above
+        // would also pass against a component nobody ever inserted.
+        f.frozen_bonds = vec![probe];
+        let tree_one = build_state_tree(&state(&f));
+        assert_eq!(
+            tree_one.len(),
+            tree_empty.len() + 1,
+            "the frozen-bond component is not in the tree at all, so the empty-case \
+             assertion above proves nothing"
+        );
+        assert_eq!(tree_one.get(&probe_key), Some(hash_value(&probe.serialize())));
+        assert_ne!(
+            tree_one.root(),
+            with_empty,
+            "a non-empty frozen-bond component did NOT move the root"
+        );
     }
 
     #[test]
@@ -3359,6 +3521,17 @@ mod tests {
         let without_loss = state_root(&state(&l));
         assert_ne!(without_loss, base);
         assert_ne!(without_reward, without_loss);
+
+        // And validator 1 a FOURTH time, in the epoch-frozen-bond component
+        // (2026-08-25). This one governs who may propose for the rest of an
+        // epoch, so an alias with any of the three above would let a slashed
+        // validator's frozen bond be mistaken for its registry record.
+        let mut m = f.clone();
+        m.frozen_bonds.retain(|b| b.validator != 1);
+        let without_frozen = state_root(&state(&m));
+        assert_ne!(without_frozen, base);
+        assert_ne!(without_frozen, without_msg);
+        assert_ne!(without_frozen, without_fee);
     }
 
     #[test]

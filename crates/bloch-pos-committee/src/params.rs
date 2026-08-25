@@ -468,6 +468,63 @@ pub mod rehearsal {
     pub static HOOK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     thread_local! {
+        static ROSTER_FREEZE_OPEN_TL: Cell<bool> = const { Cell::new(false) };
+    }
+
+    thread_local! {
+        static REVERT_ROSTER_FREEZE_TL: Cell<bool> = const { Cell::new(false) };
+    }
+    /// **MUTATION.** Reverts the epoch-roster freeze: makes
+    /// `transition::CommittedState::roster_freeze_binds` answer `false` even
+    /// with the gate open, i.e. puts the pre-2026-08-25 rule back, in which a
+    /// mid-epoch slash shrinks the roster and re-sorts every remaining
+    /// proposer of the epoch.
+    ///
+    /// It exists so the freeze's tests can be shown to go RED against the
+    /// defect they claim to close. A test of a gated consensus rule that has
+    /// never been run against the un-gated rule is a test of a fixture.
+    ///
+    /// Thread-local; see [`TlFlag`] for why this is not an `AtomicBool` — the
+    /// switch is read from inside a consensus function that almost every test
+    /// in this crate reaches, and `cargo test` runs them in parallel.
+    pub static REVERT_ROSTER_FREEZE: TlFlag = TlFlag(&REVERT_ROSTER_FREEZE_TL);
+
+    /// Test-only: treat [`super::ROSTER_FREEZE_ACTIVATION_EPOCH`] as if it had
+    /// already bound, on this thread only.
+    ///
+    /// **A switch of its own, deliberately NOT [`gates_are_forced_open`].**
+    /// That flag is already read by `seed_for_epoch` and by `finality`, and
+    /// seven tests in this crate hold it open to exercise the seed look-ahead
+    /// and the leak-recovery rules. If the roster freeze hung off the same
+    /// flag, every one of those tests would silently switch to a THIRD
+    /// consensus rule it was never written for — the same class of accident as
+    /// a process-global mutation switch leaking across threads, only worse,
+    /// because it would look deliberate. A separate flag makes the blast
+    /// radius of this gate exactly the tests that ask for it.
+    ///
+    /// Default CLOSED, like its neighbour: an unadorned `cargo test` exercises
+    /// the configuration the fleet actually runs, and the below-gate tests are
+    /// therefore the DEFAULT reading rather than an opt-in.
+    pub fn roster_freeze_forced_open() -> bool {
+        ROSTER_FREEZE_OPEN_TL.with(|c| c.get())
+    }
+
+    /// Opens the roster-freeze gate for this thread until the guard drops —
+    /// including on the unwind path, so a failing assertion cannot leave the
+    /// rule mutated for the rest of the thread.
+    #[cfg(test)]
+    pub fn roster_freeze_open_guard() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                ROSTER_FREEZE_OPEN_TL.with(|c| c.set(self.0));
+            }
+        }
+        let prev = ROSTER_FREEZE_OPEN_TL.with(|c| c.replace(true));
+        Restore(prev)
+    }
+
+    thread_local! {
         /// Plant a one-bit difference in every seed, so the A/B chain
         /// comparator can be shown to go red on a difference that is really
         /// there.
@@ -595,6 +652,109 @@ pub const ANCESTRY_SEED_ACTIVATION_EPOCH: u64 = u64::MAX;
 ///
 /// `u64::MAX` means INERT. Same arming rules as above.
 pub const LEAK_RECOVERY_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+/// Flag day for the **epoch-frozen duty roster** — the rule that makes
+/// slashing stop duties at the next epoch boundary instead of in the act.
+///
+/// # The defect
+///
+/// Every other mutator of the duty roster defers to a boundary, by design:
+/// `Deposit` writes `activation_epoch = u64::MAX` and waits for the activation
+/// queue, `Exit` writes `epoch + EXIT_DELAY_EPOCHS`, `Delegate` writes
+/// `requested_epoch = epoch + 1` under the comment *"nothing included during E
+/// may change it"*, and proposer fee rewards sit in `pending_fee_rewards`
+/// until the boundary compounds them, expressly so that "effective stake, and
+/// with it every committee and schedule, is frozen for the epoch's whole
+/// duration".
+///
+/// `apply_slashing_evidence` is the one that acts immediately. It writes three
+/// things into the registry the moment a valid `SlashingEvidence` transaction
+/// is applied, mid-epoch:
+///
+/// 1. `rec.slashed = true` — and `duty_roster_at` filters on `slashed`, so the
+///    index set SHRINKS between two blocks of one epoch;
+/// 2. `rec.exit_epoch = epoch` — and `duty_roster_at` filters on
+///    `epoch >= exit_epoch` too, so the same removal happens twice over;
+/// 3. `rec.staked_sat -= own_loss` — and the proposer draw is stake-WEIGHTED
+///    (`sample::sample` builds a cumulative-stake array), so the weights move
+///    as well as the membership.
+///
+/// Each of the three re-sorts the epoch. A Fisher-Yates over a list of a
+/// different length is a different permutation everywhere, so (1) and (2)
+/// re-partition every committee; (3) moves the cumulative array under every
+/// remaining draw. The measured damage is the one that matters most:
+/// **`schedule::proposer` changes for every remaining slot of the epoch.** A
+/// slash included at slot 3 rewrites who is allowed to propose at slots 4..31.
+///
+/// The crate already documents the hole, in three places, and each of them
+/// names this fix: `duty_roster_at`'s *"Caveat: the index set is NOT frozen for
+/// the epoch"*, the `debug_assert_eq!` in `close_epoch` (*"fixing that means
+/// freezing the epoch's roster at its first slot, which is a consensus rule
+/// change and needs its own flag day"*), and
+/// `report_boundary_vote_drop`, which exists because the divergence is
+/// reachable by anyone who can get valid equivocation evidence included and
+/// therefore must NOT be a `consensus_invariant!`.
+///
+/// # The rule this gate turns on
+///
+/// At and above this epoch, a validator slashed **during** epoch `E` keeps its
+/// place and its opening bond in `duty_roster_at(E)` for the rest of `E`, and
+/// leaves at the `E → E+1` boundary. Nothing else about the slash moves: the
+/// penalty is charged now, the record is flagged now, the ejection is recorded
+/// now, the whistleblower is paid now. Only the roster's *view* of the open
+/// epoch is frozen — which is what every other mutator already gets.
+///
+/// The freeze is carried by one committed component,
+/// [`crate::transition::CommittedState`]'s `epoch_frozen_bonds` (state root
+/// tag `0x17`), holding the offender's own bond as it stood when the epoch
+/// opened. `close_epoch` clears it at every boundary, so it is empty in every
+/// epoch in which nobody was slashed — which is every epoch of the existing
+/// chain, and the reason the state root below this gate is byte-identical.
+///
+/// # `u64::MAX` means INERT, and here that is not a formality
+///
+/// **The premise that this "costs zero flag day if it lands in the relaunch
+/// genesis" does not hold.** The founder decided to PRESERVE the history, not
+/// to cut a new genesis. Changing `duty_roster_at` changes which proposer is
+/// valid for a slot, therefore changes block validation, therefore changes the
+/// replay of blocks already in every node's log. And boot is a replay through
+/// `Engine::ingest`, which REJECTS-AND-CONTINUES: the 64 nodes would park at an
+/// old height in silence, console green, exactly the failure
+/// [`ANCESTRY_SEED_ACTIVATION_EPOCH`] documents.
+///
+/// So, the same three properties as the two gates above:
+///
+/// - **The gate reads the epoch of the BLOCK**, never a wall clock and never
+///   node-local mutable state — the standing reason is the 2026-08-08
+///   `expected_bits` split, where a rule derived from local state divided a
+///   fleet of byte-identical binaries.
+/// - **Below the gate the behaviour is byte for byte what ships today.** Not
+///   "equivalent": the same branch, the same predicate, the same leaves. That
+///   is what keeps the existing log replayable.
+/// - **Nothing is armed here.** Filling this in is a coordinated fleet rebuild
+///   followed by an epoch strictly in the future, and it is the founder's call,
+///   not this constant's. Arming an epoch already in the past fails SILENTLY —
+///   the failure that let 1,600,000 BLCH escape a write-off that never fired.
+///
+/// # Two consequences, stated rather than discovered later
+///
+/// 1. **A validator slashed during `E` is still paid for `E`.** `close_epoch`
+///    splits the epoch's issuance over `duty_roster_at(closing)` with no
+///    `slashed` clause of its own, so freezing the roster keeps the offender in
+///    the reward loop for the epoch it was caught in. That is a small number
+///    beside the penalty — one epoch of issuance against a `penalty_bps` bite
+///    of the whole bond, amplified by the correlation window — and it is the
+///    price of the schedule being frozen. Charging it back would be a SECOND
+///    consensus decision, with its own flag day; it is deliberately not made
+///    here. If the founder wants it, the place is step 2 of `close_epoch`, not
+///    the roster.
+/// 2. **The offender still counts in the epoch's finality quorum**, numerator
+///    and denominator both. That is not a side effect, it is the point: the
+///    votes admitted against the wide partition are tallied against the same
+///    wide partition, which is what stops the boundary dropping them.
+///
+/// Pinned by `the_roster_freeze_gate_is_inert`.
+pub const ROSTER_FREEZE_ACTIVATION_EPOCH: u64 = u64::MAX;
 
 /// Domain separation tags (§6.1). Fixed 16 bytes, right-padded with zeros, so
 /// no tag can be a prefix of another.

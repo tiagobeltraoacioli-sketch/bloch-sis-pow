@@ -126,6 +126,12 @@ pub struct ChainState {
     /// Delegator fee-reward ledger, carried unchanged: it is filled at the
     /// epoch boundary, which is the transition's job.
     pub delegator_fee_rewards: Vec<crate::state_root::DelegatorFeeRecord>,
+    /// Bonds frozen for the open epoch by a mid-epoch slash
+    /// (`state_root::TAG_EPOCH_FROZEN_BOND`), carried unchanged: filling it is
+    /// `transition::apply_slashing_evidence`'s job and clearing it is
+    /// `close_epoch`'s, neither of which this seam performs. Empty in every
+    /// state this module builds, and an empty component inserts no leaves.
+    pub frozen_bonds: Vec<crate::state_root::FrozenBondRecord>,
 }
 
 impl ChainState {
@@ -151,6 +157,7 @@ impl ChainState {
             delegator_slash_losses: &self.delegator_slash_losses,
             base_fee: self.base_fee,
             delegator_fee_rewards: &self.delegator_fee_rewards,
+            frozen_bonds: &self.frozen_bonds,
             taint_root: self.taint_root,
             coherence_accumulator_root: self.coherence_accumulator_root,
             coherence_nullifier_root: self.coherence_nullifier_root,
@@ -650,6 +657,7 @@ mod coherence_tests {
                 tx_bytes: 0,
             },
             delegator_fee_rewards: Vec::new(),
+            frozen_bonds: Vec::new(),
             evm: EvmCommitment {
                 account_root: [0u8; 32],
                 receipts_root: [0u8; 32],

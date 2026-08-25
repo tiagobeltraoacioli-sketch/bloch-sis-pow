@@ -990,6 +990,21 @@ pub static BOUNDARY_VOTE_DROPS: AtomicU64 = AtomicU64::new(0);
 /// every node that applied the same block. See
 /// `mid_epoch_slashing_changes_the_roster_index_set_within_one_epoch`.
 ///
+/// **The cause is closed above
+/// [`crate::params::ROSTER_FREEZE_ACTIVATION_EPOCH`] — this detector still
+/// is not an `assert!`, and promoting it is not this change's call.** Above
+/// the gate the epoch's roster is frozen at its first slot, so a mid-epoch
+/// slash no longer shrinks the index set and no longer drops votes; this
+/// counter should therefore stop moving for that reason. It must keep
+/// existing, and keep being non-fatal, for two reasons that have nothing to do
+/// with slashing: below the gate — i.e. across the entire chain the fleet is
+/// replaying today — the divergence is still live and still reachable by
+/// anyone who can get evidence included; and the counter's job is to make an
+/// UNEXPECTED divergence visible, which is a job that only starts once the
+/// expected one is gone. A gate is a promise about the future, not a proof
+/// about the present, and turning this into a halt on the strength of that
+/// promise would be trading a silent bug for a remote stop button.
+///
 /// So the requirement behind the guard — *production must be able to SEE this,
 /// which today it cannot* — is met without the fatality: an unconditional,
 /// loud, structured, rate-limited line on stderr plus a counter. The
@@ -1098,6 +1113,35 @@ pub struct CommittedState {
     /// exclusively from evidence transactions in blocks — never from gossip,
     /// which only *captures* candidate pairs (gossip.rs).
     slashing: slashing::SlashingState,
+    /// **The epoch freeze.** Validator index → the validator's own bond, in
+    /// satoshis, as it stood at the first slot of the OPEN epoch — one entry
+    /// for each validator slashed *during* the open epoch, and nothing else.
+    ///
+    /// Empty at every boundary ([`Self::close_epoch`] clears it) and therefore
+    /// empty in every epoch in which nobody was slashed — which is every epoch
+    /// of the chain this fleet is replaying, and the reason a binary carrying
+    /// this field commits byte-identical roots to one that does not
+    /// (`state_root::an_empty_frozen_bond_component_does_not_move_the_root`).
+    ///
+    /// **Only written above
+    /// [`crate::params::ROSTER_FREEZE_ACTIVATION_EPOCH`]**, and only read
+    /// there. Below the gate `apply_slashing_evidence` never inserts and
+    /// `duty_roster_at` never looks, so the map cannot influence a single byte
+    /// of the historical replay.
+    ///
+    /// # Why this has to be committed
+    ///
+    /// It decides who may propose. Above the gate `duty_roster_at` keeps a
+    /// mid-epoch-slashed validator in the epoch's roster at this bond, so two
+    /// nodes that disagreed about the number would disagree about
+    /// `schedule::proposer` for every remaining slot of the epoch. And it is
+    /// not recoverable from anything else the state holds: `staked_sat` has
+    /// already been debited by the time anyone asks, and
+    /// `slashing.window_entries()` records a per-EPOCH total, not a
+    /// per-validator one. A quantity that decides consensus and lives outside
+    /// the committed state is `expected_bits` with a different name (§5.5, and
+    /// the 2026-08-08 split).
+    epoch_frozen_bonds: BTreeMap<u32, u128>,
     /// Cumulative slashing losses per delegator account, in satoshis.
     ///
     /// A separate ledger, NOT a mutation of the delegation records: the
@@ -1108,7 +1152,10 @@ pub struct CommittedState {
     /// node's withdrawal surface nets it out
     /// (`delegator_slash_loss_sat`). The delegated stake itself stops
     /// counting the moment the operator is slashed, because the duty roster
-    /// skips slashed validators entirely.
+    /// skips slashed validators entirely — at and above
+    /// [`crate::params::ROSTER_FREEZE_ACTIVATION_EPOCH`], at the end of the
+    /// epoch the slash landed in rather than in the act, like every other
+    /// roster mutator.
     delegator_slash_losses: BTreeMap<u32, u128>,
     /// Cumulative **fee** rewards settled to each delegator account, in
     /// satoshis — the earning mirror of [`Self::delegator_slash_losses`], and
@@ -1441,6 +1488,9 @@ impl CommittedState {
             delegations: Vec::new(),
             pending_fee_rewards: BTreeMap::new(),
             slashing: slashing::SlashingState::new(),
+            // Nothing is slashed at genesis, and epoch 0 is below every flag
+            // day there will ever be.
+            epoch_frozen_bonds: BTreeMap::new(),
             delegator_slash_losses: BTreeMap::new(),
             delegator_fee_rewards: BTreeMap::new(),
             // Genesis opens at the price floor, with no usage behind it: the
@@ -1597,12 +1647,39 @@ impl CommittedState {
     /// `effective_stake` field, which decides weight; not in the filter, which
     /// decides membership.
     ///
-    /// # Caveat: the index set is NOT frozen for the epoch
+    /// # Caveat below [`crate::params::ROSTER_FREEZE_ACTIVATION_EPOCH`]: the
+    /// index set is NOT frozen for the epoch
     ///
     /// The stake is, but the membership is not: `apply_slashing_evidence` sets
     /// `slashed` mid-epoch, so a validator can leave this roster between two
     /// blocks of the same epoch and re-sort the partition under votes already
     /// admitted. See the comment on the `debug_assert_eq!` in `close_epoch`.
+    /// That is the rule the existing chain was produced and validated under,
+    /// so it is the rule this function keeps below the gate, unchanged.
+    ///
+    /// # At and above the gate: the epoch's roster is frozen at its first slot
+    ///
+    /// A validator slashed **during** epoch `E` keeps its index and its
+    /// opening bond here for the rest of `E`, and leaves at the `E → E+1`
+    /// boundary — the same deferral `Deposit`, `Exit`, `Delegate` and the
+    /// pending fee rewards already obey. Three things move under a mid-epoch
+    /// slash and all three are frozen, because all three re-sort the epoch:
+    ///
+    /// | written by the slash | what it re-sorts |
+    /// |---|---|
+    /// | `slashed = true` | index set → a different Fisher-Yates length → every committee |
+    /// | `exit_epoch = epoch` | the same removal, by the other clause |
+    /// | `staked_sat -= loss` | the cumulative-stake array → every weighted draw |
+    ///
+    /// Freezing only the first two would leave the proposer still moving,
+    /// because `sample::sample` is stake-weighted. The bond is therefore
+    /// carried in [`CommittedState::epoch_frozen_bonds`] rather than re-derived
+    /// — by the time anyone asks, `staked_sat` has already been debited.
+    ///
+    /// The freeze covers **the open epoch only** (`epoch == self.epoch`). A
+    /// look-ahead call for `E+1` gets the live predicate, so a validator
+    /// slashed during `E` is correctly absent from `E+1`'s roster; that is what
+    /// makes the ejection land at the boundary instead of never.
     fn duty_roster_at(&self, epoch: u64) -> Vec<Validator> {
         // Delegated stake resolved by the delegation module's own fold; its
         // per-validator cap uses the fixed-point form (rule 3 — the cap is
@@ -1610,12 +1687,29 @@ impl CommittedState {
         let reg = delegation::Registry::resolve(&self.delegations, epoch);
         let delegated = reg.validators(); // sorted by index
 
+        // GATED, on the epoch of the BLOCK being asked about — never a clock,
+        // never node-local state (§5.5; the 2026-08-08 `expected_bits` split).
+        // Below the gate this is `false` for every epoch the existing chain
+        // contains, the two `frozen` lookups below are `None`, and the loop is
+        // the one that shipped, statement for statement.
+        let freeze = self.roster_freeze_binds(epoch);
+
         let mut roster: Vec<Validator> = Vec::new();
         for (idx, rec) in &self.validators {
-            if rec.slashed || rec.activation_epoch > epoch || epoch >= rec.exit_epoch {
+            // `Some(bond)` ⇒ this validator was slashed during the open epoch
+            // and this is the bond it opened the epoch with. Empty map below
+            // the gate, and empty in any epoch with no slash.
+            let frozen = if freeze { self.epoch_frozen_bonds.get(idx).copied() } else { None };
+            if frozen.is_none()
+                && (rec.slashed || rec.activation_epoch > epoch || epoch >= rec.exit_epoch)
+            {
                 continue;
             }
-            let own = sat_u64(rec.staked_sat);
+            // The frozen bond replaces the debited one; the delegated share and
+            // the cohort cap are recomputed exactly as always, because a slash
+            // mutates neither (`delegator_slash_losses` is a separate ledger —
+            // the delegation records are never edited).
+            let own = sat_u64(frozen.unwrap_or(rec.staked_sat));
             let del = delegated
                 .binary_search_by_key(idx, |v| v.index)
                 .map(|p| delegated[p].effective_stake)
@@ -1625,6 +1719,46 @@ impl CommittedState {
         // The cohort cap's closed form (`s/(1-s) · others`) lives in
         // genesis_cohort.rs; this call is the whole integration.
         genesis_cohort::apply_cohort_cap(&roster, &self.genesis_cohort, epoch)
+    }
+
+    /// Does the epoch-freeze rule bind for a roster query about `epoch`?
+    ///
+    /// **One expression, three call sites** (`duty_roster_at`,
+    /// `apply_slashing_evidence`, `close_epoch`) — the writer and the reader
+    /// must never be able to disagree about whether the gate is open, because a
+    /// state that froze a bond nobody reads back is a state whose root nobody
+    /// else computes.
+    ///
+    /// Two clauses, and both matter:
+    ///
+    /// - `epoch >= ROSTER_FREEZE_ACTIVATION_EPOCH` — the flag day, read off the
+    ///   epoch derived from the block, never a wall clock.
+    /// - `epoch == self.epoch` — the freeze describes the OPEN epoch, and
+    ///   `epoch_frozen_bonds` is cleared at every boundary, so applying it to
+    ///   any other epoch would be reading one epoch's freeze into another's
+    ///   roster. `close_epoch` clears the map *before* it advances
+    ///   `self.epoch`, so there is no instant at which the new epoch can see
+    ///   the old epoch's entries.
+    ///
+    /// In a test build the flag day can be opened per-thread — see
+    /// `params::rehearsal::roster_freeze_open_guard`. Constant `false` in any
+    /// build that is not a test build, so the whole rule folds away below the
+    /// gate.
+    #[inline]
+    fn roster_freeze_binds(&self, epoch: u64) -> bool {
+        if mutation_roster_freeze_reverted() {
+            return false;
+        }
+        if epoch != self.epoch {
+            return false;
+        }
+        #[cfg(test)]
+        {
+            if crate::params::rehearsal::roster_freeze_forced_open() {
+                return true;
+            }
+        }
+        epoch >= crate::params::ROSTER_FREEZE_ACTIVATION_EPOCH
     }
 
     fn duty_roster(&self) -> Vec<Validator> {
@@ -1840,6 +1974,20 @@ impl CommittedState {
                 reward_sat: *reward_sat,
             })
             .collect();
+        // The epoch freeze (2026-08-25). Empty in every epoch with no
+        // mid-epoch slash and in every epoch below the roster-freeze gate, and
+        // an empty component inserts no leaves — which is what keeps this
+        // binary's roots byte-identical to the ones the existing block log
+        // already carries.
+        let frozen_bonds: Vec<crate::state_root::FrozenBondRecord> = self
+            .epoch_frozen_bonds
+            .iter()
+            .map(|(validator, bond_sat)| crate::state_root::FrozenBondRecord {
+                validator: *validator,
+                epoch: self.epoch,
+                bond_sat: *bond_sat,
+            })
+            .collect();
 
         // The eUTXO component comes in as the subtree the set already holds,
         // not as a cloned vector of entries to re-serialize, re-hash and
@@ -1872,6 +2020,7 @@ impl CommittedState {
                 tx_bytes: self.block_tx_bytes,
             },
             delegator_fee_rewards: &delegator_fee_rewards,
+            frozen_bonds: &frozen_bonds,
             taint_root: self.taint_root,
             coherence_accumulator_root: self.coherence_accumulator_root,
             coherence_nullifier_root: self.coherence_nullifier_root,
@@ -2464,6 +2613,63 @@ impl CommittedState {
     ///   like every other in-epoch reward (effective stake stays frozen
     ///   within the epoch). The rest of the penalty is burned by never being
     ///   credited to anyone — the same burn-by-omission as the base fee.
+    /// Everything a slash writes into the offender's registry record: the
+    /// ejection, the bond debit, the withdrawal lock, and — above
+    /// [`crate::params::ROSTER_FREEZE_ACTIVATION_EPOCH`] — the epoch freeze
+    /// that keeps the offender in the open epoch's roster until its boundary.
+    ///
+    /// **Split out so the tests drive the real writer.** The
+    /// mid-epoch-slash tests used to reproduce these writes by hand, under a
+    /// comment saying "exactly what `apply_slashing_evidence` writes" — a
+    /// comment, not a check. That is how a roster rule survives being tested:
+    /// the fixture and the function drift, and the tests keep passing against
+    /// a rule the node no longer runs. The tests call this; so does
+    /// `apply_slashing_evidence`; there is one definition of what a slash does
+    /// to a record.
+    fn eject_for_slash(&mut self, offender: u32, own_loss_sat: u128) {
+        let epoch = self.epoch;
+        // THE EPOCH FREEZE (gated). Record the bond this validator opened the
+        // epoch with, BEFORE the debit below destroys it, so `duty_roster_at`
+        // can keep the epoch's roster — index set AND weights — exactly as it
+        // stood at the epoch's first slot. `or_insert`, never overwrite: a
+        // validator cannot be slashed twice (`slashing.is_ejected` refuses the
+        // second), but if that ever changed, the FIRST reading is the one that
+        // was the epoch's opening bond, and the second would already be
+        // post-debit.
+        //
+        // Below the gate this is skipped entirely and the map stays empty, so
+        // neither the registry writes below nor the state root move by a byte
+        // from what the existing chain committed.
+        if self.roster_freeze_binds(epoch) {
+            // Copied out of the record before the map is touched: `rec` would
+            // hold a borrow of `self` across the insert otherwise.
+            if let Some(bond) = self.validators.get(&offender).map(|r| r.staked_sat) {
+                self.epoch_frozen_bonds.entry(offender).or_insert(bond);
+            }
+        }
+        if let Some(rec) = self.validators.get_mut(&offender) {
+            rec.slashed = true;
+            rec.staked_sat = rec.staked_sat.saturating_sub(own_loss_sat);
+            // Ejection: duties stop now — below the gate, in the act; above it,
+            // at the next boundary, because `duty_roster_at` reads the freeze
+            // above and this clause only bites once the epoch has turned.
+            // min(), because a validator already exiting must not have its exit
+            // pushed later by the slash.
+            if epoch < rec.exit_epoch {
+                rec.exit_epoch = epoch;
+            }
+            // The residue stays reachable through the weak-subjectivity
+            // margin, and a slash never *shortens* a scheduled lock
+            // (`u64::MAX` means no lock was scheduled at all).
+            let lock = epoch.saturating_add(staking::WITHDRAWAL_DELAY_EPOCHS);
+            rec.withdrawable_epoch = if rec.withdrawable_epoch == u64::MAX {
+                lock
+            } else {
+                rec.withdrawable_epoch.max(lock)
+            };
+        }
+    }
+
     fn apply_slashing_evidence(
         &mut self,
         evidence: &SlashingEvidence,
@@ -2535,25 +2741,7 @@ impl CommittedState {
         }
         .map_err(|_| ())?;
 
-        let epoch = self.epoch;
-        if let Some(rec) = self.validators.get_mut(&offender) {
-            rec.slashed = true;
-            rec.staked_sat = rec.staked_sat.saturating_sub(outcome.delegation_losses_sat[0]);
-            // Ejection: duties stop now. min(), because a validator already
-            // exiting must not have its exit pushed later by the slash.
-            if epoch < rec.exit_epoch {
-                rec.exit_epoch = epoch;
-            }
-            // The residue stays reachable through the weak-subjectivity
-            // margin, and a slash never *shortens* a scheduled lock
-            // (`u64::MAX` means no lock was scheduled at all).
-            let lock = epoch.saturating_add(staking::WITHDRAWAL_DELAY_EPOCHS);
-            rec.withdrawable_epoch = if rec.withdrawable_epoch == u64::MAX {
-                lock
-            } else {
-                rec.withdrawable_epoch.max(lock)
-            };
-        }
+        self.eject_for_slash(offender, outcome.delegation_losses_sat[0]);
         for (d, loss) in self
             .delegations
             .iter()
@@ -2768,13 +2956,19 @@ impl CommittedState {
             // Removing the `effective_stake > 0` filter from
             // `epoch_committees` closed the LEAK half of this divergence (the
             // two rosters now carry the same index set whatever the leak does).
-            // It does not close the SLASHING half, which is a membership change
-            // in committed state, not a stake change — fixing that means
-            // freezing the epoch's roster at its first slot, which is a
-            // consensus rule change and needs its own flag day and rollout.
-            // Until that lands, this stays a test-build guard, and the
-            // divergence is pinned by
-            // `mid_epoch_slashing_changes_the_roster_index_set_within_one_epoch`.
+            //
+            // The SLASHING half is closed at and above
+            // `params::ROSTER_FREEZE_ACTIVATION_EPOCH`, which is exactly the
+            // "freezing the epoch's roster at its first slot" this comment used
+            // to name as future work — and it needed its own flag day for the
+            // reason that constant documents, so it ships INERT. BELOW the gate
+            // — which is every block in the log this fleet replays — the
+            // divergence is unchanged and still driven by untrusted input, so
+            // this stays a test-build guard and the promotion the 2026-08-24
+            // brief asked for stays refused. The below-gate behaviour is pinned
+            // by `mid_epoch_slashing_changes_the_roster_index_set_within_one_epoch`
+            // and the above-gate behaviour by
+            // `above_the_gate_a_mid_epoch_slash_drops_no_boundary_votes`.
             // The unconditional half of the guard: present in the release
             // binary, never fatal. See `report_boundary_vote_drop` for why
             // fatal is wrong here and what would have to change to make it
@@ -2801,6 +2995,14 @@ impl CommittedState {
         //    are attestation inclusion: a validator whose vote never landed
         //    earns nothing this epoch, forfeiting its slice (its delegators'
         //    exposure to that is what makes delegation a real choice).
+        //
+        //    Note what `roster` is at and above
+        //    `params::ROSTER_FREEZE_ACTIVATION_EPOCH`: the epoch's FROZEN
+        //    roster, so a validator slashed during this epoch is still in it
+        //    and is still paid for the epoch it was caught in. That is a
+        //    consequence of freezing the schedule, not an oversight — see the
+        //    constant's docs. Clawing it back is a second consensus decision
+        //    and would belong right here, gated separately.
         let first_slot = closing * SLOTS_PER_EPOCH;
         let mut epoch_issuance: u128 = 0;
         for s in first_slot..first_slot + SLOTS_PER_EPOCH {
@@ -2954,6 +3156,19 @@ impl CommittedState {
 
         // 5. Open E+1. The cohort cap for the new epoch is applied inside
         //    duty_roster_at (genesis_cohort.rs closed form — rule 3).
+        //
+        // THE EPOCH FREEZE EXPIRES HERE, and it must expire BEFORE
+        // `st.epoch` advances. The freeze is keyed to the open epoch by
+        // `roster_freeze_binds`'s `epoch == self.epoch` clause, so if the map
+        // still held E's entries at the instant `st.epoch` became E+1, the
+        // `consensus_roster_at(next_epoch)` two lines down would build E+1's
+        // roster out of E's freeze — and the validator slashed in E would
+        // never be ejected at all. Clearing first is what turns "duties stop
+        // now" into "duties stop at the next boundary" rather than "duties
+        // never stop".
+        //
+        // A no-op below the gate: nothing was ever inserted.
+        st.epoch_frozen_bonds.clear();
         st.epoch = next_epoch;
         st.pending_votes.clear();
         let roster_next = st.consensus_roster_at(next_epoch);
@@ -3039,6 +3254,23 @@ fn with_leak_applied(roster: Vec<Validator>, leaked_of: impl Fn(u32) -> u64) -> 
 ///
 /// Constant `false` in every build that is not a test build, so the branch
 /// folds away and the switch cannot exist in a shipped binary.
+/// **MUTATION SWITCH.** `true` reverts the epoch-roster freeze — a slash
+/// removes the validator and re-weights the roster in the act again, which is
+/// the defect. Used only to drive the freeze's own tests red.
+///
+/// Constant `false` in every build that is not a test build, so the branch
+/// folds away and the switch cannot exist in a shipped binary.
+#[inline]
+fn mutation_roster_freeze_reverted() -> bool {
+    #[cfg(test)]
+    {
+        return crate::params::rehearsal::REVERT_ROSTER_FREEZE
+            .load(std::sync::atomic::Ordering::Relaxed);
+    }
+    #[cfg(not(test))]
+    false
+}
+
 #[inline]
 fn mutation_leak_drops_zeroed() -> bool {
     #[cfg(test)]
@@ -6437,6 +6669,13 @@ mod tests {
         must_move!("delegator_slash_losses", |g: &mut CommittedState| {
             g.delegator_slash_losses.insert(4, 777);
         });
+        // The epoch freeze (2026-08-25). It decides who may propose for the
+        // rest of an epoch, so it is committed for the strongest form of the
+        // §5.5 reason: two nodes disagreeing on this number disagree on the
+        // schedule itself.
+        must_move!("epoch_frozen_bonds", |g: &mut CommittedState| {
+            g.epoch_frozen_bonds.insert(2, 123_456);
+        });
         // Validator commission — it decides how a boundary splits BOTH revenue
         // streams, so a node that disagreed on it would compound a different
         // bond from the same block.
@@ -7280,13 +7519,13 @@ mod tests {
         }
         assert_eq!(st.pending_votes.len(), 8, "fixture must actually carry votes");
 
-        // The mid-epoch slash, written the way apply_slashing_evidence writes
-        // it — the unit seam, so the test does not need valid PQ evidence.
-        {
-            let rec = st.validators.get_mut(&3).unwrap();
-            rec.slashed = true;
-            rec.exit_epoch = 1;
-        }
+        // The mid-epoch slash, through the REAL writer — the unit seam, so the
+        // test does not need valid PQ evidence, but not a hand-copied
+        // imitation of it either: `eject_for_slash` is the function
+        // `apply_slashing_evidence` calls, so this fixture cannot drift from
+        // the rule the node runs. Zero loss: this test is about the MEMBERSHIP
+        // half of the divergence, and a bond debit would confound it.
+        st.eject_for_slash(3, 0);
 
         let before = BOUNDARY_VOTE_DROPS.load(Relaxed);
         let prev = std::panic::take_hook();
@@ -7414,15 +7653,13 @@ mod tests {
         let before = g.duty_roster_at(g.epoch);
         assert_eq!(before.len(), 8);
 
-        // Exactly what `apply_slashing_evidence` writes, minus the evidence
-        // plumbing — the unit seam, the same pattern `with_leak_applied` is
-        // tested at.
+        // Through the REAL writer, minus the evidence plumbing — the unit
+        // seam, the same pattern `with_leak_applied` is tested at.
+        // `eject_for_slash` is what `apply_slashing_evidence` calls, so this
+        // cannot drift from the rule the node runs; zero loss, because this
+        // test isolates the MEMBERSHIP half.
         let mut after_state = g.clone();
-        {
-            let rec = after_state.validators.get_mut(&3).unwrap();
-            rec.slashed = true;
-            rec.exit_epoch = after_state.epoch;
-        }
+        after_state.eject_for_slash(3, 0);
         let after = after_state.duty_roster_at(after_state.epoch);
 
         assert_eq!(after.len(), 7, "a slash must remove the record from the duty roster");
@@ -7455,6 +7692,534 @@ mod tests {
             "MID-EPOCH SLASH: one validator removed from an 8-member roster moved {moved} of \
              the remaining 7 into a different slot. Stake changes are invariant; membership \
              changes are not."
+        );
+    }
+
+    // ── The epoch-roster freeze, both sides of its flag day ─────────────────
+    //
+    // Four tests and their mutations. The below-gate one is the one that
+    // protects the existing chain: the founder chose to PRESERVE the history
+    // rather than cut a new genesis, so every historical block is re-validated
+    // on boot against the state root its own header carries. A rule change that
+    // reached those blocks would not merely disagree — `Engine::ingest`
+    // rejects-and-continues, so 64 nodes would park at an old height in
+    // silence, console green.
+
+    /// The shared fixture: 8 validators, epoch 1 open, a real bond, and the
+    /// loss a slash charges against it.
+    ///
+    /// `epoch = 1` and not 0 so that "the boundary after this epoch" is a real
+    /// close (`close_epoch` runs its finality step only from epoch 1) and the
+    /// slot numbers of the epoch are `32..64`.
+    fn freeze_fixture() -> (CommittedState, u128, u128) {
+        let (_t, g, _c) = setup(8);
+        let mut st = g;
+        st.epoch = 1;
+        let bond = st.validators[&3].staked_sat;
+        // A real slash charges `penalty_bps` of the bond; the exact fraction is
+        // slashing.rs's business and not this rule's. What matters here is that
+        // the loss is NON-ZERO, because a zero loss would leave `staked_sat`
+        // untouched and quietly turn the stake half of every assertion below
+        // into a tautology.
+        let loss = bond / 16;
+        assert!(loss > 0, "fixture bond too small to model a slash: the stake half is vacuous");
+        (st, bond, loss)
+    }
+
+    /// The 32 proposers of epoch 1, off a given roster.
+    fn epoch1_proposers(seed: &[u8; 32], roster: &[Validator]) -> Vec<Option<u32>> {
+        (0..SLOTS_PER_EPOCH)
+            .map(|i| schedule::proposer(seed, SLOTS_PER_EPOCH + i, roster))
+            .collect()
+    }
+
+    /// **TRIPWIRE.** The gate ships INERT and this change arms nothing.
+    ///
+    /// Note what this can and cannot do — the same honest caveat
+    /// `LEAKED_ROSTER_ACTIVATION_EPOCH` carries. It compares the constant
+    /// against a literal, i.e. a copy of itself, so it catches a SILENT change
+    /// of the value. It cannot catch the value having been wrong to begin with.
+    /// The behavioural tests on either side of the gate are what cover that,
+    /// which is why they exist and why this assertion is not the proof.
+    #[test]
+    fn the_roster_freeze_gate_is_inert() {
+        assert_eq!(
+            crate::params::ROSTER_FREEZE_ACTIVATION_EPOCH,
+            u64::MAX,
+            "the epoch-roster freeze has been ARMED. Arming it is a coordinated fleet \
+             rebuild followed by an epoch strictly in the future, and it is the founder's \
+             call. An epoch armed in the PAST fails silently - that is how 1,600,000 BLCH \
+             escaped a write-off that never fired."
+        );
+    }
+
+    /// **TEST 1 — BELOW THE GATE, NOTHING CHANGES. This is the test that
+    /// protects the history.**
+    ///
+    /// In the shipped configuration a mid-epoch slash must still do every one
+    /// of the four things it does today, because the 64 nodes are going to
+    /// replay a log full of blocks produced under exactly that rule:
+    ///
+    /// 1. nothing is frozen — so the new committed component stays empty and
+    ///    inserts no leaf, and the state root is the one the historical headers
+    ///    already carry (`state_root::an_empty_frozen_bond_component_does_not_move_the_root`);
+    /// 2. the roster's index set shrinks in the act, 8 → 7;
+    /// 3. the epoch's remaining proposers are re-sorted;
+    /// 4. the boundary tally drops the votes step 8 admitted, and the
+    ///    unconditional detector counts it.
+    ///
+    /// It asserts the DEFECT, deliberately. A test that asserted the fix here
+    /// would be asserting that the fleet cannot boot.
+    ///
+    /// **No gate guard**, which is the point: this is what a bare `cargo test`
+    /// runs, so the configuration the fleet ships is the DEFAULT reading of
+    /// this file rather than an opt-in. Its mutation
+    /// (`mutation_arming_the_freeze_reddens_the_history_test`) arms the gate
+    /// and watches all four go red.
+    #[test]
+    fn below_the_gate_a_mid_epoch_slash_behaves_exactly_as_it_ships_today() {
+        // `BOUNDARY_VOTE_DROPS` is a PROCESS-wide counter and `cargo test` runs
+        // these on parallel threads, so every test that reads it before/after a
+        // close serialises here. This one asserts the counter MOVED, which a
+        // concurrent bump could only help; the above-gate test asserts it did
+        // NOT, which a concurrent bump would break. Same lock for both.
+        let _h = crate::params::rehearsal::HOOK.lock().unwrap_or_else(|e| e.into_inner());
+        assert_roster_freeze_absent_below_the_gate();
+    }
+
+    /// The body of test 1, callable from its mutation.
+    fn assert_roster_freeze_absent_below_the_gate() {
+        let (mut st, bond, loss) = freeze_fixture();
+        let seed = st.seed_for_epoch(1);
+        let before = st.duty_roster_at(1);
+        let proposers_before = epoch1_proposers(&seed, &before);
+        assert_eq!(before.len(), 8, "control: the fixture must open with 8 in the roster");
+
+        // The real writer, not a hand-copied imitation of it. `eject_for_slash`
+        // is the function `apply_slashing_evidence` calls; a fixture that
+        // re-implemented these writes could drift from it and keep passing.
+        st.eject_for_slash(3, loss);
+
+        // (1) Nothing frozen. This is the byte-level claim: an empty component
+        // inserts no leaf, so a binary carrying this field commits the same
+        // roots as one that never had it.
+        assert!(
+            st.epoch_frozen_bonds.is_empty(),
+            "the epoch freeze wrote BELOW its flag day. Every historical block would now \
+             commit a state root its own header does not carry, and boot would park the \
+             node at an old height without saying so."
+        );
+
+        // Control: the slash really happened, so the three assertions after
+        // this are about the rule and not about an inert fixture.
+        assert!(st.validators[&3].slashed, "control: the offender was not flagged");
+        assert_eq!(st.validators[&3].staked_sat, bond - loss, "control: the bond was not debited");
+
+        // (2) The index set shrinks in the act — today's rule, unchanged.
+        let after = st.duty_roster_at(1);
+        assert_eq!(after.len(), 7, "below the gate a slash must still remove the record NOW");
+        assert!(!after.iter().any(|v| v.index == 3));
+
+        // (3) And the epoch's remaining proposers are re-sorted, which is the
+        // damage — measured, not asserted away.
+        let proposers_after = epoch1_proposers(&seed, &after);
+        assert_ne!(
+            proposers_after, proposers_before,
+            "below the gate a mid-epoch slash must STILL move the proposers: if it does not, \
+             the freeze has leaked below its flag day and the existing chain no longer replays"
+        );
+
+        // (4) The boundary still drops votes and the detector still counts it.
+        // A fresh state, because the run above already consumed this epoch's
+        // slash; the helper stages the votes first and slashes second, which
+        // is the ordering that produces the divergence.
+        let (dropped, froze) = boundary_drops_over_a_mid_epoch_slash();
+        assert!(
+            !froze,
+            "control: something was frozen below the gate, so this is not the shipped rule"
+        );
+        assert!(
+            dropped,
+            "below the gate the boundary tally must still drop the votes step 8 admitted - \
+             this is the divergence the release-binary detector exists to make visible"
+        );
+    }
+
+    /// Build an epoch-1 state carrying one vote per committee member —
+    /// admitted against the roster as it stood at the epoch's FIRST slot —
+    /// then land a mid-epoch slash on validator 3 and close the epoch.
+    ///
+    /// Returns `(the boundary dropped votes, the freeze recorded a bond)`. The
+    /// second half is the non-vacuity control the caller needs: a "no votes
+    /// dropped" result means nothing if no slash ever reached the state.
+    ///
+    /// The ordering is the whole mechanism, and it is why the votes are built
+    /// BEFORE the slash: step 8 admits against the wide partition, the
+    /// evidence lands, and the boundary tallies against whatever the roster
+    /// has become. Building the votes afterwards would model a chain in which
+    /// nobody voted before the slash, which is not the case that diverges.
+    ///
+    /// `catch_unwind` because in a TEST build the `debug_assert_eq!` beside the
+    /// detector is supposed to stop the run — the question here is whether the
+    /// detector fired, not whether the assert did.
+    fn boundary_drops_over_a_mid_epoch_slash() -> (bool, bool) {
+        use std::panic::AssertUnwindSafe;
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let (mut st, _bond, loss) = freeze_fixture();
+        let seed = st.seed_for_epoch(1);
+        let roster = st.duty_roster_at(1);
+        assert_eq!(roster.len(), 8, "control: the votes must be admitted against all 8");
+        let partition = committees::epoch_committees(&seed, 1, &roster);
+        for (i, members) in partition.iter().enumerate() {
+            for v in members {
+                let d = AttestationData {
+                    slot: SLOTS_PER_EPOCH + i as u64,
+                    head: [0x11; 32],
+                    source_epoch: 0,
+                    source_root: *st.head.as_bytes(),
+                    target_epoch: 1,
+                    target_root: [0x11; 32],
+                };
+                st.pending_votes.insert((*v, d.signing_root()), d);
+            }
+        }
+        assert!(!st.pending_votes.is_empty(), "fixture must actually carry votes");
+
+        st.eject_for_slash(3, loss);
+        let froze = !st.epoch_frozen_bonds.is_empty();
+
+        let before = BOUNDARY_VOTE_DROPS.load(Relaxed);
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| st.close_epoch()));
+        std::panic::set_hook(prev);
+        (BOUNDARY_VOTE_DROPS.load(Relaxed) > before, froze)
+    }
+
+    /// **TEST 2 — above the gate the roster does not shrink mid-epoch.**
+    ///
+    /// The index set is identical from the slash to the end of the epoch, and
+    /// REDUCED at the next boundary. Both halves are needed: "identical
+    /// forever" would not be a freeze, it would be a validator that can never
+    /// be ejected.
+    #[test]
+    fn above_the_gate_the_roster_index_set_is_frozen_until_the_boundary() {
+        let _h = crate::params::rehearsal::HOOK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::params::rehearsal::roster_freeze_open_guard();
+        assert_roster_frozen_above_the_gate();
+    }
+
+    /// The body of test 2, callable from its mutation.
+    fn assert_roster_frozen_above_the_gate() {
+        let (mut st, bond, loss) = freeze_fixture();
+        let before = st.duty_roster_at(1);
+        assert_eq!(before.len(), 8, "control: the fixture must open with 8 in the roster");
+
+        st.eject_for_slash(3, loss);
+
+        // Control, both halves: the slash really landed on the record, AND the
+        // freeze really recorded the opening bond. Without these the equality
+        // below could pass on a slash that never happened.
+        assert!(st.validators[&3].slashed, "control: the offender was not flagged");
+        assert_eq!(st.validators[&3].staked_sat, bond - loss, "control: the bond was not debited");
+        assert_eq!(
+            st.epoch_frozen_bonds.get(&3),
+            Some(&bond),
+            "the freeze did not record the bond the epoch opened with"
+        );
+
+        let after = st.duty_roster_at(1);
+        assert_eq!(
+            after.iter().map(|v| v.index).collect::<Vec<_>>(),
+            before.iter().map(|v| v.index).collect::<Vec<_>>(),
+            "THE INDEX SET MOVED INSIDE AN EPOCH: a mid-epoch slash re-sorted every committee \
+             under votes that were already admitted"
+        );
+        // And the weights too — the index set alone is not the freeze, because
+        // `sample` is stake-weighted. `Validator` is `PartialEq`, so this
+        // compares index and effective_stake for every member.
+        assert_eq!(
+            after, before,
+            "the index set held but a WEIGHT moved: the proposer draw reads stake, so this \
+             re-sorts the epoch just as surely as a membership change"
+        );
+
+        // The other half of the rule: the ejection lands at the boundary. A
+        // freeze that never expires is not a deferral, it is an immunity.
+        let closed = st.close_epoch();
+        assert_eq!(closed.epoch, 2, "control: the boundary did not advance the epoch");
+        assert!(
+            closed.epoch_frozen_bonds.is_empty(),
+            "the freeze survived the boundary - the offender would keep its duties forever"
+        );
+        let next = closed.duty_roster_at(2);
+        assert_eq!(next.len(), 7, "the slashed validator was not ejected at the boundary");
+        assert!(!next.iter().any(|v| v.index == 3));
+    }
+
+    /// **TEST 3 — the proposer does not re-sort. This is the damage the rule
+    /// exists to stop, and the one that was actually measured.**
+    ///
+    /// A slash included at slot 3 of an epoch must not change who is allowed to
+    /// propose at slots 4..31. Below the gate it changes almost all of them,
+    /// because both causes bite at once and each is sufficient on its own:
+    /// membership (a Fisher-Yates over a shorter list is a different
+    /// permutation everywhere) and stake (`sample::sample` builds a cumulative
+    /// array, so any bond change moves every draw above it).
+    ///
+    /// The test measures both causes separately and prints the numbers, so
+    /// "the proposer re-sorts" is a magnitude in the log rather than a claim in
+    /// a comment — and so that a future reader can see whether freezing only
+    /// one of the two would have been enough. It would not.
+    #[test]
+    fn above_the_gate_a_mid_epoch_slash_does_not_re_sort_the_proposers() {
+        let _h = crate::params::rehearsal::HOOK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::params::rehearsal::roster_freeze_open_guard();
+        assert_proposers_frozen_above_the_gate();
+    }
+
+    /// The body of test 3, callable from its mutation.
+    fn assert_proposers_frozen_above_the_gate() {
+        let (mut st, bond, loss) = freeze_fixture();
+        let seed = st.seed_for_epoch(1);
+        let before = st.duty_roster_at(1);
+        let proposers_before = epoch1_proposers(&seed, &before);
+        assert!(
+            proposers_before.iter().any(Option::is_some),
+            "control: the fixture epoch has no proposers at all, so nothing below can move"
+        );
+
+        st.eject_for_slash(3, loss);
+        let after = st.duty_roster_at(1);
+        let proposers_after = epoch1_proposers(&seed, &after);
+
+        // THE ASSERTION. Slot for slot, including the slots the offender itself
+        // held: a frozen roster draws the same names.
+        assert_eq!(
+            proposers_after, proposers_before,
+            "A MID-EPOCH SLASH RE-SORTED THE EPOCH'S PROPOSERS. Every block from here to the \
+             boundary would be validated against a schedule nobody agreed to before the \
+             evidence landed."
+        );
+
+        // ── Non-vacuity, and the measurement ────────────────────────────────
+        //
+        // Three counter-rosters, each isolating one cause, all built from the
+        // SAME post-slash state so nothing else can explain a difference.
+        let count_moved = |r: &[Validator]| -> usize {
+            epoch1_proposers(&seed, r)
+                .iter()
+                .zip(&proposers_before)
+                .filter(|(a, b)| a != b)
+                .count()
+        };
+
+        // (a) The rule as it ships today: no freeze at all. Both causes.
+        let mut unfrozen = st.clone();
+        unfrozen.epoch_frozen_bonds.clear();
+        let old_rule = unfrozen.duty_roster_at(1);
+        assert_eq!(old_rule.len(), 7, "control: the un-frozen rule must drop the offender");
+        let moved_old_rule = count_moved(&old_rule);
+
+        // (b) Membership alone: drop the offender, leave every other weight at
+        // its opening value.
+        let membership_only: Vec<Validator> =
+            before.iter().filter(|v| v.index != 3).copied().collect();
+        let moved_membership = count_moved(&membership_only);
+
+        // (c) Stake alone: keep the offender in the set, at its DEBITED bond.
+        let stake_only: Vec<Validator> = before
+            .iter()
+            .map(|v| {
+                if v.index == 3 {
+                    Validator {
+                        index: v.index,
+                        effective_stake: v.effective_stake.saturating_sub(sat_u64(loss)),
+                    }
+                } else {
+                    *v
+                }
+            })
+            .collect();
+        let moved_stake = count_moved(&stake_only);
+        // Measured, not asserted to be zero: the assertion above already
+        // established it, and a printed constant is a claim, not a reading.
+        let moved_frozen = count_moved(&after);
+
+        eprintln!(
+            "\nMID-EPOCH SLASH, damage to the proposer schedule of one 32-slot epoch \
+             (8 validators, bond {bond} sat, loss {loss} sat):\n  \
+             frozen (this rule)          : {moved_frozen} of 32 slots moved\n  \
+             un-frozen (today's rule)    : {moved_old_rule} of 32\n  \
+             membership change alone     : {moved_membership} of 32\n  \
+             stake change alone          : {moved_stake} of 32"
+        );
+
+        assert!(
+            moved_old_rule > 0,
+            "control failed: even WITHOUT the freeze the proposers did not move, so the \
+             assertion above is vacuous - the draw has stopped reading the roster"
+        );
+        assert!(
+            moved_membership > 0,
+            "control failed: removing a validator from the roster did not move a single \
+             proposer, so `sample` is no longer a function of the index set"
+        );
+        assert!(
+            moved_stake > 0,
+            "control failed: debiting a bond did not move a single proposer, so `sample` has \
+             stopped weighting by stake - and freezing membership alone would then have been \
+             enough, which this rule assumes it is not"
+        );
+    }
+
+    /// **The consequence at the boundary**: with the epoch frozen, the tally
+    /// partitions the same set the inclusion check admitted against, so no vote
+    /// is dropped and the release-binary detector does not fire.
+    ///
+    /// This is the pair to `the_boundary_divergence_detector_fires_on_a_mid_epoch_slash`,
+    /// which asserts the opposite below the gate. Note what is NOT asserted:
+    /// the `debug_assert!` in `close_epoch` is not promoted to a
+    /// `consensus_invariant!` here. It stays a test-build guard because below
+    /// the gate — every block in the log this fleet replays — the divergence is
+    /// still live and still driven by untrusted input, and a gate is a promise
+    /// about the future, not a proof about the present.
+    #[test]
+    fn above_the_gate_a_mid_epoch_slash_drops_no_boundary_votes() {
+        // Serialised against every other reader of the process-wide
+        // `BOUNDARY_VOTE_DROPS`: this test asserts the counter did NOT move,
+        // and a concurrent test's legitimate divergence would redden it.
+        let _h = crate::params::rehearsal::HOOK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::params::rehearsal::roster_freeze_open_guard();
+        assert_no_boundary_drop_above_the_gate();
+    }
+
+    /// The body of the boundary test, callable from its mutation.
+    fn assert_no_boundary_drop_above_the_gate() {
+        let (dropped, froze) = boundary_drops_over_a_mid_epoch_slash();
+        // The substantive claim FIRST, and the control after it — the opposite
+        // of the usual order, because this is a NEGATIVE assertion. The way a
+        // negative assertion goes wrong is by holding vacuously, so the control
+        // is only interesting once `!dropped` has been established.
+        assert!(
+            !dropped,
+            "the boundary dropped votes even with the epoch's roster frozen: the tally and \
+             the inclusion check are reading DIFFERENT rosters, which is the divergence the \
+             freeze was supposed to close"
+        );
+        assert!(
+            froze,
+            "no votes were dropped, but nothing was frozen either - this passed because no \
+             slash reached the state, not because the freeze worked"
+        );
+    }
+
+    // ── THE MUTATION PROOF ──────────────────────────────────────────────────
+    //
+    // A gated consensus rule whose tests have never been run against the
+    // un-gated rule is a test of a fixture. Each mutation below reverts the
+    // thing its target test claims to pin and requires the test to PANIC.
+    //
+    // Note that the two directions differ, and they have to:
+    //
+    //   - tests 2, 3 and the boundary test are ABOVE the gate, so their
+    //     mutation is `REVERT_ROSTER_FREEZE` — put the old rule back;
+    //   - test 1 is BELOW the gate, where reverting the freeze is a no-op by
+    //     construction (nothing is frozen below the gate either way), so
+    //     reverting it there would prove nothing. Its mutation is the opposite
+    //     one, and it is the dangerous one: ARM the gate. That is the edit a
+    //     future contributor might make by "simplifying away" a flag day, and
+    //     it is exactly the edit that would park 64 nodes at an old height.
+    //
+    // Run one and watch it go red by inverting its own assertion, e.g.
+    //
+    // ```text
+    // cargo test -p bloch-pos-committee --lib mutation_reverting_the_freeze
+    // ```
+
+    /// Run `body` with the roster freeze REVERTED, and require it to panic.
+    ///
+    /// Does **not** take `rehearsal::HOOK`: the caller already holds it, and
+    /// `std::sync::Mutex` is not reentrant — taking it twice on one thread is a
+    /// deadlock, not a warning.
+    fn expect_red_with_freeze_reverted(what: &str, body: impl FnOnce() + std::panic::UnwindSafe) {
+        use std::sync::atomic::Ordering::Relaxed;
+        crate::params::rehearsal::REVERT_ROSTER_FREEZE.store(true, Relaxed);
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let r = std::panic::catch_unwind(body);
+        std::panic::set_hook(prev);
+        // Restored before the assertion, so a failure here cannot leave the
+        // rule mutated for anything that runs after it on this thread.
+        crate::params::rehearsal::REVERT_ROSTER_FREEZE.store(false, Relaxed);
+        assert!(
+            r.is_err(),
+            "{what} stayed GREEN with the epoch-roster freeze reverted, so it is not testing \
+             the freeze at all"
+        );
+    }
+
+    /// **MUTATION for test 2.** Put the old rule back and the index set moves
+    /// inside the epoch again.
+    #[test]
+    fn mutation_reverting_the_freeze_reddens_the_index_set_test() {
+        let _h = crate::params::rehearsal::HOOK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::params::rehearsal::roster_freeze_open_guard();
+        expect_red_with_freeze_reverted(
+            "above_the_gate_the_roster_index_set_is_frozen_until_the_boundary",
+            assert_roster_frozen_above_the_gate,
+        );
+    }
+
+    /// **MUTATION for test 3 — the one that matters most.** Put the old rule
+    /// back and the epoch's remaining proposers re-sort.
+    #[test]
+    fn mutation_reverting_the_freeze_reddens_the_proposer_test() {
+        let _h = crate::params::rehearsal::HOOK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::params::rehearsal::roster_freeze_open_guard();
+        expect_red_with_freeze_reverted(
+            "above_the_gate_a_mid_epoch_slash_does_not_re_sort_the_proposers",
+            assert_proposers_frozen_above_the_gate,
+        );
+    }
+
+    /// **MUTATION for the boundary test.** Put the old rule back and the
+    /// boundary drops the votes step 8 admitted.
+    #[test]
+    fn mutation_reverting_the_freeze_reddens_the_boundary_test() {
+        let _h = crate::params::rehearsal::HOOK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::params::rehearsal::roster_freeze_open_guard();
+        expect_red_with_freeze_reverted(
+            "above_the_gate_a_mid_epoch_slash_drops_no_boundary_votes",
+            assert_no_boundary_drop_above_the_gate,
+        );
+    }
+
+    /// **MUTATION for test 1 — the history test — and the only one that runs
+    /// in the other direction.**
+    ///
+    /// Arming the gate is the edit that breaks the replay of 64 nodes. If the
+    /// below-gate test can survive it, the below-gate test is not guarding
+    /// anything, and shipping this rule armed by accident would be caught by
+    /// nothing.
+    #[test]
+    fn mutation_arming_the_freeze_reddens_the_history_test() {
+        let _h = crate::params::rehearsal::HOOK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let r = std::panic::catch_unwind(|| {
+            // The gate, armed — the mutation. The guard restores it on the way
+            // out, including on this unwind path.
+            let _g = crate::params::rehearsal::roster_freeze_open_guard();
+            assert_roster_freeze_absent_below_the_gate();
+        });
+        std::panic::set_hook(prev);
+        assert!(
+            r.is_err(),
+            "below_the_gate_a_mid_epoch_slash_behaves_exactly_as_it_ships_today stayed GREEN \
+             with the gate ARMED. It is not guarding the replay of the existing chain, and \
+             an accidentally-armed flag day would ship unnoticed."
         );
     }
 
