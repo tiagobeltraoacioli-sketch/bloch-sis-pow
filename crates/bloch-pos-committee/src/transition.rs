@@ -1627,6 +1627,23 @@ impl CommittedState {
         self.duty_roster_at(self.epoch)
     }
 
+    /// [`Self::duty_roster`] published for ONE caller: the node's fork-choice
+    /// fallback, which needs the consensus roster with the inactivity leak
+    /// **not** applied.
+    ///
+    /// Deliberately not `duty_roster_at` made public, and deliberately named
+    /// after what it is for. The leak is the branch-dependent term in
+    /// [`Self::consensus_roster_at`]; a node weighing a vote that was cast on
+    /// a branch it has never executed must not subtract absence it only
+    /// observed on its own branch. Every other consumer — the proposer draw,
+    /// the committee partition, the boundary tally — must keep reading
+    /// `consensus_roster_at`, and this must never become the roster a duty is
+    /// derived from. See `bloch_pos_node::engine::Engine::forkchoice_fallback`
+    /// for the whole argument.
+    pub fn unleaked_roster(&self) -> Vec<Validator> {
+        self.duty_roster_at(self.epoch)
+    }
+
     /// The duty roster as **consensus weight**: [`Self::duty_roster_at`] with
     /// each validator's accrued inactivity leak subtracted, once
     /// [`crate::params::LEAKED_ROSTER_ACTIVATION_EPOCH`] binds.
@@ -7053,6 +7070,70 @@ mod tests {
             crate::committees::epoch_committees(&seed, epoch, &consensus),
             crate::committees::epoch_committees(&seed, epoch, &duty),
             "same index set but different partitions - epoch_committees read stake again"
+        );
+    }
+
+    /// **The fork-choice fallback is the LEAK-FREE table**, and under a real
+    /// leak that is a different table from the one duties read.
+    ///
+    /// [`CommittedState::unleaked_roster`] exists for exactly one caller — the
+    /// node's `Engine::forkchoice_fallback`, which must not subtract from a
+    /// peer's vote an absence it only observed on its own branch. The whole
+    /// content of that decision is *which* of the two rosters it returns, so
+    /// something has to hold the two apart on a state where they actually
+    /// differ; on an unleaked state they are equal and any assertion is
+    /// vacuous.
+    ///
+    /// The `assert_ne!` against `active_validators` is the half that fails if
+    /// `unleaked_roster` is ever "simplified" into `consensus_roster_at`.
+    #[test]
+    fn the_forkchoice_fallback_roster_is_the_one_without_the_leak() {
+        let _h = crate::params::rehearsal::HOOK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::params::rehearsal::LEAK_DROPS_ZEROED
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+
+        let (_t, mut g, _c) = setup(8);
+        let seed = g.seed_for_epoch(0);
+
+        // Accrue a real leak the engine's own rule produced: epoch after epoch
+        // in which nobody attests, exactly as a partitioned branch sees the
+        // far side.
+        let mut leaked_someone = false;
+        for epoch in 1..400u64 {
+            let roster = g.duty_roster_at(0);
+            let mut accepted = Vec::new();
+            let votes = finality::votes_from_partition(epoch, &roster, &[], &seed, &mut accepted);
+            if g.finality_engine.process_epoch(&votes).is_err() {
+                break;
+            }
+            if roster.iter().any(|v| g.finality_engine.leaked_of(v.index) > 0) {
+                leaked_someone = true;
+                break;
+            }
+        }
+        assert!(
+            leaked_someone,
+            "the fold never accrued a leak at all, so both assertions below would hold \
+             trivially - the leak rule or its threshold changed"
+        );
+
+        // Open the gate. Below it `consensus_roster_at` short-circuits to the
+        // unleaked roster and the two could not differ either way.
+        let epoch = crate::params::LEAKED_ROSTER_ACTIVATION_EPOCH;
+        g.epoch = epoch;
+
+        assert_eq!(
+            g.unleaked_roster(),
+            g.duty_roster_at(epoch),
+            "the fallback must be the duty roster, value for value"
+        );
+        assert_ne!(
+            g.unleaked_roster(),
+            <CommittedState as StateReader>::active_validators(&g),
+            "THE FALLBACK IS LEAKED: unleaked_roster now returns what active_validators \
+             returns, which is the local branch's opinion of who has been absent - the \
+             very quantity the fork-choice fallback exists to refuse. See \
+             bloch_pos_node::engine::Engine::forkchoice_fallback."
         );
     }
 

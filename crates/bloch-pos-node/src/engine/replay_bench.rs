@@ -115,7 +115,7 @@ use bloch_pos_committee::{committees, derive, epoch_of, fee_market, schedule};
 
 use sha3::{Digest, Sha3_256};
 
-use super::{now_ms, Engine, StateCell};
+use super::{now_ms, Engine, RosterRing, StateCell};
 use crate::genesis::{Manifest, ManifestValidator, GENESIS_MIX};
 use crate::keys::{HybridVerifier, Keystore, ProbeVerifier};
 use crate::net;
@@ -663,6 +663,7 @@ fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
         ws_anchor_hard: false,
         ws_conflict_reported: false,
         fc_covered_removals: 0,
+        checkpoint_rosters: RosterRing::new(),
         manifest,
     }
 }

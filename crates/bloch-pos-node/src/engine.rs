@@ -35,7 +35,11 @@
 //! Canonical is whatever [`forkchoice::Store::head`] selects: walk from the
 //! **justified** checkpoint and take the heaviest child at every step, where
 //! weight is the total effective stake of validators whose *latest* message is
-//! that block or a descendant. `advance` then makes the canonical chain match
+//! that block or a descendant. Each vote is priced by the stake table
+//! committed at the checkpoint THAT VOTE names — see [`RosterRing`], and read
+//! it before touching the weighting, because pricing every vote with the local
+//! head's table is what let a node inflate its own branch by 8.27 % and left
+//! the network unable to close a partition. `advance` then makes the canonical chain match
 //! that head, extending when the head descends from it and reorganising (by
 //! replaying from genesis — never trusting an unvalidated branch) when it does
 //! not.
@@ -59,6 +63,7 @@
 //! and, on a devnet, free; when it stops being free the fix is an incremental
 //! store with a test proving it equals the rebuild, not a cache with a comment.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io;
 use std::path::PathBuf;
@@ -183,6 +188,176 @@ const MAX_TXS_PER_BLOCK: usize = 256;
 /// window safe rather than merely cheap: the window is an optimisation with a
 /// correct slow path underneath it, never a limit on what can be reorganised.
 const REORG_STATE_WINDOW: usize = 2;
+
+/// How many recently applied canonical blocks keep their effective-stake
+/// table for fork choice.
+///
+/// Nothing like [`REORG_STATE_WINDOW`]'s budget, and that is the whole reason
+/// the ring caches the ROSTER rather than the `CommittedState` it was read
+/// from. A roster is two integers per validator: at the fleet's 64 validators
+/// one entry is under a kilobyte and the whole ring is tens of kilobytes,
+/// against 128 MB for a single Genesis-3-sized state. Caching states here
+/// would have multiplied the constraint that already forces one validator per
+/// host.
+///
+/// Sized in BLOCKS, not epochs, because the checkpoint convention
+/// ([`Engine::checkpoint_root`]) names whichever block happens to be the last
+/// one before an epoch's first slot, and on a chain producing at the fleet's
+/// measured cadence that is far fewer than one block per slot. 128 blocks is
+/// at least four epochs of real history and, at the observed cadence, many
+/// more — comfortably past the two-epoch window `on_attestation` will even
+/// consider a vote from.
+const CHECKPOINT_ROSTER_WINDOW: usize = 128;
+
+/// Effective-stake tables committed by recently applied canonical blocks,
+/// keyed by block root — i.e. keyed by the value an attestation names in
+/// [`AttestationData::target_root`].
+///
+/// ## The defect this exists for
+///
+/// Fork choice weighs a vote by the voter's effective stake, and effective
+/// stake is **not** a property of the validator. `active_validators` is
+/// `CommittedState::consensus_roster_at`, which subtracts each validator's
+/// accrued inactivity leak, and the leak is a function of what a *branch* has
+/// seen attested. Two branches therefore disagree about it — and until this
+/// ring existed the node settled that disagreement with **its own head's**
+/// table, weighing every peer's vote by its own branch's opinion of that peer.
+///
+/// On a partitioned network that is self-inflation with no attacker in it: the
+/// validators on the far side of the partition look absent, their stake leaks
+/// away in the local view, and the branch the node is standing on gets heavier
+/// for free. MEASURED on the fleet: 8.27 %. Left running long enough the leak
+/// is quadratic and unbounded, the far side's weight falls below the near
+/// side's whatever the true split is, and the partition stops being able to
+/// close itself — which is the state the network is in.
+///
+/// The fix is to weigh a vote by the table committed at the checkpoint the
+/// vote itself names. That is the same posture Ethereum takes when it weighs
+/// by the justified checkpoint's state rather than by the head's.
+///
+/// ## What is in it, and what can never be
+///
+/// `remember` is called from the two places that execute a block into
+/// canonical state — [`Engine::apply_canonical`] and [`Engine::do_reorg`] —
+/// so the ring holds exactly the branches this node has *executed*. That is
+/// not agap that can be closed here: a roster is the output of running a
+/// branch, so a node cannot know a foreign branch's roster without running it,
+/// and this node deliberately runs only what fork choice already selected
+/// (`advance` is fail-closed). **The ring therefore hits for this node's own
+/// branch and for branches it recently held, and misses on first contact with
+/// a branch it has not adopted** — which is precisely the case the bias hurts.
+/// The miss policy below is where that case is actually closed; see
+/// [`Engine::forkchoice_fallback`].
+///
+/// ## One approximation, named
+///
+/// The value filed is `active_validators()` on that block's post-state, i.e.
+/// `consensus_roster_at(<that state's own epoch>)`. A vote targeting the block
+/// is cast in the epoch the checkpoint OPENS, which is the next one, so the
+/// table is one epoch's worth of leak short of the table that epoch's own
+/// duties read. Ethereum closes the same gap by processing slots forward to
+/// the boundary before reading `checkpoint_states`; this does not, because
+/// rolling the epoch here would mean running `process_epoch` on the write path
+/// of every applied block. The error is one epoch of leak, it is in the
+/// conservative direction (less leak subtracted, so a foreign vote is if
+/// anything under-penalised rather than over-), and it is bounded by the same
+/// rule that bounds the leak itself. It is written down here because an
+/// unnamed approximation in a consensus-relevant value is how the 2026-08-08
+/// fork happened.
+///
+/// Keyed by block root and not by height or epoch, for the reason
+/// `recent_states` is: a block's post-state is a pure function of the block
+/// and its ancestry, and the root commits to that ancestry transitively, so an
+/// entry can never be "the right epoch on the wrong branch". That is also why
+/// `remember` may skip a root it already holds instead of overwriting it — the
+/// second computation would be the same number.
+///
+/// The two counters exist so a test can prove the lookup was taken rather than
+/// assume it. They are per-ring `Cell`s and deliberately **not** process-wide
+/// atomics: a global counter is inflated by every other test sharing the
+/// binary, and an assertion some other test can satisfy on your behalf is not
+/// a proof.
+pub struct RosterRing {
+    entries: VecDeque<([u8; 32], Vec<bloch_pos_committee::sample::Validator>)>,
+    /// Bumped on every insert that changes the contents.
+    ///
+    /// [`ForkChoiceInputs`] carries it because the head is a function of this
+    /// ring, and `advance` writes to it (through `apply_canonical`) inside the
+    /// very loop that memoizes the head. Without it the memo would serve a
+    /// pre-write answer across a write, which is the class of bug the memo's
+    /// own doc comment spends a page bounding.
+    generation: u64,
+    hits: Cell<u64>,
+    misses: Cell<u64>,
+}
+
+impl RosterRing {
+    fn new() -> Self {
+        RosterRing {
+            entries: VecDeque::new(),
+            generation: 0,
+            hits: Cell::new(0),
+            misses: Cell::new(0),
+        }
+    }
+
+    /// File the effective-stake table committed by the block rooted at `root`.
+    fn remember(&mut self, root: [u8; 32], roster: Vec<bloch_pos_committee::sample::Validator>) {
+        if self.entries.iter().any(|(r, _)| *r == root) {
+            return;
+        }
+        self.entries.push_back((root, roster));
+        while self.entries.len() > CHECKPOINT_ROSTER_WINDOW {
+            self.entries.pop_front();
+        }
+        self.generation += 1;
+    }
+
+    /// The table committed at `root`, or `None` if this node never executed
+    /// the block. Counted either way.
+    fn roster_at(&self, root: &[u8; 32]) -> Option<&[bloch_pos_committee::sample::Validator]> {
+        match self.entries.iter().find(|(r, _)| r == root) {
+            Some((_, roster)) => {
+                self.hits.set(self.hits.get() + 1);
+                Some(roster)
+            }
+            None => {
+                self.misses.set(self.misses.get() + 1);
+                None
+            }
+        }
+    }
+
+    /// Contents fingerprint for [`ForkChoiceInputs`].
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Lookups that found a table. Test instrumentation.
+    #[cfg(test)]
+    fn hits(&self) -> u64 {
+        self.hits.get()
+    }
+
+    /// Lookups that fell through to [`Engine::forkchoice_fallback`]. Test
+    /// instrumentation.
+    #[cfg(test)]
+    fn misses(&self) -> u64 {
+        self.misses.get()
+    }
+
+    #[cfg(test)]
+    fn reset_counters(&self) {
+        self.hits.set(0);
+        self.misses.set(0);
+    }
+}
+
+impl Default for RosterRing {
+    fn default() -> Self {
+        RosterRing::new()
+    }
+}
 
 /// Decode a block body's transactions.
 ///
@@ -537,10 +712,15 @@ struct Engine {
     /// that kind of pool shrinkage apart from the epoch `retain`, which fork
     /// choice very much can see. See the argument there.
     fc_covered_removals: u64,
+    /// Effective-stake tables of executed canonical blocks, so fork choice can
+    /// weigh a vote by the checkpoint the vote names instead of by this node's
+    /// own head. See [`RosterRing`].
+    checkpoint_rosters: RosterRing,
 }
 
-/// A fingerprint of the four values `lmd_ghost_head` reads, so `advance` can
-/// tell whether recomputing it could possibly return anything new.
+/// A fingerprint of the five values `lmd_ghost_head_by_checkpoint` reads, so
+/// `advance` can tell whether recomputing it could possibly return anything
+/// new.
 ///
 /// Not a cache across calls — it is rebuilt from scratch inside each
 /// `advance`, because the completeness argument on
@@ -551,6 +731,13 @@ struct ForkChoiceInputs {
     pool: u64,
     justified: [u8; 32],
     validators: Vec<bloch_pos_committee::sample::Validator>,
+    /// [`RosterRing::generation`]. The fifth input, and the one `advance`
+    /// itself writes: `apply_canonical` files a roster inside the very loop
+    /// this memo serves. Compared by generation rather than by value for the
+    /// same reason `blocks` is compared by count — except that this one is
+    /// monotone by construction, so equal generations really do mean equal
+    /// contents, with no invariant needed to hold it up.
+    rosters: u64,
 }
 
 /// Why a transaction was turned away at the door.
@@ -1222,19 +1409,68 @@ impl Engine {
             blocks: self.blocks.len(),
             pool: self.pool.len() as u64 + self.fc_covered_removals,
             justified: self.state.finality().justified.root,
-            validators: self.state.active_validators(),
+            validators: self.forkchoice_fallback(),
+            rosters: self.checkpoint_rosters.generation(),
         }
     }
 
     fn forkchoice_head(&self) -> [u8; 32] {
         // Instrumentation only; compiled out without `perf-timing`.
         let _perf = bloch_pos_committee::perf::span(bloch_pos_committee::perf::Phase::ForkChoice);
-        lmd_ghost_head(
+        lmd_ghost_head_by_checkpoint(
             &self.blocks,
             self.pool.values(),
-            &self.state.active_validators(),
+            &self.checkpoint_rosters,
+            &self.forkchoice_fallback(),
             self.state.finality().justified.root,
         )
+    }
+
+    /// The table fork choice weighs a vote by when the vote names a checkpoint
+    /// this node has never executed.
+    ///
+    /// **This is the decision [`RosterRing`] alone does not make, and it is
+    /// where the reported partition is actually closed.** A roster is the
+    /// output of running a branch, so the ring can only ever hold branches
+    /// this node ran, and `advance` runs only what fork choice already
+    /// selected. A vote arriving from a branch this node has not adopted
+    /// therefore always misses — and that is precisely the case the 8.27 %
+    /// bias lives in. A miss policy of "use the local head's table" would be
+    /// the defect written out in full: the ring would help only where the old
+    /// rule was already close to right and change nothing where it was wrong.
+    /// It was considered and rejected on that ground, and
+    /// `the_local_head_fallback_leaves_the_minority_stranded` is the control
+    /// that shows it failing on the very fixture this change is accepted on.
+    ///
+    /// What is used instead is the local table **with the inactivity leak not
+    /// applied** — `unleaked_roster`, not `active_validators`. The reasoning
+    /// is narrow and stops where the evidence stops:
+    ///
+    /// * The leak is the branch-dependent term, and the only one that moves
+    ///   fast. It is accrued from absence *relative to a branch*, so
+    ///   subtracting it from a vote cast on a branch where that validator was
+    ///   present is not a conservative approximation; it is a known-wrong one.
+    /// * Everything else the roster carries — activation, exit, slashing, the
+    ///   delegation fold, the cohort cap — either barely moves between
+    ///   branches or is one the local view is right about. A slashed validator
+    ///   is slashed on evidence, not on absence, and stays dropped on every
+    ///   branch.
+    /// * It gives up nothing the leak is for. The leak exists so a live set
+    ///   can regain a quorum; that is the finality gadget's denominator, which
+    ///   this does not touch. Fork-choice weight is not the leak's mechanism.
+    /// * It opens no new attack worth the name. To move this node's head an
+    ///   adversary must still out-weigh the live honest set, which is not
+    ///   leaked on the branch it is voting for, so a stake majority is still
+    ///   required; and the walk starts at the justified root, so nothing
+    ///   finalized can be reorganised whatever the weights say.
+    ///
+    /// The honest limit: on a miss this is an approximation of a table the
+    /// node cannot compute, and it will be wrong about a validator that
+    /// exited, was slashed, or changed delegation on the far branch only.
+    /// Those move on epoch boundaries and by consent; the leak moves every
+    /// epoch and by accident, which is why it is the one that had to go.
+    fn forkchoice_fallback(&self) -> Vec<bloch_pos_committee::sample::Validator> {
+        self.state.unleaked_roster()
     }
 
     /// The chain of stored blocks from `target` down to the nearest canonical
@@ -1287,9 +1523,9 @@ impl Engine {
         //
         // What is skippable is the case where none of them moved, and
         // `forkchoice_inputs` is what decides that. Reusing the previous
-        // answer there is not an approximation — `lmd_ghost_head` is a pure
-        // function of exactly those inputs (that is why §5.5 made it a free
-        // function), so equal inputs mean an equal head, bit for bit.
+        // answer there is not an approximation — `lmd_ghost_head_by_checkpoint`
+        // is a pure function of exactly those inputs (that is why §5.5 made it
+        // a free function), so equal inputs mean an equal head, bit for bit.
         let mut memo: Option<(ForkChoiceInputs, [u8; 32])> = None;
         // Bounded: every iteration either advances the canonical head or
         // deletes an invalid block, and both are finite.
@@ -1438,6 +1674,31 @@ impl Engine {
             .apply_block(&self.state, &envelope, &env.body.attestations, &txs)
         {
             Ok(post) => {
+                // ── RosterRing, write side ──────────────────────────────────
+                //
+                // `self.state` is still the PRE-state of this block, which is
+                // the post-state of `env.header.parent` — this is the only
+                // call site of `apply_canonical` and `advance` reaches it only
+                // on the extension path, where the block's parent IS the head.
+                // The assertion below is what keeps that true rather than
+                // remembered: it names two independently-derived values (the
+                // node's canonical head, and a field of the arriving block)
+                // and it fails the moment a future edit applies a block off
+                // the head.
+                //
+                // So the entry filed here is "the table committed at
+                // `parent`", which is exactly what a vote naming `parent` as
+                // its target must be weighed by. The block being applied gets
+                // its own entry when its child arrives; until then it is the
+                // head, and the head is what the fallback already is.
+                debug_assert_eq!(
+                    *self.head_id().as_bytes(),
+                    env.header.parent,
+                    "apply_canonical must extend the head: the roster filed here is the \
+                     PARENT's post-state, and that identity is the only thing making it right"
+                );
+                self.checkpoint_rosters
+                    .remember(env.header.parent, self.state.active_validators());
                 self.state.set(post);
                 // Snapshot for the reorg path. Free: this is the state that
                 // was just built, kept by handle, not copied.
@@ -1655,6 +1916,22 @@ impl Engine {
         let st = applied
             .last()
             .map_or_else(|| Arc::clone(&base), |(_, st)| Arc::clone(st));
+
+        // ── RosterRing, write side (the reorg half) ────────────────────────
+        //
+        // `apply_canonical` is not on this path — `do_reorg` runs the
+        // transition itself — so without this the ring would hold nothing for
+        // any branch adopted by reorg, which is most of the branches that
+        // matter. The post-states are already computed above; this is the
+        // table each of them committed, filed under the block it belongs to.
+        // Same rule as the extension hook, reached from the other side: the
+        // entry under root `B` is the roster of `B`'s post-state.
+        self.checkpoint_rosters
+            .remember(ancestor, base.active_validators());
+        for (id, post) in &applied {
+            self.checkpoint_rosters
+                .remember(*id, post.active_validators());
+        }
 
         // Adopt.
         let old_head = self.head_slot_now();
@@ -2303,6 +2580,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         ws_anchor_hard: false,
         ws_conflict_reported: false,
         fc_covered_removals: 0,
+        checkpoint_rosters: RosterRing::new(),
         manifest,
     };
 
@@ -2599,13 +2877,41 @@ pub fn run(cfg: Config) -> io::Result<()> {
 /// it can be reasoned about and tested without standing up a node. It is also
 /// what makes the divergence from longest-chain testable at all — see
 /// `forkchoice_tests::weight_beats_length` at the bottom of this file.
+/// Test-only, and that is the point: the node runs
+/// [`lmd_ghost_head_by_checkpoint`]. This is the same call with an EMPTY ring,
+/// kept so `head_matches_the_reference_implementation` can assert it equals
+/// the pre-change algorithm.
+#[cfg(test)]
 pub fn lmd_ghost_head<'a>(
     blocks: &BTreeMap<[u8; 32], BlockEnvelope>,
     pool: impl Iterator<Item = &'a Attestation>,
     validators: &[bloch_pos_committee::sample::Validator],
     justified: [u8; 32],
 ) -> [u8; 32] {
-    let (fc, parents, children) = forkchoice_store(blocks, pool, validators);
+    // An empty ring means every lookup misses and every vote is weighed by
+    // `validators` — which is, value for value, what this function did before
+    // the ring existed. That equality is not a convenience for the callers
+    // below: it is the argument that this change needs no flag day, and
+    // `an_empty_ring_is_the_fork_choice_that_was_here_before` pins it against
+    // the pre-change reference implementation.
+    lmd_ghost_head_by_checkpoint(blocks, pool, &RosterRing::new(), validators, justified)
+}
+
+/// [`lmd_ghost_head`], weighing each vote by the roster committed at the
+/// checkpoint the vote names, and falling back to `fallback` for a checkpoint
+/// `rosters` does not hold.
+///
+/// This is what the node runs. See [`RosterRing`] for why the weight cannot be
+/// a single table, and [`Engine::forkchoice_fallback`] for what a miss means
+/// and why it is not the local head's table.
+pub fn lmd_ghost_head_by_checkpoint<'a>(
+    blocks: &BTreeMap<[u8; 32], BlockEnvelope>,
+    pool: impl Iterator<Item = &'a Attestation>,
+    rosters: &RosterRing,
+    fallback: &[bloch_pos_committee::sample::Validator],
+    justified: [u8; 32],
+) -> [u8; 32] {
+    let (fc, parents, children) = forkchoice_store(blocks, pool, rosters, fallback);
     let tree = BlockTree { parents: &parents };
     fc.head(&tree, justified, &children)
 }
@@ -2626,7 +2932,8 @@ pub fn lmd_ghost_head_reference<'a>(
     validators: &[bloch_pos_committee::sample::Validator],
     justified: [u8; 32],
 ) -> [u8; 32] {
-    let (fc, parents, children) = forkchoice_store(blocks, pool, validators);
+    let (fc, parents, children) =
+        forkchoice_store(blocks, pool, &RosterRing::new(), validators);
     let tree = BlockTree { parents: &parents };
     fc.head_reference(&tree, justified, &children)
 }
@@ -2639,7 +2946,8 @@ pub fn lmd_ghost_head_reference<'a>(
 fn forkchoice_store<'a>(
     blocks: &BTreeMap<[u8; 32], BlockEnvelope>,
     pool: impl Iterator<Item = &'a Attestation>,
-    validators: &[bloch_pos_committee::sample::Validator],
+    rosters: &RosterRing,
+    fallback: &[bloch_pos_committee::sample::Validator],
 ) -> (
     FcStore,
     HashMap<[u8; 32], [u8; 32]>,
@@ -2656,37 +2964,511 @@ fn forkchoice_store<'a>(
     }
 
     let mut fc = FcStore::new();
-    // Weight is the stake the CANONICAL state committed. A competing branch may
-    // commit a different validator set; using its numbers would let a branch
-    // vote itself heavier, so the fork choice reads one set — the one this node
-    // has validated — exactly as Ethereum weights by the justified state.
-    for v in validators {
-        fc.set_stake(v.index, v.effective_stake);
-    }
-    for env in blocks.values() {
-        for att in &env.body.attestations {
-            fc.observe(
-                att.validator,
-                LatestMessage {
-                    slot: att.data.slot,
-                    root: att.data.head,
-                },
-            );
-        }
-    }
-    // Attestations seen on the wire but not yet in any block count too: that is
-    // what makes the head responsive within a slot instead of one block behind.
-    for att in pool {
-        fc.observe(
+    // Weight is the stake committed AT THE CHECKPOINT THE VOTE NAMES.
+    //
+    // It used to be the stake this node's own head committed, applied to the
+    // whole roster at once, and the comment that stood here defended it: "a
+    // competing branch may commit a different validator set; using its numbers
+    // would let a branch vote itself heavier". The hazard is real; the
+    // conclusion was backwards. Reading one set does not make the node
+    // neutral — it makes the node's OWN branch the privileged one. Effective
+    // stake in that set has each validator's inactivity leak subtracted, the
+    // leak is accrued from absence relative to a branch, and the validators
+    // absent from this node's branch are exactly the ones voting for the other
+    // one. MEASURED self-inflation on the fleet: 8.27 %.
+    //
+    // What actually bounds the branch-votes-itself-heavier hazard is that
+    // `rosters` holds only tables this node EXECUTED. A table an arriving
+    // envelope asserted is never consulted, because no such thing is ever
+    // stored: `RosterRing::remember` is reachable only from the two functions
+    // that run a block into canonical state.
+    //
+    // Resolved per validator, not per roster, because a validator has one
+    // latest message and its weight is decided by the one checkpoint that
+    // message names.
+    let mut tables: HashMap<[u8; 32], HashMap<u32, u64>> = HashMap::new();
+    let mut weigh = |fc: &mut FcStore, att: &Attestation| {
+        let retained = fc.observe(
             att.validator,
             LatestMessage {
                 slot: att.data.slot,
                 root: att.data.head,
             },
         );
+        // `observe` answers false for a message that did NOT become this
+        // validator's latest — an older vote, a duplicate, or the second half
+        // of an equivocating pair (which also bars the validator outright).
+        // Only the retained message may set the stake, and that is what keeps
+        // the result a function of the message SET rather than of arrival
+        // order: whichever order two votes arrive in, the stake left standing
+        // is the one attached to the message left standing.
+        if !retained {
+            return;
+        }
+        let table = tables.entry(att.data.target_root).or_insert_with(|| {
+            rosters
+                .roster_at(&att.data.target_root)
+                .unwrap_or(fallback)
+                .iter()
+                .map(|v| (v.index, v.effective_stake))
+                .collect()
+        });
+        // Absent from the table is zero weight — the same answer
+        // `Store::weight`'s `unwrap_or(&0)` has always given a voter who is
+        // not in the roster at all.
+        fc.set_stake(
+            att.validator,
+            table.get(&att.validator).copied().unwrap_or(0),
+        );
+    };
+    for env in blocks.values() {
+        for att in &env.body.attestations {
+            weigh(&mut fc, att);
+        }
+    }
+    // Attestations seen on the wire but not yet in any block count too: that is
+    // what makes the head responsive within a slot instead of one block behind.
+    for att in pool {
+        weigh(&mut fc, att);
     }
 
     (fc, parents, children)
+}
+
+
+/// The checkpoint-roster ring: that it is written, and that writing it is what
+/// lets a partitioned minority rejoin.
+///
+/// Split from `forkchoice_tests` because these are about a node's *state*
+/// (which rosters it holds, and what it does about the ones it does not)
+/// rather than about the weight arithmetic.
+#[cfg(test)]
+mod checkpoint_roster_ring {
+    use super::forkchoice_tests::{chain_of, vals};
+    use super::*;
+    use bloch_pos_committee::params::{MIN_QUORUM_DENOMINATOR_DEN, MIN_QUORUM_DENOMINATOR_NUM};
+    use bloch_pos_committee::sample::Validator;
+
+    /// `forkchoice_tests::attest` votes for its own head as its checkpoint,
+    /// which is exactly the case this module must NOT use: the whole subject
+    /// here is a vote whose target is a checkpoint distinct from — and, for
+    /// the far side of a partition, absent from — the reader's branch.
+    fn attest_at(validator: u32, slot: u64, head: [u8; 32], target: [u8; 32]) -> Attestation {
+        Attestation {
+            validator,
+            data: AttestationData {
+                slot,
+                head,
+                source_epoch: 0,
+                source_root: [0u8; 32],
+                target_epoch: 2,
+                target_root: target,
+            },
+            signature: Vec::new(),
+        }
+    }
+
+    fn table(pairs: &[(u32, u64)]) -> Vec<Validator> {
+        pairs
+            .iter()
+            .map(|(index, effective_stake)| Validator {
+                index: *index,
+                effective_stake: *effective_stake,
+            })
+            .collect()
+    }
+
+    /// A ring holding exactly the given entries.
+    fn ring_of(entries: &[([u8; 32], Vec<Validator>)]) -> RosterRing {
+        let mut r = RosterRing::new();
+        for (root, roster) in entries {
+            r.remember(*root, roster.clone());
+        }
+        r.reset_counters();
+        r
+    }
+
+    // ── The write side, through the real engine ─────────────────────────────
+
+    /// `apply_canonical` files the roster its PARENT committed, not the
+    /// block's own — which is the identity the hook's `debug_assert_eq!`
+    /// exists to keep true.
+    ///
+    /// The block just applied is the head, and the head is what the fallback
+    /// already is, so its own entry is not needed until it has a child. This
+    /// pins that as the intended shape rather than an accident: if the hook
+    /// ever moves to after `set(post)` the second assertion fails.
+    #[test]
+    fn applying_a_block_files_the_roster_its_parent_committed() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        let genesis = *engine.head_id().as_bytes();
+        assert_eq!(
+            engine.checkpoint_rosters.generation(),
+            0,
+            "a fresh engine has executed nothing and must hold nothing"
+        );
+
+        engine.propose(1);
+        let b1 = *engine.head_id().as_bytes();
+        assert_ne!(
+            b1, genesis,
+            "the fixture must actually have produced and adopted a block"
+        );
+        assert!(
+            engine.checkpoint_rosters.roster_at(&genesis).is_some(),
+            "applying block 1 must file the table genesis committed"
+        );
+        assert!(
+            engine.checkpoint_rosters.roster_at(&b1).is_none(),
+            "block 1 is the head; its own table is not filed until it has a child"
+        );
+
+        engine.propose(2);
+        let b2 = *engine.head_id().as_bytes();
+        assert_ne!(b2, b1, "the fixture must have produced a second block");
+        assert!(
+            engine.checkpoint_rosters.roster_at(&b1).is_some(),
+            "block 1 now has a child, so its table must be filed"
+        );
+
+        let filed = engine
+            .checkpoint_rosters
+            .roster_at(&genesis)
+            .expect("filed above")
+            .to_vec();
+        assert!(
+            !filed.is_empty() && filed.iter().all(|v| v.effective_stake > 0),
+            "a filed table must be the real roster, not an empty placeholder: {filed:?}"
+        );
+    }
+
+    // ── The read side: a 6-vs-2 partition ───────────────────────────────────
+
+    /// n = 8, split 6 against 2, and the fixture is built so that the two
+    /// sides justify at checkpoints neither shares with the other.
+    struct Partition {
+        blocks: BTreeMap<[u8; 32], BlockEnvelope>,
+        /// The last block both sides have. Every node's fork-choice walk
+        /// starts here (see the assertion in `the_minority_cannot_justify`).
+        common: [u8; 32],
+        /// The checkpoint the six justify at — on their branch only.
+        majority_checkpoint: [u8; 32],
+        majority_tip: [u8; 32],
+        /// The checkpoint the two vote for — on their branch only.
+        minority_checkpoint: [u8; 32],
+        minority_tip: [u8; 32],
+        votes: Vec<Attestation>,
+    }
+
+    fn six_against_two() -> Partition {
+        let g = [0x99u8; 32];
+        // Common prefix, then one branch each. Slots are only ordering for the
+        // latest-message rule; every validator votes once, so they do not
+        // decide anything here.
+        let (mut blocks, common_ids) = chain_of(vec![(g, 31, 1, Vec::new())]);
+        let common = common_ids[0];
+
+        let (maj, maj_ids) = chain_of(vec![(common, 32, 2, Vec::new())]);
+        blocks.extend(maj);
+        let majority_checkpoint = maj_ids[0];
+        let (maj2, maj2_ids) = chain_of(vec![(majority_checkpoint, 33, 3, Vec::new())]);
+        blocks.extend(maj2);
+        let majority_tip = maj2_ids[0];
+
+        let (min, min_ids) = chain_of(vec![(common, 32, 4, Vec::new())]);
+        blocks.extend(min);
+        let minority_checkpoint = min_ids[0];
+        let (min2, min2_ids) = chain_of(vec![(minority_checkpoint, 33, 5, Vec::new())]);
+        blocks.extend(min2);
+        let minority_tip = min2_ids[0];
+
+        let mut votes: Vec<Attestation> = (0..6u32)
+            .map(|v| attest_at(v, 40, majority_tip, majority_checkpoint))
+            .collect();
+        votes.extend((6..8u32).map(|v| attest_at(v, 40, minority_tip, minority_checkpoint)));
+
+        Partition {
+            blocks,
+            common,
+            majority_checkpoint,
+            majority_tip,
+            minority_checkpoint,
+            minority_tip,
+            votes,
+        }
+    }
+
+    /// The fixture guard the whole acceptance rests on: the six justify at a
+    /// checkpoint the two DO NOT HAVE.
+    ///
+    /// Without this the ring lookup is never taken down its interesting path
+    /// and every assertion below would pass on a fixture that proves nothing —
+    /// the failure mode the acceptance criteria name explicitly.
+    #[test]
+    fn the_two_branches_do_not_share_a_checkpoint() {
+        let p = six_against_two();
+        assert_ne!(p.majority_checkpoint, p.minority_checkpoint);
+        assert_ne!(p.majority_checkpoint, p.common);
+        // The minority's branch, as the minority's own execution built it:
+        // the common prefix and its own two blocks, and nothing of the six's.
+        let minority_branch = [p.common, p.minority_checkpoint, p.minority_tip];
+        assert!(
+            !minority_branch.contains(&p.majority_checkpoint),
+            "the six must justify somewhere the two have never executed, or the ring \
+             lookup is never exercised and this whole module is decoration"
+        );
+    }
+
+    /// Why the minority's fork-choice walk can reach the majority branch at
+    /// all: 2 of 8 can never justify, so the two are still walking from the
+    /// last COMMON checkpoint.
+    ///
+    /// Derived from the real constants rather than from the number 33.3 %.
+    /// Justification needs two thirds of the denominator, and the inactivity
+    /// leak can shrink that denominator to at most
+    /// `MIN_QUORUM_DENOMINATOR_NUM / MIN_QUORUM_DENOMINATOR_DEN` of the
+    /// unleaked total — so the smallest set that can ever justify is
+    /// `2/3 × 1/2 = 1/3` of the stake. (`finality.rs` pins the floor itself in
+    /// `a_partitioned_minority_finalizes_because_the_leak_shrinks_the_denominator`;
+    /// this only reads it.)
+    #[test]
+    fn the_minority_cannot_justify_and_that_is_what_keeps_it_reachable() {
+        let floor_num = 2 * MIN_QUORUM_DENOMINATOR_NUM;
+        let floor_den = 3 * MIN_QUORUM_DENOMINATOR_DEN;
+        // 2/8 < floor_num/floor_den, cross-multiplied to stay in integers.
+        assert!(
+            2 * floor_den < 8 * floor_num,
+            "2 of 8 is not below the {floor_num}/{floor_den} floor — re-derive this \
+             fixture, because the minority could then justify on its own branch and would \
+             never walk toward the majority's"
+        );
+    }
+
+    /// **THE ACCEPTANCE TEST.** All eight nodes select the same head, and it
+    /// is the majority's.
+    ///
+    /// Each node is its (fallback roster, ring, justified root) triple, which
+    /// is everything `forkchoice_head` reads:
+    ///
+    /// * the six finalize normally, so nothing leaks on their branch: their
+    ///   fallback is the unleaked table and their ring holds their own
+    ///   checkpoint. They walk from it.
+    /// * the two cannot justify (test above), so their walk starts at the last
+    ///   common block; their ring holds their own branch and NOT the six's;
+    ///   and their local head's table has the six leaked down to a tenth,
+    ///   which is what a long partition does. `forkchoice_fallback` is what
+    ///   refuses to import that leak.
+    #[test]
+    fn a_six_two_partition_converges_on_the_majority_branch() {
+        let p = six_against_two();
+        let unleaked = vals(8);
+        // The table the two committed at their own checkpoint: the six had
+        // been absent a while by then, but the two themselves are voting and
+        // are never leaked on their own branch.
+        let at_minority_checkpoint = table(&[
+            (0, 60),
+            (1, 60),
+            (2, 60),
+            (3, 60),
+            (4, 60),
+            (5, 60),
+            (6, 100),
+            (7, 100),
+        ]);
+
+        // ── the six ────────────────────────────────────────────────────────
+        let majority_ring = ring_of(&[
+            (p.common, unleaked.clone()),
+            (p.majority_checkpoint, unleaked.clone()),
+        ]);
+        let majority_head = lmd_ghost_head_by_checkpoint(
+            &p.blocks,
+            p.votes.iter(),
+            &majority_ring,
+            &unleaked,
+            p.majority_checkpoint,
+        );
+
+        // ── the two ────────────────────────────────────────────────────────
+        let minority_ring = ring_of(&[
+            (p.common, unleaked.clone()),
+            (p.minority_checkpoint, at_minority_checkpoint.clone()),
+        ]);
+        let minority_head = lmd_ghost_head_by_checkpoint(
+            &p.blocks,
+            p.votes.iter(),
+            &minority_ring,
+            &unleaked,
+            p.common,
+        );
+
+        assert_eq!(
+            minority_head, p.majority_tip,
+            "the minority must give up its own branch: six votes at their own checkpoint's \
+             weight beat two"
+        );
+        assert_eq!(
+            majority_head, p.majority_tip,
+            "the majority must stay where it is"
+        );
+        assert_eq!(
+            minority_head, majority_head,
+            "CONVERGENCE: all eight nodes select one head"
+        );
+
+        // ── the ring was consulted, and here is the number ─────────────────
+        //
+        // One lookup per DISTINCT checkpoint per fork-choice call — the
+        // per-checkpoint table is resolved once and reused for every vote that
+        // names it — so two checkpoints means exactly two lookups.
+        println!(
+            "ring on a minority node: {} hit(s), {} miss(es) over {} votes at 2 distinct \
+             checkpoints",
+            minority_ring.hits(),
+            minority_ring.misses(),
+            p.votes.len(),
+        );
+        assert_eq!(
+            minority_ring.hits(),
+            1,
+            "the two's own checkpoint must be found in their ring"
+        );
+        assert_eq!(
+            minority_ring.misses(),
+            1,
+            "the six's checkpoint must MISS: it is on a branch the two never executed, and \
+             a fixture where it hits is a fixture that has quietly stopped testing the \
+             fallback"
+        );
+    }
+
+    /// **The control, and the finding.** Keep the ring, make a miss fall back
+    /// to the local head's table — the behaviour that is there today — and the
+    /// minority never rejoins.
+    ///
+    /// This is why `Engine::forkchoice_fallback` does not do that. The ring
+    /// can only hold branches this node executed, so a vote from a branch it
+    /// has not adopted always misses; a fallback to the local head therefore
+    /// leaves the defect running in exactly the case the defect is about, and
+    /// the ring would be a change that helps only where the old rule was
+    /// already close to right.
+    #[test]
+    fn the_local_head_fallback_leaves_the_minority_stranded() {
+        let p = six_against_two();
+        let unleaked = vals(8);
+        // What a long partition does to the two's own head state: the six
+        // have been absent for many epochs, so the leak has taken nine tenths
+        // of their weight — in this node's view, and in no one else's.
+        let local_head_leaked = table(&[
+            (0, 10),
+            (1, 10),
+            (2, 10),
+            (3, 10),
+            (4, 10),
+            (5, 10),
+            (6, 100),
+            (7, 100),
+        ]);
+        let at_minority_checkpoint = table(&[
+            (0, 60),
+            (1, 60),
+            (2, 60),
+            (3, 60),
+            (4, 60),
+            (5, 60),
+            (6, 100),
+            (7, 100),
+        ]);
+        let minority_ring = ring_of(&[
+            (p.common, unleaked.clone()),
+            (p.minority_checkpoint, at_minority_checkpoint),
+        ]);
+
+        let stranded = lmd_ghost_head_by_checkpoint(
+            &p.blocks,
+            p.votes.iter(),
+            &minority_ring,
+            &local_head_leaked,
+            p.common,
+        );
+        assert_eq!(
+            stranded, p.minority_tip,
+            "with the local head as the fallback the two keep their own branch — six votes \
+             weighed at a tenth (60) lose to two weighed in full (200). If this ever selects \
+             the majority tip the fixture has stopped reproducing the partition and the \
+             acceptance test above proves nothing."
+        );
+        assert_eq!(
+            minority_ring.misses(),
+            1,
+            "the six's checkpoint missed here too — the ring is not what differs between \
+             this test and the one above; only the miss policy is"
+        );
+
+        // And the pre-ring node, which had no ring at all: same answer.
+        let before_the_change = lmd_ghost_head(
+            &p.blocks,
+            p.votes.iter(),
+            &local_head_leaked,
+            p.common,
+        );
+        assert_eq!(
+            before_the_change, p.minority_tip,
+            "today's node strands the minority; that is the defect"
+        );
+    }
+
+    /// The hit path, on the one node that can legitimately have the far
+    /// branch's table: one that EXECUTED it and later left it.
+    ///
+    /// Both checkpoints are then found, nothing falls back, and the six are
+    /// weighed by the table their own branch committed rather than by any
+    /// approximation.
+    #[test]
+    fn a_node_that_executed_both_branches_weighs_each_vote_exactly() {
+        let p = six_against_two();
+        let unleaked = vals(8);
+        let at_minority_checkpoint = table(&[
+            (0, 60),
+            (1, 60),
+            (2, 60),
+            (3, 60),
+            (4, 60),
+            (5, 60),
+            (6, 100),
+            (7, 100),
+        ]);
+        // On the six's branch the two are the absent ones.
+        let at_majority_checkpoint = table(&[
+            (0, 100),
+            (1, 100),
+            (2, 100),
+            (3, 100),
+            (4, 100),
+            (5, 100),
+            (6, 40),
+            (7, 40),
+        ]);
+        let both = ring_of(&[
+            (p.common, unleaked.clone()),
+            (p.minority_checkpoint, at_minority_checkpoint),
+            (p.majority_checkpoint, at_majority_checkpoint),
+        ]);
+        // Deliberately the WORST fallback available, so that a fallback taken
+        // by accident would change the answer and be caught.
+        let poison = table(&[(0, 0), (1, 0), (2, 0), (3, 0), (4, 0), (5, 0), (6, 0), (7, 0)]);
+        let head =
+            lmd_ghost_head_by_checkpoint(&p.blocks, p.votes.iter(), &both, &poison, p.common);
+        assert_eq!(head, p.majority_tip, "600 against 200");
+        assert_eq!(both.hits(), 2, "both checkpoints must be found");
+        assert_eq!(
+            both.misses(),
+            0,
+            "nothing may fall back here — if anything did, the zeroed fallback would have \
+             made every branch weigh nothing and the tie-break, not the stake, would have \
+             chosen the head"
+        );
+    }
 }
 
 /// Whether the mempool will hold `tx` at all.
@@ -2903,7 +3685,7 @@ mod forkchoice_tests {
     use super::*;
     use bloch_pos_committee::sample::Validator;
 
-    fn header(parent: [u8; 32], slot: u64, marker: u8) -> BlockHeaderV4 {
+    pub(super) fn header(parent: [u8; 32], slot: u64, marker: u8) -> BlockHeaderV4 {
         BlockHeaderV4 {
             version: VERSION_G4,
             parent,
@@ -2920,7 +3702,7 @@ mod forkchoice_tests {
         }
     }
 
-    fn attest(validator: u32, slot: u64, head: [u8; 32]) -> Attestation {
+    pub(super) fn attest(validator: u32, slot: u64, head: [u8; 32]) -> Attestation {
         Attestation {
             validator,
             data: AttestationData {
@@ -2937,7 +3719,7 @@ mod forkchoice_tests {
 
     /// Build `blocks` from `(parent, slot, marker, attestations)` tuples,
     /// returning the map and each block's id in order.
-    fn chain_of(
+    pub(super) fn chain_of(
         specs: Vec<([u8; 32], u64, u8, Vec<Attestation>)>,
     ) -> (BTreeMap<[u8; 32], BlockEnvelope>, Vec<[u8; 32]>) {
         let mut blocks = BTreeMap::new();
@@ -2961,7 +3743,7 @@ mod forkchoice_tests {
         (blocks, ids)
     }
 
-    fn vals(n: u32) -> Vec<Validator> {
+    pub(super) fn vals(n: u32) -> Vec<Validator> {
         (0..n)
             .map(|index| Validator {
                 index,
@@ -3173,6 +3955,17 @@ mod forkchoice_tests {
     /// Fork choice selects the head. If these two ever disagree the change is
     /// a hard fork rather than a speed-up, which is the whole reason the old
     /// algorithm was kept as `lmd_ghost_head_reference` instead of deleted.
+    ///
+    /// Since the checkpoint-roster ring landed this carries a second
+    /// obligation, and it is the reason that change needs no flag day.
+    /// `lmd_ghost_head` is now a wrapper that runs the NEW per-vote weighting
+    /// with an EMPTY ring; `lmd_ghost_head_reference` is the pre-change
+    /// algorithm fed by the same store. Every round below therefore asserts
+    /// that a node holding no checkpoint rosters computes the head the old
+    /// code computed — bit for bit, over randomised DAGs with equivocators,
+    /// votes for unknown roots, body-carried and loose attestations, and
+    /// tie-breaking weights. A fleet running mixed builds diverges only where
+    /// the ring is non-empty, never merely because the binary changed.
     #[test]
     fn head_matches_the_reference_implementation() {
         let mut rng = Rng(0x0806_2308_5EED_5EED);
@@ -3374,7 +4167,8 @@ mod forkchoice_tests {
             // chain length), and `Store::head` then walks it. Reporting the
             // total alone would hide which one is left.
             let t = Instant::now();
-            let (fc, parents, children) = forkchoice_store(&blocks, pool.iter(), &validators);
+            let (fc, parents, children) =
+                forkchoice_store(&blocks, pool.iter(), &RosterRing::new(), &validators);
             let build_ms = t.elapsed().as_secs_f64() * 1000.0;
             let tree = BlockTree { parents: &parents };
             let t = Instant::now();
@@ -3849,6 +4643,7 @@ mod transfer_v2_end_to_end {
             ws_anchor_hard: false,
             ws_conflict_reported: false,
             fc_covered_removals: 0,
+            checkpoint_rosters: RosterRing::new(),
         }
     }
 
@@ -4147,6 +4942,7 @@ mod perf_support {
             // offset the very first comparison against a pool that really is
             // empty.
             fc_covered_removals: 0,
+            checkpoint_rosters: RosterRing::new(),
         };
         (engine, TestDir(dir))
     }
@@ -5426,6 +6222,7 @@ mod duty_view_anchor {
             ws_anchor_hard: false,
             ws_conflict_reported: false,
             fc_covered_removals: 0,
+            checkpoint_rosters: RosterRing::new(),
         };
         (engine, dir)
     }
