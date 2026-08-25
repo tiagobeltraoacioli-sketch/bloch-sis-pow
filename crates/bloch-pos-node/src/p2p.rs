@@ -657,13 +657,70 @@ pub struct Handle {
     /// This node's libp2p identity. Public information; printed at boot so an
     /// operator can build the `/p2p/<id>` multiaddr peers dial.
     pub peer_id: PeerId,
+    /// Frames that never reached the swarm. See [`crate::net::BroadcastDrops`].
+    drops: Arc<crate::net::BroadcastDrops>,
 }
 
 impl Handle {
     /// Publish one engine frame. Routing is by the leading `net::FRAME_*`
     /// byte, so the engine's call sites are identical on both transports.
-    pub fn broadcast(&self, frame: Vec<u8>) {
-        let _ = self.cmd.send(Command::Broadcast(frame));
+    ///
+    /// Returns false when the frame did not even reach the swarm thread.
+    ///
+    /// **This used to be `let _ = self.cmd.send(...)`.** The node publishes the
+    /// block it produced and signed through this call. If the swarm thread had
+    /// exited, or the frame was too large for gossipsub to carry, the frame was
+    /// discarded and the function returned `()`: a lost proposal slot with zero
+    /// log lines, indistinguishable from a slot this node was never assigned.
+    /// Every failure below is now counted, and every failure of a frame this
+    /// node ORIGINATED is logged with its type, its length and the reason.
+    pub fn broadcast(&self, frame: Vec<u8>, prov: crate::net::Provenance) -> bool {
+        // Checked here rather than left to fail inside the swarm. gossipsub
+        // refuses anything over `max_transmit_size` at publish time, which is
+        // after the frame has been moved across a channel and after the engine
+        // has been told nothing went wrong. Refusing it at the call the engine
+        // makes is the difference between a diagnosis and a mystery.
+        // An empty frame has no type byte to route on and is discarded by the
+        // swarm with a bare `return` — the same silent shape this work package
+        // exists to remove. Refused here, where the engine can be told.
+        if frame.is_empty() {
+            self.drops.note_malformed();
+            return false;
+        }
+        let publishes_to_gossip = matches!(
+            frame.first(),
+            Some(&crate::net::FRAME_BLOCK)
+                | Some(&crate::net::FRAME_ATT)
+                | Some(&crate::net::FRAME_TX)
+        );
+        if publishes_to_gossip && frame.len().saturating_sub(1) > MAX_GOSSIP_BYTES {
+            self.drops.lost(
+                prov,
+                &frame,
+                "payload exceeds MAX_GOSSIP_BYTES; gossipsub would refuse it",
+                0,
+            );
+            return false;
+        }
+        // No clone on the success path. `UnboundedSender::send` hands the
+        // value back inside `SendError` when it fails, so the failure branch
+        // gets the frame for free — cloning to keep one for the error message
+        // would put a second full copy of every block (up to MAX_GOSSIP_BYTES)
+        // on the hot path, and the swarm side already pays one `to_vec` when it
+        // publishes.
+        if let Err(e) = self.cmd.send(Command::Broadcast(frame)) {
+            let Command::Broadcast(frame) = e.0 else {
+                unreachable!("we just sent a Broadcast")
+            };
+            self.drops.lost(prov, &frame, "the p2p swarm thread is gone", 0);
+            return false;
+        }
+        true
+    }
+
+    /// Counters for frames that never reached the swarm.
+    pub fn drops(&self) -> &Arc<crate::net::BroadcastDrops> {
+        &self.drops
     }
 
     /// Report the engine's decision on a gossip message. A no-op for an
@@ -758,7 +815,7 @@ pub fn start(
     })?;
 
     match ready_rx.recv() {
-        Ok(Ok(())) => Ok(Handle { cmd: cmd_tx, peer_id }),
+        Ok(Ok(())) => Ok(Handle { cmd: cmd_tx, peer_id, drops: Arc::new(Default::default()) }),
         Ok(Err(e)) => Err(e),
         Err(_) => Err(io::Error::other("p2p thread died before it started")),
     }
@@ -1351,6 +1408,7 @@ fn serve_sync(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::net::Provenance;
 
     /// THE regression test for mesh defect (b) of 2026-08-07.
     ///
@@ -1731,7 +1789,7 @@ mod tests {
         let mut connected = false;
         while Instant::now() < deadline && !connected {
             attempt += 1;
-            a.handle.broadcast(crate::net::block_frame(&envelope(900 + attempt)));
+            a.handle.broadcast(crate::net::block_frame(&envelope(900 + attempt)), Provenance::Originated);
             connected = !collect_blocks(&b.rx, 1, 1).is_empty();
         }
         assert!(connected, "the mesh never formed: no block ever reached the peer");
@@ -1742,7 +1800,7 @@ mod tests {
 
         // In regime now. Ten distinct blocks, one publish each, all must land.
         for slot in 2..=11u64 {
-            a.handle.broadcast(crate::net::block_frame(&envelope(slot)));
+            a.handle.broadcast(crate::net::block_frame(&envelope(slot)), Provenance::Originated);
         }
         let deadline = Instant::now() + Duration::from_secs(20);
         let mut got: Vec<u64> = Vec::new();
@@ -1762,7 +1820,7 @@ mod tests {
 
         // And it is bidirectional — b was never told about a, it only accepted
         // a's dial, and it must still be able to publish back.
-        b.handle.broadcast(crate::net::block_frame(&envelope(500)));
+        b.handle.broadcast(crate::net::block_frame(&envelope(500)), Provenance::Originated);
         assert_eq!(collect_blocks(&a.rx, 1, 20), vec![500], "reverse direction never delivered");
     }
 
@@ -1818,5 +1876,52 @@ mod tests {
         assert!(matches!(MessageAcceptance::from(Verdict::Accept), MessageAcceptance::Accept));
         assert!(matches!(MessageAcceptance::from(Verdict::Ignore), MessageAcceptance::Ignore));
         assert!(matches!(MessageAcceptance::from(Verdict::Reject), MessageAcceptance::Reject));
+    }
+
+    /// `Handle::broadcast` must not lose a frame this node originated in
+    /// silence — the founder-level requirement of WP3.
+    ///
+    /// Both ways it can fail are exercised, because both were `let _ = ...`:
+    /// the swarm thread being gone, and a frame gossipsub could not carry.
+    /// A `Handle` is built directly rather than through `start` so this test
+    /// needs no sockets, no runtime and no peers; the failure it induces is
+    /// exactly the one a shutting-down or wedged swarm produces.
+    #[test]
+    fn an_originated_frame_is_never_dropped_in_silence() {
+        let (cmd, rx) = tokio::sync::mpsc::unbounded_channel();
+        let h = Handle {
+            cmd,
+            peer_id: PeerId::random(),
+            drops: Arc::new(crate::net::BroadcastDrops::default()),
+        };
+
+        // While the swarm is listening, a frame is accepted and nothing is
+        // counted — otherwise this test would pass on a handle that dropped
+        // everything.
+        assert!(
+            h.broadcast(crate::net::block_frame(&envelope(1)), Provenance::Originated),
+            "a live handle must accept our own block"
+        );
+        assert_eq!(h.drops().originated_lost(), 0, "a delivered frame counted as lost");
+
+        // Oversized: gossipsub would refuse it after the engine had been told
+        // nothing was wrong.
+        let mut huge = vec![crate::net::FRAME_BLOCK];
+        huge.extend(std::iter::repeat(0u8).take(MAX_GOSSIP_BYTES + 1));
+        assert!(!h.broadcast(huge, Provenance::Originated), "an unpublishable frame reported success");
+        assert_eq!(h.drops().originated_lost(), 1, "an oversized own-frame was not counted");
+
+        // Swarm gone: the exact shape of losing a proposal at shutdown.
+        drop(rx);
+        assert!(
+            !h.broadcast(crate::net::block_frame(&envelope(2)), Provenance::Originated),
+            "publishing into a dead swarm reported success"
+        );
+        assert_eq!(h.drops().originated_lost(), 2, "a lost own-block was not counted");
+
+        // A relay drop is counted too — sparsely logged, never invisible.
+        assert!(!h.broadcast(crate::net::block_frame(&envelope(3)), Provenance::Relayed));
+        assert_eq!(h.drops().relayed_lost(), 1, "a lost relayed frame was not counted");
+        assert_eq!(h.drops().originated_lost(), 2, "a relay drop was charged to origination");
     }
 }
