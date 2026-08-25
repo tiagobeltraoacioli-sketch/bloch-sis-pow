@@ -159,6 +159,20 @@ ARMED_EPOCH = 1400
 # looking at the wrong tree, and its silence means nothing.
 MIN_SOURCES_SCANNED = 20
 
+# Declared `#[test]` per consensus crate on ab9ca4e1. PER CRATE, deliberately.
+#
+# The workspace TOTAL is worthless here, and measurably so: ab9ca4e1 and
+# a5c20a90 both declare exactly 550 across the two crates, out of completely
+# different sets — 411+139 armed against 430+120 on the lastro. A merge that
+# dropped every one of the armed build's node tests and kept the lastro's
+# would still report ~550 and look untouched.
+#
+# The default-mode count is worse than worthless: the armed build ignores 44
+# of its 550 (the perf suites), the lastro ignores 4, so a bare `cargo test`
+# runs FEWER tests on the armed branch (~506) than on the lastro (~546) — a
+# comparison that reads as a regression while being the opposite.
+DECLARED_TESTS_MIN = {"bloch-pos-committee": 411, "bloch-pos-node": 139}
+
 # Every component tag the armed build's state root commits, inside
 # `build_state_tree_inner`.  An integration may only ADD tags.  Losing one is a
 # SILENT consensus change: the root stops binding a field and nothing fails to
@@ -645,6 +659,21 @@ def check_root_components(root: Path, rep: Report):
             "22751083 folded the eUTXO loop into a clone of the retained Smt")
 
 
+def check_declared_test_counts(root: Path, rep: Report):
+    """Each consensus crate must still declare at least what ab9ca4e1 declared."""
+    g = "C. proof suites (source)"
+    for crate, floor in DECLARED_TESTS_MIN.items():
+        d = root / "crates" / crate
+        if not d.is_dir():
+            rep.add(g, f"{crate} declares >= {floor} tests", False, "CRATE DIRECTORY MISSING")
+            continue
+        n = sum(len(re.findall(r'#\[\s*test\s*\]', strip_comments(q.read_text(errors="replace"))))
+                for q in d.rglob("*.rs"))
+        rep.add(g, f"{crate} declares >= {floor} tests", n >= floor,
+                f"{n} declared (ab9ca4e1 had {floor})"
+                + ("" if n >= floor else f" — {floor - n} FEWER than the armed build"))
+
+
 def check_arming_record(root: Path, rep: Report):
     """The runbook's own acceptance criterion for an armed release.
 
@@ -999,6 +1028,7 @@ def main():
     check_arming_record(root, rep)
     check_tripwire_source(root, rep)
     present = check_suites_source(root, rep)
+    check_declared_test_counts(root, rep)
     check_symbols(root, rep)
     check_structural(root, rep)
     check_root_components(root, rep)
@@ -1018,7 +1048,7 @@ def main():
         print("!! THE VERIFIER EXECUTED ZERO GATES. This report means NOTHING.")
         print("!" * 70)
         return 2
-    expected_min = 7 + 2 + len(SUITES) + len(PERF_SYMBOLS) + len(STRUCTURAL_PINS) + 5
+    expected_min = 7 + 2 + 2 + len(SUITES) + len(PERF_SYMBOLS) + len(STRUCTURAL_PINS) + 5
     if not args.no_cargo:
         expected_min += 3  # build + tripwire-run + workspace-green
     if len(gates) < expected_min:
