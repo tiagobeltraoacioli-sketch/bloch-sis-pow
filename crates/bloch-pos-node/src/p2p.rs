@@ -193,7 +193,7 @@ use libp2p::{identify, identity, noise, yamux, PeerId, StreamProtocol, SwarmBuil
 /// without depending on libp2p directly.
 pub use libp2p::Multiaddr;
 
-use crate::engine::EngineEvent;
+use crate::engine::{EngineEvent, ENGINE_EVENT_QUEUE_CAP};
 use crate::net::{IngressOutcome, NetEvent};
 
 // ── Protocol identity: a Genesis-4 node must never speak to a Genesis-3 one ──
@@ -285,6 +285,18 @@ const MAX_CONCURRENT_SYNC_SERVES: usize = 4;
 
 /// Response framing before the first envelope: tag plus envelope count.
 const SYNC_RESPONSE_HEADER_BYTES: usize = 1 + 4;
+
+/// Broadcasts waiting for the swarm loop. Each is capped at
+/// [`MAX_GOSSIP_BYTES`] plus its engine-only frame tag.
+const MAX_PENDING_BROADCASTS: usize = 8;
+
+/// Validation reports waiting for the swarm loop. Keeping this at least one
+/// engine batch means a full batch can return its gossip decisions without
+/// being blocked behind publication work.
+const MAX_PENDING_REPORTS: usize = ENGINE_EVENT_QUEUE_CAP;
+
+/// The engine frame carries one routing byte outside the gossipsub payload.
+const MAX_BROADCAST_COMMAND_BYTES: usize = MAX_GOSSIP_BYTES + 1;
 
 /// A blocking read's response, retaining its permit until libp2p confirms the
 /// bytes were flushed or reports the inbound request failed.
@@ -644,17 +656,14 @@ pub fn gossipsub_config() -> Result<gossipsub::Config, String> {
 
 // ── Handle ──────────────────────────────────────────────────────────────────
 
-enum Command {
-    /// A typed frame from the engine (`net::FRAME_*` byte, then payload),
-    /// routed to a topic or to the directed-sync path by that byte.
-    Broadcast(Vec<u8>),
-    /// The engine's verdict on a gossip message it was handed.
-    Report(Origin, Verdict),
-}
-
 /// The engine's view of the libp2p stack: publish frames, report verdicts.
 pub struct Handle {
-    cmd: tokio::sync::mpsc::UnboundedSender<Command>,
+    /// Publication work is lossy under pressure: dropping gossip or a sync
+    /// request is recoverable, while blocking the consensus thread is not.
+    broadcasts: tokio::sync::mpsc::Sender<Vec<u8>>,
+    /// Keep validation outcomes independent of publication pressure, since
+    /// `validate_messages()` holds attestations until it receives one.
+    reports: tokio::sync::mpsc::Sender<(Origin, Verdict)>,
     /// This node's libp2p identity. Public information; printed at boot so an
     /// operator can build the `/p2p/<id>` multiaddr peers dial.
     pub peer_id: PeerId,
@@ -664,14 +673,16 @@ impl Handle {
     /// Publish one engine frame. Routing is by the leading `net::FRAME_*`
     /// byte, so the engine's call sites are identical on both transports.
     pub fn broadcast(&self, frame: Vec<u8>) {
-        let _ = self.cmd.send(Command::Broadcast(frame));
+        if frame.len() <= MAX_BROADCAST_COMMAND_BYTES {
+            let _ = self.broadcasts.try_send(frame);
+        }
     }
 
     /// Report the engine's decision on a gossip message. A no-op for an
     /// [`Origin::none`].
     pub fn report(&self, origin: &Origin, verdict: Verdict) {
         if origin.inner.is_some() {
-            let _ = self.cmd.send(Command::Report(origin.clone(), verdict));
+            let _ = self.reports.try_send((origin.clone(), verdict));
         }
     }
 }
@@ -735,7 +746,10 @@ pub fn start(
     let keypair = load_or_create_identity(&cfg.data_dir.join("p2p_identity.bin"))?;
     let peer_id = PeerId::from(keypair.public());
 
-    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (broadcast_tx, broadcast_rx) =
+        tokio::sync::mpsc::channel::<Vec<u8>>(MAX_PENDING_BROADCASTS);
+    let (report_tx, report_rx) =
+        tokio::sync::mpsc::channel::<(Origin, Verdict)>(MAX_PENDING_REPORTS);
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<io::Result<()>>();
 
     std::thread::Builder::new().name("bloch-p2p".into()).spawn(move || {
@@ -750,7 +764,16 @@ pub fn start(
             match build_swarm(&keypair, &cfg) {
                 Ok(swarm) => {
                     let _ = ready_tx.send(Ok(()));
-                    run_swarm(swarm, cfg, cmd_rx, events, head_slot, inflight).await;
+                    run_swarm(
+                        swarm,
+                        cfg,
+                        broadcast_rx,
+                        report_rx,
+                        events,
+                        head_slot,
+                        inflight,
+                    )
+                    .await;
                 }
                 Err(e) => {
                     let _ = ready_tx.send(Err(e));
@@ -760,7 +783,11 @@ pub fn start(
     })?;
 
     match ready_rx.recv() {
-        Ok(Ok(())) => Ok(Handle { cmd: cmd_tx, peer_id }),
+        Ok(Ok(())) => Ok(Handle {
+            broadcasts: broadcast_tx,
+            reports: report_tx,
+            peer_id,
+        }),
         Ok(Err(e)) => Err(e),
         Err(_) => Err(io::Error::other("p2p thread died before it started")),
     }
@@ -896,7 +923,8 @@ impl Loop {
 async fn run_swarm(
     mut swarm: Swarm,
     cfg: Config,
-    mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<Command>,
+    mut broadcast_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    mut report_rx: tokio::sync::mpsc::Receiver<(Origin, Verdict)>,
     events: EngineSender<EngineEvent>,
     head_slot: Arc<AtomicU64>,
     inflight: Arc<AtomicUsize>,
@@ -943,6 +971,13 @@ async fn run_swarm(
 
     loop {
         tokio::select! {
+            biased;
+            report = report_rx.recv() => {
+                match report {
+                    Some((origin, verdict)) => handle_report(&mut swarm, origin, verdict),
+                    None => return, // engine dropped the handle
+                }
+            }
             ev = swarm.select_next_some() => {
                 if !handle_swarm_event(
                     &mut swarm,
@@ -955,9 +990,9 @@ async fn run_swarm(
                     return; // engine gone
                 }
             }
-            cmd = cmd_rx.recv() => {
-                match cmd {
-                    Some(c) => handle_command(&mut swarm, &mut st, c),
+            frame = broadcast_rx.recv() => {
+                match frame {
+                    Some(frame) => handle_broadcast(&mut swarm, &mut st, frame),
                     None => return, // engine dropped the handle
                 }
             }
@@ -993,49 +1028,46 @@ fn peer_id_of(addr: &Multiaddr) -> Option<PeerId> {
     })
 }
 
-fn handle_command(swarm: &mut Swarm, st: &mut Loop, cmd: Command) {
-    match cmd {
-        Command::Report(origin, verdict) => {
-            if let Some((msg_id, source)) = origin.inner {
-                swarm
-                    .behaviour_mut()
-                    .gossipsub
-                    .report_message_validation_result(&msg_id, &source, verdict.into());
+fn handle_report(swarm: &mut Swarm, origin: Origin, verdict: Verdict) {
+    if let Some((msg_id, source)) = origin.inner {
+        swarm
+            .behaviour_mut()
+            .gossipsub
+            .report_message_validation_result(&msg_id, &source, verdict.into());
+    }
+}
+
+fn handle_broadcast(swarm: &mut Swarm, st: &mut Loop, frame: Vec<u8>) {
+    let Some((&tag, payload)) = frame.split_first() else { return };
+    match tag {
+        crate::net::FRAME_BLOCK => {
+            // Re-gossip suppression. A block this node produced has a
+            // content hash nobody has seen, so its own announcement is
+            // never suppressed; a block that arrived on the mesh in the
+            // last TTL would be refused by gossipsub's duplicate cache
+            // anyway, after paying the hash of the whole body.
+            if let Ok(env) = crate::codec::decode_envelope(payload) {
+                let id = *env.block_id().as_bytes();
+                if !st.note_block(id) {
+                    return;
+                }
             }
+            publish(swarm, st.topics.blocks.clone(), payload.to_vec(), "blocks");
         }
-        Command::Broadcast(frame) => {
-            let Some((&tag, payload)) = frame.split_first() else { return };
-            match tag {
-                crate::net::FRAME_BLOCK => {
-                    // Re-gossip suppression. A block this node produced has a
-                    // content hash nobody has seen, so its own announcement is
-                    // never suppressed; a block that arrived on the mesh in the
-                    // last TTL would be refused by gossipsub's duplicate cache
-                    // anyway, after paying the hash of the whole body.
-                    if let Ok(env) = crate::codec::decode_envelope(payload) {
-                        let id = *env.block_id().as_bytes();
-                        if !st.note_block(id) {
-                            return;
-                        }
-                    }
-                    publish(swarm, st.topics.blocks.clone(), payload.to_vec(), "blocks");
-                }
-                crate::net::FRAME_ATT => {
-                    publish(swarm, st.topics.attestations.clone(), payload.to_vec(), "attestations");
-                }
-                crate::net::FRAME_TX => {
-                    publish(swarm, st.topics.txs.clone(), payload.to_vec(), "txs");
-                }
-                crate::net::FRAME_GET_BLOCKS => {
-                    if payload.len() != 8 {
-                        return;
-                    }
-                    let after = u64::from_le_bytes(payload.try_into().unwrap());
-                    request_blocks(swarm, st, after);
-                }
-                _ => {}
+        crate::net::FRAME_ATT => {
+            publish(swarm, st.topics.attestations.clone(), payload.to_vec(), "attestations");
+        }
+        crate::net::FRAME_TX => {
+            publish(swarm, st.topics.txs.clone(), payload.to_vec(), "txs");
+        }
+        crate::net::FRAME_GET_BLOCKS => {
+            if payload.len() != 8 {
+                return;
             }
+            let after = u64::from_le_bytes(payload.try_into().unwrap());
+            request_blocks(swarm, st, after);
         }
+        _ => {}
     }
 }
 
