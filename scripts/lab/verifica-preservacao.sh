@@ -67,6 +67,26 @@ else
   bad rpc-diagnostics "getchaininfo lost blocks_known and/or behind_by_slots"
 fi
 
+# 6. THE SEED RULE ITSELF. Added after 2026-08-25, when branch
+#    pmo/seed-ancestralidade-v2 was found carrying commit 8075fe24 - message
+#    "wire the F6 seed look-ahead into both production readers", diff doing
+#    the OPPOSITE: `let Some(src) = epoch.checked_sub(1)` with a trailing
+#    `// MUTATION A: reader back at E-1`, in `pub fn seed_for_epoch`, a
+#    PRODUCTION function with no cfg(test) gate. A binary built from that
+#    branch ships the exact partition bug under a commit claiming it fixed.
+#    The commit message is not the artifact. The code is.
+T=crates/bloch-pos-committee/src/transition.rs
+if grep -q 'crate::committees::seed_epoch(epoch)' "$T" 2>/dev/null; then
+  ok seed-rule-lookahead "seed_for_epoch goes through committees::seed_epoch in $T"
+else
+  bad seed-rule-lookahead "seed_for_epoch does NOT use committees::seed_epoch - the look-ahead is off"
+fi
+if grep -nE 'MUTATION [A-Z]' crates/*/src/*.rs 2>/dev/null | grep -vq 'MUTATION DID NOT BITE'; then
+  bad no-stray-mutation "a 'MUTATION x' marker is left in a source file - see grep above"
+else
+  ok no-stray-mutation "no stray mutation markers in production sources"
+fi
+
 echo
 [ "$FAIL" -eq 0 ] && echo "PRESERVATION: OK" || echo "PRESERVATION: FAILED"
 exit "$FAIL"
