@@ -765,12 +765,21 @@ def cargo_env(target_dir):
     return env
 
 
-def check_cargo(root: Path, rep: Report, present, target_dir):
+def check_cargo(root: Path, rep: Report, present, target_dir, release=True):
+    """Run the suites the way the armed build documents them.
+
+    `--release` by default: `tests/replay_hotpath_perf.rs` opens with
+    `cargo test --release ... -- --ignored`, and `state_root.rs` says an
+    unoptimised node "was already unusable at this state size". Timing a
+    452,726-leaf benchmark in a debug build measures the build, not the code.
+    """
     g = "E. proof suites (executed)"
     env = cargo_env(target_dir)
+    opt = ["--release"] if release else []
+    rep.note(g, "build profile", "--release (documented mode)" if release else "debug (--debug given)")
 
     # 1. everything must compile first; a compile error is a FAIL, not a skip.
-    pr, secs = run(["cargo", "build", "--workspace", "--tests"], root, env)
+    pr, secs = run(["cargo", "build", "--workspace", "--tests", *opt], root, env)
     if not rep.add(g, "cargo build --workspace --tests", pr.returncode == 0,
                    f"{secs:.0f}s" + ("" if pr.returncode == 0 else
                                      " — " + (pr.stderr.strip().splitlines() or ["?"])[-1][:160])):
@@ -778,7 +787,7 @@ def check_cargo(root: Path, rep: Report, present, target_dir):
         return
 
     for rel, crate, sel, declared, required in present:
-        cmd = ["cargo", "test", "-p", crate, *sel, "--",
+        cmd = ["cargo", "test", "-p", crate, *sel, *opt, "--",
                "--include-ignored", "--test-threads", "1",
                "-Z", "unstable-options", "--format", "json"]
         if sel == ("--lib",):
@@ -801,7 +810,7 @@ def check_cargo(root: Path, rep: Report, present, target_dir):
                 rep.add(g, rel, True, detail + f"; all {len(required)} pinned test(s) ran")
 
     # 2. the tripwire must run, by name, and report exactly one test.
-    cmd = ["cargo", "test", "-p", "bloch-pos-committee", "--lib", TRIPWIRE, "--",
+    cmd = ["cargo", "test", "-p", "bloch-pos-committee", "--lib", *opt, TRIPWIRE, "--",
            "--exact", "--include-ignored", "-Z", "unstable-options", "--format", "json"]
     pr, secs = run(cmd, root, env)
     started, ok, failed, names = parse_libtest_json(pr.stdout)
@@ -812,7 +821,7 @@ def check_cargo(root: Path, rep: Report, present, target_dir):
 
     # 3. workspace test count, for comparison against the lastro's 550.
     total_run = total_ok = total_failed = 0
-    pr, secs = run(["cargo", "test", "--workspace", "--", "-Z", "unstable-options", "--format", "json"],
+    pr, secs = run(["cargo", "test", "--workspace", *opt, "--", "-Z", "unstable-options", "--format", "json"],
                    root, env)
     s, o, f, _ = parse_libtest_json(pr.stdout)
     if s == 0:
@@ -839,6 +848,11 @@ def main():
                          "even when every static gate holds. Static gates match symbols, "
                          "files and test names by pattern; they do not type-check.")
     ap.add_argument("--target-dir", default=None)
+    ap.add_argument("--debug", action="store_true",
+                    help="run the suites unoptimised. NOT the documented mode: "
+                         "replay_hotpath_perf's own header says --release, and "
+                         "state_root.rs says a node built without optimisations "
+                         "'was already unusable at this state size'.")
     args = ap.parse_args()
 
     root = Path(args.worktree).resolve()
@@ -859,7 +873,7 @@ def main():
     check_chain_info_arity(root, rep)
     check_no_conflict_markers(root, rep)
     if not args.no_cargo:
-        check_cargo(root, rep, present, args.target_dir)
+        check_cargo(root, rep, present, args.target_dir, release=not args.debug)
     else:
         rep.note("E. proof suites (executed)", "cargo", "SKIPPED by --no-cargo; report is INCOMPLETE")
 
