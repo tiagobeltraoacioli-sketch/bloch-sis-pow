@@ -5591,4 +5591,79 @@ mod duty_view_anchor {
         );
         assert!(moved > 0);
     }
+
+    /// **The `NotInCommittee` flood, in one assertion.**
+    ///
+    /// Two functions in this file decide committee membership for the same
+    /// attestation, and they must agree or every honest vote on the network is
+    /// answered with a Reject:
+    ///
+    ///   * [`Engine::attest`] draws with [`Engine::seed_for`], which is
+    ///     `CommittedState::seed_for_epoch` — GATED, so below
+    ///     `ANCESTRY_SEED_ACTIVATION_EPOCH` it is the mix at the close of
+    ///     `E − 1`.
+    ///   * [`Engine::judge`] draws with [`Engine::seed_for_attestation`],
+    ///     anchored to the attestation's own branch.
+    ///
+    /// Until 2026-08-25 the second applied
+    /// `committees::MIN_SEED_LOOKAHEAD_EPOCHS` UNCONDITIONALLY while the first
+    /// was gated, so the two read boundaries one apart for every epoch below
+    /// the flag day — which is every epoch this chain has ever had. With 64
+    /// validators over 32 slots the committees are pairs, and two independent
+    /// permutations agree on a given validator's slot about 3% of the time. So
+    /// ~97% of honest attestations were Rejected as `NotInCommittee` by every
+    /// receiver, blocks carried almost no votes, and finality froze while the
+    /// chain looked healthy — one branch, a block every 30 s, 63 peers.
+    /// Measured on mainnet 2026-08-25: 156 of the last 156 rejections were
+    /// `NotInCommittee`, and 19 consecutive blocks carried 4 attestations
+    /// against the ~38 the roster predicts.
+    ///
+    /// This is a REGRESSION test, not an aspiration: run it against the fleet
+    /// binary (`98d8fb06`) and the `assert_eq!` on the seeds fails.
+    #[test]
+    fn the_attester_and_the_judge_draw_the_same_committee_below_the_flag_day() {
+        assert_eq!(
+            bloch_pos_committee::params::ANCESTRY_SEED_ACTIVATION_EPOCH,
+            u64::MAX,
+            "this test describes the PRE-flag-day regime; if the gate has been armed, the              agreement it pins has to be re-derived rather than assumed"
+        );
+
+        let (mut engine, _dir) = engine_with_registry(8);
+        for slot in 1..=(SLOTS_PER_EPOCH * 3) {
+            engine.propose(slot);
+        }
+        let head_epoch = epoch_of(engine.state.slot());
+        assert!(
+            head_epoch >= 2,
+            "the head only reached epoch {head_epoch}; the fixture needs epoch 2"
+        );
+
+        let e = head_epoch;
+        let rolled = engine.rolled_to(e);
+        let roster = rolled.active_validators();
+
+        // What `attest` signs under.
+        let attester_seed = Engine::seed_for(&rolled, e);
+        // What `judge` checks it against: anchored on the very `target_root`
+        // `attest` stamps into the attestation.
+        let target = engine.checkpoint_root(e);
+        let judge_seed = engine
+            .seed_for_attestation(&target, e)
+            .expect("the checkpoint of this node's own epoch is on its own branch");
+
+        assert_eq!(
+            attester_seed, judge_seed,
+            "THE FLOOD: the seed a validator attests under and the seed its peers judge it              against are different boundaries, so honest votes read as NotInCommittee"
+        );
+
+        // And the consequence spelled out, so a future refactor that keeps the
+        // seeds equal but changes the draw is still caught.
+        for slot in e * SLOTS_PER_EPOCH..(e + 1) * SLOTS_PER_EPOCH {
+            assert_eq!(
+                committees::committee_for_slot(&attester_seed, slot, &roster),
+                committees::committee_for_slot(&judge_seed, slot, &roster),
+                "slot {slot}: attester and judge disagree on who is in the committee"
+            );
+        }
+    }
 }
