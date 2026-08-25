@@ -7250,6 +7250,13 @@ mod tests {
     /// test build, so the close is run under `catch_unwind` — a test build is
     /// supposed to stop on this, production is supposed to log it and carry on.
     #[test]
+    // The detector it exercises is a `debug_assert_eq!`, which `[profile.release]`
+    // compiles out — so this can only be green in debug. Ignored rather than
+    // `#[cfg]`d away so the release listing still names it and says why.
+    #[cfg_attr(
+        not(debug_assertions),
+        ignore = "debug-only: the detector under test is a debug_assert!"
+    )]
     fn the_boundary_divergence_detector_fires_on_a_mid_epoch_slash() {
         use std::panic::AssertUnwindSafe;
         use std::sync::atomic::Ordering::Relaxed;

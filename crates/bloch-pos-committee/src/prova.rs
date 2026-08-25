@@ -74,9 +74,24 @@ use std::sync::atomic::Ordering::Relaxed;
 ///       whose eligible set is shorter, so it shuffles differently.
 /// OFF = the contract: membership is a function of the index set alone.
 pub mod mutation {
-    use std::sync::atomic::AtomicBool;
     /// Restore the pre-shuffle stake filter to step 8's roster.
-    pub static PRE_FIX_FILTER: AtomicBool = AtomicBool::new(false);
+    ///
+    /// This is a **re-export**, not a switch of its own. It used to be a
+    /// private `AtomicBool` declared right here, and that was the whole defect
+    /// in this harness: `committees::epoch_committees` reads
+    /// `params::rehearsal::RESTORE_ZERO_STAKE_FILTER`, so flipping a different
+    /// flag changed nothing. Both branches of `partition_step8` then ran the
+    /// unfiltered production rule, the two sides came out identical, and s1
+    /// fired `assert_ne!` — accusing the analysis of being wrong when what was
+    /// actually broken was the wiring. The proof asserted its own conclusion
+    /// false while measuring nothing, in every profile.
+    ///
+    /// Point it at the switch the production function actually reads, so the
+    /// mutation bites again. `TlFlag` wears the `AtomicBool` interface
+    /// (`store`/`load` taking an `Ordering`), so every call site below is
+    /// unchanged — and being thread-local, it also cannot leak into the ~260
+    /// other tests in this crate running beside it.
+    pub use crate::params::rehearsal::RESTORE_ZERO_STAKE_FILTER as PRE_FIX_FILTER;
 }
 
 /// Serialises every test that touches the process-global switch. Cargo runs
@@ -784,12 +799,13 @@ mod tests {
     /// validator at zero stake, `epoch_committees` must still partition the
     /// full index set.
     ///
-    /// It is `#[ignore]`d because it is RED on this branch by construction —
-    /// the filter is still there. `scripts/prova-relanca.sh` runs it with
-    /// `--ignored` and reports it as PENDING. When it starts passing, the
-    /// `#[ignore]` comes off and this comment goes with it.
+    /// It was `#[ignore]`d as PENDING while the pre-shuffle filter was still in
+    /// `committees.rs`. It is gone — that function now says `NO STAKE FILTER`
+    /// in-source — and this test passes, so the `#[ignore]` comes off exactly
+    /// as its own note instructed. This is the assertion the roster
+    /// unification rests on: it is now enforced on every run rather than
+    /// reported as pending by `scripts/prova-relanca.sh --ignored`.
     #[test]
-    #[ignore = "PENDING Dev A: red until the pre-shuffle filter is removed from committees.rs"]
     fn pending_dev_a_production_membership_is_leak_invariant() {
         let healthy = duty_roster();
         let mut leaked = healthy.clone();

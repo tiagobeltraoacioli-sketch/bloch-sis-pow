@@ -1760,6 +1760,14 @@ mod tests {
     /// the profile mainnet runs compiles it out. Pinned so nobody has to take
     /// the Cargo.toml on faith.
     #[test]
+    // Asserts `cfg!(debug_assertions)` on its first line, so it can only run in a
+    // debug build. Under `--release` it was not reporting a defect, it was
+    // reporting its own profile — one more red in a suite where a real red has
+    // to be findable.
+    #[cfg_attr(
+        not(debug_assertions),
+        ignore = "debug-only: this test inspects a guard that release compiles out"
+    )]
     fn the_only_guard_on_the_roster_split_is_absent_from_a_release_build() {
         assert!(
             cfg!(debug_assertions),
