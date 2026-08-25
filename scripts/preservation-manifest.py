@@ -645,6 +645,46 @@ def check_root_components(root: Path, rep: Report):
             "22751083 folded the eUTXO loop into a clone of the retained Smt")
 
 
+def check_arming_record(root: Path, rep: Report):
+    """The runbook's own acceptance criterion for an armed release.
+
+    `docs/LEAKED-ROSTER-FLAG-DAY.md` ends with a table to fill in before
+    tagging — the armed epoch, `utc(E)`, the release tag, the binary sha256
+    and the epoch at tag — and states:
+
+        "A tag without this table filled in is not an armed release; it is an
+         accident waiting for utc(E)."
+
+    So this is not a nicety invented here; it is the document's own pass/fail
+    line, applied to the constant that is running on 64 nodes.
+    """
+    g = "A. consensus constants"
+    p = root / RUNBOOK
+    if not p.is_file():
+        rep.add(g, "the runbook's arming record is filled in", False, f"{RUNBOOK} MISSING")
+        return
+    txt = p.read_text()
+    i = txt.find("| field | value |")
+    if i == -1:
+        rep.add(g, "the runbook's arming record is filled in", False,
+                "the runbook has no arming-record table — the acceptance criterion is gone")
+        return
+    rows = [l for l in txt[i:].splitlines() if l.startswith("|")][2:]
+    rows = [l for l in rows if l.strip().startswith("|") and l.count("|") >= 3]
+    unfilled = []
+    for l in rows:
+        cells = [c.strip() for c in l.strip().strip("|").split("|")]
+        if len(cells) < 2:
+            continue
+        field, value = cells[0], cells[1]
+        if value == "" or value.startswith("*(") or value == "*(fill at tag time)*":
+            unfilled.append(field.strip("`"))
+    rep.add(g, "the runbook's arming record is filled in", not unfilled,
+            f"{len(rows)} row(s), all recorded" if not unfilled else
+            f"UNFILLED: {', '.join(unfilled)} — the runbook calls a tag without this "
+            f"'not an armed release; an accident waiting for utc(E)'")
+
+
 def check_margin_matches_the_runbook(root: Path, rep: Report):
     """The armed epoch must satisfy the runbook's OWN rule.
 
@@ -956,6 +996,7 @@ def main():
     check_flag_day_is_ahead(root, rep)
     check_runbook(root, rep)
     check_margin_matches_the_runbook(root, rep)
+    check_arming_record(root, rep)
     check_tripwire_source(root, rep)
     present = check_suites_source(root, rep)
     check_symbols(root, rep)
@@ -977,7 +1018,7 @@ def main():
         print("!! THE VERIFIER EXECUTED ZERO GATES. This report means NOTHING.")
         print("!" * 70)
         return 2
-    expected_min = 6 + 2 + len(SUITES) + len(PERF_SYMBOLS) + len(STRUCTURAL_PINS) + 5
+    expected_min = 7 + 2 + len(SUITES) + len(PERF_SYMBOLS) + len(STRUCTURAL_PINS) + 5
     if not args.no_cargo:
         expected_min += 3  # build + tripwire-run + workspace-green
     if len(gates) < expected_min:
