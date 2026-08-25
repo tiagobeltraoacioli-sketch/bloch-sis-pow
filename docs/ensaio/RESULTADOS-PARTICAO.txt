@@ -86,3 +86,36 @@ As tres asserçoes parametrizadas em finality.rs::pmo_lab_arithmetic medem o
 que cada floor compra e permanecem verdadeiras qualquer que seja o valor
 embarcado. Nao ha asserçao sobre a constante embarcada — uma asserçao que
 reprova a escolha do dono e um veto fantasiado de teste.
+
+--------------------------------------------------------------------------
+CRITERIO 3 — REDE SAUDAVEL, SEM REGRESSAO
+
+  scripts/lab/particao.sh <binario> control-live
+
+Topologia do `live` (tudo por gates), com os gates NUNCA fechados. Binario
+do ramo pmo/integra, floor 1/2 (o que embarca).
+
+  VERDICT: CONVERGED slot=1391 id=7e83f0d436f70e7d
+           finalized=e41:7d80a91f08f1f8de justified=e42
+
+Os oito nos, identicos campo a campo:
+
+  17300..17307   head_slot 1397   height 1397   id fe6fc5cb49d928a0
+                 just e42   fin e41   root 7d80a91f08f1f8de
+                 blocks_known 1397  behind 1
+
+height == blocks_known == 1397 em TODOS: todo bloco recebido foi adotado,
+zero forquilhas. E o contraste que importa com a linha de base, onde
+blocks_known era igual nos dois lados e height divergia 1338 contra 540 —
+era exatamente essa diferenca que denunciava bloco recebido e nunca adotado.
+
+--------------------------------------------------------------------------
+PLACAR DOS TRES CRITERIOS
+
+  1  reproduzir a doenca      FECHADO
+  2  provar a cura            fecha sob floor 3/4; NAO fecha sob 1/2
+  3  rede saudavel intacta    FECHADO
+
+O criterio 2 e o unico em aberto, e o que o mantem aberto e uma escolha de
+projeto ja tomada pelo dono (floor 1/2, vivacidade acima de unicidade da raiz
+justificada), nao um defeito por corrigir. O preco esta medido acima.
