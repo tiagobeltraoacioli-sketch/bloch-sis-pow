@@ -214,6 +214,7 @@ class Report:
     def note(self, group, item, detail):
         """A recorded measurement, not a pass/fail gate. Does NOT count."""
         self.rows.append((group, item, "INFO", detail))
+        print(f"[INFO] {item}  --  {detail}", file=sys.stderr, flush=True)
 
     @property
     def failures(self):
@@ -945,7 +946,8 @@ def check_cargo(root: Path, rep: Report, present, target_dir, release=True):
 
     # 1. everything must compile first; a compile error is a FAIL, not a skip.
     pr, secs = run(["cargo", "build", "--workspace", "--tests", *opt], root, env)
-    if not rep.add(g, "cargo build --workspace --tests", pr.returncode == 0,
+    if not rep.add(g, "cargo build --workspace --tests " + (" ".join(opt) or "(debug)"),
+                   pr.returncode == 0,
                    f"{secs:.0f}s" + ("" if pr.returncode == 0 else
                                      " — " + (pr.stderr.strip().splitlines() or ["?"])[-1][:160])):
         rep.add(g, "suites executed", False, "not attempted: the workspace does not build")
