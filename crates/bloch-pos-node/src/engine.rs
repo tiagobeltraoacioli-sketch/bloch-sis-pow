@@ -72,7 +72,9 @@ use bloch_pos_committee::beacon::{mix_in, RandaoChain};
 use bloch_pos_committee::forkchoice::{BlockTree, LatestMessage, Store as FcStore};
 use bloch_pos_committee::gossip::{AttestationPool, GossipDecision};
 use bloch_pos_committee::header::{BlockEnvelope, BlockHeaderV4, BlockId, Body, VERSION_G4};
-use bloch_pos_committee::interfaces::{ProposalEnvelope, StateReader, StateTransition};
+use bloch_pos_committee::interfaces::{
+    ProposalEnvelope, StateReader, StateTransition, TransitionError,
+};
 use bloch_pos_committee::schedule::first_slot_of_epoch;
 use bloch_pos_committee::transition::{CommittedState, PosTransaction, Transition};
 use bloch_pos_committee::{committees, derive, epoch_of, schedule};
@@ -393,6 +395,22 @@ pub(crate) const MEMPOOL_MAX: usize = 4_096;
 /// Transactions a proposal will carry at most, independent of the consensus
 /// byte cap it is also checked against.
 const MAX_TXS_PER_BLOCK: usize = 256;
+
+/// Which transaction in `selection` a refusal blames, if the error names one.
+///
+/// `TransitionError::Transfer(i, _)` carries the index of the offending
+/// transaction. The proposer's drop loop used to ignore it and `pop()` the tail
+/// instead, which meant a culprit at index 0 of a 30-transaction selection cost
+/// 29 VALID transfers — each also evicted from the mempool, so they were gone
+/// for every later proposer too. `None` means "the error names nobody usable",
+/// and the caller falls back to the tail: liveness first, a smaller block
+/// always beats no block.
+fn refused_index(err: &TransitionError, selection_len: usize) -> Option<usize> {
+    match err {
+        TransitionError::Transfer(i, _) if (*i as usize) < selection_len => Some(*i as usize),
+        _ => None,
+    }
+}
 
 /// How many recently-applied canonical post-states are retained so a reorg
 /// can start from the fork point instead of from genesis.
@@ -1312,11 +1330,39 @@ impl Engine {
             {
                 Ok(p) => break (p, tx_bytes),
                 Err(err) => {
-                    let Some(bad) = txs.pop() else {
-                        // Empty and still refused: the fault is not in any
-                        // transaction, so proposing is genuinely impossible.
-                        eprintln!("[slot {slot}] produce refused with no transactions: {err:?}");
-                        return;
+                    // Drop the transaction the transition NAMED, not the last
+                    // one in the selection.
+                    //
+                    // `TransitionError::Transfer(i, _)` carries the index of
+                    // the offending transaction, and this loop used to throw
+                    // that away and `pop()` the tail instead. With the culprit
+                    // at index 0 of a 30-transaction selection, the proposer
+                    // discarded 29 VALID transfers one at a time — and, worse,
+                    // evicted each of them from the mempool on the way, so they
+                    // were gone for every future proposer too. Measured on
+                    // mainnet 2026-08-25: five `dropping ...` lines per slot to
+                    // publish one transaction, and one node emptied its mempool
+                    // outright. A user sending a burst saw most of it vanish
+                    // with no error anywhere: the node reported `accepted`, and
+                    // the coins were never spent.
+                    //
+                    // Popping the tail is still the fallback for an error that
+                    // names no index (or names one out of range) — liveness
+                    // first, exactly as the comment above says.
+                    let bad = match refused_index(&err, txs.len()) {
+                        Some(i) => txs.remove(i),
+                        None => {
+                            let Some(t) = txs.pop() else {
+                                // Empty and still refused: the fault is not in
+                                // any transaction, so proposing is genuinely
+                                // impossible.
+                                eprintln!(
+                                    "[slot {slot}] produce refused with no transactions: {err:?}"
+                                );
+                                return;
+                            };
+                            t
+                        }
                     };
                     eprintln!(
                         "[slot {slot}] dropping a transaction the transition refuses ({err:?}); \
@@ -6616,5 +6662,52 @@ mod drain_bound_tests {
             "the default must actually bound something"
         );
         assert_eq!(MAX_ENGINE_EVENTS_PER_TICK, 32);
+    }
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::refused_index;
+    use bloch_pos_committee::interfaces::{TransferReject, TransitionError};
+
+    /// The regression. A culprit at the FRONT must cost exactly one
+    /// transaction, not everything behind it. Before the fix this path removed
+    /// the tail, so with 30 selected and index 0 at fault the proposer
+    /// discarded 29 valid transfers and evicted them from the mempool — the
+    /// shape measured on mainnet 2026-08-25, where a user's burst of 30 mostly
+    /// vanished while the node had answered `accepted` for every one.
+    #[test]
+    fn the_culprit_at_the_front_costs_exactly_itself() {
+        let err = TransitionError::Transfer(0, TransferReject::UnknownInput);
+        assert_eq!(refused_index(&err, 30), Some(0));
+    }
+
+    #[test]
+    fn every_named_index_is_honoured_not_just_the_first() {
+        for i in 0..30u32 {
+            let err = TransitionError::Transfer(i, TransferReject::UnknownInput);
+            assert_eq!(
+                refused_index(&err, 30),
+                Some(i as usize),
+                "index {i} was named and must be the one removed"
+            );
+        }
+    }
+
+    /// An index the selection does not contain must NOT be used to index it —
+    /// `Vec::remove` would panic, and a proposer that panics is worse than a
+    /// proposer that drops the wrong transaction.
+    #[test]
+    fn an_out_of_range_index_falls_back_instead_of_panicking() {
+        let err = TransitionError::Transfer(30, TransferReject::UnknownInput);
+        assert_eq!(refused_index(&err, 30), None);
+        let err = TransitionError::Transfer(u32::MAX, TransferReject::UnknownInput);
+        assert_eq!(refused_index(&err, 30), None);
+    }
+
+    #[test]
+    fn an_empty_selection_names_nobody() {
+        let err = TransitionError::Transfer(0, TransferReject::UnknownInput);
+        assert_eq!(refused_index(&err, 0), None);
     }
 }
