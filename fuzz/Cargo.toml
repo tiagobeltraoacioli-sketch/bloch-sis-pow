@@ -27,6 +27,11 @@ libfuzzer-sys = "0.4"
 # `allow_failure: true`, so CI stayed green and the populated corpus dirs
 # kept it looking like a running program. It was not one.
 bloch = { path = "../legacy/genesis3-node" }
+# The Genesis-4 PoS node — THE LIVE CHAIN's remote surface. Consumed as a
+# library (`bloch_pos_node`); the crate is lib+bin since the WP1 split.
+bloch-pos-node = { path = "../crates/bloch-pos-node" }
+# Consensus types the codec seeds are built from (examples/g4_seedgen.rs).
+bloch-pos-committee = { path = "../crates/bloch-pos-committee" }
 bloch-sis-pow = { path = "../crates/bloch-sis-pow" }
 coherence-core = { path = "../crates/coherence-core" }
 # P1 (roadmap §1b): the netmsg / handshake decode targets mirror the node's
@@ -114,3 +119,38 @@ path = "fuzz_targets/sig_verify.rs"
 test = false
 doc = false
 
+# ── Genesis-4 (LIVE CHAIN) remote surface. An external audit found the live ──
+# ── chain's untrusted ingest entirely unfuzzed; these three cover it.      ──
+
+[[bin]]
+# Block-envelope / attestation wire decoders (src/codec.rs). Reached from both
+# gossip and sync ingest. No-panic + encode(decode(x)) == x.
+name = "g4_codec"
+path = "fuzz_targets/g4_codec.rs"
+test = false
+doc = false
+
+[[bin]]
+# JSON-RPC parse + route (src/rpc.rs). PUBLIC, unauthenticated network surface.
+# Parse and dispatch-to-RpcRequest only; the engine backend is stubbed — see
+# the honesty note at the top of the target.
+name = "g4_rpc"
+path = "fuzz_targets/g4_rpc.rs"
+test = false
+doc = false
+
+[[bin]]
+# Directed-sync frame codec (src/p2p.rs) + the nested envelope decode. Frame
+# DECODE path only; `read_capped` is WP2's.
+name = "g4_p2p_sync"
+path = "fuzz_targets/g4_p2p_sync.rs"
+test = false
+doc = false
+
+# The corpus seeder for the three g4_* targets lives in its own package at
+# fuzz/seedgen/ — see the reasoning in its manifest. It is deliberately NOT a
+# [[bin]] here (cargo-fuzz would list it as a target) and not an [[example]]
+# either (that would drag `bloch` + librocksdb-sys into a 35-minute build for
+# what is a two-minute job). Regenerate the seeds with:
+#
+#     cd fuzz/seedgen && cargo run --release

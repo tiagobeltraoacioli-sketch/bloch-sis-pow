@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Corpus seeder for the three Genesis-4 fuzz targets.
+#
+# WHY THIS IS A SEPARATE PACKAGE, and not an `[[example]]` (or a `[[bin]]`) in
+# ../Cargo.toml:
+#
+#   * A `[[bin]]` would be enumerated by `cargo fuzz list` and picked up by the
+#     `fuzz-smoke` loop as a fuzz target, which it is not.
+#   * An `[[example]]` avoids that, but it still lives in the `bloch-fuzz`
+#     package, so building it builds that package's whole dependency graph —
+#     including `bloch` (the Genesis-3 node) and therefore `librocksdb-sys`, a
+#     ~35-minute C++ build, on a profile the sanitized fuzz build shares nothing
+#     with. Measured, not guessed: it was rebuilding RocksDB from scratch.
+#
+# Seeding needs the Genesis-4 encoders and nothing else. Standing alone, this
+# builds in a couple of minutes and never touches RocksDB.
+#
+# Its own `[workspace]` table so `cargo build` inside ../ does not pull it in,
+# matching the reason ../Cargo.toml carries one.
+
+[package]
+name = "g4-seedgen"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "g4_seedgen"
+path = "src/main.rs"
+
+[dependencies]
+bloch-pos-node = { path = "../../crates/bloch-pos-node" }
+bloch-pos-committee = { path = "../../crates/bloch-pos-committee" }
+
+# Same vendored fork the root workspace patches in; a standalone workspace does
+# not inherit the root's patch table (bloch-crypto needs `with_seeded_rng`).
+[patch.crates-io]
+pqcrypto-internals = { path = "../../crates/pqcrypto-internals" }

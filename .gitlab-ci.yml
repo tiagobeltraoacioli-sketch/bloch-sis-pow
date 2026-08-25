@@ -239,7 +239,8 @@ fuzz-smoke:
     # result and must never again be reported as one.
     - cargo +nightly fuzz build
     - |
-      for t in block_parse tx_parse sha256d_pow ghostdag_order sig_verify; do
+      # Genesis-4 (LIVE CHAIN) remote surface first — codec, RPC, sync frames.
+      for t in g4_codec g4_rpc g4_p2p_sync block_parse tx_parse sha256d_pow ghostdag_order sig_verify; do
         echo "== fuzz smoke: $t =="
         cargo +nightly fuzz run "$t" -- -max_total_time=20 -runs=100000
       done
