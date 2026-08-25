@@ -65,13 +65,20 @@ SUITES = [
     (f"{COMMITTEE}/tests/properties.rs",                "bloch-pos-committee", ("--test", "properties"),
      ["forkchoice_head_matches_the_reference_implementation",
       "a_fully_tied_tree_resolves_identically_in_both_implementations"]),
-    (f"{NODE}/src/engine/replay_bench.rs",              "bloch-pos-node",      ("--lib",),
+    (f"{NODE}/src/engine/replay_bench.rs",              "bloch-pos-node",      ("--bin", "bloch-pos"),
      ["perf_end_to_end_replay", "perf_replay_depth_curve_justified"]),
 ]
 
-# `replay_bench.rs` is an inline module of the lib target, so its tests share
-# the `--lib` harness with everything else in bloch-pos-node.  Its tests are
-# recognised by this prefix.
+# `replay_bench.rs` is an inline module of `engine`, and `bloch-pos-node` has
+# NO lib target: it is binary-only (`[[bin]] name = "bloch-pos"`, no lib.rs),
+# with `mod engine;` declared in main.rs.  So its tests live in the BIN
+# harness, and `cargo test -p bloch-pos-node --lib` selects a target that does
+# not exist — it exits 0 having run nothing.
+#
+# That is exactly the empty-suite defect this script hunts, and the first
+# version of this file walked straight into it: the gate correctly refused to
+# call "ran 0" a pass, but the cause was this selector, not the branch.
+REPLAY_BENCH_TARGET = ("--bin", "bloch-pos")
 REPLAY_BENCH_PREFIX = "engine::replay_bench::"
 
 # The perf symbols, derived commit by commit.  Each entry:
@@ -957,7 +964,7 @@ def check_cargo(root: Path, rep: Report, present, target_dir, release=True):
         cmd = ["cargo", "test", "-p", crate, *sel, *opt, "--",
                "--include-ignored", "--test-threads", "1",
                "-Z", "unstable-options", "--format", "json"]
-        if sel == ("--lib",):
+        if sel == REPLAY_BENCH_TARGET:
             cmd.insert(cmd.index("--"), REPLAY_BENCH_PREFIX)
         pr, secs = run(cmd, root, env)
         started, ok, failed, names = parse_libtest_json(pr.stdout)
