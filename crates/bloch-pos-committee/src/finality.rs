@@ -174,6 +174,60 @@ impl FinalityState {
         }
     }
 
+    /// The relaunch entry point: start a Genesis-4 relaunch with an **empty
+    /// leak ledger**.
+    ///
+    /// # This is the SECOND LINE OF DEFENCE, not the fix
+    ///
+    /// The fix for the 2026-08-24 divergence is roster unification in
+    /// [`crate::committees::epoch_committees`]: committee membership becomes a
+    /// pure function of `(seed, epoch, index set)` and is therefore
+    /// leak-invariant by construction. That removes the mechanism. This
+    /// constructor removes the *fuel*: it guarantees the relaunched chain does
+    /// not open its books carrying a leak balance accrued by the broken chain.
+    /// Shipping this alone would leave the defect intact — a fresh ledger
+    /// starts diverging again the first time two nodes' zero-sets differ.
+    ///
+    /// # Why it is presently identical to [`FinalityState::new`]
+    ///
+    /// Because `new` already starts empty, and — verified across the whole
+    /// workspace on 2026-08-24 — **nothing ever reconstructs `leaked` from
+    /// committed state**. `leaked` is *written* into the state root as
+    /// [`crate::state_root::LeakRecord`]s and is never read back; the only
+    /// production constructors are `new` (from `CommittedState::genesis`) and
+    /// [`crate::ws::anchor`], both of which start empty. So a
+    /// relaunch-from-genesis already inherits nothing.
+    ///
+    /// That makes this a *pin*, not a patch, and the pin is the point: it
+    /// gives the relaunch one named call site, and
+    /// `the_relaunch_opens_its_books_with_an_empty_leak_ledger` fails the
+    /// build the day someone adds a restore path and quietly wires it here.
+    ///
+    /// # Known asymmetry, stated rather than fixed (LATENT — no live caller)
+    ///
+    /// Because the ledger is committed but never restored, a node that boots
+    /// from a weak-subjectivity checkpoint holds `leaked = {}` while a node
+    /// that replayed the same history holds the accrued balance. Once
+    /// [`crate::params::LEAKED_ROSTER_ACTIVATION_EPOCH`] binds, those two
+    /// nodes derive **different** consensus rosters from the same chain — the
+    /// §5.5 failure shape exactly. It is latent today only because
+    /// [`crate::ws::anchor`] has no caller in the node. Fixing it means either
+    /// restoring the ledger from the checkpoint or dropping it from the state
+    /// root; both are consensus changes and neither belongs in this relaunch.
+    pub fn relaunch(genesis: Checkpoint) -> Self {
+        let st = Self::new(genesis);
+        debug_assert!(st.leaked.is_empty(), "a relaunch must not inherit a leak balance");
+        st
+    }
+
+    /// Total stake the inactivity leak has destroyed, across every validator.
+    /// Zero on a state that has inherited nothing — which is what makes
+    /// "the relaunch starts clean" a number the caller can assert on rather
+    /// than a property it has to take on trust.
+    pub fn leaked_total(&self) -> u128 {
+        self.leaked.values().map(|s| *s as u128).sum()
+    }
+
     /// The canonical constructor: replay the whole history. `process_epoch` is
     /// the fold step; this exists so "state = pure function of history" is an
     /// API you can call, not a comment you must trust.
@@ -853,6 +907,223 @@ mod tests {
              and no code path gives any of it back",
             prev as f64 / STAKE_EACH as f64 * 100.0
         );
+    }
+
+
+    // ── TASK 1: zeroing the leak accumulator for the relaunch ──────────────
+    //
+    // SECOND LINE OF DEFENCE. Dev A's roster unification is the fix. These
+    // three tests pin the fuel supply: a relaunched chain must not open its
+    // books holding a leak balance the broken chain accrued, and the ledger
+    // must keep having exactly one way to become non-empty.
+
+    /// A state that really has leaked — driven through `process_epoch`, not
+    /// hand-stuffed — and the relaunch that must not inherit any of it.
+    #[test]
+    fn the_relaunch_opens_its_books_with_an_empty_leak_ledger() {
+        let _g = HOOK.lock().unwrap_or_else(|e| e.into_inner());
+        let committee: Vec<Validator> = (0..64u32).map(|i| validator(i, STAKE_EACH)).collect();
+        let mut st = FinalityState::new(genesis());
+        for e in 1..=30u64 {
+            let src = st.current_justified();
+            // Split the live vote two ways so no root ever reaches 2/3: the
+            // stall persists, the absent keep bleeding, and the ledger this
+            // test is about actually fills up.
+            let atts: Vec<(u32, AttestationData)> = (0..34u32)
+                .map(|v| vote(v, e, if v < 17 { root(1) } else { root(2) }, src))
+                .collect();
+            st.process_epoch(&EpochVotes {
+                epoch: e,
+                active_set: &committee,
+                attestations: &atts,
+            })
+            .unwrap();
+        }
+        let inherited = st.leaked_total();
+        assert!(
+            inherited > 0,
+            "the fixture leaked nothing, so this test would pass on an empty ledger and \
+             prove nothing about the reset"
+        );
+
+        // The relaunch installs a fresh state on all 64 validators.
+        let fresh = FinalityState::relaunch(genesis());
+        assert_eq!(
+            fresh.leaked_total(),
+            0,
+            "the relaunch inherited {inherited} satoshis of leak from the broken chain"
+        );
+        for v in 0..64u32 {
+            assert_eq!(fresh.leaked_of(v), 0, "validator {v} arrived at the relaunch pre-leaked");
+        }
+        // Same for the two production constructors, so the guarantee does not
+        // depend on the relaunch remembering to call the new one.
+        assert_eq!(FinalityState::new(genesis()).leaked_total(), 0);
+        assert_eq!(
+            crate::ws::anchor(&ws_fixture()).leaked_total(),
+            0,
+            "the weak-subjectivity boot must also open with an empty ledger"
+        );
+        println!(
+            "RELAUNCH RESET: a state carrying {:.4}% of one validator's stake in accrued leak \
+             is replaced by one carrying zero",
+            inherited as f64 / STAKE_EACH as f64 * 100.0
+        );
+    }
+
+    /// **The ledger accrues in exactly one place, and can only shrink under a
+    /// GOVERNED rule.**
+    ///
+    /// Source-level, because the property is about what the file *contains*: a
+    /// decay added tomorrow compiles and passes every behavioural test in this
+    /// module while silently changing the quorum denominator on a live chain.
+    ///
+    /// # Why this is not simply "the leak never shrinks"
+    ///
+    /// It was, until 2026-08-24. The first version of this test forbade every
+    /// shrink site outright, which was correct for the tree it was written
+    /// against — `crates/bloch-pos-committee/src/finality.rs` on
+    /// `relanca/e1400` has one accrual site and no decay — and would have gone
+    /// RED the moment `pmo/leak-zero` (tip `2f477fa2`) landed its
+    /// leak-recovery rule (a named RECOVERY_QUOTIENT). A guard that fails
+    /// on the very change the founder approved is not a guard, it is an
+    /// obstacle, and someone would have deleted it rather than answered it.
+    ///
+    /// So the gate is on GOVERNANCE, not on absence. A leak that can come back
+    /// down is a consensus rule; if this file contains one, then:
+    ///
+    ///   * it must be driven by a named constant, not a literal, so the rate
+    ///     is reviewable and greppable, and
+    ///   * it must carry a mutation switch that turns it off, so the disease
+    ///     stays reproducible after the cure.
+    ///
+    /// Either shape passes. What cannot pass is an ungoverned shrink — an
+    /// anonymous `-=` somewhere in the fold that no constant names and no test
+    /// can switch off.
+    #[test]
+    fn the_leak_ledger_shrinks_only_under_a_governed_rule() {
+        let src = include_str!("finality.rs");
+        // Written in pieces so this test's own source does not count itself.
+        let accrue = concat!("self.leaked", ".entry(");
+        assert_eq!(
+            src.matches(accrue).count(),
+            1,
+            "the leak accumulator no longer has exactly one accrual site; every claim about \
+             what a relaunch inherits is derived from there being only one"
+        );
+
+        // Search only CODE. Comments and this test's own needles are stripped
+        // first, because every string this test looks for also appears in the
+        // prose above it — a gate satisfied by its own documentation is the
+        // vacuous pass this whole file exists to prevent.
+        let code: String = src
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.contains("concat!(")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let shrink_sites: Vec<&str> = [
+            concat!("self.leaked", ".remove"),
+            concat!("self.leaked", ".clear"),
+            concat!("self.leaked", ".retain"),
+        ]
+        .into_iter()
+        .filter(|pat| code.contains(pat))
+        .collect();
+
+        if shrink_sites.is_empty() {
+            // The tree this branch was written against. The relaunch reset is
+            // then the ONLY thing standing between a broken chain's leak
+            // balance and the relaunched one.
+            println!(
+                "LEAK LEDGER: one accrual site, no recovery rule. The ledger is monotonic, so \
+                 `FinalityState::relaunch` is the only defence against inheriting a balance."
+            );
+            return;
+        }
+
+        // A recovery rule is present. It must be governed.
+        assert!(
+            code.contains(concat!("INACTIVITY_LEAK", "_RECOVERY_QUOTIENT")),
+            "the ledger can shrink ({}), but no named rate constant governs it. An \
+             ungoverned decay is a consensus rule hidden in a literal.",
+            shrink_sites.join(", ")
+        );
+        assert!(
+            code.contains(concat!("DISABLE_LEAK", "_RECOVERY")),
+            "the ledger can shrink, but there is no mutation switch to turn the recovery \
+             off. Without one the pre-recovery disease stops being reproducible, and every \
+             scenario that measures it becomes unfalsifiable."
+        );
+        println!(
+            "LEAK LEDGER: one accrual site plus a GOVERNED recovery rule ({}), rate constant \
+             and mutation switch both present.",
+            shrink_sites.join(", ")
+        );
+    }
+
+    /// **The ledger is committed but never restored** — stated as a finding,
+    /// not fixed here.
+    ///
+    /// `transition.rs` writes every entry into the state root as a
+    /// `LeakRecord`. Nothing anywhere reads them back into a `FinalityState`:
+    /// the ledger is rebuilt only by replaying history. So a checkpoint-booted
+    /// node and a replaying node hold different ledgers for the same chain,
+    /// and once `LEAKED_ROSTER_ACTIVATION_EPOCH` binds they derive different
+    /// consensus rosters from it — the §5.5 shape again. Latent only because
+    /// `ws::anchor` has no caller in the node.
+    #[test]
+    fn the_leak_ledger_is_committed_but_never_restored() {
+        let transition = include_str!("transition.rs");
+        assert!(
+            transition.contains(".leaked_stakes()"),
+            "the write side vanished; then this finding is stale and must be re-derived"
+        );
+        // Same stripping as `the_leak_ledger_shrinks_only_under_a_governed_rule`,
+        // and for the same reason: `include_str!` reads THIS test too, so the
+        // needles below would otherwise match their own assertion and report a
+        // restore path that does not exist. That is exactly what happened on
+        // the first recorded run of `scripts/prova-relanca.sh` — the gate went
+        // red against an unchanged tree. A self-matching guard is a false
+        // alarm, and a false alarm gets deleted rather than answered.
+        let finality: String = include_str!("finality.rs")
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.contains("concat!(")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        for needle in [concat!("fn from", "_committed"), concat!("fn with", "_leaked")] {
+            assert!(
+                !finality.contains(needle),
+                "a restore path appeared (`{needle}`). GOOD — but the relaunch must now \
+                 decide what it restores FROM, and `relaunch()` must be re-read before it \
+                 is trusted."
+            );
+        }
+        println!(
+            "FINDING (latent): `leaked` is committed as LeakRecord and never read back; \
+             a ws-checkpoint boot and a replay boot disagree on the ledger by construction"
+        );
+    }
+
+    /// Minimal checkpoint fixture; `anchor` reads only `epoch`/`block_root`.
+    fn ws_fixture() -> crate::ws::WeakSubjectivityCheckpoint {
+        crate::ws::WeakSubjectivityCheckpoint {
+            version: crate::ws::WS_FORMAT_VERSION,
+            network_id: 0,
+            genesis_root: G,
+            epoch: 0,
+            block_root: G,
+            state_root: [0u8; 32],
+            validator_set_root: [0u8; 32],
+            issued_at: 0,
+            signer_set_id: 0,
+        }
     }
 
     const STAKE_EACH: u64 = 1_000_000_000;

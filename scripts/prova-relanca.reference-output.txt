@@ -1,0 +1,221 @@
+Reference output of scripts/prova-relanca.sh
+Recorded on 2026-08-25T01:55:21Z from branch rl/c-prova.
+
+This is what a third party must see. Any difference is a finding.
+The run below is the DEFAULT mode, which exits 3 (INCOMPLETE) by design:
+the preservation manifest's static gates cannot type-check, so they
+cannot certify a tree on their own. Use --deep before tagging.
+
+=================================================================
+═══════════════════════════════════════════════════════════════════════════
+ THE RELAUNCH PROOF — Genesis-4
+ 2026-08-25T01:09:42Z   3f2d851d
+═══════════════════════════════════════════════════════════════════════════
+
+-> one cargo run, through /private/tmp/bloch-cargo-lock.sh (it blocks until the lock frees)
+
+[token] pmo-73237 waiting; held by pmo-norun 71410 22:08:17
+[token] pmo-73237 waiting; held by pmo-norun 71410 22:08:17
+[token] pmo-73237 waiting; held by pmo-norun 71410 22:08:17
+[token] pmo-73237 waiting; held by pmo-norun 71410 22:08:17
+[token] pmo-73237 waiting; held by pmo-norun 71410 22:08:17
+[token] pmo-73237 waiting; held by pmo-norun 71410 22:08:17
+[token] pmo-73237 waiting; held by pmo-norun 71410 22:08:17
+[token] pmo-73237 waiting; held by pmo-norun 71410 22:08:17
+[token] pmo-73237 waiting; held by pmo-norun 71410 22:08:17
+[token] pmo-73237 waiting; held by pmo-norun 71410 22:08:17
+[token] pmo-73237 waiting; held by pmo-norun 71410 22:08:17
+[token] pmo-73237 waiting; held by pmo-norun 71410 22:08:17
+[token] pmo-73237 waiting; held by pmo-norun 71410 22:08:17
+[token] pmo-73237 waiting; held by pmo-norun 71410 22:08:17
+[token] pmo-73237 waiting; held by pmo-norun 71410 22:08:17
+[token] pmo-73237 waiting; held by pmo-norun 71410 22:08:17
+[token] pmo-73237 waiting; held by pmo-norun 71410 22:08:17
+[token] pmo-73237 waiting; held by coordenador-suite 81877 22:26:35
+[token] pmo-73237 waiting; held by coordenador-suite 81877 22:26:35
+[token] pmo-73237 waiting; held by coordenador-suite 81877 22:26:35
+[token] pmo-73237 waiting; held by coordenador-suite 81877 22:26:35
+[token] pmo-73237 waiting; held by coordenador-suite 81877 22:26:35
+[token] pmo-73237 waiting; held by coordenador-suite 81877 22:26:35
+[token] pmo-73237 waiting; held by coordenador-suite 81877 22:26:35
+[token] pmo-73237 waiting; held by coordenador-suite 81877 22:26:35
+[token] pmo-73237 holding token, load 10 >= 8, waiting
+[token] pmo-73237 holding token, load 9 >= 8, waiting
+[token] pmo-73237 holding token, load 8 >= 8, waiting
+[token] pmo-73237 RUNNING: /var/folders/rd/z9xwrwc53h52x6gddvdrxtyr0000gn/T/prova-relanca-run.52Ayq8VbnP
+[token] pmo-73237 DONE rc=101
+┌────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ ── 1. leak accumulator ─────────────────────────────────────────────────────────────────────── │
+│ PASS     the_relaunch_opens_its_books_with_an_empty_leak_ledger                                │
+│            a relaunch inherits no leak balance from the broken chain                           │
+│ PASS     the_leak_ledger_shrinks_only_under_a_governed_rule                                    │
+│            one accrual site; any recovery rule is named and switchable                         │
+│ PASS     the_leak_ledger_is_committed_but_never_restored                                       │
+│            LATENT FINDING: committed as LeakRecord, never read back                            │
+│ PASS     the_leak_only_ever_grows                                                              │
+│            behavioural: leak is monotonic. EXPECT THIS TO GO RED at pmo/leak-zero integration  │
+│ ── 0. model fidelity ───────────────────────────────────────────────────────────────────────── │
+│ PASS     the_model_of_the_fix_is_the_production_shuffle                                        │
+│            the modelled fix IS the production shuffle, bit for bit                             │
+│ PASS     the_leak_mirror_is_the_production_arithmetic                                          │
+│            the mirrored leak arithmetic still matches transition.rs                            │
+│ ── 2. S1 disease ───────────────────────────────────────────────────────────────────────────── │
+│ PASS     s1_disease_two_nodes_diverge_and_the_chain_never_finalizes_again                      │
+│            two nodes with different zero-sets diverge; the fleet is consumed                   │
+│ ── 2. S2 cure ──────────────────────────────────────────────────────────────────────────────── │
+│ PASS     s2_cure_the_same_divergent_nodes_converge_from_the_same_state                         │
+│            the SAME divergent ledgers converge under the contract                              │
+│ PASS     s2_mutation_restoring_the_pre_fix_filter_breaks_the_cure                              │
+│            restoring the pre-shuffle filter breaks the cure                                    │
+│ ── 3. S3 healthy no-op ─────────────────────────────────────────────────────────────────────── │
+│ PASS     s3_healthy_network_is_identical_under_the_fix                                         │
+│            on a healthy network the fix changes nothing                                        │
+│ PASS     s3_mutation_the_comparator_bites_one_zero_stake_validator                             │
+│            the comparator sees a planted zero-stake validator                                  │
+│ PASS     two_identical_runs_produce_an_identical_chain                                         │
+│            chain-level: the real block driver is deterministic                                 │
+│ PASS     the_comparator_bites_a_planted_difference                                             │
+│            chain-level: MUTATE_SEED makes the chain comparator go red                          │
+│ ── 4. S4 accrued leak ──────────────────────────────────────────────────────────────────────── │
+│ PASS     s4_accrued_leak_plus_the_reset_restore_the_quorum_denominator                         │
+│            a real accrued ledger + fix + reset give the correct denominator                    │
+│ PASS     s4_mutation_the_pre_fix_filter_destroys_the_quorum_again                              │
+│            the pre-fix filter destroys the quorum again                                        │
+│ ── 5. false quorum ─────────────────────────────────────────────────────────────────────────── │
+│ PASS     a_partitioned_minority_finalizes_because_the_leak_shrinks_the_denominator             │
+│            the leak-adjusted denominator lets a minority self-finalize                         │
+│ PASS     without_the_leak_in_the_denominator_the_minority_never_finalizes                      │
+│            removing the leak from the denominator stops it                                     │
+│ ── 6. roster split (Dev A) ─────────────────────────────────────────────────────────────────── │
+│ PASS     a_single_fully_leaked_validator_makes_the_two_rosters_partition_differently           │
+│            one zero-stake validator splits the two rosters                                     │
+│ PASS     the_only_guard_on_the_roster_split_is_absent_from_a_release_build                     │
+│            the debug_assert guard is compiled out of the shipped profile                       │
+│ ── 7. flag day ─────────────────────────────────────────────────────────────────────────────── │
+│ PASS     leaked_roster_armed_epoch_matches_the_runbook                                         │
+│            LEAKED_ROSTER_ACTIVATION_EPOCH is still 1400                                        │
+│ PASS     consensus_roster_matches_duty_roster_before_the_flag_day                              │
+│            the gate is closed, so the rosters are the same today                               │
+│ ── 8. pending ──────────────────────────────────────────────────────────────────────────────── │
+│ PENDING  pending_dev_a_production_membership_is_leak_invariant                                 │
+│            PENDING Dev A: production epoch_committees must be leak-invariant                   │
+└────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+── measured output ─────────────────────────────────────────────────────
+  RELAUNCH RESET: a state carrying 2995.2691% of one validator's stake in accrued leak is replaced by one carrying zero
+  LEAK LEDGER: one accrual site, no recovery rule. The ledger is monotonic, so `FinalityState::relaunch` is the only defence against inheriting a balance.
+  FINDING (latent): `leaked` is committed as LeakRecord and never read back; a ws-checkpoint boot and a replay boot disagree on the ledger by construction
+  leak permanence: after 40 epochs an absent validator has lost 98.3413% of its stake, and no code path gives any of it back
+  FIDELITY: on a healthy roster the contract IS the production partition, 8/8 epochs
+  DISEASE: 2 nodes, zero-sets differing by 2 validators, 6 epochs of 100% honest participation. Justified: L=0 R=0, AGREED on 0. Boundary kept 2.9% of admitted votes. Fully-leaked validators 30 -> 64 of 64; 64000000000 satoshis destroyed (100% of the fleet). The denominator is now ZERO: no quorum is reachable on any input, and nothing gives the stake back.
+  DISEASE (correction): the two leak LEDGERS reconverged, gap 2000000000 -> 0. They agree again because every validator they disagreed about is pinned at zero. Ledger convergence here is the symptom of total loss, not recovery.
+  CURE: the SAME two divergent ledgers (zero-sets differing by 2 validators) now derive an IDENTICAL partition, keep 100.0% of admitted votes, and justify the same root in 6/6 epochs. Fully-leaked validators froze at 30 of 64 (scenario 1 reached 64). The leak gap froze at 2000000000.
+  MUTATION (s2): filter restored -> partitions differ, 0/6 epochs agreed, 2.9% of votes survived the boundary
+  HEALTHY NO-OP: 56 fields over 8 epochs identical under the pre-fix filter and under the contract
+  MUTATION (s3): one validator at zero stake changes the partition in 8/8 epochs — the comparator sees the defect
+  DETERMINISM: 64 slots, 512 fields compared, 0 differences
+  MUTATION: 512 fields compared, 64 differences (0 would mean the comparator is blind)
+  ACCRUED LEAK: ledger holds 30000000000 satoshis across 30 fully-leaked validators. Pre-fix: 1/34 votes survived, justified=NONE. Post-fix: 64/64 survived, JUSTIFIED against a denominator of 34000000000 (34 live validators). After the relaunch reset the denominator is 64000000000 (64 validators) — 88.2% more quorum weight than an inherited ledger would have allowed.
+  MUTATION (s4): filter restored -> boundary kept 1 of 34 honest votes, justified=NONE
+  FALSE QUORUM: 4 of 64 validators (6.25%) first justified at epoch 25 of non-finality, after the leak destroyed 92.2% of total network stake
+  MUTATION: with the leak removed from the denominator, 4 of 64 never justified
+  ROSTER SPLIT: step 8 admitted 63 honest attestations; the boundary kept 4 (6.3%). One validator at zero stake was enough.
+  CONTROL: the identical votes, tallied against the roster that admitted them, justify at epoch 1. The bug is the two rosters, not the votes.
+  thread 'prova::tests::pending_dev_a_production_membership_is_leak_invariant' (7644856) panicked at crates/bloch-pos-committee/src/prova.rs:798:13:
+  assertion `left == right` failed: epoch 0: committee membership still moves when one validator's stake goes to zero. Membership must be a function of (seed, epoch, index set).
+  left: [[10, 13], [1, 12], [37, 44], [33, 47], [6, 23], [27, 32], [2, 61], [20, 31], [58, 62], [14, 41], [17, 28], [36, 38], [18, 24], [26, 46], [54, 56], [30, 42], [22, 45], [29, 48], [59, 60], [34, 53], [50, 51], [0, 21], [5, 9], [16, 39], [15, 52], [43, 57], [11, 55], [3, 63], [8, 19], [40, 49], [4, 35], [25]]
+  right: [[5, 34], [15, 52], [25, 50], [6, 19], [20, 62], [33, 39], [23, 57], [27, 60], [9, 11], [42, 46], [41, 48], [45, 49], [26, 28], [4, 29], [14, 37], [30, 55], [21, 36], [13, 59], [0, 44], [3, 16], [7, 32], [38, 51], [24, 54], [12, 35], [17, 31], [22, 47], [1, 18], [10, 61], [58, 63], [2, 53], [40, 56], [8, 43]]
+  note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+gates in the manifest: 22   resolved: 22   failing: 0
+test events parsed: 272
+** 1 gate(s) PENDING — red by construction until another dev lands their half.
+** Not fatal here. It IS fatal before the relaunch tag.
+
+── preservation manifest (Task 3) ──────────────────────────────────────
+-- static gates only (no --deep). This run CANNOT report PASS.
+==========================================================================================================================
+PRESERVATION MANIFEST — prova-relanca (static)
+==========================================================================================================================
+
+[A. consensus constants]
+  PASS  LEAKED_ROSTER_ACTIVATION_EPOCH == 1400                          found `1400` (ab9ca4e1 armed it at 1400; it is live on 64 nodes)
+  PASS  FUNDED_STAKE_ACTIVATION_EPOCH inert                             ABSENT — constant not present on this branch, so nothing can arm (state: NOT-INTEGRATED)
+  PASS  the armed flag day is still in the future                       wall epoch 1006 (slot 32207); epoch 1400 lands 2026-08-29 10:51:19Z (+104.9 h) — the chain epoch is <= the wall epoch, so this bounds it
+
+[B. tripwire (source)]
+  PASS  leaked_roster_armed_epoch_matches_the_runbook present           crates/bloch-pos-committee/src/transition.rs:6606
+  PASS  leaked_roster_armed_epoch_matches_the_runbook actually asserts  assert=True names-const=True names-1400=True
+
+[D2. flag-day runbook]
+  PASS  docs/LEAKED-ROSTER-FLAG-DAY.md present                          252 lines
+  PASS  the runbook was not gutted                                      252 lines, need >= 200; a stub that keeps the filename passes a file-exists check and preserves nothing
+  PASS  section: What activates, in one paragraph                       present
+  PASS  section: Why this flag day is unlike a height gate              present
+  PASS  names the constant it arms                                      a runbook that no longer names its constant is not this runbook
+  INFO  runbook vs params.rs                                            DRIFT: the runbook still describes the constant as inert (u64::MAX) while params.rs says 1400
+
+[C. proof suites (source)]
+  PASS  crates/bloch-pos-node/tests/replay_hotpath_perf.rs              6 `#[test]` declared, 30884 bytes, all 3 pinned test(s) present
+  PASS  crates/bloch-pos-committee/tests/state_root_carryover_scale.rs  4 `#[test]` declared, 29199 bytes, all 2 pinned test(s) present
+  PASS  crates/bloch-pos-committee/tests/forkchoice_asymptotics.rs      1 `#[test]` declared, 6260 bytes, all 1 pinned test(s) present
+  PASS  crates/bloch-pos-committee/tests/properties.rs                  29 `#[test]` declared, 46365 bytes, all 2 pinned test(s) present
+  PASS  crates/bloch-pos-node/src/engine/replay_bench.rs                3 `#[test]` declared, 49411 bytes, all 2 pinned test(s) present
+
+[D. perf symbols on the hot path]
+  PASS  Smt (229d95a6)                                                  defined crates/bloch-pos-committee/src/state_root.rs:809; 15 production use(s), e.g. crates/bloch-pos-committee/src/lib.rs:108
+  PASS  node_insert (229d95a6)                                          defined crates/bloch-pos-committee/src/state_root.rs:576; 3 production use(s), e.g. crates/bloch-pos-committee/src/state_root.rs:591
+  PASS  node_remove (229d95a6)                                          defined crates/bloch-pos-committee/src/state_root.rs:654; 3 production use(s), e.g. crates/bloch-pos-committee/src/state_root.rs:655
+  PASS  from_leaf_map (229d95a6)                                        defined crates/bloch-pos-committee/src/state_root.rs:845; 2 production use(s), e.g. crates/bloch-pos-committee/src/state_root.rs:1661
+  PASS  state_root_with_eutxo_tree (229d95a6)                           defined crates/bloch-pos-committee/src/state_root.rs:1825; 1 production use(s), e.g. crates/bloch-pos-committee/src/transition.rs:1722
+  PASS  build_state_tree_with_eutxo_tree (229d95a6)                     defined crates/bloch-pos-committee/src/state_root.rs:1710; 1 production use(s), e.g. crates/bloch-pos-committee/src/state_root.rs:1809
+  PASS  build_subtree (22751083)                                        defined crates/bloch-pos-committee/src/state_root.rs:551; 3 production use(s), e.g. crates/bloch-pos-committee/src/state_root.rs:544
+  PASS  subtree_weights (401ed4e2)                                      defined crates/bloch-pos-committee/src/forkchoice.rs:233; 1 production use(s), e.g. crates/bloch-pos-committee/src/forkchoice.rs:190
+  PASS  head_reference (401ed4e2)                                       defined crates/bloch-pos-committee/src/forkchoice.rs:288 (oracle/counter — no prod call required)
+  PASS  ForkChoiceInputs (126d41a1)                                     defined crates/bloch-pos-node/src/engine.rs:549; 3 production use(s), e.g. crates/bloch-pos-node/src/engine.rs:1188
+  PASS  forkchoice_inputs (126d41a1)                                    defined crates/bloch-pos-node/src/engine.rs:1210; 1 production use(s), e.g. crates/bloch-pos-node/src/engine.rs:1265
+  PASS  StateCell (b945a09e)                                            defined crates/bloch-pos-node/src/engine.rs:295; 6 production use(s), e.g. crates/bloch-pos-node/src/engine.rs:308
+  PASS  rolled_to (b945a09e)                                            defined crates/bloch-pos-node/src/engine.rs:375; 5 production use(s), e.g. crates/bloch-pos-node/src/engine.rs:662
+  PASS  rolled_to_uncached (b945a09e)                                   defined crates/bloch-pos-node/src/engine.rs:683 (oracle/counter — no prod call required)
+  PASS  remember_state (b945a09e)                                       defined crates/bloch-pos-node/src/engine.rs:1528; 3 production use(s), e.g. crates/bloch-pos-node/src/engine.rs:1413
+  PASS  state_at_canonical (b945a09e)                                   defined crates/bloch-pos-node/src/engine.rs:1545; 1 production use(s), e.g. crates/bloch-pos-node/src/engine.rs:1590
+  PASS  MEMO_CAP (b945a09e)                                             defined crates/bloch-pos-node/src/engine.rs:287; 1 production use(s), e.g. crates/bloch-pos-node/src/engine.rs:414
+  PASS  REORG_STATE_WINDOW (b945a09e)                                   defined crates/bloch-pos-node/src/engine.rs:185; 1 production use(s), e.g. crates/bloch-pos-node/src/engine.rs:1508
+  PASS  root_computations (e46a13d4)                                    defined crates/bloch-pos-committee/src/transition.rs:949 (oracle/counter — no prod call required)
+  PASS  head_state_root (ae4cffbb)                                      defined crates/bloch-pos-node/src/engine.rs:647; 1 production use(s), e.g. crates/bloch-pos-node/src/engine.rs:1941
+
+[D2. structural pins (call shape)]
+  PASS  getchaininfo takes the root as a parameter                      matched at crates/bloch-pos-node/src/rpc.rs:1041
+  PASS  getchaininfo does NOT re-derive the root                        no match  (this pattern MUST NOT appear)
+  PASS  serve_rpc feeds ChainInfo the head header root                  matched at crates/bloch-pos-node/src/engine.rs:1938
+  PASS  apply_block reaches the incremental root, not a full walk       matched at crates/bloch-pos-committee/src/transition.rs:1722
+  PASS  the memoised rolled state is what the engine serves             matched at crates/bloch-pos-node/src/engine.rs:656
+  PASS  the SMT is node-based, not a flat leaf map                      matched at crates/bloch-pos-committee/src/state_root.rs:433
+  PASS  the eUTXO set hands out a tree, not a leaf map                  matched at crates/bloch-pos-committee/src/transition.rs:1216
+  PASS  the leaked-roster gate compares an epoch parameter              matched at crates/bloch-pos-committee/src/transition.rs:1535
+  PASS  no consensus roster is derived from the wall clock              no match  (this pattern MUST NOT appear)
+  PASS  the state root still commits every component                    all 21 armed tag(s) present
+  PASS  the eUTXO subtree is still committed by the retained tree       22751083 folded the eUTXO loop into a clone of the retained Smt
+  PASS  perf-timing stays off by default                                crates/bloch-pos-committee: opt-in; crates/bloch-pos-node: opt-in
+
+[E. proof suites (executed)]
+  INFO  cargo                                                           SKIPPED by --no-cargo; report is INCOMPLETE
+
+--------------------------------------------------------------------------------------------------------------------------
+gates executed: 47   PASS 47   FAIL 0
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+!! RESULT: INCOMPLETE — static gates hold, but NOTHING WAS COMPILED.
+!! --no-cargo CANNOT produce a PASS, by construction.
+!!
+!! Static gates match symbols, files and test names by PATTERN. They do
+!! not type-check, so they cannot see a call that no longer matches its
+!! callee. On 2026-08-24 this exact mode reported 42/42 PASS on a tree
+!! whose --bin target did not compile: rpc/tests.rs passed 8 arguments to
+!! chain_info_json, which takes 9 since ae4cffbb. That --bin target is
+!! where replay_bench lives, so the benchmark proving the state-root work
+!! survived the merge could not be BUILT, while this report said PASS.
+!!
+!! Re-run WITHOUT --no-cargo before calling anything preserved.
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+EXIT=3
