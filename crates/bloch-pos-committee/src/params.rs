@@ -425,6 +425,40 @@ pub mod rehearsal {
     /// catches it. Thread-local; see [`TlFlag`].
     pub static PARTITION_DUPLICATES_AN_INDEX: TlFlag = TlFlag(&PARTITION_DUPLICATES_AN_INDEX_TL);
 
+    thread_local! {
+        static GATES_OPEN_TL: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Test-only: treat [`super::ANCESTRY_SEED_ACTIVATION_EPOCH`] and
+    /// [`super::LEAK_RECOVERY_ACTIVATION_EPOCH`] as if they had already bound.
+    ///
+    /// The two flag days ship INERT (`u64::MAX`), which is correct — the fleet
+    /// must replay its existing log under the OLD rules — but it means no epoch
+    /// a test can construct ever reaches them. Without this, every test of the
+    /// post-flag-day behaviour would be dead code, and the only tests left
+    /// would be the ones asserting inertness. Both sides need cover.
+    ///
+    /// Default is CLOSED, deliberately: an unadorned `cargo test` exercises the
+    /// configuration the fleet actually runs. Tests of the new rules opt in.
+    pub fn gates_are_forced_open() -> bool {
+        GATES_OPEN_TL.with(|c| c.get())
+    }
+
+    /// Opens both gates for this thread until the returned guard drops —
+    /// including on the unwind path, so a failing assertion cannot leave the
+    /// rules mutated for the rest of the thread.
+    #[cfg(test)]
+    pub fn gates_open_guard() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                GATES_OPEN_TL.with(|c| c.set(self.0));
+            }
+        }
+        let prev = GATES_OPEN_TL.with(|c| c.replace(true));
+        Restore(prev)
+    }
+
     /// Serializes every test that flips a switch in this module. The switches
     /// are process-global and `cargo test` runs test functions on threads, so
     /// without this a mutation test would silently corrupt an unrelated one.

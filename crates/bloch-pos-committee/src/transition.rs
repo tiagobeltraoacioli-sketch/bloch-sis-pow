@@ -1529,7 +1529,11 @@ impl CommittedState {
         // same function. Changing it unconditionally does not cause a
         // disagreement, it stops the node: `ingest` rejects and returns, and
         // the node parks silently at an old height. See the constant's docs.
-        let lookahead = if epoch < crate::params::ANCESTRY_SEED_ACTIVATION_EPOCH {
+        #[cfg(test)]
+        let gate_open = crate::params::rehearsal::gates_are_forced_open();
+        #[cfg(not(test))]
+        let gate_open = false;
+        let lookahead = if !gate_open && epoch < crate::params::ANCESTRY_SEED_ACTIVATION_EPOCH {
             0
         } else {
             #[cfg(test)]
@@ -4061,6 +4065,9 @@ mod tests {
     /// genesis mix — reachable arithmetic, not an unreachable branch.
     #[test]
     fn the_rule_reads_a_boundary_the_state_still_retains() {
+        // The rules under test ship INERT behind their flag days; open them for
+        // this thread so this is not dead code. See params::rehearsal.
+        let _gates = crate::params::rehearsal::gates_open_guard();
         // `seed_for_epoch` goes through `rehearsal_mutate`, which reads the
         // process-global `MUTATE_SEED`; `randao_mix_at` does not. So this test
         // is a READER of that global and must be excluded from the A/B
@@ -7336,7 +7343,13 @@ mod tests {
     #[test]
     fn the_partition_coverage_guard_survives_into_a_release_build() {
         let src = include_str!("transition.rs");
-        let needle = "epoch partition must cover the roster exactly once";
+        // The guard's message changed on 2026-08-24 when it stopped comparing
+        // seat COUNT (a tautology no input could fail) and started comparing
+        // sorted index vectors. This test only proves the guard is
+        // UNCONDITIONAL; that its condition can actually fail is proved by
+        // `the_partition_invariant_catches_a_duplicated_index`, which drives the
+        // real condition instead of a planted `1 + 1 == 3`.
+        let needle = "epoch partition must seat every validator exactly once";
         let at = src.find(needle).expect("the coverage guard's message moved");
         let window = &src[at.saturating_sub(500)..at];
         assert!(
@@ -8202,6 +8215,9 @@ mod tests {
 
         #[test]
         fn the_model_of_the_reader_matches_the_reader() {
+        // The rules under test ship INERT behind their flag days; open them for
+        // this thread so this is not dead code. See params::rehearsal.
+        let _gates = crate::params::rehearsal::gates_open_guard();
             let c = chain(8, 5 * SLOTS_PER_EPOCH + 3, &[]);
             for target in 0..=6u64 {
                 for head in [0u64, 31, 64, 95, 128, 160, 163] {
@@ -8239,6 +8255,9 @@ mod tests {
         /// vacuous and this test proves nothing about the anchor.
         #[test]
         fn the_anchor_never_disagrees_at_any_lag() {
+        // The rules under test ship INERT behind their flag days; open them for
+        // this thread so this is not dead code. See params::rehearsal.
+        let _gates = crate::params::rehearsal::gates_open_guard();
             const TARGET: u64 = 5;
             let lead_slot = TARGET * SLOTS_PER_EPOCH + 3;
             let c = chain(8, lead_slot, &[]);
@@ -8375,6 +8394,9 @@ mod tests {
         /// entry for the empty epoch.
         #[test]
         fn the_anchors_header_mix_is_the_transitions_boundary_mix() {
+        // The rules under test ship INERT behind their flag days; open them for
+        // this thread so this is not dead code. See params::rehearsal.
+        let _gates = crate::params::rehearsal::gates_open_guard();
             // Epoch 3 (slots 96..=127) is left ENTIRELY empty.
             let empty: Vec<u64> = (3 * SLOTS_PER_EPOCH..4 * SLOTS_PER_EPOCH).collect();
             let last = 6 * SLOTS_PER_EPOCH;
@@ -8610,6 +8632,9 @@ mod tests {
         /// tautology.
         #[test]
         fn nothing_in_the_previous_epoch_can_move_an_epochs_seed() {
+        // The rules under test ship INERT behind their flag days; open them for
+        // this thread so this is not dead code. See params::rehearsal.
+        let _gates = crate::params::rehearsal::gates_open_guard();
             const E: u64 = 4;
             let head_slot = E * SLOTS_PER_EPOCH;
             // Withheld slots, all inside E-1 (epoch 3 = slots 96..=127).
@@ -8731,6 +8756,9 @@ mod tests {
         /// This one runs both ways in one execution, like the test above.
         #[test]
         fn the_shipped_reader_takes_the_older_boundary_not_the_newer() {
+        // The rules under test ship INERT behind their flag days; open them for
+        // this thread so this is not dead code. See params::rehearsal.
+        let _gates = crate::params::rehearsal::gates_open_guard();
             let c = chain(8, 4 * SLOTS_PER_EPOCH + 1, &[]);
             let st = &c.states[(4 * SLOTS_PER_EPOCH + 1) as usize];
             assert_eq!(st.epoch, 4);

@@ -230,6 +230,18 @@ impl FinalityState {
     /// [`Self::denominator_floor_disabled`]. Constant `false` in a release
     /// build.
     #[inline]
+    /// See `params::rehearsal::gates_are_forced_open`. Constant `false` in any
+    /// build that is not a test build, so the gate folds to the shipped one.
+    #[inline]
+    fn gates_forced_open() -> bool {
+        #[cfg(test)]
+        {
+            return crate::params::rehearsal::gates_are_forced_open();
+        }
+        #[cfg(not(test))]
+        false
+    }
+
     fn leak_recovery_disabled() -> bool {
         #[cfg(test)]
         {
@@ -285,7 +297,9 @@ impl FinalityState {
             // Mutation hook, `cfg(test)` only: the arithmetic mainnet ran on
             // 2026-08-24, kept runnable so the incident stays reproducible.
             leak_adjusted
-        } else if votes.epoch < crate::params::LEAK_RECOVERY_ACTIVATION_EPOCH {
+        } else if !Self::gates_forced_open()
+            && votes.epoch < crate::params::LEAK_RECOVERY_ACTIVATION_EPOCH
+        {
             // GATED. Below the flag day the denominator is the leak-adjusted
             // total with NO floor — the arithmetic the existing chain's blocks
             // were folded under. The floor decides which checkpoints justify,
@@ -426,7 +440,8 @@ impl FinalityState {
         // GATED on the same flag day as the floor: `leaked` is committed into
         // the state root (`state_root.rs`, `leaked: Vec<LeakRecord>`), so
         // recovering it on historical epochs changes the root and stops replay.
-        if votes.epoch >= crate::params::LEAK_RECOVERY_ACTIVATION_EPOCH
+        if (Self::gates_forced_open()
+            || votes.epoch >= crate::params::LEAK_RECOVERY_ACTIVATION_EPOCH)
             && !Self::leak_recovery_disabled()
         {
             //
@@ -1045,6 +1060,9 @@ mod tests {
     /// denominator must be the full unleaked total again.
     #[test]
     fn the_fourth_ensaio_a_relaunch_that_inherits_the_leak() {
+        // The rules under test ship INERT behind their flag days; open them for
+        // this thread so this is not dead code. See params::rehearsal.
+        let _gates = crate::params::rehearsal::gates_open_guard();
         let _g = HOOK.lock().unwrap_or_else(|e| e.into_inner());
         let committee: Vec<Validator> = (0..64u32).map(|i| validator(i, STAKE_EACH)).collect();
         let unleaked_total = STAKE_EACH as u128 * 64;
@@ -1235,6 +1253,9 @@ mod tests {
     /// a chain 110 epochs into non-finality can ever climb out.
     #[test]
     fn the_leak_recovers_once_the_validator_participates_even_during_a_stall() {
+        // The rules under test ship INERT behind their flag days; open them for
+        // this thread so this is not dead code. See params::rehearsal.
+        let _gates = crate::params::rehearsal::gates_open_guard();
         let _g = HOOK.lock().unwrap_or_else(|e| e.into_inner());
         let committee: Vec<Validator> = (0..64u32).map(|i| validator(i, STAKE_EACH)).collect();
         let mut st = FinalityState::new(genesis());
