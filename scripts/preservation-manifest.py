@@ -630,6 +630,50 @@ def check_root_components(root: Path, rep: Report):
             "22751083 folded the eUTXO loop into a clone of the retained Smt")
 
 
+def check_margin_matches_the_runbook(root: Path, rep: Report):
+    """The armed epoch must satisfy the runbook's OWN rule.
+
+        E = round_up_to_100( epoch_at_tag + 900 )
+
+    with the 900 broken down in the runbook as 270 rollout + 90 fleet-green
+    soak + 180 decision margin + 360 contingency.
+
+    The tripwire cannot check this. It asserts `LEAKED_ROSTER_ACTIVATION_EPOCH
+    == 1400` against a literal 1400 written in its own source, so it compares
+    the constant to a copy of itself and passes no matter what the runbook
+    says. This recomputes the rule from the live manifest's cadence and the
+    ARMED date that params.rs records, which is the only way the claim "the
+    armed value was produced by that runbook" can be tested at all.
+    """
+    g = "A. consensus constants"
+    par = root / PARAMS
+    man = root / MANIFEST_FILE
+    if not par.is_file() or not man.is_file():
+        rep.add(g, "the armed epoch honours the runbook's margin", False,
+                "unresolvable: params.rs or the genesis manifest is missing")
+        return
+    m = re.search(r'ARMED\s+(\d{4})-(\d{2})-(\d{2})\s+at\s+epoch\s+([\d_]+)', par.read_text())
+    if not m:
+        rep.add(g, "the armed epoch honours the runbook's margin", False,
+                "params.rs records no `ARMED <date> at epoch <N>` line — the arming is undated, "
+                "so no margin can be checked")
+        return
+    import calendar
+    tag = calendar.timegm((int(m.group(1)), int(m.group(2)), int(m.group(3)), 0, 0, 0, 0, 0, 0)) * 1000
+    b = man.read_bytes()[:24]
+    gms = int.from_bytes(b[8:16], "little")
+    slot_ms = int.from_bytes(b[16:24], "little") or 30_000
+    e_tag = max(0, (tag - gms) // slot_ms) // 32
+    required = -(-(e_tag + 900) // 100) * 100
+    armed = int(m.group(4).replace("_", ""))
+    rep.add(g, "the armed epoch honours the runbook's margin", armed >= required,
+            f"ARMED {m.group(1)}-{m.group(2)}-{m.group(3)} => epoch_at_tag {e_tag}; "
+            f"rule E = round_up_100({e_tag}+900) = {required}; armed {armed}"
+            + ("" if armed >= required else
+               f" — SHORT by {required - armed} epochs ({(required - armed) / 90:.1f} days). "
+               f"Margin granted {armed - e_tag} < 540 needed for rollout+soak+decision alone."))
+
+
 def check_tripwire_source(root: Path, rep: Report):
     g = "B. tripwire (source)"
     p = root / TRIPWIRE_FILE
@@ -896,6 +940,7 @@ def main():
     check_constants(root, rep)
     check_flag_day_is_ahead(root, rep)
     check_runbook(root, rep)
+    check_margin_matches_the_runbook(root, rep)
     check_tripwire_source(root, rep)
     present = check_suites_source(root, rep)
     check_symbols(root, rep)
@@ -917,7 +962,7 @@ def main():
         print("!! THE VERIFIER EXECUTED ZERO GATES. This report means NOTHING.")
         print("!" * 70)
         return 2
-    expected_min = 5 + 2 + len(SUITES) + len(PERF_SYMBOLS) + len(STRUCTURAL_PINS) + 5
+    expected_min = 6 + 2 + len(SUITES) + len(PERF_SYMBOLS) + len(STRUCTURAL_PINS) + 5
     if not args.no_cargo:
         expected_min += 3  # build + tripwire-run + workspace-green
     if len(gates) < expected_min:
