@@ -355,14 +355,29 @@ fraud — but it was read as though the benchmark had passed, and it had not run
 Not for the relaunch. Written down now because it is the kind of finding that
 evaporates and then costs a network.
 
-**The worst possible geometry for a consensus mistake.** Measured with
-`git merge-tree`:
+**Measured with `git merge-tree`, not inspected.** An earlier hand-written list
+in this section was wrong in both directions — it named `staking.rs` and
+`perf.rs`, which do NOT collide, and missed `rpc.rs`, `rpc/tests.rs` and
+`cold_start.rs`. Use the measurement:
 
 ```
 state_root.rs   ZERO conflict hunks
-engine.rs       1 conflict, only at end of file (test modules)
+engine.rs       1 conflict, end of file only - 100% #[cfg(test)] additive
 transition.rs   3 conflicts, ALL inside compute_root
+rpc/tests.rs    NO conflict - and it is the dangerous one
 ```
+
+**The one that hurts does not conflict at all.** `rpc/tests.rs` has a call with
+8 arguments on one side and 9 on the other; git auto-merges it silently and
+takes down the test target where proof suite #5 lives. No conflict, no warning,
+and only `cargo test --workspace --no-run` sees it.
+
+Also measured, and it retires an earlier fear: the `compute_root` seam is
+**protected by the compiler**. In the auto-merge, `state_root_with_eutxo_leaves`
+and `EutxoSet::leaves` cease to exist while `ConsensusState` requires the two new
+fields, so BOTH one-sided resolutions fail to compile. The silent-divergence
+scenario described below is what would happen if someone hand-resolved around
+that; the compiler will not let a plain merge produce it.
 
 The single file that conflicts is NOT the file that defines the leaves. Whoever
 merges sees conflicts in one place, resolves by taking a whole side, and
@@ -438,3 +453,33 @@ whenever it is re-verified.
 Related, and the reason this matters beyond bookkeeping: a suite reported as
 "550 passed" never included the performance tests. Nobody lied; everybody read
 it as though the benchmark had passed.
+
+## 18. What three quarters would have bought, and what it would have cost
+
+**This is analysis, not a decision.** The floor is one half, by the founder's
+call, re-affirmed after this argument was put to him. Recorded so that if he
+ever reopens it he does not have to pay for the work twice.
+
+A floor of 3/4 makes the minimum recoverable fraction exceed 1/2, so no two
+disjoint sets can both justify — it buys **uniqueness of the justified root**,
+which 1/2 does not. A rehearsal showed a partition healing under 3/4.
+
+The price, and it is the reason the answer is not obviously 3/4: under a 3/4
+floor the chain **cannot recover finality from the loss of more than a quarter
+of the stake** — with 64 validators, 33 must always be reachable. A fleet that
+loses half its nodes never finalizes again, at all, rather than finalizing on
+two roots. That is the trade: 1/2 keeps liveness and permits up to three
+pairwise-disjoint justifying sets; 3/4 guarantees one root and forfeits recovery
+from a majority outage.
+
+The measurement that would actually settle it, and which has NOT been made:
+given the partition observed today, does the chain heal under 1/2, under 3/4, or
+under both? Answering it needs the 6-against-2 arm against a corrected binary,
+which did not run.
+
+A warning for whoever revisits this. The commit that moved the floor to 3/4 also
+installed an assertion **about the shipped constant** requiring `NUM * 4 >= DEN *
+3`. Anyone reverting only the value would have found the suite red and concluded
+that 1/2 was the mistake. **The guard defended the change against its own
+owner.** If you change the floor, change the assertion in the same commit, and
+never write a guard that makes reverting your decision look like a failure.
