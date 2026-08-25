@@ -297,8 +297,12 @@ def strip_comments(src: str) -> str:
             while i < n and src[i] != "\n":
                 i += 1
         elif c == "/" and nxt == "*":
+            # Keep the newlines: a comment must not shift the line numbers this
+            # script reports, or every file:line in the report is a lie.
             i += 2
             while i < n and not (src[i] == "*" and i + 1 < n and src[i + 1] == "/"):
+                if src[i] == "\n":
+                    out.append("\n")
                 i += 1
             i += 2
         elif c == '"':
@@ -477,6 +481,70 @@ def check_perf_feature_off(root: Path, rep: Report):
         else:
             detail.append(f"{crate}: opt-in")
     rep.add(g, "perf-timing stays off by default", ok, "; ".join(detail))
+
+
+CHAIN_INFO_ARITY = 9
+
+def check_chain_info_arity(root: Path, rep: Report):
+    """Every `chain_info_json` call site must pass the 9-argument form.
+
+    Measured, not assumed:
+
+      751afdae  rpc/tests.rs — 1 call site,  8 args
+      ab9ca4e1  rpc/tests.rs — 1 call site,  9 args (ae4cffbb added state_root)
+      a5c20a90  rpc/tests.rs — 2 call sites, 8 args each
+
+    The lastro added a SECOND test carrying the old arity on top of the
+    untouched base call.  `rpc/tests.rs` is a real collision that was not on
+    the PMO's list, and resolving it in the lastro's favour gives two 8-arg
+    calls against a 9-arg callee: the `bloch-pos-node` lib test target stops
+    compiling, and `engine/replay_bench.rs` — proof suite #5 — cannot be built
+    or run AT ALL.  No static symbol or file check can see that; this can.
+    """
+    g = "D2. structural pins (call shape)"
+    sites = []
+    for crate in (COMMITTEE, NODE):
+        d = root / crate / "src"
+        if not d.is_dir():
+            continue
+        for q in sorted(d.rglob("*.rs")):
+            txt = strip_comments(q.read_text())
+            for m in re.finditer(r'\bchain_info_json\s*\(', txt):
+                i = m.end()
+                depth, j, cuts = 1, i, []
+                while j < len(txt) and depth:
+                    ch = txt[j]
+                    if ch in "([{":
+                        depth += 1
+                    elif ch in ")]}":
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    elif ch == "," and depth == 1:
+                        cuts.append(j)
+                    j += 1
+                inner = txt[i:j]
+                pieces, prev = [], i
+                for c in cuts + [j]:
+                    pieces.append(txt[prev:c])
+                    prev = c + 1
+                # A trailing comma leaves an empty final piece; it is not an
+                # argument. Rust allows it and the armed build uses it.
+                args = len([q for q in pieces if q.strip()])
+                ln = txt[:m.start()].count("\n") + 1
+                # the definition itself is a call-shaped match too
+                before = txt[max(0, m.start() - 8):m.start()]
+                if before.rstrip().endswith("fn"):
+                    continue
+                sites.append((f"{q.relative_to(root)}:{ln}", args))
+    if not sites:
+        rep.add(g, "every chain_info_json call passes the 9-arg form", False,
+                "NO call site found at all — getchaininfo is unreachable or renamed")
+        return
+    bad = [f"{w} passes {n}" for w, n in sites if n != CHAIN_INFO_ARITY]
+    rep.add(g, "every chain_info_json call passes the 9-arg form", not bad,
+            f"{len(sites)} call site(s)" + (f"; WRONG ARITY: {'; '.join(bad)}" if bad
+                                            else f", all {CHAIN_INFO_ARITY} args"))
 
 
 def check_root_components(root: Path, rep: Report):
@@ -761,6 +829,7 @@ def main():
     check_structural(root, rep)
     check_root_components(root, rep)
     check_perf_feature_off(root, rep)
+    check_chain_info_arity(root, rep)
     if not args.no_cargo:
         check_cargo(root, rep, present, args.target_dir)
     else:
@@ -774,7 +843,7 @@ def main():
         print("!! THE VERIFIER EXECUTED ZERO GATES. This report means NOTHING.")
         print("!" * 70)
         return 2
-    expected_min = 3 + 2 + len(SUITES) + len(PERF_SYMBOLS) + len(STRUCTURAL_PINS) + 3
+    expected_min = 3 + 2 + len(SUITES) + len(PERF_SYMBOLS) + len(STRUCTURAL_PINS) + 4
     if not args.no_cargo:
         expected_min += 3  # build + tripwire-run + workspace-green
     if len(gates) < expected_min:
@@ -795,11 +864,13 @@ def main():
         print("!!")
         print("!! Static gates match symbols, files and test names by PATTERN. They do")
         print("!! not type-check, so they cannot see a call that no longer matches its")
-        print("!! callee. On 2026-08-24 this exact mode reported 42/42 PASS on a tree")
-        print("!! whose --bin target did not compile: rpc/tests.rs passed 8 arguments to")
-        print("!! chain_info_json, which takes 9 since ae4cffbb. That --bin target is")
-        print("!! where replay_bench lives, so the benchmark proving the state-root work")
-        print("!! survived the merge could not be BUILT, while this report said PASS.")
+        print("!! callee. The live example, measured on all three trees:")
+        print("!!   ab9ca4e1 rpc/tests.rs — 1 call to chain_info_json, 9 args")
+        print("!!   a5c20a90 rpc/tests.rs — 2 calls to chain_info_json, 8 args each")
+        print("!! chain_info_json has taken 9 since ae4cffbb. Resolve that file the")
+        print("!! wrong way and the bloch-pos-node test target stops compiling — and")
+        print("!! that target is where engine/replay_bench.rs lives, so proof suite #5")
+        print("!! could not be BUILT while every static gate above still said PASS.")
         print("!!")
         print("!! Re-run WITHOUT --no-cargo before calling anything preserved.")
         print("!" * 70)
