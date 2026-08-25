@@ -212,32 +212,54 @@ cargo-geiger:
     - cargo geiger --all-features --output-format Ascii || true
   allow_failure: true
 
-# cargo-fuzz smoke — links the fuzz harness against the REAL bloch API and runs
-# each scanner-priority target for a few seconds to prove it does not fault on
-# shallow input. NON-BLOCKING: a bounded smoke run is a build/link + no-shallow-
-# crash check, NOT a coverage-exhausting campaign (that runs continuously in
-# OSS-Fuzz — see fuzz/oss-fuzz/). Needs the nightly toolchain + cargo-fuzz +
-# libFuzzer; the guard skips soft if nightly is unavailable on the runner.
-# Local: `cargo +nightly fuzz run <target> -- -max_total_time=30`.
-fuzz-smoke:
+# ── Fuzzing, in two jobs, because they answer two different questions. ──────
+#
+# `fuzz-build` asks "does the harness link against the real node?" That has a
+# yes/no answer, it is cheap, and getting it wrong is invisible: from the
+# Genesis-4 trunk switch until 2026-08-25 the answer was NO for every one of the
+# then-eleven targets. fuzz/Cargo.toml took `bloch` from the repo root, the root
+# had become a VIRTUAL manifest, and `cargo metadata` on the fuzz crate failed
+# at resolution — so nothing could be built. Nobody noticed for the whole
+# Genesis-4 era, because the only job that would have caught it was
+# `allow_failure: true` and the tree still carried eleven populated corpus
+# directories that made it look like a running program.
+#
+# So fuzz-build BLOCKS. A harness that does not link is a broken build, not a
+# weak fuzzing result, and it must never again be able to go green.
+fuzz-build:
   stage: test
   before_script: []
   script:
     - |
       if ! rustup toolchain list | grep -q nightly; then
-        echo "nightly toolchain not installed on this runner — skipping fuzz smoke (informational)."
+        echo "nightly toolchain not installed on this runner — skipping fuzz build (informational)."
         echo "install: rustup toolchain install nightly && cargo install cargo-fuzz"
         exit 0
       fi
     - cargo install cargo-fuzz --locked 2>/dev/null || true
-    # BUILD EVERY TARGET FIRST, and fail on it. From the Genesis-4 trunk switch
-    # until 2026-08-25 this job could not build a single target: fuzz/Cargo.toml
-    # took `bloch` from the repo root, the root became a VIRTUAL manifest, and
-    # `cargo metadata` on the fuzz crate failed outright. `allow_failure: true`
-    # meant the pipeline stayed green through all of it while fuzz/corpus/ kept
-    # eleven populated directories on disk. A link failure is not a fuzzing
-    # result and must never again be reported as one.
     - cargo +nightly fuzz build
+  timeout: 60m
+
+# `fuzz-smoke` asks "does a short campaign find a shallow crash?" That is a
+# search, and a search that finds nothing in 20 seconds has not proved anything
+# — so a red here is a signal to read, not a merge blocker, and it stays
+# NON-BLOCKING. A real campaign runs continuously in OSS-Fuzz (fuzz/oss-fuzz/).
+# Local: `cargo +nightly fuzz run <target> -- -max_total_time=30`.
+#
+# NOTE the asymmetry is deliberate: `allow_failure: true` is defensible for a
+# bounded search and indefensible for a link check. Splitting the jobs is what
+# lets the link check block without making a 20-second search a gate.
+fuzz-smoke:
+  stage: test
+  needs: ["fuzz-build"]
+  before_script: []
+  script:
+    - |
+      if ! rustup toolchain list | grep -q nightly; then
+        echo "nightly toolchain not installed on this runner — skipping fuzz smoke (informational)."
+        exit 0
+      fi
+    - cargo install cargo-fuzz --locked 2>/dev/null || true
     - |
       # Genesis-4 (LIVE CHAIN) remote surface first — codec, RPC, sync frames.
       for t in g4_codec g4_rpc g4_p2p_sync block_parse tx_parse sha256d_pow ghostdag_order sig_verify; do

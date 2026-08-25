@@ -81,9 +81,15 @@ kept looking like a running fuzzing program on disk.
 
 Fix: `bloch = { path = "../legacy/genesis3-node" }`. That package still declares
 `[lib] name = "bloch"`, so every `bloch::...` import in the existing targets
-resolves unchanged. `fuzz-smoke` now runs `cargo +nightly fuzz build` (all
-targets) *before* it runs anything, because a link failure is not a fuzzing
-result and must never again be reported as one.
+resolves unchanged. CI is now two jobs, because they answer two different
+questions. **`fuzz-build` blocks**: "does the harness link against the real
+node?" has a yes/no answer, and the answer being NO is exactly what went
+unnoticed here — a harness that does not link is a broken build, not a weak
+fuzzing result. **`fuzz-smoke` stays `allow_failure: true`**: a 20-second search
+that finds nothing has not proved anything, so a red there is a signal to read
+rather than a merge gate. The asymmetry is the point; `allow_failure` is
+defensible for a bounded search and indefensible for a link check, and one job
+could not be both.
 
 ## Execution status — 2026-08-25, after the harness repair
 
