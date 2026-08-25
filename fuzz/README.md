@@ -4,7 +4,7 @@ Coverage-guided fuzzers (cargo-fuzz / libFuzzer) for the consensus-critical
 parsers that consume bytes from untrusted peers. A parse must only ever return
 `Err` — never panic, over-allocate, or hang.
 
-Targets (11 total):
+Targets (14 total):
 
 Wire / P2P ingest (untrusted remote bytes — primary attack surface):
 - `block_parse`     — `Block::from_bitcoin_bytes` (incl. the shielded-tx suffix).
@@ -30,6 +30,11 @@ Crypto:
 - `sig_verify`      — hybrid ML-DSA-65 ‖ Falcon-1024 `crypto::verify` + the
                       crypto-agility suite-envelope / legacy-fallback parser.
 
+Genesis-4 live node:
+- `g4_codec`        — block-envelope and attestation wire decoders.
+- `g4_rpc`          — bounded JSON-RPC parser and route dispatcher.
+- `g4_p2p_sync`     — libp2p directed-sync request and response decoders.
+
 Run (nightly toolchain + cargo-fuzz):
 
 ```bash
@@ -38,6 +43,7 @@ cargo install cargo-fuzz
 cargo +nightly fuzz run sha256d_pow                       # or any target above
 cargo +nightly fuzz run ghostdag_order -- -max_total_time=300
 cargo +nightly fuzz run sig_verify   -- -max_total_time=300
+cargo +nightly fuzz run g4_codec     -- -max_total_time=300
 ```
 
 Reproduce a crash: `cargo +nightly fuzz run <target> fuzz/artifacts/...`.
@@ -67,4 +73,6 @@ This crate is **not** part of the node build (not a path-dep of `bloch`); it is
 its own workspace root (empty `[workspace]` table) so `cargo fuzz build` does not
 walk up into the node workspace. Wire `cargo fuzz run` into CI/nightly on a
 capable runner (see `oss-fuzz/`). New parsers of untrusted bytes should get a
-target here.
+target here. The three `g4_*` targets depend directly on `bloch-pos-node`'s
+library target, so they fuzz the live Genesis-4 implementation rather than a
+recreated parser.

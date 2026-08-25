@@ -18,9 +18,14 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-bloch = { path = ".." }
+# Genesis-3 is retained only for the legacy targets below; its package moved
+# when the root manifest became a virtual Genesis-4 workspace.
+bloch = { path = "../legacy/genesis3-node" }
 bloch-sis-pow = { path = "../crates/bloch-sis-pow" }
 coherence-core = { path = "../crates/coherence-core" }
+# The live Genesis-4 node library. These targets exercise the same parsers and
+# protocol decoders that receive remote traffic, not a compatibility wrapper.
+bloch-pos-node = { path = "../crates/bloch-pos-node" }
 # P1 (roadmap §1b): the netmsg / handshake decode targets mirror the node's
 # gossipsub/transport ingest, which decodes with bincode 2 (serde). Match the
 # node's version so the wire format under fuzz is identical.
@@ -103,5 +108,25 @@ doc = false
 # Hybrid PQ signature verifier + crypto-agility suite envelope parser.
 name = "sig_verify"
 path = "fuzz_targets/sig_verify.rs"
+test = false
+doc = false
+
+# ── Genesis-4 live-node remote surfaces. ─────────────────────────────────────
+
+[[bin]]
+name = "g4_codec"
+path = "fuzz_targets/g4_codec.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "g4_rpc"
+path = "fuzz_targets/g4_rpc.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "g4_p2p_sync"
+path = "fuzz_targets/g4_p2p_sync.rs"
 test = false
 doc = false

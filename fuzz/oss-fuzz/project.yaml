@@ -2,10 +2,9 @@ homepage: "https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow"
 main_repo: "https://github.com/tiagobeltraoacioli-sketch/bloch-sis-pow.git"
 language: rust
 primary_contact: "tiagobeltraoacioli@gmail.com"
-# Continuous coverage-guided fuzzing of the Bloch (Genesis-2) node's
-# untrusted-input attack surface: P2P wire parsers, the LIVE SHA-256d PoW
-# verifier, GhostDAG ordering, and the hybrid ML-DSA-65 ‖ Falcon-1024 signature
-# envelope. See fuzz/README.md for the per-target rationale.
+# Continuous coverage-guided fuzzing of the legacy wire surfaces and the live
+# Genesis-4 node's envelope, RPC, and libp2p sync decoders. See fuzz/README.md
+# for the per-target rationale.
 fuzzing_engines:
   - libfuzzer
 sanitizers:

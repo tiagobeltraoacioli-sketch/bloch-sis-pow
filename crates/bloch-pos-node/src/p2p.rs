@@ -286,6 +286,15 @@ const MAX_CONCURRENT_SYNC_SERVES: usize = 4;
 /// Response framing before the first envelope: tag plus envelope count.
 const SYNC_RESPONSE_HEADER_BYTES: usize = 1 + 4;
 
+/// A blocking read's response, retaining its permit until libp2p confirms the
+/// bytes were flushed or reports the inbound request failed.
+type SyncServeResponse = (
+    request_response::InboundRequestId,
+    request_response::ResponseChannel<SyncResponse>,
+    SyncResponse,
+    tokio::sync::OwnedSemaphorePermit,
+);
+
 /// Peers a single `get-blocks` is directed at. Not one (a silent peer would
 /// stall recovery), not all (that is the broadcast this replaces).
 const SYNC_FANOUT: usize = 3;
@@ -925,11 +934,9 @@ async fn run_swarm(
     // here to be written to the substream — the swarm loop must never sit in
     // a file read while blocks and attestations wait behind it.
     let serve_slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SYNC_SERVES));
-    let (resp_tx, mut resp_rx) = tokio::sync::mpsc::channel::<(
-        request_response::ResponseChannel<SyncResponse>,
-        SyncResponse,
-        tokio::sync::OwnedSemaphorePermit,
-    )>(MAX_CONCURRENT_SYNC_SERVES);
+    let (resp_tx, mut resp_rx) =
+        tokio::sync::mpsc::channel::<SyncServeResponse>(MAX_CONCURRENT_SYNC_SERVES);
+    let mut response_permits = HashMap::new();
 
     let mut redial = tokio::time::interval(REDIAL_INTERVAL);
     redial.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -937,7 +944,14 @@ async fn run_swarm(
     loop {
         tokio::select! {
             ev = swarm.select_next_some() => {
-                if !handle_swarm_event(&mut swarm, &mut st, &resp_tx, &serve_slots, ev) {
+                if !handle_swarm_event(
+                    &mut swarm,
+                    &mut st,
+                    &resp_tx,
+                    &serve_slots,
+                    &mut response_permits,
+                    ev,
+                ) {
                     return; // engine gone
                 }
             }
@@ -947,8 +961,10 @@ async fn run_swarm(
                     None => return, // engine dropped the handle
                 }
             }
-            Some((channel, resp, _permit)) = resp_rx.recv() => {
-                let _ = swarm.behaviour_mut().sync.send_response(channel, resp);
+            Some((request_id, channel, resp, permit)) = resp_rx.recv() => {
+                if swarm.behaviour_mut().sync.send_response(channel, resp).is_ok() {
+                    response_permits.insert(request_id, permit);
+                }
             }
             _ = redial.tick() => {
                 let connected: Vec<PeerId> = swarm.connected_peers().copied().collect();
@@ -1075,12 +1091,12 @@ fn request_blocks(swarm: &mut Swarm, st: &Loop, after_slot: u64) {
 fn handle_swarm_event(
     swarm: &mut Swarm,
     st: &mut Loop,
-    resp_tx: &tokio::sync::mpsc::Sender<(
-        request_response::ResponseChannel<SyncResponse>,
-        SyncResponse,
-        tokio::sync::OwnedSemaphorePermit,
-    )>,
+    resp_tx: &tokio::sync::mpsc::Sender<SyncServeResponse>,
     serve_slots: &Arc<tokio::sync::Semaphore>,
+    response_permits: &mut HashMap<
+        request_response::InboundRequestId,
+        tokio::sync::OwnedSemaphorePermit,
+    >,
     ev: SwarmEvent<G4BehaviourEvent>,
 ) -> bool {
     match ev {
@@ -1174,9 +1190,15 @@ fn handle_swarm_event(
             message,
             ..
         })) => match message {
-            request_response::Message::Request { request, channel, .. } => {
+            request_response::Message::Request {
+                request_id,
+                request,
+                channel,
+            } => {
                 match serve_slots.clone().try_acquire_owned() {
-                    Ok(permit) => serve_sync(st, resp_tx.clone(), permit, request, channel),
+                    Ok(permit) => {
+                        serve_sync(st, resp_tx.clone(), permit, request_id, request, channel)
+                    }
                     Err(_) => {
                         // The protocol has no Busy variant. An empty page is
                         // recoverable: a still-behind requester asks again from
@@ -1203,7 +1225,14 @@ fn handle_swarm_event(
                             *e = (*e).max(slot);
                             match st.emit(NetEvent::Block(env), bytes.len()) {
                                 IngressOutcome::Queued => {}
-                                IngressOutcome::Shed => page_queued = false,
+                                IngressOutcome::Shed => {
+                                    page_queued = false;
+                                    // The rest of this page cannot make
+                                    // progress while the engine is full; do
+                                    // not spend decoder CPU on an attacker
+                                    // supplied page we must not advance past.
+                                    break;
+                                }
                                 IngressOutcome::Closed => return false,
                             }
                         }
@@ -1228,6 +1257,19 @@ fn handle_swarm_event(
                 }
             }
         },
+        SwarmEvent::Behaviour(G4BehaviourEvent::Sync(request_response::Event::ResponseSent {
+            request_id,
+            ..
+        }))
+        | SwarmEvent::Behaviour(G4BehaviourEvent::Sync(request_response::Event::InboundFailure {
+            request_id,
+            ..
+        })) => {
+            // A permit spans the blocking read, bounded response queue, and
+            // actual transport write. `ResponseSent` means flushed; every
+            // inbound failure means the channel can no longer consume it.
+            response_permits.remove(&request_id);
+        }
         SwarmEvent::Behaviour(G4BehaviourEvent::Sync(request_response::Event::OutboundFailure {
             peer,
             error,
@@ -1342,12 +1384,9 @@ fn on_gossip(
 /// bytes, then hand the response back to the swarm loop to write.
 fn serve_sync(
     st: &Loop,
-    resp_tx: tokio::sync::mpsc::Sender<(
-        request_response::ResponseChannel<SyncResponse>,
-        SyncResponse,
-        tokio::sync::OwnedSemaphorePermit,
-    )>,
+    resp_tx: tokio::sync::mpsc::Sender<SyncServeResponse>,
     permit: tokio::sync::OwnedSemaphorePermit,
+    request_id: request_response::InboundRequestId,
     request: SyncRequest,
     channel: request_response::ResponseChannel<SyncResponse>,
 ) {
@@ -1371,7 +1410,7 @@ fn serve_sync(
             }
         };
         if resp_tx
-            .try_send((channel, SyncResponse::Blocks { envelopes }, permit))
+            .try_send((request_id, channel, SyncResponse::Blocks { envelopes }, permit))
             .is_err()
         {
             eprintln!("p2p: dropping get-blocks response because the swarm loop stopped");

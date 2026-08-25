@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 #
-# bloch-pos — the Genesis-4 node binary, and the binary the live chain runs.
+# bloch-pos — the Genesis-4 node library and CLI, and the binary the live chain runs.
 #
 # A NEW binary, deliberately: it was written while the Genesis-3 proof-of-work
 # node (`bloch`, now at legacy/genesis3-node/) was still producing blocks, and
@@ -40,6 +40,9 @@ publish = false
 [[bin]]
 name = "bloch-pos"
 path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
 
 [features]
 # Phase timers for the end-to-end replay benchmark (src/replay_bench.rs).

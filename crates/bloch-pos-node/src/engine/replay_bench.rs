@@ -33,12 +33,12 @@
 //!
 //! # Why this lives in `src/engine/` under `cfg(test)`
 //!
-//! `Engine` and every one of its fields are private to `engine`, and
-//! `bloch-pos-node` has no `[lib]` target — only a `[[bin]]`. An integration
-//! test in `tests/` therefore cannot reach `ingest` at all, and the only
-//! alternative is to reimplement the replay loop against the public committee
-//! API. That would measure the reimplementation: no `forkchoice_head`, no
-//! `advance` retry loop, no `path_to_canonical` — three of the costs under
+//! `Engine` and every one of its fields are private to `engine`. The public node
+//! library deliberately exposes protocol parser seams for fuzzing, not engine
+//! internals, so an integration test in `tests/` cannot reach `ingest` at all.
+//! The only alternative would be to reimplement the replay loop against the
+//! public committee API. That would measure the reimplementation: no
+//! `forkchoice_head`, no `advance` retry loop, no `path_to_canonical` — three of the costs under
 //! investigation. A CHILD module of `engine` sees its parent's private items,
 //! so this file drives the real thing and **nothing in production code had to
 //! be made more visible for it**. It costs one `#[cfg(test)] mod` line in
@@ -48,7 +48,7 @@
 //!
 //! ```text
 //! cargo test --release -p bloch-pos-node --features perf-timing \
-//!     --bin bloch-pos replay_bench -- --ignored --nocapture --test-threads=1
+//!     --lib replay_bench -- --ignored --nocapture --test-threads=1
 //! ```
 //!
 //! Without `--features perf-timing` the same test runs and reports wall time

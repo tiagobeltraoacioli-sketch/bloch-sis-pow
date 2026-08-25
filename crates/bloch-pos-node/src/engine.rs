@@ -106,7 +106,7 @@ pub(crate) const ENGINE_EVENT_QUEUE_CAP: usize = 128;
 /// Validating a block can be expensive. Draining until the channel is empty
 /// would let a steady remote stream postpone attestations and proposals
 /// indefinitely even when ingress memory is bounded.
-const MAX_ENGINE_EVENTS_PER_TICK: usize = 32;
+const MAX_ENGINE_EVENTS_PER_TICK: usize = 4;
 
 /// Which transport the node runs.
 ///

@@ -161,11 +161,9 @@ jobs:
   # shallow input. NOT a coverage-exhausting campaign (that runs continuously in
   # OSS-Fuzz — see fuzz/oss-fuzz/). Non-blocking.
   #
-  # GENESIS-3 SCOPE. Every target below (block_parse, tx_parse, sha256d_pow,
-  # ghostdag_order, sig_verify) is a Genesis-3 surface. The Genesis-4 parser and
-  # P2P surfaces in bloch-pos-node have NO fuzz targets. That is a real gap in
-  # coverage of the live chain, and writing the harness is the work that closes
-  # it — not relabelling these.
+  # The g4_* targets link against the live Genesis-4 node library and exercise
+  # its envelope, RPC, and libp2p directed-sync decoder surfaces. The legacy
+  # targets remain here for opening-ledger and shared-crypto coverage.
   fuzz-smoke:
     name: cargo-fuzz smoke (report-only)
     runs-on: ubuntu-latest
@@ -180,7 +178,7 @@ jobs:
           cargo install cargo-fuzz --locked
       - name: fuzz smoke (priority surfaces)
         run: |
-          for t in block_parse tx_parse sha256d_pow ghostdag_order sig_verify; do
+          for t in block_parse tx_parse sha256d_pow ghostdag_order sig_verify g4_codec g4_rpc g4_p2p_sync; do
             echo "== fuzz smoke: $t =="
             cargo +nightly fuzz run "$t" -- -max_total_time=20 -runs=100000
           done

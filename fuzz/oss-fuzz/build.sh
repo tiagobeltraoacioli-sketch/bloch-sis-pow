@@ -28,6 +28,9 @@ TARGETS=(
   pow_decode
   ghostdag_order
   sig_verify
+  g4_codec
+  g4_rpc
+  g4_p2p_sync
 )
 
 for target in "${TARGETS[@]}"; do

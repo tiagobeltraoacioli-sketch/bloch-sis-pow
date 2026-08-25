@@ -2,44 +2,27 @@
 
 //! # bloch-pos-committee
 //!
-//! > **PROSE PARTIALLY SUPERSEDED — 2026-08-11 (PMO ruling; APIs unaffected).**
-//! > The description below was written against the **sampled** committee
-//! > design (128 per epoch + 8 per slot), which finding F1 replaced with a
-//! > **partition** of the active set — see `committees.rs`, which is the
-//! > current design and its own rationale. Under the partition, every active
-//! > validator serves in exactly one slot committee per epoch, and one
-//! > attestation does both jobs: its slot's fork-choice weight and its
-//! > epoch's justification vote. The sampled draw ([`slot_subcommittee`],
-//! > [`epoch_committee`], `sample::*`) remains in-tree as the record of the
-//! > analysis and for the sortition machinery it shares with the proposer
-//! > draw; it is not the committee mechanism the node composes.
+//! The committee layer of the live Genesis-4 proof-of-stake node.
 //!
-//! The committee layer of the Proof-of-Stake migration design
-//! (`docs/specs/BLOCH-POS-SHA3-LATTICE-MIGRATION.md`, §6.5.2):
-//!
-//! - a **per-slot subcommittee** (8 validators) whose only job is to give
-//!   LMD-GHOST its fork-choice weight between epoch boundaries;
-//! - an **epoch committee** (128 validators) that votes once per epoch for
-//!   justification and finality.
+//! Active validators are deterministically partitioned across an epoch's slot
+//! committees — see [`committees`]. Every active validator serves in exactly
+//! one slot committee per epoch, and its attestation supplies both that slot's
+//! LMD-GHOST weight and the epoch's justification vote. The older sampled
+//! helpers ([`slot_subcommittee`], [`epoch_committee`], `sample::*`) remain for
+//! their shared sortition machinery and audit record; they are not the
+//! committee mechanism the node composes.
 //!
 //! ## Why the split exists
 //!
-//! The hybrid ML-DSA-65 ‖ Falcon-1024 signature is ≈ 4,589 B and costs a
-//! measured 7,274,849 RV32IM instructions to verify in-circuit
-//! (`spikes/prover-cost/RESULTS.md`). Having a full committee attest every slot
-//! — the Ethereum shape — would cost 308.7 GB of signatures per year and
-//! 15.5 M proving cycles per second. Moving the full vote to the epoch boundary
-//! cuts both by 32×, but epoch-only voting leaves nothing weighting the fork
-//! choice *inside* an epoch, which makes short reorgs cheap. The small per-slot
-//! sample buys that weight back for 1/8 the per-slot cost.
+//! The deterministic partition bounds signature verification while preserving
+//! fork-choice weight throughout each epoch. It avoids both a full-validator
+//! vote every slot and an epoch-only vote with no timely fork-choice signal.
 //!
 //! ## Status
 //!
-//! **UNAUDITED. Not wired into the node.** This crate is not a member of the
-//! node workspace and is not a path-dependency of `bloch`, so the node's build
-//! and validation path are untouched — the same posture
-//! `crates/coherence-prover` takes. Activation, when it comes, is a
-//! height-gated flag day like `STATE_ROOT_ACTIVATION_HEIGHT`.
+//! **UNAUDITED. Wired into the node.** This crate is a root-workspace member and
+//! a direct dependency of `bloch-pos-node`; its transition, committee,
+//! fork-choice, and gossip logic run on the node's validation path.
 //!
 //! ## The rule this crate is written to obey
 //!

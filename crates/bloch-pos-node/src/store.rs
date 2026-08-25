@@ -255,11 +255,11 @@ fn discard_exact(r: &mut impl Read, mut len: usize) -> io::Result<bool> {
     let mut buf = [0u8; 8 * 1024];
     while len > 0 {
         let chunk_len = len.min(buf.len());
-        let n = r.read(&mut buf[..chunk_len])?;
-        if n == 0 {
-            return Ok(false);
+        match r.read_exact(&mut buf[..chunk_len]) {
+            Ok(()) => len -= chunk_len,
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(false),
+            Err(e) => return Err(e),
         }
-        len -= n;
     }
     Ok(true)
 }

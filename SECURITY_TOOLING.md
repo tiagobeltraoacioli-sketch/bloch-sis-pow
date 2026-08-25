@@ -37,9 +37,7 @@
 | **cargo-fuzz / libFuzzer** | Panics/UB/DoS on adversarial input to the P2P wire, PoW verifier, DAG ordering, signature parsing | Deep logic bugs, consensus splits | `cargo +nightly fuzz run <target>` (targets below) |
 | **proptest** | Property invariants (deterministic ordering, blue-score monotonicity, emission conservation) | Invariants nobody wrote | `cargo test` (property tests run in-suite) |
 
-**Fuzz targets** (`fuzz/fuzz_targets/`): `block_parse`, `netmsg_decode`, `handshake_decode`, `pow_decode`, `pow_verify`, `sha256d_pow`, `merkle_path`, `ghostdag_order`, `mempool_ops`, `sig_verify` — priority order: P2P deserialization (primary remote surface) → SHA-256d PoW verify → GhostDAG ordering → signature/attestation parsing. An **OSS-Fuzz** application (`fuzz/oss-fuzz/{project.yaml,build.sh,Dockerfile}`) reuses these so Google runs them continuously for free.
-
-> **Every one of those targets is a Genesis-3 surface, and Genesis-3 has stopped.** The Genesis-4 node's parsers and P2P surfaces (`crates/bloch-pos-node`) have **no fuzz targets at all**. The live chain's remote attack surface is, today, unfuzzed. Writing that harness is the work that closes the gap; relabelling the existing targets would not.
+**Fuzz targets** (`fuzz/fuzz_targets/`): `block_parse`, `netmsg_decode`, `handshake_decode`, `pow_decode`, `pow_verify`, `sha256d_pow`, `merkle_path`, `ghostdag_order`, `mempool_ops`, `sig_verify`, `g4_codec`, `g4_rpc`, `g4_p2p_sync`. The `g4_*` targets directly link the live `bloch-pos-node` library and cover its envelope/attestation decoder, bounded JSON-RPC parser/dispatcher, and libp2p directed-sync decoders. An **OSS-Fuzz** application (`fuzz/oss-fuzz/{project.yaml,build.sh,Dockerfile}`) reuses these so Google runs them continuously for free.
 
 ### The hardened-clippy gate, measured (2026-08-13)
 
