@@ -185,7 +185,11 @@ class Report:
 
     def add(self, group, item, ok, detail=""):
         self.executed += 1
-        self.rows.append((group, item, "PASS" if ok else "FAIL", detail))
+        st = "PASS" if ok else "FAIL"
+        self.rows.append((group, item, st, detail))
+        # Stream it: the cargo gates take tens of minutes and a report that
+        # only exists at the end is a report nobody can supervise.
+        print(f"[{st}] {item}  --  {detail}", file=sys.stderr, flush=True)
         return ok
 
     def note(self, group, item, detail):
@@ -794,11 +798,9 @@ def check_cargo(root: Path, rep: Report, present, target_dir):
             f"{total_run} run, {total_ok} ok, {total_failed} failed, {secs:.0f}s")
     rep.note("F. workspace", "workspace test count (default, no --include-ignored)", str(total_run))
 
-    pr, secs = run(["cargo", "test", "--workspace", "--",
-                    "--include-ignored", "-Z", "unstable-options", "--format", "json"],
-                   root, env, timeout=10800)
-    s, o, f, _ = parse_libtest_json(pr.stdout)
-    rep.note("F. workspace", "workspace test count (--include-ignored)", f"{s} run, {o} ok, {f} failed, {secs:.0f}s")
+    # NOT re-run with --include-ignored here: the five suites above already
+    # ran theirs that way, and a second workspace-wide sweep re-does every
+    # 452,726-leaf benchmark for a number no gate reads.
 
 
 # ──────────────────────────────────── main ──────────────────────────────────
