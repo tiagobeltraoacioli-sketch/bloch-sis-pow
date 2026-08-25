@@ -70,6 +70,37 @@ pub enum NetEvent {
     Transaction(bloch_pos_committee::transition::PosTransaction),
 }
 
+impl NetEvent {
+    /// Conservative heap reservation for an event queued at the engine.
+    ///
+    /// `wire_bytes` accounts for the payload retained by the decoded event.
+    /// A block also allocates the two vector backing stores whose metadata is
+    /// not present in the wire format. Transactions may have several nested
+    /// vector-backed witnesses, so reserve their bounded metadata separately.
+    fn queue_bytes(&self, wire_bytes: usize) -> usize {
+        const TRANSACTION_METADATA_RESERVATION: usize = 2 * 1024 * 1024;
+
+        let metadata = match self {
+            NetEvent::Block(env) => env
+                .body
+                .transactions
+                .capacity()
+                .saturating_mul(std::mem::size_of::<Vec<u8>>())
+                .saturating_add(
+                    env.body
+                        .attestations
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<Attestation>()),
+                ),
+            NetEvent::Attestation(_, _) => 0,
+            NetEvent::Transaction(_) => TRANSACTION_METADATA_RESERVATION,
+        };
+        wire_bytes
+            .saturating_add(metadata)
+            .saturating_add(std::mem::size_of::<NetEvent>())
+    }
+}
+
 /// The transport the engine holds. One of two, chosen at startup.
 pub enum Net {
     Devnet(DevnetMesh),
@@ -138,14 +169,18 @@ const SYNC_FANOUT: usize = 2;
 /// down.
 const SYNC_PAGE_BLOCKS: usize = 512;
 
-/// Network events queued for the engine before the transport starts shedding.
+/// Network bytes queued for the engine before the transport starts shedding.
 ///
 /// The engine consumes one channel on one thread, and during replay it does not
 /// consume at all — replay is hours at Genesis-4's state size. An unbounded
 /// queue in front of a consumer that is asleep is just a slower way to run out
 /// of memory. Blocks and attestations are both recoverable (asked for again,
 /// gossiped again), so shedding beats dying.
-const ENGINE_QUEUE_CAP: usize = 4096;
+///
+/// Every accepted transport frame is capped at 8 MiB. The byte budget lets a
+/// normal page of small blocks through while limiting a peer sending maximum
+/// frames to a bounded share of validator memory.
+pub(crate) const ENGINE_QUEUE_BYTE_CAP: usize = 32 * 1024 * 1024;
 
 const INBOUND_QUEUE_DEPTH: usize = 256;
 
@@ -193,6 +228,23 @@ impl DevnetMesh {
     }
 }
 
+/// The result of trying to hand an event to the engine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IngressOutcome {
+    Queued,
+    Shed,
+    Closed,
+}
+
+fn reserve_engine_bytes(inflight: &std::sync::atomic::AtomicUsize, bytes: usize) -> bool {
+    bytes <= ENGINE_QUEUE_BYTE_CAP
+        && inflight
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes).filter(|total| *total <= ENGINE_QUEUE_BYTE_CAP)
+            })
+            .is_ok()
+}
+
 /// Hand one network event to the engine, or drop it if the engine is behind.
 ///
 /// The engine consumes on a single thread, and during replay it does not
@@ -205,21 +257,33 @@ impl DevnetMesh {
 /// attestation is re-gossiped by its author's next broadcast. Losing one costs
 /// a round trip. Keeping all of them costs the process.
 ///
-/// Returns false when the engine is gone, so callers can stop their thread.
-fn send_to_engine(
-    events: &Sender<EngineEvent>,
+/// The caller supplies the encoded size so the reservation follows the actual
+/// allocation rather than an arbitrary event count. The bounded engine channel
+/// is a second, independent ceiling.
+pub(crate) fn send_to_engine(
+    events: &SyncSender<EngineEvent>,
     inflight: &Arc<std::sync::atomic::AtomicUsize>,
     ev: NetEvent,
-) -> bool {
-    if inflight.load(Ordering::Acquire) >= ENGINE_QUEUE_CAP {
-        return true; // shed, but the connection stays healthy
+    wire_bytes: usize,
+) -> IngressOutcome {
+    let reserved = ev.queue_bytes(wire_bytes);
+    if !reserve_engine_bytes(inflight, reserved) {
+        return IngressOutcome::Shed;
     }
-    inflight.fetch_add(1, Ordering::AcqRel);
-    if events.send(EngineEvent::Net(ev)).is_err() {
-        inflight.fetch_sub(1, Ordering::AcqRel);
-        return false;
+    match events.try_send(EngineEvent::Net {
+        event: ev,
+        ingress_bytes: reserved,
+    }) {
+        Ok(()) => IngressOutcome::Queued,
+        Err(TrySendError::Full(_)) => {
+            inflight.fetch_sub(reserved, Ordering::AcqRel);
+            IngressOutcome::Shed
+        }
+        Err(TrySendError::Disconnected(_)) => {
+            inflight.fetch_sub(reserved, Ordering::AcqRel);
+            IngressOutcome::Closed
+        }
     }
-    true
 }
 
 pub fn block_frame(env: &BlockEnvelope) -> Vec<u8> {
@@ -353,7 +417,7 @@ pub fn start(
     bind_addr: &str,
     listen_port: u16,
     peer_addrs: Vec<String>,
-    events: Sender<EngineEvent>,
+    events: SyncSender<EngineEvent>,
     data_dir: PathBuf,
     head_slot: Arc<AtomicU64>,
     inflight: Arc<std::sync::atomic::AtomicUsize>,
@@ -406,7 +470,10 @@ pub fn start(
                             if frame.first() == Some(&FRAME_GET_BLOCKS) {
                                 serve_get_blocks(&wsock, &data_dir, &frame);
                             } else if let Some(ev) = decode_event(&frame) {
-                                if !send_to_engine(&events, &inflight, ev) {
+                                if matches!(
+                                    send_to_engine(&events, &inflight, ev, frame.len()),
+                                    IngressOutcome::Closed
+                                ) {
                                     return;
                                 }
                             }
@@ -447,7 +514,10 @@ pub fn start(
                     match read_frame(&mut rsock) {
                         Ok(frame) => {
                             if let Some(ev) = decode_event(&frame) {
-                                if !send_to_engine(&events, &inflight, ev) {
+                                if matches!(
+                                    send_to_engine(&events, &inflight, ev, frame.len()),
+                                    IngressOutcome::Closed
+                                ) {
                                     return;
                                 }
                             }
@@ -537,4 +607,18 @@ pub fn start(
     }
 
     Ok(DevnetMesh { peers, inbound })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ingress_byte_budget_is_strict() {
+        let inflight = std::sync::atomic::AtomicUsize::new(0);
+        assert!(reserve_engine_bytes(&inflight, ENGINE_QUEUE_BYTE_CAP));
+        assert_eq!(inflight.load(Ordering::Acquire), ENGINE_QUEUE_BYTE_CAP);
+        assert!(!reserve_engine_bytes(&inflight, 1));
+        assert_eq!(inflight.load(Ordering::Acquire), ENGINE_QUEUE_BYTE_CAP);
+    }
 }
