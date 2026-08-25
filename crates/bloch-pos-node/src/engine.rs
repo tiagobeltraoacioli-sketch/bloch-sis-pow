@@ -90,9 +90,23 @@ use crate::store::Store;
 /// state — rather than from a copy kept alongside it — is why this wrapper
 /// exists; see [`crate::rpc::EngineBackend`].
 pub enum EngineEvent {
-    Net(NetEvent),
+    Net {
+        event: NetEvent,
+        ingress_bytes: usize,
+    },
     Rpc(RpcCall),
 }
+
+/// Number of external events awaiting the consensus thread, independently of
+/// the byte budget enforced by `net::send_to_engine`.
+const ENGINE_EVENT_QUEUE_CAP: usize = 128;
+
+/// Process a bounded batch before returning to slot-duty scheduling.
+///
+/// Validating a block can be expensive. Draining until the channel is empty
+/// would let a steady remote stream postpone attestations and proposals
+/// indefinitely even when ingress memory is bounded.
+const MAX_ENGINE_EVENTS_PER_TICK: usize = 32;
 
 /// Which transport the node runs.
 ///
@@ -2115,6 +2129,39 @@ impl Engine {
 /// that the log of a multi-hour replay stays readable.
 const REPLAY_PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
+fn process_engine_event(
+    engine: &mut Engine,
+    ev: EngineEvent,
+    wall_epoch: u64,
+    inflight: &std::sync::atomic::AtomicUsize,
+) {
+    match ev {
+        EngineEvent::Net {
+            event,
+            ingress_bytes,
+        } => {
+            match event {
+                NetEvent::Block(env) => engine.ingest(env),
+                NetEvent::Attestation(att, origin) => engine.on_attestation(att, origin, wall_epoch),
+                NetEvent::Transaction(tx) => {
+                    // Gossip has nobody to answer to; the verdict is the RPC's
+                    // concern, not a peer's.
+                    let _ = engine.on_transaction(tx);
+                }
+            }
+            // Release only after processing. The reservation covers both
+            // queued work and the event currently being validated.
+            inflight.fetch_sub(ingress_bytes, std::sync::atomic::Ordering::AcqRel);
+        }
+        EngineEvent::Rpc(call) => {
+            let result = engine.serve_rpc(call.req);
+            // A client that hung up between asking and being answered is normal,
+            // not an error worth logging.
+            let _ = call.reply.send(result);
+        }
+    }
+}
+
 pub fn run(cfg: Config) -> io::Result<()> {
     let (mut manifest, digest) = Manifest::load(&cfg.genesis_path)?;
 
@@ -2213,28 +2260,12 @@ pub fn run(cfg: Config) -> io::Result<()> {
 
     let logged = store.read_all()?;
     let head_slot = Arc::new(AtomicU64::new(0));
-    // Network events queued but not yet handled. The transport reads it to
-    // decide when to shed rather than queue — see `net::send_to_engine`. It is
-    // decremented below, after each event is actually processed, so "in flight"
-    // means exactly that and not "ever sent".
+    // Network bytes queued or being handled by the engine. Both transports
+    // reserve this before enqueueing and shed when the finite budget is full.
+    // It is decremented only after processing, so the budget includes expensive
+    // validation already underway as well as replay-time backlog.
     let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let (tx, rx) = mpsc::channel::<EngineEvent>();
-    // The transports speak NetEvent and know nothing about the RPC; the engine
-    // consumes one channel. Rather than teach both transports the engine's
-    // event type — coupling the network layer to a queue it has no business
-    // knowing about — a forwarder wraps their events on the way in. One thread
-    // and one hop, and each side keeps the shape it was designed with.
-    let (net_tx, net_rx) = mpsc::channel::<NetEvent>();
-    {
-        let tx = tx.clone();
-        std::thread::spawn(move || {
-            for ev in net_rx {
-                if tx.send(EngineEvent::Net(ev)).is_err() {
-                    return; // engine gone; nothing left to deliver to
-                }
-            }
-        });
-    }
+    let (tx, rx) = mpsc::sync_channel::<EngineEvent>(ENGINE_EVENT_QUEUE_CAP);
     let net = match cfg.transport {
         Transport::Devnet => net::Net::Devnet(net::start(
             &cfg.listen_addr,
@@ -2270,8 +2301,9 @@ pub fn run(cfg: Config) -> io::Result<()> {
                     max_peers: cfg.max_peers,
                     behind_proxy: cfg.behind_proxy,
                 },
-                net_tx,
+                tx.clone(),
                 head_slot.clone(),
+                inflight.clone(),
             )?;
             println!("p2p: node identity {}", handle.peer_id);
             net::Net::Libp2p(handle)
@@ -2549,34 +2581,11 @@ pub fn run(cfg: Config) -> io::Result<()> {
         let wait = next_deadline.saturating_sub(now_ms()).clamp(1, 500);
         match rx.recv_timeout(Duration::from_millis(wait)) {
             Ok(ev) => {
-                let mut pending = vec![ev];
-                while let Ok(more) = rx.try_recv() {
-                    pending.push(more);
-                }
-                for ev in pending {
-                    // Every `EngineEvent::Net` was counted into `inflight` by
-                    // the transport; releasing it here — after handling, not on
-                    // dequeue — is what makes the cap mean "work the engine has
-                    // not done yet".
-                    if matches!(ev, EngineEvent::Net(_)) {
-                        inflight.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-                    }
-                    match ev {
-                        EngineEvent::Net(NetEvent::Block(env)) => engine.ingest(env),
-                        EngineEvent::Net(NetEvent::Attestation(att, origin)) => {
-                            engine.on_attestation(att, origin, wall_epoch)
-                        }
-                        EngineEvent::Net(NetEvent::Transaction(tx)) => {
-                            // Gossip has nobody to answer to; the verdict is the
-                            // RPC's concern, not a peer's.
-                            let _ = engine.on_transaction(tx);
-                        }
-                        EngineEvent::Rpc(call) => {
-                            let result = engine.serve_rpc(call.req);
-                            // A client that hung up between asking and being
-                            // answered is normal, not an error worth logging.
-                            let _ = call.reply.send(result);
-                        }
+                process_engine_event(&mut engine, ev, wall_epoch, &inflight);
+                for _ in 1..MAX_ENGINE_EVENTS_PER_TICK {
+                    match rx.try_recv() {
+                        Ok(ev) => process_engine_event(&mut engine, ev, wall_epoch, &inflight),
+                        Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
                     }
                 }
             }
