@@ -984,8 +984,15 @@ def check_cargo(root: Path, rep: Report, present, target_dir, release=True):
                 rep.add(g, rel, True, detail + f"; all {len(required)} pinned test(s) ran")
 
     # 2. the tripwire must run, by name, and report exactly one test.
+    # NOT `--exact`: libtest matches the FULL path, and the tripwire's is
+    # `tests::leaked_roster_armed_epoch_matches_the_runbook` (transition.rs
+    # line 3388 opens `mod tests`). `--exact` with the bare function name
+    # matched nothing and the gate reported "ran 0" against a test that is
+    # present and green. Substring filter plus the name check below is both
+    # correct and stricter: it proves a test whose name ENDS with the tripwire
+    # actually started, rather than trusting cargo's exit code.
     cmd = ["cargo", "test", "-p", "bloch-pos-committee", "--lib", *opt, TRIPWIRE, "--",
-           "--exact", "--include-ignored", "-Z", "unstable-options", "--format", "json"]
+           "--include-ignored", "-Z", "unstable-options", "--format", "json"]
     pr, secs = run(cmd, root, env)
     started, ok, failed, names = parse_libtest_json(pr.stdout)
     matched = [n for n in names if n.endswith(TRIPWIRE)]
