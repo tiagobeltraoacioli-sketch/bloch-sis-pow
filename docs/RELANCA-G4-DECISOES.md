@@ -349,3 +349,78 @@ And a scope note worth keeping, because it changed what a headline number
 meant: `#[ignore]`d tests are NOT in a plain `cargo test` run. A suite reported
 as "550 passed" never included the ignored performance tests. That is scope, not
 fraud — but it was read as though the benchmark had passed, and it had not run.
+
+## 16. POST-RELAUNCH MERGE HAZARD — read before merging perf with the ballast work
+
+Not for the relaunch. Written down now because it is the kind of finding that
+evaporates and then costs a network.
+
+**The worst possible geometry for a consensus mistake.** Measured with
+`git merge-tree`:
+
+```
+state_root.rs   ZERO conflict hunks
+engine.rs       1 conflict, only at end of file (test modules)
+transition.rs   3 conflicts, ALL inside compute_root
+```
+
+The single file that conflicts is NOT the file that defines the leaves. Whoever
+merges sees conflicts in one place, resolves by taking a whole side, and
+silently drops the ballast branch's field bindings — with no marker anywhere in
+the file that defines them.
+
+**Both naive resolutions of `compute_root` are wrong, and asymmetrically:**
+
+- Taking PERF's line (`state_root_with_eutxo_tree(..., tree())` replacing
+  `state_root_with_eutxo_leaves(..., leaves())`) silently discards two committed
+  columns — `TAG_WRITTEN_OFF` and `TAG_STAKE_LOW_WATER`. **Consensus divergence
+  with no compile error.**
+- Taking BALLAST's line does not compile, because it calls a function PERF
+  deleted.
+
+One fails loudly, the other fails silently. Anyone resolving toward the side
+that compiles will believe they got it right.
+
+**The correct resolution is unambiguous:** both of the ballast branch's fields
+in the `ConsensusState` literal, PLUS perf's new callee. Never a whole side.
+
+**Confirm these two tests survive the merge BEFORE running anything** — they are
+what catches a wrong resolution, and a bad merge deletes the safety net along
+with the guard:
+- `every_component_field_is_load_bearing` (`state_root.rs:2107`, extended
+  `:2205-2220`)
+- `pre_gate_roots_are_byte_identical_to_the_ungated_code`
+
+**A comment that becomes a lie on merge:** the ballast branch's `params.rs`
+documents its gate as "the same idiom as `LEAKED_ROSTER_ACTIVATION_EPOCH` just
+above" — meaning `u64::MAX`. After the merge the one above is 1400, so the
+comment is false. A comment that lies about a consensus gate is the category
+that bit us three times in one day.
+
+**The tripwire behaves correctly here:** perf renamed it asserting `== 1400`,
+ballast kept the old one asserting `== u64::MAX`. Resolving toward ballast
+leaves `u64::MAX` asserted against `params.rs = 1400` and the suite fails loudly,
+by design. Keep both tests.
+
+**Correction to something stated repeatedly, including by me:** the incremental
+part is the **eUTXO subtree** (`EutxoSet.tree: Smt`), not the state root. Every
+non-eUTXO component is rebuilt from scratch on every call, on both sides. That
+is good news and it retires a risk raised earlier: since the incremental path
+and the full path are THE SAME FUNCTION, a replaying node and an updating node
+cannot disagree. The 22.2x still stands; the mechanism was described wrongly.
+
+**Residue to watch:** the ballast branch's new `remove` calls exercise perf's
+`node_remove` and `collapse`, which did not exist in the base — new volume and
+new shapes over `collapse`, whose fold-depth arithmetic has a margin of a single
+test.
+
+**An open question nobody has examined:** `params.rs` merges cleanly, 1400 on
+one side and `u64::MAX` on the other with no line overlap — but nobody has
+checked whether the two flag days INTERACT: ordering between them, and a roster
+moving under a ballasted-bonus write-off.
+
+**Confirmed false positives** (do not spend time on them): `lmd_ghost_head` does
+not collide (the ballast hunks land in `admissible`'s doc comment; the function
+is byte-identical to base); `perf.rs` has empty intersection; `staking.rs` has
+empty intersection; the eUTXO mutation sites all go through `insert`/`remove`,
+which move `entries` and `tree` together.
