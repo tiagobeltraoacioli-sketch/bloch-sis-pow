@@ -207,6 +207,37 @@ pub const MIN_QUORUM_DENOMINATOR_DEN: u128 = 2;
 /// armed and inert halves produced an identical 143 blocks before the
 /// boundary, neither forked, and only the armed half's slot occupancy moved
 /// after it (68.1% -> 72.8%).
+///
+/// # Where 1400 actually comes from — it is NOT the runbook's formula
+///
+/// An earlier version of this comment said the armed value "was produced by
+/// that runbook". **That was false**, and it is corrected here rather than
+/// quietly dropped, because a comment that misstates the provenance of a
+/// consensus flag day is the same category of defect this file keeps paying
+/// for.
+///
+/// The runbook's formula is `E = round_up_100(epoch_at_tag + 900)`. Armed at
+/// epoch 909, that gives **1900**; the runbook's own worked example gives 1600;
+/// the runbook never mentions 1400 anywhere. The armed value is 500 epochs —
+/// 5.6 days — below the formula.
+///
+/// It was chosen deliberately by the integration coordinator, and this is the
+/// reasoning that should have been written down beside it at the time. The
+/// runbook's 900 decomposes as 270 rollout (12 boxes x ~6 h of replay) + 90
+/// soak + 180 decision + ~360 contingency. **The rollout term is obsolete**:
+/// with replay down to ~7 minutes, rolling the fleet is about an hour — roughly
+/// 4 epochs, not 270. So the real requirement is on the order of 274 epochs and
+/// 1400 leaves 491 of margin, close to double.
+///
+/// **Do not "fix" the constant to match the formula.** Changing it is a flag
+/// day across 64 nodes; the margin is sufficient on the argument above. Fix the
+/// runbook instead: its rollout term must be derived from measured replay cost,
+/// not held fixed at days.
+///
+/// Note what the tripwire can and cannot do. It compares this constant against
+/// a literal `1400` in the test source — a copy of itself. That catches a
+/// SILENT change of the epoch. It cannot catch the epoch having been wrong from
+/// the start, which is exactly what happened here and why this note exists.
 pub const LEAKED_ROSTER_ACTIVATION_EPOCH: u64 = 1400;
 
 /// Flag-day epoch at which the deduplicated transfer format (`TransferV2`,

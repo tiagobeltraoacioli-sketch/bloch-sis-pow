@@ -424,3 +424,17 @@ not collide (the ballast hunks land in `admissible`'s doc comment; the function
 is byte-identical to base); `perf.rs` has empty intersection; `staking.rs` has
 empty intersection; the eUTXO mutation sites all go through `insert`/`remove`,
 which move `entries` and `tree` together.
+
+## 17. Two suites that run nothing, and a claim that never measured anything
+
+`replay_hotpath_perf` (6 of 6) and `replay_bench` (3 of 3) are **entirely
+`#[ignore]`d**. Run the way a reviewer runs them, they report `ok` having
+executed nothing at all. Two whole suites, not a few stray tests.
+
+**Any performance claim from this project needs an explicit
+`--include-ignored`, or it measured nothing.** That includes the 22.2x number
+whenever it is re-verified.
+
+Related, and the reason this matters beyond bookkeeping: a suite reported as
+"550 passed" never included the performance tests. Nobody lied; everybody read
+it as though the benchmark had passed.
