@@ -98,7 +98,7 @@ def main():
                 break
         want = label.replace("cap", "")
         ok = ("UNBOUNDED" in mode) if label == "unbounded" else \
-             (f"at most {want} events" in mode)
+             (f"at most {want} event" in mode)
         if not ok:
             print(f"!! {base}: knob did NOT apply (mode line: {mode!r}) — run VOID")
             continue
