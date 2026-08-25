@@ -660,6 +660,13 @@ impl Handle {
         // after the frame has been moved across a channel and after the engine
         // has been told nothing went wrong. Refusing it at the call the engine
         // makes is the difference between a diagnosis and a mystery.
+        // An empty frame has no type byte to route on and is discarded by the
+        // swarm with a bare `return` — the same silent shape this work package
+        // exists to remove. Refused here, where the engine can be told.
+        if frame.is_empty() {
+            self.drops.note_malformed();
+            return false;
+        }
         let publishes_to_gossip = matches!(
             frame.first(),
             Some(&crate::net::FRAME_BLOCK)
@@ -675,7 +682,16 @@ impl Handle {
             );
             return false;
         }
-        if self.cmd.send(Command::Broadcast(frame.clone())).is_err() {
+        // No clone on the success path. `UnboundedSender::send` hands the
+        // value back inside `SendError` when it fails, so the failure branch
+        // gets the frame for free — cloning to keep one for the error message
+        // would put a second full copy of every block (up to MAX_GOSSIP_BYTES)
+        // on the hot path, and the swarm side already pays one `to_vec` when it
+        // publishes.
+        if let Err(e) = self.cmd.send(Command::Broadcast(frame)) {
+            let Command::Broadcast(frame) = e.0 else {
+                unreachable!("we just sent a Broadcast")
+            };
             self.drops.lost(prov, &frame, "the p2p swarm thread is gone", 0);
             return false;
         }
