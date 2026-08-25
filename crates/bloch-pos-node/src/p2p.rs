@@ -1055,9 +1055,9 @@ async fn run_swarm(
     }
 }
 
-fn reserve_broadcast_bytes(inflight: &AtomicUsize, bytes: usize) -> bool {
+fn reserve_broadcast_bytes(total_queued: &AtomicUsize, bytes: usize) -> bool {
     bytes <= BROADCAST_QUEUE_BYTE_CAP
-        && inflight
+        && total_queued
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(bytes).filter(|total| *total <= BROADCAST_QUEUE_BYTE_CAP)
             })

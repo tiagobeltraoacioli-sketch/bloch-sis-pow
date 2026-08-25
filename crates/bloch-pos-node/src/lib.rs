@@ -2,7 +2,7 @@
 
 //! # bloch-pos — the Genesis-4 node library and CLI
 //!
-//! This binary runs the live proof-of-stake mainnet. It called itself a
+//! This crate powers the live proof-of-stake mainnet. It called itself a
 //! devnet-stage build until 2026-08-14 — which was true when written and
 //! false the moment Genesis-4 launched, and it was the first line anyone
 //! evaluating the software read.
@@ -26,7 +26,7 @@
 //! signatures are hybrid PQ regardless), no peer persistence or peer
 //! exchange, no deposits/exits, no slashing-evidence pipeline, no
 //! checkpoint-sync **state download** (the weak-subjectivity boot gate itself
-//! IS wired — `ws_boot`), no peer persistence or peer exchange. JSON-RPC and
+//! IS wired — `ws_boot`). JSON-RPC and
 //! mainnet genesis-manifest support are implemented; see the module docs of
 //! `engine`, `net`, `p2p`, `rpc`, `store`, `ws_boot` for each boundary at its
 //! site.
