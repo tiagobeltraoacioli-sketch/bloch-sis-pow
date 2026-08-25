@@ -223,6 +223,20 @@ impl FinalityState {
         false
     }
 
+    /// The quorum floor fraction. The shipped constants unless a test is
+    /// measuring what a different floor would cost; see `FLOOR_OVERRIDE`.
+    /// Constant-folds to the constants in a release build.
+    #[inline]
+    fn quorum_floor_fraction() -> (u128, u128) {
+        #[cfg(test)]
+        {
+            if let Some(f) = tests_hook::FLOOR_OVERRIDE.with(std::cell::Cell::get) {
+                return f;
+            }
+        }
+        (MIN_QUORUM_DENOMINATOR_NUM, MIN_QUORUM_DENOMINATOR_DEN)
+    }
+
     /// Mutation switch: reproduce the PRE-FIX accumulator, which had exactly
     /// one write path and never came back down. Same purpose as
     /// [`Self::denominator_floor_disabled`]. Constant `false` in a release
@@ -292,7 +306,8 @@ impl FinalityState {
             // 2026-08-24, kept runnable so the incident stays reproducible.
             leak_adjusted
         } else {
-            let floor = unleaked_total * MIN_QUORUM_DENOMINATOR_NUM / MIN_QUORUM_DENOMINATOR_DEN;
+            let (num, den) = Self::quorum_floor_fraction();
+            let floor = unleaked_total * num / den;
             leak_adjusted.max(floor)
         };
 
@@ -1180,6 +1195,107 @@ mod tests {
         );
     }
 
+    /// **How much of the fleet must come back before finality does — the
+    /// price of the quorum floor, measured on the partition we actually
+    /// had.**
+    ///
+    /// THIS IS RECORDED DATA, NOT A RULE. The shipped floor is
+    /// `MIN_QUORUM_DENOMINATOR_NUM/DEN = 1/2`, chosen by the founder on
+    /// 2026-08-25 with the residual in front of him: 1/2 puts the minimum
+    /// recovering fraction at 1/3, which admits up to three pairwise-disjoint
+    /// justifying sets and therefore does NOT make the justified root unique.
+    /// He took liveness over uniqueness. This test does not argue with that
+    /// and does not change it — it exists so that if the question is ever
+    /// reopened, the cost of the other answer is a number he can read rather
+    /// than an argument he has to referee.
+    ///
+    /// The scenario is the relaunch: start from the leak the 2026-08-24
+    /// partition actually accrued, bring `k` of the 64 validators back, and
+    /// ask the smallest `k` for which finality returns.
+    #[test]
+    fn how_much_of_the_fleet_must_return_before_finality_does() {
+        let committee: Vec<Validator> = (0..64u32).map(|i| validator(i, STAKE_EACH)).collect();
+        let inherited = mainnet_leak_after(56);
+
+        // Smallest k in 1..=64 whose return restores finality within 200
+        // epochs, under a given floor. Validators 0..4 are the ones that
+        // never leaked — the partition's own group — so they come back first,
+        // which is the realistic and the FAVOURABLE ordering for recovery.
+        let smallest_k_that_heals = |num: u128, den: u128| -> Option<u32> {
+            for k in 1..=64u32 {
+                tests_hook::FLOOR_OVERRIDE.with(|c| c.set(Some((num, den))));
+                let mut st = FinalityState::new(genesis());
+                st.leaked = inherited.clone();
+                let mut healed = false;
+                for e in 1..=200u64 {
+                    let src = st.current_justified();
+                    let atts: Vec<(u32, AttestationData)> =
+                        (0..k).map(|v| vote(v, e, root((e % 251) as u8), src)).collect();
+                    let out = st
+                        .process_epoch(&EpochVotes {
+                            epoch: e,
+                            active_set: &committee,
+                            attestations: &atts,
+                        })
+                        .unwrap();
+                    if out.finalized.is_some() {
+                        healed = true;
+                        break;
+                    }
+                }
+                tests_hook::FLOOR_OVERRIDE.with(|c| c.set(None));
+                if healed {
+                    return Some(k);
+                }
+            }
+            None
+        };
+
+        let half = smallest_k_that_heals(1, 2).expect("1/2 must heal for some k");
+        let three_quarters = smallest_k_that_heals(3, 4).expect("3/4 must heal for some k");
+
+        // The shipped rule must be the more permissive one, or the constant
+        // and this measurement disagree about what 1/2 means.
+        assert!(
+            half < three_quarters,
+            "a lower floor must not require MORE of the fleet to return ({half} vs \
+             {three_quarters}) — the algebra or the implementation is wrong"
+        );
+        assert_eq!(
+            (MIN_QUORUM_DENOMINATOR_NUM, MIN_QUORUM_DENOMINATOR_DEN),
+            (1, 2),
+            "the shipped floor is the founder's 1/2 (2026-08-25); this test measures \
+             alternatives, it does not install them"
+        );
+
+        println!(
+            "PRICE OF THE FLOOR, on the partition of 2026-08-24 (60 of 64 leaked to zero):\n  \
+             floor 1/2 (SHIPPED, founder's decision): finality returns once {half} of 64 \
+             validators are back ({:.1}% of stake)\n  \
+             floor 3/4 (measured, NOT shipped):       finality returns once \
+             {three_quarters} of 64 validators are back ({:.1}% of stake)\n  \
+             So between {half} and {} returning validators, 1/2 heals the chain and 3/4 \
+             does not. Below {half}, neither does.",
+            half as f64 / 64.0 * 100.0,
+            three_quarters as f64 / 64.0 * 100.0,
+            three_quarters - 1
+        );
+
+        // And the fact that decides the relaunch either way: the group that
+        // was actually live during the partition — 4 of 64 — heals under
+        // NEITHER floor. The relaunch does not depend on the floor; it
+        // depends on validators coming back.
+        assert!(
+            half > 4,
+            "4 of 64 healed the chain on its own — then the floor is not blocking the \
+             minority that finalized alone on 2026-08-24, and the fix does not work"
+        );
+        println!(
+            "  The 4-of-64 group that finalized alone on 2026-08-24 heals under NEITHER \
+             floor. The relaunch depends on validators returning, not on this constant."
+        );
+    }
+
     /// The leak still WORKS. Two properties that must survive the fix, or the
     /// fix has quietly turned a liveness mechanism into a no-op.
     #[test]
@@ -1546,5 +1662,11 @@ mod tests_hook {
         pub(super) static DISABLE_DENOMINATOR_FLOOR: Cell<bool> = const { Cell::new(false) };
         /// Reproduce the pre-fix accumulator: monotonic, never recovers.
         pub(super) static DISABLE_LEAK_RECOVERY: Cell<bool> = const { Cell::new(false) };
+        /// Override the quorum floor with `(num, den)`, for measuring what a
+        /// DIFFERENT floor would cost. `None` = use the shipped constants,
+        /// which are the founder's 1/2 and are what every non-measuring test
+        /// and every shipped binary reads.
+        pub(super) static FLOOR_OVERRIDE: Cell<Option<(u128, u128)>> =
+            const { Cell::new(None) };
     }
 }
