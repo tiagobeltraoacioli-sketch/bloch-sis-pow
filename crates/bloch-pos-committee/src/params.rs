@@ -308,8 +308,27 @@ pub const BLOCK_BYTES_V2_ACTIVATION_EPOCH: u64 = 800;
 /// see one is not comparing anything.
 #[cfg(test)]
 pub mod rehearsal {
-    use std::sync::atomic::AtomicBool;
-    pub static MUTATE_SEED: AtomicBool = AtomicBool::new(false);
+    use std::cell::Cell;
+
+    // THREAD-LOCAL, not `static AtomicBool`. `cargo test` runs every #[test]
+    // on its own thread inside ONE process, so a process-global seed mutation
+    // set by the A/B rehearsal is read by every other test running in
+    // parallel. That is not hypothetical: it is what made
+    // `the_new_rule_diverges_from_the_old_one_at_epoch_1_not_epoch_2` fail
+    // with `left: [6, 7, 7, 7, ...]` — a seed with one bit flipped, asserted
+    // at epoch 0 before a single block is applied — and what made
+    // `the_rule_reads_a_boundary_the_state_still_retains` fail with
+    // `Proposal(NotScheduledProposer)`, because a mutated seed draws a
+    // different proposer. Both pass under `--test-threads 1` and fail in
+    // parallel, which is the signature.
+    //
+    // The `AB_HOOKS` mutex in transition.rs serializes the A/B tests against
+    // EACH OTHER and does nothing for the tests that never take it. A
+    // per-thread cell needs no cooperation from anyone: a switch cannot reach
+    // a test that did not set it.
+    thread_local! {
+        pub static MUTATE_SEED: Cell<bool> = const { Cell::new(false) };
+    }
 }
 
 /// Domain separation tags (§6.1). Fixed 16 bytes, right-padded with zeros, so
