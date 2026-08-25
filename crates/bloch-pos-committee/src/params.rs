@@ -148,6 +148,9 @@ pub const MIN_QUORUM_DENOMINATOR_NUM: u128 = 1;
 /// Denominator of [`MIN_QUORUM_DENOMINATOR_NUM`].
 pub const MIN_QUORUM_DENOMINATOR_DEN: u128 = 2;
 
+// The owner's decision on this pair, and the residual he accepted with it, are
+// pinned in `tests::the_quorum_floor_is_the_one_the_owner_chose`.
+
 /// Flag-day epoch at which the inactivity leak starts reaching the **duty
 /// roster**, and not only the quorum denominator.
 ///

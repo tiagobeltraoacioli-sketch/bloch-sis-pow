@@ -1353,6 +1353,51 @@ mod tests {
         assert!(st.leaked_of(41) > st.leaked_of(40), "the still-absent validator must owe more");
     }
 
+    /// **The quorum floor is an OWNER'S DECISION, not an engineering default.**
+    ///
+    /// One half. Chosen by the founder on 2026-08-24, textually ("mantem 1/2"),
+    /// and re-affirmed AFTER the technical argument for three quarters and its
+    /// price were put to him.
+    ///
+    /// The residual he accepted, stated so nobody has to rediscover it: a floor
+    /// of 1/2 puts the minimum recoverable fraction at **1/3**, which admits up
+    /// to three pairwise-disjoint sets. It therefore **does NOT guarantee a
+    /// unique justified root**. Concretely, once this and leak recovery bind, a
+    /// 50/50 fleet partition becomes WORSE than today: as the leak drains the
+    /// denominator each half crosses its own quorum, justifies its own root, and
+    /// the floor is prophylactic — it does not undo them. He chose liveness over
+    /// uniqueness knowing that. Three quarters would buy uniqueness at the price
+    /// of never recovering finality from the loss of more than a quarter of the
+    /// stake.
+    ///
+    /// # Why an equality assertion here, when that form is usually weak
+    ///
+    /// Asserting a constant against a literal copy of itself does NOT catch
+    /// "right constant, wrong reader" — that is what let the roster split live,
+    /// and this test would not have found it. It is the correct tool against a
+    /// DIFFERENT failure: the silent reversal of an owner's decision by someone
+    /// who found a better answer. That happened on 2026-08-24, when the floor
+    /// was moved to 3/4 on another branch without going back to him. Do not read
+    /// this test as evidence the floor is correct; read it as evidence the floor
+    /// is his.
+    ///
+    /// Changing it requires his decision, not a better argument.
+    #[test]
+    fn the_quorum_floor_is_the_one_the_owner_chose() {
+        assert_eq!(
+            (
+                crate::params::MIN_QUORUM_DENOMINATOR_NUM,
+                crate::params::MIN_QUORUM_DENOMINATOR_DEN
+            ),
+            (1, 2),
+            "the quorum floor was changed away from the one half the founder chose on \
+             2026-08-24. That is an owner's decision about a trade-off he made knowing the \
+             residual (a 1/2 floor admits up to three disjoint justifying sets and so does \
+             NOT make the justified root unique). Take it back to him before editing this \
+             test."
+        );
+    }
+
     // ── TASK 1: zeroing the leak accumulator for the relaunch ──────────────
     //
     // SECOND LINE OF DEFENCE. Dev A's roster unification is the fix. These
