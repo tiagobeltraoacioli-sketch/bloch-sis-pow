@@ -899,50 +899,61 @@ def run(cmd, cwd, env, timeout=5400):
     return pr, time.time() - t0
 
 
-def parse_libtest_json(out: str):
-    """Return (started, ok, failed, names, failed_names) from `--format json`.
+def parse_libtest(out: str):
+    """Parse libtest's ORDINARY output. Returns (run, ok, failed, names, failed_names).
 
-    `failed_names` exists because the first executed run reported
-    "307 run, 304 ok, 1 failed" and named nothing — a verdict nobody can act
-    on. A gate that says something broke owes you which thing.
+    Deliberately NOT `--format json`. That needs `-Z unstable-options`, which
+    needs `RUSTC_BOOTSTRAP=1`, which changes the build fingerprint: every
+    artifact this script compiles is then invisible to a normal `cargo test`
+    and vice versa, so the two rebuild the workspace from scratch past each
+    other. On a shared `target` that silently invalidates other people's cache
+    too. Measured here: one alternation cost a full release rebuild of libp2p.
+
+    `run` counts tests that actually EXECUTED — `ignored` is excluded, which is
+    the whole point of this file: a suite where everything is `#[ignore]`d
+    reports `ok` having run nothing, and this must report 0, not "fine".
+
+    Counts come from the `test result:` summary lines (reliable at any
+    `--test-threads`); names come from the per-test lines and the `failures:`
+    blocks.
     """
-    started = ok = failed = 0
-    names, failed_names = [], []
-    for line in out.splitlines():
-        line = line.strip()
-        if not line.startswith("{"):
-            continue
-        try:
-            ev = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if ev.get("type") != "test":
-            continue
-        if ev.get("event") == "started":
-            started += 1
-            names.append(ev.get("name", ""))
-        elif ev.get("event") == "ok":
-            ok += 1
-        elif ev.get("event") in ("failed", "timeout"):
-            failed += 1
-            failed_names.append(ev.get("name", "<unnamed>"))
-    return started, ok, failed, names, failed_names
-
-
-def parse_plain(out: str):
-    """Fallback: sum `test result:` lines."""
-    passed = failed = 0
-    for m in re.finditer(r'test result: \w+\. (\d+) passed; (\d+) failed', out):
-        passed += int(m.group(1))
+    run = ok = failed = 0
+    for m in re.finditer(
+            r'^test result: \w+\. (\d+) passed; (\d+) failed(?:; (\d+) ignored)?',
+            out, re.M):
+        ok += int(m.group(1))
         failed += int(m.group(2))
-    return passed, failed
+    run = ok + failed
 
+    names = [m.group(1) for m in
+             re.finditer(r'^test ([\w:<>\[\] ,#-]+?) \.\.\. (?:ok|FAILED|failed)', out, re.M)]
+
+    failed_names = []
+    # The stdout-dump header is unambiguous and survives interleaving.
+    failed_names += re.findall(r'^---- (.+?) stdout ----', out, re.M)
+    # The plain list after the final `failures:` header.
+    for block in re.findall(r'^failures:\n((?:^\s{4}\S.*\n)+)', out, re.M):
+        failed_names += [l.strip() for l in block.splitlines() if l.strip()]
+    # De-duplicate, keep order.
+    seen, uniq = set(), []
+    for n in failed_names:
+        if n not in seen:
+            seen.add(n)
+            uniq.append(n)
+    return run, ok, failed, names, uniq
 
 def cargo_env(target_dir):
+    """The environment for every cargo call.
+
+    NOTHING here may change the build fingerprint. `RUSTC_BOOTSTRAP=1` used to
+    be set for `--format json`; it does change it, so a normal `cargo test`
+    and this script invalidated each other's artifacts on every alternation.
+    See `parse_libtest`.
+    """
     env = dict(os.environ)
     if target_dir:
         env["CARGO_TARGET_DIR"] = str(target_dir)
-    env["RUSTC_BOOTSTRAP"] = "1"   # allows -Z unstable-options for --format json
+    env.pop("RUSTC_BOOTSTRAP", None)
     return env
 
 
@@ -970,12 +981,11 @@ def check_cargo(root: Path, rep: Report, present, target_dir, release=True):
 
     for rel, crate, sel, declared, required in present:
         cmd = ["cargo", "test", "-p", crate, *sel, *opt, "--",
-               "--include-ignored", "--test-threads", "1",
-               "-Z", "unstable-options", "--format", "json"]
+               "--include-ignored", "--test-threads", "1"]
         if sel == REPLAY_BENCH_TARGET:
             cmd.insert(cmd.index("--"), REPLAY_BENCH_PREFIX)
         pr, secs = run(cmd, root, env)
-        started, ok, failed, names, bad_names = parse_libtest_json(pr.stdout)
+        started, ok, failed, names, bad_names = parse_libtest(pr.stdout + pr.stderr)
         detail = f"declared {declared}, ran {started}, ok {ok}, failed {failed}, {secs:.0f}s"
         if bad_names:
             detail += "  FAILED: " + ", ".join(bad_names[:5])
@@ -986,11 +996,23 @@ def check_cargo(root: Path, rep: Report, present, target_dir, release=True):
         elif started < declared:
             rep.add(g, rel, False, detail + "  <-- fewer tests ran than the source declares")
         else:
-            never_ran = [t for t in required if not any(n.endswith(t) or n == t for n in names)]
-            if never_ran:
-                rep.add(g, rel, False, detail + f"  <-- pinned test(s) never RAN: {', '.join(never_ran)}")
+            # The pinned-test check reads the per-test lines. If those are
+            # absent while tests demonstrably ran, the honest verdict is "could
+            # not verify", NOT "the tests did not run" — a gate whose failure
+            # mode is a false accusation is worse than no gate. Seen for real
+            # in a filtered capture where only the `test result:` summaries
+            # survived and every per-test line was gone.
+            if not names:
+                rep.add(g, rel, False, detail +
+                        "  <-- CANNOT VERIFY: the run reported results but no per-test "
+                        "lines, so which tests ran is unknown (output filtered or "
+                        "truncated?). Not a claim that they did not run.")
             else:
-                rep.add(g, rel, True, detail + f"; all {len(required)} pinned test(s) ran")
+                never_ran = [t for t in required if not any(n.endswith(t) or n == t for n in names)]
+                if never_ran:
+                    rep.add(g, rel, False, detail + f"  <-- pinned test(s) never RAN: {', '.join(never_ran)}")
+                else:
+                    rep.add(g, rel, True, detail + f"; all {len(required)} pinned test(s) ran")
 
     # 2. the tripwire must run, by name, and report exactly one test.
     # NOT `--exact`: libtest matches the FULL path, and the tripwire's is
@@ -1001,9 +1023,9 @@ def check_cargo(root: Path, rep: Report, present, target_dir, release=True):
     # correct and stricter: it proves a test whose name ENDS with the tripwire
     # actually started, rather than trusting cargo's exit code.
     cmd = ["cargo", "test", "-p", "bloch-pos-committee", "--lib", *opt, TRIPWIRE, "--",
-           "--include-ignored", "-Z", "unstable-options", "--format", "json"]
+           "--include-ignored"]
     pr, secs = run(cmd, root, env)
-    started, ok, failed, names, _ = parse_libtest_json(pr.stdout)
+    started, ok, failed, names, _ = parse_libtest(pr.stdout + pr.stderr)
     matched = [n for n in names if n.endswith(TRIPWIRE)]
     rep.add("B. tripwire (source)", f"{TRIPWIRE} runs and passes",
             started >= 1 and ok >= 1 and failed == 0 and bool(matched) and pr.returncode == 0,
@@ -1014,12 +1036,8 @@ def check_cargo(root: Path, rep: Report, present, target_dir, release=True):
     # `--no-fail-fast`: without it cargo stops at the first failing binary, so
     # the count is "however far it got" and the other crates go unreported.
     # The first executed run stopped at 307 of ~506 for exactly that reason.
-    pr, secs = run(["cargo", "test", "--workspace", *opt, "--no-fail-fast", "--",
-                    "-Z", "unstable-options", "--format", "json"], root, env)
-    s, o, f, _, bad_names = parse_libtest_json(pr.stdout)
-    if s == 0:
-        s2, f2 = parse_plain(pr.stdout)
-        s, o, f = s2 + f2, s2, f2
+    pr, secs = run(["cargo", "test", "--workspace", *opt, "--no-fail-fast"], root, env)
+    s, o, f, _, bad_names = parse_libtest(pr.stdout + pr.stderr)
     total_run, total_ok, total_failed = s, o, f
     rep.add("F. workspace", "cargo test --workspace is green", f == 0 and pr.returncode == 0,
             f"{total_run} run, {total_ok} ok, {total_failed} failed, {secs:.0f}s"
