@@ -1544,7 +1544,35 @@ mod pmo_lab_arithmetic {
         })
     }
 
-    /// The laboratory's REAL stake split, measured off a running devnet.
+    /// CORRECTION 2026-08-24: the 47.53/52.47 figure below is the split
+    /// AFTER 42 epochs of partition, measured on the MINORITY's own chain -
+    /// not the split at genesis. At genesis the devnet is 80/20:
+    /// `bloch-pos genesis` assigns `(i % 3 + 1) * 200_000 BLOCH` (main.rs:707),
+    /// so nodes 0..5 hold 2,400k BLOCH and nodes 6,7 hold 600k.
+    ///
+    /// The two sides were measured from both chains at once, which is what
+    /// exposed it:
+    ///     v6 seen from side A: 20,000,000,000,000  (exactly genesis)
+    ///     v6 seen from side B: 87,748,075,889,696  (+339%)
+    /// On A's chain the minority produced nothing and earned nothing. On its
+    /// OWN chain it produced everything and collected every reward.
+    ///
+    /// **So there are TWO amplifiers, not one.** The leak shrinks the
+    /// denominator, and block rewards inflate the isolated side's own
+    /// numerator. A partitioned minority mints itself into a majority on its
+    /// own branch: 20% -> 52.47% in 42 epochs, a 4.4x inflation.
+    ///
+    /// **This is why no fixed floor is a complete fix.** The floor is a
+    /// fraction of the CURRENT active set, and the current active set is
+    /// exactly what the isolated branch is inflating. To clear the bar the
+    /// minority needs 1.7x at a 1/2 floor and 2.5x at 3/4; it reached 4.4x.
+    /// A higher floor buys TIME, proportional to how long the inflation takes
+    /// - it does not close the hole. Closing it means anchoring the
+    /// denominator to the stake set as of the last FINALIZED checkpoint,
+    /// which a branch cannot mint its way past because the bar stops moving
+    /// at the last point both sides agreed on.
+    ///
+    /// The laboratory's post-partition stake split, measured off a running devnet.
     ///
     /// The lab calls it a "6/2 split" and that is a count of NODES, not of
     /// stake. `keygen` hands out wildly unequal bonds - v7 carries 8.5x v0 -
