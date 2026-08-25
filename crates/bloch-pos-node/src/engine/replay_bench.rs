@@ -624,7 +624,7 @@ fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
     let verifier = HybridVerifier::new(manifest.pubkeys());
     let head_slot = Arc::new(AtomicU64::new(0));
     let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = std::sync::mpsc::sync_channel(super::ENGINE_EVENT_QUEUE_CAP);
     // The receiver is leaked on purpose: dropping it would make the mesh's
     // sender fail, and nothing in this benchmark reads a network event anyway.
     std::mem::forget(rx);

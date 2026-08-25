@@ -3814,7 +3814,7 @@ mod transfer_v2_end_to_end {
         ));
         std::fs::create_dir_all(&dir).expect("create the test data dir");
         let store = Store::open(&dir, &[0u8; 32]).expect("open the test store");
-        let (events, _rx) = mpsc::channel::<EngineEvent>();
+        let (events, _rx) = mpsc::sync_channel::<EngineEvent>(ENGINE_EVENT_QUEUE_CAP);
         // `_rx` drops here: nothing dials this node, and the accept loop
         // exits quietly on a closed channel.
         let head_slot = Arc::new(AtomicU64::new(0));
@@ -4108,7 +4108,7 @@ mod perf_support {
         let genesis_id = manifest.genesis_id();
         let state = manifest.genesis_state();
         let store = Store::open(&dir, &[0u8; 32]).expect("open the test store");
-        let (events, _rx) = mpsc::channel::<EngineEvent>();
+        let (events, _rx) = mpsc::sync_channel::<EngineEvent>(ENGINE_EVENT_QUEUE_CAP);
         let head_slot = Arc::new(AtomicU64::new(0));
         let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let net = net::Net::Devnet(
@@ -5392,7 +5392,7 @@ mod duty_view_anchor {
         let genesis_id = manifest.genesis_id();
         let state = manifest.genesis_state();
         let store = Store::open(&dir.0, &[0u8; 32]).expect("open the test store");
-        let (events, _rx) = mpsc::channel::<EngineEvent>();
+        let (events, _rx) = mpsc::sync_channel::<EngineEvent>(ENGINE_EVENT_QUEUE_CAP);
         let head_slot = Arc::new(AtomicU64::new(0));
         let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let net = net::Net::Devnet(
