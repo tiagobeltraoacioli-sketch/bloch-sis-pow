@@ -59,7 +59,7 @@
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -752,13 +752,13 @@ pub struct RpcCall {
 /// behind the loop means a query can never observe a half-applied block, and it
 /// means no reader can be looking at last epoch's answer.
 pub struct EngineBackend {
-    /// `Mutex` because `mpsc::Sender` only became `Sync` in Rust 1.72 and this
+    /// `Mutex` because `mpsc::SyncSender` only became `Sync` in Rust 1.72 and this
     /// crate pins no MSRV. The lock is held exactly long enough to clone.
-    engine: Mutex<Sender<crate::engine::EngineEvent>>,
+    engine: Mutex<SyncSender<crate::engine::EngineEvent>>,
 }
 
 impl EngineBackend {
-    pub fn new(engine: Sender<crate::engine::EngineEvent>) -> Self {
+    pub fn new(engine: SyncSender<crate::engine::EngineEvent>) -> Self {
         EngineBackend { engine: Mutex::new(engine) }
     }
 }
@@ -772,8 +772,14 @@ impl RpcBackend for EngineBackend {
             // itself is still fine, but saying so honestly beats unwrapping.
             Err(poisoned) => poisoned.into_inner().clone(),
         };
-        if sender.send(crate::engine::EngineEvent::Rpc(RpcCall { req, reply: tx })).is_err() {
-            return Err(RpcError::unavailable("node is shutting down"));
+        match sender.try_send(crate::engine::EngineEvent::Rpc(RpcCall { req, reply: tx })) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                return Err(RpcError::unavailable("consensus queue is busy; retry"));
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                return Err(RpcError::unavailable("node is shutting down"));
+            }
         }
         match rx.recv_timeout(ENGINE_TIMEOUT) {
             Ok(result) => result,

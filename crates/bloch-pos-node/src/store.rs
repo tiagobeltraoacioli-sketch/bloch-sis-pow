@@ -164,8 +164,24 @@ impl Store {
     /// Reads the log file fresh so a reader thread never touches the append
     /// handle.
     pub fn blocks_after(dir: &Path, after_slot: u64, limit: usize) -> io::Result<Vec<Vec<u8>>> {
+        Self::blocks_after_limited(dir, after_slot, limit, usize::MAX)
+    }
+
+    /// Like [`Self::blocks_after`], but also bounds the encoded response bytes.
+    ///
+    /// `byte_limit` includes each envelope's four-byte response length prefix,
+    /// but not the response's fixed tag/count prefix. The scanner reads only a
+    /// fixed header before deciding whether an eligible candidate fits; a body
+    /// that cannot fit is neither allocated nor read from disk.
+    pub fn blocks_after_limited(
+        dir: &Path,
+        after_slot: u64,
+        limit: usize,
+        byte_limit: usize,
+    ) -> io::Result<Vec<Vec<u8>>> {
         let mut f = io::BufReader::new(File::open(dir.join("blocks.log"))?);
         let mut out = Vec::new();
+        let mut encoded_bytes = 0usize;
         let mut len4 = [0u8; 4];
         loop {
             if out.len() >= limit {
@@ -182,29 +198,70 @@ impl Store {
             if len > crate::codec::MAX_FIELD_LEN {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "log frame over cap"));
             }
-            let mut payload = vec![0u8; len];
-            match f.read_exact(&mut payload) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(e),
-            }
             // Only the header is parsed while skipping: the slot is all the
             // filter needs, and the signatures/attestations behind it are the
             // expensive part.
             let hdr_len = bloch_pos_committee::header::BlockHeaderV4::ENCODED_LEN;
-            if payload.len() < hdr_len {
+            if len < hdr_len {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "log frame shorter than a header"));
             }
+            let mut header_bytes = vec![0u8; hdr_len];
+            match f.read_exact(&mut header_bytes) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e),
+            }
             let header = bloch_pos_committee::header::BlockHeaderV4::canonical_deserialize(
-                &payload[..hdr_len],
+                &header_bytes,
             )
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "undecodable header in block log"))?;
-            if header.slot > after_slot {
-                out.push(payload);
+            let tail_len = len - hdr_len;
+            if header.slot <= after_slot {
+                if !discard_exact(&mut f, tail_len)? {
+                    break;
+                }
+                continue;
             }
+
+            let frame_bytes = len
+                .checked_add(4)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "log frame length overflow"))?;
+            if encoded_bytes
+                .checked_add(frame_bytes)
+                .map_or(true, |total| total > byte_limit)
+            {
+                break;
+            }
+
+            let mut payload = Vec::with_capacity(len);
+            payload.extend_from_slice(&header_bytes);
+            payload.resize(len, 0);
+            match f.read_exact(&mut payload[hdr_len..]) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e),
+            }
+            encoded_bytes += frame_bytes;
+            out.push(payload);
         }
         Ok(out)
     }
+}
+
+/// Discard exactly `len` bytes without allocating a candidate log frame.
+///
+/// Returns `false` for the tolerated truncated tail used by [`Store::read_all`].
+fn discard_exact(r: &mut impl Read, mut len: usize) -> io::Result<bool> {
+    let mut buf = [0u8; 8 * 1024];
+    while len > 0 {
+        let chunk_len = len.min(buf.len());
+        let n = r.read(&mut buf[..chunk_len])?;
+        if n == 0 {
+            return Ok(false);
+        }
+        len -= n;
+    }
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -241,6 +298,27 @@ mod tests {
 
         let past_tip = Store::blocks_after(&dir, 99, 100).expect("scan");
         assert!(past_tip.is_empty(), "a peer at the tip is told there is nothing more");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn blocks_after_limited_stops_before_an_over_budget_frame() {
+        let dir = std::env::temp_dir().join(format!("bloch-pos-store-limited-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, &[8u8; 32]).expect("open");
+        let first = sample_envelope(1);
+        let second = sample_envelope(2);
+        let first_bytes = crate::codec::encode_envelope(&first);
+        store.append(&first).expect("append first");
+        store.append(&second).expect("append second");
+
+        let one_frame = first_bytes.len() + 4;
+        let limited = Store::blocks_after_limited(&dir, 0, 100, one_frame).expect("scan");
+        assert_eq!(limited, vec![first_bytes], "the next frame is not read into the response");
+
+        let none = Store::blocks_after_limited(&dir, 0, 100, one_frame - 1).expect("scan");
+        assert!(none.is_empty(), "an over-budget first frame is not partially served");
 
         let _ = fs::remove_dir_all(&dir);
     }

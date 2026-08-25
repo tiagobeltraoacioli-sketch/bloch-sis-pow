@@ -164,20 +164,18 @@
 //!   validation, the canonical-address idempotency fix) are Genesis-3 code
 //!   that is not ported yet.
 //!
-//! - **The channel to the engine is unbounded.** During a cold sync the
-//!   in-flight ceiling is roughly `MAX_PAGES_WITHOUT_PROGRESS × MAX_SYNC_BLOCKS`
-//!   blocks per serving peer — a real bound, but a generous one (tens of MB),
-//!   and it is a bound on *memory*, not backpressure. Genesis-3 learned the
-//!   other side of this: a bounded channel that sheds under load dropped the
-//!   very sync replies the orphan pool was waiting on, in silence. Neither
-//!   answer is free; this one is chosen because a syncing node that stalls is
-//!   worse than one that is briefly fat, and it is named rather than assumed.
+//! - **Ingress is bounded by both event count and bytes.** A replaying engine
+//!   consumes no network work, so the transports reserve from a 32 MiB budget
+//!   before enqueueing. When it is full, gossip is shed and a sync page is not
+//!   advanced past blocks the engine did not receive; the normal sync pump asks
+//!   again from the applied head. That trades a recoverable round trip for
+//!   keeping validator memory and slot duties available.
 
 use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::Sender as EngineSender;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::SyncSender as EngineSender;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -195,7 +193,8 @@ use libp2p::{identify, identity, noise, yamux, PeerId, StreamProtocol, SwarmBuil
 /// without depending on libp2p directly.
 pub use libp2p::Multiaddr;
 
-use crate::net::NetEvent;
+use crate::engine::EngineEvent;
+use crate::net::{IngressOutcome, NetEvent};
 
 // ── Protocol identity: a Genesis-4 node must never speak to a Genesis-3 one ──
 
@@ -276,6 +275,16 @@ pub const MAX_SYNC_BLOCKS: usize = 128;
 /// Byte ceiling on a sync frame, checked while building the response and again
 /// while reading it.
 pub const MAX_SYNC_FRAME: u64 = 8 * 1024 * 1024;
+
+/// Disk reads permitted at once while serving remote sync requests.
+///
+/// This is deliberately much lower than the protocol's substream ceiling:
+/// substreams are cheap handles; scanning and framing a block log is bounded
+/// disk and memory work.
+const MAX_CONCURRENT_SYNC_SERVES: usize = 4;
+
+/// Response framing before the first envelope: tag plus envelope count.
+const SYNC_RESPONSE_HEADER_BYTES: usize = 1 + 4;
 
 /// Peers a single `get-blocks` is directed at. Not one (a silent peer would
 /// stall recovery), not all (that is the broadcast this replaces).
@@ -481,7 +490,10 @@ impl RrCodec for SyncCodec {
 
 async fn read_capped<T: AsyncRead + Unpin + Send>(io: &mut T) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
-    io.take(MAX_SYNC_FRAME).read_to_end(&mut buf).await?;
+    io.take(MAX_SYNC_FRAME + 1).read_to_end(&mut buf).await?;
+    if buf.len() > MAX_SYNC_FRAME as usize {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "sync frame over byte cap"));
+    }
     Ok(buf)
 }
 
@@ -706,8 +718,9 @@ fn load_or_create_identity(path: &std::path::Path) -> io::Result<identity::Keypa
 /// engine's shape changes with the transport.
 pub fn start(
     cfg: Config,
-    events: EngineSender<NetEvent>,
+    events: EngineSender<EngineEvent>,
     head_slot: Arc<AtomicU64>,
+    inflight: Arc<AtomicUsize>,
 ) -> io::Result<Handle> {
     std::fs::create_dir_all(&cfg.data_dir)?;
     let keypair = load_or_create_identity(&cfg.data_dir.join("p2p_identity.bin"))?;
@@ -728,7 +741,7 @@ pub fn start(
             match build_swarm(&keypair, &cfg) {
                 Ok(swarm) => {
                     let _ = ready_tx.send(Ok(()));
-                    run_swarm(swarm, cfg, cmd_rx, events, head_slot).await;
+                    run_swarm(swarm, cfg, cmd_rx, events, head_slot, inflight).await;
                 }
                 Err(e) => {
                     let _ = ready_tx.send(Err(e));
@@ -808,7 +821,8 @@ fn build_swarm(keypair: &identity::Keypair, cfg: &Config) -> io::Result<Swarm> {
 
 /// State the swarm loop owns.
 struct Loop {
-    events: EngineSender<NetEvent>,
+    events: EngineSender<EngineEvent>,
+    inflight: Arc<AtomicUsize>,
     data_dir: PathBuf,
     head_slot: Arc<AtomicU64>,
     /// Highest block slot each peer has been seen forwarding. A relayer holds
@@ -850,8 +864,8 @@ impl Loop {
         self.recent_blocks.insert(id, now).is_none()
     }
 
-    fn emit(&self, ev: NetEvent) -> bool {
-        self.events.send(ev).is_ok()
+    fn emit(&self, ev: NetEvent, wire_bytes: usize) -> IngressOutcome {
+        crate::net::send_to_engine(&self.events, &self.inflight, ev, wire_bytes)
     }
 
     /// May this node chase another full page? Advancing the applied head is
@@ -874,11 +888,13 @@ async fn run_swarm(
     mut swarm: Swarm,
     cfg: Config,
     mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<Command>,
-    events: EngineSender<NetEvent>,
+    events: EngineSender<EngineEvent>,
     head_slot: Arc<AtomicU64>,
+    inflight: Arc<AtomicUsize>,
 ) {
     let mut st = Loop {
         events,
+        inflight,
         data_dir: cfg.data_dir.clone(),
         head_slot,
         peer_head: HashMap::new(),
@@ -908,10 +924,12 @@ async fn run_swarm(
     // Sync responses are read off disk on a blocking pool, then handed back
     // here to be written to the substream — the swarm loop must never sit in
     // a file read while blocks and attestations wait behind it.
-    let (resp_tx, mut resp_rx) = tokio::sync::mpsc::unbounded_channel::<(
+    let serve_slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SYNC_SERVES));
+    let (resp_tx, mut resp_rx) = tokio::sync::mpsc::channel::<(
         request_response::ResponseChannel<SyncResponse>,
         SyncResponse,
-    )>();
+        tokio::sync::OwnedSemaphorePermit,
+    )>(MAX_CONCURRENT_SYNC_SERVES);
 
     let mut redial = tokio::time::interval(REDIAL_INTERVAL);
     redial.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -919,7 +937,7 @@ async fn run_swarm(
     loop {
         tokio::select! {
             ev = swarm.select_next_some() => {
-                if !handle_swarm_event(&mut swarm, &mut st, &resp_tx, ev) {
+                if !handle_swarm_event(&mut swarm, &mut st, &resp_tx, &serve_slots, ev) {
                     return; // engine gone
                 }
             }
@@ -929,7 +947,7 @@ async fn run_swarm(
                     None => return, // engine dropped the handle
                 }
             }
-            Some((channel, resp)) = resp_rx.recv() => {
+            Some((channel, resp, _permit)) = resp_rx.recv() => {
                 let _ = swarm.behaviour_mut().sync.send_response(channel, resp);
             }
             _ = redial.tick() => {
@@ -1057,10 +1075,12 @@ fn request_blocks(swarm: &mut Swarm, st: &Loop, after_slot: u64) {
 fn handle_swarm_event(
     swarm: &mut Swarm,
     st: &mut Loop,
-    resp_tx: &tokio::sync::mpsc::UnboundedSender<(
+    resp_tx: &tokio::sync::mpsc::Sender<(
         request_response::ResponseChannel<SyncResponse>,
         SyncResponse,
+        tokio::sync::OwnedSemaphorePermit,
     )>,
+    serve_slots: &Arc<tokio::sync::Semaphore>,
     ev: SwarmEvent<G4BehaviourEvent>,
 ) -> bool {
     match ev {
@@ -1155,12 +1175,25 @@ fn handle_swarm_event(
             ..
         })) => match message {
             request_response::Message::Request { request, channel, .. } => {
-                serve_sync(st, resp_tx.clone(), request, channel);
+                match serve_slots.clone().try_acquire_owned() {
+                    Ok(permit) => serve_sync(st, resp_tx.clone(), permit, request, channel),
+                    Err(_) => {
+                        // The protocol has no Busy variant. An empty page is
+                        // recoverable: a still-behind requester asks again from
+                        // its applied head, while the server keeps its bounded
+                        // disk-read budget for work it can complete.
+                        let _ = swarm
+                            .behaviour_mut()
+                            .sync
+                            .send_response(channel, SyncResponse::Blocks { envelopes: Vec::new() });
+                    }
+                }
             }
             request_response::Message::Response { response, .. } => {
                 let SyncResponse::Blocks { envelopes } = response;
                 let was_full = envelopes.len() >= MAX_SYNC_BLOCKS;
                 let mut highest = 0u64;
+                let mut page_queued = true;
                 for bytes in envelopes {
                     match crate::codec::decode_envelope(&bytes) {
                         Ok(env) => {
@@ -1168,8 +1201,10 @@ fn handle_swarm_event(
                             highest = highest.max(slot);
                             let e = st.peer_head.entry(peer).or_insert(0);
                             *e = (*e).max(slot);
-                            if !st.emit(NetEvent::Block(env)) {
-                                return false;
+                            match st.emit(NetEvent::Block(env), bytes.len()) {
+                                IngressOutcome::Queued => {}
+                                IngressOutcome::Shed => page_queued = false,
+                                IngressOutcome::Closed => return false,
                             }
                         }
                         Err(e) => {
@@ -1182,7 +1217,7 @@ fn handle_swarm_event(
                 // engine's sync timer — that is the difference between "a
                 // request from genesis is accepted" and "a node can actually
                 // sync from genesis". A short page ends the walk.
-                if was_full && highest > 0 && st.may_chase_page() {
+                if was_full && page_queued && highest > 0 && st.may_chase_page() {
                     swarm.behaviour_mut().sync.send_request(
                         &peer,
                         SyncRequest::GetBlocks {
@@ -1242,7 +1277,10 @@ fn on_gossip(
                 let e = st.peer_head.entry(source).or_insert(0);
                 *e = (*e).max(slot);
                 st.note_block(*env.block_id().as_bytes());
-                return st.emit(NetEvent::Block(env));
+                return !matches!(
+                    st.emit(NetEvent::Block(env), message.data.len()),
+                    IngressOutcome::Closed
+                );
             }
             Err(e) => {
                 // Undecodable bytes on the block topic cannot come from a
@@ -1257,8 +1295,21 @@ fn on_gossip(
             Ok(att) => {
                 // No verdict yet. The engine decides through `gossip.rs` and
                 // calls `Handle::report`, which is what finally relays it.
-                let origin = Origin { inner: Some((message_id, source)) };
-                return st.emit(NetEvent::Attestation(att, origin));
+                let origin = Origin {
+                    inner: Some((message_id.clone(), source.clone())),
+                };
+                return match st.emit(NetEvent::Attestation(att, origin), message.data.len()) {
+                    IngressOutcome::Queued => true,
+                    IngressOutcome::Shed => {
+                        // `validate_messages()` retains an attestation until a
+                        // verdict arrives. No engine event means no later
+                        // verdict, so explicitly release this one without
+                        // penalizing the peer.
+                        report(swarm, Verdict::Ignore);
+                        true
+                    }
+                    IngressOutcome::Closed => false,
+                };
             }
             Err(e) => {
                 eprintln!("p2p: undecodable attestation from {source}: {e}");
@@ -1269,7 +1320,10 @@ fn on_gossip(
         match bloch_pos_committee::transition::PosTransaction::from_canonical_bytes(&message.data) {
             Ok(tx) => {
                 report(swarm, Verdict::Accept);
-                return st.emit(NetEvent::Transaction(tx));
+                return !matches!(
+                    st.emit(NetEvent::Transaction(tx), message.data.len()),
+                    IngressOutcome::Closed
+                );
             }
             Err(e) => {
                 eprintln!("p2p: undecodable transaction from {source}: {e}");
@@ -1288,10 +1342,12 @@ fn on_gossip(
 /// bytes, then hand the response back to the swarm loop to write.
 fn serve_sync(
     st: &Loop,
-    resp_tx: tokio::sync::mpsc::UnboundedSender<(
+    resp_tx: tokio::sync::mpsc::Sender<(
         request_response::ResponseChannel<SyncResponse>,
         SyncResponse,
+        tokio::sync::OwnedSemaphorePermit,
     )>,
+    permit: tokio::sync::OwnedSemaphorePermit,
     request: SyncRequest,
     channel: request_response::ResponseChannel<SyncResponse>,
 ) {
@@ -1302,27 +1358,24 @@ fn serve_sync(
         // `after_slot = 0` is the from-genesis case and is served like any
         // other: the scan starts at the first logged block. There is no
         // "recent only" path and no datadir donation.
-        let envelopes = match crate::store::Store::blocks_after(&dir, after_slot, limit) {
-            Ok(all) => {
-                let mut out = Vec::new();
-                let mut bytes = 0usize;
-                for b in all.into_iter() {
-                    // Byte cap as well as block cap: one answer must never
-                    // become a history dump. Leave slack for the framing.
-                    if bytes + b.len() + 4 > (MAX_SYNC_FRAME as usize) - 1024 {
-                        break;
-                    }
-                    bytes += b.len() + 4;
-                    out.push(b);
-                }
-                out
-            }
+        let envelopes = match crate::store::Store::blocks_after_limited(
+            &dir,
+            after_slot,
+            limit,
+            (MAX_SYNC_FRAME as usize).saturating_sub(SYNC_RESPONSE_HEADER_BYTES),
+        ) {
+            Ok(envelopes) => envelopes,
             Err(e) => {
                 eprintln!("p2p: serving get-blocks failed: {e}");
                 Vec::new()
             }
         };
-        let _ = resp_tx.send((channel, SyncResponse::Blocks { envelopes }));
+        if resp_tx
+            .try_send((channel, SyncResponse::Blocks { envelopes }, permit))
+            .is_err()
+        {
+            eprintln!("p2p: dropping get-blocks response because the swarm loop stopped");
+        }
     });
 }
 
@@ -1500,8 +1553,9 @@ mod tests {
 
     struct Node {
         handle: Handle,
-        rx: Receiver<NetEvent>,
+        rx: Receiver<EngineEvent>,
         head: Arc<AtomicU64>,
+        inflight: Arc<AtomicUsize>,
         addr: Multiaddr,
         _dir: PathBuf,
     }
@@ -1516,8 +1570,9 @@ mod tests {
         }
         let port = free_port();
         let addr: Multiaddr = format!("/ip4/127.0.0.1/tcp/{port}").parse().expect("addr");
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::sync_channel(crate::engine::ENGINE_EVENT_QUEUE_CAP);
         let head = Arc::new(AtomicU64::new(blocks));
+        let inflight = Arc::new(AtomicUsize::new(0));
         let handle = start(
             Config {
                 listen: vec![addr.clone()],
@@ -1533,20 +1588,35 @@ mod tests {
             },
             tx,
             head.clone(),
+            inflight.clone(),
         )
         .expect("p2p starts");
-        Node { handle, rx, head, addr, _dir: dir }
+        Node { handle, rx, head, inflight, addr, _dir: dir }
+    }
+
+    /// Receive one event exactly as the engine would: processing releases its
+    /// byte reservation and applied blocks advance the shared sync head.
+    fn next_net_event(node: &Node, timeout: Duration) -> Option<NetEvent> {
+        match node.rx.recv_timeout(timeout) {
+            Ok(EngineEvent::Net { event, ingress_bytes }) => {
+                node.inflight.fetch_sub(ingress_bytes, Ordering::AcqRel);
+                if let NetEvent::Block(env) = &event {
+                    node.head.fetch_max(env.header.slot, Ordering::Relaxed);
+                }
+                Some(event)
+            }
+            Ok(_) | Err(_) => None,
+        }
     }
 
     /// Collect events until `want` blocks have arrived or the deadline passes.
-    fn collect_blocks(rx: &Receiver<NetEvent>, want: usize, secs: u64) -> Vec<u64> {
+    fn collect_blocks(node: &Node, want: usize, secs: u64) -> Vec<u64> {
         let deadline = Instant::now() + Duration::from_secs(secs);
         let mut slots = Vec::new();
         while slots.len() < want && Instant::now() < deadline {
-            match rx.recv_timeout(Duration::from_millis(200)) {
-                Ok(NetEvent::Block(env)) => slots.push(env.header.slot),
-                Ok(_) => {}
-                Err(_) => {}
+            match next_net_event(node, Duration::from_millis(200)) {
+                Some(NetEvent::Block(env)) => slots.push(env.header.slot),
+                Some(_) | None => {}
             }
         }
         slots
@@ -1583,13 +1653,13 @@ mod tests {
         while Instant::now() < deadline && !connected {
             attempt += 1;
             a.handle.broadcast(crate::net::block_frame(&envelope(900 + attempt)));
-            connected = !collect_blocks(&b.rx, 1, 1).is_empty();
+            connected = !collect_blocks(&b, 1, 1).is_empty();
         }
         assert!(connected, "the mesh never formed: no block ever reached the peer");
 
         // Drain whatever else the retry loop put in flight, so the next
         // assertion is about the publishes it names and nothing else.
-        while b.rx.recv_timeout(Duration::from_millis(300)).is_ok() {}
+        while next_net_event(&b, Duration::from_millis(300)).is_some() {}
 
         // In regime now. Ten distinct blocks, one publish each, all must land.
         for slot in 2..=11u64 {
@@ -1598,7 +1668,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(20);
         let mut got: Vec<u64> = Vec::new();
         while got.len() < 10 && Instant::now() < deadline {
-            if let Ok(NetEvent::Block(env)) = b.rx.recv_timeout(Duration::from_millis(200)) {
+            if let Some(NetEvent::Block(env)) = next_net_event(&b, Duration::from_millis(200)) {
                 if (2..=11).contains(&env.header.slot) {
                     got.push(env.header.slot);
                 }
@@ -1614,7 +1684,7 @@ mod tests {
         // And it is bidirectional — b was never told about a, it only accepted
         // a's dial, and it must still be able to publish back.
         b.handle.broadcast(crate::net::block_frame(&envelope(500)));
-        assert_eq!(collect_blocks(&a.rx, 1, 20), vec![500], "reverse direction never delivered");
+        assert_eq!(collect_blocks(&a, 1, 20), vec![500], "reverse direction never delivered");
     }
 
     /// The exchange's question, at the transport layer: a node with an EMPTY
@@ -1630,7 +1700,7 @@ mod tests {
         let cold = node("cold-client", 0, &[server.addr.clone()]);
         assert_eq!(cold.head.load(Ordering::Relaxed), 0, "the cold node starts at genesis");
 
-        let mut got = collect_blocks(&cold.rx, total as usize, 60);
+        let mut got = collect_blocks(&cold, total as usize, 60);
         got.sort_unstable();
         assert_eq!(
             got.len(),
@@ -1653,7 +1723,7 @@ mod tests {
         assert_eq!(restarted.head.load(Ordering::Relaxed), missed_from);
 
         let want = (total - missed_from) as usize;
-        let mut got = collect_blocks(&restarted.rx, want, 60);
+        let mut got = collect_blocks(&restarted, want, 60);
         got.sort_unstable();
         assert_eq!(
             got,

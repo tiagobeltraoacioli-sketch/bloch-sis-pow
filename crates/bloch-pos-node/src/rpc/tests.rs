@@ -787,7 +787,7 @@ fn a_successful_call_carries_result_and_no_error() {
 fn an_unreachable_engine_is_reported_not_hung() {
     // A backend whose engine channel is already closed: this is what every
     // in-flight request sees when the node stops.
-    let (tx, rx) = mpsc::channel::<crate::engine::EngineEvent>();
+    let (tx, rx) = mpsc::sync_channel::<crate::engine::EngineEvent>(1);
     drop(rx);
     let backend = EngineBackend::new(tx);
     let err = backend.call(RpcRequest::ChainInfo).expect_err("a dead engine must not look healthy");

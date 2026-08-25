@@ -99,7 +99,7 @@ pub enum EngineEvent {
 
 /// Number of external events awaiting the consensus thread, independently of
 /// the byte budget enforced by `net::send_to_engine`.
-const ENGINE_EVENT_QUEUE_CAP: usize = 128;
+pub(crate) const ENGINE_EVENT_QUEUE_CAP: usize = 128;
 
 /// Process a bounded batch before returning to slot-duty scheduling.
 ///
