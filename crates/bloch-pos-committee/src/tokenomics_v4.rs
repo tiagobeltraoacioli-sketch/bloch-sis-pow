@@ -175,12 +175,12 @@ pub const FOUNDATION_LIQUID_AT_GENESIS_BLOCH: u128 =
 /// 43,172" would have waited days for a height that produces a different
 /// number. Heights and block counts are now stated separately, both times.
 ///
-/// The split stays exact: 3,805,746,000 is divisible by 21, so ×100/21 lands
-/// on a whole number with no aggregate dust, same as the previous figure.
+/// The split stays exact: 3,810,744,000 is divisible by 21, so ×100/21 lands
+/// on a whole number with no aggregate dust, same as every previous figure.
 ///
 /// Raising this does not breach the cap. [`VALIDATOR_EMISSION_BLOCH`] is the
-/// remainder of a fixed total, so 151,720,000 BLOCH more carryover is
-/// 151,720,000 BLOCH less validator emission — the holders' ledger grows and
+/// remainder of a fixed total, so 175,520,000 BLOCH more carryover is
+/// 175,520,000 BLOCH less validator emission — the holders' ledger grows and
 /// the future issuance shrinks by exactly the same amount. That is the right
 /// bucket to absorb it: it is unissued, so nothing is taken from anyone who
 /// already holds coins, and the alternative is taking it from an allocation
@@ -387,9 +387,10 @@ const _: () = assert!(VC_BLOCH * SPLIT_DENOMINATOR == 2_100_000_000 * SPLIT_NUME
 const _: () = assert!(TEAM_BLOCH * SPLIT_DENOMINATOR == 2_100_000_000 * SPLIT_NUMERATOR);
 const _: () = assert!(MARKETING_BLOCH * SPLIT_DENOMINATOR == 840_000_000 * SPLIT_NUMERATOR);
 const _: () = assert!(LIQUIDITY_BLOCH * SPLIT_DENOMINATOR == 1_050_000_000 * SPLIT_NUMERATOR);
-// Re-pinned 2026-08-13 to the measured snapshot (h39,328): the carryover is
-// what the ledger says it is, not what a draft said it would be. The split
-// stays exact on the new figure too — 3,805,746,000 is divisible by 21.
+// Re-pinned to the TERMINAL snapshot (h39,918, block_count 50,690): the
+// carryover is what the ledger says it is, not what a draft said it would be.
+// The split stays exact on the new figure too — 3,810,744,000 is divisible
+// by 21. The h39,328 re-pin this comment used to describe was superseded.
 const _: () =
     assert!(CARRYOVER_TOTAL_BLOCH * SPLIT_DENOMINATOR == 3_810_744_000 * SPLIT_NUMERATOR);
 const _: () =
