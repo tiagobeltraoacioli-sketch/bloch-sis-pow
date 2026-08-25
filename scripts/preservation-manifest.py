@@ -900,9 +900,14 @@ def run(cmd, cwd, env, timeout=5400):
 
 
 def parse_libtest_json(out: str):
-    """Return (started, ok, failed, names) from `--format json` output."""
+    """Return (started, ok, failed, names, failed_names) from `--format json`.
+
+    `failed_names` exists because the first executed run reported
+    "307 run, 304 ok, 1 failed" and named nothing — a verdict nobody can act
+    on. A gate that says something broke owes you which thing.
+    """
     started = ok = failed = 0
-    names = []
+    names, failed_names = [], []
     for line in out.splitlines():
         line = line.strip()
         if not line.startswith("{"):
@@ -911,14 +916,17 @@ def parse_libtest_json(out: str):
             ev = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if ev.get("type") == "test" and ev.get("event") == "started":
+        if ev.get("type") != "test":
+            continue
+        if ev.get("event") == "started":
             started += 1
             names.append(ev.get("name", ""))
-        elif ev.get("type") == "test" and ev.get("event") == "ok":
+        elif ev.get("event") == "ok":
             ok += 1
-        elif ev.get("type") == "test" and ev.get("event") in ("failed", "timeout"):
+        elif ev.get("event") in ("failed", "timeout"):
             failed += 1
-    return started, ok, failed, names
+            failed_names.append(ev.get("name", "<unnamed>"))
+    return started, ok, failed, names, failed_names
 
 
 def parse_plain(out: str):
@@ -967,13 +975,14 @@ def check_cargo(root: Path, rep: Report, present, target_dir, release=True):
         if sel == REPLAY_BENCH_TARGET:
             cmd.insert(cmd.index("--"), REPLAY_BENCH_PREFIX)
         pr, secs = run(cmd, root, env)
-        started, ok, failed, names = parse_libtest_json(pr.stdout)
+        started, ok, failed, names, bad_names = parse_libtest_json(pr.stdout)
         detail = f"declared {declared}, ran {started}, ok {ok}, failed {failed}, {secs:.0f}s"
+        if bad_names:
+            detail += "  FAILED: " + ", ".join(bad_names[:5])
         if started == 0:
             rep.add(g, rel, False, detail + "  <-- SUITE RAN EMPTY (this is the defect)")
         elif failed or pr.returncode != 0:
-            bad = [n for n in names]
-            rep.add(g, rel, False, detail + f"  first={bad[0] if bad else '?'}")
+            rep.add(g, rel, False, detail)
         elif started < declared:
             rep.add(g, rel, False, detail + "  <-- fewer tests ran than the source declares")
         else:
@@ -994,7 +1003,7 @@ def check_cargo(root: Path, rep: Report, present, target_dir, release=True):
     cmd = ["cargo", "test", "-p", "bloch-pos-committee", "--lib", *opt, TRIPWIRE, "--",
            "--include-ignored", "-Z", "unstable-options", "--format", "json"]
     pr, secs = run(cmd, root, env)
-    started, ok, failed, names = parse_libtest_json(pr.stdout)
+    started, ok, failed, names, _ = parse_libtest_json(pr.stdout)
     matched = [n for n in names if n.endswith(TRIPWIRE)]
     rep.add("B. tripwire (source)", f"{TRIPWIRE} runs and passes",
             started >= 1 and ok >= 1 and failed == 0 and bool(matched) and pr.returncode == 0,
@@ -1002,15 +1011,19 @@ def check_cargo(root: Path, rep: Report, present, target_dir, release=True):
 
     # 3. workspace test count, for comparison against the lastro's 550.
     total_run = total_ok = total_failed = 0
-    pr, secs = run(["cargo", "test", "--workspace", *opt, "--", "-Z", "unstable-options", "--format", "json"],
-                   root, env)
-    s, o, f, _ = parse_libtest_json(pr.stdout)
+    # `--no-fail-fast`: without it cargo stops at the first failing binary, so
+    # the count is "however far it got" and the other crates go unreported.
+    # The first executed run stopped at 307 of ~506 for exactly that reason.
+    pr, secs = run(["cargo", "test", "--workspace", *opt, "--no-fail-fast", "--",
+                    "-Z", "unstable-options", "--format", "json"], root, env)
+    s, o, f, _, bad_names = parse_libtest_json(pr.stdout)
     if s == 0:
         s2, f2 = parse_plain(pr.stdout)
         s, o, f = s2 + f2, s2, f2
     total_run, total_ok, total_failed = s, o, f
     rep.add("F. workspace", "cargo test --workspace is green", f == 0 and pr.returncode == 0,
-            f"{total_run} run, {total_ok} ok, {total_failed} failed, {secs:.0f}s")
+            f"{total_run} run, {total_ok} ok, {total_failed} failed, {secs:.0f}s"
+            + ("  FAILED: " + ", ".join(bad_names[:8]) if bad_names else ""))
     rep.note("F. workspace", "workspace test count (default, no --include-ignored)", str(total_run))
 
     # NOT re-run with --include-ignored here: the five suites above already
