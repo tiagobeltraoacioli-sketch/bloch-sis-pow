@@ -285,6 +285,15 @@ impl FinalityState {
             // Mutation hook, `cfg(test)` only: the arithmetic mainnet ran on
             // 2026-08-24, kept runnable so the incident stays reproducible.
             leak_adjusted
+        } else if votes.epoch < crate::params::LEAK_RECOVERY_ACTIVATION_EPOCH {
+            // GATED. Below the flag day the denominator is the leak-adjusted
+            // total with NO floor — the arithmetic the existing chain's blocks
+            // were folded under. The floor decides which checkpoints justify,
+            // and justification is committed into the state root, so applying
+            // it to historical epochs makes this node compute a root the
+            // headers do not carry and stops its replay dead. See
+            // `params::LEAK_RECOVERY_ACTIVATION_EPOCH`.
+            leak_adjusted
         } else {
             let floor = unleaked_total * MIN_QUORUM_DENOMINATOR_NUM / MIN_QUORUM_DENOMINATOR_DEN;
             leak_adjusted.max(floor)
@@ -414,7 +423,12 @@ impl FinalityState {
         }
 
         // ── 4. Leak recovery ───────────────────────────────────────────────
-        if !Self::leak_recovery_disabled() {
+        // GATED on the same flag day as the floor: `leaked` is committed into
+        // the state root (`state_root.rs`, `leaked: Vec<LeakRecord>`), so
+        // recovering it on historical epochs changes the root and stops replay.
+        if votes.epoch >= crate::params::LEAK_RECOVERY_ACTIVATION_EPOCH
+            && !Self::leak_recovery_disabled()
+        {
             //
             // THIS IS THE ZEROING THE RELAUNCH NEEDS. `leaked` used to have a
             // single write path (`+= bite`) with no decay, no reset and no
@@ -1530,9 +1544,24 @@ pub fn votes_from_partition<'a>(
 mod tests_hook {
     use std::sync::atomic::AtomicBool;
     /// Counterfactual: drop the leak out of the denominator entirely.
-    pub(super) static IGNORE_LEAK_IN_DENOMINATOR: AtomicBool = AtomicBool::new(false);
+    thread_local! {
+        static IGNORE_LEAK_IN_DENOMINATOR_TL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    /// Thread-local; see `params::rehearsal::TlFlag`.
+    pub(super) static IGNORE_LEAK_IN_DENOMINATOR: crate::params::rehearsal::TlFlag =
+        crate::params::rehearsal::TlFlag(&IGNORE_LEAK_IN_DENOMINATOR_TL);
     /// Reproduce the pre-fix denominator: leak-adjusted, no floor.
-    pub(super) static DISABLE_DENOMINATOR_FLOOR: AtomicBool = AtomicBool::new(false);
+    thread_local! {
+        static DISABLE_DENOMINATOR_FLOOR_TL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    /// Thread-local; see `params::rehearsal::TlFlag`.
+    pub(super) static DISABLE_DENOMINATOR_FLOOR: crate::params::rehearsal::TlFlag =
+        crate::params::rehearsal::TlFlag(&DISABLE_DENOMINATOR_FLOOR_TL);
     /// Reproduce the pre-fix accumulator: monotonic, never recovers.
-    pub(super) static DISABLE_LEAK_RECOVERY: AtomicBool = AtomicBool::new(false);
+    thread_local! {
+        static DISABLE_LEAK_RECOVERY_TL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    /// Thread-local; see `params::rehearsal::TlFlag`.
+    pub(super) static DISABLE_LEAK_RECOVERY: crate::params::rehearsal::TlFlag =
+        crate::params::rehearsal::TlFlag(&DISABLE_LEAK_RECOVERY_TL);
 }

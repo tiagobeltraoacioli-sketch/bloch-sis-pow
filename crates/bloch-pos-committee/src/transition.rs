@@ -1522,10 +1522,26 @@ impl CommittedState {
         // thread (`params::rehearsal::with_lookahead_zero`), which is how the
         // anti-partition tests are shown to go red against the pre-fix rule
         // without editing a line of source.
-        #[cfg(test)]
-        let back = 1 + crate::params::rehearsal::effective_lookahead();
-        #[cfg(not(test))]
-        let back = 1 + crate::committees::MIN_SEED_LOOKAHEAD_EPOCHS;
+        //
+        // GATED. Below `ANCESTRY_SEED_ACTIVATION_EPOCH` this is the ORIGINAL
+        // rule, `back = 1`, because the existing chain's blocks were produced
+        // and validated under it and boot is a replay of that log through this
+        // same function. Changing it unconditionally does not cause a
+        // disagreement, it stops the node: `ingest` rejects and returns, and
+        // the node parks silently at an old height. See the constant's docs.
+        let lookahead = if epoch < crate::params::ANCESTRY_SEED_ACTIVATION_EPOCH {
+            0
+        } else {
+            #[cfg(test)]
+            {
+                crate::params::rehearsal::effective_lookahead()
+            }
+            #[cfg(not(test))]
+            {
+                crate::committees::MIN_SEED_LOOKAHEAD_EPOCHS
+            }
+        };
+        let back = 1 + lookahead;
         let Some(src) = epoch.checked_sub(back) else {
             return Self::rehearsal_mutate(self.genesis_mix);
         };
@@ -6808,6 +6824,61 @@ mod tests {
             crate::params::LEAKED_ROSTER_ACTIVATION_EPOCH,
             1400,
             "the armed epoch must match docs/LEAKED-ROSTER-FLAG-DAY.md; changing it again is a new flag day"
+        );
+    }
+
+    /// The two flag days added for the preserve-history relaunch must stay
+    /// INERT until they are armed deliberately, and when armed they must match
+    /// the runbook that is versioned beside them.
+    ///
+    /// Same idiom, and the same job, as
+    /// `leaked_roster_armed_epoch_matches_the_runbook`: a tripwire against a
+    /// SILENT change of a consensus flag day. Arming either of these in an
+    /// epoch that is already in the PAST fails silently — the rule simply
+    /// applies to everything — which is how 1,600,000 BLCH once escaped a
+    /// write-off that never fired.
+    #[test]
+    fn the_replay_compatibility_gates_are_inert_until_armed() {
+        for (name, value) in [
+            ("ANCESTRY_SEED_ACTIVATION_EPOCH", crate::params::ANCESTRY_SEED_ACTIVATION_EPOCH),
+            ("LEAK_RECOVERY_ACTIVATION_EPOCH", crate::params::LEAK_RECOVERY_ACTIVATION_EPOCH),
+        ] {
+            assert_eq!(
+                value,
+                u64::MAX,
+                "{name} has been armed. That is a deliberate act and it needs three things \
+                 before this assertion may be updated: (1) the epoch must be STRICTLY IN THE \
+                 FUTURE at tag time — an epoch already past arms silently and applies the rule \
+                 to the whole history; (2) it must fall AFTER the rollout completes, since all \
+                 64 validators stop and restart together; (3) the value must match the runbook \
+                 versioned in docs/. Update this test in the same commit that arms it."
+            );
+        }
+    }
+
+    /// Below its flag day, `seed_for_epoch` must be the ORIGINAL rule, mix of
+    /// `epoch − 1`. This is what lets the corrected binary replay the existing
+    /// log at all: the seed decides the partition, the partition decides which
+    /// attestations are admitted, and that is committed in the state root.
+    ///
+    /// The break is at epoch 1, not epoch 2 — `seed_epoch(1)` is `None` under
+    /// the corrected rule, so it takes the genesis mix while the original takes
+    /// `boundary_mixes[0]`, the close of epoch 0, which is not the genesis mix
+    /// once epoch 0 has produced a block.
+    #[test]
+    fn below_its_flag_day_the_seed_is_the_original_rule() {
+        let (_t, mut g, _c) = setup(4);
+        // A boundary mix for epoch 0 that is NOT the genesis mix, which is the
+        // only case that can tell the two rules apart at epoch 1.
+        g.boundary_mixes.insert(0, [0xA5u8; 32]);
+        assert_ne!(g.genesis_mix, [0xA5u8; 32], "fixture must distinguish the two rules");
+
+        assert_eq!(
+            g.seed_for_epoch(1),
+            [0xA5u8; 32],
+            "epoch 1 below the flag day must read boundary_mixes[0] — the ORIGINAL rule. \
+             Reading the genesis mix here is the corrected rule leaking into history, and it \
+             stops every node's boot replay at epoch 1"
         );
     }
 

@@ -321,12 +321,44 @@ pub const BLOCK_BYTES_V2_ACTIVATION_EPOCH: u64 = 800;
 pub mod rehearsal {
     use std::cell::Cell;
 
+    /// A mutation switch that is **thread-local**, wearing the `AtomicBool`
+    /// interface so call sites do not have to change.
+    ///
+    /// Every switch here was a process-global `AtomicBool` guarded by [`HOOK`]
+    /// — a mutex the two tests flipping a switch take and the other ~260 tests
+    /// in the crate do NOT, while `cargo test` runs them in parallel on
+    /// separate threads. A switch read from inside a consensus function
+    /// (`epoch_committees`, `with_leak_applied`, `seed_for_epoch`) therefore
+    /// mutated the rule under every test running beside it. That produces false
+    /// REDS and false GREENS, so a green suite was a property of the thread
+    /// scheduler.
+    ///
+    /// Thread-local makes the leak impossible by construction rather than by
+    /// discipline. `MUTATE_SEED` was converted first; this covers the rest,
+    /// including `RESTORE_ZERO_STAKE_FILTER` — the switch the ONLY proof of the
+    /// roster unification depends on, and therefore the switch the decision to
+    /// keep epoch 1400 armed on 64 production nodes rests on.
+    pub struct TlFlag(pub &'static std::thread::LocalKey<Cell<bool>>);
+
+    impl TlFlag {
+        pub fn store(&self, v: bool, _order: std::sync::atomic::Ordering) {
+            self.0.with(|c| c.set(v));
+        }
+        pub fn load(&self, _order: std::sync::atomic::Ordering) -> bool {
+            self.0.with(|c| c.get())
+        }
+    }
+
     /// Restores the pre-2026-08-24 `effective_stake > 0` filter that ran
     /// *before* the Fisher-Yates shuffle in `committees::epoch_committees` —
     /// i.e. puts the roster-split defect back, so the tests that pin the fix
     /// can be shown to go red. Read only through
     /// `committees::mutation_restores_zero_stake_filter`.
-    pub static RESTORE_ZERO_STAKE_FILTER: AtomicBool = AtomicBool::new(false);
+    thread_local! {
+        static RESTORE_ZERO_STAKE_FILTER_TL: Cell<bool> = const { Cell::new(false) };
+    }
+    /// Thread-local; see [`TlFlag`] for why this is not an `AtomicBool`.
+    pub static RESTORE_ZERO_STAKE_FILTER: TlFlag = TlFlag(&RESTORE_ZERO_STAKE_FILTER_TL);
 
     /// Makes `transition::with_leak_applied` REMOVE a validator whose leak has
     /// eaten its whole stake, instead of keeping it at `effective_stake = 0`.
@@ -341,7 +373,11 @@ pub mod rehearsal {
     /// rosters as fixtures rather than through the call sites.
     ///
     /// Read only through `transition::mutation_leak_drops_zeroed`.
-    pub static LEAK_DROPS_ZEROED: AtomicBool = AtomicBool::new(false);
+    thread_local! {
+        static LEAK_DROPS_ZEROED_TL: Cell<bool> = const { Cell::new(false) };
+    }
+    /// Thread-local; see [`TlFlag`] for why this is not an `AtomicBool`.
+    pub static LEAK_DROPS_ZEROED: TlFlag = TlFlag(&LEAK_DROPS_ZEROED_TL);
 
     /// Serializes every test that flips a switch in this module. The switches
     /// are process-global and `cargo test` runs test functions on threads, so
@@ -421,6 +457,61 @@ pub mod rehearsal {
         }
     }
 }
+
+/// Flag day for the **seed look-ahead** (`CommittedState::seed_for_epoch`).
+///
+/// Below this epoch the seed for `E` is the mix at the close of `E − 1` — the
+/// original rule, which the existing chain's blocks were produced and validated
+/// under. From it, the seed is the close of `E − 1 − `[`crate::committees::MIN_SEED_LOOKAHEAD_EPOCHS`].
+///
+/// # Why this gate exists, and why it was briefly deleted
+///
+/// It was removed on 2026-08-24 on the integration coordinator's instruction,
+/// under the premise that a coordinated stop — all 64 validators halted and
+/// restarted together — makes a flag day unnecessary, because there is no live
+/// network for a gradual rollout to split.
+///
+/// **The premise was wrong, and the reason is worth keeping.** Persistence here
+/// is an append-only BLOCK LOG (`store.rs`), and boot is a REPLAY of that log
+/// through the same transition that accepted the blocks live. The transition
+/// re-validates the state root (`StateRootMismatch`), and the seed decides the
+/// committee partition, which decides which attestations are admitted, which
+/// changes the root. So a node running the new rule against the old log does
+/// not merely disagree at the boundary — it stops. `Engine::ingest` rejects and
+/// returns, so the node ends up silently parked at an old height with a
+/// truncated chain, and cannot follow the live network either. No panic, no
+/// alarm.
+///
+/// The break is at **epoch 1**, not epoch 2: `seed_epoch(1)` is `None`, so the
+/// corrected rule takes the genesis mix while the base takes `boundary_mixes[0]`
+/// — the close of epoch 0, which is not the genesis mix once epoch 0 has
+/// produced a block. First divergent proposer slot is 32; only epoch 0 is
+/// common ground. Without this gate the new binary stops near the start of the
+/// chain.
+///
+/// `u64::MAX` means INERT. Fill at tag time, and it must be **strictly in the
+/// future** and **after the rollout completes** — arming an epoch already in the
+/// past is the failure mode that let 1,600,000 BLCH escape a write-off that
+/// never fired, and it fails SILENTLY. The gate reads the epoch derived from the
+/// BLOCK, never a local clock: reading node-local mutable state is what caused
+/// the 2026-08-08 `expected_bits` consensus split.
+pub const ANCESTRY_SEED_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+/// Flag day for **inactivity-leak recovery and the quorum-denominator floor**
+/// ([`INACTIVITY_LEAK_RECOVERY_QUOTIENT`], [`MIN_QUORUM_DENOMINATOR_NUM`]).
+///
+/// Same reason as [`ANCESTRY_SEED_ACTIVATION_EPOCH`], one layer along: the leak
+/// accumulator is committed into the state root (`state_root.rs`, `leaked:
+/// Vec<LeakRecord>`), and the floor changes which checkpoints justify, which is
+/// committed too. A node folding the log under new leak rules computes a root
+/// the historical headers do not carry.
+///
+/// An empty accumulator serializes as a zero length, byte-identical to a chain
+/// that never leaked, so blocks before the first bite replay unchanged and the
+/// break point is the first epoch boundary that accrues one.
+///
+/// `u64::MAX` means INERT. Same arming rules as above.
+pub const LEAK_RECOVERY_ACTIVATION_EPOCH: u64 = u64::MAX;
 
 /// Domain separation tags (§6.1). Fixed 16 bytes, right-padded with zeros, so
 /// no tag can be a prefix of another.
