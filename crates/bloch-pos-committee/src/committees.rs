@@ -323,6 +323,16 @@ pub fn epoch_committees(
             // A rejected draw still consumes XOF output, keeping the stream
             // position a deterministic function of the inputs.
         };
+        // The mutation switch that gives the epoch-partition invariant a real
+        // input: duplicate one index, lose another, keep the length. `false` in
+        // every build that is not a test build, so this folds away.
+        #[cfg(test)]
+        if crate::params::rehearsal::PARTITION_DUPLICATES_AN_INDEX
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            eligible[i] = eligible[j];
+            continue;
+        }
         eligible.swap(i, j);
     }
 

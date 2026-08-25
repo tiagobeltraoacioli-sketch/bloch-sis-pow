@@ -2970,18 +2970,34 @@ impl CommittedState {
         //
         // Why this condition is internal and cannot be driven by untrusted
         // input: both sides come from ONE value, `roster_next`, which is
-        // derived from already-validated committed state. The left side is the
-        // size of `epoch_committees`' own output over that roster; the right is
-        // that roster's length. Nothing a block, a transaction or a peer can
-        // carry appears on either side — the only way they can differ is if
-        // `epoch_committees` stops covering its input exactly once, which is a
-        // code bug in this crate. (`.len()`, not a stake filter: since
-        // 2026-08-24 membership is the whole index set, weight-zero included.)
+        // derived from already-validated committed state. Nothing a block, a
+        // transaction or a peer can carry appears on either side — the only way
+        // they can differ is if `epoch_committees` stops covering its input
+        // exactly once, which is a code bug in this crate.
+        //
+        // IDENTITY, NOT CARDINALITY, and that distinction is the whole value of
+        // this guard. It compared seat COUNT against roster LENGTH until
+        // 2026-08-24, and in that form it was a tautology in the shipped binary:
+        // both sides reduce to `roster_next.len()`, and no input can separate
+        // them. The concrete input that walks straight through the counting
+        // version is one character in the shuffle —
+        //
+        //     committees.rs:  eligible.swap(i, j)  ->  eligible[i] = eligible[j]
+        //
+        // which DUPLICATES one index and LOSES another while the length stays
+        // exactly right. A real partition bug, invisible to a seat count.
+        // Comparing the sorted index vectors catches it, and costs one sort of
+        // a list that is already tiny.
+        let mut seated: Vec<u32> = partition.iter().flatten().copied().collect();
+        seated.sort_unstable();
+        let mut expected: Vec<u32> = roster_next.iter().map(|v| v.index).collect();
+        expected.sort_unstable();
         consensus_invariant!(
-            partition.iter().map(Vec::len).sum::<usize>() == roster_next.len(),
-            "epoch partition must cover the roster exactly once: {} seats over {} validators",
-            partition.iter().map(Vec::len).sum::<usize>(),
-            roster_next.len()
+            seated == expected,
+            "epoch partition must seat every validator exactly once: {} seats over {} \
+             validators, and the index sets differ",
+            seated.len(),
+            expected.len()
         );
 
         st
@@ -6824,6 +6840,68 @@ mod tests {
             crate::params::LEAKED_ROSTER_ACTIVATION_EPOCH,
             1400,
             "the armed epoch must match docs/LEAKED-ROSTER-FLAG-DAY.md; changing it again is a new flag day"
+        );
+    }
+
+    /// **The epoch-partition invariant, exercised on the REAL condition.**
+    ///
+    /// The existing guard test greps the source to prove the check is
+    /// unconditional, then fires `consensus_invariant!(1 + 1 == 3)` — so it
+    /// proves the macro panics, never that this invariant can. This one drives
+    /// the actual condition with the input that separates identity from
+    /// cardinality: `eligible[i] = eligible[j]` in the shuffle, which duplicates
+    /// one index and loses another while the length stays exactly right.
+    ///
+    /// In its pre-2026-08-24 counting form the guard was GREEN on this input —
+    /// a real partition bug walked through it. That is why the comparison is
+    /// now on sorted index vectors.
+    #[test]
+    fn the_partition_invariant_catches_a_duplicated_index() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let _h = crate::params::rehearsal::HOOK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Control: unmutated, a boundary closes without tripping the guard.
+        crate::params::rehearsal::PARTITION_DUPLICATES_AN_INDEX.store(false, Relaxed);
+        let (_t, st, _c) = setup(8);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| st.clone().close_epoch()))
+                .is_ok(),
+            "control failed: the boundary panics even unmutated, so the mutation below \
+             would prove nothing"
+        );
+
+        // Cardinality is NOT enough: with the mutation on, the seat count still
+        // equals the roster length. This is the assertion the old guard made.
+        crate::params::rehearsal::PARTITION_DUPLICATES_AN_INDEX.store(true, Relaxed);
+        let (_t2, st2, _c2) = setup(8);
+        let seed = st2.seed_for_epoch(st2.epoch + 1);
+        let roster = st2.consensus_roster_at(st2.epoch + 1);
+        let partition = committees::epoch_committees(&seed, st2.epoch + 1, &roster);
+        assert_eq!(
+            partition.iter().map(Vec::len).sum::<usize>(),
+            roster.len(),
+            "the mutation is supposed to preserve the SEAT COUNT — if it does not, it is \
+             not reproducing the bug this guard was weak to"
+        );
+        let mut seated: Vec<u32> = partition.iter().flatten().copied().collect();
+        seated.sort_unstable();
+        let mut expected: Vec<u32> = roster.iter().map(|v| v.index).collect();
+        expected.sort_unstable();
+        assert_ne!(
+            seated, expected,
+            "the mutation did not actually duplicate an index, so the guard below is \
+             not being tested on the input it exists for"
+        );
+
+        // And the shipped guard goes red on it.
+        let red =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| st2.clone().close_epoch()));
+        crate::params::rehearsal::PARTITION_DUPLICATES_AN_INDEX.store(false, Relaxed);
+        assert!(
+            red.is_err(),
+            "THE PARTITION INVARIANT IS BACK TO COUNTING SEATS: an index was duplicated and \
+             another lost, the length stayed right, and the guard passed. That is a real \
+             partition bug shipping undetected."
         );
     }
 

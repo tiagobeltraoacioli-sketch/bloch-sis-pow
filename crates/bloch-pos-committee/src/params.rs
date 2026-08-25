@@ -379,6 +379,21 @@ pub mod rehearsal {
     /// Thread-local; see [`TlFlag`] for why this is not an `AtomicBool`.
     pub static LEAK_DROPS_ZEROED: TlFlag = TlFlag(&LEAK_DROPS_ZEROED_TL);
 
+    thread_local! {
+        static PARTITION_DUPLICATES_AN_INDEX_TL: Cell<bool> = const { Cell::new(false) };
+    }
+    /// Makes the Fisher-Yates step in `committees::epoch_committees` do
+    /// `eligible[i] = eligible[j]` instead of `eligible.swap(i, j)` —
+    /// DUPLICATING one validator index and LOSING another while the list length
+    /// stays exactly right.
+    ///
+    /// It exists to give the epoch-partition `consensus_invariant!` an input
+    /// that can actually make it fail. In its pre-2026-08-24 counting form
+    /// (seat count vs roster length) this mutation walks straight through: both
+    /// sides still reduce to the same number. Comparing sorted index vectors
+    /// catches it. Thread-local; see [`TlFlag`].
+    pub static PARTITION_DUPLICATES_AN_INDEX: TlFlag = TlFlag(&PARTITION_DUPLICATES_AN_INDEX_TL);
+
     /// Serializes every test that flips a switch in this module. The switches
     /// are process-global and `cargo test` runs test functions on threads, so
     /// without this a mutation test would silently corrupt an unrelated one.
