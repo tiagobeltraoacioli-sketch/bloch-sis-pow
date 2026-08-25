@@ -1351,6 +1351,7 @@ mod tests {
         );
         // Meanwhile a validator that stayed away kept paying.
         assert!(st.leaked_of(41) > st.leaked_of(40), "the still-absent validator must owe more");
+    }
 
     // ── TASK 1: zeroing the leak accumulator for the relaunch ──────────────
     //
