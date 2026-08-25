@@ -1173,16 +1173,41 @@ fn committee_sizes_differ_by_at_most_one() {
     }
 }
 
+/// Zero-stake validators DO get a seat — an inert one.
+///
+/// Inverted 2026-08-24. This test used to assert the opposite: that
+/// `epoch_committees` dropped every validator with `effective_stake == 0`. That
+/// filter ran *before* the Fisher-Yates shuffle, so a roster of 64 and the same
+/// roster with one validator leaked to zero produced entirely different
+/// permutations — and `transition.rs` holds both variants for one epoch (step 8
+/// reads the leak-applied roster, the boundary tally reads the unleaked one).
+/// The result was that attestations a block had admitted were dropped at the
+/// boundary and nothing finalized.
+///
+/// Membership is now a pure function of (seed, epoch, index set); stake decides
+/// WEIGHT only, and a zero-weight member contributes 0 to both sides of the
+/// quorum. Ineligibility — slashed, exited, not yet activated — is applied at
+/// the roster level in `transition::duty_roster_at`, which is the one predicate
+/// all four roster producers share. See `committees::epoch_committees`' docs.
 #[test]
-fn ineligible_validators_are_never_assigned() {
+fn zero_stake_validators_hold_an_inert_seat_rather_than_being_dropped() {
     let mut vs = uniform_set(100, 100_000);
     for v in vs.iter_mut().take(40) {
         v.effective_stake = 0;
     }
     let cs = epoch_committees(&MIX, 1, &vs);
     let all: Vec<u32> = cs.iter().flatten().copied().collect();
-    assert_eq!(all.len(), 60);
-    assert!(all.iter().all(|v| *v >= 40));
+    assert_eq!(all.len(), 100, "every validator in the index set gets exactly one seat");
+    assert!((0..40).all(|i| all.contains(&i)), "the zero-stake validators must be seated");
+
+    // The seats are inert: identical partition to one where those 40 carry
+    // stake, so no call path can move the committees by changing stake.
+    let funded = uniform_set(100, 100_000);
+    assert_eq!(
+        epoch_committees(&MIX, 1, &funded),
+        cs,
+        "the partition must be invariant under a pure stake change"
+    );
 }
 
 #[test]

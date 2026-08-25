@@ -120,6 +120,7 @@ fn spawn_node(
     dir: &Path,
     genesis: &Path,
     listen: u16,
+    rpc: u16,
     peers: &[u16],
     log: &Path,
 ) -> Child {
@@ -147,8 +148,17 @@ fn spawn_node(
             // number, so leaving it on would have two of them fail to bind and
             // exit. A real operator gives each node its own; the test does the
             // same rather than disabling the server and testing less.
+            //
+            // Allocated by `free_port`, NOT derived as `listen + 1000`, which
+            // is what this used to do and is why the test failed roughly one
+            // run in five. `free_port` returns an OS-chosen EPHEMERAL port; on
+            // macOS that range is 49152-65535, so `listen + 1000` overflows
+            // u16 whenever the OS hands out anything above 64535 and the test
+            // panics with "attempt to add with overflow" before a single node
+            // starts. Three draws per run made that a ~17% failure rate that
+            // looked like flakiness and was arithmetic.
             "--rpc-port",
-            &(listen + 1000).to_string(),
+            &rpc.to_string(),
             "--stop-at-slot",
             &STOP_SLOT.to_string(),
         ])
@@ -192,6 +202,7 @@ fn a_cold_node_builds_the_same_chain_from_genesis_without_a_donated_datadir() {
     ]);
 
     let ports: Vec<u16> = (0..3).map(|_| free_port()).collect();
+    let rpc_ports: Vec<u16> = (0..3).map(|_| free_port()).collect();
     let all: Vec<u16> = ports.clone();
 
     let mut fleet = Fleet(Vec::new());
@@ -200,6 +211,7 @@ fn a_cold_node_builds_the_same_chain_from_genesis_without_a_donated_datadir() {
             &root.join(format!("d{i}")),
             &genesis,
             ports[i],
+            rpc_ports[i],
             &all,
             &root.join(format!("n{i}.log")),
         ));
@@ -224,6 +236,7 @@ fn a_cold_node_builds_the_same_chain_from_genesis_without_a_donated_datadir() {
         &cold_dir,
         &genesis,
         ports[2],
+        rpc_ports[2],
         &all,
         &root.join("n2.log"),
     ));
@@ -306,10 +319,57 @@ fn a_cold_node_builds_the_same_chain_from_genesis_without_a_donated_datadir() {
     let b = std::fs::read(cold_dir.join("blocks.log")).expect("cold block log");
     let n = a.len().min(b.len());
     assert!(n > 0, "one of the block logs is empty");
-    assert_eq!(
-        &a[..n],
-        &b[..n],
-        "the block logs diverge: the cold node stored a different chain"
+    //
+    // NOTE ON WHAT THIS DOES AND DOES NOT PROVE. This is a BYTE comparison of
+    // two files, which is strictly stronger than "the two nodes agree on the
+    // chain" — and the gap between the two is real, not hypothetical.
+    //
+    // MEASURED, 2026-08-23, 1 failure in 10 runs on this branch:
+    //     founder log 34145 B, cold log 34146 B, first diff at byte 29241
+    //     common slots [11, 36, 40]
+    //     all common slots agree on (block id, head root)? TRUE
+    //
+    // That is two nodes on the SAME chain, agreeing on every block they
+    // share, whose logs still differ by one byte. They can: the founder has
+    // produced since slot 0 and REWRITES its log whole on every reorg
+    // (`Store::rewrite`), while the cold node appends as it syncs. Same
+    // chain, different write history, so byte-identity is not implied. The
+    // comment above claiming determinism makes this "the same claim as (2)"
+    // is wrong — determinism gives the same STATE for the same blocks, not
+    // the same BYTES in a file two nodes wrote by different routes.
+    //
+    // Left as an assertion rather than weakened, because it does catch a real
+    // divergence too and this test cannot decode the log (bloch-pos-node is a
+    // binary crate, so `Store::read_all` is not reachable from `tests/`).
+    // What IS fixed here is the message: on failure it now prints whether the
+    // nodes actually disagreed, so the next person to see this knows in one
+    // line whether they are looking at a consensus bug or at log framing.
+    let byte_identical = a[..n] == b[..n];
+    if !byte_identical {
+        let off = (0..n).find(|i| a[*i] != b[*i]).unwrap_or(n);
+        let agree = common.iter().all(|s| cold[s] == founder[s]);
+        eprintln!(
+            "block logs differ: founder {} B, cold {} B, first differing byte {off}",
+            a.len(),
+            b.len()
+        );
+        eprintln!("  common slots: {common:?}");
+        eprintln!("  do the nodes agree on (block id, head root) at every common slot? {agree}");
+        eprintln!(
+            "  {}",
+            if agree {
+                "THEY AGREE — this is a log-framing difference, NOT a consensus divergence. \
+                 See the note above this assertion."
+            } else {
+                "THEY DISAGREE — this IS a consensus divergence. Investigate."
+            }
+        );
+    }
+    assert!(
+        byte_identical,
+        "the founder's and the cold node's block logs are not byte-identical over their \
+         common prefix; see the printed diagnostic above for whether the two nodes actually \
+         disagreed about the chain"
     );
 
     let _ = std::fs::remove_dir_all(&root);
