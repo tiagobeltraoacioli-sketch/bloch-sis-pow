@@ -209,26 +209,6 @@ impl FinalityState {
         false
     }
 
-    /// Fold one epoch of votes into the state.
-    ///
-    /// Order inside this function matters and is part of consensus:
-    /// 1. tally votes with **pre-epoch** leak-adjusted stakes (this epoch's
-    ///    leak must not influence this epoch's own quorum),
-    /// 2. justify / finalize,
-    /// 3. tick the leak using the **post-vote** finalized epoch, so the epoch
-    ///    that restores finality does not also punish its participants.
-    /// `true` only in a test build with the mutation switch on. Constant
-    /// `false` everywhere else, so the branch above folds away in a release.
-    #[inline]
-    fn denominator_ignores_leak() -> bool {
-        #[cfg(test)]
-        {
-            return tests_hook::IGNORE_LEAK_IN_DENOMINATOR.load(std::sync::atomic::Ordering::Relaxed);
-        }
-        #[cfg(not(test))]
-        false
-    }
-
     /// Mutation switch: reproduce the PRE-FIX denominator, with no floor. The
     /// two tests that document the 2026-08-24 false quorum set it, so the
     /// disease stays reproducible from this repository after the cure landed.
@@ -257,6 +237,14 @@ impl FinalityState {
         false
     }
 
+    /// Fold one epoch of votes into the state.
+    ///
+    /// Order inside this function matters and is part of consensus:
+    /// 1. tally votes with **pre-epoch** leak-adjusted stakes (this epoch's
+    ///    leak must not influence this epoch's own quorum),
+    /// 2. justify / finalize,
+    /// 3. tick the leak using the **post-vote** finalized epoch, so the epoch
+    ///    that restores finality does not also punish its participants.
     pub fn process_epoch(&mut self, votes: &EpochVotes<'_>) -> Result<EpochOutcome, FinalityError> {
         if votes.epoch != self.next_epoch {
             return Err(FinalityError::OutOfOrderEpoch {
