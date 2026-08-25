@@ -551,6 +551,31 @@ def check_chain_info_arity(root: Path, rep: Report):
                                             else f", all {CHAIN_INFO_ARITY} args"))
 
 
+def check_no_conflict_markers(root: Path, rep: Report):
+    """No source file may carry an unresolved conflict marker.
+
+    Obvious, and worth a gate anyway: every other static check here matches
+    symbols and call shapes, and a `<<<<<<<` block removes neither. The naive
+    three-way merge of ab9ca4e1 and a5c20a90 leaves markers in transition.rs
+    and engine.rs while 42 of 43 gates still pass, so without this the report
+    would call an unresolved tree preserved.
+    """
+    g = "D2. structural pins (call shape)"
+    bad = []
+    for crate in (COMMITTEE, NODE):
+        d = root / crate
+        if not d.is_dir():
+            continue
+        for q in sorted(d.rglob("*.rs")):
+            txt = q.read_text(errors="replace")
+            for marker in ("<<<<<<< ", ">>>>>>> "):
+                if any(l.startswith(marker) for l in txt.splitlines()):
+                    bad.append(str(q.relative_to(root)))
+                    break
+    rep.add(g, "no unresolved conflict markers", not bad,
+            "; ".join(sorted(set(bad))) if bad else "clean across both consensus crates")
+
+
 def check_root_components(root: Path, rep: Report):
     g = "D2. structural pins (call shape)"
     p = root / f"{COMMITTEE}/src/state_root.rs"
@@ -832,6 +857,7 @@ def main():
     check_root_components(root, rep)
     check_perf_feature_off(root, rep)
     check_chain_info_arity(root, rep)
+    check_no_conflict_markers(root, rep)
     if not args.no_cargo:
         check_cargo(root, rep, present, args.target_dir)
     else:
@@ -845,7 +871,7 @@ def main():
         print("!! THE VERIFIER EXECUTED ZERO GATES. This report means NOTHING.")
         print("!" * 70)
         return 2
-    expected_min = 3 + 2 + len(SUITES) + len(PERF_SYMBOLS) + len(STRUCTURAL_PINS) + 4
+    expected_min = 3 + 2 + len(SUITES) + len(PERF_SYMBOLS) + len(STRUCTURAL_PINS) + 5
     if not args.no_cargo:
         expected_min += 3  # build + tripwire-run + workspace-green
     if len(gates) < expected_min:
