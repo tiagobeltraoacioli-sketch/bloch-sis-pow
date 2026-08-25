@@ -49,3 +49,8 @@ deploy/artifacts/
 __pycache__/
 *.pyc
 target-wp7/
+bench/bloch-pos-wp7
+bench/**/*.pid
+bench/**/*.key
+bench/**/meta.bin
+bench/**/ws_latest.bin
