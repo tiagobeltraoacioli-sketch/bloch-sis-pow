@@ -449,19 +449,37 @@ pub fn attestation_root(attestations: &[Attestation]) -> [u8; 32] {
 /// attestation this rule excludes is one whose committee a fresh node could
 /// not re-derive from the parent state alone (§5.5 fails closed).
 ///
-/// **KNOWN DIVERGENCE, recorded 2026-08-12, not fixed here.** "One definition,
-/// used twice" is true of this function's two callers, but this function and
-/// [`crate::transition`]'s step 8 do not draw the same committee: this one
-/// calls [`crate::slot_subcommittee`] (the sampled 8-validator draw), the
-/// transition calls [`crate::committees::committee_for_slot`] (the F1
-/// partition). The partition is the current design and the sampled draw is
-/// superseded — see the lib.rs banner — so a producer filtering with this
-/// predicate can drop attestations its own validator would have accepted, and
-/// keep ones it would refuse. It was masked while `derive::validate_block`
-/// existed, because that validator used this same superseded rule and so
-/// agreed with the producer perfectly while both disagreed with the node.
-/// Deleting the parallel validator is what exposed it. Fixing it is a change
-/// to `produce.rs`'s filter, on a seam this task did not open.
+/// **Divergence recorded 2026-08-12, CLOSED 2026-08-25.** This function used
+/// to draw the committee with [`crate::slot_subcommittee`] (the superseded
+/// sampled 8-validator draw) while [`crate::transition`]'s step 8 draws with
+/// [`crate::committees::committee_for_slot`] (the F1 partition) — so a
+/// producer filtering with this predicate could drop attestations the
+/// transition accepts and keep ones it refuses. It was masked while
+/// `derive::validate_block` existed, because that parallel validator used the
+/// same superseded rule and so agreed with the producer perfectly while both
+/// disagreed with the node. Deleting it is what exposed the gap. Both sides
+/// now draw the F1 partition from the same parent-committed seed and active
+/// set.
+///
+/// # Why this one carries NO flag day, unlike its three siblings
+///
+/// The other three corrections landing beside it
+/// ([`crate::params::ANCESTRY_SEED_ACTIVATION_EPOCH`],
+/// [`crate::params::LEAK_RECOVERY_ACTIVATION_EPOCH`],
+/// [`crate::params::LEAKED_ROSTER_ACTIVATION_EPOCH`]) change a fold rule: they
+/// decide what the state root is, so applying them to history a node already
+/// stores makes it compute a root the stored headers do not carry, and its
+/// replay stops. This one changes nothing a node folds. It is a PRODUCER-SIDE
+/// filter — the only non-test caller is [`crate::produce::produce`] — and the
+/// rule it must agree with, step 8 of `compute_post_state`, is itself ungated
+/// and always has been. Putting this behind epoch 1400 would therefore not
+/// make it safer; it would keep the producer disagreeing with every validator
+/// on the network until 1400, which is the defect, deliberately extended.
+///
+/// The consequence for replay, stated so it can be checked rather than
+/// believed: no code path reachable from `Engine::ingest` calls this function,
+/// so a replay of the existing block log is byte-identical with and without
+/// it. That is the A/B this change was shipped under.
 pub fn validate_included_attestation(
     parent: &ParentState<'_>,
     block_slot: u64,
@@ -475,7 +493,10 @@ pub fn validate_included_attestation(
     }
     let seed = sortition_seed(parent, att.data.slot).ok_or(RejectReason::NotInCommittee)?;
     let active = active_validators(&parent.chain.registry, crate::epoch_of(block_slot));
-    let committee = crate::slot_subcommittee(&seed, att.data.slot, &active);
+    // The F1 partition, NOT `slot_subcommittee`. This must be the same draw
+    // `transition::compute_post_state` step 8 makes, or the producer assembles
+    // blocks the network refuses (`TransitionError::Attestation`).
+    let committee = crate::committees::committee_for_slot(&seed, att.data.slot, &active);
     validate_attestation(att, &committee, block_slot, verifier)
 }
 

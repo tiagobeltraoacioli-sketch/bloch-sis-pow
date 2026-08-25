@@ -278,7 +278,7 @@ fn run_epoch(
 
     // ── close_epoch: tally against the UNLEAKED duty roster ──
     let mut accepted = Vec::new();
-    let ev = votes_from_partition(epoch, &duty, &admitted, &SEED, &mut accepted);
+    let ev = votes_from_partition(epoch, &duty, &duty, &admitted, &SEED, &mut accepted);
     let survived = ev.attestations.len();
     let out = st.process_epoch(&ev).expect("dense, in-order epochs");
     (out.justified.map(|c| c.root), admitted.len(), survived)
@@ -942,7 +942,7 @@ mod tests {
             .collect();
 
         let mut accepted = Vec::new();
-        let ev = votes_from_partition(epoch, &duty, &stream, &SEED, &mut accepted);
+        let ev = votes_from_partition(epoch, &duty, &duty, &stream, &SEED, &mut accepted);
         let survived = ev.attestations.len();
         let out = st.process_epoch(&ev).expect("dense, in-order epochs");
         OneEpoch { justified: out.justified.map(|c| c.root), admitted: stream.len(), survived }
@@ -985,7 +985,7 @@ mod tests {
                 })
                 .collect();
             let mut accepted = Vec::new();
-            let ev = votes_from_partition(epoch, &duty, &stream, &SEED, &mut accepted);
+            let ev = votes_from_partition(epoch, &duty, &duty, &stream, &SEED, &mut accepted);
             let survived = ev.attestations.len();
             let res = st.process_epoch(&ev).expect("dense, in-order epochs");
             out.push(HealthyRecord {

@@ -2734,10 +2734,21 @@ impl CommittedState {
             // `active_set` is the whole duty roster, not the slot committee:
             // the union of an epoch's committees IS the active set, so the
             // quorum denominator is total active stake (F1).
+            //
+            // The PARTITION is drawn from `consensus_roster_at` — the roster
+            // step 8 admitted these votes against — while the DENOMINATOR base
+            // stays the unleaked `roster`, because `process_epoch` subtracts
+            // the leak itself and would otherwise charge it twice. Below
+            // `LEAKED_ROSTER_ACTIVATION_EPOCH` the two are the same value, so
+            // this changes nothing about the chain as it stands; above it, it
+            // is what keeps the boundary tally reading the same committee the
+            // block did.
             let mut accepted = Vec::new();
+            let partition_set = st.consensus_roster_at(closing);
             let epoch_votes = finality::votes_from_partition(
                 closing,
                 &roster,
+                &partition_set,
                 &votes,
                 &st.seed_for_epoch(closing),
                 &mut accepted,
@@ -7009,7 +7020,7 @@ mod tests {
         for epoch in 1..400u64 {
             let roster = g.duty_roster_at(0);
             let mut accepted = Vec::new();
-            let votes = finality::votes_from_partition(epoch, &roster, &[], &seed, &mut accepted);
+            let votes = finality::votes_from_partition(epoch, &roster, &roster, &[], &seed, &mut accepted);
             if g.finality_engine.process_epoch(&votes).is_err() {
                 break;
             }
@@ -7116,7 +7127,7 @@ mod tests {
         for epoch in 1..400u64 {
             let roster = g.duty_roster_at(0);
             let mut accepted = Vec::new();
-            let votes = finality::votes_from_partition(epoch, &roster, &[], &seed, &mut accepted);
+            let votes = finality::votes_from_partition(epoch, &roster, &roster, &[], &seed, &mut accepted);
             if g.finality_engine.process_epoch(&votes).is_err() {
                 break;
             }

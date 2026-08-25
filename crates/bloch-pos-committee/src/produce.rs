@@ -412,28 +412,35 @@ mod tests {
         (chain, parent_header, reveal_states)
     }
 
-    /// Attestations for the parent slot from the full slot subcommittee,
-    /// signed by the mock suite — plus helpers to reach the scheduled
-    /// proposer.
+    /// One attestation per F1 partition committee member across the block's
+    /// epoch (the partition spreads the fixture's validators over the first
+    /// slots of the epoch, one member each), signed by the mock suite — the
+    /// same committee rule `validate_included_attestation` and the
+    /// transition's step 8 enforce since the 2026-08-25 alignment.
     fn collected_attestations(parent: &ParentState<'_>) -> Vec<Attestation> {
-        let att_slot = PARENT_SLOT;
-        let seed = derive::sortition_seed(parent, att_slot).expect("seed committed");
-        let active =
-            derive::active_validators(&parent.chain.registry, crate::epoch_of(SLOT));
-        let committee = crate::slot_subcommittee(&seed, att_slot, &active);
-        committee
-            .iter()
-            .map(|&v| {
-                let data = AttestationData {
-                    slot: att_slot,
-                    head: *parent.header.id().as_bytes(),
-                    source_epoch: 0,
-                    source_root: parent.header.justified_root,
-                    target_epoch: 1,
-                    target_root: *parent.header.id().as_bytes(),
-                };
-                let signature = mock_sig(v, &data.signing_root());
-                Attestation { data, validator: v, signature }
+        let epoch = crate::epoch_of(SLOT);
+        let active = derive::active_validators(&parent.chain.registry, epoch);
+        let first = epoch * crate::params::SLOTS_PER_EPOCH;
+        (first..=PARENT_SLOT)
+            .flat_map(|att_slot| {
+                let seed = derive::sortition_seed(parent, att_slot).expect("seed committed");
+                let committee =
+                    crate::committees::committee_for_slot(&seed, att_slot, &active);
+                committee
+                    .into_iter()
+                    .map(move |v| {
+                        let data = AttestationData {
+                            slot: att_slot,
+                            head: *parent.header.id().as_bytes(),
+                            source_epoch: 0,
+                            source_root: parent.header.justified_root,
+                            target_epoch: 1,
+                            target_root: *parent.header.id().as_bytes(),
+                        };
+                        let signature = mock_sig(v, &data.signing_root());
+                        Attestation { data, validator: v, signature }
+                    })
+                    .collect::<Vec<_>>()
             })
             .collect()
     }
@@ -540,6 +547,84 @@ mod tests {
         assert_eq!(envelope.body.transactions, txs());
         // And the header names the validator that built it.
         assert_eq!(h.proposer_index, proposer);
+    }
+
+    /// The producer's inclusion filter must draw the SAME committee the
+    /// transition's step 8 draws — `committees::committee_for_slot` (the F1
+    /// partition), not the superseded `slot_subcommittee` sample.
+    ///
+    /// The divergence was recorded in derive.rs on 2026-08-12 and was harmless
+    /// only while gossip pools stayed empty. The shared-basis gossip fix fills
+    /// them, and a producer filtering by the wrong draw then assembles blocks
+    /// the whole network refuses at step 8 (`TransitionError::Attestation`).
+    ///
+    /// Both halves are here: the sampled-only validator must be DROPPED, and
+    /// the real partition member must be KEPT (a filter that drops everything
+    /// would satisfy the first half alone).
+    #[test]
+    fn the_inclusion_filter_draws_the_partition_committee_not_the_sampled_one() {
+        let (chain, pheader, reveals) = fixture();
+        let parent = ParentState { header: &pheader, chain: &chain, reveal_states: &reveals };
+        let epoch = crate::epoch_of(SLOT);
+        let active = derive::active_validators(&parent.chain.registry, epoch);
+
+        // A slot of this epoch whose partition committee is non-empty and
+        // whose superseded sampled draw contains someone the partition does
+        // not — i.e. a slot where the two rules actually disagree. If the
+        // fixture stopped exposing one, this test proves nothing and says so.
+        let (att_slot, member, intruder) = (epoch * crate::params::SLOTS_PER_EPOCH..=PARENT_SLOT)
+            .find_map(|slot| {
+                let seed = derive::sortition_seed(&parent, slot)?;
+                let partition = crate::committees::committee_for_slot(&seed, slot, &active);
+                let member = *partition.first()?;
+                let intruder = crate::slot_subcommittee(&seed, slot, &active)
+                    .into_iter()
+                    .find(|v| !partition.contains(v))?;
+                Some((slot, member, intruder))
+            })
+            .expect("the fixture must expose a slot where the two draws disagree");
+
+        let vote = |v: u32| {
+            let data = AttestationData {
+                slot: att_slot,
+                head: *parent.header.id().as_bytes(),
+                source_epoch: 0,
+                source_root: parent.header.justified_root,
+                target_epoch: 1,
+                target_root: *parent.header.id().as_bytes(),
+            };
+            Attestation { data, validator: v, signature: mock_sig(v, &data.signing_root()) }
+        };
+
+        // The predicate itself, both directions.
+        assert!(
+            derive::validate_included_attestation(&parent, SLOT, &vote(member), &MockCrypto)
+                .is_ok(),
+            "a member of the partition committee the transition uses must be includable"
+        );
+        assert_eq!(
+            derive::validate_included_attestation(&parent, SLOT, &vote(intruder), &MockCrypto),
+            Err(crate::attestation::RejectReason::NotInCommittee),
+            "v{intruder} is in the superseded sampled draw for slot {att_slot} but NOT in the \
+             partition committee the transition enforces — including it would doom the block"
+        );
+
+        // And end to end: the producer carries the one and drops the other.
+        let proposer = derive::scheduled_proposer(&parent, SLOT).expect("stake is nonzero");
+        let envelope = produce(
+            &parent,
+            SLOT,
+            proposer,
+            &mut producer_randao(proposer),
+            &[vote(intruder), vote(member)],
+            &txs(),
+            &MockSigner(proposer),
+            &MockCrypto,
+        )
+        .expect("the scheduled proposer must produce");
+        let carried: Vec<u32> = envelope.body.attestations.iter().map(|a| a.validator).collect();
+        assert!(carried.contains(&member), "carried {carried:?}, expected v{member} kept");
+        assert!(!carried.contains(&intruder), "carried {carried:?}, expected v{intruder} dropped");
     }
 
     // ── Refusals ──
