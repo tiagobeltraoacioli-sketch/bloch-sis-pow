@@ -273,10 +273,16 @@ const CHECKPOINT_ROSTER_WINDOW: usize = 128;
 /// second computation would be the same number.
 ///
 /// The two counters exist so a test can prove the lookup was taken rather than
-/// assume it. They are per-ring `Cell`s and deliberately **not** process-wide
-/// atomics: a global counter is inflated by every other test sharing the
-/// binary, and an assertion some other test can satisfy on your behalf is not
-/// a proof.
+/// assume it, and so the *mechanism* can be reported as a number instead of a
+/// claim: how many votes this node priced with the voter's own table, and how
+/// many it priced with someone else's. They count VOTES, not lookups — the
+/// per-checkpoint table is resolved once and reused, so a lookup count would
+/// say "2" about a network of sixty-four validators and answer the wrong
+/// question.
+///
+/// They are per-ring `Cell`s and deliberately **not** process-wide atomics: a
+/// global counter is inflated by every other test sharing the binary, and an
+/// assertion some other test can satisfy on your behalf is not a proof.
 pub struct RosterRing {
     entries: VecDeque<([u8; 32], Vec<bloch_pos_committee::sample::Validator>)>,
     /// Bumped on every insert that changes the contents.
@@ -287,8 +293,8 @@ pub struct RosterRing {
     /// pre-write answer across a write, which is the class of bug the memo's
     /// own doc comment spends a page bounding.
     generation: u64,
-    hits: Cell<u64>,
-    misses: Cell<u64>,
+    exact: Cell<u64>,
+    foreign: Cell<u64>,
 }
 
 impl RosterRing {
@@ -296,8 +302,8 @@ impl RosterRing {
         RosterRing {
             entries: VecDeque::new(),
             generation: 0,
-            hits: Cell::new(0),
-            misses: Cell::new(0),
+            exact: Cell::new(0),
+            foreign: Cell::new(0),
         }
     }
 
@@ -314,18 +320,19 @@ impl RosterRing {
     }
 
     /// The table committed at `root`, or `None` if this node never executed
-    /// the block. Counted either way.
+    /// the block. Not counted — see [`Self::note_vote`].
     fn roster_at(&self, root: &[u8; 32]) -> Option<&[bloch_pos_committee::sample::Validator]> {
-        match self.entries.iter().find(|(r, _)| r == root) {
-            Some((_, roster)) => {
-                self.hits.set(self.hits.get() + 1);
-                Some(roster)
-            }
-            None => {
-                self.misses.set(self.misses.get() + 1);
-                None
-            }
-        }
+        self.entries
+            .iter()
+            .find(|(r, _)| r == root)
+            .map(|(_, roster)| roster.as_slice())
+    }
+
+    /// One vote priced. `exact` is whether it was priced with the table its own
+    /// checkpoint committed, rather than with the fallback.
+    fn note_vote(&self, exact: bool) {
+        let c = if exact { &self.exact } else { &self.foreign };
+        c.set(c.get() + 1);
     }
 
     /// Contents fingerprint for [`ForkChoiceInputs`].
@@ -333,23 +340,24 @@ impl RosterRing {
         self.generation
     }
 
-    /// Lookups that found a table. Test instrumentation.
+    /// Votes priced with the voter's OWN checkpoint table.
     #[cfg(test)]
-    fn hits(&self) -> u64 {
-        self.hits.get()
+    fn votes_priced_exactly(&self) -> u64 {
+        self.exact.get()
     }
 
-    /// Lookups that fell through to [`Engine::forkchoice_fallback`]. Test
-    /// instrumentation.
+    /// Votes priced with somebody else's table — the fallback. This is the
+    /// count the 8.27 % came out of: before the change every one of these was
+    /// priced with the local HEAD's table, which is the branch-dependent one.
     #[cfg(test)]
-    fn misses(&self) -> u64 {
-        self.misses.get()
+    fn votes_priced_with_a_foreign_table(&self) -> u64 {
+        self.foreign.get()
     }
 
     #[cfg(test)]
     fn reset_counters(&self) {
-        self.hits.set(0);
-        self.misses.set(0);
+        self.exact.set(0);
+        self.foreign.set(0);
     }
 }
 
@@ -2986,7 +2994,7 @@ fn forkchoice_store<'a>(
     // Resolved per validator, not per roster, because a validator has one
     // latest message and its weight is decided by the one checkpoint that
     // message names.
-    let mut tables: HashMap<[u8; 32], HashMap<u32, u64>> = HashMap::new();
+    let mut tables: HashMap<[u8; 32], (bool, HashMap<u32, u64>)> = HashMap::new();
     let mut weigh = |fc: &mut FcStore, att: &Attestation| {
         let retained = fc.observe(
             att.validator,
@@ -3005,14 +3013,22 @@ fn forkchoice_store<'a>(
         if !retained {
             return;
         }
-        let table = tables.entry(att.data.target_root).or_insert_with(|| {
-            rosters
-                .roster_at(&att.data.target_root)
-                .unwrap_or(fallback)
-                .iter()
-                .map(|v| (v.index, v.effective_stake))
-                .collect()
+        let (exact, table) = tables.entry(att.data.target_root).or_insert_with(|| {
+            match rosters.roster_at(&att.data.target_root) {
+                Some(roster) => (
+                    true,
+                    roster.iter().map(|v| (v.index, v.effective_stake)).collect(),
+                ),
+                None => (
+                    false,
+                    fallback.iter().map(|v| (v.index, v.effective_stake)).collect(),
+                ),
+            }
         });
+        // Counted per VOTE and not per checkpoint, because the question the
+        // instrumentation has to answer is "how many votes did this node price
+        // with a table that was not the voter's own".
+        rosters.note_vote(*exact);
         // Absent from the table is zero weight — the same answer
         // `Store::weight`'s `unwrap_or(&0)` has always given a voter who is
         // not in the roster at all.
@@ -3161,6 +3177,15 @@ mod checkpoint_roster_ring {
     }
 
     fn six_against_two() -> Partition {
+        two_branches(6, 2)
+    }
+
+    /// `left` validators vote for the branch called "majority" here (it is
+    /// only ever the numerically larger one in the 6-vs-2 fixture), `right`
+    /// for the other. Everything else — blocks, slots, roots — is identical
+    /// across splits, so two scenarios differing only in who voted cannot also
+    /// be differing in the shape of the chain.
+    fn two_branches(left: u32, right: u32) -> Partition {
         let g = [0x99u8; 32];
         // Common prefix, then one branch each. Slots are only ordering for the
         // latest-message rule; every validator votes once, so they do not
@@ -3182,10 +3207,12 @@ mod checkpoint_roster_ring {
         blocks.extend(min2);
         let minority_tip = min2_ids[0];
 
-        let mut votes: Vec<Attestation> = (0..6u32)
+        let mut votes: Vec<Attestation> = (0..left)
             .map(|v| attest_at(v, 40, majority_tip, majority_checkpoint))
             .collect();
-        votes.extend((6..8u32).map(|v| attest_at(v, 40, minority_tip, minority_checkpoint)));
+        votes.extend(
+            (left..left + right).map(|v| attest_at(v, 40, minority_tip, minority_checkpoint)),
+        );
 
         Partition {
             blocks,
@@ -3317,28 +3344,24 @@ mod checkpoint_roster_ring {
         );
 
         // ── the ring was consulted, and here is the number ─────────────────
-        //
-        // One lookup per DISTINCT checkpoint per fork-choice call — the
-        // per-checkpoint table is resolved once and reused for every vote that
-        // names it — so two checkpoints means exactly two lookups.
         println!(
-            "ring on a minority node: {} hit(s), {} miss(es) over {} votes at 2 distinct \
-             checkpoints",
-            minority_ring.hits(),
-            minority_ring.misses(),
+            "6-vs-2, ring on a minority node: {} of {} votes priced with the voter's OWN \
+             checkpoint table, {} with the fallback",
+            minority_ring.votes_priced_exactly(),
             p.votes.len(),
+            minority_ring.votes_priced_with_a_foreign_table(),
         );
         assert_eq!(
-            minority_ring.hits(),
-            1,
-            "the two's own checkpoint must be found in their ring"
+            minority_ring.votes_priced_exactly(),
+            2,
+            "the two's own votes must be priced from their own checkpoint, found in their ring"
         );
         assert_eq!(
-            minority_ring.misses(),
-            1,
-            "the six's checkpoint must MISS: it is on a branch the two never executed, and \
-             a fixture where it hits is a fixture that has quietly stopped testing the \
-             fallback"
+            minority_ring.votes_priced_with_a_foreign_table(),
+            6,
+            "the six's votes must take the FALLBACK: their checkpoint is on a branch the two \
+             never executed, and a fixture where it is found is a fixture that has quietly \
+             stopped testing the fallback at all"
         );
     }
 
@@ -3399,10 +3422,10 @@ mod checkpoint_roster_ring {
              acceptance test above proves nothing."
         );
         assert_eq!(
-            minority_ring.misses(),
-            1,
-            "the six's checkpoint missed here too — the ring is not what differs between \
-             this test and the one above; only the miss policy is"
+            minority_ring.votes_priced_with_a_foreign_table(),
+            6,
+            "the six's votes took the fallback here too — the ring is not what differs \
+             between this test and the one above; only the miss policy is"
         );
 
         // And the pre-ring node, which had no ring at all: same answer.
@@ -3460,13 +3483,261 @@ mod checkpoint_roster_ring {
         let head =
             lmd_ghost_head_by_checkpoint(&p.blocks, p.votes.iter(), &both, &poison, p.common);
         assert_eq!(head, p.majority_tip, "600 against 200");
-        assert_eq!(both.hits(), 2, "both checkpoints must be found");
         assert_eq!(
-            both.misses(),
+            both.votes_priced_exactly(),
+            8,
+            "every vote must be priced from its own checkpoint"
+        );
+        assert_eq!(
+            both.votes_priced_with_a_foreign_table(),
             0,
             "nothing may fall back here — if anything did, the zeroed fallback would have \
              made every branch weigh nothing and the tie-break, not the stake, would have \
              chosen the head"
+        );
+    }
+
+    // ── Two sides that SEE EACH OTHER ───────────────────────────────────────
+
+    /// Total weight resting on `tip`'s votes under table `t`. Used only to
+    /// report the mechanism as a number.
+    fn branch_weight(votes: &[Attestation], tip: [u8; 32], t: &[Validator]) -> u64 {
+        votes
+            .iter()
+            .filter(|a| a.data.head == tip)
+            .map(|a| {
+                t.iter()
+                    .find(|v| v.index == a.validator)
+                    .map_or(0, |v| v.effective_stake)
+            })
+            .sum()
+    }
+
+    /// **The mainnet case, and the one 6-vs-2 does not model.** Slot 32297:
+    /// two heads 104 blocks apart, and each side answers `getblockbyid` for the
+    /// other side's head. The blocks arrive. Fork choice throws them away.
+    ///
+    /// 5 against 3, because both sides of the live fork are still finalizing
+    /// and 3/8 = 37.5 % clears the 1/3 floor — a split where one side is below
+    /// the floor is the *other* scenario, and modelling only that one would
+    /// have left this uncovered.
+    ///
+    /// Both sides are given the SAME message set, which is the whole point:
+    /// nothing here is withheld from anybody. The only thing that differs
+    /// between the two nodes is the table each holds — and today that is
+    /// enough to make them disagree forever.
+    ///
+    /// ## The fixture's one assumption, stated
+    ///
+    /// Both sides walk from the last checkpoint they still share. That is the
+    /// case this change can close, and
+    /// `conflicting_justified_checkpoints_are_beyond_any_weighting` is the
+    /// control showing what happens once it stops being true. If the live fork
+    /// has already justified conflicting checkpoints, no weighting fixes it and
+    /// this test is not evidence that it does.
+    #[test]
+    fn two_sides_that_see_each_other_converge_only_after_the_fix() {
+        let p = two_branches(5, 3);
+        let unleaked = vals(8);
+
+        // Each side's HEAD table: the far side has been absent from this
+        // side's chain for many epochs, so this side's leak has taken most of
+        // their weight — in this side's view, and in nobody else's.
+        let a_head = table(&[
+            (0, 100),
+            (1, 100),
+            (2, 100),
+            (3, 100),
+            (4, 100),
+            (5, 20),
+            (6, 20),
+            (7, 20),
+        ]);
+        let b_head = table(&[
+            (0, 20),
+            (1, 20),
+            (2, 20),
+            (3, 20),
+            (4, 20),
+            (5, 100),
+            (6, 100),
+            (7, 100),
+        ]);
+        // Each side's own checkpoint table: shallower, because it was
+        // committed earlier, and nobody is leaked on the branch they vote for.
+        let at_a = table(&[
+            (0, 100),
+            (1, 100),
+            (2, 100),
+            (3, 100),
+            (4, 100),
+            (5, 40),
+            (6, 40),
+            (7, 40),
+        ]);
+        let at_b = table(&[
+            (0, 40),
+            (1, 40),
+            (2, 40),
+            (3, 40),
+            (4, 40),
+            (5, 100),
+            (6, 100),
+            (7, 100),
+        ]);
+
+        // ── today ──────────────────────────────────────────────────────────
+        //
+        // A node holding no checkpoint rosters, pricing every vote with its own
+        // head, IS the pre-change node — asserted below rather than asserted
+        // about, by running the old entry point beside it.
+        let today_a_ring = ring_of(&[]);
+        let today_a = lmd_ghost_head_by_checkpoint(
+            &p.blocks,
+            p.votes.iter(),
+            &today_a_ring,
+            &a_head,
+            p.common,
+        );
+        let today_b_ring = ring_of(&[]);
+        let today_b = lmd_ghost_head_by_checkpoint(
+            &p.blocks,
+            p.votes.iter(),
+            &today_b_ring,
+            &b_head,
+            p.common,
+        );
+        assert_eq!(
+            today_a,
+            lmd_ghost_head(&p.blocks, p.votes.iter(), &a_head, p.common),
+            "an empty ring must be the pre-change node exactly, or 'today' here is a \
+             straw man"
+        );
+        assert_eq!(today_a, p.majority_tip, "side A keeps its own head");
+        assert_eq!(today_b, p.minority_tip, "side B keeps its own head");
+        assert_ne!(
+            today_a, today_b,
+            "THE LIVE DEFECT: both sides hold every block and every vote, and still \
+             disagree. If this ever converges the fixture has stopped reproducing slot \
+             32297 and everything below proves nothing."
+        );
+        assert_eq!(
+            today_a_ring.votes_priced_with_a_foreign_table(),
+            8,
+            "today every vote on side A is priced with side A's head table"
+        );
+        assert_eq!(today_b_ring.votes_priced_with_a_foreign_table(), 8);
+
+        // The mechanism, as a number: what each side thinks the RIVAL branch
+        // weighs, against what the rival's own checkpoint says it weighs.
+        let a_sees_rival = branch_weight(&p.votes, p.minority_tip, &a_head);
+        let rival_truth = branch_weight(&p.votes, p.minority_tip, &at_b);
+        let b_sees_rival = branch_weight(&p.votes, p.majority_tip, &b_head);
+        let own_truth = branch_weight(&p.votes, p.majority_tip, &at_a);
+        println!(
+            "two sides that see each other — side A prices the rival branch at {a_sees_rival} \
+             where its own checkpoint says {rival_truth}; side B prices the rival at \
+             {b_sees_rival} where its own checkpoint says {own_truth}. Each side is \
+             discounting the other by the leak IT accrued."
+        );
+        assert!(
+            a_sees_rival < rival_truth && b_sees_rival < own_truth,
+            "control: if neither side is under-pricing the other, the fixture is not the bias"
+        );
+
+        // ── after ──────────────────────────────────────────────────────────
+        let ring_a = ring_of(&[(p.common, unleaked.clone()), (p.majority_checkpoint, at_a)]);
+        let ring_b = ring_of(&[(p.common, unleaked.clone()), (p.minority_checkpoint, at_b)]);
+        let head_a = lmd_ghost_head_by_checkpoint(
+            &p.blocks,
+            p.votes.iter(),
+            &ring_a,
+            &unleaked,
+            p.common,
+        );
+        let head_b = lmd_ghost_head_by_checkpoint(
+            &p.blocks,
+            p.votes.iter(),
+            &ring_b,
+            &unleaked,
+            p.common,
+        );
+        assert_eq!(
+            head_a, head_b,
+            "CONVERGENCE: two sides that see each other must select one head"
+        );
+        assert_eq!(
+            head_a, p.majority_tip,
+            "and it must be the heavier side's — 5 against 3, once neither side is \
+             discounting the other"
+        );
+
+        println!(
+            "after: side A priced {} of 8 votes from the voter's own checkpoint ({} from the \
+             fallback); side B, {} of 8 ({} from the fallback)",
+            ring_a.votes_priced_exactly(),
+            ring_a.votes_priced_with_a_foreign_table(),
+            ring_b.votes_priced_exactly(),
+            ring_b.votes_priced_with_a_foreign_table(),
+        );
+        assert_eq!(ring_a.votes_priced_exactly(), 5);
+        assert_eq!(ring_a.votes_priced_with_a_foreign_table(), 3);
+        assert_eq!(ring_b.votes_priced_exactly(), 3);
+        assert_eq!(ring_b.votes_priced_with_a_foreign_table(), 5);
+    }
+
+    /// **What this change does NOT close, pinned so nobody has to take my word
+    /// for it.**
+    ///
+    /// LMD-GHOST starts its walk at the justified checkpoint — that is what
+    /// makes finalized history un-reorganisable, and it is a safety property,
+    /// not an implementation detail. Once two sides have justified checkpoints
+    /// on their own branches, neither side's walk can reach the other's blocks
+    /// at all, and no change to how votes are weighed can reconcile them: the
+    /// weights are read strictly below a root neither side will leave.
+    ///
+    /// Everything here runs WITH the fix — full rings, exact tables, nothing
+    /// falling back — and the two heads still differ. If the live fork has
+    /// already reached this state (two finalized epochs 64 apart is the
+    /// question to answer), the weight fix is necessary and not sufficient,
+    /// and the remaining step is an operational decision about which history
+    /// survives, not a patch.
+    #[test]
+    fn conflicting_justified_checkpoints_are_beyond_any_weighting() {
+        let p = two_branches(5, 3);
+        let unleaked = vals(8);
+        let both = ring_of(&[
+            (p.common, unleaked.clone()),
+            (p.majority_checkpoint, unleaked.clone()),
+            (p.minority_checkpoint, unleaked.clone()),
+        ]);
+
+        let head_a = lmd_ghost_head_by_checkpoint(
+            &p.blocks,
+            p.votes.iter(),
+            &both,
+            &unleaked,
+            p.majority_checkpoint,
+        );
+        let head_b = lmd_ghost_head_by_checkpoint(
+            &p.blocks,
+            p.votes.iter(),
+            &both,
+            &unleaked,
+            p.minority_checkpoint,
+        );
+        assert_eq!(head_a, p.majority_tip);
+        assert_eq!(head_b, p.minority_tip);
+        assert_ne!(
+            head_a, head_b,
+            "control: if these converge the walk is no longer anchored at the justified \
+             root, which would be a far worse bug than the one being fixed"
+        );
+        assert_eq!(
+            both.votes_priced_with_a_foreign_table(),
+            0,
+            "nothing fell back here — the two heads differ with the fix working perfectly, \
+             which is the whole claim"
         );
     }
 }
