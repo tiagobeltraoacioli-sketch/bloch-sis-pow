@@ -41,6 +41,25 @@ def time_to_tip(s, tip):
     return (tip / (ms / 1000.0), ms) if ms > 0 else None
 
 
+def worst_tick_ms(s):
+    """Longest observed mean tick, i.e. the worst duty postponement.
+
+    Between two samples the loop advanced `dticks` times in `dt` ms, so
+    `dt/dticks` is the mean tick length over that window and the largest such
+    window is a LOWER BOUND on the longest single tick. This is the quantity
+    the bound actually buys: the slot loop attests and proposes BETWEEN ticks,
+    so a tick that runs for seconds is seconds in which this node performs no
+    duty at all. Throughput is what the bound was feared to cost; this is what
+    it was introduced to fix, and it is measured here in the same runs.
+    """
+    worst = 0.0
+    for a, b in zip(s, s[1:]):
+        dt, dticks = b[0] - a[0], b[3] - a[3]
+        if dticks > 0:
+            worst = max(worst, dt / dticks)
+    return worst
+
+
 def slope(s, tip):
     lo, hi = 0.05 * tip, 0.95 * tip
     seg = [x for x in s if lo <= x[2] <= hi]
@@ -92,11 +111,12 @@ def main():
         labels.setdefault(label, []).append(
             (run, r, last[2], last[0], last[5], last[6],
              max(x[7] for x in s), last[4] / max(last[3], 1),
-             slope(s, tip), tt[1] if tt else None, last[3]))
+             slope(s, tip), tt[1] if tt else None, last[3],
+             worst_tick_ms(s)))
     print(f"fixture tip = {tip} blocks\n")
     hdr = ("condition", "runs", "median blk/s", "spread (min..max)",
-           "reached", "shedBLK", "shedGOS", "peakBLKb", "ev/tick")
-    print("| %-14s | %4s | %12s | %-21s | %7s | %7s | %7s | %9s | %7s |" % hdr)
+           "reached", "shedBLK", "shedGOS", "ev/tick", "worstTick")
+    print("| %-14s | %4s | %12s | %-21s | %7s | %7s | %7s | %7s | %9s |" % hdr)
     print("|" + "-" * 16 + "|" + "-" * 6 + "|" + "-" * 14 + "|" + "-" * 23 +
           "|" + "-" * 9 + "|" + "-" * 9 + "|" + "-" * 9 + "|" + "-" * 11 +
           "|" + "-" * 9 + "|")
@@ -116,9 +136,10 @@ def main():
         shedg = max(x[5] for x in rs)
         peakq = max(x[6] for x in rs)
         evt = statistics.median([x[7] for x in rs])
-        print("| %-14s | %4d | %12.1f | %-21s | %3d/%-3d | %7d | %7d | %9d | %7.2f |"
+        wt = statistics.median([x[11] for x in rs])
+        print("| %-14s | %4d | %12.1f | %-21s | %3d/%-3d | %7d | %7d | %7.2f | %7.0fms |"
               % (label, len(rs), med, f"{spread} (±{rel:.0f}%)", reached,
-                 len(rs), shedb, shedg, peakq, evt))
+                 len(rs), shedb, shedg, evt, wt))
     print("\nblk/s above is tip/elapsed-to-tip. Raw per run:\n")
     for label in ORDER:
         if label not in labels:
