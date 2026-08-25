@@ -4434,24 +4434,46 @@ mod wp11_select_break {
     }
 
     /// **The LIVE cap, not the museum one.** `max_block_tx_bytes` is
-    /// flag-day gated: 262,144 B below epoch 800 and 524,288 B from it
-    /// (fee_market.rs:65/85, params.rs:308). Genesis-4 mainnet is past epoch
-    /// 1400, so the cap a real proposer packs against TODAY is 512 KiB and a
-    /// 256 KiB-sized poison would not trigger anything on the fleet. This
-    /// test sizes the poison against the post-activation cap and drives
-    /// selection at a post-activation epoch, so the claim is about the chain
-    /// that is running rather than the era it launched in.
+    /// flag-day gated: 262,144 B below `BLOCK_BYTES_V2_ACTIVATION_EPOCH`
+    /// (= 800, params.rs:308) and 524,288 B from it (fee_market.rs:65/85).
+    /// Genesis-4 mainnet is at **epoch 1033**, measured from a node on
+    /// 2026-08-25 — past the epoch-800 activation, so the cap a real
+    /// proposer packs against TODAY is 512 KiB and a 256 KiB-sized poison
+    /// would not trigger anything on the fleet.
+    ///
+    /// The epoch is stated because an earlier revision of this test said
+    /// "mainnet is past epoch 1400" and derived the era from
+    /// `ACTIVATION + 600`, which lands exactly on 1400 — a DIFFERENT flag
+    /// day, still 367 epochs out and unfired. The arithmetic happened to
+    /// pick the one number that reads as "the pending flag day has already
+    /// passed". What the conclusion actually rests on is `1033 >= 800`, so
+    /// the era is derived from the activation constant and the observed
+    /// height, and the cap is read from `max_block_tx_bytes` rather than
+    /// hard-coded.
     #[test]
     fn the_same_poison_empties_selection_at_the_live_post_flag_day_cap() {
         use bloch_pos_committee::fee_market::max_block_tx_bytes;
         use bloch_pos_committee::params::BLOCK_BYTES_V2_ACTIVATION_EPOCH;
 
-        // A mainnet-shaped epoch: past the byte-cap flag day.
-        let live_epoch = BLOCK_BYTES_V2_ACTIVATION_EPOCH + 600;
+        /// The epoch Genesis-4 mainnet was observed at, 2026-08-25.
+        /// Not a threshold — a witness that the live chain is past the
+        /// activation. Any later reading keeps this test honest; a reading
+        /// BELOW 800 would invalidate its premise, which is why the
+        /// relationship is asserted rather than assumed.
+        const MAINNET_EPOCH_OBSERVED: u64 = 1_033;
+
+        assert!(
+            MAINNET_EPOCH_OBSERVED >= BLOCK_BYTES_V2_ACTIVATION_EPOCH,
+            "premise: the observed mainnet epoch ({MAINNET_EPOCH_OBSERVED}) \
+             must be past the byte-cap activation ({})",
+            BLOCK_BYTES_V2_ACTIVATION_EPOCH,
+        );
+        let live_epoch = MAINNET_EPOCH_OBSERVED;
         let cap = max_block_tx_bytes(live_epoch);
         assert_eq!(
             cap, 524_288,
-            "harness: the post-flag-day cap must be the 512 KiB one"
+            "harness: at the observed mainnet epoch the cap must be the \
+             512 KiB one"
         );
 
         let (mut engine, _dir) = perf_support::proposing_engine();
@@ -4535,6 +4557,8 @@ mod wp11_select_break {
         use bloch_pos_committee::fee_market::max_block_tx_bytes;
         use bloch_pos_committee::params::BLOCK_BYTES_V2_ACTIVATION_EPOCH;
 
+        // The activation epoch itself is the first era with the new cap, and
+        // mainnet (epoch 1033, measured 2026-08-25) is inside it.
         let live_cap = max_block_tx_bytes(BLOCK_BYTES_V2_ACTIVATION_EPOCH);
         let old_cap = max_block_tx_bytes(0);
         assert_eq!((live_cap, old_cap), (524_288, 262_144), "the two caps");
