@@ -612,6 +612,25 @@ pub fn start(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bloch_pos_committee::attestation::AttestationData;
+
+    fn test_attestation() -> NetEvent {
+        NetEvent::Attestation(
+            Attestation {
+                data: AttestationData {
+                    slot: 1,
+                    head: [1; 32],
+                    source_epoch: 0,
+                    source_root: [2; 32],
+                    target_epoch: 1,
+                    target_root: [3; 32],
+                },
+                validator: 0,
+                signature: Vec::new(),
+            },
+            Origin::none(),
+        )
+    }
 
     #[test]
     fn ingress_byte_budget_is_strict() {
@@ -620,5 +639,35 @@ mod tests {
         assert_eq!(inflight.load(Ordering::Acquire), ENGINE_QUEUE_BYTE_CAP);
         assert!(!reserve_engine_bytes(&inflight, 1));
         assert_eq!(inflight.load(Ordering::Acquire), ENGINE_QUEUE_BYTE_CAP);
+    }
+
+    #[test]
+    fn ingress_count_cap_sheds_and_refunds_the_reservation() {
+        let (events, rx) = mpsc::sync_channel(1);
+        let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        assert_eq!(
+            send_to_engine(&events, &inflight, test_attestation(), 1),
+            IngressOutcome::Queued
+        );
+        let reserved = inflight.load(Ordering::Acquire);
+        assert!(reserved > 0);
+
+        assert_eq!(
+            send_to_engine(&events, &inflight, test_attestation(), 1),
+            IngressOutcome::Shed
+        );
+        assert_eq!(
+            inflight.load(Ordering::Acquire),
+            reserved,
+            "a full event channel must not retain the rejected event's bytes"
+        );
+
+        let ingress_bytes = match rx.try_recv().expect("queued event") {
+            EngineEvent::Net { ingress_bytes, .. } => ingress_bytes,
+            EngineEvent::Rpc(_) => panic!("network ingress must queue a network event"),
+        };
+        inflight.fetch_sub(ingress_bytes, Ordering::AcqRel);
+        assert_eq!(inflight.load(Ordering::Acquire), 0);
     }
 }

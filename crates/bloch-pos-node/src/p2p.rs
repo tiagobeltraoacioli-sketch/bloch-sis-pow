@@ -1565,6 +1565,42 @@ mod tests {
         assert!(decode_sync_response(&b).is_err());
     }
 
+    #[test]
+    fn handle_sheds_broadcasts_without_displacing_validation_reports() {
+        let (broadcasts, mut broadcast_rx) = tokio::sync::mpsc::channel(1);
+        let (reports, mut report_rx) = tokio::sync::mpsc::channel(1);
+        let handle = Handle {
+            broadcasts,
+            reports,
+            peer_id: PeerId::random(),
+        };
+
+        handle.broadcast(vec![crate::net::FRAME_TX, 1]);
+        handle.broadcast(vec![crate::net::FRAME_TX, 2]);
+        assert_eq!(
+            broadcast_rx.try_recv().expect("first broadcast"),
+            vec![crate::net::FRAME_TX, 1]
+        );
+        assert!(matches!(
+            broadcast_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+
+        let origin = Origin {
+            inner: Some((MessageId::from("test"), PeerId::random())),
+        };
+        handle.report(&origin, Verdict::Accept);
+        let (reported_origin, verdict) = report_rx.try_recv().expect("validation report");
+        assert!(reported_origin.inner.is_some());
+        assert_eq!(verdict, Verdict::Accept);
+
+        handle.broadcast(vec![0; MAX_BROADCAST_COMMAND_BYTES + 1]);
+        assert!(matches!(
+            broadcast_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
     // ── Two live swarms on localhost ────────────────────────────────────────
     //
     // These bring up real sockets, a real noise handshake, a real gossipsub
