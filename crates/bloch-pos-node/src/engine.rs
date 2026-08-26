@@ -72,14 +72,16 @@ use bloch_pos_committee::beacon::{mix_in, RandaoChain};
 use bloch_pos_committee::forkchoice::{BlockTree, LatestMessage, Store as FcStore};
 use bloch_pos_committee::gossip::{AttestationPool, GossipDecision};
 use bloch_pos_committee::header::{BlockEnvelope, BlockHeaderV4, BlockId, Body, VERSION_G4};
-use bloch_pos_committee::interfaces::{ProposalEnvelope, StateReader, StateTransition};
+use bloch_pos_committee::interfaces::{
+    ProposalEnvelope, StateReader, StateTransition, TransitionError,
+};
 use bloch_pos_committee::schedule::first_slot_of_epoch;
 use bloch_pos_committee::transition::{CommittedState, PosTransaction, Transition};
 use bloch_pos_committee::{committees, derive, epoch_of, schedule};
 
 use crate::genesis::{Manifest, GENESIS_MIX};
 use crate::keys::{HybridVerifier, Keystore, ProbeVerifier};
-use crate::net::{self, NetEvent, Origin, Verdict};
+use crate::net::{self, EngineQueue, NetEvent, Origin, Provenance, Verdict};
 use crate::rpc::{self, Admitted, Finality, Json, RpcCall, RpcError, RpcRequest, RpcResult};
 use crate::store::Store;
 
@@ -90,7 +92,16 @@ use crate::store::Store;
 /// state — rather than from a copy kept alongside it — is why this wrapper
 /// exists; see [`crate::rpc::EngineBackend`].
 pub enum EngineEvent {
-    Net(NetEvent),
+    /// A network event welded to its reservation in [`EngineQueue`].
+    ///
+    /// One field, not two, and the permit inside it is unreachable: the only
+    /// way to get at the event is [`net::Admission::handle`], which releases
+    /// the quota after the handler returns. The previous shape,
+    /// `Net(NetEvent, net::Permit)`, made the right thing merely CUSTOMARY —
+    /// `drop(permit); engine.ingest(env)` compiled, restored release-on-dequeue
+    /// (the semantics this commit calls a lie), and passed every test. It no
+    /// longer compiles.
+    Net(net::Admission),
     Rpc(RpcCall),
 }
 
@@ -143,6 +154,230 @@ pub struct Config {
     pub rpc_port: Option<u16>,
 }
 
+/// Forward libp2p's decoded events onto the engine channel, admitting each one
+/// into [`EngineQueue`] on the way.
+///
+/// **This hop is the libp2p path's only ceiling.** `p2p::Loop::emit` sends into
+/// an unbounded channel and counts nothing, so before this the production
+/// transport had no admission control at all — while the engine's
+/// hand-written decrement fired for its events anyway, subtracting from a
+/// counter nobody had incremented and wrapping it to ~2^64.
+///
+/// Admitting here rather than inside `p2p.rs` keeps that module speaking plain
+/// `NetEvent` — its tests read the raw events — and puts the quota on the one
+/// thread both transports already pass through. This thread does nothing but
+/// forward, so it is a hop and not a second queue in front of a sleeping
+/// consumer.
+///
+/// A free function and not a closure so it can be tested: see
+/// `libp2p_admission_tests`.
+fn forward_admitted(
+    net_rx: mpsc::Receiver<NetEvent>,
+    tx: mpsc::Sender<EngineEvent>,
+    queue: Arc<EngineQueue>,
+) {
+    for ev in net_rx {
+        let bytes = ev.wire_bytes();
+        let Some(adm) = EngineQueue::admit_event_owned(&queue, ev, bytes) else {
+            continue; // shed: counted, and logged if the limiter allows
+        };
+        if tx.send(EngineEvent::Net(adm)).is_err() {
+            return; // engine gone; nothing left to deliver to
+        }
+    }
+}
+
+/// A test-only vantage point INSIDE `Engine::ingest`.
+///
+/// "The permit is still held while the work runs" cannot be observed from
+/// outside the handler: by the time `drain_pending` returns, a correct
+/// implementation and one that released on dequeue look identical — both read
+/// zero. So the reading has to be taken from within `ingest` itself, and the
+/// only way to do that without putting a test field on `Engine` (whose
+/// constructors are consensus code) is a thread-local the test installs and the
+/// node binary never compiles.
+#[cfg(test)]
+mod ingest_witness {
+    use super::*;
+    use std::cell::RefCell;
+    use std::sync::atomic::AtomicUsize;
+
+    thread_local! {
+        static WITNESS: RefCell<Option<(Arc<EngineQueue>, Arc<AtomicUsize>)>> =
+            const { RefCell::new(None) };
+    }
+
+    /// Watch `queue` for the duration of `f`, returning the block-item count
+    /// seen at the top of `Engine::ingest`, or `None` if `ingest` never ran.
+    pub(super) fn watching<R>(queue: &Arc<EngineQueue>, f: impl FnOnce() -> R) -> (R, Option<usize>) {
+        let seen = Arc::new(AtomicUsize::new(usize::MAX));
+        WITNESS.with(|w| *w.borrow_mut() = Some((queue.clone(), seen.clone())));
+        let out = f();
+        WITNESS.with(|w| *w.borrow_mut() = None);
+        let v = seen.load(Ordering::Acquire);
+        (out, (v != usize::MAX).then_some(v))
+    }
+
+    pub(super) fn record() {
+        WITNESS.with(|w| {
+            if let Some((q, seen)) = w.borrow().as_ref() {
+                seen.store(q.stats().block.items, Ordering::Release);
+            }
+        });
+    }
+}
+
+/// Handle one batch of dequeued events, in arrival order.
+///
+/// A free function taking `&mut Engine` rather than inline in `run`'s loop for
+/// one reason: `run` needs a live socket, a data directory and a validator key,
+/// so nothing inside it could be tested, and "the quota is still held while
+/// `ingest` runs" is exactly the property that has to be tested at this level
+/// rather than asserted in a comment. See
+/// `quota_holding_tests::the_quota_is_held_while_the_engine_does_the_work`.
+///
+/// Ordering is untouched: one channel, drained into one `Vec`, handled front to
+/// back. Splitting the queue by class would reorder attestations against blocks
+/// and so change which votes are in the pool when LMD-GHOST runs, which is a
+/// consensus change; splitting the ADMISSION TEST, which is what `EngineQueue`
+/// does, leaves this loop exactly as it was.
+/// Events one tick of the slot loop may take off the engine channel.
+///
+/// **What this bounds.** The drain used to be `while let Ok(more) =
+/// rx.try_recv() { pending.push(more) }` — it emptied the whole channel before
+/// returning to slot duties. A node being fed a steady stream (a peer serving
+/// it a 512-block sync page, or 64 validators attesting) therefore postponed
+/// attesting and proposing for as long as the stream lasted, which on a node
+/// applying blocks at ~0.6 s each is minutes per tick.
+///
+/// **This value is a GUESS and is meant to be measured. The measurement, not
+/// this comment, decides it.** Override it without rebuilding by setting
+/// `BLOCH_MAX_EVENTS_PER_TICK`; `BLOCH_MAX_EVENTS_PER_TICK=0` restores the
+/// old unbounded drain exactly, which is the control arm of that experiment.
+///
+/// The reasoning it is a guess FROM, offered so the measurement can contradict
+/// something specific:
+///
+///   - A smaller bound does NOT cost throughput the way it looks like it
+///     should. `recv_timeout` only waits when the channel is EMPTY, so a
+///     backed-up channel is drained `MAX_ENGINE_EVENTS_PER_TICK` events per
+///     LOOP ITERATION, with only a few cheap comparisons between iterations —
+///     not one batch per 500 ms tick. The "4 events/tick = 8 events/s" ceiling
+///     that made 4 look catastrophic assumes the loop sleeps between batches,
+///     and it does not. Expect the sync rate with and without the bound to come
+///     out close; if it does not, this model is wrong and the number should
+///     follow the measurement.
+///   - What the bound actually buys is a ceiling on how long duties are
+///     postponed, and it costs that ceiling times the per-event handling cost.
+///     At the replay cost of 0.59 s per block, 32 blocks is still ~19 s of
+///     postponed duties — so if live ingest is anywhere near replay cost, this
+///     number should come DOWN, not up. A bound on elapsed time rather than on
+///     a count would express that directly and is the change to make next.
+///   - Interaction with the inbound quota is real: bounding the drain slows the
+///     rate at which permits are given back, so under a flood the classes fill
+///     sooner and the transport sheds sooner. That is the trade — shed a
+///     recoverable frame, keep the slot.
+///
+/// NOTE for whoever measures: boot replay does NOT pass through this channel
+/// (it is a plain loop over the block log), so this bound cannot affect restart
+/// replay at all. Only live and sync ingest reach it.
+///
+/// # The risk this bound carries, which is not a throughput risk
+///
+/// Measure for FORKS, not only for blocks per second.
+///
+/// The duty path below this loop is guarded by `in_grace` — the first two slots
+/// after boot — and by nothing else. There is no "am I caught up?" test before
+/// `attest(slot)` or `propose(slot)`. So the postponement this bound removes
+/// was doing double duty: while a node drained a whole sync page before
+/// returning to its duties, it was also DECLINING to propose on a head it had
+/// not finished advancing. Bounding the drain lets a node that is still behind
+/// reach `propose` with events for its own parent still sitting in the channel,
+/// and build on a stale parent instead of building nothing.
+///
+/// This is not hypothetical arithmetic — `tests/cold_start.rs` (three real
+/// processes over libp2p) failed twice at the default bound with two nodes
+/// holding different blocks at a common slot, and passed at
+/// `BLOCH_MAX_EVENTS_PER_TICK=0`. It then passed 3/3 at BOTH values on an
+/// unloaded machine, so the failures track machine load rather than this
+/// constant and the bound is NOT convicted. But the mechanism above is real
+/// whatever that test does, and "a slot spent on nothing" and "a slot spent on
+/// a fork" are not the same cost. If this bound is lowered, the honest fix that
+/// goes with it is a synced-check on the duty path, not a smaller number.
+pub const MAX_ENGINE_EVENTS_PER_TICK: usize = 32;
+
+/// The bound in force, read once per process.
+///
+/// `BLOCH_MAX_EVENTS_PER_TICK` overrides [`MAX_ENGINE_EVENTS_PER_TICK`], and
+/// `0` means unbounded — the pre-WP3 behaviour, kept reachable so both arms of
+/// the measurement are the same binary. It is announced on stdout when it is
+/// not the default, because a benchmark run whose bound nobody can see in the
+/// log is a benchmark of an unknown.
+fn max_engine_events_per_tick() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| match std::env::var("BLOCH_MAX_EVENTS_PER_TICK") {
+        Err(_) => MAX_ENGINE_EVENTS_PER_TICK,
+        Ok(v) => match v.trim().parse::<usize>() {
+            Ok(0) => {
+                println!("engine: BLOCH_MAX_EVENTS_PER_TICK=0 — the drain is UNBOUNDED this run");
+                usize::MAX
+            }
+            Ok(n) => {
+                println!("engine: draining at most {n} event(s) per tick (BLOCH_MAX_EVENTS_PER_TICK)");
+                n
+            }
+            Err(_) => {
+                eprintln!(
+                    "engine: BLOCH_MAX_EVENTS_PER_TICK={v:?} is not a number — \
+                     using {MAX_ENGINE_EVENTS_PER_TICK}"
+                );
+                MAX_ENGINE_EVENTS_PER_TICK
+            }
+        },
+    })
+}
+
+/// Take `first` plus up to `max - 1` more events off the channel.
+///
+/// Separated from [`drain_pending`], which HANDLES them, so the bound can be
+/// tested at any value without a node, a clock or an environment variable —
+/// including `usize::MAX`, which must behave exactly like the unbounded drain
+/// it replaces. `max` is never zero: `first` has already been taken off the
+/// channel and dropping it would lose an event AND its permit's meaning.
+fn take_pending(
+    rx: &mpsc::Receiver<EngineEvent>,
+    first: EngineEvent,
+    max: usize,
+) -> Vec<EngineEvent> {
+    let mut pending = Vec::with_capacity(max.min(64));
+    pending.push(first);
+    while pending.len() < max {
+        match rx.try_recv() {
+            Ok(more) => pending.push(more),
+            Err(_) => break,
+        }
+    }
+    pending
+}
+
+fn drain_pending(engine: &mut Engine, pending: Vec<EngineEvent>, wall_epoch: u64) {
+    for ev in pending {
+        match ev {
+            // No release step, and no permit binding to mis-order: the
+            // `Admission` owns its reservation and hands it back after
+            // `on_net` returns. The version this replaces destructured the
+            // permit here, which made releasing early a one-word edit.
+            EngineEvent::Net(adm) => engine.on_net(adm, wall_epoch),
+            EngineEvent::Rpc(call) => {
+                let result = engine.serve_rpc(call.req);
+                // A client that hung up between asking and being answered is
+                // normal, not an error worth logging.
+                let _ = call.reply.send(result);
+            }
+        }
+    }
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -155,11 +390,27 @@ const NO_TXS: [PosTransaction; 0] = [];
 /// Ceiling on mempool entries. Not a policy — a bound, so an unauthenticated
 /// devnet transport cannot turn into unbounded memory. Real admission control
 /// (fees, per-sender limits, eviction by price) is `gossip.rs` work.
-const MEMPOOL_MAX: usize = 4_096;
+pub(crate) const MEMPOOL_MAX: usize = 4_096;
 
 /// Transactions a proposal will carry at most, independent of the consensus
 /// byte cap it is also checked against.
 const MAX_TXS_PER_BLOCK: usize = 256;
+
+/// Which transaction in `selection` a refusal blames, if the error names one.
+///
+/// `TransitionError::Transfer(i, _)` carries the index of the offending
+/// transaction. The proposer's drop loop used to ignore it and `pop()` the tail
+/// instead, which meant a culprit at index 0 of a 30-transaction selection cost
+/// 29 VALID transfers — each also evicted from the mempool, so they were gone
+/// for every later proposer too. `None` means "the error names nobody usable",
+/// and the caller falls back to the tail: liveness first, a smaller block
+/// always beats no block.
+fn refused_index(err: &TransitionError, selection_len: usize) -> Option<usize> {
+    match err {
+        TransitionError::Transfer(i, _) if (*i as usize) < selection_len => Some(*i as usize),
+        _ => None,
+    }
+}
 
 /// How many recently-applied canonical post-states are retained so a reorg
 /// can start from the fork point instead of from genesis.
@@ -537,6 +788,11 @@ struct Engine {
     /// that kind of pool shrinkage apart from the epoch `retain`, which fork
     /// choice very much can see. See the argument there.
     fc_covered_removals: u64,
+    /// The inbound quota, read-only from here. Carried so `getchaininfo` can
+    /// report depth and shed counts: a counter only visible inside the process
+    /// is a counter nobody checks, and that invisibility is half of why silent
+    /// shedding hid a block-delivery failure for weeks.
+    queue: Arc<EngineQueue>,
 }
 
 /// A fingerprint of the four values `lmd_ghost_head` reads, so `advance` can
@@ -951,12 +1207,26 @@ impl Engine {
         };
         self.pool
             .insert((att.validator, att.data.signing_root()), att.clone());
-        self.net.broadcast(net::att_frame(&att));
-        println!(
-            "[slot {slot}] attested (epoch {e}, head {}, target {})",
-            crate::codec::hex8(&data.head),
-            crate::codec::hex8(&data.target_root)
-        );
+        // ORIGINATED: this node signed it three lines up.
+        let published = self.net.broadcast(net::att_frame(&att), Provenance::Originated);
+        // The old line printed "attested" unconditionally, including when the
+        // broadcast had been discarded — an operator reading it had no way to
+        // tell a cast vote from a vote that never left the process.
+        if published {
+            println!(
+                "[slot {slot}] attested (epoch {e}, head {}, target {})",
+                crate::codec::hex8(&data.head),
+                crate::codec::hex8(&data.target_root)
+            );
+        } else {
+            eprintln!(
+                "[slot {slot}] ATTESTATION NOT PUBLISHED (epoch {e}, head {}, target {}) — \
+                 it is in this node's own pool and nowhere else; the transport logged why. \
+                 This vote does not count toward anyone else's fork choice.",
+                crate::codec::hex8(&data.head),
+                crate::codec::hex8(&data.target_root)
+            );
+        }
     }
 
     fn propose(&mut self, slot: u64) {
@@ -1060,11 +1330,39 @@ impl Engine {
             {
                 Ok(p) => break (p, tx_bytes),
                 Err(err) => {
-                    let Some(bad) = txs.pop() else {
-                        // Empty and still refused: the fault is not in any
-                        // transaction, so proposing is genuinely impossible.
-                        eprintln!("[slot {slot}] produce refused with no transactions: {err:?}");
-                        return;
+                    // Drop the transaction the transition NAMED, not the last
+                    // one in the selection.
+                    //
+                    // `TransitionError::Transfer(i, _)` carries the index of
+                    // the offending transaction, and this loop used to throw
+                    // that away and `pop()` the tail instead. With the culprit
+                    // at index 0 of a 30-transaction selection, the proposer
+                    // discarded 29 VALID transfers one at a time — and, worse,
+                    // evicted each of them from the mempool on the way, so they
+                    // were gone for every future proposer too. Measured on
+                    // mainnet 2026-08-25: five `dropping ...` lines per slot to
+                    // publish one transaction, and one node emptied its mempool
+                    // outright. A user sending a burst saw most of it vanish
+                    // with no error anywhere: the node reported `accepted`, and
+                    // the coins were never spent.
+                    //
+                    // Popping the tail is still the fallback for an error that
+                    // names no index (or names one out of range) — liveness
+                    // first, exactly as the comment above says.
+                    let bad = match refused_index(&err, txs.len()) {
+                        Some(i) => txs.remove(i),
+                        None => {
+                            let Some(t) = txs.pop() else {
+                                // Empty and still refused: the fault is not in
+                                // any transaction, so proposing is genuinely
+                                // impossible.
+                                eprintln!(
+                                    "[slot {slot}] produce refused with no transactions: {err:?}"
+                                );
+                                return;
+                            };
+                            t
+                        }
                     };
                     eprintln!(
                         "[slot {slot}] dropping a transaction the transition refuses ({err:?}); \
@@ -1136,12 +1434,76 @@ impl Engine {
             .get(id.as_bytes())
             .expect("just ingested")
             .clone();
-        self.net.broadcast(net::block_frame(&env));
+        // ORIGINATED, and the reason part (B) of this work package exists: this
+        // is the block this node built and signed, and it exists nowhere else.
+        // The transport logs the type, length and reason; this line names the
+        // slot and the block, which the transport cannot know.
+        if !self.net.broadcast(net::block_frame(&env), Provenance::Originated) {
+            eprintln!(
+                "[slot {slot}] OWN BLOCK {} NOT PUBLISHED — it was produced, signed and \
+                 stored, and no peer received it. This slot is lost, the node is not; \
+                 the transport logged the reason above.",
+                crate::codec::hex8(id.as_bytes()),
+            );
+        }
+    }
+
+    // ── Network events ─────────────────────────────────────────────────────
+
+    /// Handle one admitted network event with its quota still held.
+    ///
+    /// `Admission::handle` is the only way to reach the event, and it drops the
+    /// permit after this closure returns — so the quota measures work not yet
+    /// DONE, which is what the old hand-written counter claimed and did not do.
+    /// There is no binding here that a later edit could drop early; that is the
+    /// point of the type.
+    /// One line per epoch naming everything this node failed to publish, and
+    /// nothing at all when it published everything.
+    ///
+    /// The per-event lines in `net.rs` say what was lost as it happens; a
+    /// relayed loss is deliberately not one line per event, so without this
+    /// there is no total anywhere an operator can reach. The adopted inbound
+    /// quota makes the same argument for its own counters and answers it
+    /// through `getchaininfo`; the outbound counters are not in that response
+    /// yet (see the report — changing the RPC's shape is a wider decision than
+    /// this work package), so for now the periodic line is the reading.
+    fn report_broadcast_drops(&self, epoch: u64) {
+        let d = self.net.drops();
+        let (own_lost, own_partial) = (d.originated_lost(), d.originated_partial());
+        let (relay_lost, relay_partial) = (d.relayed_lost(), d.relayed_partial());
+        let malformed = d.malformed();
+        if own_lost | own_partial | relay_lost | relay_partial | malformed == 0 {
+            return;
+        }
+        println!(
+            "[epoch {epoch}] BROADCAST LOSSES since boot: our own {own_lost} lost, \
+             {own_partial} partial; relayed {relay_lost} lost, {relay_partial} partial; \
+             {malformed} malformed. Our own losses are proposals and votes this node \
+             produced and no peer received."
+        );
+    }
+
+    fn on_net(&mut self, adm: net::Admission, wall_epoch: u64) {
+        adm.handle(|ev| match ev {
+            NetEvent::Block(env) => self.ingest(env),
+            NetEvent::Attestation(att, origin) => self.on_attestation(att, origin, wall_epoch),
+            // Gossip has nobody to answer to; the verdict is the RPC's
+            // concern, not a peer's.
+            NetEvent::Transaction(tx) => {
+                let _ = self.on_transaction(tx, Provenance::Relayed);
+            }
+        })
     }
 
     // ── Block ingestion: store, then advance canonical as far as possible ──
 
     fn ingest(&mut self, env: BlockEnvelope) {
+        // Tests install a witness here to read the queue from INSIDE the
+        // handler — the only vantage point from which "the permit is still
+        // held while the work runs" is observable at all. Compiled out of the
+        // node binary entirely.
+        #[cfg(test)]
+        ingest_witness::record();
         let id = *env.block_id().as_bytes();
         if self.blocks.contains_key(&id) || self.canonical.contains(&id) {
             return;
@@ -1342,7 +1704,17 @@ impl Engine {
     /// answer to — the RPC — can say. The gossip path ignores the result: a
     /// peer is not waiting on a verdict, and a duplicate arriving twice over a
     /// full mesh is the normal case rather than a fault.
-    fn on_transaction(&mut self, tx: PosTransaction) -> Result<Admitted, Refusal> {
+    /// `prov` is the ONE thing this function cannot work out for itself.
+    /// Gossip and the RPC both land here (see the argument at the `admissible`
+    /// call below), and the two have opposite answers: a transaction a peer
+    /// gossiped is a relay, a transaction a local user submitted is this node's
+    /// own publication and the user has been told it was accepted. Tagging the
+    /// call site either way would be wrong half the time, so the caller says.
+    fn on_transaction(
+        &mut self,
+        tx: PosTransaction,
+        prov: Provenance,
+    ) -> Result<Admitted, Refusal> {
         let key = tx.canonical_bytes();
         if self.mempool.contains_key(&key) {
             return Ok(Admitted::Duplicate);
@@ -1436,7 +1808,8 @@ impl Engine {
         let mut frame = vec![net::FRAME_TX];
         frame.extend_from_slice(&key);
         self.mempool.insert(key, tx);
-        self.net.broadcast(frame);
+        // Provenance comes from the caller — see this function's doc.
+        self.net.broadcast(frame, prov);
         Ok(Admitted::New)
     }
 
@@ -1892,8 +2265,10 @@ impl Engine {
                 if self.live {
                     // Relay now: it was held, so nobody downstream got it from
                     // us. A duplicate publish is refused locally and costs
-                    // nothing.
-                    self.net.broadcast(frame);
+                    // nothing. RELAYED — this attestation is someone else's,
+                    // and its author re-gossips it — so a drop here is counted
+                    // and logged on the doubling schedule, not per event.
+                    self.net.broadcast(frame, Provenance::Relayed);
                 }
             }
         }
@@ -2026,6 +2401,7 @@ impl Engine {
                 self.state.validator_count(),
                 self.mempool.len(),
                 self.blocks.len(),
+                &self.queue.stats(),
             )),
 
             RpcRequest::BlockCount => {
@@ -2119,7 +2495,11 @@ impl Engine {
 
             RpcRequest::TxOut { txid, vout } => Ok(rpc::txout_json(&self.state, &txid, vout)),
 
-            RpcRequest::SendRawTransaction(tx) => match self.on_transaction(tx.clone()) {
+            // ORIGINATED: a local user submitted this and has been told it
+            // was accepted, so this node is its publisher, not a relay.
+            RpcRequest::SendRawTransaction(tx) => match self
+                .on_transaction(tx.clone(), Provenance::Originated)
+            {
                 Ok(outcome) => Ok(rpc::submitted_json(&tx, outcome)),
                 // The two refusals are not the same fact and must not carry
                 // the same advice. "Retry later" is correct for a full
@@ -2261,11 +2641,12 @@ pub fn run(cfg: Config) -> io::Result<()> {
 
     let logged = store.read_all()?;
     let head_slot = Arc::new(AtomicU64::new(0));
-    // Network events queued but not yet handled. The transport reads it to
-    // decide when to shed rather than queue — see `net::send_to_engine`. It is
-    // decremented below, after each event is actually processed, so "in flight"
-    // means exactly that and not "ever sent".
-    let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // Network events queued but not yet handled, metered separately per class
+    // — see `net::EngineQueue`. Blocks and attestations used to share one cap
+    // of 4096, which is how a flood of stale attestations silently ate the
+    // quota that arriving blocks needed and left 61 of 64 validators unable to
+    // deliver one.
+    let queue = Arc::new(EngineQueue::new());
     let (tx, rx) = mpsc::channel::<EngineEvent>();
     // The transports speak NetEvent and know nothing about the RPC; the engine
     // consumes one channel. Rather than teach both transports the engine's
@@ -2275,13 +2656,8 @@ pub fn run(cfg: Config) -> io::Result<()> {
     let (net_tx, net_rx) = mpsc::channel::<NetEvent>();
     {
         let tx = tx.clone();
-        std::thread::spawn(move || {
-            for ev in net_rx {
-                if tx.send(EngineEvent::Net(ev)).is_err() {
-                    return; // engine gone; nothing left to deliver to
-                }
-            }
-        });
+        let queue = queue.clone();
+        std::thread::spawn(move || forward_admitted(net_rx, tx, queue));
     }
     let net = match cfg.transport {
         Transport::Devnet => net::Net::Devnet(net::start(
@@ -2291,7 +2667,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
             tx.clone(),
             cfg.data_dir.clone(),
             head_slot.clone(),
-            inflight.clone(),
+            queue.clone(),
         )?),
         Transport::Libp2p => {
             let parse = |s: &str, what: &str| -> io::Result<crate::p2p::Multiaddr> {
@@ -2351,6 +2727,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         ws_anchor_hard: false,
         ws_conflict_reported: false,
         fc_covered_removals: 0,
+        queue: queue.clone(),
         manifest,
     };
 
@@ -2522,12 +2899,51 @@ pub fn run(cfg: Config) -> io::Result<()> {
         }
     }
 
+    // ── WP7 sync-throughput instrument ──
+    //
+    // `BLOCH_SYNC_BENCH_MS` only; the drain bound itself is WP3's
+    // `BLOCH_MAX_EVENTS_PER_TICK` and is deliberately NOT re-implemented here —
+    // the point of the measurement is the real candidate, not a stand-in.
+    //
+    // A periodic line rather than a start/stop stopwatch: a single before/after
+    // pair over the process would fold in boot, the dial and the first sync
+    // round trip, none of which are the drain loop's throughput. A curve lets
+    // the steady state be read off the interior and the transient discarded.
+    let bench_interval_ms: u64 = std::env::var("BLOCH_SYNC_BENCH_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    let bench_started = std::time::Instant::now();
+    let mut bench_last = bench_started;
+    let mut bench_ticks: u64 = 0;
+    let mut bench_events: u64 = 0;
+    // ── Slot-duty starvation ──
+    //
+    // The loop attests and proposes ONLY between ticks. A tick that runs long
+    // therefore does not merely delay a duty, it skips every slot that began
+    // and ended inside it — the node produces nothing for those slots and they
+    // are indistinguishable, from outside, from a validator that is down.
+    // `bench_skipped` counts exactly those slots: the wall clock advanced by
+    // more than one slot between two consecutive passes of the loop.
+    let mut bench_skipped: u64 = 0;
+    let mut bench_max_jump: u64 = 0;
+    let mut bench_proposed: u64 = 0;
+    let mut bench_attested: u64 = 0;
+    // How late a proposal was, relative to the slot's own proposal deadline.
+    // Late is survivable; skipped is not, and the two are separated here
+    // rather than folded into one latency figure.
+    let mut bench_late_max: u64 = 0;
+    let mut bench_seen_slot: Option<u64> = None;
+
     // ── The slot loop ──
     let genesis_ms = engine.manifest.genesis_time_ms;
     let slot_ms = engine.manifest.slot_ms;
     let mut last_attested: u64 = engine.state.slot();
     let mut last_built: u64 = engine.state.slot();
     let mut last_sync_req: u64 = 0;
+    // `u64::MAX` so the first pass through the loop reports (and stays silent
+    // when there is nothing to report), rather than skipping epoch 0.
+    let mut last_drop_report: u64 = u64::MAX;
 
     loop {
         let now = now_ms();
@@ -2538,7 +2954,20 @@ pub fn run(cfg: Config) -> io::Result<()> {
         let slot = (now - genesis_ms) / slot_ms;
         let slot_start = genesis_ms + slot * slot_ms;
         let wall_epoch = epoch_of(slot);
+        if wall_epoch != last_drop_report {
+            last_drop_report = wall_epoch;
+            engine.report_broadcast_drops(wall_epoch);
+        }
         if slot != engine.wall_slot {
+            // Measured BEFORE the assignment, and skipping the first pass,
+            // whose `wall_slot` is still the replayed head rather than a slot
+            // this loop has seen.
+            if let Some(prev) = bench_seen_slot {
+                let jump = slot.saturating_sub(prev);
+                bench_skipped += jump.saturating_sub(1);
+                bench_max_jump = bench_max_jump.max(jump);
+            }
+            bench_seen_slot = Some(slot);
             engine.wall_slot = slot;
             // Drop everything the acceptance window has moved past. The pool
             // reads no clock of its own, so this is the only thing that bounds
@@ -2570,11 +2999,14 @@ pub fn run(cfg: Config) -> io::Result<()> {
         if !in_grace && slot > last_attested {
             engine.attest(slot);
             last_attested = slot;
+            bench_attested += 1;
         }
         let propose_at = slot_start + slot_ms / 3;
         if !in_grace && now >= propose_at && slot > last_built {
             engine.propose(slot);
             last_built = slot;
+            bench_proposed += 1;
+            bench_late_max = bench_late_max.max(now.saturating_sub(propose_at));
         }
 
         // Sync when behind or when a stored branch has holes. Rate-limited;
@@ -2584,7 +3016,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         if (behind || engine.needs_sync) && now.saturating_sub(last_sync_req) > 2 * slot_ms {
             engine
                 .net
-                .broadcast(net::get_blocks_frame(engine.state.slot()));
+                .broadcast(net::get_blocks_frame(engine.state.slot()), Provenance::Originated);
             engine.needs_sync = false;
             last_sync_req = now;
         }
@@ -2597,36 +3029,11 @@ pub fn run(cfg: Config) -> io::Result<()> {
         let wait = next_deadline.saturating_sub(now_ms()).clamp(1, 500);
         match rx.recv_timeout(Duration::from_millis(wait)) {
             Ok(ev) => {
-                let mut pending = vec![ev];
-                while let Ok(more) = rx.try_recv() {
-                    pending.push(more);
-                }
-                for ev in pending {
-                    // Every `EngineEvent::Net` was counted into `inflight` by
-                    // the transport; releasing it here — after handling, not on
-                    // dequeue — is what makes the cap mean "work the engine has
-                    // not done yet".
-                    if matches!(ev, EngineEvent::Net(_)) {
-                        inflight.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-                    }
-                    match ev {
-                        EngineEvent::Net(NetEvent::Block(env)) => engine.ingest(env),
-                        EngineEvent::Net(NetEvent::Attestation(att, origin)) => {
-                            engine.on_attestation(att, origin, wall_epoch)
-                        }
-                        EngineEvent::Net(NetEvent::Transaction(tx)) => {
-                            // Gossip has nobody to answer to; the verdict is the
-                            // RPC's concern, not a peer's.
-                            let _ = engine.on_transaction(tx);
-                        }
-                        EngineEvent::Rpc(call) => {
-                            let result = engine.serve_rpc(call.req);
-                            // A client that hung up between asking and being
-                            // answered is normal, not an error worth logging.
-                            let _ = call.reply.send(result);
-                        }
-                    }
-                }
+                // BOUNDED, where this used to empty the channel before slot
+                // duties could run again. See `MAX_ENGINE_EVENTS_PER_TICK`.
+                let pending = take_pending(&rx, ev, max_engine_events_per_tick());
+                bench_events += pending.len() as u64;
+                drain_pending(&mut engine, pending, wall_epoch);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -2635,6 +3042,42 @@ pub fn run(cfg: Config) -> io::Result<()> {
                     "network channel closed",
                 ));
             }
+        }
+
+        // One machine-readable sample per interval, inert unless the knob is
+        // set. Shedding is reported PER CLASS, through WP3's own
+        // `EngineQueue::stats`, because a shed block and a shed attestation are
+        // not the same event: the first is a hole the sync pump must
+        // re-request, the second is a vote the mesh will re-gossip. Occupancy
+        // is here for the same reason — the cost of a slower drain is the quota
+        // filling, and this is where it would show if it did.
+        bench_ticks += 1;
+        if bench_interval_ms > 0
+            && bench_last.elapsed() >= Duration::from_millis(bench_interval_ms)
+        {
+            let q = queue.stats();
+            println!(
+                "syncbench t_ms={} head={} blocks={} ticks={} events={} \
+shedblk={} shedatt={} shedtx={} qblk={} qatt={} qtx={} \
+skipped={} maxjump={} proposed={} attested={} latemax={}",
+                bench_started.elapsed().as_millis(),
+                engine.state.slot(),
+                engine.chain.len() - 1,
+                bench_ticks,
+                bench_events,
+                q.block.shed,
+                q.attestation.shed,
+                q.transaction.shed,
+                q.block.items,
+                q.attestation.items,
+                q.transaction.items,
+                bench_skipped,
+                bench_max_jump,
+                bench_proposed,
+                bench_attested,
+                bench_late_max,
+            );
+            bench_last = std::time::Instant::now();
         }
     }
 }
@@ -3917,7 +4360,7 @@ mod transfer_v2_end_to_end {
     /// HOLDS `entries` — the outputs the sweep spends. `epochs_past` places
     /// `genesis_time_ms` so the node's real wall epoch is at least that
     /// (+2 slots of margin so the epoch cannot regress mid-test).
-    fn engine_at_wall_epoch(epochs_past: u64, entries: &[EutxoEntry]) -> Engine {
+    pub(super) fn engine_at_wall_epoch(epochs_past: u64, entries: &[EutxoEntry]) -> Engine {
         let slot_ms = 500u64;
         let back_ms = epochs_past
             .saturating_mul(SLOTS_PER_EPOCH)
@@ -3966,7 +4409,7 @@ mod transfer_v2_end_to_end {
         // `_rx` drops here: nothing dials this node, and the accept loop
         // exits quietly on a closed channel.
         let head_slot = Arc::new(AtomicU64::new(0));
-        let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let queue = Arc::new(EngineQueue::new());
         let net = net::Net::Devnet(
             net::start(
                 "127.0.0.1",
@@ -3975,7 +4418,7 @@ mod transfer_v2_end_to_end {
                 events,
                 dir.clone(),
                 head_slot.clone(),
-                inflight,
+                queue.clone(),
             )
             .expect("bind the devnet transport on an ephemeral port"),
         );
@@ -4006,6 +4449,7 @@ mod transfer_v2_end_to_end {
             ws_anchor_hard: false,
             ws_conflict_reported: false,
             fc_covered_removals: 0,
+            queue,
         }
     }
 
@@ -4089,14 +4533,14 @@ mod transfer_v2_end_to_end {
         // ── Gossip path, on a FRESH engine ──────────────────────────────────
         let mut gossip_node = engine_at_wall_epoch(V2_FLAG_DAY + 1, &entries);
         assert_eq!(
-            gossip_node.on_transaction(tx.clone()),
+            gossip_node.on_transaction(tx.clone(), Provenance::Relayed),
             Ok(Admitted::New),
             "the gossip path must admit the sweep"
         );
         // Surviving the mempool: a second delivery collapses to Duplicate
         // instead of being refused or double-inserted.
         assert_eq!(
-            gossip_node.on_transaction(tx.clone()),
+            gossip_node.on_transaction(tx.clone(), Provenance::Relayed),
             Ok(Admitted::Duplicate),
             "a re-gossiped sweep must be a duplicate, not a refusal"
         );
@@ -4138,7 +4582,7 @@ mod transfer_v2_end_to_end {
 
         // Gossip path: refused with today's string.
         let err = node
-            .on_transaction(tx.clone())
+            .on_transaction(tx.clone(), Provenance::Relayed)
             .expect_err("pre-activation, the gossip path must refuse V2");
         assert!(
             err.reason().contains("deduplicated transfers (tag 0x06) are not active"),
@@ -4258,7 +4702,7 @@ mod perf_support {
         let store = Store::open(&dir, &[0u8; 32]).expect("open the test store");
         let (events, _rx) = mpsc::channel::<EngineEvent>();
         let head_slot = Arc::new(AtomicU64::new(0));
-        let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let queue = Arc::new(EngineQueue::new());
         let net = net::Net::Devnet(
             net::start(
                 "127.0.0.1",
@@ -4267,7 +4711,7 @@ mod perf_support {
                 events,
                 dir.clone(),
                 head_slot.clone(),
-                inflight,
+                queue.clone(),
             )
             .expect("bind the devnet transport on an ephemeral port"),
         );
@@ -4304,6 +4748,7 @@ mod perf_support {
             // offset the very first comparison against a pool that really is
             // empty.
             fc_covered_removals: 0,
+            queue,
         };
         (engine, TestDir(dir))
     }
@@ -4392,6 +4837,405 @@ mod root_budget_tests {
             "five slots must cost ten state-root computations, not fifteen"
         );
     }
+}
+
+/// **WP11 — the `select_transactions` byte-cap `break`.** A measurement, not
+/// a fix. `select_transactions` (engine.rs) walks the mempool — a
+/// `BTreeMap<Vec<u8>, _>` keyed by canonical bytes, so byte-lexicographic
+/// over the ENCODING, not insertion order — and on the first transaction
+/// whose bytes would overflow the block byte cap it does `break`, not
+/// `continue`. A single transaction that (a) encodes larger than
+/// `MAX_BLOCK_TX_BYTES` and (b) sorts before every other entry therefore
+/// ends selection at the first step and empties the proposal.
+///
+/// The encoding makes (b) free to arrange: a `Transfer` is `0x01`, then
+/// `inputs.len() as u32 LE`, then the inputs (each beginning with a 32-byte
+/// `txid` the sender picks). A one-input transfer (`01 01 00 00 00 …`) sorts
+/// before every two-input one (`01 02 00 00 00 …`), and among one-input
+/// transfers the order is the `txid` — so `txid = [0u8;32]` sorts first.
+/// Size (a) comes from the OUTPUT list, which the encoding places AFTER the
+/// inputs and which `admissible` only checks is non-empty: thousands of
+/// outputs under one real, correctly-signed input pass admission and blow
+/// past the cap.
+#[cfg(test)]
+mod wp11_select_break {
+    use super::*;
+    use bloch_pos_committee::fee_market::MAX_BLOCK_TX_BYTES;
+    use bloch_pos_committee::transition::{TransferInput, TransferOutput};
+
+    /// One real hybrid keypair, fixed seed so the test is deterministic.
+    fn keypair() -> (Vec<u8>, Vec<u8>) {
+        bloch_crypto::crypto::generate_keypair_from_seed(&[7u8; 32])
+            .expect("hybrid keypair from a fixed seed")
+    }
+
+    /// A correctly-signed one-input `Transfer` with `txid = [fill; 32]` and
+    /// `n_outputs` outputs. With `fill = 0` it sorts before any transfer with
+    /// a non-zero leading txid byte; `n_outputs` sets its encoded size.
+    /// Signs for real, so it also passes `admissible`.
+    fn signed_transfer(fill: u8, n_outputs: usize) -> PosTransaction {
+        let (pk, sk) = keypair();
+        let script_hash: [u8; 32] = {
+            use sha3::{Digest, Sha3_256};
+            Sha3_256::digest(&pk).into()
+        };
+        let outputs: Vec<TransferOutput> = (0..n_outputs)
+            .map(|i| TransferOutput {
+                value: 1_000 + i as u64,
+                script_hash,
+            })
+            .collect();
+        let mut tx = PosTransaction::Transfer {
+            inputs: vec![TransferInput {
+                txid: [fill; 32],
+                vout: 0,
+                pubkey: pk,
+                signature: Vec::new(),
+            }],
+            outputs,
+            tx_bytes: 0,
+            tip_millisat_per_gas: 0,
+        };
+        let root = tx.spend_signing_root();
+        let sig = bloch_crypto::crypto::sign(&sk, &root).expect("sign the spend root");
+        if let PosTransaction::Transfer { inputs, .. } = &mut tx {
+            inputs[0].signature = sig;
+        }
+        tx
+    }
+
+    /// **#1 — REPRODUCE.** One oversized transfer that sorts first, plus five
+    /// ordinary transfers that would all have fit, and `select_transactions`
+    /// returns EMPTY. The control removes the oversized one and gets all five,
+    /// proving they would have fit — the emptiness is the `break`, nothing
+    /// else.
+    #[test]
+    fn one_oversized_first_sorting_transfer_empties_the_selection() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+
+        // The poison: sorts first (txid all-zero), and larger than the cap.
+        let poison = signed_transfer(0x00, 8_000);
+        let poison_bytes = poison.canonical_bytes();
+        assert!(
+            poison_bytes.len() as u64 > MAX_BLOCK_TX_BYTES,
+            "harness: the poison transfer must exceed the block byte cap \
+             ({} bytes vs cap {})",
+            poison_bytes.len(),
+            MAX_BLOCK_TX_BYTES,
+        );
+
+        // Five ordinary transfers, each tiny, each sorting AFTER the poison
+        // (leading txid byte non-zero). Together far under the cap.
+        let ordinary: Vec<PosTransaction> = (1..=5u8)
+            .map(|k| signed_transfer(0x10 * k, 1))
+            .collect();
+        let ordinary_total: u64 = ordinary
+            .iter()
+            .map(|t| t.canonical_bytes().len() as u64)
+            .sum();
+        assert!(
+            ordinary_total < MAX_BLOCK_TX_BYTES,
+            "harness: the ordinary transfers must all fit ({} bytes vs cap {})",
+            ordinary_total,
+            MAX_BLOCK_TX_BYTES,
+        );
+
+        // Load the mempool: poison + the five ordinary ones.
+        engine
+            .mempool
+            .insert(poison_bytes.clone(), poison.clone());
+        for t in &ordinary {
+            engine.mempool.insert(t.canonical_bytes(), t.clone());
+        }
+        assert_eq!(engine.mempool.len(), 6, "harness: six entries loaded");
+
+        // Confirm the poison really is the first key the BTreeMap yields.
+        let first_key = engine.mempool.keys().next().expect("non-empty").clone();
+        assert_eq!(
+            first_key, poison_bytes,
+            "harness: the poison must sort first, or the test proves nothing"
+        );
+
+        // THE MEASUREMENT: selection is EMPTY, though five would have fit.
+        let selected = engine.select_transactions(0);
+        assert!(
+            selected.is_empty(),
+            "CONFIRMED-or-DEMOLISHED: with a first-sorting oversized transfer, \
+             select_transactions returned {} transactions; the hypothesis \
+             predicts 0",
+            selected.len(),
+        );
+
+        // THE CONTROL: drop the poison and the same five are selected — they
+        // always fit; the `break` on the poison is the whole cause.
+        engine.mempool.remove(&poison_bytes);
+        let selected_after = engine.select_transactions(0);
+        assert_eq!(
+            selected_after.len(),
+            5,
+            "control: without the poison, all five ordinary transfers select"
+        );
+    }
+
+    /// **#2 — REACHABILITY.** The exact poison runs through `admissible`
+    /// (the one gate both the RPC and gossip paths converge on) and is
+    /// ACCEPTED: one real self-generated keypair, one correct signature over
+    /// a txid that need not exist, and thousands of outputs. No funds, no
+    /// existing UTXO, no size check. Cost: one unauthenticated request.
+    #[test]
+    fn the_poison_is_admissible_with_a_self_generated_key_and_no_funds() {
+        let poison = signed_transfer(0x00, 8_000);
+        // wall_epoch is only read by the TransferV2 arm; a V1 Transfer is
+        // judged identically at every epoch, so 0 is representative.
+        let verdict = admissible(&poison, 0);
+        assert!(
+            verdict.is_ok(),
+            "REACHABLE: admissible must accept the poison (self-signed, \
+             nonexistent input, oversized) — it rejected with {verdict:?}"
+        );
+    }
+
+    /// **#1(b) — PRODUCED-BUT-EMPTY, settled.** The founder's correction:
+    /// does this drop a SLOT (no block) or only empty the block? Drive the
+    /// real proposer with only the poison in the mempool. A block IS produced
+    /// and adopted (chain grows), it carries ZERO transactions, and the
+    /// poison is STILL in the mempool afterward — never selected, so never
+    /// reached by `propose`'s drop-and-retry guard. This is a
+    /// transaction-inclusion halt, not a production halt.
+    #[test]
+    fn the_proposer_still_produces_a_block_and_it_is_empty() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+
+        let poison = signed_transfer(0x00, 8_000);
+        let poison_bytes = poison.canonical_bytes();
+        engine.mempool.insert(poison_bytes.clone(), poison);
+        let chain_before = engine.chain.len();
+
+        engine.propose(1);
+
+        assert_eq!(
+            engine.chain.len(),
+            chain_before + 1,
+            "PRODUCED: a block was still proposed and adopted — the slot is \
+             NOT dropped"
+        );
+        let head = engine
+            .blocks
+            .get(engine.head_id().as_bytes())
+            .expect("the adopted block is stored");
+        assert_eq!(
+            head.body.transactions.len(),
+            0,
+            "EMPTY: the produced block carries zero transactions"
+        );
+        assert!(
+            engine.mempool.contains_key(&poison_bytes),
+            "PERMANENT: the poison was never selected, so propose's \
+             drop-and-retry never saw it — it is still in the mempool"
+        );
+    }
+
+    /// **The LIVE cap, not the museum one.** `max_block_tx_bytes` is
+    /// flag-day gated: 262,144 B below `BLOCK_BYTES_V2_ACTIVATION_EPOCH`
+    /// (= 800, params.rs:308) and 524,288 B from it (fee_market.rs:65/85).
+    /// Genesis-4 mainnet is at **epoch 1033**, measured from a node on
+    /// 2026-08-25 — past the epoch-800 activation, so the cap a real
+    /// proposer packs against TODAY is 512 KiB and a 256 KiB-sized poison
+    /// would not trigger anything on the fleet.
+    ///
+    /// The epoch is stated because an earlier revision of this test said
+    /// "mainnet is past epoch 1400" and derived the era from
+    /// `ACTIVATION + 600`, which lands exactly on 1400 — a DIFFERENT flag
+    /// day, still 367 epochs out and unfired. The arithmetic happened to
+    /// pick the one number that reads as "the pending flag day has already
+    /// passed". What the conclusion actually rests on is `1033 >= 800`, so
+    /// the era is derived from the activation constant and the observed
+    /// height, and the cap is read from `max_block_tx_bytes` rather than
+    /// hard-coded.
+    #[test]
+    fn the_same_poison_empties_selection_at_the_live_post_flag_day_cap() {
+        use bloch_pos_committee::fee_market::max_block_tx_bytes;
+        use bloch_pos_committee::params::BLOCK_BYTES_V2_ACTIVATION_EPOCH;
+
+        /// The epoch Genesis-4 mainnet was observed at, 2026-08-25.
+        /// Not a threshold — a witness that the live chain is past the
+        /// activation. Any later reading keeps this test honest; a reading
+        /// BELOW 800 would invalidate its premise, which is why the
+        /// relationship is asserted rather than assumed.
+        const MAINNET_EPOCH_OBSERVED: u64 = 1_033;
+
+        assert!(
+            MAINNET_EPOCH_OBSERVED >= BLOCK_BYTES_V2_ACTIVATION_EPOCH,
+            "premise: the observed mainnet epoch ({MAINNET_EPOCH_OBSERVED}) \
+             must be past the byte-cap activation ({})",
+            BLOCK_BYTES_V2_ACTIVATION_EPOCH,
+        );
+        let live_epoch = MAINNET_EPOCH_OBSERVED;
+        let cap = max_block_tx_bytes(live_epoch);
+        assert_eq!(
+            cap, 524_288,
+            "harness: at the observed mainnet epoch the cap must be the \
+             512 KiB one"
+        );
+
+        let (mut engine, _dir) = perf_support::proposing_engine();
+
+        // 16,000 outputs × 40 B ≈ 640 KB — over the LIVE cap, and still far
+        // under the 8 MiB frame limit (codec.rs MAX_FIELD_LEN), so it fits
+        // on the wire and reaches the mempool intact.
+        let poison = signed_transfer(0x00, 16_000);
+        let poison_bytes = poison.canonical_bytes();
+        assert!(
+            poison_bytes.len() as u64 > cap,
+            "harness: the poison must exceed the LIVE cap ({} vs {cap})",
+            poison_bytes.len(),
+        );
+        assert!(
+            poison_bytes.len() < 8 * 1024 * 1024,
+            "harness: the poison must still fit one wire frame ({} B)",
+            poison_bytes.len(),
+        );
+        // It is admissible at the live epoch too — same three checks.
+        assert!(
+            admissible(&poison, live_epoch).is_ok(),
+            "the poison must be admissible at the live epoch"
+        );
+
+        let ordinary: Vec<PosTransaction> =
+            (1..=5u8).map(|k| signed_transfer(0x10 * k, 1)).collect();
+        engine.mempool.insert(poison_bytes.clone(), poison);
+        for t in &ordinary {
+            engine.mempool.insert(t.canonical_bytes(), t.clone());
+        }
+        assert_eq!(
+            engine.mempool.keys().next().expect("non-empty"),
+            &poison_bytes,
+            "harness: the poison must sort first"
+        );
+
+        let selected = engine.select_transactions(live_epoch);
+        assert!(
+            selected.is_empty(),
+            "at the LIVE cap, selection returned {} transactions; the \
+             hypothesis predicts 0",
+            selected.len(),
+        );
+
+        // Control at the same epoch: the five always fit.
+        engine.mempool.remove(&poison_bytes);
+        assert_eq!(
+            engine.select_transactions(live_epoch).len(),
+            5,
+            "control: without the poison all five select at the live cap"
+        );
+    }
+
+    /// **REACHABILITY, measured per entry path — and the RPC door is SHUT
+    /// at the live cap.**
+    ///
+    /// `sendrawtransaction` takes the canonical bytes as HEX (rpc.rs
+    /// `route`, the "sendrawtransaction" arm) and the HTTP body is capped at
+    /// `rpc::MAX_BODY_BYTES` = 1 MiB, rejected with 413 on Content-Length
+    /// alone, before the body is read (rpc.rs:1111). To trip the byte cap a
+    /// transaction must EXCEED it, so at the live cap every possible poison
+    /// is at least 524,289 binary bytes = at least 1,048,578 hex characters
+    /// — already more than the whole body allowance, before the JSON
+    /// envelope. That is an inequality over the two constants, so it holds
+    /// for EVERY poison and not merely for the witness built below.
+    ///
+    /// Gossip is the open door: `net.rs:268` admits any frame up to
+    /// `codec::MAX_FIELD_LEN` = 8 MiB, and `on_transaction` re-broadcasts the
+    /// full canonical bytes to every peer, so one delivery poisons the mesh.
+    ///
+    /// Sizes are MEASURED, never computed. A hybrid signature is
+    /// VARIABLE-LENGTH (Falcon-1024 is randomised), so two encodings of the
+    /// "same" transaction differ by a byte or two; an earlier revision of
+    /// this test derived the per-output cost from two samples, read that
+    /// jitter as part of the per-output term, and built a poison that missed
+    /// the cap. Everything below is sized by growing a real transaction
+    /// until a real measurement clears the bound.
+    #[test]
+    fn rpc_body_cap_shuts_the_rpc_door_at_the_live_cap_but_not_gossip() {
+        use bloch_pos_committee::fee_market::max_block_tx_bytes;
+        use bloch_pos_committee::params::BLOCK_BYTES_V2_ACTIVATION_EPOCH;
+
+        // The activation epoch itself is the first era with the new cap, and
+        // mainnet (epoch 1033, measured 2026-08-25) is inside it.
+        let live_cap = max_block_tx_bytes(BLOCK_BYTES_V2_ACTIVATION_EPOCH);
+        let old_cap = max_block_tx_bytes(0);
+        assert_eq!((live_cap, old_cap), (524_288, 262_144), "the two caps");
+
+        // THE CATEGORICAL CLAIM, over constants only: any transaction big
+        // enough to trip the live cap is too big to be sent as hex through
+        // the RPC body limit. No witness can escape this.
+        assert!(
+            2 * (live_cap as usize + 1) > crate::rpc::MAX_BODY_BYTES,
+            "RPC hex of the SMALLEST possible live-cap poison ({}) must \
+             exceed MAX_BODY_BYTES ({})",
+            2 * (live_cap as usize + 1),
+            crate::rpc::MAX_BODY_BYTES,
+        );
+
+        // A witness, grown by measurement until it really clears a bound.
+        // Each output costs value(8) + script_hash(32) = 40 B.
+        let grow_past = |bound: u64| -> (usize, usize) {
+            let mut n = (bound as usize / 40) + 8;
+            loop {
+                let len = signed_transfer(0x00, n).canonical_bytes().len();
+                if len as u64 > bound {
+                    return (n, len);
+                }
+                n += ((bound as usize + 1 - len).div_ceil(40)).max(1);
+            }
+        };
+
+        let (n, bin) = grow_past(live_cap);
+        let hex = bin * 2;
+        println!(
+            "live-cap poison: {n} outputs, {bin} B binary, {hex} hex chars \
+             (live cap {live_cap}, MAX_BODY_BYTES {}, MAX_FIELD_LEN {})",
+            crate::rpc::MAX_BODY_BYTES,
+            crate::codec::MAX_FIELD_LEN,
+        );
+        assert!(bin as u64 > live_cap, "the witness must exceed the live cap");
+        // THE RPC DOOR: shut.
+        assert!(
+            hex > crate::rpc::MAX_BODY_BYTES,
+            "RPC cannot carry it: {hex} hex chars vs body cap {}",
+            crate::rpc::MAX_BODY_BYTES,
+        );
+        // THE GOSSIP DOOR: open, with 16x room.
+        assert!(
+            bin < crate::codec::MAX_FIELD_LEN,
+            "gossip must carry it: {bin} B vs frame cap {}",
+            crate::codec::MAX_FIELD_LEN,
+        );
+        // And it is admitted, therefore re-broadcast to every peer.
+        assert!(
+            admissible(&signed_transfer(0x00, n), BLOCK_BYTES_V2_ACTIVATION_EPOCH).is_ok(),
+            "the poison must be admissible at the live epoch"
+        );
+
+        // THE CONTROL, and the reason this is a flag-day story: under the OLD
+        // 256 KiB cap the same attack fits the 1 MiB body comfortably, so
+        // before epoch 800 this WAS reachable by one unauthenticated HTTP
+        // request. The flag day that doubled the cap is what closed the RPC
+        // door — incidentally, not by design.
+        let (n_old, bin_old) = grow_past(old_cap);
+        println!(
+            "old-cap poison: {n_old} outputs, {bin_old} B binary, {} hex chars \
+             — fits the 1 MiB body",
+            bin_old * 2
+        );
+        assert!(bin_old as u64 > old_cap);
+        assert!(
+            bin_old * 2 < crate::rpc::MAX_BODY_BYTES,
+            "under the old cap the RPC door was OPEN: {} hex chars vs {}",
+            bin_old * 2,
+            crate::rpc::MAX_BODY_BYTES,
+        );
+    }
+
 }
 
 /// What the deleted work actually cost, on a state the size the fleet runs.
@@ -4591,14 +5435,14 @@ mod bench {
         let before = |st: &CommittedState| -> u128 {
             let t = Instant::now();
             let root = st.state_root();
-            let v = crate::rpc::chain_info_json(st, &head, root, 0, Some(0), 0, 1, 0, 1);
+            let v = crate::rpc::chain_info_json(st, &head, root, 0, Some(0), 0, 1, 0, 1, &Default::default());
             let us = t.elapsed().as_micros();
             std::hint::black_box(v);
             us
         };
         let after = |st: &CommittedState| -> u128 {
             let t = Instant::now();
-            let v = crate::rpc::chain_info_json(st, &head, header_root, 0, Some(0), 0, 1, 0, 1);
+            let v = crate::rpc::chain_info_json(st, &head, header_root, 0, Some(0), 0, 1, 0, 1, &Default::default());
             let us = t.elapsed().as_micros();
             std::hint::black_box(v);
             us
@@ -4638,10 +5482,10 @@ mod bench {
         // Byte-identical, which is what makes this transport-only. Asserted
         // rather than printed: a bench that quietly changed the answer would
         // be measuring the wrong thing to begin with.
-        let a = crate::rpc::chain_info_json(&st, &head, header_root, 0, Some(0), 0, 1, 0, 1);
+        let a = crate::rpc::chain_info_json(&st, &head, header_root, 0, Some(0), 0, 1, 0, 1, &Default::default());
         let b = {
             let root = st.state_root();
-            crate::rpc::chain_info_json(&st, &head, root, 0, Some(0), 0, 1, 0, 1)
+            crate::rpc::chain_info_json(&st, &head, root, 0, Some(0), 0, 1, 0, 1, &Default::default())
         };
         assert_eq!(
             a.to_string(),
@@ -5542,7 +6386,7 @@ mod duty_view_anchor {
         let store = Store::open(&dir.0, &[0u8; 32]).expect("open the test store");
         let (events, _rx) = mpsc::channel::<EngineEvent>();
         let head_slot = Arc::new(AtomicU64::new(0));
-        let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let queue = Arc::new(EngineQueue::new());
         let net = net::Net::Devnet(
             net::start(
                 "127.0.0.1",
@@ -5551,7 +6395,7 @@ mod duty_view_anchor {
                 events,
                 dir.0.clone(),
                 head_slot.clone(),
-                inflight,
+                queue.clone(),
             )
             .expect("bind the devnet transport on an ephemeral port"),
         );
@@ -5583,6 +6427,7 @@ mod duty_view_anchor {
             ws_anchor_hard: false,
             ws_conflict_reported: false,
             fc_covered_removals: 0,
+            queue,
         };
         (engine, dir)
     }
@@ -5755,6 +6600,328 @@ mod admissao_entrada_gasta {
     }
 }
 
+
+#[cfg(test)]
+mod libp2p_admission_tests {
+    //! The production transport's admission, which nothing covered until the
+    //! mutation run: deleting the quota check from the forwarder left the whole
+    //! suite green, and that is precisely the state libp2p shipped in.
+
+    use super::*;
+    use crate::net::{Class, EngineQueue, NetEvent};
+    use bloch_pos_committee::attestation::{Attestation, AttestationData};
+    use bloch_pos_committee::header::{BlockEnvelope, BlockHeaderV4, Body};
+
+    fn envelope(slot: u64) -> BlockEnvelope {
+        BlockEnvelope {
+            header: BlockHeaderV4 {
+                version: 4,
+                parent: [0u8; 32],
+                state_root: [0u8; 32],
+                body_root: [0u8; 32],
+                slot,
+                proposer_index: 17,
+                randao_reveal: [0u8; 32],
+                randao_mix: [0u8; 32],
+                justified_root: [0u8; 32],
+                finalized_root: [0u8; 32],
+                attestation_root: [0u8; 32],
+                coherence_root: [0u8; 32],
+            },
+            proposer_sig: vec![7u8; 64],
+            body: Body { attestations: Vec::new(), transactions: Vec::new() },
+        }
+    }
+
+    fn attestation(slot: u64) -> NetEvent {
+        NetEvent::Attestation(
+            Attestation {
+                data: AttestationData {
+                    slot,
+                    head: [0u8; 32],
+                    source_epoch: 0,
+                    source_root: [0u8; 32],
+                    target_epoch: 0,
+                    target_root: [0u8; 32],
+                },
+                validator: 3,
+                signature: vec![9u8; 4_800],
+            },
+            crate::net::Origin::none(),
+        )
+    }
+
+    /// Drain the forwarder to completion over a fixed input.
+    fn forward(queue: &Arc<EngineQueue>, evs: Vec<NetEvent>) -> Vec<EngineEvent> {
+        let (net_tx, net_rx) = mpsc::channel::<NetEvent>();
+        let (tx, rx) = mpsc::channel::<EngineEvent>();
+        for e in evs {
+            net_tx.send(e).expect("the forwarder has not started yet");
+        }
+        drop(net_tx); // closing the input is what ends the loop
+        forward_admitted(net_rx, tx, queue.clone());
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(ev);
+        }
+        out
+    }
+
+    /// The motivating case again, on the production transport this time: with
+    /// the attestation quota saturated, a block still gets through.
+    #[test]
+    fn a_block_still_arrives_on_libp2p_while_attestations_are_saturated() {
+        let queue = Arc::new(EngineQueue::new());
+        let (att_items, _) = (2048usize, ());
+        let _flood: Vec<_> = (0..att_items)
+            .filter_map(|_| EngineQueue::admit(&queue, Class::Attestation, 4_929))
+            .collect();
+        assert_eq!(_flood.len(), att_items, "the attestation class must really be full");
+
+        let out = forward(&queue, vec![attestation(1), NetEvent::Block(envelope(25_750))]);
+        assert_eq!(out.len(), 1, "the attestation is shed, the block is not");
+        match &out[0] {
+            EngineEvent::Net(adm) => match adm.peek() {
+                NetEvent::Block(env) => assert_eq!(env.header.slot, 25_750),
+                _ => panic!("the survivor must be the block"),
+            },
+            _ => panic!("the survivor must be the block"),
+        }
+        assert_eq!(queue.stats().attestation.shed, 1, "and the shed attestation is counted");
+    }
+
+    /// The CONTROL: the forwarder is a ceiling, not a funnel. Saturate BLOCKS
+    /// and the block it forwards must be shed and counted — otherwise the
+    /// libp2p path is the unbounded channel it used to be.
+    #[test]
+    fn the_libp2p_forwarder_sheds_and_counts_when_the_block_quota_is_full() {
+        let queue = Arc::new(EngineQueue::new());
+        let _full: Vec<_> = (0..1024usize)
+            .filter_map(|_| EngineQueue::admit(&queue, Class::Block, 700))
+            .collect();
+        assert_eq!(_full.len(), 1024, "the block class must really be full");
+
+        let out = forward(&queue, vec![NetEvent::Block(envelope(9))]);
+        assert!(out.is_empty(), "a block over the block quota must not reach the engine");
+        assert_eq!(queue.stats().block.shed, 1, "and it must leave a trace");
+    }
+
+    /// The forwarder must charge each event to its own class and to its real
+    /// size — it is the only place the libp2p path is measured, so an event
+    /// mis-sized here is a ceiling that is wrong by exactly that much.
+    #[test]
+    fn the_forwarder_charges_each_event_to_its_own_class_and_size() {
+        let queue = Arc::new(EngineQueue::new());
+        let block = NetEvent::Block(envelope(4));
+        let att = attestation(4);
+        let (bb, ab) = (block.wire_bytes(), att.wire_bytes());
+
+        let held = forward(&queue, vec![block, att]);
+        assert_eq!(held.len(), 2);
+        let s = queue.stats();
+        assert_eq!(s.block.items, 1, "one block on the block meter");
+        assert_eq!(s.block.bytes, bb, "charged its real wire size");
+        assert_eq!(s.attestation.items, 1, "one attestation on the attestation meter");
+        assert_eq!(s.attestation.bytes, ab);
+
+        drop(held);
+        let s = queue.stats();
+        assert_eq!(s.block.items + s.attestation.items, 0, "and the permits give it all back");
+        assert_eq!(s.block.bytes + s.attestation.bytes, 0);
+    }
+}
+
+/// **N2, at the level where N2 lived.** The engine's own dequeue path must hold
+/// the quota until the handler is done.
+///
+/// The net-level test (`net::queue_tests::the_quota_is_held_while_the_work_runs`)
+/// pins `Admission::handle`. This one pins the CALL SITE — `drain_pending`, the
+/// function extracted out of `run`'s loop — because that is where the surviving
+/// mutation lived: `drop(permit); engine.ingest(env)` was a one-word edit
+/// against the old two-field variant, restored the release-on-dequeue semantics
+/// the commit message calls a lie, and passed all 520 tests.
+///
+/// It cannot pass now for two independent reasons, which is the point of having
+/// both: `EngineEvent::Net` carries a single opaque `Admission` with a private
+/// permit, so the mutation no longer compiles; and if someone reintroduced an
+/// early release inside `Admission::handle` — where it would still compile —
+/// this test reads 0 where it demands 1.
+#[cfg(test)]
+mod quota_holding_tests {
+    use super::*;
+    use bloch_pos_committee::header::{BlockEnvelope, BlockHeaderV4, Body};
+    use crate::net::Class;
+
+    /// The cheapest envelope `ingest` accepts, which is itself the finding:
+    /// two commitment roots over empty vectors — fixed constants an attacker
+    /// copies — and a non-zero slot. No signature is checked before this is
+    /// stored. See the note on `BLOCK_ITEMS_PER_CONN`.
+    fn cheap_block(slot: u64) -> BlockEnvelope {
+        BlockEnvelope {
+            header: BlockHeaderV4 {
+                version: bloch_pos_committee::header::VERSION_G4,
+                parent: [7u8; 32],
+                state_root: [0u8; 32],
+                body_root: derive::body_root(&[]),
+                slot,
+                proposer_index: 0,
+                randao_reveal: [0u8; 32],
+                randao_mix: [0u8; 32],
+                justified_root: [0u8; 32],
+                finalized_root: [0u8; 32],
+                attestation_root: derive::attestation_root(&[]),
+                coherence_root: [0u8; 32],
+            },
+            proposer_sig: vec![1u8; 32],
+            body: Body { attestations: Vec::new(), transactions: Vec::new() },
+        }
+    }
+
+    #[test]
+    fn the_quota_is_held_while_the_engine_does_the_work() {
+        let mut engine = transfer_v2_end_to_end::engine_at_wall_epoch(0, &[]);
+        let queue = engine.queue.clone();
+
+        let ev = NetEvent::Block(cheap_block(4));
+        let adm = EngineQueue::admit_event_owned(&queue, ev, 700)
+            .expect("an empty queue admits");
+        assert_eq!(queue.stats().block.items, 1, "queued, before any handling");
+
+        let (_, seen) = ingest_witness::watching(&queue, || {
+            drain_pending(&mut engine, vec![EngineEvent::Net(adm)], 0);
+        });
+
+        assert_eq!(
+            seen,
+            Some(1),
+            "the block quota must still be held at the top of ingest — reading 0 here is \\
+             exactly the release-on-dequeue semantics this commit calls a lie, and None \\
+             means ingest never ran at all"
+        );
+
+        // CONTROL: it is given back. Without this half, a permit that simply
+        // leaked would satisfy the assertion above and quietly shrink the quota
+        // for the life of the process — the shape of the original underflow.
+        let after = queue.stats().block;
+        assert_eq!(after.items, 0, "and returned once the handler is done");
+        assert_eq!(after.bytes, 0);
+
+        // And the work really happened: the block is in the engine.
+        assert_eq!(engine.blocks.len(), 1, "ingest must have stored the block");
+    }
+
+    /// The CONTROL for the control: an event the engine SHEDS must not leave
+    /// quota behind either. A test that only ever admits cannot tell a
+    /// balanced ledger from one that never gets tested on the refusal path.
+    #[test]
+    fn a_shed_block_leaves_no_quota_behind() {
+        let queue = Arc::new(EngineQueue::new());
+        let _full: Vec<_> = (0..1024usize)
+            .filter_map(|_| EngineQueue::admit(&queue, Class::Block, 700))
+            .collect();
+        assert_eq!(_full.len(), 1024);
+
+        let before = queue.stats().block;
+        assert!(
+            EngineQueue::admit_event_owned(&queue, NetEvent::Block(cheap_block(5)), 700).is_none(),
+            "a full block class must refuse"
+        );
+        let after = queue.stats().block;
+        assert_eq!(after.items, before.items, "a refusal must consume no item");
+        assert_eq!(after.bytes, before.bytes, "and no bytes");
+        assert_eq!(after.shed, before.shed + 1, "and must be counted");
+    }
+}
+
+/// Tests for the DRAIN BOUND — part (C).
+///
+/// They exercise `take_pending` directly rather than through the slot loop,
+/// because the property is about how many events leave the channel per tick and
+/// nothing else: no node, no clock, no environment variable. That is also what
+/// lets the same test run at the bound a benchmark chooses, including the
+/// unbounded value, which must behave exactly like the drain it replaces.
+#[cfg(test)]
+mod drain_bound_tests {
+    use super::*;
+
+    /// An event that costs nothing to build and carries no quota, so these
+    /// tests measure the bound and not the queue.
+    fn event() -> EngineEvent {
+        let (reply, _rx) = mpsc::channel();
+        EngineEvent::Rpc(RpcCall { req: RpcRequest::ChainInfo, reply })
+    }
+
+    /// `first` plus `n` more on the channel.
+    fn loaded(n: usize) -> (mpsc::Sender<EngineEvent>, mpsc::Receiver<EngineEvent>) {
+        let (tx, rx) = mpsc::channel();
+        for _ in 0..n {
+            tx.send(event()).expect("the receiver is alive");
+        }
+        (tx, rx)
+    }
+
+    /// The bound is a bound: a channel with more in it than the tick allows
+    /// leaves the rest for the next tick, so slot duties run in between.
+    #[test]
+    fn take_pending_stops_at_the_bound() {
+        let (_tx, rx) = loaded(9);
+        // 10 events exist: `first` in hand plus 9 queued. A bound of 4 takes
+        // `first` and 3 more, so 6 stay queued for the next tick. Getting this
+        // arithmetic wrong is how the first version of this test asserted 9 and
+        // could never have passed — it was caught by re-running the suite on
+        // the RESTORED tree after the mutation proofs, which is the only step
+        // that distinguishes "my fix works" from "my test never ran green".
+        let taken = take_pending(&rx, event(), 4);
+        assert_eq!(taken.len(), 4, "the tick took more than its bound");
+        assert_eq!(rx.try_iter().count(), 6, "the remainder must stay queued for the next tick");
+    }
+
+    /// A bound of 1 still makes progress. An off-by-one here would return an
+    /// empty batch and lose `first` — an event already taken off the channel,
+    /// whose quota permit would be released without the work ever being done.
+    #[test]
+    fn a_bound_of_one_still_takes_the_event_already_in_hand() {
+        let (_tx, rx) = loaded(3);
+        let taken = take_pending(&rx, event(), 1);
+        assert_eq!(taken.len(), 1, "a bound of 1 must still handle the event it was handed");
+        assert_eq!(rx.try_iter().count(), 3);
+    }
+
+    /// The control arm of the measurement: `BLOCH_MAX_EVENTS_PER_TICK=0` maps
+    /// to `usize::MAX`, and at that value this must be the old unbounded drain
+    /// exactly — everything, in one tick.
+    #[test]
+    fn take_pending_is_unbounded_at_usize_max() {
+        let (_tx, rx) = loaded(500);
+        let taken = take_pending(&rx, event(), usize::MAX);
+        assert_eq!(taken.len(), 501, "the unbounded arm must empty the channel");
+        assert_eq!(rx.try_iter().count(), 0);
+    }
+
+    /// A bound larger than the backlog is not a wait: `try_recv` ends the batch
+    /// as soon as the channel is empty, so a quiet node is never delayed by a
+    /// generous bound.
+    #[test]
+    fn a_bound_larger_than_the_backlog_does_not_block() {
+        let (_tx, rx) = loaded(2);
+        let taken = take_pending(&rx, event(), 4096);
+        assert_eq!(taken.len(), 3, "an empty channel must end the batch immediately");
+    }
+
+    /// The shipped default, pinned. Not because 32 is proven — it is a guess,
+    /// and `MAX_ENGINE_EVENTS_PER_TICK`'s doc says so — but because changing it
+    /// must be a deliberate edit rather than a side effect, and because the
+    /// benchmark's two arms are "this value" and "unbounded".
+    #[test]
+    fn the_default_bound_is_a_bound() {
+        assert!(
+            MAX_ENGINE_EVENTS_PER_TICK > 0 && MAX_ENGINE_EVENTS_PER_TICK < usize::MAX,
+            "the default must actually bound something"
+        );
+        assert_eq!(MAX_ENGINE_EVENTS_PER_TICK, 32);
+    }
+}
+
 #[cfg(test)]
 mod teto_de_gas {
     use super::{escolher_para_o_bloco, tx_gas};
@@ -5842,5 +7009,51 @@ mod teto_de_gas {
             tip_millisat_per_gas: 0,
         };
         assert_ne!(tx_gas(&tx2), tx_gas(&tx), "1 entrada nao pode custar o mesmo que 746");
+    }
+}
+
+mod refusal_tests {
+    use super::refused_index;
+    use bloch_pos_committee::interfaces::{TransferReject, TransitionError};
+
+    /// The regression. A culprit at the FRONT must cost exactly one
+    /// transaction, not everything behind it. Before the fix this path removed
+    /// the tail, so with 30 selected and index 0 at fault the proposer
+    /// discarded 29 valid transfers and evicted them from the mempool — the
+    /// shape measured on mainnet 2026-08-25, where a user's burst of 30 mostly
+    /// vanished while the node had answered `accepted` for every one.
+    #[test]
+    fn the_culprit_at_the_front_costs_exactly_itself() {
+        let err = TransitionError::Transfer(0, TransferReject::UnknownInput);
+        assert_eq!(refused_index(&err, 30), Some(0));
+    }
+
+    #[test]
+    fn every_named_index_is_honoured_not_just_the_first() {
+        for i in 0..30u32 {
+            let err = TransitionError::Transfer(i, TransferReject::UnknownInput);
+            assert_eq!(
+                refused_index(&err, 30),
+                Some(i as usize),
+                "index {i} was named and must be the one removed"
+            );
+        }
+    }
+
+    /// An index the selection does not contain must NOT be used to index it —
+    /// `Vec::remove` would panic, and a proposer that panics is worse than a
+    /// proposer that drops the wrong transaction.
+    #[test]
+    fn an_out_of_range_index_falls_back_instead_of_panicking() {
+        let err = TransitionError::Transfer(30, TransferReject::UnknownInput);
+        assert_eq!(refused_index(&err, 30), None);
+        let err = TransitionError::Transfer(u32::MAX, TransferReject::UnknownInput);
+        assert_eq!(refused_index(&err, 30), None);
+    }
+
+    #[test]
+    fn an_empty_selection_names_nobody() {
+        let err = TransitionError::Transfer(0, TransferReject::UnknownInput);
+        assert_eq!(refused_index(&err, 0), None);
     }
 }

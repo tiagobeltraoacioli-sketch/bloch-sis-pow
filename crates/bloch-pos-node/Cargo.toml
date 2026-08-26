@@ -37,6 +37,25 @@ publish = false
 # Member of the root workspace since Genesis-4 became the trunk (see the same
 # note in bloch-pos-committee/Cargo.toml).
 
+# The node as a library. Added so the crate can be LINKED, which `cargo-fuzz`
+# requires and a bin-only crate cannot offer: an external audit found that
+# "the live chain's remote surface has no fuzzing", and the reason it had none
+# is mechanical — there was nothing to link against. The g4_codec / g4_rpc /
+# g4_p2p_sync targets build on this so they drive the real decoders rather
+# than a transcription of them.
+#
+# The module tree is declared in src/lib.rs and NOWHERE ELSE. main.rs consumes
+# it with `use bloch_pos_node::…`, exactly as a fuzz target does. Declaring the
+# same `mod`s in both roots would compile the node twice and mint two distinct
+# types per name — a `codec::DecodeErr` from the lib would not be a
+# `codec::DecodeErr` in the binary.
+[lib]
+name = "bloch_pos_node"
+path = "src/lib.rs"
+
+# Unchanged: this is still the binary the fleet runs, still `bloch-pos`, still
+# built from src/main.rs — which now holds only the composition root: argument
+# parsing, the subcommands, process setup.
 [[bin]]
 name = "bloch-pos"
 path = "src/main.rs"

@@ -27,3 +27,23 @@ probes (`nm_*`) so the fuzzer has both a deep starting point and boundary seeds.
 To regenerate/expand from the node's real serializers (round-trip fixtures)
 requires the nightly + `cargo-fuzz` toolchain that the fuzz crate is gated on
 (it is `exclude`d from the workspace). That is a follow-up, not a claim made here.
+
+## Genesis-4 targets (`g4_codec`, `g4_rpc`, `g4_p2p_sync`) — encoder-derived
+
+Unlike the Genesis-3 seeds above, these are **not hand-derived**. They are
+written by `fuzz/seedgen`, a small standalone package that calls the node's own
+`encode_envelope`, `encode_attestation`, `encode_sync_request` and
+`encode_sync_response`, so a change to the wire format changes the seeds the
+next time they are regenerated instead of silently invalidating them:
+
+    cd fuzz/seedgen && cargo run --release
+
+The `g4_rpc` seeds are the exception, and are literal request bodies — that
+surface is text, so there is no encoder to call. Each one is a method `route()`
+actually accepts, so the fuzzer starts inside the dispatcher rather than outside
+the JSON parser, plus a few shapes the dispatcher must survive (a batch, an
+id larger than 2^53, a deeply nested id).
+
+These directories hold seeds only. libFuzzer writes newly discovered inputs back
+into the corpus directory it is given, so after a campaign this tree will have
+grown; what is committed is the small seed set, deliberately.

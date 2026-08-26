@@ -479,9 +479,29 @@ impl RrCodec for SyncCodec {
     }
 }
 
+/// Read one sync frame, refusing anything over [`MAX_SYNC_FRAME`].
+///
+/// The obvious spelling — `io.take(MAX_SYNC_FRAME).read_to_end(&mut buf)` —
+/// is a silent-corruption bug, and it shipped. `take(n)` does not fail on an
+/// oversized stream: it reports EOF at exactly `n` bytes and returns the
+/// prefix. A peer sending `MAX_SYNC_FRAME + 1` bytes therefore had its frame
+/// cut mid-body and the truncated buffer handed to the decoder **as if it
+/// were the whole message**, on the live chain's sync path, triggerable by
+/// any remote peer.
+///
+/// So the ceiling is read with one byte of headroom: reaching
+/// `MAX_SYNC_FRAME + 1` bytes proves the frame did not fit, and the read
+/// fails loudly instead of lying. The successful path still starts from an
+/// empty `Vec` and grows — nothing pre-allocates 8 MiB per read.
 async fn read_capped<T: AsyncRead + Unpin + Send>(io: &mut T) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
-    io.take(MAX_SYNC_FRAME).read_to_end(&mut buf).await?;
+    io.take(MAX_SYNC_FRAME + 1).read_to_end(&mut buf).await?;
+    if buf.len() as u64 > MAX_SYNC_FRAME {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("sync frame exceeds the {MAX_SYNC_FRAME} byte ceiling"),
+        ));
+    }
     Ok(buf)
 }
 
@@ -637,13 +657,70 @@ pub struct Handle {
     /// This node's libp2p identity. Public information; printed at boot so an
     /// operator can build the `/p2p/<id>` multiaddr peers dial.
     pub peer_id: PeerId,
+    /// Frames that never reached the swarm. See [`crate::net::BroadcastDrops`].
+    drops: Arc<crate::net::BroadcastDrops>,
 }
 
 impl Handle {
     /// Publish one engine frame. Routing is by the leading `net::FRAME_*`
     /// byte, so the engine's call sites are identical on both transports.
-    pub fn broadcast(&self, frame: Vec<u8>) {
-        let _ = self.cmd.send(Command::Broadcast(frame));
+    ///
+    /// Returns false when the frame did not even reach the swarm thread.
+    ///
+    /// **This used to be `let _ = self.cmd.send(...)`.** The node publishes the
+    /// block it produced and signed through this call. If the swarm thread had
+    /// exited, or the frame was too large for gossipsub to carry, the frame was
+    /// discarded and the function returned `()`: a lost proposal slot with zero
+    /// log lines, indistinguishable from a slot this node was never assigned.
+    /// Every failure below is now counted, and every failure of a frame this
+    /// node ORIGINATED is logged with its type, its length and the reason.
+    pub fn broadcast(&self, frame: Vec<u8>, prov: crate::net::Provenance) -> bool {
+        // Checked here rather than left to fail inside the swarm. gossipsub
+        // refuses anything over `max_transmit_size` at publish time, which is
+        // after the frame has been moved across a channel and after the engine
+        // has been told nothing went wrong. Refusing it at the call the engine
+        // makes is the difference between a diagnosis and a mystery.
+        // An empty frame has no type byte to route on and is discarded by the
+        // swarm with a bare `return` — the same silent shape this work package
+        // exists to remove. Refused here, where the engine can be told.
+        if frame.is_empty() {
+            self.drops.note_malformed();
+            return false;
+        }
+        let publishes_to_gossip = matches!(
+            frame.first(),
+            Some(&crate::net::FRAME_BLOCK)
+                | Some(&crate::net::FRAME_ATT)
+                | Some(&crate::net::FRAME_TX)
+        );
+        if publishes_to_gossip && frame.len().saturating_sub(1) > MAX_GOSSIP_BYTES {
+            self.drops.lost(
+                prov,
+                &frame,
+                "payload exceeds MAX_GOSSIP_BYTES; gossipsub would refuse it",
+                0,
+            );
+            return false;
+        }
+        // No clone on the success path. `UnboundedSender::send` hands the
+        // value back inside `SendError` when it fails, so the failure branch
+        // gets the frame for free — cloning to keep one for the error message
+        // would put a second full copy of every block (up to MAX_GOSSIP_BYTES)
+        // on the hot path, and the swarm side already pays one `to_vec` when it
+        // publishes.
+        if let Err(e) = self.cmd.send(Command::Broadcast(frame)) {
+            let Command::Broadcast(frame) = e.0 else {
+                unreachable!("we just sent a Broadcast")
+            };
+            self.drops.lost(prov, &frame, "the p2p swarm thread is gone", 0);
+            return false;
+        }
+        true
+    }
+
+    /// Counters for frames that never reached the swarm.
+    pub fn drops(&self) -> &Arc<crate::net::BroadcastDrops> {
+        &self.drops
     }
 
     /// Report the engine's decision on a gossip message. A no-op for an
@@ -738,7 +815,7 @@ pub fn start(
     })?;
 
     match ready_rx.recv() {
-        Ok(Ok(())) => Ok(Handle { cmd: cmd_tx, peer_id }),
+        Ok(Ok(())) => Ok(Handle { cmd: cmd_tx, peer_id, drops: Arc::new(Default::default()) }),
         Ok(Err(e)) => Err(e),
         Err(_) => Err(io::Error::other("p2p thread died before it started")),
     }
@@ -1331,6 +1408,7 @@ fn serve_sync(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::net::Provenance;
 
     /// THE regression test for mesh defect (b) of 2026-08-07.
     ///
@@ -1439,6 +1517,135 @@ mod tests {
         let mut b = vec![SYNC_TAG_BLOCKS];
         b.extend_from_slice(&((MAX_SYNC_BLOCKS as u32) + 1).to_le_bytes());
         assert!(decode_sync_response(&b).is_err());
+    }
+
+    // ── The 8 MiB frame ceiling ─────────────────────────────────────────────
+    //
+    // `read_capped` used to be `io.take(MAX_SYNC_FRAME).read_to_end(..)`.
+    // `take` does not error on overflow, it reports EOF at the cap, so an
+    // 8 MiB + 1 frame from any remote peer was cut mid-body and the prefix
+    // was decoded as if it were the whole message. These three tests pin the
+    // boundary from both sides.
+    //
+    // MEMORY: the two ceiling tests each build an 8 MiB source and read it
+    // into a `Vec` that grows to at most ~16 MiB — roughly 24 MiB peak per
+    // test, and `cargo test` runs them on parallel threads. That is why there
+    // are two of them and not a sweep.
+
+    /// Byte `i` of a test frame. Coprime-ish stride so a shift, a truncation
+    /// or a duplicated chunk all change the pattern.
+    fn frame_byte(i: usize) -> u8 {
+        (i % 251) as u8
+    }
+
+    fn frame_of(len: usize) -> Vec<u8> {
+        (0..len).map(frame_byte).collect()
+    }
+
+    /// A frame of EXACTLY the ceiling is legal and must arrive whole.
+    ///
+    /// This is the half that keeps the fix honest in the other direction: a
+    /// `>=` where the code needs `>` would reject a legal maximum-size sync
+    /// page and stall cold sync, and this test goes red on it.
+    #[test]
+    fn read_capped_accepts_a_frame_of_exactly_the_ceiling() {
+        let data = frame_of(MAX_SYNC_FRAME as usize);
+        let mut src: &[u8] = &data;
+        let got = futures::executor::block_on(read_capped(&mut src))
+            .expect("a frame of exactly MAX_SYNC_FRAME is legal and must be accepted");
+
+        assert_eq!(
+            got.len() as u64,
+            MAX_SYNC_FRAME,
+            "a maximum-size frame came back short"
+        );
+        // Byte-identity, not just length: truncation is not the only way to
+        // corrupt a frame. Compared with `assert!` because `assert_eq!` would
+        // print 8 MiB of bytes on failure.
+        assert!(got == data, "a maximum-size frame came back altered");
+    }
+
+    /// One byte over the ceiling must FAIL. It must not come back truncated.
+    ///
+    /// This is the regression test proper. Against the old
+    /// `take(MAX_SYNC_FRAME)` it fails at the first assert with an 8 MiB
+    /// `Ok(..)` in hand.
+    #[test]
+    fn read_capped_rejects_a_frame_one_byte_over_the_ceiling() {
+        let data = frame_of(MAX_SYNC_FRAME as usize + 1);
+        let mut src: &[u8] = &data;
+        let got = futures::executor::block_on(read_capped(&mut src));
+
+        let err = match got {
+            Err(e) => e,
+            Ok(buf) => panic!(
+                "an oversized frame ({} bytes) was accepted as {} bytes of \
+                 valid data — silent truncation is back on the sync path",
+                data.len(),
+                buf.len()
+            ),
+        };
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::InvalidData,
+            "an over-ceiling frame must be reported as bad data, not as {err:?}"
+        );
+    }
+
+    /// `codec::MAX_FIELD_LEN` and [`MAX_SYNC_FRAME`] are both `8 * 1024 * 1024`.
+    ///
+    /// That coincidence is worth pinning, and it costs nothing to pin: it is
+    /// arithmetic on two constants, not another 8 MiB allocation. Two
+    /// consequences follow from it.
+    ///
+    /// First, [`read_capped`] is the OUTER bound — the frame ceiling is
+    /// reached at or before the field ceiling, so a hostile length prefix is
+    /// stopped by the read, not by the decoder. Second, a single field of
+    /// exactly `MAX_FIELD_LEN` can never legally arrive: every frame carries
+    /// at least a 1-byte tag and a 4-byte length prefix ahead of the field
+    /// body, which puts it over the frame ceiling. So the decoder's own
+    /// maximum is unreachable through this transport, and the boundary that
+    /// actually gets exercised in production is this one.
+    ///
+    /// If someone raises [`MAX_SYNC_FRAME`] past `MAX_FIELD_LEN` those two
+    /// statements stop being true and this test says so.
+    #[test]
+    fn the_frame_ceiling_binds_before_the_field_ceiling() {
+        assert!(
+            MAX_SYNC_FRAME as usize <= crate::codec::MAX_FIELD_LEN,
+            "MAX_SYNC_FRAME ({MAX_SYNC_FRAME}) now exceeds codec::MAX_FIELD_LEN ({}): \
+             read_capped is no longer the first bound a hostile frame meets",
+            crate::codec::MAX_FIELD_LEN
+        );
+        // Tag + length prefix ahead of the body: a maximum-size field does
+        // not fit in a maximum-size frame.
+        assert!(
+            crate::codec::MAX_FIELD_LEN + 5 > MAX_SYNC_FRAME as usize,
+            "a single field of MAX_FIELD_LEN now fits inside one sync frame"
+        );
+    }
+
+    /// The ordinary case the sync path actually spends its life in: a small
+    /// frame round-trips through the codec unchanged.
+    #[test]
+    fn read_capped_round_trips_a_small_frame() {
+        let req = SyncRequest::GetBlocks { after_slot: 7, limit: 9 };
+        let encoded = encode_sync_request(&req);
+        assert!(
+            (encoded.len() as u64) < MAX_SYNC_FRAME,
+            "this test is only meaningful below the ceiling"
+        );
+
+        let mut src: &[u8] = &encoded;
+        let got = futures::executor::block_on(read_capped(&mut src))
+            .expect("an ordinary sync request must still read");
+        assert_eq!(got, encoded, "a small frame did not survive read_capped");
+
+        match decode_sync_request(&got).expect("the bytes must still decode") {
+            SyncRequest::GetBlocks { after_slot, limit } => {
+                assert_eq!((after_slot, limit), (7, 9));
+            }
+        }
     }
 
     // ── Two live swarms on localhost ────────────────────────────────────────
@@ -1582,7 +1789,7 @@ mod tests {
         let mut connected = false;
         while Instant::now() < deadline && !connected {
             attempt += 1;
-            a.handle.broadcast(crate::net::block_frame(&envelope(900 + attempt)));
+            a.handle.broadcast(crate::net::block_frame(&envelope(900 + attempt)), Provenance::Originated);
             connected = !collect_blocks(&b.rx, 1, 1).is_empty();
         }
         assert!(connected, "the mesh never formed: no block ever reached the peer");
@@ -1593,7 +1800,7 @@ mod tests {
 
         // In regime now. Ten distinct blocks, one publish each, all must land.
         for slot in 2..=11u64 {
-            a.handle.broadcast(crate::net::block_frame(&envelope(slot)));
+            a.handle.broadcast(crate::net::block_frame(&envelope(slot)), Provenance::Originated);
         }
         let deadline = Instant::now() + Duration::from_secs(20);
         let mut got: Vec<u64> = Vec::new();
@@ -1613,7 +1820,7 @@ mod tests {
 
         // And it is bidirectional — b was never told about a, it only accepted
         // a's dial, and it must still be able to publish back.
-        b.handle.broadcast(crate::net::block_frame(&envelope(500)));
+        b.handle.broadcast(crate::net::block_frame(&envelope(500)), Provenance::Originated);
         assert_eq!(collect_blocks(&a.rx, 1, 20), vec![500], "reverse direction never delivered");
     }
 
@@ -1669,5 +1876,52 @@ mod tests {
         assert!(matches!(MessageAcceptance::from(Verdict::Accept), MessageAcceptance::Accept));
         assert!(matches!(MessageAcceptance::from(Verdict::Ignore), MessageAcceptance::Ignore));
         assert!(matches!(MessageAcceptance::from(Verdict::Reject), MessageAcceptance::Reject));
+    }
+
+    /// `Handle::broadcast` must not lose a frame this node originated in
+    /// silence — the founder-level requirement of WP3.
+    ///
+    /// Both ways it can fail are exercised, because both were `let _ = ...`:
+    /// the swarm thread being gone, and a frame gossipsub could not carry.
+    /// A `Handle` is built directly rather than through `start` so this test
+    /// needs no sockets, no runtime and no peers; the failure it induces is
+    /// exactly the one a shutting-down or wedged swarm produces.
+    #[test]
+    fn an_originated_frame_is_never_dropped_in_silence() {
+        let (cmd, rx) = tokio::sync::mpsc::unbounded_channel();
+        let h = Handle {
+            cmd,
+            peer_id: PeerId::random(),
+            drops: Arc::new(crate::net::BroadcastDrops::default()),
+        };
+
+        // While the swarm is listening, a frame is accepted and nothing is
+        // counted — otherwise this test would pass on a handle that dropped
+        // everything.
+        assert!(
+            h.broadcast(crate::net::block_frame(&envelope(1)), Provenance::Originated),
+            "a live handle must accept our own block"
+        );
+        assert_eq!(h.drops().originated_lost(), 0, "a delivered frame counted as lost");
+
+        // Oversized: gossipsub would refuse it after the engine had been told
+        // nothing was wrong.
+        let mut huge = vec![crate::net::FRAME_BLOCK];
+        huge.extend(std::iter::repeat(0u8).take(MAX_GOSSIP_BYTES + 1));
+        assert!(!h.broadcast(huge, Provenance::Originated), "an unpublishable frame reported success");
+        assert_eq!(h.drops().originated_lost(), 1, "an oversized own-frame was not counted");
+
+        // Swarm gone: the exact shape of losing a proposal at shutdown.
+        drop(rx);
+        assert!(
+            !h.broadcast(crate::net::block_frame(&envelope(2)), Provenance::Originated),
+            "publishing into a dead swarm reported success"
+        );
+        assert_eq!(h.drops().originated_lost(), 2, "a lost own-block was not counted");
+
+        // A relay drop is counted too — sparsely logged, never invisible.
+        assert!(!h.broadcast(crate::net::block_frame(&envelope(3)), Provenance::Relayed));
+        assert_eq!(h.drops().relayed_lost(), 1, "a lost relayed frame was not counted");
+        assert_eq!(h.drops().originated_lost(), 2, "a relay drop was charged to origination");
     }
 }

@@ -48,3 +48,9 @@ deploy/artifacts/
 # Python bytecode (sdk/codegen, tools/*)
 __pycache__/
 *.pyc
+target-wp7/
+bench/bloch-pos-wp7
+bench/**/*.pid
+bench/**/*.key
+bench/**/meta.bin
+bench/**/ws_latest.bin

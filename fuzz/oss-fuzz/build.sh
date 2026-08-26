@@ -17,6 +17,11 @@ FUZZ_TARGET_OUTPUT_DIR="$SRC/bloch/fuzz/target/x86_64-unknown-linux-gnu/release"
 
 # Keep this list in sync with the [[bin]] entries in fuzz/Cargo.toml.
 TARGETS=(
+  # Genesis-4 — THE LIVE CHAIN's remote surface (codec / RPC / sync frames).
+  g4_codec
+  g4_rpc
+  g4_p2p_sync
+  # Genesis-3 — the retired proof-of-work node, kept buildable for audit.
   block_parse
   tx_parse
   netmsg_decode
