@@ -1455,20 +1455,15 @@ impl Engine {
     /// the slot this proposer is building for, not from anything ambient.
     fn select_transactions(&self, epoch: u64) -> Vec<PosTransaction> {
         let cap = bloch_pos_committee::fee_market::max_block_tx_bytes(epoch);
-        let mut out = Vec::new();
-        let mut bytes = 0u64;
-        for (encoded, tx) in self.mempool.iter() {
-            if out.len() >= MAX_TXS_PER_BLOCK {
-                break;
-            }
-            let n = encoded.len() as u64;
-            if bytes + n > cap {
-                break;
-            }
-            bytes += n;
-            out.push(tx.clone());
-        }
-        out
+        let gas_cap = bloch_pos_committee::fee_market::BLOCK_GAS_LIMIT;
+        let custos: Vec<(u64, u64)> = self
+            .mempool
+            .iter()
+            .map(|(encoded, tx)| (encoded.len() as u64, tx_gas(tx)))
+            .collect();
+        let escolhidos = escolher_para_o_bloco(&custos, cap, gas_cap, MAX_TXS_PER_BLOCK);
+        let mempool: Vec<&PosTransaction> = self.mempool.values().collect();
+        escolhidos.into_iter().map(|i| mempool[i].clone()).collect()
     }
 
     /// Apply one block that extends the current head. True on success.
@@ -2790,6 +2785,84 @@ fn primeira_entrada_ausente(
         .iter()
         .map(|i| (i.txid, i.vout))
         .find(|(txid, vout)| !no_estado(txid, *vout) && !no_mempool(txid, *vout))
+}
+
+/// Quais transacoes cabem num bloco, dados os custos de cada uma.
+///
+/// Pura de proposito: `select_transactions` le do mempool de um `Engine`, e um
+/// Engine inteiro nao se monta num teste. Os custos entram como uma lista de
+/// `(bytes, gas)` e sai a lista de indices escolhidos — entao a decisao de
+/// empacotamento fica exercitavel sem no, sem rede e sem estado.
+///
+/// AS DUAS PARADAS SE COMPORTAM DIFERENTE, e isso e deliberado:
+///
+///   - bytes usa `break`. E o comportamento que ja existia, e muda-lo tem
+///     risco proprio (uma transferencia grande hoje bloqueia as menores atras
+///     dela — item conhecido e separado). Nao o altero de carona.
+///   - gas usa `continue`. Uma transferencia que nao cabe no gas restante nao
+///     impede uma menor logo atras de caber, e parar aqui criaria a MESMA
+///     classe de defeito numa dimensao nova, no mesmo commit que existe para
+///     consertar um desperdicio.
+///
+/// Sem isto o proponente montava um bloco que estourava o gas, a transicao o
+/// recusava com `BlockGasLimitExceeded`, e o laco de descarte tirava uma
+/// transferencia VALIDA — e a apagava do mempool. Medido na mainnet em
+/// 26/08/2026: duas transferencias de ~746 entradas, 54.890.976 de gas cada,
+/// 91,5% do teto do bloco por transferencia; as duas somam 109.781.952 contra
+/// os 60.000.000 do limite, enquanto em bytes cabiam folgadas (77 KB de 512).
+fn escolher_para_o_bloco(
+    custos: &[(u64, u64)],
+    teto_bytes: u64,
+    teto_gas: u64,
+    teto_contagem: usize,
+) -> Vec<usize> {
+    let mut escolhidos = Vec::new();
+    let mut bytes = 0u64;
+    let mut gas = 0u64;
+    for (i, (n, g)) in custos.iter().enumerate() {
+        if escolhidos.len() >= teto_contagem {
+            break;
+        }
+        if bytes.saturating_add(*n) > teto_bytes {
+            break;
+        }
+        if gas.saturating_add(*g) > teto_gas {
+            continue;
+        }
+        bytes = bytes.saturating_add(*n);
+        gas = gas.saturating_add(*g);
+        escolhidos.push(i);
+    }
+    escolhidos
+}
+
+/// O gas que a transicao vai cobrar por esta transacao.
+///
+/// ESPELHA `transition.rs` e tem que continuar espelhando: se a selecao cobrar
+/// diferente da validacao, o proponente monta um bloco que ele proprio acha que
+/// cabe e todo no rejeita — trocando um defeito por outro mais dificil de ver.
+/// Dois detalhes faceis de errar, os dois lidos do codigo da transicao e nao
+/// supostos:
+///
+///   - a classe usa a contagem REAL de entradas (`inputs.len()`), nao um numero
+///     que a transacao declare. Gas compra CPU de no, e e uma verificacao
+///     hibrida por entrada que a transicao esta prestes a gastar;
+///   - o tamanho e o campo DECLARADO `tx_bytes`, NAO `encoded.len()`. E o
+///     declarado que a transicao cobra (transition.rs ~2173), e uma
+///     transferencia pode declarar MAIS do que usa, nunca menos.
+///
+/// `SlashingEvidence` custa zero, como na transicao. `Deposit` e `Delegate` sao
+/// recusados na admissao e nao chegam ao mempool; se um dia chegarem, este zero
+/// subestima, e o laco de descarte do proponente continua sendo a rede de
+/// seguranca — as duas guardas existem por nenhuma confiar na outra.
+fn tx_gas(tx: &PosTransaction) -> u64 {
+    use bloch_pos_committee::fee_market::{intrinsic_gas, TxClass};
+    match tx {
+        PosTransaction::Transfer { inputs, tx_bytes, .. } => {
+            intrinsic_gas(TxClass::Eutxo { inputs: inputs.len() as u32 }, *tx_bytes)
+        }
+        _ => 0,
+    }
 }
 
 pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'static str> {
@@ -5679,5 +5752,95 @@ mod admissao_entrada_gasta {
     #[test]
     fn sem_entradas_nada_a_objetar() {
         assert_eq!(primeira_entrada_ausente(&tx(&[], 1), NAO, NAO), None);
+    }
+}
+
+#[cfg(test)]
+mod teto_de_gas {
+    use super::{escolher_para_o_bloco, tx_gas};
+    use bloch_pos_committee::fee_market::{intrinsic_gas, TxClass, BLOCK_GAS_LIMIT};
+    use bloch_pos_committee::transition::{PosTransaction, TransferInput, TransferOutput};
+
+    const BYTES: u64 = 524_288;
+    const CONT: usize = 256;
+
+    /// O caso medido na mainnet em 26/08/2026: duas transferencias de ~746
+    /// entradas, cada uma com 91,5% do gas do bloco. Em bytes cabiam folgadas.
+    const G: u64 = 54_890_976;
+    const B: u64 = 38_498;
+
+    #[test]
+    fn duas_que_estouram_o_gas_viram_uma() {
+        let r = escolher_para_o_bloco(&[(B, G), (B, G)], BYTES, BLOCK_GAS_LIMIT, CONT);
+        assert_eq!(r, vec![0], "so a primeira cabe: 2 x 54.890.976 passa de 60.000.000");
+    }
+
+    /// CONTROLE: em BYTES elas cabiam. Se este falhasse, o teste acima estaria
+    /// passando por causa do teto de bytes e nao do de gas.
+    #[test]
+    fn controle_em_bytes_as_duas_cabiam() {
+        assert!(2 * B < BYTES, "77 KB de 512 KB");
+        let r = escolher_para_o_bloco(&[(B, 1), (B, 1)], BYTES, BLOCK_GAS_LIMIT, CONT);
+        assert_eq!(r, vec![0, 1], "com gas baixo as duas entram");
+    }
+
+    /// A escolha do `continue`: uma cara que nao cabe NAO bloqueia as baratas
+    /// atras dela. Com `break` o bloco sairia com uma so.
+    #[test]
+    fn uma_cara_nao_bloqueia_as_baratas_atras() {
+        let r = escolher_para_o_bloco(&[(10, 1), (10, G), (10, 1), (10, 1)], BYTES, BLOCK_GAS_LIMIT, CONT);
+        assert_eq!(r, vec![0, 1, 2, 3], "a cara cabe depois da primeira barata");
+        // e quando ela REALMENTE nao cabe, as seguintes ainda entram
+        let r2 = escolher_para_o_bloco(&[(10, G), (10, G), (10, 5), (10, 5)], BYTES, BLOCK_GAS_LIMIT, CONT);
+        assert_eq!(r2, vec![0, 2, 3], "a segunda cara e pulada, as duas baratas entram");
+    }
+
+    /// CONTROLE do de cima: bytes continuam com `break`, comportamento antigo
+    /// preservado. Se alguem trocar para `continue` de carona, isto cai.
+    #[test]
+    fn controle_bytes_ainda_param_a_varredura() {
+        let r = escolher_para_o_bloco(&[(10, 1), (BYTES, 1), (10, 1)], BYTES, BLOCK_GAS_LIMIT, CONT);
+        assert_eq!(r, vec![0], "o `break` de bytes para tudo — nao mudei isso aqui");
+    }
+
+    /// Exatamente no teto passa; um de gas acima nao.
+    #[test]
+    fn a_fronteira_do_gas_e_exata() {
+        assert_eq!(escolher_para_o_bloco(&[(10, BLOCK_GAS_LIMIT)], BYTES, BLOCK_GAS_LIMIT, CONT), vec![0]);
+        assert!(escolher_para_o_bloco(&[(10, BLOCK_GAS_LIMIT + 1)], BYTES, BLOCK_GAS_LIMIT, CONT).is_empty());
+    }
+
+    /// O teto de contagem continua valendo, e para a varredura.
+    #[test]
+    fn contagem_continua_limitando() {
+        let c: Vec<(u64, u64)> = (0..10).map(|_| (1u64, 1u64)).collect();
+        assert_eq!(escolher_para_o_bloco(&c, BYTES, BLOCK_GAS_LIMIT, 3), vec![0, 1, 2]);
+    }
+
+    /// `tx_gas` tem que cobrar o que a transicao cobra: contagem REAL de
+    /// entradas e o campo DECLARADO `tx_bytes`. Errar qualquer um dos dois faz
+    /// o proponente montar um bloco que ele acha que cabe e todo no rejeita.
+    #[test]
+    fn tx_gas_espelha_a_transicao() {
+        let tx = PosTransaction::Transfer {
+            inputs: (0..746)
+                .map(|_| TransferInput { txid: [0; 32], vout: 0, pubkey: vec![], signature: vec![] })
+                .collect(),
+            outputs: vec![TransferOutput { value: 1, script_hash: [0; 32] }],
+            tx_bytes: B,
+            tip_millisat_per_gas: 0,
+        };
+        let esperado = intrinsic_gas(TxClass::Eutxo { inputs: 746 }, B);
+        assert_eq!(tx_gas(&tx), esperado);
+        assert_eq!(tx_gas(&tx), G, "e bate com o medido na mainnet");
+        // CONTROLE: mudar o numero de entradas MUDA o gas. Sem isto, um tx_gas
+        // que ignorasse as entradas passaria no teste acima por coincidencia.
+        let tx2 = PosTransaction::Transfer {
+            inputs: vec![TransferInput { txid: [0; 32], vout: 0, pubkey: vec![], signature: vec![] }],
+            outputs: vec![TransferOutput { value: 1, script_hash: [0; 32] }],
+            tx_bytes: B,
+            tip_millisat_per_gas: 0,
+        };
+        assert_ne!(tx_gas(&tx2), tx_gas(&tx), "1 entrada nao pode custar o mesmo que 746");
     }
 }
