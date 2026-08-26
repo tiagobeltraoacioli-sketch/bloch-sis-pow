@@ -1380,6 +1380,59 @@ impl Engine {
         // feeds. Gossip (`NetEvent::Transaction`) and RPC both land in this
         // one call, so one call site carries the whole decision.
         admissible(&tx, epoch_of(self.wall_slot())).map_err(Refusal::Invalid)?;
+
+        // ── A ENTRADA EXISTE? ─────────────────────────────────────────────
+        //
+        // O comentario acima nomeia esta lacuna: a checagem estrutural "NAO
+        // pega uma transferencia cujas entradas nao existem". Elas entravam,
+        // ficavam, e cada proponente as recusava de novo com
+        // `Transfer(i, UnknownInput)`.
+        //
+        // Medido na mainnet: uma rajada montada sobre uma leitura de UTXO
+        // desatualizada gastava a mesma moeda varias vezes; um proponente
+        // selecionou 36 e recusou 35. Pior, um no OBSERVADOR (archival, sem
+        // chave) nunca propoe, entao nunca executa o caminho de remocao — as
+        // mortas ficavam no mempool dele para sempre, e e dele que o RPC
+        // publico le. Uma transferencia morta aparecia como pendente por horas.
+        //
+        // Isto continua NAO sendo validacao completa: nao confere assinatura,
+        // nem conservacao, nem taxa. Confere uma coisa que o estado responde
+        // sem construir bloco nenhum — se o outpoint esta no conjunto eUTXO.
+        // A guarda do proponente continua sendo a que carrega a vivacidade;
+        // esta so reduz desperdicio. Duas checagens, nenhuma confiando na outra.
+        //
+        // O GASTO ENCADEADO E ACEITO DE PROPOSITO. As saidas de uma
+        // transferencia viram UTXO com o txid dela (transition.rs ~2224), e o
+        // proponente aplica em sequencia — entao B pode gastar uma saida de A
+        // com A ainda no mempool. Recusar por "nao esta no estado" quebraria
+        // isso. Por isso o segundo braco: se o outpoint nao esta no estado, ele
+        // ainda pode ser CRIADO por algo que ja esta no mempool.
+        //
+        // O custo fica no caminho raro: o `continue` sai antes de tocar no
+        // mempool quando a entrada existe, que e o caso normal. So uma entrada
+        // ausente paga a varredura.
+        if primeira_entrada_ausente(
+            &tx,
+            |txid, vout| self.state.utxo(txid, vout).is_some(),
+            |txid, vout| {
+                self.mempool.values().any(|m| match m {
+                    PosTransaction::Transfer { outputs, .. } => {
+                        (vout as usize) < outputs.len() && m.txid() == *txid
+                    }
+                    _ => false,
+                })
+            },
+        )
+        .is_some()
+        {
+            return Err(Refusal::Invalid(
+                "an input of this transfer is not in the unspent set: it was already spent, \
+                 or it never existed. No proposer could ever include this transaction, so it \
+                 is refused here instead of sitting in the mempool. Re-read the unspent \
+                 outputs and build it again.",
+            ));
+        }
+
         let mut frame = vec![net::FRAME_TX];
         frame.extend_from_slice(&key);
         self.mempool.insert(key, tx);
@@ -2708,6 +2761,37 @@ fn forkchoice_store<'a>(
 /// running the transition, which needs a candidate header this path has no
 /// reason to build. What it catches is the class that has actually been
 /// exploited or is currently exploitable.
+/// A primeira entrada desta transferencia que ninguem pode fornecer, se houver.
+///
+/// Pura de proposito: `on_transaction` precisa do estado e do mempool para
+/// responder, e um `Engine` inteiro nao se monta num teste. As duas consultas
+/// entram como funcoes, entao a DECISAO fica exercitavel sem no, sem rede e sem
+/// disco — e e a decisao que recusa dinheiro de alguem, entao precisa de teste.
+///
+/// `no_estado`   o outpoint esta no conjunto eUTXO commitado.
+/// `no_mempool`  alguma transferencia ja admitida CRIA esse outpoint. Aceitar
+///               isto e o que mantem o gasto encadeado funcionando: as saidas
+///               viram UTXO com o txid da propria transferencia
+///               (transition.rs ~2224) e o proponente aplica em sequencia,
+///               entao B pode gastar uma saida de A com A ainda no mempool.
+///               Recusar por "nao esta no estado" quebraria isso.
+///
+/// `None` significa "nada a objetar", nunca "esta valida": assinatura,
+/// conservacao e taxa continuam sendo julgadas pela transicao.
+fn primeira_entrada_ausente(
+    tx: &PosTransaction,
+    no_estado: impl Fn(&[u8; 32], u32) -> bool,
+    no_mempool: impl Fn(&[u8; 32], u32) -> bool,
+) -> Option<([u8; 32], u32)> {
+    let PosTransaction::Transfer { inputs, .. } = tx else {
+        return None;
+    };
+    inputs
+        .iter()
+        .map(|i| (i.txid, i.vout))
+        .find(|(txid, vout)| !no_estado(txid, *vout) && !no_mempool(txid, *vout))
+}
+
 pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'static str> {
     match tx {
         // Staking messages are refused outright until bonding is funded from
@@ -5495,5 +5579,105 @@ mod duty_view_anchor {
             partition_caught_up.len()
         );
         assert!(moved > 0);
+    }
+}
+
+#[cfg(test)]
+mod admissao_entrada_gasta {
+    use super::primeira_entrada_ausente;
+    use bloch_pos_committee::transition::{
+        PosTransaction, TransferInput, TransferOutput,
+    };
+
+    fn id(b: u8) -> [u8; 32] {
+        [b; 32]
+    }
+    fn tx(entradas: &[(u8, u32)], n_saidas: usize) -> PosTransaction {
+        PosTransaction::Transfer {
+            inputs: entradas
+                .iter()
+                .map(|(b, v)| TransferInput {
+                    txid: id(*b),
+                    vout: *v,
+                    pubkey: vec![1],
+                    signature: vec![2],
+                })
+                .collect(),
+            outputs: (0..n_saidas)
+                .map(|_| TransferOutput { value: 1, script_hash: id(9) })
+                .collect(),
+            tx_bytes: 1,
+            tip_millisat_per_gas: 0,
+        }
+    }
+    const NAO: fn(&[u8; 32], u32) -> bool = |_, _| false;
+    const SIM: fn(&[u8; 32], u32) -> bool = |_, _| true;
+
+    /// A REGRESSAO. Uma entrada que ninguem tem e nomeada, e por isso a
+    /// transferencia e recusada na admissao em vez de ficar no mempool sendo
+    /// recusada por todo proponente ate o fim dos tempos.
+    #[test]
+    fn entrada_que_ninguem_tem_e_nomeada() {
+        assert_eq!(primeira_entrada_ausente(&tx(&[(7, 3)], 1), NAO, NAO), Some((id(7), 3)));
+    }
+
+    /// CONTROLE: com a entrada no estado, nada e objetado. Sem esta metade, o
+    /// teste acima passaria mesmo com a funcao recusando tudo.
+    #[test]
+    fn controle_entrada_no_estado_passa() {
+        assert_eq!(primeira_entrada_ausente(&tx(&[(7, 3)], 1), SIM, NAO), None);
+    }
+
+    /// O GASTO ENCADEADO CONTINUA VALENDO. As saidas viram UTXO com o txid da
+    /// propria transferencia e o proponente aplica em sequencia, entao B pode
+    /// gastar uma saida de A com A ainda no mempool. Recusar isso seria quebrar
+    /// um caminho legitimo para fechar outro.
+    #[test]
+    fn gasto_encadeado_e_aceito() {
+        assert_eq!(primeira_entrada_ausente(&tx(&[(7, 0)], 1), NAO, SIM), None);
+    }
+
+    /// CONTROLE do de cima: a MESMA transferencia, sem o pai no mempool, e
+    /// recusada. Se esta falhasse, a anterior estaria passando por a funcao
+    /// aceitar tudo, nao por ela entender encadeamento.
+    #[test]
+    fn controle_sem_o_pai_no_mempool_e_recusada() {
+        assert_eq!(primeira_entrada_ausente(&tx(&[(7, 0)], 1), NAO, NAO), Some((id(7), 0)));
+    }
+
+    /// Nomeia a PRIMEIRA ausente, nao qualquer uma — a mensagem de recusa fica
+    /// util para quem for reconstruir a transferencia.
+    #[test]
+    fn nomeia_a_primeira_ausente() {
+        let so_a_do_meio_existe = |t: &[u8; 32], _v: u32| *t == id(2);
+        let r = primeira_entrada_ausente(&tx(&[(1, 0), (2, 0), (3, 0)], 1), so_a_do_meio_existe, NAO);
+        assert_eq!(r, Some((id(1), 0)), "a primeira ausente e a 1, nao a 3");
+    }
+
+    /// Uma entrada basta para recusar. Vinte e nove boas nao compram passagem
+    /// para uma morta: o bloco inteiro seria recusado pela transicao.
+    #[test]
+    fn uma_ausente_entre_muitas_boas_recusa() {
+        let mut e: Vec<(u8, u32)> = (0..29).map(|i| (i as u8, 0)).collect();
+        e.push((99, 0));
+        let todas_menos_a_99 = |t: &[u8; 32], _v: u32| *t != id(99);
+        assert_eq!(primeira_entrada_ausente(&tx(&e, 1), todas_menos_a_99, NAO), Some((id(99), 0)));
+    }
+
+    /// `vout` faz parte da identidade do outpoint. Duas saidas da mesma
+    /// transacao sao moedas diferentes, e confundi-las seria gastar a errada.
+    #[test]
+    fn vout_distingue_outpoints() {
+        let so_vout_0 = |_t: &[u8; 32], v: u32| v == 0;
+        assert_eq!(primeira_entrada_ausente(&tx(&[(7, 0)], 1), so_vout_0, NAO), None);
+        assert_eq!(primeira_entrada_ausente(&tx(&[(7, 1)], 1), so_vout_0, NAO), Some((id(7), 1)));
+    }
+
+    /// Sem entradas nao ha o que objetar aqui. O vazio ja e recusado pela
+    /// checagem estrutural em `admissible`, e duplicar o julgamento faria duas
+    /// mensagens diferentes para um mesmo defeito.
+    #[test]
+    fn sem_entradas_nada_a_objetar() {
+        assert_eq!(primeira_entrada_ausente(&tx(&[], 1), NAO, NAO), None);
     }
 }
