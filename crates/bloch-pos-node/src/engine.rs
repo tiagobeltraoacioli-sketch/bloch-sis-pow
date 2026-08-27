@@ -1889,6 +1889,28 @@ impl Engine {
                 for encoded in &env.body.transactions {
                     self.mempool.remove(encoded);
                 }
+                // E DESPEJA AS CONCORRENTES. Remover so as incluidas deixava no
+                // mempool toda transacao que gastava as MESMAS entradas: elas
+                // nunca mais podem ser aplicadas, mas ficavam ali para sempre,
+                // recusadas por todo proponente com `UnknownInput` e nunca
+                // removidas — porque so o no que PROPOE executa o caminho de
+                // descarte, e um no observador nunca propoe.
+                //
+                // Era essa assimetria — o proponente apaga, os outros guardam —
+                // que fazia os nos discordarem sobre o mempool e o RPC publico
+                // mostrar como pendente o que a rede ja tinha matado. Medido em
+                // 27/08/2026: 924 e 1030 ocorrencias de `UnknownInput` nos logs
+                // de duas caixas, e no mesmo minuto os nos reportavam 0, 1, 5 e
+                // 6 transacoes.
+                //
+                // Nao e heuristica: um outpoint que este bloco consumiu nao
+                // volta ao conjunto nao-gasto. Quem o gasta esta morto, e dizer
+                // isso agora e melhor que descobrir a cada proposta.
+                let gastos: std::collections::BTreeSet<([u8; 32], u32)> =
+                    txs.iter().flat_map(outpoints_gastos).collect();
+                if !gastos.is_empty() {
+                    self.mempool.retain(|_, tx| !conflita_com_gastos(tx, &gastos));
+                }
                 let cur_e = epoch_of(self.state.slot());
                 self.pool.retain(|_, a| epoch_of(a.data.slot) >= cur_e);
 
@@ -3199,6 +3221,33 @@ fn forkchoice_store<'a>(
 /// running the transition, which needs a candidate header this path has no
 /// reason to build. What it catches is the class that has actually been
 /// exploited or is currently exploitable.
+/// Os outpoints que esta transacao gasta — nas DUAS variantes de transferencia.
+///
+/// `TransferV2` (tag 0x06) e 93% do trafego vivo: a cadeia esta na epoca 1181 e
+/// `TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH` e 800, entao o flag day passou ha
+/// 380 epocas. Toda funcao deste arquivo que so casa `Transfer` esta cega para
+/// quase tudo que circula — foi exatamente o que aconteceu com as duas funcoes
+/// abaixo antes desta correcao, e o `_ =>` silencioso e o que escondeu.
+fn outpoints_gastos(tx: &PosTransaction) -> Vec<([u8; 32], u32)> {
+    match tx {
+        PosTransaction::Transfer { inputs, .. } => {
+            inputs.iter().map(|i| (i.txid, i.vout)).collect()
+        }
+        PosTransaction::TransferV2 { inputs, .. } => {
+            inputs.iter().map(|i| (i.txid, i.vout)).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Esta transacao gasta algum outpoint que o bloco recem-aplicado consumiu?
+///
+/// Pura para poder ser testada: a decisao de DESPEJAR transferencia de alguem
+/// do mempool nao pode depender de montar um Engine.
+fn conflita_com_gastos(tx: &PosTransaction, gastos: &std::collections::BTreeSet<([u8; 32], u32)>) -> bool {
+    outpoints_gastos(tx).into_iter().any(|o| gastos.contains(&o))
+}
+
 /// A primeira entrada desta transferencia que ninguem pode fornecer, se houver.
 ///
 /// Pura de proposito: `on_transaction` precisa do estado e do mempool para
@@ -3221,12 +3270,10 @@ fn primeira_entrada_ausente(
     no_estado: impl Fn(&[u8; 32], u32) -> bool,
     no_mempool: impl Fn(&[u8; 32], u32) -> bool,
 ) -> Option<([u8; 32], u32)> {
-    let PosTransaction::Transfer { inputs, .. } = tx else {
-        return None;
-    };
-    inputs
-        .iter()
-        .map(|i| (i.txid, i.vout))
+    // AS DUAS VARIANTES. Antes so `Transfer` casava e o `let ... else` devolvia
+    // None para TransferV2 — ou seja, a recusa nao tocava 93% do trafego.
+    outpoints_gastos(tx)
+        .into_iter()
         .find(|(txid, vout)| !no_estado(txid, *vout) && !no_mempool(txid, *vout))
 }
 
@@ -3303,6 +3350,15 @@ fn tx_gas(tx: &PosTransaction) -> u64 {
     match tx {
         PosTransaction::Transfer { inputs, tx_bytes, .. } => {
             intrinsic_gas(TxClass::Eutxo { inputs: inputs.len() as u32 }, *tx_bytes)
+        }
+        // V2 cobra pelo TAMANHO DA TABELA de testemunhas, nao pelo numero de
+        // entradas: `keys.len()` verificacoes, nao `inputs.len()`
+        // (transition.rs:2382, que diz isso com todas as letras). Uma varredura
+        // de 973 entradas com UMA chave custa ~835.812 de gas, nao 71.546.868.
+        // Cobrar por `inputs.len()` aqui tornaria toda consolidacao grande
+        // permanentemente inselecionavel, em todo proponente, para sempre.
+        PosTransaction::TransferV2 { keys, tx_bytes, .. } => {
+            intrinsic_gas(TxClass::Eutxo { inputs: keys.len() as u32 }, *tx_bytes)
         }
         _ => 0,
     }
@@ -7055,5 +7111,109 @@ mod refusal_tests {
     fn an_empty_selection_names_nobody() {
         let err = TransitionError::Transfer(0, TransferReject::UnknownInput);
         assert_eq!(refused_index(&err, 0), None);
+    }
+}
+
+#[cfg(test)]
+mod v2_e_despejo {
+    use super::{conflita_com_gastos, outpoints_gastos, primeira_entrada_ausente, tx_gas};
+    use bloch_pos_committee::fee_market::{intrinsic_gas, TxClass};
+    use bloch_pos_committee::transition::{
+        PosTransaction, TransferInput, TransferInputV2, TransferOutput, WitnessKey,
+    };
+    use std::collections::BTreeSet;
+
+    fn id(b: u8) -> [u8; 32] { [b; 32] }
+    fn saida() -> TransferOutput { TransferOutput { value: 1, script_hash: id(9) } }
+
+    fn v1(entradas: &[(u8, u32)]) -> PosTransaction {
+        PosTransaction::Transfer {
+            inputs: entradas.iter().map(|(b, v)| TransferInput {
+                txid: id(*b), vout: *v, pubkey: vec![1], signature: vec![2],
+            }).collect(),
+            outputs: vec![saida()],
+            tx_bytes: 38_498,
+            tip_millisat_per_gas: 0,
+        }
+    }
+    fn v2(entradas: &[(u8, u32)], n_chaves: usize, bytes: u64) -> PosTransaction {
+        PosTransaction::TransferV2 {
+            keys: (0..n_chaves).map(|_| WitnessKey { pubkey: vec![1], signature: vec![2] }).collect(),
+            inputs: entradas.iter().map(|(b, v)| TransferInputV2 {
+                txid: id(*b), vout: *v, key_index: 0,
+            }).collect(),
+            outputs: vec![saida()],
+            tx_bytes: bytes,
+            tip_millisat_per_gas: 0,
+        }
+    }
+    const NAO: fn(&[u8; 32], u32) -> bool = |_, _| false;
+    const SIM: fn(&[u8; 32], u32) -> bool = |_, _| true;
+
+    /// A REGRESSAO QUE A AUDITORIA ACHOU. A admissao era cega ao formato que a
+    /// rede usa: `TransferV2` e 93% do trafego vivo (epoca 1181, flag day na
+    /// 800) e o `let ... else` devolvia None para ele.
+    #[test]
+    fn a_admissao_enxerga_v2() {
+        assert_eq!(primeira_entrada_ausente(&v2(&[(7, 3)], 1, 28_495), NAO, NAO), Some((id(7), 3)));
+    }
+
+    /// CONTROLE: a V1 equivalente sempre foi pega. Sem esta metade, o teste
+    /// acima passaria mesmo com a funcao recusando tudo.
+    #[test]
+    fn controle_v1_continua_sendo_pega() {
+        assert_eq!(primeira_entrada_ausente(&v1(&[(7, 3)]), NAO, NAO), Some((id(7), 3)));
+        assert_eq!(primeira_entrada_ausente(&v2(&[(7, 3)], 1, 28_495), SIM, NAO), None, "com a entrada no estado, nada a objetar");
+    }
+
+    /// O GAS DA V2 E POR TABELA DE TESTEMUNHAS, nao por entrada. Uma varredura
+    /// de 973 entradas com UMA chave custa ~835 mil, nao 71 milhoes. Cobrar por
+    /// `inputs.len()` tornaria toda consolidacao grande inselecionavel.
+    #[test]
+    fn v2_cobra_por_chave_e_nao_por_entrada() {
+        let entradas: Vec<(u8, u32)> = (0..250).map(|i| (i as u8, 0u32)).collect();
+        let tx = v2(&entradas, 1, 47_379);
+        assert_eq!(tx_gas(&tx), intrinsic_gas(TxClass::Eutxo { inputs: 1 }, 47_379));
+        assert_eq!(tx_gas(&tx), 835_812, "o numero que a cadeia realmente cobra");
+        // CONTROLE do dano evitado: cobrando por entrada, uma varredura de 973
+        // passaria de 71 milhoes e nunca mais entraria em bloco nenhum.
+        assert!(intrinsic_gas(TxClass::Eutxo { inputs: 973 }, 47_379) > 60_000_000);
+        // e mais chaves DEVEM custar mais — senao o teste acima passaria com
+        // um tx_gas que ignorasse as chaves.
+        assert!(tx_gas(&v2(&entradas, 4, 47_379)) > tx_gas(&tx));
+    }
+
+    /// CONTROLE: a V1 continua cobrando por entrada, que e o que a transicao faz.
+    #[test]
+    fn controle_v1_continua_cobrando_por_entrada() {
+        let tx = v1(&[(1, 0), (2, 0), (3, 0)]);
+        assert_eq!(tx_gas(&tx), intrinsic_gas(TxClass::Eutxo { inputs: 3 }, 38_498));
+    }
+
+    /// O DESPEJO. Uma transacao que gasta um outpoint que o bloco consumiu esta
+    /// morta: o outpoint nao volta ao conjunto nao-gasto.
+    #[test]
+    fn concorrente_que_gasta_a_mesma_entrada_e_despejada() {
+        let gastos: BTreeSet<_> = outpoints_gastos(&v2(&[(7, 0), (8, 1)], 1, 28_495)).into_iter().collect();
+        assert!(conflita_com_gastos(&v2(&[(7, 0)], 1, 28_495), &gastos), "V2 concorrente");
+        assert!(conflita_com_gastos(&v1(&[(8, 1)]), &gastos), "V1 concorrente — formatos se cruzam");
+    }
+
+    /// CONTROLE: quem NAO toca nas entradas gastas fica. Um despejo que remove
+    /// tudo nao e um despejo, e removeria transferencia boa de alguem.
+    #[test]
+    fn controle_quem_nao_conflita_permanece() {
+        let gastos: BTreeSet<_> = outpoints_gastos(&v2(&[(7, 0)], 1, 28_495)).into_iter().collect();
+        assert!(!conflita_com_gastos(&v2(&[(7, 1)], 1, 28_495), &gastos), "mesmo txid, vout diferente = outra moeda");
+        assert!(!conflita_com_gastos(&v1(&[(99, 0)]), &gastos));
+        assert!(!conflita_com_gastos(&v2(&[], 1, 100), &gastos), "sem entradas nao conflita com nada");
+    }
+
+    /// `outpoints_gastos` tem que ver as duas variantes, senao o despejo herda
+    /// a mesma cegueira que a admissao tinha.
+    #[test]
+    fn outpoints_ve_as_duas_variantes() {
+        assert_eq!(outpoints_gastos(&v1(&[(1, 0), (2, 5)])), vec![(id(1), 0), (id(2), 5)]);
+        assert_eq!(outpoints_gastos(&v2(&[(1, 0), (2, 5)], 1, 100)), vec![(id(1), 0), (id(2), 5)]);
     }
 }
