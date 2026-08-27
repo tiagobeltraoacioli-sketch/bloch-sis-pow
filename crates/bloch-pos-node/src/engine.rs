@@ -72,7 +72,9 @@ use bloch_pos_committee::beacon::{mix_in, RandaoChain};
 use bloch_pos_committee::forkchoice::{BlockTree, LatestMessage, Store as FcStore};
 use bloch_pos_committee::gossip::{AttestationPool, GossipDecision};
 use bloch_pos_committee::header::{BlockEnvelope, BlockHeaderV4, BlockId, Body, VERSION_G4};
-use bloch_pos_committee::interfaces::{ProposalEnvelope, StateReader, StateTransition};
+use bloch_pos_committee::interfaces::{
+    ProposalEnvelope, StateReader, StateTransition, TransitionError,
+};
 use bloch_pos_committee::schedule::first_slot_of_epoch;
 use bloch_pos_committee::transition::{CommittedState, PosTransaction, Transition};
 use bloch_pos_committee::{committees, derive, epoch_of, schedule};
@@ -1060,11 +1062,17 @@ impl Engine {
             {
                 Ok(p) => break (p, tx_bytes),
                 Err(err) => {
-                    let Some(bad) = txs.pop() else {
+                    let bad = match refused_index(&err, txs.len()) {
+                        Some(i) => txs.remove(i),
+                        None => {
+                    let Some(t) = txs.pop() else {
                         // Empty and still refused: the fault is not in any
                         // transaction, so proposing is genuinely impossible.
                         eprintln!("[slot {slot}] produce refused with no transactions: {err:?}");
                         return;
+                    };
+                            t
+                        }
                     };
                     eprintln!(
                         "[slot {slot}] dropping a transaction the transition refuses ({err:?}); \
@@ -1380,6 +1388,59 @@ impl Engine {
         // feeds. Gossip (`NetEvent::Transaction`) and RPC both land in this
         // one call, so one call site carries the whole decision.
         admissible(&tx, epoch_of(self.wall_slot())).map_err(Refusal::Invalid)?;
+
+        // ── A ENTRADA EXISTE? ─────────────────────────────────────────────
+        //
+        // O comentario acima nomeia esta lacuna: a checagem estrutural "NAO
+        // pega uma transferencia cujas entradas nao existem". Elas entravam,
+        // ficavam, e cada proponente as recusava de novo com
+        // `Transfer(i, UnknownInput)`.
+        //
+        // Medido na mainnet: uma rajada montada sobre uma leitura de UTXO
+        // desatualizada gastava a mesma moeda varias vezes; um proponente
+        // selecionou 36 e recusou 35. Pior, um no OBSERVADOR (archival, sem
+        // chave) nunca propoe, entao nunca executa o caminho de remocao — as
+        // mortas ficavam no mempool dele para sempre, e e dele que o RPC
+        // publico le. Uma transferencia morta aparecia como pendente por horas.
+        //
+        // Isto continua NAO sendo validacao completa: nao confere assinatura,
+        // nem conservacao, nem taxa. Confere uma coisa que o estado responde
+        // sem construir bloco nenhum — se o outpoint esta no conjunto eUTXO.
+        // A guarda do proponente continua sendo a que carrega a vivacidade;
+        // esta so reduz desperdicio. Duas checagens, nenhuma confiando na outra.
+        //
+        // O GASTO ENCADEADO E ACEITO DE PROPOSITO. As saidas de uma
+        // transferencia viram UTXO com o txid dela (transition.rs ~2224), e o
+        // proponente aplica em sequencia — entao B pode gastar uma saida de A
+        // com A ainda no mempool. Recusar por "nao esta no estado" quebraria
+        // isso. Por isso o segundo braco: se o outpoint nao esta no estado, ele
+        // ainda pode ser CRIADO por algo que ja esta no mempool.
+        //
+        // O custo fica no caminho raro: o `continue` sai antes de tocar no
+        // mempool quando a entrada existe, que e o caso normal. So uma entrada
+        // ausente paga a varredura.
+        if primeira_entrada_ausente(
+            &tx,
+            |txid, vout| self.state.utxo(txid, vout).is_some(),
+            |txid, vout| {
+                self.mempool.values().any(|m| match m {
+                    PosTransaction::Transfer { outputs, .. } => {
+                        (vout as usize) < outputs.len() && m.txid() == *txid
+                    }
+                    _ => false,
+                })
+            },
+        )
+        .is_some()
+        {
+            return Err(Refusal::Invalid(
+                "an input of this transfer is not in the unspent set: it was already spent, \
+                 or it never existed. No proposer could ever include this transaction, so it \
+                 is refused here instead of sitting in the mempool. Re-read the unspent \
+                 outputs and build it again.",
+            ));
+        }
+
         let mut frame = vec![net::FRAME_TX];
         frame.extend_from_slice(&key);
         self.mempool.insert(key, tx);
@@ -1402,20 +1463,15 @@ impl Engine {
     /// the slot this proposer is building for, not from anything ambient.
     fn select_transactions(&self, epoch: u64) -> Vec<PosTransaction> {
         let cap = bloch_pos_committee::fee_market::max_block_tx_bytes(epoch);
-        let mut out = Vec::new();
-        let mut bytes = 0u64;
-        for (encoded, tx) in self.mempool.iter() {
-            if out.len() >= MAX_TXS_PER_BLOCK {
-                break;
-            }
-            let n = encoded.len() as u64;
-            if bytes + n > cap {
-                break;
-            }
-            bytes += n;
-            out.push(tx.clone());
-        }
-        out
+        let gas_cap = bloch_pos_committee::fee_market::BLOCK_GAS_LIMIT;
+        let custos: Vec<(u64, u64)> = self
+            .mempool
+            .iter()
+            .map(|(encoded, tx)| (encoded.len() as u64, tx_gas(tx)))
+            .collect();
+        let escolhidos = escolher_para_o_bloco(&custos, cap, gas_cap, MAX_TXS_PER_BLOCK);
+        let mempool: Vec<&PosTransaction> = self.mempool.values().collect();
+        escolhidos.into_iter().map(|i| mempool[i].clone()).collect()
     }
 
     /// Apply one block that extends the current head. True on success.
@@ -1467,6 +1523,19 @@ impl Engine {
                 // same bytes they were keyed under.
                 for encoded in &env.body.transactions {
                     self.mempool.remove(encoded);
+                }
+                // E DESPEJA AS CONCORRENTES. Remover so as incluidas deixava no
+                // mempool toda transacao que gastava as MESMAS entradas: elas
+                // nunca mais podem ser aplicadas, e so saiam do mempool do no
+                // que PROPOS. Um no observador nunca propoe, entao guardava a
+                // morta para sempre — e e dele que o RPC publico le. Era essa
+                // assimetria que fazia os nos discordarem (0, 1, 5 e 6
+                // transacoes no mesmo minuto) e mostrar como pendente o que a
+                // rede ja tinha matado.
+                let gastos: std::collections::BTreeSet<([u8; 32], u32)> =
+                    txs.iter().flat_map(outpoints_gastos).collect();
+                if !gastos.is_empty() {
+                    self.mempool.retain(|_, tx| !conflita_com_gastos(tx, &gastos));
                 }
                 let cur_e = epoch_of(self.state.slot());
                 self.pool.retain(|_, a| epoch_of(a.data.slot) >= cur_e);
@@ -2708,6 +2777,157 @@ fn forkchoice_store<'a>(
 /// running the transition, which needs a candidate header this path has no
 /// reason to build. What it catches is the class that has actually been
 /// exploited or is currently exploitable.
+/// Os outpoints que esta transacao gasta — nas DUAS variantes de transferencia.
+///
+/// `TransferV2` (tag 0x06) e 93% do trafego vivo: a cadeia esta na epoca 1188 e
+/// `TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH` e 800. Toda funcao que so casa
+/// `Transfer` esta cega para quase tudo que circula, e o `_ =>` silencioso e o
+/// que esconde — foi assim que duas funcoes deste arquivo nasceram cegas.
+fn outpoints_gastos(tx: &PosTransaction) -> Vec<([u8; 32], u32)> {
+    match tx {
+        PosTransaction::Transfer { inputs, .. } => inputs.iter().map(|i| (i.txid, i.vout)).collect(),
+        PosTransaction::TransferV2 { inputs, .. } => inputs.iter().map(|i| (i.txid, i.vout)).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Esta transacao gasta algum outpoint que o bloco recem-aplicado consumiu?
+fn conflita_com_gastos(
+    tx: &PosTransaction,
+    gastos: &std::collections::BTreeSet<([u8; 32], u32)>,
+) -> bool {
+    outpoints_gastos(tx).into_iter().any(|o| gastos.contains(&o))
+}
+
+/// Qual transacao da selecao a recusa CULPA, se o erro nomear uma.
+///
+/// `TransitionError::Transfer(i, _)` carrega o indice. O laco de proposta
+/// jogava isso fora e fazia `pop()` da cauda: com a culpada no indice 0 de uma
+/// selecao de 30, o proponente descartava 29 transferencias VALIDAS e apagava
+/// cada uma do mempool. Medido: ~190 ocorrencias de `Transfer(i>0, ...)` nos
+/// logs, cada uma uma valida perdida.
+fn refused_index(err: &TransitionError, selection_len: usize) -> Option<usize> {
+    match err {
+        TransitionError::Transfer(i, _) if (*i as usize) < selection_len => Some(*i as usize),
+        _ => None,
+    }
+}
+
+/// A primeira entrada desta transferencia que ninguem pode fornecer, se houver.
+///
+/// Pura de proposito: `on_transaction` precisa do estado e do mempool para
+/// responder, e um `Engine` inteiro nao se monta num teste. As duas consultas
+/// entram como funcoes, entao a DECISAO fica exercitavel sem no, sem rede e sem
+/// disco — e e a decisao que recusa dinheiro de alguem, entao precisa de teste.
+///
+/// `no_estado`   o outpoint esta no conjunto eUTXO commitado.
+/// `no_mempool`  alguma transferencia ja admitida CRIA esse outpoint. Aceitar
+///               isto e o que mantem o gasto encadeado funcionando: as saidas
+///               viram UTXO com o txid da propria transferencia
+///               (transition.rs ~2224) e o proponente aplica em sequencia,
+///               entao B pode gastar uma saida de A com A ainda no mempool.
+///               Recusar por "nao esta no estado" quebraria isso.
+///
+/// `None` significa "nada a objetar", nunca "esta valida": assinatura,
+/// conservacao e taxa continuam sendo julgadas pela transicao.
+fn primeira_entrada_ausente(
+    tx: &PosTransaction,
+    no_estado: impl Fn(&[u8; 32], u32) -> bool,
+    no_mempool: impl Fn(&[u8; 32], u32) -> bool,
+) -> Option<([u8; 32], u32)> {
+    // AS DUAS VARIANTES. So `Transfer` casava, e o `let ... else` devolvia None
+    // para TransferV2 — a recusa nao tocava 93% do trafego.
+    outpoints_gastos(tx)
+        .into_iter()
+        .find(|(txid, vout)| !no_estado(txid, *vout) && !no_mempool(txid, *vout))
+}
+
+/// Quais transacoes cabem num bloco, dados os custos de cada uma.
+///
+/// Pura de proposito: `select_transactions` le do mempool de um `Engine`, e um
+/// Engine inteiro nao se monta num teste. Os custos entram como uma lista de
+/// `(bytes, gas)` e sai a lista de indices escolhidos — entao a decisao de
+/// empacotamento fica exercitavel sem no, sem rede e sem estado.
+///
+/// AS DUAS PARADAS SE COMPORTAM DIFERENTE, e isso e deliberado:
+///
+///   - bytes usa `break`. E o comportamento que ja existia, e muda-lo tem
+///     risco proprio (uma transferencia grande hoje bloqueia as menores atras
+///     dela — item conhecido e separado). Nao o altero de carona.
+///   - gas usa `continue`. Uma transferencia que nao cabe no gas restante nao
+///     impede uma menor logo atras de caber, e parar aqui criaria a MESMA
+///     classe de defeito numa dimensao nova, no mesmo commit que existe para
+///     consertar um desperdicio.
+///
+/// Sem isto o proponente montava um bloco que estourava o gas, a transicao o
+/// recusava com `BlockGasLimitExceeded`, e o laco de descarte tirava uma
+/// transferencia VALIDA — e a apagava do mempool. Medido na mainnet em
+/// 26/08/2026: duas transferencias de ~746 entradas, 54.890.976 de gas cada,
+/// 91,5% do teto do bloco por transferencia; as duas somam 109.781.952 contra
+/// os 60.000.000 do limite, enquanto em bytes cabiam folgadas (77 KB de 512).
+fn escolher_para_o_bloco(
+    custos: &[(u64, u64)],
+    teto_bytes: u64,
+    teto_gas: u64,
+    teto_contagem: usize,
+) -> Vec<usize> {
+    let mut escolhidos = Vec::new();
+    let mut bytes = 0u64;
+    let mut gas = 0u64;
+    for (i, (n, g)) in custos.iter().enumerate() {
+        if escolhidos.len() >= teto_contagem {
+            break;
+        }
+        if bytes.saturating_add(*n) > teto_bytes {
+            break;
+        }
+        if gas.saturating_add(*g) > teto_gas {
+            continue;
+        }
+        bytes = bytes.saturating_add(*n);
+        gas = gas.saturating_add(*g);
+        escolhidos.push(i);
+    }
+    escolhidos
+}
+
+/// O gas que a transicao vai cobrar por esta transacao.
+///
+/// ESPELHA `transition.rs` e tem que continuar espelhando: se a selecao cobrar
+/// diferente da validacao, o proponente monta um bloco que ele proprio acha que
+/// cabe e todo no rejeita — trocando um defeito por outro mais dificil de ver.
+/// Dois detalhes faceis de errar, os dois lidos do codigo da transicao e nao
+/// supostos:
+///
+///   - a classe usa a contagem REAL de entradas (`inputs.len()`), nao um numero
+///     que a transacao declare. Gas compra CPU de no, e e uma verificacao
+///     hibrida por entrada que a transicao esta prestes a gastar;
+///   - o tamanho e o campo DECLARADO `tx_bytes`, NAO `encoded.len()`. E o
+///     declarado que a transicao cobra (transition.rs ~2173), e uma
+///     transferencia pode declarar MAIS do que usa, nunca menos.
+///
+/// `SlashingEvidence` custa zero, como na transicao. `Deposit` e `Delegate` sao
+/// recusados na admissao e nao chegam ao mempool; se um dia chegarem, este zero
+/// subestima, e o laco de descarte do proponente continua sendo a rede de
+/// seguranca — as duas guardas existem por nenhuma confiar na outra.
+fn tx_gas(tx: &PosTransaction) -> u64 {
+    use bloch_pos_committee::fee_market::{intrinsic_gas, TxClass};
+    match tx {
+        PosTransaction::Transfer { inputs, tx_bytes, .. } => {
+            intrinsic_gas(TxClass::Eutxo { inputs: inputs.len() as u32 }, *tx_bytes)
+        }
+        // V2 cobra pelo TAMANHO DA TABELA de testemunhas: `keys.len()`
+        // verificacoes, nao `inputs.len()` (transition.rs:2382, textual). Uma
+        // varredura de 973 entradas com UMA chave custa ~835.812, nao
+        // 71.546.868. Cobrar por entrada tornaria toda consolidacao grande
+        // permanentemente inselecionavel, em todo proponente.
+        PosTransaction::TransferV2 { keys, tx_bytes, .. } => {
+            intrinsic_gas(TxClass::Eutxo { inputs: keys.len() as u32 }, *tx_bytes)
+        }
+        _ => 0,
+    }
+}
+
 pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'static str> {
     match tx {
         // Staking messages are refused outright until bonding is funded from
@@ -5495,5 +5715,346 @@ mod duty_view_anchor {
             partition_caught_up.len()
         );
         assert!(moved > 0);
+    }
+}
+
+#[cfg(test)]
+mod admissao_entrada_gasta {
+    use super::primeira_entrada_ausente;
+    use bloch_pos_committee::transition::{
+        PosTransaction, TransferInput, TransferOutput,
+    };
+
+    fn id(b: u8) -> [u8; 32] {
+        [b; 32]
+    }
+    fn tx(entradas: &[(u8, u32)], n_saidas: usize) -> PosTransaction {
+        PosTransaction::Transfer {
+            inputs: entradas
+                .iter()
+                .map(|(b, v)| TransferInput {
+                    txid: id(*b),
+                    vout: *v,
+                    pubkey: vec![1],
+                    signature: vec![2],
+                })
+                .collect(),
+            outputs: (0..n_saidas)
+                .map(|_| TransferOutput { value: 1, script_hash: id(9) })
+                .collect(),
+            tx_bytes: 1,
+            tip_millisat_per_gas: 0,
+        }
+    }
+    const NAO: fn(&[u8; 32], u32) -> bool = |_, _| false;
+    const SIM: fn(&[u8; 32], u32) -> bool = |_, _| true;
+
+    /// A REGRESSAO. Uma entrada que ninguem tem e nomeada, e por isso a
+    /// transferencia e recusada na admissao em vez de ficar no mempool sendo
+    /// recusada por todo proponente ate o fim dos tempos.
+    #[test]
+    fn entrada_que_ninguem_tem_e_nomeada() {
+        assert_eq!(primeira_entrada_ausente(&tx(&[(7, 3)], 1), NAO, NAO), Some((id(7), 3)));
+    }
+
+    /// CONTROLE: com a entrada no estado, nada e objetado. Sem esta metade, o
+    /// teste acima passaria mesmo com a funcao recusando tudo.
+    #[test]
+    fn controle_entrada_no_estado_passa() {
+        assert_eq!(primeira_entrada_ausente(&tx(&[(7, 3)], 1), SIM, NAO), None);
+    }
+
+    /// O GASTO ENCADEADO CONTINUA VALENDO. As saidas viram UTXO com o txid da
+    /// propria transferencia e o proponente aplica em sequencia, entao B pode
+    /// gastar uma saida de A com A ainda no mempool. Recusar isso seria quebrar
+    /// um caminho legitimo para fechar outro.
+    #[test]
+    fn gasto_encadeado_e_aceito() {
+        assert_eq!(primeira_entrada_ausente(&tx(&[(7, 0)], 1), NAO, SIM), None);
+    }
+
+    /// CONTROLE do de cima: a MESMA transferencia, sem o pai no mempool, e
+    /// recusada. Se esta falhasse, a anterior estaria passando por a funcao
+    /// aceitar tudo, nao por ela entender encadeamento.
+    #[test]
+    fn controle_sem_o_pai_no_mempool_e_recusada() {
+        assert_eq!(primeira_entrada_ausente(&tx(&[(7, 0)], 1), NAO, NAO), Some((id(7), 0)));
+    }
+
+    /// Nomeia a PRIMEIRA ausente, nao qualquer uma — a mensagem de recusa fica
+    /// util para quem for reconstruir a transferencia.
+    #[test]
+    fn nomeia_a_primeira_ausente() {
+        let so_a_do_meio_existe = |t: &[u8; 32], _v: u32| *t == id(2);
+        let r = primeira_entrada_ausente(&tx(&[(1, 0), (2, 0), (3, 0)], 1), so_a_do_meio_existe, NAO);
+        assert_eq!(r, Some((id(1), 0)), "a primeira ausente e a 1, nao a 3");
+    }
+
+    /// Uma entrada basta para recusar. Vinte e nove boas nao compram passagem
+    /// para uma morta: o bloco inteiro seria recusado pela transicao.
+    #[test]
+    fn uma_ausente_entre_muitas_boas_recusa() {
+        let mut e: Vec<(u8, u32)> = (0..29).map(|i| (i as u8, 0)).collect();
+        e.push((99, 0));
+        let todas_menos_a_99 = |t: &[u8; 32], _v: u32| *t != id(99);
+        assert_eq!(primeira_entrada_ausente(&tx(&e, 1), todas_menos_a_99, NAO), Some((id(99), 0)));
+    }
+
+    /// `vout` faz parte da identidade do outpoint. Duas saidas da mesma
+    /// transacao sao moedas diferentes, e confundi-las seria gastar a errada.
+    #[test]
+    fn vout_distingue_outpoints() {
+        let so_vout_0 = |_t: &[u8; 32], v: u32| v == 0;
+        assert_eq!(primeira_entrada_ausente(&tx(&[(7, 0)], 1), so_vout_0, NAO), None);
+        assert_eq!(primeira_entrada_ausente(&tx(&[(7, 1)], 1), so_vout_0, NAO), Some((id(7), 1)));
+    }
+
+    /// Sem entradas nao ha o que objetar aqui. O vazio ja e recusado pela
+    /// checagem estrutural em `admissible`, e duplicar o julgamento faria duas
+    /// mensagens diferentes para um mesmo defeito.
+    #[test]
+    fn sem_entradas_nada_a_objetar() {
+        assert_eq!(primeira_entrada_ausente(&tx(&[], 1), NAO, NAO), None);
+    }
+}
+
+#[cfg(test)]
+mod teto_de_gas {
+    use super::{escolher_para_o_bloco, tx_gas};
+    use bloch_pos_committee::fee_market::{intrinsic_gas, TxClass, BLOCK_GAS_LIMIT};
+    use bloch_pos_committee::transition::{PosTransaction, TransferInput, TransferOutput};
+
+    const BYTES: u64 = 524_288;
+    const CONT: usize = 256;
+
+    /// O caso medido na mainnet em 26/08/2026: duas transferencias de ~746
+    /// entradas, cada uma com 91,5% do gas do bloco. Em bytes cabiam folgadas.
+    const G: u64 = 54_890_976;
+    const B: u64 = 38_498;
+
+    #[test]
+    fn duas_que_estouram_o_gas_viram_uma() {
+        let r = escolher_para_o_bloco(&[(B, G), (B, G)], BYTES, BLOCK_GAS_LIMIT, CONT);
+        assert_eq!(r, vec![0], "so a primeira cabe: 2 x 54.890.976 passa de 60.000.000");
+    }
+
+    /// CONTROLE: em BYTES elas cabiam. Se este falhasse, o teste acima estaria
+    /// passando por causa do teto de bytes e nao do de gas.
+    #[test]
+    fn controle_em_bytes_as_duas_cabiam() {
+        assert!(2 * B < BYTES, "77 KB de 512 KB");
+        let r = escolher_para_o_bloco(&[(B, 1), (B, 1)], BYTES, BLOCK_GAS_LIMIT, CONT);
+        assert_eq!(r, vec![0, 1], "com gas baixo as duas entram");
+    }
+
+    /// A escolha do `continue`: uma cara que nao cabe NAO bloqueia as baratas
+    /// atras dela. Com `break` o bloco sairia com uma so.
+    #[test]
+    fn uma_cara_nao_bloqueia_as_baratas_atras() {
+        let r = escolher_para_o_bloco(&[(10, 1), (10, G), (10, 1), (10, 1)], BYTES, BLOCK_GAS_LIMIT, CONT);
+        assert_eq!(r, vec![0, 1, 2, 3], "a cara cabe depois da primeira barata");
+        // e quando ela REALMENTE nao cabe, as seguintes ainda entram
+        let r2 = escolher_para_o_bloco(&[(10, G), (10, G), (10, 5), (10, 5)], BYTES, BLOCK_GAS_LIMIT, CONT);
+        assert_eq!(r2, vec![0, 2, 3], "a segunda cara e pulada, as duas baratas entram");
+    }
+
+    /// CONTROLE do de cima: bytes continuam com `break`, comportamento antigo
+    /// preservado. Se alguem trocar para `continue` de carona, isto cai.
+    #[test]
+    fn controle_bytes_ainda_param_a_varredura() {
+        let r = escolher_para_o_bloco(&[(10, 1), (BYTES, 1), (10, 1)], BYTES, BLOCK_GAS_LIMIT, CONT);
+        assert_eq!(r, vec![0], "o `break` de bytes para tudo — nao mudei isso aqui");
+    }
+
+    /// Exatamente no teto passa; um de gas acima nao.
+    #[test]
+    fn a_fronteira_do_gas_e_exata() {
+        assert_eq!(escolher_para_o_bloco(&[(10, BLOCK_GAS_LIMIT)], BYTES, BLOCK_GAS_LIMIT, CONT), vec![0]);
+        assert!(escolher_para_o_bloco(&[(10, BLOCK_GAS_LIMIT + 1)], BYTES, BLOCK_GAS_LIMIT, CONT).is_empty());
+    }
+
+    /// O teto de contagem continua valendo, e para a varredura.
+    #[test]
+    fn contagem_continua_limitando() {
+        let c: Vec<(u64, u64)> = (0..10).map(|_| (1u64, 1u64)).collect();
+        assert_eq!(escolher_para_o_bloco(&c, BYTES, BLOCK_GAS_LIMIT, 3), vec![0, 1, 2]);
+    }
+
+    /// `tx_gas` tem que cobrar o que a transicao cobra: contagem REAL de
+    /// entradas e o campo DECLARADO `tx_bytes`. Errar qualquer um dos dois faz
+    /// o proponente montar um bloco que ele acha que cabe e todo no rejeita.
+    #[test]
+    fn tx_gas_espelha_a_transicao() {
+        let tx = PosTransaction::Transfer {
+            inputs: (0..746)
+                .map(|_| TransferInput { txid: [0; 32], vout: 0, pubkey: vec![], signature: vec![] })
+                .collect(),
+            outputs: vec![TransferOutput { value: 1, script_hash: [0; 32] }],
+            tx_bytes: B,
+            tip_millisat_per_gas: 0,
+        };
+        let esperado = intrinsic_gas(TxClass::Eutxo { inputs: 746 }, B);
+        assert_eq!(tx_gas(&tx), esperado);
+        assert_eq!(tx_gas(&tx), G, "e bate com o medido na mainnet");
+        // CONTROLE: mudar o numero de entradas MUDA o gas. Sem isto, um tx_gas
+        // que ignorasse as entradas passaria no teste acima por coincidencia.
+        let tx2 = PosTransaction::Transfer {
+            inputs: vec![TransferInput { txid: [0; 32], vout: 0, pubkey: vec![], signature: vec![] }],
+            outputs: vec![TransferOutput { value: 1, script_hash: [0; 32] }],
+            tx_bytes: B,
+            tip_millisat_per_gas: 0,
+        };
+        assert_ne!(tx_gas(&tx2), tx_gas(&tx), "1 entrada nao pode custar o mesmo que 746");
+    }
+}
+
+
+mod refusal_tests {
+    use super::refused_index;
+    use bloch_pos_committee::interfaces::{TransferReject, TransitionError};
+
+    /// The regression. A culprit at the FRONT must cost exactly one
+    /// transaction, not everything behind it. Before the fix this path removed
+    /// the tail, so with 30 selected and index 0 at fault the proposer
+    /// discarded 29 valid transfers and evicted them from the mempool — the
+    /// shape measured on mainnet 2026-08-25, where a user's burst of 30 mostly
+    /// vanished while the node had answered `accepted` for every one.
+    #[test]
+    fn the_culprit_at_the_front_costs_exactly_itself() {
+        let err = TransitionError::Transfer(0, TransferReject::UnknownInput);
+        assert_eq!(refused_index(&err, 30), Some(0));
+    }
+
+    #[test]
+    fn every_named_index_is_honoured_not_just_the_first() {
+        for i in 0..30u32 {
+            let err = TransitionError::Transfer(i, TransferReject::UnknownInput);
+            assert_eq!(
+                refused_index(&err, 30),
+                Some(i as usize),
+                "index {i} was named and must be the one removed"
+            );
+        }
+    }
+
+    /// An index the selection does not contain must NOT be used to index it —
+    /// `Vec::remove` would panic, and a proposer that panics is worse than a
+    /// proposer that drops the wrong transaction.
+    #[test]
+    fn an_out_of_range_index_falls_back_instead_of_panicking() {
+        let err = TransitionError::Transfer(30, TransferReject::UnknownInput);
+        assert_eq!(refused_index(&err, 30), None);
+        let err = TransitionError::Transfer(u32::MAX, TransferReject::UnknownInput);
+        assert_eq!(refused_index(&err, 30), None);
+    }
+
+    #[test]
+    fn an_empty_selection_names_nobody() {
+        let err = TransitionError::Transfer(0, TransferReject::UnknownInput);
+        assert_eq!(refused_index(&err, 0), None);
+    }
+}
+
+#[cfg(test)]
+mod v2_e_despejo {
+    use super::{conflita_com_gastos, outpoints_gastos, primeira_entrada_ausente, tx_gas};
+    use bloch_pos_committee::fee_market::{intrinsic_gas, TxClass};
+    use bloch_pos_committee::transition::{
+        PosTransaction, TransferInput, TransferInputV2, TransferOutput, WitnessKey,
+    };
+    use std::collections::BTreeSet;
+
+    fn id(b: u8) -> [u8; 32] { [b; 32] }
+    fn saida() -> TransferOutput { TransferOutput { value: 1, script_hash: id(9) } }
+
+    fn v1(entradas: &[(u8, u32)]) -> PosTransaction {
+        PosTransaction::Transfer {
+            inputs: entradas.iter().map(|(b, v)| TransferInput {
+                txid: id(*b), vout: *v, pubkey: vec![1], signature: vec![2],
+            }).collect(),
+            outputs: vec![saida()],
+            tx_bytes: 38_498,
+            tip_millisat_per_gas: 0,
+        }
+    }
+    fn v2(entradas: &[(u8, u32)], n_chaves: usize, bytes: u64) -> PosTransaction {
+        PosTransaction::TransferV2 {
+            keys: (0..n_chaves).map(|_| WitnessKey { pubkey: vec![1], signature: vec![2] }).collect(),
+            inputs: entradas.iter().map(|(b, v)| TransferInputV2 {
+                txid: id(*b), vout: *v, key_index: 0,
+            }).collect(),
+            outputs: vec![saida()],
+            tx_bytes: bytes,
+            tip_millisat_per_gas: 0,
+        }
+    }
+    const NAO: fn(&[u8; 32], u32) -> bool = |_, _| false;
+    const SIM: fn(&[u8; 32], u32) -> bool = |_, _| true;
+
+    /// A REGRESSAO QUE A AUDITORIA ACHOU. A admissao era cega ao formato que a
+    /// rede usa: `TransferV2` e 93% do trafego vivo (epoca 1181, flag day na
+    /// 800) e o `let ... else` devolvia None para ele.
+    #[test]
+    fn a_admissao_enxerga_v2() {
+        assert_eq!(primeira_entrada_ausente(&v2(&[(7, 3)], 1, 28_495), NAO, NAO), Some((id(7), 3)));
+    }
+
+    /// CONTROLE: a V1 equivalente sempre foi pega. Sem esta metade, o teste
+    /// acima passaria mesmo com a funcao recusando tudo.
+    #[test]
+    fn controle_v1_continua_sendo_pega() {
+        assert_eq!(primeira_entrada_ausente(&v1(&[(7, 3)]), NAO, NAO), Some((id(7), 3)));
+        assert_eq!(primeira_entrada_ausente(&v2(&[(7, 3)], 1, 28_495), SIM, NAO), None, "com a entrada no estado, nada a objetar");
+    }
+
+    /// O GAS DA V2 E POR TABELA DE TESTEMUNHAS, nao por entrada. Uma varredura
+    /// de 973 entradas com UMA chave custa ~835 mil, nao 71 milhoes. Cobrar por
+    /// `inputs.len()` tornaria toda consolidacao grande inselecionavel.
+    #[test]
+    fn v2_cobra_por_chave_e_nao_por_entrada() {
+        let entradas: Vec<(u8, u32)> = (0..250).map(|i| (i as u8, 0u32)).collect();
+        let tx = v2(&entradas, 1, 47_379);
+        assert_eq!(tx_gas(&tx), intrinsic_gas(TxClass::Eutxo { inputs: 1 }, 47_379));
+        assert_eq!(tx_gas(&tx), 835_812, "o numero que a cadeia realmente cobra");
+        // CONTROLE do dano evitado: cobrando por entrada, uma varredura de 973
+        // passaria de 71 milhoes e nunca mais entraria em bloco nenhum.
+        assert!(intrinsic_gas(TxClass::Eutxo { inputs: 973 }, 47_379) > 60_000_000);
+        // e mais chaves DEVEM custar mais — senao o teste acima passaria com
+        // um tx_gas que ignorasse as chaves.
+        assert!(tx_gas(&v2(&entradas, 4, 47_379)) > tx_gas(&tx));
+    }
+
+    /// CONTROLE: a V1 continua cobrando por entrada, que e o que a transicao faz.
+    #[test]
+    fn controle_v1_continua_cobrando_por_entrada() {
+        let tx = v1(&[(1, 0), (2, 0), (3, 0)]);
+        assert_eq!(tx_gas(&tx), intrinsic_gas(TxClass::Eutxo { inputs: 3 }, 38_498));
+    }
+
+    /// O DESPEJO. Uma transacao que gasta um outpoint que o bloco consumiu esta
+    /// morta: o outpoint nao volta ao conjunto nao-gasto.
+    #[test]
+    fn concorrente_que_gasta_a_mesma_entrada_e_despejada() {
+        let gastos: BTreeSet<_> = outpoints_gastos(&v2(&[(7, 0), (8, 1)], 1, 28_495)).into_iter().collect();
+        assert!(conflita_com_gastos(&v2(&[(7, 0)], 1, 28_495), &gastos), "V2 concorrente");
+        assert!(conflita_com_gastos(&v1(&[(8, 1)]), &gastos), "V1 concorrente — formatos se cruzam");
+    }
+
+    /// CONTROLE: quem NAO toca nas entradas gastas fica. Um despejo que remove
+    /// tudo nao e um despejo, e removeria transferencia boa de alguem.
+    #[test]
+    fn controle_quem_nao_conflita_permanece() {
+        let gastos: BTreeSet<_> = outpoints_gastos(&v2(&[(7, 0)], 1, 28_495)).into_iter().collect();
+        assert!(!conflita_com_gastos(&v2(&[(7, 1)], 1, 28_495), &gastos), "mesmo txid, vout diferente = outra moeda");
+        assert!(!conflita_com_gastos(&v1(&[(99, 0)]), &gastos));
+        assert!(!conflita_com_gastos(&v2(&[], 1, 100), &gastos), "sem entradas nao conflita com nada");
+    }
+
+    /// `outpoints_gastos` tem que ver as duas variantes, senao o despejo herda
+    /// a mesma cegueira que a admissao tinha.
+    #[test]
+    fn outpoints_ve_as_duas_variantes() {
+        assert_eq!(outpoints_gastos(&v1(&[(1, 0), (2, 5)])), vec![(id(1), 0), (id(2), 5)]);
+        assert_eq!(outpoints_gastos(&v2(&[(1, 0), (2, 5)], 1, 100)), vec![(id(1), 0), (id(2), 5)]);
     }
 }
