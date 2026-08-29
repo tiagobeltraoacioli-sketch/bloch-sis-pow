@@ -103,7 +103,7 @@ pub const VC_BLOCH: u128 = 10_000_000_000; // 10%
 /// cliff sits six months off the VC cliff so no two buckets share a month.
 pub const TEAM_BLOCH: u128 = 10_000_000_000; // 10%
 /// 25% (1,000,000,000) liquid at genesis for listing and launch spend; the
-/// rest linear over 24 months.
+/// rest linear over 24 months — the shortest tail of the four.
 pub const MARKETING_BLOCH: u128 = 4_000_000_000; //  4%
 /// 100% liquid at genesis — deployed to order books and AMM pools. The one
 /// bucket where full unlock is the function, not a concession.
@@ -114,15 +114,23 @@ pub const FOUNDATION_HELD_BLOCH: u128 =
     VC_BLOCH + TEAM_BLOCH + MARKETING_BLOCH + LIQUIDITY_BLOCH;
 
 /// Of those four, what is spendable at slot 0: all of liquidity plus the 25%
-/// marketing tranche. VC and team are entirely cliffed.
+/// genesis tranche of VC, team and marketing.
 ///
-/// This equals **25.0% of circulating supply at genesis** — exactly the G2
-/// threshold, and unchanged by the split (a redenomination moves no ratio).
+/// **This number doubled on 2026-08-29**, from 6 B to 11 B, and the reason is
+/// the schedule change, not a reallocation: VC and team used to be entirely
+/// cliffed and now open at a quarter like everything else. Against a genesis
+/// float of 31,646,400,000 BLCH (carryover + liquidity + the insider TGE) that
+/// is **34.76% of circulating supply at genesis**, where the previous schedule
+/// put the Foundation at 25.0% — the old G2 threshold, which this no longer
+/// meets. Recorded here rather than left to be derived, because a threshold
+/// that stops being met should be visible at the constant that stopped meeting
+/// it.
+///
 /// Worth keeping as a constant rather than a paragraph: two holders account
 /// for the whole genesis float, and neither can change that by behaving
 /// differently. Only emission and independent stake dilute them.
-pub const FOUNDATION_LIQUID_AT_GENESIS_BLOCH: u128 =
-    LIQUIDITY_BLOCH + MARKETING_BLOCH * MARKETING_TGE_NUMERATOR / MARKETING_TGE_DENOMINATOR;
+pub const FOUNDATION_LIQUID_AT_GENESIS_BLOCH: u128 = LIQUIDITY_BLOCH
+    + (VC_BLOCH + TEAM_BLOCH + MARKETING_BLOCH) * TGE_NUMERATOR / TGE_DENOMINATOR;
 
 /// The carried-over ledger — **one balance set, no founder line**.
 ///
@@ -261,54 +269,88 @@ pub const EMISSION_YEARS: u64 = 40;
 /// 42,076,800 slots.
 pub const EMISSION_SLOTS: u64 = EMISSION_YEARS * SLOTS_PER_YEAR;
 
-// ── Founder vesting: 2-year cliff, then 8-year linear ───────────────────────
+// ── Insider unlock: 25% at genesis, no cliff, then a linear tail ────────────
+//
+// **Founder decision, 2026-08-29.** Every insider bucket now unlocks a quarter
+// at genesis and the remainder linearly, with NO CLIFF ANYWHERE. This
+// supersedes the staggered-cliff design (VC 12 mo, team 18, founder 24) and
+// the 2026-08-21 two-year-cliff founder grant before it.
+//
+// What the staggered cliffs bought was the absence of a "cliff wall" — several
+// buckets beginning to unlock in the same month, concentrating sell pressure
+// onto one date. Removing the cliffs does not reintroduce that wall, it
+// dissolves it: there is no longer a date on which anything *begins*, because
+// every bucket is already unlocking at slot 1, so no month is special. What
+// separates the buckets now is DURATION rather than start — 24 / 36 / 48 / 60
+// months, shortest for marketing and longest for the founder — so the
+// alignment demanded grows with the holder's horizon.
+//
+// The trade, stated rather than buried. This is a WEAKER lock-up than the
+// schedule it replaces, in two measurable ways:
+//
+//   1. 8.5 B BLCH — a quarter of the 34 B insider allocation — is spendable at
+//      slot 0, where before only a quarter of marketing (1 B) was.
+//   2. Validators no longer out-earn the largest single insider bucket from
+//      day one. Under the cliffed schedule every 10 B bucket sat at zero for
+//      at least a year, so the comparison was trivial; now the emission curve
+//      does not overtake the largest bucket until **month 18**
+//      (`decay_leads_the_largest_insider_bucket_from_month_18`).
+//
+// Neither schedule is enforced by consensus. `GenesisAllocation::unlock_epoch`
+// exists in the manifest and is folded into its digest, but no validation path
+// reads it, the live genesis was built with `unlock_epoch: 0` for all five
+// buckets, and `state_root::EutxoEntry` has no lock field for a node to read.
+// Both schedules are therefore commitments, not rules, until the vesting-lock
+// flag day exists. Changing these constants changes what is PROMISED; it does
+// not change what the live chain enforces, which is nothing.
 
-/// Two-year cliff, eight-year linear vest — fully vested at year 10.
+/// Fraction of every insider bucket released at genesis (TGE): 25%.
+pub const TGE_NUMERATOR: u128 = 25;
+pub const TGE_DENOMINATOR: u128 = 100;
+
+/// Founder grant: 25% at genesis, remainder linear over 60 months — the
+/// longest tail of the four, which is the point of it.
+pub const FOUNDER_VESTING_SLOTS: u64 = 60 * MONTH_SLOTS;
+
+/// With no cliff, the end of the founder's vest IS its duration. Kept as a
+/// named constant so "when is the founder fully vested" has one answer.
+pub const FOUNDER_VESTING_END_SLOT: u64 = FOUNDER_VESTING_SLOTS;
+
+/// TGE-then-linear unlock, in satoshis. No cliff: the tail starts at slot 0.
 ///
-/// **Founder decision, 2026-08-21.** This supersedes the ten-year cliff and
-/// forty-year vest that had been restored on 2026-08-11 (which had itself
-/// reversed a draft shortening). The earlier schedule's stated reasoning was
-/// that it sat "far beyond any market benchmark, and deliberately so"; that
-/// reasoning is retired with it rather than left standing next to numbers it no
-/// longer describes.
+/// Linear **per slot** rather than in monthly tranches. A step function
+/// creates moments where a large block of stake becomes spendable at once —
+/// under PoS each is a scheduled opportunity to move the stake distribution
+/// discontinuously, and a visible, game-able date. Per-slot linear has no such
+/// edges, which is the same reasoning that rejected a halving in the emission
+/// curve below.
 ///
-/// What did NOT change, and is the more important half of the picture: the
-/// carried-over balance arrives **liquid at genesis** and is not governed by
-/// this schedule. `FOUNDER_TOTAL_BLOCH` is that carryover plus this grant, and
-/// only the grant waits. Reading these two constants as "the founder's position
-/// is locked for ten years" would be wrong in both directions — the grant is,
-/// the carryover never was.
-///
-/// Ten years still sits at the long end of market practice, where three to four
-/// is typical.
-pub const FOUNDER_CLIFF_SLOTS: u64 = 2 * SLOTS_PER_YEAR;
-pub const FOUNDER_VESTING_SLOTS: u64 = 8 * SLOTS_PER_YEAR;
-pub const FOUNDER_VESTING_END_SLOT: u64 = FOUNDER_CLIFF_SLOTS + FOUNDER_VESTING_SLOTS;
+/// Integer division truncates, so `slot >= linear_slots` returns the exact
+/// total rather than the accumulated quotient. Without that, up to
+/// `linear_slots - 1` satoshis would be permanently unspendable — harmless
+/// economically, but the supply accounting would fail to balance, and a supply
+/// invariant that is "nearly" satisfied is not an invariant.
+pub const fn tge_linear_sat(total_bloch: u128, slot: u64, linear_slots: u64) -> u128 {
+    let total = total_bloch * SAT_PER_BLOCH;
+    if linear_slots == 0 || slot >= linear_slots {
+        return total;
+    }
+    let tge = total * TGE_NUMERATOR / TGE_DENOMINATOR;
+    let locked = total - tge;
+    tge + locked * slot as u128 / linear_slots as u128
+}
 
 /// Founder satoshis unlocked by `slot`.
 ///
-/// Linear **per slot** rather than in monthly tranches (V2 used 480 monthly
-/// steps). A step function creates 480 moments where a large block of stake
-/// becomes spendable at once — under PoS that is 480 scheduled opportunities to
-/// move the stake distribution discontinuously, and every one of them is a
-/// visible, game-able date. Per-slot linear has no such edges.
-///
-/// Integer division truncates, so the last slot is special-cased to release the
-/// exact remainder. Without that, up to `FOUNDER_VESTING_SLOTS - 1` satoshis
-/// would be permanently unspendable — harmless economically, but it would make
-/// the supply accounting fail to balance, and a supply invariant that is
-/// "nearly" satisfied is not an invariant.
+/// This governs the GRANT only. The carried-over balance is not on this
+/// schedule and never was: it arrived liquid at genesis. `FOUNDER_TOTAL_BLOCH`
+/// is that carryover plus this grant, and only the grant waits — reading these
+/// constants as "the founder's position is locked" is wrong in both
+/// directions.
 pub const fn founder_vested_sat(slot: u64) -> u128 {
-    let total = FOUNDER_BLOCH * SAT_PER_BLOCH;
-    if slot < FOUNDER_CLIFF_SLOTS {
-        return 0;
-    }
-    if slot >= FOUNDER_VESTING_END_SLOT {
-        return total;
-    }
-    let elapsed = (slot - FOUNDER_CLIFF_SLOTS) as u128;
-    total * elapsed / FOUNDER_VESTING_SLOTS as u128
+    tge_linear_sat(FOUNDER_BLOCH, slot, FOUNDER_VESTING_SLOTS)
 }
+
 
 // ── Validator emission ──────────────────────────────────────────────────────
 
@@ -477,64 +519,45 @@ const _: () = assert!(
     "se isto falhar, o int64 do SDK Go voltou a caber — atualize os docs"
 );
 
-// ── Vesting: team, VC, marketing, liquidity ─────────────────────────────────
+// ── Insider unlock: the per-bucket durations ────────────────────────────────
 //
-// Schedules follow prevailing market practice (§7 of the spec), with the cliffs
-// deliberately staggered. The single most cited failure mode in vesting design
-// is the "cliff wall" — several buckets beginning to unlock in the same month,
-// concentrating sell pressure into one date. Founder (24), team (18) and VC
-// (12) cliff six months apart, so unlocks arrive as a stream.
+// One shape for all four (25% at genesis, no cliff, linear tail); what differs
+// is how long the tail runs. Ordered by the horizon the holder is asked to
+// take: marketing funds launch programmes and is shortest, the founder is
+// longest. The ordering is asserted, not merely intended — see
+// `durations_are_ordered_by_holder_horizon`.
 
 pub const MONTH_SLOTS: u64 = SLOTS_PER_YEAR / 12;
 
-/// VC / crypto hedge funds: 12-month cliff, 24-month linear (3 years total).
-/// A 12-month cliff is the standard among recent L1s; funds rarely accept more.
-pub const VC_CLIFF_SLOTS: u64 = 12 * MONTH_SLOTS;
-pub const VC_VESTING_SLOTS: u64 = 24 * MONTH_SLOTS;
+/// VC / crypto hedge funds: 25% at genesis, remainder linear over 36 months.
+/// The shortest of the three 10 B buckets — funds rarely accept more, and this
+/// is the bucket the decentralisation check below measures against.
+pub const VC_VESTING_SLOTS: u64 = 36 * MONTH_SLOTS;
 
-/// Development team: 18-month cliff, 36-month linear (4.5 years total).
-/// The institutional standard is a 12-month cliff plus 36-month linear; 18 is
-/// both defensible where institutional investors participate and necessary here
-/// to keep the team cliff off the VC cliff month.
-pub const TEAM_CLIFF_SLOTS: u64 = 18 * MONTH_SLOTS;
-pub const TEAM_VESTING_SLOTS: u64 = 36 * MONTH_SLOTS;
+/// Development team: 25% at genesis, remainder linear over 48 months.
+pub const TEAM_VESTING_SLOTS: u64 = 48 * MONTH_SLOTS;
 
-/// Marketing: 25% at genesis for listing and launch activity, the rest linear
-/// over 24 months. Mirrors the common split between launch spend (immediate)
-/// and ongoing programmes (vested).
-pub const MARKETING_TGE_NUMERATOR: u128 = 25;
-pub const MARKETING_TGE_DENOMINATOR: u128 = 100;
+/// Marketing: 25% at genesis for listing and launch activity, remainder linear
+/// over 24 months — the shortest tail, because the spend it funds is
+/// front-loaded.
 pub const MARKETING_VESTING_SLOTS: u64 = 24 * MONTH_SLOTS;
 
-/// Generic cliff-then-linear unlock, in satoshis.
-pub const fn vested_sat(total_bloch: u128, slot: u64, cliff: u64, duration: u64) -> u128 {
-    let total = total_bloch * SAT_PER_BLOCH;
-    if slot < cliff {
-        return 0;
-    }
-    if duration == 0 || slot >= cliff + duration {
-        return total;
-    }
-    total * (slot - cliff) as u128 / duration as u128
-}
-
 pub const fn vc_vested_sat(slot: u64) -> u128 {
-    vested_sat(VC_BLOCH, slot, VC_CLIFF_SLOTS, VC_VESTING_SLOTS)
+    tge_linear_sat(VC_BLOCH, slot, VC_VESTING_SLOTS)
 }
 
 pub const fn team_vested_sat(slot: u64) -> u128 {
-    vested_sat(TEAM_BLOCH, slot, TEAM_CLIFF_SLOTS, TEAM_VESTING_SLOTS)
+    tge_linear_sat(TEAM_BLOCH, slot, TEAM_VESTING_SLOTS)
 }
 
 pub const fn marketing_vested_sat(slot: u64) -> u128 {
-    let total = MARKETING_BLOCH * SAT_PER_BLOCH;
-    let at_tge = total * MARKETING_TGE_NUMERATOR / MARKETING_TGE_DENOMINATOR;
-    at_tge + vested_sat(MARKETING_BLOCH - MARKETING_BLOCH * MARKETING_TGE_NUMERATOR
-        / MARKETING_TGE_DENOMINATOR, slot, 0, MARKETING_VESTING_SLOTS)
+    tge_linear_sat(MARKETING_BLOCH, slot, MARKETING_VESTING_SLOTS)
 }
 
 /// Liquidity is fully unlocked at genesis — that is its function. Vesting the
-/// liquidity bucket would defeat the purpose of having one.
+/// liquidity bucket would defeat the purpose of having one, so the 25% rule
+/// deliberately does NOT reach it (founder decision, 2026-08-29). It is the
+/// one documented exception to "every bucket unlocks a quarter".
 pub const fn liquidity_vested_sat(_slot: u64) -> u128 {
     LIQUIDITY_BLOCH * SAT_PER_BLOCH
 }
@@ -545,6 +568,24 @@ pub const fn insider_unlocked_sat(slot: u64) -> u128 {
     founder_vested_sat(slot) + team_vested_sat(slot) + vc_vested_sat(slot)
         + marketing_vested_sat(slot)
 }
+
+/// Insider satoshis spendable at slot 0 — the number the schedule change is
+/// really about. Pinned so moving the TGE fraction has to come through here.
+pub const INSIDER_TGE_SAT: u128 = insider_unlocked_sat(0);
+
+const _: () = assert!(
+    INSIDER_TGE_SAT
+        == (FOUNDER_BLOCH + VC_BLOCH + TEAM_BLOCH + MARKETING_BLOCH) * SAT_PER_BLOCH
+            * TGE_NUMERATOR / TGE_DENOMINATOR,
+    "a fracao de TGE mudou — reveja BLOCH-TOKENOMICS-V4 antes de seguir"
+);
+const _: () = assert!(
+    MARKETING_VESTING_SLOTS <= VC_VESTING_SLOTS
+        && VC_VESTING_SLOTS <= TEAM_VESTING_SLOTS
+        && TEAM_VESTING_SLOTS <= FOUNDER_VESTING_SLOTS,
+    "as duracoes sairam da ordem marketing <= vc <= time <= fundador"
+);
+
 
 // ── Emission curve: the decision that actually drives decentralisation ──────
 //

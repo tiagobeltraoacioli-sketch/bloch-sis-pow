@@ -38,8 +38,12 @@ pure ×100/21 split of the V2 nominal, decided 2026-08-12.
 Those coins were mined, on the same chain, under the same rules as everyone
 else's — so they are carried the same way, as ordinary liquid balance, and
 liquid includes stakeable (decided 2026-08-11, §4A.1). The founder additionally
-receives a new 10% grant under a 10-year cliff and 40-year linear vest — the V2
-premine schedule, at 10% rather than the V2 17%.
+receives a new 10% grant. **Founder decision, 2026-08-29: every insider bucket
+now unlocks 25% at genesis with NO CLIFF, and the remainder linearly over
+24–60 months** (marketing 24, VC 36, team 48, founder 60). This supersedes both
+the staggered-cliff table below and the 2026-08-21 two-year-cliff founder grant
+before it; see §3.1-bis for what the change costs. Liquidity is the one
+exception and stays 100% liquid at genesis, because that is its function.
 
 100 billion costs two things, both accepted with eyes open and both now
 resolved rather than tolerated (see §8.1 and
@@ -55,9 +59,9 @@ what Go does.
 | Destination | BLCH | Share | Unlock |
 |---|---:|---:|---|
 | Carryover — the whole ledger | 18,146,400,000 | 17.97% | **liquid at genesis** |
-| Founder — new grant | 10,000,000,000 | 10.00% | 10-year cliff, then 40-year linear |
-| VC / crypto hedge funds | 10,000,000,000 | 10.00% | 12-month cliff, then 24-month linear |
-| Development team | 10,000,000,000 | 10.00% | 18-month cliff, then 36-month linear |
+| Founder — new grant | 10,000,000,000 | 10.00% | 25% at genesis, remainder linear over 60 months |
+| VC / crypto hedge funds | 10,000,000,000 | 10.00% | 25% at genesis, remainder linear over 36 months |
+| Development team | 10,000,000,000 | 10.00% | 25% at genesis, remainder linear over 48 months |
 | Marketing | 4,000,000,000 | 4.00% | 25% at genesis, remainder linear over 24 months |
 | Liquidity | 5,000,000,000 | 5.00% | 100% liquid at genesis |
 | **Validators** | **42,853,600,000** | **43.03%** | emitted over 40 years |
@@ -130,6 +134,46 @@ number does, which is why the legend carries both.
 
 Validator emission runs for 40 years and is supplemented by transaction fees.
 **After the 21 B is fully issued, validators are paid 100% from fees.**
+
+---
+
+### 3.1-bis. What the no-cliff schedule costs (2026-08-29)
+
+The staggered cliffs bought the absence of a "cliff wall" — several buckets
+beginning to unlock in the same month. Removing them does not reintroduce that
+wall, it dissolves it: nothing *begins* on a date any more, because every
+bucket is already unlocking at slot 1. What separates the buckets now is
+duration, not start, in 12-month steps.
+
+Two things get worse, and both are measured rather than asserted:
+
+| | Cliffed schedule | No-cliff schedule |
+|---|---:|---:|
+| Insider BLCH spendable at slot 0 | 1,000,000,000 | **8,500,000,000** |
+| Genesis float | 24,146,400,000 | **31,646,400,000** |
+| Foundation share of that float | 25.0% | **34.8%** |
+| Validators lead the largest insider bucket from | slot 0 | **month 18** |
+| That lead at month 24 | ~1.70x | **~1.10x** |
+
+The last two rows matter most, because the 10%/year decay rate in §6 was
+chosen partly on the "validators out-earn the insider unlock schedule"
+constraint. Under the cliffed table that was true trivially — every 10 B bucket
+sat at zero for at least a year. It is no longer trivial: validators start
+behind and overtake at month 18. The constraint still holds, with far less
+margin, and the emission curve was **not** re-tuned to restore the old margin.
+Doing so is a separate decision and is not taken here.
+
+The 25%-of-stake concentration gate is unaffected: the largest single bucket
+peaks at 15.6% of circulating supply at month 36.
+
+Pinned by `decay_leads_the_largest_insider_bucket_only_from_month_18` and
+`a_quarter_of_every_insider_bucket_circulates_at_genesis`.
+
+**None of this is enforced by consensus.** `GenesisAllocation::unlock_epoch`
+exists in the manifest and is folded into its digest, but no validation path
+reads it, the live genesis was built with `unlock_epoch: 0` for all five
+buckets, and `state_root::EutxoEntry` has no lock field. Changing this schedule
+changes what is *promised*, not what the chain enforces — which is nothing.
 
 ---
 

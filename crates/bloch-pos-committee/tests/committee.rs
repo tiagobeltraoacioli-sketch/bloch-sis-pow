@@ -476,20 +476,24 @@ fn allocations_sum_to_total_supply() {
 }
 
 #[test]
-fn founder_is_fully_locked_through_the_cliff() {
-    assert_eq!(tk::founder_vested_sat(0), 0);
-    assert_eq!(tk::founder_vested_sat(tk::FOUNDER_CLIFF_SLOTS - 1), 0);
-    // First slot after the cliff releases essentially nothing — linear, no jump.
-    assert_eq!(tk::founder_vested_sat(tk::FOUNDER_CLIFF_SLOTS), 0);
+fn founder_releases_a_quarter_at_genesis_and_then_only_slivers() {
+    let total = tk::FOUNDER_BLOCH * tk::SAT_PER_BLOCH;
+    // Sem cliff desde 2026-08-29: a concessao ABRE em 25% e ja se move no
+    // slot seguinte. O que a ausencia de cliff nao introduz e um degrau.
+    assert_eq!(tk::founder_vested_sat(0), total / 4);
+    assert!(tk::founder_vested_sat(1) > total / 4, "o primeiro slot nao liberou nada");
+    assert!(tk::founder_vested_sat(1) - total / 4 < total / 1_000_000,
+        "o primeiro slot liberou um degrau, nao um sliver");
 }
 
 #[test]
 fn founder_vesting_is_linear_and_completes_exactly() {
     let total = tk::FOUNDER_BLOCH * tk::SAT_PER_BLOCH;
-    let mid = tk::FOUNDER_CLIFF_SLOTS + tk::FOUNDER_VESTING_SLOTS / 2;
-    let half = tk::founder_vested_sat(mid);
-    let err = (half as i128 - (total / 2) as i128).abs();
-    assert!(err < 1_000_000, "meio do vesting deveria ser ~metade, erro {err}");
+    // Metade da cauda de 60 meses: 25% de TGE + metade dos 75% restantes.
+    let mid = tk::FOUNDER_VESTING_SLOTS / 2;
+    let want = total / 4 + (total - total / 4) / 2;
+    let err = (tk::founder_vested_sat(mid) as i128 - want as i128).abs();
+    assert!(err < 1_000_000, "meio do vesting deveria ser 62,5%, erro {err}");
     // Exact at the end: no dust may be stranded, or supply accounting breaks.
     assert_eq!(tk::founder_vested_sat(tk::FOUNDER_VESTING_END_SLOT), total);
     assert_eq!(tk::founder_vested_sat(u64::MAX), total);
@@ -566,25 +570,28 @@ fn halving_beats_flat_on_early_validator_share() {
 // ── vesting ─────────────────────────────────────────────────────────────────
 
 #[test]
-fn cliffs_are_staggered_to_avoid_a_cliff_wall() {
-    // Founder 24 mo, team 18 mo, VC 12 mo — three distinct months.
+fn durations_are_ordered_by_holder_horizon() {
+    // Os cliffs sairam (2026-08-29). O que substitui o escalonamento e a ORDEM
+    // das caudas: 24 / 36 / 48 / 60, em passos de 12 meses. Nada mais
+    // "comeca" numa data, entao nao ha muro do qual escalonar.
     let m = tk::MONTH_SLOTS;
-    assert_eq!(tk::VC_CLIFF_SLOTS / m, 12);
-    assert_eq!(tk::TEAM_CLIFF_SLOTS / m, 18);
-    // 24 meses desde a decisao do founder de 2026-08-21 (era 120, dez anos).
-    // O comentario acima ja dizia 24: era do rascunho que a decisao de 11/08
-    // tinha revertido, e ficou dessincronizado do valor fixado aqui.
-    assert_eq!(tk::FOUNDER_CLIFF_SLOTS / m, 24);
-    let mut cliffs = [tk::VC_CLIFF_SLOTS, tk::TEAM_CLIFF_SLOTS, tk::FOUNDER_CLIFF_SLOTS];
-    cliffs.sort();
-    assert!(cliffs.windows(2).all(|w| w[1] - w[0] >= 6 * m), "cliffs a menos de 6 meses");
+    assert_eq!(tk::MARKETING_VESTING_SLOTS / m, 24);
+    assert_eq!(tk::VC_VESTING_SLOTS / m, 36);
+    assert_eq!(tk::TEAM_VESTING_SLOTS / m, 48);
+    assert_eq!(tk::FOUNDER_VESTING_SLOTS / m, 60);
+    let d = [tk::MARKETING_VESTING_SLOTS, tk::VC_VESTING_SLOTS,
+             tk::TEAM_VESTING_SLOTS, tk::FOUNDER_VESTING_SLOTS];
+    assert!(d.windows(2).all(|w| w[1] - w[0] == 12 * m), "as caudas sairam do passo de 12 meses");
 }
 
 #[test]
-fn locked_buckets_release_nothing_at_genesis() {
-    assert_eq!(tk::vc_vested_sat(0), 0);
-    assert_eq!(tk::team_vested_sat(0), 0);
-    assert_eq!(tk::founder_vested_sat(0), 0);
+fn every_insider_bucket_releases_a_quarter_at_genesis() {
+    let q = |b: u128| b * tk::SAT_PER_BLOCH / 4;
+    assert_eq!(tk::vc_vested_sat(0), q(tk::VC_BLOCH));
+    assert_eq!(tk::team_vested_sat(0), q(tk::TEAM_BLOCH));
+    assert_eq!(tk::founder_vested_sat(0), q(tk::FOUNDER_BLOCH));
+    assert_eq!(tk::marketing_vested_sat(0), q(tk::MARKETING_BLOCH));
+    assert_eq!(tk::INSIDER_TGE_SAT, 8_500_000_000 * tk::SAT_PER_BLOCH);
 }
 
 #[test]
@@ -632,13 +639,17 @@ fn insider_unlock_is_monotonic_and_capped() {
 }
 
 #[test]
-fn nothing_but_liquidity_marketing_and_holders_circulates_at_genesis() {
-    // The strongest property of the V4 schedule: at genesis no insider bucket
-    // except a quarter of marketing has any spendable stake at all.
+fn a_quarter_of_every_insider_bucket_circulates_at_genesis() {
+    // A propriedade mais forte do cronograma V4 ERA: no genesis, nenhum balde
+    // de insider exceto um quarto do marketing tinha stake gastavel. A mudanca
+    // de 2026-08-29 abre mao disso deliberadamente — 8,5 B contra 1 B, 8,5x.
+    // Fixado no valor novo para que a mudanca nao possa acontecer duas vezes
+    // por acidente.
     let sat = tk::SAT_PER_BLOCH;
     let circulating_insiders = tk::insider_unlocked_sat(0);
-    assert_eq!(circulating_insiders, tk::MARKETING_BLOCH * sat / 4);
-    assert_eq!(tk::founder_vested_sat(0), 0);
+    assert_eq!(circulating_insiders, 8_500_000_000 * sat);
+    assert_eq!(circulating_insiders, tk::INSIDER_TGE_SAT);
+    assert_eq!(tk::founder_vested_sat(0), tk::FOUNDER_BLOCH * sat / 4);
 }
 
 #[test]
@@ -717,21 +728,31 @@ fn decay_curve_emits_the_allocation_exactly() {
 }
 
 #[test]
-fn decay_front_loads_enough_to_outpace_insider_unlocks() {
-    // The decentralisation constraint: by month 24 validators must hold more
-    // than any single insider bucket has unlocked by then.
-    let m24 = 2 * tk::SLOTS_PER_YEAR;
-    let validators = tk::validator_emitted_decay_by(m24);
-    let biggest_insider = tk::vc_vested_sat(m24); // VC cliffs first
+fn decay_leads_the_largest_insider_bucket_only_from_month_18() {
+    // A restricao de descentralizacao, reafirmada para o cronograma de
+    // 2026-08-29 — e ela ENFRAQUECEU, o que este teste registra em vez de
+    // absorver alargando uma faixa.
+    //
+    // Sob os cliffs, todo balde de 10 B ficava em zero por pelo menos um ano,
+    // entao "validadores superam o maior balde de insider" valia desde o slot
+    // 0 e a margem no mes 24 era ~1,7x. Com 25% abrindo no genesis e sem
+    // cliff, os validadores COMECAM ATRAS — o maior balde ja tem 2,5 B no dia
+    // um — e so ultrapassam no mes 18. O mes e o numero que mudou.
+    let m = tk::MONTH_SLOTS;
+    let biggest = |slot: u64| {
+        tk::founder_vested_sat(slot)
+            .max(tk::vc_vested_sat(slot))
+            .max(tk::team_vested_sat(slot))
+            .max(tk::marketing_vested_sat(slot))
+    };
+    assert!(tk::validator_emitted_decay_by(0) < biggest(0), "no genesis os validadores tem zero");
+    assert!(tk::validator_emitted_decay_by(17 * m) < biggest(17 * m), "cruzou antes do mes 18");
+    assert!(tk::validator_emitted_decay_by(18 * m) > biggest(18 * m), "nao cruzou no mes 18");
 
-    // A margem e uma RAZAO, e o split de 2026-08-12 nao move razao nenhuma:
-    // validadores lideram o maior balde de insider por ~1,7x no mes 24, o
-    // mesmo que no supply de 21 bi. (A margem encolhera na volta para 21 bi
-    // porque a ALOCACAO relativa mudou naquela revisao; o split nao muda.)
-    assert!(validators > biggest_insider,
-        "validadores {validators} atras do maior insider {biggest_insider}");
-    let ratio = validators * 100 / biggest_insider;
-    assert!((160..=185).contains(&ratio), "margem mudou: {ratio}/100");
+    // E, uma vez a frente, a margem so abre.
+    let r = |mo: u64| tk::validator_emitted_decay_by(mo * m) * 100 / biggest(mo * m);
+    assert!((108..=115).contains(&r(24)), "margem no mes 24 mudou: {}/100", r(24));
+    assert!((175..=182).contains(&r(60)), "margem no mes 60 mudou: {}/100", r(60));
 }
 
 // ── receita do validador (modelo Solana) ────────────────────────────────────
@@ -1400,31 +1421,36 @@ fn each_foundation_bucket_is_pinned() {
     assert_eq!(tk::FOUNDATION_HELD_BLOCH, 29_000_000_000);
     assert_eq!(tk::FOUNDATION_HELD_BLOCH * 100 / tk::TOTAL_SUPPLY_BLOCH, 29);
 
-    // Liquido no genesis: so liquidez inteira e o quarto do marketing.
-    assert_eq!(tk::vc_vested_sat(0), 0, "VC nao pode ter nada liquido no genesis");
-    assert_eq!(tk::team_vested_sat(0), 0, "time nao pode ter nada liquido no genesis");
+    // Liquido no genesis: liquidez inteira + o quarto de VC, time e marketing.
+    assert_eq!(tk::vc_vested_sat(0), 2_500_000_000 * sat);
+    assert_eq!(tk::team_vested_sat(0), 2_500_000_000 * sat);
     assert_eq!(tk::marketing_vested_sat(0), 1_000_000_000 * sat);
     assert_eq!(tk::liquidity_vested_sat(0), 5_000_000_000 * sat);
-    assert_eq!(tk::FOUNDATION_LIQUID_AT_GENESIS_BLOCH, 6_000_000_000);
+    assert_eq!(tk::FOUNDATION_LIQUID_AT_GENESIS_BLOCH, 11_000_000_000);
 
     // Cada balde veste por inteiro, no prazo dele.
     let y = tk::SLOTS_PER_YEAR;
     assert_eq!(tk::vc_vested_sat(3 * y), tk::VC_BLOCH * sat, "VC no ano 3");
-    assert_eq!(tk::team_vested_sat(5 * y), tk::TEAM_BLOCH * sat, "time no ano 4,5");
+    assert_eq!(tk::team_vested_sat(4 * y), tk::TEAM_BLOCH * sat, "time no ano 4");
     assert_eq!(tk::marketing_vested_sat(2 * y), tk::MARKETING_BLOCH * sat);
+    assert_eq!(tk::founder_vested_sat(5 * y), tk::FOUNDER_BLOCH * sat, "fundador no ano 5");
 }
 
 #[test]
 fn two_holders_account_for_the_entire_genesis_float() {
-    // O numero do 7B: a fundacao fica com exatamente 25% do circulante no slot
-    // 0 e o carryover com os outros 75%. Nenhum dos dois consegue mudar isso
-    // se comportando diferente — so emissao e stake independente diluem.
+    // Continuam dois holders — a fundacao e o fundador — mas as fatias mudaram
+    // com o cronograma de 2026-08-29: a fundacao dobrou (6 B -> 11 B, porque
+    // VC e time deixaram de ser cliffados) e o fundador passou a trazer 25% da
+    // concessao alem do carryover. O float do genesis cresceu de 24,1 B para
+    // 31,6 B. Nenhum dos dois consegue mudar isso se comportando diferente —
+    // so emissao e stake independente diluem.
     let f = tk::FOUNDATION_LIQUID_AT_GENESIS_BLOCH;
-    let c = tk::CARRYOVER_TOTAL_BLOCH;
-    let circulating = f + c;
-    assert_eq!(circulating, 24_146_400_000);
-    assert_eq!(f * 1000 / circulating, 248, "fundacao = 24,8% do circulante");
-    assert_eq!(c * 1000 / circulating, 751, "carryover = 75,1% (truncado)");
+    let founder = tk::CARRYOVER_TOTAL_BLOCH
+        + tk::FOUNDER_BLOCH * tk::TGE_NUMERATOR / tk::TGE_DENOMINATOR;
+    let circulating = f + founder;
+    assert_eq!(circulating, 31_646_400_000);
+    assert_eq!(f * 1000 / circulating, 347, "fundacao = 34,7% do circulante");
+    assert_eq!(founder * 1000 / circulating, 652, "fundador = 65,2% (truncado)");
 }
 
 // ── coorte de genesis e o teto declinante ───────────────────────────────────

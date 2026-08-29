@@ -442,7 +442,7 @@ impl Schedule {
     /// Satoshis of a `value_sat` output unlocked by `slot`.
     ///
     /// Truncating integer arithmetic, identical shape to
-    /// `tokenomics_v4::vested_sat` — the tests below assert slot-exact
+    /// `tokenomics_v4::tge_linear_sat` — the tests below assert slot-exact
     /// agreement with the crate's per-bucket functions, so the schedule the
     /// genesis carries and the schedule the consensus constants describe are
     /// provably the same function.
@@ -512,21 +512,26 @@ pub struct Genesis {
 
 /// The five bucket schedules, expressed from the tokenomics-v4 constants.
 /// These are derivations, not restatements: change the crate and these follow.
+/// The genesis tranche every insider bucket opens with, in basis points.
+/// Derived from the crate constants so the two cannot drift.
+pub const INSIDER_TGE_BPS: u16 = (v4::TGE_NUMERATOR * 10_000 / v4::TGE_DENOMINATOR) as u16;
+
+/// All four insider buckets share one shape — 25% at genesis, no cliff — and
+/// differ only in the length of the linear tail.
+fn insider_schedule(linear_slots: u64) -> Schedule {
+    Schedule { tge_bps: INSIDER_TGE_BPS, cliff_slots: 0, linear_slots }
+}
 pub fn founder_schedule() -> Schedule {
-    Schedule { tge_bps: 0, cliff_slots: v4::FOUNDER_CLIFF_SLOTS, linear_slots: v4::FOUNDER_VESTING_SLOTS }
+    insider_schedule(v4::FOUNDER_VESTING_SLOTS)
 }
 pub fn vc_schedule() -> Schedule {
-    Schedule { tge_bps: 0, cliff_slots: v4::VC_CLIFF_SLOTS, linear_slots: v4::VC_VESTING_SLOTS }
+    insider_schedule(v4::VC_VESTING_SLOTS)
 }
 pub fn team_schedule() -> Schedule {
-    Schedule { tge_bps: 0, cliff_slots: v4::TEAM_CLIFF_SLOTS, linear_slots: v4::TEAM_VESTING_SLOTS }
+    insider_schedule(v4::TEAM_VESTING_SLOTS)
 }
 pub fn marketing_schedule() -> Schedule {
-    Schedule {
-        tge_bps: (v4::MARKETING_TGE_NUMERATOR * 10_000 / v4::MARKETING_TGE_DENOMINATOR) as u16,
-        cliff_slots: 0,
-        linear_slots: v4::MARKETING_VESTING_SLOTS,
-    }
+    insider_schedule(v4::MARKETING_VESTING_SLOTS)
 }
 pub fn liquidity_schedule() -> Schedule {
     Schedule::LIQUID
@@ -1251,23 +1256,25 @@ mod tests {
 
     #[test]
     fn no_lock_is_absent() {
-        // Every bucket that the spec says is locked IS locked, and every
+        // Every bucket that the spec says is vested IS vested, and every
         // bucket that must be liquid IS liquid. An output with a missing
         // schedule cannot exist by construction (the field is not optional),
         // so "absent" here means "wrongly liquid".
+        //
+        // Reescrito 2026-08-29: "nada liquido no genesis" deixou de ser a
+        // regra para os baldes de insider — todos abrem em 25%. O que nao pode
+        // sumir agora e a CAUDA. Um balde com tge_bps=10.000 ou linear_slots=0
+        // seria liquido por inteiro, e e isso que este teste ainda defende.
         let g = kat_genesis();
         let sched = |b: &str| g.outputs.iter().find(|o| o.bucket == b).unwrap().schedule;
 
-        for locked in ["founder", "vc", "team"] {
-            let s = sched(locked);
-            assert_eq!(s.tge_bps, 0, "{locked}: nothing liquid at genesis");
-            assert!(s.cliff_slots > 0, "{locked}: cliff missing");
-            assert!(s.linear_slots > 0, "{locked}: linear vesting missing");
+        for vested in ["founder", "vc", "team", "marketing"] {
+            let s = sched(vested);
+            assert_eq!(s.tge_bps, INSIDER_TGE_BPS, "{vested}: nao abre em 25%");
+            assert_eq!(s.cliff_slots, 0, "{vested}: cliff voltou");
+            assert!(s.linear_slots > 0, "{vested}: cauda linear sumiu");
+            assert!(!s.is_liquid(), "{vested}: ficou liquido por inteiro");
         }
-        let m = sched("marketing");
-        assert_eq!(m.tge_bps, 2_500, "marketing: 25% at TGE");
-        assert_eq!(m.cliff_slots, 0);
-        assert!(m.linear_slots > 0, "marketing: linear vesting missing");
         assert!(sched("liquidity").is_liquid());
         for o in g.outputs.iter().filter(|o| o.bucket == "holder") {
             assert!(o.schedule.is_liquid(), "carryover holders are liquid by decision");
@@ -1276,21 +1283,25 @@ mod tests {
 
     #[test]
     fn schedules_are_the_spec_schedules_in_slots() {
-        // §1/§7 tables. Founder: 10-year cliff, 40-year linear (the V2 premine
-        // schedule, restored 2026-08-11 — NOT the 24/120-month draft). The
-        // Foundation buckets convert at 87,660 slots/month.
+        // Cronograma de 2026-08-29: 25% no genesis, SEM CLIFF, cauda linear de
+        // 24/36/48/60 meses. Este teste vinha afirmando cliff de 10 anos e
+        // vest de 40 para o fundador — numeros do rascunho de 11/08 que o
+        // proprio crate ja tinha superado em 21/08; estava desatualizado antes
+        // desta mudanca, e e reescrito contra as constantes, nao contra
+        // literais que podem envelhecer de novo.
         assert_eq!(v4::MONTH_SLOTS, 87_660);
-        let f = founder_schedule();
-        assert_eq!(
-            (f.cliff_slots, f.linear_slots),
-            (10 * v4::SLOTS_PER_YEAR, 40 * v4::SLOTS_PER_YEAR)
-        );
-        let vc = vc_schedule();
-        assert_eq!((vc.cliff_slots, vc.linear_slots), (12 * v4::MONTH_SLOTS, 24 * v4::MONTH_SLOTS));
-        let t = team_schedule();
-        assert_eq!((t.cliff_slots, t.linear_slots), (18 * v4::MONTH_SLOTS, 36 * v4::MONTH_SLOTS));
-        let m = marketing_schedule();
-        assert_eq!(m.linear_slots, 24 * v4::MONTH_SLOTS);
+        assert_eq!(INSIDER_TGE_BPS, 2_500);
+        for (label, sch, months) in [
+            ("founder", founder_schedule(), 60u64),
+            ("team", team_schedule(), 48),
+            ("vc", vc_schedule(), 36),
+            ("marketing", marketing_schedule(), 24),
+        ] {
+            assert_eq!(sch.cliff_slots, 0, "{label} ainda tem cliff");
+            assert_eq!(sch.tge_bps, INSIDER_TGE_BPS, "{label} nao abre em 25%");
+            assert_eq!(sch.linear_slots, months * v4::MONTH_SLOTS, "{label} mudou de duracao");
+        }
+        assert!(liquidity_schedule().is_liquid(), "liquidez deixou de ser liquida");
     }
 
     #[test]
@@ -1338,22 +1349,22 @@ mod tests {
     }
 
     #[test]
-    fn liquid_at_genesis_is_exactly_marketing_tge_plus_liquidity_plus_holders() {
+    fn liquid_at_genesis_is_a_quarter_of_each_insider_bucket_plus_liquidity_and_holders() {
         let g = kat_genesis();
         let liquid: u128 = g
             .outputs
             .iter()
             .map(|o| o.schedule.unlocked_sat(o.value_sat, 0))
             .sum();
-        let expected = 1_000_000_000 * v4::SAT_PER_BLOCH            // 25% of marketing
-            + 5_000_000_000 * v4::SAT_PER_BLOCH - g.cohort_stake_sat // liquidity net of stake
-            + g.carryover_issued_sat;                               // holders
+        let expected = 8_500_000_000 * v4::SAT_PER_BLOCH             // 25% dos quatro baldes
+            + 5_000_000_000 * v4::SAT_PER_BLOCH - g.cohort_stake_sat // liquidez menos o stake
+            + g.carryover_issued_sat;                                // holders
         assert_eq!(liquid, expected);
-        // The founder's GRANT holds no spendable stake at genesis — the
-        // liquidity the founder does have at slot 0 is the carried-over
-        // holder balance, stated in §4A, not smuggled through this bucket.
+        // A CONCESSAO do fundador agora abre em um quarto; antes de 2026-08-29
+        // abria em zero. A liquidez que o fundador tem no slot 0 e essa mais o
+        // saldo carregado, e as duas estao declaradas, nao contrabandeadas.
         let founder = g.outputs.iter().find(|o| o.bucket == "founder").unwrap();
-        assert_eq!(founder.schedule.unlocked_sat(founder.value_sat, 0), 0);
+        assert_eq!(founder.schedule.unlocked_sat(founder.value_sat, 0), founder.value_sat / 4);
     }
 
     // ── Bucket-address hygiene ─────────────────────────────────────────────
