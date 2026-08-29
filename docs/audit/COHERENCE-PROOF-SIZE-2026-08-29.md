@@ -32,8 +32,13 @@ ELF do guest: 201.632 bytes. Tamanho = `bincode::serialize` do
 | Core | **5,32x** |
 | Compressed | **2,43x** |
 
-Para UMA transacao blindada. A recursao FRI funciona — corta 54% — e e
-pos-quantica, entao nao e o wrap proibido pela C1 §3. Mas 1,21 MiB continua
+Para UMA transacao blindada. A recursao hash-based funciona — corta 54% — e e
+pos-quantica, entao nao e o wrap proibido pela C1 §3. **Correcao de termo
+(2026-08-29):** este documento dizia "recursao FRI". Para o SDK 6.5.0, que e a
+versao medida, o PCS e **Basefold** (`Poseidon2KoalaBear16BasefoldConfig`,
+`sp1-hypercube-6.5.0/src/verifier/config.rs:14`), nao FRI estrito — o SDK 4.2.1
+usava FRI/BabyBear. A propriedade pos-quantica e a mesma; o termo estava
+errado. Mas 1,21 MiB continua
 sendo 2,4 vezes o bloco.
 
 **O desenho da C1 §3, "FRI cru no corpo do bloco", nao e viavel nos limites
@@ -93,5 +98,9 @@ nao os "minutos" genericos que as analises vinham assumindo.
 - Nada sobre o modo `compressed` ser aceitavel ao verificador portado: o
   `407cffc` rejeita tudo que nao seja `Core` (`matches!(proof.proof,
   SP1Proof::Core(_))`). Se compressed for o caminho, essa checagem precisa ser
-  reaberta deliberadamente — ela e larga demais hoje, porque recursao FRI e
-  pos-quantica e esta sendo recusada junto com os wraps que nao sao.
+  reaberta deliberadamente — ela e larga demais hoje, porque a recursao
+  hash-based e pos-quantica e esta sendo recusada junto com os wraps que nao
+  sao. Verificado na fonte: `verify_compressed` nao toca simbolo bn254 nem
+  emparelhamento algum (`sp1-prover-6.5.0/src/verify.rs:527-580`), e nao baixa
+  artefato em tempo de verificacao — ao contrario do caminho Plonk/Groth16, que
+  chama `try_install_circuit_artifacts`.
