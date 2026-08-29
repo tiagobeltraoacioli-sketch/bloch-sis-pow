@@ -1095,20 +1095,37 @@ mod tests {
         read_cohort(&cohort_text(GENESIS_COHORT_FLOOR)).unwrap()
     }
 
-    /// Two-row fixture summing to EXACTLY `CARRYOVER_TOTAL_BLOCH` (the larger
-    /// row is the measured largest address, 3,546,175,400 BLCH). Digest is a
+    /// Two-row fixture summing to EXACTLY `CARRYOVER_TOTAL_BLOCH`. Digest is a
     /// KAT generated with CPython's hashlib.shake_256 — the digest
     /// build_carryover.py would publish for these bytes.
-    // Post-split satoshis (2026-08-12): row `a` is the largest-address G3
-    // measurement under `split_g3_sat` (354,617,540,000,000,000 x 100/21,
-    // truncated), row `b` absorbs the remainder so the file sums to exactly
-    // `CARRYOVER_TOTAL_BLOCH` — the same close-the-total dust rule the real
-    // builder must state.
+    ///
+    /// **Re-anchored 2026-08-29.** The previous fixture summed to
+    /// 1,797,088,000,000,000,000 sat against the 1,814,640,000,000,000,000 the
+    /// constants pin — 175,520,000 BLCH short, because it was written against
+    /// an earlier snapshot height and never moved when the measured ledger
+    /// did. `build_genesis` is fail-closed on that comparison, so the mismatch
+    /// did not corrupt anything; it took `kat_genesis()` down and with it 18
+    /// tests that had nothing to do with the carryover, which is how one stale
+    /// literal turns into a red suite that reads like a broken ceremony.
+    ///
+    /// The two rows are now derived from the constants rather than from a
+    /// remembered measurement, so the fixture cannot drift from them again
+    /// without this comment being wrong on its face:
+    ///
+    /// - row `a` = `LARGEST_CARRYOVER_ADDRESS_BLOCH` (17,046,829,380 BLCH),
+    ///   the measured largest address — 93.94% of the carryover, the same
+    ///   share `BLOCH-TOKENOMICS-V4` §2 reports;
+    /// - row `b` = the remaining 1,099,570,620 BLCH, the other 14 addresses
+    ///   aggregated into one line, which is what makes the file close on
+    ///   `CARRYOVER_TOTAL_BLOCH` exactly.
+    ///
+    /// Two rows, not sixteen: the fixture exercises the parser, the ordering
+    /// rule and the total, none of which need the real cardinality.
     const KAT2_TEXT: &str = concat!(
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\t1688654952380952380\n",
-        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\t108433047619047620\n",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\t1704682938000000000\n",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\t109957062000000000\n",
     );
-    const KAT2_DIGEST: &str = "310669067dedad1c6a33e251cb0f424bdaf7ca2c7aa48331417b639bbc3845ce";
+    const KAT2_DIGEST: &str = "81458de186908646dd4b1daf9e1a6262fbb5d32a424e672b40b4b67ebf84cfdd";
 
     /// The canonical empty-pool artifact — what the (provably empty) mainnet
     /// pool publishes.
@@ -1166,8 +1183,8 @@ mod tests {
         // digest defends): digest must change, so the published digest no
         // longer matches and the build refuses.
         let tampered = KAT2_TEXT
-            .replace("1688654952380952380", "1688654952380952381")
-            .replace("108433047619047620", "108433047619047619");
+            .replace("1704682938000000000", "1704682938000000001")
+            .replace("109957062000000000", "109957061999999999");
         let good = read_carryover(KAT2_TEXT).unwrap();
         let bad = read_carryover(&tampered).unwrap();
         assert_eq!(good.total_sat, bad.total_sat, "fixture must keep the total fixed");
@@ -1235,8 +1252,21 @@ mod tests {
         // Liquidity funds the cohort (§3.3.1): output + bonded stake is the
         // whole bucket.
         assert_eq!(get("liquidity") + g.cohort_stake_sat, sat(5_000_000_000));
-        assert_eq!(v4::VALIDATOR_EMISSION_BLOCH, 43_029_120_000);
-        assert_eq!(v4::CARRYOVER_TOTAL_BLOCH, 17_970_880_000);
+        // Corrigidos 2026-08-29, mesma causa que o KAT: os dois literais
+        // vinham da altura de snapshot anterior. O carryover medido em h39.918
+        // e 18.146.400.000, e a emissao de validadores e o resto do teto —
+        // 100 B menos o carryover menos os 39 B de baldes = 42.853.600.000.
+        // Ficaram vermelhos junto com todo o resto do arquivo, entao a
+        // divergencia nao aparecia como o achado que era. (A tabela §1 do
+        // BLOCH-TOKENOMICS-V4 ainda traz 43.029.120.000 na legenda do grafico
+        // de pizza; a constante e que manda.)
+        assert_eq!(v4::VALIDATOR_EMISSION_BLOCH, 42_853_600_000);
+        assert_eq!(v4::CARRYOVER_TOTAL_BLOCH, 18_146_400_000);
+        assert_eq!(
+            v4::CARRYOVER_TOTAL_BLOCH + v4::VALIDATOR_EMISSION_BLOCH + 39_000_000_000,
+            v4::TOTAL_SUPPLY_BLOCH,
+            "os dois literais acima tem de fechar o teto de 100 B"
+        );
     }
 
     #[test]
@@ -1245,7 +1275,7 @@ mod tests {
         // with any other total (one extra satoshi here) is not the record the
         // constants were balanced around. The ceremony stops — it never
         // scales, pads, or truncates.
-        let text = KAT2_TEXT.replace("108433047619047620", "108433047619047621");
+        let text = KAT2_TEXT.replace("109957062000000000", "109957062000000001");
         let carry = read_carryover(&text).unwrap();
         let digest = carry.digest;
         let err = build(&carry, &addrs(), &test_cohort(), &digest).unwrap_err();
