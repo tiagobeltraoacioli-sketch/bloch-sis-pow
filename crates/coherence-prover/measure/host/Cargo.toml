@@ -1,0 +1,13 @@
+[package]
+name = "coherence-proof-size"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# default-features = false NAO e higiene: com as features default o sp1-sdk
+# arrasta alloy-consensus 0.14, que nao compila contra serde >= 1.0.228.
+sp1-sdk = { version = "=6.5.0", default-features = false, features = ["blocking"] }
+coherence-core = { path = "../../../coherence-core" }
+bincode = "1"
+
+[workspace]

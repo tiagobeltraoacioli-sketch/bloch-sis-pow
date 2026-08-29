@@ -1,0 +1,13 @@
+[package]
+name = "coherence-spend-measure-guest"
+version = "0.1.0"
+edition = "2021"
+
+# Espelho de ../../program/src/main.rs, com as versoes PINADAS que a medicao de
+# 2026-08-29 usou. Vive separado de proposito: a versao de SDK que o projeto
+# adota e decisao em aberto, e este harness nao deve decidi-la por atalho.
+[dependencies]
+sp1-zkvm = "=6.5.0"
+coherence-core = { path = "../../../coherence-core" }
+
+[workspace]
