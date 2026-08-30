@@ -572,6 +572,22 @@ struct Engine {
     rejected: BTreeMap<Vec<u8>, (u64, u64)>,
     /// Total re-offers this node has barred since boot, across all keys.
     rejected_hits: u64,
+    /// Transactions the epoch sweep found spending inputs this chain does not
+    /// have — on ONE sweep. Eviction takes two.
+    ///
+    /// The second strike exists for the chained spend: a transfer paying from
+    /// the output of another transfer still in the mempool points, at this
+    /// instant, at an outpoint the eUTXO set does not have, and becomes
+    /// perfectly valid the moment its parent lands. Evicting on the first
+    /// sweep would kill a legitimate wallet pattern. Surviving one sweep and
+    /// failing the next gives it between one and two epochs (16-32 min) for
+    /// the parent to arrive — generous, because parents land in blocks, not
+    /// in epochs. A transaction that becomes valid again leaves this set.
+    mempool_suspect: BTreeSet<Vec<u8>>,
+    /// Epoch of the last sweep, so it runs once per epoch and not once per
+    /// block. Starts at `u64::MAX` so the first boundary a node crosses
+    /// sweeps, whatever epoch it booted into.
+    mempool_swept_epoch: u64,
     store: Store,
     net: net::Net,
     head_slot: Arc<AtomicU64>,
@@ -1481,6 +1497,129 @@ impl Engine {
     /// answer to — the RPC — can say. The gossip path ignores the result: a
     /// peer is not waiting on a verdict, and a duplicate arriving twice over a
     /// full mesh is the normal case rather than a fault.
+    /// Outpoints a transaction spends, when it spends any.
+    ///
+    /// `None` for everything that is not a transfer: staking messages consume
+    /// no eUTXO today (that is precisely the gap the validator-opening wave
+    /// closes), so "spends nothing" and "spends something absent" must not be
+    /// the same answer — the sweep may only ever judge transactions that
+    /// actually name outpoints.
+    fn spent_outpoints(tx: &PosTransaction) -> Option<Vec<([u8; 32], u32)>> {
+        match tx {
+            PosTransaction::Transfer { inputs, .. } => {
+                Some(inputs.iter().map(|i| (i.txid, i.vout)).collect())
+            }
+            PosTransaction::TransferV2 { inputs, .. } => {
+                Some(inputs.iter().map(|i| (i.txid, i.vout)).collect())
+            }
+            _ => None,
+        }
+    }
+
+    /// Evict mempool transactions that spend outputs this chain does not have.
+    ///
+    /// # Why this exists, and why the proposer's drop loop was not enough
+    ///
+    /// The drop loop is the ONLY path that removed an inapplicable
+    /// transaction, and it runs exactly when this node PROPOSES. A node that
+    /// never proposes therefore never drops anything: its mempool is a
+    /// one-way sink that fills to `MEMPOOL_MAX` and stays there.
+    ///
+    /// That is not hypothetical. Measured on the live fleet, 2026-08-30:
+    /// the two archival nodes and the public RPC node — none of which holds a
+    /// validator key, all three with `proposing block` count of exactly zero —
+    /// were sitting on 63, 63 and **190** transactions (5 MB) while the
+    /// validators around them had drained from 91 to 9 by proposing. The
+    /// public explorer reads one of those observers, so the number the world
+    /// saw was a figure no validator held any more.
+    ///
+    /// The rejection cache (see [`Self::reject_transaction`]) does not help
+    /// them either: it is written by the drop loop, so on an observer it is
+    /// never written at all. This sweep is the half that works without
+    /// proposing.
+    ///
+    /// # What it checks, and what it deliberately does not
+    ///
+    /// Only outpoint existence. That is a lookup per input against committed
+    /// state, and it catches the class that actually accumulates
+    /// (`UnknownInput` — a transfer built against a divergent node's UTXO
+    /// view, or one whose inputs were spent by someone else). It does NOT
+    /// re-run the transition: conservation, signatures and script matching
+    /// stay where they are, because a full answer needs a candidate header
+    /// this path has no reason to build. Two checks, neither trusting the
+    /// other — the same posture `admissible` documents for itself.
+    ///
+    /// Once per epoch, not once per block: every RPC call already competes
+    /// with consensus on this thread, and an observer accumulates over days,
+    /// so 16 minutes of latency costs nothing and 32 sweeps per epoch would
+    /// be waste.
+    fn sweep_mempool(&mut self, epoch: u64) {
+        if self.mempool_swept_epoch == epoch {
+            return;
+        }
+        self.mempool_swept_epoch = epoch;
+
+        let mut evict: Vec<Vec<u8>> = Vec::new();
+        let mut suspect: Vec<Vec<u8>> = Vec::new();
+        let mut cleared: Vec<Vec<u8>> = Vec::new();
+        for (key, tx) in &self.mempool {
+            let Some(outpoints) = Self::spent_outpoints(tx) else {
+                continue;
+            };
+            let missing = outpoints
+                .iter()
+                .any(|(txid, vout)| self.state.utxo(txid, *vout).is_none());
+            if !missing {
+                if self.mempool_suspect.contains(key) {
+                    cleared.push(key.clone());
+                }
+                continue;
+            }
+            if self.mempool_suspect.contains(key) {
+                evict.push(key.clone());
+            } else {
+                suspect.push(key.clone());
+            }
+        }
+
+        for key in cleared {
+            self.mempool_suspect.remove(&key);
+        }
+        for key in suspect {
+            self.mempool_suspect.insert(key);
+        }
+        if evict.is_empty() {
+            return;
+        }
+        let n = evict.len();
+        // The WALL slot, not the head's.
+        //
+        // `is_rejected` is checked against `wall_slot()` on the admission
+        // path, so a bar minted against the committed head is born already
+        // expired on exactly the node this sweep exists for: an observer
+        // catching up sits thousands of slots behind the clock, and
+        // `head + TTL` is then far in the past. Same clock on both sides or
+        // the TTL means nothing. (The proposer's drop loop is not exposed to
+        // this: it bars with the slot it is building for, which IS the wall.)
+        let slot = self.wall_slot();
+        for key in evict {
+            self.mempool.remove(&key);
+            self.mempool_suspect.remove(&key);
+            // Barred as well, and for the same reason the drop loop bars: the
+            // peers still holding it re-offer it, and structural admission
+            // cannot see what this sweep just saw.
+            self.reject_transaction(key, slot);
+        }
+        if self.live {
+            eprintln!(
+                "[epoch {epoch}] mempool sweep: evicted {n} transaction(s) spending outputs \
+                 this chain does not have; {} left, {} barred",
+                self.mempool.len(),
+                self.rejected.len()
+            );
+        }
+    }
+
     /// Bar a transaction the transition refused from coming back, and expire
     /// whatever is due to expire while we are here.
     ///
@@ -1682,6 +1821,10 @@ impl Engine {
                 }
                 let cur_e = epoch_of(self.state.slot());
                 self.pool.retain(|_, a| epoch_of(a.data.slot) >= cur_e);
+                // Once per epoch: drop what can no longer apply. On a
+                // validator this only anticipates the drop loop; on an
+                // observer it is the ONLY thing that ever empties the pool.
+                self.sweep_mempool(cur_e);
 
                 if self.live {
                     if let Err(e) = self.store.append(env) {
@@ -2519,6 +2662,8 @@ pub fn run(cfg: Config) -> io::Result<()> {
         mempool: BTreeMap::new(),
         rejected: BTreeMap::new(),
         rejected_hits: 0,
+        mempool_suspect: BTreeSet::new(),
+        mempool_swept_epoch: u64::MAX,
         store,
         net,
         head_slot,
@@ -4067,6 +4212,8 @@ mod transfer_v2_end_to_end {
             mempool: BTreeMap::new(),
             rejected: BTreeMap::new(),
         rejected_hits: 0,
+        mempool_suspect: BTreeSet::new(),
+        mempool_swept_epoch: u64::MAX,
             store,
             net,
             head_slot,
@@ -4187,6 +4334,155 @@ mod transfer_v2_end_to_end {
         );
         let selected_rpc = rpc_node.select_transactions(epoch_of(rpc_node.wall_slot()));
         assert_eq!(selected_rpc, vec![tx]);
+    }
+
+    /// **A varredura esta LIGADA no caminho de aplicacao.**
+    ///
+    /// Os tres testes abaixo chamam `sweep_mempool` diretamente: provam a
+    /// logica e NAO provam a fiacao. Rodei a mutacao — removi a chamada de
+    /// `apply_canonical` — e os tres continuaram verdes. Um teste que nao
+    /// pode ficar vermelho nao esta testando nada, que e literalmente o
+    /// defeito que o arnes `prova` carregou por seis dias.
+    ///
+    /// Dirigir `apply_canonical` daqui exigiria bloco, proponente e cadeia
+    /// RANDAO — o harness disso vive nos testes de integracao. Entao a fiacao
+    /// e presa no fonte, o mesmo idioma dos tripwires de
+    /// `coherence_replay_identity.rs` e de `prova.rs`: e a diferenca entre
+    /// "a funcao funciona" e "a funcao e chamada".
+    #[test]
+    fn the_sweep_is_wired_into_the_apply_path() {
+        let src = include_str!("engine.rs");
+        // A agulha e montada em pedacos: escrita inteira, ela apareceria no
+        // fonte DENTRO deste proprio teste, e o scan casaria consigo mesmo —
+        // um tripwire que nao pode ficar vermelho. Cai nessa duas vezes hoje.
+        let chamada = concat!("self.sweep_", "mempool(cur_e);");
+        assert!(
+            src.contains(chamada),
+            "a chamada de sweep_mempool sumiu de apply_canonical. Sem ela a \
+             varredura e codigo morto e um no observador volta a ser \
+             sorvedouro de mao unica — 190 transacoes num deles em 2026-08-30."
+        );
+        // E na fronteira de epoca, nao a cada bloco: `cur_e` e a epoca, e a
+        // propria funcao retorna cedo se ja varreu nesta epoca.
+        assert!(
+            src.contains(concat!("let cur_e = epoch_of(self.", "state.slot());")),
+            "o argumento da varredura deixou de ser a epoca da cabeca"
+        );
+    }
+
+    /// **A varredura de epoca e a UNICA coisa que limpa um observador.**
+    ///
+    /// O laco de descarte do proponente so roda quando o no propoe. Um no sem
+    /// chave de validador nunca propoe, entao nunca descarta — e o mempool
+    /// dele vira sorvedouro de mao unica ate o teto de 4.096. Medido na frota
+    /// viva em 2026-08-30: dois archivals e o no de RPC publico, todos com
+    /// `proposing block` igual a ZERO, seguravam 63, 63 e 190 transacoes
+    /// enquanto os validadores em volta drenaram de 91 para 9 propondo. O
+    /// explorer publico le um desses observadores, entao o numero que o mundo
+    /// via era um que nenhum validador tinha mais.
+    ///
+    /// E o cache de recusa nao os ajuda: ele e ESCRITO pelo laco de descarte,
+    /// que num observador nunca roda.
+    #[test]
+    fn the_epoch_sweep_evicts_what_can_no_longer_apply() {
+        let (entries, good) = sweep_fixture(16);
+        let mut node = engine_at_wall_epoch(V2_FLAG_DAY + 1, &entries);
+
+        // Uma transacao gastando um outpoint que esta cadeia NAO tem: o txid
+        // do fixture e [0x33; 32], este e outro. Inserida direto no mempool
+        // porque `admissible` conferiria a assinatura — e o que se testa aqui
+        // e o que acontece DEPOIS da admissao.
+        let bad = match good.clone() {
+            PosTransaction::TransferV2 { keys, mut inputs, outputs, tx_bytes, tip_millisat_per_gas } => {
+                for i in inputs.iter_mut() {
+                    i.txid = [0x99u8; 32];
+                }
+                PosTransaction::TransferV2 { keys, inputs, outputs, tx_bytes, tip_millisat_per_gas }
+            }
+            other => other,
+        };
+        let bad_key = bad.canonical_bytes();
+        let good_key = good.canonical_bytes();
+        node.mempool.insert(bad_key.clone(), bad);
+        node.mempool.insert(good_key.clone(), good);
+        assert_eq!(node.mempool.len(), 2);
+
+        // PRIMEIRA varredura: a ruim vira suspeita, ninguem e despejado. O
+        // segundo tempo existe para o gasto encadeado — uma transferencia que
+        // paga da saida de outra ainda no mempool aponta, neste instante,
+        // para um outpoint ausente e fica valida quando a mae entra.
+        node.sweep_mempool(10);
+        assert_eq!(
+            node.mempool.len(),
+            2,
+            "a primeira varredura NAO pode despejar: seria matar gasto encadeado"
+        );
+        assert!(node.mempool_suspect.contains(&bad_key), "a ruim tem que ficar suspeita");
+        assert!(!node.mempool_suspect.contains(&good_key), "a boa nao pode ficar suspeita");
+
+        // A varredura roda UMA VEZ POR EPOCA: repetir a mesma epoca e no-op.
+        node.sweep_mempool(10);
+        assert_eq!(node.mempool.len(), 2, "duas chamadas na mesma epoca sao uma varredura");
+
+        // SEGUNDA epoca: agora despeja, e barra.
+        node.sweep_mempool(11);
+        assert_eq!(node.mempool.len(), 1, "a ruim tem que sair na segunda varredura");
+        assert!(node.mempool.contains_key(&good_key), "a boa tem que permanecer");
+        assert!(
+            node.is_rejected(&bad_key, node.wall_slot()).is_some(),
+            "despejar sem barrar e enxugar gelo: os pares reoferecem"
+        );
+    }
+
+    /// **Uma transacao que volta a ser valida sai da suspeita.** O caso do
+    /// gasto encadeado, do outro lado: a mae entrou, o outpoint existe, e a
+    /// filha nao pode carregar a marca para a varredura seguinte.
+    #[test]
+    fn becoming_valid_again_clears_the_suspicion() {
+        let (entries, good) = sweep_fixture(16);
+        let mut node = engine_at_wall_epoch(V2_FLAG_DAY + 1, &entries);
+        let key = good.canonical_bytes();
+        node.mempool.insert(key.clone(), good);
+
+        // Marcada a mao, como se uma varredura anterior a tivesse reprovado
+        // enquanto a mae ainda nao tinha entrado.
+        node.mempool_suspect.insert(key.clone());
+        node.sweep_mempool(20);
+
+        assert!(
+            !node.mempool_suspect.contains(&key),
+            "os inputs existem: a marca tem que ser apagada, senao a proxima \
+             varredura despeja uma transacao perfeitamente valida"
+        );
+        assert_eq!(node.mempool.len(), 1);
+    }
+
+    /// Mensagens que nao gastam eUTXO nao sao julgadas pela varredura.
+    ///
+    /// Hoje `Deposit` e `Delegate` nao consomem output nenhum — e exatamente a
+    /// lacuna que a onda de abertura fecha. Ate la, "nao gasta nada" e "gasta
+    /// algo ausente" precisam ser respostas diferentes, ou a varredura despeja
+    /// staking por engano.
+    #[test]
+    fn the_sweep_does_not_judge_transactions_that_spend_nothing() {
+        let (entries, _) = sweep_fixture(16);
+        let mut node = engine_at_wall_epoch(V2_FLAG_DAY + 1, &entries);
+        let dep = PosTransaction::Deposit {
+            pubkey: vec![0x77; 32],
+            amount_sat: 25_000 * 100_000_000,
+            randao_commitment: [0x78; 32],
+            withdrawal_credentials: vec![0x79; 32],
+            commission_bps: 0,
+        };
+        node.mempool.insert(dep.canonical_bytes(), dep);
+        node.sweep_mempool(30);
+        node.sweep_mempool(31);
+        assert_eq!(
+            node.mempool.len(),
+            1,
+            "uma mensagem que nao nomeia outpoint nenhum nao pode ser despejada \
+             por 'gastar algo ausente'"
+        );
     }
 
     /// **A transição diz QUAL transação, e o laço tem que acreditar nela.**
@@ -4575,6 +4871,8 @@ mod perf_support {
             mempool: BTreeMap::new(),
             rejected: BTreeMap::new(),
         rejected_hits: 0,
+        mempool_suspect: BTreeSet::new(),
+        mempool_swept_epoch: u64::MAX,
             store,
             net,
             head_slot,
@@ -5862,6 +6160,8 @@ mod duty_view_anchor {
             mempool: BTreeMap::new(),
             rejected: BTreeMap::new(),
         rejected_hits: 0,
+        mempool_suspect: BTreeSet::new(),
+        mempool_swept_epoch: u64::MAX,
             store,
             net,
             head_slot,
