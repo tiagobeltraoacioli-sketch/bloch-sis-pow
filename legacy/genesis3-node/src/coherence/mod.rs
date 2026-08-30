@@ -33,6 +33,10 @@ pub enum TxError {
     UnknownAnchor,
     DuplicateNullifierInTx([u8; 32]),
     DoubleSpend([u8; 32]),
+    /// output_ciphertexts is not one well-formed NoteCiphertext per output
+    /// commitment (index-aligned). Without this structural precondition a
+    /// block could carry outputs whose recipients can never discover them.
+    MalformedCiphertexts,
     ProofInvalid,
     /// Reorg wants to disconnect a block older than the bounded undo horizon —
     /// the caller must rebuild the shielded state from the canonical chain.
@@ -85,6 +89,12 @@ impl ShieldedState {
     {
         if !self.knows_anchor(&tx.anchor) {
             return Err(TxError::UnknownAnchor);
+        }
+        // Structural precondition (analogous to check_spend's C2 count binds):
+        // exactly one well-formed note ciphertext per output commitment, so
+        // every accepted output is discoverable by its recipient.
+        if !tx.ciphertexts_well_formed() {
+            return Err(TxError::MalformedCiphertexts);
         }
         let mut seen = HashSet::new();
         for nf in &tx.nullifiers {
@@ -351,8 +361,18 @@ impl ShieldedPool {
 mod tests {
     use super::*;
 
+    /// One structurally well-formed (all-zero) note ciphertext per output —
+    /// validate() enforces ciphertexts_well_formed() as a precondition.
+    fn dummy_cts(n: usize) -> Vec<NoteCiphertext> {
+        (0..n).map(|_| NoteCiphertext {
+            kem_ct: vec![0u8; NOTE_KEM_CT_LEN],
+            nonce: [0u8; NOTE_AEAD_NONCE_LEN],
+            payload: vec![0u8; NOTE_PLAINTEXT_LEN + NOTE_AEAD_TAG_LEN],
+        }).collect()
+    }
+
     fn dummy_tx(anchor: [u8; 32], nfs: Vec<[u8; 32]>) -> ShieldedTx {
-        ShieldedTx { anchor, nullifiers: nfs, outputs: vec![], fee: 0, proof: vec![1], binding_sig: vec![] }
+        ShieldedTx { anchor, nullifiers: nfs, outputs: vec![], output_ciphertexts: vec![], fee: 0, proof: vec![1], binding_sig: vec![] }
     }
 
     #[test]
@@ -378,7 +398,30 @@ mod tests {
     }
 
     fn tx_with(anchor: [u8; 32], nfs: Vec<[u8; 32]>, outs: Vec<[u8; 32]>) -> ShieldedTx {
-        ShieldedTx { anchor, nullifiers: nfs, outputs: outs, fee: 0, proof: vec![1], binding_sig: vec![] }
+        let cts = dummy_cts(outs.len());
+        ShieldedTx { anchor, nullifiers: nfs, outputs: outs, output_ciphertexts: cts, fee: 0, proof: vec![1], binding_sig: vec![] }
+    }
+
+    #[test]
+    fn validate_rejects_missing_or_malformed_output_ciphertexts() {
+        let mut st = ShieldedState::new();
+        let anchor = [0x66u8; 32];
+        st.record_anchor(anchor);
+        let ok = |_p: &SpendPublic, _pf: &[u8]| true;
+
+        // One output, zero ciphertexts → recipient could never discover it.
+        let mut no_ct = tx_with(anchor, vec![[1u8; 32]], vec![[2u8; 32]]);
+        no_ct.output_ciphertexts.clear();
+        assert_eq!(st.validate(&no_ct, ok), Err(TxError::MalformedCiphertexts));
+
+        // Wrong-length kem_ct → structurally malformed.
+        let mut short = tx_with(anchor, vec![[1u8; 32]], vec![[2u8; 32]]);
+        short.output_ciphertexts[0].kem_ct.pop();
+        assert_eq!(st.validate(&short, ok), Err(TxError::MalformedCiphertexts));
+
+        // Count-matched, well-formed → passes the structural gate.
+        let good = tx_with(anchor, vec![[1u8; 32]], vec![[2u8; 32]]);
+        assert_eq!(st.validate(&good, ok), Ok(()));
     }
 
     #[test]
@@ -465,7 +508,8 @@ mod tests {
     // Proof verification is SP1/FRI in production; the engine tests mock it to
     // exercise the CONSENSUS logic (anchors, nullifiers, tree, atomicity).
     fn tx(anchor: [u8; 32], nfs: Vec<[u8; 32]>, outs: Vec<[u8; 32]>) -> ShieldedTx {
-        ShieldedTx { anchor, nullifiers: nfs, outputs: outs, fee: 0, proof: vec![1], binding_sig: vec![] }
+        let cts = dummy_cts(outs.len());
+        ShieldedTx { anchor, nullifiers: nfs, outputs: outs, output_ciphertexts: cts, fee: 0, proof: vec![1], binding_sig: vec![] }
     }
 
     #[test]

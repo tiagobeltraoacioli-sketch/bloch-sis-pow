@@ -32,7 +32,14 @@ impl Rng {
 }
 
 fn tx(anchor: [u8; 32], nfs: Vec<[u8; 32]>, outs: Vec<[u8; 32]>) -> ShieldedTx {
-    ShieldedTx { anchor, nullifiers: nfs, outputs: outs, fee: 0, proof: vec![1], binding_sig: vec![] }
+    // One structurally well-formed (all-zero) note ciphertext per output —
+    // validate() enforces ciphertexts_well_formed() as a precondition.
+    let cts = outs.iter().map(|_| bloch::coherence::NoteCiphertext {
+        kem_ct: vec![0u8; bloch::coherence::NOTE_KEM_CT_LEN],
+        nonce: [0u8; bloch::coherence::NOTE_AEAD_NONCE_LEN],
+        payload: vec![0u8; bloch::coherence::NOTE_PLAINTEXT_LEN + bloch::coherence::NOTE_AEAD_TAG_LEN],
+    }).collect();
+    ShieldedTx { anchor, nullifiers: nfs, outputs: outs, output_ciphertexts: cts, fee: 0, proof: vec![1], binding_sig: vec![] }
 }
 
 /// A fixed nullifier pool so the random stream forces real reuse/double-spends.

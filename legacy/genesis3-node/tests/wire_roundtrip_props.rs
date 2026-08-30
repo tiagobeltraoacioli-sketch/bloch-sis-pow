@@ -6,7 +6,10 @@
 //! splitmix64 PRNG — no external randomness), catching serialization drift the
 //! fixed-example tests miss.
 
-use bloch::coherence::ShieldedTx;
+use bloch::coherence::{
+    NoteCiphertext, ShieldedTx,
+    NOTE_AEAD_NONCE_LEN, NOTE_AEAD_TAG_LEN, NOTE_KEM_CT_LEN, NOTE_PLAINTEXT_LEN,
+};
 use bloch::core::{Block, BlockHeader, Transaction, TxInput, TxOutput};
 
 /// Deterministic PRNG (splitmix64) — reproducible, no wall-clock/random deps.
@@ -58,7 +61,18 @@ fn rand_shielded(r: &mut Rng) -> ShieldedTx {
     let proof = r.bytes(proof_len);
     let sig_len = r.range(64);
     let binding_sig = r.bytes(sig_len);
-    ShieldedTx { anchor, nullifiers, outputs, fee, proof, binding_sig }
+    // One note ciphertext per output; the wire parser enforces the exact
+    // ML-KEM-1024 / AEAD component lengths, so only lengths are fixed here.
+    let output_ciphertexts: Vec<NoteCiphertext> = (0..n_out).map(|_| {
+        let mut nonce = [0u8; NOTE_AEAD_NONCE_LEN];
+        for b in nonce.iter_mut() { *b = r.next() as u8; }
+        NoteCiphertext {
+            kem_ct: r.bytes(NOTE_KEM_CT_LEN),
+            nonce,
+            payload: r.bytes(NOTE_PLAINTEXT_LEN + NOTE_AEAD_TAG_LEN),
+        }
+    }).collect();
+    ShieldedTx { anchor, nullifiers, outputs, output_ciphertexts, fee, proof, binding_sig }
 }
 
 #[test]

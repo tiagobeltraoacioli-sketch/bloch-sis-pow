@@ -24,7 +24,10 @@ use std::fs;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 
-use bloch::coherence::ShieldedTx;
+use bloch::coherence::{
+    NoteCiphertext, ShieldedTx,
+    NOTE_AEAD_NONCE_LEN, NOTE_AEAD_TAG_LEN, NOTE_KEM_CT_LEN, NOTE_PLAINTEXT_LEN,
+};
 use bloch::core::{Block, BlockHeader, Transaction, TxInput, TxOutput};
 use bloch::mempool::Mempool;
 use bloch::network::{NetworkMessage, SyncEntry};
@@ -98,10 +101,24 @@ fn rand_tx(r: &mut Rng) -> Transaction {
 }
 
 fn rand_shielded(r: &mut Rng) -> ShieldedTx {
+    let outputs: Vec<[u8; 32]> = (0..r.range(3)).map(|_| r.arr32()).collect();
+    // Length-exact per-output note ciphertexts: read_shielded_tx enforces the
+    // ML-KEM-1024 / AEAD component lengths, so the VALID corpus must use them
+    // (malformed lengths are exercised by the mutation pass over these bytes).
+    let output_ciphertexts: Vec<NoteCiphertext> = outputs.iter().map(|_| {
+        let mut nonce = [0u8; NOTE_AEAD_NONCE_LEN];
+        for b in nonce.iter_mut() { *b = r.next() as u8; }
+        NoteCiphertext {
+            kem_ct: r.bytes(NOTE_KEM_CT_LEN),
+            nonce,
+            payload: r.bytes(NOTE_PLAINTEXT_LEN + NOTE_AEAD_TAG_LEN),
+        }
+    }).collect();
     ShieldedTx {
         anchor: r.arr32(),
         nullifiers: (0..r.range(3)).map(|_| r.arr32()).collect(),
-        outputs: (0..r.range(3)).map(|_| r.arr32()).collect(),
+        outputs,
+        output_ciphertexts,
         fee: r.next() % 1_000_000,
         proof: r.bytes_rand(0, 120),
         binding_sig: r.bytes_rand(0, 64),

@@ -1159,6 +1159,18 @@ fn write_shielded_tx(out: &mut Vec<u8>, tx: &coherence_core::ShieldedTx) {
     for nf in &tx.nullifiers { out.extend_from_slice(nf); }
     write_varint(out, tx.outputs.len() as u64);
     for o in &tx.outputs { out.extend_from_slice(o); }
+    // Per-output note ciphertexts (ML-KEM-1024 + AEAD), index-aligned with
+    // `outputs`. Kept adjacent to the outputs they decrypt. Committed into the
+    // block body merkle root for free via body_merkle_root() hashing these
+    // bytes.
+    write_varint(out, tx.output_ciphertexts.len() as u64);
+    for ct in &tx.output_ciphertexts {
+        write_varint(out, ct.kem_ct.len() as u64);
+        out.extend_from_slice(&ct.kem_ct);
+        out.extend_from_slice(&ct.nonce);
+        write_varint(out, ct.payload.len() as u64);
+        out.extend_from_slice(&ct.payload);
+    }
     out.extend_from_slice(&tx.fee.to_le_bytes());
     write_varint(out, tx.proof.len() as u64);
     out.extend_from_slice(&tx.proof);
@@ -1176,6 +1188,26 @@ fn read_shielded_tx(cur: &mut Cursor<&[u8]>) -> Result<coherence_core::ShieldedT
     if out_n > 100_000 { return Err(format!("implausible output count {}", out_n)); }
     let mut outputs = Vec::with_capacity(out_n.min(1024) as usize);
     for _ in 0..out_n { outputs.push(read_32(cur)?); }
+    let ct_n = read_varint(cur)?;
+    if ct_n > 100_000 { return Err(format!("implausible ciphertext count {}", ct_n)); }
+    let mut output_ciphertexts = Vec::with_capacity(ct_n.min(1024) as usize);
+    for _ in 0..ct_n {
+        let kem_len = read_varint(cur)?;
+        if kem_len as usize != coherence_core::NOTE_KEM_CT_LEN {
+            return Err(format!("implausible kem_ct length {}", kem_len));
+        }
+        let kem_ct = read_bytes(cur, kem_len as usize)?;
+        let mut nonce = [0u8; coherence_core::NOTE_AEAD_NONCE_LEN];
+        cur.read_exact(&mut nonce).map_err(|_| "nonce EOF".to_string())?;
+        let payload_len = read_varint(cur)?;
+        if payload_len as usize
+            != coherence_core::NOTE_PLAINTEXT_LEN + coherence_core::NOTE_AEAD_TAG_LEN
+        {
+            return Err(format!("implausible note payload length {}", payload_len));
+        }
+        let payload = read_bytes(cur, payload_len as usize)?;
+        output_ciphertexts.push(coherence_core::NoteCiphertext { kem_ct, nonce, payload });
+    }
     let fee = read_u64_le(cur)?;
     let proof_len = read_varint(cur)?;
     if proof_len > 8_000_000 { return Err(format!("implausible proof length {}", proof_len)); }
@@ -1183,7 +1215,9 @@ fn read_shielded_tx(cur: &mut Cursor<&[u8]>) -> Result<coherence_core::ShieldedT
     let sig_len = read_varint(cur)?;
     if sig_len > 100_000 { return Err(format!("implausible binding_sig length {}", sig_len)); }
     let binding_sig = read_bytes(cur, sig_len as usize)?;
-    Ok(coherence_core::ShieldedTx { anchor, nullifiers, outputs, fee, proof, binding_sig })
+    Ok(coherence_core::ShieldedTx {
+        anchor, nullifiers, outputs, output_ciphertexts, fee, proof, binding_sig,
+    })
 }
 
 // ────────────────────────────────────────────────────────────────────────────
