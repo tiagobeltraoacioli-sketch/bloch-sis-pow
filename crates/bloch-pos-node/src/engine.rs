@@ -157,6 +157,33 @@ const NO_TXS: [PosTransaction; 0] = [];
 /// (fees, per-sender limits, eviction by price) is `gossip.rs` work.
 const MEMPOOL_MAX: usize = 4_096;
 
+/// How long a transaction the proposer's drop loop refused stays barred from
+/// re-admission, in slots. 128 slots is four epochs (~64 min at 30 s slots).
+///
+/// **Why a ban expires instead of being permanent.** The refusal that sends a
+/// transaction here is the transition's, and not every one of those is a
+/// property of the transaction alone. `UnknownInput` in particular is a
+/// statement about the state at ONE moment: a transfer that spends the output
+/// of another transfer still in the mempool is refused today and applies
+/// perfectly once its parent lands. Barring it forever would turn a chained
+/// spend — a legitimate thing a wallet does — into a coin that can never be
+/// moved, and the node would give no sign. A ban that lapses costs such a
+/// transaction a delay; a ban that does not costs it everything.
+///
+/// Four epochs is chosen against what the ban has to outlive: the gossip that
+/// keeps re-offering the transaction. It must be long enough that the mesh
+/// stops handing it back before the door reopens, and short enough that a
+/// wrongly-barred chained spend is not stuck past a user's patience.
+const REJECTION_TTL_SLOTS: u64 = 128;
+
+/// Cap on the rejection cache, so remembering refusals cannot itself become
+/// the memory exhaustion it prevents. Same order as [`MEMPOOL_MAX`], because
+/// the cache can hold at most what passed through the mempool.
+///
+/// At the cap the entry expiring SOONEST is evicted first: it is the one whose
+/// door was about to reopen anyway, so the eviction costs the least protection.
+const REJECTION_MAX: usize = 4_096;
+
 /// Transactions a proposal will carry at most, independent of the consensus
 /// byte cap it is also checked against.
 const MAX_TXS_PER_BLOCK: usize = 256;
@@ -514,6 +541,25 @@ struct Engine {
     /// public network needs all four; `gossip.rs` in the pure crate is where
     /// that belongs and it is still not wired.
     mempool: BTreeMap<Vec<u8>, PosTransaction>,
+    /// Transactions the proposer's drop loop refused, keyed exactly like
+    /// [`Self::mempool`] and mapping to the slot the bar lifts at.
+    ///
+    /// Without this, dropping a refused transaction from the mempool does not
+    /// remove it from the NETWORK: the peers still holding it re-offer it, the
+    /// thin structural admission check lets it back in, and the next proposal
+    /// drops it again. Measured on the live chain 2026-08-30 — a node cleared
+    /// its mempool to 0 while proposing at slot 47,878 and was holding 21 of
+    /// the same transactions 383 slots later. The mempool self-cleans; the
+    /// fleet-wide population does not converge. This is what makes the removal
+    /// stick, and it is why the ban is checked BEFORE the re-broadcast: a node
+    /// that knows better must stop amplifying.
+    ///
+    /// It is deliberately node-local and unsigned. Nothing here is gossiped —
+    /// a refusal one node reached is not evidence another must accept, and a
+    /// shared ban list is a censorship channel that needs a threat model this
+    /// does not have. Each node learns from its own proposals, and convergence
+    /// is the fleet arriving at the same answer separately.
+    rejected: BTreeMap<Vec<u8>, u64>,
     store: Store,
     net: net::Net,
     head_slot: Arc<AtomicU64>,
@@ -565,6 +611,14 @@ enum Refusal {
     AtCapacity,
     /// `admissible` refused it on its merits. Retrying is pointless.
     Invalid(&'static str),
+    /// This node's own proposer already tried to build a block with it and the
+    /// transition refused. Distinct from `Invalid`, and the difference is not
+    /// cosmetic: `Invalid` is a verdict on the bytes, which no passage of time
+    /// changes, while this is a verdict on the bytes AGAINST A STATE — it can
+    /// stop being true, so the bar lifts on its own after
+    /// [`REJECTION_TTL_SLOTS`]. Carries the slot it lifts at, so a caller with
+    /// someone to answer to can say when to try again.
+    PreviouslyRefused { until_slot: u64 },
 }
 
 impl Refusal {
@@ -574,6 +628,9 @@ impl Refusal {
         match self {
             Refusal::AtCapacity => "mempool is at capacity",
             Refusal::Invalid(why) => why,
+            Refusal::PreviouslyRefused { .. } => {
+                "this node's proposer already had the transition refuse this transaction"
+            }
         }
     }
 }
@@ -1078,7 +1135,17 @@ impl Engine {
                     );
                     // Out of the mempool too, or the next proposer inherits the
                     // same halt this loop just avoided.
-                    self.mempool.remove(&bad.canonical_bytes());
+                    //
+                    // And barred from returning: removal alone is not enough,
+                    // because the peers that still hold it re-offer it and the
+                    // structural admission check has no way to see what the
+                    // transition just saw. Without the bar the node cleans
+                    // itself and refills — observed on the live chain, mempool
+                    // 0 at slot 47,878 and 21 of the same transactions back
+                    // 383 slots later.
+                    let bad_key = bad.canonical_bytes();
+                    self.mempool.remove(&bad_key);
+                    self.reject_transaction(bad_key, slot);
                 }
             }
         };
@@ -1348,10 +1415,54 @@ impl Engine {
     /// answer to — the RPC — can say. The gossip path ignores the result: a
     /// peer is not waiting on a verdict, and a duplicate arriving twice over a
     /// full mesh is the normal case rather than a fault.
+    /// Bar a transaction the transition refused from coming back, and expire
+    /// whatever is due to expire while we are here.
+    ///
+    /// Purging lazily on write rather than on a timer keeps the cache free of
+    /// its own upkeep loop: nothing has to run for entries to lapse, they are
+    /// simply not honoured past their slot (see [`Self::is_rejected`]), and
+    /// this call reclaims the space. A node that stops proposing therefore
+    /// stops growing this, which is the correct shape — it also stops learning.
+    fn reject_transaction(&mut self, key: Vec<u8>, slot: u64) {
+        self.rejected.retain(|_, until| *until > slot);
+        while self.rejected.len() >= REJECTION_MAX {
+            // Evict the soonest to lapse: it is the entry closest to being
+            // worthless anyway. `BTreeMap` is ordered by KEY, not by value, so
+            // the minimum has to be found rather than popped.
+            let Some(victim) = self
+                .rejected
+                .iter()
+                .min_by_key(|(_, until)| **until)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            self.rejected.remove(&victim);
+        }
+        self.rejected.insert(key, slot.saturating_add(REJECTION_TTL_SLOTS));
+    }
+
+    /// Whether `key` is barred as of `slot`, without mutating anything.
+    ///
+    /// Reads the expiry rather than assuming the purge has run, so a stale
+    /// entry can never bar a transaction one slot longer than it should.
+    fn is_rejected(&self, key: &[u8], slot: u64) -> Option<u64> {
+        self.rejected.get(key).copied().filter(|until| *until > slot)
+    }
+
     fn on_transaction(&mut self, tx: PosTransaction) -> Result<Admitted, Refusal> {
         let key = tx.canonical_bytes();
         if self.mempool.contains_key(&key) {
             return Ok(Admitted::Duplicate);
+        }
+        // Before capacity, and before the structural check: a transaction this
+        // node's own proposer already watched the transition refuse must not
+        // take a mempool slot, and must not be re-broadcast. Ahead of the
+        // capacity test on purpose — otherwise a mempool filled by refused
+        // transactions answers `AtCapacity`, which tells the sender to retry
+        // and is exactly the wrong advice.
+        if let Some(until_slot) = self.is_rejected(&key, self.wall_slot()) {
+            return Err(Refusal::PreviouslyRefused { until_slot });
         }
         if self.mempool.len() >= MEMPOOL_MAX {
             return Err(Refusal::AtCapacity);
@@ -2097,6 +2208,17 @@ impl Engine {
                          the transaction was not judged invalid"
                     ),
                 )),
+                Err(Refusal::PreviouslyRefused { until_slot }) => Err(RpcError::new(
+                    rpc::TX_REFUSED,
+                    format!(
+                        "this node's proposer already had the transition refuse this \
+                         transaction, so it is barred until slot {until_slot}. The usual \
+                         cause is that it spends an output this chain does not have — \
+                         either it was built against a node on a different branch, or its \
+                         parent transaction has not landed yet. If the parent is still \
+                         pending, resubmit after it confirms."
+                    ),
+                )),
                 Err(Refusal::Invalid(why)) => Err(RpcError::new(
                     rpc::TX_REFUSED,
                     format!("{why} — this transaction cannot be admitted; retrying \
@@ -2298,6 +2420,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         att_pool: AttestationPool::new(),
         wall_slot: 0,
         mempool: BTreeMap::new(),
+        rejected: BTreeMap::new(),
         store,
         net,
         head_slot,
@@ -3844,6 +3967,7 @@ mod transfer_v2_end_to_end {
             att_pool: AttestationPool::new(),
             wall_slot: 0,
             mempool: BTreeMap::new(),
+            rejected: BTreeMap::new(),
             store,
             net,
             head_slot,
@@ -3964,6 +4088,139 @@ mod transfer_v2_end_to_end {
         );
         let selected_rpc = rpc_node.select_transactions(epoch_of(rpc_node.wall_slot()));
         assert_eq!(selected_rpc, vec![tx]);
+    }
+
+    /// **The bar is what makes the drop stick.** Removing a refused
+    /// transaction from the mempool does not remove it from the network: the
+    /// peers still holding it re-offer it, and the structural admission check
+    /// cannot see what the transition saw. Measured on the live chain
+    /// 2026-08-30 — a node proposed at slot 47,878 with `mempool 0` in the
+    /// same log line, and was holding 21 of the same transactions 383 slots
+    /// later.
+    ///
+    /// Mutation: delete the `is_rejected` arm from `on_transaction` and this
+    /// test goes red on the second assertion — the transaction walks straight
+    /// back in, which is the pre-2026-08-30 behaviour.
+    #[test]
+    fn a_refused_transaction_does_not_come_back_through_gossip() {
+        let (entries, tx) = sweep_fixture(16);
+        let mut node = engine_at_wall_epoch(V2_FLAG_DAY + 1, &entries);
+        let key = tx.canonical_bytes();
+
+        assert_eq!(
+            node.on_transaction(tx.clone()),
+            Ok(Admitted::New),
+            "control: the fixture must be admissible before anything bars it"
+        );
+
+        // Exactly what the proposer's drop loop does when the transition
+        // refuses: out of the mempool, and barred.
+        let slot = node.wall_slot();
+        node.mempool.remove(&key);
+        node.reject_transaction(key.clone(), slot);
+
+        match node.on_transaction(tx.clone()) {
+            Err(Refusal::PreviouslyRefused { until_slot }) => assert_eq!(
+                until_slot,
+                slot + REJECTION_TTL_SLOTS,
+                "the bar must lift exactly REJECTION_TTL_SLOTS after the refusal"
+            ),
+            other => panic!("a barred transaction must not be re-admitted: {other:?}"),
+        }
+        assert!(
+            node.mempool.is_empty(),
+            "a barred transaction must not take a mempool slot"
+        );
+    }
+
+    /// **And the bar lifts.** `UnknownInput` — the refusal that sends almost
+    /// everything here — is a verdict against a STATE, not against the bytes:
+    /// a transfer spending a parent still in the mempool is refused now and
+    /// applies once the parent lands. A permanent bar would make a chained
+    /// spend an unspendable coin, silently.
+    ///
+    /// The clock is real here (`wall_slot()` reads the manifest against the
+    /// system clock), so the expiry is exercised by barring at a slot far
+    /// behind the wall rather than by winding the wall forward.
+    #[test]
+    fn the_bar_lifts_after_the_ttl() {
+        let (entries, tx) = sweep_fixture(16);
+        let mut node = engine_at_wall_epoch(V2_FLAG_DAY + 1, &entries);
+        let key = tx.canonical_bytes();
+        let now = node.wall_slot();
+        assert!(
+            now > REJECTION_TTL_SLOTS,
+            "harness: the wall slot must be past the TTL for this test to mean anything"
+        );
+
+        node.reject_transaction(key.clone(), 0); // lapses at slot REJECTION_TTL_SLOTS
+        assert_eq!(
+            node.is_rejected(&key, now),
+            None,
+            "a bar whose slot has passed must not be honoured"
+        );
+        assert_eq!(
+            node.on_transaction(tx),
+            Ok(Admitted::New),
+            "once the bar lapses the transaction must be admissible again"
+        );
+    }
+
+    /// **Remembering refusals must not become the exhaustion it prevents.**
+    /// The cache is capped, and the entry evicted is the one expiring soonest
+    /// — the one closest to worthless anyway.
+    #[test]
+    fn the_rejection_cache_is_bounded() {
+        let (entries, tx) = sweep_fixture(16);
+        let mut node = engine_at_wall_epoch(V2_FLAG_DAY + 1, &entries);
+        let now = node.wall_slot();
+        for i in 0..(REJECTION_MAX as u64 + 64) {
+            // Distinct keys, increasing expiry, so eviction has a defined order.
+            node.reject_transaction(i.to_le_bytes().to_vec(), now + i);
+        }
+        assert!(
+            node.rejected.len() <= REJECTION_MAX,
+            "the cache grew past its cap: {} entries",
+            node.rejected.len()
+        );
+        assert_eq!(
+            node.is_rejected(&0u64.to_le_bytes().to_vec(), now),
+            None,
+            "the earliest-expiring entry must be the one evicted"
+        );
+        assert!(
+            node.is_rejected(&(REJECTION_MAX as u64 + 63).to_le_bytes().to_vec(), now)
+                .is_some(),
+            "the most recent bar must survive the eviction"
+        );
+        // The mempool fixture is untouched by any of this.
+        assert_eq!(node.on_transaction(tx), Ok(Admitted::New));
+    }
+
+    /// **The bar answers before capacity, and the order is the message.** A
+    /// mempool filled to `MEMPOOL_MAX` answering `AtCapacity` tells the sender
+    /// to retry later; for a transaction this node has already watched the
+    /// transition refuse, that is precisely the wrong advice, and it invites
+    /// the retry loop that keeps the population alive.
+    #[test]
+    fn the_bar_is_answered_before_capacity() {
+        let (entries, tx) = sweep_fixture(16);
+        let mut node = engine_at_wall_epoch(V2_FLAG_DAY + 1, &entries);
+        let key = tx.canonical_bytes();
+        let slot = node.wall_slot();
+        node.reject_transaction(key, slot);
+        // Fill to the cap with anything: the point is which check speaks first.
+        for i in 0..MEMPOOL_MAX as u64 {
+            node.mempool.insert(i.to_le_bytes().to_vec(), tx.clone());
+        }
+        assert!(node.mempool.len() >= MEMPOOL_MAX, "harness: the mempool must be full");
+        assert!(
+            matches!(
+                node.on_transaction(tx),
+                Err(Refusal::PreviouslyRefused { .. })
+            ),
+            "a barred transaction must be told it is barred, never told to retry"
+        );
     }
 
     /// (d): before the flag day NOTHING changes — this is the photograph of
@@ -4136,6 +4393,7 @@ mod perf_support {
             att_pool: AttestationPool::new(),
             wall_slot: 0,
             mempool: BTreeMap::new(),
+            rejected: BTreeMap::new(),
             store,
             net,
             head_slot,
@@ -5421,6 +5679,7 @@ mod duty_view_anchor {
             att_pool: AttestationPool::new(),
             wall_slot: 0,
             mempool: BTreeMap::new(),
+            rejected: BTreeMap::new(),
             store,
             net,
             head_slot,
