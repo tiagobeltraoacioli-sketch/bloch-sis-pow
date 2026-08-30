@@ -542,7 +542,16 @@ struct Engine {
     /// that belongs and it is still not wired.
     mempool: BTreeMap<Vec<u8>, PosTransaction>,
     /// Transactions the proposer's drop loop refused, keyed exactly like
-    /// [`Self::mempool`] and mapping to the slot the bar lifts at.
+    /// [`Self::mempool`] and mapping to `(slot the bar lifts at, times it has
+    /// barred a re-offer)`.
+    ///
+    /// The counter exists because the first version of this was UNMEASURABLE
+    /// in production: the gossip path discards `on_transaction`'s result on
+    /// purpose ("a peer is not waiting on a verdict"), so a bar left no trace
+    /// anywhere — no line, no counter, no RPC — and "is the cache working?"
+    /// could only be answered by inference from mempool sizes. In a repo whose
+    /// rule is that a proof you cannot re-run is a claim, that was the wrong
+    /// thing to ship.
     ///
     /// Without this, dropping a refused transaction from the mempool does not
     /// remove it from the NETWORK: the peers still holding it re-offer it, the
@@ -559,7 +568,9 @@ struct Engine {
     /// shared ban list is a censorship channel that needs a threat model this
     /// does not have. Each node learns from its own proposals, and convergence
     /// is the fleet arriving at the same answer separately.
-    rejected: BTreeMap<Vec<u8>, u64>,
+    rejected: BTreeMap<Vec<u8>, (u64, u64)>,
+    /// Total re-offers this node has barred since boot, across all keys.
+    rejected_hits: u64,
     store: Store,
     net: net::Net,
     head_slot: Arc<AtomicU64>,
@@ -1450,7 +1461,7 @@ impl Engine {
     /// this call reclaims the space. A node that stops proposing therefore
     /// stops growing this, which is the correct shape — it also stops learning.
     fn reject_transaction(&mut self, key: Vec<u8>, slot: u64) {
-        self.rejected.retain(|_, until| *until > slot);
+        self.rejected.retain(|_, (until, _)| *until > slot);
         while self.rejected.len() >= REJECTION_MAX {
             // Evict the soonest to lapse: it is the entry closest to being
             // worthless anyway. `BTreeMap` is ordered by KEY, not by value, so
@@ -1458,14 +1469,14 @@ impl Engine {
             let Some(victim) = self
                 .rejected
                 .iter()
-                .min_by_key(|(_, until)| **until)
+                .min_by_key(|(_, (until, _))| *until)
                 .map(|(k, _)| k.clone())
             else {
                 break;
             };
             self.rejected.remove(&victim);
         }
-        self.rejected.insert(key, slot.saturating_add(REJECTION_TTL_SLOTS));
+        self.rejected.insert(key, (slot.saturating_add(REJECTION_TTL_SLOTS), 0));
     }
 
     /// Whether `key` is barred as of `slot`, without mutating anything.
@@ -1473,7 +1484,35 @@ impl Engine {
     /// Reads the expiry rather than assuming the purge has run, so a stale
     /// entry can never bar a transaction one slot longer than it should.
     fn is_rejected(&self, key: &[u8], slot: u64) -> Option<u64> {
-        self.rejected.get(key).copied().filter(|until| *until > slot)
+        self.rejected.get(key).map(|(until, _)| *until).filter(|until| *until > slot)
+    }
+
+    /// Record that a bar just refused a re-offer, and say so ONCE per
+    /// transaction.
+    ///
+    /// Once, not every time: the gossip mesh re-offers, and this node's log
+    /// already carries 18,912 lines of `attestation REJECTED: NotInCommittee`
+    /// — a message that repeats is a message nobody reads. The first refusal
+    /// per key is the event worth seeing (it proves the bar met a real
+    /// re-offer, which is the whole claim); the rest is a number, and the
+    /// number is `rejected_hits`, readable from outside through
+    /// `getmempoolinfo` so measuring the cache needs no shell on the box.
+    fn note_bar(&mut self, key: &[u8], until_slot: u64) {
+        self.rejected_hits = self.rejected_hits.saturating_add(1);
+        let first = match self.rejected.get_mut(key) {
+            Some((_, hits)) => {
+                *hits = hits.saturating_add(1);
+                *hits == 1
+            }
+            None => false,
+        };
+        if first && self.live {
+            eprintln!(
+                "barred a re-offered transaction the transition had refused \
+                 (bar lifts at slot {until_slot}); total barred since boot: {}",
+                self.rejected_hits
+            );
+        }
     }
 
     fn on_transaction(&mut self, tx: PosTransaction) -> Result<Admitted, Refusal> {
@@ -1488,6 +1527,7 @@ impl Engine {
         // transactions answers `AtCapacity`, which tells the sender to retry
         // and is exactly the wrong advice.
         if let Some(until_slot) = self.is_rejected(&key, self.wall_slot()) {
+            self.note_bar(&key, until_slot);
             return Err(Refusal::PreviouslyRefused { until_slot });
         }
         if self.mempool.len() >= MEMPOOL_MAX {
@@ -2320,6 +2360,8 @@ impl Engine {
                 MEMPOOL_MAX,
                 self.mempool.keys().map(Vec::len).sum(),
                 self.state.next_base_fee(),
+                self.rejected.len(),
+                self.rejected_hits,
             )),
         }
     }
@@ -2510,6 +2552,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         wall_slot: 0,
         mempool: BTreeMap::new(),
         rejected: BTreeMap::new(),
+        rejected_hits: 0,
         store,
         net,
         head_slot,
@@ -4057,6 +4100,7 @@ mod transfer_v2_end_to_end {
             wall_slot: 0,
             mempool: BTreeMap::new(),
             rejected: BTreeMap::new(),
+        rejected_hits: 0,
             store,
             net,
             head_slot,
@@ -4219,6 +4263,55 @@ mod transfer_v2_end_to_end {
         assert!(
             node.mempool.is_empty(),
             "a barred transaction must not take a mempool slot"
+        );
+    }
+
+    /// **A barra tem que ser mensuravel de fora.** A primeira versao deste
+    /// cache nao era: o caminho de gossip descarta o resultado de
+    /// `on_transaction` de proposito, entao barrar nao deixava rastro nenhum e
+    /// "o cache esta funcionando?" so podia ser respondido por inferencia
+    /// sobre o tamanho do mempool. Num repo cujo lema e que prova que ninguem
+    /// pode rodar de novo e alegacao, isso era a coisa errada de embarcar.
+    ///
+    /// `barred` e `barred_hits` respondem perguntas diferentes: quantas
+    /// transacoes o no esta se recusando a readmitir, e quantas reofertas ele
+    /// de fato ja recusou. Cache com entradas e zero hits nao esta barrando
+    /// nada real — distincao que o tamanho do mempool sozinho nao faz.
+    #[test]
+    fn the_bar_is_counted_so_it_can_be_measured_from_outside() {
+        let (entries, tx) = sweep_fixture(16);
+        let mut node = engine_at_wall_epoch(V2_FLAG_DAY + 1, &entries);
+        let key = tx.canonical_bytes();
+        let slot = node.wall_slot();
+
+        node.reject_transaction(key.clone(), slot);
+        assert_eq!(node.rejected.len(), 1, "uma entrada no cache");
+        assert_eq!(node.rejected_hits, 0, "entrada nova ainda nao barrou nada");
+
+        // Tres reofertas pelo gossip, como a malha faz.
+        for _ in 0..3 {
+            assert!(matches!(
+                node.on_transaction(tx.clone()),
+                Err(Refusal::PreviouslyRefused { .. })
+            ));
+        }
+        assert_eq!(node.rejected_hits, 3, "as tres reofertas tem que ser contadas");
+        assert_eq!(
+            node.rejected.get(&key).map(|(_, hits)| *hits),
+            Some(3),
+            "e contadas TAMBEM por chave, que e o que decide se a linha de log sai uma vez so"
+        );
+
+        // E o RPC precisa dizer isso sem ninguem ter chave da caixa.
+        let out = node.serve_rpc(RpcRequest::MempoolInfo).expect("mempoolinfo responde");
+        let json = out.to_string();
+        assert!(
+            json.contains("\"barred\":1"),
+            "getmempoolinfo tem que expor o tamanho do cache: {json}"
+        );
+        assert!(
+            json.contains("\"barred_hits\":3"),
+            "getmempoolinfo tem que expor as reofertas barradas: {json}"
         );
     }
 
@@ -4483,6 +4576,7 @@ mod perf_support {
             wall_slot: 0,
             mempool: BTreeMap::new(),
             rejected: BTreeMap::new(),
+        rejected_hits: 0,
             store,
             net,
             head_slot,
@@ -5769,6 +5863,7 @@ mod duty_view_anchor {
             wall_slot: 0,
             mempool: BTreeMap::new(),
             rejected: BTreeMap::new(),
+        rejected_hits: 0,
             store,
             net,
             head_slot,
