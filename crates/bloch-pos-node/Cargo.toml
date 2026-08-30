@@ -76,6 +76,16 @@ tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
 futures = "0.3"
 async-trait = "0.1"
 
+# Test-only. The Coherence merge-gate suite (tests/coherence_*.rs, the
+# DEV-15 wave gate) drives the C1-frozen pool primitives directly — the
+# accumulator, the nullifier set, and the LE64(position) nullifier binding —
+# to prove reorg/crash byte-identity for the pool the wave is wiring in.
+# A dev-dependency on purpose: nothing in the shipped binary may link the
+# pool until the epochal gate exists, and keeping it out of [dependencies]
+# is what makes that a build-graph fact rather than a review comment.
+[dev-dependencies]
+coherence-core = { path = "../coherence-core" }
+
 # Same vendored fork the root workspace patches in (root Cargo.toml
 # [patch.crates-io]): bloch-crypto calls `with_seeded_rng`, which only exists
 # in the vendored pqcrypto-internals 0.2.11 fork. A standalone workspace does
