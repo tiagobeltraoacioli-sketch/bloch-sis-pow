@@ -366,6 +366,36 @@ pub enum TransitionError {
     /// and `BadSignature` in particular are the two facts an operator must be
     /// able to read off a divergence without a debugger.
     Transfer(u32, TransferReject),
+    /// An unshield names more value than the committed shielded-pool total —
+    /// the Coherence turnstile (2026-08-29, the Zcash-2019 lesson made a
+    /// consensus rule).
+    ///
+    /// This is defence in depth **outside the proof system**: the shielded
+    /// pool hides individual values behind commitments and nullifiers, so a
+    /// soundness failure in the proof stack (a bug in the circuit, the
+    /// verifier, or the SP1 toolchain) would let a "valid" proof unshield
+    /// coins that were never shielded — minting transparent value from
+    /// nothing, through the cap's blind spot: shield/unshield move existing
+    /// coins and never touch `issued_sat`, so `SupplyCapExceeded` cannot see
+    /// it. The transition therefore keeps its own committed count of the
+    /// value inside the pool (`TAG_SHIELDED_POOL`) and refuses, by integer
+    /// comparison alone, any unshield the pool cannot cover — no matter what
+    /// the proof says.
+    ShieldedPoolUnderflow,
+    /// The committed shielded-pool total exceeds the committed issued supply
+    /// (`shielded_pool_sat > issued_sat`) — a state no honest history can
+    /// produce, since every satoshi in the pool entered it as already-issued
+    /// transparent value.
+    ///
+    /// Same posture as [`Self::SupplyCapExceeded`], one layer in: unreachable
+    /// through the transition's own arithmetic (shielding more than the
+    /// issued supply is refused at the seam), it fires on a supplied
+    /// pre-state — a forged snapshot, a corrupted state-sync payload — that
+    /// already claims a pool bigger than everything ever minted. Refusing to
+    /// build on such a state is what chains the turnstile to the hard cap:
+    /// `pool <= issued <= TOTAL_SUPPLY_SAT`, both inequalities enforced by
+    /// the transition, neither by the prover.
+    ShieldedPoolExceedsIssued,
 }
 
 /// Why a value transfer was refused by the state transition.

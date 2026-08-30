@@ -1662,3 +1662,103 @@ fn out_of_slot_attestations_are_dropped_not_counted_absent() {
     // E o denominador continua sendo o conjunto ativo INTEIRO.
     assert_eq!(out.active_set.len(), 200);
 }
+
+// ── The Coherence turnstile is chained to the hard cap (2026-08-29) ─────────
+//
+// A soundness failure in the shielded pool's proof stack (circuit, verifier
+// or SP1 toolchain) would let a "valid" proof unshield value that was never
+// shielded — minting transparent coins through the cap's blind spot, because
+// shield/unshield move existing coins and never advance `issued_sat`, so
+// `SupplyCapExceeded` cannot fire. The turnstile is the committed counter
+// (`TAG_SHIELDED_POOL`) plus two integer rules the TRANSITION enforces with
+// no proof in sight: `pool >= 0` (checked subtraction on every unshield) and
+// `pool <= issued` (checked at the entrance and against every pre-state).
+// Chained with the hard-cap invariant `issued <= TOTAL_SUPPLY_SAT`, the pool
+// can never hold — and therefore never release — more than the supply,
+// whatever the prover claims. This test exercises that chain through the
+// public seam alone: no proof object exists anywhere in it, which is the
+// point.
+
+#[test]
+fn shielded_pool_total_never_exceeds_the_issued_supply_or_the_cap() {
+    use bloch_pos_committee::interfaces::TransitionError;
+    use bloch_pos_committee::state_root::EvmCommitment;
+    use bloch_pos_committee::tokenomics_v4 as tk;
+    use bloch_pos_committee::{
+        BlockHeaderV4, BlockId, CommittedState, GenesisValidator, VERSION_G4,
+    };
+
+    let header = BlockHeaderV4 {
+        version: VERSION_G4,
+        parent: [0u8; 32],
+        state_root: [0u8; 32],
+        body_root: [0u8; 32],
+        slot: 0,
+        proposer_index: 0,
+        randao_reveal: [0u8; 32],
+        randao_mix: [0u8; 32],
+        justified_root: [0u8; 32],
+        finalized_root: [0u8; 32],
+        attestation_root: [0u8; 32],
+        coherence_root: [0u8; 32],
+    };
+    let vals = [GenesisValidator {
+        index: 0,
+        pubkey: vec![0xAB; 8],
+        staked_sat: 200_000 * tk::SAT_PER_BLOCH,
+        randao_commitment: [0xAA; 32],
+        withdrawal_credentials: vec![0xEF; 4],
+        commission_bps: 500,
+    }];
+    let mut st = CommittedState::genesis(
+        BlockId::of(&header),
+        [7u8; 32],
+        &vals,
+        &[],
+        [0x11; 32],
+        [0x22; 32],
+        [0x33; 32],
+        EvmCommitment {
+            account_root: [0u8; 32],
+            receipts_root: [0u8; 32],
+            gas_used: 0,
+            base_fee_per_gas: 0,
+        },
+        &[],
+    );
+
+    // The pool opens empty, and `pool >= 0` holds before anything else: the
+    // first satoshi out is refused with no proof consulted — apply_unshield
+    // has no proof parameter to present.
+    assert_eq!(st.shielded_pool_sat(), 0);
+    assert_eq!(st.apply_unshield(1).unwrap_err(), TransitionError::ShieldedPoolUnderflow);
+
+    let issued = tk::GENESIS_ISSUED_SAT;
+    // Everything ever issued can be shielded; one satoshi more cannot. This
+    // is the link to the cap: pool <= issued, and issued <= TOTAL_SUPPLY_SAT
+    // is the hard-cap invariant the transition enforces at 3c.
+    st.apply_shield(issued).unwrap();
+    assert_eq!(st.apply_shield(1).unwrap_err(), TransitionError::ShieldedPoolExceedsIssued);
+    assert!(st.shielded_pool_sat() <= issued);
+    assert!(issued <= tk::TOTAL_SUPPLY_SAT, "the chain's right link");
+    st.apply_unshield(issued).unwrap();
+
+    // An adversarial interleaving of shields and unshields — some accepted,
+    // some refused — can never drive the counter above the issued supply nor
+    // below zero. Deterministic splitmix-style walk, no randomness in CI.
+    let mut x: u128 = 0x9E37_79B9_7F4A_7C15;
+    for _ in 0..1_000 {
+        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let v = x % (issued / 3 + 1);
+        if x & 1 == 0 {
+            let _ = st.apply_shield(v);
+        } else {
+            let _ = st.apply_unshield(v);
+        }
+        assert!(
+            st.shielded_pool_sat() <= issued,
+            "the turnstile let the pool outgrow the issued supply"
+        );
+    }
+    assert!(issued <= tk::TOTAL_SUPPLY_SAT);
+}
