@@ -446,11 +446,17 @@ fn getutxos_lists_the_outputs_and_reports_truncation() {
 
 #[test]
 fn getmempoolinfo_reports_size_capacity_and_the_next_price() {
-    let v = mempool_info_json(7, 4_096, 1_750, 1_000);
+    let v = mempool_info_json(7, 4_096, 1_750, 1_000, 12, 34);
     assert_eq!(v.get("size").unwrap().as_u64(), Some(7));
     assert_eq!(v.get("max").unwrap().as_u64(), Some(4_096));
     assert_eq!(v.get("bytes").unwrap().as_u64(), Some(1_750));
     assert_eq!(v.get("next_base_fee_millisat_per_gas").unwrap().as_str(), Some("1000"));
+    // O cache de recusa, de fora (2026-08-30). Duas perguntas diferentes:
+    // quantas transacoes o no se recusa a readmitir, e quantas reofertas ele
+    // ja recusou de fato. Cache com entradas e zero hits nao esta barrando
+    // nada real.
+    assert_eq!(v.get("barred").unwrap().as_u64(), Some(12));
+    assert_eq!(v.get("barred_hits").unwrap().as_u64(), Some(34));
 }
 
 #[test]

@@ -1565,12 +1565,23 @@ pub fn mempool_info_json(
     max: usize,
     bytes: usize,
     next_base_fee_millisat_per_gas: u128,
+    barred: usize,
+    barred_hits: u64,
 ) -> Json {
     Json::obj(vec![
         ("size", Json::u(size as u64)),
         ("max", Json::u(max as u64)),
         ("bytes", Json::u(bytes as u64)),
         ("next_base_fee_millisat_per_gas", Json::sat(next_base_fee_millisat_per_gas)),
+        // The rejection cache, from outside. Two numbers and they answer
+        // different questions: `barred` is how many transactions this node is
+        // currently refusing to re-admit, `barred_hits` is how many re-offers
+        // it has actually turned away since boot. A cache with entries and
+        // zero hits is barring nothing real — the distinction the mempool size
+        // alone cannot make, and the reason measuring this needed an RPC
+        // rather than a log line on a box someone has to hold a key for.
+        ("barred", Json::u(barred as u64)),
+        ("barred_hits", Json::u(barred_hits)),
     ])
 }
 
