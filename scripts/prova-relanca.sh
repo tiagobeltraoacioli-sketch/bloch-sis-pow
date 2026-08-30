@@ -34,10 +34,15 @@
 #
 # Each scenario has a partner test that flips the code back to the BROKEN
 # behaviour and asserts the scenario's conclusion fails. The switches are
-# `AtomicBool`s under `#[cfg(test)]` (the `params::rehearsal::MUTATE_SEED`
-# idiom), so they cannot exist in a shipped binary:
+# thread-local flags under `#[cfg(test)]` (the `params::rehearsal` idiom), so
+# they cannot exist in a shipped binary, and each one lives in the SAME file
+# as the rule it mutates — a switch that models production elsewhere is a
+# second definition of the rule, and it is the second definition nobody
+# updates (that is exactly how this harness went blind for six days):
 #
-#   crates/bloch-pos-committee/src/prova.rs      mutation::PRE_FIX_FILTER
+#   crates/bloch-pos-committee/src/params.rs     rehearsal::RESTORE_ZERO_STAKE_FILTER
+#                                                (prova.rs re-exports it as
+#                                                 mutation::PRE_FIX_FILTER)
 #   crates/bloch-pos-committee/src/finality.rs   tests_hook::IGNORE_LEAK_IN_DENOMINATOR
 #   crates/bloch-pos-committee/src/params.rs     rehearsal::MUTATE_SEED
 #
@@ -90,7 +95,7 @@ MANIFEST=$(cat <<'EOF'
 1. leak accumulator|finality::tests::the_leak_ledger_shrinks_only_under_a_governed_rule|proof|one accrual site; any recovery rule is named and switchable
 1. leak accumulator|finality::tests::the_leak_ledger_is_committed_but_never_restored|proof|LATENT FINDING: committed as LeakRecord, never read back
 1. leak accumulator|finality::tests::the_leak_only_ever_grows|proof|behavioural: leak is monotonic. EXPECT THIS TO GO RED at pmo/leak-zero integration (2f477fa2 adds a recovery rule); it is that branch's test to update, not this one's
-0. model fidelity|prova::tests::the_model_of_the_fix_is_the_production_shuffle|proof|the modelled fix IS the production shuffle, bit for bit
+0. model fidelity|prova::tests::the_mutation_switch_is_the_production_filter|proof|the mutation switch reaches the production partition: inert on a healthy roster, bites on one zero-stake validator
 0. model fidelity|prova::tests::the_leak_mirror_is_the_production_arithmetic|proof|the mirrored leak arithmetic still matches transition.rs
 2. S1 disease|prova::tests::s1_disease_two_nodes_diverge_and_the_chain_never_finalizes_again|proof|two nodes with different zero-sets diverge; the fleet is consumed
 2. S2 cure|prova::tests::s2_cure_the_same_divergent_nodes_converge_from_the_same_state|proof|the SAME divergent ledgers converge under the contract
@@ -105,9 +110,9 @@ MANIFEST=$(cat <<'EOF'
 5. false quorum|finality::tests::without_the_leak_in_the_denominator_the_minority_never_finalizes|mutation|removing the leak from the denominator stops it
 6. roster split (Dev A)|finality::tests::a_single_fully_leaked_validator_makes_the_two_rosters_partition_differently|proof|one zero-stake validator splits the two rosters
 6. roster split (Dev A)|finality::tests::the_only_guard_on_the_roster_split_is_absent_from_a_release_build|proof|the debug_assert guard is compiled out of the shipped profile
+6. roster split (Dev A)|prova::tests::production_membership_is_leak_invariant|proof|production epoch_committees is leak-invariant (was the PENDING gate; landed b0300409)
 7. flag day|transition::tests::leaked_roster_armed_epoch_matches_the_runbook|proof|LEAKED_ROSTER_ACTIVATION_EPOCH is still 1400
 7. flag day|transition::tests::consensus_roster_matches_duty_roster_before_the_flag_day|proof|the gate is closed, so the rosters are the same today
-8. pending|prova::tests::pending_dev_a_production_membership_is_leak_invariant|pending|PENDING Dev A: production epoch_committees must be leak-invariant
 EOF
 )
 
@@ -141,29 +146,26 @@ echo "-> one cargo run, through $CARGO_LOCK (it blocks until the lock frees)"
 echo
 
 RAW="$(mktemp -t prova-relanca)"
-RAW2="$(mktemp -t prova-relanca-pending)"
 RUNNER="$(mktemp -t prova-relanca-run)"
 KEEP_DIR="${PROVA_KEEP_DIR:-$ROOT/.prova-runs}"
 mkdir -p "$KEEP_DIR"
 keep_evidence() {
   cp "$RAW"  "$KEEP_DIR/last-events.json"  2>/dev/null
-  cp "$RAW2" "$KEEP_DIR/last-pending.json" 2>/dev/null
   cp "$RAW.err" "$KEEP_DIR/last-stderr.log" 2>/dev/null
-  rm -f "$RAW" "$RAW2" "$RAW.err" "$RUNNER"
+  rm -f "$RAW" "$RAW.err" "$RUNNER"
 }
 trap keep_evidence EXIT
 
-# The pending gate is `#[ignore]`d, so it needs its own selector.
-PENDING_TEST="prova::tests::pending_dev_a_production_membership_is_leak_invariant"
-
-# TWO test-binary runs, ONE build, ONE lock acquisition.
+# ONE test-binary run, ONE build, ONE lock acquisition.
 #
-# The first version of this ran everything with `--include-ignored` so the
-# pending gate would be picked up in a single pass. That was wrong and cost a
-# 15-minute hold on the shared cargo lock: `--include-ignored` on this crate
-# also drags in every ignored perf and scale benchmark (the preservation
-# manifest budgets THREE HOURS for the equivalent workspace run). The pending
-# gate is one test and is selected by exact name instead.
+# There used to be a second pass, `--ignored --exact`, for the one gate that
+# was `#[ignore]`d pending Dev A's fix. That fix landed (b0300409), the gate
+# was promoted to a normal test on 2026-08-30, and the second pass went with
+# it. Do NOT reach for `--include-ignored` if another pending gate appears:
+# on this crate it also drags in every ignored perf and scale benchmark (the
+# preservation manifest budgets THREE HOURS for the equivalent workspace run)
+# and it once cost a 15-minute hold on the shared cargo lock. Select the one
+# test by exact name.
 #
 # --show-output, because libtest only puts stdout in the JSON for FAILING
 # tests without it — and the measured numbers each scenario prints are the
@@ -171,15 +173,17 @@ PENDING_TEST="prova::tests::pending_dev_a_production_membership_is_leak_invarian
 #
 # JSON, so a test that never RAN is distinguishable from one that passed —
 # which is the failure mode this whole file exists to prevent.
-# --test-threads 1, because the mutation switches are process globals.
+# --test-threads 1, for a stable, readable event order — NOT for switch
+# safety. The mutation switches are thread-local (params::rehearsal::TlFlag),
+# and one test thread means one shared thread-local, so a switch left set by a
+# panicking test would leak into every later test. `prova.rs` guards against
+# that with an RAII `Mutated` that restores on drop, panic path included.
 cat > "$RUNNER" <<RUNNER_EOF
 #!/bin/sh
 cd "$ROOT" || exit 1
 export RUSTC_BOOTSTRAP=1
 cargo test -p bloch-pos-committee --lib -- \
     --test-threads 1 --show-output -Z unstable-options --format json > "$RAW" 2> "$RAW.err"
-cargo test -p bloch-pos-committee --lib -- --ignored --exact "$PENDING_TEST" \
-    --test-threads 1 --show-output -Z unstable-options --format json > "$RAW2" 2>> "$RAW.err"
 RUNNER_EOF
 chmod +x "$RUNNER"
 
@@ -200,15 +204,13 @@ if ! grep -q '"type": *"test"' "$RAW" 2>/dev/null; then
   exit 2
 fi
 
-PROVA_RAW="$RAW" PROVA_RAW2="$RAW2" PROVA_MANIFEST="$MANIFEST" python3 - <<'PYEOF'
+PROVA_RAW="$RAW" PROVA_MANIFEST="$MANIFEST" python3 - <<'PYEOF'
 import json, os, sys
 
 raw = open(os.environ["PROVA_RAW"], encoding="utf-8", errors="replace").read()
-# The pending gate runs in its own pass (see the script above); its events are
-# appended so the manifest is resolved against BOTH passes.
-p2 = os.environ.get("PROVA_RAW2", "")
-if p2 and os.path.exists(p2):
-    raw += "\n" + open(p2, encoding="utf-8", errors="replace").read()
+# One pass. A gate that a future branch has to `#[ignore]` needs its own
+# `--ignored --exact` selector and its events merged here again — see the
+# note on --include-ignored above before adding one.
 results, outputs = {}, {}
 for line in raw.splitlines():
     line = line.strip()

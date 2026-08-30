@@ -34,13 +34,17 @@
 //!
 //! Dev A's fix removes the pre-shuffle filter, making committee membership a
 //! pure function of `(seed, epoch, index set)` — **leak-invariant by
-//! construction**. Until that lands, [`partition_step8`] models the fixed
-//! behaviour by calling the *real* [`crate::committees::epoch_committees`]
-//! with the roster's stakes normalised to 1. That is not an approximation:
-//! `effective_stake` is read in exactly one place in that function, the
-//! filter, so normalising the stakes and deleting the filter produce the same
-//! eligible set and therefore the same shuffle, byte for byte. The fidelity is
-//! itself asserted, in [`tests::the_model_of_the_fix_is_the_production_shuffle`].
+//! construction**. It LANDED, in `b0300409` (2026-08-24), and this file now
+//! measures it directly: [`partition_step8`] is one unbranched call to the
+//! real [`crate::committees::epoch_committees`], and the defect is put back
+//! by the production mutation switch inside that function, never modelled
+//! here. See [`mutation`] for the six days this file spent measuring nothing
+//! because it modelled the fix instead of reading it.
+//!
+//! The wiring is itself asserted, in
+//! [`tests::the_mutation_switch_is_the_production_filter`] — both halves: the
+//! switch is inert where nobody is at zero stake, and it bites where somebody
+//! is.
 //!
 //! # What is real and what is modelled
 //!
@@ -66,23 +70,74 @@ use std::sync::atomic::Ordering::Relaxed;
 
 // ────────────────────────────── the mutation ────────────────────────────────
 
-/// The mutation switch. `#[cfg(test)]` by virtue of the whole module being
-/// test-only, exactly like [`crate::params::rehearsal`]: it cannot exist in a
-/// shipped binary.
+/// The mutation switch — **the production one**, re-exported, not a second
+/// switch this file owns.
 ///
-/// ON  = the PRE-FIX behaviour: step 8 partitions the leak-applied roster,
-///       whose eligible set is shorter, so it shuffles differently.
+/// ON  = the PRE-FIX behaviour: `epoch_committees` filters `effective_stake >
+///       0` before the shuffle, so the leak-applied roster (which holds
+///       fully-leaked validators at zero) yields a shorter eligible set and a
+///       different Fisher-Yates permutation.
 /// OFF = the contract: membership is a function of the index set alone.
+///
+/// # Why this is a re-export, and what happened when it was not (2026-08-30)
+///
+/// This harness owned a private `AtomicBool` of the same name, and
+/// [`partition_step8`] branched on it: ON returned "today's production
+/// function on today's production input", OFF returned a *model* of the fix
+/// (the same function with stakes normalised to 1). That was accurate on the
+/// branch this file was written on — where the pre-shuffle filter was still
+/// in `epoch_committees` — and it went stale the moment Dev A's fix landed in
+/// `b0300409`. The merge (`bb01991c`) brought the harness in AFTER the fix
+/// without re-running it, so from 2026-08-24 the "broken" branch called a
+/// function that no longer had the defect: both branches computed the same
+/// partition, no mutation could bite, and the five tests that require it to
+/// bite were RED on the trunk for six days.
+///
+/// The lesson is not "re-run the suite after a merge" — that is true and
+/// insufficient. It is that a mutation switch modelling production is a
+/// SECOND definition of the rule, and the second definition is the one nobody
+/// updates. There is now exactly one: `epoch_committees` reads
+/// [`crate::params::rehearsal::RESTORE_ZERO_STAKE_FILTER`] through
+/// `committees::mutation_restores_zero_stake_filter`, and this name IS that
+/// static. A future change to the production filter cannot leave this harness
+/// measuring something else, because there is nothing else to measure.
+///
+/// Thread-local (see [`crate::params::rehearsal::TlFlag`]), so flipping it
+/// cannot mutate the rule under the ~260 other tests running in parallel.
 pub mod mutation {
-    use std::sync::atomic::AtomicBool;
-    /// Restore the pre-shuffle stake filter to step 8's roster.
-    pub static PRE_FIX_FILTER: AtomicBool = AtomicBool::new(false);
+    pub use crate::params::rehearsal::RESTORE_ZERO_STAKE_FILTER as PRE_FIX_FILTER;
 }
 
-/// Serialises every test that touches the process-global switch. Cargo runs
-/// tests in parallel; a process global read by two scenarios at once would
-/// make the whole harness report noise.
-static HOOK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// Sets the mutation switch and restores it on drop — **including on the
+/// panic path**.
+///
+/// `scripts/prova-relanca.sh` runs this suite with `--test-threads 1`, and
+/// the switch is thread-local, so one test's leaked `true` is every later
+/// test's silent mutation. Every scenario below used to store `false` on the
+/// line after its assertions, which is exactly the placement an assertion
+/// failure skips: one genuine red would have cascaded into a screen of false
+/// reds pointing at the wrong scenarios. Guard instead of discipline.
+struct Mutated(());
+
+impl Mutated {
+    fn on() -> Self {
+        mutation::PRE_FIX_FILTER.store(true, Relaxed);
+        Mutated(())
+    }
+    fn off() -> Self {
+        mutation::PRE_FIX_FILTER.store(false, Relaxed);
+        Mutated(())
+    }
+    fn set(pre_fix: bool) -> Self {
+        if pre_fix { Self::on() } else { Self::off() }
+    }
+}
+
+impl Drop for Mutated {
+    fn drop(&mut self) {
+        mutation::PRE_FIX_FILTER.store(false, Relaxed);
+    }
+}
 
 // ──────────────────────────── the two partitions ────────────────────────────
 
@@ -92,20 +147,11 @@ static HOOK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// `consensus_roster` is the leak-applied roster — the one
 /// `CommittedState::consensus_roster_at` returns once the flag day binds.
 pub fn partition_step8(seed: &[u8; 32], epoch: u64, consensus_roster: &[Validator]) -> Vec<Vec<u32>> {
-    if mutation::PRE_FIX_FILTER.load(Relaxed) {
-        // BROKEN — and this is not a re-implementation of the broken code, it
-        // IS the broken code: today's production function, called on today's
-        // production input.
-        return committees::epoch_committees(seed, epoch, consensus_roster);
-    }
-    // THE CONTRACT (pending Dev A). Same production function, stakes
-    // normalised so the pre-shuffle filter cannot remove anyone — which is
-    // what deleting the filter does. Membership = f(seed, epoch, index set).
-    let by_index: Vec<Validator> = consensus_roster
-        .iter()
-        .map(|v| Validator { index: v.index, effective_stake: 1 })
-        .collect();
-    committees::epoch_committees(seed, epoch, &by_index)
+    // ONE call, and no branch. Which behaviour it exhibits is decided inside
+    // `epoch_committees`, by the same switch every other proof of the roster
+    // unification reads. Before 2026-08-30 this function branched and modelled
+    // the fix itself; see [`mutation`] for what that cost.
+    committees::epoch_committees(seed, epoch, consensus_roster)
 }
 
 /// The partition the **epoch boundary** tallies against. Unconditional: this
@@ -308,28 +354,68 @@ mod tests {
 
     // ═══════════════════════ fidelity of the model ══════════════════════════
 
-    /// **The model of the fix is the production shuffle.**
+    /// **The mutation switch reaches the production partition** — the
+    /// tripwire whose absence let this harness rot for six days.
     ///
-    /// If every validator has stake, the pre-shuffle filter removes nobody, so
-    /// the contract and today's production function must agree *bit for bit*.
-    /// This is what makes [`partition_step8`] a model of the fix rather than a
-    /// convenient invention — and it is also scenario 3's core claim: on a
-    /// healthy network the fix is a no-op.
+    /// Two halves, and the second is the one that matters:
+    ///
+    /// 1. On a roster where nobody is at zero, the two switch states must
+    ///    agree *bit for bit*. The filter removes nobody, so flipping it
+    ///    changes nothing — scenario 3's core claim, and the reason the fix
+    ///    is not a hard fork on a healthy chain.
+    /// 2. On a roster with ONE validator at exactly zero, they must DISAGREE
+    ///    in every epoch. This is what proves the switch still reaches the
+    ///    real `epoch_committees` and still selects a real difference in it.
+    ///
+    /// Half 2 did not exist before 2026-08-30, and its absence is the whole
+    /// story: the old fidelity test asserted only that the harness's model of
+    /// the fix equalled production on a HEALTHY roster — which stayed true
+    /// after Dev A's fix landed and made the model and the "defect" the same
+    /// function. Every scenario kept passing its fidelity gate while every
+    /// mutation silently stopped biting. A fidelity test that only checks the
+    /// case where the mutation does nothing cannot notice the mutation dying.
     #[test]
-    fn the_model_of_the_fix_is_the_production_shuffle() {
-        let _g = HOOK.lock().unwrap_or_else(|e| e.into_inner());
-        mutation::PRE_FIX_FILTER.store(false, Relaxed);
+    fn the_mutation_switch_is_the_production_filter() {
+        // 1. No zero stake: flipping the switch must change nothing.
         let healthy = duty_roster();
         for epoch in 0..8u64 {
+            let with_filter = {
+                let _m = Mutated::on();
+                partition_step8(&SEED, epoch, &healthy)
+            };
             assert_eq!(
+                with_filter,
                 partition_step8(&SEED, epoch, &healthy),
-                committees::epoch_committees(&SEED, epoch, &healthy),
-                "epoch {epoch}: the contract and production disagree on a roster with no \
-                 zero stake. Then the model is not the production shuffle and nothing \
-                 below measures the real function."
+                "epoch {epoch}: the switch changed the partition on a roster with no zero \
+                 stake. The filter has nobody to remove there, so either the switch now \
+                 selects something else or the partition reads stake somewhere new."
             );
         }
-        println!("FIDELITY: on a healthy roster the contract IS the production partition, 8/8 epochs");
+        // 2. One validator at exactly zero: it must change every epoch.
+        let mut planted = duty_roster();
+        planted[7].effective_stake = 0;
+        let mut bit = 0usize;
+        for epoch in 0..8u64 {
+            let with_filter = {
+                let _m = Mutated::on();
+                partition_step8(&SEED, epoch, &planted)
+            };
+            if with_filter != partition_step8(&SEED, epoch, &planted) {
+                bit += 1;
+            }
+        }
+        assert_eq!(
+            bit, 8,
+            "THE SWITCH IS DEAD: with one validator at zero stake it changed the partition \
+             in only {bit} of 8 epochs. Every mutation in this file is then measuring \
+             nothing, and every scenario below is passing for a reason it does not state. \
+             This is exactly the state the harness was in from 2026-08-24 to 2026-08-30."
+        );
+        println!(
+            "FIDELITY: the switch is inert on a healthy roster (8/8 epochs identical) and \
+             bites on one zero-stake validator (8/8 epochs different) — it reaches the \
+             production partition"
+        );
     }
 
     /// The leak arithmetic this file mirrors is still the arithmetic
@@ -384,10 +470,8 @@ mod tests {
     /// have passed a relaunch on a claim the code does not support.
     #[test]
     fn s1_disease_two_nodes_diverge_and_the_chain_never_finalizes_again() {
-        let _g = HOOK.lock().unwrap_or_else(|e| e.into_inner());
-        mutation::PRE_FIX_FILTER.store(true, Relaxed); // the CURRENT behaviour
+        let _m = Mutated::on(); // the PRE-FIX behaviour, restored on drop
         let r = drive_two_nodes();
-        mutation::PRE_FIX_FILTER.store(false, Relaxed);
 
         assert_ne!(
             r.zeros_left, r.zeros_right,
@@ -484,8 +568,7 @@ mod tests {
     /// the same attestations, and justify the same root.
     #[test]
     fn s2_cure_the_same_divergent_nodes_converge_from_the_same_state() {
-        let _g = HOOK.lock().unwrap_or_else(|e| e.into_inner());
-        mutation::PRE_FIX_FILTER.store(false, Relaxed); // the contract
+        let _m = Mutated::off(); // the contract
         let r = drive_two_nodes();
 
         assert_ne!(
@@ -554,10 +637,8 @@ mod tests {
     /// stated as its own scenario and asserted here as a negative.
     #[test]
     fn s2_mutation_restoring_the_pre_fix_filter_breaks_the_cure() {
-        let _g = HOOK.lock().unwrap_or_else(|e| e.into_inner());
-        mutation::PRE_FIX_FILTER.store(true, Relaxed);
+        let _m = Mutated::on();
         let r = drive_two_nodes();
-        mutation::PRE_FIX_FILTER.store(false, Relaxed);
         assert_ne!(
             r.step8_left, r.step8_right,
             "MUTATION DID NOT BITE: with the pre-shuffle filter restored the two nodes still \
@@ -588,7 +669,6 @@ mod tests {
     /// current code and under the contract.
     #[test]
     fn s3_healthy_network_is_identical_under_the_fix() {
-        let _g = HOOK.lock().unwrap_or_else(|e| e.into_inner());
         let (a, fields_a) = healthy_run(true); // pre-fix
         let (b, fields_b) = healthy_run(false); // contract
         assert_eq!(fields_a, fields_b);
@@ -619,14 +699,14 @@ mod tests {
     /// `scripts/prova-relanca.sh` runs both.
     #[test]
     fn s3_mutation_the_comparator_bites_one_zero_stake_validator() {
-        let _g = HOOK.lock().unwrap_or_else(|e| e.into_inner());
         let mut planted = duty_roster();
         planted[7].effective_stake = 0;
         let mut differences = 0usize;
         for epoch in 0..HEALTHY_EPOCHS {
-            mutation::PRE_FIX_FILTER.store(true, Relaxed);
-            let pre = partition_step8(&SEED, epoch, &planted);
-            mutation::PRE_FIX_FILTER.store(false, Relaxed);
+            let pre = {
+                let _m = Mutated::on();
+                partition_step8(&SEED, epoch, &planted)
+            };
             let post = partition_step8(&SEED, epoch, &planted);
             if pre != post {
                 differences += 1;
@@ -666,7 +746,6 @@ mod tests {
     ///    would NOT have got had the balance been inherited.
     #[test]
     fn s4_accrued_leak_plus_the_reset_restore_the_quorum_denominator() {
-        let _g = HOOK.lock().unwrap_or_else(|e| e.into_inner());
         let live: Vec<u32> = (0..34).collect();
         let (stalled, zeros) = build_stalled_ledger(&live);
         let duty = duty_roster();
@@ -684,10 +763,11 @@ mod tests {
         );
 
         // (1) pre-fix.
-        mutation::PRE_FIX_FILTER.store(true, Relaxed);
-        let broken = one_epoch_from(&stalled, &leaked_roster);
+        let broken = {
+            let _m = Mutated::on();
+            one_epoch_from(&stalled, &leaked_roster)
+        };
         // (2) post-fix, from the IDENTICAL state.
-        mutation::PRE_FIX_FILTER.store(false, Relaxed);
         let fixed = one_epoch_from(&stalled, &leaked_roster);
 
         assert_eq!(
@@ -750,13 +830,11 @@ mod tests {
     /// ledger must once again destroy the quorum.
     #[test]
     fn s4_mutation_the_pre_fix_filter_destroys_the_quorum_again() {
-        let _g = HOOK.lock().unwrap_or_else(|e| e.into_inner());
         let live: Vec<u32> = (0..34).collect();
         let (stalled, _) = build_stalled_ledger(&live);
         let leaked_roster = with_leak_applied_mirror(&duty_roster(), &stalled);
-        mutation::PRE_FIX_FILTER.store(true, Relaxed);
+        let _m = Mutated::on();
         let r = one_epoch_from(&stalled, &leaked_roster);
-        mutation::PRE_FIX_FILTER.store(false, Relaxed);
         assert_eq!(
             r.justified, None,
             "MUTATION DID NOT BITE: with the pre-shuffle filter restored, an accrued ledger \
@@ -775,22 +853,23 @@ mod tests {
         );
     }
 
-    // ═════════════════ PENDING DEV A — the contract, on production ═══════════
+    // ═══════════════ DEV A'S CONTRACT, ASSERTED ON PRODUCTION ═══════════════
 
-    /// **This is the test that goes green the day Dev A lands the fix.**
+    /// **The contract, on the production function directly.**
     ///
-    /// Everything above measures the contract through [`partition_step8`].
-    /// This one asserts it of the *production* function directly: with one
-    /// validator at zero stake, `epoch_committees` must still partition the
-    /// full index set.
+    /// With one validator at zero stake, `epoch_committees` must still
+    /// partition the full index set: membership is `(seed, epoch, index set)`
+    /// and stake decides weight only.
     ///
-    /// It is `#[ignore]`d because it is RED on this branch by construction —
-    /// the filter is still there. `scripts/prova-relanca.sh` runs it with
-    /// `--ignored` and reports it as PENDING. When it starts passing, the
-    /// `#[ignore]` comes off and this comment goes with it.
+    /// This was `#[ignore]`d and named `pending_dev_a_…`, red by construction
+    /// while the pre-shuffle filter was still in `committees.rs`. The filter
+    /// went in `b0300409` and this went green — and nobody noticed, because
+    /// `scripts/prova-relanca.sh` reported it as a PENDING gate (its own
+    /// output says "remove the #[ignore] … and move it out of the pending
+    /// section"). Promoted to a normal gate on 2026-08-30, together with the
+    /// mutation rewiring that the same landing had silently broken.
     #[test]
-    #[ignore = "PENDING Dev A: red until the pre-shuffle filter is removed from committees.rs"]
-    fn pending_dev_a_production_membership_is_leak_invariant() {
+    fn production_membership_is_leak_invariant() {
         let healthy = duty_roster();
         let mut leaked = healthy.clone();
         leaked[7].effective_stake = 0;
@@ -965,7 +1044,7 @@ mod tests {
     /// Drive a healthy chain — 64 validators, nobody at zero — and record it.
     /// Returns the records and the number of fields compared.
     fn healthy_run(pre_fix: bool) -> (Vec<HealthyRecord>, usize) {
-        mutation::PRE_FIX_FILTER.store(pre_fix, Relaxed);
+        let _m = Mutated::set(pre_fix);
         let duty = duty_roster();
         let mut st = FinalityState::new(genesis());
         let mut out = Vec::new();
@@ -998,7 +1077,6 @@ mod tests {
                 leaked_total: st.leaked_total(),
             });
         }
-        mutation::PRE_FIX_FILTER.store(false, Relaxed);
         let fields = out.len() * 7;
         (out, fields)
     }
