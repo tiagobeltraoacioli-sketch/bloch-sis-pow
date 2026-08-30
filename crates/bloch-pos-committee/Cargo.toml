@@ -20,6 +20,15 @@ perf-timing = []
 
 [dependencies]
 sha3 = { version = "0.10", default-features = false }
+# NEW EDGE IN THE CONSENSUS DEPENDENCY GRAPH (Coherence wave, 2026-08-29).
+# This crate did not depend on coherence-core before: the shielded-pool roots
+# were carried as opaque values (§6.6.1 "carried, never recomputed"). Putting
+# the pool STATE inside `CommittedState` (transition.rs::CoherencePoolState)
+# makes the consensus crate hold — and, after the COHERENCE_ACTIVATION_EPOCH
+# flag day, derive roots from — the pool's accumulator frontier and nullifier
+# SMT, whose single source of truth is coherence-core (shared with the SP1
+# guest and the wallet). Deliberate and visible, not incidental.
+coherence-core = { path = "../coherence-core" }
 
 [dev-dependencies]
 hex = "0.4"

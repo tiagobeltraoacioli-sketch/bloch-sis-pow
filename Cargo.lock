@@ -1550,6 +1550,7 @@ dependencies = [
 name = "bloch-pos-committee"
 version = "0.1.0"
 dependencies = [
+ "coherence-core",
  "hex",
  "sha3 0.10.9",
 ]
@@ -1561,6 +1562,7 @@ dependencies = [
  "async-trait",
  "bloch-crypto",
  "bloch-pos-committee",
+ "coherence-core",
  "futures",
  "libp2p",
  "sha3 0.10.9",

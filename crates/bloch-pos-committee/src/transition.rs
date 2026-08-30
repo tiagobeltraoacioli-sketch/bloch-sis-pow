@@ -1133,10 +1133,50 @@ pub struct CommittedState {
     /// `close_epoch` alone — a boundary is not a block and moves no price.
     block_gas_used: u64,
     block_tx_bytes: u64,
-    /// Carried roots (§6.6.2): never recomputed by this transition.
+    /// Carried roots (§6.6.2): never recomputed by this transition **before
+    /// [`crate::params::COHERENCE_ACTIVATION_EPOCH`]**. The two Coherence
+    /// fields hold whatever genesis stamped — `[0u8; 32]` sentinels on the
+    /// live chain — and are committed verbatim while the gate is closed. From
+    /// the flag day on, the committed Coherence roots come from
+    /// [`Self::coherence_pool`] instead and these two fields are dead weight
+    /// carried for history (see [`committed_coherence_roots_at`]).
     taint_root: [u8; 32],
     coherence_accumulator_root: [u8; 32],
     coherence_nullifier_root: [u8; 32],
+    /// The Coherence shielded-pool STATE (Coherence wave, 2026-08-29): the
+    /// accumulator frontier + leaf count and the nullifier SMT — everything
+    /// the next shielded application needs and nothing it does not.
+    ///
+    /// **Why the pool state lives here.** Genesis-4 reorgs are
+    /// replay-of-state (`engine.rs::do_reorg` refolds from a kept pre-state
+    /// clone; `REORG_STATE_WINDOW`), never undo. With the pool inside the
+    /// state, reorg-correctness of the shielded ledger falls out of the pure
+    /// fold for free — no `disconnect_block` port from Genesis-3, no second
+    /// durable write to keep atomic with `blocks.log`: the fsynced log IS the
+    /// batch, and the pool is a projection of the same durable object.
+    ///
+    /// **What stays out.** The full commitment-leaf vector: it is a witness
+    /// service for wallets, reconstructible from block bodies, therefore a
+    /// node-side index — the exact §5.5 cannot-be-reconstructed bar
+    /// (`state_root.rs` module docs) says it does not belong in committed
+    /// state. The frontier + count is the reconstruction-critical residue:
+    /// a node syncing by state root cannot rebuild it from headers.
+    ///
+    /// **Inert until the flag day.** Pre-activation this field must stay
+    /// empty (no path in this crate mutates it yet — application is the
+    /// shielded-tx wave's seam) and the committed roots remain the carried
+    /// sentinels above, so every historical block replays byte-identically.
+    ///
+    /// **Clone cost is a consensus-liveness concern**, not a nicety:
+    /// `compute_post_state` starts from `pre.clone()` on every block, so the
+    /// pool uses fixed-size (`Frontier`, ≈1 KB memcpy) and structurally
+    /// shared (`NullifierSmt`, O(1) Arc clone) forms — never an O(pool) Vec.
+    ///
+    /// **Coordination seam (DEV-8):** if the pool-balance ratchet leaf enters
+    /// committed state, its home is a field beside this one plus its own SMT
+    /// leaf — deliberately NOT added here, so the ratchet's semantics arrive
+    /// with their owner rather than as an uncommitted stub.
+    coherence_pool: CoherencePoolState,
     /// L1 EVM execution commitment, carried (`BLOCH-L1-EVM-STATE-MODEL.md`).
     /// The node's execution layer computes it; this transition only commits
     /// it, exactly like the Coherence roots above.
@@ -1321,6 +1361,184 @@ impl FromIterator<crate::state_root::EutxoEntry> for EutxoSet {
     }
 }
 
+/// The Coherence shielded-pool state a [`CommittedState`] holds: accumulator
+/// frontier + leaf count, and the nullifier SMT. See the field docs on
+/// [`CommittedState::coherence_pool`] for why this is consensus state and what
+/// is deliberately excluded (the full leaf vector; the DEV-8 ratchet leaf).
+///
+/// Both members are the cheap-clone forms from `coherence-core`, pinned there
+/// as root-identical to the ratified reference structures: [`Frontier`] is a
+/// fixed ≈1 KB memcpy, [`NullifierSmt`] clones by bumping two `Arc`s — so the
+/// per-block `pre.clone()` in `compute_post_state` stays O(1) in pool size.
+///
+/// [`Frontier`]: coherence_core::Frontier
+/// [`NullifierSmt`]: coherence_core::NullifierSmt
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CoherencePoolState {
+    accumulator: coherence_core::Frontier,
+    nullifiers: coherence_core::NullifierSmt,
+}
+
+impl CoherencePoolState {
+    pub fn is_empty(&self) -> bool {
+        self.accumulator.is_empty() && self.nullifiers.is_empty()
+    }
+
+    /// Leaves appended so far — the next appended commitment's position, the
+    /// value a nullifier binds via `LE64(position)` (C1 §1.3). Leaf order is
+    /// consensus; it is exactly the append order of this accumulator.
+    pub fn leaf_count(&self) -> u64 {
+        self.accumulator.leaf_count()
+    }
+
+    /// `(accumulator_root, nullifier_set_root)` — the pair the state root
+    /// commits (and the header binds) once the flag day opens. For an empty
+    /// pool this is the pinned NON-zero pair (`cd640768…`, `d5fdc9dc…`), NOT
+    /// the `[0u8; 32]` genesis sentinel — the distinction
+    /// [`committed_coherence_roots_at`] exists to police.
+    pub fn roots(&self) -> ([u8; 32], [u8; 32]) {
+        (self.accumulator.root(), self.nullifiers.root())
+    }
+
+    /// Append an output commitment; returns its consensus position. The
+    /// admission rules for WHEN this may happen (anchor validity, proof
+    /// verification, fee flow) are the shielded-application seam's, not this
+    /// struct's — it only guarantees the structure stays consistent.
+    pub fn append_commitment(&mut self, cm: [u8; 32]) -> u64 {
+        self.accumulator.append(cm)
+    }
+
+    /// Insert a spent nullifier. `false` means already spent — the
+    /// double-spend check itself; the application seam must reject the
+    /// transaction on it, never ignore it.
+    #[must_use]
+    pub fn insert_nullifier(&mut self, nf: [u8; 32]) -> bool {
+        self.nullifiers.insert(nf)
+    }
+
+    pub fn contains_nullifier(&self, nf: &[u8; 32]) -> bool {
+        self.nullifiers.contains(nf)
+    }
+
+    pub fn nullifier_count(&self) -> u64 {
+        self.nullifiers.len()
+    }
+
+    /// Canonical byte encoding, one per pool state:
+    ///
+    /// ```text
+    /// u8  version (=1)
+    /// u64 LE  accumulator leaf count
+    /// 33 × 32 B  frontier slots (unset slots zero — enforced both ways)
+    /// u64 LE  nullifier count
+    /// n × 32 B  nullifiers, strictly ascending
+    /// ```
+    ///
+    /// Fixed field order, fixed widths, sorted keys, no padding: two nodes
+    /// holding the same pool serialize the same bytes. Not a wire format for
+    /// the network — a snapshot/persistence encoding for the node side.
+    pub fn serialize(&self) -> Vec<u8> {
+        let keys = self.nullifiers.keys_sorted();
+        let mut out = Vec::with_capacity(1 + 8 + 33 * 32 + 8 + keys.len() * 32);
+        out.push(1u8);
+        out.extend_from_slice(&self.accumulator.leaf_count().to_le_bytes());
+        for slot in self.accumulator.slots() {
+            out.extend_from_slice(slot);
+        }
+        out.extend_from_slice(&(keys.len() as u64).to_le_bytes());
+        for k in &keys {
+            out.extend_from_slice(k);
+        }
+        out
+    }
+
+    /// Decode [`Self::serialize`]'s output, refusing anything non-canonical:
+    /// wrong version, truncation, trailing bytes, a frontier slot where the
+    /// count bit is clear, unsorted or duplicate nullifiers. Corrupt state is
+    /// an error to surface, never bytes to repair in place.
+    pub fn deserialize(bytes: &[u8]) -> Result<Self, &'static str> {
+        let mut at = 0usize;
+        let take = |at: &mut usize, n: usize| -> Result<&[u8], &'static str> {
+            let s = bytes.get(*at..*at + n).ok_or("coherence pool state truncated")?;
+            *at += n;
+            Ok(s)
+        };
+        if *take(&mut at, 1)? != [1u8] {
+            return Err("unknown coherence pool state version");
+        }
+        let leaf_count = u64::from_le_bytes(take(&mut at, 8)?.try_into().unwrap());
+        let mut slots = [[0u8; 32]; coherence_core::TREE_DEPTH + 1];
+        for slot in slots.iter_mut() {
+            slot.copy_from_slice(take(&mut at, 32)?);
+        }
+        let accumulator = coherence_core::Frontier::from_parts(leaf_count, slots)?;
+        let n = u64::from_le_bytes(take(&mut at, 8)?.try_into().unwrap());
+        let n_usize = usize::try_from(n).map_err(|_| "nullifier count out of range")?;
+        if n_usize
+            .checked_mul(32)
+            .and_then(|b| b.checked_add(at))
+            .map(|end| end != bytes.len())
+            .unwrap_or(true)
+        {
+            return Err("coherence pool state length mismatch");
+        }
+        let mut keys = Vec::with_capacity(n_usize);
+        for _ in 0..n_usize {
+            let mut k = [0u8; 32];
+            k.copy_from_slice(take(&mut at, 32)?);
+            keys.push(k);
+        }
+        let nullifiers = coherence_core::NullifierSmt::from_sorted_unique(&keys)?;
+        Ok(Self { accumulator, nullifiers })
+    }
+}
+
+/// The `(accumulator_root, nullifier_root)` pair the state root commits and
+/// the header's `coherence_root` binds, resolved through the
+/// [`crate::params::COHERENCE_ACTIVATION_EPOCH`] flag day.
+///
+/// **Pre-activation** the carried values pass through VERBATIM — on the live
+/// chain those are the `[0u8; 32]` genesis sentinels, and verbatim is what
+/// keeps every block since genesis replaying byte-identically (deriving
+/// unconditionally would re-root history and fork the fleet at deploy). The
+/// pool must still be empty here: nothing may write to it before the gate
+/// opens, and the debug assert makes a premature write fail every test that
+/// computes a root rather than surfacing on mainnet.
+///
+/// **Post-activation** the roots are DERIVED from the pool — and note the
+/// invariant the debug assert states: an empty pool derives the pinned
+/// non-zero pair, never `[0u8; 32]`. The sentinel and "empty pool" are
+/// different values; the bridge between them is exactly what the flag day
+/// (DEV-10) exists to cross.
+///
+/// A free function with the activation epoch injected so tests exercise the
+/// closed AND open gate without waiting for a u64::MAX epoch; production
+/// callers go through [`CommittedState::committed_coherence_roots`], which
+/// pins the constant.
+fn committed_coherence_roots_at(
+    epoch: u64,
+    activation_epoch: u64,
+    carried: ([u8; 32], [u8; 32]),
+    pool: &CoherencePoolState,
+) -> ([u8; 32], [u8; 32]) {
+    if epoch < activation_epoch {
+        debug_assert!(
+            pool.is_empty(),
+            "shielded pool mutated before COHERENCE_ACTIVATION_EPOCH: the pool state is inert \
+             until the flag day, and a pre-gate write would be committed by nothing"
+        );
+        carried
+    } else {
+        let (acc, nfs) = pool.roots();
+        debug_assert!(
+            acc != [0u8; 32] && nfs != [0u8; 32],
+            "derived Coherence roots must never be the [0u8;32] genesis sentinel: an empty \
+             pool's real roots are the pinned cd640768…/d5fdc9dc… pair"
+        );
+        (acc, nfs)
+    }
+}
+
 /// Does `key_hash` — SHA3-256 of a spender's public key — open an output
 /// locked by `script_hash`?
 ///
@@ -1453,6 +1671,9 @@ impl CommittedState {
             taint_root,
             coherence_accumulator_root,
             coherence_nullifier_root,
+            // Empty until the COHERENCE_ACTIVATION_EPOCH flag day; the
+            // committed roots stay the two carried values above until then.
+            coherence_pool: CoherencePoolState::default(),
             evm,
             issued_sat: tokenomics_v4::GENESIS_ISSUED_SAT,
             eutxos: opening_balances.iter().cloned().collect(),
@@ -1475,10 +1696,44 @@ impl CommittedState {
     /// The producer stamps this and the validator checks against it, so there
     /// is one expression of the rule and both sides evaluate it.
     pub fn coherence_root(&self) -> [u8; 32] {
-        crate::derive::coherence_binding(
-            &self.coherence_accumulator_root,
-            &self.coherence_nullifier_root,
+        let (acc, nfs) = self.committed_coherence_roots();
+        crate::derive::coherence_binding(&acc, &nfs)
+    }
+
+    /// The `(accumulator_root, nullifier_root)` pair this state commits:
+    /// the carried values verbatim before
+    /// [`crate::params::COHERENCE_ACTIVATION_EPOCH`], the pool-derived roots
+    /// from the flag day on. One resolver, read by BOTH the state root
+    /// ([`Self::compute_root`]) and the header binding
+    /// ([`Self::coherence_root`]), so the two can never disagree about which
+    /// side of the gate they are on.
+    fn committed_coherence_roots(&self) -> ([u8; 32], [u8; 32]) {
+        committed_coherence_roots_at(
+            self.epoch,
+            crate::params::COHERENCE_ACTIVATION_EPOCH,
+            (self.coherence_accumulator_root, self.coherence_nullifier_root),
+            &self.coherence_pool,
         )
+    }
+
+    /// The shielded-pool state committed at this block. Read-only surface;
+    /// mutation is the shielded-application seam's, via
+    /// [`Self::coherence_pool_mut`].
+    pub fn coherence_pool(&self) -> &CoherencePoolState {
+        &self.coherence_pool
+    }
+
+    /// Mutable access for shielded-transaction application — which MUST be
+    /// gated on `epoch >= COHERENCE_ACTIVATION_EPOCH` by its caller: a
+    /// pre-gate write is committed by nothing and trips the
+    /// [`committed_coherence_roots_at`] assert in every test that computes a
+    /// root.
+    // Unused until the shielded-application seam lands (its owner calls this
+    // from the transaction step, gated on the flag day); the allow is scoped
+    // so its removal is one keystroke when that happens.
+    #[allow(dead_code)]
+    pub(crate) fn coherence_pool_mut(&mut self) -> &mut CoherencePoolState {
+        &mut self.coherence_pool
     }
 
     pub fn head(&self) -> BlockId {
@@ -1850,6 +2105,12 @@ impl CommittedState {
         // (It genuinely WAS `&[]` once, under a comment saying the node
         // supplied it, and nothing did: every block from genesis committed an
         // empty balance component. Hence the emphasis.)
+        //
+        // The Coherence pair goes through the flag-day resolver: carried
+        // sentinels verbatim before COHERENCE_ACTIVATION_EPOCH (bit-identical
+        // replay of the live chain), pool-derived roots after it.
+        let (coherence_accumulator_root, coherence_nullifier_root) =
+            self.committed_coherence_roots();
         crate::state_root::state_root_with_eutxo_tree(&ConsensusState {
             eutxos: &[],
             validators: &validators,
@@ -1873,8 +2134,8 @@ impl CommittedState {
             },
             delegator_fee_rewards: &delegator_fee_rewards,
             taint_root: self.taint_root,
-            coherence_accumulator_root: self.coherence_accumulator_root,
-            coherence_nullifier_root: self.coherence_nullifier_root,
+            coherence_accumulator_root,
+            coherence_nullifier_root,
             evm: self.evm,
             issued_sat: self.issued_sat,
         }, self.eutxos.tree())
@@ -6490,6 +6751,15 @@ mod tests {
         let mut g = st.clone();
         g.pubkey_index.clear();
         assert_eq!(g.compute_root(), base, "pubkey_index is derived from the registry");
+        // `coherence_pool`: NOT in the deliberately-uncommitted category and
+        // NOT mutable here either — it is gated. Before
+        // `COHERENCE_ACTIVATION_EPOCH` (inert, u64::MAX) the committed pair
+        // is the carried root fields verbatim (both covered by `must_move!`
+        // above) and the pool must be EMPTY: a pre-gate mutation is illegal
+        // and trips the resolver's debug assert in every root computation
+        // (pinned in `coherence_pool_tests::premature_pool_write_screams`).
+        // Post-activation the pool IS the committed pair — pinned in
+        // `coherence_pool_tests::resolver_carries_verbatim_then_derives`.
     }
 
     /// Two nodes that reach the same state over different paths — buffered
@@ -8901,5 +9171,278 @@ mod carried_ownership_tests {
         almost[..20].copy_from_slice(&mine[..20]);
         almost[31] = 1; // one byte of tail set
         assert!(!owns(&mine, &almost));
+    }
+}
+
+#[cfg(test)]
+mod coherence_pool_tests {
+    use super::*;
+    use crate::header::BlockHeaderV4;
+
+    /// The real roots of an EMPTY pool — pinned against `coherence-core`'s
+    /// own pins. These are what the chain commits for "no shielded activity"
+    /// once the flag day opens; they are NOT `[0u8; 32]`.
+    const EMPTY_ACC: &str = "cd640768299853bb27e3dfa62faed4b9c2e9348d8ac2f81dd03ecc96ae5b3ff1";
+    const EMPTY_NFS: &str = "d5fdc9dcde0d309db399649a21cd95e45e117e369c13cca70b8e87f2849f7930";
+
+    fn unhex32(s: &str) -> [u8; 32] {
+        hex::decode(s).unwrap().try_into().unwrap()
+    }
+
+    /// The genesis sentinel pair the live chain committed
+    /// (`bloch-pos-node/src/genesis.rs`): both roots `[0u8; 32]`.
+    const SENTINEL: ([u8; 32], [u8; 32]) = ([0u8; 32], [0u8; 32]);
+
+    /// The flag-day resolver, both sides of the gate:
+    ///
+    /// - closed: the carried pair passes through VERBATIM — the live chain's
+    ///   `[0u8; 32]` sentinels included, which is what keeps replay of every
+    ///   historical block byte-identical;
+    /// - open: the pool derives, and an EMPTY pool derives the pinned
+    ///   NON-zero pair. The inequality asserted between the two sides is the
+    ///   invariant this whole seam polices: the sentinel and "empty pool" are
+    ///   different values, and the bridge between them is a deliberate
+    ///   flag-day change (DEV-10), never an accident of deployment.
+    #[test]
+    fn resolver_carries_verbatim_then_derives() {
+        let pool = CoherencePoolState::default();
+
+        // Gate closed: verbatim, zeros and all.
+        assert_eq!(committed_coherence_roots_at(0, 10, SENTINEL, &pool), SENTINEL);
+        assert_eq!(committed_coherence_roots_at(9, 10, SENTINEL, &pool), SENTINEL);
+        // Non-sentinel carried values (a devnet whose ceremony stamped real
+        // roots) also pass through untouched.
+        let carried = ([0x11; 32], [0x22; 32]);
+        assert_eq!(committed_coherence_roots_at(9, 10, carried, &pool), carried);
+
+        // Gate open: derived, and the carried values stop mattering.
+        let derived = committed_coherence_roots_at(10, 10, SENTINEL, &pool);
+        assert_eq!(derived, (unhex32(EMPTY_ACC), unhex32(EMPTY_NFS)));
+        assert_eq!(committed_coherence_roots_at(u64::MAX, 10, carried, &pool), derived);
+
+        // THE invariant: empty pool ≠ genesis sentinel. If these were ever
+        // equal, the flag day would be a no-op and nobody would notice the
+        // chain silently re-rooting.
+        assert_ne!(derived, SENTINEL, "empty-pool roots must differ from the genesis sentinel");
+    }
+
+    /// Post-gate, pool content moves each derived root through its own half
+    /// — and the accumulator's LEAF ORDER is committed, not just its set:
+    /// the nullifier binds `LE64(position)`, so order is consensus.
+    #[test]
+    fn pool_content_moves_the_derived_roots() {
+        let empty = committed_coherence_roots_at(0, 0, SENTINEL, &CoherencePoolState::default());
+
+        let mut with_cm = CoherencePoolState::default();
+        assert_eq!(with_cm.append_commitment([0xA1; 32]), 0);
+        assert_eq!(with_cm.append_commitment([0xA2; 32]), 1);
+        let r1 = committed_coherence_roots_at(0, 0, SENTINEL, &with_cm);
+        assert_ne!(r1.0, empty.0, "commitments must move the accumulator root");
+        assert_eq!(r1.1, empty.1, "commitments must not move the nullifier root");
+
+        let mut swapped = CoherencePoolState::default();
+        swapped.append_commitment([0xA2; 32]);
+        swapped.append_commitment([0xA1; 32]);
+        assert_ne!(
+            committed_coherence_roots_at(0, 0, SENTINEL, &swapped).0,
+            r1.0,
+            "leaf order is consensus and must move the accumulator root"
+        );
+
+        let mut with_nf = CoherencePoolState::default();
+        assert!(with_nf.insert_nullifier([0xB1; 32]));
+        assert!(!with_nf.insert_nullifier([0xB1; 32]), "re-insert reports the double spend");
+        let r2 = committed_coherence_roots_at(0, 0, SENTINEL, &with_nf);
+        assert_eq!(r2.0, empty.0, "nullifiers must not move the accumulator root");
+        assert_ne!(r2.1, empty.1, "nullifiers must move the nullifier root");
+        assert!(with_nf.contains_nullifier(&[0xB1; 32]));
+        assert_eq!(with_nf.nullifier_count(), 1);
+    }
+
+    /// Writing to the pool while the gate is closed must fail LOUDLY in every
+    /// debug/test build — not surface as a silent root divergence on mainnet.
+    /// This is the executable form of "the pool is inert until the flag day".
+    #[test]
+    fn premature_pool_write_screams() {
+        let mut pool = CoherencePoolState::default();
+        pool.append_commitment([0xC1; 32]);
+        let out = std::panic::catch_unwind(|| {
+            committed_coherence_roots_at(5, 10, SENTINEL, &pool)
+        });
+        assert!(
+            out.is_err(),
+            "a non-empty pool before COHERENCE_ACTIVATION_EPOCH must trip the debug assert"
+        );
+    }
+
+    /// The canonical encoding round-trips, and every non-canonical mutation
+    /// of the bytes is refused rather than repaired.
+    #[test]
+    fn serialization_round_trips_and_rejects_corruption() {
+        // Empty pool.
+        let empty = CoherencePoolState::default();
+        assert_eq!(CoherencePoolState::deserialize(&empty.serialize()).unwrap(), empty);
+
+        // A populated pool.
+        let mut pool = CoherencePoolState::default();
+        for i in 0..37u8 {
+            pool.append_commitment([i; 32]);
+            assert!(pool.insert_nullifier([i ^ 0x5A; 32]));
+        }
+        let bytes = pool.serialize();
+        let back = CoherencePoolState::deserialize(&bytes).unwrap();
+        assert_eq!(back, pool);
+        assert_eq!(back.roots(), pool.roots());
+        assert_eq!(back.leaf_count(), 37);
+        assert_eq!(back.nullifier_count(), 37);
+
+        // Truncation, trailing garbage, bad version.
+        assert!(CoherencePoolState::deserialize(&bytes[..bytes.len() - 1]).is_err());
+        let mut long = bytes.clone();
+        long.push(0);
+        assert!(CoherencePoolState::deserialize(&long).is_err());
+        let mut badver = bytes.clone();
+        badver[0] = 2;
+        assert!(CoherencePoolState::deserialize(&badver).is_err());
+
+        // A stale frontier slot where the leaf-count bit is clear: 37 =
+        // 0b100101, bit 1 clear, slot 1 sits at offset 1 + 8 + 32.
+        let mut stale = bytes.clone();
+        stale[1 + 8 + 32] ^= 1;
+        assert!(CoherencePoolState::deserialize(&stale).is_err());
+
+        // Unsorted nullifier keys: swap the first two 32-byte keys.
+        let keys_at = 1 + 8 + 33 * 32 + 8;
+        let mut unsorted = bytes.clone();
+        for i in 0..32 {
+            unsorted.swap(keys_at + i, keys_at + 32 + i);
+        }
+        assert!(CoherencePoolState::deserialize(&unsorted).is_err());
+    }
+
+    /// Pre-gate, the live states in this suite commit the carried pair and
+    /// the header binding agrees with it — i.e. adding the pool field changed
+    /// no committed byte while the constant is `u64::MAX`. (The full-strength
+    /// version of this claim is the live blocks.log replay gate,
+    /// `bloch-pos-node/tests/replay_live_gate.rs`.)
+    #[test]
+    fn pre_gate_commitment_is_the_carried_pair() {
+        assert_eq!(crate::params::COHERENCE_ACTIVATION_EPOCH, u64::MAX, "gate must ship INERT");
+        // Derived, not invented: a block id only ever comes from a header.
+        let genesis_id = BlockId::of(&BlockHeaderV4 {
+            version: BLOCK_VERSION_V4,
+            parent: [0u8; 32],
+            state_root: [0u8; 32],
+            body_root: [0u8; 32],
+            slot: 0,
+            proposer_index: 0,
+            randao_reveal: [0u8; 32],
+            randao_mix: [0x09; 32],
+            justified_root: [0u8; 32],
+            finalized_root: [0u8; 32],
+            attestation_root: [0u8; 32],
+            coherence_root: crate::derive::coherence_binding(&[0u8; 32], &[0u8; 32]),
+        });
+        let st = CommittedState::genesis(
+            genesis_id,
+            [9; 32],
+            &[],
+            &[],
+            [0u8; 32],
+            [0u8; 32],
+            [0u8; 32],
+            EvmCommitment {
+                account_root: [0u8; 32],
+                receipts_root: [0u8; 32],
+                gas_used: 0,
+                base_fee_per_gas: 0,
+            },
+            &[],
+        );
+        assert!(st.coherence_pool().is_empty());
+        assert_eq!(st.committed_coherence_roots(), SENTINEL);
+        assert_eq!(
+            st.coherence_root(),
+            crate::derive::coherence_binding(&[0u8; 32], &[0u8; 32]),
+            "pre-gate header binding must be over the carried sentinels, verbatim"
+        );
+    }
+
+    /// Measurement, not a property — the number the pool-in-state design
+    /// stands on: `compute_post_state` clones `pre` once per block, so the
+    /// pool's clone must stay O(1) as the pool grows, where the reference
+    /// `NullifierSet` (sorted Vec) clone grows linearly. Run:
+    ///
+    /// ```text
+    /// cargo test --release -p bloch-pos-committee --lib \
+    ///   coherence_pool_tests::clone_cost_measured -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "measurement for the ADVISOR-E thresholds; run --release with --nocapture"]
+    fn clone_cost_measured() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        fn key(i: u64) -> [u8; 32] {
+            // Spread keys across the tree like real nullifiers (hash output).
+            let mut k = [0u8; 32];
+            let h = Sha3_256::digest(i.to_le_bytes());
+            k.copy_from_slice(&h);
+            k
+        }
+        let per_iter = |t0: Instant, iters: u32| t0.elapsed().as_nanos() as f64 / iters as f64;
+
+        println!("n        | pool clone | vec-set clone | smt insert | smt root | vec-set root");
+        for &n in &[1_000u64, 10_000, 100_000] {
+            let mut pool = CoherencePoolState::default();
+            let mut vecset = coherence_core::NullifierSet::new();
+            for i in 0..n {
+                pool.append_commitment(key(i ^ 0xABCD));
+                assert!(pool.insert_nullifier(key(i)));
+                vecset.insert(key(i));
+            }
+
+            let clones = 1_000u32;
+            let t0 = Instant::now();
+            for _ in 0..clones {
+                black_box(pool.clone());
+            }
+            let pool_clone_ns = per_iter(t0, clones);
+
+            let t0 = Instant::now();
+            for _ in 0..clones {
+                black_box(vecset.clone());
+            }
+            let vec_clone_ns = per_iter(t0, clones);
+
+            let inserts = 100u32;
+            let t0 = Instant::now();
+            for j in 0..inserts {
+                let mut p = pool.clone(); // O(1), measured above
+                assert!(p.insert_nullifier(key(n + j as u64)));
+                black_box(p);
+            }
+            let insert_ns = per_iter(t0, inserts);
+
+            let roots = 100u32;
+            let t0 = Instant::now();
+            for _ in 0..roots {
+                black_box(pool.roots());
+            }
+            let pool_root_ns = per_iter(t0, roots);
+
+            let t0 = Instant::now();
+            black_box(vecset.root());
+            let vec_root_ns = t0.elapsed().as_nanos() as f64;
+
+            println!(
+                "{n:>8} | {:>7.1} µs | {:>10.1} µs | {:>7.1} µs | {:>5.1} µs | {:>9.1} µs",
+                pool_clone_ns / 1e3,
+                vec_clone_ns / 1e3,
+                insert_ns / 1e3,
+                pool_root_ns / 1e3,
+                vec_root_ns / 1e3,
+            );
+        }
     }
 }
