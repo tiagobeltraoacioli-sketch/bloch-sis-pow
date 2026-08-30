@@ -652,6 +652,9 @@ fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
         att_pool: AttestationPool::new(),
         wall_slot: 0,
         mempool: BTreeMap::new(),
+        // O cache de recusa (2026-08-30): o replay nao propoe, entao nunca
+        // bane nada — o campo existe para o tipo, sempre vazio aqui.
+        rejected: BTreeMap::new(),
         store,
         net,
         head_slot,
