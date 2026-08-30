@@ -146,6 +146,13 @@ fn state<'a>(f: &'a Fixture, e: &'a [EutxoEntry]) -> ConsensusState<'a> {
             tx_bytes: 0,
         },
         delegator_fee_rewards: &[],
+        // The two Coherence leaves (2026-08-29). Both at their inert values,
+        // which is what this fixture measures: an empty anchor record and a
+        // zero turnstile each contribute NO leaf, so the hot-path cost this
+        // test bounds is unchanged by the Coherence wave — which is the fact
+        // worth pinning here, not a synthetic non-empty pool.
+        shielded_pool_sat: 0,
+        coherence_anchors: Default::default(),
     }
 }
 

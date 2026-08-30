@@ -1762,3 +1762,223 @@ fn shielded_pool_total_never_exceeds_the_issued_supply_or_the_cap() {
     }
     assert!(issued <= tk::TOTAL_SUPPLY_SAT);
 }
+
+// ── Coherence flag day: the sentinel, the bridge, the tripwire ──────────────
+//
+// The live Genesis-4 genesis committed `[0u8; 32]` for both shielded-pool
+// roots (bloch-pos-node/src/genesis.rs, integration-plan decision 6), while
+// the ceremony tool computes the pool's REAL roots — for an empty pool,
+// values no hashing turns into zero. The disagreement is recorded and
+// intentional (block 1's state_root pins the zeros; "fixing" genesis bricks
+// every node's replay at boot). What resolves it on the live chain is the
+// COHERENCE_ACTIVATION_EPOCH bridge, and these tests are the tripwire around
+// that arrangement: they fail if the constant disappears, if the pinned
+// empty roots drift from the C1-frozen computation, or if the transition
+// starts moving the roots before the flag day.
+mod coherence_flag_day {
+    use bloch_pos_committee::header::{BlockHeaderV4, BlockId, VERSION_G4};
+    use bloch_pos_committee::interfaces::StateTransition;
+    use bloch_pos_committee::state_root::EvmCommitment;
+    use bloch_pos_committee::transition::{
+        coherence_sentinel_bridge, CommittedState, GenesisValidator, Transition,
+    };
+    use bloch_pos_committee::{derive, params, SignatureVerifier};
+
+    /// Never called by process_epoch — the boundary verifies nothing.
+    struct NoVerify;
+    impl SignatureVerifier for NoVerify {
+        fn verify(&self, _v: u32, _root: &[u8; 32], _sig: &[u8]) -> bool {
+            false
+        }
+        fn verify_with_key(&self, _pk: &[u8], _root: &[u8; 32], _sig: &[u8]) -> bool {
+            false
+        }
+    }
+
+    /// A minimal committed state carrying the LIVE chain's sentinel roots.
+    fn sentinel_genesis() -> CommittedState {
+        let header = BlockHeaderV4 {
+            version: VERSION_G4,
+            parent: [0u8; 32],
+            state_root: [0u8; 32],
+            body_root: [0u8; 32],
+            slot: 0,
+            proposer_index: 0,
+            randao_reveal: [0u8; 32],
+            randao_mix: [0u8; 32],
+            justified_root: [0u8; 32],
+            finalized_root: [0u8; 32],
+            attestation_root: [0u8; 32],
+            coherence_root: [0u8; 32],
+        };
+        let vals = vec![GenesisValidator {
+            index: 0,
+            pubkey: vec![0xAB; 8],
+            staked_sat: 200_000 * 100_000_000,
+            randao_commitment: [0x5A; 32],
+            withdrawal_credentials: vec![0xCD; 4],
+            commission_bps: 500,
+        }];
+        CommittedState::genesis(
+            BlockId::of(&header),
+            [0x07; 32],
+            &vals,
+            &[],
+            [0u8; 32], // taint: dissolved (decision 8)
+            [0u8; 32], // coherence accumulator: the sentinel
+            [0u8; 32], // coherence nullifier set: the sentinel
+            EvmCommitment {
+                account_root: [0u8; 32],
+                receipts_root: [0u8; 32],
+                gas_used: 0,
+                base_fee_per_gas: 0,
+            },
+            &[],
+        )
+    }
+
+    /// TRIPWIRE. The flag day exists and is INERT. Anyone re-arming the
+    /// Coherence trail — or changing what the carried roots mean — must come
+    /// through this constant, and this assertion is the door they find: it
+    /// fails the moment the constant is lowered, so the lowering commit must
+    /// also update this test, which is the moment the mixed-fleet analysis
+    /// in params.rs gets re-read. Deleting the constant fails compilation
+    /// here instead.
+    #[test]
+    fn coherence_flag_day_exists_and_is_inert() {
+        assert_eq!(
+            params::COHERENCE_ACTIVATION_EPOCH,
+            u64::MAX,
+            "COHERENCE_ACTIVATION_EPOCH was lowered — this is a consensus \
+             flag day on a network whose finality floor is 1/2: re-read the \
+             mixed-fleet / double-finalization analysis on the constant, \
+             audit the fleet rollout, then update this pin"
+        );
+    }
+
+    /// The byte-pinned empty roots in params.rs are exactly what the
+    /// C1-frozen coherence-core code computes for empty structures. The
+    /// consensus binary never links the pool's hashing, so this dev-dep
+    /// cross-check is what keeps the pin honest.
+    #[test]
+    fn pinned_empty_roots_match_the_c1_frozen_computation() {
+        assert_eq!(
+            params::COHERENCE_EMPTY_ACCUMULATOR_ROOT,
+            coherence_core::CommitmentTree::new().root(),
+            "params.rs pin drifted from coherence-core's empty accumulator"
+        );
+        assert_eq!(
+            params::COHERENCE_EMPTY_NULLIFIER_ROOT,
+            coherence_core::NullifierSet::new().root(),
+            "params.rs pin drifted from coherence-core's empty nullifier set"
+        );
+        // And neither is the sentinel — the whole reason the bridge exists.
+        assert_ne!(params::COHERENCE_EMPTY_ACCUMULATOR_ROOT, [0u8; 32]);
+        assert_ne!(params::COHERENCE_EMPTY_NULLIFIER_ROOT, [0u8; 32]);
+    }
+
+    /// The binding the live chain carries today, pinned end to end:
+    /// SHA3(DS_COHERENCE ‖ 0³² ‖ 0³²), confirmed by RPC against a live block
+    /// (2026-08-29). If this moves, blocks already finalized stop
+    /// re-validating.
+    #[test]
+    fn the_live_chain_carries_the_sentinel_binding() {
+        assert_eq!(
+            hex::encode(derive::coherence_binding(&[0u8; 32], &[0u8; 32])),
+            "3ac97a48fe4c1dc2de33022b2473e76e609c85ce0c0bce96540851f682bccb56",
+        );
+    }
+
+    /// The bridge in isolation: fires only at the activation boundary, swaps
+    /// only sentinels, and leaves real roots — a future chain whose genesis
+    /// committed them — untouched.
+    #[test]
+    fn bridge_fires_only_at_the_activation_boundary_and_only_on_sentinels() {
+        // Not the activation epoch: nothing moves.
+        let (mut acc, mut nf) = ([0u8; 32], [0u8; 32]);
+        coherence_sentinel_bridge(41, 42, &mut acc, &mut nf);
+        assert_eq!((acc, nf), ([0u8; 32], [0u8; 32]));
+        coherence_sentinel_bridge(43, 42, &mut acc, &mut nf);
+        assert_eq!((acc, nf), ([0u8; 32], [0u8; 32]));
+
+        // The activation boundary: each sentinel becomes the real empty root.
+        coherence_sentinel_bridge(42, 42, &mut acc, &mut nf);
+        assert_eq!(acc, params::COHERENCE_EMPTY_ACCUMULATOR_ROOT);
+        assert_eq!(nf, params::COHERENCE_EMPTY_NULLIFIER_ROOT);
+
+        // Real (non-zero) roots pass through the boundary untouched.
+        let (mut acc2, mut nf2) = ([0x11u8; 32], [0x22u8; 32]);
+        coherence_sentinel_bridge(42, 42, &mut acc2, &mut nf2);
+        assert_eq!((acc2, nf2), ([0x11u8; 32], [0x22u8; 32]));
+
+        // And bridged roots are stable: a second boundary (a reorg replay of
+        // the same epoch) reproduces the same values.
+        coherence_sentinel_bridge(42, 42, &mut acc, &mut nf);
+        assert_eq!(acc, params::COHERENCE_EMPTY_ACCUMULATOR_ROOT);
+        assert_eq!(nf, params::COHERENCE_EMPTY_NULLIFIER_ROOT);
+    }
+
+    /// TRIPWIRE, state-level: with the constant at u64::MAX the transition
+    /// carries the sentinel through epoch boundaries bit-for-bit — the
+    /// carried-never-recomputed posture the live chain finalized under. If
+    /// someone wires shielded application (or any other root movement)
+    /// without gating it on COHERENCE_ACTIVATION_EPOCH, this is the test
+    /// that goes red.
+    #[test]
+    fn pre_activation_boundaries_carry_the_sentinel_unchanged() {
+        let t = Transition::new(NoVerify);
+        let g = sentinel_genesis();
+        let sentinel_binding = derive::coherence_binding(&[0u8; 32], &[0u8; 32]);
+        assert_eq!(g.coherence_root(), sentinel_binding);
+
+        let mut st = g;
+        for _ in 0..3 {
+            st = t.process_epoch(&st).expect("boundary is infallible");
+            assert_eq!(
+                st.coherence_root(),
+                sentinel_binding,
+                "an epoch boundary moved the carried Coherence roots while \
+                 COHERENCE_ACTIVATION_EPOCH is inert (u64::MAX) — root \
+                 semantics changed without the flag day"
+            );
+        }
+    }
+}
+
+// ── The two "empty" routes must agree (2026-08-30, DEV-6 x DEV-7 x DEV-10) ──
+//
+// Three pieces landed independently and each has its own notion of what an
+// empty pool commits:
+//
+//   1. the sentinel BRIDGE writes `params::COHERENCE_EMPTY_*_ROOT` into the
+//      carried pair at the activation boundary (`coherence_sentinel_bridge`);
+//   2. the flag-day RESOLVER ignores the carried pair from that epoch on and
+//      returns `CoherencePoolState::roots()` — the `Frontier` / `NullifierSmt`
+//      the transition holds (`committed_coherence_roots_at`);
+//   3. the pins in `coherence-core` anchor `CommitmentTree` / `NullifierSet`.
+//
+// DEV-10's test above holds (1) against (3). This holds (1) against (2) —
+// the pair nothing else compares, and the one whose disagreement would be
+// silent: the bridge would write cd640768…, the resolver would immediately
+// return something else, and the committed root would move at the boundary
+// for a reason no constant explains. `Frontier` was written as the
+// leaf-free equivalent of `CommitmentTree` precisely so these are the same
+// number; this test is what keeps that true.
+#[test]
+fn the_bridged_constants_are_exactly_what_the_resolver_derives_from_an_empty_pool() {
+    use bloch_pos_committee::params;
+    let pool = bloch_pos_committee::transition::CoherencePoolState::default();
+    let (acc, nfs) = pool.roots();
+    assert_eq!(
+        acc, params::COHERENCE_EMPTY_ACCUMULATOR_ROOT,
+        "the accumulator root the resolver derives from an empty pool differs from the \
+         constant the sentinel bridge writes — the committed root would jump at the \
+         activation boundary with no rule behind the jump"
+    );
+    assert_eq!(
+        nfs, params::COHERENCE_EMPTY_NULLIFIER_ROOT,
+        "the nullifier root the resolver derives from an empty pool differs from the \
+         constant the sentinel bridge writes"
+    );
+    assert!(pool.is_empty());
+}

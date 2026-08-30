@@ -628,27 +628,166 @@ pub const ANCESTRY_SEED_ACTIVATION_EPOCH: u64 = u64::MAX;
 /// `u64::MAX` means INERT. Same arming rules as above.
 pub const LEAK_RECOVERY_ACTIVATION_EPOCH: u64 = u64::MAX;
 
-/// Flag day for **shielded-pool state inside `CommittedState`** (Coherence
-/// wave). Before this epoch the transition commits the two Coherence roots
-/// exactly as carried — which on the live chain means the `[0u8; 32]` genesis
-/// sentinels (`bloch-pos-node/src/genesis.rs`), byte-identical to every block
-/// since genesis. From this epoch on, the committed accumulator and
-/// nullifier-set roots are **derived from the pool state the transition
-/// holds** (`transition.rs::CoherencePoolState`).
+/// Flag-day epoch at which the **entire Coherence trail** goes live: shielded
+/// transaction tags become acceptable in blocks, the two pool roots stop
+/// being carried and start being applied, new leaves enter the accumulator,
+/// the verifier arms — and, at the boundary that opens this epoch, the
+/// genesis zero sentinel is bridged to the pool's real empty roots
+/// ([`crate::transition::coherence_sentinel_bridge`]).
 ///
-/// Why it must be gated: deriving unconditionally forks the live chain at
-/// deploy. The real root of an EMPTY pool is NOT zero (the accumulator's is
-/// `cd640768…`, the nullifier set's `d5fdc9dc…` — pinned in
-/// `coherence-core::persistent_state_tests`), so recomputation changes
-/// `state_root` and `coherence_root` for every block since genesis and the
-/// new binary diverges the moment it replays. The sentinel→real-root bridge
-/// is DEV-10's change, armed here.
+/// **ONE constant for the whole trail, deliberately.** A pool whose
+/// transactions are acceptable before its roots move, or whose roots move
+/// before its verifier arms, is not a partially-launched feature — it is two
+/// consensus rules disagreeing about the same block. Every gate on the trail
+/// reads this constant and only this constant.
 ///
-/// `u64::MAX` means INERT. Same arming rules as
-/// [`ANCESTRY_SEED_ACTIVATION_EPOCH`]: fill at tag time, strictly in the
-/// future, after the fleet rollout completes; the gate reads the epoch of the
-/// state being folded, never a clock.
+/// `u64::MAX` means INERT: every node ships the trail and none of it changes
+/// what a block may carry or commit until this constant is lowered and the
+/// fleet is rebuilt together. Same idiom as
+/// [`TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH`] — a consensus rule arrives by
+/// flag day, never by whoever restarts first.
+///
+/// # The sentinel this bridges
+///
+/// The live Genesis-4 genesis committed `[0u8; 32]` for both pool roots
+/// (integration-plan decision 6, `bloch-pos-node/src/genesis.rs`), and every
+/// block since carries `coherence_root = SHA3(DS_COHERENCE ‖ 0³² ‖ 0³²)` —
+/// confirmed on-chain. But zero is a *sentinel*, not a root: the C1-frozen
+/// empty accumulator and empty nullifier set hash to
+/// [`COHERENCE_EMPTY_ACCUMULATOR_ROOT`] and
+/// [`COHERENCE_EMPTY_NULLIFIER_ROOT`], values no amount of hashing turns into
+/// zero. While the pool is inert the discrepancy is cosmetic — the roots are
+/// carried, never opened. The moment the pool applies its first note it
+/// becomes consensus: a proof against the zero sentinel verifies against
+/// nothing. So the transition that OPENS this epoch rewrites each sentinel
+/// root to its real empty value, deterministically, once — the one sanctioned
+/// exception to "carried, never recomputed" (§6.6.1), and it is a
+/// substitution, not a recomputation. A future chain whose genesis commits
+/// real (non-zero) roots passes through the bridge untouched.
+///
+/// **The swap shares this flag day on purpose — there is no separate
+/// sentinel epoch.** Considered and decided (2026-08-29): while the pool is
+/// inert the zeros are inert too, so bridging them earlier buys nothing, and
+/// the first shielded transaction already requires a 100%-rebuilt fleet — a
+/// second flag day would be a second full-fleet rollout, i.e. double
+/// exposure to exactly the risk described below, for zero benefit. The
+/// counter-argument (the swap alone is smaller and testable in isolation) is
+/// answered by [`crate::transition::coherence_sentinel_bridge`] being a free
+/// function tested in isolation regardless of when it fires.
+///
+/// # Why a mixed fleet agrees before the flag day
+///
+/// A pre-activation block carrying a shielded transaction is rejected by BOTH
+/// binaries, for different proximate reasons and the same verdict: the old
+/// binary fails to decode the body (unknown wire tag), the new one decodes it
+/// and refuses it at the gate (`TxClass::Shielded` is not yet acceptable).
+/// And pre-activation both binaries carry the sentinel roots unchanged — the
+/// bridge fires only AT the activation boundary — so headers and state roots
+/// agree block for block. Either way no fork opens. AFTER activation the two
+/// binaries diverge on the first boundary block (the bridge moves the state
+/// root) — so "the fleet is on the new binary" is a precondition of lowering
+/// this, not a hope.
+///
+/// # A partial rollout on THIS network can double-finalize, not just stall
+///
+/// The comfortable reading — "stale nodes fall out of quorum and freeze,
+/// updated majority continues" — assumes a 2/3 quorum. This network's
+/// finality floor is **1/2 by founder decision** (liveness over
+/// root-uniqueness, reaffirmed after an agent unilaterally raised it; see the
+/// quorum note earlier in this file), and the 2026-08-24 incident it records
+/// — three nodes finalizing epoch 986 under three different roots — is what
+/// the floor permits under divergence. So a rollout that leaves close to
+/// half the stake on the old binary when this epoch arrives does not
+/// produce a stalled minority: it can produce TWO finalized chains, one per
+/// binary, each above the floor. And the headcount overstates the margin —
+/// validators can sit `active` in the registry with no node behind them
+/// (v15 and v39 were, 2026-08-28), so count updated *stake with a live
+/// node*, not updated validators. Operationally that means what the E=1400
+/// flag day meant: an audited rollout across every live node BEFORE the
+/// epoch arrives, remembering that rotating a binary drops the node from
+/// the quorum until it rebuilds finality — stagger the fleet, never restart
+/// it at once, and arm the epoch only after the audit says the live,
+/// staked, node-backed majority is comfortably past the floor.
+///
+/// The gate reads the COMMITTED epoch (`CommittedState::epoch`, rolled by
+/// `close_epoch` from committed state alone), never node-local state — the
+/// 2026-08-08 `expected_bits` fork is the standing reason.
+///
+/// When lowered, the value must be an epoch ≥ 1 that is still in the future:
+/// `close_epoch` never opens epoch 0 (genesis states it directly), and an
+/// activation epoch armed in the past is how 1,600,000 BLCH once escaped a
+/// write-off that never fired.
+///
+/// # The application seam this same constant gates
+///
+/// Flag day for **Coherence shielded-transaction application** — the epoch at
+/// which `compute_post_state` may start moving the two committed pool roots
+/// (`coherence_accumulator_root` / `coherence_nullifier_root`) instead of
+/// carrying them verbatim (§6.6.1/§6.6.2).
+///
+/// Why this cannot be unconditional: the live genesis committed `[0u8; 32]`
+/// in the carried roots (`bloch-pos-node/src/genesis.rs`), and both roots are
+/// committed into every block's `state_root` and mirrored in every header's
+/// `coherence_root`. A node that starts *deriving* them where the historical
+/// producer *carried* them computes roots the historical headers do not carry
+/// — it forks off the live chain at the first shielded transaction, the exact
+/// failure family of [`ANCESTRY_SEED_ACTIVATION_EPOCH`]'s doc. So:
+///
+/// - below this epoch, a block carrying any shielded delta is **invalid**
+///   (`derive::ShieldedReject::NotActive`) and an empty application is the
+///   identity — bit-for-bit the carried-roots behaviour the fleet replays;
+/// - at or above it, the deltas are applied and the mirror is derived from
+///   the **post** state.
+///
+/// The gate reads the epoch derived from the BLOCK being judged
+/// (`epoch_of(header.slot)`) — committed data, identical on every node —
+/// never a local clock or node-local mutable state (the 2026-08-08
+/// `expected_bits` lesson).
+///
+/// The sentinel->real-root bridge is DEV-10's change, armed here.
+///
+/// `u64::MAX` means INERT. DEV-10 owns arming it; the arming rules are the
+/// same as [`ANCESTRY_SEED_ACTIVATION_EPOCH`]'s (strictly in the future,
+/// after the fleet rollout completes), plus one of its own: it must not arm
+/// before the shielded wire format exists (DEV-9) and the pool state that can
+/// re-root under the C1 tree is bound (DEV-5) — an armed gate with no engine
+/// behind it turns every shielded transaction into
+/// `ShieldedReject::PoolUnavailable`, a fail-closed block reject.
 pub const COHERENCE_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+/// Root of the **empty** C1-frozen commitment accumulator: 32 levels of the
+/// SHAKE-256 tree over no leaves (`coherence_core::CommitmentTree::new()`).
+///
+/// `cd640768299853bb27e3dfa62faed4b9c2e9348d8ac2f81dd03ecc96ae5b3ff1`
+///
+/// Pinned as bytes because this crate's posture toward Coherence is
+/// carried-never-recomputed (§6.6.1): the consensus crate does not link the
+/// pool's hashing (see the note in [`crate::derive`] on the removed
+/// `nullifier_set_root`), so the one value it needs — what "empty" hashes to,
+/// for the [`COHERENCE_ACTIVATION_EPOCH`] bridge — is a constant, and a
+/// dev-dependency test (`tests/committee.rs`) holds it against the live
+/// `coherence-core` computation so the pin cannot drift from the code.
+pub const COHERENCE_EMPTY_ACCUMULATOR_ROOT: [u8; 32] = [
+    0xCD, 0x64, 0x07, 0x68, 0x29, 0x98, 0x53, 0xBB,
+    0x27, 0xE3, 0xDF, 0xA6, 0x2F, 0xAE, 0xD4, 0xB9,
+    0xC2, 0xE9, 0x34, 0x8D, 0x8A, 0xC2, 0xF8, 0x1D,
+    0xD0, 0x3E, 0xCC, 0x96, 0xAE, 0x5B, 0x3F, 0xF1,
+];
+
+/// Root of the **empty** C1.1 nullifier set: the 256-deep SHAKE-256 sparse
+/// Merkle tree over no nullifiers (`coherence_core::NullifierSet::new()`).
+///
+/// `d5fdc9dcde0d309db399649a21cd95e45e117e369c13cca70b8e87f2849f7930`
+///
+/// Same pin-plus-dev-test arrangement as
+/// [`COHERENCE_EMPTY_ACCUMULATOR_ROOT`], for the same reason.
+pub const COHERENCE_EMPTY_NULLIFIER_ROOT: [u8; 32] = [
+    0xD5, 0xFD, 0xC9, 0xDC, 0xDE, 0x0D, 0x30, 0x9D,
+    0xB3, 0x99, 0x64, 0x9A, 0x21, 0xCD, 0x95, 0xE4,
+    0x5E, 0x11, 0x7E, 0x36, 0x9C, 0x13, 0xCC, 0xA7,
+    0x0B, 0x8E, 0x87, 0xF2, 0x84, 0x9F, 0x79, 0x30,
+];
+
 
 /// Domain separation tags (§6.1). Fixed 16 bytes, right-padded with zeros, so
 /// no tag can be a prefix of another.

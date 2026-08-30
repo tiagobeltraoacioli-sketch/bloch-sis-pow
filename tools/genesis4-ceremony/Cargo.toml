@@ -10,11 +10,24 @@ publish = false
 # argument that "nothing here can affect the live validation path of the
 # running chain". That argument was about blast radius, and it was right about
 # blast radius — but the effect of a private workspace is that `cargo build
-# --workspace` and `cargo test --workspace` SKIP this crate entirely, so the
-# tool that assembled the live Genesis-4 genesis block was never built by CI.
-# bloch-pos-committee was moved back for the same reason. Blast radius is
-# controlled by the dependency direction (one-way, by path, into this crate
-# and never out of it), not by hiding the crate from the build.
+# --workspace` and `cargo test --workspace` SKIP this crate entirely, so this
+# genesis tool was never built by CI. bloch-pos-committee was moved back for
+# the same reason. Blast radius is controlled by the dependency direction
+# (one-way, by path, into this crate and never out of it), not by hiding the
+# crate from the build.
+#
+# HONESTY NOTE (2026-08-29): an earlier version of the comment above called
+# this "the tool that assembled the live Genesis-4 genesis block". For the
+# Coherence roots that is FALSE: the live genesis was synthesized by
+# `bloch-pos-node/src/genesis.rs`, which committed the `[0u8; 32]` sentinel
+# for both pool roots — the real empty-pool roots this crate computes (and
+# pins in `empty_pool_commits_a_real_root_never_the_zero_sentinel`) never
+# reached the node. The two tools disagree ON PURPOSE and must not be
+# "reconciled": block 1's state_root pins the zeros, so editing the node's
+# genesis bricks every node's replay at boot. The live chain converges on the
+# real roots via the `COHERENCE_ACTIVATION_EPOCH` flag-day bridge
+# (bloch-pos-committee/src/params.rs); future chains should launch from this
+# crate's ceremony-computed roots and never need the bridge.
 
 [dependencies]
 # Single source of truth for every tokenomics number. The ceremony does not

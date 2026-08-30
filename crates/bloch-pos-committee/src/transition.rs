@@ -552,6 +552,32 @@ impl PosTransaction {
         h.finalize().into()
     }
 
+    /// The shielded delta this transaction contributes to the Coherence pool
+    /// — the extraction seam `compute_post_state`'s application step reads.
+    ///
+    /// `None` for every variant that exists today: no shielded transaction
+    /// variant exists yet, because its wire format and body tag are DEV-9's
+    /// and hang on the open proof-carriage decision (the measured SP1 proof
+    /// does not fit the block). The match is deliberately **exhaustive, with
+    /// no wildcard arm**: the day DEV-9 adds the variant, this function stops
+    /// compiling and forces the answer "what does it do to the pool" — the
+    /// compile-time hold that keeps the application path from silently
+    /// treating a shielded transaction as delta-free.
+    ///
+    /// A `Some` return must only ever be produced AFTER the transaction's
+    /// proof has been verified — an unverified delta must not exist (see
+    /// `derive::ShieldedDelta`).
+    pub fn shielded_delta(&self) -> Option<crate::derive::ShieldedDelta> {
+        match self {
+            PosTransaction::Transfer { .. }
+            | PosTransaction::TransferV2 { .. }
+            | PosTransaction::Deposit { .. }
+            | PosTransaction::Exit { .. }
+            | PosTransaction::Delegate { .. }
+            | PosTransaction::SlashingEvidence(_) => None,
+        }
+    }
+
     /// The canonical wire encoding of a consensus transaction — the bytes the
     /// header's `body_root` is a Merkle root over.
     ///
@@ -1633,6 +1659,45 @@ fn owns(key_hash: &[u8; 32], script_hash: &[u8; 32]) -> bool {
     script_hash[20..] == [0u8; 12] && key_hash[..20] == script_hash[..20]
 }
 
+/// The Coherence sentinel bridge (see
+/// [`crate::params::COHERENCE_ACTIVATION_EPOCH`]).
+///
+/// The live Genesis-4 genesis committed `[0u8; 32]` for both pool roots — a
+/// sentinel no derivation produces, not the hash of anything. At the epoch
+/// boundary that OPENS the activation epoch, each root that still holds the
+/// sentinel is rewritten to the real root of the empty structure
+/// ([`crate::params::COHERENCE_EMPTY_ACCUMULATOR_ROOT`],
+/// [`crate::params::COHERENCE_EMPTY_NULLIFIER_ROOT`]); a root that already
+/// holds a real value — a future chain whose genesis ceremony committed the
+/// pool's actual roots — passes through untouched.
+///
+/// A free function taking `activation_epoch` as a parameter rather than
+/// reading the constant itself, so the tripwire tests can drive the firing
+/// case while the shipped constant stays `u64::MAX`; the ONE production call
+/// site (`close_epoch`, step 5a) passes
+/// [`crate::params::COHERENCE_ACTIVATION_EPOCH`].
+///
+/// This is the single sanctioned exception to "carried, never recomputed"
+/// (§6.6.1) — and it is a *substitution* of one constant for another, not a
+/// recomputation: no pool data flows in, so it cannot disagree between nodes
+/// that agree on the committed epoch.
+pub fn coherence_sentinel_bridge(
+    opening_epoch: u64,
+    activation_epoch: u64,
+    accumulator_root: &mut [u8; 32],
+    nullifier_root: &mut [u8; 32],
+) {
+    if opening_epoch != activation_epoch {
+        return;
+    }
+    if *accumulator_root == [0u8; 32] {
+        *accumulator_root = crate::params::COHERENCE_EMPTY_ACCUMULATOR_ROOT;
+    }
+    if *nullifier_root == [0u8; 32] {
+        *nullifier_root = crate::params::COHERENCE_EMPTY_NULLIFIER_ROOT;
+    }
+}
+
 /// Why a shielded spend's anchor was refused
 /// ([`CommittedState::require_coherence_anchor`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1762,8 +1827,14 @@ impl CommittedState {
         st
     }
 
-    /// Id of the block that produced this state.
-    /// Exactly the value a block's header must carry in `coherence_root`.
+    /// The §6.6.2 mirror binding of THIS state's committed pool roots.
+    ///
+    /// A block's header must carry the **post-state** value: the transition
+    /// applies the block's shielded deltas to its clone and checks the header
+    /// against the clone's `coherence_root()` (step 3d). Calling this on the
+    /// PRE-state gives the same bytes only while application is inert — a
+    /// producer stamping the pre-state binding after the flag day arms is
+    /// stamping a header its own probe will reject.
     ///
     /// An accessor and not two public fields on purpose: the header field is a
     /// *binding* over both pool roots, and exposing the roots separately would
@@ -1812,6 +1883,7 @@ impl CommittedState {
         &mut self.coherence_pool
     }
 
+    /// Id of the block that produced this state.
     pub fn head(&self) -> BlockId {
         self.head
     }
@@ -3505,6 +3577,26 @@ impl CommittedState {
         // 5. Open E+1. The cohort cap for the new epoch is applied inside
         //    duty_roster_at (genesis_cohort.rs closed form — rule 3).
         st.epoch = next_epoch;
+        // 5a. The Coherence sentinel bridge — fires exactly once, at the
+        //     boundary that opens COHERENCE_ACTIVATION_EPOCH, and is a no-op
+        //     at every other boundary (and forever, while the constant is
+        //     u64::MAX). Gated on `next_epoch`, which is committed state
+        //     (`closing + 1`), never node-local bookkeeping — the 2026-08-08
+        //     `expected_bits` lesson. It runs INSIDE close_epoch because
+        //     compute_post_state rolls skipped boundaries through this same
+        //     function one epoch at a time, so `==` cannot be jumped over by
+        //     an empty epoch. The first block of the activation epoch still
+        //     *carries* the sentinel binding in its header (the header rule
+        //     is "the binding over the state the PARENT committed", §6.6.2,
+        //     and its parent closed the previous epoch); the block's POST
+        //     state commits the real roots, and every later header carries
+        //     them. Deterministic on every node, no header-rule change.
+        coherence_sentinel_bridge(
+            next_epoch,
+            crate::params::COHERENCE_ACTIVATION_EPOCH,
+            &mut st.coherence_accumulator_root,
+            &mut st.coherence_nullifier_root,
+        );
         st.pending_votes.clear();
         let roster_next = st.consensus_roster_at(next_epoch);
         st.previous_participation = std::mem::take(&mut st.current_participation);
@@ -3721,7 +3813,9 @@ impl<V: SignatureVerifier> Transition<V> {
         // cheap-to-expensive. The functions are `derive`'s: one derivation
         // path means the producer stamps and the validator checks by calling
         // the same code, which is the whole anti-h28080 invariant `produce.rs`
-        // is built on.
+        // is built on. (Of the original three, `coherence_root` moved to step
+        // 3d on 2026-08-29: its expectation is a function of the post-apply
+        // state, so it is checked against the state this transition computes.)
         let tx_bytes: Vec<Vec<u8>> =
             transactions.iter().map(PosTransaction::canonical_bytes).collect();
         if header.body_root != crate::derive::body_root(&tx_bytes) {
@@ -3730,13 +3824,13 @@ impl<V: SignatureVerifier> Transition<V> {
         if header.attestation_root != crate::derive::attestation_root(attestations) {
             return Err(TransitionError::AttestationRootMismatch);
         }
-        // Carried, never recomputed (§6.6.1): the pool is inert under PoS, so
-        // the header must reproduce the binding over the state the PARENT
-        // committed. Deriving it — rather than copying the parent's header
-        // field — is what makes it a check instead of a tautology.
-        if header.coherence_root != pre.coherence_root() {
-            return Err(TransitionError::CoherenceRootMismatch);
-        }
+        // The third header commitment — `coherence_root` — is checked at step
+        // 3d below, against the state this transition COMPUTES. It used to be
+        // checked here against `pre`; see 3d for why that was a trap. Moving
+        // the check does not move the accept/reject set (while application is
+        // inert the two states carry identical pool roots, and a block that
+        // fails only this check fails it in either position), so the shift in
+        // the frozen error order is not consensus-visible.
 
         // Roll epoch accounting over any empty boundary slots the chain
         // skipped. Identical to the caller invoking process_epoch itself —
@@ -3783,6 +3877,63 @@ impl<V: SignatureVerifier> Transition<V> {
         // rather than two checks that can be violated between each other.
         if st.shielded_pool_sat > st.issued_sat {
             return Err(TransitionError::ShieldedPoolExceedsIssued);
+        }
+
+        // 3e. SHIELDED APPLICATION (§6.6) AND THE COHERENCE MIRROR, against
+        // the state this transition computes.
+        //
+        // Order: after 3b, because `body_root` must commit to the block's
+        // bytes — shielded ones included — before any state mutates; inside
+        // the clone, so a later reject drops the applied roots with the rest
+        // of `st` (atomicity for free); before step 12, so the roots the
+        // state root commits are the POST-apply roots, not a forever
+        // off-by-one carry of the pre-state.
+        //
+        // The mirror is checked against `st`, never against `pre`. Checking
+        // `pre.coherence_root()` was correct only by coincidence of the inert
+        // pool (post == pre), and it was a trap: the live proposer stamps
+        // `state.coherence_root()` (`bloch-pos-node/src/engine.rs`) and this
+        // check compared the same pre-state binding, so the day application
+        // moved the roots, producer and validator would have kept agreeing —
+        // with each other — on a header that no longer committed to the
+        // pool's post-block state. No compile error, no split: both live
+        // sides wrong together, silently. Deriving the expectation from the
+        // computed state makes the check follow application by construction,
+        // and a proposer whose stamp lags reproves in its own probe
+        // (`compute_post_state` runs before the header is signed), whose
+        // drop-loop keeps the node live instead of splitting the network —
+        // the h28080 lesson, applied to the seam that actually runs.
+        //
+        // While application is inert this whole step is bit-for-bit today's
+        // carried-roots behaviour: no variant yields a delta
+        // (`PosTransaction::shielded_delta` is None-for-all, exhaustively),
+        // the empty application is the identity, and `close_epoch` never
+        // touches the pool roots — so the binding checked here equals the
+        // parent's, on every block of the live chain's log.
+        //
+        // MERGE NOTE (2026-08-30, DEV-6 x DEV-7): this step writes the POST
+        // roots back into the CARRIED pair, while `committed_coherence_roots`
+        // resolves to the POOL's roots from the flag day on. Today the two
+        // cannot disagree — `apply_shielded` is the identity on an empty
+        // delta list and fails closed (`PoolUnavailable`) on any other, so
+        // the carried pair never moves and the gate is unarmed. The day
+        // DEV-5's pool binding lands, whoever lands it owns making this write
+        // go through the pool (`coherence_pool_mut`) instead: writing the
+        // carried pair while the resolver reads the pool would freeze the
+        // committed roots at the empty-pool values with no compile error.
+        let shielded: Vec<crate::derive::ShieldedDelta> =
+            transactions.iter().filter_map(PosTransaction::shielded_delta).collect();
+        let (post_accumulator, post_nullifier) = crate::derive::apply_shielded(
+            block_epoch,
+            &st.coherence_accumulator_root,
+            &st.coherence_nullifier_root,
+            &shielded,
+        )
+        .map_err(TransitionError::Shielded)?;
+        st.coherence_accumulator_root = post_accumulator;
+        st.coherence_nullifier_root = post_nullifier;
+        if header.coherence_root != st.coherence_root() {
+            return Err(TransitionError::CoherenceRootMismatch);
         }
 
         // Consensus weight, not raw stake: the proposer draw below and the
@@ -7390,6 +7541,50 @@ mod tests {
             good.header.coherence_root,
             "the coherence binding ignored the accumulator root"
         );
+    }
+
+    /// **The regression test for step 3d's direction.** The Coherence mirror
+    /// is judged against the state the transition COMPUTES, and the accepted
+    /// block's header equals its own post-state's binding — the invariant
+    /// that survives shielded application turning on, which "check against
+    /// `pre`" (the pre-2026-08-29 form) did not: with the live proposer
+    /// stamping `state.coherence_root()` and the validator comparing the same
+    /// pre-state value, both sides would have kept agreeing on a header that
+    /// no longer committed to the pool's post-block state — wrong together,
+    /// silently, with no compile error to catch it.
+    ///
+    /// While application is inert the move is invisible by construction, and
+    /// that fact is pinned too: the post state's binding equals the pre
+    /// state's on every accepted block (empty application is the identity,
+    /// `close_epoch` never touches the pool roots), including across an epoch
+    /// boundary — which is exactly why relocating the check does not change
+    /// the accept/reject set on the live chain's log.
+    #[test]
+    fn coherence_mirror_is_checked_against_the_computed_state() {
+        let (t, g, mut chains) = setup(4);
+
+        // Same-epoch block.
+        let b1 = build_block(&t, &g, 1, &[], &[], &mut chains);
+        let s1 = t.apply_block(&g, &b1, &[], &[]).unwrap();
+        assert_eq!(
+            b1.header.coherence_root,
+            s1.coherence_root(),
+            "the header must carry the POST-state binding"
+        );
+        assert_eq!(
+            s1.coherence_root(),
+            g.coherence_root(),
+            "inert application: the post binding still equals the parent's"
+        );
+
+        // Across an epoch boundary: the check reads the rolled clone, and the
+        // roll must not have moved the pool roots either.
+        let far = crate::SLOTS_PER_EPOCH * 2 + 1;
+        let b2 = build_block(&t, &s1, far, &[], &[], &mut chains);
+        let s2 = t.apply_block(&s1, &b2, &[], &[]).unwrap();
+        assert_eq!(b2.header.coherence_root, s2.coherence_root());
+        assert_eq!(s2.coherence_accumulator_root, g.coherence_accumulator_root);
+        assert_eq!(s2.coherence_nullifier_root, g.coherence_nullifier_root);
     }
 
 

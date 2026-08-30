@@ -91,6 +91,13 @@ pub enum ProduceError {
     /// local chain and the chain the network registered have diverged (wrong
     /// seed, missed re-commit, restored stale backup). Nothing was consumed.
     RevealRejected(BeaconError),
+    /// The Coherence mirror could not be derived
+    /// ([`derive::expected_coherence`] refused the block's shielded deltas).
+    /// Unreachable while this stack passes no deltas — transactions are
+    /// opaque bytes here and no shielded wire tag exists (DEV-9) — but the
+    /// refusal is surfaced rather than panicked on, so a future caller that
+    /// does thread deltas gets a refusal instead of a doomed block.
+    Shielded(derive::ShieldedReject),
 }
 
 /// The producer's RANDAO chain with slot-consumption tracking.
@@ -223,6 +230,13 @@ pub fn produce(
         .collect();
 
     let (justified_root, finalized_root) = derive::expected_finality(parent);
+    // Coherence mirror over the POST-state pool roots. This stack's
+    // transactions are opaque bytes with no shielded wire tag (DEV-9), so the
+    // shielded delta list is empty by construction and the application is the
+    // identity; when DEV-9 lands a tag, whoever threads it here must pass the
+    // block's actual deltas or the header stops committing to the pool.
+    let coherence_root =
+        derive::expected_coherence(parent, slot, &[]).map_err(ProduceError::Shielded)?;
     let header = BlockHeaderV4 {
         version: VERSION_G4,
         // The parent id through the single §5.4 derivation path — no stored
@@ -237,7 +251,7 @@ pub fn produce(
         justified_root,
         finalized_root,
         attestation_root: derive::attestation_root(&attestations),
-        coherence_root: derive::expected_coherence(parent),
+        coherence_root,
     };
 
     // ── Point of no return: a header now exists for this slot. Record the
@@ -518,7 +532,7 @@ mod tests {
         // Carried roots and the post-state root.
         let (justified, finalized) = derive::expected_finality(&parent);
         assert_eq!((h.justified_root, h.finalized_root), (justified, finalized));
-        assert_eq!(h.coherence_root, derive::expected_coherence(&parent));
+        assert_eq!(Ok(h.coherence_root), derive::expected_coherence(&parent, h.slot, &[]));
         assert_eq!(
             h.state_root,
             derive::post_state_root(&parent, h.slot, mix, &envelope.body.attestations)
@@ -797,7 +811,7 @@ mod tests {
                 && h.attestation_root == derive::attestation_root(&e.body.attestations)
                 && h.justified_root == justified
                 && h.finalized_root == finalized
-                && h.coherence_root == derive::expected_coherence(&parent)
+                && Ok(h.coherence_root) == derive::expected_coherence(&parent, h.slot, &[])
                 && h.state_root
                     == derive::post_state_root(&parent, h.slot, mix, &e.body.attestations)
                 && MockCrypto.verify(h.proposer_index, &h.proposal_signing_root(), &e.proposer_sig)

@@ -32,6 +32,15 @@ coherence-core = { path = "../coherence-core" }
 
 [dev-dependencies]
 hex = "0.4"
+# NOTE: coherence-core is NOT repeated here. DEV-10 added it as a
+# dev-dependency with a comment saying the shipped binary never links the
+# pool's hashing — that was true of the crate as it stood in the spec, and
+# false of the crate as it stands now: the Coherence wave put the pool STATE
+# inside `CommittedState`, so coherence-core is a real `[dependencies]` edge
+# (see the note there). The dev entry was a redundant duplicate carrying a
+# statement the dependency above contradicts. The tests that hold the
+# byte-pinned COHERENCE_EMPTY_* roots against the C1-frozen computation reach
+# coherence-core through the normal dependency.
 
 # The suite walks 8,192-step SHAKE-256 reveal chains and 256-deep SMTs, so an
 # unoptimized Keccak permutation puts tens of seconds on `cargo test`. Optimize

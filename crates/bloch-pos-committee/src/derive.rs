@@ -331,28 +331,124 @@ pub fn coherence_binding(accumulator_root: &[u8; 32], nullifier_root: &[u8; 32])
 // Coherence engine — computes it there, with the same code the SP1 guest runs.
 
 
+// ── Shielded application (§6.6) ─────────────────────────────────────────────
+
+/// One shielded transaction as the **application seam** sees it: the digests
+/// it contributes to the committed pool state, and nothing else.
+///
+/// Deliberately not a wire format. The transaction's on-chain encoding, its
+/// body tag and the proof it carries are DEV-9's, and they hang on an open
+/// architecture decision — the measured SP1 proof does not fit the block
+/// (core 2.66 MiB, compressed 1.21 MiB, against the 524,288-byte cap). This
+/// type freezes none of that: it carries no bytes, no proof and no
+/// verification result, only what root application consumes. Whatever
+/// carriage DEV-9 lands, it reduces to this before it touches state — and
+/// proof verification happens **before** the reduction, never after (an
+/// unverified delta must not exist).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShieldedDelta {
+    /// Note commitments this transaction appends to the accumulator, in the
+    /// transaction's own order.
+    pub note_commitments: Vec<[u8; 32]>,
+    /// Nullifiers this transaction inserts into the nullifier set.
+    pub nullifiers: Vec<[u8; 32]>,
+}
+
+/// Why a block's shielded deltas cannot be applied.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShieldedReject {
+    /// A shielded delta appeared in a block whose epoch is below
+    /// [`crate::params::COHERENCE_ACTIVATION_EPOCH`]. Before the flag day the
+    /// pool is carried-never-recomputed, so a shielded transaction is not a
+    /// no-op to skip — it is an invalid block.
+    NotActive,
+    /// The gate is open but no pool state is bound that can re-root the C1
+    /// trees. Fail closed: accepting a delta without moving the roots would
+    /// commit a mirror over state the chain did not reach. This variant
+    /// disappears when DEV-5's pool state is bound behind [`apply_shielded`].
+    PoolUnavailable,
+}
+
+/// Apply one block's shielded deltas to the committed pool roots, returning
+/// the **post-state** `(accumulator_root, nullifier_root)` pair.
+///
+/// The one definition of shielded application at this layer — the transition
+/// mutates its clone with exactly this function's output, and
+/// [`expected_coherence`] derives the header mirror from it, so the committed
+/// roots and the mirror cannot be computed two ways.
+///
+/// Three arms, in order:
+/// - **empty block** → identity. Total, gate-independent, and bit-for-bit the
+///   carried-roots behaviour every block on the live chain was produced
+///   under — which is what keeps a full replay of the existing log
+///   root-identical (the merge gate for this seam).
+/// - **deltas below the flag day** → [`ShieldedReject::NotActive`].
+/// - **deltas at/after the flag day** → delegated re-rooting. §6.6.1 forbids
+///   this crate re-rooting the pool (the C1-frozen SHAKE-256 trees live in
+///   `coherence-core`, and a root cannot be advanced without the tree behind
+///   it), so until DEV-5's pool state is bound here this arm fails closed
+///   with [`ShieldedReject::PoolUnavailable`]. That binding is the ONE marked
+///   place application becomes real; nothing else changes shape.
+///
+/// `block_epoch` is the epoch derived from the block being judged — committed
+/// data, never a clock (see the gate's doc in [`crate::params`]).
+pub fn apply_shielded(
+    block_epoch: u64,
+    pre_accumulator_root: &[u8; 32],
+    pre_nullifier_root: &[u8; 32],
+    shielded: &[ShieldedDelta],
+) -> Result<([u8; 32], [u8; 32]), ShieldedReject> {
+    if shielded.is_empty() {
+        return Ok((*pre_accumulator_root, *pre_nullifier_root));
+    }
+    if block_epoch < crate::params::COHERENCE_ACTIVATION_EPOCH {
+        return Err(ShieldedReject::NotActive);
+    }
+    // DEV-5 binding point: pool_state.apply(pre roots, deltas) -> post roots.
+    Err(ShieldedReject::PoolUnavailable)
+}
+
 /// The coherence root the child header must carry: the [`coherence_binding`]
-/// of the **parent's committed** accumulator and nullifier-set roots.
+/// of the child's **post-state** pool roots — the parent's committed roots
+/// with the block's shielded deltas applied through [`apply_shielded`].
 ///
 /// Derived from `parent.chain`, not copied from `parent.header`: a value that
 /// is only ever copied forward is anchored in nothing but the genesis stamp,
 /// and validates nothing (the §5.5 "no value the validator cannot re-derive
-/// from committed state" rule). Because shielded-transaction application is
-/// inert at this seam — [`post_chain_state`] carries both roots unchanged —
-/// the parent's committed roots ARE the child's post-state roots, so this is
-/// simultaneously "carried, never re-rooted" (§6.6.1) and re-derivable.
+/// from committed state" rule). While application is inert (no shielded wire
+/// format exists, the flag day is unarmed) the post roots ARE the parent's
+/// committed roots, so this is simultaneously "carried, never re-rooted"
+/// (§6.6.1) and re-derivable — and byte-identical to what it always returned.
 ///
-/// When DEV-3 wires shielded application, [`post_chain_state`] starts
-/// updating the two roots and this function must take the block's shielded
-/// transactions and derive from the *post* state. Change the signature when
-/// that happens — both the producer ([`crate::produce`]) and the validator
-/// call this one function, so the compiler will hold them together through
-/// the change (the h28080 lesson, applied forward).
-pub fn expected_coherence(parent: &ParentState<'_>) -> [u8; 32] {
-    coherence_binding(
+/// ## Scope, stated honestly (2026-08-29 correction)
+///
+/// A previous doc here promised that "both the producer and the validator
+/// call this one function, so the compiler will hold them together". That was
+/// false, and it is the kind of falsehood that causes h28080-shaped stalls:
+/// this function's producer is [`crate::produce`], which has **no production
+/// caller** — the live pair is the node's proposer
+/// (`bloch-pos-node/src/engine.rs`, stamping `CommittedState::coherence_root`)
+/// and the transition's mirror check, which since this change compares
+/// against the state the transition **computes** (post-application), not the
+/// state it was handed. Those two are held together by the proposer's probe
+/// (`compute_post_state` runs before the header is signed), not by this
+/// signature. This function keeps the derive-stack internally consistent and
+/// nothing more; whoever changes the mirror's semantics must change the
+/// transition, and the transition's own coherence step is where the live rule
+/// lives.
+pub fn expected_coherence(
+    parent: &ParentState<'_>,
+    block_slot: u64,
+    shielded: &[ShieldedDelta],
+) -> Result<[u8; 32], ShieldedReject> {
+    let (acc, nf) = apply_shielded(
+        crate::epoch_of(block_slot),
         &parent.chain.coherence_accumulator_root,
         &parent.chain.coherence_nullifier_root,
-    )
+        shielded,
+    )?;
+    Ok(coherence_binding(&acc, &nf))
 }
 
 // ── Body commitments (DS_BODY domain, §6.1) ─────────────────────────────────
@@ -728,19 +824,26 @@ mod coherence_tests {
         let expected = coherence_binding(&[0x12; 32], &[0x13; 32]);
         for header in [&honest, &stale] {
             let parent = ParentState { header, chain: &chain, reveal_states: &[] };
-            assert_eq!(expected_coherence(&parent), expected);
+            assert_eq!(expected_coherence(&parent, 1, &[]), Ok(expected));
         }
     }
 
-    /// Carriage invariant while shielded application is inert: whatever block
-    /// is applied, [`post_chain_state`] leaves both Coherence roots untouched
-    /// — so `expected_coherence` over the parent equals the binding of the
-    /// child's post-state roots, and the mirror stays consistent block after
-    /// block. The day this test fails is the day shielded application was
-    /// wired in — at which point `expected_coherence` must move to the post
-    /// state (see its doc).
+    /// Pre-activation carriage invariant (block epoch <
+    /// [`crate::params::COHERENCE_ACTIVATION_EPOCH`]): whatever block is
+    /// applied, [`post_chain_state`] leaves both Coherence roots untouched,
+    /// an empty [`apply_shielded`] is the identity, and `expected_coherence`
+    /// equals the binding of the carried roots — so the mirror stays
+    /// consistent block after block, byte-identical to the live chain's
+    /// entire history.
+    ///
+    /// This test used to say "the day this test fails is the day shielded
+    /// application was wired in". Application is wired now (2026-08-29,
+    /// `transition::compute_post_state`), and this invariant did NOT move:
+    /// below the flag day it holds by consensus rule, not by absence of code
+    /// — a shielded delta before activation is an invalid block
+    /// ([`ShieldedReject::NotActive`]), pinned here.
     #[test]
-    fn post_chain_state_carries_both_coherence_roots_unchanged() {
+    fn coherence_roots_carried_unchanged_below_activation() {
         let parent_chain = chain([0xAA; 32], [0xBB; 32]);
         let header = header_with_coherence(coherence_binding(&[0xAA; 32], &[0xBB; 32]));
         let parent = ParentState { header: &header, chain: &parent_chain, reveal_states: &[] };
@@ -748,8 +851,49 @@ mod coherence_tests {
         assert_eq!(post.coherence_accumulator_root, [0xAA; 32]);
         assert_eq!(post.coherence_nullifier_root, [0xBB; 32]);
         assert_eq!(
-            expected_coherence(&parent),
-            coherence_binding(&post.coherence_accumulator_root, &post.coherence_nullifier_root),
+            expected_coherence(&parent, 1, &[]),
+            Ok(coherence_binding(&post.coherence_accumulator_root, &post.coherence_nullifier_root)),
+        );
+        // A delta below the flag day is refused, not skipped: skipping would
+        // let a pre-activation block smuggle shielded content the roots never
+        // committed.
+        let delta = ShieldedDelta {
+            note_commitments: vec![[0x01; 32]],
+            nullifiers: vec![[0x02; 32]],
+        };
+        assert_eq!(
+            expected_coherence(&parent, 1, std::slice::from_ref(&delta)),
+            Err(ShieldedReject::NotActive),
+        );
+    }
+
+    /// [`apply_shielded`]'s three arms, pinned one by one.
+    ///
+    /// The empty-block arm must be the identity at EVERY epoch — including at
+    /// and past the flag day — because that is what keeps a replay of the
+    /// live blocks.log root-identical after the gate arms: the historical
+    /// blocks carry no shielded deltas, so their roots must keep carrying.
+    /// The post-activation arm fails CLOSED until DEV-5's pool state is bound
+    /// (a root cannot be advanced without the tree behind it, §6.6.1).
+    #[test]
+    fn apply_shielded_gate_arms() {
+        let acc = [0xA1; 32];
+        let nf = [0xB2; 32];
+        // Identity on empty, gate-independent.
+        for epoch in [0, 7, crate::params::COHERENCE_ACTIVATION_EPOCH, u64::MAX] {
+            assert_eq!(apply_shielded(epoch, &acc, &nf, &[]), Ok((acc, nf)));
+        }
+        let delta = ShieldedDelta {
+            note_commitments: vec![[0x03; 32]],
+            nullifiers: vec![[0x04; 32]],
+        };
+        let deltas = std::slice::from_ref(&delta);
+        // Below the flag day: invalid block, not a skip.
+        assert_eq!(apply_shielded(0, &acc, &nf, deltas), Err(ShieldedReject::NotActive));
+        // At/after the flag day: fail closed until the pool state binds.
+        assert_eq!(
+            apply_shielded(crate::params::COHERENCE_ACTIVATION_EPOCH, &acc, &nf, deltas),
+            Err(ShieldedReject::PoolUnavailable),
         );
     }
 
