@@ -307,6 +307,37 @@ pub const TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH: u64 = 800;
 /// the 2026-08-08 `expected_bits` fork cost us.
 pub const BLOCK_BYTES_V2_ACTIVATION_EPOCH: u64 = 800;
 
+/// Flag day for the Coherence shielded-pool anchor policy
+/// (`state_root::TAG_COHERENCE_ANCHORS`, 2026-08-29).
+///
+/// From this epoch, `transition::close_epoch` starts maintaining the
+/// committed anchor record: it snapshots the accumulator root at every epoch
+/// boundary and, when a checkpoint finalizes, promotes the snapshot that
+/// finalization made irreversible into the anchor set a shielded spend may
+/// name (`CommittedState::require_coherence_anchor`). The record is committed
+/// as a state-root leaf **only once it is non-empty**, so below this epoch
+/// every state root is byte-identical to the roots the fleet signs today —
+/// the genesis ceremony committed no anchor leaf, and deriving one
+/// unconditionally would have forked the live chain at rollout.
+///
+/// `u64::MAX` means INERT: every node ships the whole mechanism — leaf,
+/// maintenance, validation rule — and none of it changes a single committed
+/// byte until this constant is lowered and the fleet is rebuilt together.
+/// Same idiom as [`TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH`]; the gate reads
+/// the COMMITTED epoch being closed, never node-local state — the 2026-08-08
+/// `expected_bits` fork is the standing reason.
+///
+/// **Arming precondition, on top of the fleet rebuild:** the finality-rewind
+/// violation recorded on this network (nodes re-finalizing below their own
+/// finalized checkpoint — the descending ratchet in the node's `FcStore`)
+/// must be fixed first. The whole security argument of the anchor policy is
+/// "finalized cannot be un-created"; on a fleet where finality can rewind, a
+/// committed anchor can name a root the rewound chain no longer contains,
+/// and a shielded spend then survives on one node and not another. Inert,
+/// this constant costs nothing; armed before that fix, it converts a known
+/// liveness defect into a consensus split.
+pub const COHERENCE_ANCHOR_ACTIVATION_EPOCH: u64 = u64::MAX;
+
 /// **The F6 seed look-ahead is UNCONDITIONAL.** There is no flag day.
 ///
 /// `CommittedState::seed_for_epoch` seeds epoch `E` from the mix at the close
@@ -432,10 +463,11 @@ pub mod rehearsal {
         static GATES_OPEN_TL: Cell<bool> = const { Cell::new(false) };
     }
 
-    /// Test-only: treat [`super::ANCESTRY_SEED_ACTIVATION_EPOCH`] and
-    /// [`super::LEAK_RECOVERY_ACTIVATION_EPOCH`] as if they had already bound.
+    /// Test-only: treat the inert flag days — among them
+    /// [`super::COHERENCE_ANCHOR_ACTIVATION_EPOCH`] — as if they had already
+    /// bound.
     ///
-    /// The two flag days ship INERT (`u64::MAX`), which is correct — the fleet
+    /// The inert flag days ship at `u64::MAX`, which is correct — the fleet
     /// must replay its existing log under the OLD rules — but it means no epoch
     /// a test can construct ever reaches them. Without this, every test of the
     /// post-flag-day behaviour would be dead code, and the only tests left

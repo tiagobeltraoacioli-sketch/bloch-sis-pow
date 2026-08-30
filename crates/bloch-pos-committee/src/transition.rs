@@ -1177,6 +1177,26 @@ pub struct CommittedState {
     /// leaf — deliberately NOT added here, so the ratchet's semantics arrive
     /// with their owner rather than as an uncommitted stub.
     coherence_pool: CoherencePoolState,
+    /// The shielded-pool anchor set (`TAG_COHERENCE_ANCHORS`, 2026-08-29):
+    /// finalized-checkpoint epoch → the accumulator root that finalization
+    /// made irreversible. Membership here is THE validity rule for a
+    /// shielded spend's anchor ([`Self::require_coherence_anchor`]); the
+    /// last [`crate::state_root::COHERENCE_ANCHORS_RETAINED`] are kept.
+    /// Empty until [`crate::params::COHERENCE_ANCHOR_ACTIVATION_EPOCH`]
+    /// opens the writer in `close_epoch` — and while empty, the record
+    /// contributes no leaf, so pre-activation roots are unchanged.
+    coherence_anchors: BTreeMap<u64, [u8; 32]>,
+    /// Boundary snapshots feeding the map above: closed epoch → the
+    /// accumulator root at that epoch's close, last
+    /// [`crate::state_root::COHERENCE_BOUNDARY_ROOTS_RETAINED`] retained.
+    /// Committed (same leaf) because the promotion *derives* the next
+    /// anchor from it — kept node-locally it would be `expected_bits` for
+    /// the shielded pool. Why the buffer exists at all: the root that
+    /// finalizing checkpoint `F` actually covers is the one at the close of
+    /// epoch `F − 1`, never the root current at promotion time, which holds
+    /// 1–2 epochs of UNFINALIZED appends — anchoring those would let a
+    /// conforming rewind un-create a spendable note.
+    coherence_boundary_roots: BTreeMap<u64, [u8; 32]>,
     /// L1 EVM execution commitment, carried (`BLOCH-L1-EVM-STATE-MODEL.md`).
     /// The node's execution layer computes it; this transition only commits
     /// it, exactly like the Coherence roots above.
@@ -1583,6 +1603,20 @@ fn owns(key_hash: &[u8; 32], script_hash: &[u8; 32]) -> bool {
     script_hash[20..] == [0u8; 12] && key_hash[..20] == script_hash[..20]
 }
 
+/// Why a shielded spend's anchor was refused
+/// ([`CommittedState::require_coherence_anchor`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoherenceAnchorReject {
+    /// The named accumulator root is not among the last
+    /// [`crate::state_root::COHERENCE_ANCHORS_RETAINED`]
+    /// finalized-checkpoint roots the state commits. One variant for every
+    /// cause on purpose — "the set is empty because the policy is not yet
+    /// active", "the anchor rotated out", and "the anchor never existed"
+    /// must be indistinguishable to the submitter, or the error becomes an
+    /// oracle over the pool's history.
+    UnknownAnchor,
+}
+
 impl CommittedState {
     /// The state committed by the genesis block. Its checkpoint is justified
     /// and finalized by definition — finality needs a root of trust.
@@ -1674,6 +1708,12 @@ impl CommittedState {
             // Empty until the COHERENCE_ACTIVATION_EPOCH flag day; the
             // committed roots stay the two carried values above until then.
             coherence_pool: CoherencePoolState::default(),
+            // Empty at genesis on purpose, and the ceremony committed no
+            // anchor leaf: the anchor policy activates by flag day
+            // (`params::COHERENCE_ANCHOR_ACTIVATION_EPOCH`), and seeding an
+            // anchor here would change the genesis state root.
+            coherence_anchors: BTreeMap::new(),
+            coherence_boundary_roots: BTreeMap::new(),
             evm,
             issued_sat: tokenomics_v4::GENESIS_ISSUED_SAT,
             eutxos: opening_balances.iter().cloned().collect(),
@@ -2134,8 +2174,35 @@ impl CommittedState {
             },
             delegator_fee_rewards: &delegator_fee_rewards,
             taint_root: self.taint_root,
+            // Through the flag-day resolver, NOT `self.*` directly: pre-activation
+            // it carries the sentinels verbatim (byte-identical replay of the live
+            // chain), post-activation it derives from the pool. Reading the fields
+            // raw here would bypass the gate — the merge of the pool-state and
+            // anchor-leaf branches offered both spellings, and only this one is
+            // correct.
             coherence_accumulator_root,
             coherence_nullifier_root,
+            // The anchor-policy record: both halves, straight from the
+            // committed maps. Empty until the flag-day writer runs, and an
+            // empty record contributes no leaf (its docs carry the rule).
+            coherence_anchors: crate::state_root::CoherenceAnchorRecord {
+                anchors: self
+                    .coherence_anchors
+                    .iter()
+                    .map(|(epoch, root)| crate::state_root::CoherenceAnchorEntry {
+                        epoch: *epoch,
+                        accumulator_root: *root,
+                    })
+                    .collect(),
+                boundary_roots: self
+                    .coherence_boundary_roots
+                    .iter()
+                    .map(|(epoch, root)| crate::state_root::CoherenceAnchorEntry {
+                        epoch: *epoch,
+                        accumulator_root: *root,
+                    })
+                    .collect(),
+            },
             evm: self.evm,
             issued_sat: self.issued_sat,
         }, self.eutxos.tree())
@@ -2957,6 +3024,111 @@ impl CommittedState {
 
     // ── Epoch boundary ──────────────────────────────────────────────────────
 
+    /// One step of the shielded-pool anchor policy, run at the close of
+    /// epoch `closing` (gated by the caller — see `close_epoch` step 1b).
+    ///
+    /// Two halves, in this order:
+    ///
+    /// 1. **Promote.** If this boundary's tally newly finalized checkpoint
+    ///    `F` (`finalized_now = Some(F)`), the root that finalization made
+    ///    irreversible is the boundary snapshot of epoch `F − 1` — the
+    ///    chain up to `F`'s checkpoint block, which is the last block
+    ///    strictly before `F`'s first slot. NOT the current accumulator
+    ///    root: that one holds 1–2 epochs of unfinalized appends, and
+    ///    anchoring it would let a rewind-conforming node un-create a note
+    ///    another node already accepted a spend of. The snapshot enters
+    ///    [`Self::coherence_anchors`] keyed by `F`, and the set trims to
+    ///    the last [`crate::state_root::COHERENCE_ANCHORS_RETAINED`].
+    /// 2. **Snapshot.** Record this boundary's accumulator root for a
+    ///    later finalization to promote, trimming the buffer to
+    ///    [`crate::state_root::COHERENCE_BOUNDARY_ROOTS_RETAINED`]` = 2` —
+    ///    exact because Casper k=1 adjacency means the only checkpoint
+    ///    `close_epoch(E)` can newly finalize is `E − 1`, whose covered
+    ///    prefix ends at boundary `E − 2` (the constant's docs carry the
+    ///    proof; the promotion-order dependence — promote BEFORE recording
+    ///    `closing` — is part of it).
+    ///
+    /// A miss in step 1 does not promote — fail closed: the existing
+    /// anchors stay valid, only newer notes wait. With dense boundaries
+    /// (`compute_post_state` walks every epoch) a miss is reachable only on
+    /// the activation ramp, when `F − 1` closed before the gate opened; the
+    /// `debug_assert` pins that reasoning without making untrusted input a
+    /// halt lever.
+    fn roll_coherence_anchors(&mut self, closing: u64, finalized_now: Option<u64>) {
+        if let Some(f) = finalized_now {
+            match f.checked_sub(1).and_then(|e| self.coherence_boundary_roots.get(&e)).copied() {
+                Some(root) => {
+                    self.coherence_anchors.insert(f, root);
+                    while self.coherence_anchors.len()
+                        > crate::state_root::COHERENCE_ANCHORS_RETAINED
+                    {
+                        self.coherence_anchors.pop_first();
+                    }
+                }
+                None => {
+                    // Legitimate only when the wanted epoch predates
+                    // everything this buffer ever recorded (the activation
+                    // ramp). Anything else means the retention proof above
+                    // no longer matches the finality rule — widen the
+                    // buffer with it.
+                    debug_assert!(
+                        f.checked_sub(1).is_none()
+                            || self
+                                .coherence_boundary_roots
+                                .keys()
+                                .next()
+                                .is_none_or(|first| f - 1 < *first),
+                        "finalization of checkpoint {f} wanted boundary {} but the \
+                         committed buffer holds {:?} — the finality rule and \
+                         COHERENCE_BOUNDARY_ROOTS_RETAINED have diverged",
+                        f - 1,
+                        self.coherence_boundary_roots.keys().collect::<Vec<_>>(),
+                    );
+                }
+            }
+        }
+        self.coherence_boundary_roots.insert(closing, self.coherence_accumulator_root);
+        while self.coherence_boundary_roots.len()
+            > crate::state_root::COHERENCE_BOUNDARY_ROOTS_RETAINED
+        {
+            self.coherence_boundary_roots.pop_first();
+        }
+    }
+
+    /// **The** validity rule for a shielded spend's anchor: the accumulator
+    /// root the proof was built against must be one a finalized checkpoint
+    /// committed — membership in [`Self::coherence_anchors`], nothing else.
+    ///
+    /// The carriage that will call this does not exist yet (the pool is
+    /// inert under PoS, §6.6.1); the rule ships first so the admission path
+    /// is frozen before the traffic: whoever wires shielded transactions
+    /// into `apply_transaction` MUST route the anchor through here, and
+    /// MUST judge nullifier non-membership against the pre-state's
+    /// *current* `coherence_nullifier_root` — never against any anchor-era
+    /// set, which would readmit a double spend.
+    ///
+    /// Fail-closed by construction: before the flag day (or before the
+    /// first post-activation finalization) the set is empty and every
+    /// anchor is refused. The accepted cost, stated: a new note becomes
+    /// spendable only when its epoch's checkpoint finalizes — 2 epochs (32
+    /// minutes) behind head in the good regime, indefinitely during a
+    /// finality stall, during which every EXISTING anchor stays valid. Spam
+    /// cannot shorten or flush the window (Genesis-3's per-transaction
+    /// window could be flushed in ~2 minutes); only finality moves it.
+    pub fn require_coherence_anchor(&self, anchor: &[u8; 32]) -> Result<(), CoherenceAnchorReject> {
+        if self.coherence_anchors.values().any(|root| root == anchor) {
+            Ok(())
+        } else {
+            Err(CoherenceAnchorReject::UnknownAnchor)
+        }
+    }
+
+    /// The committed anchor set, oldest first — the read surface a wallet
+    /// or RPC uses to pick the newest finalized anchor to prove against.
+    pub fn coherence_anchors(&self) -> impl Iterator<Item = (u64, [u8; 32])> + '_ {
+        self.coherence_anchors.iter().map(|(epoch, root)| (*epoch, *root))
+    }
+
     /// Close the current epoch E and open E+1. Infallible and pure — it runs
     /// whether or not the boundary slot carried a block, because a withheld
     /// proposal must not become a lever over everyone's rewards or over the
@@ -2967,6 +3139,10 @@ impl CommittedState {
         let mut st = self.clone();
         let closing = st.epoch;
         let roster = st.duty_roster_at(closing);
+
+        // Filled by step 1 when this boundary's tally newly finalizes a
+        // checkpoint; read by the anchor roll below it.
+        let mut finalized_now: Option<u64> = None;
 
         // 1. Justification and finality (finality.rs). Epoch 0's checkpoint
         //    is the genesis root of trust — already justified and finalized —
@@ -3053,7 +3229,24 @@ impl CommittedState {
             // Out-of-order is unreachable: this is the only call site and it
             // feeds epochs densely by construction. A total no-op on Err
             // beats a panic in a consensus path.
-            let _ = st.finality_engine.process_epoch(&epoch_votes);
+            if let Ok(outcome) = st.finality_engine.process_epoch(&epoch_votes) {
+                finalized_now = outcome.finalized.map(|cp| cp.epoch);
+            }
+        }
+
+        // 1b. The shielded-pool anchor roll (`TAG_COHERENCE_ANCHORS`):
+        // promote the boundary snapshot the new finalization made
+        // irreversible, then snapshot this boundary for a later one. GATED —
+        // below the flag day nothing is written, the record stays empty, and
+        // an empty record contributes no leaf, so every pre-activation state
+        // root is byte-identical to what the live fleet signs. The gate
+        // reads `closing`, which is COMMITTED state, never node-local.
+        #[cfg(test)]
+        let anchor_gate_open = crate::params::rehearsal::gates_are_forced_open();
+        #[cfg(not(test))]
+        let anchor_gate_open = false;
+        if anchor_gate_open || closing >= crate::params::COHERENCE_ANCHOR_ACTIVATION_EPOCH {
+            st.roll_coherence_anchors(closing, finalized_now);
         }
 
         // 2. Rewards for the closed epoch (rewards.rs). Issuance follows the
@@ -4831,6 +5024,158 @@ mod tests {
         assert_eq!(fin.justified, Checkpoint { epoch: 2, root: *cp2.as_bytes() });
         assert_eq!(fin.finalized, Checkpoint { epoch: 1, root: *cp1.as_bytes() });
         assert_eq!(fin.previous_justified, Checkpoint { epoch: 1, root: *cp1.as_bytes() });
+    }
+
+    /// The shielded-pool anchor roll, driven through the REAL path — real
+    /// blocks, real votes, real `close_epoch`, real finality engine — with
+    /// the flag day forced open for this thread.
+    ///
+    /// The property under test is the one the whole policy stands on: when
+    /// checkpoint `F` finalizes, the anchor admitted is the accumulator root
+    /// at the close of epoch `F − 1` — the prefix that finalization actually
+    /// made irreversible — and neither the root at `F`'s own close nor the
+    /// root current at promotion time, both of which contain unfinalized
+    /// appends a conforming rewind could still erase. The pool is inert
+    /// under PoS, so each epoch is given a distinct accumulator root by
+    /// mutating the carried field directly between blocks — exactly what an
+    /// active pool layer would commit.
+    ///
+    /// This test is also the tripwire
+    /// `state_root::COHERENCE_BOUNDARY_ROOTS_RETAINED`'s docs name: it
+    /// exercises promotion at the maximum lag the k=1 adjacency rule
+    /// permits, so a finality-rule change that widens the lag lands here
+    /// first (as the `debug_assert` in `roll_coherence_anchors`).
+    #[test]
+    fn finalization_promotes_the_prior_boundary_accumulator_root() {
+        // The policy ships INERT behind its flag day; open it for this
+        // thread so this is not dead code. See params::rehearsal.
+        let _gates = crate::params::rehearsal::gates_open_guard();
+        let (t, mut g, mut chains) = setup(8);
+
+        const ROOT_E0: [u8; 32] = [0xA0; 32];
+        const ROOT_E1: [u8; 32] = [0xA1; 32];
+        const ROOT_E2: [u8; 32] = [0xA2; 32];
+        g.coherence_accumulator_root = ROOT_E0;
+
+        // Nothing is spendable before the first post-activation
+        // finalization: fail closed, not open.
+        assert!(g.require_coherence_anchor(&ROOT_E0).is_err());
+
+        // Crossing into epoch 1 closes epoch 0 and snapshots boundary(0).
+        let b1 = build_block(&t, &g, 32, &[], &[], &mut chains);
+        let mut s1 = t.apply_block(&g, &b1, &[], &[]).unwrap();
+        let cp1 = s1.head();
+        assert_eq!(
+            s1.coherence_boundary_roots,
+            BTreeMap::from([(0u64, ROOT_E0)]),
+            "closing epoch 0 must snapshot its boundary accumulator root"
+        );
+        assert!(s1.coherence_anchors.is_empty(), "nothing finalized yet");
+
+        // The pool appends during epoch 1.
+        s1.coherence_accumulator_root = ROOT_E1;
+
+        let atts1 = full_epoch_attestations(&s1, *cp1.as_bytes());
+        let b2 = build_block(&t, &s1, 63, &atts1, &[], &mut chains);
+        let s2 = t.apply_block(&s1, &b2, &atts1, &[]).unwrap();
+
+        // Crossing into epoch 2 closes epoch 1: justifies cp1, finalizes
+        // nothing, snapshots boundary(1).
+        let b3 = build_block(&t, &s2, 64, &[], &[], &mut chains);
+        let mut s3 = t.apply_block(&s2, &b3, &[], &[]).unwrap();
+        let cp2 = s3.head();
+        assert_eq!(
+            s3.coherence_boundary_roots,
+            BTreeMap::from([(0u64, ROOT_E0), (1u64, ROOT_E1)]),
+        );
+        assert!(s3.coherence_anchors.is_empty(), "one justification finalizes nothing");
+
+        // The pool appends during epoch 2.
+        s3.coherence_accumulator_root = ROOT_E2;
+
+        // Epoch 2's votes make the link consecutive: closing epoch 2
+        // finalizes checkpoint 1.
+        let atts2 = full_epoch_attestations(&s3, *cp2.as_bytes());
+        let b4 = build_block(&t, &s3, 95, &atts2, &[], &mut chains);
+        let s4 = t.apply_block(&s3, &b4, &atts2, &[]).unwrap();
+        let b5 = build_block(&t, &s4, 96, &[], &[], &mut chains);
+        let s5 = t.apply_block(&s4, &b5, &[], &[]).unwrap();
+        assert_eq!(s5.finality().finalized.epoch, 1, "precondition: cp1 finalized");
+
+        // THE PROPERTY: the promoted anchor is boundary(F − 1) = ROOT_E0 —
+        // not ROOT_E1 (the close of F itself, one epoch of unfinalized
+        // appends) and not ROOT_E2 (the root current at promotion time).
+        assert_eq!(
+            s5.coherence_anchors,
+            BTreeMap::from([(1u64, ROOT_E0)]),
+            "finalizing checkpoint F must promote the boundary root of F − 1"
+        );
+        assert!(s5.require_coherence_anchor(&ROOT_E0).is_ok());
+        assert_eq!(
+            s5.require_coherence_anchor(&ROOT_E1),
+            Err(CoherenceAnchorReject::UnknownAnchor),
+            "the unfinalized epoch's root must not be spendable against"
+        );
+        assert_eq!(
+            s5.require_coherence_anchor(&ROOT_E2),
+            Err(CoherenceAnchorReject::UnknownAnchor),
+        );
+        // The buffer rolled: last 2 boundaries only.
+        assert_eq!(
+            s5.coherence_boundary_roots,
+            BTreeMap::from([(1u64, ROOT_E1), (2u64, ROOT_E2)]),
+        );
+
+        // One more epoch: closing epoch 3 finalizes checkpoint 2 and
+        // promotes boundary(1) — the set accumulates in epoch order and the
+        // older anchor stays valid.
+        let cp3 = s5.head();
+        let atts3 = full_epoch_attestations(&s5, *cp3.as_bytes());
+        let b6 = build_block(&t, &s5, 127, &atts3, &[], &mut chains);
+        let s6 = t.apply_block(&s5, &b6, &atts3, &[]).unwrap();
+        let b7 = build_block(&t, &s6, 128, &[], &[], &mut chains);
+        let s7 = t.apply_block(&s6, &b7, &[], &[]).unwrap();
+        assert_eq!(s7.finality().finalized.epoch, 2);
+        assert_eq!(
+            s7.coherence_anchors,
+            BTreeMap::from([(1u64, ROOT_E0), (2u64, ROOT_E1)]),
+        );
+        assert!(s7.require_coherence_anchor(&ROOT_E0).is_ok(), "older anchors stay valid");
+        assert!(s7.require_coherence_anchor(&ROOT_E1).is_ok());
+    }
+
+    /// The other side of the flag day: with the gate at its shipped value
+    /// (`u64::MAX`), the exact sequence that finalizes a checkpoint writes
+    /// NOTHING into the anchor record — no maps, no leaf, no state-root
+    /// movement relative to today's rules — and every anchor is refused.
+    /// An unadorned `cargo test` runs the configuration the fleet runs.
+    #[test]
+    fn anchor_policy_is_inert_below_the_flag_day() {
+        let (t, g, mut chains) = setup(8);
+
+        let b1 = build_block(&t, &g, 32, &[], &[], &mut chains);
+        let s1 = t.apply_block(&g, &b1, &[], &[]).unwrap();
+        let cp1 = s1.head();
+        let atts1 = full_epoch_attestations(&s1, *cp1.as_bytes());
+        let b2 = build_block(&t, &s1, 63, &atts1, &[], &mut chains);
+        let s2 = t.apply_block(&s1, &b2, &atts1, &[]).unwrap();
+        let b3 = build_block(&t, &s2, 64, &[], &[], &mut chains);
+        let s3 = t.apply_block(&s2, &b3, &[], &[]).unwrap();
+        let cp2 = s3.head();
+        let atts2 = full_epoch_attestations(&s3, *cp2.as_bytes());
+        let b4 = build_block(&t, &s3, 95, &atts2, &[], &mut chains);
+        let s4 = t.apply_block(&s3, &b4, &atts2, &[]).unwrap();
+        let b5 = build_block(&t, &s4, 96, &[], &[], &mut chains);
+        let s5 = t.apply_block(&s4, &b5, &[], &[]).unwrap();
+
+        assert_eq!(s5.finality().finalized.epoch, 1, "finality itself must advance");
+        assert!(s5.coherence_anchors.is_empty(), "inert gate must write no anchors");
+        assert!(s5.coherence_boundary_roots.is_empty(), "inert gate must write no snapshots");
+        assert_eq!(
+            s5.require_coherence_anchor(&s5.coherence_accumulator_root),
+            Err(CoherenceAnchorReject::UnknownAnchor),
+            "below the flag day every anchor is refused — fail closed"
+        );
     }
 
     #[test]
@@ -6721,6 +7066,16 @@ mod tests {
         });
         must_move!("coherence_nullifier_root", |g: &mut CommittedState| {
             g.coherence_nullifier_root[0] ^= 1
+        });
+        // The anchor policy (2026-08-29): both halves of the record. These
+        // insert into EMPTY maps, so they also pin the empty-record rule
+        // from the state side — a record that stayed uncommitted while
+        // non-empty would leave both mutations rootless and fail here.
+        must_move!("coherence_anchors", |g: &mut CommittedState| {
+            g.coherence_anchors.insert(9, [0xC9; 32]);
+        });
+        must_move!("coherence_boundary_roots", |g: &mut CommittedState| {
+            g.coherence_boundary_roots.insert(9, [0xCA; 32]);
         });
 
         // Distinct mutations must commit distinctly — a collision would mean

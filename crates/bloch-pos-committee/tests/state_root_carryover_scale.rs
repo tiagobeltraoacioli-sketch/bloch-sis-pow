@@ -293,6 +293,7 @@ fn state<'a>(f: &'a Fixture, e: &'a [EutxoEntry]) -> ConsensusState<'a> {
         taint_root: h32(101),
         coherence_accumulator_root: h32(102),
         coherence_nullifier_root: h32(103),
+        coherence_anchors: Default::default(),
         evm: EvmCommitment {
             account_root: h32(201),
             receipts_root: h32(202),
