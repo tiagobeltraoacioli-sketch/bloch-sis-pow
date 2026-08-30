@@ -75,6 +75,7 @@ use bloch_pos_committee::header::{BlockEnvelope, BlockHeaderV4, BlockId, Body, V
 use bloch_pos_committee::interfaces::{ProposalEnvelope, StateReader, StateTransition};
 use bloch_pos_committee::schedule::first_slot_of_epoch;
 use bloch_pos_committee::transition::{CommittedState, PosTransaction, Transition};
+use bloch_pos_committee::interfaces::TransitionError;
 use bloch_pos_committee::{committees, derive, epoch_of, schedule};
 
 use crate::genesis::{Manifest, GENESIS_MIX};
@@ -647,6 +648,31 @@ impl Refusal {
 }
 
 
+/// Which transaction in the body the transition is accusing, if it says.
+///
+/// `TransitionError::Transfer(u32, _)` and `Transaction(u32)` both carry "the
+/// index into the body list" — the variant docs say it in those words. Every
+/// other error names no transaction: a root mismatch, a shielded refusal, a
+/// cap breach are properties of the block or of the whole selection.
+///
+/// A free function, and bounds-checked against the CURRENT length, for two
+/// reasons. It is the one decision in the drop loop worth testing on its own —
+/// the loop around it needs a proposer slot, a RANDAO chain and a signing key
+/// to run at all. And the index came from a transition that judged a list this
+/// function may no longer be holding: the loop shrinks `txs` every round, so an
+/// index that was valid when the error was raised can be stale by the time it
+/// is used. Out of range falls back to `None`, and `None` means "drop the tail
+/// and retry", which is the behaviour that keeps the node producing.
+fn culprit_index(err: &TransitionError, len: usize) -> Option<usize> {
+    match err {
+        TransitionError::Transfer(i, _) | TransitionError::Transaction(i) => {
+            let i = *i as usize;
+            (i < len).then_some(i)
+        }
+        _ => None,
+    }
+}
+
 impl Engine {
     // ── Derivations over the canonical chain ────────────────────────────────
 
@@ -1160,11 +1186,40 @@ impl Engine {
             {
                 Ok(p) => break (p, tx_bytes),
                 Err(err) => {
-                    let Some(bad) = txs.pop() else {
-                        // Empty and still refused: the fault is not in any
-                        // transaction, so proposing is genuinely impossible.
-                        eprintln!("[slot {slot}] produce refused with no transactions: {err:?}");
-                        return;
+                    // WHICH transaction, when the transition says which.
+                    //
+                    // `TransitionError::Transfer(u32, _)` and `Transaction(u32)`
+                    // both carry "the index into the body list" — the doc on the
+                    // variant says so in those words. Popping the TAIL instead
+                    // was a defect with a cost that compounds: if the offender
+                    // sits early in the selection, the loop discards every good
+                    // transaction behind it one at a time, re-running the whole
+                    // transition each round (O(k^2) for k = MAX_TXS_PER_BLOCK),
+                    // and — since the rejection cache landed on 2026-08-30 —
+                    // BARS each of those innocent transactions for
+                    // REJECTION_TTL_SLOTS. One bad transaction could bar up to
+                    // 255 legitimate ones for ~64 minutes. The cache did not
+                    // create the defect; it turned a wasted slot into an hour
+                    // of censorship, which is why the two are fixed together.
+                    //
+                    // The tail is still the fallback for the errors that name
+                    // no index (`Shielded`, root mismatches): dropping SOMEthing
+                    // and retrying is what keeps the node producing, and that is
+                    // the whole point of this loop.
+                    let bad = match culprit_index(&err, txs.len()) {
+                        Some(i) => txs.remove(i),
+                        None => match txs.pop() {
+                            Some(t) => t,
+                            None => {
+                                // Empty and still refused: the fault is not in
+                                // any transaction, so proposing is genuinely
+                                // impossible.
+                                eprintln!(
+                                    "[slot {slot}] produce refused with no transactions: {err:?}"
+                                );
+                                return;
+                            }
+                        },
                     };
                     eprintln!(
                         "[slot {slot}] dropping a transaction the transition refuses ({err:?}); \
@@ -4221,6 +4276,38 @@ mod transfer_v2_end_to_end {
         );
         let selected_rpc = rpc_node.select_transactions(epoch_of(rpc_node.wall_slot()));
         assert_eq!(selected_rpc, vec![tx]);
+    }
+
+    /// **A transição diz QUAL transação, e o laço tem que acreditar nela.**
+    ///
+    /// O laço de descarte tirava a ÚLTIMA (`txs.pop()`) enquanto o erro carrega
+    /// o índice do corpo. Com a ofensora no início da seleção, isso descarta
+    /// uma a uma todas as boas atrás dela, re-rodando a transição inteira a
+    /// cada volta — e, desde que o cache de recusa entrou em 2026-08-30,
+    /// BARRANDO cada inocente por `REJECTION_TTL_SLOTS`. Uma transação ruim
+    /// podia barrar até 255 legítimas por ~64 minutos. O cache não criou o
+    /// defeito; transformou um slot desperdiçado em uma hora de censura.
+    #[test]
+    fn the_drop_loop_accuses_the_transaction_the_transition_named() {
+        use bloch_pos_committee::interfaces::{TransferReject, TransitionError};
+
+        // As duas variantes que nomeiam índice.
+        assert_eq!(
+            culprit_index(&TransitionError::Transfer(0, TransferReject::UnknownInput), 8),
+            Some(0),
+            "a ofensora no INICIO e o caso que o pop() da cauda errava por 7 posicoes"
+        );
+        assert_eq!(culprit_index(&TransitionError::Transaction(5), 8), Some(5));
+
+        // Índice obsoleto: o laço encurta `txs` a cada volta, então um índice
+        // válido quando o erro subiu pode não ser mais. Fora de alcance cai no
+        // descarte da cauda, que é o que mantém o nó produzindo.
+        assert_eq!(culprit_index(&TransitionError::Transaction(8), 8), None);
+        assert_eq!(culprit_index(&TransitionError::Transaction(0), 0), None);
+
+        // Erros que não nomeiam transação nenhuma continuam na cauda.
+        assert_eq!(culprit_index(&TransitionError::AttestationRootMismatch, 8), None);
+        assert_eq!(culprit_index(&TransitionError::CoherenceRootMismatch, 8), None);
     }
 
     /// **The bar is what makes the drop stick.** Removing a refused
