@@ -28,7 +28,8 @@
 //! still runs the pool, but a `Reject` costs the sender nothing here.
 //!
 //! Wire: `u32 LE frame length ‖ type byte ‖ payload`.
-//! Types: 0x01 block envelope, 0x02 attestation, 0x03 get-blocks{after_slot}.
+//! Types: 0x01 block envelope, 0x02 attestation, 0x03 get-blocks{after_slot},
+//! 0x04 transaction, 0x05 get-time, 0x06 time{now_ms} (see the constants).
 //!
 //! Topology per peer pair: each side dials the other (two TCP connections per
 //! pair). A node broadcasts on its *outbound* connections; sync requests go
@@ -56,6 +57,18 @@ pub const FRAME_GET_BLOCKS: u8 = 0x03;
 /// carries, so what a peer gossips and what a proposer commits to are the same
 /// object and no second encoding exists to disagree with the first.
 pub const FRAME_TX: u8 = 0x04;
+/// Ask a peer for its clock. Empty payload; answered with [`FRAME_TIME`] on
+/// the same socket. **This is a wire addition** (2026-08-31, the
+/// clock-vs-peer-time gate): it is backward-safe — a pre-addition binary's
+/// read loop drops any frame type it does not know, silently — but such a
+/// peer contributes no sample, so the clock check only sees peers running
+/// this build or newer. No flag day needed; rolling the fleet forward is
+/// what arms the check.
+pub const FRAME_GET_TIME: u8 = 0x05;
+/// The answer: 8 bytes, the responder's unix time in milliseconds, LE. Time,
+/// not slot: milliseconds are manifest-independent, and the requester judges
+/// skew on its own slot geometry.
+pub const FRAME_TIME: u8 = 0x06;
 
 pub use crate::p2p::{Origin, Verdict};
 
@@ -175,9 +188,17 @@ pub struct DevnetMesh {
     /// Pushing on inbound connections costs nothing — the socket is already
     /// open and the peer is already reading it.
     inbound: Arc<Mutex<Vec<SyncSender<Vec<u8>>>>>,
+    /// Where the listener actually bound — the real port when `listen_port`
+    /// was 0. Tests dial it; production reads it never.
+    local_addr: std::net::SocketAddr,
 }
 
 impl DevnetMesh {
+    /// The address the inbound listener bound (test hook; see the field).
+    pub fn local_addr(&self) -> std::net::SocketAddr {
+        self.local_addr
+    }
+
     /// Broadcast one frame (type byte + payload, no length prefix) to every
     /// peer, dialed or dialing.
     pub fn broadcast(&self, frame: Vec<u8>) {
@@ -357,10 +378,12 @@ pub fn start(
     data_dir: PathBuf,
     head_slot: Arc<AtomicU64>,
     inflight: Arc<std::sync::atomic::AtomicUsize>,
+    clock: Arc<crate::time_check::PeerClock>,
 ) -> std::io::Result<DevnetMesh> {
     // Inbound: accept, then per-connection: read frames; data frames go to
     // the engine, get-blocks is answered in place from the log.
     let listener = TcpListener::bind((bind_addr, listen_port))?;
+    let local_addr = listener.local_addr()?;
     let inbound: Arc<Mutex<Vec<SyncSender<Vec<u8>>>>> = Arc::new(Mutex::new(Vec::new()));
     {
         let events = events.clone();
@@ -405,6 +428,19 @@ pub fn start(
                         Ok(frame) => {
                             if frame.first() == Some(&FRAME_GET_BLOCKS) {
                                 serve_get_blocks(&wsock, &data_dir, &frame);
+                            } else if frame.as_slice() == [FRAME_GET_TIME] {
+                                // The peer is running the clock-vs-peer-time
+                                // gate; answer with our clock on the socket it
+                                // asked over. NOT recorded as a sample here:
+                                // inbound peers chose us, and a median open to
+                                // volunteers is a median an attacker can pack.
+                                let mut f = Vec::with_capacity(9);
+                                f.push(FRAME_TIME);
+                                f.extend_from_slice(&crate::time_check::now_ms().to_le_bytes());
+                                let Ok(mut w) = wsock.lock() else { return };
+                                if write_frame(&mut w, &f).is_err() {
+                                    return;
+                                }
                             } else if let Some(ev) = decode_event(&frame) {
                                 if !send_to_engine(&events, &inflight, ev) {
                                     return;
@@ -433,6 +469,7 @@ pub fn start(
         let head_slot = head_slot.clone();
         let sync_slots = sync_slots.clone();
         let inflight = inflight.clone();
+        let clock = clock.clone();
         thread::spawn(move || loop {
             let Ok(sock) = TcpStream::connect(&addr) else {
                 thread::sleep(Duration::from_millis(300));
@@ -443,10 +480,18 @@ pub fn start(
             if let Ok(mut rsock) = wsock.try_clone() {
                 let events = events.clone();
                 let inflight = inflight.clone();
+                let clock = clock.clone();
+                let addr = addr.clone();
                 thread::spawn(move || loop {
                     match read_frame(&mut rsock) {
                         Ok(frame) => {
-                            if let Some(ev) = decode_event(&frame) {
+                            if frame.len() == 9 && frame[0] == FRAME_TIME {
+                                // The answer to the FRAME_GET_TIME sent below.
+                                // Keyed by the CONFIGURED address: only peers
+                                // the operator chose get a clock vote.
+                                let peer_ms = u64::from_le_bytes(frame[1..9].try_into().unwrap());
+                                clock.record(&addr, peer_ms, crate::time_check::now_ms());
+                            } else if let Some(ev) = decode_event(&frame) {
                                 if !send_to_engine(&events, &inflight, ev) {
                                     return;
                                 }
@@ -456,6 +501,11 @@ pub fn start(
                     }
                 });
             }
+            // Ask for the peer's clock, once per connection, before anything
+            // else — the boot gate may be waiting on this sample. An old
+            // binary at the other end drops the frame silently and simply
+            // never answers; the gate treats an unanswered peer as absent.
+            let _ = write_frame(&mut wsock, &[FRAME_GET_TIME]);
             // Claim one of the `SYNC_FANOUT` sync slots before asking for
             // history. A dialer that cannot claim one stays connected and keeps
             // receiving broadcasts — it just does not add another concurrent
@@ -536,5 +586,5 @@ pub fn start(
         });
     }
 
-    Ok(DevnetMesh { peers, inbound })
+    Ok(DevnetMesh { peers, inbound, local_addr })
 }

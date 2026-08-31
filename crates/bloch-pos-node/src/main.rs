@@ -50,6 +50,7 @@ mod net;
 mod p2p;
 mod rpc;
 mod store;
+mod time_check;
 mod ws_boot;
 
 use std::path::PathBuf;

@@ -2235,6 +2235,10 @@ pub fn run(cfg: Config) -> io::Result<()> {
             }
         });
     }
+    // Peer clock samples for the boot gate below. Created before the
+    // transports so the very first connections can already answer the time
+    // probe; by the time replay finishes the samples are simply there.
+    let peer_clock = Arc::new(crate::time_check::PeerClock::new());
     let net = match cfg.transport {
         Transport::Devnet => net::Net::Devnet(net::start(
             &cfg.listen_addr,
@@ -2244,6 +2248,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
             cfg.data_dir.clone(),
             head_slot.clone(),
             inflight.clone(),
+            peer_clock.clone(),
         )?),
         Transport::Libp2p => {
             let parse = |s: &str, what: &str| -> io::Result<crate::p2p::Multiaddr> {
@@ -2272,6 +2277,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
                 },
                 net_tx,
                 head_slot.clone(),
+                peer_clock.clone(),
             )?;
             println!("p2p: node identity {}", handle.peer_id);
             net::Net::Libp2p(handle)
@@ -2362,6 +2368,65 @@ pub fn run(cfg: Config) -> io::Result<()> {
         .head_slot
         .store(engine.state.slot(), Ordering::Relaxed);
 
+    // ── Clock sanity: does this host agree with its peers about now? ──
+    //
+    // MUST run before the weak-subjectivity gate below, because that gate's
+    // `wall_epoch` is computed from the host clock and the host clock is the
+    // ONLY attacker-influenceable input to the boot decision (the 2026-08-31
+    // audit finding, rated HIGH). Roll a fresh node's clock back toward
+    // genesis and `anchor_age == wall_epoch` re-enters the launch trust-once
+    // window: the node boots with no checkpoint at all and syncs whatever
+    // history its peers offer — and one bad boot is permanent, because the
+    // first finalized epoch on the forged chain flips `has_local_finality`
+    // and every later boot is `Resume`. The same rollback saturates
+    // `anchor_age` to 0 below a stale anchor's epoch, so freshness dies too.
+    //
+    // **Node-local policy**: this changes when the node refuses to START,
+    // never what it accepts — no block, attestation or checkpoint becomes
+    // valid or invalid here, so differing margins cannot fork (the 2026-08-08
+    // `expected_bits` lesson does not apply). See `time_check.rs` for the
+    // margin argument, the bootstrap trade-off and what a hostile peer
+    // majority can and cannot do to this check.
+    {
+        let configured = match cfg.transport {
+            Transport::Devnet => cfg.peers.len(),
+            Transport::Libp2p => cfg.p2p_peers.len(),
+        };
+        if configured == 0 {
+            // A genuinely isolated node (the first node of a network, a
+            // single-node devnet) has nothing to compare against and MUST
+            // still be startable — refusing here would make bootstrap
+            // impossible. The cost is stated where it is paid: below, in the
+            // no-answers branch, which is the adversarial flavor of this case.
+            println!(
+                "clock check: no peers configured — nothing to compare the local clock                  against; weak-subjectivity freshness rests on this host's clock alone."
+            );
+        } else {
+            let want = configured.min(crate::time_check::TARGET_SAMPLES);
+            let n = peer_clock.wait_for(want, crate::time_check::SAMPLE_WAIT);
+            let named = peer_clock.skews();
+            let skews: Vec<i64> = named.iter().map(|(_, s)| *s).collect();
+            let margin = crate::time_check::margin_ms(engine.manifest.slot_ms);
+            match crate::time_check::gate(&skews, margin) {
+                crate::time_check::ClockVerdict::Ok { median_ms, samples } => println!(
+                    "clock check: median skew {:+.1} s against {samples} peer(s) — within                      the ±{:.1} s margin (half an epoch).",
+                    median_ms as f64 / 1000.0,
+                    margin as f64 / 1000.0,
+                ),
+                crate::time_check::ClockVerdict::Refuse { median_ms, samples } => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        crate::time_check::refusal_message(median_ms, samples, margin, &named),
+                    ));
+                }
+                crate::time_check::ClockVerdict::NoSamples => eprintln!(
+                    "WARNING: {configured} peer(s) configured but none answered the time                      probe within {}s (got {n}). Either they run a build without the                      clock-check wire frames, or something is withholding answers. THE                      CLOCK CHECK IS DOWN: every weak-subjectivity boot decision below                      rests on this host's unverified clock — the exact condition the                      check exists to catch. Verify NTP sync on this host before trusting                      a fresh sync from these peers.",
+                    crate::time_check::SAMPLE_WAIT.as_secs(),
+                ),
+            }
+        }
+    }
+
     // ── Weak subjectivity: may the node sync at all? (§4.2) ──
     //
     // Runs AFTER replay, because the question the boot decision asks — how old
@@ -2376,7 +2441,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
     // and the age compared against the window must be measured on the same
     // clock the node's own epochs are numbered by. The NTP caveat of §1
     // applies here verbatim — a clock set backward makes a stale node look
-    // fresh.
+    // fresh — which is why the clock-vs-peer-time gate above runs FIRST.
     {
         let genesis_ms = engine.manifest.genesis_time_ms;
         let slot_ms = engine.manifest.slot_ms;
