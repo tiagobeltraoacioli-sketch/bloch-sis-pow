@@ -259,6 +259,288 @@ pub fn verify_non_membership(nf: &[u8; 32], path: &[[u8; 32]], root: &[u8; 32]) 
     node == *root
 }
 
+// ── Nullifier set, persistent form (Arc-shared SMT-256) — same root ──────────
+//
+// [`NullifierSet`] is the ratified definition (C1.1) and stays the reference:
+// a sorted `Vec` whose `root()` descends the whole set. That shape is exactly
+// wrong for a set that lives inside a consensus state which is **cloned once
+// per block** (`compute_post_state` starts from `pre.clone()`): the clone is
+// O(n) memcpy, the insert is O(n) `Vec::insert`, and the root is O(n·depth)
+// hashing — replay goes quadratic in the pool's lifetime.
+//
+// `NullifierSmt` is the same set under the same commitment — bit-identical
+// roots, pinned by test against `NullifierSet` — held as a persistent tree of
+// immutable `Arc` nodes, the pattern `bloch-pos-committee::state_root::Smt`
+// already uses for the eUTXO component: clone is O(1) (two pointer bumps),
+// insert rebuilds only the touched path (≈2·256 SHAKE-256 calls, constant in
+// the set size), and `root()` reads the cached top hash. Structural sharing is
+// safe for exactly the reason it is safe in `state_root::Smt`: nodes are
+// immutable, every node's hash is computed in its constructor from the very
+// children it is built with, and a mutation rebuilds the root path instead of
+// editing it — there is no invalidation step, so none can be forgotten.
+//
+// There is deliberately **no `remove`**: Genesis-4 reorgs are replay-of-state
+// (the engine refolds from a kept pre-state clone), never undo, so the
+// insert-only monotonicity of §6.6.1 holds with no exception here.
+
+/// One immutable node of the persistent nullifier tree.
+///
+/// `Leaf` is a **maximal singleton**: the unique key below this point, with
+/// the subtree's hash (the present-leaf folded up through empty siblings)
+/// computed for the depth the node sits at. Both constructors below keep that
+/// canonical form — a `Split` always has ≥ 2 keys under it — so two trees
+/// holding the same set are structurally identical whatever order built them.
+#[derive(Debug)]
+enum NfsNode {
+    Leaf {
+        key: [u8; 32],
+        hash: [u8; 32],
+    },
+    Split {
+        left: Option<std::sync::Arc<NfsNode>>,
+        right: Option<std::sync::Arc<NfsNode>>,
+        hash: [u8; 32],
+    },
+}
+
+impl NfsNode {
+    fn hash(&self) -> [u8; 32] {
+        match self {
+            NfsNode::Leaf { hash, .. } | NfsNode::Split { hash, .. } => *hash,
+        }
+    }
+}
+
+/// Hash of a singleton subtree rooted at depth `d` holding exactly `key`:
+/// the present-leaf marker folded up through empty siblings along the key's
+/// bits. Identical to what [`NullifierSet::subtree_root`] computes for a
+/// one-key slice at the same depth.
+fn nfset_singleton_hash(key: &[u8; 32], d: usize, empty: &[[u8; 32]]) -> [u8; 32] {
+    let mut h = nfset_present();
+    for lvl in (d..NFSET_DEPTH).rev() {
+        let sibling = &empty[NFSET_DEPTH - 1 - lvl];
+        h = if nfset_bit(key, lvl) {
+            nfset_parent(sibling, &h)
+        } else {
+            nfset_parent(&h, sibling)
+        };
+    }
+    h
+}
+
+/// Hash of an optional child sitting at depth `child_depth`.
+fn nfs_child_hash(child: &Option<std::sync::Arc<NfsNode>>, child_depth: usize, empty: &[[u8; 32]]) -> [u8; 32] {
+    match child {
+        Some(n) => n.hash(),
+        None => empty[NFSET_DEPTH - child_depth],
+    }
+}
+
+fn nfs_leaf(key: [u8; 32], d: usize, empty: &[[u8; 32]]) -> std::sync::Arc<NfsNode> {
+    std::sync::Arc::new(NfsNode::Leaf { key, hash: nfset_singleton_hash(&key, d, empty) })
+}
+
+fn nfs_split(
+    left: Option<std::sync::Arc<NfsNode>>,
+    right: Option<std::sync::Arc<NfsNode>>,
+    d: usize,
+    empty: &[[u8; 32]],
+) -> std::sync::Arc<NfsNode> {
+    let hash = nfset_parent(
+        &nfs_child_hash(&left, d + 1, empty),
+        &nfs_child_hash(&right, d + 1, empty),
+    );
+    std::sync::Arc::new(NfsNode::Split { left, right, hash })
+}
+
+/// Split node at depth `d` holding exactly the two distinct keys `a` and `b`.
+fn nfs_split_pair(a: [u8; 32], b: [u8; 32], d: usize, empty: &[[u8; 32]]) -> std::sync::Arc<NfsNode> {
+    debug_assert_ne!(a, b);
+    let ab = nfset_bit(&a, d);
+    if ab == nfset_bit(&b, d) {
+        let child = nfs_split_pair(a, b, d + 1, empty);
+        let (l, r) = if ab { (None, Some(child)) } else { (Some(child), None) };
+        nfs_split(l, r, d, empty)
+    } else {
+        let (lo, hi) = if ab { (b, a) } else { (a, b) };
+        nfs_split(
+            Some(nfs_leaf(lo, d + 1, empty)),
+            Some(nfs_leaf(hi, d + 1, empty)),
+            d,
+            empty,
+        )
+    }
+}
+
+/// The spent-nullifier set as a persistent, structurally-shared SMT-256.
+///
+/// Commits to **exactly the same root** as [`NullifierSet`] over the same set
+/// (pinned by test); differs only in cost shape — see the module comment
+/// above. `Clone` is O(1); use this form wherever the set lives inside a
+/// state that is cloned per block.
+#[derive(Clone)]
+pub struct NullifierSmt {
+    top: Option<std::sync::Arc<NfsNode>>,
+    len: u64,
+    /// `empty[h]` = root of an all-empty subtree of height `h`. Shared across
+    /// clones (same posture as `state_root::Smt`): a per-instance immutable
+    /// table, never global mutable state.
+    empty: std::sync::Arc<Vec<[u8; 32]>>,
+}
+
+impl Default for NullifierSmt {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for NullifierSmt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The tree is 256 levels deep; a derived Debug would print it all.
+        f.debug_struct("NullifierSmt")
+            .field("len", &self.len)
+            .field("root", &self.root())
+            .finish()
+    }
+}
+
+/// Equality is root equality: the root is a collision-resistant commitment to
+/// the set, and both construction paths (incremental insert and bulk build)
+/// produce the same canonical structure anyway. Comparing hashes keeps the
+/// check O(1) instead of a 256-deep structural walk.
+impl PartialEq for NullifierSmt {
+    fn eq(&self, other: &Self) -> bool {
+        self.len == other.len && self.root() == other.root()
+    }
+}
+impl Eq for NullifierSmt {}
+
+impl NullifierSmt {
+    pub fn new() -> Self {
+        Self { top: None, len: 0, empty: std::sync::Arc::new(nfset_empty_roots().to_vec()) }
+    }
+
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn contains(&self, nf: &[u8; 32]) -> bool {
+        let mut node = self.top.as_ref();
+        let mut d = 0usize;
+        while let Some(n) = node {
+            match &**n {
+                NfsNode::Leaf { key, .. } => return key == nf,
+                NfsNode::Split { left, right, .. } => {
+                    node = if nfset_bit(nf, d) { right.as_ref() } else { left.as_ref() };
+                    d += 1;
+                }
+            }
+        }
+        false
+    }
+
+    /// Insert `nf`. Returns false if it was already spent — the double-spend
+    /// check itself, same contract as [`NullifierSet::insert`].
+    pub fn insert(&mut self, nf: [u8; 32]) -> bool {
+        if self.contains(&nf) {
+            return false;
+        }
+        let empty = std::sync::Arc::clone(&self.empty);
+        self.top = Some(Self::insert_rec(self.top.as_ref(), &nf, 0, &empty));
+        self.len += 1;
+        true
+    }
+
+    /// Rebuild the path from depth `d` down to where `nf` lands; every node
+    /// off the path is shared, not copied. `nf` is known absent (checked by
+    /// the caller), so a `Leaf` met here always splits.
+    fn insert_rec(
+        node: Option<&std::sync::Arc<NfsNode>>,
+        nf: &[u8; 32],
+        d: usize,
+        empty: &[[u8; 32]],
+    ) -> std::sync::Arc<NfsNode> {
+        match node {
+            None => nfs_leaf(*nf, d, empty),
+            Some(n) => match &**n {
+                NfsNode::Leaf { key, .. } => nfs_split_pair(*key, *nf, d, empty),
+                NfsNode::Split { left, right, .. } => {
+                    if nfset_bit(nf, d) {
+                        let new_right = Self::insert_rec(right.as_ref(), nf, d + 1, empty);
+                        nfs_split(left.clone(), Some(new_right), d, empty)
+                    } else {
+                        let new_left = Self::insert_rec(left.as_ref(), nf, d + 1, empty);
+                        nfs_split(Some(new_left), right.clone(), d, empty)
+                    }
+                }
+            },
+        }
+    }
+
+    /// The canonical root — [`NullifierSet::root`] of the same set, read from
+    /// the cached top hash in O(1).
+    pub fn root(&self) -> [u8; 32] {
+        match &self.top {
+            Some(n) => n.hash(),
+            None => self.empty[NFSET_DEPTH],
+        }
+    }
+
+    /// Every key, ascending (an in-order walk of an MSB-first tree is sorted
+    /// order). This is the canonical serialization order.
+    pub fn keys_sorted(&self) -> Vec<[u8; 32]> {
+        fn walk(node: &Option<std::sync::Arc<NfsNode>>, out: &mut Vec<[u8; 32]>) {
+            if let Some(n) = node {
+                match &**n {
+                    NfsNode::Leaf { key, .. } => out.push(*key),
+                    NfsNode::Split { left, right, .. } => {
+                        walk(left, out);
+                        walk(right, out);
+                    }
+                }
+            }
+        }
+        let mut out = Vec::with_capacity(self.len as usize);
+        walk(&self.top, &mut out);
+        out
+    }
+
+    /// Bulk build from strictly-ascending unique keys — the deserialization
+    /// path. One singleton fold per key (the same total hashing as one
+    /// [`NullifierSet::root`] pass), against ~2× that for repeated `insert`.
+    /// Rejects unsorted or duplicated input rather than canonicalising it:
+    /// the caller is decoding a serialized state, and bytes that are not the
+    /// canonical encoding are corruption, not a formatting choice.
+    pub fn from_sorted_unique(keys: &[[u8; 32]]) -> Result<Self, &'static str> {
+        if keys.windows(2).any(|w| w[0] >= w[1]) {
+            return Err("nullifier keys not strictly ascending");
+        }
+        let empty = std::sync::Arc::new(nfset_empty_roots().to_vec());
+        fn build(
+            keys: &[[u8; 32]],
+            d: usize,
+            empty: &[[u8; 32]],
+        ) -> Option<std::sync::Arc<NfsNode>> {
+            match keys.len() {
+                0 => None,
+                1 => Some(nfs_leaf(keys[0], d, empty)),
+                _ => {
+                    let split = keys.partition_point(|k| !nfset_bit(k, d));
+                    let l = build(&keys[..split], d + 1, empty);
+                    let r = build(&keys[split..], d + 1, empty);
+                    Some(nfs_split(l, r, d, empty))
+                }
+            }
+        }
+        let top = build(keys, 0, &empty);
+        Ok(Self { top, len: keys.len() as u64, empty })
+    }
+}
+
 // ── Commitment tree (incremental, fixed depth, SHAKE-256) ─────────────────────
 
 /// Append-only Merkle accumulator of note commitments; the root is the anchor.
@@ -348,6 +630,117 @@ pub fn verify_path(leaf: &[u8; 32], index: u64, path: &[[u8; 32]], root: &[u8; 3
         idx >>= 1;
     }
     &cur == root
+}
+
+// ── Commitment accumulator, frontier form (what consensus state holds) ───────
+
+/// The commitment accumulator reduced to what appending needs: the **frontier**
+/// (one partial root per set bit of the leaf count) plus the leaf count.
+///
+/// Commits to **exactly the same root** as a [`CommitmentTree`] holding the
+/// same leaves in the same order (pinned by test). The difference is what is
+/// stored: `CommitmentTree` keeps the full leaf vector — a witness service for
+/// wallets, reconstructible from block bodies, therefore a node-side index —
+/// while consensus state needs only what the next append and the next root
+/// require. Leaf order is consensus (the nullifier binds `LE64(position)`,
+/// §1.3), and it is exactly the append order this struct advances.
+///
+/// Fixed size (≈1 KB), so cloning it inside a per-block state clone is a
+/// memcpy, not an O(pool) copy. `append` is O(TREE_DEPTH) hashing worst case,
+/// amortised 2 hashes; `root()` is O(TREE_DEPTH) hashing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Frontier {
+    leaf_count: u64,
+    /// `slots[d]` is meaningful iff bit `d` of `leaf_count` is set (slot
+    /// `TREE_DEPTH` iff the tree is exactly full); every other slot is
+    /// **zeroed**, kept canonical by `append` so that derived equality and
+    /// byte serialization are functions of the accumulated leaves alone.
+    slots: [[u8; 32]; TREE_DEPTH + 1],
+}
+
+impl Default for Frontier {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Frontier {
+    pub fn new() -> Self {
+        Self { leaf_count: 0, slots: [[0u8; 32]; TREE_DEPTH + 1] }
+    }
+
+    /// Number of leaves accumulated. The next leaf's position — the value the
+    /// nullifier binds — is exactly this.
+    pub fn leaf_count(&self) -> u64 {
+        self.leaf_count
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.leaf_count == 0
+    }
+
+    /// Append `cm`, returning its position. Same contract as
+    /// [`CommitmentTree::append`]; panics if the tree is full (2^32 leaves) —
+    /// deterministic across all nodes, and a full pool is a protocol-level
+    /// event, not a condition to paper over locally.
+    pub fn append(&mut self, cm: [u8; 32]) -> u64 {
+        assert!(self.leaf_count < 1u64 << TREE_DEPTH, "commitment accumulator full (2^32 leaves)");
+        let pos = self.leaf_count;
+        let mut cur = cm;
+        let mut d = 0usize;
+        // Carry: each completed left subtree combines and its slot zeroes,
+        // exactly the binary increment of `leaf_count`.
+        while (self.leaf_count >> d) & 1 == 1 {
+            cur = merkle_parent(&self.slots[d], &cur);
+            self.slots[d] = [0u8; 32];
+            d += 1;
+        }
+        self.slots[d] = cur;
+        self.leaf_count += 1;
+        pos
+    }
+
+    /// The accumulator root — [`CommitmentTree::root`] of the same leaves.
+    pub fn root(&self) -> [u8; 32] {
+        if self.leaf_count == 1u64 << TREE_DEPTH {
+            return self.slots[TREE_DEPTH];
+        }
+        let empty = CommitmentTree::empty_roots();
+        let mut cur = empty[0];
+        for d in 0..TREE_DEPTH {
+            cur = if (self.leaf_count >> d) & 1 == 1 {
+                merkle_parent(&self.slots[d], &cur)
+            } else {
+                merkle_parent(&cur, &empty[d])
+            };
+        }
+        cur
+    }
+
+    /// The raw slots, for canonical serialization. Unset slots are zero — an
+    /// invariant `append` maintains and [`Frontier::from_parts`] enforces.
+    pub fn slots(&self) -> &[[u8; 32]; TREE_DEPTH + 1] {
+        &self.slots
+    }
+
+    /// Rebuild from serialized parts, refusing non-canonical bytes: a slot
+    /// whose count bit is clear must be zero, or two encodings of the same
+    /// accumulator would exist (and derived equality would lie).
+    pub fn from_parts(
+        leaf_count: u64,
+        slots: [[u8; 32]; TREE_DEPTH + 1],
+    ) -> Result<Self, &'static str> {
+        if leaf_count > 1u64 << TREE_DEPTH {
+            return Err("frontier leaf count exceeds 2^32");
+        }
+        for (d, slot) in slots.iter().enumerate() {
+            let bit_set = (leaf_count >> d) & 1 == 1;
+            if !bit_set && slot != &[0u8; 32] {
+                return Err("frontier slot set where the leaf-count bit is clear");
+            }
+        }
+        Ok(Self { leaf_count, slots })
+    }
 }
 
 // ── Spend statement (the SP1 guest logic; proved in ZK) ───────────────────────
@@ -704,5 +1097,136 @@ mod nfset_tests {
         let r = nf(2);
         assert_ne!(nfset_parent(&l, &r), merkle_parent(&l, &r));
         assert_ne!(NullifierSet::new().root(), CommitmentTree::new().root());
+    }
+}
+
+#[cfg(test)]
+mod persistent_state_tests {
+    use super::*;
+
+    /// Deterministic pseudo-random 32-byte keys (SHAKE of a counter), so the
+    /// equivalence claims below are exercised over keys that actually spread
+    /// across the tree instead of clustering in one subtree.
+    fn prk(i: u64) -> [u8; 32] {
+        shake256_32(&[b"coherence-test-key", &i.to_le_bytes()])
+    }
+
+    fn unhex32(s: &str) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        for i in 0..32 {
+            out[i] = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap();
+        }
+        out
+    }
+
+    /// The two empty roots are pinned as constants because the live Genesis-4
+    /// chain committed `[0u8; 32]` sentinels instead of them: an empty pool
+    /// and the genesis sentinel are DIFFERENT values, and any code that
+    /// equates them must fail a test, not a mainnet. The flag-day bridge from
+    /// sentinel to real root is a separate, deliberate change (DEV-10).
+    #[test]
+    fn empty_roots_are_pinned_and_are_not_zero() {
+        let acc = unhex32("cd640768299853bb27e3dfa62faed4b9c2e9348d8ac2f81dd03ecc96ae5b3ff1");
+        let nfs = unhex32("d5fdc9dcde0d309db399649a21cd95e45e117e369c13cca70b8e87f2849f7930");
+        assert_eq!(CommitmentTree::new().root(), acc);
+        assert_eq!(Frontier::new().root(), acc);
+        assert_eq!(NullifierSet::new().root(), nfs);
+        assert_eq!(NullifierSmt::new().root(), nfs);
+        assert_ne!(acc, [0u8; 32], "empty accumulator root must not equal the genesis sentinel");
+        assert_ne!(nfs, [0u8; 32], "empty nullifier root must not equal the genesis sentinel");
+        assert_ne!(acc, nfs);
+    }
+
+    /// The frontier is the same accumulator as the full-leaf-vector tree:
+    /// identical roots and positions at every step, across lengths that cover
+    /// every carry shape up to several complete subtrees.
+    #[test]
+    fn frontier_matches_commitment_tree_at_every_length() {
+        let mut tree = CommitmentTree::new();
+        let mut frontier = Frontier::new();
+        assert_eq!(tree.root(), frontier.root());
+        for i in 0..130u64 {
+            let cm = prk(i);
+            let p1 = tree.append(cm);
+            let p2 = frontier.append(cm);
+            assert_eq!(p1, p2, "positions diverge at leaf {i}");
+            assert_eq!(frontier.leaf_count(), tree.len() as u64);
+            assert_eq!(tree.root(), frontier.root(), "roots diverge after leaf {i}");
+        }
+    }
+
+    /// Frontier serialization round-trips through its parts, and the
+    /// non-canonical encodings (a stale slot where the count bit is clear)
+    /// are refused rather than accepted-and-unequal.
+    #[test]
+    fn frontier_parts_round_trip_and_reject_non_canonical() {
+        let mut f = Frontier::new();
+        for i in 0..37u64 {
+            f.append(prk(i));
+        }
+        let rebuilt = Frontier::from_parts(f.leaf_count(), *f.slots()).unwrap();
+        assert_eq!(f, rebuilt);
+        assert_eq!(f.root(), rebuilt.root());
+
+        // 37 = 0b100101: bit 1 is clear, so slot 1 must be zero.
+        let mut bad = *f.slots();
+        bad[1] = [0xAA; 32];
+        assert!(Frontier::from_parts(37, bad).is_err());
+        assert!(Frontier::from_parts((1u64 << TREE_DEPTH) + 1, *f.slots()).is_err());
+    }
+
+    /// The persistent SMT commits to exactly the NullifierSet root at every
+    /// step, via both construction paths, and agrees on membership.
+    #[test]
+    fn nullifier_smt_matches_nullifier_set_at_every_step() {
+        let mut reference = NullifierSet::new();
+        let mut persistent = NullifierSmt::new();
+        assert_eq!(reference.root(), persistent.root());
+        let keys: Vec<[u8; 32]> = (0..96u64).map(prk).collect();
+        for (i, k) in keys.iter().enumerate() {
+            assert!(persistent.insert(*k));
+            assert!(reference.insert(*k));
+            assert_eq!(reference.root(), persistent.root(), "roots diverge after insert {i}");
+            assert!(!persistent.insert(*k), "re-insert must report the double spend");
+            assert!(persistent.contains(k));
+        }
+        assert!(!persistent.contains(&prk(1_000_000)));
+        assert_eq!(persistent.len(), 96);
+
+        // Bulk build from the canonical serialization order agrees with the
+        // incrementally built tree — and with the reference.
+        let sorted = persistent.keys_sorted();
+        assert!(sorted.windows(2).all(|w| w[0] < w[1]), "keys_sorted must be strictly ascending");
+        let bulk = NullifierSmt::from_sorted_unique(&sorted).unwrap();
+        assert_eq!(bulk, persistent);
+        assert_eq!(bulk.root(), reference.root());
+
+        // Non-canonical input is refused.
+        let mut unsorted = sorted.clone();
+        unsorted.swap(0, 1);
+        assert!(NullifierSmt::from_sorted_unique(&unsorted).is_err());
+        let mut dup = sorted.clone();
+        dup[1] = dup[0];
+        assert!(NullifierSmt::from_sorted_unique(&dup).is_err());
+    }
+
+    /// Clone is structural sharing: after cloning, mutating one side must not
+    /// move the other side's root — and both sides stay internally correct.
+    #[test]
+    fn nullifier_smt_clone_shares_and_diverges_safely() {
+        let mut a = NullifierSmt::new();
+        for i in 0..40u64 {
+            a.insert(prk(i));
+        }
+        let frozen = a.clone();
+        let frozen_root = frozen.root();
+        a.insert(prk(999));
+        assert_ne!(a.root(), frozen_root, "insert must move the mutated tree's root");
+        assert_eq!(frozen.root(), frozen_root, "the clone must be immune to later inserts");
+        assert_eq!(
+            frozen.root(),
+            NullifierSet::from_iter((0..40u64).map(prk)).root(),
+            "the frozen clone still commits the original set"
+        );
     }
 }

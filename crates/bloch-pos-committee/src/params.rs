@@ -596,6 +596,28 @@ pub const ANCESTRY_SEED_ACTIVATION_EPOCH: u64 = u64::MAX;
 /// `u64::MAX` means INERT. Same arming rules as above.
 pub const LEAK_RECOVERY_ACTIVATION_EPOCH: u64 = u64::MAX;
 
+/// Flag day for **shielded-pool state inside `CommittedState`** (Coherence
+/// wave). Before this epoch the transition commits the two Coherence roots
+/// exactly as carried — which on the live chain means the `[0u8; 32]` genesis
+/// sentinels (`bloch-pos-node/src/genesis.rs`), byte-identical to every block
+/// since genesis. From this epoch on, the committed accumulator and
+/// nullifier-set roots are **derived from the pool state the transition
+/// holds** (`transition.rs::CoherencePoolState`).
+///
+/// Why it must be gated: deriving unconditionally forks the live chain at
+/// deploy. The real root of an EMPTY pool is NOT zero (the accumulator's is
+/// `cd640768…`, the nullifier set's `d5fdc9dc…` — pinned in
+/// `coherence-core::persistent_state_tests`), so recomputation changes
+/// `state_root` and `coherence_root` for every block since genesis and the
+/// new binary diverges the moment it replays. The sentinel→real-root bridge
+/// is DEV-10's change, armed here.
+///
+/// `u64::MAX` means INERT. Same arming rules as
+/// [`ANCESTRY_SEED_ACTIVATION_EPOCH`]: fill at tag time, strictly in the
+/// future, after the fleet rollout completes; the gate reads the epoch of the
+/// state being folded, never a clock.
+pub const COHERENCE_ACTIVATION_EPOCH: u64 = u64::MAX;
+
 /// Domain separation tags (§6.1). Fixed 16 bytes, right-padded with zeros, so
 /// no tag can be a prefix of another.
 pub const DS_SORTITION: [u8; 16] = *b"BLCH4:SORTIT\0\0\0\0";
