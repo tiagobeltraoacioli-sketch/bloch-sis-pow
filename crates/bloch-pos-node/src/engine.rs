@@ -3053,6 +3053,39 @@ mod forkchoice_tests {
         );
     }
 
+    /// Pins the committee crate's restated suite envelope against the one
+    /// bloch-crypto actually produces. `staking::SUITE_ENVELOPE_HYBRID` and
+    /// `staking::committed_hybrid_body` restate the 4-byte header (`magic ‖
+    /// suite LE`) because that crate is deliberately free of the FFI stack;
+    /// this test is the cross-crate check its doc comment promises. If either
+    /// side ever moves, a registered validator's exit would start failing as
+    /// `MalformedRegisteredKey` — this failure is cheaper.
+    #[test]
+    fn committee_envelope_matches_crypto() {
+        use bloch_pos_committee::staking::{
+            committed_hybrid_body, HYBRID_PK_BYTES, SUITE_ENVELOPE_HYBRID,
+        };
+        // A real keypair, exactly as genesis registration committed them.
+        let (pk, _sk) = bloch_crypto::crypto::generate_keypair();
+        assert_eq!(
+            pk.len(),
+            HYBRID_PK_BYTES + SUITE_ENVELOPE_HYBRID.len(),
+            "generated hybrid pubkey must be envelope + body"
+        );
+        assert_eq!(
+            &pk[..4],
+            &SUITE_ENVELOPE_HYBRID[..],
+            "the committee crate's restated envelope must match bloch-crypto's"
+        );
+        let (suite, body) = bloch_crypto::crypto::split_envelope(&pk)
+            .expect("a generated pubkey always carries the envelope");
+        assert_eq!(suite, 0x0001, "staking pins the hybrid suite");
+        let resolved = committed_hybrid_body(&pk).expect("enveloped form must resolve");
+        assert_eq!(&resolved[..], body, "stripping must land exactly on the hybrid body");
+        // The raw body — the shape funded deposits commit — resolves to itself.
+        assert_eq!(&committed_hybrid_body(body).expect("raw form must resolve")[..], body);
+    }
+
     /// The transfer guard that already existed, pinned so the refactor into a
     /// free function cannot quietly drop it — this is the check that stopped
     /// the one-request halt at slot 69.
