@@ -11,14 +11,29 @@ wallet ──(public, witness)──▶  /prove  ──▶ raw FRI proof ──�
 node   ── verifies the FRI proof locally (sp1-sdk verifier) ── no trust in this box
 ```
 
+## PRIVACY — the operator of this box sees the full witness
+
+"No trust in this box" above is about **consensus** (a bad proof is rejected by
+every node). It is NOT about **privacy**: every `/prove` request hands this
+service the complete spend witness — input notes with their values, output
+notes, Merkle paths, and the wallet's **nullifier key `nk`**, which links that
+wallet's past and future shielded spends. Whoever operates this machine (and
+its cloud provider) can read all of it, for every wallet that delegates.
+Delegated proving exists because local proving needs desktop-class hardware
+(83–215 s and ~16 GB for a 2-in/2-out spend — `COHERENCE-PROOF-SIZE-2026-08-29`);
+it is a hardware workaround, not a private protocol. Self-host it, or accept
+showing your entire shielded history to the operator. Never market this
+endpoint as "private".
+
 ## Why this shape
 
 - **Proving is heavy** (seconds–minutes, GBs of RAM, ~GPU) → a dedicated,
   scale-to-zero GPU machine. **Verifying is cheap** → stays in the node.
 - **Self-hosted, not a third party.** For a privacy chain, the prover runs on
   infra you control (see the Succinct Network alternative below).
-- **Post-quantum coherence:** the service uses `.core()` (STARK/FRI) and never
-  `.groth16()/.plonk()` — an elliptic-curve wrap would be Shor-breakable.
+- **Post-quantum coherence:** the service proves with `SP1ProofMode::Core`
+  (STARK/FRI) and never `.groth16()/.plonk()` — an elliptic-curve wrap would be
+  Shor-breakable. It also refuses to serve or validate non-Core envelopes.
 
 ## Best-practice setup (what this config does)
 
@@ -66,9 +81,13 @@ CPU prover without the `cuda` feature).
 
 ## Gaps to close (honest)
 
-- **Untested until deployed.** No SP1 toolchain runs in the dev sandbox, so this
-  is a validated *recipe*, not a proven binary. Pin your SP1 version and confirm
-  the `prove().core().run()` / `verify()` surface for it.
+- **The image build is untested until deployed.** The crates now compile and
+  prove locally against the pinned toolchain (`sp1up --version v6.5.0`,
+  `sp1-sdk =6.5.0` — pinned in the Dockerfile via `SP1UP_VERSION`), but this
+  Docker/Fly recipe itself has not been exercised end-to-end on a GPU box.
+- **Proof size is an open consensus problem.** Core is 5.3x and Compressed 2.4x
+  the V2 block-tx cap (`COHERENCE-PROOF-SIZE-2026-08-29`). This service can
+  produce proofs no block can carry yet.
 - **Node-side verifier not wired yet.** The node still stubs proof verification
   to `false` (rejects shielded txs). Wiring `sp1-sdk`'s FRI verifier into the
   node's `verify_proof` closure (replacing the stub) is the step that actually

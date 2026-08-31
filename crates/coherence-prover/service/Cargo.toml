@@ -2,11 +2,20 @@
 name = "coherence-prover-service"
 version = "0.1.0"
 edition = "2021"
-# HTTP prover service — deployed on a server (Fly.io GPU) where the SP1 toolchain
-# is installed. NOT built by the node's cargo build (not a path-dep of bloch).
+# HTTP DELEGATED prover service — deployed on a server (Fly.io GPU) where the
+# SP1 toolchain is installed. NOT built by the node's cargo build (the root
+# workspace excludes crates/coherence-prover); member of ../Cargo.toml.
+#
+# PRIVACY: whoever runs this service SEES THE FULL WITNESS of every /prove
+# request — notes, values, nullifier keys. See ../README.md and
+# deploy/sp1-prover/README.md before pointing any wallet at a box you do not
+# control.
 
 [dependencies]
-sp1-sdk = "4"
+# =6.5.0 must match the guest toolchain (sp1up v6.5.0). default-features =
+# false is load-bearing (alloy-consensus 0.14 vs serde >= 1.0.228 — see
+# ../script/Cargo.toml); `blocking` gates the synchronous API.
+sp1-sdk = { version = "=6.5.0", default-features = false, features = ["blocking"] }
 coherence-core = { path = "../../coherence-core" }
 axum = "0.7"
 tokio = { version = "1", features = ["full"] }

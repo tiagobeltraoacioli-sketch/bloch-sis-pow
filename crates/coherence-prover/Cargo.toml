@@ -1,0 +1,20 @@
+# Workspace for the SP1 HOST crates (script + service).
+#
+# Deliberately EXCLUDED from the repo-root workspace (root Cargo.toml
+# `exclude = ["crates/coherence-prover", ...]`): sp1-sdk is a heavy dependency
+# that needs `protoc` at build time and must not enter the everyday node build.
+# This file exists so the two host crates share ONE committed Cargo.lock —
+# without it they were lockless strays that two honest builds resolved
+# differently.
+#
+# NOT members, on purpose:
+# - `program/`  — the SP1 guest. Built by `cargo prove build` with the pinned
+#   succinct toolchain (sp1up --version v6.5.0), different target triple,
+#   own [workspace] table + committed Cargo.lock. Same ELF => same vkey; a
+#   drifting guest lock is a silent verifier fork.
+# - `measure/`  — the proof-size measurement harness (guest+host mirror),
+#   kept self-contained so its recorded numbers stay reproducible.
+[workspace]
+resolver = "2"
+members = ["script", "service"]
+exclude = ["program", "measure"]

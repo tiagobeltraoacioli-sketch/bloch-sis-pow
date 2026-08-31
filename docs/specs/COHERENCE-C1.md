@@ -104,7 +104,11 @@ for a post-audit upgrade, never shipped on the security path before C3/C4.
 FRI/STARK proving of a Sapling-class circuit is feasible on commodity hardware
 but heavy; **mobile proving is not yet practical** (consistent with "mobile =
 wallet", not a prover). Options: prove on desktop, or a (non-private) delegated
-prover for light clients. Recorded as an open cost, not hand-waved.
+prover for light clients. "Non-private" is load-bearing: the delegated prover
+receives the FULL witness — note values and the nullifier key `nk`, which links
+that wallet's past and future spends — see the privacy warning in
+`crates/coherence-prover/README.md` and `deploy/sp1-prover/README.md`.
+Recorded as an open cost, not hand-waved.
 
 ## 6. Shielded transaction — wire format
 ```

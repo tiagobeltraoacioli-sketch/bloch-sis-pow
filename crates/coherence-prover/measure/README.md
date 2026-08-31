@@ -46,8 +46,17 @@ por escrito que o `SP1UP_VERSION` estava por pinar.
 
 ## Por que separado de `../program`
 
-O guest aqui e um espelho de `../program/src/main.rs` com versoes pinadas. Nao
-alterei `../program`, `../script` nem `../service`: qual SDK o projeto adota e
-decisao em aberto, e um harness de medicao nao deve decidi-la por atalho. As
-tres crates originais continuam sem compilar, e isso esta documentado em vez de
-consertado silenciosamente.
+O guest aqui e um espelho de `../program/src/main.rs` com versoes pinadas. Na
+epoca da medicao, nao alterei `../program`, `../script` nem `../service`: qual
+SDK o projeto adota era decisao em aberto, e um harness de medicao nao deve
+decidi-la por atalho.
+
+**Atualizacao 2026-08-29 (onda Coherence, DEV-3):** a decisao foi tomada — o
+projeto adotou o pino deste harness (toolchain `sp1up --version v6.5.0`,
+`=6.5.0` nas duas pontas) e as tres crates originais foram consertadas e
+COMPILAM: caminho do ELF novo, API `blocking` do SDK 6, construtor explicito
+(`ProverClient::builder().cpu().build()`, nunca o sensivel a env), locks
+commitados, workspace proprio em `../Cargo.toml`. Os cinco pre-requisitos
+acima agora estao documentados em `REPRO.md` §"SP1 guest", e o
+`deploy/sp1-prover/Dockerfile` pina `SP1UP_VERSION=v6.5.0`. Este harness
+permanece como estava — congelado junto com a medicao que o justifica.

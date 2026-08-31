@@ -111,6 +111,74 @@ Two options, in preference order:
   qemu-user, then `nix build .#attested-image --rebuild --check` — correct but
   slow; the true bit-for-bit partner should be a native x86_64 host.
 
+## SP1 guest (Coherence shielded-spend prover) — pinned build
+
+The zkVM guest in `crates/coherence-prover/program` is CONSENSUS-ADJACENT
+reproducibility: the verifier pins the vkey of one exact ELF, and every honest
+prover must rebuild that same ELF bit-for-bit. Different lockfile resolution or
+a different SP1 toolchain ⇒ different ELF ⇒ different vkey ⇒ a silent fork
+between provers and the verifier. These prerequisites were discovered
+empirically (see `crates/coherence-prover/measure/README.md` and
+`docs/audit/COHERENCE-PROOF-SIZE-2026-08-29.md`); none of them is optional.
+
+1. **Pinned SP1 toolchain — `v6.5.0`, always with an explicit version.**
+
+   ```bash
+   curl -L https://sp1up.succinct.xyz | bash
+   sp1up --version v6.5.0        # cargo-prove sp1 (92b8eab 2026-08-26)
+   cargo prove --version         # must print the 92b8eab build
+   ```
+
+   A bare `sp1up` installs "current", which WILL diverge from the `=6.5.0`
+   pins in the three `Cargo.toml`s. (Historical failure mode: the unversioned
+   toolchain emits riscv64 ELFs that the then-declared `sp1-sdk = "4"` refused
+   with `must be a 32-bit elf`, and the 4.2.1-era toolchain no longer compiles
+   current crates — dies on `proc-macro2`.)
+
+2. **`protoc`** — `sp1-prover-types` generates code from `.proto` in its build
+   script. `brew install protobuf` (measured with libprotoc 36.0); the Docker
+   build installs a pinned upstream release (Ubuntu 22.04 apt's 3.12 is too
+   old). Without it the HOST crates (`script`, `service`) fail to build.
+
+3. **Build the guest ELF** (its `Cargo.lock` is COMMITTED — keep `--locked`):
+
+   ```bash
+   cd crates/coherence-prover/program
+   cargo prove build --locked
+   ```
+
+   The ELF lands at (SP1 6.x layout; the old `program/elf/riscv32im-…` path is
+   gone):
+
+   ```
+   crates/coherence-prover/program/target/elf-compilation/\
+   riscv64im-succinct-zkvm-elf/release/coherence-spend-program
+   ```
+
+   `script/` and `service/` `include_bytes!` it from exactly there, so the
+   guest MUST be built before the hosts. Reference digest at pin time
+   (toolchain v6.5.0, committed lock):
+   `sha256 = 52bae8ae56e531586ff1a26db41a5fe8e49a0590d740b63adac50509f5878f2b`
+   (macOS arm64 host build — confirm cross-host stability before pinning a
+   vkey from it; the two-builder rule above applies here too).
+
+4. **Build the host crates** — from the `crates/coherence-prover` workspace
+   (the repo-root workspace EXCLUDES it, so `-p` from the root won't find it):
+
+   ```bash
+   cd crates/coherence-prover
+   cargo build --release --locked            # script + service, shared lock
+   ```
+
+5. **Docker image**: `deploy/sp1-prover/Dockerfile` pins `SP1UP_VERSION=v6.5.0`
+   and `PROTOC_VERSION`, builds the guest `--locked`, then the service
+   `--locked` from the crate workspace. Bump SP1UP_VERSION only together with
+   the `=6.5.0` crate pins — they are one version, not two.
+
+Claim-ladder note: with locks committed and the toolchain pinned this is
+"reproducible-by-design"; the word "reproducible" (and any published vkey) is
+earned only by a bit-for-bit two-builder ELF comparison, same as the OS images.
+
 ## CI
 
 - `.gitlab-ci.yml` gains a `nix` stage with a `repro` job (tag

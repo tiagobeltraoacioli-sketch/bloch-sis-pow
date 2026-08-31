@@ -2,8 +2,18 @@
 name = "coherence-prover-script"
 version = "0.1.0"
 edition = "2021"
-# Host prover/verifier — run with `cargo run --release` where SP1 is installed.
+# Host prover/verifier smoke test — build the guest ELF first
+# (`cd ../program && cargo prove build`), then `cargo run --release` here.
+# Member of the ../Cargo.toml workspace (shared, committed Cargo.lock).
 
 [dependencies]
-sp1-sdk = "4"
+# =6.5.0 must match the guest toolchain (sp1up v6.5.0) — SDK 4.x cannot load
+# the riscv64 ELFs the current toolchain emits.
+#
+# default-features = false is NOT dependency hygiene: with default features the
+# SDK drags alloy-consensus 0.14, which does not compile against
+# serde >= 1.0.228 — the build dies long before proving anything.
+# `blocking` gates the synchronous API (blocking::ProverClient).
+sp1-sdk = { version = "=6.5.0", default-features = false, features = ["blocking"] }
 coherence-core = { path = "../../coherence-core" }
+bincode = "1"

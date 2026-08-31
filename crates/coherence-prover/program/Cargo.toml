@@ -2,10 +2,24 @@
 name = "coherence-spend-program"
 version = "0.1.0"
 edition = "2021"
-# SP1 guest — built with `cargo prove build`, NOT the node's cargo build.
+# SP1 guest — built with `cargo prove build` under the PINNED succinct
+# toolchain (`sp1up --version v6.5.0`), NOT the node's cargo build. The ELF
+# lands in:
+#   target/elf-compilation/riscv64im-succinct-zkvm-elf/release/coherence-spend-program
+# which is where ../script and ../service include_bytes! it from.
 
 [dependencies]
-# Pin to the SP1 version you install with sp1up; check current SDK docs.
-sp1-zkvm = "4"
-# Lean coherence primitives (to be extracted from src/coherence — see README).
+# =6.5.0, matching the sp1up v6.5.0 toolchain. The old `sp1-zkvm = "4"` pin is
+# unbuildable today: the current toolchain emits riscv64 ELFs which the 4.x SDK
+# rejects with `must be a 32-bit elf`, and the 4.2.1-era toolchain is too old
+# for current crates (dies compiling proc-macro2). See ../measure/README.md.
+sp1-zkvm = "=6.5.0"
+# Lean coherence primitives — single source of truth for the spend statement.
 coherence-core = { path = "../../coherence-core" }
+
+# Own workspace root ON PURPOSE (the parent ../Cargo.toml excludes this dir):
+# the guest builds with a different toolchain + target than the host crates.
+# Its Cargo.lock is COMMITTED — without it two honest builds resolve deps
+# differently => different ELF => different vkey => silent hard fork between
+# provers and the pinned verifier.
+[workspace]
