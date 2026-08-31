@@ -2641,6 +2641,35 @@ impl CommittedState {
         self.validators.len()
     }
 
+    /// Did `validator` have an attestation included on the canonical chain in
+    /// the CURRENT (open) epoch? `None` when the participation map does not
+    /// track this index — a validator outside the epoch's duty roster, or an
+    /// index the chain does not know.
+    ///
+    /// Observability read, node-local reporting only: this is the same
+    /// `current_participation` map rewards read at the epoch close, exposed
+    /// so an operator can be told "your attestation landed" without grepping
+    /// a log. It writes nothing and no consensus rule reads it through here.
+    pub fn attested_in_current_epoch(&self, validator: u32) -> Option<bool> {
+        self.current_participation.get(&validator).copied()
+    }
+
+    /// Did `validator` have an attestation included in the PREVIOUS epoch —
+    /// the epoch whose rewards have been (or are about to be) settled? Same
+    /// contract as [`Self::attested_in_current_epoch`].
+    pub fn attested_in_previous_epoch(&self, validator: u32) -> Option<bool> {
+        self.previous_participation.get(&validator).copied()
+    }
+
+    /// The inactivity leak accrued against `validator`, in satoshis. Zero for
+    /// a validator that is voting (or has not been leaking long enough to
+    /// accrue). Observability read of the same number `active_validators`
+    /// subtracts from effective stake; exposed so an operator can see a leak
+    /// eating their stake while it is still small.
+    pub fn leaked_of(&self, validator: u32) -> u64 {
+        self.finality_engine.leaked_of(validator)
+    }
+
     /// Every unspent output, in `(txid, vout)` order.
     ///
     /// Order is the map's, so it is a function of the data and not of insertion
