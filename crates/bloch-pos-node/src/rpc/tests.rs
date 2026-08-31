@@ -470,6 +470,76 @@ fn sendrawtransaction_reply_names_the_kind_and_disclaims_the_hash() {
     assert_eq!(dup.get("accepted"), Some(&Json::Bool(true)));
 }
 
+/// The served schedule is the compiled-in schedule — every gate in
+/// `params_feed::SCHEDULE` appears in the reply, with the wall-clock instant
+/// derived from the manifest cadence and nothing invented for inert gates.
+///
+/// Together with the committee-crate tripwire
+/// (`params_feed::tests::every_activation_gate_is_in_the_feed`) this closes
+/// the loop: a new gate without a feed entry fails THAT suite, and a feed
+/// entry the RPC drops or mangles fails THIS one.
+#[test]
+fn getconsensusschedule_serves_every_gate_with_manifest_dates() {
+    use bloch_pos_committee::params_feed as feed;
+    // The mainnet manifest's recorded cadence (genesis/README.md):
+    // 2026-08-13 21:31:19.962 UTC, 30 s slots. Handed in as arguments the way
+    // the engine hands its own manifest in.
+    const GENESIS_MS: u64 = 1_786_656_679_962;
+    const SLOT_MS: u64 = 30_000;
+    let v = consensus_schedule_json(GENESIS_MS, SLOT_MS, 1_500);
+
+    assert_eq!(v.get("schema").unwrap().as_str(), Some("bloch-consensus-schedule/1"));
+    assert_eq!(v.get("genesis_time_unix_ms").unwrap().as_u64(), Some(GENESIS_MS));
+    assert_eq!(v.get("slot_ms").unwrap().as_u64(), Some(SLOT_MS));
+    assert_eq!(v.get("current_epoch").unwrap().as_u64(), Some(1_500));
+
+    let Some(Json::Arr(changes)) = v.get("changes") else { panic!("changes must be an array") };
+    assert_eq!(
+        changes.len(),
+        feed::SCHEDULE.len(),
+        "the RPC reply dropped or invented a gate relative to params_feed::SCHEDULE"
+    );
+    for (served, defined) in changes.iter().zip(feed::SCHEDULE) {
+        assert_eq!(served.get("gate").unwrap().as_str(), Some(defined.gate));
+        let epoch = served.get("activation_epoch").unwrap();
+        let when = served.get("activation_time_unix_ms").unwrap();
+        if defined.activation_epoch == feed::INERT {
+            assert_eq!(epoch, &Json::Null, "{}: inert must serve null, not u64::MAX", defined.gate);
+            assert_eq!(when, &Json::Null, "{}: an inert gate has no date", defined.gate);
+            assert_eq!(served.get("status").unwrap().as_str(), Some("inert"));
+        } else {
+            assert_eq!(epoch.as_u64(), Some(defined.activation_epoch));
+            assert_eq!(
+                when.as_u64(),
+                feed::activation_unix_ms(GENESIS_MS, SLOT_MS, 32, defined.activation_epoch),
+                "{}: wall clock must be genesis + epoch * 32 * slot_ms",
+                defined.gate
+            );
+        }
+        let Some(Json::Arr(params)) = served.get("parameters") else {
+            panic!("{}: parameters must be an array", defined.gate)
+        };
+        assert_eq!(params.len(), defined.deltas.len());
+    }
+
+    // The change the exchange hit, end to end: epoch 800, cap 262144 → 524288,
+    // served as R3 decimal strings, active, dated 2026-08-22 18:51:19.962 UTC.
+    let bytes_v2 = changes
+        .iter()
+        .find(|c| c.get("gate").and_then(Json::as_str) == Some("BLOCK_BYTES_V2_ACTIVATION_EPOCH"))
+        .expect("the payload-cap flag day must be in the feed");
+    assert_eq!(bytes_v2.get("activation_epoch").unwrap().as_u64(), Some(800));
+    assert_eq!(bytes_v2.get("activation_time_unix_ms").unwrap().as_u64(), Some(1_787_424_679_962));
+    assert_eq!(bytes_v2.get("status").unwrap().as_str(), Some("active"));
+    let Some(Json::Arr(params)) = bytes_v2.get("parameters") else { unreachable!() };
+    let cap = params
+        .iter()
+        .find(|p| p.get("name").and_then(Json::as_str) == Some("MAX_BLOCK_TX_BYTES"))
+        .expect("cap delta");
+    assert_eq!(cap.get("before").unwrap().as_str(), Some("262144"));
+    assert_eq!(cap.get("after").unwrap().as_str(), Some("524288"));
+}
+
 // ─── 2. Routing and the JSON-RPC envelope ───────────────────────────────────
 
 #[test]
@@ -483,6 +553,9 @@ fn every_method_routes_to_its_request() {
 
     call(b, &request("getblockcount", "[]"));
     assert_eq!(spy.last(), Some(RpcRequest::BlockCount));
+
+    call(b, &request("getconsensusschedule", "[]"));
+    assert_eq!(spy.last(), Some(RpcRequest::ConsensusSchedule));
 
     call(b, &request("getblockbyslot", "[41290]"));
     assert_eq!(spy.last(), Some(RpcRequest::BlockBySlot(41_290)));

@@ -1980,6 +1980,15 @@ impl Engine {
                 self.blocks.len(),
             )),
 
+            // Pure function of the manifest cadence, the wall clock and the
+            // compiled-in schedule — no consensus state is read, but the
+            // manifest lives here, so the answer is assembled here.
+            RpcRequest::ConsensusSchedule => Ok(rpc::consensus_schedule_json(
+                self.manifest.genesis_time_ms,
+                self.manifest.slot_ms,
+                bloch_pos_committee::epoch_of(self.wall_slot()),
+            )),
+
             RpcRequest::BlockCount => {
                 let fin = self.state.finality();
                 Ok(rpc::block_count_json(

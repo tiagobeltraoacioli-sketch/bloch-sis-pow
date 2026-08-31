@@ -113,6 +113,11 @@ pub mod gossip;
 pub mod header;
 pub mod interfaces;
 pub mod params;
+// The integrator-facing consensus-parameter change schedule: every epoch
+// gate in this crate as data, derived from the constants themselves, with a
+// tripwire test that fails the build if a new gate is added without a feed
+// entry. Served over RPC as `getconsensusschedule` by `bloch-pos-node`.
+pub mod params_feed;
 // Instrumentation only, and compiled out unless `perf-timing` is on — see
 // the module docs. No consensus rule reads it.
 pub mod perf;

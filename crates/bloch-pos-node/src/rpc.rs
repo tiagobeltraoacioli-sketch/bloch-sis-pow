@@ -726,6 +726,18 @@ pub enum RpcRequest {
     /// is what makes it testable without standing up a node.
     SendRawTransaction(PosTransaction),
     MempoolInfo,
+    /// `getconsensusschedule` — every epoch-gated consensus-parameter change,
+    /// past and future, as data.
+    ///
+    /// Exists because an exchange found the epoch-800 payload-cap doubling on
+    /// their own, by hitting it. The schedule is
+    /// `bloch_pos_committee::params_feed::SCHEDULE`, whose values ARE the
+    /// consensus constants (referenced, not copied) — so this method cannot
+    /// disagree with the validation code in the same binary, and an
+    /// integrator polls a node instead of reading commits. Read-only, but it
+    /// still goes through the engine: the wall-clock cadence that turns an
+    /// epoch into a date lives in the genesis manifest, which the engine owns.
+    ConsensusSchedule,
 }
 
 /// Whatever can answer an [`RpcRequest`]. In production this is the channel to
@@ -854,6 +866,7 @@ fn want_hex32(params: Option<&Json>, pos: usize, name: &str) -> Result<[u8; 32],
 pub fn route(method: &str, params: Option<&Json>) -> Result<RpcRequest, RpcError> {
     Ok(match method {
         "getchaininfo" => RpcRequest::ChainInfo,
+        "getconsensusschedule" => RpcRequest::ConsensusSchedule,
         "getblockcount" => RpcRequest::BlockCount,
         "getblockbyslot" => RpcRequest::BlockBySlot(want_u64(params, 0, "slot")?),
         "getblockbyid" => RpcRequest::BlockById(want_hex32(params, 0, "block_id")?),
@@ -1239,6 +1252,76 @@ pub fn chain_info_json(
         // (R1), so the node states it.
         ("wall_slot", Json::u(wall_slot)),
         ("behind_by_slots", Json::u(wall_slot.saturating_sub(slot))),
+    ])
+}
+
+/// `getconsensusschedule` — the consensus-parameter change feed (see
+/// [`RpcRequest::ConsensusSchedule`]).
+///
+/// A pure projection of `bloch_pos_committee::params_feed::SCHEDULE` plus the
+/// manifest's cadence. Everything consensus-critical in the reply is a
+/// reference to the constants the validation code itself reads; the only
+/// computed fields are the wall-clock instants and the status, both derived
+/// here from `(genesis_time_ms, slot_ms, SLOTS_PER_EPOCH)` so every node
+/// publishes the same dates for the same manifest.
+///
+/// Contract notes for integrators, versioned by `schema`:
+/// - `activation_epoch` is a number for an armed gate and `null` for a gate
+///   shipped inert (`u64::MAX` in the source) — inert gates are published so
+///   the SHAPE of the next change is known before its date is.
+/// - `status` is `"active"` / `"scheduled"` / `"inert"`, judged against this
+///   node's wall clock at answer time; an activation binds at the FIRST slot
+///   of its epoch.
+/// - numeric `before`/`after` are decimal **strings** (R3: they are u128 in
+///   consensus and must not pass through a double); `null` means the change
+///   is a rule or wire-format change, described in `note`.
+/// - `changes` is sorted by activation epoch, so diffing two polls shows an
+///   arming as a changed line, not a reshuffle.
+pub fn consensus_schedule_json(genesis_time_ms: u64, slot_ms: u64, wall_epoch: u64) -> Json {
+    use bloch_pos_committee::params_feed as feed;
+    let changes: Vec<Json> = feed::SCHEDULE
+        .iter()
+        .map(|c| {
+            let when =
+                feed::activation_unix_ms(genesis_time_ms, slot_ms, SLOTS_PER_EPOCH, c.activation_epoch);
+            let deltas: Vec<Json> = c
+                .deltas
+                .iter()
+                .map(|d| {
+                    Json::obj(vec![
+                        ("name", Json::s(d.name)),
+                        ("unit", Json::s(d.unit)),
+                        ("before", d.before.map_or(Json::Null, Json::sat)),
+                        ("after", d.after.map_or(Json::Null, Json::sat)),
+                        ("note", Json::s(d.note)),
+                    ])
+                })
+                .collect();
+            Json::obj(vec![
+                ("gate", Json::s(c.gate)),
+                ("defined_in", Json::s(c.defined_in)),
+                (
+                    "activation_epoch",
+                    if c.activation_epoch == feed::INERT {
+                        Json::Null
+                    } else {
+                        Json::u(c.activation_epoch)
+                    },
+                ),
+                ("activation_time_unix_ms", when.map_or(Json::Null, Json::u)),
+                ("status", Json::s(feed::status_at(c.activation_epoch, wall_epoch))),
+                ("summary", Json::s(c.summary)),
+                ("parameters", Json::Arr(deltas)),
+            ])
+        })
+        .collect();
+    Json::obj(vec![
+        ("schema", Json::s("bloch-consensus-schedule/1")),
+        ("genesis_time_unix_ms", Json::u(genesis_time_ms)),
+        ("slot_ms", Json::u(slot_ms)),
+        ("slots_per_epoch", Json::u(SLOTS_PER_EPOCH)),
+        ("current_epoch", Json::u(wall_epoch)),
+        ("changes", Json::Arr(changes)),
     ])
 }
 
