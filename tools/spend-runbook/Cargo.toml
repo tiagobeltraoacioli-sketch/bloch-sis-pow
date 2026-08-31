@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# spend-runbook — the executable companion to
+# docs/integration/BLOCH-SPEND-RUNBOOK.md: build, sign, locally validate and
+# (against a node the operator names) submit one Genesis-4 eUTXO transfer,
+# with NON-PRODUCTION keys.
+#
+# Why this exists: the exchange-integration book (§13 item 1) states plainly
+# that the entire signing path had been read from source and never executed.
+# This crate is the "someone has actually run it" half. It holds NO network
+# code beyond what an integrator would use (the node's JSON-RPC via any HTTP
+# client), and it deliberately compiles the NODE'S OWN source files for the
+# keystore, codec and genesis formats (src/main.rs `#[path]` modules) so the
+# bytes it produces cannot drift from the bytes the node parses.
+#
+# NEVER point this tool at a production key. It generates throwaway keys and
+# that is the only kind it should ever touch.
+
+[package]
+name = "spend-runbook"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "Executable spend runbook for Bloch Genesis-4: keygen, devnet genesis with a liquid allocation, transfer build/sign/validate. Non-production keys only."
+publish = false
+
+[[bin]]
+name = "spend-runbook"
+path = "src/main.rs"
+
+[dependencies]
+bloch-pos-committee = { path = "../../crates/bloch-pos-committee" }
+bloch-crypto = { path = "../../crates/bloch-crypto" }
+sha3 = "0.10"
