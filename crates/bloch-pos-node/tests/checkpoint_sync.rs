@@ -43,7 +43,12 @@ use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_bloch-pos");
 
-const SLOT_MS: u64 = 1000;
+// 1500 ms, not cold_start's 1000: this test needs FINALITY, which needs
+// attestations signed (hybrid PQ, debug build) and gossiped inside the first
+// third of every slot, epoch after epoch. Measured on a loaded box: at 1 s
+// slots the fleet produced blocks but included almost no attestations and
+// justification never moved.
+const SLOT_MS: u64 = 1500;
 /// Epoch the checkpoint attests. Its boundary block is the last block before
 /// slot `2 * 32 = 64`.
 const CHECKPOINT_EPOCH: u64 = 2;
@@ -51,7 +56,7 @@ const CHECKPOINT_EPOCH: u64 = 2;
 /// the two-round rule, so "finalized >= 2" was measured arriving as late as
 /// FINALIZED epoch 4, ~slot 190); the stop leaves the synced node room after
 /// that plus ceremony time.
-const STOP_SLOT: u64 = 300;
+const STOP_SLOT: u64 = 250;
 const GENESIS_START_IN_SECS: u64 = 6;
 
 struct Fleet(Vec<Child>);
@@ -234,8 +239,8 @@ fn a_node_bootstraps_from_checkpoint_plus_downloaded_state_and_matches_the_repla
 
     // ── Wait until finality has passed the checkpoint epoch on BOTH RPC
     //    witnesses the mint will use. ──
-    wait_for_finalized(&root.join("n0.log"), CHECKPOINT_EPOCH, 260);
-    wait_for_finalized(&root.join("n1.log"), CHECKPOINT_EPOCH, 90);
+    wait_for_finalized(&root.join("n0.log"), CHECKPOINT_EPOCH, 340);
+    wait_for_finalized(&root.join("n1.log"), CHECKPOINT_EPOCH, 120);
 
     // ── Mint the checkpoint against both RPCs (they must agree). ──
     let ck_prefix = root.join("wsck");
