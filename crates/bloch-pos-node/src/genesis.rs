@@ -148,13 +148,25 @@ pub struct CarryoverCommitment {
     pub total_sat: u128,
 }
 
-/// One consensus-vested allocation output.
+/// One allocation output — consensus-vested only if `unlock_epoch` says so.
 ///
 /// These are the buckets §3 names — founder, VC, team, marketing, liquidity,
 /// validator emission — expressed as genesis outputs rather than as a promise
-/// kept off-chain. `unlock_epoch` is what makes the vesting consensus: an
-/// output is unspendable until the chain reaches that epoch, so the schedule
-/// is enforced by every node instead of by whoever holds the key.
+/// kept off-chain. `unlock_epoch` is what CAN make the vesting consensus:
+/// since 2026-08-31 it is carried into the committed `EutxoEntry` and both
+/// transfer arms refuse the output until the chain reaches that epoch
+/// (`TransferReject::VestingLocked`). Before that date the field only
+/// perturbed the txid — no lock reached state, and this comment claimed
+/// enforcement that did not exist.
+///
+/// **The live mainnet manifest commits all five buckets at `unlock_epoch:
+/// 0`** (genesis/mainnet.manifest, digest `f47d3e49…`): every bucket was
+/// liquid from block 0, by the manifest's own terms, and all five allocation
+/// outpoints were measured already spent on 2026-08-31. A schedule this
+/// field enforces exists only on a chain whose manifest actually carries
+/// nonzero epochs — or via the flag-day seeding
+/// (`params::VESTING_LOCK_ACTIVATION_EPOCH`), which can lock only outpoints
+/// still unspent when it arms.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GenesisAllocation {
     /// Which bucket this is, as a stable tag (see `alloc_purpose`).
@@ -653,6 +665,9 @@ pub fn read_carryover_snapshot<R: BufRead>(
             // a real SHA3-256, so this field is a union of two formats by
             // decision rather than by accident.
             script_hash,
+            // Carried balances arrive liquid — always have, by the
+            // tokenomics' own terms (the carryover is not an insider bucket).
+            unlock_epoch: 0,
         });
     }
 
@@ -1068,13 +1083,17 @@ impl Manifest {
         self.allocations
             .iter()
             .map(|a| {
-                let mut h = Sha3_256::new();
-                Digest::update(&mut h, b"BLCH4:genesis-alloc\0");
-                Digest::update(&mut h, [a.purpose]);
-                Digest::update(&mut h, a.script_hash);
-                Digest::update(&mut h, a.amount_sat.to_le_bytes());
-                Digest::update(&mut h, a.unlock_epoch.to_le_bytes());
-                let txid: [u8; 32] = h.finalize().into();
+                // The single txid definition lives with the consensus code
+                // (`vesting::genesis_alloc_txid`): the flag-day seeding
+                // targets these outpoints by recomputing them, and two
+                // copies of the preimage would be two chances to disagree
+                // about which output is which.
+                let txid = bloch_pos_committee::vesting::genesis_alloc_txid(
+                    a.purpose,
+                    &a.script_hash,
+                    a.amount_sat,
+                    a.unlock_epoch,
+                );
                 bloch_pos_committee::state_root::EutxoEntry {
                     txid,
                     vout: 0,
@@ -1084,6 +1103,13 @@ impl Manifest {
                     value: u64::try_from(a.amount_sat)
                         .expect("allocation exceeds u64 satoshis — see check_supply"),
                     script_hash: a.script_hash,
+                    // Into the ENTRY, not only into the txid preimage. Until
+                    // 2026-08-31 this line did not exist: the manifest's
+                    // unlock_epoch perturbed the txid and then vanished, so
+                    // no lock ever reached committed state and nothing was
+                    // ever consensus-vested — including the live mainnet's
+                    // five buckets, which the manifest committed at 0 anyway.
+                    unlock_epoch: a.unlock_epoch,
                 }
             })
             .collect()

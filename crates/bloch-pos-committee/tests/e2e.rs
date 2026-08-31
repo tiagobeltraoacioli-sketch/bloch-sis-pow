@@ -320,6 +320,7 @@ mod harness {
                 vout: u32::from(i),
                 value: 1_000 + u64::from(i),
                 script_hash: h3(&[b"E2E:SCRIPT", &[i]]),
+                unlock_epoch: 0,
             })
             .collect();
         let validators: Vec<SrValidatorRecord> = s

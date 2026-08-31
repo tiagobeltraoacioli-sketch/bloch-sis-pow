@@ -460,6 +460,15 @@ pub enum TransferReject {
     /// same `TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH` gate — no second flag
     /// day.
     WitnessTableNotCanonical,
+    /// The input's output carries a consensus vesting lock
+    /// (`EutxoEntry::unlock_epoch`) and the chain has not reached that epoch.
+    /// The rule that makes a published vesting schedule a fact about the
+    /// chain instead of a fact about a document: until the unlock epoch, the
+    /// holder's own signature is not enough. Checked right after set
+    /// membership — a field compare, cheaper than everything after it — and
+    /// vacuously true on any chain where no seeding or locked genesis has
+    /// run, because transfers only ever create liquid outputs.
+    VestingLocked,
 }
 
 /// Why a deposit was rejected (§7.1, §4.1, §6.6.3).

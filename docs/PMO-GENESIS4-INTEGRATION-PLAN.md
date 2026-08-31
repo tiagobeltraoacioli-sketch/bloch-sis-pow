@@ -447,7 +447,12 @@ Breaks: `state_root` of block 1 onward (expected, §2). Also:
   state.** `EutxoEntry` has no vesting field and nothing enforces one. The
   claim at `genesis.rs:100-102` that vesting "is enforced by every node" is
   **not implemented**. Not item 3's job to build, but the doc comment should
-  stop asserting it.
+  stop asserting it. *(RESOLVED 2026-08-31: `EutxoEntry::unlock_epoch` is now
+  committed (leaf unchanged when 0, so no root discontinuity), both transfer
+  arms enforce it (`TransferReject::VestingLocked`), and a flag-day seeding
+  ships inert behind `params::VESTING_LOCK_ACTIVATION_EPOCH`. Too late for
+  the live allocations: all five outpoints were measured spent that same
+  day, so arming the flag day on this chain locks nothing.)*
 - **The test fixture carries stale figures.** `mainnet_sample()`
   (`genesis.rs:414-417`) still uses `entry_count: 413_743` and
   `17_970_880_000` BLCH — the pre-re-measurement numbers. Should be 452,133 and

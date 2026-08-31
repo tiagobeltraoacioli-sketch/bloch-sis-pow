@@ -2156,6 +2156,13 @@ impl CommittedState {
             let Some(entry) = self.eutxos.get(&key) else {
                 return Err(TransferReject::UnknownInput);
             };
+            // The vesting gate, against the COMMITTED epoch — the entry's
+            // lock is in its leaf, `self.epoch` is rolled by `close_epoch`,
+            // so two nodes cannot disagree here without already disagreeing
+            // on a root. A field compare, so it sits before the hashes.
+            if entry.unlock_epoch > self.epoch {
+                return Err(TransferReject::VestingLocked);
+            }
             // The key the output committed to, checked before the signature —
             // one hash against one hybrid verification.
             let key_hash: [u8; 32] = Sha3_256::digest(&i.pubkey).into();
@@ -2228,6 +2235,12 @@ impl CommittedState {
                 vout,
                 value: o.value,
                 script_hash: o.script_hash,
+                // Transfers create LIQUID outputs, always: a lock is part of
+                // the chain's opening terms (genesis or the flag-day
+                // seeding), never something a spender mints — and the gate
+                // above already kept a locked input from reaching this line
+                // before its epoch.
+                unlock_epoch: 0,
             });
         }
         Ok(charge)
@@ -2352,6 +2365,11 @@ impl CommittedState {
             let Some(entry) = self.eutxos.get(&key) else {
                 return Err(TransferReject::UnknownInput);
             };
+            // The vesting gate — same rule, same placement, same committed
+            // inputs as V1's. A format change must never be a lock bypass.
+            if entry.unlock_epoch > self.epoch {
+                return Err(TransferReject::VestingLocked);
+            }
             let Some(key_hash) = key_hashes.get(i.key_index as usize) else {
                 return Err(TransferReject::BadKeyIndex);
             };
@@ -2436,6 +2454,12 @@ impl CommittedState {
                 vout,
                 value: o.value,
                 script_hash: o.script_hash,
+                // Transfers create LIQUID outputs, always: a lock is part of
+                // the chain's opening terms (genesis or the flag-day
+                // seeding), never something a spender mints — and the gate
+                // above already kept a locked input from reaching this line
+                // before its epoch.
+                unlock_epoch: 0,
             });
         }
         Ok(charge)
@@ -3004,7 +3028,81 @@ impl CommittedState {
             expected.len()
         );
 
+        // 7. The vesting-lock flag day (params::VESTING_LOCK_ACTIVATION_EPOCH,
+        //    inert at u64::MAX). Runs exactly at the boundary that OPENS the
+        //    activation epoch — equality, not `>=`, because boundaries are
+        //    walked densely and a one-time state rewrite must be one-time.
+        //    Placed after the epoch roll so a replayed chain and a live one
+        //    agree on the epoch the seeded entries first exist in.
+        if next_epoch == crate::params::VESTING_LOCK_ACTIVATION_EPOCH {
+            st.seed_vesting_locks();
+        }
+
         st
+    }
+
+    /// Replace each still-unspent genesis allocation outpoint with the
+    /// tranche outputs of [`crate::vesting::tranche_schedule`] — the one-time
+    /// flag-day rewrite that puts the published vesting schedule into
+    /// committed state.
+    ///
+    /// **Value is conserved exactly**: an outpoint is rewritten only if it
+    /// still holds its full genesis value under its genesis script, and the
+    /// tranches inserted sum to precisely that value (asserted here, and
+    /// their conservation against the curves is pinned in `vesting::tests`).
+    /// `issued_sat` does not move — nothing is minted or burned, the same
+    /// coins change shape.
+    ///
+    /// **A spent target is skipped, silently and on purpose.** The seed
+    /// table names outpoints, and an outpoint that was spent before the flag
+    /// day no longer exists to lock; its value sits under fresh txids this
+    /// table does not name, and claiming THOSE would be confiscating outputs
+    /// whose owner may no longer be the allocation's. That skip is why the
+    /// flag day has a go/no-go precondition (confirm the targets unspent by
+    /// `gettxout` BEFORE arming) — and why, on the chain measured 2026-08-31
+    /// with all five allocation outpoints already spent, arming this locks
+    /// nothing at all. The mechanism cannot repair the past; it can only
+    /// hold a schedule that is still there to hold.
+    fn seed_vesting_locks(&mut self) {
+        for target in crate::vesting::seed_targets() {
+            let outpoint = (target.txid, 0u32);
+            let Some(entry) = self.eutxos.get(&outpoint) else {
+                // Spent (or never existed on this network): nothing to lock.
+                continue;
+            };
+            if entry.value != target.value_sat || entry.script_hash != target.script_hash {
+                // Not the output the table pinned. Unreachable without a
+                // txid collision, and refused rather than assumed away.
+                continue;
+            }
+            let Some(tranches) = crate::vesting::tranche_schedule(target.purpose) else {
+                continue;
+            };
+            let total: u128 = tranches.iter().map(|t| t.value_sat as u128).sum();
+            consensus_invariant!(
+                total == target.value_sat as u128,
+                "vesting tranches for purpose {:#x} sum to {} sat against an allocation of {}",
+                target.purpose,
+                total,
+                target.value_sat,
+            );
+            self.eutxos.remove(&outpoint);
+            for (i, tr) in tranches.iter().enumerate() {
+                self.eutxos.insert(crate::state_root::EutxoEntry {
+                    txid: crate::vesting::tranche_txid(
+                        target.purpose,
+                        i as u32,
+                        &target.script_hash,
+                        tr.value_sat,
+                        tr.unlock_epoch,
+                    ),
+                    vout: 0,
+                    value: tr.value_sat,
+                    script_hash: target.script_hash,
+                    unlock_epoch: tr.unlock_epoch,
+                });
+            }
+        }
     }
 }
 
@@ -3748,6 +3846,7 @@ mod tests {
             vout,
             value,
             script_hash: script_of(owner),
+            unlock_epoch: 0,
         }
     }
 
@@ -4172,6 +4271,7 @@ mod tests {
                     vout: 0,
                     value: 1_000 + i as u64,
                     script_hash: [7u8; 32],
+                    unlock_epoch: 0,
                 }
             })
             .collect();
@@ -4204,6 +4304,7 @@ mod tests {
                 vout: 0,
                 value: 42,
                 script_hash: [9u8; 32],
+                unlock_epoch: 0,
             });
         }
         let edit = t2.elapsed();
@@ -5389,6 +5490,115 @@ mod tests {
         // about the outpoint and not about the fixture.
         let good = transfer_spending(std::slice::from_ref(&real), &alice, to, 512, 1, price);
         assert!(g.clone().apply_transfer(&good, price, &ToyVerifier).is_ok());
+    }
+
+    /// **A committed vesting lock refuses the owner's own signature until its
+    /// epoch — and only until its epoch.** The rule that makes a published
+    /// schedule a fact about the chain: the transfer below is perfectly
+    /// signed, perfectly conserving, and rejected anyway, on both formats.
+    ///
+    /// Sabotage this catches: dropping either arm's `unlock_epoch` compare
+    /// turns the first half of each pair into an accepted spend; comparing
+    /// with `>=` instead of `>` fails the second half, where the epoch has
+    /// arrived and the coin must move.
+    #[test]
+    fn a_vesting_locked_output_waits_for_its_epoch_on_both_formats() {
+        let alice = owner_key(0x61);
+        let to = script_of(&owner_key(0x62));
+        let locked = crate::state_root::EutxoEntry {
+            unlock_epoch: 5,
+            ..opening(0x91, 0, 50_000_000, &alice)
+        };
+        let (_t, g, _c) = setup_funded(4, std::slice::from_ref(&locked));
+        let price = g.next_base_fee();
+
+        // V1, before the epoch: refused for the lock, not for anything else.
+        let tx = transfer_spending(std::slice::from_ref(&locked), &alice, to, 512, 1, price);
+        assert_eq!(
+            g.clone().apply_transfer(&tx, price, &ToyVerifier),
+            Err(TransferReject::VestingLocked),
+        );
+
+        // V2, before the epoch: a format change is not a lock bypass. Direct
+        // seam, past the flag-day gate — the same way the format's own
+        // discipline tests exercise it.
+        let tx2 = transfer_v2_raw(
+            std::slice::from_ref(&locked),
+            &[&alice],
+            &[0],
+            to,
+            512,
+            1,
+            price,
+        );
+        assert_eq!(
+            g.clone().apply_transfer_v2(&tx2, price, &ToyVerifier),
+            Err(TransferReject::VestingLocked),
+        );
+
+        // At the unlock epoch, both formats spend it — the lock expires
+        // exactly when the schedule says, not one epoch later.
+        let mut due = g.clone();
+        due.epoch = 5;
+        assert!(due.clone().apply_transfer(&tx, price, &ToyVerifier).is_ok());
+        assert!(due.clone().apply_transfer_v2(&tx2, price, &ToyVerifier).is_ok());
+    }
+
+    /// **The flag-day seeding: an unspent allocation becomes its tranche
+    /// schedule, exactly, and a spent one is left alone.**
+    ///
+    /// Conservation is the load-bearing half — the rewrite must move value
+    /// into locked shape without minting or burning a satoshi — and the
+    /// skip is the honest half: a target that is no longer in the set has
+    /// nothing to lock, and the seeding must not invent a claim on whatever
+    /// outputs its spend created.
+    #[test]
+    fn seeding_locks_what_is_there_and_only_what_is_there() {
+        let target = crate::vesting::seed_targets()
+            .into_iter()
+            .find(|t| t.purpose == crate::vesting::alloc_purpose::FOUNDER)
+            .expect("founder is a seed target");
+        let allocation = crate::state_root::EutxoEntry {
+            txid: target.txid,
+            vout: 0,
+            value: target.value_sat,
+            script_hash: target.script_hash,
+            unlock_epoch: 0,
+        };
+        let (_t, g, _c) = setup_funded(4, std::slice::from_ref(&allocation));
+        let before = g.balance_sat(&target.script_hash);
+
+        let mut seeded = g.clone();
+        seeded.seed_vesting_locks();
+
+        // The allocation outpoint is gone; the tranches are its exact value,
+        // every one locked to a future epoch, every one still the founder's.
+        assert!(seeded.utxo(&target.txid, 0).is_none());
+        let tranches: Vec<_> = seeded
+            .eutxos()
+            .filter(|e| e.script_hash == target.script_hash)
+            .cloned()
+            .collect();
+        let schedule = crate::vesting::tranche_schedule(target.purpose).unwrap();
+        assert_eq!(tranches.len(), schedule.len());
+        assert_eq!(seeded.balance_sat(&target.script_hash), before, "seeding conserves value");
+        assert!(tranches.iter().all(|e| e.unlock_epoch > 0), "every founder tranche is locked");
+
+        // And a locked tranche is actually held by the gate: the earliest
+        // tranche refuses a perfectly signed spend at epoch 0. (`opening`'s
+        // toy ownership does not apply here — the founder script is not a
+        // toy key hash — so assert through the entry, not a signature.)
+        let earliest = tranches.iter().map(|e| e.unlock_epoch).min().unwrap();
+        assert!(earliest > seeded.epoch);
+
+        // A state where the allocation was ALREADY spent: seeding rewrites
+        // nothing — same entries before and after, bit for bit.
+        let (_t2, spent, _c2) = setup_funded(4, &[opening(0x92, 0, 1_000_000, &owner_key(0x63))]);
+        let mut reseeded = spent.clone();
+        reseeded.seed_vesting_locks();
+        let a: Vec<_> = spent.eutxos().cloned().collect();
+        let b: Vec<_> = reseeded.eutxos().cloned().collect();
+        assert_eq!(a, b, "a spent target must be skipped, not re-invented");
     }
 
     /// **The test that stops anyone spending anyone else's coins.**

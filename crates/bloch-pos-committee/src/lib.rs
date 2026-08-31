@@ -132,6 +132,7 @@ pub mod schedule;
 pub mod slashing;
 pub mod derive;
 pub mod transition;
+pub mod vesting;
 pub mod ws;
 
 pub use attestation::{Attestation, AttestationData, RejectReason, SignatureVerifier};

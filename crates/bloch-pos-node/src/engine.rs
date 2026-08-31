@@ -3867,6 +3867,7 @@ mod transfer_v2_end_to_end {
                 vout,
                 value: 8_400 * 100_000_000, // 8,400 BLCH at 8 decimals
                 script_hash,
+                unlock_epoch: 0,
             })
             .collect();
         let inputs: Vec<TransferInputV2> = entries
@@ -4271,6 +4272,7 @@ mod bench {
                     h[..4].copy_from_slice(&(i % 4096).to_le_bytes());
                     h
                 },
+                unlock_epoch: 0,
             })
             .collect();
         CommittedState::genesis(
@@ -4327,6 +4329,7 @@ mod bench {
                     h[..4].copy_from_slice(&(i % 4096).to_le_bytes());
                     h
                 },
+                unlock_epoch: 0,
             })
             .collect();
         let vs: Vec<bloch_pos_committee::transition::GenesisValidator> = (0..validators)

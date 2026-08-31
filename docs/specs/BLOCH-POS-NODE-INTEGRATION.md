@@ -278,8 +278,24 @@ and published ahead of launch:
   the genesis block per tokenomics §3.2.2),
 - the carryover balance set itself (as `carryover.tsv`-style data, verified
   against the digest at load),
-- the six allocation outputs with consensus-enforced vesting locks
-  (tokenomics §8.2 — a schedule in a spreadsheet is not a schedule),
+- the allocation outputs, each carrying an `unlock_epoch`
+  (tokenomics §8.2 — a schedule in a spreadsheet is not a schedule).
+  **CORRECTED 2026-08-31 — this bullet used to claim "consensus-enforced
+  vesting locks", and that was false twice over.** First, until 2026-08-31
+  the manifest's `unlock_epoch` was hashed into the allocation's txid and
+  then dropped: it never reached the committed `EutxoEntry`, and
+  `apply_transfer` had no epoch gate, so no lock was ever enforced by any
+  node. (Enforcement now exists: `EutxoEntry::unlock_epoch` is committed in
+  the state root and both transfer arms refuse a spend before its epoch —
+  `TransferReject::VestingLocked`.) Second, and independently of the code:
+  the live mainnet manifest (`genesis/mainnet.manifest`, digest
+  `f47d3e49…`) committed **all five buckets — founder 10B, VC 10B, team
+  10B, marketing 4B, liquidity 5B, 39B BLOCH total — at `unlock_epoch: 0`,
+  all under the founder's script**. Every bucket was liquid from block 0 by
+  the manifest's own terms, and all five allocation outpoints were measured
+  already SPENT on 2026-08-31 (three fleet nodes, consistent head, epoch
+  1,599). No consensus vesting has ever bound this chain's allocations, and
+  a lock introduced now cannot reach coins that have already moved,
 - the genesis validator set + the **genesis cohort** list
   (`genesis_cohort.rs` caps its combined weight, 100% → 33.3% over year one),
 - `genesis_time` (slot-0 timestamp) and network version.

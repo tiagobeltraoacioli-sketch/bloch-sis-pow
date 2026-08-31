@@ -714,6 +714,15 @@ pub enum RpcRequest {
     /// possible. A holder also could not audit their own position beyond an
     /// aggregate balance and an arbitrary first thousand outputs.
     ///
+    /// **That precondition was measured on 2026-08-31, and it FAILED**: all
+    /// five allocation outpoints answer `unspent: false` on three fleet nodes
+    /// at a consistent head (slot 51,184, epoch 1,599), and the founder
+    /// script's balance stood at ~37.94B BLOCH against the ~56.05B it opened
+    /// with. The seeding machinery exists and ships inert
+    /// (`params::VESTING_LOCK_ACTIVATION_EPOCH = u64::MAX`); arming it on
+    /// this chain locks nothing unless the buckets are first returned to the
+    /// pinned outpoints (`bloch_pos_committee::vesting::seed_targets`).
+    ///
     /// Read-only: no consensus surface, no flag day.
     TxOut { txid: [u8; 32], vout: u32 },
     /// A transaction that **already decoded**.
@@ -1495,6 +1504,12 @@ fn eutxo_json(e: &EutxoEntry) -> Json {
         ("vout", Json::u(u64::from(e.vout))),
         ("value_sat", Json::sat(u128::from(e.value))),
         ("script_hash", Json::hex(&e.script_hash)),
+        // The committed vesting lock: first epoch this output may be spent,
+        // 0 = liquid. This is the §4.6 "vesting-lock visibility" answer —
+        // extra field on the existing shapes rather than a new method, so a
+        // wallet learns "spendable now, and if not, when" from the same call
+        // it already makes before building a transaction.
+        ("unlock_epoch", Json::u(e.unlock_epoch)),
     ])
 }
 

@@ -98,6 +98,14 @@ Two structural facts frame everything below:
   while the real new concentration (17% founder + 24% other insiders, all
   untainted genesis allocations) sits entirely **outside** the taint set. The
   defense that actually binds in V4 is **vesting**, not taint (F4).
+  *(Corrected 2026-08-31: on the launched chain, vesting did not bind
+  either. The mainnet manifest committed every allocation bucket at
+  `unlock_epoch: 0`, the field never reached committed state before
+  2026-08-31, and all five allocation outpoints were measured spent that
+  day. The anti-capture defense this document rests on has, to date, never
+  operated; consensus enforcement now exists — `EutxoEntry::unlock_epoch`,
+  `TransferReject::VestingLocked` — but only binds a chain whose genesis or
+  flag-day seeding sets it, and cannot reach coins already moved.)*
 
 ---
 
@@ -314,6 +322,9 @@ replaces the founder's carried balance with a *new untainted* vested allocation
 untainted genesis outputs. The real Genesis-4 concentration is entirely outside
 the taint set; the anti-capture defense that actually operates is **vesting**
 (founder 0 spendable at genesis, `tokenomics_v4.rs:65-94`), not taint.
+*(Corrected 2026-08-31: "actually operates" was aspiration — the launched
+manifest set every bucket's `unlock_epoch` to 0 and no lock ever reached
+committed state; see the F4 correction above.)*
 
 **Code path.** migration §4.1, §6.6.3; `delegation.rs:76-77, 122-124, 311`;
 `interfaces.rs:279-339`.
