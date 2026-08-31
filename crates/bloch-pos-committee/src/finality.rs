@@ -604,6 +604,33 @@ impl FinalityState {
     pub fn leaked_stakes(&self) -> impl Iterator<Item = (u32, u64)> + '_ {
         self.leaked.iter().map(|(v, s)| (*v, *s))
     }
+
+    /// Rebuild a fold state from its committed components — the
+    /// checkpoint-sync restore path (`transition::snapshot`), and nothing
+    /// else.
+    ///
+    /// This deliberately breaks the "only [`FinalityState::new`] and the fold
+    /// itself produce values of this type" property, so the terms are stated
+    /// here: every field this constructor accepts is committed under
+    /// `TAG_FINALITY` in the state root (`state_root::FinalityRecord` carries
+    /// the full fold state), and the ONLY caller is a restore that recomputes
+    /// that root and refuses the whole state on a mismatch. A caller that
+    /// could hand this constructor unverified values would be a second
+    /// producer of finality out of thin air — do not add one.
+    ///
+    /// `justified` is taken as `(epoch, root)` pairs exactly as
+    /// [`FinalityState::justified_checkpoints`] renders them; at most one
+    /// root per epoch is representable by the map, matching the
+    /// disjoint-quorums invariant.
+    pub fn from_committed_parts(
+        justified: BTreeMap<u64, [u8; 32]>,
+        current_justified: Checkpoint,
+        finalized: Checkpoint,
+        leaked: BTreeMap<u32, u64>,
+        next_epoch: u64,
+    ) -> Self {
+        FinalityState { justified, current_justified, finalized, leaked, next_epoch }
+    }
 }
 
 #[cfg(test)]
