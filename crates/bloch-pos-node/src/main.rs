@@ -43,6 +43,10 @@
 //! rule once integration review starts).
 
 mod codec;
+// `pub` and uncalled on purpose: the shielded-proof verifier is doubly inert
+// (no shielded-tx wire tag exists yet, and its every default is RejectAll).
+// See the module docs before wiring anything to it.
+pub mod coherence;
 mod engine;
 mod genesis;
 mod keys;

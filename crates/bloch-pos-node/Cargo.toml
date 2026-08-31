@@ -49,6 +49,15 @@ path = "src/main.rs"
 # whether the breakdown is available. Never enable it on a producing node.
 perf-timing = ["bloch-pos-committee/perf-timing"]
 
+# Coherence: verify shielded-spend FRI proofs with SP1 (src/coherence.rs).
+# OFF by default — the default build graph contains NO sp1 crate. Enabling it
+# only compiles the backend; the node still rejects every shielded proof
+# unless BLOCH_SHIELDED_VERIFY=sp1 is set AND the guest ELF loads AND its
+# hash matches the pin (all fail-closed — see the module docs). The feature
+# lives HERE and only here: bloch-pos-committee must never link sp1-sdk (the
+# verifier crosses into consensus as a trait, the interfaces.rs pattern).
+sp1-verify = ["dep:sp1-sdk", "dep:bincode"]
+
 [dependencies]
 # The frozen consensus math (pure, sha3-only).
 bloch-pos-committee = { path = "../bloch-pos-committee" }
@@ -57,6 +66,27 @@ bloch-pos-committee = { path = "../bloch-pos-committee" }
 # build stopped being instant at M2 — planned in the integration doc §6.
 bloch-crypto = { path = "../bloch-crypto" }
 sha3 = "0.10"
+
+# Coherence shielded-pool primitives (SpendPublic — the type the verifier
+# trait in src/coherence.rs speaks). Lean (sha3 + serde) and ALREADY in this
+# binary's graph transitively via bloch-crypto; making it direct adds nothing.
+coherence-core = { path = "../coherence-core" }
+
+# ── Optional — only pulled with the `sp1-verify` feature (see [features]) ──
+#
+# Pinned =6.5.0: the exact SDK the proof-size measurement ran
+# (docs/audit/COHERENCE-PROOF-SIZE-2026-08-29.md), so verifier and measured
+# artifact agree on the wire envelope. default-features = false is NOT
+# hygiene: the default features drag alloy-consensus 0.14, which does not
+# compile against serde >= 1.0.228. (Unlike SDK 4, tonic 0.12 still comes
+# along even with default features off — it is a non-optional dependency of
+# sp1-prover's internal worker architecture at 6.5.0; only the alloy stack is
+# droppable.) "blocking" gives the synchronous client — consensus validation
+# cannot await a proof.
+sp1-sdk = { version = "=6.5.0", default-features = false, features = ["blocking"], optional = true }
+# The proof envelope's wire format is bincode-1 fixint; bincode 2's
+# `config::legacy()` decodes it. Same major the Genesis-3 node standardized on.
+bincode = { version = "2", features = ["serde"], optional = true }
 
 # The production network layer (src/p2p.rs). Same major version the Genesis-3
 # node runs (0.56), so the mesh fixes ported from it apply to the same
