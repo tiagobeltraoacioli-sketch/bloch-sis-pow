@@ -1546,6 +1546,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloch-partner-send"
+version = "0.1.0"
+dependencies = [
+ "bloch-crypto",
+ "bloch-pos-committee",
+ "hex",
+ "rpassword",
+ "serde",
+ "serde_json",
+ "sha3 0.10.9",
+]
+
+[[package]]
 name = "bloch-pos-committee"
 version = "0.1.0"
 dependencies = [
