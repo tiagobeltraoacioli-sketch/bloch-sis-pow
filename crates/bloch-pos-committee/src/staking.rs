@@ -500,6 +500,17 @@ pub enum WithdrawReject {
 /// transaction carries no spending authority of its own, which is why there is
 /// no signature to verify here: after [`WITHDRAWAL_DELAY_EPOCHS`] the transfer
 /// to `withdrawal_addr` is the only thing that can happen to these coins.
+///
+/// **Reference-spec only — the consensus gate is stricter.** This function
+/// recomputes the ripeness clock from `exit_epoch + WITHDRAWAL_DELAY_EPOCHS`;
+/// the transaction that actually pays (`transition.rs`, the `Withdraw` arm of
+/// `apply_transaction`, behind `params::WITHDRAWAL_ACTIVATION_EPOCH`) gates on
+/// the COMMITTED `withdrawable_epoch` field instead, which every slash
+/// *extends* — post-activation to the full correlation window — and also
+/// settles the inactivity leak and re-prices a slashed residue at the door.
+/// The two agree exactly on the unslashed voluntary path this module states;
+/// where they differ, the committed field wins, by the §5.5 rule that no
+/// consensus value is recomputed from parts when the whole is committed.
 pub fn validate_withdrawal(
     record: &ValidatorRecord,
     current_epoch: u64,
