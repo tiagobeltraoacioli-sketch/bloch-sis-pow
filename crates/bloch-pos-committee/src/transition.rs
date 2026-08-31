@@ -5291,6 +5291,189 @@ mod tests {
         );
     }
 
+    /// **Withdrawal-fee semantics, part 1: a transfer is valid at EXACTLY
+    /// one base fee — a point, not a range.**
+    ///
+    /// The conservation equality prices the fee from the block's committed
+    /// base fee, never from the transaction ([`fee_market::charge`] inside
+    /// `apply_transfer`); the transfer's outputs were fixed by the price its
+    /// wallet quoted. Sweeping the price around the quote: one millisatoshi
+    /// up — the smallest representable move — the transfer underpays; one
+    /// down it overpays; and BOTH are [`TransferReject::ValueNotConserved`],
+    /// because the check is `==`, not `>=`. A full controller step (±1/8) is
+    /// farther from the point and fails identically.
+    ///
+    /// The width of the valid set is degenerate in general, not just here:
+    /// fees settle as `ceil(gas·price/1000)` satoshis, so two prices can
+    /// coincide only for `gas < 1000`, and no transaction is that cheap
+    /// (`TX_FLAT_GAS` alone is 5,000 —
+    /// `fee_market::tests::a_satoshi_settled_fee_moves_on_every_millisat_step`
+    /// pins the bound). The last assertions re-derive that on this very
+    /// transaction, so the sweep finding one admissible price cannot be a
+    /// fixture accident.
+    ///
+    /// Sabotage: replacing the conservation `==` with `>=` makes the
+    /// price-below-quote half pass (an overpaying transfer admitted); making
+    /// the fee a declared field instead of a derived one makes every price
+    /// pass.
+    #[test]
+    fn a_transfer_is_valid_at_exactly_one_base_fee() {
+        let alice = owner_key(0x58);
+        let to = script_of(&owner_key(0x59));
+        let coin = opening(0x83, 0, 50_000_000, &alice);
+        let (_t, g, _c) = setup_funded(4, &[coin.clone()]);
+
+        // Quoted well above the floor so the sweep can move both directions.
+        let quote: u128 = 8_000;
+        let tx = transfer_spending(std::slice::from_ref(&coin), &alice, to, 512, 3, quote);
+
+        let step = quote / fee_market::BASE_FEE_CHANGE_DENOMINATOR; // one ±1/8 controller step
+        for price in [quote - step, quote - 1, quote, quote + 1, quote + step] {
+            let got = g.clone().apply_transfer(&tx, price, &ToyVerifier);
+            if price == quote {
+                assert!(got.is_ok(), "the quoted price must admit the transfer");
+            } else {
+                assert_eq!(
+                    got,
+                    Err(TransferReject::ValueNotConserved),
+                    "price {price} != quote {quote} must be a hard conservation reject"
+                );
+            }
+        }
+
+        // Why no neighbouring price can settle equal: this transfer's gas is
+        // orders of magnitude past the 1,000-gas threshold, so each msat
+        // step moves its satoshi fee.
+        let PosTransaction::Transfer { tx_bytes, .. } = &tx else { unreachable!() };
+        let gas = fee_market::intrinsic_gas(fee_market::TxClass::Eutxo { inputs: 1 }, *tx_bytes);
+        assert!(gas >= 1_000, "gas={gas}");
+        let at = fee_market::charge(fee_market::TxClass::Eutxo { inputs: 1 }, *tx_bytes, quote, 3);
+        let up =
+            fee_market::charge(fee_market::TxClass::Eutxo { inputs: 1 }, *tx_bytes, quote + 1, 3);
+        assert!(up.base_fee_sat > at.base_fee_sat, "a msat step must move the satoshi fee");
+    }
+
+    /// [`probe_env`] without consuming the proposer's reveal — for blocks a
+    /// test EXPECTS the transition to refuse. `probe_env` advances the
+    /// proposer's [`RandaoChain`]; a refused block would leave that chain
+    /// one reveal ahead of the committed `RevealState`, and the next
+    /// legitimate build at the same slot would then carry the WRONG reveal
+    /// and fail on randao instead of the rule under test.
+    fn peek_env(
+        pre: &CommittedState,
+        slot: u64,
+        txs: &[PosTransaction],
+        chains: &[RandaoChain],
+    ) -> ProposalEnvelope {
+        let roster = pre.duty_roster();
+        let seed = pre.seed_for_epoch(pre.epoch);
+        let p = schedule::proposer(&seed, slot, &roster).unwrap();
+        let reveal = chains[p as usize].peek_reveal().unwrap();
+        let fin = pre.finality_view();
+        let header = BlockHeaderV4 {
+            version: BLOCK_VERSION_V4,
+            parent: *pre.head.as_bytes(),
+            state_root: [0u8; 32],
+            body_root: crate::derive::body_root(
+                &txs.iter().map(PosTransaction::canonical_bytes).collect::<Vec<_>>(),
+            ),
+            slot,
+            proposer_index: p,
+            randao_reveal: reveal,
+            randao_mix: beacon::mix_in(&pre.randao_mix, &reveal),
+            justified_root: fin.justified.root,
+            finalized_root: fin.finalized.root,
+            attestation_root: crate::derive::attestation_root(&[]),
+            coherence_root: pre.coherence_root(),
+        };
+        ProposalEnvelope { header, proposer_sig: vec![0u8; 8] }
+    }
+
+    /// **Withdrawal-fee semantics, parts 2 and 3, demonstrated on the chain
+    /// rather than read from the code.** Three blocks:
+    ///
+    /// 1. a byte-congested block lands at the 10-msat floor and the
+    ///    controller moves the next price to 11 (upward step floored at +1);
+    /// 2. a transfer QUOTED AT 10 before that block — the held withdrawal —
+    ///    is refused, and refused as a WHOLE-BLOCK reject
+    ///    (`TransitionError::Transfer(0, ValueNotConserved)`). That error is
+    ///    what the proposer's drop-and-retry loop keys on
+    ///    (bloch-pos-node/src/engine.rs, `propose`) when it silently removes
+    ///    the transaction from the mempool. The same spend REBUILT at 11 is
+    ///    accepted in the same slot;
+    /// 3. the rebuilt block is slack, the price decays straight back to the
+    ///    floor — and the ORIGINAL stale bytes, identical and never rebuilt,
+    ///    now apply.
+    ///
+    /// So the "resubmitting identical bytes is permanently invalid" reading
+    /// is right in operation and wrong in one word: the bytes are invalid at
+    /// every price EXCEPT the quoted one, and revive if and only if the
+    /// controller returns to that exact price — which at the floor it
+    /// reliably does. The operational consequence is sharper than
+    /// "permanently invalid", not weaker: a withdrawal that was rebuilt at
+    /// the new fee and a stale twin whose bytes ever reached a mempool can
+    /// BOTH confirm once the price decays, so void-and-rebuild must spend
+    /// the same inputs (making the old bytes conflict), not merely forget
+    /// them.
+    #[test]
+    fn a_held_fee_quote_dies_on_the_first_price_move_and_revives_only_at_its_exact_price() {
+        let alice = owner_key(0x5A);
+        let bob = owner_key(0x5B);
+        let carol = owner_key(0x5C);
+        let sink = script_of(&owner_key(0x5D));
+        let coin_a = opening(0x84, 0, 50_000_000, &alice);
+        let coin_b = opening(0x84, 1, 50_000_000, &bob);
+        let coin_c = opening(0x84, 2, 50_000_000, &carol);
+        let (t, g, mut chains) =
+            setup_funded(4, &[coin_a.clone(), coin_b.clone(), coin_c.clone()]);
+
+        // Genesis prices at the floor.
+        let floor = fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS;
+        assert_eq!(g.next_base_fee(), floor);
+
+        // Everybody quotes at the floor — the price a wallet reads NOW.
+        // Alice's transfer declares its bytes past the 128 KiB EIP-1559 byte
+        // target (legal: under the 256 KiB cap): one transfer congests the
+        // block on the byte axis, exactly the traffic shape this chain's
+        // controller exists for.
+        let congesting = transfer_spending(&[coin_a], &alice, sink, 180_000, 0, floor);
+        let stale_bob = transfer_spending(&[coin_b.clone()], &bob, sink, 512, 0, floor);
+        let stale_carol = transfer_spending(&[coin_c.clone()], &carol, sink, 512, 0, floor);
+
+        // Block 1: the congested block applies at the floor...
+        let b1 = build_block(&t, &g, 1, &[], std::slice::from_ref(&congesting), &mut chains);
+        let s1 = t.apply_block(&g, &b1, &[], std::slice::from_ref(&congesting)).unwrap();
+        // ...and the controller moves. One congested block, one price step —
+        // and every fee quoted before it is now dead.
+        assert_eq!(s1.next_base_fee(), floor + 1);
+
+        // Block 2, the negative half: Bob's held quote rejects the whole
+        // block, with the transfer's own named reason.
+        let env = peek_env(&s1, 2, std::slice::from_ref(&stale_bob), &chains);
+        assert_eq!(
+            t.compute_post_state(&s1, &env, &[], std::slice::from_ref(&stale_bob)).unwrap_err(),
+            TransitionError::Transfer(0, TransferReject::ValueNotConserved),
+            "a fee quoted one price step ago must reject the block that carries it"
+        );
+
+        // The same spend REBUILT at the new price is accepted in that slot.
+        let rebuilt_bob = transfer_spending(&[coin_b], &bob, sink, 512, 0, floor + 1);
+        let b2 = build_block(&t, &s1, 2, &[], std::slice::from_ref(&rebuilt_bob), &mut chains);
+        let s2 = t.apply_block(&s1, &b2, &[], std::slice::from_ref(&rebuilt_bob)).unwrap();
+
+        // Block 2 was slack, so the price decays straight back to the floor...
+        assert_eq!(s2.next_base_fee(), floor);
+
+        // ...and Carol's ORIGINAL bytes — quoted at 10, refused-at-11 class,
+        // never rebuilt — now apply as they are.
+        let b3 = build_block(&t, &s2, 3, &[], std::slice::from_ref(&stale_carol), &mut chains);
+        let s3 = t.apply_block(&s2, &b3, &[], std::slice::from_ref(&stale_carol)).unwrap();
+        assert!(
+            !s3.eutxos.contains_key(&(coin_c.txid, coin_c.vout)),
+            "the revived transfer must actually have spent Carol's coin"
+        );
+    }
+
     /// **Double spend.** The same output spent twice in one block is refused —
     /// whether the two spends are two transactions or two inputs of one.
     ///

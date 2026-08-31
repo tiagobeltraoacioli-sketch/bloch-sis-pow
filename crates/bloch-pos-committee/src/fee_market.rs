@@ -622,6 +622,112 @@ mod tests {
         assert_eq!(b, MAX_BASE_FEE_MILLISAT_PER_GAS);
     }
 
+    /// **Withdrawal-fee semantics, the arithmetic half: a transaction's
+    /// satoshi fee moves on EVERY millisatoshi step of the base fee, so the
+    /// set of prices a fixed transfer conserves at is a single point.**
+    ///
+    /// Fees settle as `ceil(gas · price / 1000)` satoshis
+    /// ([`fee_parts_sat`]). Two adjacent prices settle to the same satoshi
+    /// figure only when `gas < 1000` — for `gas >= 1000` the step is at
+    /// least `floor(gas/1000) >= 1` satoshi. No representable transaction is
+    /// that cheap: [`TX_FLAT_GAS`] alone is 5,000, before a single byte or
+    /// verification is priced. The transition-level twin
+    /// (`transition::tests::a_transfer_is_valid_at_exactly_one_base_fee`)
+    /// shows the consequence — `ValueNotConserved` one msat to either side
+    /// of the quote; this test pins the bound that makes it general rather
+    /// than a fixture accident.
+    #[test]
+    fn a_satoshi_settled_fee_moves_on_every_millisat_step() {
+        // The cheapest transaction ANY class can construct: zero bytes, the
+        // cheapest verifier. Still 8,000 gas — eight times the threshold.
+        let cheapest = intrinsic_gas(TxClass::EvmSecp256k1, 0);
+        assert_eq!(cheapest, TX_FLAT_GAS + SECP256K1_VERIFY_GAS);
+        assert!(cheapest >= 1_000, "no transaction may dip under the 1,000-gas step bound");
+
+        // Every 1-msat move of the base fee moves the satoshi fee, at the
+        // floor, at a mid price, and far above — for the cheapest possible
+        // transaction and for a real minimal PQ transfer alike.
+        let minimal_transfer =
+            intrinsic_gas(TxClass::Eutxo { inputs: 1 }, HYBRID_SIG_BYTES + 256);
+        for gas in [cheapest, minimal_transfer] {
+            for base in [MIN_BASE_FEE_MILLISAT_PER_GAS, 8_000, 1_000_000] {
+                let (at, _) = fee_parts_sat(gas, base, 0);
+                let (up, _) = fee_parts_sat(gas, base + 1, 0);
+                let (down, _) = fee_parts_sat(gas, base - 1, 0);
+                assert!(down < at && at < up, "gas={gas} base={base}: a msat step must move the fee");
+            }
+        }
+
+        // The 1,000-gas bound is load-bearing, not slack: BELOW it adjacent
+        // prices genuinely settle equal — a hypothetical 1-gas transaction
+        // costs 1 sat at 10 msat/gas and at 11. Only the intrinsic-gas floor
+        // above keeps this degeneracy out of the protocol.
+        assert_eq!(fee_parts_sat(1, 10, 0), fee_parts_sat(1, 11, 0));
+    }
+
+    /// **Withdrawal-fee semantics: how long can a quoted fee be held before
+    /// the transaction it priced becomes invalid?** The controller's own
+    /// arithmetic, stepped block by block. Three regimes:
+    ///
+    /// 1. **At the floor with slack blocks the price is pinned** — a quoted
+    ///    fee survives an idle chain indefinitely.
+    /// 2. **One over-target block always moves the price**, whatever the
+    ///    base (the upward step is floored at +1 msat), and by
+    ///    [`a_satoshi_settled_fee_moves_on_every_millisat_step`] any move
+    ///    kills every held quote. The window under congestion is therefore
+    ///    at most ONE produced block — 30 s of wall clock
+    ///    ([`crate::params::SLOT_DURATION_SECS`]); skipped slots stretch it
+    ///    (no block, no update) but the first produced block ends it.
+    /// 3. **Above the floor there is no rest state at all**: even an empty
+    ///    block moves the price down (`base/8 >= 1` because the floor is 10
+    ///    and the denominator 8 — the `MIN >= DENOMINATOR` compile-time
+    ///    assert is exactly this fact), so during post-congestion decay the
+    ///    window is also one block per price level.
+    ///
+    /// And the growth rate: saturated congestion compounds at 9/8 per
+    /// block, doubling the price within 6 blocks — 3 minutes. A withdrawal
+    /// priced at the start of a burst is not merely invalid, it is ~2x
+    /// under-priced by the time a rebuild reaches the chain if the rebuild
+    /// also waits.
+    #[test]
+    fn the_exposure_window_of_a_quoted_fee() {
+        let idle = BlockUsage { gas_used: 0, tx_bytes: 0 };
+
+        // Regime 1: floor + idle = pinned. The quote lives as long as the lull.
+        assert_eq!(
+            next_base_fee(MIN_BASE_FEE_MILLISAT_PER_GAS, idle, 0),
+            MIN_BASE_FEE_MILLISAT_PER_GAS
+        );
+
+        // Regime 2: one over-target block moves the price whatever the base.
+        // The marginal case — a single byte over target, proportional delta
+        // truncating to zero — is floored to +1, and +1 msat is fatal to
+        // every held quote.
+        let barely = BlockUsage { gas_used: 0, tx_bytes: BLOCK_TX_BYTES_TARGET + 1 };
+        for base in [MIN_BASE_FEE_MILLISAT_PER_GAS, 8_000, 1_000_000_000] {
+            assert!(next_base_fee(base, barely, 0) > base, "base={base}");
+        }
+
+        // Regime 3: above the floor even an EMPTY block moves the price.
+        for base in [MIN_BASE_FEE_MILLISAT_PER_GAS + 1, 8_000] {
+            assert!(next_base_fee(base, idle, 0) < base, "base={base}");
+        }
+
+        // The compounding: from any base, saturation doubles the price in
+        // exactly 6 blocks = 180 s.
+        let saturated =
+            BlockUsage { gas_used: BLOCK_GAS_LIMIT, tx_bytes: MAX_BLOCK_TX_BYTES };
+        let mut price = 8_000u128;
+        let mut blocks = 0u64;
+        while price < 16_000 {
+            price = next_base_fee(price, saturated, 0);
+            blocks += 1;
+            assert!(blocks <= 6, "doubling must take at most 6 saturated blocks");
+        }
+        assert_eq!(blocks, 6);
+        assert_eq!(blocks * crate::params::SLOT_DURATION_SECS, 180);
+    }
+
     // ── Settlement ──────────────────────────────────────────────────────────
 
     #[test]

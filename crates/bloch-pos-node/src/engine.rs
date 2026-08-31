@@ -3030,6 +3030,77 @@ mod forkchoice_tests {
         );
     }
 
+    /// **Withdrawal-fee semantics, part 3: what does the mempool do with a
+    /// transaction whose quoted base fee has gone stale?**
+    ///
+    /// Empirically: nothing. This free function is the ONE gate between the
+    /// wire and `self.mempool.insert` (`on_transaction` — gossip and RPC both
+    /// land there), and it is deliberately structural: shape and signature.
+    /// It reads no price, no UTXO values, no conservation — it takes no state
+    /// at all. Therefore:
+    ///
+    /// - a transfer quoted at a superseded base fee is ADMITTED (asserted
+    ///   below on a transfer whose implied fee admission cannot even see);
+    /// - nothing re-evaluates the pool on a base-fee change: admission runs
+    ///   once, at entry, and the `mempool` field is a plain
+    ///   `BTreeMap<canonical_bytes, tx>` with no revalidation hook;
+    /// - the transaction is retained until a proposer selects it and the
+    ///   transition refuses it (`ValueNotConserved` at the block's price), at
+    ///   which point the drop-and-retry loop in `propose` removes it —
+    ///   `self.mempool.remove(&bad.canonical_bytes())` — with a line on the
+    ///   proposer's stderr and no notice to the submitter (there is no
+    ///   transaction-status RPC to poll: G4 transfers have no queryable id);
+    /// - resubmitting the identical bytes passes this door again (second
+    ///   assert): re-admitted, to be re-dropped by the next proposer that
+    ///   picks it up. Silent churn, never inclusion — unless the base fee
+    ///   revisits the exact quoted price, in which case the bytes confirm as
+    ///   they are (pinned chain-side by `bloch-pos-committee`'s
+    ///   `a_held_fee_quote_dies_on_the_first_price_move_and_revives_only_at_its_exact_price`).
+    ///
+    /// Sabotage: adding a price check to `admissible` fails this test's
+    /// first assert — which is the point: if admission ever starts reading
+    /// prices, the retained-not-reevaluated answer documented here stops
+    /// being true and this pin says so.
+    #[test]
+    fn the_mempool_door_is_fee_blind_so_a_stale_quote_is_retained_and_readmitted() {
+        // A REAL hybrid keypair: `admissible` verifies through the real
+        // bloch_crypto verifier, and this test must not weaken that gate to
+        // pass its own fixture.
+        let (pubkey, secret) = bloch_crypto::crypto::generate_keypair();
+        let mut tx = PosTransaction::Transfer {
+            inputs: vec![bloch_pos_committee::transition::TransferInput {
+                txid: [0x42; 32],
+                vout: 0,
+                pubkey,
+                signature: Vec::new(),
+            }],
+            // Outputs fixed by SOME quoted price. Whether they conserve at
+            // the CURRENT price is exactly what admission cannot see: it
+            // holds no state, no UTXO values, no base fee.
+            outputs: vec![bloch_pos_committee::transition::TransferOutput {
+                value: 123_456,
+                script_hash: [9u8; 32],
+            }],
+            tx_bytes: 8_192,
+            tip_millisat_per_gas: 0,
+        };
+        // Witnesses live outside the signing root, so signing after
+        // construction is the wallet's own order of operations.
+        let root = tx.spend_signing_root();
+        let sig = bloch_crypto::crypto::sign(&secret, &root).expect("hybrid sign");
+        if let PosTransaction::Transfer { inputs, .. } = &mut tx {
+            inputs[0].signature = sig;
+        }
+
+        assert!(
+            admissible(&tx, 0).is_ok(),
+            "a stale-priced transfer must pass the mempool door: admission reads no fee"
+        );
+        // Identical bytes, admitted again: after a proposer drops the first
+        // copy, a resubmission re-enters the pool — churn, not progress.
+        assert!(admissible(&tx, 0).is_ok());
+    }
+
     #[test]
     fn weight_beats_length() {
         let g = [0x99u8; 32]; // the justified root the walk starts from
