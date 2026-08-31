@@ -281,11 +281,23 @@ moves files and fixes build wiring. Fixing them is separate work.
 
 **These are Genesis-3 binaries, and Genesis-3 has stopped.** They are kept
 published because they are the artifacts an auditor replays the closed chain
-with, not because there is a network for them to join. There is no prebuilt
-Genesis-4 node yet; build `bloch-pos` from source.
+with, not because there is a network for them to join. The one prebuilt
+Genesis-4 binary (`genesis4-node-20260814`) is **consensus-dead since epoch
+800** — it predates every armed flag day (correction staged in
+`deploy/RELEASE-CORRECTION-genesis4-node-20260814.md`);
+build `bloch-pos` from source, from `main` at or after `ab9ca4e1`, and run
+`bloch-pos selfcheck` to see which flag days your build knows.
 
 Building from source is the recommended path — you run the bytes you
-compiled, and the build is reproducible by design (see [REPRO.md](./REPRO.md)).
+compiled. Honest reproducibility claim (the earned-word ladder in
+`deploy/RELEASE-INTEGRITY.md` §3): a `bloch-pos` build is **deterministic
+from the same source path** — two clean builds at one path are bit-identical,
+measured — but a rebuild at a *different* absolute path yields a different
+hash (cargo's `-Cmetadata` hashes the manifest path), so your binary not
+matching a published hash is not by itself evidence of tampering. The
+canonical containerized build that would make hashes comparable across
+machines is specified there but does not exist yet; until it does, this
+project does not use the word "reproducible" for `bloch-pos`.
 The binaries below are a convenience, not the standard.
 
 Prebuilt `bloch` and `bloch-cli` for **Linux x86_64**. The last release is
