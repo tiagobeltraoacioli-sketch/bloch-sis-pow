@@ -1,4 +1,11 @@
-# Deploying a Bloch-SIS node on Akash
+# HISTORICAL (Genesis-1 PoW) — Deploying a Bloch-SIS node on Akash
+
+> **RETIRED.** This deploys the Genesis-1 proof-of-work node (`bloch`,
+> ports 16110/16210, `--mine`) to Akash. That chain is terminated; the live
+> chain is Genesis-4 proof of stake (`bloch-pos`, ports 19000+N P2P /
+> 16400+N RPC). To run a node that follows the live chain, use
+> [`deploy/OBSERVER-NODE.md`](../OBSERVER-NODE.md). Kept as record of the
+> Akash deployment mechanics only.
 
 Run a censorship-resistant Bloch-SIS full node on the [Akash](https://akash.network)
 decentralized cloud. Three steps: **build** the image, **push** it to a public

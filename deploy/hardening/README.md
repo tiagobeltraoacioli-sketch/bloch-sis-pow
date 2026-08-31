@@ -1,5 +1,11 @@
 # Runtime hardening (Bloch-SIS-Linux L2)
 
+> **Command examples below are Genesis-1/3-era** (`bloch` binary, `--mine`,
+> ports 16110/16210 — a retired proof-of-work chain). The *hardening
+> principles* (non-root, cap-drop, read-only rootfs, no core dumps, seccomp)
+> apply unchanged to a Genesis-4 `bloch-pos` container; substitute the binary,
+> flags and ports from [`deploy/OBSERVER-NODE.md`](../OBSERVER-NODE.md).
+
 L2 shrinks the node's attack surface. It has two tiers; this directory covers
 the **container tier** (deliverable + testable today). The **OS tier**
 (dm-verity immutable rootfs, measured boot) needs the bootable image build and

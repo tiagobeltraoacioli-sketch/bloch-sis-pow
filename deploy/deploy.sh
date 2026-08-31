@@ -1,5 +1,7 @@
 #!/bin/bash
-# Bloch Protocol — Deploy 3 nodes to Akash
+# HISTORICAL (Genesis-1 PoW) — Deploy 3 nodes to Akash. The chain these SDLs
+# join is terminated; the live chain is Genesis-4 PoS (`bloch-pos`). To run a
+# node that follows the live chain, see deploy/OBSERVER-NODE.md.
 # Usage: ./deploy.sh
 
 set -e

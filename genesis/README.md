@@ -17,27 +17,33 @@ are needed; neither is useful alone.
 
 ## Running a node against it
 
+    gzip -dk carryover.tsv.gz     # the loader reads the uncompressed TSV
     bloch-pos run \
       --data-dir  ./data \
-      --genesis    ./genesis/mainnet.manifest \
-      --carryover  ./carryover.tsv.gz  # decompress first; the loader reads TSV
-      --rpc-port   16400
+      --genesis   ./genesis/mainnet.manifest \
+      --carryover ./carryover.tsv \
+      --transport devnet --listen 19100 \
+      --peers     <peer list — see deploy/OBSERVER-NODE.md §5> \
+      --rpc-port  16400
 
 A data dir with no `validator.key` runs in observer mode: the node follows the
 chain and serves RPC, and signs nothing.
 
-## What does not work yet, stated because you will hit it in the first hour
+The full third-party procedure — prerequisites, every flag, the ports, the
+weak-subjectivity window, and how to verify you are on the canonical chain —
+is [`deploy/OBSERVER-NODE.md`](../deploy/OBSERVER-NODE.md).
 
-Syncing from genesis over the transport the live fleet runs (`--transport
-devnet`) **does not complete**. A node started this way applies the blocks it
-can reach, then follows the live tip over gossip without backfilling the gap —
-and reports a head, a height and a state root as though it were caught up. We
-reproduced it on 2026-08-14: an observer reported height 556 and state root
-`54870aa9…` while the network was at height 1511 and `2b7a7ac1…`, with no error
-raised at any point.
+## A gap this section used to describe, now closed
 
-So the missing piece for a third party is not the manifest or the snapshot.
-Both are here. It is a transport that completes a cold sync and says so
-honestly when it has not. That work is in progress; a node stood up before it
-lands would answer confidently and wrongly, which is worse for an exchange than
-not running one.
+Until late August 2026 a cold sync over the devnet transport **did not
+complete**: a node applied the blocks it could reach, then followed the live
+tip without backfilling the gap, and reported a head as though it were caught
+up (reproduced 2026-08-14: an observer at height 556 / state root `54870aa9…`
+while the network was at 1511 / `2b7a7ac1…`, with no error raised). The
+transport now runs a paginated sync pump — 512 blocks per page, from two peers
+at a time, re-asking from its own head every few seconds until a peer answers
+with an empty page (`src/net.rs`, `SYNC_PAGE_BLOCKS`/`SYNC_FANOUT`) — and
+syncing from genesis completes. Verify anyway, every time:
+`getchaininfo.behind_by_slots` must be 0–1, and your `block_id`/`state_root`
+at a given slot must match a second source before the node's answers are
+treated as the network's.

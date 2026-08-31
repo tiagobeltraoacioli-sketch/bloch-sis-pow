@@ -1,4 +1,6 @@
 ---
+# HISTORICAL (Genesis-1 PoW): joins a terminated chain (bloch, 16110/16210).
+# For the live Genesis-4 PoS chain see deploy/OBSERVER-NODE.md.
 version: "2.0"
 
 services:

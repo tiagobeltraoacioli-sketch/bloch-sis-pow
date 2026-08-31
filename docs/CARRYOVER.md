@@ -1,5 +1,14 @@
 # Genesis-3 carry-over snapshot
 
+> **SUPERSEDED — do not follow the commands below.** This describes the
+> Genesis-1 → Genesis-3 snapshot (413,743 rows, SHA-256 `88f29fd3…`) and the
+> retired `bloch` PoW node, and its peer IPs are dead. The `carryover.tsv.gz`
+> committed at the repo root today is the **Genesis-3 → Genesis-4** snapshot
+> (452,726 rows, SHA-256 `84ddbbac…`) — authoritative description in
+> [`CARRYOVER-SNAPSHOT.md`](../CARRYOVER-SNAPSHOT.md), node bring-up in
+> [`deploy/OBSERVER-NODE.md`](../deploy/OBSERVER-NODE.md). Kept as record of
+> how the Genesis-3 opening state was constructed.
+
 Genesis-3 does **not** start from an empty ledger: it opens with the balances
 carried over from the prior chain. A fresh node must ingest that snapshot at
 startup, or it forks off with the wrong opening state and never matches the real

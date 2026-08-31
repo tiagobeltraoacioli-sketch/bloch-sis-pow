@@ -1,4 +1,8 @@
-# Genesis-2 fly deploy — status & runbook
+# HISTORICAL — Genesis-2 fly deploy — status & runbook
+
+> **RETIRED.** Genesis-2 (SHA-256d PoW devnet) is long superseded; the live
+> chain is Genesis-4 proof of stake. To run a node today, use
+> [`deploy/OBSERVER-NODE.md`](../OBSERVER-NODE.md). Kept as record.
 
 Scaffolding for redeploying the Fly fleet onto the **Genesis-2 devnet**
 (`ChainId::Genesis2Devnet`, SHA-256d PoW, carry-over ledger). Prepared by task

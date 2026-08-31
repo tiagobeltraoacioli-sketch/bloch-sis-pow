@@ -1,2 +1,9 @@
-88f29fd3b7a5851cb557be8f8a6a7627b9efbe198662d8335695f2fd5f99373c  carryover.tsv  (uncompressed)
-a72be3cc149b0f4c2c56aa8f438abf24ae44f1a6b212083e8ffbad75aba2b08d  carryover.tsv.gz
+# Genesis-3 terminal snapshot (452,726 rows) — the Genesis-4 opening state.
+# Authority: CARRYOVER-SNAPSHOT.md. The node verifies the SHA3-256
+# (3d67246e94881a17d302b464f79fee55886d8068794e76fed43081117fbe308d), not these
+# SHA-256s; they are here because `sha256sum -c` reproduces them.
+84ddbbac2afdd5c78618096a7d4f66cf5b04a3e5757a03fe90550e50096183f6  carryover.tsv
+4d1e2738baec39ec25e2e33968f72a47abb261f271de62fb48a33be55bfc83be  carryover.tsv.gz
+# Until 2026-08-31 this file listed the retired Genesis-1 snapshot (413,743
+# rows, 88f29fd3…/a72be3cc…) — values that could never match the committed
+# .gz and would make a verifier refuse the correct file.
