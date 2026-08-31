@@ -63,7 +63,7 @@ follows from that.
 | Employment of protocol engineers | Postern Labs | Foundation should not be the engineering employer, or the split is cosmetic |
 | Release signing keys for the node | Postern Labs | Whoever builds, signs |
 | Weak-subjectivity checkpoints | Foundation | §5.3 |
-| The genesis taint list | Foundation, published for challenge | §5.4 |
+| ~~The genesis taint list~~ | ~~Foundation, published for challenge~~ — **row superseded 2026-08-29**: there is no list to sign (§5.4) | §5.4 |
 
 ## 5. Four things this structure gets wrong if built naively
 
@@ -113,7 +113,23 @@ parameters in `BLOCH-WEAK-SUBJECTIVITY.md` §6 (phased 2-of-3 → 3-of-5 with a
 client-enforced external-signer minimum; 12-month review with a hard stop at
 15 months).
 
-### 5.4 The taint list is an unaudited power
+### 5.4 The taint list is an unaudited power — SUPERSEDED: the power was dissolved
+
+> **Superseded 2026-08-29.** There is no taint list and no one to attribute
+> it to. The founder's 2026-08-11 single-set decision dissolved it: the
+> carryover crosses as one undifferentiated balance set, with no exclusion
+> list (`BLOCH-TOKENOMICS-V4.md` §2, §3 item 3 — "There is now no list to
+> write. That concern was not mitigated — it ceased to exist"). The code
+> agrees: the taint set is empty by construction and the eligibility oracle
+> may never report `true`
+> (`crates/bloch-pos-committee/src/staking.rs:188-197`, `:257-260`).
+>
+> The paragraph below is kept as the argument that *won*: it named the list
+> an unaudited power, and the resolution was not to audit the power but to
+> abolish it. It must not be read as describing anything the Foundation
+> holds or publishes — the §4 signing table's taint row is void for the same
+> reason. What the Foundation still genuinely holds of this shape is the
+> weak-subjectivity checkpoint key (§5.3), and only that.
 
 Which addresses count as "founder" — and are therefore ineligible for the
 carryover and for staking — is decided by whoever writes the list. Nothing in

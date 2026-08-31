@@ -90,6 +90,21 @@ proof to this transaction (non-malleability).
   heavier than curve SNARKs. Acceptable: verification stays cheap and PQ; client
   proving cost is the known burden (§5).
 
+> **Premise measured and failed (2026-08-29).** This section's design — the
+> raw FRI proof carried in the block body — was measured against the real
+> guest (`crates/coherence-prover/measure/`) and is **not viable under the
+> current limits**: one core proof is 2,791,567 B (2.66 MiB), **5.32×** the
+> whole 512 KiB block (`MAX_BLOCK_TX_BYTES_V2 = 524_288`,
+> `crates/bloch-pos-committee/src/fee_market.rs:85`); one compressed proof
+> (FRI recursion — still post-quantum, *not* the forbidden wrap) is
+> 1,272,753 B (1.21 MiB), **2.43×**. "Tens–hundreds of KB" above was wrong by
+> an order of magnitude. The numbers and the three exits are in
+> `docs/audit/COHERENCE-PROOF-SIZE-2026-08-29.md`; the registration against
+> this freeze is `COHERENCE-C1.2.md §6` (DRAFT). The Groth16-wrapper
+> prohibition stands unchanged — what must move is where the proof lives or
+> how large a block is, and that architecture decision is **pending, not
+> made**. No constant in this document should be tuned in its place.
+
 ## 4. Research alternative (NOT critical-path until audited)
 
 For smaller proofs + ring-signature sender privacy, the **lattice RingCT**
@@ -107,6 +122,18 @@ wallet", not a prover). Options: prove on desktop, or a (non-private) delegated
 prover for light clients. Recorded as an open cost, not hand-waved.
 
 ## 6. Shielded transaction — wire format
+
+> **Amended by C1.2 (2026-08-29, DRAFT — pending ratification).** This
+> format was frozen unshippable: an output is a bare 32-byte `cm`, and a
+> commitment is hiding by construction, so the recipient of a note had no
+> way to discover it — the pool could hold value nobody could find.
+> `COHERENCE-C1.2.md §1` adds `output_ciphertexts: Vec<NoteCiphertext>`
+> (ML-KEM-1024, FIPS 203; one ciphertext per output, count checked by
+> consensus) to this struct. That is the first amendment that moves frozen
+> material, and the reason C1.1's preamble sentence "nothing C1 froze moves" was rewritten
+> rather than preserved. Until C1.2 is ratified, the struct below remains
+> the normative wire.
+
 ```
 ShieldedTx {
   anchor:        [u8;32],

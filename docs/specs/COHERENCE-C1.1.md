@@ -25,10 +25,22 @@ needs a root, and a state-syncing node needs to be able to check it.
 
 Two things follow, and they are the whole of this document:
 
-1. **This is an addition, not a change.** Nothing C1 froze moves. `DOM_CM`,
-   `DOM_NF`, `DOM_MT`, `TREE_DEPTH = 32`, the nullifier derivation binding leaf
-   position, the spend statement — all untouched. A migration sweep that
-   re-domained any of them would itself be the reset §6.6.1 forbids.
+1. **This rev's own material is an addition, not a change.** Nothing *this
+   rev* touches moves what C1 froze: `DOM_CM`, `DOM_NF`, `DOM_MT`,
+   `TREE_DEPTH = 32`, the nullifier derivation binding leaf position, the
+   spend statement — all untouched. A migration sweep that re-domained any of
+   them would itself be the reset §6.6.1 forbids.
+
+   > **Rewritten by C1.2 (2026-08-29, DRAFT — pending ratification).** As
+   > ratified, this item read: *"This is an addition, not a change. Nothing
+   > C1 froze moves."* True of C1.1's own additions; false as a doctrine
+   > about C1 amendments in general, and it was starting to be read as one.
+   > C1.2 **does** move frozen material — the C1 §6 wire format gains
+   > `output_ciphertexts` — because the frozen format was unshippable: an
+   > output is a bare 32-byte `cm` and the recipient could never discover
+   > their own note. The sentence is scoped to what it was true of, instead
+   > of being left to promise what the next amendment could not keep. See
+   > `COHERENCE-C1.2.md §0`.
 2. **It had to be settled before the genesis ceremony, not after.** The root is
    a leaf of the genesis `state_root`, so it is an input to the genesis block
    id. An interim commitment (which is what shipped between 2026-08-11 and this

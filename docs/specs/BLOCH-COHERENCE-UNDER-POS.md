@@ -12,6 +12,24 @@
 > `BLOCH-TOKENOMICS-V4.md` e `BLOCH-POS-SHA3-LATTICE-MIGRATION.md`, que sao
 > os normativos.
 
+> **RECLASSIFICACAO DOS ACHADOS — 2026-08-29 (C1.2).** O carimbo acima parou
+> na premissa e nao desceu aos achados; a `COHERENCE-C1.1.md` (ratificada
+> 2026-08-12) nem sequer era mencionada. Situacao real de F1–F13, contra a
+> arvore em `af2f12e5`:
+>
+> | Achados | Situacao |
+> |---|---|
+> | **F1, F2, F3, F5, F11, F12** | **Descrevem o no morto.** Os caminhos citados (`src/main.rs`, `src/coherence/`, `src/storage/`) vivem hoje em `legacy/genesis3-node/` e nao rodam em lugar nenhum. Nenhum deles descreve o no PoS, que nao tem pool: as duas raizes Coherence sao estado comprometido **carregado, nunca recomputado** (`crates/bloch-pos-committee/src/transition.rs:1138-1139`, validado em `transition.rs:3187` via `derive.rs::expected_coherence`). Os problemas de *lifecycle* que esses achados apontavam nao foram consertados — o codigo que os tinha foi aposentado, e o no PoS ainda nao escreveu o equivalente (escopo do DEV-3). |
+> | **F9, F13** | **FECHADOS pela C1.1** (ratificada 2026-08-12). A raiz do conjunto de nulificadores existe e e consenso: `coherence_core::NullifierSet` (SMT SHAKE-256 sob `bloch:coherence:nfset:v1`, `crates/coherence-core/src/lib.rs:123`, raiz `:188`, nao-pertinencia `:219`/`:243`), folha do `state_root` (`crates/bloch-pos-committee/src/state_root.rs:1591-1592`). A constante empty-leaf: o **documento** moveu, nao o codigo (C1.1 §2). |
+> | **F4** | **Valido, e mais forte que antes**: o pool segue provadamente vazio, e a Genesis-4 abre com o pool vazio *comprometido* — a cerimonia exige a raiz do conjunto vazio, nao zeros (`tools/genesis4-ceremony/src/lib.rs:1730-1734`). |
+> | **F6** | Valido — `crates/coherence-core/src/lib.rs:273` (append-only), `:286` (`truncate` so para undo), `:156` (insert-only). |
+> | **F7** | Valido — `root()` segue O(n) por chamada (`lib.rs:297`); o frontier tree nao foi portado. |
+> | **F8** | Valido — o nulificador segue amarrando `position` (`lib.rs:46-48`); ordem de folhas e consenso. |
+> | **F10** | Valido — `ShieldedTx` segue sem ponte de valor (`lib.rs:437`; saldo fechado em `:428`). `shield_tx`/unshield continuam por escrever. |
+>
+> A C1.2 (`COHERENCE-C1.2.md`, DRAFT) e quem carrega adiante o que daqui
+> continua normativo; os carimbos inline abaixo marcam o que morreu no lugar
+> onde morreu.
 
 > **Owner:** A9 (Coherence integration), Genesis-4 / Bell PoS migration.
 > **Inputs:** `BLOCH-POS-SHA3-LATTICE-MIGRATION.md` §6.6 (all four requirements),
@@ -277,6 +295,15 @@ one, with no compatibility burden and no deployed wallets to break.
 
 ### 3.2 `shield_tx` design (transparent → shielded)
 
+> **Carimbo 2026-08-29:** a **regra 2** da lista de validade abaixo ficou
+> ORFA com a dissolucao do taint (`BLOCH-TOKENOMICS-V4.md` §3, item 3: "There
+> is now no list to write"). Nao existe taint set, nao existe raiz de taint a
+> consultar (o campo `taint_root` sobrevive inerte no estado comprometido —
+> `crates/bloch-pos-committee/src/transition.rs:1137` — pela mesma razao que
+> `DepositInput::tainted` sobrevive inerte, `staking.rs:188-197`). O esqueleto
+> do tipo (entradas transparentes, `value_shielded` publico, prova de soma) e
+> as regras 1 e 3 seguem sendo o desenho de referencia.
+
 ```text
 ShieldTx {
     transparent_inputs:  Vec<OutPoint>       // spends eUTXO outputs; signed hybrid, public
@@ -301,6 +328,13 @@ Validity, checked by every node against parent-committed state:
    `value_shielded` (so the pool's implicit balance stays backed).
 
 ### 3.3 Why the taint check does not hurt privacy
+
+> **Carimbo 2026-08-29: ORFA.** Esta secao defendia a privacidade de um
+> cheque que nao existe mais — o taint foi dissolvido. O argumento tecnico
+> (um gate de entrada sobre ancestralidade ja publica nao vaza nada do
+> conteudo da nota) permanece correto e reutilizavel se algum dia um gate de
+> entrada voltar; hoje nao ha gate a defender. A observacao de UX no final
+> (shields sao visiveis *como* shields) independe do taint e continua valida.
 
 The check runs **entirely on the transparent side, before any private state
 exists for this value**:
@@ -347,6 +381,27 @@ deposit-eligible — the spec should say this out loud rather than leave it to
 be discovered.
 
 ### 3.5 Ordering constraint with taint activation
+
+> **Carimbo 2026-08-29: ORFA — e com uma consequencia que ninguem tinha
+> escrito.** Esta secao impunha: `shield_tx` nao pode ativar antes do taint
+> set existir, "senao a concentracao de 94% se blinda na brecha e a regra
+> vira decorativa para sempre". Com o taint dissolvido
+> (`BLOCH-TOKENOMICS-V4.md` §3 item 3; decisao do fundador de 2026-08-11), o
+> cenario que esta secao tratava como panico passou a ser **o desenho
+> aceito**: quando `shield_tx` existir e ativar, TODA moeda podera entrar no
+> pool — a concentracao do carryover (93,94% do conjunto num unico endereco,
+> V4 §2) incluida. Nao ha brecha a fechar porque nao ha mais gate; a ordem de
+> ativacao abaixo nao protege nada.
+>
+> **Decisao pendente do fundador, registrada sem resolver:** a dissolucao do
+> taint foi decidida no contexto de *staking e carryover* (atribuibilidade do
+> bond, `staking.rs:9-16`), nao no contexto de *blindagem*. Se "a maior
+> posicao da cadeia pode se tornar invisivel" e uma consequencia aceita ou
+> apenas uma consequencia nao examinada da mesma decisao, ninguem escreveu.
+> Ha tempo de sobra para decidir — F4 vale: o pool esta vazio, o verificador
+> e fail-closed e `shield_tx` nem existe como tipo (F10) — mas a decisao tem
+> dono, e o dono nao e um dev de spec. `COHERENCE-C1.2.md §7` aponta para ca
+> e explicitamente nao resolve.
 
 The taint set is defined at the Genesis-4 activation block (§4.1 rule 2:
 "never re-opened"). `shield_tx` **must not activate before the taint set
@@ -435,6 +490,31 @@ resolution (same lineage, heavy `main.rs` drift).
 | 10 | G4 state machine: Coherence leaves in `state_root` SMT + `coherence_root` header mirror; seam copies from last PoW commitment (§1.2(2), §2.5) | new | DEV-1/DEV-3 |
 | 11 | Port `PruneGate`/`ProofCheckpoint` as the §6.6.4 degradation posture; epoch-proof statement added later without touching accept paths | `0b64d94` | DEV-2 |
 | 12 | A3 shadow-fork continuity matrix (§1.3); §3.4 negative deposit test; no-`new()`-outside-genesis lint | tests | gate **G11** |
+
+> **Carimbo 2026-08-29 sobre a tabela acima:**
+>
+> - **Item 4 MORREU como port.** O alvo do cherry-pick — o accept path de
+>   `src/main.rs` — e o no morto (`legacy/genesis3-node/`). A *exigencia*
+>   (undo de reorg amarrado ao fork choice) sobrevive, mas renasce como
+>   codigo novo do no PoS sob a catraca de finalidade da C1.2 §4, nao como
+>   port do `f069610`.
+> - **Item 5 MORREU como CFs RocksDB.** As column families propostas eram do
+>   storage do no morto; o no PoS tem o proprio store (`bloch-pos-node/src/
+>   store.rs`) e a persistencia do pool sera desenhada contra ele (DEV-3).
+>   A disciplina que o item carregava — escrita atomica com o commit do
+>   bloco — e o que sobrevive.
+> - **Item 7 ENTREGUE** — e a C1.1 (ratificada 2026-08-12) fechou F9 e F13;
+>   a parte NoteCiphertext foi para a C1.2 (DRAFT), que a moveu de
+>   ML-KEM-768 para **ML-KEM-1024** (C1.2 §2 tem o porquê).
+> - **Item 8 MORREU.** Nao ha fase hibrida, nao ha coinbase, nao ha
+>   flag-day de PoW: a Genesis-4 nasce de snapshot e a costura virou a
+>   cerimonia de genesis, que ja comete as duas raizes Coherence no
+>   `state_root` do bloco 0 (`tools/genesis4-ceremony`). O Phase-0/ADR-035
+>   fica como historico do branch `feat/zk-ledger`.
+> - Itens 1, 3, 9, 10, 11 seguem abertos na forma reestruturada que a C1.2
+>   e o plano DEV-3 descrevem (o item 10 esta parcialmente entregue: as
+>   folhas e o espelho de header existem e sao validados;
+>   falta a aplicacao de transacoes blindadas).
 
 **Out of scope for A9, flagged:** the Utreexo-crate dedup ruling
 (`a167203` vs `ed030c3`, founder ADR pending) — it affects `state_root`'s
