@@ -13,8 +13,10 @@
 //! costs a hybrid ML-DSA-65 ‖ Falcon-1024 verification (measured **7,274,849**
 //! RV32IM instructions, `spikes/prover-cost/RESULTS.md`) and ≈ 4.6 KB of
 //! signature bytes; an EVM transaction costs computation and state; a shielded
-//! transaction costs a FRI-STARK proof verification and tens-to-hundreds of KB
-//! of proof bytes (`COHERENCE-C1.md`). The design still charges them in a
+//! transaction costs a FRI-STARK proof verification and a **fixed-size** 1.21
+//! MiB compressed proof (measured 2026-08-29,
+//! `docs/audit/COHERENCE-PROOF-SIZE-2026-08-29.md` — "tens-to-hundreds of KB"
+//! was wrong by an order of magnitude). The design still charges them in a
 //! single unit, **gas**, through per-class cost functions, because the scarce
 //! resource they all contend for is the same one: **block bytes under the
 //! gossip budget** (gate G10 of the migration spec). A per-byte gas charge
@@ -152,7 +154,219 @@ pub const SECP256K1_VERIFY_GAS: u64 = 3_000;
 /// the hybrid-verify cost times a placeholder factor until the verifier is
 /// measured the way the signature verifiers were (`coherence-prover` has the
 /// harness). The spec forbids activation with this number unmeasured.
+///
+/// Measurement IS in flight (2026-08-29): the proof-size half already landed
+/// (`docs/audit/COHERENCE-PROOF-SIZE-2026-08-29.md` — compressed proofs are
+/// fixed-size, so the verification cost is priceable as a constant), and the
+/// verify-time half is being run on the same harness. The native hybrid-verify
+/// baseline for the derivation is already measured on the same machine:
+/// **0.2637 ms** median over 200 iterations
+/// (`crates/coherence-prover/measure/hybrid-baseline/`). When the SP1 verify
+/// median lands, this constant becomes
+/// `HYBRID_VERIFY_INSTRUCTIONS * t_shielded / t_hybrid / INSTRUCTIONS_PER_GAS`
+/// — the same instruction-count method that produced [`HYBRID_VERIFY_GAS`],
+/// with the time ratio anchoring the count to hardware-independent units.
 pub const SHIELDED_VERIFY_GAS_PROVISIONAL: u64 = 25 * HYBRID_VERIFY_GAS;
+
+// ── The shielded lane: per-nullifier work and the measured proof ────────────
+//
+// Everything in this section prices or bounds the Coherence (C1) lane. The
+// governing measurement is `docs/audit/COHERENCE-PROOF-SIZE-2026-08-29.md`:
+// a compressed (FRI-recursion) proof is **fixed-size** — quadrupling the
+// spend's work (1.04 M → 4.12 M cycles) moved it by 384 bytes (0.03%) —
+// because a FRI proof is sized by the trace padded to the next power of two,
+// and the statement occupies 6.2%–24.5% of one 2^24 shard. Two consequences
+// are load-bearing here:
+//
+// 1. **`MAX_SHIELDED_TX_OUTPUTS` and the proof's size do NOT compete for
+//    block space.** Any table trading one against the other starts from a
+//    false premise. What grows with outputs is the ML-KEM ciphertext bytes
+//    (per-output, priced through `GAS_PER_BYTE` like all bytes); the proof
+//    term is a constant.
+// 2. **The verification cost is priceable as a constant** — which is what
+//    lets `SHIELDED_VERIFY_GAS` be a constant at all.
+
+/// Measured serialized size of one **compressed** SP1 proof of the C1 spend
+/// statement: 1,273,137 B (1.21 MiB), the larger of the two measured configs
+/// (2-in/2-out: 1,272,753 B; 8-in/8-out: 1,273,137 B — 0.03% apart, the
+/// fixed-size finding). `bincode::serialize` of `SP1ProofWithPublicValues`,
+/// SP1 6.5.0, the envelope the verifier decodes.
+pub const SHIELDED_PROOF_BYTES_COMPRESSED: u64 = 1_273_137;
+
+/// Core (raw FRI) mode, for the record: 2,831,511 B (2.70 MiB). Never
+/// includable under any current or plausible cap; recursion (still FRI, still
+/// post-quantum — NOT the pairing wrap C1 §3 forbids) halves it and is the
+/// only mode this module's numbers contemplate.
+pub const SHIELDED_PROOF_BYTES_CORE: u64 = 2_831_511;
+
+/// ML-KEM-1024 note ciphertext carried per shielded output so the recipient
+/// can decrypt the note off-chain (DEV-2's decision, Coherence wave):
+/// 1,568 B of ML-KEM-1024 ciphertext + 100 B of note payload/AEAD framing.
+/// This is the term that actually grows with outputs — the proof does not.
+pub const SHIELDED_OUTPUT_CIPHERTEXT_BYTES: u64 = 1_668;
+
+/// Mirror of `coherence_core::NFSET_DEPTH` (this crate deliberately has no
+/// dependency besides `sha3`; the one-state-root suite pins the two trees
+/// agree). One level per bit of a nullifier: the spent-nullifier set is a
+/// sparse Merkle tree keyed by the nullifier itself.
+pub const NFSET_DEPTH: u64 = 256;
+
+/// Measured cost of one Keccak/SHAKE-256 permutation in RV32IM instructions:
+/// 16,371 = 3,912,658 instructions across the 239 permutations inside one
+/// hybrid verification (`spikes/prover-cost/RESULTS.md`, 2026-08-10) — the
+/// SAME measurement series that produced [`HYBRID_VERIFY_INSTRUCTIONS`], so
+/// the per-nullifier price below is in the same unit as every other verify
+/// price in this module.
+pub const SHAKE256_PERMUTATION_INSTRUCTIONS: u64 = 16_371;
+
+/// SMT hashes of consensus work per nullifier: one O(`NFSET_DEPTH`)-hash walk
+/// for the lookup/non-membership side and one for the insertion's path
+/// recompute. Each internal node is one SHAKE-256 of 88 B (24 B domain tag +
+/// two children) — a single permutation.
+pub const NULLIFIER_SMT_HASHES: u64 = 2 * NFSET_DEPTH;
+
+/// Gas per nullifier: 83,819. This is why shielded gas is **not flat per
+/// transaction**: every nullifier makes every node do two 256-level SMT
+/// walks, and a price that ignored that would let a 16-nullifier spend pay
+/// the same as a 1-nullifier one for 16× the consensus work — the exact
+/// shape `Eutxo { inputs }` already refuses for hybrid verifications.
+pub const NULLIFIER_GAS: u64 =
+    NULLIFIER_SMT_HASHES * SHAKE256_PERMUTATION_INSTRUCTIONS / INSTRUCTIONS_PER_GAS;
+
+// ── Shielded DoS bounds, recalibrated from G3 ───────────────────────────────
+//
+// Genesis-3 (`26bd7ae`, `check_tx_bounds`) capped a shielded tx at
+// `MAX_TX_NULLIFIERS = 256` and `MAX_TX_PROOF_BYTES = 4 MiB`. Both numbers
+// are incoherent with Genesis-4 and are recalibrated here, with the
+// compile-time assertions at the bottom making the incoherence unrepresentable:
+//
+// - **4 MiB is 8× the whole V2 block** (`MAX_BLOCK_TX_BYTES_V2` = 512 KiB), so
+//   a bounds-legal tx could never be included — which is exactly the DoS
+//   window the bounds exist to close: nodes would relay, buffer and verify
+//   mempool objects that no block can carry. The bound on a tx must be tied
+//   to `max_block_tx_bytes(epoch)`, not declared free-hand.
+// - **256 nullifiers breaks the fixed-size property.** The measured spend
+//   costs 512,485 cycles per in/out pair on a ~17,659-cycle base; 256 pairs
+//   is ~131 M cycles = 8 shards of 2^24, and a multi-shard proof is neither
+//   fixed-size nor fixed-verify-cost — the two facts this module's shielded
+//   prices stand on.
+
+/// Max nullifiers (spent notes) per shielded tx: 16. Sized to keep the spend
+/// statement inside HALF of one 2^24-cycle SP1 shard (16 pairs ≈ 8.22 M
+/// cycles, 49%), preserving the measured fixed-size/fixed-cost property with
+/// headroom for statement growth. Gas already prices each one
+/// ([`NULLIFIER_GAS`]); this bound is the DoS backstop, not the price.
+pub const MAX_SHIELDED_TX_NULLIFIERS: u64 = 16;
+
+/// Max shielded outputs per tx: 16, same shard-margin rationale. (The
+/// transparent lane's `bloch-euvm::MAX_TX_OUTPUTS = 1024` is a different
+/// lane: transparent outputs are 32 B, shielded ones carry a 1,668 B
+/// ciphertext each.)
+pub const MAX_SHIELDED_TX_OUTPUTS: u64 = 16;
+
+/// Fixed envelope bytes of a shielded tx outside the vectors: anchor (32) +
+/// fee (8) + the five vector length prefixes (40) under the canonical
+/// encoding.
+pub const SHIELDED_TX_BASE_BYTES: u64 = 80;
+
+/// Wire bytes per nullifier.
+pub const SHIELDED_NULLIFIER_BYTES: u64 = 32;
+
+/// Wire bytes per shielded output: the 32 B commitment plus the ML-KEM-1024
+/// note ciphertext.
+pub const SHIELDED_OUTPUT_BYTES: u64 = 32 + SHIELDED_OUTPUT_CIPHERTEXT_BYTES;
+
+/// Worst-case binding signature: one hybrid signature.
+pub const SHIELDED_BINDING_SIG_MAX_BYTES: u64 = HYBRID_SIG_BYTES;
+
+/// The byte figure a shielded transaction is charged for — and the rule that
+/// keeps the byte term honest if the founder's pending architecture decision
+/// takes the proof OUT of the block body (data-availability option):
+///
+/// **`tx_bytes == len(canonical_bytes) + proof_len`, always.** The envelope
+/// half and the proof half are BOTH network-moved bytes whether the proof
+/// travels in the body or beside it, so both are charged at
+/// [`GAS_PER_BYTE`]. An off-body proof that escaped the byte term would be
+/// 1.27 MB of unpriced gossip per tx — the fee market must price what the
+/// network actually moves, not what the block body happens to contain.
+/// Whoever wires shielded application into `transition.rs` must enforce the
+/// equality on admission (the way `TransferReject::UnderdeclaredSize` pins
+/// the transparent lane's floor).
+pub const fn shielded_tx_bytes(nullifiers: u64, outputs: u64, proof_len: u64) -> u64 {
+    SHIELDED_TX_BASE_BYTES
+        .saturating_add(nullifiers.saturating_mul(SHIELDED_NULLIFIER_BYTES))
+        .saturating_add(outputs.saturating_mul(SHIELDED_OUTPUT_BYTES))
+        .saturating_add(SHIELDED_BINDING_SIG_MAX_BYTES)
+        .saturating_add(proof_len)
+}
+
+/// Max proof bytes per shielded tx: **derived from the block cap, not
+/// declared** — the largest proof a bounds-maximal tx could carry and still
+/// fit `max_block_tx_bytes` in the era the lane can exist in (V2; the lane
+/// is inert and V2 activated at epoch 800). 491,907 B. This replaces G3's
+/// free-standing 4 MiB: any future cap change moves this bound with it, and
+/// the assertion below refuses to compile a combination where a legal tx is
+/// unincludable.
+pub const MAX_SHIELDED_TX_PROOF_BYTES: u64 =
+    max_block_tx_bytes(crate::params::BLOCK_BYTES_V2_ACTIVATION_EPOCH)
+        - (SHIELDED_TX_BASE_BYTES
+            + MAX_SHIELDED_TX_NULLIFIERS * SHIELDED_NULLIFIER_BYTES
+            + MAX_SHIELDED_TX_OUTPUTS * SHIELDED_OUTPUT_BYTES
+            + SHIELDED_BINDING_SIG_MAX_BYTES);
+
+/// The smallest payload cap that would fit ONE bounds-maximal shielded tx
+/// carrying the measured compressed proof: 1,305,518 B (≈ 1.25 MiB).
+/// **Analysis constant, not consensus** — the cap decision is the founder's
+/// (ADVISOR-A is evaluating the options); this number exists so the decision
+/// is made against arithmetic instead of adjectives. See the analysis block
+/// below.
+pub const MIN_BLOCK_TX_BYTES_FOR_SHIELDED: u64 = shielded_tx_bytes(
+    MAX_SHIELDED_TX_NULLIFIERS,
+    MAX_SHIELDED_TX_OUTPUTS,
+    SHIELDED_PROOF_BYTES_COMPRESSED,
+);
+
+// ── The block cap vs the shielded lane: the analysis, not the decision ──────
+//
+// `MAX_BLOCK_TX_BYTES_V2` = 524,288 B; the measured compressed proof alone is
+// 1,273,137 B = **2.43× the whole block**. No shielded tx is includable under
+// the current caps, in either era. The cap itself is NOT changed here — it is
+// the founder's architecture decision — but the three questions that decision
+// needs are answered by constants in this file:
+//
+// 1. **Minimum cap that fits one shielded tx:**
+//    [`MIN_BLOCK_TX_BYTES_FOR_SHIELDED`] = 1,305,518 B — 2.49× the V2 cap.
+//    The honest yardstick is worse: the cap is almost never reached. Today's
+//    typical block is ~43 KB, so a block carrying one shielded tx is **30–40×
+//    the typical block** the fleet actually gossips, on a fleet whose measured
+//    cadence is 13% and which has already been stalled by one node flooding
+//    old blocks. Comparing against the cap understates the jump by an order
+//    of magnitude.
+//
+// 2. **Effect on the `capacity_v2_still_gas_bound` assertion** (the const
+//    assert below pinning `cap × GAS_PER_BYTE ≤ BLOCK_GAS_LIMIT`): bytes stay
+//    the binding resource for any cap up to `BLOCK_GAS_LIMIT / GAS_PER_BYTE`
+//    = 3,750,000 B. A 1.31 MiB cap costs 21 M of the 60 M gas cap when
+//    saturated — the assertion survives, but the margin narrows from 7.15× to
+//    2.86×. G3's 4 MiB tx bound would not even compile here: 4 MiB × 16 =
+//    67.1 M gas > 60 M, silently flipping the scarce resource from bytes to
+//    gas and invalidating every capacity number derived from the byte cap.
+//
+// 3. **A separate shielded-lane cap vs raising the general cap:** raising the
+//    general cap to ~1.5 MiB triples the worst-case gossip budget for EVERY
+//    block, shielded or not — the EIP-1559 byte target doubles with it
+//    (`target_is_half_the_cap_in_both_eras`), so the controller would read
+//    today's ~43 KB blocks as 3% utilisation and pin the base fee to the
+//    floor even under real transparent congestion. A separate per-block
+//    shielded budget (e.g. at most one shielded slot, budgeted beside the
+//    payload the way attestations already are) confines the 1.27 MB to blocks
+//    that actually carry a proof, keeps the transparent fee market's target
+//    meaningful, and puts an explicit ceiling on verify work per block. The
+//    third option — proof outside the body (data availability, the
+//    `feat/zk-ledger` scaffold) — moves the bytes off the consensus path
+//    entirely; under it the CURRENT caps stand and only the charged-bytes
+//    rule above is needed. The analysis orders them: off-body ≥ separate
+//    lane budget > general raise. The decision is not made here.
 
 /// The transaction classes a block can carry, for intrinsic-gas purposes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -171,9 +385,13 @@ pub enum TxClass {
     /// EVM transaction from a secp256k1 account — **gated** on the founder's
     /// dual-authorisation decision; priced so the options are comparable.
     EvmSecp256k1,
-    /// Coherence shielded transaction: one proof verification. The proof's
-    /// bytes are charged like any other bytes.
-    Shielded,
+    /// Coherence shielded transaction: one proof verification — a CONSTANT,
+    /// because the compressed proof is measured fixed-size — plus a term per
+    /// nullifier, because the SMT lookup+insert work scales with them
+    /// (`NULLIFIER_GAS`; same shape as `Eutxo { inputs }`: gas buys the node
+    /// work the transaction actually causes). The proof's bytes are charged
+    /// like any other bytes, under the `shielded_tx_bytes` rule.
+    Shielded { nullifiers: u32 },
 }
 
 /// Verification gas for a transaction class.
@@ -182,7 +400,8 @@ pub const fn verify_gas(class: TxClass) -> u64 {
         TxClass::Eutxo { inputs } => HYBRID_VERIFY_GAS.saturating_mul(inputs as u64),
         TxClass::EvmPq => HYBRID_VERIFY_GAS,
         TxClass::EvmSecp256k1 => SECP256K1_VERIFY_GAS,
-        TxClass::Shielded => SHIELDED_VERIFY_GAS_PROVISIONAL,
+        TxClass::Shielded { nullifiers } => SHIELDED_VERIFY_GAS_PROVISIONAL
+            .saturating_add(NULLIFIER_GAS.saturating_mul(nullifiers as u64)),
     }
 }
 
@@ -454,6 +673,42 @@ const _: () = assert!(MIN_BASE_FEE_MILLISAT_PER_GAS >= BASE_FEE_CHANGE_DENOMINAT
 
 // The derived verify price is the number the spec quotes.
 const _: () = assert!(HYBRID_VERIFY_GAS == 72_748);
+
+// ── Shielded bounds: tied to the block cap, by construction ─────────────────
+//
+// The G3 regression these guard against: commit `26bd7ae` declared
+// `MAX_TX_PROOF_BYTES = 4 MiB` free-hand — 8× the whole V2 block — so a
+// bounds-legal shielded tx could NEVER be included, which is precisely the
+// mempool-DoS window tx bounds exist to close. Deriving the proof bound from
+// `max_block_tx_bytes(epoch)` and pinning the sum here makes that class of
+// drift a compile error instead of a latent incoherence.
+
+// (1) A bounds-maximal shielded tx exactly fills — never exceeds — the
+//     payload cap of the era the lane can exist in.
+const _: () = assert!(
+    shielded_tx_bytes(
+        MAX_SHIELDED_TX_NULLIFIERS,
+        MAX_SHIELDED_TX_OUTPUTS,
+        MAX_SHIELDED_TX_PROOF_BYTES
+    ) == max_block_tx_bytes(crate::params::BLOCK_BYTES_V2_ACTIVATION_EPOCH),
+    "os limites da tx blindada tem que somar exatamente o teto do bloco"
+);
+
+// (2) And its gas fits under the gas cap: a byte-legal shielded tx must also
+//     be gas-legal, or the byte tie above would be theater.
+const _: () = assert!(
+    intrinsic_gas(
+        TxClass::Shielded { nullifiers: MAX_SHIELDED_TX_NULLIFIERS as u32 },
+        max_block_tx_bytes(crate::params::BLOCK_BYTES_V2_ACTIVATION_EPOCH)
+    ) <= BLOCK_GAS_LIMIT,
+    "uma tx blindada legal em bytes tem que ser legal em gas"
+);
+
+// (3) The derived per-nullifier price is the number the docs quote, and the
+//     bounds arithmetic lands where the analysis says it does.
+const _: () = assert!(NULLIFIER_GAS == 83_819);
+const _: () = assert!(MAX_SHIELDED_TX_PROOF_BYTES == 491_907);
+const _: () = assert!(MIN_BLOCK_TX_BYTES_FOR_SHIELDED == 1_305_518);
 
 // One satoshi is still the settlement quantum; the msat price never mints
 // sub-satoshi value (ceil_div output is whole satoshis by construction, this
@@ -768,6 +1023,73 @@ mod tests {
         let tipped = charge(TxClass::Eutxo { inputs: 1 }, 512, MIN_BASE_FEE_MILLISAT_PER_GAS, 100);
         assert_eq!(tipped.base_fee_sat, a.base_fee_sat);
         assert_eq!(tipped.priority_fee_sat, ceil_div(a.gas as u128 * 100, MILLISAT_PER_SAT));
+    }
+
+    // ── The shielded lane ───────────────────────────────────────────────────
+
+    /// The measured compressed proof does NOT fit under any current cap —
+    /// 1,273,137 B vs a 491,907 B proof budget and a 524,288 B block. This is
+    /// the honest state of the lane: bounds-coherent (a legal tx is includable
+    /// by construction, the const asserts above) but not yet REACHABLE by a
+    /// real proof. The day this test fails is the day the founder's cap /
+    /// data-availability decision landed (ADVISOR-A) — re-derive
+    /// `MAX_SHIELDED_TX_PROOF_BYTES`'s margin notes and the analysis block,
+    /// then delete or invert this test deliberately. It must not be "fixed"
+    /// by nudging a constant.
+    #[test]
+    fn the_measured_proof_does_not_fit_todays_caps() {
+        assert!(SHIELDED_PROOF_BYTES_COMPRESSED > MAX_SHIELDED_TX_PROOF_BYTES);
+        assert!(SHIELDED_PROOF_BYTES_COMPRESSED > MAX_BLOCK_TX_BYTES_V2);
+        // And the analysis constant is exactly the gap the decision must close.
+        assert_eq!(
+            MIN_BLOCK_TX_BYTES_FOR_SHIELDED,
+            shielded_tx_bytes(
+                MAX_SHIELDED_TX_NULLIFIERS,
+                MAX_SHIELDED_TX_OUTPUTS,
+                SHIELDED_PROOF_BYTES_COMPRESSED
+            )
+        );
+    }
+
+    /// Shielded gas is NOT flat per tx: each nullifier buys two 256-level SMT
+    /// walks from every node, and the price scales with that work — the same
+    /// property `bytes_bind_before_gas_for_eutxo_blocks` protects for hybrid
+    /// verifications. Outputs, by contrast, must price through BYTES (the
+    /// ML-KEM ciphertext), never through the proof term: the proof is
+    /// fixed-size, so two txs differing only in outputs differ in gas exactly
+    /// by their byte difference.
+    #[test]
+    fn shielded_gas_scales_with_nullifiers_and_outputs_price_as_bytes() {
+        let one = verify_gas(TxClass::Shielded { nullifiers: 1 });
+        let sixteen = verify_gas(TxClass::Shielded { nullifiers: 16 });
+        assert_eq!(sixteen - one, 15 * NULLIFIER_GAS);
+
+        // Outputs: same class, same proof, more ciphertext bytes — the gas
+        // gap is GAS_PER_BYTE times the ciphertext bytes, nothing else.
+        let b2 = shielded_tx_bytes(2, 2, SHIELDED_PROOF_BYTES_COMPRESSED);
+        let b8 = shielded_tx_bytes(2, 8, SHIELDED_PROOF_BYTES_COMPRESSED);
+        let g2 = intrinsic_gas(TxClass::Shielded { nullifiers: 2 }, b2);
+        let g8 = intrinsic_gas(TxClass::Shielded { nullifiers: 2 }, b8);
+        assert_eq!(g8 - g2, 6 * SHIELDED_OUTPUT_BYTES * GAS_PER_BYTE);
+    }
+
+    /// The charged-bytes rule for the off-body option: `shielded_tx_bytes`
+    /// includes the proof length whether or not the proof rides in the block
+    /// body, so `GAS_PER_BYTE` prices what the network moves. A proof "moved
+    /// out" of the body changes the charge by exactly zero.
+    #[test]
+    fn shielded_bytes_always_include_the_proof() {
+        let envelope_only = shielded_tx_bytes(2, 2, 0);
+        let with_proof = shielded_tx_bytes(2, 2, SHIELDED_PROOF_BYTES_COMPRESSED);
+        assert_eq!(with_proof - envelope_only, SHIELDED_PROOF_BYTES_COMPRESSED);
+        // And the envelope model is the sum of its declared parts.
+        assert_eq!(
+            envelope_only,
+            SHIELDED_TX_BASE_BYTES
+                + 2 * SHIELDED_NULLIFIER_BYTES
+                + 2 * SHIELDED_OUTPUT_BYTES
+                + SHIELDED_BINDING_SIG_MAX_BYTES
+        );
     }
 
     #[test]

@@ -1,8 +1,20 @@
 //! Mede tamanho da prova SP1 do spend da Coherence, com N entradas e N saidas.
 //! N vem de argv[1] (default 8). Core (FRI cru) e Compressed (recursao FRI).
+//!
+//! 2026-08-29 (fase 2): tambem mede o TEMPO DE VERIFICACAO de cada modo —
+//! `client.verify()` repetido `VERIFY_ITERS` vezes, mediana reportada — porque
+//! `SHIELDED_VERIFY_GAS` (fee_market.rs) e derivado desse numero e a spec
+//! proibe ativar a lane blindada com ele nao medido. O par deste numero e o
+//! baseline nativo da verificacao hibrida (`../hybrid-baseline/`), medido na
+//! MESMA maquina: o gas sai da razao entre os dois tempos, ancorada em
+//! `HYBRID_VERIFY_INSTRUCTIONS` (ver fee_market.rs, "SHIELDED_VERIFY_GAS").
 
 use coherence_core::{check_spend, CommitmentTree, Note, SpendInput, SpendPublic, SpendWitness};
 use sp1_sdk::blocking::{Elf, ProveRequest, Prover, ProverClient, SP1ProofMode, SP1Stdin};
+use sp1_sdk::ProvingKey;
+
+/// Verificacoes cronometradas por modo (mais 1 de aquecimento, descartada).
+const VERIFY_ITERS: usize = 20;
 
 const ELF: &[u8] = include_bytes!(
     "../../guest/target/elf-compilation/riscv64im-succinct-zkvm-elf/release/coherence-spend-measure-guest"
@@ -68,6 +80,20 @@ fn main() {
                 let b = bincode::serialize(&p).expect("serialize");
                 println!("{nome}: {} bytes ({:.1} KiB) em {:.1}s",
                          b.len(), b.len() as f64 / 1024.0, t.elapsed().as_secs_f64());
+
+                // Tempo de verificacao: 1 aquecimento + VERIFY_ITERS medidas.
+                // Mediana, nao media: uma pausa de GC/paging nao deve mover o
+                // numero que vira constante de consenso.
+                client.verify(&p, pk.verifying_key(), None).expect("verify falhou");
+                let mut ms: Vec<f64> = (0..VERIFY_ITERS).map(|_| {
+                    let t = std::time::Instant::now();
+                    client.verify(&p, pk.verifying_key(), None).expect("verify falhou");
+                    t.elapsed().as_secs_f64() * 1_000.0
+                }).collect();
+                ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let mediana = ms[ms.len() / 2];
+                println!("{nome} VERIFY: mediana {mediana:.2} ms  (min {:.2}, max {:.2}, {} iters)",
+                         ms[0], ms[ms.len() - 1], VERIFY_ITERS);
             }
             Err(e) => println!("{nome} FALHOU: {e:?}"),
         }

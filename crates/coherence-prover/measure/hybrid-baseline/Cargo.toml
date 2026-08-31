@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+[package]
+name = "coherence-hybrid-baseline"
+version = "0.1.0"
+edition = "2021"
+
+# Baseline nativo da verificacao hibrida ML-DSA-65 ‖ Falcon-1024, medido na
+# MESMA maquina que mede o verify SP1 (../host). Existe porque a derivacao de
+# SHIELDED_VERIFY_GAS (fee_market.rs) e uma RAZAO de tempos ancorada em
+# HYBRID_VERIFY_INSTRUCTIONS: o numerador vem do host, o denominador vem daqui,
+# e nenhum dos dois vale sozinho.
+[dependencies]
+bloch-crypto = { path = "../../../bloch-crypto" }
+
+# O mesmo patch do workspace raiz: bloch-crypto chama with_seeded_rng(), que so
+# existe no fork vendorado. Sem isto o baseline nao compila fora do workspace.
+[patch.crates-io]
+pqcrypto-internals = { path = "../../../pqcrypto-internals" }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+[workspace]
