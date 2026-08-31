@@ -524,6 +524,43 @@ pub mod rehearsal {
         Restore(prev)
     }
 
+    thread_local! {
+        static DEPOSIT_FUNDING_OPEN_TL: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Test-only: treat [`super::FUNDED_STAKING_ACTIVATION_EPOCH`] as if it
+    /// had already bound for the funded `DepositV2` arm (tag `0x07`). The
+    /// legacy unfunded `Deposit` is consensus-rejected at EVERY epoch and no
+    /// longer waits for this gate — the guard opens only the successor.
+    ///
+    /// Its own flag, NOT folded into [`gates_are_forced_open`]: that guard
+    /// documents itself as covering the seed and leak-recovery gates, and the
+    /// tests that open it exercise finality arithmetic that has nothing to do
+    /// with deposits — one shared switch would silently retire the unfunded
+    /// deposit under every one of them, reddening (or worse, greening)
+    /// assertions written against the pre-flag-day rules. Default is CLOSED,
+    /// so an unadorned `cargo test` exercises the configuration the fleet
+    /// actually runs; tests of the funded format opt in. Thread-local — see
+    /// [`TlFlag`] for why nothing here may be a process global.
+    pub fn deposit_funding_forced_open() -> bool {
+        DEPOSIT_FUNDING_OPEN_TL.with(|c| c.get())
+    }
+
+    /// Opens the deposit-funding gate for this thread until the returned
+    /// guard drops — including on the unwind path, so a failing assertion
+    /// cannot leave the rule mutated for the rest of the thread.
+    #[cfg(test)]
+    pub fn deposit_funding_open_guard() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                DEPOSIT_FUNDING_OPEN_TL.with(|c| c.set(self.0));
+            }
+        }
+        let prev = DEPOSIT_FUNDING_OPEN_TL.with(|c| c.replace(true));
+        Restore(prev)
+    }
+
     /// Serializes every test that flips a switch in this module. The switches
     /// are process-global and `cargo test` runs test functions on threads, so
     /// without this a mutation test would silently corrupt an unrelated one.
@@ -817,16 +854,26 @@ pub fn seed_lookahead_at(epoch: u64) -> u64 {
     }
 }
 
-/// Flag day for **eUTXO-funded staking** — the epoch at which the funded
-/// deposit encoding (coins actually spent into the bond, proof of possession
-/// carried and checked) becomes acceptable in blocks, routed through
-/// [`crate::transition::CommittedState::apply_deposit`] and judged by
-/// [`crate::staking::validate_deposit`], the one statement of the deposit
-/// rule.
+/// Flag day for **eUTXO-funded staking** — the ONE constant for the feature:
+/// the epoch at which the funded deposit wire format
+/// ([`crate::transition::PosTransaction::DepositV2`], tag `0x07` — coins
+/// actually spent into the bond, proof of possession carried and checked,
+/// applied by `CommittedState::apply_deposit_v2` with the field rules taken
+/// from [`crate::staking::validate_deposit_fields`]) becomes acceptable in
+/// blocks, and at which the funded delegation path
+/// ([`crate::transition::CommittedState::apply_delegation`]) opens with it.
+/// An earlier integration draft carried a second constant
+/// (`DEPOSIT_FUNDING_ACTIVATION_EPOCH`) for the same feature; two gates for
+/// one switch is how the two halves drift apart, so it was unified here.
 ///
 /// # What is and is not gated on this constant
 ///
-/// Below it, `apply_deposit` refuses (`TxReject::StakingNotActive`). The
+/// Below it, `DepositV2` refuses (`TransferReject::FormatNotActive` — the
+/// same two-roads verdict as `TransferV2`: the old binary fails to decode
+/// tag `0x07`, the new one refuses at the gate, so a mixed fleet stays on
+/// one chain until the flag day) and `apply_delegation` refuses
+/// (`TxReject::StakingNotActive`). AFTER activation the binaries diverge in
+/// both directions, so the fleet must be rebuilt before this is lowered. The
 /// legacy unfunded encodings — wire tags `0x02` (`Deposit`) and `0x04`
 /// (`Delegate`) — are NOT what activates here: they name an `amount_sat`,
 /// carry no signature and spend no output, so they are consensus-rejected at
@@ -935,6 +982,31 @@ pub const DS_DEPOSIT: [u8; 16] = *b"BLCH4:DEPOSIT\0\0\0";
 /// the outputs, the declared size and the tip — everything except the
 /// witnesses, which cannot be inside a root they are produced over.
 pub const DS_SPEND: [u8; 16] = *b"BLCH4:SPEND\0\0\0\0\0";
+/// The signing root a funded deposit's INPUT witnesses cover
+/// (`PosTransaction::DepositV2`): the domain under which a coin's owner
+/// authorises destroying that coin into *this* validator bond and nothing
+/// else.
+///
+/// Its own tag, and not [`DS_SPEND`], because the two preimages carry
+/// different structures behind the same fold style: under one tag, a
+/// signature over a deposit could — for some adversarially chosen field
+/// values — parse as a signature over a transfer, and a coin authorised into
+/// a bond would instead move to an attacker's output. Distinct tags make the
+/// cross-reading impossible by construction instead of improbable by
+/// arithmetic. And it is not [`DS_DEPOSIT`] either: that tag is the
+/// VALIDATOR key's proof-of-possession domain (§7.1), signed by a different
+/// key over a different statement ("I possess this key"), and a root that
+/// served both would let one signature answer for the other.
+///
+/// The preimage covers the spend points, every §7.1 registration field
+/// (pubkey, amount, RANDAO commitment, withdrawal address, commission), the
+/// change outputs, the declared size and the tip — everything except the
+/// witnesses and the PoP, which are signatures and cannot live inside a root
+/// they are produced over. Both are still checked against committed material:
+/// each witness against the spent output's `script_hash` and this root, the
+/// PoP against the pubkey and the §7.1 root, whose every field is inside
+/// *this* root and therefore inside the txid.
+pub const DS_DEPOSIT_FUND: [u8; 16] = *b"BLCH4:DEPFUND\0\0\0";
 /// Transaction identity: `txid = SHA3-256(DS_TXID ‖ spend signing root)`.
 ///
 /// Derived from the witness-free signing root, so a transaction's id — and

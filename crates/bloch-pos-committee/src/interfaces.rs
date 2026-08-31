@@ -417,11 +417,14 @@ pub enum TransferReject {
     /// trusted to be unreachable: the overwrite would silently destroy the
     /// existing output's value.
     OutputExists,
-    /// A `TransferV2` (deduplicated-witness, tag `0x06`) arrived before
-    /// `params::TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH`. The format ships
-    /// inert; before the flag day a block carrying it is invalid on every
-    /// node — this is the new binary's half of the same verdict the old
-    /// binary reaches via `TxDecodeError::UnknownTag(0x06)`.
+    /// A gated wire format arrived before its flag day: a `TransferV2`
+    /// (deduplicated-witness, tag `0x06`) before
+    /// `params::TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH`, or a funded
+    /// deposit (`DepositV2`, tag `0x07`) before
+    /// `params::FUNDED_STAKING_ACTIVATION_EPOCH`. Each format ships inert;
+    /// before its flag day a block carrying it is invalid on every node —
+    /// this is the new binary's half of the same verdict the old binary
+    /// reaches via `TxDecodeError::UnknownTag`.
     FormatNotActive,
     /// A V2 input's `key_index` points past the end of the witness table.
     /// Structural, checked per input before any hash or signature work.

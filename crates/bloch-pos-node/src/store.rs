@@ -338,6 +338,7 @@ mod scan {
                             PosTransaction::Delegate { .. } => 0x04,
                             PosTransaction::SlashingEvidence(_) => 0x05,
                             PosTransaction::TransferV2 { .. } => 0x06,
+                            PosTransaction::DepositV2 { .. } => 0x07,
                         };
                         assert_eq!(tag, decoded_tag, "wire tag vs decoded variant");
                         *by_tag.entry(tag).or_insert(0) += 1;

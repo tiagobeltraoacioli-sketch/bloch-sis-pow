@@ -2776,6 +2776,12 @@ pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'s
         // `params::FUNDED_STAKING_ACTIVATION_EPOCH` /
         // `params::SIGNED_EXIT_ACTIVATION_EPOCH`, and admitting them once
         // armed means teaching THIS function their formats too.
+        //
+        // The funded successor's wire format now EXISTS: `DepositV2` (tag
+        // 0x07, the arm below) lands behind
+        // `params::FUNDED_STAKING_ACTIVATION_EPOCH`. This refusal of the
+        // legacy shape stays either way — it is consensus-invalid at every
+        // epoch, and this arm is just the cheap outer door.
         PosTransaction::Deposit { .. } => Err(
             "deposits are not accepted: bonding is not yet funded from the UTXO set, \
              so a deposit would create stake without spending coins",
@@ -2927,6 +2933,50 @@ pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'s
             for k in keys {
                 if !bloch_crypto::crypto::verify(&k.pubkey, &signing_root, &k.signature) {
                     return Err("transfer carries a signature that does not verify");
+                }
+            }
+            Ok(())
+        }
+        // DepositV2 (tag 0x07, the FUNDED deposit): admitted from its flag
+        // day, refused before it — wall-clock epoch on this side of the
+        // mempool door, committed epoch on the consensus side, for exactly
+        // the reasons written on the TransferV2 arm above. Load-bearing
+        // either way: without this arm the catch-all below would ADMIT the
+        // format, and pre-flag-day that is mempool stuffing (every proposer
+        // pays to probe-drop what consensus must refuse), while post-flag-day
+        // an unverified PoP or witness would ride to the proposer for free.
+        PosTransaction::DepositV2 { inputs, pubkey, proof_of_possession, .. } => {
+            if wall_epoch < bloch_pos_committee::params::FUNDED_STAKING_ACTIVATION_EPOCH {
+                return Err(
+                    "funded deposits (tag 0x07) are not active: the format ships behind \
+                     a flag day (FUNDED_STAKING_ACTIVATION_EPOCH) that this chain has \
+                     not reached",
+                );
+            }
+            // Cheap-first, mirroring the consensus arm (`apply_deposit_v2`):
+            // structure, then the two signature families — this path is
+            // unauthenticated, so an invalid shape must cost zero hybrid
+            // verifications.
+            if inputs.is_empty() {
+                return Err("deposit spends no outputs — the bond it names would be minted, \
+                            not funded, and consensus refuses it");
+            }
+            // The PoP: the validator key over the §7.1 root. One derivation,
+            // shared with consensus (`deposit_pop_signing_root`); `None`
+            // means the framed pubkey does not parse, which no block can
+            // ever apply.
+            let Some(pop_root) = tx.deposit_pop_signing_root() else {
+                return Err("deposit validator key is not a suite-framed hybrid public key");
+            };
+            if !bloch_crypto::crypto::verify(pubkey, &pop_root, proof_of_possession) {
+                return Err("deposit proof of possession does not verify under its own key");
+            }
+            // The funding witnesses, over the deposit's own domain-tagged
+            // root — same placement and same reason as the Transfer arm.
+            let signing_root = tx.spend_signing_root();
+            for i in inputs {
+                if !bloch_crypto::crypto::verify(&i.pubkey, &signing_root, &i.signature) {
+                    return Err("deposit carries a funding signature that does not verify");
                 }
             }
             Ok(())

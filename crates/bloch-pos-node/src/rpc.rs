@@ -1413,6 +1413,7 @@ pub fn submitted_json(tx: &PosTransaction, outcome: Admitted) -> Json {
         PosTransaction::Transfer { .. } => "transfer",
         PosTransaction::TransferV2 { .. } => "transfer_v2",
         PosTransaction::Deposit { .. } => "deposit",
+        PosTransaction::DepositV2 { .. } => "deposit_v2",
         PosTransaction::Exit { .. } => "exit",
         PosTransaction::Delegate { .. } => "delegate",
         PosTransaction::SlashingEvidence(_) => "slashing_evidence",

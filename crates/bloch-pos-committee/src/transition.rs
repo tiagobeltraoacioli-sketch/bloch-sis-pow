@@ -389,8 +389,8 @@ pub enum PosTransaction {
     /// its doc comment used to claim "PoP/taint already checked at
     /// admission", which was false in the way that mattered — admission is
     /// node-local, and a proposer's own block never passes through it. The
-    /// funded successor (coins spent into the bond, PoP carried) routes
-    /// through [`CommittedState::apply_deposit`] behind
+    /// funded successor ([`Self::DepositV2`], coins spent into the bond,
+    /// PoP carried) routes through `CommittedState::apply_deposit_v2` behind
     /// [`crate::params::FUNDED_STAKING_ACTIVATION_EPOCH`]. The variant
     /// survives only so old wire bytes still DECODE — to a transaction every
     /// node refuses — rather than shifting the meaning of tag `0x02`.
@@ -409,6 +409,77 @@ pub enum PosTransaction {
         /// rationale: a cap is evaded by a front-end, a visible rate is
         /// priced by delegators.
         commission_bps: u128,
+    },
+    /// The **eUTXO-funded** validator registration (wire tag `0x07`) — INERT
+    /// until [`crate::params::FUNDED_STAKING_ACTIVATION_EPOCH`], and the
+    /// format that closes the gap [`Self::Deposit`] leaves open: a bond that
+    /// spends no output is stake minted from nothing (measured 2026-08-13 at
+    /// 25,000 BLCH per unauthenticated request; ~46 requests to a third of
+    /// active stake), and slashing it burns coins the depositor never had —
+    /// which voids the economic-security argument entirely.
+    ///
+    /// Three properties, none implied by the others:
+    ///
+    /// 1. **The bond is real coins.** `inputs` are consumed from the
+    ///    committed unspent set under the same ownership rule as a transfer
+    ///    (committed `script_hash`, witness over the signing root), and
+    ///    `sum(inputs) == amount_sat + sum(change) + fee` holds with the same
+    ///    strict equality — auditable exactly the way a transfer is.
+    /// 2. **The key is possessed.** `proof_of_possession` is a hybrid
+    ///    signature by the VALIDATOR key over the §7.1 root
+    ///    ([`Self::deposit_pop_signing_root`], domain
+    ///    [`crate::params::DS_DEPOSIT`]) covering the pubkey, the amount, the
+    ///    RANDAO commitment **and the withdrawal address** — so neither the
+    ///    key nor the credentials the stake returns to can be swapped under
+    ///    someone else's PoP (the rogue-key registration).
+    /// 3. **The coins' owner authorised THIS bond.** Each input witness signs
+    ///    the [`crate::params::DS_DEPOSIT_FUND`] root, which covers every
+    ///    registration field — a signature over a transfer can never fund a
+    ///    bond, and a signature over this deposit can never move coins
+    ///    anywhere else.
+    ///
+    /// The coin owner and the validator key are deliberately allowed to be
+    /// different parties: the coins fund the bond, the PoP binds the key, and
+    /// the principal returns to `withdrawal_addr` — never to the hot key.
+    DepositV2 {
+        /// The outputs funding the bond, each with its own witness — same
+        /// shape and same per-input verification cost as a transfer's.
+        inputs: Vec<TransferInput>,
+        /// Suite-framed hybrid validator key (`0xB1 0x0C ‖ suite ‖ ML-DSA-65
+        /// pk ‖ Falcon-1024 pk`, [`staking::FRAMED_HYBRID_PK_BYTES`] bytes).
+        /// Opaque on the wire; the transition parses and refuses any other
+        /// shape ([`staking::parse_framed_pubkey`]).
+        pubkey: Vec<u8>,
+        /// The bond, in satoshis — the value that leaves the spendable set
+        /// and becomes `staked_sat`.
+        amount_sat: u128,
+        /// `c_0`, head of the SHAKE-256 reveal chain (§6.3).
+        randao_commitment: [u8; 32],
+        /// Where the principal returns after withdrawal — fixed at deposit
+        /// time and covered by the PoP, so a compromise of the hot validator
+        /// key can never redirect it ([`staking::Address`]). Fixed-width,
+        /// unlike `Deposit`'s free-form `withdrawal_credentials`: the funded
+        /// format commits to a 32-byte script hash, the same shape a
+        /// [`TransferOutput`] locks to.
+        withdrawal_addr: [u8; 32],
+        /// Commission in basis points — same rules as [`Self::Deposit`].
+        commission_bps: u128,
+        /// Hybrid signature by the validator key over
+        /// [`Self::deposit_pop_signing_root`]. Like the input witnesses it
+        /// lives OUTSIDE the signing root (a validator could re-randomise its
+        /// own Falcon half, and identity must not move under that), and like
+        /// them every byte is checked against committed material: the key it
+        /// verifies under is inside the root, and so is everything it signs.
+        proof_of_possession: Vec<u8>,
+        /// What the inputs carry beyond the bond and the fee, returned to
+        /// whoever the depositor names — ordinary spendable outputs keyed by
+        /// `(txid, vout)` like a transfer's.
+        change: Vec<TransferOutput>,
+        /// Declared payload bytes — same floor and same block-cap accounting
+        /// as a transfer ([`TransferReject::UnderdeclaredSize`]).
+        tx_bytes: u64,
+        /// The sender's tip, in millisatoshi per gas.
+        tip_millisat_per_gas: u128,
     },
     /// Voluntary exit — the LEGACY UNAUTHENTICATED encoding (tag `0x03`),
     /// **consensus-rejected at every epoch** since 2026-08-31. It is an
@@ -530,9 +601,9 @@ impl PosTransaction {
         }
 
         let mut h = Sha3_256::new();
-        h.update(crate::params::DS_SPEND);
         match self {
             PosTransaction::Transfer { inputs, outputs, tx_bytes, tip_millisat_per_gas } => {
+                h.update(crate::params::DS_SPEND);
                 fold_spend(
                     &mut h,
                     &mut inputs.iter().map(|i| (i.txid, i.vout)),
@@ -543,6 +614,7 @@ impl PosTransaction {
                 );
             }
             PosTransaction::TransferV2 { inputs, outputs, tx_bytes, tip_millisat_per_gas, .. } => {
+                h.update(crate::params::DS_SPEND);
                 fold_spend(
                     &mut h,
                     &mut inputs.iter().map(|i| (i.txid, i.vout)),
@@ -552,9 +624,104 @@ impl PosTransaction {
                     *tip_millisat_per_gas,
                 );
             }
-            other => h.update(other.canonical_bytes()),
+            PosTransaction::DepositV2 {
+                inputs,
+                pubkey,
+                amount_sat,
+                randao_commitment,
+                withdrawal_addr,
+                commission_bps,
+                proof_of_possession: _,
+                change,
+                tx_bytes,
+                tip_millisat_per_gas,
+            } => {
+                // Its OWN domain, not DS_SPEND — see the DS_DEPOSIT_FUND
+                // rationale in params.rs: under one tag a signature over a
+                // deposit could, for adversarial field values, parse as a
+                // signature over a transfer, and a coin authorised into a
+                // bond would move to an attacker's output instead. Distinct
+                // tags make the cross-reading impossible by construction.
+                //
+                // NOT `fold_spend`, and not a duplicate of it either: the
+                // preimage interleaves the §7.1 registration fields between
+                // the spend points and the outputs, so the two folds share no
+                // reusable shape. Field order is declaration order, every
+                // variable-length field length-prefixed — the same
+                // injectivity rules as `canonical_bytes`. The witnesses and
+                // the PoP stay outside for the documented reason: they are
+                // signatures, and a root that covered them could never be
+                // signed.
+                h.update(crate::params::DS_DEPOSIT_FUND);
+                h.update((inputs.len() as u32).to_le_bytes());
+                for i in inputs {
+                    h.update(i.txid);
+                    h.update(i.vout.to_le_bytes());
+                }
+                h.update((pubkey.len() as u32).to_le_bytes());
+                h.update(pubkey);
+                h.update(amount_sat.to_le_bytes());
+                h.update(randao_commitment);
+                h.update(withdrawal_addr);
+                h.update(commission_bps.to_le_bytes());
+                h.update((change.len() as u32).to_le_bytes());
+                for o in change {
+                    h.update(o.value.to_le_bytes());
+                    h.update(o.script_hash);
+                }
+                h.update(tx_bytes.to_le_bytes());
+                h.update(tip_millisat_per_gas.to_le_bytes());
+            }
+            other => {
+                h.update(crate::params::DS_SPEND);
+                h.update(other.canonical_bytes());
+            }
         }
         h.finalize().into()
+    }
+
+    /// The §7.1 root a funded deposit's proof of possession must sign:
+    /// [`staking::DepositTx::signing_root`] over this transaction's
+    /// registration fields, domain [`crate::params::DS_DEPOSIT`].
+    ///
+    /// ONE derivation, shared by the transition's consensus check, the node's
+    /// admission mirror, and any wallet building a deposit — a second copy of
+    /// this fold would be the duplicate-derivation defect this crate refuses
+    /// (`pow_hash`/`block_hash`, one layer up). It is deliberately a
+    /// *different* root from [`Self::spend_signing_root`], under a different
+    /// tag, signed by a different key over a different statement ("I possess
+    /// this key", not "I spend these coins") — a root that served both would
+    /// let one signature answer for the other. Every field it covers is also
+    /// inside the DS_DEPOSIT_FUND root, and therefore inside the txid.
+    ///
+    /// `None` for every other variant, and for a `DepositV2` whose framed
+    /// pubkey does not parse — a malformed key has no possession to prove,
+    /// and the caller must refuse, never panic.
+    pub fn deposit_pop_signing_root(&self) -> Option<[u8; 32]> {
+        let PosTransaction::DepositV2 {
+            pubkey,
+            amount_sat,
+            randao_commitment,
+            withdrawal_addr,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let (suite, raw) = staking::parse_framed_pubkey(pubkey)?;
+        Some(
+            staking::DepositTx {
+                suite,
+                amount_sat: *amount_sat,
+                validator_pubkey: *raw,
+                randao_commitment: *randao_commitment,
+                withdrawal_addr: *withdrawal_addr,
+                // The root does not cover the PoP (a signature cannot cover
+                // itself), so an empty placeholder changes nothing.
+                proof_of_possession: Vec::new(),
+            }
+            .signing_root(),
+        )
     }
 
     /// This transaction's id: `SHA3-256(DS_TXID ‖ spend_signing_root)`.
@@ -690,6 +857,44 @@ impl PosTransaction {
                 b.extend_from_slice(randao_commitment);
                 put(&mut b, withdrawal_credentials);
                 b.extend_from_slice(&commission_bps.to_le_bytes());
+            }
+            PosTransaction::DepositV2 {
+                inputs,
+                pubkey,
+                amount_sat,
+                randao_commitment,
+                withdrawal_addr,
+                commission_bps,
+                proof_of_possession,
+                change,
+                tx_bytes,
+                tip_millisat_per_gas,
+            } => {
+                // 0x07: the funded deposit. Same encoding rules as every
+                // other tag — one-byte discriminant, fixed-width LE fields in
+                // declaration order, every variable-length field
+                // length-prefixed — same injectivity argument.
+                b.push(0x07);
+                b.extend_from_slice(&(inputs.len() as u32).to_le_bytes());
+                for i in inputs {
+                    b.extend_from_slice(&i.txid);
+                    b.extend_from_slice(&i.vout.to_le_bytes());
+                    put(&mut b, &i.pubkey);
+                    put(&mut b, &i.signature);
+                }
+                put(&mut b, pubkey);
+                b.extend_from_slice(&amount_sat.to_le_bytes());
+                b.extend_from_slice(randao_commitment);
+                b.extend_from_slice(withdrawal_addr);
+                b.extend_from_slice(&commission_bps.to_le_bytes());
+                put(&mut b, proof_of_possession);
+                b.extend_from_slice(&(change.len() as u32).to_le_bytes());
+                for o in change {
+                    b.extend_from_slice(&o.value.to_le_bytes());
+                    b.extend_from_slice(&o.script_hash);
+                }
+                b.extend_from_slice(&tx_bytes.to_le_bytes());
+                b.extend_from_slice(&tip_millisat_per_gas.to_le_bytes());
             }
             PosTransaction::Exit { validator } => {
                 b.push(0x03);
@@ -837,6 +1042,46 @@ impl PosTransaction {
                     keys,
                     inputs,
                     outputs,
+                    tx_bytes: r.u64()?,
+                    tip_millisat_per_gas: r.u128()?,
+                }
+            }
+            0x07 => {
+                // Purely structural, like tags 0x01/0x06: counts come from
+                // untrusted bytes, so nothing is preallocated from them, and
+                // whether the format is ACTIVE is the transition's question
+                // (`FormatNotActive`, against the committed epoch), never the
+                // decoder's.
+                let n_in = r.u32()?;
+                let mut inputs = Vec::new();
+                for _ in 0..n_in {
+                    inputs.push(TransferInput {
+                        txid: r.h32()?,
+                        vout: r.u32()?,
+                        pubkey: r.bytes()?,
+                        signature: r.bytes()?,
+                    });
+                }
+                let pubkey = r.bytes()?;
+                let amount_sat = r.u128()?;
+                let randao_commitment = r.h32()?;
+                let withdrawal_addr = r.h32()?;
+                let commission_bps = r.u128()?;
+                let proof_of_possession = r.bytes()?;
+                let n_change = r.u32()?;
+                let mut change = Vec::new();
+                for _ in 0..n_change {
+                    change.push(TransferOutput { value: r.u64()?, script_hash: r.h32()? });
+                }
+                PosTransaction::DepositV2 {
+                    inputs,
+                    pubkey,
+                    amount_sat,
+                    randao_commitment,
+                    withdrawal_addr,
+                    commission_bps,
+                    proof_of_possession,
+                    change,
                     tx_bytes: r.u64()?,
                     tip_millisat_per_gas: r.u128()?,
                 }
@@ -1257,25 +1502,28 @@ pub struct CommittedState {
     ///
     /// # The gap that is still open, named rather than left to be discovered
     ///
-    /// **Bonding is not funded from this set.** `PosTransaction::Deposit` and
-    /// `Delegate` name an `amount_sat` and spend no output; `Exit` and the
-    /// withdrawal delay return no output either. So the chain holds two pools
-    /// — this one and the registry's bonded stake — and coins do not travel
-    /// between them: fee rewards compound into bonds that this set never
-    /// funded. Since 2026-08-31 the transaction door into that gap is closed
-    /// BY CONSENSUS: the unfunded staking arms in `apply_transaction` reject
-    /// at every epoch (`TxReject::StakingNotActive`), so a deposit can no
-    /// longer create bonded stake without destroying spendable coins — not
-    /// even in a committee member's own block, which the earlier mempool-only
-    /// refusal never covered.
+    /// **Bonding is not YET funded from this set on the live chain.** The
+    /// legacy `PosTransaction::Deposit` and `Delegate` named an `amount_sat`
+    /// and spent no output; `Exit` and the withdrawal delay return no output
+    /// either. So the chain holds two pools — this one and the registry's
+    /// bonded stake — and coins do not travel between them: fee rewards
+    /// compound into bonds that this set never funded. Since 2026-08-31 the
+    /// transaction door into that gap is closed BY CONSENSUS: the unfunded
+    /// staking arms in `apply_transaction` reject at every epoch
+    /// (`TxReject::StakingNotActive`), so a deposit can no longer create
+    /// bonded stake without destroying spendable coins — not even in a
+    /// committee member's own block, which the earlier mempool-only refusal
+    /// never covered.
     ///
-    /// Conservation therefore holds **within** the transfer path (the fee is
-    /// exactly what leaves the set, pinned by test) and **not** across the two
-    /// pools. Closing it means giving deposits and withdrawals eUTXO inputs
-    /// and outputs, which is a change to the staking messages' wire shape and
-    /// to their admission rules, not to this field — that funded path lands
-    /// behind [`crate::params::FUNDED_STAKING_ACTIVATION_EPOCH`], through
-    /// [`CommittedState::apply_deposit`]. Until then, no single
+    /// The deposit half of the funded fix EXISTS and is inert:
+    /// [`PosTransaction::DepositV2`] (tag `0x07`) consumes inputs from this
+    /// set and moves `amount_sat` into `staked_sat` under strict conservation
+    /// ([`CommittedState::apply_deposit_v2`]), behind
+    /// [`crate::params::FUNDED_STAKING_ACTIVATION_EPOCH`] — the same flag day
+    /// that opens [`CommittedState::apply_delegation`]. Until that epoch
+    /// binds, and until withdrawal gets the same treatment, conservation
+    /// holds **within** the transfer path (the fee is exactly what leaves the
+    /// set, pinned by test) and **not** across the two pools, and no single
     /// number in this state is "the supply".
     eutxos: EutxoSet,
 }
@@ -1487,6 +1735,59 @@ fn owns(key_hash: &[u8; 32], script_hash: &[u8; 32]) -> bool {
         return true;
     }
     script_hash[20..] == [0u8; 12] && key_hash[..20] == script_hash[..20]
+}
+
+/// Has the funded-staking flag day ([`crate::params::FUNDED_STAKING_ACTIVATION_EPOCH`])
+/// bound at `epoch`?
+///
+/// ONE constant for the whole feature — the `DepositV2` wire format becoming
+/// acceptable and the funded delegation path opening — because two gates for
+/// one switch is how the halves drift apart (an earlier draft carried a
+/// second `DEPOSIT_FUNDING_ACTIVATION_EPOCH`; it was unified away). The
+/// legacy unfunded `Deposit` does NOT wait for this gate: it is
+/// consensus-rejected at every epoch by its own arm. `epoch` must be the
+/// COMMITTED epoch (`CommittedState::epoch`, already rolled to the block's),
+/// never anything node-local — the 2026-08-08 `expected_bits` fork is the
+/// standing reason. The rehearsal overrides are test-only plumbing and
+/// default closed: the bool guard opens the gate everywhere, the epoch
+/// placement exercises the seam through the same `>=` the fleet runs.
+fn deposit_funding_active(epoch: u64) -> bool {
+    // The rehearsal module is `cfg(test)` and cannot exist in a shipped
+    // binary — same idiom as the gate read in `seed_for_epoch`.
+    #[cfg(test)]
+    {
+        if crate::params::rehearsal::deposit_funding_forced_open() {
+            return true;
+        }
+        epoch >= crate::params::rehearsal::effective_funded_staking_activation()
+    }
+    #[cfg(not(test))]
+    {
+        epoch >= crate::params::FUNDED_STAKING_ACTIVATION_EPOCH
+    }
+}
+
+/// The per-validator deposit cap the transition enforces: 1% of committed
+/// active stake ([`delegation::MAX_VALIDATOR_STAKE_BPS`]), floored at
+/// [`staking::MIN_DEPOSIT_SAT`] so a naive 1% at genesis (active stake ≈ 0)
+/// cannot deadlock the bootstrap. One derivation, called by BOTH deposit arms
+/// so the two formats cannot disagree about the cap.
+///
+/// **KNOWN DIVERGENCE, flagged rather than hidden**: this is the naive
+/// product against *uncapped* active stake, while
+/// [`delegation::Registry::cap_sat`] — the derivation the dead
+/// `staking::validate_deposit` docs point to — resolves the cap against
+/// *capped* stake by fixed-point iteration, which is materially stricter
+/// exactly when concentration is high (its docs: 9.99M vs 1.0% under a 90%
+/// whale). Two cap derivations for one rule is the duplicate-derivation
+/// defect this crate refuses; they must be unified — the fixed point needs
+/// the per-validator stake list, which this call site does not thread yet —
+/// and the unification is consensus, so it belongs on the SAME flag day as
+/// [`crate::params::FUNDED_STAKING_ACTIVATION_EPOCH`], not on a quiet
+/// binary swap.
+fn deposit_cap_sat(total_active_sat: u128) -> u128 {
+    (total_active_sat * delegation::MAX_VALIDATOR_STAKE_BPS / 10_000)
+        .max(staking::MIN_DEPOSIT_SAT)
 }
 
 impl CommittedState {
@@ -2068,15 +2369,10 @@ impl CommittedState {
     fn apply_transaction(
         &mut self,
         tx: &PosTransaction,
-        // Unused since the 2026-08-31 closure retired the legacy staking
-        // arms, KEPT in the signature deliberately: the per-validator cap is
-        // a fraction of committed active stake and must arrive from the
-        // caller (rule 1), so when the funded staking wire formats land as
-        // new variants their arms will need exactly this input again —
-        // `apply_deposit` already takes it. Removing and re-adding a
-        // parameter on a consensus seam across two flag days invites a
-        // transposition bug for zero cleanliness.
-        _total_active_sat: u128,
+        // Committed active stake, from the caller (rule 1): the funded
+        // deposit's per-validator cap is a fraction of it, and the legacy
+        // arms that once read it are consensus-rejects now.
+        total_active_sat: u128,
         base_fee_millisat_per_gas: u128,
         verifier: &dyn SignatureVerifier,
     ) -> Result<fee_market::TxCharge, TxReject> {
@@ -2115,14 +2411,26 @@ impl CommittedState {
                 //
                 // No flag day reopens THIS encoding. The flag day
                 // (`params::FUNDED_STAKING_ACTIVATION_EPOCH`) activates the
-                // funded successor format — coins spent into the bond, PoP
-                // carried — whose wire shape is owned by the funded-format
-                // work stream and which routes through `apply_deposit`
-                // below, where `staking::validate_deposit` is the single
-                // statement of the deposit rule. The min/cap checks that
-                // used to be restated inline here are gone with the arm:
-                // the rule now exists in exactly one place.
+                // funded successor format — `DepositV2` (tag 0x07), coins
+                // spent into the bond, PoP carried — which routes through
+                // `apply_deposit_v2` below, with the field rules taken from
+                // `staking::validate_deposit_fields`, the single statement
+                // of the deposit rule. The min/cap checks that used to be
+                // restated inline here are gone with the arm: the rule now
+                // exists in exactly one place.
                 Err(TxReject::StakingNotActive)
+            }
+            PosTransaction::DepositV2 { .. } => {
+                // THE FLAG-DAY GATE, FIRST — same discipline, same constant
+                // and same two-roads argument as the TransferV2 arm above:
+                // pre-activation this reject and the old binary's
+                // `UnknownTag(0x07)` decode failure are two roads to the same
+                // verdict on the same block, which is what keeps a mixed
+                // fleet on one chain until the flag day.
+                if !deposit_funding_active(self.epoch) {
+                    return Err(TxReject::Transfer(TransferReject::FormatNotActive));
+                }
+                self.apply_deposit_v2(tx, total_active_sat, base_fee_millisat_per_gas, verifier)
             }
             PosTransaction::Exit { .. } => {
                 // CONSENSUS REJECT, at every epoch — the gravest of the
@@ -2170,101 +2478,6 @@ impl CommittedState {
         }
     }
 
-    /// Apply one FUNDED deposit — the post-flag-day path, and the only path
-    /// that can ever register a validator from a transaction.
-    ///
-    /// The deposit rule itself — suite tag, transparency, taint, minimum,
-    /// per-validator cap, proof of possession — is [`staking::validate_deposit`]
-    /// and is stated NOWHERE else; this method contributes only what a pure
-    /// rule cannot know: the flag-day gate, the two state-dependent facts
-    /// (duplicate registration, the cap derived from committed active stake),
-    /// and the registration itself. Until 2026-08-31 the live `Deposit` arm
-    /// restated the minimum and the cap inline while `validate_deposit` sat
-    /// unreferenced — two statements of one rule, free to drift; this is the
-    /// merge.
-    ///
-    /// # Interface, deliberately taken rather than designed
-    ///
-    /// The wire encoding that reaches this method — how the PoP travels, how
-    /// the spent outputs are named, how the suite-tagged key is enveloped —
-    /// belongs to the funded-format work stream. This method takes the
-    /// SEMANTIC deposit ([`staking::DepositTx`]) plus the caller-resolved
-    /// facts about its inputs ([`staking::DepositInput`], per the staking
-    /// module's "the caller resolves each spent output against the ledger"
-    /// contract) and an injected [`staking::HybridKeyVerifier`]. `commission_bps`
-    /// rides alongside because the committed record requires it and §7.1's
-    /// `DepositTx` predates it.
-    ///
-    /// Returns the new validator index. On any `Err` the state is untouched:
-    /// every check runs before the first mutation, the same discipline as
-    /// `apply_transfer`.
-    pub(crate) fn apply_deposit(
-        &mut self,
-        tx: &staking::DepositTx,
-        inputs: &[staking::DepositInput],
-        commission_bps: u128,
-        total_active_sat: u128,
-        keys: &dyn staking::HybridKeyVerifier,
-    ) -> Result<u32, TxReject> {
-        // THE FLAG-DAY GATE, FIRST — before any other look at the deposit.
-        // Read from `self.epoch`, which is COMMITTED state already rolled to
-        // the block's epoch by `close_epoch`, never from anything node-local
-        // — the 2026-08-08 `expected_bits` fork is the standing reason. In a
-        // shipped binary the gate is the constant; a test may move it on its
-        // own thread so both sides of the boundary are exercisable through
-        // this same `<` (see `params::rehearsal`).
-        #[cfg(test)]
-        let activation = crate::params::rehearsal::effective_funded_staking_activation();
-        #[cfg(not(test))]
-        let activation = crate::params::FUNDED_STAKING_ACTIVATION_EPOCH;
-        if self.epoch < activation {
-            return Err(TxReject::StakingNotActive);
-        }
-        // A second deposit of a registered key is a top-up path decision the
-        // interface refuses to make implicitly. State-dependent, so it lives
-        // here, not in the pure rule.
-        let pubkey_hash: [u8; 32] = Sha3_256::digest(tx.validator_pubkey).into();
-        if self.pubkey_index.contains_key(&pubkey_hash) {
-            return Err(TxReject::StakingRule);
-        }
-        // Per-validator cap: 1% of committed active stake, floored at the
-        // minimum deposit — a naive 1% cap at genesis (active stake ≈ 0)
-        // would deadlock the bootstrap. Derived HERE because the cap is a
-        // fraction of a value in committed state, which the §5.5-pure rule
-        // takes as an explicit input (staking.rs docs on `max_stake_sat`).
-        let cap = (total_active_sat * delegation::MAX_VALIDATOR_STAKE_BPS / 10_000)
-            .max(staking::MIN_DEPOSIT_SAT);
-        // The one deposit rule. Its verdict is relayed, never restated.
-        staking::validate_deposit(tx, inputs, cap, keys).map_err(TxReject::Deposit)?;
-        // Next free index: a deterministic function of the registry, never of
-        // anything local.
-        let index = self.validators.keys().next_back().map_or(0, |k| k + 1);
-        self.validators.insert(
-            index,
-            ValidatorRecord {
-                index,
-                pubkey: tx.validator_pubkey.to_vec(),
-                staked_sat: tx.amount_sat,
-                randao_commitment: tx.randao_commitment,
-                withdrawal_credentials: tx.withdrawal_addr.to_vec(),
-                // Not scheduled until the activation queue admits it.
-                activation_epoch: u64::MAX,
-                exit_epoch: u64::MAX,
-                withdrawable_epoch: u64::MAX,
-                slashed: false,
-                commission_bps,
-            },
-        );
-        self.reveals_used.insert(index, 0);
-        self.pubkey_index.insert(pubkey_hash, index);
-        self.deposit_history.push(QueuedDeposit {
-            pubkey_hash,
-            deposit_epoch: self.epoch,
-            amount_sat: tx.amount_sat,
-        });
-        Ok(index)
-    }
-
     /// Apply one signed voluntary exit — the post-flag-day path, and the only
     /// path that can ever retire a validator from a transaction.
     ///
@@ -2281,8 +2494,10 @@ impl CommittedState {
     ///
     /// # Interface, deliberately taken rather than designed
     ///
-    /// Like [`Self::apply_deposit`], the wire encoding that reaches this
-    /// method belongs to the staking-format work stream; this takes the
+    /// Unlike the funded deposit — whose wire format ([`PosTransaction::DepositV2`])
+    /// already exists and routes through `apply_deposit_v2` — the signed
+    /// exit's wire encoding still belongs to the staking-format work
+    /// stream; this takes the
     /// SEMANTIC exit ([`staking::ExitTx`]: committed-pubkey hash, epoch,
     /// hybrid signature) plus an injected [`staking::HybridKeyVerifier`].
     /// The exit names its validator by pubkey hash, not index, because the
@@ -2297,8 +2512,8 @@ impl CommittedState {
         exit: &staking::ExitTx,
         keys: &dyn staking::HybridKeyVerifier,
     ) -> Result<u32, TxReject> {
-        // THE FLAG-DAY GATE, FIRST — same reading discipline as
-        // `apply_deposit`: the COMMITTED epoch, never anything node-local
+        // THE FLAG-DAY GATE, FIRST — same reading discipline as the
+        // `DepositV2` gate: the COMMITTED epoch, never anything node-local
         // (the 2026-08-08 `expected_bits` fork is the standing reason).
         #[cfg(test)]
         let activation = crate::params::rehearsal::effective_signed_exit_activation();
@@ -2350,7 +2565,7 @@ impl CommittedState {
 
     /// Apply one FUNDED delegation — the post-flag-day path, holding the
     /// state-dependent delegation rules the retired tag-0x04 arm used to
-    /// hold. Like [`Self::apply_deposit`] it takes the semantic message; the
+    /// hold. Unlike `apply_deposit_v2` it takes the semantic message; the
     /// funded wire encoding (with the delegator's authorisation and the
     /// outputs being bonded) belongs to the funded-format work stream, and
     /// resolving those is the caller's job before this is reached.
@@ -2371,12 +2586,10 @@ impl CommittedState {
         validator: u32,
         amount_sat: u128,
     ) -> Result<(), TxReject> {
-        // Same gate, same reading discipline as `apply_deposit`.
-        #[cfg(test)]
-        let activation = crate::params::rehearsal::effective_funded_staking_activation();
-        #[cfg(not(test))]
-        let activation = crate::params::FUNDED_STAKING_ACTIVATION_EPOCH;
-        if self.epoch < activation {
+        // Same gate, same constant and same reading discipline as the
+        // `DepositV2` arm — literally the same reader, so the two halves of
+        // funded staking cannot open on different days.
+        if !deposit_funding_active(self.epoch) {
             return Err(TxReject::StakingNotActive);
         }
         let Some(rec) = self.validators.get(&validator) else {
@@ -2788,6 +3001,265 @@ impl CommittedState {
                 unlock_epoch: 0,
             });
         }
+        Ok(charge)
+    }
+
+    /// Authorise, price and apply one **funded** validator registration
+    /// ([`PosTransaction::DepositV2`]): the spend half of a transfer welded
+    /// to the registration half of a deposit, with conservation as the weld.
+    ///
+    /// The properties, and where each is checked:
+    ///
+    /// 1. **Only the owner funds.** Each input's key must hash to the
+    ///    committed `script_hash` and its witness must verify over the
+    ///    [`crate::params::DS_DEPOSIT_FUND`] root — the same two checks as
+    ///    [`Self::apply_transfer`], against a root that names THIS bond.
+    /// 2. **Only the key's holder registers.** The PoP must verify under the
+    ///    deposit's own pubkey over [`PosTransaction::deposit_pop_signing_root`],
+    ///    which covers the pubkey and the withdrawal address — so neither can
+    ///    be swapped under someone else's proof.
+    /// 3. **Value is conserved, across the two pools.**
+    ///    `sum(inputs) == amount + sum(change) + fee`, strict equality like a
+    ///    transfer's; the `amount` leaves the spendable set and becomes
+    ///    `staked_sat`, so bonded stake is now DESTROYED spendable coins, and
+    ///    slashing burns coins the depositor really committed.
+    /// 4. **The §7.1/§4.1 registration rules** come from
+    ///    [`staking::validate_deposit_fields`] — the one derivation, shared
+    ///    with the admission-boundary `validate_deposit` — plus the
+    ///    registry-dependent rules (duplicate key, cap) that only this struct
+    ///    can answer.
+    ///
+    /// Check order is consensus and cheapest-first, PoP before the per-input
+    /// witnesses only because it is one verification against N. Every check
+    /// runs before any mutation, so a refused deposit leaves the state
+    /// untouched.
+    ///
+    /// The gas class term is `inputs + 1`: gas buys node CPU, and the PoP is
+    /// one more hybrid verification this function actually runs.
+    fn apply_deposit_v2(
+        &mut self,
+        tx: &PosTransaction,
+        total_active_sat: u128,
+        base_fee_millisat_per_gas: u128,
+        verifier: &dyn SignatureVerifier,
+    ) -> Result<fee_market::TxCharge, TxReject> {
+        let PosTransaction::DepositV2 {
+            inputs,
+            pubkey,
+            amount_sat,
+            randao_commitment,
+            withdrawal_addr,
+            commission_bps,
+            proof_of_possession,
+            change,
+            tx_bytes,
+            tip_millisat_per_gas,
+        } = tx
+        else {
+            // Unreachable: the only caller matches the variant first. A
+            // consensus function does not panic on any input.
+            return Err(TxReject::StakingRule);
+        };
+
+        // ── Structure ───────────────────────────────────────────────────────
+        //
+        // A deposit that spends nothing is the exact defect this format
+        // exists to close — refused on shape before anything else.
+        if inputs.is_empty() {
+            return Err(TxReject::Transfer(TransferReject::NoInputs));
+        }
+        if *tx_bytes < tx.canonical_bytes().len() as u64 {
+            return Err(TxReject::Transfer(TransferReject::UnderdeclaredSize));
+        }
+
+        // ── The registration fields (cheap, one derivation) ─────────────────
+        //
+        // The framed key must parse to exactly the hybrid arrangement — a
+        // key of any other shape has no §7.1 identity. Suite, amount floor
+        // and cap then come from `validate_deposit_fields`, the same
+        // derivation `validate_deposit` runs at the admission boundary.
+        let Some((suite, raw_pk)) = staking::parse_framed_pubkey(pubkey) else {
+            return Err(TxReject::StakingRule);
+        };
+        let dep = staking::DepositTx {
+            suite,
+            amount_sat: *amount_sat,
+            validator_pubkey: *raw_pk,
+            randao_commitment: *randao_commitment,
+            withdrawal_addr: *withdrawal_addr,
+            // The field rules never read the PoP (it is checked below,
+            // through the injected verifier), and `signing_root` does not
+            // cover it — an empty placeholder avoids cloning ~4.6 KB.
+            proof_of_possession: Vec::new(),
+        };
+        // Every input is transparent BY CONSTRUCTION on this chain: the
+        // committed eUTXO set holds no shielded outputs (the Coherence pool
+        // is a separate commitment), so membership — checked per input below
+        // — is what proves transparency. The §6.6.3 facts are stated to the
+        // one shared rule set rather than re-derived here; the taint set is
+        // retired and empty in Genesis-4 (staking.rs).
+        let facts: Vec<staking::DepositInput> = inputs
+            .iter()
+            .map(|_| staking::DepositInput { transparent: true, tainted: false })
+            .collect();
+        // The one statement of the field rules; its verdict is RELAYED under
+        // the canonical taxonomy, never restated (`TxReject::Deposit`).
+        staking::validate_deposit_fields(&dep, &facts, deposit_cap_sat(total_active_sat))
+            .map_err(TxReject::Deposit)?;
+        // Registry-dependent: a second deposit of a registered key is a
+        // top-up path decision the interface refuses to make implicitly.
+        // Identity is the FRAMED wire bytes, exactly as the 0x02 arm hashes
+        // them — two hash conventions for one key would let a key register
+        // twice.
+        let pubkey_hash: [u8; 32] = Sha3_256::digest(pubkey).into();
+        if self.pubkey_index.contains_key(&pubkey_hash) {
+            return Err(TxReject::StakingRule);
+        }
+
+        // ── The spend points, and the set ───────────────────────────────────
+        //
+        // Identical rules to `apply_transfer`, and deliberately so: the coins
+        // funding a bond are authorised, deduplicated and consumed exactly
+        // like coins funding a payment.
+        let mut seen: BTreeSet<([u8; 32], u32)> = BTreeSet::new();
+        let mut spent_value: u128 = 0;
+        for i in inputs {
+            let key = (i.txid, i.vout);
+            if !seen.insert(key) {
+                return Err(TxReject::Transfer(TransferReject::DuplicateInput));
+            }
+            let Some(entry) = self.eutxos.get(&key) else {
+                return Err(TxReject::Transfer(TransferReject::UnknownInput));
+            };
+            // The vesting gate — same rule, same placement, same committed
+            // inputs as the two transfer arms'. Without it, bonding would be
+            // a lock bypass: a locked coin could be bonded, exited and
+            // withdrawn back LIQUID, laundering the schedule through the
+            // registry.
+            if entry.unlock_epoch > self.epoch {
+                return Err(TxReject::Transfer(TransferReject::VestingLocked));
+            }
+            let key_hash: [u8; 32] = Sha3_256::digest(&i.pubkey).into();
+            if !owns(&key_hash, &entry.script_hash) {
+                return Err(TxReject::Transfer(TransferReject::ScriptMismatch));
+            }
+            spent_value += entry.value as u128;
+        }
+
+        // ── The price, derived ──────────────────────────────────────────────
+        //
+        // `inputs + 1`: one hybrid verification per input plus the PoP —
+        // the verifications this function actually runs, which is what gas
+        // buys. Saturating only against a 4-billion-input encoding no block
+        // cap would ever admit.
+        let charge = fee_market::charge(
+            fee_market::TxClass::Eutxo { inputs: (inputs.len() as u32).saturating_add(1) },
+            *tx_bytes,
+            base_fee_millisat_per_gas,
+            *tip_millisat_per_gas,
+        );
+
+        // ── Conservation, across the two pools ──────────────────────────────
+        //
+        // Strict equality, same as a transfer: the bond is a declared output
+        // that happens to land in the registry instead of the set, and a
+        // deposit whose inputs exceed amount+change+fee has misdeclared
+        // itself, not tipped the proposer.
+        //
+        // The sum below cannot overflow, and the ORDER above is why:
+        // `validate_deposit_fields` already bounded the wire-controlled
+        // `amount_sat` by the cap (≤ 1% of bonded supply), `change_sat` is a
+        // sum of u64s, and the fee is market-derived — the workspace ships
+        // with overflow-checks on, so an unbounded `amount_sat` reaching this
+        // line would be a remotely triggerable panic, not a wrap.
+        let change_sat: u128 = change.iter().map(|o| o.value as u128).sum();
+        let fee = charge.base_fee_sat + charge.priority_fee_sat;
+        if spent_value != *amount_sat + change_sat + fee {
+            return Err(TxReject::Transfer(TransferReject::ValueNotConserved));
+        }
+
+        // ── The change keys ─────────────────────────────────────────────────
+        let txid = tx.txid();
+        for vout in 0..change.len() as u32 {
+            if self.eutxos.contains_key(&(txid, vout)) {
+                return Err(TxReject::Transfer(TransferReject::OutputExists));
+            }
+        }
+
+        // ── The expensive checks, last ──────────────────────────────────────
+        //
+        // The PoP first (one verification against N witnesses): the
+        // validator key over the §7.1 root, whose every field is inside the
+        // DS_DEPOSIT_FUND root and therefore inside the txid. Without it, a
+        // rogue-key registration could claim someone else's key material or
+        // brick a queue slot with a key nobody can use.
+        let Some(pop_root) = tx.deposit_pop_signing_root() else {
+            // Unreachable past `parse_framed_pubkey` above; refused, never
+            // panicked, all the same.
+            return Err(TxReject::StakingRule);
+        };
+        if !verifier.verify_with_key(pubkey, &pop_root, proof_of_possession) {
+            return Err(TxReject::Deposit(staking::DepositReject::BadProofOfPossession));
+        }
+        // Then the owners: each witness over the deposit's OWN domain-tagged
+        // root — a signature over a transfer can never fund a bond
+        // (DS_DEPOSIT_FUND, params.rs).
+        let signing_root = tx.spend_signing_root();
+        for i in inputs {
+            if !verifier.verify_with_key(&i.pubkey, &signing_root, &i.signature) {
+                return Err(TxReject::Transfer(TransferReject::BadSignature));
+            }
+        }
+
+        // ── Apply ───────────────────────────────────────────────────────────
+        //
+        // Nothing above may fail from here. The inputs leave the spendable
+        // set, the change returns to it, and the difference (minus the fee)
+        // is the bond — the equality above is what makes "bonded stake is
+        // destroyed spendable coins" an audit, not a slogan.
+        for i in inputs {
+            self.eutxos.remove(&(i.txid, i.vout));
+        }
+        for (vout, o) in change.iter().enumerate() {
+            self.eutxos.insert(crate::state_root::EutxoEntry {
+                txid,
+                vout: vout as u32,
+                value: o.value,
+                script_hash: o.script_hash,
+                // Change is LIQUID, like every spender-created output: a
+                // lock is issued by the chain's opening terms, never minted
+                // — and the vesting gate above already kept a locked coin
+                // from funding this bond before its epoch.
+                unlock_epoch: 0,
+            });
+        }
+        // The registration half: identical to the retired 0x02 arm's, so
+        // funded validators enter the ONE queue under one set of lifecycle
+        // rules (activation delay, 4-per-epoch throttle).
+        let index = self.validators.keys().next_back().map_or(0, |k| k + 1);
+        self.validators.insert(
+            index,
+            ValidatorRecord {
+                index,
+                pubkey: pubkey.clone(),
+                staked_sat: *amount_sat,
+                randao_commitment: *randao_commitment,
+                withdrawal_credentials: withdrawal_addr.to_vec(),
+                // Not scheduled until the activation queue admits it.
+                activation_epoch: u64::MAX,
+                exit_epoch: u64::MAX,
+                withdrawable_epoch: u64::MAX,
+                slashed: false,
+                commission_bps: *commission_bps,
+            },
+        );
+        self.reveals_used.insert(index, 0);
+        self.pubkey_index.insert(pubkey_hash, index);
+        self.deposit_history.push(QueuedDeposit {
+            pubkey_hash,
+            deposit_epoch: self.epoch,
+            amount_sat: *amount_sat,
+        });
         Ok(charge)
     }
 
@@ -4156,10 +4628,14 @@ mod tests {
 
     // ── Funded/signed staking fixtures ──────────────────────────────────────
     //
-    // The post-flag-day paths (`apply_deposit`, `apply_exit`,
+    // The post-flag-day exit/delegation paths (`apply_exit`,
     // `apply_delegation`) verify through `staking::HybridKeyVerifier`, whose
     // AND-composition and split points are pinned by staking.rs's own tests;
     // here the verifier is a switchboard so a test can fail exactly one half.
+    // Registration fixtures go through the ONE funded path — a conserving
+    // `DepositV2` applied via `apply_transaction` — never a side door: the
+    // committed pubkey is then the FRAMED wire bytes, exactly what mainnet
+    // will commit, which is what the exit tests must bind against.
 
     struct ToyHybridKeys {
         accept_mldsa: bool,
@@ -4179,24 +4655,32 @@ mod tests {
         ToyHybridKeys { accept_mldsa: true, accept_falcon: true }
     }
 
-    /// A well-formed funded deposit for a fresh `tag`-patterned raw hybrid
-    /// key — the committed shape `apply_deposit` registers.
-    fn funded_deposit_tx(tag: u8) -> staking::DepositTx {
-        staking::DepositTx {
-            suite: staking::SUITE_MLDSA65_FALCON1024,
-            amount_sat: staking::MIN_DEPOSIT_SAT,
-            validator_pubkey: [tag; staking::HYBRID_PK_BYTES],
-            randao_commitment: [tag ^ 0xFF; 32],
-            withdrawal_addr: [tag; 32],
-            // ML-DSA half + a plausible Falcon half, as in staking.rs tests.
-            proof_of_possession: vec![0u8; staking::MLDSA65_SIG_BYTES + 1280],
-        }
-    }
-
-    /// The one shape a deposit input may have in Genesis-4: transparent,
-    /// untainted (the taint set is retired and empty).
-    fn clean_deposit_inputs() -> Vec<staking::DepositInput> {
-        vec![staking::DepositInput { transparent: true, tainted: false }]
+    /// Register a fresh validator through the ONE funded path: seed a coin,
+    /// build a conserving `DepositV2` for the `tag`-patterned framed key
+    /// ([`framed_validator_key`]), and apply it via `apply_transaction` with
+    /// the funded gate opened for exactly this call. Returns the new index.
+    ///
+    /// This is the successor of the retired `apply_deposit` fixture seam:
+    /// registration in tests takes the same road a block takes, so the
+    /// committed pubkey (and therefore the exit identity hash) is the framed
+    /// wire form, never a second convention.
+    fn register_funded_validator(st: &mut CommittedState, tag: u8) -> u32 {
+        let owner = owner_key(tag);
+        let coin = opening(0xE0u8 ^ tag, 9, 30_000_000_000_000, &owner);
+        st.eutxos.insert(coin.clone());
+        let price = st.next_base_fee();
+        let tx = deposit_v2_funding(
+            std::slice::from_ref(&coin),
+            &owner,
+            &framed_validator_key(tag),
+            staking::MIN_DEPOSIT_SAT,
+            script_of(&owner),
+            price,
+        );
+        let _open = crate::params::rehearsal::deposit_funding_open_guard();
+        st.apply_transaction(&tx, 0, price, &ToyVerifier)
+            .expect("a conserving funded deposit must register");
+        *st.validators.keys().next_back().expect("just registered")
     }
 
     /// A signed exit for the given committed record, at `epoch`.
@@ -5244,83 +5728,108 @@ mod tests {
         assert!(st.randao_mix_at(3).is_none());
     }
 
-    /// The activation pipeline, now fed by the FUNDED path: `apply_deposit`
-    /// registers the record (this test moves the flag day; the shipped
-    /// constant is inert `u64::MAX`), the queue schedules it, and the epoch
-    /// walk activates it. The legacy tag-0x02 inclusion this test used to
-    /// drive is consensus-rejected at every epoch — see
+    /// The activation pipeline, fed by the ONE funded path: a conserving
+    /// `DepositV2` (this test opens the gate; the shipped constant is inert
+    /// `u64::MAX`) registers the record, the queue schedules it, and the
+    /// epoch walk activates it. The legacy tag-0x02 inclusion this test used
+    /// to drive is consensus-rejected at every epoch — see
     /// `legacy_staking_messages_are_consensus_rejected_at_every_epoch`.
     #[test]
     fn deposit_queues_and_activates_through_the_epoch_pipeline() {
-        crate::params::rehearsal::with_funded_staking_activation_at(0, || {
-            let (t, g, _chains) = setup(4);
-            let mut st = g.clone();
+        let (t, g, _chains) = setup(4);
+        let mut st = g.clone();
 
-            // Included during epoch 1 — walk one boundary first, as the old
-            // block-carried inclusion did.
+        // Included during epoch 1 — walk one boundary first, as the old
+        // block-carried inclusion did.
+        st = t.process_epoch(&st).unwrap();
+        assert_eq!(st.epoch, 1);
+        let new_index = register_funded_validator(&mut st, 0xAA);
+        assert_eq!(new_index, 4, "next free index is a function of the registry");
+
+        let rec = st.validator_record(new_index).expect("deposit must register a record");
+        assert_eq!(rec.activation_epoch, u64::MAX, "not scheduled until the queue admits it");
+        assert_eq!(
+            rec.pubkey,
+            framed_validator_key(0xAA),
+            "the committed identity is the FRAMED wire bytes"
+        );
+        assert!(
+            !st.active_validators().iter().any(|v| v.index == new_index),
+            "a queued validator has no duties"
+        );
+
+        // Walk the boundaries to the activation epoch: deposit at epoch 1
+        // → eligible at 1 + ACTIVATION_DELAY_EPOCHS.
+        let expected = 1 + staking::ACTIVATION_DELAY_EPOCHS;
+        while st.epoch < expected {
             st = t.process_epoch(&st).unwrap();
-            assert_eq!(st.epoch, 1);
-            let tx = funded_deposit_tx(0xAA);
-            let new_index = st
-                .apply_deposit(&tx, &clean_deposit_inputs(), 500, 0, &accept_all_keys())
-                .expect("a valid funded deposit must register");
-            assert_eq!(new_index, 4, "next free index is a function of the registry");
+        }
+        let rec = st.validator_record(new_index).unwrap();
+        assert_eq!(rec.activation_epoch, expected);
+        assert!(
+            st.active_validators().iter().any(|v| v.index == new_index),
+            "activated validator must appear in the roster"
+        );
 
-            let rec = st.validator_record(new_index).expect("deposit must register a record");
-            assert_eq!(rec.activation_epoch, u64::MAX, "not scheduled until the queue admits it");
-            assert!(
-                !st.active_validators().iter().any(|v| v.index == new_index),
-                "a queued validator has no duties"
+        // A second deposit of the same key, funded by different real coins,
+        // is a deterministic reject — the top-up decision the interface
+        // refuses to make implicitly (pinned again, block-level, in
+        // `funded_deposit_registration_rules_still_bind`).
+        {
+            let _open = crate::params::rehearsal::deposit_funding_open_guard();
+            let owner = owner_key(0x37);
+            let coin = opening(0xDD, 3, 30_000_000_000_000, &owner);
+            let mut probe = st.clone();
+            probe.eutxos.insert(coin.clone());
+            let price = probe.next_base_fee();
+            let dup = deposit_v2_funding(
+                std::slice::from_ref(&coin),
+                &owner,
+                &framed_validator_key(0xAA),
+                staking::MIN_DEPOSIT_SAT,
+                script_of(&owner),
+                price,
             );
-
-            // Walk the boundaries to the activation epoch: deposit at epoch 1
-            // → eligible at 1 + ACTIVATION_DELAY_EPOCHS.
-            let expected = 1 + staking::ACTIVATION_DELAY_EPOCHS;
-            while st.epoch < expected {
-                st = t.process_epoch(&st).unwrap();
-            }
-            let rec = st.validator_record(new_index).unwrap();
-            assert_eq!(rec.activation_epoch, expected);
-            assert!(
-                st.active_validators().iter().any(|v| v.index == new_index),
-                "activated validator must appear in the roster"
-            );
-
-            // A second deposit of the same pubkey is a deterministic reject —
-            // the top-up decision the interface refuses to make implicitly.
-            let mut dup = funded_deposit_tx(0xAA);
-            dup.randao_commitment = [0xDD; 32];
             assert_eq!(
-                st.clone().apply_deposit(&dup, &clean_deposit_inputs(), 500, 0, &accept_all_keys()),
+                probe.apply_transaction(&dup, 0, price, &ToyVerifier),
                 Err(TxReject::StakingRule)
             );
 
-            // And the one deposit rule is actually consulted: a PoP that
-            // fails one hybrid half is the rule's own verdict, relayed.
-            let fresh = funded_deposit_tx(0xAB);
-            let mldsa_only = ToyHybridKeys { accept_mldsa: true, accept_falcon: false };
+            // And a PoP failure is the rule's own verdict, relayed under the
+            // canonical taxonomy.
+            let mut no_pop = deposit_v2_funding(
+                std::slice::from_ref(&coin),
+                &owner,
+                &framed_validator_key(0xAB),
+                staking::MIN_DEPOSIT_SAT,
+                script_of(&owner),
+                price,
+            );
+            if let PosTransaction::DepositV2 { proof_of_possession, .. } = &mut no_pop {
+                *proof_of_possession = vec![0x00; 32];
+            }
+            let mut probe = st.clone();
+            probe.eutxos.insert(coin.clone());
             assert_eq!(
-                st.clone().apply_deposit(&fresh, &clean_deposit_inputs(), 500, 0, &mldsa_only),
+                probe.apply_transaction(&no_pop, 0, price, &ToyVerifier),
                 Err(TxReject::Deposit(staking::DepositReject::BadProofOfPossession))
             );
-        });
+        }
     }
 
     /// The exit lifecycle, now through the SIGNED path: a validator
-    /// registered by `apply_deposit` and activated by the queue exits through
-    /// `apply_exit`, which routes the one exit rule
-    /// (`staking::validate_exit`) against the key as committed. Both flag
-    /// days are moved here; shipped, both are inert `u64::MAX`.
+    /// registered by a funded `DepositV2` and activated by the queue exits
+    /// through `apply_exit`, which routes the one exit rule
+    /// (`staking::validate_exit`) against the key as committed — the FRAMED
+    /// wire bytes. The exit flag day is moved here; shipped it is inert
+    /// `u64::MAX`.
     #[test]
     fn exit_schedules_duty_stop_and_withdrawal_delay() {
-        crate::params::rehearsal::with_funded_staking_activation_at(0, || {
+        {
             crate::params::rehearsal::with_signed_exit_activation_at(0, || {
                 let (t, g, _chains) = setup(4);
                 let mut st = g.clone();
-                let tx = funded_deposit_tx(0xAB);
-                let idx = st
-                    .apply_deposit(&tx, &clean_deposit_inputs(), 500, 0, &accept_all_keys())
-                    .unwrap();
+                let idx = register_funded_validator(&mut st, 0xAB);
                 let expected_activation = staking::ACTIVATION_DELAY_EPOCHS;
                 while st.epoch < expected_activation {
                     st = t.process_epoch(&st).unwrap();
@@ -5353,7 +5862,7 @@ mod tests {
                     Err(TxReject::Exit(staking::ExitReject::AlreadyExited))
                 );
             });
-        });
+        }
     }
 
     /// What `apply_exit` refuses, and under whose taxonomy. The signature
@@ -5364,14 +5873,11 @@ mod tests {
     /// refusal, and none of them mutates state.
     #[test]
     fn apply_exit_binds_to_the_registered_key() {
-        crate::params::rehearsal::with_funded_staking_activation_at(0, || {
+        {
             crate::params::rehearsal::with_signed_exit_activation_at(0, || {
                 let (t, g, _chains) = setup(4);
                 let mut st = g.clone();
-                let tx = funded_deposit_tx(0xAB);
-                let idx = st
-                    .apply_deposit(&tx, &clean_deposit_inputs(), 500, 0, &accept_all_keys())
-                    .unwrap();
+                let idx = register_funded_validator(&mut st, 0xAB);
                 while st.epoch < staking::ACTIVATION_DELAY_EPOCHS {
                     st = t.process_epoch(&st).unwrap();
                 }
@@ -5415,7 +5921,7 @@ mod tests {
                 assert_eq!(st.validator_record(idx).unwrap().exit_epoch, u64::MAX);
                 assert_eq!(st.validator_record(0).unwrap().exit_epoch, u64::MAX);
             });
-        });
+        }
     }
 
     /// **The 2026-08-31 closure, block level.** The legacy staking encodings
@@ -5503,14 +6009,27 @@ mod tests {
     #[test]
     fn funded_staking_activates_at_its_flag_day_and_not_before() {
         crate::params::rehearsal::with_funded_staking_activation_at(2, || {
-            let (t, g, _chains) = setup(4);
-            // Epoch 1 = activation − 1: the boundary's near side.
+            let owner = owner_key(0x2E);
+            let coin = opening(0x9E, 0, 30_000_000_000_000, &owner);
+            let (t, g, _chains) = setup_funded(4, std::slice::from_ref(&coin));
+            // Epoch 1 = activation − 1: the boundary's near side. The funded
+            // wire format is a format like tag 0x06: before the flag day the
+            // verdict is FormatNotActive (the old binary's road is
+            // UnknownTag(0x07)); the delegation seam says StakingNotActive.
             let mut st = t.process_epoch(&g).unwrap();
             assert_eq!(st.epoch, 1);
-            let tx = funded_deposit_tx(0xAA);
+            let price = st.next_base_fee();
+            let tx = deposit_v2_funding(
+                std::slice::from_ref(&coin),
+                &owner,
+                &framed_validator_key(0xAA),
+                staking::MIN_DEPOSIT_SAT,
+                script_of(&owner),
+                price,
+            );
             assert_eq!(
-                st.apply_deposit(&tx, &clean_deposit_inputs(), 500, 0, &accept_all_keys()),
-                Err(TxReject::StakingNotActive)
+                st.apply_transaction(&tx, 0, price, &ToyVerifier),
+                Err(TxReject::Transfer(TransferReject::FormatNotActive))
             );
             assert_eq!(
                 st.apply_delegation(900, 0, delegation::MIN_DELEGATION_SAT),
@@ -5519,12 +6038,23 @@ mod tests {
             assert!(st.deposit_history.is_empty());
             assert!(st.delegations.is_empty());
 
-            // Epoch 2 = activation: both apply.
+            // Epoch 2 = activation: both apply. The deposit is rebuilt at
+            // this epoch's base fee — conservation is priced by the market,
+            // not by the fixture.
             st = t.process_epoch(&st).unwrap();
             assert_eq!(st.epoch, 2);
-            let idx = st
-                .apply_deposit(&tx, &clean_deposit_inputs(), 500, 0, &accept_all_keys())
+            let price = st.next_base_fee();
+            let tx = deposit_v2_funding(
+                std::slice::from_ref(&coin),
+                &owner,
+                &framed_validator_key(0xAA),
+                staking::MIN_DEPOSIT_SAT,
+                script_of(&owner),
+                price,
+            );
+            st.apply_transaction(&tx, 0, price, &ToyVerifier)
                 .expect("at the flag day the funded deposit applies");
+            let idx = *st.validators.keys().next_back().unwrap();
             assert_eq!(idx, 4);
             st.apply_delegation(900, 0, delegation::MIN_DELEGATION_SAT)
                 .expect("at the flag day the funded delegation applies");
@@ -5552,20 +6082,11 @@ mod tests {
     /// refused.
     #[test]
     fn signed_exits_activate_at_their_flag_day_and_not_before() {
-        // Registration needs the funded path, so open it just to build the
-        // fixture, then let it lapse: `with_` restores on the way out.
+        // Registration needs the funded path, so the helper opens its gate
+        // just to build the fixture, then lets it lapse (guard drop).
         let (t, g, _chains) = setup(4);
         let mut st = g.clone();
-        let idx = crate::params::rehearsal::with_funded_staking_activation_at(0, || {
-            st.apply_deposit(
-                &funded_deposit_tx(0xAB),
-                &clean_deposit_inputs(),
-                500,
-                0,
-                &accept_all_keys(),
-            )
-            .unwrap()
-        });
+        let idx = register_funded_validator(&mut st, 0xAB);
         while st.epoch < staking::ACTIVATION_DELAY_EPOCHS {
             st = t.process_epoch(&st).unwrap();
         }
@@ -5590,16 +6111,24 @@ mod tests {
                 st.epoch + staking::EXIT_DELAY_EPOCHS
             );
 
-            // Exits being open does not open the funded formats.
+            // Exits being open does not open the funded formats: the wire
+            // deposit is still an inactive format, the delegation seam is
+            // still closed.
+            let owner = owner_key(0x2F);
+            let coin = opening(0x9F, 0, 30_000_000_000_000, &owner);
+            st.eutxos.insert(coin.clone());
+            let price = st.next_base_fee();
+            let dep = deposit_v2_funding(
+                std::slice::from_ref(&coin),
+                &owner,
+                &framed_validator_key(0xAC),
+                staking::MIN_DEPOSIT_SAT,
+                script_of(&owner),
+                price,
+            );
             assert_eq!(
-                st.apply_deposit(
-                    &funded_deposit_tx(0xAC),
-                    &clean_deposit_inputs(),
-                    500,
-                    0,
-                    &accept_all_keys()
-                ),
-                Err(TxReject::StakingNotActive)
+                st.apply_transaction(&dep, 0, price, &ToyVerifier),
+                Err(TxReject::Transfer(TransferReject::FormatNotActive))
             );
             assert_eq!(
                 st.apply_delegation(901, 0, delegation::MIN_DELEGATION_SAT),
@@ -5617,18 +6146,25 @@ mod tests {
     fn staking_flag_days_ship_inert() {
         assert_eq!(crate::params::FUNDED_STAKING_ACTIVATION_EPOCH, u64::MAX);
         assert_eq!(crate::params::SIGNED_EXIT_ACTIVATION_EPOCH, u64::MAX);
-        // And through the un-overridden readers, the paths refuse.
-        let (_t, g, _chains) = setup(4);
+        // And through the un-overridden readers, the paths refuse: the wire
+        // deposit as an inactive FORMAT, the delegation and exit seams under
+        // the staking taxonomy.
+        let owner = owner_key(0x2D);
+        let coin = opening(0x9D, 0, 30_000_000_000_000, &owner);
+        let (_t, g, _chains) = setup_funded(4, std::slice::from_ref(&coin));
         let mut st = g.clone();
+        let price = st.next_base_fee();
+        let dep = deposit_v2_funding(
+            std::slice::from_ref(&coin),
+            &owner,
+            &framed_validator_key(0xAA),
+            staking::MIN_DEPOSIT_SAT,
+            script_of(&owner),
+            price,
+        );
         assert_eq!(
-            st.apply_deposit(
-                &funded_deposit_tx(0xAA),
-                &clean_deposit_inputs(),
-                500,
-                0,
-                &accept_all_keys()
-            ),
-            Err(TxReject::StakingNotActive)
+            st.apply_transaction(&dep, 0, price, &ToyVerifier),
+            Err(TxReject::Transfer(TransferReject::FormatNotActive))
         );
         assert_eq!(
             st.apply_delegation(900, 0, delegation::MIN_DELEGATION_SAT),
@@ -5637,6 +6173,547 @@ mod tests {
         let rec = st.validator_record(0).unwrap();
         let exit = exit_tx_for(&rec, st.epoch);
         assert_eq!(st.apply_exit(&exit, &accept_all_keys()), Err(TxReject::StakingNotActive));
+    }
+
+    // ── Funded deposits (tag 0x07) ──────────────────────────────────────────
+
+    /// A well-formed suite-framed hybrid validator key: real geometry
+    /// ([`staking::FRAMED_HYBRID_PK_BYTES`]), toy bytes. The transition
+    /// checks the frame, not the algebra — the algebra lives behind the
+    /// injected verifier, as everywhere in this crate.
+    fn framed_validator_key(tag: u8) -> Vec<u8> {
+        let mut k = Vec::with_capacity(staking::FRAMED_HYBRID_PK_BYTES);
+        k.extend_from_slice(&staking::SUITE_FRAME_MAGIC);
+        k.extend_from_slice(&staking::SUITE_MLDSA65_FALCON1024.to_le_bytes());
+        k.extend_from_slice(&vec![tag; staking::HYBRID_PK_BYTES]);
+        k
+    }
+
+    /// Sign a funded deposit correctly: every funding witness under `owner`
+    /// over the DS_DEPOSIT_FUND root, the PoP under the deposit's own
+    /// validator key over the §7.1 root. Separate from construction for the
+    /// same reason as [`resign`]: a negative test must be able to break ONE
+    /// signature deliberately, not every signature by accident.
+    fn sign_deposit_v2(tx: &mut PosTransaction, owner: &[u8]) {
+        let root = tx.spend_signing_root();
+        let pop_root =
+            tx.deposit_pop_signing_root().expect("fixture keys are well-formed frames");
+        if let PosTransaction::DepositV2 { inputs, pubkey, proof_of_possession, .. } = tx {
+            let pk = pubkey.clone();
+            for i in inputs.iter_mut() {
+                i.signature = toy_sign(owner, &root);
+            }
+            *proof_of_possession = toy_sign(&pk, &pop_root);
+        }
+    }
+
+    /// A conserving funded deposit: spends `entries` whole, bonds `amount`,
+    /// returns the remainder after the market's fee as change. The fee comes
+    /// from the **same** `fee_market::charge` call the transition makes —
+    /// class term `inputs + 1`, exactly as `apply_deposit_v2` derives it.
+    fn deposit_v2_funding(
+        entries: &[crate::state_root::EutxoEntry],
+        owner: &[u8],
+        validator_key: &[u8],
+        amount_sat: u128,
+        change_to: [u8; 32],
+        price: u128,
+    ) -> PosTransaction {
+        let inputs: Vec<TransferInput> = entries
+            .iter()
+            .map(|e| TransferInput {
+                txid: e.txid,
+                vout: e.vout,
+                pubkey: owner.to_vec(),
+                // Right LENGTH, wrong bytes: the real signature goes in below.
+                signature: vec![0u8; 32],
+            })
+            .collect();
+        let spent: u128 = entries.iter().map(|e| e.value as u128).sum();
+
+        let probe = PosTransaction::DepositV2 {
+            inputs: inputs.clone(),
+            pubkey: validator_key.to_vec(),
+            amount_sat,
+            randao_commitment: [0xC0; 32],
+            withdrawal_addr: change_to,
+            commission_bps: 500,
+            proof_of_possession: vec![0u8; 32],
+            change: vec![TransferOutput { value: 0, script_hash: change_to }],
+            tx_bytes: 0,
+            tip_millisat_per_gas: 0,
+        };
+        let tx_bytes = probe.canonical_bytes().len() as u64;
+
+        let charge = fee_market::charge(
+            fee_market::TxClass::Eutxo { inputs: inputs.len() as u32 + 1 },
+            tx_bytes,
+            price,
+            0,
+        );
+        let fee = charge.base_fee_sat + charge.priority_fee_sat;
+        assert!(
+            spent >= amount_sat + fee,
+            "fixture underfunded: {spent} sat cannot bond {amount_sat} and pay {fee}"
+        );
+        let change = (spent - amount_sat - fee) as u64;
+
+        let mut tx = PosTransaction::DepositV2 {
+            inputs,
+            pubkey: validator_key.to_vec(),
+            amount_sat,
+            randao_commitment: [0xC0; 32],
+            withdrawal_addr: change_to,
+            commission_bps: 500,
+            proof_of_possession: vec![0u8; 32],
+            change: vec![TransferOutput { value: change, script_hash: change_to }],
+            tx_bytes,
+            tip_millisat_per_gas: 0,
+        };
+        sign_deposit_v2(&mut tx, owner);
+        tx
+    }
+
+    /// The codec is the exact inverse for tag `0x07`, and identity is
+    /// witness-free: re-encoding signatures or the PoP must not move the
+    /// txid (that is transaction malleability), while any SIGNED field must.
+    #[test]
+    fn funded_deposit_round_trips_and_its_identity_is_witness_free() {
+        let owner = owner_key(0x50);
+        let coin = opening(0x90, 0, 30_000_000_000_000, &owner);
+        let tx = deposit_v2_funding(
+            std::slice::from_ref(&coin),
+            &owner,
+            &framed_validator_key(0xA1),
+            staking::MIN_DEPOSIT_SAT,
+            script_of(&owner_key(0x51)),
+            fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+        );
+
+        let decoded = PosTransaction::from_canonical_bytes(&tx.canonical_bytes())
+            .expect("a funded deposit must decode from its own canonical bytes");
+        assert_eq!(decoded, tx);
+
+        // Witness and PoP bytes are outside the signing root, so outside the
+        // txid — a relay re-shaping them cannot move where the change lands.
+        let txid = tx.txid();
+        let mut restamped = tx.clone();
+        if let PosTransaction::DepositV2 { inputs, proof_of_possession, .. } = &mut restamped {
+            inputs[0].signature = vec![0xFF; 64];
+            *proof_of_possession = vec![0xEE; 64];
+        }
+        assert_eq!(restamped.txid(), txid, "witness bytes leaked into the txid");
+
+        // Every registration field IS identity: moving the withdrawal
+        // address must move the txid, or a relay could redirect a principal.
+        let mut redirected = tx.clone();
+        if let PosTransaction::DepositV2 { withdrawal_addr, .. } = &mut redirected {
+            withdrawal_addr[0] ^= 0x01;
+        }
+        assert_ne!(redirected.txid(), txid, "the withdrawal address is outside the txid");
+    }
+
+    /// The flag day arms the funded format — and ONLY the funded format:
+    /// pre-activation `DepositV2` is `FormatNotActive` on the new binary
+    /// (the old one refuses the same block via `UnknownTag(0x07)` — two
+    /// roads, one verdict), and once it binds the format applies. The legacy
+    /// unfunded `Deposit` does not participate in the switch at all: it is
+    /// consensus-rejected at EVERY epoch (`StakingNotActive`), before the
+    /// flag day and after it — a flag day retires nothing here because the
+    /// closure already did.
+    #[test]
+    fn the_deposit_flag_day_arms_the_funded_format_and_the_unfunded_one_stays_dead() {
+        let owner = owner_key(0x52);
+        let coin = opening(0x91, 0, 30_000_000_000_000, &owner);
+        let (_t, g, _chains) = setup_funded(4, std::slice::from_ref(&coin));
+        let funded = deposit_v2_funding(
+            std::slice::from_ref(&coin),
+            &owner,
+            &framed_validator_key(0xA2),
+            staking::MIN_DEPOSIT_SAT,
+            script_of(&owner_key(0x53)),
+            g.next_base_fee(),
+        );
+        let unfunded = PosTransaction::Deposit {
+            pubkey: vec![0xAB; 8],
+            amount_sat: staking::MIN_DEPOSIT_SAT,
+            randao_commitment: [0xCD; 32],
+            withdrawal_credentials: vec![0xEF; 4],
+            commission_bps: 500,
+        };
+
+        // TODAY'S RULES (gate closed — the configuration the fleet runs):
+        // the funded format is refused as inactive, and the unfunded one is
+        // refused by the every-epoch closure.
+        let mut probe = g.clone();
+        assert_eq!(
+            probe.apply_transaction(&funded, 0, g.next_base_fee(), &ToyVerifier),
+            Err(TxReject::Transfer(TransferReject::FormatNotActive)),
+        );
+        let mut probe = g.clone();
+        assert_eq!(
+            probe.apply_transaction(&unfunded, 0, g.next_base_fee(), &ToyVerifier),
+            Err(TxReject::StakingNotActive),
+            "the unfunded shape is dead at every epoch — not waiting for a flag day"
+        );
+
+        // FLAG DAY BOUND (rehearsal): the funded format applies; the
+        // unfunded verdict does not move.
+        let _open = crate::params::rehearsal::deposit_funding_open_guard();
+        let mut probe = g.clone();
+        assert!(
+            probe
+                .apply_transaction(&funded, 0, g.next_base_fee(), &ToyVerifier)
+                .is_ok(),
+            "post-flag-day, a well-formed funded deposit must apply"
+        );
+        let mut probe = g.clone();
+        assert_eq!(
+            probe.apply_transaction(&unfunded, 0, g.next_base_fee(), &ToyVerifier),
+            Err(TxReject::StakingNotActive),
+            "the closure is not undone by the successor's flag day"
+        );
+    }
+
+    /// The property the whole format exists for: a bond is DESTROYED
+    /// spendable coins, auditable as the same strict equality a transfer
+    /// answers to — through a full block, not a unit seam.
+    #[test]
+    fn a_funded_deposit_destroys_spendable_coins_and_creates_the_bond() {
+        let _open = crate::params::rehearsal::deposit_funding_open_guard();
+        let owner = owner_key(0x54);
+        let coin = opening(0x92, 0, 30_000_000_000_000, &owner);
+        let (t, g, mut chains) = setup_funded(4, std::slice::from_ref(&coin));
+
+        let amount = staking::MIN_DEPOSIT_SAT;
+        let change_to = script_of(&owner_key(0x55));
+        let tx = deposit_v2_funding(
+            std::slice::from_ref(&coin),
+            &owner,
+            &framed_validator_key(0xA3),
+            amount,
+            change_to,
+            g.next_base_fee(),
+        );
+        let (tx_bytes, n_inputs) = match &tx {
+            PosTransaction::DepositV2 { tx_bytes, inputs, .. } => (*tx_bytes, inputs.len()),
+            _ => unreachable!(),
+        };
+        let charge = fee_market::charge(
+            fee_market::TxClass::Eutxo { inputs: n_inputs as u32 + 1 },
+            tx_bytes,
+            g.next_base_fee(),
+            0,
+        );
+        let fee = charge.base_fee_sat + charge.priority_fee_sat;
+
+        let before: u128 = g.eutxos.values().map(|e| e.value as u128).sum();
+        let b = build_block(&t, &g, 1, &[], std::slice::from_ref(&tx), &mut chains);
+        let st = t
+            .apply_block(&g, &b, &[], std::slice::from_ref(&tx))
+            .expect("a conserving funded deposit must apply through a full block");
+        let after: u128 = st.eutxos.values().map(|e| e.value as u128).sum();
+
+        // CONSERVATION ACROSS THE TWO POOLS: what left the spendable set is
+        // the bond plus the fee — no more (theft), no less (mint).
+        assert_eq!(before - after, amount + fee, "the bond must be destroyed spendable coins");
+
+        // The coin is gone, the change exists at the deposit's own txid.
+        assert!(!st.eutxos.contains_key(&(coin.txid, coin.vout)), "the input must be consumed");
+        let change_entry =
+            st.eutxos.get(&(tx.txid(), 0)).expect("the change output must be created");
+        assert_eq!(change_entry.script_hash, change_to);
+        assert_eq!(change_entry.value as u128, coin.value as u128 - amount - fee);
+
+        // The registration half: a real record, bonded with the destroyed
+        // value, queued — never active before the queue admits it.
+        let rec = st.validator_record(4).expect("the deposit must register a validator");
+        assert_eq!(rec.staked_sat, amount);
+        assert_eq!(rec.activation_epoch, u64::MAX, "activation still owes the queue");
+        assert_eq!(rec.withdrawal_credentials, change_to.to_vec());
+        assert!(
+            !st.active_validators().iter().any(|v| v.index == 4),
+            "a queued validator has no duties"
+        );
+    }
+
+    /// Rogue-key and no-key registrations: the PoP must verify under the
+    /// deposit's OWN validator key, over the §7.1 domain — not any other
+    /// key, and not any other root.
+    #[test]
+    fn a_deposit_without_possession_of_the_validator_key_is_refused() {
+        let _open = crate::params::rehearsal::deposit_funding_open_guard();
+        let owner = owner_key(0x56);
+        let coin = opening(0x93, 0, 30_000_000_000_000, &owner);
+        let (_t, g, _chains) = setup_funded(4, std::slice::from_ref(&coin));
+        let key = framed_validator_key(0xA4);
+        let good = deposit_v2_funding(
+            std::slice::from_ref(&coin),
+            &owner,
+            &key,
+            staking::MIN_DEPOSIT_SAT,
+            script_of(&owner_key(0x57)),
+            g.next_base_fee(),
+        );
+
+        // Control first: with the right PoP this exact deposit applies, so
+        // every refusal below is about the PoP and nothing else.
+        let mut probe = g.clone();
+        assert!(probe
+            .apply_transaction(&good, 0, g.next_base_fee(), &ToyVerifier)
+            .is_ok());
+
+        // No PoP worth the name: garbage bytes (same LENGTH as a real toy
+        // signature, so the size floor cannot be what refuses it).
+        let mut no_pop = good.clone();
+        if let PosTransaction::DepositV2 { proof_of_possession, .. } = &mut no_pop {
+            *proof_of_possession = vec![0x00; 32];
+        }
+        let mut probe = g.clone();
+        assert_eq!(
+            probe.apply_transaction(&no_pop, 0, g.next_base_fee(), &ToyVerifier),
+            Err(TxReject::Deposit(staking::DepositReject::BadProofOfPossession)),
+            "a deposit with no proof of possession must be refused, by name"
+        );
+
+        // ANOTHER PARTY'S pubkey: a valid-shaped PoP produced by a different
+        // key — the rogue-key registration, claiming key material the
+        // depositor does not hold.
+        let mut rogue = good.clone();
+        let pop_root = rogue.deposit_pop_signing_root().unwrap();
+        if let PosTransaction::DepositV2 { proof_of_possession, .. } = &mut rogue {
+            *proof_of_possession = toy_sign(&framed_validator_key(0xA5), &pop_root);
+        }
+        let mut probe = g.clone();
+        assert_eq!(
+            probe.apply_transaction(&rogue, 0, g.next_base_fee(), &ToyVerifier),
+            Err(TxReject::Deposit(staking::DepositReject::BadProofOfPossession)),
+            "a PoP under someone else's key must not register this pubkey"
+        );
+
+        // The right key over the WRONG DOMAIN: a signature over the spend
+        // root must not double as possession — the two roots answer
+        // different questions and the tags keep them apart.
+        let mut cross = good.clone();
+        let spend_root = cross.spend_signing_root();
+        if let PosTransaction::DepositV2 { pubkey, proof_of_possession, .. } = &mut cross {
+            *proof_of_possession = toy_sign(&pubkey.clone(), &spend_root);
+        }
+        let mut probe = g.clone();
+        assert_eq!(
+            probe.apply_transaction(&cross, 0, g.next_base_fee(), &ToyVerifier),
+            Err(TxReject::Deposit(staking::DepositReject::BadProofOfPossession)),
+            "a signature over the spend domain must not prove key possession"
+        );
+    }
+
+    /// The funding side: a deposit can only consume coins whose owner signed
+    /// THIS deposit, under the deposit's own domain.
+    #[test]
+    fn a_deposit_funded_with_coins_it_does_not_own_is_refused() {
+        let _open = crate::params::rehearsal::deposit_funding_open_guard();
+        let owner = owner_key(0x58);
+        // Same LENGTH as `owner` (equal tag % 5), different bytes: the swap
+        // must not change the encoding's size, or the size floor would fire
+        // before the ownership rule this test is about.
+        let thief = owner_key(0x62);
+        assert_eq!(owner.len(), thief.len());
+        let coin = opening(0x94, 0, 30_000_000_000_000, &owner);
+        let (_t, g, _chains) = setup_funded(4, std::slice::from_ref(&coin));
+        let key = framed_validator_key(0xA6);
+        let good = deposit_v2_funding(
+            std::slice::from_ref(&coin),
+            &owner,
+            &key,
+            staking::MIN_DEPOSIT_SAT,
+            script_of(&owner_key(0x5A)),
+            g.next_base_fee(),
+        );
+
+        // A key that is not the one the output commits to: refused on the
+        // hash, before any signature is even looked at.
+        let mut wrong_key = good.clone();
+        if let PosTransaction::DepositV2 { inputs, .. } = &mut wrong_key {
+            inputs[0].pubkey = thief.clone();
+        }
+        sign_deposit_v2(&mut wrong_key, &thief);
+        let mut probe = g.clone();
+        assert_eq!(
+            probe.apply_transaction(&wrong_key, 0, g.next_base_fee(), &ToyVerifier),
+            Err(TxReject::Transfer(TransferReject::ScriptMismatch)),
+        );
+
+        // The RIGHT key, but a witness taken from the TRANSFER domain over
+        // the same spend points: a signature authorising a payment must
+        // never authorise a bond (DS_DEPOSIT_FUND's whole reason to exist).
+        let mut cross = good.clone();
+        let (points, outs, bytes, tip) = match &cross {
+            PosTransaction::DepositV2 { inputs, change, tx_bytes, tip_millisat_per_gas, .. } => {
+                (inputs.clone(), change.clone(), *tx_bytes, *tip_millisat_per_gas)
+            }
+            _ => unreachable!(),
+        };
+        let transfer_root = PosTransaction::Transfer {
+            inputs: points,
+            outputs: outs,
+            tx_bytes: bytes,
+            tip_millisat_per_gas: tip,
+        }
+        .spend_signing_root();
+        if let PosTransaction::DepositV2 { inputs, .. } = &mut cross {
+            inputs[0].signature = toy_sign(&owner, &transfer_root);
+        }
+        let mut probe = g.clone();
+        assert_eq!(
+            probe.apply_transaction(&cross, 0, g.next_base_fee(), &ToyVerifier),
+            Err(TxReject::Transfer(TransferReject::BadSignature)),
+            "a transfer witness must not fund a bond — the domains must not cross"
+        );
+
+        // An outpoint that is not in the set funds nothing.
+        let mut phantom = good.clone();
+        if let PosTransaction::DepositV2 { inputs, .. } = &mut phantom {
+            inputs[0].vout = 7;
+        }
+        sign_deposit_v2(&mut phantom, &owner);
+        let mut probe = g.clone();
+        assert_eq!(
+            probe.apply_transaction(&phantom, 0, g.next_base_fee(), &ToyVerifier),
+            Err(TxReject::Transfer(TransferReject::UnknownInput)),
+        );
+    }
+
+    /// Conservation is an equality, both directions: a deposit may neither
+    /// mint into its change nor quietly overpay.
+    #[test]
+    fn a_non_conserving_funded_deposit_is_refused() {
+        let _open = crate::params::rehearsal::deposit_funding_open_guard();
+        let owner = owner_key(0x5B);
+        let coin = opening(0x95, 0, 30_000_000_000_000, &owner);
+        let (_t, g, _chains) = setup_funded(4, std::slice::from_ref(&coin));
+        let good = deposit_v2_funding(
+            std::slice::from_ref(&coin),
+            &owner,
+            &framed_validator_key(0xA7),
+            staking::MIN_DEPOSIT_SAT,
+            script_of(&owner_key(0x5C)),
+            g.next_base_fee(),
+        );
+
+        for delta in [1i64, -1i64] {
+            let mut skewed = good.clone();
+            if let PosTransaction::DepositV2 { change, .. } = &mut skewed {
+                change[0].value = change[0].value.checked_add_signed(delta).unwrap();
+            }
+            // Signatures restored, so the reject is conservation — not a
+            // stale witness over the edited field.
+            sign_deposit_v2(&mut skewed, &owner);
+            let mut probe = g.clone();
+            assert_eq!(
+                probe.apply_transaction(&skewed, 0, g.next_base_fee(), &ToyVerifier),
+                Err(TxReject::Transfer(TransferReject::ValueNotConserved)),
+                "one satoshi of skew ({delta}) must already refuse"
+            );
+        }
+    }
+
+    /// The registration rules ride along unchanged: frame, floor, duplicate
+    /// key, and the no-input shape that IS the old defect.
+    #[test]
+    fn funded_deposit_registration_rules_still_bind() {
+        let _open = crate::params::rehearsal::deposit_funding_open_guard();
+        let owner = owner_key(0x5D);
+        let coin = opening(0x96, 0, 30_000_000_000_000, &owner);
+        let coin2 = opening(0x97, 0, 30_000_000_000_000, &owner);
+        let (_t, g, _chains) = setup_funded(4, &[coin.clone(), coin2.clone()]);
+        let key = framed_validator_key(0xA8);
+        let good = deposit_v2_funding(
+            std::slice::from_ref(&coin),
+            &owner,
+            &key,
+            staking::MIN_DEPOSIT_SAT,
+            script_of(&owner_key(0x5E)),
+            g.next_base_fee(),
+        );
+
+        // A bond below the floor — even a perfectly conserving one.
+        let mut probe = g.clone();
+        let mut small = good.clone();
+        if let PosTransaction::DepositV2 { amount_sat, change, .. } = &mut small {
+            *amount_sat -= 1;
+            change[0].value += 1;
+        }
+        sign_deposit_v2(&mut small, &owner);
+        assert_eq!(
+            probe.apply_transaction(&small, 0, g.next_base_fee(), &ToyVerifier),
+            Err(TxReject::Deposit(staking::DepositReject::BelowMinimum)),
+        );
+
+        // A validator key that is not a well-formed frame: wrong suite id,
+        // then wrong length. Re-signed each time, so the refusal is the
+        // frame — these die before any verifier runs. The verdicts differ on
+        // purpose: a parseable frame with the wrong suite is the rule's own
+        // `WrongSuite`, relayed; an unparseable byte string has no §7.1
+        // identity at all and is refused on shape.
+        for (bad_key, verdict) in [
+            (
+                {
+                    let mut k = key.clone();
+                    k[2..4].copy_from_slice(&0x0002u16.to_le_bytes()); // SUITE_MLDSA65_ONLY
+                    k
+                },
+                TxReject::Deposit(staking::DepositReject::WrongSuite),
+            ),
+            (vec![0xA8; 40], TxReject::StakingRule),
+        ] {
+            let mut malformed = good.clone();
+            if let PosTransaction::DepositV2 { pubkey, .. } = &mut malformed {
+                *pubkey = bad_key;
+            }
+            let root = malformed.spend_signing_root();
+            if let PosTransaction::DepositV2 { inputs, .. } = &mut malformed {
+                for i in inputs.iter_mut() {
+                    i.signature = toy_sign(&owner, &root);
+                }
+            }
+            let mut probe = g.clone();
+            assert_eq!(
+                probe.apply_transaction(&malformed, 0, g.next_base_fee(), &ToyVerifier),
+                Err(verdict),
+                "a mis-framed validator key must not register"
+            );
+        }
+
+        // A second deposit of the same key, funded by DIFFERENT real coins:
+        // still one registration per key.
+        let mut st = g.clone();
+        st.apply_transaction(&good, 0, g.next_base_fee(), &ToyVerifier)
+            .expect("control: the first registration applies");
+        let again = deposit_v2_funding(
+            std::slice::from_ref(&coin2),
+            &owner,
+            &key,
+            staking::MIN_DEPOSIT_SAT,
+            script_of(&owner_key(0x5F)),
+            g.next_base_fee(),
+        );
+        assert_eq!(
+            st.apply_transaction(&again, 0, g.next_base_fee(), &ToyVerifier),
+            Err(TxReject::StakingRule),
+            "one key, one registration — the funded path must not open a top-up"
+        );
+
+        // And the no-input shape — the exact defect this format closes — is
+        // refused on structure, before anything else is looked at.
+        let mut unfunded = good.clone();
+        if let PosTransaction::DepositV2 { inputs, .. } = &mut unfunded {
+            inputs.clear();
+        }
+        let mut probe = g.clone();
+        assert_eq!(
+            probe.apply_transaction(&unfunded, 0, g.next_base_fee(), &ToyVerifier),
+            Err(TxReject::Transfer(TransferReject::NoInputs)),
+        );
     }
 
     /// One transfer, charged by the fee market rather than by its own say-so,
@@ -6274,13 +7351,16 @@ mod tests {
 
     /// **A committed vesting lock refuses the owner's own signature until its
     /// epoch — and only until its epoch.** The rule that makes a published
-    /// schedule a fact about the chain: the transfer below is perfectly
-    /// signed, perfectly conserving, and rejected anyway, on both formats.
+    /// schedule a fact about the chain: each spend below is perfectly
+    /// signed, perfectly conserving, and rejected anyway — on every path
+    /// that consumes committed outputs: Transfer, TransferV2, and the funded
+    /// DepositV2.
     ///
-    /// Sabotage this catches: dropping either arm's `unlock_epoch` compare
-    /// turns the first half of each pair into an accepted spend; comparing
-    /// with `>=` instead of `>` fails the second half, where the epoch has
-    /// arrived and the coin must move.
+    /// Sabotage this catches: dropping any arm's `unlock_epoch` compare
+    /// turns the first half of its pair into an accepted spend (for the
+    /// deposit, into a lock-laundering bond); comparing with `>=` instead of
+    /// `>` fails the second half, where the epoch has arrived and the coin
+    /// must move.
     #[test]
     fn a_vesting_locked_output_waits_for_its_epoch_on_both_formats() {
         let alice = owner_key(0x61);
@@ -6322,6 +7402,36 @@ mod tests {
         due.epoch = 5;
         assert!(due.clone().apply_transfer(&tx, price, &ToyVerifier).is_ok());
         assert!(due.clone().apply_transfer_v2(&tx2, price, &ToyVerifier).is_ok());
+
+        // And the FUNDED DEPOSIT format (tag 0x07): bonding is not a lock
+        // bypass either. Without the gate in `apply_deposit_v2`, a locked
+        // coin could be bonded, exited and withdrawn back liquid —
+        // laundering the schedule through the validator registry.
+        let big_locked = crate::state_root::EutxoEntry {
+            unlock_epoch: 5,
+            ..opening(0x93, 7, 30_000_000_000_000, &alice)
+        };
+        let (_t2, g2, _c2) = setup_funded(4, std::slice::from_ref(&big_locked));
+        let price2 = g2.next_base_fee();
+        let dep = deposit_v2_funding(
+            std::slice::from_ref(&big_locked),
+            &alice,
+            &framed_validator_key(0xB7),
+            staking::MIN_DEPOSIT_SAT,
+            script_of(&alice),
+            price2,
+        );
+        let _open = crate::params::rehearsal::deposit_funding_open_guard();
+        let mut probe = g2.clone();
+        assert_eq!(
+            probe.apply_transaction(&dep, 0, price2, &ToyVerifier),
+            Err(TxReject::Transfer(TransferReject::VestingLocked)),
+            "a locked coin must not fund a bond before its epoch"
+        );
+        let mut due2 = g2.clone();
+        due2.epoch = 5;
+        due2.apply_transaction(&dep, 0, price2, &ToyVerifier)
+            .expect("at the unlock epoch the coin may be bonded");
     }
 
     /// **The flag-day seeding: an unspent allocation becomes its tranche
@@ -7270,19 +8380,12 @@ mod tests {
         let spender = owner_key(0x3D);
         let coin = opening(0x79, 0, 100_000_000, &spender);
         let (t, mut g, mut chains) = setup_funded(8, &[coin.clone()]);
-        // The deposit and the delegation enter through the funded paths (flag
-        // day moved for the fixture; the legacy tag-0x02/0x04 carriers are
-        // consensus-rejected at every epoch), so `deposit_history` and
-        // `delegations` are as live as block-carried ones would have been.
+        // The deposit enters through the ONE funded wire path (the helper
+        // opens the gate just for the call) and the delegation through its
+        // seam (flag day moved), so `deposit_history` and `delegations`
+        // are as live as block-carried ones would have been.
+        register_funded_validator(&mut g, 0xAB);
         crate::params::rehearsal::with_funded_staking_activation_at(0, || {
-            g.apply_deposit(
-                &funded_deposit_tx(0xAB),
-                &clean_deposit_inputs(),
-                500,
-                0,
-                &accept_all_keys(),
-            )
-            .unwrap();
             g.apply_delegation(900, 0, delegation::MIN_DELEGATION_SAT).unwrap();
         });
         let fee = transfer_spending(
@@ -7491,19 +8594,11 @@ mod tests {
         let spender = owner_key(0x3F);
         let coin = opening(0x7A, 0, 100_000_000, &spender);
         let (t, mut g, mut chains) = setup_funded(8, &[coin.clone()]);
-        // Deposit and delegation enter through the funded paths before the
-        // chain starts (flag day moved; the legacy tag-0x02/0x04 carriers are
-        // consensus-rejected at every epoch), so both bookkeeping components
-        // are live on every path below.
+        // Deposit (funded wire path) and delegation (its seam, flag day
+        // moved) enter before the chain starts, so both bookkeeping
+        // components are live on every path below.
+        register_funded_validator(&mut g, 0xAB);
         crate::params::rehearsal::with_funded_staking_activation_at(0, || {
-            g.apply_deposit(
-                &funded_deposit_tx(0xAB),
-                &clean_deposit_inputs(),
-                500,
-                0,
-                &accept_all_keys(),
-            )
-            .unwrap();
             g.apply_delegation(900, 0, delegation::MIN_DELEGATION_SAT).unwrap();
         });
         let g = g;
@@ -7819,6 +8914,12 @@ mod tests {
             // the same strict-equality rule, mints nothing.
             PosTransaction::TransferV2 { .. } => {}
             PosTransaction::Deposit { .. } => {}
+            // The funded registration: DESTROYS spendable coins into the
+            // bond under the same strict equality as a transfer
+            // (`sum(inputs) == amount + change + fee`, `apply_deposit_v2`) —
+            // strictly less mintable than the unfunded `Deposit` it retires,
+            // whose bonded `amount_sat` never left the spendable set.
+            PosTransaction::DepositV2 { .. } => {}
             PosTransaction::Exit { .. } => {}
             PosTransaction::Delegate { .. } => {}
             PosTransaction::SlashingEvidence(_) => {}
