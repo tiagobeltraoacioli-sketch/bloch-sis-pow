@@ -141,6 +141,19 @@ pub struct Config {
     /// the server entirely.
     pub rpc_bind: String,
     pub rpc_port: Option<u16>,
+    /// `--accept-new-signing-history`: create a fresh, empty
+    /// slashing-protection store for a keystore that has none. The genuine
+    /// first-boot case only — a key that HAS signed anywhere must carry its
+    /// exported history instead ([`crate::signing_history`]). Off, a
+    /// validator with no history file refuses to start rather than signing
+    /// blind.
+    pub accept_new_signing_history: bool,
+    /// `--doppelganger-epochs`: how many epochs a restarted validator stays
+    /// silent while listening for its own key signing elsewhere
+    /// ([`Doppelganger`]). Default 2. `0` disables the watch — for a chain
+    /// launch orchestrated by one operator, not for a machine whose twin
+    /// might exist.
+    pub doppelganger_epochs: u64,
 }
 
 fn now_ms() -> u64 {
@@ -451,6 +464,48 @@ use state_cell::StateCell;
 #[cfg(test)]
 mod replay_bench;
 
+/// The startup doppelganger watch: is this validator key already live on
+/// another machine?
+///
+/// The signing-history store cannot see a *concurrent* twin — two machines
+/// each hold their own store and each happily advances it (the limitation
+/// its module docs state). What CAN see a twin is the network: an active
+/// validator attests every epoch, and those attestations reach this node's
+/// verified gossip pipeline. So on a restart into an already-running chain
+/// the node stays deliberately silent for a configurable number of epochs
+/// and listens. Any **signature-verified** message from its own validator
+/// index for a slot it provably did not sign — a slot at or after the watch
+/// began, while the watch keeps this node from signing at all — is the same
+/// key signing elsewhere, and the node shuts down instead of joining in and
+/// completing the equivocation.
+///
+/// Honesty about the bounds of this check:
+///
+/// - the watch costs its own duties for the window — the deliberate trade,
+///   liveness paid for safety, same direction as the signing guard;
+/// - it only sees what gossip delivers; a twin on a partitioned network is
+///   invisible until the partition heals;
+/// - two nodes started at the same moment with the same key are BOTH silent
+///   for the window and detect nothing — the watch catches the common
+///   accidents (warm backup still running, restored snapshot, forgotten
+///   systemd unit), not a synchronized double start;
+/// - a boot at the birth of the chain (wall slot 0) skips the watch: no
+///   history exists in which a twin could already have signed.
+///
+/// `watch_from_slot` starts two slots after boot, mirroring the boot grace,
+/// so a message this node's *previous life* signed in the boot slot (crash
+/// and restart within one slot, or ±1 slot of peer clock skew) is not
+/// mistaken for a twin.
+struct Doppelganger {
+    /// First slot at which an observed own-index signature counts as a twin.
+    watch_from_slot: u64,
+    /// Duties stay silent until the wall clock reaches this slot.
+    silent_until_slot: u64,
+    /// Set when a twin was seen; once set, this node never signs again and
+    /// the run loop exits with the message.
+    alarm: Option<String>,
+}
+
 struct Engine {
     manifest: Manifest,
     state: StateCell,
@@ -469,6 +524,19 @@ struct Engine {
     /// keystore, is how you equivocate and get slashed. There is no safe
     /// version of that, so there is this.
     keys: Option<Keystore>,
+    /// Node-local slashing protection ([`crate::signing_history`]): the
+    /// durable record of the highest slot proposed and the highest
+    /// source/target epochs attested, consulted and advanced — fsynced —
+    /// BEFORE every signature this node releases. `Some` whenever `keys` is
+    /// `Some`; a signing engine without it refuses its duties rather than
+    /// signing blind, because an unrecorded signature is one a restart (or a
+    /// restored snapshot) can repeat.
+    guard: Option<crate::signing_history::SigningHistory>,
+    /// The startup doppelganger watch ([`Doppelganger`]): `Some` while this
+    /// node is deliberately silent, listening for its own validator index
+    /// signing elsewhere. `None` on observers, after the watch has expired
+    /// on a clean boot, or when the operator disabled it.
+    doppelganger: Option<Doppelganger>,
     /// Every structurally-valid block seen, canonical or not, by id.
     /// Unpruned — fine for a devnet, listed as a limitation.
     blocks: BTreeMap<[u8; 32], BlockEnvelope>,
@@ -909,6 +977,61 @@ impl Engine {
         chain
     }
 
+    // ── Doppelganger watch ──────────────────────────────────────────────────
+
+    /// True while the watch — or a raised alarm — forbids signing at `slot`.
+    fn doppelganger_silent(&self, slot: u64) -> bool {
+        match &self.doppelganger {
+            None => false,
+            Some(d) => d.alarm.is_some() || slot < d.silent_until_slot,
+        }
+    }
+
+    /// A **signature-verified** message from `validator` for `slot` passed
+    /// through this node. If it is our own index, for a slot inside the
+    /// silent window — a slot this node provably did not sign — the same key
+    /// is live on another machine: raise the alarm, permanently.
+    ///
+    /// The window test is on the *message's* slot, not the wall clock, so a
+    /// twin's attestation from inside the window still convicts when it
+    /// arrives late; and a message from after the window proves nothing
+    /// (past `silent_until_slot` it could be our own signature echoed back).
+    fn doppelganger_observe(&mut self, validator: u32, slot: u64, what: &str) {
+        let Some(our_index) = self.keys.as_ref().map(|k| k.index) else {
+            return;
+        };
+        let Some(d) = self.doppelganger.as_mut() else {
+            return;
+        };
+        if d.alarm.is_some()
+            || validator != our_index
+            || slot < d.watch_from_slot
+            || slot >= d.silent_until_slot
+        {
+            return;
+        }
+        let msg = format!(
+            "DOPPELGANGER DETECTED: a signature-verified {what} by validator {validator} — \
+             THIS node's key — for slot {slot} arrived from the network while this node was \
+             deliberately silent (watching slots {}..{}). The same key is signing on another \
+             machine: a warm backup, a restored snapshot, a systemd unit that was never \
+             stopped. Refusing to ever sign from this process — two live signers is how a \
+             validator equivocates and loses stake. Find and stop the other signer before \
+             starting this node again.",
+            d.watch_from_slot, d.silent_until_slot,
+        );
+        eprintln!("{msg}");
+        d.alarm = Some(msg);
+    }
+
+    /// The alarm, if the watch has convicted a twin. The run loop turns this
+    /// into a process exit; the duty gates treat it as "never sign again".
+    fn doppelganger_alarm(&self) -> Option<&str> {
+        self.doppelganger
+            .as_ref()
+            .and_then(|d| d.alarm.as_deref())
+    }
+
     // ── Duties ──────────────────────────────────────────────────────────────
 
     fn attest(&mut self, slot: u64) {
@@ -917,6 +1040,15 @@ impl Engine {
             return;
         };
         let index = keys.index;
+        // Doppelganger watch: stay silent while listening for this key
+        // signing elsewhere — and forever once it has been seen doing so.
+        if self.doppelganger_silent(slot) {
+            eprintln!(
+                "[slot {slot}] NOT ATTESTING: doppelganger watch \
+                 (listening for validator {index} signing elsewhere)"
+            );
+            return;
+        }
         let e = epoch_of(slot);
         if e == 0 {
             // Epoch 0's checkpoint is genesis — justified by definition;
@@ -939,6 +1071,27 @@ impl Engine {
             target_epoch: e,
             target_root: self.checkpoint_root(e),
         };
+        // Slashing protection, BEFORE the signature exists. `record_attestation`
+        // advances the durable watermark and fsyncs it; only on `Ok` may the
+        // vote be signed. A refusal costs this epoch's attestation reward — the
+        // deliberate trade, because the alternative it prevents is a double or
+        // surround vote worth 5% of stake plus ejection.
+        match self.guard.as_mut() {
+            None => {
+                eprintln!(
+                    "[slot {slot}] NOT ATTESTING: this node holds a validator key but no \
+                     signing-history store — refusing to sign blind (see \
+                     BLOCH-SLASHING-PROTECTION.md)"
+                );
+                return;
+            }
+            Some(g) => {
+                if let Err(e) = g.record_attestation(data.source_epoch, data.target_epoch) {
+                    eprintln!("[slot {slot}] NOT ATTESTING: {e}");
+                    return;
+                }
+            }
+        }
         let signature = self
             .keys
             .as_ref()
@@ -964,6 +1117,14 @@ impl Engine {
             return;
         };
         let index = keys.index;
+        // Doppelganger watch: same gate as `attest`, same reason.
+        if self.doppelganger_silent(slot) {
+            eprintln!(
+                "[slot {slot}] NOT PROPOSING: doppelganger watch \
+                 (listening for validator {index} signing elsewhere)"
+            );
+            return;
+        }
         let e = epoch_of(slot);
         let rolled = self.rolled_to(e);
         let roster = rolled.active_validators();
@@ -1078,6 +1239,27 @@ impl Engine {
         };
         header.state_root = post.state_root();
 
+        // Slashing protection, BEFORE the signature exists. Placed after the
+        // post-state work on purpose: a block the transition refuses must not
+        // burn the slot's watermark, but once the watermark IS advanced (and
+        // fsynced) a crash anywhere below costs one missed slot, never a
+        // second header for a signed slot.
+        match self.guard.as_mut() {
+            None => {
+                eprintln!(
+                    "[slot {slot}] NOT PROPOSING: this node holds a validator key but no \
+                     signing-history store — refusing to sign blind (see \
+                     BLOCH-SLASHING-PROTECTION.md)"
+                );
+                return;
+            }
+            Some(g) => {
+                if let Err(e) = g.record_proposal(slot) {
+                    eprintln!("[slot {slot}] NOT PROPOSING: {e}");
+                    return;
+                }
+            }
+        }
         let proposer_sig = self
             .keys
             .as_ref()
@@ -1173,8 +1355,19 @@ impl Engine {
         if env.header.slot == 0 {
             return; // genesis is synthesized, never received
         }
+        let (proposer, slot) = (env.header.proposer_index, env.header.slot);
         self.blocks.insert(id, env);
         self.advance();
+        // Doppelganger watch, proposal side. Only a block the transition
+        // accepted onto the canonical chain counts: canonical is the one
+        // state in which the proposer's signature is known to have been
+        // verified, and an unverified header's proposer_index is a byte
+        // anyone can write. (A twin's block stranded on a fork evades this
+        // hook — but a live twin also attests every epoch, and the
+        // attestation hook in `apply_decision` sees those.)
+        if self.canonical.contains(&id) {
+            self.doppelganger_observe(proposer, slot, "block proposal");
+        }
         // The block is queryable now, so attestations parked on it can be
         // re-run. `advance()` first: an attestation released here votes on
         // fork choice, and it should see the chain the block already moved.
@@ -1791,6 +1984,11 @@ impl Engine {
                         ev.second.validator, ev.second.data.slot,
                     );
                 }
+                // `Accept` means the pool verified the signature against the
+                // roster — which makes this the doppelganger watch's window
+                // on the world: a verified vote by OUR index, from a slot the
+                // watch kept us silent for, can only be another machine.
+                self.doppelganger_observe(att.validator, att.data.slot, "attestation");
                 self.pool
                     .insert((att.validator, att.data.signing_root()), att);
                 self.net.report(origin, Verdict::Accept);
@@ -2197,6 +2395,121 @@ pub fn run(cfg: Config) -> io::Result<()> {
         }
     }
 
+    // Slashing protection. A validator signs nothing until its signing
+    // history is open, bound to this key and this network, and writable.
+    // Missing or unreadable is a refusal to START, not a downgrade — a
+    // validator that silently signed blind would look healthy right up to
+    // the slashing. The one escape is `--accept-new-signing-history`, the
+    // operator's explicit, logged assertion that this key has never signed.
+    let guard = match keys.as_ref() {
+        None => None,
+        Some(k) => {
+            use crate::signing_history::SigningHistory;
+            let mut g = match SigningHistory::open(&cfg.data_dir) {
+                Ok(g) => g,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    if !cfg.accept_new_signing_history {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "{}/validator.key is present but {}/{} is not. Refusing to \
+                                 run a validator with no record of what its key has signed: \
+                                 if this key ever signed anywhere — another machine, a \
+                                 restored snapshot, a previous install — signing without \
+                                 that record is how validators equivocate and get slashed.\n\
+                                 - If the key HAS signed before: export its history where it \
+                                 ran (`bloch-pos protection-export`) and install it here \
+                                 (`bloch-pos protection-import`) before starting.\n\
+                                 - If the key has GENUINELY never signed on this network: \
+                                 start once with --accept-new-signing-history.",
+                                cfg.data_dir.display(),
+                                cfg.data_dir.display(),
+                                crate::signing_history::HISTORY_FILE,
+                            ),
+                        ));
+                    }
+                    eprintln!(
+                        "########################################################################\n\
+                         # --accept-new-signing-history: creating an EMPTY slashing-protection #\n\
+                         # history for this validator key. You are asserting this key has      #\n\
+                         # NEVER signed a proposal or attestation on this network — not on     #\n\
+                         # another machine, not before a snapshot restore, not anywhere. If    #\n\
+                         # that is wrong, this node can double-sign and the stake WILL be      #\n\
+                         # slashed. Drop the flag after this boot.                             #\n\
+                         ########################################################################"
+                    );
+                    SigningHistory::create_bound(&cfg.data_dir, &digest, &k.pubkey)?
+                }
+                Err(e) => {
+                    return Err(io::Error::new(
+                        e.kind(),
+                        format!(
+                            "cannot read {}/{}: {e}. Refusing to sign over an unreadable \
+                             signing history — repair or re-import it \
+                             (`bloch-pos protection-import`) rather than deleting it.",
+                            cfg.data_dir.display(),
+                            crate::signing_history::HISTORY_FILE,
+                        ),
+                    ));
+                }
+            };
+            g.bind(&digest, &k.pubkey)?;
+            println!(
+                "slashing protection: {} (proposal watermark {}, attestation watermark {})",
+                cfg.data_dir.join(crate::signing_history::HISTORY_FILE).display(),
+                g.highest_proposed_slot()
+                    .map_or("none".to_string(), |n| format!("slot {n}")),
+                g.attestation_watermark()
+                    .map_or("none".to_string(), |(s, t)| format!(
+                        "source e{s}, target e{t}"
+                    )),
+            );
+            Some(g)
+        }
+    };
+
+    // The doppelganger watch (see [`Doppelganger`]). Armed for a validator
+    // joining a chain that is already running; skipped at wall slot 0, where
+    // no history exists in which a twin could already have signed.
+    let doppelganger = match keys.as_ref() {
+        None => None,
+        Some(k) => {
+            let boot_slot =
+                now_ms().saturating_sub(manifest.genesis_time_ms) / manifest.slot_ms.max(1);
+            if cfg.doppelganger_epochs == 0 {
+                eprintln!(
+                    "doppelganger watch DISABLED (--doppelganger-epochs 0): if validator \
+                     {}'s key is live on another machine, nothing here will notice before \
+                     the equivocation",
+                    k.index
+                );
+                None
+            } else if boot_slot == 0 {
+                println!(
+                    "doppelganger watch skipped: booting at the chain's slot 0, where no \
+                     history exists in which this key could already be signing"
+                );
+                None
+            } else {
+                // Two slots of margin, mirroring the boot grace: a signature
+                // our own previous life released in the boot slot must not
+                // read as a twin.
+                let from = boot_slot + 2;
+                let until = from + cfg.doppelganger_epochs * bloch_pos_committee::SLOTS_PER_EPOCH;
+                println!(
+                    "doppelganger watch: silent until slot {until}, listening for validator \
+                     {} signing elsewhere (slots {from}..{until}; --doppelganger-epochs {})",
+                    k.index, cfg.doppelganger_epochs
+                );
+                Some(Doppelganger {
+                    watch_from_slot: from,
+                    silent_until_slot: until,
+                    alarm: None,
+                })
+            }
+        }
+    };
+
     let store = Store::open(&cfg.data_dir, &digest)?;
     let genesis_state = manifest.genesis_state();
     let genesis_id = manifest.genesis_id();
@@ -2284,6 +2597,8 @@ pub fn run(cfg: Config) -> io::Result<()> {
         tr_probe: Transition::new(ProbeVerifier),
         verifier,
         keys,
+        guard,
+        doppelganger,
         blocks: BTreeMap::new(),
         chain: vec![(0, genesis_id)],
         canonical: BTreeSet::from([*genesis_id.as_bytes()]),
@@ -2480,6 +2795,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
     let mut last_attested: u64 = engine.state.slot();
     let mut last_built: u64 = engine.state.slot();
     let mut last_sync_req: u64 = 0;
+    let mut dopp_clear_announced = false;
 
     loop {
         let now = now_ms();
@@ -2512,6 +2828,26 @@ pub fn run(cfg: Config) -> io::Result<()> {
                     crate::codec::hex8(&fin.finalized.root),
                 );
                 return Ok(());
+            }
+        }
+
+        // Doppelganger watch: a raised alarm ends the process — signing
+        // again from here is exactly the accident the watch exists to stop,
+        // and a process that keeps running is a process someone will forget
+        // is refusing its duties.
+        if let Some(msg) = engine.doppelganger_alarm() {
+            return Err(io::Error::new(io::ErrorKind::Other, msg.to_string()));
+        }
+        if !dopp_clear_announced {
+            if let Some(d) = &engine.doppelganger {
+                if slot >= d.silent_until_slot {
+                    println!(
+                        "doppelganger watch clear at slot {slot}: no other signer for this \
+                         key was seen in slots {}..{}; duties enabled",
+                        d.watch_from_slot, d.silent_until_slot
+                    );
+                    dopp_clear_announced = true;
+                }
             }
         }
 
@@ -3830,6 +4166,8 @@ mod transfer_v2_end_to_end {
             tr_probe: Transition::new(ProbeVerifier),
             verifier,
             keys: None,
+            guard: None,
+            doppelganger: None,
             blocks: BTreeMap::new(),
             chain: vec![(0, genesis_id)],
             canonical: BTreeSet::from([*genesis_id.as_bytes()]),
@@ -4115,6 +4453,11 @@ mod perf_support {
             .expect("bind the devnet transport on an ephemeral port"),
         );
         let verifier = HybridVerifier::new(manifest.pubkeys());
+        // The signing engine's invariant: a keystore never signs without its
+        // slashing-protection store (the fixture's key is newborn, so the
+        // empty history is the true one).
+        let guard = crate::signing_history::SigningHistory::create_unbound(&dir, &ks.pubkey)
+            .expect("create the signing-history store");
         let engine = Engine {
             manifest,
             state: StateCell::new(state),
@@ -4122,6 +4465,8 @@ mod perf_support {
             tr_probe: Transition::new(ProbeVerifier),
             verifier,
             keys: Some(ks),
+            guard: Some(guard),
+            doppelganger: None,
             blocks: BTreeMap::new(),
             chain: vec![(0, genesis_id)],
             canonical: BTreeSet::from([*genesis_id.as_bytes()]),
@@ -5400,6 +5745,9 @@ mod duty_view_anchor {
         );
         let verifier = HybridVerifier::new(manifest.pubkeys());
         let ks0 = Keystore::load(&dir.0.join("v0")).expect("re-load validator 0");
+        let guard =
+            crate::signing_history::SigningHistory::create_unbound(&dir.0, &ks0.pubkey)
+                .expect("create the signing-history store");
         let engine = Engine {
             manifest,
             state: StateCell::new(state),
@@ -5407,6 +5755,8 @@ mod duty_view_anchor {
             tr_probe: Transition::new(ProbeVerifier),
             verifier,
             keys: Some(ks0),
+            guard: Some(guard),
+            doppelganger: None,
             blocks: BTreeMap::new(),
             chain: vec![(0, genesis_id)],
             canonical: BTreeSet::from([*genesis_id.as_bytes()]),
@@ -5495,5 +5845,256 @@ mod duty_view_anchor {
             partition_caught_up.len()
         );
         assert!(moved > 0);
+    }
+}
+
+/// Slashing protection at the ENGINE seam: the gates in `propose`/`attest`
+/// really stand between the duty logic and the signature. The store's own
+/// semantics — watermarks, crash windows, snapshots, interchange — are pinned
+/// in `signing_history.rs`; what these tests pin is that the node consults it
+/// and obeys a refusal.
+#[cfg(test)]
+mod signing_guard_tests {
+    use super::*;
+    use bloch_pos_committee::SLOTS_PER_EPOCH;
+
+    /// The restored-snapshot / rewound-data-dir shape, end to end. A reorg
+    /// hands the node's own slot-1 block back — the chain state now looks
+    /// exactly like a rollback to before that block — and the node is asked
+    /// to propose slot 1 again. Without the guard it would sign a second
+    /// header for a signed slot; with it, the slot is refused and the head
+    /// stays put.
+    #[test]
+    fn a_rewound_node_refuses_to_re_sign_a_slot_it_already_proposed() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        let genesis = *engine.chain[0].1.as_bytes();
+
+        engine.propose(1);
+        assert_eq!(engine.chain.len(), 2, "fixture: slot 1 must land");
+
+        // The rewind. The signed block leaves the store entirely, so nothing
+        // below can be "the transition refused a duplicate" — only the guard
+        // stands between the key and a second signature.
+        let signed = *engine.chain[1].1.as_bytes();
+        assert!(engine.do_reorg(genesis, Vec::new()), "hand the block back");
+        engine.blocks.remove(&signed);
+        assert_eq!(engine.chain.len(), 1, "rewound to genesis");
+
+        engine.propose(1);
+        assert_eq!(
+            engine.chain.len(),
+            1,
+            "the guard must refuse slot 1: this key already signed a proposal there"
+        );
+        // The chain is not stuck — the next slot signs normally.
+        engine.propose(2);
+        assert_eq!(engine.chain.len(), 2, "slot 2 is above the watermark and lands");
+    }
+
+    /// Same shape for attestations: one vote per target epoch, ever. The
+    /// pool is cleared between the two calls so the only thing refusing the
+    /// second signature is the guard, not pool dedup.
+    #[test]
+    fn a_second_attestation_for_the_same_target_epoch_is_refused() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        // Reach epoch 1 (attest refuses epoch 0 by construction).
+        for slot in 1..=SLOTS_PER_EPOCH {
+            engine.propose(slot);
+        }
+        // Single validator ⇒ it sits in exactly one committee of epoch 1;
+        // sweep the epoch and let the committee check pick the slot.
+        let mut signed_slot = None;
+        for slot in SLOTS_PER_EPOCH..2 * SLOTS_PER_EPOCH {
+            let before = engine.pool.len();
+            engine.attest(slot);
+            if engine.pool.len() > before {
+                signed_slot = Some(slot);
+                break;
+            }
+        }
+        let slot = signed_slot.expect("the validator must be in one committee of epoch 1");
+
+        // The restart-after-crash / restored-snapshot view: the in-memory
+        // trace of the vote is gone, the durable watermark is not.
+        engine.pool.clear();
+        engine.attest(slot);
+        assert!(
+            engine.pool.is_empty(),
+            "the guard must refuse a second vote for target epoch 1"
+        );
+    }
+
+    /// Requirement: refuse to sign when the store is missing, rather than
+    /// signing blind. An engine holding a key but no guard performs no duty.
+    /// (`run` refuses to even boot this configuration; the engine-level
+    /// refusal is the second lock on the same door.)
+    #[test]
+    fn a_keyed_engine_with_no_history_store_signs_nothing() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        engine.guard = None;
+
+        engine.propose(1);
+        assert_eq!(engine.chain.len(), 1, "no proposal may be signed without the store");
+
+        for slot in 0..2 * SLOTS_PER_EPOCH {
+            engine.attest(slot);
+        }
+        assert!(engine.pool.is_empty(), "no attestation may be signed without the store");
+    }
+
+    /// The record-before-sign ordering, observed from outside: when the
+    /// record cannot be made durable, no signature is released — the duty
+    /// simply does not happen. If signing preceded recording, this test
+    /// would see a block despite the store being unwritable.
+    #[cfg(unix)]
+    #[test]
+    fn when_the_record_cannot_be_written_the_signature_is_never_released() {
+        use std::os::unix::fs::PermissionsExt;
+        let (mut engine, dir) = perf_support::proposing_engine();
+
+        std::fs::set_permissions(&dir.0, std::fs::Permissions::from_mode(0o555))
+            .expect("make the data dir unwritable");
+        engine.propose(1);
+        let produced = engine.chain.len();
+        std::fs::set_permissions(&dir.0, std::fs::Permissions::from_mode(0o755))
+            .expect("restore permissions");
+
+        assert_eq!(
+            produced, 1,
+            "an unrecordable signature must not exist: record-then-sign, never the reverse"
+        );
+        // Nothing was signed, so nothing is burned: the same slot signs once
+        // the store is writable again.
+        engine.propose(1);
+        assert_eq!(engine.chain.len(), 2, "slot 1 lands after the store recovers");
+    }
+
+    // ── The doppelganger watch ──────────────────────────────────────────
+
+    /// A watched engine performs no duty, and the moment a verified
+    /// attestation by its OWN validator index arrives from inside the silent
+    /// window, the alarm latches and the node never signs again — even for
+    /// slots far past the window. The attestation is signed with the real
+    /// key, because that is exactly what a twin holds: the same key.
+    #[test]
+    fn a_twin_attestation_during_the_silent_window_latches_the_alarm() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        engine.doppelganger = Some(Doppelganger {
+            watch_from_slot: 1,
+            silent_until_slot: 1 + 2 * SLOTS_PER_EPOCH,
+            alarm: None,
+        });
+
+        // Silent: no proposal, no attestation, anywhere in the window.
+        engine.propose(1);
+        assert_eq!(engine.chain.len(), 1, "the watch must suppress proposals");
+        engine.attest(SLOTS_PER_EPOCH + 1);
+        assert!(engine.pool.is_empty(), "the watch must suppress attestations");
+
+        // The twin speaks: an attestation by validator 0 — our index — for a
+        // slot the watch kept us silent for, arriving through the verified
+        // pipeline (`Accept` is only ever produced after the pool checked
+        // the signature; that contract is pinned in the gossip crate).
+        let data = AttestationData {
+            slot: 5,
+            head: *engine.chain[0].1.as_bytes(),
+            source_epoch: 0,
+            source_root: [0u8; 32],
+            target_epoch: 1,
+            target_root: [0u8; 32],
+        };
+        let signature = engine.keys.as_ref().unwrap().sign(&data.signing_root());
+        let att = Attestation { data, validator: 0, signature };
+        engine.apply_decision(
+            att,
+            GossipDecision::Accept { slashing_candidate: None },
+            &Origin::none(),
+        );
+        assert!(
+            engine.doppelganger_alarm().is_some(),
+            "a verified own-index attestation from the silent window is a twin"
+        );
+
+        // Latched: past the window, the node still refuses every duty.
+        engine.propose(3 * SLOTS_PER_EPOCH);
+        assert_eq!(
+            engine.chain.len(),
+            1,
+            "after the alarm the node must never sign again"
+        );
+    }
+
+    /// The proposal side of the watch: a canonical block by our own index,
+    /// for a slot inside the silent window, raises the alarm. Built by
+    /// signing a real block and handing it back through `ingest` — the same
+    /// rewind trick as the re-sign test, because a twin's block and our own
+    /// rewound block are indistinguishable by construction.
+    #[test]
+    fn a_twin_canonical_block_during_the_silent_window_latches_the_alarm() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        let genesis = *engine.chain[0].1.as_bytes();
+
+        engine.propose(1);
+        assert_eq!(engine.chain.len(), 2, "fixture: slot 1 must land");
+        let signed = *engine.chain[1].1.as_bytes();
+        let env = engine.blocks.get(&signed).expect("the signed block").clone();
+        assert!(engine.do_reorg(genesis, Vec::new()), "hand the block back");
+        engine.blocks.remove(&signed);
+
+        engine.doppelganger = Some(Doppelganger {
+            watch_from_slot: 1,
+            silent_until_slot: 1 + 2 * SLOTS_PER_EPOCH,
+            alarm: None,
+        });
+        engine.ingest(env);
+        assert!(
+            engine.canonical.contains(&signed),
+            "fixture: the block must come back canonical, or the hook was never reached"
+        );
+        assert!(
+            engine.doppelganger_alarm().is_some(),
+            "a canonical own-index block from the silent window is a twin"
+        );
+    }
+
+    /// What must NOT alarm: our own history arriving during sync (slots
+    /// before the watch began), messages from after the window (past
+    /// `silent_until_slot` they could be our own signatures echoed back),
+    /// and other validators' messages. The watch convicts on exactly one
+    /// shape — own index, inside the window — or it convicts honest restarts.
+    #[test]
+    fn old_own_messages_foreign_messages_and_post_window_messages_do_not_alarm() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        engine.doppelganger = Some(Doppelganger {
+            watch_from_slot: 10,
+            silent_until_slot: 20,
+            alarm: None,
+        });
+        fn vote(engine: &mut Engine, validator: u32, slot: u64) {
+            let data = AttestationData {
+                slot,
+                head: *engine.chain[0].1.as_bytes(),
+                source_epoch: 0,
+                source_root: [0u8; 32],
+                target_epoch: 1,
+                target_root: [0u8; 32],
+            };
+            let signature = engine.keys.as_ref().unwrap().sign(&data.signing_root());
+            let att = Attestation { data, validator, signature };
+            engine.apply_decision(
+                att,
+                GossipDecision::Accept { slashing_candidate: None },
+                &Origin::none(),
+            );
+        }
+        vote(&mut engine, 0, 9); // our index, but before the watch: history syncing in
+        vote(&mut engine, 0, 20); // our index, but at/after the window's end: could be us
+        vote(&mut engine, 7, 15); // inside the window, someone else's index
+        assert!(
+            engine.doppelganger_alarm().is_none(),
+            "none of these shapes proves a twin"
+        );
+        vote(&mut engine, 0, 15); // own index, inside the window: the one convicting shape
+        assert!(engine.doppelganger_alarm().is_some());
     }
 }

@@ -640,6 +640,8 @@ fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
         tr_probe: Transition::new(ProbeVerifier),
         verifier,
         keys: None, // observer: replay proposes nothing and attests nothing
+        guard: None,
+        doppelganger: None,
         blocks: BTreeMap::new(),
         chain: vec![(0, genesis_id)],
         canonical: BTreeSet::from([*genesis_id.as_bytes()]),

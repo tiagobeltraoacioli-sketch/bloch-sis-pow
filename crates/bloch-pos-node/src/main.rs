@@ -49,6 +49,7 @@ mod keys;
 mod net;
 mod p2p;
 mod rpc;
+mod signing_history;
 mod store;
 mod ws_boot;
 
@@ -101,6 +102,8 @@ fn main() {
         Some("genesis") => genesis_cmd(&args[1..]),
         Some("genesis-mainnet") => genesis_mainnet(&args[1..]),
         Some("submit-tx") => submit_tx(&args[1..]),
+        Some("protection-export") => protection_export(&args[1..]),
+        Some("protection-import") => protection_import(&args[1..]),
         Some("run") => run_cmd(&args[1..]),
         Some(other) => {
             eprintln!("{NAME}: unknown command `{other}` (see --help)");
@@ -218,6 +221,38 @@ fn print_help() {
                must accompany --ws-checkpoint. With neither flag the genesis\n\
                anchor is the first checkpoint, which is why a fresh devnet\n\
                boots with no ceremony.\n\
+                         [--accept-new-signing-history]\n\
+               Slashing protection: <dir>/signing_history.bin records the\n\
+               highest slot this key ever proposed and the highest\n\
+               source/target epochs it ever attested, fsynced BEFORE each\n\
+               signature is released, and the node refuses to sign anything\n\
+               at or below those watermarks. A validator whose keystore has\n\
+               no history file REFUSES TO START rather than signing blind.\n\
+               --accept-new-signing-history creates a fresh, empty history —\n\
+               pass it ONLY when this key has genuinely never signed on this\n\
+               network, anywhere. If the key has signed before, carry its\n\
+               history over with protection-export / protection-import\n\
+               instead; an empty history on a used key is how validators get\n\
+               slashed. See docs/specs/BLOCH-SLASHING-PROTECTION.md.\n\
+                         [--doppelganger-epochs <n>]\n\
+               How many epochs a restarting validator stays SILENT while\n\
+               listening for its own key signing elsewhere (default 2). A\n\
+               verified attestation or canonical block by this node's own\n\
+               validator index during that window means the key is live on\n\
+               another machine, and the node shuts down instead of joining\n\
+               in and completing the equivocation. Costs the window's\n\
+               duties on every restart. `0` disables the watch; the watch\n\
+               is also skipped when booting at the chain's slot 0.\n\
+           bloch-pos protection-export --data-dir <dir> [--out <file>]\n\
+               Write the key's signing history in the documented text\n\
+               interchange format (stdout by default). Run this BEFORE\n\
+               moving a validator key to another machine, and carry the\n\
+               file WITH the key.\n\
+           bloch-pos protection-import --data-dir <dir> --from <file>\n\
+               Install (or merge into) <dir>/signing_history.bin from an\n\
+               exported file. Merging only ever RAISES watermarks. Run this\n\
+               on the destination machine BEFORE the first `run` with a\n\
+               migrated key.\n\
          \n\
          The integration plan is docs/specs/BLOCH-POS-NODE-INTEGRATION.md."
     );
@@ -475,19 +510,153 @@ fn keygen(args: &[String]) {
         Ok(ks) => {
             use sha3::{Digest, Sha3_256};
             let pkh: [u8; 32] = Sha3_256::digest(&ks.pubkey).into();
+            // The key is born WITH its slashing-protection store, so a key
+            // never exists without the record of what it has signed (which,
+            // right now, is nothing). It is network-unbound because keygen
+            // cannot know the genesis digest; the first `run` binds it.
+            if let Err(e) =
+                signing_history::SigningHistory::create_unbound(&PathBuf::from(&dir), &ks.pubkey)
+            {
+                eprintln!("keygen: could not create the signing-history store: {e}");
+                exit(1);
+            }
             // Public information only — never a secret byte.
             println!(
                 "wrote {dir}/validator.key (devnet, throwaway): validator {index}, \
-                 pubkey sha3 {}, randao commitment {}",
+                 pubkey sha3 {}, randao commitment {}\n\
+                 wrote {dir}/{} (empty slashing-protection history — travels WITH the key)",
                 codec::hex8(&pkh),
                 codec::hex8(
                     &bloch_pos_committee::beacon::RandaoChain::generate(ks.randao_seed)
                         .commitment()
-                )
+                ),
+                signing_history::HISTORY_FILE,
             );
         }
         Err(e) => {
             eprintln!("keygen failed: {e}");
+            exit(1);
+        }
+    }
+}
+
+/// `protection-export --data-dir <dir> [--out <file>]` — the signing history
+/// in the interchange text format (BLOCH-SLASHING-PROTECTION.md §3).
+///
+/// This is the first half of the only safe key migration: export here, carry
+/// the file WITH the key, `protection-import` on the destination before the
+/// first `run`. Migrating a validator key without its history is exactly how
+/// double-signing happens.
+fn protection_export(args: &[String]) {
+    let Some(dir) = arg_value(args, "--data-dir") else {
+        eprintln!("protection-export: --data-dir is required");
+        exit(2);
+    };
+    let h = match signing_history::SigningHistory::open(&PathBuf::from(&dir)) {
+        Ok(h) => h,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "protection-export: {dir} holds no {}. Nothing to export — and if \
+                 validator.key in that dir HAS signed, its history is lost and the only \
+                 safe course is to treat the key as unsafe to run until the chain has \
+                 moved past everything it could have signed.",
+                signing_history::HISTORY_FILE
+            );
+            exit(1);
+        }
+        Err(e) => {
+            eprintln!("protection-export: cannot read the signing history: {e}");
+            exit(1);
+        }
+    };
+    let text = h.export_text();
+    match arg_value(args, "--out") {
+        None => print!("{text}"),
+        Some(out) => {
+            if let Err(e) = std::fs::write(&out, &text) {
+                eprintln!("protection-export: cannot write {out}: {e}");
+                exit(1);
+            }
+            println!(
+                "wrote {out} — carry this file WITH the key; import it on the destination \
+                 with `bloch-pos protection-import` BEFORE the first run"
+            );
+        }
+    }
+}
+
+/// `protection-import --data-dir <dir> --from <file>` — install or merge a
+/// signing history exported by `protection-export`.
+///
+/// Merging only ever RAISES watermarks (the node ends up refusing more,
+/// never less), refuses a record for a different validator key, and refuses
+/// a record from a different network. If the data dir holds a keystore, the
+/// record must match it.
+fn protection_import(args: &[String]) {
+    let (Some(dir), Some(from)) = (arg_value(args, "--data-dir"), arg_value(args, "--from"))
+    else {
+        eprintln!("protection-import: --data-dir and --from are required");
+        exit(2);
+    };
+    let text = match std::fs::read_to_string(&from) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("protection-import: cannot read {from}: {e}");
+            exit(1);
+        }
+    };
+    let rec = match signing_history::SigningHistory::parse_interchange(&text) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("protection-import: {from} is not a valid interchange file: {e}");
+            exit(1);
+        }
+    };
+    let dir = PathBuf::from(dir);
+    // If the destination already holds the key, the record must be FOR that
+    // key — importing someone else's history protects nothing.
+    match keys::Keystore::load(&dir) {
+        Ok(ks) if ks.pubkey != rec.pubkey => {
+            eprintln!(
+                "protection-import: {from} records the history of a DIFFERENT validator \
+                 key than {}/validator.key; refusing",
+                dir.display()
+            );
+            exit(1);
+        }
+        _ => {} // matching key, or no keystore yet (import-before-key is fine)
+    }
+    match signing_history::SigningHistory::open(&dir) {
+        Ok(mut h) => match h.merge_interchange(&rec) {
+            Ok(summary) => println!(
+                "merged {from} into {}/{}: {summary}",
+                dir.display(),
+                signing_history::HISTORY_FILE
+            ),
+            Err(e) => {
+                eprintln!("protection-import: {e}");
+                exit(1);
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            match signing_history::SigningHistory::create_from_interchange(&dir, &rec) {
+                Ok(h) => println!(
+                    "installed {}/{} (proposal watermark {}, attestation watermark {})",
+                    dir.display(),
+                    signing_history::HISTORY_FILE,
+                    h.highest_proposed_slot()
+                        .map_or("none".to_string(), |n| n.to_string()),
+                    h.attestation_watermark()
+                        .map_or("none".to_string(), |(s, t)| format!("({s}, {t})")),
+                ),
+                Err(e) => {
+                    eprintln!("protection-import: cannot install the history: {e}");
+                    exit(1);
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("protection-import: cannot read the existing history: {e}");
             exit(1);
         }
     }
@@ -840,6 +1009,17 @@ fn run_cmd(args: &[String]) {
         // exposed port is a write surface, not only a read one.
         rpc_bind: arg_value(args, "--rpc-bind").unwrap_or_else(|| "127.0.0.1".to_string()),
         rpc_port,
+        accept_new_signing_history: args.iter().any(|a| a == "--accept-new-signing-history"),
+        doppelganger_epochs: match arg_value(args, "--doppelganger-epochs") {
+            None => 2,
+            Some(v) => match v.parse::<u64>() {
+                Ok(n) => n,
+                Err(_) => {
+                    eprintln!("run: --doppelganger-epochs takes a number of epochs (got `{v}`)");
+                    exit(2);
+                }
+            },
+        },
     };
     if let Err(e) = engine::run(cfg) {
         eprintln!("bloch-pos: {e}");
