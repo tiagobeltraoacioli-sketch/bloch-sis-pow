@@ -46,15 +46,27 @@
 //! chain that contradicts its trust anchor; a node that booted on its own
 //! finality treats it as the WS_CONFLICT alarm, never a reorg.
 //!
+//! ## Checkpoint-sync state download (§4.3.2) — WIRED
+//!
+//! An admitted non-genesis anchor is now a *sync starting point*, not only a
+//! floor: after this gate passes, the engine's acquisition phase
+//! (`engine::run`, using `crate::state_sync`) obtains the checkpoint's
+//! committed state — from a local artifact (`--state-snapshot`) or from
+//! peers in verified chunks (`--state-sync`) — and installs it only after
+//! the recomputed state root reproduces the checkpoint's `state_root`
+//! (`transition::snapshot::restore` is the sole constructor and carries the
+//! check; no transport is trusted). Without either flag the node still
+//! replays from genesis under the anchor, and says how to do better.
+//!
 //! ## Honestly not wired (devnet stage)
 //!
-//! Checkpoint-sync state download (§4.3.2) does not exist — this node syncs
-//! by replaying full blocks from genesis, so a non-genesis anchor is a
-//! *floor and cross-check*, not a sync starting point. Consequently the
-//! `RefuseStale` recovery can only establish "checkpoint descends from local
-//! history" against blocks it already has; a fresh checkpoint beyond the
-//! local head halts for the operator instead of header-syncing forward, and
-//! `--ws-accept-reorg` is not implemented.
+//! The `RefuseStale` recovery can still only establish "checkpoint descends
+//! from local history" against blocks the node already has: a node WITH own
+//! (stale) finality whose fresh checkpoint lies beyond its local head halts
+//! for the operator — adopting it would abandon local history, and
+//! `--ws-accept-reorg` is not implemented. State download moves fresh
+//! installs and nodes without finality of their own; it does not overrule
+//! anyone's database.
 
 use std::fs;
 use std::io;

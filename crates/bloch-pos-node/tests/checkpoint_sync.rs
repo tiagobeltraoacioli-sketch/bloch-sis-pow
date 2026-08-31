@@ -47,9 +47,11 @@ const SLOT_MS: u64 = 1000;
 /// Epoch the checkpoint attests. Its boundary block is the last block before
 /// slot `2 * 32 = 64`.
 const CHECKPOINT_EPOCH: u64 = 2;
-/// Where every node stops. Leaves the synced node room to follow the live
-/// chain after finalization of epoch 2 (~slot 130) plus ceremony time.
-const STOP_SLOT: u64 = 220;
+/// Where every node stops. Finality can skip epochs (a missed epoch delays
+/// the two-round rule, so "finalized >= 2" was measured arriving as late as
+/// FINALIZED epoch 4, ~slot 190); the stop leaves the synced node room after
+/// that plus ceremony time.
+const STOP_SLOT: u64 = 300;
 const GENESIS_START_IN_SECS: u64 = 6;
 
 struct Fleet(Vec<Child>);
@@ -142,18 +144,28 @@ fn spawn_node(dir: &Path, genesis: &Path, listen: u16, rpc: u16, peers: &[u16], 
         .expect("spawn node")
 }
 
-/// Wait until `log` contains `needle`, or fail after `for_secs`.
-fn wait_for_log(log: &Path, needle: &str, for_secs: u64) {
+/// Wait until `log` reports `*** FINALIZED epoch N` with `N >= min_epoch`.
+/// Finality can legitimately SKIP epochs (an epoch that misses justification
+/// delays the two-round rule, and the next finalization jumps past it), so
+/// this parses every finalization line rather than grepping for one literal
+/// epoch — the first version did exactly that and timed out on a healthy
+/// chain that finalized 1 and then 4.
+fn wait_for_finalized(log: &Path, min_epoch: u64, for_secs: u64) {
     let deadline = Instant::now() + Duration::from_secs(for_secs);
     loop {
         if let Ok(s) = std::fs::read_to_string(log) {
-            if s.contains(needle) {
+            let best = s
+                .lines()
+                .filter_map(|l| l.strip_prefix("*** FINALIZED epoch "))
+                .filter_map(|r| r.split_whitespace().next()?.parse::<u64>().ok())
+                .max();
+            if best.is_some_and(|b| b >= min_epoch) {
                 return;
             }
         }
         assert!(
             Instant::now() < deadline,
-            "timed out waiting for `{needle}` in {}:\n{}",
+            "timed out waiting for finalized epoch >= {min_epoch} in {}:\n{}",
             log.display(),
             std::fs::read_to_string(log).unwrap_or_default()
         );
@@ -181,17 +193,17 @@ fn a_node_bootstraps_from_checkpoint_plus_downloaded_state_and_matches_the_repla
     let root = tmp_root();
     let genesis = root.join("genesis.bin");
 
-    // Two founding validators; the syncing node will be an observer with an
-    // EMPTY data dir — no keystore, no donated database, nothing.
-    for i in 0..2 {
+    // Three founding validators (a 2-of-3 quorum tolerates one missed vote
+    // per epoch, which two validators cannot); the syncing node will be an
+    // observer with an EMPTY data dir — no keystore, no donated database.
+    for i in 0..3 {
         let dir = root.join(format!("d{i}"));
         run_to_completion(&["keygen", "--dir", dir.to_str().unwrap(), "--index", &i.to_string()]);
     }
-    let keys = format!(
-        "{},{}",
-        root.join("d0").to_str().unwrap(),
-        root.join("d1").to_str().unwrap()
-    );
+    let keys = (0..3)
+        .map(|i| root.join(format!("d{i}")).to_str().unwrap().to_string())
+        .collect::<Vec<_>>()
+        .join(",");
     run_to_completion(&[
         "genesis",
         "--keys",
@@ -204,26 +216,26 @@ fn a_node_bootstraps_from_checkpoint_plus_downloaded_state_and_matches_the_repla
         &GENESIS_START_IN_SECS.to_string(),
     ]);
 
-    let ports: Vec<u16> = (0..3).map(|_| free_port()).collect();
-    let rpc_ports: Vec<u16> = (0..3).map(|_| free_port()).collect();
+    let ports: Vec<u16> = (0..4).map(|_| free_port()).collect();
+    let rpc_ports: Vec<u16> = (0..4).map(|_| free_port()).collect();
 
     let mut fleet = Fleet(Vec::new());
-    for i in 0..2 {
+    for i in 0..3 {
         fleet.0.push(spawn_node(
             &root.join(format!("d{i}")),
             &genesis,
             ports[i],
             rpc_ports[i],
-            &ports[..2],
+            &ports[..3],
             &root.join(format!("n{i}.log")),
             &[],
         ));
     }
 
-    // ── Wait for finality past the checkpoint epoch on BOTH founders. ──
-    let fin_line = format!("*** FINALIZED epoch {CHECKPOINT_EPOCH}");
-    wait_for_log(&root.join("n0.log"), &fin_line, 200);
-    wait_for_log(&root.join("n1.log"), &fin_line, 60);
+    // ── Wait until finality has passed the checkpoint epoch on BOTH RPC
+    //    witnesses the mint will use. ──
+    wait_for_finalized(&root.join("n0.log"), CHECKPOINT_EPOCH, 260);
+    wait_for_finalized(&root.join("n1.log"), CHECKPOINT_EPOCH, 90);
 
     // ── Mint the checkpoint against both RPCs (they must agree). ──
     let ck_prefix = root.join("wsck");
@@ -349,9 +361,9 @@ fn a_node_bootstraps_from_checkpoint_plus_downloaded_state_and_matches_the_repla
     fleet.0.push(spawn_node(
         &sync_dir,
         &genesis,
-        ports[2],
-        rpc_ports[2],
-        &ports[..2],
+        ports[3],
+        rpc_ports[3],
+        &ports[..3],
         &root.join("sync.log"),
         &[
             "--ws-checkpoint",

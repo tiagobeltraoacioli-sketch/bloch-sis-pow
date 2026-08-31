@@ -111,13 +111,21 @@ out-of-band property the whole mechanism needs.
   be described as decentralised.
 - The published checkpoint can never override a running node's own finality
   (`ws::cross_check`); it moves only fresh installs and the long-offline.
-- `validator_set_root` is all-zeros at this milestone: no node computes a
-  validator-registry SMT root yet, and the genesis anchor carries zeros for
-  the same reason (`engine::run`). The field is in the format so checkpoint
-  -sync state download can use it without a format change.
-- Until checkpoint-sync **state download** exists (`ws_boot.rs` "honestly not
-  wired"), a checkpoint anchors and cross-checks a from-genesis sync; it is
-  not yet a sync starting point.
+- `validator_set_root` is all-zeros at this milestone — and checkpoint-sync
+  state download, now shipped, deliberately does NOT need it: the registry
+  is committed leaf-by-leaf inside `state_root`, so the one root already
+  verifies the downloaded registry (spec §4.3.2-impl). The field stays in
+  the format for a future registry-only fast path; this artifact is
+  unaffected.
+- Checkpoint-sync **state download is wired** (2026-08-31): a node started
+  with `--ws-checkpoint <envelope> --state-sync` downloads the checkpoint's
+  committed state from peers in resumable chunks (or takes a local file via
+  `--state-snapshot`), refuses it unless the recomputed state root
+  reproduces this artifact's `state_root`, and syncs forward from the
+  boundary block instead of replaying from genesis. The serving side exports
+  boundary states automatically at publication epochs; `bloch-pos run
+  --export-state-epoch <E> --export-state-out <file>` produces the artifact
+  for any past epoch by replay.
 
 ## Current artifact — epoch 1536 (mainnet, minted 2026-08-31, UNSIGNED)
 
