@@ -129,7 +129,7 @@ fn print_help() {
                                --spend <txid-hex>:<vout> [--spend ...]\n\
                                --pay <script-hash-hex>:<sat> [--pay ...]\n\
                                [--signature <hex>] [--tx-bytes n]\n\
-                               [--tip millisat-per-gas]\n\
+                               [--tip millisat-per-gas] [--raw]\n\
                Send one Transfer to a running node, which gossips it on.\n\
                --pay order IS the output order (position = vout).\n\
                WITHOUT --signature it prints the signing root and sends\n\
@@ -137,6 +137,11 @@ fn print_help() {
                SAME flags plus --signature. This tool never holds a\n\
                spending key. No acknowledgement: confirmation is seeing\n\
                it in a block.\n\
+               --raw prints the signed transaction's canonical bytes as\n\
+               hex instead of requiring --to: hand that hex to any node's\n\
+               JSON-RPC `sendrawtransaction`, which is how a remote\n\
+               integrator submits through a public RPC endpoint without\n\
+               reaching the (non-public) devnet transport port.\n\
            bloch-pos genesis --keys <dir1,dir2,...> --out <file>\n\
                              [--slot-ms <ms>] [--start-in <secs>]\n\
                              [--alloc <script-hash-hex>:<sat>]...\n\
@@ -259,10 +264,22 @@ fn print_help() {
 /// a keypair on an operator's shell history, and this crate has no business
 /// creating spending keys at all.
 fn submit_tx(args: &[String]) {
-    let Some(to) = arg_value(args, "--to") else {
-        eprintln!("submit-tx: --to <host:port> is required");
+    // `--raw` prints the signed transaction's canonical bytes as hex instead
+    // of sending them, for `sendrawtransaction` over JSON-RPC. It exists for
+    // the party this tool otherwise cannot serve: a REMOTE integrator, who can
+    // reach a public RPC front but must never be able to reach the devnet
+    // transport port (that mesh is unauthenticated by design and stays bound
+    // to loopback / a private interface). With `--raw`, `--to` is optional;
+    // giving both prints the hex AND sends.
+    let raw_out = args.iter().any(|a| a == "--raw");
+    let to = arg_value(args, "--to");
+    if to.is_none() && !raw_out {
+        eprintln!(
+            "submit-tx: --to <host:port> is required (or --raw to print the \
+             canonical hex for JSON-RPC `sendrawtransaction`)"
+        );
         exit(2);
-    };
+    }
     let num = |name: &str, default: u128| -> u128 {
         arg_value(args, name)
             .and_then(|s| s.parse().ok())
@@ -401,6 +418,20 @@ fn submit_tx(args: &[String]) {
         }
     }
     let bytes = tx.canonical_bytes();
+    if raw_out {
+        println!("{}", codec::hex(&bytes));
+        // The txid is derived, never carried — print it so a remote submitter
+        // can confirm the spend with `gettxout(txid, vout)` (whose `finalized`
+        // flag is the settlement judgement), since there is no tx index.
+        eprintln!(
+            "submit-tx: canonical bytes above ({} bytes) — submit them as the \
+             `hex` param of JSON-RPC `sendrawtransaction`.\n\
+             txid {}",
+            bytes.len(),
+            codec::hex32(&tx.txid()),
+        );
+    }
+    let Some(to) = to else { return };
     match bloch_pos_node_net_send(&to, &bytes) {
         Ok(()) => println!(
             "submitted {} bytes to {to} — it lands in a block or it does not; \
