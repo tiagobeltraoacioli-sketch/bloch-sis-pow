@@ -284,18 +284,6 @@ impl FinalityState {
     /// [`Self::denominator_floor_disabled`]. Constant `false` in a release
     /// build.
     #[inline]
-    /// See `params::rehearsal::gates_are_forced_open`. Constant `false` in any
-    /// build that is not a test build, so the gate folds to the shipped one.
-    #[inline]
-    fn gates_forced_open() -> bool {
-        #[cfg(test)]
-        {
-            return crate::params::rehearsal::gates_are_forced_open();
-        }
-        #[cfg(not(test))]
-        false
-    }
-
     fn leak_recovery_disabled() -> bool {
         #[cfg(test)]
         {
@@ -351,16 +339,16 @@ impl FinalityState {
             // Mutation hook, `cfg(test)` only: the arithmetic mainnet ran on
             // 2026-08-24, kept runnable so the incident stays reproducible.
             leak_adjusted
-        } else if !Self::gates_forced_open()
-            && votes.epoch < crate::params::LEAK_RECOVERY_ACTIVATION_EPOCH
-        {
+        } else if votes.epoch < crate::params::leak_recovery_gate_epoch() {
             // GATED. Below the flag day the denominator is the leak-adjusted
             // total with NO floor — the arithmetic the existing chain's blocks
             // were folded under. The floor decides which checkpoints justify,
             // and justification is committed into the state root, so applying
             // it to historical epochs makes this node compute a root the
             // headers do not carry and stops its replay dead. See
-            // `params::LEAK_RECOVERY_ACTIVATION_EPOCH`.
+            // `params::LEAK_RECOVERY_ACTIVATION_EPOCH`; the effective epoch
+            // (rehearsal hooks included) comes from exactly one reader,
+            // `params::leak_recovery_gate_epoch`.
             leak_adjusted
         } else {
             let floor = unleaked_total * MIN_QUORUM_DENOMINATOR_NUM / MIN_QUORUM_DENOMINATOR_DEN;
@@ -494,8 +482,7 @@ impl FinalityState {
         // GATED on the same flag day as the floor: `leaked` is committed into
         // the state root (`state_root.rs`, `leaked: Vec<LeakRecord>`), so
         // recovering it on historical epochs changes the root and stops replay.
-        if (Self::gates_forced_open()
-            || votes.epoch >= crate::params::LEAK_RECOVERY_ACTIVATION_EPOCH)
+        if votes.epoch >= crate::params::leak_recovery_gate_epoch()
             && !Self::leak_recovery_disabled()
         {
             //
@@ -1351,6 +1338,246 @@ mod tests {
         );
         // Meanwhile a validator that stayed away kept paying.
         assert!(st.leaked_of(41) > st.leaked_of(40), "the still-absent validator must owe more");
+    }
+
+    // ── THE FLAG-DAY SEAM ───────────────────────────────────────────────────
+    //
+    // `gates_open_guard` can only model the two endpoints of
+    // `LEAK_RECOVERY_ACTIVATION_EPOCH` — closed everywhere or open everywhere
+    // — and the flag day is neither: it is a binary armed at a FINITE epoch A,
+    // replaying 1,500+ epochs of history below A before ever reaching it. The
+    // three tests here place A inside the fold's reachable range
+    // (`gates_armed_at_guard`) and pin the seam from both sides. The first is
+    // the one that protects the live chain: it is the proof that rolling the
+    // armed binary onto the fleet BEFORE epoch A changes nothing a node
+    // computes, which is the entire safety argument of the rollout.
+
+    /// **Arming the gate is invisible below it — the rollout-safety property.**
+    ///
+    /// The identical vote history — the 2026-08-24 4-of-64 partition, the
+    /// worst history this module knows — is folded twice: once by the shipped
+    /// inert binary and once by a binary armed at epoch `A`, with every folded
+    /// epoch below `A`. The two states must be equal after EVERY epoch, not
+    /// merely at the end: a transient divergence that happens to reconverge
+    /// would still have committed a different state root in between, and the
+    /// root is what the headers carry.
+    ///
+    /// The fold must also still contain the DISEASE: the minority self-
+    /// justifies below the gate, in both runs, at the same epoch. That is not
+    /// a defect of this test — it is its point. The armed binary's replay of
+    /// the existing log must reproduce history's wrong quorums bit for bit,
+    /// because the headers that carry them are already consensus; a binary
+    /// that "fixes" a historical epoch is a binary that parks at it.
+    #[test]
+    fn arming_the_leak_gate_changes_nothing_below_it() {
+        const A: u64 = 40;
+        let committee: Vec<Validator> = (0..64u32).map(|i| validator(i, STAKE_EACH)).collect();
+        let mut inert = FinalityState::new(genesis());
+        let mut armed = FinalityState::new(genesis());
+        let mut first_false_quorum: Option<u64> = None;
+        for e in 1..A {
+            let src = inert.current_justified();
+            let atts: Vec<(u32, AttestationData)> =
+                (0..4u32).map(|v| vote(v, e, root(e as u8), src)).collect();
+            let ev = EpochVotes { epoch: e, active_set: &committee, attestations: &atts };
+            let out_inert = inert.process_epoch(&ev).unwrap();
+            let out_armed = {
+                let _armed = crate::params::rehearsal::gates_armed_at_guard(A);
+                armed.process_epoch(&ev).unwrap()
+            };
+            assert_eq!(
+                out_inert, out_armed,
+                "epoch {e} (below the gate at {A}): the armed binary produced a different \
+                 epoch outcome than the shipped one — the gate is leaking into history"
+            );
+            assert_eq!(
+                inert, armed,
+                "epoch {e} (below the gate at {A}): the armed binary's fold state diverged \
+                 from the shipped one. The state is committed into the root, so this is the \
+                 divergence that parks every replaying node"
+            );
+            if out_inert.justified.is_some() && first_false_quorum.is_none() {
+                first_false_quorum = Some(e);
+            }
+        }
+        let fq = first_false_quorum.expect(
+            "control: the 4-of-64 partition must still self-justify below the gate — if it \
+             cannot, this history no longer contains the incident and the equality above is \
+             proved on the wrong input",
+        );
+        assert!(
+            fq > INACTIVITY_LEAK_THRESHOLD_EPOCHS,
+            "control: the false quorum at {fq} must be the leak's doing, not a 2/3 error"
+        );
+        println!(
+            "SEAM (below): armed-at-{A} and shipped folds are equal after all {} epochs, \
+             INCLUDING the false quorum both reproduce at epoch {fq}",
+            A - 1
+        );
+    }
+
+    /// **The floor binds at exactly `A` — not one epoch before, not one
+    /// after.** Below `A` the armed fold must still produce the historical
+    /// false quorum (the gate must not fire early); from `A` on, the same
+    /// 6.25% partition must never justify again, while a shipped inert fold
+    /// of the same votes keeps self-justifying — the discriminating pair at
+    /// the boundary epoch itself.
+    #[test]
+    fn the_leak_gate_floor_binds_at_its_epoch_and_not_before() {
+        const A: u64 = 30;
+        const HORIZON: u64 = 150;
+        let committee: Vec<Validator> = (0..64u32).map(|i| validator(i, STAKE_EACH)).collect();
+
+        let mut armed_st = FinalityState::new(genesis());
+        let mut inert_st = FinalityState::new(genesis());
+        let mut armed_justified: Vec<u64> = Vec::new();
+        let mut inert_justified: Vec<u64> = Vec::new();
+        for e in 1..=HORIZON {
+            let src_a = armed_st.current_justified();
+            let atts_a: Vec<(u32, AttestationData)> =
+                (0..4u32).map(|v| vote(v, e, root((e % 251) as u8), src_a)).collect();
+            let out_a = {
+                let _armed = crate::params::rehearsal::gates_armed_at_guard(A);
+                armed_st
+                    .process_epoch(&EpochVotes {
+                        epoch: e,
+                        active_set: &committee,
+                        attestations: &atts_a,
+                    })
+                    .unwrap()
+            };
+            if out_a.justified.is_some() {
+                armed_justified.push(e);
+            }
+
+            let src_i = inert_st.current_justified();
+            let atts_i: Vec<(u32, AttestationData)> =
+                (0..4u32).map(|v| vote(v, e, root((e % 251) as u8), src_i)).collect();
+            let out_i = inert_st
+                .process_epoch(&EpochVotes {
+                    epoch: e,
+                    active_set: &committee,
+                    attestations: &atts_i,
+                })
+                .unwrap();
+            if out_i.justified.is_some() {
+                inert_justified.push(e);
+            }
+        }
+
+        // Below A: identical, false quorum included.
+        assert!(
+            armed_justified.iter().any(|e| *e < A),
+            "the armed fold produced NO false quorum below the gate — the floor fired early, \
+             which is precisely the replay-breaking behaviour the gate exists to prevent"
+        );
+        assert_eq!(
+            armed_justified.iter().filter(|e| **e < A).collect::<Vec<_>>(),
+            inert_justified.iter().filter(|e| **e < A).collect::<Vec<_>>(),
+            "below the gate the armed and inert folds must justify the same epochs"
+        );
+        // At and above A: the armed fold never justifies again…
+        assert!(
+            armed_justified.iter().all(|e| *e < A),
+            "THE FLOOR IS NOT BINDING: a 4-of-64 partition justified at epoch(s) {:?} — at or \
+             above the gate — against a denominator floored at half the unleaked total",
+            armed_justified.iter().filter(|e| **e >= A).collect::<Vec<_>>()
+        );
+        // …while the inert fold keeps doing so, so the silence above is the
+        // gate's doing and not the fixture's.
+        assert!(
+            inert_justified.iter().any(|e| *e >= A),
+            "control: the shipped inert fold stopped justifying too, so the assertion above \
+             does not discriminate the gate from the input"
+        );
+        println!(
+            "SEAM (floor): armed-at-{A} justified at {:?} and then never again through epoch \
+             {HORIZON}; the inert fold justified {} more times after {A}",
+            armed_justified,
+            inert_justified.iter().filter(|e| **e >= A).count()
+        );
+    }
+
+    /// **Recovery starts at exactly `A`.** A validator that returned and
+    /// participates holds a frozen scar for every epoch below the gate — the
+    /// "permanent scar" the flag day exists to end — and begins discharging it
+    /// on the FIRST epoch at the gate, strictly monotonically, to zero.
+    #[test]
+    fn leak_recovery_starts_exactly_at_the_gate() {
+        const A: u64 = 30;
+        let _armed = crate::params::rehearsal::gates_armed_at_guard(A);
+        let committee: Vec<Validator> = (0..64u32).map(|i| validator(i, STAKE_EACH)).collect();
+        let mut st = FinalityState::new(genesis());
+
+        // Epochs 1..=9: validator 40 is absent while the chain stalls, so it
+        // accrues a scar.
+        for e in 1..=9u64 {
+            let src = st.current_justified();
+            let atts: Vec<(u32, AttestationData)> =
+                (0..4u32).map(|v| vote(v, e, root(e as u8), src)).collect();
+            st.process_epoch(&EpochVotes { epoch: e, active_set: &committee, attestations: &atts })
+                .unwrap();
+        }
+        let scar = st.leaked_of(40);
+        assert!(scar > 0, "control: validator 40 must carry a scar to discharge");
+
+        // Epochs 10..A: validator 40 is back and votes every epoch. Below the
+        // gate its scar must not move by a single satoshi — participation
+        // spares it the bite, and recovery is not yet consensus.
+        for e in 10..A {
+            let src = st.current_justified();
+            let mut atts: Vec<(u32, AttestationData)> =
+                (0..4u32).map(|v| vote(v, e, root(e as u8), src)).collect();
+            atts.push(vote(40, e, root(e as u8), src));
+            st.process_epoch(&EpochVotes { epoch: e, active_set: &committee, attestations: &atts })
+                .unwrap();
+            assert_eq!(
+                st.leaked_of(40),
+                scar,
+                "epoch {e} (below the gate): the returned validator's scar moved. Downward is \
+                 recovery firing early — a state root history does not carry; upward is a bite \
+                 on a participant"
+            );
+        }
+
+        // From A: the scar discharges, strictly, starting on the gate epoch
+        // itself, and reaches EMPTY — not a small residue. The horizon is
+        // sized by the rate, not guessed: 1/16 per epoch is a (15/16)^k decay,
+        // so a ~2.2e8-satoshi scar needs ~ln(scar/16)/ln(16/15) ≈ 260 epochs
+        // before the max(·,1) floor finishes the last 15 — 400 covers it, and
+        // it is the same horizon the fourth ensaio uses.
+        let mut prev = scar;
+        let mut drained_at = None;
+        for e in A..A + 400 {
+            let src = st.current_justified();
+            let mut atts: Vec<(u32, AttestationData)> =
+                (0..4u32).map(|v| vote(v, e, root(e as u8), src)).collect();
+            atts.push(vote(40, e, root(e as u8), src));
+            st.process_epoch(&EpochVotes { epoch: e, active_set: &committee, attestations: &atts })
+                .unwrap();
+            let now = st.leaked_of(40);
+            if e == A {
+                assert!(
+                    now < prev,
+                    "the gate epoch {A} itself must be the first epoch of recovery — it \
+                     discharged nothing"
+                );
+            }
+            assert!(
+                now < prev || now == 0,
+                "epoch {e} (at/above the gate): a participating validator's scar did not fall"
+            );
+            prev = now;
+            if now == 0 {
+                drained_at = Some(e);
+                break;
+            }
+        }
+        let d = drained_at.expect("the scar must drain to zero in bounded time");
+        println!(
+            "SEAM (recovery): scar of {scar} satoshis frozen for epochs 10..{A}, first \
+             discharged at exactly {A}, empty at {d}"
+        );
     }
 
     /// **The quorum floor is an OWNER'S DECISION, not an engineering default.**

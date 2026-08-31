@@ -1,0 +1,107 @@
+# Activation patch for the two replay gates — DELIBERATELY NOT APPLIED.
+#
+# Carries the placeholder __E_STAR__ so it cannot be applied thoughtlessly:
+# unreplaced, it does not compile. Choose E* by docs/RELANCA-G4-DIAS-DE-BANDEIRA.md
+# §2.2 (re-measure t_replay first), check §2.3 (strictly future AT TAG TIME) and
+# §2.6 (E* > 1400), then:
+#
+#   E=<chosen epoch>
+#   sed "s/__E_STAR__/$E/g" docs/RELANCA-G4-DIAS-DE-BANDEIRA.activation.patch | git apply
+#   cargo test -p bloch-pos-committee --lib
+#
+# The suite then pins $E (the inert tripwire is replaced by the armed one and
+# by the shared-flag-day test of §2.5). Fill the §9 table in the same commit.
+#
+diff --git a/crates/bloch-pos-committee/src/params.rs b/crates/bloch-pos-committee/src/params.rs
+--- a/crates/bloch-pos-committee/src/params.rs
++++ b/crates/bloch-pos-committee/src/params.rs
+@@ -599,7 +599,11 @@ pub mod rehearsal {
+ /// never fired, and it fails SILENTLY. The gate reads the epoch derived from the
+ /// BLOCK, never a local clock: reading node-local mutable state is what caused
+ /// the 2026-08-08 `expected_bits` consensus split.
+-pub const ANCESTRY_SEED_ACTIVATION_EPOCH: u64 = u64::MAX;
++///
++/// ARMED per `docs/RELANCA-G4-DIAS-DE-BANDEIRA.md` (one E* for both gates,
++/// its §2.5). The §9 table must be filled in this same commit, and the
++/// tripwire `the_replay_gates_armed_epoch_matches_the_runbook` pins the value.
++pub const ANCESTRY_SEED_ACTIVATION_EPOCH: u64 = __E_STAR__;
+ 
+ /// Flag day for **inactivity-leak recovery and the quorum-denominator floor**
+ /// ([`INACTIVITY_LEAK_RECOVERY_QUOTIENT`], [`MIN_QUORUM_DENOMINATOR_NUM`]).
+@@ -615,7 +619,11 @@ pub const ANCESTRY_SEED_ACTIVATION_EPOCH: u64 = u64::MAX;
+ /// break point is the first epoch boundary that accrues one.
+ ///
+ /// `u64::MAX` means INERT. Same arming rules as above.
+-pub const LEAK_RECOVERY_ACTIVATION_EPOCH: u64 = u64::MAX;
++///
++/// ARMED at the SAME epoch as [`ANCESTRY_SEED_ACTIVATION_EPOCH`] — one flag
++/// day for both gates (runbook §2.5), pinned by
++/// `the_two_replay_gates_share_one_flag_day`.
++pub const LEAK_RECOVERY_ACTIVATION_EPOCH: u64 = __E_STAR__;
+ 
+ /// The epoch [`ANCESTRY_SEED_ACTIVATION_EPOCH`]'s readers actually compare
+ /// against in THIS build.
+diff --git a/crates/bloch-pos-committee/src/transition.rs b/crates/bloch-pos-committee/src/transition.rs
+--- a/crates/bloch-pos-committee/src/transition.rs
++++ b/crates/bloch-pos-committee/src/transition.rs
+@@ -6912,35 +6912,42 @@ mod tests {
+         );
+     }
+ 
+-    /// The two flag days added for the preserve-history relaunch must stay
+-    /// INERT until they are armed deliberately, and when armed they must match
+-    /// the runbook that is versioned beside them.
+-    ///
+-    /// Same idiom, and the same job, as
+-    /// `leaked_roster_armed_epoch_matches_the_runbook`: a tripwire against a
+-    /// SILENT change of a consensus flag day. Arming either of these in an
+-    /// epoch that is already in the PAST fails silently — the rule simply
+-    /// applies to everything — which is how 1,600,000 BLCH once escaped a
+-    /// write-off that never fired.
++    /// The two flag days of the preserve-history relaunch, ARMED. This is
++    /// `the_replay_compatibility_gates_are_inert_until_armed` with its job
++    /// flipped, not changed: it is still a tripwire — now against a SECOND
++    /// silent move of the epoch, which would be a new flag day needing its
++    /// own fleet rollout, announcement and runbook. The value must equal the
++    /// one in the §9 table of `docs/RELANCA-G4-DIAS-DE-BANDEIRA.md` and in
++    /// the release notes of the armed build.
+     #[test]
+-    fn the_replay_compatibility_gates_are_inert_until_armed() {
++    fn the_replay_gates_armed_epoch_matches_the_runbook() {
+         for (name, value) in [
+             ("ANCESTRY_SEED_ACTIVATION_EPOCH", crate::params::ANCESTRY_SEED_ACTIVATION_EPOCH),
+             ("LEAK_RECOVERY_ACTIVATION_EPOCH", crate::params::LEAK_RECOVERY_ACTIVATION_EPOCH),
+         ] {
+             assert_eq!(
+                 value,
+-                u64::MAX,
+-                "{name} has been armed. That is a deliberate act and it needs three things \
+-                 before this assertion may be updated: (1) the epoch must be STRICTLY IN THE \
+-                 FUTURE at tag time — an epoch already past arms silently and applies the rule \
+-                 to the whole history; (2) it must fall AFTER the rollout completes, since all \
+-                 64 validators stop and restart together; (3) the value must match the runbook \
+-                 versioned in docs/. Update this test in the same commit that arms it."
++                __E_STAR__,
++                "{name} no longer matches the armed epoch the runbook recorded. Changing it \
++                 again is a NEW flag day — rollout, announcement, runbook — never an edit."
+             );
+         }
+     }
+ 
++    /// Runbook §2.5: ONE flag day for both replay gates. Two epochs would be
++    /// two consensus boundaries to observe and two windows for a lagging node
++    /// to disagree in; the ability to attribute a fork to one rule is already
++    /// covered by the per-gate tests and the boundary-divergence detector.
++    #[test]
++    fn the_two_replay_gates_share_one_flag_day() {
++        assert_eq!(
++            crate::params::ANCESTRY_SEED_ACTIVATION_EPOCH,
++            crate::params::LEAK_RECOVERY_ACTIVATION_EPOCH,
++            "the two replay gates are armed at different epochs; \
++             docs/RELANCA-G4-DIAS-DE-BANDEIRA.md §2.5 decides one E* for both"
++        );
++    }
++
+     /// Below its flag day, `seed_for_epoch` must be the ORIGINAL rule, mix of
+     /// `epoch − 1`. This is what lets the corrected binary replay the existing
+     /// log at all: the seed decides the partition, the partition decides which

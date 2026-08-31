@@ -35,6 +35,18 @@ reproduzir ou refutar. A regra é uma:
 > **A constante, o tripwire e este arquivo entram no MESMO commit.** Se o
 > commit não tem os três, o release não está armado — está acidentado.
 
+O diff de armamento está versionado ao lado deste arquivo como
+`RELANCA-G4-DIAS-DE-BANDEIRA.activation.patch`, com o placeholder `__E_STAR__`
+— sem substituir, não compila, de propósito. Ele troca exatamente três coisas:
+as duas constantes e o tripwire de inércia (que vira o tripwire armado mais o
+teste do §2.5). Aplicação no dia do tag:
+
+```sh
+E=<E* escolhido pela fórmula do §2.2, no instante do tag>
+sed "s/__E_STAR__/$E/g" docs/RELANCA-G4-DIAS-DE-BANDEIRA.activation.patch | git apply
+cargo test -p bloch-pos-committee --lib   # o tripwire armado agora pina $E
+```
+
 ---
 
 ## 1. O que cada portão muda no COMPORTAMENTO do nó
@@ -44,15 +56,30 @@ Não no que o nome sugere. O que segue foi lido em `transition.rs`,
 
 ### 1.1 `ANCESTRY_SEED_ACTIVATION_EPOCH` — a semente
 
-O código, `transition.rs:1532` dentro de `CommittedState::seed_for_epoch`:
+O código, dentro de `CommittedState::seed_for_epoch` (`transition.rs`), que
+desde a unificação lê a regra de **um único lugar**,
+`params::seed_lookahead_at`:
 
 ```rust
-let lookahead = if epoch < crate::params::ANCESTRY_SEED_ACTIVATION_EPOCH { 0 }
-                else { crate::committees::MIN_SEED_LOOKAHEAD_EPOCHS };
-let back = 1 + lookahead;
+// params.rs — a ÚNICA grafia da regra F6:
+pub fn seed_lookahead_at(epoch: u64) -> u64 {
+    if epoch < ancestry_seed_gate_epoch() { 0 }        // regra antiga: back = 1
+    else { crate::committees::MIN_SEED_LOOKAHEAD_EPOCHS } // regra nova: back = 2
+}
+// transition.rs::seed_for_epoch:
+let back = 1 + crate::params::seed_lookahead_at(epoch);
 ```
 
-`MIN_SEED_LOOKAHEAD_EPOCHS = 1` (`committees.rs:99`). Então:
+`MIN_SEED_LOOKAHEAD_EPOCHS = 1` (`committees.rs`). A unificação não é
+cosmética: o juiz de gossip do nó (`engine.rs::seed_for_attestation`) carregava
+uma **cópia própria e não-portada** da aritmética — escrita na janela em que o
+portão tinha sido deletado — e por isso julgava atestações chegando por gossip
+contra os comitês do fechamento de `E−2` enquanto a transição (e o dever do
+próprio atestador) usava `E−1`. Voto honesto respondido com
+`Reject(NotInCommittee)`, penalidade para o peer que retransmitiu, e pool de
+proponente magro. As duas pontas agora chamam `seed_lookahead_at`, e o teste
+`the_judge_accepts_the_attestation_the_duty_path_produces` (`engine.rs`) fica
+vermelho se voltarem a divergir. Então:
 
 | | abaixo do portão | a partir do portão |
 |---|---|---|
@@ -96,10 +123,10 @@ Pinado por `below_its_flag_day_the_seed_is_the_original_rule`
 Este portão controla **duas** regras que estão em lugares diferentes de
 `finality.rs::process_epoch`, e é importante saber que são duas:
 
-**(a) O piso do denominador**, `finality.rs:288`:
+**(a) O piso do denominador** (`finality.rs::process_epoch`):
 
 ```rust
-} else if votes.epoch < crate::params::LEAK_RECOVERY_ACTIVATION_EPOCH {
+} else if votes.epoch < crate::params::leak_recovery_gate_epoch() {
     leak_adjusted                                   // sem piso — a aritmética de hoje
 } else {
     let floor = unleaked_total * MIN_QUORUM_DENOMINATOR_NUM / MIN_QUORUM_DENOMINATOR_DEN;
@@ -107,13 +134,19 @@ Este portão controla **duas** regras que estão em lugares diferentes de
 }
 ```
 
-**(b) A recuperação do acumulador**, `finality.rs:429`:
+**(b) A recuperação do acumulador** (`finality.rs::process_epoch`):
 
 ```rust
-if votes.epoch >= crate::params::LEAK_RECOVERY_ACTIVATION_EPOCH && !Self::leak_recovery_disabled() {
+if votes.epoch >= crate::params::leak_recovery_gate_epoch() && !Self::leak_recovery_disabled() {
     // leaked -= max(leaked / INACTIVITY_LEAK_RECOVERY_QUOTIENT, 1), entrada REMOVIDA no zero
 }
 ```
+
+(`params::leak_recovery_gate_epoch()` devolve a constante em qualquer binário
+de produção — `#[inline]`, dobra em tempo de compilação; em build de teste ela
+pode ser movida por thread via `rehearsal::gates_armed_at_guard`, que é o que
+torna a COSTURA — inerte abaixo de `E*`, armada a partir dele — testável em vez
+de só os dois extremos.)
 
 `INACTIVITY_LEAK_RECOVERY_QUOTIENT = 16` (`params.rs:110`);
 `MIN_QUORUM_DENOMINATOR = 1/2` (`params.rs:147-149`).
@@ -246,6 +279,14 @@ risco e podem ficar como estão.
 `E* = arredonda_100(1006 + 636) = 1700` → **2026-09-01T18:51:19.962Z**, slot
 54.400. Arredondar para múltiplo de 100 custa no máximo ~26 h e faz o valor
 ficar legível em anúncio e em linha de log.
+
+> **Re-rodado em 2026-08-31T16:38Z** (época de parede **1601**): o 1700 acima
+> está VENCIDO — restam ~99 épocas, menos que o soak sozinho. Com a mesma
+> fórmula e os mesmos R/S/D: `E* = arredonda_100(1601 + 636) = 2300` →
+> **2026-09-08T10:51:19.962Z**, slot 73.600; ponto de decisão `E*−180 = 2120` →
+> 2026-09-06T10:51:19Z. Vale enquanto o tag sair até a época **1664**
+> (2026-09-01 ≈ 14:20 UTC); depois disso, re-rode a conta — é para isso que
+> ela é uma fórmula e não um número.
 
 Compare com a fórmula obsoleta: `arredonda_100(1006 + 900) = 2000`, isto é
 **300 épocas — 3,3 dias — a mais**, todas elas pagando por um replay que não
@@ -394,24 +435,37 @@ mainnet em duas cadeias que finalizam histórias diferentes.
 
 ### Débitos que bloqueiam o tag
 
-1. **Não existe teste de "abaixo da bandeira" para o portão do leak/piso.** O da
-   semente existe (`below_its_flag_day_the_seed_is_the_original_rule`,
-   `transition.rs:6947`); o do leak, não — grep por `LEAK_RECOVERY_ACTIVATION_EPOCH`
-   em `finality.rs` dá **três acertos, todos no código de produção** (`:288`,
-   `:295`, `:429`), zero em teste. Sem ele, reverter o portão em `process_epoch`
-   passa em todo o resto da suíte.
-2. **A suíte de finalidade sob portão inerte não foi verificada.** Testes como
-   `a_partitioned_minority_finalizes_because_the_leak_shrinks_the_denominator` e
-   `the_leak_recovers_once_the_validator_participates_even_during_a_stall`
-   exercitam épocas 1..60; com `LEAK_RECOVERY_ACTIVATION_EPOCH = u64::MAX` nem o
-   piso nem a recuperação rodam nelas. Ou ganham o idioma `checked_mul → return`
-   (o de `the_block_cap_gate_reads_the_epoch_from_the_blocks_own_header`,
-   `transition.rs:4939`), ou a suíte está vermelha. **Leitura de código: não
-   compilei nada** (§8).
-3. **`leaked` não é legível por RPC**, e `BOUNDARY_VOTE_DROPS` também não. A
-   métrica direta do que o portão 1.2 faz **não é observável remotamente**; o §4
-   se vira com sinais indiretos. Expor os dois em `getchaininfo` é trabalho
-   pequeno e deveria entrar antes do tag.
+1. **RESOLVIDO — testes de costura para o portão do leak/piso.** Três testes em
+   `finality.rs` colocam a época de ativação DENTRO do alcance da dobra
+   (`rehearsal::gates_armed_at_guard`) e pinam a costura pelos dois lados:
+   `arming_the_leak_gate_changes_nothing_below_it` (o binário armado dobra a
+   história do incidente de 2026-08-24 idêntica ao inerte, quórum falso
+   incluído — a propriedade de que o rollout antecipado depende),
+   `the_leak_gate_floor_binds_at_its_epoch_and_not_before` e
+   `leak_recovery_starts_exactly_at_the_gate`. Do lado da semente, além do
+   `below_its_flag_day_the_seed_is_the_original_rule` que já existia:
+   `arming_the_seed_gate_changes_nothing_below_it` (cadeia real, cabeça a
+   cabeça, bit a bit) e `the_seed_gate_binds_exactly_at_its_epoch` (a cadeia
+   CRUZA a fronteira viva; a época `E*` é semeada pelo fechamento de `E*−2`,
+   que a retenção ainda segura).
+2. **RESOLVIDO — a suíte sob portão inerte compila e passa, mas NÃO estava
+   verde.** Rodar `cargo test -p bloch-pos-committee --lib` inteiro (o que a
+   duração do teste de SMT desencoraja) revelou **5 testes do harness
+   `prova.rs` vermelhos em HEAD, deterministicamente** — não por causa dos
+   portões: o braço `PRE_FIX_FILTER` de `partition_step8` chamava
+   `epoch_committees` puro, e quando o fix de 2026-08-24 REMOVEU o filtro
+   pré-shuffle da produção (deixando-o só atrás do switch de ensaio
+   `RESTORE_ZERO_STAKE_FILTER`), o braço "quebrado" virou silenciosamente o
+   braço curado e toda asserção "a mutação morde" falhou. Corrigido: o braço
+   ON re-arma o filtro pelo mesmo switch thread-local; os 9 testes de
+   `prova.rs` passam, e o resto da suíte (290 testes, incluindo o SMT lento)
+   passou na mesma rodada completa que expôs os 5.
+3. **RESOLVIDO PELA METADE — `leaked` agora é legível por RPC.**
+   `getchaininfo` devolve `leaked_total_sat`
+   (`CommittedState::leaked_total_sat`, projeção somente-leitura do
+   acumulador). É a métrica direta do §4.4: catraca antes de `E*`, dívida
+   tendendo a zero depois. `BOUNDARY_VOTE_DROPS` continua sem RPC — a
+   conferência segue sendo `grep BLOCH-CONSENSUS-DIVERGENCE` no log.
 
 ---
 
@@ -832,7 +886,20 @@ esperando `utc(E*)`.
   números verificados (5 pontos finalizados distintos entre 6 upstreams; 12 ramos
   registrados em `RELANCA-G4-DECISOES.md` §7) e nenhum deles é a contagem de
   hoje.
-- **A interação entre E\* e o dia de bandeira 1400 não foi examinada** por
-  ninguém (§2.6, item 4).
-- **Não há teste de "abaixo da bandeira" para o portão do leak/piso** (§3,
-  débito 1). É bloqueante.
+- **A interação entre E\* e o dia de bandeira 1400 foi examinada uma vez**
+  (§2.6, item 4; análise no commit dos testes de costura). Resumo: a
+  recuperação pós-`E*` devolve peso ao roteiro que o 1400 já lê, então stake
+  AUSENTE que recupera (todos recuperam quando a cadeia finaliza) volta a
+  ganhar sorteios de proponente e a ocupação de slot pode CAIR um degrau — a
+  dente-de-serra documentada em `params.rs` no
+  `INACTIVITY_LEAK_RECOVERY_QUOTIENT`. A amplitude é limitada pela fração
+  ausente; com 60/64 vivos hoje é pequena, mas é por isso que o predicado do
+  §3 precisa registrar, durante o soak, o stake ATESTANTE contra o denominador
+  que o piso imporá: a finalidade continua em `E*` sse
+  `3·atestante ≥ 2·max(total_ajustado_por_leak, total_sem_leak/2)` — no limite
+  (ausentes totalmente vazados), atestante ≥ 1/3 do total sem leak. Abaixo
+  disso o piso congela a finalidade em `E*` até esse stake voltar ou sair do
+  registro — comportamento desejado por projeto, mas que ninguém quer
+  descobrir na fronteira. Sem exame de segunda pessoa — confira.
+- ~~Não há teste de "abaixo da bandeira" para o portão do leak/piso~~ —
+  resolvido, §3 débito 1.
