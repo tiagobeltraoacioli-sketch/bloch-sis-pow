@@ -462,6 +462,42 @@ pub mod rehearsal {
         Restore(prev)
     }
 
+    thread_local! {
+        static DEPOSIT_FUNDING_OPEN_TL: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Test-only: treat [`super::DEPOSIT_FUNDING_ACTIVATION_EPOCH`] as if it
+    /// had already bound — both halves of the switch, the `DepositV2` arm and
+    /// the retirement of the unfunded `Deposit`.
+    ///
+    /// Its own flag, NOT folded into [`gates_are_forced_open`]: that guard
+    /// documents itself as covering the seed and leak-recovery gates, and the
+    /// tests that open it exercise finality arithmetic that has nothing to do
+    /// with deposits — one shared switch would silently retire the unfunded
+    /// deposit under every one of them, reddening (or worse, greening)
+    /// assertions written against the pre-flag-day rules. Default is CLOSED,
+    /// so an unadorned `cargo test` exercises the configuration the fleet
+    /// actually runs; tests of the funded format opt in. Thread-local — see
+    /// [`TlFlag`] for why nothing here may be a process global.
+    pub fn deposit_funding_forced_open() -> bool {
+        DEPOSIT_FUNDING_OPEN_TL.with(|c| c.get())
+    }
+
+    /// Opens the deposit-funding gate for this thread until the returned
+    /// guard drops — including on the unwind path, so a failing assertion
+    /// cannot leave the rule mutated for the rest of the thread.
+    #[cfg(test)]
+    pub fn deposit_funding_open_guard() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                DEPOSIT_FUNDING_OPEN_TL.with(|c| c.set(self.0));
+            }
+        }
+        let prev = DEPOSIT_FUNDING_OPEN_TL.with(|c| c.replace(true));
+        Restore(prev)
+    }
+
     /// Serializes every test that flips a switch in this module. The switches
     /// are process-global and `cargo test` runs test functions on threads, so
     /// without this a mutation test would silently corrupt an unrelated one.
@@ -596,6 +632,49 @@ pub const ANCESTRY_SEED_ACTIVATION_EPOCH: u64 = u64::MAX;
 /// `u64::MAX` means INERT. Same arming rules as above.
 pub const LEAK_RECOVERY_ACTIVATION_EPOCH: u64 = u64::MAX;
 
+/// Flag day for **eUTXO-funded deposits** (`PosTransaction::DepositV2`, wire
+/// tag `0x07`) — the format that makes a validator bond spend real coins.
+///
+/// # What this gate arms, and what it retires
+///
+/// Below this epoch the chain's only deposit shape is the unfunded
+/// `PosTransaction::Deposit` (tag `0x02`): it names an `amount_sat` and spends
+/// no output, so a deposit creates bonded stake without destroying spendable
+/// coins — stake minted from nothing, measured on 2026-08-13 at 25,000 BLCH
+/// per unauthenticated request (see `bloch-pos-node/src/engine.rs`,
+/// `admissible`, which is the node-local refusal buying time for this flag
+/// day). From this epoch, ON THE SAME SWITCH:
+///
+/// - tag `0x07` becomes acceptable in blocks: inputs are consumed from the
+///   committed unspent set, `sum(inputs) == amount + change + fee` is enforced
+///   with the same strict equality as a transfer, and the proof of possession
+///   is a consensus check, not an admission courtesy;
+/// - tag `0x02` becomes INVALID: the unfunded shape dies the moment the funded
+///   one exists, because running both would keep the mint-from-nothing path
+///   open next to the rule that closes it. One switch, never two — a deposit
+///   format and the retirement of its predecessor must not have separate flag
+///   days (the `WitnessTableNotCanonical` rationale, one layer up).
+///
+/// # Why a mixed fleet agrees before the flag day
+///
+/// Identical argument to [`TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH`]: a
+/// pre-activation block carrying `0x07` is rejected by BOTH binaries — the old
+/// one fails to decode the body (`TxDecodeError::UnknownTag(0x07)`), the new
+/// one decodes it and refuses at the gate
+/// ([`crate::interfaces::TransferReject::FormatNotActive`]). And a
+/// pre-activation block carrying `0x02` is *accepted* by both: the retirement
+/// arm reads the same constant, so the new binary changes nothing about what a
+/// node accepts until the epoch arrives. AFTER activation the binaries diverge
+/// in both directions, so **the fleet must be rebuilt before this constant is
+/// ever lowered**.
+///
+/// `u64::MAX` means INERT. Same arming rules as
+/// [`ANCESTRY_SEED_ACTIVATION_EPOCH`]: strictly in the future, after the
+/// rollout completes, and the gate reads the COMMITTED epoch
+/// (`CommittedState::epoch`, already rolled to the block's epoch), never a
+/// local clock — the 2026-08-08 `expected_bits` fork is the standing reason.
+pub const DEPOSIT_FUNDING_ACTIVATION_EPOCH: u64 = u64::MAX;
+
 /// Domain separation tags (§6.1). Fixed 16 bytes, right-padded with zeros, so
 /// no tag can be a prefix of another.
 pub const DS_SORTITION: [u8; 16] = *b"BLCH4:SORTIT\0\0\0\0";
@@ -623,6 +702,31 @@ pub const DS_DEPOSIT: [u8; 16] = *b"BLCH4:DEPOSIT\0\0\0";
 /// the outputs, the declared size and the tip — everything except the
 /// witnesses, which cannot be inside a root they are produced over.
 pub const DS_SPEND: [u8; 16] = *b"BLCH4:SPEND\0\0\0\0\0";
+/// The signing root a funded deposit's INPUT witnesses cover
+/// (`PosTransaction::DepositV2`): the domain under which a coin's owner
+/// authorises destroying that coin into *this* validator bond and nothing
+/// else.
+///
+/// Its own tag, and not [`DS_SPEND`], because the two preimages carry
+/// different structures behind the same fold style: under one tag, a
+/// signature over a deposit could — for some adversarially chosen field
+/// values — parse as a signature over a transfer, and a coin authorised into
+/// a bond would instead move to an attacker's output. Distinct tags make the
+/// cross-reading impossible by construction instead of improbable by
+/// arithmetic. And it is not [`DS_DEPOSIT`] either: that tag is the
+/// VALIDATOR key's proof-of-possession domain (§7.1), signed by a different
+/// key over a different statement ("I possess this key"), and a root that
+/// served both would let one signature answer for the other.
+///
+/// The preimage covers the spend points, every §7.1 registration field
+/// (pubkey, amount, RANDAO commitment, withdrawal address, commission), the
+/// change outputs, the declared size and the tip — everything except the
+/// witnesses and the PoP, which are signatures and cannot live inside a root
+/// they are produced over. Both are still checked against committed material:
+/// each witness against the spent output's `script_hash` and this root, the
+/// PoP against the pubkey and the §7.1 root, whose every field is inside
+/// *this* root and therefore inside the txid.
+pub const DS_DEPOSIT_FUND: [u8; 16] = *b"BLCH4:DEPFUND\0\0\0";
 /// Transaction identity: `txid = SHA3-256(DS_TXID ‖ spend signing root)`.
 ///
 /// Derived from the witness-free signing root, so a transaction's id — and
