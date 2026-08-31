@@ -262,28 +262,76 @@ pub fn verify_non_membership(nf: &[u8; 32], path: &[[u8; 32]], root: &[u8; 32]) 
 // ── Commitment tree (incremental, fixed depth, SHAKE-256) ─────────────────────
 
 /// Append-only Merkle accumulator of note commitments; the root is the anchor.
-#[derive(Debug, Clone, Default)]
+///
+/// Internally a frontier-based incremental tree (Eth2 deposit-contract /
+/// Zcash-`Frontier`-style): `append` folds the new leaf up the fixed-depth
+/// tree in O(TREE_DEPTH) hashes and caches the root, so `root()` is O(1)
+/// instead of the previous full O(n) rebuild. The `leaves` Vec is retained
+/// for witness generation (`path`) and reorg undo (`truncate`); the root
+/// semantics are byte-identical to the old full-rebuild implementation
+/// (golden-tested against it below).
+#[derive(Debug, Clone)]
 pub struct CommitmentTree {
+    /// All appended commitments — kept for `path()` (witness gen) and
+    /// `truncate()` (reorg undo, bounded by MAX_REORG_UNDO).
     leaves: Vec<[u8; 32]>,
+    /// frontier[d] = hash of the last left node written at level d that is
+    /// still awaiting (or was last awaiting) its right sibling. Only read
+    /// when the ascending fold arrives at level d with an odd index, at
+    /// which point it provably holds the completed left-subtree hash.
+    frontier: Vec<[u8; 32]>,
+    /// Cached current root, updated incrementally on append/truncate.
+    root: [u8; 32],
+}
+
+impl Default for CommitmentTree {
+    fn default() -> Self { Self::new() }
 }
 
 impl CommitmentTree {
-    pub fn new() -> Self { Self { leaves: Vec::new() } }
+    pub fn new() -> Self {
+        let empty = Self::empty_roots();
+        Self {
+            leaves: Vec::new(),
+            frontier: vec![[0u8; 32]; TREE_DEPTH],
+            root: empty[TREE_DEPTH],
+        }
+    }
 
     pub fn append(&mut self, cm: [u8; 32]) -> u64 {
-        let pos = self.leaves.len() as u64;
+        let pos = self.leaves.len();
+        // Past 2^TREE_DEPTH leaves the fold wraps and the frontier and the
+        // full-rebuild algorithm DIVERGE — neither guards against it, so
+        // catch it loudly in debug builds before roots silently disagree.
+        // (u64 so the shift is well-defined on 32-bit targets, e.g. the
+        // SP1 riscv32 guest, where `1usize << 32` would not compile.)
+        debug_assert!(
+            (pos as u64) < 1u64 << TREE_DEPTH,
+            "CommitmentTree capacity exceeded: 2^{TREE_DEPTH} leaves"
+        );
         self.leaves.push(cm);
-        pos
+        self.fold_in(pos, cm);
+        pos as u64
     }
 
     /// Number of appended leaves (commitments).
     pub fn len(&self) -> usize { self.leaves.len() }
     pub fn is_empty(&self) -> bool { self.leaves.is_empty() }
 
-    /// Drop leaves back to the first `n` (reorg undo). The root recomputes from
-    /// the remaining leaves; truncating to a prior length restores the exact
-    /// earlier root (append-only tree over a `Vec`).
-    pub fn truncate(&mut self, n: usize) { self.leaves.truncate(n); }
+    /// Drop leaves back to the first `n` (reorg undo). Rebuilds the frontier
+    /// and cached root from the remaining leaves — O(n·TREE_DEPTH), but only
+    /// on the rare reorg-undo path (bounded by MAX_REORG_UNDO); truncating to
+    /// a prior length restores the exact earlier root.
+    pub fn truncate(&mut self, n: usize) {
+        self.leaves.truncate(n);
+        let empty = Self::empty_roots();
+        self.frontier = vec![[0u8; 32]; TREE_DEPTH];
+        self.root = empty[TREE_DEPTH];
+        for i in 0..self.leaves.len() {
+            let cm = self.leaves[i];
+            self.fold_in(i, cm);
+        }
+    }
 
     fn empty_roots() -> [[u8; 32]; TREE_DEPTH + 1] {
         let mut e = [[0u8; 32]; TREE_DEPTH + 1];
@@ -294,22 +342,35 @@ impl CommitmentTree {
         e
     }
 
-    pub fn root(&self) -> [u8; 32] {
+    /// Current root (the anchor). O(1) — reads the incrementally maintained
+    /// cache; byte-identical to the old full-rebuild computation.
+    pub fn root(&self) -> [u8; 32] { self.root }
+
+    /// Incremental insert: folds `cm` at leaf position `idx` up through the
+    /// fixed-depth tree, using the frontier as the running set of "left node
+    /// awaiting its right pair" hashes and padding incomplete levels with the
+    /// SAME `empty_roots()` table the old O(n) `root()` used — which is what
+    /// makes the two algorithms produce byte-identical roots.
+    fn fold_in(&mut self, idx: usize, cm: [u8; 32]) {
         let empty = Self::empty_roots();
-        let mut level: Vec<[u8; 32]> = self.leaves.clone();
+        let mut index = idx;
+        let mut cur = cm;
         for d in 0..TREE_DEPTH {
-            let mut next = Vec::with_capacity((level.len() + 1) / 2);
-            let mut i = 0;
-            while i < level.len() {
-                let l = level[i];
-                let r = if i + 1 < level.len() { level[i + 1] } else { empty[d] };
-                next.push(merkle_parent(&l, &r));
-                i += 2;
+            if index % 2 == 0 {
+                // `cur` is the (possibly still-incomplete) left node at this
+                // level; record it and pad the missing right sibling.
+                self.frontier[d] = cur;
+                cur = merkle_parent(&cur, &empty[d]);
+            } else {
+                // `cur` is the right child; its left sibling subtree is
+                // complete and its hash was recorded by the append that
+                // finished it (leaf index·2^d − 1).
+                let left = self.frontier[d];
+                cur = merkle_parent(&left, &cur);
             }
-            if next.is_empty() { next.push(empty[d + 1]); }
-            level = next;
+            index /= 2;
         }
-        level[0]
+        self.root = cur;
     }
 
     pub fn path(&self, index: u64) -> Option<Vec<[u8; 32]>> {
@@ -468,6 +529,197 @@ mod tests {
         assert_eq!(n.commitment(), n.commitment());
         assert_ne!(n.commitment(), n.nullifier(&[9; 32], 0));
         assert_ne!(n.nullifier(&[9; 32], 0), n.nullifier(&[9; 32], 1));
+    }
+
+    /// Literal copy of the OLD (pre-frontier) `CommitmentTree::root()` body:
+    /// full bottom-up rebuild padding every incomplete level with the
+    /// `empty_roots()` table. The frontier implementation must match this
+    /// bit-for-bit — it is the consensus anchor definition.
+    fn naive_root(leaves: &[[u8; 32]]) -> [u8; 32] {
+        let empty = CommitmentTree::empty_roots();
+        let mut level: Vec<[u8; 32]> = leaves.to_vec();
+        for d in 0..TREE_DEPTH {
+            let mut next = Vec::with_capacity((level.len() + 1) / 2);
+            let mut i = 0;
+            while i < level.len() {
+                let l = level[i];
+                let r = if i + 1 < level.len() { level[i + 1] } else { empty[d] };
+                next.push(merkle_parent(&l, &r));
+                i += 2;
+            }
+            if next.is_empty() { next.push(empty[d + 1]); }
+            level = next;
+        }
+        level[0]
+    }
+
+    /// Parse a 64-char lowercase hex string into 32 bytes (test-only, no deps).
+    fn from_hex32(s: &str) -> [u8; 32] {
+        assert_eq!(s.len(), 64);
+        let mut out = [0u8; 32];
+        for (i, byte) in out.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap();
+        }
+        out
+    }
+
+    /// ABSOLUTE known-answer tests. The golden tests below are RELATIVE: they
+    /// compare the frontier root against `naive_root`, but both sides share
+    /// `merkle_parent`/`empty_roots`, so an accidental change to `DOM_MT`,
+    /// the empty-leaf tag, or SHAKE-256 wiring would move BOTH sides together
+    /// and stay green. These fixed hex vectors pin the anchor bytes
+    /// themselves: if any of them moves, the consensus root moved.
+    #[test]
+    fn known_answer_roots_are_pinned() {
+        // Empty commitment accumulator (TREE_DEPTH = 32).
+        assert_eq!(
+            CommitmentTree::new().root(),
+            from_hex32("cd640768299853bb27e3dfa62faed4b9c2e9348d8ac2f81dd03ecc96ae5b3ff1"),
+            "empty CommitmentTree root moved — consensus anchor changed"
+        );
+        // Empty nullifier set (sparse tree, depth 256).
+        assert_eq!(
+            NullifierSet::new().root(),
+            from_hex32("d5fdc9dcde0d309db399649a21cd95e45e117e369c13cca70b8e87f2849f7930"),
+            "empty NullifierSet root moved — consensus root changed"
+        );
+        // Single known leaf 0x42…42 at position 0.
+        let mut t = CommitmentTree::new();
+        assert_eq!(t.append([0x42u8; 32]), 0);
+        assert_eq!(
+            t.root(),
+            from_hex32("19645c7d68b35d191281ae875036aa7cb3f0830f841a65d3f0a3788b5cef2805"),
+            "single-leaf CommitmentTree root moved — consensus anchor changed"
+        );
+    }
+
+    /// Deterministic pseudo-random 32-byte leaf (xorshift64*, no deps).
+    fn rand_leaf(state: &mut u64) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        for chunk in out.chunks_mut(8) {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            chunk.copy_from_slice(&state.wrapping_mul(0x2545F4914F6CDD1D).to_le_bytes());
+        }
+        out
+    }
+
+    /// GOLDEN TEST: frontier root == old full-rebuild root after EVERY append,
+    /// for the empty tree, 1, 2, and every size up to 300 (covers all
+    /// power-of-two boundaries 2^k−1 / 2^k / 2^k+1 for k ≤ 8 en route).
+    #[test]
+    fn frontier_root_matches_naive_root_incrementally() {
+        let mut seed = 0x1BAD_5EED_u64;
+        let mut t = CommitmentTree::new();
+        let mut leaves: Vec<[u8; 32]> = Vec::new();
+
+        // Empty tree: cached root must equal the naive empty root, and
+        // Default must equal new().
+        assert_eq!(t.root(), naive_root(&leaves));
+        assert_eq!(CommitmentTree::default().root(), t.root());
+        assert!(t.is_empty());
+
+        for i in 0..300usize {
+            let cm = rand_leaf(&mut seed);
+            let pos = t.append(cm);
+            leaves.push(cm);
+            assert_eq!(pos as usize, i);
+            assert_eq!(t.len(), leaves.len());
+            assert_eq!(t.root(), naive_root(&leaves), "root diverged at n={}", i + 1);
+        }
+    }
+
+    /// GOLDEN TEST at larger power-of-two boundaries (2^k−1 / 2^k / 2^k+1 for
+    /// k up to 10), asserting at the boundaries only (naive_root is O(n)).
+    #[test]
+    fn frontier_root_matches_naive_root_at_boundaries() {
+        let mut seed = 0xF0CA_CC1A_u64;
+        let mut t = CommitmentTree::new();
+        let mut leaves: Vec<[u8; 32]> = Vec::new();
+        let boundaries: Vec<usize> = (8..=10u32)
+            .flat_map(|k| {
+                let p = 1usize << k;
+                [p - 1, p, p + 1]
+            })
+            .collect();
+        let max = *boundaries.last().unwrap();
+        for _ in 0..max {
+            let cm = rand_leaf(&mut seed);
+            t.append(cm);
+            leaves.push(cm);
+            if boundaries.contains(&leaves.len()) {
+                assert_eq!(t.root(), naive_root(&leaves), "root diverged at n={}", leaves.len());
+            }
+        }
+    }
+
+    /// GOLDEN TEST for the reorg path: random truncate-then-reappend sequences
+    /// (simulating disconnect_block/apply_block cycles) keep the frontier root
+    /// equal to the naive root, and truncating to a previously seen length
+    /// restores the exact earlier root.
+    #[test]
+    fn frontier_survives_truncate_reappend_reorg_cycles() {
+        let mut seed = 0xD15C_0BEE_u64;
+        let mut t = CommitmentTree::new();
+        let mut leaves: Vec<[u8; 32]> = Vec::new();
+        let mut root_at_len: Vec<[u8; 32]> = vec![t.root()]; // root_at_len[n] = root with first n leaves
+
+        // Grow to 96 leaves, remembering every historical root.
+        for _ in 0..96 {
+            let cm = rand_leaf(&mut seed);
+            t.append(cm);
+            leaves.push(cm);
+            root_at_len.push(t.root());
+        }
+
+        for round in 0..24 {
+            // Truncate to a pseudo-random prior length (including 0).
+            *(&mut seed) ^= seed << 13;
+            let n = (seed as usize) % (leaves.len() + 1);
+            t.truncate(n);
+            leaves.truncate(n);
+            assert_eq!(t.len(), n);
+            assert_eq!(t.root(), naive_root(&leaves), "round {round}: truncate({n}) diverged");
+            assert_eq!(t.root(), root_at_len[n], "round {round}: truncate({n}) != historical root");
+            root_at_len.truncate(n + 1);
+
+            // Re-append a fresh batch (fork's replacement blocks).
+            let grow = 1 + ((seed >> 8) as usize) % 17;
+            for _ in 0..grow {
+                let cm = rand_leaf(&mut seed);
+                t.append(cm);
+                leaves.push(cm);
+                root_at_len.push(t.root());
+            }
+            assert_eq!(t.root(), naive_root(&leaves), "round {round}: reappend diverged");
+        }
+    }
+
+    /// Paths generated by the (unchanged) `path()` must still verify against
+    /// the (now cached) `root()`, including straddling a truncate.
+    #[test]
+    fn paths_verify_against_cached_root_across_truncate() {
+        let mut seed = 0xABAD_1DEA_u64;
+        let mut t = CommitmentTree::new();
+        let cms: Vec<[u8; 32]> = (0..37).map(|_| rand_leaf(&mut seed)).collect();
+        for cm in &cms { t.append(*cm); }
+
+        let root = t.root();
+        for (i, cm) in cms.iter().enumerate() {
+            let path = t.path(i as u64).unwrap();
+            assert!(verify_path(cm, i as u64, &path, &root), "path {i} failed pre-truncate");
+        }
+        assert!(t.path(37).is_none());
+
+        t.truncate(20);
+        let root2 = t.root();
+        assert_ne!(root, root2);
+        for (i, cm) in cms.iter().take(20).enumerate() {
+            let path = t.path(i as u64).unwrap();
+            assert!(verify_path(cm, i as u64, &path, &root2), "path {i} failed post-truncate");
+        }
+        assert!(t.path(20).is_none());
     }
 
     #[test]
