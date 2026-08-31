@@ -141,6 +141,13 @@ pub struct Config {
     /// the server entirely.
     pub rpc_bind: String,
     pub rpc_port: Option<u16>,
+    /// `--accept-new-signing-history`: create a fresh, empty
+    /// slashing-protection store for a keystore that has none. The genuine
+    /// first-boot case only — a key that HAS signed anywhere must carry its
+    /// exported history instead ([`crate::signing_history`]). Off, a
+    /// validator with no history file refuses to start rather than signing
+    /// blind.
+    pub accept_new_signing_history: bool,
 }
 
 fn now_ms() -> u64 {
@@ -469,6 +476,14 @@ struct Engine {
     /// keystore, is how you equivocate and get slashed. There is no safe
     /// version of that, so there is this.
     keys: Option<Keystore>,
+    /// Node-local slashing protection ([`crate::signing_history`]): the
+    /// durable record of the highest slot proposed and the highest
+    /// source/target epochs attested, consulted and advanced — fsynced —
+    /// BEFORE every signature this node releases. `Some` whenever `keys` is
+    /// `Some`; a signing engine without it refuses its duties rather than
+    /// signing blind, because an unrecorded signature is one a restart (or a
+    /// restored snapshot) can repeat.
+    guard: Option<crate::signing_history::SigningHistory>,
     /// Every structurally-valid block seen, canonical or not, by id.
     /// Unpruned — fine for a devnet, listed as a limitation.
     blocks: BTreeMap<[u8; 32], BlockEnvelope>,
@@ -939,6 +954,27 @@ impl Engine {
             target_epoch: e,
             target_root: self.checkpoint_root(e),
         };
+        // Slashing protection, BEFORE the signature exists. `record_attestation`
+        // advances the durable watermark and fsyncs it; only on `Ok` may the
+        // vote be signed. A refusal costs this epoch's attestation reward — the
+        // deliberate trade, because the alternative it prevents is a double or
+        // surround vote worth 5% of stake plus ejection.
+        match self.guard.as_mut() {
+            None => {
+                eprintln!(
+                    "[slot {slot}] NOT ATTESTING: this node holds a validator key but no \
+                     signing-history store — refusing to sign blind (see \
+                     BLOCH-SLASHING-PROTECTION.md)"
+                );
+                return;
+            }
+            Some(g) => {
+                if let Err(e) = g.record_attestation(data.source_epoch, data.target_epoch) {
+                    eprintln!("[slot {slot}] NOT ATTESTING: {e}");
+                    return;
+                }
+            }
+        }
         let signature = self
             .keys
             .as_ref()
@@ -1078,6 +1114,27 @@ impl Engine {
         };
         header.state_root = post.state_root();
 
+        // Slashing protection, BEFORE the signature exists. Placed after the
+        // post-state work on purpose: a block the transition refuses must not
+        // burn the slot's watermark, but once the watermark IS advanced (and
+        // fsynced) a crash anywhere below costs one missed slot, never a
+        // second header for a signed slot.
+        match self.guard.as_mut() {
+            None => {
+                eprintln!(
+                    "[slot {slot}] NOT PROPOSING: this node holds a validator key but no \
+                     signing-history store — refusing to sign blind (see \
+                     BLOCH-SLASHING-PROTECTION.md)"
+                );
+                return;
+            }
+            Some(g) => {
+                if let Err(e) = g.record_proposal(slot) {
+                    eprintln!("[slot {slot}] NOT PROPOSING: {e}");
+                    return;
+                }
+            }
+        }
         let proposer_sig = self
             .keys
             .as_ref()
@@ -2197,6 +2254,79 @@ pub fn run(cfg: Config) -> io::Result<()> {
         }
     }
 
+    // Slashing protection. A validator signs nothing until its signing
+    // history is open, bound to this key and this network, and writable.
+    // Missing or unreadable is a refusal to START, not a downgrade — a
+    // validator that silently signed blind would look healthy right up to
+    // the slashing. The one escape is `--accept-new-signing-history`, the
+    // operator's explicit, logged assertion that this key has never signed.
+    let guard = match keys.as_ref() {
+        None => None,
+        Some(k) => {
+            use crate::signing_history::SigningHistory;
+            let mut g = match SigningHistory::open(&cfg.data_dir) {
+                Ok(g) => g,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    if !cfg.accept_new_signing_history {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "{}/validator.key is present but {}/{} is not. Refusing to \
+                                 run a validator with no record of what its key has signed: \
+                                 if this key ever signed anywhere — another machine, a \
+                                 restored snapshot, a previous install — signing without \
+                                 that record is how validators equivocate and get slashed.\n\
+                                 - If the key HAS signed before: export its history where it \
+                                 ran (`bloch-pos protection-export`) and install it here \
+                                 (`bloch-pos protection-import`) before starting.\n\
+                                 - If the key has GENUINELY never signed on this network: \
+                                 start once with --accept-new-signing-history.",
+                                cfg.data_dir.display(),
+                                cfg.data_dir.display(),
+                                crate::signing_history::HISTORY_FILE,
+                            ),
+                        ));
+                    }
+                    eprintln!(
+                        "########################################################################\n\
+                         # --accept-new-signing-history: creating an EMPTY slashing-protection #\n\
+                         # history for this validator key. You are asserting this key has      #\n\
+                         # NEVER signed a proposal or attestation on this network — not on     #\n\
+                         # another machine, not before a snapshot restore, not anywhere. If    #\n\
+                         # that is wrong, this node can double-sign and the stake WILL be      #\n\
+                         # slashed. Drop the flag after this boot.                             #\n\
+                         ########################################################################"
+                    );
+                    SigningHistory::create_bound(&cfg.data_dir, &digest, &k.pubkey)?
+                }
+                Err(e) => {
+                    return Err(io::Error::new(
+                        e.kind(),
+                        format!(
+                            "cannot read {}/{}: {e}. Refusing to sign over an unreadable \
+                             signing history — repair or re-import it \
+                             (`bloch-pos protection-import`) rather than deleting it.",
+                            cfg.data_dir.display(),
+                            crate::signing_history::HISTORY_FILE,
+                        ),
+                    ));
+                }
+            };
+            g.bind(&digest, &k.pubkey)?;
+            println!(
+                "slashing protection: {} (proposal watermark {}, attestation watermark {})",
+                cfg.data_dir.join(crate::signing_history::HISTORY_FILE).display(),
+                g.highest_proposed_slot()
+                    .map_or("none".to_string(), |n| format!("slot {n}")),
+                g.attestation_watermark()
+                    .map_or("none".to_string(), |(s, t)| format!(
+                        "source e{s}, target e{t}"
+                    )),
+            );
+            Some(g)
+        }
+    };
+
     let store = Store::open(&cfg.data_dir, &digest)?;
     let genesis_state = manifest.genesis_state();
     let genesis_id = manifest.genesis_id();
@@ -2284,6 +2414,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         tr_probe: Transition::new(ProbeVerifier),
         verifier,
         keys,
+        guard,
         blocks: BTreeMap::new(),
         chain: vec![(0, genesis_id)],
         canonical: BTreeSet::from([*genesis_id.as_bytes()]),
@@ -3830,6 +3961,7 @@ mod transfer_v2_end_to_end {
             tr_probe: Transition::new(ProbeVerifier),
             verifier,
             keys: None,
+            guard: None,
             blocks: BTreeMap::new(),
             chain: vec![(0, genesis_id)],
             canonical: BTreeSet::from([*genesis_id.as_bytes()]),
@@ -4115,6 +4247,11 @@ mod perf_support {
             .expect("bind the devnet transport on an ephemeral port"),
         );
         let verifier = HybridVerifier::new(manifest.pubkeys());
+        // The signing engine's invariant: a keystore never signs without its
+        // slashing-protection store (the fixture's key is newborn, so the
+        // empty history is the true one).
+        let guard = crate::signing_history::SigningHistory::create_unbound(&dir, &ks.pubkey)
+            .expect("create the signing-history store");
         let engine = Engine {
             manifest,
             state: StateCell::new(state),
@@ -4122,6 +4259,7 @@ mod perf_support {
             tr_probe: Transition::new(ProbeVerifier),
             verifier,
             keys: Some(ks),
+            guard: Some(guard),
             blocks: BTreeMap::new(),
             chain: vec![(0, genesis_id)],
             canonical: BTreeSet::from([*genesis_id.as_bytes()]),
@@ -5400,6 +5538,9 @@ mod duty_view_anchor {
         );
         let verifier = HybridVerifier::new(manifest.pubkeys());
         let ks0 = Keystore::load(&dir.0.join("v0")).expect("re-load validator 0");
+        let guard =
+            crate::signing_history::SigningHistory::create_unbound(&dir.0, &ks0.pubkey)
+                .expect("create the signing-history store");
         let engine = Engine {
             manifest,
             state: StateCell::new(state),
@@ -5407,6 +5548,7 @@ mod duty_view_anchor {
             tr_probe: Transition::new(ProbeVerifier),
             verifier,
             keys: Some(ks0),
+            guard: Some(guard),
             blocks: BTreeMap::new(),
             chain: vec![(0, genesis_id)],
             canonical: BTreeSet::from([*genesis_id.as_bytes()]),
@@ -5495,5 +5637,127 @@ mod duty_view_anchor {
             partition_caught_up.len()
         );
         assert!(moved > 0);
+    }
+}
+
+/// Slashing protection at the ENGINE seam: the gates in `propose`/`attest`
+/// really stand between the duty logic and the signature. The store's own
+/// semantics — watermarks, crash windows, snapshots, interchange — are pinned
+/// in `signing_history.rs`; what these tests pin is that the node consults it
+/// and obeys a refusal.
+#[cfg(test)]
+mod signing_guard_tests {
+    use super::*;
+    use bloch_pos_committee::SLOTS_PER_EPOCH;
+
+    /// The restored-snapshot / rewound-data-dir shape, end to end. A reorg
+    /// hands the node's own slot-1 block back — the chain state now looks
+    /// exactly like a rollback to before that block — and the node is asked
+    /// to propose slot 1 again. Without the guard it would sign a second
+    /// header for a signed slot; with it, the slot is refused and the head
+    /// stays put.
+    #[test]
+    fn a_rewound_node_refuses_to_re_sign_a_slot_it_already_proposed() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        let genesis = *engine.chain[0].1.as_bytes();
+
+        engine.propose(1);
+        assert_eq!(engine.chain.len(), 2, "fixture: slot 1 must land");
+
+        // The rewind. The signed block leaves the store entirely, so nothing
+        // below can be "the transition refused a duplicate" — only the guard
+        // stands between the key and a second signature.
+        let signed = *engine.chain[1].1.as_bytes();
+        assert!(engine.do_reorg(genesis, Vec::new()), "hand the block back");
+        engine.blocks.remove(&signed);
+        assert_eq!(engine.chain.len(), 1, "rewound to genesis");
+
+        engine.propose(1);
+        assert_eq!(
+            engine.chain.len(),
+            1,
+            "the guard must refuse slot 1: this key already signed a proposal there"
+        );
+        // The chain is not stuck — the next slot signs normally.
+        engine.propose(2);
+        assert_eq!(engine.chain.len(), 2, "slot 2 is above the watermark and lands");
+    }
+
+    /// Same shape for attestations: one vote per target epoch, ever. The
+    /// pool is cleared between the two calls so the only thing refusing the
+    /// second signature is the guard, not pool dedup.
+    #[test]
+    fn a_second_attestation_for_the_same_target_epoch_is_refused() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        // Reach epoch 1 (attest refuses epoch 0 by construction).
+        for slot in 1..=SLOTS_PER_EPOCH {
+            engine.propose(slot);
+        }
+        // Single validator ⇒ it sits in exactly one committee of epoch 1;
+        // sweep the epoch and let the committee check pick the slot.
+        let mut signed_slot = None;
+        for slot in SLOTS_PER_EPOCH..2 * SLOTS_PER_EPOCH {
+            let before = engine.pool.len();
+            engine.attest(slot);
+            if engine.pool.len() > before {
+                signed_slot = Some(slot);
+                break;
+            }
+        }
+        let slot = signed_slot.expect("the validator must be in one committee of epoch 1");
+
+        // The restart-after-crash / restored-snapshot view: the in-memory
+        // trace of the vote is gone, the durable watermark is not.
+        engine.pool.clear();
+        engine.attest(slot);
+        assert!(
+            engine.pool.is_empty(),
+            "the guard must refuse a second vote for target epoch 1"
+        );
+    }
+
+    /// Requirement: refuse to sign when the store is missing, rather than
+    /// signing blind. An engine holding a key but no guard performs no duty.
+    /// (`run` refuses to even boot this configuration; the engine-level
+    /// refusal is the second lock on the same door.)
+    #[test]
+    fn a_keyed_engine_with_no_history_store_signs_nothing() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        engine.guard = None;
+
+        engine.propose(1);
+        assert_eq!(engine.chain.len(), 1, "no proposal may be signed without the store");
+
+        for slot in 0..2 * SLOTS_PER_EPOCH {
+            engine.attest(slot);
+        }
+        assert!(engine.pool.is_empty(), "no attestation may be signed without the store");
+    }
+
+    /// The record-before-sign ordering, observed from outside: when the
+    /// record cannot be made durable, no signature is released — the duty
+    /// simply does not happen. If signing preceded recording, this test
+    /// would see a block despite the store being unwritable.
+    #[cfg(unix)]
+    #[test]
+    fn when_the_record_cannot_be_written_the_signature_is_never_released() {
+        use std::os::unix::fs::PermissionsExt;
+        let (mut engine, dir) = perf_support::proposing_engine();
+
+        std::fs::set_permissions(&dir.0, std::fs::Permissions::from_mode(0o555))
+            .expect("make the data dir unwritable");
+        engine.propose(1);
+        let produced = engine.chain.len();
+        std::fs::set_permissions(&dir.0, std::fs::Permissions::from_mode(0o755))
+            .expect("restore permissions");
+
+        assert_eq!(
+            produced, 1,
+            "an unrecordable signature must not exist: record-then-sign, never the reverse"
+        );
+        // Nothing was signed, so nothing is burned: the same slot signs once
+        // the store is writable again.
+        engine.propose(1);
+        assert_eq!(engine.chain.len(), 2, "slot 1 lands after the store recovers");
     }
 }

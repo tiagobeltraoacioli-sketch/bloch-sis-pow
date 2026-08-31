@@ -223,14 +223,21 @@ fn a_cold_node_builds_the_same_chain_from_genesis_without_a_donated_datadir() {
     // peers, exactly like an exchange standing up a node today.
     std::thread::sleep(Duration::from_secs(COLD_START_DELAY_SECS));
     let cold_dir = root.join("d2");
-    let cold_files: Vec<String> = std::fs::read_dir(&cold_dir)
+    let mut cold_files: Vec<String> = std::fs::read_dir(&cold_dir)
         .expect("read cold dir")
         .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
         .collect();
+    cold_files.sort();
     assert_eq!(
         cold_files,
-        vec!["validator.key".to_string()],
-        "the cold node's data dir must contain only its own keystore, not a donated database"
+        vec![
+            // keygen writes the key WITH its (empty) slashing-protection
+            // history — key-side material, not chain data. The point of the
+            // assert stands: no block log, no meta, no donated database.
+            "signing_history.bin".to_string(),
+            "validator.key".to_string(),
+        ],
+        "the cold node's data dir must contain only its own key material, not a donated database"
     );
     fleet.0.push(spawn_node(
         &cold_dir,
