@@ -93,10 +93,24 @@ static HOOK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// `CommittedState::consensus_roster_at` returns once the flag day binds.
 pub fn partition_step8(seed: &[u8; 32], epoch: u64, consensus_roster: &[Validator]) -> Vec<Vec<u32>> {
     if mutation::PRE_FIX_FILTER.load(Relaxed) {
-        // BROKEN — and this is not a re-implementation of the broken code, it
-        // IS the broken code: today's production function, called on today's
-        // production input.
-        return committees::epoch_committees(seed, epoch, consensus_roster);
+        // BROKEN — the pre-fix behaviour. When this harness was written the
+        // bare call below WAS the broken code: the production function still
+        // carried its pre-shuffle `effective_stake > 0` filter. Dev A's fix
+        // then REMOVED the filter from `epoch_committees` and kept it only
+        // behind the thread-local rehearsal switch
+        // `params::rehearsal::RESTORE_ZERO_STAKE_FILTER` — at which point the
+        // bare call silently became the CURE, ON and OFF produced identical
+        // partitions, and every "the mutation bites" assertion in this file
+        // went red (found 2026-08-31, present at HEAD). So the ON branch now
+        // restores the filter through the same switch the committee-level
+        // mutation tests use; it is still the production function on the
+        // production input, with the production pre-fix filter re-armed for
+        // exactly this call. Thread-local, and `partition_step8` is only ever
+        // called on the test's own thread, so nothing leaks across tests.
+        crate::params::rehearsal::RESTORE_ZERO_STAKE_FILTER.store(true, Relaxed);
+        let partition = committees::epoch_committees(seed, epoch, consensus_roster);
+        crate::params::rehearsal::RESTORE_ZERO_STAKE_FILTER.store(false, Relaxed);
+        return partition;
     }
     // THE CONTRACT (pending Dev A). Same production function, stakes
     // normalised so the pre-shuffle filter cannot remove anyone — which is

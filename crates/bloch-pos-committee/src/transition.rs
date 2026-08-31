@@ -1565,11 +1565,14 @@ impl CommittedState {
     ///
     /// # The look-ahead
     ///
-    /// `back = 1 + `[`crate::committees::MIN_SEED_LOOKAHEAD_EPOCHS`],
-    /// unconditionally — there is no flag day. See
-    /// [`crate::params`]'s note on the removed
-    /// `ANCESTRY_SEED_ACTIVATION_EPOCH` for why the gate went away with the
-    /// coordinated relaunch, and why that is not a precedent.
+    /// `back = 1 + `[`crate::params::seed_lookahead_at`]`(epoch)` — which is 0
+    /// below [`crate::params::ANCESTRY_SEED_ACTIVATION_EPOCH`] (the original
+    /// rule the existing chain's blocks carry) and
+    /// [`crate::committees::MIN_SEED_LOOKAHEAD_EPOCHS`] at and above it. An
+    /// earlier version of this comment said "unconditionally — there is no
+    /// flag day", recording the 2026-08-24 deletion of the gate; the deletion
+    /// was reversed (see the constant's docs for why the coordinated-relaunch
+    /// premise was wrong) and the comment is corrected with it.
     ///
     /// `back = 2` is what closes finding F6: at `back = 1` the seed for epoch
     /// `E` is the mix at the close of `E − 1`, so the trailing proposers of
@@ -1601,23 +1604,7 @@ impl CommittedState {
         // same function. Changing it unconditionally does not cause a
         // disagreement, it stops the node: `ingest` rejects and returns, and
         // the node parks silently at an old height. See the constant's docs.
-        #[cfg(test)]
-        let gate_open = crate::params::rehearsal::gates_are_forced_open();
-        #[cfg(not(test))]
-        let gate_open = false;
-        let lookahead = if !gate_open && epoch < crate::params::ANCESTRY_SEED_ACTIVATION_EPOCH {
-            0
-        } else {
-            #[cfg(test)]
-            {
-                crate::params::rehearsal::effective_lookahead()
-            }
-            #[cfg(not(test))]
-            {
-                crate::committees::MIN_SEED_LOOKAHEAD_EPOCHS
-            }
-        };
-        let back = 1 + lookahead;
+        let back = 1 + crate::params::seed_lookahead_at(epoch);
         let Some(src) = epoch.checked_sub(back) else {
             return Self::rehearsal_mutate(self.genesis_mix);
         };
@@ -1739,6 +1726,19 @@ impl CommittedState {
             return roster;
         }
         with_leak_applied(roster, |index| self.finality_engine.leaked_of(index))
+    }
+
+    /// Total stake the inactivity leak currently holds against every
+    /// validator, in satoshis — [`finality::FinalityState::leaked_total`]
+    /// surfaced on the committed state so the node's RPC can expose it.
+    ///
+    /// This is the direct observable of the `LEAK_RECOVERY_ACTIVATION_EPOCH`
+    /// flag day (debt 3 of `docs/RELANCA-G4-DIAS-DE-BANDEIRA.md` §3): before
+    /// the gate it is a ratchet that only grows; from the gate on it must
+    /// trend to zero while the fleet participates. A read-only projection —
+    /// nothing here can move consensus.
+    pub fn leaked_total_sat(&self) -> u128 {
+        self.finality_engine.leaked_total()
     }
 
     /// The frozen finality view over the engine's state.
@@ -9005,6 +9005,147 @@ mod tests {
                 "the two rules must first diverge in epoch 1 — epoch 1 is NOT common ground, \
                  because the base rule seeds it from the close of epoch 0 while the look-ahead \
                  seeds it from the genesis mix"
+            );
+        }
+
+        // ── THE FLAG-DAY SEAM ───────────────────────────────────────────────
+        //
+        // The gate tests above cover the two endpoints: shipped-inert (the
+        // rule closed everywhere) and `gates_open_guard` (open everywhere).
+        // The flag day is neither — it is a finite `A` with the old rule
+        // below and the new rule at and above, on one chain. These two tests
+        // place `A` inside a driven chain's range via `gates_armed_at_guard`.
+
+        /// **Arming the seed gate is invisible below it — the rollout-safety
+        /// property.** The same genesis, the same driver, the same slots:
+        /// one chain built by the shipped inert binary, one by a binary
+        /// armed at an epoch beyond the range. Every head id must match bit
+        /// for bit — the id covers the header, the header covers the state
+        /// root, so this is "the armed binary replays the existing log to
+        /// identical roots" in one assertion per slot.
+        ///
+        /// The control arms the gate INSIDE the range instead and demands
+        /// divergence, so a gate that quietly stopped gating cannot pass.
+        #[test]
+        fn arming_the_seed_gate_changes_nothing_below_it() {
+            const SLOTS: u64 = 4 * SLOTS_PER_EPOCH;
+            let inert = chain(8, SLOTS, &[]);
+            let armed = {
+                // Far beyond every epoch this chain reaches.
+                let _armed = crate::params::rehearsal::gates_armed_at_guard(1_000);
+                chain(8, SLOTS, &[])
+            };
+            for slot in 0..=SLOTS as usize {
+                assert_eq!(
+                    inert.states[slot].head, armed.states[slot].head,
+                    "slot {slot}: the chain built by the armed binary diverged from the \
+                     shipped one BELOW the gate — this is the divergence that parks every \
+                     replaying node at this slot"
+                );
+            }
+
+            // Control: armed inside the range, the gate must bite. Epoch 1 is
+            // the first epoch the two rules disagree on (see
+            // `the_two_rules_first_draw_a_different_proposer_at`), so arming
+            // at 1 must move the chain somewhere in the driven range.
+            let armed_low = {
+                let _armed = crate::params::rehearsal::gates_armed_at_guard(1);
+                chain(8, SLOTS, &[])
+            };
+            assert_ne!(
+                inert.states[SLOTS as usize].head, armed_low.states[SLOTS as usize].head,
+                "control: a gate armed at epoch 1 changed nothing over {SLOTS} slots — the \
+                 equality above is being satisfied by a gate that no longer gates"
+            );
+        }
+
+        /// **The gate binds at exactly `A`, the chain crosses it alive, and
+        /// the seam needs no boundary the retention has evicted.**
+        ///
+        /// With `A = 3`: epoch 2 (below) must read the close of epoch 1 —
+        /// the original rule; epoch 3 (at the gate) must read the close of
+        /// epoch 1 as well — the look-ahead rule's `E − 2`, which is the SAME
+        /// boundary, so the flag day's first armed epoch is seeded by a mix
+        /// that was already fixed and already retained, and nothing at the
+        /// seam can reach for an evicted boundary. Epoch 4 then reads the
+        /// close of 2, and the schedule is knowable one epoch ahead from
+        /// there on. The fixture itself is half the proof: `chain()` drives
+        /// real blocks with real quorum attestations through `apply_block`
+        /// across the boundary, so a stall at the seam would fail the driver
+        /// before any assertion runs.
+        #[test]
+        fn the_seed_gate_binds_exactly_at_its_epoch() {
+            const A: u64 = 3;
+            const SLOTS: u64 = 5 * SLOTS_PER_EPOCH;
+            let inert = chain(8, SLOTS, &[]);
+            let _armed = crate::params::rehearsal::gates_armed_at_guard(A);
+            let c = chain(8, SLOTS, &[]);
+
+            // Below the gate the two chains are one chain.
+            for slot in 0..(A * SLOTS_PER_EPOCH) as usize {
+                assert_eq!(
+                    inert.states[slot].head, c.states[slot].head,
+                    "slot {slot} is below the gate's first slot and must be common ground"
+                );
+            }
+            // And the gate really bit: past the boundary they part.
+            assert_ne!(
+                inert.states[SLOTS as usize].head, c.states[SLOTS as usize].head,
+                "control: the armed chain never diverged from the inert one, so A={A} \
+                 changed nothing and the assertions below are vacuous"
+            );
+
+            // Epoch 2, below the gate: the ORIGINAL rule, close of E − 1.
+            let st2 = &c.states[(2 * SLOTS_PER_EPOCH) as usize];
+            assert_eq!(st2.epoch, 2);
+            let close0 = st2.boundary_mixes[&0];
+            let close1 = st2.boundary_mixes[&1];
+            assert_ne!(close0, close1, "control: the two candidate boundaries must differ");
+            assert_eq!(
+                st2.seed_for_epoch(2),
+                close1,
+                "epoch {} (below the gate at {A}) must be seeded by the close of epoch 1 — \
+                 the original rule",
+                2
+            );
+
+            // Epoch 3, AT the gate: the look-ahead rule, close of E − 2 —
+            // which is the close of epoch 1 again. Same boundary, so the
+            // seam is continuous by construction; the partitions still
+            // differ because the epoch number is folded into the XOF seed.
+            let st3 = &c.states[(3 * SLOTS_PER_EPOCH) as usize];
+            assert_eq!(st3.epoch, 3);
+            let c1 = st3.boundary_mixes[&1];
+            let c2 = st3.boundary_mixes[&2];
+            assert_ne!(c1, c2, "control: the two candidate boundaries must differ");
+            assert_eq!(
+                st3.seed_for_epoch(3),
+                c1,
+                "epoch 3 (the gate epoch) must be seeded by the close of epoch 1 — E − 2, \
+                 the look-ahead rule. Reading the close of epoch 2 here means the gate did \
+                 not bind at its own epoch"
+            );
+            let roster = st3.consensus_roster_at(3);
+            assert_ne!(
+                committees::epoch_committees(&c1, 2, &roster),
+                committees::epoch_committees(&c1, 3, &roster),
+                "epochs 2 and 3 share a seed mix at the seam and must still partition \
+                 differently — the epoch number is folded into the XOF seed"
+            );
+
+            // Epoch 4, above the gate: close of E − 2 = close of 2, retained.
+            let st4 = &c.states[(4 * SLOTS_PER_EPOCH) as usize];
+            assert_eq!(st4.epoch, 4);
+            assert_eq!(
+                st4.seed_for_epoch(4),
+                st4.boundary_mixes[&2],
+                "epoch 4 (above the gate) must be seeded by the close of epoch 2"
+            );
+            // The grinding window is closed from the gate on: the seed of the
+            // OPEN epoch's successor is already fixed by a retained boundary.
+            assert!(
+                st4.boundary_mixes.contains_key(&3),
+                "retention must still hold the close of epoch 3 while epoch 4 is open"
             );
         }
     }

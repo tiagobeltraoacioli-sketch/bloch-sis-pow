@@ -805,8 +805,23 @@ impl Engine {
     /// "both ends compute membership from the same finalized state", and a
     /// node that cannot reach the branch is not in a position to make that
     /// claim about anybody.
+    ///
+    /// # The look-ahead is the transition's, through the one shared reader
+    ///
+    /// `params::seed_lookahead_at(epoch)` — NOT a local copy of the
+    /// arithmetic. This function used to hard-code
+    /// `MIN_SEED_LOOKAHEAD_EPOCHS`: it was written in the window when the
+    /// flag day had been deleted and the look-ahead was unconditional, and
+    /// when `ANCESTRY_SEED_ACTIVATION_EPOCH` was restored in the committee
+    /// crate this copy was not re-gated. From then until the shared reader,
+    /// the judge derived committees from the close of `E − 2` while the
+    /// transition — and therefore every attester's own duty derivation via
+    /// [`Self::seed_for`] — used the close of `E − 1`, so honest gossiped
+    /// attestations were answered `Reject(NotInCommittee)`, penalizing the
+    /// relaying peer and starving proposer pools of every vote except the
+    /// proposer's own. One rule, one spelling; the gate travels with it.
     fn seed_for_attestation(&self, target_root: &[u8; 32], epoch: u64) -> Option<[u8; 32]> {
-        match epoch.checked_sub(committees::MIN_SEED_LOOKAHEAD_EPOCHS) {
+        match epoch.checked_sub(bloch_pos_committee::params::seed_lookahead_at(epoch)) {
             None => Some(GENESIS_MIX),
             Some(src) => self.ancestral_boundary_mix(target_root, src),
         }
@@ -5689,5 +5704,124 @@ mod duty_view_anchor {
             partition_caught_up.len()
         );
         assert!(moved > 0);
+    }
+
+    /// **The gossip judge and the duty path derive ONE committee below the
+    /// gate.**
+    ///
+    /// The attestation is built exactly as [`Engine::attest`] builds it — the
+    /// duty slot found through `rolled_to` + `seed_for`, the transition's
+    /// gated rule — signed with the validator's real key, and handed to
+    /// [`Engine::judge`], which is the path every attestation ARRIVING OVER
+    /// GOSSIP takes. It must come back `Accept`.
+    ///
+    /// This went red against the tree as it stood: `seed_for_attestation`
+    /// carried its own ungated copy of the look-ahead (written in the window
+    /// when the flag day had been deleted, not re-gated when the gate was
+    /// restored), so below `ANCESTRY_SEED_ACTIVATION_EPOCH` the judge derived
+    /// the close-of-`E − 2` committees while the attester's duty and the
+    /// transition's admission used the close of `E − 1`. An honest vote was
+    /// answered `Reject(NotInCommittee)` — a peer penalty for the relayer and
+    /// a vote that never reached a proposer's pool. Both readers now go
+    /// through `params::seed_lookahead_at`, so this cannot silently split
+    /// again without this test failing.
+    ///
+    /// # Why EVERY epoch, judged AT ITS OWN TIME, and the discriminance control
+    ///
+    /// The first version of this test judged one attestation for one epoch,
+    /// and it passed with the ungated copy restored — the mutation did not
+    /// bite: the judged epoch's two candidate boundaries (`close(E − 1)` and
+    /// `close(E − 2)`) coincide whenever epoch `E − 1` produced no block, and
+    /// even when they differ, the duty slot drawn under one partition can
+    /// collide with the slot drawn under the other. So this version judges
+    /// v0's honest vote in every epoch — and it does so WHILE THE CHAIN IS IN
+    /// that epoch, because deriving a past epoch's duty from today's head
+    /// falls off the two-boundary RANDAO retention and answers with the
+    /// genesis mix (the anchor caveat this module documents). It requires at
+    /// least two epochs in which the candidate boundaries actually differ, or
+    /// the fixture is declared too weak.
+    #[test]
+    fn the_judge_accepts_every_attestation_the_duty_path_produces() {
+        let (mut engine, _dir) = engine_with_registry(8);
+        let mut discriminating = 0usize;
+        let mut judged = 0usize;
+        for slot in 1..=(SLOTS_PER_EPOCH * 5) {
+            engine.propose(slot);
+            // Judge each epoch once, at its last slot — the chain is inside
+            // the epoch, exactly as a live judge would be.
+            if slot % SLOTS_PER_EPOCH != SLOTS_PER_EPOCH - 1 {
+                continue;
+            }
+            let e = epoch_of(slot);
+            if e < 2 {
+                continue; // the two look-ahead rules do not separate below epoch 2
+            }
+
+            let rolled = engine.rolled_to(e);
+            // Control: can this epoch tell the two rules apart? Retention
+            // holds exactly {e − 2, e − 1} while e is open.
+            let newer = rolled.randao_mix_at(e - 1);
+            let older = rolled.randao_mix_at(e - 2);
+            if newer.is_some() && older.is_some() && newer != older {
+                discriminating += 1;
+            }
+
+            // The attester's own duty derivation, verbatim from `attest`.
+            let roster = rolled.active_validators();
+            let seed = Engine::seed_for(&rolled, e);
+            let duty_slot = (e * SLOTS_PER_EPOCH..(e + 1) * SLOTS_PER_EPOCH)
+                .find(|s| {
+                    committees::committee_for_slot(&seed, *s, &roster)
+                        .binary_search(&0)
+                        .is_ok()
+                })
+                .expect("validator 0 must hold exactly one slot seat in its epoch's partition");
+            let fin = rolled.finality();
+            let data = AttestationData {
+                slot: duty_slot,
+                head: *engine.head_id().as_bytes(),
+                source_epoch: fin.justified.epoch,
+                source_root: fin.justified.root,
+                target_epoch: e,
+                target_root: engine.checkpoint_root(e),
+            };
+            let att = Attestation {
+                signature: engine
+                    .keys
+                    .as_ref()
+                    .expect("fixture holds v0's key")
+                    .sign(&data.signing_root()),
+                data,
+                validator: 0,
+            };
+
+            // The receiving side: the same engine, judging the vote as if it
+            // had arrived over gossip. A fresh pool per epoch, so dedup from
+            // one epoch cannot mask a verdict in the next.
+            engine.wall_slot = duty_slot.max(slot);
+            let mut pool = AttestationPool::new();
+            let decision = engine.judge(&mut pool, att, e);
+            assert!(
+                matches!(decision, GossipDecision::Accept { .. }),
+                "epoch {e}: an attestation built by the duty path was not admitted by the \
+                 gossip judge (got {decision:?}). Below the gate both must read the close of \
+                 epoch {} — if the judge read the close of epoch {} instead, its look-ahead \
+                 copy has come ungated from the transition's again",
+                e - 1,
+                e - 2,
+            );
+            judged += 1;
+        }
+        assert!(judged >= 3, "only {judged} epochs were judged; the fixture is too short");
+        assert!(
+            discriminating >= 2,
+            "only {discriminating} epoch(s) had close(E-1) != close(E-2): the fixture \
+             cannot tell the two look-ahead rules apart and the Accepts above prove nothing \
+             — drive more slots"
+        );
+        println!(
+            "judge/duty agreement: v0's honest vote ACCEPTED in {judged} epochs \
+             ({discriminating} of them discriminating between the two look-ahead rules)"
+        );
     }
 }

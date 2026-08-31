@@ -1230,6 +1230,11 @@ pub fn chain_info_json(
             ]),
         ),
         ("total_active_stake_sat", Json::sat(state.total_active_stake_sat())),
+        // The inactivity-leak accumulator, whole-fleet total. The direct
+        // observable of the LEAK_RECOVERY flag day: a ratchet before the gate,
+        // a debt trending to zero after it (runbook
+        // docs/RELANCA-G4-DIAS-DE-BANDEIRA.md §3, debt 3 / §4.4).
+        ("leaked_total_sat", Json::sat(state.leaked_total_sat())),
         ("base_fee_millisat_per_gas", Json::sat(state.base_fee_millisat_per_gas())),
         ("next_base_fee_millisat_per_gas", Json::sat(state.next_base_fee())),
         ("mempool", Json::u(mempool as u64)),

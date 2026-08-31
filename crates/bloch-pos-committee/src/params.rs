@@ -307,45 +307,26 @@ pub const TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH: u64 = 800;
 /// the 2026-08-08 `expected_bits` fork cost us.
 pub const BLOCK_BYTES_V2_ACTIVATION_EPOCH: u64 = 800;
 
-/// **The F6 seed look-ahead is UNCONDITIONAL.** There is no flag day.
-///
-/// `CommittedState::seed_for_epoch` seeds epoch `E` from the mix at the close
-/// of `E − 1 − `[`crate::committees::MIN_SEED_LOOKAHEAD_EPOCHS`], always. It
-/// was written behind an inert `ANCESTRY_SEED_ACTIVATION_EPOCH` gate first,
-/// and the gate was REMOVED on the founder's instruction (2026-08-24): the
-/// relaunch is a coordinated convergence — one storage state installed on all
-/// 64 validators, all restarted together — so there is no live network for a
-/// gradual rollout to split, which is the only thing the gate bought. Deleting
-/// it also deletes the way it could go wrong: an activation epoch armed in the
-/// past, which is how 1,600,000 BLCH once escaped a write-off that never
-/// fired.
-///
-/// **What this means for anyone reading later.** The rule is now implicit in
-/// the binary rather than dated in a constant, so "which seed rule does this
-/// chain run" is answered by the release, not by the state. Any FUTURE change
-/// to `seed_for_epoch` on a live network needs a gate again — this note is not
-/// a precedent for changing consensus without one.
-///
-/// # What the look-ahead closes
-///
-/// F6, proposer grinding: at `back = 1` the seed for `E` is the mix at the
-/// close of `E − 1`, so the trailing proposers of `E − 1` see the partition
-/// their own reveal produces before they must publish it, and can re-sort `E`
-/// by withholding.
-///
-/// It also removes the sub-epoch-lag case of the duty-view ANCHOR defect,
-/// because the `E − 2` mix is frozen before `E − 1` begins. It is a mitigation
-/// of that defect, not a fix; the fix is anchoring the duty view to the
-/// ancestry of the thing being judged (`bloch-pos-node/src/engine.rs`).
-///
-/// # It costs nothing at the seam
-///
-/// `close_epoch` retains [`crate::state_root::RANDAO_BOUNDARIES_RETAINED`]` =
-/// 2` boundaries, so while `E` is open the state holds `{E − 2, E − 1}`. The
-/// rule reads `E − 2`, already there. No retention change, and therefore no
-/// state-root change — `state_root::randao_window` folds exactly the retained
-/// boundaries into the tree. Pinned by
-/// `the_rule_reads_a_boundary_the_state_still_retains`.
+// ── The F6 seed look-ahead is GATED, not unconditional ─────────────────────
+//
+// A previous version of this comment declared the look-ahead "UNCONDITIONAL —
+// there is no flag day", recording the 2026-08-24 decision to delete
+// `ANCESTRY_SEED_ACTIVATION_EPOCH`. That decision was reversed and the gate
+// was restored, because the premise ("a coordinated relaunch has no live
+// network to split") was wrong: boot is a REPLAY of the block log, and a
+// binary running the new rule against a log produced under the old one parks
+// silently at epoch 1. The comment outlived the reversal by 230 lines, which
+// is exactly the defect class a stale consensus comment is.
+//
+// The rule as shipped: below [`ANCESTRY_SEED_ACTIVATION_EPOCH`] the seed for
+// epoch `E` is the mix at the close of `E − 1` (the original rule, the one
+// the existing chain's blocks carry); at and above it, the close of
+// `E − 1 − MIN_SEED_LOOKAHEAD_EPOCHS`. The full reasoning — what F6 closes,
+// why the retention window already covers `E − 2`, and why the gate exists —
+// lives on the constant itself (below) and on
+// [`crate::transition::CommittedState::seed_for_epoch`]. The look-ahead in
+// force at any epoch is answered by exactly one function,
+// [`seed_lookahead_at`], and every production reader must go through it.
 
 /// Test-only rehearsal hook. `cfg(test)`, so it cannot exist in a shipped
 /// binary. Flips one bit of every seed, so the deterministic chain comparator
@@ -459,6 +440,46 @@ pub mod rehearsal {
             }
         }
         let prev = GATES_OPEN_TL.with(|c| c.replace(true));
+        Restore(prev)
+    }
+
+    thread_local! {
+        static ARMED_AT_TL: Cell<Option<u64>> = const { Cell::new(None) };
+    }
+
+    /// Test-only: the epoch both gates behave as ARMED AT on this thread, if a
+    /// test has set one. `None` in every other circumstance, including all
+    /// shipped builds — the production gate readers consult this only under
+    /// `cfg(test)`.
+    ///
+    /// This exists because [`gates_are_forced_open`] can only model the two
+    /// endpoints — gate closed everywhere (`u64::MAX`) or open everywhere
+    /// (epoch 0) — and neither endpoint contains the flag day itself. The
+    /// property the live chain's safety rests on is the SEAM: a binary armed
+    /// at epoch `A` must be bit-identical to the inert one for every epoch
+    /// below `A`, and must apply the new rule from `A` exactly. Without a way
+    /// to place `A` inside a test's reachable range, that property is dead
+    /// code until it fires on mainnet — which is the one place it must never
+    /// fire first.
+    pub fn armed_activation_epoch() -> Option<u64> {
+        ARMED_AT_TL.with(Cell::get)
+    }
+
+    /// Arms both gates at `epoch` for this thread until the returned guard
+    /// drops — including on the unwind path, so a failing assertion cannot
+    /// leave the gates armed for the rest of the thread.
+    ///
+    /// Precedence: [`gates_open_guard`] (open everywhere) wins over this if
+    /// both are set, mirroring the reader in [`super::ancestry_seed_gate_epoch`].
+    #[cfg(test)]
+    pub fn gates_armed_at_guard(epoch: u64) -> impl Drop {
+        struct Restore(Option<u64>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                ARMED_AT_TL.with(|c| c.set(self.0));
+            }
+        }
+        let prev = ARMED_AT_TL.with(|c| c.replace(Some(epoch)));
         Restore(prev)
     }
 
@@ -595,6 +616,87 @@ pub const ANCESTRY_SEED_ACTIVATION_EPOCH: u64 = u64::MAX;
 ///
 /// `u64::MAX` means INERT. Same arming rules as above.
 pub const LEAK_RECOVERY_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+/// The epoch [`ANCESTRY_SEED_ACTIVATION_EPOCH`]'s readers actually compare
+/// against in THIS build.
+///
+/// In a shipped binary this **is** the constant — `#[inline]`, no state, the
+/// comparison folds at compile time. In a test build the rehearsal hooks may
+/// move it on the current thread only: [`rehearsal::gates_open_guard`] forces
+/// it to 0 (armed everywhere), [`rehearsal::gates_armed_at_guard`] places it
+/// at a chosen epoch so the SEAM — inert below, armed at and above — is
+/// reachable by a test. Every production read of the gate goes through here;
+/// a second reader comparing the raw constant would silently not take the
+/// rehearsal, which is how the engine's copy of the look-ahead drifted from
+/// the transition's in the first place.
+#[inline]
+pub fn ancestry_seed_gate_epoch() -> u64 {
+    #[cfg(test)]
+    {
+        if rehearsal::gates_are_forced_open() {
+            return 0;
+        }
+        if let Some(e) = rehearsal::armed_activation_epoch() {
+            return e;
+        }
+    }
+    ANCESTRY_SEED_ACTIVATION_EPOCH
+}
+
+/// The epoch [`LEAK_RECOVERY_ACTIVATION_EPOCH`]'s readers actually compare
+/// against in THIS build. Same contract as [`ancestry_seed_gate_epoch`].
+#[inline]
+pub fn leak_recovery_gate_epoch() -> u64 {
+    #[cfg(test)]
+    {
+        if rehearsal::gates_are_forced_open() {
+            return 0;
+        }
+        if let Some(e) = rehearsal::armed_activation_epoch() {
+            return e;
+        }
+    }
+    LEAK_RECOVERY_ACTIVATION_EPOCH
+}
+
+/// The seed look-ahead in force at `epoch` — **the one spelling of the F6
+/// rule**, consulted by [`crate::transition::CommittedState::seed_for_epoch`]
+/// and by the node's attestation-judging path
+/// (`bloch-pos-node/src/engine.rs::seed_for_attestation`).
+///
+/// Below [`ANCESTRY_SEED_ACTIVATION_EPOCH`] it is 0: the seed for `E` is the
+/// close of `E − 1`, the original rule the existing chain's blocks were
+/// produced and validated under. At and above the gate it is
+/// [`crate::committees::MIN_SEED_LOOKAHEAD_EPOCHS`].
+///
+/// # Why this must be the only spelling
+///
+/// The node's gossip judge carried its own copy of this arithmetic. It was
+/// written in the window when the gate had been deleted (2026-08-24) and the
+/// look-ahead was unconditional; when the gate was restored in the committee
+/// crate, the copy was not re-gated. Result, live on mainnet until this
+/// function unified them: the transition admitted attestations under the
+/// close-of-`E − 1` committees (gate closed) while the gossip judge derived
+/// the close-of-`E − 2` committees (gate ignored) — so honest attestations
+/// arriving over gossip were answered `Reject(NotInCommittee)` and never
+/// reached a proposer's pool, and quorum leaned on validators large enough to
+/// include their own votes in their own blocks. Two spellings of one
+/// consensus-adjacent rule is the `expected_bits` defect class; this function
+/// is the fix's shape: one authority, everyone calls it.
+#[inline]
+pub fn seed_lookahead_at(epoch: u64) -> u64 {
+    if epoch < ancestry_seed_gate_epoch() {
+        return 0;
+    }
+    #[cfg(test)]
+    {
+        crate::params::rehearsal::effective_lookahead()
+    }
+    #[cfg(not(test))]
+    {
+        crate::committees::MIN_SEED_LOOKAHEAD_EPOCHS
+    }
+}
 
 /// Domain separation tags (§6.1). Fixed 16 bytes, right-padded with zeros, so
 /// no tag can be a prefix of another.
