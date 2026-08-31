@@ -1198,7 +1198,10 @@ pub struct CommittedState {
     /// exactly what leaves the set, pinned by test) and **not** across the two
     /// pools. Closing it means giving deposits and withdrawals eUTXO inputs
     /// and outputs, which is a change to the staking messages' wire shape and
-    /// to their admission rules, not to this field. Until then, no single
+    /// to their admission rules, not to this field. The flag day that retires
+    /// the unfunded shapes ships inert as
+    /// [`crate::params::UNFUNDED_BONDING_RETIREMENT_EPOCH`], and the funded
+    /// replacements must land behind that same epoch. Until then, no single
 
     /// number in this state is "the supply".
     eutxos: EutxoSet,
@@ -1981,6 +1984,21 @@ impl CommittedState {
                 withdrawal_credentials,
                 commission_bps,
             } => {
+                // THE RETIREMENT GATE, FIRST — before any other look at the
+                // message. An unfunded deposit mints bonded weight from
+                // nothing (the "Bonding is not funded from this set" note on
+                // `eutxos`); the node's mempool refusal (`engine::admissible`)
+                // cannot bind a proposer writing its own block, so from the
+                // flag day the transition itself refuses. Reads `self.epoch` —
+                // COMMITTED state, rolled by `close_epoch` — never anything
+                // node-local (the 2026-08-08 `expected_bits` fork is the
+                // standing reason). INERT until
+                // `params::UNFUNDED_BONDING_RETIREMENT_EPOCH` is lowered,
+                // which must happen only together with the funded replacement
+                // shapes (see the constant's doc).
+                if self.epoch >= crate::params::UNFUNDED_BONDING_RETIREMENT_EPOCH {
+                    return Err(TxReject::StakingRule);
+                }
                 let pubkey_hash: [u8; 32] = Sha3_256::digest(pubkey).into();
                 // A second deposit of a registered key is a top-up path
                 // decision the interface refuses to make implicitly.
@@ -2048,6 +2066,14 @@ impl CommittedState {
                 Ok(free)
             }
             PosTransaction::Delegate { delegator, validator, amount_sat, eligible } => {
+                // Same retirement gate as `Deposit`, for the same reason: an
+                // unfunded delegation names an `amount_sat`, spends no output,
+                // carries no signature, and from the next epoch that amount
+                // weighs in the duty roster. Gate FIRST, before any
+                // state-dependent check.
+                if self.epoch >= crate::params::UNFUNDED_BONDING_RETIREMENT_EPOCH {
+                    return Err(TxReject::StakingRule);
+                }
                 let Some(rec) = self.validators.get(validator) else {
                     return Err(TxReject::StakingRule);
                 };
@@ -4727,6 +4753,73 @@ mod tests {
             ),
             Err(TxReject::StakingRule)
         );
+    }
+
+    /// The unfunded-bonding retirement gate ships INERT. Same tripwire idiom
+    /// as the leaked-roster epoch: it compares the constant against a copy of
+    /// itself, so it catches a SILENT change, not the constant being wrong.
+    /// Lowering it is a flag day across the fleet, never a local edit.
+    #[test]
+    fn unfunded_bonding_retirement_ships_inert() {
+        assert_eq!(crate::params::UNFUNDED_BONDING_RETIREMENT_EPOCH, u64::MAX);
+    }
+
+    /// From the retirement epoch the transition itself refuses the unfunded
+    /// staking messages — the consensus-side closure of the mint the node's
+    /// mempool refusal (`engine::admissible`) can only paper over: a proposer
+    /// writing its own block never consults a mempool.
+    ///
+    /// The gate must fire FIRST, before any state-dependent check. For
+    /// `Delegate` the ordering is load-bearing and this test proves it: the
+    /// arm computes `self.epoch + 1` for the request epoch, which at
+    /// `u64::MAX` overflows in debug — reaching that line would panic, so the
+    /// clean `StakingRule` reject is itself the proof the gate ran first.
+    #[test]
+    fn unfunded_staking_is_refused_from_the_retirement_epoch() {
+        let (_t, g, _chains) = setup(4);
+        let mut st = g.clone();
+        // The gate reads committed epoch; model a state whose committed epoch
+        // has reached the (inert, u64::MAX) retirement point.
+        st.epoch = crate::params::UNFUNDED_BONDING_RETIREMENT_EPOCH;
+
+        let deposit = PosTransaction::Deposit {
+            pubkey: vec![0xAA; 8],
+            amount_sat: staking::MIN_DEPOSIT_SAT,
+            randao_commitment: [0xBB; 32],
+            withdrawal_credentials: vec![0xCC; 4],
+            commission_bps: 500,
+        };
+        assert_eq!(
+            st.apply_transaction(
+                &deposit,
+                0,
+                fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+                &OkVerifier
+            ),
+            Err(TxReject::StakingRule),
+            "a deposit at the retirement epoch must be refused by consensus"
+        );
+        assert!(st.validator_record(4).is_none(), "the refusal must leave no record");
+
+        // Validator 0 exists and is live, so the only rule this can trip is
+        // the gate — not a missing-validator or slashed/exiting check.
+        let delegate = PosTransaction::Delegate {
+            delegator: 900,
+            validator: 0,
+            amount_sat: delegation::MIN_DELEGATION_SAT,
+            eligible: true,
+        };
+        assert_eq!(
+            st.apply_transaction(
+                &delegate,
+                0,
+                fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+                &OkVerifier
+            ),
+            Err(TxReject::StakingRule),
+            "a delegation at the retirement epoch must be refused by consensus"
+        );
+        assert!(st.delegations.is_empty(), "the refusal must record nothing");
     }
 
     #[test]

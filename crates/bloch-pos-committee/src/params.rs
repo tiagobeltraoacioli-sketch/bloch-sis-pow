@@ -596,6 +596,46 @@ pub const ANCESTRY_SEED_ACTIVATION_EPOCH: u64 = u64::MAX;
 /// `u64::MAX` means INERT. Same arming rules as above.
 pub const LEAK_RECOVERY_ACTIVATION_EPOCH: u64 = u64::MAX;
 
+/// Flag day that RETIRES the unfunded staking messages — `Deposit` (wire tag
+/// `0x02`) and `Delegate` (tag `0x04`) — from block bodies.
+///
+/// From this epoch on, `CommittedState::apply_transaction` refuses both, which
+/// makes any block carrying one invalid everywhere. Below it nothing changes:
+/// `u64::MAX` means INERT, the [`ANCESTRY_SEED_ACTIVATION_EPOCH`] idiom — the
+/// gate ships in every binary and changes what a block may carry only when
+/// this constant is lowered and the fleet is rebuilt together.
+///
+/// # The hole this exists to close
+///
+/// Neither message spends an output or carries a signature: each names an
+/// `amount_sat` and the transition mints that much bonded weight from nothing
+/// (the "Bonding is not funded from this set" note on the committed `eutxos`
+/// field is the ledger-side statement of the same gap). The node's mempool
+/// refuses both (`engine::admissible`, measured 2026-08-13 at 25,000 BLCH of
+/// stake per unauthenticated request), but a mempool refusal is node-local: a
+/// proposer that writes one into its own block bypasses every mempool on the
+/// network, and every honest node applies the result. Closing *that* path
+/// changes which blocks are acceptable, so it cannot arrive by whoever
+/// restarts first — it arrives here, by flag day.
+///
+/// # Arming this constant is a decision about validator entry
+///
+/// Retirement alone closes staking entry permanently: no deposit message, no
+/// new validators, no delegation, ever. So this must be lowered only together
+/// with the funded replacements — deposit and delegation shapes that spend
+/// eUTXO inputs under a witness, name the delegator by the key that funded
+/// the bond, and give deactivation and withdrawal their own messages back
+/// into the eUTXO set — landing under NEW wire tags gated on this same epoch,
+/// so one constant swaps the unfunded surface for the funded one atomically.
+/// Arming it without them is choosing to have no staking entry at all, which
+/// must never happen by accident.
+///
+/// Same arming rules as [`ANCESTRY_SEED_ACTIVATION_EPOCH`]: strictly in the
+/// future, only after the rollout completes, and the gate reads the COMMITTED
+/// epoch — never a local clock, which is what the 2026-08-08 `expected_bits`
+/// fork cost us.
+pub const UNFUNDED_BONDING_RETIREMENT_EPOCH: u64 = u64::MAX;
+
 /// Domain separation tags (§6.1). Fixed 16 bytes, right-padded with zeros, so
 /// no tag can be a prefix of another.
 pub const DS_SORTITION: [u8; 16] = *b"BLCH4:SORTIT\0\0\0\0";

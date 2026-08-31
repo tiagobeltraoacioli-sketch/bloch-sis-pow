@@ -2727,7 +2727,11 @@ pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'s
         // already carries a deposit still applies it. It closes the path anyone
         // can reach and buys time to close the real one — giving deposits and
         // withdrawals eUTXO inputs and outputs, which is a wire-format change
-        // and needs a flag day.
+        // and needs a flag day. The consensus side of that flag day now exists,
+        // inert: `params::UNFUNDED_BONDING_RETIREMENT_EPOCH` (u64::MAX) gates
+        // both arms in `CommittedState::apply_transaction`, and lowering it —
+        // together with the funded replacement shapes — is what finally binds
+        // a proposer too.
         PosTransaction::Deposit { .. } => Err(
             "deposits are not accepted: bonding is not yet funded from the UTXO set, \
              so a deposit would create stake without spending coins",
