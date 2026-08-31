@@ -267,3 +267,130 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod scan {
+    //! One-shot replay-precondition scanner for the 2026-08-31 staking
+    //! closure (the consensus rejection of tags `0x02`/`0x03`/`0x04`).
+    //!
+    //! The RPC exposes only `tx_count`, so whether any live block carries a
+    //! staking message cannot be answered from outside the node. This test
+    //! answers it with the node's own machinery — [`Store::read_all`]'s
+    //! framing and `PosTransaction::from_canonical_bytes`, the same decode
+    //! replay runs (`engine::body_transactions`) — never a byte grep, so a
+    //! `0x02` inside a witness table or an evidence payload cannot be
+    //! miscounted as a staking message.
+    //!
+    //! Run against a copied mainnet log (copy READ-ONLY off a fleet host):
+    //!
+    //! ```text
+    //! mkdir -p /tmp/mainnet-scan && cp /tmp/mainnet-blocks.log /tmp/mainnet-scan/blocks.log
+    //! SCAN_BLOCKS_LOG=/tmp/mainnet-scan cargo test -p bloch-pos-node --bins \
+    //!     scan_block_log_for_staking_tags -- --ignored --nocapture
+    //! ```
+    //!
+    //! `#[ignore]` because it needs a real chain log; it is a diagnostic,
+    //! not a CI assertion. The final assert encodes the rollout question:
+    //! it FAILS if any block anywhere carries tag 0x02, 0x03 or 0x04 —
+    //! in which case the every-epoch rejection would strand replay at that
+    //! block and must instead ship behind an activation gate above it.
+
+    use super::Store;
+    use bloch_pos_committee::transition::{PosTransaction, TxDecodeError};
+    use std::path::Path;
+
+    #[test]
+    #[ignore]
+    fn scan_block_log_for_staking_tags() {
+        let dir = std::env::var("SCAN_BLOCKS_LOG")
+            .expect("set SCAN_BLOCKS_LOG to a directory containing blocks.log");
+        // The digest only matters for a dir that already has a meta.bin;
+        // a bare copied blocks.log gets a fresh marker and is read as-is.
+        let store = Store::open(Path::new(&dir), &[0u8; 32]).expect("open scan dir");
+        let envs = store.read_all().expect("read the block log");
+
+        let mut blocks_with_txs = 0usize;
+        let mut tx_total = 0usize;
+        // Counts indexed by wire tag byte (first byte of the canonical
+        // encoding), populated only after the REAL decoder has classified
+        // the bytes.
+        let mut by_tag: std::collections::BTreeMap<u8, usize> = std::collections::BTreeMap::new();
+        // The rollout question: every staking-tagged transaction, located.
+        let mut staking_hits: Vec<(usize, u64, u8)> = Vec::new(); // (log index, slot, tag)
+        let mut undecodable: Vec<(usize, u64, String)> = Vec::new();
+
+        for (i, env) in envs.iter().enumerate() {
+            if env.body.transactions.is_empty() {
+                continue;
+            }
+            blocks_with_txs += 1;
+            for bytes in &env.body.transactions {
+                tx_total += 1;
+                let tag = *bytes.first().expect("empty tx bytes in a stored body");
+                match PosTransaction::from_canonical_bytes(bytes) {
+                    Ok(tx) => {
+                        // Classify by the DECODED variant; then sanity-pin
+                        // that the wire tag agrees with it.
+                        let decoded_tag = match tx {
+                            PosTransaction::Transfer { .. } => 0x01,
+                            PosTransaction::Deposit { .. } => 0x02,
+                            PosTransaction::Exit { .. } => 0x03,
+                            PosTransaction::Delegate { .. } => 0x04,
+                            PosTransaction::SlashingEvidence(_) => 0x05,
+                            PosTransaction::TransferV2 { .. } => 0x06,
+                        };
+                        assert_eq!(tag, decoded_tag, "wire tag vs decoded variant");
+                        *by_tag.entry(tag).or_insert(0) += 1;
+                        if matches!(tag, 0x02 | 0x03 | 0x04) {
+                            staking_hits.push((i, env.header.slot, tag));
+                        }
+                    }
+                    // Tag 0x05 is one-way by construction; a stored one
+                    // would ALREADY break replay today. Count it, loudly.
+                    Err(TxDecodeError::EvidenceNotDecodable) => {
+                        *by_tag.entry(0x05).or_insert(0) += 1;
+                        undecodable.push((i, env.header.slot, "evidence (0x05)".into()));
+                    }
+                    Err(e) => {
+                        undecodable.push((i, env.header.slot, format!("{e:?} (tag {tag:#04x})")));
+                    }
+                }
+            }
+        }
+
+        println!("blocks in log:            {}", envs.len());
+        println!("blocks carrying txs:      {blocks_with_txs}");
+        println!("transactions total:       {tx_total}");
+        for (tag, n) in &by_tag {
+            let name = match tag {
+                0x01 => "Transfer",
+                0x02 => "Deposit  (LEGACY STAKING)",
+                0x03 => "Exit     (LEGACY STAKING)",
+                0x04 => "Delegate (LEGACY STAKING)",
+                0x05 => "SlashingEvidence",
+                0x06 => "TransferV2",
+                _ => "??",
+            };
+            println!("  tag {tag:#04x} {name:<26} {n}");
+        }
+        for (i, slot, tag) in &staking_hits {
+            println!("STAKING TX IN LOG: log index {i}, slot {slot}, tag {tag:#04x}");
+        }
+        for (i, slot, why) in &undecodable {
+            println!("UNDECODABLE TX: log index {i}, slot {slot}: {why}");
+        }
+
+        assert!(
+            undecodable.is_empty(),
+            "the log holds transactions replay cannot decode — see the lines above"
+        );
+        assert!(
+            staking_hits.is_empty(),
+            "REPLAY PRECONDITION FAILED: {} staking-tagged transaction(s) exist in the live \
+             log (lines above). The every-epoch rejection of tags 0x02/0x03/0x04 would strand \
+             every upgraded node at the first of those blocks; the rejection must ship behind \
+             an activation gate keyed ABOVE the last of them instead.",
+            staking_hits.len()
+        );
+    }
+}

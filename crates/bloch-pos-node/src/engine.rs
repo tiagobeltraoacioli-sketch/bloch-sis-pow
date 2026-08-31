@@ -2766,11 +2766,16 @@ pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'s
         // to a third of the active stake and stop finality, a hundred and
         // eighty to two thirds and take the chain.
         //
-        // This is a node-side refusal, not a consensus rule: a block that
-        // already carries a deposit still applies it. It closes the path anyone
-        // can reach and buys time to close the real one — giving deposits and
-        // withdrawals eUTXO inputs and outputs, which is a wire-format change
-        // and needs a flag day.
+        // Since 2026-08-31 this refusal is ALSO a consensus rule: the
+        // `Deposit`/`Delegate`/`Exit` arms in `apply_transaction` reject the
+        // legacy encodings at every epoch (`TxReject::StakingNotActive`,
+        // transition.rs), so a block carrying one is rejected wholesale even
+        // when a committee member proposes it — the path this mempool door
+        // never covered. This arm stays as the cheap outer refusal; the
+        // funded/signed successors land behind
+        // `params::FUNDED_STAKING_ACTIVATION_EPOCH` /
+        // `params::SIGNED_EXIT_ACTIVATION_EPOCH`, and admitting them once
+        // armed means teaching THIS function their formats too.
         PosTransaction::Deposit { .. } => Err(
             "deposits are not accepted: bonding is not yet funded from the UTXO set, \
              so a deposit would create stake without spending coins",
@@ -2926,13 +2931,17 @@ pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'s
             }
             Ok(())
         }
-        // Exit is UNAUTHENTICATED: its arm in transition.rs checks registry
-        // state and never touches a verifier, and this catch-all used to admit
-        // it. Sixty-four Exit messages would set exit_epoch on all sixty-four
-        // validators, and an exit cannot be revoked (`exit_epoch != u64::MAX`
-        // is refused), so the roster would empty and every bond lock for
-        // 2,080 epochs. Refused until the message carries a signature that
-        // binds it to the validator's own key.
+        // Exit (tag 0x03) is UNAUTHENTICATED — an index and nothing else —
+        // and this catch-all used to admit it. Sixty-four Exit messages would
+        // set exit_epoch on all sixty-four validators, and an exit cannot be
+        // revoked (`exit_epoch != u64::MAX` is refused), so the roster would
+        // empty and every bond lock for 2,080 epochs. Since 2026-08-31 the
+        // transition rejects this encoding at every epoch too
+        // (`TxReject::StakingNotActive`) — the arm that applied it from a
+        // bare index is gone; the signed successor (`staking::ExitTx`,
+        // verified by `staking::validate_exit` through
+        // `CommittedState::apply_exit`) lands behind
+        // `params::SIGNED_EXIT_ACTIVATION_EPOCH`.
         PosTransaction::Exit { .. } => Err(
             "exits are not accepted: the Exit message is not authenticated, \
              so anyone could retire any validator irreversibly",
