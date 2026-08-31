@@ -1158,6 +1158,36 @@ pub struct CommittedState {
     /// they widen the gap below the cap, and the invariant is one-sided
     /// (`issued_sat <= TOTAL_SUPPLY_SAT`, enforced in `compute_post_state`).
     issued_sat: u128,
+    /// Total value inside the Coherence shielded pool, in satoshis — the
+    /// turnstile (2026-08-29), committed under `TAG_SHIELDED_POOL`.
+    ///
+    /// Every shield adds to it, every unshield subtracts from it, and the
+    /// subtraction is **checked**: an unshield naming more than the pool
+    /// holds is refused (`TransitionError::ShieldedPoolUnderflow`) by one
+    /// integer comparison, before and regardless of any proof verification.
+    /// This is defence in depth outside the proof system — the Zcash-2019
+    /// lesson: a soundness bug there let proofs the verifier accepted mint
+    /// transparent value out of the shielded pool, and nothing counted the
+    /// pool to notice. `issued_sat` cannot catch that attack, because
+    /// shield/unshield move existing coins and never advance issuance; this
+    /// counter is the orthogonal one that does. The chained invariant is
+    /// `shielded_pool_sat <= issued_sat <= TOTAL_SUPPLY_SAT` — the left
+    /// inequality enforced at [`Self::apply_shield`] and re-checked against
+    /// any supplied pre-state in `compute_post_state`
+    /// (`ShieldedPoolExceedsIssued`), the right one by the hard-cap check.
+    ///
+    /// Committed rather than derived for the same §5.5 reason as
+    /// `issued_sat`: the balance is a fold over the whole history, and the
+    /// pool's own committed roots hide the values by construction — a
+    /// state-synced node cannot reconstruct it (full argument at
+    /// `state_root::TAG_SHIELDED_POOL`).
+    ///
+    /// INERT today: no transaction variant reaches [`Self::apply_shield`] or
+    /// [`Self::apply_unshield`] yet — the shielded transaction types are a
+    /// separate Coherence-wave deliverable with an open architecture
+    /// decision. The counter, its leaf and its invariants land first so the
+    /// turnstile exists *before* the door.
+    shielded_pool_sat: u128,
     /// The unspent-output set, keyed by `(txid, vout)` so iteration order is a
     /// function of the data and never of insertion history (rule 2).
     ///
@@ -1455,6 +1485,12 @@ impl CommittedState {
             coherence_nullifier_root,
             evm,
             issued_sat: tokenomics_v4::GENESIS_ISSUED_SAT,
+            // The pool opens empty: the carryover and the vested allocations
+            // are transparent outputs, and nothing can have been shielded
+            // before the chain existed. Zero is a decision, not a default —
+            // a genesis that opened with value already "in" the pool would
+            // let that value be unshielded without ever having been shielded.
+            shielded_pool_sat: 0,
             eutxos: opening_balances.iter().cloned().collect(),
         };
         // Seed epoch 0's participation for the launch roster, so the
@@ -1483,6 +1519,65 @@ impl CommittedState {
 
     pub fn head(&self) -> BlockId {
         self.head
+    }
+
+    // ── The Coherence turnstile (2026-08-29) ────────────────────────────────
+    //
+    // The pool counter's ONLY two mutation paths. Both are total, both use
+    // checked arithmetic, and neither takes a proof: the turnstile is the
+    // consensus rule that holds even when the proof system lies. The shielded
+    // transaction variants that will call these do not exist yet (separate
+    // Coherence-wave deliverable, architecture decision open); the seam is
+    // built against that interface and is inert until they land. When they
+    // do, the transition calls `apply_shield` with the transparent value a
+    // shield locks into the pool, and `apply_unshield` with the transparent
+    // value an unshield claims out of it — in both cases AFTER the eUTXO-side
+    // rules and BEFORE trusting anything the proof asserts.
+
+    /// Total value inside the Coherence shielded pool, in satoshis — the
+    /// committed turnstile counter (`TAG_SHIELDED_POOL`).
+    pub fn shielded_pool_sat(&self) -> u128 {
+        self.shielded_pool_sat
+    }
+
+    /// Record `value_sat` entering the shielded pool.
+    ///
+    /// Refuses a total that would exceed the committed issued supply
+    /// ([`TransitionError::ShieldedPoolExceedsIssued`]): every satoshi that
+    /// enters the pool is an already-issued transparent satoshi, so
+    /// `pool <= issued` is an invariant no honest history can break — and
+    /// enforcing it at the entrance is what chains the turnstile to the
+    /// 100-billion hard cap (`pool <= issued <= TOTAL_SUPPLY_SAT`). The
+    /// `checked_add` makes overflow impossible rather than unlikely.
+    pub fn apply_shield(&mut self, value_sat: u128) -> Result<(), TransitionError> {
+        let next = self
+            .shielded_pool_sat
+            .checked_add(value_sat)
+            .ok_or(TransitionError::ShieldedPoolExceedsIssued)?;
+        if next > self.issued_sat {
+            return Err(TransitionError::ShieldedPoolExceedsIssued);
+        }
+        self.shielded_pool_sat = next;
+        Ok(())
+    }
+
+    /// Record `value_sat` leaving the shielded pool — **the turnstile**.
+    ///
+    /// One checked subtraction, no proof parameter, on purpose: an unshield
+    /// claiming more than the pool has ever taken in is refused
+    /// ([`TransitionError::ShieldedPoolUnderflow`]) no matter what the proof
+    /// system says about it. This is the defence-in-depth rule Zcash adopted
+    /// after the 2019 counterfeiting vulnerability: with it, a soundness
+    /// failure in the circuit, the verifier or the SP1 toolchain is capped at
+    /// stealing from the pool's existing balance — it can no longer mint
+    /// transparent value from nothing and pierce the supply cap through the
+    /// blind spot where `issued_sat` never moves.
+    pub fn apply_unshield(&mut self, value_sat: u128) -> Result<(), TransitionError> {
+        self.shielded_pool_sat = self
+            .shielded_pool_sat
+            .checked_sub(value_sat)
+            .ok_or(TransitionError::ShieldedPoolUnderflow)?;
+        Ok(())
     }
 
     // ── Derivations from committed state (rule 1: no other source exists) ──
@@ -1877,6 +1972,7 @@ impl CommittedState {
             coherence_nullifier_root: self.coherence_nullifier_root,
             evm: self.evm,
             issued_sat: self.issued_sat,
+            shielded_pool_sat: self.shielded_pool_sat,
         }, self.eutxos.tree())
     }
 
@@ -3218,6 +3314,21 @@ impl<V: SignatureVerifier> Transition<V> {
         // to the cap itself.
         if st.issued_sat > tokenomics_v4::TOTAL_SUPPLY_SAT {
             return Err(TransitionError::SupplyCapExceeded);
+        }
+
+        // 3d. THE TURNSTILE'S OWN PRE-STATE INVARIANT (2026-08-29): the
+        // committed shielded-pool total may never exceed the committed issued
+        // supply — every satoshi in the pool entered as already-issued
+        // transparent value. Same posture and same placement rationale as 3c
+        // (one integer comparison, unreachable through this transition's own
+        // arithmetic because `apply_shield` refuses at the entrance): what it
+        // catches is a supplied pre-state — forged snapshot, corrupted
+        // state-sync — that already claims a pool bigger than everything
+        // ever minted. Refusing to build on it is what makes
+        // `pool <= issued <= TOTAL_SUPPLY_SAT` a chained consensus invariant
+        // rather than two checks that can be violated between each other.
+        if st.shielded_pool_sat > st.issued_sat {
+            return Err(TransitionError::ShieldedPoolExceedsIssued);
         }
 
         // Consensus weight, not raw stake: the proposer draw below and the
@@ -6461,6 +6572,11 @@ mod tests {
         must_move!("coherence_nullifier_root", |g: &mut CommittedState| {
             g.coherence_nullifier_root[0] ^= 1
         });
+        // The Coherence turnstile (2026-08-29): one satoshi in the pool must
+        // move the root, or the unshield floor is node-local opinion.
+        must_move!("shielded_pool_sat", |g: &mut CommittedState| {
+            g.shielded_pool_sat += 1
+        });
 
         // Distinct mutations must commit distinctly — a collision would mean
         // two different states share a root.
@@ -6722,6 +6838,94 @@ mod tests {
         let b1 = build_block(&t, &at_cap, 1, &[], &[], &mut chains);
         let s1 = t.apply_block(&at_cap, &b1, &[], &[]).expect("at-cap block rejected");
         assert_eq!(s1.issued_sat, tokenomics_v4::TOTAL_SUPPLY_SAT, "no issuance may follow");
+    }
+
+    // ── The Coherence turnstile (2026-08-29) ────────────────────────────────
+
+    /// **The turnstile, independent of the proof system.** `apply_unshield`
+    /// takes a value and nothing else — there is no proof parameter to
+    /// present, so no proof, valid or falsely-valid, can talk it past the
+    /// committed pool total. An unshield of one satoshi more than the pool
+    /// holds is refused, and the failed call leaves the counter untouched
+    /// (a reject must not half-apply).
+    #[test]
+    fn unshield_beyond_the_pool_is_refused_without_asking_the_prover() {
+        let (_t, g, _chains) = setup(4);
+        let mut st = g.clone();
+        assert_eq!(st.shielded_pool_sat(), 0, "the pool must open empty");
+
+        // Nothing was ever shielded: the very first satoshi out is refused.
+        assert_eq!(st.apply_unshield(1).unwrap_err(), TransitionError::ShieldedPoolUnderflow);
+
+        st.apply_shield(1_000).unwrap();
+        st.apply_unshield(600).unwrap();
+        assert_eq!(st.shielded_pool_sat(), 400);
+        // One satoshi over the balance: refused, balance unmoved.
+        assert_eq!(st.apply_unshield(401).unwrap_err(), TransitionError::ShieldedPoolUnderflow);
+        assert_eq!(st.shielded_pool_sat(), 400, "a refused unshield must not move the counter");
+        // Down to exactly zero is fine — the invariant is `pool >= 0`.
+        st.apply_unshield(400).unwrap();
+        assert_eq!(st.shielded_pool_sat(), 0);
+    }
+
+    /// The turnstile is chained to the hard cap at the entrance:
+    /// `pool <= issued`, so by 3c's `issued <= TOTAL_SUPPLY_SAT` the pool can
+    /// never hold more than the supply — whatever the proof system believes.
+    /// Shielding past the issued supply is refused; a `u128` overflow attempt
+    /// is refused by the same rule, not by a panic.
+    #[test]
+    fn pool_can_never_exceed_the_issued_supply() {
+        let (_t, g, _chains) = setup(4);
+        let mut st = g.clone();
+
+        // Everything ever issued can, in principle, be shielded — but not
+        // one satoshi more.
+        st.apply_shield(st.issued_sat).unwrap();
+        assert_eq!(st.shielded_pool_sat(), st.issued_sat);
+        assert_eq!(st.apply_shield(1).unwrap_err(), TransitionError::ShieldedPoolExceedsIssued);
+        assert!(st.shielded_pool_sat() <= st.issued_sat);
+        assert!(st.issued_sat <= tokenomics_v4::TOTAL_SUPPLY_SAT);
+
+        // Checked arithmetic: an overflow-shaped shield is a reject, never a
+        // wrap and never a panic on a consensus path.
+        assert_eq!(
+            st.apply_shield(u128::MAX).unwrap_err(),
+            TransitionError::ShieldedPoolExceedsIssued,
+        );
+        assert_eq!(st.shielded_pool_sat(), st.issued_sat, "a refused shield must not move it");
+    }
+
+    /// A pre-state claiming a pool bigger than everything ever issued is
+    /// refused with its own error — the 3d twin of
+    /// `block_on_a_state_beyond_the_cap_is_rejected`: unreachable through
+    /// this transition's arithmetic, it can only arrive from outside (a
+    /// forged snapshot, a corrupted state-sync payload), and an honest node
+    /// must refuse to extend it rather than launder it under a valid block.
+    #[test]
+    fn block_on_a_state_whose_pool_exceeds_issuance_is_rejected() {
+        let (t, g, mut chains) = setup(4);
+        let b1 = build_block(&t, &g, 1, &[], &[], &mut chains);
+        let mut forged = g.clone();
+        forged.shielded_pool_sat = forged.issued_sat + 1;
+        assert_eq!(
+            t.compute_post_state(&forged, &b1, &[], &[]).unwrap_err(),
+            TransitionError::ShieldedPoolExceedsIssued,
+        );
+    }
+
+    /// Exactly at issuance is VALID — the invariant is one-sided
+    /// (`pool <= issued`), and a chain whose entire supply sits shielded must
+    /// keep producing blocks. The counter is carried through the block
+    /// untouched: no transaction variant moves it yet, and a block that is
+    /// not a shield or an unshield must never move it either.
+    #[test]
+    fn block_with_the_whole_issuance_shielded_is_accepted() {
+        let (t, g, mut chains) = setup(4);
+        let mut at_issued = g.clone();
+        at_issued.shielded_pool_sat = at_issued.issued_sat;
+        let b = build_block(&t, &at_issued, 1, &[], &[], &mut chains);
+        let s = t.apply_block(&at_issued, &b, &[], &[]).expect("pool == issued must be valid");
+        assert_eq!(s.shielded_pool_sat(), at_issued.issued_sat, "the counter is carried");
     }
 
     /// Emission stops at the cap: an epoch boundary crossed with zero

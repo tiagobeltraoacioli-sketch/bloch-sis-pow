@@ -27,10 +27,35 @@
 //!   ([`TAG_ISSUED_SUPPLY`], 2026-08-12),
 //! - the Coherence shielded-pool state: the accumulator root and the
 //!   nullifier-set root (§6.6.2). Finality means nothing if the shielded
-//!   ledger is not part of what gets finalized.
+//!   ledger is not part of what gets finalized,
+//! - the Coherence pool-value turnstile: the total satoshis inside the
+//!   shielded pool ([`TAG_SHIELDED_POOL`], 2026-08-29).
 //!
 //! The list is closed, and each extension carries the same argument. The
-//! 2026-08-12 fee-market pair is the latest: `TAG_BASE_FEE` because the next
+//! 2026-08-29 turnstile leaf carries its own: the pool balance is a fold
+//! over the entire chain history (every shield adds, every unshield
+//! subtracts), and the two Coherence roots above cannot yield it — they
+//! commit note commitments and nullifiers, which hide the values *by
+//! construction*; that hiding is the pool's purpose, not an encoding
+//! accident. So a node that syncs by state root holds the 0x07/0x08 roots
+//! and still cannot reconstruct how much value the pool contains — the
+//! cannot-be-reconstructed bar, cleared exactly. And the value is
+//! consensus-relevant because the transition reads it to validate blocks:
+//! an unshield claiming more than the pool holds is refused by integer
+//! comparison, independent of the proof system
+//! (`TransitionError::ShieldedPoolUnderflow`) — the invariant Zcash added
+//! after its 2019 counterfeiting bug, where a sound-looking proof minted
+//! transparent value out of the shielded pool and no committed counter
+//! existed to notice. Uncommitted, the counter is the `expected_bits`
+//! shape verbatim: two nodes disagreeing on the pool total would judge the
+//! same unshield differently while their roots claim agreement. Note what
+//! this leaf is NOT: it is not redundant with [`TAG_ISSUED_SUPPLY`] —
+//! shield and unshield move existing coins and never touch `issued_sat`,
+//! so the hard-cap check is structurally blind to a pool-inflation attack;
+//! the turnstile is the orthogonal counter that sees it.
+//!
+//! The
+//! 2026-08-12 fee-market pair came before it: `TAG_BASE_FEE` because the next
 //! block's price is *derived from* it — a price kept in node-local execution
 //! bookkeeping is `expected_bits` with a different name — and
 //! `TAG_DELEGATOR_FEE_REWARD` because a withdrawal pays it out, so two nodes
@@ -217,6 +242,36 @@ const TAG_BASE_FEE: u8 = 0x15;
 /// history — and same §5.5 argument: a withdrawal pays this out, so a node
 /// that disagreed on it would pay a different amount for the same exit.
 const TAG_DELEGATOR_FEE_REWARD: u8 = 0x16;
+
+/// Total value inside the Coherence shielded pool, in satoshis (2026-08-29):
+/// one singleton leaf, a `u128` serialized as 16 LE bytes — the turnstile.
+///
+/// The transition maintains it (shield adds, unshield subtracts, checked
+/// arithmetic in both directions) and refuses any unshield the committed
+/// total cannot cover (`TransitionError::ShieldedPoolUnderflow`). That
+/// refusal is a plain integer comparison OUTSIDE the proof system: even a
+/// proof the verifier accepts cannot take out more than the pool has ever
+/// taken in. It is the invariant Zcash adopted after the 2019 counterfeiting
+/// vulnerability, where a soundness bug let "valid" proofs mint transparent
+/// value from the shielded pool — and no committed counter existed to catch
+/// it.
+///
+/// Why it must be committed and cannot be derived: the balance is a fold over
+/// the whole chain history, and the pool's own roots
+/// ([`TAG_COHERENCE_ACCUMULATOR`], [`TAG_COHERENCE_NULLIFIERS`]) commit
+/// commitments and nullifiers that hide the values by construction — a
+/// state-synced node holding both roots still cannot reconstruct the total.
+/// Uncommitted, it is the §5.5 failure shape verbatim. Orthogonal to
+/// [`TAG_ISSUED_SUPPLY`], not redundant with it: shield/unshield move
+/// existing coins and never advance `issued_sat`, so the hard-cap check is
+/// blind to pool inflation; the chained invariant is
+/// `pool <= issued <= TOTAL_SUPPLY_SAT`, the left inequality enforced here
+/// (`TransitionError::ShieldedPoolExceedsIssued` on a pre-state that violates
+/// it), the right one by the cap check. Recorded as a visible §5.5 revision,
+/// not smuggled. Tag value provisional pending PMO arbitration with the
+/// other Coherence-wave extension (tags are append-only; 0x16 was the last
+/// frozen).
+const TAG_SHIELDED_POOL: u8 = 0x17;
 
 
 fn sha3(parts: &[&[u8]]) -> [u8; 32] {
@@ -1598,6 +1653,10 @@ pub struct ConsensusState<'a> {
     /// never decrement it — they only widen the gap below the cap, and the
     /// cap invariant is one-sided.
     pub issued_sat: u128,
+    /// Total value inside the Coherence shielded pool, in satoshis
+    /// ([`TAG_SHIELDED_POOL`]) — the turnstile counter. Never negative by
+    /// type; never above `issued_sat` by transition rule.
+    pub shielded_pool_sat: u128,
     /// Spent slashing evidence — the anti-replay set (§7.3).
     pub applied_evidence: &'a [AppliedEvidenceRecord],
     /// Per-epoch slashed stake inside the correlation window (§7.3).
@@ -1787,6 +1846,12 @@ fn build_state_tree_inner(state: &ConsensusState<'_>, eutxo_tree: &Smt) -> Smt {
     smt.insert(
         derive_key(TAG_ISSUED_SUPPLY, &[]),
         hash_value(&state.issued_sat.to_le_bytes()),
+    );
+    // The Coherence turnstile (2026-08-29): a sixth singleton, fixed-width
+    // 16-byte LE — the pool total the unshield floor is checked against.
+    smt.insert(
+        derive_key(TAG_SHIELDED_POOL, &[]),
+        hash_value(&state.shielded_pool_sat.to_le_bytes()),
     );
     for e in state.applied_evidence {
         smt.insert(derive_key(TAG_SLASH_APPLIED, &e.entry_key()), hash_value(&e.serialize()));
@@ -3130,6 +3195,8 @@ mod tests {
             // serialization that dropped or aliased the counter must move the
             // root in the coverage test below.
             issued_sat: crate::tokenomics_v4::GENESIS_ISSUED_SAT + 12_345,
+            // Non-zero and distinct from every other counter, same reason.
+            shielded_pool_sat: 987_654_321,
             applied_evidence: &f.applied,
             slash_window: &f.window,
             delegator_slash_losses: &f.losses,
@@ -3261,8 +3328,8 @@ mod tests {
         mutated!(|g: &mut Fx| g.fee_rewards[0].reward_sat += 1);
         mutated!(|g: &mut Fx| g.fee_rewards.pop().map(|_| ()).unwrap());
 
-        // Singleton roots and the issued-supply counter.
-        for i in 0..4 {
+        // Singleton roots, the issued-supply counter and the pool turnstile.
+        for i in 0..5 {
             let f2 = f.clone();
             let mut s = state(&f2);
             match i {
@@ -3272,7 +3339,12 @@ mod tests {
                 // One satoshi of issuance must move the root — this is the
                 // leaf the hard-cap invariant reads, and an uncommitted or
                 // truncated counter is the §5.5 failure for the cap itself.
-                _ => s.issued_sat += 1,
+                3 => s.issued_sat += 1,
+                // One satoshi in the pool must move the root — this is the
+                // leaf the unshield turnstile reads; uncommitted, two nodes
+                // would judge the same unshield differently under agreeing
+                // roots.
+                _ => s.shielded_pool_sat += 1,
             }
             let r = state_root(&s);
             assert_ne!(r, base);

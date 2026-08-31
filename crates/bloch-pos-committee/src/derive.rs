@@ -112,6 +112,11 @@ pub struct ChainState {
     /// unchanged: issuance happens at epoch boundaries, which are the
     /// transition's job, never this seam's.
     pub issued_sat: u128,
+    /// Total value inside the Coherence shielded pool
+    /// (`TAG_SHIELDED_POOL`, 2026-08-29) — the turnstile counter. Carried
+    /// unchanged: shields and unshields are transactions, and transactions
+    /// are opaque at this seam; only the transition moves it.
+    pub shielded_pool_sat: u128,
     /// Slashing bookkeeping (§7.3), carried through this seam unchanged —
     /// evidence is executed by the transition, never here.
     pub applied_evidence: Vec<crate::state_root::AppliedEvidenceRecord>,
@@ -156,6 +161,7 @@ impl ChainState {
             coherence_nullifier_root: self.coherence_nullifier_root,
             evm: self.evm,
             issued_sat: self.issued_sat,
+            shielded_pool_sat: self.shielded_pool_sat,
         })
     }
 }
@@ -658,6 +664,8 @@ mod coherence_tests {
             },
             // Genesis-shaped, written out for the same break-this-line reason.
             issued_sat: crate::tokenomics_v4::GENESIS_ISSUED_SAT,
+            // Genesis-shaped: the pool opens empty, nothing shielded yet.
+            shielded_pool_sat: 0,
         }
     }
 

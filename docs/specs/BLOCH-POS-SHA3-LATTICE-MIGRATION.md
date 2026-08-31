@@ -478,6 +478,33 @@ Two consequences worth stating, because both surfaced as test failures:
 > `fee_market::intrinsic_gas` and priced at the committed base fee. That moves
 > `canonical_bytes`, hence `body_root`, hence block identity — flagged here
 > because it is a fork-relevant encoding change, not an internal refactor.
+>
+> **Revision 2026-08-29 — the Coherence pool-value turnstile.** One new
+> committed component, tag `0x17` (`state_root::TAG_SHIELDED_POOL`, tag value
+> provisional pending PMO arbitration of the Coherence-wave tag assignments;
+> tags are append-only and `0x16` was the last frozen): the total value inside
+> the Coherence shielded pool, in satoshis. The transition maintains it —
+> every shield adds, every unshield subtracts, both with checked arithmetic —
+> and enforces two integer invariants **outside the proof system**:
+> `pool >= 0` (`TransitionError::ShieldedPoolUnderflow`: an unshield naming
+> more than the pool holds is refused, whatever the proof says) and
+> `pool <= issued_sat` (`TransitionError::ShieldedPoolExceedsIssued`, checked
+> at the shield seam and against every supplied pre-state). Chained with the
+> 0x14 hard-cap invariant this gives `pool <= issued <= TOTAL_SUPPLY_SAT`: a
+> soundness failure in the proof stack (circuit, verifier, SP1 toolchain) is
+> capped at the pool's existing balance and can no longer mint transparent
+> value from nothing — the invariant Zcash adopted after its 2019
+> counterfeiting bug, made a consensus rule here before the shielded
+> transaction variants even exist (they are a separate deliverable; the
+> counter lands inert, so the turnstile exists before the door). It passes
+> this section's cannot-be-reconstructed bar exactly: the balance is a fold
+> over the whole chain history, and the pool's own committed roots (`0x07`
+> accumulator, `0x08` nullifier set) hide the underlying values *by
+> construction* — a node syncing by state root holds both roots and still
+> cannot derive the total. And it is not redundant with `0x14`:
+> shield/unshield move existing coins and never advance `issued_sat`, so the
+> supply-cap check is structurally blind to pool inflation; this counter is
+> the orthogonal one that sees it.
 
 **Hard rule, learned from the difficulty defect:** every consensus-relevant
 value used to validate block *B* must be derivable from `B.parent`'s committed

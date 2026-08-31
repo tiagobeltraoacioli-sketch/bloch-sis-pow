@@ -300,6 +300,7 @@ fn state<'a>(f: &'a Fixture, e: &'a [EutxoEntry]) -> ConsensusState<'a> {
             base_fee_per_gas: 1,
         },
         issued_sat: 1_000_000_000_000_000,
+        shielded_pool_sat: 0,
         applied_evidence: &[],
         slash_window: &[],
         delegator_slash_losses: &[],

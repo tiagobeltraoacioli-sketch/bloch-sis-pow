@@ -389,6 +389,8 @@ mod tests {
                 base_fee_per_gas: 1,
             },
             issued_sat: crate::tokenomics_v4::GENESIS_ISSUED_SAT,
+            // The pool opens empty — nothing shielded before the chain ran.
+            shielded_pool_sat: 0,
         };
         let parent_header = BlockHeaderV4 {
             version: VERSION_G4,
