@@ -419,6 +419,9 @@ mod harness {
             taint_root: TAINT_ROOT,
             coherence_accumulator_root: COHERENCE_ACC_ROOT,
             coherence_nullifier_root: COHERENCE_NUL_ROOT,
+            // Pre-activation anchor policy: empty record, no leaf — this
+            // harness runs below the flag day, like the live fleet.
+            coherence_anchors: bloch_pos_committee::state_root::CoherenceAnchorRecord::default(),
             evm: EVM_COMMITMENT,
             // This devnet harness pays no issuance, so the counter stays at
             // its genesis value for the whole run — committed, not omitted.

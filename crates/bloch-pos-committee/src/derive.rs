@@ -104,6 +104,13 @@ pub struct ChainState {
     pub coherence_accumulator_root: [u8; 32],
     /// Coherence nullifier-set root (§6.6.2), carried.
     pub coherence_nullifier_root: [u8; 32],
+    /// The shielded-pool anchor policy (`TAG_COHERENCE_ANCHORS`), carried
+    /// through this seam unchanged: promotion and boundary snapshots happen
+    /// at epoch boundaries, which are the transition's job, never this
+    /// seam's — but the record is carried, because the state root commits
+    /// all components and a root over a subset is not the root the header
+    /// must carry.
+    pub coherence_anchors: crate::state_root::CoherenceAnchorRecord,
     /// L1 EVM execution commitment (`BLOCH-L1-EVM-STATE-MODEL.md`), carried —
     /// updating it is EVM execution, which happens in the node's transition,
     /// not in this seam.
@@ -154,6 +161,7 @@ impl ChainState {
             taint_root: self.taint_root,
             coherence_accumulator_root: self.coherence_accumulator_root,
             coherence_nullifier_root: self.coherence_nullifier_root,
+            coherence_anchors: self.coherence_anchors.clone(),
             evm: self.evm,
             issued_sat: self.issued_sat,
         })
@@ -635,6 +643,8 @@ mod coherence_tests {
             taint_root: [0u8; 32],
             coherence_accumulator_root: acc,
             coherence_nullifier_root: nf,
+            // Pre-activation anchor policy: empty, therefore no leaf.
+            coherence_anchors: crate::state_root::CoherenceAnchorRecord::default(),
             // Empty EVM segment: no accounts, no receipts, no gas. Written out
             // rather than defaulted so the next carried component breaks this
             // line and gets looked at.

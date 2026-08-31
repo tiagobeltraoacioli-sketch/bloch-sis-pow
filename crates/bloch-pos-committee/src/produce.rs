@@ -373,6 +373,7 @@ mod tests {
             taint_root: [0x11; 32],
             coherence_accumulator_root: [0x12; 32],
             coherence_nullifier_root: [0x13; 32],
+            coherence_anchors: crate::state_root::CoherenceAnchorRecord::default(),
             applied_evidence: Vec::new(),
             slash_window: Vec::new(),
             delegator_slash_losses: Vec::new(),

@@ -28,15 +28,45 @@
 //! - the Coherence shielded-pool state: the accumulator root and the
 //!   nullifier-set root (§6.6.2). Finality means nothing if the shielded
 //!   ledger is not part of what gets finalized.
+//! - the shielded-pool anchor policy ([`TAG_COHERENCE_ANCHORS`],
+//!   2026-08-29): the accumulator roots the last finalized checkpoints made
+//!   irreversible — the only roots a shielded spend may name as its anchor —
+//!   plus the two epoch-boundary snapshots awaiting the next finalization.
 //!
 //! The list is closed, and each extension carries the same argument. The
-//! 2026-08-12 fee-market pair is the latest: `TAG_BASE_FEE` because the next
+//! 2026-08-12 fee-market pair carries it so: `TAG_BASE_FEE` because the next
 //! block's price is *derived from* it — a price kept in node-local execution
 //! bookkeeping is `expected_bits` with a different name — and
 //! `TAG_DELEGATOR_FEE_REWARD` because a withdrawal pays it out, so two nodes
 //! disagreeing on it would pay different amounts for the same exit. Both
 //! clear the cannot-be-reconstructed bar; both are recorded here and in
 //! `BLOCH-L1-FEE-MARKET.md` §4.4/§6.1 rather than smuggled.
+//!
+//! The 2026-08-29 anchor-policy leaf is the latest, and here is its
+//! admission argument in full. A shielded spend names the accumulator root
+//! its membership proof was built against, and the validation rule is set
+//! membership: the named anchor must be one of the roots this leaf commits.
+//! That set is consensus-relevant — two nodes disagreeing on it accept
+//! different spends while their state roots claim agreement — and it cannot
+//! be reconstructed from what the transition sees:
+//! `compute_post_state(pre, envelope, attestations, transactions)` has the
+//! parent's committed state and the block, no ancestor headers, so an anchor
+//! history kept anywhere else is node-local mutable state deciding validity
+//! — `expected_bits` with a different name. Genesis-3 kept exactly that: a
+//! rolling window of the last 100 *distinct tip* roots inside the node's own
+//! `ShieldedState` (`legacy/genesis3-node/src/coherence/mod.rs`), advanced
+//! per applied transaction, which made it flushable by cheap spam in about
+//! two minutes — paid griefing against 215-second proofs — and blind to
+//! finality, so a rewind could orphan the very tree a standing proof was
+//! built against; this network has a *recorded* finality-rewind violation,
+//! so that is not hypothetical. Denominating the window in **finalized
+//! checkpoints** instead puts the clock on finality, which spam cannot
+//! accelerate, and admits no note a conforming rewind could un-create.
+//! Committing it as a leaf is what makes the rule the same on a node that
+//! replayed and a node that state-synced. Only **accumulator** roots are in
+//! the leaf, deliberately: nullifier non-membership must be judged against
+//! the pre-state's *current* set (`TAG_COHERENCE_NULLIFIERS`), because
+//! judging it against any anchor-era set would readmit a double spend.
 //!
 //! It was first extended on 2026-08-11, and the reason is
 //! the reason the list exists at all: §5.5's hard rule ("every
@@ -218,6 +248,26 @@ const TAG_BASE_FEE: u8 = 0x15;
 /// that disagreed on it would pay a different amount for the same exit.
 const TAG_DELEGATOR_FEE_REWARD: u8 = 0x16;
 
+/// The Coherence shielded-pool anchor policy (2026-08-29): one singleton
+/// leaf holding [`CoherenceAnchorRecord`] — the accumulator roots the last
+/// [`COHERENCE_ANCHORS_RETAINED`] finalized checkpoints made irreversible,
+/// plus the [`COHERENCE_BOUNDARY_ROOTS_RETAINED`] epoch-boundary snapshots
+/// the next finalization will promote from. The full admission argument is
+/// in the module docs; the short form: a spend's anchor is judged by
+/// membership in this set, membership is consensus, and the transition sees
+/// no ancestor headers to re-derive it from, so it lives here or it lives in
+/// node-local mutable state — and the second option is the 2026-08-08 fork.
+///
+/// The leaf is committed **only when the record is non-empty** — the same
+/// rule every per-entry component already follows (an empty `fc_messages`
+/// contributes zero leaves), applied at record granularity. That is what
+/// keeps every pre-activation state root byte-identical to the roots the
+/// live fleet is signing today: the record only becomes non-empty once
+/// `params::COHERENCE_ANCHOR_ACTIVATION_EPOCH` opens the writer in
+/// `transition::close_epoch`, so the leaf's appearance IS the flag day, and
+/// committing unconditionally would have forked the live chain at rollout —
+/// genesis committed no such leaf.
+const TAG_COHERENCE_ANCHORS: u8 = 0x17;
 
 fn sha3(parts: &[&[u8]]) -> [u8; 32] {
     let mut h = Sha3_256::new();
@@ -1552,6 +1602,135 @@ impl DelegatorFeeRecord {
     }
 }
 
+/// How many finalized-checkpoint accumulator roots the shielded-pool anchor
+/// set retains — the K of the anchor policy ([`TAG_COHERENCE_ANCHORS`]).
+///
+/// Derived, not inherited:
+///
+/// - **Rotation rate.** At most one checkpoint finalizes per epoch — the
+///   engine justifies at most one checkpoint per epoch, and Casper k=1
+///   adjacency (`finality.rs`: `cp.epoch == source.epoch + 1`) means the
+///   only checkpoint `close_epoch(E)` can newly finalize is `E − 1`. That
+///   holds through a stall heal too: the skipped epochs justify by skip link
+///   and are never finalized, finality jumps in ONE event naming a recent
+///   checkpoint. So the set rotates at most once per epoch =
+///   `SLOTS_PER_EPOCH × SLOT_DURATION_SECS` = 32 × 30 s = **16 minutes**,
+///   and a wallet that fetched the newest anchor has a guaranteed validity
+///   window of at least `(K − 1)` full epochs.
+/// - **Floor.** The proof must survive from anchor fetch to on-chain
+///   inclusion. Measured, not assumed (`COHERENCE-PROOF-SIZE-2026-08-29`):
+///   83 s core / 215 s compressed for a 2-in/2-out spend on 8 desktop CPU
+///   cores — call it ~15 min on consumer hardware at 4× — plus inclusion
+///   latency on a fleet whose measured block cadence has run as low as 13%,
+///   which stretches "a few blocks of mempool wait" toward an hour. Worst
+///   realistic pipeline ≈ 2 h ⟹ `(K − 1) × 16 min ≥ 2 h` ⟹ K ≥ 9.
+/// - **Why 32 and not 9.** The margin is nearly free and the failure costs
+///   are asymmetric. Every retained anchor is a *finalized* root, so a
+///   larger K admits no note a rewind-respecting node could lose — it only
+///   lengthens how long an old finalized tree root stays nameable, a privacy
+///   disclosure bounded to "the note predates that checkpoint" (the same
+///   trade Zcash makes with its 100-block anchor window, over a longer
+///   wall-clock but a smaller root count). Too-small K forcibly re-proves —
+///   215 measured seconds per eviction, per victim. 32 anchors cost 1,280
+///   bytes of leaf and give ≥ 8 h of guaranteed validity in the good regime.
+/// - **Why a count and not an age in slots.** An age rule EXPIRES anchors
+///   during a finality stall — exactly when no replacement can be minted —
+///   and this network's stalls are recorded operations history, not a
+///   hypothesis. A count-based set never shrinks under a stall; its window
+///   only widens. It fails in the right direction.
+pub const COHERENCE_ANCHORS_RETAINED: usize = 32;
+
+/// How many closed epoch-boundary accumulator snapshots the anchor record
+/// buffers while they await finalization.
+///
+/// Two is exact, and here is the proof, because this constant is coupled to
+/// the finality rule. Finalizing checkpoint `F` makes irreversible the chain
+/// up to `F`'s checkpoint block — the last block strictly before `F`'s first
+/// slot, i.e. through the end of epoch `F − 1` — so the accumulator root
+/// that finalization actually covers is the one committed at the **close of
+/// epoch `F − 1`**, never the root current at promotion time, which is 1–2
+/// epochs of *unfinalized* appends ahead. Casper k=1 adjacency means
+/// `close_epoch(E)` can only newly finalize `F = E − 1`, so the promotion
+/// reads the snapshot of `E − 2`; the buffer at that moment holds
+/// `{E − 2, E − 1}` (epochs close densely — `compute_post_state` walks every
+/// boundary), and 2 always suffices. If the finality rule ever grows a k=2
+/// finalization arm, this widens with it — that coupling is pinned by
+/// `transition`'s `finalization_promotes_the_prior_boundary_accumulator_root`.
+pub const COHERENCE_BOUNDARY_ROOTS_RETAINED: usize = 2;
+
+/// One entry of the anchor-policy record: an epoch, and the Coherence
+/// accumulator root bound to it. In `anchors` the epoch is the finalized
+/// checkpoint's; in `boundary_roots` it is the closed epoch the snapshot was
+/// taken at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CoherenceAnchorEntry {
+    pub epoch: u64,
+    pub accumulator_root: [u8; 32],
+}
+
+impl CoherenceAnchorEntry {
+    fn write_into(&self, s: &mut Vec<u8>) {
+        s.extend_from_slice(&self.epoch.to_le_bytes());
+        s.extend_from_slice(&self.accumulator_root);
+    }
+}
+
+/// The shielded-pool anchor policy, committed as one leaf under
+/// [`TAG_COHERENCE_ANCHORS`] — see the module docs for the admission
+/// argument and the tag docs for the empty-record rule.
+///
+/// A single leaf and not per-entry leaves for the [`FinalityRecord`] reason:
+/// the set is only ever read and replaced whole (validation is membership in
+/// the whole set, promotion rewrites it), and nothing proves one historical
+/// anchor in isolation. **Accumulator roots only** — the nullifier-set root
+/// stays out by design, because non-membership against anything but the
+/// current set readmits double spends.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CoherenceAnchorRecord {
+    /// The accumulator roots of the last [`COHERENCE_ANCHORS_RETAINED`]
+    /// finalized checkpoints, any order — serialization sorts by epoch, so
+    /// the committed bytes are a function of the set.
+    pub anchors: Vec<CoherenceAnchorEntry>,
+    /// Boundary snapshots of the last
+    /// [`COHERENCE_BOUNDARY_ROOTS_RETAINED`] closed epochs, awaiting
+    /// promotion by the next finalization. Committed for the §5.5 reason:
+    /// the promotion *derives the next anchor from* this buffer, so a
+    /// state-synced node without it would promote nothing — or worse,
+    /// something local.
+    pub boundary_roots: Vec<CoherenceAnchorEntry>,
+}
+
+impl CoherenceAnchorRecord {
+    /// True when the record commits nothing — the pre-activation state, in
+    /// which the leaf is absent and the state root is byte-identical to a
+    /// root computed before this component existed.
+    pub fn is_empty(&self) -> bool {
+        self.anchors.is_empty() && self.boundary_roots.is_empty()
+    }
+
+    fn serialize(&self) -> Vec<u8> {
+        // Canonicalise here, not in the builder — same rule as
+        // `FinalityRecord`: the committed bytes are a function of the
+        // content, whichever order a caller assembled the vectors in.
+        let mut anchors = self.anchors.clone();
+        anchors.sort_by_key(|a| a.epoch);
+        let mut boundary_roots = self.boundary_roots.clone();
+        boundary_roots.sort_by_key(|b| b.epoch);
+
+        let mut s = Vec::with_capacity(16 + 40 * (anchors.len() + boundary_roots.len()));
+        // Count prefixes keep the two variable-length lists unambiguous.
+        s.extend_from_slice(&(anchors.len() as u64).to_le_bytes());
+        for a in &anchors {
+            a.write_into(&mut s);
+        }
+        s.extend_from_slice(&(boundary_roots.len() as u64).to_le_bytes());
+        for b in &boundary_roots {
+            b.write_into(&mut s);
+        }
+        s
+    }
+}
+
 /// Everything `state_root` commits, passed **by argument** — this struct is
 /// the §5.5 rule made into a type. A block validator builds it from the
 /// parent block's committed state and from nothing else; there is no way to
@@ -1609,6 +1788,13 @@ pub struct ConsensusState<'a> {
     /// Cumulative fee rewards per delegator account
     /// ([`TAG_DELEGATOR_FEE_REWARD`]).
     pub delegator_fee_rewards: &'a [DelegatorFeeRecord],
+    /// The shielded-pool anchor policy ([`TAG_COHERENCE_ANCHORS`]): the
+    /// finalized-checkpoint accumulator roots a spend may anchor to, plus
+    /// the boundary buffer the next finalization promotes from. Committed
+    /// as one leaf when non-empty; an empty record contributes no leaf —
+    /// see the tag docs for why that equivalence is the activation gate's
+    /// other half.
+    pub coherence_anchors: CoherenceAnchorRecord,
 }
 
 /// How many **closed** epoch boundaries the committed beacon history retains,
@@ -1775,6 +1961,18 @@ fn build_state_tree_inner(state: &ConsensusState<'_>, eutxo_tree: &Smt) -> Smt {
         derive_key(TAG_COHERENCE_NULLIFIERS, &[]),
         hash_value(&state.coherence_nullifier_root),
     );
+    // The anchor-policy leaf (2026-08-29): committed only when non-empty,
+    // which is the same contribution rule every per-entry component follows
+    // (an empty component is absent leaves), applied at record granularity.
+    // It is what keeps every pre-activation root byte-identical to the roots
+    // the live fleet signs — the writer in `transition::close_epoch` is
+    // epoch-gated, and until it runs, this record is empty by construction.
+    if !state.coherence_anchors.is_empty() {
+        smt.insert(
+            derive_key(TAG_COHERENCE_ANCHORS, &[]),
+            hash_value(&state.coherence_anchors.serialize()),
+        );
+    }
     // The EVM commitment is the fourth carried foreign component — a single
     // structured leaf, not per-account leaves. Expanding accounts here would
     // commit the same state twice (once in the keccak MPT, once in this SMT)
@@ -2800,6 +2998,7 @@ mod tests {
         losses: Vec<DelegatorLossRecord>,
         base_fee: BaseFeeRecord,
         fee_rewards: Vec<DelegatorFeeRecord>,
+        anchor_policy: CoherenceAnchorRecord,
     }
 
     fn fixture() -> Fx {
@@ -2928,6 +3127,21 @@ mod tests {
             DelegatorFeeRecord { delegator: 1, reward_sat: 55 },
             DelegatorFeeRecord { delegator: 900, reward_sat: 4_321 },
         ];
+        // Anchor policy, non-empty in BOTH lists: an empty list is one the
+        // coverage test cannot distinguish from a dropped serialization loop.
+        // Epoch 7 deliberately collides with a slash-window epoch and an
+        // anchor epoch collides with a boundary epoch — tags and count
+        // prefixes are what keep them apart.
+        let anchor_policy = CoherenceAnchorRecord {
+            anchors: vec![
+                CoherenceAnchorEntry { epoch: 7, accumulator_root: key(0xC1) },
+                CoherenceAnchorEntry { epoch: 8, accumulator_root: key(0xC2) },
+            ],
+            boundary_roots: vec![
+                CoherenceAnchorEntry { epoch: 8, accumulator_root: key(0xC3) },
+                CoherenceAnchorEntry { epoch: 9, accumulator_root: key(0xC4) },
+            ],
+        };
         Fx {
             eutxos,
             validators,
@@ -2947,6 +3161,7 @@ mod tests {
             losses,
             base_fee,
             fee_rewards,
+            anchor_policy,
         }
     }
 
@@ -3135,6 +3350,7 @@ mod tests {
             delegator_slash_losses: &f.losses,
             base_fee: f.base_fee,
             delegator_fee_rewards: &f.fee_rewards,
+            coherence_anchors: f.anchor_policy.clone(),
         }
     }
 
@@ -3161,6 +3377,9 @@ mod tests {
         g.delegations.reverse();
         g.pending_fees.reverse();
         g.fee_rewards.reverse();
+        // The single-leaf anchor record canonicalises its internal lists.
+        g.anchor_policy.anchors.reverse();
+        g.anchor_policy.boundary_roots.reverse();
         let root_b = state_root(&state(&g));
 
         assert_eq!(root_a, root_b);
@@ -3260,6 +3479,18 @@ mod tests {
         mutated!(|g: &mut Fx| g.fee_rewards[0].delegator += 1);
         mutated!(|g: &mut Fx| g.fee_rewards[0].reward_sat += 1);
         mutated!(|g: &mut Fx| g.fee_rewards.pop().map(|_| ()).unwrap());
+        // The anchor-policy leaf: every field of both lists is load-bearing,
+        // and so is which LIST an entry sits in — an anchor is spendable
+        // against, a boundary snapshot is not yet.
+        mutated!(|g: &mut Fx| g.anchor_policy.anchors[0].epoch += 100);
+        mutated!(|g: &mut Fx| g.anchor_policy.anchors[0].accumulator_root[0] ^= 1);
+        mutated!(|g: &mut Fx| g.anchor_policy.anchors.pop().map(|_| ()).unwrap());
+        mutated!(|g: &mut Fx| g.anchor_policy.boundary_roots[0].epoch += 100);
+        mutated!(|g: &mut Fx| g.anchor_policy.boundary_roots[0].accumulator_root[0] ^= 1);
+        mutated!(|g: &mut Fx| {
+            let e = g.anchor_policy.boundary_roots.pop().unwrap();
+            g.anchor_policy.anchors.push(e);
+        });
 
         // Singleton roots and the issued-supply counter.
         for i in 0..4 {
@@ -3286,6 +3517,39 @@ mod tests {
                 assert_ne!(roots[i], roots[j], "distinct states {i} and {j} share a root");
             }
         }
+    }
+
+    /// The activation contract of [`TAG_COHERENCE_ANCHORS`] (tag docs): a
+    /// state whose anchor record is empty commits EXACTLY the root it
+    /// committed before the component existed — the leaf is absent, not
+    /// "present and empty". This equivalence is what lets the anchor policy
+    /// ship in a binary the live fleet can run *before* the flag day: until
+    /// `close_epoch`'s writer gate opens, the record is empty by
+    /// construction and every root is byte-identical to today's.
+    #[test]
+    fn empty_anchor_record_contributes_no_leaf_and_a_nonempty_one_does() {
+        let anchor_key = derive_key(TAG_COHERENCE_ANCHORS, &[]);
+
+        let mut f = fixture();
+        f.anchor_policy = CoherenceAnchorRecord::default();
+        let without = build_state_tree(&state(&f));
+        assert_eq!(without.get(&anchor_key), None, "empty record must contribute no leaf");
+
+        let g = fixture();
+        let with = build_state_tree(&state(&g));
+        assert!(with.get(&anchor_key).is_some(), "non-empty record must be a real leaf");
+        assert_ne!(without.root(), with.root());
+
+        // The boundary buffer alone — the activation ramp, before any
+        // finalization has promoted an anchor — is already committed: the
+        // buffer is the input the first promotion derives from (§5.5), so a
+        // state-synced node must receive it.
+        let mut h = fixture();
+        h.anchor_policy.anchors.clear();
+        assert!(
+            build_state_tree(&state(&h)).get(&anchor_key).is_some(),
+            "a lone boundary snapshot must already be committed"
+        );
     }
 
     #[test]
