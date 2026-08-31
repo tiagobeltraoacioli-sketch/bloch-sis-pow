@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# ws-publisher — the recurring publication pipeline for weak-subjectivity
+# checkpoints (docs/specs/BLOCH-WS-PUBLICATION-PIPELINE.md).
+#
+# The spec's cadence (`ws.rs::WS_PUBLICATION_INTERVAL_EPOCHS = 256`) is a
+# promise that a checkpoint EXISTS on schedule. This crate is the machinery
+# that keeps the promise: a stager the timer runs unattended (touches no
+# keys), a signer step a human runs (touches one key, attended), a sealer
+# that assembles and verifies the m-of-n envelope, and a `verify` subcommand
+# that is itself the third-party verification instruction, executable.
+#
+# Same division of labor as tools/genesis4-ceremony: every constant, the
+# canonical byte layout, the digest and the quorum rule are IMPORTED from
+# crates/bloch-pos-committee — this crate restates none of them, so what it
+# stages cannot drift from what the node verifies at boot.
+
+[package]
+name = "ws-publisher"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "Weak-subjectivity checkpoint publication pipeline: stage on cadence, seal after the human signing ceremony, verify as a third party. Offline tool, UNAUDITED."
+publish = false
+
+[[bin]]
+name = "bloch-ws-publisher"
+path = "src/main.rs"
+
+[dependencies]
+# The single authority on the checkpoint format, digest, window and quorum
+# rule (ws.rs). One-way path dependency, into this crate and never out.
+bloch-pos-committee = { path = "../../crates/bloch-pos-committee" }
+# The real ML-DSA-65 ‖ Falcon-1024 suite — the same verifier calls the node's
+# ws_boot::WsHybridVerifier makes, so "seals here" and "verifies at boot"
+# are the same judgement.
+bloch-crypto = { path = "../../crates/bloch-crypto" }
+hex = "0.4"

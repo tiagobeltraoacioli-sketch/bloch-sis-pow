@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# bloch-ws-stage.timer — the cadence keeper.
+#
+# WS_PUBLICATION_INTERVAL_EPOCHS = 256 epochs ≈ 2.85 days (ws.rs). Hourly
+# ticks give ~68 attempts per interval; the stage subcommand is idempotent
+# and a NOTHING_DUE / ALREADY_* tick costs one RPC call. Persistent=true
+# replays a tick missed while the box was down — the catch-up rule is inside
+# the tool (stage only the LATEST due epoch), not in the schedule.
+
+[Unit]
+Description=Hourly tick of the Bloch WS checkpoint stager
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=5m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

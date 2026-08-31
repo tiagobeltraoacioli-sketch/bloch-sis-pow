@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# bloch-ws-stage.service — one tick of the weak-subjectivity publication
+# pipeline. Driven by bloch-ws-stage.timer; never enabled on its own.
+#
+# Install (as the fleet's ubuntu user; see BLOCH-WS-PUBLICATION-PIPELINE.md §3):
+#   sudo cp bloch-ws-stage.{service,timer} /etc/systemd/system/
+#   sudo cp ws-publication.env.example /etc/bloch/ws-publication.env   # then edit
+#   sudo cp ws-stage.sh /usr/local/bin/ && sudo chmod +x /usr/local/bin/ws-stage.sh
+#   sudo systemctl daemon-reload && sudo systemctl enable --now bloch-ws-stage.timer
+
+[Unit]
+Description=Bloch WS checkpoint stager (unattended; touches no keys)
+# Needs the local node's RPC, nothing else.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+EnvironmentFile=/etc/bloch/ws-publication.env
+ExecStart=/usr/local/bin/ws-stage.sh
+# The stager writes only under WS_DIR and /tmp. It holds no secrets, so a
+# compromise of this unit can at worst stage a payload the signers will
+# refuse — but keep the surface small anyway.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target

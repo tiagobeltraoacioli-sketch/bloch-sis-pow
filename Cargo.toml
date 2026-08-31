@@ -15,6 +15,7 @@ members = [
     "crates/bloch-pos-committee",  # frozen consensus math (pure, sha3-only)
     "crates/bloch-pos-node",       # the `bloch-pos` binary the fleet runs
     "tools/genesis4-ceremony",     # assembled the live genesis block
+    "tools/ws-publisher",          # weak-subjectivity checkpoint publication pipeline
 
     # ── Shared protocol crates. Used by BOTH eras; not PoW-only. ──
     # bloch-crypto is on the Genesis-4 consensus path (hybrid ML-DSA-65 ‖
