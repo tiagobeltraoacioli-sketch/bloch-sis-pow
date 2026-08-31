@@ -1662,3 +1662,86 @@ fn out_of_slot_attestations_are_dropped_not_counted_absent() {
     // E o denominador continua sendo o conjunto ativo INTEIRO.
     assert_eq!(out.active_set.len(), 200);
 }
+
+// ── the value bridge meets staking (§3.4) ───────────────────────────────────
+
+/// §3.4 of `BLOCH-COHERENCE-UNDER-POS.md`, POSITIVE direction — the test the
+/// spec asked for out loud and the suite lacked: **an unshield's transparent
+/// output funds a valid deposit.** The negative direction (a shielded input
+/// is rejected, `DepositReject::ShieldedInput`) was already pinned in
+/// `staking.rs`; this is its complement. Unshield outputs are fresh
+/// transparent eUTXO outputs, born untainted (the Genesis-4 taint set is
+/// dissolved), so nothing about their pool provenance may reject them at the
+/// deposit gate — the only admissible rejections are size and signature.
+#[test]
+fn unshield_output_funds_a_valid_deposit() {
+    use bloch_pos_committee::staking::{
+        HybridKeyVerifier, HYBRID_PK_BYTES, MIN_DEPOSIT_SAT, MLDSA65_SIG_BYTES,
+        SUITE_MLDSA65_FALCON1024,
+    };
+    use coherence_core::{
+        check_unshield, transparent_outputs_digest, CommitmentTree, Note, SpendInput,
+        TransparentOutput, UnshieldPublic, UnshieldWitness,
+    };
+
+    struct AcceptAll;
+    impl HybridKeyVerifier for AcceptAll {
+        fn verify_mldsa65(&self, _pk: &[u8], _root: &[u8; 32], _sig: &[u8]) -> bool {
+            true
+        }
+        fn verify_falcon1024(&self, _pk: &[u8], _root: &[u8; 32], _sig: &[u8]) -> bool {
+            true
+        }
+    }
+
+    // 1. A real unshield, at deposit scale: the note holds MIN_DEPOSIT + fee,
+    //    and the whole minimum stake leaves the pool to one transparent
+    //    output. MIN_DEPOSIT_SAT (25,000 BLCH = 2.5e12 sat) fits the u64
+    //    transparent value comfortably.
+    let deposit_sat_u64 = u64::try_from(MIN_DEPOSIT_SAT).expect("MIN_DEPOSIT_SAT fits u64");
+    let fee = 1_000u64;
+
+    let mut tree = CommitmentTree::new();
+    let note = Note { v: deposit_sat_u64 + fee, pk_d: [1; 32], rho: [2; 32], psi: [3; 32] };
+    let pos = tree.append(note.commitment());
+    let anchor = tree.root();
+    let nk = [4u8; 32];
+
+    let staker_script = [0x57u8; 32];
+    let outs = [TransparentOutput { value_sat: deposit_sat_u64, script_hash: staker_script }];
+    let public = UnshieldPublic {
+        anchor,
+        nullifiers: vec![note.nullifier(&nk, pos)],
+        change_commitments: vec![],
+        value_unshielded: deposit_sat_u64,
+        fee,
+        transparent_digest: transparent_outputs_digest(&outs),
+    };
+    let witness = UnshieldWitness {
+        inputs: vec![SpendInput { note, position: pos, path: tree.path(pos).unwrap(), nk }],
+        change_outputs: vec![],
+    };
+    assert_eq!(check_unshield(&public, &witness), Ok(()), "the unshield itself must be valid");
+
+    // 2. The node resolves that fresh output for the deposit admission
+    //    exactly as the eligibility oracle must report it: TRANSPARENT (it is
+    //    an ordinary eUTXO entry — the pool has no addressable outputs) and
+    //    untainted (there is no taint set to be in).
+    let unshield_funded = vec![DepositInput { transparent: true, tainted: false }];
+
+    // 3. The deposit those coins fund is admitted with no further question.
+    let tx = DepositTx {
+        suite: SUITE_MLDSA65_FALCON1024,
+        amount_sat: public.value_unshielded as u128,
+        validator_pubkey: [7u8; HYBRID_PK_BYTES],
+        randao_commitment: [1u8; 32],
+        withdrawal_addr: [2u8; 32],
+        proof_of_possession: vec![0u8; MLDSA65_SIG_BYTES + 1280],
+    };
+    let max_stake: u128 = MIN_DEPOSIT_SAT * 400; // any cap above the amount
+    assert_eq!(
+        validate_deposit(&tx, &unshield_funded, max_stake, &AcceptAll),
+        Ok(()),
+        "an unshield-funded deposit is §3.4-clean and must be admitted"
+    );
+}

@@ -23,6 +23,11 @@ sha3 = { version = "0.10", default-features = false }
 
 [dev-dependencies]
 hex = "0.4"
+# Test-only: the §3.4 bridge test in tests/committee.rs builds a real
+# Coherence unshield (check_unshield) and feeds its transparent output to
+# validate_deposit. Dev-dependency, so the frozen consensus crate still has
+# no runtime dependency on the shielded pool (carried-never-recomputed).
+coherence-core = { path = "../coherence-core" }
 
 # The suite walks 8,192-step SHAKE-256 reveal chains and 256-deep SMTs, so an
 # unoptimized Keccak permutation puts tens of seconds on `cargo test`. Optimize
