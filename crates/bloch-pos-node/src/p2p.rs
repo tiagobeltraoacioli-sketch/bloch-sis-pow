@@ -773,6 +773,39 @@ pub fn start(
 
 type Swarm = libp2p::Swarm<G4Behaviour>;
 
+/// The behaviour stack, factored out of [`build_swarm`] so the DNS and
+/// TCP-only transport paths below cannot drift into two configurations.
+fn g4_behaviour(
+    gs: gossipsub::Behaviour,
+    max_peers: u32,
+    key: &identity::Keypair,
+) -> G4Behaviour {
+    let identify = identify::Behaviour::new(identify::Config::new(
+        IDENTIFY_PROTOCOL.into(),
+        key.public(),
+    ));
+    // Hold established-incoming at max_peers so inbound dials cannot
+    // fill every slot (eclipse hardening — bounded, not adversarially
+    // tested); allow 2× total for churn headroom.
+    let limits = libp2p::connection_limits::ConnectionLimits::default()
+        .with_max_established(Some(max_peers.saturating_mul(2)))
+        .with_max_established_incoming(Some(max_peers))
+        .with_max_pending_incoming(Some(max_peers))
+        .with_max_pending_outgoing(Some(max_peers.max(1)));
+    G4Behaviour {
+        gossipsub: gs,
+        identify,
+        sync: request_response::Behaviour::with_codec(
+            SyncCodec,
+            std::iter::once((SYNC_PROTOCOL, ProtocolSupport::Full)),
+            RrConfig::default()
+                .with_request_timeout(Duration::from_secs(30))
+                .with_max_concurrent_streams(MAX_CONCURRENT_SYNC_STREAMS),
+        ),
+        connection_limits: libp2p::connection_limits::Behaviour::new(limits),
+    }
+}
+
 fn build_swarm(keypair: &identity::Keypair, cfg: &Config) -> io::Result<Swarm> {
     let gs_cfg = gossipsub_config().map_err(io::Error::other)?;
     let mut gs = gossipsub::Behaviour::new(MessageAuthenticity::Signed(keypair.clone()), gs_cfg)
@@ -784,41 +817,40 @@ fn build_swarm(keypair: &identity::Keypair, cfg: &Config) -> io::Result<Swarm> {
     }
 
     let max_peers = cfg.max_peers as u32;
-    let mut swarm = SwarmBuilder::with_existing_identity(keypair.clone())
+    // DNS is a convenience for `/dns4/…` peer entries, not a requirement —
+    // the fleet's peer lists are `/ip4/…` multiaddrs. `with_dns` reads the
+    // SYSTEM resolver config at startup and fails outright where none is
+    // readable (measured: a sandboxed spawn on macOS dies with "no
+    // nameservers found in config" before binding a single socket). A node
+    // that cannot resolve names can still run the network it was given
+    // addresses for, so that failure downgrades to TCP-only with a loud
+    // warning instead of refusing to start.
+    let mut swarm = match SwarmBuilder::with_existing_identity(keypair.clone())
         .with_tokio()
         .with_tcp(libp2p::tcp::Config::default(), noise::Config::new, yamux_config)
         .map_err(|e| io::Error::other(e.to_string()))?
         .with_dns()
-        .map_err(|e| io::Error::other(e.to_string()))?
-        .with_behaviour(|key| {
-            let identify = identify::Behaviour::new(identify::Config::new(
-                IDENTIFY_PROTOCOL.into(),
-                key.public(),
-            ));
-            // Hold established-incoming at max_peers so inbound dials cannot
-            // fill every slot (eclipse hardening — bounded, not adversarially
-            // tested); allow 2× total for churn headroom.
-            let limits = libp2p::connection_limits::ConnectionLimits::default()
-                .with_max_established(Some(max_peers.saturating_mul(2)))
-                .with_max_established_incoming(Some(max_peers))
-                .with_max_pending_incoming(Some(max_peers))
-                .with_max_pending_outgoing(Some(max_peers.max(1)));
-            G4Behaviour {
-                gossipsub: gs,
-                identify,
-                sync: request_response::Behaviour::with_codec(
-                    SyncCodec,
-                    std::iter::once((SYNC_PROTOCOL, ProtocolSupport::Full)),
-                    RrConfig::default()
-                        .with_request_timeout(Duration::from_secs(30))
-                        .with_max_concurrent_streams(MAX_CONCURRENT_SYNC_STREAMS),
-                ),
-                connection_limits: libp2p::connection_limits::Behaviour::new(limits),
-            }
-        })
-        .map_err(|e| io::Error::other(e.to_string()))?
-        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(300)))
-        .build();
+    {
+        Ok(b) => b
+            .with_behaviour(|key| g4_behaviour(gs, max_peers, key))
+            .map_err(|e| io::Error::other(e.to_string()))?
+            .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(300)))
+            .build(),
+        Err(e) => {
+            eprintln!(
+                "p2p: system DNS unavailable ({e}); running TCP-only — /dns4 peer \
+                 multiaddrs will not resolve, /ip4 peers are unaffected"
+            );
+            SwarmBuilder::with_existing_identity(keypair.clone())
+                .with_tokio()
+                .with_tcp(libp2p::tcp::Config::default(), noise::Config::new, yamux_config)
+                .map_err(|e| io::Error::other(e.to_string()))?
+                .with_behaviour(|key| g4_behaviour(gs, max_peers, key))
+                .map_err(|e| io::Error::other(e.to_string()))?
+                .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(300)))
+                .build()
+        }
+    };
 
     for t in [TOPIC_BLOCKS, TOPIC_ATTESTATIONS, TOPIC_TXS] {
         swarm

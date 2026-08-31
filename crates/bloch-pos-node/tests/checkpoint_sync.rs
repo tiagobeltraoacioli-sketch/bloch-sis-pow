@@ -193,7 +193,20 @@ fn copy_dir(src: &Path, dst: &Path) {
     }
 }
 
+/// Debug builds are excluded, with a measured reason, not squeamishness: a
+/// validator's duty window is ONE slot, and under debug-build hybrid PQ
+/// crypto the engine thread routinely spends longer than a slot inside a
+/// single `apply_block`, so validators miss their partition slots, epochs
+/// collect fewer than the quorum's attestations, and finality — which this
+/// test genuinely needs, unlike `cold_start` — never moves (observed: 10
+/// attestations across 7 epochs, justified stuck at e0 for 219 slots).
+/// `./test.sh` builds release for the same reason. Run as:
+///
+/// ```text
+/// cargo test --release -p bloch-pos-node --test checkpoint_sync
+/// ```
 #[test]
+#[cfg_attr(debug_assertions, ignore = "needs finality: run with --release (see doc comment)")]
 fn a_node_bootstraps_from_checkpoint_plus_downloaded_state_and_matches_the_replayers() {
     let root = tmp_root();
     let genesis = root.join("genesis.bin");
