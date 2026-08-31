@@ -59,8 +59,10 @@ use bloch_pos_committee::genesis_cohort::{
     cohort_cap_bps, COHORT_CAP_FLOOR_BPS, COHORT_CAP_START_BPS, COHORT_TAPER_EPOCHS,
 };
 use bloch_pos_committee::params::{
-    DS_ATTEST, DS_BLOCK, DS_BODY, DS_DEPOSIT, DS_EXIT, DS_PROPOSE, DS_RANDAO, DS_SLASH,
-    DS_SORTITION, DS_STATE, SLOTS_PER_EPOCH, SLOT_DURATION_SECS,
+    ANCESTRY_SEED_ACTIVATION_EPOCH, BLOCK_BYTES_V2_ACTIVATION_EPOCH, DS_ATTEST, DS_BLOCK, DS_BODY,
+    DS_DEPOSIT, DS_EXIT, DS_PROPOSE, DS_RANDAO, DS_SLASH, DS_SORTITION, DS_STATE,
+    LEAKED_ROSTER_ACTIVATION_EPOCH, LEAK_RECOVERY_ACTIVATION_EPOCH, SLOTS_PER_EPOCH,
+    SLOT_DURATION_SECS, TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH,
 };
 use bloch_pos_committee::tokenomics_v4::{
     FOUNDER_BLOCH, SAT_PER_BLOCH, TEAM_BLOCH, TOTAL_SUPPLY_SAT, VALIDATOR_EMISSION_BLOCH, VC_BLOCH,
@@ -94,7 +96,12 @@ fn main() {
         Some("--help") | Some("-h") | None => print_help(),
         Some("selfcheck") => {
             self_check();
-            println!("self-check passed");
+            if args.iter().any(|a| a == "--json") {
+                println!("{}", consensus_compat_json());
+            } else {
+                println!("self-check passed");
+                print_consensus_compat();
+            }
         }
         Some("keygen") => keygen(&args[1..]),
         Some("keygen-public") => keygen_public(&args[1..]),
@@ -114,8 +121,12 @@ fn print_help() {
         "{NAME} {VERSION} — Bloch Genesis-4 Proof-of-Stake node\n\
          \n\
          USAGE:\n\
-           bloch-pos selfcheck\n\
-               Verify the frozen consensus parameters this binary links.\n\
+           bloch-pos selfcheck [--json]\n\
+               Verify the frozen consensus parameters this binary links,\n\
+               then state which consensus flag days (activation epochs) it\n\
+               was built knowing — the epoch range it is valid for. --json\n\
+               prints only the machine-readable statement, for release\n\
+               pages and fleet sweeps.\n\
            bloch-pos keygen --dir <dir> --index <i>\n\
                Generate a THROWAWAY devnet validator keystore (hybrid\n\
                ML-DSA-65‖Falcon-1024 + RANDAO seed) at <dir>/validator.key.\n\
@@ -913,4 +924,115 @@ fn self_check() {
     // Migration design §5.1: the slot cadence everything descends from.
     assert_eq!(SLOT_DURATION_SECS, 30);
     assert_eq!(SLOTS_PER_EPOCH, 32);
+}
+
+/// The consensus flag days this binary was built knowing. `u64::MAX` means the
+/// gate ships INERT — code present, rule not armed.
+///
+/// This is the release-page compatibility statement, produced by the binary
+/// itself so it cannot drift from the code — the same principle as the version
+/// stamp (deploy/RELEASE-INTEGRITY.md §1: nothing that cannot state its own
+/// identity is a release). The defect it closes is `genesis4-node-20260814`:
+/// a published binary that predated the epoch-800 and epoch-1400 armings,
+/// diverged on schedule, and whose release page said nothing — because there
+/// was no artifact that could say it.
+///
+/// Two binaries are consensus-compatible at epoch E if and only if their gate
+/// lists agree on every gate with activation epoch ≤ E. A binary missing a
+/// gate armed after it was published follows the old rule at that epoch and
+/// forks. `gates_digest` collapses the comparison to one string equality.
+///
+/// Keep this list in sync with the armed/inert gate constants in
+/// `bloch_pos_committee::params` — the tripwire test in that crate pins the
+/// armed values; this table is the mirror the outside world sees.
+const CONSENSUS_GATES: [(&str, u64); 5] = [
+    (
+        "TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH",
+        TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH,
+    ),
+    (
+        "BLOCK_BYTES_V2_ACTIVATION_EPOCH",
+        BLOCK_BYTES_V2_ACTIVATION_EPOCH,
+    ),
+    (
+        "LEAKED_ROSTER_ACTIVATION_EPOCH",
+        LEAKED_ROSTER_ACTIVATION_EPOCH,
+    ),
+    (
+        "ANCESTRY_SEED_ACTIVATION_EPOCH",
+        ANCESTRY_SEED_ACTIVATION_EPOCH,
+    ),
+    (
+        "LEAK_RECOVERY_ACTIVATION_EPOCH",
+        LEAK_RECOVERY_ACTIVATION_EPOCH,
+    ),
+];
+
+/// SHA3-256 over the canonical serialization of [`CONSENSUS_GATES`]: one
+/// `NAME=<epoch|inert>\n` line per gate, sorted by name. Sorted, so the digest
+/// is a property of the gate SET, not of declaration order.
+fn consensus_gates_digest() -> String {
+    use sha3::{Digest, Sha3_256};
+    let mut lines: Vec<String> = CONSENSUS_GATES
+        .iter()
+        .map(|(name, epoch)| {
+            if *epoch == u64::MAX {
+                format!("{name}=inert\n")
+            } else {
+                format!("{name}={epoch}\n")
+            }
+        })
+        .collect();
+    lines.sort();
+    let digest: [u8; 32] = Sha3_256::digest(lines.concat().as_bytes()).into();
+    hex_lower(&digest)
+}
+
+/// The machine-readable consensus-compatibility statement, for release pages
+/// and fleet sweeps: `bloch-pos selfcheck --json`. Hand-rolled JSON on
+/// purpose — every value is a constant this binary links, and a serializer
+/// dependency for eight fields would be surface without benefit.
+fn consensus_compat_json() -> String {
+    let mut gates = String::new();
+    let mut max_armed: u64 = 0;
+    for (i, (name, epoch)) in CONSENSUS_GATES.iter().enumerate() {
+        if i > 0 {
+            gates.push_str(",\n");
+        }
+        if *epoch == u64::MAX {
+            gates.push_str(&format!("    {{\"name\": \"{name}\", \"epoch\": null}}"));
+        } else {
+            gates.push_str(&format!("    {{\"name\": \"{name}\", \"epoch\": {epoch}}}"));
+            max_armed = max_armed.max(*epoch);
+        }
+    }
+    format!(
+        "{{\n  \"binary\": \"{NAME} {VERSION}\",\n  \"block_version\": \"{:#010x}\",\n  \
+         \"slot_duration_secs\": {SLOT_DURATION_SECS},\n  \"slots_per_epoch\": {SLOTS_PER_EPOCH},\n  \
+         \"consensus_gates\": [\n{gates}\n  ],\n  \
+         \"gates_digest\": \"{}\",\n  \
+         \"knows_gates_through_epoch\": {max_armed},\n  \
+         \"compatibility_rule\": \"valid at epoch E only if this gate list matches the canonical one on every gate with epoch <= E; a gate armed on the network after this build makes this binary consensus-dead at that gate's epoch\"\n}}",
+        bloch_pos_committee::header::VERSION_G4,
+        consensus_gates_digest(),
+    )
+}
+
+/// Human form of the same statement, printed after `selfcheck` passes.
+fn print_consensus_compat() {
+    println!("\nconsensus gates this binary knows (epoch = flag day; inert = not armed):");
+    for (name, epoch) in CONSENSUS_GATES {
+        if epoch == u64::MAX {
+            println!("  {name:<44} inert");
+        } else {
+            println!("  {name:<44} {epoch}");
+        }
+    }
+    println!("  gates digest: {}", consensus_gates_digest());
+    println!(
+        "A gate armed on the network after this build makes this binary\n\
+         consensus-dead at that gate's epoch. Compare against the current\n\
+         release page before trusting this node past today's epoch.\n\
+         Machine-readable: bloch-pos selfcheck --json"
+    );
 }
