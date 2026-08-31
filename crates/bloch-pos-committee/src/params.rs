@@ -596,6 +596,39 @@ pub const ANCESTRY_SEED_ACTIVATION_EPOCH: u64 = u64::MAX;
 /// `u64::MAX` means INERT. Same arming rules as above.
 pub const LEAK_RECOVERY_ACTIVATION_EPOCH: u64 = u64::MAX;
 
+/// Flag day for **Coherence shielded-transaction application** — the epoch at
+/// which `compute_post_state` may start moving the two committed pool roots
+/// (`coherence_accumulator_root` / `coherence_nullifier_root`) instead of
+/// carrying them verbatim (§6.6.1/§6.6.2).
+///
+/// Why this cannot be unconditional: the live genesis committed `[0u8; 32]`
+/// in the carried roots (`bloch-pos-node/src/genesis.rs`), and both roots are
+/// committed into every block's `state_root` and mirrored in every header's
+/// `coherence_root`. A node that starts *deriving* them where the historical
+/// producer *carried* them computes roots the historical headers do not carry
+/// — it forks off the live chain at the first shielded transaction, the exact
+/// failure family of [`ANCESTRY_SEED_ACTIVATION_EPOCH`]'s doc. So:
+///
+/// - below this epoch, a block carrying any shielded delta is **invalid**
+///   (`derive::ShieldedReject::NotActive`) and an empty application is the
+///   identity — bit-for-bit the carried-roots behaviour the fleet replays;
+/// - at or above it, the deltas are applied and the mirror is derived from
+///   the **post** state.
+///
+/// The gate reads the epoch derived from the BLOCK being judged
+/// (`epoch_of(header.slot)`) — committed data, identical on every node —
+/// never a local clock or node-local mutable state (the 2026-08-08
+/// `expected_bits` lesson).
+///
+/// `u64::MAX` means INERT. DEV-10 owns arming it; the arming rules are the
+/// same as [`ANCESTRY_SEED_ACTIVATION_EPOCH`]'s (strictly in the future,
+/// after the fleet rollout completes), plus one of its own: it must not arm
+/// before the shielded wire format exists (DEV-9) and the pool state that can
+/// re-root under the C1 tree is bound (DEV-5) — an armed gate with no engine
+/// behind it turns every shielded transaction into
+/// `ShieldedReject::PoolUnavailable`, a fail-closed block reject.
+pub const COHERENCE_ACTIVATION_EPOCH: u64 = u64::MAX;
+
 /// Domain separation tags (§6.1). Fixed 16 bytes, right-padded with zeros, so
 /// no tag can be a prefix of another.
 pub const DS_SORTITION: [u8; 16] = *b"BLCH4:SORTIT\0\0\0\0";

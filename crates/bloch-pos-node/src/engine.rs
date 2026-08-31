@@ -1011,8 +1011,14 @@ impl Engine {
             finalized_root: fin.finalized.root,
             attestation_root: derive::attestation_root(&atts),
             // Derived from the parent's committed pool roots, not zeroed. The
-            // transition checks this (step 3b) since 2026-08-12; a zeroed field
-            // was accepted before only because nothing checked it.
+            // transition checks this since 2026-08-12 — and since 2026-08-29
+            // against the POST-state it computes (step 3d), which equals this
+            // pre-state stamp only while no shielded delta exists in the
+            // block. That is guaranteed today (no shielded transaction
+            // variant exists; `PosTransaction::shielded_delta` is
+            // None-for-all); when DEV-9's variant lands, this stamp must move
+            // to the probe's post-state or the probe below will refuse the
+            // header and the drop-loop will shed the shielded transactions.
             coherence_root: self.state.coherence_root(),
         };
 

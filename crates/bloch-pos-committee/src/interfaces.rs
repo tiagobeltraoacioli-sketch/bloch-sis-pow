@@ -319,11 +319,22 @@ pub enum TransitionError {
     /// quorum the body carries.
     AttestationRootMismatch,
     /// Header `coherence_root` is not the §6.6.2 mirror binding of the
-    /// parent's **committed** accumulator and nullifier-set roots
-    /// (`derive::expected_coherence` — derived from parent state, which
-    /// carries the pool's roots unchanged; the pool itself is never
-    /// re-rooted, §6.6.1).
+    /// accumulator and nullifier-set roots of the state the transition
+    /// **computed** — the parent's committed roots with the block's shielded
+    /// deltas applied (`derive::apply_shielded`; identity while application
+    /// is inert, so pre-activation this is exactly the parent's carried
+    /// roots). Checked against the computed state, never the supplied one, so
+    /// the mirror follows application by construction instead of by a second
+    /// derivation someone must remember to update (the h28080 shape).
     CoherenceRootMismatch,
+    /// The block's shielded deltas were refused before application
+    /// (`derive::ShieldedReject`): carried before the
+    /// `COHERENCE_ACTIVATION_EPOCH` flag day, or with no pool state bound
+    /// that can re-root the C1 trees (fail closed). Distinct from
+    /// `CoherenceRootMismatch`: that one says the header lied about the
+    /// roots, this one says the block's shielded content is inadmissible no
+    /// matter what the header claims.
+    Shielded(crate::derive::ShieldedReject),
     /// The committed cumulative issuance would exceed the hard cap
     /// (`tokenomics_v4::TOTAL_SUPPLY_SAT`) — founder decision, 2026-08-12:
     /// the cap is a consensus invariant, not a property the emission curve
