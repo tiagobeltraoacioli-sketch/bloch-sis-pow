@@ -23,6 +23,11 @@ sha3 = { version = "0.10", default-features = false }
 
 [dev-dependencies]
 hex = "0.4"
+# Dev-only, deliberately: the shipped consensus binary never links the pool's
+# hashing (carried-never-recomputed, §6.6.1). The tests use it to hold the
+# byte-pinned COHERENCE_EMPTY_* roots in params.rs against the C1-frozen
+# computation, so the pin cannot drift from the code that defines it.
+coherence-core = { path = "../coherence-core" }
 
 # The suite walks 8,192-step SHAKE-256 reveal chains and 256-deep SMTs, so an
 # unoptimized Keccak permutation puts tens of seconds on `cargo test`. Optimize

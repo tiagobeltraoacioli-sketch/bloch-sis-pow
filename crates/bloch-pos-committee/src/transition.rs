@@ -1365,6 +1365,45 @@ fn owns(key_hash: &[u8; 32], script_hash: &[u8; 32]) -> bool {
     script_hash[20..] == [0u8; 12] && key_hash[..20] == script_hash[..20]
 }
 
+/// The Coherence sentinel bridge (see
+/// [`crate::params::COHERENCE_ACTIVATION_EPOCH`]).
+///
+/// The live Genesis-4 genesis committed `[0u8; 32]` for both pool roots — a
+/// sentinel no derivation produces, not the hash of anything. At the epoch
+/// boundary that OPENS the activation epoch, each root that still holds the
+/// sentinel is rewritten to the real root of the empty structure
+/// ([`crate::params::COHERENCE_EMPTY_ACCUMULATOR_ROOT`],
+/// [`crate::params::COHERENCE_EMPTY_NULLIFIER_ROOT`]); a root that already
+/// holds a real value — a future chain whose genesis ceremony committed the
+/// pool's actual roots — passes through untouched.
+///
+/// A free function taking `activation_epoch` as a parameter rather than
+/// reading the constant itself, so the tripwire tests can drive the firing
+/// case while the shipped constant stays `u64::MAX`; the ONE production call
+/// site (`close_epoch`, step 5a) passes
+/// [`crate::params::COHERENCE_ACTIVATION_EPOCH`].
+///
+/// This is the single sanctioned exception to "carried, never recomputed"
+/// (§6.6.1) — and it is a *substitution* of one constant for another, not a
+/// recomputation: no pool data flows in, so it cannot disagree between nodes
+/// that agree on the committed epoch.
+pub fn coherence_sentinel_bridge(
+    opening_epoch: u64,
+    activation_epoch: u64,
+    accumulator_root: &mut [u8; 32],
+    nullifier_root: &mut [u8; 32],
+) {
+    if opening_epoch != activation_epoch {
+        return;
+    }
+    if *accumulator_root == [0u8; 32] {
+        *accumulator_root = crate::params::COHERENCE_EMPTY_ACCUMULATOR_ROOT;
+    }
+    if *nullifier_root == [0u8; 32] {
+        *nullifier_root = crate::params::COHERENCE_EMPTY_NULLIFIER_ROOT;
+    }
+}
+
 impl CommittedState {
     /// The state committed by the genesis block. Its checkpoint is justified
     /// and finalized by definition — finality needs a root of trust.
@@ -2955,6 +2994,26 @@ impl CommittedState {
         // 5. Open E+1. The cohort cap for the new epoch is applied inside
         //    duty_roster_at (genesis_cohort.rs closed form — rule 3).
         st.epoch = next_epoch;
+        // 5a. The Coherence sentinel bridge — fires exactly once, at the
+        //     boundary that opens COHERENCE_ACTIVATION_EPOCH, and is a no-op
+        //     at every other boundary (and forever, while the constant is
+        //     u64::MAX). Gated on `next_epoch`, which is committed state
+        //     (`closing + 1`), never node-local bookkeeping — the 2026-08-08
+        //     `expected_bits` lesson. It runs INSIDE close_epoch because
+        //     compute_post_state rolls skipped boundaries through this same
+        //     function one epoch at a time, so `==` cannot be jumped over by
+        //     an empty epoch. The first block of the activation epoch still
+        //     *carries* the sentinel binding in its header (the header rule
+        //     is "the binding over the state the PARENT committed", §6.6.2,
+        //     and its parent closed the previous epoch); the block's POST
+        //     state commits the real roots, and every later header carries
+        //     them. Deterministic on every node, no header-rule change.
+        coherence_sentinel_bridge(
+            next_epoch,
+            crate::params::COHERENCE_ACTIVATION_EPOCH,
+            &mut st.coherence_accumulator_root,
+            &mut st.coherence_nullifier_root,
+        );
         st.pending_votes.clear();
         let roster_next = st.consensus_roster_at(next_epoch);
         st.previous_participation = std::mem::take(&mut st.current_participation);

@@ -1549,6 +1549,7 @@ dependencies = [
 name = "bloch-pos-committee"
 version = "0.1.0"
 dependencies = [
+ "coherence-core",
  "hex",
  "sha3 0.10.9",
 ]

@@ -954,6 +954,33 @@ impl Manifest {
     /// The committed state of block 0. Coherence starts empty (integration
     /// plan decision 6) and taint is dissolved (decision 8): all three
     /// carried roots are zero.
+    ///
+    /// # The zeros are a SENTINEL, pinned — do not "fix" them
+    ///
+    /// `[0u8; 32]` is not the root of an empty pool. The C1-frozen empty
+    /// accumulator and empty nullifier set hash to real values
+    /// (`bloch_pos_committee::params::COHERENCE_EMPTY_ACCUMULATOR_ROOT` /
+    /// `..._NULLIFIER_ROOT`), and the ceremony tool
+    /// (`tools/genesis4-ceremony`) computes exactly those for an empty pool —
+    /// its test `empty_pool_commits_a_real_root_never_the_zero_sentinel`
+    /// pins that. The two genesis tools therefore DISAGREE, and the
+    /// disagreement is intentional and must stay: the live chain launched
+    /// from THIS code, the ceremony's roots never reached the node, and while
+    /// the genesis header itself commits `state_root: [0u8; 32]` (so the
+    /// genesis id does not pin the sentinel), **block 1's `state_root` was
+    /// computed over the state these zeros seed** — change them and every
+    /// node's boot replay dies at block 1 with a state-root mismatch. The
+    /// test `the_live_sentinel_zeros_are_pinned_do_not_reconcile_with_the_ceremony`
+    /// below is the mirror of the ceremony's test and exists to stop the
+    /// "unification" that would brick the fleet.
+    ///
+    /// What resolves the sentinel on the live chain is the flag-day bridge:
+    /// at the boundary opening
+    /// `bloch_pos_committee::params::COHERENCE_ACTIVATION_EPOCH`, the
+    /// transition rewrites each zero root to the real empty root
+    /// (`bloch_pos_committee::transition::coherence_sentinel_bridge`),
+    /// deterministically on every node. A FUTURE chain should not rely on
+    /// the bridge: launch it from ceremony-computed roots.
     pub fn genesis_state(&self) -> CommittedState {
         let vals: Vec<GenesisValidator> = self
             .validators
@@ -1138,6 +1165,51 @@ mod tests {
             allocations: Vec::new(),
             carryover_entries: Vec::new(),
         }
+    }
+
+    /// THE MIRROR of the ceremony's
+    /// `empty_pool_commits_a_real_root_never_the_zero_sentinel`
+    /// (`tools/genesis4-ceremony/src/lib.rs`) — and deliberately its
+    /// OPPOSITE. The ceremony pins that an empty pool commits real roots;
+    /// this pins that the LIVE chain's genesis committed the `[0u8; 32]`
+    /// sentinel instead, and that it must keep doing so: block 1's
+    /// `state_root` was computed over the state these zeros seed, so
+    /// "reconciling" this file with the ceremony bricks every node's boot
+    /// replay at block 1. The two tools disagreeing is recorded, on purpose,
+    /// in both suites — see the doc on [`Manifest::genesis_state`]. The
+    /// sentinel is resolved on the live chain by the
+    /// `COHERENCE_ACTIVATION_EPOCH` flag-day bridge, not by editing genesis.
+    #[test]
+    fn the_live_sentinel_zeros_are_pinned_do_not_reconcile_with_the_ceremony() {
+        use bloch_pos_committee::{derive, params};
+        let m = sample();
+        // The header carries the sentinel binding path: literal zeros.
+        assert_eq!(m.genesis_header().coherence_root, [0u8; 32]);
+        // The committed state carries the sentinel roots, and its binding is
+        // the value every live block's header repeats — confirmed by RPC
+        // against the running chain (2026-08-29):
+        // 3ac97a48fe4c1dc2de33022b2473e76e609c85ce0c0bce96540851f682bccb56.
+        const LIVE_SENTINEL_BINDING: [u8; 32] = [
+            0x3A, 0xC9, 0x7A, 0x48, 0xFE, 0x4C, 0x1D, 0xC2,
+            0xDE, 0x33, 0x02, 0x2B, 0x24, 0x73, 0xE7, 0x6E,
+            0x60, 0x9C, 0x85, 0xCE, 0x0C, 0x0B, 0xCE, 0x96,
+            0x54, 0x08, 0x51, 0xF6, 0x82, 0xBC, 0xCB, 0x56,
+        ];
+        assert_eq!(m.genesis_state().coherence_root(), LIVE_SENTINEL_BINDING);
+        // And the sentinel is NOT the empty pool's real roots — the exact
+        // disagreement with the ceremony this test exists to keep visible.
+        assert_ne!(params::COHERENCE_EMPTY_ACCUMULATOR_ROOT, [0u8; 32]);
+        assert_ne!(params::COHERENCE_EMPTY_NULLIFIER_ROOT, [0u8; 32]);
+        assert_ne!(
+            m.genesis_state().coherence_root(),
+            derive::coherence_binding(
+                &params::COHERENCE_EMPTY_ACCUMULATOR_ROOT,
+                &params::COHERENCE_EMPTY_NULLIFIER_ROOT,
+            ),
+            "the live sentinel binding must differ from the ceremony's \
+             empty-pool binding; if these ever agree, one of the two \
+             definitions was silently rewritten"
+        );
     }
 
     // ── Carryover fixtures ──────────────────────────────────────────────
