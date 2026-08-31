@@ -383,7 +383,19 @@ pub enum PosTransaction {
         /// [`Self::Transfer`].
         tip_millisat_per_gas: u128,
     },
-    /// Register a validator (§7.1). PoP/taint already checked at admission.
+    /// Register a validator (§7.1).
+    ///
+    /// **What this wire shape can and cannot enforce.** It carries no suite
+    /// tag, no spent inputs, and no proof of possession, so the §7.1 checks
+    /// over those fields (`staking::validate_deposit`: suite, shielded/taint
+    /// eligibility, PoP) are UNENFORCEABLE here — not "already checked at
+    /// admission", as this comment used to claim. The node-side mempool
+    /// (`engine::admissible`) refuses every `Deposit` outright until bonding
+    /// is funded from the eUTXO set, and that refusal is not a consensus
+    /// rule: a block that carries one is still applied, bounds-checked but
+    /// PoP-less. Carrying the PoP and funding inputs is the same wire-format
+    /// flag day that closes the stake-from-nothing gap; when it lands,
+    /// `staking::validate_deposit` is the check the handler must run.
     Deposit {
         /// Suite-tagged hybrid public key (opaque bytes, per the interfaces).
         pubkey: Vec<u8>,
@@ -1987,15 +1999,19 @@ impl CommittedState {
                 if self.pubkey_index.contains_key(&pubkey_hash) {
                     return Err(TxReject::StakingRule);
                 }
-                if *amount_sat < staking::MIN_DEPOSIT_SAT {
-                    return Err(TxReject::StakingRule);
-                }
                 // Per-validator cap: 1% of committed active stake, floored at
                 // the minimum deposit — a naive 1% cap at genesis (active
                 // stake ≈ 0) would deadlock the bootstrap (staking.rs docs).
+                // Deliberately NOT `delegation::Registry::cap_sat` (the
+                // fixed-point cap, strictly tighter): the naive cap is what
+                // the live chain has committed to, and tightening what a node
+                // accepts is a flag-day change.
                 let cap = (total_active_sat * delegation::MAX_VALIDATOR_STAKE_BPS / 10_000)
                     .max(staking::MIN_DEPOSIT_SAT);
-                if *amount_sat > cap {
+                // Bounds live in exactly one place —
+                // `staking::validate_deposit_bounds` — shared with the §7.1
+                // admission check so the two sites cannot drift.
+                if staking::validate_deposit_bounds(*amount_sat, cap).is_err() {
                     return Err(TxReject::StakingRule);
                 }
                 // Next free index: a deterministic function of the registry,
@@ -4727,6 +4743,60 @@ mod tests {
             ),
             Err(TxReject::StakingRule)
         );
+    }
+
+    /// The `Deposit` handler's bounds ARE `staking::validate_deposit_bounds`
+    /// — one shared function, not a second copy (the duplication an exchange
+    /// audit flagged against `e4083f9`). This test sweeps the boundary at two
+    /// caps — the genesis floor (`total_active = 0` ⇒ cap = MIN) and a live
+    /// 1%-of-active cap — and requires the handler's verdict to equal the
+    /// shared rule's verdict at every point. If someone re-inlines a
+    /// comparison and it drifts, this is where it breaks.
+    #[test]
+    fn deposit_handler_bounds_agree_with_the_shared_rule() {
+        let (t, g, mut chains) = setup(4);
+        let b = build_block(&t, &g, 1, &[], &[], &mut chains);
+        let st = t.apply_block(&g, &b, &[], &[]).unwrap();
+
+        // (total_active_sat, expected naive cap = 1% floored at MIN).
+        let min = staking::MIN_DEPOSIT_SAT;
+        let cases = [
+            (0u128, min),                       // genesis floor
+            (10_000 * min, 100 * min),          // live cap: 1% of active
+        ];
+        for (total_active, cap) in cases {
+            for (i, amount) in
+                [min - 1, min, cap, cap + 1].into_iter().enumerate()
+            {
+                let deposit = PosTransaction::Deposit {
+                    // Distinct pubkey per attempt, clear of the genesis
+                    // validators' `vec![0..n; 8]`: uniqueness must not shadow
+                    // the bounds verdict under test.
+                    pubkey: vec![0xF0 + i as u8; 8],
+                    amount_sat: amount,
+                    randao_commitment: [0x11; 32],
+                    withdrawal_credentials: vec![0x22; 4],
+                    commission_bps: 0,
+                };
+                let mut probe = st.clone();
+                let handler = probe.apply_transaction(
+                    &deposit,
+                    total_active,
+                    fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+                    &OkVerifier,
+                );
+                let shared = staking::validate_deposit_bounds(amount, cap);
+                assert_eq!(
+                    handler.is_ok(),
+                    shared.is_ok(),
+                    "handler and shared bounds rule diverge at amount {amount} \
+                     (total_active {total_active}, cap {cap})"
+                );
+                if handler.is_err() {
+                    assert_eq!(handler, Err(TxReject::StakingRule));
+                }
+            }
+        }
     }
 
     #[test]

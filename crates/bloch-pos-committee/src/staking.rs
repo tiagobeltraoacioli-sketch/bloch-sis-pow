@@ -269,6 +269,45 @@ pub enum DepositReject {
     BadProofOfPossession,
 }
 
+/// The stake-bounds rule, stated once: `MIN_DEPOSIT_SAT ≤ amount ≤
+/// max_stake_sat` (§4.1, §4.1.3).
+///
+/// This is THE single statement of the bounds rule. Two callers share it and
+/// must never re-implement it:
+///
+/// - [`validate_deposit`] below — the full §7.1 admission check for the
+///   future funded-deposit wire format;
+/// - the `PosTransaction::Deposit` handler in `transition::apply_transaction`
+///   — the consensus path that applies a block-carried deposit today.
+///
+/// Until 2026-08 the two sites carried their own copies of these two
+/// comparisons (an exchange audit against `e4083f9` flagged the duplication);
+/// identical then, but two copies of a consensus rule are a drift waiting to
+/// happen — the 2026-08-08 `expected_bits` fork is the standing reason this
+/// crate does not tolerate that shape.
+///
+/// `max_stake_sat` is caller-derived for the §5.5 reason documented on
+/// [`validate_deposit`]. Note the derivations at the two call sites are NOT
+/// yet unified: the transition computes a naive
+/// `total_active × MAX_VALIDATOR_STAKE_BPS / 10 000` floored at
+/// [`MIN_DEPOSIT_SAT`], while this crate's documented derivation is
+/// `delegation::Registry::cap_sat` (fixed-point, strictly ≤ the naive cap).
+/// The naive cap is the rule the live chain has committed to; switching the
+/// transition to `cap_sat` would tighten what a node accepts and is therefore
+/// a flag-day change, not a refactor.
+pub fn validate_deposit_bounds(
+    amount_sat: u128,
+    max_stake_sat: u128,
+) -> Result<(), DepositReject> {
+    if amount_sat < MIN_DEPOSIT_SAT {
+        return Err(DepositReject::BelowMinimum);
+    }
+    if amount_sat > max_stake_sat {
+        return Err(DepositReject::AboveMaximum);
+    }
+    Ok(())
+}
+
 /// Validate a `DEPOSIT` against §7.1 and §4.1.
 ///
 /// `max_stake_sat` is a parameter, not a constant, because
@@ -300,12 +339,7 @@ pub fn validate_deposit(
     if inputs.iter().any(|i| i.tainted) {
         return Err(DepositReject::TaintedInput);
     }
-    if tx.amount_sat < MIN_DEPOSIT_SAT {
-        return Err(DepositReject::BelowMinimum);
-    }
-    if tx.amount_sat > max_stake_sat {
-        return Err(DepositReject::AboveMaximum);
-    }
+    validate_deposit_bounds(tx.amount_sat, max_stake_sat)?;
     if !verify_hybrid(&tx.validator_pubkey, &tx.signing_root(), &tx.proof_of_possession, verifier)
     {
         return Err(DepositReject::BadProofOfPossession);
@@ -664,6 +698,52 @@ mod tests {
             validate_deposit(&at_max, &transparent_clean(), MAX_STAKE, &accept_all()),
             Ok(())
         );
+    }
+
+    /// The bounds rule stated once, pinned once: `validate_deposit_bounds` is
+    /// the function the transition's `Deposit` handler shares with the full
+    /// §7.1 check, so its boundary behaviour IS the consensus boundary.
+    #[test]
+    fn bounds_rule_boundaries_are_inclusive() {
+        assert_eq!(
+            validate_deposit_bounds(MIN_DEPOSIT_SAT - 1, MAX_STAKE),
+            Err(DepositReject::BelowMinimum)
+        );
+        assert_eq!(validate_deposit_bounds(MIN_DEPOSIT_SAT, MAX_STAKE), Ok(()));
+        assert_eq!(validate_deposit_bounds(MAX_STAKE, MAX_STAKE), Ok(()));
+        assert_eq!(
+            validate_deposit_bounds(MAX_STAKE + 1, MAX_STAKE),
+            Err(DepositReject::AboveMaximum)
+        );
+        // Below-minimum wins when both bounds fail (cap < minimum can only
+        // happen if a caller ignores the genesis floor): the reject must name
+        // the rule the depositor can actually act on.
+        assert_eq!(
+            validate_deposit_bounds(MIN_DEPOSIT_SAT - 1, MIN_DEPOSIT_SAT - 2),
+            Err(DepositReject::BelowMinimum)
+        );
+    }
+
+    /// `validate_deposit` must not carry its own copy of the bounds — its
+    /// verdict on any amount must equal `validate_deposit_bounds`' verdict
+    /// whenever the other checks pass. A sweep across the boundary pins the
+    /// delegation.
+    #[test]
+    fn full_check_delegates_bounds_to_the_shared_rule() {
+        for amount in [
+            0,
+            MIN_DEPOSIT_SAT - 1,
+            MIN_DEPOSIT_SAT,
+            MIN_DEPOSIT_SAT + 1,
+            MAX_STAKE - 1,
+            MAX_STAKE,
+            MAX_STAKE + 1,
+        ] {
+            let full =
+                validate_deposit(&deposit(amount), &transparent_clean(), MAX_STAKE, &accept_all());
+            let bounds = validate_deposit_bounds(amount, MAX_STAKE);
+            assert_eq!(full, bounds, "divergence at amount {amount}");
+        }
     }
 
     #[test]

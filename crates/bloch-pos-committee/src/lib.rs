@@ -148,7 +148,8 @@ pub use slashing::{
     EvidenceError, SlashableOffense, SlashingEvidence, SlashingOutcome, SlashingState,
 };
 pub use staking::{
-    resolve_activations, validate_deposit, validate_exit, validate_withdrawal, DepositInput,
+    resolve_activations, validate_deposit, validate_deposit_bounds, validate_exit,
+    validate_withdrawal, DepositInput,
     DepositReject, DepositTx, ExitReject, ExitTx, HybridKeyVerifier, QueuedDeposit, WithdrawReject,
 };
 pub use state_root::{

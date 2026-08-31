@@ -255,7 +255,9 @@ fn mutation_restores_zero_stake_filter() -> bool {
 /// zero stake — not merely leaked to zero — would now take an inert seat. Every
 /// runtime path that can create a validator record forbids that state:
 /// `staking::validate_deposit` and the `Deposit` handler both reject below
-/// `MIN_DEPOSIT_SAT` (25,000 BLCH); `staked_sat` thereafter only ever grows,
+/// `MIN_DEPOSIT_SAT` (25,000 BLCH) — since 2026-08 through the one shared
+/// `staking::validate_deposit_bounds`, so the two cannot drift apart;
+/// `staked_sat` thereafter only ever grows,
 /// except in `apply_slashing_evidence`, which sets `slashed = true` in the same
 /// statement and so removes the record from every roster; and
 /// `genesis_cohort::apply_cohort_cap` cannot scale a member to zero, because
