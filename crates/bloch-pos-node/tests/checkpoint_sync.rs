@@ -352,20 +352,25 @@ fn a_node_bootstraps_from_checkpoint_plus_downloaded_state_and_matches_the_repla
         "--export-state-out",
         artifact.to_str().unwrap(),
     ]);
-    // Parse ", state root <hex64>," and " (slot N)," from the export report.
-    let state_root_hex = export_out
+    // Parse the export REPORT line — not the whole stdout, which also
+    // carries boot and replay lines that mention "state root" in hex8.
+    let report = export_out
+        .lines()
+        .find(|l| l.starts_with("exported epoch-"))
+        .unwrap_or_else(|| panic!("no export report line in:\n{export_out}"));
+    let state_root_hex = report
         .split("state root ")
         .nth(1)
         .and_then(|s| s.split(',').next())
-        .expect("export printed the state root")
+        .expect("report names the state root")
         .trim()
         .to_string();
-    assert_eq!(state_root_hex.len(), 64, "export output changed shape:\n{export_out}");
-    let boundary_slot: u64 = export_out
+    assert_eq!(state_root_hex.len(), 64, "export report changed shape:\n{report}");
+    let boundary_slot: u64 = report
         .split("(slot ")
         .nth(1)
         .and_then(|s| s.split(')').next())
-        .expect("export printed the boundary slot")
+        .expect("report names the boundary slot")
         .parse()
         .expect("boundary slot parses");
     assert!(boundary_slot < CHECKPOINT_EPOCH * 32, "boundary must precede the epoch");

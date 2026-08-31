@@ -460,7 +460,6 @@ pub fn serve(data_dir: &Path, req: &StateSyncRequest) -> StateSyncResponse {
 pub struct Download {
     path: PathBuf,
     file: File,
-    state_root: [u8; 32],
     total_len: u64,
     chunk_hashes: Vec<[u8; 32]>,
     have: Vec<bool>,
@@ -509,15 +508,10 @@ impl Download {
         Ok(Download {
             path,
             file,
-            state_root: *state_root,
             total_len: *total_len,
             chunk_hashes: chunk_hashes.clone(),
             have,
         })
-    }
-
-    pub fn state_root(&self) -> [u8; 32] {
-        self.state_root
     }
 
     /// Chunk indices still needed, capped at `limit`.
