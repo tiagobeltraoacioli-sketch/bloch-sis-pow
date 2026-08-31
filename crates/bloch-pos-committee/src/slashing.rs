@@ -157,19 +157,7 @@ impl SlashingEvidence {
     /// itself, so re-broadcasting one honest attestation twice can never be
     /// made to look like equivocation.
     pub fn offense(&self) -> Result<SlashableOffense, EvidenceError> {
-        if self.first.validator != self.second.validator {
-            return Err(EvidenceError::DifferentValidators);
-        }
-        let (a, b) = (&self.first.data, &self.second.data);
-        if a.is_double_vote(b) {
-            Ok(SlashableOffense::DoubleVote)
-        } else if a.surrounds(b) || b.surrounds(a) {
-            // Surround is checked both ways: the offence is the *pair*, and
-            // which message the submitter listed first is not meaningful.
-            Ok(SlashableOffense::SurroundVote)
-        } else {
-            Err(EvidenceError::NotConflicting)
-        }
+        attestation_offence(&self.first, &self.second)
     }
 
     /// Canonical anti-replay identity of this evidence.
@@ -184,15 +172,125 @@ impl SlashingEvidence {
     ///   non-malleable; if a re-encoded signature changed the identity, one
     ///   offence could be "fresh evidence" arbitrarily many times.
     pub fn id(&self) -> [u8; 32] {
-        let r1 = self.first.data.signing_root();
-        let r2 = self.second.data.signing_root();
-        let (lo, hi) = if r1 <= r2 { (r1, r2) } else { (r2, r1) };
-        let mut h = Sha3_256::new();
-        h.update(DS_SLASH);
-        h.update(self.first.validator.to_le_bytes());
-        h.update(lo);
-        h.update(hi);
-        h.finalize().into()
+        pair_id(
+            self.first.validator,
+            self.first.data.signing_root(),
+            self.second.data.signing_root(),
+        )
+    }
+}
+
+/// The order-independent, signature-free identity shared by both evidence
+/// forms: `SHA3-256(DS_SLASH ‖ validator ‖ sorted roots)`. One definition on
+/// purpose — [`SlashingEvidence::id`], [`SlashingState::process_proposer`]
+/// and the node's admission dedup ([`wire_evidence_id`]) must all name the
+/// same pair the same way, or a pair one of them refuses as a replay is
+/// fresh evidence to another.
+fn pair_id(validator: u32, r1: [u8; 32], r2: [u8; 32]) -> [u8; 32] {
+    let (lo, hi) = if r1 <= r2 { (r1, r2) } else { (r2, r1) };
+    let mut h = Sha3_256::new();
+    h.update(DS_SLASH);
+    h.update(validator.to_le_bytes());
+    h.update(lo);
+    h.update(hi);
+    h.finalize().into()
+}
+
+/// Structural check for an attestation pair: same signer, genuinely
+/// conflicting data. Deliberately does **not** touch signatures — this is
+/// the cheap gate. The identical-data case falls out of the predicates
+/// themselves: `is_double_vote` requires `self != other`, and nothing
+/// surrounds itself, so re-broadcasting one honest attestation twice can
+/// never be made to look like equivocation.
+fn attestation_offence(
+    first: &Attestation,
+    second: &Attestation,
+) -> Result<SlashableOffense, EvidenceError> {
+    if first.validator != second.validator {
+        return Err(EvidenceError::DifferentValidators);
+    }
+    let (a, b) = (&first.data, &second.data);
+    if a.is_double_vote(b) {
+        Ok(SlashableOffense::DoubleVote)
+    } else if a.surrounds(b) || b.surrounds(a) {
+        // Surround is checked both ways: the offence is the *pair*, and
+        // which message the submitter listed first is not meaningful.
+        Ok(SlashableOffense::SurroundVote)
+    } else {
+        Err(EvidenceError::NotConflicting)
+    }
+}
+
+/// Structural check for a header pair: one signer, one slot, two different
+/// blocks. Signature-free like [`attestation_offence`], and it shares that
+/// function's identical-data property: one header equals itself, so
+/// re-gossiping your own block can never be made to look like equivocation.
+/// The scheduled-proposer question is deliberately NOT asked here — see
+/// [`SlashingState::process_proposer`], which owns that argument.
+fn proposer_offence(
+    first: &ProposalEnvelope,
+    second: &ProposalEnvelope,
+) -> Result<SlashableOffense, EvidenceError> {
+    if first.header.proposer_index != second.header.proposer_index {
+        return Err(EvidenceError::DifferentValidators);
+    }
+    if first.header.slot != second.header.slot
+        || crate::header::BlockId::of(&first.header) == crate::header::BlockId::of(&second.header)
+    {
+        return Err(EvidenceError::NotConflicting);
+    }
+    Ok(SlashableOffense::ProposerEquivocation)
+}
+
+/// Structural classification of a wire-shape evidence payload
+/// ([`crate::interfaces::SlashingEvidence`]): which offence it would prove,
+/// if the signatures verify. The same cheap gate consensus runs as step 1 of
+/// [`SlashingState::process`] / [`SlashingState::process_proposer`], exposed
+/// so the node's mempool admission judges structure by the one definition —
+/// admission must never admit a shape the transition refuses on structure,
+/// nor refuse one it accepts.
+pub fn wire_offence(
+    ev: &crate::interfaces::SlashingEvidence,
+) -> Result<SlashableOffense, EvidenceError> {
+    match ev {
+        crate::interfaces::SlashingEvidence::AttestationOffence { first, second } => {
+            attestation_offence(first, second)
+        }
+        crate::interfaces::SlashingEvidence::ProposerEquivocation { first, second } => {
+            proposer_offence(first, second)
+        }
+    }
+}
+
+/// The validator a wire-shape evidence payload accuses — the `first` half's
+/// signer, exactly as `apply_slashing_evidence` reads it. Only meaningful on
+/// a pair [`wire_offence`] accepts, which is what guarantees both halves
+/// name the same validator.
+pub fn wire_offender(ev: &crate::interfaces::SlashingEvidence) -> u32 {
+    match ev {
+        crate::interfaces::SlashingEvidence::AttestationOffence { first, .. } => first.validator,
+        crate::interfaces::SlashingEvidence::ProposerEquivocation { first, .. } => {
+            first.header.proposer_index
+        }
+    }
+}
+
+/// Anti-replay identity of a wire-shape evidence payload — [`pair_id`] over
+/// the same roots consensus hashes, so the node's admission dedup and the
+/// transition's applied-set agree byte for byte. Pinned against the
+/// consensus-side ids by `wire_id_matches_the_consensus_ids`.
+pub fn wire_evidence_id(ev: &crate::interfaces::SlashingEvidence) -> [u8; 32] {
+    match ev {
+        crate::interfaces::SlashingEvidence::AttestationOffence { first, second } => pair_id(
+            first.validator,
+            first.data.signing_root(),
+            second.data.signing_root(),
+        ),
+        crate::interfaces::SlashingEvidence::ProposerEquivocation { first, second } => pair_id(
+            first.header.proposer_index,
+            first.header.proposal_signing_root(),
+            second.header.proposal_signing_root(),
+        ),
     }
 }
 
@@ -284,6 +382,16 @@ impl SlashingState {
     /// Has this validator already been slashed and ejected?
     pub fn is_ejected(&self, validator: u32) -> bool {
         self.ejected.contains(&validator)
+    }
+
+    /// Has this exact evidence pair (in either order) already been applied?
+    ///
+    /// Read by the node's mempool admission so a pair already settled on
+    /// chain is refused at the door instead of riding the mesh to die in a
+    /// proposer's probe. Consensus itself never calls this — its own replay
+    /// check is step 2 of `process`/`process_proposer`, against the same set.
+    pub fn is_applied(&self, id: &[u8; 32]) -> bool {
+        self.applied.contains(id)
     }
 
     /// Total stake slashed within the correlation window ending at `epoch`.
@@ -391,31 +499,22 @@ impl SlashingState {
         including_proposer: u32,
         verifier: &dyn SignatureVerifier,
     ) -> Result<SlashingOutcome, EvidenceError> {
-        // 1. Structure: one signer, one slot, two different blocks.
-        if first.header.proposer_index != second.header.proposer_index {
-            return Err(EvidenceError::DifferentValidators);
-        }
-        if first.header.slot != second.header.slot
-            || crate::header::BlockId::of(&first.header) == crate::header::BlockId::of(&second.header)
-        {
-            return Err(EvidenceError::NotConflicting);
-        }
+        // 1. Structure: one signer, one slot, two different blocks
+        //    ([`proposer_offence`] — the definition admission shares).
+        proposer_offence(first, second)?;
 
-        // 2. Anti-replay. Same construction as the attestation id: sorted
-        //    signing roots, signatures excluded. The proposal signing root is
-        //    under DS_PROPOSE while attestation roots are under DS_ATTEST, so
-        //    a header-pair id can never collide with an attestation-pair id
-        //    even though both live in one `applied` set.
-        let r1 = first.header.proposal_signing_root();
-        let r2 = second.header.proposal_signing_root();
-        let (lo, hi) = if r1 <= r2 { (r1, r2) } else { (r2, r1) };
+        // 2. Anti-replay. Same construction as the attestation id
+        //    ([`pair_id`]): sorted signing roots, signatures excluded. The
+        //    proposal signing root is under DS_PROPOSE while attestation
+        //    roots are under DS_ATTEST, so a header-pair id can never collide
+        //    with an attestation-pair id even though both live in one
+        //    `applied` set.
         let validator = first.header.proposer_index;
-        let mut h = Sha3_256::new();
-        h.update(DS_SLASH);
-        h.update(validator.to_le_bytes());
-        h.update(lo);
-        h.update(hi);
-        let id: [u8; 32] = h.finalize().into();
+        let id = pair_id(
+            validator,
+            first.header.proposal_signing_root(),
+            second.header.proposal_signing_root(),
+        );
         if self.applied.contains(&id) {
             return Err(EvidenceError::AlreadyApplied);
         }
@@ -807,6 +906,76 @@ mod tests {
         let r = st.process_proposer(&a, &b, 11, &dels, TOTAL_ACTIVE, 42, &RootEchoVerifier);
         assert_eq!(r.unwrap_err(), EvidenceError::AlreadySlashed);
         assert_eq!(st.slashed_in_window(11), 5_000);
+    }
+
+    #[test]
+    fn wire_id_matches_the_consensus_ids() {
+        // Attestation form: the wire id IS the pair id, either order.
+        let pair = double_vote(7);
+        let wire = crate::interfaces::SlashingEvidence::AttestationOffence {
+            first: pair.first.clone(),
+            second: pair.second.clone(),
+        };
+        assert_eq!(wire_evidence_id(&wire), pair.id());
+        let swapped = crate::interfaces::SlashingEvidence::AttestationOffence {
+            first: pair.second.clone(),
+            second: pair.first.clone(),
+        };
+        assert_eq!(wire_evidence_id(&swapped), pair.id(), "order must not matter");
+
+        // Proposer form: the id admission computes is the id the transition
+        // burns — proved by applying the pair and asking `is_applied` for the
+        // wire id.
+        let (a, b) = (signed_header(5, 7, 0xAA), signed_header(5, 7, 0xBB));
+        let wire_p = crate::interfaces::SlashingEvidence::ProposerEquivocation {
+            first: a.clone(),
+            second: b.clone(),
+        };
+        let dels = [delegation(1, 7, 100_000)];
+        let mut st = SlashingState::new();
+        assert!(!st.is_applied(&wire_evidence_id(&wire_p)));
+        st.process_proposer(&a, &b, 10, &dels, TOTAL_ACTIVE, 42, &RootEchoVerifier).unwrap();
+        assert!(st.is_applied(&wire_evidence_id(&wire_p)));
+        // And the attestation-form id is untouched: DS_ATTEST vs DS_PROPOSE
+        // keep the two id spaces disjoint inside the one applied set.
+        assert!(!st.is_applied(&wire_evidence_id(&wire)));
+    }
+
+    #[test]
+    fn wire_offence_agrees_with_the_consensus_checks() {
+        // Conflicting pairs classify exactly as `process` would.
+        let dv = double_vote(7);
+        let wire = |p: &SlashingEvidence| crate::interfaces::SlashingEvidence::AttestationOffence {
+            first: p.first.clone(),
+            second: p.second.clone(),
+        };
+        assert_eq!(wire_offence(&wire(&dv)), Ok(SlashableOffense::DoubleVote));
+        assert_eq!(wire_offence(&wire(&surround(7))), Ok(SlashableOffense::SurroundVote));
+        assert_eq!(wire_offence(&wire(&dv)), dv.offense(), "one definition, two doors");
+
+        // Header pairs: conflicting, identical, different-slot, different
+        // proposer — each verdict matches `process_proposer`'s step 1.
+        let ok = crate::interfaces::SlashingEvidence::ProposerEquivocation {
+            first: signed_header(5, 7, 0xAA),
+            second: signed_header(5, 7, 0xBB),
+        };
+        assert_eq!(wire_offence(&ok), Ok(SlashableOffense::ProposerEquivocation));
+        assert_eq!(wire_offender(&ok), 7);
+        let same = crate::interfaces::SlashingEvidence::ProposerEquivocation {
+            first: signed_header(5, 7, 0xAA),
+            second: signed_header(5, 7, 0xAA),
+        };
+        assert_eq!(wire_offence(&same), Err(EvidenceError::NotConflicting));
+        let other_slot = crate::interfaces::SlashingEvidence::ProposerEquivocation {
+            first: signed_header(5, 7, 0xAA),
+            second: signed_header(6, 7, 0xBB),
+        };
+        assert_eq!(wire_offence(&other_slot), Err(EvidenceError::NotConflicting));
+        let other_signer = crate::interfaces::SlashingEvidence::ProposerEquivocation {
+            first: signed_header(5, 7, 0xAA),
+            second: signed_header(5, 8, 0xBB),
+        };
+        assert_eq!(wire_offence(&other_signer), Err(EvidenceError::DifferentValidators));
     }
 
     #[test]

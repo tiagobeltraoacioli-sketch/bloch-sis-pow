@@ -650,6 +650,7 @@ fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
         recent_states: VecDeque::new(),
         pool: BTreeMap::new(),
         att_pool: AttestationPool::new(),
+        proposals_seen: std::collections::BTreeMap::new(),
         wall_slot: 0,
         mempool: BTreeMap::new(),
         // O cache de recusa (2026-08-30): o replay nao propoe, entao nunca

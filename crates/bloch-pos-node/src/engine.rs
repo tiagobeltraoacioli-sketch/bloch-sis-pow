@@ -67,12 +67,15 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use bloch_pos_committee::attestation::{Attestation, AttestationData};
+use bloch_pos_committee::attestation::{Attestation, AttestationData, SignatureVerifier};
 use bloch_pos_committee::beacon::{mix_in, RandaoChain};
 use bloch_pos_committee::forkchoice::{BlockTree, LatestMessage, Store as FcStore};
 use bloch_pos_committee::gossip::{AttestationPool, GossipDecision};
 use bloch_pos_committee::header::{BlockEnvelope, BlockHeaderV4, BlockId, Body, VERSION_G4};
-use bloch_pos_committee::interfaces::{ProposalEnvelope, StateReader, StateTransition};
+use bloch_pos_committee::interfaces::{
+    ProposalEnvelope, SlashingEvidence, StateReader, StateTransition, ValidatorRecord,
+};
+use bloch_pos_committee::slashing;
 use bloch_pos_committee::schedule::first_slot_of_epoch;
 use bloch_pos_committee::transition::{CommittedState, PosTransaction, Transition};
 use bloch_pos_committee::interfaces::TransitionError;
@@ -533,6 +536,14 @@ struct Engine {
     /// Wall-clock slot, refreshed by the slot loop. `att_pool` never reads a
     /// clock (that is its determinism rule), so the node supplies one.
     wall_slot: u64,
+    /// First signed header seen per `(slot, proposer)` within the recent
+    /// watch window — the proposer-side twin of `att_pool`'s per-duty
+    /// equivocation capture. A second, different header for a watched duty
+    /// becomes a §7.3 evidence transaction through
+    /// [`detect_proposer_equivocation`] and [`Engine::report_equivocation`].
+    /// Bounded by [`PROPOSER_WATCH_SLOTS`] (pruned on every ingest); one
+    /// report per duty, mirroring `MAX_EQUIVOCATIONS_PER_DUTY`.
+    proposals_seen: BTreeMap<(u64, u32), SeenProposal>,
     /// Transactions waiting for a block, keyed by canonical bytes so a
     /// duplicate gossip collapses instead of being included twice.
     ///
@@ -1354,12 +1365,24 @@ impl Engine {
         if env.header.slot == 0 {
             return; // genesis is synthesized, never received
         }
+        // Watch for a second signed header on the same (slot, proposer) —
+        // the proposer-side twin of the attestation pool's equivocation
+        // capture. Before the insert, while `env` is still whole; and before
+        // any signature check on purpose: the submission path
+        // (`report_equivocation` → `on_transaction`) verifies both proposer
+        // signatures itself, so a peer feeding fabricated header pairs costs
+        // this node two hybrid verifications and nothing is ever relayed.
+        let wall = self.wall_slot();
+        let equivocation = detect_proposer_equivocation(&mut self.proposals_seen, &env, wall);
         self.blocks.insert(id, env);
         self.advance();
         // The block is queryable now, so attestations parked on it can be
         // re-run. `advance()` first: an attestation released here votes on
         // fork choice, and it should see the chain the block already moved.
         self.release_held(id);
+        if let Some(ev) = equivocation {
+            self.report_equivocation(ev);
+        }
     }
 
     // ── Fork choice: LMD-GHOST ──────────────────────────────────────────────
@@ -1589,6 +1612,23 @@ impl Engine {
         let mut suspect: Vec<Vec<u8>> = Vec::new();
         let mut cleared: Vec<Vec<u8>> = Vec::new();
         for (key, tx) in &self.mempool {
+            // Evidence goes stale differently from a transfer: not by
+            // missing outputs but by its offender being ejected (someone
+            // else's evidence landed first) or by its exact pair being
+            // applied. Both facts are permanent on this branch, so eviction
+            // is immediate rather than two-strike; in the reorg corner where
+            // validity could return, the rejection bar's TTL lets the pair
+            // be re-offered later.
+            if let PosTransaction::SlashingEvidence(ev) = tx {
+                let stale = match self.state.validator_record(slashing::wire_offender(ev)) {
+                    Some(rec) => rec.slashed,
+                    None => true,
+                } || self.state.evidence_applied(&slashing::wire_evidence_id(ev));
+                if stale {
+                    evict.push(key.clone());
+                }
+                continue;
+            }
             let Some(outpoints) = Self::spent_outpoints(tx) else {
                 continue;
             };
@@ -1757,6 +1797,26 @@ impl Engine {
         // feeds. Gossip (`NetEvent::Transaction`) and RPC both land in this
         // one call, so one call site carries the whole decision.
         admissible(&tx, epoch_of(self.wall_slot())).map_err(Refusal::Invalid)?;
+        // Evidence carries the rest of its admission here, where the head
+        // state and the verifier live: structure was `admissible`'s
+        // (stateless) half, this is the stateful half — the offender exists
+        // and is still slashable, the pair is not already settled on chain
+        // or already in flight, and BOTH signatures verify. Unverified
+        // evidence must never take a mempool slot or be relayed: relaying it
+        // would let anyone spend two hybrid verifications of every node on
+        // the mesh for free bytes, and the whistleblower reward makes
+        // near-duplicate spam profitable to try — the per-offender dedup is
+        // what bounds it.
+        if let PosTransaction::SlashingEvidence(ev) = &tx {
+            evidence_admissible(
+                self.state.validator_record(slashing::wire_offender(ev)),
+                self.state.evidence_applied(&slashing::wire_evidence_id(ev)),
+                self.mempool.values(),
+                ev,
+                &self.verifier,
+            )
+            .map_err(Refusal::Invalid)?;
+        }
         let mut frame = vec![net::FRAME_TX];
         frame.extend_from_slice(&key);
         self.mempool.insert(key, tx);
@@ -2205,15 +2265,15 @@ impl Engine {
         match decision {
             GossipDecision::Accept { slashing_candidate } => {
                 if let Some(ev) = slashing_candidate {
-                    // Captured, not processed. The slashing pipeline
-                    // (`SlashingState::process`, evidence transactions) is not
-                    // wired in this binary — saying so here beats a silent
-                    // drop that looks like nothing happened.
-                    eprintln!(
-                        "EQUIVOCATION captured: validator {} signed two attestations for slot {} \
-                         (slashing pipeline NOT wired — evidence is logged, not prosecuted)",
-                        ev.second.validator, ev.second.data.slot,
-                    );
+                    // Captured AND prosecuted: the pair the pool assembled
+                    // becomes a §7.3 evidence transaction and goes through
+                    // the one admission door (`on_transaction`), which
+                    // re-verifies both signatures, dedups against chain and
+                    // mempool, and — once admitted — broadcasts it so it
+                    // reaches whoever proposes next. A refusal is policy
+                    // speaking (flag day unarmed, duplicate, already
+                    // slashed) and is logged, never silent.
+                    self.report_equivocation((*ev).into());
                 }
                 self.pool
                     .insert((att.validator, att.data.signing_root()), att);
@@ -2230,6 +2290,56 @@ impl Engine {
                 eprintln!("attestation from v{} REJECTED: {reason:?}", att.validator);
                 self.net.report(origin, Verdict::Reject);
             }
+        }
+    }
+
+    /// One equivocation observation — an attestation pair from the gossip
+    /// pool or a header pair from the block watcher — becomes a submitted
+    /// §7.3 evidence transaction.
+    ///
+    /// This is the whistleblower path that was missing: the slashing
+    /// pipeline paid `1/WHISTLEBLOWER_QUOTIENT` of the penalty to the
+    /// proposer that includes evidence, but a validator that merely
+    /// *observed* an equivocation had no way to get the evidence into a
+    /// block unless it happened to be proposing. Now any node that holds two
+    /// conflicting signed messages constructs the evidence, admits it to its
+    /// own mempool and broadcasts it — so it reaches whoever proposes next.
+    ///
+    /// Submission goes through [`Engine::on_transaction`], the same door
+    /// gossip and RPC use, so everything admission promises — structure,
+    /// chain/mempool dedup, both signatures verified — holds for
+    /// self-constructed evidence too. A refusal is policy speaking (the flag
+    /// day unarmed, a duplicate, an already-slashed offender), not an error,
+    /// and is logged rather than silently dropped: the pre-wiring binary's
+    /// silent "captured, not processed" is exactly what this replaces.
+    ///
+    /// Complementary, not overlapping: the node-local slashing-protection
+    /// store (`signing_history`, the anti-double-sign watermark consulted
+    /// before this node signs anything) shares the shape of the check but
+    /// guards THIS node's key from producing such a pair; this path watches
+    /// everyone else's signatures and prosecutes the pairs it sees.
+    fn report_equivocation(&mut self, ev: SlashingEvidence) {
+        let offender = slashing::wire_offender(&ev);
+        let what = match &ev {
+            SlashingEvidence::ProposerEquivocation { first, .. } => {
+                format!("signed two conflicting headers for slot {}", first.header.slot)
+            }
+            SlashingEvidence::AttestationOffence { second, .. } => {
+                format!("signed two conflicting attestations (slot {})", second.data.slot)
+            }
+        };
+        eprintln!(
+            "EQUIVOCATION observed: validator {offender} {what}; submitting slashing evidence"
+        );
+        match self.on_transaction(PosTransaction::SlashingEvidence(ev)) {
+            Ok(Admitted::New) => eprintln!(
+                "slashing evidence against v{offender} admitted to the mempool and broadcast"
+            ),
+            Ok(Admitted::Duplicate) => {} // already held, already relayed
+            Err(refusal) => eprintln!(
+                "slashing evidence against v{offender} not submitted: {}",
+                refusal.reason()
+            ),
         }
     }
 
@@ -2747,6 +2857,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         recent_states: VecDeque::new(),
         pool: BTreeMap::new(),
         att_pool: AttestationPool::new(),
+        proposals_seen: BTreeMap::new(),
         wall_slot: 0,
         mempool: BTreeMap::new(),
         rejected: BTreeMap::new(),
@@ -3355,7 +3466,197 @@ pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'s
             "exits are not accepted: the Exit message is not authenticated, \
              so anyone could retire any validator irreversibly",
         ),
-        _ => Ok(()),
+        // Slashing evidence (tag 0x05): gated on its flag day exactly like
+        // TransferV2 above — pre-activation no block may carry it, so
+        // holding or relaying it would only stuff mempools — then judged on
+        // structure through the ONE definition consensus uses. This arm used
+        // to be `_ => Ok(())`, which would have admitted evidence with zero
+        // checks; the match is exhaustive now so a new variant must decide
+        // its admission policy explicitly.
+        PosTransaction::SlashingEvidence(ev) => {
+            if wall_epoch < bloch_pos_committee::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH {
+                return Err(
+                    "slashing evidence is not active: the format ships behind a flag day \
+                     (SLASHING_EVIDENCE_ACTIVATION_EPOCH) that this chain has not reached",
+                );
+            }
+            evidence_structurally_admissible(ev)
+        }
+    }
+}
+
+/// The structural half of evidence admission — pure, like [`admissible`]
+/// itself: does this payload prove an offence at all, judged by the one
+/// definition consensus runs as step 1 of its own pipeline
+/// ([`slashing::wire_offence`])? Split from the flag-day gate so the
+/// structure stays testable while the gate ships closed.
+pub(crate) fn evidence_structurally_admissible(
+    ev: &SlashingEvidence,
+) -> Result<(), &'static str> {
+    use bloch_pos_committee::slashing::EvidenceError;
+    match slashing::wire_offence(ev) {
+        Ok(_) => Ok(()),
+        Err(EvidenceError::DifferentValidators) => Err(
+            "the two messages are signed by different validators — disagreement, not equivocation",
+        ),
+        Err(EvidenceError::NotConflicting) => {
+            Err("the two messages do not conflict — there is no offence to prove")
+        }
+        // `wire_offence` only returns the two structural variants; the rest
+        // of the enum belongs to the stateful pipeline. Total anyway.
+        Err(_) => Err("evidence does not prove an offence"),
+    }
+}
+
+/// The stateful half of evidence admission, run by `on_transaction` after
+/// [`admissible`]'s structural half. Cheapest-first, signatures last — the
+/// same DoS ordering `SlashingState::process` documents, because this path
+/// is unauthenticated and a hybrid verification costs ~145 µs.
+///
+/// What each check buys, in order:
+///
+/// - **offender exists** — evidence against an index this chain never
+///   registered proves nothing about this chain (the transition would refuse
+///   the block; refusing here keeps it off the wire);
+/// - **not already slashed** — ejection is permanent, so once ANY evidence
+///   lands, an attacker holding the offender's key could otherwise mint
+///   endless fresh, correctly-signed pairs and have every node relay them.
+///   This check turns that spring dry the moment the first evidence applies;
+/// - **not already applied** — the exact pair (either order) settled on
+///   chain is a replay, refused without a signature check;
+/// - **one in-flight evidence per offender** — the whistleblower reward
+///   makes near-duplicate spam (fresh pairs, same offender) worth trying
+///   before the first evidence lands; one offence is enough to eject, so a
+///   second pending pair adds nothing and is refused. The mempool scan is
+///   bounded by `MEMPOOL_MAX` and evidence is rare;
+/// - **both signatures verify** — through the same verifier consensus will
+///   judge the block with. Forged evidence dies here, unrelayed, costing the
+///   forger nothing but this node's two verifications.
+///
+/// A free function over the resolved facts rather than a method, so every
+/// branch is testable without standing up an engine.
+fn evidence_admissible<'a>(
+    offender_record: Option<ValidatorRecord>,
+    already_applied: bool,
+    mempool: impl Iterator<Item = &'a PosTransaction>,
+    ev: &SlashingEvidence,
+    verifier: &dyn SignatureVerifier,
+) -> Result<(), &'static str> {
+    let Some(rec) = offender_record else {
+        return Err("evidence names a validator index this chain never registered");
+    };
+    if rec.slashed {
+        return Err(
+            "the named validator is already slashed and ejected — its stake was burned \
+             then, and further evidence proves nothing new",
+        );
+    }
+    if already_applied {
+        return Err("this evidence pair (in either order) was already applied on chain");
+    }
+    let offender = rec.index;
+    for held in mempool {
+        if let PosTransaction::SlashingEvidence(prior) = held {
+            if slashing::wire_offender(prior) == offender {
+                return Err(
+                    "evidence against this validator is already in the mempool — one applied \
+                     offence ejects it, and a second pending pair adds nothing",
+                );
+            }
+        }
+    }
+    // THE SIGNATURES, LAST.
+    let verified = match ev {
+        SlashingEvidence::AttestationOffence { first, second } => [first, second]
+            .into_iter()
+            .all(|a| verifier.verify(a.validator, &a.data.signing_root(), &a.signature)),
+        SlashingEvidence::ProposerEquivocation { first, second } => {
+            [first, second].into_iter().all(|e| {
+                verifier.verify(
+                    e.header.proposer_index,
+                    &e.header.proposal_signing_root(),
+                    &e.proposer_sig,
+                )
+            })
+        }
+    };
+    if !verified {
+        return Err(
+            "an evidence signature does not verify — forged or corrupted evidence \
+             must not be relayed",
+        );
+    }
+    Ok(())
+}
+
+/// How long a `(slot, proposer)` duty stays watched for a second signed
+/// header, in slots. Two epochs, matching the attestation pool's acceptance
+/// window (`gossip::ATTESTATION_WINDOW_SLOTS`): blocks older than that
+/// arrive in bulk during sync, where a "second header" is far more likely a
+/// replayed fork branch than live equivocation — and evidence for a genuine
+/// old offence can still be submitted through RPC by anyone holding both
+/// envelopes, because the transition deliberately accepts arbitrarily old
+/// evidence (§7.3: prosecutable as long as the stake is reachable).
+const PROPOSER_WATCH_SLOTS: u64 = 2 * bloch_pos_committee::params::SLOTS_PER_EPOCH;
+
+/// One watched duty: the first signed header seen, kept whole so it can
+/// become half of a [`SlashingEvidence`] the moment a conflicting one
+/// arrives. `reported` caps a duty at one evidence, mirroring the
+/// attestation pool's `MAX_EQUIVOCATIONS_PER_DUTY`: a third distinct header
+/// proves nothing new, and reporting it again would let a malicious proposer
+/// use its own equivocation as an amplification primitive.
+struct SeenProposal {
+    first: ProposalEnvelope,
+    reported: bool,
+}
+
+/// Watch one arriving block for proposer equivocation: a second, different
+/// signed header for a `(slot, proposer)` already seen becomes evidence.
+///
+/// A free function over the map so the policy is testable without a node.
+/// Deliberately runs BEFORE any signature verification — the caller's
+/// submission path re-verifies both halves before anything is admitted or
+/// relayed, so fabricated headers cost the feeder nothing but this node's
+/// two refused verifications. The map is pruned to the watch window on every
+/// call, so its size is bounded by the window's duty count however the
+/// caller drives it.
+fn detect_proposer_equivocation(
+    seen: &mut BTreeMap<(u64, u32), SeenProposal>,
+    env: &BlockEnvelope,
+    wall_slot: u64,
+) -> Option<SlashingEvidence> {
+    let floor = wall_slot.saturating_sub(PROPOSER_WATCH_SLOTS);
+    seen.retain(|(slot, _), _| *slot >= floor);
+    // Outside the window: sync backfill below, more than gossip's one-slot
+    // clock skew above.
+    if env.header.slot < floor || env.header.slot > wall_slot.saturating_add(1) {
+        return None;
+    }
+    match seen.entry((env.header.slot, env.header.proposer_index)) {
+        std::collections::btree_map::Entry::Vacant(v) => {
+            v.insert(SeenProposal {
+                first: ProposalEnvelope {
+                    header: env.header,
+                    proposer_sig: env.proposer_sig.clone(),
+                },
+                reported: false,
+            });
+            None
+        }
+        std::collections::btree_map::Entry::Occupied(mut o) => {
+            let rec = o.get_mut();
+            if rec.reported || rec.first.header.id() == env.block_id() {
+                return None;
+            }
+            rec.reported = true;
+            Some(SlashingEvidence::ProposerEquivocation {
+                first: rec.first.clone(),
+                second: ProposalEnvelope {
+                    header: env.header,
+                    proposer_sig: env.proposer_sig.clone(),
+                },
+            })
+        }
     }
 }
 
@@ -4297,6 +4598,7 @@ mod transfer_v2_end_to_end {
             recent_states: VecDeque::new(),
             pool: BTreeMap::new(),
             att_pool: AttestationPool::new(),
+            proposals_seen: BTreeMap::new(),
             wall_slot: 0,
             mempool: BTreeMap::new(),
             rejected: BTreeMap::new(),
@@ -4956,6 +5258,7 @@ mod perf_support {
             recent_states: VecDeque::new(),
             pool: BTreeMap::new(),
             att_pool: AttestationPool::new(),
+            proposals_seen: BTreeMap::new(),
             wall_slot: 0,
             mempool: BTreeMap::new(),
             rejected: BTreeMap::new(),
@@ -6245,6 +6548,7 @@ mod duty_view_anchor {
             recent_states: VecDeque::new(),
             pool: BTreeMap::new(),
             att_pool: AttestationPool::new(),
+            proposals_seen: BTreeMap::new(),
             wall_slot: 0,
             mempool: BTreeMap::new(),
             rejected: BTreeMap::new(),
@@ -6406,5 +6710,361 @@ mod duty_view_anchor {
                 "slot {slot}: attester and judge disagree on who is in the committee"
             );
         }
+    }
+}
+
+
+#[cfg(test)]
+mod evidence_tests {
+    //! Adversarial coverage of the whistleblower path: admission (both
+    //! halves), the proposer-equivocation watcher, and the flag-day gate.
+    //! Everything here drives the free functions directly — the same code
+    //! `on_transaction` and `ingest` run — so no engine (and no real hybrid
+    //! keypair) has to be stood up to reach every refusal branch.
+
+    use super::*;
+
+    /// A signature is "valid" iff it equals the signing root — forgery (any
+    /// other bytes) is detectable per-message, mirroring the committee
+    /// crate's own `RootEchoVerifier` test double.
+    struct RootEchoVerifier;
+    impl SignatureVerifier for RootEchoVerifier {
+        fn verify(&self, _v: u32, root: &[u8; 32], sig: &[u8]) -> bool {
+            sig == root
+        }
+        fn verify_with_key(&self, _pk: &[u8], root: &[u8; 32], sig: &[u8]) -> bool {
+            sig == root
+        }
+    }
+
+    fn record(index: u32, slashed: bool) -> ValidatorRecord {
+        ValidatorRecord {
+            index,
+            pubkey: vec![index as u8; 8],
+            staked_sat: 1_000_000,
+            randao_commitment: [0; 32],
+            withdrawal_credentials: vec![0; 4],
+            activation_epoch: 0,
+            exit_epoch: u64::MAX,
+            withdrawable_epoch: u64::MAX,
+            slashed,
+            commission_bps: 0,
+        }
+    }
+
+    fn att(v: u32, target_epoch: u64, head: u8, signed: bool) -> Attestation {
+        let data = AttestationData {
+            slot: target_epoch * 32,
+            head: [head; 32],
+            source_epoch: 0,
+            source_root: [1; 32],
+            target_epoch,
+            target_root: [head; 32],
+        };
+        let signature = if signed { data.signing_root().to_vec() } else { vec![0u8; 8] };
+        Attestation { data, validator: v, signature }
+    }
+
+    fn double_vote(v: u32) -> SlashingEvidence {
+        SlashingEvidence::AttestationOffence {
+            first: att(v, 1, 0xAA, true),
+            second: att(v, 1, 0xBB, true),
+        }
+    }
+
+    fn header_env(slot: u64, proposer: u32, mark: u8, signed: bool) -> ProposalEnvelope {
+        let header = BlockHeaderV4 {
+            version: VERSION_G4,
+            parent: [mark; 32],
+            state_root: [0; 32],
+            body_root: [0; 32],
+            slot,
+            proposer_index: proposer,
+            randao_reveal: [1; 32],
+            randao_mix: [2; 32],
+            justified_root: [3; 32],
+            finalized_root: [4; 32],
+            attestation_root: [5; 32],
+            coherence_root: [6; 32],
+        };
+        let proposer_sig =
+            if signed { header.proposal_signing_root().to_vec() } else { vec![0u8; 9] };
+        ProposalEnvelope { header, proposer_sig }
+    }
+
+    fn block(slot: u64, proposer: u32, mark: u8) -> BlockEnvelope {
+        let env = header_env(slot, proposer, mark, true);
+        BlockEnvelope {
+            header: env.header,
+            proposer_sig: env.proposer_sig,
+            body: Body { transactions: Vec::new(), attestations: Vec::new() },
+        }
+    }
+
+    // ── the flag-day gate ───────────────────────────────────────────────────
+
+    /// The shipped configuration: `SLASHING_EVIDENCE_ACTIVATION_EPOCH` is
+    /// `u64::MAX`, so no wall epoch admits evidence and none of it can reach
+    /// the wire — which is what keeps a mixed fleet's gossip clean until the
+    /// coordinated rollout (see the constant's doc in params.rs).
+    #[test]
+    fn evidence_is_refused_at_the_door_before_its_flag_day() {
+        assert_eq!(
+            bloch_pos_committee::params::SLASHING_EVIDENCE_ACTIVATION_EPOCH,
+            u64::MAX,
+            "the evidence gate has been armed — update this test only as \
+             part of the coordinated flag-day rollout"
+        );
+        let tx = PosTransaction::SlashingEvidence(double_vote(3));
+        let err = admissible(&tx, 0).unwrap_err();
+        assert!(err.contains("SLASHING_EVIDENCE_ACTIVATION_EPOCH"), "{err}");
+        // A large (but reachable) wall epoch changes nothing while inert.
+        assert!(admissible(&tx, 10_000_000).is_err());
+    }
+
+    // ── structural admission ────────────────────────────────────────────────
+
+    #[test]
+    fn structural_admission_matches_the_consensus_predicates() {
+        // A real conflict passes.
+        assert!(evidence_structurally_admissible(&double_vote(3)).is_ok());
+        let headers = SlashingEvidence::ProposerEquivocation {
+            first: header_env(5, 7, 0xAA, true),
+            second: header_env(5, 7, 0xBB, true),
+        };
+        assert!(evidence_structurally_admissible(&headers).is_ok());
+
+        // Honest cross-epoch voting is not an offence.
+        let innocent = SlashingEvidence::AttestationOffence {
+            first: att(3, 1, 0xAA, true),
+            second: att(3, 2, 0xBB, true),
+        };
+        assert!(evidence_structurally_admissible(&innocent)
+            .unwrap_err()
+            .contains("do not conflict"));
+
+        // Two validators disagreeing is consensus working.
+        let two_signers = SlashingEvidence::AttestationOffence {
+            first: att(3, 1, 0xAA, true),
+            second: att(4, 1, 0xBB, true),
+        };
+        assert!(evidence_structurally_admissible(&two_signers)
+            .unwrap_err()
+            .contains("different validators"));
+
+        // Re-gossiping one block twice is not proposer equivocation.
+        let same_block = SlashingEvidence::ProposerEquivocation {
+            first: header_env(5, 7, 0xAA, true),
+            second: header_env(5, 7, 0xAA, true),
+        };
+        assert!(evidence_structurally_admissible(&same_block).is_err());
+    }
+
+    // ── stateful admission ──────────────────────────────────────────────────
+
+    #[test]
+    fn stateful_admission_walks_its_checks_cheapest_first() {
+        let ev = double_vote(3);
+        let empty: Vec<PosTransaction> = Vec::new();
+
+        // Unknown offender.
+        let err = evidence_admissible(None, false, empty.iter(), &ev, &RootEchoVerifier)
+            .unwrap_err();
+        assert!(err.contains("never registered"), "{err}");
+
+        // Already slashed: the endless-fresh-pairs spam spring runs dry.
+        let err = evidence_admissible(
+            Some(record(3, true)),
+            false,
+            empty.iter(),
+            &ev,
+            &RootEchoVerifier,
+        )
+        .unwrap_err();
+        assert!(err.contains("already slashed"), "{err}");
+
+        // Exact pair already settled on chain.
+        let err = evidence_admissible(
+            Some(record(3, false)),
+            true,
+            empty.iter(),
+            &ev,
+            &RootEchoVerifier,
+        )
+        .unwrap_err();
+        assert!(err.contains("already applied"), "{err}");
+
+        // One in-flight evidence per offender: a FRESH pair (different data,
+        // so a different evidence id) against the same offender is refused
+        // while one is pending — the near-duplicate bound the whistleblower
+        // reward makes necessary.
+        let pending = vec![PosTransaction::SlashingEvidence(SlashingEvidence::AttestationOffence {
+            first: att(3, 2, 0xCC, true),
+            second: att(3, 2, 0xDD, true),
+        })];
+        let err = evidence_admissible(
+            Some(record(3, false)),
+            false,
+            pending.iter(),
+            &ev,
+            &RootEchoVerifier,
+        )
+        .unwrap_err();
+        assert!(err.contains("already in the mempool"), "{err}");
+
+        // Pending evidence against a DIFFERENT offender does not block it.
+        let other = vec![PosTransaction::SlashingEvidence(double_vote(9))];
+        assert!(evidence_admissible(
+            Some(record(3, false)),
+            false,
+            other.iter(),
+            &ev,
+            &RootEchoVerifier,
+        )
+        .is_ok());
+
+        // And the clean case is admitted.
+        assert!(evidence_admissible(
+            Some(record(3, false)),
+            false,
+            empty.iter(),
+            &ev,
+            &RootEchoVerifier,
+        )
+        .is_ok());
+    }
+
+    /// Forged evidence — either half, either form — is refused at the
+    /// signature step and therefore never relayed: rejection costs the
+    /// submitter nothing (no bar is minted here) and costs this node exactly
+    /// the verifications it chose to spend.
+    #[test]
+    fn forged_evidence_is_refused_and_never_relayable() {
+        let empty: Vec<PosTransaction> = Vec::new();
+
+        let forged_att = SlashingEvidence::AttestationOffence {
+            first: att(3, 1, 0xAA, true),
+            second: att(3, 1, 0xBB, false), // garbage signature
+        };
+        let err = evidence_admissible(
+            Some(record(3, false)),
+            false,
+            empty.iter(),
+            &forged_att,
+            &RootEchoVerifier,
+        )
+        .unwrap_err();
+        assert!(err.contains("does not verify"), "{err}");
+
+        let forged_header = SlashingEvidence::ProposerEquivocation {
+            first: header_env(5, 7, 0xAA, false), // garbage signature
+            second: header_env(5, 7, 0xBB, true),
+        };
+        let err = evidence_admissible(
+            Some(record(7, false)),
+            false,
+            empty.iter(),
+            &forged_header,
+            &RootEchoVerifier,
+        )
+        .unwrap_err();
+        assert!(err.contains("does not verify"), "{err}");
+
+        // Both halves honestly signed: the header form is admitted.
+        let honest = SlashingEvidence::ProposerEquivocation {
+            first: header_env(5, 7, 0xAA, true),
+            second: header_env(5, 7, 0xBB, true),
+        };
+        assert!(evidence_admissible(
+            Some(record(7, false)),
+            false,
+            empty.iter(),
+            &honest,
+            &RootEchoVerifier,
+        )
+        .is_ok());
+    }
+
+    // ── the proposer watcher ────────────────────────────────────────────────
+
+    #[test]
+    fn a_second_header_for_a_watched_duty_becomes_evidence_once() {
+        let mut seen = BTreeMap::new();
+        let wall = 100;
+
+        // First header: watched, no evidence.
+        assert!(detect_proposer_equivocation(&mut seen, &block(100, 7, 0xAA), wall).is_none());
+        // The same block again (same id): still nothing — re-gossip is not
+        // equivocation, the same property the consensus predicates carry.
+        assert!(detect_proposer_equivocation(&mut seen, &block(100, 7, 0xAA), wall).is_none());
+
+        // A DIFFERENT header for the same (slot, proposer): evidence, with
+        // the stored first half and the arriving second half.
+        let second = block(100, 7, 0xBB);
+        let ev = detect_proposer_equivocation(&mut seen, &second, wall)
+            .expect("a conflicting pair must be captured");
+        match &ev {
+            SlashingEvidence::ProposerEquivocation { first, second: s } => {
+                assert_eq!(first.header.parent, [0xAA; 32]);
+                assert_eq!(s.header.parent, [0xBB; 32]);
+                assert_eq!(slashing::wire_offender(&ev), 7);
+                assert!(slashing::wire_offence(&ev).is_ok(), "must satisfy consensus structure");
+            }
+            _ => unreachable!(),
+        }
+
+        // A THIRD distinct header: capped, like MAX_EQUIVOCATIONS_PER_DUTY —
+        // an equivocator must not amplify through its own reporter.
+        assert!(detect_proposer_equivocation(&mut seen, &block(100, 7, 0xCC), wall).is_none());
+
+        // A different proposer at the same slot is its own duty.
+        assert!(detect_proposer_equivocation(&mut seen, &block(100, 8, 0xDD), wall).is_none());
+    }
+
+    #[test]
+    fn the_watcher_ignores_backfill_and_stays_bounded() {
+        let mut seen = BTreeMap::new();
+        let wall = 10 * PROPOSER_WATCH_SLOTS;
+
+        // Sync backfill (below the window): not watched at all.
+        assert!(detect_proposer_equivocation(&mut seen, &block(1, 7, 0xAA), wall).is_none());
+        assert!(detect_proposer_equivocation(&mut seen, &block(1, 7, 0xBB), wall).is_none());
+        assert!(seen.is_empty(), "backfill must not occupy the watch");
+
+        // Far-future headers (beyond one slot of clock skew): ignored too.
+        assert!(detect_proposer_equivocation(&mut seen, &block(wall + 2, 7, 0xAA), wall).is_none());
+        assert!(seen.is_empty());
+
+        // In-window entries are pruned once the wall moves past the window.
+        assert!(detect_proposer_equivocation(&mut seen, &block(wall, 7, 0xAA), wall).is_none());
+        assert_eq!(seen.len(), 1);
+        let later = wall + PROPOSER_WATCH_SLOTS + 1;
+        assert!(detect_proposer_equivocation(&mut seen, &block(later, 9, 0xEE), later).is_none());
+        assert_eq!(seen.len(), 1, "the old duty must have been pruned");
+        assert!(seen.contains_key(&(later, 9)));
+    }
+
+    /// The two detection channels meet the same admission door: an
+    /// attestation pair captured by the gossip pool converts (`From`) into
+    /// the wire shape whose structure and offender the consensus helpers
+    /// agree on — the glue `report_equivocation` relies on.
+    #[test]
+    fn the_gossip_pools_captured_pair_converts_into_admissible_evidence() {
+        let pair = bloch_pos_committee::slashing::SlashingEvidence {
+            first: att(3, 1, 0xAA, true),
+            second: att(3, 1, 0xBB, true),
+        };
+        let wire: SlashingEvidence = pair.into();
+        assert!(evidence_structurally_admissible(&wire).is_ok());
+        assert_eq!(slashing::wire_offender(&wire), 3);
+        let empty: Vec<PosTransaction> = Vec::new();
+        assert!(evidence_admissible(
+            Some(record(3, false)),
+            false,
+            empty.iter(),
+            &wire,
+            &RootEchoVerifier,
+        )
+        .is_ok());
     }
 }
