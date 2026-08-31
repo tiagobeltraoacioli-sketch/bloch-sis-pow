@@ -169,6 +169,14 @@ fn print_help() {
                graylists a whole mesh that shares one proxy address.\n\
          \n\
                          [--stop-at-slot <n>]\n\
+                         [--max-propose-lag <slots>|off]\n\
+               --max-propose-lag arms the proposal-lag gate: the node\n\
+               declines its own proposal duty when its head is more than\n\
+               that many slots behind the wall clock, instead of extending\n\
+               a stale head onto a minority branch. OFF by default. Arming\n\
+               it is a fleet-wide decision: if the whole network halts for\n\
+               longer than the margin, armed nodes cannot restart it.\n\
+         \n\
                          [--ws-checkpoint <file>] [--ws-signer-set <file>]\n\
                          [--carryover <snapshot.tsv>]\n\
                Run a validator node. <dir> must hold validator.key; chain\n\
@@ -815,6 +823,32 @@ fn run_cmd(args: &[String]) {
         },
     };
 
+    // The proposal-lag gate. OFF unless asked for, because armed it is a
+    // liveness-policy change the whole fleet must make together — see the
+    // gate in `engine::Engine::propose` for the full argument, including why
+    // a fleet armed through a total outage cannot restart itself. A zero
+    // margin is refused rather than clamped: the head is always at least one
+    // slot behind the slot being proposed for, so zero means "never propose",
+    // which nobody armed a proposer to do.
+    let max_propose_lag_slots = match arg_value(args, "--max-propose-lag").as_deref() {
+        None | Some("off") => None,
+        Some(s) => match s.parse::<u64>() {
+            Ok(0) => {
+                eprintln!(
+                    "run: --max-propose-lag 0 would decline every proposal (the head is \
+                     always at least one slot behind the slot being proposed); use a margin \
+                     well above the chain's normal empty stretches, e.g. 240"
+                );
+                exit(2);
+            }
+            Ok(n) => Some(n),
+            Err(_) => {
+                eprintln!("run: --max-propose-lag must be a slot count or `off` (got `{s}`)");
+                exit(2);
+            }
+        },
+    };
+
     let cfg = engine::Config {
         data_dir: PathBuf::from(data_dir),
         genesis_path: PathBuf::from(genesis_path),
@@ -840,6 +874,7 @@ fn run_cmd(args: &[String]) {
         // exposed port is a write surface, not only a read one.
         rpc_bind: arg_value(args, "--rpc-bind").unwrap_or_else(|| "127.0.0.1".to_string()),
         rpc_port,
+        max_propose_lag_slots,
     };
     if let Err(e) = engine::run(cfg) {
         eprintln!("bloch-pos: {e}");

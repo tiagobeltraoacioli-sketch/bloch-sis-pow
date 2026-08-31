@@ -313,6 +313,16 @@ impl Json {
         }
     }
 
+    /// Test-only for now: the health assertions read it. Gated so the
+    /// non-test build stays warning-clean rather than carrying dead code.
+    #[cfg(test)]
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Json::Bool(b) => Some(*b),
+            _ => None,
+        }
+    }
+
     pub fn get(&self, key: &str) -> Option<&Json> {
         match self {
             Json::Obj(fields) => fields.iter().find(|(k, _)| k == key).map(|(_, v)| v),
@@ -1166,6 +1176,117 @@ fn respond(sock: &mut TcpStream, status: u16, body: &str) -> io::Result<()> {
 // must be derivable from its inputs so it can be tested without standing up a
 // node. Every one of them is exercised below against a real `CommittedState`.
 
+/// Slots behind the wall clock beyond which a node counts as *behind* rather
+/// than merely between blocks.
+///
+/// The number is chosen against this chain's measured cadence, not against an
+/// ideal one. Genesis-4 fills roughly 13% of its slots (post-migration
+/// measurement), so a healthy, fully-synced node routinely sits many slots
+/// behind the wall clock simply because the slots in between are empty. At
+/// 13% cadence an empty stretch of 64 slots (two epochs, 32 minutes) occurs
+/// about once every three weeks; every shorter threshold fires weekly or
+/// daily. And when the *chain itself* goes quiet for two epochs, "this node
+/// is not making progress" is a true statement an operator wants to see —
+/// the false-positive case is itself alert-worthy.
+///
+/// Against the incident this exists for: the stalled nodes were ~480 slots
+/// behind (4 hours), and even the ones that recovered were 90–130 behind.
+/// Both are far past this line.
+pub const HEALTH_BEHIND_SLOTS: u64 = 64;
+
+/// Apply-silence, in slots' worth of wall time, beyond which *behind*
+/// hardens into *stalled*.
+///
+/// A node 480 slots behind that is actually syncing applies blocks
+/// continuously — its silence is measured in milliseconds. One that has
+/// applied nothing for eight slots (four minutes at the 30s cadence) while
+/// two epochs behind is not slow, it is stuck: that is exactly the shape of
+/// the post-replay stall this field exists to expose, which was previously
+/// diagnosable only by shelling in and watching a log not grow.
+pub const HEALTH_SILENCE_SLOTS: u64 = 8;
+
+/// The node's own liveness verdict: is it keeping up with the wall clock,
+/// and if not, is it at least making progress toward it?
+///
+/// # Why this exists
+///
+/// The post-replay sync stall (2026-08, production): a node finishes replay
+/// far behind the live head and then stops — peers connected, RPC answering,
+/// zero blocks applied, zero log lines. To a monitor reading `height` it
+/// looks like an ordinary laggard; to `behind_by_slots` alone it looks like
+/// a syncing node. The distinction that matters — *behind and advancing*
+/// versus *behind and dead* — needs both the lag and the time since the last
+/// applied block, judged together. This type is that judgement, made once,
+/// as a pure function, so the RPC field, the periodic log line and the tests
+/// all report the same verdict.
+///
+/// # What the verdict means
+///
+/// - `syncing`: behind the wall clock by at least [`HEALTH_BEHIND_SLOTS`]
+///   but a block was applied within the last [`HEALTH_SILENCE_SLOTS`] slots'
+///   worth of time — catching up, leave it alone.
+/// - `stalled`: behind by at least [`HEALTH_BEHIND_SLOTS`] AND no block
+///   applied for [`HEALTH_SILENCE_SLOTS`] slots' worth of time — **not
+///   making progress**. This is the boolean an integrator should alert on,
+///   and the one an exchange observer node should stop crediting deposits
+///   on. It self-clears the moment a block is applied or the lag closes.
+///
+/// The two raw inputs are carried alongside the verdict so a consumer with a
+/// different risk posture can apply its own thresholds.
+///
+/// # One honest limitation
+///
+/// A node cannot locally distinguish "I am deaf" from "the whole chain went
+/// quiet": if no canonical block exists for two epochs anywhere, every
+/// healthy node reports `stalled` too. That is accepted — a chain-wide
+/// two-epoch outage deserves the same alert — and it is why this verdict
+/// must never gate consensus behaviour by itself (see the proposal-lag gate
+/// in `engine.rs`, which is separate, opt-in, and flag-day material).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Health {
+    /// Wall-clock slot minus the head's slot.
+    pub behind_by_slots: u64,
+    /// Wall time since this node last applied a canonical block (or since
+    /// boot, if it has applied none).
+    pub ms_since_last_applied: u64,
+    /// Behind, and recently applied a block: catching up.
+    pub syncing: bool,
+    /// Behind, and NOT applying blocks: not making progress. Alert on this.
+    pub stalled: bool,
+}
+
+impl Health {
+    /// The verdict, as a pure function of its inputs — no clock, no node —
+    /// so `engine.rs` and the tests judge with the same code.
+    ///
+    /// `slot_ms` converts the silence threshold from slots to wall time;
+    /// `.max(1)` for the same reason `Engine::wall_slot` guards its divisor —
+    /// a hand-edited manifest must not turn a health check into an overflow.
+    pub fn assess(wall_slot: u64, head_slot: u64, ms_since_last_applied: u64, slot_ms: u64) -> Health {
+        let behind_by_slots = wall_slot.saturating_sub(head_slot);
+        let behind = behind_by_slots >= HEALTH_BEHIND_SLOTS;
+        let silent = ms_since_last_applied >= HEALTH_SILENCE_SLOTS.saturating_mul(slot_ms.max(1));
+        Health {
+            behind_by_slots,
+            ms_since_last_applied,
+            syncing: behind && !silent,
+            stalled: behind && silent,
+        }
+    }
+
+    /// The `getchaininfo` sub-object. `secs`, not `ms`, on the wire: the
+    /// consumers poll at seconds granularity and every other duration on
+    /// this surface is seconds.
+    pub fn json(&self) -> Json {
+        Json::obj(vec![
+            ("behind_by_slots", Json::u(self.behind_by_slots)),
+            ("secs_since_last_block", Json::u(self.ms_since_last_applied / 1000)),
+            ("syncing", Json::Bool(self.syncing)),
+            ("stalled", Json::Bool(self.stalled)),
+        ])
+    }
+}
+
 /// `getchaininfo` — the method the finality-aware consumers read (V4 §2).
 #[allow(clippy::too_many_arguments)]
 pub fn chain_info_json(
@@ -1183,6 +1304,12 @@ pub fn chain_info_json(
     height: u64,
     finalized_height: Option<u64>,
     wall_slot: u64,
+    // The node's own liveness verdict, judged by [`Health::assess`] from the
+    // same wall clock as `wall_slot`. Handed in rather than derived here
+    // because the silence measurement (`last_applied_ms`) lives on the
+    // engine, and this function's rule is to stay a pure projection of its
+    // arguments.
+    health: &Health,
     validators_total: usize,
     mempool: usize,
     blocks_known: usize,
@@ -1239,6 +1366,13 @@ pub fn chain_info_json(
         // (R1), so the node states it.
         ("wall_slot", Json::u(wall_slot)),
         ("behind_by_slots", Json::u(wall_slot.saturating_sub(slot))),
+        // The liveness verdict — see [`Health`]. `behind_by_slots` above
+        // says how far; `health.stalled` says whether the node is actually
+        // moving toward closing the gap, which is the difference between a
+        // node that is syncing and one that has silently stopped. The
+        // post-replay stall (2026-08) looked identical to a laggard on every
+        // field above this line; this object is what tells them apart.
+        ("health", health.json()),
     ])
 }
 

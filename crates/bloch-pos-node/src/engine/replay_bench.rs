@@ -663,6 +663,7 @@ fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
         ws_anchor_hard: false,
         ws_conflict_reported: false,
         fc_covered_removals: 0,
+        max_propose_lag_slots: None,
         manifest,
     }
 }

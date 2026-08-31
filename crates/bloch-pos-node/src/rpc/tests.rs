@@ -210,7 +210,10 @@ fn getchaininfo_reports_slot_epoch_head_root_and_both_checkpoints() {
     // against `st.state_root()`, so this test still fails if the field ever
     // stops being the committed root of the state the rest of the object
     // describes.
-    let v = chain_info_json(&st, &head, st.state_root(), 0, Some(0), 12, 2, 3, 0);
+    // A wall slot of 12 with the head at slot 0: behind by 12, which is
+    // inside the normal cadence gap — the health verdict must say so.
+    let health = Health::assess(12, 0, 3_000, 30_000);
+    let v = chain_info_json(&st, &head, st.state_root(), 0, Some(0), 12, &health, 2, 3, 0);
 
     assert_eq!(v.get("slot").unwrap().as_u64(), Some(0));
     assert_eq!(v.get("epoch").unwrap().as_u64(), Some(0));
@@ -234,6 +237,82 @@ fn getchaininfo_reports_slot_epoch_head_root_and_both_checkpoints() {
     assert_eq!(v.get("wall_slot").unwrap().as_u64(), Some(12));
     assert_eq!(v.get("behind_by_slots").unwrap().as_u64(), Some(12));
     assert_eq!(v.get("mempool").unwrap().as_u64(), Some(3));
+
+    // The health object rides along, field for field, and this near-head
+    // node reads as neither syncing nor stalled.
+    let h = v.get("health").unwrap();
+    assert_eq!(h.get("behind_by_slots").unwrap().as_u64(), Some(12));
+    assert_eq!(h.get("secs_since_last_block").unwrap().as_u64(), Some(3));
+    assert_eq!(h.get("syncing").unwrap().as_bool(), Some(false));
+    assert_eq!(h.get("stalled").unwrap().as_bool(), Some(false));
+}
+
+// ─── The liveness verdict ───────────────────────────────────────────────────
+//
+// `Health::assess` is the one place the "am I making progress" judgement is
+// made — `getchaininfo` and the slot loop's periodic line both read it — so
+// these cases ARE the defended behaviour of the post-replay stall's safety
+// net. Slot cadence in all of them is the production 30s.
+
+const SLOT_MS: u64 = 30_000;
+
+/// The measured incident, as a test: ~480 slots behind, nothing applied for
+/// minutes, RPC answering. The verdict must be STALLED — this is the node
+/// that used to look like an ordinary laggard.
+#[test]
+fn far_behind_and_silent_is_stalled() {
+    let h = Health::assess(50_010, 49_530, 5 * 60 * 1_000, SLOT_MS);
+    assert_eq!(h.behind_by_slots, 480);
+    assert!(h.stalled, "480 behind with five minutes of apply-silence is a stall");
+    assert!(!h.syncing, "stalled and syncing are mutually exclusive verdicts");
+}
+
+/// The same lag while blocks are being applied is a node CATCHING UP — the
+/// recovery path the 90–130-slot laggards took — and must not alarm.
+#[test]
+fn far_behind_but_applying_is_syncing_not_stalled() {
+    let h = Health::assess(50_010, 49_530, 2_000, SLOT_MS);
+    assert!(h.syncing);
+    assert!(!h.stalled, "a node applying blocks two seconds ago is progressing");
+}
+
+/// A healthy node between blocks on a sparse chain: a dozen empty slots and
+/// six minutes since the last block are ORDINARY on a 13%-cadence chain, and
+/// must raise nothing — silence alone is not a stall.
+#[test]
+fn ordinary_cadence_gaps_are_healthy() {
+    let h = Health::assess(1_012, 1_000, 6 * 60 * 1_000, SLOT_MS);
+    assert!(!h.syncing);
+    assert!(!h.stalled, "behind by less than HEALTH_BEHIND_SLOTS is never a stall");
+}
+
+/// The thresholds are the contract integrators alert on; pin the boundary on
+/// both sides so a casual retune shows up as a failing test.
+#[test]
+fn the_stall_boundary_sits_exactly_at_the_documented_thresholds() {
+    let silence = HEALTH_SILENCE_SLOTS * SLOT_MS;
+    // One slot / one millisecond inside the line: not stalled.
+    assert!(!Health::assess(HEALTH_BEHIND_SLOTS - 1 + 100, 100, silence, SLOT_MS).stalled);
+    assert!(!Health::assess(HEALTH_BEHIND_SLOTS + 100, 100, silence - 1, SLOT_MS).stalled);
+    // At the line on both axes: stalled.
+    assert!(Health::assess(HEALTH_BEHIND_SLOTS + 100, 100, silence, SLOT_MS).stalled);
+}
+
+/// A wall clock behind the head (clock skew, or a freshly proposed block in
+/// the current slot) must saturate to zero, never wrap.
+#[test]
+fn a_head_ahead_of_the_wall_clock_is_zero_behind() {
+    let h = Health::assess(99, 100, 0, SLOT_MS);
+    assert_eq!(h.behind_by_slots, 0);
+    assert!(!h.syncing && !h.stalled);
+}
+
+/// A zero `slot_ms` from a hand-edited manifest must not panic the health
+/// check (the same guard `Engine::wall_slot` carries for its division).
+#[test]
+fn a_zero_slot_ms_manifest_does_not_panic_the_verdict() {
+    let h = Health::assess(1_000, 0, 1_000, 0);
+    assert!(h.stalled || h.syncing); // behind either way; no panic is the point
 }
 
 #[test]
