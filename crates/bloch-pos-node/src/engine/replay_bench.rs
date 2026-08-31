@@ -631,7 +631,16 @@ fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
     // Loopback, ephemeral port, no peers. Nothing in this file dials, listens
     // for, or sends anything to any network.
     let net = net::Net::Devnet(
-        net::start("127.0.0.1", 0, Vec::new(), tx, dir.to_path_buf(), head_slot.clone(), inflight)
+        net::start(
+            "127.0.0.1",
+            0,
+            Vec::new(),
+            tx,
+            dir.to_path_buf(),
+            head_slot.clone(),
+            inflight,
+            Arc::new(crate::time_check::PeerClock::new()),
+        )
             .expect("loopback devnet transport"),
     );
     Engine {
