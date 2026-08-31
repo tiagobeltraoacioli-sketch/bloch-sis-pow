@@ -70,6 +70,44 @@ pub const HYBRID_PK_BYTES: usize = MLDSA65_PK_BYTES + FALCON1024_PK_BYTES;
 /// a fixed split point allows exactly one.
 pub const MLDSA65_SIG_BYTES: usize = 3309;
 
+/// The 4-byte crypto-agility envelope every hybrid public key travels in:
+/// `0xB1 0x0C ‖ suite_id (u16 LE)` followed by the raw key body. **Mirrored
+/// from `bloch-crypto`** (`crypto::SUITE_MAGIC` / `SUITE_HEADER_LEN`, the
+/// origin of the framing) the same way [`SAT_PER_BLOCH`] mirrors
+/// `tokenomics_v4`: this crate never links the PQ stack, but the framed bytes
+/// are consensus — they are what the registry commits, what `script_hash`
+/// hashes, and what the injected verifier receives — so the split points must
+/// be constants of this module, not implicit knowledge of the node.
+/// `bloch-pos-node` pins the mirror against the real stack by test
+/// (`keys::tests::suite_frame_constants_mirror_bloch_crypto`).
+pub const SUITE_FRAME_MAGIC: [u8; 2] = [0xB1, 0x0C];
+/// Magic (2) + suite id (2).
+pub const SUITE_FRAME_HEADER_LEN: usize = 4;
+/// A framed hybrid public key: header ‖ ML-DSA-65 pk ‖ Falcon-1024 pk.
+pub const FRAMED_HYBRID_PK_BYTES: usize = SUITE_FRAME_HEADER_LEN + HYBRID_PK_BYTES;
+
+/// Parse a suite-framed hybrid public key into `(suite, raw hybrid key)`.
+///
+/// `None` on any malformation — wrong length, wrong magic — and the caller
+/// must treat `None` as invalid, never panic (consensus rule). The length is
+/// checked EXACTLY: a frame with trailing bytes is not "a key plus garbage",
+/// it is two encodings of one key, which is the injectivity failure every
+/// codec in this crate refuses. The suite id is returned even when it is not
+/// [`SUITE_MLDSA65_FALCON1024`], so the caller can report `WrongSuite` as the
+/// distinct fact it is rather than folding it into "malformed".
+pub fn parse_framed_pubkey(bytes: &[u8]) -> Option<(u16, &[u8; HYBRID_PK_BYTES])> {
+    if bytes.len() != FRAMED_HYBRID_PK_BYTES {
+        return None;
+    }
+    if bytes[..2] != SUITE_FRAME_MAGIC {
+        return None;
+    }
+    let suite = u16::from_le_bytes([bytes[2], bytes[3]]);
+    let body: &[u8; HYBRID_PK_BYTES] =
+        bytes[SUITE_FRAME_HEADER_LEN..].try_into().expect("length checked above");
+    Some((suite, body))
+}
+
 // ---------------------------------------------------------------------------
 // Lifecycle constants (§5.1). All epochs; one epoch = 32 slots ≈ 16 min.
 // ---------------------------------------------------------------------------
@@ -288,6 +326,26 @@ pub fn validate_deposit(
     max_stake_sat: u128,
     verifier: &dyn HybridKeyVerifier,
 ) -> Result<(), DepositReject> {
+    validate_deposit_fields(tx, inputs, max_stake_sat)?;
+    if !verify_hybrid(&tx.validator_pubkey, &tx.signing_root(), &tx.proof_of_possession, verifier)
+    {
+        return Err(DepositReject::BadProofOfPossession);
+    }
+    Ok(())
+}
+
+/// The cheap half of [`validate_deposit`]: every §7.1/§4.1 rule EXCEPT the
+/// proof of possession. Split out — not duplicated — so the funded-deposit
+/// arm of the transition (`PosTransaction::DepositV2`), whose PoP runs
+/// through the transition's own injected verifier, still takes the field
+/// rules from this one derivation. `validate_deposit` is exactly this
+/// followed by the PoP; the check order (cheapest-first, PoP last) is
+/// unchanged by the split.
+pub fn validate_deposit_fields(
+    tx: &DepositTx,
+    inputs: &[DepositInput],
+    max_stake_sat: u128,
+) -> Result<(), DepositReject> {
     if tx.suite != SUITE_MLDSA65_FALCON1024 {
         return Err(DepositReject::WrongSuite);
     }
@@ -305,10 +363,6 @@ pub fn validate_deposit(
     }
     if tx.amount_sat > max_stake_sat {
         return Err(DepositReject::AboveMaximum);
-    }
-    if !verify_hybrid(&tx.validator_pubkey, &tx.signing_root(), &tx.proof_of_possession, verifier)
-    {
-        return Err(DepositReject::BadProofOfPossession);
     }
     Ok(())
 }

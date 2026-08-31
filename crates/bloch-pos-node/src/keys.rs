@@ -157,3 +157,46 @@ fn os_random(buf: &mut [u8]) -> io::Result<()> {
     let mut f = fs::File::open("/dev/urandom")?;
     f.read_exact(buf)
 }
+
+#[cfg(test)]
+mod tests {
+    /// The committee crate mirrors the suite-frame geometry
+    /// (`staking::SUITE_FRAME_MAGIC` and friends) instead of linking the PQ
+    /// stack; this test is the pin that keeps the mirror honest against the
+    /// real one. It generates a real hybrid keypair, so a drift in either
+    /// side's framing — magic, header width, or either key length — fails
+    /// here rather than on a live deposit.
+    #[test]
+    fn suite_frame_constants_mirror_bloch_crypto() {
+        use bloch_pos_committee::staking;
+
+        assert_eq!(
+            staking::SUITE_FRAME_HEADER_LEN,
+            bloch_crypto::crypto::SUITE_HEADER_LEN,
+            "frame header width drifted between the mirror and bloch-crypto"
+        );
+        assert_eq!(
+            staking::MLDSA65_PK_BYTES,
+            bloch_crypto::crypto::MLDSA_PUBKEY_LEN,
+            "ML-DSA-65 pk length drifted"
+        );
+
+        let (pk, _sk) = bloch_crypto::crypto::generate_keypair();
+        assert_eq!(
+            pk.len(),
+            staking::FRAMED_HYBRID_PK_BYTES,
+            "a real framed hybrid pk must be exactly the mirror's framed length"
+        );
+        assert_eq!(&pk[..2], &staking::SUITE_FRAME_MAGIC, "frame magic drifted");
+
+        let (suite, raw) = staking::parse_framed_pubkey(&pk)
+            .expect("the mirror must parse a real bloch-crypto hybrid key");
+        assert_eq!(suite, staking::SUITE_MLDSA65_FALCON1024);
+        assert_eq!(raw.len(), staking::HYBRID_PK_BYTES);
+        assert_eq!(
+            &pk[staking::SUITE_FRAME_HEADER_LEN..],
+            raw.as_slice(),
+            "the parsed body must be the frame's payload, byte for byte"
+        );
+    }
+}
