@@ -49,6 +49,7 @@ mod keys;
 mod net;
 mod p2p;
 mod rpc;
+mod state_sync;
 mod store;
 mod ws_boot;
 mod ws_tool;
@@ -141,6 +142,17 @@ fn print_help() {
                SAME flags plus --signature. This tool never holds a\n\
                spending key. No acknowledgement: confirmation is seeing\n\
                it in a block.\n\
+           run … --ws-checkpoint <envelope> --ws-signer-set <set> --state-sync\n\
+               Checkpoint-sync: verify the signed checkpoint, DOWNLOAD its\n\
+               committed state from peers (chunked, resumable), verify that\n\
+               the state reproduces the checkpoint's state_root, and sync\n\
+               forward from there instead of replaying from genesis.\n\
+               --state-snapshot <file> uses a local artifact instead of\n\
+               downloading (same verification, no trust in the file).\n\
+           run … --export-state-epoch <E> --export-state-out <file>\n\
+               Replay the local log and write epoch E's boundary-state\n\
+               snapshot artifact (the file --state-snapshot consumes and\n\
+               nodes serve to peers), then exit.\n\
            bloch-pos ws-checkpoint --genesis <manifest> --rpc <a>[,<b>...]\n\
                                    --epoch <E> --signer-set-id <n>\n\
                                    --out <prefix>\n\
@@ -860,6 +872,19 @@ fn run_cmd(args: &[String]) {
         // exposed port is a write surface, not only a read one.
         rpc_bind: arg_value(args, "--rpc-bind").unwrap_or_else(|| "127.0.0.1".to_string()),
         rpc_port,
+        state_snapshot: arg_value(args, "--state-snapshot").map(PathBuf::from),
+        state_sync: args.iter().any(|a| a == "--state-sync"),
+        export_state_epoch: match arg_value(args, "--export-state-epoch") {
+            None => None,
+            Some(s) => match s.parse::<u64>() {
+                Ok(e) => Some(e),
+                Err(_) => {
+                    eprintln!("run: --export-state-epoch must be an epoch number (got `{s}`)");
+                    exit(2);
+                }
+            },
+        },
+        export_state_out: arg_value(args, "--export-state-out").map(PathBuf::from),
     };
     if let Err(e) = engine::run(cfg) {
         eprintln!("bloch-pos: {e}");

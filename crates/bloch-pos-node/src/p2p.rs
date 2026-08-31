@@ -358,16 +358,25 @@ impl From<Verdict> for MessageAcceptance {
 pub enum SyncRequest {
     /// Every block with `slot > after_slot`, capped at `limit`.
     GetBlocks { after_slot: u64, limit: u32 },
+    /// A checkpoint-sync state request, carried opaquely: the payload is an
+    /// encoded `state_sync::StateSyncRequest`, so the chunked-download wire
+    /// form has exactly one definition (in `state_sync.rs`) on both
+    /// transports and this codec stays a framing layer.
+    State { payload: Vec<u8> },
 }
 
 /// The answer to a [`SyncRequest`]: encoded block envelopes, in chain order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SyncResponse {
     Blocks { envelopes: Vec<Vec<u8>> },
+    /// An encoded `state_sync::StateSyncResponse` — see [`SyncRequest::State`].
+    State { payload: Vec<u8> },
 }
 
 const SYNC_TAG_GET_BLOCKS: u8 = 0x01;
+const SYNC_TAG_GET_STATE: u8 = 0x02;
 const SYNC_TAG_BLOCKS: u8 = 0x01;
+const SYNC_TAG_STATE: u8 = 0x02;
 
 pub fn encode_sync_request(req: &SyncRequest) -> Vec<u8> {
     match req {
@@ -376,6 +385,12 @@ pub fn encode_sync_request(req: &SyncRequest) -> Vec<u8> {
             out.push(SYNC_TAG_GET_BLOCKS);
             out.extend_from_slice(&after_slot.to_le_bytes());
             out.extend_from_slice(&limit.to_le_bytes());
+            out
+        }
+        SyncRequest::State { payload } => {
+            let mut out = Vec::with_capacity(1 + payload.len());
+            out.push(SYNC_TAG_GET_STATE);
+            out.extend_from_slice(payload);
             out
         }
     }
@@ -390,6 +405,11 @@ pub fn decode_sync_request(buf: &[u8]) -> Result<SyncRequest, crate::codec::Deco
             r.finish()?;
             Ok(SyncRequest::GetBlocks { after_slot, limit })
         }
+        SYNC_TAG_GET_STATE => {
+            // Opaque to this layer; `state_sync::decode_request` is the
+            // strict decoder and runs on the serving side.
+            Ok(SyncRequest::State { payload: buf[1..].to_vec() })
+        }
         _ => Err(crate::codec::DecodeErr("unknown sync request tag")),
     }
 }
@@ -403,6 +423,12 @@ pub fn encode_sync_response(resp: &SyncResponse) -> Vec<u8> {
             for e in envelopes {
                 crate::codec::put_bytes(&mut out, e);
             }
+            out
+        }
+        SyncResponse::State { payload } => {
+            let mut out = Vec::with_capacity(1 + payload.len());
+            out.push(SYNC_TAG_STATE);
+            out.extend_from_slice(payload);
             out
         }
     }
@@ -423,6 +449,7 @@ pub fn decode_sync_response(buf: &[u8]) -> Result<SyncResponse, crate::codec::De
             r.finish()?;
             Ok(SyncResponse::Blocks { envelopes })
         }
+        SYNC_TAG_STATE => Ok(SyncResponse::State { payload: buf[1..].to_vec() }),
         _ => Err(crate::codec::DecodeErr("unknown sync response tag")),
     }
 }
@@ -999,6 +1026,9 @@ fn handle_command(swarm: &mut Swarm, st: &mut Loop, cmd: Command) {
                     let after = u64::from_le_bytes(payload.try_into().unwrap());
                     request_blocks(swarm, st, after);
                 }
+                crate::net::FRAME_GET_STATE => {
+                    request_state(swarm, st, payload.to_vec());
+                }
                 _ => {}
             }
         }
@@ -1036,6 +1066,23 @@ fn publish(swarm: &mut Swarm, topic: IdentTopic, data: Vec<u8>, name: &str) {
 /// O(peers × blocks) amplification that stalled the chain. Not a single peer
 /// either — a silent one would stall recovery — so [`SYNC_FANOUT`] peers,
 /// preferring the highest observed head.
+/// Direct a state-sync request at the best-connected peers. Fanout, like
+/// blocks: one silent peer must not stall a bootstrap, and the download
+/// bookkeeping dedups duplicate answers by chunk index.
+fn request_state(swarm: &mut Swarm, st: &Loop, payload: Vec<u8>) {
+    let mut peers: Vec<PeerId> = swarm.connected_peers().copied().collect();
+    if peers.is_empty() {
+        return;
+    }
+    peers.sort_by_key(|p| {
+        (std::cmp::Reverse(st.peer_head.get(p).copied().unwrap_or(0)), p.to_bytes())
+    });
+    let req = SyncRequest::State { payload };
+    for p in peers.into_iter().take(SYNC_FANOUT) {
+        swarm.behaviour_mut().sync.send_request(&p, req.clone());
+    }
+}
+
 fn request_blocks(swarm: &mut Swarm, st: &Loop, after_slot: u64) {
     let mut peers: Vec<PeerId> = swarm.connected_peers().copied().collect();
     if peers.is_empty() {
@@ -1158,7 +1205,22 @@ fn handle_swarm_event(
                 serve_sync(st, resp_tx.clone(), request, channel);
             }
             request_response::Message::Response { response, .. } => {
-                let SyncResponse::Blocks { envelopes } = response;
+                let envelopes = match response {
+                    SyncResponse::Blocks { envelopes } => envelopes,
+                    SyncResponse::State { payload } => {
+                        match crate::state_sync::decode_response(&payload) {
+                            Ok(resp) => {
+                                if !st.emit(NetEvent::StateSync(resp)) {
+                                    return false;
+                                }
+                            }
+                            Err(e) => eprintln!(
+                                "p2p: undecodable state-sync response from {peer}: {e}"
+                            ),
+                        }
+                        return true;
+                    }
+                };
                 let was_full = envelopes.len() >= MAX_SYNC_BLOCKS;
                 let mut highest = 0u64;
                 for bytes in envelopes {
@@ -1295,7 +1357,24 @@ fn serve_sync(
     request: SyncRequest,
     channel: request_response::ResponseChannel<SyncResponse>,
 ) {
-    let SyncRequest::GetBlocks { after_slot, limit } = request;
+    let (after_slot, limit) = match request {
+        SyncRequest::GetBlocks { after_slot, limit } => (after_slot, limit),
+        SyncRequest::State { payload } => {
+            // Checkpoint-sync serving: strict-decode the inner request and
+            // answer from the snapshot store. Anything malformed or absent is
+            // `Unavailable` — the peer's remedy is the same either way.
+            let dir = st.data_dir.clone();
+            tokio::task::spawn_blocking(move || {
+                let resp = match crate::state_sync::decode_request(&payload) {
+                    Ok(req) => crate::state_sync::serve(&dir, &req),
+                    Err(_) => return, // not even a request; answer nothing
+                };
+                let payload = crate::state_sync::encode_response(&resp);
+                let _ = resp_tx.send((channel, SyncResponse::State { payload }));
+            });
+            return;
+        }
+    };
     let dir = st.data_dir.clone();
     let limit = (limit as usize).min(MAX_SYNC_BLOCKS);
     tokio::task::spawn_blocking(move || {

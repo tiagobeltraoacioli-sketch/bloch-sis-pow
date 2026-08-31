@@ -60,12 +60,13 @@
 //! store with a test proving it equals the rebuild, not a cache with a comment.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bloch_pos_committee::attestation::{Attestation, AttestationData};
 use bloch_pos_committee::beacon::{mix_in, RandaoChain};
@@ -75,12 +76,14 @@ use bloch_pos_committee::header::{BlockEnvelope, BlockHeaderV4, BlockId, Body, V
 use bloch_pos_committee::interfaces::{ProposalEnvelope, StateReader, StateTransition};
 use bloch_pos_committee::schedule::first_slot_of_epoch;
 use bloch_pos_committee::transition::{CommittedState, PosTransaction, Transition};
+use bloch_pos_committee::ws::WeakSubjectivityCheckpoint;
 use bloch_pos_committee::{committees, derive, epoch_of, schedule};
 
 use crate::genesis::{Manifest, GENESIS_MIX};
 use crate::keys::{HybridVerifier, Keystore, ProbeVerifier};
 use crate::net::{self, NetEvent, Origin, Verdict};
 use crate::rpc::{self, Admitted, Finality, Json, RpcCall, RpcError, RpcRequest, RpcResult};
+use crate::state_sync::{self, StateSyncRequest, StateSyncResponse};
 use crate::store::Store;
 
 /// Everything that reaches the consensus thread from outside it.
@@ -141,6 +144,23 @@ pub struct Config {
     /// the server entirely.
     pub rpc_bind: String,
     pub rpc_port: Option<u16>,
+    /// Checkpoint-sync: a local snapshot artifact (`*.snap`, from
+    /// `--export-state-epoch` on a synced node or an out-of-band copy) to
+    /// verify against the boot checkpoint and start from. Verification is
+    /// [`crate::state_sync::import`]'s three-step chain; the file's origin
+    /// carries no trust.
+    pub state_snapshot: Option<PathBuf>,
+    /// Checkpoint-sync: when the verified boot checkpoint is ahead of local
+    /// history, download the checkpoint's state from peers (chunked,
+    /// resumable) instead of replaying every block from genesis. Off by
+    /// default — starting from a snapshot forgoes local re-execution of the
+    /// skipped history, and that trade is the operator's to make.
+    pub state_sync: bool,
+    /// Export mode: replay the local log, write the boundary-state snapshot
+    /// for this weak-subjectivity publication epoch to
+    /// [`Config::export_state_out`], and exit without joining the network.
+    pub export_state_epoch: Option<u64>,
+    pub export_state_out: Option<PathBuf>,
 }
 
 fn now_ms() -> u64 {
@@ -537,6 +557,37 @@ struct Engine {
     /// that kind of pool shrinkage apart from the epoch `retain`, which fork
     /// choice very much can see. See the argument there.
     fc_covered_removals: u64,
+    /// Where this node's local history begins.
+    ///
+    /// [`BaseState::Genesis`] on an ordinary node. On a checkpoint-synced
+    /// node it holds the verified snapshot state — the post-state of
+    /// `chain[0]` — because `replay_to` must fold from *somewhere this node
+    /// actually has*, and genesis is no longer that.
+    base: BaseState,
+    /// Set when this node bootstrapped from a verified checkpoint snapshot:
+    /// `(checkpoint epoch, boundary block root)`. Three consumers, each
+    /// because the chain below the base does not exist locally: fork choice
+    /// walks from this root while the state's own justified checkpoint still
+    /// predates it ([`Engine::forkchoice_walk_root`]);
+    /// [`Engine::own_finalized_root_at`] refuses epochs below it (this chain
+    /// cannot witness them); and the history surfaces (RPC `getblock`, peer
+    /// block serving) simply lack the earlier blocks — backfill is a
+    /// service, not consensus.
+    sync_base: Option<(u64, [u8; 32])>,
+    /// The publication epoch whose boundary snapshot was last exported, so a
+    /// boundary crossing exports once, not on every block of the new epoch.
+    last_boundary_export: Option<u64>,
+}
+
+/// See [`Engine::base`].
+enum BaseState {
+    /// History starts at the genesis block; the base state is the manifest's
+    /// genesis state, recomputed on demand (it is derivable, and holding a
+    /// second carryover-scale state resident for a rare path is RAM the
+    /// fleet does not have).
+    Genesis,
+    /// History starts at a verified snapshot; underivable, so it is held.
+    Snapshot(Arc<CommittedState>),
 }
 
 /// A fingerprint of the four values `lmd_ghost_head` reads, so `advance` can
@@ -815,6 +866,14 @@ impl Engine {
     /// canonical chain under the same checkpoint convention its attesters
     /// vote, never from anything a peer or a publication asserted.
     fn own_finalized_root_at(&self, epoch: u64) -> Option<[u8; 32]> {
+        // Below the sync base this chain holds no blocks: `checkpoint_root`
+        // would degenerate to chain[0] and *invent* a witness for an epoch
+        // this node never saw. No answer is the honest answer.
+        if let Some((base_epoch, _)) = self.sync_base {
+            if epoch < base_epoch {
+                return None;
+            }
+        }
         (epoch <= self.state.finality().finalized.epoch).then(|| self.checkpoint_root(epoch))
     }
 
@@ -882,11 +941,115 @@ impl Engine {
         }
     }
 
-    /// This validator's RANDAO chain, positioned at its committed reveal
-    /// count on the CANONICAL chain (= how many canonical blocks it
-    /// proposed). Regenerated from the seed on every use: a reorg can drop
-    /// our own blocks, so an incrementally-advanced local chain would drift
-    /// from what the committed state expects the next reveal to open.
+    /// Install a VERIFIED snapshot as this node's history base: the state
+    /// becomes the boundary block's post-state, the canonical chain begins at
+    /// that block, and everything below it is absent by design (backfill is a
+    /// service, not consensus).
+    ///
+    /// `persist` carries the artifact's file bytes on a first install, so a
+    /// restart re-verifies and resumes from here (`state.snap` + the
+    /// checkpoint in `ws_latest.bin`); the restart path itself passes `None`
+    /// because what it read from disk is already what it would write.
+    ///
+    /// The caller vouches that `state`/`env` came out of
+    /// [`state_sync::import`] against `cp` — there is no other way to obtain
+    /// the pair, since `snapshot::restore` is the only constructor of a
+    /// non-genesis, non-transition state.
+    fn install_snapshot(
+        &mut self,
+        state: CommittedState,
+        env: BlockEnvelope,
+        cp: &WeakSubjectivityCheckpoint,
+        persist: Option<&[u8]>,
+    ) -> io::Result<()> {
+        let id = env.block_id();
+        let slot = env.header.slot;
+        // Persist FIRST: a crash between installation and persistence would
+        // leave a blocks.log that starts mid-history with nothing under it.
+        if let Some(bytes) = persist {
+            let data_dir = self.store.dir().to_path_buf();
+            let tmp = data_dir.join("state.snap.tmp");
+            fs::write(&tmp, bytes)?;
+            fs::rename(&tmp, data_dir.join(state_sync::INSTALLED_SNAPSHOT))?;
+            crate::ws_boot::save_latest(&data_dir, cp)?;
+        }
+        let arc = Arc::new(state);
+        self.state.set_arc(Arc::clone(&arc));
+        self.base = BaseState::Snapshot(Arc::clone(&arc));
+        self.chain = vec![(slot, id)];
+        self.canonical = BTreeSet::from([*id.as_bytes()]);
+        self.blocks.insert(*id.as_bytes(), env);
+        self.recent_states.clear();
+        self.remember_state(*id.as_bytes(), arc);
+        self.sync_base = Some((cp.epoch, *id.as_bytes()));
+        self.head_slot.store(slot, Ordering::Relaxed);
+        self.last_applied_ms = now_ms();
+        let fin = self.state.finality();
+        println!(
+            "checkpoint-sync: state INSTALLED at checkpoint epoch {} — head slot {} ({}),              state root {}, justified e{}, finalized e{}. History below this base is not              held; the node syncs forward from here.",
+            cp.epoch,
+            slot,
+            crate::codec::hex8(id.as_bytes()),
+            crate::codec::hex8(&cp.state_root),
+            fin.justified.epoch,
+            fin.finalized.epoch,
+        );
+        Ok(())
+    }
+
+    /// If the block about to apply at `new_slot` is the first canonical block
+    /// at or past a weak-subjectivity publication boundary
+    /// (`ws::is_publication_epoch`), the CURRENT head is that publication
+    /// epoch's `checkpoint_root` — the exact block a future signed checkpoint
+    /// will pin — and its post-state (the current state) is the snapshot a
+    /// joining node will ask for by root. Export it, off-thread: the state
+    /// travels as an `Arc` (no copy), and serialisation happens off the slot
+    /// loop.
+    ///
+    /// Exported eagerly, before the epoch finalizes: the file is keyed by
+    /// state root, so an export on a branch that later loses is dead weight
+    /// that ages out of the pruned store, never something a checkpoint can
+    /// name.
+    fn maybe_export_boundary(&mut self, new_slot: u64) {
+        use bloch_pos_committee::ws::WS_PUBLICATION_INTERVAL_EPOCHS as INTERVAL;
+        let target = epoch_of(new_slot) - epoch_of(new_slot) % INTERVAL;
+        if target == 0 || self.last_boundary_export == Some(target) {
+            return;
+        }
+        let Some(first) = first_slot_of_epoch(target) else { return };
+        if self.state.slot() >= first {
+            // Not a crossing: the boundary is already behind the head.
+            return;
+        }
+        let head = self.head_id();
+        let Some(env) = self.blocks.get(head.as_bytes()).cloned() else {
+            return; // head is the synthesized genesis — nothing exportable
+        };
+        self.last_boundary_export = Some(target);
+        let state = self.state.arc();
+        let dir = state_sync::snapshots_dir(self.store.dir());
+        std::thread::spawn(move || match state_sync::export_to_dir(&dir, &state, &env) {
+            Ok(path) => println!(
+                "checkpoint-sync: exported the epoch-{target} boundary state to {}",
+                path.display()
+            ),
+            Err(e) => eprintln!("checkpoint-sync: boundary export failed: {e}"),
+        });
+    }
+
+    /// This validator's RANDAO chain, positioned at its COMMITTED reveal
+    /// count — `CommittedState::reveals_used_of`, the very value
+    /// `apply_block` will judge the next reveal against. Regenerated from the
+    /// seed on every use: a reorg can drop our own blocks, and the canonical
+    /// state's committed count moves with the reorg, so a regenerated chain
+    /// cannot drift from what the state expects.
+    ///
+    /// This used to count our own blocks on the canonical chain — the same
+    /// number, but only for a node that holds its whole chain. A
+    /// checkpoint-synced validator holds nothing below its sync base, so the
+    /// walk undercounted exactly there and every reveal it produced would
+    /// have been refused. The committed pair is the single definition of
+    /// where the chain stands and it arrives inside the verified snapshot.
     ///
     /// Only ever called from the proposing path, which an observer never
     /// reaches — hence the expect rather than an Option return threaded
@@ -896,12 +1059,7 @@ impl Engine {
             .keys
             .as_ref()
             .expect("randao_positioned is proposer-only");
-        let mine = self.chain.iter().skip(1).filter(|(_, id)| {
-            self.blocks
-                .get(id.as_bytes())
-                .is_some_and(|e| e.header.proposer_index == keys.index)
-        });
-        let count = mine.count();
+        let count = self.state.reveals_used_of(keys.index);
         let mut chain = RandaoChain::generate(keys.randao_seed);
         for _ in 0..count {
             chain.next_reveal();
@@ -1221,8 +1379,25 @@ impl Engine {
         ForkChoiceInputs {
             blocks: self.blocks.len(),
             pool: self.pool.len() as u64 + self.fc_covered_removals,
-            justified: self.state.finality().justified.root,
+            justified: self.forkchoice_walk_root(),
             validators: self.state.active_validators(),
+        }
+    }
+
+    /// The root LMD-GHOST walks from. Normally the state's own justified
+    /// checkpoint. On a checkpoint-synced node whose justified checkpoint
+    /// still predates the sync base, the base root — the deepest block this
+    /// node holds — is used instead, exactly as Ethereum anchors fork choice
+    /// in the checkpoint state it synced. Without this the walk would start
+    /// at a root this node deliberately does not hold, see no children, and
+    /// freeze on it forever. The override retires by itself: the first
+    /// justification at or past the base epoch is of a block this node
+    /// applied, and the ordinary rule takes over.
+    fn forkchoice_walk_root(&self) -> [u8; 32] {
+        let j = self.state.finality().justified;
+        match self.sync_base {
+            Some((base_epoch, base_root)) if base_epoch > j.epoch => base_root,
+            _ => j.root,
         }
     }
 
@@ -1233,7 +1408,7 @@ impl Engine {
             &self.blocks,
             self.pool.values(),
             &self.state.active_validators(),
-            self.state.finality().justified.root,
+            self.forkchoice_walk_root(),
         )
     }
 
@@ -1438,6 +1613,12 @@ impl Engine {
             .apply_block(&self.state, &envelope, &env.body.attestations, &txs)
         {
             Ok(post) => {
+                if self.live {
+                    // Before the head moves: the pre-apply head may be a
+                    // publication-epoch boundary whose state should be served
+                    // to joining nodes.
+                    self.maybe_export_boundary(env.header.slot);
+                }
                 self.state.set(post);
                 // Snapshot for the reorg path. Free: this is the state that
                 // was just built, kept by handle, not copied.
@@ -1581,7 +1762,10 @@ impl Engine {
                     .clone()
             })
             .collect();
-        let mut st = self.manifest.genesis_state();
+        let mut st = match &self.base {
+            BaseState::Genesis => self.manifest.genesis_state(),
+            BaseState::Snapshot(base) => (**base).clone(),
+        };
         for env in &prefix {
             let envelope = ProposalEnvelope {
                 header: env.header.clone(),
@@ -2115,6 +2299,245 @@ impl Engine {
 /// that the log of a multi-hour replay stays readable.
 const REPLAY_PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Export the boundary-state snapshot of one publication epoch from a
+/// replayed engine: `<out>` gets the `state_sync` file form (boundary
+/// envelope + canonical state body), and the printed state root is what a
+/// `ws-checkpoint` derivation for the same epoch must carry.
+///
+/// The candidate was captured during replay (the head's post-state while the
+/// head was still before the epoch's first slot); it must name exactly
+/// `checkpoint_root(epoch)` or the replay reorganised across the boundary
+/// and the export refuses rather than writing a state no checkpoint pins.
+fn export_state_snapshot(
+    engine: &Engine,
+    epoch: u64,
+    out: &Path,
+    candidate: Option<([u8; 32], Arc<CommittedState>)>,
+) -> io::Result<()> {
+    let bad = |m: String| io::Error::new(io::ErrorKind::InvalidData, m);
+    let first = first_slot_of_epoch(epoch)
+        .ok_or_else(|| bad(format!("epoch {epoch} has no first slot (overflow)")))?;
+    if engine.state.slot() < first {
+        return Err(bad(format!(
+            "the local chain (head slot {}) has not reached epoch {epoch} (first slot {first}); \
+             nothing to export",
+            engine.state.slot()
+        )));
+    }
+    let boundary = engine.checkpoint_root(epoch);
+    let Some((cid, st)) = candidate else {
+        return Err(bad(
+            "no pre-boundary block was replayed — the boundary is the genesis block, whose \
+             state every node derives from the manifest without a snapshot"
+            .into(),
+        ));
+    };
+    if cid != boundary {
+        return Err(bad(
+            "the replayed candidate does not match the canonical boundary block (a reorg \
+             crossed the boundary during replay); re-run against a settled log"
+                .into(),
+        ));
+    }
+    let env = engine.blocks.get(&boundary).cloned().ok_or_else(|| {
+        bad("boundary block is not stored (genesis is synthesized and cannot be exported)".into())
+    })?;
+    let fin = engine.state.finality();
+    if epoch > fin.finalized.epoch {
+        eprintln!(
+            "WARNING: epoch {epoch} is beyond this node's finalized epoch {} — the exported \
+             boundary could still reorganise. A published checkpoint must only ever pin a \
+             finalized epoch.",
+            fin.finalized.epoch
+        );
+    }
+    let body = st.snapshot_serialize();
+    let file = state_sync::encode_snapshot_file(&env, &body);
+    fs::write(out, &file)?;
+    println!(
+        "exported epoch-{epoch} boundary state: block {} (slot {}), state root {}, {} bytes → {}",
+        crate::codec::hex8(&boundary),
+        env.header.slot,
+        crate::codec::hex32(&env.header.state_root),
+        file.len(),
+        out.display(),
+    );
+    println!(
+        "a ws-checkpoint derived for epoch {epoch} must carry exactly this block root and \
+         state root; a node boots from the file with --ws-checkpoint <envelope> \
+         --state-snapshot <this file>"
+    );
+    Ok(())
+}
+
+/// Boot-time chunked, resumable download of the checkpoint's state from
+/// peers, over whichever transport the node runs.
+///
+/// Requests go out as engine frames (`net::get_state_frame`): the devnet mesh
+/// broadcasts them (any holder answers; duplicates dedup by chunk index), the
+/// libp2p stack directs them at the best-known peers. Responses come back on
+/// the ordinary engine channel; everything that is not a state-sync answer is
+/// dropped here, because the node deliberately performs no duty and applies
+/// no block until it stands on a verified state (those blocks re-arrive via
+/// ordinary sync afterwards).
+///
+/// Progress survives restarts: chunks land in
+/// `<data-dir>/statesync/<root>.part` at their final offsets and are
+/// re-hashed against the manifest on resume. Nothing a peer sends is
+/// believed: a chunk mismatching the manifest hash is dropped; the assembled
+/// artifact must still pass `state_sync::import`'s full verification chain,
+/// and an artifact that fails it is destroyed and re-fetched (from whoever
+/// answers first the next round), bounded by an attempt cap.
+fn download_snapshot(
+    net: &net::Net,
+    rx: &mpsc::Receiver<EngineEvent>,
+    inflight: &Arc<std::sync::atomic::AtomicUsize>,
+    data_dir: &Path,
+    genesis: &CommittedState,
+    cp: &WeakSubjectivityCheckpoint,
+) -> io::Result<(CommittedState, BlockEnvelope, Vec<u8>)> {
+    const ROUND: Duration = Duration::from_secs(5);
+    const OVERALL: Duration = Duration::from_secs(6 * 3600);
+    const PIPELINE: usize = 8;
+    const MAX_REFUSED_ARTIFACTS: u32 = 3;
+
+    println!(
+        "checkpoint-sync: downloading the epoch-{} state (root {}) from peers…",
+        cp.epoch,
+        crate::codec::hex8(&cp.state_root),
+    );
+    let started = Instant::now();
+    let mut download: Option<state_sync::Download> = None;
+    let mut refused = 0u32;
+    let mut last_report = Instant::now();
+    loop {
+        if started.elapsed() > OVERALL {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "checkpoint-sync: no peer served the snapshot within the deadline; the partial \
+                 download is kept and resumes on the next start",
+            ));
+        }
+        // (Re-)issue requests for whatever is still missing. Idempotent and
+        // periodic, so a lost frame or a silent peer costs one round, not the
+        // download.
+        match &download {
+            None => net.broadcast(net::get_state_frame(&StateSyncRequest::Manifest {
+                state_root: cp.state_root,
+            })),
+            Some(d) => {
+                for index in d.missing(PIPELINE) {
+                    net.broadcast(net::get_state_frame(&StateSyncRequest::Chunk {
+                        state_root: cp.state_root,
+                        index,
+                    }));
+                }
+            }
+        }
+        let round_end = Instant::now() + ROUND;
+        loop {
+            let left = round_end.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            let ev = match rx.recv_timeout(left) {
+                Ok(ev) => ev,
+                Err(mpsc::RecvTimeoutError::Timeout) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "network channel closed"))
+                }
+            };
+            // Same bookkeeping as the slot loop: the devnet transport counts
+            // every Net event into `inflight` and sheds at the cap, so a
+            // download that consumed events without releasing them would
+            // shed its own chunks.
+            if matches!(ev, EngineEvent::Net(_)) {
+                inflight.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            }
+            let EngineEvent::Net(NetEvent::StateSync(resp)) = ev else {
+                continue; // blocks/attestations re-arrive via ordinary sync later
+            };
+            match resp {
+                m @ StateSyncResponse::Manifest { .. } => {
+                    let StateSyncResponse::Manifest { state_root, total_len, .. } = &m else {
+                        unreachable!()
+                    };
+                    if *state_root != cp.state_root || download.is_some() {
+                        continue;
+                    }
+                    match state_sync::Download::open(data_dir, &m) {
+                        Ok(d) => {
+                            let (done, total) = d.done_count();
+                            println!(
+                                "checkpoint-sync: manifest — {total_len} bytes in {total} chunks \
+                                 ({done} already on disk)"
+                            );
+                            download = Some(d);
+                            break; // go request chunks immediately
+                        }
+                        Err(e) => {
+                            eprintln!("checkpoint-sync: refusing a peer's manifest: {e}")
+                        }
+                    }
+                }
+                StateSyncResponse::Chunk { state_root, index, bytes } => {
+                    if state_root != cp.state_root {
+                        continue;
+                    }
+                    if let Some(d) = &mut download {
+                        if d.accept_chunk(index, &bytes)? && last_report.elapsed().as_secs() >= 2
+                        {
+                            let (done, total) = d.done_count();
+                            println!("checkpoint-sync: {done}/{total} chunks");
+                            last_report = Instant::now();
+                        }
+                    }
+                }
+                StateSyncResponse::Unavailable { state_root } => {
+                    if state_root == cp.state_root && download.is_none() {
+                        println!(
+                            "checkpoint-sync: a peer does not hold this snapshot; still asking"
+                        );
+                    }
+                }
+            }
+        }
+        if download.as_ref().is_some_and(|d| d.complete()) {
+            let mut d = download.take().expect("checked");
+            let bytes = d.take_bytes()?;
+            match state_sync::import(&bytes, genesis, cp) {
+                Ok((st, env)) => {
+                    d.destroy();
+                    println!(
+                        "checkpoint-sync: artifact verified — state root reproduces the \
+                         checkpoint's {}",
+                        crate::codec::hex8(&cp.state_root)
+                    );
+                    return Ok((st, env, bytes));
+                }
+                Err(e) => {
+                    // The whole artifact — and the manifest that shaped it —
+                    // was a lie or corrupt. Destroy and start clean.
+                    d.destroy();
+                    refused += 1;
+                    eprintln!("checkpoint-sync: assembled artifact REFUSED ({e}); refetching");
+                    if refused >= MAX_REFUSED_ARTIFACTS {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "checkpoint-sync: {refused} assembled artifacts failed \
+                                 verification against the checkpoint — either every reachable \
+                                 peer is serving a forgery or the checkpoint itself is wrong; \
+                                 refusing to keep trying blindly ({e})"
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub fn run(cfg: Config) -> io::Result<()> {
     let (mut manifest, digest) = Manifest::load(&cfg.genesis_path)?;
 
@@ -2303,8 +2726,36 @@ pub fn run(cfg: Config) -> io::Result<()> {
         ws_anchor_hard: false,
         ws_conflict_reported: false,
         fc_covered_removals: 0,
+        base: BaseState::Genesis,
+        sync_base: None,
+        last_boundary_export: None,
         manifest,
     };
+
+    // ── Checkpoint-sync restart: a previously installed snapshot base ──
+    //
+    // Re-verified IN FULL on every boot against the checkpoint persisted in
+    // `ws_latest.bin` — the data dir gets no more trust here than blocks.log
+    // gets from replay. Only after the whole import chain passes (block id,
+    // header root, recomputed state root) does the engine's history begin at
+    // the boundary instead of genesis; the log replay below then extends it.
+    {
+        let installed = cfg.data_dir.join(crate::state_sync::INSTALLED_SNAPSHOT);
+        if installed.is_file() {
+            let network_id = crate::ws_boot::network_id_of(&digest);
+            let cp = crate::ws_boot::load_latest(&cfg.data_dir, network_id, genesis_id.as_bytes())?
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "state.snap exists but ws_latest.bin does not: the installed snapshot                          has no checkpoint to verify against. Restore ws_latest.bin or move                          the data dir aside and re-sync.",
+                    )
+                })?;
+            let bytes = fs::read(&installed)?;
+            let genesis_state = engine.manifest.genesis_state();
+            let (st, env) = state_sync::import(&bytes, &genesis_state, &cp)?;
+            engine.install_snapshot(st, env, &cp, None)?;
+        }
+    }
 
     // ── Replay: restart returns to the same state, by re-running the same
     // transition over the same inputs. ──
@@ -2327,8 +2778,20 @@ pub fn run(cfg: Config) -> io::Result<()> {
     }
     let replay_started = std::time::Instant::now();
     let mut last_report = replay_started;
+    // Export mode: while the head is still before the target epoch's first
+    // slot, the current head is a candidate boundary block — the last update
+    // before the head crosses is the boundary itself. An `Arc`, not a copy.
+    let export_first_slot = cfg
+        .export_state_epoch
+        .and_then(first_slot_of_epoch);
+    let mut export_candidate: Option<([u8; 32], Arc<CommittedState>)> = None;
     for (i, env) in logged.into_iter().enumerate() {
         engine.ingest(env);
+        if let Some(first) = export_first_slot {
+            if engine.state.slot() < first && engine.chain.len() > 1 {
+                export_candidate = Some((*engine.head_id().as_bytes(), engine.state.arc()));
+            }
+        }
         // Time-based, not every-N-blocks: block cost varies by an order of
         // magnitude with how many transactions a block carries, so a fixed
         // count reports in bursts and then goes quiet exactly when the work is
@@ -2362,6 +2825,14 @@ pub fn run(cfg: Config) -> io::Result<()> {
         .head_slot
         .store(engine.state.slot(), Ordering::Relaxed);
 
+    // ── Export mode: write the boundary snapshot and exit ──
+    if let Some(epoch) = cfg.export_state_epoch {
+        let out = cfg.export_state_out.clone().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "--export-state-epoch needs --export-state-out")
+        })?;
+        return export_state_snapshot(&engine, epoch, &out, export_candidate);
+    }
+
     // ── Weak subjectivity: may the node sync at all? (§4.2) ──
     //
     // Runs AFTER replay, because the question the boot decision asks — how old
@@ -2377,7 +2848,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
     // clock the node's own epochs are numbered by. The NTP caveat of §1
     // applies here verbatim — a clock set backward makes a stale node look
     // fresh.
-    {
+    let anchor_checkpoint: WeakSubjectivityCheckpoint = {
         let genesis_ms = engine.manifest.genesis_time_ms;
         let slot_ms = engine.manifest.slot_ms;
         let wall_slot = now_ms().saturating_sub(genesis_ms) / slot_ms;
@@ -2430,8 +2901,61 @@ pub fn run(cfg: Config) -> io::Result<()> {
                 engine.ws_anchor = Some((ws.anchor_epoch, ws.anchor_root));
                 engine.ws_anchor_hard = ws.anchor_is_hard;
                 engine.enforce_ws_anchor();
+                ws.checkpoint
             }
             Err(msg) => return Err(io::Error::new(io::ErrorKind::PermissionDenied, msg)),
+        }
+    };
+
+    // ── Checkpoint-sync acquisition (§4.3.2): make the anchor a sync
+    //    STARTING POINT, not only a floor. ──
+    //
+    // Runs after the gate, so only a checkpoint the gate admitted (verified
+    // quorum, anti-rollback, cross-checked against own finality) can name the
+    // state to fetch — and before the RPC and the slot loop, so the node
+    // never performs a duty or answers a query from a state it is still
+    // assembling. The genesis anchor is excluded: a node inside the first
+    // window needs nothing beyond genesis, and "download the genesis state"
+    // is replay with extra steps.
+    {
+        use bloch_pos_committee::ws::WS_GENESIS_SIGNER_SET_ID;
+        let cp = &anchor_checkpoint;
+        let wants_state = engine.sync_base.is_none()
+            && cp.signer_set_id != WS_GENESIS_SIGNER_SET_ID
+            && cp.epoch > epoch_of(engine.state.slot())
+            && !engine.canonical.contains(&cp.block_root);
+        if wants_state {
+            if let Some(path) = &cfg.state_snapshot {
+                let bytes = fs::read(path)?;
+                let genesis_state = engine.manifest.genesis_state();
+                let (st, env) = state_sync::import(&bytes, &genesis_state, cp)?;
+                engine.install_snapshot(st, env, cp, Some(&bytes))?;
+            } else if cfg.state_sync {
+                let genesis_state = engine.manifest.genesis_state();
+                let (st, env, bytes) = download_snapshot(
+                    &engine.net,
+                    &rx,
+                    &inflight,
+                    &cfg.data_dir,
+                    &genesis_state,
+                    cp,
+                )?;
+                engine.install_snapshot(st, env, cp, Some(&bytes))?;
+            } else {
+                println!(
+                    "checkpoint-sync: this node is anchored at epoch {} but its local head is \
+                     at epoch {} — it will replay every block from genesis to get there. Pass \
+                     --state-sync to download the checkpoint's verified state from peers, or \
+                     --state-snapshot <file> to start from a local artifact.",
+                    cp.epoch,
+                    epoch_of(engine.state.slot()),
+                );
+            }
+        } else if cfg.state_snapshot.is_some() && engine.sync_base.is_none() {
+            println!(
+                "checkpoint-sync: --state-snapshot ignored — the anchor does not call for a \
+                 state download (genesis anchor, or local history already reaches it)"
+            );
         }
     }
 
@@ -2570,6 +3094,11 @@ pub fn run(cfg: Config) -> io::Result<()> {
                             // Gossip has nobody to answer to; the verdict is the
                             // RPC's concern, not a peer's.
                             let _ = engine.on_transaction(tx);
+                        }
+                        EngineEvent::Net(NetEvent::StateSync(_)) => {
+                            // A state-sync answer outside the boot download
+                            // loop: late, duplicated, or unsolicited. The
+                            // node's state does not come from here — drop it.
                         }
                         EngineEvent::Rpc(call) => {
                             let result = engine.serve_rpc(call.req);
@@ -3849,6 +4378,9 @@ mod transfer_v2_end_to_end {
             ws_anchor_hard: false,
             ws_conflict_reported: false,
             fc_covered_removals: 0,
+            base: BaseState::Genesis,
+            sync_base: None,
+            last_boundary_export: None,
         }
     }
 
@@ -4147,6 +4679,9 @@ mod perf_support {
             // offset the very first comparison against a pool that really is
             // empty.
             fc_covered_removals: 0,
+            base: BaseState::Genesis,
+            sync_base: None,
+            last_boundary_export: None,
         };
         (engine, TestDir(dir))
     }
@@ -5426,6 +5961,9 @@ mod duty_view_anchor {
             ws_anchor_hard: false,
             ws_conflict_reported: false,
             fc_covered_removals: 0,
+            base: BaseState::Genesis,
+            sync_base: None,
+            last_boundary_export: None,
         };
         (engine, dir)
     }

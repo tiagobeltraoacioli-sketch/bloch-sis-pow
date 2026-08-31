@@ -56,6 +56,12 @@ pub const FRAME_GET_BLOCKS: u8 = 0x03;
 /// carries, so what a peer gossips and what a proposer commits to are the same
 /// object and no second encoding exists to disagree with the first.
 pub const FRAME_TX: u8 = 0x04;
+/// Payload is an encoded [`crate::state_sync::StateSyncRequest`] — a
+/// checkpoint-sync state download request, answered from the local snapshot
+/// store rather than relayed.
+pub const FRAME_GET_STATE: u8 = 0x05;
+/// Payload is an encoded [`crate::state_sync::StateSyncResponse`].
+pub const FRAME_STATE: u8 = 0x06;
 
 pub use crate::p2p::{Origin, Verdict};
 
@@ -68,6 +74,10 @@ pub enum NetEvent {
     /// [`Origin::none`] and reporting is a no-op.
     Attestation(Attestation, Origin),
     Transaction(bloch_pos_committee::transition::PosTransaction),
+    /// A checkpoint-sync state download answer (manifest, chunk, or
+    /// unavailable). Only the boot-time download loop consumes these; at any
+    /// other time they are dropped, harmlessly.
+    StateSync(crate::state_sync::StateSyncResponse),
 }
 
 /// The transport the engine holds. One of two, chosen at startup.
@@ -240,6 +250,15 @@ pub fn get_blocks_frame(after_slot: u64) -> Vec<u8> {
     f
 }
 
+/// A state-sync request as an engine frame: the devnet mesh sends it to every
+/// peer (any holder may answer; duplicates dedup in the download bookkeeping),
+/// libp2p routes it onto the directed-sync protocol.
+pub fn get_state_frame(req: &crate::state_sync::StateSyncRequest) -> Vec<u8> {
+    let mut f = vec![FRAME_GET_STATE];
+    f.extend_from_slice(&crate::state_sync::encode_request(req));
+    f
+}
+
 /// Send one transaction to a running node and disconnect.
 ///
 /// The node gossips it onward, so any peer is an equally good entry point.
@@ -286,6 +305,9 @@ fn decode_event(frame: &[u8]) -> Option<NetEvent> {
             r.finish().ok()?;
             Some(NetEvent::Attestation(att, Origin::none()))
         }
+        &FRAME_STATE => {
+            crate::state_sync::decode_response(&frame[1..]).ok().map(NetEvent::StateSync)
+        }
         &FRAME_TX => {
             // Decoding here, at the edge, is deliberate: a frame that does not
             // decode never reaches the mempool, so a proposer cannot be handed
@@ -296,6 +318,18 @@ fn decode_event(frame: &[u8]) -> Option<NetEvent> {
         }
         _ => None,
     }
+}
+
+/// Answer a peer's `FRAME_GET_STATE` on the socket it asked over, from the
+/// local snapshot store. Same locking discipline as [`serve_get_blocks`]: the
+/// write half is shared, so the lock is taken around one whole frame.
+fn serve_get_state(sock: &Arc<Mutex<TcpStream>>, data_dir: &PathBuf, frame: &[u8]) {
+    let Ok(req) = crate::state_sync::decode_request(&frame[1..]) else { return };
+    let resp = crate::state_sync::serve(data_dir, &req);
+    let mut f = vec![FRAME_STATE];
+    f.extend_from_slice(&crate::state_sync::encode_response(&resp));
+    let Ok(mut w) = sock.lock() else { return };
+    let _ = write_frame(&mut w, &f);
 }
 
 /// Serve one get-blocks request on `sock` from the local block log.
@@ -405,6 +439,8 @@ pub fn start(
                         Ok(frame) => {
                             if frame.first() == Some(&FRAME_GET_BLOCKS) {
                                 serve_get_blocks(&wsock, &data_dir, &frame);
+                            } else if frame.first() == Some(&FRAME_GET_STATE) {
+                                serve_get_state(&wsock, &data_dir, &frame);
                             } else if let Some(ev) = decode_event(&frame) {
                                 if !send_to_engine(&events, &inflight, ev) {
                                     return;

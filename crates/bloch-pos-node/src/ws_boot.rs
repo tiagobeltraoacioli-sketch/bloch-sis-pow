@@ -289,6 +289,11 @@ pub struct WsOutcome {
     /// Prominent messages the engine prints (collected so tests can assert
     /// on them instead of scraping stderr).
     pub warnings: Vec<String>,
+    /// The full admitted anchor artifact. `anchor_epoch`/`anchor_root` above
+    /// are its enforcement view; checkpoint-sync state download needs the
+    /// rest — above all `state_root`, which is what a downloaded state must
+    /// reproduce (`state_sync::import`).
+    pub checkpoint: WeakSubjectivityCheckpoint,
 }
 
 fn hex32(b: &[u8; 32]) -> String {
@@ -523,6 +528,7 @@ pub fn boot(
             anchor_root: anchor.block_root,
             anchor_is_hard: !has_local_finality,
             warnings,
+            checkpoint: anchor,
         }),
         Err(msg) => Err(msg),
     })
