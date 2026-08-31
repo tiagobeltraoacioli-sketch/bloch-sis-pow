@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# bloch-withdraw — the reference exchange withdrawal client for Genesis-4.
+#
+# NOT a wallet and NOT a node: a state machine that pays one withdrawal at
+# most once on a chain with no transaction ids, no fee-bump path, and a
+# mempool that drops without notice. The double-payment race it exists to
+# close is stated in DOUBLE-PAYMENT-RACE.md next to this file; the README is
+# the integration guide.
+#
+# Depends on the CONSENSUS crates on purpose: canonical transaction bytes,
+# txids, signing roots and the fee arithmetic all come from
+# bloch-pos-committee, and signatures from bloch-crypto — the same code the
+# validators run. A withdrawal client that re-implements any of those is a
+# client that can disagree with consensus about its own transaction.
+#
+# DISTRIBUTION: written to be handed to an exchange/partner as a file. Do not
+# publish it as a public artifact or web page (publish = false below is about
+# crates.io, like every crate in this workspace).
+
+[package]
+name = "bloch-withdraw"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "Reference withdrawal client for Bloch Genesis-4: idempotent by withdrawal id, double-payment-safe by input pinning, finality-aware crediting. UNAUDITED."
+publish = false
+
+[dependencies]
+# The live chain's consensus math: PosTransaction (canonical bytes, txid,
+# signing root), fee_market (gas, base-fee arithmetic), params.
+bloch-pos-committee = { path = "../bloch-pos-committee" }
+# The hybrid ML-DSA-65 ‖ Falcon-1024 suite + the bloch1q address type.
+bloch-crypto = { path = "../bloch-crypto" }
+sha3 = "0.10"
