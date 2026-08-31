@@ -141,6 +141,13 @@ pub struct Config {
     /// the server entirely.
     pub rpc_bind: String,
     pub rpc_port: Option<u16>,
+    /// Decline the node's own proposal duty when the head is more than this
+    /// many slots behind the wall clock. `None` — the default — disarms the
+    /// gate entirely and preserves the behaviour every deployed node has
+    /// today. See the gate itself in [`Engine::propose`] for what arming it
+    /// means and the coordination it requires; this is NOT a knob to flip
+    /// per-node on a whim.
+    pub max_propose_lag_slots: Option<u64>,
 }
 
 fn now_ms() -> u64 {
@@ -537,6 +544,9 @@ struct Engine {
     /// that kind of pool shrinkage apart from the epoch `retain`, which fork
     /// choice very much can see. See the argument there.
     fc_covered_removals: u64,
+    /// The proposal-lag gate's margin, from [`Config::max_propose_lag_slots`].
+    /// `None` disarms it. Read exactly once, in [`Engine::propose`].
+    max_propose_lag_slots: Option<u64>,
 }
 
 /// A fingerprint of the four values `lmd_ghost_head` reads, so `advance` can
@@ -970,6 +980,58 @@ impl Engine {
         let seed = Self::seed_for(&rolled, e);
         if schedule::proposer(&seed, slot, &roster) != Some(index) {
             return;
+        }
+
+        // ── The proposal-lag gate. OPT-IN, and consensus-affecting when
+        // armed: read this whole comment before wiring the flag anywhere. ──
+        //
+        // Why it exists: a node that stalls behind the live head keeps its
+        // wall clock, so its proposal slots keep arriving — and when one
+        // does, it proposes on its own stale head and pins itself (and every
+        // attester that follows it) to a minority branch. That is not a
+        // hypothetical: block f7568afa at slot 50010 was exactly this, a
+        // post-replay-stalled node extending a head hundreds of slots old.
+        // A proposal built that far behind the wall clock cannot win fork
+        // choice against a live branch; all it can do is make the fork map
+        // worse. Declining the duty is strictly better for the network AND
+        // for the proposer.
+        //
+        // Why it is a plain wall-clock margin and not the `Health` verdict:
+        // the veto must depend on nothing but the slot being proposed for
+        // and the head being proposed on — two values every observer of the
+        // resulting block can check — not on apply-timing local to this
+        // process. `slot` here IS the wall slot (the loop derives it from
+        // the clock), so `slot - head_slot` is "how stale is the head I am
+        // about to extend".
+        //
+        // Why the margin must dwarf the cadence gap: on a chain filling ~13%
+        // of its slots, a healthy head is routinely 5–30 slots old, so any
+        // margin below ~64 slots silences honest proposers during ordinary
+        // quiet stretches. The stall this defends against measured 480
+        // slots; there is no need to cut fine.
+        //
+        // **The liveness caveat that makes this flag-day material:** if the
+        // WHOLE network halts for longer than the margin, every armed node's
+        // head is stale and every armed node declines — the halt becomes
+        // self-sustaining until operators intervene (restart without the
+        // flag, or with a larger margin). A node cannot locally tell "I am
+        // behind the others" from "there are no others ahead of me". So the
+        // fleet must arm this together, with a margin chosen against the
+        // chain's worst observed quiet stretch, and the runbook for a full
+        // halt must say "disarm first". Shipping it armed-by-default,
+        // silently, is how a transient outage becomes a permanent one.
+        if let Some(margin) = self.max_propose_lag_slots {
+            let head_slot = self.head_slot_now();
+            let lag = slot.saturating_sub(head_slot);
+            if lag > margin {
+                eprintln!(
+                    "[slot {slot}] DECLINING proposal duty: head {} at slot {head_slot} is \
+                     {lag} slots behind the wall clock (margin {margin}). Proposing here \
+                     would extend a stale head onto a minority branch; syncing instead.",
+                    crate::codec::hex8(self.head_id().as_bytes()),
+                );
+                return;
+            }
         }
 
         // Attestations this block may carry: current epoch, not from the
@@ -1869,6 +1931,24 @@ impl Engine {
         now_ms().saturating_sub(self.manifest.genesis_time_ms) / self.manifest.slot_ms.max(1)
     }
 
+    /// The node's own liveness verdict, judged now.
+    ///
+    /// The head slot is read from `state` — the same value the slot loop's
+    /// `behind` predicate reads — and the silence from `last_applied_ms`,
+    /// which both `apply_canonical` and `do_reorg` refresh, so "applied a
+    /// block" here means the same event it means everywhere else in this
+    /// module. The verdict logic itself lives in [`rpc::Health::assess`],
+    /// pure and tested, so the RPC field and the periodic log line cannot
+    /// disagree.
+    fn health(&self) -> rpc::Health {
+        rpc::Health::assess(
+            self.wall_slot(),
+            self.state.slot(),
+            now_ms().saturating_sub(self.last_applied_ms),
+            self.manifest.slot_ms,
+        )
+    }
+
     /// Wall-clock seconds a slot corresponds to. Display only — derived from
     /// the manifest's cadence, never a consensus field (the header has no time).
     fn slot_timestamp_secs(&self, slot: u64) -> u64 {
@@ -1975,6 +2055,7 @@ impl Engine {
                 self.chain.len() as u64 - 1,
                 self.finalized_height(),
                 self.wall_slot(),
+                &self.health(),
                 self.state.validator_count(),
                 self.mempool.len(),
                 self.blocks.len(),
@@ -2114,6 +2195,87 @@ impl Engine {
 /// operator watching a stalled fleet gets an answer quickly, and long enough
 /// that the log of a multi-hour replay stays readable.
 const REPLAY_PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Cadence of the periodic liveness line. Thirty seconds — one slot at the
+/// production cadence — is often enough that an operator tailing the log sees
+/// the state within a slot, and quiet enough that a long stall does not bury
+/// the rest of the log under itself.
+const HEALTH_LINE_INTERVAL_MS: u64 = 30_000;
+
+/// Turns the stream of [`rpc::Health`] verdicts into the few log lines an
+/// operator actually needs: a periodic STALL line while stalled, a periodic
+/// sync-progress line while catching up, one RECOVERED line on the
+/// transition back, and *nothing* while healthy.
+///
+/// # Why this exists as a type
+///
+/// The single worst property of the post-replay stall was that a stalled
+/// node was **silent**: RPC answering, peers connected, and not one log line
+/// to distinguish "slow" from "dead" — an operator had to shell in and watch
+/// a file not grow for 75 seconds. The slot loop already wakes at least
+/// every 500ms whether or not anything arrives, so it is the one place
+/// guaranteed to keep running while the rest of the node is wedged
+/// elsewhere; this reporter is what it says when it wakes. It is a struct
+/// and not inline loop code so the cadence and edge-transitions are testable
+/// without running a node.
+struct HealthReporter {
+    last_line_ms: u64,
+    was_stalled: bool,
+}
+
+impl HealthReporter {
+    fn new(now_ms: u64) -> Self {
+        // Seeded with the boot time so the first line waits a full interval:
+        // a node that boots behind and starts syncing immediately should not
+        // open its log with an alarm.
+        HealthReporter { last_line_ms: now_ms, was_stalled: false }
+    }
+
+    /// The line to print now, if any. Pure in its inputs; the caller owns
+    /// the clock and the printing.
+    fn tick(&mut self, now_ms: u64, h: &rpc::Health, head_slot: u64, wall_slot: u64) -> Option<String> {
+        let due = now_ms.saturating_sub(self.last_line_ms) >= HEALTH_LINE_INTERVAL_MS;
+        if h.stalled {
+            if !due {
+                return None;
+            }
+            self.last_line_ms = now_ms;
+            self.was_stalled = true;
+            return Some(format!(
+                "[health] STALLED: head at slot {head_slot} is {} slots behind wall slot \
+                 {wall_slot} and no block has been applied for {}s. The node is NOT making \
+                 progress — peers and RPC being up does not mean it is syncing. If this line \
+                 repeats, restart the node and capture the data dir first.",
+                h.behind_by_slots,
+                h.ms_since_last_applied / 1000,
+            ));
+        }
+        if self.was_stalled {
+            // The recovery edge is announced immediately, not on the
+            // interval: the operator watching a stall needs the all-clear
+            // the moment it is true.
+            self.last_line_ms = now_ms;
+            self.was_stalled = false;
+            return Some(format!(
+                "[health] recovered: applying blocks again ({} slots behind wall slot {wall_slot})",
+                h.behind_by_slots,
+            ));
+        }
+        if h.syncing {
+            if !due {
+                return None;
+            }
+            self.last_line_ms = now_ms;
+            return Some(format!(
+                "[health] syncing: head at slot {head_slot}, {} slots behind wall slot \
+                 {wall_slot}, last block applied {}s ago",
+                h.behind_by_slots,
+                h.ms_since_last_applied / 1000,
+            ));
+        }
+        None
+    }
+}
 
 pub fn run(cfg: Config) -> io::Result<()> {
     let (mut manifest, digest) = Manifest::load(&cfg.genesis_path)?;
@@ -2303,8 +2465,20 @@ pub fn run(cfg: Config) -> io::Result<()> {
         ws_anchor_hard: false,
         ws_conflict_reported: false,
         fc_covered_removals: 0,
+        max_propose_lag_slots: cfg.max_propose_lag_slots,
         manifest,
     };
+    if let Some(margin) = cfg.max_propose_lag_slots {
+        // Armed is a fleet decision, not a default — say so where the
+        // operator who armed it will see it. The full argument is on the
+        // gate in `propose`.
+        println!(
+            "proposal-lag gate ARMED: this node declines its proposal duty when its head \
+             is more than {margin} slots behind the wall clock. If the WHOLE network halts \
+             for longer than that, armed nodes cannot restart it — disarm before recovering \
+             from a full outage."
+        );
+    }
 
     // ── Replay: restart returns to the same state, by re-running the same
     // transition over the same inputs. ──
@@ -2480,6 +2654,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
     let mut last_attested: u64 = engine.state.slot();
     let mut last_built: u64 = engine.state.slot();
     let mut last_sync_req: u64 = 0;
+    let mut health_report = HealthReporter::new(now_ms());
 
     loop {
         let now = now_ms();
@@ -2527,6 +2702,32 @@ pub fn run(cfg: Config) -> io::Result<()> {
         if !in_grace && now >= propose_at && slot > last_built {
             engine.propose(slot);
             last_built = slot;
+        }
+
+        // ── Liveness self-report ──
+        //
+        // Runs on the slot loop because the slot loop is the thread that
+        // provably keeps waking (recv_timeout ≤ 500ms) even while the rest
+        // of the node is wedged: in the measured post-replay stall the
+        // engine thread still answered RPC, so it still reaches this line —
+        // and a node that is behind and not advancing SAYS SO instead of
+        // logging nothing for hours. The verdict is `Engine::health`, the
+        // same one `getchaininfo` serves, so the log and the RPC never
+        // disagree about whether this node is making progress.
+        {
+            let h = rpc::Health::assess(
+                slot,
+                engine.state.slot(),
+                now.saturating_sub(engine.last_applied_ms),
+                slot_ms,
+            );
+            if let Some(line) = health_report.tick(now, &h, engine.state.slot(), slot) {
+                if h.stalled {
+                    eprintln!("{line}");
+                } else {
+                    println!("{line}");
+                }
+            }
         }
 
         // Sync when behind or when a stored branch has holes. Rate-limited;
@@ -3849,6 +4050,7 @@ mod transfer_v2_end_to_end {
             ws_anchor_hard: false,
             ws_conflict_reported: false,
             fc_covered_removals: 0,
+            max_propose_lag_slots: None,
         }
     }
 
@@ -4147,6 +4349,7 @@ mod perf_support {
             // offset the very first comparison against a pool that really is
             // empty.
             fc_covered_removals: 0,
+            max_propose_lag_slots: None,
         };
         (engine, TestDir(dir))
     }
@@ -4255,6 +4458,16 @@ mod bench {
 
     /// The Genesis-3 carryover's output count, per `CARRYOVER-SNAPSHOT.md`.
     const MAINNET_EUTXOS: u32 = 452_133;
+
+    /// A fixed healthy verdict for the `chain_info_json` benches: the health
+    /// object is a handful of integer fields either way, so its value is
+    /// irrelevant to what these measure.
+    const HEALTHY: crate::rpc::Health = crate::rpc::Health {
+        behind_by_slots: 0,
+        ms_since_last_applied: 0,
+        syncing: false,
+        stalled: false,
+    };
 
     fn mainnet_sized_state(n: u32) -> CommittedState {
         let entries: Vec<EutxoEntry> = (0..n)
@@ -4434,14 +4647,14 @@ mod bench {
         let before = |st: &CommittedState| -> u128 {
             let t = Instant::now();
             let root = st.state_root();
-            let v = crate::rpc::chain_info_json(st, &head, root, 0, Some(0), 0, 1, 0, 1);
+            let v = crate::rpc::chain_info_json(st, &head, root, 0, Some(0), 0, &HEALTHY, 1, 0, 1);
             let us = t.elapsed().as_micros();
             std::hint::black_box(v);
             us
         };
         let after = |st: &CommittedState| -> u128 {
             let t = Instant::now();
-            let v = crate::rpc::chain_info_json(st, &head, header_root, 0, Some(0), 0, 1, 0, 1);
+            let v = crate::rpc::chain_info_json(st, &head, header_root, 0, Some(0), 0, &HEALTHY, 1, 0, 1);
             let us = t.elapsed().as_micros();
             std::hint::black_box(v);
             us
@@ -4481,10 +4694,10 @@ mod bench {
         // Byte-identical, which is what makes this transport-only. Asserted
         // rather than printed: a bench that quietly changed the answer would
         // be measuring the wrong thing to begin with.
-        let a = crate::rpc::chain_info_json(&st, &head, header_root, 0, Some(0), 0, 1, 0, 1);
+        let a = crate::rpc::chain_info_json(&st, &head, header_root, 0, Some(0), 0, &HEALTHY, 1, 0, 1);
         let b = {
             let root = st.state_root();
-            crate::rpc::chain_info_json(&st, &head, root, 0, Some(0), 0, 1, 0, 1)
+            crate::rpc::chain_info_json(&st, &head, root, 0, Some(0), 0, &HEALTHY, 1, 0, 1)
         };
         assert_eq!(
             a.to_string(),
@@ -5426,6 +5639,7 @@ mod duty_view_anchor {
             ws_anchor_hard: false,
             ws_conflict_reported: false,
             fc_covered_removals: 0,
+            max_propose_lag_slots: None,
         };
         (engine, dir)
     }
@@ -5495,5 +5709,171 @@ mod duty_view_anchor {
             partition_caught_up.len()
         );
         assert!(moved > 0);
+    }
+}
+
+/// The proposal-lag gate: defence #3 against the post-replay sync stall.
+///
+/// The incident being defended: a node that stalled ~480 slots behind kept
+/// its wall clock, its proposal slot arrived, and it proposed on its stale
+/// head (block f7568afa, slot 50010) — pinning itself and its attesters to a
+/// minority branch. Armed, the gate declines that duty; disarmed (the
+/// default), nothing changes. These tests drive the REAL `propose` path via
+/// `perf_support::proposing_engine`, so a decline asserted here is a block
+/// that genuinely was not built, not a mock's opinion.
+#[cfg(test)]
+mod proposal_lag_gate_tests {
+    use super::*;
+
+    #[test]
+    fn disarmed_a_stale_proposer_still_proposes() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        assert_eq!(
+            engine.max_propose_lag_slots, None,
+            "OFF must be the default: arming the gate is an explicit, coordinated act"
+        );
+        engine.propose(500); // head at genesis slot 0 → 500 slots stale
+        assert_eq!(
+            engine.chain.len(),
+            2,
+            "with the gate disarmed, today's deployed behaviour is unchanged: \
+             the stale proposal is still built"
+        );
+    }
+
+    #[test]
+    fn armed_a_proposer_past_the_margin_declines() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        engine.max_propose_lag_slots = Some(240);
+        engine.propose(500);
+        assert_eq!(
+            engine.chain.len(),
+            1,
+            "500 slots of lag past a 240-slot margin must produce NO block — \
+             this is the f7568afa case, refused"
+        );
+        assert!(
+            engine.blocks.is_empty(),
+            "declining means the block was never built, not built and discarded"
+        );
+    }
+
+    #[test]
+    fn armed_a_proposer_at_or_inside_the_margin_proposes() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        engine.max_propose_lag_slots = Some(240);
+        engine.propose(240); // lag exactly the margin: not PAST it, so allowed
+        assert_eq!(
+            engine.chain.len(),
+            2,
+            "lag equal to the margin is inside the gate — `>` not `>=`, so an \
+             ordinary quiet stretch exactly at the margin does not silence a proposer"
+        );
+    }
+
+    #[test]
+    fn the_gate_judges_head_lag_not_absolute_slot_numbers() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        engine.max_propose_lag_slots = Some(240);
+        engine.propose(200); // lag 200, inside the margin: proposes, head moves to slot 200
+        assert_eq!(engine.chain.len(), 2);
+        engine.propose(430); // lag now 230 from the NEW head: still allowed
+        assert_eq!(
+            engine.chain.len(),
+            3,
+            "a node whose head keeps up keeps proposing at any absolute slot — \
+             the veto is about staleness, never about how old the chain is"
+        );
+    }
+}
+
+/// The periodic liveness line: defence #1 against the post-replay sync stall.
+///
+/// The property under test is the one the incident exposed by its absence:
+/// a node that is behind and not advancing SAYS SO, repeatedly, while a
+/// healthy or merely quiet node says nothing. The reporter is driven with a
+/// hand clock here; the slot loop drives it with the real one.
+#[cfg(test)]
+mod health_reporter_tests {
+    use super::*;
+
+    const SLOT_MS: u64 = 30_000;
+
+    /// The measured stall: far behind, minutes of apply-silence.
+    fn stalled() -> rpc::Health {
+        rpc::Health::assess(1_000, 100, 10 * SLOT_MS, SLOT_MS)
+    }
+    /// The same lag, but blocks applied seconds ago: catching up.
+    fn syncing() -> rpc::Health {
+        rpc::Health::assess(1_000, 100, 1_000, SLOT_MS)
+    }
+    /// Keeping up with the wall clock.
+    fn healthy() -> rpc::Health {
+        rpc::Health::assess(105, 100, 1_000, SLOT_MS)
+    }
+
+    #[test]
+    fn a_stalled_node_speaks_on_the_interval_and_keeps_speaking() {
+        let mut r = HealthReporter::new(0);
+        assert!(
+            r.tick(500, &stalled(), 100, 1_000).is_none(),
+            "inside the first interval the node holds its tongue — a boot into \
+             catch-up must not open the log with an alarm"
+        );
+        let line = r
+            .tick(HEALTH_LINE_INTERVAL_MS, &stalled(), 100, 1_000)
+            .expect("one interval in, a stalled node must say so");
+        assert!(line.contains("STALLED"), "the operator greps for this word: {line}");
+        assert!(line.contains("900 slots behind"), "the line carries the lag: {line}");
+        assert!(
+            r.tick(HEALTH_LINE_INTERVAL_MS + 400, &stalled(), 100, 1_000).is_none(),
+            "no re-print inside the interval — a stall must not bury the log under itself"
+        );
+        assert!(
+            r.tick(2 * HEALTH_LINE_INTERVAL_MS, &stalled(), 100, 1_000).is_some(),
+            "and it repeats every interval for as long as the stall lasts — \
+             periodic, not once, is what lets `tail -f` distinguish dead from slow"
+        );
+    }
+
+    #[test]
+    fn recovery_is_announced_immediately_and_exactly_once() {
+        let mut r = HealthReporter::new(0);
+        r.tick(HEALTH_LINE_INTERVAL_MS, &stalled(), 100, 1_000)
+            .expect("enter the stalled state first");
+        let line = r
+            .tick(HEALTH_LINE_INTERVAL_MS + 1, &syncing(), 150, 1_000)
+            .expect("the all-clear must not wait out the interval");
+        assert!(line.contains("recovered"), "{line}");
+        assert!(
+            r.tick(HEALTH_LINE_INTERVAL_MS + 2, &healthy(), 999, 1_000).is_none(),
+            "recovered is an edge, not a state — it is said once"
+        );
+    }
+
+    #[test]
+    fn a_syncing_node_reports_progress_periodically() {
+        let mut r = HealthReporter::new(0);
+        let line = r
+            .tick(HEALTH_LINE_INTERVAL_MS, &syncing(), 100, 1_000)
+            .expect("a node two epochs behind owes the operator a progress line");
+        assert!(line.contains("syncing"), "{line}");
+        assert!(!line.contains("STALLED"), "progress must never be dressed as a stall");
+        assert!(
+            r.tick(HEALTH_LINE_INTERVAL_MS + 10, &syncing(), 120, 1_000).is_none(),
+            "progress lines keep the same cadence discipline as stall lines"
+        );
+    }
+
+    #[test]
+    fn a_healthy_node_says_nothing_ever() {
+        let mut r = HealthReporter::new(0);
+        for i in 0..10u64 {
+            assert!(
+                r.tick(i * HEALTH_LINE_INTERVAL_MS, &healthy(), 100, 105).is_none(),
+                "a node keeping up must not chat — silence stays meaningful only \
+                 if health never spends it"
+            );
+        }
     }
 }
