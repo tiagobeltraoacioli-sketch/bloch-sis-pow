@@ -2894,6 +2894,30 @@ pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'s
             "exits are not accepted: the Exit message is not authenticated, \
              so anyone could retire any validator irreversibly",
         ),
+        // Withdraw (tag 0x07): admitted from its flag day, refused before it —
+        // wall-clock epoch on this side of the mempool door, committed epoch
+        // on the consensus side, the same split argued at the TransferV2 arm.
+        //
+        // Post-flag-day it is admitted with NO further stateless check, and
+        // unlike Exit that is sound: the message is unauthenticated by DESIGN.
+        // It carries no choice — the payout address was fixed at deposit time
+        // and the amount is the committed residue — so the worst an
+        // unauthenticated submitter can do is pay a ripe bond to the one
+        // address its owner already named. Every stateful reason it might not
+        // apply (not exited, delay not elapsed, already paid, slashed lock
+        // still running) lives in committed state this function deliberately
+        // does not read; that class reaches the mempool and dies in the
+        // proposer's probe, exactly like a transfer with unknown inputs.
+        PosTransaction::Withdraw { .. } => {
+            if wall_epoch < bloch_pos_committee::params::WITHDRAWAL_ACTIVATION_EPOCH {
+                return Err(
+                    "withdrawals (tag 0x07) are not active: the transaction ships behind \
+                     a flag day (WITHDRAWAL_ACTIVATION_EPOCH) that this chain has not \
+                     reached",
+                );
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
@@ -3008,6 +3032,21 @@ mod forkchoice_tests {
             admissible(&delegate, 0).is_err(),
             "a delegation must not be admitted either"
         );
+    }
+
+    /// Withdrawals (tag 0x07) ship behind `WITHDRAWAL_ACTIVATION_EPOCH =
+    /// u64::MAX`: refused at the mempool door until the flag day, admitted
+    /// with no further stateless check from it — the message is
+    /// unauthenticated by design (it carries no choice; every stateful
+    /// refusal lives in committed state and bites at the proposer's probe).
+    #[test]
+    fn withdrawals_are_refused_until_the_flag_day() {
+        let w = PosTransaction::Withdraw { validator: 0 };
+        let err = admissible(&w, 0).expect_err("inert until the flag day");
+        assert!(err.contains("not active"), "the refusal must say why: {err}");
+        // The epoch just below the gate still refuses; the gate itself admits.
+        assert!(admissible(&w, u64::MAX - 1).is_err());
+        assert!(admissible(&w, u64::MAX).is_ok());
     }
 
     /// The transfer guard that already existed, pinned so the refactor into a
