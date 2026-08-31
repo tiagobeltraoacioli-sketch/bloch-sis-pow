@@ -186,6 +186,7 @@ fn eutxos(n: u32, owned: u32, owner_script: [u8; 32]) -> Vec<EutxoEntry> {
             vout: i % 4,
             value: 8_400_000_000u64.wrapping_add(i as u64),
             script_hash: if i < owned { owner_script } else { h32(0xF000_0000 ^ i as u64) },
+            unlock_epoch: 0,
         })
         .collect()
 }

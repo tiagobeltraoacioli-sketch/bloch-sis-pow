@@ -287,6 +287,47 @@ pub const LEAKED_ROSTER_ACTIVATION_EPOCH: u64 = 1400;
 /// standing reason.
 pub const TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH: u64 = 800;
 
+/// Flag day for consensus vesting locks — SHIPS INERT (`u64::MAX`), and the
+/// decision to arm it is not this constant's to make.
+///
+/// # What activates
+///
+/// At the epoch boundary that OPENS this epoch, `close_epoch` runs the
+/// one-time seeding ([`crate::vesting`]): each genesis allocation outpoint
+/// that is **still unspent** is replaced, in committed state, by tranche
+/// outputs whose `unlock_epoch`s follow the tokenomics_v4 vesting curves
+/// (founder 2y cliff + 8y linear; team 18m + 36m; VC 12m + 24m; marketing
+/// 25% TGE + 24m; liquidity is liquid by design and is not seeded). From
+/// that block on, both transfer arms refuse to spend an output before its
+/// `unlock_epoch` ([`crate::interfaces::TransferReject::VestingLocked`]).
+///
+/// # Why this is a fork point (and the enforcement is not)
+///
+/// The lock field serializes into an entry's leaf only when nonzero
+/// (`EutxoEntry::serialize`), so merely shipping this code moves no root and
+/// the spend check is vacuously true pre-activation — no entry can carry a
+/// nonzero lock before the seeding runs. The SEEDING is the discontinuity:
+/// it rewrites outpoints, so the state root at the boundary differs from
+/// what an old binary computes. "The fleet is on the new binary" is a
+/// precondition of lowering this, exactly as for
+/// [`TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH`] above.
+///
+/// # The go/no-go precondition, and its measured answer
+///
+/// Seeding can only lock what is still there. The runbook precondition
+/// (rpc.rs, `TxOut`) is that the allocation outpoints are unspent when the
+/// rule arms. **Measured 2026-08-31 against three fleet nodes (consistent
+/// head, slot 51,184, epoch 1,599): all five allocation outpoints are
+/// already SPENT** — `gettxout` answers `unspent: false` for every one, and
+/// the founder script's balance stands at ~37.94B BLOCH against the ~56.05B
+/// it opened with. Arming this flag day on the current chain therefore seeds
+/// nothing and locks nothing; the honest uses left are (a) a future genesis
+/// whose manifest carries real `unlock_epoch`s, and (b) a negotiated
+/// re-commitment in which the buckets are first RETURNED to fresh outpoints
+/// whose txids are pinned here before arming. Neither is a unilateral code
+/// change, which is why the constant ships at `u64::MAX`.
+pub const VESTING_LOCK_ACTIVATION_EPOCH: u64 = u64::MAX;
+
 /// Flag day for the 512 KiB block payload cap
 /// ([`crate::fee_market::MAX_BLOCK_TX_BYTES_V2`]).
 ///

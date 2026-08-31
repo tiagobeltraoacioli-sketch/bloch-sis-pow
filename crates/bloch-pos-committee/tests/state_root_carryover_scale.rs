@@ -214,6 +214,7 @@ fn final_entry(i: u32) -> EutxoEntry {
         vout: i % 4,
         value: 8_400_000_000u64.wrapping_add(i as u64),
         script_hash: h32(0xF000_0000 ^ i as u64),
+        unlock_epoch: 0,
     }
 }
 
@@ -225,6 +226,7 @@ fn ghost_entry(i: u32) -> EutxoEntry {
         vout: 3 - (i % 4),
         value: 1_000u64.wrapping_add(i as u64),
         script_hash: h32(0x0BAD_0000 ^ i as u64),
+        unlock_epoch: 0,
     }
 }
 

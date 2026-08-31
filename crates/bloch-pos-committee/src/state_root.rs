@@ -1003,6 +1003,22 @@ pub struct EutxoEntry {
     pub value: u64,
     /// SHA3-256 of the locking script / eUTXO datum.
     pub script_hash: [u8; 32],
+    /// First epoch at which this output may be spent; `0` means liquid.
+    ///
+    /// This is the field that makes a vesting schedule CONSENSUS rather than
+    /// documentation. Before 2026-08-31 the manifest's `unlock_epoch` was
+    /// hashed into the allocation txid and then dropped — no lock ever
+    /// reached committed state, `apply_transfer` had nothing to check, and
+    /// three published documents claimed otherwise. Now the value lives here,
+    /// in the entry the state root commits, and both transfer arms refuse a
+    /// spend while `epoch < unlock_epoch` ([`crate::interfaces::TransferReject::VestingLocked`]).
+    ///
+    /// Only two sources may set it nonzero: a genesis manifest allocation,
+    /// and the flag-day seeding in `close_epoch`
+    /// ([`crate::params::VESTING_LOCK_ACTIVATION_EPOCH`]). Transfers always
+    /// create liquid outputs — a lock is issued by the chain's opening terms,
+    /// never minted by a spender.
+    pub unlock_epoch: u64,
 }
 
 impl EutxoEntry {
@@ -1012,12 +1028,26 @@ impl EutxoEntry {
         k.extend_from_slice(&self.vout.to_le_bytes());
         k
     }
+    /// Canonical bytes the leaf hash commits.
+    ///
+    /// `unlock_epoch` is appended ONLY when nonzero. That asymmetry is
+    /// load-bearing, not thrift: every output that exists on the live chain
+    /// today is liquid, and this keeps each of their leaves byte-identical to
+    /// the pre-lock encoding — the committed state root does not move for any
+    /// state that carries no lock, so the field lands without a root
+    /// discontinuity and only the flag-day SEEDING (which creates locked
+    /// entries) is a fork point. The two forms cannot collide: they differ in
+    /// length (76 vs 84 bytes) under the same `MARK_VALUE` domain, and the
+    /// bytes are only ever hashed, never parsed back.
     fn serialize(&self) -> Vec<u8> {
-        let mut s = Vec::with_capacity(76);
+        let mut s = Vec::with_capacity(84);
         s.extend_from_slice(&self.txid);
         s.extend_from_slice(&self.vout.to_le_bytes());
         s.extend_from_slice(&self.value.to_le_bytes());
         s.extend_from_slice(&self.script_hash);
+        if self.unlock_epoch != 0 {
+            s.extend_from_slice(&self.unlock_epoch.to_le_bytes());
+        }
         s
     }
 }
@@ -1849,6 +1879,44 @@ pub fn total_effective_stake(validators: &[ValidatorRecord]) -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The lock field lands without moving any liquid leaf.** A zero
+    /// `unlock_epoch` serializes to the exact 76-byte pre-lock encoding —
+    /// which is what lets the field ship without a root discontinuity on a
+    /// chain where every output is liquid — and a nonzero one both extends
+    /// the bytes and moves the leaf, which is what makes the lock committed
+    /// rather than advisory. If the zero case ever grows to 84 bytes, every
+    /// node that upgrades computes a different root for the SAME state, at
+    /// the next block, with no flag day: that is the regression this pins.
+    #[test]
+    fn a_liquid_entry_hashes_exactly_as_it_did_before_locks_existed() {
+        let liquid = EutxoEntry {
+            txid: [0xAB; 32],
+            vout: 3,
+            value: 8_400 * 100_000_000,
+            script_hash: [0xCD; 32],
+            unlock_epoch: 0,
+        };
+        // The pre-lock encoding, byte for byte.
+        let mut legacy = Vec::with_capacity(76);
+        legacy.extend_from_slice(&liquid.txid);
+        legacy.extend_from_slice(&liquid.vout.to_le_bytes());
+        legacy.extend_from_slice(&liquid.value.to_le_bytes());
+        legacy.extend_from_slice(&liquid.script_hash);
+        assert_eq!(liquid.serialize(), legacy);
+
+        // A lock is IN the leaf: same coin, different unlock, different
+        // committed bytes and a different leaf hash — and two different
+        // nonzero locks also differ from each other.
+        let locked = EutxoEntry { unlock_epoch: 7, ..liquid.clone() };
+        let later = EutxoEntry { unlock_epoch: 8, ..liquid.clone() };
+        assert_eq!(locked.serialize().len(), 84);
+        assert_ne!(eutxo_leaf(&liquid).1, eutxo_leaf(&locked).1);
+        assert_ne!(eutxo_leaf(&locked).1, eutxo_leaf(&later).1);
+        // The tree KEY is the outpoint alone, unlock or no unlock: a lock
+        // changes what is committed at the slot, never which slot.
+        assert_eq!(eutxo_leaf(&liquid).0, eutxo_leaf(&locked).0);
+    }
 
     fn key(n: u8) -> [u8; 32] {
         // Spread test keys through the whole key space via the real
@@ -2834,6 +2902,7 @@ mod tests {
                 vout: i as u32,
                 value: 840_000_000_000 + i as u64,
                 script_hash: val(i),
+                unlock_epoch: 0,
             })
             .collect();
         let validators: Vec<ValidatorRecord> = (0..4u8)
@@ -2998,7 +3067,13 @@ mod tests {
             .map(|i| {
                 let mut txid = [0u8; 32];
                 txid[..4].copy_from_slice(&i.to_le_bytes());
-                EutxoEntry { txid, vout: 0, value: 1_000 + i as u64, script_hash: [7u8; 32] }
+                EutxoEntry {
+                    txid,
+                    vout: 0,
+                    value: 1_000 + i as u64,
+                    script_hash: [7u8; 32],
+                    unlock_epoch: 0,
+                }
             })
             .collect();
 
@@ -3392,6 +3467,7 @@ mod tests {
                 vout: 0,
                 value: u64::MAX - 1,
                 script_hash: val(i),
+                unlock_epoch: 0,
             })
             .collect();
         let expected = 3u128 * (u64::MAX as u128 - 1);

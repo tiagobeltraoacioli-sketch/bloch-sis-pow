@@ -599,9 +599,18 @@ fn genesis_mainnet(args: &[String]) {
         exit(1);
     }
 
-    // The five vested buckets, from the constants. Script hashes are the
-    // founder's carryover address under the same zero-extension rule the
-    // carryover uses — one ownership convention on the chain, not two.
+    // The five allocation buckets, from the constants — LIQUID AT GENESIS,
+    // all of them: every `unlock_epoch` below is 0, which is what the live
+    // mainnet manifest committed and what the chain has enforced ever since
+    // (nothing, by the manifest's own terms). Calling them "vested" here was
+    // the generator's contribution to a three-document fiction; the vesting
+    // curves live in tokenomics_v4 and, as of 2026-08-31, a manifest CAN
+    // carry real unlock epochs that consensus enforces
+    // (`EutxoEntry::unlock_epoch`, `TransferReject::VestingLocked`) — this
+    // one just doesn't, and regenerating it does not change the running
+    // chain. Script hashes are the founder's carryover address under the
+    // same zero-extension rule the carryover uses — one ownership convention
+    // on the chain, not two.
     let alloc = |purpose: u8, bloch: u128, unlock_epoch: u64| genesis::GenesisAllocation {
         purpose,
         script_hash: {

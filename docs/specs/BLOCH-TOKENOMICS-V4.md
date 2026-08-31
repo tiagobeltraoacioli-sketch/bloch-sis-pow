@@ -521,6 +521,13 @@ founder. Where V4 now lands:
 | Insiders total | 94.3% | 25.0% liquid (Foundation) + 16.89% | 55.97% |
 | Validators (earned) | — | 0%, growing | 43.03% |
 
+> *Corrected 2026-08-31: the "locked" row describes the intended schedule
+> (since revised to a 2-yr cliff + 8-yr vest), not the launched chain — the
+> mainnet manifest committed the founder bucket, like every bucket, at
+> `unlock_epoch: 0`, and no lock was enforced by the node in any case. On
+> the chain as launched the founder's spendable share at genesis was
+> 16.89% + 10.00%, not 16.89%. See §8.2's status note.*
+
 An earlier draft cliffed the founder's whole position and could claim **no
 spendable founder stake at genesis** — a consensus-enforced answer, and a much
 stronger one than this. Carrying the balance across liquid gave it up: the
@@ -927,6 +934,21 @@ Six allocations must appear in the genesis block as consensus-recognised
 outputs with their unlock schedules enforced by consensus, not by promise —
 the same standard §4.1 of the migration design applies to the old premine. A
 vesting schedule that lives in a spreadsheet is not a vesting schedule.
+
+> **Status, corrected 2026-08-31 — the launched chain did not meet this
+> requirement.** The mainnet manifest committed five allocation outputs
+> (founder 10B, VC 10B, team 10B, marketing 4B, liquidity 5B BLOCH), all at
+> the founder's script hash and all with `unlock_epoch: 0` — liquid from
+> block 0 by the manifest's own terms. Independently, the node never
+> enforced the field: it perturbed the allocation txid and was discarded, so
+> even a nonzero value would have locked nothing. By this section's own
+> standard, the launched schedule was a spreadsheet schedule. Consensus
+> enforcement exists as of 2026-08-31 (`EutxoEntry::unlock_epoch` in the
+> committed state root, `TransferReject::VestingLocked` in both transfer
+> arms, flag-day seeding behind `params::VESTING_LOCK_ACTIVATION_EPOCH`,
+> shipped inert) — but on 2026-08-31 all five allocation outpoints were
+> measured already spent, so on this chain the machinery can bind only
+> outputs deliberately returned to pinned outpoints, or a future genesis.
 
 ---
 

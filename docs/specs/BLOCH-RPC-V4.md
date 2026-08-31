@@ -294,17 +294,30 @@ These are public commitments; the RPC is where they become checkable.
   hybrid signatures are not returned (they are prunable after finality,
   migration spec §6.5.1).
 
-### 4.6 Open — vesting-lock visibility (`getvestingstatus`)
+### 4.6 Vesting-lock visibility — decided, and corrected
 
-With taint dissolved, the only coin-class question left is **vesting**:
-founder/VC/team/marketing genesis outputs carry consensus vesting locks
-(Tokenomics V4 §7), and a wallet should be able to ask "is this output
-spendable now, and if not, when?" before building a doomed transaction.
-Whether this is a dedicated `getvestingstatus [outpoint | address]` or extra
-fields on `getutxos` is an OpenAPI-freeze decision; the need itself is pinned
-by interfaces doc §4.6 (vesting locks are what replaced the taint set's
-eligibility role). Decide before the freeze; do not resurrect the word
-"taint" in the API.
+**CORRECTED 2026-08-31.** This section used to state that
+"founder/VC/team/marketing genesis outputs carry consensus vesting locks
+(Tokenomics V4 §7)". They do not, and never have, in two independent ways:
+
+1. **The code did not enforce locks.** The manifest's `unlock_epoch` was
+   committed into each allocation's txid preimage and then discarded — the
+   committed `EutxoEntry` had no lock field and the transfer path had no
+   epoch gate. As of 2026-08-31 the machinery exists (`EutxoEntry::
+   unlock_epoch` committed in the state root; `TransferReject::VestingLocked`
+   in both transfer arms; flag-day seeding behind
+   `params::VESTING_LOCK_ACTIVATION_EPOCH`, shipped inert at `u64::MAX`).
+2. **The live manifest never asked for locks.** `genesis/mainnet.manifest`
+   commits all five buckets (founder 10B, VC 10B, team 10B, marketing 4B,
+   liquidity 5B — 39B BLOCH) at `unlock_epoch: 0`, all at the founder's
+   script hash. Every bucket has been liquid since block 0, and all five
+   allocation outpoints were measured **already spent** on 2026-08-31
+   (`gettxout` on three fleet nodes at a consistent head, epoch 1,599).
+
+The visibility decision itself: extra field, not a new method. `getutxos` /
+`listunspent` / `gettxout` now return `unlock_epoch` (0 = liquid) on every
+UTXO object, so a wallet learns "spendable now, and if not, when" from the
+call it already makes. Do not resurrect the word "taint" in the API.
 
 ---
 

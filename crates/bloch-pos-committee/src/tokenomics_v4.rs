@@ -279,6 +279,16 @@ pub const EMISSION_SLOTS: u64 = EMISSION_YEARS * SLOTS_PER_YEAR;
 /// is locked for ten years" would be wrong in both directions — the grant is,
 /// the carryover never was.
 ///
+/// **CORRECTED 2026-08-31: on the launched chain, the grant does not wait
+/// either.** These curves had no consensus callers until the `vesting`
+/// module landed — nothing read them into state, and the live manifest
+/// committed every bucket at `unlock_epoch: 0`, so the founder grant has
+/// been as liquid as the carryover since block 0 and its allocation
+/// outpoint was measured spent on 2026-08-31. This schedule binds a chain
+/// only through `crate::vesting` (a locked genesis manifest, or the
+/// flag-day seeding while the outpoints still exist); on the current chain
+/// it is a published intention, not an enforced rule.
+///
 /// Ten years still sits at the long end of market practice, where three to four
 /// is typical.
 pub const FOUNDER_CLIFF_SLOTS: u64 = 2 * SLOTS_PER_YEAR;

@@ -26,7 +26,7 @@ use bloch_pos_committee::transition::GenesisValidator;
 // ─── Fixtures ───────────────────────────────────────────────────────────────
 
 fn entry(txid: u8, vout: u32, value: u64, script: u8) -> EutxoEntry {
-    EutxoEntry { txid: [txid; 32], vout, value, script_hash: [script; 32] }
+    EutxoEntry { txid: [txid; 32], vout, value, script_hash: [script; 32], unlock_epoch: 0 }
 }
 
 /// A committed genesis state with two validators and four outputs across two
@@ -431,10 +431,13 @@ fn getutxos_lists_the_outputs_and_reports_truncation() {
         other => panic!("utxos must be an array, got {other:?}"),
     };
     assert_eq!(entries.len(), 3);
-    // Every returned output belongs to the requested script hash.
+    // Every returned output belongs to the requested script hash — and
+    // carries its vesting lock (§4.6 visibility: 0 = liquid, which is what
+    // these fixtures are). A wallet must never have to guess spendability.
     for e in &entries {
         assert_eq!(e.get("script_hash").unwrap().as_str(), Some(crate::codec::hex32(&[0xAB; 32]).as_str()));
         assert!(e.get("txid").is_some() && e.get("vout").is_some());
+        assert_eq!(e.get("unlock_epoch").unwrap().as_u64(), Some(0));
     }
 
     // A short page says it was cut rather than pretending it was the whole set.

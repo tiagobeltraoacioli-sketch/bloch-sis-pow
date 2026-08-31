@@ -62,6 +62,7 @@ fn eutxos(n: u32) -> Vec<EutxoEntry> {
             vout: i % 4,
             value: 8_400_000_000u64.wrapping_add(i as u64),
             script_hash: h32(0xF000_0000 ^ i as u64),
+            unlock_epoch: 0,
         })
         .collect()
 }
@@ -296,6 +297,7 @@ fn perf_state_root_breakdown() {
                     vout: i,
                     value: 1_000,
                     script_hash: h32(0x5151 + i as u64),
+                    unlock_epoch: 0,
                 });
                 t2.insert(k, v);
             }
@@ -646,6 +648,7 @@ fn incremental_path() {
                 vout: i,
                 value: 1_000,
                 script_hash: h32(0x7171 + i as u64),
+                unlock_epoch: 0,
             })
         })
         .collect();

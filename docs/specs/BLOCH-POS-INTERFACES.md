@@ -282,7 +282,14 @@ decision, 2026-08-11): **the taint set does not survive into Genesis-4, and it
 is not repurposed.** It starts empty and stays empty — a carried-over balance
 that is liquid is also stakeable, the founder's included, and the vesting
 locks on the founder/VC/team/marketing allocations are enforced as
-spendability of the genesis outputs, not as a coin class. For this contract
+spendability of the genesis outputs, not as a coin class. *(Corrected
+2026-08-31: "are enforced" was the design, not the chain. The launched
+manifest committed every allocation at `unlock_epoch: 0` and, until
+2026-08-31, the field never reached committed state anyway — no lock has
+ever bound these outputs, and all five allocation outpoints were measured
+spent that day. The enforcement now exists as described —
+`EutxoEntry::unlock_epoch`, refused as `TransferReject::VestingLocked` — for
+any chain whose genesis or flag-day seeding actually sets it.)* For this contract
 that means: conforming `StakeEligibility` implementations never return
 `Tainted` (the variant stays, frozen and inert), `StateRoots::taint_root` is a
 reserved all-zero slot, and `DepositReject::TaintedInput` is unreachable in
