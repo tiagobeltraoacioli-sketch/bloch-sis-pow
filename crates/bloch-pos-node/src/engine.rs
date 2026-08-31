@@ -4983,6 +4983,7 @@ mod rolled_memo_tests {
                     vout: 0,
                     value: 1_000 + u64::from(i),
                     script_hash: [7u8; 32],
+                    unlock_epoch: 0,
                 }
             })
             .collect();

@@ -4329,6 +4329,7 @@ mod tests {
             vout: 0,
             value: 1_000 + i as u64,
             script_hash: [7u8; 32],
+            unlock_epoch: 0,
         }
     }
 
