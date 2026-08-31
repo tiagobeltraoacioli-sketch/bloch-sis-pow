@@ -263,17 +263,22 @@ mod state_cell {
     /// a node whose head lags its wall clock. The memo is dropped whole on
     /// every applied block anyway, so this bounds a burst, not a lifetime.
     ///
-    /// **It is also a memory budget, and it is the larger of the two this
-    /// module spends.** Each entry is a whole `CommittedState`, structurally
-    /// sharing nothing with the live one, so a full memo is `MEMO_CAP` extra
-    /// copies — the same unit [`REORG_STATE_WINDOW`] is counted in, four
-    /// times over. It is transient where the retention window is steady
-    /// state, but the peak is what an OOM kills on.
+    /// **It is also a memory budget, and it used to be the larger of the two
+    /// this module spends.** Each entry is a whole `CommittedState` — but
+    /// since 2026-08-31 a rolled state *shares its eUTXO map* with the state
+    /// it was rolled from (`close_epoch` never writes to the ledger, so the
+    /// `Arc` in `EutxoSet` is never unshared on this path), and the eUTXO map
+    /// was almost all of the 60 MB the measurement below records. A memo
+    /// entry now costs the per-epoch fields — registry, participation,
+    /// finality view — not the ledger. The figures below predate the sharing
+    /// and are kept as the record of what an *unshared* state costs, which is
+    /// still what [`REORG_STATE_WINDOW`] holds when blocks move the ledger.
     ///
     /// MEASURED on this tree by `bench::bench_state_footprint` (`--release`,
-    /// Genesis-3-sized eUTXO set, RSS delta over four clones): **60 MB per
-    /// state**, so a full memo is ~240 MB and the two features together peak
-    /// around 300 MB per validator above the pre-change baseline.
+    /// Genesis-3-sized eUTXO set, RSS delta over four clones, PRE-sharing):
+    /// **60 MB per state**, so a full memo was ~240 MB and the two features
+    /// together peaked around 300 MB per validator above the pre-change
+    /// baseline.
     ///
     /// That 60 MB does NOT match the 128 MB in [`REORG_STATE_WINDOW`]'s doc.
     /// Both are real measurements of the same quantity on different hosts
@@ -348,6 +353,20 @@ mod state_cell {
             self.generation
         }
 
+        /// How many rolled states the memo holds right now. Test surface —
+        /// so a test can pin that a roll of many epochs leaves (and, with the
+        /// in-loop eviction, passes through) no more than `MEMO_CAP` entries.
+        #[cfg(test)]
+        pub(super) fn memo_len(&self) -> usize {
+            self.memo.borrow().len()
+        }
+
+        /// The eviction bound, for the same test.
+        #[cfg(test)]
+        pub(super) fn memo_cap() -> usize {
+            MEMO_CAP
+        }
+
         /// Plant an entry in the memo by hand. TEST ONLY, and only so a test
         /// can prove the generation half of the key is load-bearing: an entry
         /// planted under a stale generation must never be returned, and the
@@ -417,12 +436,21 @@ mod state_cell {
                     epoch: cur_epoch,
                     rolled: Arc::clone(&cur),
                 });
-            }
-            // Evict the lowest epochs first: they are the cheapest to rebuild
-            // (fewest rolls from the base) and the least likely to be asked
-            // for again, since the traffic walks forward.
-            while memo.len() > MEMO_CAP {
-                memo.remove(0);
+                // Evict the lowest epochs first: they are the cheapest to
+                // rebuild (fewest rolls from the base) and the least likely
+                // to be asked for again, since the traffic walks forward.
+                //
+                // INSIDE the loop, not after it (2026-08-31): evicting after
+                // meant a roll of N epochs transiently held N entries, and on
+                // a node N epochs behind the wall clock — the one node that
+                // rolls far — that was N full states at once. The rolled
+                // states now share the eUTXO map, so an entry is small; this
+                // keeps the memo's population bounded by MEMO_CAP at every
+                // point of the roll rather than only between calls, so the
+                // bound does not depend on the sharing to hold.
+                while memo.len() > MEMO_CAP {
+                    memo.remove(0);
+                }
             }
             cur
         }
@@ -4070,6 +4098,15 @@ mod perf_support {
     /// the slot as an argument and read no clock — so the manifest's cadence
     /// is set to something plausible and then not depended upon.
     pub(super) fn proposing_engine() -> (Engine, TestDir) {
+        proposing_engine_funded(&[])
+    }
+
+    /// The same engine, opening with a ledger — for the tests whose claim is
+    /// about what happens (or must not happen) to the eUTXO map. On an empty
+    /// map "no copies" is vacuous; on a funded one it is the catch-up fix.
+    pub(super) fn proposing_engine_funded(
+        opening: &[bloch_pos_committee::state_root::EutxoEntry],
+    ) -> (Engine, TestDir) {
         static DIR_SEQ: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
             "bloch-pos-perf-{}-{}",
@@ -4094,7 +4131,7 @@ mod perf_support {
             cohort: Vec::new(),
             carryover: None,
             allocations: Vec::new(),
-            carryover_entries: Vec::new(),
+            carryover_entries: opening.to_vec(),
         };
         let genesis_id = manifest.genesis_id();
         let state = manifest.genesis_state();
@@ -4662,6 +4699,69 @@ mod bench {
             median(rolls)
         );
     }
+
+    /// **The catch-up regime, measured.** A node `gap` epochs behind the wall
+    /// clock re-derives `rolled_to(wall_epoch)` after every applied block,
+    /// because applying a block bumps the state generation and empties the
+    /// memo. The number that decides whether such a node can catch up is the
+    /// cost of that one re-roll — `gap` × `process_epoch` — paid per block,
+    /// against a 30 s slot.
+    ///
+    /// Sized at the Genesis-4 carryover's own output count so the figure is
+    /// the fleet's. `cargo test --release -p bloch-pos-node -- --ignored
+    /// --nocapture bench_catch_up_roll`.
+    ///
+    /// MEASURED 2026-08-31 (macOS/x86_64, `--release`, box under load — the
+    /// counts are exact, the times are indicative):
+    ///
+    /// BEFORE the eUTXO map was shared, the primitives on this same state
+    /// were clone ≈ 204 ms and `process_epoch` ≈ 369 ms (the clone is inside
+    /// it), 65 MB RSS per unshared state — so one re-roll cost the gap times
+    /// that, per applied block: gap 4 ≈ 1.7 s, gap 15 ≈ 5.8 s, gap 100
+    /// ≈ 37 s (past the 30 s slot), gap 1550 ≈ 9.5 min and ~93 GB transient
+    /// — unrunnable on this 16 GB machine, which is the fleet's cold-start
+    /// death reproduced as an OOM instead of a stall. Map copies per block
+    /// = the gap, by construction.
+    ///
+    /// AFTER: clone ≈ 0 µs, `process_epoch` ≈ 3 µs, rolled states share the
+    /// ledger (~0 MB each). The re-roll per applied block measured gap 1 =
+    /// 6 µs, gap 4 = 14 µs, gap 15 = 82 µs, gap 100 = 842 µs, gap 1550 =
+    /// 81 ms — and ZERO map copies at every gap. The catch-up bound moves
+    /// from `gap × ~0.37 s + t_apply < 30 s` (breaks near gap ≈ 6–10 on
+    /// fleet hardware) to `gap × ~50 µs + t_apply < 30 s`, with memory flat
+    /// at `MEMO_CAP` ledger-sharing entries instead of `gap × 60 MB`.
+    #[test]
+    #[ignore]
+    fn bench_catch_up_roll() {
+        let st = mainnet_sized_state(MAINNET_EUTXOS);
+        let tr = Transition::new(ProbeVerifier);
+        let head = epoch_of(st.slot());
+        for gap in [1u64, 4, 15, 100, 1550] {
+            let mut cell = StateCell::new(st.clone());
+            let mut samples = Vec::new();
+            let copies_before = bloch_pos_committee::transition::eutxo_map_deep_copies();
+            // Three "applied blocks": each replaces the state (same content —
+            // the cost under measurement is the roll, not the apply) so the
+            // generation moves and the memo empties, exactly as `set` does on
+            // the live path. The timed call is what the first attestation
+            // after each block pays.
+            for _ in 0..3 {
+                cell.set((*cell.arc()).clone());
+                let t = Instant::now();
+                let out = cell.rolled_to(head + gap, |s| {
+                    tr.process_epoch(s).expect("infallible")
+                });
+                samples.push(t.elapsed().as_micros());
+                std::hint::black_box(&out);
+            }
+            let copies = bloch_pos_committee::transition::eutxo_map_deep_copies() - copies_before;
+            println!(
+                "gap {gap:>5} epochs: rolled_to after each of 3 applied blocks = \
+                 {samples:?} us (median {} us), eUTXO-map deep copies {copies}",
+                median(samples.clone())
+            );
+        }
+    }
 }
 
 /// **Win 1's proof.** The memoized rolled state must be the SAME STATE the
@@ -4820,6 +4920,100 @@ mod rolled_memo_tests {
             poison.state_root(),
             "an entry under the LIVE generation was not served, so the test above passed \
              because nothing reads the memo rather than because the key rejected the entry"
+        );
+    }
+
+    /// **The catch-up stall of 2026-08-31, reproduced and pinned shut.** A
+    /// node whose head lags the wall clock runs exactly this loop: apply a
+    /// block (which moves the generation and empties the memo), then judge
+    /// the next gossiped attestation, which calls `rolled_to(wall_epoch)` —
+    /// a fresh roll across the entire gap, every block, all the way up.
+    ///
+    /// Before the eUTXO map was shared, each of those rolls deep-copied the
+    /// full ledger once per epoch crossed (`close_epoch` starts with
+    /// `self.clone()`), so a block cost `gap` map copies — ~60 MB and tens
+    /// of milliseconds each at carryover scale — and eviction ran only after
+    /// the roll, so the roll transiently held `gap` whole states. The fleet's
+    /// measured break was a 6–10-epoch gap; a cold start (~1,550 epochs)
+    /// was unconditionally fatal.
+    ///
+    /// The claim that ends that regime, as assertions rather than timings:
+    /// over the same number of applied blocks, the number of full-map copies
+    /// is **the same at a trivial gap and at a deep one — and it is zero** —
+    /// and the memo's population never exceeds `MEMO_CAP` even immediately
+    /// after a roll much longer than the cap. The bit-identity check against
+    /// the uncached derivation is what makes "the roll still happened" a
+    /// fact and not an assumption: the rolled state at the far epoch equals
+    /// the one derived from scratch, on a funded ledger, so nothing was
+    /// skipped to make the counter read zero.
+    ///
+    /// With the copies gone, catch-up needs `gap × t_process_epoch + t_apply
+    /// < slot time` and `MEMO_CAP` small memo entries of memory — not
+    /// `gap × t_map_clone` and `gap × 60 MB`.
+    #[test]
+    fn a_node_far_behind_judges_the_wall_epoch_without_copying_the_ledger() {
+        use bloch_pos_committee::transition::eutxo_map_deep_copies;
+
+        // A funded ledger, so "zero copies" is a claim about real entries and
+        // not about an empty map.
+        let opening: Vec<bloch_pos_committee::state_root::EutxoEntry> = (0..256u32)
+            .map(|i| {
+                let mut txid = [0u8; 32];
+                txid[..4].copy_from_slice(&i.to_le_bytes());
+                bloch_pos_committee::state_root::EutxoEntry {
+                    txid,
+                    vout: 0,
+                    value: 1_000 + u64::from(i),
+                    script_hash: [7u8; 32],
+                }
+            })
+            .collect();
+
+        // 48 epochs is past the fleet's measured 6–10-epoch break AND well
+        // past MEMO_CAP, so the mid-roll eviction actually runs; 3 epochs is
+        // the gap the fleet survives. The regime being killed is "copies
+        // scale with the gap", so the assertion is equality across the two.
+        const BLOCKS: u64 = 10;
+        let mut copies_per_gap = Vec::new();
+        for gap in [3u64, 48] {
+            let (mut engine, _dir) = perf_support::proposing_engine_funded(&opening);
+            assert_eq!(
+                engine.state.utxos().count(),
+                opening.len(),
+                "fixture: the opening ledger must actually be in the state"
+            );
+            let before = eutxo_map_deep_copies();
+            let mut wall = 0;
+            for slot in 1..=BLOCKS {
+                engine.propose(slot);
+                wall = epoch_of(engine.state.slot()) + gap;
+                let rolled = engine.rolled_to(wall);
+                std::hint::black_box(&rolled);
+                assert!(
+                    engine.state.memo_len() <= StateCell::memo_cap(),
+                    "slot {slot}, gap {gap}: the memo held {} entries after the roll — \
+                     the in-loop eviction is not bounding it",
+                    engine.state.memo_len()
+                );
+            }
+            // The roll is real: its far end is bit-identical to the uncached
+            // derivation on this funded ledger.
+            assert_eq!(
+                *engine.rolled_to(wall),
+                engine.rolled_to_uncached(wall),
+                "gap {gap}: the rolled state diverged from the from-scratch derivation"
+            );
+            copies_per_gap.push(eutxo_map_deep_copies() - before);
+        }
+        assert_eq!(
+            copies_per_gap[0], copies_per_gap[1],
+            "full-map copies scale with the gap again ({copies_per_gap:?} for gaps [3, 48]) — \
+             a node far behind is back to paying the ledger per epoch per block"
+        );
+        assert_eq!(
+            copies_per_gap[1], 0,
+            "an epoch roll deep-copied the ledger — close_epoch writes to it, or a clone \
+             stopped sharing it"
         );
     }
 }
