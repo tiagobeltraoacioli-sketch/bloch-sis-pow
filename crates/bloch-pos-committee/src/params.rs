@@ -529,6 +529,84 @@ pub mod rehearsal {
         f()
     }
 
+    thread_local! {
+        /// Test-only override of [`super::FUNDED_STAKING_ACTIVATION_EPOCH`].
+        ///
+        /// The shipped constant is `u64::MAX` — correctly INERT, since the
+        /// funded staking format does not exist — which means no epoch a test
+        /// can construct ever reaches it. Without an override, every test of
+        /// the post-activation path (`apply_deposit` accepting a valid funded
+        /// deposit) would be dead code, and the boundary itself — reject at
+        /// `activation − 1`, accept at `activation` — untestable from either
+        /// side. Same argument as [`gates_are_forced_open`], but carrying an
+        /// EPOCH rather than a bool, so the numeric boundary is exercised
+        /// through the same `<` the fleet runs, not a bypass of it.
+        ///
+        /// Thread-local for the reasons documented on [`TlFlag`] and
+        /// [`MUTATE_SEED`]: a process-global override would rewrite the
+        /// consensus rule under every test running beside the one that set it.
+        static FUNDED_STAKING_ACTIVATION_TL: Cell<Option<u64>> = const { Cell::new(None) };
+    }
+
+    /// Run `f` with the funded-staking flag day set to `epoch` on this
+    /// thread, then restore the shipped constant — including on the unwind
+    /// path, so a failing assertion cannot leave the rule mutated for the
+    /// rest of the thread.
+    #[cfg(test)]
+    pub fn with_funded_staking_activation_at<R>(epoch: u64, f: impl FnOnce() -> R) -> R {
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                FUNDED_STAKING_ACTIVATION_TL.with(|c| c.set(None));
+            }
+        }
+        FUNDED_STAKING_ACTIVATION_TL.with(|c| c.set(Some(epoch)));
+        let _r = Restore;
+        f()
+    }
+
+    /// The funded-staking flag day this build's readers must use: the shipped
+    /// constant, unless a test has moved it on this thread.
+    #[cfg(test)]
+    pub fn effective_funded_staking_activation() -> u64 {
+        FUNDED_STAKING_ACTIVATION_TL
+            .with(Cell::get)
+            .unwrap_or(super::FUNDED_STAKING_ACTIVATION_EPOCH)
+    }
+
+    thread_local! {
+        /// Test-only override of [`super::SIGNED_EXIT_ACTIVATION_EPOCH`] —
+        /// the exit twin of [`FUNDED_STAKING_ACTIVATION_TL`], carried
+        /// separately because the two flag days are separate constants and a
+        /// test must be able to move one while proving the other did not
+        /// follow.
+        static SIGNED_EXIT_ACTIVATION_TL: Cell<Option<u64>> = const { Cell::new(None) };
+    }
+
+    /// Run `f` with the signed-exit flag day set to `epoch` on this thread,
+    /// then restore the shipped constant — including on the unwind path.
+    #[cfg(test)]
+    pub fn with_signed_exit_activation_at<R>(epoch: u64, f: impl FnOnce() -> R) -> R {
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                SIGNED_EXIT_ACTIVATION_TL.with(|c| c.set(None));
+            }
+        }
+        SIGNED_EXIT_ACTIVATION_TL.with(|c| c.set(Some(epoch)));
+        let _r = Restore;
+        f()
+    }
+
+    /// The signed-exit flag day this build's readers must use: the shipped
+    /// constant, unless a test has moved it on this thread.
+    #[cfg(test)]
+    pub fn effective_signed_exit_activation() -> u64 {
+        SIGNED_EXIT_ACTIVATION_TL
+            .with(Cell::get)
+            .unwrap_or(super::SIGNED_EXIT_ACTIVATION_EPOCH)
+    }
+
     /// The look-ahead this build's readers must use: the shipped constant,
     /// unless a test has mutated the rule on this thread.
     #[cfg(test)]
@@ -595,6 +673,97 @@ pub const ANCESTRY_SEED_ACTIVATION_EPOCH: u64 = u64::MAX;
 ///
 /// `u64::MAX` means INERT. Same arming rules as above.
 pub const LEAK_RECOVERY_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+/// Flag day for **eUTXO-funded staking** — the epoch at which the funded
+/// deposit encoding (coins actually spent into the bond, proof of possession
+/// carried and checked) becomes acceptable in blocks, routed through
+/// [`crate::transition::CommittedState::apply_deposit`] and judged by
+/// [`crate::staking::validate_deposit`], the one statement of the deposit
+/// rule.
+///
+/// # What is and is not gated on this constant
+///
+/// Below it, `apply_deposit` refuses (`TxReject::StakingNotActive`). The
+/// legacy unfunded encodings — wire tags `0x02` (`Deposit`) and `0x04`
+/// (`Delegate`) — are NOT what activates here: they name an `amount_sat`,
+/// carry no signature and spend no output, so they are consensus-rejected at
+/// EVERY epoch (see the two arms in `apply_transaction`). This constant names
+/// the epoch at which their funded successors, whose wire format is owned by
+/// the funded-format work stream, start being applied.
+///
+/// # The acceptance change the rejection itself is
+///
+/// Until 2026-08-31 the refusal of unfunded staking messages lived only at
+/// the mempool door (`bloch-pos-node/src/engine.rs::admissible`), and its own
+/// comment said so: "a node-side refusal, not a consensus rule: a block that
+/// already carries a deposit still applies it." The consequence was that any
+/// CURRENT COMMITTEE MEMBER could include a `Deposit` in its own block and
+/// mint bonded stake — no key possession proven, no coins spent. Bounded
+/// (outsiders cannot propose, and minted stake has no withdrawal path back to
+/// coins), but it was consensus-weight inflation available to insiders.
+///
+/// Moving the refusal into `apply_transaction` closes that path, and it is a
+/// TIGHTENING of what a node accepts: a binary from before this change
+/// applies a deposit-carrying block, a binary from after rejects it
+/// (`TransitionError::Transaction`). The two diverge on exactly the blocks
+/// only a malicious insider can produce — which is the point — so the fleet
+/// must be rebuilt together, per the flag-day runbook. **Replay precondition,
+/// checked before rollout, not assumed:** no block in the live log may carry
+/// tag `0x02` or `0x04`. The mempool has refused both since Genesis-4 launch
+/// (2026-08-13) and only committee members propose, so the log should be
+/// clean — but if an insider ever exercised the gap, an upgraded node will
+/// stop at that block, and the rejection would instead need its own armed
+/// activation epoch.
+///
+/// `u64::MAX` means INERT: funded staking does not exist yet, so nothing may
+/// activate it. Arm it only when (1) the funded wire format is landed and the
+/// fleet rebuilt, (2) the epoch is STRICTLY in the future at tag time — an
+/// epoch already past arms silently, the failure mode that once let 1,600,000
+/// BLCH escape a write-off — and (3) the value matches the runbook. The gate
+/// reads the COMMITTED epoch (`CommittedState::epoch`, rolled by
+/// `close_epoch`), never node-local state — the 2026-08-08 `expected_bits`
+/// fork is the standing reason.
+pub const FUNDED_STAKING_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+/// Flag day for **signed voluntary exits** — the epoch at which an exit that
+/// carries a hybrid signature over its own signing root
+/// ([`crate::staking::ExitTx`], judged by [`crate::staking::validate_exit`]
+/// through [`crate::transition::CommittedState::apply_exit`]) becomes
+/// acceptable in blocks.
+///
+/// # Why exits have their own constant
+///
+/// Separate from [`FUNDED_STAKING_ACTIVATION_EPOCH`] because the two formats
+/// have independent lives: a signed exit needs nothing from the eUTXO set —
+/// only the signature §7.2 always specified — so it can (and should) activate
+/// without waiting for the funded deposit machinery, while a funded deposit
+/// has no dependency on exits. The three rejections below land together; the
+/// three activations need not.
+///
+/// # What this closes
+///
+/// The wire `Exit` (tag `0x03`) is literally `Exit { validator: u32 }` — an
+/// index, nothing else. Its arm in `apply_transaction` checked registry state
+/// and never touched a verifier, while its doc comment claimed "Signature
+/// already checked at admission" — false the same way the deposit comment
+/// was: admission is node-local, and a proposer building its own block never
+/// consults it. One hostile proposal slot could therefore carry `Exit` for
+/// EVERY active index; every node would apply them, duties would stop
+/// `EXIT_DELAY_EPOCHS` (32) later, and an exit is irrevocable
+/// (`exit_epoch != u64::MAX` is refused) — the roster empties, every bond
+/// locks for the 2,048-epoch withdrawal delay, and the attacker's own
+/// relative weight rises. Combined with the unfunded-deposit mint this was
+/// "exit everyone else, mint yourself a majority". As with the deposit, the
+/// consensus arm now rejects tag `0x03` at EVERY epoch — no flag day reopens
+/// an unauthenticated encoding — and this constant gates only the signed
+/// successor. Same fleet-rebuild discipline and the same replay precondition
+/// as above: the live log must be checked for tag `0x03` blocks before
+/// rollout.
+///
+/// `u64::MAX` means INERT. Same arming rules as
+/// [`FUNDED_STAKING_ACTIVATION_EPOCH`], including the strictly-in-the-future
+/// requirement and reading only the committed epoch.
+pub const SIGNED_EXIT_ACTIVATION_EPOCH: u64 = u64::MAX;
 
 /// Domain separation tags (§6.1). Fixed 16 bytes, right-padded with zeros, so
 /// no tag can be a prefix of another.

@@ -70,6 +70,43 @@ pub const HYBRID_PK_BYTES: usize = MLDSA65_PK_BYTES + FALCON1024_PK_BYTES;
 /// a fixed split point allows exactly one.
 pub const MLDSA65_SIG_BYTES: usize = 3309;
 
+/// The 4-byte suite envelope (`magic ‖ suite-id LE`) that bloch-crypto
+/// prepends to every key it generates: `B1 0C` then [`SUITE_MLDSA65_FALCON1024`].
+/// The genesis registry committed its 64 pubkeys in exactly this enveloped
+/// form (~3,749 B each), so any rule that verifies against a *registered* key
+/// must know where the hybrid body starts.
+///
+/// Restated from `bloch-crypto` (`crypto/mod.rs`: `SUITE_MAGIC`,
+/// `SUITE_HEADER_LEN`) because this crate is deliberately dependency-free of
+/// the FFI stack; the two statements are pinned against each other by a test
+/// in the node crate, which depends on both
+/// (`bloch-pos-node/src/engine.rs::committee_envelope_matches_crypto`).
+pub const SUITE_ENVELOPE_HYBRID: [u8; 4] = [0xB1, 0x0C, 0x01, 0x00];
+
+/// Resolve a pubkey **as committed in the registry** to the raw hybrid body
+/// whose split points this module owns.
+///
+/// Registered keys exist in exactly two committed shapes: the suite-enveloped
+/// form (the genesis launch set — [`SUITE_ENVELOPE_HYBRID`] then the body)
+/// and the raw [`HYBRID_PK_BYTES`] body (funded deposits, whose `DepositTx`
+/// carries the body with the suite as a separate field). Anything else has no
+/// defined halves, so nothing can be verified against it — `None`, and the
+/// caller must reject rather than guess.
+pub fn committed_hybrid_body(registered_pubkey: &[u8]) -> Option<&[u8; HYBRID_PK_BYTES]> {
+    let body: &[u8] = match registered_pubkey.len() {
+        HYBRID_PK_BYTES => registered_pubkey,
+        n if n == HYBRID_PK_BYTES + SUITE_ENVELOPE_HYBRID.len()
+            && registered_pubkey[..SUITE_ENVELOPE_HYBRID.len()] == SUITE_ENVELOPE_HYBRID =>
+        {
+            &registered_pubkey[SUITE_ENVELOPE_HYBRID.len()..]
+        }
+        _ => return None,
+    };
+    // Infallible after the length match above; `try_into` rather than an
+    // unwrap-free transmute because the compiler checks the width for us.
+    body.try_into().ok()
+}
+
 // ---------------------------------------------------------------------------
 // Lifecycle constants (§5.1). All epochs; one epoch = 32 slots ≈ 16 min.
 // ---------------------------------------------------------------------------
@@ -418,7 +455,11 @@ impl ValidatorRecord {
 /// Voluntary exit message (§7.2). Hybrid-signed by the validator key.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExitTx {
-    /// SHA3-256 of the exiting validator's hybrid pubkey.
+    /// SHA3-256 of the validator's pubkey **bytes as committed at
+    /// registration** — enveloped for the genesis launch set, raw hybrid for
+    /// funded deposits (see [`committed_hybrid_body`]). The same convention
+    /// as the transition's pubkey index and the deposit queue, so one hash is
+    /// one identity everywhere.
     pub pubkey_hash: [u8; 32],
     /// Epoch the exit is intended for. Signed, so a captured exit message
     /// cannot be replayed at a different (earlier or much later) time — the
@@ -451,29 +492,51 @@ pub enum ExitReject {
     /// Exit epoch is ahead of the including epoch — pre-signing exits for the
     /// future would decouple the withdrawal clock from inclusion time.
     FutureEpoch,
+    /// The registered pubkey bytes are neither the raw hybrid body nor the
+    /// suite-enveloped form ([`committed_hybrid_body`] returned `None`), so
+    /// no signature can ever verify against them. Named rather than folded
+    /// into `BadSignature`: at a consensus divergence, "the key on record has
+    /// no defined halves" and "the signature failed" point at different bugs.
+    MalformedRegisteredKey,
     /// Hybrid signature invalid (either half).
     BadSignature,
 }
 
-/// Validate a voluntary exit against the validator's committed record.
+/// Validate a voluntary exit against the validator's **registered** key —
+/// the pubkey bytes exactly as committed at registration, never a key the
+/// exit message supplies. This is the one statement of the exit rule; the
+/// transition contributes only the state-dependent facts a pure rule cannot
+/// know (whether the record exists, is active, already exiting, slashed) and
+/// relays this verdict.
+///
+/// `already_exited` arrives as a fact rather than a record because the
+/// committed registry stores its pubkeys as opaque bytes (enveloped at
+/// genesis), which the fixed-width [`ValidatorRecord`] of this module cannot
+/// represent — and a rule that only ran against a record no production state
+/// can produce is how this function spent its first two weeks with zero
+/// production call sites.
 pub fn validate_exit(
     exit: &ExitTx,
-    record: &ValidatorRecord,
+    registered_pubkey: &[u8],
+    already_exited: bool,
     current_epoch: u64,
     verifier: &dyn HybridKeyVerifier,
 ) -> Result<(), ExitReject> {
-    let expected: [u8; 32] = Sha3_256::digest(record.pubkey).into();
+    let expected: [u8; 32] = Sha3_256::digest(registered_pubkey).into();
     if exit.pubkey_hash != expected {
         return Err(ExitReject::UnknownValidator);
     }
-    if record.exit_epoch.is_some() {
+    if already_exited {
         return Err(ExitReject::AlreadyExited);
     }
     if exit.epoch > current_epoch {
         return Err(ExitReject::FutureEpoch);
     }
+    let Some(body) = committed_hybrid_body(registered_pubkey) else {
+        return Err(ExitReject::MalformedRegisteredKey);
+    };
     // Signature last: cheapest-first, as everywhere else in the crate.
-    if !verify_hybrid(&record.pubkey, &exit.signing_root(), &exit.signature, verifier) {
+    if !verify_hybrid(body, &exit.signing_root(), &exit.signature, verifier) {
         return Err(ExitReject::BadSignature);
     }
     Ok(())
@@ -781,7 +844,7 @@ mod tests {
     fn voluntary_exit_lifecycle() {
         let mut rec = record();
         let exit = exit_for(&rec, 100);
-        assert_eq!(validate_exit(&exit, &rec, 100, &accept_all()), Ok(()));
+        assert_eq!(validate_exit(&exit, &rec.pubkey, false, 100, &accept_all()), Ok(()));
         rec.exit_epoch = Some(100);
 
         // Duties continue through the exit delay, then stop.
@@ -790,7 +853,10 @@ mod tests {
 
         // A second exit is rejected: the withdrawal clock must never reset.
         let again = exit_for(&rec, 101);
-        assert_eq!(validate_exit(&again, &rec, 101, &accept_all()), Err(ExitReject::AlreadyExited));
+        assert_eq!(
+            validate_exit(&again, &rec.pubkey, true, 101, &accept_all()),
+            Err(ExitReject::AlreadyExited)
+        );
     }
 
     #[test]
@@ -798,14 +864,84 @@ mod tests {
         let rec = record();
         let exit = exit_for(&rec, 100);
         let mldsa_only = HalfwiseVerifier { accept_mldsa: true, accept_falcon: false };
-        assert_eq!(validate_exit(&exit, &rec, 100, &mldsa_only), Err(ExitReject::BadSignature));
+        assert_eq!(
+            validate_exit(&exit, &rec.pubkey, false, 100, &mldsa_only),
+            Err(ExitReject::BadSignature)
+        );
     }
 
     #[test]
     fn exit_for_future_epoch_rejected() {
         let rec = record();
         let exit = exit_for(&rec, 101);
-        assert_eq!(validate_exit(&exit, &rec, 100, &accept_all()), Err(ExitReject::FutureEpoch));
+        assert_eq!(
+            validate_exit(&exit, &rec.pubkey, false, 100, &accept_all()),
+            Err(ExitReject::FutureEpoch)
+        );
+    }
+
+    /// The registry's committed identity is the hash of the bytes AS
+    /// COMMITTED — for a genesis validator that is the enveloped form. The
+    /// rule must bind the exit to that identity while still splitting the
+    /// hybrid halves at the right offset underneath the envelope.
+    #[test]
+    fn exit_verifies_against_an_enveloped_registered_key() {
+        let raw = [7u8; HYBRID_PK_BYTES];
+        let mut committed = SUITE_ENVELOPE_HYBRID.to_vec();
+        committed.extend_from_slice(&raw);
+
+        // Body resolution: raw passes through, enveloped is stripped, and
+        // the two resolve to the SAME body.
+        assert_eq!(committed_hybrid_body(&raw).unwrap(), &raw);
+        assert_eq!(committed_hybrid_body(&committed).unwrap(), &raw);
+
+        // A hash taken over the RAW body does not name the committed
+        // identity of an enveloped key — the binding is to the bytes on
+        // record, not to the body underneath them.
+        let raw_hash_exit = ExitTx {
+            pubkey_hash: Sha3_256::digest(raw).into(),
+            epoch: 100,
+            signature: vec![0u8; MLDSA65_SIG_BYTES + 1280],
+        };
+        assert_eq!(
+            validate_exit(&raw_hash_exit, &committed, false, 100, &accept_all()),
+            Err(ExitReject::UnknownValidator)
+        );
+
+        // The committed-bytes hash verifies, through the envelope.
+        let exit = ExitTx {
+            pubkey_hash: Sha3_256::digest(&committed).into(),
+            epoch: 100,
+            signature: vec![0u8; MLDSA65_SIG_BYTES + 1280],
+        };
+        assert_eq!(validate_exit(&exit, &committed, false, 100, &accept_all()), Ok(()));
+        // And the AND-composition still holds underneath it.
+        let falcon_only = HalfwiseVerifier { accept_mldsa: false, accept_falcon: true };
+        assert_eq!(
+            validate_exit(&exit, &committed, false, 100, &falcon_only),
+            Err(ExitReject::BadSignature)
+        );
+    }
+
+    /// A registered key with no defined halves must be a NAMED refusal, not a
+    /// signature failure and never a panic.
+    #[test]
+    fn exit_against_undecodable_registered_key_is_refused_by_name() {
+        // Wrong length entirely.
+        let junk = vec![9u8; 100];
+        let exit = ExitTx {
+            pubkey_hash: Sha3_256::digest(&junk).into(),
+            epoch: 100,
+            signature: vec![0u8; MLDSA65_SIG_BYTES + 1280],
+        };
+        assert_eq!(
+            validate_exit(&exit, &junk, false, 100, &accept_all()),
+            Err(ExitReject::MalformedRegisteredKey)
+        );
+        // Envelope-length but the wrong magic: not an envelope, not a body.
+        let mut bad_magic = vec![0u8; HYBRID_PK_BYTES + 4];
+        bad_magic[0] = 0xFF;
+        assert_eq!(committed_hybrid_body(&bad_magic), None);
     }
 
     #[test]

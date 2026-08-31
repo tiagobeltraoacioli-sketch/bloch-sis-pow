@@ -383,7 +383,17 @@ pub enum PosTransaction {
         /// [`Self::Transfer`].
         tip_millisat_per_gas: u128,
     },
-    /// Register a validator (§7.1). PoP/taint already checked at admission.
+    /// Register a validator — the LEGACY UNFUNDED encoding (tag `0x02`),
+    /// **consensus-rejected at every epoch** since 2026-08-31. It names an
+    /// `amount_sat`, carries no proof of possession and spends no output;
+    /// its doc comment used to claim "PoP/taint already checked at
+    /// admission", which was false in the way that mattered — admission is
+    /// node-local, and a proposer's own block never passes through it. The
+    /// funded successor (coins spent into the bond, PoP carried) routes
+    /// through [`CommittedState::apply_deposit`] behind
+    /// [`crate::params::FUNDED_STAKING_ACTIVATION_EPOCH`]. The variant
+    /// survives only so old wire bytes still DECODE — to a transaction every
+    /// node refuses — rather than shifting the meaning of tag `0x02`.
     Deposit {
         /// Suite-tagged hybrid public key (opaque bytes, per the interfaces).
         pubkey: Vec<u8>,
@@ -400,9 +410,25 @@ pub enum PosTransaction {
         /// priced by delegators.
         commission_bps: u128,
     },
-    /// Voluntary exit (§7.2). Signature already checked at admission.
+    /// Voluntary exit — the LEGACY UNAUTHENTICATED encoding (tag `0x03`),
+    /// **consensus-rejected at every epoch** since 2026-08-31. It is an
+    /// index and nothing else; its doc comment used to claim "Signature
+    /// already checked at admission", which was false — no signature exists
+    /// anywhere in this encoding, and one proposal slot carrying `Exit` for
+    /// every active index would have retired the whole roster irrevocably.
+    /// The signed successor ([`staking::ExitTx`]) routes through
+    /// [`CommittedState::apply_exit`] behind
+    /// [`crate::params::SIGNED_EXIT_ACTIVATION_EPOCH`]. The variant survives
+    /// only so old wire bytes still decode to a refused transaction.
     Exit { validator: u32 },
-    /// Bond delegated stake behind an operator.
+    /// Bond delegated stake behind an operator — the LEGACY UNFUNDED
+    /// encoding (tag `0x04`), **consensus-rejected at every epoch** since
+    /// 2026-08-31: no signature, no inputs, `amount_sat` minted rather than
+    /// spent, and `eligible` taken from the transaction — proposer-chosen
+    /// eligibility at zero cost. The funded successor routes through
+    /// [`CommittedState::apply_delegation`] behind
+    /// [`crate::params::FUNDED_STAKING_ACTIVATION_EPOCH`], with eligibility
+    /// derived from committed state, never from the message.
     Delegate {
         delegator: u32,
         validator: u32,
@@ -863,17 +889,38 @@ impl core::fmt::Display for TxDecodeError {
 ///
 /// A named reason rather than `()`, because the transfer rules decide who may
 /// move coins and a bare unit told an operator nothing about *which* rule a
-/// diverging node applied differently. The staking arms keep a single reason:
-/// their detailed rejects (`DepositReject`, `ExitReject`) belong to the
-/// admission boundary that owns those checks, and inventing a second, subtly
-/// different taxonomy here is the duplicate-derivation habit this crate
-/// refuses.
+/// diverging node applied differently. The delegation arm keeps a single
+/// reason (`StakingRule`); the deposit and exit paths CARRY the canonical
+/// taxonomies ([`staking::DepositReject`], [`staking::ExitReject`]) rather
+/// than inventing a second, subtly different one here — the
+/// duplicate-derivation habit this crate refuses is restating a rule, not
+/// relaying its verdict.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TxReject {
     /// A value transfer broke one of the eUTXO rules.
     Transfer(TransferReject),
     /// A deposit, exit or delegation failed its state-dependent rule.
     StakingRule,
+    /// A staking message arrived before its authenticated, funded successor
+    /// format is active. The legacy encodings — tag `0x02` (`Deposit`), tag
+    /// `0x03` (`Exit`), tag `0x04` (`Delegate`) — get this at EVERY epoch:
+    /// `0x02`/`0x04` name an `amount_sat`, spend nothing and mint stake;
+    /// `0x03` is a bare index whose application retires any validator
+    /// irrevocably — no flag day can make an unauthenticated encoding
+    /// acceptable. Their successors reject with this below
+    /// [`crate::params::FUNDED_STAKING_ACTIVATION_EPOCH`] /
+    /// [`crate::params::SIGNED_EXIT_ACTIVATION_EPOCH`]. Distinct from
+    /// `StakingRule` for the same reason `TransferReject::FormatNotActive`
+    /// is distinct: a divergence at a flag day must be readable from logs.
+    StakingNotActive,
+    /// The funded deposit path ran the one deposit rule
+    /// ([`staking::validate_deposit`]) and it refused; the verdict is relayed
+    /// verbatim.
+    Deposit(staking::DepositReject),
+    /// The signed exit path ran the one exit rule
+    /// ([`staking::validate_exit`]) and it refused; the verdict is relayed
+    /// verbatim.
+    Exit(staking::ExitReject),
     /// Slashing evidence reached the plain transaction seam instead of
     /// `apply_slashing_evidence`, which is the only path that verifies it.
     MisroutedEvidence,
@@ -1190,16 +1237,21 @@ pub struct CommittedState {
     /// `Delegate` name an `amount_sat` and spend no output; `Exit` and the
     /// withdrawal delay return no output either. So the chain holds two pools
     /// — this one and the registry's bonded stake — and coins do not travel
-    /// between them: a deposit creates bonded stake without destroying
-    /// spendable coins, and fee rewards compound into bonds that this set
-    /// never funded.
+    /// between them: fee rewards compound into bonds that this set never
+    /// funded. Since 2026-08-31 the transaction door into that gap is closed
+    /// BY CONSENSUS: the unfunded staking arms in `apply_transaction` reject
+    /// at every epoch (`TxReject::StakingNotActive`), so a deposit can no
+    /// longer create bonded stake without destroying spendable coins — not
+    /// even in a committee member's own block, which the earlier mempool-only
+    /// refusal never covered.
     ///
     /// Conservation therefore holds **within** the transfer path (the fee is
     /// exactly what leaves the set, pinned by test) and **not** across the two
     /// pools. Closing it means giving deposits and withdrawals eUTXO inputs
     /// and outputs, which is a change to the staking messages' wire shape and
-    /// to their admission rules, not to this field. Until then, no single
-
+    /// to their admission rules, not to this field — that funded path lands
+    /// behind [`crate::params::FUNDED_STAKING_ACTIVATION_EPOCH`], through
+    /// [`CommittedState::apply_deposit`]. Until then, no single
     /// number in this state is "the supply".
     eutxos: EutxoSet,
 }
@@ -1944,16 +1996,18 @@ impl CommittedState {
     fn apply_transaction(
         &mut self,
         tx: &PosTransaction,
-        total_active_sat: u128,
+        // Unused since the 2026-08-31 closure retired the legacy staking
+        // arms, KEPT in the signature deliberately: the per-validator cap is
+        // a fraction of committed active stake and must arrive from the
+        // caller (rule 1), so when the funded staking wire formats land as
+        // new variants their arms will need exactly this input again —
+        // `apply_deposit` already takes it. Removing and re-adding a
+        // parameter on a consensus seam across two flag days invites a
+        // transposition bug for zero cleanliness.
+        _total_active_sat: u128,
         base_fee_millisat_per_gas: u128,
         verifier: &dyn SignatureVerifier,
     ) -> Result<fee_market::TxCharge, TxReject> {
-        let free = fee_market::TxCharge {
-            gas: 0,
-            tx_bytes: 0,
-            base_fee_sat: 0,
-            priority_fee_sat: 0,
-        };
         match tx {
             PosTransaction::Transfer { .. } => self
                 .apply_transfer(tx, base_fee_millisat_per_gas, verifier)
@@ -1974,102 +2028,66 @@ impl CommittedState {
                 self.apply_transfer_v2(tx, base_fee_millisat_per_gas, verifier)
                     .map_err(TxReject::Transfer)
             }
-            PosTransaction::Deposit {
-                pubkey,
-                amount_sat,
-                randao_commitment,
-                withdrawal_credentials,
-                commission_bps,
-            } => {
-                let pubkey_hash: [u8; 32] = Sha3_256::digest(pubkey).into();
-                // A second deposit of a registered key is a top-up path
-                // decision the interface refuses to make implicitly.
-                if self.pubkey_index.contains_key(&pubkey_hash) {
-                    return Err(TxReject::StakingRule);
-                }
-                if *amount_sat < staking::MIN_DEPOSIT_SAT {
-                    return Err(TxReject::StakingRule);
-                }
-                // Per-validator cap: 1% of committed active stake, floored at
-                // the minimum deposit — a naive 1% cap at genesis (active
-                // stake ≈ 0) would deadlock the bootstrap (staking.rs docs).
-                let cap = (total_active_sat * delegation::MAX_VALIDATOR_STAKE_BPS / 10_000)
-                    .max(staking::MIN_DEPOSIT_SAT);
-                if *amount_sat > cap {
-                    return Err(TxReject::StakingRule);
-                }
-                // Next free index: a deterministic function of the registry,
-                // never of anything local.
-                let index = self.validators.keys().next_back().map_or(0, |k| k + 1);
-                self.validators.insert(
-                    index,
-                    ValidatorRecord {
-                        index,
-                        pubkey: pubkey.clone(),
-                        staked_sat: *amount_sat,
-                        randao_commitment: *randao_commitment,
-                        withdrawal_credentials: withdrawal_credentials.clone(),
-                        // Not scheduled until the activation queue admits it.
-                        activation_epoch: u64::MAX,
-                        exit_epoch: u64::MAX,
-                        withdrawable_epoch: u64::MAX,
-                        slashed: false,
-                        commission_bps: *commission_bps,
-                    },
-                );
-                self.reveals_used.insert(index, 0);
-                self.pubkey_index.insert(pubkey_hash, index);
-                self.deposit_history.push(QueuedDeposit {
-                    pubkey_hash,
-                    deposit_epoch: self.epoch,
-                    amount_sat: *amount_sat,
-                });
-                Ok(free)
+            PosTransaction::Deposit { .. } => {
+                // CONSENSUS REJECT, at every epoch — this arm is the legacy
+                // UNFUNDED encoding (tag 0x02): it names an `amount_sat`,
+                // carries no proof of possession and spends no output, so
+                // applying it registers bonded stake minted from nothing.
+                // Until 2026-08-31 the only thing standing between a current
+                // committee member and that mint was the MEMPOOL refusal in
+                // `bloch-pos-node/src/engine.rs::admissible` — a node-side
+                // courtesy a proposer building its own block never consults.
+                // Every node now reaches this verdict inside the transition,
+                // so a block carrying the mint is rejected wholesale
+                // (`TransitionError::Transaction`), insider or not.
+                //
+                // No flag day reopens THIS encoding. The flag day
+                // (`params::FUNDED_STAKING_ACTIVATION_EPOCH`) activates the
+                // funded successor format — coins spent into the bond, PoP
+                // carried — whose wire shape is owned by the funded-format
+                // work stream and which routes through `apply_deposit`
+                // below, where `staking::validate_deposit` is the single
+                // statement of the deposit rule. The min/cap checks that
+                // used to be restated inline here are gone with the arm:
+                // the rule now exists in exactly one place.
+                Err(TxReject::StakingNotActive)
             }
-            PosTransaction::Exit { validator } => {
-                let Some(rec) = self.validators.get_mut(validator) else {
-                    return Err(TxReject::StakingRule);
-                };
-                // Active, not already exiting, not slashed (slashing has its
-                // own ejection path and must not share the voluntary one).
-                if rec.slashed
-                    || rec.activation_epoch > self.epoch
-                    || rec.exit_epoch != u64::MAX
-                {
-                    return Err(TxReject::StakingRule);
-                }
-                // Duties stop EXIT_DELAY_EPOCHS after the request — an exit
-                // must not dodge already-assigned duties — and the stake
-                // stays slashable through the weak-subjectivity margin.
-                let exit_epoch = self.epoch.saturating_add(staking::EXIT_DELAY_EPOCHS);
-                rec.exit_epoch = exit_epoch;
-                rec.withdrawable_epoch =
-                    exit_epoch.saturating_add(staking::WITHDRAWAL_DELAY_EPOCHS);
-                Ok(free)
+            PosTransaction::Exit { .. } => {
+                // CONSENSUS REJECT, at every epoch — the gravest of the
+                // three, and found last. Tag 0x03 is `Exit { validator: u32 }`
+                // — an index, NOTHING ELSE. This arm used to check only
+                // registry state (exists, active, not exiting, not slashed)
+                // and then write `exit_epoch`, while `staking::validate_exit`
+                // — which does verify a hybrid signature — sat with zero
+                // production call sites. The arm's own doc claimed the
+                // signature was "already checked at admission"; admission is
+                // node-local and a proposer's own block never passes it. One
+                // hostile proposal slot could therefore carry `Exit` for
+                // every active index: every node applies them, duties stop
+                // EXIT_DELAY_EPOCHS (32) later, an exit is irrevocable, and
+                // every bond locks for the 2,048-epoch withdrawal delay —
+                // while the attacker's relative weight rises. Combined with
+                // the unfunded deposit: exit everyone else, mint a majority.
+                //
+                // No flag day reopens THIS encoding — it has no field a
+                // signature could live in. The signed successor
+                // (`staking::ExitTx`) routes through `apply_exit` below,
+                // behind `params::SIGNED_EXIT_ACTIVATION_EPOCH`, where
+                // `staking::validate_exit` is the single statement of the
+                // exit rule.
+                Err(TxReject::StakingNotActive)
             }
-            PosTransaction::Delegate { delegator, validator, amount_sat, eligible } => {
-                let Some(rec) = self.validators.get(validator) else {
-                    return Err(TxReject::StakingRule);
-                };
-                if rec.slashed || rec.exit_epoch != u64::MAX {
-                    return Err(TxReject::StakingRule);
-                }
-                if *amount_sat < delegation::MIN_DELEGATION_SAT {
-                    return Err(TxReject::StakingRule);
-                }
-                self.delegations.push(Delegation {
-                    delegator: *delegator,
-                    validator: *validator,
-                    amount_sat: *amount_sat,
-                    // A delegation included during epoch E requests from
-                    // E+1: the stake backing epoch E's committees was fixed
-                    // before E started, and nothing included *during* E may
-                    // change it (the same principle as ACTIVATION_DELAY).
-                    requested_epoch: self.epoch + 1,
-                    deactivate_epoch: None,
-                    eligible: *eligible,
-                });
-                Ok(free)
+            PosTransaction::Delegate { .. } => {
+                // Same verdict as `Deposit`, same grounds: the legacy tag
+                // 0x04 names a `delegator: u32` and an `amount_sat` with no
+                // signature and no output spent — delegated consensus weight
+                // minted from nothing, applied by the transition if a
+                // committee member put it in a block. Rejected everywhere,
+                // at every epoch; the funded delegation format (same work
+                // stream as the funded deposit) is what the flag day will
+                // activate, and it will route through `apply_delegation`,
+                // which keeps the state-dependent delegation rules.
+                Err(TxReject::StakingNotActive)
             }
             // Evidence needs the injected signature verifier, which lives on
             // the Transition, not on the state — compute_post_state routes it
@@ -2078,6 +2096,242 @@ impl CommittedState {
             // beats silently accepting unverified evidence.
             PosTransaction::SlashingEvidence(_) => Err(TxReject::MisroutedEvidence),
         }
+    }
+
+    /// Apply one FUNDED deposit — the post-flag-day path, and the only path
+    /// that can ever register a validator from a transaction.
+    ///
+    /// The deposit rule itself — suite tag, transparency, taint, minimum,
+    /// per-validator cap, proof of possession — is [`staking::validate_deposit`]
+    /// and is stated NOWHERE else; this method contributes only what a pure
+    /// rule cannot know: the flag-day gate, the two state-dependent facts
+    /// (duplicate registration, the cap derived from committed active stake),
+    /// and the registration itself. Until 2026-08-31 the live `Deposit` arm
+    /// restated the minimum and the cap inline while `validate_deposit` sat
+    /// unreferenced — two statements of one rule, free to drift; this is the
+    /// merge.
+    ///
+    /// # Interface, deliberately taken rather than designed
+    ///
+    /// The wire encoding that reaches this method — how the PoP travels, how
+    /// the spent outputs are named, how the suite-tagged key is enveloped —
+    /// belongs to the funded-format work stream. This method takes the
+    /// SEMANTIC deposit ([`staking::DepositTx`]) plus the caller-resolved
+    /// facts about its inputs ([`staking::DepositInput`], per the staking
+    /// module's "the caller resolves each spent output against the ledger"
+    /// contract) and an injected [`staking::HybridKeyVerifier`]. `commission_bps`
+    /// rides alongside because the committed record requires it and §7.1's
+    /// `DepositTx` predates it.
+    ///
+    /// Returns the new validator index. On any `Err` the state is untouched:
+    /// every check runs before the first mutation, the same discipline as
+    /// `apply_transfer`.
+    pub(crate) fn apply_deposit(
+        &mut self,
+        tx: &staking::DepositTx,
+        inputs: &[staking::DepositInput],
+        commission_bps: u128,
+        total_active_sat: u128,
+        keys: &dyn staking::HybridKeyVerifier,
+    ) -> Result<u32, TxReject> {
+        // THE FLAG-DAY GATE, FIRST — before any other look at the deposit.
+        // Read from `self.epoch`, which is COMMITTED state already rolled to
+        // the block's epoch by `close_epoch`, never from anything node-local
+        // — the 2026-08-08 `expected_bits` fork is the standing reason. In a
+        // shipped binary the gate is the constant; a test may move it on its
+        // own thread so both sides of the boundary are exercisable through
+        // this same `<` (see `params::rehearsal`).
+        #[cfg(test)]
+        let activation = crate::params::rehearsal::effective_funded_staking_activation();
+        #[cfg(not(test))]
+        let activation = crate::params::FUNDED_STAKING_ACTIVATION_EPOCH;
+        if self.epoch < activation {
+            return Err(TxReject::StakingNotActive);
+        }
+        // A second deposit of a registered key is a top-up path decision the
+        // interface refuses to make implicitly. State-dependent, so it lives
+        // here, not in the pure rule.
+        let pubkey_hash: [u8; 32] = Sha3_256::digest(tx.validator_pubkey).into();
+        if self.pubkey_index.contains_key(&pubkey_hash) {
+            return Err(TxReject::StakingRule);
+        }
+        // Per-validator cap: 1% of committed active stake, floored at the
+        // minimum deposit — a naive 1% cap at genesis (active stake ≈ 0)
+        // would deadlock the bootstrap. Derived HERE because the cap is a
+        // fraction of a value in committed state, which the §5.5-pure rule
+        // takes as an explicit input (staking.rs docs on `max_stake_sat`).
+        let cap = (total_active_sat * delegation::MAX_VALIDATOR_STAKE_BPS / 10_000)
+            .max(staking::MIN_DEPOSIT_SAT);
+        // The one deposit rule. Its verdict is relayed, never restated.
+        staking::validate_deposit(tx, inputs, cap, keys).map_err(TxReject::Deposit)?;
+        // Next free index: a deterministic function of the registry, never of
+        // anything local.
+        let index = self.validators.keys().next_back().map_or(0, |k| k + 1);
+        self.validators.insert(
+            index,
+            ValidatorRecord {
+                index,
+                pubkey: tx.validator_pubkey.to_vec(),
+                staked_sat: tx.amount_sat,
+                randao_commitment: tx.randao_commitment,
+                withdrawal_credentials: tx.withdrawal_addr.to_vec(),
+                // Not scheduled until the activation queue admits it.
+                activation_epoch: u64::MAX,
+                exit_epoch: u64::MAX,
+                withdrawable_epoch: u64::MAX,
+                slashed: false,
+                commission_bps,
+            },
+        );
+        self.reveals_used.insert(index, 0);
+        self.pubkey_index.insert(pubkey_hash, index);
+        self.deposit_history.push(QueuedDeposit {
+            pubkey_hash,
+            deposit_epoch: self.epoch,
+            amount_sat: tx.amount_sat,
+        });
+        Ok(index)
+    }
+
+    /// Apply one signed voluntary exit — the post-flag-day path, and the only
+    /// path that can ever retire a validator from a transaction.
+    ///
+    /// The exit rule itself — identity binding, replay/pre-signing bounds,
+    /// hybrid signature over [`staking::ExitTx::signing_root`] against the
+    /// key **as committed at registration** — is [`staking::validate_exit`]
+    /// and is stated NOWHERE else; this method contributes only what the
+    /// pure rule cannot know: the flag-day gate, the record's existence and
+    /// standing (active, not already exiting, not slashed — slashing has its
+    /// own ejection path and must not share the voluntary one), and the two
+    /// clock writes. Until 2026-08-31 the live `Exit` arm wrote `exit_epoch`
+    /// from a bare index while `validate_exit` had zero production call
+    /// sites; this is the merge.
+    ///
+    /// # Interface, deliberately taken rather than designed
+    ///
+    /// Like [`Self::apply_deposit`], the wire encoding that reaches this
+    /// method belongs to the staking-format work stream; this takes the
+    /// SEMANTIC exit ([`staking::ExitTx`]: committed-pubkey hash, epoch,
+    /// hybrid signature) plus an injected [`staking::HybridKeyVerifier`].
+    /// The exit names its validator by pubkey hash, not index, because the
+    /// hash is what the signature's identity binding runs against; the index
+    /// is resolved from the committed `pubkey_index`, never trusted from the
+    /// wire.
+    ///
+    /// Returns the retired validator's index. On any `Err` the state is
+    /// untouched: every check runs before the first mutation.
+    pub(crate) fn apply_exit(
+        &mut self,
+        exit: &staking::ExitTx,
+        keys: &dyn staking::HybridKeyVerifier,
+    ) -> Result<u32, TxReject> {
+        // THE FLAG-DAY GATE, FIRST — same reading discipline as
+        // `apply_deposit`: the COMMITTED epoch, never anything node-local
+        // (the 2026-08-08 `expected_bits` fork is the standing reason).
+        #[cfg(test)]
+        let activation = crate::params::rehearsal::effective_signed_exit_activation();
+        #[cfg(not(test))]
+        let activation = crate::params::SIGNED_EXIT_ACTIVATION_EPOCH;
+        if self.epoch < activation {
+            return Err(TxReject::StakingNotActive);
+        }
+        // Resolve the record by its committed identity. An unknown hash is
+        // the rule's own UnknownValidator, relayed under the one taxonomy.
+        let Some(&index) = self.pubkey_index.get(&exit.pubkey_hash) else {
+            return Err(TxReject::Exit(staking::ExitReject::UnknownValidator));
+        };
+        let Some(rec) = self.validators.get(&index) else {
+            // The two maps are written together everywhere; diverging here
+            // means corrupted state, and refusing beats guessing.
+            return Err(TxReject::Exit(staking::ExitReject::UnknownValidator));
+        };
+        // Standing: state-dependent, so it lives here, not in the pure rule.
+        // Not-yet-active and slashed keep the legacy arm's `StakingRule`
+        // verdict; already-exiting is the rule's own `AlreadyExited`, passed
+        // to it as a fact and relayed from it as a verdict.
+        if rec.slashed || rec.activation_epoch > self.epoch {
+            return Err(TxReject::StakingRule);
+        }
+        // The one exit rule: identity, replay bounds, hybrid signature
+        // against the registered key. Its verdict is relayed, never restated.
+        staking::validate_exit(
+            exit,
+            &rec.pubkey,
+            rec.exit_epoch != u64::MAX,
+            self.epoch,
+            keys,
+        )
+        .map_err(TxReject::Exit)?;
+        // All checks passed — now, and only now, the two clock writes.
+        // Duties stop EXIT_DELAY_EPOCHS after the request — an exit must not
+        // dodge already-assigned duties — and the stake stays slashable
+        // through the weak-subjectivity margin.
+        let exit_epoch = self.epoch.saturating_add(staking::EXIT_DELAY_EPOCHS);
+        let rec = self
+            .validators
+            .get_mut(&index)
+            .expect("checked above; the registry is not touched in between");
+        rec.exit_epoch = exit_epoch;
+        rec.withdrawable_epoch = exit_epoch.saturating_add(staking::WITHDRAWAL_DELAY_EPOCHS);
+        Ok(index)
+    }
+
+    /// Apply one FUNDED delegation — the post-flag-day path, holding the
+    /// state-dependent delegation rules the retired tag-0x04 arm used to
+    /// hold. Like [`Self::apply_deposit`] it takes the semantic message; the
+    /// funded wire encoding (with the delegator's authorisation and the
+    /// outputs being bonded) belongs to the funded-format work stream, and
+    /// resolving those is the caller's job before this is reached.
+    ///
+    /// Unlike the retired arm, there is no `eligible` parameter: the tag-0x04
+    /// encoding took eligibility FROM THE TRANSACTION, which let a proposer
+    /// assert it at will. Eligibility is a fact about committed state, and in
+    /// Genesis-4 that fact is unconditional: the §4.1 taint set is retired
+    /// and EMPTY, and no oracle may derive `false` from where a coin came
+    /// from (founder decision, 2026-08-11 — `delegation.rs` module docs).
+    /// Every funded delegation is therefore recorded eligible; the bit stays
+    /// in [`Delegation`] only as the fail-closed door the state machine
+    /// carries, and repopulating the set that could close it is a consensus
+    /// change with its own flag day, not a parameter.
+    pub(crate) fn apply_delegation(
+        &mut self,
+        delegator: u32,
+        validator: u32,
+        amount_sat: u128,
+    ) -> Result<(), TxReject> {
+        // Same gate, same reading discipline as `apply_deposit`.
+        #[cfg(test)]
+        let activation = crate::params::rehearsal::effective_funded_staking_activation();
+        #[cfg(not(test))]
+        let activation = crate::params::FUNDED_STAKING_ACTIVATION_EPOCH;
+        if self.epoch < activation {
+            return Err(TxReject::StakingNotActive);
+        }
+        let Some(rec) = self.validators.get(&validator) else {
+            return Err(TxReject::StakingRule);
+        };
+        if rec.slashed || rec.exit_epoch != u64::MAX {
+            return Err(TxReject::StakingRule);
+        }
+        if amount_sat < delegation::MIN_DELEGATION_SAT {
+            return Err(TxReject::StakingRule);
+        }
+        self.delegations.push(Delegation {
+            delegator,
+            validator,
+            amount_sat,
+            // A delegation included during epoch E requests from E+1: the
+            // stake backing epoch E's committees was fixed before E started,
+            // and nothing included *during* E may change it (the same
+            // principle as ACTIVATION_DELAY).
+            requested_epoch: self.epoch + 1,
+            deactivate_epoch: None,
+            // Derived from committed state, never from the message: the
+            // Genesis-4 taint set is empty, so every funded delegation is
+            // eligible (see the method docs).
+            eligible: true,
+        });
+        Ok(())
     }
 
     /// Authorise, price and apply one value transfer against the committed
@@ -3730,6 +3984,60 @@ mod tests {
         }
     }
 
+    // ── Funded/signed staking fixtures ──────────────────────────────────────
+    //
+    // The post-flag-day paths (`apply_deposit`, `apply_exit`,
+    // `apply_delegation`) verify through `staking::HybridKeyVerifier`, whose
+    // AND-composition and split points are pinned by staking.rs's own tests;
+    // here the verifier is a switchboard so a test can fail exactly one half.
+
+    struct ToyHybridKeys {
+        accept_mldsa: bool,
+        accept_falcon: bool,
+    }
+
+    impl staking::HybridKeyVerifier for ToyHybridKeys {
+        fn verify_mldsa65(&self, _pk: &[u8], _root: &[u8; 32], _sig: &[u8]) -> bool {
+            self.accept_mldsa
+        }
+        fn verify_falcon1024(&self, _pk: &[u8], _root: &[u8; 32], _sig: &[u8]) -> bool {
+            self.accept_falcon
+        }
+    }
+
+    fn accept_all_keys() -> ToyHybridKeys {
+        ToyHybridKeys { accept_mldsa: true, accept_falcon: true }
+    }
+
+    /// A well-formed funded deposit for a fresh `tag`-patterned raw hybrid
+    /// key — the committed shape `apply_deposit` registers.
+    fn funded_deposit_tx(tag: u8) -> staking::DepositTx {
+        staking::DepositTx {
+            suite: staking::SUITE_MLDSA65_FALCON1024,
+            amount_sat: staking::MIN_DEPOSIT_SAT,
+            validator_pubkey: [tag; staking::HYBRID_PK_BYTES],
+            randao_commitment: [tag ^ 0xFF; 32],
+            withdrawal_addr: [tag; 32],
+            // ML-DSA half + a plausible Falcon half, as in staking.rs tests.
+            proof_of_possession: vec![0u8; staking::MLDSA65_SIG_BYTES + 1280],
+        }
+    }
+
+    /// The one shape a deposit input may have in Genesis-4: transparent,
+    /// untainted (the taint set is retired and empty).
+    fn clean_deposit_inputs() -> Vec<staking::DepositInput> {
+        vec![staking::DepositInput { transparent: true, tainted: false }]
+    }
+
+    /// A signed exit for the given committed record, at `epoch`.
+    fn exit_tx_for(rec: &ValidatorRecord, epoch: u64) -> staking::ExitTx {
+        staking::ExitTx {
+            pubkey_hash: Sha3_256::digest(&rec.pubkey).into(),
+            epoch,
+            signature: vec![0u8; staking::MLDSA65_SIG_BYTES + 1280],
+        }
+    }
+
     /// A spender's "key". Length varies with the tag so two owners never share
     /// a script hash by accident.
     fn owner_key(tag: u8) -> Vec<u8> {
@@ -4574,27 +4882,24 @@ mod tests {
 
     #[test]
     fn replay_is_delivery_order_independent() {
-        let (t, g, mut chains) = setup(8);
+        // A chain with real content: two value transfers (the staking
+        // messages that used to sit here are consensus-rejected at every
+        // epoch since 2026-08-31 — a block carrying one no longer applies)
+        // and a full attestation quorum.
+        let alice = owner_key(0x50);
+        let bob_script = script_of(&owner_key(0x51));
+        let coin_a = opening(0x80, 0, 60_000_000, &alice);
+        let coin_b = opening(0x80, 1, 40_000_000, &alice);
+        let (t, g, mut chains) = setup_funded(8, &[coin_a.clone(), coin_b.clone()]);
 
-        // A chain with real content: a deposit, a delegation, and a full
-        // attestation quorum.
-        let deposit = PosTransaction::Deposit {
-            pubkey: vec![0xAB; 8],
-            amount_sat: staking::MIN_DEPOSIT_SAT,
-            randao_commitment: [0xCD; 32],
-            withdrawal_credentials: vec![0xEF; 4],
-            commission_bps: 500,
-        };
-        let delegate = PosTransaction::Delegate {
-            delegator: 900,
-            validator: 0,
-            amount_sat: delegation::MIN_DELEGATION_SAT,
-            eligible: true,
-        };
-        let b1 = build_block(&t, &g, 33, &[], &[deposit.clone()], &mut chains);
-        let s1 = t.apply_block(&g, &b1, &[], &[deposit.clone()]).unwrap();
-        let b2 = build_block(&t, &s1, 34, &[], &[delegate.clone()], &mut chains);
-        let s2 = t.apply_block(&s1, &b2, &[], &[delegate.clone()]).unwrap();
+        let tx1 =
+            transfer_spending(&[coin_a], &alice, bob_script, 512, 2, g.next_base_fee());
+        let b1 = build_block(&t, &g, 33, &[], std::slice::from_ref(&tx1), &mut chains);
+        let s1 = t.apply_block(&g, &b1, &[], std::slice::from_ref(&tx1)).unwrap();
+        let tx2 =
+            transfer_spending(&[coin_b], &alice, bob_script, 512, 2, s1.next_base_fee());
+        let b2 = build_block(&t, &s1, 34, &[], std::slice::from_ref(&tx2), &mut chains);
+        let s2 = t.apply_block(&s1, &b2, &[], std::slice::from_ref(&tx2)).unwrap();
         let atts = full_epoch_attestations(&s2, *s1.head().as_bytes());
         let b3 = build_block(&t, &s2, 63, &atts, &[], &mut chains);
         let final_a = t.apply_block(&s2, &b3, &atts, &[]).unwrap();
@@ -4602,13 +4907,13 @@ mod tests {
         // Out-of-order delivery: a later block cannot apply early — the
         // parent check refuses it, so delivery order never reaches state.
         assert_eq!(
-            t.apply_block(&g, &b2, &[], &[delegate.clone()]),
+            t.apply_block(&g, &b2, &[], std::slice::from_ref(&tx2)),
             Err(TransitionError::WrongParent),
         );
 
         // The caller buffers and replays in chain order: identical end state.
-        let r1 = t.apply_block(&g, &b1, &[], &[deposit]).unwrap();
-        let r2 = t.apply_block(&r1, &b2, &[], &[delegate]).unwrap();
+        let r1 = t.apply_block(&g, &b1, &[], std::slice::from_ref(&tx1)).unwrap();
+        let r2 = t.apply_block(&r1, &b2, &[], std::slice::from_ref(&tx2)).unwrap();
         let final_b = t.apply_block(&r2, &b3, &atts, &[]).unwrap();
         assert_eq!(final_a, final_b);
         assert_eq!(final_a.state_root(), final_b.state_root());
@@ -4674,88 +4979,399 @@ mod tests {
         assert!(st.randao_mix_at(3).is_none());
     }
 
+    /// The activation pipeline, now fed by the FUNDED path: `apply_deposit`
+    /// registers the record (this test moves the flag day; the shipped
+    /// constant is inert `u64::MAX`), the queue schedules it, and the epoch
+    /// walk activates it. The legacy tag-0x02 inclusion this test used to
+    /// drive is consensus-rejected at every epoch — see
+    /// `legacy_staking_messages_are_consensus_rejected_at_every_epoch`.
     #[test]
     fn deposit_queues_and_activates_through_the_epoch_pipeline() {
-        let (t, g, mut chains) = setup(4);
-        let deposit = PosTransaction::Deposit {
-            pubkey: vec![0xAA; 8],
-            amount_sat: staking::MIN_DEPOSIT_SAT,
-            randao_commitment: [0xBB; 32],
-            withdrawal_credentials: vec![0xCC; 4],
-            commission_bps: 500,
-        };
-        // Included during epoch 1.
-        let b = build_block(&t, &g, 33, &[], std::slice::from_ref(&deposit), &mut chains);
-        let mut st = t.apply_block(&g, &b, &[], std::slice::from_ref(&deposit)).unwrap();
+        crate::params::rehearsal::with_funded_staking_activation_at(0, || {
+            let (t, g, _chains) = setup(4);
+            let mut st = g.clone();
 
-        let new_index = 4u32;
-        let rec = st.validator_record(new_index).expect("deposit must register a record");
-        assert_eq!(rec.activation_epoch, u64::MAX, "not scheduled until the queue admits it");
-        assert!(
-            !st.active_validators().iter().any(|v| v.index == new_index),
-            "a queued validator has no duties"
-        );
-
-        // Walk the boundaries to the activation epoch: deposit at epoch 1 →
-        // eligible at 1 + ACTIVATION_DELAY_EPOCHS.
-        let expected = 1 + staking::ACTIVATION_DELAY_EPOCHS;
-        while st.epoch < expected {
+            // Included during epoch 1 — walk one boundary first, as the old
+            // block-carried inclusion did.
             st = t.process_epoch(&st).unwrap();
-        }
-        let rec = st.validator_record(new_index).unwrap();
-        assert_eq!(rec.activation_epoch, expected);
-        assert!(
-            st.active_validators().iter().any(|v| v.index == new_index),
-            "activated validator must appear in the roster"
-        );
+            assert_eq!(st.epoch, 1);
+            let tx = funded_deposit_tx(0xAA);
+            let new_index = st
+                .apply_deposit(&tx, &clean_deposit_inputs(), 500, 0, &accept_all_keys())
+                .expect("a valid funded deposit must register");
+            assert_eq!(new_index, 4, "next free index is a function of the registry");
 
-        // A second deposit of the same pubkey is a deterministic reject.
-        let dup = PosTransaction::Deposit {
-            pubkey: vec![0xAA; 8],
-            amount_sat: staking::MIN_DEPOSIT_SAT,
-            randao_commitment: [0xDD; 32],
-            withdrawal_credentials: vec![0xEE; 4],
-            commission_bps: 500,
-        };
-        let mut probe = st.clone();
-        assert_eq!(
-            probe.apply_transaction(
-                &dup,
-                0,
-                fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
-                &OkVerifier
-            ),
-            Err(TxReject::StakingRule)
-        );
+            let rec = st.validator_record(new_index).expect("deposit must register a record");
+            assert_eq!(rec.activation_epoch, u64::MAX, "not scheduled until the queue admits it");
+            assert!(
+                !st.active_validators().iter().any(|v| v.index == new_index),
+                "a queued validator has no duties"
+            );
+
+            // Walk the boundaries to the activation epoch: deposit at epoch 1
+            // → eligible at 1 + ACTIVATION_DELAY_EPOCHS.
+            let expected = 1 + staking::ACTIVATION_DELAY_EPOCHS;
+            while st.epoch < expected {
+                st = t.process_epoch(&st).unwrap();
+            }
+            let rec = st.validator_record(new_index).unwrap();
+            assert_eq!(rec.activation_epoch, expected);
+            assert!(
+                st.active_validators().iter().any(|v| v.index == new_index),
+                "activated validator must appear in the roster"
+            );
+
+            // A second deposit of the same pubkey is a deterministic reject —
+            // the top-up decision the interface refuses to make implicitly.
+            let mut dup = funded_deposit_tx(0xAA);
+            dup.randao_commitment = [0xDD; 32];
+            assert_eq!(
+                st.clone().apply_deposit(&dup, &clean_deposit_inputs(), 500, 0, &accept_all_keys()),
+                Err(TxReject::StakingRule)
+            );
+
+            // And the one deposit rule is actually consulted: a PoP that
+            // fails one hybrid half is the rule's own verdict, relayed.
+            let fresh = funded_deposit_tx(0xAB);
+            let mldsa_only = ToyHybridKeys { accept_mldsa: true, accept_falcon: false };
+            assert_eq!(
+                st.clone().apply_deposit(&fresh, &clean_deposit_inputs(), 500, 0, &mldsa_only),
+                Err(TxReject::Deposit(staking::DepositReject::BadProofOfPossession))
+            );
+        });
     }
 
+    /// The exit lifecycle, now through the SIGNED path: a validator
+    /// registered by `apply_deposit` and activated by the queue exits through
+    /// `apply_exit`, which routes the one exit rule
+    /// (`staking::validate_exit`) against the key as committed. Both flag
+    /// days are moved here; shipped, both are inert `u64::MAX`.
     #[test]
     fn exit_schedules_duty_stop_and_withdrawal_delay() {
-        let (t, g, mut chains) = setup(4);
-        let exit = PosTransaction::Exit { validator: 0 };
-        let b = build_block(&t, &g, 1, &[], std::slice::from_ref(&exit), &mut chains);
-        let st = t.apply_block(&g, &b, &[], std::slice::from_ref(&exit)).unwrap();
+        crate::params::rehearsal::with_funded_staking_activation_at(0, || {
+            crate::params::rehearsal::with_signed_exit_activation_at(0, || {
+                let (t, g, _chains) = setup(4);
+                let mut st = g.clone();
+                let tx = funded_deposit_tx(0xAB);
+                let idx = st
+                    .apply_deposit(&tx, &clean_deposit_inputs(), 500, 0, &accept_all_keys())
+                    .unwrap();
+                let expected_activation = staking::ACTIVATION_DELAY_EPOCHS;
+                while st.epoch < expected_activation {
+                    st = t.process_epoch(&st).unwrap();
+                }
+                assert!(st.active_validators().iter().any(|v| v.index == idx));
 
-        let rec = st.validator_record(0).unwrap();
-        assert_eq!(rec.exit_epoch, staking::EXIT_DELAY_EPOCHS, "duties stop only after the delay");
-        assert_eq!(
-            rec.withdrawable_epoch,
-            staking::EXIT_DELAY_EPOCHS + staking::WITHDRAWAL_DELAY_EPOCHS,
-            "the weak-subjectivity margin counts from the exit epoch"
-        );
-        // Still on duty this epoch — an exit is not a same-epoch escape.
-        assert!(st.active_validators().iter().any(|v| v.index == 0));
-        // A second exit is rejected: the withdrawal clock must never reset.
-        let mut probe = st.clone();
-        assert_eq!(
-            probe.apply_transaction(
-                &exit,
+                let rec = st.validator_record(idx).unwrap();
+                let exit = exit_tx_for(&rec, st.epoch);
+                let exited = st.apply_exit(&exit, &accept_all_keys()).expect("a signed exit applies");
+                assert_eq!(exited, idx, "the index comes from the committed registry");
+
+                let request_epoch = st.epoch;
+                let rec = st.validator_record(idx).unwrap();
+                assert_eq!(
+                    rec.exit_epoch,
+                    request_epoch + staking::EXIT_DELAY_EPOCHS,
+                    "duties stop only after the delay"
+                );
+                assert_eq!(
+                    rec.withdrawable_epoch,
+                    request_epoch + staking::EXIT_DELAY_EPOCHS + staking::WITHDRAWAL_DELAY_EPOCHS,
+                    "the weak-subjectivity margin counts from the exit epoch"
+                );
+                // Still on duty this epoch — an exit is not a same-epoch escape.
+                assert!(st.active_validators().iter().any(|v| v.index == idx));
+                // A second exit is rejected — the withdrawal clock must never
+                // reset — and the verdict is the rule's own, relayed.
+                assert_eq!(
+                    st.apply_exit(&exit, &accept_all_keys()),
+                    Err(TxReject::Exit(staking::ExitReject::AlreadyExited))
+                );
+            });
+        });
+    }
+
+    /// What `apply_exit` refuses, and under whose taxonomy. The signature
+    /// checks bind the exit to the REGISTERED key: an unknown identity, a
+    /// half-failing signature, and a registered key with no defined hybrid
+    /// halves (the genesis fixture's 8-byte toys — exactly what a corrupt
+    /// registry entry would look like) are each a named, deterministic
+    /// refusal, and none of them mutates state.
+    #[test]
+    fn apply_exit_binds_to_the_registered_key() {
+        crate::params::rehearsal::with_funded_staking_activation_at(0, || {
+            crate::params::rehearsal::with_signed_exit_activation_at(0, || {
+                let (t, g, _chains) = setup(4);
+                let mut st = g.clone();
+                let tx = funded_deposit_tx(0xAB);
+                let idx = st
+                    .apply_deposit(&tx, &clean_deposit_inputs(), 500, 0, &accept_all_keys())
+                    .unwrap();
+                while st.epoch < staking::ACTIVATION_DELAY_EPOCHS {
+                    st = t.process_epoch(&st).unwrap();
+                }
+                let rec = st.validator_record(idx).unwrap();
+
+                // Unknown identity: nobody registered this hash.
+                let mut stranger = exit_tx_for(&rec, st.epoch);
+                stranger.pubkey_hash = [0x99; 32];
+                assert_eq!(
+                    st.apply_exit(&stranger, &accept_all_keys()),
+                    Err(TxReject::Exit(staking::ExitReject::UnknownValidator))
+                );
+
+                // One hybrid half failing fails the exit — the AND lives in
+                // the staking module and the transition must not soften it.
+                let exit = exit_tx_for(&rec, st.epoch);
+                let falcon_only = ToyHybridKeys { accept_mldsa: false, accept_falcon: true };
+                assert_eq!(
+                    st.apply_exit(&exit, &falcon_only),
+                    Err(TxReject::Exit(staking::ExitReject::BadSignature))
+                );
+
+                // Pre-signing for a future epoch is refused by the rule.
+                let future = exit_tx_for(&rec, st.epoch + 1);
+                assert_eq!(
+                    st.apply_exit(&future, &accept_all_keys()),
+                    Err(TxReject::Exit(staking::ExitReject::FutureEpoch))
+                );
+
+                // A registered key with no defined halves fails CLOSED, by
+                // name — never verifies, never panics.
+                let toy_rec = st.validator_record(0).unwrap();
+                assert_eq!(toy_rec.pubkey.len(), 8, "fixture premise");
+                let toy_exit = exit_tx_for(&toy_rec, st.epoch);
+                assert_eq!(
+                    st.apply_exit(&toy_exit, &accept_all_keys()),
+                    Err(TxReject::Exit(staking::ExitReject::MalformedRegisteredKey))
+                );
+
+                // None of the refusals moved any clock.
+                assert_eq!(st.validator_record(idx).unwrap().exit_epoch, u64::MAX);
+                assert_eq!(st.validator_record(0).unwrap().exit_epoch, u64::MAX);
+            });
+        });
+    }
+
+    /// **The 2026-08-31 closure, block level.** The legacy staking encodings
+    /// — tag 0x02 `Deposit` (stake minted from nothing), tag 0x03 `Exit` (a
+    /// bare index retiring any validator), tag 0x04 `Delegate`
+    /// (proposer-chosen weight and eligibility) — are rejected BY CONSENSUS,
+    /// inside the transition, at every epoch. Until today the only refusal
+    /// was the mempool's (`bloch-pos-node`'s `admissible`), which a proposer
+    /// building its own block never consults; each of these bodies is
+    /// exactly what a hostile committee member would have included, and each
+    /// now rejects the whole block on every node.
+    ///
+    /// The flag-day overrides are exercised INSIDE the negative: even with
+    /// both successor flag days forced open, the legacy encodings stay
+    /// rejected — no flag day reopens an unauthenticated format.
+    #[test]
+    fn legacy_staking_messages_are_consensus_rejected_at_every_epoch() {
+        let legacy: [PosTransaction; 3] = [
+            PosTransaction::Deposit {
+                pubkey: vec![0xAA; 8],
+                amount_sat: staking::MIN_DEPOSIT_SAT,
+                randao_commitment: [0xBB; 32],
+                withdrawal_credentials: vec![0xCC; 4],
+                commission_bps: 500,
+            },
+            // The exact shape of the roster-emptying attack: an index.
+            PosTransaction::Exit { validator: 0 },
+            PosTransaction::Delegate {
+                delegator: 900,
+                validator: 0,
+                amount_sat: delegation::MIN_DELEGATION_SAT,
+                eligible: true,
+            },
+        ];
+
+        for tx in &legacy {
+            // Block level: a fresh fixture per body (a probe consumes a
+            // proposer reveal, and the header commits to its body).
+            let (t, g, mut chains) = setup(4);
+            let env = probe_env(&g, 1, std::slice::from_ref(tx), &mut chains);
+            assert_eq!(
+                t.compute_post_state(&g, &env, &[], std::slice::from_ref(tx)).unwrap_err(),
+                TransitionError::Transaction(0),
+                "a block carrying {tx:?} must be rejected wholesale"
+            );
+
+            // Transaction level, with the named reason, and state untouched.
+            let mut probe = g.clone();
+            assert_eq!(
+                probe.apply_transaction(
+                    tx,
+                    0,
+                    fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+                    &OkVerifier
+                ),
+                Err(TxReject::StakingNotActive),
+            );
+            assert_eq!(probe.validators, g.validators, "a refused message must not touch state");
+            assert!(probe.delegations.is_empty());
+            assert!(probe.deposit_history.is_empty());
+
+            // And no flag day reopens the legacy encodings: with BOTH
+            // successor activations forced open, the verdict is unchanged.
+            crate::params::rehearsal::with_funded_staking_activation_at(0, || {
+                crate::params::rehearsal::with_signed_exit_activation_at(0, || {
+                    assert_eq!(
+                        g.clone().apply_transaction(
+                            tx,
+                            0,
+                            fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+                            &OkVerifier
+                        ),
+                        Err(TxReject::StakingNotActive),
+                        "the flag days gate the successors, never tag 0x02/0x03/0x04"
+                    );
+                });
+            });
+        }
+    }
+
+    /// Both sides of the funded-staking flag day, through the same `<` the
+    /// fleet runs: `apply_deposit` and `apply_delegation` refuse with
+    /// `StakingNotActive` at `activation − 1` and apply at `activation` —
+    /// and the OTHER flag day (signed exits) does not open with this one.
+    #[test]
+    fn funded_staking_activates_at_its_flag_day_and_not_before() {
+        crate::params::rehearsal::with_funded_staking_activation_at(2, || {
+            let (t, g, _chains) = setup(4);
+            // Epoch 1 = activation − 1: the boundary's near side.
+            let mut st = t.process_epoch(&g).unwrap();
+            assert_eq!(st.epoch, 1);
+            let tx = funded_deposit_tx(0xAA);
+            assert_eq!(
+                st.apply_deposit(&tx, &clean_deposit_inputs(), 500, 0, &accept_all_keys()),
+                Err(TxReject::StakingNotActive)
+            );
+            assert_eq!(
+                st.apply_delegation(900, 0, delegation::MIN_DELEGATION_SAT),
+                Err(TxReject::StakingNotActive)
+            );
+            assert!(st.deposit_history.is_empty());
+            assert!(st.delegations.is_empty());
+
+            // Epoch 2 = activation: both apply.
+            st = t.process_epoch(&st).unwrap();
+            assert_eq!(st.epoch, 2);
+            let idx = st
+                .apply_deposit(&tx, &clean_deposit_inputs(), 500, 0, &accept_all_keys())
+                .expect("at the flag day the funded deposit applies");
+            assert_eq!(idx, 4);
+            st.apply_delegation(900, 0, delegation::MIN_DELEGATION_SAT)
+                .expect("at the flag day the funded delegation applies");
+            // Eligibility is DERIVED, not taken from any message: the
+            // Genesis-4 taint set is empty, so the recorded bit is true, and
+            // there is no parameter through which a proposer could have said
+            // otherwise.
+            let d = st.delegations.last().unwrap();
+            assert!(d.eligible, "derived eligibility must record true in Genesis-4");
+            assert_eq!(d.requested_epoch, st.epoch + 1, "counts only from the next epoch");
+
+            // Funded staking opening does NOT open signed exits: their flag
+            // day is separate and still inert here.
+            let rec = st.validator_record(0).unwrap();
+            let exit = exit_tx_for(&rec, st.epoch);
+            assert_eq!(
+                st.apply_exit(&exit, &accept_all_keys()),
+                Err(TxReject::StakingNotActive)
+            );
+        });
+    }
+
+    /// Both sides of the signed-exit flag day — and the funded flag day does
+    /// not follow it: with only exits armed, deposits and delegations stay
+    /// refused.
+    #[test]
+    fn signed_exits_activate_at_their_flag_day_and_not_before() {
+        // Registration needs the funded path, so open it just to build the
+        // fixture, then let it lapse: `with_` restores on the way out.
+        let (t, g, _chains) = setup(4);
+        let mut st = g.clone();
+        let idx = crate::params::rehearsal::with_funded_staking_activation_at(0, || {
+            st.apply_deposit(
+                &funded_deposit_tx(0xAB),
+                &clean_deposit_inputs(),
+                500,
                 0,
-                fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
-                &OkVerifier
+                &accept_all_keys(),
+            )
+            .unwrap()
+        });
+        while st.epoch < staking::ACTIVATION_DELAY_EPOCHS {
+            st = t.process_epoch(&st).unwrap();
+        }
+        let activation = st.epoch + 1;
+        crate::params::rehearsal::with_signed_exit_activation_at(activation, || {
+            let rec = st.validator_record(idx).unwrap();
+            // Near side: one epoch before the flag day.
+            let exit = exit_tx_for(&rec, st.epoch);
+            assert_eq!(
+                st.apply_exit(&exit, &accept_all_keys()),
+                Err(TxReject::StakingNotActive)
+            );
+            assert_eq!(st.validator_record(idx).unwrap().exit_epoch, u64::MAX);
+
+            // At the flag day: the signed exit applies.
+            st = t.process_epoch(&st).unwrap();
+            assert_eq!(st.epoch, activation);
+            let exit = exit_tx_for(&rec, st.epoch);
+            assert_eq!(st.apply_exit(&exit, &accept_all_keys()), Ok(idx));
+            assert_eq!(
+                st.validator_record(idx).unwrap().exit_epoch,
+                st.epoch + staking::EXIT_DELAY_EPOCHS
+            );
+
+            // Exits being open does not open the funded formats.
+            assert_eq!(
+                st.apply_deposit(
+                    &funded_deposit_tx(0xAC),
+                    &clean_deposit_inputs(),
+                    500,
+                    0,
+                    &accept_all_keys()
+                ),
+                Err(TxReject::StakingNotActive)
+            );
+            assert_eq!(
+                st.apply_delegation(901, 0, delegation::MIN_DELEGATION_SAT),
+                Err(TxReject::StakingNotActive)
+            );
+        });
+    }
+
+    /// The shipped constants are INERT — `u64::MAX`, unreachable by any
+    /// epoch — and must stay so until the runbook arms them: the successor
+    /// formats do not exist on the wire yet, so nothing may activate them.
+    /// Arming either is a flag day with the same discipline as
+    /// `leaked_roster_armed_epoch_matches_the_runbook`.
+    #[test]
+    fn staking_flag_days_ship_inert() {
+        assert_eq!(crate::params::FUNDED_STAKING_ACTIVATION_EPOCH, u64::MAX);
+        assert_eq!(crate::params::SIGNED_EXIT_ACTIVATION_EPOCH, u64::MAX);
+        // And through the un-overridden readers, the paths refuse.
+        let (_t, g, _chains) = setup(4);
+        let mut st = g.clone();
+        assert_eq!(
+            st.apply_deposit(
+                &funded_deposit_tx(0xAA),
+                &clean_deposit_inputs(),
+                500,
+                0,
+                &accept_all_keys()
             ),
-            Err(TxReject::StakingRule)
+            Err(TxReject::StakingNotActive)
         );
+        assert_eq!(
+            st.apply_delegation(900, 0, delegation::MIN_DELEGATION_SAT),
+            Err(TxReject::StakingNotActive)
+        );
+        let rec = st.validator_record(0).unwrap();
+        let exit = exit_tx_for(&rec, st.epoch);
+        assert_eq!(st.apply_exit(&exit, &accept_all_keys()), Err(TxReject::StakingNotActive));
     }
 
     /// One transfer, charged by the fee market rather than by its own say-so,
@@ -5568,23 +6184,21 @@ mod tests {
         let spender = owner_key(0x3B);
         let coins: Vec<_> =
             (0..2u32).map(|i| opening(0x78, i, 100_000_000, &spender)).collect();
-        let (t, g, mut chains) = setup_funded(4, &coins);
+        let (t, mut g, mut chains) = setup_funded(4, &coins);
         // A delegation behind validator 0, bonded during epoch 0 so it is
         // warming up (partially activated under the churn budget) by epoch 1 —
         // the epoch whose boundary settles the fee. Requested during E means
         // it can only count from E+1, which is why the fee block cannot be in
-        // epoch 0.
+        // epoch 0. Bonded through the FUNDED path (flag day moved for the
+        // test; the legacy tag-0x04 carrier is consensus-rejected at every
+        // epoch).
         let operator = 0u32;
-        let delegate = PosTransaction::Delegate {
-            delegator: 900,
-            validator: operator,
+        crate::params::rehearsal::with_funded_staking_activation_at(0, || {
             // Large next to a 200,000-BLOCH self-bond, so the delegator's
             // stake-weighted share survives the pro-rata truncation.
-            amount_sat: sat(600_000),
-            eligible: true,
-        };
-        let b1 = build_block(&t, &g, 1, &[], std::slice::from_ref(&delegate), &mut chains);
-        let s1 = t.apply_block(&g, &b1, &[], std::slice::from_ref(&delegate)).unwrap();
+            g.apply_delegation(900, operator, sat(600_000)).unwrap();
+        });
+        let s1 = g;
 
         // Find a slot in epoch 1 that the operator itself proposes: the fee
         // accrues to the block's producer, so the producer must be the account
@@ -6003,22 +6617,20 @@ mod tests {
 
     #[test]
     fn evidence_transaction_slashes_operator_and_delegators_and_pays_whistleblower() {
-        let (t, g, mut chains) = setup(4);
+        let (t, mut g, mut chains) = setup(4);
         let seed = g.seed_for_epoch(0);
         // Pick an offender that is NOT the proposer of the evidence-carrying
         // block, so the whistleblower's account is cleanly separable.
         let p2 = schedule::proposer(&seed, 2, &g.duty_roster()).unwrap();
         let offender = (p2 + 1) % 4;
 
-        // Block 1: a delegator bonds behind the future offender.
-        let delegate = PosTransaction::Delegate {
-            delegator: 900,
-            validator: offender,
-            amount_sat: delegation::MIN_DELEGATION_SAT,
-            eligible: true,
-        };
-        let b1 = build_block(&t, &g, 1, &[], std::slice::from_ref(&delegate), &mut chains);
-        let s1 = t.apply_block(&g, &b1, &[], std::slice::from_ref(&delegate)).unwrap();
+        // A delegator bonds behind the future offender — through the funded
+        // path (flag day moved; the legacy tag-0x04 carrier is
+        // consensus-rejected at every epoch).
+        crate::params::rehearsal::with_funded_staking_activation_at(0, || {
+            g.apply_delegation(900, offender, delegation::MIN_DELEGATION_SAT).unwrap();
+        });
+        let s1 = g;
 
         // Block 2 carries the evidence transaction.
         let ev = PosTransaction::SlashingEvidence(double_vote_evidence(offender));
@@ -6283,20 +6895,22 @@ mod tests {
         // vacuously.
         let spender = owner_key(0x3D);
         let coin = opening(0x79, 0, 100_000_000, &spender);
-        let (t, g, mut chains) = setup_funded(8, &[coin.clone()]);
-        let deposit = PosTransaction::Deposit {
-            pubkey: vec![0xAB; 8],
-            amount_sat: staking::MIN_DEPOSIT_SAT,
-            randao_commitment: [0xCD; 32],
-            withdrawal_credentials: vec![0xEF; 4],
-            commission_bps: 500,
-        };
-        let delegate = PosTransaction::Delegate {
-            delegator: 900,
-            validator: 0,
-            amount_sat: delegation::MIN_DELEGATION_SAT,
-            eligible: true,
-        };
+        let (t, mut g, mut chains) = setup_funded(8, &[coin.clone()]);
+        // The deposit and the delegation enter through the funded paths (flag
+        // day moved for the fixture; the legacy tag-0x02/0x04 carriers are
+        // consensus-rejected at every epoch), so `deposit_history` and
+        // `delegations` are as live as block-carried ones would have been.
+        crate::params::rehearsal::with_funded_staking_activation_at(0, || {
+            g.apply_deposit(
+                &funded_deposit_tx(0xAB),
+                &clean_deposit_inputs(),
+                500,
+                0,
+                &accept_all_keys(),
+            )
+            .unwrap();
+            g.apply_delegation(900, 0, delegation::MIN_DELEGATION_SAT).unwrap();
+        });
         let fee = transfer_spending(
             std::slice::from_ref(&coin),
             &spender,
@@ -6306,12 +6920,10 @@ mod tests {
             g.next_base_fee(),
         );
         let slot1 = SLOTS_PER_EPOCH + 1;
-        let b1 =
-            build_block(&t, &g, slot1, &[], &[deposit.clone(), fee.clone()], &mut chains);
-        let s1 = t.apply_block(&g, &b1, &[], &[deposit, fee]).unwrap();
-        let b2 =
-            build_block(&t, &s1, slot1 + 1, &[], std::slice::from_ref(&delegate), &mut chains);
-        let s2 = t.apply_block(&s1, &b2, &[], &[delegate]).unwrap();
+        let b1 = build_block(&t, &g, slot1, &[], std::slice::from_ref(&fee), &mut chains);
+        let s1 = t.apply_block(&g, &b1, &[], std::slice::from_ref(&fee)).unwrap();
+        let b2 = build_block(&t, &s1, slot1 + 1, &[], &[], &mut chains);
+        let s2 = t.apply_block(&s1, &b2, &[], &[]).unwrap();
         let atts = full_epoch_attestations(&s2, *s1.head().as_bytes());
         let b3 = build_block(&t, &s2, slot1 + 7, &atts, &[], &mut chains);
         let mut st = t.apply_block(&s2, &b3, &atts, &[]).unwrap();
@@ -6504,20 +7116,23 @@ mod tests {
     fn convergent_paths_commit_identical_roots_with_bookkeeping_live() {
         let spender = owner_key(0x3F);
         let coin = opening(0x7A, 0, 100_000_000, &spender);
-        let (t, g, mut chains) = setup_funded(8, &[coin.clone()]);
-        let deposit = PosTransaction::Deposit {
-            pubkey: vec![0xAB; 8],
-            amount_sat: staking::MIN_DEPOSIT_SAT,
-            randao_commitment: [0xCD; 32],
-            withdrawal_credentials: vec![0xEF; 4],
-            commission_bps: 500,
-        };
-        let delegate = PosTransaction::Delegate {
-            delegator: 900,
-            validator: 0,
-            amount_sat: delegation::MIN_DELEGATION_SAT,
-            eligible: true,
-        };
+        let (t, mut g, mut chains) = setup_funded(8, &[coin.clone()]);
+        // Deposit and delegation enter through the funded paths before the
+        // chain starts (flag day moved; the legacy tag-0x02/0x04 carriers are
+        // consensus-rejected at every epoch), so both bookkeeping components
+        // are live on every path below.
+        crate::params::rehearsal::with_funded_staking_activation_at(0, || {
+            g.apply_deposit(
+                &funded_deposit_tx(0xAB),
+                &clean_deposit_inputs(),
+                500,
+                0,
+                &accept_all_keys(),
+            )
+            .unwrap();
+            g.apply_delegation(900, 0, delegation::MIN_DELEGATION_SAT).unwrap();
+        });
+        let g = g;
         let fee = transfer_spending(
             std::slice::from_ref(&coin),
             &spender,
@@ -6527,12 +7142,10 @@ mod tests {
             g.next_base_fee(),
         );
         let slot1 = SLOTS_PER_EPOCH + 1;
-        let b1 =
-            build_block(&t, &g, slot1, &[], &[deposit.clone(), fee.clone()], &mut chains);
-        let s1 = t.apply_block(&g, &b1, &[], &[deposit.clone(), fee.clone()]).unwrap();
-        let b2 =
-            build_block(&t, &s1, slot1 + 1, &[], std::slice::from_ref(&delegate), &mut chains);
-        let s2 = t.apply_block(&s1, &b2, &[], std::slice::from_ref(&delegate)).unwrap();
+        let b1 = build_block(&t, &g, slot1, &[], std::slice::from_ref(&fee), &mut chains);
+        let s1 = t.apply_block(&g, &b1, &[], std::slice::from_ref(&fee)).unwrap();
+        let b2 = build_block(&t, &s1, slot1 + 1, &[], &[], &mut chains);
+        let s2 = t.apply_block(&s1, &b2, &[], &[]).unwrap();
         let atts = full_epoch_attestations(&s2, *s1.head().as_bytes());
         let b3 = build_block(&t, &s2, slot1 + 7, &atts, &[], &mut chains);
 
@@ -6542,8 +7155,8 @@ mod tests {
         // Node B: processed the empty genesis-epoch boundary EXPLICITLY, then
         // applied the same blocks with b3's attestations delivered reversed.
         let e1 = t.process_epoch(&g).unwrap();
-        let r1 = t.apply_block(&e1, &b1, &[], &[deposit, fee]).unwrap();
-        let r2 = t.apply_block(&r1, &b2, &[], &[delegate]).unwrap();
+        let r1 = t.apply_block(&e1, &b1, &[], std::slice::from_ref(&fee)).unwrap();
+        let r2 = t.apply_block(&r1, &b2, &[], &[]).unwrap();
         let mut reversed = atts.clone();
         reversed.reverse();
         // Since step 3b the header commits to the ordered attestation list, so
@@ -6601,22 +7214,43 @@ mod tests {
     /// comment.
     #[test]
     fn header_must_commit_to_body_attestations_and_coherence() {
-        let (t, g, mut chains) = setup(4);
-        let deposit = PosTransaction::Exit { validator: 3 };
-        let good = build_block(&t, &g, 1, &[], std::slice::from_ref(&deposit), &mut chains);
+        // Two spendable coins so the carried body and the swapped-in body are
+        // both well-formed transactions. (This test used to carry legacy
+        // `Exit` messages as body content; those are consensus-rejected at
+        // every epoch now, and the control below must APPLY.)
+        let spender = owner_key(0x41);
+        let coin_a = opening(0x7B, 0, 60_000_000, &spender);
+        let coin_b = opening(0x7B, 1, 40_000_000, &spender);
+        let (t, g, mut chains) = setup_funded(4, &[coin_a.clone(), coin_b.clone()]);
+        let carried = transfer_spending(
+            &[coin_a],
+            &spender,
+            script_of(&owner_key(0x42)),
+            512,
+            2,
+            g.next_base_fee(),
+        );
+        let good = build_block(&t, &g, 1, &[], std::slice::from_ref(&carried), &mut chains);
         // Control: it applies.
-        assert!(t.apply_block(&g, &good, &[], std::slice::from_ref(&deposit)).is_ok());
+        assert!(t.apply_block(&g, &good, &[], std::slice::from_ref(&carried)).is_ok());
 
         // A body the header does not name.
         let mut b = good.clone();
         b.header.body_root = [0xAB; 32];
         assert_eq!(
-            t.compute_post_state(&g, &b, &[], std::slice::from_ref(&deposit)).unwrap_err(),
+            t.compute_post_state(&g, &b, &[], std::slice::from_ref(&carried)).unwrap_err(),
             TransitionError::BodyRootMismatch,
         );
         // ...and the reverse direction: header untouched, body swapped. This is
         // the case that matters, because it is the one an attacker controls.
-        let other = PosTransaction::Exit { validator: 2 };
+        let other = transfer_spending(
+            &[coin_b],
+            &spender,
+            script_of(&owner_key(0x42)),
+            512,
+            2,
+            g.next_base_fee(),
+        );
         assert_eq!(
             t.compute_post_state(&g, &good, &[], std::slice::from_ref(&other)).unwrap_err(),
             TransitionError::BodyRootMismatch,
@@ -6625,14 +7259,14 @@ mod tests {
         let mut b = good.clone();
         b.header.attestation_root = [0xCD; 32];
         assert_eq!(
-            t.compute_post_state(&g, &b, &[], std::slice::from_ref(&deposit)).unwrap_err(),
+            t.compute_post_state(&g, &b, &[], std::slice::from_ref(&carried)).unwrap_err(),
             TransitionError::AttestationRootMismatch,
         );
 
         let mut b = good.clone();
         b.header.coherence_root = [0xEF; 32];
         assert_eq!(
-            t.compute_post_state(&g, &b, &[], std::slice::from_ref(&deposit)).unwrap_err(),
+            t.compute_post_state(&g, &b, &[], std::slice::from_ref(&carried)).unwrap_err(),
             TransitionError::CoherenceRootMismatch,
         );
 
@@ -6798,8 +7432,12 @@ mod tests {
 
         // Exhaustive match, no `_` arm: every transaction the protocol can
         // carry is enumerated, and none of them is a mint or a cap edit —
-        // Transfer moves existing coins and pays fees from them, Deposit and
-        // Delegate bond existing coins, Exit unbonds them, evidence burns.
+        // Transfer moves existing coins and pays fees from them, evidence
+        // burns, and the legacy staking encodings (Deposit, Exit, Delegate)
+        // are consensus-rejected at every epoch precisely BECAUSE two of
+        // them minted bonded stake from nothing; their funded successors
+        // (`apply_deposit`/`apply_delegation`/`apply_exit`) bond and unbond
+        // existing coins.
         let witness = PosTransaction::Exit { validator: 0 };
         match &witness {
             PosTransaction::Transfer { .. } => {}
