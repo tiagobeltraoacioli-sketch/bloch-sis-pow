@@ -40,6 +40,11 @@ use serde::{Serialize, Deserialize};
 
 pub mod seed;
 pub mod encryption;
+// ML-KEM-1024 note encryption for the Coherence shielded pool. Feature-gated
+// (`note-crypto`) so node builds — which only validate ciphertext STRUCTURE,
+// never decapsulate — stay ML-KEM-free (see README.md's transport row).
+#[cfg(feature = "note-crypto")]
+pub mod note_crypto;
 #[cfg(feature = "node")]
 pub mod client;
 pub mod errors;

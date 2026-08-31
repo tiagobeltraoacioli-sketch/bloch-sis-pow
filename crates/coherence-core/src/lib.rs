@@ -15,6 +15,14 @@ pub const TREE_DEPTH: usize = 32;
 const DOM_CM: &[u8] = b"bloch:coherence:cm:v1";
 const DOM_NF: &[u8] = b"bloch:coherence:nf:v1";
 const DOM_MT: &[u8] = b"bloch:coherence:mt:v1";
+/// Domain tag for the per-output note-ciphertext KDF/AAD (same family as
+/// DOM_CM/DOM_NF/DOM_MT). Never reused for any other derivation.
+///
+/// The KEM identifier is baked into the tag on purpose: a future KEM swap
+/// (harvest-now-decrypt-later response, FIPS revision, hybrid) gets a new tag
+/// and therefore a disjoint key/AAD space — old and new ciphertexts can never
+/// be confused, and the tag alone says how to decapsulate.
+const DOM_NOTE_CT: &[u8] = b"bloch:coherence:notect:mlkem1024:v1";
 
 /// SHAKE-256 squeezed to 32 bytes over the concatenation of `parts`.
 fn shake256_32(parts: &[&[u8]]) -> [u8; 32] {
@@ -45,6 +53,70 @@ impl Note {
     /// Nullifier at `position` under nullifier key `nk`.
     pub fn nullifier(&self, nk: &[u8; 32], position: u64) -> [u8; 32] {
         shake256_32(&[DOM_NF, nk, &self.rho, &position.to_le_bytes()])
+    }
+}
+
+// ── Note ciphertext (per-output ML-KEM-1024 + AEAD wire format) ──────────────
+//
+// Recipients scanning the chain see only opaque 32-byte commitments; the
+// NoteCiphertext travelling alongside each output is what lets the recipient
+// DISCOVER and decrypt the note (v, rho, psi) addressed to them. It is
+// auxiliary wire/body data: never an input to `check_spend`, never part of the
+// ZK statement, and consensus-committed only via the block body merkle root.
+//
+// ML-KEM-1024 (FIPS 203 final, NIST Category 5) — deliberately a category
+// ABOVE the ML-DSA-65 signatures (Category 3): the ciphertext sits on-chain
+// forever, so decrypting it is a retroactive harvest-now-decrypt-later attack
+// with no deadline, while forging a signature requires a quantum adversary at
+// spend time. Different threat windows, different margins.
+
+/// ML-KEM-1024 (FIPS 203) ciphertext length.
+pub const NOTE_KEM_CT_LEN: usize = 1568;
+/// AEAD (AES-256-GCM) nonce length for note ciphertexts.
+pub const NOTE_AEAD_NONCE_LEN: usize = 12;
+/// AEAD (AES-256-GCM) authentication tag length.
+pub const NOTE_AEAD_TAG_LEN: usize = 16;
+/// Note plaintext: LE64(v) ‖ rho ‖ psi. pk_d is deliberately NOT on the wire —
+/// the recipient reconstructs the full `Note` with their own pk_d and MUST
+/// verify `Note::commitment() == cm` before trusting the decryption.
+pub const NOTE_PLAINTEXT_LEN: usize = 8 + 32 + 32;
+
+/// Derive the 32-byte AEAD key for a note ciphertext from the ML-KEM-1024
+/// shared secret: SHAKE256(DOM_NOTE_CT ‖ ss). Pure SHAKE-256, matching the
+/// crate's existing hash-only dependency footprint.
+pub fn derive_note_aead_key(kem_shared_secret: &[u8]) -> [u8; 32] {
+    shake256_32(&[DOM_NOTE_CT, kem_shared_secret])
+}
+
+/// AAD binding a note ciphertext 1:1 to a specific on-chain output commitment:
+/// DOM_NOTE_CT ‖ cm. A ciphertext replayed/copied against a different cm fails
+/// AEAD authentication (defense-in-depth on top of the block body root's
+/// whole-tx binding).
+pub fn note_ciphertext_aad(cm: &[u8; 32]) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(DOM_NOTE_CT.len() + 32);
+    aad.extend_from_slice(DOM_NOTE_CT);
+    aad.extend_from_slice(cm);
+    aad
+}
+
+/// Per-output note ciphertext: ML-KEM-1024 encapsulation + AEAD-sealed note
+/// payload. Wire size = 1568 + 12 + (72 + 16) = 1668 bytes per output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoteCiphertext {
+    /// ML-KEM-1024 ciphertext (exactly `NOTE_KEM_CT_LEN` bytes).
+    pub kem_ct: Vec<u8>,
+    /// AEAD nonce (fresh random per output).
+    pub nonce: [u8; NOTE_AEAD_NONCE_LEN],
+    /// AEAD ciphertext ‖ tag over LE64(v) ‖ rho ‖ psi
+    /// (exactly `NOTE_PLAINTEXT_LEN + NOTE_AEAD_TAG_LEN` bytes).
+    pub payload: Vec<u8>,
+}
+
+impl NoteCiphertext {
+    /// Structural well-formedness: exact component lengths.
+    pub fn well_formed(&self) -> bool {
+        self.kem_ct.len() == NOTE_KEM_CT_LEN
+            && self.payload.len() == NOTE_PLAINTEXT_LEN + NOTE_AEAD_TAG_LEN
     }
 }
 
@@ -438,6 +510,11 @@ pub struct ShieldedTx {
     pub anchor: [u8; 32],
     pub nullifiers: Vec<[u8; 32]>,
     pub outputs: Vec<[u8; 32]>,
+    /// One `NoteCiphertext` per `outputs[i]`, same index/order — the ciphertext
+    /// at index i is addressed to the recipient of the commitment at index i.
+    /// Outside the ZK statement (`public()`/`check_spend` never see it);
+    /// consensus-committed via the block body merkle root.
+    pub output_ciphertexts: Vec<NoteCiphertext>,
     pub fee: u64,
     pub proof: Vec<u8>,
     pub binding_sig: Vec<u8>,
@@ -451,6 +528,13 @@ impl ShieldedTx {
             out_commitments: self.outputs.clone(),
             fee: self.fee,
         }
+    }
+
+    /// Structural precondition: exactly one well-formed ciphertext per output
+    /// commitment (index-aligned).
+    pub fn ciphertexts_well_formed(&self) -> bool {
+        self.output_ciphertexts.len() == self.outputs.len()
+            && self.output_ciphertexts.iter().all(NoteCiphertext::well_formed)
     }
 }
 
@@ -704,5 +788,51 @@ mod nfset_tests {
         let r = nf(2);
         assert_ne!(nfset_parent(&l, &r), merkle_parent(&l, &r));
         assert_ne!(NullifierSet::new().root(), CommitmentTree::new().root());
+    }
+
+    #[test]
+    fn note_ciphertext_well_formedness_checks_exact_lengths() {
+        let good = NoteCiphertext {
+            kem_ct: vec![0u8; NOTE_KEM_CT_LEN],
+            nonce: [0u8; NOTE_AEAD_NONCE_LEN],
+            payload: vec![0u8; NOTE_PLAINTEXT_LEN + NOTE_AEAD_TAG_LEN],
+        };
+        assert!(good.well_formed());
+        // ML-KEM-1024: the wire cost per output is 1568 + 12 + 88 = 1668 bytes.
+        assert_eq!(good.kem_ct.len() + good.nonce.len() + good.payload.len(), 1668);
+        let mut short_kem = good.clone();
+        short_kem.kem_ct.pop();
+        assert!(!short_kem.well_formed());
+        let mut long_payload = good.clone();
+        long_payload.payload.push(0);
+        assert!(!long_payload.well_formed());
+
+        // ShieldedTx: count must match outputs, and each ct must be well-formed.
+        let tx = ShieldedTx {
+            anchor: [0; 32], nullifiers: vec![], outputs: vec![[1; 32]],
+            output_ciphertexts: vec![good.clone()], fee: 0, proof: vec![], binding_sig: vec![],
+        };
+        assert!(tx.ciphertexts_well_formed());
+        let mut missing = tx.clone();
+        missing.output_ciphertexts.clear();
+        assert!(!missing.ciphertexts_well_formed());
+        let mut malformed = tx.clone();
+        malformed.output_ciphertexts[0].kem_ct.pop();
+        assert!(!malformed.ciphertexts_well_formed());
+    }
+
+    #[test]
+    fn note_aead_key_and_aad_are_domain_separated_and_deterministic() {
+        let ss = [0x5Au8; 32];
+        assert_eq!(derive_note_aead_key(&ss), derive_note_aead_key(&ss));
+        assert_ne!(derive_note_aead_key(&ss), derive_note_aead_key(&[0x5Bu8; 32]));
+        // Distinct from every other domain's output over the same bytes.
+        assert_ne!(derive_note_aead_key(&ss), shake256_32(&[DOM_CM, &ss]));
+        assert_ne!(derive_note_aead_key(&ss), shake256_32(&[DOM_NF, &ss]));
+        // The domain tag names the KEM: swapping KEMs later re-keys the space.
+        assert!(DOM_NOTE_CT.ends_with(b"mlkem1024:v1"));
+        let aad = note_ciphertext_aad(&[7u8; 32]);
+        assert_eq!(aad.len(), DOM_NOTE_CT.len() + 32);
+        assert_ne!(aad, note_ciphertext_aad(&[8u8; 32]));
     }
 }

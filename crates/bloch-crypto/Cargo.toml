@@ -40,6 +40,16 @@ wallet-cli = ["dep:clap", "dep:rpassword"]
 # the guard bites only when a mainnet artifact is cut:
 #   cargo test -p bloch-crypto --features mainnet canonical_k_activation_height_is_set_for_mainnet
 mainnet = []
+# `note-crypto` gates wallet::note_crypto — the ML-KEM-1024 + AES-256-GCM
+# per-output note encryption for the Coherence shielded pool. Off by default
+# ON PURPOSE: the node validates note ciphertexts STRUCTURALLY (exact lengths,
+# one per output — coherence-core, no KEM involved) and never encapsulates or
+# decapsulates, so the node binary must not link ML-KEM it never executes.
+# This keeps README.md's transport row ("no ML-KEM anywhere in
+# crates/bloch-pos-node") literally true. Wallet builds that send or scan for
+# notes enable it:
+#   cargo build -p bloch-crypto --features note-crypto
+note-crypto = ["dep:pqcrypto-mlkem"]
 # `auxpow-rehearsal` is an EMPTY marker feature (no deps). It ONLY lowers
 # AUXPOW_ACTIVATION_HEIGHT to 0 (core/mod.rs) so a LOCAL, off-mainnet build
 # accepts merged-mined (AuxPoW) blocks — for exercising the end-to-end BTC↔Bloch
@@ -60,6 +70,15 @@ pqcrypto-mldsa     = "0.1"
 pqcrypto-falcon    = { version = "0.4", default-features = false, features = ["std"] }
 pqcrypto-traits    = "0.3"
 pqcrypto-internals = "0.2"
+# ML-KEM-1024 (FIPS 203 final) note encryption (wallet::note_crypto), gated by
+# the `note-crypto` feature so the node's dependency tree stays ML-KEM-free.
+# Category 5 vs the signatures' Category 3 on purpose: note ciphertexts live
+# on-chain forever, so confidentiality faces a retroactive
+# harvest-now-decrypt-later adversary with no deadline. Resolves against the
+# vendored crates/pqcrypto-internals fork via the root [patch.crates-io]
+# (pqcrypto-mlkem 0.1 wants pqcrypto-internals ^0.2.6; the fork declares
+# 0.2.11 — verified compatible).
+pqcrypto-mlkem     = { version = "0.1", optional = true }
 
 # Hashing / KDF / AEAD.
 sha2   = "0.10"
