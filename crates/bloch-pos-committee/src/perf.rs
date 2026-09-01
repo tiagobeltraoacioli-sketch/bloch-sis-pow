@@ -60,10 +60,62 @@ pub enum Phase {
     /// The node's `Engine::do_reorg` — self time only, so the `apply_block`
     /// calls inside it are attributed to their own phases.
     Reorg = 5,
+    /// The node's `Engine::ingest` — one arriving block, dedup check included.
+    /// Self time only: the fork choice and transition it reaches are attributed
+    /// to their own phases, so this is the block path's own overhead.
+    Ingest = 6,
+    /// The node's `Engine::on_attestation` — one arriving attestation, all the
+    /// way through `judge`. Self time, so the `rolled_to` inside it is
+    /// attributed to `rolled_to` and what remains here is committee sampling,
+    /// signature verification and pool bookkeeping.
+    OnAttestation = 7,
+    /// `Engine::serve_rpc`, answered on the consensus thread between duties.
+    Rpc = 8,
+    /// Blocked in `recv_timeout` with nothing to do. **This is the phase that
+    /// decides the question**: a syncing node starved of blocks is idle here,
+    /// and one that is compute-bound is not.
+    Idle = 9,
+    /// `CommittedState::duty_roster_at` — the delegation fold, the registry
+    /// walk and the cohort cap, which together build the validator set. Called
+    /// from fork choice, from `advance`'s input comparison and from the
+    /// transition, and `Registry::resolve` inside it is a `for e in 0..=epoch`
+    /// loop, so its cost grows with the chain's age rather than its size.
+    Roster = 10,
+    /// `Engine::forkchoice_store` — rebuilding the fork-choice store: the
+    /// parent/child maps over every stored block plus one `observe` per
+    /// attestation in every stored block body. Charged separately from
+    /// `forkchoice` so the rebuild can be told apart from the head walk.
+    FcStoreBuild = 11,
+    /// `Engine::advance` — the convergence loop itself: the fork-choice input
+    /// comparison, the head check and the retry bookkeeping. Self time, so the
+    /// fork choice, the roster build and the transition it reaches are each
+    /// charged to their own phase and what is left here is the loop's own.
+    Advance = 12,
+    /// `Engine::path_to_canonical` — the walk from the fork-choice head down
+    /// to the nearest canonical ancestor, which **clones every envelope on the
+    /// branch**. Charged separately because that clone is deep: each envelope
+    /// carries its body's attestations, and each of those a hybrid signature.
+    PathToCanonical = 13,
+    /// `Engine::apply_canonical` self time — the envelope clone handed to the
+    /// transition, the block-log append and fsync, and the pool bookkeeping.
+    /// The transition itself is charged to `state_root`/`state_clone`/
+    /// `epoch_boundary`.
+    ApplyCanonical = 14,
+    /// `Store::append` — encode the envelope, one `write_all`, then
+    /// **`sync_data`**. Charged on its own because it is the one cost boot
+    /// replay does not pay: replay runs with `live = false` and never touches
+    /// the log, so a per-block fsync is invisible to the replay profile and
+    /// present in every network-sync block.
+    LogAppend = 15,
+    /// `StateCell::set` plus `remember_state` — the generation bump, the memo
+    /// drop and the recent-state ring eviction. Charged separately because
+    /// every one of those drops an `Arc<CommittedState>`, and the last handle
+    /// to one frees the whole eUTXO map.
+    StateCommit = 16,
 }
 
 /// How many phases there are, for the fixed-size accumulator.
-pub const N_PHASES: usize = 6;
+pub const N_PHASES: usize = 17;
 
 /// Human names, index-aligned with [`Phase`].
 pub const PHASE_NAMES: [&str; N_PHASES] = [
@@ -73,6 +125,17 @@ pub const PHASE_NAMES: [&str; N_PHASES] = [
     "forkchoice",
     "rolled_to",
     "reorg",
+    "ingest",
+    "on_attestation",
+    "rpc",
+    "idle",
+    "roster",
+    "fc_store_build",
+    "advance",
+    "path_to_canonical",
+    "apply_canonical",
+    "log_append",
+    "state_commit",
 ];
 
 #[cfg(feature = "perf-timing")]

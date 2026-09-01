@@ -1211,8 +1211,12 @@ impl Engine {
     // ── Block ingestion: store, then advance canonical as far as possible ──
 
     fn ingest(&mut self, env: BlockEnvelope) {
+        // Instrumentation only; compiled out without `perf-timing`.
+        let _perf = bloch_pos_committee::perf::span(bloch_pos_committee::perf::Phase::Ingest);
+        syncprof::bump(syncprof::Ev::BlockIn);
         let id = *env.block_id().as_bytes();
         if self.blocks.contains_key(&id) || self.canonical.contains(&id) {
+            syncprof::bump(syncprof::Ev::BlockDup);
             return;
         }
         // A cheap early reject before the block reaches the transition, using
@@ -1314,6 +1318,9 @@ impl Engine {
     /// guessing is the fail-closed half of the rule: a branch is adopted only
     /// after being replayed and validated in full.
     fn path_to_canonical(&self, target: [u8; 32]) -> Option<([u8; 32], Vec<BlockEnvelope>)> {
+        // Instrumentation only; compiled out without `perf-timing`.
+        let _perf =
+            bloch_pos_committee::perf::span(bloch_pos_committee::perf::Phase::PathToCanonical);
         if self.canonical.contains(&target) {
             return Some((target, Vec::new()));
         }
@@ -1346,6 +1353,8 @@ impl Engine {
     /// case is a legitimate LMD-GHOST outcome and is handled by reorganising to
     /// an empty branch.
     fn advance(&mut self) {
+        // Instrumentation only; compiled out without `perf-timing`.
+        let _perf = bloch_pos_committee::perf::span(bloch_pos_committee::perf::Phase::Advance);
         // Fork choice is recomputed at the top of every iteration, and the
         // last iteration exists only to confirm the head stopped moving. That
         // confirmation is NOT free and it is NOT redundant: `apply_canonical`
@@ -1489,6 +1498,9 @@ impl Engine {
 
     /// Apply one block that extends the current head. True on success.
     fn apply_canonical(&mut self, env: &BlockEnvelope) -> bool {
+        // Instrumentation only; compiled out without `perf-timing`.
+        let _perf =
+            bloch_pos_committee::perf::span(bloch_pos_committee::perf::Phase::ApplyCanonical);
         let id = env.block_id();
         let envelope = ProposalEnvelope {
             header: env.header.clone(),
@@ -1507,11 +1519,17 @@ impl Engine {
             .apply_block(&self.state, &envelope, &env.body.attestations, &txs)
         {
             Ok(post) => {
-                self.state.set(post);
-                // Snapshot for the reorg path. Free: this is the state that
-                // was just built, kept by handle, not copied.
-                let snapshot = self.state.arc();
-                self.remember_state(*id.as_bytes(), snapshot);
+                {
+                    // Instrumentation only; compiled out without `perf-timing`.
+                    let _perf = bloch_pos_committee::perf::span(
+                        bloch_pos_committee::perf::Phase::StateCommit,
+                    );
+                    self.state.set(post);
+                    // Snapshot for the reorg path. Free: this is the state that
+                    // was just built, kept by handle, not copied.
+                    let snapshot = self.state.arc();
+                    self.remember_state(*id.as_bytes(), snapshot);
+                }
                 self.canonical.insert(*id.as_bytes());
                 self.chain.push((env.header.slot, id));
                 self.head_slot.store(env.header.slot, Ordering::Relaxed);
@@ -1541,7 +1559,14 @@ impl Engine {
                 self.pool.retain(|_, a| epoch_of(a.data.slot) >= cur_e);
 
                 if self.live {
-                    if let Err(e) = self.store.append(env) {
+                    // Instrumentation only; compiled out without `perf-timing`.
+                    let appended = {
+                        let _perf = bloch_pos_committee::perf::span(
+                            bloch_pos_committee::perf::Phase::LogAppend,
+                        );
+                        self.store.append(env)
+                    };
+                    if let Err(e) = appended {
                         eprintln!("FATAL: block log append failed: {e}");
                         std::process::exit(1);
                     }
@@ -1800,6 +1825,12 @@ impl Engine {
     /// (an attestation arriving milliseconds before the block it votes for) is
     /// precisely the one a naive implementation calls invalid.
     fn on_attestation(&mut self, att: Attestation, origin: Origin, wall_epoch: u64) {
+        // Instrumentation only; compiled out without `perf-timing`. Spans the
+        // whole call, so `rolled_to` inside `judge` is a child and what is
+        // charged here is everything else about admitting one attestation.
+        let _perf =
+            bloch_pos_committee::perf::span(bloch_pos_committee::perf::Phase::OnAttestation);
+        syncprof::bump(syncprof::Ev::AttIn);
         let e = epoch_of(att.data.slot);
         // Narrower than `gossip.rs`'s own two-epoch window, and for a reason
         // that belongs to the node, not the policy: committee membership must
@@ -1811,6 +1842,7 @@ impl Engine {
         // full 64-slot window) needs per-epoch seed/roster history, which is
         // storage work, not policy work.
         if e != wall_epoch && e != wall_epoch + 1 {
+            syncprof::bump(syncprof::Ev::AttWindowed);
             self.net.report(&origin, Verdict::Ignore);
             return;
         }
@@ -2204,6 +2236,71 @@ impl Engine {
 /// that the log of a multi-hour replay stays readable.
 const REPLAY_PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
+
+/// Event counters for the sync profile — **instrumentation only**, and
+/// compiled out with the `perf-timing` feature off.
+///
+/// `perf.rs` answers "where did the consensus thread's time go". It cannot
+/// answer "how many of the blocks that arrived were ones we already had",
+/// which is the other half of a sync diagnosis: a node can be busy and making
+/// no progress. These are thread-local, write-only, read by the periodic
+/// report, and nothing in consensus can see one.
+mod syncprof {
+    /// What was counted. Index-aligned with [`NAMES`].
+    #[derive(Clone, Copy)]
+    #[repr(usize)]
+    pub enum Ev {
+        /// Block frames dequeued by the engine.
+        BlockIn = 0,
+        /// Of those, ones `ingest` dropped because the block was already
+        /// stored or already canonical — pure duplicate delivery.
+        BlockDup = 1,
+        /// Attestation frames dequeued.
+        AttIn = 2,
+        /// Of those, ones dropped by the epoch window before `judge` ran.
+        AttWindowed = 3,
+        /// RPC calls served on the consensus thread.
+        RpcIn = 4,
+        /// Transaction frames dequeued.
+        TxIn = 5,
+    }
+    pub const N_EV: usize = 6;
+    pub const NAMES: [&str; N_EV] =
+        ["block_in", "block_dup", "att_in", "att_windowed", "rpc_in", "tx_in"];
+
+    #[cfg(feature = "perf-timing")]
+    mod imp {
+        use super::N_EV;
+        use std::cell::Cell;
+        thread_local! {
+            static C: [Cell<u64>; N_EV] = Default::default();
+        }
+        #[inline]
+        pub fn bump(e: super::Ev) {
+            C.with(|c| c[e as usize].set(c[e as usize].get() + 1));
+        }
+        pub fn take() -> [u64; N_EV] {
+            C.with(|c| {
+                let mut out = [0u64; N_EV];
+                for (i, cell) in c.iter().enumerate() {
+                    out[i] = cell.replace(0);
+                }
+                out
+            })
+        }
+    }
+    #[cfg(not(feature = "perf-timing"))]
+    mod imp {
+        use super::N_EV;
+        #[inline(always)]
+        pub fn bump(_e: super::Ev) {}
+        pub fn take() -> [u64; N_EV] {
+            [0; N_EV]
+        }
+    }
+    pub use imp::{bump, take};
+}
+
 pub fn run(cfg: Config) -> io::Result<()> {
     let (mut manifest, digest) = Manifest::load(&cfg.genesis_path)?;
 
@@ -2331,6 +2428,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
             cfg.peers.clone(),
             tx.clone(),
             cfg.data_dir.clone(),
+            store.index(),
             head_slot.clone(),
             inflight.clone(),
         )?),
@@ -2570,6 +2668,28 @@ pub fn run(cfg: Config) -> io::Result<()> {
     let mut last_built: u64 = engine.state.slot();
     let mut last_sync_req: u64 = 0;
 
+    // ── The sync profile ──
+    //
+    // Instrumentation only, and the whole block is inert without
+    // `perf-timing`: `perf::take()` returns zeros, the counters return zeros,
+    // and `SYNC_PROFILE_INTERVAL` is only read to decide whether to print
+    // them. Nothing here is on a consensus path and no rule reads a counter.
+    //
+    // It exists because the replay profile and the network-sync profile are
+    // different questions with the same-looking answer. Replay is a closed
+    // loop over a local file: every millisecond is block application, so a
+    // per-block breakdown IS the wall clock. Network sync is an event loop
+    // that also waits, serves RPC, and judges other people's attestations —
+    // and a breakdown that only covers block application can be entirely
+    // correct and still account for two percent of the elapsed time.
+    // `idle` and `on_attestation` are here so the sum can be checked against
+    // the clock, and the leftover reported honestly.
+    let mut last_profile = std::time::Instant::now();
+    let mut profile_head = engine.state.slot();
+    let mut profile_height = engine.chain.len().saturating_sub(1) as u64;
+    let profile_started = std::time::Instant::now();
+    let _ = perf_reset_at_start();
+
     loop {
         let now = now_ms();
         if now < genesis_ms {
@@ -2636,7 +2756,14 @@ pub fn run(cfg: Config) -> io::Result<()> {
             slot_start + slot_ms
         };
         let wait = next_deadline.saturating_sub(now_ms()).clamp(1, 500);
-        match rx.recv_timeout(Duration::from_millis(wait)) {
+        let recv = {
+            // Instrumentation only. Charging the blocking wait to its own
+            // phase is what lets the report distinguish "starved of blocks"
+            // from "too slow to apply the blocks it has".
+            let _perf = bloch_pos_committee::perf::span(bloch_pos_committee::perf::Phase::Idle);
+            rx.recv_timeout(Duration::from_millis(wait))
+        };
+        match recv {
             Ok(ev) => {
                 let mut pending = vec![ev];
                 while let Ok(more) = rx.try_recv() {
@@ -2658,9 +2785,14 @@ pub fn run(cfg: Config) -> io::Result<()> {
                         EngineEvent::Net(NetEvent::Transaction(tx)) => {
                             // Gossip has nobody to answer to; the verdict is the
                             // RPC's concern, not a peer's.
+                            syncprof::bump(syncprof::Ev::TxIn);
                             let _ = engine.on_transaction(tx);
                         }
                         EngineEvent::Rpc(call) => {
+                            let _perf = bloch_pos_committee::perf::span(
+                                bloch_pos_committee::perf::Phase::Rpc,
+                            );
+                            syncprof::bump(syncprof::Ev::RpcIn);
                             let result = engine.serve_rpc(call.req);
                             // A client that hung up between asking and being
                             // answered is normal, not an error worth logging.
@@ -2677,7 +2809,71 @@ pub fn run(cfg: Config) -> io::Result<()> {
                 ));
             }
         }
+
+        if bloch_pos_committee::perf::ENABLED
+            && last_profile.elapsed() >= SYNC_PROFILE_INTERVAL
+        {
+            let window = last_profile.elapsed();
+            last_profile = std::time::Instant::now();
+            let head = engine.state.slot();
+            let height = engine.chain.len().saturating_sub(1) as u64;
+            let phases = bloch_pos_committee::perf::take();
+            let evs = syncprof::take();
+            let secs = window.as_secs_f64().max(1e-9);
+            let applied = height.saturating_sub(profile_height);
+            let total_secs = profile_started.elapsed().as_secs_f64().max(1e-9);
+            println!(
+                "SYNCPROF window={:.1}s head_slot={head} (+{}) height={height} (+{applied})                  rate={:.3} blocks/s lifetime_rate={:.3} blocks/s blocks_stored={} pool={}                  mempool={}",
+                secs,
+                head.saturating_sub(profile_head),
+                applied as f64 / secs,
+                (height as f64) / total_secs,
+                engine.blocks.len(),
+                engine.pool.len(),
+                engine.mempool.len(),
+            );
+            let mut sum = std::time::Duration::ZERO;
+            for (i, (d, n)) in phases.iter().enumerate() {
+                sum += *d;
+                println!(
+                    "SYNCPROF   {:>14} {:>9.3}s {:>6.2}% n={} {:.3}ms/call",
+                    bloch_pos_committee::perf::PHASE_NAMES[i],
+                    d.as_secs_f64(),
+                    100.0 * d.as_secs_f64() / secs,
+                    n,
+                    if *n > 0 { d.as_secs_f64() * 1e3 / *n as f64 } else { 0.0 },
+                );
+            }
+            // "Everything else" stated rather than hidden: the phases are
+            // disjoint self-times, so wall minus their sum is real work the
+            // breakdown does not name, and a reader needs to see how big it is
+            // before trusting any percentage above.
+            println!(
+                "SYNCPROF   {:>14} {:>9.3}s {:>6.2}%   (wall minus the named phases)",
+                "unattributed",
+                (secs - sum.as_secs_f64()).max(0.0),
+                100.0 * (secs - sum.as_secs_f64()).max(0.0) / secs,
+            );
+            let ev_line: Vec<String> = syncprof::NAMES
+                .iter()
+                .zip(evs.iter())
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect();
+            println!("SYNCPROF   events {}", ev_line.join(" "));
+            profile_head = head;
+            profile_height = height;
+        }
     }
+}
+
+/// How often the sync profile prints. Instrumentation only.
+const SYNC_PROFILE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Zero the phase counters so the first profile window is not charged for
+/// boot replay. Instrumentation only; a no-op without `perf-timing`.
+fn perf_reset_at_start() -> [(Duration, u64); bloch_pos_committee::perf::N_PHASES] {
+    let _ = syncprof::take();
+    bloch_pos_committee::perf::take()
 }
 
 /// LMD-GHOST head over `blocks`, given the loose attestations in `pool`, the
@@ -2734,6 +2930,8 @@ fn forkchoice_store<'a>(
     HashMap<[u8; 32], [u8; 32]>,
     HashMap<[u8; 32], Vec<[u8; 32]>>,
 ) {
+    // Instrumentation only; compiled out without `perf-timing`.
+    let _perf = bloch_pos_committee::perf::span(bloch_pos_committee::perf::Phase::FcStoreBuild);
     let mut parents: HashMap<[u8; 32], [u8; 32]> = HashMap::new();
     let mut children: HashMap<[u8; 32], Vec<[u8; 32]>> = HashMap::new();
     for (id, env) in blocks {
@@ -3906,6 +4104,7 @@ mod transfer_v2_end_to_end {
                 Vec::new(),
                 events,
                 dir.clone(),
+                store.index(),
                 head_slot.clone(),
                 inflight,
             )
@@ -4198,6 +4397,7 @@ mod perf_support {
                 Vec::new(),
                 events,
                 dir.clone(),
+                store.index(),
                 head_slot.clone(),
                 inflight,
             )
@@ -5869,6 +6069,7 @@ mod duty_view_anchor {
                 Vec::new(),
                 events,
                 dir.0.clone(),
+                store.index(),
                 head_slot.clone(),
                 inflight,
             )

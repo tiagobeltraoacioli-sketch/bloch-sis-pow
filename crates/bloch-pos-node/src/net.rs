@@ -310,7 +310,12 @@ fn decode_event(frame: &[u8]) -> Option<NetEvent> {
 /// The lock is taken per frame, not held across the whole dump: a full history
 /// answer is hundreds of megabytes, and holding it throughout would stall every
 /// broadcast to this peer for the duration.
-fn serve_get_blocks(sock: &Arc<Mutex<TcpStream>>, data_dir: &PathBuf, frame: &[u8]) {
+fn serve_get_blocks(
+    sock: &Arc<Mutex<TcpStream>>,
+    data_dir: &PathBuf,
+    index: &crate::store::FrameIndex,
+    frame: &[u8],
+) {
     if frame.len() != 9 {
         return;
     }
@@ -322,7 +327,11 @@ fn serve_get_blocks(sock: &Arc<Mutex<TcpStream>>, data_dir: &PathBuf, frame: &[u
     // re-asks from its new head for as long as it holds a sync slot, so the
     // full history still arrives; it just no longer arrives as one allocation
     // large enough to kill the receiver.
-    match crate::store::Store::blocks_after(data_dir, after, SYNC_PAGE_BLOCKS) {
+    // Served from the log's frame table rather than by walking the log from
+    // byte 0. Same bytes, same page, same tolerance of a truncated tail — the
+    // difference is that answering a caught-up peer's five-second "anything
+    // new?" now costs a table lookup instead of a read of the entire chain.
+    match crate::store::blocks_after_indexed(data_dir, index, after, SYNC_PAGE_BLOCKS) {
         Ok(blocks) => {
             for b in blocks {
                 let mut f = Vec::with_capacity(1 + b.len());
@@ -355,6 +364,7 @@ pub fn start(
     peer_addrs: Vec<String>,
     events: Sender<EngineEvent>,
     data_dir: PathBuf,
+    index: crate::store::FrameIndex,
     head_slot: Arc<AtomicU64>,
     inflight: Arc<std::sync::atomic::AtomicUsize>,
 ) -> std::io::Result<DevnetMesh> {
@@ -365,6 +375,7 @@ pub fn start(
     {
         let events = events.clone();
         let data_dir = data_dir.clone();
+        let index = index.clone();
         let inbound = inbound.clone();
         let inflight = inflight.clone();
         thread::spawn(move || {
@@ -398,13 +409,14 @@ pub fn start(
 
                 let events = events.clone();
                 let data_dir = data_dir.clone();
+                let index = index.clone();
                 let inflight = inflight.clone();
                 let mut rsock = rsock;
                 thread::spawn(move || loop {
                     match read_frame(&mut rsock) {
                         Ok(frame) => {
                             if frame.first() == Some(&FRAME_GET_BLOCKS) {
-                                serve_get_blocks(&wsock, &data_dir, &frame);
+                                serve_get_blocks(&wsock, &data_dir, &index, &frame);
                             } else if let Some(ev) = decode_event(&frame) {
                                 if !send_to_engine(&events, &inflight, ev) {
                                     return;

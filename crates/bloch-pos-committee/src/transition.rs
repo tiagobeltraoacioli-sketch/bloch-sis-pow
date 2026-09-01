@@ -1624,6 +1624,8 @@ impl CommittedState {
     /// blocks of the same epoch and re-sort the partition under votes already
     /// admitted. See the comment on the `debug_assert_eq!` in `close_epoch`.
     fn duty_roster_at(&self, epoch: u64) -> Vec<Validator> {
+        // Instrumentation only; compiled out without `perf-timing`.
+        let _perf = crate::perf::span(crate::perf::Phase::Roster);
         // Delegated stake resolved by the delegation module's own fold; its
         // per-validator cap uses the fixed-point form (rule 3 — the cap is
         // measured against the capped total, not the total it reduces).

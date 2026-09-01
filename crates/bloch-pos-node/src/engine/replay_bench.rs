@@ -631,8 +631,19 @@ fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
     // Loopback, ephemeral port, no peers. Nothing in this file dials, listens
     // for, or sends anything to any network.
     let net = net::Net::Devnet(
-        net::start("127.0.0.1", 0, Vec::new(), tx, dir.to_path_buf(), head_slot.clone(), inflight)
-            .expect("loopback devnet transport"),
+        net::start(
+            "127.0.0.1",
+            0,
+            Vec::new(),
+            tx,
+            dir.to_path_buf(),
+            // An empty frame table: nothing dials this node, so nothing asks
+            // it for a page, and the benchmark's data dir has no log to index.
+            Default::default(),
+            head_slot.clone(),
+            inflight,
+        )
+        .expect("loopback devnet transport"),
     );
     Engine {
         state: StateCell::new(genesis_state),
