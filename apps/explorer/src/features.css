@@ -246,3 +246,117 @@
 }
 .halving-note strong { color: var(--brass); }
 .halving-note .mono { font-family: var(--font-mono); color: var(--text); }
+
+/* ── The validator surface ──────────────────────────────────────────────
+   Two ideas carry the visual language here.
+
+   First, a stake is drawn as a bar split into weight the validator still has
+   and weight the inactivity leak took. Those two quantities differ by roughly
+   half across today's whole fleet, so any design that showed one number would
+   have been showing the wrong one.
+
+   Second, the qualifying note is styled as content, not as fine print. The
+   most important sentences on these pages are the ones explaining that 64 rows
+   are one operator and that a concentration figure by index measures nothing.
+   Setting those at 11px grey would be a way of publishing them without saying
+   them.
+   ───────────────────────────────────────────────────────────────────── */
+
+.vsummary { margin-bottom: 20px; }
+
+.bad-fg { color: var(--danger); }
+
+/* Provenance: quiet, present, and never omitted. */
+.provenance {
+  font-size: 12.5px;
+  color: var(--text-dim);
+  margin: 0 0 16px;
+  line-height: 1.55;
+}
+
+/* A qualifying note that must be read, inside a card. */
+.notebox {
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 10px;
+  background: var(--surface-2, var(--panel));
+  padding: 16px 18px;
+  margin: 18px 0;
+}
+.notebox h3 {
+  margin: 0 0 10px;
+  font-size: 15px;
+  font-family: var(--font-display, var(--sans));
+  letter-spacing: -0.01em;
+}
+.notebox p { margin: 0 0 10px; line-height: 1.62; font-size: 13.5px; }
+.notebox p:last-child { margin-bottom: 0; }
+
+.notebox-inline {
+  border-left: 3px solid var(--border-hi, var(--border));
+  padding: 2px 0 2px 14px;
+  margin: 14px 0 0;
+  font-size: 13.5px;
+  line-height: 1.62;
+  color: var(--text);
+}
+
+.mono-wrap { word-break: break-all; font-size: 12.5px; }
+
+/* Stake bar: filled = weight the roster carries, hatched = weight leaked. */
+.stakebar {
+  display: inline-flex;
+  width: 100%;
+  min-width: 90px;
+  height: 9px;
+  border-radius: 5px;
+  overflow: hidden;
+  background: var(--line-soft, var(--border));
+  vertical-align: middle;
+}
+.stakebar-eff { background: var(--chart-1); }
+.stakebar-leak {
+  background: repeating-linear-gradient(
+    135deg,
+    var(--danger) 0 3px,
+    transparent 3px 6px
+  );
+  opacity: 0.55;
+}
+
+.vstate { display: inline-flex; gap: 5px; align-items: center; flex-wrap: wrap; }
+
+.vtable td { vertical-align: middle; }
+.vtable td:nth-child(5) { min-width: 110px; width: 18%; }
+
+.statetally { display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; }
+.statetally-row { display: flex; align-items: baseline; gap: 10px; }
+.statetally-n { font-variant-numeric: tabular-nums; font-weight: 600; min-width: 2.5em; }
+
+.outliers { margin: 8px 0 0; padding-left: 18px; line-height: 1.9; }
+.outliers li { margin-bottom: 4px; }
+
+/* A constant with its defining line available on hover. */
+.cited { position: relative; white-space: nowrap; cursor: help; }
+.cited-mark {
+  font-size: 0.62em;
+  vertical-align: super;
+  color: var(--text-faint, var(--text-dim));
+  margin-left: 1px;
+}
+
+.vchart { margin: 16px 0 4px; }
+.vchart svg { display: block; max-width: 100%; overflow: visible; }
+.vchart-lbl { font-size: 9.5px; font-family: var(--font-mono, var(--mono)); }
+
+.conflict-claims {
+  margin-top: 10px;
+  font-family: var(--font-mono, var(--mono));
+  font-size: 11.5px;
+  line-height: 1.7;
+}
+
+@media (max-width: 720px) {
+  .vtable td:nth-child(5),
+  .vtable th:nth-child(5) { display: none; }
+}

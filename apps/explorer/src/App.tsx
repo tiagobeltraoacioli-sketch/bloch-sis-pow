@@ -8,6 +8,8 @@ import { G4Dashboard } from "./pages/G4Dashboard";
 import { G4BlockPage } from "./pages/G4Block";
 import { BalancePage } from "./pages/Balance";
 import { ValidatorsPage } from "./pages/Validators";
+import { ValidatorDetailPage } from "./pages/ValidatorDetail";
+import { ValidatorQueuesPage } from "./pages/ValidatorQueues";
 import { SnapshotPage } from "./pages/Snapshot";
 import "./features.css";
 
@@ -40,6 +42,15 @@ function renderRoute(path: string) {
     if (mb) return <BalancePage initial={mb.h} key={"bal" + mb.h} />;
   }
   if (path === "/validators") return <ValidatorsPage />;
+  // Order matters: the literal route must be tested before the :index pattern,
+  // or "/validators/queues" is read as validator number NaN.
+  if (path === "/validators/queues") return <ValidatorQueuesPage />;
+  {
+    const mv = matchRoute(path, "/validators/:index");
+    if (mv && /^\d+$/.test(mv.index)) {
+      return <ValidatorDetailPage index={Number(mv.index)} key={"v" + mv.index} />;
+    }
+  }
   if (path === "/snapshot") return <SnapshotPage />;
 
   const m = matchRoute(path, "/slot/:s");

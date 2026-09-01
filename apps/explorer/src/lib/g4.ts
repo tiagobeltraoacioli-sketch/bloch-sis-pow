@@ -149,11 +149,20 @@ export interface G4Validator {
   pubkey_bytes: number;
   state: string;
   own_stake_sat: string;
-  effective_stake_sat: string;
+  /**
+   * Null when the active roster does not carry this validator this epoch.
+   *
+   * That is a DIFFERENT statement from zero and the node keeps them apart on
+   * purpose — "not sampled" and "sampled with no weight" are distinguishable
+   * states and a reader cares which one it is looking at. Every consumer here
+   * has to branch on it rather than defaulting it to 0.
+   */
+  effective_stake_sat: string | null;
   commission_bps: string;
   randao_commitment: string;
   slashed: boolean;
-  activation_epoch: number;
+  /** Null when the validator has never been scheduled to activate. */
+  activation_epoch: number | null;
   exit_epoch: number | null;
   withdrawable_epoch: number | null;
 }
