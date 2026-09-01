@@ -3330,9 +3330,22 @@ impl CommittedState {
             .map_err(TxReject::Deposit)?;
         // Registry-dependent: a second deposit of a registered key is a
         // top-up path decision the interface refuses to make implicitly.
-        // Identity is the FRAMED wire bytes, exactly as the 0x02 arm hashes
-        // them — two hash conventions for one key would let a key register
-        // twice.
+        //
+        // IDENTITY IS THE FRAMED WIRE BYTES, and this is the ONLY place a
+        // transaction may register a validator — both halves of that
+        // sentence are load-bearing. An earlier draft of this integration
+        // carried a second registration path (`apply_deposit`, taking the
+        // semantic `staking::DepositTx`) that hashed the RAW hybrid body
+        // instead: the same physical key would then have had two different
+        // `pubkey_hash` values, this duplicate check could not see across
+        // them, and one key could register twice — doubling a bond's
+        // consensus weight the moment the funded gate armed. That path was
+        // retired rather than documented; if a future work stream needs the
+        // semantic form, it must route THROUGH here, not beside it.
+        //
+        // The framed form is also what the exit path verifies against
+        // (`staking::committed_hybrid_body`), and the two spellings of the
+        // frame are pinned equal at compile time in staking.rs.
         let pubkey_hash: [u8; 32] = Sha3_256::digest(pubkey).into();
         if self.pubkey_index.contains_key(&pubkey_hash) {
             return Err(TxReject::StakingRule);
