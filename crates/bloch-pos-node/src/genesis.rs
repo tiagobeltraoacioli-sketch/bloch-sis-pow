@@ -904,6 +904,75 @@ impl Manifest {
             + self.allocations.iter().map(|a| a.amount_sat).sum::<u128>()
     }
 
+    /// What genesis puts into the REGISTRY, and what no output funded.
+    ///
+    /// [`Self::genesis_issued_sat`] sums the carryover and the allocations and
+    /// nothing else, and `CommittedState::genesis` seeds the committed
+    /// issuance counter from `tokenomics_v4::GENESIS_ISSUED_SAT` rather than
+    /// from the ledger it was handed. So the bonds this method sums are coin
+    /// that exists in the state, was never issued, and appears in no counter
+    /// — measured at 160,000,000,000,000 sat (1,600,000 BLCH) across the 64
+    /// launch validators of `genesis/mainnet.manifest`.
+    ///
+    /// It is not a defect of the manifest. There is nowhere for the number to
+    /// go: `TOTAL_SUPPLY_SAT == GENESIS_ISSUED_SAT + VALIDATOR_EMISSION_SAT`
+    /// exactly, so adding the bond to issued supply would put the counter over
+    /// the hard cap. It is a fact about the chain that has to be carried
+    /// explicitly, and this is where it is carried.
+    pub fn unbacked_bond_sat(&self) -> u128 {
+        self.validators.iter().map(|v| v.stake_sat).sum()
+    }
+
+    /// Audit the launch bonds against the write-off rule that will pay them.
+    ///
+    /// `CommittedState::unbacked_principal_sat` derives a cohort member's
+    /// unbacked principal from committed state alone — cohort membership plus
+    /// a per-validator constant — which is exact only while two measured facts
+    /// about this manifest hold: every bonded validator is inside the published
+    /// cohort, and every cohort bond is exactly
+    /// `tokenomics_v4::GENESIS_COHORT_PRINCIPAL_SAT`.
+    ///
+    /// Neither is a rule anything enforces, so both are checked HERE, against
+    /// the bytes, before a chain is launched from them. A manifest that broke
+    /// either would not be mispriced quietly: it would fail this audit, and the
+    /// write-off constants would have to be re-derived from it.
+    pub fn check_bond_backing(&self) -> Result<(), String> {
+        use bloch_pos_committee::tokenomics_v4 as t;
+        let mut cohort = self.cohort.clone();
+        cohort.sort_unstable();
+        for v in &self.validators {
+            if v.stake_sat == 0 {
+                continue;
+            }
+            if cohort.binary_search(&v.index).is_err() {
+                return Err(format!(
+                    "validator {} is bonded ({} sat) but is not in the published cohort — \
+                     its principal is unbacked and no rule can see it",
+                    v.index, v.stake_sat
+                ));
+            }
+            if v.stake_sat != t::GENESIS_COHORT_PRINCIPAL_SAT {
+                return Err(format!(
+                    "validator {} is bonded at {} sat; the write-off is derived against \
+                     {} sat — re-derive tokenomics_v4::GENESIS_COHORT_PRINCIPAL_SAT",
+                    v.index,
+                    v.stake_sat,
+                    t::GENESIS_COHORT_PRINCIPAL_SAT
+                ));
+            }
+        }
+        let total = self.unbacked_bond_sat();
+        if total != t::GENESIS_UNBACKED_PRINCIPAL_SAT {
+            return Err(format!(
+                "the launch bond sums to {total} sat; tokenomics_v4 says {} \
+                 (difference {})",
+                t::GENESIS_UNBACKED_PRINCIPAL_SAT,
+                total.abs_diff(t::GENESIS_UNBACKED_PRINCIPAL_SAT)
+            ));
+        }
+        Ok(())
+    }
+
     /// Refuse a manifest that does not add up.
     ///
     /// This is the check that makes the manifest a claim rather than an
@@ -1903,5 +1972,91 @@ mod blp02_hybrid_suite {
             Ok(m) => assert_eq!(m.validators.len(), 64, "the live set is 64 validators"),
             Err(e) => panic!("the live Genesis-4 manifest must decode, got: {}", e.0),
         }
+    }
+}
+
+#[cfg(test)]
+mod launch_bond_backing {
+    use super::*;
+
+    /// The live manifest, or `None` where the artefact is not beside the code.
+    fn live() -> Option<Manifest> {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../genesis/mainnet.manifest");
+        Manifest::decode(&std::fs::read(path).ok()?).ok()
+    }
+
+    /// **The measurement, against the bytes the fleet decodes.**
+    ///
+    /// Two sums, one file: the manifest's own arithmetic closes to
+    /// `GENESIS_ISSUED_SAT` with a difference of ZERO, and the launch bonds sit
+    /// entirely outside that closure. The zero is the proof — a sum that
+    /// balances without a term is a sum the term is not in.
+    #[test]
+    fn the_live_manifest_balances_without_its_launch_bond() {
+        use bloch_pos_committee::tokenomics_v4 as t;
+        let Some(m) = live() else { return };
+
+        // Half one: the issuance closes exactly.
+        assert!(m.check_supply().is_ok(), "the live manifest must pass its own supply check");
+        assert_eq!(m.genesis_issued_sat(), t::GENESIS_ISSUED_SAT);
+        assert_eq!(m.genesis_issued_sat(), 5_714_640_000_000_000_000);
+        assert_eq!(m.carryover.as_ref().map(|c| c.total_sat), Some(1_814_640_000_000_000_000));
+        assert_eq!(
+            m.allocations.iter().map(|a| a.amount_sat).sum::<u128>(),
+            3_900_000_000_000_000_000,
+        );
+        assert_eq!(m.allocations.len(), 5);
+
+        // Half two: the bond is outside it, and is exactly 1,600,000 BLCH.
+        assert_eq!(m.validators.len(), 64);
+        assert_eq!(m.unbacked_bond_sat(), 160_000_000_000_000);
+        assert_eq!(m.unbacked_bond_sat(), t::GENESIS_UNBACKED_PRINCIPAL_SAT);
+
+        // The closure is blind to the bond by construction: adding it changes
+        // nothing the check reads, so `check_supply` still passes on a manifest
+        // whose bonds were doubled. That is the defect, stated as a test.
+        let mut doubled = Manifest {
+            genesis_time_ms: m.genesis_time_ms,
+            slot_ms: m.slot_ms,
+            validators: m.validators.clone(),
+            cohort: m.cohort.clone(),
+            carryover: m.carryover.clone(),
+            allocations: m.allocations.clone(),
+            carryover_entries: Vec::new(),
+        };
+        for v in &mut doubled.validators {
+            v.stake_sat *= 2;
+        }
+        assert!(
+            doubled.check_supply().is_ok(),
+            "check_supply cannot see a bond — it sums the carryover and the \
+             allocations and nothing else"
+        );
+        assert!(
+            doubled.check_bond_backing().is_err(),
+            "check_bond_backing is the one that can"
+        );
+    }
+
+    /// The two facts the derived write-off rests on, checked against the file:
+    /// every bonded validator is inside the published cohort, and every cohort
+    /// bond is exactly the constant `unbacked_principal_sat` derives against.
+    #[test]
+    fn the_live_cohort_is_uniform_and_complete() {
+        use bloch_pos_committee::tokenomics_v4 as t;
+        let Some(m) = live() else { return };
+        if let Err(e) = m.check_bond_backing() {
+            panic!("the live manifest fails the write-off's precondition: {e}");
+        }
+        assert_eq!(m.cohort.len(), 64, "the cohort is the whole launch set");
+        for v in &m.validators {
+            assert_eq!(v.stake_sat, t::GENESIS_COHORT_PRINCIPAL_SAT);
+        }
+        // All 64 pay to ONE address. Not a defect — it is the founder-operated
+        // launch the cohort taper exists to unwind — but it is why the write-off
+        // has exactly one economic counterparty, and it belongs in the record.
+        let creds: std::collections::BTreeSet<&[u8]> =
+            m.validators.iter().map(|v| v.withdrawal_credentials.as_slice()).collect();
+        assert_eq!(creds.len(), 1, "all 64 launch bonds pay to one address");
     }
 }

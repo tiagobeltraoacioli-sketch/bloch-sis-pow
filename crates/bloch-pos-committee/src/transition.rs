@@ -1249,6 +1249,87 @@ impl<'a> TxReader<'a> {
     }
 }
 
+// ─── The supply audit ───────────────────────────────────────────────────────
+
+/// How much of one bond is principal that no output funded and no counter
+/// issued. See [`CommittedState::unbacked_principal_sat`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnbackedPrincipal {
+    /// Derivable from committed state.
+    Known(u128),
+    /// **Not derivable.** A slashed launch bond: the burn history that would
+    /// say how much of the principal is already gone is not committed
+    /// anywhere, so any number here would be a guess. Consumers must refuse,
+    /// never round.
+    Indeterminate,
+}
+
+/// Every pool that holds coin in one state, beside the two counters that claim
+/// to explain them.
+///
+/// # Why five pools and not two
+///
+/// Coin in this chain lives in more places than the eUTXO set and the
+/// registry. A transaction's fee leaves the set immediately and is materialised
+/// as no output at all: the producer's share sits in `pending_fee_rewards`
+/// until the epoch boundary compounds it into a bond, and any delegator share
+/// sits in `delegator_fee_rewards`. Both are real satoshis in neither of the
+/// two obvious pools, and a conservation check that omitted them would read
+/// every fee as a burn.
+///
+/// # The invariant, and the honest shape of it
+///
+/// [`Self::backing`] is what was issued plus what was never issued but exists
+/// anyway; [`Self::coin_in_existence`] is what is actually there. The chain
+/// burns — half the base fee during the emission era, 31/32 of every slashing
+/// penalty, the inactivity leak at the withdrawal door — and **no counter
+/// records a burn** (`state_root.rs`: "gross and monotone … the cap invariant
+/// is one-sided"). So the invariant cannot be a running equality:
+///
+/// * it is an EQUALITY at genesis ([`Self::slack`] is zero), and
+/// * [`Self::slack`] is `>= 0` in every reachable state, and
+/// * `slack` is MONOTONE NON-DECREASING across every transition — it grows by
+///   exactly what was burned and by nothing else.
+///
+/// A mint is precisely a state transition that makes `slack` fall. That is the
+/// whole detector: the unfunded `Deposit` (tag `0x02`), a `DepositV2` whose
+/// conservation check has been removed, and a withdrawal that pays a launch
+/// bond's principal out to an address all fail it, in that one number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SupplyAudit {
+    /// The committed cumulative-issuance counter.
+    pub issued_sat: u128,
+    /// Launch principal still outstanding — coin that exists and was never
+    /// issued.
+    pub unbacked_principal_sat: u128,
+    pub eutxo_sat: u128,
+    pub bonded_sat: u128,
+    pub pending_fee_sat: u128,
+    pub delegator_fee_sat: u128,
+}
+
+impl SupplyAudit {
+    /// Every satoshi that exists, wherever it is sitting.
+    pub fn coin_in_existence(&self) -> u128 {
+        self.eutxo_sat + self.bonded_sat + self.pending_fee_sat + self.delegator_fee_sat
+    }
+
+    /// Everything that could legitimately be there: what the chain issued,
+    /// plus the launch principal it never issued but holds anyway.
+    pub fn backing(&self) -> u128 {
+        self.issued_sat + self.unbacked_principal_sat
+    }
+
+    /// `backing - coin_in_existence`: cumulative burn, and nothing else.
+    ///
+    /// `None` means the coin outran its backing — a mint. Returned rather
+    /// than saturated, because saturating here would turn the one failure this
+    /// type exists to catch into a zero.
+    pub fn slack(&self) -> Option<u128> {
+        self.backing().checked_sub(self.coin_in_existence())
+    }
+}
+
 // ─── The committed state ────────────────────────────────────────────────────
 
 /// One validator of the launch set, as published in the genesis block.
@@ -2620,11 +2701,64 @@ impl CommittedState {
                     };
                     residual -= residual * topup_bps / 10_000;
                 }
-                // A fully-consumed bond (100% slash, or leak >= stake) pays
-                // nothing: refused rather than minting a zero-value output —
-                // the same dust discipline the transfer path enforces by
-                // never creating value-free entries, and what keeps the
+
+                // ── The launch cohort's principal is not payable ─────────────
+                //
+                // 3. The write-off, and the whole reason this arm may not be
+                //    armed before `FUNDED_STAKING_ACTIVATION_EPOCH`. A launch
+                //    validator's principal was written into the registry by
+                //    the genesis ceremony: no output funded it (the manifest's
+                //    carryover-plus-allocations balances to `GENESIS_ISSUED_SAT`
+                //    to the satoshi WITHOUT it) and no counter issued it
+                //    (`issued_sat` is seeded from the constant, and this arm
+                //    deliberately does not move it). Paying it into an eUTXO
+                //    output would therefore create spendable coin from nothing
+                //    — and `TOTAL_SUPPLY_SAT == GENESIS_ISSUED_SAT +
+                //    VALIDATOR_EMISSION_SAT` exactly, so there is no headroom
+                //    to legitimise it after the fact either.
+                //
+                //    What IS payable is everything the bond earned on top:
+                //    reward compounding advanced `issued_sat` by the same
+                //    satoshi it added to `staked_sat`, so that half is real,
+                //    counted, and owed. The write-off subtracts the principal
+                //    and nothing more.
+                //
+                //    Subtracted LAST, after the leak and the slashing
+                //    re-price, so those two continue to price the whole bond
+                //    exactly as they did before this rule existed. The
+                //    ordering is unobservable for a cohort record — a slashed
+                //    one is refused two lines down — and this keeps the leak
+                //    arithmetic identical for every other record.
+                let unbacked_sat = match self.unbacked_principal_sat(*validator) {
+                    UnbackedPrincipal::Known(v) => v,
+                    // A slashed launch bond: how much of the principal the
+                    // slash already burned is not committed anywhere, so the
+                    // write-off would be a guess in one direction or a double
+                    // charge in the other. Refuse, and leave the bond where it
+                    // is — a payout that cannot be computed must not be
+                    // approximated. Unreachable on the live chain today (64 of
+                    // 64 launch validators carry no applied slash) and it stays
+                    // a refusal rather than a `debug_assert` because "today"
+                    // is not a consensus rule.
+                    UnbackedPrincipal::Indeterminate => return Err(TxReject::StakingRule),
+                };
+                residual = residual.saturating_sub(unbacked_sat);
+                // A fully-consumed bond (100% slash, or leak >= stake, or a
+                // launch bond whose whole balance is written-off principal)
+                // pays nothing: refused rather than minting a zero-value
+                // output — the same dust discipline the transfer path enforces
+                // by never creating value-free entries, and what keeps the
                 // one-outpoint-per-validator argument below airtight.
+                //
+                // The write-off adds a case worth naming: a launch validator
+                // that never earned is refused here PERMANENTLY, not merely
+                // "not yet". Its exit already stopped its duties, so no further
+                // emission can accrue, and `withdrawable_epoch` is deliberately
+                // left unset — there is nothing owed, so there is nothing to
+                // mark paid. The verdict is the generic `StakingRule`, which
+                // reads the same as "not ripe"; an operator seeing it should
+                // check `unbacked_principal_sat` against the bond before
+                // concluding the clock is the problem.
                 if residual == 0 {
                     return Err(TxReject::StakingRule);
                 }
@@ -2646,15 +2780,19 @@ impl CommittedState {
 
                 // ── Apply. Nothing below may fail ───────────────────────────
                 //
-                // Conservation, stated as the invariant a test can pin: the
-                // eUTXO set gains exactly `residual`; the bond loses its whole
-                // `staked_sat`; the difference (`leak + top-up`) is burned by
-                // never being credited; `issued_sat` does not move, because
-                // the bond's value was already counted issued when it entered
-                // the bond (reward compounding advances the counter, and a
-                // funded deposit's coins were issued before they were bonded
-                // — the deposit-funding precondition on the activation
-                // constant is what makes that second half true).
+                // Conservation, stated as the invariant a test DOES pin
+                // (`CommittedState::supply_audit`): the eUTXO set gains exactly
+                // `residual`; the bond loses its whole `staked_sat`; the
+                // difference (`leak + top-up + the written-off principal`) is
+                // burned or retired by never being credited; `issued_sat` does
+                // not move, because the payable part of the bond was already
+                // counted issued when it entered the bond (reward compounding
+                // advances the counter, and a funded deposit's coins were
+                // issued before they were bonded — the deposit-funding
+                // precondition on the activation constant is what makes that
+                // second half true), and the UNPAYABLE part was never issued
+                // at all, which is why it is written off above rather than
+                // paid and then somehow accounted.
                 self.eutxos.insert(crate::state_root::EutxoEntry {
                     txid,
                     vout: 0,
@@ -3707,6 +3845,119 @@ impl CommittedState {
     /// same reason [`crate::state_root::total_utxo_value`] exists.
     pub fn total_unspent_sat(&self) -> u128 {
         self.eutxos.values().map(|e| e.value as u128).sum()
+    }
+
+    // ── The supply audit ────────────────────────────────────────────────────
+    //
+    // Everything below is a READ-ONLY projection of already-committed state.
+    // No consensus rule changes because these exist; they compute the number
+    // the chain has never had — "how much coin is there" — so that a test can
+    // assert it, and so that the withdrawal rule has one place to ask how much
+    // of a bond was never issued.
+
+    /// Coins parked in the in-epoch producer-fee float. Real satoshis: they
+    /// left the eUTXO set when the transaction paid, and they are in no bond
+    /// until the epoch boundary compounds them.
+    pub fn pending_fee_total_sat(&self) -> u128 {
+        self.pending_fee_rewards.values().sum()
+    }
+
+    /// Coins credited to delegators and not yet in any bond. Always zero on
+    /// the live chain today — `apply_delegation` is behind an inert flag day
+    /// and the legacy `Delegate` tag is a consensus reject at every epoch — but
+    /// counted, because a pool that is empty by accident is still a pool.
+    pub fn delegator_fee_total_sat(&self) -> u128 {
+        self.delegator_fee_rewards.values().sum()
+    }
+
+    /// Every satoshi bonded in the registry.
+    pub fn total_bonded_sat(&self) -> u128 {
+        self.validators.values().map(|r| r.staked_sat).sum()
+    }
+
+    /// How much of `index`'s bond is principal that no output ever funded.
+    ///
+    /// # What is unbacked, and why only this
+    ///
+    /// A bond registered by [`PosTransaction::DepositV2`] is DESTROYED
+    /// spendable coins — `apply_deposit_v2` refuses unless
+    /// `spent_value == amount_sat + change + fee`, so the eUTXO set fell by
+    /// exactly what the registry gained. A bond grown by reward compounding is
+    /// freshly ISSUED coin — `close_epoch` advances `issued_sat` and
+    /// `staked_sat` on the same line, in the same `if let`, so the counter
+    /// cannot move without the bond. Both are backed.
+    ///
+    /// The launch cohort's bond is neither. `CommittedState::genesis` writes 64
+    /// records straight from the manifest while seeding `issued_sat` from
+    /// `GENESIS_ISSUED_SAT`, which the manifest's own arithmetic balances to
+    /// zero WITHOUT the stake. So exactly one class of coin in this state was
+    /// never funded and never issued, and it is this one.
+    ///
+    /// # Derived, never materialised
+    ///
+    /// This reads only fields the state root already commits — cohort
+    /// membership (`TAG_GENESIS_COHORT`) and `staked_sat` — so there is no
+    /// second encoding of the fact to drift from the first, and no state-root
+    /// schema change. `min` with the live bond is the saturation guard: a bond
+    /// already paid down to zero owes nothing, and the write-off can never
+    /// exceed what is there to write off.
+    ///
+    /// # The one case it refuses to answer
+    ///
+    /// A SLASHED cohort bond is [`UnbackedPrincipal::Indeterminate`]. Slashing
+    /// burns from `staked_sat` (`apply_slashing_evidence`) and reward
+    /// compounding adds to it, and committed state records neither history —
+    /// so a bond slashed below its principal and then regrown by rewards is
+    /// indistinguishable from one that was never slashed, and `min(principal,
+    /// staked_sat)` would charge the burn twice, the second time against real
+    /// emitted coin. Refusing is the only answer that is not a guess. The fix
+    /// that would let it answer is a committed low-water mark per record — a
+    /// state-root column, and a separate decision; see
+    /// `docs/adr/ADR-042-cohort-principal-writeoff.md`.
+    pub fn unbacked_principal_sat(&self, index: u32) -> UnbackedPrincipal {
+        let Some(rec) = self.validators.get(&index) else {
+            return UnbackedPrincipal::Known(0);
+        };
+        if self.genesis_cohort.binary_search(&index).is_err() {
+            // Funded at deposit, or grown from issued emission. Backed.
+            return UnbackedPrincipal::Known(0);
+        }
+        if rec.slashed {
+            return UnbackedPrincipal::Indeterminate;
+        }
+        UnbackedPrincipal::Known(
+            tokenomics_v4::GENESIS_COHORT_PRINCIPAL_SAT.min(rec.staked_sat),
+        )
+    }
+
+    /// The whole unbacked principal still outstanding in the registry.
+    ///
+    /// An indeterminate record contributes its full nominal principal, capped
+    /// at its bond: the total is an accounting figure and must not shrink
+    /// because one record's composition became unreadable — under-reporting
+    /// the unbacked total is the direction that hides a mint.
+    pub fn unbacked_principal_total_sat(&self) -> u128 {
+        self.validators
+            .keys()
+            .map(|i| match self.unbacked_principal_sat(*i) {
+                UnbackedPrincipal::Known(v) => v,
+                UnbackedPrincipal::Indeterminate => tokenomics_v4::GENESIS_COHORT_PRINCIPAL_SAT
+                    .min(self.validators[i].staked_sat),
+            })
+            .sum()
+    }
+
+    /// Every pool that holds coin, and the two counters that claim to explain
+    /// them. See [`SupplyAudit`].
+    pub fn supply_audit(&self) -> SupplyAudit {
+        SupplyAudit {
+            issued_sat: self.issued_sat,
+            unbacked_principal_sat: self.unbacked_principal_total_sat(),
+            eutxo_sat: self.total_unspent_sat(),
+            bonded_sat: self.total_bonded_sat(),
+            pending_fee_sat: self.pending_fee_total_sat(),
+            delegator_fee_sat: self.delegator_fee_total_sat(),
+        }
     }
 
     /// The price this state's block charged, in millisatoshi per gas. The
@@ -11870,6 +12121,492 @@ mod tests {
             );
         }
     }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // The supply invariant
+    //
+    // "issued_sat must equal all coin in existence" is the check whose absence
+    // let a 1,600,000-BLCH launch bond sit outside every counter for eighteen
+    // days without anything going red. These tests are that check.
+    // ───────────────────────────────────────────────────────────────────────
+
+    /// A genesis in the SHAPE of `genesis/mainnet.manifest`: an opening ledger
+    /// summing to exactly `GENESIS_ISSUED_SAT`, and `n` launch validators each
+    /// bonded at `principal`, every one of them inside the committed cohort.
+    ///
+    /// No randao chains: these tests are arithmetic over a committed state, and
+    /// generating 64 hash chains to assert a sum would be paying for machinery
+    /// the assertion never uses.
+    fn launch_shaped(n: u32, principal: u128, extra: &[crate::state_root::EutxoEntry]) -> CommittedState {
+        let extra_sat: u128 = extra.iter().map(|e| e.value as u128).sum();
+        let treasury = tokenomics_v4::GENESIS_ISSUED_SAT - extra_sat;
+        let mut ledger = vec![crate::state_root::EutxoEntry {
+            txid: [0xF0; 32],
+            vout: 0,
+            // The whole opening issuance in one output: 5.71e18 sat is inside
+            // u64, which is the same headroom argument `TOTAL_SUPPLY_SAT <=
+            // u64::MAX` makes for a single balance.
+            value: sat_u64(treasury),
+            script_hash: [0xE9; 32],
+            unlock_epoch: 0,
+        }];
+        ledger.extend_from_slice(extra);
+        let vals: Vec<GenesisValidator> = (0..n)
+            .map(|i| GenesisValidator {
+                index: i,
+                pubkey: vec![i as u8, 0x4C],
+                staked_sat: principal,
+                randao_commitment: [i as u8; 32],
+                // All 64 of the live cohort's credentials are the SAME
+                // address; the fixture keeps that, because a payout test that
+                // used 64 addresses would not be testing the chain that runs.
+                withdrawal_credentials: vec![0xE9; 32],
+                commission_bps: 0,
+            })
+            .collect();
+        CommittedState::genesis(
+            genesis_block_id(),
+            [0x07; 32],
+            &vals,
+            &(0..n).collect::<Vec<u32>>(),
+            [0u8; 32],
+            [0u8; 32],
+            [0u8; 32],
+            EvmCommitment {
+                account_root: [0u8; 32],
+                receipts_root: [0u8; 32],
+                gas_used: 0,
+                base_fee_per_gas: 0,
+            },
+            &ledger,
+        )
+    }
+
+    /// The same launch shape, with real randao chains and a `Transition`, for
+    /// the tests that have to go through a whole block.
+    ///
+    /// The validator keys and chain seeds are built exactly as `setup_with`
+    /// builds them, because the proposer draw and the reveal check are the
+    /// machinery under test's feet, not the thing under test.
+    fn launch_shaped_with_chains(
+        n: u32,
+        extra: &[crate::state_root::EutxoEntry],
+    ) -> (Transition<ToyVerifier>, CommittedState, Vec<RandaoChain>) {
+        let extra_sat: u128 = extra.iter().map(|e| e.value as u128).sum();
+        let mut ledger = vec![crate::state_root::EutxoEntry {
+            txid: [0xF0; 32],
+            vout: 0,
+            value: sat_u64(tokenomics_v4::GENESIS_ISSUED_SAT - extra_sat),
+            script_hash: [0xE9; 32],
+            unlock_epoch: 0,
+        }];
+        ledger.extend_from_slice(extra);
+        let mut chains = Vec::new();
+        let mut vals = Vec::new();
+        for i in 0..n {
+            let mut seed = [0u8; 32];
+            seed[0] = i as u8;
+            seed[1] = 0x5A;
+            let chain = RandaoChain::generate(seed);
+            vals.push(GenesisValidator {
+                index: i,
+                pubkey: vec![i as u8; 8],
+                staked_sat: tokenomics_v4::GENESIS_COHORT_PRINCIPAL_SAT,
+                randao_commitment: chain.commitment(),
+                withdrawal_credentials: vec![0xE9; 32],
+                commission_bps: 0,
+            });
+            chains.push(chain);
+        }
+        let st = CommittedState::genesis(
+            genesis_block_id(),
+            [0x07; 32],
+            &vals,
+            &(0..n).collect::<Vec<u32>>(),
+            [0u8; 32],
+            [0u8; 32],
+            [0u8; 32],
+            EvmCommitment {
+                account_root: [0u8; 32],
+                receipts_root: [0u8; 32],
+                gas_used: 0,
+                base_fee_per_gas: 0,
+            },
+            &ledger,
+        );
+        (Transition::new(ToyVerifier), st, chains)
+    }
+
+    /// **The measurement, re-derived as an assertion.**
+    ///
+    /// The launch state balances to zero WITHOUT the bond, which is the proof
+    /// the bond is outside it: `issued_sat` is seeded from `GENESIS_ISSUED_SAT`
+    /// and the opening ledger sums to the same number, so the 1,600,000 BLCH in
+    /// the registry is coin that exists, was never issued, and appears in no
+    /// counter. Naming it (`unbacked_principal_sat`) is what closes the gap to
+    /// zero — the number is not made to disappear, it is made VISIBLE.
+    #[test]
+    fn the_launch_bond_is_exactly_the_gap_between_issued_supply_and_coin_in_existence() {
+        let st = launch_shaped(
+            tokenomics_v4::GENESIS_COHORT_SIZE as u32,
+            tokenomics_v4::GENESIS_COHORT_PRINCIPAL_SAT,
+            &[],
+        );
+        let a = st.supply_audit();
+
+        // The two halves of the manifest, as the node seeds them.
+        assert_eq!(a.issued_sat, tokenomics_v4::GENESIS_ISSUED_SAT);
+        assert_eq!(a.eutxo_sat, tokenomics_v4::GENESIS_ISSUED_SAT);
+        assert_eq!(a.bonded_sat, tokenomics_v4::GENESIS_UNBACKED_PRINCIPAL_SAT);
+        assert_eq!(a.pending_fee_sat, 0);
+        assert_eq!(a.delegator_fee_sat, 0);
+
+        // THE FINDING: coin in existence exceeds issued supply by exactly the
+        // launch bond — 1,600,000 BLCH, 160,000,000,000,000 sat.
+        assert_eq!(
+            a.coin_in_existence() - a.issued_sat,
+            tokenomics_v4::GENESIS_UNBACKED_PRINCIPAL_SAT,
+            "the launch bond is coin that no counter knows about"
+        );
+        assert_eq!(tokenomics_v4::GENESIS_UNBACKED_PRINCIPAL_SAT, 160_000_000_000_000);
+
+        // And there is no room to simply count it. `TOTAL_SUPPLY_SAT ==
+        // GENESIS_ISSUED_SAT + VALIDATOR_EMISSION_SAT` EXACTLY, so every
+        // satoshi added to genesis issuance is a satoshi taken out of the
+        // emission headroom: count the bond and the 40-year schedule promises
+        // 1,600,000 BLCH more than the cap will let it pay. It would not fail
+        // loudly either — `close_epoch` clamps issuance to `TOTAL_SUPPLY_SAT -
+        // issued_sat`, so the schedule and the cap would simply disagree and
+        // the clamp would silently win, decades from now. That is the failure
+        // mode `Manifest::check_supply`'s own comment names.
+        let headroom_if_counted =
+            tokenomics_v4::TOTAL_SUPPLY_SAT - (a.issued_sat + a.bonded_sat);
+        assert_eq!(
+            tokenomics_v4::VALIDATOR_EMISSION_SAT - headroom_if_counted,
+            tokenomics_v4::GENESIS_UNBACKED_PRINCIPAL_SAT,
+            "counting the launch bond shorts the emission schedule by exactly the bond"
+        );
+
+        // Named, the books balance to the satoshi.
+        assert_eq!(a.unbacked_principal_sat, tokenomics_v4::GENESIS_UNBACKED_PRINCIPAL_SAT);
+        assert_eq!(a.slack(), Some(0), "a launch state must balance exactly");
+    }
+
+    /// A funded deposit moves coin between the two pools and burns only what
+    /// the fee market says it burns. The invariant's slack grows by exactly
+    /// that burn and by nothing else — which is what "preserved by every path
+    /// that moves either" means for a chain with no burn counter.
+    #[test]
+    fn a_funded_deposit_preserves_the_supply_invariant() {
+        let _open = crate::params::rehearsal::deposit_funding_open_guard();
+        let owner = owner_key(0x60);
+        let coin = opening(0x93, 0, 30_000_000_000_000, &owner);
+        let (t, g, mut chains) = launch_shaped_with_chains(4, std::slice::from_ref(&coin));
+
+        let before = g.supply_audit();
+        assert_eq!(before.slack(), Some(0), "control: the fixture starts balanced");
+
+        let tx = deposit_v2_funding(
+            std::slice::from_ref(&coin),
+            &owner,
+            &framed_validator_key(0xB1),
+            staking::MIN_DEPOSIT_SAT,
+            script_of(&owner_key(0x61)),
+            g.next_base_fee(),
+        );
+        let b = build_block(&t, &g, 1, &[], std::slice::from_ref(&tx), &mut chains);
+        let st = t
+            .apply_block(&g, &b, &[], std::slice::from_ref(&tx))
+            .expect("a conserving funded deposit must apply");
+        let after = st.supply_audit();
+
+        // Nothing was minted: `issued_sat` did not move, and neither did the
+        // unbacked principal — a funded bond is backed by construction.
+        assert_eq!(after.issued_sat, before.issued_sat);
+        assert_eq!(after.unbacked_principal_sat, before.unbacked_principal_sat);
+
+        // The bond is destroyed spendable coin: what left the set is the bond
+        // plus the fee, and the fee's producer half is sitting in the float,
+        // not gone.
+        assert_eq!(after.bonded_sat - before.bonded_sat, staking::MIN_DEPOSIT_SAT);
+
+        // The burn, derived from the fee market rather than read back out of
+        // the audit. Reading it back would make the next assertion circular —
+        // it would confirm that the audit agrees with itself, which is exactly
+        // the shape of check that let the launch bond through.
+        let (tx_bytes, n_inputs) = match &tx {
+            PosTransaction::DepositV2 { tx_bytes, inputs, .. } => (*tx_bytes, inputs.len()),
+            _ => unreachable!(),
+        };
+        let charge = fee_market::charge(
+            fee_market::TxClass::Eutxo { inputs: n_inputs as u32 + 1 },
+            tx_bytes,
+            g.next_base_fee(),
+            0,
+        );
+        let burned = crate::rewards::split_fees_at(charge.base_fee_sat, charge.priority_fee_sat, 1)
+            .burned;
+        assert!(burned > 0, "control: the emission-era base fee must burn something");
+
+        assert_eq!(
+            before.coin_in_existence() - after.coin_in_existence(),
+            burned,
+            "the only coin that left existence is the burnt half of the base fee"
+        );
+        assert_eq!(
+            after.slack().expect("a funded deposit may never outrun its backing"),
+            before.slack().unwrap() + burned,
+            "slack must grow by the burn and by nothing else — a single satoshi \
+             of skew either way is a mint or an unexplained burn"
+        );
+    }
+
+    /// **The mutation detector.** A deposit whose declared bond and change
+    /// exceed the coins it spends is the original defect wearing the funded
+    /// format's clothes, and `apply_deposit_v2`'s conservation equality is the
+    /// one line standing between it and the state.
+    ///
+    /// The assertion order below is deliberate: the AUDIT is checked first,
+    /// against whatever state the attempt left behind, and only then the
+    /// verdict. Delete the equality from `apply_deposit_v2` and the deposit
+    /// applies, the registry gains a bond larger than the set lost, and the
+    /// first assertion goes red — before the second one has a chance to
+    /// notice the verdict changed. That ordering is what makes this a test of
+    /// the invariant and not a second copy of
+    /// `a_non_conserving_funded_deposit_is_refused`.
+    #[test]
+    fn a_deposit_that_outruns_its_inputs_is_caught_by_the_audit() {
+        let _open = crate::params::rehearsal::deposit_funding_open_guard();
+        let owner = owner_key(0x62);
+        let coin = opening(0x94, 0, 30_000_000_000_000, &owner);
+        let (_t, g, _chains) = launch_shaped_with_chains(4, std::slice::from_ref(&coin));
+        assert_eq!(g.supply_audit().slack(), Some(0), "control: balanced to start");
+
+        let mut skewed = deposit_v2_funding(
+            std::slice::from_ref(&coin),
+            &owner,
+            &framed_validator_key(0xB2),
+            staking::MIN_DEPOSIT_SAT,
+            script_of(&owner_key(0x63)),
+            g.next_base_fee(),
+        );
+        // 1,000 BLCH of change the inputs never paid for — far more than the
+        // base-fee burn of the same transaction could ever mask, so the audit
+        // cannot come out level by accident.
+        if let PosTransaction::DepositV2 { change, .. } = &mut skewed {
+            change[0].value += sat_u64(sat(1_000));
+        }
+        // Signatures restored: the refusal under test is conservation, never a
+        // stale witness over the edited field.
+        sign_deposit_v2(&mut skewed, &owner);
+
+        let mut probe = g.clone();
+        let verdict = probe.apply_transaction(&skewed, 0, g.next_base_fee(), &ToyVerifier);
+        assert!(
+            probe.supply_audit().slack().is_some(),
+            "coin outran its backing: `apply_deposit_v2` let a bond through that \
+             the eUTXO set did not pay for"
+        );
+        assert_eq!(
+            verdict,
+            Err(TxReject::Transfer(TransferReject::ValueNotConserved)),
+            "and the refusal must be the conservation one, by name"
+        );
+    }
+
+    /// **What the invariant catches.** The unfunded `Deposit` (tag 0x02) is a
+    /// consensus reject at every epoch — but the reason it must stay one is
+    /// arithmetic, not policy, and this is the arithmetic: its registration
+    /// half alone drives the audit's slack negative, because bonded stake grew
+    /// with nothing debited anywhere.
+    ///
+    /// The mint is applied here by HAND, bypassing the refusal, because the
+    /// point is to show what the refusal is protecting. A test that only
+    /// asserted `Err(StakingNotActive)` would pass just as well if the
+    /// invariant were unwritable.
+    #[test]
+    fn an_unfunded_bond_drives_the_supply_invariant_negative() {
+        let mut st = launch_shaped(4, tokenomics_v4::GENESIS_COHORT_PRINCIPAL_SAT, &[]);
+        assert_eq!(st.supply_audit().slack(), Some(0));
+
+        // The consensus verdict, first: this shape cannot reach the state.
+        let unfunded = PosTransaction::Deposit {
+            pubkey: vec![0xAB; 8],
+            amount_sat: staking::MIN_DEPOSIT_SAT,
+            randao_commitment: [0xCD; 32],
+            withdrawal_credentials: vec![0xEF; 4],
+            commission_bps: 0,
+        };
+        assert_eq!(
+            st.clone().apply_transaction(&unfunded, 0, 0, &OkVerifier),
+            Err(TxReject::StakingNotActive),
+        );
+
+        // Now do by hand exactly what the retired arm did, and watch the books
+        // fail. The new record is NOT in the genesis cohort, so it claims to be
+        // a backed bond — which is precisely the lie.
+        st.validators.insert(
+            9,
+            ValidatorRecord {
+                index: 9,
+                pubkey: vec![0xAB; 8],
+                staked_sat: staking::MIN_DEPOSIT_SAT,
+                randao_commitment: [0xCD; 32],
+                withdrawal_credentials: vec![0xEF; 32],
+                activation_epoch: u64::MAX,
+                exit_epoch: u64::MAX,
+                withdrawable_epoch: u64::MAX,
+                slashed: false,
+                commission_bps: 0,
+            },
+        );
+        assert_eq!(
+            st.supply_audit().slack(),
+            None,
+            "an unfunded bond must make the audit refuse to balance"
+        );
+    }
+
+    /// The withdrawal half. A ripe launch bond pays out what it EARNED and
+    /// writes off what it was handed: the emission is real, counted
+    /// (`close_epoch` moves `issued_sat` and `staked_sat` on the same line) and
+    /// owed; the principal was never issued and is not payable.
+    ///
+    /// The control at the end is the whole finding in one line: paying the bond
+    /// in full — what this arm did before the write-off — takes the audit's
+    /// slack negative by exactly the principal.
+    #[test]
+    fn a_ripe_launch_bond_pays_its_emission_and_writes_off_its_principal() {
+        let _gates = crate::params::rehearsal::gates_open_guard();
+        let principal = tokenomics_v4::GENESIS_COHORT_PRINCIPAL_SAT;
+        let earned = sat(3_000);
+        let mut st = launch_shaped(4, principal, &[]);
+
+        // This bond earned: emission compounds into the bond AND advances the
+        // counter, so both sides move together and the state stays balanced.
+        st.validators.get_mut(&0).unwrap().staked_sat += earned;
+        st.issued_sat += earned;
+        assert_eq!(st.supply_audit().slack(), Some(0), "control: emission is backed");
+
+        st.validators.get_mut(&0).unwrap().exit_epoch = 1;
+        st.validators.get_mut(&0).unwrap().withdrawable_epoch = 2;
+        st.epoch = 2;
+
+        let before = st.supply_audit();
+        assert_eq!(before.unbacked_principal_sat, 4 * principal);
+        withdraw(&mut st, 0, 0).expect("a ripe launch bond must pay its emission");
+
+        let w = PosTransaction::Withdraw { validator: 0 };
+        let out = st.eutxos.get(&(w.txid(), 0)).expect("the payout output must exist");
+        assert_eq!(
+            out.value as u128, earned,
+            "the payout is the emission, never the principal"
+        );
+        assert_eq!(out.script_hash.to_vec(), st.validator_record(0).unwrap().withdrawal_credentials);
+
+        let after = st.supply_audit();
+        assert_eq!(after.unbacked_principal_sat, 3 * principal, "one principal retired");
+        assert_eq!(
+            after.slack(),
+            before.slack(),
+            "an unslashed, unleaked write-off burns nothing and mints nothing"
+        );
+
+        // THE CONTROL, and the finding. Had the arm paid `staked_sat` — which
+        // is what it did until this rule — the set would have gained the
+        // principal too, while the backing lost it: slack falls by exactly
+        // 25,000 BLCH per launch validator, 1,600,000 BLCH across the cohort.
+        let paid_in_full = after.coin_in_existence() + principal;
+        assert_eq!(
+            after.backing().checked_sub(paid_in_full),
+            None,
+            "paying a launch bond in full is a mint, and this is the arithmetic"
+        );
+    }
+
+    /// A slashed launch bond is not priceable from committed state, so the
+    /// door refuses rather than guessing. See
+    /// `CommittedState::unbacked_principal_sat`.
+    #[test]
+    fn a_slashed_launch_bond_is_refused_rather_than_mispaid() {
+        let _gates = crate::params::rehearsal::gates_open_guard();
+        let principal = tokenomics_v4::GENESIS_COHORT_PRINCIPAL_SAT;
+        let mut st = launch_shaped(4, principal, &[]);
+        st.issued_sat += sat(3_000);
+        st.validators.get_mut(&0).unwrap().staked_sat += sat(3_000);
+
+        assert_eq!(st.unbacked_principal_sat(0), UnbackedPrincipal::Known(principal));
+        assert_eq!(st.unbacked_principal_sat(1), UnbackedPrincipal::Known(principal));
+        // Not in the cohort, and absent: both are backed by definition.
+        assert_eq!(st.unbacked_principal_sat(99), UnbackedPrincipal::Known(0));
+
+        st.validators.get_mut(&0).unwrap().slashed = true;
+        assert_eq!(st.unbacked_principal_sat(0), UnbackedPrincipal::Indeterminate);
+
+        st.validators.get_mut(&0).unwrap().exit_epoch = 1;
+        st.validators.get_mut(&0).unwrap().withdrawable_epoch = 2;
+        st.epoch = 2;
+        assert_eq!(
+            withdraw(&mut st, 0, 0),
+            Err(TxReject::StakingRule),
+            "a bond whose composition is unreadable must not be paid at all"
+        );
+        assert_eq!(st.supply_audit().slack(), Some(0), "the refusal moved nothing");
+    }
+
+    /// The third path that moves either quantity: the epoch boundary. Emission
+    /// advances `issued_sat` and `staked_sat` on the same line, in the same
+    /// `if let`, so the counter cannot move without the bond — and the audit is
+    /// what turns that code reading into an assertion.
+    #[test]
+    fn an_epoch_boundary_mints_into_the_bonds_and_nowhere_else() {
+        let (t, g, mut chains) = launch_shaped_with_chains(4, &[]);
+        assert_eq!(g.supply_audit().slack(), Some(0));
+
+        // Epoch 1: an epoch-0 attestation cannot exist, so nobody earns at the
+        // first boundary and the assertion would be vacuous there.
+        let e1 = t.process_epoch(&g).unwrap();
+        let atts = full_epoch_attestations(&e1, *e1.head.as_bytes());
+        let b = build_block(&t, &e1, 2 * SLOTS_PER_EPOCH - 1, &atts, &[], &mut chains);
+        let applied = t.apply_block(&e1, &b, &atts, &[]).unwrap();
+
+        let before = applied.supply_audit();
+        let after = t.process_epoch(&applied).unwrap().supply_audit();
+
+        let minted = after.issued_sat - before.issued_sat;
+        assert!(minted > 0, "control: full participation must earn something");
+        assert_eq!(
+            after.bonded_sat - before.bonded_sat,
+            minted,
+            "every minted satoshi must land in a bond"
+        );
+        assert_eq!(after.eutxo_sat, before.eutxo_sat, "emission must not touch the ledger");
+        assert_eq!(
+            after.unbacked_principal_sat, before.unbacked_principal_sat,
+            "emission is backed: it must not grow the unbacked principal"
+        );
+        assert_eq!(
+            after.slack(),
+            before.slack(),
+            "a boundary with no fees to burn must leave the books exactly where they were"
+        );
+    }
+
+    /// The write-off binds to the COHORT, not to the registry: a validator that
+    /// deposited its way in after genesis is backed, and its bond pays in full.
+    #[test]
+    fn a_funded_bond_is_never_written_off() {
+        let _gates = crate::params::rehearsal::gates_open_guard();
+        let (_t, mut st) = exited_payable(0);
+        assert!(st.genesis_cohort.is_empty(), "control: this fixture has no cohort");
+        let bond = st.validator_record(0).unwrap().staked_sat;
+        assert_eq!(st.unbacked_principal_sat(0), UnbackedPrincipal::Known(0));
+        st.epoch = st.validator_record(0).unwrap().withdrawable_epoch;
+        let before = st.total_unspent_sat();
+        withdraw(&mut st, 0, 0).unwrap();
+        assert_eq!(st.total_unspent_sat() - before, bond, "a backed bond pays in full");
+    }
+
 }
 
 #[cfg(test)]

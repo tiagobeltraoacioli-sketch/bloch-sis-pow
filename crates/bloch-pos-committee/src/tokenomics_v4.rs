@@ -704,3 +704,80 @@ pub const fn annual_inflation_bps(year: u64) -> u128 {
     }
     annual * 10_000 / TOTAL_SUPPLY_SAT
 }
+
+// ── The launch cohort's bond, and why it is not in the numbers above ────────
+//
+// MEASURED, twice and independently, from `genesis/mainnet.manifest`
+// (SHA-256 7eef82a7…b2dd, the file three fleet hosts decode byte-identically):
+//
+//   carryover.total_sat                      1,814,640,000,000,000,000
+//   Σ allocations (5 buckets)              + 3,900,000,000,000,000,000
+//   ────────────────────────────────────────────────────────────────────
+//   Manifest::genesis_issued_sat()           5,714,640,000,000,000,000
+//   GENESIS_ISSUED_SAT                       5,714,640,000,000,000,000
+//   difference                                                       0
+//
+//   Σ ManifestValidator::stake_sat (64)        160,000,000,000,000
+//
+// The manifest balances to zero WITHOUT the stake, and that is the proof the
+// stake is outside it: `genesis_issued_sat()` (bloch-pos-node/src/genesis.rs)
+// sums the carryover and the allocations and nothing else, and `issued_sat` is
+// SEEDED from the constant rather than derived by summing the ledger. So at
+// slot 0 the chain holds 5,714,640,000,000,000,000 sat of spendable outputs
+// PLUS 160,000,000,000,000 sat of bonded stake that no output funded and no
+// counter records.
+//
+// Note also what the zero above does NOT prove. `GENESIS_ISSUED_SAT` is
+// defined as `TOTAL_SUPPLY_SAT - VALIDATOR_EMISSION_SAT`, and
+// `VALIDATOR_EMISSION_BLOCH` is defined as the total minus the carryover minus
+// the five buckets — so `GENESIS_ISSUED_SAT ≡ (carryover + buckets) ×
+// SAT_PER_BLOCH` BY ALGEBRA. `Manifest::check_supply` is therefore a
+// manifest↔constant typing check, not a supply audit: it cannot see a bond,
+// because no term in it has ever been a bond.
+
+/// The bond each Genesis-4 launch validator was registered with, in satoshis.
+///
+/// Uniform across all 64: every `ManifestValidator::stake_sat` in
+/// `genesis/mainnet.manifest` is exactly this value, which is also
+/// [`crate::staking::MIN_DEPOSIT_SAT`]. Uniformity is a MEASURED fact of the
+/// live file, not a rule — `Manifest::unbacked_bond_sat` re-derives the total
+/// from the manifest itself and a manifest that broke the uniformity would
+/// fail its audit rather than be silently mispriced here.
+pub const GENESIS_COHORT_PRINCIPAL_SAT: u128 = 25_000 * SAT_PER_BLOCH;
+
+/// How many validators the chain launched with.
+pub const GENESIS_COHORT_SIZE: u128 = 64;
+
+/// The whole unbacked launch principal: 1,600,000 BLCH of bonded stake that
+/// exists in the registry, is inside no `issued_sat`, and was funded by no
+/// output.
+///
+/// It is 0.0016% of [`TOTAL_SUPPLY_SAT`] — small, and that is not the point.
+/// [`TOTAL_SUPPLY_SAT`] equals `GENESIS_ISSUED_SAT + VALIDATOR_EMISSION_SAT`
+/// EXACTLY, so there is no headroom anywhere in the schedule: every satoshi
+/// added to genesis issuance is a satoshi taken out of the emission budget.
+/// Counting this stake as issued therefore leaves the 40-year schedule
+/// promising 1,600,000 BLCH more than the cap will let it pay — and it fails
+/// SILENTLY, because `close_epoch` clamps issuance to the remaining headroom,
+/// so the schedule and the cap simply disagree and the clamp wins, decades
+/// from now. Paying it out instead would move it into the spendable set as
+/// coin nobody ever issued. Neither is available, which is why the third
+/// option — never paying the principal — is the one
+/// `CommittedState::unbacked_principal_sat` implements. See
+/// `docs/adr/ADR-042-cohort-principal-writeoff.md`.
+pub const GENESIS_UNBACKED_PRINCIPAL_SAT: u128 =
+    GENESIS_COHORT_PRINCIPAL_SAT * GENESIS_COHORT_SIZE;
+
+// The schedule has no slack for the launch bond. Stated as a build error rather
+// than a comment: the identity below is what makes "just count it" a silent
+// shortfall in the emission budget rather than a free correction, and an edit
+// that opened a gap between the cap and its two halves would take that
+// reasoning out from under the write-off without anything going red.
+const _: () = assert!(
+    GENESIS_ISSUED_SAT + VALIDATOR_EMISSION_SAT == TOTAL_SUPPLY_SAT,
+    "the cap has no headroom; the launch bond cannot be counted into issued supply"
+);
+const _: () = assert!(
+    GENESIS_UNBACKED_PRINCIPAL_SAT == 160_000_000_000_000,
+    "the measured launch bond moved: re-audit genesis/mainnet.manifest before editing this"
+);

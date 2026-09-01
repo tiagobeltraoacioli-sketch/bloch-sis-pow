@@ -370,15 +370,31 @@ pub const VESTING_LOCK_ACTIVATION_EPOCH: u64 = u64::MAX;
 ///    the eUTXO set never funded. Withdrawals must not arm until those two
 ///    are accounted (precondition 2), and arming them BEFORE
 ///    `FUNDED_STAKING_ACTIVATION_EPOCH` would reopen the printer outright.
-/// 2. **The genesis bonds must be accounted inside issued supply.** The
-///    withdrawal pays committed bonds out as eUTXO value without touching
-///    `issued_sat` (the bond's value is treated as already issued — reward
-///    compounding incremented the counter when it entered the bond, and a
-///    funded deposit's coins were issued before they were bonded). Whether
-///    the launch validators' `staked_sat` was inside `GENESIS_ISSUED_SAT`
-///    is a genesis-ceremony fact that must be audited before the first
-///    genesis-cohort withdrawal, or the supply-cap invariant tracks a
-///    number the spendable set quietly exceeds.
+/// 2. **The genesis bonds must be accounted — AUDITED, ANSWERED, and the
+///    answer was no.** The withdrawal pays committed bonds out as eUTXO value
+///    without touching `issued_sat` (the bond's value is treated as already
+///    issued — reward compounding incremented the counter when it entered the
+///    bond, and a funded deposit's coins were issued before they were bonded).
+///    Whether the launch validators' `staked_sat` was inside
+///    `GENESIS_ISSUED_SAT` was a genesis-ceremony fact nobody had checked.
+///
+///    It was checked on 2026-09-01, against `genesis/mainnet.manifest`, twice
+///    and independently: **it was not.** `Manifest::genesis_issued_sat()` sums
+///    the carryover (18,146,400,000 BLCH) and the five allocation buckets
+///    (39,000,000,000 BLCH) to exactly `GENESIS_ISSUED_SAT`, difference ZERO —
+///    and the 64 launch bonds, 1,600,000 BLCH in total, are outside that
+///    closure. A sum that balances without a term is a sum the term is not in.
+///
+///    So this precondition is met not by counting the bond (there is no
+///    headroom: `TOTAL_SUPPLY_SAT == GENESIS_ISSUED_SAT +
+///    VALIDATOR_EMISSION_SAT` exactly, so counting it silently shorts the
+///    40-year emission schedule by the same amount) but by never paying it:
+///    `CommittedState::unbacked_principal_sat` derives each launch bond's
+///    unbacked principal from committed state and the `Withdraw` arm subtracts
+///    it. The emission accrued on top is real, counted and paid in full. The
+///    invariant that would have caught this eighteen days earlier is
+///    `CommittedState::supply_audit`. Decision record and the two rejected
+///    alternatives: `docs/adr/ADR-042-cohort-principal-writeoff.md`.
 /// 3. **The fleet must be rebuilt before this is lowered** — after
 ///    activation the old binary still rejects what the new one accepts, so
 ///    "everyone runs the new binary" is a precondition, not a hope.
