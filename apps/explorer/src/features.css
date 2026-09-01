@@ -246,3 +246,107 @@
 }
 .halving-note strong { color: var(--brass); }
 .halving-note .mono { font-family: var(--font-mono); color: var(--text); }
+
+/* ── Fees & mempool ─────────────────────────────────────────────────────────
+   The page's one visual argument: a flat line is the truth here, so the
+   occupancy strip is built to read as deliberate emptiness rather than as a
+   chart that failed to load. Ticks sit on a visible baseline; a block with
+   transactions grows off it and changes colour, so the day one arrives it is
+   unmissable against 96 that did not. */
+.fee-card { margin-bottom: 22px; }
+.fee-card-key { border-color: color-mix(in srgb, var(--accent) 45%, transparent); }
+.fee-h3 {
+  margin: 26px 0 10px; font-size: 13px; font-weight: 620;
+  text-transform: uppercase; letter-spacing: 0.14em; color: var(--ink-2);
+}
+
+.fee-formula {
+  background: var(--bg-elev-2); border: 1px solid var(--border);
+  border-radius: 10px; padding: 12px 14px; margin: 4px 0 18px;
+}
+.fee-formula > code { font-size: 14px; color: var(--ink); }
+.fee-formula-note { margin-top: 7px; font-size: 12.5px; color: var(--muted); }
+
+.fee-calc { display: grid; grid-template-columns: minmax(240px, 320px) 1fr; gap: 22px; }
+@media (max-width: 780px) { .fee-calc { grid-template-columns: 1fr; } }
+.fee-inputs { display: flex; flex-direction: column; gap: 14px; }
+.fee-field { display: flex; flex-direction: column; gap: 5px; }
+.fee-lbl {
+  display: flex; justify-content: space-between; align-items: baseline; gap: 10px;
+  font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.12em; color: var(--muted);
+}
+.fee-hint { text-transform: none; letter-spacing: 0; font-size: 11px; opacity: 0.8; }
+.fee-toggle { display: flex; gap: 6px; }
+.fee-toggle button {
+  flex: 1; padding: 8px 10px; border-radius: 8px; cursor: pointer;
+  border: 1px solid var(--border); background: var(--surface);
+  color: var(--ink-2); font-family: var(--font-mono); font-size: 12px;
+}
+.fee-toggle button.on {
+  background: var(--accent-soft); border-color: var(--accent); color: var(--accent);
+}
+
+.fee-out { min-width: 0; }
+.fee-total { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+.fee-total-v {
+  font-size: 34px; font-variant-numeric: tabular-nums; line-height: 1; color: var(--accent);
+}
+.fee-total-u { font-size: 15px; color: var(--muted); }
+.fee-total-b { font-size: 12.5px; color: var(--muted); font-family: var(--font-mono); }
+.fee-breakdown td { padding: 6px 10px; }
+.fee-breakdown .num { text-align: right; font-variant-numeric: tabular-nums; }
+.fee-breakdown .fee-sum td { border-top: 1px solid var(--border); font-weight: 600; }
+
+.fee-notes { margin-top: 18px; font-size: 13.5px; line-height: 1.65; color: var(--ink-2); }
+.fee-notes p + p { margin-top: 10px; }
+
+.fee-flat {
+  display: flex; gap: 20px; align-items: flex-start; flex-wrap: wrap;
+  padding: 14px 16px; border-radius: 10px;
+  background: var(--bg-elev-2); border: 1px solid var(--border);
+}
+.fee-flat p { margin: 0; flex: 1; min-width: 260px; font-size: 13.5px; line-height: 1.65; color: var(--ink-2); }
+.fee-flat-line { display: flex; align-items: baseline; gap: 7px; }
+.fee-flat-price { font-size: 40px; line-height: 1; font-variant-numeric: tabular-nums; color: var(--accent); }
+.fee-flat-u { font-size: 12px; color: var(--muted); }
+
+.fee-strip-wrap { margin-top: 22px; }
+.fee-strip-head {
+  display: flex; justify-content: space-between; align-items: baseline;
+  gap: 14px; flex-wrap: wrap; margin-bottom: 8px; font-size: 12.5px;
+}
+.fee-strip {
+  display: flex; align-items: flex-end; gap: 2px; height: 64px;
+  padding: 0 2px 0; border-bottom: 1px solid var(--accent);
+}
+.fee-tick {
+  flex: 1 1 0; min-width: 2px; height: var(--h, 2px);
+  background: color-mix(in srgb, var(--ink) 26%, transparent); border-radius: 1px 1px 0 0;
+}
+.fee-tick.has-tx { background: var(--accent); }
+.fee-tick.missed {
+  height: 64px; background: repeating-linear-gradient(
+    180deg, color-mix(in srgb, var(--muted) 20%, transparent) 0 2px, transparent 2px 5px);
+}
+.fee-strip-note { margin-top: 10px; font-size: 12.5px; line-height: 1.6; }
+
+.fee-eq {
+  display: flex; gap: 14px; align-items: baseline; flex-wrap: wrap;
+  margin: 16px 0; padding: 14px 16px; border-radius: 10px;
+  background: var(--accent-soft); border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+}
+.fee-eq > code { font-size: 15px; color: var(--ink); }
+.fee-eq .faint { font-size: 12.5px; }
+
+.fee-quote {
+  overflow-x: auto; margin: 12px 0; padding: 13px 15px; border-radius: 10px;
+  background: var(--bg-elev-2); border: 1px solid var(--border);
+}
+.fee-quote code { font-size: 12px; line-height: 1.6; color: var(--ink-2); white-space: pre; }
+
+.pill.ok { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); }
+.pill.bad {
+  background: var(--warn-bg); color: var(--ink-2); border-color: var(--warn-bord);
+  font-variant-numeric: tabular-nums;
+}
+.fee-eras p { font-size: 13.5px; line-height: 1.65; color: var(--ink-2); }
