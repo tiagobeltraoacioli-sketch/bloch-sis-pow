@@ -157,6 +157,50 @@ that restarted onto something else).
 The sweep is read-only and needs ~30 s per host over SSH. It is deliberately
 manual (or PMO-driven) — CI must never hold fleet SSH keys.
 
+### 4.1 The gate sweep — "will the fleet follow this flag day, or fork?"
+
+The §4 sweep above answers *"is every box running the release?"*. It cannot
+answer *"will every box follow the gate we are about to arm?"*, because two
+boxes on two different stamps may still implement the same gate set, and two
+boxes on the same stamp cannot differ. Arming a flag day needs the second
+question answered, and before this tool existed it was unanswerable: `selfcheck`
+printed `self-check passed` and silently ignored `--json`.
+
+```sh
+scripts/fleet-gate-sweep.sh --epoch <E>          # the flag day you are arming
+scripts/fleet-gate-sweep.sh --epoch <E> --reference-json consensus-compat.json
+```
+
+Read-only: one `selfcheck` per host, which opens no data dir, binds no port and
+writes nothing. Exit 0 = every host agrees through epoch E; exit 1 = a host
+forks or cannot state its gates; exit 2 = the sweep could not run.
+
+Three rules it enforces, each learned from a real failure:
+
+- **It asks the RUNNING image, not the path in the host table.** Same lesson as
+  §4 one level down: it resolves `/proc/PID/exe` and falls back to the
+  configured path only when no node is running, saying which answered. A path
+  in a hand-maintained TSV is a weaker claim than a unit file.
+- **A host that cannot answer is NOT READY, never "fine".** A binary predating
+  `--json` exits 0 — silence is not agreement. And a host the sweep failed to
+  contact is reported as a *sweep* failure in the sweep's own words, never as a
+  fact about the node.
+- **Arming a gate is a release-page event** (§7.3). A gate armed on the network
+  after a binary was published makes that binary consensus-dead at that epoch.
+
+`gates_digest` equal across two binaries ⇒ compatible at every epoch, now and
+later. Different ⇒ compatible only up to the first gate they differ on, which
+is what `--epoch E` computes.
+
+**Precedent, found by the first real run of this sweep (2026-09-01):** the
+public-RPC box `136.244.90.238` was running `bloch-pos-fixed`, stamped
+`2701feab` (2026-08-18) — a build whose `params.rs` declares **zero**
+`*_ACTIVATION_EPOCH` constants, i.e. one that predates every armed flag day. It
+was frozen at **height 12298, epoch 800** — the exact epoch of the first gate it
+does not implement — while the archivals were at height 32454, epoch 1667. It
+had been serving public RPC in that state. This is `genesis4-node-20260814`
+repeating, and nothing in the release path had noticed for two weeks.
+
 ## 5. The rollback package
 
 ### 5.1 What it is
@@ -273,7 +317,12 @@ releases.
 4. Assemble the rollback package from release N−1
    (`make-rollback-package.sh`), pass §5.3 on a scratch host, stage per §5.2.
 5. Deploy via drop-ins; run the §4 sweep — every host must match the
-   published sha256 and stamp; repeat sweep ≥24 h later.
+   published sha256 and stamp; repeat sweep ≥24 h later. Then run the §4.1
+   **gate sweep** (`scripts/fleet-gate-sweep.sh`) and require exit 0: matching
+   bytes prove the rollout landed, but only matching gate sets prove the fleet
+   will still be one chain after the next flag day. Re-run it, and require
+   exit 0 again, immediately **before arming any activation epoch** — that run
+   is the thing that gates the arming, not this one.
 6. File the sweep tables and hashes in the release notes. G8 is green only
    with all six on record.
 

@@ -1464,42 +1464,167 @@ fn print_consensus_compat() {
 
 #[cfg(test)]
 mod consensus_gate_tripwire {
-    use super::CONSENSUS_GATES;
+    use super::{consensus_compat_json, CONSENSUS_GATES};
 
-    /// Every `pub const *_ACTIVATION_EPOCH` in the committee params must
-    /// appear in [`CONSENSUS_GATES`], and vice versa. The values cannot drift
-    /// (the table imports the constants); the failure mode this guards is
-    /// OMISSION — a new gate armed in params.rs that the release-page
-    /// statement (`selfcheck --json`) silently does not mention, recreating
-    /// the genesis4-node-20260814 defect one flag day later.
-    #[test]
-    fn gate_table_mirrors_params_exactly() {
-        let params_src = std::fs::read_to_string(concat!(
+    /// The params source, read from disk so the test sees DECLARATIONS rather
+    /// than only the constants this file happens to import. Importing is
+    /// exactly what a drifted table does not do, so importing is not evidence.
+    fn params_src() -> String {
+        let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../bloch-pos-committee/src/params.rs"
-        ))
-        .expect("read bloch-pos-committee/src/params.rs");
+        );
+        std::fs::read_to_string(path).unwrap_or_else(|e| {
+            panic!(
+                "TRIPWIRE BROKEN: cannot read {path}: {e}\n\
+                 The gate table can no longer be checked against params.rs. \
+                 Fix the path before shipping — a tripwire that cannot read \
+                 its subject is worse than none, because it passes."
+            )
+        })
+    }
 
-        let mut in_params: Vec<&str> = params_src
+    /// Names of every `pub const *_ACTIVATION_EPOCH` DECLARED in params.rs.
+    ///
+    /// Parses declarations rather than pattern-matching names. A name regex is
+    /// the wrong tool twice over: `[A-Z_]*_ACTIVATION_EPOCH` silently misses
+    /// `BLOCK_BYTES_V2_ACTIVATION_EPOCH` because of the digit — and that gate
+    /// is ARMED at epoch 800, so the miss is not academic — and any name match
+    /// also strikes the several `///` doc lines in params.rs that merely
+    /// MENTION a gate. Requiring the `pub const ` prefix and taking the text
+    /// before `:` sees the declaration and nothing else.
+    fn declared_gates(src: &str) -> Vec<&str> {
+        let mut v: Vec<&str> = src
             .lines()
             .filter_map(|l| {
-                let l = l.trim_start();
-                let rest = l.strip_prefix("pub const ")?;
+                let rest = l.trim_start().strip_prefix("pub const ")?;
                 let name = rest.split(':').next()?.trim();
                 name.ends_with("_ACTIVATION_EPOCH").then_some(name)
             })
             .collect();
-        in_params.sort_unstable();
-        in_params.dedup();
+        v.sort_unstable();
+        v
+    }
+
+    /// Every `pub const *_ACTIVATION_EPOCH` declared in the committee params
+    /// must appear in [`CONSENSUS_GATES`], and vice versa.
+    ///
+    /// The VALUES cannot drift — the table imports the constants, so a changed
+    /// epoch changes the digest automatically and the compiler enforces the
+    /// link. The failure mode this guards is OMISSION: a gate added to
+    /// params.rs that the release-page statement (`selfcheck --json`) silently
+    /// does not mention. That reproduces the genesis4-node-20260814 defect one
+    /// flag day later — a binary that answers confidently and is wrong.
+    ///
+    /// It fails LOUDLY and SPECIFICALLY, naming the constants missing and the
+    /// ones naming nothing, because a bare `assert_eq!` on two sorted lists is
+    /// a puzzle at 3am on the morning of a flag day.
+    #[test]
+    fn gate_table_mirrors_params_exactly() {
+        let src = params_src();
+        let in_params = declared_gates(&src);
+
+        let deduped = {
+            let mut d = in_params.clone();
+            d.dedup();
+            d
+        };
+        assert_eq!(
+            in_params.len(),
+            deduped.len(),
+            "params.rs declares the same *_ACTIVATION_EPOCH constant twice"
+        );
+
+        // A parser that silently matches nothing would wave through ANY table.
+        assert!(
+            !in_params.is_empty(),
+            "TRIPWIRE BROKEN: found zero `pub const *_ACTIVATION_EPOCH` in \
+             params.rs. Either every gate was deleted (it was not) or the \
+             declaration style changed and this parser no longer sees them. \
+             Fix the parser — as written it would now accept any gate table \
+             at all, which is the failure this test exists to prevent."
+        );
 
         let mut in_table: Vec<&str> = CONSENSUS_GATES.iter().map(|(n, _)| *n).collect();
         in_table.sort_unstable();
-
+        let table_len = in_table.len();
+        let table_dedup = {
+            let mut d = in_table.clone();
+            d.dedup();
+            d
+        };
         assert_eq!(
-            in_params, in_table,
-            "CONSENSUS_GATES (main.rs) and the *_ACTIVATION_EPOCH constants \
-             (params.rs) disagree — a gate is missing from the release \
-             compatibility statement, or names a constant that no longer exists"
+            table_len,
+            table_dedup.len(),
+            "CONSENSUS_GATES lists the same gate name twice — the digest would \
+             count it twice and no two binaries could ever be compared"
+        );
+
+        let missing: Vec<&str> = in_params
+            .iter()
+            .filter(|n| !in_table.contains(n))
+            .copied()
+            .collect();
+        let stale: Vec<&str> = in_table
+            .iter()
+            .filter(|n| !in_params.contains(n))
+            .copied()
+            .collect();
+
+        assert!(
+            missing.is_empty() && stale.is_empty(),
+            "CONSENSUS_GATES (bloch-pos-node/src/main.rs) does not mirror the \
+             *_ACTIVATION_EPOCH constants in bloch-pos-committee/src/params.rs.\n\
+             \n\
+             MISSING from the table (declared in params.rs, absent from \
+             `selfcheck --json`): {missing:?}\n\
+             STALE in the table (named here, no longer declared in params.rs): \
+             {stale:?}\n\
+             \n\
+             params.rs declares {} gate(s); the table lists {}.\n\
+             \n\
+             CONSEQUENCE IF SHIPPED: `gates_digest` would be computed over an \
+             incomplete set, so two binaries that genuinely disagree about a \
+             gate would publish the SAME digest and scripts/fleet-gate-sweep.sh \
+             would call them compatible on the eve of a flag day. That is \
+             exactly how genesis4-node-20260814 went out.\n\
+             \n\
+             FIX: add one row per missing constant to CONSENSUS_GATES in \
+             main.rs (and import it in the `bloch_pos_committee::params` use \
+             block), and delete any row named stale. Do NOT change a value in \
+             params.rs to make this pass — this test never justifies arming or \
+             moving an activation epoch.",
+            in_params.len(),
+            in_table.len(),
+        );
+    }
+
+    /// Inert gates must be STATED, not skipped. A binary that ships a gate
+    /// inert is distinguishable from one that never heard of the gate, and
+    /// only the second is doomed when the flag day is finally chosen — so the
+    /// statement has to carry both, and `epoch: null` is how it says "inert".
+    #[test]
+    fn statement_names_every_gate_including_inert() {
+        let json = consensus_compat_json();
+        for (name, epoch) in CONSENSUS_GATES {
+            assert!(
+                json.contains(name),
+                "`selfcheck --json` omits {name}; the fleet sweep compares \
+                 whole gate sets, so an omitted gate is an invisible fork"
+            );
+            if epoch == u64::MAX {
+                assert!(
+                    json.contains(&format!("\"name\": \"{name}\", \"epoch\": null")),
+                    "inert gate {name} must serialize as `epoch: null`, so a \
+                     binary that ships it inert never collides with one that \
+                     has never heard of it"
+                );
+            }
+        }
+        assert!(
+            json.contains("\"gates_digest\""),
+            "the statement must carry gates_digest — it is the string the \
+             fleet sweep compares"
         );
     }
 }
