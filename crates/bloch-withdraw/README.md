@@ -26,9 +26,30 @@ re-implementation that can drift.
 | Crediting line is `finalized`, not head | branch on the finality fields; never count confirmations |
 | Sub-dust outputs have poisoned blocks historically | this library never emits an output below 546 sat |
 
-`script_hash` for an address `bloch1q<40 hex hash><8 hex checksum>` is the
-20 hash bytes, zero-padded to 32. `address::script_hash_of_address_str` does
-this (with checksum validation) for you.
+## Payees are `script_hash`es, not addresses
+
+`create()` takes a **64-hex `script_hash`** — the value
+`bloch-pos spendkey` prints, which is `SHA3-256(the payee's hybrid public
+key)`, all 32 bytes. That is the identifier Genesis-4 uses; the RPC surface has
+no address method at all.
+
+An earlier version of this crate derived every script hash from a `bloch1q…`
+address instead — the 20 bytes the address encodes, zero-extended to 32. That
+shape is real, but for a native Genesis-4 key it names a **different key in the
+eUTXO set**, and consensus opens both, so nothing complains. Two consequences:
+this client polled the wrong hash for its own hot-wallet balance (a funded
+wallet reads as empty), and every payee it paid got an output their own wallet
+does not watch, at 160 bits of preimage resistance instead of 256.
+
+An address is therefore refused by default. `Config::allow_carryover_address`
+re-enables it for the one population it is correct for — holders whose balance
+crossed from Genesis-3, whose coins already sit under that shape.
+
+`Config::network` selects the chain (mainnet by default). A mainnet-configured
+client refuses a `bloch1t…` payee exactly as it always did; a testnet-configured
+one refuses `bloch1q…`, which nothing checked before. A `script_hash` carries no
+network marker and is accepted on either — network isolation on this chain is
+outpoint disjointness, not string prefixes (`deploy/testnet/REPLAY-ISOLATION.md`).
 
 ## Quickstart
 

@@ -37,7 +37,7 @@
 //! spend is still there. Until then a reorg can un-spend the coins, and the
 //! machine walks back to `Submitted` and resumes.
 
-use crate::address::{script_hash_of_address_str, KeyMaterial, ScriptHash};
+use crate::address::{parse_payee, KeyMaterial, ScriptHash};
 use crate::build::{
     build_transfer, format_for_epoch, BuildError, BuildRequest, BuiltTransfer, DUST_FLOOR_SAT,
 };
@@ -62,6 +62,28 @@ pub struct Config {
     pub max_behind_slots: u64,
     /// `listunspent` page size for coin selection (node caps at 1,000).
     pub utxo_page: u64,
+    /// Which chain this client is pointed at. **Mainnet by default**, so a
+    /// client that never mentions the field behaves exactly as it did before.
+    ///
+    /// It exists because the testnet an exchange rehearses on is the one place
+    /// this path can be run before a customer's money is the first thing
+    /// through it, and the client used to refuse every `bloch1t…` payee
+    /// unconditionally — a withdrawal client unusable on the testnet built for
+    /// rehearsing withdrawals. Setting this to `Testnet` moves the network
+    /// check rather than removing it: a mainnet-configured client still
+    /// refuses testnet payees, and a testnet-configured one now refuses
+    /// mainnet payees, which nothing checked before.
+    pub network: bloch_crypto::address::Network,
+    /// Allow a `bloch1q…`/`bloch1t…` address as a payee, paying the carried
+    /// 20-byte shape. **Off by default.**
+    ///
+    /// Genesis-4 names payees by `script_hash`. The address form is correct for
+    /// exactly one population — Genesis-3 carryover holders — and silently
+    /// wrong for everyone else: it locks the output to a different UTXO-set key
+    /// than the payee's own wallet watches, at 160 bits of preimage resistance
+    /// instead of 256. Turn it on only if you know which population you are
+    /// paying.
+    pub allow_carryover_address: bool,
 }
 
 impl Default for Config {
@@ -71,6 +93,8 @@ impl Default for Config {
             dust_floor_sat: DUST_FLOOR_SAT,
             max_behind_slots: 4,
             utxo_page: 1000,
+            network: bloch_crypto::address::Network::Mainnet,
+            allow_carryover_address: false,
         }
     }
 }
@@ -156,14 +180,21 @@ impl<'a> Withdrawer<'a> {
     pub fn create(
         &self,
         id: &str,
-        recipient_address: &str,
+        recipient: &str,
         amount_sat: u64,
     ) -> Result<WithdrawalRecord, WithdrawError> {
         if id.is_empty() {
             return Err(WithdrawError::BadRequest("empty withdrawal id".into()));
         }
-        let recipient_script_hash = script_hash_of_address_str(recipient_address)
-            .map_err(WithdrawError::BadRequest)?;
+        // `recipient` is a 64-hex script_hash — the identifier Genesis-4 uses.
+        // An address is accepted only under `allow_carryover_address`, and only
+        // on the configured network; see `address::parse_payee`.
+        let (recipient_script_hash, _form) = parse_payee(
+            recipient,
+            self.cfg.network,
+            self.cfg.allow_carryover_address,
+        )
+        .map_err(WithdrawError::BadRequest)?;
         if amount_sat < self.cfg.dust_floor_sat {
             return Err(WithdrawError::BadRequest(format!(
                 "amount {amount_sat} sat is below the dust floor ({} sat)",

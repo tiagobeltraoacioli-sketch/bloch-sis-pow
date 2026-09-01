@@ -381,10 +381,11 @@ mod tests {
         Coin { txid: [tag; 32], vout: 0, value_sat }
     }
 
+    /// A recipient's `script_hash`, in the native 32-byte shape. It used to be
+    /// the carried shape (20 bytes then twelve zeroes) because the client
+    /// derived payees from addresses; it does not any more.
     fn recipient() -> [u8; 32] {
-        let mut s = [0u8; 32];
-        s[..20].copy_from_slice(&[0xEE; 20]);
-        s
+        [0xEE; 32]
     }
 
     fn base_request<'a>(coins: &'a [Coin], amount: u64) -> BuildRequest<'a> {

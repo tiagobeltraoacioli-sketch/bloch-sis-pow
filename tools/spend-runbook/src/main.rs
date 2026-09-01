@@ -134,22 +134,26 @@ fn unhex32(s: &str, what: &str) -> [u8; 32] {
     }
 }
 
-/// A destination: either a 64-hex-char script hash (used verbatim) or a
-/// `bloch1q…`/`bloch1t…` address (20-byte hash, zero-extended to 32 — the
-/// same `owns` convention the node applies, rpc.rs / transition.rs).
+/// A destination: a 64-hex `script_hash`, and only that.
+///
+/// This used to accept an address too, zero-extending its 20 bytes to 32. That
+/// shape is real — it is how the Genesis-3 carryover sits in the eUTXO set —
+/// but derived from a live key it is a DIFFERENT UTXO-set key from
+/// `SHA3-256(pubkey)`, which is where the key's own coins are and what
+/// `getbalance` is asked about. Consensus opens both (`script_hash::owns`), so
+/// paying the wrong one is silent: the recipient reads a zero balance and
+/// reports the chain broken. A runbook that is executed to learn the path must
+/// not teach that. Ask for the `script_hash`.
 fn dest_script_hash(s: &str) -> [u8; 32] {
     if s.starts_with("bloch1") {
-        match bloch_crypto::address::Address::parse(s) {
-            Ok(a) => {
-                let mut sh = [0u8; 32];
-                sh[..20].copy_from_slice(a.hash());
-                sh
-            }
-            Err(e) => bail(&format!("address {s}: {e:?}")),
-        }
-    } else {
-        unhex32(s, "script hash")
+        bail(
+            "Genesis-4 pays to a 32-byte script_hash, not to an address. An address carries \
+             20 bytes, and locking an output to those 20 bytes zero-extended is a different \
+             key in the UTXO set from SHA3-256(pubkey) — the recipient would see nothing. \
+             Use the `script_hash` line from `keygen` / `bloch-pos spendkey`.",
+        )
     }
+    unhex32(s, "script hash")
 }
 
 // ─── keygen ─────────────────────────────────────────────────────────────────
@@ -180,9 +184,8 @@ fn keygen(args: &[String]) {
         let _ = std::fs::set_permissions(&sk_path, std::fs::Permissions::from_mode(0o600));
     }
 
-    let full: [u8; 32] = Sha3_256::digest(&pk).into();
-    let mut addr_form = [0u8; 32];
-    addr_form[..20].copy_from_slice(&full[..20]);
+    // THE derivation, from the consensus crate. Not recomputed here.
+    let full: [u8; 32] = bloch_pos_committee::script_hash::from_pubkey(&pk);
     let mainnet =
         bloch_crypto::address::Address::from_pubkey(&pk, bloch_crypto::address::Network::Mainnet);
     let testnet =
@@ -191,14 +194,13 @@ fn keygen(args: &[String]) {
     println!("wrote {}", pk_path.display());
     println!("wrote {} (mode 0600)", sk_path.display());
     println!("pubkey_len            : {} bytes (suite-enveloped hybrid)", pk.len());
-    println!("script_hash (full 32) : {}", codec::hex32(&full));
-    println!("script_hash (addr20+0): {}", codec::hex32(&addr_form));
-    println!("address (mainnet)     : {mainnet}");
-    println!("address (testnet)     : {testnet}");
+    println!("script_hash           : {}", codec::hex32(&full));
+    println!("address (mainnet)     : {mainnet}  [DISPLAY ONLY — not a payee]");
+    println!("address (testnet)     : {testnet}  [DISPLAY ONLY — not a payee]");
     println!();
-    println!("Either script_hash form is spendable by this key (`owns`, rpc.rs).");
-    println!("Outputs paid to the ADDRESS use the addr20+0 form; getbalance and");
-    println!("getutxos take whichever form the output was created under.");
+    println!("The script_hash above is the ONLY identifier to hand out. The addresses are");
+    println!("printed so a human can recognise the key in a log; they are not payees, and");
+    println!("deriving a script_hash from one produces a different UTXO-set key.");
     eprintln!("\nTHROWAWAY KEY. Do not fund it with more than a rehearsal amount.");
 }
 

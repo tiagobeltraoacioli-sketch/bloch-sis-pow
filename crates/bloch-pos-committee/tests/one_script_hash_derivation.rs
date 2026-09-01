@@ -58,6 +58,12 @@ const ALLOWED: &[(&str, &str)] = &[
          (FOUNDER_WITHDRAWAL_H160), under the same ingest rule",
     ),
     (
+        "tools/partner-send/verify_receipt.py",
+        "a standalone receipt verifier for Genesis-3 CARRYOVER addresses, which must run with \
+         nothing installed and therefore cannot call the Rust function; its docstring names \
+         the canonical one and this entry is the link between them",
+    ),
+    (
         "crates/bloch-pos-committee/tests/one_script_hash_derivation.rs",
         "this guard, which has to spell the pattern in order to look for it",
     ),

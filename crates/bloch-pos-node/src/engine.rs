@@ -5233,7 +5233,7 @@ mod transfer_v2_end_to_end {
     fn sweep_fixture(n: u32) -> (Vec<EutxoEntry>, PosTransaction) {
         let (pk, sk) = bloch_crypto::crypto::generate_keypair_from_seed(&[42u8; 32])
             .expect("hybrid keypair from a fixed seed");
-        let script_hash: [u8; 32] = Sha3_256::digest(&pk).into();
+        let script_hash = bloch_pos_committee::script_hash::from_pubkey(&pk);
         let entries: Vec<EutxoEntry> = (0..n)
             .map(|vout| EutxoEntry {
                 txid: [0x33u8; 32],

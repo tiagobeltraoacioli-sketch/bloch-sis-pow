@@ -10,7 +10,7 @@
 //! two base fees, staleness), and — given an address — its balance and first
 //! unspent outputs. Sends nothing.
 
-use bloch_withdraw::address::script_hash_of_address_str;
+use bloch_withdraw::address::parse_payee;
 use bloch_withdraw::rpc::{chain_info, get_balance, list_unspent};
 use bloch_withdraw::HttpNode;
 
@@ -40,9 +40,18 @@ fn main() {
         }
     }
 
+    // Takes a 64-hex script_hash (what `bloch-pos spendkey` prints). A probe is
+    // read-only, so it accepts either network and the carryover address form
+    // too — it moves no coins and refusing here would only make it useless for
+    // looking at a carried balance.
     if let Some(address) = args.next() {
-        let script_hash = match script_hash_of_address_str(&address) {
-            Ok(h) => h,
+        let net = if address.starts_with("bloch1t") {
+            bloch_crypto::address::Network::Testnet
+        } else {
+            bloch_crypto::address::Network::Mainnet
+        };
+        let script_hash = match parse_payee(&address, net, true) {
+            Ok((h, _form)) => h,
             Err(e) => {
                 eprintln!("{e}");
                 std::process::exit(2);

@@ -593,11 +593,19 @@ pub fn read_carryover_snapshot<R: BufRead>(
                 ),
             });
         }
-        let mut script_hash = [0u8; 32];
         // Zero-extension to the RIGHT — founder decision, 2026-08-13, see the
         // function docs. The direction is consensus: padded on the left, every
-        // output has a different owner and this is a different chain.
-        script_hash[..G3_ADDRESS_BYTES].copy_from_slice(&hexbuf);
+        // output has a different owner and this is a different chain. The
+        // transcription itself lives in `bloch_pos_committee::script_hash` so
+        // that this file is a *caller* of the rule rather than one of several
+        // places that spell it.
+        // The length was already refused above if it were anything but 20; the
+        // array conversion re-states that to the type system, which is the
+        // point of the typed helper — a `&[u8]` argument would have let a
+        // future edit hand it 32 bytes and lose twelve of them silently.
+        let mut h160 = [0u8; G3_ADDRESS_BYTES];
+        h160.copy_from_slice(&hexbuf);
+        let script_hash = bloch_pos_committee::script_hash::carried_from_g3_hash160(&h160);
 
         // The canonical row, into the set root: the same bytes the snapshot
         // tool wrote, rebuilt from what was parsed rather than replayed from

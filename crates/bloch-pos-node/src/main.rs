@@ -882,11 +882,13 @@ fn genesis_mainnet(args: &[String]) {
     // carryover uses — one ownership convention on the chain, not two.
     let alloc = |purpose: u8, bloch: u128, unlock_epoch: u64| genesis::GenesisAllocation {
         purpose,
-        script_hash: {
-            let mut h = [0u8; 32];
-            h[..20].copy_from_slice(&t::FOUNDER_WITHDRAWAL_H160);
-            h
-        },
+        // A real Genesis-3 hash160, transcribed under the carryover's own
+        // zero-extension rule — one ownership convention on the chain, not two.
+        // This is the ingest shape, NOT a derivation from a key; see
+        // `bloch_pos_committee::script_hash`.
+        script_hash: bloch_pos_committee::script_hash::carried_from_g3_hash160(
+            &t::FOUNDER_WITHDRAWAL_H160,
+        ),
         amount_sat: bloch * t::SAT_PER_BLOCH,
         unlock_epoch,
     };
@@ -1116,8 +1118,9 @@ fn spendkey(args: &[String]) {
             exit(1);
         }
     };
-    use sha3::{Digest, Sha3_256};
-    let script_hash: [u8; 32] = Sha3_256::digest(&ks.pubkey).into();
+    // THE derivation, from the consensus crate — not recomputed here, so that
+    // what this prints and what an output must commit to cannot drift apart.
+    let script_hash = bloch_pos_committee::script_hash::from_pubkey(&ks.pubkey);
     println!("script_hash\t{}", codec::hex32(&script_hash));
     println!("pubkey\t{}", codec::hex(&ks.pubkey));
     if let Some(root_hex) = arg_value(args, "--sign") {

@@ -126,6 +126,7 @@ pub mod produce;
 pub mod tokenomics_v4;
 pub mod rewards;
 pub mod sample;
+pub mod script_hash;
 pub mod staking;
 pub mod state_root;
 pub mod schedule;

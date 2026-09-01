@@ -151,15 +151,61 @@ building a transfer.
 
 ---
 
-## 4. Addresses and `script_hash`
+## 4. `script_hash` — the only identifier
 
-Balance and UTXO methods take a **`script_hash`** — 32 bytes of hex.
+Balance and UTXO methods take a **`script_hash`**: 32 bytes of hex. It is the
+identifier this chain uses. There is no address method anywhere on the RPC
+surface — no `validateaddress`, no address-keyed balance — and that is not an
+omission.
 
-Derive it from a `bloch1q…` address by taking the 20 bytes that follow the `bloch1q`
-prefix and right-padding with zeroes to 32 bytes.
+**A key's `script_hash` is `SHA3-256(its hybrid public key)`** — the full 32
+bytes, no truncation, no encoding. The key holder reads it straight off their
+tooling:
 
-Every response echoes the `script_hash` it used. Compare it to what you sent as a
-one-line integration self-check.
+```
+bloch-pos keygen  --dir ./mykey --index 0
+bloch-pos spendkey --dir ./mykey            # prints script_hash + pubkey
+```
+
+Ask a customer for that 64-hex string. Every response echoes the `script_hash`
+it used; compare it to what you sent as a one-line integration self-check.
+
+### The `bloch1q…` address form, and why it is not this
+
+An earlier version of this document said:
+
+> Derive it from a `bloch1q…` address by taking the 20 bytes that follow the
+> `bloch1q` prefix and right-padding with zeroes to 32 bytes.
+
+**That instruction was wrong for any Genesis-4 key, and it is withdrawn.** An
+address encodes only the first 20 bytes of the same digest. Zero-extending
+those 20 bytes gives a 32-byte value that is a **different key in the eUTXO
+set** from `SHA3-256(pubkey)`:
+
+```
+SHA3-256(pubkey)                        <- where the key's coins are
+SHA3-256(pubkey)[0..20] ‖ 0x00 × 12     <- a different UTXO-set key
+```
+
+Coins paid to one are invisible to `getbalance` and `getutxos` on the other.
+
+The failure is silent, which is the part worth internalising. The chain's
+ownership rule accepts *both* shapes for the same key — it has to, or the
+Genesis-3 opening ledger would be frozen — so nothing rejects the transaction
+and nothing logs a warning. The payee simply queries their own `script_hash`,
+sees zero, and reports that your withdrawal never arrived. It also hands them
+an output protected by 160 bits of preimage resistance instead of 256.
+
+The zero-extended shape is correct for exactly one population: **holders whose
+balance crossed from Genesis-3**, whose coins already sit under it because the
+carryover transcribed their old 20-byte address into the field. If you are
+crediting or debiting a carryover holder by address, that shape is theirs. For
+anyone who generated a key on Genesis-4 — which is everyone else, and everyone
+on the testnet — it is not.
+
+**Rule of thumb:** if the counterparty can hand you 64 hex characters, use
+them. If they can only hand you a `bloch1q…`, ask them why, because a
+Genesis-4 key has no address form.
 
 ---
 
@@ -170,7 +216,9 @@ detection is a poll of the address you issued:
 
 1. **`getbalance [script_hash]`** — cheap, exact, gives a true `utxo_count`.
 2. When it moves, **`getutxos [script_hash, limit, offset]`** — see which outputs arrived,
-   with `txid`, `vout`, `value_sat` and the slot they landed in.
+   with `txid`, `vout`, `value_sat` and `script_hash`. (It does **not** carry the slot the
+   output landed in; neither does `gettxout`. Use `gettxout`'s `at_slot` — the head the node
+   answered from — as an upper bound, which is all the settlement test below needs.)
 3. **`gettxout [txid, vout]`** — confirm an individual output.
 
 This gives satoshi-exact crediting with no reorg-scanning logic, no block traversal, and no
@@ -184,8 +232,19 @@ dependence on an indexer staying in sync with the chain.
 | Stage | Signal | Action |
 |---|---|---|
 | Accepted | `sendrawtransaction` → `accepted:true` | in the mempool |
-| Included | output visible via `gettxout` / `getutxos` | in a block |
-| **Final** | `getchaininfo.finalized.epoch` ≥ that block's epoch | **credit** |
+| Included | `gettxout(txid, vout).unspent == true`; note its `at_slot` | in a block |
+| **Final** | `getchaininfo.finalized.epoch > at_slot / 32`, **and** `gettxout` still `unspent` | **credit** |
+
+`sendrawtransaction` returns a `tx_hash`. **That is not the txid** — it is
+SHA3-256 of the canonical bytes, a local correlation handle, and no block commits
+to it. The txid is derived from the signing root; take it from whatever built the
+transaction (`bloch-pos submit-tx` prints it) and use that for `gettxout`. The
+response says so in its own `tx_hash_note` field; it is repeated here because
+passing the wrong 32 bytes to `gettxout` returns a perfectly well-formed
+`unspent: false` that looks like a lost withdrawal.
+
+`gettxout` carries **no** `finalized` flag — the re-check against
+`getchaininfo` above is the settlement test.
 
 Finality is explicit on Genesis-4 and published in every `getchaininfo` response — you do
 not estimate it from a confirmation count. Credit on `finalized` and you have a

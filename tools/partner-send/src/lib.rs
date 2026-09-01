@@ -165,15 +165,28 @@ pub fn format_blch(sat: u64) -> String {
 
 // ── Addresses ───────────────────────────────────────────────────────────────
 
-/// The 32-byte `script_hash` the Genesis-4 UTXO set keys an address's
-/// outputs by: the address's 20-byte pubkey hash, zero-padded to 32. This is
-/// the padding `owns()` in `bloch-pos-committee` accepts
-/// (`script_hash[20..] == 0 && key_hash[..20] == script_hash[..20]`), and the
-/// derivation the RPC docs state for integrators.
+/// The 32-byte `script_hash` an ADDRESS's outputs are keyed by: the address's
+/// 20 bytes, zero-extended. Delegated to the consensus crate's
+/// [`bloch_pos_committee::script_hash::carried_from_g3_hash160`] — this file
+/// used to re-implement it, which is how a codebase ends up with six copies of
+/// a rule and two of them wrong.
+///
+/// # This is NOT how you find a Genesis-4 key's coins
+///
+/// A native Genesis-4 key's outputs are keyed by
+/// `bloch_pos_committee::script_hash::from_pubkey` — `SHA3-256(pubkey)`, all 32
+/// bytes — and that is a **different key in the eUTXO set**. Consensus opens
+/// both (`script_hash::owns`), so paying the wrong one is silent: the payee's
+/// own wallet queries the other hash and reads zero.
+///
+/// This tool is address-driven because its population is address-driven:
+/// **Genesis-3 carryover holders on mainnet**, for whom the 20-byte form is
+/// genuinely the one their coins already sit under. Do not point it at a native
+/// Genesis-4 key. If a partner sends you a 64-hex `script_hash` rather than a
+/// `bloch1q…` address, that is a native key — use a tool that pays a
+/// `script_hash` (`bloch-pos submit-tx --pay`, or `bloch-withdraw`).
 pub fn script_hash32(addr: &Address) -> [u8; 32] {
-    let mut sh = [0u8; 32];
-    sh[..20].copy_from_slice(addr.hash_bytes());
-    sh
+    bloch_pos_committee::script_hash::carried_from_g3_hash160(addr.hash_bytes())
 }
 
 // ── The plan ────────────────────────────────────────────────────────────────

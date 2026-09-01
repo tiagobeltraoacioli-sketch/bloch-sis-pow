@@ -76,8 +76,20 @@ def parse_address(addr):
 
 
 def script_hash_hex(hash20):
-    """The chain's UTXO-set key for this address: 20 bytes, zero-padded to 32."""
-    return (hash20 + b"\x00" * 12).hex()
+    """The UTXO-set key for an ADDRESS: its 20 bytes, zero-extended to 32.
+
+    Mirrors bloch_pos_committee::script_hash::carried_from_g3_hash160, which is
+    the one implementation; this is a re-statement in Python because a receipt
+    verifier must run with nothing installed, and it is guarded by
+    crates/bloch-pos-committee/tests/one_script_hash_derivation.rs.
+
+    NOT the derivation for a native Genesis-4 key. That key's outputs are keyed
+    by SHA3-256(pubkey) -- all 32 bytes -- which is a DIFFERENT key in the UTXO
+    set. Consensus opens both, so paying the wrong one is silent and the payee
+    reads a zero balance. This function is for Genesis-3 carryover addresses,
+    which is the population partner-send exists to pay.
+    """
+    return (hash20 + bytes(12)).hex()
 
 
 def format_blch(sat):

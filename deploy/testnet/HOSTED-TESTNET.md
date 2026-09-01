@@ -162,13 +162,22 @@ Cloudflare edge provides the first line).
 
 ## 5. Faucet: manual drip now, and that is the recommendation
 
-`tools/faucet` was assessed and **rejected for adaptation now**: it is
-Genesis-3 vintage end to end — `bloch1t…` bech32 addresses and
-`validateaddress`, against a G3 RPC surface and a G3 transaction format,
-none of which exist on Genesis-4 (G4 is `script_hash`-keyed, hybrid
-ML-DSA-65 ‖ Falcon-1024, different canonical bytes). Its own README says
-scaffold/unaudited/never run against a live network. Adapting it is a
-rewrite of everything except the rate limiter.
+`tools/faucet` **has since been moved onto the Genesis-4 surface** (the
+assessment below described it before that work). It now speaks
+`getutxos`/`sendrawtransaction` by `script_hash`, accepts only a 64-hex
+recipient, is configured by `FAUCET_FUNDING_SCRIPT_HASH` rather than an
+address, and refuses to start unless the node at `FAUCET_RPC_URL` reports the
+genesis block id it was configured for. Its offline self-test passes. It has
+still **never been run against a live node** and its payout path is off by
+default, so it is not what the first partners get.
+
+Two things it could not previously do, worth recording because they are the
+reason the manual drip was the only option: it derived a `script_hash` by
+zero-extending an address (a different UTXO-set key from the one a
+`bloch-pos spendkey` key owns — a funded requester would have read zero), and
+its preflight *required* the funding value to parse as a `bloch1t…` address,
+which a native Genesis-4 faucet key does not have. It could not have been
+pointed at the real faucet output.
 
 Instead: **`faucet-drip.sh`** — ~100 lines over the exact
 `getutxos → submit-tx → spendkey --sign → submit-tx` path the local testnet
@@ -199,9 +208,13 @@ Fully rehearsable through the public endpoint, remotely:
    the root is the external-signer seam); re-run with `--signature --raw` →
    canonical hex **and txid**.
 4. `sendrawtransaction` (hex) via `https://t4rpc.posternlabs.com`.
-5. Confirm: `gettxout(txid, vout)` — its `finalized` flag is the settlement
-   judgement; ~32 min at real cadence. Balance via `getbalance`/`getutxos`.
-   There is deliberately no tx index (`gettransaction` is refused).
+5. Confirm: `gettxout(txid, vout)` → `unspent: true` plus its `at_slot`, then
+   `getchaininfo` until `finalized.epoch > at_slot / 32`, re-checking that
+   `gettxout` still says `unspent`. ~32 min at real cadence. **`gettxout` does
+   NOT carry a `finalized` flag** — this runbook said it did, and running the
+   flow proved otherwise; see ONBOARDING-PARTNER.md §"Settle". Balance via
+   `getbalance`/`getutxos`. There is deliberately no tx index
+   (`gettransaction` is refused).
 
 `submit-tx --raw` is the one code addition this plan required (this branch,
 `main.rs`): it prints canonical bytes + txid instead of requiring access to
@@ -265,16 +278,46 @@ up including the reset.
 
 ## 9. Honest schedule
 
+Rewritten 2026-09-01. The previous version promised **2026-09-04** on a schedule
+that started 2026-09-01 and assumed both partner-breaking defects did not exist.
+The PMO's counter-estimate at the time was **9–11 September**. Both defects are
+now fixed and the spend path has actually been run
+(`SPEND-PATH-REHEARSAL.md`), which removes the two items that were the
+uncertainty; what remains is deployment, which is founder-authorised fleet work
+and is not something an engineering estimate can compress.
+
+**Done (was 2 of the 5 items on the 9–11 Sep estimate):**
+
+| Item | Estimated | Status |
+|---|---|---|
+| Merge the CLI seam (`spendkey`, `genesis --alloc`, `submit-tx --raw`) | 1 day | merged on `agent/testnet-spendpath` |
+| Decide the `script_hash` form and align the consumers | 1 day, "mostly decision latency" | decided (native `SHA3-256(pubkey)`), 8 sites collapsed onto one function, guard test proven to catch a ninth |
+| Fix `bloch-withdraw`'s mainnet-only refusal | 0.5 day | fixed, and the client has now reached `Paid` on a testnet |
+| One real end-to-end rehearsal before a partner sees it | 1 day | **done** — see `SPEND-PATH-REHEARSAL.md` |
+
+**Remaining:**
+
 | When | What |
 |---|---|
-| Day 0 (½ day) | rustup + release build on node4, deploy binary, disable dead forward |
-| Day 0–1 | `hosted-testnet-up.sh` (~2 h proofs at 30 s slots), then 24 h soak with health timer |
-| Day 1 | nginx + cloudflared + DNS; external round-trip: drip → remote `--raw` spend → `sendrawtransaction` → `gettxout` finalized |
-| Day 2 | Onboarding doc finalized with live endpoint + genesis digest; delivered to first partner |
+| Day 0 (½ day) | rustup + release build on node4 (~45–90 min on 2 vCPU), deploy binary, disable the dead `bloch-rpc-8080` forward |
+| Day 0–1 | `hosted-testnet-up.sh` (~2 h of proofs at 30 s slots), then 24 h soak with the health timer |
+| Day 1 | nginx + cloudflared + DNS; external round-trip from off-box: drip → remote `--raw` spend → `sendrawtransaction` → settle |
+| Day 2 | Onboarding doc finalised with the live endpoint and genesis digest; delivered to the first partner |
 
-Start 2026-09-01 → **partner-ready 2026-09-04** (one day of buffer on three
-days of work — the 2-vCPU build and the first 30 s-cadence soak are the
-uncertain items). Genesis-cohort validator rehearsal: +2 days from a
-partner's request. Deposit/exit lifecycle rehearsal: **blocked on the
-funded-bonding protocol work** — late September at the earliest; not
-promised to partners.
+**9–11 September still holds, and is now the right number rather than a
+pessimistic one.** The work that was uncertain is finished and the remaining
+three days are deployment on a box that does not yet have cloudflared, plus a
+24 h soak that cannot be shortened. Slipping to the 11th costs nothing; pulling
+it earlier would mean skipping the soak, which is the one item that catches the
+failure this deployment is designed against.
+
+**Available sooner, and worth offering:** the *local* testnet. It has run, it
+carries the full spend path, and a partner runs it themselves from
+`local-testnet-up.sh` with no dependency on node4, on cloudflared, or on us.
+For a partner whose question is "does our withdrawal code work against this
+chain", that is the whole answer, and it is available today. Offer it as the
+early deliverable and the hosted endpoint as the follow-on.
+
+Genesis-cohort validator rehearsal: +2 days from a partner's request.
+Deposit/exit lifecycle rehearsal: **blocked on the funded-bonding protocol
+work** — late September at the earliest; not promised to partners.

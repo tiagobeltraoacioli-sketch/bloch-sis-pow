@@ -76,12 +76,23 @@ python3 verify_receipt.py bloch1q<partner-address> \
     --rpc http://<their-node>:16400 --expect 25
 ```
 
-It validates the address checksum, derives the `script_hash` (the 20 bytes
-after `bloch1q`, zero-padded to 32), baselines the balance, polls
+It validates the address checksum, derives the **carryover** `script_hash`
+(the 20 bytes after `bloch1q`, zero-extended to 32), baselines the balance,
+polls
 `getbalance`, lists the exact outputs that arrive, then waits for the
 chain's **explicit finality** on the receiving epoch (16–32 min) and prints
 a receipt. Exit 0 = received and matches; exit 2 = received but a different
 amount; exit 3 = timeout.
+
+> **This tool is for Genesis-3 carryover holders, who are named by address.**
+> A native Genesis-4 key is named by a 64-hex `script_hash` —
+> `SHA3-256(pubkey)`, all 32 bytes — and that is a *different key in the eUTXO
+> set* from the address's 20 bytes zero-extended. Consensus opens both, so
+> paying the wrong one is silent: the payee queries their own `script_hash`,
+> sees nothing, and reports the transfer as missing. If a partner sends you 64
+> hex characters instead of a `bloch1q…`, do not convert it and do not use this
+> tool — pay the `script_hash` with `bloch-pos submit-tx --pay` or
+> `bloch-withdraw`.
 
 ## If it refuses
 

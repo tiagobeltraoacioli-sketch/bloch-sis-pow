@@ -33,19 +33,27 @@ fn wallet_key() -> &'static KeyMaterial {
     KEY.get_or_init(|| KeyMaterial::from_seed(&[0x57; 32]).unwrap())
 }
 
+/// A recipient's `script_hash`: 32 bytes, the native Genesis-4 shape.
+///
+/// It used to be twenty 0xEE bytes and twelve zeroes — the carried shape —
+/// because the client derived every payee from an address. It does not any
+/// more, and a test that kept building the carried shape would have been the
+/// last place the old convention survived.
 fn recipient_script() -> [u8; 32] {
-    let mut s = [0u8; 32];
-    s[..20].copy_from_slice(&[0xEE; 20]);
-    s
+    [0xEE; 32]
 }
 
+/// The payee, in the form Genesis-4 actually uses: a 64-hex `script_hash`.
+///
+/// This used to be the `bloch1q…` address whose 20 bytes matched
+/// `recipient_script`. It is now the hash itself, because the client no longer
+/// derives one from the other — see `address.rs`.
 fn recipient_address() -> String {
-    // The bloch1q form of `recipient_script` (20 hash bytes + checksum).
-    let addr = bloch_crypto::address::Address::from_hash(
-        [0xEE; 20],
-        bloch_crypto::address::Network::Mainnet,
-    );
-    addr.to_string()
+    hex_of(&recipient_script())
+}
+
+fn hex_of(b: &[u8; 32]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
 // ─── The fake chain ─────────────────────────────────────────────────────────

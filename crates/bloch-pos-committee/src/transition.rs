@@ -1441,7 +1441,7 @@ impl FromIterator<crate::state_root::EutxoEntry> for EutxoSet {
 /// bytes and become checkable under both arms. The probability is 2^-96 per
 /// key, and both arms demand the same key, so it changes nothing about who
 /// can spend it.
-fn owns(key_hash: &[u8; 32], script_hash: &[u8; 32]) -> bool {
+pub fn owns(key_hash: &[u8; 32], script_hash: &[u8; 32]) -> bool {
     if key_hash == script_hash {
         return true;
     }
@@ -7738,6 +7738,111 @@ mod tests {
         assert!(s.utxo(&v1.txid(), 0).is_some(), "the payment must land in the set");
     }
 
+    /// **The claim a testnet partner is asked to rely on, checked.**
+    ///
+    /// A hosted testnet starts at epoch 0, while mainnet is long past every
+    /// flag day this binary knows. Partner-facing material says an ordinary
+    /// withdrawal — a V1 `Transfer` — is *the same code on both*, and that is
+    /// the sentence a partner would act on, so it is verified here rather than
+    /// asserted in prose.
+    ///
+    /// The transfer is applied to bit-identical pre-state at epochs that
+    /// straddle every activation constant that exists, and the post-state and
+    /// the charge must be identical every time. `apply_transfer` reads no
+    /// epoch — this test is what keeps that true, because the reject the day
+    /// someone adds an epoch-gated rule to the V1 path is here and not in
+    /// production.
+    ///
+    /// The price is held fixed on purpose. Base-fee *formation* IS epoch-gated
+    /// (`BLOCK_BYTES_V2_ACTIVATION_EPOCH` moves the EIP-1559 byte target); that
+    /// is a separate, real difference and it is pinned by
+    /// `the_block_capacity_a_v1_transfer_lives_in_is_epoch_gated` below. What
+    /// this test isolates is the claim actually made: given a price, the
+    /// validation and the state transition do not know what epoch it is.
+    #[test]
+    fn a_v1_transfer_applies_identically_at_every_epoch() {
+        let alice = owner_key(0x70);
+        let to = script_of(&owner_key(0x71));
+        let coin = opening(0x88, 0, 50_000_000, &alice);
+        let (_t, g, _c) = setup_funded(4, &[coin.clone()]);
+        let price = g.next_base_fee();
+        let v1 = transfer_spending(std::slice::from_ref(&coin), &alice, to, 512, 1, price);
+
+        // Straddle every activation constant the binary knows, plus the ends.
+        let epochs: [u64; 10] = [
+            0,
+            1,
+            crate::params::TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH - 1,
+            crate::params::TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH,
+            crate::params::BLOCK_BYTES_V2_ACTIVATION_EPOCH,
+            crate::params::LEAKED_ROSTER_ACTIVATION_EPOCH - 1,
+            crate::params::LEAKED_ROSTER_ACTIVATION_EPOCH,
+            crate::params::LEAKED_ROSTER_ACTIVATION_EPOCH + 1,
+            100_000,
+            u64::MAX - 1,
+        ];
+
+        let mut baseline: Option<(fee_market::TxCharge, EutxoSet)> = None;
+        for e in epochs {
+            let mut st = g.clone();
+            st.epoch = e;
+            let charge = st
+                .apply_transfer(&v1, price, &ToyVerifier)
+                .unwrap_or_else(|r| panic!("a V1 transfer was refused at epoch {e}: {r:?}"));
+            match &baseline {
+                None => baseline = Some((charge, st.eutxos.clone())),
+                Some((c0, u0)) => {
+                    assert_eq!(&charge, c0, "the charge moved at epoch {e}");
+                    assert_eq!(
+                        &st.eutxos, u0,
+                        "THE V1 TRANSFER PATH HAS ACQUIRED AN EPOCH DEPENDENCE. At epoch {e} the \
+                         same transfer over the same pre-state left a different unspent set. \
+                         Partner-facing material tells integrators an ordinary withdrawal is \
+                         epoch-independent and therefore identical on a fresh testnet and on \
+                         mainnet; that is now false, and the material has to change before the \
+                         rule ships."
+                    );
+                }
+            }
+        }
+
+        // And the commitment surface itself carries no epoch: the same flags
+        // produce the same root and the same txid whenever they are signed.
+        assert_eq!(v1.spend_signing_root(), v1.spend_signing_root());
+        let mut early = g.clone();
+        early.epoch = 0;
+        let mut late = g.clone();
+        late.epoch = u64::MAX - 1;
+        assert_eq!(
+            early.next_base_fee_at(0) > 0,
+            late.next_base_fee_at(u64::MAX - 1) > 0,
+            "the fee floor exists in both eras"
+        );
+    }
+
+    /// The one epoch dependence a V1 withdrawal really does meet, stated in
+    /// numbers so partner-facing material can quote them.
+    ///
+    /// It is not in the transfer's validation — it is the size of the room the
+    /// transfer has to fit in. Before the flag day a block carries half the
+    /// payload it carries after, and the EIP-1559 byte target halves with it.
+    /// On an idle chain both eras price at the floor, so an ordinary withdrawal
+    /// pays the same fee; under load they do not.
+    #[test]
+    fn the_block_capacity_a_v1_transfer_lives_in_is_epoch_gated() {
+        use crate::fee_market::{block_tx_bytes_target, max_block_tx_bytes};
+        const ACT: u64 = crate::params::BLOCK_BYTES_V2_ACTIVATION_EPOCH;
+        assert_eq!(max_block_tx_bytes(0), 262_144, "a fresh testnet's first blocks are 256 KiB");
+        assert_eq!(max_block_tx_bytes(ACT), 524_288, "mainnet's are 512 KiB");
+        assert_eq!(block_tx_bytes_target(0), max_block_tx_bytes(0) / 2);
+        assert_eq!(block_tx_bytes_target(ACT), max_block_tx_bytes(ACT) / 2);
+        assert_eq!(
+            max_block_tx_bytes(ACT) / max_block_tx_bytes(0),
+            2,
+            "the ratio is the number partner docs quote; if it moves, they are wrong"
+        );
+    }
+
     /// **Equivalence at the byte level (item test a).** Re-encoding a signed
     /// V1 transfer as V2 moves the SAME signature bytes into the table; the
     /// signing root and txid are bit-identical, the two apply paths produce
@@ -9069,7 +9174,14 @@ mod carried_ownership_tests {
     use super::*;
 
     fn h(bytes: &[u8]) -> [u8; 32] {
-        Sha3_256::digest(bytes).into()
+        crate::script_hash::from_pubkey(bytes)
+    }
+
+    /// The carried shape, built the one way it is allowed to be built.
+    fn carried_of(full: &[u8; 32]) -> [u8; 32] {
+        let mut h160 = [0u8; 20];
+        h160.copy_from_slice(&full[..20]);
+        crate::script_hash::carried_from_g3_hash160(&h160)
     }
 
     /// A carried output — 20 bytes of the Genesis-3 hash, 12 zeros — must be
@@ -9079,8 +9191,7 @@ mod carried_ownership_tests {
     fn a_carried_output_opens_for_its_genesis3_owner() {
         let pubkey = b"a hybrid public key stands in here";
         let full = h(pubkey);
-        let mut carried = [0u8; 32];
-        carried[..20].copy_from_slice(&full[..20]);
+        let carried = carried_of(&full);
         assert!(owns(&full, &carried), "the holder of the same key must be able to spend");
     }
 
@@ -9101,8 +9212,7 @@ mod carried_ownership_tests {
     fn a_different_key_opens_neither_form() {
         let mine = h(b"my key");
         let theirs = h(b"someone else's key");
-        let mut carried = [0u8; 32];
-        carried[..20].copy_from_slice(&mine[..20]);
+        let carried = carried_of(&mine);
         assert!(!owns(&theirs, &carried), "a carried output is not a free-for-all");
         assert!(!owns(&theirs, &mine));
     }
@@ -9114,8 +9224,7 @@ mod carried_ownership_tests {
     #[test]
     fn the_relaxed_arm_needs_the_zero_tail() {
         let mine = h(b"my key");
-        let mut almost = [0u8; 32];
-        almost[..20].copy_from_slice(&mine[..20]);
+        let mut almost = carried_of(&mine);
         almost[31] = 1; // one byte of tail set
         assert!(!owns(&mine, &almost));
     }
