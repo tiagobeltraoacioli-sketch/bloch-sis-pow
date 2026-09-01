@@ -1253,14 +1253,31 @@ pub struct EutxoSet {
     tree: crate::state_root::Smt,
 }
 
+/// MEASUREMENT INSTRUMENTATION (branch measure/rss-curve, not for merge).
+///
+/// `Arc::make_mut` copies the whole map when the `Arc` is SHARED and mutates
+/// in place when it is not. Which of the two happens is invisible from
+/// outside, and it is the difference between paying ~52 MiB for a block and
+/// paying nothing. These two counters are the only way to say which the
+/// replay actually did, rather than inferring it from an RSS shape.
+pub static COW_COPIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static COW_IN_PLACE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn note_cow(entries: &std::sync::Arc<BTreeMap<([u8; 32], u32), crate::state_root::EutxoEntry>>) {
+    let c = if std::sync::Arc::strong_count(entries) > 1 { &COW_COPIED } else { &COW_IN_PLACE };
+    c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 impl EutxoSet {
     fn insert(&mut self, entry: crate::state_root::EutxoEntry) {
         let (key, value_hash) = crate::state_root::eutxo_leaf(&entry);
         self.tree.insert(key, value_hash);
+        note_cow(&self.entries);
         std::sync::Arc::make_mut(&mut self.entries).insert((entry.txid, entry.vout), entry);
     }
 
     fn remove(&mut self, outpoint: &([u8; 32], u32)) {
+        note_cow(&self.entries);
         if let Some(entry) = std::sync::Arc::make_mut(&mut self.entries).remove(outpoint) {
             let (key, _) = crate::state_root::eutxo_leaf(&entry);
             self.tree.remove(&key);

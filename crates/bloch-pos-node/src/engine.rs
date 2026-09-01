@@ -581,6 +581,13 @@ mod state_cell {
                 cur_epoch = best.epoch;
                 cur = Arc::clone(&best.rolled);
             }
+            // MEASUREMENT INSTRUMENTATION (branch measure/rss-curve, not for
+            // merge): count the rolls this call performs. Each one allocates a
+            // whole `CommittedState` and pushes it, so a gap of N epochs holds
+            // N of them at once — MEMO_CAP bounds only what SURVIVES the trim
+            // below, never the burst inside this loop. Printing it is the only
+            // way to say whether an RSS spike IS this and not the allocator.
+            let mut rolls = 0usize;
             while cur_epoch < epoch {
                 cur = Arc::new(roll(&cur));
                 cur_epoch += 1;
@@ -589,6 +596,14 @@ mod state_cell {
                     epoch: cur_epoch,
                     rolled: Arc::clone(&cur),
                 });
+                rolls += 1;
+            }
+            if rolls > 0 {
+                println!(
+                    "[rolled_to] base_epoch={base_epoch} target_epoch={epoch} rolls={rolls} \
+                     memo_held_before_trim={}",
+                    memo.len()
+                );
             }
             // Evict the lowest epochs first: they are the cheapest to rebuild
             // (fewest rolls from the base) and the least likely to be asked
@@ -2882,6 +2897,12 @@ pub fn run(cfg: Config) -> io::Result<()> {
             "signatures: {hits} from RAM, {misses} re-read from the log, {absent} not found \
              (retention {:?}, trimmed through slot {})",
             engine.sig_retention, engine.sig_trimmed_through,
+        );
+        // MEASUREMENT INSTRUMENTATION (branch measure/rss-curve, not for merge).
+        println!(
+            "eutxo cow: {} mutations COPIED the whole map (Arc shared), {} mutated in place",
+            bloch_pos_committee::transition::COW_COPIED.load(Ordering::Relaxed),
+            bloch_pos_committee::transition::COW_IN_PLACE.load(Ordering::Relaxed),
         );
     }
     engine
