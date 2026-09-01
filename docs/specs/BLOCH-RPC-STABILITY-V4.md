@@ -749,6 +749,19 @@ The four anti-DoS conditions, and how each is met:
 `CommittedState::validator_records(start, limit)` is a `BTreeMap::range` plus a
 `take`, so it is genuinely O(log V + page) and not O(V) with a skip.
 
+**This method reduces node load rather than adding it, and there is a caller in
+this repository proving it.** `apps/explorer/src/pages/Validators.tsx` fetches
+the validator table with `getvalidatorcount` followed by `allValidators()`
+(`apps/explorer/src/lib/g4.ts`), which is **one `getvalidator` call per
+validator** — 64 calls per page load today, bounded in flight only by
+`RPC_CONCURRENCY`. Its own comment says why: *"the RPC has no bulk form, and
+the set is 64 entries — small enough that asking honestly beats inventing a
+pagination the node does not have."* It now has one. The same page becomes two
+calls at `limit=50`, or three at the default 25, against a consensus thread the
+comment already worried about competing with. That workaround was written
+because the method was missing, and it is the strongest evidence that the
+method belongs in the node.
+
 **`start` and `next_start` are registry indices, not offsets.** The registry is
 a map and may be sparse; a client computing `start + limit` skips records the
 moment an index is missing. A page that is exactly full always carries a
