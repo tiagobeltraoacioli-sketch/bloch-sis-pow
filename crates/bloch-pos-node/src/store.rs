@@ -339,6 +339,7 @@ mod scan {
                             PosTransaction::SlashingEvidence(_) => 0x05,
                             PosTransaction::TransferV2 { .. } => 0x06,
                             PosTransaction::DepositV2 { .. } => 0x07,
+                            PosTransaction::Withdraw { .. } => 0x08,
                         };
                         assert_eq!(tag, decoded_tag, "wire tag vs decoded variant");
                         *by_tag.entry(tag).or_insert(0) += 1;
@@ -370,6 +371,8 @@ mod scan {
                 0x04 => "Delegate (LEGACY STAKING)",
                 0x05 => "SlashingEvidence",
                 0x06 => "TransferV2",
+                0x07 => "DepositV2",
+                0x08 => "Withdraw",
                 _ => "??",
             };
             println!("  tag {tag:#04x} {name:<26} {n}");

@@ -328,6 +328,62 @@ pub const TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH: u64 = 800;
 /// change, which is why the constant ships at `u64::MAX`.
 pub const VESTING_LOCK_ACTIVATION_EPOCH: u64 = u64::MAX;
 
+/// Flag day for the withdrawal transaction (tag `0x08`,
+/// [`crate::transition::PosTransaction::Withdraw`]) — the path that turns an
+/// exited validator's bonded stake back into spendable eUTXO coins — and,
+/// with it, the two slashing-side rules it depends on:
+///
+/// - a slash schedules the residue's lock at `slash_epoch +
+///   `[`crate::slashing::CORRELATION_WINDOW_EPOCHS`] (4,096) instead of
+///   `slash_epoch + `[`crate::staking::WITHDRAWAL_DELAY_EPOCHS`] (2,048), so
+///   a proven offender's residue stays reachable for the full window in which
+///   correlated offences amplify;
+/// - a slashed residue is re-priced at the withdrawal itself: the payout is
+///   reduced by the correlation amplification visible in the trailing window
+///   at the door (`3 × slashed_share`, the same arithmetic
+///   `slashing::penalty_bps` runs at evidence time), and the reduction is
+///   burned. See the `Withdraw` arm of `apply_transaction` for the full rule
+///   and its stated limits.
+///
+/// `u64::MAX` until the founder sets it: below this epoch the transaction is
+/// INERT — the old binary fails to decode tag `0x08`
+/// (`TxDecodeError::UnknownTag`), the new one decodes it and refuses it at
+/// the gate, so a pre-activation block carrying one is invalid on BOTH
+/// binaries for different proximate reasons and the same verdict, exactly the
+/// [`TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH`] idiom. The gate reads the
+/// COMMITTED epoch (`CommittedState::epoch`, already rolled to the block's
+/// epoch), never node-local state — the 2026-08-08 `expected_bits` fork is
+/// the standing reason.
+///
+/// # Preconditions of ever lowering this, in order of severity
+///
+/// 1. **Deposits must debit the eUTXO set first — PARTLY ANSWERED, and the
+///    remaining half is the blocker.** The unfunded `Deposit` (tag `0x02`)
+///    that named an `amount_sat` and spent no output is now
+///    consensus-rejected at EVERY epoch, and the funded successor
+///    (`DepositV2`, tag `0x07`, behind
+///    [`FUNDED_STAKING_ACTIVATION_EPOCH`]) destroys real coins into the
+///    bond under strict conservation. So the money printer this precondition
+///    named — deposit → exit → withdraw while the deposit costs nothing — is
+///    closed for NEW bonds. What is NOT closed: the **genesis** bonds, which
+///    no transaction ever funded, and reward compounding, which grows bonds
+///    the eUTXO set never funded. Withdrawals must not arm until those two
+///    are accounted (precondition 2), and arming them BEFORE
+///    `FUNDED_STAKING_ACTIVATION_EPOCH` would reopen the printer outright.
+/// 2. **The genesis bonds must be accounted inside issued supply.** The
+///    withdrawal pays committed bonds out as eUTXO value without touching
+///    `issued_sat` (the bond's value is treated as already issued — reward
+///    compounding incremented the counter when it entered the bond, and a
+///    funded deposit's coins were issued before they were bonded). Whether
+///    the launch validators' `staked_sat` was inside `GENESIS_ISSUED_SAT`
+///    is a genesis-ceremony fact that must be audited before the first
+///    genesis-cohort withdrawal, or the supply-cap invariant tracks a
+///    number the spendable set quietly exceeds.
+/// 3. **The fleet must be rebuilt before this is lowered** — after
+///    activation the old binary still rejects what the new one accepts, so
+///    "everyone runs the new binary" is a precondition, not a hope.
+pub const WITHDRAWAL_ACTIVATION_EPOCH: u64 = u64::MAX;
+
 /// Flag day for the 512 KiB block payload cap
 /// ([`crate::fee_market::MAX_BLOCK_TX_BYTES_V2`]).
 ///
@@ -454,8 +510,9 @@ pub mod rehearsal {
         static GATES_OPEN_TL: Cell<bool> = const { Cell::new(false) };
     }
 
-    /// Test-only: treat [`super::ANCESTRY_SEED_ACTIVATION_EPOCH`] and
-    /// [`super::LEAK_RECOVERY_ACTIVATION_EPOCH`] as if they had already bound.
+    /// Test-only: treat [`super::ANCESTRY_SEED_ACTIVATION_EPOCH`],
+    /// [`super::LEAK_RECOVERY_ACTIVATION_EPOCH`] and
+    /// [`super::WITHDRAWAL_ACTIVATION_EPOCH`] as if they had already bound.
     ///
     /// The two flag days ship INERT (`u64::MAX`), which is correct — the fleet
     /// must replay its existing log under the OLD rules — but it means no epoch

@@ -492,6 +492,31 @@ pub enum PosTransaction {
     /// [`crate::params::SIGNED_EXIT_ACTIVATION_EPOCH`]. The variant survives
     /// only so old wire bytes still decode to a refused transaction.
     Exit { validator: u32 },
+    /// Turn an exited validator's bonded residue into spendable coins (§7.2's
+    /// second half; wire tag `0x08`) — INERT until
+    /// [`crate::params::WITHDRAWAL_ACTIVATION_EPOCH`].
+    ///
+    /// This is the transaction that closes the lifecycle a deposit and an
+    /// exit open: before it existed, `withdrawable_epoch` was committed on every
+    /// record and gated nothing spendable — bonded stake could not become
+    /// coins by any path. The payout is **fully determined by the committed
+    /// record**: the address is the `withdrawal_credentials` fixed at deposit
+    /// time (a compromise of the hot validator key must not redirect the
+    /// principal — [`crate::staking::Address`]'s rationale), the amount is
+    /// the record's residual `staked_sat` after every slash, the inactivity
+    /// leak, and the correlation re-price at the door. Because nothing in the
+    /// message chooses anything, it carries **no signature**: it is a
+    /// permissionless crank, and the only thing it can ever do is move the
+    /// bond to the one place the depositor already named. (Contrast `Exit`,
+    /// the legacy tag `0x03`, which is consensus-rejected at every epoch
+    /// precisely because it is unauthenticated AND changes someone else's
+    /// lifecycle irreversibly; a withdrawal of a record that is already
+    /// payable changes nothing the owner would refuse.)
+    ///
+    /// The rules — delay, slashing interaction, conservation — live in the
+    /// `Withdraw` arm of `apply_transaction`, which is their single
+    /// definition.
+    Withdraw { validator: u32 },
     /// Bond delegated stake behind an operator — the LEGACY UNFUNDED
     /// encoding (tag `0x04`), **consensus-rejected at every epoch** since
     /// 2026-08-31: no signature, no inputs, `amount_sat` minted rather than
@@ -900,6 +925,24 @@ impl PosTransaction {
                 b.push(0x03);
                 b.extend_from_slice(&validator.to_le_bytes());
             }
+            PosTransaction::Withdraw { validator } => {
+                // 0x08: the withdrawal crank. One fixed-width field, same
+                // injectivity argument as Exit — and the same "old binary
+                // rejects on UnknownTag, new binary rejects at the gate"
+                // pre-activation agreement as tag 0x06.
+                //
+                // NOT 0x07: that tag belongs to the funded deposit
+                // (`DepositV2`). The two formats were written in parallel and
+                // BOTH claimed 0x07; a textual merge would have compiled with
+                // two `0x07 =>` decode arms (an `unreachable_patterns` warning
+                // this workspace does not deny) and silently given every
+                // withdrawal on the wire the deposit's meaning, or the
+                // reverse. One tag, one transaction — and
+                // `every_wire_tag_is_claimed_exactly_once` fails if that ever
+                // stops being true.
+                b.push(0x08);
+                b.extend_from_slice(&validator.to_le_bytes());
+            }
             PosTransaction::Delegate { delegator, validator, amount_sat, eligible } => {
                 b.push(0x04);
                 b.extend_from_slice(&delegator.to_le_bytes());
@@ -1086,6 +1129,7 @@ impl PosTransaction {
                     tip_millisat_per_gas: r.u128()?,
                 }
             }
+            0x08 => PosTransaction::Withdraw { validator: r.u32()? },
             other => return Err(TxDecodeError::UnknownTag(other)),
         };
         // Trailing bytes would mean two encodings decode to one transaction,
@@ -1504,26 +1548,34 @@ pub struct CommittedState {
     ///
     /// **Bonding is not YET funded from this set on the live chain.** The
     /// legacy `PosTransaction::Deposit` and `Delegate` named an `amount_sat`
-    /// and spent no output; `Exit` and the withdrawal delay return no output
-    /// either. So the chain holds two pools — this one and the registry's
-    /// bonded stake — and coins do not travel between them: fee rewards
-    /// compound into bonds that this set never funded. Since 2026-08-31 the
-    /// transaction door into that gap is closed BY CONSENSUS: the unfunded
-    /// staking arms in `apply_transaction` reject at every epoch
-    /// (`TxReject::StakingNotActive`), so a deposit can no longer create
-    /// bonded stake without destroying spendable coins — not even in a
+    /// and spent no output. Since 2026-08-31 that door is closed BY
+    /// CONSENSUS: the unfunded staking arms in `apply_transaction` reject at
+    /// every epoch (`TxReject::StakingNotActive`), so a deposit can no longer
+    /// create bonded stake without destroying spendable coins — not even in a
     /// committee member's own block, which the earlier mempool-only refusal
-    /// never covered.
+    /// never covered. What still enters bonds from outside this set is reward
+    /// compounding, and what was never funded by it at all is the genesis
+    /// cohort's stake.
     ///
-    /// The deposit half of the funded fix EXISTS and is inert:
+    /// Both halves of the funded round trip now EXIST, and both are inert:
     /// [`PosTransaction::DepositV2`] (tag `0x07`) consumes inputs from this
     /// set and moves `amount_sat` into `staked_sat` under strict conservation
     /// ([`CommittedState::apply_deposit_v2`]), behind
     /// [`crate::params::FUNDED_STAKING_ACTIVATION_EPOCH`] — the same flag day
-    /// that opens [`CommittedState::apply_delegation`]. Until that epoch
-    /// binds, and until withdrawal gets the same treatment, conservation
-    /// holds **within** the transfer path (the fee is exactly what leaves the
-    /// set, pinned by test) and **not** across the two pools, and no single
+    /// that opens [`CommittedState::apply_delegation`] — and
+    /// [`PosTransaction::Withdraw`] (tag `0x08`) pays an exited bond's
+    /// residue back into this set, behind
+    /// [`crate::params::WITHDRAWAL_ACTIVATION_EPOCH`]. The ORDER of those two
+    /// flag days is a safety property, not a preference: arming the outflow
+    /// while the inflow is closed would turn the genesis cohort's unfunded
+    /// bonds into fresh spendable coins, which is why the withdrawal
+    /// constant names funded deposits and a genesis-supply audit as
+    /// preconditions of ever lowering it.
+    ///
+    /// Until both bind, conservation holds **within** the transfer path (the
+    /// fee is exactly what leaves the set, pinned by test) and **at** the
+    /// withdrawal (the set gains exactly the residue the bond loses, pinned
+    /// by test), and **not** across the two pools, and no single
     /// number in this state is "the supply".
     eutxos: EutxoSet,
 }
@@ -2431,6 +2483,176 @@ impl CommittedState {
                     return Err(TxReject::Transfer(TransferReject::FormatNotActive));
                 }
                 self.apply_deposit_v2(tx, total_active_sat, base_fee_millisat_per_gas, verifier)
+            }
+            PosTransaction::Withdraw { validator } => {
+                // THE FLAG-DAY GATE, FIRST — before any other look at the
+                // transaction, read from the COMMITTED epoch, exactly the
+                // TransferV2 discipline and for the same 2026-08-08 reason.
+                // Pre-activation this reject and the old binary's
+                // `UnknownTag(0x08)` are two roads to one verdict.
+                if !withdrawal_rules_active(self.epoch) {
+                    return Err(TxReject::StakingRule);
+                }
+                // The crank is FREE, as the retired staking arms were: it
+                // carries no payload the fee market prices, and charging a
+                // permissionless message nobody is obliged to send would make
+                // an owed payout depend on someone volunteering a fee.
+                let free = fee_market::TxCharge {
+                    gas: 0,
+                    tx_bytes: 0,
+                    base_fee_sat: 0,
+                    priority_fee_sat: 0,
+                };
+                let Some(rec) = self.validators.get(validator) else {
+                    return Err(TxReject::StakingRule);
+                };
+                // ── The committed record decides everything ─────────────────
+                //
+                // The gate is `withdrawable_epoch`, THE COMMITTED FIELD — never
+                // a recomputation from `exit_epoch + WITHDRAWAL_DELAY_EPOCHS`.
+                // The two disagree exactly when it matters: every slash
+                // extends the committed field (`apply_slashing_evidence`), so
+                // reading the field is what makes included evidence
+                // automatically defer the payout, with no second clock to
+                // drift. (`staking::validate_withdrawal`, the reference
+                // function, recomputes — which is why it is not called here.)
+                //
+                // `withdrawable_epoch == u64::MAX` covers two states with one
+                // meaning — "nothing is withdrawable": a record that never
+                // exited has no lock scheduled, and a record already paid out
+                // had the field reset by the payout below. That reset IS the
+                // committed withdraw-once marker: no new record field, so no
+                // state-root schema change, and both halves of the sentinel
+                // (`exit_epoch`, `withdrawable_epoch`) are already in the
+                // committed leaf.
+                if rec.exit_epoch == u64::MAX {
+                    return Err(TxReject::StakingRule);
+                }
+                if rec.withdrawable_epoch == u64::MAX {
+                    return Err(TxReject::StakingRule);
+                }
+                if self.epoch < rec.withdrawable_epoch {
+                    return Err(TxReject::StakingRule);
+                }
+                // The payout address, fixed at deposit time and committed in
+                // the record. It must be exactly the 32 bytes an eUTXO
+                // `script_hash` holds; a record registered with malformed
+                // credentials cannot be paid ANYWHERE else — inventing a
+                // fallback address would be consensus choosing where someone
+                // else's money goes — so it is refused and stays bonded.
+                // (Wallet-side deposit builders must validate the length; the
+                // fixed-at-deposit rule is what makes this unfixable later.)
+                let Ok(script_hash) = <[u8; 32]>::try_from(rec.withdrawal_credentials.as_slice())
+                else {
+                    return Err(TxReject::StakingRule);
+                };
+                let was_slashed = rec.slashed;
+                let bonded_sat = rec.staked_sat;
+
+                // ── The residual, priced at the door ────────────────────────
+                //
+                // 1. The inactivity leak settles here. The leak is tracked as
+                //    a cumulative side ledger (`FinalityState::leaked`) and
+                //    never deducted from `staked_sat`, so a withdrawal that
+                //    read the bond alone would pay out stake the leak already
+                //    burned for quorum purposes — the leak would be play
+                //    money. The leaked portion is burned by never being paid.
+                let leaked_sat = u128::from(self.finality_engine.leaked_of(*validator));
+                let mut residual = bonded_sat.saturating_sub(leaked_sat);
+
+                // 2. A slashed residue is re-priced against the correlation
+                //    window as seen AT THE WITHDRAWAL, not only as seen at the
+                //    evidence. Evidence-time pricing (`slashing::penalty_bps`)
+                //    looks backwards, so the FIRST offender of a coordinated
+                //    batch is priced before its co-conspirators are visible
+                //    and pays the least — "offend first, exit, outwait the
+                //    lock" would otherwise be the cheapest seat in the
+                //    conspiracy. So the offender waits the FULL correlation
+                //    window (the lock `apply_slashing_evidence` schedules
+                //    post-activation) and, at the door, pays the same
+                //    `3 × slashed_share` amplification over the window ending
+                //    at the withdrawal epoch. Its own slash sits outside that
+                //    window by construction (the lock is CORRELATION_WINDOW
+                //    long and the window looks back CORRELATION_WINDOW − 1),
+                //    so the top-up prices exactly the correlated damage that
+                //    became visible while it waited. The reduction is burned
+                //    by never being credited, like every other slashing burn.
+                //
+                //    Honest limits, stated: this is a re-price of the
+                //    RESIDUE, not a retroactive re-judgment of the original
+                //    offence; and an offender who delays its withdrawal past
+                //    the batch's window ages the correlation out — the rule
+                //    charges correlation still visible at the door, which is
+                //    the same trailing-window coarseness the evidence-time
+                //    penalty already accepts.
+                if was_slashed {
+                    let topup_bps = if total_active_sat == 0 {
+                        // Mirror `penalty_bps`: no stake to measure
+                        // correlation against, no amplification.
+                        0
+                    } else {
+                        (slashing::CORRELATION_MULTIPLIER
+                            * 10_000
+                            * self.slashing.slashed_in_window(self.epoch)
+                            / total_active_sat)
+                            .min(10_000)
+                    };
+                    residual -= residual * topup_bps / 10_000;
+                }
+                // A fully-consumed bond (100% slash, or leak >= stake) pays
+                // nothing: refused rather than minting a zero-value output —
+                // the same dust discipline the transfer path enforces by
+                // never creating value-free entries, and what keeps the
+                // one-outpoint-per-validator argument below airtight.
+                if residual == 0 {
+                    return Err(TxReject::StakingRule);
+                }
+
+                // ── The output key ──────────────────────────────────────────
+                //
+                // `(txid, 0)` where the txid is derived from the canonical
+                // bytes (`DS_TXID`/`DS_SPEND` over tag 0x08 ‖ index), so one
+                // validator maps to ONE outpoint forever: the withdraw-once
+                // sentinel above means this transaction can apply at most
+                // once per validator, and distinct validators differ in the
+                // preimage. A collision with a live output therefore needs a
+                // SHA3-256 collision — refused rather than assumed away,
+                // exactly as `apply_transfer` refuses it.
+                let txid = tx.txid();
+                if self.eutxos.contains_key(&(txid, 0)) {
+                    return Err(TxReject::StakingRule);
+                }
+
+                // ── Apply. Nothing below may fail ───────────────────────────
+                //
+                // Conservation, stated as the invariant a test can pin: the
+                // eUTXO set gains exactly `residual`; the bond loses its whole
+                // `staked_sat`; the difference (`leak + top-up`) is burned by
+                // never being credited; `issued_sat` does not move, because
+                // the bond's value was already counted issued when it entered
+                // the bond (reward compounding advances the counter, and a
+                // funded deposit's coins were issued before they were bonded
+                // — the deposit-funding precondition on the activation
+                // constant is what makes that second half true).
+                self.eutxos.insert(crate::state_root::EutxoEntry {
+                    txid,
+                    vout: 0,
+                    // Saturation unreachable (supply < 2^64 per bond, the
+                    // compute_root narrowing argument); sat_u64 exists so the
+                    // narrowing cannot wrap.
+                    value: sat_u64(residual),
+                    script_hash,
+                    // A returned bond is LIQUID: the lock field is issued by
+                    // the chain's opening terms or the seeding, never minted
+                    // by a payout (`crate::vesting`).
+                    unlock_epoch: 0,
+                });
+                if let Some(rec) = self.validators.get_mut(validator) {
+                    rec.staked_sat = 0;
+                    // The committed withdraw-once marker — see above.
+                    rec.withdrawable_epoch = u64::MAX;
+                }
+                Ok(free)
             }
             PosTransaction::Exit { .. } => {
                 // CONSENSUS REJECT, at every epoch — the gravest of the
@@ -3369,7 +3591,24 @@ impl CommittedState {
             // The residue stays reachable through the weak-subjectivity
             // margin, and a slash never *shortens* a scheduled lock
             // (`u64::MAX` means no lock was scheduled at all).
-            let lock = epoch.saturating_add(staking::WITHDRAWAL_DELAY_EPOCHS);
+            //
+            // From the withdrawal flag day the lock is the FULL correlation
+            // window, not the voluntary-exit margin: a proven offender's
+            // residue must still be reachable when correlation with later
+            // co-conspirators becomes visible, and the withdrawal that ends
+            // the lock re-prices the residue against exactly that window
+            // (the `Withdraw` arm's top-up — the two rules are one flag day,
+            // through one gate, or the payout rule pays what the lock rule
+            // still holds). Pre-activation the old lock stands: withdrawals
+            // do not exist yet, so the shorter figure gates nothing and
+            // changing it would move committed state — and the state root —
+            // under a live fleet for no behavioural difference.
+            let lock_epochs = if withdrawal_rules_active(epoch) {
+                slashing::CORRELATION_WINDOW_EPOCHS
+            } else {
+                staking::WITHDRAWAL_DELAY_EPOCHS
+            };
+            let lock = epoch.saturating_add(lock_epochs);
             rec.withdrawable_epoch = if rec.withdrawable_epoch == u64::MAX {
                 lock
             } else {
@@ -3946,6 +4185,24 @@ fn mutation_leak_drops_zeroed() -> bool {
     false
 }
 
+/// Is the withdrawal flag day ([`crate::params::WITHDRAWAL_ACTIVATION_EPOCH`])
+/// in force at the COMMITTED `epoch`?
+///
+/// One definition for the two consensus sites that must flip together — the
+/// `Withdraw` arm of `apply_transaction` and the slashed-residue lock in
+/// `apply_slashing_evidence` — because a fleet where the payout rule and the
+/// lock rule activate on different days pays residues the other rule still
+/// holds. Test builds may force it open (`params::rehearsal`), the same
+/// pattern as `seed_for_epoch`'s gate; a shipped binary reads only the
+/// constant and the committed epoch.
+fn withdrawal_rules_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if crate::params::rehearsal::gates_are_forced_open() {
+        return true;
+    }
+    epoch >= crate::params::WITHDRAWAL_ACTIVATION_EPOCH
+}
+
 /// Narrow a `u128` stake to the `u64` the sampling layer carries. Saturating,
 /// never wrapping: unreachable at the V4 supply scale for a single bond, and
 /// present only so a refactor cannot introduce a silent wrap.
@@ -4229,7 +4486,28 @@ impl<V: SignatureVerifier> Transition<V> {
         let mut priority_fees: u128 = 0;
         let mut block_gas: u64 = 0;
         let mut block_bytes: u64 = 0;
+        // Evidence-before-withdrawals is a VALIDITY rule, not a packing
+        // convention: a block carrying slashing evidence after a withdrawal is
+        // invalid. Without it, in-block order — which the proposer alone
+        // chooses — would decide whether same-block evidence reaches the bond
+        // or finds it already paid out; with it, evidence in a block always
+        // hits bonded stake (the extended lock it writes then rejects any
+        // later withdrawal of that validator in the same block, invalidating
+        // the whole block). Honest scope: this closes the ORDERING game only —
+        // a colluding proposer can still simply omit the evidence, and the
+        // defence against that is the delay itself (any proposer across
+        // ~2,048 epochs can include it, and the whistleblower cut pays them
+        // to). Pre-activation the flag is unreachable: a `Withdraw` anywhere
+        // in the block already rejected it at its own index before any later
+        // evidence is looked at.
+        let mut withdrawal_seen = false;
         for (i, tx) in transactions.iter().enumerate() {
+            if matches!(tx, PosTransaction::Withdraw { .. }) {
+                withdrawal_seen = true;
+            }
+            if withdrawal_seen && matches!(tx, PosTransaction::SlashingEvidence(_)) {
+                return Err(TransitionError::Transaction(i as u32));
+            }
             let applied = match tx {
                 PosTransaction::SlashingEvidence(ev) => st
                     .apply_slashing_evidence(
@@ -8307,6 +8585,421 @@ mod tests {
         );
     }
 
+    // ────────────────────────────────────────────────────────────────────────
+    // Withdrawals (tag 0x08): the path that turns an exited bond back into
+    // spendable coins. Every test of the post-flag-day rules holds the
+    // rehearsal guard; the inertness test deliberately does not, because it
+    // asserts the configuration the fleet actually ships.
+    // ────────────────────────────────────────────────────────────────────────
+
+    /// `setup(4)` with validator `v`'s withdrawal credentials widened to the
+    /// 32 bytes an eUTXO script hash needs (the fixture's 4-byte credentials
+    /// are themselves a test input — see the malformed-credentials test), and
+    /// `v` retired at epoch 0 through [`retire_at_current_epoch`].
+    ///
+    /// Tests move the clock by assigning `st.epoch` directly rather than by
+    /// 2,048 `close_epoch` calls: the Withdraw arm reads only the committed
+    /// epoch, the registry, the slashing window, the leak ledger and the
+    /// eUTXO set, and the leak test below is the one that runs the real
+    /// pipeline, because there the pipeline is what is under test.
+    /// Retire validator `v` the way an exit does, WITHOUT a carrier: the
+    /// legacy tag-0x03 `Exit` these fixtures used is consensus-rejected at
+    /// every epoch, and the signed successor is behind its own (separate)
+    /// flag day whose wire format does not exist yet. What the withdrawal
+    /// rules actually read is the pair of committed clocks, so the fixture
+    /// writes exactly what `apply_exit` writes and nothing else.
+    fn retire_at_current_epoch(st: &mut CommittedState, v: u32) {
+        let now = st.epoch;
+        let rec = st.validators.get_mut(&v).expect("fixture validator");
+        rec.exit_epoch = now.saturating_add(staking::EXIT_DELAY_EPOCHS);
+        rec.withdrawable_epoch =
+            rec.exit_epoch.saturating_add(staking::WITHDRAWAL_DELAY_EPOCHS);
+    }
+
+    fn exited_payable(v: u32) -> (Transition<OkVerifier>, CommittedState) {
+        let (t, mut st, _chains) = setup(4);
+        st.validators.get_mut(&v).unwrap().withdrawal_credentials = vec![0xD0 ^ v as u8; 32];
+        retire_at_current_epoch(&mut st, v);
+        (t, st)
+    }
+
+    fn withdraw(
+        st: &mut CommittedState,
+        v: u32,
+        total_active_sat: u128,
+    ) -> Result<fee_market::TxCharge, TxReject> {
+        st.apply_transaction(
+            &PosTransaction::Withdraw { validator: v },
+            total_active_sat,
+            fee_market::MIN_BASE_FEE_MILLISAT_PER_GAS,
+            &OkVerifier,
+        )
+    }
+
+    /// **One wire tag, one transaction — the test that would have caught the
+    /// collision this integration nearly shipped.**
+    ///
+    /// The funded deposit (`DepositV2`) and the withdrawal crank (`Withdraw`)
+    /// were written in parallel work streams and BOTH claimed tag `0x07`.
+    /// Nothing in the language stops that: duplicate match arms compile with
+    /// an `unreachable_patterns` warning, this workspace does not
+    /// `deny(warnings)`, and whichever arm is textually first silently wins
+    /// every decode — so half of one format's transactions would have been
+    /// read as the other, past every signature check, on a consensus seam.
+    /// The withdrawal moved to `0x08`; this test is what makes the next
+    /// collision a red build instead of a fork.
+    ///
+    /// It reads each tag from the ENCODER (the first byte of
+    /// `canonical_bytes`) and re-decodes it, so it fails on three distinct
+    /// mistakes: two variants sharing a tag, a decode arm wired to the wrong
+    /// variant, and a variant whose tag no decoder claims.
+    #[test]
+    fn every_wire_tag_is_claimed_exactly_once() {
+        // One witness per variant. The `name` match below has no `_` arm, so
+        // a new variant fails to compile until it is listed — and therefore
+        // until its tag is checked here.
+        let witnesses: Vec<PosTransaction> = vec![
+            PosTransaction::Transfer {
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                tx_bytes: 0,
+                tip_millisat_per_gas: 0,
+            },
+            PosTransaction::Deposit {
+                pubkey: vec![0xAA; 8],
+                amount_sat: staking::MIN_DEPOSIT_SAT,
+                randao_commitment: [0xBB; 32],
+                withdrawal_credentials: vec![0xCC; 4],
+                commission_bps: 500,
+            },
+            PosTransaction::Exit { validator: 1 },
+            PosTransaction::Delegate {
+                delegator: 900,
+                validator: 0,
+                amount_sat: delegation::MIN_DELEGATION_SAT,
+                eligible: true,
+            },
+            PosTransaction::SlashingEvidence(double_vote_evidence(0)),
+            PosTransaction::TransferV2 {
+                keys: Vec::new(),
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                tx_bytes: 0,
+                tip_millisat_per_gas: 0,
+            },
+            PosTransaction::DepositV2 {
+                inputs: Vec::new(),
+                pubkey: framed_validator_key(0xA0),
+                amount_sat: staking::MIN_DEPOSIT_SAT,
+                randao_commitment: [0xC0; 32],
+                withdrawal_addr: [0xD0; 32],
+                commission_bps: 500,
+                proof_of_possession: vec![0u8; 32],
+                change: Vec::new(),
+                tx_bytes: 0,
+                tip_millisat_per_gas: 0,
+            },
+            PosTransaction::Withdraw { validator: 1 },
+        ];
+
+        // A name per variant, so a failure says WHICH two formats collided.
+        fn name(tx: &PosTransaction) -> &'static str {
+            match tx {
+                PosTransaction::Transfer { .. } => "Transfer",
+                PosTransaction::Deposit { .. } => "Deposit",
+                PosTransaction::Exit { .. } => "Exit",
+                PosTransaction::Delegate { .. } => "Delegate",
+                PosTransaction::SlashingEvidence(_) => "SlashingEvidence",
+                PosTransaction::TransferV2 { .. } => "TransferV2",
+                PosTransaction::DepositV2 { .. } => "DepositV2",
+                PosTransaction::Withdraw { .. } => "Withdraw",
+            }
+        }
+
+        let mut claimed: std::collections::BTreeMap<u8, &'static str> =
+            std::collections::BTreeMap::new();
+        for tx in &witnesses {
+            let bytes = tx.canonical_bytes();
+            let tag = *bytes.first().expect("every encoding carries its tag");
+            if let Some(other) = claimed.insert(tag, name(tx)) {
+                panic!(
+                    "wire tag {tag:#04x} is claimed by BOTH {other} and {} — duplicate \
+                     arms compile, and the first one silently wins every decode",
+                    name(tx),
+                );
+            }
+            // And the decoder agrees about which variant that tag names.
+            // Evidence is one-way by construction (`EvidenceNotDecodable`),
+            // so it is checked for its verdict rather than its round trip.
+            match PosTransaction::from_canonical_bytes(&bytes) {
+                Ok(back) => assert_eq!(
+                    name(&back),
+                    name(tx),
+                    "tag {tag:#04x} encodes {} but decodes to {}",
+                    name(tx),
+                    name(&back),
+                ),
+                Err(TxDecodeError::EvidenceNotDecodable) => {
+                    assert_eq!(tag, 0x05, "only tag 0x05 may be one-way");
+                }
+                Err(e) => panic!("tag {tag:#04x} ({}) failed to decode: {e:?}", name(tx)),
+            }
+        }
+        assert_eq!(claimed.len(), witnesses.len(), "every variant needs its own tag");
+        // The tags this chain has frozen, spelled out: a renumbering is a
+        // wire-format change and must fail here first.
+        assert_eq!(
+            claimed.keys().copied().collect::<Vec<u8>>(),
+            vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08],
+        );
+    }
+
+    #[test]
+    fn withdrawals_ship_inert_and_roundtrip_on_the_wire() {
+        // The constant the fleet runs. If this assertion is red, someone armed
+        // the flag day — which is a coordinated-rollout decision, not an edit.
+        assert_eq!(crate::params::WITHDRAWAL_ACTIVATION_EPOCH, u64::MAX, "must ship inert");
+
+        // Tag 0x08 is decodable and injective on the new binary (the old one
+        // fails the same bytes with UnknownTag — the other road to the same
+        // pre-activation verdict).
+        let w = PosTransaction::Withdraw { validator: 3 };
+        assert_eq!(PosTransaction::from_canonical_bytes(&w.canonical_bytes()).unwrap(), w);
+
+        // Gate closed — no rehearsal guard: even a perfectly ripe record is
+        // refused at the committed-epoch gate.
+        let (_t, mut st) = exited_payable(0);
+        st.epoch = st.validator_record(0).unwrap().withdrawable_epoch;
+        assert_eq!(withdraw(&mut st, 0, 0), Err(TxReject::StakingRule));
+    }
+
+    #[test]
+    fn a_ripe_exit_pays_the_bond_to_the_deposit_credentials_once() {
+        let _gates = crate::params::rehearsal::gates_open_guard();
+        let (_t, mut st) = exited_payable(0);
+        let rec0 = st.validator_record(0).unwrap();
+        let ripe = rec0.withdrawable_epoch;
+        assert_eq!(ripe, staking::EXIT_DELAY_EPOCHS + staking::WITHDRAWAL_DELAY_EPOCHS);
+
+        // One epoch early: refused.
+        st.epoch = ripe - 1;
+        assert_eq!(withdraw(&mut st, 0, 0), Err(TxReject::StakingRule));
+
+        // Ripe: pays the whole bond (unslashed, unleaked), to exactly the
+        // credentials fixed at deposit time, conserving value — the set gains
+        // exactly what the bond loses.
+        st.epoch = ripe;
+        let before = st.total_unspent_sat();
+        withdraw(&mut st, 0, 0).unwrap();
+        let w = PosTransaction::Withdraw { validator: 0 };
+        let out = st.eutxos.get(&(w.txid(), 0)).expect("the payout output must exist").clone();
+        assert_eq!(out.value as u128, rec0.staked_sat, "the whole bond");
+        assert_eq!(
+            out.script_hash.as_slice(),
+            st.validator_record(0).unwrap().withdrawal_credentials.as_slice(),
+            "paid where the DEPOSIT said, not where anyone later asked"
+        );
+        assert_eq!(st.total_unspent_sat() - before, rec0.staked_sat);
+
+        // The record survives the payout — later slashing evidence must still
+        // find *a* record, never `None` — but holds nothing and cannot pay
+        // twice: `withdrawable_epoch = u64::MAX` is the committed
+        // withdraw-once marker.
+        let after = st.validator_record(0).expect("the record must NOT be deleted");
+        assert_eq!(after.staked_sat, 0);
+        assert_eq!(after.withdrawable_epoch, u64::MAX);
+        assert_eq!(withdraw(&mut st, 0, 0), Err(TxReject::StakingRule));
+
+        // Never exited, and never registered: nothing to withdraw.
+        assert_eq!(withdraw(&mut st, 1, 0), Err(TxReject::StakingRule));
+        assert_eq!(withdraw(&mut st, 99, 0), Err(TxReject::StakingRule));
+    }
+
+    /// **The escape the adversarial review flagged**: equivocate, exit, and
+    /// wait for the record to vanish before the evidence lands. It must not
+    /// be possible — no code path deletes a `ValidatorRecord` at exit, so
+    /// `apply_slashing_evidence`'s "no record, nothing to slash" bail can
+    /// never be reached by exiting, and evidence between exit and withdrawal
+    /// both cuts the bond and re-arms the clock past the scheduled payout.
+    #[test]
+    fn evidence_between_exit_and_withdrawal_still_bites_the_bond() {
+        let _gates = crate::params::rehearsal::gates_open_guard();
+        let (_t, mut st) = exited_payable(0);
+        let scheduled = st.validator_record(0).unwrap().withdrawable_epoch;
+        let total = 4 * sat(200_000);
+
+        // The evidence arrives one epoch before the payout would have opened
+        // — 2,047 epochs after the offender stopped doing duties.
+        st.epoch = scheduled - 1;
+        st.apply_slashing_evidence(&double_vote_evidence(0), 1, total, &OkVerifier)
+            .expect("an exited-but-unwithdrawn validator must still be slashable");
+
+        let rec = st.validator_record(0).unwrap();
+        assert!(rec.slashed);
+        let cut = sat(200_000) * slashing::SLASH_PROPOSER_EQUIV_BPS / 10_000;
+        assert_eq!(rec.staked_sat, sat(200_000) - cut, "the penalty reached the bond");
+        // The slash re-arms the lock to the FULL correlation window from the
+        // slash epoch — the flag-day rule — never merely the old margin …
+        assert_eq!(
+            rec.withdrawable_epoch,
+            (scheduled - 1) + slashing::CORRELATION_WINDOW_EPOCHS
+        );
+        // … so the payout the exit had scheduled is no longer ripe.
+        st.epoch = scheduled;
+        assert_eq!(withdraw(&mut st, 0, total), Err(TxReject::StakingRule));
+    }
+
+    #[test]
+    fn a_slashed_residue_is_repriced_against_the_window_at_the_door() {
+        let _gates = crate::params::rehearsal::gates_open_guard();
+        let (_t, mut st, _chains) = setup(4);
+        st.validators.get_mut(&0).unwrap().withdrawal_credentials = vec![0xA0; 32];
+        let total = 4 * sat(200_000);
+        let w = PosTransaction::Withdraw { validator: 0 };
+
+        // Epoch 0: validator 0 equivocates — the FIRST of a spread-out batch,
+        // priced at base only, because nothing is in the window yet. That
+        // evidence-time discount is exactly what the door re-price exists to
+        // claw back.
+        st.apply_slashing_evidence(&double_vote_evidence(0), 1, total, &OkVerifier).unwrap();
+        let residue = st.validator_record(0).unwrap().staked_sat;
+        assert_eq!(
+            residue,
+            sat(200_000) - sat(200_000) * slashing::SLASH_PROPOSER_EQUIV_BPS / 10_000
+        );
+        let lock = st.validator_record(0).unwrap().withdrawable_epoch;
+        assert_eq!(lock, slashing::CORRELATION_WINDOW_EPOCHS);
+
+        // A co-conspirator is slashed 2,000 epochs later.
+        st.epoch = 2_000;
+        st.apply_slashing_evidence(&double_vote_evidence(1), 2, total, &OkVerifier).unwrap();
+
+        // Scenario A: withdraw the moment the lock opens. The trailing window
+        // still holds the co-conspirator's slash (and, by construction, not
+        // the offender's own — the lock is one window long and the window
+        // looks back one window minus one), so the residue pays the same
+        // 3 × slashed_share amplification the evidence-time penalty charges,
+        // and the reduction is burned, not moved.
+        let mut a = st.clone();
+        a.epoch = lock;
+        let visible = a.slashing.slashed_in_window(lock);
+        assert!(visible > 0, "test premise: the batch is inside the trailing window");
+        let topup_bps =
+            (slashing::CORRELATION_MULTIPLIER * 10_000 * visible / total).min(10_000);
+        assert!(topup_bps > 0);
+        let expect = residue - residue * topup_bps / 10_000;
+        let before = a.total_unspent_sat();
+        withdraw(&mut a, 0, total).unwrap();
+        assert_eq!(a.eutxos.get(&(w.txid(), 0)).unwrap().value as u128, expect);
+        assert_eq!(a.total_unspent_sat() - before, expect, "the top-up is burned");
+
+        // Scenario B: wait until the whole batch has aged out of the trailing
+        // window, and the un-topped residue pays in full — the rule charges
+        // correlation still visible at the door, nothing else. (The refusal
+        // is per-attempt, not forever: a residue locked by amplification
+        // unlocks as the window ages.)
+        let mut b = st;
+        b.epoch = 2_000 + slashing::CORRELATION_WINDOW_EPOCHS;
+        assert_eq!(b.slashing.slashed_in_window(b.epoch), 0);
+        withdraw(&mut b, 0, total).unwrap();
+        assert_eq!(b.eutxos.get(&(w.txid(), 0)).unwrap().value as u128, residue);
+    }
+
+    #[test]
+    fn the_inactivity_leak_settles_at_the_door() {
+        let _gates = crate::params::rehearsal::gates_open_guard();
+        let (t, g, _chains) = setup(4);
+        // No attestations, no finality: past the threshold the leak bites
+        // every absentee — through the REAL epoch pipeline, because the leak
+        // ledger is what this test is about.
+        let mut st = g;
+        for _ in 0..12 {
+            st = t.process_epoch(&st).unwrap();
+        }
+        let leaked = st.finality_engine.leaked_of(0) as u128;
+        assert!(leaked > 0, "test premise: the leak must have bitten");
+
+        st.validators.get_mut(&0).unwrap().withdrawal_credentials = vec![0xB0; 32];
+        retire_at_current_epoch(&mut st, 0);
+        let rec = st.validator_record(0).unwrap();
+        st.epoch = rec.withdrawable_epoch;
+        withdraw(&mut st, 0, 0).unwrap();
+        let w = PosTransaction::Withdraw { validator: 0 };
+        assert_eq!(
+            st.eutxos.get(&(w.txid(), 0)).unwrap().value as u128,
+            rec.staked_sat - leaked,
+            "stake the leak burned for quorum purposes must never be paid out"
+        );
+    }
+
+    #[test]
+    fn same_block_evidence_reaches_the_bond_in_either_order() {
+        let _gates = crate::params::rehearsal::gates_open_guard();
+        let (t, g, _chains) = setup(4);
+        // Hand-built ripeness: validator 3 exited "long ago", payable at
+        // epoch 0, so a withdrawal is packable into the very next block.
+        let mut pre = g;
+        {
+            let rec = pre.validators.get_mut(&3).unwrap();
+            rec.withdrawal_credentials = vec![0xC3; 32];
+            rec.exit_epoch = 0;
+            rec.withdrawable_epoch = 0;
+        }
+        let w = PosTransaction::Withdraw { validator: 3 };
+        let ev = PosTransaction::SlashingEvidence(double_vote_evidence(3));
+
+        // Sanity, so the rejections below have teeth: alone, the withdrawal
+        // applies in a block.
+        let (_, _, mut chains_a) = setup(4);
+        let env = probe_env(&pre, 1, std::slice::from_ref(&w), &mut chains_a);
+        let post = t.compute_post_state(&pre, &env, &[], std::slice::from_ref(&w)).unwrap();
+        assert_eq!(post.validator_record(3).unwrap().staked_sat, 0);
+
+        // [withdraw, evidence]: the ordering rule itself. Without it the
+        // proposer's chosen order would let the payout outrun the evidence.
+        let both = vec![w.clone(), ev.clone()];
+        let (_, _, mut chains_b) = setup(4);
+        let env = probe_env(&pre, 1, &both, &mut chains_b);
+        assert_eq!(
+            t.compute_post_state(&pre, &env, &[], &both).unwrap_err(),
+            TransitionError::Transaction(1),
+            "a proposer must not be able to sequence a payout in front of evidence"
+        );
+
+        // [evidence, withdraw]: the evidence's re-armed lock refuses the
+        // withdrawal — the same verdict, so a block carrying both is invalid
+        // regardless of the order the proposer alone chooses.
+        let both = vec![ev, w];
+        let (_, _, mut chains_c) = setup(4);
+        let env = probe_env(&pre, 1, &both, &mut chains_c);
+        assert_eq!(
+            t.compute_post_state(&pre, &env, &[], &both).unwrap_err(),
+            TransitionError::Transaction(1),
+        );
+    }
+
+    #[test]
+    fn malformed_credentials_and_empty_residues_stay_where_they_are() {
+        let _gates = crate::params::rehearsal::gates_open_guard();
+        // The fixture's 4-byte credentials are not a payable script hash:
+        // refused, and the bond stays bonded — consensus must never invent a
+        // destination for someone else's coins.
+        let (_t, mut st, _chains) = setup(4);
+        retire_at_current_epoch(&mut st, 2);
+        st.epoch = st.validator_record(2).unwrap().withdrawable_epoch;
+        let outputs = st.eutxos.len();
+        assert_eq!(withdraw(&mut st, 2, 0), Err(TxReject::StakingRule));
+        assert_eq!(st.validator_record(2).unwrap().staked_sat, sat(200_000), "still bonded");
+        assert_eq!(st.eutxos.len(), outputs, "no output of any value appeared");
+
+        // A fully consumed bond pays nothing rather than minting a zero-value
+        // output.
+        let (_t2, mut st2) = exited_payable(0);
+        st2.validators.get_mut(&0).unwrap().staked_sat = 0;
+        st2.epoch = st2.validator_record(0).unwrap().withdrawable_epoch;
+        assert_eq!(withdraw(&mut st2, 0, 0), Err(TxReject::StakingRule));
+    }
+
     #[test]
     fn genesis_cohort_cap_binds_at_the_floor() {
         // Direct roster check: one whale in the cohort, two outsiders. At
@@ -8921,6 +9614,16 @@ mod tests {
             // whose bonded `amount_sat` never left the spendable set.
             PosTransaction::DepositV2 { .. } => {}
             PosTransaction::Exit { .. } => {}
+            // Pays an exited bond's residue into the eUTXO set WITHOUT
+            // touching `issued_sat`: the bond's value is treated as already
+            // issued (compounding advanced the counter when rewards entered
+            // the bond). That accounting is only cap-safe because deposits
+            // are required to be funded before the flag day ever arms —
+            // `params::WITHDRAWAL_ACTIVATION_EPOCH` names that precondition,
+            // and this arm is the second human gate on the same fact: an
+            // unfunded deposit paid out by this transaction WOULD be a mint,
+            // which is why the transaction ships inert.
+            PosTransaction::Withdraw { .. } => {}
             PosTransaction::Delegate { .. } => {}
             PosTransaction::SlashingEvidence(_) => {}
         }
