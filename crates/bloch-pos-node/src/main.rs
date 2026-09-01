@@ -113,6 +113,7 @@ fn main() {
         Some("genesis") => genesis_cmd(&args[1..]),
         Some("genesis-mainnet") => genesis_mainnet(&args[1..]),
         Some("submit-tx") => submit_tx(&args[1..]),
+        Some("spendkey") => spendkey(&args[1..]),
         Some("protection-export") => protection_export(&args[1..]),
         Some("protection-import") => protection_import(&args[1..]),
         // Two names, one command: `doctor` is what an operator types when
@@ -166,7 +167,7 @@ fn print_help() {
                                --spend <txid-hex>:<vout> [--spend ...]\n\
                                --pay <script-hash-hex>:<sat> [--pay ...]\n\
                                [--signature <hex>] [--tx-bytes n]\n\
-                               [--tip millisat-per-gas]\n\
+                               [--tip millisat-per-gas] [--raw]\n\
                Send one Transfer to a running node, which gossips it on.\n\
                --pay order IS the output order (position = vout).\n\
                WITHOUT --signature it prints the signing root and sends\n\
@@ -174,6 +175,11 @@ fn print_help() {
                SAME flags plus --signature. This tool never holds a\n\
                spending key. No acknowledgement: confirmation is seeing\n\
                it in a block.\n\
+               --raw prints the signed transaction's canonical bytes as\n\
+               hex instead of requiring --to: hand that hex to any node's\n\
+               JSON-RPC `sendrawtransaction`, which is how a remote\n\
+               integrator submits through a public RPC endpoint without\n\
+               reaching the (non-public) devnet transport port.\n\
            run … --ws-checkpoint <envelope> --ws-signer-set <set> --state-sync\n\
                Checkpoint-sync: verify the signed checkpoint, DOWNLOAD its\n\
                committed state from peers (chunked, resumable), verify that\n\
@@ -202,8 +208,16 @@ fn print_help() {
                flags.\n\
            bloch-pos genesis --keys <dir1,dir2,...> --out <file>\n\
                              [--slot-ms <ms>] [--start-in <secs>]\n\
+                             [--alloc <script-hash-hex>:<sat>]...\n\
                Build a devnet genesis manifest from the keystores' public\n\
-               parts. Slot 0 starts <secs> from now (default 5).\n\
+               parts. Slot 0 starts <secs> from now (default 5). --alloc\n\
+               adds a liquid-at-genesis output (a devnet faucet balance);\n\
+               fund it to a THROWAWAY key's script hash, never one that\n\
+               owns anything on mainnet.\n\
+           bloch-pos spendkey --dir <keystore-dir> [--sign <root-hex>]\n\
+               DEVNET/TESTNET ONLY. Print a keystore's spend script hash\n\
+               (SHA3-256 of its hybrid pubkey) and pubkey; with --sign,\n\
+               also sign a 32-byte spend signing root from submit-tx.\n\
            bloch-pos run --data-dir <dir> --genesis <file>\n\
                          [--transport devnet|libp2p]\n\
                devnet (default) is the TCP full mesh: no authentication, no\n\
@@ -354,10 +368,22 @@ fn print_help() {
 /// a keypair on an operator's shell history, and this crate has no business
 /// creating spending keys at all.
 fn submit_tx(args: &[String]) {
-    let Some(to) = arg_value(args, "--to") else {
-        eprintln!("submit-tx: --to <host:port> is required");
+    // `--raw` prints the signed transaction's canonical bytes as hex instead
+    // of sending them, for `sendrawtransaction` over JSON-RPC. It exists for
+    // the party this tool otherwise cannot serve: a REMOTE integrator, who can
+    // reach a public RPC front but must never be able to reach the devnet
+    // transport port (that mesh is unauthenticated by design and stays bound
+    // to loopback / a private interface). With `--raw`, `--to` is optional;
+    // giving both prints the hex AND sends.
+    let raw_out = args.iter().any(|a| a == "--raw");
+    let to = arg_value(args, "--to");
+    if to.is_none() && !raw_out {
+        eprintln!(
+            "submit-tx: --to <host:port> is required (or --raw to print the \
+             canonical hex for JSON-RPC `sendrawtransaction`)"
+        );
         exit(2);
-    };
+    }
     let num = |name: &str, default: u128| -> u128 {
         arg_value(args, name)
             .and_then(|s| s.parse().ok())
@@ -496,6 +522,20 @@ fn submit_tx(args: &[String]) {
         }
     }
     let bytes = tx.canonical_bytes();
+    if raw_out {
+        println!("{}", codec::hex(&bytes));
+        // The txid is derived, never carried — print it so a remote submitter
+        // can confirm the spend with `gettxout(txid, vout)` (whose `finalized`
+        // flag is the settlement judgement), since there is no tx index.
+        eprintln!(
+            "submit-tx: canonical bytes above ({} bytes) — submit them as the \
+             `hex` param of JSON-RPC `sendrawtransaction`.\n\
+             txid {}",
+            bytes.len(),
+            codec::hex32(&tx.txid()),
+        );
+    }
+    let Some(to) = to else { return };
     match bloch_pos_node_net_send(&to, &bytes) {
         Ok(()) => println!(
             "submitted {} bytes to {to} — it lands in a block or it does not; \
@@ -956,6 +996,57 @@ fn genesis_cmd(args: &[String]) {
             commission_bps: 0,
         });
     }
+    // `--alloc <script-hash-hex>:<sat>`, repeatable — a liquid-at-genesis
+    // output, which is how a devnet/testnet gets a spendable balance (a
+    // faucet) without touching the mainnet carryover. Deliberately takes a
+    // script hash and not a key: the manifest stays public material only.
+    //
+    // ISOLATION RULE (do not weaken): the spend signing root carries no
+    // network identifier, so cross-network replay is prevented ONLY by the
+    // two chains' outpoint sets being disjoint. These allocations derive
+    // their txids from (purpose, script_hash, amount, unlock_epoch); a
+    // testnet allocation that reproduced a mainnet allocation's exact tuple
+    // would mint the SAME outpoint on both chains and a spend signature
+    // would replay. Fund testnets from throwaway keys only.
+    let mut allocations = Vec::new();
+    for (i, a) in args.iter().enumerate() {
+        if a != "--alloc" {
+            continue;
+        }
+        let Some(spec) = args.get(i + 1) else {
+            eprintln!("genesis: --alloc needs <script-hash-hex>:<sat>");
+            exit(2);
+        };
+        let Some((sh_hex, sat)) = spec.rsplit_once(':') else {
+            eprintln!("genesis: --alloc {spec}: expected <script-hash-hex>:<sat>");
+            exit(2);
+        };
+        let script_hash = match codec::unhex(sh_hex) {
+            Ok(b) if b.len() == 32 => {
+                let mut h = [0u8; 32];
+                h.copy_from_slice(&b);
+                h
+            }
+            Ok(b) => {
+                eprintln!("genesis: --alloc: script hash is {} bytes, expected 32", b.len());
+                exit(2);
+            }
+            Err(e) => {
+                eprintln!("genesis: --alloc: {e}");
+                exit(2);
+            }
+        };
+        let Ok(amount_sat) = sat.parse::<u128>() else {
+            eprintln!("genesis: --alloc: bad amount {sat}");
+            exit(2);
+        };
+        allocations.push(genesis::GenesisAllocation {
+            purpose: genesis::alloc_purpose::LIQUIDITY,
+            script_hash,
+            amount_sat,
+            unlock_epoch: 0,
+        });
+    }
     let manifest = genesis::Manifest {
         genesis_time_ms: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -965,12 +1056,13 @@ fn genesis_cmd(args: &[String]) {
         slot_ms,
         validators,
         cohort: Vec::new(),
-        // `genesis` builds devnet manifests: no carried balances, no vested
-        // allocations. The mainnet manifest is assembled by a separate path
+        // `genesis` builds devnet manifests: no carried balances and no
+        // ceremony-derived allocations — only the liquid `--alloc` outputs
+        // above, if any. The mainnet manifest is assembled by a separate path
         // that takes the signed Genesis-3 snapshot as input, because its
         // inputs come from a ceremony and not from a command line.
         carryover: None,
-        allocations: Vec::new(),
+        allocations,
         carryover_entries: Vec::new(),
     };
     if let Err(e) = manifest.check_supply() {
@@ -991,6 +1083,61 @@ fn genesis_cmd(args: &[String]) {
         codec::hex8(manifest.genesis_id().as_bytes()),
         codec::hex32(&digest)
     );
+}
+
+/// `spendkey --dir <keystore-dir> [--sign <root-hex>]` — DEVNET/TESTNET ONLY.
+///
+/// Treats a `keygen` keystore as a *spending* key: prints the SHA3-256 of its
+/// hybrid public key (the `script_hash` an output must commit to for this key
+/// to spend it) and the public key itself. With `--sign`, also signs the given
+/// 32-byte spend signing root (the digest `submit-tx` prints) with both halves
+/// of the hybrid suite and prints the signature hex.
+///
+/// This is the external-signer seam `submit-tx` documents, packaged for a
+/// throwaway network: the secret never leaves the keystore file, but a root
+/// signed here IS authorisation to move whatever that key owns on ANY chain
+/// where the named outpoints exist. The spend signing root carries no
+/// network identifier — isolation between a testnet and mainnet rests
+/// entirely on their genesis outputs being disjoint (different script
+/// hashes, therefore different txids, transitively forever). NEVER load a
+/// key that owns mainnet outputs here, and NEVER build a testnet genesis
+/// that reproduces a mainnet allocation or the mainnet carryover byte for
+/// byte — identical genesis outpoints would make spend signatures replay
+/// across the two chains.
+fn spendkey(args: &[String]) {
+    let Some(dir) = arg_value(args, "--dir") else {
+        eprintln!("spendkey: --dir <keystore-dir> is required");
+        exit(2);
+    };
+    let ks = match keys::Keystore::load(&PathBuf::from(&dir)) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("spendkey: cannot load keystore {dir}: {e}");
+            exit(1);
+        }
+    };
+    use sha3::{Digest, Sha3_256};
+    let script_hash: [u8; 32] = Sha3_256::digest(&ks.pubkey).into();
+    println!("script_hash\t{}", codec::hex32(&script_hash));
+    println!("pubkey\t{}", codec::hex(&ks.pubkey));
+    if let Some(root_hex) = arg_value(args, "--sign") {
+        let root = match codec::unhex(&root_hex) {
+            Ok(b) if b.len() == 32 => {
+                let mut a = [0u8; 32];
+                a.copy_from_slice(&b);
+                a
+            }
+            Ok(b) => {
+                eprintln!("spendkey: --sign root is {} bytes, expected 32", b.len());
+                exit(2);
+            }
+            Err(e) => {
+                eprintln!("spendkey: --sign: {e}");
+                exit(2);
+            }
+        };
+        println!("signature\t{}", codec::hex(&ks.sign(&root)));
+    }
 }
 
 fn run_cmd(args: &[String]) {
