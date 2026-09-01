@@ -528,7 +528,7 @@ live Genesis-4 carryover, to the entry:
 | `getchaininfo` | **2 × O(V + D)** | — | See F1. |
 | `getutxos` / `listunspent` | O(U) + O(matches) allocated | **10.7 ms** (limit 100) · **30.8 ms** (limit 1000) | See F3. |
 | `getbalance` | **2 × O(U)** | **18.2 ms** (withdrawn; ~1.7 ms warm after F2) | See F2. U grows; this number only goes up. |
-| `getsupply` | O(1) | **3.1 µs** | One committed field plus two constants. Flat in V (2.3 µs at V=512) and flat in U. Cheaper than `getcapabilities`. |
+| `getsupply` | O(1) | **3.1 µs** | One committed field plus two constants. Flat in V (2.3 µs at V=512) and flat in U. |
 | `getstakedistribution` | O(V + D) + O(V log V) | **30 µs** (V=64) · **38 µs** (V=512) | One roster build (3.3 µs at V=64, 16.4 µs at V=512) dominates. Response is fixed-size: 2,194 bytes at V=64, 2,221 at V=512. |
 | `getvalidators` | O(log V + page) + O(V + D) | **1.58 ms** (page 50) | Tracks the PAGE, not the registry: the same page measures 1.59 ms at V=512. ~32 µs per record, all of it `pubkey_hash`. |
 
@@ -626,9 +626,13 @@ committed under `TAG_ISSUED_SUPPLY`, seeded at genesis with
 satoshis `close_epoch` actually credits. Plus two compile-time constants and
 the JSON build. It does not move with the chain, with V, or with the eUTXO set
 — the only other method on this surface with that property is
-`getcapabilities`, and `getsupply` is **thirty times cheaper than it** (3.1 µs
-against ~100 µs), because it builds a much smaller JSON tree. It is the
-cheapest method on the surface, full stop.
+`getcapabilities`.
+
+The `getcapabilities` figure in the table above (~100 µs) comes from a
+different run on a different day, so the two are **not** directly comparable
+and no ratio between them should be quoted. What can be said from one run is
+that `getsupply` is flat in V: 3.1 µs at V=64 and 2.3 µs at V=512, i.e. inside
+the noise of the measurement rather than tracking anything.
 
 ```json
 {

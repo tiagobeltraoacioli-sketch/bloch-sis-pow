@@ -2069,10 +2069,17 @@ pub fn validators_json(
 
 /// `getsupply` — what has been issued, against the cap.
 ///
-/// **Cost: O(1).** One field read of committed state and two compile-time
-/// constants. Nothing here walks the eUTXO set, the registry or the chain, so
-/// the price does not move as the chain grows — which is the property that
-/// makes it safe on a port with no authentication and no rate limit.
+/// **Cost: O(1), measured at 3.1 µs** (`what_the_new_reads_cost`, release).
+/// One field read of committed state and two compile-time constants. Nothing
+/// here walks the eUTXO set, the registry or the chain, so the price does not
+/// move as the chain grows — which is the property that makes it safe on a
+/// port with no authentication and no rate limit. Measured at V=512 it is
+/// 2.3 µs, i.e. flat in V to within the noise of the measurement.
+///
+/// `getcapabilities` is the only other method here with that property. Do not
+/// quote a ratio between the two: its ~100 µs figure comes from a different
+/// run on a different day, and this module has already had to withdraw one
+/// number that was compared across runs.
 ///
 /// # The two things a reader gets wrong, which is why they ship in the payload
 ///
