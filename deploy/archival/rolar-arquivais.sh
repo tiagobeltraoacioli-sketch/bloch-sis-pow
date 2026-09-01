@@ -241,7 +241,7 @@ f_checar() {
   fi
 
   # 2. a frota esta INTEIRA antes de mexer em qualquer arquival
-  local refs; refs=$(referencias) && bem "referencias de validador vivas: $(wc -l <<<"$refs" | tr -d ' ')" \
+  local refs; refs=$(referencias) && bem "referencias de validador vivas: $(printf '%s\n' "$refs" | wc -l | tr -d ' ')" \
     || mal "menos de 2 caixas de validador respondendo — nao role arquival com a frota assim"
 
   # 3. os dois arquivais estao HOJE na cadeia (linha de base)
@@ -289,7 +289,7 @@ f_rolar() {
 
   # A ordem e obrigatoria: o segundo so entra depois de o primeiro estar
   # provado e de volta no 8080.
-  local primeiro; primeiro=$(awk '{print $1}' <<<"$ORDEM")
+  local primeiro=${ORDEM%% *}
   if [ "$a" != "$primeiro" ] && [ ! -s "$WORKA/rolado-$primeiro" ]; then
     echo "RECUSO: $primeiro ainda nao foi rolado e provado. Um arquival por vez." >&2
     return 3
@@ -308,7 +308,9 @@ f_rolar() {
   [ "$EXECUTAR" = 1 ] || diga "   (ENSAIO — nada sera alterado; exporte EXECUTAR=1 para valer)"
 
   # -- 0. prova ANTES. Nao se rola um no que ja esta bifurcado.
-  prova_de_raiz "$a" "$p" || { echo "ABORTA: $a nao esta provado ANTES do roll" >&2; return 1; }
+  local pr
+  prova_de_raiz "$a" "$p"; pr=$?
+  [ "$pr" = 0 ] || { echo "ABORTA: $a nao esta provado ANTES do roll (motivo acima; $([ "$pr" = 1 ] && echo BIFURCADO || echo 'leitura falhou'))" >&2; return "$pr"; }
 
   # -- 1. copiar o binario e conferir NO ALVO (ida e volta de sha256)
   local sl; sl=$(shasum -a 256 "$BIN_NOVO" | awk '{print $1}')
@@ -336,7 +338,14 @@ f_rolar() {
   # caixas. Nenhum deploy, nenhuma mudanca de env.
   diga "-- 2. tirando $a do quorum publico (para o socat 8080, o no segue rodando)"
   E "$a" "sudo systemctl stop bloch-rpc-8080"
-  publico_ainda_serve || { echo "ABORTA: o RPC publico degradou ao tirar $a; religue o 8080" >&2; return 1; }
+  # Nada foi destruido ainda (o no segue rodando), entao o aborto aqui se
+  # desfaz sozinho: devolve o encaminhador e sai. Um roll que deixa o publico
+  # pior do que achou nao e um roll, e um incidente.
+  publico_ainda_serve || {
+    echo "ABORTA: o RPC publico degradou ao tirar $a do quorum. Devolvendo o 8080." >&2
+    E "$a" "sudo systemctl start bloch-rpc-8080"
+    return 1
+  }
 
   # -- 3. parar o no e fotografar a store.
   # Seguro por script porque este no NAO TEM CHAVE: meta.bin/ws_latest.bin aqui
@@ -374,7 +383,7 @@ f_rolar() {
   # -- 6. A PROVA. So aqui se decide se o roll valeu.
   diga "-- 6. prova de raiz depois do roll"
   prova_de_raiz "$a" "$p"; pr=$?
-  if [ "$pr" = 2 ]; then
+  if [ "$pr" != 0 ] && [ "$pr" != 1 ]; then
     echo "NAO CONSEGUI PROVAR (leitura falhou). NAO religue o 8080 e NAO conclua nada:" >&2
     echo "  resolva a leitura e rode:  bash $0 provar $a" >&2
     return 2
