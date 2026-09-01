@@ -1,0 +1,65 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# bloch-indexer — the historical index the explorer reads instead of a validator.
+#
+# ## Why this exists, and why it is not a performance nicety
+#
+# A Genesis-4 node answers about **current state only**: `getbalance` sums the
+# committed eUTXO set as it is now, `getblockbyslot` returns one header summary,
+# and `gettransaction` refuses outright (there is no transaction index). Every
+# historical question an explorer asks — "blocks 30,000–30,100", "this address
+# over time", "who attested in epoch 900" — therefore decomposes into a burst of
+# RPC calls, and the node's RPC has **no authentication and no rate limiting**
+# and is serviced by the thread that runs consensus (`rpc.rs`: MAX_CONNECTIONS
+# 64, ENGINE_TIMEOUT 10 s, "the node's consensus thread must survive its RPC
+# port being hammered"). A test already starved the nodes it was measuring by
+# polling too hard. An explorer pointed at a validator is a load generator aimed
+# at consensus.
+#
+# So this index is a safety requirement. It reads the chain ONCE, from an
+# archival observer's `blocks.log`, and serves every historical question from
+# its own store.
+#
+# ## Dependencies: none that are new
+#
+# `bloch-pos-committee` is in-tree and `sha3` is already in the workspace lock,
+# so adding this crate adds **zero** entries to `Cargo.lock`. That is deliberate:
+# the lock is shared with the binary the fleet runs and with `repro-manifest.sh`,
+# and an indexer is not a reason to put a C library (SQLite) into a consensus
+# repo's reproducible build. The storage layer here is consequently hand-rolled,
+# in the same spirit as `rpc.rs` hand-rolling HTTP rather than pulling axum.
+#
+# It is a normal workspace member, per the root manifest's standing instruction
+# that a crate with its own `[workspace]` is invisible to `cargo test
+# --workspace`.
+[package]
+name = "bloch-indexer"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "Historical index over a Genesis-4 blocks.log: blocks, transactions, address balances and outputs, epoch/finality history, validator participation and supply over time. Read-only; built from an archival observer, never from a validator."
+publish = false
+
+[[bin]]
+name = "bloch-indexer"
+path = "src/main.rs"
+
+[lib]
+name = "bloch_indexer"
+path = "src/lib.rs"
+
+[dependencies]
+# The consensus types and their canonical encodings. The indexer decodes what
+# consensus encoded, through consensus's own decoder — a second parser would be
+# the duplicate-derivation defect this repo keeps paying for.
+bloch-pos-committee = { path = "../../crates/bloch-pos-committee" }
+sha3 = "0.10"
+# Only for three suite constants that the node's `genesis.rs` manifest decoder
+# checks a validator pubkey against (SUITE_HEADER_LEN, SUITE_MLDSA65_FALCON1024,
+# MLDSA_PUBKEY_LEN). The indexer verifies no signatures — it reads a chain an
+# archival already validated. Carried anyway rather than forked: reusing the
+# node's manifest decoder means the index opens on the ledger the chain opened
+# on, checked by the same code, and a private copy of that decoder is exactly
+# the second derivation this repository keeps paying for. Already in the
+# workspace lock via bloch-pos-node, so this still adds no new entry.
+bloch-crypto = { path = "../../crates/bloch-crypto" }
