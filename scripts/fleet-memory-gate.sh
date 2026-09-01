@@ -51,6 +51,15 @@
 #                    format and same file as fleet-gate-sweep.sh.
 #
 # VERDICTS, per box
+#   SUM_DATA is the sum of VmData (heap actually allocated) across the box.
+#   It runs AHEAD of SUM_RSS — measured 2026-09-01, ~2,000 MiB of heap against
+#   ~1,250 MiB resident per validator, a lag of ~650 MiB each. That gap is why
+#   an RSS-derived growth slope reads LOW over a short window: new map entries
+#   land in heap the allocator already holds, and RSS only steps up later. Use
+#   RSS for "does it fit in RAM right now" (this gate) and VmData for "where is
+#   this going" (the projection). A projection built on an RSS slope measured
+#   over minutes will be optimistic; this program had one.
+#
 #   PASS     N x peak + reserve <= MemTotal. Roll all at once.
 #   STAGGER  the simultaneous roll does not fit, but one boot peak alongside
 #            N-1 nodes at their CURRENT resident size does. Restart them one
@@ -102,7 +111,7 @@ probe() {
         -o ConnectTimeout="$TIMEOUT" "ubuntu@$host" '
     mt=$(awk "/^MemTotal:/{print int(\$2/1024)}" /proc/meminfo)
     ma=$(awk "/^MemAvailable:/{print int(\$2/1024)}" /proc/meminfo)
-    n=0; rss=0; hwm=0; age=0
+    n=0; rss=0; hwm=0; age=0; dat=0
     for p in $(pgrep -f "'"$PAT"'" 2>/dev/null); do
       [ "$p" = "$$" ] && continue
       s=/proc/$p/status; [ -r "$s" ] || continue
@@ -119,6 +128,8 @@ probe() {
       printf "%s\\n" "$args" | grep -qx -- "--data-dir" || continue
       printf "%s\\n" "$args" | grep -qx -- "--data-dir" || continue
       r=$(awk "/^VmRSS:/{print int(\$2/1024)}" "$s" 2>/dev/null)
+      dv=$(awk "/^VmData:/{print int(\$2/1024)}" "$s" 2>/dev/null)
+      [ -n "${dv:-}" ] && dat=$((dat+dv))
       h=$(awk "/^VmHWM:/{print int(\$2/1024)}" "$s" 2>/dev/null)
       [ -n "$r" ] || continue
       n=$((n+1)); rss=$((rss+r)); [ "${h:-0}" -gt "$hwm" ] && hwm=$h
@@ -128,9 +139,9 @@ probe() {
       e=$(ps -o etimes= -p $p 2>/dev/null | tr -d " ")
       [ -n "${e:-}" ] && [ "$e" -gt "$age" ] && age=$e
     done
-    echo "$mt $ma $n $rss $hwm $((age/86400))"' 2>/dev/null)
+    echo "$mt $ma $n $rss $hwm $((age/86400)) $dat"' 2>/dev/null)
   if [ -z "$out" ]; then
-    echo "$label $host UNREACHABLE 0 0 0 0 0" > "$TMP/$label.out"
+    echo "$label $host UNREACHABLE 0 0 0 0 0 0" > "$TMP/$label.out"
   else
     echo "$label $host $out" > "$TMP/$label.out"
   fi
@@ -146,13 +157,13 @@ wait
 
 # ---- verdicts ------------------------------------------------------------
 rc=0; rows=""; stale=""
-printf '%-12s %-16s %6s %6s %3s %8s %8s %5s %8s  %s\n' \
-  BOX HOST TOTAL AVAIL N SUM_RSS MAX_HWM AGE_D NEED VERDICT
+printf '%-12s %-16s %6s %6s %3s %8s %8s %8s %5s %8s  %s\n' \
+  BOX HOST TOTAL AVAIL N SUM_RSS SUM_DATA MAX_HWM AGE_D NEED VERDICT
 for f in "$TMP"/*.out; do
-  read -r label host mt ma np rss hwm aged < "$f"
+  read -r label host mt ma np rss hwm aged dat < "$f"
   if [ "$mt" = "UNREACHABLE" ]; then
-    printf '%-12s %-16s %6s %6s %3s %8s %8s %5s %8s  %s\n' \
-      "$label" "$host" - - - - - - - "UNREACHABLE"
+    printf '%-12s %-16s %6s %6s %3s %8s %8s %8s %5s %8s  %s\n' \
+      "$label" "$host" - - - - - - - - "UNREACHABLE"
     rc=1; rows="$rows{\"box\":\"$label\",\"verdict\":\"UNREACHABLE\"},"; continue
   fi
   # peak per validator: measured candidate if given, else this box's own
@@ -169,8 +180,8 @@ for f in "$TMP"/*.out; do
   elif [ "$stag" -le "$cap" ]; then v="STAGGER"; rc=1
   else v="FAIL"; rc=1; fi
   [ -z "$PEAK" ] && [ "$v" = "PASS" ] && v="PASS(observed-only)"
-  printf '%-12s %-16s %6s %6s %3s %8s %8s %5s %8s  %s\n' \
-    "$label" "$host" "$mt" "$ma" "$np" "$rss" "$hwm" "$aged" "$need" "$v"
+  printf '%-12s %-16s %6s %6s %3s %8s %8s %8s %5s %8s  %s\n' \
+    "$label" "$host" "$mt" "$ma" "$np" "$rss" "$dat" "$hwm" "$aged" "$need" "$v"
   [ -z "$PEAK" ] && [ "${aged:-0}" -gt 2 ] && stale="$stale $label(${aged}d)"
   rows="$rows{\"box\":\"$label\",\"host\":\"$host\",\"mem_total_mib\":$mt,\"mem_avail_mib\":$ma,\"validators\":$np,\"sum_rss_mib\":$rss,\"max_hwm_mib\":$hwm,\"peak_mib\":$p,\"peak_source\":\"$src\",\"capacity_mib\":$cap,\"simultaneous_need_mib\":$need,\"staggered_need_mib\":$stag,\"verdict\":\"$v\"},"
 done
