@@ -38,8 +38,22 @@
 # idiom), so they cannot exist in a shipped binary:
 #
 #   crates/bloch-pos-committee/src/prova.rs      mutation::PRE_FIX_FILTER
+#     -> which now sets params::rehearsal::RESTORE_ZERO_STAKE_FILTER, the
+#        switch `committees::epoch_committees` actually reads. Between
+#        2026-08-24 and 2026-09-01 it did not, so BOTH arms called the same
+#        post-fix code, no mutation could bite, and five gates were red while
+#        their messages announced the analysis "refuted". A mutation switch
+#        that does not reach production is not a switch. If you add one, the
+#        test that it BITES is the only thing that tells you it is wired.
 #   crates/bloch-pos-committee/src/finality.rs   tests_hook::IGNORE_LEAK_IN_DENOMINATOR
+#   crates/bloch-pos-committee/src/finality.rs   tests_hook::DISABLE_DENOMINATOR_FLOOR
 #   crates/bloch-pos-committee/src/params.rs     rehearsal::MUTATE_SEED
+#   crates/bloch-pos-committee/src/params.rs     rehearsal::gates_open_guard()
+#
+# SECTION 0 IS NOT A MUTATION SCENARIO. `s0_three_partitions_…` touches no
+# switch at all: it runs the arithmetic a shipped binary runs, because
+# LEAK_RECOVERY_ACTIVATION_EPOCH is u64::MAX. Its partner opens the gates to
+# show the cure works. See docs/post-mortems/2026-08-24-finality-divergence.md.
 #
 # MACHINE RULE
 #
@@ -92,6 +106,9 @@ MANIFEST=$(cat <<'EOF'
 1. leak accumulator|finality::tests::the_leak_only_ever_grows|proof|behavioural: leak is monotonic. EXPECT THIS TO GO RED at pmo/leak-zero integration (2f477fa2 adds a recovery rule); it is that branch's test to update, not this one's
 0. model fidelity|prova::tests::the_model_of_the_fix_is_the_production_shuffle|proof|the modelled fix IS the production shuffle, bit for bit
 0. model fidelity|prova::tests::the_leak_mirror_is_the_production_arithmetic|proof|the mirrored leak arithmetic still matches transition.rs
+0. INCIDENT 24/08|prova::tests::s0_three_partitions_finalize_three_different_roots_at_the_same_epoch|proof|three 4-of-64 partitions finalize ONE epoch under THREE roots, on the shipped arithmetic
+0. INCIDENT 24/08|prova::tests::s0_cure_the_denominator_floor_stops_all_three_partitions|mutation|with the denominator floor in force none of the three finalizes
+0. INCIDENT 24/08|prova::tests::the_quorum_floor_is_shipped_but_not_in_force|proof|LEAK_RECOVERY_ACTIVATION_EPOCH is u64::MAX, so the floor is unreachable in production
 2. S1 disease|prova::tests::s1_disease_two_nodes_diverge_and_the_chain_never_finalizes_again|proof|two nodes with different zero-sets diverge; the fleet is consumed
 2. S2 cure|prova::tests::s2_cure_the_same_divergent_nodes_converge_from_the_same_state|proof|the SAME divergent ledgers converge under the contract
 2. S2 cure|prova::tests::s2_mutation_restoring_the_pre_fix_filter_breaks_the_cure|mutation|restoring the pre-shuffle filter breaks the cure
@@ -107,7 +124,7 @@ MANIFEST=$(cat <<'EOF'
 6. roster split (Dev A)|finality::tests::the_only_guard_on_the_roster_split_is_absent_from_a_release_build|proof|the debug_assert guard is compiled out of the shipped profile
 7. flag day|transition::tests::leaked_roster_armed_epoch_matches_the_runbook|proof|LEAKED_ROSTER_ACTIVATION_EPOCH is still 1400
 7. flag day|transition::tests::consensus_roster_matches_duty_roster_before_the_flag_day|proof|the gate is closed, so the rosters are the same today
-8. pending|prova::tests::pending_dev_a_production_membership_is_leak_invariant|pending|PENDING Dev A: production epoch_committees must be leak-invariant
+6. roster split (Dev A)|prova::tests::production_membership_is_leak_invariant|proof|LANDED: production epoch_committees is leak-invariant; the pre-shuffle filter is gone
 EOF
 )
 
@@ -153,8 +170,11 @@ keep_evidence() {
 }
 trap keep_evidence EXIT
 
-# The pending gate is `#[ignore]`d, so it needs its own selector.
-PENDING_TEST="prova::tests::pending_dev_a_production_membership_is_leak_invariant"
+# No `#[ignore]`d gate remains. `pending_dev_a_production_membership_is_leak_invariant`
+# was un-ignored and renamed on 2026-09-01: the fix it waited for had landed on
+# 2026-08-24 and the ignore outlived its reason by a week. The second pass is kept,
+# empty, because the next gate that is red-by-construction will want it back.
+PENDING_TEST=""
 
 # TWO test-binary runs, ONE build, ONE lock acquisition.
 #
@@ -178,8 +198,12 @@ cd "$ROOT" || exit 1
 export RUSTC_BOOTSTRAP=1
 cargo test -p bloch-pos-committee --lib -- \
     --test-threads 1 --show-output -Z unstable-options --format json > "$RAW" 2> "$RAW.err"
-cargo test -p bloch-pos-committee --lib -- --ignored --exact "$PENDING_TEST" \
-    --test-threads 1 --show-output -Z unstable-options --format json > "$RAW2" 2>> "$RAW.err"
+if [ -n "$PENDING_TEST" ]; then
+  cargo test -p bloch-pos-committee --lib -- --ignored --exact "$PENDING_TEST" \
+      --test-threads 1 --show-output -Z unstable-options --format json > "$RAW2" 2>> "$RAW.err"
+else
+  : > "$RAW2"
+fi
 RUNNER_EOF
 chmod +x "$RUNNER"
 

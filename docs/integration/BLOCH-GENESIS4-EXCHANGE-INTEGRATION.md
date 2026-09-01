@@ -185,11 +185,39 @@ dependence on an indexer staying in sync with the chain.
 |---|---|---|
 | Accepted | `sendrawtransaction` → `accepted:true` | in the mempool |
 | Included | output visible via `gettxout` / `getutxos` | in a block |
-| **Final** | `getchaininfo.finalized.epoch` ≥ that block's epoch | **credit** |
+| **Final** | `getchaininfo.finalized.epoch` ≥ that block's epoch | **not sufficient — see the note below** |
 
 Finality is explicit on Genesis-4 and published in every `getchaininfo` response — you do
-not estimate it from a confirmation count. Credit on `finalized` and you have a
-cryptographic settlement guarantee, typically 1–2 epochs (16–32 minutes) after inclusion.
+not estimate it from a confirmation count.
+
+> **Do not credit on `finalized` alone.** An earlier revision of this page called that a
+> cryptographic settlement guarantee. **It is not one**, and we are correcting it rather
+> than waiting to be asked. What Genesis-4 offers today is *economic* finality under an
+> assumption of healthy participation. Two defects, both demonstrated by test:
+>
+> 1. **The quorum denominator shrinks with no floor.** It is leak-adjusted
+>    unconditionally; the floor and the recovery rule are written but gated behind
+>    `LEAK_RECOVERY_ACTIVATION_EPOCH`, which is `u64::MAX`. A partitioned minority
+>    holding 6.25% of stake has been shown to self-finalise once the absent majority
+>    has leaked away.
+> 2. **`finalized` is not a latch across a reorg.** Fork choice walks from the
+>    *justified* root, and the state committed there already finalises two epochs below
+>    the head — so the deepest cut the algorithm may legitimately propose, with no
+>    invalid block and no misbehaving peer, is itself a finality rewind. Measured
+>    repeatedly: finalized epoch 6 → 4 → 2 → 0 in three in-rules cuts.
+>
+> **Two nodes agreeing does not mitigate this.** Both can rewind independently.
+>
+> **What to do instead**, until this note is withdrawn: credit at **finalized + 3 epochs**
+> (~48 minutes past finality), require **two independently operated nodes** to agree on
+> the same finalized **root and epoch** — not the epoch alone — and **re-verify
+> immediately before releasing funds**. The margin of 3 bounds the single-cut case with
+> one epoch to spare. It does not bound a repeated ratchet: **no depth is provably safe
+> today**, and we would rather say so than quote a number that sounds like one.
+>
+> This note is withdrawn when the finality latch ships and the denominator floor is
+> armed. See `docs/decisions/LEAK-RECOVERY-ARMING-BRIEF.md` and
+> `docs/decisions/FINALITY-LATCH-FORK-SAFETY.md`.
 
 ---
 

@@ -82,6 +82,19 @@ pub const INACTIVITY_LEAK_QUOTIENT: u128 = 64;
 /// incident, where three nodes finalized epoch 986 under three different roots
 /// and no amount of arriving blocks could reunify them.
 ///
+/// **This paragraph is the CORRECT account of that incident, and it is now
+/// reproduced rather than asserted** — see
+/// `prova::tests::s0_three_partitions_finalize_three_different_roots_at_the_same_epoch`
+/// and `docs/post-mortems/2026-08-24-finality-divergence.md`. Two things the
+/// next post-mortem must not repeat. First, the *other* finding of 2026-08-24
+/// — the pre-shuffle roster filter in `epoch_committees`, proven by
+/// `prova.rs` scenarios 1 to 4 — is a real defect but was **inert at epoch
+/// 986**, gated behind [`LEAKED_ROSTER_ACTIVATION_EPOCH`] = 1400; it did not
+/// cause this and has been miscited as its cause. Second, the epoch number and
+/// the count of three in the sentence above are single-sourced to this comment,
+/// written the same evening; the *mechanism* is now measured, the *specific
+/// numbers* are still recollection.
+///
 /// # Why it lives HERE and not in a migration
 ///
 /// `CommittedState` has no constructor that reads a database

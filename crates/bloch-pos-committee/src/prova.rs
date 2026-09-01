@@ -16,21 +16,49 @@
 //! the mutation cannot exist in a shipped binary — and each one has a named
 //! partner test that asserts the mutation BITES.
 //!
-//! # The defect, in one paragraph
+//! # WHICH DEFECT THIS FILE IS ABOUT — read this before citing it
 //!
-//! [`crate::committees::epoch_committees`] filters `effective_stake > 0`
-//! **before** its Fisher-Yates shuffle. A shuffle is length-dependent, so a
-//! 64-element list and a 63-element list produce entirely different
-//! permutations — not the same permutation with one element missing.
-//! `transition::with_leak_applied` zeroes a fully-leaked validator's stake but
-//! keeps it in the roster, so the leak-applied roster (which
+//! This file covers **two different failures**, and they were confused with
+//! each other for a week. The settled account of both is
+//! `docs/post-mortems/2026-08-24-finality-divergence.md`; cite that, not this
+//! header.
+//!
+//! - **Scenario 0 is the 2026-08-24 incident**: the quorum DENOMINATOR is
+//!   leak-adjusted with no floor, so a node that can hear only a handful of
+//!   the fleet shrinks its own denominator until that handful is two thirds of
+//!   it, and finalizes alone. Three partitions did it at once, on one epoch,
+//!   under three roots. This is **live in every shipped binary today**, because
+//!   [`crate::params::LEAK_RECOVERY_ACTIVATION_EPOCH`] is `u64::MAX`.
+//! - **Scenarios 1 to 4 are the roster split**, described below. It is a real
+//!   defect, it was fixed on 2026-08-24, and it was **provably inert at the
+//!   time of the incident** — mainnet was at ~epoch 986 and the rule that
+//!   exposes it does not bind until epoch 1400. It did not cause the
+//!   divergence, and it must stop being cited as if it had.
+//!
+//! # The roster split (scenarios 1–4), in one paragraph
+//!
+//! [`crate::committees::epoch_committees`] **used to** filter
+//! `effective_stake > 0` **before** its Fisher-Yates shuffle. A shuffle is
+//! length-dependent, so a 64-element list and a 63-element list produce
+//! entirely different permutations — not the same permutation with one element
+//! missing. `transition::with_leak_applied` zeroes a fully-leaked validator's
+//! stake but keeps it in the roster, so the leak-applied roster (which
 //! `compute_post_state` step 8 uses to admit attestations into a block)
-//! partitions differently from the unleaked roster (which `close_epoch` uses
-//! to tally the boundary). Honest attestations admitted by the block are
-//! dropped at the tally. It is inert only until
-//! [`crate::params::LEAKED_ROSTER_ACTIVATION_EPOCH`] fires.
+//! partitioned differently from the unleaked roster (which `close_epoch` uses
+//! to tally the boundary). Honest attestations admitted by the block were
+//! dropped at the tally.
 //!
-//! # The contract this harness measures against
+//! **The filter is gone** (`b0300409`, 2026-08-24 19:50). It survives only
+//! behind [`crate::params::rehearsal::RESTORE_ZERO_STAKE_FILTER`], a
+//! `cfg(test)` thread-local, which is what [`partition_step8`]'s broken arm
+//! now sets. Between 2026-08-24 and 2026-09-01 it did not set it, both arms of
+//! that function computed the same partition, and five tests failed while
+//! announcing that this analysis was refuted. They were not refuting it; they
+//! were reporting that they could no longer reach the code they exercise.
+//! [`crate::params::LEAKED_ROSTER_ACTIVATION_EPOCH`] is now ARMED and bound, so
+//! reintroducing the filter today would split the live fleet.
+//!
+//! # The contract scenarios 1–4 measure against
 //!
 //! Dev A's fix removes the pre-shuffle filter, making committee membership a
 //! pure function of `(seed, epoch, index set)` — **leak-invariant by
@@ -93,19 +121,55 @@ static HOOK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// `CommittedState::consensus_roster_at` returns once the flag day binds.
 pub fn partition_step8(seed: &[u8; 32], epoch: u64, consensus_roster: &[Validator]) -> Vec<Vec<u32>> {
     if mutation::PRE_FIX_FILTER.load(Relaxed) {
-        // BROKEN — and this is not a re-implementation of the broken code, it
+        // BROKEN. Dev A's fix HAS landed (2026-08-24): `epoch_committees` no
+        // longer contains an `effective_stake > 0` filter at all, so simply
+        // calling it on a leak-applied roster no longer reproduces anything.
+        // The pre-fix behaviour now has to be asked for, through the switch
+        // production actually reads.
+        //
+        // ── WHY THIS LINE EXISTS (2026-09-01) ───────────────────────────────
+        // It used to say only `return committees::epoch_committees(...)`, with
+        // the comment "this is not a re-implementation of the broken code, it
         // IS the broken code: today's production function, called on today's
-        // production input.
+        // production input". That was true when it was written and stopped
+        // being true the moment the filter was deleted. From then on BOTH arms
+        // of this function computed the identical partition, the mutation was
+        // a no-op, and five tests failed while their own messages announced
+        // that the analysis was "refuted" — a static reference pointing at code
+        // that had moved. See `docs/post-mortems/2026-08-24-finality-divergence.md`.
+        let _g = pre_fix_filter_guard();
         return committees::epoch_committees(seed, epoch, consensus_roster);
     }
-    // THE CONTRACT (pending Dev A). Same production function, stakes
-    // normalised so the pre-shuffle filter cannot remove anyone — which is
-    // what deleting the filter does. Membership = f(seed, epoch, index set).
+    // THE CONTRACT, and since 2026-08-24 also the production behaviour. Same
+    // production function, stakes normalised so that even if the pre-shuffle
+    // filter were restored it could not remove anyone — which is what deleting
+    // the filter does. Membership = f(seed, epoch, index set).
     let by_index: Vec<Validator> = consensus_roster
         .iter()
         .map(|v| Validator { index: v.index, effective_stake: 1 })
         .collect();
     committees::epoch_committees(seed, epoch, &by_index)
+}
+
+/// Turn the production pre-shuffle filter back on for this thread, and off
+/// again when the guard drops — including on an unwind, so a failing assertion
+/// inside a scenario cannot leave the consensus rule mutated for the rest of
+/// the thread.
+///
+/// [`crate::params::rehearsal::RESTORE_ZERO_STAKE_FILTER`] is the switch
+/// `committees::mutation_restores_zero_stake_filter` reads, and it is
+/// thread-local for the reason that module documents at length. `HOOK` still
+/// serialises the scenarios because [`mutation::PRE_FIX_FILTER`] itself is a
+/// process global.
+fn pre_fix_filter_guard() -> impl Drop {
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            crate::params::rehearsal::RESTORE_ZERO_STAKE_FILTER.store(false, Relaxed);
+        }
+    }
+    crate::params::rehearsal::RESTORE_ZERO_STAKE_FILTER.store(true, Relaxed);
+    Restore
 }
 
 /// The partition the **epoch boundary** tallies against. Unconditional: this
@@ -347,6 +411,237 @@ mod tests {
             src.contains("if epoch < crate::params::LEAKED_ROSTER_ACTIVATION_EPOCH"),
             "the flag-day gate moved; this harness models the POST-flag-day roster and its \
              relevance depends on that gate still being the thing that arms it"
+        );
+    }
+
+    // ════════════ SCENARIO 0 — the 2026-08-24 incident, reproduced ═══════════
+
+    /// The three partitions of the incident, and how many epochs they are
+    /// driven for. 4-of-64 is the size recorded in
+    /// [`crate::params::MIN_QUORUM_DENOMINATOR_NUM`]'s docs ("The 2026-08-24
+    /// partitions were 4 of 64"); 120 epochs is the horizon
+    /// `finality::tests::run_partition_inner` uses for the same scenario.
+    const INCIDENT_PARTITIONS: [&[u32]; 3] = [&[0, 1, 2, 3], &[4, 5, 6, 7], &[8, 9, 10, 11]];
+    const INCIDENT_HORIZON: u64 = 120;
+
+    /// A root that is a function of (partition, epoch), so two partitions
+    /// never accidentally agree and every epoch has its own checkpoint — which
+    /// is what lets consecutive justification finalize.
+    fn incident_root(tag: u8, epoch: u64) -> [u8; 32] {
+        let mut r = [0u8; 32];
+        r[0] = 0xE0 | tag;
+        r[1..9].copy_from_slice(&epoch.to_le_bytes());
+        r
+    }
+
+    /// Drive ONE node that can hear only `heard`, for `INCIDENT_HORIZON`
+    /// epochs, and report the first epoch it FINALIZED and what it finalized.
+    ///
+    /// The node's registry is the full 64-validator roster — every node had
+    /// the same registry; that is not what the partition changed. What the
+    /// partition changed is the attestation set that reached it. Everything
+    /// here goes through the real [`FinalityState::process_epoch`]; no leak
+    /// balance and no denominator is hand-stuffed.
+    fn drive_partitioned_node(heard: &[u32], tag: u8) -> (Option<u64>, Option<Checkpoint>, f64) {
+        let roster = duty_roster();
+        let mut st = FinalityState::new(genesis());
+        for e in 1..=INCIDENT_HORIZON {
+            let src = st.current_justified();
+            let target = incident_root(tag, e);
+            let atts: Vec<(u32, AttestationData)> = heard
+                .iter()
+                .map(|v| att(*v, e * SLOTS_PER_EPOCH, e, target, src))
+                .collect();
+            let out = st
+                .process_epoch(&crate::finality::EpochVotes {
+                    epoch: e,
+                    active_set: &roster,
+                    attestations: &atts,
+                })
+                .expect("dense, in-order epochs");
+            if let Some(cp) = out.finalized {
+                let destroyed: u128 = (0..N).map(|v| st.leaked_of(v) as u128).sum();
+                let total = N as u128 * STAKE as u128;
+                return (Some(e), Some(cp), destroyed as f64 / total as f64 * 100.0);
+            }
+        }
+        (None, None, 0.0)
+    }
+
+    /// **THE INCIDENT: three nodes finalize the same epoch on three different
+    /// roots — with no bug in the finality code and no disagreement about any
+    /// rule.**
+    ///
+    /// This is the scenario the rest of this file was believed to explain and
+    /// does not. The mechanism is not the committee partition; it is the
+    /// **quorum denominator**. `process_epoch` measures the two-thirds test
+    /// against the LEAK-ADJUSTED total. A node that can hear only four of the
+    /// sixty-four counts the other sixty as absent, absent stake leaks, and the
+    /// leak is subtracted from the very total the quorum is measured against.
+    /// The denominator walks down until it fits inside the minority the node
+    /// can still hear, and that minority justifies — then finalizes — its own
+    /// branch. Three disjoint partitions do this three times, independently, at
+    /// the same epoch, on three different roots.
+    ///
+    /// Nothing in this test touches a mutation switch. **It runs the arithmetic
+    /// a shipped binary runs today**, because
+    /// [`crate::params::LEAK_RECOVERY_ACTIVATION_EPOCH`] is `u64::MAX`, so
+    /// `process_epoch` takes the unfloored `leak_adjusted` branch on every
+    /// epoch a real chain can reach. The floor and the leak recovery that
+    /// landed on 2026-08-25 are correct and are NOT in force. That is the
+    /// finding, and it is why this test is not decorated as a historical
+    /// curiosity: it is a description of the code the fleet is running.
+    ///
+    /// The companion below shows the floor stops it, so this is not a test
+    /// that merely cannot fail.
+    #[test]
+    fn s0_three_partitions_finalize_three_different_roots_at_the_same_epoch() {
+        let _g = HOOK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let outcomes: Vec<(Option<u64>, Option<Checkpoint>, f64)> = INCIDENT_PARTITIONS
+            .iter()
+            .enumerate()
+            .map(|(i, heard)| drive_partitioned_node(heard, i as u8))
+            .collect();
+
+        let mut finalized = Vec::new();
+        for (i, (epoch, cp, destroyed)) in outcomes.iter().enumerate() {
+            let epoch = epoch.unwrap_or_else(|| {
+                panic!(
+                    "partition {i} ({:?}) never finalized in {INCIDENT_HORIZON} epochs. Then \
+                     the leak-adjusted denominator is not the mechanism of the 2026-08-24 \
+                     divergence and this account is wrong.",
+                    INCIDENT_PARTITIONS[i]
+                )
+            });
+            finalized.push((epoch, cp.expect("finalized epoch carries a checkpoint"), *destroyed));
+        }
+
+        // All three at the SAME epoch. The partitions are the same size and
+        // see the same schedule, so anything else would mean the outcome
+        // depends on something other than the denominator.
+        let e0 = finalized[0].0;
+        for (i, (e, _, _)) in finalized.iter().enumerate() {
+            assert_eq!(
+                *e, e0,
+                "partition {i} finalized at epoch {e}, partition 0 at {e0}. Three symmetric \
+                 partitions must reach the false quorum together, or the mechanism is not \
+                 the one this test names."
+            );
+        }
+
+        // Three DIFFERENT roots. This is the safety violation.
+        let roots: Vec<[u8; 32]> = finalized.iter().map(|(_, cp, _)| cp.root).collect();
+        for i in 0..roots.len() {
+            for j in (i + 1)..roots.len() {
+                assert_ne!(
+                    roots[i], roots[j],
+                    "partitions {i} and {j} finalized the same root; then this fixture is \
+                     not reproducing a divergence at all"
+                );
+            }
+        }
+        // ...and all three are checkpoints for one and the same epoch.
+        let ce = finalized[0].1.epoch;
+        for (i, (_, cp, _)) in finalized.iter().enumerate() {
+            assert_eq!(
+                cp.epoch, ce,
+                "partition {i} finalized checkpoint epoch {}, partition 0 finalized {ce}. \
+                 The incident is three roots for ONE epoch; different epochs would be a \
+                 different, and much less serious, fact.",
+                cp.epoch
+            );
+        }
+
+        // The quorum was false: 4 of 64 is 6.25%, nowhere near two thirds of
+        // an intact denominator. If it justified before the leak threshold it
+        // did so without the leak, and the mechanism is not what is claimed.
+        assert!(
+            e0 > crate::params::INACTIVITY_LEAK_THRESHOLD_EPOCHS,
+            "a partition finalized at epoch {e0}, at or before the leak threshold — 4/64 \
+             cannot reach 2/3 of an unshrunken denominator, so the fixture is wrong"
+        );
+
+        println!(
+            "INCIDENT (s0): 3 disjoint partitions of 4 of 64 validators (6.25% each) EACH \
+             finalized checkpoint epoch {ce} at epoch {e0}, on 3 DIFFERENT roots \
+             ({:02x?}, {:02x?}, {:02x?}), after the leak destroyed {:.1}% of network stake. \
+             No mutation switch was touched: this is the arithmetic a shipped binary runs, \
+             because LEAK_RECOVERY_ACTIVATION_EPOCH is u64::MAX.",
+            &roots[0][..2],
+            &roots[1][..2],
+            &roots[2][..2],
+            finalized[0].2
+        );
+    }
+
+    /// **The cure, and the proof that scenario 0 can be stopped.**
+    ///
+    /// A test that reproduces a failure is worth nothing unless something makes
+    /// it stop. Open the two flag-day gates
+    /// ([`crate::params::rehearsal::gates_open_guard`], `cfg(test)`) so the
+    /// denominator floor and the leak recovery are in force, and run the
+    /// IDENTICAL three partitions. None of them may finalize, ever: with the
+    /// floor at one half, a set must hold at least a third of the original
+    /// stake to be rescued by the leak, and 6.25% is not a third.
+    ///
+    /// This is also the exact measurement of what arming
+    /// [`crate::params::LEAK_RECOVERY_ACTIVATION_EPOCH`] would buy. Arming it
+    /// is the founder's decision and is NOT taken here.
+    #[test]
+    fn s0_cure_the_denominator_floor_stops_all_three_partitions() {
+        let _g = HOOK.lock().unwrap_or_else(|e| e.into_inner());
+        let _gates = crate::params::rehearsal::gates_open_guard();
+
+        for (i, heard) in INCIDENT_PARTITIONS.iter().enumerate() {
+            let (epoch, cp, _) = drive_partitioned_node(heard, i as u8);
+            assert_eq!(
+                epoch, None,
+                "MUTATION DID NOT BITE: with the denominator floor in force, partition {i} \
+                 ({heard:?}) still finalized {cp:?} at epoch {epoch:?}. Either the gate is \
+                 not wired or scenario 0 was passing for some other reason."
+            );
+        }
+        println!(
+            "CURE (s0): with the floor at {}/{} of the unleaked total in force, all 3 \
+             partitions of 4 of 64 failed to finalize in {INCIDENT_HORIZON} epochs. The \
+             floor is GATED INERT in production (LEAK_RECOVERY_ACTIVATION_EPOCH = u64::MAX); \
+             arming it is the founder's decision.",
+            crate::params::MIN_QUORUM_DENOMINATOR_NUM,
+            crate::params::MIN_QUORUM_DENOMINATOR_DEN
+        );
+    }
+
+    /// **The ratchet is live: the shipped default IS the incident arithmetic.**
+    ///
+    /// Scenario 0 above proves it behaviourally. This states it as a fact about
+    /// the constant, so that the day somebody arms the flag day, exactly one
+    /// test tells them that scenario 0 has changed meaning.
+    ///
+    /// It does NOT assert that the gate should be armed. It asserts that while
+    /// it reads `u64::MAX`, no epoch any chain can reach takes the floored
+    /// branch — which is the difference between "the fix landed" and "the fix
+    /// is in force", and the difference the audit could not settle.
+    #[test]
+    fn the_quorum_floor_is_shipped_but_not_in_force() {
+        assert_eq!(
+            crate::params::LEAK_RECOVERY_ACTIVATION_EPOCH,
+            u64::MAX,
+            "LEAK_RECOVERY_ACTIVATION_EPOCH has been armed. The denominator floor and the \
+             leak recovery are now in force from that epoch, so \
+             `s0_three_partitions_finalize_three_different_roots_at_the_same_epoch` no \
+             longer describes what a shipped binary does after it. Re-read both scenario 0 \
+             tests, and re-read the settlement guarantee in \
+             docs/post-mortems/2026-08-24-finality-divergence.md before telling an \
+             integrator anything about finality."
+        );
+        println!(
+            "RATCHET: LEAK_RECOVERY_ACTIVATION_EPOCH = u64::MAX. The floor \
+             ({}/{}) and the leak recovery are compiled in and UNREACHABLE; every epoch a \
+             real chain can reach takes the unfloored, leak-adjusted denominator — the \
+             arithmetic of 2026-08-24.",
+            crate::params::MIN_QUORUM_DENOMINATOR_NUM,
+            crate::params::MIN_QUORUM_DENOMINATOR_DEN
         );
     }
 
@@ -775,22 +1070,24 @@ mod tests {
         );
     }
 
-    // ═════════════════ PENDING DEV A — the contract, on production ═══════════
+    // ══════════════════ LANDED — the contract, on production ═════════════════
 
-    /// **This is the test that goes green the day Dev A lands the fix.**
+    /// **The contract, asserted of the production function directly.**
     ///
     /// Everything above measures the contract through [`partition_step8`].
-    /// This one asserts it of the *production* function directly: with one
-    /// validator at zero stake, `epoch_committees` must still partition the
-    /// full index set.
+    /// This one asserts it of the *production* function: with one validator at
+    /// zero stake, `epoch_committees` must still partition the full index set.
     ///
-    /// It is `#[ignore]`d because it is RED on this branch by construction —
-    /// the filter is still there. `scripts/prova-relanca.sh` runs it with
-    /// `--ignored` and reports it as PENDING. When it starts passing, the
-    /// `#[ignore]` comes off and this comment goes with it.
+    /// It was `#[ignore]`d as `pending_dev_a_…` on the grounds that it was
+    /// "RED on this branch by construction — the filter is still there".
+    /// **The filter is not still there.** It was removed from
+    /// `committees::epoch_committees` on 2026-08-24 and survives only behind
+    /// `params::rehearsal::RESTORE_ZERO_STAKE_FILTER`, a `cfg(test)`
+    /// thread-local. The `#[ignore]` outlived its reason by a week, and while
+    /// it stood, the one assertion that could have detected that the rest of
+    /// this file had gone stale was the one assertion never run.
     #[test]
-    #[ignore = "PENDING Dev A: red until the pre-shuffle filter is removed from committees.rs"]
-    fn pending_dev_a_production_membership_is_leak_invariant() {
+    fn production_membership_is_leak_invariant() {
         let healthy = duty_roster();
         let mut leaked = healthy.clone();
         leaked[7].effective_stake = 0;

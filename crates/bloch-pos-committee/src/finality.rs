@@ -59,6 +59,26 @@
 //! checkpoints at the same epoch would therefore need two disjoint ≥ 2/3 stake
 //! quorums out of one 3/3 total — impossible. At most one root is justified
 //! per epoch, hence at most one can ever be finalized per epoch, on any input.
+//!
+//! ## ...and the scope that argument does NOT have
+//!
+//! **The paragraph above is true of ONE `FinalityState` and false of the
+//! network.** "One 3/3 total" is not a network constant: `process_epoch`
+//! measures the two-thirds test against the LEAK-ADJUSTED total, and the leak
+//! ledger is a function of the attestations *this node heard*. Two nodes that
+//! heard different subsets hold different denominators, so "two disjoint 2/3
+//! quorums out of one total" never has to happen — each side is a 2/3 quorum
+//! out of its OWN, smaller total. With no floor on that denominator (which is
+//! the shipped configuration: `params::LEAK_RECOVERY_ACTIVATION_EPOCH` is
+//! `u64::MAX`) a set of any size finalizes alone once the stall is long enough:
+//! one node needs 28 epochs, four need 25.
+//!
+//! That is not a hypothetical — it is the 2026-08-24 incident, three nodes
+//! finalizing one epoch under three roots. It is reproduced, with the cure,
+//! in `prova::tests::s0_three_partitions_finalize_three_different_roots_at_the_
+//! same_epoch`, and settled in
+//! `docs/post-mortems/2026-08-24-finality-divergence.md`. Anyone quoting the
+//! safety argument to an integrator must quote this section with it.
 
 use crate::attestation::AttestationData;
 use crate::params::{
