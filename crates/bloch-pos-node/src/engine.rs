@@ -606,6 +606,103 @@ struct Engine {
     /// that kind of pool shrinkage apart from the epoch `retain`, which fork
     /// choice very much can see. See the argument there.
     fc_covered_removals: u64,
+    /// `blocks` in the shape fork choice reads it. A pure projection, kept in
+    /// step rather than rebuilt — see [`ForkChoiceIndex`].
+    fc_index: ForkChoiceIndex,
+}
+
+/// `Engine::blocks` in the shape fork choice reads it: the parent/child edges,
+/// and the attestation triples lifted out of the block bodies.
+///
+/// **Every field is a pure projection of `blocks`, not node-local state.**
+/// That distinction is the whole safety argument, and it is the one the module
+/// docs above insist on: a *cache* of a consensus derivation is what made two
+/// honest nodes disagree in the `expected_bits` incident, whereas a projection
+/// has no opinion of its own — [`ForkChoiceIndex::rebuild`] is its definition,
+/// and `the_index_is_the_rebuild_after_every_mutation` asserts the incremental
+/// maintenance below reproduces it entry for entry after every insert and
+/// every removal.
+///
+/// It exists because `forkchoice_store` rebuilt all of this from scratch on
+/// every head computation, walking all of `blocks` twice per block ingested —
+/// O(N) work per block, O(N²) per replay, measured at 60–75% of samples at
+/// depth 24k. The two halves it buys are different:
+///
+/// * `parents`/`children` make the **justified subtree** reachable without a
+///   full scan, which is what lets [`lmd_ghost_head_indexed`] hand fork choice
+///   a tree bounded by the unjustified suffix (~4 epochs on the live chain)
+///   instead of by the whole DAG. That is the asymptotic half.
+/// * `atts` is the constant-factor half. The fold over block-body attestations
+///   cannot be narrowed — see the note on `lmd_ghost_head_indexed` — but it no
+///   longer has to walk `BlockEnvelope`s to do it. A `BlockEnvelope` carries
+///   hybrid ML-DSA‖Falcon signatures, so touching every body to read 1.6
+///   attestations a block means dragging a gigabyte of key material through
+///   the cache; the triples fork choice actually reads are 48 bytes each.
+#[derive(Default)]
+struct ForkChoiceIndex {
+    /// child id → parent id, for every block in `blocks`.
+    parents: HashMap<[u8; 32], [u8; 32]>,
+    /// parent id → its children in `blocks`, ascending. Never an empty vec:
+    /// the rebuild cannot produce one, so removal drops the key instead.
+    children: HashMap<[u8; 32], Vec<[u8; 32]>>,
+    /// block id → the (validator, latest-message) pairs its body carries, in
+    /// body order. Keyed by a `BTreeMap` so iteration is in the same block-id
+    /// order `blocks` itself iterates in — which fork choice depends on, and
+    /// must, until `Store::observe` is a function of the message set. See
+    /// `probe_a_later_vote_masks_an_equivocation_and_the_bar_depends_on_order`
+    /// in the committee crate's `tests/properties.rs`.
+    atts: BTreeMap<[u8; 32], Vec<(u32, LatestMessage)>>,
+}
+
+impl ForkChoiceIndex {
+    /// The definition: what the index would be if built from `blocks` now.
+    /// The incremental `insert`/`remove` below are correct exactly insofar as
+    /// they agree with this, which is what the test asserts.
+    fn rebuild(blocks: &BTreeMap<[u8; 32], BlockEnvelope>) -> Self {
+        let mut ix = ForkChoiceIndex::default();
+        for (id, env) in blocks {
+            ix.insert(*id, env);
+        }
+        ix
+    }
+
+    fn insert(&mut self, id: [u8; 32], env: &BlockEnvelope) {
+        self.parents.insert(id, env.header.parent);
+        let kids = self.children.entry(env.header.parent).or_default();
+        if let Err(pos) = kids.binary_search(&id) {
+            kids.insert(pos, id);
+        }
+        self.atts.insert(
+            id,
+            env.body
+                .attestations
+                .iter()
+                .map(|a| {
+                    (
+                        a.validator,
+                        LatestMessage {
+                            slot: a.data.slot,
+                            root: a.data.head,
+                        },
+                    )
+                })
+                .collect(),
+        );
+    }
+
+    fn remove(&mut self, id: &[u8; 32]) {
+        if let Some(parent) = self.parents.remove(id) {
+            if let Some(kids) = self.children.get_mut(&parent) {
+                if let Ok(pos) = kids.binary_search(id) {
+                    kids.remove(pos);
+                }
+                if kids.is_empty() {
+                    self.children.remove(&parent);
+                }
+            }
+        }
+        self.atts.remove(id);
+    }
 }
 
 /// A fingerprint of the four values `lmd_ghost_head` reads, so `advance` can
@@ -1242,6 +1339,7 @@ impl Engine {
         if env.header.slot == 0 {
             return; // genesis is synthesized, never received
         }
+        self.fc_index.insert(id, &env);
         self.blocks.insert(id, env);
         self.advance();
         // The block is queryable now, so attestations parked on it can be
@@ -1298,8 +1396,8 @@ impl Engine {
     fn forkchoice_head(&self) -> [u8; 32] {
         // Instrumentation only; compiled out without `perf-timing`.
         let _perf = bloch_pos_committee::perf::span(bloch_pos_committee::perf::Phase::ForkChoice);
-        lmd_ghost_head(
-            &self.blocks,
+        lmd_ghost_head_indexed(
+            &self.fc_index,
             self.pool.values(),
             &self.state.active_validators(),
             self.state.finality().justified.root,
@@ -1384,6 +1482,7 @@ impl Engine {
                 let mut progressed = false;
                 for env in &branch {
                     if !self.apply_canonical(env) {
+                        self.fc_index.remove(env.block_id().as_bytes());
                         self.blocks.remove(env.block_id().as_bytes());
                         break;
                     }
@@ -1716,6 +1815,7 @@ impl Engine {
                         crate::codec::hex8(env.block_id().as_bytes()),
                         env.header.slot
                     );
+                    self.fc_index.remove(env.block_id().as_bytes());
                     self.blocks.remove(env.block_id().as_bytes());
                     return false;
                 }
@@ -2392,6 +2492,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         ws_anchor_hard: false,
         ws_conflict_reported: false,
         fc_covered_removals: 0,
+        fc_index: ForkChoiceIndex::default(),
         manifest,
     };
 
@@ -2695,6 +2796,106 @@ pub fn lmd_ghost_head<'a>(
     justified: [u8; 32],
 ) -> [u8; 32] {
     let (fc, parents, children) = forkchoice_store(blocks, pool, validators);
+    let tree = BlockTree { parents: &parents };
+    fc.head(&tree, justified, &children)
+}
+
+/// [`lmd_ghost_head`], reading the maintained [`ForkChoiceIndex`] instead of
+/// walking `blocks` — and handing fork choice only the **justified subtree**.
+///
+/// This is what the node calls. [`lmd_ghost_head`] stays as the reference it
+/// is pinned against (`head_matches_the_index`), for the same reason
+/// [`lmd_ghost_head_reference`] was kept: the head is consensus-relevant, so
+/// "faster" has to be proved equal, not asserted.
+///
+/// # Why narrowing the tree cannot move the head
+///
+/// `Store::head` descends from `justified` through `children`, so it reads
+/// `children[X]` only for X on that descent — every one of them a descendant
+/// of `justified`. And `Store::subtree_weights` gives a block the total stake
+/// of the votes resting on it *or below it*: `weights[b]` accumulates up the
+/// parent edges, so for `b` in the subtree it sums exactly `b`'s descendants.
+/// A block outside the subtree cannot be one of them — if an ancestor `A` of a
+/// vote root `R` descended from `justified`, `R` would too — so the votes this
+/// narrowing drops from the parent map were contributing nothing to any block
+/// the descent can reach. Restricting `parents`/`children` to the subtree
+/// therefore leaves `weights` unchanged on every block whose weight is read.
+///
+/// The cycle bound survives too: `head`'s `limit` is `parents.len() +
+/// children.len() + 1`, and the descent visits distinct blocks of the subtree,
+/// of which there are at most `parents.len() + 1`.
+///
+/// # Why the *fold* is not narrowed with it
+///
+/// Every stored block's attestations are still observed, all of them, in
+/// block-id order. That is not caution, it is required: `Store::observe`
+/// returns early on `prev.slot >= msg.slot`, so a vote at a higher slot can
+/// **mask** an equivocating pair at a lower one and leave the validator
+/// unbarred — while folding the pair first bars it forever. Dropping the
+/// observations that live outside the subtree can therefore flip a validator's
+/// full stake on or off inside it. The witness is
+/// `probe_a_later_vote_masks_an_equivocation_and_the_bar_depends_on_order` in
+/// the committee crate. Until that fold is a function of the message set — a
+/// consensus change, needing a flag day — this loop stays O(blocks), and the
+/// replay stays quadratic in the constant this leaves behind.
+fn lmd_ghost_head_indexed<'a>(
+    index: &ForkChoiceIndex,
+    pool: impl Iterator<Item = &'a Attestation>,
+    validators: &[bloch_pos_committee::sample::Validator],
+    justified: [u8; 32],
+) -> [u8; 32] {
+    // The justified subtree, by descent over the maintained child lists.
+    // `seen` is the same fail-safe as `head`'s step bound: a parent map with a
+    // cycle in it must terminate the consensus thread's work, not hang it.
+    let mut parents: HashMap<[u8; 32], [u8; 32]> = HashMap::new();
+    let mut children: HashMap<[u8; 32], Vec<[u8; 32]>> = HashMap::new();
+    let mut seen: BTreeSet<[u8; 32]> = BTreeSet::new();
+    seen.insert(justified);
+    // `justified` maps to its own parent when this node has the block, exactly
+    // as the from-scratch build would. It changes no weight inside the subtree
+    // — nothing there is its descendant — and keeps the step bound generous.
+    if let Some(p) = index.parents.get(&justified) {
+        parents.insert(justified, *p);
+    }
+    let mut frontier = vec![justified];
+    while let Some(b) = frontier.pop() {
+        let Some(kids) = index.children.get(&b) else {
+            continue;
+        };
+        // The index keeps sibling lists ascending, and filtering preserves
+        // order, so `mine` is sorted — the same list `forkchoice_store` sorts.
+        let mut mine = Vec::with_capacity(kids.len());
+        for k in kids {
+            if seen.insert(*k) {
+                parents.insert(*k, b);
+                mine.push(*k);
+                frontier.push(*k);
+            }
+        }
+        if !mine.is_empty() {
+            children.insert(b, mine);
+        }
+    }
+
+    let mut fc = FcStore::new();
+    for v in validators {
+        fc.set_stake(v.index, v.effective_stake);
+    }
+    for atts in index.atts.values() {
+        for (validator, msg) in atts {
+            fc.observe(*validator, *msg);
+        }
+    }
+    for att in pool {
+        fc.observe(
+            att.validator,
+            LatestMessage {
+                slot: att.data.slot,
+                root: att.data.head,
+            },
+        );
+    }
+
     let tree = BlockTree { parents: &parents };
     fc.head(&tree, justified, &children)
 }
@@ -3336,6 +3537,103 @@ mod forkchoice_tests {
                      different head than the one it replaced"
                 );
             }
+
+            // Third side of the same triangle: what the node actually calls.
+            // `lmd_ghost_head_indexed` reads the maintained index and narrows
+            // the tree to the justified subtree, so it must agree with the
+            // from-scratch build on the same DAGs — forks, ties, equivocators,
+            // votes for blocks nobody has, and both choices of walk root.
+            let index = ForkChoiceIndex::rebuild(&blocks);
+            for justified in [g, ids[rng.below(ids.len() as u64) as usize]] {
+                assert_eq!(
+                    lmd_ghost_head_indexed(&index, pool.iter(), &validators, justified),
+                    lmd_ghost_head(&blocks, pool.iter(), &validators, justified),
+                    "round {round}: the indexed fork choice selected a \
+                     different head than the from-scratch build"
+                );
+            }
+        }
+    }
+
+    /// **The index is a projection, not state.** `ForkChoiceIndex` is only
+    /// safe because it has no opinion of its own: after any sequence of
+    /// inserts and removals it must be entry-for-entry what
+    /// `ForkChoiceIndex::rebuild` would produce from `blocks` at that moment.
+    ///
+    /// That is the property the module docs demand of anything carried across
+    /// head computations — the `expected_bits` fork came from node-local
+    /// mutable state that two honest nodes could disagree about. A projection
+    /// cannot diverge; a cache can. This is the test that keeps it one.
+    #[test]
+    fn the_index_is_the_rebuild_after_every_mutation() {
+        let mut rng = Rng(0x0901_2609_1DEA_1DEA);
+        let g = [0x99u8; 32];
+        for _ in 0..60u64 {
+            let mut blocks: BTreeMap<[u8; 32], BlockEnvelope> = BTreeMap::new();
+            let mut index = ForkChoiceIndex::default();
+            let mut ids: Vec<[u8; 32]> = Vec::new();
+
+            let n = 1 + rng.below(20) as usize;
+            for i in 0..n {
+                // Siblings on purpose: `children` is the field a bad removal
+                // corrupts, and it only has more than one entry under a fork.
+                let parent = if ids.is_empty() || rng.below(3) == 0 {
+                    g
+                } else {
+                    ids[rng.below(ids.len() as u64) as usize]
+                };
+                let atts: Vec<Attestation> = (0..rng.below(3))
+                    .map(|_| attest(rng.below(8) as u32, 1 + rng.below(4), g))
+                    .collect();
+                let (one, one_id) = chain_of(vec![(parent, i as u64 + 1, i as u8, atts)]);
+                let (id, env) = one.into_iter().next().expect("one block");
+                index.insert(id, &env);
+                blocks.insert(id, env);
+                ids.push(one_id[0]);
+
+                assert_index_is_rebuild(&index, &blocks, "after insert");
+            }
+
+            // Removals, in an order unrelated to insertion — the invalid-block
+            // paths in `advance` and `do_reorg` take blocks out from the
+            // middle, including the last child of a parent.
+            for i in (1..ids.len()).rev() {
+                ids.swap(i, rng.below(i as u64 + 1) as usize);
+            }
+            for id in ids {
+                index.remove(&id);
+                blocks.remove(&id);
+                assert_index_is_rebuild(&index, &blocks, "after remove");
+            }
+            assert!(index.children.is_empty(), "an emptied index kept a key");
+        }
+    }
+
+    /// Entry-for-entry equality with the rebuild, including the absence of
+    /// empty child vectors — `rebuild` cannot produce one, so neither may
+    /// incremental removal, or the two would differ in `children.len()` and
+    /// with it `head`'s step bound.
+    fn assert_index_is_rebuild(
+        index: &ForkChoiceIndex,
+        blocks: &BTreeMap<[u8; 32], BlockEnvelope>,
+        when: &str,
+    ) {
+        let fresh = ForkChoiceIndex::rebuild(blocks);
+        assert_eq!(index.parents, fresh.parents, "parents diverged {when}");
+        assert_eq!(index.children, fresh.children, "children diverged {when}");
+        assert_eq!(
+            index.atts.keys().collect::<Vec<_>>(),
+            fresh.atts.keys().collect::<Vec<_>>(),
+            "attestation index keys diverged {when}"
+        );
+        for (id, got) in &index.atts {
+            let want = fresh.atts.get(id).expect("key set already compared");
+            assert_eq!(got.len(), want.len(), "attestation count diverged {when}");
+            for (a, b) in got.iter().zip(want) {
+                assert_eq!(a.0, b.0, "validator diverged {when}");
+                assert_eq!(a.1.slot, b.1.slot, "message slot diverged {when}");
+                assert_eq!(a.1.root, b.1.root, "message root diverged {when}");
+            }
         }
     }
 
@@ -3938,6 +4236,7 @@ mod transfer_v2_end_to_end {
             ws_anchor_hard: false,
             ws_conflict_reported: false,
             fc_covered_removals: 0,
+            fc_index: ForkChoiceIndex::default(),
         }
     }
 
@@ -4236,6 +4535,7 @@ mod perf_support {
             // offset the very first comparison against a pool that really is
             // empty.
             fc_covered_removals: 0,
+            fc_index: ForkChoiceIndex::default(),
         };
         (engine, TestDir(dir))
     }
@@ -5352,6 +5652,7 @@ mod reorg_state_tests {
         // `assert_ne!` fixture guard below, which is the entire reason that
         // guard is there.
         let rival_id = *rival.block_id().as_bytes();
+        engine.fc_index.remove(&rival_id);
         engine
             .blocks
             .remove(&rival_id)
@@ -5362,6 +5663,7 @@ mod reorg_state_tests {
         }
 
         // Back in: the test needs it stored to reorg onto it.
+        engine.fc_index.insert(rival_id, &rival);
         engine.blocks.insert(rival_id, rival.clone());
         assert!(
             !engine.canonical.contains(&rival_id),
@@ -5902,6 +6204,7 @@ mod duty_view_anchor {
             ws_anchor_hard: false,
             ws_conflict_reported: false,
             fc_covered_removals: 0,
+            fc_index: ForkChoiceIndex::default(),
         };
         (engine, dir)
     }
