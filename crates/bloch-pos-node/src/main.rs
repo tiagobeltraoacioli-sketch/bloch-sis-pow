@@ -141,13 +141,20 @@ fn print_help() {
                Build a devnet genesis manifest from the keystores' public\n\
                parts. Slot 0 starts <secs> from now (default 5).\n\
            bloch-pos run --data-dir <dir> --genesis <file>\n\
-                         [--transport devnet|libp2p]\n\
+                         [--transport devnet|libp2p|dual]\n\
                devnet (default) is the TCP full mesh: no authentication, no\n\
                admission control, no relay logic. It is what the 64-validator\n\
                devnet finalized on and it stays reproducible.\n\
                libp2p is the production stack: gossipsub on Genesis-4-only\n\
                protocol ids, gossip.rs admission control, directed paginated\n\
                sync. Anything reachable from outside a firewall wants this.\n\
+               dual runs BOTH in one process, so a fleet can move between\n\
+               transports as a rolling change instead of a flag day. It needs\n\
+               the flags of both (--listen AND --p2p-listen) and refuses to\n\
+               start with only one half bound. It does NOT relay between the\n\
+               two meshes: it publishes what it authored or validated, on\n\
+               both, and everything else crosses by sync. See the header of\n\
+               crates/bloch-pos-node/src/net.rs for why bridging is refused.\n\
          \n\
              devnet transport:\n\
                          --listen <port> [--listen-addr <ip>]\n\
@@ -769,14 +776,31 @@ fn run_cmd(args: &[String]) {
     let transport = match arg_value(args, "--transport").as_deref() {
         None | Some("devnet") => engine::Transport::Devnet,
         Some("libp2p") => engine::Transport::Libp2p,
+        // Dual is reachable ONLY by naming it. `None` is still `Devnet`, so a
+        // command line that worked yesterday selects the same transport today.
+        Some("dual") => engine::Transport::Dual,
         Some(other) => {
-            eprintln!("run: --transport must be `devnet` or `libp2p`, not `{other}`");
+            eprintln!("run: --transport must be `devnet`, `libp2p` or `dual`, not `{other}`");
             exit(2);
         }
     };
     let listen = arg_value(args, "--listen").and_then(|s| s.parse::<u16>().ok());
-    if transport == engine::Transport::Devnet && listen.is_none() {
-        eprintln!("run: --listen <port> is required for the devnet transport");
+    if matches!(
+        transport,
+        engine::Transport::Devnet | engine::Transport::Dual
+    ) && listen.is_none()
+    {
+        // Refused rather than defaulted. A `dual` node that came up with only
+        // its libp2p half bound would look, in every log and every RPC answer,
+        // exactly like a node bridging two populations — while one of them
+        // could not reach it at all. Half a dual node is worse than none.
+        eprintln!(
+            "run: --listen <port> is required for the `{}` transport",
+            match transport {
+                engine::Transport::Dual => "dual",
+                _ => "devnet",
+            }
+        );
         exit(2);
     }
     let csv = |name: &str| -> Vec<String> {
@@ -790,7 +814,11 @@ fn run_cmd(args: &[String]) {
             .unwrap_or_default()
     };
     let mut p2p_listen = csv("--p2p-listen");
-    if transport == engine::Transport::Libp2p && p2p_listen.is_empty() {
+    if matches!(
+        transport,
+        engine::Transport::Libp2p | engine::Transport::Dual
+    ) && p2p_listen.is_empty()
+    {
         p2p_listen.push("/ip4/0.0.0.0/tcp/16400".to_string());
     }
     let stop_at_slot = arg_value(args, "--stop-at-slot").and_then(|s| s.parse::<u64>().ok());
@@ -913,4 +941,34 @@ fn self_check() {
     // Migration design §5.1: the slot cadence everything descends from.
     assert_eq!(SLOT_DURATION_SECS, 30);
     assert_eq!(SLOTS_PER_EPOCH, 32);
+
+    // WIRE-NAMESPACE-REGISTRY.md §2 — the frame-byte namespace, and §7 gap 1,
+    // which records that nothing froze it.
+    //
+    // This is the one shared namespace in the tree with NO compiler
+    // diagnostic of any kind: `net.rs` matches `&FRAME_BLOCK` as a
+    // binding-by-reference (so `unreachable_patterns` never fires) and
+    // compares `FRAME_GET_BLOCKS` with a runtime `==`. Two constants with
+    // different names and the same value are invisible to the toolchain. Five
+    // collisions in this family were found in a single day in August 2026.
+    //
+    // Asserted here, at every `run`, and not only in a unit test, because the
+    // failure it guards is a chain split and the cost of the check is four
+    // comparisons at boot.
+    let frames: [(&str, u8); 4] = [
+        ("FRAME_BLOCK", net::FRAME_BLOCK),
+        ("FRAME_ATT", net::FRAME_ATT),
+        ("FRAME_GET_BLOCKS", net::FRAME_GET_BLOCKS),
+        ("FRAME_TX", net::FRAME_TX),
+    ];
+    for (i, (na, a)) in frames.iter().enumerate() {
+        assert_eq!(
+            *a,
+            (i + 1) as u8,
+            "{na} is not on its registered allocation (§2 of the wire namespace registry)"
+        );
+        for (nb, b) in frames.iter().skip(i + 1) {
+            assert_ne!(a, b, "frame bytes {na} and {nb} collide — silent chain split");
+        }
+    }
 }
