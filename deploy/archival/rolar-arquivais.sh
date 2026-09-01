@@ -58,6 +58,65 @@ set -u -o pipefail
 : "${EXECUTAR:=0}"
 : "${PROXY_URL:=https://posternlabs.com/g4rpc}"
 
+# ── TRAVA DE LINHAGEM ──────────────────────────────────────────────────────
+#
+# MEDIDO EM 2026-09-01, e e a razao de este bloco existir: `quatro`, `cinco` e
+# `seis` NAO sao uma progressao. Sao tres ramos.
+#
+#   git merge-base 46133196 bed1b9ce  ->  1aacab47   (24/08, ANTES do `quatro`)
+#   git merge-base --is-ancestor 0a3a436a bed1b9ce   ->  NAO
+#
+# `seis` (bed1b9ce) saiu do tronco ANTES do `quatro` e por isso nao tem
+# 47f7644b, "as quatro correcoes sobre o que a frota roda". Uma delas nao esta
+# atras de portao nenhum e vale HOJE, em toda epoca:
+#
+#   cinco:  seed_for_attestation  -> lookahead 0 abaixo do flag day (inerte)
+#   seis:   seed_for_attestation  -> lookahead MIN_SEED_LOOKAHEAD_EPOCHS, SEM portao
+#
+# Engine::judge chama seed_for_attestation. Um arquival NAO propoe, entao nao
+# pode se auto-bifurcar — mas ele JULGA atestacao, e julgar contra outro comite
+# muda justificado/finalizado, que e exatamente o campo sobre o qual o
+# `getchaininfo` do proxy publico corrobora. Um arquival no `seis` responde,
+# parece saudavel, e publica outra cadeia.
+#
+# E o `gates_digest` NAO PEGA ISSO. Os tres binarios dao a MESMA string
+# (a03bccc3...), porque o digesto e sobre o CONJUNTO DE PORTOES — nomes e
+# epocas — e nao sobre o comportamento atras deles. Uma correcao atras de um
+# portao que ja existe e invisivel para ele. O digesto continua valendo para o
+# que ele promete (o dia em que um dos 9 portoes for armado); ele so nao pode
+# ser a unica pergunta.
+#
+# Por isso a trava e por LINHAGEM e nao por digesto. Um binario so entra num
+# arquival se o commit que ele imprime estiver nesta lista.
+: "${LINHAGEM_APROVADA:=46133196}"
+
+case " $LINHAGEM_APROVADA " in
+  *" ${ESPERADO:0:8} "*) ;;
+  *)
+    cat >&2 <<TRAVA
+RECUSO: ESPERADO=$ESPERADO nao esta na linhagem da frota ($LINHAGEM_APROVADA).
+
+  A frota roda 'cinco' (46133196). O unico binario Linux montado hoje e
+  bloch-pos-seis-linux (bed1b9ce), que NAO descende do que a frota roda:
+  falta-lhe 47f7644b, e com ele o gate de ANCESTRY_SEED em
+  Engine::seed_for_attestation. Um arquival nesse binario julga atestacao
+  contra outro comite e publica outro finalizado — sem propor um bloco
+  sequer, e sem que o gates_digest acuse nada.
+
+  O release certo EXISTE e e barato: 'git merge-tree 46133196 bed1b9ce'
+  fecha com ZERO conflitos (arvore 6aad5401). Ele carrega as correcoes de
+  consenso da frota E o fix de catch-up. Monte esse, e so entao role.
+
+  Para conferir de novo, sem tocar em nada:
+    bash digesto-portoes.sh 0a3a436a 46133196 bed1b9ce   # sai IGUAIS — e o ponto
+    git merge-base --is-ancestor 0a3a436a bed1b9ce       # sai falso — e o problema
+
+  Se um dia esta trava estiver errada, ela se abre por conf, deliberadamente:
+    LINHAGEM_APROVADA='46133196 <o novo commit>' EXECUTAR=1 bash \$0 rolar <host>
+TRAVA
+    exit 4 ;;
+esac
+
 # Ordem obrigatoria do roll. Trocar isto e uma decisao, nao um detalhe.
 ORDEM="139.180.173.231 139.180.166.5"
 
@@ -186,8 +245,12 @@ prova_de_raiz() { # prova_de_raiz <host> <porta>
     if [ "$id" = "$esperado_id" ] && [ "$sr" = "$esperado_sr" ]; then
       concordam=$((concordam+1)); caixas="$caixas $b"
     else
+      # Codigo 3, nao 1. O 1 quer dizer "o ALVO bifurcou", e aqui o alvo nem
+      # foi consultado ainda — quem discorda sao as referencias entre si.
+      # Chamar isso de "o arquival bifurcou" manda o operador consertar a
+      # maquina errada no momento em que ele menos pode errar de alvo.
       mal "referencia $b DISCORDA das outras no slot $S — a FROTA esta partida; nao role nada agora"
-      return 1
+      return 3
     fi
   done < <(printf '%s\n' "$refs")
   [ "$concordam" -ge 2 ] || { mal "so $concordam referencia respondeu com raiz real no slot $S"; return 2; }
@@ -263,6 +326,7 @@ f_checar() {
     case $? in
       0) bem "$a concorda com a frota agora" ;;
       1) mal "$a JA BIFUROU — resolva isso antes de qualquer roll" ;;
+      3) mal "a FROTA esta partida (as referencias discordam entre si) — o problema nao e $a; nao role nada agora" ;;
       *) mal "$a: NAO CONSEGUI PROVAR (leitura falhou; nao e uma acusacao de bifurcacao) — rode 'provar $a' e olhe o motivo" ;;
     esac
   done
@@ -326,10 +390,16 @@ f_rolar() {
   # -- 1. copiar o binario e conferir NO ALVO (ida e volta de sha256)
   local sl; sl=$(shasum -a 256 "$BIN_NOVO" | awk '{print $1}')
   if [ "$EXECUTAR" = 1 ]; then
+    # O `if EXECUTAR=1` acima ja protege isto, mas a protecao nao pode depender
+    # de um `if` que um refactor futuro pode mover: o scp e um write remoto e
+    # anuncia-se como tal.
+    diga "  [ESCRITA] scp $BIN_NOVO -> ubuntu@$a:$BIN_REMOTO.entrando"
     scp -q -i "$CHAVE" -o StrictHostKeyChecking=no "$BIN_NOVO" "ubuntu@$a:$BIN_REMOTO.entrando" || return 1
     local sr; sr=$(G "$a" "sha256sum $BIN_REMOTO.entrando | cut -d' ' -f1")
     [ "$sl" = "$sr" ] || { echo "ABORTA: sha256 nao bate ($sl != $sr)" >&2; return 1; }
-    local v; v=$(G "$a" "chmod +x $BIN_REMOTO.entrando && $BIN_REMOTO.entrando --version 2>&1 | head -1")
+    # chmod e um write; e executar o binario que entra tambem nao e leitura.
+    E "$a" "chmod +x $BIN_REMOTO.entrando"
+    local v; v=$(G "$a" "$BIN_REMOTO.entrando --version 2>&1 | head -1")
     case "$v" in *"$ESPERADO"*) bem "binario no alvo: $v";; *) echo "ABORTA: --version no alvo nao contem '$ESPERADO': $v" >&2; return 1;; esac
     # portoes: se o binario sabe se declarar, o digesto TEM que bater
     local d; if d=$(digesto_do_alvo "$a" "$BIN_REMOTO.entrando"); then
@@ -382,9 +452,24 @@ f_rolar() {
   # ExecStart de uma linha e o outro de varias com barra invertida; mexer so no
   # caminho do binario funciona nos dois sem reescrever a unit.
   diga "-- 4. trocando o binario na unit (guardando $unit.preroll)"
-  E "$a" "sudo cp -a $unit $unit.preroll && \
+  # O `|| {}` nao e enfeite. `set -e` NAO esta em vigor (linha `set -u -o
+  # pipefail`), entao sem ele um `sed` que nao casa — o caso do ExecStart com o
+  # binario citado duas vezes na mesma linha — deixava a unit INTACTA, pulava o
+  # daemon-reload, e o passo 5 subia o binario VELHO. A prova do passo 6 entao
+  # passa (o binario velho esta na cadeia certa), o script grava `rolado-$a` e
+  # anuncia "rolado e provado" com o no ainda no `quatro`. Um roll que nao
+  # aconteceu, relatado como sucesso.
+  # E `test ! -e` no .preroll pelo mesmo motivo que a store tem: um segundo
+  # roll nao pode gravar por cima da unica unit que sabe voltar.
+  E "$a" "test ! -e $unit.preroll || { echo 'JA EXISTE $unit.preroll'; exit 9; }; \
+          sudo cp -a $unit $unit.preroll && \
           sudo sed -i 's#$velho#$BIN_REMOTO#' $unit && \
-          grep -c '$BIN_REMOTO' $unit && ! grep -q '$velho' $unit && sudo systemctl daemon-reload"
+          grep -q '$BIN_REMOTO' $unit && ! grep -q '$velho' $unit && sudo systemctl daemon-reload" || {
+    echo "ABORTA: a unit de $a NAO foi trocada (sed nao casou, ou o .preroll ja existia)." >&2
+    echo "  O no esta PARADO e FORA do quorum publico. Nada foi sobrescrito. Para desfazer:" >&2
+    echo "    ssh ubuntu@$a 'sudo systemctl start bloch-archival && sudo systemctl start bloch-rpc-8080'" >&2
+    return 1
+  }
 
   # -- 5. subir e esperar chegar na ponta.
   diga "-- 5. subindo"
@@ -416,13 +501,28 @@ f_rolar() {
 
 f_reverter() {
   local a="${1:?uso: reverter <arquival>}"
+  # `rolar` valida o alvo e `reverter` nao validava: um IP digitado errado
+  # levava um `systemctl stop` a uma maquina que nao e arquival.
+  case " $ARQUIVAIS " in *" $a "*) ;; *) echo "nao e um arquival: $a" >&2; return 2;; esac
   local unit=/etc/systemd/system/bloch-archival.service
   diga "== reverter $a para o binario anterior =="
   # A unit pre-roll e a origem da verdade: ela aponta para o `bloch-pos-quatro`
   # que NUNCA foi sobrescrito (por isso BIN_REMOTO tem nome proprio).
   E "$a" "sudo systemctl stop bloch-rpc-8080"
   E "$a" "sudo systemctl stop bloch-archival"
-  E "$a" "test -f $unit.preroll && sudo cp -a $unit.preroll $unit && sudo systemctl daemon-reload"
+  # Sem este `|| return`, um .preroll ausente (roll abortado antes do passo 4,
+  # alguem limpou, host errado) fazia a linha inteira virar um no-op silencioso
+  # — e a linha seguinte RELIGAVA O BINARIO NOVO enquanto o operador lia
+  # "revertido". E o pior defeito possivel num caminho de rollback: ele mente
+  # exatamente quando e a unica coisa em que se esta confiando.
+  E "$a" "test -f $unit.preroll && sudo cp -a $unit.preroll $unit && sudo systemctl daemon-reload" || {
+    echo "ABORTA O REVERT: $a nao tem $unit.preroll — nao ha para onde voltar." >&2
+    echo "  O no esta PARADO. NAO religue no escuro: descubra qual binario a unit aponta" >&2
+    echo "    ssh ubuntu@$a 'grep ExecStart $unit'" >&2
+    echo "  e, se a store estiver fotografada, o caminho de volta e ela:" >&2
+    echo "    ssh ubuntu@$a 'cp -a /home/ubuntu/g4/archival.preroll/. /home/ubuntu/g4/archival/'" >&2
+    return 1
+  }
   E "$a" "sudo systemctl start bloch-archival"
   local p; p=$(porta_de "$a"); : "${p:=16400}"
   esperar_ponta "$a" "$p"
@@ -451,9 +551,23 @@ esperar_ponta() { # esperar_ponta <host> <porta>
     if [ -n "$b" ] && [ "$b" -le "$BEHIND_OK" ] 2>/dev/null; then bem "$a na ponta (behind=$b)"; return 0; fi
     # binario velho nao expoe behind_by_slots: cai para "a altura anda e alcanca"
     if [ -z "$b" ]; then
-      local refs rh; refs=$(referencias); read -r rb rp < <(printf '%s\n' "$refs" | head -1)
-      rh=$(campo "$(RPC "$rb" "$rp" getchaininfo)" height 2>/dev/null || echo 0)
-      [ $(( rh - h )) -le 4 ] 2>/dev/null && { bem "$a alcancou a frota (altura $h vs $rh)"; return 0; }
+      # `|| echo 0` era uma armadilha: com a referencia muda, rh=0 e
+      # 0 - 27000 = -27000, que e `<= 4`, e o script anunciava "alcancou a
+      # frota" por NAO TER CONSEGUIDO LER a frota. Uma leitura falha tem que
+      # ser uma leitura falha; so um numero real pode encerrar a espera.
+      local refs rb rp rh; refs=$(referencias) || refs=""
+      read -r rb rp < <(printf '%s\n' "$refs" | head -1)
+      if [ -n "${rb:-}" ]; then
+        rh=$(campo "$(RPC "$rb" "$rp" getchaininfo)" height 2>/dev/null || echo '')
+        if [ -n "$rh" ] && [ "$rh" -gt 0 ] 2>/dev/null; then
+          # E preciso alcancar POR CIMA: h nao pode estar acima da frota por
+          # mais que a folga, senao um no na propria bifurcacao "alcanca".
+          local d=$(( rh - h ))
+          [ "$d" -le 4 ] && [ "$d" -ge -4 ] 2>/dev/null && { bem "$a alcancou a frota (altura $h vs $rh)"; return 0; }
+        else
+          printf '   %02d referencia muda — nao conta como alcancar\n' "$i"
+        fi
+      fi
     fi
     [ "$h" = "$anterior" ] && parado=$((parado+1)) || parado=0
     anterior=$h
@@ -485,7 +599,27 @@ f_verificar() {
     diga "-- $a  $ver"
     [ "$(G "$a" 'systemctl is-active bloch-archival')" = active ] && bem "bloch-archival ativa" || mal "bloch-archival NAO ativa"
     [ "$(G "$a" 'systemctl is-active bloch-rpc-8080')" = active ] && bem "bloch-rpc-8080 ativa" || mal "bloch-rpc-8080 NAO ativa (fora do quorum publico)"
-    prova_de_raiz "$a" "${p:-16400}" || mal "$a nao passou na prova de raiz"
+    prova_de_raiz "$a" "${p:-16400}" >/dev/null
+    case $? in
+      0) bem "$a com raiz identica a frota" ;;
+      1) mal "$a DIVERGIU da frota" ;;
+      3) mal "a FROTA esta partida — nao da para julgar $a agora" ;;
+      *) mal "$a: leitura falhou (NAO e uma acusacao de divergencia)" ;;
+    esac
+    # RESPONDER NAO E ANDAR. Um no congelado na altura certa passa em tudo
+    # acima: a unit esta ativa, o 8080 esta ativo, e a raiz de um slot antigo
+    # bate. Duas leituras separadas por um slot e o que distingue os dois.
+    local h1 h2
+    h1=$(campo "$(RPC "$a" "${p:-16400}" getchaininfo)" height 2>/dev/null || echo '')
+    sleep "$(( SLOT_MS / 1000 + 5 ))"
+    h2=$(campo "$(RPC "$a" "${p:-16400}" getchaininfo)" height 2>/dev/null || echo '')
+    if [ -z "$h1" ] || [ -z "$h2" ]; then
+      mal "$a: nao consegui ler a altura duas vezes — sem julgamento sobre avanco"
+    elif [ "$h2" -gt "$h1" ] 2>/dev/null; then
+      bem "$a avancou ($h1 -> $h2)"
+    else
+      mal "$a NAO AVANCOU em um slot ($h1 -> $h2) — responde, mas a cadeia parou nele"
+    fi
   done
   publico_ainda_serve || mal "o RPC publico nao respondeu"
   diga ""
