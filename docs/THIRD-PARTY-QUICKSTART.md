@@ -221,21 +221,31 @@ build, idle machine, syncing from the two published bootnodes:
 | 3 min | 528 | 12 | 408 slots/min |
 | 5 min | 620 | 12 | 37 slots/min |
 | 7 min | 664 | 18 | 22 slots/min |
-| 8 min | 697 | 19 | 32 slots/min |
+| 9 min | 734 | 20 | 37 slots/min |
+| 12 min | 846 | 24 | 83 slots/min |
 
-The rate falls by more than an order of magnitude within the first 20 epochs
-and then settles near **~30 slots/min**. At that rate a full sync to a head
-near slot 52,600 is on the order of **a day or more**, not hours. Budget for
-that, and start well before any deadline that matters to you — in particular
-the weak-subjectivity deadline in §0.
+The rate falls by **more than an order of magnitude within the first 20
+epochs**, then settles, minute to minute erratic (0–83), averaging
+**~35 slots/min** over a sustained window.
 
-> This deceleration is a **known open defect**, not a property of the chain.
-> Each epoch boundary does work proportional to the whole ledger. A partial
+The chain itself only advances 2 slots/min, so your node does still gain and
+will converge. But at 35 slots/min a full sync to a head near slot 52,600 is
+about **26 hours** — a day, not an afternoon. Plan for it, and note that the
+figure grows as the chain does: every day you wait adds roughly another 40
+minutes of catch-up on top.
+
+If you are syncing to beat the weak-subjectivity deadline in §0, **26 hours of
+sync inside a 4-day window means starting now, not on 4 September.**
+
+> This deceleration is a **known open defect**, not a property of the chain:
+> each epoch boundary does work proportional to the whole ledger. A partial
 > fix (`fix(catch-up): share the eUTXO map so an epoch roll stops paying the
-> ledger`, `Arc<BTreeMap>` copy-on-write) is on `integ/ws-checkpoint-tooling`
-> and roughly halves the time to a given epoch, but **does not remove the
-> deceleration** — the table above was measured *with* that fix applied. If
-> your build predates it, expect worse.
+> ledger`, `Arc<BTreeMap>` copy-on-write) is on `integ/ws-checkpoint-tooling`,
+> and the table above was measured **with** that fix applied — so it does not
+> remove the deceleration. A build without it reached the same epoch in about
+> twice the time in our run, but that comparison was contaminated by CPU
+> contention and should not be quoted as the fix's effect. Use a build that
+> has it; do not expect it to change the order of magnitude.
 
 ### The faster path: seed from an archival node — recommended
 
