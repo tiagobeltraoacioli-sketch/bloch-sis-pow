@@ -1007,9 +1007,44 @@ pub const FUNDED_STAKING_ACTIVATION_EPOCH: u64 = u64::MAX;
 /// as above: the live log must be checked for tag `0x03` blocks before
 /// rollout.
 ///
+/// # The carrier this gate arms (wire tag `0x09`)
+///
+/// Until 2026-08-31 this constant gated a path **no bytes could reach**:
+/// `apply_exit` was complete and tested and `validate_exit` verified the
+/// hybrid signature properly, and no `PosTransaction` variant carried a
+/// [`crate::staking::ExitTx`] — every call site was a doc comment or a test.
+/// The consequence was not academic. `Withdraw` requires `exit_epoch` to be
+/// set, and the only production writer of that field was the
+/// slashing/ejection path, so a validator could join Genesis-4 and leave only
+/// by being punished. The carrier is
+/// [`crate::transition::PosTransaction::ExitV2`], tag `0x09`, which encodes
+/// the WHOLE envelope (committed-pubkey hash, epoch, hybrid signature) — not
+/// a signing root, the mistake that left tag `0x05` one-way and §7.3
+/// unreachable from a block body.
+///
+/// # An exit-side rate limit does NOT exist, and this gate does not add one
+///
+/// Stated here because arming is where it becomes real. Nothing meters
+/// voluntary exits: the churn budget ([`crate::delegation::WARMUP_RATE_BPS`],
+/// [`crate::delegation::MIN_CHURN_SAT`]) governs DELEGATION warm-up and
+/// cool-down, and `crate::staking` has no exit queue at all — the whole
+/// self-bonded set can exit in one epoch, and
+/// [`crate::ws`]'s module docs already record that as a measured fact rather
+/// than an assumption. [`crate::staking::EXIT_DELAY_EPOCHS`] delays when
+/// duties STOP; it does not bound how many may request. Arming this gate
+/// therefore makes a mass simultaneous exit expressible on the wire for the
+/// first time, and the exposure is to LIVENESS (the roster, and with it the
+/// quorum denominator, can empty as fast as blocks can carry signatures), not
+/// to the supply cap. Whether that needs a churn limit — and if so, whether
+/// it belongs beside the activation throttle
+/// ([`crate::staking::MAX_ACTIVATIONS_PER_EPOCH`]) — is a consensus-parameter
+/// decision for the founder, flagged here, deliberately NOT invented in code.
+///
 /// `u64::MAX` means INERT. Same arming rules as
 /// [`FUNDED_STAKING_ACTIVATION_EPOCH`], including the strictly-in-the-future
-/// requirement and reading only the committed epoch.
+/// requirement and reading only the committed epoch. One further precondition
+/// of its own: the exit-rate question above must have an answer before the
+/// day, because after it the answer is a hard fork rather than a constant.
 pub const SIGNED_EXIT_ACTIVATION_EPOCH: u64 = u64::MAX;
 
 // ── The ordering the three staking gates may never be armed out of ─────────

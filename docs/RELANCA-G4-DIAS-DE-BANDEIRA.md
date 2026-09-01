@@ -1016,17 +1016,20 @@ tropeça.
 | 5 | `LEAK_RECOVERY_ACTIVATION_EPOCH` | `u64::MAX` | recuperação do leak + piso de quórum (§1) | n/a |
 | 6 | `VESTING_LOCK_ACTIVATION_EPOCH` | `u64::MAX` | semeadura única das travas de vesting | n/a |
 | 7 | `FUNDED_STAKING_ACTIVATION_EPOCH` | `u64::MAX` | `DepositV2` (tag `0x07`) + delegação financiada | **parcial** |
-| 8 | `SIGNED_EXIT_ACTIVATION_EPOCH` | `u64::MAX` | saída voluntária assinada (`apply_exit`) | **NÃO** |
+| 8 | `SIGNED_EXIT_ACTIVATION_EPOCH` | `u64::MAX` | saída voluntária assinada (`ExitV2`, tag `0x09` → `apply_exit`) | sim |
 | 9 | `WITHDRAWAL_ACTIVATION_EPOCH` | `u64::MAX` | `Withdraw` (tag `0x08`), trava de 4.096 épocas, ordem evidência-antes-de-saque | sim |
 
 A coluna "carregador na rede" é a que quase ninguém pergunta, e é a que
 decide se armar um portão faz alguma coisa:
 
-- **#8 não tem carregador nenhum.** `apply_exit` não tem **nenhum** ponto de
-  chamada de produção — só testes. Armar `SIGNED_EXIT` hoje **não muda
-  nada**: não existe forma de uma saída assinada entrar num bloco. O
-  carregador de wire está sendo escrito (tag `0x09`, fluxo separado); o
-  portão só passa a significar alguma coisa depois dele.
+- **#8 ganhou carregador NESTE merge.** Era o portão sem estrada: `apply_exit`
+  não tinha ponto de chamada de produção, então armar `SIGNED_EXIT` não mudava
+  nada. `PosTransaction::ExitV2` (tag `0x09`) fecha isso — o braço de
+  `apply_transaction` lê o portão pela época COMMITADA e entrega o
+  `staking::ExitTx` a `apply_exit`. O portão continua **inerte**
+  (`u64::MAX`); o que mudou é que armá-lo deixou de ser um no-op, e por isso
+  a segunda pré-condição da §11.3 (o limite de vazão de saída) passou de
+  observação a bloqueio real.
 - **#7 é parcial.** `DepositV2` (tag `0x07`) tem codec, portão e verificação
   completos — armar torna depósitos financiados reais. Mas `apply_delegation`
   está atrás da MESMA constante e **também não tem ponto de chamada de
@@ -1052,7 +1055,7 @@ e isso é um fato do código hoje, não um plano:
 |---|---|---|
 | `DepositV2` (braço de wire, tag `0x07`) | `FUNDED_STAKING` | `TxReject::Transfer(FormatNotActive)` |
 | `apply_delegation` | `FUNDED_STAKING` | `TxReject::StakingNotActive` |
-| `ExitV2` (braço de wire, tag `0x09`) — **ainda não integrado** | `SIGNED_EXIT` | `TxReject::StakingNotActive` |
+| `ExitV2` (braço de wire, tag `0x09`) | `SIGNED_EXIT` | `TxReject::StakingNotActive` |
 | `apply_exit` | `SIGNED_EXIT` | `TxReject::StakingNotActive` |
 | `Withdraw` (braço de wire, tag `0x08`) | `WITHDRAWAL` | `TxReject::StakingRule` |
 
@@ -1061,11 +1064,11 @@ Repare na primeira e na segunda linha: **é o MESMO portão, o mesmo
 porta por onde a mensagem entrou.** O par do `SIGNED_EXIT` é o único
 internamente consistente.
 
-A linha do `ExitV2` descreve o portador que ainda **não** está nesta árvore
-(vem no merge do carregador); as outras quatro são o código de hoje. Esta
-tabela deve ficar um merge ATRÁS do código, nunca à frente — uma doc que
-promete um caminho que ainda não existe é o mesmo defeito de sempre, virado
-do avesso.
+As **cinco** linhas são o código de hoje: o carregador do `ExitV2` entrou
+neste commit, e esta linha deixou de ser promessa no mesmo commit em que
+virou código. Esta tabela deve ficar um merge ATRÁS do código, nunca à
+frente — uma doc que promete um caminho que ainda não existe é o mesmo
+defeito de sempre, virado do avesso.
 
 Isso é **diagnóstico, não consenso**: qualquer `Err` invalida o bloco no
 mesmo índice (`TransitionError::Transaction(i)`), então nenhum veredito aqui
@@ -1130,8 +1133,10 @@ constante. Além disso:
 - **#8 `SIGNED_EXIT`** — duas pré-condições, e a segunda é uma DECISÃO, não
   uma verificação:
   1. o carregador de wire (tag `0x09`) precisa existir e estar na frota.
-     Antes disso, armar é ruído — e ruído que a página de release vai
-     afirmar como recurso.
+     **Existe** desde este merge (`PosTransaction::ExitV2`); o que falta é a
+     metade operacional — a frota reconstruída com um binário que o linke.
+     Um nó sem o braço recusa o bloco inteiro no decode (`UnknownTag(0x09)`),
+     então armar antes do rollout parte a rede em vez de habilitar a saída.
   2. **decidir se pode haver saída sem limite de vazão.** Não existe
      throttle de saída em lugar nenhum: entrada tem
      `MAX_ACTIVATIONS_PER_EPOCH = 4`, saída não tem nada (procurado por

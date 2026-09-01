@@ -499,6 +499,50 @@ pub enum PosTransaction {
     /// [`crate::params::SIGNED_EXIT_ACTIVATION_EPOCH`]. The variant survives
     /// only so old wire bytes still decode to a refused transaction.
     Exit { validator: u32 },
+    /// Voluntary exit — the SIGNED successor (wire tag `0x09`), INERT until
+    /// [`crate::params::SIGNED_EXIT_ACTIVATION_EPOCH`].
+    ///
+    /// This is the carrier the exit lifecycle was missing. Before it,
+    /// [`CommittedState::apply_exit`] was complete and tested and
+    /// [`staking::validate_exit`] verified the hybrid signature properly, and
+    /// **no wire format reached either** — every call site was a doc comment
+    /// or a test. The consequence was not cosmetic: a validator could join
+    /// Genesis-4 and never voluntarily leave, because `Withdraw` (tag `0x08`)
+    /// requires `exit_epoch` to be set and the only production writer of that
+    /// field was the slashing/ejection path. Stake went in, and came back out
+    /// only through misbehaviour. Exactly the defect class the slashing
+    /// evidence carrier had: a correct application path the network cannot
+    /// address.
+    ///
+    /// # Why it carries the whole envelope, and why that is the whole point
+    ///
+    /// The variant holds [`staking::ExitTx`] itself — committed-pubkey hash,
+    /// epoch, and the hybrid signature — not an index, and not a signing
+    /// root. Tag `0x05` (`SlashingEvidence`) folds its nested messages in
+    /// through the roots they were *signed over*; a hash does not invert, so
+    /// evidence built in-process can never be recovered from a block body
+    /// ([`TxDecodeError::EvidenceNotDecodable`]). Repeating that here would
+    /// have produced a carrier that looked complete and delivered nothing.
+    /// Every field is therefore encoded whole and pinned by a
+    /// truncation-sweep round trip
+    /// (`tests::signed_exit_round_trips_and_refuses_every_truncation`).
+    ///
+    /// # Identity is the committed convention, not a second one
+    ///
+    /// `pubkey_hash` is SHA3-256 of the pubkey bytes **exactly as committed
+    /// at registration** — the suite-FRAMED form that `apply_deposit_v2`
+    /// writes and the genesis registry already carries, not the raw hybrid
+    /// body ([`staking::committed_hybrid_body`] strips the envelope for the
+    /// signature check, and only for that). Hashing the raw body would make a
+    /// perfectly valid exit reject as
+    /// [`staking::ExitReject::UnknownValidator`]. There is ONE registration
+    /// convention and this reads it; introducing a second is the
+    /// double-registration hole in another costume.
+    ///
+    /// The rule itself is stated nowhere here: the arm routes to
+    /// [`CommittedState::apply_exit`], which relays
+    /// [`staking::validate_exit`]'s verdict.
+    ExitV2(staking::ExitTx),
     /// Turn an exited validator's bonded residue into spendable coins (§7.2's
     /// second half; wire tag `0x08`) — INERT until
     /// [`crate::params::WITHDRAWAL_ACTIVATION_EPOCH`].
@@ -932,6 +976,36 @@ impl PosTransaction {
                 b.push(0x03);
                 b.extend_from_slice(&validator.to_le_bytes());
             }
+            PosTransaction::ExitV2(exit) => {
+                // 0x09: the signed voluntary exit. Same encoding rules as
+                // every other tag — one-byte discriminant, fixed-width LE
+                // fields in declaration order, every variable-length field
+                // length-prefixed — and therefore the same injectivity
+                // argument.
+                //
+                // THE ENVELOPE, WHOLE. Not `exit.signing_root()`: the evidence
+                // arm below folds its nested messages in through the roots
+                // they were signed over, which is why tag 0x05 is one-way and
+                // why §7.3 stayed unreachable from a block body however
+                // complete `slashing.rs` was. A signing root is a hash and a
+                // hash does not invert; a verifier handed one has nothing to
+                // re-verify against. Every field a node needs to re-derive the
+                // root and check the signature is written out here.
+                //
+                // Consequence worth stating: this transaction's `txid` is
+                // taken over the whole encoding (the `other` arm of
+                // `spend_signing_root`), so it MOVES if the Falcon half is
+                // re-randomised. Harmless, and only because nothing keys off
+                // it — an exit creates no output, and the mempool keys by the
+                // canonical bytes themselves. `Withdraw` is the arm that
+                // derives an outpoint from its txid, and it is a different
+                // transaction with no signature to re-randomise. Do not build
+                // an index on this id.
+                b.push(0x09);
+                b.extend_from_slice(&exit.pubkey_hash);
+                b.extend_from_slice(&exit.epoch.to_le_bytes());
+                put(&mut b, &exit.signature);
+            }
             PosTransaction::Withdraw { validator } => {
                 // 0x08: the withdrawal crank. One fixed-width field, same
                 // injectivity argument as Exit — and the same "old binary
@@ -1137,6 +1211,17 @@ impl PosTransaction {
                 }
             }
             0x08 => PosTransaction::Withdraw { validator: r.u32()? },
+            0x09 => PosTransaction::ExitV2(staking::ExitTx {
+                // Purely structural, like tags 0x01/0x06/0x07: the signature
+                // is read as opaque length-prefixed bytes and NOT verified
+                // here, and whether the format is ACTIVE is the transition's
+                // question (against the committed epoch), never the
+                // decoder's. A decoder that answered either would be a second
+                // copy of a consensus rule, free to drift.
+                pubkey_hash: r.h32()?,
+                epoch: r.u64()?,
+                signature: r.bytes()?,
+            }),
             other => return Err(TxDecodeError::UnknownTag(other)),
         };
         // Trailing bytes would mean two encodings decode to one transaction,
@@ -1830,6 +1915,34 @@ fn deposit_funding_active(epoch: u64) -> bool {
     }
 }
 
+/// Has the signed-exit flag day ([`crate::params::SIGNED_EXIT_ACTIVATION_EPOCH`])
+/// bound at `epoch`?
+///
+/// The exit twin of [`deposit_funding_active`], and ONE reader for the whole
+/// feature: the `ExitV2` wire arm of [`CommittedState::apply_transaction`] and
+/// [`CommittedState::apply_exit`] itself both come through here. Two readers
+/// comparing the same constant is how the engine's copy of the seed look-ahead
+/// drifted from the transition's; one function cannot disagree with itself.
+///
+/// `epoch` must be the COMMITTED epoch (`CommittedState::epoch`, already rolled
+/// to the block's by `close_epoch`), never anything node-local — the
+/// 2026-08-08 `expected_bits` fork is the standing reason. Separate from the
+/// funded-staking gate on purpose: a signed exit needs nothing from the eUTXO
+/// set, so the two flag days have independent lives (the constant's own docs
+/// argue this at length).
+fn signed_exit_active(epoch: u64) -> bool {
+    // The rehearsal module is `cfg(test)` and cannot exist in a shipped
+    // binary — same idiom as `deposit_funding_active` above.
+    #[cfg(test)]
+    {
+        epoch >= crate::params::rehearsal::effective_signed_exit_activation()
+    }
+    #[cfg(not(test))]
+    {
+        epoch >= crate::params::SIGNED_EXIT_ACTIVATION_EPOCH
+    }
+}
+
 /// The per-validator deposit cap the transition enforces: 1% of committed
 /// active stake ([`delegation::MAX_VALIDATOR_STAKE_BPS`]), floored at
 /// [`staking::MIN_DEPOSIT_SAT`] so a naive 1% at genesis (active stake ≈ 0)
@@ -2441,23 +2554,16 @@ impl CommittedState {
         // being `&dyn SignatureVerifier`.
         //
         // The transfer and deposit arms verify whole hybrid keys
-        // (`verify_with_key`); the staking rules take the half-split
-        // `staking::HybridKeyVerifier`, because they verify against the
+        // (`verify_with_key`); the signed exit's rule
+        // (`staking::validate_exit`) takes the half-split
+        // `staking::HybridKeyVerifier`, because it verifies against the
         // registered key with the suite envelope stripped
-        // (`staking::committed_hybrid_body`) and compose the two halves with
-        // AND themselves (`staking::verify_hybrid`). Neither interface can be
-        // written in terms of the other: a single half handed to
-        // `verify_with_key` is simply a malformed key.
-        //
-        // Both views are the SAME crypto and must be the same object. A
-        // transition that could be given a real verifier for spends and a
-        // permissive one for the staking lifecycle would make retiring a
-        // validator cheaper to forge than moving a coin. A generic bound is
-        // what makes that unrepresentable — there is no second verifier to
-        // pass. The alternative considered and rejected was a second,
-        // optional verifier defaulting to one that refuses: fail-closed, but
-        // SILENTLY, and only after a flag day arms the path — "every exit is
-        // refused and nobody knows why" is the worse failure.
+        // (`staking::committed_hybrid_body`) and composes the two halves with
+        // AND itself. Both views are the SAME crypto and must be the same
+        // object: a transition that could be given a real verifier for spends
+        // and a permissive one for exits would make retiring a validator
+        // cheaper to forge than moving a coin. A generic bound is what makes
+        // that unrepresentable — there is no second verifier to pass.
         verifier: &(impl SignatureVerifier + staking::HybridKeyVerifier),
     ) -> Result<fee_market::TxCharge, TxReject> {
         match tx {
@@ -2711,6 +2817,51 @@ impl CommittedState {
                 // exit rule.
                 Err(TxReject::StakingNotActive)
             }
+            PosTransaction::ExitV2(exit) => {
+                // THE FLAG-DAY GATE, FIRST — before any other look at the
+                // transaction, read from the COMMITTED epoch through the one
+                // shared reader, exactly the `DepositV2`/`Withdraw` shape and
+                // for the same 2026-08-08 reason.
+                //
+                // Pre-activation this reject and an old binary's
+                // `UnknownTag(0x09)` decode failure are two roads to the same
+                // verdict on the same block — the property that keeps a mixed
+                // fleet on one chain until the flag day. `StakingNotActive`
+                // rather than `FormatNotActive` because that is the verdict
+                // `apply_exit` itself returns at the same gate, and the two
+                // must not be readable as different events in a log.
+                if !signed_exit_active(self.epoch) {
+                    return Err(TxReject::StakingNotActive);
+                }
+                // The rule is stated nowhere here. `apply_exit` resolves the
+                // index from the committed `pubkey_index` (never from the
+                // wire), checks standing, and relays
+                // `staking::validate_exit`'s verdict — including the hybrid
+                // signature against the key AS COMMITTED AT REGISTRATION.
+                // This arm contributes the gate and the fee shape, nothing
+                // else.
+                self.apply_exit(exit, verifier)?;
+                // FREE, on the `Withdraw` crank's reasoning and one bound of
+                // its own: an exit carries no payload the fee market prices,
+                // and it can apply AT MOST ONCE PER VALIDATOR EVER
+                // (`exit_epoch != u64::MAX` is `AlreadyExited`, and the field
+                // never returns to the sentinel except by a payout that also
+                // ends the record). So the total consensus work this format
+                // can ever create is bounded by the roster, not by whoever is
+                // willing to submit. Honest scope: an INVALID exit is not
+                // bounded that way — it is cheap to gossip and the mempool
+                // door cannot verify its signature (the message carries only
+                // the key's hash, and the key lives in committed state the
+                // admission path deliberately does not read). Such a
+                // transaction dies in the proposer's probe exactly like a
+                // transfer spending outputs that do not exist.
+                Ok(fee_market::TxCharge {
+                    gas: 0,
+                    tx_bytes: 0,
+                    base_fee_sat: 0,
+                    priority_fee_sat: 0,
+                })
+            }
             PosTransaction::Delegate { .. } => {
                 // Same verdict as `Deposit`, same grounds: the legacy tag
                 // 0x04 names a `delegator: u32` and an `amount_sat` with no
@@ -2769,11 +2920,12 @@ impl CommittedState {
         // THE FLAG-DAY GATE, FIRST — same reading discipline as the
         // `DepositV2` gate: the COMMITTED epoch, never anything node-local
         // (the 2026-08-08 `expected_bits` fork is the standing reason).
-        #[cfg(test)]
-        let activation = crate::params::rehearsal::effective_signed_exit_activation();
-        #[cfg(not(test))]
-        let activation = crate::params::SIGNED_EXIT_ACTIVATION_EPOCH;
-        if self.epoch < activation {
+        //
+        // Through `signed_exit_active` — the SAME function the `ExitV2` wire
+        // arm calls, not a second comparison against the same constant. Two
+        // readers of one gate is how the engine's seed look-ahead drifted
+        // from the transition's; one function cannot disagree with itself.
+        if !signed_exit_active(self.epoch) {
             return Err(TxReject::StakingNotActive);
         }
         // Resolve the record by its committed identity. An unknown hash is
@@ -4952,8 +5104,7 @@ mod tests {
     // The transition demands both interfaces of its ONE injected verifier
     // (`Transition<V: SignatureVerifier + HybridKeyVerifier>`), so an
     // accept-everything verifier must say yes on both — otherwise "accept
-    // everything" would quietly mean "accept everything except the staking
-    // lifecycle".
+    // everything" would quietly mean "accept everything except exits".
     impl staking::HybridKeyVerifier for OkVerifier {
         fn verify_mldsa65(&self, _pk: &[u8], _root: &[u8; 32], _sig: &[u8]) -> bool {
             true
@@ -5005,16 +5156,39 @@ mod tests {
         }
     }
     // Permissive on the staking halves, deliberately: `ToyVerifier` exists to
-    // bind SPEND signatures to keys, and the tests that bind STAKING
-    // signatures use the `ToyHybridKeys` switchboard so a single half can be
-    // failed on purpose. A transfer test must die on the transfer, never on
-    // staking plumbing.
+    // bind SPEND signatures to keys, and the tests that bind EXIT signatures
+    // use the `ToyHybridKeys` switchboard (or `HalfDeafVerifier` below) so a
+    // single half can be failed on purpose. A transfer test must die on the
+    // transfer, never on staking plumbing.
     impl staking::HybridKeyVerifier for ToyVerifier {
         fn verify_mldsa65(&self, _pk: &[u8], _root: &[u8; 32], _sig: &[u8]) -> bool {
             true
         }
         fn verify_falcon1024(&self, _pk: &[u8], _root: &[u8; 32], _sig: &[u8]) -> bool {
             true
+        }
+    }
+
+    /// Spends verify like [`ToyVerifier`]; the FALCON half of every hybrid
+    /// signature fails. The one verifier that can prove a signed exit reaching
+    /// the wire arm is really carried to `staking::validate_exit` — under a
+    /// permissive verifier the whole signature check could be deleted and
+    /// every exit test would still pass.
+    struct HalfDeafVerifier;
+    impl SignatureVerifier for HalfDeafVerifier {
+        fn verify(&self, _v: u32, _root: &[u8; 32], _sig: &[u8]) -> bool {
+            true
+        }
+        fn verify_with_key(&self, pk: &[u8], root: &[u8; 32], sig: &[u8]) -> bool {
+            sig == toy_sign(pk, root).as_slice()
+        }
+    }
+    impl staking::HybridKeyVerifier for HalfDeafVerifier {
+        fn verify_mldsa65(&self, _pk: &[u8], _root: &[u8; 32], _sig: &[u8]) -> bool {
+            true
+        }
+        fn verify_falcon1024(&self, _pk: &[u8], _root: &[u8; 32], _sig: &[u8]) -> bool {
+            false
         }
     }
 
@@ -6537,6 +6711,232 @@ mod tests {
         });
     }
 
+    // ────────────────────────────────────────────────────────────────────────
+    // The signed exit ON THE WIRE (tag 0x09) — the carrier that makes
+    // `apply_exit` reachable from a block.
+    //
+    // Before it, `apply_exit` was complete and tested, `staking::validate_exit`
+    // verified the hybrid signature properly, and NO wire format carried an
+    // `ExitTx`: every call site was a doc comment or a test. A validator could
+    // join Genesis-4 and never voluntarily leave, because `Withdraw` needs
+    // `exit_epoch` set and the only production writer of that field was the
+    // slashing/ejection path.
+    // ────────────────────────────────────────────────────────────────────────
+
+    /// `decode ∘ encode` is the identity on the WHOLE envelope, and every
+    /// truncation of the encoding is refused.
+    ///
+    /// This is the test the slashing-evidence carrier did not have, and its
+    /// absence is why §7.3 stayed unreachable: that encoder folds its nested
+    /// messages in as the roots they were SIGNED OVER, a hash does not invert,
+    /// and so evidence could be built in-process and never recovered from a
+    /// block body (`TxDecodeError::EvidenceNotDecodable`, still true below).
+    /// A carrier that loses a field is worse than no carrier — it looks
+    /// finished. So: the signature comes back byte-for-byte, and no prefix of
+    /// the encoding decodes to anything at all.
+    #[test]
+    fn signed_exit_round_trips_and_refuses_every_truncation() {
+        // A signature long enough to have both halves, with a non-uniform
+        // body: a codec that dropped or reordered bytes inside it would still
+        // pass against a constant fill.
+        let signature: Vec<u8> = (0..staking::MLDSA65_SIG_BYTES + 1280)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let tx = PosTransaction::ExitV2(staking::ExitTx {
+            pubkey_hash: [0x5A; 32],
+            epoch: 0x0123_4567_89AB_CDEF,
+            signature: signature.clone(),
+        });
+        let bytes = tx.canonical_bytes();
+        assert_eq!(bytes[0], 0x09, "the signed exit is tag 0x09");
+
+        // 1. Identity — every field, including the signature, whole.
+        let back = PosTransaction::from_canonical_bytes(&bytes)
+            .expect("the signed exit must decode from its own bytes");
+        assert_eq!(back, tx, "decode ∘ encode must be the identity");
+        let PosTransaction::ExitV2(round) = &back else {
+            panic!("tag 0x09 decoded to another variant");
+        };
+        assert_eq!(round.signature, signature, "the signature must survive the wire");
+        // And what the rule will actually hash is unchanged — the property the
+        // evidence encoder cannot offer, stated as a property and not as a
+        // field-by-field re-assertion.
+        let PosTransaction::ExitV2(original) = &tx else { unreachable!() };
+        assert_eq!(round.signing_root(), original.signing_root());
+
+        // 2. Every truncation is refused. Not a sample: the whole sweep, so a
+        //    length prefix that silently accepts a short read cannot hide in
+        //    the one offset nobody tried.
+        for cut in 0..bytes.len() {
+            let short = &bytes[..cut];
+            assert!(
+                PosTransaction::from_canonical_bytes(short).is_err(),
+                "a {cut}-byte prefix of a {}-byte signed exit decoded",
+                bytes.len(),
+            );
+        }
+
+        // 3. And one byte too many is `TrailingBytes`, not a silent accept:
+        //    two encodings decoding to one transaction is exactly what breaks
+        //    the injectivity `body_root` depends on.
+        let mut long = bytes.clone();
+        long.push(0x00);
+        assert_eq!(
+            PosTransaction::from_canonical_bytes(&long),
+            Err(TxDecodeError::TrailingBytes),
+        );
+
+        // 4. A zero-length signature still round-trips as a STRUCTURE — the
+        //    decoder is not where validity is decided (the transition is), and
+        //    a decoder that refused it would be a second copy of a consensus
+        //    rule, free to drift from `staking::verify_hybrid`'s split point.
+        let empty = PosTransaction::ExitV2(staking::ExitTx {
+            pubkey_hash: [0; 32],
+            epoch: 0,
+            signature: Vec::new(),
+        });
+        assert_eq!(
+            PosTransaction::from_canonical_bytes(&empty.canonical_bytes()),
+            Ok(empty),
+        );
+    }
+
+    /// The whole path, end to end: bytes in a block body → `apply_exit` →
+    /// the two clock writes. This is the claim the task turns on, so it is
+    /// made through the DECODED transaction, never the in-process one.
+    #[test]
+    fn the_signed_exit_wire_arm_reaches_apply_exit() {
+        let (t, g, _chains) = setup(4);
+        let mut st = g.clone();
+        let idx = register_funded_validator(&mut st, 0xAB);
+        while st.epoch < staking::ACTIVATION_DELAY_EPOCHS {
+            st = t.process_epoch(&st).unwrap();
+        }
+        crate::params::rehearsal::with_signed_exit_activation_at(0, || {
+            let rec = st.validator_record(idx).unwrap();
+            // Identity is the COMMITTED convention: SHA3-256 over the pubkey
+            // bytes exactly as registration wrote them (suite-framed, from
+            // `apply_deposit_v2` — the one registration path). A second
+            // convention here would reject a valid exit as `UnknownValidator`.
+            let exit = exit_tx_for(&rec, st.epoch);
+            let tx = PosTransaction::ExitV2(exit);
+
+            // THROUGH THE WIRE. A block body carries opaque bytes; what the
+            // transition applies is what the decoder recovered from them.
+            let wire = tx.canonical_bytes();
+            let decoded = PosTransaction::from_canonical_bytes(&wire)
+                .expect("the block body must yield the transaction back");
+
+            let mut probe = st.clone();
+            let charge = probe
+                .apply_transaction(&decoded, 0, st.next_base_fee(), &ToyVerifier)
+                .expect("a signed exit past its flag day applies from the wire");
+            // Free, on the crank's reasoning: bounded by the roster, since a
+            // record can exit at most once, ever.
+            assert_eq!(charge.gas, 0);
+            assert_eq!(charge.tx_bytes, 0);
+            assert_eq!(charge.base_fee_sat, 0);
+            assert_eq!(charge.priority_fee_sat, 0);
+
+            // The two clock writes `apply_exit` makes, and nothing else.
+            let after = probe.validator_record(idx).unwrap();
+            assert_eq!(after.exit_epoch, probe.epoch + staking::EXIT_DELAY_EPOCHS);
+            assert_eq!(
+                after.withdrawable_epoch,
+                after.exit_epoch + staking::WITHDRAWAL_DELAY_EPOCHS,
+            );
+
+            // A second exit for the same record is the rule's `AlreadyExited`,
+            // relayed — the wire arm adds no second opinion.
+            let again = PosTransaction::ExitV2(exit_tx_for(&rec, probe.epoch));
+            assert_eq!(
+                probe.apply_transaction(&again, 0, st.next_base_fee(), &ToyVerifier),
+                Err(TxReject::Exit(staking::ExitReject::AlreadyExited)),
+            );
+
+            // THE SIGNATURE IS REALLY CHECKED, and it is checked through
+            // `staking::validate_exit` — under a verifier whose Falcon half
+            // refuses, the same bytes are refused, with the rule's own
+            // verdict. Without this the whole signature check could be
+            // deleted and every assertion above would still pass.
+            let mut deaf = st.clone();
+            assert_eq!(
+                deaf.apply_transaction(&decoded, 0, st.next_base_fee(), &HalfDeafVerifier),
+                Err(TxReject::Exit(staking::ExitReject::BadSignature)),
+            );
+            assert_eq!(
+                deaf.validator_record(idx).unwrap().exit_epoch,
+                u64::MAX,
+                "a refused exit must leave the record untouched",
+            );
+
+            // An identity nobody registered is the rule's `UnknownValidator` —
+            // resolved from the committed `pubkey_index`, never from the wire.
+            let stranger = PosTransaction::ExitV2(staking::ExitTx {
+                pubkey_hash: [0x11; 32],
+                epoch: st.epoch,
+                signature: vec![0u8; staking::MLDSA65_SIG_BYTES + 1280],
+            });
+            let mut probe2 = st.clone();
+            assert_eq!(
+                probe2.apply_transaction(&stranger, 0, st.next_base_fee(), &ToyVerifier),
+                Err(TxReject::Exit(staking::ExitReject::UnknownValidator)),
+            );
+        });
+    }
+
+    /// The carrier ships INERT, and the pre-activation agreement between an
+    /// old binary and this one is stated as an assertion rather than a claim.
+    ///
+    /// Below the flag day this build answers tag 0x09 with
+    /// `StakingNotActive`; a binary without the variant answers the same block
+    /// with `UnknownTag(0x09)` at decode. Two roads, one verdict: the block is
+    /// refused by both, so no fork can open before the flag day. The second
+    /// half of that is checked here directly — 0x09 is a tag the FROZEN table
+    /// did not contain, and `UnknownTag` is exactly what an unextended decoder
+    /// returns for it.
+    #[test]
+    fn the_signed_exit_wire_format_ships_inert() {
+        assert_eq!(
+            crate::params::SIGNED_EXIT_ACTIVATION_EPOCH,
+            u64::MAX,
+            "arming a flag day is the founder's decision, not a code change",
+        );
+
+        // No rehearsal guard: this asserts the configuration the fleet ships.
+        let (t, g, _chains) = setup(4);
+        let mut st = g.clone();
+        let idx = register_funded_validator(&mut st, 0xAB);
+        while st.epoch < staking::ACTIVATION_DELAY_EPOCHS {
+            st = t.process_epoch(&st).unwrap();
+        }
+        let rec = st.validator_record(idx).unwrap();
+        let tx = PosTransaction::ExitV2(exit_tx_for(&rec, st.epoch));
+        let price = st.next_base_fee();
+        assert_eq!(
+            st.apply_transaction(&tx, 0, price, &ToyVerifier),
+            Err(TxReject::StakingNotActive),
+            "the signed exit must be refused at every epoch this binary can reach",
+        );
+        assert_eq!(st.validator_record(idx).unwrap().exit_epoch, u64::MAX);
+
+        // The refusal is the GATE's, not a shape complaint: the same bytes
+        // apply once the flag day is moved onto them, and nothing else changed.
+        crate::params::rehearsal::with_signed_exit_activation_at(st.epoch, || {
+            let mut armed = st.clone();
+            assert!(armed
+                .apply_transaction(&tx, 0, price, &ToyVerifier)
+                .is_ok());
+        });
+
+        // And the round trip is stable in the shipped configuration too: the
+        // bytes a future flag day will accept are the bytes written today.
+        assert_eq!(
+            PosTransaction::from_canonical_bytes(&tx.canonical_bytes()),
+            Ok(tx),
+        );
+    }
+
     /// The shipped constants are INERT — `u64::MAX`, unreachable by any
     /// epoch — and must stay so until the runbook arms them: the successor
     /// formats do not exist on the wire yet, so nothing may activate them.
@@ -6573,6 +6973,13 @@ mod tests {
         let rec = st.validator_record(0).unwrap();
         let exit = exit_tx_for(&rec, st.epoch);
         assert_eq!(st.apply_exit(&exit, &accept_all_keys()), Err(TxReject::StakingNotActive));
+        // And the WIRE carrier that reaches that seam (tag 0x09) is refused by
+        // the SAME gate, from the same bytes a block body would hold: the
+        // format now exists, and shipping it inert is the whole point.
+        assert_eq!(
+            st.apply_transaction(&PosTransaction::ExitV2(exit), 0, price, &ToyVerifier),
+            Err(TxReject::StakingNotActive)
+        );
     }
 
     // ── Funded deposits (tag 0x07) ──────────────────────────────────────────
@@ -8822,6 +9229,11 @@ mod tests {
                 tip_millisat_per_gas: 0,
             },
             PosTransaction::Withdraw { validator: 1 },
+            PosTransaction::ExitV2(staking::ExitTx {
+                pubkey_hash: [0xE0; 32],
+                epoch: 7,
+                signature: vec![0xE1; staking::MLDSA65_SIG_BYTES + 1280],
+            }),
         ];
 
         // A name per variant, so a failure says WHICH two formats collided.
@@ -8835,6 +9247,7 @@ mod tests {
                 PosTransaction::TransferV2 { .. } => "TransferV2",
                 PosTransaction::DepositV2 { .. } => "DepositV2",
                 PosTransaction::Withdraw { .. } => "Withdraw",
+                PosTransaction::ExitV2(_) => "ExitV2",
             }
         }
 
@@ -8872,7 +9285,7 @@ mod tests {
         // wire-format change and must fail here first.
         assert_eq!(
             claimed.keys().copied().collect::<Vec<u8>>(),
-            vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08],
+            vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09],
         );
     }
 
@@ -9736,6 +10149,17 @@ mod tests {
             // whose bonded `amount_sat` never left the spendable set.
             PosTransaction::DepositV2 { .. } => {}
             PosTransaction::Exit { .. } => {}
+            // The SIGNED exit (tag 0x09): writes two clocks on a committed
+            // record and moves no value at all — it neither creates nor
+            // destroys a satoshi, and it cannot even reach the payout, which
+            // is `Withdraw`'s job behind its own, strictly later, flag day
+            // (`WITHDRAWAL_ACTIVATION_EPOCH >= SIGNED_EXIT_ACTIVATION_EPOCH`
+            // is a `const assert` in params.rs). Its risk is to LIVENESS, not
+            // to the cap: nothing meters how many validators may exit in one
+            // epoch (see `staking`/`ws` — the churn budget covers delegation
+            // warm-up and cool-down only), so this arm is also where a future
+            // exit-side rate limit would have to be argued.
+            PosTransaction::ExitV2(_) => {}
             // Pays an exited bond's residue into the eUTXO set WITHOUT
             // touching `issued_sat`: the bond's value is treated as already
             // issued (compounding advanced the counter when rewards entered

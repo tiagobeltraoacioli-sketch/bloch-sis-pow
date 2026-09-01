@@ -4328,6 +4328,46 @@ pub(crate) fn admissible(tx: &PosTransaction, wall_epoch: u64) -> Result<(), &'s
             "exits are not accepted: the Exit message is not authenticated, \
              so anyone could retire any validator irreversibly",
         ),
+        // ExitV2 (tag 0x09, the SIGNED exit): admitted from its flag day,
+        // refused before it — wall-clock epoch on this side of the mempool
+        // door, committed epoch on the consensus side, the same split argued
+        // at the TransferV2 arm. Load-bearing: without this arm the catch-all
+        // below would ADMIT the format, and pre-flag-day that is mempool
+        // stuffing for a transaction every node must refuse.
+        //
+        // WHAT THIS ARM CANNOT DO, said plainly. It cannot check the
+        // signature. The message names its validator by the HASH of the key
+        // committed at registration, and the key itself lives in committed
+        // state this function deliberately does not read — unlike `DepositV2`,
+        // which carries its own key and so can have its PoP verified here.
+        // What is checkable without state is the shape, and the one shape that
+        // no committed state can ever make applicable is a signature with no
+        // room for both halves: `staking::verify_hybrid` splits at
+        // MLDSA65_SIG_BYTES and refuses anything not longer than that, so such
+        // a message is a guaranteed `BadSignature` at every epoch. Refusing it
+        // here is the same class of check as "a transfer with no inputs" — not
+        // a validity check, a refusal of the impossible. Everything else
+        // reaches the mempool and dies in the proposer's probe.
+        //
+        // No rule here that the consensus arm does not also enforce: the gate
+        // is the same constant, and the length floor is the one
+        // `staking::verify_hybrid` applies inside `validate_exit`.
+        PosTransaction::ExitV2(exit) => {
+            if wall_epoch < bloch_pos_committee::params::SIGNED_EXIT_ACTIVATION_EPOCH {
+                return Err(
+                    "signed exits (tag 0x09) are not active: the format ships behind \
+                     a flag day (SIGNED_EXIT_ACTIVATION_EPOCH) that this chain has \
+                     not reached",
+                );
+            }
+            if exit.signature.len() <= bloch_pos_committee::staking::MLDSA65_SIG_BYTES {
+                return Err(
+                    "signed exit carries no room for a Falcon-1024 half — the hybrid \
+                     signature can never verify, at any epoch",
+                );
+            }
+            Ok(())
+        }
         // Withdraw (tag 0x08): admitted from its flag day, refused before it —
         // wall-clock epoch on this side of the mempool door, committed epoch
         // on the consensus side, the same split argued at the TransferV2 arm.
@@ -4514,6 +4554,49 @@ mod forkchoice_tests {
         // The epoch just below the gate still refuses; the gate itself admits.
         assert!(admissible(&w, u64::MAX - 1).is_err());
         assert!(admissible(&w, u64::MAX).is_ok());
+    }
+
+    /// Signed exits (tag 0x09) ship behind `SIGNED_EXIT_ACTIVATION_EPOCH =
+    /// u64::MAX`: refused at the mempool door until the flag day, and even
+    /// after it a signature with no room for both hybrid halves is refused
+    /// before relay.
+    ///
+    /// The length floor is not a new rule invented at this door — it is the
+    /// one `staking::verify_hybrid` applies inside `validate_exit`, which the
+    /// consensus arm reaches through `apply_exit`. A message below it can
+    /// never apply at any epoch under any committed state, so relaying it is
+    /// pure waste. Everything the door CANNOT decide (does this key hash name
+    /// a validator? is it already exiting? does the signature verify?) needs
+    /// committed state this function deliberately does not read, and reaches
+    /// the mempool to die in the proposer's probe.
+    #[test]
+    fn signed_exits_are_refused_until_the_flag_day() {
+        let good = |sig_len: usize| {
+            PosTransaction::ExitV2(bloch_pos_committee::staking::ExitTx {
+                pubkey_hash: [0x5A; 32],
+                epoch: 0,
+                signature: vec![0xE1; sig_len],
+            })
+        };
+        let hybrid = bloch_pos_committee::staking::MLDSA65_SIG_BYTES + 1280;
+
+        let err = admissible(&good(hybrid), 0).expect_err("inert until the flag day");
+        assert!(err.contains("not active"), "the refusal must say why: {err}");
+        // The epoch just below the gate still refuses; the gate itself admits.
+        assert!(admissible(&good(hybrid), u64::MAX - 1).is_err());
+        assert!(admissible(&good(hybrid), u64::MAX).is_ok());
+
+        // Past the gate, a signature that cannot carry a Falcon half is
+        // refused before relay — same split point as the consensus rule.
+        let stunted = good(bloch_pos_committee::staking::MLDSA65_SIG_BYTES);
+        let err = admissible(&stunted, u64::MAX).expect_err("no room for both halves");
+        assert!(err.contains("Falcon"), "the refusal must say why: {err}");
+
+        // And the legacy, unauthenticated exit stays refused at EVERY epoch —
+        // no flag day reopens it, on either side of the mempool door.
+        let legacy = PosTransaction::Exit { validator: 0 };
+        assert!(admissible(&legacy, 0).is_err());
+        assert!(admissible(&legacy, u64::MAX).is_err());
     }
 
     /// The transfer guard that already existed, pinned so the refactor into a

@@ -360,6 +360,7 @@ mod scan {
                             PosTransaction::TransferV2 { .. } => 0x06,
                             PosTransaction::DepositV2 { .. } => 0x07,
                             PosTransaction::Withdraw { .. } => 0x08,
+                            PosTransaction::ExitV2(_) => 0x09,
                         };
                         assert_eq!(tag, decoded_tag, "wire tag vs decoded variant");
                         *by_tag.entry(tag).or_insert(0) += 1;
@@ -393,6 +394,7 @@ mod scan {
                 0x06 => "TransferV2",
                 0x07 => "DepositV2",
                 0x08 => "Withdraw",
+                0x09 => "ExitV2",
                 _ => "??",
             };
             println!("  tag {tag:#04x} {name:<26} {n}");
