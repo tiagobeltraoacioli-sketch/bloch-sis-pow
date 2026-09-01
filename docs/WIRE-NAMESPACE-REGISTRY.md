@@ -94,9 +94,9 @@ has drifted to ~1008 in the deeper worktrees).
 | Tag | Meaning | Status | Owner | Frozen by |
 | --- | --- | --- | --- | --- |
 | `0x01` | `Transfer` | **Merged**, mainline `transition.rs:744` | consensus | `crates/bloch-pos-committee/tests/committee.rs` |
-| `0x02` | `Deposit` | **Merged**, legacy — decodes, then rejected at transition | consensus | committee tests |
-| `0x03` | `Exit` | **Merged**, legacy — decodes, then rejected | consensus | committee tests |
-| `0x04` | `Delegate` | **Merged**, legacy — decodes, then rejected | consensus | committee tests |
+| `0x02` | `Deposit` | **Merged, and APPLIED — not rejected. See the correction below.** | consensus | committee tests |
+| `0x03` | `Exit` | **Merged, and APPLIED — not rejected.** | consensus | committee tests |
+| `0x04` | `Delegate` | **Merged, and APPLIED — not rejected.** | consensus | committee tests |
 | `0x05` | `SlashingEvidence` | **Merged**, mainline `transition.rs:792`; returns `EvidenceNotDecodable` on the tx path | consensus | committee tests |
 | `0x06` | `TransferV2` (deduplicated witness) | **Merged**, mainline `transition.rs:819` | consensus | committee tests |
 | `0x07` | `DepositV2` | **UNMERGED — CONTESTED, see C-4** | staking | *none yet* |
@@ -105,6 +105,51 @@ has drifted to ~1008 in the deeper worktrees).
 | `0x0A`–`0xFF` | free | — | — | — |
 
 **Next free transaction tag: `0x0A`.** (`0x09` is reserved, not free.)
+
+### CORRECTION, 2026-09-01 — `0x02`/`0x03`/`0x04` are not "rejected"
+
+Earlier revisions of this table described `Deposit`, `Exit` and `Delegate` as
+"legacy — decodes, then rejected at transition". **That is wrong, and the error
+matters, because it describes a consensus-critical path as closed when it is
+open.** Verified by reading `apply_transaction`
+(`crates/bloch-pos-committee/src/transition.rs:2007-2145`):
+
+- `Deposit` (`:2040`), `Exit` (`:2092`) and `Delegate` (`:2113`) each fall
+  through to a full apply arm and **return success**.
+- **The only activation gate in the entire function is `TransferV2`'s**
+  (`:2036-2038`, `self.epoch < TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH →
+  FormatNotActive`). There is no equivalent guard on any staking arm.
+- `SlashingEvidence` is the only staking-family tag that *is* refused here
+  (`:2142`, `MisroutedEvidence`) — and only because it is routed elsewhere.
+
+What is actually true: **the mempool declines to relay these, as node-local
+policy, and that is not a consensus rule.** A block that already carries a
+deposit still applies it on every node.
+
+`Deposit`'s apply arm (`:2040-2085`) inserts a `ValidatorRecord` with
+`staked_sat: *amount_sat`, **spends no eUTXO input and verifies no signature.**
+The checks are only: key not already registered, `amount_sat >=
+MIN_DEPOSIT_SAT`, and `amount_sat <= max(1% of active stake, MIN_DEPOSIT_SAT)`.
+With `MIN_DEPOSIT_SAT = 25_000 * SAT_PER_BLOCH` (`staking.rs:97`), that is
+**25,000 BLCH of bonded stake conjured per accepted message**, and the cap grows
+as the stake it admits grows.
+
+The transition module names this itself, at `transition.rs:1252-1262` — it is
+disclosed, not hidden:
+
+> **Bonding is not funded from this set.** `PosTransaction::Deposit` and
+> `Delegate` name an `amount_sat` and spend no output; `Exit` and the
+> withdrawal delay return no output either. So the chain holds two pools — this
+> one and the registry's bonded stake — and coins do not travel between them: a
+> deposit creates bonded stake without destroying spendable coins…
+
+**Registry consequence, and the reason this correction lives here:** a tag whose
+consensus behaviour is "applied" must never be recorded as "rejected". This
+table is what the next agent reads before deciding whether a tag is safe to
+reuse, renumber, or leave alone. It is not a wire collision, but it is the same
+failure mode — the register disagreeing with the code — and it is why every
+`Status` cell in this file should be read as a claim about *consensus*, never
+about mempool policy. Full analysis on the correctness-debt page.
 
 Mainline today decodes `0x01`–`0x06` and returns `UnknownTag(other)` for
 everything else. Tags `0x07`/`0x08` exist only in worktrees.
