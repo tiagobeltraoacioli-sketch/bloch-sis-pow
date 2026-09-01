@@ -356,6 +356,21 @@ and only if the merge keeps both arms.
 `agent-a9c4ba491715890b9` and `agent-a1d31358b1c038bdf` must renumber `Withdraw`
 to `0x08` before merging. Owner: staking.
 
+**OPEN — needs founder ratification, 2026-09-01.** The renumbering has already
+been *applied* in the merge that produced `wt-withdraw-land`, whose own
+`tools/staking-cli/INTEGRATION-NOTES.md:1-30` records that `DepositV2` and
+`Withdraw` were independently assigned `0x07` by two streams, that the merge
+moved `Withdraw` to `0x08`, and that **"the owners must ratify (or reverse) this
+number explicitly."**
+
+The PMO does not consider a number ratified because a merge picked one. `0x08`
+is the PMO's standing allocation and the majority of the work already encodes
+it — but `Withdraw` is a **spend path an exchange will integrate against**, so
+the number must be confirmed deliberately rather than inherited from a merge
+conflict resolution. **One founder decision: confirm `Withdraw = 0x08`, or
+reverse it. Until then, treat `0x07`/`0x08` as provisional in any partner-facing
+document.**
+
 ### C-5 — Transaction tag `0x09` `ExitV2` is allocated but absent
 Not a collision; a bookkeeping hazard. `0x09` appears in the founder's allocation
 list, but grep across all 195 worktrees finds **no `ExitV2` identifier and no
