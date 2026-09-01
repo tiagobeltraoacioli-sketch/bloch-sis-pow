@@ -24,19 +24,15 @@ sha3 = { version = "0.10", default-features = false }
 [dev-dependencies]
 hex = "0.4"
 
-# The suite walks 8,192-step SHAKE-256 reveal chains and 256-deep SMTs, so an
-# unoptimized Keccak permutation puts tens of seconds on `cargo test`. Optimize
-# only the hash dependencies under dev; this crate's own code keeps full debug.
+# The 8,192-step SHAKE-256 reveal chains and 256-deep SMTs in this suite are
+# dominated by the Keccak permutation. The `[profile.dev.package.sha3]` and
+# `[profile.dev.package.keccak]` overrides that used to sit HERE were inert:
+# cargo honours `[profile.*]` only in the workspace root manifest, and this
+# crate stopped being its own root. They now live in the root Cargo.toml.
 #
-# INERT AS WRITTEN. This was valid while the crate was its own workspace root.
-# It is now a member of the root workspace, and cargo ignores `[profile.*]` in
-# anything but the workspace root — it warns and moves on. Kept, unchanged and
-# labelled, rather than moved: relocating it to the root Cargo.toml changes the
-# dev profile for every crate in the tree, which is a build-configuration
-# decision, not a documentation fix. `cargo test -p bloch-pos-committee` is
-# correspondingly slower than it was.
-[profile.dev.package.sha3]
-opt-level = 3
-
-[profile.dev.package.keccak]
-opt-level = 3
+# The note they carried claimed moving them "changes the dev profile for every
+# crate in the tree". That was wrong, and measurement settled it: a
+# `profile.dev.package.<dep>` override changes how those two DEPENDENCIES are
+# compiled and nothing else — this crate's own code keeps full debug, and
+# `opt-level` does not touch `overflow-checks`, which is the one profile
+# setting the root manifest identifies as consensus-critical.

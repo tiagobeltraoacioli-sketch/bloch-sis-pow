@@ -58,5 +58,18 @@ overflow-checks = true
 # seeded-RNG support (`with_seeded_rng`) for deterministic ML-DSA-65 / Falcon
 # keygen, enabling Wallet::from_seed(). Vendoring makes the workspace
 # self-contained and reproducible.
+# Keccak is the hot path of every state-root and reveal-chain test in the
+# workspace: unoptimized, `bloch-pos-committee`'s suite spends minutes inside
+# the permutation alone. Optimize ONLY these two dependencies under dev. This
+# leaves every workspace crate's own code at full debug, and inherits
+# `overflow-checks` from the dev profile untouched — `opt-level` cannot change
+# overflow behaviour, so the consensus guarantee stated above is unaffected.
+# Measured on tests/state_root_carryover_scale.rs: 239.55s -> 33.84s (7.1x).
+[profile.dev.package.sha3]
+opt-level = 3
+
+[profile.dev.package.keccak]
+opt-level = 3
+
 [patch.crates-io]
 pqcrypto-internals = { path = "crates/pqcrypto-internals" }
