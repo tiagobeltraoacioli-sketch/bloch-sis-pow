@@ -1074,9 +1074,31 @@ constante. Além disso:
   erre por um satoshi produz transação recusada, não transação com troco
   errado; (c) aceitar, e comunicar, que delegação financiada continua
   inalcançável até ter carregador.
-- **#8 `SIGNED_EXIT`** — o carregador de wire (tag `0x09`) precisa existir e
-  estar na frota. Antes disso, armar é ruído — e ruído que a página de
-  release vai afirmar como recurso.
+- **#8 `SIGNED_EXIT`** — duas pré-condições, e a segunda é uma DECISÃO, não
+  uma verificação:
+  1. o carregador de wire (tag `0x09`) precisa existir e estar na frota.
+     Antes disso, armar é ruído — e ruído que a página de release vai
+     afirmar como recurso.
+  2. **decidir se pode haver saída sem limite de vazão.** Não existe
+     throttle de saída em lugar nenhum: entrada tem
+     `MAX_ACTIVATIONS_PER_EPOCH = 4`, saída não tem nada (procurado por
+     `max_exits|exit_churn|exits_per_epoch|MAX_EXIT` no crate inteiro:
+     zero ocorrências; os docs de `ws.rs` já registram o fato — "o
+     conjunto auto-vinculado inteiro pode sair numa época"). A assimetria,
+     em números:
+
+     | | ritmo |
+     |---|---|
+     | **esvaziar** | o conjunto inteiro pede saída em **1 época**; deveres param `EXIT_DELAY_EPOCHS` = 32 épocas depois (~8,5 h) |
+     | **repor** | `MAX_ACTIVATIONS_PER_EPOCH` = 4 ⇒ ≥ **16 épocas** de admissões para 64 validadores, mais `ACTIVATION_DELAY_EPOCHS` = 8 |
+
+     Esvazia em uma época, repõe em dezesseis — e todo vínculo drenado
+     fica preso por `WITHDRAWAL_DELAY_EPOCHS` = 2.048 de qualquer forma.
+     Isso é parâmetro de **vivacidade**, então é decisão do fundador:
+     ou se arma aceitando a assimetria, ou o limite de vazão de saída
+     entra ANTES do armamento (e aí é consenso, com dia de bandeira
+     próprio). O que não pode é armar sem que alguém tenha decidido —
+     é por isso que está escrito aqui e na doc da própria constante.
 - **#9 `WITHDRAWAL`** — o mais caro, e o único cuja pré-condição **não é de
   código**:
   1. `FUNDED_STAKING` e `SIGNED_EXIT` armados antes (o compilador garante);
