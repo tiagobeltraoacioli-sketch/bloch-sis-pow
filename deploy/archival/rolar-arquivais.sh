@@ -298,6 +298,12 @@ f_rolar() {
   local p; p=$(porta_de "$a"); : "${p:=16400}"
   local unit=/etc/systemd/system/bloch-archival.service
   local velho; velho=$(G "$a" "grep -o '/home/ubuntu/g4/bloch-pos-[a-z0-9.-]*' $unit | head -1")
+  if [ "$velho" = "$BIN_REMOTO" ]; then
+    echo "RECUSO: $a JA aponta para $BIN_REMOTO. Um segundo 'rolar' aqui nao e" >&2
+    echo "  idempotente: ele fotografaria a store ATUAL (que pode estar bifurcada)" >&2
+    echo "  por cima do snapshot bom. Use 'provar $a', ou 'reverter $a'." >&2
+    return 3
+  fi
   diga "== rolar $a : $velho -> $BIN_REMOTO =="
   [ "$EXECUTAR" = 1 ] || diga "   (ENSAIO — nada sera alterado; exporte EXECUTAR=1 para valer)"
 
@@ -337,9 +343,20 @@ f_rolar() {
   # nao carregam memoria de voto (num validador isso seria assinatura dupla).
   diga "-- 3. parando o no e fotografando a store"
   E "$a" "sudo systemctl stop bloch-archival"
-  E "$a" "rm -rf /home/ubuntu/g4/archival.preroll && mkdir -p /home/ubuntu/g4/archival.preroll && \
+  # `test ! -e` e nao `rm -rf`: o snapshot so vale porque foi tirado ANTES do
+  # roll — uma bifurcacao nasce depois. Refazer a foto num segundo roll
+  # gravaria a store JA BIFURCADA por cima da unica copia canonica e apagaria
+  # o caminho de volta. O primeiro snapshot fica; se sobrou um de um roll
+  # anterior, o operador decide o que fazer com ele, nao o script.
+  E "$a" "test ! -e /home/ubuntu/g4/archival.preroll || { echo 'JA EXISTE archival.preroll — nao vou sobrescrever o snapshot bom'; exit 9; }; \
+          mkdir -p /home/ubuntu/g4/archival.preroll && \
           cp -a /home/ubuntu/g4/archival/blocks.log /home/ubuntu/g4/archival/meta.bin \
-                /home/ubuntu/g4/archival/ws_latest.bin /home/ubuntu/g4/archival.preroll/"
+                /home/ubuntu/g4/archival/ws_latest.bin /home/ubuntu/g4/archival.preroll/" || {
+    echo "ABORTA: nao consegui fotografar a store de $a com seguranca." >&2
+    echo "  O no esta PARADO e FORA do quorum publico. Para desfazer:" >&2
+    echo "    ssh ubuntu@$a 'sudo systemctl start bloch-archival && sudo systemctl start bloch-rpc-8080'" >&2
+    return 1
+  }
 
   # -- 4. trocar SO o token do binario na unit. Um dos dois arquivais tem
   # ExecStart de uma linha e o outro de varias com barra invertida; mexer so no
