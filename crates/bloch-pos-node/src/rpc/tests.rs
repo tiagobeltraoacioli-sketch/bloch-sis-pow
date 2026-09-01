@@ -446,7 +446,20 @@ fn getutxos_lists_the_outputs_and_reports_truncation() {
 
 #[test]
 fn getmempoolinfo_reports_size_capacity_and_the_next_price() {
-    let v = mempool_info_json(7, 4_096, 1_750, 1_000, 12, 34);
+    let v = mempool_info_json(
+        7,
+        4_096,
+        1_750,
+        1_000,
+        12,
+        34,
+        MempoolPolicy {
+            floor_tip: Some(9),
+            per_sender_max: 256,
+            evicted_by_price: 5,
+            refused_by_sender_cap: 6,
+        },
+    );
     assert_eq!(v.get("size").unwrap().as_u64(), Some(7));
     assert_eq!(v.get("max").unwrap().as_u64(), Some(4_096));
     assert_eq!(v.get("bytes").unwrap().as_u64(), Some(1_750));
@@ -457,6 +470,62 @@ fn getmempoolinfo_reports_size_capacity_and_the_next_price() {
     // nada real.
     assert_eq!(v.get("barred").unwrap().as_u64(), Some(12));
     assert_eq!(v.get("barred_hits").unwrap().as_u64(), Some(34));
+    // The admission policy, from outside. `floor_tip` is a millisat-per-gas
+    // `u128` and therefore a decimal STRING (R3), not a number: this is the
+    // one field an integrator reads to answer "what do I have to pay", and a
+    // JSON double would silently round it above 2^53.
+    assert_eq!(
+        v.get("floor_tip_millisat_per_gas").unwrap().as_str(),
+        Some("9")
+    );
+    assert_eq!(v.get("per_sender_max").unwrap().as_u64(), Some(256));
+    assert_eq!(v.get("evicted_by_price").unwrap().as_u64(), Some(5));
+    assert_eq!(v.get("refused_by_sender_cap").unwrap().as_u64(), Some(6));
+}
+
+/// No floor is `null`, and it must not be reported as zero.
+///
+/// Zero is a real floor — it is what a pool full of zero-tip traffic offers,
+/// and an integrator must bid strictly above it. "There is nothing to beat"
+/// is a different fact, and collapsing the two would tell a client with a
+/// half-empty mempool that it needs to outbid something.
+#[test]
+fn no_floor_is_null_and_not_zero() {
+    let v = mempool_info_json(
+        1,
+        4_096,
+        10,
+        1_000,
+        0,
+        0,
+        MempoolPolicy {
+            floor_tip: None,
+            per_sender_max: 256,
+            evicted_by_price: 0,
+            refused_by_sender_cap: 0,
+        },
+    );
+    assert_eq!(v.get("floor_tip_millisat_per_gas"), Some(&Json::Null));
+
+    let zero = mempool_info_json(
+        4_096,
+        4_096,
+        10,
+        1_000,
+        0,
+        0,
+        MempoolPolicy {
+            floor_tip: Some(0),
+            per_sender_max: 256,
+            evicted_by_price: 0,
+            refused_by_sender_cap: 0,
+        },
+    );
+    assert_eq!(
+        zero.get("floor_tip_millisat_per_gas").unwrap().as_str(),
+        Some("0"),
+        "a floor of zero is a floor, not an absence"
+    );
 }
 
 #[test]

@@ -83,6 +83,7 @@ use bloch_pos_committee::{committees, derive, epoch_of, schedule};
 
 use crate::genesis::{Manifest, GENESIS_MIX};
 use crate::keys::{HybridVerifier, Keystore, ProbeVerifier};
+use crate::mempool::{Mempool, Refused};
 use crate::net::{self, NetEvent, Origin, Verdict};
 use crate::rpc::{self, Admitted, Finality, Json, RpcCall, RpcError, RpcRequest, RpcResult};
 use crate::store::Store;
@@ -156,10 +157,13 @@ fn now_ms() -> u64 {
 
 const NO_TXS: [PosTransaction; 0] = [];
 
-/// Ceiling on mempool entries. Not a policy — a bound, so an unauthenticated
-/// devnet transport cannot turn into unbounded memory. Real admission control
-/// (fees, per-sender limits, eviction by price) is `gossip.rs` work.
-const MEMPOOL_MAX: usize = 4_096;
+/// Ceiling on mempool entries. Still a memory bound and still not a policy —
+/// but what happens AT the bound is now a policy, and it lives in
+/// [`crate::mempool`]: eviction by price, and a per-sender quota. The comment
+/// that used to stand here deferred all three of those to a `gossip.rs` that
+/// was never written; the deferral is over, and the one thing that did NOT
+/// move is the number.
+const MEMPOOL_MAX: usize = crate::mempool::MEMPOOL_MAX;
 
 /// How long a transaction the proposer's drop loop refused stays barred from
 /// re-admission, in slots. 128 slots is four epochs (~64 min at 30 s slots).
@@ -191,6 +195,17 @@ const REJECTION_MAX: usize = 4_096;
 /// Transactions a proposal will carry at most, independent of the consensus
 /// byte cap it is also checked against.
 const MAX_TXS_PER_BLOCK: usize = 256;
+
+/// The per-sender mempool quota is exactly one block's worth of transactions,
+/// and this is where that equality is enforced rather than merely described.
+///
+/// [`crate::mempool::PER_SENDER_MAX`] documents its value as "one sender may
+/// hold at most one full block's worth of the queue". That sentence is only
+/// true while the two numbers agree, and they live in different files. Lower
+/// the quota below the block cap and the founder's consolidation sweep is
+/// throttled below a limit that already binds it; raise it and the sentence
+/// in the other file quietly becomes false. Either way the build stops here.
+const _: () = assert!(crate::mempool::PER_SENDER_MAX == MAX_TXS_PER_BLOCK);
 
 /// How many recently-applied canonical post-states are retained so a reorg
 /// can start from the fork point instead of from genesis.
@@ -547,12 +562,25 @@ struct Engine {
     /// Transactions waiting for a block, keyed by canonical bytes so a
     /// duplicate gossip collapses instead of being included twice.
     ///
-    /// Devnet mempool, and the limitations are the point: no fee ordering (it
-    /// is insertion-ordered), no per-sender limit, no eviction beyond
-    /// `MEMPOOL_MAX`, and admission checks only that the bytes decode. A
-    /// public network needs all four; `gossip.rs` in the pure crate is where
-    /// that belongs and it is still not wired.
-    mempool: BTreeMap<Vec<u8>, PosTransaction>,
+    /// The doc that stood here listed four gaps — "no fee ordering (it is
+    /// insertion-ordered), no per-sender limit, no eviction beyond
+    /// `MEMPOOL_MAX`, and admission checks only that the bytes decode" — and
+    /// deferred all four to a `gossip.rs` that was never written. Three of
+    /// them are now closed in [`crate::mempool`] (ordering by tip, a
+    /// per-sender quota, eviction by price at the bound) and the fourth was
+    /// closed earlier by [`admissible`]. **One of the four was also simply
+    /// wrong, and it took a test to find out**: this was never
+    /// insertion-ordered. It was a `BTreeMap` keyed by canonical bytes, so
+    /// the proposer packed in lexicographic order over a hash-like prefix —
+    /// grindable by an attacker, uninfluenceable by an honest wallet.
+    /// `mempool_flood_characterisation` measured all of it before anything
+    /// changed.
+    ///
+    /// What is still NOT here, and cannot be: admission never resolves an
+    /// input against committed state, so nothing in this pool has been
+    /// checked for existence, ownership or conservation. See the module doc
+    /// on [`crate::mempool`] for the vectors that leaves open by name.
+    mempool: Mempool,
     /// Transactions the proposer's drop loop refused, keyed exactly like
     /// [`Self::mempool`] and mapping to `(slot the bar lifts at, times it has
     /// barred a re-offer)`.
@@ -646,8 +674,26 @@ struct ForkChoiceInputs {
 /// operator ends up growing the mempool to fix a bad signature.
 #[derive(Debug, PartialEq, Eq)]
 enum Refusal {
-    /// The mempool is full. The transaction was NOT judged invalid.
-    AtCapacity,
+    /// The mempool is full and this transaction did not outbid the cheapest
+    /// thing in it. The transaction was NOT judged invalid, and it was not
+    /// judged at all — it lost an auction.
+    ///
+    /// `floor` is the tip it would have had to strictly exceed, when there is
+    /// a priced entry to name. `None` means the pool is full of things that
+    /// carry no price at all (slashing evidence), so there is no number that
+    /// would have helped and the honest answer is "this node is full".
+    ///
+    /// Carrying the floor is the difference between an integrator who can act
+    /// and one who can only retry: "full, try later" is what an exchange asks
+    /// about, and "full, bid above 7" is an answer.
+    AtCapacity { floor: Option<u128> },
+    /// This sender already holds [`crate::mempool::PER_SENDER_MAX`] entries.
+    ///
+    /// Deliberately NOT folded into `AtCapacity`: the pool may have plenty of
+    /// room, and the advice is completely different. A sender at its quota
+    /// gets in by waiting for its own transactions to confirm — bidding
+    /// higher does nothing, and telling it otherwise would sell a retry loop.
+    SenderQuota { held: usize },
     /// `admissible` refused it on its merits. Retrying is pointless.
     Invalid(&'static str),
     /// This node's own proposer already tried to build a block with it and the
@@ -665,7 +711,10 @@ impl Refusal {
     /// ACT on the difference must match the variant, not read this string.
     fn reason(&self) -> &'static str {
         match self {
-            Refusal::AtCapacity => "mempool is at capacity",
+            Refusal::AtCapacity { .. } => "mempool is at capacity",
+            Refusal::SenderQuota { .. } => {
+                "this sender already holds the maximum number of pending transactions"
+            }
             Refusal::Invalid(why) => why,
             Refusal::PreviouslyRefused { .. } => {
                 "this node's proposer already had the transition refuse this transaction"
@@ -674,6 +723,116 @@ impl Refusal {
     }
 }
 
+
+/// Reorder a selection so that a transaction spending an output created by
+/// another transaction IN THE SAME SELECTION comes after it.
+///
+/// # Why this exists at all, and why it arrived with the price ordering
+///
+/// The transition applies a body in order. A transfer that spends the output
+/// of another transfer in the same block is applicable only if its parent
+/// went first; the other way round the transition raises `Transfer(i, _)`,
+/// the proposer's drop loop drops exactly that transaction — and **bars it
+/// for [`REJECTION_TTL_SLOTS`]**. So a mis-ordered chained spend does not
+/// merely miss a block: it is barred from this node for 128 slots for the
+/// crime of being packed in the wrong order by this node.
+///
+/// Under the byte ordering this replaced, whether a parent preceded its child
+/// was a coin flip on a hash prefix, so the harm existed but was random.
+/// Ordering by price makes it **systematic and adversarial-free**: paying the
+/// child more than the parent is the entire point of child-pays-for-parent,
+/// it is what a wallet does when a first transfer is stuck, and it puts the
+/// child above its parent every single time. Shipping the price ladder
+/// without this pass would take the most common reason to bid high and turn
+/// it into a reliable way to get barred. That is why the two land together.
+///
+/// # The order it produces
+///
+/// Kahn's algorithm, always taking the READY transaction that stood earliest
+/// in the input. The input is price-descending, so "earliest ready" means
+/// "highest-paying transaction whose parents have all been placed": greedy
+/// price order subject to the dependency constraint, and fully deterministic
+/// — the tie-break is a position in a totally-ordered vector, never a hash
+/// map's iteration order.
+///
+/// A cycle is impossible — a txid is a hash of the transaction's contents
+/// including its inputs, so a cycle would be a hash cycle — but a `while`
+/// loop that assumes so would hang a proposer if it were ever wrong. Anything
+/// left unplaced is appended in input order instead, which is exactly the
+/// behaviour before this pass existed.
+///
+/// # It changes no block's validity
+///
+/// It permutes what THIS node proposes. A block's validity is decided by
+/// `Transition::apply_block` over the body as received; nothing here is
+/// consulted when judging someone else's block, and this function is not
+/// reachable from the consensus crate. A node without this pass and a node
+/// with it accept the same blocks — the one without it merely proposes worse
+/// ones and bars its own users more often.
+fn parents_first(selected: Vec<PosTransaction>) -> Vec<PosTransaction> {
+    if selected.len() < 2 {
+        return selected;
+    }
+    // Which position creates which txid. `or_insert` keeps the FIRST — the
+    // better-paid one, since the input is price-descending — in the
+    // degenerate case where two entries with different canonical bytes share
+    // a txid (same spend, differently encoded witnesses). Only one of those
+    // can ever apply anyway.
+    let mut producer: BTreeMap<[u8; 32], usize> = BTreeMap::new();
+    for (i, tx) in selected.iter().enumerate() {
+        if matches!(
+            tx,
+            PosTransaction::Transfer { .. } | PosTransaction::TransferV2 { .. }
+        ) {
+            producer.entry(tx.txid()).or_insert(i);
+        }
+    }
+    let n = selected.len();
+    let mut needs = vec![0usize; n];
+    let mut blocked_by: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (i, tx) in selected.iter().enumerate() {
+        let Some(outpoints) = Engine::spent_outpoints(tx) else {
+            continue;
+        };
+        // Distinct parents: a transaction spending three outputs of the same
+        // parent must wait for it once, not three times, or `needs` never
+        // reaches zero and the transaction is silently pushed to the cycle
+        // fallback.
+        let parents: BTreeSet<usize> = outpoints
+            .iter()
+            .filter_map(|(txid, _)| producer.get(txid).copied())
+            .filter(|p| *p != i)
+            .collect();
+        needs[i] = parents.len();
+        for p in parents {
+            blocked_by[p].push(i);
+        }
+    }
+    let mut ready: BTreeSet<usize> = (0..n).filter(|i| needs[*i] == 0).collect();
+    let mut order: Vec<usize> = Vec::with_capacity(n);
+    while let Some(&i) = ready.iter().next() {
+        ready.remove(&i);
+        order.push(i);
+        for &j in &blocked_by[i] {
+            needs[j] -= 1;
+            if needs[j] == 0 {
+                ready.insert(j);
+            }
+        }
+    }
+    if order.len() < n {
+        // Unreachable unless txids cycle. Append the rest in input order:
+        // that is precisely what this function did before it existed, so the
+        // fallback is "no worse than yesterday" rather than a panic.
+        let placed: BTreeSet<usize> = order.iter().copied().collect();
+        order.extend((0..n).filter(|i| !placed.contains(i)));
+    }
+    let mut slots: Vec<Option<PosTransaction>> = selected.into_iter().map(Some).collect();
+    order
+        .into_iter()
+        .filter_map(|i| slots[i].take())
+        .collect()
+}
 
 /// Which transaction in the body the transition is accusing, if it says.
 ///
@@ -1611,7 +1770,7 @@ impl Engine {
         let mut evict: Vec<Vec<u8>> = Vec::new();
         let mut suspect: Vec<Vec<u8>> = Vec::new();
         let mut cleared: Vec<Vec<u8>> = Vec::new();
-        for (key, tx) in &self.mempool {
+        for (key, tx) in self.mempool.iter() {
             // Evidence goes stale differently from a transfer: not by
             // missing outputs but by its offender being ejected (someone
             // else's evidence landed first) or by its exact pair being
@@ -1764,8 +1923,33 @@ impl Engine {
             self.note_bar(&key, until_slot);
             return Err(Refusal::PreviouslyRefused { until_slot });
         }
-        if self.mempool.len() >= MEMPOOL_MAX {
-            return Err(Refusal::AtCapacity);
+        // Price and quota, BEFORE the signature checks.
+        //
+        // This is a pure question — it mutates nothing — and it is asked here
+        // rather than after `admissible` for one measured reason: a hybrid
+        // verification costs ~145 µs of lattice arithmetic, and deriving a
+        // price and a sender bucket costs a SHA3 over each witness key. A
+        // flooder who cannot get in should pay this node microseconds, not
+        // milliseconds. Asking first is what makes the quota a defence
+        // against work rather than only against memory.
+        //
+        // It is deliberately NOT trusted to stand in for the insert below,
+        // which re-decides from scratch; this call only avoids wasted work.
+        //
+        // **Nothing here writes the rejection bar, and nothing here may.**
+        // Both refusals mean "not now": a transaction that lost an auction
+        // must be free to come straight back when the auction changes, and a
+        // sender at its quota gets in the moment one of its own transactions
+        // confirms. Barring either would turn a queue position into a
+        // 128-slot sentence.
+        if let Err(why) = self.mempool.check_admission(&tx) {
+            return Err(match why {
+                Refused::AtCapacity { floor } => Refusal::AtCapacity { floor },
+                Refused::SenderQuota { held, .. } => {
+                    self.mempool.note_sender_cap_refusal();
+                    Refusal::SenderQuota { held }
+                }
+            });
         }
         // Refuse the shapes consensus can never apply.
         //
@@ -1819,18 +2003,78 @@ impl Engine {
         }
         let mut frame = vec![net::FRAME_TX];
         frame.extend_from_slice(&key);
-        self.mempool.insert(key, tx);
+        // The insert re-decides, so `len <= MEMPOOL_MAX` holds whatever the
+        // check above concluded. It can displace the cheapest held entry —
+        // and the displaced transaction is NOT barred. It was outbid, not
+        // judged, and this node will take it back the moment it can.
+        let displaced = match self.mempool.insert(key, tx) {
+            Ok(d) => d,
+            // Unreachable while `check_admission` and `insert` see the same
+            // pool, which they do: nothing between them touches it. Handled
+            // rather than unwrapped because "unreachable" arguments about
+            // node-local state are exactly what this repo has been bitten by.
+            Err(Refused::AtCapacity { floor }) => return Err(Refusal::AtCapacity { floor }),
+            Err(Refused::SenderQuota { held, .. }) => {
+                return Err(Refusal::SenderQuota { held })
+            }
+        };
+        if let Some(victim) = displaced {
+            // The one piece of bookkeeping a price eviction owes the rest of
+            // the engine: take the victim out of the suspect set too.
+            //
+            // `mempool_suspect` is the sweep's first strike — "this spends an
+            // outpoint the chain does not have YET" — and the second strike
+            // evicts AND BARS. If a displaced transaction left its strike
+            // behind, coming back later would put it one sweep from a
+            // 128-slot bar it had not earned, and the chained spend the
+            // two-strike rule exists to protect is exactly the traffic most
+            // likely to be sitting at the bottom of the price ladder. An
+            // eviction for price must leave no verdict behind, and a stale
+            // strike is a verdict.
+            self.mempool_suspect.remove(&victim);
+        }
         self.net.broadcast(frame);
         Ok(Admitted::New)
     }
 
     /// Transactions for the block this node is about to propose.
     ///
-    /// Insertion order, bounded by both [`MAX_TXS_PER_BLOCK`] and the
-    /// consensus byte cap. Insertion order is not a fee market: a real
-    /// proposer sorts by what the transaction pays, and doing that here before
-    /// transfers carry a value format would be inventing an ordering over a
-    /// field nobody sets yet.
+    /// Best-paid first, bounded by both [`MAX_TXS_PER_BLOCK`] and the
+    /// consensus byte cap, then reordered so a parent precedes its child.
+    ///
+    /// The doc that stood here said "insertion order is not a fee market: a
+    /// real proposer sorts by what the transaction pays, and doing that here
+    /// before transfers carry a value format would be inventing an ordering
+    /// over a field nobody sets yet." Transfers now carry
+    /// `tip_millisat_per_gas`, the sender sets it, and `fee_market::charge`
+    /// pays the producer out of it — so the field exists, and the ordering is
+    /// no longer invented. See [`crate::mempool::Price`] for why it is the
+    /// RATE and not the total.
+    ///
+    /// # This does not change what is valid, and here is the whole argument
+    ///
+    /// Everything this function decides — WHICH transactions and in WHAT
+    /// order — is an input to a block this node is building. A receiving node
+    /// judges that block with `Transition::apply_block`, which reads the
+    /// header, the body and the committed state, and never reads a mempool.
+    /// It cannot: `bloch-pos-committee` does not depend on `bloch-pos-node`,
+    /// so there is no path from consensus to this type at all. A node running
+    /// this policy and a node running the byte-ordered `BTreeMap` it replaces
+    /// therefore accept exactly the same set of blocks; they differ only in
+    /// which blocks they would PROPOSE, and a proposer has always been free
+    /// to include any subset it likes. `mempool_policy_is_not_block_validity`
+    /// pins it.
+    ///
+    /// # Why the byte cap now skips instead of stopping
+    ///
+    /// The old loop `break`s on the first transaction that would not fit.
+    /// Under byte order that cost an arbitrary tail; under price order it
+    /// would mean one fat, well-paid transaction near the top of the ladder
+    /// ends the block, leaving room a hundred smaller payers would have
+    /// filled. Skipping and continuing is strictly better utilisation and
+    /// changes nothing about validity — the cap is still checked against
+    /// every candidate, and `bytes` only ever grows by what was actually
+    /// taken.
     ///
     /// `epoch` is the epoch of the slot being produced, because the byte cap
     /// is flag-day gated. Packing against the wrong era is not symmetric: the
@@ -1841,18 +2085,18 @@ impl Engine {
         let cap = bloch_pos_committee::fee_market::max_block_tx_bytes(epoch);
         let mut out = Vec::new();
         let mut bytes = 0u64;
-        for (encoded, tx) in self.mempool.iter() {
+        for (encoded, tx) in self.mempool.by_price_desc() {
             if out.len() >= MAX_TXS_PER_BLOCK {
                 break;
             }
             let n = encoded.len() as u64;
             if bytes + n > cap {
-                break;
+                continue;
             }
             bytes += n;
             out.push(tx.clone());
         }
-        out
+        parents_first(out)
     }
 
     /// Apply one block that extends the current head. True on success.
@@ -2638,11 +2882,39 @@ impl Engine {
                 // this, every refusal returned MEMPOOL_FULL with the words
                 // "the transaction was not judged invalid" appended, which
                 // for an invalid transaction was simply false.
-                Err(Refusal::AtCapacity) => Err(RpcError::new(
+                // "Retry later" is still correct here — a full mempool is not
+                // a verdict — but retrying the same bid at the same price is
+                // not what will work, so the floor goes in the message. This
+                // is the number an integrator was previously forced to guess
+                // at from `size` and `max`.
+                Err(Refusal::AtCapacity { floor }) => Err(RpcError::new(
                     rpc::MEMPOOL_FULL,
+                    match floor {
+                        Some(f) => format!(
+                            "mempool is at capacity ({MEMPOOL_MAX} entries) and this \
+                             transaction did not outbid the cheapest one held; retry with a \
+                             tip strictly above {f} millisat per gas — the transaction was \
+                             not judged invalid"
+                        ),
+                        None => format!(
+                            "mempool is at capacity ({MEMPOOL_MAX} entries) and holds \
+                             nothing evictable by price; retry later — the transaction was \
+                             not judged invalid"
+                        ),
+                    },
+                )),
+                // Not MEMPOOL_FULL: the pool may be nearly empty. Bidding
+                // higher does nothing at all, and saying "retry later" without
+                // saying what changes would send an integrator into the same
+                // loop that made the capacity message worth fixing.
+                Err(Refusal::SenderQuota { held }) => Err(RpcError::new(
+                    rpc::TX_REFUSED,
                     format!(
-                        "mempool is at capacity ({MEMPOOL_MAX} entries); retry later — \
-                         the transaction was not judged invalid"
+                        "this sender already holds {held} pending transactions, the \
+                         per-sender maximum. Raising the tip will not help: the quota is \
+                         checked before price, on purpose, so that a cap cannot be bought \
+                         past. Wait for one of your pending transactions to confirm, or \
+                         submit from a different address."
                     ),
                 )),
                 Err(Refusal::PreviouslyRefused { until_slot }) => Err(RpcError::new(
@@ -2666,10 +2938,16 @@ impl Engine {
             RpcRequest::MempoolInfo => Ok(rpc::mempool_info_json(
                 self.mempool.len(),
                 MEMPOOL_MAX,
-                self.mempool.keys().map(Vec::len).sum(),
+                self.mempool.bytes(),
                 self.state.next_base_fee(),
                 self.rejected.len(),
                 self.rejected_hits,
+                rpc::MempoolPolicy {
+                    floor_tip: self.mempool.floor_tip(),
+                    per_sender_max: crate::mempool::PER_SENDER_MAX,
+                    evicted_by_price: self.mempool.evicted_by_price(),
+                    refused_by_sender_cap: self.mempool.refused_by_sender_cap(),
+                },
             )),
         }
     }
@@ -2859,7 +3137,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         att_pool: AttestationPool::new(),
         proposals_seen: BTreeMap::new(),
         wall_slot: 0,
-        mempool: BTreeMap::new(),
+        mempool: Mempool::new(),
         rejected: BTreeMap::new(),
         rejected_hits: 0,
         mempool_suspect: BTreeSet::new(),
@@ -4600,7 +4878,7 @@ mod transfer_v2_end_to_end {
             att_pool: AttestationPool::new(),
             proposals_seen: BTreeMap::new(),
             wall_slot: 0,
-            mempool: BTreeMap::new(),
+            mempool: Mempool::new(),
             rejected: BTreeMap::new(),
         rejected_hits: 0,
         mempool_suspect: BTreeSet::new(),
@@ -4624,6 +4902,36 @@ mod transfer_v2_end_to_end {
     /// of them through a ONE-entry witness table with one real hybrid
     /// signature — the whole economy of the format. Returns the entries so
     /// the engine's genesis can hold the very outputs being swept.
+    /// Fill a node's mempool to exactly `MEMPOOL_MAX`, with one address per
+    /// entry so the per-sender quota is not what stops it.
+    ///
+    /// The entries are structurally-shaped only — they are pushed past
+    /// `on_transaction` on purpose, because a test that wants a FULL mempool
+    /// wants capacity, not 4,096 real hybrid verifications. The tip is 1 and
+    /// not 0 so that a caller can still measure a floor above it if it wants
+    /// to; nothing here depends on that.
+    pub(super) fn fill_to_capacity(node: &mut Engine) {
+        use bloch_pos_committee::transition::TransferInput;
+        for seed in 0..MEMPOOL_MAX as u32 {
+            let mut txid = [0u8; 32];
+            txid[..4].copy_from_slice(&seed.to_be_bytes());
+            let filler = PosTransaction::Transfer {
+                inputs: vec![TransferInput {
+                    txid,
+                    vout: 0,
+                    pubkey: seed.to_be_bytes().to_vec(),
+                    signature: vec![0xCD; 8],
+                }],
+                outputs: vec![TransferOutput { value: 1_000, script_hash: [0xEE; 32] }],
+                tx_bytes: 0,
+                tip_millisat_per_gas: 1,
+            };
+            node.mempool
+                .insert(filler.canonical_bytes(), filler)
+                .expect("distinct addresses, so only capacity can refuse");
+        }
+    }
+
     fn sweep_fixture(n: u32) -> (Vec<EutxoEntry>, PosTransaction) {
         let (pk, sk) = bloch_crypto::crypto::generate_keypair_from_seed(&[42u8; 32])
             .expect("hybrid keypair from a fixed seed");
@@ -4794,8 +5102,8 @@ mod transfer_v2_end_to_end {
         };
         let bad_key = bad.canonical_bytes();
         let good_key = good.canonical_bytes();
-        node.mempool.insert(bad_key.clone(), bad);
-        node.mempool.insert(good_key.clone(), good);
+        node.mempool.insert(bad_key.clone(), bad).expect("an empty pool has room");
+        node.mempool.insert(good_key.clone(), good).expect("an empty pool has room");
         assert_eq!(node.mempool.len(), 2);
 
         // PRIMEIRA varredura: a ruim vira suspeita, ninguem e despejado. O
@@ -4833,7 +5141,7 @@ mod transfer_v2_end_to_end {
         let (entries, good) = sweep_fixture(16);
         let mut node = engine_at_wall_epoch(V2_FLAG_DAY + 1, &entries);
         let key = good.canonical_bytes();
-        node.mempool.insert(key.clone(), good);
+        node.mempool.insert(key.clone(), good).expect("an empty pool has room");
 
         // Marcada a mao, como se uma varredura anterior a tivesse reprovado
         // enquanto a mae ainda nao tinha entrado.
@@ -4865,7 +5173,7 @@ mod transfer_v2_end_to_end {
             withdrawal_credentials: vec![0x79; 32],
             commission_bps: 0,
         };
-        node.mempool.insert(dep.canonical_bytes(), dep);
+        node.mempool.insert(dep.canonical_bytes(), dep).expect("an empty pool has room");
         node.sweep_mempool(30);
         node.sweep_mempool(31);
         assert_eq!(
@@ -5076,11 +5384,14 @@ mod transfer_v2_end_to_end {
         let key = tx.canonical_bytes();
         let slot = node.wall_slot();
         node.reject_transaction(key, slot);
-        // Fill to the cap with anything: the point is which check speaks first.
-        for i in 0..MEMPOOL_MAX as u64 {
-            node.mempool.insert(i.to_le_bytes().to_vec(), tx.clone());
-        }
-        assert!(node.mempool.len() >= MEMPOOL_MAX, "harness: the mempool must be full");
+        // Fill to the cap. Each filler carries a DIFFERENT address, and it
+        // has to: this harness used to insert 4,096 clones of one
+        // transaction, which the pool accepted because nothing counted per
+        // sender. It does now, so one address gets 256 slots and the pool
+        // would sit 15/16 empty — the precondition below would fail and the
+        // test would be measuring nothing.
+        fill_to_capacity(&mut node);
+        assert_eq!(node.mempool.len(), MEMPOOL_MAX, "harness: the mempool must be full");
         assert!(
             matches!(
                 node.on_transaction(tx),
@@ -5154,17 +5465,30 @@ mod transfer_v2_end_to_end {
         // the assertion above could be satisfied by never reporting a full
         // mempool at all.
         let mut full = node;
-        for i in 0..MEMPOOL_MAX {
-            full.mempool.insert(vec![0xEE, (i >> 8) as u8, i as u8], tx.clone());
-        }
+        fill_to_capacity(&mut full);
         let RpcResult::Err(e2) = full.serve_rpc(RpcRequest::SendRawTransaction(tx.clone()))
         else {
             panic!("a full mempool must produce an RPC error");
         };
         assert_eq!(e2.code, rpc::MEMPOOL_FULL, "full is not refused: {e2:?}");
+        // A full mempool SHOULD advise retrying — and now it says what to
+        // retry WITH. The fill above is priced at 1, this transaction bids 0,
+        // so the answer is a number: bid strictly above 1. The assertion is
+        // on the advice being actionable, not on the phrase "retry later",
+        // because naming the floor is the improvement.
         assert!(
-            e2.message.contains("retry later"),
+            e2.message.contains("retry"),
             "a full mempool SHOULD advise retrying: {}",
+            e2.message
+        );
+        assert!(
+            e2.message.contains("strictly above 1"),
+            "and it should say what to retry with, not just 'later': {}",
+            e2.message
+        );
+        assert!(
+            e2.message.contains("not judged invalid"),
+            "a capacity refusal must still disclaim being a verdict: {}",
             e2.message
         );
     }
@@ -5200,6 +5524,20 @@ mod perf_support {
     /// the slot as an argument and read no clock — so the manifest's cadence
     /// is set to something plausible and then not depended upon.
     pub(super) fn proposing_engine() -> (Engine, TestDir) {
+        proposing_engine_funded(&[])
+    }
+
+    /// The same engine, opening with balances someone can actually spend.
+    ///
+    /// `proposing_engine` opens with an empty eUTXO set, which is fine for
+    /// every test that only needs blocks to be produced — but a test about
+    /// TRANSACTION ordering needs transactions that apply, and a transfer
+    /// that applies needs an output to spend. The entries go in through the
+    /// manifest's opening balances, the one supported way to fill them, so
+    /// the state under test is built by the production path.
+    pub(super) fn proposing_engine_funded(
+        opening: &[bloch_pos_committee::state_root::EutxoEntry],
+    ) -> (Engine, TestDir) {
         static DIR_SEQ: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
             "bloch-pos-perf-{}-{}",
@@ -5224,7 +5562,7 @@ mod perf_support {
             cohort: Vec::new(),
             carryover: None,
             allocations: Vec::new(),
-            carryover_entries: Vec::new(),
+            carryover_entries: opening.to_vec(),
         };
         let genesis_id = manifest.genesis_id();
         let state = manifest.genesis_state();
@@ -5260,7 +5598,7 @@ mod perf_support {
             att_pool: AttestationPool::new(),
             proposals_seen: BTreeMap::new(),
             wall_slot: 0,
-            mempool: BTreeMap::new(),
+            mempool: Mempool::new(),
             rejected: BTreeMap::new(),
         rejected_hits: 0,
         mempool_suspect: BTreeSet::new(),
@@ -6550,7 +6888,7 @@ mod duty_view_anchor {
             att_pool: AttestationPool::new(),
             proposals_seen: BTreeMap::new(),
             wall_slot: 0,
-            mempool: BTreeMap::new(),
+            mempool: Mempool::new(),
             rejected: BTreeMap::new(),
         rejected_hits: 0,
         mempool_suspect: BTreeSet::new(),
@@ -7069,57 +7407,113 @@ mod evidence_tests {
     }
 }
 
-/// What the mempool actually does under a flood, MEASURED — the "before"
-/// half of the fee-admission work.
+/// What the mempool does under a flood — the OLD policy and the NEW one, run
+/// side by side in the same test, on the same transactions.
 ///
-/// Every claim in the module doc for [`Engine::mempool`] that this suite
-/// could check, it checks. Two of them were wrong.
+/// # Why the old policy is reproduced here instead of quoted
+///
+/// The "before" numbers in the report for this work were produced by an
+/// earlier version of this module that asserted the behaviour of the
+/// `BTreeMap` mempool while it was still the mempool. Once it was replaced,
+/// that suite could only be a quotation — and a quotation is not a
+/// measurement. So [`old_policy`] reproduces the replaced policy in fifteen
+/// lines, exactly as it stood (`len() >= MEMPOOL_MAX` → refuse;
+/// `BTreeMap::iter()` → selection order), and every test below runs BOTH and
+/// prints BOTH. The contrast is re-measured on every `cargo test` rather than
+/// remembered.
+///
+/// Three claims in the old field doc were checkable. **One of them was
+/// false**: the pool was documented as "insertion-ordered" and was in fact
+/// ordered lexicographically by canonical bytes — a hash-like prefix an
+/// attacker can grind and an honest wallet cannot influence.
 #[cfg(test)]
-mod mempool_flood_characterisation {
+mod mempool_flood_before_and_after {
     use super::transfer_v2_end_to_end::engine_at_wall_epoch;
     use super::*;
     use bloch_pos_committee::transition::{TransferInput, TransferOutput};
 
-    /// A structurally-shaped transfer with a chosen tip. Never submitted
-    /// through `on_transaction` — these go straight into the map, because
-    /// what is being measured is the CAPACITY and ORDERING behaviour, not
-    /// the admission checks in front of it. A flood of 4,096 real hybrid
-    /// signatures would measure PQClean, not the mempool.
-    fn flood_tx(seed: u32, tip: u128) -> PosTransaction {
+    /// The mempool policy this work replaced, in full.
+    ///
+    /// Faithful to the two lines that were the whole of it: `on_transaction`
+    /// refused when `self.mempool.len() >= MEMPOOL_MAX`, and
+    /// `select_transactions` walked `self.mempool.iter()` — a `BTreeMap`
+    /// keyed by canonical bytes. Nothing else about admission has changed
+    /// underneath this, so running it is running yesterday's node.
+    mod old_policy {
+        use super::*;
+
+        pub struct Old {
+            pub entries: BTreeMap<Vec<u8>, PosTransaction>,
+            pub max: usize,
+        }
+
+        impl Old {
+            pub fn new(max: usize) -> Self {
+                Old { entries: BTreeMap::new(), max }
+            }
+
+            /// `Err` is the old `Refusal::AtCapacity`. Note what it does NOT
+            /// do: it never looks at the transaction it is refusing.
+            pub fn insert(&mut self, k: Vec<u8>, tx: PosTransaction) -> Result<(), ()> {
+                if self.entries.len() >= self.max {
+                    return Err(());
+                }
+                self.entries.insert(k, tx);
+                Ok(())
+            }
+
+            pub fn select(&self, limit: usize) -> Vec<&PosTransaction> {
+                self.entries.values().take(limit).collect()
+            }
+        }
+    }
+    use old_policy::Old;
+
+    /// A structurally-shaped transfer with a chosen owner and tip. Inserted
+    /// straight into the pool, never through `on_transaction`: what is being
+    /// measured is capacity, ordering and quota behaviour, and a flood of
+    /// 4,096 real hybrid signatures would measure PQClean instead.
+    fn flood_tx(owner: &[u8], seed: u32, tip: u128) -> PosTransaction {
         let mut txid = [0u8; 32];
         txid[..4].copy_from_slice(&seed.to_be_bytes());
         PosTransaction::Transfer {
             inputs: vec![TransferInput {
                 txid,
                 vout: 0,
-                pubkey: vec![0xAB; 8],
+                pubkey: owner.to_vec(),
                 signature: vec![0xCD; 8],
             }],
-            outputs: vec![TransferOutput {
-                value: 1_000,
-                script_hash: [0xEE; 32],
-            }],
+            outputs: vec![TransferOutput { value: 1_000, script_hash: [0xEE; 32] }],
             tx_bytes: 0,
             tip_millisat_per_gas: tip,
         }
     }
 
-    /// A transfer that will really pass `admissible`: one input, one output,
-    /// one genuine hybrid signature over the spend root, and a tip.
-    fn paying_transfer(seed: u8, tip: u128) -> PosTransaction {
+    /// One flooding identity per seed, so a pool can be filled to capacity
+    /// without the per-sender quota being the thing that stops it. Measuring
+    /// the price rule requires the quota to be out of the way, and vice
+    /// versa; each test puts exactly one of them under load.
+    fn many_senders(n: u32, tip: u128) -> Vec<PosTransaction> {
+        (0..n)
+            .map(|s| flood_tx(&s.to_be_bytes(), s, tip))
+            .collect()
+    }
+
+    /// A transfer that really passes `admissible`: one input, one output, one
+    /// genuine ML-DSA-65 ‖ Falcon-1024 signature over the spend root, and a
+    /// tip. `seed` also fixes the identity, so a caller can put a real signer
+    /// and a flood of `flood_tx`es under the same address.
+    fn paying_transfer(seed: u8, tip: u128) -> (Vec<u8>, PosTransaction) {
         let (pk, sk) = bloch_crypto::crypto::generate_keypair_from_seed(&[seed; 32])
             .expect("hybrid keypair from a fixed seed");
         let mut tx = PosTransaction::Transfer {
             inputs: vec![TransferInput {
                 txid: [seed; 32],
                 vout: 0,
-                pubkey: pk,
+                pubkey: pk.clone(),
                 signature: Vec::new(),
             }],
-            outputs: vec![TransferOutput {
-                value: 1_000,
-                script_hash: [0x22; 32],
-            }],
+            outputs: vec![TransferOutput { value: 1_000, script_hash: [0x22; 32] }],
             tx_bytes: 0,
             tip_millisat_per_gas: tip,
         };
@@ -7128,92 +7522,152 @@ mod mempool_flood_characterisation {
         if let PosTransaction::Transfer { inputs, .. } = &mut tx {
             inputs[0].signature = sig;
         }
-        tx
+        (pk, tx)
     }
 
-    /// MEASUREMENT 1 — a full mempool refuses a paying transaction, and the
-    /// price it offers is not read at all.
-    #[test]
-    fn today_a_flood_of_zero_tip_transactions_locks_out_any_price() {
-        let mut e = engine_at_wall_epoch(0, &[]);
-        for seed in 0..MEMPOOL_MAX as u32 {
-            let tx = flood_tx(seed, 0);
-            e.mempool.insert(tx.canonical_bytes(), tx);
+    fn tip_of(tx: &PosTransaction) -> u128 {
+        match tx {
+            PosTransaction::Transfer { tip_millisat_per_gas, .. }
+            | PosTransaction::TransferV2 { tip_millisat_per_gas, .. } => *tip_millisat_per_gas,
+            _ => u128::MAX,
         }
-        assert_eq!(e.mempool.len(), MEMPOOL_MAX);
+    }
 
-        let rich = paying_transfer(7, u128::MAX);
+    /// **MEASUREMENT 1 — a flood at the floor price versus one paying
+    /// transaction.** This is the question the exchange asked.
+    #[test]
+    fn a_zero_tip_flood_no_longer_locks_out_a_paying_transfer() {
+        let flood = many_senders(MEMPOOL_MAX as u32, 0);
+
+        // ── BEFORE ──────────────────────────────────────────────────────
+        let mut old = Old::new(MEMPOOL_MAX);
+        for tx in &flood {
+            old.insert(tx.canonical_bytes(), tx.clone()).expect("room");
+        }
+        let (_, rich) = paying_transfer(7, u128::MAX);
+        let before = old.insert(rich.canonical_bytes(), rich.clone());
+        eprintln!(
+            "MEASURED before/1: pool {} of {}; a transfer bidding u128::MAX -> {:?}; \
+             the bid was never read",
+            old.entries.len(),
+            MEMPOOL_MAX,
+            before.map(|_| "admitted").map_err(|_| "AtCapacity"),
+        );
+        assert_eq!(before, Err(()), "the old policy refused it unconditionally");
+        assert!(!old.entries.contains_key(&rich.canonical_bytes()));
+
+        // ── AFTER ───────────────────────────────────────────────────────
+        let mut e = engine_at_wall_epoch(0, &[]);
+        for tx in &flood {
+            e.mempool.insert(tx.canonical_bytes(), tx.clone()).expect("room");
+        }
+        assert_eq!(e.mempool.len(), MEMPOOL_MAX, "harness: the pool is full");
+        assert_eq!(e.mempool.floor_tip(), Some(0), "a full pool of zero-tip traffic");
+
         let verdict = e.on_transaction(rich.clone());
-        eprintln!("MEASURED before/1: verdict for a max-tip transfer = {verdict:?}");
-        assert_eq!(verdict, Err(Refusal::AtCapacity));
-        assert_eq!(
+        eprintln!(
+            "MEASURED after/1: pool {} of {}; a transfer bidding u128::MAX -> {:?}; \
+             floor was {:?}, evicted_by_price {}",
             e.mempool.len(),
             MEMPOOL_MAX,
-            "nothing was evicted to make room"
+            verdict,
+            Some(0u128),
+            e.mempool.evicted_by_price(),
         );
-        assert!(
-            !e.mempool.contains_key(&rich.canonical_bytes()),
-            "the paying transfer did not get in"
-        );
-        // And the bar is NOT written: capacity is not a refusal on merits.
-        assert!(e.rejected.is_empty());
+        assert_eq!(verdict, Ok(Admitted::New), "the paying transfer gets in");
+        assert!(e.mempool.contains_key(&rich.canonical_bytes()));
+        assert_eq!(e.mempool.len(), MEMPOOL_MAX, "the memory bound still holds");
+        assert_eq!(e.mempool.evicted_by_price(), 1, "exactly one zero-tip entry left");
+        // And the eviction wrote no verdict: the displaced transaction is
+        // free to come back the moment the auction changes.
+        assert!(e.rejected.is_empty(), "an eviction for price is not a refusal");
     }
 
-    /// MEASUREMENT 2 — the order the proposer packs in. The field doc says
-    /// "insertion-ordered". It is not: `mempool` is a `BTreeMap` keyed by
-    /// canonical bytes, so the order is LEXICOGRAPHIC BY CIPHERTEXT-LIKE
-    /// BYTES — grindable by an attacker and unrelated to what anyone pays.
+    /// **MEASUREMENT 1b — matching the floor still does not get in.** The
+    /// other half of the same rule, and the half that keeps the fix from
+    /// being a new denial of service: if equality displaced, a flood arriving
+    /// at exactly the floor would make the node churn its pool forever, one
+    /// eviction per message, with the rejection bar unavailable because a
+    /// price loss is not a refusal.
     #[test]
-    fn today_selection_order_is_lexicographic_by_canonical_bytes() {
-        let e = {
-            let mut e = engine_at_wall_epoch(0, &[]);
-            // Inserted in DESCENDING price, so "insertion order" and
-            // "price order" would agree and both differ from byte order.
-            for (seed, tip) in [(9u32, 900u128), (5, 500), (1, 100), (7, 700)] {
-                let tx = flood_tx(seed, tip);
-                e.mempool.insert(tx.canonical_bytes(), tx);
-            }
-            e
-        };
-        let selected = e.select_transactions(0);
-        let tips: Vec<u128> = selected
-            .iter()
-            .map(|t| match t {
-                PosTransaction::Transfer { tip_millisat_per_gas, .. } => *tip_millisat_per_gas,
-                _ => unreachable!(),
-            })
-            .collect();
-        eprintln!("MEASURED before/2: proposer packs tips in this order = {tips:?}");
-
-        let mut by_bytes: Vec<Vec<u8>> =
-            selected.iter().map(|t| t.canonical_bytes()).collect();
-        let as_selected = by_bytes.clone();
-        by_bytes.sort();
-        assert_eq!(
-            as_selected, by_bytes,
-            "selection is ascending canonical bytes"
-        );
-        assert_ne!(
-            tips,
-            vec![900u128, 700, 500, 100],
-            "selection is NOT price-descending"
-        );
-    }
-
-    /// MEASUREMENT 3 — one key can own the entire mempool. There is no
-    /// per-sender accounting of any kind, so a single hybrid keypair,
-    /// signing once per transaction, fills every slot.
-    #[test]
-    fn today_one_sender_can_hold_every_slot() {
+    fn matching_the_floor_does_not_churn_the_pool() {
         let mut e = engine_at_wall_epoch(0, &[]);
-        // The flood entries all carry the SAME witness pubkey (`0xAB`×8),
-        // which is the only sender-like value admission can see.
-        for seed in 0..MEMPOOL_MAX as u32 {
-            let tx = flood_tx(seed, 0);
-            e.mempool.insert(tx.canonical_bytes(), tx);
+        for tx in many_senders(MEMPOOL_MAX as u32, 5) {
+            e.mempool.insert(tx.canonical_bytes(), tx).expect("room");
         }
-        let distinct_senders: BTreeSet<Vec<u8>> = e
-            .mempool
+        let (_, equal) = paying_transfer(9, 5);
+        assert_eq!(
+            e.on_transaction(equal),
+            Err(Refusal::AtCapacity { floor: Some(5) }),
+            "equal is not strictly greater, and the refusal names the floor"
+        );
+        assert_eq!(e.mempool.evicted_by_price(), 0, "nothing churned");
+    }
+
+    /// **MEASUREMENT 2 — what the proposer packs, and in what order.**
+    ///
+    /// The old field doc claimed "insertion-ordered". It was not. Inserting
+    /// in descending price makes insertion order and price order agree, so
+    /// any deviation from `[900, 700, 500, 100]` is a deviation from BOTH,
+    /// and the measured result was `[100, 500, 700, 900]` — ascending
+    /// canonical bytes, which for these fixtures happens to run opposite to
+    /// price and in general runs in no direction anyone can predict.
+    #[test]
+    fn selection_is_now_price_descending_and_was_byte_ascending() {
+        let txs: Vec<PosTransaction> = [(9u32, 900u128), (5, 500), (1, 100), (7, 700)]
+            .iter()
+            .map(|(s, tip)| flood_tx(&s.to_be_bytes(), *s, *tip))
+            .collect();
+
+        // ── BEFORE ──
+        let mut old = Old::new(MEMPOOL_MAX);
+        for tx in &txs {
+            old.insert(tx.canonical_bytes(), tx.clone()).unwrap();
+        }
+        let before: Vec<u128> = old.select(MAX_TXS_PER_BLOCK).into_iter().map(tip_of).collect();
+        eprintln!("MEASURED before/2: proposer packs tips in this order = {before:?}");
+        let mut sorted_bytes: Vec<Vec<u8>> =
+            old.select(MAX_TXS_PER_BLOCK).iter().map(|t| t.canonical_bytes()).collect();
+        let as_selected = sorted_bytes.clone();
+        sorted_bytes.sort();
+        assert_eq!(as_selected, sorted_bytes, "the old order was ascending canonical bytes");
+        assert_ne!(before, vec![900, 700, 500, 100], "and it was NOT price-descending");
+        assert_ne!(
+            before,
+            vec![900, 500, 100, 700],
+            "nor was it insertion order, whatever the field doc said"
+        );
+
+        // ── AFTER ──
+        let mut e = engine_at_wall_epoch(0, &[]);
+        for tx in &txs {
+            e.mempool.insert(tx.canonical_bytes(), tx.clone()).unwrap();
+        }
+        let after: Vec<u128> = e.select_transactions(0).iter().map(tip_of).collect();
+        eprintln!("MEASURED after/2:  proposer packs tips in this order = {after:?}");
+        assert_eq!(after, vec![900, 700, 500, 100], "best-paid first");
+    }
+
+    /// **MEASUREMENT 3 — one address versus the whole pool.**
+    ///
+    /// The quota is checked BEFORE the signature work, so the refusal below
+    /// costs this node a SHA3 per witness key and no lattice arithmetic at
+    /// all. That ordering is the reason the bound is a defence against work
+    /// and not only against memory.
+    #[test]
+    fn one_sender_could_hold_every_slot_and_now_holds_a_block_at_most() {
+        // The flood and the real signer share one address, which is what
+        // makes this a measurement of the quota rather than of two identities.
+        let (pk, rich) = paying_transfer(7, u128::MAX);
+
+        // ── BEFORE ──
+        let mut old = Old::new(MEMPOOL_MAX);
+        for seed in 0..MEMPOOL_MAX as u32 {
+            let tx = flood_tx(&pk, seed, 0);
+            old.insert(tx.canonical_bytes(), tx).expect("room");
+        }
+        let distinct: BTreeSet<Vec<u8>> = old
+            .entries
             .values()
             .filter_map(|t| match t {
                 PosTransaction::Transfer { inputs, .. } => Some(inputs[0].pubkey.clone()),
@@ -7221,11 +7675,533 @@ mod mempool_flood_characterisation {
             })
             .collect();
         eprintln!(
-            "MEASURED before/3: {} entries held by {} distinct witness key(s)",
-            e.mempool.len(),
-            distinct_senders.len()
+            "MEASURED before/3: {} entries ({} of {}) held by {} distinct address(es)",
+            old.entries.len(),
+            old.entries.len(),
+            MEMPOOL_MAX,
+            distinct.len()
         );
+        assert_eq!(old.entries.len(), MEMPOOL_MAX);
+        assert_eq!(distinct.len(), 1, "one key, the whole pool");
+
+        // ── AFTER ──
+        let mut e = engine_at_wall_epoch(0, &[]);
+        let mut admitted = 0usize;
+        for seed in 0..MEMPOOL_MAX as u32 {
+            let tx = flood_tx(&pk, seed, 0);
+            if e.mempool.insert(tx.canonical_bytes(), tx).is_ok() {
+                admitted += 1;
+            }
+        }
+        eprintln!(
+            "MEASURED after/3:  {} entries ({} of {}) held by 1 address; \
+             {} of {} offers refused at the quota",
+            e.mempool.len(),
+            admitted,
+            MEMPOOL_MAX,
+            MEMPOOL_MAX - admitted,
+            MEMPOOL_MAX,
+        );
+        assert_eq!(admitted, crate::mempool::PER_SENDER_MAX);
+        assert_eq!(e.mempool.len(), crate::mempool::PER_SENDER_MAX);
+
+        // The real path refuses the same address BEFORE verifying anything,
+        // and the refusal is not `AtCapacity`: the pool is 15/16 empty and
+        // telling this sender to bid higher would be a lie.
+        assert_eq!(
+            e.on_transaction(rich),
+            Err(Refusal::SenderQuota { held: crate::mempool::PER_SENDER_MAX }),
+            "a sender at its ceiling is refused however much it offers"
+        );
+        assert!(
+            e.mempool.len() < MEMPOOL_MAX,
+            "and the other 15/16 of the pool is still there for everyone else"
+        );
+        let (_, other) = paying_transfer(11, 1);
+        assert_eq!(e.on_transaction(other), Ok(Admitted::New), "a different address is unaffected");
+    }
+
+    /// **A price eviction must leave no verdict behind.**
+    ///
+    /// `mempool_suspect` is the epoch sweep's FIRST STRIKE — "this spends an
+    /// outpoint the chain does not have yet" — and the second strike evicts
+    /// AND bars for `REJECTION_TTL_SLOTS`. If a displaced transaction left
+    /// its strike in that set, coming back later would put it one sweep from
+    /// a 128-slot bar it never earned. And the traffic most likely to be
+    /// sitting at the bottom of the price ladder is exactly the traffic most
+    /// likely to be a chained spend waiting for its parent.
+    ///
+    /// So: mark the cheapest entry suspect, have something outbid it, and
+    /// check the mark went with it.
+    #[test]
+    fn a_price_eviction_takes_the_suspect_mark_with_it() {
+        let mut e = engine_at_wall_epoch(0, &[]);
+        let victim = flood_tx(b"victim", 1, 0);
+        let vkey = victim.canonical_bytes();
+        e.mempool.insert(vkey.clone(), victim).expect("room");
+        for tx in many_senders(MEMPOOL_MAX as u32 - 1, 5) {
+            e.mempool.insert(tx.canonical_bytes(), tx).expect("room");
+        }
+        assert_eq!(e.mempool.len(), MEMPOOL_MAX, "harness: full, with one entry at tip 0");
+        assert_eq!(e.mempool.floor_tip(), Some(0), "harness: the victim is the cheapest");
+
+        // As if one sweep had already seen its parent missing.
+        e.mempool_suspect.insert(vkey.clone());
+
+        let (_, rich) = paying_transfer(3, 9);
+        assert_eq!(e.on_transaction(rich), Ok(Admitted::New), "9 beats a floor of 0");
+        assert!(!e.mempool.contains_key(&vkey), "the cheapest entry was displaced");
+        assert!(
+            !e.mempool_suspect.contains(&vkey),
+            "an eviction for price must take the suspect mark with it — otherwise a \
+             transaction that merely lost an auction comes back one sweep away from a \
+             128-slot bar it never earned"
+        );
+        // And it was not barred either: losing an auction is not a verdict.
+        assert!(e.rejected.is_empty());
+    }
+
+    /// **The bound itself, driven by an adversary who is trying to break it.**
+    /// Random prices, random identities, far more offers than slots, and the
+    /// one hard promise checked after every single one.
+    #[test]
+    fn the_memory_bound_holds_under_everything() {
+        let mut e = engine_at_wall_epoch(0, &[]);
+        for seed in 0..(MEMPOOL_MAX as u32 * 2) {
+            // 64 identities × a 256 quota = 16,384 slots of quota against a
+            // 4,096-slot pool, so the quota cannot be what holds the line here.
+            let owner = (seed % 64).to_be_bytes();
+            let tx = flood_tx(&owner, seed, u128::from(seed % 4_099));
+            let _ = e.mempool.insert(tx.canonical_bytes(), tx);
+            assert!(e.mempool.len() <= MEMPOOL_MAX, "the memory bound is the one hard promise");
+        }
         assert_eq!(e.mempool.len(), MEMPOOL_MAX);
-        assert_eq!(distinct_senders.len(), 1, "one key, the whole pool");
+        eprintln!(
+            "MEASURED: 8,192 offers, 64 identities, prices 0..4098 -> pool {} of {}, \
+             floor {:?}, {} evicted by price",
+            e.mempool.len(),
+            MEMPOOL_MAX,
+            e.mempool.floor_tip(),
+            e.mempool.evicted_by_price(),
+        );
+    }
+}
+
+/// The two things this admission policy owes the rest of the system: it must
+/// not change what is VALID, and it must not turn a legitimate chained spend
+/// into a 128-slot ban.
+///
+/// Both are driven through the real proposer, the real transition and the
+/// real ML-DSA-65 ‖ Falcon-1024 verifier.
+#[cfg(test)]
+mod policy_boundaries {
+    use super::perf_support::{proposing_engine_funded, TestDir};
+    use super::*;
+    use bloch_pos_committee::fee_market;
+    use bloch_pos_committee::state_root::EutxoEntry;
+    use bloch_pos_committee::transition::{TransferInput, TransferOutput};
+    use sha3::{Digest, Sha3_256};
+
+    const SAT: u64 = 100_000_000;
+
+    /// An identity plus one funded output it owns.
+    struct Funded {
+        pk: Vec<u8>,
+        sk: Vec<u8>,
+        script_hash: [u8; 32],
+        entry: EutxoEntry,
+    }
+
+    fn funded(seed: u8) -> Funded {
+        let (pk, sk) = bloch_crypto::crypto::generate_keypair_from_seed(&[seed; 32])
+            .expect("hybrid keypair from a fixed seed");
+        let script_hash: [u8; 32] = Sha3_256::digest(&pk).into();
+        Funded {
+            pk: pk.clone(),
+            sk,
+            script_hash,
+            entry: EutxoEntry {
+                txid: [seed; 32],
+                vout: 0,
+                value: 8_400 * SAT,
+                script_hash,
+            },
+        }
+    }
+
+    /// A signed V1 transfer that spends one outpoint whole and pays `tip`.
+    ///
+    /// Two consensus rules make this fiddlier than a fixture usually is, and
+    /// both are the transition's, not admission's:
+    ///
+    /// 1. `tx_bytes` is DECLARED, and a declaration below the transaction's
+    ///    own canonical length is `UnderdeclaredSize`. A hybrid witness is
+    ///    most of a transfer's bytes, so the length is not knowable before
+    ///    signing.
+    /// 2. Conservation is STRICT EQUALITY: `spent == created + fee`, and the
+    ///    fee is derived from the declared size and the tip. Overpaying is
+    ///    `ValueNotConserved` just as underpaying is.
+    ///
+    /// So: build once to learn the length, declare it with margin, price the
+    /// transaction, and set the single output to whatever is left. The margin
+    /// covers the varint growth from writing real numbers where zeroes stood.
+    ///
+    /// Every other mempool fixture in this file declares `tx_bytes: 0`, which
+    /// is right for them — admission is stateless and deliberately does not
+    /// police the declared size. These are different because they must
+    /// actually APPLY inside a block.
+    fn transfer(
+        f: &Funded,
+        txid: [u8; 32],
+        vout: u32,
+        spend_value: u64,
+        tip: u128,
+        base_fee: u128,
+    ) -> PosTransaction {
+        let build = |declared: u64, out_value: u64| -> PosTransaction {
+            let mut tx = PosTransaction::Transfer {
+                inputs: vec![TransferInput {
+                    txid,
+                    vout,
+                    pubkey: f.pk.clone(),
+                    signature: Vec::new(),
+                }],
+                outputs: vec![TransferOutput { value: out_value, script_hash: f.script_hash }],
+                tx_bytes: declared,
+                tip_millisat_per_gas: tip,
+            };
+            let root = tx.spend_signing_root();
+            let sig = bloch_crypto::crypto::sign(&f.sk, &root).expect("sign the spend root");
+            if let PosTransaction::Transfer { inputs, .. } = &mut tx {
+                inputs[0].signature = sig;
+            }
+            tx
+        };
+        let declared = build(0, spend_value).canonical_bytes().len() as u64 + 64;
+        let charge = fee_market::charge(
+            fee_market::TxClass::Eutxo { inputs: 1 },
+            declared,
+            base_fee,
+            tip,
+        );
+        let fee = charge.base_fee_sat + charge.priority_fee_sat;
+        let out = u128::from(spend_value)
+            .checked_sub(fee)
+            .expect("the fixture must fund its own fee");
+        let tx = build(declared, out as u64);
+        assert!(
+            declared >= tx.canonical_bytes().len() as u64,
+            "the fixture must declare at least its own length, or consensus refuses it"
+        );
+        tx
+    }
+
+    /// What a transfer built by [`transfer`] leaves spendable, so a child can
+    /// be built against its parent's output without recomputing the fee.
+    fn output_value(tx: &PosTransaction) -> u64 {
+        match tx {
+            PosTransaction::Transfer { outputs, .. } => outputs[0].value,
+            _ => unreachable!("this fixture only builds V1 transfers"),
+        }
+    }
+
+    fn tip_of(tx: &PosTransaction) -> u128 {
+        match tx {
+            PosTransaction::Transfer { tip_millisat_per_gas, .. }
+            | PosTransaction::TransferV2 { tip_millisat_per_gas, .. } => *tip_millisat_per_gas,
+            _ => u128::MAX,
+        }
+    }
+
+    /// **The guard, and the violation it exists to prevent, in one test.**
+    ///
+    /// Child-pays-for-parent is the case: a wallet whose first transfer is
+    /// stuck sends a second one spending its output and bids the second one
+    /// UP. Price ordering alone puts the child above its parent every single
+    /// time — that is not an edge case, it is what CPFP means — and a body
+    /// with the child first is refused by the transition, dropped by the
+    /// proposer's drop loop, and **barred for `REJECTION_TTL_SLOTS`**.
+    ///
+    /// So the test measures the raw price order (the violation), then the
+    /// guarded order, then drives a real proposal and checks that nothing was
+    /// barred and both transactions landed.
+    #[test]
+    fn a_child_that_pays_more_is_still_ordered_after_its_parent() {
+        let f = funded(0x51);
+        let (mut e, _dir) = proposing_engine_funded(&[f.entry.clone()]);
+
+        // Parent spends the funded output and pays a small tip.
+        // The base fee is read once, from the pre-state, because that is the
+        // number the transition prices the whole block against.
+        let base_fee = e.state.next_base_fee();
+        let parent = transfer(&f, f.entry.txid, 0, f.entry.value, 1, base_fee);
+        // Child spends the parent's own output — an outpoint that does NOT
+        // exist in committed state yet — and pays far more.
+        let child = transfer(&f, parent.txid(), 0, output_value(&parent), 1_000_000, base_fee);
+
+        for tx in [&parent, &child] {
+            e.mempool
+                .insert(tx.canonical_bytes(), tx.clone())
+                .expect("room, and one address well under its quota");
+        }
+
+        // THE VIOLATION, measured: raw price order puts the child first.
+        // This is exactly what `select_transactions` would hand the proposer
+        // if `parents_first` were deleted.
+        let raw: Vec<u128> = e.mempool.by_price_desc().iter().map(|(_, t)| tip_of(t)).collect();
+        eprintln!("MEASURED: raw price order tips = {raw:?} (child first — the violation)");
+        assert_eq!(raw, vec![1_000_000, 1], "price alone puts the child above its parent");
+        let raw_ids: Vec<[u8; 32]> =
+            e.mempool.by_price_desc().iter().map(|(_, t)| t.txid()).collect();
+        assert_eq!(raw_ids[0], child.txid(), "the violation is a child-before-parent body");
+
+        // THE GUARD: selection repairs it, and does not merely drop one.
+        let selected = e.select_transactions(epoch_of(1));
+        assert_eq!(selected.len(), 2, "both are still selected — the guard reorders, it never drops");
+        assert_eq!(selected[0].txid(), parent.txid(), "parent first");
+        assert_eq!(selected[1].txid(), child.txid(), "child second");
+
+        // And the real proposer, end to end: the block carries both, in that
+        // order, and NOTHING was barred.
+        e.propose(1);
+        let env = e
+            .blocks
+            .get(e.head_id().as_bytes())
+            .expect("the proposed block was adopted")
+            .clone();
+        let body = body_transactions(&env).expect("the body decodes");
+        eprintln!(
+            "MEASURED: proposed body carries {} transaction(s), tips {:?}; barred {}",
+            body.len(),
+            body.iter().map(tip_of).collect::<Vec<_>>(),
+            e.rejected.len(),
+        );
+        assert_eq!(body.len(), 2, "a chained pair belongs in one block, not one of it");
+        assert_eq!(body[0].txid(), parent.txid());
+        assert_eq!(body[1].txid(), child.txid());
+        assert!(
+            e.rejected.is_empty(),
+            "no legitimate chained spend may be barred by this node's own packing order"
+        );
+    }
+
+    /// **`REJECTION_TTL_SLOTS` still means what it meant.** The vector this
+    /// work does NOT close, measured, and measured together with the reason
+    /// it must stay open.
+    ///
+    /// A child whose parent is in nobody's block yet spends an outpoint the
+    /// chain does not have. Admission cannot see that — it never resolves an
+    /// input — so the child reaches the pool, the proposer's probe refuses
+    /// it, and it IS barred. That is correct and unavoidable.
+    ///
+    /// What must never happen is the bar becoming permanent. A refusal like
+    /// this is a statement about state at one moment; the parent lands and
+    /// the same bytes become perfectly valid. A permanent ban would turn a
+    /// coin into one that can never be moved, with no signal to the sender.
+    /// So the bar carries an expiry, and this test reads it: exactly
+    /// `slot + REJECTION_TTL_SLOTS`, and gone afterwards.
+    #[test]
+    fn an_orphan_child_is_barred_and_the_bar_expires_on_its_own() {
+        let f = funded(0x52);
+        let (mut e, _dir) = proposing_engine_funded(&[f.entry.clone()]);
+
+        // Only the child. Its parent exists nowhere: not on chain, not in
+        // this pool.
+        let base_fee = e.state.next_base_fee();
+        let absent_parent = transfer(&f, f.entry.txid, 0, f.entry.value, 1, base_fee);
+        let orphan = transfer(
+            &f,
+            absent_parent.txid(),
+            0,
+            output_value(&absent_parent),
+            1_000_000,
+            base_fee,
+        );
+        let key = orphan.canonical_bytes();
+        e.mempool.insert(key.clone(), orphan).expect("admission cannot see the missing parent");
+
+        e.propose(1);
+        let (until, _) = *e
+            .rejected
+            .get(&key)
+            .expect("the proposer's probe refused it, so it is barred");
+        eprintln!(
+            "MEASURED: an orphan chained spend is barred until slot {until} \
+             (proposed at slot 1, TTL {REJECTION_TTL_SLOTS})"
+        );
+        assert_eq!(
+            until,
+            1 + REJECTION_TTL_SLOTS,
+            "the bar must carry an expiry, and it must be the documented one"
+        );
+
+        // The bar is real while it lasts...
+        assert!(e.is_rejected(&key, 1).is_some(), "barred at the slot it was minted");
+        assert!(
+            e.is_rejected(&key, until - 1).is_some(),
+            "still barred one slot before it lifts"
+        );
+        // ...and it lifts on its own, with no block, no message and no
+        // operator. This is the assertion that stops a future convenience
+        // from making the ban permanent.
+        assert!(
+            e.is_rejected(&key, until).is_none(),
+            "the bar MUST expire — a stateful refusal is a statement about one moment"
+        );
+    }
+
+    /// **Nothing in this policy can change which blocks a node accepts.**
+    ///
+    /// Two halves, because one alone would not be a proof.
+    ///
+    /// 1. **Unreachability.** `bloch-pos-committee` — the crate that owns
+    ///    `Transition::apply_block`, which is the whole of block validity —
+    ///    does not depend on `bloch-pos-node`. There is therefore no call
+    ///    path from any consensus rule to `crate::mempool` at all. This is
+    ///    read from the manifest at test time rather than asserted from
+    ///    memory, so adding the dependency fails the test rather than
+    ///    silently making the argument false.
+    ///
+    /// 2. **Indifference, measured.** One real block, produced by a real
+    ///    proposer, judged twice by the real transition from the same
+    ///    pre-state — once while the judge's mempool is full, once after it
+    ///    has been emptied. Same verdict, byte-identical post-state root.
+    ///    The pool is not an input to the judgement, and this is what that
+    ///    looks like from outside.
+    ///
+    /// So a node running this policy and a node running the byte-ordered
+    /// `BTreeMap` it replaces accept exactly the same blocks. They differ
+    /// only in which blocks they would PROPOSE — and a proposer has always
+    /// been free to include any subset of its pool, in any order that
+    /// applies.
+    #[test]
+    fn mempool_policy_is_not_block_validity() {
+        // ── 1. Unreachability ───────────────────────────────────────────
+        let consensus_manifest = include_str!("../../bloch-pos-committee/Cargo.toml");
+        assert!(
+            !consensus_manifest.contains("bloch-pos-node"),
+            "the consensus crate must not depend on the node crate; if it ever does, \
+             every 'admission is node-local policy' argument in this repo needs redoing"
+        );
+
+        // ── 2. Indifference ─────────────────────────────────────────────
+        let f = funded(0x53);
+        let (mut e, _dir) = proposing_engine_funded(&[f.entry.clone()]);
+        let paid = transfer(&f, f.entry.txid, 0, f.entry.value, 500, e.state.next_base_fee());
+        e.mempool.insert(paid.canonical_bytes(), paid).expect("room");
+
+        // The pre-state, captured before anything is applied.
+        let pre = e.state.arc();
+        e.propose(1);
+        let env = e
+            .blocks
+            .get(e.head_id().as_bytes())
+            .expect("the proposed block was adopted")
+            .clone();
+        let txs = body_transactions(&env).expect("the body decodes");
+        assert_eq!(txs.len(), 1, "the harness must have produced a block with a transaction");
+        let envelope = ProposalEnvelope {
+            header: env.header.clone(),
+            proposer_sig: env.proposer_sig.clone(),
+        };
+
+        // Judge it with a FULL pool.
+        for seed in 0..64u32 {
+            let mut txid = [0u8; 32];
+            txid[..4].copy_from_slice(&seed.to_be_bytes());
+            let noise = PosTransaction::Transfer {
+                inputs: vec![TransferInput {
+                    txid,
+                    vout: 0,
+                    pubkey: seed.to_be_bytes().to_vec(),
+                    signature: vec![0xCD; 8],
+                }],
+                outputs: vec![TransferOutput { value: 1, script_hash: [0xEE; 32] }],
+                tx_bytes: 0,
+                tip_millisat_per_gas: u128::MAX,
+            };
+            let _ = e.mempool.insert(noise.canonical_bytes(), noise);
+        }
+        assert!(e.mempool.len() >= 64, "harness: the judge's pool must be non-trivial");
+        let with_pool = e
+            .tr
+            .apply_block(&pre, &envelope, &env.body.attestations, &txs)
+            .map(|s| s.state_root());
+
+        // Empty it completely and judge the same block again.
+        let keys: Vec<Vec<u8>> = e.mempool.iter().map(|(k, _)| k.clone()).collect();
+        for k in &keys {
+            e.mempool.remove(k);
+        }
+        assert!(e.mempool.is_empty(), "harness: the judge's pool must now be empty");
+        let without_pool = e
+            .tr
+            .apply_block(&pre, &envelope, &env.body.attestations, &txs)
+            .map(|s| s.state_root());
+
+        eprintln!(
+            "MEASURED: same block judged with a {}-entry pool and with an empty pool -> \
+             verdicts equal: {}",
+            keys.len(),
+            with_pool == without_pool
+        );
+        assert!(with_pool.is_ok(), "the block must actually be valid, or this proves nothing");
+        assert_eq!(
+            with_pool, without_pool,
+            "a block's validity must not depend on what the judge happens to be holding"
+        );
+    }
+
+    /// `parents_first` is total, deterministic, and never loses or invents a
+    /// transaction — including on the inputs it was not designed for.
+    ///
+    /// The last assertion is the one that matters for liveness: a proposer
+    /// that dropped a transaction here would silently shrink every block, and
+    /// a proposer that hung here would stop producing.
+    #[test]
+    fn the_ordering_pass_is_total() {
+        let f = funded(0x54);
+        // No chain, no state: this test only exercises the ordering pass, so
+        // the fee it prices against is irrelevant and is pinned at zero.
+        let a = transfer(&f, [1; 32], 0, SAT, 5, 0);
+        let b = transfer(&f, [2; 32], 0, SAT, 4, 0);
+        let c = transfer(&f, a.txid(), 0, SAT, 9, 0);
+        let d = transfer(&f, c.txid(), 0, SAT, 8, 0);
+
+        // Empty and singleton: returned untouched.
+        assert!(parents_first(Vec::new()).is_empty());
+        assert_eq!(parents_first(vec![a.clone()])[0].txid(), a.txid());
+
+        // A three-deep chain handed over in exactly the wrong order.
+        let out = parents_first(vec![d.clone(), c.clone(), b.clone(), a.clone()]);
+        let ids: Vec<[u8; 32]> = out.iter().map(|t| t.txid()).collect();
+        assert_eq!(out.len(), 4, "nothing lost, nothing invented");
+        let pos = |t: &PosTransaction| ids.iter().position(|i| *i == t.txid()).unwrap();
+        assert!(pos(&a) < pos(&c), "a before its child c");
+        assert!(pos(&c) < pos(&d), "c before its child d");
+        // `b` depends on nothing, so it keeps its greedy position: it stood
+        // third in the input and every earlier entry was blocked, so it goes
+        // first. The rule is "earliest READY", and determinism is the point.
+        assert_eq!(ids[0], b.txid(), "the earliest unblocked entry leads");
+
+        // Independent transactions are left exactly as they came.
+        let indep = parents_first(vec![a.clone(), b.clone()]);
+        assert_eq!(indep[0].txid(), a.txid());
+        assert_eq!(indep[1].txid(), b.txid());
+
+        // Idempotent: ordering an ordered list changes nothing.
+        let once = parents_first(vec![d, c, b, a]);
+        let twice = parents_first(once.clone());
+        assert_eq!(
+            once.iter().map(|t| t.txid()).collect::<Vec<_>>(),
+            twice.iter().map(|t| t.txid()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Keep `TestDir` referenced so the guard type is not flagged unused when
+    /// this module is compiled alone.
+    #[allow(dead_code)]
+    fn _dir_type(d: TestDir) -> TestDir {
+        d
     }
 }

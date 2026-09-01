@@ -1560,6 +1560,31 @@ pub fn txout_json(state: &CommittedState, txid: &[u8; 32], vout: u32) -> Json {
 }
 
 /// `getmempoolinfo`.
+/// The admission policy, from outside. Grouped into one struct rather than
+/// four more positional arguments because `mempool_info_json` already takes
+/// six and a seventh `usize` next to `barred: usize` is a bug waiting to be
+/// introduced by whoever adds the eighth.
+///
+/// These are reply FIELDS on an already-allocated method, not new method
+/// names: §5 of `docs/WIRE-NAMESPACE-REGISTRY.md` scopes the RPC namespace to
+/// the method-name string, and no name is added here.
+pub struct MempoolPolicy {
+    /// The tip an arriving transfer must strictly exceed to displace
+    /// something, or `None` when the pool has room (nothing to beat) or holds
+    /// nothing evictable by price.
+    ///
+    /// This is the field an exchange actually asked for. Before it, "what do
+    /// I have to pay" could only be answered by submitting and reading the
+    /// error, and the error did not say either.
+    pub floor_tip: Option<u128>,
+    pub per_sender_max: usize,
+    /// Transactions dropped since boot because something outbid them. NOT a
+    /// count of rejections: none of these were judged, and none were barred.
+    pub evicted_by_price: u64,
+    /// Offers turned away since boot because their sender was at its quota.
+    pub refused_by_sender_cap: u64,
+}
+
 pub fn mempool_info_json(
     size: usize,
     max: usize,
@@ -1567,6 +1592,7 @@ pub fn mempool_info_json(
     next_base_fee_millisat_per_gas: u128,
     barred: usize,
     barred_hits: u64,
+    policy: MempoolPolicy,
 ) -> Json {
     Json::obj(vec![
         ("size", Json::u(size as u64)),
@@ -1582,6 +1608,31 @@ pub fn mempool_info_json(
         // rather than a log line on a box someone has to hold a key for.
         ("barred", Json::u(barred as u64)),
         ("barred_hits", Json::u(barred_hits)),
+        // The admission policy, from outside.
+        //
+        // `floor_tip` is a decimal STRING like every other millisat-per-gas
+        // field here (R3): it is a `u128` and 10^19 does not survive a JSON
+        // double. `null` means "nothing to beat" — either the pool has room,
+        // or what it holds carries no price. It is deliberately not zero:
+        // zero is a real floor an integrator must bid above, and "no floor"
+        // is not.
+        (
+            "floor_tip_millisat_per_gas",
+            policy.floor_tip.map_or(Json::Null, Json::sat),
+        ),
+        ("per_sender_max", Json::u(policy.per_sender_max as u64)),
+        // Two counters that answer different questions, and neither is a
+        // rejection count. `evicted_by_price` is how many transactions this
+        // node dropped because something outbid them — they were not judged,
+        // and they may come straight back. `refused_by_sender_cap` is how
+        // many offers were turned away at a quota. A node with a large
+        // `evicted_by_price` and an empty `barred` is a node whose fee market
+        // is working; the reverse is a node refusing traffic on merits.
+        ("evicted_by_price", Json::u(policy.evicted_by_price)),
+        (
+            "refused_by_sender_cap",
+            Json::u(policy.refused_by_sender_cap),
+        ),
     ])
 }
 

@@ -46,6 +46,7 @@ mod codec;
 mod engine;
 mod genesis;
 mod keys;
+mod mempool;
 mod net;
 mod p2p;
 mod rpc;

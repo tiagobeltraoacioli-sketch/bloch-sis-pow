@@ -26,8 +26,9 @@
 //! refuse. Its own doc claimed the pool was "insertion-ordered". It was not —
 //! a `BTreeMap` keyed by canonical transaction bytes is ordered
 //! LEXICOGRAPHICALLY BY THOSE BYTES, which is a value an attacker grinds and
-//! an honest wallet cannot influence at all. Measured, before this change
-//! (`engine::mempool_flood_characterisation`):
+//! an honest wallet cannot influence at all. Measured, and re-measured on
+//! every run against a faithful reproduction of the old policy
+//! (`engine::mempool_flood_before_and_after`):
 //!
 //! - 4,096 transactions offering a tip of zero filled the pool, and a
 //!   transfer offering `u128::MAX` per gas was then refused `AtCapacity`
@@ -49,23 +50,81 @@
 //!    with the old canonical-byte order kept as the tie-break so equal-priced
 //!    traffic behaves exactly as it does today.
 //!
-//! # What admission still cannot check, and says so
+//! # What this policy bounds — and, precisely, what it does not
 //!
-//! Admission is stateless by construction: it never resolves an input
-//! against the committed eUTXO set. So it cannot know whether the outputs a
-//! transfer spends exist, whether the key it verified actually owns them
-//! (`ScriptMismatch`), or whether it conserves value. An invalid signed exit
-//! is the sharpest case: the message names a validator index, and the key
-//! that would authenticate it lives in committed state that this path
-//! deliberately does not read — so no amount of admission policy can verify
-//! it, and pretending otherwise would be the `expected_bits` mistake in a new
-//! place. Those classes reach the pool, die in the proposer's probe, and are
-//! barred there by [`crate::engine::REJECTION_TTL_SLOTS`] — a bar that
-//! **expires**, because a refusal against state is a statement about one
-//! moment. Nothing in this module writes that bar, and nothing in this module
-//! may: an eviction for price is not a verdict on a transaction, and a
-//! transaction that lost an auction must be free to come straight back when
-//! the auction changes.
+//! Stating the second half is the point. A claimed defence that does not hold
+//! is worse than a named gap.
+//!
+//! ## Bounded
+//!
+//! 1. **Memory.** At most [`MEMPOOL_MAX`] entries, whatever an attacker does.
+//!    Driven adversarially by `the_bound_is_never_exceeded_however_it_is_driven`
+//!    and `the_memory_bound_holds_under_everything`.
+//! 2. **Lockout by a cheap flood.** A pool full of minimum-fee traffic can no
+//!    longer keep a paying transaction out; the cheapest entry is displaced by
+//!    anything that strictly beats it. Measured.
+//! 3. **Monopoly by one address.** No single address holds more than
+//!    [`PER_SENDER_MAX`] of the queue. Measured: 4,096 → 256.
+//! 4. **Verification work spent on traffic that cannot get in.** Price and
+//!    quota are decided BEFORE `admissible` runs, so a refused offer costs a
+//!    SHA3 per witness key rather than a ~145 µs hybrid verification. This is
+//!    the same ordering the old code had (capacity was checked before
+//!    `admissible` too), generalised.
+//!
+//! ## NOT bounded, and why no policy here could bound it
+//!
+//! Admission is stateless by construction: it never resolves an input against
+//! the committed eUTXO set. A policy that read committed state would be a
+//! node-local derivation of a consensus-shaped fact, which is exactly the
+//! `expected_bits` mistake that forked this network on 2026-08-08. So:
+//!
+//! 1. **Sybil identities.** A bucket is the hash of a public key, and keys are
+//!    free. `MEMPOOL_MAX / PER_SENDER_MAX` = 16 fresh keypairs buys the whole
+//!    pool again. The quota stops one address monopolising the queue; it is
+//!    NOT a sybil defence and must never be sold as one. What actually prices
+//!    a funded flood is the ladder, not the quota.
+//! 2. **Transfers that will never apply.** Nonexistent inputs
+//!    (`UnknownInput`), a key that signed but owns nothing
+//!    (`ScriptMismatch`), value that does not conserve — all reach the pool.
+//!    They pay a tip they will never be charged, so a well-crafted one can
+//!    even outbid real traffic. They die in the proposer's probe.
+//! 3. **An invalid SIGNED EXIT (tag `0x09`, on branch `wt/signed-exit-wire`)
+//!    — the sharpest case, and the one this module explicitly does not
+//!    defend against.** The message carries the HASH of the withdrawal key,
+//!    not the key; the key itself lives in the validator record in committed
+//!    state, which this path deliberately does not read. Admission therefore
+//!    cannot verify the signature at all — not "does not bother to", *cannot*.
+//!    It is cheap to gossip, it is indistinguishable at the door from a valid
+//!    one, and it consumes a slot until a proposer probes it. Every stateful
+//!    refusal has this shape; the signed exit is merely the cheapest to mint.
+//!
+//!    Nothing in this file changes that, and nothing in this file claims to.
+//!    In THIS tree the unsigned [`PosTransaction::Exit`] is refused outright
+//!    by [`crate::engine::admissible`], so the vector is not yet reachable
+//!    here — but it becomes reachable the moment `0x09` lands, and the price
+//!    such a message should carry is an open decision. `price_of` gives it
+//!    `Tip(0)` today, which is the safe direction (first evicted, never
+//!    protected), and `staking_messages_are_evicted_first` is the tripwire
+//!    that forces whoever lands `0x09` to revisit it rather than inherit it.
+//!
+//! ## Where the unbounded classes actually die, and why the bar must expire
+//!
+//! In the proposer's probe, barred by [`crate::engine::REJECTION_TTL_SLOTS`]
+//! — a bar that **expires after 128 slots**, deliberately. A refusal like
+//! `UnknownInput` is a statement about state at ONE MOMENT: a transfer
+//! spending an output still sitting in the mempool is refused now and
+//! perfectly valid the instant its parent lands. A permanent ban would turn
+//! that coin into one that can never be moved, with no signal to the sender.
+//! `an_orphan_child_is_barred_and_the_bar_expires_on_its_own` measures both
+//! halves — the bar is real, and it lifts on its own at exactly
+//! `slot + 128`.
+//!
+//! **Nothing in this module writes that bar, and nothing in this module may.**
+//! An eviction for price is not a verdict on a transaction; a transaction
+//! that lost an auction must be free to come straight back when the auction
+//! changes, and a sender at its quota gets in the moment one of its own
+//! transactions confirms. Both refusals here mean "not now", and both stop
+//! being true without anyone doing anything.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -379,12 +438,7 @@ impl Mempool {
     /// The one decision function. Pure: it mutates nothing, so a caller may
     /// ask before doing expensive verification and act on the answer
     /// afterwards, provided nothing touched the pool in between.
-    fn decide(
-        &self,
-        key: &[u8],
-        price: Price,
-        senders: &[[u8; 32]],
-    ) -> Result<Decision, Refused> {
+    fn decide(&self, price: Price, senders: &[[u8; 32]]) -> Result<Decision, Refused> {
         // The quota first, and ahead of price: a sender at its ceiling is
         // refused however much it offers. That ordering IS the rule — a cap
         // a rich sender can buy its way past is not a cap.
@@ -429,7 +483,7 @@ impl Mempool {
     /// in costs this node no lattice arithmetic; and deliberately NOT trusted
     /// to stand in for the insert, which re-decides.
     pub fn check_admission(&self, tx: &PosTransaction) -> Result<(), Refused> {
-        self.decide(&tx.canonical_bytes(), price_of(tx), &senders(tx)).map(|_| ())
+        self.decide(price_of(tx), &senders(tx)).map(|_| ())
     }
 
     /// Hold a transaction, displacing the cheapest one if the pool is full.
@@ -455,7 +509,7 @@ impl Mempool {
         }
         let price = price_of(&tx);
         let senders = senders(&tx);
-        let displaced = match self.decide(&key, price, &senders)? {
+        let displaced = match self.decide(price, &senders)? {
             Decision::Fits => None,
             Decision::Displace(victim) => {
                 self.remove(&victim);

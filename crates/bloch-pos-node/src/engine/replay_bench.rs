@@ -118,6 +118,7 @@ use sha3::{Digest, Sha3_256};
 use super::{now_ms, Engine, StateCell};
 use crate::genesis::{Manifest, ManifestValidator, GENESIS_MIX};
 use crate::keys::{HybridVerifier, Keystore, ProbeVerifier};
+use crate::mempool::Mempool;
 use crate::net;
 use crate::store::Store;
 
@@ -652,7 +653,7 @@ fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
         att_pool: AttestationPool::new(),
         proposals_seen: std::collections::BTreeMap::new(),
         wall_slot: 0,
-        mempool: BTreeMap::new(),
+        mempool: Mempool::new(),
         // O cache de recusa (2026-08-30): o replay nao propoe, entao nunca
         // bane nada — o campo existe para o tipo, sempre vazio aqui.
         rejected: BTreeMap::new(),
