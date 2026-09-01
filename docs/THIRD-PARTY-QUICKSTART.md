@@ -199,11 +199,12 @@ survives a reboot.
 Two phases, and the first one is silent — this is the part that looks like a
 hang and is not:
 
-**Phase 1 — genesis state construction (~10 minutes, no output).** The node
-builds the sparse Merkle tree over all 452,726 carryover outputs before it
-opens its RPC or connects to any peer. Measured at **10 minutes** on an
-M-series Mac, release build. Nothing is printed and no port is open while this
-runs. It is not stuck.
+**Phase 1 — genesis state construction (~2 minutes, completely silent).** The
+node builds the sparse Merkle tree over all 452,726 carryover outputs before it
+opens its RPC or connects to any peer. Nothing is printed, no port is open, and
+`getchaininfo` does not answer. **It is not stuck.** Measured at ~2 minutes on
+an idle M-series Mac (release build); it stretched to ~10 minutes on the same
+machine while a compile was competing for CPU, so give it a quiet core.
 
 **Phase 2 — replay from genesis.** Blocks arrive from the bootnodes and are
 applied one at a time, each one fully validated:
@@ -212,17 +213,34 @@ applied one at a time, each one fully validated:
 [slot 1] applied 1f65a776 by v46 — head root 17f80dfd, justified e0, finalized e0
 ```
 
-Your node gains on the live chain the whole time — the chain advances 2 slots
-per minute, and replay is far faster than that — so it converges.
+**This is the slow part, and it decelerates.** Measured 2026-09-01, release
+build, idle machine, syncing from the two published bootnodes:
 
-> **Known defect, check your build.** Builds before the catch-up fix
-> (`fix(catch-up): share the eUTXO map so an epoch roll stops paying the
-> ledger`) clone the entire eUTXO set on every epoch boundary. Replay starts
-> near 3 slots/s and **decays to ~0.25 slots/s** within 25 epochs, which turns
-> a few hours into days. Measured on an unfixed build 2026-09-01. Confirm your
-> build contains that commit before starting a long sync.
+| Elapsed | Slot | Epoch | Rate |
+|---|---|---|---|
+| 3 min | 528 | 12 | 408 slots/min |
+| 5 min | 620 | 12 | 37 slots/min |
+| 7 min | 664 | 18 | 22 slots/min |
+| 8 min | 697 | 19 | 32 slots/min |
 
-### The faster path: seed from an archival node
+The rate falls by more than an order of magnitude within the first 20 epochs
+and then settles near **~30 slots/min**. At that rate a full sync to a head
+near slot 52,600 is on the order of **a day or more**, not hours. Budget for
+that, and start well before any deadline that matters to you — in particular
+the weak-subjectivity deadline in §0.
+
+> This deceleration is a **known open defect**, not a property of the chain.
+> Each epoch boundary does work proportional to the whole ledger. A partial
+> fix (`fix(catch-up): share the eUTXO map so an epoch roll stops paying the
+> ledger`, `Arc<BTreeMap>` copy-on-write) is on `integ/ws-checkpoint-tooling`
+> and roughly halves the time to a given epoch, but **does not remove the
+> deceleration** — the table above was measured *with* that fix applied. If
+> your build predates it, expect worse.
+
+### The faster path: seed from an archival node — recommended
+
+Given the numbers above, this is the path to use unless you have a specific
+reason to replay from genesis.
 
 If a full replay does not fit your window, copy `blocks.log`, `meta.bin` and
 `ws_latest.bin` (~202 MB) from a healthy node's data directory and let your
@@ -240,7 +258,38 @@ wrong. What it cannot detect on its own is a *complete and internally
 consistent* alternative history, which is exactly what §0's weak-subjectivity
 anchor is for.
 
-## 6. Prove you are on the real chain
+## 6. How your node actually reaches the chain
+
+Worth understanding before you depend on it, because it decides what your
+monitoring should watch. Verified against the code and the live hosts on
+2026-09-01.
+
+The bootnodes are **leaves**: each dials all 63 validators outbound, no
+validator dials them, and the two do not dial each other. You hang off a leaf.
+
+**Blocks reach you by pulling, not by being pushed.** A block is broadcast only
+by the node that proposed it, so an observer never re-broadcasts one to you.
+Instead your node issues a periodic get-blocks request whenever it is behind
+and two slots have passed. This works — it is how the bootnodes themselves
+follow the chain — but it means:
+
+- You will normally sit **0–2 slots behind** the head, not exactly at it.
+  `behind_by_slots` of 0–1 is healthy; a number that climbs and stays up means
+  your peers stopped answering.
+- Your liveness depends entirely on a bootnode answering your requests. With
+  both configured you have two independent paths; if one goes away the other is
+  unaffected, because they do not depend on each other.
+
+**Your transactions do propagate outward.** A transaction that arrives by
+gossip goes through the same admission path as one submitted to the local RPC,
+and is re-broadcast on the receiving node's outbound connections. So a
+withdrawal you submit to your own node reaches the bootnode, and the bootnode
+passes it to the 63 validators it dials. Receiving and sending both work.
+
+There is no acknowledgement for a submitted transaction — confirmation is
+seeing it in a block. Poll for it; do not assume acceptance.
+
+## 7. Prove you are on the real chain
 
 **Same height is not agreement.** Two forked nodes happily report the same
 height with different roots, and a forked node answers RPC normally. Compare
@@ -265,7 +314,7 @@ Also check `behind_by_slots` in `getchaininfo`: 0–1 means you are at the head.
 Do this **before** you credit anything to a customer, and keep doing it — a
 node that silently diverges is the failure mode that costs money.
 
-## 7. Once a signed checkpoint exists
+## 8. Once a signed checkpoint exists
 
 Not yet available — no signer keys exist. When the Phase A ceremony has
 happened, a fresh node past the window adds two flags:
