@@ -1,0 +1,66 @@
+# Bloch Genesis-4 — public entry points (devnet transport)
+#
+# Format: one <host>:<port> per line, '#' comments. Pass the whole list to
+# `bloch-pos run --peers` as a comma-separated string. See
+# docs/THIRD-PARTY-QUICKSTART.md.
+#
+# WHAT THESE ARE. Both are keyless ARCHIVAL OBSERVERS (`bloch-archival.service`)
+# run by Postern Labs. They hold no validator.key, so they never propose and
+# never attest; they follow the chain and answer block-sync requests. They are
+# the correct thing for a third party to peer with.
+#
+# WHY NOT VALIDATOR ADDRESSES. The devnet transport has no authentication and
+# no admission control, so a published validator address is an unauthenticated
+# frame-push surface directly into consensus. On 2026-08-09 one stale node
+# dumped 1,270 old blocks and stopped block production across the whole
+# network. Validator addresses stay private, behind per-IP firewall rules.
+#
+# WHY THESE TWO AND NOT MORE. The public list may contain only addresses we
+# control and expect to keep. Validators move between hosts — 64 of them moved
+# on 2026-08-30/31 — and a public list naming them would rot silently, because
+# the devnet transport reconnects dead peers forever and never raises an error
+# (net.rs). These two addresses do not move when validators move.
+#
+# TRANSPORT. devnet, NOT libp2p. This is not a preference; `--transport libp2p`
+# against these hosts exchanges zero frames and leaves you alone on your own
+# fork (see the quick start, "Why not libp2p"). Verified 2026-09-01: all 63
+# fleet validators and both nodes below run `--transport devnet`.
+#
+# WHY THESE AND NOT A VALIDATOR'S PEER LIST. Derive the public list from what
+# actually answers, never from a validator unit's --peers. Measured 2026-09-01:
+# each validator carries 128 peer entries of which 64 point at the twelve
+# decommissioned "classico" boxes, plus a ghost entry 139.84.201.52:19063 —
+# a dead PORT on a LIVE host, which any host-level reachability check passes.
+# The two observers below carry exactly 63 entries, 9 per fleet host, with no
+# ghost and no decommissioned address. Their lists are the clean ones.
+#
+# TOPOLOGY, STATED PLAINLY. These two are independent LEAVES: each dials the
+# 63 validators outbound, no validator dials :19100, and the two do not dial
+# each other (verified 2026-09-01). Consequences for you:
+#   - Publishing both is redundancy FOR YOU (two independent paths to the
+#     fleet), not mutual reinforcement between them. If one dies the other is
+#     unaffected — and equally, neither can cover for the other's rot.
+#   - Your node FOLLOWS BY PULLING. An observer never broadcasts blocks (a
+#     block is broadcast only by the node that proposed it, engine.rs:1331),
+#     so you receive blocks by your own periodic get-blocks request, which
+#     fires whenever you fall behind and 2 slots have passed (engine.rs:3111).
+#     Expect to sit 0-2 slots behind the head, not exactly at it.
+#   - Your TRANSACTIONS DO relay. A transaction arriving by gossip goes
+#     through the same admit path as one from the RPC and is re-broadcast
+#     (engine.rs:3141 -> on_transaction -> net.broadcast), so a transaction
+#     you submit reaches the observer and the observer passes it to the 63
+#     validators on its outbound connections.
+#
+# Verified 2026-09-01 ~01:45 UTC: both reachable from off-network on 19100,
+# both keyless, both `--transport devnet`, both at epoch 1638 reporting the
+# IDENTICAL finalized root bb9fe982…5670 at finalized height 31462 — the
+# check that proves they are on one chain and not two.
+
+139.180.166.5:19100
+139.180.173.231:19100
+
+# HONEST LIMIT: two hosts, one provider family (139.180.x). One provider
+# suspension takes out both. A three-host tier on three providers is staged in
+# ~/bloch-rollout/bootnodes-20260831/ (provision-bootnode.sh) and is the
+# durable answer; these two are what exists and is publishable today without
+# restarting anything.
