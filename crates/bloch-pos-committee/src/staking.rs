@@ -202,6 +202,26 @@ pub const MAX_ACTIVATIONS_PER_EPOCH: usize = 4;
 /// — or slashing for duties already assigned — within the same epoch.
 pub const EXIT_DELAY_EPOCHS: u64 = 32;
 
+/// Validators allowed to retire per epoch once
+/// [`crate::params::EXIT_CHURN_ACTIVATION_EPOCH`] is armed — the exit-side
+/// mirror of [`MAX_ACTIVATIONS_PER_EPOCH`], and INERT until that flag day.
+///
+/// Set equal to `MAX_ACTIVATIONS_PER_EPOCH` on purpose. That equality is the
+/// whole rule: while `MAX_EXITS_PER_EPOCH <= MAX_ACTIVATIONS_PER_EPOCH` the
+/// active set can never shrink faster than the activation queue can replenish
+/// it, so a drain can always be raced by admissions. Any larger value slows an
+/// exodus without bounding it, and the bound is the only property worth having
+/// — the elapsed drain time is dominated by [`EXIT_DELAY_EPOCHS`] either way.
+///
+/// Honest scope, in the register the bond constant uses: this meters the
+/// ORDERLY exit only. A coalition that simply stops attesting sheds its duties
+/// at exactly the same rate with or without this limit, and is answered by the
+/// inactivity leak, not here. What the limit denies is the ability to convert
+/// the whole set's participation into an irrevocable, already-scheduled
+/// departure — and to start every bond's withdrawal clock together — inside a
+/// single epoch. It is not a defence against validators who are merely absent.
+pub const MAX_EXITS_PER_EPOCH: usize = MAX_ACTIVATIONS_PER_EPOCH;
+
 /// Epochs between a voluntary exit and the stake becoming spendable
 /// (§5.1, §7.2: 2,048 ≈ 22.8 days). This is the weak-subjectivity margin —
 /// see the module docs. It must exceed the longest window in which an exited

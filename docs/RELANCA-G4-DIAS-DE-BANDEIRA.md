@@ -925,7 +925,7 @@ esperando `utc(E*)`.
 
 ---
 
-## 11. Calendário consolidado dos dias de bandeira (todos os nove portões)
+## 11. Calendário consolidado dos dias de bandeira (todos os dez portões)
 
 Escrito na integração de consenso de 2026-08-31, que juntou seis worktrees e
 introduziu **quatro** constantes de ativação novas. As seções 0–10 acima
@@ -983,7 +983,7 @@ tocar nos sucessores.
 > inverte a resposta. Rode de novo, no dia. O custo é um teste; o custo de
 > não rodar é a frota inteira parada num bloco do passado.
 
-### 11.1 Os nove portões
+### 11.1 Os dez portões
 
 Cadência: um slot = 30 s, 32 slots = uma época ⇒ **1 época ≈ 16 min ≈ 90
 épocas/dia**. Qualquer conversão época→data abaixo usa essa taxa a partir da
@@ -1002,10 +1002,15 @@ tropeça.
 | 7 | `FUNDED_STAKING_ACTIVATION_EPOCH` | `u64::MAX` | `DepositV2` (tag `0x07`) + delegação financiada | **parcial** |
 | 8 | `SIGNED_EXIT_ACTIVATION_EPOCH` | `u64::MAX` | saída voluntária assinada (`apply_exit`) | **NÃO** |
 | 9 | `WITHDRAWAL_ACTIVATION_EPOCH` | `u64::MAX` | `Withdraw` (tag `0x08`), trava de 4.096 épocas, ordem evidência-antes-de-saque | sim |
+| 10 | `EXIT_CHURN_ACTIVATION_EPOCH` | `u64::MAX` | limite de vazão de saída, `MAX_EXITS_PER_EPOCH` = 4 (§11.6) | **NÃO** (depende de #8) |
 
 A coluna "carregador na rede" é a que quase ninguém pergunta, e é a que
 decide se armar um portão faz alguma coisa:
 
+- **#10 é inerte duas vezes.** O limite de vazão só é lido dentro de
+  `apply_exit`, que já é inalcançável abaixo de #8. Armar #10 sozinho não abre
+  nada e não recusa nada — ele só pode **recusar** uma saída, nunca autorizar
+  uma (teste `arming_exit_churn_alone_opens_no_exit`). Detalhe em §11.6.
 - **#8 não tem carregador nenhum.** `apply_exit` não tem **nenhum** ponto de
   chamada de produção — só testes. Armar `SIGNED_EXIT` hoje **não muda
   nada**: não existe forma de uma saída assinada entrar num bloco. O
@@ -1079,26 +1084,17 @@ constante. Além disso:
   1. o carregador de wire (tag `0x09`) precisa existir e estar na frota.
      Antes disso, armar é ruído — e ruído que a página de release vai
      afirmar como recurso.
-  2. **decidir se pode haver saída sem limite de vazão.** Não existe
-     throttle de saída em lugar nenhum: entrada tem
-     `MAX_ACTIVATIONS_PER_EPOCH = 4`, saída não tem nada (procurado por
-     `max_exits|exit_churn|exits_per_epoch|MAX_EXIT` no crate inteiro:
-     zero ocorrências; os docs de `ws.rs` já registram o fato — "o
-     conjunto auto-vinculado inteiro pode sair numa época"). A assimetria,
-     em números:
-
-     | | ritmo |
-     |---|---|
-     | **esvaziar** | o conjunto inteiro pede saída em **1 época**; deveres param `EXIT_DELAY_EPOCHS` = 32 épocas depois (~8,5 h) |
-     | **repor** | `MAX_ACTIVATIONS_PER_EPOCH` = 4 ⇒ ≥ **16 épocas** de admissões para 64 validadores, mais `ACTIVATION_DELAY_EPOCHS` = 8 |
-
-     Esvazia em uma época, repõe em dezesseis — e todo vínculo drenado
-     fica preso por `WITHDRAWAL_DELAY_EPOCHS` = 2.048 de qualquer forma.
-     Isso é parâmetro de **vivacidade**, então é decisão do fundador:
-     ou se arma aceitando a assimetria, ou o limite de vazão de saída
-     entra ANTES do armamento (e aí é consenso, com dia de bandeira
-     próprio). O que não pode é armar sem que alguém tenha decidido —
-     é por isso que está escrito aqui e na doc da própria constante.
+  2. **decidir se pode haver saída sem limite de vazão.** Continua sendo
+     decisão do fundador — mas desde 2026-08-31 as duas opções estão
+     **construídas**, e escolher não custa mais uma implementação. O portão
+     #10 (`EXIT_CHURN_ACTIVATION_EPOCH`, inerte em `u64::MAX`) liga um limite
+     de `MAX_EXITS_PER_EPOCH` = 4 saídas por época. Armar #8 deixando #10 em
+     `u64::MAX` **é** aceitar a assimetria, explicitamente, e é o padrão que
+     sai da caixa. Os números, o argumento de fila-versus-recusa e o que o
+     limite não compra estão na §11.6. Não existe asserção de compilação
+     ligando #10 a #8, **de propósito**: forçar a ordem transformaria esta
+     decisão de vivacidade num erro de build, que é exatamente o contrário do
+     que esta seção existe para fazer.
 - **#9 `WITHDRAWAL`** — o mais caro, e o único cuja pré-condição **não é de
   código**:
   1. `FUNDED_STAKING` e `SIGNED_EXIT` armados antes (o compilador garante);
@@ -1148,3 +1144,171 @@ armada.
 - **A ordem entre #7/#8/#9 é garantida; o espaçamento não.** As asserções
   proíbem inverter, não escolher épocas próximas demais para a frota rolar
   entre elas. Esse julgamento é da §2.
+
+### 11.6 O portão #10: o limite de vazão de saída, em números
+
+Tudo abaixo usa **1 época ≈ 16 min** (§11.1) e um conjunto de **64**
+validadores. `EXIT_DELAY_EPOCHS` = 32, `ACTIVATION_DELAY_EPOCHS` = 8,
+`MAX_ACTIVATIONS_PER_EPOCH` = 4, `WITHDRAWAL_DELAY_EPOCHS` = 2.048.
+
+#### 11.6.1 A assimetria não é a que a tabela antiga sugeria
+
+A versão anterior desta seção comparava "1 época para esvaziar" com "16
+épocas para repor". As duas pontas estavam certas e a conclusão estava
+**errada**, porque comparava coisas diferentes: uma é a janela de *pedido*, a
+outra é o tempo de *conclusão*. Fim a fim:
+
+| operação | épocas | relógio |
+|---|---|---|
+| esvaziar 64 (hoje, sem limite) | 1 de pedidos + 32 de `EXIT_DELAY` = **32** | **8 h 32** |
+| repor 64 do zero | 8 de `ACTIVATION_DELAY` + 16 de admissões = **23** | **6 h 08** |
+
+Ou seja: **repor já é mais rápido que esvaziar em tempo de parede.** A
+assimetria real não é de duração, é de **compromisso irrevogável por época**.
+Uma saída não pode ser cancelada (um registro com `exit_epoch != u64::MAX` é
+recusado), então uma única época de espaço em bloco basta para tornar a perda
+do conjunto inteiro um fato consumado — enquanto o único remédio, admitir
+substitutos, corre a 4 por época. A razão "partidas irrevogáveis por época :
+substitutos por época" é hoje **64 : 4 = 16 : 1**. É isso que o limite muda.
+
+#### 11.6.2 Drenar 64 com o limite em N
+
+Pedidos levam ⌈64/N⌉ épocas; o último a pedir para de ter deveres 32 épocas
+depois. Roteiro vazio em ⌈64/N⌉ − 1 + 32 épocas.
+
+| N | épocas de pedidos | roteiro vazio em | relógio | encolhe mais rápido que repõe? |
+|---|---|---|---|---|
+| sem limite (hoje) | 1 | 32 | 8 h 32 | **sim, 16:1** |
+| 16 | 4 | 35 | 9 h 20 | sim, 4:1 |
+| 8 | 8 | 39 | 10 h 24 | sim, 2:1 |
+| **4** | **16** | **47** | **12 h 32** | **não — empata com a reposição** |
+| 2 | 32 | 63 | 16 h 48 | não (repõe 2× mais rápido) |
+| 1 | 64 | 95 | 25 h 20 | não (repõe 4× mais rápido) |
+
+A coluna que decide é a última, e ela tem um degrau, não uma inclinação. Com
+**N ≤ 4 = `MAX_ACTIVATIONS_PER_EPOCH`** o conjunto **nunca** encolhe mais
+rápido do que a fila de ativação repõe: um dreno sempre pode ser corrido de
+lado por admissões. Acima de 4, o encolhimento líquido é (N − 4) por época e o
+limite apenas *desacelera* um êxodo sem *limitá-lo*. Por isso o valor
+implementado é `MAX_EXITS_PER_EPOCH = MAX_ACTIVATIONS_PER_EPOCH` — escrito
+como a igualdade, não como o literal `4`, para que mexer num lado mova o
+outro. Baixar mais que 4 compra tempo de parede e nenhuma propriedade nova.
+
+#### 11.6.3 O que um atacante ganha saindo em bloco coordenado
+
+Depois do fechamento do §11.0 a tag `0x03` está recusada em toda época, então
+**ninguém tira ninguém**: uma saída exige a assinatura do próprio validador.
+Um êxodo coordenado é portanto uma coalizão retirando o *próprio* stake. O que
+os `k` membros ganham fazendo isso em UMA época em vez de ⌈k/N⌉:
+
+1. **Todos os vínculos partem o relógio de saque juntos.** Com o limite, o
+   último do grupo parte ⌈k/N⌉ − 1 épocas depois, e fica *slashable* esse
+   tempo a mais. Para k = 32 e N = 4: 7 épocas ≈ **1 h 52** de exposição extra
+   na cauda. É pouco contra as 2.048 épocas de `WITHDRAWAL_DELAY`, e deve ser
+   apresentado como pouco.
+2. **A razão de irrevogabilidade cai de 16:1 para N:4** (§11.6.1) — com N = 4,
+   para **1:1**. Este é o ganho de verdade, e é estrutural, não temporal.
+3. **A rede vê o dreno chegando.** ⌈k/N⌉ épocas de tráfego de saída
+   publicamente visível é a mesma propriedade que a doc de
+   `MAX_ACTIVATIONS_PER_EPOCH` reivindica para a entrada.
+
+**O que o limite NÃO compra, e precisa estar escrito junto:** ele mede a saída
+**ordeira**. Uma coalizão que simplesmente *para de atestar* larga os deveres
+exatamente no mesmo ritmo com ou sem limite, e não é respondida aqui — é
+respondida pelo *inactivity leak*. E o leak, na G4, ajusta o quórum mas **não**
+o `duty_roster_at`: a finalidade se cura, a produção de bloco não. Contra
+ausência, o portão #10 não faz nada. Ele nega apenas a capacidade de converter
+a participação do conjunto inteiro numa partida agendada e irreversível dentro
+de uma época. Vender isso como defesa contra 51% seria mentira.
+
+Segundo limite, do mesmo tipo: o medidor conta **saídas voluntárias**, não
+partidas. O caminho de slashing escreve `exit_epoch = época` (crua), e toma o
+`min`, então um infrator que já tinha saído nesta época tem o carimbo puxado
+para trás e **libera uma vaga** do medidor. Com slashings na mesma época, mais
+validadores podem deixar o roteiro do que `MAX_EXITS_PER_EPOCH`. Isso é a
+forma certa — limitar a taxa de ejeção de um infrator **provado** deixaria um
+atacante provado de plantão — e comprar a vaga liberada custa uma penalidade
+de slashing contra um validador que já estava sendo ejetado. Não é atalho
+barato, mas é uma limitação de verdade e está escrita aqui, não escondida.
+
+#### 11.6.4 Fila ou recusa — e por que o excedente é RECUSADO
+
+Implementado: o excedente é **recusado** (`TxReject::ExitChurnLimit`) e o
+validador tenta de novo numa época seguinte. Não existe fila de saídas
+pendentes. O argumento:
+
+- **Uma fila é estado comprometido novo.** Ela precisa de uma lista de saídas
+  pendentes dentro de `CommittedState`, ou seja uma folha nova na raiz de
+  estado — o que transforma um limite inerte numa **migração de formato de
+  estado**, e faz binário velho e binário novo produzirem raízes diferentes
+  para o mesmo bloco. A recusa não guarda nada: o contador é **derivado** de
+  `exit_epoch == época + EXIT_DELAY_EPOCHS`, que já é estado comprometido.
+  Codificação byte-idêntica, zero migração. É o que permite isto embarcar
+  inerte sem dia de bandeira próprio para a raiz.
+- **A ordenação de uma fila de saída é grindável de um jeito que a de entrada
+  não é.** A fila de entrada ordena por `(deposit_epoch, pubkey_hash)`, e
+  moer um hash favorável custa **um par de chaves e um vínculo financiado por
+  tentativa**, comprando no máximo ordem intra-época. Numa fila de saída o
+  validador **já é dono da chave**: ele a escolheu no depósito, possivelmente
+  anos antes, e poderia tê-la moído ali ao custo de pares de chaves e nada
+  mais — comprando posição **permanente** em toda corrida futura de saída.
+- **A posição na fila vale dinheiro exatamente na hora que ela governa.**
+  Numa corrida (preço caindo, ou ataque coordenado) sair primeiro é o prêmio.
+  Uma fila cria um lugar alocável e moível precisamente no cenário para o qual
+  ela existe. A recusa não aloca nada novo: quem entra no bloco é decidido
+  pelo proponente e pelo mempool, como em toda outra transação — propriedade
+  velha e conhecida, não superfície nova.
+- **Uma fila precisa de teto, ou é DoS.** E o teto reintroduz a recusa.
+
+**O custo da opção não tomada, dito de frente** (a recusa não é grátis):
+
+- **Não há garantia de atendimento.** Uma fila garante saída eventual numa
+  posição fixa; a recusa garante só uma *taxa*. Em teoria um validador pode
+  ser preterido várias épocas seguidas. Na prática o limite de 64/N épocas
+  para drenar limita o dano, mas isso é aritmética do conjunto, não garantia
+  formal de justiça.
+- **A tentativa custa uma assinatura nova.** `ExitTx` assina a própria época,
+  então uma saída recusada **não pode ser reenviada**: tem que ser assinada de
+  novo para a época seguinte (fixado no teste
+  `exit_churn_limit_meters_and_the_surplus_retries`). Isso é custo de UX real
+  — e, do outro lado, é a razão de não haver risco de replay de mensagem
+  capturada.
+- **"Tente de novo" é pior experiência que "você é o número 37"** justamente
+  na corrida em que as pessoas estão nervosas.
+
+O que a recusa **não** faz é prender stake. O atraso é de épocas; o vínculo
+segue as mesmas 2.048 épocas de `WITHDRAWAL_DELAY` que seguiria de qualquer
+forma. "Validador que não consegue sair" seria verdade se a recusa fosse
+permanente; ela é por época.
+
+#### 11.6.5 Segurança de fork, pré-armamento
+
+Binário velho e binário novo aceitam **exatamente** os mesmos blocos enquanto
+#10 estiver em `u64::MAX`, e o argumento tem três degraus independentes:
+
+1. `exit_churn_active(epoch)` é `epoch >= u64::MAX`, falso para toda época
+   alcançável, então a recusa nunca é avaliada e `apply_exit` percorre o mesmo
+   caminho de antes.
+2. `apply_exit` já é inalcançável abaixo de #8 (`SIGNED_EXIT`, também
+   `u64::MAX`), e a tag `0x03` está recusada em toda época. Não existe hoje
+   transação que chegue nesse código. São duas trancas na mesma porta.
+3. **A raiz de estado não muda.** Nenhum campo novo em `CommittedState`,
+   nenhuma folha nova, nenhuma variação de codificação — o contador é uma
+   varredura derivada de `exit_epoch`, computada e descartada. A variante
+   `TxReject::ExitChurnLimit` é um veredicto local; motivo de recusa não é
+   estado comprometido.
+
+O portão lê a época **COMPROMETIDA** (`CommittedState::epoch`) pelo leitor
+compartilhado `exit_churn_active`, gêmeo de `deposit_funding_active`, nunca um
+relógio local do nó — a divergência de `expected_bits` de 2026-08-08 é a razão
+permanente de isso estar escrito em cada portão.
+
+#### 11.6.6 Coordenação com o fluxo do wire
+
+O carregador da saída assinada (tag `0x09`) está sendo escrito em
+`wt/signed-exit-wire`. O limite de vazão **não toca as mesmas linhas**: ele
+vive dentro de `apply_exit`, entre a chamada a `staking::validate_exit` e as
+duas escritas de relógio, enquanto o fluxo do wire trabalha na codificação e
+no roteamento em `apply_transaction`. A tag `0x09` **não** foi reivindicada
+por este trabalho, e nenhum número de wire novo foi consumido — o portão #10
+não tem formato de transação próprio.

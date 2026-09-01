@@ -30,6 +30,16 @@
 //!    [`crate::staking`] meters exits — the entire self-bonded set can exit
 //!    in one epoch. There is no churn credit to decline; on the path that
 //!    matters there is nothing to take.
+//!
+//!    Since 2026-08-31 a meter EXISTS but is INERT:
+//!    [`crate::staking::MAX_EXITS_PER_EPOCH`], behind
+//!    [`crate::params::EXIT_CHURN_ACTIVATION_EPOCH`] = `u64::MAX`. The
+//!    sentence above therefore still describes every reachable epoch, and
+//!    [`WS_PERIOD_EPOCHS`] must not be re-derived on the assumption of a rate
+//!    limit unless that gate is armed — and not even then, because the bound
+//!    below is driven by `EXIT_DELAY_EPOCHS`, which a churn limit does not
+//!    move. Recorded here so the next person re-doing this arithmetic finds
+//!    the gate instead of concluding the module docs went stale.
 //! 2. **The bound was not conservative — it was 31 epochs too long.** A
 //!    validator keeps duties for [`crate::staking::EXIT_DELAY_EPOCHS`] epochs
 //!    after its exit is included

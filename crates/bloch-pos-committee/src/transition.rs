@@ -1210,6 +1210,18 @@ pub enum TxReject {
     /// ([`staking::validate_exit`]) and it refused; the verdict is relayed
     /// verbatim.
     Exit(staking::ExitReject),
+    /// The exit was valid in every other respect but this epoch has already
+    /// admitted [`staking::MAX_EXITS_PER_EPOCH`] retirements. Inert until
+    /// [`crate::params::EXIT_CHURN_ACTIVATION_EPOCH`].
+    ///
+    /// Its own variant, not `StakingRule`, for the reason `StakingNotActive`
+    /// is its own variant: a rate limit is the one exit refusal that says
+    /// "correct, but not now", and a validator reading it learns that its
+    /// message needs only a later epoch — not a different message. It is also
+    /// the verdict whose rate in the logs tells the founder whether an armed
+    /// limit is binding, which is unreadable if it is folded into the generic
+    /// staking refusal.
+    ExitChurnLimit,
     /// Slashing evidence reached the plain transaction seam instead of
     /// `apply_slashing_evidence`, which is the only path that verifies it.
     MisroutedEvidence,
@@ -1816,6 +1828,28 @@ fn deposit_funding_active(epoch: u64) -> bool {
     #[cfg(not(test))]
     {
         epoch >= crate::params::FUNDED_STAKING_ACTIVATION_EPOCH
+    }
+}
+
+/// Is the exit-side churn limit ([`staking::MAX_EXITS_PER_EPOCH`]) in force at
+/// `epoch`? The exit twin of [`deposit_funding_active`], written in the same
+/// shape and read from the same place, so the two meters cannot drift into
+/// different gating idioms.
+///
+/// `epoch` is the COMMITTED epoch and nothing else — the caller passes
+/// `CommittedState::epoch`, never a node-local clock. The 2026-08-08
+/// `expected_bits` fork is the standing reason that discipline is written down
+/// at every gate rather than assumed.
+fn exit_churn_active(epoch: u64) -> bool {
+    // The rehearsal module is `cfg(test)` and cannot exist in a shipped
+    // binary — same idiom as the gate read in `deposit_funding_active`.
+    #[cfg(test)]
+    {
+        epoch >= crate::params::rehearsal::effective_exit_churn_activation()
+    }
+    #[cfg(not(test))]
+    {
+        epoch >= crate::params::EXIT_CHURN_ACTIVATION_EPOCH
     }
 }
 
@@ -2729,6 +2763,71 @@ impl CommittedState {
     ///
     /// Returns the retired validator's index. On any `Err` the state is
     /// untouched: every check runs before the first mutation.
+    /// How many validators have already been retired **during the current
+    /// epoch** — the meter [`staking::MAX_EXITS_PER_EPOCH`] is read against.
+    ///
+    /// # Why this is derived and not stored
+    ///
+    /// `apply_exit` stamps `exit_epoch = self.epoch + EXIT_DELAY_EPOCHS`, and
+    /// `EXIT_DELAY_EPOCHS` is a constant, so the map from "epoch a record was
+    /// retired in" to "the `exit_epoch` it carries" is a bijection: the records
+    /// retired this epoch are exactly those whose `exit_epoch` equals the value
+    /// this epoch would stamp. The count is therefore already a function of
+    /// committed state.
+    ///
+    /// That matters for more than tidiness. A stored per-epoch counter would be
+    /// a new field in [`CommittedState`] and so a new leaf in the state root,
+    /// which turns an inert rate limit into a state-format migration and gives
+    /// old and new binaries different roots for the same block. Deriving it
+    /// keeps the committed encoding byte-identical, which is what lets this
+    /// ship inert with no flag day of its own for the state root.
+    ///
+    /// O(validators) per exit, deliberately: [`staking::resolve_activations`]
+    /// sets the precedent that the entry-side meter is a reference
+    /// implementation replayed from committed history rather than a cache, and
+    /// the two meters should be readable side by side. At Genesis-4 set sizes
+    /// this is a scan of tens of records.
+    ///
+    /// The `u64::MAX` guard is the "not scheduled" sentinel
+    /// ([`crate::interfaces::ValidatorRecord`]): a record that never exited
+    /// must never be counted as one that did.
+    ///
+    /// # Slashing does not contaminate the count, and is not metered by it
+    ///
+    /// The slashing path writes `rec.exit_epoch = epoch` — the CURRENT epoch,
+    /// bare — while a voluntary exit stamps `epoch + EXIT_DELAY_EPOCHS`. A
+    /// slash can therefore never produce the value this scan looks for, since
+    /// that would mean being slashed 32 epochs in the future. The two writes
+    /// are unambiguous and no ejection is ever miscounted as a retirement.
+    ///
+    /// The converse is real and deliberate. Slashing takes the `min`, so an
+    /// offender who already exited THIS epoch has its stamp pulled back to
+    /// `epoch`, which drops it out of this count and frees an allowance slot.
+    /// That means the meter bounds **voluntary exits**, not total departures:
+    /// with slashings in the same epoch, more validators can leave the roster
+    /// than `MAX_EXITS_PER_EPOCH`. That is the right shape — a rate limit on
+    /// ejecting a *proven* offender would leave a proven attacker on duty —
+    /// but it is a limitation, not a rounding error, and §11.6.3 of the
+    /// flag-day runbook states it where the decision is made. Buying the freed
+    /// slot costs the attacker a slashing penalty against a validator that was
+    /// being ejected anyway, so it is not a cheap way around the meter.
+    fn exits_recorded_this_epoch(&self) -> usize {
+        let stamped = self.epoch.saturating_add(staking::EXIT_DELAY_EPOCHS);
+        if stamped == u64::MAX {
+            // Only reachable within EXIT_DELAY_EPOCHS of the end of the u64
+            // epoch space, where the stamp would collide with the sentinel and
+            // `apply_exit`'s own write would already be reading as "never
+            // exited". Pre-existing boundary, not introduced here; counting
+            // zero is the conservative reading and it is unreachable in any
+            // chain that will ever run.
+            return 0;
+        }
+        self.validators
+            .values()
+            .filter(|r| r.exit_epoch == stamped)
+            .count()
+    }
+
     pub(crate) fn apply_exit(
         &mut self,
         exit: &staking::ExitTx,
@@ -2771,6 +2870,30 @@ impl CommittedState {
             keys,
         )
         .map_err(TxReject::Exit)?;
+        // THE CHURN METER, last of the refusals and deliberately AFTER the
+        // signature. Ordering is the diagnostic: a malformed or wrongly-signed
+        // exit must report what is wrong with it, so only a message that would
+        // otherwise have been applied can ever come back `ExitChurnLimit`. A
+        // validator receiving it knows its exit is correct and needs a later
+        // epoch, nothing more. Rejecting consumes no allowance, so the order
+        // costs nothing but clarity.
+        //
+        // Inert until `params::EXIT_CHURN_ACTIVATION_EPOCH`, read through the
+        // shared `exit_churn_active` reader off the COMMITTED epoch. Note the
+        // whole method is already unreachable below the signed-exit flag day,
+        // so this is the second lock on a closed door.
+        //
+        // Surplus policy is REJECT, not defer: there is no queue of pending
+        // exits, and the argument for that choice — chiefly that an exit queue
+        // needs a deterministic order which is grindable with keys the exiting
+        // party already holds, and valuable to hold a good place in during the
+        // exact rush it would govern — is in
+        // `docs/RELANCA-G4-DIAS-DE-BANDEIRA.md` §11.6.4.
+        if exit_churn_active(self.epoch)
+            && self.exits_recorded_this_epoch() >= staking::MAX_EXITS_PER_EPOCH
+        {
+            return Err(TxReject::ExitChurnLimit);
+        }
         // All checks passed — now, and only now, the two clock writes.
         // Duties stop EXIT_DELAY_EPOCHS after the request — an exit must not
         // dodge already-assigned duties — and the stake stays slashable
@@ -6213,6 +6336,133 @@ mod tests {
                 assert_eq!(st.validator_record(0).unwrap().exit_epoch, u64::MAX);
             });
         }
+    }
+
+    /// Register `n` funded validators and run the chain to their activation.
+    /// Tags are distinct so no two share a key, a coin or a script hash.
+    fn activated_cohort(
+        t: &Transition<OkVerifier>,
+        g: &CommittedState,
+        n: u8,
+    ) -> (CommittedState, Vec<u32>) {
+        let mut st = g.clone();
+        let idxs: Vec<u32> = (0..n).map(|k| register_funded_validator(&mut st, 0xA0 + k)).collect();
+        // Run until the whole cohort is on duty. This is NOT simply
+        // `ACTIVATION_DELAY_EPOCHS` epochs: the entry meter admits
+        // `MAX_ACTIVATIONS_PER_EPOCH` per epoch, so a cohort larger than that
+        // trickles in over several boundaries — the very asymmetry the exit
+        // meter mirrors, showing up here as a fixture cost.
+        let all_active = |st: &CommittedState| {
+            let active = st.active_validators();
+            idxs.iter().all(|i| active.iter().any(|v| v.index == *i))
+        };
+        let mut guard = 0;
+        while !all_active(&st) {
+            st = t.process_epoch(&st).unwrap();
+            guard += 1;
+            assert!(guard < 64, "cohort must activate within a bounded number of epochs");
+        }
+        (st, idxs)
+    }
+
+    /// **The shipped posture.** `EXIT_CHURN_ACTIVATION_EPOCH` is `u64::MAX`, so
+    /// with only the signed-exit flag day open the whole cohort still retires
+    /// inside ONE epoch — `MAX_EXITS_PER_EPOCH` is not consulted. This is the
+    /// asymmetry the founder has not yet decided to close, pinned as a test so
+    /// that closing it is a visible change and not a silent one.
+    #[test]
+    fn exit_churn_limit_is_inert_as_shipped() {
+        crate::params::rehearsal::with_signed_exit_activation_at(0, || {
+            let (t, g, _chains) = setup(4);
+            let cohort = staking::MAX_EXITS_PER_EPOCH + 1;
+            let (mut st, idxs) = activated_cohort(&t, &g, cohort as u8);
+            let epoch = st.epoch;
+            for i in &idxs {
+                let rec = st.validator_record(*i).unwrap();
+                let exit = exit_tx_for(&rec, epoch);
+                st.apply_exit(&exit, &accept_all_keys())
+                    .expect("unmetered: every exit applies in the same epoch");
+            }
+            assert_eq!(
+                st.exits_recorded_this_epoch(),
+                cohort,
+                "more than the entry side could ever admit, in a single epoch"
+            );
+        });
+    }
+
+    /// **The armed posture.** With the churn flag day open the epoch admits
+    /// exactly `MAX_EXITS_PER_EPOCH` retirements; the surplus is REJECTED —
+    /// not queued — under its own verdict, moves no clock, and succeeds on
+    /// retry in the next epoch. That retry is the whole surplus policy: the
+    /// stake is delayed, never trapped.
+    #[test]
+    fn exit_churn_limit_meters_and_the_surplus_retries() {
+        crate::params::rehearsal::with_signed_exit_activation_at(0, || {
+            crate::params::rehearsal::with_exit_churn_activation_at(0, || {
+                let (t, g, _chains) = setup(4);
+                let cohort = staking::MAX_EXITS_PER_EPOCH + 1;
+                let (mut st, idxs) = activated_cohort(&t, &g, cohort as u8);
+                let epoch = st.epoch;
+
+                // The allowance, exactly.
+                for i in &idxs[..staking::MAX_EXITS_PER_EPOCH] {
+                    let rec = st.validator_record(*i).unwrap();
+                    let exit = exit_tx_for(&rec, epoch);
+                    st.apply_exit(&exit, &accept_all_keys()).expect("within the allowance");
+                }
+                assert_eq!(st.exits_recorded_this_epoch(), staking::MAX_EXITS_PER_EPOCH);
+
+                // One more: correct in every other respect, refused only for
+                // being one too many, and NOTHING is written.
+                let surplus = idxs[staking::MAX_EXITS_PER_EPOCH];
+                let rec = st.validator_record(surplus).unwrap();
+                let exit = exit_tx_for(&rec, epoch);
+                assert_eq!(
+                    st.apply_exit(&exit, &accept_all_keys()),
+                    Err(TxReject::ExitChurnLimit),
+                    "the surplus is rejected, not deferred into a queue"
+                );
+                assert_eq!(
+                    st.validator_record(surplus).unwrap().exit_epoch,
+                    u64::MAX,
+                    "a rate-limited exit leaves the record untouched"
+                );
+
+                // Next epoch the meter is empty again — it counts only the
+                // records THIS epoch would stamp — and the retry applies.
+                st = t.process_epoch(&st).unwrap();
+                assert_eq!(st.exits_recorded_this_epoch(), 0, "the meter is per-epoch");
+                let rec = st.validator_record(surplus).unwrap();
+                // The epoch is inside the signing root, so the retry is a
+                // freshly signed message; a captured one would be replay.
+                let retry = exit_tx_for(&rec, st.epoch);
+                st.apply_exit(&retry, &accept_all_keys()).expect("the surplus exits next epoch");
+                assert_eq!(
+                    st.validator_record(surplus).unwrap().exit_epoch,
+                    st.epoch + staking::EXIT_DELAY_EPOCHS,
+                    "delayed by one epoch, never trapped"
+                );
+            });
+        });
+    }
+
+    /// The two flag days are independent constants. Arming the churn limit
+    /// alone opens nothing: exits are still refused by the signed-exit gate,
+    /// so a mis-ordered arming can never widen what a block may contain.
+    #[test]
+    fn arming_exit_churn_alone_opens_no_exit() {
+        crate::params::rehearsal::with_exit_churn_activation_at(0, || {
+            let (t, g, _chains) = setup(4);
+            let (mut st, idxs) = activated_cohort(&t, &g, 1);
+            let rec = st.validator_record(idxs[0]).unwrap();
+            let exit = exit_tx_for(&rec, st.epoch);
+            assert_eq!(
+                st.apply_exit(&exit, &accept_all_keys()),
+                Err(TxReject::StakingNotActive),
+                "the churn meter never authorises an exit; it only refuses one"
+            );
+        });
     }
 
     /// **The 2026-08-31 closure, block level.** The legacy staking encodings

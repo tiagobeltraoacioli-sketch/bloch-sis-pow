@@ -763,6 +763,39 @@ pub mod rehearsal {
             .unwrap_or(super::SIGNED_EXIT_ACTIVATION_EPOCH)
     }
 
+    thread_local! {
+        /// Test-only override of [`super::EXIT_CHURN_ACTIVATION_EPOCH`] — the
+        /// churn twin of [`SIGNED_EXIT_ACTIVATION_TL`], carried separately for
+        /// the same reason: the two flag days are independent constants, and
+        /// the tests that matter most open ONE of them and prove the other did
+        /// not follow.
+        static EXIT_CHURN_ACTIVATION_TL: Cell<Option<u64>> = const { Cell::new(None) };
+    }
+
+    /// Run `f` with the exit-churn flag day set to `epoch` on this thread, then
+    /// restore the shipped constant — including on the unwind path.
+    #[cfg(test)]
+    pub fn with_exit_churn_activation_at<R>(epoch: u64, f: impl FnOnce() -> R) -> R {
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                EXIT_CHURN_ACTIVATION_TL.with(|c| c.set(None));
+            }
+        }
+        EXIT_CHURN_ACTIVATION_TL.with(|c| c.set(Some(epoch)));
+        let _r = Restore;
+        f()
+    }
+
+    /// The exit-churn flag day this build's readers must use: the shipped
+    /// constant, unless a test has moved it on this thread.
+    #[cfg(test)]
+    pub fn effective_exit_churn_activation() -> u64 {
+        EXIT_CHURN_ACTIVATION_TL
+            .with(Cell::get)
+            .unwrap_or(super::EXIT_CHURN_ACTIVATION_EPOCH)
+    }
+
     /// The look-ahead this build's readers must use: the shipped constant,
     /// unless a test has mutated the rule on this thread.
     #[cfg(test)]
@@ -1012,6 +1045,66 @@ pub const FUNDED_STAKING_ACTIVATION_EPOCH: u64 = u64::MAX;
 /// requirement and reading only the committed epoch.
 pub const SIGNED_EXIT_ACTIVATION_EPOCH: u64 = u64::MAX;
 
+/// Flag day for the **exit-side churn limit** — the epoch at which
+/// [`crate::staking::MAX_EXITS_PER_EPOCH`] starts bounding how many validators
+/// may retire per epoch, enforced in
+/// [`crate::transition::CommittedState::apply_exit`].
+///
+/// # The asymmetry this exists to close
+///
+/// Entry is metered and exit is not. A deposit waits
+/// [`crate::staking::ACTIVATION_DELAY_EPOCHS`] (8) and then joins a queue that
+/// admits [`crate::staking::MAX_ACTIVATIONS_PER_EPOCH`] (4) per epoch; an exit
+/// is accepted the moment it is included, with no credit to decline, so the
+/// entire active set can commit to leaving inside ONE epoch and stop being
+/// assigned duties [`crate::staking::EXIT_DELAY_EPOCHS`] (32) later. `ws.rs`
+/// records the same fact from the weak-subjectivity side.
+///
+/// # What the limit actually buys, stated honestly
+///
+/// NOT wall-clock drain time. Emptying the set takes 32 epochs with or without
+/// the limit, because `EXIT_DELAY_EPOCHS` dominates; refilling 64 slots takes
+/// 8 + 16 = 24 epochs, which is *faster*. The asymmetry is not "empties faster
+/// than it fills" in elapsed time — it is in **how much irrevocable commitment
+/// a single epoch can absorb**. An exit cannot be revoked (a record with
+/// `exit_epoch != u64::MAX` is refused), so one epoch of block space can make
+/// the loss of the whole set a settled fact that no later action undoes, while
+/// the only remedy — admitting replacements — is rate-limited to 4/epoch.
+///
+/// The limit's real content is therefore a rate relation, not a delay: with
+/// `MAX_EXITS_PER_EPOCH <= MAX_ACTIVATIONS_PER_EPOCH` the set can never shrink
+/// faster than it can be replenished. Above that ratio the limit slows an
+/// exodus without bounding it.
+///
+/// # Why this is its own constant
+///
+/// Separate from [`SIGNED_EXIT_ACTIVATION_EPOCH`] because the two are separate
+/// decisions. That constant decides whether a signed exit is *possible*; this
+/// one decides whether exits are *metered*. Deliberately there is NO ordering
+/// assertion tying the two (see the assertion block below): whether to accept
+/// the unmetered asymmetry is a liveness decision reserved to the founder, and
+/// a compile-time ordering rule would convert that open decision into a build
+/// error — arming signed exits while leaving this inert must stay buildable,
+/// because it is exactly today's documented posture.
+///
+/// # Surplus policy: REJECT, not queue
+///
+/// An exit beyond the epoch's allowance is refused
+/// ([`crate::transition::TxReject::ExitChurnLimit`]) and the validator retries
+/// in a later epoch. There is no deferred-exit queue, and adding one would
+/// require a new committed object with a deterministic order — an order that,
+/// unlike the deposit queue's, would be both grindable with keys the exiting
+/// party already owns and financially valuable to hold a good position in. See
+/// `docs/RELANCA-G4-DIAS-DE-BANDEIRA.md` §11.6.4 for the full argument and the
+/// cost of the option not taken.
+///
+/// `u64::MAX` means INERT. Same arming rules as
+/// [`FUNDED_STAKING_ACTIVATION_EPOCH`]: the epoch must be STRICTLY in the
+/// future at tag time, the fleet must be rebuilt first, and the gate reads the
+/// COMMITTED epoch (`CommittedState::epoch`) and never node-local state — the
+/// 2026-08-08 `expected_bits` fork is the standing reason.
+pub const EXIT_CHURN_ACTIVATION_EPOCH: u64 = u64::MAX;
+
 // ── The ordering the three staking gates may never be armed out of ─────────
 //
 // Checked at COMPILE TIME, because the failure mode is an edit to a constant
@@ -1035,6 +1128,17 @@ const _: () = assert!(
      signed exit is the only thing that can exit one — arming the payout first \
      ships a door with no road to it"
 );
+
+// EXIT_CHURN_ACTIVATION_EPOCH is deliberately NOT constrained against
+// SIGNED_EXIT_ACTIVATION_EPOCH here, and the omission is the decision, not an
+// oversight. Neither order is unsafe: armed churn with inert exits is dead
+// code (nothing can retire a validator), and armed exits with inert churn is
+// precisely the posture shipped today. Asserting `EXIT_CHURN <= SIGNED_EXIT`
+// would make "arm signed exits without a rate limit" a build failure — i.e. it
+// would decide a liveness question that belongs to the founder. The two
+// assertions above encode facts that are true regardless of preference (a
+// payout must not precede the thing it pays out on); this one would encode a
+// preference, so it is left out on purpose.
 
 /// Domain separation tags (§6.1). Fixed 16 bytes, right-padded with zeros, so
 /// no tag can be a prefix of another.
