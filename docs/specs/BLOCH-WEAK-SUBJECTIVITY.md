@@ -600,8 +600,22 @@ document does is bound it, and the bounds are worth stating exactly:
 Every constant is a Phase 1 review item and lands with a KAT (A1) and a devnet
 sweep (A3), per the rules of engagement. The KAT set must include: envelope
 verification vectors (valid; m−1 sigs; quorum without external; duplicate
-signer index; wrong `network_id`; rollback attempt), and the boot state
-machine (§4.2) exercised at the three age boundaries.
+signer index; **duplicate signer KEY across two slots**; wrong `network_id`;
+rollback attempt), and the boot state machine (§4.2) exercised at the three
+age boundaries.
+
+> **The duplicate-KEY vector was missing from this list, and that omission is
+> where the bug came from.** "Duplicate signer index" was specified, built and
+> tested; nothing ever compared two slots' key bytes, in `SignerSet`, in
+> `matches_policy`, in the file decoders, or in `verify_envelope`. An
+> arrangement seating one key in two slots is therefore a 1-of-n that every
+> client accepts, and if the two slots differ in subset it defeats the
+> external minimum of §6.1 as well — the very rule this document calls a
+> "verification requirement, not a policy hope". Reproduced end to end with
+> real ML-DSA-65 ‖ Falcon-1024 keys on 2026-09-01. The rule now exists in
+> `ws.rs` as `WS_DISTINCT_KEYS_ENFORCED_FROM_EPOCH` and **ships inert**;
+> arming it is a governance decision, and the fork-safety argument for doing
+> so is on `verify_envelope`.
 
 | Deliverable | Owner |
 |---|---|

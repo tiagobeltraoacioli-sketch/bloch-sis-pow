@@ -138,7 +138,11 @@ bloch-pos ws-checkpoint \
   --out checkpoints/wscheckpoint-<epoch>
 ```
 
-Give **at least two** `--rpc` endpoints, on independently operated nodes. A
+Give **at least two** `--rpc` endpoints, on **different hosts** — see the
+concrete endpoint table in `CHECKPOINT-CEREMONY-CHECKLIST.md` §3, which names
+the two that are reachable from outside the fleet today. Two ports on one box
+are two validator processes but one witness, and `ws-checkpoint` now says so
+rather than counting them as two. A
 forked node answers as confidently as a correct one; the tool refuses on any
 disagreement and prints a single-endpoint warning if you give it only one. This
 fleet has had real forks — treat the warning as a stop.

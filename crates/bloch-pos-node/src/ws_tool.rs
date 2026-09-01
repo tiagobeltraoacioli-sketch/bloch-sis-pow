@@ -306,6 +306,77 @@ fn view_of(addr: &str, epoch: u64) -> Result<ChainView, String> {
     Ok(ChainView { genesis_block, boundary_slot, block_root, state_root })
 }
 
+/// The **witness** an `--rpc` endpoint represents, for the purpose of asking
+/// "is this two independent witnesses or one wearing two hats?"
+///
+/// Counting endpoint *strings* answers the wrong question. On this fleet a
+/// single box forwards three ports to three different validators
+/// (`:8080`/`:8880`/`:2052` → `16400+i`/`16407+i`/`16414+i`), and every box is
+/// reachable under a bare IP and under a `nip.io` wildcard name for the same
+/// IP. So `139.84.201.52:8080`, `139.84.201.52.nip.io:8080` and
+/// `139.84.201.52:2052` are three strings, three `ChainView`s that agree, and
+/// **one operator, one machine, one binary, one maintenance window**. The
+/// runbook asks for two *independently operated* nodes; two processes on one
+/// box are not that, and the disagreement check cannot notice because honest
+/// nodes are supposed to agree.
+///
+/// Normalising to the host — with `nip.io`/`sslip.io` wildcard names folded
+/// back to the address they encode — makes the count mean what the runbook
+/// means. It is deliberately conservative: it can merge two genuinely
+/// separate machines behind one name (a load balancer), which produces an
+/// unnecessary warning, never a missing one.
+fn witness_host(addr: &str) -> String {
+    // Strip a scheme and any path, then the port.
+    let a: &str = addr.rsplit("://").next().unwrap_or(addr);
+    let a = a.split('/').next().unwrap_or(a);
+    // A trailing root dot may sit on the name (`example.com.:8080`) or, from
+    // a sloppy paste, after the port. Trim before and after the port split.
+    let a = a.trim_end_matches('.');
+    let host = match a.rsplit_once(':') {
+        // Guard against IPv6 literals, where the last colon is not a port.
+        Some((h, port)) if !h.contains(':') && port.chars().all(|c| c.is_ascii_digit()) => h,
+        _ => a,
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    // Wildcard-DNS services encode the address in the name. All of
+    // `1.2.3.4.nip.io`, `1-2-3-4.sslip.io` and `anything.1.2.3.4.nip.io`
+    // resolve to 1.2.3.4, so all of them are the same witness.
+    for suffix in [".nip.io", ".sslip.io", ".xip.io"] {
+        if let Some(stem) = host.strip_suffix(suffix) {
+            // Dashed form, always the last label: `1-2-3-4`.
+            if let Some(last) = stem.rsplit('.').next() {
+                let dotted = last.replace('-', ".");
+                if is_ipv4_literal(&dotted) {
+                    return dotted;
+                }
+            }
+            // Dotted form, possibly with a prefix: take the trailing four
+            // labels when they form an address, else the whole stem.
+            let labels: Vec<&str> = stem.split('.').collect();
+            if labels.len() >= 4 {
+                let tail = labels[labels.len() - 4..].join(".");
+                if is_ipv4_literal(&tail) {
+                    return tail;
+                }
+            }
+            return stem.to_string();
+        }
+    }
+    host
+}
+
+/// Four dot-separated decimal octets. Used only to decide whether a
+/// wildcard-DNS label really encodes an address; a wrong answer costs an
+/// unnecessary warning, never a suppressed one.
+fn is_ipv4_literal(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('.').collect();
+    parts.len() == 4
+        && parts.iter().all(|p| {
+            !p.is_empty() && p.len() <= 3 && p.chars().all(|c| c.is_ascii_digit())
+                && p.parse::<u16>().map(|n| n <= 255).unwrap_or(false)
+        })
+}
+
 // ─── ws-keygen ──────────────────────────────────────────────────────────────
 
 /// `ws-keygen --out <prefix>` → `<prefix>.pk` (0644) and `<prefix>.sk`
@@ -485,6 +556,19 @@ fn checkpoint(args: &[String]) -> Result<(), String> {
     if rpcs.is_empty() {
         return Err("--rpc needs at least one <host:port>".into());
     }
+    // A repeated endpoint is a typo, not a policy question: it would silence
+    // the single-witness warning below while adding no witness at all.
+    for i in 0..rpcs.len() {
+        for j in (i + 1)..rpcs.len() {
+            if rpcs[i] == rpcs[j] {
+                return Err(format!(
+                    "--rpc lists `{}` twice. Two copies of one endpoint are one witness; \
+                     listing it again would only silence the single-endpoint warning.",
+                    rpcs[i]
+                ));
+            }
+        }
+    }
     let epoch: u64 =
         req(args, "--epoch")?.parse().map_err(|_| "--epoch must be an epoch number".to_string())?;
     if epoch == 0 {
@@ -564,11 +648,35 @@ fn checkpoint(args: &[String]) -> Result<(), String> {
             hex32(&genesis_root),
         ));
     }
-    if views.len() == 1 {
+    // Count WITNESSES, not endpoints (see `witness_host`). Agreement between
+    // two ports on one box is not the corroboration the runbook asks for, and
+    // before this the aliasing silently satisfied the check.
+    let mut hosts: Vec<String> = rpcs.iter().map(|a| witness_host(a)).collect();
+    hosts.sort();
+    hosts.dedup();
+    if hosts.len() == 1 {
+        if rpcs.len() > 1 {
+            println!(
+                "WARNING: {} endpoints, but all resolve to ONE host ({}) — that is one \
+                 witness, not {}. Two ports on one machine share an operator, a binary \
+                 and a maintenance window, and they agree with each other by construction. \
+                 Re-run with --rpc <a>,<b> on DIFFERENT hosts before the ceremony signs it.",
+                rpcs.len(),
+                hosts[0],
+                rpcs.len(),
+            );
+        } else {
+            println!(
+                "WARNING: single RPC endpoint — this artifact rests on one node's word. \
+                 Re-run with --rpc <a>,<b> against independently operated nodes before the \
+                 ceremony signs it."
+            );
+        }
+    } else {
         println!(
-            "WARNING: single RPC endpoint — this artifact rests on one node's word. \
-             Re-run with --rpc <a>,<b> against independently operated nodes before the \
-             ceremony signs it."
+            "{} endpoints across {} distinct hosts agree on the epoch-{epoch} checkpoint.",
+            rpcs.len(),
+            hosts.len()
         );
     }
 
@@ -851,6 +959,18 @@ fn explain_reject(r: &ws::EnvelopeReject, set: &SignerSet) -> String {
             "signer index {index} appears twice. One key must not count twice toward the \
              quorum — most likely the same signer's file was collected from two machines."
         ),
+        E::DuplicateSignerKey { slot_a, slot_b } => format!(
+            "SECURITY: slots {slot_a} and {slot_b} of arrangement {} hold the SAME public \
+             key. That is not a {}-of-{} — one keyholder signs once, lists the identical \
+             signature at both indices, and the index-uniqueness rule never fires because \
+             the indices differ. If the two slots also differ in subset, the >={} external \
+             minimum falls with it. The arrangement is the fault, not the signatures: \
+             re-run the §2 ceremony confirming every holder's .pk fingerprint DIFFERS.",
+            set.id,
+            set.threshold,
+            set.signers.len(),
+            set.min_external
+        ),
         E::QuorumNotReached { got, need } => format!(
             "{got} signature(s), but arrangement {} needs {need}. Collect {} more.",
             set.id,
@@ -1032,6 +1152,24 @@ fn verify(args: &[String]) -> Result<(), String> {
 
     match ws::verify_envelope(&env, &set, network_id, &genesis_root, &WsHybridVerifier) {
         Ok(ok) => {
+            if let Some((a, b)) = ok.unsound_arrangement {
+                println!(
+                    "!!!! UNSOUND ARRANGEMENT: slots {a} and {b} hold the SAME public key."
+                );
+                println!(
+                    "     The signatures below are valid, and the quorum count is still a"
+                );
+                println!(
+                    "     lie: ONE keyholder can produce them all. ws::verify_envelope"
+                );
+                println!(
+                    "     ACCEPTS this today — the §6.1 distinct-key rule ships inert"
+                );
+                println!(
+                    "     (ws::WS_DISTINCT_KEYS_ENFORCED_FROM_EPOCH). DO NOT PUBLISH."
+                );
+                println!();
+            }
             if ok.arrangement_past_review {
                 println!(
                     "WARNING: the arrangement is past its 12-month review deadline (epoch {}, \
@@ -1375,6 +1513,52 @@ mod tests {
         .unwrap_err();
         assert!(e.contains("unsound"), "{e}");
         assert!(!Path::new(&out).exists());
+    }
+
+    /// Endpoint aliasing: the fleet reaches one box under several names and
+    /// ports, so counting `--rpc` strings overstates the witnesses. Every
+    /// pair below is ONE machine.
+    #[test]
+    fn aliased_endpoints_collapse_to_one_witness() {
+        // Bare IP, wildcard-DNS name for the same IP, and a second forwarder
+        // port on the same box: one witness.
+        assert_eq!(witness_host("139.84.201.52:8080"), "139.84.201.52");
+        assert_eq!(witness_host("139.84.201.52.nip.io:8080"), "139.84.201.52");
+        assert_eq!(witness_host("http://139.84.201.52.nip.io:8080/"), "139.84.201.52");
+        assert_eq!(witness_host("139.84.201.52:2052"), "139.84.201.52");
+        assert_eq!(witness_host("139.84.201.52:16400"), "139.84.201.52");
+        assert_eq!(witness_host("136-244-82-226.sslip.io"), "136.244.82.226");
+        assert_eq!(witness_host("node.139.84.201.52.nip.io:8080"), "139.84.201.52");
+        // A wildcard-DNS name whose stem is NOT an address stays whole,
+        // rather than collapsing to a meaningless last label.
+        assert_eq!(witness_host("alpha.beta.nip.io"), "alpha.beta");
+        // Case and a trailing dot are the same name.
+        assert_eq!(witness_host("Node-A.Example.COM.:8080"), "node-a.example.com");
+        assert_eq!(witness_host("Node-A.Example.COM:8080."), "node-a.example.com");
+
+        // Violating the guard: genuinely different hosts must stay distinct,
+        // or the warning would fire on a correct ceremony.
+        assert_ne!(
+            witness_host("139.84.201.52:8880"),
+            witness_host("139.84.202.139:2052")
+        );
+        assert_ne!(witness_host("[2001:db8::1]:8080"), witness_host("[2001:db8::2]:8080"));
+    }
+
+    /// A repeated endpoint must be refused outright: it adds no witness and
+    /// would silence the warning that says so.
+    #[test]
+    fn checkpoint_refuses_a_repeated_rpc_endpoint() {
+        let e = checkpoint(&[
+            s("--genesis"), s("/nonexistent.manifest"),
+            s("--rpc"), s("127.0.0.1:1,127.0.0.1:1"),
+            s("--epoch"), s("1536"),
+            s("--signer-set-id"), s("1"),
+            s("--out"), s("/nonexistent/cp"),
+        ])
+        .unwrap_err();
+        assert!(e.contains("twice"), "{e}");
+        assert!(e.contains("one witness"), "{e}");
     }
 
     /// Below threshold. `ws-envelope` must not produce the file at all — the

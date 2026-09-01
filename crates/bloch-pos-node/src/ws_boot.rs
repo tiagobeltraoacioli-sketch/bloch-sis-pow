@@ -352,6 +352,26 @@ pub fn boot(
                     hex32(&env.checkpoint.ws_digest())
                 ))
             })?;
+        // The arrangement seats one key in two slots: the m-of-n is a 1-of-n
+        // and its single holder can mint this envelope alone. Reported by
+        // `verify_envelope` whether or not the §6.1 distinct-key flag day is
+        // armed (`ws::WS_DISTINCT_KEYS_ENFORCED_FROM_EPOCH`); while it is
+        // inert, the boot still proceeds and this is the only thing that
+        // tells the operator. Say so without hedging.
+        if let Some((a, b)) = ok.unsound_arrangement {
+            warnings.push(format!(
+                "!!!! UNSOUND ARRANGEMENT: signer set {} holds the SAME public key in \
+                 slots {a} and {b}. This is not an m-of-n — one keyholder alone can \
+                 produce a quorum, and if the two slots differ in subset the external \
+                 minimum falls with it. This node is proceeding ONLY because the \
+                 distinct-key rule ships inert; the anchor you just adopted is worth \
+                 exactly one signature. Do not treat this checkpoint as published \
+                 under a {}-of-{}. Escalate.",
+                set.id,
+                set.threshold,
+                set.signers.len(),
+            ));
+        }
         if ok.arrangement_past_review {
             warnings.push(format!(
                 "WARNING: signer arrangement {} is past its 12-month review deadline \

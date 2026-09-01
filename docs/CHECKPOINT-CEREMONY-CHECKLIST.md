@@ -10,6 +10,25 @@ Every command below is the real one. Substitute only the values in `<>`.
 
 ---
 
+## 0.0 What is NOT yet enforced by software — read this once
+
+Two claims elsewhere in this repo are stronger than the code. Both are stated
+here so nobody discovers them during a ceremony.
+
+1. **"The external minimum is enforced by every client, not by ceremony
+   discipline"** is true only for a *sound* arrangement. An arrangement that
+   seats one key in an internal slot and again in an external slot defeats
+   both the threshold and the external minimum at once, and
+   `ws::verify_envelope` accepts it — reproduced end to end with real hybrid
+   keys. §2's fingerprint comparison is what prevents that, and until
+   `WS_DISTINCT_KEYS_ENFORCED_FROM_EPOCH` is armed it is the *only* thing
+   preventing it at the network layer.
+2. **`ws-verify` printing `ACCEPTED` is not the same as "sound".** Read the
+   `!!!! UNSOUND ARRANGEMENT` block if it appears; the verdict line below it
+   will still say `ACCEPTED`.
+
+---
+
 ## 0. Roles, machines, and the one rule that matters
 
 | role | machine | holds | touches the network |
@@ -63,8 +82,17 @@ If it is not, fix the mode, then treat the key as compromised and regenerate.
 
 Each holder reads their `.pk` fingerprint aloud. M reads back what M received.
 **Confirm all three fingerprints are DIFFERENT from each other.** If two match,
-stop: one key seated in two slots turns a 2-of-3 into a 1-of-3, and the
-publication tooling — not the network — is what refuses it (see §6, F11).
+stop: one key seated in two slots turns a 2-of-3 into a 1-of-3.
+
+**This comparison is load-bearing, and it is the only thing standing here.**
+The publication tooling refuses to build or assemble against such a set, and
+`SignerSet::matches_policy` now refuses it as a shape, so an arrangement
+minted by `ws-signer-set` cannot carry a repeated key. But a signer-set file
+hand-encoded outside the tool still verifies: `ws::verify_envelope` gained the
+distinct-key rule as **`WS_DISTINCT_KEYS_ENFORCED_FROM_EPOCH`, which ships
+INERT (`u64::MAX`)**. Until it is armed, a node handed such an arrangement
+boots, prints `!!!! UNSOUND ARRANGEMENT`, and proceeds. So: the network warns,
+the tooling refuses, and **this call is what prevents it.**
 
 Write the three fingerprints into the ceremony record, in slot order. The order
 you list them below **is** the signer index, forever.
@@ -112,6 +140,46 @@ bloch-pos ws-checkpoint \
 Two `--rpc` endpoints on **independently operated** nodes. If the tool prints a
 single-endpoint warning, stop and find a second node — this fleet has forked
 before, and a forked node answers as confidently as a correct one.
+
+**Which two endpoints, concretely (2026-09-01).** The validators' own `164xx`
+RPC ports are *not* world-open: the only `ufw` rule is a single-source
+allowlist naming the founder's workstation, and it exists on 3 of 63
+validators. From any other machine they time out. The reachable surface is:
+
+| from | endpoint | fronts |
+| --- | --- | --- |
+| anywhere | `https://posternlabs.com/g4rpc` | a Cloudflare Worker over 9 upstreams, 2-of-N quorum |
+| anywhere | `<fleet-host>:8880` | validator `16407+i` on that host |
+| anywhere | `<fleet-host>:2052` | validator `16414+i` on that host |
+
+The seven fleet hosts are `139.84.201.52`, `139.84.202.139`, `139.84.204.46`,
+`139.84.205.54`, `149.28.180.128`, `67.219.108.230`, `67.219.108.96`.
+
+**So the runbook's requirement is already satisfiable today, with no firewall
+change** — pick two ports on two *different* hosts, e.g.:
+
+```
+--rpc 139.84.201.52:8880,139.84.202.139:2052
+```
+
+That is two validators, two machines, two boxes. Three cautions:
+
+1. **Do not use `posternlabs.com/g4rpc` as one of the two.** It is a proxy,
+   not a node: it already answers from whichever upstreams agree, it is *soft*
+   on `getchaininfo` (it will return a single uncorroborated node's answer
+   rather than error), and pointing the tool at it twice, or at it plus one of
+   the nodes behind it, is one witness wearing two hats.
+2. **Two ports on the SAME host are one witness.** They are two validator
+   processes, but one operator, one binary, one maintenance window — and they
+   agree by construction. `ws-checkpoint` now counts distinct *hosts* rather
+   than distinct `--rpc` strings, folds `nip.io`/`sslip.io` wildcard names back
+   to the address they encode, and refuses a literally repeated endpoint. It
+   will tell you when your two endpoints are one witness.
+3. **Ports 8880 and 2052 are scheduled for deletion.** `harden-rpc.sh` stage 2
+   proposes closing them because they have no consumer. They now have one:
+   this ceremony. Either exempt them, or move the ceremony to a pair of
+   endpoints that survives the hardening — but do not let stage 2 land while
+   this checklist points at them.
 
 Produces `wscheckpoint-<epoch>.bin` (154 bytes — **this is the artifact**),
 `wscheckpoint-<epoch>.json` (human view, not the artifact), and prints the
@@ -273,7 +341,8 @@ Everything below was reproduced deliberately in rehearsal.
 | `signer-set id 0 is reserved` | You passed `--id 0`. | The first real arrangement is `--id 1`. |
 | `FRESHNESS ... STALE` | Valid, but past the halfway mark of the window. | Publish the next epoch now. ~11 days of margin remain. |
 | `FRESHNESS ... EXPIRED` | Valid signatures, useless artifact. | A fresh node given this still refuses. Publish immediately; this is a liveness incident. |
-| `!!!! UNSOUND ARRANGEMENT` | Two slots hold the same public key. | **Security incident.** The arrangement is a 1-of-n. Do not publish. Re-run §2 confirming all three fingerprints differ. |
+| `!!!! UNSOUND ARRANGEMENT` | Two slots hold the same public key. | **Security incident.** The arrangement is a 1-of-n and one keyholder produced every signature in it. Do not publish. Re-run §2 confirming all three fingerprints differ. Note that this is a **warning, not a refusal**: `ws::verify_envelope` still ACCEPTS such an envelope, because the distinct-key rule ships inert. A node that boots on it says the same thing and keeps going. |
+| `DuplicateSignerKey { slot_a, slot_b }` | Same cause as the row above, but from a build where `WS_DISTINCT_KEYS_ENFORCED_FROM_EPOCH` has been armed. | The arrangement is the fault, not the signatures. Governance must adopt a sound arrangement under a **new `--id`**. Signing again cannot help. |
 | `WS_CONFLICT` at a joiner's boot | The published checkpoint contradicts that node's own finality. | **Escalate immediately.** Either the signers published a false checkpoint or that node is on a forged branch. Never delete a data directory to "fix" this — that destroys the evidence. |
 
 **A signature that does not verify is never fixed by signing again.** Find out

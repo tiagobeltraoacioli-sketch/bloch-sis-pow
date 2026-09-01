@@ -309,6 +309,44 @@ pub const WS_PHASE_B_SIGNERS: usize = 5;
 /// Phase B minimum valid signatures from the external subset.
 pub const WS_PHASE_B_MIN_EXTERNAL: usize = 2;
 
+/// **Flag day for distinct-key enforcement (§6.1, INERT).**
+///
+/// `u64::MAX` means "never": with this value every code path below behaves
+/// exactly as it did before the rule existed. Arming it is a founder
+/// decision and a release decision, not a code-review one.
+///
+/// ## What the rule is
+///
+/// The quorum has always counted distinct signer *indices*, not distinct
+/// *keys*. [`verify_envelope`]'s [`EnvelopeReject::DuplicateSigner`] fires
+/// when one index is listed twice, and until now nothing anywhere compared
+/// two slots' `pubkey` bytes — not [`SignerSet`], not
+/// [`SignerSet::matches_policy`], not the file decoders. An arrangement that
+/// seats ONE key in TWO slots is therefore a 1-of-n wearing an m-of-n's
+/// clothes: its single holder signs once, the byte-identical signature is
+/// listed at both indices, the indices differ, and every rule passes. Seat
+/// the duplicate once `internal` and once `external` and `min_external`
+/// falls in the same stroke — the rule §6.1 leans on to make two
+/// founder-adjacent keys not a quorum.
+///
+/// ## Why an epoch, and why arming it retroactively is the right move
+///
+/// The gate is judged against the checkpoint's own `epoch`, like
+/// [`SignerSet::hard_stop`], so a given artifact verifies identically on
+/// every machine. That has one sharp edge worth stating: a *future* flag-day
+/// epoch is dodgeable. An attacker holding a duplicate-key arrangement can
+/// simply mint a checkpoint whose `epoch` is below the flag day, and the
+/// forgery survives for as long as that epoch stays inside the freshness
+/// window ([`WS_PERIOD_EPOCHS`]).
+///
+/// The fix is to arm it at an epoch **already in the past**. Normally a
+/// consensus rule may not be applied retroactively; this one may, because it
+/// is not a consensus rule in the fork-choice sense — see the fork-safety
+/// note on [`verify_envelope`]. Nothing in the network re-judges old
+/// artifacts; the only effect is that a duplicate-key arrangement stops
+/// admitting *anyone*, at any epoch, the moment the binary ships.
+pub const WS_DISTINCT_KEYS_ENFORCED_FROM_EPOCH: u64 = u64::MAX;
+
 /// Reserved `signer_set_id` of the genesis anchor. No envelope exists for it:
 /// the genesis block is release-baked and its trust is the signed Genesis-3
 /// snapshot whose digest it embeds, not a Foundation quorum.
@@ -367,6 +405,36 @@ impl SignerSet {
             && self.signers.iter().filter(|s| s.external).count() >= min_external
             && self.threshold <= self.signers.len()
             && self.min_external <= self.threshold
+            // An arrangement holding one key in two slots satisfies every
+            // count above while being a 1-of-n. This clause is NOT on the
+            // acceptance path (`verify_envelope` does not call this
+            // function), so tightening it changes nothing about what a node
+            // accepts — it only stops such a set passing a release-build or
+            // tooling shape gate, where the arrangement is born.
+            && self.duplicate_key_slots().is_none()
+    }
+
+    /// The first pair of slots holding byte-identical public keys, if any.
+    ///
+    /// Cost is `n(n-1)/2` comparisons of [`HYBRID_PK_BYTES`] bytes — for the
+    /// §6.1 shapes (n = 3, then 5) that is 3 and 10 memcmps of ~4 KB. A
+    /// single hybrid verification is ~7.3M instructions; this is noise beside
+    /// it, which is why [`verify_envelope`] can afford to run it before the
+    /// signature loop rather than merging it into one.
+    ///
+    /// Deliberately NOT short-circuited on `external`: two slots holding the
+    /// same key are unsound whatever their subset flags say. The
+    /// internal/external pairing is merely the *worst* case, because it
+    /// defeats `min_external` as well as `threshold`.
+    pub fn duplicate_key_slots(&self) -> Option<(u8, u8)> {
+        for i in 0..self.signers.len() {
+            for j in (i + 1)..self.signers.len() {
+                if self.signers[i].pubkey == self.signers[j].pubkey {
+                    return Some((i as u8, j as u8));
+                }
+            }
+        }
+        None
     }
 }
 
@@ -410,6 +478,12 @@ pub enum EnvelopeReject {
     /// Fewer external signatures than the minimum — a quorum consisting only
     /// of founder-adjacent keys must not verify (rule 4).
     ExternalQuorumNotReached { got: usize, need: usize },
+    /// Two slots of the arrangement hold the SAME public key, making it a
+    /// 1-of-n: one holder signs once and lists the identical signature at
+    /// both indices, so [`EnvelopeReject::DuplicateSigner`] — which compares
+    /// indices — never fires. Gated by
+    /// [`WS_DISTINCT_KEYS_ENFORCED_FROM_EPOCH`], inert until it is armed.
+    DuplicateSignerKey { slot_a: u8, slot_b: u8 },
     /// A listed signature failed either half of the hybrid. Every listed
     /// signature must verify — a mixture of valid and junk signatures is
     /// malformed, not "enough valid ones".
@@ -422,6 +496,18 @@ pub struct EnvelopeOk {
     /// The arrangement is past its 12-month review deadline (but inside
     /// grace). Accept, warn loudly: the review ADR is overdue.
     pub arrangement_past_review: bool,
+    /// Two slots of the arrangement hold the same public key — the quorum is
+    /// a 1-of-n (see [`WS_DISTINCT_KEYS_ENFORCED_FROM_EPOCH`]).
+    ///
+    /// This field is populated **whether or not** the flag day is armed, and
+    /// that is the point of shipping the rule inert: a node and `ws-verify`
+    /// can scream about an unsound arrangement from the day the binary
+    /// ships, with zero change to what is accepted. When the flag day is
+    /// armed this can no longer be `Some` on a successful verification —
+    /// the same condition returns [`EnvelopeReject::DuplicateSignerKey`]
+    /// instead — so a release that arms it should also drop any handling
+    /// that treats this as a warning.
+    pub unsound_arrangement: Option<(u8, u8)>,
 }
 
 /// Verify an envelope against the arrangement and the chain identity the
@@ -432,7 +518,47 @@ pub struct EnvelopeOk {
 /// 2. every listed signature verifies over `ws_digest` under BOTH halves
 ///    (the AND-composition is [`crate::staking`]'s, called — not copied),
 /// 3. at least `set.threshold` signatures,
-/// 4. at least `set.min_external` from externally-flagged signers.
+/// 4. at least `set.min_external` from externally-flagged signers,
+/// 5. (INERT — [`WS_DISTINCT_KEYS_ENFORCED_FROM_EPOCH`]) no two slots of the
+///    arrangement hold the same public key. Rules 1 and 3 count *indices*;
+///    without rule 5 an arrangement seating one key twice is a 1-of-n that
+///    every client accepts.
+///
+/// # Fork safety of tightening this function
+///
+/// Tightening rule 5 changes what a node accepts, which reads like a hard
+/// fork and is not one. This function is called from exactly one production
+/// site — the node's boot path, on a file the *operator* supplies
+/// (`--ws-checkpoint`). A checkpoint envelope is never gossiped, never
+/// embedded in a block, and never an input to fork choice or to block
+/// validation; the engine's only use of this module afterwards is
+/// [`cross_check`] against an anchor already admitted. So:
+///
+/// * **Sound arrangement (every slot a different key): no divergence at
+///   all.** Old and new binaries return the identical verdict on every
+///   envelope. This is the only case that exists today if the ceremony was
+///   run correctly, and it is publicly checkable — the arrangement file ships
+///   with every envelope.
+/// * **Unsound arrangement, honest checkpoint:** the old binary boots and
+///   adopts the anchor; the new one refuses to boot. Nobody follows a
+///   *different* chain — some nodes follow *none* until a sound arrangement
+///   is published. That is a liveness event for new joiners, not a split.
+/// * **Unsound arrangement, forged checkpoint:** the old binary can be walked
+///   onto a false history; the new one cannot. The divergence here is the
+///   hazard the rule removes, and it exists today whether or not the rule
+///   ships.
+///
+/// In no case do two sets of nodes finalize different chains, because the
+/// artifact this function judges is not a consensus message. Two further
+/// facts bound it: [`accept`] refuses an envelope older than the stored
+/// `ws_latest`, and [`cross_check`] guarantees a checkpoint never reorganizes
+/// a node that has finality of its own — only the fresh and the long-offline
+/// can be moved by the signers at all.
+///
+/// The corollary is stated on the constant: because no split can open, this
+/// is the rare tightening that may be armed at an epoch *already past*, which
+/// is the only way to close the dodge of minting a checkpoint below a future
+/// flag day.
 pub fn verify_envelope(
     env: &CheckpointEnvelope,
     set: &SignerSet,
@@ -463,6 +589,21 @@ pub fn verify_envelope(
     // wall clock: the artifact must verify identically on every machine.
     if cp.epoch > set.hard_stop() {
         return Err(EnvelopeReject::ArrangementExpired { hard_stop_epoch: set.hard_stop() });
+    }
+
+    // Rule 5 (§6.1): the arrangement itself must not seat one key twice.
+    // Judged here — after the envelope is known to name THIS arrangement, and
+    // before anything about the signature list is examined — because an
+    // unsound arrangement is a fault of the SET, not of the envelope: no list
+    // of signatures against it means anything. Costs a handful of memcmps;
+    // see `duplicate_key_slots`.
+    let unsound = set.duplicate_key_slots();
+    if let Some((slot_a, slot_b)) = unsound {
+        if cp.epoch >= WS_DISTINCT_KEYS_ENFORCED_FROM_EPOCH {
+            return Err(EnvelopeReject::DuplicateSignerKey { slot_a, slot_b });
+        }
+        // Inert: fall through and report it in `EnvelopeOk` instead, so the
+        // alarm is available before the rule is armed.
     }
 
     // Index validity and uniqueness before any signature math.
@@ -505,7 +646,10 @@ pub fn verify_envelope(
         }
     }
 
-    Ok(EnvelopeOk { arrangement_past_review: cp.epoch > set.review_deadline() })
+    Ok(EnvelopeOk {
+        arrangement_past_review: cp.epoch > set.review_deadline(),
+        unsound_arrangement: unsound,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -951,6 +1095,121 @@ mod tests {
             verify_envelope(&envelope(&[2]), &phase_a_set(), NET, &GEN, &poison_all),
             Err(EnvelopeReject::QuorumNotReached { got: 1, need: WS_PHASE_A_THRESHOLD })
         );
+    }
+
+    /// The arrangement that seats ONE key in TWO slots — the §6.1 forgery.
+    ///
+    /// Slot 0 is internal, slot 2 external, both holding key `10`. One holder
+    /// signs once; the identical signature is listed at indices 0 and 2. The
+    /// indices differ, so `DuplicateSigner` never fires; the external count
+    /// sees slot 2 and is satisfied; the quorum count sees two entries. Every
+    /// rule passes and the "2-of-3, >=1 external" is a 1-of-3.
+    fn one_key_two_slots_set() -> SignerSet {
+        SignerSet {
+            id: 1,
+            signers: vec![signer(10, false), signer(11, false), signer(10, true)],
+            threshold: WS_PHASE_A_THRESHOLD,
+            min_external: WS_PHASE_A_MIN_EXTERNAL,
+            adopted_epoch: 0,
+        }
+    }
+
+    #[test]
+    fn duplicate_key_is_reported_while_the_rule_is_inert() {
+        // The flag day is u64::MAX (inert), so acceptance is UNCHANGED: the
+        // forgery still verifies, exactly as it does on every deployed
+        // binary. What is new is that the verdict now carries the alarm.
+        assert_eq!(
+            WS_DISTINCT_KEYS_ENFORCED_FROM_EPOCH,
+            u64::MAX,
+            "the distinct-key rule must ship INERT; arming it is a founder decision"
+        );
+        let ok = verify_envelope(&envelope(&[0, 2]), &one_key_two_slots_set(), NET, &GEN, &accept_all())
+            .expect("inert: the forgery is still accepted, and that is the finding");
+        assert_eq!(ok.unsound_arrangement, Some((0, 2)));
+
+        // Violating the guard: a SOUND arrangement must never trip it.
+        let ok = verify_envelope(&envelope(&[0, 2]), &phase_a_set(), NET, &GEN, &accept_all())
+            .expect("must verify");
+        assert_eq!(ok.unsound_arrangement, None);
+    }
+
+    #[test]
+    fn duplicate_key_is_refused_once_the_flag_day_is_reached() {
+        // Exercises the ARMED branch without touching the constant. The gate
+        // is `cp.epoch >= WS_DISTINCT_KEYS_ENFORCED_FROM_EPOCH`, so a
+        // checkpoint at epoch u64::MAX is on the far side of it whatever the
+        // constant is set to. `adopted_epoch = u64::MAX` saturates
+        // `hard_stop` to u64::MAX so the §6.3 dead-man's switch does not fire
+        // first and mask the result.
+        let mut set = one_key_two_slots_set();
+        set.adopted_epoch = u64::MAX;
+        let mut env = envelope(&[0, 2]);
+        env.checkpoint.epoch = u64::MAX;
+        assert_eq!(
+            verify_envelope(&env, &set, NET, &GEN, &accept_all()),
+            Err(EnvelopeReject::DuplicateSignerKey { slot_a: 0, slot_b: 2 })
+        );
+
+        // Violating the guard: the SAME envelope against a sound arrangement
+        // of the same shape must still be accepted at the same epoch, so the
+        // rejection above is attributable to the duplicate key and to nothing
+        // else about epoch u64::MAX.
+        let mut sound = phase_a_set();
+        sound.adopted_epoch = u64::MAX;
+        assert!(verify_envelope(&env, &sound, NET, &GEN, &accept_all()).is_ok());
+    }
+
+    #[test]
+    fn duplicate_key_is_refused_before_any_signature_verification() {
+        // Cheapest-first discipline: poison every key. If the signature loop
+        // ran, this would report BadSignature. The arrangement check must
+        // fire first — an unsound SET makes any list of signatures moot.
+        let mut set = one_key_two_slots_set();
+        set.adopted_epoch = u64::MAX;
+        let mut env = envelope(&[0, 2]);
+        env.checkpoint.epoch = u64::MAX;
+        assert_eq!(
+            verify_envelope(&env, &set, NET, &GEN, &MarkerVerifier { poison: 10 }),
+            Err(EnvelopeReject::DuplicateSignerKey { slot_a: 0, slot_b: 2 })
+        );
+    }
+
+    #[test]
+    fn duplicate_key_defeats_the_external_minimum() {
+        // The half of the finding that matters most: the duplicate occupies
+        // one internal and one external slot, so a single INTERNAL holder
+        // satisfies `min_external`. Proven by contrast — the same two listed
+        // indices against a sound set are refused for want of an external.
+        let forged = one_key_two_slots_set();
+        assert!(verify_envelope(&envelope(&[0, 2]), &forged, NET, &GEN, &accept_all()).is_ok());
+        assert_eq!(forged.signers[0].pubkey, forged.signers[2].pubkey);
+        assert!(!forged.signers[0].external && forged.signers[2].external);
+        assert_eq!(
+            verify_envelope(&envelope(&[0, 1]), &phase_a_set(), NET, &GEN, &accept_all()),
+            Err(EnvelopeReject::ExternalQuorumNotReached { got: 0, need: WS_PHASE_A_MIN_EXTERNAL })
+        );
+    }
+
+    #[test]
+    fn matches_policy_rejects_a_repeated_key() {
+        // Off the acceptance path, so this one is armed today: a release
+        // build or a tool that shape-checks an arrangement now refuses it.
+        // This is what made the tooling call the forgery "matches the §6.1
+        // Phase A policy" before the fix.
+        assert!(!one_key_two_slots_set().matches_policy(
+            WS_PHASE_A_THRESHOLD,
+            WS_PHASE_A_SIGNERS,
+            WS_PHASE_A_MIN_EXTERNAL
+        ));
+        // Violating the guard: the sound set of the same shape still passes.
+        assert!(phase_a_set().matches_policy(
+            WS_PHASE_A_THRESHOLD,
+            WS_PHASE_A_SIGNERS,
+            WS_PHASE_A_MIN_EXTERNAL
+        ));
+        assert_eq!(one_key_two_slots_set().duplicate_key_slots(), Some((0, 2)));
+        assert_eq!(phase_a_set().duplicate_key_slots(), None);
     }
 
     #[test]
