@@ -139,11 +139,10 @@ pub fn decode_checkpoint(bytes: &[u8]) -> Result<WeakSubjectivityCheckpoint, Dec
 /// Encode a distribution envelope: magic ‖ canonical checkpoint ‖ signature
 /// list. This is the node's file framing of the spec's `wscheckpoint-*.bin`
 /// artifact family; the digest signers sign is over the canonical bytes only.
-/// Not called by the node binary — the *publication* side (the signing
-/// ceremony of §6, which is not this program) writes these files and the node
-/// only reads them. It lives next to its decoder anyway, and the round-trip
-/// tests below are what keep the two from drifting into two formats.
-#[allow(dead_code)]
+/// Not called on the node's boot path — the *publication* side (the signing
+/// ceremony of §6, `ws_tool`) writes these files and the boot path only
+/// reads them. Living next to its decoder, with the round-trip tests below,
+/// is what keeps the two from drifting into two formats.
 pub fn encode_envelope_file(env: &CheckpointEnvelope) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(WS_ENVELOPE_MAGIC);
@@ -175,11 +174,11 @@ pub fn decode_envelope_file(bytes: &[u8]) -> Result<CheckpointEnvelope, DecodeEr
     Ok(CheckpointEnvelope { checkpoint, signatures })
 }
 
-/// Encode a signer arrangement (devnet aid — a release build hard-codes the
-/// §6 arrangements next to its pinned genesis, and this file form becomes a
-/// test fixture). Pubkeys are the RAW hybrid halves (`HYBRID_PK_BYTES`), the
-/// form `ws::Signer` carries — not the 4-byte suite envelope.
-#[allow(dead_code)] // written by the release/ceremony side, read by the node.
+/// Encode a signer arrangement (written by the ceremony side, `ws_tool`;
+/// a release build will additionally hard-code the §6 arrangements next to
+/// its pinned genesis, and this file form then becomes a test fixture).
+/// Pubkeys are the RAW hybrid halves (`HYBRID_PK_BYTES`), the form
+/// `ws::Signer` carries — not the 4-byte suite envelope.
 pub fn encode_signer_set_file(set: &SignerSet) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(WS_SIGNER_SET_MAGIC);

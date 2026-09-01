@@ -51,6 +51,7 @@ mod p2p;
 mod rpc;
 mod store;
 mod ws_boot;
+mod ws_tool;
 
 use std::path::PathBuf;
 use std::process::exit;
@@ -102,6 +103,10 @@ fn main() {
         Some("genesis-mainnet") => genesis_mainnet(&args[1..]),
         Some("submit-tx") => submit_tx(&args[1..]),
         Some("run") => run_cmd(&args[1..]),
+        Some(
+            cmd @ ("ws-keygen" | "ws-signer-set" | "ws-checkpoint" | "ws-sign" | "ws-envelope"
+            | "ws-verify"),
+        ) => ws_tool::run(cmd, &args[1..]),
         Some(other) => {
             eprintln!("{NAME}: unknown command `{other}` (see --help)");
             exit(2);
@@ -136,6 +141,34 @@ fn print_help() {
                SAME flags plus --signature. This tool never holds a\n\
                spending key. No acknowledgement: confirmation is seeing\n\
                it in a block.\n\
+           bloch-pos ws-checkpoint --genesis <manifest> --rpc <a>[,<b>...]\n\
+                                   --epoch <E> --signer-set-id <n>\n\
+                                   --out <prefix>\n\
+               Derive the weak-subjectivity checkpoint for a FINALIZED\n\
+               epoch from running nodes (all --rpc endpoints must agree),\n\
+               writing <prefix>.bin (154 canonical bytes) + <prefix>.json\n\
+               and printing the ws digest the signers sign.\n\
+           bloch-pos ws-keygen --out <prefix>\n\
+           bloch-pos ws-signer-set --id <n> --threshold <m>\n\
+                                   --min-external <k> --adopted-epoch <e>\n\
+                                   --signer <pk>:<internal|external> ...\n\
+                                   --out <set.bin>\n\
+           bloch-pos ws-sign --key <sk> --checkpoint <cp.bin>\n\
+                             [--pubkey <pk>] --out <sigfile>\n\
+           bloch-pos ws-envelope --checkpoint <cp.bin>\n\
+                                 --signer-set <set.bin>\n\
+                                 --sig <index>:<sigfile> ...\n\
+                                 [--genesis <manifest>] --out <env.bin>\n\
+           bloch-pos ws-verify --envelope <env.bin> --signer-set <set.bin>\n\
+                               --genesis <manifest> [--rpc <a>] [--now-epoch <n>]\n\
+               The rest of the signing ceremony (BLOCH-WEAK-SUBJECTIVITY.md\n\
+               section 6): per-signer keypairs, the signer-arrangement file\n\
+               that --ws-signer-set consumes, offline signing of the ws\n\
+               digest, envelope assembly, and verification exactly as a\n\
+               booting node performs it. ws-envelope runs ws::verify_envelope\n\
+               on its own output and REFUSES to write an envelope a node\n\
+               would reject, which is why --signer-set is required there.\n\
+               Runbook: docs/CHECKPOINT-RUNBOOK.md.\n\
            bloch-pos genesis --keys <dir1,dir2,...> --out <file>\n\
                              [--slot-ms <ms>] [--start-in <secs>]\n\
                Build a devnet genesis manifest from the keystores' public\n\
