@@ -87,6 +87,18 @@ export const Cost = {
  *   'lineage'     the answer is head-shaped; the witness certifies the lineage.
  *   'none'        the question is node-local and corroboration is meaningless.
  *   'edge'        the edge answers from its own knowledge; no node is asked.
+ *   'pinned'      the answer is PAGINATED, so it must come from ONE named node
+ *                 and cannot be quorum-checked. Asking two archivals for page
+ *                 N of the registry and comparing them is not corroboration:
+ *                 if the two nodes are on different heads their registries are
+ *                 different sequences, and `next_start` is an index into
+ *                 whichever one answered. Walking a cursor across a failover
+ *                 pool therefore interleaves two registries and produces a
+ *                 page set that never existed on either node — silently, with
+ *                 no disagreement for a quorum check to catch, because each
+ *                 individual page is internally consistent. `core.js` pins
+ *                 these to a single upstream for the whole walk and labels the
+ *                 result uncorroborated, which is the honest thing to call it.
  */
 export const EDGE_SURFACE = [
   {
@@ -183,6 +195,41 @@ export const EDGE_SURFACE = [
     summary: 'the ASKED NODE pending count and price — not a chain fact',
   },
   {
+    name: 'getvalidators',
+    cacheClass: CacheClass.Epoch,
+    cost: Cost.Cheap,
+    // NOT quorum. See 'pinned' in the header: a cursor walked across two
+    // archivals interleaves two registries. The node caps a page at 50
+    // (VALIDATOR_PAGE_MAX) precisely so this stays cheap per call.
+    corroboration: 'pinned',
+    ttlMs: 120_000,
+    summary: 'the registry, one page at a time; same record shape as getvalidator',
+  },
+  {
+    name: 'getsupply',
+    cacheClass: CacheClass.Epoch,
+    // O(1), measured at 3.1 us: one field read and two compile-time constants.
+    cost: Cost.Cheap,
+    corroboration: 'quorum',
+    // Epoch-keyed AND short-TTL'd, which is not redundant: `issued_sat` is
+    // monotone per BLOCK, not per epoch, so the epoch key alone would serve a
+    // supply figure up to a full epoch stale. The epoch key handles the
+    // boundary; this TTL handles the drift inside it.
+    ttlMs: 30_000,
+    summary: 'issued against the cap; gross and monotone, and NOT circulating supply',
+  },
+  {
+    name: 'getstakedistribution',
+    cacheClass: CacheClass.Epoch,
+    // One roster build O(V + D) plus O(V log V); the response is fixed-size.
+    cost: Cost.Cheap,
+    corroboration: 'quorum',
+    // Genuinely epoch-constant: effective stake, activation and exit all move
+    // only on an epoch transition, so the epoch key is the invalidation.
+    ttlMs: 120_000,
+    summary: 'concentration of the active set — Nakamoto at one third, top 20, quantiles',
+  },
+  {
     name: 'getcapabilities',
     cacheClass: CacheClass.Epoch,
     cost: Cost.Cheap,
@@ -239,5 +286,16 @@ export function edgeMethodNames() {
  */
 export function isBranchSensitive(name) {
   const m = BY_NAME.get(name);
-  return !!m && m.corroboration !== 'none' && m.corroboration !== 'edge';
+  if (!m) return false;
+  // 'pinned' IS branch-sensitive in the ordinary sense — the registry differs
+  // across heads — but it must not go down the quorum path, which would
+  // compare two pages that were never meant to be compared. It is excluded
+  // here and handled by pinning instead; see `isPinned`.
+  return m.corroboration !== 'none' && m.corroboration !== 'edge' && m.corroboration !== 'pinned';
+}
+
+/** Methods that must be answered by exactly one named upstream. See 'pinned'. */
+export function isPinned(name) {
+  const m = BY_NAME.get(name);
+  return !!m && m.corroboration === 'pinned';
 }

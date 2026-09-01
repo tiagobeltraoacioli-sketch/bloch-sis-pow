@@ -91,10 +91,13 @@ test('the edge method namespace is frozen', () => {
     'getcapabilities',
     'getchaininfo',
     'getmempoolinfo',
+    'getstakedistribution',
+    'getsupply',
     'gettxout',
     'getutxos',
     'getvalidator',
     'getvalidatorcount',
+    'getvalidators',
     'listunspent',
   ];
 
@@ -178,7 +181,7 @@ test('every exposed method declares a cache class, a cost and a corroboration le
     assert.ok(classes.has(m.cacheClass), `${m.name}: unknown cache class ${m.cacheClass}`);
     assert.ok(costs.has(m.cost), `${m.name}: unknown cost ${m.cost}`);
     assert.ok(
-      ['quorum', 'lineage', 'none', 'edge'].includes(m.corroboration),
+      ['quorum', 'lineage', 'none', 'edge', 'pinned'].includes(m.corroboration),
       `${m.name}: unknown corroboration level ${m.corroboration}`,
     );
     assert.ok(Number.isFinite(m.ttlMs) && m.ttlMs > 0, `${m.name}: needs a positive ttlMs`);

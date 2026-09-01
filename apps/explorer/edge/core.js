@@ -53,6 +53,7 @@ import {
 import {
   methodSpec,
   isBranchSensitive,
+  isPinned,
   CacheClass,
   Cost,
   EDGE_SURFACE,
@@ -208,7 +209,13 @@ export function planeView(now) {
  */
 async function askArchivals(rpcReq, urls, opts) {
   const now = opts.now;
-  const { order: ordered } = order(urls, now());
+  let { order: ordered } = order(urls, now());
+  // A pinned read takes the healthiest upstream and ONLY that one. Asking both
+  // and then picking a winner would look identical from here and be wrong: for
+  // a paginated method the two answers are pages of different sequences, so
+  // "they agreed" and "they disagreed" are equally meaningless. `order()` is
+  // health-sorted, so this is the best single node we know of.
+  if (opts.single) ordered = ordered.slice(0, 1);
   const t = Math.min(ATTEMPT_TIMEOUT_MS, opts.deadline - now() - 250);
   if (t < 500) return { answers: [], attempts: [{ outcome: 'skipped: time budget exhausted' }] };
 
@@ -348,6 +355,24 @@ function corroborationOf(spec, answers, ctx) {
       note:
         'a node-local reading. Two nodes disagreeing here is normal and is not ' +
         'a fork: the mempool does not converge on this chain.',
+      cache_salt: salt(),
+      witness: wit,
+      plane: pv,
+    };
+  }
+  if (spec.corroboration === 'pinned') {
+    return {
+      level: Level.Uncorroborated,
+      archival_witnesses: answers.length,
+      of: ctx.archivalCount,
+      pinned_to: ctx.pinnedTo || null,
+      note:
+        'read from ONE archival on purpose. This method is paginated, and a ' +
+        'cursor walked across two nodes that disagree about the head ' +
+        'interleaves two registries into a page set that existed on neither. ' +
+        'One node answering consistently is worth more here than two nodes ' +
+        'agreeing about nothing, so this is uncorroborated by construction ' +
+        'rather than by failure.',
       cache_salt: salt(),
       witness: wit,
       plane: pv,
@@ -705,6 +730,7 @@ export async function handleRead(payload, opts) {
       ...opts,
       witness: wit,
       deadline,
+      single: isPinned(method),
     });
 
     if (!answers.length) {
@@ -835,6 +861,7 @@ function finish(result, meta, o) {
       now: t,
       finalised: withFinality.finalized === true || meta.finalised === true,
       archivalCount: o.archivalCount,
+      pinnedTo: (o.answers && o.answers.length === 1 && o.answers[0] && o.answers[0].url) || null,
     },
   );
   if (o.degraded) corroboration.degraded = o.degraded;
