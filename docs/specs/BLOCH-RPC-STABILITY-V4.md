@@ -19,7 +19,8 @@ Not public: internal + direct delivery to integrators. Do not publish to the
 `BLOCH-RPC-V4.md` says what the surface should be. This document says what it
 **is**, enumerated by reading the dispatcher rather than by probing it, and what
 an integrator may rely on across a release. Everything in §1–§4 is asserted by
-tests named inline; §5 is a design that is not built.
+tests named inline. §5 was a design that was not built; as of 2026-09-01 it
+is built, and is normative with the rest.
 
 ---
 
