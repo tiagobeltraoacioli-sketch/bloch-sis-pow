@@ -2,6 +2,37 @@
 
 //! Stake delegation — the subsystem the Solana revenue model requires.
 //!
+//! # STATUS: NOT REACHABLE ON THE NETWORK, AND THAT IS THE DECISION
+//!
+//! Everything below describes rules that no transaction can currently invoke.
+//! The legacy carrier (wire tag `0x04`) is consensus-rejected at every epoch,
+//! no funded successor format exists, and
+//! [`crate::transition::CommittedState::apply_delegation`] — the only
+//! function in the tree that can add a delegation to committed state — has
+//! **zero production call sites**.
+//!
+//! It began as an accident (nobody wrote the carrier) and it is being kept on
+//! purpose. Delegation is the cheapest way through the blind spot the
+//! genesis-cohort cap ([`crate::genesis_cohort`]) names in its own module doc:
+//! the cap binds a fixed published set of founder-operated validators down to
+//! 33.33% within a year, and cannot see founder-controlled stake outside that
+//! set. The founder holds ~94% of the carried-over supply; ADR-037 made
+//! carried coin stakeable; rule 4 below is retired-and-empty, so every
+//! delegation would be recorded eligible unconditionally. Delegated weight
+//! counts as NON-cohort, so it does not just evade the cap — it enlarges the
+//! base the cap is a fraction of and thereby raises the cohort's own permitted
+//! weight, with economic control unchanged. The concentration metrics in this
+//! module cannot see it, for the reason the honest note at the end of this
+//! header already gives.
+//!
+//! The argument on the other side is not weak, and is not hidden: without
+//! delegation, participating in consensus requires the 25,000 BLCH deposit and
+//! a validator you run yourself, which is its own centralising force. Both
+//! cases and a recommendation are in
+//! `docs/adr/ADR-041-delegation-off-pending-decision.md` — **Proposed, not
+//! Accepted.** Turning delegation on is a founder decision; it is not licensed
+//! by the fact that the code in this file is finished and tested.
+//!
 //! Commission is meaningless without delegated stake, and rewards paid pro-rata
 //! to all stake only make sense if stake can sit behind an operator without
 //! running one. This module supplies that: delegate, deactivate, withdraw, and

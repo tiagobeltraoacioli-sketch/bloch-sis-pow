@@ -1011,11 +1011,47 @@ decide se armar um portão faz alguma coisa:
   nada**: não existe forma de uma saída assinada entrar num bloco. O
   carregador de wire está sendo escrito (tag `0x09`, fluxo separado); o
   portão só passa a significar alguma coisa depois dele.
-- **#7 é parcial.** `DepositV2` (tag `0x07`) tem codec, portão e verificação
-  completos — armar torna depósitos financiados reais. Mas `apply_delegation`
-  está atrás da MESMA constante e **também não tem ponto de chamada de
-  produção**: delegação financiada continua inalcançável até ganhar o seu
-  próprio formato de wire. Uma constante, dois caminhos, só um alcançável.
+- **#7 é parcial, e a metade que falta é DELIBERADA.** `DepositV2` (tag
+  `0x07`) tem codec, portão e verificação completos — armar torna depósitos
+  financiados reais. Mas `apply_delegation` está atrás da MESMA constante e
+  **não tem ponto de chamada de produção**: delegação continua inalcançável
+  depois de armar. Uma constante, dois caminhos, só um alcançável.
+
+  **Isso não é uma pendência do rollout. É o estado pretendido, e há um motivo
+  de segurança.** O carregador de delegação nunca foi escrito (acidente) e uma
+  análise de segurança pediu que não seja escrito (decisão) — as duas coisas
+  concordam, e é por isso que estão registradas aqui em vez de esperarem que
+  alguém "conserte" o que parece um recurso pela metade.
+
+  O motivo, em um parágrafo. O **único** controle de descentralização que a
+  Genesis-4 realmente impõe é o teto da coorte de génese
+  (`crates/bloch-pos-committee/src/genesis_cohort.rs`): um conjunto FIXO e
+  publicado de validadores operados pelo fundador, cujo peso combinado cai
+  linearmente até 33,33% em um ano — de onde sai o número de que o stake
+  externo fica com 66,67% da finalidade no ano um. O próprio módulo declara o
+  ponto cego dele: nada impede o fundador de financiar validadores **fora** da
+  coorte, e nenhuma regra on-chain enxerga propriedade beneficiária. Delegação
+  é a forma mais barata de ocupar esse ponto cego: o fundador detém ~94% da
+  oferta carregada, a ADR-037 tornou moeda carregada stakeável como qualquer
+  outra, e o conjunto de taint da §4.1 está aposentado e vazio — então
+  `apply_delegation` grava `eligible: true` incondicionalmente, por
+  construção. E o efeito não é apenas escapar do teto: peso delegado conta
+  como **não-coorte**, portanto **aumenta a base** sobre a qual os 33,33% são
+  calculados e assim **eleva o teto da própria coorte**, sem que o controle
+  econômico saia do lugar.
+
+  O argumento contrário existe e não está escondido: sem delegação, participar
+  do consenso exige o depósito mínimo de 25.000 BLCH e um validador próprio, o
+  que centraliza na direção oposta. Os dois lados, com recomendação, estão em
+  **`docs/adr/ADR-041-delegation-off-pending-decision.md`**, com status
+  **Proposed** — decisão do fundador, ainda não tomada.
+
+  Enquanto não for tomada, o estado desligado é defendido por teste:
+  `delegation_is_unreachable_and_may_not_be_wired_by_accident`
+  (`transition.rs`) fica **vermelho** se `apply_delegation` ganhar um chamador
+  ou se o conjunto de delegações passar a crescer em outro lugar. Verificado
+  quebrando, não lendo: as duas mutações foram aplicadas, deram vermelho com a
+  mensagem certa, e foram revertidas.
 - **#6 não semeia nada na cadeia atual.** A semeadura só reescreve outpoints
   de alocação **ainda não gastos**, e os cinco foram medidos **GASTOS** em
   2026-08-31 (`gettxout` responde `unspent: false` para todos; o saldo do
@@ -1072,8 +1108,11 @@ constante. Além disso:
   ferramenta capaz de montar um `DepositV2` conservante: a igualdade
   `soma(entradas) == amount + troco + taxa` é **estrita**, e uma carteira que
   erre por um satoshi produz transação recusada, não transação com troco
-  errado; (c) aceitar, e comunicar, que delegação financiada continua
-  inalcançável até ter carregador.
+  errado; (c) **não escrever carregador de delegação para "completar" o
+  portão** — delegação segue desligada por decisão de segurança enquanto a
+  ADR-041 estiver `Proposed` (§11.1); e (d) comunicar isso na página de
+  release, para que "staking financiado ativo" não seja lido como "delegação
+  ativa".
 - **#8 `SIGNED_EXIT`** — duas pré-condições, e a segunda é uma DECISÃO, não
   uma verificação:
   1. o carregador de wire (tag `0x09`) precisa existir e estar na frota.

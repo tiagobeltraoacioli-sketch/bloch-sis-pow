@@ -917,8 +917,10 @@ pub fn seed_lookahead_at(epoch: u64) -> u64 {
 /// actually spent into the bond, proof of possession carried and checked,
 /// applied by `CommittedState::apply_deposit_v2` with the field rules taken
 /// from [`crate::staking::validate_deposit_fields`]) becomes acceptable in
-/// blocks, and at which the funded delegation path
-/// ([`crate::transition::CommittedState::apply_delegation`]) opens with it.
+/// blocks. The funded delegation path
+/// ([`crate::transition::CommittedState::apply_delegation`]) sits behind the
+/// SAME constant — but see the warning below: arming this does not, and is
+/// not meant to, turn delegation on.
 /// An earlier integration draft carried a second constant
 /// (`DEPOSIT_FUNDING_ACTIVATION_EPOCH`) for the same feature; two gates for
 /// one switch is how the two halves drift apart, so it was unified here.
@@ -961,6 +963,31 @@ pub fn seed_lookahead_at(epoch: u64) -> u64 {
 /// clean — but if an insider ever exercised the gap, an upgraded node will
 /// stop at that block, and the rejection would instead need its own armed
 /// activation epoch.
+///
+/// # Arming this does NOT enable delegation — and must not be made to
+///
+/// One constant, two paths, and only one of them is reachable. `DepositV2`
+/// has a wire format, a decoder and a verifier, so arming this makes funded
+/// deposits real. `apply_delegation` has **zero production call sites**, and
+/// no funded delegation wire format exists — so on the day this is armed,
+/// delegation stays exactly as dead as it is today, and that is the intended
+/// outcome, not a gap in the rollout.
+///
+/// It is intended because the missing carrier is also the thing a security
+/// review asked not to build. The genesis-cohort cap
+/// ([`crate::genesis_cohort`]) is the one enforceable decentralisation rule
+/// Genesis-4 has, it binds a fixed published set, and its own module doc names
+/// its blind spot: founder-controlled stake OUTSIDE that set. Delegation walks
+/// straight into it — the founder holds ~94% of the carried-over supply,
+/// ADR-037 made carried coin stakeable, and the retired taint set means
+/// `apply_delegation` marks every delegation `eligible: true` unconditionally.
+/// Delegated weight counts as non-cohort, which enlarges the base the 33.33%
+/// cap is taken against and so RAISES the cohort's own permitted weight, while
+/// one party keeps control of both sides. The honest counter-argument —
+/// delegation is how holders under the 25,000 BLCH minimum participate at all
+/// — and a recommendation are in
+/// `docs/adr/ADR-041-delegation-off-pending-decision.md`, which is **Proposed,
+/// awaiting the founder**. Do not resolve it by writing a carrier.
 ///
 /// `u64::MAX` means INERT: funded staking does not exist yet, so nothing may
 /// activate it. Arm it only when (1) the funded wire format is landed and the

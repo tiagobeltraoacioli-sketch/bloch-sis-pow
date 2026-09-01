@@ -2685,10 +2685,44 @@ impl CommittedState {
                 // signature and no output spent — delegated consensus weight
                 // minted from nothing, applied by the transition if a
                 // committee member put it in a block. Rejected everywhere,
-                // at every epoch; the funded delegation format (same work
-                // stream as the funded deposit) is what the flag day will
-                // activate, and it will route through `apply_delegation`,
-                // which keeps the state-dependent delegation rules.
+                // at every epoch.
+                //
+                // ── DELEGATION IS OFF, AND NOT ONLY BECAUSE THIS TAG IS BAD ─
+                //
+                // Read the sentence above and it looks like this arm is
+                // waiting for a funded successor, the way `Deposit` waited
+                // for `DepositV2`. It is not. There is NO funded delegation
+                // wire format anywhere in the tree, `apply_delegation` has
+                // ZERO production call sites, and whether one should ever be
+                // built is an OPEN FOUNDER DECISION — `docs/adr/
+                // ADR-041-delegation-off-pending-decision.md`.
+                //
+                // The security reason, in one paragraph. Genesis-4's only
+                // enforceable decentralisation control is the genesis-cohort
+                // cap (`genesis_cohort.rs`): the founder-operated launch set
+                // is a FIXED, published set whose combined weight tapers to
+                // 33.33% within a year, so external stake reaches 66.67% of
+                // finality weight — and that module already names its own
+                // limit, that nothing stops the founder funding validators
+                // OUTSIDE the cohort. Delegation widens exactly that hole and
+                // costs nothing to walk through: the founder holds ~94% of
+                // the carried-over supply, ADR-037 made carried-over coin
+                // stakeable like any other, and the §4.1 taint set is retired
+                // and empty, so `apply_delegation` records EVERY delegation
+                // `eligible: true` by construction. Delegating that balance
+                // across nominally independent operators does not merely
+                // evade the cap — it INVERTS it: the delegated weight lands
+                // outside the cohort, so it enlarges the denominator the cap
+                // is taken against and thereby RAISES the founder's own
+                // permitted cohort weight, while the economic control stays
+                // in one place. Consensus cannot see beneficial ownership
+                // behind a delegator index; `delegation.rs` says so itself.
+                //
+                // So the accident (no carrier was ever written) and the
+                // security analysis (do not write one) agree, and this arm
+                // records that agreement so the next reader does not
+                // "helpfully" fix a bug that is a decision. Pinned by
+                // `delegation_is_unreachable_and_may_not_be_wired_by_accident`.
                 Err(TxReject::StakingNotActive)
             }
             // Evidence needs the injected signature verifier, which lives on
@@ -2785,12 +2819,63 @@ impl CommittedState {
         Ok(index)
     }
 
-    /// Apply one FUNDED delegation — the post-flag-day path, holding the
-    /// state-dependent delegation rules the retired tag-0x04 arm used to
-    /// hold. Unlike `apply_deposit_v2` it takes the semantic message; the
-    /// funded wire encoding (with the delegator's authorisation and the
-    /// outputs being bonded) belongs to the funded-format work stream, and
-    /// resolving those is the caller's job before this is reached.
+    /// Apply one FUNDED delegation — holding the state-dependent delegation
+    /// rules the retired tag-0x04 arm used to hold. Unlike `apply_deposit_v2`
+    /// it takes the semantic message; a funded wire encoding (with the
+    /// delegator's authorisation and the outputs being bonded) would have to
+    /// resolve those before this is reached.
+    ///
+    /// # THIS FUNCTION IS DELIBERATELY UNREACHABLE. DO NOT WIRE IT UP.
+    ///
+    /// It has **zero production call sites** — only tests. That is not a
+    /// loose end someone forgot to tie; it is the state the chain is meant to
+    /// be in, and there are two independent reasons, which is why undoing it
+    /// takes a founder decision and not a pull request.
+    ///
+    /// **1. Nothing can reach it, because no funded delegation format
+    /// exists.** The legacy carrier (tag `0x04`, [`PosTransaction::Delegate`])
+    /// is consensus-rejected at every epoch and can never be revived: it names
+    /// a `delegator: u32` and an `amount_sat` with no signature and no output
+    /// spent, i.e. delegated consensus weight minted from nothing. Unlike the
+    /// deposit — whose funded successor `DepositV2` (tag `0x07`) exists,
+    /// decodes, and verifies — delegation has no successor in this tree or in
+    /// any unmerged branch. [`crate::params::FUNDED_STAKING_ACTIVATION_EPOCH`]
+    /// gates BOTH halves, so arming that one constant makes funded deposits
+    /// real and leaves delegation exactly as dead as it is now. One constant,
+    /// two paths, only one of them reachable.
+    ///
+    /// **2. Building the missing carrier would defeat the one
+    /// decentralisation control Genesis-4 actually enforces.** The
+    /// genesis-cohort cap ([`crate::genesis_cohort`]) is a consensus rule over
+    /// a FIXED, published set: the founder-operated launch validators, whose
+    /// combined weight tapers to `COHORT_CAP_FLOOR_BPS` (33.33%) within a
+    /// year, leaving external stake 66.67% of finality weight. Its stated
+    /// blind spot is stake the founder controls from OUTSIDE the cohort.
+    /// Delegation is the cheapest possible way to occupy that blind spot: the
+    /// founder holds ~94% of the carried-over supply; ADR-037 made carried
+    /// coin stakeable like any other; and the §4.1 taint set is retired and
+    /// empty, so this function writes `eligible: true` unconditionally, by
+    /// construction, for every delegation it is ever handed. The delegated
+    /// weight would count as NON-cohort, which does not merely dodge the cap
+    /// but enlarges the base the cap is a fraction of — raising the cohort's
+    /// own permitted weight while one party keeps economic control of both
+    /// sides. `delegation.rs` already states the part no rule can fix:
+    /// consensus sees operators, never beneficial owners.
+    ///
+    /// **The counter-argument is real and is written down, not buried.**
+    /// Delegation is how a holder below the 25,000 BLCH deposit minimum takes
+    /// part in consensus at all; permanently disabling it has a genuine
+    /// decentralisation cost of its own, in the opposite direction. Both
+    /// sides, with a recommendation, are in
+    /// `docs/adr/ADR-041-delegation-off-pending-decision.md`. That ADR is
+    /// **Proposed, not Accepted**: the founder has not ruled.
+    ///
+    /// **If you are here to give this function a caller:** you are making a
+    /// consensus change with a security argument against it that is currently
+    /// unanswered. Get ADR-041 decided first. The test
+    /// `delegation_is_unreachable_and_may_not_be_wired_by_accident` will go
+    /// red the moment a call site appears, and its failure message says the
+    /// same thing.
     ///
     /// Unlike the retired arm, there is no `eligible` parameter: the tag-0x04
     /// encoding took eligibility FROM THE TRANSACTION, which let a proposer
@@ -6290,6 +6375,183 @@ mod tests {
                     );
                 });
             });
+        }
+    }
+
+    /// **The delegation off-switch, frozen in source.**
+    ///
+    /// Delegation does not exist on the network, and this test is what keeps
+    /// it that way against the most likely failure mode — not an attack, but
+    /// a helpful developer who greps `apply_delegation`, finds no caller,
+    /// reads that as an unfinished feature, and wires one up. The
+    /// runtime tests above cannot catch that: they prove the LEGACY tag 0x04
+    /// is rejected, and a new carrier would not be tag 0x04. Reachability is
+    /// a property of the source, so it is checked in the source, exactly as
+    /// `the_partition_coverage_guard_survives_into_a_release_build` checks
+    /// that a guard is unconditional.
+    ///
+    /// # Why the off state is defended and not merely observed
+    ///
+    /// The genesis-cohort cap ([`crate::genesis_cohort`]) is the only
+    /// enforceable decentralisation rule Genesis-4 has: a FIXED, published set
+    /// of founder-operated validators whose combined weight tapers to 33.33%
+    /// within a year. Its own module doc names the blind spot — founder stake
+    /// held OUTSIDE the cohort — and delegation is the cheapest way through
+    /// it. The founder holds ~94% of the carried-over supply, ADR-037 made
+    /// carried coin stakeable like any other, and the §4.1 taint set is
+    /// retired and empty, so `apply_delegation` writes `eligible: true`
+    /// unconditionally for anything handed to it. Delegated weight is counted
+    /// NON-cohort, which does not just dodge the cap: it enlarges the base the
+    /// cap is a fraction of, so it RAISES the cohort's own permitted weight,
+    /// while one party keeps economic control of both sides. Consensus cannot
+    /// see beneficial ownership behind a delegator index and no on-chain rule
+    /// can, which is the point `delegation.rs` makes about its own metrics.
+    ///
+    /// The case AGAINST leaving it off is real — delegation is how a holder
+    /// under the 25,000 BLCH deposit minimum participates in consensus at all
+    /// — and it is written out in full, with a recommendation, in
+    /// `docs/adr/ADR-041-delegation-off-pending-decision.md`. That ADR is
+    /// **Proposed**. Until the founder rules on it, this test is the ruling.
+    ///
+    /// # What it actually checks
+    ///
+    /// Three things, all against production source only:
+    ///
+    /// 1. `apply_delegation` has zero call sites anywhere in this crate. It is
+    ///    `pub(crate)`, so this crate is the entire surface a call site could
+    ///    ever appear on — the scan is exhaustive, not a sample.
+    /// 2. `CommittedState::delegations` grows in exactly ONE place, and that
+    ///    place is inside `apply_delegation`. This is the check that survives
+    ///    renaming: a carrier that avoids the function but pushes a
+    ///    `Delegation` directly is caught here.
+    /// 3. The three doc blocks that record WHY still exist. Deleting the
+    ///    reasoning has to be a deliberate act with a red test attached, not a
+    ///    tidy-up.
+    ///
+    /// Verified by breaking it, not by reading it: wiring the `Delegate` arm
+    /// to `apply_delegation` turns check 1 red with the message below; the
+    /// wiring was then reverted.
+    #[test]
+    fn delegation_is_unreachable_and_may_not_be_wired_by_accident() {
+        // Every source file of the crate, each cut at its OWN first top-level
+        // `#[cfg(test)]`, so that no test's source — including this one, which
+        // necessarily contains the needles as string literals — can answer a
+        // question about production code.
+        let modules: [(&str, &str); 27] = [
+            ("attestation.rs", include_str!("attestation.rs")),
+            ("beacon.rs", include_str!("beacon.rs")),
+            ("committees.rs", include_str!("committees.rs")),
+            ("delegation.rs", include_str!("delegation.rs")),
+            ("derive.rs", include_str!("derive.rs")),
+            ("fee_market.rs", include_str!("fee_market.rs")),
+            ("finality.rs", include_str!("finality.rs")),
+            ("forkchoice.rs", include_str!("forkchoice.rs")),
+            ("genesis_cohort.rs", include_str!("genesis_cohort.rs")),
+            ("gossip.rs", include_str!("gossip.rs")),
+            ("header.rs", include_str!("header.rs")),
+            ("interfaces.rs", include_str!("interfaces.rs")),
+            ("lib.rs", include_str!("lib.rs")),
+            ("params.rs", include_str!("params.rs")),
+            ("perf.rs", include_str!("perf.rs")),
+            ("produce.rs", include_str!("produce.rs")),
+            ("prova.rs", include_str!("prova.rs")),
+            ("rewards.rs", include_str!("rewards.rs")),
+            ("sample.rs", include_str!("sample.rs")),
+            ("schedule.rs", include_str!("schedule.rs")),
+            ("slashing.rs", include_str!("slashing.rs")),
+            ("staking.rs", include_str!("staking.rs")),
+            ("state_root.rs", include_str!("state_root.rs")),
+            ("tokenomics_v4.rs", include_str!("tokenomics_v4.rs")),
+            ("transition.rs", include_str!("transition.rs")),
+            ("vesting.rs", include_str!("vesting.rs")),
+            ("ws.rs", include_str!("ws.rs")),
+        ];
+
+        let mut call_sites: Vec<&str> = Vec::new();
+        let mut push_sites: Vec<&str> = Vec::new();
+        let mut transition_prod: &str = "";
+
+        for (name, src) in modules {
+            let prod = src.split("\n#[cfg(test)]\n").next().unwrap();
+            for _ in 0..prod.matches(".apply_delegation(").count() {
+                call_sites.push(name);
+            }
+            for _ in 0..prod.matches("delegations.push(").count() {
+                push_sites.push(name);
+            }
+            if name == "transition.rs" {
+                // If this file ever stops having a top-level `#[cfg(test)]`,
+                // the slice above silently becomes the whole file and every
+                // assertion below starts reading test code as production —
+                // a green test proving nothing. Fail loudly instead.
+                assert!(
+                    prod.len() < src.len(),
+                    "the top-level `#[cfg(test)]` boundary of transition.rs moved; this scan \
+                     just read the test modules as production and proves nothing"
+                );
+                transition_prod = prod;
+            }
+        }
+
+        // ── 1. No caller ────────────────────────────────────────────────────
+        assert!(
+            call_sites.is_empty(),
+            "`apply_delegation` has gained {} production call site(s), in {call_sites:?}.\n\
+             \n\
+             THIS IS NOT A BUG YOU ARE FIXING. Delegation is off on purpose. It is the \
+             cheapest route through the one blind spot the genesis-cohort cap names in its \
+             own module doc (founder-controlled stake outside the fixed cohort): the founder \
+             holds ~94% of the carried-over supply, ADR-037 made that coin stakeable, and \
+             `apply_delegation` marks every delegation eligible unconditionally because the \
+             taint set is retired. Delegated weight counts as NON-cohort, which enlarges the \
+             base the 33.33% cap is taken against and so RAISES the cohort's permitted \
+             weight while economic control does not move.\n\
+             \n\
+             There is a real argument on the other side (delegation is how holders under the \
+             25,000 BLCH minimum participate at all). Both are in \
+             docs/adr/ADR-041-delegation-off-pending-decision.md, which is PROPOSED and not \
+             yet decided by the founder. Get it decided, then change this test in the same \
+             commit as the carrier.",
+            call_sites.len()
+        );
+
+        // ── 2. One growth site, and it is the gated one ─────────────────────
+        assert_eq!(
+            push_sites,
+            ["transition.rs"],
+            "the delegation set is grown from {} place(s) ({push_sites:?}); it must be grown \
+             from exactly one, inside `apply_delegation`, or check 1 above stops meaning \
+             anything — a carrier can push a `Delegation` without ever naming the function",
+            push_sites.len()
+        );
+        let fn_at = transition_prod
+            .find("pub(crate) fn apply_delegation(")
+            .expect("`apply_delegation` was renamed or removed; re-derive this test");
+        let push_at = transition_prod
+            .find("delegations.push(")
+            .expect("checked non-empty by the assertion above");
+        assert!(push_at > fn_at, "the only `delegations.push(` moved ABOVE `apply_delegation`");
+        let between = &transition_prod[fn_at..push_at];
+        assert!(
+            !between.contains("\n    fn ") && !between.contains("\n    pub fn ")
+                && !between.contains("\n    pub(crate) fn "),
+            "another method now sits between `apply_delegation` and the only \
+             `delegations.push(`; the push is no longer inside the gated function"
+        );
+
+        // ── 3. The reasoning is still there ─────────────────────────────────
+        for needle in [
+            "THIS FUNCTION IS DELIBERATELY UNREACHABLE",
+            "DELEGATION IS OFF, AND NOT ONLY BECAUSE THIS TAG IS BAD",
+            "ADR-041-delegation-off-pending-decision.md",
+        ] {
+            assert!(
+                transition_prod.contains(needle),
+                "the note {needle:?} was removed from transition.rs. The off state has a \
+                 security argument behind it; deleting the argument leaves the next reader \
+                 with a function that looks unfinished, which is exactly how it gets wired \
+                 up. Restore it, or take the decision in ADR-041 first."
+            );
         }
     }
 
