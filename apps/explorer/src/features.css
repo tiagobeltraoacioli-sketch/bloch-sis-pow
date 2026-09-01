@@ -246,3 +246,146 @@
 }
 .halving-note strong { color: var(--brass); }
 .halving-note .mono { font-family: var(--font-mono); color: var(--text); }
+
+/* ── Supply surface ──────────────────────────────────────────────────────────
+   The page where a caveat has to sit beside the number it qualifies, so the
+   quantity card carries an "is" line and a "not" line as structure rather than
+   as prose someone can trim later. */
+
+.sup-card { margin-bottom: 22px; padding: 20px 22px; }
+
+.sup-q-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(255px, 1fr));
+  gap: 1px;
+  background: var(--line);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow: hidden;
+}
+.sup-q { background: var(--panel); padding: 16px 18px 15px; display: flex; flex-direction: column; gap: 7px; }
+.sup-q.tone-cap { background: var(--bg-glow); }
+.sup-q.tone-unissued { background: var(--bg-glow); }
+.sup-q-label {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.sup-q-value {
+  font-size: 25px;
+  line-height: 1.05;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.015em;
+}
+.sup-q.tone-live .sup-q-value { color: var(--accent); }
+.sup-q-unit { font-size: 11.5px; color: var(--muted); margin-left: 6px; letter-spacing: 0.06em; }
+.sup-q-is { font-size: 12.5px; line-height: 1.6; color: var(--ink-2); }
+.sup-q-not {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--text-dim);
+  border-top: 1px dashed var(--border);
+  padding-top: 9px;
+  margin-top: auto;
+}
+.sup-q-not-tag {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--signal);
+  border: 1px solid currentColor;
+  border-radius: 4px;
+  padding: 1px 5px;
+  position: relative;
+  top: -1px;
+}
+
+.sup-caveat { margin: 16px 0 0; }
+.sup-caveat-title { color: var(--text); }
+
+/* Chart */
+.sup-chart-wrap { display: grid; grid-template-columns: minmax(0, 1fr) 250px; gap: 22px; align-items: start; }
+@media (max-width: 900px) { .sup-chart-wrap { grid-template-columns: 1fr; } }
+.sup-chart { width: 100%; height: auto; display: block; }
+.sup-axis { font-size: 10px; fill: var(--muted); font-family: var(--font-mono); }
+.sup-band-label { font-size: 10.5px; fill: var(--accent-strong); font-family: var(--font-mono); }
+.sup-legend { display: flex; flex-direction: column; gap: 14px; padding-top: 8px; }
+.sup-legend-row { display: flex; gap: 9px; align-items: flex-start; }
+.sup-swatch { flex: none; width: 11px; height: 11px; border-radius: 3px; display: inline-block; position: relative; top: 3px; }
+.sup-legend-name { font-size: 13px; font-weight: 600; }
+.sup-legend-detail { font-size: 11.5px; color: var(--muted); font-family: var(--font-mono); }
+.sup-legend-note { font-size: 11.5px; line-height: 1.55; color: var(--muted); margin-top: 3px; }
+
+/* Concentration */
+.sup-addr { font-size: 11.5px; color: var(--signal); }
+.sup-unlock { white-space: normal; font-size: 12px; color: var(--muted); }
+.sup-row-sub td { background: var(--surface); font-weight: 600; }
+.sup-row-total td { background: var(--signal-soft); font-weight: 700; border-top: 1.5px solid var(--signal); }
+.sup-bar {
+  position: relative;
+  height: 22px;
+  margin-top: 18px;
+  border-radius: 6px;
+  background: var(--surface-2);
+  overflow: hidden;
+}
+.sup-bar-fill { height: 100%; background: var(--signal); opacity: 0.85; }
+.sup-bar-mark { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--ink); opacity: 0.55; }
+.sup-bar-key { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 8px; font-size: 11.5px; color: var(--ink-2); }
+.sup-live-conc { margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--line); }
+.sup-hash { font-family: var(--font-mono); font-size: 11.5px; word-break: break-all; line-height: 1.45; }
+
+/* getsupply panel */
+.sup-rpc { margin-top: 16px; padding: 15px 17px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
+.sup-rpc-head { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 11px; font-size: 12px; }
+
+/* The tautology, laid out as the substitution it is */
+.sup-proof {
+  margin-top: 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow: hidden;
+  background: var(--surface);
+}
+.sup-proof-row {
+  display: flex;
+  gap: 14px;
+  align-items: baseline;
+  flex-wrap: wrap;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--line);
+  font-size: 13px;
+}
+.sup-proof-row:last-child { border-bottom: 0; }
+.sup-proof-k {
+  flex: none;
+  width: 108px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.sup-proof-sub { background: var(--panel); }
+.sup-proof-out { background: var(--signal-soft); font-weight: 600; }
+
+/* The two disagreeing artefacts, side by side */
+.sup-versus { display: grid; grid-template-columns: 1fr auto 1fr; gap: 16px; align-items: stretch; margin-top: 16px; }
+@media (max-width: 820px) { .sup-versus { grid-template-columns: 1fr; } }
+.sup-versus-side { border: 1px solid var(--line); border-radius: 12px; padding: 15px 17px; background: var(--panel); }
+.sup-versus-tag { margin-bottom: 9px; }
+.sup-versus-value { font-size: 24px; font-variant-numeric: tabular-nums; letter-spacing: -0.015em; }
+.sup-versus-src { margin-top: 5px; font-size: 11px; word-break: break-all; }
+.sup-versus-src code { color: var(--muted); }
+.sup-versus-note { margin-top: 10px; font-size: 12px; line-height: 1.6; color: var(--ink-2); }
+.sup-versus-gap { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; padding: 0 4px; }
+.sup-versus-delta { font-size: 15px; font-weight: 700; color: var(--signal); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.sup-pill-sm { font-size: 9.5px; padding: 1px 6px; vertical-align: middle; }
+.sup-row-live td { background: var(--accent-soft); }

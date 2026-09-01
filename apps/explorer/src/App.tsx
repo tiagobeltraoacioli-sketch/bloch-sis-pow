@@ -9,6 +9,7 @@ import { G4BlockPage } from "./pages/G4Block";
 import { BalancePage } from "./pages/Balance";
 import { ValidatorsPage } from "./pages/Validators";
 import { SnapshotPage } from "./pages/Snapshot";
+import { SupplyPage } from "./pages/Supply";
 import "./features.css";
 
 // The Bloch sphere — one qubit, every state. Canonical protocol mark,
@@ -28,6 +29,7 @@ const Logo = () => (
 const NAV = [
   { to: "/", label: "Chain" },
   { to: "/balance", label: "Balance" },
+  { to: "/supply", label: "Supply" },
   { to: "/validators", label: "Validators" },
   { to: "/snapshot", label: "Snapshot" },
 ];
@@ -39,6 +41,7 @@ function renderRoute(path: string) {
     const mb = matchRoute(path, "/balance/:h");
     if (mb) return <BalancePage initial={mb.h} key={"bal" + mb.h} />;
   }
+  if (path === "/supply") return <SupplyPage />;
   if (path === "/validators") return <ValidatorsPage />;
   if (path === "/snapshot") return <SnapshotPage />;
 
