@@ -1,7 +1,16 @@
 //! Coherence shielded-pool primitives — the lean, portable core.
 //!
-//! Single source of truth shared by the node (`bloch::coherence` re-exports
-//! this), the SP1 guest prover (`crates/coherence-prover`), and the mobile
+//! > **Not live on Genesis-4.** These primitives were built for the Genesis-3
+//! > proof-of-work node (`legacy/genesis3-node`, which re-exports them as
+//! > `bloch::coherence`); that chain stopped permanently at height 39,918 on
+//! > 2026-08-13. The live chain is **Genesis-4, proof of stake**, and it has
+//! > **no shielded pool**: `bloch-pos-node` does not depend on this crate, and
+//! > no Genesis-4 transaction type is shielded. This crate reaches the live
+//! > build only transitively, as a dependency of `bloch-crypto`. Nothing here
+//! > has been audited.
+//!
+//! Single source of truth shared by the Genesis-3 node, the SP1 guest prover
+//! (`crates/coherence-prover`), and the mobile
 //! wallet. Implements the C1-frozen formats (`docs/specs/COHERENCE-C1.md`):
 //! SHAKE-256 note commitments, hash-derived nullifiers, a SHAKE-256 incremental
 //! Merkle accumulator, and `check_spend` — the exact statement the ZK circuit
@@ -971,6 +980,19 @@ pub struct ShieldedTx {
     pub output_ciphertexts: Vec<NoteCiphertext>,
     pub fee: u64,
     pub proof: Vec<u8>,
+    /// **OPEN ITEM — no scheme, no sighash domain.** This field predates the
+    /// value bridge and has never had a defined signer, key, or message. In
+    /// Sapling the binding signature exists because balance lives in
+    /// homomorphic Pedersen value commitments; here commitments are SHAKE-256
+    /// hashes with no homomorphism, so that role is impossible — balance is
+    /// enforced *inside* the proved statement instead. The transplant-binding
+    /// role (a proof must not be movable onto a different transaction) is
+    /// filled for the bridge by committing a transaction digest into the
+    /// public inputs (see [`UnshieldPublic::transparent_digest`]). What
+    /// remains undecided for THIS field: define an envelope-malleability
+    /// signature (scheme + sighash domain) or delete the field at wire
+    /// freeze. Until that decision, verifiers MUST ignore it and producers
+    /// MUST leave it empty.
     pub binding_sig: Vec<u8>,
 }
 
@@ -989,6 +1011,617 @@ impl ShieldedTx {
     pub fn ciphertexts_well_formed(&self) -> bool {
         self.output_ciphertexts.len() == self.outputs.len()
             && self.output_ciphertexts.iter().all(NoteCiphertext::well_formed)
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Value bridge (F10): shield / unshield — transparent ↔ shielded
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// C1 froze a HERMETIC pool: `check_spend` enforces Σin = Σout + fee over notes
+// only, so value could neither enter the pool nor leave it beyond the public
+// fee (finding F10 of `BLOCH-COHERENCE-UNDER-POS.md`). The types below are the
+// doors: `ShieldTx` (transparent → shielded) and `UnshieldTx` (shielded →
+// transparent). `check_spend` itself is untouched — it is the C1-frozen
+// statement and the pinned SP1 guest proves exactly it.
+//
+// ── WIRE FORMAT: **NOT FROZEN** ──────────────────────────────────────────────
+// The measured proof does not fit the block
+// (`docs/audit/COHERENCE-PROOF-SIZE-2026-08-29.md`: core 2.66 MiB, compressed
+// 1.21 MiB, vs `MAX_BLOCK_TX_BYTES_V2` = 512 KiB). Whether the block cap rises
+// or the proof moves off-body (data availability) is an OPEN architecture
+// decision. Consequences drawn here:
+//   * proof carriage sits behind [`ProofCarrier`] + [`ProofFetch`] — both
+//     outcomes fit without touching statements or transaction logic;
+//   * the serde derives on these types are plumbing for tests and prototypes
+//     ONLY. No canonical byte layout is defined and nothing here is a
+//     C1-ratified encoding. Do not pin hashes of these encodings.
+//
+// ── TAINT IS DEAD ────────────────────────────────────────────────────────────
+// §3.2 rule 2, §3.3 and §3.5 of `BLOCH-COHERENCE-UNDER-POS.md` (the taint gate
+// on shielding and its activation ordering) are orphaned: the Genesis-4 taint
+// set dissolved (see `bloch-pos-committee/src/tokenomics_v4.rs` and
+// `interfaces.rs` — "`Tainted` variants are never produced"). `ShieldTx`
+// therefore carries NO taint rule. What survives is §3.4 — a stake deposit may
+// spend only transparent inputs — and it is already enforced in
+// `bloch-pos-committee::staking::validate_deposit`
+// (`DepositReject::ShieldedInput`). Unshield outputs are ordinary fresh
+// transparent outputs, born untainted, and therefore deposit-eligible; the
+// positive test pinning that lives in
+// `bloch-pos-committee/tests/committee.rs::unshield_output_funds_a_valid_deposit`.
+
+/// Domain tag for proof-blob commitments ([`ProofCarrier::commitment`]).
+const DOM_PROOF: &[u8] = b"bloch:coherence:proofcm:v1";
+/// Domain tag for the unshield transparent-outputs digest.
+const DOM_TOUT: &[u8] = b"bloch:coherence:unshield-touts:v1";
+
+/// `SHAKE256(DOM_PROOF ‖ bytes)` — the consensus identity of a proof blob.
+///
+/// This is the indirection the open block-size decision hangs on: whatever a
+/// transaction merkle-binds, gossips, or fetches, the 32-byte commitment is
+/// the stable name of the proof in BOTH architecture outcomes.
+pub fn proof_commitment(bytes: &[u8]) -> [u8; 32] {
+    shake256_32(&[DOM_PROOF, bytes])
+}
+
+/// Where a transaction's proof bytes live. **The** indirection for the open
+/// architecture decision:
+///
+/// * **Outcome A — the block cap rises**: producers use
+///   [`ProofCarrier::Inline`]; [`ProofCarrier::resolve`] returns the bytes
+///   with no fetch. Nothing else changes.
+/// * **Outcome B — the proof leaves the block body** (data availability):
+///   producers use [`ProofCarrier::Detached`]; the body carries only the
+///   32-byte commitment + length, and validators resolve the bytes through a
+///   [`ProofFetch`] implementation (mempool sidecar, DA layer, …). `resolve`
+///   re-hashes what was fetched, so a fetch layer can never substitute a
+///   different proof than the one the transaction committed to.
+///
+/// Statements, transaction logic, and the pool-value ratchet are identical in
+/// both outcomes; only the `ProofFetch` implementation differs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProofCarrier {
+    /// Proof travels in the transaction body.
+    Inline(Vec<u8>),
+    /// Proof lives off-body; the transaction carries its commitment and size.
+    Detached { commitment: [u8; 32], len: u64 },
+}
+
+/// Supplies detached proof bytes by commitment. Implemented by the node
+/// (mempool sidecar store, DA layer client); [`NoDetachedProofs`] is the
+/// fail-closed default for contexts where only inline proofs are acceptable.
+pub trait ProofFetch {
+    fn fetch(&self, commitment: &[u8; 32]) -> Option<Vec<u8>>;
+}
+
+/// Resolves nothing: any [`ProofCarrier::Detached`] fails with `NotFound`.
+pub struct NoDetachedProofs;
+
+impl ProofFetch for NoDetachedProofs {
+    fn fetch(&self, _commitment: &[u8; 32]) -> Option<Vec<u8>> {
+        None
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProofUnavailable {
+    /// The fetch layer has no bytes for this commitment. Fail-closed: a
+    /// transaction whose proof cannot be resolved is unverifiable, not valid.
+    NotFound { commitment: [u8; 32] },
+    /// Fetched bytes have the wrong length for the declared blob.
+    LengthMismatch { expected: u64, got: u64 },
+    /// Fetched bytes hash to a different commitment — a substituted proof.
+    CommitmentMismatch { expected: [u8; 32], got: [u8; 32] },
+}
+
+impl ProofCarrier {
+    /// The consensus identity of the proof, independent of carriage.
+    pub fn commitment(&self) -> [u8; 32] {
+        match self {
+            ProofCarrier::Inline(bytes) => proof_commitment(bytes),
+            ProofCarrier::Detached { commitment, .. } => *commitment,
+        }
+    }
+
+    /// Declared byte length (what fee/weight accounting charges for).
+    pub fn len(&self) -> u64 {
+        match self {
+            ProofCarrier::Inline(bytes) => bytes.len() as u64,
+            ProofCarrier::Detached { len, .. } => *len,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Produce the actual proof bytes, verifying that what came back is the
+    /// blob this transaction committed to.
+    pub fn resolve(&self, fetch: &dyn ProofFetch) -> Result<Vec<u8>, ProofUnavailable> {
+        match self {
+            ProofCarrier::Inline(bytes) => Ok(bytes.clone()),
+            ProofCarrier::Detached { commitment, len } => {
+                let bytes = fetch
+                    .fetch(commitment)
+                    .ok_or(ProofUnavailable::NotFound { commitment: *commitment })?;
+                if bytes.len() as u64 != *len {
+                    return Err(ProofUnavailable::LengthMismatch {
+                        expected: *len,
+                        got: bytes.len() as u64,
+                    });
+                }
+                let got = proof_commitment(&bytes);
+                if got != *commitment {
+                    return Err(ProofUnavailable::CommitmentMismatch {
+                        expected: *commitment,
+                        got,
+                    });
+                }
+                Ok(bytes)
+            }
+        }
+    }
+}
+
+// ── Bridge-facing transparent views ──────────────────────────────────────────
+
+
+/// Minimal view of a spent transparent output (eUTXO outpoint). This crate
+/// stays lean — the node resolves these against its ledger and performs the
+/// full eUTXO validation (existence, hybrid signatures, transparent balance).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransparentOutPoint {
+    pub txid: [u8; 32],
+    pub vout: u32,
+}
+
+/// A fresh transparent output created by an unshield. `script_hash` follows
+/// the Genesis-4 addressing (32-byte script hash).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransparentOutput {
+    pub value_sat: u64,
+    pub script_hash: [u8; 32],
+}
+
+/// `SHAKE256(DOM_TOUT ‖ count ‖ (value ‖ script_hash)*)` — the digest of the
+/// transparent side of an unshield, committed into [`UnshieldPublic`] so the
+/// proof is bound to *these* destinations. Without it, a valid unshield proof
+/// could be replayed with the transparent outputs swapped to an attacker's
+/// script — the classic proof-transplant. Length-prefixed and fixed-width, so
+/// the encoding is injective.
+pub fn transparent_outputs_digest(outputs: &[TransparentOutput]) -> [u8; 32] {
+    let mut h = Shake256::default();
+    h.update(DOM_TOUT);
+    h.update(&(outputs.len() as u64).to_le_bytes());
+    for o in outputs {
+        h.update(&o.value_sat.to_le_bytes());
+        h.update(&o.script_hash);
+    }
+    let mut xof = h.finalize_xof();
+    let mut out = [0u8; 32];
+    xof.read(&mut out);
+    out
+}
+
+// ── Shield statement (proved in ZK; strictly smaller than spend) ─────────────
+
+/// Public inputs of the shield proof. No anchor and no nullifiers — a shield
+/// spends no note, so its statement is strictly smaller than `check_spend`:
+/// only "each committed note opens to some value and the values total exactly
+/// the public `value_shielded`".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShieldPublic {
+    /// Total value entering the pool, PUBLIC — as in any t→z design. How it
+    /// splits into notes stays inside the proof.
+    pub value_shielded: u64,
+    pub out_commitments: Vec<[u8; 32]>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShieldWitness {
+    pub outputs: Vec<Note>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShieldError {
+    /// public.out_commitments.len() != witness.outputs.len(). Same
+    /// counterfeiting vector as the C2 bind on `check_spend`: an extra public
+    /// commitment the balance never sees would mint an unbacked note.
+    OutputCountMismatch { public: usize, witness: usize },
+    OutputCommitment(usize),
+    Overflow,
+    Unbalanced { outputs: u128, value_shielded: u64 },
+}
+
+/// The EXACT statement the shield proof must attest (runs on the PRIVATE
+/// witness): every public commitment opens to a witness note, and the note
+/// values total exactly the public `value_shielded`. Backing invariant: the
+/// pool's implicit balance grows by precisely what the transparent side paid
+/// in.
+pub fn check_shield(public: &ShieldPublic, w: &ShieldWitness) -> Result<(), ShieldError> {
+    if public.out_commitments.len() != w.outputs.len() {
+        return Err(ShieldError::OutputCountMismatch {
+            public: public.out_commitments.len(),
+            witness: w.outputs.len(),
+        });
+    }
+    let mut out_sum: u128 = 0;
+    for (i, out) in w.outputs.iter().enumerate() {
+        if public.out_commitments.get(i) != Some(&out.commitment()) {
+            return Err(ShieldError::OutputCommitment(i));
+        }
+        out_sum = out_sum.checked_add(out.v as u128).ok_or(ShieldError::Overflow)?;
+    }
+    if out_sum != public.value_shielded as u128 {
+        return Err(ShieldError::Unbalanced { outputs: out_sum, value_shielded: public.value_shielded });
+    }
+    Ok(())
+}
+
+// ── Unshield statement (proved in ZK; `check_spend` + one public term) ───────
+
+/// Public inputs of the unshield proof: exactly [`SpendPublic`] plus the
+/// public `value_unshielded` and the binding digest of the transparent side.
+///
+/// **This is a revision of the frozen C1 spend statement**, not a reuse of
+/// it: a new guest proves [`check_unshield`], which means a new ELF and a new
+/// pinned verifying key alongside the spend one. `check_spend` and its pinned
+/// guest are untouched.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnshieldPublic {
+    pub anchor: [u8; 32],
+    pub nullifiers: Vec<[u8; 32]>,
+    /// Shielded change staying in the pool.
+    pub change_commitments: Vec<[u8; 32]>,
+    /// Total value leaving the pool, PUBLIC.
+    pub value_unshielded: u64,
+    /// Paid from the pool, like `SpendPublic::fee`.
+    pub fee: u64,
+    /// [`transparent_outputs_digest`] of the transaction's transparent
+    /// outputs. Not recomputable from the witness — the statement simply
+    /// commits it, and the VERIFIER recomputes it from the transaction
+    /// ([`UnshieldTx::public`] builds it from the tx's own outputs, so the
+    /// bind holds by construction). This term is what makes an unshield proof
+    /// non-transplantable onto different destinations.
+    pub transparent_digest: [u8; 32],
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnshieldWitness {
+    pub inputs: Vec<SpendInput>,
+    pub change_outputs: Vec<Note>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnshieldError {
+    Membership(usize),
+    Nullifier(usize),
+    /// The same nullifier appears twice among the public nullifiers — i.e.
+    /// the same note is spent twice INSIDE one transaction, doubling
+    /// `in_sum`. Application-level `NullifierSet::insert` would also catch
+    /// it, but this is the statement where a soundness reviewer looks first,
+    /// so the statement rejects it itself. (`check_spend` relies on the
+    /// application layer for this case; flagged, not changed — it is frozen.)
+    DuplicateNullifier(usize),
+    ChangeCommitment(usize),
+    NullifierCountMismatch { public: usize, witness: usize },
+    ChangeCountMismatch { public: usize, witness: usize },
+    Overflow,
+    Unbalanced { inputs: u128, change: u128, value_unshielded: u64, fee: u64 },
+}
+
+/// The EXACT statement the unshield proof must attest: `check_spend`'s
+/// membership/nullifier/opening checks over the pool side, with the balance
+/// extended by one public term:
+///
+/// ```text
+/// Σ inputs = Σ change + value_unshielded + fee
+/// ```
+///
+/// This is the soundness-critical statement of the whole bridge: a break here
+/// MINTS transparent supply and pierces the 100 B hard cap. The defense
+/// outside the proof system is [`PoolValue`] — see its docs.
+pub fn check_unshield(public: &UnshieldPublic, w: &UnshieldWitness) -> Result<(), UnshieldError> {
+    if public.change_commitments.len() != w.change_outputs.len() {
+        return Err(UnshieldError::ChangeCountMismatch {
+            public: public.change_commitments.len(),
+            witness: w.change_outputs.len(),
+        });
+    }
+    if public.nullifiers.len() != w.inputs.len() {
+        return Err(UnshieldError::NullifierCountMismatch {
+            public: public.nullifiers.len(),
+            witness: w.inputs.len(),
+        });
+    }
+    let mut in_sum: u128 = 0;
+    for (i, inp) in w.inputs.iter().enumerate() {
+        let cm = inp.note.commitment();
+        if !verify_path(&cm, inp.position, &inp.path, &public.anchor) {
+            return Err(UnshieldError::Membership(i));
+        }
+        let nf = inp.note.nullifier(&inp.nk, inp.position);
+        if public.nullifiers.get(i) != Some(&nf) {
+            return Err(UnshieldError::Nullifier(i));
+        }
+        if public.nullifiers[..i].contains(&nf) {
+            return Err(UnshieldError::DuplicateNullifier(i));
+        }
+        in_sum = in_sum.checked_add(inp.note.v as u128).ok_or(UnshieldError::Overflow)?;
+    }
+    let mut change_sum: u128 = 0;
+    for (i, out) in w.change_outputs.iter().enumerate() {
+        if public.change_commitments.get(i) != Some(&out.commitment()) {
+            return Err(UnshieldError::ChangeCommitment(i));
+        }
+        change_sum = change_sum.checked_add(out.v as u128).ok_or(UnshieldError::Overflow)?;
+    }
+    // u64 + u64 fits u128; the change_sum add is the only one that can carry.
+    let owed = change_sum
+        .checked_add(public.value_unshielded as u128 + public.fee as u128)
+        .ok_or(UnshieldError::Overflow)?;
+    if in_sum != owed {
+        return Err(UnshieldError::Unbalanced {
+            inputs: in_sum,
+            change: change_sum,
+            value_unshielded: public.value_unshielded,
+            fee: public.fee,
+        });
+    }
+    Ok(())
+}
+
+// ── Bridge transaction types (wire format NOT frozen — see section header) ──
+
+/// Structural validity of a bridge transaction — the cheap checks every node
+/// runs before touching a proof.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BridgeShapeError {
+    /// One ciphertext per commitment, or the recipient cannot ever decrypt
+    /// the note — a burned note that still counts toward the pool.
+    CiphertextCountMismatch { commitments: usize, ciphertexts: usize },
+    /// A shield must spend at least one transparent input.
+    NoTransparentInputs,
+    /// An unshield must spend at least one note.
+    NoNullifiers,
+    /// An unshield must create at least one transparent output.
+    NoTransparentOutputs,
+    /// A zero-value bridge crossing is spam by construction.
+    ZeroValue,
+    /// Σ transparent output values must equal the public `value_unshielded`
+    /// exactly — this equality is what welds the proved pool-side balance to
+    /// the transparent ledger. It is a NODE-side check (the statement cannot
+    /// see the transparent outputs; it sees only their digest).
+    TransparentSumMismatch { outputs_sum: u128, value_unshielded: u64 },
+}
+
+/// `shield_tx` — transparent → shielded (spec §3.2, taint rule dropped).
+///
+/// Node-side validity (outside this crate):
+/// 1. eUTXO: inputs exist, hybrid signatures verify, and
+///    `Σ inputs = value_shielded + fee + transparent change`. The input
+///    signatures MUST cover the entire transaction — `value_shielded`, the
+///    commitment list, the ciphertexts and the proof commitment included —
+///    which is why `ShieldTx` carries no `binding_sig`: the transparent
+///    signer is the binder.
+/// 2. [`ShieldTx::check_shape`].
+/// 3. The proof (resolved via [`ProofCarrier::resolve`]) verifies
+///    [`check_shield`] against [`ShieldTx::public`].
+/// 4. State: append `outputs` to the commitment tree; credit
+///    [`PoolValue::apply_shield`]. No anchor, no nullifiers — a shield spends
+///    no note.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShieldTx {
+    pub transparent_inputs: Vec<TransparentOutPoint>,
+    /// PUBLIC total entering the pool.
+    pub value_shielded: u64,
+    /// Fee, paid on the transparent side (from the inputs), NOT from the pool.
+    pub fee: u64,
+    /// Note commitments entering the tree.
+    pub outputs: Vec<[u8; 32]>,
+    /// One per output (DEV-2 format).
+    pub output_ciphertexts: Vec<NoteCiphertext>,
+    pub proof: ProofCarrier,
+}
+
+impl ShieldTx {
+    pub fn public(&self) -> ShieldPublic {
+        ShieldPublic { value_shielded: self.value_shielded, out_commitments: self.outputs.clone() }
+    }
+
+    pub fn check_shape(&self) -> Result<(), BridgeShapeError> {
+        if self.transparent_inputs.is_empty() {
+            return Err(BridgeShapeError::NoTransparentInputs);
+        }
+        if self.value_shielded == 0 {
+            return Err(BridgeShapeError::ZeroValue);
+        }
+        if self.outputs.len() != self.output_ciphertexts.len() {
+            return Err(BridgeShapeError::CiphertextCountMismatch {
+                commitments: self.outputs.len(),
+                ciphertexts: self.output_ciphertexts.len(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// `unshield_tx` — shielded → transparent.
+///
+/// Node-side validity (outside this crate):
+/// 1. [`UnshieldTx::check_shape`] — including the transparent-sum weld.
+/// 2. `anchor` is a known commitment-tree root; every nullifier is absent
+///    from the [`NullifierSet`] (then inserted on application).
+/// 3. The proof (resolved via [`ProofCarrier::resolve`]) verifies
+///    [`check_unshield`] against [`UnshieldTx::public`] — whose
+///    `transparent_digest` is recomputed from THIS transaction's outputs, so
+///    a proof bound to other destinations cannot verify here.
+/// 4. State: insert nullifiers, append `change_commitments`, create the
+///    transparent outputs as fresh eUTXO entries, and debit
+///    [`PoolValue::apply_unshield`] — the ratchet runs even when the proof
+///    verified.
+///
+/// The created outputs are ordinary transparent outputs: born untainted
+/// (there is no taint set) and deposit-eligible under §3.4.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnshieldTx {
+    pub anchor: [u8; 32],
+    pub nullifiers: Vec<[u8; 32]>,
+    /// Shielded change staying in the pool.
+    pub change_commitments: Vec<[u8; 32]>,
+    /// One per change commitment (DEV-2 format).
+    pub change_ciphertexts: Vec<NoteCiphertext>,
+    /// PUBLIC total leaving the pool. Must equal Σ `transparent_outputs`
+    /// values exactly ([`UnshieldTx::check_shape`]).
+    pub value_unshielded: u64,
+    /// Paid from the pool.
+    pub fee: u64,
+    pub transparent_outputs: Vec<TransparentOutput>,
+    pub proof: ProofCarrier,
+    /// **OPEN ITEM** — same pendency as [`ShieldedTx::binding_sig`]: no
+    /// scheme, no sighash domain. The anti-transplant role is filled by
+    /// `transparent_digest` inside the proved statement; whether this field
+    /// gains an envelope-malleability signature or is deleted is a
+    /// wire-freeze decision. Until then: producers leave it empty, verifiers
+    /// ignore it.
+    pub binding_sig: Vec<u8>,
+}
+
+impl UnshieldTx {
+    /// The public inputs this transaction demands of its proof. The digest is
+    /// derived from the transaction's OWN transparent outputs — binding by
+    /// construction: change the destinations and the proof no longer speaks
+    /// for this transaction.
+    pub fn public(&self) -> UnshieldPublic {
+        UnshieldPublic {
+            anchor: self.anchor,
+            nullifiers: self.nullifiers.clone(),
+            change_commitments: self.change_commitments.clone(),
+            value_unshielded: self.value_unshielded,
+            fee: self.fee,
+            transparent_digest: transparent_outputs_digest(&self.transparent_outputs),
+        }
+    }
+
+    pub fn check_shape(&self) -> Result<(), BridgeShapeError> {
+        if self.nullifiers.is_empty() {
+            return Err(BridgeShapeError::NoNullifiers);
+        }
+        if self.transparent_outputs.is_empty() {
+            return Err(BridgeShapeError::NoTransparentOutputs);
+        }
+        if self.value_unshielded == 0 {
+            return Err(BridgeShapeError::ZeroValue);
+        }
+        if self.change_commitments.len() != self.change_ciphertexts.len() {
+            return Err(BridgeShapeError::CiphertextCountMismatch {
+                commitments: self.change_commitments.len(),
+                ciphertexts: self.change_ciphertexts.len(),
+            });
+        }
+        let mut sum: u128 = 0;
+        for o in &self.transparent_outputs {
+            sum += o.value_sat as u128; // u128 sum of u64s cannot overflow at any real count
+        }
+        if sum != self.value_unshielded as u128 {
+            return Err(BridgeShapeError::TransparentSumMismatch {
+                outputs_sum: sum,
+                value_unshielded: self.value_unshielded,
+            });
+        }
+        Ok(())
+    }
+}
+
+// ── Pool-value ratchet (interface for DEV-8) ─────────────────────────────────
+
+/// The pool's transparent backing, in satoshis — **the defense that lives
+/// OUTSIDE the proof system.**
+///
+/// A soundness failure in the unshield proof mints transparent supply and
+/// pierces the 100 B hard cap. This counter caps the blast radius: the chain
+/// can never pay out more transparent value than has ever entered the pool,
+/// no matter what a proof claims. [`PoolValueError::WouldMint`] is the alarm
+/// — a transaction that trips it is invalid even if its proof verified.
+///
+/// Interface contract with DEV-8 (the supply ratchet):
+/// * DEV-8 owns WHERE this commits — it must live in the consensus-committed
+///   state (`state_root`), never node-local (§5.5), or two honest nodes could
+///   disagree on whether an unshield is covered.
+/// * This type owns the ARITHMETIC: all mutations are checked, deltas are the
+///   three `apply_*` calls (one per shielded tx kind), and each has an exact
+///   inverse `undo_*` for reorg disconnects.
+/// * Monotone invariant for the ratchet proper:
+///   `Σ apply_unshield amounts ≤ Σ apply_shield amounts` at every block —
+///   which is exactly "this counter never underflows".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PoolValue {
+    sat: u128,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolValueError {
+    Overflow,
+    /// The pool does not hold what this operation withdraws. On an unshield
+    /// this is the counterfeit alarm; on an `undo_*` it means state
+    /// corruption (an undo that was never applied).
+    WouldMint { pool: u128, requested: u128 },
+}
+
+impl PoolValue {
+    pub const ZERO: PoolValue = PoolValue { sat: 0 };
+
+    pub fn from_sat(sat: u128) -> Self {
+        Self { sat }
+    }
+
+    pub fn sat(&self) -> u128 {
+        self.sat
+    }
+
+    /// Shield applied: `value_shielded` enters the pool. (The shield fee is
+    /// paid transparently and never touches the pool.)
+    pub fn apply_shield(&mut self, value_shielded: u64) -> Result<(), PoolValueError> {
+        self.sat = self.sat.checked_add(value_shielded as u128).ok_or(PoolValueError::Overflow)?;
+        Ok(())
+    }
+
+    /// Shielded spend applied: only the public fee leaves the pool.
+    pub fn apply_spend(&mut self, fee: u64) -> Result<(), PoolValueError> {
+        self.debit(fee as u128)
+    }
+
+    /// Unshield applied: `value_unshielded + fee` leaves the pool.
+    pub fn apply_unshield(&mut self, value_unshielded: u64, fee: u64) -> Result<(), PoolValueError> {
+        self.debit(value_unshielded as u128 + fee as u128)
+    }
+
+    /// Reorg disconnect of a shield.
+    pub fn undo_shield(&mut self, value_shielded: u64) -> Result<(), PoolValueError> {
+        self.debit(value_shielded as u128)
+    }
+
+    /// Reorg disconnect of a shielded spend.
+    pub fn undo_spend(&mut self, fee: u64) -> Result<(), PoolValueError> {
+        self.sat = self.sat.checked_add(fee as u128).ok_or(PoolValueError::Overflow)?;
+        Ok(())
+    }
+
+    /// Reorg disconnect of an unshield.
+    pub fn undo_unshield(&mut self, value_unshielded: u64, fee: u64) -> Result<(), PoolValueError> {
+        self.sat = self
+            .sat
+            .checked_add(value_unshielded as u128 + fee as u128)
+            .ok_or(PoolValueError::Overflow)?;
+        Ok(())
+    }
+
+    fn debit(&mut self, amount: u128) -> Result<(), PoolValueError> {
+        if amount > self.sat {
+            return Err(PoolValueError::WouldMint { pool: self.sat, requested: amount });
+        }
+        self.sat -= amount;
+        Ok(())
     }
 }
 
@@ -1610,5 +2243,481 @@ mod persistent_state_tests {
             NullifierSet::from_iter((0..40u64).map(prk)).root(),
             "the frozen clone still commits the original set"
         );
+    }
+}
+
+#[cfg(test)]
+mod bridge_tests {
+    use super::*;
+
+    fn note(v: u64, tag: u8) -> Note {
+        Note { v, pk_d: [tag; 32], rho: [tag ^ 0x11; 32], psi: [tag ^ 0x22; 32] }
+    }
+
+    fn ct() -> NoteCiphertext {
+        // Well-formed per DEV-2's real ML-KEM-1024 struct (this test helper
+        // previously built the opaque placeholder newtype).
+        NoteCiphertext {
+            kem_ct: vec![0u8; NOTE_KEM_CT_LEN],
+            nonce: [0u8; NOTE_AEAD_NONCE_LEN],
+            payload: vec![0u8; NOTE_PLAINTEXT_LEN + NOTE_AEAD_TAG_LEN],
+        }
+    }
+
+    // ── check_shield ────────────────────────────────────────────────────────
+
+    #[test]
+    fn shield_accepts_exact_backing_and_hides_the_split() {
+        // 1000 in, split 700/300 — the split is witness-only; the statement
+        // sees the commitments and the public total.
+        let a = note(700, 1);
+        let b = note(300, 2);
+        let public = ShieldPublic {
+            value_shielded: 1000,
+            out_commitments: vec![a.commitment(), b.commitment()],
+        };
+        let w = ShieldWitness { outputs: vec![a, b] };
+        assert_eq!(check_shield(&public, &w), Ok(()));
+    }
+
+    /// The counterfeiting vector, shield edition: notes totalling MORE than
+    /// the public value_shielded would mint unbacked pool value.
+    #[test]
+    fn shield_rejects_notes_exceeding_the_public_value() {
+        let a = note(700, 1);
+        let b = note(400, 2); // 1100 committed, 1000 declared
+        let public = ShieldPublic {
+            value_shielded: 1000,
+            out_commitments: vec![a.commitment(), b.commitment()],
+        };
+        let w = ShieldWitness { outputs: vec![a, b] };
+        assert_eq!(
+            check_shield(&public, &w),
+            Err(ShieldError::Unbalanced { outputs: 1100, value_shielded: 1000 })
+        );
+    }
+
+    /// And the burn direction: declaring more than the notes carry would
+    /// desync the pool's implicit balance from its notes.
+    #[test]
+    fn shield_rejects_public_value_exceeding_the_notes() {
+        let a = note(500, 1);
+        let public = ShieldPublic { value_shielded: 1000, out_commitments: vec![a.commitment()] };
+        let w = ShieldWitness { outputs: vec![a] };
+        assert!(matches!(check_shield(&public, &w), Err(ShieldError::Unbalanced { .. })));
+    }
+
+    /// C2-bind, shield edition: an extra public commitment the balance check
+    /// never sees must fail on count, not slip through.
+    #[test]
+    fn shield_binds_public_count_to_witness() {
+        let a = note(1000, 1);
+        let smuggled = note(1_000_000, 9);
+        let public = ShieldPublic {
+            value_shielded: 1000,
+            out_commitments: vec![a.commitment(), smuggled.commitment()],
+        };
+        let w = ShieldWitness { outputs: vec![a] };
+        assert_eq!(
+            check_shield(&public, &w),
+            Err(ShieldError::OutputCountMismatch { public: 2, witness: 1 })
+        );
+    }
+
+    #[test]
+    fn shield_rejects_wrong_commitment_and_u64_scale_imbalance() {
+        let a = note(1000, 1);
+        let public = ShieldPublic { value_shielded: 1000, out_commitments: vec![[0xAB; 32]] };
+        let w = ShieldWitness { outputs: vec![a] };
+        assert_eq!(check_shield(&public, &w), Err(ShieldError::OutputCommitment(0)));
+
+        // At u64::MAX scale the u128 accumulator must neither wrap nor agree:
+        // two max-value notes cannot be declared as a small public total.
+        let m1 = note(u64::MAX, 1);
+        let m2 = note(u64::MAX, 2);
+        let public = ShieldPublic {
+            value_shielded: 1000,
+            out_commitments: vec![m1.commitment(), m2.commitment()],
+        };
+        let w = ShieldWitness { outputs: vec![m1, m2] };
+        assert!(matches!(check_shield(&public, &w), Err(ShieldError::Unbalanced { .. })));
+    }
+
+    // ── check_unshield ──────────────────────────────────────────────────────
+
+    /// One funded tree, reused across the unshield tests.
+    fn funded(v: u64) -> (CommitmentTree, Note, u64, Vec<[u8; 32]>, [u8; 32], [u8; 32]) {
+        let mut t = CommitmentTree::new();
+        let n = note(v, 7);
+        let pos = t.append(n.commitment());
+        let anchor = t.root();
+        let path = t.path(pos).unwrap();
+        let nk = [3u8; 32];
+        (t, n, pos, path, anchor, nk)
+    }
+
+    fn valid_unshield() -> (UnshieldPublic, UnshieldWitness) {
+        // 1000 in = 300 change + 600 out + 100 fee
+        let (_t, inp, pos, path, anchor, nk) = funded(1000);
+        let change = note(300, 8);
+        let public = UnshieldPublic {
+            anchor,
+            nullifiers: vec![inp.nullifier(&nk, pos)],
+            change_commitments: vec![change.commitment()],
+            value_unshielded: 600,
+            fee: 100,
+            transparent_digest: transparent_outputs_digest(&[TransparentOutput {
+                value_sat: 600,
+                script_hash: [0x51; 32],
+            }]),
+        };
+        let w = UnshieldWitness {
+            inputs: vec![SpendInput { note: inp, position: pos, path, nk }],
+            change_outputs: vec![change],
+        };
+        (public, w)
+    }
+
+    #[test]
+    fn unshield_accepts_a_balanced_exit() {
+        let (public, w) = valid_unshield();
+        assert_eq!(check_unshield(&public, &w), Ok(()));
+    }
+
+    /// THE mint vector: claiming more public value_unshielded than the notes
+    /// fund. A soundness break here counterfeits transparent supply, so the
+    /// statement-level rejection is the first of the two defenses (the
+    /// PoolValue ratchet is the second).
+    #[test]
+    fn unshield_rejects_minting_more_than_the_inputs_fund() {
+        let (mut public, w) = valid_unshield();
+        public.value_unshielded = 601; // one sat over
+        assert_eq!(
+            check_unshield(&public, &w),
+            Err(UnshieldError::Unbalanced {
+                inputs: 1000,
+                change: 300,
+                value_unshielded: 601,
+                fee: 100
+            })
+        );
+    }
+
+    #[test]
+    fn unshield_rejects_forged_membership_and_wrong_nullifier() {
+        let (public, w) = valid_unshield();
+
+        let forged = UnshieldPublic { anchor: [0xCD; 32], ..public.clone() };
+        assert_eq!(check_unshield(&forged, &w), Err(UnshieldError::Membership(0)));
+
+        let mut wrong_nf = public.clone();
+        wrong_nf.nullifiers[0] = [0xEE; 32];
+        assert_eq!(check_unshield(&wrong_nf, &w), Err(UnshieldError::Nullifier(0)));
+    }
+
+    /// C2-binds, unshield edition: public vectors bound to witness lengths in
+    /// both directions.
+    #[test]
+    fn unshield_binds_public_counts_to_witness() {
+        let (public, w) = valid_unshield();
+
+        let mut smuggled_change = public.clone();
+        smuggled_change.change_commitments.push(note(1_000_000, 9).commitment());
+        assert_eq!(
+            check_unshield(&smuggled_change, &w),
+            Err(UnshieldError::ChangeCountMismatch { public: 2, witness: 1 })
+        );
+
+        let mut missing_nf = public.clone();
+        missing_nf.nullifiers.clear();
+        assert_eq!(
+            check_unshield(&missing_nf, &w),
+            Err(UnshieldError::NullifierCountMismatch { public: 0, witness: 1 })
+        );
+
+        let mut extra_nf = public.clone();
+        extra_nf.nullifiers.push([0xEE; 32]);
+        assert_eq!(
+            check_unshield(&extra_nf, &w),
+            Err(UnshieldError::NullifierCountMismatch { public: 2, witness: 1 })
+        );
+    }
+
+    /// Spending the same note twice in ONE transaction doubles in_sum — the
+    /// intra-tx double-spend the NullifierSet only catches at application.
+    /// The unshield statement rejects it itself.
+    #[test]
+    fn unshield_rejects_intra_tx_double_spend() {
+        let (_t, inp, pos, path, anchor, nk) = funded(1000);
+        let nf = inp.nullifier(&nk, pos);
+        let change = note(300, 8);
+        let public = UnshieldPublic {
+            anchor,
+            nullifiers: vec![nf, nf],
+            change_commitments: vec![change.commitment()],
+            value_unshielded: 1600, // 2×1000 − 300 − 100: balanced IF the dup counted
+            fee: 100,
+            transparent_digest: [0u8; 32],
+        };
+        let dup = SpendInput { note: inp.clone(), position: pos, path: path.clone(), nk };
+        let w = UnshieldWitness { inputs: vec![dup.clone(), dup], change_outputs: vec![change] };
+        assert_eq!(check_unshield(&public, &w), Err(UnshieldError::DuplicateNullifier(1)));
+    }
+
+    /// The anti-transplant bind: the same shielded material pointed at a
+    /// different transparent destination yields DIFFERENT public inputs, so a
+    /// proof committed to one set of publics cannot speak for the other.
+    #[test]
+    fn unshield_public_binds_the_transparent_destinations() {
+        let tx = UnshieldTx {
+            anchor: [1; 32],
+            nullifiers: vec![[2; 32]],
+            change_commitments: vec![],
+            change_ciphertexts: vec![],
+            value_unshielded: 600,
+            fee: 100,
+            transparent_outputs: vec![TransparentOutput {
+                value_sat: 600,
+                script_hash: [0x51; 32],
+            }],
+            proof: ProofCarrier::Inline(vec![]),
+            binding_sig: vec![],
+        };
+        let mut hijacked = tx.clone();
+        hijacked.transparent_outputs[0].script_hash = [0x66; 32]; // attacker's script
+
+        assert_ne!(tx.public(), hijacked.public());
+        assert_ne!(tx.public().transparent_digest, hijacked.public().transparent_digest);
+
+        // Same value split differently must also re-bind.
+        let mut resplit = tx.clone();
+        resplit.transparent_outputs = vec![
+            TransparentOutput { value_sat: 300, script_hash: [0x51; 32] },
+            TransparentOutput { value_sat: 300, script_hash: [0x51; 32] },
+        ];
+        assert_ne!(tx.public().transparent_digest, resplit.public().transparent_digest);
+    }
+
+    // ── shapes: the transparent weld and the ciphertext count ───────────────
+
+    #[test]
+    fn unshield_shape_welds_outputs_to_the_public_value() {
+        let mut tx = UnshieldTx {
+            anchor: [1; 32],
+            nullifiers: vec![[2; 32]],
+            change_commitments: vec![[3; 32]],
+            change_ciphertexts: vec![ct()],
+            value_unshielded: 600,
+            fee: 100,
+            transparent_outputs: vec![TransparentOutput {
+                value_sat: 600,
+                script_hash: [0x51; 32],
+            }],
+            proof: ProofCarrier::Inline(vec![]),
+            binding_sig: vec![],
+        };
+        assert_eq!(tx.check_shape(), Ok(()));
+
+        // Output sum drifting from the proved public value is the weld break:
+        // the pool would be debited 600 while the ledger credits 700.
+        tx.transparent_outputs[0].value_sat = 700;
+        assert_eq!(
+            tx.check_shape(),
+            Err(BridgeShapeError::TransparentSumMismatch {
+                outputs_sum: 700,
+                value_unshielded: 600
+            })
+        );
+
+        tx.transparent_outputs.clear();
+        assert_eq!(tx.check_shape(), Err(BridgeShapeError::NoTransparentOutputs));
+
+        tx.transparent_outputs = vec![TransparentOutput { value_sat: 0, script_hash: [0x51; 32] }];
+        tx.value_unshielded = 0;
+        assert_eq!(tx.check_shape(), Err(BridgeShapeError::ZeroValue));
+    }
+
+    #[test]
+    fn shield_shape_requires_inputs_value_and_ciphertext_parity() {
+        let mut tx = ShieldTx {
+            transparent_inputs: vec![TransparentOutPoint { txid: [9; 32], vout: 0 }],
+            value_shielded: 1000,
+            fee: 10,
+            outputs: vec![[1; 32], [2; 32]],
+            output_ciphertexts: vec![ct(), ct()],
+            proof: ProofCarrier::Inline(vec![]),
+        };
+        assert_eq!(tx.check_shape(), Ok(()));
+
+        tx.output_ciphertexts.pop();
+        assert_eq!(
+            tx.check_shape(),
+            Err(BridgeShapeError::CiphertextCountMismatch { commitments: 2, ciphertexts: 1 })
+        );
+        tx.output_ciphertexts.push(ct());
+
+        tx.transparent_inputs.clear();
+        assert_eq!(tx.check_shape(), Err(BridgeShapeError::NoTransparentInputs));
+        tx.transparent_inputs.push(TransparentOutPoint { txid: [9; 32], vout: 0 });
+
+        tx.value_shielded = 0;
+        assert_eq!(tx.check_shape(), Err(BridgeShapeError::ZeroValue));
+    }
+
+    // ── proof carriage indirection ──────────────────────────────────────────
+
+    struct MapFetch(std::collections::HashMap<[u8; 32], Vec<u8>>);
+    impl ProofFetch for MapFetch {
+        fn fetch(&self, commitment: &[u8; 32]) -> Option<Vec<u8>> {
+            self.0.get(commitment).cloned()
+        }
+    }
+
+    #[test]
+    fn proof_carrier_serves_both_architecture_outcomes() {
+        let bytes = vec![0xAA; 128];
+        let cm = proof_commitment(&bytes);
+
+        // Outcome A: inline. Resolution is trivial and needs no fetch layer.
+        let inline = ProofCarrier::Inline(bytes.clone());
+        assert_eq!(inline.commitment(), cm);
+        assert_eq!(inline.resolve(&NoDetachedProofs).unwrap(), bytes);
+
+        // Outcome B: detached, resolved through a store.
+        let detached = ProofCarrier::Detached { commitment: cm, len: 128 };
+        assert_eq!(detached.commitment(), cm, "same identity in both carriages");
+        let store = MapFetch([(cm, bytes.clone())].into_iter().collect());
+        assert_eq!(detached.resolve(&store).unwrap(), bytes);
+    }
+
+    #[test]
+    fn detached_proofs_fail_closed() {
+        let bytes = vec![0xAA; 128];
+        let cm = proof_commitment(&bytes);
+        let carrier = ProofCarrier::Detached { commitment: cm, len: 128 };
+
+        // Absent → unverifiable, never valid.
+        assert_eq!(
+            carrier.resolve(&NoDetachedProofs),
+            Err(ProofUnavailable::NotFound { commitment: cm })
+        );
+
+        // A substituted proof of the right length is caught by re-hashing.
+        let mut forged = bytes.clone();
+        forged[0] ^= 1;
+        let bad_store = MapFetch([(cm, forged.clone())].into_iter().collect());
+        assert_eq!(
+            carrier.resolve(&bad_store),
+            Err(ProofUnavailable::CommitmentMismatch {
+                expected: cm,
+                got: proof_commitment(&forged)
+            })
+        );
+
+        // Wrong length is rejected before hashing.
+        let short = ProofCarrier::Detached { commitment: cm, len: 64 };
+        let store = MapFetch([(cm, bytes)].into_iter().collect());
+        assert_eq!(
+            short.resolve(&store),
+            Err(ProofUnavailable::LengthMismatch { expected: 64, got: 128 })
+        );
+    }
+
+    // ── the pool-value ratchet ──────────────────────────────────────────────
+
+    /// The defense outside the proof system: even a "verified" unshield can
+    /// never withdraw more than the pool has ever received.
+    #[test]
+    fn ratchet_caps_withdrawals_at_lifetime_deposits() {
+        let mut pool = PoolValue::ZERO;
+        pool.apply_shield(1000).unwrap();
+        pool.apply_spend(100).unwrap(); // a shielded spend's fee leaves too
+        assert_eq!(pool.sat(), 900);
+
+        // The counterfeit scenario: a soundness break produced a proof for
+        // 900 out + 1 fee. The proof verified; the ratchet still says no.
+        assert_eq!(
+            pool.apply_unshield(900, 1),
+            Err(PoolValueError::WouldMint { pool: 900, requested: 901 })
+        );
+        // And a rejected operation must not have moved the counter.
+        assert_eq!(pool.sat(), 900);
+
+        // The exact remaining backing can leave.
+        pool.apply_unshield(850, 50).unwrap();
+        assert_eq!(pool.sat(), 0);
+    }
+
+    #[test]
+    fn ratchet_undo_is_exact_inverse_and_detects_corruption() {
+        let mut pool = PoolValue::from_sat(500);
+        let snapshot = pool;
+
+        pool.apply_shield(300).unwrap();
+        pool.apply_unshield(100, 10).unwrap();
+        pool.apply_spend(5).unwrap();
+        // Disconnect in reverse order, as a reorg would.
+        pool.undo_spend(5).unwrap();
+        pool.undo_unshield(100, 10).unwrap();
+        pool.undo_shield(300).unwrap();
+        assert_eq!(pool, snapshot, "reorg undo must restore the exact backing");
+
+        // Undoing a shield that was never applied is state corruption, and it
+        // reports as the mint alarm rather than wrapping.
+        let mut broken = PoolValue::ZERO;
+        assert_eq!(broken.undo_shield(1), Err(PoolValueError::WouldMint { pool: 0, requested: 1 }));
+    }
+
+    // ── end-to-end: shield feeds the tree, unshield drains it ───────────────
+
+    /// The full bridge round-trip at the statement level: transparent value
+    /// enters via check_shield, the minted notes are real tree citizens that
+    /// check_unshield can spend back out, and the ratchet books every leg.
+    #[test]
+    fn bridge_round_trip_conserves_value() {
+        let mut pool = PoolValue::ZERO;
+        let mut tree = CommitmentTree::new();
+
+        // Shield 1000 into two notes.
+        let a = note(700, 1);
+        let b = note(300, 2);
+        let shield_pub = ShieldPublic {
+            value_shielded: 1000,
+            out_commitments: vec![a.commitment(), b.commitment()],
+        };
+        assert_eq!(
+            check_shield(&shield_pub, &ShieldWitness { outputs: vec![a.clone(), b.clone()] }),
+            Ok(())
+        );
+        let pa = tree.append(a.commitment());
+        let pb = tree.append(b.commitment());
+        pool.apply_shield(1000).unwrap();
+
+        // Unshield note `a` (700): 500 out, 150 change, 50 fee.
+        let anchor = tree.root();
+        let nk = [3u8; 32];
+        let change = note(150, 4);
+        let public = UnshieldPublic {
+            anchor,
+            nullifiers: vec![a.nullifier(&nk, pa)],
+            change_commitments: vec![change.commitment()],
+            value_unshielded: 500,
+            fee: 50,
+            transparent_digest: transparent_outputs_digest(&[TransparentOutput {
+                value_sat: 500,
+                script_hash: [0x51; 32],
+            }]),
+        };
+        let w = UnshieldWitness {
+            inputs: vec![SpendInput { note: a, position: pa, path: tree.path(pa).unwrap(), nk }],
+            change_outputs: vec![change],
+        };
+        assert_eq!(check_unshield(&public, &w), Ok(()));
+        pool.apply_unshield(500, 50).unwrap();
+
+        // The books close: 1000 in − 550 out = 450 backing, which is exactly
+        // note b (300, untouched at pb) + the 150 change note.
+        assert_eq!(pool.sat(), 450);
+        let _ = pb;
     }
 }
