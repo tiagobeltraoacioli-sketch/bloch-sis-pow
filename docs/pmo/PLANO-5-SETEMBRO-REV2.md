@@ -86,6 +86,21 @@ validated point, not by `git log`.**
 returns: that tree carries the colliding numbering and has no tag assertion of
 any kind. *Depends: nothing. Start now.*
 
+**This one merge resolves five separate problems**, which is why it is the
+highest-leverage engineering item in the plan. Verified: the branch also carries
+`020771ad` (*"test(prova): restaura o filtro pre-fix pela chave de ensaio"*),
+**the fix for the five `prova::tests` failures currently red on `main`.** So
+merging 1.2 lands, in one go: the transport routability fix, the C-1/C-2
+collision resolution, the pairwise guard tests that make the frame-byte
+namespace defensible at all, the peers gauge that is the missing detection
+surface for the silent fork, **and** the repair of the failing test suite.
+
+Note what that last one means for the incident dispute: the five failures are
+**base failures, not integration failures** — static reference rot, where the
+mutation hooks stopped reaching production code after the committee-partition
+rewrite. They are not a live consensus regression. See the correctness-debt
+page; the dispute still needs a consensus owner, but it is not a merge blocker.
+
 **1.3 — Merge `agent-bootnode-onboarding`** — `deploy/bootnodes/bootnodes.txt`
 (two devnet archival observers, both verified at epoch 1638 on the identical
 finalized root today), `verify-bootnodes.sh`, and the 406-line
