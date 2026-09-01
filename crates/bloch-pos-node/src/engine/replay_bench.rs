@@ -663,6 +663,11 @@ fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
         ws_anchor_hard: false,
         ws_conflict_reported: false,
         fc_covered_removals: 0,
+        sig_retention: super::SigRetention::ToFinalized,
+        sig_trimmed_through: 0,
+        sig_hits: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        sig_misses: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        sig_absent: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         fc_index: Default::default(),
         manifest,
     }

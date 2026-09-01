@@ -127,6 +127,9 @@ pub struct Config {
     /// libp2p transport: zero the IP-colocation score penalty.
     pub behind_proxy: bool,
     pub stop_at_slot: Option<u64>,
+    /// How much of the chain keeps its proposer signatures in RAM.
+    /// [`SigRetention::ToFinalized`] unless an operator says otherwise.
+    pub sig_retention: SigRetention,
     pub ws: crate::ws_boot::WsConfig,
     /// The Genesis-3 balance snapshot, when the manifest commits to one. It is
     /// a separate file rather than a manifest field because it is tens of
@@ -183,6 +186,106 @@ const MAX_TXS_PER_BLOCK: usize = 256;
 /// window safe rather than merely cheap: the window is an optimisation with a
 /// correct slow path underneath it, never a limit on what can be reorganised.
 const REORG_STATE_WINDOW: usize = 2;
+
+/// How much of the chain keeps its proposer signature resident in
+/// `Engine::blocks`.
+///
+/// # The measurement this exists for
+///
+/// A retained `BlockEnvelope` costs 14,633 B per block at the live block
+/// shape, measured by allocator over 20,000 blocks. The same envelope with
+/// `proposer_sig` emptied costs 2,041 B. **86.1% of the map is signature
+/// material**, and the map is roughly 61% of total node growth — so this one
+/// field is over half of everything the process accumulates.
+///
+/// # Who was asked, and what they said
+///
+/// Every reader of a *stored* signature was enumerated before any of this was
+/// written, and only three non-test reads exist in the node:
+///
+/// | Reader | Needs the retained bytes? |
+/// |---|---|
+/// | RPC | **No** — `proposer_sig` does not occur anywhere in `rpc.rs` |
+/// | Serving a syncing peer | **No** — `net.rs`/`p2p.rs` call `Store::blocks_after`, already streaming off disk |
+/// | Fork choice | **No** — each attestation is projected to a 48-byte `(validator, slot, root)` triple |
+/// | Slashing | **No** — evidence transactions carry their own `ProposalEnvelope` copies |
+/// | `replay_to` / `state_at_canonical` | Yes, but **in chain order from genesis**, which is what `blocks.log` is |
+/// | `do_reorg`, own-block broadcast | **Genuinely** — and only the recent suffix and the tip |
+///
+/// # Why the window is a speed knob and not a safety one
+///
+/// This is the load-bearing property, and it is structural rather than
+/// argued. A signature is only ever *used* by handing it to
+/// `Transition::apply_block`, which verifies it (transition.rs step 7). So:
+///
+/// * a signature found in RAM, and the same signature re-read from the log,
+///   are the same bytes and take the same path;
+/// * a signature that cannot be found at all yields a **refusal**, never an
+///   acceptance.
+///
+/// There is no third outcome. A window that is too small therefore makes the
+/// node slower — a seek and a decode per read, and in the pathological case a
+/// re-sync of a block it threw away — and cannot make it wrong. That is what
+/// contains the finality-rewind risk this chain has actually shown (a node
+/// observed dropping from head slot 26457 to 8432): a reorg deeper than the
+/// window is a slow reorg, not a divergent one.
+///
+/// It is also why **no verification receipt was built**. A cached "this
+/// signature verified once" flag would be node-local derived state standing
+/// in for a consensus check — the `expected_bits` defect this project has
+/// already paid for. The log holds the real bytes; nothing needs a summary of
+/// them, and boot re-verification stays exactly as it was, because it is the
+/// only thing that would notice a `blocks.log` edited offline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SigRetention {
+    /// Keep every signature from the finalized checkpoint to the tip; drop
+    /// what is below it. **The default, and the only setting whose slow path
+    /// is never taken by a reorg**: a trimmed block is finalized, so it cannot
+    /// leave the canonical chain, and it is in `blocks.log`, so the miss path
+    /// always finds it.
+    ///
+    /// The window this yields is not a guess. The unfinalized suffix on this
+    /// chain is 85 blocks and the deepest reorg ever observed is 13 — 6.5×
+    /// margin — and the margin is free, because finality, not a constant,
+    /// sets it.
+    ToFinalized,
+    /// Keep signatures for blocks within `n` slots of the head, and nothing
+    /// else. **A test and diagnosis knob, not an operating mode.**
+    ///
+    /// With `n` smaller than the unfinalized suffix this trims blocks that can
+    /// still be reorganised away, and such a block's bytes then exist nowhere
+    /// locally once the log is rewritten. What happens then is the honest
+    /// worst case and it is worth stating precisely: the block is refused for
+    /// a bad signature, dropped, its descendants lose their lineage,
+    /// `needs_sync` is raised, and the node re-fetches it from a peer with its
+    /// signature attached. Slower — much slower — and still never wrong.
+    ///
+    /// `Slots(0)` keeps only the head.
+    Slots(u64),
+    /// Keep nothing: drop each signature as the block is stored, so that
+    /// **every** later read goes to the log. **Replay-only** — see
+    /// `trim_on_insert` for why a live node must not run this — and it exists
+    /// for one purpose, which is to make the miss path testable at full scale.
+    /// A window that has never been missed is untested; under this setting a
+    /// mainnet replay misses on every block and must still land on the same
+    /// state root.
+    None,
+}
+
+impl SigRetention {
+    /// Parse the `--sig-retention` operator flag. `finalized` (the default)
+    /// or a slot count.
+    pub fn parse(s: &str) -> Option<SigRetention> {
+        match s {
+            "finalized" => Some(SigRetention::ToFinalized),
+            // Retain everything: today's behaviour, kept nameable so a
+            // measurement has a baseline arm that is not "a different binary".
+            "all" => Some(SigRetention::Slots(u64::MAX)),
+            "none" => Some(SigRetention::None),
+            other => other.parse::<u64>().ok().map(SigRetention::Slots),
+        }
+    }
+}
 
 /// Decode a block body's transactions.
 ///
@@ -540,6 +643,12 @@ struct Engine {
     keys: Option<Keystore>,
     /// Every structurally-valid block seen, canonical or not, by id.
     /// Unpruned — fine for a devnet, listed as a limitation.
+    ///
+    /// **Not every envelope in here still carries its `proposer_sig`.** Below
+    /// the retention window (see [`SigRetention`] and `sig_floor`) the bytes
+    /// are dropped and re-read from `blocks.log` on demand; `proposal_for`
+    /// is the accessor that hides the difference, and no other code should
+    /// read `proposer_sig` off a value taken from this map.
     blocks: BTreeMap<[u8; 32], BlockEnvelope>,
     /// Canonical chain, ascending slot, genesis first.
     chain: Vec<(u64, BlockId)>,
@@ -606,6 +715,20 @@ struct Engine {
     /// that kind of pool shrinkage apart from the epoch `retain`, which fork
     /// choice very much can see. See the argument there.
     fc_covered_removals: u64,
+    /// How much of the chain keeps its proposer signatures resident.
+    sig_retention: SigRetention,
+    /// Highest canonical slot whose signature has already been dropped, so
+    /// the trim is a cursor walk and not a scan of the whole map. Derived
+    /// state with no consensus content: setting it to 0 costs a second walk
+    /// and changes nothing else.
+    sig_trimmed_through: u64,
+    /// Signatures served from RAM, from the log, and asked for and not found.
+    /// Instrumentation only — nothing reads them to decide anything. They
+    /// exist because a retention window that has never been missed is
+    /// untested, and these are how a run proves it was.
+    sig_hits: Arc<AtomicU64>,
+    sig_misses: Arc<AtomicU64>,
+    sig_absent: Arc<AtomicU64>,
     /// `blocks` in the shape fork choice reads it. A pure projection, kept in
     /// step rather than rebuilt — see [`ForkChoiceIndex`].
     fc_index: ForkChoiceIndex,
@@ -1297,11 +1420,20 @@ impl Engine {
             }
             return;
         }
-        let env = self
+        let mut env = self
             .blocks
             .get(id.as_bytes())
             .expect("just ingested")
             .clone();
+        // Broadcasting our own block is one of only two readers that
+        // genuinely need retained signature bytes, and it needs exactly the
+        // tip's — which every operating retention setting keeps. This goes
+        // through the accessor anyway so that the one setting that does not
+        // (`SigRetention::None`, replay-only) cannot make a proposer emit an
+        // unsigned block: it would re-read it from the log instead.
+        if env.proposer_sig.is_empty() {
+            env.proposer_sig = self.proposer_sig_for(&env);
+        }
         self.net.broadcast(net::block_frame(&env));
     }
 
@@ -1341,6 +1473,7 @@ impl Engine {
         }
         self.fc_index.insert(id, &env);
         self.blocks.insert(id, env);
+        self.trim_on_insert(&id);
         self.advance();
         // The block is queryable now, so attestations parked on it can be
         // re-run. `advance()` first: an attestation released here votes on
@@ -1589,10 +1722,7 @@ impl Engine {
     /// Apply one block that extends the current head. True on success.
     fn apply_canonical(&mut self, env: &BlockEnvelope) -> bool {
         let id = env.block_id();
-        let envelope = ProposalEnvelope {
-            header: env.header.clone(),
-            proposer_sig: env.proposer_sig.clone(),
-        };
+        let envelope = self.proposal_for(env);
         let before = self.state.finality();
         let txs = match body_transactions(env) {
             Ok(t) => t,
@@ -1638,7 +1768,11 @@ impl Engine {
                 }
                 let cur_e = epoch_of(self.state.slot());
                 self.pool.retain(|_, a| epoch_of(a.data.slot) >= cur_e);
-
+                // The append below is what puts this block's frame in the log,
+                // and the trim is ordered AFTER it on purpose: a block whose
+                // signature has been dropped must already have somewhere to be
+                // read back from. During replay the frame is there by
+                // construction (it is what is being replayed).
                 if self.live {
                     if let Err(e) = self.store.append(env) {
                         eprintln!("FATAL: block log append failed: {e}");
@@ -1686,6 +1820,7 @@ impl Engine {
                         self.enforce_ws_anchor();
                     }
                 }
+                self.trim_signatures();
                 true
             }
             Err(err) => {
@@ -1699,6 +1834,151 @@ impl Engine {
                 false
             }
         }
+    }
+
+    // ── Signature retention ────────────────────────────────────────────────
+
+    /// Lowest slot whose proposer signature is kept resident. Everything
+    /// strictly below this may be dropped from `blocks` and re-read from the
+    /// log on demand.
+    ///
+    /// Under [`SigRetention::ToFinalized`] it is the first slot of the
+    /// FINALIZED epoch — the checkpoint — and that choice is what makes the
+    /// slow path unreachable in normal operation rather than merely rare: a
+    /// block below it is finalized, so it cannot leave the canonical chain,
+    /// so it is in `blocks.log`, so the miss path always finds it.
+    fn sig_floor(&self) -> u64 {
+        match self.sig_retention {
+            SigRetention::ToFinalized => {
+                self.state.finality().finalized.epoch * bloch_pos_committee::params::SLOTS_PER_EPOCH
+            }
+            SigRetention::Slots(n) => self.head_slot_now().saturating_sub(n),
+            // Handled at insert, not by the cursor: see `trim_on_insert`.
+            SigRetention::None => 0,
+        }
+    }
+
+    /// Drop the proposer signatures the window has moved past.
+    ///
+    /// A cursor walk, not a scan: `sig_trimmed_through` only moves forward and
+    /// each canonical block is visited once, so this is amortized O(1) per
+    /// applied block and free (one comparison) on the blocks where finality
+    /// did not move. The cursor is derived state with no consensus content —
+    /// resetting it to 0 costs one extra walk and changes nothing else, which
+    /// is exactly what makes it safe to clamp after a reorg.
+    ///
+    /// `proposer_sig = Vec::new()` and not `.clear()`: `clear` keeps the 4.6 KB
+    /// allocation, which is the entire thing being reclaimed.
+    fn trim_signatures(&mut self) {
+        if matches!(self.sig_retention, SigRetention::None) {
+            return;
+        }
+        let floor = self.sig_floor();
+        if floor <= self.sig_trimmed_through {
+            return;
+        }
+        let Engine { chain, blocks, sig_trimmed_through, .. } = self;
+        // `chain` is ascending by slot, so the range is two binary searches.
+        let from = chain.partition_point(|(slot, _)| *slot < *sig_trimmed_through);
+        let to = chain.partition_point(|(slot, _)| *slot < floor);
+        for (_, id) in &chain[from..to] {
+            if let Some(env) = blocks.get_mut(id.as_bytes()) {
+                if !env.proposer_sig.is_empty() {
+                    env.proposer_sig = Vec::new();
+                }
+            }
+        }
+        *sig_trimmed_through = floor;
+    }
+
+    /// The [`SigRetention::None`] trim: drop the signature as the block is
+    /// stored, so that every later read of it is a miss.
+    ///
+    /// Replay-only, and the reason is worth being blunt about. A block that
+    /// has just arrived from the network is **not in `blocks.log` yet** — it
+    /// is appended by `apply_canonical`, after the transition has accepted it
+    /// — so throwing its signature away here leaves it nowhere. Replaying an
+    /// existing log is the one situation where every ingested block is already
+    /// logged, and it is the situation this setting exists to instrument: it
+    /// turns a full mainnet replay into a full-scale exercise of the disk
+    /// path, 30,578 signatures read back frame by frame, with the final state
+    /// root as the verdict.
+    fn trim_on_insert(&mut self, id: &[u8; 32]) {
+        if !matches!(self.sig_retention, SigRetention::None) {
+            return;
+        }
+        if let Some(env) = self.blocks.get_mut(id) {
+            env.proposer_sig = Vec::new();
+        }
+    }
+
+    /// The proposer signature for a stored block: from RAM if the window still
+    /// holds it, otherwise from `blocks.log`.
+    ///
+    /// An empty `proposer_sig` in `blocks` is the only marker, and it needs no
+    /// bookkeeping to be correct in either direction. A block whose signature
+    /// was trimmed reads it back here. A block that arrived with a genuinely
+    /// empty signature — which a peer may send — is looked up, is not in the
+    /// log (it was never applied), comes back empty, and is refused by
+    /// `apply_block` exactly as it was before. The lookup is
+    /// identity-checked, so the log can only ever return *this* block's
+    /// signature or nothing.
+    ///
+    /// Returns the bytes rather than a borrow because the two branches have
+    /// different lifetimes and the RAM branch's clone is what the three call
+    /// sites did already.
+    fn proposer_sig_for(&self, env: &BlockEnvelope) -> Vec<u8> {
+        if !env.proposer_sig.is_empty() {
+            self.sig_hits.fetch_add(1, Ordering::Relaxed);
+            return env.proposer_sig.clone();
+        }
+        self.sig_misses.fetch_add(1, Ordering::Relaxed);
+        let id = *env.block_id().as_bytes();
+        match crate::store::proposer_sig_at(
+            self.store.dir(),
+            &self.store.index(),
+            env.header.slot,
+            &id,
+        ) {
+            Ok(Some(sig)) => sig,
+            Ok(None) => {
+                self.sig_absent.fetch_add(1, Ordering::Relaxed);
+                Vec::new()
+            }
+            Err(e) => {
+                // Not fatal, and deliberately so: the worst this can cause is
+                // a refusal, and a refusal is recoverable (the node re-syncs
+                // the block). Exiting here would turn a transient IO fault
+                // into a dead validator.
+                self.sig_absent.fetch_add(1, Ordering::Relaxed);
+                eprintln!(
+                    "store: could not re-read the signature of {} at slot {}: {e}",
+                    crate::codec::hex8(&id),
+                    env.header.slot
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    /// The `ProposalEnvelope` the transition wants, with the signature
+    /// resolved through [`Engine::proposer_sig_for`]. The single place the
+    /// three consensus readers go through.
+    fn proposal_for(&self, env: &BlockEnvelope) -> ProposalEnvelope {
+        ProposalEnvelope {
+            header: env.header.clone(),
+            proposer_sig: self.proposer_sig_for(env),
+        }
+    }
+
+    /// `(hits, misses, absent)` — how the signature reads of this run were
+    /// served. Instrumentation only; nothing reads it to decide anything.
+    pub fn sig_counters(&self) -> (u64, u64, u64) {
+        (
+            self.sig_hits.load(Ordering::Relaxed),
+            self.sig_misses.load(Ordering::Relaxed),
+            self.sig_absent.load(Ordering::Relaxed),
+        )
     }
 
     /// Keep a canonical block's post-state for the reorg path. Oldest out
@@ -1755,10 +2035,14 @@ impl Engine {
                 .blocks
                 .get(cid.as_bytes())
                 .expect("canonical block stored");
-            let envelope = ProposalEnvelope {
-                header: env.header.clone(),
-                proposer_sig: env.proposer_sig.clone(),
-            };
+            // The signature comes through `proposal_for`, which is where the
+            // retention window is felt: below the checkpoint these bytes are
+            // not in RAM and are re-read from the frame this very block was
+            // logged in. `replay_to` walks the canonical prefix in chain
+            // order, which is the order `blocks.log` is written in, so the
+            // miss path here is a seek into a file the walk is already
+            // marching along.
+            let envelope = self.proposal_for(env);
             let txs = body_transactions(env)
                 .expect("a canonical block's body decoded when it was applied");
             st = self
@@ -1796,10 +2080,7 @@ impl Engine {
         // that just won without recomputing anything.
         let mut applied: Vec<([u8; 32], Arc<CommittedState>)> = Vec::with_capacity(branch.len());
         for env in &branch {
-            let envelope = ProposalEnvelope {
-                header: env.header.clone(),
-                proposer_sig: env.proposer_sig.clone(),
-            };
+            let envelope = self.proposal_for(env);
             let txs = match body_transactions(env) {
                 Ok(t) => t,
                 Err(e) => {
@@ -1852,6 +2133,12 @@ impl Engine {
         self.head_slot
             .store(self.head_slot_now(), Ordering::Relaxed);
         self.last_applied_ms = now_ms();
+        // The chain was just truncated and re-extended, so the trim cursor may
+        // now point above the head. Clamping it down re-walks a range that is
+        // already trimmed, which is idempotent, and keeps the invariant
+        // ("everything below the cursor has been visited") true of the chain
+        // that actually exists rather than of the one that just lost.
+        self.sig_trimmed_through = self.sig_trimmed_through.min(self.head_slot_now());
         let cur_e = epoch_of(self.state.slot());
         self.pool.retain(|_, a| epoch_of(a.data.slot) >= cur_e);
         if self.live {
@@ -1896,6 +2183,7 @@ impl Engine {
             // A reorg can move the finalized root at the anchor's epoch.
             self.enforce_ws_anchor();
         }
+        self.trim_signatures();
         true
     }
 
@@ -2521,6 +2809,11 @@ pub fn run(cfg: Config) -> io::Result<()> {
         ws_anchor_hard: false,
         ws_conflict_reported: false,
         fc_covered_removals: 0,
+        sig_retention: cfg.sig_retention,
+        sig_trimmed_through: 0,
+        sig_hits: Arc::new(AtomicU64::new(0)),
+        sig_misses: Arc::new(AtomicU64::new(0)),
+        sig_absent: Arc::new(AtomicU64::new(0)),
         fc_index: ForkChoiceIndex::default(),
         manifest,
     };
@@ -2578,6 +2871,17 @@ pub fn run(cfg: Config) -> io::Result<()> {
             crate::codec::hex8(&engine.state.state_root()),
             engine.state.finality().justified.epoch,
             engine.state.finality().finalized.epoch,
+        );
+        // How the signature reads of this replay were served. Printed rather
+        // than hidden behind a feature flag because it is the only evidence
+        // that the retention window's slow path was exercised at all — a
+        // window that has never been missed is untested, and `misses` is where
+        // that shows.
+        let (hits, misses, absent) = engine.sig_counters();
+        println!(
+            "signatures: {hits} from RAM, {misses} re-read from the log, {absent} not found \
+             (retention {:?}, trimmed through slot {})",
+            engine.sig_retention, engine.sig_trimmed_through,
         );
     }
     engine
@@ -2732,6 +3036,10 @@ pub fn run(cfg: Config) -> io::Result<()> {
                     crate::codec::hex8(&fin.justified.root),
                     fin.finalized.epoch,
                     crate::codec::hex8(&fin.finalized.root),
+                );
+                let (hits, misses, absent) = engine.sig_counters();
+                println!(
+                    "STOP signatures: {hits} from RAM, {misses} from the log, {absent} not found"
                 );
                 return Ok(());
             }
@@ -4268,6 +4576,11 @@ mod transfer_v2_end_to_end {
             ws_anchor_hard: false,
             ws_conflict_reported: false,
             fc_covered_removals: 0,
+            sig_retention: SigRetention::ToFinalized,
+            sig_trimmed_through: 0,
+            sig_hits: Arc::new(AtomicU64::new(0)),
+            sig_misses: Arc::new(AtomicU64::new(0)),
+            sig_absent: Arc::new(AtomicU64::new(0)),
             fc_index: ForkChoiceIndex::default(),
         }
     }
@@ -4567,6 +4880,11 @@ mod perf_support {
             // offset the very first comparison against a pool that really is
             // empty.
             fc_covered_removals: 0,
+            sig_retention: SigRetention::ToFinalized,
+            sig_trimmed_through: 0,
+            sig_hits: Arc::new(AtomicU64::new(0)),
+            sig_misses: Arc::new(AtomicU64::new(0)),
+            sig_absent: Arc::new(AtomicU64::new(0)),
             fc_index: ForkChoiceIndex::default(),
         };
         (engine, TestDir(dir))
@@ -6236,6 +6554,11 @@ mod duty_view_anchor {
             ws_anchor_hard: false,
             ws_conflict_reported: false,
             fc_covered_removals: 0,
+            sig_retention: SigRetention::ToFinalized,
+            sig_trimmed_through: 0,
+            sig_hits: Arc::new(AtomicU64::new(0)),
+            sig_misses: Arc::new(AtomicU64::new(0)),
+            sig_absent: Arc::new(AtomicU64::new(0)),
             fc_index: ForkChoiceIndex::default(),
         };
         (engine, dir)
