@@ -1880,22 +1880,52 @@ impl Engine {
         let cur_e = epoch_of(self.state.slot());
         self.pool.retain(|_, a| epoch_of(a.data.slot) >= cur_e);
         if self.live {
-            // Borrowed, not collected — see `Store::rewrite`. Building this as
-            // a `Vec<BlockEnvelope>` cloned the whole canonical chain (~440
-            // MiB at the live height, ~2.9 GiB at 200k blocks) to write bytes
-            // the map already holds, so a reorg transiently needed TWICE the
-            // node's largest allocation. The frames written are identical.
+            // ── The log is edited at the fork point, not rebuilt ──
             //
-            // The fields are destructured so the borrow checker can see that
-            // the mutable borrow (`store`) and the shared ones (`chain`,
-            // `blocks`) are disjoint.
+            // This wrote the ENTIRE canonical chain back to disk on every
+            // reorg, at any depth. A reorg cannot change a block below the
+            // fork point, so all of it below `cut` was re-encoded and
+            // re-written byte-identical to what was already there — work
+            // sized by the chain rather than by the reorg, on the thread that
+            // also runs consensus.
+            //
+            // The measured cost of both paths, the reorg rate it has to be
+            // weighed against, and the command that reproduces either, are in
+            // `docs/perf/REORG-WRITE-PATH.md`. No figure for this belongs in a
+            // comment that is not from a run of `reorg_write_cost_on_a_real_log`.
+            //
+            // `chain` was truncated to `cut + 1` and the branch pushed onto
+            // it above, so the log's first `cut` frames are `chain[1..=cut]`
+            // and the branch is everything after. `replace_tail` verifies
+            // that first claim against the bytes on disk before it cuts —
+            // see its docs; a reorg to genesis passes `None` because genesis
+            // is synthesized and never logged.
+            //
+            // Fields are destructured so the borrow checker can see the
+            // mutable borrow (`store`) and the shared ones are disjoint.
             let Engine { store, chain, blocks, .. } = self;
-            let canonical_envs = chain[1..]
-                .iter()
-                .map(|(_, id)| blocks.get(id.as_bytes()).expect("stored"));
-            if let Err(e) = store.rewrite(canonical_envs) {
-                eprintln!("FATAL: block log rewrite failed: {e}");
-                std::process::exit(1);
+            let last_kept = if cut == 0 {
+                None
+            } else {
+                Some(blocks.get(chain[cut].1.as_bytes()).expect("stored"))
+            };
+            if let Err(e) = store.replace_tail(cut, last_kept, branch.iter()) {
+                // The precondition did not hold, or the splice failed. NOT
+                // fatal: `rewrite` builds the answer from the caller's own
+                // data and needs no precondition at all, so falling back to
+                // it costs the old 0.4 s and gets the old, atomic result.
+                // A node that lands here repeatedly has a frame table drifting
+                // from its chain, which is worth the loud line.
+                eprintln!(
+                    "reorg: tail splice refused ({e}); falling back to the full log rewrite"
+                );
+                let canonical_envs = chain[1..]
+                    .iter()
+                    .map(|(_, id)| blocks.get(id.as_bytes()).expect("stored"));
+                if let Err(e) = store.rewrite(canonical_envs) {
+                    eprintln!("FATAL: block log rewrite failed: {e}");
+                    std::process::exit(1);
+                }
             }
             // Free for the same reason as `apply_canonical`'s: every block
             // in `branch` passed `apply_block`, so the adopted head's header
