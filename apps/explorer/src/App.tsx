@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-import { useEffect, useState } from "react";
-import { useRouter, Link, matchRoute } from "./lib/router";
-import { rpcIsDegraded, activeRpcEndpoint } from "./lib/rpc";
+import { Fragment, useEffect, useState } from "react";
+import { useRouter, Link } from "./lib/router";
+import { Route, match } from "./routes";
 import { G4Search } from "./components/g4search";
 import { g4rpc, G4_RPC } from "./lib/g4";
 import { G4Dashboard } from "./pages/G4Dashboard";
@@ -22,28 +22,42 @@ const Logo = () => (
   </svg>
 );
 
-// Two chains, one explorer. Genesis-4 first because it is the live one; the
-// Genesis-3 entries stay because its history is the ledger Genesis-4 opened
-// with, and a reader who came looking for it must still find it.
-const NAV = [
-  { to: "/", label: "Chain" },
-  { to: "/balance", label: "Balance" },
-  { to: "/validators", label: "Validators" },
-  { to: "/snapshot", label: "Snapshot" },
+// The route table and the nav are one declaration.
+//
+// `nav: true` on a route puts it in the header. That is deliberate: a nav
+// entry pointing at a path with no route, or a route nobody can reach from
+// the header, are both bugs that used to be possible because NAV and the
+// if-chain were two independent lists that had to be kept in step by hand.
+//
+// See `src/routes.tsx` for why this is a table and how literals are protected
+// from being shadowed by patterns.
+const ROUTES: (Route & { nav?: string })[] = [
+  { pattern: "/", nav: "Chain", render: () => <G4Dashboard /> },
+  { pattern: "/balance", nav: "Balance", render: () => <BalancePage /> },
+  {
+    pattern: "/balance/:h",
+    render: (p) => <BalancePage initial={p.h} />,
+    key: (p) => "bal" + p.h,
+  },
+  { pattern: "/validators", nav: "Validators", render: () => <ValidatorsPage /> },
+  { pattern: "/snapshot", nav: "Snapshot", render: () => <SnapshotPage /> },
+  {
+    pattern: "/slot/:s",
+    render: (p) => <G4BlockPage slot={Number(p.s)} />,
+    guard: (p) => /^\d+$/.test(p.s),
+    key: (p) => "s" + p.s,
+  },
 ];
 
-function renderRoute(path: string) {
-  if (path === "/" || path === "") return <G4Dashboard />;
-  if (path === "/balance") return <BalancePage />;
-  {
-    const mb = matchRoute(path, "/balance/:h");
-    if (mb) return <BalancePage initial={mb.h} key={"bal" + mb.h} />;
-  }
-  if (path === "/validators") return <ValidatorsPage />;
-  if (path === "/snapshot") return <SnapshotPage />;
+const NAV = ROUTES.filter((r) => r.nav).map((r) => ({ to: r.pattern, label: r.nav! }));
 
-  const m = matchRoute(path, "/slot/:s");
-  if (m) return <G4BlockPage slot={Number(m.s)} key={"s" + m.s} />;
+function renderRoute(path: string) {
+  const hit = match(ROUTES, path);
+  if (hit) {
+    const el = hit.route.render(hit.params);
+    const k = hit.route.key ? hit.route.key(hit.params) : hit.route.pattern;
+    return <Fragment key={k}>{el}</Fragment>;
+  }
 
   // Genesis-3 routes are gone, not broken-on-purpose: this explorer is the
   // proof-of-stake chain now. The state proof of work ended in is published
@@ -144,9 +158,7 @@ export function App() {
           opened carrying every balance from Genesis-3, the proof-of-work era that ended at height
           39,918; that handover is published in full on the <Link to="/snapshot">snapshot</Link>.
           Not an official service; Bloch is ownerless/neutral. Integer satoshis are the source of
-          truth (1 BLOCH = 1e8 sat). Not an official service; Bloch is
-          ownerless/neutral. Integer satoshis are the source of truth (1 BLOCH = 1e8 sat); “bloch”
-          values are display-only. BLCH is neutral native gas, never a value or investment claim.
+          truth (1 BLOCH = 1e8 sat); “bloch” values are display-only. BLCH is neutral native gas, never a value or investment claim.
           <RpcStatus />
         </div>
       </footer>

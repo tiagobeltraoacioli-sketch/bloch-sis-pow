@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "description": "DAG-aware block explorer for the Bloch (GhostDAG-Q) chain \u2014 explorer.posternlabs.com",
+  "description": "Block explorer for Bloch Genesis-4, a post-quantum proof-of-stake chain \u2014 blochl1.com",
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
