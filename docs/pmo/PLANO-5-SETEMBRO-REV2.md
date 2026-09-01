@@ -51,6 +51,16 @@ reachable from outside a firewall wants" `--transport libp2p` — which today me
 zero peers and a private fork. It ships *in the binary*, so no doc edit reaches
 it. One paragraph. WS0 §2.1.
 
+**Measured, and it is why this is a Phase 0 item rather than a nicety
+(WS0 §7.4.1):** a node that follows that advice **justifies its own private chain
+at stall epoch 28 and finalizes it at epoch 29 — about 7 hours 44 minutes after
+starting.** From then on it finalizes every epoch, permanently, and reports
+`in sync`, `finalizing`, **64 active validators** and **full bonded stake** —
+because `validators.active` keeps zeroed records and `total_active_stake_sat` is
+read from the *unleaked* roster. `getchaininfo` has no peers field and there is
+no `getpeerinfo` method, so zero peers is not observable over RPC at all.
+**Every indicator an exchange monitors reads healthy, inside one working day.**
+
 **0.4 — Founder decisions, listed so they can be answered in one sitting:**
 ratify `Withdraw = 0x08` (registry C-4); fund ~0.001 BLCH for the mainnet spend
 rehearsal; decide disclosure on the staking-deposit defect; **name the owner of
