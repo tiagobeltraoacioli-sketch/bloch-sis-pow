@@ -1026,6 +1026,43 @@ decide se armar um portão faz alguma coisa:
   outpoints novos, fixados aqui antes de armar. Nenhum dos dois é mudança
   unilateral de código.
 
+### 11.1.1 O que cada portão IMPRIME antes de abrir — e por que não é uniforme
+
+Se você está diagnosticando uma divergência num dia de bandeira, **procure
+pelo PORTÃO, não pela string**. As recusas pré-ativação não usam um nome só,
+e isso é um fato do código hoje, não um plano:
+
+| caminho | constante | veredito pré-ativação |
+|---|---|---|
+| `DepositV2` (braço de wire, tag `0x07`) | `FUNDED_STAKING` | `TxReject::Transfer(FormatNotActive)` |
+| `apply_delegation` | `FUNDED_STAKING` | `TxReject::StakingNotActive` |
+| `ExitV2` (braço de wire, tag `0x09`) — **ainda não integrado** | `SIGNED_EXIT` | `TxReject::StakingNotActive` |
+| `apply_exit` | `SIGNED_EXIT` | `TxReject::StakingNotActive` |
+| `Withdraw` (braço de wire, tag `0x08`) | `WITHDRAWAL` | `TxReject::StakingRule` |
+
+Repare na primeira e na segunda linha: **é o MESMO portão, o mesmo
+`deposit_funding_active`, imprimindo dois eventos diferentes conforme a
+porta por onde a mensagem entrou.** O par do `SIGNED_EXIT` é o único
+internamente consistente.
+
+A linha do `ExitV2` descreve o portador que ainda **não** está nesta árvore
+(vem no merge do carregador); as outras quatro são o código de hoje. Esta
+tabela deve ficar um merge ATRÁS do código, nunca à frente — uma doc que
+promete um caminho que ainda não existe é o mesmo defeito de sempre, virado
+do avesso.
+
+Isso é **diagnóstico, não consenso**: qualquer `Err` invalida o bloco no
+mesmo índice (`TransitionError::Transaction(i)`), então nenhum veredito aqui
+muda o que a rede aceita. Está registrado em vez de corrigido de propósito —
+uniformizar quatro vereditos enquanto duas esteiras reencenam merges nestes
+mesmos arquivos é como nasce colisão (a de tag `0x07` nasceu assim). Quando a
+convergência fechar e a árvore estiver parada, o par `ExitV2`/`apply_exit` é
+o modelo a seguir.
+
+**Para quem for mexer:** não "conserte" um veredito isolado. Cada um destes
+está afirmado em teste de outra esteira; mudar um sozinho fica vermelho em
+lugar que você não está olhando.
+
 ### 11.2 A ordem — e por que duas dessas setas são erro de compilação
 
 ```
