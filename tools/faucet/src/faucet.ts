@@ -1,13 +1,17 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-// Core faucet flow: validate a testnet address, select UTXOs from the funding
-// wallet via getutxos, hand an unsigned job to the Signer, and broadcast the
-// signed raw tx via sendrawtransaction.
+// Core faucet flow: parse the recipient's 32-byte script_hash, select UTXOs
+// from the funding script_hash via getutxos, hand an unsigned job to the
+// Signer, and broadcast the signed raw tx via sendrawtransaction.
+//
+// Nothing in this file converts an address into a script_hash. Genesis-4 has
+// exactly one derivation — SHA3-256(hybrid pubkey) — and it lives with the key,
+// not here; see `address.ts`.
 //
 // TESTNET-ONLY. The coins dispensed are test BLCH with NO value on a
 // zero-security testnet.
 
 import type { FaucetConfig } from "./config.js";
-import { addressScriptHash, parseRecipient } from "./address.js";
+import { isRecipient, parseRecipient } from "./address.js";
 import { RpcClient, RpcError, parseSats, type Utxo } from "./rpc.js";
 import type { PaymentJob, Signer } from "./signer.js";
 
@@ -15,8 +19,8 @@ export interface DripSuccess {
   ok: true;
   txid: string;
   amountSats: number;
-  toAddress: string;
-  /** The 32-byte script_hash actually paid, as 64 hex. */
+  /** The 32-byte script_hash actually paid, as 64 hex. The only payee identity
+   *  Genesis-4 has; there is deliberately no `toAddress` field any more. */
   scriptHash: string;
   dryRun: boolean;
   signer: string;
@@ -60,37 +64,27 @@ export class Faucet {
   }
 
   async drip(to: string): Promise<DripResult> {
-    // 1) Resolve the recipient. Two accepted forms — a 64-hex script_hash (what
-    //    `bloch-pos spendkey` prints, and the ONLY form a native Genesis-4 key
-    //    has) or a `bloch1t…` carryover address, which is zero-extended to 32
-    //    bytes the way the chain does it.
-    const rcpt = parseRecipient(to);
-    if (!rcpt) {
-      return {
-        ok: false,
-        error:
-          "expected a 64-hex script_hash (from `bloch-pos spendkey`) or a bloch1t… address",
-        code: "bad_address",
-      };
+    // 1) Resolve the recipient. ONE accepted form: the 64-hex script_hash that
+    //    `bloch-pos spendkey` prints. An address is refused with an
+    //    explanation rather than converted — converting it would fund a
+    //    different UTXO-set key and the requester would see a zero balance.
+    const parsed = parseRecipient(to);
+    if (!isRecipient(parsed)) {
+      return { ok: false, error: parsed.message, code: parsed.code };
     }
-    // An address must be testnet-prefixed. A bare script_hash has no network
-    // marker and cannot be checked — see `parseRecipient` for why that is safe
-    // in the receiving direction.
-    if (rcpt.kind === "address" && !rcpt.address!.startsWith("bloch1t")) {
-      return {
-        ok: false,
-        error: "faucet is testnet-only; a bloch1q… mainnet address is refused",
-        code: "not_testnet",
-      };
-    }
+    const rcpt = parsed;
 
     // There is deliberately no node-side address check: the Genesis-4 RPC has
     // no `validateaddress` method. The local checksum in `address.ts` mirrors
     // the node's own rule, and the node remains the final authority when it
     // rejects the broadcast.
 
-    if (!this.cfg.dryRun && this.cfg.fundingAddress === "") {
-      return { ok: false, error: "FAUCET_FUNDING_ADDRESS is not configured", code: "misconfigured" };
+    if (!this.cfg.dryRun && this.cfg.fundingScriptHash === "") {
+      return {
+        ok: false,
+        error: "FAUCET_FUNDING_SCRIPT_HASH is not configured",
+        code: "misconfigured",
+      };
     }
 
     // Config amounts are operator-set env ints; parseSats still range-checks
@@ -98,10 +92,10 @@ export class Faucet {
     const target = parseSats(this.cfg.amountSats, "FAUCET_AMOUNT_SATS") +
       parseSats(this.cfg.feeSats, "FAUCET_FEE_SATS");
 
-    // 3) Fetch funding UTXOs — by script_hash, which is what the node takes.
-    const fundingSh = this.cfg.fundingAddress
-      ? addressScriptHash(this.cfg.fundingAddress) ?? this.cfg.fundingAddress
-      : rcpt.scriptHashHex;
+    // 3) Fetch funding UTXOs — by script_hash, which is the only thing the
+    //    node takes. No conversion, no fallback: the configured value already
+    //    IS the 32-byte key, validated at load time.
+    const fundingSh = this.cfg.fundingScriptHash || rcpt.scriptHashHex;
     let funding;
     try {
       funding = await this.rpc.getUtxos(fundingSh);
@@ -120,21 +114,17 @@ export class Faucet {
     }
 
     // 4) Build the unsigned job and hand it to the signer.
-    const changeAddr = this.cfg.changeAddress || this.cfg.fundingAddress;
     const job: PaymentJob = {
       network: "testnet",
-      toAddress: rcpt.address ?? rcpt.scriptHashHex,
-      // The script hashes are what a signer actually needs: `submit-tx` takes
-      // `--pay <script-hash-hex>:<sat>`, never an address.
+      // Three script hashes and nothing else. `submit-tx` takes
+      // `--pay <script-hash-hex>:<sat>` and `getutxos` takes a script_hash;
+      // no node interface anywhere accepts an address, so a signer given one
+      // could not build a transaction.
       toScriptHash: rcpt.scriptHashHex,
-      changeScriptHash: changeAddr
-        ? addressScriptHash(changeAddr) ?? changeAddr
-        : fundingSh,
+      changeScriptHash: this.cfg.changeScriptHash || fundingSh,
       fundingScriptHash: fundingSh,
       amountSats: this.cfg.amountSats,
       feeSats: this.cfg.feeSats,
-      changeAddress: changeAddr || this.cfg.fundingAddress || rcpt.scriptHashHex,
-      fundingAddress: this.cfg.fundingAddress || rcpt.scriptHashHex,
       selectedUtxos: pick.selected,
     };
 
@@ -153,7 +143,6 @@ export class Faucet {
         ok: true,
         txid,
         amountSats: this.cfg.amountSats,
-        toAddress: job.toAddress,
         scriptHash: rcpt.scriptHashHex,
         dryRun: true,
         signer: this.signer.kind,
@@ -166,7 +155,6 @@ export class Faucet {
         ok: true,
         txid,
         amountSats: this.cfg.amountSats,
-        toAddress: job.toAddress,
         scriptHash: rcpt.scriptHashHex,
         dryRun: false,
         signer: this.signer.kind,

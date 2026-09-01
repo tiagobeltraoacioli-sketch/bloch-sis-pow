@@ -87,16 +87,23 @@ export function createFaucetServer(cfg: FaucetConfig, faucet: Faucet, limiter: R
         try {
           const raw = await readBody(req);
           const parsed = raw ? (JSON.parse(raw) as { address?: string; scriptHash?: string }) : {};
-          // Either name works. `scriptHash` is the primary form — it is what
-          // `bloch-pos spendkey` prints and the only form a native Genesis-4
-          // key has — and `address` is kept for carryover-style addresses.
+          // `scriptHash` is THE field. `address` is still read so that a
+          // partner who sends one gets the specific refusal from
+          // `parseRecipient` explaining what to send instead, rather than a
+          // blank "missing scriptHash".
           address = (parsed.scriptHash ?? parsed.address ?? "").trim();
         } catch (e) {
           json(res, 400, { ok: false, error: `bad request body: ${e instanceof Error ? e.message : e}` });
           return;
         }
         if (!address) {
-          json(res, 400, { ok: false, error: "missing 'scriptHash' (or 'address')", code: "bad_request" });
+          json(res, 400, {
+            ok: false,
+            error:
+              "missing 'scriptHash': the 64-hex value `bloch-pos spendkey` prints. " +
+              "Genesis-4 does not pay to addresses.",
+            code: "bad_request",
+          });
           return;
         }
 

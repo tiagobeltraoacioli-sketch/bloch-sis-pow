@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-// Bloch address helpers (testnet-aware).
+// Bloch Genesis-4 recipient parsing for the testnet faucet.
 //
-// An address is: <prefix> + hex(20-byte pubkey hash) + hex(4-byte checksum),
-// where checksum = SHA3-256(SHA3-256(hash20))[..4]  (double SHA3-256, first 4
-// bytes). This mirrors the node's validateaddress logic in src/rpc/mod.rs.
+// Genesis-4 identifies a payee by a 32-byte `script_hash`, never by an address.
+// This file therefore parses addresses ONLY so it can refuse them with a useful
+// message; it contains no address-to-script_hash conversion. See the long
+// comment further down for why adding one back would be a bug, not a feature.
 //
+// An address, where one still appears (Genesis-3 material, operator typos), is:
+//   <prefix> + hex(20-byte pubkey hash) + hex(4-byte checksum)
+// with checksum = SHA3-256(SHA3-256(hash20))[..4].
 //   mainnet prefix: "bloch1q"   testnet prefix: "bloch1t"
-//
-// The on-chain `script_pubkey` is exactly the 20-byte hash (hex), so these
-// helpers convert between an address and a script_pubkey.
 
 import { createHash } from "node:crypto";
 
@@ -69,63 +70,92 @@ export function isTestnetAddress(addr: string): boolean {
   return p !== null && p.network === "testnet";
 }
 
-// ── script_hash: what the node actually speaks ──────────────────────────────
+// ── script_hash: THE one derivation, and why this file no longer has one ────
 //
-// The RPC surface does NOT take addresses. `getutxos`/`listunspent`,
-// `getbalance` and the `--pay` flag of `submit-tx` all take a 32-byte
-// `script_hash` as 64 hex characters (`rpc.rs`, `want_hex32(params, 0,
-// "script_hash")`). There is no `validateaddress` method at all. An earlier
-// version of this service passed bech32-style addresses to those calls, which
-// could never have worked against a real node.
+// A Genesis-4 output is locked by a 32-byte `script_hash`. There is exactly
+// ONE way to derive one for a key you control:
 //
-// Two things live in this namespace and they are NOT interchangeable:
+//     script_hash = SHA3-256(hybrid public key)        // full 32 bytes
 //
-//   * A **Genesis-3 carryover address** owns 20 bytes of hash, and the chain
-//     zero-extends it on the right to 32 (`genesis.rs`: `script_hash[0..20] =
-//     the snapshot's hash160`, `script_hash[20..32] = 0x00`). That is what
-//     `addressScriptHash` reproduces.
+// That is what `bloch-pos spendkey` prints, what a genesis allocation commits
+// to, and what every output a Genesis-4 transaction creates uses
+// (`transition.rs`, `owns`: "every output a Genesis-4 transaction creates uses
+// [the native form]"). It has NO address encoding — 32 bytes do not fit in the
+// 20-byte body of a `bloch1q…`/`bloch1t…` address.
 //
-//   * A **native Genesis-4 key** owns `SHA3-256(hybrid pubkey)` — a full 32
-//     bytes, printed by `bloch-pos spendkey`. It has NO address encoding,
-//     because 32 bytes do not fit in the 20-byte address body.
+// A SECOND 32-byte shape exists on mainnet and is NOT a second derivation:
+// the Genesis-3 carryover writes a snapshot's 20-byte hash160 into
+// `script_hash[0..20]` and zeroes the rest (`genesis.rs`). Those outputs were
+// minted by the carryover ingest, once, from a file. Nothing derives them from
+// a key, and nothing may: `SHA3-256(pubkey)[0..20] ‖ 0x00*12` has the carried
+// shape but is a DIFFERENT eUTXO-set key from `SHA3-256(pubkey)`, so coins paid
+// to one are invisible to `getbalance` on the other. Consensus tolerates the
+// truncated form (`owns` matches on the 20-byte prefix when the tail is zero),
+// which is why the mistake is silent rather than loud — and it costs the
+// recipient 160 bits of preimage resistance instead of 256.
 //
-// So a partner who follows the onboarding guide (`keygen` then `spendkey`) has
-// a script_hash that CANNOT be written as a `bloch1t…` address. A faucet that
-// only accepted addresses could not fund them. Accept both, and treat the
-// 64-hex script_hash as the primary form.
+// This faucet serves a testnet built with NO carryover. Therefore the carried
+// shape can never address a fundable output here, and this file deliberately
+// contains no address→script_hash conversion at all. An address is refused
+// with an explanation, not silently converted. The address parser below
+// survives only so that refusal can be specific.
 
-/** Zero-extend a 20-byte address hash to the 32-byte script_hash, G3-style. */
-export function addressScriptHash(addr: string): string | null {
-  const p = parseAddress(addr);
-  if (!p) return null;
-  return p.hashHex + "00".repeat(12);
-}
-
+/** A recipient the faucet will pay. Always the native 32-byte form. */
 export interface Recipient {
   scriptHashHex: string;
-  /** How the requester expressed it, for the response and the logs. */
-  kind: "script_hash" | "address";
-  /** Present only when they gave an address. */
-  address?: string;
+  /** Kept for symmetry with the logs; only one kind is accepted. */
+  kind: "script_hash";
 }
 
+/** Why an input was refused, in words a partner can act on. */
+export type RecipientError = { code: "bad_address" | "not_testnet"; message: string };
+
 /**
- * Accept either form. Returns null when neither parses.
+ * Accept the ONLY identifier this chain has: a 64-hex `script_hash`.
  *
- * A bare 64-hex script_hash carries NO network marker — it cannot, it is a
- * hash — so this function cannot tell a testnet script_hash from a mainnet
- * one, and does not pretend to. That is safe here for the reason set out in
- * `deploy/testnet/REPLAY-ISOLATION.md`: paying coins TO a hash is harmless
- * whichever chain the requester also uses it on, because the outpoint this
- * creates exists only on this chain. The direction that matters is what the
- * faucet spends FROM, and that is checked at startup (`index.ts` preflight).
+ * A bare script_hash carries no network marker — it cannot, it is a hash — so
+ * this function cannot tell a testnet script_hash from a mainnet one and does
+ * not pretend to. That is safe in the RECEIVING direction, for the reason set
+ * out in `deploy/testnet/REPLAY-ISOLATION.md`: paying coins TO a hash creates
+ * an outpoint that exists only on this chain. The direction that matters is
+ * what the faucet spends FROM, and that is bound to a specific genesis block
+ * at startup (`index.ts` preflight), which is a far stronger check than any
+ * address prefix ever was.
  */
-export function parseRecipient(input: string): Recipient | null {
+export function parseRecipient(input: string): Recipient | RecipientError {
   const s = input.trim();
   if (/^[0-9a-fA-F]{64}$/.test(s)) {
     return { scriptHashHex: s.toLowerCase(), kind: "script_hash" };
   }
-  const sh = addressScriptHash(s);
-  if (sh) return { scriptHashHex: sh, kind: "address", address: s };
-  return null;
+  const addr = parseAddress(s);
+  if (addr) {
+    if (addr.network === "mainnet") {
+      return {
+        code: "not_testnet",
+        message:
+          "that is a bloch1q… MAINNET address, and this faucet is testnet-only. " +
+          "Genesis-4 does not identify recipients by address at all: run " +
+          "`bloch-pos keygen` then `bloch-pos spendkey` and send the 64-hex script_hash it prints.",
+      };
+    }
+    return {
+      code: "bad_address",
+      message:
+        "Genesis-4 does not pay to addresses. An address carries 20 bytes; a native " +
+        "Genesis-4 key is locked by SHA3-256(pubkey), all 32 of them, and the two are " +
+        "different keys in the UTXO set — funding the address form would leave you " +
+        "looking at a zero balance. Run `bloch-pos keygen` then `bloch-pos spendkey` " +
+        "and send the 64-hex script_hash it prints.",
+    };
+  }
+  return {
+    code: "bad_address",
+    message:
+      "expected a 64-hex script_hash, as printed by `bloch-pos spendkey`.",
+  };
+}
+
+/** Narrowing helper so callers do not have to duck-type the union. */
+export function isRecipient(r: Recipient | RecipientError): r is Recipient {
+  return (r as Recipient).scriptHashHex !== undefined;
 }

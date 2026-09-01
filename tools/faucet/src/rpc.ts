@@ -173,6 +173,25 @@ export class RpcClient {
   async getChainInfo(): Promise<Record<string, unknown>> {
     return (await this.transport.call("getchaininfo", [])) as Record<string, unknown>;
   }
+
+  /**
+   * `getblockbyslot(0).block_id` — the genesis block's id, which IS this
+   * network's identity. Used by the startup preflight to bind the faucet to
+   * one chain.
+   *
+   * Deliberately built from methods that already exist. `getchaininfo` carries
+   * no genesis digest and no network id, and inventing an RPC name to carry one
+   * is not this tool's decision to make (wire names are claimed from the PMO).
+   * The genesis block id is already public, already stable, and already unique
+   * per network, so nothing new is needed.
+   */
+  async getGenesisBlockId(): Promise<string> {
+    const b = (await this.transport.call("getblockbyslot", [0])) as { block_id?: string };
+    if (typeof b?.block_id !== "string" || !/^[0-9a-f]{64}$/i.test(b.block_id)) {
+      throw new RpcError("getblockbyslot(0) returned no usable block_id", "getblockbyslot");
+    }
+    return b.block_id.toLowerCase();
+  }
 }
 
 // ── Offline stub transport (dry-run) ──────────────────────────────────────────
@@ -215,6 +234,11 @@ export class StubTransport implements JsonRpcTransport {
         const tag = (raw.length ^ this.broadcastCount).toString(16).padStart(2, "0");
         return { txid: tag.repeat(32).slice(0, 64) };
       }
+      case "getblockbyslot":
+        // A stub chain has a stub genesis. The preflight refuses to accept it
+        // as proof of anything: the genesis binding is only enforced in LIVE
+        // mode, where this transport is not used.
+        return { block_id: "00".repeat(32), slot: Number(params[0] ?? 0), height: 0, stub: true };
       case "gettxout":
         return { txid: String(params[0] ?? ""), vout: Number(params[1] ?? 0), finalized: false };
       default:

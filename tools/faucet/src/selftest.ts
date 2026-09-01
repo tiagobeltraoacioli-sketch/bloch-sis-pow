@@ -24,25 +24,34 @@ function assert(cond: boolean, msg: string): void {
 }
 
 async function run(): Promise<void> {
-  // A valid, checksummed testnet address generated locally.
-  const hash = randomBytes(20);
-  const testAddr = encodeAddress(hash, "testnet");
+  // A valid, checksummed testnet address generated locally — used ONLY to prove
+  // it is refused. Genesis-4 has no address-shaped recipient.
+  const testAddr = encodeAddress(randomBytes(20), "testnet");
   assert(parseAddress(testAddr)?.network === "testnet", "generated address round-trips as testnet");
 
-  const cfg = { ...loadConfig(), dryRun: true, fundingAddress: encodeAddress(randomBytes(20), "testnet") };
-  const rpc = new RpcClient(new StubTransport(cfg.fundingAddress));
+  const fundingSh = randomBytes(32).toString("hex");
+  const cfg = {
+    ...loadConfig(),
+    dryRun: true,
+    fundingScriptHash: fundingSh,
+    changeScriptHash: fundingSh,
+  };
+  const rpc = new RpcClient(new StubTransport(cfg.fundingScriptHash));
   const faucet = new Faucet(cfg, rpc, new StubSigner());
   const limiter = new RateLimiter(cfg.perAddressWindowMs, cfg.perIpWindowMs, cfg.perIpMax);
 
-  // Happy path (dry-run).
-  const d1 = await faucet.drip(testAddr);
-  assert(d1.ok === true, "drip to valid testnet address succeeds in dry-run");
+  // Happy path (dry-run): the ONE accepted recipient form, which is what
+  // `bloch-pos spendkey` prints and the only form a native Genesis-4 key has.
+  const recipSh = randomBytes(32).toString("hex");
+  const d1 = await faucet.drip(recipSh);
+  assert(d1.ok === true, "drip to a 64-hex script_hash succeeds in dry-run");
   if (d1.ok) {
     assert(d1.dryRun === true, "result is flagged dry-run");
     assert(/^[0-9a-f]{64}$/.test(d1.txid), "returns a 64-hex txid");
+    assert(d1.scriptHash === recipSh, "the script_hash paid is the one asked for, unmodified");
   }
 
-  // Reject a mainnet address.
+  // Reject a mainnet address, with the mainnet-specific message.
   const mainAddr = encodeAddress(randomBytes(20), "mainnet");
   const d2 = await faucet.drip(mainAddr);
   assert(d2.ok === false && d2.code === "not_testnet", "mainnet address rejected as not_testnet");
@@ -51,21 +60,30 @@ async function run(): Promise<void> {
   const d3 = await faucet.drip("bloch1tZZZ");
   assert(d3.ok === false && d3.code === "bad_address", "malformed address rejected");
 
-  // A bare 64-hex script_hash is the primary recipient form: it is what
-  // `bloch-pos spendkey` prints, and a native Genesis-4 key has no address.
+  // A bloch1t address is REFUSED, not converted. This assertion is the whole
+  // point of the change: zero-extending an address hash to 32 bytes produces a
+  // different eUTXO-set key from SHA3-256(pubkey), so a partner funded that way
+  // reads a zero balance and reports the testnet as broken. The old test
+  // asserted the conversion; it pinned the bug.
   {
-    const sh = randomBytes(32).toString("hex");
-    const d = await faucet.drip(sh);
-    assert(d.ok === true && d.scriptHash === sh, "drip accepts a bare 64-hex script_hash");
-  }
-
-  // A bloch1t address is zero-extended to 32 bytes the way the chain does it.
-  {
-    const p2 = parseAddress(testAddr)!;
     const d = await faucet.drip(testAddr);
     assert(
-      d.ok === true && d.scriptHash === p2.hashHex + "00".repeat(12),
-      "an address is zero-extended to its script_hash",
+      d.ok === false && d.code === "bad_address",
+      "a bloch1t… address is refused, never converted to a script_hash",
+    );
+    assert(
+      d.ok === false && /zero balance/.test(d.error),
+      "the refusal explains the zero-balance failure it prevents",
+    );
+  }
+
+  // And nothing anywhere may reintroduce the conversion: the module exports no
+  // address-to-script_hash function at all.
+  {
+    const mod = (await import("./address.js")) as Record<string, unknown>;
+    assert(
+      mod.addressScriptHash === undefined,
+      "address.ts exports no addressScriptHash — one derivation, and it is not here",
     );
   }
 
