@@ -352,22 +352,37 @@ impl From<Verdict> for MessageAcceptance {
 // `codec::encode_envelope` output, so a synced block and a gossiped block are
 // the same object, not two encodings that can disagree.
 
-/// A directed sync request. One variant today; the tag byte is there so a
-/// second one does not need a new protocol id.
+/// A directed sync request. The tag byte is there so a second variant does
+/// not need a new protocol id — and `GetTime` is that second variant.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SyncRequest {
     /// Every block with `slot > after_slot`, capped at `limit`.
     GetBlocks { after_slot: u64, limit: u32 },
+    /// The peer's clock, for the boot-time clock-vs-peer-time gate.
+    ///
+    /// **Wire addition** (2026-08-31) on `/bloch-g4/sync/1`, no protocol
+    /// bump: a pre-addition responder fails to decode the tag and errors the
+    /// substream — one `OutboundFailure` line on the requester, no sample, no
+    /// other effect, so old and new builds interoperate and no flag day is
+    /// needed. Rolling the fleet forward is what arms the check.
+    GetTime,
 }
 
-/// The answer to a [`SyncRequest`]: encoded block envelopes, in chain order.
+/// The answer to a [`SyncRequest`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SyncResponse {
+    /// Encoded block envelopes, in chain order.
     Blocks { envelopes: Vec<Vec<u8>> },
+    /// The responder's unix time in milliseconds. Time, not slot:
+    /// milliseconds are manifest-independent, and the requester judges skew
+    /// on its own slot geometry.
+    Time { now_ms: u64 },
 }
 
 const SYNC_TAG_GET_BLOCKS: u8 = 0x01;
 const SYNC_TAG_BLOCKS: u8 = 0x01;
+const SYNC_TAG_GET_TIME: u8 = 0x02;
+const SYNC_TAG_TIME: u8 = 0x02;
 
 pub fn encode_sync_request(req: &SyncRequest) -> Vec<u8> {
     match req {
@@ -378,6 +393,7 @@ pub fn encode_sync_request(req: &SyncRequest) -> Vec<u8> {
             out.extend_from_slice(&limit.to_le_bytes());
             out
         }
+        SyncRequest::GetTime => vec![SYNC_TAG_GET_TIME],
     }
 }
 
@@ -389,6 +405,10 @@ pub fn decode_sync_request(buf: &[u8]) -> Result<SyncRequest, crate::codec::Deco
             let limit = r.u32()?;
             r.finish()?;
             Ok(SyncRequest::GetBlocks { after_slot, limit })
+        }
+        SYNC_TAG_GET_TIME => {
+            r.finish()?;
+            Ok(SyncRequest::GetTime)
         }
         _ => Err(crate::codec::DecodeErr("unknown sync request tag")),
     }
@@ -403,6 +423,12 @@ pub fn encode_sync_response(resp: &SyncResponse) -> Vec<u8> {
             for e in envelopes {
                 crate::codec::put_bytes(&mut out, e);
             }
+            out
+        }
+        SyncResponse::Time { now_ms } => {
+            let mut out = Vec::with_capacity(9);
+            out.push(SYNC_TAG_TIME);
+            out.extend_from_slice(&now_ms.to_le_bytes());
             out
         }
     }
@@ -422,6 +448,11 @@ pub fn decode_sync_response(buf: &[u8]) -> Result<SyncResponse, crate::codec::De
             }
             r.finish()?;
             Ok(SyncResponse::Blocks { envelopes })
+        }
+        SYNC_TAG_TIME => {
+            let now_ms = r.u64()?;
+            r.finish()?;
+            Ok(SyncResponse::Time { now_ms })
         }
         _ => Err(crate::codec::DecodeErr("unknown sync response tag")),
     }
@@ -708,6 +739,8 @@ pub fn start(
     cfg: Config,
     events: EngineSender<NetEvent>,
     head_slot: Arc<AtomicU64>,
+    clock: Arc<crate::time_check::PeerClock>,
+    peers_gauge: Arc<std::sync::atomic::AtomicUsize>,
 ) -> io::Result<Handle> {
     std::fs::create_dir_all(&cfg.data_dir)?;
     let keypair = load_or_create_identity(&cfg.data_dir.join("p2p_identity.bin"))?;
@@ -728,7 +761,7 @@ pub fn start(
             match build_swarm(&keypair, &cfg) {
                 Ok(swarm) => {
                     let _ = ready_tx.send(Ok(()));
-                    run_swarm(swarm, cfg, cmd_rx, events, head_slot).await;
+                    run_swarm(swarm, cfg, cmd_rx, events, head_slot, clock, peers_gauge).await;
                 }
                 Err(e) => {
                     let _ = ready_tx.send(Err(e));
@@ -823,6 +856,10 @@ struct Loop {
     pages_since_progress: u32,
     /// The applied head at the last page, so progress can be detected.
     head_at_last_page: u64,
+    /// Peer clock samples for the boot-time clock-vs-peer-time gate. Written
+    /// here (only for peers THIS node dialed — see `ConnectionEstablished`),
+    /// read once by `engine::run` before the weak-subjectivity decision.
+    clock: Arc<crate::time_check::PeerClock>,
     /// Address → the peer id reachable there, learned from a successful dial
     /// and from identify's advertised listen addresses. Lets an address-only
     /// `--p2p-peer` be recognised as already connected on the redial tick.
@@ -834,6 +871,14 @@ struct Loop {
     /// dials fail with EADDRINUSE against the connection that already exists,
     /// which reads in the log exactly like a peer that cannot be reached.
     dialed: HashMap<Multiaddr, PeerId>,
+    /// Live gauge of DISTINCT connected peers, mirrored from
+    /// `swarm.connected_peers().count()` on every connection edge. This is
+    /// the number an operator's monitoring scrapes (`bloch_pos_peers_connected`)
+    /// — the engine thread cannot ask the swarm directly, and "57 peers
+    /// connected" was precisely the number that made the 2026-08 stalled node
+    /// look healthy, so it must sit NEXT to the health verdict, not replace
+    /// it. Observability only; nothing in consensus reads it.
+    peers_gauge: Arc<std::sync::atomic::AtomicUsize>,
     topics: Topics,
 }
 
@@ -876,16 +921,20 @@ async fn run_swarm(
     mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<Command>,
     events: EngineSender<NetEvent>,
     head_slot: Arc<AtomicU64>,
+    clock: Arc<crate::time_check::PeerClock>,
+    peers_gauge: Arc<std::sync::atomic::AtomicUsize>,
 ) {
     let mut st = Loop {
         events,
         data_dir: cfg.data_dir.clone(),
         head_slot,
+        clock,
         peer_head: HashMap::new(),
         recent_blocks: HashMap::new(),
         pages_since_progress: 0,
         head_at_last_page: 0,
         dialed: HashMap::new(),
+        peers_gauge,
         topics: Topics {
             blocks: IdentTopic::new(TOPIC_BLOCKS),
             attestations: IdentTopic::new(TOPIC_ATTESTATIONS),
@@ -1069,8 +1118,17 @@ fn handle_swarm_event(
         }
         SwarmEvent::ConnectionEstablished { peer_id, ref endpoint, num_established, .. } => {
             println!("p2p: connected {peer_id}");
+            st.peers_gauge
+                .store(swarm.connected_peers().count(), Ordering::Relaxed);
             if let libp2p::core::ConnectedPoint::Dialer { address, .. } = endpoint {
                 st.dialed.insert(address.clone(), peer_id);
+                // Ask the peer for its clock — the boot gate may be waiting
+                // on the sample. ONLY on connections this node dialed: an
+                // inbound peer chose us, sybils are free, and a clock median
+                // open to volunteers is a median an attacker can pack. An old
+                // binary fails to decode the request and the substream errors
+                // (one OutboundFailure line); the gate treats it as absent.
+                swarm.behaviour_mut().sync.send_request(&peer_id, SyncRequest::GetTime);
             }
             // DO NOT call `gossipsub.add_explicit_peer()` here — see this
             // module's header. An explicit peer is excluded from mesh
@@ -1105,6 +1163,8 @@ fn handle_swarm_event(
             }
         }
         SwarmEvent::ConnectionClosed { peer_id, num_established, cause, .. } => {
+            st.peers_gauge
+                .store(swarm.connected_peers().count(), Ordering::Relaxed);
             if num_established == 0 {
                 st.peer_head.remove(&peer_id);
                 // The cause is the whole diagnostic value of this line. A bare
@@ -1158,7 +1218,16 @@ fn handle_swarm_event(
                 serve_sync(st, resp_tx.clone(), request, channel);
             }
             request_response::Message::Response { response, .. } => {
-                let SyncResponse::Blocks { envelopes } = response;
+                let envelopes = match response {
+                    SyncResponse::Time { now_ms } => {
+                        // Keyed by PeerId: the identity behind the Noise
+                        // handshake, so however many connections a peer holds
+                        // it gets one clock vote.
+                        st.clock.record(&peer.to_string(), now_ms, crate::time_check::now_ms());
+                        return true;
+                    }
+                    SyncResponse::Blocks { envelopes } => envelopes,
+                };
                 let was_full = envelopes.len() >= MAX_SYNC_BLOCKS;
                 let mut highest = 0u64;
                 for bytes in envelopes {
@@ -1295,7 +1364,14 @@ fn serve_sync(
     request: SyncRequest,
     channel: request_response::ResponseChannel<SyncResponse>,
 ) {
-    let SyncRequest::GetBlocks { after_slot, limit } = request;
+    let (after_slot, limit) = match request {
+        SyncRequest::GetTime => {
+            // Answered in place — reading the clock needs no blocking pool.
+            let _ = resp_tx.send((channel, SyncResponse::Time { now_ms: crate::time_check::now_ms() }));
+            return;
+        }
+        SyncRequest::GetBlocks { after_slot, limit } => (after_slot, limit),
+    };
     let dir = st.data_dir.clone();
     let limit = (limit as usize).min(MAX_SYNC_BLOCKS);
     tokio::task::spawn_blocking(move || {
@@ -1421,6 +1497,33 @@ mod tests {
         assert_eq!(decode_sync_response(&encode_sync_response(&resp)).unwrap(), resp);
     }
 
+    /// The clock-probe variants added 2026-08-31 round-trip like the rest —
+    /// and a pre-addition decoder's behavior on them is pinned: unknown tag,
+    /// clean error, which is what makes the wire addition backward-safe
+    /// (the requester just never gets a sample from an old peer).
+    #[test]
+    fn time_probe_frames_round_trip_and_are_backward_safe() {
+        let req = SyncRequest::GetTime;
+        assert_eq!(decode_sync_request(&encode_sync_request(&req)).unwrap(), req);
+        let resp = SyncResponse::Time { now_ms: 1_790_000_000_123 };
+        assert_eq!(decode_sync_response(&encode_sync_response(&resp)).unwrap(), resp);
+
+        // Trailing bytes refused, like every other frame.
+        let mut b = encode_sync_request(&SyncRequest::GetTime);
+        b.push(0);
+        assert!(decode_sync_request(&b).is_err());
+        let mut b = encode_sync_response(&SyncResponse::Time { now_ms: 7 });
+        b.push(0);
+        assert!(decode_sync_response(&b).is_err());
+
+        // What an OLD binary sees: tag 0x02 did not exist before the
+        // addition, so the old decoder's `_ =>` arm errors the substream —
+        // pinned here by asserting the new tags are exactly the first
+        // formerly-unknown values, not a reuse of the block tags.
+        assert_ne!(SYNC_TAG_GET_TIME, SYNC_TAG_GET_BLOCKS);
+        assert_ne!(SYNC_TAG_TIME, SYNC_TAG_BLOCKS);
+    }
+
     #[test]
     fn sync_frames_reject_trailing_bytes() {
         let mut b = encode_sync_request(&SyncRequest::GetBlocks { after_slot: 1, limit: 1 });
@@ -1533,6 +1636,8 @@ mod tests {
             },
             tx,
             head.clone(),
+            Arc::new(crate::time_check::PeerClock::new()),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         )
         .expect("p2p starts");
         Node { handle, rx, head, addr, _dir: dir }

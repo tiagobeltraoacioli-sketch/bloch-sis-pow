@@ -146,6 +146,12 @@ pub const SLOT_EMPTY: i64 = -32007;
 /// correct response is opposite: never resubmit these bytes.
 pub const TX_REFUSED: i64 = -32008;
 
+/// `getvalidatorstatus` on a node that holds no validator key. An observer
+/// has no duties, so "is my validator working" has no referent — this code
+/// says so instead of inventing an empty status a dashboard would render as
+/// a broken validator.
+pub const NO_VALIDATOR_KEY: i64 = -32009;
+
 /// A JSON-RPC error object: a code a client can branch on and a message a human
 /// can act on. Both halves are required — a bare code makes an operator read
 /// this source file, and a bare message makes a client parse English.
@@ -309,6 +315,16 @@ impl Json {
         match self {
             Json::Num(raw) => raw.parse().ok(),
             Json::Str(s) => s.parse().ok(),
+            _ => None,
+        }
+    }
+
+    /// Reads a boolean. Production code reads it too now — the GET /health
+    /// endpoint branches its status code on `health.stalled` — so the old
+    /// `#[cfg(test)]` gate is gone.
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Json::Bool(b) => Some(*b),
             _ => None,
         }
     }
@@ -726,6 +742,19 @@ pub enum RpcRequest {
     /// is what makes it testable without standing up a node.
     SendRawTransaction(PosTransaction),
     MempoolInfo,
+    /// `getvalidatorstatus` — the status of THE validator key this node
+    /// holds: registry state, duty-roster membership, next duty slots,
+    /// whether recent attestations landed on chain, the signing-guard
+    /// watermarks and the doppelganger watch. The first question a
+    /// third-party operator asks — "is my validator working" — answered
+    /// without SSH and without reading source. Node-local observability:
+    /// nothing in consensus reads any of it.
+    ValidatorStatus,
+    /// `getmetrics` / `GET /metrics` — the same numbers as a Prometheus
+    /// text exposition ([`MetricsSnapshot`]). One snapshot, taken on the
+    /// engine thread, so every series in one scrape describes the same
+    /// instant.
+    Metrics,
 }
 
 /// Whatever can answer an [`RpcRequest`]. In production this is the channel to
@@ -917,6 +946,11 @@ pub fn route(method: &str, params: Option<&Json>) -> Result<RpcRequest, RpcError
             RpcRequest::SendRawTransaction(tx)
         }
         "getmempoolinfo" => RpcRequest::MempoolInfo,
+        "getvalidatorstatus" => RpcRequest::ValidatorStatus,
+        // The JSON-RPC spelling of the scrape surface, for clients behind a
+        // POST-only proxy (the public g4rpc forwards JSON-RPC bodies, not
+        // arbitrary GETs). The result is the exposition text as one string.
+        "getmetrics" => RpcRequest::Metrics,
         other => return Err(RpcError::method_not_found(other)),
     })
 }
@@ -1041,7 +1075,7 @@ fn serve_connection(sock: &mut TcpStream, backend: &dyn RpcBackend) {
     let _ = sock.set_read_timeout(Some(IO_TIMEOUT));
     let _ = sock.set_write_timeout(Some(IO_TIMEOUT));
     match read_request(sock) {
-        Ok(body) => {
+        Ok(HttpRequest::Post(body)) => {
             // The body must be text before it can be JSON. Invalid UTF-8 is a
             // parse error with a JSON-RPC shape, not a dropped connection.
             let response = match std::str::from_utf8(&body) {
@@ -1050,8 +1084,56 @@ fn serve_connection(sock: &mut TcpStream, backend: &dyn RpcBackend) {
             };
             let _ = respond(sock, 200, &response);
         }
+        Ok(HttpRequest::Get(path)) => serve_get(sock, &path, backend),
         Err(HttpError { status, message }) => {
             let _ = respond(sock, status, &envelope(Json::Null, Err(RpcError::invalid_request(message))));
+        }
+    }
+}
+
+/// The two GET endpoints. Both are answered by the SAME engine thread that
+/// answers JSON-RPC — deliberately, twice over: the numbers describe one
+/// consistent instant, and the scrape doubles as a liveness probe of the
+/// consensus loop itself. If the loop is wedged hard enough that it cannot
+/// answer within [`ENGINE_TIMEOUT`], the scrape fails and the monitoring sees
+/// a down target — which is the truth. (The measured 2026-08 stall was NOT
+/// that shape: its loop kept running and will answer; the `stalled` flag it
+/// serves is what says the node is broken.)
+fn serve_get(sock: &mut TcpStream, path: &str, backend: &dyn RpcBackend) {
+    match path {
+        "/metrics" => match backend.call(RpcRequest::Metrics) {
+            Ok(Json::Str(text)) => {
+                let _ = respond_typed(sock, 200, PROM_CONTENT_TYPE, &text);
+            }
+            Ok(_) => {
+                let _ = respond_typed(sock, 500, "text/plain", "metrics backend returned a non-text value\n");
+            }
+            Err(e) => {
+                let _ = respond_typed(sock, 503, "text/plain", &format!("{}\n", e.message));
+            }
+        },
+        "/health" => match backend.call(RpcRequest::ChainInfo) {
+            Ok(info) => {
+                let health = info.get("health").cloned().unwrap_or(Json::Null);
+                let stalled = health.get("stalled").and_then(Json::as_bool).unwrap_or(false);
+                // 503 when stalled: a load balancer or an exchange's deposit
+                // gate takes the node out of rotation on status code alone,
+                // no JSON parsing required. The body carries the health
+                // object either way for the human who curls it.
+                let status = if stalled { 503 } else { 200 };
+                let _ = respond(sock, status, &health.to_string());
+            }
+            Err(e) => {
+                let _ = respond(sock, 503, &envelope(Json::Null, Err(e)));
+            }
+        },
+        _ => {
+            let _ = respond_typed(
+                sock,
+                404,
+                "text/plain",
+                "not found; GET serves /metrics and /health, everything else is JSON-RPC over POST\n",
+            );
         }
     }
 }
@@ -1065,8 +1147,21 @@ fn http_err(status: u16, message: &'static str) -> HttpError {
     HttpError { status, message }
 }
 
-/// Read one HTTP request and return its body.
-fn read_request(sock: &mut TcpStream) -> Result<Vec<u8>, HttpError> {
+/// One parsed HTTP request: a JSON-RPC POST body, or a GET path.
+///
+/// GET exists for the two operational endpoints only — `/metrics`
+/// (Prometheus text exposition) and `/health` (load-balancer / liveness
+/// probe). Everything else on this server is JSON-RPC over POST, and GETs to
+/// any other path are answered 404 rather than routed anywhere near the RPC
+/// dispatch: a scrape surface must not become a second, unaudited query
+/// surface by accident.
+enum HttpRequest {
+    Post(Vec<u8>),
+    Get(String),
+}
+
+/// Read one HTTP request: the body of a POST, or the path of a GET.
+fn read_request(sock: &mut TcpStream) -> Result<HttpRequest, HttpError> {
     let mut buf: Vec<u8> = Vec::with_capacity(1024);
     let mut chunk = [0u8; 4096];
 
@@ -1090,8 +1185,18 @@ fn read_request(sock: &mut TcpStream) -> Result<Vec<u8>, HttpError> {
     let request_line = lines.next().unwrap_or("");
     let mut parts = request_line.split(' ');
     let verb = parts.next().unwrap_or("");
+    if verb.eq_ignore_ascii_case("GET") {
+        // Strip any query string: a scraper that appends `?…` still means
+        // the same endpoint, and the endpoints here take no parameters.
+        let path = parts.next().unwrap_or("");
+        let path = path.split('?').next().unwrap_or("").to_string();
+        return Ok(HttpRequest::Get(path));
+    }
     if !verb.eq_ignore_ascii_case("POST") {
-        return Err(http_err(405, "this endpoint accepts POST only"));
+        return Err(http_err(
+            405,
+            "this endpoint accepts POST (JSON-RPC) and GET /metrics or /health",
+        ));
     }
 
     let mut content_length: Option<usize> = None;
@@ -1125,7 +1230,7 @@ fn read_request(sock: &mut TcpStream) -> Result<Vec<u8>, HttpError> {
             Err(_) => return Err(http_err(408, "timed out reading the request body")),
         }
     }
-    Ok(body)
+    Ok(HttpRequest::Post(body))
 }
 
 fn find_head_end(buf: &[u8]) -> Option<usize> {
@@ -1133,14 +1238,26 @@ fn find_head_end(buf: &[u8]) -> Option<usize> {
 }
 
 fn respond(sock: &mut TcpStream, status: u16, body: &str) -> io::Result<()> {
+    respond_typed(sock, status, "application/json", body)
+}
+
+/// The Prometheus text exposition content type, version pinned — the same
+/// string the pool proxy's exporter serves (`pool-proxy/src/metrics.rs`),
+/// because two exporters in one project answering with two content types is
+/// how a scraper config works against one of them by luck.
+const PROM_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
+
+fn respond_typed(sock: &mut TcpStream, status: u16, content_type: &str, body: &str) -> io::Result<()> {
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
+        404 => "Not Found",
         405 => "Method Not Allowed",
         408 => "Request Timeout",
         411 => "Length Required",
         413 => "Payload Too Large",
         431 => "Request Header Fields Too Large",
+        500 => "Internal Server Error",
         503 => "Service Unavailable",
         _ => "Error",
     };
@@ -1149,7 +1266,7 @@ fn respond(sock: &mut TcpStream, status: u16, body: &str) -> io::Result<()> {
     // left waiting on a socket that will never answer again.
     let head = format!(
         "HTTP/1.1 {status} {reason}\r\n\
-         Content-Type: application/json\r\n\
+         Content-Type: {content_type}\r\n\
          Content-Length: {}\r\n\
          Connection: close\r\n\r\n",
         body.len()
@@ -1165,6 +1282,425 @@ fn respond(sock: &mut TcpStream, status: u16, body: &str) -> io::Result<()> {
 // §5.5 gives and `engine::lmd_ghost_head` follows: a value a client will read
 // must be derivable from its inputs so it can be tested without standing up a
 // node. Every one of them is exercised below against a real `CommittedState`.
+
+/// Slots behind the wall clock beyond which a node counts as *behind* rather
+/// than merely between blocks.
+///
+/// The number is chosen against this chain's measured cadence, not against an
+/// ideal one. Genesis-4 fills roughly 13% of its slots (post-migration
+/// measurement), so a healthy, fully-synced node routinely sits many slots
+/// behind the wall clock simply because the slots in between are empty. At
+/// 13% cadence an empty stretch of 64 slots (two epochs, 32 minutes) occurs
+/// about once every three weeks; every shorter threshold fires weekly or
+/// daily. And when the *chain itself* goes quiet for two epochs, "this node
+/// is not making progress" is a true statement an operator wants to see —
+/// the false-positive case is itself alert-worthy.
+///
+/// Against the incident this exists for: the stalled nodes were ~480 slots
+/// behind (4 hours), and even the ones that recovered were 90–130 behind.
+/// Both are far past this line.
+pub const HEALTH_BEHIND_SLOTS: u64 = 64;
+
+/// Apply-silence, in slots' worth of wall time, beyond which *behind*
+/// hardens into *stalled*.
+///
+/// A node 480 slots behind that is actually syncing applies blocks
+/// continuously — its silence is measured in milliseconds. One that has
+/// applied nothing for eight slots (four minutes at the 30s cadence) while
+/// two epochs behind is not slow, it is stuck: that is exactly the shape of
+/// the post-replay stall this field exists to expose, which was previously
+/// diagnosable only by shelling in and watching a log not grow.
+pub const HEALTH_SILENCE_SLOTS: u64 = 8;
+
+/// The node's own liveness verdict: is it keeping up with the wall clock,
+/// and if not, is it at least making progress toward it?
+///
+/// # Why this exists
+///
+/// The post-replay sync stall (2026-08, production): a node finishes replay
+/// far behind the live head and then stops — peers connected, RPC answering,
+/// zero blocks applied, zero log lines. To a monitor reading `height` it
+/// looks like an ordinary laggard; to `behind_by_slots` alone it looks like
+/// a syncing node. The distinction that matters — *behind and advancing*
+/// versus *behind and dead* — needs both the lag and the time since the last
+/// applied block, judged together. This type is that judgement, made once,
+/// as a pure function, so the RPC field, the periodic log line and the tests
+/// all report the same verdict.
+///
+/// # What the verdict means
+///
+/// - `syncing`: behind the wall clock by at least [`HEALTH_BEHIND_SLOTS`]
+///   but a block was applied within the last [`HEALTH_SILENCE_SLOTS`] slots'
+///   worth of time — catching up, leave it alone.
+/// - `stalled`: behind by at least [`HEALTH_BEHIND_SLOTS`] AND no block
+///   applied for [`HEALTH_SILENCE_SLOTS`] slots' worth of time — **not
+///   making progress**. This is the boolean an integrator should alert on,
+///   and the one an exchange observer node should stop crediting deposits
+///   on. It self-clears the moment a block is applied or the lag closes.
+///
+/// The two raw inputs are carried alongside the verdict so a consumer with a
+/// different risk posture can apply its own thresholds.
+///
+/// # One honest limitation
+///
+/// A node cannot locally distinguish "I am deaf" from "the whole chain went
+/// quiet": if no canonical block exists for two epochs anywhere, every
+/// healthy node reports `stalled` too. That is accepted — a chain-wide
+/// two-epoch outage deserves the same alert — and it is why this verdict
+/// must never gate consensus behaviour by itself (see the proposal-lag gate
+/// in `engine.rs`, which is separate, opt-in, and flag-day material).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Health {
+    /// Wall-clock slot minus the head's slot.
+    pub behind_by_slots: u64,
+    /// Wall time since this node last applied a canonical block (or since
+    /// boot, if it has applied none).
+    pub ms_since_last_applied: u64,
+    /// Behind, and recently applied a block: catching up.
+    pub syncing: bool,
+    /// Behind, and NOT applying blocks: not making progress. Alert on this.
+    pub stalled: bool,
+}
+
+impl Health {
+    /// The verdict, as a pure function of its inputs — no clock, no node —
+    /// so `engine.rs` and the tests judge with the same code.
+    ///
+    /// `slot_ms` converts the silence threshold from slots to wall time;
+    /// `.max(1)` for the same reason `Engine::wall_slot` guards its divisor —
+    /// a hand-edited manifest must not turn a health check into an overflow.
+    pub fn assess(wall_slot: u64, head_slot: u64, ms_since_last_applied: u64, slot_ms: u64) -> Health {
+        let behind_by_slots = wall_slot.saturating_sub(head_slot);
+        let behind = behind_by_slots >= HEALTH_BEHIND_SLOTS;
+        let silent = ms_since_last_applied >= HEALTH_SILENCE_SLOTS.saturating_mul(slot_ms.max(1));
+        Health {
+            behind_by_slots,
+            ms_since_last_applied,
+            syncing: behind && !silent,
+            stalled: behind && silent,
+        }
+    }
+
+    /// The `getchaininfo` sub-object. `secs`, not `ms`, on the wire: the
+    /// consumers poll at seconds granularity and every other duration on
+    /// this surface is seconds.
+    pub fn json(&self) -> Json {
+        Json::obj(vec![
+            ("behind_by_slots", Json::u(self.behind_by_slots)),
+            ("secs_since_last_block", Json::u(self.ms_since_last_applied / 1000)),
+            ("syncing", Json::Bool(self.syncing)),
+            ("stalled", Json::Bool(self.stalled)),
+        ])
+    }
+}
+
+
+// ─── Operator observability: metrics and validator status ──────────────────
+//
+// Everything below is NODE-LOCAL REPORTING. No value here is read by any
+// consensus rule, none is gossiped, and two nodes reporting differently
+// cannot fork — the whole surface is a projection of state the node already
+// holds, assembled on the engine thread so one response describes one
+// instant. (The gates being REPORTED here — the signing guard, the
+// doppelganger watch, the proposal-lag gate — live in `engine.rs` and
+// `signing_history.rs`; none of them reads this module.)
+
+/// The doppelganger watch, as an operator sees it. The engine reduces its
+/// internal state to one of these; keeping the reduction a plain enum means
+/// the metric encoding and the JSON string cannot drift apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DoppelgangerView {
+    /// `--doppelganger-epochs 0`, or a boot at the chain's slot 0: nothing
+    /// is or will be watching for a twin this run.
+    Disabled,
+    /// Deliberately silent, listening for this key signing elsewhere, until
+    /// the given slot.
+    Watching { silent_until_slot: u64 },
+    /// The watch ran its window and saw no twin; duties are enabled.
+    Clear,
+    /// A twin WAS seen. Reported for completeness: in practice the run loop
+    /// exits the process on this state, so a scraper is far more likely to
+    /// observe the target going down plus the DOPPELGANGER line in the log.
+    Alarmed,
+}
+
+impl DoppelgangerView {
+    /// The metric encoding (`bloch_pos_doppelganger_state`). Documented on
+    /// the series' HELP line; keep the two in sync.
+    pub fn as_gauge(self) -> u64 {
+        match self {
+            DoppelgangerView::Disabled => 0,
+            DoppelgangerView::Watching { .. } => 1,
+            DoppelgangerView::Clear => 2,
+            DoppelgangerView::Alarmed => 3,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DoppelgangerView::Disabled => "disabled",
+            DoppelgangerView::Watching { .. } => "watching",
+            DoppelgangerView::Clear => "clear",
+            DoppelgangerView::Alarmed => "alarmed",
+        }
+    }
+}
+
+/// The validator-specific half of the observability surface: everything the
+/// node knows about the ONE key it holds. Built by the engine, rendered
+/// here, shared by `getvalidatorstatus` and the validator series of
+/// `/metrics` so the two can never disagree.
+#[derive(Clone, Debug)]
+pub struct ValidatorStatusView {
+    pub index: u32,
+    /// Registry facts, when the index is in the committed registry at all.
+    /// `None` is itself a finding: the node holds a key for an index the
+    /// chain does not know, which the status must say rather than hide.
+    pub registry: Option<ValidatorRegistryView>,
+    /// Member of the CURRENT epoch's duty roster (the set duties are drawn
+    /// from). False for a queued, exited or unknown validator.
+    pub in_duty_roster: bool,
+    /// Next slot at which this validator is in a committee and expected to
+    /// attest, scanned from the wall clock to `projection_end_slot`. `None`
+    /// means no duty inside that horizon — normal for proposals, surprising
+    /// for attestation (every roster member attests once per epoch).
+    pub next_attestation_slot: Option<u64>,
+    /// Next slot at which this validator is the proposer, same horizon.
+    pub next_proposal_slot: Option<u64>,
+    /// The horizon the two scans covered (exclusive): end of the NEXT epoch.
+    /// Further out the roster and seed can still change with reveals that
+    /// have not happened, so the node stops rather than guess.
+    pub projection_end_slot: u64,
+    /// Whether an attestation by this validator is included on the canonical
+    /// chain in the current / previous epoch. `None` when the participation
+    /// map does not track this index (not in that epoch's roster). THIS is
+    /// "did my duty actually land", as opposed to the signed-counters below,
+    /// which are "did my node try".
+    pub attested_in_current_epoch: Option<bool>,
+    pub attested_in_previous_epoch: Option<bool>,
+    /// Duties performed by THIS PROCESS since boot. Process-local by nature:
+    /// they reset on restart, and they count signatures released, not
+    /// inclusions. `attestations_signed` climbing while
+    /// `attested_in_current_epoch` stays false is itself a diagnosis — the
+    /// vote leaves this node and never lands (mesh problem), versus the vote
+    /// never being produced (duty problem).
+    pub attestations_signed: u64,
+    pub proposals_signed: u64,
+    /// Duties this process REFUSED via a protective gate — the signing
+    /// guard, the doppelganger silence, or the proposal-lag gate. A value
+    /// that keeps climbing is the cue to read the log lines those gates
+    /// print.
+    pub duties_refused: u64,
+    /// Slashing-protection watermarks, when the store is open. `None` in the
+    /// watermark fields means "nothing signed yet"; `guard_present: false`
+    /// means the store itself is missing — a keyed node in that state
+    /// performs no duties at all.
+    pub guard_present: bool,
+    pub guard_highest_proposed_slot: Option<u64>,
+    /// `(source_epoch, target_epoch)` of the highest attestation recorded.
+    pub guard_attestation_watermark: Option<(u64, u64)>,
+    pub doppelganger: DoppelgangerView,
+    /// Context the numbers above are judged against.
+    pub wall_slot: u64,
+    pub current_epoch: u64,
+}
+
+/// Registry facts for [`ValidatorStatusView`] — the same numbers
+/// `getvalidator` serves, reduced to what the operator of THIS key acts on.
+#[derive(Clone, Debug)]
+pub struct ValidatorRegistryView {
+    /// One of `validator_state`'s words: active / queued / exiting / exited
+    /// / slashed.
+    pub state: &'static str,
+    pub slashed: bool,
+    pub own_stake_sat: u128,
+    /// Effective stake in the active set; `None` when not in it.
+    pub effective_stake_sat: Option<u64>,
+    /// Inactivity leak accrued against this validator, in satoshis. Nonzero
+    /// means finality has been failing while this validator's votes were not
+    /// in the counted set; it is the "penalty pending" an operator can still
+    /// act on.
+    pub leaked_sat: u64,
+    pub activation_epoch: Option<u64>,
+    pub exit_epoch: Option<u64>,
+    pub withdrawable_epoch: Option<u64>,
+}
+
+impl ValidatorStatusView {
+    /// The `getvalidatorstatus` result object.
+    pub fn json(&self) -> Json {
+        let opt_u = |v: Option<u64>| v.map_or(Json::Null, Json::u);
+        let opt_b = |v: Option<bool>| v.map_or(Json::Null, Json::Bool);
+        let registry = match &self.registry {
+            None => Json::Null,
+            Some(r) => Json::obj(vec![
+                ("state", Json::s(r.state)),
+                ("slashed", Json::Bool(r.slashed)),
+                ("own_stake_sat", Json::sat(r.own_stake_sat)),
+                (
+                    "effective_stake_sat",
+                    r.effective_stake_sat
+                        .map_or(Json::Null, |v| Json::sat(u128::from(v))),
+                ),
+                ("leaked_sat", Json::sat(u128::from(r.leaked_sat))),
+                ("activation_epoch", opt_u(r.activation_epoch)),
+                ("exit_epoch", opt_u(r.exit_epoch)),
+                ("withdrawable_epoch", opt_u(r.withdrawable_epoch)),
+            ]),
+        };
+        let dopp = match self.doppelganger {
+            DoppelgangerView::Watching { silent_until_slot } => Json::obj(vec![
+                ("state", Json::s(self.doppelganger.as_str())),
+                ("silent_until_slot", Json::u(silent_until_slot)),
+            ]),
+            other => Json::obj(vec![("state", Json::s(other.as_str()))]),
+        };
+        Json::obj(vec![
+            ("validator_index", Json::u(u64::from(self.index))),
+            ("registry", registry),
+            ("in_duty_roster", Json::Bool(self.in_duty_roster)),
+            ("next_attestation_slot", opt_u(self.next_attestation_slot)),
+            ("next_proposal_slot", opt_u(self.next_proposal_slot)),
+            ("projection_end_slot", Json::u(self.projection_end_slot)),
+            ("attested_in_current_epoch", opt_b(self.attested_in_current_epoch)),
+            ("attested_in_previous_epoch", opt_b(self.attested_in_previous_epoch)),
+            ("attestations_signed_since_boot", Json::u(self.attestations_signed)),
+            ("proposals_signed_since_boot", Json::u(self.proposals_signed)),
+            ("duties_refused_since_boot", Json::u(self.duties_refused)),
+            ("signing_guard", Json::obj(vec![
+                ("present", Json::Bool(self.guard_present)),
+                ("highest_proposed_slot", opt_u(self.guard_highest_proposed_slot)),
+                (
+                    "attestation_source_epoch",
+                    opt_u(self.guard_attestation_watermark.map(|(s, _)| s)),
+                ),
+                (
+                    "attestation_target_epoch",
+                    opt_u(self.guard_attestation_watermark.map(|(_, t)| t)),
+                ),
+            ])),
+            ("doppelganger", dopp),
+            ("wall_slot", Json::u(self.wall_slot)),
+            ("current_epoch", Json::u(self.current_epoch)),
+        ])
+    }
+}
+
+/// One consistent reading of every number `/metrics` exposes, taken on the
+/// engine thread. The struct exists (rather than rendering inline in the
+/// engine) so the exposition format is a pure function a test can pin
+/// without standing up a node — the same rule every other projection in
+/// this module follows.
+#[derive(Clone, Debug)]
+pub struct MetricsSnapshot {
+    pub head_slot: u64,
+    pub head_height: u64,
+    pub wall_slot: u64,
+    pub health: Health,
+    pub finalized_height: Option<u64>,
+    pub justified_epoch: u64,
+    pub finalized_epoch: u64,
+    pub current_epoch: u64,
+    pub peers_connected: usize,
+    pub peers_configured: usize,
+    pub mempool_transactions: usize,
+    pub mempool_capacity: usize,
+    pub mempool_bytes: usize,
+    pub blocks_known: usize,
+    pub validators_total: usize,
+    pub validators_active: usize,
+    pub uptime_secs: u64,
+    /// The validator series, absent on an observer. Absence is the honest
+    /// encoding: an observer scraping 0 for "attested" would page someone
+    /// about a validator that does not exist.
+    pub validator: Option<ValidatorStatusView>,
+}
+
+impl MetricsSnapshot {
+    /// Prometheus text exposition, version 0.0.4 — the format and naming
+    /// conventions of the pool proxy's exporter, `bloch_pos_` prefix.
+    pub fn render(&self) -> String {
+        let mut out = String::with_capacity(4096);
+        fn series(out: &mut String, name: &str, kind: &str, help: &str, value: &str) {
+            out.push_str("# HELP ");
+            out.push_str(name);
+            out.push(' ');
+            out.push_str(help);
+            out.push_str("\n# TYPE ");
+            out.push_str(name);
+            out.push(' ');
+            out.push_str(kind);
+            out.push('\n');
+            out.push_str(name);
+            out.push(' ');
+            out.push_str(value);
+            out.push('\n');
+        }
+        fn gauge(out: &mut String, name: &str, help: &str, value: String) {
+            series(out, name, "gauge", help, &value);
+        }
+        let b = |v: bool| if v { "1" } else { "0" }.to_string();
+
+        gauge(&mut out, "bloch_pos_head_slot", "Slot of the canonical head this node has applied.", self.head_slot.to_string());
+        gauge(&mut out, "bloch_pos_head_height", "Height (canonical block count minus one) of the applied head.", self.head_height.to_string());
+        gauge(&mut out, "bloch_pos_wall_slot", "Slot the wall clock says it is now.", self.wall_slot.to_string());
+        gauge(&mut out, "bloch_pos_behind_slots", "wall_slot minus head slot. Routinely nonzero on this chain (most slots are empty); alert on bloch_pos_stalled, not on this alone.", self.health.behind_by_slots.to_string());
+        gauge(&mut out, "bloch_pos_secs_since_last_block", "Seconds since this node last APPLIED a canonical block (or since boot). The number that was only visible as log-file growth during the 2026-08 stall.", (self.health.ms_since_last_applied / 1000).to_string());
+        gauge(&mut out, "bloch_pos_syncing", "1 while behind the wall clock but still applying blocks (catching up; leave it alone).", b(self.health.syncing));
+        gauge(&mut out, "bloch_pos_stalled", "1 while behind the wall clock AND applying nothing. THE alert signal: RPC answering and peers connected do not clear it.", b(self.health.stalled));
+        match self.finalized_height {
+            Some(h) => {
+                gauge(&mut out, "bloch_pos_has_finality", "1 once any epoch has finalized in this node's view.", "1".to_string());
+                gauge(&mut out, "bloch_pos_finalized_height", "Height of the last finalized block (series absent until finality exists).", h.to_string());
+            }
+            None => gauge(&mut out, "bloch_pos_has_finality", "1 once any epoch has finalized in this node's view.", "0".to_string()),
+        }
+        gauge(&mut out, "bloch_pos_justified_epoch", "Highest justified epoch in this node's view.", self.justified_epoch.to_string());
+        gauge(&mut out, "bloch_pos_finalized_epoch", "Highest finalized epoch in this node's view.", self.finalized_epoch.to_string());
+        gauge(&mut out, "bloch_pos_finality_distance_epochs", "Current epoch minus finalized epoch. 2 is the floor when finality is healthy; a climbing value means finality is failing and the inactivity leak is (or will be) active.", self.current_epoch.saturating_sub(self.finalized_epoch).to_string());
+        gauge(&mut out, "bloch_pos_peers_connected", "Live P2P connections (libp2p: distinct peers; devnet transport: connections, which counts a two-way pair twice).", self.peers_connected.to_string());
+        gauge(&mut out, "bloch_pos_peers_configured", "Peers this node was told to dial.", self.peers_configured.to_string());
+        gauge(&mut out, "bloch_pos_mempool_transactions", "Transactions waiting in the mempool.", self.mempool_transactions.to_string());
+        gauge(&mut out, "bloch_pos_mempool_capacity", "Mempool admission ceiling.", self.mempool_capacity.to_string());
+        gauge(&mut out, "bloch_pos_mempool_bytes", "Canonical bytes held by the mempool.", self.mempool_bytes.to_string());
+        gauge(&mut out, "bloch_pos_blocks_known", "Every structurally valid block this node stores, canonical or not (unpruned).", self.blocks_known.to_string());
+        gauge(&mut out, "bloch_pos_validators_total", "Validator records in the committed registry.", self.validators_total.to_string());
+        gauge(&mut out, "bloch_pos_validators_active", "Validators in the active set this epoch.", self.validators_active.to_string());
+        gauge(&mut out, "bloch_pos_uptime_seconds", "Seconds since this process booted.", self.uptime_secs.to_string());
+
+        if let Some(v) = &self.validator {
+            gauge(&mut out, "bloch_pos_validator_index", "The validator index of the key this node holds.", v.index.to_string());
+            gauge(&mut out, "bloch_pos_validator_in_registry", "1 when the held key's index exists in the committed registry.", b(v.registry.is_some()));
+            gauge(&mut out, "bloch_pos_validator_in_duty_roster", "1 when this validator is in the current epoch's duty roster. THE validator-is-working precondition.", b(v.in_duty_roster));
+            if let Some(r) = &v.registry {
+                gauge(&mut out, "bloch_pos_validator_slashed", "1 when the registry marks this validator slashed.", b(r.slashed));
+                gauge(&mut out, "bloch_pos_validator_exiting", "1 when an exit epoch is set (exiting or exited).", b(r.exit_epoch.is_some()));
+                gauge(&mut out, "bloch_pos_validator_leaked_sat", "Inactivity leak accrued against this validator, satoshis. Nonzero = finality failing while this validator's votes were absent from the counted set.", r.leaked_sat.to_string());
+            }
+            // Absent-vs-false again: a validator outside an epoch's roster
+            // has no participation entry, and a 0 would read as a missed
+            // duty.
+            if let Some(a) = v.attested_in_current_epoch {
+                gauge(&mut out, "bloch_pos_validator_attested_current_epoch", "1 when an attestation by this validator is included on the canonical chain this epoch.", b(a));
+            }
+            if let Some(a) = v.attested_in_previous_epoch {
+                gauge(&mut out, "bloch_pos_validator_attested_previous_epoch", "1 when an attestation by this validator was included in the previous epoch.", b(a));
+            }
+            series(&mut out, "bloch_pos_validator_attestations_signed_total", "counter", "Attestations signed by this process since boot (signatures released, not inclusions).", &v.attestations_signed.to_string());
+            series(&mut out, "bloch_pos_validator_proposals_signed_total", "counter", "Blocks signed by this process since boot.", &v.proposals_signed.to_string());
+            series(&mut out, "bloch_pos_validator_duties_refused_total", "counter", "Duties refused by a protective gate (signing guard, doppelganger silence, proposal-lag gate) since boot. Climbing = read the node log.", &v.duties_refused.to_string());
+            series(&mut out, "bloch_pos_signing_guard_present", "gauge", "1 when the slashing-protection store is open. A keyed node without it performs NO duties.", &b(v.guard_present));
+            if let Some(slot) = v.guard_highest_proposed_slot {
+                series(&mut out, "bloch_pos_signing_guard_highest_proposed_slot", "gauge", "Highest slot this key ever signed a proposal for (durable watermark).", &slot.to_string());
+            }
+            if let Some((_, target)) = v.guard_attestation_watermark {
+                series(&mut out, "bloch_pos_signing_guard_attestation_target_epoch", "gauge", "Target epoch of the highest attestation this key signed (durable watermark). current_epoch minus this = epochs since the key last voted.", &target.to_string());
+            }
+            series(&mut out, "bloch_pos_doppelganger_state", "gauge", "0 disabled/skipped, 1 watching (duties deliberately silent), 2 clear, 3 alarmed (the process exits on 3).", &v.doppelganger.as_gauge().to_string());
+        }
+        out
+    }
+}
 
 /// `getchaininfo` — the method the finality-aware consumers read (V4 §2).
 #[allow(clippy::too_many_arguments)]
@@ -1183,6 +1719,12 @@ pub fn chain_info_json(
     height: u64,
     finalized_height: Option<u64>,
     wall_slot: u64,
+    // The node's own liveness verdict, judged by [`Health::assess`] from the
+    // same wall clock as `wall_slot`. Handed in rather than derived here
+    // because the silence measurement (`last_applied_ms`) lives on the
+    // engine, and this function's rule is to stay a pure projection of its
+    // arguments.
+    health: &Health,
     validators_total: usize,
     mempool: usize,
     blocks_known: usize,
@@ -1239,6 +1781,13 @@ pub fn chain_info_json(
         // (R1), so the node states it.
         ("wall_slot", Json::u(wall_slot)),
         ("behind_by_slots", Json::u(wall_slot.saturating_sub(slot))),
+        // The liveness verdict — see [`Health`]. `behind_by_slots` above
+        // says how far; `health.stalled` says whether the node is actually
+        // moving toward closing the gap, which is the difference between a
+        // node that is syncing and one that has silently stopped. The
+        // post-replay stall (2026-08) looked identical to a laggard on every
+        // field above this line; this object is what tells them apart.
+        ("health", health.json()),
     ])
 }
 

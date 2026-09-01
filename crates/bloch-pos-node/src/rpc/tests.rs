@@ -210,7 +210,10 @@ fn getchaininfo_reports_slot_epoch_head_root_and_both_checkpoints() {
     // against `st.state_root()`, so this test still fails if the field ever
     // stops being the committed root of the state the rest of the object
     // describes.
-    let v = chain_info_json(&st, &head, st.state_root(), 0, Some(0), 12, 2, 3, 0);
+    // A wall slot of 12 with the head at slot 0: behind by 12, which is
+    // inside the normal cadence gap — the health verdict must say so.
+    let health = Health::assess(12, 0, 3_000, 30_000);
+    let v = chain_info_json(&st, &head, st.state_root(), 0, Some(0), 12, &health, 2, 3, 0);
 
     assert_eq!(v.get("slot").unwrap().as_u64(), Some(0));
     assert_eq!(v.get("epoch").unwrap().as_u64(), Some(0));
@@ -234,6 +237,82 @@ fn getchaininfo_reports_slot_epoch_head_root_and_both_checkpoints() {
     assert_eq!(v.get("wall_slot").unwrap().as_u64(), Some(12));
     assert_eq!(v.get("behind_by_slots").unwrap().as_u64(), Some(12));
     assert_eq!(v.get("mempool").unwrap().as_u64(), Some(3));
+
+    // The health object rides along, field for field, and this near-head
+    // node reads as neither syncing nor stalled.
+    let h = v.get("health").unwrap();
+    assert_eq!(h.get("behind_by_slots").unwrap().as_u64(), Some(12));
+    assert_eq!(h.get("secs_since_last_block").unwrap().as_u64(), Some(3));
+    assert_eq!(h.get("syncing").unwrap().as_bool(), Some(false));
+    assert_eq!(h.get("stalled").unwrap().as_bool(), Some(false));
+}
+
+// ─── The liveness verdict ───────────────────────────────────────────────────
+//
+// `Health::assess` is the one place the "am I making progress" judgement is
+// made — `getchaininfo` and the slot loop's periodic line both read it — so
+// these cases ARE the defended behaviour of the post-replay stall's safety
+// net. Slot cadence in all of them is the production 30s.
+
+const SLOT_MS: u64 = 30_000;
+
+/// The measured incident, as a test: ~480 slots behind, nothing applied for
+/// minutes, RPC answering. The verdict must be STALLED — this is the node
+/// that used to look like an ordinary laggard.
+#[test]
+fn far_behind_and_silent_is_stalled() {
+    let h = Health::assess(50_010, 49_530, 5 * 60 * 1_000, SLOT_MS);
+    assert_eq!(h.behind_by_slots, 480);
+    assert!(h.stalled, "480 behind with five minutes of apply-silence is a stall");
+    assert!(!h.syncing, "stalled and syncing are mutually exclusive verdicts");
+}
+
+/// The same lag while blocks are being applied is a node CATCHING UP — the
+/// recovery path the 90–130-slot laggards took — and must not alarm.
+#[test]
+fn far_behind_but_applying_is_syncing_not_stalled() {
+    let h = Health::assess(50_010, 49_530, 2_000, SLOT_MS);
+    assert!(h.syncing);
+    assert!(!h.stalled, "a node applying blocks two seconds ago is progressing");
+}
+
+/// A healthy node between blocks on a sparse chain: a dozen empty slots and
+/// six minutes since the last block are ORDINARY on a 13%-cadence chain, and
+/// must raise nothing — silence alone is not a stall.
+#[test]
+fn ordinary_cadence_gaps_are_healthy() {
+    let h = Health::assess(1_012, 1_000, 6 * 60 * 1_000, SLOT_MS);
+    assert!(!h.syncing);
+    assert!(!h.stalled, "behind by less than HEALTH_BEHIND_SLOTS is never a stall");
+}
+
+/// The thresholds are the contract integrators alert on; pin the boundary on
+/// both sides so a casual retune shows up as a failing test.
+#[test]
+fn the_stall_boundary_sits_exactly_at_the_documented_thresholds() {
+    let silence = HEALTH_SILENCE_SLOTS * SLOT_MS;
+    // One slot / one millisecond inside the line: not stalled.
+    assert!(!Health::assess(HEALTH_BEHIND_SLOTS - 1 + 100, 100, silence, SLOT_MS).stalled);
+    assert!(!Health::assess(HEALTH_BEHIND_SLOTS + 100, 100, silence - 1, SLOT_MS).stalled);
+    // At the line on both axes: stalled.
+    assert!(Health::assess(HEALTH_BEHIND_SLOTS + 100, 100, silence, SLOT_MS).stalled);
+}
+
+/// A wall clock behind the head (clock skew, or a freshly proposed block in
+/// the current slot) must saturate to zero, never wrap.
+#[test]
+fn a_head_ahead_of_the_wall_clock_is_zero_behind() {
+    let h = Health::assess(99, 100, 0, SLOT_MS);
+    assert_eq!(h.behind_by_slots, 0);
+    assert!(!h.syncing && !h.stalled);
+}
+
+/// A zero `slot_ms` from a hand-edited manifest must not panic the health
+/// check (the same guard `Engine::wall_slot` carries for its division).
+#[test]
+fn a_zero_slot_ms_manifest_does_not_panic_the_verdict() {
+    let h = Health::assess(1_000, 0, 1_000, 0);
+    assert!(h.stalled || h.syncing); // behind either way; no panic is the point
 }
 
 #[test]
@@ -507,6 +586,12 @@ fn every_method_routes_to_its_request() {
 
     call(b, &request("getmempoolinfo", "[]"));
     assert_eq!(spy.last(), Some(RpcRequest::MempoolInfo));
+
+    call(b, &request("getvalidatorstatus", "[]"));
+    assert_eq!(spy.last(), Some(RpcRequest::ValidatorStatus));
+
+    call(b, &request("getmetrics", "[]"));
+    assert_eq!(spy.last(), Some(RpcRequest::Metrics));
 
     let tx = test_transfer(1, 250, 1_000);
     let hex: String = tx.canonical_bytes().iter().map(|b| format!("{b:02x}")).collect();
@@ -915,8 +1000,13 @@ fn the_server_binds_loopback_when_asked_for_loopback() {
 fn http_that_is_not_a_json_rpc_post_is_answered_not_dropped() {
     let (addr, _) = test_server();
 
-    // GET is refused with a status, not a hang or a panic.
+    // GET exists for exactly two endpoints; any other path is 404, said
+    // with a status rather than a hang or a panic.
     let r = http(addr, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert!(r.starts_with("HTTP/1.1 404"), "got {r}");
+
+    // A verb that is neither GET nor POST is 405.
+    let r = http(addr, "PUT / HTTP/1.1\r\nHost: x\r\n\r\n");
     assert!(r.starts_with("HTTP/1.1 405"), "got {r}");
 
     // POST with no Content-Length cannot be read.
@@ -981,4 +1071,248 @@ fn a_body_split_across_packets_is_reassembled() {
     let _ = sock.read_to_string(&mut out);
     assert!(out.starts_with("HTTP/1.1 200"), "got {out}");
     assert_eq!(spy.last(), Some(RpcRequest::BlockBySlot(41_290)));
+}
+
+// ─── The observability surface ──────────────────────────────────────────────
+
+fn full_status_view() -> ValidatorStatusView {
+    ValidatorStatusView {
+        index: 41,
+        registry: Some(ValidatorRegistryView {
+            state: "active",
+            slashed: false,
+            own_stake_sat: 25_000 * 100_000_000,
+            effective_stake_sat: Some(2_400_000_000_000),
+            leaked_sat: 0,
+            activation_epoch: Some(0),
+            exit_epoch: None,
+            withdrawable_epoch: None,
+        }),
+        in_duty_roster: true,
+        next_attestation_slot: Some(1_337),
+        next_proposal_slot: None,
+        projection_end_slot: 1_344,
+        attested_in_current_epoch: Some(true),
+        attested_in_previous_epoch: Some(false),
+        attestations_signed: 12,
+        proposals_signed: 2,
+        duties_refused: 1,
+        guard_present: true,
+        guard_highest_proposed_slot: Some(1_300),
+        guard_attestation_watermark: Some((40, 41)),
+        doppelganger: DoppelgangerView::Watching { silent_until_slot: 1_400 },
+        wall_slot: 1_336,
+        current_epoch: 41,
+    }
+}
+
+/// The status object answers the operator's questions by name: each load-
+/// bearing field is asserted through a JSON round trip, so a rename or a
+/// silently dropped field fails here and not in someone's dashboard.
+#[test]
+fn validator_status_json_carries_every_operator_question() {
+    let v = full_status_view();
+    let j = parse_json(&v.json().to_string()).expect("status must serialize to valid JSON");
+    assert_eq!(j.get("validator_index").unwrap().as_u64(), Some(41));
+    assert_eq!(
+        j.get("registry").unwrap().get("state").unwrap().as_str(),
+        Some("active")
+    );
+    assert_eq!(j.get("in_duty_roster").unwrap().as_bool(), Some(true));
+    assert_eq!(j.get("next_attestation_slot").unwrap().as_u64(), Some(1_337));
+    // "No proposal in the horizon" must be null, not 0 — slot 0 exists.
+    assert_eq!(j.get("next_proposal_slot"), Some(&Json::Null));
+    assert_eq!(j.get("attested_in_current_epoch").unwrap().as_bool(), Some(true));
+    assert_eq!(j.get("attested_in_previous_epoch").unwrap().as_bool(), Some(false));
+    assert_eq!(j.get("duties_refused_since_boot").unwrap().as_u64(), Some(1));
+    let guard = j.get("signing_guard").unwrap();
+    assert_eq!(guard.get("present").unwrap().as_bool(), Some(true));
+    assert_eq!(guard.get("highest_proposed_slot").unwrap().as_u64(), Some(1_300));
+    assert_eq!(guard.get("attestation_target_epoch").unwrap().as_u64(), Some(41));
+    let dopp = j.get("doppelganger").unwrap();
+    assert_eq!(dopp.get("state").unwrap().as_str(), Some("watching"));
+    assert_eq!(dopp.get("silent_until_slot").unwrap().as_u64(), Some(1_400));
+    // Stake is an amount and therefore a decimal string (R3), not a number.
+    assert!(matches!(
+        j.get("registry").unwrap().get("own_stake_sat"),
+        Some(Json::Str(_))
+    ));
+}
+
+/// A validator the chain does not know must SAY so — `registry: null` — and
+/// the epoch-participation fields must distinguish "not tracked" (null)
+/// from "tracked and false".
+#[test]
+fn validator_status_json_reports_absence_as_null_not_zero() {
+    let mut v = full_status_view();
+    v.registry = None;
+    v.attested_in_current_epoch = None;
+    let j = parse_json(&v.json().to_string()).unwrap();
+    assert_eq!(j.get("registry"), Some(&Json::Null));
+    assert_eq!(j.get("attested_in_current_epoch"), Some(&Json::Null));
+    assert_eq!(
+        j.get("attested_in_previous_epoch").unwrap().as_bool(),
+        Some(false),
+        "tracked-and-false must stay false, not be flattened into null"
+    );
+}
+
+fn snapshot(validator: Option<ValidatorStatusView>) -> MetricsSnapshot {
+    MetricsSnapshot {
+        head_slot: 1_320,
+        head_height: 402,
+        wall_slot: 1_336,
+        health: Health::assess(1_336, 1_320, 12_000, 30_000),
+        finalized_height: Some(400),
+        justified_epoch: 40,
+        finalized_epoch: 39,
+        current_epoch: 41,
+        peers_connected: 57,
+        peers_configured: 60,
+        mempool_transactions: 3,
+        mempool_capacity: 4_096,
+        mempool_bytes: 900,
+        blocks_known: 405,
+        validators_total: 64,
+        validators_active: 62,
+        uptime_secs: 7_200,
+        validator,
+    }
+}
+
+/// The exposition format, pinned: HELP and TYPE on every series, the series
+/// the alert recipes in BLOCH-OPERATOR-OBSERVABILITY.md reference, and the
+/// values from the snapshot — including the incident shape (57 peers, not
+/// stalled here) the fleet actually saw.
+#[test]
+fn metrics_render_is_valid_prometheus_text() {
+    let text = snapshot(Some(full_status_view())).render();
+    for series in [
+        "bloch_pos_head_slot 1320",
+        "bloch_pos_behind_slots 16",
+        "bloch_pos_secs_since_last_block 12",
+        "bloch_pos_syncing 0",
+        "bloch_pos_stalled 0",
+        "bloch_pos_finalized_height 400",
+        "bloch_pos_finality_distance_epochs 2",
+        "bloch_pos_peers_connected 57",
+        "bloch_pos_validator_in_duty_roster 1",
+        "bloch_pos_validator_attested_current_epoch 1",
+        "bloch_pos_validator_attested_previous_epoch 0",
+        "bloch_pos_validator_attestations_signed_total 12",
+        "bloch_pos_signing_guard_present 1",
+        "bloch_pos_doppelganger_state 1",
+    ] {
+        assert!(text.contains(&format!("\n{series}\n")) || text.contains(&format!("{series}\n")),
+            "missing series line {series:?} in:\n{text}");
+    }
+    assert!(text.contains("# HELP bloch_pos_stalled "));
+    assert!(text.contains("# TYPE bloch_pos_stalled gauge"));
+    assert!(text.contains("# TYPE bloch_pos_validator_attestations_signed_total counter"));
+    // Every non-comment line is `name value`, values numeric — the whole
+    // format contract a scraper needs.
+    for line in text.lines().filter(|l| !l.starts_with('#') && !l.is_empty()) {
+        let mut parts = line.split(' ');
+        let name = parts.next().unwrap();
+        assert!(name.starts_with("bloch_pos_"), "unprefixed series {line:?}");
+        let value = parts.next().expect("a value");
+        assert!(value.parse::<f64>().is_ok(), "non-numeric value in {line:?}");
+        assert_eq!(parts.next(), None, "trailing tokens in {line:?}");
+    }
+}
+
+/// An observer has NO validator series — absent, not zeroed. A dashboard
+/// that pages on `validator_attested == 0` must not fire for a node that
+/// never claimed to hold a key.
+#[test]
+fn metrics_for_an_observer_omit_the_validator_series_entirely() {
+    let text = snapshot(None).render();
+    assert!(!text.contains("bloch_pos_validator_"), "observer must expose no validator series");
+    assert!(!text.contains("bloch_pos_doppelganger_state"));
+    assert!(text.contains("bloch_pos_stalled"), "node series must still be there");
+}
+
+/// Participation gauges are absent (not 0) when the epoch does not track
+/// this validator — the same absent-vs-false rule as the JSON.
+#[test]
+fn untracked_participation_omits_the_gauge_rather_than_reporting_a_miss() {
+    let mut v = full_status_view();
+    v.attested_in_current_epoch = None;
+    let text = snapshot(Some(v)).render();
+    assert!(!text.contains("bloch_pos_validator_attested_current_epoch"));
+    assert!(text.contains("bloch_pos_validator_attested_previous_epoch 0"));
+}
+
+/// GET /metrics serves whatever text the backend returns, as the pinned
+/// Prometheus content type — through a real socket, because the content
+/// type and the GET routing are exactly the parts a unit test of `render`
+/// cannot see.
+#[test]
+fn get_metrics_answers_prometheus_text_over_http() {
+    let (addr, spy) = test_server();
+    let r = http(addr, "GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert!(r.starts_with("HTTP/1.1 200 OK"), "got {r}");
+    assert!(
+        r.contains("Content-Type: text/plain; version=0.0.4"),
+        "the scrape content type must be the pinned Prometheus one, got {r}"
+    );
+    // The Spy answers Json::s("ok"), so the body is the raw text "ok" — no
+    // JSON envelope on the scrape surface.
+    let body = r.split("\r\n\r\n").nth(1).expect("a body");
+    assert_eq!(body, "ok");
+    assert_eq!(spy.last(), Some(RpcRequest::Metrics));
+
+    // A query string still reaches the endpoint (Prometheus can append them).
+    let r = http(addr, "GET /metrics?x=1 HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert!(r.starts_with("HTTP/1.1 200 OK"), "got {r}");
+}
+
+/// GET /health branches its STATUS CODE on the stalled flag, so a load
+/// balancer needs no JSON: 200 healthy, 503 stalled.
+#[test]
+fn get_health_maps_stalled_onto_the_status_code() {
+    // A healthy chaininfo → 200.
+    struct Healthy;
+    impl RpcBackend for Healthy {
+        fn call(&self, _req: RpcRequest) -> RpcResult {
+            Ok(Json::obj(vec![(
+                "health",
+                Json::obj(vec![
+                    ("behind_by_slots", Json::u(3)),
+                    ("stalled", Json::Bool(false)),
+                ]),
+            )]))
+        }
+    }
+    let addr = serve("127.0.0.1", 0, Arc::new(Healthy)).unwrap();
+    let r = http(addr, "GET /health HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert!(r.starts_with("HTTP/1.1 200 OK"), "got {r}");
+
+    // The stall — the exact 2026-08 incident shape — → 503, with the health
+    // object in the body for the human who curls it.
+    struct Stalled;
+    impl RpcBackend for Stalled {
+        fn call(&self, _req: RpcRequest) -> RpcResult {
+            Ok(Json::obj(vec![(
+                "health",
+                Json::obj(vec![
+                    ("behind_by_slots", Json::u(480)),
+                    ("stalled", Json::Bool(true)),
+                ]),
+            )]))
+        }
+    }
+    let addr = serve("127.0.0.1", 0, Arc::new(Stalled)).unwrap();
+    let r = http(addr, "GET /health HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert!(r.starts_with("HTTP/1.1 503"), "a stalled node must fail the probe, got {r}");
+    let body = r.split("\r\n\r\n").nth(1).expect("a body");
+    let v = parse_json(body).expect("health body is JSON");
+    assert_eq!(v.get("behind_by_slots").unwrap().as_u64(), Some(480));
+
+    // An engine that cannot answer at all is also 503 — an unreachable
+    // consensus thread must never read as healthy.
+    let failing = Spy::failing(RpcError::unavailable("wedged"));
+    let addr = serve("127.0.0.1", 0, failing).unwrap();
+    let r = http(addr, "GET /health HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert!(r.starts_with("HTTP/1.1 503"), "got {r}");
 }
