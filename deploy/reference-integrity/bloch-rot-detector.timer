@@ -1,0 +1,12 @@
+# /etc/systemd/system/bloch-rot-detector.timer
+[Unit]
+Description=Run the Bloch G4 reference-rot detector hourly
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=1h
+RandomizedDelaySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

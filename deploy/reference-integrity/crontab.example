@@ -1,0 +1,10 @@
+# Reference-rot detector, cron form. cron mails any output, and the detector
+# prints its one verdict line whenever something has rotted (and nothing at all
+# when --quiet and clean), so a quiet mailbox means a healthy fleet.
+MAILTO=tiagobeltraoacioli@gmail.com
+17 * * * * /opt/bloch/reference-integrity/rot-detector.sh --quiet 2>&1
+
+# Belt and braces: once a day, prove the DERIVATION still agrees with reality,
+# which catches drift the peer check alone would miss (e.g. a unit added by
+# hand with a hand-typed peer list).
+23 6 * * * /opt/bloch/reference-integrity/derive-peers.sh check 2>&1

@@ -1,0 +1,17 @@
+# /etc/systemd/system/bloch-rot-detector.service  (or ~/.config/systemd/user/)
+# Installed on the OPERATOR's machine or a jump box — never on a validator.
+# It only reads; it needs the fleet ssh key and nothing else.
+[Unit]
+Description=Bloch G4 reference-rot detector (read-only)
+Documentation=file:/deploy/reference-integrity/README.md
+
+[Service]
+Type=oneshot
+ExecStart=/opt/bloch/reference-integrity/rot-detector.sh --quiet
+# A non-zero exit marks the unit failed, which is the point: `systemctl
+# --failed` and any existing alerting see it without reading a log.
+SuccessExitStatus=0
+# Exit 2 (undetermined) must NOT be silent either — it means we lost the
+# ability to check, which is how the last outage stayed invisible.
+StandardOutput=journal
+StandardError=journal
