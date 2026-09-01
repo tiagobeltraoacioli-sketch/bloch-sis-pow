@@ -185,7 +185,7 @@ dependence on an indexer staying in sync with the chain.
 |---|---|---|
 | Accepted | `sendrawtransaction` → `accepted:true` | in the mempool |
 | Included | output visible via `gettxout` / `getutxos` | in a block |
-| **Final** | `getchaininfo.finalized.epoch` ≥ that block's epoch | **credit** |
+| **Final** | `getchaininfo.finalized.epoch` ≥ that block's epoch | **not sufficient — see the note below** |
 
 Finality is explicit on Genesis-4 and published in every `getchaininfo` response — you do
 not estimate it from a confirmation count.
