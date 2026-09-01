@@ -88,7 +88,7 @@ fi
 MANIFEST=$(cat <<'EOF'
 1. leak accumulator|finality::tests::the_relaunch_opens_its_books_with_an_empty_leak_ledger|proof|a relaunch inherits no leak balance from the broken chain
 1. leak accumulator|finality::tests::the_leak_ledger_shrinks_only_under_a_governed_rule|proof|one accrual site; any recovery rule is named and switchable
-1. leak accumulator|finality::tests::the_leak_ledger_is_committed_but_never_restored|proof|LATENT FINDING: committed as LeakRecord, never read back
+1. leak accumulator|finality::tests::the_leak_ledger_is_committed_and_restored_by_exactly_one_path|proof|the old latent finding is CLOSED: LeakRecords are read back by the root-verified snapshot restore, and by nothing else
 1. leak accumulator|finality::tests::the_leak_only_ever_grows|proof|behavioural: leak is monotonic. EXPECT THIS TO GO RED at pmo/leak-zero integration (2f477fa2 adds a recovery rule); it is that branch's test to update, not this one's
 0. model fidelity|prova::tests::the_model_of_the_fix_is_the_production_shuffle|proof|the modelled fix IS the production shuffle, bit for bit
 0. model fidelity|prova::tests::the_leak_mirror_is_the_production_arithmetic|proof|the mirrored leak arithmetic still matches transition.rs

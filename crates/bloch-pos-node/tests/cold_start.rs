@@ -123,6 +123,7 @@ fn spawn_node(
     rpc: u16,
     peers: &[u16],
     log: &Path,
+    doppelganger_epochs: u64,
 ) -> Child {
     let peer_list = peers
         .iter()
@@ -161,6 +162,8 @@ fn spawn_node(
             &rpc.to_string(),
             "--stop-at-slot",
             &STOP_SLOT.to_string(),
+            "--doppelganger-epochs",
+            &doppelganger_epochs.to_string(),
         ])
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err))
@@ -214,6 +217,12 @@ fn a_cold_node_builds_the_same_chain_from_genesis_without_a_donated_datadir() {
             rpc_ports[i],
             &all,
             &root.join(format!("n{i}.log")),
+            // The founders are a chain launch orchestrated by one operator —
+            // the documented case for disabling the doppelganger watch. (The
+            // 6-second genesis head start is eaten by PQ keygen, so they boot
+            // a few slots past slot 0 and the default watch would silence the
+            // whole fleet for two epochs, past STOP_SLOT.)
+            0,
         ));
     }
 
@@ -223,14 +232,21 @@ fn a_cold_node_builds_the_same_chain_from_genesis_without_a_donated_datadir() {
     // peers, exactly like an exchange standing up a node today.
     std::thread::sleep(Duration::from_secs(COLD_START_DELAY_SECS));
     let cold_dir = root.join("d2");
-    let cold_files: Vec<String> = std::fs::read_dir(&cold_dir)
+    let mut cold_files: Vec<String> = std::fs::read_dir(&cold_dir)
         .expect("read cold dir")
         .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
         .collect();
+    cold_files.sort();
     assert_eq!(
         cold_files,
-        vec!["validator.key".to_string()],
-        "the cold node's data dir must contain only its own keystore, not a donated database"
+        vec![
+            // keygen writes the key WITH its (empty) slashing-protection
+            // history — key-side material, not chain data. The point of the
+            // assert stands: no block log, no meta, no donated database.
+            "signing_history.bin".to_string(),
+            "validator.key".to_string(),
+        ],
+        "the cold node's data dir must contain only its own key material, not a donated database"
     );
     fleet.0.push(spawn_node(
         &cold_dir,
@@ -239,6 +255,13 @@ fn a_cold_node_builds_the_same_chain_from_genesis_without_a_donated_datadir() {
         rpc_ports[2],
         &all,
         &root.join("n2.log"),
+        // Watch off here too: this test is about cold-start chain IDENTITY,
+        // and on a loaded machine the late node's votes and proposals are
+        // what break fork-choice ties between the two founders — silencing
+        // it for two epochs (the default watch) lets forked heads persist to
+        // STOP_SLOT. The watch itself is pinned by the engine unit tests
+        // (`signing_guard_tests`), not here.
+        0,
     ));
 
     for c in &mut fleet.0 {

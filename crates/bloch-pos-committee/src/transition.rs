@@ -157,6 +157,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// see the same constant the header encoder stamps.
 pub use crate::header::VERSION_G4 as BLOCK_VERSION_V4;
 
+/// Checkpoint-sync state snapshots: the canonical byte form of a
+/// [`CommittedState`] and the verified-or-nothing [`snapshot::restore`]. A
+/// CHILD module on purpose — restore reconstructs the struct field by field,
+/// which needs the private fields, and widening them for an external module
+/// would hand every consumer a door around the transition.
+pub mod snapshot;
+
 // ─── Header identity: DELEGATED, never re-derived here ─────────────────────
 //
 // This module carried its own `canonical_header_bytes` / `block_id` /
@@ -1379,8 +1386,12 @@ fn report_boundary_vote_drop(closing: u64, admitted: usize, tallied: usize) {
 ///
 /// A plain value: `Clone` + `PartialEq`, no interior mutability, no handles.
 /// Everything a consensus rule may read arrives through this struct, and the
-/// struct is only ever produced by [`CommittedState::genesis`] or by the
-/// transition itself — there is no constructor that reads a database.
+/// struct is only ever produced by [`CommittedState::genesis`], by the
+/// transition itself, or by [`snapshot::restore`] — which exists for
+/// checkpoint-sync and refuses to produce a value whose recomputed state
+/// root is not the one a verified checkpoint commits to. There is still no
+/// constructor that reads a database, and no constructor that skips
+/// verification.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CommittedState {
     /// Slot of the block whose post-state this is.
@@ -3736,6 +3747,49 @@ impl CommittedState {
         self.validators.len()
     }
 
+    /// Did `validator` have an attestation included on the canonical chain in
+    /// the CURRENT (open) epoch? `None` when the participation map does not
+    /// track this index — a validator outside the epoch's duty roster, or an
+    /// index the chain does not know.
+    ///
+    /// Observability read, node-local reporting only: this is the same
+    /// `current_participation` map rewards read at the epoch close, exposed
+    /// so an operator can be told "your attestation landed" without grepping
+    /// a log. It writes nothing and no consensus rule reads it through here.
+    pub fn attested_in_current_epoch(&self, validator: u32) -> Option<bool> {
+        self.current_participation.get(&validator).copied()
+    }
+
+    /// Did `validator` have an attestation included in the PREVIOUS epoch —
+    /// the epoch whose rewards have been (or are about to be) settled? Same
+    /// contract as [`Self::attested_in_current_epoch`].
+    pub fn attested_in_previous_epoch(&self, validator: u32) -> Option<bool> {
+        self.previous_participation.get(&validator).copied()
+    }
+
+    /// The inactivity leak accrued against `validator`, in satoshis. Zero for
+    /// a validator that is voting (or has not been leaking long enough to
+    /// accrue). Observability read of the same number `active_validators`
+    /// subtracts from effective stake; exposed so an operator can see a leak
+    /// eating their stake while it is still small.
+    pub fn leaked_of(&self, validator: u32) -> u64 {
+        self.finality_engine.leaked_of(validator)
+    }
+
+    /// The committed RANDAO reveal count of one validator — how many links
+    /// down its hash chain the canonical chain has consumed.
+    ///
+    /// Exposed for the node's proposer path: on a checkpoint-synced node the
+    /// canonical chain below the sync base is not held, so counting one's own
+    /// canonical blocks (the old positioning rule) undercounts. The committed
+    /// pair `(randao_commitment, reveals_used)` is the transition's own
+    /// definition of where the chain stands — the same value `apply_block`
+    /// judges the next reveal against — so positioning from it cannot drift
+    /// from what the validator will be checked with.
+    pub fn reveals_used_of(&self, validator: u32) -> u32 {
+        *self.reveals_used.get(&validator).unwrap_or(&0)
+    }
+
     /// Every unspent output, in `(txid, vout)` order.
     ///
     /// Order is the map's, so it is a function of the data and not of insertion
@@ -4941,7 +4995,7 @@ mod tests {
         h.finalize().to_vec()
     }
 
-    struct ToyVerifier;
+    pub(super) struct ToyVerifier;
     impl SignatureVerifier for ToyVerifier {
         fn verify(&self, _v: u32, _root: &[u8; 32], _sig: &[u8]) -> bool {
             true
@@ -5674,7 +5728,7 @@ mod tests {
 
     /// Build a valid block at `slot` on top of `pre`, consuming the drawn
     /// proposer's next reveal — the same walk a real validator client does.
-    fn build_block<V: SignatureVerifier + staking::HybridKeyVerifier>(
+    pub(super) fn build_block<V: SignatureVerifier + staking::HybridKeyVerifier>(
         t: &Transition<V>,
         pre: &CommittedState,
         slot: u64,
@@ -9132,8 +9186,8 @@ mod tests {
     /// all been applied, and one equivocator is barred. This is the fixture
     /// the two tests below share — a state where the pre-extension root would
     /// have been blind to most of what follows.
-    fn state_with_live_bookkeeping() -> (Transition<ToyVerifier>, CommittedState, Vec<Attestation>)
-    {
+    pub(super) fn state_with_live_bookkeeping(
+    ) -> (Transition<ToyVerifier>, CommittedState, Vec<Attestation>, Vec<RandaoChain>) {
         // Funded, and the transfer below actually spends: the unspent set is
         // one of the components the root must bind, and a fixture where it sat
         // empty (or untouched since genesis) would exercise that leaf
@@ -9178,7 +9232,7 @@ mod tests {
         assert!(!st.delegations.is_empty());
         assert!(!st.pending_fee_rewards.is_empty());
         assert!(!st.boundary_mixes.is_empty());
-        (t, st, atts)
+        (t, st, atts, chains)
     }
 
     /// Every consensus-relevant `CommittedState` field moves the root; every
@@ -9190,7 +9244,7 @@ mod tests {
     /// this list to diff against the struct.
     #[test]
     fn every_committed_state_field_is_bound_by_the_root() {
-        let (_t, st, _) = state_with_live_bookkeeping();
+        let (_t, st, _, _) = state_with_live_bookkeeping();
         let base = st.compute_root();
 
         let mut moved = vec![base];

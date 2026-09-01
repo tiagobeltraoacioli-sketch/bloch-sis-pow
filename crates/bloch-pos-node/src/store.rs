@@ -83,6 +83,12 @@ impl Store {
     /// broadcast after this returns, so anything the network has seen from
     /// us is durable locally (the producer-side equivocation fence across
     /// restarts).
+    /// The data dir this store was opened on — the anchor for the node's
+    /// sibling stores (snapshots, statesync partials).
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     pub fn append(&mut self, env: &BlockEnvelope) -> io::Result<()> {
         let payload = crate::codec::encode_envelope(env);
         let mut frame = Vec::with_capacity(4 + payload.len());
