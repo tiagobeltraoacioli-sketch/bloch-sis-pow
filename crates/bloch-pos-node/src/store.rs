@@ -1314,6 +1314,14 @@ mod tests {
         fs::create_dir_all(&dst).expect("mkdir");
         fs::copy(src.join("meta.bin"), dst.join("meta.bin")).expect("copy meta");
         fs::copy(src.join("blocks.log"), dst.join("blocks.log")).expect("copy log");
+        // **Flush the copy before anything is timed.** Otherwise the 400 MB
+        // just written sit dirty in the page cache and the first `fsync` in
+        // the timed region — whichever path issues it — pays to write them
+        // out. That is the harness's cost, not the write path's, and it
+        // flatters neither side honestly. A production node's log is clean
+        // when a reorg arrives: every `append` already fsynced it.
+        File::open(dst.join("blocks.log")).expect("open").sync_all().expect("flush the copy");
+        let _ = std::process::Command::new("sync").status();
         dst
     }
 
@@ -1503,6 +1511,138 @@ mod tests {
                 dir.display()
             );
         }
+    }
+
+
+    /// The env var naming the child of the syscall-ordering test.
+    #[cfg(target_os = "linux")]
+    const ORDER_ENV: &str = "BLOCH_STORE_ORDER_CHILD";
+
+    /// **The durability ordering, checked at the syscall level.**
+    ///
+    /// This test exists because of a hole the rest of the suite has, and the
+    /// hole is worth stating plainly: deleting the `sync_all` from
+    /// `replace_tail` breaks nothing that any other test here can see. Killing
+    /// a process does not empty the page cache, so a `SIGKILL` between the
+    /// truncate and the append leaves the same bytes visible whether or not
+    /// the truncation was ever made durable. Every crash test in this file
+    /// still passes with the `fsync` gone. That was measured, not assumed —
+    /// see `docs/perf/REORG-WRITE-PATH.md`, mutation M5.
+    ///
+    /// What the `sync_all` actually defends against is power loss, and this
+    /// suite cannot cut power. What it *can* do is check the property the
+    /// defence is made of: that on the log's own descriptor the calls come in
+    /// the order `ftruncate` → `fsync` → `write`, and that **no write lands
+    /// between the truncate and its fsync**. If they ever reorder, a crash
+    /// could leave the old size with new frames written inside it — a log
+    /// spliced from two branches, which replay does not reject.
+    ///
+    /// That is an ordering proof, not a durability proof. The gap is real and
+    /// named: it assumes `fsync` means what the filesystem says it means.
+    ///
+    /// Linux only, and inert without `strace` — so it is not a gate on a Mac.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_truncation_is_made_durable_before_anything_is_written_past_it() {
+        // Child: open an existing log and splice it. Nothing else touches
+        // `blocks.log` in this process, so every traced syscall on that
+        // descriptor belongs to `replace_tail`.
+        if let Ok(dir) = std::env::var(ORDER_ENV) {
+            let dir = PathBuf::from(dir);
+            let mut store = Store::open(&dir, &[7u8; 32]).expect("child open");
+            let kept = sample_envelope(4);
+            let branch: Vec<BlockEnvelope> = (70..=71u64).map(sample_envelope).collect();
+            store
+                .replace_tail(4, Some(&kept), branch.iter())
+                .expect("child splice");
+            std::process::exit(0);
+        }
+
+        if std::process::Command::new("strace")
+            .arg("-V")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| !s.success())
+            .unwrap_or(true)
+        {
+            eprintln!(
+                "SKIPPED: strace is not installed, so the ordering that makes \
+                 replace_tail crash-safe is UNCHECKED on this machine"
+            );
+            return;
+        }
+
+        let dir = tmpdir("order");
+        {
+            let mut store = Store::open(&dir, &[7u8; 32]).expect("open");
+            for slot in 1..=9u64 {
+                store.append(&sample_envelope(slot)).expect("append");
+            }
+        }
+        let trace = dir.join("trace.txt");
+        let status = std::process::Command::new("strace")
+            .args(["-f", "-y", "-e", "trace=ftruncate,fsync,fdatasync,write", "-o"])
+            .arg(&trace)
+            .arg(std::env::current_exe().expect("current exe"))
+            .args([
+                "--exact",
+                "store::tests::the_truncation_is_made_durable_before_anything_is_written_past_it",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(ORDER_ENV, &dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("spawn strace");
+        assert!(status.success(), "the traced child failed: {status:?}");
+
+        // `-y` annotates each descriptor with its path, so the log's calls are
+        // the lines that name it.
+        let text = fs::read_to_string(&trace).expect("read trace");
+        let calls: Vec<&str> = text
+            .lines()
+            .filter(|l| l.contains("blocks.log"))
+            .filter_map(|l| {
+                for c in ["ftruncate", "fdatasync", "fsync", "write"] {
+                    if let Some(p) = l.find(c) {
+                        // Only a call at the head of the line's syscall
+                        // position, not a substring of a path.
+                        if l[..p].chars().all(|ch| ch.is_ascii_digit() || ch == ' ') {
+                            return Some(c);
+                        }
+                    }
+                }
+                None
+            })
+            .collect();
+
+        let t = calls
+            .iter()
+            .position(|c| *c == "ftruncate")
+            .unwrap_or_else(|| panic!("no ftruncate on blocks.log in {calls:?}"));
+        let sync_after_t = calls[t + 1..]
+            .iter()
+            .position(|c| *c == "fsync" || *c == "fdatasync")
+            .map(|i| t + 1 + i)
+            .unwrap_or_else(|| panic!("nothing synced the truncation: {calls:?}"));
+        let write_after_t = calls[t + 1..].iter().position(|c| *c == "write").map(|i| t + 1 + i);
+
+        assert!(
+            write_after_t.map_or(true, |w| w > sync_after_t),
+            "a write landed at {write_after_t:?}, before the truncation was synced at \
+             {sync_after_t} — a crash there leaves the old size with new frames inside \
+             it, which is a log spliced from two branches. Calls: {calls:?}"
+        );
+        // And the branch really was written, so this did not pass by tracing
+        // a splice that wrote nothing.
+        assert!(
+            write_after_t.is_some(),
+            "no write followed the truncate; the test traced nothing: {calls:?}"
+        );
+        println!("syscall order on blocks.log: {calls:?}");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     fn sample_envelope(slot: u64) -> BlockEnvelope {
