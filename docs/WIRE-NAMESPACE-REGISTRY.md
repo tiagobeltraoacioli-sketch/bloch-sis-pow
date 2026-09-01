@@ -21,6 +21,34 @@ citing the older sweep):
 
 ---
 
+## Quick reference — every namespace and its next free value
+
+Nine namespaces. **Claim from the PMO before writing the constant.**
+
+| # | Namespace | Dispatch | Diagnostic on duplicate | Next free |
+| --- | --- | --- | --- | --- |
+| §1 | Transaction tags | `match` on `u8` literal | warning, same-`match` only | **`0x0A`** (`0x09` reserved) |
+| §1a | Slashing-evidence kinds (nested in `0x05`) | `match`, has catch-all | warning, same-`match` only | **`0x03`** |
+| §2 | Frame bytes | `match` by *reference* + runtime `==` | **NONE** | **`0x09`** |
+| §3a | Sync **request** tags | `match` | none in practice | **`0x04`** |
+| §3b | Sync **response** tags | `match` | none in practice | **`0x04`** |
+| §4 | State-root tags | key prefix, never matched | **NONE — consensus-fatal** | **`0x19`** |
+| §5 | RPC method names | `match` on `&str` | warning | *(names, not numbers)* |
+| §9.1 | Role tags (**two files**) | hashed into sortition seed | **NONE — consensus-fatal** | **`0x04`** |
+| §9.2 | Merkle `MARK_*` / `KIND_*` | hashed | none | **`0x03`** each |
+| §9.3 | Genesis allocation buckets | — | none | **`0x07`** |
+| §9.4 | Domain separators `DS_*` | 16-byte tag | none | *(strings; ≤10 chars after `BLCH4:`)* |
+
+**Three namespaces have no diagnostic at all: §2, §4, and §9.1.** Two of the
+three are consensus-fatal on collision. Those are the ones this file exists for.
+
+**Deliberate same-value pairs that are CORRECT — do not "fix" them:**
+`SYNC_TAG_GET_BLOCKS` = `SYNC_TAG_BLOCKS` = `0x01` (§3, different namespaces);
+`MARK_NODE` = `KIND_TX` = `0x01` (§9.2, different namespaces); `TAG_EUTXO` =
+`FRAME_BLOCK` = `0x01` (different namespaces entirely). A test that checks these
+for global distinctness will fail on correct code and be "fixed" by renumbering
+— which causes the split it was meant to prevent.
+
 ## 0. The rule
 
 **No dev agent may use a transaction tag, frame byte, sync tag, state-root tag,
