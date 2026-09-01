@@ -79,7 +79,7 @@ pub const FRAME_TIME: u8 = 0x06;
 /// accepts in silence. Neither had shipped, so the collision was resolved
 /// here by moving state sync up; `frame_bytes_are_claimed_exactly_once`
 /// below is what stops the next one.
-pub const FRAME_GET_STATE: u8 = 0x05;
+pub const FRAME_GET_STATE: u8 = 0x07;
 /// Payload is an encoded [`crate::state_sync::StateSyncResponse`].
 pub const FRAME_STATE: u8 = 0x08;
 
