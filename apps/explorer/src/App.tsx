@@ -7,6 +7,8 @@ import { g4rpc, G4_RPC } from "./lib/g4";
 import { G4Dashboard } from "./pages/G4Dashboard";
 import { G4BlockPage } from "./pages/G4Block";
 import { BalancePage } from "./pages/Balance";
+import { HashPage } from "./pages/Hash";
+import { OutpointPage } from "./pages/Outpoint";
 import { ValidatorsPage } from "./pages/Validators";
 import { SnapshotPage } from "./pages/Snapshot";
 import "./features.css";
@@ -27,17 +29,39 @@ const Logo = () => (
 // with, and a reader who came looking for it must still find it.
 const NAV = [
   { to: "/", label: "Chain" },
-  { to: "/balance", label: "Balance" },
+  { to: "/hash", label: "Balance" },
   { to: "/validators", label: "Validators" },
   { to: "/snapshot", label: "Snapshot" },
 ];
 
 function renderRoute(path: string) {
   if (path === "/" || path === "") return <G4Dashboard />;
-  if (path === "/balance") return <BalancePage />;
+
+  // `/hash/<64 hex>` is the canonical name of an eUTXO-set entry, and every
+  // other identifier a person can paste redirects into it (HashPage does the
+  // rewrite once it has classified the input). `/balance…` are the old URLs,
+  // kept working rather than 404'd: a permalink that stops resolving is how a
+  // reader concludes the balance is gone.
+  if (path === "/hash" || path === "/balance") return <BalancePage />;
   {
+    const mh = matchRoute(path, "/hash/:q");
+    if (mh) return <HashPage q={mh.q} key={"h" + mh.q} />;
     const mb = matchRoute(path, "/balance/:h");
-    if (mb) return <BalancePage initial={mb.h} key={"bal" + mb.h} />;
+    if (mb) return <HashPage q={mb.h} key={"h" + mb.h} />;
+  }
+  {
+    // An OUTPOINT, not a transaction: this chain has no transaction ids, so
+    // there is no `/tx/:id` to offer and pretending otherwise would promise a
+    // lookup `gettransaction` refuses by design.
+    const mo = matchRoute(path, "/outpoint/:txid/:vout");
+    if (mo)
+      return (
+        <OutpointPage
+          txid={mo.txid.toLowerCase()}
+          vout={Number(mo.vout)}
+          key={"o" + mo.txid + mo.vout}
+        />
+      );
   }
   if (path === "/validators") return <ValidatorsPage />;
   if (path === "/snapshot") return <SnapshotPage />;

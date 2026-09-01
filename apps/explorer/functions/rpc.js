@@ -1,67 +1,83 @@
 // Cloudflare Pages Function: /rpc  (blochl1.com, Pages project bloch-explorer)
 // ---------------------------------------------------------------------------
-// Read-only JSON-RPC passthrough to a Bloch node: an explicit read-only method
-// allowlist, a same-origin/CORS-tight surface, and no key ever exposed to the
-// browser. The upstream node RPC is READ-PUBLIC (no auth for reads); the only
-// thing this Function adds is the allowlist + shielding the node URL.
+// Read-only JSON-RPC passthrough to the Genesis-4 ARCHIVAL nodes: an explicit
+// read-only method allowlist, CORS, and failover between the two archivals.
 //
-// This is the client's fallback endpoint (src/lib/rpc.ts tier 3) and the one
-// that survives the pool decommission by construction — it lives and dies
-// with the site itself.
+// WHY THIS FUNCTION HAS TO EXIST AT ALL. The archivals answer JSON-RPC on
+// :8080 with no `Access-Control-Allow-Origin` header of any kind (measured
+// 2026-09-01), so a browser cannot call them directly however public they are.
+// This Function is the CORS boundary.
 //
-// Config (Pages project env var, Settings → Environment variables):
-//   BLOCH_RPC_URL   the upstream node RPC, e.g. http://<archival-node>:16210/.
-//                   MUST NOT be a Cloudflare-proxied hostname — a Worker
-//                   fetching a proxied host on the same account trips the 403
-//                   "error code: 1003" loop. Use a DNS-only hostname or a
-//                   direct origin.
-//                   If unset, this Function answers 503 EXPLICITLY rather than
-//                   silently trying a default that cannot work in production.
+// WHY ARCHIVALS AND NOT A VALIDATOR. A Genesis-4 node serves RPC from the
+// consensus thread itself — `EngineBackend::call` posts every request to the
+// engine's event loop and waits on it. The port has no auth and no rate limit.
+// Pointing a public web page at a validator means every reader competes with
+// block production, on a chain whose block cadence is already the thing
+// everyone is watching. The archivals propose nothing, so they can absorb it.
 //
-// NOTE (Genesis-4): the allowlist below is the Genesis-3 surface. At the V4
-// relaunch it must be rebuilt against docs/specs/BLOCH-RPC-V4.md — several
-// methods here die with PoW and the new staking/finality methods are absent.
+// WRITES ARE NOT PROXIED. `sendrawtransaction` is deliberately absent from the
+// allowlist below: it is a write, this endpoint is unauthenticated, and an
+// explorer has no business carrying one.
+//
+// UPSTREAM HOSTNAMES, NOT IPs. A Pages Function is a Worker, and a Worker
+// `fetch()` to a bare IP literal is answered by Cloudflare itself with 403
+// "error code: 1003" — it never reaches the origin. Nor may the hostname be
+// Cloudflare-PROXIED, which trips the same 1003 from the other side. So the
+// upstreams are `sslip.io` names, which resolve by DNS to the IP encoded in
+// them: `139-180-166-5.sslip.io` -> 139.180.166.5. Both were verified to
+// answer `getblockcount` on 2026-09-01. That puts a third party in the
+// resolution path; the durable fix is DNS-only A records in a zone we control,
+// exactly as `wrangler.toml` says for the Genesis-3 upstream, and it needs a
+// token with `zone:write`.
+//
+// Optional override: `BLOCH_G4_RPC_URLS`, comma-separated, replaces the list.
 // ---------------------------------------------------------------------------
 
+/**
+ * The archivals, tried in order. Both are peers/archival only.
+ * Plain http:// is deliberate: the hop is Function -> origin, server side, so
+ * there is no browser mixed-content problem. It is unencrypted, which for a
+ * read-only public chain RPC means an observer learns which entries were asked
+ * about and an on-path attacker could lie to the explorer. Neither touches
+ * keys or consensus.
+ */
+const DEFAULT_UPSTREAMS = [
+  "http://139-180-166-5.sslip.io:8080/",
+  "http://139-180-173-231.sslip.io:8080/",
+];
+
+// The Genesis-4 READ surface, taken from `route()` in
+// `crates/bloch-pos-node/src/rpc.rs`. The list that used to be here was the
+// Genesis-3 one — `getdaginfo`, `gethashrate`, `getblockbyheight`,
+// `validateaddress` and the rest died with proof of work, and every method
+// this explorer actually calls was missing from it.
+//
+// Two names are absent on purpose rather than by oversight:
+//   `sendrawtransaction`  a write; see the header.
+//   `gettransaction`      the node refuses it by design (there are no
+//                         transaction ids at this layer). It is left OUT so
+//                         the refusal comes from the node, in the node's own
+//                         words, rather than from this proxy pretending the
+//                         method does not exist — those are different
+//                         diagnoses and an integrator acts differently on each.
 const ALLOWED_METHODS = new Set([
-  // network / chain
-  "getnetworkinfo",
-  "getdaginfo",
+  // chain / head
+  "getcapabilities",
+  "getchaininfo",
   "getblockcount",
-  "getchainstats",
-  "gethashrate",
-  "getdifficultyhistory",
-  "getblocktimepercentiles",
-  "getsupplydistribution",
-  "getaddresscount",
-  // blocks
-  "getblockhash",
-  "getblock",
-  "getblockbyheight",
-  "getrecentblocks",
-  "gettxsbyblock",
-  // transactions
-  "gettransaction",
-  "gettxstatus",
-  "getrawmempool",
   "getmempoolinfo",
-  "getmempoolstats",
-  "estimatefee",
-  "estimatefeeadvanced",
-  "decoderawtransaction",
-  // addresses / utxo
+  // blocks
+  "getblockbyslot",
+  "getblockbyid",
+  // validators
+  "getvalidator",
+  "getvalidatorcount",
+  // the eUTXO set
   "getbalance",
   "getutxos",
-  "getaddressinfo",
-  "getaddressbalance_at_height",
-  "listtransactions",
-  "validateaddress",
-  "validateaddressverbose",
-  // pools / peers / misc
-  "getpools",
-  "getpeerinfo",
-  "getpeers",
-  "getattestation",
+  "listunspent",
+  "gettxout",
+  "gettransaction",
 ]);
 
 const UPSTREAM_TIMEOUT_MS = 12000;
@@ -70,6 +86,7 @@ const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type",
+  "Access-Control-Expose-Headers": "x-bloch-upstream",
 };
 
 function json(status, body) {
@@ -83,22 +100,17 @@ export async function onRequestOptions() {
   return new Response(null, { status: 204, headers: CORS });
 }
 
+function upstreams(env) {
+  const raw = env.BLOCH_G4_RPC_URLS || env.BLOCH_RPC_URL || "";
+  const list = raw
+    .split(",")
+    .map((u) => u.trim())
+    .filter(Boolean);
+  return list.length ? list : DEFAULT_UPSTREAMS;
+}
+
 export async function onRequestPost(context) {
   const { request, env } = context;
-  const upstream = env.BLOCH_RPC_URL;
-  if (!upstream) {
-    // Explicit, diagnosable failure — never a silent default. The client
-    // (src/lib/rpc.ts) treats 5xx as "endpoint down" and fails over.
-    return json(503, {
-      jsonrpc: "2.0",
-      id: null,
-      error: {
-        code: -32000,
-        message:
-          "RPC proxy not configured: set BLOCH_RPC_URL on the Pages project (Settings → Environment variables)",
-      },
-    });
-  }
 
   let body;
   try {
@@ -119,34 +131,56 @@ export async function onRequestPost(context) {
   }
 
   // Rebuild the envelope ourselves — never forward arbitrary extra fields.
-  const forward = {
+  const forward = JSON.stringify({
     jsonrpc: "2.0",
     id,
     method,
     params: Array.isArray(body.params) ? body.params : [],
-  };
+  });
 
-  const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), UPSTREAM_TIMEOUT_MS);
-  try {
-    const res = await fetch(upstream, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(forward),
-      signal: ac.signal,
-    });
-    const text = await res.text();
-    return new Response(text, {
-      status: res.status,
-      headers: { "Content-Type": "application/json", ...CORS },
-    });
-  } catch (e) {
-    return json(502, {
-      jsonrpc: "2.0",
-      id,
-      error: { code: -32000, message: `upstream unreachable: ${String(e && e.message || e)}` },
-    });
-  } finally {
-    clearTimeout(timer);
+  const targets = upstreams(env);
+  let lastError = "no upstream configured";
+
+  for (const upstream of targets) {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), UPSTREAM_TIMEOUT_MS);
+    try {
+      const res = await fetch(upstream, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: forward,
+        signal: ac.signal,
+      });
+      // A 5xx from an archival is that box having a bad time, not an answer.
+      // Move on. Any 2xx/4xx is the node speaking and is returned verbatim,
+      // including a JSON-RPC `error` object: "gettransaction is refused by
+      // design" is a real answer and asking a second node cannot improve it.
+      if (res.status >= 500) {
+        lastError = `${upstream} answered ${res.status}`;
+        continue;
+      }
+      const text = await res.text();
+      return new Response(text, {
+        status: res.status,
+        headers: {
+          "Content-Type": "application/json",
+          // Which archival answered. The explorer prints it, so a reader can
+          // tell two nodes apart when they disagree instead of assuming one
+          // anonymous "the chain".
+          "x-bloch-upstream": new URL(upstream).host,
+          ...CORS,
+        },
+      });
+    } catch (e) {
+      lastError = `${upstream}: ${String((e && e.message) || e)}`;
+    } finally {
+      clearTimeout(timer);
+    }
   }
+
+  return json(502, {
+    jsonrpc: "2.0",
+    id,
+    error: { code: -32000, message: `no archival answered (${lastError})` },
+  });
 }

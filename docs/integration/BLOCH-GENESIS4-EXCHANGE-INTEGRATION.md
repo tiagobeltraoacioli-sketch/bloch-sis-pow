@@ -602,6 +602,17 @@ divergence, not against §5.4's rewind.
 - **Re-verify before releasing funds.** Do not treat a single `finalized: true`
   reading as durable. Re-read the output with `gettxout` immediately before you
   act on it, and treat a block that has stopped being finalized as a hold.
+  **`gettxout` is not where finality comes from.** It returns exactly
+  `{txid, vout, unspent, utxo, at_slot}` — five fields, none of them
+  `finalized`, verified against the live archivals 2026-09-01. A client keying
+  settlement on `result.finalized` from this call reads `undefined`. The
+  `finalized: true` above is a *block* field (`getblockbyslot`) and the
+  authority is `getchaininfo.finalized`; `gettxout` answers one question only,
+  "is this output still unspent", and you combine the two yourself.
+  While here: `at_slot` in that reply is the **head slot the node answered
+  from** (`txout_json` emits `state.slot()` on both the found and the not-found
+  branch), not the slot the output was created in. Dating a deposit by it dates
+  it to whenever you happened to ask.
 - **Add a depth margin.** Credit at a fixed number of epochs *past* finality
   rather than at the finality boundary itself. The margin is what absorbs a
   rewind, and it is the only mechanism here that does.
