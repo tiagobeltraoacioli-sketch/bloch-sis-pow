@@ -168,7 +168,12 @@ fn print_help() {
                zeroes the IP-colocation score penalty, which otherwise\n\
                graylists a whole mesh that shares one proxy address.\n\
          \n\
-                         [--stop-at-slot <n>]\n\
+                         [--stop-at-slot <n>] [--sig-retention <r>]\n\
+               --sig-retention says how much of the chain keeps its\n\
+               proposer signatures in RAM: `finalized` (default; from the\n\
+               finalized checkpoint to the tip), a slot count, or `none`.\n\
+               `none` is replay-only and reads every signature back from\n\
+               blocks.log — the diagnostic that proves that path works.\n\
                          [--ws-checkpoint <file>] [--ws-signer-set <file>]\n\
                          [--carryover <snapshot.tsv>]\n\
                Run a validator node. <dir> must hold validator.key; chain\n\
@@ -795,6 +800,23 @@ fn run_cmd(args: &[String]) {
     }
     let stop_at_slot = arg_value(args, "--stop-at-slot").and_then(|s| s.parse::<u64>().ok());
 
+    // How much of the chain keeps its proposer signatures resident. A
+    // malformed value is refused rather than silently defaulting, for the same
+    // reason `--rpc-port` is: an operator who typed a retention meant it.
+    let sig_retention = match arg_value(args, "--sig-retention") {
+        None => engine::SigRetention::ToFinalized,
+        Some(s) => match engine::SigRetention::parse(&s) {
+            Some(r) => r,
+            None => {
+                eprintln!(
+                    "run: --sig-retention must be `finalized` (the default), a slot count, \
+                     or `none` (replay-only, forces every signature read to the log) — got `{s}`"
+                );
+                exit(2);
+            }
+        },
+    };
+
     let ws = ws_boot::WsConfig {
         checkpoint: arg_value(args, "--ws-checkpoint").map(PathBuf::from),
         signer_set: arg_value(args, "--ws-signer-set").map(PathBuf::from),
@@ -815,6 +837,34 @@ fn run_cmd(args: &[String]) {
         },
     };
 
+    // A retention other than `all` MUST NOT reach a live node, and this is a
+    // refusal rather than a warning because the failure it prevents is silent
+    // and irreversible.
+    //
+    // `Engine::blocks` is not a cache of `blocks.log` — on a reorg it is the
+    // SOURCE of it. `do_reorg` re-encodes `chain[1..]`, the whole canonical
+    // chain, out of the map and renames the result over the log
+    // (engine.rs `store.rewrite`), and `apply_canonical` appends the tip from
+    // the same map. Both go through `codec::encode_envelope`, which writes
+    // `proposer_sig`. So a node whose map has been trimmed would, on its first
+    // reorg, rewrite every historical frame WITHOUT its signature, destroy the
+    // only remaining copy of those bytes, and fail its own boot
+    // re-verification on the next restart — with no error at the moment of
+    // loss.
+    //
+    // The measurement arms are therefore confined to replay-and-exit, where
+    // `live` is false and neither writer can run.
+    if sig_retention != engine::SigRetention::Slots(u64::MAX) && stop_at_slot.is_none() {
+        eprintln!(
+            "run: --sig-retention other than `all` is a measurement mode and requires \
+             --stop-at-slot, which exits before the node goes live. A live node writes \
+             blocks.log FROM the in-memory block map (append on every block, full rewrite \
+             on every reorg), so a trimmed map would silently write signature-less frames \
+             over its own history."
+        );
+        exit(2);
+    }
+
     let cfg = engine::Config {
         data_dir: PathBuf::from(data_dir),
         genesis_path: PathBuf::from(genesis_path),
@@ -831,6 +881,7 @@ fn run_cmd(args: &[String]) {
             .unwrap_or(64),
         behind_proxy: args.iter().any(|a| a == "--behind-proxy"),
         stop_at_slot,
+        sig_retention,
         ws,
         // Required exactly when the manifest commits to a carryover; `run`
         // refuses both mismatches rather than defaulting either way.

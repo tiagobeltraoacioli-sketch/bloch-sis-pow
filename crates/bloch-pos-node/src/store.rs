@@ -24,16 +24,72 @@
 //! at most one truncated trailing frame, which replay detects and drops.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 
 use bloch_pos_committee::header::BlockEnvelope;
 
 const META_MAGIC: &[u8; 8] = b"BPOSMETA";
 
+/// Where one logged block sits in `blocks.log`, and what slot it is for.
+///
+/// `offset` points at the frame's PAYLOAD, not at its 4-byte length prefix,
+/// because the payload is what a `get-blocks` answer carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrameRef {
+    pub slot: u64,
+    pub offset: u64,
+    pub len: u32,
+}
+
+/// The log's frame table, shared with the transport's reader threads.
+///
+/// # Why this exists
+///
+/// [`Store::blocks_after`] answers a peer's `get-blocks` by walking the log
+/// **from byte 0**, parsing one header per frame until it has found the page.
+/// The comment on it argues that this is already the cheap version, and
+/// against `read_all().filter()` it is — but it is still O(chain) per request,
+/// and the requester's cost is not the interesting one. The cost lands on a
+/// peer, and the loop that asks is a timer: a node holding a sync slot re-asks
+/// every five seconds for as long as it holds one, **including after it has
+/// caught up**, when the honest answer is "nothing". So the steady state of a
+/// healthy fleet is every node making two peers read their entire block log,
+/// twelve times a minute, to return an empty page.
+///
+/// Measured end to end over the wire, on the live chain's own history
+/// (2026-09-01, 33,063 blocks / 461 MB log, idle 2-core Edgevana box, log warm
+/// in page cache — so these are the *best* case for the walk). Time to the
+/// first block of a 512-block page:
+///
+/// ```text
+///   after_slot        walk      index
+///            0      2.1 ms     2.2 ms
+///        13000     21.2 ms     2.5 ms
+///        26000     28.6 ms     4.3 ms
+///        40000     45.0 ms     2.7 ms
+///        53400     77.1 ms     2.1 ms
+/// ```
+///
+/// The walk is linear in the chain and the index is flat, which is the whole
+/// point: the useful part of the answer is 512 blocks no matter how long the
+/// chain is. The worst case is the one that is asked most often and does not
+/// appear in the table at all — `after_slot = tip`, the empty page a
+/// caught-up peer asks for twice every five seconds, for ever. That walks the
+/// entire log to conclude there is nothing to send, **and then sends nothing**,
+/// so it is invisible from both ends: the requester sees no reply either way.
+/// Served from the table it opens no file at all.
+///
+/// It is not a cache and it cannot go stale in a way that changes an answer:
+/// it is built from the log at `open`, appended to by `append`, rebuilt by
+/// `rewrite`, and every byte it names is re-read from the file at serve time.
+pub type FrameIndex = Arc<RwLock<Vec<FrameRef>>>;
+
 pub struct Store {
     dir: PathBuf,
     log: File,
+    frames: FrameIndex,
 }
 
 impl Store {
@@ -76,7 +132,20 @@ impl Store {
             .append(true)
             .read(true)
             .open(dir.join("blocks.log"))?;
-        Ok(Store { dir: dir.to_path_buf(), log })
+        let frames = Arc::new(RwLock::new(scan_frames(dir)?));
+        Ok(Store { dir: dir.to_path_buf(), log, frames })
+    }
+
+    /// The data dir this store was opened on, so a caller holding a `&Store`
+    /// can reach the log-reading free functions without carrying the path a
+    /// second time.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// The frame table, for the transport's `get-blocks` handler.
+    pub fn index(&self) -> FrameIndex {
+        Arc::clone(&self.frames)
     }
 
     /// Append one applied block. One write, then fsync — the block is only
@@ -88,8 +157,20 @@ impl Store {
         let mut frame = Vec::with_capacity(4 + payload.len());
         frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         frame.extend_from_slice(&payload);
+        // Where this frame's payload will land. Taken from the file itself,
+        // not from a running total, so the index cannot drift away from the
+        // bytes on disk if anything ever appends by another path.
+        let at = self.log.seek(SeekFrom::End(0))?;
         self.log.write_all(&frame)?;
-        self.log.sync_data()
+        self.log.sync_data()?;
+        if let Ok(mut idx) = self.frames.write() {
+            idx.push(FrameRef {
+                slot: env.header.slot,
+                offset: at + 4,
+                len: payload.len() as u32,
+            });
+        }
+        Ok(())
     }
 
     /// Read every complete frame in the log, in order.
@@ -172,6 +253,12 @@ impl Store {
             .append(true)
             .read(true)
             .open(self.dir.join("blocks.log"))?;
+        // Rebuilt, not patched: a reorg replaces the whole file, so every
+        // offset the old table held is meaningless.
+        let rebuilt = scan_frames(&self.dir)?;
+        if let Ok(mut idx) = self.frames.write() {
+            *idx = rebuilt;
+        }
         Ok(())
     }
 
@@ -349,6 +436,248 @@ impl Iterator for LogReader {
     }
 }
 
+/// Walk `blocks.log` once and record where every complete frame is.
+///
+/// Framing only: the 4-byte length, then just enough of the payload to read
+/// the header's slot, then a **seek** past the rest. Nothing is decoded and no
+/// body is copied, so this reads a fixed number of bytes per block rather than
+/// the whole file.
+///
+/// Tolerates exactly what [`Store::read_all`] and [`Store::blocks_after`]
+/// tolerate and stops in the same places: a truncated trailing frame ends the
+/// table, an over-cap length is an error. That equivalence is the whole
+/// correctness argument for serving from this table, and
+/// `indexed_and_scanned_answers_are_identical` is where it is checked rather
+/// than asserted.
+fn scan_frames(dir: &Path) -> io::Result<Vec<FrameRef>> {
+    let path = dir.join("blocks.log");
+    let file = match File::open(&path) {
+        Ok(f) => f,
+        // No log yet is not an error: a fresh data dir has an empty table.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    // Read once, up front. The per-frame alternative is a `metadata` syscall
+    // per block, which on a 33,000-block log costs more than the scan.
+    let file_len = file.metadata()?.len();
+    let mut f = io::BufReader::with_capacity(1 << 16, file);
+    let hdr_len = bloch_pos_committee::header::BlockHeaderV4::ENCODED_LEN;
+    let mut out = Vec::new();
+    let mut at: u64 = 0;
+    let mut len4 = [0u8; 4];
+    let mut head = vec![0u8; hdr_len];
+    loop {
+        match f.read_exact(&mut len4) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e),
+        }
+        let len = u32::from_le_bytes(len4) as usize;
+        if len > crate::codec::MAX_FIELD_LEN {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "log frame over cap"));
+        }
+        let end = at + 4 + len as u64;
+        // The frame is not all there: a crash mid-append. The linear scan
+        // stops here and drops it, so the table must not contain it either —
+        // otherwise a peer is served bytes that are not a block. Checked
+        // BEFORE the header is parsed, because a torn frame's first bytes
+        // still parse.
+        if end > file_len || len < hdr_len {
+            break;
+        }
+        if f.read_exact(&mut head).is_err() {
+            break;
+        }
+        let header = bloch_pos_committee::header::BlockHeaderV4::canonical_deserialize(&head)
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "undecodable header in block log")
+            })?;
+        // The body is skipped, not read: only the slot is needed here, and the
+        // bytes are re-read at serve time anyway.
+        if f.seek_relative((len - hdr_len) as i64).is_err() {
+            break;
+        }
+        out.push(FrameRef { slot: header.slot, offset: at + 4, len: len as u32 });
+        at = end;
+    }
+    Ok(out)
+}
+
+/// The indexed answer to a `get-blocks`: the same bytes
+/// [`Store::blocks_after`] returns, found by lookup instead of by walking.
+///
+/// The filter is applied to the TABLE, frame by frame in log order, with no
+/// assumption that slots increase — the linear version tests every frame's
+/// slot individually and this tests every entry's, so the two select the same
+/// frames for any log, monotonic or not. Only the selected frames are read.
+pub fn blocks_after_indexed(
+    dir: &Path,
+    index: &FrameIndex,
+    after_slot: u64,
+    limit: usize,
+) -> io::Result<Vec<Vec<u8>>> {
+    let wanted: Vec<FrameRef> = match index.read() {
+        Ok(idx) => idx
+            .iter()
+            .filter(|fr| fr.slot > after_slot)
+            .take(limit)
+            .copied()
+            .collect(),
+        // A poisoned lock is not a reason to serve a wrong answer; fall back
+        // to the walk, which needs no shared state at all.
+        Err(_) => return Store::blocks_after(dir, after_slot, limit),
+    };
+    if wanted.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut f = File::open(dir.join("blocks.log"))?;
+    let mut out = Vec::with_capacity(wanted.len());
+    for fr in wanted {
+        f.seek(SeekFrom::Start(fr.offset))?;
+        let mut payload = vec![0u8; fr.len as usize];
+        match f.read_exact(&mut payload) {
+            Ok(()) => out.push(payload),
+            // The file shrank under us (a reorg rewrote it between the table
+            // read and this one). Serving a short page is correct — the peer
+            // asks again — and is what the walk would also have done.
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(out)
+}
+
+/// The proposer signature of one logged block, read back from the log.
+///
+/// # Why this exists
+///
+/// `Engine::blocks` holds a full [`BlockEnvelope`] per block, and 86.1% of
+/// that is the proposer's hybrid ML-DSA-65 ‖ Falcon-1024 signature — 14,633 B
+/// per block with it, 2,041 B without, measured by allocator at the live
+/// block shape over 20,000 blocks. Below the finalized checkpoint nothing
+/// reads it: the RPC never names the field, a syncing peer is served from
+/// `blocks_after`/[`blocks_after_indexed`] which stream the log, fork choice
+/// projects each attestation to a 48-byte triple, and slashing evidence
+/// carries its own copies. The two readers that do want one — `replay_to` and
+/// `do_reorg` — read the chain in order, which is what this file already is.
+///
+/// So the engine drops the retained bytes and comes back here for them. That
+/// makes the retention window a **performance** parameter and not a safety
+/// one, which is the property the whole design rests on: a miss is a seek and
+/// a decode, never a wrong answer.
+///
+/// # What is returned, and what is checked
+///
+/// Only `proposer_sig`. The caller keeps its own header and body; this
+/// function's job is to hand back exactly the bytes that were discarded.
+/// The frame's header is deserialized and its [`BlockId`] compared against
+/// `id` before the signature is handed over, so a frame logged for a
+/// different block — a log rewritten under us mid-read, a slot reused across
+/// a reorg — is a miss rather than a graft. Frames are searched in log order
+/// and the first identity match wins; a canonical log holds one frame per
+/// slot, so that is normally the first candidate.
+///
+/// `Ok(None)` means the log does not hold this block. That is not an error:
+/// the caller falls back to whatever it has, and since every use of a
+/// signature ends in `Transition::apply_block`, which verifies it, a missing
+/// signature can only ever produce a **refusal**. It can never produce an
+/// acceptance, which is why no correctness argument here depends on the
+/// window being the right size.
+pub fn proposer_sig_at(
+    dir: &Path,
+    index: &FrameIndex,
+    slot: u64,
+    id: &[u8; 32],
+) -> io::Result<Option<Vec<u8>>> {
+    let candidates: Vec<FrameRef> = match index.read() {
+        Ok(idx) => idx.iter().filter(|fr| fr.slot == slot).copied().collect(),
+        // A poisoned lock must not turn into a wrong answer. Fall back to the
+        // walk, which needs no shared state at all.
+        Err(_) => return proposer_sig_scanned(dir, slot, id),
+    };
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    let mut f = File::open(dir.join("blocks.log"))?;
+    let mut payload = Vec::new();
+    for fr in candidates {
+        f.seek(SeekFrom::Start(fr.offset))?;
+        payload.clear();
+        payload.resize(fr.len as usize, 0);
+        match f.read_exact(&mut payload) {
+            Ok(()) => {}
+            // The file shrank under us: nothing to hand back, and the caller
+            // treats that as a miss.
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(e),
+        }
+        if let Some(sig) = sig_if_it_is(&payload, id) {
+            return Ok(Some(sig));
+        }
+    }
+    Ok(None)
+}
+
+/// [`proposer_sig_at`] without the table — the same answer, by walking the log.
+///
+/// Kept as the definition the indexed path is checked against
+/// (`the_index_and_the_walk_return_the_same_signature`), and used when the
+/// table's lock is poisoned.
+pub fn proposer_sig_scanned(
+    dir: &Path,
+    slot: u64,
+    id: &[u8; 32],
+) -> io::Result<Option<Vec<u8>>> {
+    let hdr_len = bloch_pos_committee::header::BlockHeaderV4::ENCODED_LEN;
+    let mut f = io::BufReader::with_capacity(1 << 16, File::open(dir.join("blocks.log"))?);
+    let mut len4 = [0u8; 4];
+    loop {
+        match f.read_exact(&mut len4) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(e),
+        }
+        let len = u32::from_le_bytes(len4) as usize;
+        if len > crate::codec::MAX_FIELD_LEN {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "log frame over cap"));
+        }
+        if len < hdr_len {
+            return Ok(None); // torn trailing frame
+        }
+        let mut payload = vec![0u8; len];
+        match f.read_exact(&mut payload) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(e),
+        }
+        // The slot filter first, so a non-matching frame costs a header parse
+        // and no envelope decode.
+        let header = bloch_pos_committee::header::BlockHeaderV4::canonical_deserialize(
+            &payload[..hdr_len],
+        )
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "undecodable header in block log"))?;
+        if header.slot != slot {
+            continue;
+        }
+        if let Some(sig) = sig_if_it_is(&payload, id) {
+            return Ok(Some(sig));
+        }
+    }
+}
+
+/// Decode one frame payload and hand back its `proposer_sig` **iff** the
+/// frame is the block `id` names. The identity check is the whole point: it
+/// is what makes a disk read incapable of grafting one block's signature onto
+/// another's header.
+fn sig_if_it_is(payload: &[u8], id: &[u8; 32]) -> Option<Vec<u8>> {
+    let env = crate::codec::decode_envelope(payload).ok()?;
+    if env.block_id().as_bytes() == id {
+        Some(env.proposer_sig)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -497,6 +826,95 @@ mod tests {
         // The append handle was reopened onto the new file.
         store.append(&sample_envelope(13)).expect("append after rewrite");
         assert_eq!(store.read_all().expect("read").len(), 4);
+    }
+
+    /// **The whole correctness argument for the index, as a test.**
+    ///
+    /// The indexed answer must equal the walked answer for every request, on
+    /// logs that break the properties an index is tempting to assume. Each
+    /// case below is a deliberate violation of one such assumption, and the
+    /// control at the end shows the test can actually fail.
+    #[test]
+    fn indexed_and_scanned_answers_are_identical() {
+        let dir = std::env::temp_dir().join(format!("bloch-pos-idx-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+
+        // VIOLATION 1: slots are NOT monotonic, and NOT contiguous. A binary
+        // search over the table would be wrong here; the filter is linear over
+        // the table for exactly this reason.
+        let slots = [4u64, 1, 9, 9, 2, 40, 7];
+        {
+            let mut store = Store::open(&dir, &[9u8; 32]).expect("open");
+            for s in slots {
+                store.append(&sample_envelope(s)).expect("append");
+            }
+        }
+        let reopened = Store::open(&dir, &[9u8; 32]).expect("reopen");
+        let idx = reopened.index();
+        assert_eq!(
+            idx.read().unwrap().len(),
+            slots.len(),
+            "the table rebuilt at open must hold every frame the log holds"
+        );
+        for after in [0u64, 1, 2, 4, 7, 9, 39, 40, 41, u64::MAX] {
+            for limit in [0usize, 1, 3, 100] {
+                let walked = Store::blocks_after(&dir, after, limit).expect("walk");
+                let looked = blocks_after_indexed(&dir, &idx, after, limit).expect("lookup");
+                assert_eq!(
+                    walked, looked,
+                    "indexed answer diverged from the walk at after={after} limit={limit}"
+                );
+            }
+        }
+
+        // VIOLATION 2: a truncated trailing frame (a crash mid-append). The
+        // walk drops it; the table must not offer it either, or a peer is
+        // served bytes that are not a block.
+        {
+            let path = dir.join("blocks.log");
+            let full = fs::metadata(&path).expect("meta").len();
+            let mut bytes = fs::read(&path).expect("read");
+            bytes.extend_from_slice(&999u32.to_le_bytes());
+            bytes.extend_from_slice(&[0xAB; 40]); // a length that is a lie
+            fs::write(&path, &bytes).expect("write");
+            assert!(fs::metadata(&path).expect("meta").len() > full);
+        }
+        let torn = Store::open(&dir, &[9u8; 32]).expect("reopen torn");
+        let torn_idx = torn.index();
+        assert_eq!(
+            torn_idx.read().unwrap().len(),
+            slots.len(),
+            "a truncated trailing frame must not enter the table"
+        );
+        for after in [0u64, 2, 9, 40] {
+            assert_eq!(
+                Store::blocks_after(&dir, after, 100).expect("walk"),
+                blocks_after_indexed(&dir, &torn_idx, after, 100).expect("lookup"),
+                "indexed answer diverged from the walk on a torn log at after={after}"
+            );
+        }
+
+        // CONTROL. If the two paths could not disagree, the assertions above
+        // would prove nothing. Hand the lookup a table built for a DIFFERENT
+        // log and it must produce a different answer — which is what makes the
+        // agreement above evidence rather than a tautology.
+        let other = dir.join("other");
+        let _ = fs::remove_dir_all(&other);
+        {
+            let mut st = Store::open(&other, &[9u8; 32]).expect("open other");
+            for s in [4u64, 1, 9, 9, 2, 40, 7] {
+                let mut e = sample_envelope(s);
+                e.header.parent = [0x5A; 32]; // different bytes, same framing
+                st.append(&e).expect("append");
+            }
+        }
+        let other_store = Store::open(&other, &[9u8; 32]).expect("reopen other");
+        assert_ne!(
+            blocks_after_indexed(&other, &other_store.index(), 0, 100).expect("lookup"),
+            Store::blocks_after(&dir, 0, 100).expect("walk"),
+            "control failed: the two logs are indistinguishable, so agreement proves nothing"
+        );
+
         let _ = fs::remove_dir_all(&dir);
     }
 
