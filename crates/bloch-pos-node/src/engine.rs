@@ -77,11 +77,12 @@ use bloch_pos_committee::schedule::first_slot_of_epoch;
 use bloch_pos_committee::transition::{CommittedState, PosTransaction, Transition};
 use bloch_pos_committee::{committees, derive, epoch_of, schedule};
 
+use crate::blockmap::BlockMap;
 use crate::genesis::{Manifest, GENESIS_MIX};
 use crate::keys::{HybridVerifier, Keystore, ProbeVerifier};
 use crate::net::{self, NetEvent, Origin, Verdict};
 use crate::rpc::{self, Admitted, Finality, Json, RpcCall, RpcError, RpcRequest, RpcResult};
-use crate::store::Store;
+use crate::store::{self, Store};
 
 /// Everything that reaches the consensus thread from outside it.
 ///
@@ -539,8 +540,17 @@ struct Engine {
     /// version of that, so there is this.
     keys: Option<Keystore>,
     /// Every structurally-valid block seen, canonical or not, by id.
-    /// Unpruned — fine for a devnet, listed as a limitation.
-    blocks: BTreeMap<[u8; 32], BlockEnvelope>,
+    ///
+    /// **Still unpruned. Nothing was deleted and nothing became
+    /// unaddressable** — `len`, `contains_key` and the set of ids answer
+    /// exactly what they answered when this was a
+    /// `BTreeMap<[u8; 32], BlockEnvelope>`. What changed is that the ~90% of
+    /// each envelope which is post-quantum signature material — verified once
+    /// at ingest, never read again — now lives in `blocks.log`, where an
+    /// identical copy of it already sat, instead of in RAM beside it. See
+    /// [`crate::blockmap`] for the composition measurement and for why this is
+    /// not the pruning that was refused.
+    blocks: BlockMap,
     /// Canonical chain, ascending slot, genesis first.
     chain: Vec<(u64, BlockId)>,
     /// Canonical ids (incl. genesis).
@@ -620,6 +630,25 @@ struct ForkChoiceInputs {
     pool: u64,
     justified: [u8; 32],
     validators: Vec<bloch_pos_committee::sample::Validator>,
+}
+
+/// What became of an attempted reorg.
+///
+/// Three outcomes, and the third is new. It used to be a `bool`, because the
+/// only two things that could happen were "adopted" and "a branch block failed
+/// validation". Serving block bytes from `blocks.log` adds a third: the branch
+/// is not wrong, this node simply cannot read something it needs. That is a
+/// sync problem, and collapsing it into `Rejected` would delete a block that
+/// nothing said was invalid — while the path that used to handle the
+/// equivalent I/O condition, `do_reorg`'s log rewrite, handled it with
+/// `process::exit(1)`. Neither is an acceptable answer to a missing block.
+#[derive(Debug, PartialEq, Eq)]
+enum Reorg {
+    Adopted,
+    /// A branch block failed validation and was removed. Recompute.
+    Rejected,
+    /// The node cannot read what it needs. Nothing was changed; sync.
+    Unavailable,
 }
 
 /// Why a transaction was turned away at the door.
@@ -714,8 +743,8 @@ impl Engine {
     /// of length one — genesis state, before any block, is small — and it is
     /// paid until the first block arrives and never again.
     fn head_state_root(&self) -> [u8; 32] {
-        match self.blocks.get(self.head_id().as_bytes()) {
-            Some(env) => env.header.state_root,
+        match self.blocks.facts(self.head_id().as_bytes()) {
+            Some(f) => f.state_root,
             None => self.state.state_root(),
         }
     }
@@ -815,11 +844,11 @@ impl Engine {
             if cur == genesis {
                 return Some(GENESIS_MIX);
             }
-            let env = self.blocks.get(&cur)?;
-            if env.header.slot < first {
-                return Some(env.header.randao_mix);
+            let f = self.blocks.facts(&cur)?;
+            if f.slot < first {
+                return Some(f.randao_mix);
             }
-            cur = env.header.parent;
+            cur = f.parent;
         }
         None
     }
@@ -967,8 +996,8 @@ impl Engine {
             .expect("randao_positioned is proposer-only");
         let mine = self.chain.iter().skip(1).filter(|(_, id)| {
             self.blocks
-                .get(id.as_bytes())
-                .is_some_and(|e| e.header.proposer_index == keys.index)
+                .facts(id.as_bytes())
+                .is_some_and(|f| f.proposer_index == keys.index)
         });
         let count = mine.count();
         let mut chain = RandaoChain::generate(keys.randao_seed);
@@ -1200,17 +1229,39 @@ impl Engine {
             }
             return;
         }
-        let env = self
-            .blocks
-            .get(id.as_bytes())
-            .expect("just ingested")
-            .clone();
-        self.net.broadcast(net::block_frame(&env));
+        // Just ingested, so it is either resident or (if it went canonical in
+        // the same breath) one hot-cache hit away. A read failure here is a
+        // lost slot, not a lost node: the block is on this node's chain and
+        // its peers will ask for it.
+        match self.blocks.envelope(id.as_bytes()) {
+            Ok(env) => self.net.broadcast(net::block_frame(&env)),
+            Err(e) => eprintln!(
+                "[slot {slot}] cannot re-read own block {} to broadcast it: {e}",
+                crate::codec::hex8(id.as_bytes())
+            ),
+        }
     }
 
     // ── Block ingestion: store, then advance canonical as far as possible ──
 
+    /// Boot replay's ingest: the block came out of `blocks.log` at `offset`,
+    /// so its bytes are already durable and already addressable and the map
+    /// records where they are instead of keeping a second copy.
+    ///
+    /// Identical to [`Engine::ingest`] in every consensus respect — same early
+    /// rejections, same `advance`, same `release_held` — and it has to be:
+    /// this is the path a restarting node takes over its whole history, and a
+    /// replay that admitted a different set of blocks than the live node did
+    /// would not be a replay.
+    fn ingest_logged(&mut self, env: BlockEnvelope, offset: u64) {
+        self.ingest_at(env, Some(offset));
+    }
+
     fn ingest(&mut self, env: BlockEnvelope) {
+        self.ingest_at(env, None);
+    }
+
+    fn ingest_at(&mut self, env: BlockEnvelope, logged_at: Option<u64>) {
         let id = *env.block_id().as_bytes();
         if self.blocks.contains_key(&id) || self.canonical.contains(&id) {
             return;
@@ -1242,7 +1293,10 @@ impl Engine {
         if env.header.slot == 0 {
             return; // genesis is synthesized, never received
         }
-        self.blocks.insert(id, env);
+        match logged_at {
+            Some(off) => self.blocks.insert_logged(id, env, off),
+            None => self.blocks.insert_resident(id, env),
+        }
         self.advance();
         // The block is queryable now, so attestations parked on it can be
         // re-run. `advance()` first: an attestation released here votes on
@@ -1313,28 +1367,60 @@ impl Engine {
     /// must sync before it can judge the branch. Returning `None` rather than
     /// guessing is the fail-closed half of the rule: a branch is adopted only
     /// after being replayed and validated in full.
-    fn path_to_canonical(&self, target: [u8; 32]) -> Option<([u8; 32], Vec<BlockEnvelope>)> {
+    /// The walk down is over [`BlockFacts`] — a parent edge is 32 bytes and
+    /// needs no envelope — and only the branch that is actually returned is
+    /// materialised. On the live chain that is the unfinalized suffix (85
+    /// blocks) and in the common case one block; it is never the whole map,
+    /// which is what the old `env.clone()` inside the walk made it on a deep
+    /// miss.
+    ///
+    /// A block whose bytes cannot be produced is `None` — the same answer as a
+    /// missing parent edge, and the same one the caller already handles by
+    /// setting `needs_sync`. This is one of the two places a store-backed map
+    /// could have turned an absent block into a panic, and it does not.
+    fn path_to_canonical(&self, target: [u8; 32]) -> Option<([u8; 32], Vec<Arc<BlockEnvelope>>)> {
         if self.canonical.contains(&target) {
             return Some((target, Vec::new()));
         }
-        let mut branch = Vec::new();
+        let mut ids = Vec::new();
         let mut cur = target;
+        let ancestor;
         // Bounded by the number of stored blocks: a cycle (which a malicious
         // peer could otherwise induce) terminates instead of hanging.
+        let mut walked = false;
         for _ in 0..=self.blocks.len() {
-            match self.blocks.get(&cur) {
-                Some(env) => {
-                    branch.push(env.clone());
-                    cur = env.header.parent;
+            match self.blocks.facts(&cur) {
+                Some(f) => {
+                    ids.push(cur);
+                    cur = f.parent;
                     if self.canonical.contains(&cur) {
-                        branch.reverse();
-                        return Some((cur, branch));
+                        walked = true;
+                        break;
                     }
                 }
                 None => return None,
             }
         }
-        None
+        if !walked {
+            return None;
+        }
+        ancestor = cur;
+        ids.reverse();
+        let mut branch = Vec::with_capacity(ids.len());
+        for id in &ids {
+            match self.blocks.envelope(id) {
+                Ok(env) => branch.push(env),
+                Err(e) => {
+                    eprintln!(
+                        "cannot read stored block {} off the log: {e} — treating the branch as \
+                         unavailable and syncing rather than adopting it",
+                        crate::codec::hex8(id)
+                    );
+                    return None;
+                }
+            }
+        }
+        Some((ancestor, branch))
     }
 
     /// Make the canonical chain equal the LMD-GHOST head.
@@ -1392,8 +1478,21 @@ impl Engine {
                 if !progressed {
                     continue;
                 }
-            } else if !self.do_reorg(ancestor, branch) {
-                continue; // offending block removed; recompute
+            } else {
+                match self.do_reorg(ancestor, branch) {
+                    Reorg::Adopted => {}
+                    // Offending block removed; recompute.
+                    Reorg::Rejected => continue,
+                    // The branch is right but this node cannot read what it
+                    // needs to adopt it. Keep the chain we have and ask the
+                    // mesh — the same response as a missing parent edge, and
+                    // NOT the `process::exit(1)` the log-rewrite path used to
+                    // reach for.
+                    Reorg::Unavailable => {
+                        self.needs_sync = true;
+                        return;
+                    }
+                }
             }
         }
     }
@@ -1541,9 +1640,17 @@ impl Engine {
                 self.pool.retain(|_, a| epoch_of(a.data.slot) >= cur_e);
 
                 if self.live {
-                    if let Err(e) = self.store.append(env) {
-                        eprintln!("FATAL: block log append failed: {e}");
-                        std::process::exit(1);
+                    match self.store.append(env) {
+                        // The bytes are now durable in `blocks.log`, so the
+                        // in-RAM copy is a duplicate of a file this process
+                        // already has open. THIS is where the 90% leaves RAM
+                        // on a running node; boot replay does the same at
+                        // `insert_logged`, having never made the copy at all.
+                        Ok(off) => self.blocks.mark_logged(id.as_bytes(), off),
+                        Err(e) => {
+                            eprintln!("FATAL: block log append failed: {e}");
+                            std::process::exit(1);
+                        }
                     }
                     let after = self.state.finality();
                     // The head root is FREE here, and it used to cost a whole
@@ -1621,11 +1728,11 @@ impl Engine {
     /// computed once; the replay recomputes it. Retention is therefore a
     /// speed decision with no consensus content, which is exactly the
     /// property `reorg_state_tests` pins.
-    fn state_at_canonical(&self, id: [u8; 32]) -> Arc<CommittedState> {
+    fn state_at_canonical(&self, id: [u8; 32]) -> Option<Arc<CommittedState>> {
         if let Some((_, st)) = self.recent_states.iter().find(|(bid, _)| *bid == id) {
-            return Arc::clone(st);
+            return Some(Arc::clone(st));
         }
-        Arc::new(self.replay_to(id))
+        self.replay_to(id).map(Arc::new)
     }
 
     /// Rebuild a canonical block's post-state from genesis, re-executing the
@@ -1635,35 +1742,56 @@ impl Engine {
     /// now the fallback for a reorg deeper than [`REORG_STATE_WINDOW`], and
     /// it is also the reference the snapshot path is tested against — the
     /// slow path staying correct is what lets the fast path be small.
-    fn replay_to(&self, id: [u8; 32]) -> CommittedState {
+    /// # Why this is `Option` now, and what replaced the `expect`
+    ///
+    /// It used to say `.expect("canonical block stored")`, which was true of a
+    /// map that held every envelope in RAM. Reading the same blocks off
+    /// `blocks.log` introduces a way for that to fail — a truncated file, a
+    /// bad sector, an offset table that a future edit forgot to update — and
+    /// **a missing block must not be a panic.** So it is a `None`, and the one
+    /// caller ([`Engine::state_at_canonical`]) propagates it to `do_reorg`,
+    /// which refuses the reorg and asks the mesh.
+    ///
+    /// The blocks are read one at a time rather than collected into a `Vec`
+    /// first. The old `prefix` vector was the entire canonical chain,
+    /// materialised whole, on a path whose whole purpose is a reorg deeper
+    /// than the snapshot ring — the moment a node can least afford a second
+    /// copy of its history. They are read **by id, in chain order**, which is
+    /// what makes this correct even when the log's order is not the chain's:
+    /// during boot replay `live` is false, so an adopted reorg leaves the log
+    /// holding the pre-reorg sequence, and only an id-keyed offset table
+    /// answers correctly there. See [`crate::blockmap::Home::Logged`].
+    fn replay_to(&self, id: [u8; 32]) -> Option<CommittedState> {
         let cut = self
             .chain
             .iter()
             .position(|(_, cid)| cid.as_bytes() == &id)
             .expect("replay target is canonical");
-        let prefix: Vec<BlockEnvelope> = self.chain[1..=cut]
-            .iter()
-            .map(|(_, cid)| {
-                self.blocks
-                    .get(cid.as_bytes())
-                    .expect("canonical block stored")
-                    .clone()
-            })
-            .collect();
         let mut st = self.manifest.genesis_state();
-        for env in &prefix {
+        for (_, cid) in &self.chain[1..=cut] {
+            let env = match self.blocks.envelope(cid.as_bytes()) {
+                Ok(env) => env,
+                Err(e) => {
+                    eprintln!(
+                        "cannot replay to {}: canonical block {} unreadable ({e})",
+                        crate::codec::hex8(&id),
+                        crate::codec::hex8(cid.as_bytes())
+                    );
+                    return None;
+                }
+            };
             let envelope = ProposalEnvelope {
                 header: env.header.clone(),
                 proposer_sig: env.proposer_sig.clone(),
             };
-            let txs = body_transactions(env)
+            let txs = body_transactions(&env)
                 .expect("a canonical block's body decoded when it was applied");
             st = self
                 .tr
                 .apply_block(&st, &envelope, &env.body.attestations, &txs)
                 .expect("canonical prefix replay cannot fail (it applied before)");
         }
-        st
+        Some(st)
     }
 
     /// Adopt `branch`, attached at canonical `ancestor`. True if adopted;
@@ -1675,7 +1803,7 @@ impl Engine {
     /// full replay of the chain. The branch is still validated block by block
     /// through the real `apply_block` — nothing about what gets adopted
     /// changes; only where the fold starts does.
-    fn do_reorg(&mut self, ancestor: [u8; 32], branch: Vec<BlockEnvelope>) -> bool {
+    fn do_reorg(&mut self, ancestor: [u8; 32], branch: Vec<Arc<BlockEnvelope>>) -> Reorg {
         // Instrumentation only; compiled out without `perf-timing`. Self time
         // only — the `apply_block` calls below are attributed to their own
         // phases, so this reads as "reorg overhead beyond re-execution". Note
@@ -1688,7 +1816,12 @@ impl Engine {
             .position(|(_, id)| id.as_bytes() == &ancestor)
             .expect("ancestor is canonical");
 
-        let base = self.state_at_canonical(ancestor);
+        let Some(base) = self.state_at_canonical(ancestor) else {
+            // The ancestor's post-state is not in the ring and the prefix
+            // could not be re-read. Nothing has been mutated yet, so keeping
+            // the current chain is a complete answer.
+            return Reorg::Unavailable;
+        };
         // Post-states of the branch, so the ring is refilled for the branch
         // that just won without recomputing anything.
         let mut applied: Vec<([u8; 32], Arc<CommittedState>)> = Vec::with_capacity(branch.len());
@@ -1701,7 +1834,7 @@ impl Engine {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("reorg candidate rejected at slot {}: {e}", env.header.slot);
-                    return false;
+                    return Reorg::Rejected;
                 }
             };
             let pre: &CommittedState = applied.last().map_or(&*base, |(_, st)| st);
@@ -1717,13 +1850,83 @@ impl Engine {
                         env.header.slot
                     );
                     self.blocks.remove(env.block_id().as_bytes());
-                    return false;
+                    return Reorg::Rejected;
                 }
             }
         }
         let st = applied
             .last()
             .map_or_else(|| Arc::clone(&base), |(_, st)| Arc::clone(st));
+
+        // ── The log rewrite is PREPARED before anything is adopted ──
+        //
+        // Two reasons, and the first is a constraint on this change: the old
+        // code adopted the branch, then built `canonical_envs` — the entire
+        // canonical chain, every block from genesis, whole, in one `Vec` — and
+        // called `store.rewrite`, whose only failure response was
+        // `process::exit(1)`. Reading those blocks off the log instead adds a
+        // way for the *materialisation* to fail, and a block this node cannot
+        // read must not become a dead node. Preparing first means such a
+        // failure costs nothing: the chain has not moved and `Unavailable`
+        // sends the node to sync.
+        //
+        // The second is the 1.2 GiB. That `Vec` was a second copy of the whole
+        // chain, taken on a live path, on a box already at its ceiling. Here
+        // every block already in the log is named by offset and copied through
+        // a 1 MiB buffer without being decoded; only the adopted branch is
+        // encoded. Memory is the branch, not the history.
+        let mut orphans: Vec<[u8; 32]> = Vec::new();
+        let mut plan: Vec<([u8; 32], Option<u64>)> = Vec::new();
+        if self.live {
+            let mut next: BTreeSet<[u8; 32]> = self.chain[1..=cut]
+                .iter()
+                .map(|(_, id)| *id.as_bytes())
+                .collect();
+            for env in &branch {
+                next.insert(*env.block_id().as_bytes());
+            }
+            // A block the rewrite is about to drop from the file keeps its
+            // bytes only if they are pulled into RAM first. `blocks` is the
+            // record of every block seen, and an orphan can be voted for and
+            // can win again; losing it would silently shrink the key set,
+            // which is the one thing this change promises not to do.
+            for (id, _) in self.blocks.iter_facts() {
+                if self.blocks.is_logged(id) && !next.contains(id) {
+                    orphans.push(*id);
+                }
+            }
+            for id in &orphans {
+                if let Err(e) = self.blocks.make_resident(id) {
+                    eprintln!(
+                        "cannot preserve orphaned block {} across the log rewrite: {e}",
+                        crate::codec::hex8(id)
+                    );
+                    return Reorg::Unavailable;
+                }
+            }
+            for (_, id) in &self.chain[1..=cut] {
+                let id = *id.as_bytes();
+                match self.blocks.log_offset(&id) {
+                    Some(off) => plan.push((id, Some(off))),
+                    None => {
+                        // Canonical but not in the log: only possible after a
+                        // boot-replay reorg, whose rewrite `live == false`
+                        // suppressed. It is resident, so it re-encodes.
+                        if !self.blocks.contains_key(&id) {
+                            eprintln!(
+                                "cannot rewrite the log: canonical block {} is not stored",
+                                crate::codec::hex8(&id)
+                            );
+                            return Reorg::Unavailable;
+                        }
+                        plan.push((id, None));
+                    }
+                }
+            }
+            for env in &branch {
+                plan.push((*env.block_id().as_bytes(), None));
+            }
+        }
 
         // Adopt.
         let old_head = self.head_slot_now();
@@ -1751,14 +1954,62 @@ impl Engine {
         let cur_e = epoch_of(self.state.slot());
         self.pool.retain(|_, a| epoch_of(a.data.slot) >= cur_e);
         if self.live {
-            let canonical_envs: Vec<BlockEnvelope> = self.chain[1..]
-                .iter()
-                .map(|(_, id)| self.blocks.get(id.as_bytes()).expect("stored").clone())
-                .collect();
-            if let Err(e) = self.store.rewrite(&canonical_envs) {
-                eprintln!("FATAL: block log rewrite failed: {e}");
-                std::process::exit(1);
+            // Resolve the plan into frame sources. Every `None` is a block the
+            // log does not have, and every one of those is resident by
+            // construction of the plan above — but the read is still checked,
+            // because "by construction" is what the `expect("stored")` this
+            // replaces also claimed.
+            let mut held: Vec<Option<Arc<BlockEnvelope>>> = Vec::with_capacity(plan.len());
+            for (id, off) in &plan {
+                if off.is_some() {
+                    held.push(None);
+                    continue;
+                }
+                match self.blocks.envelope(id) {
+                    Ok(env) => held.push(Some(env)),
+                    Err(e) => {
+                        eprintln!(
+                            "FATAL-AVOIDED: canonical block {} unreadable while rewriting the \
+                             log ({e}). The chain in RAM has already moved, so this node stops \
+                             following rather than running with a log that does not describe \
+                             it — but it stops by refusing work, not by dying mid-write.",
+                            crate::codec::hex8(id)
+                        );
+                        self.needs_sync = true;
+                        return Reorg::Adopted;
+                    }
+                }
             }
+            let srcs: Vec<store::FrameSrc<'_>> = plan
+                .iter()
+                .zip(held.iter())
+                .map(|((_, off), env)| match off {
+                    Some(o) => store::FrameSrc::Logged(*o),
+                    None => store::FrameSrc::Envelope(
+                        env.as_deref().expect("plan entry without an offset is resident"),
+                    ),
+                })
+                .collect();
+            let new_offsets = match self.store.rewrite_frames(&srcs) {
+                Ok(offs) => offs,
+                Err(e) => {
+                    // Still fatal, and deliberately: this is a WRITE failure —
+                    // a full or broken disk — not a missing block. The
+                    // distinction is the whole point of `FetchErr`.
+                    eprintln!("FATAL: block log rewrite failed: {e}");
+                    std::process::exit(1);
+                }
+            };
+            drop(held);
+            let relocated: Vec<([u8; 32], u64)> = plan
+                .iter()
+                .map(|(id, _)| *id)
+                .zip(new_offsets)
+                .collect();
+            self.blocks.relocate(&relocated);
+            // The old file is unlinked; every cached read handle and every hot
+            // envelope was addressed against it.
+            self.blocks.reopen();
             // Free for the same reason as `apply_canonical`'s: every block
             // in `branch` passed `apply_block`, so the adopted head's header
             // carries the post-state root already checked against it. Only a
@@ -1768,8 +2019,8 @@ impl Engine {
                 Some(env) => env.header.state_root,
                 None => self
                     .blocks
-                    .get(&ancestor)
-                    .map(|env| env.header.state_root)
+                    .facts(&ancestor)
+                    .map(|f| f.state_root)
                     .unwrap_or_else(|| self.state.state_root()),
             };
             println!(
@@ -1783,7 +2034,7 @@ impl Engine {
             // A reorg can move the finalized root at the anchor's epoch.
             self.enforce_ws_anchor();
         }
-        true
+        Reorg::Adopted
     }
 
     // ── Attestation admission, through the pure crate's gossip policy ───────
@@ -2017,11 +2268,22 @@ impl Engine {
     }
 
     /// Look up one block by id, genesis included.
-    fn envelope_by_id(&self, id: &[u8; 32]) -> Option<BlockEnvelope> {
+    fn envelope_by_id(&self, id: &[u8; 32]) -> Option<Arc<BlockEnvelope>> {
         if self.chain[0].1.as_bytes() == id {
-            return Some(self.genesis_envelope());
+            return Some(Arc::new(self.genesis_envelope()));
         }
-        self.blocks.get(id).cloned()
+        // An unreadable block answers the RPC the same way an unknown one
+        // does. The alternative — surfacing the I/O error as a distinct code —
+        // would tell a caller something it cannot act on and would make the
+        // method's contract depend on where the bytes happen to live.
+        match self.blocks.envelope(id) {
+            Ok(env) => Some(env),
+            Err(crate::blockmap::FetchErr::Missing) => None,
+            Err(e) => {
+                eprintln!("getblock {}: {e}", crate::codec::hex8(id));
+                None
+            }
+        }
     }
 
     fn block_reply(&self, env: &BlockEnvelope) -> Json {
@@ -2300,7 +2562,14 @@ pub fn run(cfg: Config) -> io::Result<()> {
         crate::codec::hex8(&digest),
     );
 
-    let logged = store.read_all()?;
+    // Counted, not collected. `read_all` returned a `Vec<BlockEnvelope>` — the
+    // whole chain, decoded, in RAM, alive for the entire replay ON TOP OF the
+    // map being built out of it, on top of the 400 MB `Vec<u8>` it decoded
+    // from. Three copies of the same history at the moment a node has the
+    // least room. The census reads length prefixes and seeks over the bodies,
+    // so the progress line still knows its denominator; the frames themselves
+    // are streamed below, one at a time.
+    let (n_logged, _valid_end) = store.frame_census()?;
     let head_slot = Arc::new(AtomicU64::new(0));
     // Network events queued but not yet handled. The transport reads it to
     // decide when to shed rather than queue — see `net::send_to_engine`. It is
@@ -2373,7 +2642,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         tr_probe: Transition::new(ProbeVerifier),
         verifier,
         keys,
-        blocks: BTreeMap::new(),
+        blocks: BlockMap::new(&cfg.data_dir),
         chain: vec![(0, genesis_id)],
         canonical: BTreeSet::from([*genesis_id.as_bytes()]),
         recent_states: VecDeque::new(),
@@ -2408,7 +2677,6 @@ pub fn run(cfg: Config) -> io::Result<()> {
     // no way to tell whether it was progressing, stuck, or minutes from
     // finishing. An operator needs a rate and a remainder to decide whether to
     // wait or intervene, and neither existed.
-    let n_logged = logged.len();
     if n_logged > 0 {
         println!(
             "replaying {n_logged} blocks from the log — the RPC stays silent until this finishes"
@@ -2416,8 +2684,15 @@ pub fn run(cfg: Config) -> io::Result<()> {
     }
     let replay_started = std::time::Instant::now();
     let mut last_report = replay_started;
-    for (i, env) in logged.into_iter().enumerate() {
-        engine.ingest(env);
+    // The frames stream out of the file one at a time, each with the offset it
+    // was read from, and `ingest_logged` records that offset INSTEAD of
+    // keeping the envelope: the bytes are already on this disk, in this file,
+    // and the map that used to hold a second copy of all of them now holds an
+    // offset plus the ~139 B of header fields and vote triples anything
+    // actually reads.
+    for (i, frame) in store::frames(&cfg.data_dir)?.enumerate() {
+        let (off, env) = frame?;
+        engine.ingest_logged(env, off);
         // Time-based, not every-N-blocks: block cost varies by an order of
         // magnitude with how many transactions a block carries, so a fixed
         // count reports in bursts and then goes quiet exactly when the work is
@@ -2438,9 +2713,15 @@ pub fn run(cfg: Config) -> io::Result<()> {
     }
     engine.live = true;
     if n_logged > 0 {
+        // `held whole` is the one thing left that a peer can grow without
+        // bound: blocks the log does not have, which on a healthy node is the
+        // fork overhang and on the live chain is zero. It is printed because
+        // the alternative is that it is only ever visible as RSS.
         println!(
-            "replayed {} blocks: head slot {}, state root {}, justified e{}, finalized e{}",
+            "replayed {} blocks ({} held whole): head slot {}, state root {}, justified e{}, \
+             finalized e{}",
             n_logged,
+            engine.blocks.resident_count(),
             engine.state.slot(),
             crate::codec::hex8(&engine.state.state_root()),
             engine.state.finality().justified.epoch,
@@ -2689,7 +2970,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
 /// what makes the divergence from longest-chain testable at all — see
 /// `forkchoice_tests::weight_beats_length` at the bottom of this file.
 pub fn lmd_ghost_head<'a>(
-    blocks: &BTreeMap<[u8; 32], BlockEnvelope>,
+    blocks: &BlockMap,
     pool: impl Iterator<Item = &'a Attestation>,
     validators: &[bloch_pos_committee::sample::Validator],
     justified: [u8; 32],
@@ -2710,7 +2991,7 @@ pub fn lmd_ghost_head<'a>(
 /// Test-only: the binary must not carry an O(V·D²) fork choice it can reach.
 #[cfg(test)]
 pub fn lmd_ghost_head_reference<'a>(
-    blocks: &BTreeMap<[u8; 32], BlockEnvelope>,
+    blocks: &BlockMap,
     pool: impl Iterator<Item = &'a Attestation>,
     validators: &[bloch_pos_committee::sample::Validator],
     justified: [u8; 32],
@@ -2726,7 +3007,7 @@ pub fn lmd_ghost_head_reference<'a>(
 /// message sets proves nothing.
 #[allow(clippy::type_complexity)]
 fn forkchoice_store<'a>(
-    blocks: &BTreeMap<[u8; 32], BlockEnvelope>,
+    blocks: &BlockMap,
     pool: impl Iterator<Item = &'a Attestation>,
     validators: &[bloch_pos_committee::sample::Validator],
 ) -> (
@@ -2736,9 +3017,14 @@ fn forkchoice_store<'a>(
 ) {
     let mut parents: HashMap<[u8; 32], [u8; 32]> = HashMap::new();
     let mut children: HashMap<[u8; 32], Vec<[u8; 32]>> = HashMap::new();
-    for (id, env) in blocks {
-        parents.insert(*id, env.header.parent);
-        children.entry(env.header.parent).or_default().push(*id);
+    // Over [`BlockFacts`], not envelopes: a parent edge is 32 bytes and an
+    // observed vote is a 44-byte triple, so this whole loop — which runs twice
+    // per block over every block ever seen — touches ~139 B/block instead of
+    // the ~43 KB envelope it used to walk. Same ids, same order (the map is
+    // still a `BTreeMap` keyed by id), same sibling lists.
+    for (id, f) in blocks.iter_facts() {
+        parents.insert(*id, f.parent);
+        children.entry(f.parent).or_default().push(*id);
     }
     for kids in children.values_mut() {
         kids.sort_unstable();
@@ -2752,13 +3038,17 @@ fn forkchoice_store<'a>(
     for v in validators {
         fc.set_stake(v.index, v.effective_stake);
     }
-    for env in blocks.values() {
-        for att in &env.body.attestations {
+    // The triples a block's body carried. `FcStore::observe` reads exactly
+    // `att.validator`, `att.data.slot` and `att.data.head` and nothing else —
+    // never the ≈4,589-byte signature — so the message set folded here is the
+    // same set, member for member, as when this walked the bodies.
+    for (_, f) in blocks.iter_facts() {
+        for v in f.votes.iter() {
             fc.observe(
-                att.validator,
+                v.validator,
                 LatestMessage {
-                    slot: att.data.slot,
-                    root: att.data.head,
+                    slot: v.slot,
+                    root: v.head,
                 },
             );
         }
@@ -3024,6 +3314,18 @@ mod forkchoice_tests {
         }
     }
 
+    /// A `BlockMap` over a test `BTreeMap`, every block held whole.
+    ///
+    /// The fixtures build plain maps of envelopes because that is the shape a
+    /// fork-choice question is naturally posed in, and there is no `blocks.log`
+    /// behind them to serve from. `BlockMap::in_memory` puts them in the shape
+    /// the production signature takes without introducing a file — so the
+    /// differential oracle below still feeds BOTH implementations the same
+    /// object, which is the only reason it proves anything.
+    fn fcmap(blocks: &BTreeMap<[u8; 32], BlockEnvelope>) -> BlockMap {
+        BlockMap::in_memory(blocks.iter().map(|(id, env)| (*id, env.clone())))
+    }
+
     /// Build `blocks` from `(parent, slot, marker, attestations)` tuples,
     /// returning the map and each block's id in order.
     fn chain_of(
@@ -3148,7 +3450,7 @@ mod forkchoice_tests {
             attest(3, 1, b1),
         ];
 
-        let head = lmd_ghost_head(&blocks, pool.iter(), &validators, g);
+        let head = lmd_ghost_head(&fcmap(&blocks), pool.iter(), &validators, g);
         assert_eq!(
             head, b1,
             "fork choice followed length instead of attested weight — LMD-GHOST is not wired"
@@ -3163,7 +3465,7 @@ mod forkchoice_tests {
             attest(3, 1, b1),
         ];
         assert_eq!(
-            lmd_ghost_head(&blocks, pool_flipped.iter(), &validators, g),
+            lmd_ghost_head(&fcmap(&blocks), pool_flipped.iter(), &validators, g),
             a3
         );
     }
@@ -3183,9 +3485,9 @@ mod forkchoice_tests {
 
         let validators = vals(4);
         let mut pool = vec![attest(0, 1, a1), attest(1, 1, b1), attest(2, 1, b1)];
-        let first = lmd_ghost_head(&blocks, pool.iter(), &validators, g);
+        let first = lmd_ghost_head(&fcmap(&blocks), pool.iter(), &validators, g);
         pool.reverse();
-        let second = lmd_ghost_head(&blocks, pool.iter(), &validators, g);
+        let second = lmd_ghost_head(&fcmap(&blocks), pool.iter(), &validators, g);
         assert_eq!(first, second);
     }
 
@@ -3206,7 +3508,7 @@ mod forkchoice_tests {
         let validators = vals(1);
         let mut pool = vec![attest(0, 1, a1)];
         pool.extend((100..150u32).map(|v| attest(v, 1, b1)));
-        assert_eq!(lmd_ghost_head(&blocks, pool.iter(), &validators, g), a1);
+        assert_eq!(lmd_ghost_head(&fcmap(&blocks), pool.iter(), &validators, g), a1);
     }
 
     /// An equivocator is barred entirely, not counted for either side. With the
@@ -3224,7 +3526,7 @@ mod forkchoice_tests {
         let validators = vals(2);
         // Validator 1 signs both heads in the same slot; validator 0 backs a1.
         let pool = vec![attest(0, 1, a1), attest(1, 1, a1), attest(1, 1, b1)];
-        let head = lmd_ghost_head(&blocks, pool.iter(), &validators, g);
+        let head = lmd_ghost_head(&fcmap(&blocks), pool.iter(), &validators, g);
         assert_eq!(
             head, a1,
             "the equivocator was counted, or the honest vote was dropped"
@@ -3330,8 +3632,8 @@ mod forkchoice_tests {
 
             for justified in [g, ids[rng.below(ids.len() as u64) as usize]] {
                 assert_eq!(
-                    lmd_ghost_head(&blocks, pool.iter(), &validators, justified),
-                    lmd_ghost_head_reference(&blocks, pool.iter(), &validators, justified),
+                    lmd_ghost_head(&fcmap(&blocks), pool.iter(), &validators, justified),
+                    lmd_ghost_head_reference(&fcmap(&blocks), pool.iter(), &validators, justified),
                     "round {round}: the rewritten fork choice selected a \
                      different head than the one it replaced"
                 );
@@ -3368,8 +3670,8 @@ mod forkchoice_tests {
         let with_pool: Vec<Attestation> = carried.clone();
         let without_pool: Vec<Attestation> = Vec::new();
         assert_eq!(
-            lmd_ghost_head(&blocks, with_pool.iter(), &validators, g),
-            lmd_ghost_head(&blocks, without_pool.iter(), &validators, g),
+            lmd_ghost_head(&fcmap(&blocks), with_pool.iter(), &validators, g),
+            lmd_ghost_head(&fcmap(&blocks), without_pool.iter(), &validators, g),
             "dropping from the pool an attestation the stored block {} still \
              carries moved the head — `fc_covered_removals` would be unsound",
             crate::codec::hex8(&carrier)
@@ -3391,12 +3693,12 @@ mod forkchoice_tests {
         };
         let loose = vec![attest(0, 1, smaller)];
         assert_eq!(
-            lmd_ghost_head(&bare, loose.iter(), &validators, g),
+            lmd_ghost_head(&fcmap(&bare), loose.iter(), &validators, g),
             smaller,
             "the loose vote did not carry its block"
         );
         assert_eq!(
-            lmd_ghost_head(&bare, [].iter(), &validators, g),
+            lmd_ghost_head(&fcmap(&bare), [].iter(), &validators, g),
             larger,
             "the control is not controlling: dropping an uncarried \
              attestation must be able to move the head, or the epoch `retain` \
@@ -3449,11 +3751,11 @@ mod forkchoice_tests {
                 .collect();
 
             let t = Instant::now();
-            let new_head = lmd_ghost_head(&blocks, pool.iter(), &validators, g);
+            let new_head = lmd_ghost_head(&fcmap(&blocks), pool.iter(), &validators, g);
             let new_ms = t.elapsed().as_secs_f64() * 1000.0;
 
             let t = Instant::now();
-            let old_head = lmd_ghost_head_reference(&blocks, pool.iter(), &validators, g);
+            let old_head = lmd_ghost_head_reference(&fcmap(&blocks), pool.iter(), &validators, g);
             let old_ms = t.elapsed().as_secs_f64() * 1000.0;
 
             // Split the surviving cost, because there are two of them and only
@@ -3463,7 +3765,7 @@ mod forkchoice_tests {
             // chain length), and `Store::head` then walks it. Reporting the
             // total alone would hide which one is left.
             let t = Instant::now();
-            let (fc, parents, children) = forkchoice_store(&blocks, pool.iter(), &validators);
+            let (fc, parents, children) = forkchoice_store(&fcmap(&blocks), pool.iter(), &validators);
             let build_ms = t.elapsed().as_secs_f64() * 1000.0;
             let tree = BlockTree { parents: &parents };
             let t = Instant::now();
@@ -3919,7 +4221,7 @@ mod transfer_v2_end_to_end {
             tr_probe: Transition::new(ProbeVerifier),
             verifier,
             keys: None,
-            blocks: BTreeMap::new(),
+            blocks: BlockMap::new(&dir),
             chain: vec![(0, genesis_id)],
             canonical: BTreeSet::from([*genesis_id.as_bytes()]),
             recent_states: VecDeque::new(),
@@ -4211,7 +4513,7 @@ mod perf_support {
             tr_probe: Transition::new(ProbeVerifier),
             verifier,
             keys: Some(ks),
-            blocks: BTreeMap::new(),
+            blocks: BlockMap::new(&dir),
             chain: vec![(0, genesis_id)],
             canonical: BTreeSet::from([*genesis_id.as_bytes()]),
             recent_states: VecDeque::new(),
@@ -4287,7 +4589,7 @@ mod root_budget_tests {
         // whole basis for deleting the computation.
         let head = engine
             .blocks
-            .get(engine.head_id().as_bytes())
+            .envelope(engine.head_id().as_bytes())
             .expect("the adopted block is stored");
         let recomputed_before = root_computations();
         assert_eq!(
@@ -5325,13 +5627,14 @@ mod reorg_state_tests {
         let fork_point = *engine.head_id().as_bytes();
 
         engine.propose(2);
-        let rival = engine
+        let rival = (*engine
             .blocks
-            .get(engine.head_id().as_bytes())
-            .expect("the rival was just proposed and adopted")
-            .clone();
-        assert!(
+            .envelope(engine.head_id().as_bytes())
+            .expect("the rival was just proposed and adopted"))
+        .clone();
+        assert_eq!(
             engine.do_reorg(fork_point, Vec::new()),
+            Reorg::Adopted,
             "handing the rival back must succeed"
         );
         assert_eq!(
@@ -5352,17 +5655,18 @@ mod reorg_state_tests {
         // `assert_ne!` fixture guard below, which is the entire reason that
         // guard is there.
         let rival_id = *rival.block_id().as_bytes();
-        engine
-            .blocks
-            .remove(&rival_id)
-            .expect("the rival is stored until this line removes it");
+        assert!(
+            engine.blocks.contains_key(&rival_id),
+            "the rival is stored until this line removes it"
+        );
+        engine.blocks.remove(&rival_id);
 
         for slot in 3..3 + depth {
             engine.propose(slot);
         }
 
         // Back in: the test needs it stored to reorg onto it.
-        engine.blocks.insert(rival_id, rival.clone());
+        engine.blocks.insert_resident(rival_id, rival.clone());
         assert!(
             !engine.canonical.contains(&rival_id),
             "the rival must be off the canonical chain when the fixture is handed over"
@@ -5410,8 +5714,8 @@ mod reorg_state_tests {
                  cases below would never exercise the replay fallback"
             );
             assert_eq!(
-                *engine.state_at_canonical(id),
-                engine.replay_to(id),
+                *engine.state_at_canonical(id).expect("stored"),
+                engine.replay_to(id).expect("stored"),
                 "depth {depth}: the snapshot and the replay-from-genesis \
                  disagree about the same block's post-state"
             );
@@ -5432,7 +5736,7 @@ mod reorg_state_tests {
             let (mut engine, _dir, fork_point, rival) = forked(depth);
 
             let expected = {
-                let base = engine.replay_to(fork_point);
+                let base = engine.replay_to(fork_point).expect("stored");
                 let envelope = ProposalEnvelope {
                     header: rival.header.clone(),
                     proposer_sig: rival.proposer_sig.clone(),
@@ -5464,8 +5768,9 @@ mod reorg_state_tests {
                 "depth {depth}: the fork point should be retained iff it is inside the window"
             );
 
-            assert!(
-                engine.do_reorg(fork_point, vec![rival.clone()]),
+            assert_eq!(
+                engine.do_reorg(fork_point, vec![Arc::new(rival.clone())]),
+                Reorg::Adopted,
                 "depth {depth}: the reorg must be adopted"
             );
             assert_eq!(
@@ -5489,7 +5794,7 @@ mod reorg_state_tests {
             for (id, st) in engine.recent_states.iter() {
                 assert_eq!(
                     **st,
-                    engine.replay_to(*id),
+                    engine.replay_to(*id).expect("stored"),
                     "depth {depth}: the ring kept a post-state that is not this block's"
                 );
                 assert!(
@@ -5539,8 +5844,8 @@ mod head_root_tests {
         let head = engine.head_id();
         let env = engine
             .blocks
-            .get(head.as_bytes())
-            .unwrap_or_else(|| panic!("{ctx}: the head must be a stored block here"));
+            .envelope(head.as_bytes())
+            .unwrap_or_else(|_| panic!("{ctx}: the head must be a stored block here"));
         let computed = engine.state.state_root();
         assert_eq!(
             env.header.state_root, computed,
@@ -5650,8 +5955,9 @@ mod head_root_tests {
                 saw_replay_fallback = true;
             }
 
-            assert!(
-                engine.do_reorg(fork_point, vec![rival.clone()]),
+            assert_eq!(
+                engine.do_reorg(fork_point, vec![Arc::new(rival.clone())]),
+                Reorg::Adopted,
                 "{ctx}: the reorg must be adopted"
             );
 
@@ -5710,8 +6016,9 @@ mod head_root_tests {
         let ahead = assert_invariant(&engine, "one block above the fork point");
         assert_ne!(at_fork, ahead, "fixture: the second block must move the root");
 
-        assert!(
+        assert_eq!(
             engine.do_reorg(fork_point, Vec::new()),
+            Reorg::Adopted,
             "handing the block back must succeed"
         );
         assert_eq!(
@@ -5739,12 +6046,12 @@ mod head_root_tests {
     fn at_boot_the_head_is_genesis_and_genesis_has_no_stored_header() {
         let (engine, _dir) = perf_support::proposing_engine();
         assert!(
-            engine.blocks.is_empty(),
+            engine.blocks.len() == 0,
             "a fresh engine has no stored blocks"
         );
         assert_eq!(engine.chain.len(), 1, "the chain is genesis alone");
         assert!(
-            engine.blocks.get(engine.head_id().as_bytes()).is_none(),
+            !engine.blocks.contains_key(engine.head_id().as_bytes()),
             "genesis is synthesized and is never in `blocks` — the header lookup MUST \
              miss here, and the fallback below is what answers"
         );
@@ -5883,7 +6190,7 @@ mod duty_view_anchor {
             tr_probe: Transition::new(ProbeVerifier),
             verifier,
             keys: Some(ks0),
-            blocks: BTreeMap::new(),
+            blocks: BlockMap::new(&dir.0),
             chain: vec![(0, genesis_id)],
             canonical: BTreeSet::from([*genesis_id.as_bytes()]),
             recent_states: VecDeque::new(),
@@ -5936,8 +6243,9 @@ mod duty_view_anchor {
         // three blocks less of it. This is what "a node that is behind" is.
         let ancestor = *engine.chain[engine.chain.len() - 4].1.as_bytes();
         let before = engine.chain.len();
-        assert!(
+        assert_eq!(
             engine.do_reorg(ancestor, Vec::new()),
+            Reorg::Adopted,
             "handing three blocks back on the node's own branch must succeed"
         );
         assert_eq!(engine.chain.len(), before - 3);
@@ -5974,3 +6282,192 @@ mod duty_view_anchor {
     }
 }
 
+
+/// The three things a store-backed `blocks` had to be forced to get right,
+/// each proved by breaking it.
+///
+/// The map now answers `envelope` from a file, so three failure modes exist
+/// that could not exist when it answered from RAM: the log rewrite can drop a
+/// block that is still in the map, a canonical block can become unreadable,
+/// and the log's byte layout can be torn by a crash. The first would shrink
+/// the key set silently; the other two used to be impossible and their
+/// nearest analogues in the old code were `.expect("canonical block stored")`
+/// and `process::exit(1)`.
+#[cfg(test)]
+mod store_backed_tests {
+    use super::reorg_state_tests::forked;
+    use super::*;
+
+    /// A reorg rewrites the log to the winning chain. The blocks it drops are
+    /// still in `blocks`, and they must still be READABLE — `judge` answers
+    /// `known` from this map, an orphan can be voted for, and an orphan can
+    /// win again.
+    ///
+    /// Without the promote-to-resident pass in `do_reorg` this fails: the
+    /// entry survives (so `contains_key` still says yes) but its bytes were
+    /// just deleted from the file its offset points into, and `envelope`
+    /// returns `Missing` — the key set intact and its contents gone, which is
+    /// the worst of both.
+    #[test]
+    fn a_reorg_keeps_the_blocks_it_orphans_readable() {
+        let (mut engine, _dir, fork_point, rival) = forked(3);
+        assert!(engine.live, "the rewrite path only runs live");
+
+        // The canonical blocks above the fork point are the ones about to be
+        // orphaned. Record them, with their bodies, before the reorg.
+        let doomed: Vec<Arc<BlockEnvelope>> = engine.chain[1..]
+            .iter()
+            .filter(|(_, id)| *id.as_bytes() != fork_point)
+            .map(|(_, id)| engine.blocks.envelope(id.as_bytes()).expect("canonical, stored"))
+            .filter(|env| env.header.slot > 1)
+            .collect();
+        assert!(!doomed.is_empty(), "fixture: the reorg must orphan something");
+
+        assert_eq!(
+            engine.do_reorg(fork_point, vec![Arc::new(rival.clone())]),
+            Reorg::Adopted
+        );
+
+        for env in &doomed {
+            let id = *env.block_id().as_bytes();
+            assert!(
+                !engine.canonical.contains(&id),
+                "fixture: the block really was orphaned"
+            );
+            assert!(
+                engine.blocks.contains_key(&id),
+                "an orphan stays in the map — nothing is pruned"
+            );
+            let got = engine
+                .blocks
+                .envelope(&id)
+                .expect("an orphan's bytes survive the rewrite that dropped them from the log");
+            assert_eq!(got.header, env.header);
+            assert_eq!(
+                got.proposer_sig, env.proposer_sig,
+                "whole, not just the header"
+            );
+        }
+    }
+
+    /// The log rewrite is byte-exact for every block that did not move.
+    ///
+    /// `rewrite_frames` copies logged frames verbatim instead of decoding and
+    /// re-encoding them. That is only sound if the copy is the same bytes, so
+    /// the prefix of the log below the fork point is compared before and
+    /// after.
+    #[test]
+    fn the_rewrite_copies_unmoved_frames_byte_for_byte() {
+        let (mut engine, dir, fork_point, rival) = forked(2);
+        let log = dir.0.join("blocks.log");
+        let before = std::fs::read(&log).expect("read the log");
+        // The fork point is the first block; its frame is the head of the file
+        // and must survive the rewrite untouched.
+        let first_len = 4 + u32::from_le_bytes(before[..4].try_into().unwrap()) as usize;
+        assert_eq!(
+            engine.do_reorg(fork_point, vec![Arc::new(rival)]),
+            Reorg::Adopted
+        );
+        let after = std::fs::read(&log).expect("read the log");
+        assert_eq!(
+            &after[..first_len],
+            &before[..first_len],
+            "a frame the reorg did not touch is copied, not re-encoded"
+        );
+    }
+
+    /// **A canonical block this node cannot read must not kill it.**
+    ///
+    /// The old `replay_to` said `.expect("canonical block stored")` and the
+    /// old log rewrite said `process::exit(1)`. Both were defensible over a
+    /// map that held every envelope in RAM; neither is defensible over a file.
+    /// Here the file is removed under a running engine — the crudest possible
+    /// version of a bad sector — and the node is required to answer
+    /// `Unavailable` and ask the mesh.
+    #[test]
+    fn an_unreadable_canonical_block_is_a_sync_problem_not_a_panic() {
+        let (mut engine, dir, fork_point, rival) = forked(REORG_STATE_WINDOW as u64 + 2);
+
+        // Deeper than the snapshot ring, so the reorg must take the
+        // replay-from-genesis path and really does need to read the log.
+        assert!(
+            !engine
+                .recent_states
+                .iter()
+                .any(|(id, _)| *id == fork_point),
+            "fixture: the fork point must be outside the retention window"
+        );
+        // Control: with the log intact the reorg is adopted.
+        {
+            let (mut ok_engine, _ok_dir, ok_fork, ok_rival) =
+                forked(REORG_STATE_WINDOW as u64 + 2);
+            assert_eq!(
+                ok_engine.do_reorg(ok_fork, vec![Arc::new(ok_rival)]),
+                Reorg::Adopted,
+                "control: the same fixture with a readable log adopts"
+            );
+        }
+
+        std::fs::remove_file(dir.0.join("blocks.log")).expect("remove the log");
+        engine.blocks.reopen();
+
+        assert!(
+            engine.replay_to(fork_point).is_none(),
+            "replay_to reports the failure instead of unwrapping it"
+        );
+        assert!(
+            engine.state_at_canonical(fork_point).is_none(),
+            "and so does the caller between it and do_reorg"
+        );
+        let head_before = *engine.head_id().as_bytes();
+        assert_eq!(
+            engine.do_reorg(fork_point, vec![Arc::new(rival)]),
+            Reorg::Unavailable,
+            "the reorg is refused — not adopted, and not treated as an invalid branch"
+        );
+        assert_eq!(
+            *engine.head_id().as_bytes(),
+            head_before,
+            "and nothing moved: refusing costs the node its chain, not its state"
+        );
+    }
+
+    /// `advance` turns that refusal into a sync request rather than a spin or
+    /// a silent stall.
+    #[test]
+    fn advance_asks_the_mesh_when_a_branch_cannot_be_read() {
+        let (mut engine, dir, _fork_point, rival) = forked(REORG_STATE_WINDOW as u64 + 2);
+        let rival_id = *rival.block_id().as_bytes();
+        // Make the rival the fork-choice winner by voting for it with the
+        // whole registry, so `advance` will try to adopt it.
+        for v in engine.state.active_validators() {
+            let att = Attestation {
+                data: AttestationData {
+                    slot: rival.header.slot,
+                    head: rival_id,
+                    source_epoch: 0,
+                    source_root: [0; 32],
+                    target_epoch: 0,
+                    target_root: rival_id,
+                },
+                validator: v.index,
+                signature: Vec::new(),
+            };
+            engine.pool.insert((v.index, att.data.signing_root()), att);
+        }
+        std::fs::remove_file(dir.0.join("blocks.log")).expect("remove the log");
+        engine.blocks.reopen();
+        engine.needs_sync = false;
+
+        engine.advance();
+
+        assert!(
+            engine.needs_sync,
+            "a branch that cannot be read sends the node to sync"
+        );
+        assert!(
+            engine.blocks.contains_key(&rival_id),
+            "and does NOT delete the block, which nothing said was invalid"
+        );
+    }
+}

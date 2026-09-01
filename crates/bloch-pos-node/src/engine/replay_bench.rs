@@ -116,6 +116,7 @@ use bloch_pos_committee::{committees, derive, epoch_of, fee_market, schedule};
 use sha3::{Digest, Sha3_256};
 
 use super::{now_ms, Engine, StateCell};
+use crate::blockmap::BlockMap;
 use crate::genesis::{Manifest, ManifestValidator, GENESIS_MIX};
 use crate::keys::{HybridVerifier, Keystore, ProbeVerifier};
 use crate::net;
@@ -640,7 +641,7 @@ fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
         tr_probe: Transition::new(ProbeVerifier),
         verifier,
         keys: None, // observer: replay proposes nothing and attests nothing
-        blocks: BTreeMap::new(),
+        blocks: BlockMap::new(dir),
         chain: vec![(0, genesis_id)],
         canonical: BTreeSet::from([*genesis_id.as_bytes()]),
         // Both of these mirror `boot`'s literal exactly, and they have to:

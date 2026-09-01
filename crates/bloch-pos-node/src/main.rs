@@ -42,6 +42,7 @@
 //! `main.rs` is the composition root (PMO change-controlled; §9.4 two-reviewer
 //! rule once integration review starts).
 
+mod blockmap;
 mod codec;
 mod engine;
 mod genesis;
