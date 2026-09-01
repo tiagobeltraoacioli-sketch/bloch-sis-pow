@@ -74,6 +74,9 @@ export function createFaucetServer(cfg: FaucetConfig, faucet: Faucet, limiter: R
           perAddressWindowMs: cfg.perAddressWindowMs,
           perIpWindowMs: cfg.perIpWindowMs,
           perIpMax: cfg.perIpMax,
+          globalWindowMs: cfg.globalWindowMs,
+          globalMaxSats: cfg.globalMaxSats,
+          globalSpentSats: limiter.spentSats(),
           rails: "SCAFFOLD/reference, unaudited, testnet-only; test BLCH has no value; BLCH is not a security.",
         });
         return;
@@ -83,19 +86,27 @@ export function createFaucetServer(cfg: FaucetConfig, faucet: Faucet, limiter: R
         let address = "";
         try {
           const raw = await readBody(req);
-          const parsed = raw ? (JSON.parse(raw) as { address?: string }) : {};
-          address = (parsed.address ?? "").trim();
+          const parsed = raw ? (JSON.parse(raw) as { address?: string; scriptHash?: string }) : {};
+          // Either name works. `scriptHash` is the primary form — it is what
+          // `bloch-pos spendkey` prints and the only form a native Genesis-4
+          // key has — and `address` is kept for carryover-style addresses.
+          address = (parsed.scriptHash ?? parsed.address ?? "").trim();
         } catch (e) {
           json(res, 400, { ok: false, error: `bad request body: ${e instanceof Error ? e.message : e}` });
           return;
         }
         if (!address) {
-          json(res, 400, { ok: false, error: "missing 'address'", code: "bad_request" });
+          json(res, 400, { ok: false, error: "missing 'scriptHash' (or 'address')", code: "bad_request" });
           return;
         }
 
-        // Rate limit BEFORE doing work.
-        const decision = limiter.check(address, ip);
+        // Reserve BEFORE doing work, and reserve ATOMICALLY. The previous
+        // shape (check here, record after the await) let every request that
+        // arrived during the payment see an un-recorded quota: 47 of 100
+        // concurrent requests for one address all paid out. `reserve` decides
+        // and records in one synchronous step, so the second request sees the
+        // first one's reservation.
+        const decision = limiter.reserve(address, ip, cfg.amountSats);
         if (!decision.allowed) {
           const retryS = Math.ceil((decision.retryAfterMs ?? 0) / 1000);
           res.setHeader("retry-after", String(retryS));
@@ -108,11 +119,25 @@ export function createFaucetServer(cfg: FaucetConfig, faucet: Faucet, limiter: R
           return;
         }
 
-        const result = await faucet.drip(address);
+        const ticket = decision.ticket!;
+        let result;
+        try {
+          result = await faucet.drip(address);
+        } catch (e) {
+          // A thrown signer/transport fault must not leave the address locked
+          // out for a day for a failure that was ours.
+          limiter.release(ticket);
+          throw e;
+        }
         if (result.ok) {
-          limiter.record(address, ip);
+          limiter.commit(ticket);
           json(res, 200, result);
         } else {
+          // Release gives back the address cooldown and the spend, but NOT the
+          // per-IP hit — the attempt still cost the node and this host real
+          // work, and refunding it is what made failing requests an unlimited
+          // free DoS against both.
+          limiter.release(ticket);
           const status = result.code === "faucet_empty" || result.code === "node_error" ? 503 : 400;
           json(res, status, result);
         }

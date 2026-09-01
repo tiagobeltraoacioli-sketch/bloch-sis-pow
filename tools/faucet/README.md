@@ -129,3 +129,56 @@ emitted JS from `dist/` (NodeNext `.js` import specifiers).
 
 This is the **community edition**. Do not refer to it as "Postern OS", and never
 use the name "BABA YAGA".
+
+## Status, honestly
+
+This service is a **reference implementation that has never been run against a
+live Genesis-4 node.** Two classes of defect were found and fixed in
+2026-08-31; the second one is the reason for the warning above.
+
+### Fixed: the rate limiter was decorative
+
+The previous limiter checked the quota, awaited the payment, and only then
+recorded the hit — so every request arriving inside that window saw an
+un-recorded quota. Measured: **47 of 100 concurrent requests for one address
+all paid out.** Three further bypasses existed alongside it: address keys were
+not case-normalised (Bloch addresses are checksum-case-insensitive, so one
+address had ~2^40 spellings, each with its own 24 h quota), failed requests
+were never recorded at all (making them an unbounded free DoS against both this
+host and the node), and there was no global ceiling of any kind.
+
+`RateLimiter` now reserves atomically and the caller settles the ticket:
+`commit()` on payout, `release()` on failure. `release()` returns the address
+cooldown and the spend but **not** the per-IP hit, so the IP budget bounds work
+done rather than money paid. A rolling global ceiling bounds the sum across all
+clients. All of this is covered by `npm run selftest`.
+
+State is still process-local, so **a restart clears every cooldown.** That is
+acceptable only because the coins are worthless.
+
+### Fixed: the RPC surface did not exist
+
+This client was written against four methods the Genesis-4 node does not
+implement — `validateaddress`, `getnetworkinfo`, `gettxstatus`, and
+`getutxos(address)`. The node's actual `getutxos`/`listunspent` takes a
+**32-byte `script_hash` as 64 hex**, never an address, and there is no
+address-validation RPC at all. The LIVE path could not have completed a single
+drip.
+
+The recipient model was wrong for the same reason. An address carries a
+20-byte hash; a native Genesis-4 key's `script_hash` is `SHA3-256(pubkey)`, a
+full 32 bytes with **no address encoding**. A partner who follows the
+onboarding guide (`keygen`, then `spendkey`) has a `script_hash` that could not
+be expressed as an address, so an address-only faucet could never have funded
+them. `script_hash` is now the primary input form; `bloch1t…` addresses are
+still accepted and zero-extended the way the chain does it.
+
+### Still open
+
+- **No signer ships.** `FAUCET_SIGNER_CMD` is a seam, not an implementation.
+  Building one means computing the fee exactly (`gas = 5,000 + tx_bytes×16 +
+  72,748 per signature`, priced at the base fee from `getchaininfo`), and it
+  must be validated against a live node before it is trusted with coins. It was
+  deliberately not written blind.
+- **Never commissioned.** Nothing here has been exercised end to end against a
+  real node. Do not enable LIVE mode until it has been.

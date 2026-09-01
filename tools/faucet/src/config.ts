@@ -15,10 +15,21 @@ function envInt(name: string, fallback: number): number {
   return Number.isFinite(n) ? Math.trunc(n) : fallback;
 }
 
+/**
+ * Strict boolean. FAIL-CLOSED on anything unrecognised: the only flag this
+ * parses is the one that decides whether the service spends real coins, and
+ * the old lenient form treated `FAUCET_DRY_RUN=treu` as `false` and booted
+ * LIVE. A typo must never be the thing that arms a payout.
+ */
 function envBool(name: string, fallback: boolean): boolean {
   const v = process.env[name];
   if (v === undefined || v === "") return fallback;
-  return /^(1|true|yes|on)$/i.test(v);
+  if (/^(1|true|yes|on)$/i.test(v)) return true;
+  if (/^(0|false|no|off)$/i.test(v)) return false;
+  throw new Error(
+    `${name}=${JSON.stringify(v)} is not a boolean. Use one of 1/true/yes/on or 0/false/no/off. ` +
+      `Refusing to guess, because guessing wrong here means spending coins.`,
+  );
 }
 
 export interface FaucetConfig {
@@ -35,6 +46,8 @@ export interface FaucetConfig {
   perAddressWindowMs: number;
   perIpWindowMs: number;
   perIpMax: number;
+  globalWindowMs: number;
+  globalMaxSats: number;
 }
 
 export function loadConfig(): FaucetConfig {
@@ -53,5 +66,12 @@ export function loadConfig(): FaucetConfig {
     perAddressWindowMs: envInt("FAUCET_PER_ADDRESS_WINDOW_MS", 86_400_000),
     perIpWindowMs: envInt("FAUCET_PER_IP_WINDOW_MS", 3_600_000),
     perIpMax: envInt("FAUCET_PER_IP_MAX", 5),
+    // Drain ceiling across ALL clients. The per-address and per-IP limits bound
+    // ONE client; nothing bounded the sum of them, and an attacker with a
+    // routed IPv6 /64 has 2^64 distinct per-IP keys. Default 500 BLCH per
+    // rolling 24 h: generous for a partner integrating a withdrawal flow
+    // (500 drips at the 1 BLCH default), and a bounded loss if abused.
+    globalWindowMs: envInt("FAUCET_GLOBAL_WINDOW_MS", 86_400_000),
+    globalMaxSats: envInt("FAUCET_GLOBAL_MAX_SATS", 50_000_000_000),
   };
 }

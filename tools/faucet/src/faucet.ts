@@ -7,7 +7,7 @@
 // zero-security testnet.
 
 import type { FaucetConfig } from "./config.js";
-import { isTestnetAddress, parseAddress } from "./address.js";
+import { addressScriptHash, parseRecipient } from "./address.js";
 import { RpcClient, RpcError, parseSats, type Utxo } from "./rpc.js";
 import type { PaymentJob, Signer } from "./signer.js";
 
@@ -16,6 +16,8 @@ export interface DripSuccess {
   txid: string;
   amountSats: number;
   toAddress: string;
+  /** The 32-byte script_hash actually paid, as 64 hex. */
+  scriptHash: string;
   dryRun: boolean;
   signer: string;
 }
@@ -57,27 +59,35 @@ export class Faucet {
     return null;
   }
 
-  async drip(toAddress: string): Promise<DripResult> {
-    // 1) Local checksum + prefix check (must be testnet).
-    const parsed = parseAddress(toAddress);
-    if (!parsed) return { ok: false, error: "invalid or malformed address", code: "bad_address" };
-    if (parsed.network !== "testnet" || !isTestnetAddress(toAddress)) {
-      return { ok: false, error: "faucet is testnet-only; expected a bloch1t… address", code: "not_testnet" };
+  async drip(to: string): Promise<DripResult> {
+    // 1) Resolve the recipient. Two accepted forms — a 64-hex script_hash (what
+    //    `bloch-pos spendkey` prints, and the ONLY form a native Genesis-4 key
+    //    has) or a `bloch1t…` carryover address, which is zero-extended to 32
+    //    bytes the way the chain does it.
+    const rcpt = parseRecipient(to);
+    if (!rcpt) {
+      return {
+        ok: false,
+        error:
+          "expected a 64-hex script_hash (from `bloch-pos spendkey`) or a bloch1t… address",
+        code: "bad_address",
+      };
+    }
+    // An address must be testnet-prefixed. A bare script_hash has no network
+    // marker and cannot be checked — see `parseRecipient` for why that is safe
+    // in the receiving direction.
+    if (rcpt.kind === "address" && !rcpt.address!.startsWith("bloch1t")) {
+      return {
+        ok: false,
+        error: "faucet is testnet-only; a bloch1q… mainnet address is refused",
+        code: "not_testnet",
+      };
     }
 
-    // 2) Ask the node too, when reachable (authoritative). Tolerate node-down.
-    try {
-      const v = await this.rpc.validateAddress(toAddress);
-      if (!v.isvalid) return { ok: false, error: "node rejected address as invalid", code: "bad_address" };
-      if (v.network !== "testnet") {
-        return { ok: false, error: "node reports address is not testnet", code: "not_testnet" };
-      }
-    } catch (e) {
-      if (!this.cfg.dryRun) {
-        return { ok: false, error: `node validateaddress failed: ${errMsg(e)}`, code: "node_error" };
-      }
-      // dry-run: proceed on the local check alone.
-    }
+    // There is deliberately no node-side address check: the Genesis-4 RPC has
+    // no `validateaddress` method. The local checksum in `address.ts` mirrors
+    // the node's own rule, and the node remains the final authority when it
+    // rejects the broadcast.
 
     if (!this.cfg.dryRun && this.cfg.fundingAddress === "") {
       return { ok: false, error: "FAUCET_FUNDING_ADDRESS is not configured", code: "misconfigured" };
@@ -88,10 +98,13 @@ export class Faucet {
     const target = parseSats(this.cfg.amountSats, "FAUCET_AMOUNT_SATS") +
       parseSats(this.cfg.feeSats, "FAUCET_FEE_SATS");
 
-    // 3) Fetch funding UTXOs.
+    // 3) Fetch funding UTXOs — by script_hash, which is what the node takes.
+    const fundingSh = this.cfg.fundingAddress
+      ? addressScriptHash(this.cfg.fundingAddress) ?? this.cfg.fundingAddress
+      : rcpt.scriptHashHex;
     let funding;
     try {
-      funding = await this.rpc.getUtxos(this.cfg.fundingAddress || toAddress);
+      funding = await this.rpc.getUtxos(fundingSh);
     } catch (e) {
       return { ok: false, error: `getutxos failed: ${errMsg(e)}`, code: "node_error" };
     }
@@ -107,13 +120,21 @@ export class Faucet {
     }
 
     // 4) Build the unsigned job and hand it to the signer.
+    const changeAddr = this.cfg.changeAddress || this.cfg.fundingAddress;
     const job: PaymentJob = {
       network: "testnet",
-      toAddress,
+      toAddress: rcpt.address ?? rcpt.scriptHashHex,
+      // The script hashes are what a signer actually needs: `submit-tx` takes
+      // `--pay <script-hash-hex>:<sat>`, never an address.
+      toScriptHash: rcpt.scriptHashHex,
+      changeScriptHash: changeAddr
+        ? addressScriptHash(changeAddr) ?? changeAddr
+        : fundingSh,
+      fundingScriptHash: fundingSh,
       amountSats: this.cfg.amountSats,
       feeSats: this.cfg.feeSats,
-      changeAddress: this.cfg.changeAddress || this.cfg.fundingAddress || toAddress,
-      fundingAddress: this.cfg.fundingAddress || toAddress,
+      changeAddress: changeAddr || this.cfg.fundingAddress || rcpt.scriptHashHex,
+      fundingAddress: this.cfg.fundingAddress || rcpt.scriptHashHex,
       selectedUtxos: pick.selected,
     };
 
@@ -132,7 +153,8 @@ export class Faucet {
         ok: true,
         txid,
         amountSats: this.cfg.amountSats,
-        toAddress,
+        toAddress: job.toAddress,
+        scriptHash: rcpt.scriptHashHex,
         dryRun: true,
         signer: this.signer.kind,
       };
@@ -144,7 +166,8 @@ export class Faucet {
         ok: true,
         txid,
         amountSats: this.cfg.amountSats,
-        toAddress,
+        toAddress: job.toAddress,
+        scriptHash: rcpt.scriptHashHex,
         dryRun: false,
         signer: this.signer.kind,
       };

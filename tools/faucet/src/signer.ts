@@ -18,7 +18,17 @@ import type { Utxo } from "./rpc.js";
 
 export interface PaymentJob {
   network: "testnet";
+  /** Display form: the address if one was given, else the script_hash. */
   toAddress: string;
+  /**
+   * The three fields a signer actually spends against. `submit-tx` takes
+   * `--pay <script-hash-hex>:<sat>` and `getutxos` takes a script_hash; no
+   * node interface anywhere accepts an address, so a signer that worked from
+   * `toAddress` could not build a transaction.
+   */
+  toScriptHash: string;
+  changeScriptHash: string;
+  fundingScriptHash: string;
   amountSats: number;
   feeSats: number;
   changeAddress: string;

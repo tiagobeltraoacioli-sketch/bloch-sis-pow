@@ -26,14 +26,38 @@ polling (the chain moves every 30 s; polling faster than ~5 s gains nothing).
 | Unit | 1 BLCH = 100,000,000 sat |
 | Signature suite | hybrid ML-DSA-65 ‖ Falcon-1024 (post-quantum; secp256k1 hardware cannot sign this chain) |
 | Account model | eUTXO. An output is locked to `script_hash` = SHA3-256 of the owner's hybrid public key (32 bytes, hex over RPC) |
-| Fee | gas × price. gas = 5,000 + tx_bytes×16 + 72,748 per input signature; price = protocol base fee (floor 10 msat/gas, EIP-1559-style) + your tip. On an idle testnet the base fee sits at its floor |
+| Fee | gas × price. gas = 5,000 + tx_bytes×16 + 72,748 **per hybrid signature verified**; price = protocol base fee (floor 10 msat/gas, EIP-1559-style) + your tip. On an idle testnet the base fee sits at its floor. Under V1 that is one term per input; under TransferV2 it is one per *owner*, so consolidating many inputs under one key gets materially cheaper once V2 is active |
 | Validators | 4 (testnet; operated by Postern Labs) — mainnet has 64 |
 
 ## Getting test coins
 
-The faucet is a manual drip for now: send your 64-hex `script_hash` and the
-amount you need to ⟨contact channel⟩. Typical turnaround: same day. Test
-BLCH has no value of any kind.
+Generate a key, read its `script_hash`, and ask for a drip. **The
+`script_hash` is the identifier this chain uses** — not an address. A native
+Genesis-4 key's `script_hash` is `SHA3-256(hybrid pubkey)`, a full 32 bytes,
+and it has no address encoding at all.
+
+### Faucet policy
+
+| | |
+|---|---|
+| Drip | 1 tBLCH (100,000,000 sat) per request |
+| Per recipient | one drip per `script_hash` per 24 h |
+| Per source IP | 5 requests per hour |
+| Global ceiling | 500 tBLCH per rolling 24 h across all requesters |
+| Cost | free; test BLCH has no value of any kind |
+
+The per-IP budget is charged on every **attempt**, not on every payout, so a
+malformed request still costs you one of the five. The per-recipient cooldown
+is charged only on a successful drip.
+
+**Operating status, stated plainly:** the automated faucet service
+(`tools/faucet`) is a reference implementation whose limits and policy are
+real and tested, but which has **not yet been run against a live node** and
+ships with the payout path disabled by default. Until it is commissioned, the
+faucet is a **manual drip**: send your 64-hex `script_hash` to
+⟨contact channel⟩, typical turnaround same day. Ask for the amount you need
+up front — a manual drip has no cooldown, so one larger allocation is easier
+for both of us than repeated top-ups.
 
 Generate a key and see your `script_hash` with the node binary
 (⟨download/build reference⟩):
@@ -81,6 +105,59 @@ checkpoints, `next_base_fee_millisat_per_gas`), `getblockcount`,
 `getblockbyslot`, `getblockbyid`, `getvalidator`, `getvalidatorcount`,
 `getmempoolinfo`.
 
+## Does this exercise the same code path as a real mainnet withdrawal?
+
+This is the question the testnet exists to answer, so here is the audited
+answer rather than a reassurance. **Yes for the withdrawal path itself, with
+three named deltas, none of which touch how a transfer is validated.**
+
+**What is identical — verified, not assumed:**
+
+- **The signing root.** `spend_signing_root` folds the same `DS_SPEND` domain,
+  the same fields, in the same order, on both networks. There is no network
+  branch in it.
+- **Signature verification.** The spend path calls the same hybrid
+  ML-DSA-65 ‖ Falcon-1024 verifier as consensus itself — spending an output is
+  deliberately exactly as hard to forge as attesting to a block.
+- **Admission.** `sendrawtransaction` decodes canonical bytes and verifies the
+  hybrid signature **before** the mempool, on both networks, in the same
+  function.
+- **The state transition and the fee market.** No `if testnet` /
+  `if mainnet` branch exists anywhere in transaction validation, the
+  transition, or fee pricing. We grepped for it; every hit is a comment.
+- **Finality.** `gettxout(txid, vout).finalized` is the same judgement from
+  the same Casper-style checkpoint logic.
+
+**Delta X — flag-day epochs are absolute, and a fresh testnet starts at epoch
+0.** `TransferV2` (deduplicated witnesses) activates at epoch 800, which
+mainnet passed long ago and a fresh testnet reaches after ≈8.9 days. **The
+plain V1 transfer path — which is what a withdrawal is — is epoch-independent
+and byte-identical from epoch 0.** So an ordinary withdrawal rehearsal is
+unaffected. What you cannot rehearse in a new testnet's first nine days is
+*witness-deduplicated consolidation*, i.e. sweeping many inputs owned by one
+key into one signature. If your withdrawal design depends on that, tell us and
+we will point you at a testnet instance that is already past epoch 800.
+
+**Delta Y — binary lineage.** The testnet runs the current development branch;
+the mainnet fleet runs an older build. No validation rule differs between the
+two, but the bytes are not the same bytes, and the testnet-only CLI helpers
+(`spendkey`, `genesis --alloc`, `submit-tx --raw`) are absent from the fleet
+build. They are not feature-gated — they simply postdate it. Treat
+`submit-tx --raw` as a reference signer, not as the tool you will run in
+production; the seam you integrate against is the 32-byte signing root, and
+that is stable.
+
+**Delta Z — genesis composition.** Different validator set, different
+balances, no carryover. This is the security boundary, not an incidental
+difference; see safety rule 1 below and `REPLAY-ISOLATION.md`.
+
+**What NEITHER network can rehearse today.** The staking lifecycle — on-chain
+deposit, activation, exit, withdrawal — is refused at admission on mainnet and
+testnet alike, because deposits are not yet funded from the UTXO set and exits
+are not yet authenticated. If your integration only ever moves coins, this does
+not affect you. If you intend to stake, no rehearsal exists anywhere yet, and
+we will not pretend otherwise.
+
 ## Validator rehearsal — current honest status
 
 - **Available now, on request:** a *genesis-cohort seat*. At the next
@@ -112,9 +189,18 @@ checkpoints, `next_base_fee_millisat_per_gas`), `getblockcount`,
 ## Two safety rules
 
 1. **Never reuse keys across networks.** Spend signatures on this chain
-   commit to outpoints, not to a network id. The two networks' outpoints
-   are disjoint by construction, so replay is impossible — keep it that
-   way: testnet keys are throwaway, mainnet keys never touch testnet
-   tooling.
+   commit to **outpoints, not to a network id** — there is no chain id in the
+   signing root. Isolation therefore rests on one property: the two networks'
+   outpoint sets are disjoint, because this testnet's genesis is funded from
+   keys generated here and ingests none of mainnet's ledger. That is a fact
+   about how we build the genesis, **not a guarantee the protocol enforces**,
+   and we would rather you knew the difference. The full argument, including
+   what is machine-checked and what is operational discipline, is in
+   `REPLAY-ISOLATION.md` — ask us for it.
+
+   The practical consequence for you: treat testnet keys as throwaway and
+   never load a mainnet key into testnet tooling. Key reuse is not what
+   would break isolation, but it is what would put you in the blast radius
+   if anything else did.
 2. Test BLCH is not redeemable, convertible, or transferable to mainnet,
    and nothing here is an offer of anything.

@@ -1706,6 +1706,173 @@ mod tests {
         assert_eq!(a, b);
     }
 
+
+    // ── CROSS-NETWORK REPLAY: the property a hosted testnet rests on ────────
+    //
+    // `PosTransaction::spend_signing_root` folds DS_SPEND, the spend points,
+    // the outputs, `tx_bytes` and the tip. It does NOT fold a chain id, a
+    // network id, or the genesis digest. DS_SPEND separates a spend from other
+    // MESSAGE TYPES inside Bloch; it does not separate one Bloch NETWORK from
+    // another, and every Bloch network uses the identical tag.
+    //
+    // The consequence is exact: a spend signature is a statement about an
+    // OUTPOINT. If the same outpoint exists on two networks under the same
+    // `script_hash`, one signature authorises the movement of both coins, and
+    // a transaction lifted out of a testnet block and rebroadcast to mainnet
+    // is a valid mainnet transaction. Nothing in consensus stops it, because
+    // from mainnet's side it is indistinguishable from a genuine spend.
+    //
+    // So cross-network safety is bought with exactly one thing: the two
+    // networks' outpoint sets being DISJOINT. These tests pin both halves of
+    // that — the half that saves us, and the half that would sink us — so the
+    // property is enforced by the suite rather than remembered by whoever
+    // last read the comment in `genesis_cmd`.
+
+    /// The half that saves us. A testnet funded from a freshly generated key
+    /// has a `script_hash` no mainnet allocation has, and `script_hash` is
+    /// inside the txid preimage — so the outpoint it mints cannot exist on
+    /// mainnet, and a signature spending it names a coin mainnet has never
+    /// heard of. Mainnet rejects it as an unknown input.
+    #[test]
+    fn a_freshly_keyed_testnet_allocation_cannot_collide_with_mainnet() {
+        use bloch_pos_committee::tokenomics_v4 as t;
+        let mainnet = GenesisAllocation {
+            purpose: alloc_purpose::FOUNDER,
+            script_hash: [0xAA; 32],
+            amount_sat: 1_000 * t::SAT_PER_BLOCH,
+            unlock_epoch: 0,
+        };
+        // Same bucket, same amount, same schedule — differing ONLY in the key
+        // that owns it, which is what "throwaway key" actually buys.
+        let testnet = GenesisAllocation { script_hash: [0xBB; 32], ..mainnet.clone() };
+
+        let mut mm = sample();
+        mm.allocations = vec![mainnet];
+        let mut tm = sample();
+        tm.allocations = vec![testnet];
+
+        let m_out = mm.allocation_outputs();
+        let t_out = tm.allocation_outputs();
+        assert_ne!(
+            m_out[0].txid, t_out[0].txid,
+            "a different owning key must mint a different outpoint — this is the \
+             ONLY thing preventing a testnet spend signature from being valid on \
+             mainnet",
+        );
+    }
+
+    /// The half that would sink us, pinned deliberately.
+    ///
+    /// The allocation txid is `SHA3-256(BLCH4:genesis-alloc\0 ‖ purpose ‖
+    /// script_hash ‖ amount_sat ‖ unlock_epoch)` and nothing else. Reproduce
+    /// that four-field tuple on a testnet and you mint a BIT-IDENTICAL
+    /// outpoint on both chains. If the key that owns it is a real mainnet key
+    /// — which is precisely what seeding a testnet from the Genesis-3
+    /// carryover would do, 452,726 times over — then every spend signed on the
+    /// testnet is a valid mainnet spend of real money, and the testnet becomes
+    /// a machine for harvesting live-key authorisations.
+    ///
+    /// This test exists so that anyone who "optimises" the testnet by copying
+    /// mainnet allocations has to delete an assertion that tells them why not.
+    #[test]
+    fn reproducing_a_mainnet_allocation_tuple_mints_the_same_outpoint() {
+        use bloch_pos_committee::tokenomics_v4 as t;
+        let alloc = GenesisAllocation {
+            purpose: alloc_purpose::FOUNDER,
+            script_hash: [0xAA; 32],
+            amount_sat: 1_000 * t::SAT_PER_BLOCH,
+            unlock_epoch: 0,
+        };
+        let mut a = sample();
+        a.allocations = vec![alloc.clone()];
+        // A manifest that is a DIFFERENT NETWORK in every respect the manifest
+        // can express: different genesis time, different slot length, and a
+        // different validator set. None of it reaches the txid.
+        let mut b = sample();
+        b.genesis_time_ms = a.genesis_time_ms + 86_400_000;
+        b.slot_ms = a.slot_ms * 60;
+        b.validators.truncate(1);
+        b.allocations = vec![alloc];
+
+        assert_eq!(
+            a.allocation_outputs()[0].txid,
+            b.allocation_outputs()[0].txid,
+            "two unrelated networks that share one allocation tuple share the \
+             outpoint — and therefore share every spend signature over it",
+        );
+    }
+
+    /// States the negative directly, so nobody has to infer it: there is no
+    /// network binding anywhere in the allocation outpoint. Every field of the
+    /// manifest that identifies WHICH network this is can be changed without
+    /// moving the txid by one bit.
+    #[test]
+    fn the_allocation_outpoint_carries_no_network_binding() {
+        use bloch_pos_committee::tokenomics_v4 as t;
+        let alloc = GenesisAllocation {
+            purpose: alloc_purpose::LIQUIDITY,
+            script_hash: [0x5C; 32],
+            amount_sat: 7 * t::SAT_PER_BLOCH,
+            unlock_epoch: 3,
+        };
+        let mut base = sample();
+        base.allocations = vec![alloc.clone()];
+        let baseline = base.allocation_outputs()[0].txid;
+
+        // The manifest digest is what `ws_boot::network_id_of` turns into a
+        // network id, so these edits genuinely produce a different network.
+        let mut moved = clone_of(&base);
+        moved.genesis_time_ms += 1;
+        assert_ne!(moved.encode(), base.encode(), "the edit must change the manifest");
+        assert_eq!(
+            moved.allocation_outputs()[0].txid,
+            baseline,
+            "changing the network did not change the outpoint — cross-network \
+             replay is prevented by disjoint outpoints alone, never by identity",
+        );
+
+        // And the four fields that DO reach it, each on its own.
+        for mutate in [
+            (|a: &mut GenesisAllocation| a.purpose = alloc_purpose::TEAM) as fn(&mut GenesisAllocation),
+            |a: &mut GenesisAllocation| a.script_hash = [0x5D; 32],
+            |a: &mut GenesisAllocation| a.amount_sat += 1,
+            |a: &mut GenesisAllocation| a.unlock_epoch += 1,
+        ] {
+            let mut one = alloc.clone();
+            mutate(&mut one);
+            let mut m = sample();
+            m.allocations = vec![one];
+            assert_ne!(
+                m.allocation_outputs()[0].txid,
+                baseline,
+                "every field in the preimage must move the txid, or two distinct \
+                 allocations could collide inside one genesis",
+            );
+        }
+    }
+
+    /// A testnet manifest must commit to no carryover at all. The carryover is
+    /// the one input that reproduces mainnet outpoints EXACTLY — `ingest` keeps
+    /// the Genesis-3 `(txid, vout)` unchanged by design, because wallets depend
+    /// on it — so a testnet that ingested it would hand every Genesis-3 holder's
+    /// live outpoint to a public faucet network.
+    #[test]
+    fn a_testnet_manifest_commits_to_no_carryover() {
+        use bloch_pos_committee::tokenomics_v4 as t;
+        let mut tn = sample();
+        tn.allocations = vec![GenesisAllocation {
+            purpose: alloc_purpose::LIQUIDITY,
+            script_hash: [0x77; 32],
+            amount_sat: 100 * t::SAT_PER_BLOCH,
+            unlock_epoch: 0,
+        }];
+        assert!(tn.carryover.is_none(), "a testnet manifest must carry no commitment");
+        assert!(tn.carryover_entries.is_empty(), "and no ingested entries");
+        // opening_balances is therefore exactly the allocations: no mainnet
+        // outpoint can enter the testnet ledger through this path.
+        assert_eq!(tn.opening_balances(), tn.allocation_outputs());
+    }
+
     #[test]
     fn mainnet_manifest_round_trips() {
         let m = mainnet_sample();

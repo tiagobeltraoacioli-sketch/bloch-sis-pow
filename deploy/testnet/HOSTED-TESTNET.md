@@ -8,6 +8,18 @@ same `run` command, same devnet transport, same transition.
 
 ## 0. Two binding rules (inherited from the code, do not weaken)
 
+> **The full replay-isolation argument now lives in `REPLAY-ISOLATION.md`**,
+> alongside the four tests in `crates/bloch-pos-node/src/genesis.rs` that
+> enforce it. Read it before changing anything about how this genesis is
+> built. The short version is below; the long version is the one that matters,
+> because the guarantee is narrower than it looks.
+
+> **UNCLAIMED WIRE NUMBERS (blocking a real deployment).** The ports below
+> (18500-18503 RPC, 19500-19503 mesh, 8788 nginx) and the hostname
+> `t4rpc.posternlabs.com` have **not** been claimed from the PMO. They do not
+> collide with the mainnet fleet's 16400+i, but that is an observation, not an
+> allocation. Claim them before bringing this up on a shared host.
+
 1. **Never seed from the mainnet carryover; never reproduce a mainnet
    allocation tuple.** `spend_signing_root`
    (`crates/bloch-pos-committee/src/transition.rs`) carries no chain id;

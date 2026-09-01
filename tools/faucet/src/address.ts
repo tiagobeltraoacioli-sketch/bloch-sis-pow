@@ -68,3 +68,64 @@ export function isTestnetAddress(addr: string): boolean {
   const p = parseAddress(addr);
   return p !== null && p.network === "testnet";
 }
+
+// ── script_hash: what the node actually speaks ──────────────────────────────
+//
+// The RPC surface does NOT take addresses. `getutxos`/`listunspent`,
+// `getbalance` and the `--pay` flag of `submit-tx` all take a 32-byte
+// `script_hash` as 64 hex characters (`rpc.rs`, `want_hex32(params, 0,
+// "script_hash")`). There is no `validateaddress` method at all. An earlier
+// version of this service passed bech32-style addresses to those calls, which
+// could never have worked against a real node.
+//
+// Two things live in this namespace and they are NOT interchangeable:
+//
+//   * A **Genesis-3 carryover address** owns 20 bytes of hash, and the chain
+//     zero-extends it on the right to 32 (`genesis.rs`: `script_hash[0..20] =
+//     the snapshot's hash160`, `script_hash[20..32] = 0x00`). That is what
+//     `addressScriptHash` reproduces.
+//
+//   * A **native Genesis-4 key** owns `SHA3-256(hybrid pubkey)` — a full 32
+//     bytes, printed by `bloch-pos spendkey`. It has NO address encoding,
+//     because 32 bytes do not fit in the 20-byte address body.
+//
+// So a partner who follows the onboarding guide (`keygen` then `spendkey`) has
+// a script_hash that CANNOT be written as a `bloch1t…` address. A faucet that
+// only accepted addresses could not fund them. Accept both, and treat the
+// 64-hex script_hash as the primary form.
+
+/** Zero-extend a 20-byte address hash to the 32-byte script_hash, G3-style. */
+export function addressScriptHash(addr: string): string | null {
+  const p = parseAddress(addr);
+  if (!p) return null;
+  return p.hashHex + "00".repeat(12);
+}
+
+export interface Recipient {
+  scriptHashHex: string;
+  /** How the requester expressed it, for the response and the logs. */
+  kind: "script_hash" | "address";
+  /** Present only when they gave an address. */
+  address?: string;
+}
+
+/**
+ * Accept either form. Returns null when neither parses.
+ *
+ * A bare 64-hex script_hash carries NO network marker — it cannot, it is a
+ * hash — so this function cannot tell a testnet script_hash from a mainnet
+ * one, and does not pretend to. That is safe here for the reason set out in
+ * `deploy/testnet/REPLAY-ISOLATION.md`: paying coins TO a hash is harmless
+ * whichever chain the requester also uses it on, because the outpoint this
+ * creates exists only on this chain. The direction that matters is what the
+ * faucet spends FROM, and that is checked at startup (`index.ts` preflight).
+ */
+export function parseRecipient(input: string): Recipient | null {
+  const s = input.trim();
+  if (/^[0-9a-fA-F]{64}$/.test(s)) {
+    return { scriptHashHex: s.toLowerCase(), kind: "script_hash" };
+  }
+  const sh = addressScriptHash(s);
+  if (sh) return { scriptHashHex: sh, kind: "address", address: s };
+  return null;
+}

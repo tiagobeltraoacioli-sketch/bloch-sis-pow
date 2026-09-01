@@ -132,8 +132,14 @@ export interface GetUtxosResult {
 export class RpcClient {
   constructor(private readonly transport: JsonRpcTransport) {}
 
-  async getUtxos(address: string): Promise<GetUtxosResult> {
-    return (await this.transport.call("getutxos", [address])) as GetUtxosResult;
+  /**
+   * `getutxos(script_hash, limit)`. The node takes a 32-byte script_hash as 64
+   * hex, NOT an address — `rpc.rs` routes it through
+   * `want_hex32(params, 0, "script_hash")`. Passing an address here was a
+   * silent guarantee of failure against any real node.
+   */
+  async getUtxos(scriptHashHex: string): Promise<GetUtxosResult> {
+    return (await this.transport.call("getutxos", [scriptHashHex])) as GetUtxosResult;
   }
 
   async sendRawTransaction(rawHex: string): Promise<string> {
@@ -141,24 +147,31 @@ export class RpcClient {
     return r.txid;
   }
 
-  async validateAddress(address: string): Promise<{ isvalid: boolean; network: string; checksum: boolean }> {
-    return (await this.transport.call("validateaddress", [address])) as {
-      isvalid: boolean;
-      network: string;
-      checksum: boolean;
-    };
+  // NOTE ON WHAT IS *NOT* HERE. This client previously exposed
+  // `validateaddress`, `gettxstatus` and `getnetworkinfo`. The Genesis-4 node
+  // implements NONE of them — its whole dispatch table is `getchaininfo`,
+  // `getblockcount`, `getblockbyslot`, `getblockbyid`, `getvalidator`,
+  // `getvalidatorcount`, `getvalidatorstatus`, `getbalance`,
+  // `getutxos`/`listunspent`, `gettxout`, `sendrawtransaction`,
+  // `getmempoolinfo`, `getmetrics`, plus `gettransaction` and `getnewaddress`
+  // which exist only to refuse. Calling the three removed names returned
+  // "method not found", so the LIVE path could never have completed a drip.
+  // Address validation is therefore local only (`address.ts` mirrors the
+  // node's own checksum rule) and settlement is read with `gettxout`.
+
+  /**
+   * `gettxout(txid, vout)`. `finalized: true` is the settlement judgement —
+   * there are no confirmations on this chain.
+   */
+  async getTxOut(txid: string, vout = 0): Promise<{ finalized?: boolean } & Record<string, unknown>> {
+    return (await this.transport.call("gettxout", [txid, vout])) as {
+      finalized?: boolean;
+    } & Record<string, unknown>;
   }
 
-  async getTxStatus(txid: string): Promise<{ status: string; confirmations: number; in_mempool: boolean }> {
-    return (await this.transport.call("gettxstatus", [txid])) as {
-      status: string;
-      confirmations: number;
-      in_mempool: boolean;
-    };
-  }
-
-  async getNetworkInfo(): Promise<Record<string, unknown>> {
-    return (await this.transport.call("getnetworkinfo", [])) as Record<string, unknown>;
+  /** `getchaininfo` — height, epoch, justified/finalized checkpoints. */
+  async getChainInfo(): Promise<Record<string, unknown>> {
+    return (await this.transport.call("getchaininfo", [])) as Record<string, unknown>;
   }
 }
 
@@ -169,18 +182,14 @@ export class RpcClient {
 export class StubTransport implements JsonRpcTransport {
   private broadcastCount = 0;
 
-  constructor(private readonly fundingAddress: string) {}
+  constructor(private readonly fundingScriptHash: string) {}
 
   async call(method: string, params: unknown[]): Promise<unknown> {
     switch (method) {
-      case "getnetworkinfo":
-        return { network: "testnet(stub)", chain: "bloch-sis", blocks: 0, syncing: false };
-      case "validateaddress": {
-        const addr = String(params[0] ?? "");
-        const isTestnet = addr.startsWith("bloch1t");
-        return { address: addr, isvalid: isTestnet, network: isTestnet ? "testnet" : "unknown", checksum: isTestnet };
-      }
-      case "getutxos": {
+      case "getchaininfo":
+        return { height: 0, epoch: 0, justified: null, finalized: null, stub: true };
+      case "getutxos":
+      case "listunspent": {
         const addr = String(params[0] ?? "");
         // Emits the canonical decimal-STRING form on purpose: the offline
         // selftest then exercises the real V4 wire encoding instead of the
@@ -206,8 +215,8 @@ export class StubTransport implements JsonRpcTransport {
         const tag = (raw.length ^ this.broadcastCount).toString(16).padStart(2, "0");
         return { txid: tag.repeat(32).slice(0, 64) };
       }
-      case "gettxstatus":
-        return { status: "pending", in_mempool: true, confirmations: 0, txid: String(params[0] ?? "") };
+      case "gettxout":
+        return { txid: String(params[0] ?? ""), vout: Number(params[1] ?? 0), finalized: false };
       default:
         return { error: `stub: unsupported method ${method}` };
     }
