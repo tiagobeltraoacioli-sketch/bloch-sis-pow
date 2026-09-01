@@ -139,12 +139,19 @@ Rules:
 - Never derive anything from the treasury or any production keystore with
   this tool. It cannot read `validator.key` keystores for signing, by design.
 
-Address → script_hash (the rule an exchange needs for deposits): strip
-`bloch1q` (or `bloch1t`), take the first 40 hex chars (20 bytes), verify the
-last 8 hex chars are `SHA3-256(SHA3-256(hash20))[..4]`, then zero-extend the
-20 bytes to 32. That 32-byte value is the `script_hash` parameter for
-`getbalance` / `listunspent`, and the `script_hash` to put in an output
-paying that address.
+`script_hash` (the rule an exchange needs for deposits and withdrawals):
+**`SHA3-256(the holder's hybrid public key)`, all 32 bytes.** That is what
+`spendkey` / `keygen` prints, the `script_hash` parameter for `getbalance` /
+`listunspent`, and the `script_hash` to put in an output paying that holder.
+
+**Do not derive it from an address.** Stripping `bloch1q`/`bloch1t` and
+zero-extending the 20 bytes gives the shape the Genesis-3 carryover uses. For a
+native Genesis-4 key that is a **different key in the eUTXO set** —
+`getbalance` on one does not see coins locked under the other — and the chain's
+ownership rule accepts both, so nothing errors and the payee simply reads zero.
+That form is correct only for holders whose balance crossed from Genesis-3,
+whose coins already sit under it. The one implementation of both is
+`bloch_pos_committee::script_hash`.
 
 ## 3. Funding and UTXO discovery
 

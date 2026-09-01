@@ -1,10 +1,17 @@
 # Bloch Testnet Faucet (reference)
 
-A small, standalone service that dispenses **test BLCH** to a testnet
-`bloch1t…` address: it selects UTXOs from a funding wallet via the node's
+A small, standalone service that dispenses **test BLCH** to a Genesis-4
+`script_hash`: it selects UTXOs from a funding `script_hash` via the node's
 JSON-RPC (`getutxos`), hands an **unsigned payment job** to an external signer,
 and broadcasts the signed transaction via `sendrawtransaction`. It ships a tiny
-web form and a JSON API, with per-address and per-IP rate limiting.
+web form and a JSON API, with per-recipient, per-IP and global rate limiting.
+
+**The recipient is a 64-hex `script_hash`, never an address.** Genesis-4 locks
+an output to `SHA3-256(the owner's hybrid public key)` — 32 bytes, no address
+encoding — which is what `bloch-pos spendkey` prints. An address is refused with
+an explanation rather than converted: zero-extending an address's 20 bytes gives
+a *different key in the eUTXO set*, consensus opens both, and the funded party
+would read a zero balance with nothing anywhere reporting an error.
 
 > **License:** MIT OR Apache-2.0 — a *different*, more permissive licence than
 > the protocol itself. This line used to claim "the same permissive terms as the
@@ -20,8 +27,11 @@ web form and a JSON API, with per-address and per-IP rate limiting.
 
 - **SCAFFOLD / reference tool. Unaudited. Pre-production.** Do not treat this as
   a secure, production faucet.
-- **Testnet-only.** It only accepts `bloch1t…` addresses and refuses mainnet
-  addresses.
+- **Testnet-only, and bound to one testnet.** In LIVE mode it refuses to start
+  unless the node at `FAUCET_RPC_URL` reports the genesis block id set in
+  `FAUCET_EXPECT_GENESIS_BLOCK_ID`. That replaced a `bloch1t…` prefix check on
+  the funding string, which inspected a string in isolation from the RPC URL and
+  therefore proved nothing about the chain at the other end of the socket.
 - **Test BLCH has NO value.** This is a faucet for a **zero-security testnet**.
   BLCH is **not a security**; nobody makes any value or investment claim.
 - **Reference, untested against a live network.** It builds and runs, and the
@@ -40,11 +50,13 @@ web form and a JSON API, with per-address and per-IP rate limiting.
 ## How it works
 
 ```
-address ──▶ [validate: local checksum + node validateaddress]
-        ──▶ [rate limit: per-address cooldown + per-IP window]
-        ──▶ getutxos(funding)  ──▶ greedy coin selection
-        ──▶ Signer.buildSignedPayment(job)   ← key lives HERE, never in the faucet
-        ──▶ sendrawtransaction(rawHex)  ──▶ { txid }
+startup ──▶ [preflight: getblockbyslot(0).block_id == FAUCET_EXPECT_GENESIS_BLOCK_ID]
+
+script_hash ──▶ [parse: 64 hex, or a refusal that says what to send instead]
+            ──▶ [rate limit: per-recipient cooldown + per-IP window + global ceiling]
+            ──▶ getutxos(FAUCET_FUNDING_SCRIPT_HASH)  ──▶ greedy coin selection
+            ──▶ Signer.buildSignedPayment(job)   ← key lives HERE, never in the faucet
+            ──▶ sendrawtransaction(rawHex)  ──▶ { txid }
 ```
 
 Bloch JSON-RPC quirks handled by `src/rpc.ts`:
@@ -81,8 +93,9 @@ Copy `.env.example` to `.env` and edit. Key vars:
 |---|---|
 | `FAUCET_RPC_URL` | node JSON-RPC endpoint (default `http://127.0.0.1:16210/`) |
 | `FAUCET_RPC_API_KEY` | optional `X-API-Key` for write methods |
-| `FAUCET_FUNDING_ADDRESS` | testnet `bloch1t…` wallet that holds test BLCH |
-| `FAUCET_CHANGE_ADDRESS` | change address (default = funding) |
+| `FAUCET_FUNDING_SCRIPT_HASH` | 64-hex `script_hash` holding the test BLCH (from `bloch-pos spendkey`) |
+| `FAUCET_CHANGE_SCRIPT_HASH` | where change goes (default = funding) |
+| `FAUCET_EXPECT_GENESIS_BLOCK_ID` | 64-hex `getblockbyslot(0).block_id`; the network binding, required in LIVE mode |
 | `FAUCET_AMOUNT_SATS` | drip amount in sat (default `100000000` = 1 test BLCH) |
 | `FAUCET_FEE_SATS` | flat fee in sat |
 | `FAUCET_SIGNER_CMD` | external signer command (see above) |
@@ -104,7 +117,7 @@ npm start             # http://127.0.0.1:8080
 
 # Live testnet (requires a node + a configured signer):
 FAUCET_DRY_RUN=false FAUCET_SIGNER_CMD="bloch-wallet faucet-sign" \
-FAUCET_FUNDING_ADDRESS=bloch1t… npm start
+FAUCET_FUNDING_SCRIPT_HASH=<64 hex> FAUCET_EXPECT_GENESIS_BLOCK_ID=<64 hex> npm start
 ```
 
 `npm run dev` and `npm run selftest` compile with `tsc` first, then run the
@@ -113,7 +126,7 @@ emitted JS from `dist/` (NodeNext `.js` import specifiers).
 ## API
 
 - `GET /` — web form.
-- `POST /api/faucet` — body `{"address":"bloch1t…"}` → `{ ok, txid, amountSats, dryRun, signer }` or `{ ok:false, error, code }`.
+- `POST /api/faucet` — body `{"scriptHash":"<64 hex>"}` → `{ ok, txid, amountSats, scriptHash, dryRun, signer }` or `{ ok:false, error, code }`. (`address` is still read, purely so that sending one returns the specific refusal instead of "missing field".)
 - `GET /api/health` — liveness.
 - `GET /api/status` — mode, amounts, rate-limit config, rails.
 
@@ -171,7 +184,7 @@ full 32 bytes with **no address encoding**. A partner who follows the
 onboarding guide (`keygen`, then `spendkey`) has a `script_hash` that could not
 be expressed as an address, so an address-only faucet could never have funded
 them. `script_hash` is now the primary input form; `bloch1t…` addresses are
-still accepted and zero-extended the way the chain does it.
+REFUSED, not converted — see the note at the top of this file.
 
 ### Still open
 
