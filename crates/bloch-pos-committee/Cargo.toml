@@ -24,19 +24,7 @@ sha3 = { version = "0.10", default-features = false }
 [dev-dependencies]
 hex = "0.4"
 
-# The suite walks 8,192-step SHAKE-256 reveal chains and 256-deep SMTs, so an
-# unoptimized Keccak permutation puts tens of seconds on `cargo test`. Optimize
-# only the hash dependencies under dev; this crate's own code keeps full debug.
-#
-# INERT AS WRITTEN. This was valid while the crate was its own workspace root.
-# It is now a member of the root workspace, and cargo ignores `[profile.*]` in
-# anything but the workspace root — it warns and moves on. Kept, unchanged and
-# labelled, rather than moved: relocating it to the root Cargo.toml changes the
-# dev profile for every crate in the tree, which is a build-configuration
-# decision, not a documentation fix. `cargo test -p bloch-pos-committee` is
-# correspondingly slower than it was.
-[profile.dev.package.sha3]
-opt-level = 3
-
-[profile.dev.package.keccak]
-opt-level = 3
+# The dev-profile hash optimization these lines used to carry now lives in the
+# ROOT Cargo.toml, which is the only manifest cargo reads `[profile.*]` from.
+# It was inert here for as long as this crate has been a workspace member; see
+# the root manifest for the measurement that justified moving it.

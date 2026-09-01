@@ -39,6 +39,29 @@ members = [
 # crate, add it to `members` — do not give it a private workspace.
 exclude = ["crates/coherence-prover", "fuzz"]
 
+# Dev-profile hash optimization. The bloch-pos-committee suite walks 8,192-step
+# SHAKE-256 reveal chains and 50,000-leaf SMTs, so an unoptimized Keccak
+# permutation dominates its debug runtime.
+#
+# These lived in crates/bloch-pos-committee/Cargo.toml, where they were INERT:
+# cargo honours `[profile.*]` only in the workspace root, and that crate became
+# a member. The note left there declined to move them on the grounds that doing
+# so "changes the dev profile for every crate in the tree". That is true of a
+# bare `[profile.dev]`, but NOT of these: `[profile.dev.package.<name>]` is a
+# PER-PACKAGE override and reaches only the named dependency. First-party code,
+# including bloch-pos-committee's own, keeps full debug and full overflow
+# checks.
+#
+# Measured 2026-09-01 on an idle 2-core box, debug:
+# `state_root::tests::a_small_update_costs_a_bounded_number_of_node_hashes`
+# went from 555.2 s to 73.2 s (7.6x) with the node-hash count unchanged at
+# 4201. That nine-minute silent test is what got reported as a hang, twice.
+[profile.dev.package.sha3]
+opt-level = 3
+
+[profile.dev.package.keccak]
+opt-level = 3
+
 [profile.release]
 opt-level      = 3
 lto            = true

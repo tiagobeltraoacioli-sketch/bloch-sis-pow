@@ -2,12 +2,20 @@
 //!
 //! This is the seam between Bloch's block layer and the `bloch-sis-pow`
 //! reference crate (a SHAKE-256 hashcash PoW with a Module-SIS structural
-//! gate — the identity of Bloch-SIS). Since B5b, **Bloch-SIS is the live
-//! consensus PoW**: `Block::validate_pow` verifies the block's solution
-//! vector via `verify_regime`, with the residual width selected by the
-//! block's height (soft fork SF-1): `TESTNET_RESIDUAL_COEFFS` (= 4) below
-//! `CANONICAL_K_ACTIVATION_HEIGHT`, `CANONICAL_RESIDUAL_COEFFS` (= 8) at or
-//! above it. SHA-256d is gone from the Mainnet/Testnet consensus — it returns
+//! gate — the identity of Bloch-SIS). Bloch-SIS was Genesis-3's consensus
+//! PoW; Genesis-3 stopped at height 39,918 on 2026-08-13 and the live chain
+//! is Genesis-4 proof of stake, so nothing here mines any more. This module is
+//! retained because it is what an auditor replays the closed chain with.
+//!
+//! `Block::validate_pow` verifies the block's solution vector via
+//! `verify_regime`, with the residual width `k` chosen by
+//! [`canonical_residual_coeffs`]. That selector is DIFFICULTY-DRIVEN, not a
+//! height jump: `k = 4` below `K_RULE_ACTIVATION_HEIGHT` at any difficulty,
+//! then `k` rises 5 → 6 → 7 → 8 as the block's own ASERT `bits` cross the
+//! `K_WORK_*` thresholds, and eases back if difficulty falls. The older
+//! `CANONICAL_K_ACTIVATION_HEIGHT` (a flat k: 4 → 8 jump at height 40,320) was
+//! RETIRED in 43ab5aa8; the constant still exists but no consensus path reads
+//! it. SHA-256d is gone from the Mainnet/Testnet consensus — it returns
 //! ONLY as the Genesis-2 devnet's chain-selected algorithm (see [`sha256d`]
 //! and the pinned dispatcher [`mine_pow_parallel`], which route on
 //! `bloch_crypto::core::pow_algorithm`, the same single mapping
@@ -22,10 +30,11 @@
 //! **hashcash cumulative work**, with the Module-SIS residual as a structural
 //! gate. Bloch runs the relaxed testnet regime — **zero security by design** —
 //! until the canonical gate params, the no-shortcut proof, the ePrint, and the
-//! audit land. Soft fork SF-1 (k: 4 → 8 at the activation height) tightens the
-//! structural gate's rejection floor from ~2^12 to ~2^24 but does NOT change
-//! this security story: k = 8 is the *candidate* canonical width, still
-//! pending the no-shortcut proof, and the security source remains hashcash.
+//! audit land. The k-ramp tightens the structural gate's rejection floor
+//! (~8x per +1 to k, so ~2^12 at k = 4 up to ~2^24 at k = 8) but does NOT
+//! change this security story: k is a structural/throughput filter, every
+//! width in 4..=8 sits in the trivial q-ary regime at `β = q/16`, and the
+//! security source remains hashcash cumulative work.
 //! See `BLOCH_DEVELOPMENT_PLAN.md` §3 and `crates/bloch-sis-pow`.
 
 pub use bloch_sis_pow::{bits_to_target, target_to_bits, Target, VerifyError};
@@ -57,11 +66,17 @@ pub use bloch_sis_pow::TESTNET_RESIDUAL_COEFFS;
 /// target).
 pub use bloch_sis_pow::CANONICAL_RESIDUAL_COEFFS;
 
-/// Soft fork SF-1 activation height + height→k selector (re-exported from
-/// `bloch_crypto::core`, the consensus module `Block::validate_pow` lives in,
-/// so miner and validator provably share one selector). The activation height
-/// is a PLACEHOLDER the founder must set before the live deploy — see its doc.
-pub use bloch_crypto::core::{canonical_residual_coeffs, CANONICAL_K_ACTIVATION_HEIGHT, K_RULE_ACTIVATION_HEIGHT};
+/// The k-ramp's rule-activation height and its (height, bits) → k selector,
+/// re-exported from `bloch_crypto::core` — the consensus module
+/// `Block::validate_pow` lives in — so miner and validator provably share one
+/// selector. Below [`K_RULE_ACTIVATION_HEIGHT`] k is 4 at every difficulty;
+/// at or above it k rides the block's own `bits`.
+///
+/// The retired `CANONICAL_K_ACTIVATION_HEIGHT` is deliberately NOT re-exported
+/// here: nothing in the validate/mine path reads it, and re-exporting it from
+/// the PoW seam is what let three tests in this file keep treating it as the
+/// live gate for six weeks after it stopped being one.
+pub use bloch_crypto::core::{canonical_residual_coeffs, K_RULE_ACTIVATION_HEIGHT};
 
 /// GhostDAG accumulated-work contribution of a block at compact difficulty
 /// `bits`, computed from the **crate's** target semantics (consistent with
@@ -169,8 +184,9 @@ pub fn verify_sis_pow_testnet(
 /// (k = 4), height-blind. Returns the found `(nonce, solution)` or `None`
 /// within the attempt budget. **Zero security** — dev/testnet only. Consensus
 /// mining must use the height-aware [`mine_sis_pow`] instead: a k=4-only
-/// block mined at/after `CANONICAL_K_ACTIVATION_HEIGHT` is rejected by
-/// upgraded validators.
+/// block is rejected by upgraded validators wherever the difficulty ramp has
+/// lifted k above 4 (at or above [`K_RULE_ACTIVATION_HEIGHT`], once the
+/// block's `bits` cross `K_WORK_5`).
 pub fn mine_sis_pow_testnet(
     pow_preimage: &[u8],
     bits: u32,
@@ -180,10 +196,13 @@ pub fn mine_sis_pow_testnet(
     mine_sis_pow_regime(pow_preimage, bits, TESTNET_RESIDUAL_COEFFS, start_nonce, max_attempts)
 }
 
-/// Height-aware consensus verify (soft fork SF-1). Verifies a Module-SIS PoW
+/// Height- and difficulty-aware consensus verify. Verifies a Module-SIS PoW
 /// witness at compact difficulty `bits` under the residual width selected by
-/// `height` — the height OF THE BLOCK BEING VALIDATED (never the tip):
-/// k = 4 below [`CANONICAL_K_ACTIVATION_HEIGHT`], k = 8 at/above it.
+/// `canonical_residual_coeffs(height, bits)` — the height and bits OF THE
+/// BLOCK BEING VALIDATED (never the tip): k = 4 below
+/// [`K_RULE_ACTIVATION_HEIGHT`], and at or above it k rises with the block's
+/// own ASERT difficulty. Note that `bits` is therefore load-bearing twice
+/// over: it is both the aux-hash target and an input to the gate width.
 ///
 /// This mirrors `Block::validate_pow` exactly (both route k through
 /// `bloch_crypto::core::canonical_residual_coeffs`).
@@ -417,7 +436,7 @@ mod tests {
         assert_ne!(below, a, "below ANCHOR2 must not use the re-anchor");
     }
 
-    /// Soft fork SF-1: fixed preimage for the height-aware k=8 e2e test.
+    /// Soft fork SF-1: fixed preimage for the k=8 witness e2e test.
     const K8_E2E_PREIMAGE: &[u8] = b"bloch-sf1-k8-e2e-preimage";
 
     /// Pre-searched start nonce whose FIRST 4096-candidate window contains a
@@ -430,6 +449,28 @@ mod tests {
     /// sf1_search`) and update this constant from the
     /// "src/pow tests K8_E2E_START_NONCE" line.
     const K8_E2E_START_NONCE: u64 = 4058; // found at attempt 2662 of 4096
+
+    /// Compact difficulty that lands in the ramp's **k = 5** band, chosen so a
+    /// unit test can actually exercise a k > 4 gate.
+    ///
+    /// Since the k-jump was retired for the difficulty-driven ramp
+    /// (`canonical_residual_coeffs`), **no height alone can lift k** — k is a
+    /// function of the block's own `bits`. A test that wants k > 4 must
+    /// therefore supply bits the ramp reacts to, and those same bits are the
+    /// aux-hash target the witness has to meet, so the two costs are coupled:
+    ///
+    /// | band | needs work ≥ | aux-hash pass rate | k=4 residual | joint     |
+    /// |------|--------------|--------------------|--------------|-----------|
+    /// | k=5  | 32           | ~1/63              | ~1/4096      | ~1/2^18   |
+    /// | k=8  | 16_384       | ~1/16_384          | ~1/16.7M     | ~1/2^38   |
+    ///
+    /// k = 5 is the only band a debug-build brute force can reach. `0x20040000`
+    /// decodes to a target of `04 00 …` → work 63, comfortably clear of
+    /// `K_WORK_5` (32) without paying for a harder aux target than the test
+    /// needs. The k > 4 precondition is asserted explicitly below, so retuning
+    /// the `K_WORK_*` knobs fails loudly on the fixture rather than silently
+    /// turning the gate test into a tautology.
+    const RAMP_K5_BITS: u32 = 0x2004_0000;
 
     #[test]
     fn canonical_residual_coeffs_difficulty_driven_via_reexport() {
@@ -447,68 +488,162 @@ mod tests {
     }
 
     #[test]
-    fn canonical_mine_verify_roundtrip_at_k8() {
-        // (d) height-aware mine → verify roundtrip at a post-activation
-        // height, plus the subset property through the node seam.
+    fn k8_witness_verifies_under_every_k_the_ramp_selects() {
+        // The soft-fork no-partition property, at the node seam: a witness
+        // mined at the FULL canonical width (k = 8) also satisfies every
+        // narrower gate, because the k = 4 residual check is a byte-prefix of
+        // the k = 8 one. An un-upgraded peer therefore never rejects a block an
+        // upgraded miner produced.
+        //
+        // WHAT THIS TEST CANNOT DO, and why it no longer claims to. Until the
+        // k-ramp landed, k = 8 was selected by HEIGHT, so a test could mine at
+        // k = 8 against the easiest possible aux target and then verify "at the
+        // k=8 height". Under the difficulty-driven ramp k = 8 is reachable only
+        // at work ≥ K_WORK_8 (16_384) — an aux target of ~1/16_384 on top of a
+        // ~1/8^8 residual, i.e. ~2^38 expected candidates. That is not mineable
+        // in a unit test at any height, so no test can mine a witness *at* the
+        // difficulty where the ramp asks for k = 8. The subset direction below
+        // is the part that is both testable and the part no-partition needs.
         let bits = target_to_bits(&Target::MAX);
-        let h = CANONICAL_K_ACTIVATION_HEIGHT;
 
-        let (nonce, s) = mine_sis_pow(K8_E2E_PREIMAGE, bits, h, K8_E2E_START_NONCE, 4096)
-            .expect("pinned window must contain a k=8 solution — if solver \
-                     internals changed, re-run the sf1_search utility");
+        // Mine at the canonical width EXPLICITLY, through the regime miner.
+        // Going through the height-aware `mine_sis_pow` would let the selector
+        // choose k from (height, bits) — which, at the easiest target, is k = 4.
+        // This test used to do exactly that: it asked for a "k=8 roundtrip" at
+        // CANONICAL_K_ACTIVATION_HEIGHT, silently mined and verified at k = 4,
+        // and passed without ever touching k = 8.
+        let (nonce, s) = mine_sis_pow_regime(
+            K8_E2E_PREIMAGE,
+            bits,
+            CANONICAL_RESIDUAL_COEFFS,
+            K8_E2E_START_NONCE,
+            4096,
+        )
+        .expect("pinned window must contain a k=8 solution — if solver \
+                 internals changed, re-run the sf1_search utility");
 
-        // Verifies at the height it was mined for (k = 8)...
-        assert!(verify_sis_pow(K8_E2E_PREIMAGE, nonce, &s, bits, h).is_ok());
-        assert!(verify_sis_pow(K8_E2E_PREIMAGE, nonce, &s, bits, h + 1).is_ok());
-        // ...and below H too (k = 4 is a prefix subset of k = 8): un-upgraded
-        // peers accept post-fork blocks — the soft-fork no-partition property.
-        assert!(verify_sis_pow(K8_E2E_PREIMAGE, nonce, &s, bits, 0).is_ok());
+        // The witness really is k=8-valid. This assertion is what keeps the
+        // test honest: without it, a solver change that quietly narrowed the
+        // mined width would leave every assertion below still passing.
+        assert!(
+            bloch_sis_pow::verify_regime(
+                K8_E2E_PREIMAGE, nonce, &s, &bits_to_target(bits), CANONICAL_RESIDUAL_COEFFS,
+            )
+            .is_ok(),
+            "pinned witness is not k=8-valid — the pinned start nonce is stale",
+        );
+
+        // ...and it therefore satisfies the narrower gate the ramp selects at
+        // every position on the ramp.
+        for h in [
+            0u64,
+            K_RULE_ACTIVATION_HEIGHT - 1,
+            K_RULE_ACTIVATION_HEIGHT,
+            K_RULE_ACTIVATION_HEIGHT + 1,
+        ] {
+            assert!(
+                verify_sis_pow(K8_E2E_PREIMAGE, nonce, &s, bits, h).is_ok(),
+                "k=8 witness must verify at height {h} (prefix-subset property)",
+            );
+        }
         assert!(verify_sis_pow_testnet(K8_E2E_PREIMAGE, nonce, &s, bits).is_ok());
-        // Tampering the nonce breaks it at the canonical height.
-        assert!(verify_sis_pow(K8_E2E_PREIMAGE, nonce.wrapping_add(1), &s, bits, h).is_err());
+        // Tampering the nonce breaks it wherever the ramp sits.
+        assert!(verify_sis_pow(
+            K8_E2E_PREIMAGE, nonce.wrapping_add(1), &s, bits, K_RULE_ACTIVATION_HEIGHT,
+        )
+        .is_err());
     }
 
     #[test]
-    fn k4_mined_block_rejected_at_canonical_height() {
-        // (b) at the node seam: a k=4 (pre-fork style) witness must be
-        // rejected by the height-aware verify at/above H. A k=4 solution
-        // sneaks past k=8 with probability ≈ 1/4096, so mine until one fails
-        // (more than 8 mines has probability ≈ 4096^-8 — never).
-        let preimage = b"bloch-sf1-k4-rejected-at-h";
-        let bits = target_to_bits(&Target::MAX);
-        let h = CANONICAL_K_ACTIVATION_HEIGHT;
+    fn k4_mined_witness_rejected_where_the_ramp_lifts_k() {
+        // At the node seam: a k=4-only witness must be rejected by the
+        // height-aware verify wherever the difficulty ramp has lifted k above
+        // 4, and must stay valid below the rule activation (where k = 4 for
+        // every difficulty) — the soft fork tightens without invalidating
+        // history.
+        //
+        // This test previously pinned `h = CANONICAL_K_ACTIVATION_HEIGHT` and
+        // the easiest possible target, on the retired assumption that height
+        // alone selects k = 8. Under the ramp those parameters select k = 4 on
+        // both sides of the comparison, so every k=4 witness was accepted and
+        // the loop fell through to a message ("gate broken") that named the one
+        // thing that was NOT wrong.
+        let preimage = b"bloch-sf1-k4-rejected-on-ramp";
+        let bits = RAMP_K5_BITS;
+        let h = K_RULE_ACTIVATION_HEIGHT;
 
+        // Precondition, asserted before anything is mined: this test is only
+        // meaningful if the ramp really selects k > 4 for these (height, bits).
+        // If the K_WORK_* calibration moves, THIS is the assertion that should
+        // fail — not the "gate broken" one at the bottom, which would be a lie.
+        // Two distinguishable failures, deliberately: if the SELECTOR stops
+        // lifting k, this precondition fires; if the ENFORCEMENT stops applying
+        // the k it selected, the "gate broken" expect at the bottom fires. The
+        // old test could only ever produce the second message, which is why it
+        // spent six weeks reporting a broken gate that was not broken.
+        let k_above = canonical_residual_coeffs(h, bits);
+        assert!(
+            k_above > TESTNET_RESIDUAL_COEFFS,
+            "cannot exercise a k>4 gate: canonical_residual_coeffs({h}, {bits:#010x}) \
+             returned k={k_above}. Either the K_WORK_* thresholds moved (re-pick \
+             RAMP_K5_BITS to sit above K_WORK_5) or the ramp stopped rising with \
+             difficulty (a consensus regression — do NOT just retune the fixture)",
+        );
+        assert_eq!(
+            canonical_residual_coeffs(h - 1, bits),
+            TESTNET_RESIDUAL_COEFFS,
+            "below the rule activation k must be 4 at any difficulty",
+        );
+
+        // A k=4 witness passes the k=5 gate with probability ~1/8, so mine
+        // until one fails it (16 consecutive passes has probability 8^-16).
+        //
+        // COST, measured on an idle 2-core box in a debug build: ~4.9 s when
+        // the gate works (the first or second window fails k=5, as expected),
+        // but ~64 s when it does NOT, because all 16 windows are mined before
+        // the loop gives up. If this test ever appears to hang in CI rather
+        // than to fail, that IS the failure — read it as a broken gate, and
+        // give it a minute before killing the job.
         let mut rejected = None;
-        for i in 0..8u64 {
-            let (nonce, s) = mine_sis_pow_testnet(preimage, bits, i * 1_000_003, 500_000)
+        for i in 0..16u64 {
+            let (nonce, s) = mine_sis_pow_testnet(preimage, bits, i * 1_000_003, 8_000_000)
                 .expect("k=4 testnet regime must be brute-force mineable");
-            // Height-aware verify agrees with the testnet verify below H.
+            // Below activation the height-aware verify agrees with the testnet
+            // verify: the witness is valid there.
             assert!(verify_sis_pow(preimage, nonce, &s, bits, h - 1).is_ok());
+            assert!(verify_sis_pow(preimage, nonce, &s, bits, 0).is_ok());
             if verify_sis_pow(preimage, nonce, &s, bits, h).is_err() {
                 rejected = Some((nonce, s));
                 break;
             }
         }
-        let (nonce, s) = rejected
-            .expect("8 consecutive k=4 solutions all passed k=8 — gate broken");
+        let (nonce, s) = rejected.expect(
+            "16 consecutive k=4 witnesses all passed the ramp's k>4 gate — gate broken",
+        );
+        // Rejected at and above the activation, and for the RESIDUAL reason —
+        // not because the aux hash happened to miss.
         assert!(matches!(
             verify_sis_pow(preimage, nonce, &s, bits, h).unwrap_err(),
+            VerifyError::ResidualTooLarge { .. }
+        ));
+        assert!(matches!(
+            verify_sis_pow(preimage, nonce, &s, bits, h + 1).unwrap_err(),
             VerifyError::ResidualTooLarge { .. }
         ));
     }
 
     #[test]
     fn height_aware_miner_below_activation_matches_testnet_regime() {
-        // (e) below H the height-aware miner IS the testnet regime: cheap to
-        // mine, and its output verifies under both the testnet and the
-        // height-aware verify at pre-fork heights.
+        // Below the rule activation the height-aware miner IS the testnet
+        // regime: cheap to mine, and its output verifies under both the testnet
+        // and the height-aware verify at pre-activation heights.
         let preimage = b"bloch-sf1-below-h-equivalence";
         let bits = target_to_bits(&Target::MAX);
 
         let (nonce, s) = mine_sis_pow(preimage, bits, 0, 0, 20_000_000)
-            .expect("below H the height-aware miner must be k=4-cheap");
+            .expect("below the rule activation the height-aware miner must be k=4-cheap");
         assert!(verify_sis_pow(preimage, nonce, &s, bits, 0).is_ok());
-        assert!(verify_sis_pow(preimage, nonce, &s, bits, CANONICAL_K_ACTIVATION_HEIGHT - 1).is_ok());
+        assert!(verify_sis_pow(preimage, nonce, &s, bits, K_RULE_ACTIVATION_HEIGHT - 1).is_ok());
         assert!(verify_sis_pow_testnet(preimage, nonce, &s, bits).is_ok());
     }
 

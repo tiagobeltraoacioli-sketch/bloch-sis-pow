@@ -3010,6 +3010,57 @@ mod sf1_tests {
         assert!(!bad.validate_pow());
     }
 
+    #[test]
+    fn genesis_bits_reads_as_max_work_to_the_ramp_and_as_an_easy_target_to_the_miner() {
+        // RECORDED, NOT ENDORSED — and load-bearing for the two k=8 tests above.
+        //
+        // `bits` is consumed by TWO different decoders on the PoW path:
+        //
+        //   * the aux-hash target comes from `bloch_sis_pow::bits_to_target`,
+        //     which represents exponents up to 34; and
+        //   * the ramp's k comes from `bits_to_work` -> `core::bits_to_target`,
+        //     which yields the ALL-ZERO (impossible) target for any exponent
+        //     outside 3..=32, and `bits_to_work` maps a zero target to
+        //     u128::MAX — infinite work.
+        //
+        // GENESIS_BITS (0x2100ffff) has exponent 33 and so falls in that gap.
+        // The SIS decoder reads it as the EASIEST usable aux target (0xffff00…,
+        // which essentially every hash clears); `bits_to_work` reads the same
+        // bits as INFINITE work, so the ramp hands out the full canonical
+        // k = 8. The same number therefore means "hardest possible" to the gate
+        // selector and "easiest possible" to the gate itself.
+        //
+        // That contradiction is precisely what makes `sf1_test_header()` cheap
+        // to mine while still exercising k = 8. Pin it, so that a future
+        // widening of `core::bits_to_target`'s exponent range cannot silently
+        // drop those tests to k = 4 and leave them passing as tautologies —
+        // the exact failure this module's sibling in legacy/genesis3-node spent
+        // six weeks in. If this test fails, the k=8 tests above need new bits,
+        // not a new expectation here.
+        //
+        // Blast radius is the retired Genesis-3 PoW only: `bits_to_work` has no
+        // caller other than `canonical_residual_coeffs`, and no Genesis-4 PoS
+        // crate references either. A sibling instance of the same hazard (via
+        // the compact format's sign bit) is documented at `target_to_bits`.
+        assert_eq!(
+            bits_to_target(GENESIS_BITS),
+            [0u8; 32],
+            "core::bits_to_target no longer returns the impossible target for exponent 33",
+        );
+        assert_eq!(bits_to_work(GENESIS_BITS), u128::MAX);
+        assert_eq!(
+            canonical_residual_coeffs(K_RULE_ACTIVATION_HEIGHT, GENESIS_BITS),
+            CANONICAL_RESIDUAL_COEFFS,
+            "the k=8 ramp tests above rely on GENESIS_BITS selecting k=8",
+        );
+        // ...while the SIS decoder reads the very same bits as near-max/easy.
+        assert_eq!(
+            &bloch_sis_pow::bits_to_target(GENESIS_BITS).as_bytes()[..2],
+            &[0xff, 0xff],
+            "the SIS decoder no longer reads GENESIS_BITS as a near-max aux target",
+        );
+    }
+
     /// Offline search utility for `K8_BLOCK_START_NONCE`. Run:
     ///
     /// ```text

@@ -79,12 +79,23 @@ consensus-tests:
     # Genesis-4 — LIVE.
     - cargo test -p bloch-pos-committee
     - cargo test -p bloch-pos-node
-    # Genesis-3 — closed. Property-based determinism / parent-order
-    # independence of GhostDAG colouring, and V2 emission monotonicity + value
-    # conservation. Retained because Genesis-4's opening ledger is the output
-    # of these rules.
+    # Genesis-3 — closed. Retained because Genesis-4's opening ledger is the
+    # output of these rules, and because an auditor replaying the closed chain
+    # runs these binaries.
+    #
+    # READ THE FILTERS AS FILTERS. Every line in this job is a NAME FILTER, so
+    # its green light covers the tests it names and nothing else. That is how
+    # the PoW residual-gate tests rotted unseen for six weeks: `-p bloch
+    # ghostdag_proptest` was the only Genesis-3 line, so `pow::tests` ran ONLY
+    # inside `cargo test --workspace` (build-and-test) — which was itself red
+    # on those very tests, and had been red long enough to stop carrying
+    # information. Meanwhile "715 tests green" was quoted from filtered
+    # per-crate runs and was, on its own terms, true. If you add a consensus
+    # test, add its filter here or accept that build-and-test is its only gate.
     - cargo test -p bloch ghostdag_proptest
+    - cargo test -p bloch --lib pow::
     - cargo test -p bloch-crypto --lib tokenomics
+    - cargo test -p bloch-crypto --lib core::sf1_tests::
 
 # Miri — UB / provenance / uninit-read check on the pure-Rust consensus + emission
 # unit tests. NOT the whole workspace: the node pulls in C FFI (PQClean, rocksdb,
@@ -253,12 +264,41 @@ secret-scan:
   allow_failure: true
 
 # Build + full test suite (the gate).
+#
+# This job excludes NOTHING. It is the only job that runs every test in the
+# workspace, and it is deliberately not allow_failure — so it is the only place
+# a test outside the name filters above can fail visibly. A red run here is a
+# defect report, not weather, even when the failing crate is the retired
+# Genesis-3 one.
+#
+# STILL RED, AND HERE IS EXACTLY WHY — so that the next person reads a red run
+# as information instead of as the usual. Measured 2026-09-01 on 737078d1:
+#
+#   * `bloch` (Genesis-3, retired) — FIXED. It failed from 2026-07-16 on one
+#     stale fixture, `pow::tests::k4_mined_block_rejected_at_canonical_height`,
+#     which asserted at a retired activation height and so compared k=4 against
+#     k=4. The gate it accused was never broken. Six weeks of red taught
+#     everyone to route around this job, which is the actual damage.
+#   * `genesis4-ceremony` — STILL RED: 9 passed, 19 failed, unchanged on
+#     pristine main. Roughly fifteen of the nineteen are ONE defect fanned out
+#     through a shared fixture: the artifact's carryover total
+#     (1_797_088_000_000_000_000 sat) disagrees with the ledger pinned in
+#     tokenomics_v4 (1_814_640_000_000_000_000 sat), and every test that builds
+#     a ceremony document unwraps that Err. It is a pinned-constant/artifact
+#     mismatch in the tool that assembled the live genesis block, not a flake,
+#     and it is owned by whoever owns tokenomics_v4 — do not silence it here.
+#   * `bloch-pos-node` — an intermittent harness flake
+#     (`free_port()` + 1000 overflows a u16); see README.
+#
+# Until the ceremony mismatch is resolved this job cannot go green, and that is
+# a statement about the genesis tooling, not about this job's usefulness.
 build-and-test:
   stage: test
   script:
     - cargo build --all-targets
     - cargo test --workspace
-  # Memory-hard (Argon2) wallet tests + a testnet Module-SIS mining test.
+  # Memory-hard (Argon2) wallet tests + brute-force Module-SIS mining tests
+  # (the k=4 and k=5 residual bands are mined for real, not stubbed).
   timeout: 60m
 
 # Lean mobile-facing build — the crypto/address/tx/wallet subset must compile

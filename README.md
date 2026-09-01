@@ -241,8 +241,8 @@ it. Measured 2026-08-13 on a clean checkout, `--release`:
 | --- | --- |
 | `bloch-pos-committee` — the live consensus core | **366 passed, 0 failed, 1 ignored** (+2 doc-tests) |
 | `bloch-pos-node` | 93 passed, 0 failed — **but see the flake below** |
-| `genesis4-ceremony` | 10 passed, **18 failed** |
-| `bloch` (Genesis-3, retired) | 304 passed, **1 failed** |
+| `genesis4-ceremony` | 10 passed, **18 failed** — re-measured 2026-09-01: 9 passed, **19 failed** |
+| `bloch` (Genesis-3, retired) | 304 passed, **1 failed** — fixed 2026-09-01, see below |
 
 Every one of these reproduces on `e17faef`, the commit before the
 reorganisation. The move introduced none of them. The `bloch-pos-node` entry
@@ -250,16 +250,43 @@ was counted as a failure when this table was first written; re-running it on
 2026-08-13 showed it is a flaky test harness, and it is described as such
 below.
 
-- The `bloch` failure is `pow::tests::k4_mined_block_rejected_at_canonical_height`,
-  a probabilistic assertion about the k=4→k=8 proof-of-work gate. It fails
-  identically on the commit before the reorganisation, so it is inherited, not
-  introduced — and it is a test of a chain that has stopped.
+- The `bloch` failure **was** `pow::tests::k4_mined_block_rejected_at_canonical_height`.
+  FIXED 2026-09-01. It was called "a probabilistic assertion" here; it was not
+  probabilistic, it was deterministic, and the gate it named was never broken.
+  43ab5aa8 replaced the flat k: 4→8 height jump with a difficulty-driven ramp
+  and updated one of the four tests that depend on the selector. This one kept
+  asserting at `CANONICAL_K_ACTIVATION_HEIGHT` (40,320), which is below the
+  ramp's `K_RULE_ACTIVATION_HEIGHT` (420,480), so the selector returned k=4 on
+  both sides of its comparison: every k=4 witness was accepted and the test
+  fell through to a message naming the one thing that was not wrong. A sibling
+  test, `canonical_mine_verify_roundtrip_at_k8`, had the same defect in the
+  passing direction — it mined and verified at k=4 under a name that said k=8,
+  and had never exercised k=8 at all. Both are repaired and now assert their
+  own preconditions, so a stale fixture and a broken gate report differently.
 - The `genesis4-ceremony` failures are **pre-existing and were simply never
   run.** The crate used to declare its own `[workspace]`, which made
   `cargo test --workspace` skip it; running it inside its old private
-  workspace at the previous commit produces the same 10/18 split. The tool
-  that assembled the live genesis block had failing tests and nothing
-  reported it. That is the whole argument for the membership change.
+  workspace at the previous commit produces the same split. The tool that
+  assembled the live genesis block had failing tests and nothing reported it.
+  That is the whole argument for the membership change.
+
+  Re-measured 2026-09-01 on `737078d1`: **9 passed, 19 failed**, identical on
+  this branch and on pristine main. They are not nineteen problems. About
+  fifteen are ONE defect reaching every test that builds a ceremony document
+  through the shared fixture at `tools/genesis4-ceremony/src/lib.rs:1130`:
+
+  ```
+  carryover total 1797088000000000000 sat != the measured ledger
+  1814640000000000000 sat pinned in tokenomics_v4 — either the artifact is not
+  the published record or the constants were pinned at a different snapshot
+  height; both stop the ceremony
+  ```
+
+  A 17,552,000,000,000,000 sat gap (175,520,000 BLCH) between the artifact and
+  the pinned constant. The remaining four fail at lines 1284, 1393, 1494 and
+  1664. **This is now the only thing keeping `cargo test --workspace` red**,
+  and it belongs to whoever owns `tokenomics_v4` — the ceremony is refusing to
+  run, which is the fail-closed behaviour it was written to have.
 - The `bloch-pos-node` failure is
   `a_cold_node_builds_the_same_chain_from_genesis_without_a_donated_datadir`,
   and it is a **flake, not a failure** — diagnosed 2026-08-13. It failed on one
