@@ -9,6 +9,8 @@ import { FinalityPage } from "./pages/Finality";
 import { G4BlockPage } from "./pages/G4Block";
 import { BalancePage } from "./pages/Balance";
 import { ValidatorsPage } from "./pages/Validators";
+import { ValidatorDetailPage } from "./pages/ValidatorDetail";
+import { ValidatorQueuesPage } from "./pages/ValidatorQueues";
 import { SnapshotPage } from "./pages/Snapshot";
 import { SupplyPage } from "./pages/Supply";
 import { FeesPage } from "./pages/Fees";
@@ -46,6 +48,15 @@ const ROUTES: (Route & { nav?: string })[] = [
   { pattern: "/supply", nav: "Supply", render: () => <SupplyPage /> },
   { pattern: "/fees", nav: "Fees", render: () => <FeesPage /> },
   { pattern: "/validators", nav: "Validators", render: () => <ValidatorsPage /> },
+  // No "must come before /validators/:index" comment here: match() tries every
+  // literal before any pattern, so this is safe wherever it sits. See routes.tsx.
+  { pattern: "/validators/queues", render: () => <ValidatorQueuesPage /> },
+  {
+    pattern: "/validators/:index",
+    render: (p) => <ValidatorDetailPage index={Number(p.index)} />,
+    guard: (p) => /^\d+$/.test(p.index),
+    key: (p) => "v" + p.index,
+  },
   { pattern: "/snapshot", nav: "Snapshot", render: () => <SnapshotPage /> },
   {
     pattern: "/slot/:s",

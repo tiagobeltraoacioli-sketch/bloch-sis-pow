@@ -24,6 +24,24 @@ import { fmtBloch, fmtInt, timeAgo } from "../lib/format";
 import { Link } from "../lib/router";
 import { Loading } from "../components/ui";
 
+/**
+ * The two stake totals, from `getstakedistribution`.
+ *
+ * They are NOT interchangeable and the gap between them is currently a factor
+ * of about 2.25. `duty_total_active_stake_sat` is the pre-leak DUTY roster —
+ * the number `getvalidatorcount` and `getchaininfo` report. `total_active_stake_sat`
+ * is the post-leak CONSENSUS roster, and it is the one every quorum threshold
+ * is actually taken against. Telling a reader to take two thirds of the duty
+ * total, which is what this page used to do, overstates the quorum by that
+ * whole factor. The node names them apart for exactly this reason; see
+ * `stake_distribution` in crates/bloch-pos-node/src/rpc.rs.
+ */
+interface StakeTotals {
+  epoch: number;
+  total_active_stake_sat: string;
+  duty_total_active_stake_sat: string;
+}
+
 const POLL_MS = 15_000;
 const RECENT = 12;
 
@@ -43,6 +61,7 @@ export function G4Dashboard() {
   // the two are always rendered from the same reading: showing a fresh badge
   // next to a stale number would be worse than showing no badge at all.
   const [corro, setCorro] = useState<G4Corroboration | null>(null);
+  const [stake, setStake] = useState<StakeTotals | null>(null);
 
   useEffect(() => {
     let stop = false;
@@ -56,15 +75,17 @@ export function G4Dashboard() {
         // Each of these is allowed to fail on its own. The RPC is served by
         // the consensus loop, so a slow answer during block production is
         // ordinary — one timeout must not blank the page.
-        const [v, m, b] = await Promise.allSettled([
+        const [v, m, b, sd] = await Promise.allSettled([
           g4rpc<G4ValidatorCount>("getvalidatorcount"),
           g4rpc<Mempool>("getmempoolinfo"),
           recentBlocks(h.slot, RECENT),
+          g4rpc<StakeTotals>("getstakedistribution"),
         ]);
         if (stop) return;
         if (v.status === "fulfilled") setVals(v.value);
         if (m.status === "fulfilled") setMp(m.value);
         if (b.status === "fulfilled") setBlocks(b.value);
+        if (sd.status === "fulfilled") setStake(sd.value);
       } catch (e: any) {
         if (!stop) setErr(String(e?.message ?? e));
       }
@@ -148,8 +169,11 @@ export function G4Dashboard() {
 
         <p className="g4-note">
           Production and finality are separate questions. A block every slot says proposers are
-          healthy; a finalized epoch says two thirds of the leak-adjusted bonded stake agreed. It does
-          not say they cannot take it back — see finality. Two epochs of lag is the floor — finalizing epoch <em>n</em> requires epoch{" "}
+          healthy; a finalized epoch says two thirds of the <em>consensus</em> stake agreed —
+          the post-leak total on the right, not the duty total on the left. The two differ by
+          more than a factor of two while the leak is biting, so two thirds of the wrong one is
+          not a near-miss. It does not say they cannot take it back — see{" "}
+          <Link to="/finality">finality</Link>. Two epochs of lag is the floor — finalizing epoch <em>n</em> requires epoch{" "}
           <em>n+1</em> to justify on top of it.
         </p>
 
@@ -175,10 +199,24 @@ export function G4Dashboard() {
                   <span className="g4-dim"> of {fmtInt(vals.total)}</span>
                 </span>
               </div>
+              {/* Both totals or neither. Rendering one and calling it "bonded
+                  stake" beside a two-thirds claim is the 2.25x error this
+                  page shipped: the tile was the duty roster, the threshold is
+                  taken on the consensus roster. */}
               <div className="g4-stat">
-                <span className="g4-k">Bonded stake</span>
+                <span className="g4-k">Duty stake</span>
                 <span className="g4-v">{fmtBloch(BigInt(vals.total_active_stake_sat), 0)}</span>
+                <span className="g4-dim">roster before the leak</span>
               </div>
+              {stake && (
+                <div className="g4-stat">
+                  <span className="g4-k">Consensus stake</span>
+                  <span className="g4-v">
+                    {fmtBloch(BigInt(stake.total_active_stake_sat), 0)}
+                  </span>
+                  <span className="g4-dim">after the leak — quorum is taken on this</span>
+                </div>
+              )}
             </div>
           ) : (
             <p className="lookup-hint">The validator count did not answer this round.</p>
