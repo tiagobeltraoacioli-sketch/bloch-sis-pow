@@ -99,12 +99,16 @@ Two deliberate anti-false-alarm rules, both from real incidents:
   six `INVISIBLE-NODE` findings on six different boxes that all answered on the
   next pass. A box running nine nodes drops the occasional request under load,
   and a single miss is indistinguishable from a dead node.
-- **Heads are compared only within the same slot.** The sweep takes minutes and
-  a slot is 30 s, so counting distinct heads across a whole sweep reports a fork
-  on a perfectly converged fleet. The first run of this detector did exactly
-  that: "3 distinct heads" turned out to be three consecutive slots with one
-  head each. Finalized height is the slot-insensitive signal, and it is the one
-  that must be unanimous.
+- **Everything time-varying is compared only within the same slot.** The sweep
+  takes about four minutes and a slot is 30 s, so counting distinct values
+  across a whole sweep reports a fork on a perfectly converged fleet. The first
+  run of this detector did exactly that — "3 distinct heads" turned out to be
+  three consecutive slots with one head each — and the naive fix (compare
+  *finalized* height instead, since it is monotone) failed the same way one run
+  in five: finality advances mid-sweep, so 31,430 and 31,462, exactly one epoch
+  apart, looked like a fork. The rules that survive a slow sweep are: nodes
+  reading the **same slot** must agree on head and on finality, and no node may
+  lag the fleet's maximum finality by more than `FINALITY_SLACK`.
 
 A detector that cries wolf gets ignored, and an ignored detector is worse than
 none — it converts a known gap into a false sense of coverage.

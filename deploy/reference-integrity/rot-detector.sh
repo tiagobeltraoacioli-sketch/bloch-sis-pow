@@ -41,7 +41,7 @@ done
 [ -f "$CONF" ] || { echo "ROT-DETECTOR: UNDETERMINED — missing conf $CONF"; exit 2; }
 # shellcheck disable=SC1090
 . "$CONF"
-: "${BEHIND_OK:=4}" "${DEAD_PEER_FAIL:=1}" "${MIN_LIVE_FRACTION:=95}"
+: "${BEHIND_OK:=4}" "${DEAD_PEER_FAIL:=1}" "${MIN_LIVE_FRACTION:=95}" "${FINALITY_SLACK:=64}"
 : "${PROXY_JS:=}" "${PROXY_URL:=}" "${STATE_DIR:=$HOME/.bloch-reference-integrity}"
 
 note() { [ "$QUIET" = 1 ] || echo "$*"; }
@@ -94,10 +94,11 @@ done
 
 printf '%s' "$UP_RESULT" > "$INV/proxy-upstreams.raw"
 
-python3 - "$INV" "$BEHIND_OK" "$DEAD_PEER_FAIL" "$MIN_LIVE_FRACTION" "$QUIET" "$JSON" "${PROXY_URL:-}" "${PEER_SCOPE:-validators}" <<'PY'
+python3 - "$INV" "$BEHIND_OK" "$DEAD_PEER_FAIL" "$MIN_LIVE_FRACTION" "$QUIET" "$JSON" "${PROXY_URL:-}" "${PEER_SCOPE:-validators}" "${FINALITY_SLACK:-64}" <<'PY'
 import sys, os, json, collections
-inv, behind_ok, dead_fail, min_frac, quiet, as_json, proxy_url, scope = sys.argv[1:9]
-behind_ok, dead_fail, min_frac, quiet, as_json = int(behind_ok), int(dead_fail), int(min_frac), int(quiet), int(as_json)
+inv, behind_ok, dead_fail, min_frac, quiet, as_json, proxy_url, scope, finality_slack = sys.argv[1:10]
+behind_ok, dead_fail, min_frac, quiet, as_json, finality_slack = (
+    int(behind_ok), int(dead_fail), int(min_frac), int(quiet), int(as_json), int(finality_slack))
 
 def tsv(name):
     p = os.path.join(inv, name)
@@ -174,10 +175,24 @@ for sl, hc in sorted(per_slot.items()):
     if len(hc) > 1:
         rot("CONSENSUS", f"slot {sl}: {len(hc)} distinct heads among nodes reading the SAME slot — "
             + ", ".join(f"{k}×{v}" for k, v in hc.most_common(4)) + " (a real fork, not sweep skew)")
-# Finalized height is monotone and slot-insensitive: disagreement here is the
-# reliable fork signal, and a node below the others is the reliable straggler.
-if len(fins) > 1:
-    rot("CONSENSUS", f"{len(fins)} distinct finalized heights: " + ", ".join(f"{k}×{v}" for k, v in fins.most_common(4)))
+# Finality is NOT slot-insensitive either — it advances during the sweep, and a
+# four-minute sweep straddles an epoch boundary often enough that "two distinct
+# finalized heights" fires on a healthy fleet (it did, once in five runs: 31430
+# and 31462, exactly one epoch apart). Two rules that survive a slow sweep:
+#   a) nodes reading the SAME slot must agree on finality — a real fork signal;
+#   b) no node may lag the fleet maximum by more than FINALITY_SLACK.
+per_slot_fin = collections.defaultdict(set)
+for r in rpc:
+    if len(r) > 4 and r[2].isdigit() and r[4]: per_slot_fin[int(r[2])].add(r[4])
+for sl, fs in sorted(per_slot_fin.items()):
+    if len(fs) > 1:
+        rot("CONSENSUS", f"slot {sl}: nodes at the same slot report different finalized heights {sorted(fs)} — a real fork, not sweep skew")
+fin_ints = [int(f) for f in fins if f.isdigit()]
+if fin_ints:
+    fmax = max(fin_ints)
+    for r in rpc:
+        if len(r) > 4 and r[4].isdigit() and fmax - int(r[4]) > finality_slack:
+            rot("CONSENSUS", f"{r[0]}:{r[1]} finalized {r[4]}, {fmax - int(r[4])} behind the fleet max {fmax} (slack {finality_slack})")
 late = [(r[0], r[1], median - int(r[2])) for r in rpc if len(r) > 2 and r[2].isdigit() and median - int(r[2]) > behind_ok]
 for h, p, d in late:
     rot("CONSENSUS", f"{h}:{p} is {d} slots behind the fleet median ({median}) — the usual first sign of a rotted peer set")

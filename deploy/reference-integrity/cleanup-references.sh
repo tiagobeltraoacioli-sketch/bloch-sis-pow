@@ -94,11 +94,18 @@ preflight() {
   local splitslots fin
   splitslots=$(awk -F'\t' 'NF>5 && $3 ~ /^[0-9]+$/ && $6!=""{print $3"\t"$6}' "$INV/rpc.tsv" \
       | sort -u | cut -f1 | uniq -d | wc -l | tr -d ' ')
-  fin=$(awk -F'\t' 'NF>4 && $5!=""{print $5}' "$INV/rpc.tsv" | sort -u | wc -l | tr -d ' ')
-  if [ "$splitslots" = 0 ] && [ "$fin" = 1 ]; then
-    say "  chain:            converged (one head per slot, one finalized height $(awk -F'\t' 'NF>4 && $5!=""{print $5}' "$INV/rpc.tsv" | sort -u)) — safe to roll"
+  # Finality advances DURING the sweep, so "more than one finalized height" is
+  # normal; what matters is that nodes at the same slot agree, and that nobody
+  # lags the maximum by more than FINALITY_SLACK.
+  local finsplit finlag fmax
+  finsplit=$(awk -F'\t' 'NF>4 && $3 ~ /^[0-9]+$/ && $5!=""{print $3"\t"$5}' "$INV/rpc.tsv" \
+      | sort -u | cut -f1 | uniq -d | wc -l | tr -d ' ')
+  fmax=$(awk -F'\t' 'NF>4 && $5 ~ /^[0-9]+$/{print $5}' "$INV/rpc.tsv" | sort -n | tail -1)
+  finlag=$(awk -F'\t' -v m="$fmax" -v s="${FINALITY_SLACK:-64}" 'NF>4 && $5 ~ /^[0-9]+$/ && m-$5>s' "$INV/rpc.tsv" | wc -l | tr -d ' ')
+  if [ "$splitslots" = 0 ] && [ "$finsplit" = 0 ] && [ "$finlag" = 0 ]; then
+    say "  chain:            converged (one head per slot, one finality per slot, max finalized $fmax, no node lagging) — safe to roll"
   else
-    say "  chain:            REFUSE — $splitslots slot(s) with disagreeing heads, $fin distinct finalized heights. Converge first: a peer rewrite during a fork changes who each side can hear."; bad=1
+    say "  chain:            REFUSE — $splitslots slot(s) with disagreeing heads, $finsplit slot(s) with disagreeing finality, $finlag node(s) lagging finality. Converge first: a peer rewrite during a fork changes who each side can hear."; bad=1
   fi
   # 2. the rollout tool must exist and already know how to do this
   if [ -x "$ROLLOUT/rollout-release.sh" ]; then say "  rollout tool:     $ROLLOUT/rollout-release.sh present"
