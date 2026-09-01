@@ -249,7 +249,7 @@ fn body_transactions(env: &BlockEnvelope) -> Result<Vec<PosTransaction>, String>
 /// accumulates across messages and can therefore *drift*; a rolled state is a
 /// deterministic function of one value this type owns and can watch change.
 mod state_cell {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::ops::Deref;
     use std::sync::Arc;
 
@@ -303,6 +303,26 @@ mod state_cell {
         /// less than these two, not on there being only one.
         generation: u64,
         memo: RefCell<Vec<Entry>>,
+        /// `(generation, active_count, total_active_stake_sat)` — the answer
+        /// [`CommittedState::active_roster_summary`] last gave, and which
+        /// state it gave it for.
+        ///
+        /// **The key is the generation and nothing else, and that is the whole
+        /// argument.** The summary is a pure function of `self.state`: the
+        /// registry, the delegations, the cohort record and the leak counters
+        /// it reads are all fields of that one value, and the epoch it derives
+        /// at is `state.epoch`, a field too. `CommittedState` is replaced
+        /// whole, never mutated in place, by exactly the two writers below —
+        /// so a generation that has not moved is the same bytes, and the same
+        /// bytes cannot produce a different roster. That is a stronger key
+        /// than the `(epoch, head)` this was scoped as: two heads at the same
+        /// epoch are different generations, and the epoch cannot advance
+        /// without one (`close_epoch` runs only inside `apply_block`).
+        ///
+        /// A `Cell` and not a `RefCell` because the value is `Copy` and there
+        /// is nothing to borrow. Both writers clear it, for the same
+        /// belt-and-braces reason they clear `memo`.
+        roster: Cell<Option<(u64, usize, u128)>>,
     }
 
     impl StateCell {
@@ -311,6 +331,7 @@ mod state_cell {
                 state: Arc::new(state),
                 generation: 0,
                 memo: RefCell::new(Vec::new()),
+                roster: Cell::new(None),
             }
         }
 
@@ -322,6 +343,7 @@ mod state_cell {
             self.state = Arc::new(state);
             self.generation = self.generation.wrapping_add(1);
             self.memo.get_mut().clear();
+            self.roster.set(None);
         }
 
         /// Same, for a state that is already shared — the reorg path builds
@@ -332,6 +354,7 @@ mod state_cell {
             self.state = state;
             self.generation = self.generation.wrapping_add(1);
             self.memo.get_mut().clear();
+            self.roster.set(None);
         }
 
         /// The live state as a shared handle, for the one caller that must
@@ -360,6 +383,52 @@ mod state_cell {
                 epoch,
                 rolled: Arc::new(rolled),
             });
+        }
+
+        /// Plant a roster answer by hand. TEST ONLY, and for the same reason
+        /// [`Self::plant`] exists: a memo whose key is never actually
+        /// consulted would pass any test that only checks the answer is
+        /// right, because recomputing always gives the right answer. Planting
+        /// a WRONG answer is the only way to prove the lookup happens and
+        /// that the generation is what rejects it.
+        #[cfg(test)]
+        pub(super) fn plant_roster(&self, generation: u64, count: usize, stake: u128) {
+            self.roster.set(Some((generation, count, stake)));
+        }
+
+        /// `(active validator count, total active stake in satoshis)` for the
+        /// canonical state, memoized on the generation.
+        ///
+        /// # What this is for
+        ///
+        /// `getchaininfo` publishes both numbers, in adjacent fields, and
+        /// before [`CommittedState::active_roster_summary`] each was a
+        /// separate build of the epoch's duty roster — a delegation fold, a
+        /// walk of the registry, a cohort-cap application, twice per call, on
+        /// the consensus thread. That function made it one build. This memo
+        /// makes it one build *per block* rather than one per caller, which is
+        /// the half that matters on an unauthenticated port: the RPC has no
+        /// rate limit, so the bound on how often this runs is the bound on how
+        /// often a stranger can ask for it.
+        ///
+        /// # What it does not do
+        ///
+        /// It does not cache a roster. `active_roster_summary` builds the
+        /// roster, reads two integers off it and drops it; what is retained
+        /// here is the two integers. Nothing in consensus can read this — the
+        /// only callers are the `ChainInfo` and `ValidatorCount` arms of
+        /// `serve_rpc` — so a stale entry could at worst misreport a query,
+        /// and it cannot even do that, since the key moves whenever the state
+        /// does.
+        pub(super) fn active_roster(&self) -> (usize, u128) {
+            if let Some((generation, count, stake)) = self.roster.get() {
+                if generation == self.generation {
+                    return (count, stake);
+                }
+            }
+            let (count, stake) = self.state.active_roster_summary();
+            self.roster.set(Some((self.generation, count, stake)));
+            (count, stake)
         }
 
         /// The canonical state with epoch accounting rolled forward to
@@ -1979,17 +2048,26 @@ impl Engine {
                 VERSION_G4,
             )),
 
-            RpcRequest::ChainInfo => Ok(rpc::chain_info_json(
-                &self.state,
-                &self.head_id(),
-                self.head_state_root(),
-                self.chain.len() as u64 - 1,
-                self.finalized_height(),
-                self.wall_slot(),
-                self.state.validator_count(),
-                self.mempool.len(),
-                self.blocks.len(),
-            )),
+            RpcRequest::ChainInfo => {
+                // Read BEFORE the call and handed in, for the same reason
+                // `head_state_root` is: it is the expensive part of the
+                // response, the engine is the only thing that knows when it
+                // last changed, and `rpc::chain_info_json` should not be
+                // deciding when consensus-derived work runs.
+                let (count, total_stake_sat) = self.state.active_roster();
+                Ok(rpc::chain_info_json(
+                    &self.state,
+                    &self.head_id(),
+                    self.head_state_root(),
+                    self.chain.len() as u64 - 1,
+                    self.finalized_height(),
+                    self.wall_slot(),
+                    self.state.validator_count(),
+                    rpc::ActiveRoster { count, total_stake_sat },
+                    self.mempool.len(),
+                    self.blocks.len(),
+                ))
+            }
 
             RpcRequest::BlockCount => {
                 let fin = self.state.finality();
@@ -2062,17 +2140,17 @@ impl Engine {
                 ))
             }
 
-            RpcRequest::ValidatorCount => Ok(Json::obj(vec![
-                ("total", Json::u(self.state.validator_count() as u64)),
-                (
-                    "active",
-                    Json::u(self.state.active_validators().len() as u64),
-                ),
-                (
-                    "total_active_stake_sat",
-                    Json::sat(self.state.total_active_stake_sat()),
-                ),
-            ])),
+            RpcRequest::ValidatorCount => {
+                // Same two numbers `getchaininfo` publishes, from the same
+                // memo, so the two methods cannot disagree and the second
+                // caller does not pay for the roster again.
+                let (active, total_stake_sat) = self.state.active_roster();
+                Ok(Json::obj(vec![
+                    ("total", Json::u(self.state.validator_count() as u64)),
+                    ("active", Json::u(active as u64)),
+                    ("total_active_stake_sat", Json::sat(total_stake_sat)),
+                ]))
+            }
 
             RpcRequest::Balance(script_hash) => Ok(rpc::balance_json(&self.state, &script_hash)),
 
@@ -4441,18 +4519,23 @@ mod bench {
         // measured path, exactly as `apply_block` computed it once on the way
         // in.
         let header_root = st.state_root();
+        // Likewise off the measured path: this bench is about the state root
+        // and must not silently also report the roster. `bench_active_roster`
+        // measures that half on its own.
+        let (rc, rs) = st.active_roster_summary();
+        let roster = crate::rpc::ActiveRoster { count: rc, total_stake_sat: rs };
 
         let before = |st: &CommittedState| -> u128 {
             let t = Instant::now();
             let root = st.state_root();
-            let v = crate::rpc::chain_info_json(st, &head, root, 0, Some(0), 0, 1, 0, 1);
+            let v = crate::rpc::chain_info_json(st, &head, root, 0, Some(0), 0, 1, roster, 0, 1);
             let us = t.elapsed().as_micros();
             std::hint::black_box(v);
             us
         };
         let after = |st: &CommittedState| -> u128 {
             let t = Instant::now();
-            let v = crate::rpc::chain_info_json(st, &head, header_root, 0, Some(0), 0, 1, 0, 1);
+            let v = crate::rpc::chain_info_json(st, &head, header_root, 0, Some(0), 0, 1, roster, 0, 1);
             let us = t.elapsed().as_micros();
             std::hint::black_box(v);
             us
@@ -4492,15 +4575,339 @@ mod bench {
         // Byte-identical, which is what makes this transport-only. Asserted
         // rather than printed: a bench that quietly changed the answer would
         // be measuring the wrong thing to begin with.
-        let a = crate::rpc::chain_info_json(&st, &head, header_root, 0, Some(0), 0, 1, 0, 1);
+        let a = crate::rpc::chain_info_json(&st, &head, header_root, 0, Some(0), 0, 1, roster, 0, 1);
         let b = {
             let root = st.state_root();
-            crate::rpc::chain_info_json(&st, &head, root, 0, Some(0), 0, 1, 0, 1)
+            crate::rpc::chain_info_json(&st, &head, root, 0, Some(0), 0, 1, roster, 0, 1)
         };
         assert_eq!(
             a.to_string(),
             b.to_string(),
             "the handed-in root produced a different response body than the recomputed one"
+        );
+    }
+
+    /// A carryover-sized eUTXO set with the live chain's CONCENTRATION.
+    ///
+    /// `carryover_state_with_validators` spreads its outputs over 4,096 script
+    /// hashes, ~110 each. The live Genesis-4 set does not look like that: the
+    /// founder holds ~94% of the supply, so one script hash owns hundreds of
+    /// thousands of outputs. That difference is the whole cost of `getbalance`
+    /// and `getutxos` — the scan is the same either way, but what the old
+    /// `getutxos` body ALLOCATED was a function of how many outputs matched,
+    /// and on the flat fixture nothing matches enough to show it.
+    fn concentrated_state(n: u32, validators: u32, whale_share_pct: u32) -> CommittedState {
+        let flat = carryover_state_with_validators(n, validators);
+        let whale = [0xF0u8; 32];
+        let entries: Vec<EutxoEntry> = flat
+            .eutxos()
+            .enumerate()
+            .map(|(i, e)| EutxoEntry {
+                script_hash: if (i as u64 * 100 / n.max(1) as u64) < whale_share_pct as u64 {
+                    whale
+                } else {
+                    e.script_hash
+                },
+                ..e.clone()
+            })
+            .collect();
+        rebuild_with_entries(&flat, &entries)
+    }
+
+    /// The whale's script hash in [`concentrated_state`].
+    const WHALE: [u8; 32] = [0xF0u8; 32];
+
+    fn rebuild_with_entries(like: &CommittedState, entries: &[EutxoEntry]) -> CommittedState {
+        let vs: Vec<bloch_pos_committee::transition::GenesisValidator> = (0..like
+            .validator_count() as u32)
+            .map(|i| bloch_pos_committee::transition::GenesisValidator {
+                index: i,
+                pubkey: vec![(i % 251) as u8; 3_749],
+                staked_sat: 32 * 100_000_000,
+                randao_commitment: {
+                    let mut c = [0u8; 32];
+                    c[..4].copy_from_slice(&i.to_le_bytes());
+                    c
+                },
+                withdrawal_credentials: vec![0xAB; 32],
+                commission_bps: 500,
+            })
+            .collect();
+        CommittedState::genesis(
+            like.head(),
+            GENESIS_MIX,
+            &vs,
+            &[],
+            [0u8; 32],
+            [0u8; 32],
+            [0u8; 32],
+            EvmCommitment {
+                account_root: [0u8; 32],
+                receipts_root: [0u8; 32],
+                gas_used: 0,
+                base_fee_per_gas: 0,
+            },
+            entries,
+        )
+    }
+
+    /// **What the validator roster costs `getchaininfo`, three ways.**
+    ///
+    /// BEFORE  — `active_validators().len()` then `total_active_stake_sat()`,
+    ///           which is literally what the old `chain_info_json` body did.
+    ///           Two independent `duty_roster_at` builds: two
+    ///           `delegation::Registry::resolve` folds, two walks of the
+    ///           registry, two cohort-cap applications.
+    /// AFTER   — `active_roster_summary()`: one build, both numbers.
+    /// MEMO    — `StateCell::active_roster()` on a warm generation: the answer
+    ///           the previous caller already paid for.
+    ///
+    /// MEASURED 2026-09-01, release, 64 validators (the live Genesis-4 set),
+    /// median of 9:
+    ///
+    /// ```text
+    ///   BEFORE (two roster builds) : 0.004 ms
+    ///   AFTER  (one roster build)  : 0.002 ms
+    ///   MEMO   (warm generation)   : below the microsecond timer's resolution
+    /// ```
+    ///
+    /// ►► READ THAT HONESTLY. The duplicate build is real and removing it is
+    /// free, but at 64 validators it was costing **about two microseconds per
+    /// `getchaininfo`**. This is a tidiness fix, not a denial-of-service fix,
+    /// and it must not be reported as one — the same overstatement was made
+    /// about `getbalance` (see `what_a_read_costs_at_carryover_scale`, where
+    /// the 18.2 ms and the "~55 calls/s saturate a validator" figure were both
+    /// withdrawn after remeasurement) and overstating it twice is how a real
+    /// finding gets discounted later.
+    ///
+    /// The roster cost is linear in the registry, so this would matter at a
+    /// registry two or three orders of magnitude larger. Genesis-4 has 64
+    /// validators. Re-measure before citing this as a saving.
+    ///
+    /// The memo is still worth having for a different reason than speed: it
+    /// bounds how often consensus-derived work runs to once per block rather
+    /// than once per caller, on a port with no authentication and no rate
+    /// limit. That is a bound the node controls instead of one a stranger
+    /// controls, which is worth two microseconds of nothing.
+    #[test]
+    #[ignore]
+    fn bench_active_roster() {
+        const CARRYOVER_N: u32 = 452_726;
+        const N_VALIDATORS: u32 = 64;
+        let st = carryover_state_with_validators(CARRYOVER_N, N_VALIDATORS);
+
+        let before = || -> u128 {
+            let t = Instant::now();
+            let n = st.active_validators().len();
+            let s = st.total_active_stake_sat();
+            let us = t.elapsed().as_micros();
+            std::hint::black_box((n, s));
+            us
+        };
+        let after = || -> u128 {
+            let t = Instant::now();
+            let v = st.active_roster_summary();
+            let us = t.elapsed().as_micros();
+            std::hint::black_box(v);
+            us
+        };
+
+        // The memo lives on `StateCell`, so measure it through `StateCell`
+        // rather than reimplementing the lookup — a bench of a paraphrase of
+        // the memo would not be a bench of the memo.
+        let cell = StateCell::new(st.clone());
+        let _ = cell.active_roster(); // pay for the first build, off the clock
+        let memo = || -> u128 {
+            let t = Instant::now();
+            let v = cell.active_roster();
+            let us = t.elapsed().as_micros();
+            std::hint::black_box(v);
+            us
+        };
+
+        let b = median((0..9).map(|_| before()).collect());
+        let a = median((0..9).map(|_| after()).collect());
+        let m = median((0..9).map(|_| memo()).collect());
+        println!("roster reads behind getchaininfo @ {N_VALIDATORS} validators");
+        println!("  BEFORE (two roster builds) : {:>9.3} ms", b as f64 / 1_000.0);
+        println!("  AFTER  (one roster build)  : {:>9.3} ms", a as f64 / 1_000.0);
+        println!("  MEMO   (warm generation)   : {:>9.3} ms", m as f64 / 1_000.0);
+
+        assert_eq!(
+            st.active_roster_summary(),
+            (st.active_validators().len(), st.total_active_stake_sat()),
+            "the projection answered something other than the two accessors"
+        );
+    }
+
+    /// **What `getbalance` and `getutxos` cost, before and after.**
+    ///
+    /// Sized and SHAPED like the live chain: 452,726 outputs, 94% of them on
+    /// one script hash, which is the founder's shape and the shape an attacker
+    /// would pick anyway, since the request that costs the node most costs the
+    /// caller the same 120 bytes as any other.
+    ///
+    /// `getbalance` BEFORE is two scans (`.count()` and `balance_sat()`),
+    /// AFTER is the fold. `getutxos` BEFORE collects every match then takes
+    /// `limit`; AFTER keeps at most `limit` during the walk. The allocation
+    /// line is the number that matters for `getutxos`: the scan is unavoidable
+    /// because `total` is published, the collection was not.
+    #[test]
+    #[ignore]
+    fn bench_balance_and_utxos() {
+        const CARRYOVER_N: u32 = 452_726;
+        const N_VALIDATORS: u32 = 64;
+        const WHALE_SHARE_PCT: u32 = 94;
+        let st = concentrated_state(CARRYOVER_N, N_VALIDATORS, WHALE_SHARE_PCT);
+        let matches = st.eutxos().filter(|e| e.script_hash == WHALE).count();
+
+        // BEFORE: exactly the two bodies that were replaced.
+        let bal_before = || -> u128 {
+            let t = Instant::now();
+            let count = st.eutxos().filter(|e| e.script_hash == WHALE).count();
+            let bal = st.balance_sat(&WHALE);
+            let us = t.elapsed().as_micros();
+            std::hint::black_box((count, bal));
+            us
+        };
+        let bal_after = || -> u128 {
+            let t = Instant::now();
+            let v = crate::rpc::balance_json(&st, &WHALE);
+            let us = t.elapsed().as_micros();
+            std::hint::black_box(v);
+            us
+        };
+
+        const LIMIT: usize = 1_000; // UTXO_PAGE_MAX, the worst legal page
+
+        // ── `getutxos`: THE COLLECTION ONLY, and that caveat is load-bearing.
+        //
+        // The first version of this bench compared a hand-rolled BEFORE against
+        // the real `utxos_json`, and reported AFTER as SLOWER — 2.7x on one
+        // run, 2.6x on a second (9.445 ms against 24.918 ms, min of 15). That
+        // is a measurement bug reproducing, not a regression reproducing: the
+        // BEFORE closure collected references and stopped, while AFTER went on
+        // to build 1,000 `eutxo_json` objects and the enclosing response —
+        // roughly 2,000 hex encodings the BEFORE never paid for. It was
+        // comparing half a function to a whole one, and the ~15 ms gap is the
+        // half that was missing.
+        //
+        // The production bodies do not differ that way. Both walk the filtered
+        // set once and call `eutxo_json` exactly `limit` times; the old one
+        // ALSO allocated and freed one reference per match (425,563 of them,
+        // 3.2 MB). The new body does strictly less work, so it cannot be
+        // slower — that is settled by reading the two bodies, and no stopwatch
+        // is needed for it.
+        //
+        // `eutxo_json` is private to the `rpc` module and this bench is a child
+        // of `engine`, so a FAITHFUL end-to-end before/after cannot be written
+        // here. It is written where it can be:
+        // `rpc::tests::what_a_read_costs_at_carryover_scale`, which has module
+        // access and reconstructs the old body verbatim. **Read that one for
+        // the timing.**
+        //
+        // What is measured here is the one thing this change is actually about
+        // and that the other bench cannot isolate: the COLLECTION. The old body
+        // materialised one reference per match before paging; the new one keeps
+        // at most `limit`. Both closures below stop at the same point, so this
+        // comparison is like-for-like even though neither is the whole method.
+        let collect_before = || -> u128 {
+            let t = Instant::now();
+            let all: Vec<&EutxoEntry> =
+                st.eutxos().filter(|e| e.script_hash == WHALE).collect();
+            let total = all.len();
+            let kept = all.iter().take(LIMIT).count();
+            let us = t.elapsed().as_micros();
+            std::hint::black_box((total, kept));
+            us
+        };
+        let collect_after = || -> u128 {
+            let t = Instant::now();
+            let mut total = 0usize;
+            let mut kept: Vec<&EutxoEntry> = Vec::with_capacity(LIMIT);
+            for e in st.eutxos().filter(|e| e.script_hash == WHALE) {
+                total += 1;
+                if kept.len() < LIMIT {
+                    kept.push(e);
+                }
+            }
+            let us = t.elapsed().as_micros();
+            std::hint::black_box((total, kept.len()));
+            us
+        };
+
+        let ms = |us: u128| us as f64 / 1_000.0;
+        // MIN of many, not median of a few. This box runs several agents'
+        // release builds at once, and a median over 7 samples on a saturated
+        // machine is mostly a measurement of somebody else's compile. The
+        // minimum is the least contaminated sample, which is the statistic
+        // this wants; both columns get it, and the reps are INTERLEAVED so a
+        // load spike cannot land on one variant only.
+        //
+        // It works: with this scheme `getbalance` came back at 13.454 ms
+        // BEFORE against 6.592 ms AFTER — 2.04x, which is exactly "two walks
+        // became one" and nothing else. (Medians on the same run: 17.384 and
+        // 10.004. Both columns are ~8x the live-chain figure for the same
+        // shape; the ratio survives the contention, the absolutes do not.)
+        const REPS: usize = 15;
+        let (mut bbs, mut bas, mut ubs, mut uas) = (vec![], vec![], vec![], vec![]);
+        for _ in 0..REPS {
+            bbs.push(bal_before());
+            bas.push(bal_after());
+            ubs.push(collect_before());
+            uas.push(collect_after());
+        }
+        let lo = |v: &Vec<u128>| *v.iter().min().expect("REPS > 0");
+        let (bb, ba) = (lo(&bbs), lo(&bas));
+        let (ub, ua) = (lo(&ubs), lo(&uas));
+        println!(
+            "  (min of {REPS} interleaved reps; medians for reference: \
+             bal {} / {} ms, utxo {} / {} ms)",
+            ms(median(bbs.clone())),
+            ms(median(bas.clone())),
+            ms(median(ubs.clone())),
+            ms(median(uas.clone())),
+        );
+        let ref_bytes = std::mem::size_of::<&EutxoEntry>();
+        println!(
+            "eUTXO queries @ n = {CARRYOVER_N}, {matches} of them on one script hash \
+             ({WHALE_SHARE_PCT}%)"
+        );
+        println!("  getbalance BEFORE (two scans)      : {:>9.3} ms", ms(bb));
+        println!("  getbalance AFTER  (one fold)       : {:>9.3} ms", ms(ba));
+        println!("  getutxos COLLECTION ONLY — not the whole method; see");
+        println!("    rpc::tests::what_a_read_costs_at_carryover_scale for that");
+        println!("  collect BEFORE (one ref per match)  : {:>9.3} ms", ms(ub));
+        println!("  collect AFTER  (at most `limit`)    : {:>9.3} ms", ms(ua));
+        println!(
+            "  getutxos   peak refs BEFORE        : {} x {ref_bytes} B = {:.1} MB",
+            matches,
+            (matches * ref_bytes) as f64 / 1_048_576.0
+        );
+        println!(
+            "  getutxos   peak refs AFTER         : {} (the page the caller asked for)",
+            LIMIT.min(matches)
+        );
+
+        // The answers must not have moved. Both bodies are on the same state,
+        // so this is an equality of full response bodies, not of summaries.
+        let v = crate::rpc::balance_json(&st, &WHALE);
+        assert_eq!(v.get("utxo_count").unwrap().as_u64(), Some(matches as u64));
+        assert_eq!(
+            v.get("balance_sat").unwrap().as_str().map(str::to_string),
+            Some(st.balance_sat(&WHALE).to_string()),
+            "the one-pass fold disagreed with `balance_sat`"
+        );
+        // The real method still answers what the old one did — asserted here
+        // even though it is not what is timed above, because a bench whose
+        // subject silently changed its answer is measuring the wrong thing.
+        let u = crate::rpc::utxos_json(&st, &WHALE, LIMIT);
+        assert_eq!(u.get("total").unwrap().as_u64(), Some(matches as u64));
+        assert_eq!(u.get("returned").unwrap().as_u64(), Some(LIMIT as u64));
+        assert_eq!(
+            u.get("truncated").map(|t| t.to_string()),
+            Some("true".to_string()),
+            "a page smaller than the match set must still report itself truncated"
         );
     }
 
@@ -4777,6 +5184,64 @@ mod rolled_memo_tests {
             *after,
             engine.rolled_to_uncached(target),
             "after the state moved, the memo must serve the NEW roll"
+        );
+    }
+
+    /// The roster memo's key is load-bearing, proved the same way as the
+    /// rolled-state memo's: by planting a wrong answer under it.
+    ///
+    /// First half: a summary tagged with a generation that is not the live one
+    /// must be ignored, and the honest numbers recomputed. That planted entry
+    /// is exactly what an unkeyed memo — one that just remembered the last
+    /// answer — would have served, and it is what would make `getchaininfo`
+    /// publish a validator count from before a slashing.
+    ///
+    /// Second half is the control, and the first proves nothing without it: a
+    /// memo that is never consulted would also pass. The same nonsense under
+    /// the LIVE generation IS returned, so the lookup is real and it was the
+    /// generation that rejected the first one.
+    #[test]
+    fn a_stale_roster_summary_is_never_served_and_a_live_one_is() {
+        let (mut engine, _dir) = perf_support::proposing_engine();
+        for slot in 1..=3 {
+            engine.propose(slot);
+        }
+        let live = engine.state.generation();
+        assert!(live > 0, "fixture: blocks must have moved the generation");
+
+        let honest = engine.state.active_roster_summary();
+        // Emphatically not the answer: a count and a stake nothing could
+        // legitimately produce on this fixture.
+        let poison = (usize::MAX, u128::MAX);
+        assert_ne!(honest, poison, "fixture: the planted answer must differ from the honest one");
+
+        // ── the stale entry ────────────────────────────────────────────────
+        engine.state.plant_roster(live.wrapping_sub(1), poison.0, poison.1);
+        assert_eq!(
+            engine.state.active_roster(),
+            honest,
+            "a roster summary memoized against a DIFFERENT state was served — \
+             `getchaininfo` would publish a validator count and a stake total from \
+             before the block that changed them"
+        );
+
+        // ── the control ───────────────────────────────────────────────────
+        engine.state.plant_roster(live, poison.0, poison.1);
+        assert_eq!(
+            engine.state.active_roster(),
+            poison,
+            "the memo was not consulted at all, so the half above passed vacuously"
+        );
+
+        // ── and a block must clear it ─────────────────────────────────────
+        // The planted poison is still in place. Applying a block moves the
+        // generation and empties the memo; if it did not, this read would
+        // still be poisoned.
+        engine.propose(4);
+        assert_eq!(
+            engine.state.active_roster(),
+            engine.state.active_roster_summary(),
+            "an applied block did not invalidate the roster memo"
         );
     }
 
@@ -5508,3 +5973,4 @@ mod duty_view_anchor {
         assert!(moved > 0);
     }
 }
+

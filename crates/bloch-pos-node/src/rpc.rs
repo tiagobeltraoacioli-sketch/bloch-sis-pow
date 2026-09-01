@@ -1539,6 +1539,23 @@ pub fn capabilities_json(
     ])
 }
 
+/// The two roster-derived numbers `getchaininfo` and `getvalidatorcount`
+/// publish, carried together because they come from ONE roster build.
+///
+/// See [`CommittedState::active_roster_summary`] for why they used to cost two,
+/// and `Engine::active_roster` for the memo that makes repeated reads free.
+/// Handed in for the same reason `state_root` is: the number is not cheap, the
+/// engine already has a reason to know it, and the RPC layer is not the place
+/// to decide when consensus-derived work runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ActiveRoster {
+    /// `StateReader::active_validators().len()` — the consensus roster's size.
+    pub count: usize,
+    /// `StateReader::total_active_stake_sat()` — the DUTY roster's stake sum,
+    /// leak not subtracted. Different roster from `count`, on purpose.
+    pub total_stake_sat: u128,
+}
+
 /// `getchaininfo` — the method the finality-aware consumers read (V4 §2).
 #[allow(clippy::too_many_arguments)]
 pub fn chain_info_json(
@@ -1557,6 +1574,14 @@ pub fn chain_info_json(
     finalized_height: Option<u64>,
     wall_slot: u64,
     validators_total: usize,
+    // The active count and the total active stake, HANDED IN for the same
+    // reason `state_root` above is. This line used to be two separate reads
+    // *inside* the body — `state.active_validators().len()` and
+    // `state.total_active_stake_sat()` — and each of those built the epoch's
+    // duty roster from scratch: a delegation fold, a registry walk and a
+    // cohort-cap application, twice, on the consensus thread, per caller. The
+    // values are unchanged; only who computes them, and how often, is.
+    active: ActiveRoster,
     mempool: usize,
     blocks_known: usize,
 ) -> Json {
@@ -1599,10 +1624,10 @@ pub fn chain_info_json(
             "validators",
             Json::obj(vec![
                 ("total", Json::u(validators_total as u64)),
-                ("active", Json::u(state.active_validators().len() as u64)),
+                ("active", Json::u(active.count as u64)),
             ]),
         ),
-        ("total_active_stake_sat", Json::sat(state.total_active_stake_sat())),
+        ("total_active_stake_sat", Json::sat(active.total_stake_sat)),
         ("base_fee_millisat_per_gas", Json::sat(state.base_fee_millisat_per_gas())),
         ("next_base_fee_millisat_per_gas", Json::sat(state.next_base_fee())),
         ("mempool", Json::u(mempool as u64)),
@@ -1872,12 +1897,68 @@ fn eutxo_json(e: &EutxoEntry) -> Json {
 }
 
 /// `getbalance` — the summed value of every output locked to `script_hash`.
+///
+/// # One pass, not two
+///
+/// This body used to read `.count()` off one walk of the eUTXO set and
+/// `state.balance_sat()` — a second walk with the same filter — off another.
+/// The set has no index by script hash, so each walk visits every output: at
+/// Genesis-4's 452,726-entry carryover that is 905,452 filter evaluations per
+/// call instead of 452,726. The fold below visits each entry once and produces
+/// both numbers.
+///
+/// `u128` for the sum, matching [`CommittedState::balance_sat`]'s arithmetic
+/// contract: a single output fits `u64`, a sum of two large ones does not.
+///
+/// # How much this is worth — corrected downward, 2026-09-01
+///
+/// An earlier note here (and in `what_a_read_costs_at_carryover_scale`) put
+/// `getbalance` at **18.2 ms**, and concluded that ~55 calls a second would be
+/// 100% of a validator's consensus thread. **Both figures are withdrawn.**
+/// Measured against the heaviest address on the live chain (426,194 outputs),
+/// the call costs about **1.7 ms warm** — the same as an empty address — and
+/// about 22 ms only on a cold thread. The 18.2 ms was a cold measurement read
+/// as a steady-state one.
+///
+/// So this change removes roughly one 1.7 ms walk per call, not nine
+/// milliseconds, and the amplification argument built on the old number does
+/// not survive: `getbalance` is not the lever it was described as. The change
+/// is still right — a duplicate walk of the whole eUTXO set for a number you
+/// already have is not defensible at any cost — but it should not be sold as a
+/// denial-of-service fix.
+///
+/// The RATIO, however, is measured and is exactly what the change predicts.
+/// `bench_balance_and_utxos`, 452,726 outputs with 425,563 on one script hash,
+/// min of 15 interleaved reps (min rather than median because the box was
+/// running other agents' release builds; interleaved so a load spike cannot
+/// land on one variant only):
+///
+/// ```text
+///   BEFORE (two walks) : 13.454 ms      (median 17.384)
+///   AFTER  (one walk)  :  6.592 ms      (median 10.004)
+///                        ---------
+///                        2.04x
+/// ```
+///
+/// Treat the absolute numbers as unusable — they are ~8x the live-chain figure
+/// for the same shape, which is the contention, not the code. The 2.04x is the
+/// result: two walks became one, and nothing else moved.
+///
+/// What IS still true, and is the actual exposure: this runs on the consensus
+/// thread, from a port with no authentication and no rate limit, and the walk
+/// is linear in the whole set and grows with it. The durable fix is a
+/// `script_hash -> outpoints` index in committed state, which is a state-layout
+/// change and not a query-layer one. The fix in front of it today is not
+/// serving this port to the world.
 pub fn balance_json(state: &CommittedState, script_hash: &[u8; 32]) -> Json {
-    let count = state.eutxos().filter(|e| &e.script_hash == script_hash).count();
+    let (count, balance_sat) = state
+        .eutxos()
+        .filter(|e| &e.script_hash == script_hash)
+        .fold((0u64, 0u128), |(n, sum), e| (n + 1, sum + u128::from(e.value)));
     Json::obj(vec![
         ("script_hash", Json::hex(script_hash)),
-        ("balance_sat", Json::sat(state.balance_sat(script_hash))),
-        ("utxo_count", Json::u(count as u64)),
+        ("balance_sat", Json::sat(balance_sat)),
+        ("utxo_count", Json::u(count)),
     ])
 }
 
@@ -1886,11 +1967,41 @@ pub fn balance_json(state: &CommittedState, script_hash: &[u8; 32]) -> Json {
 /// `truncated` rather than a cursor: the honest thing for a devnet-stage
 /// surface is to say the page was cut, not to invent a pagination protocol the
 /// OpenAPI V4 freeze has not decided on.
+///
+/// # The page is bounded; the collection used to not be
+///
+/// This body used to `collect()` **every** match into a `Vec<&EutxoEntry>` and
+/// then `take(limit)` from it. `total` needs the count, so the walk is
+/// unavoidable — but the collection was not: a caller asking for a page of
+/// 1,000 outputs on an address holding hundreds of thousands of them made the
+/// node materialise a reference for each one first. The founder's address is
+/// exactly that shape — 426,194 outputs — so one `getutxos` against it
+/// allocated roughly 3.4 MB before returning 1,000 entries, on the consensus
+/// thread, from a port with no authentication and no rate limit, for a request
+/// that costs the caller 120 bytes.
+///
+/// Unlike `getbalance` (see above, where the amplification claim was withdrawn
+/// after remeasurement), the asymmetry here is in the ALLOCATION and is real:
+/// the response is bounded at `limit` entries either way, so the caller's cost
+/// does not grow with the address while the node's did.
+///
+/// Now the scan counts every match and *keeps* at most `limit` of them, so
+/// peak allocation is a function of the page size the caller was going to be
+/// given anyway. Same scan, same `total`, same first `limit` entries in the
+/// same `(txid, vout)` order — the iterator is ordered, so taking the first
+/// `limit` during the walk and taking them after it select the same outputs.
 pub fn utxos_json(state: &CommittedState, script_hash: &[u8; 32], limit: usize) -> Json {
-    let matching: Vec<&EutxoEntry> =
-        state.eutxos().filter(|e| &e.script_hash == script_hash).collect();
-    let total = matching.len();
-    let page: Vec<Json> = matching.iter().take(limit).map(|e| eutxo_json(e)).collect();
+    let mut total: usize = 0;
+    // `limit` is caller-supplied but clamped to `UTXO_PAGE_MAX` before it
+    // reaches here (see the `getutxos` arm of `parse_request`), so this
+    // reserve cannot be steered into a large allocation by a request.
+    let mut page: Vec<Json> = Vec::with_capacity(limit.min(UTXO_PAGE_MAX));
+    for e in state.eutxos().filter(|e| &e.script_hash == script_hash) {
+        total += 1;
+        if page.len() < limit {
+            page.push(eutxo_json(e));
+        }
+    }
     Json::obj(vec![
         ("script_hash", Json::hex(script_hash)),
         ("total", Json::u(total as u64)),

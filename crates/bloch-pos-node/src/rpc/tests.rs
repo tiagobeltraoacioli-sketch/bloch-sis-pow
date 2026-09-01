@@ -210,7 +210,23 @@ fn getchaininfo_reports_slot_epoch_head_root_and_both_checkpoints() {
     // against `st.state_root()`, so this test still fails if the field ever
     // stops being the committed root of the state the rest of the object
     // describes.
-    let v = chain_info_json(&st, &head, st.state_root(), 0, Some(0), 12, 2, 3, 0);
+    // The roster summary is handed in as the engine hands it in. Taken from
+    // `active_roster_summary` and NOT from a literal, so this test reads the
+    // same numbers a live node publishes; `active_roster_summary_matches_the_two_accessors`
+    // is what pins those to `active_validators()` / `total_active_stake_sat()`.
+    let (count, total_stake_sat) = st.active_roster_summary();
+    let v = chain_info_json(
+        &st,
+        &head,
+        st.state_root(),
+        0,
+        Some(0),
+        12,
+        2,
+        crate::rpc::ActiveRoster { count, total_stake_sat },
+        3,
+        0,
+    );
 
     assert_eq!(v.get("slot").unwrap().as_u64(), Some(0));
     assert_eq!(v.get("epoch").unwrap().as_u64(), Some(0));
@@ -841,7 +857,8 @@ fn getcapabilities_describes_the_surface_without_reading_state() {
 /// `docs/specs/BLOCH-RPC-STABILITY-V4.md`, which is why any proposed method
 /// that would add a third scan has to justify itself against them.
 ///
-/// Measured 2026-08-31, release build, 452,726 entries:
+/// Measured 2026-08-31, release build, 452,726 entries — BEFORE the one-pass
+/// rewrite of `balance_json` and the bounded page in `utxos_json`:
 ///
 /// ```text
 /// getbalance          18.2 ms    (two full scans)
@@ -852,8 +869,51 @@ fn getcapabilities_describes_the_surface_without_reading_state() {
 /// ```
 ///
 /// Reads are serialised onto the consensus thread, so ~55 `getbalance` calls a
-/// second are 100% of a validator's consensus thread — on a port with no
+/// second were 100% of a validator's consensus thread — on a port with no
 /// authentication and no rate limit.
+///
+/// The test now prints BOTH the old body and the new one on the same state, so
+/// the comparison is reproduced rather than remembered.
+///
+/// **THIS TEST HAS NOT BEEN RUN TO COMPLETION.** It was attempted on
+/// 2026-09-01 and abandoned: the box was running several agents' release
+/// builds, and the LTO link alone ran over half an hour. Run it on a quiet
+/// machine before quoting any number from it.
+///
+/// The sibling bench in the node crate (`engine::bench::bench_balance_and_utxos`)
+/// DID complete, and settles the `getbalance` half: 13.454 ms for the old
+/// two-walk body against 6.592 ms for the new one-walk body, min of 15
+/// interleaved reps at 452,726 outputs with 425,563 on one script hash —
+/// **2.04x**, which is precisely "two walks became one". Its absolute values
+/// are ~8x the live-chain figure for the same shape and should be ignored; the
+/// ratio is the result.
+///
+/// It does NOT settle the `getutxos` half, and the reason is worth keeping:
+/// that bench's first `getutxos` comparison put the new body 2.6-2.7x SLOWER,
+/// twice. Both times it was the same measurement bug — a BEFORE closure that
+/// collected references and stopped, against an AFTER that went on to build
+/// 1,000 `eutxo_json` objects and the response, roughly 2,000 hex encodings
+/// the BEFORE never paid for. The gap WAS the missing half of the function.
+///
+/// What is not in doubt, because it is a property of the code rather than of a
+/// stopwatch: both `utxos_json` bodies do one filtered walk and exactly `limit`
+/// `eutxo_json` calls, and the old one additionally allocated and freed one
+/// reference per match (425,563 of them, 3.2 MB). The new body does strictly
+/// less work and cannot be slower. This test is the place to confirm that with
+/// a number, because it is the only one with the module access to reconstruct
+/// the old body verbatim. The old bodies are
+/// written out below under `# the old bodies, kept as the reference`; if the
+/// production bodies are ever changed again, change those to match what they
+/// replaced, or this stops measuring a delta and starts measuring noise.
+///
+/// **What the improvement does and does not buy.** It removes one walk of the
+/// eUTXO set per `getbalance`, which on the corrected numbers is worth about
+/// 1.7 ms a call, not nine. A duplicate walk for a number you already have is
+/// not defensible at any cost, so the change stands on its own — but it is not
+/// a denial-of-service fix and must not be reported as one. The walk that
+/// remains is still linear in the whole set because there is no index by
+/// script hash. The durable fix is that index, in committed state; the fix in
+/// front of it today is not serving this port to the world at all.
 #[test]
 #[ignore = "a measurement of the read surface, not a pass/fail assertion"]
 fn what_a_read_costs_at_carryover_scale() {
@@ -902,18 +962,60 @@ fn what_a_read_costs_at_carryover_scale() {
     println!("built {CARRYOVER_N} entries in {:?}", built.elapsed());
 
     let script = [0u8; 32];
+    let matches = state.eutxos().filter(|e| e.script_hash == script).count();
+    println!("{matches} of {CARRYOVER_N} outputs match the probed script hash");
+
+    // ── the old bodies, kept as the reference the new ones are measured
+    // ── against. These are what `balance_json` and `utxos_json` used to be,
+    // ── verbatim; they are not paraphrases and must not become paraphrases.
+    let old_balance = |st: &CommittedState| {
+        let count = st.eutxos().filter(|e| e.script_hash == script).count();
+        let bal = st.balance_sat(&script);
+        (count, bal)
+    };
+    let old_utxos = |st: &CommittedState, limit: usize| {
+        let matching: Vec<&EutxoEntry> =
+            st.eutxos().filter(|e| e.script_hash == script).collect();
+        let total = matching.len();
+        let page: Vec<Json> = matching.iter().take(limit).map(|e| eutxo_json(e)).collect();
+        (total, page.len())
+    };
 
     let t = Instant::now();
-    let _ = balance_json(&state, &script);
-    println!("getbalance          {:?}  (two full scans)", t.elapsed());
-
+    let before = old_balance(&state);
+    let bal_before = t.elapsed();
     let t = Instant::now();
-    let _ = utxos_json(&state, &script, UTXO_PAGE_DEFAULT);
-    println!("getutxos limit=100  {:?}  (one full scan, collects every match)", t.elapsed());
+    let after = balance_json(&state, &script);
+    let bal_after = t.elapsed();
+    println!("getbalance BEFORE   {bal_before:?}  (two full scans)");
+    println!("getbalance AFTER    {bal_after:?}  (one fold)");
+    // Same answer, or the measurement is of a different function.
+    assert_eq!(after.get("utxo_count").unwrap().as_u64(), Some(before.0 as u64));
+    assert_eq!(
+        after.get("balance_sat").unwrap().as_str().map(str::to_string),
+        Some(before.1.to_string()),
+        "the one-pass fold disagreed with the two-scan body it replaced"
+    );
 
-    let t = Instant::now();
-    let _ = utxos_json(&state, &script, UTXO_PAGE_MAX);
-    println!("getutxos limit=1000 {:?}", t.elapsed());
+    for limit in [UTXO_PAGE_DEFAULT, UTXO_PAGE_MAX] {
+        let t = Instant::now();
+        let b = old_utxos(&state, limit);
+        let u_before = t.elapsed();
+        let t = Instant::now();
+        let a = utxos_json(&state, &script, limit);
+        let u_after = t.elapsed();
+        println!("getutxos limit={limit:<4} BEFORE {u_before:?}  (collects every match)");
+        println!("getutxos limit={limit:<4} AFTER  {u_after:?}  (keeps at most `limit`)");
+        assert_eq!(a.get("total").unwrap().as_u64(), Some(b.0 as u64));
+        assert_eq!(a.get("returned").unwrap().as_u64(), Some(b.1 as u64));
+        println!(
+            "  peak refs BEFORE {} x {} B = {:.2} MB   AFTER {} entries",
+            b.0,
+            std::mem::size_of::<&EutxoEntry>(),
+            (b.0 * std::mem::size_of::<&EutxoEntry>()) as f64 / 1_048_576.0,
+            b.1
+        );
+    }
 
     let t = Instant::now();
     let _ = txout_json(&state, &balances[0].txid, 0);

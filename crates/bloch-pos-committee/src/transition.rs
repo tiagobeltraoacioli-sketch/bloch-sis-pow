@@ -1228,9 +1228,26 @@ pub struct CommittedState {
 /// The leaf itself comes from [`crate::state_root::eutxo_leaf`], the single
 /// definition shared with the from-scratch path, so a kept leaf and a
 /// recomputed one cannot disagree by construction.
+/// **Why the entries sit behind an `Arc`.** `compute_post_state` clones the
+/// whole committed state once per block (and again per epoch boundary) before
+/// a single transaction runs, and this map is the largest thing in it —
+/// 452,726 entries on the live Genesis-4 chain. MEASURED on real mainnet
+/// history: 1,051 transactions in 32,455 blocks, so **97.2% of blocks deep-copy
+/// the entire ledger to change nothing in it**, and a `sample(1)` profile of a
+/// real replay puts `BTreeMap::clone::clone_subtree` plus its matching
+/// `drop_in_place` and allocator traffic above every other cost in the node,
+/// hashing included.
+///
+/// `Arc` makes the clone a refcount bump and defers the physical copy to the
+/// first mutation, which `Arc::make_mut` performs exactly once per block that
+/// actually touches the set. It is a pure copy-on-write change: the map type,
+/// its ordering, its contents and `values()`'s iteration order are all
+/// untouched, so no leaf, no key and no state root can move. That is asserted
+/// rather than asserted-about — see `tests/eutxo_cow.rs`, and the real-history
+/// replay in the report.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct EutxoSet {
-    entries: BTreeMap<([u8; 32], u32), crate::state_root::EutxoEntry>,
+    entries: std::sync::Arc<BTreeMap<([u8; 32], u32), crate::state_root::EutxoEntry>>,
     /// The subtree of `entry key -> value hash` leaves, one per entry, always
     /// exactly in step.
     tree: crate::state_root::Smt,
@@ -1240,11 +1257,11 @@ impl EutxoSet {
     fn insert(&mut self, entry: crate::state_root::EutxoEntry) {
         let (key, value_hash) = crate::state_root::eutxo_leaf(&entry);
         self.tree.insert(key, value_hash);
-        self.entries.insert((entry.txid, entry.vout), entry);
+        std::sync::Arc::make_mut(&mut self.entries).insert((entry.txid, entry.vout), entry);
     }
 
     fn remove(&mut self, outpoint: &([u8; 32], u32)) {
-        if let Some(entry) = self.entries.remove(outpoint) {
+        if let Some(entry) = std::sync::Arc::make_mut(&mut self.entries).remove(outpoint) {
             let (key, _) = crate::state_root::eutxo_leaf(&entry);
             self.tree.remove(&key);
         }
@@ -1317,7 +1334,10 @@ impl FromIterator<crate::state_root::EutxoEntry> for EutxoSet {
         // leaves — and therefore commit an identical root.
         let leaves: BTreeMap<[u8; 32], [u8; 32]> =
             entries.values().map(crate::state_root::eutxo_leaf).collect();
-        EutxoSet { entries, tree: crate::state_root::Smt::from_leaf_map(&leaves) }
+        EutxoSet {
+            entries: std::sync::Arc::new(entries),
+            tree: crate::state_root::Smt::from_leaf_map(&leaves),
+        }
     }
 }
 
@@ -1662,11 +1682,74 @@ impl CommittedState {
     /// carries zero weight into both the quorum numerator and denominator.
     /// Read `epoch_committees`' docs before changing either roster.
     fn consensus_roster_at(&self, epoch: u64) -> Vec<Validator> {
-        let roster = self.duty_roster_at(epoch);
+        self.with_consensus_weight(self.duty_roster_at(epoch), epoch)
+    }
+
+    /// The leak half of [`Self::consensus_roster_at`], split out so a caller
+    /// that has ALREADY built the duty roster can reach consensus weight
+    /// without building it a second time.
+    ///
+    /// Extracted for [`Self::active_roster_summary`] and for no other reason.
+    /// It exists so that the "subtract the leak once the flag day binds" rule
+    /// has exactly ONE expression: a caller that needed both the pre-leak
+    /// stake and the post-leak index set would otherwise have to re-write the
+    /// `epoch < LEAKED_ROSTER_ACTIVATION_EPOCH` branch, and a second copy of
+    /// that branch is a consensus rule that can drift from this one.
+    fn with_consensus_weight(&self, roster: Vec<Validator>, epoch: u64) -> Vec<Validator> {
         if epoch < crate::params::LEAKED_ROSTER_ACTIVATION_EPOCH {
             return roster;
         }
         with_leak_applied(roster, |index| self.finality_engine.leaked_of(index))
+    }
+
+    /// The two roster-derived numbers a query surface publishes — how many
+    /// validators are active, and what they stake in total — from **one**
+    /// [`Self::duty_roster_at`] instead of two.
+    ///
+    /// # Why this is a projection and not a cache
+    ///
+    /// `duty_roster_at`'s own docs say the roster is derived on demand and
+    /// never cached, because a cached roster is the §5.5 pattern this crate
+    /// bans. Nothing here changes that: this function builds the roster,
+    /// reads two numbers off it, and drops it, exactly as the two accessors
+    /// below it did — it holds nothing across calls. What it removes is the
+    /// *duplicate build*, not the derivation.
+    ///
+    /// # Why it was two builds
+    ///
+    /// [`StateReader::active_validators`] answers with the consensus roster
+    /// (leak applied) and [`StateReader::total_active_stake_sat`] with the
+    /// duty roster (leak not applied). They are different rosters, so a
+    /// caller wanting both — `getchaininfo` wants both, in adjacent fields —
+    /// paid `duty_roster_at` twice: two `delegation::Registry::resolve`
+    /// folds, two walks of the registry, two cohort-cap applications. This
+    /// pays for the shared part once and applies the leak to the result,
+    /// which is what `consensus_roster_at` does anyway.
+    ///
+    /// The two values are bit-for-bit what the accessors return; the count is
+    /// taken AFTER [`Self::with_consensus_weight`] rather than assuming the
+    /// leak preserves the index set, because whether it does is precisely
+    /// what the `LEAK_DROPS_ZEROED` mutation switch exists to falsify.
+    ///
+    /// # How much this saves — measured, and it is small
+    ///
+    /// At Genesis-4's 64 validators the duplicate build cost about **two
+    /// microseconds** per `getchaininfo` (`bench_active_roster` in the node
+    /// crate: 4 µs before, 2 µs after). This is worth doing because building
+    /// the same roster twice for two numbers is indefensible at any price, not
+    /// because it was expensive. Do not cite it as a performance or
+    /// denial-of-service fix. The cost is linear in the registry, so the
+    /// picture changes at a registry orders of magnitude larger — re-measure
+    /// before claiming anything about one.
+    pub fn active_roster_summary(&self) -> (usize, u128) {
+        let roster = self.duty_roster_at(self.epoch);
+        // Read the stake off the PRE-leak roster: that is `duty_roster()`,
+        // which is what `total_active_stake_sat` sums. Reading it after the
+        // leak would silently answer a different (smaller) question.
+        let total_stake_sat: u128 =
+            roster.iter().map(|v| u128::from(v.effective_stake)).sum();
+        let count = self.with_consensus_weight(roster, self.epoch).len();
+        (count, total_stake_sat)
     }
 
     /// The frozen finality view over the engine's state.
@@ -7063,6 +7146,76 @@ mod tests {
         );
     }
 
+    /// **The one-build projection answers exactly what the two accessors did.**
+    ///
+    /// `active_roster_summary` exists so `getchaininfo` stops building the
+    /// epoch's duty roster twice per call. The saving is only legitimate if
+    /// the pair it returns is bit-for-bit `(active_validators().len(),
+    /// total_active_stake_sat())` — and the interesting case is precisely the
+    /// one where those two read DIFFERENT rosters: the count comes from the
+    /// consensus roster (leak subtracted), the stake from the duty roster
+    /// (leak not subtracted). A projection that read both off one side would
+    /// be wrong in exactly one of the two numbers.
+    ///
+    /// So this drives the same real-leak fixture as the call-site test above,
+    /// with the gate open, and asserts non-vacuity first: if the two rosters
+    /// were identical here, the assertion would hold for a broken
+    /// implementation too.
+    #[test]
+    fn active_roster_summary_matches_the_two_accessors() {
+        let _h = crate::params::rehearsal::HOOK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::params::rehearsal::LEAK_DROPS_ZEROED
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+
+        let (_t, mut g, _c) = setup(8);
+        let seed = g.seed_for_epoch(0);
+
+        // Accrue a real leak, exactly as the call-site test does — fabricating
+        // the accumulator would make the fixture prove itself.
+        for epoch in 1..400u64 {
+            let roster = g.duty_roster_at(0);
+            let mut accepted = Vec::new();
+            let votes = finality::votes_from_partition(epoch, &roster, &[], &seed, &mut accepted);
+            if g.finality_engine.process_epoch(&votes).is_err() {
+                break;
+            }
+            if roster
+                .iter()
+                .any(|v| g.finality_engine.leaked_of(v.index) >= v.effective_stake)
+            {
+                break;
+            }
+        }
+
+        // Open the gate, so the consensus roster really is the leaked one.
+        // `epoch` and not `slot`: every roster function here derives at
+        // `self.epoch`, which is also what `active_roster_summary` reads.
+        g.epoch = crate::params::LEAKED_ROSTER_ACTIVATION_EPOCH;
+
+        // Non-vacuity: the two rosters must actually differ here, or a
+        // projection that read both numbers off one of them would pass.
+        assert_ne!(
+            g.consensus_roster_at(g.epoch),
+            g.duty_roster_at(g.epoch),
+            "control failed: the leak never reached the consensus roster, so this test \
+             cannot distinguish a correct projection from one that reads a single roster"
+        );
+
+        let (count, stake_sat) = g.active_roster_summary();
+        assert_eq!(
+            count,
+            g.active_validators().len(),
+            "active count drifted from `active_validators()` - `getchaininfo` would \
+             publish a validator count no other method agrees with"
+        );
+        assert_eq!(
+            stake_sat,
+            g.total_active_stake_sat(),
+            "total active stake drifted from `total_active_stake_sat()` - the summary \
+             read the stake off the LEAKED roster, which is a different question"
+        );
+    }
+
     /// **MUTATION.** Put the split back through `with_leak_applied` and watch
     /// the call-site test go red:
     ///
@@ -8901,5 +9054,203 @@ mod carried_ownership_tests {
         almost[..20].copy_from_slice(&mine[..20]);
         almost[31] = 1; // one byte of tail set
         assert!(!owns(&mine, &almost));
+    }
+}
+
+/// The eUTXO copy-on-write change moves no state root.
+///
+/// `EutxoSet::entries` went from an owned `BTreeMap` to `Arc<BTreeMap>` so that
+/// `CommittedState::clone` — paid once per block, twice on an epoch boundary —
+/// stops deep-copying 452,726 ledger entries that 97.2% of blocks never touch
+/// (MEASURED: 1,051 transactions in 32,455 real mainnet blocks). The claim
+/// pinned here is that the change is invisible to consensus: same map, same
+/// ordering, same contents, therefore same leaves, same keys, same root.
+///
+/// The end-to-end proof is a replay of real mainnet history — `apply_block`
+/// recomputes the post-state root and returns `StateRootMismatch`, so a clean
+/// replay of the live chain is itself the proof. This module is the unit half:
+/// it shows the aliasing `Arc` introduces cannot be observed.
+#[cfg(test)]
+mod eutxo_cow {
+    use super::EutxoSet;
+    use crate::state_root::EutxoEntry;
+
+    fn e(i: u32) -> EutxoEntry {
+        EutxoEntry {
+            txid: [i as u8; 32],
+            vout: i % 4,
+            value: 8_400_000_000 + i as u64,
+            script_hash: [(i % 7) as u8; 32],
+        }
+    }
+
+    fn set(n: u32) -> EutxoSet {
+        (0..n).map(e).collect()
+    }
+
+    /// A clone that is then mutated must not disturb the original — the whole
+    /// point of `make_mut`, and the one way a copy-on-write bug shows up.
+    #[test]
+    fn mutating_a_clone_leaves_the_original_untouched() {
+        let a = set(256);
+        let root_a = a.tree().root();
+        let mut b = a.clone();
+        assert_eq!(a.tree().root(), b.tree().root(), "a clone starts equal");
+
+        b.insert(e(1000));
+        assert_eq!(a.tree().root(), root_a, "the original's root moved when its clone was written");
+        assert_ne!(b.tree().root(), root_a, "the clone's root did not move on insert");
+        assert_eq!(a, set(256), "the original's contents changed");
+
+        let mut c = a.clone();
+        c.remove(&(e(5).txid, e(5).vout));
+        assert_eq!(a.tree().root(), root_a, "removing from a clone moved the original's root");
+        assert_eq!(a, set(256), "the original's contents changed on a clone's remove");
+        assert_ne!(c.tree().root(), root_a, "the clone's root did not move on remove");
+    }
+
+    /// Iteration order is consensus-visible wherever the set is walked; an
+    /// `Arc` around the same `BTreeMap` cannot change it, and this says so.
+    #[test]
+    fn iteration_order_is_unchanged_by_the_arc() {
+        let s = set(512);
+        let seen: Vec<_> = s.values().map(|x| (x.txid, x.vout)).collect();
+        let mut sorted = seen.clone();
+        sorted.sort();
+        assert_eq!(seen, sorted, "values() must still yield ascending (txid, vout)");
+    }
+
+    /// Two sets built the same way are equal through the `Arc`, and two built
+    /// differently are not — `PartialEq` must compare contents, not pointers.
+    #[test]
+    fn equality_compares_contents_not_pointers() {
+        assert_eq!(set(64), set(64), "independently built equal sets compare unequal");
+        assert_ne!(set(64), set(65));
+        let a = set(64);
+        let b = a.clone();
+        assert_eq!(a, b, "an aliased clone compares unequal");
+    }
+
+    /// The root a copy-on-write set commits is the root a freshly built set
+    /// commits — insert/remove through `make_mut` must land in the same place
+    /// a direct mutation would.
+    #[test]
+    fn cow_mutation_reaches_the_same_root_as_a_fresh_build() {
+        let mut grown = set(128);
+        for i in 128..192 {
+            grown.insert(e(i));
+        }
+        assert_eq!(grown.tree().root(), set(192).tree().root(), "grow-by-insert root differs");
+        assert_eq!(grown, set(192));
+
+        let mut shrunk = set(192);
+        for i in 128..192 {
+            shrunk.remove(&(e(i).txid, e(i).vout));
+        }
+        assert_eq!(shrunk.tree().root(), set(128).tree().root(), "shrink-by-remove root differs");
+        assert_eq!(shrunk, set(128));
+    }
+}
+
+/// What the eUTXO copy-on-write change is worth, at the live chain's size.
+///
+/// Instrumentation only, `#[ignore]`d, asserts nothing. Both halves run over
+/// the SAME 452,726-entry data in the same process, and every figure is a
+/// MINIMUM over repetitions — on a loaded machine the mean is noise but the
+/// minimum is the least-preempted run, which is the number wanted here.
+///
+/// Run: `cargo test --release -p bloch-pos-committee --lib eutxo_clone_cost \
+///        -- --ignored --nocapture`
+#[cfg(test)]
+mod eutxo_clone_cost {
+    use super::EutxoSet;
+    use crate::state_root::EutxoEntry;
+    use std::collections::BTreeMap;
+    use std::time::{Duration, Instant};
+
+    /// Genesis-4's measured carryover size.
+    const N: u32 = 452_726;
+
+    fn h32(seed: u64) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        let mut x = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        for c in out.chunks_mut(8) {
+            x ^= x >> 30;
+            x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            x ^= x >> 27;
+            x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+            x ^= x >> 31;
+            c.copy_from_slice(&x.to_le_bytes());
+            x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        }
+        out
+    }
+
+    fn min_of<T>(k: usize, mut f: impl FnMut() -> T) -> Duration {
+        let mut best = Duration::from_secs(3600);
+        for _ in 0..k {
+            let t = Instant::now();
+            let out = f();
+            let d = t.elapsed();
+            std::hint::black_box(&out);
+            drop(out);
+            if d < best {
+                best = d;
+            }
+        }
+        best
+    }
+
+    fn us(d: Duration) -> f64 {
+        d.as_secs_f64() * 1e6
+    }
+
+    #[test]
+    #[ignore]
+    fn eutxo_clone_cost() {
+        println!("\n=== per-block eUTXO clone cost at Genesis-4 carryover size ===");
+        println!(
+            "profile: {}",
+            if cfg!(debug_assertions) { "DEBUG — worthless" } else { "release" }
+        );
+        let entries: BTreeMap<([u8; 32], u32), EutxoEntry> = (0..N)
+            .map(|i| {
+                let e = EutxoEntry {
+                    txid: h32(i as u64),
+                    vout: i % 4,
+                    value: 8_400_000_000u64.wrapping_add(i as u64),
+                    script_hash: h32(0xF000_0000 ^ i as u64),
+                };
+                ((e.txid, e.vout), e)
+            })
+            .collect();
+        println!("entries: {}", entries.len());
+
+        // BEFORE: what `CommittedState::clone` used to do to this field.
+        let before = min_of(20, || entries.clone());
+        println!("owned BTreeMap::clone (the OLD per-block cost) : {:>10.1} us", us(before));
+
+        // AFTER: the same field behind an Arc — what it costs now on the
+        // 97.2% of blocks that never touch the set.
+        let set: EutxoSet = entries.values().cloned().collect();
+        let after = min_of(2000, || set.clone());
+        println!("EutxoSet::clone, no mutation (the NEW cost)    : {:>10.3} us", us(after));
+
+        // AFTER, on a block that DOES spend: make_mut pays the copy once.
+        let victim = *entries.keys().next().expect("non-empty");
+        let mutated = min_of(20, || {
+            let mut c = set.clone();
+            c.remove(&victim);
+            c
+        });
+        println!("EutxoSet::clone + one remove (a spending block): {:>10.1} us", us(mutated));
+        println!(
+            "\nspeedup on a non-spending block: {:.0}x",
+            us(before) / us(after).max(1e-9)
+        );
+        println!(
+            "MEASURED on real mainnet history: 1,051 transactions in 32,455 blocks,\n\
+             so 97.2% of blocks take the cheap path."
+        );
     }
 }
