@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+[package]
+name = "bloch-staking-cli"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = """
+Operator tool for Genesis-4 validator staking transactions: funded deposit
+(DepositV2), signed voluntary exit, funded delegation, and the withdrawal
+crank. Every consensus quantity — signing roots, canonical bytes, txid, fee
+arithmetic, the per-validator cap — is imported from the consensus crate,
+never re-derived. Full plan preview before signing, typed confirmation at a
+real terminal, offline plan/sign/broadcast split, and build-time refusal of
+anything the chain would refuse (activation epochs included).
+"""
+
+[[bin]]
+name = "bloch-stake"
+path = "src/main.rs"
+
+[dependencies]
+# The live chain's transaction, staking and fee-market types — the SAME
+# crate the fleet's consensus runs. The signing roots, txids, canonical
+# bytes, activation gates and the deposit cap all come from here.
+bloch-pos-committee = { path = "../../crates/bloch-pos-committee" }
+# bloch1q… address parsing, hybrid ML-DSA-65 ‖ Falcon-1024 software
+# sign/verify, BIP39 seed derivation, encrypted keyfile decryption.
+bloch-crypto = { path = "../../crates/bloch-crypto" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+sha3 = { version = "0.10", default-features = false }
+# Hidden terminal input for seed phrases / keyfile passwords.
+rpassword = "7"

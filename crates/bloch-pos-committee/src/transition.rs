@@ -1837,7 +1837,13 @@ fn deposit_funding_active(epoch: u64) -> bool {
 /// and the unification is consensus, so it belongs on the SAME flag day as
 /// [`crate::params::FUNDED_STAKING_ACTIVATION_EPOCH`], not on a quiet
 /// binary swap.
-fn deposit_cap_sat(total_active_sat: u128) -> u128 {
+///
+/// **Visibility is deliberate.** `pub` so a client prices a bond against THIS
+/// derivation instead of restating "1% of active stake" in a wallet — a
+/// restated fold is a drift waiting to become a rejected deposit. Callers
+/// outside the crate must pass the chain's committed `total_active_stake_sat`,
+/// read from the node, and must not cache it across epochs.
+pub fn deposit_cap_sat(total_active_sat: u128) -> u128 {
     (total_active_sat * delegation::MAX_VALIDATOR_STAKE_BPS / 10_000)
         .max(staking::MIN_DEPOSIT_SAT)
 }
