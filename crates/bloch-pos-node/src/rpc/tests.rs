@@ -606,11 +606,14 @@ fn the_rpc_method_namespace_is_frozen() {
         "getchaininfo",
         "getmempoolinfo",
         "getnewaddress",
+        "getstakedistribution",
+        "getsupply",
         "gettransaction",
         "gettxout",
         "getutxos",
         "getvalidator",
         "getvalidatorcount",
+        "getvalidators",
         "listunspent",
         "sendrawtransaction",
     ];
@@ -699,14 +702,17 @@ fn only_the_frozen_names_route() {
     }
 
     let outside = [
-        // The names an integrator probed on the live endpoint, all absent.
+        // The names an integrator probed on the live endpoint that are still
+        // absent. `getsupply` and `getvalidators` left this list when they were
+        // built; `getissuance`, `getstakinginfo` and `getsupplyinfo` stay,
+        // because a near-synonym that silently works is how two names for one
+        // number end up in two clients.
         "getblockbyheight",
+        "getcirculatingsupply",
         "getissuance",
         "getpeers",
         "getstakinginfo",
-        "getsupply",
         "getsupplyinfo",
-        "getvalidators",
         "help",
         // Genesis-3 names that must not silently come back with PoW meanings.
         "getblock",
@@ -787,10 +793,26 @@ fn getcapabilities_describes_the_surface_without_reading_state() {
 
     // The absent list is the substitute for probing.
     let Some(Json::Arr(absent)) = v.get("absent") else { panic!("no absent array") };
-    for want in ["getblockbyheight", "getsupply", "getvalidators", "getstakinginfo", "help"] {
+    for want in ["getblockbyheight", "getissuance", "getstakinginfo", "getpeers", "help"] {
         assert!(
             absent.iter().any(|a| a.get("name") == Some(&Json::s(want))),
             "`{want}` was probed by a real integrator and must be answered here"
+        );
+    }
+
+    // The three names an integrator probed and got -32601 for, which this
+    // build now serves. They must have MOVED from `absent` to `methods`, not
+    // been added to one and left in the other: a client that reads `absent`
+    // and short-circuits would never call a method that works.
+    for moved in ["getsupply", "getvalidators", "getstakedistribution"] {
+        assert!(
+            methods.iter().any(|m| m.get("name") == Some(&Json::s(moved))),
+            "`{moved}` is served but getcapabilities does not list it"
+        );
+        assert!(
+            !absent.iter().any(|a| a.get("name") == Some(&Json::s(moved))),
+            "`{moved}` is served AND advertised as absent; the two lists are \
+             telling a client opposite things"
         );
     }
 
@@ -1493,4 +1515,540 @@ fn a_body_split_across_packets_is_reassembled() {
     let _ = sock.read_to_string(&mut out);
     assert!(out.starts_with("HTTP/1.1 200"), "got {out}");
     assert_eq!(spy.last(), Some(RpcRequest::BlockBySlot(41_290)));
+}
+
+// ─── The three reads the chain could not answer ─────────────────────────────
+
+/// `getsupply` reports the counter, the cap, and the two things a reader gets
+/// wrong — in the payload, not in a document.
+#[test]
+fn getsupply_ships_its_caveats_as_fields_not_as_documentation() {
+    use bloch_pos_committee::tokenomics_v4::{GENESIS_ISSUED_SAT, TOTAL_SUPPLY_SAT};
+
+    let issued = GENESIS_ISSUED_SAT + 777_000;
+    let v = supply_json(issued, TOTAL_SUPPLY_SAT, GENESIS_ISSUED_SAT, 54_547, 1_704, 1_702);
+
+    // R3 everywhere: every satoshi field is a decimal string, never a number.
+    for field in [
+        "issued_sat",
+        "cap_sat",
+        "remaining_sat",
+        "genesis_issued_sat",
+        "emitted_since_genesis_sat",
+    ] {
+        assert!(
+            matches!(v.get(field), Some(Json::Str(_))),
+            "`{field}` must be a decimal string; 10^19 sat does not survive a double"
+        );
+    }
+
+    assert_eq!(v.get("issued_sat").unwrap().as_str(), Some(issued.to_string().as_str()));
+    assert_eq!(
+        v.get("cap_sat").unwrap().as_str(),
+        Some(TOTAL_SUPPLY_SAT.to_string().as_str())
+    );
+    // The number that actually grows, which is the headline for issuance.
+    assert_eq!(v.get("emitted_since_genesis_sat").unwrap().as_str(), Some("777000"));
+
+    // The identity that makes `remaining_sat` mean what it means. If this ever
+    // fails, `remaining_sat` has stopped being the validator emission budget
+    // and the note below it has become a lie.
+    let remaining: u128 = v.get("remaining_sat").unwrap().as_str().unwrap().parse().unwrap();
+    assert_eq!(
+        remaining,
+        bloch_pos_committee::tokenomics_v4::VALIDATOR_EMISSION_SAT - 777_000,
+        "`remaining_sat` is the UNMINTED VALIDATOR EMISSION, not unissued supply"
+    );
+
+    // Both caveats travel with the answer. An integrator who reads `issued_sat`
+    // as circulating supply is wrong by however much has been burned, and the
+    // one who most needs to be told is the one who never opened the spec.
+    let issued_note = v.get("issued_note").unwrap().as_str().unwrap();
+    assert!(issued_note.contains("GROSS"), "the monotone/gross caveat must ship");
+    assert!(
+        issued_note.contains("not circulating supply"),
+        "the response must refuse the label a Bitcoin-shaped audit will apply"
+    );
+    let rem_note = v.get("remaining_note").unwrap().as_str().unwrap();
+    assert!(rem_note.contains("VALIDATOR EMISSION"), "the budget caveat must ship");
+
+    // Head state sits above the finalized checkpoint, so the counter can still
+    // move. An audit wanting a figure nobody can take back waits for this.
+    assert_eq!(v.get("at_epoch").unwrap().as_u64(), Some(1_704));
+    assert_eq!(v.get("finalized_epoch").unwrap().as_u64(), Some(1_702));
+    assert_eq!(v.get("finalized"), Some(&Json::Bool(false)));
+
+    let settled = supply_json(issued, TOTAL_SUPPLY_SAT, GENESIS_ISSUED_SAT, 32, 1, 9);
+    assert_eq!(settled.get("finalized"), Some(&Json::Bool(true)));
+}
+
+/// The two subtractions cannot panic, even on a state that violates the
+/// one-sided invariant they rest on.
+///
+/// `issued_sat <= TOTAL_SUPPLY_SAT` is enforced in `compute_post_state`, so a
+/// state this node accepted cannot get here. But a query surface that panics
+/// when an invariant it does not own is broken turns a consensus bug into a
+/// dead node — on an unauthenticated port, that is the whole attack.
+#[test]
+fn getsupply_does_not_panic_when_the_supply_invariant_is_violated() {
+    use bloch_pos_committee::tokenomics_v4::{GENESIS_ISSUED_SAT, TOTAL_SUPPLY_SAT};
+
+    let over = supply_json(TOTAL_SUPPLY_SAT + 1, TOTAL_SUPPLY_SAT, GENESIS_ISSUED_SAT, 0, 0, 0);
+    assert_eq!(over.get("remaining_sat").unwrap().as_str(), Some("0"));
+
+    let under = supply_json(0, TOTAL_SUPPLY_SAT, GENESIS_ISSUED_SAT, 0, 0, 0);
+    assert_eq!(under.get("emitted_since_genesis_sat").unwrap().as_str(), Some("0"));
+}
+
+/// `getvalidators` pages by registry index, and `next_start` is an index.
+#[test]
+fn getvalidators_pages_by_index_and_stops_without_looping() {
+    let st = state_with_balances();
+    let effective: Vec<(u32, u64)> =
+        st.active_validators().iter().map(|v| (v.index, v.effective_stake)).collect();
+
+    // A page shorter than the limit is the end of the registry. `next_start`
+    // must be null: a client that kept paging on a non-null cursor here would
+    // poll this method forever, on a port with no rate limit.
+    let all = st.validator_records(0, 50);
+    assert_eq!(all.len(), 2);
+    let v = validators_json(&all, &effective, st.validator_count(), 0, 50, 0);
+    assert_eq!(v.get("total").unwrap().as_u64(), Some(2));
+    assert_eq!(v.get("returned").unwrap().as_u64(), Some(2));
+    assert_eq!(v.get("next_start"), Some(&Json::Null));
+
+    // A full page carries a cursor, and the cursor is `last index + 1` — NOT
+    // `start + limit`. The registry is a map and may be sparse; a client that
+    // computes the offset itself skips records the moment an index is missing.
+    let first = st.validator_records(0, 1);
+    let v1 = validators_json(&first, &effective, st.validator_count(), 0, 1, 0);
+    assert_eq!(v1.get("returned").unwrap().as_u64(), Some(1));
+    assert_eq!(v1.get("next_start").unwrap().as_u64(), Some(1));
+
+    // Resuming from the cursor yields the rest. This page is ALSO exactly full,
+    // so it carries a cursor even though it ended the registry — a full page
+    // cannot know it was the last one without reading a record past it, and
+    // that peek would cost a clone of a ~3.7 KB key on every page to save one
+    // lookup on the last.
+    let second = st.validator_records(1, 1);
+    let v2 = validators_json(&second, &effective, st.validator_count(), 1, 1, 0);
+    let Some(Json::Arr(recs)) = v2.get("validators") else { panic!("no validators array") };
+    assert_eq!(recs.len(), 1);
+    assert_eq!(recs[0].get("index").unwrap().as_u64(), Some(1));
+    assert_eq!(v2.get("next_start").unwrap().as_u64(), Some(2));
+
+    // The walk terminates on the empty page, which is why a client must stop on
+    // `next_start: null` and never on arithmetic over `total`.
+    let third = st.validator_records(2, 1);
+    assert!(third.is_empty());
+    let v3 = validators_json(&third, &effective, st.validator_count(), 2, 1, 0);
+    assert_eq!(v3.get("returned").unwrap().as_u64(), Some(0));
+    assert_eq!(v3.get("next_start"), Some(&Json::Null));
+
+    // Starting past the end is empty, not an error: a validator can exit
+    // between two pages and a scanner must not treat that as a failure.
+    let past = st.validator_records(9_999, 50);
+    assert!(past.is_empty());
+    let vp = validators_json(&past, &effective, st.validator_count(), 9_999, 50, 0);
+    assert_eq!(vp.get("returned").unwrap().as_u64(), Some(0));
+    assert_eq!(vp.get("next_start"), Some(&Json::Null));
+}
+
+/// The page record is byte-for-byte the `getvalidator` record.
+///
+/// One definition of what a validator looks like, so a client that already
+/// parses the single-record method needs no new code — and so the two cannot
+/// drift into disagreeing about the same validator.
+#[test]
+fn getvalidators_reuses_the_getvalidator_record_verbatim() {
+    let st = state_with_balances();
+    let effective: Vec<(u32, u64)> =
+        st.active_validators().iter().map(|v| (v.index, v.effective_stake)).collect();
+
+    let single = validator_json(
+        &st.validator_record(1).unwrap(),
+        effective.iter().find(|(i, _)| *i == 1).map(|(_, s)| *s),
+        0,
+    );
+    let page = validators_json(&st.validator_records(1, 1), &effective, 2, 1, 1, 0);
+    let Some(Json::Arr(recs)) = page.get("validators") else { panic!() };
+    assert_eq!(recs[0], single, "the paged record must be the single record");
+}
+
+/// The page limit is clamped, not rejected, and the clamp is visible.
+#[test]
+fn getvalidators_clamps_an_absurd_page_instead_of_refusing_it() {
+    let RpcRequest::Validators { start, limit } =
+        route("getvalidators", Some(&parse_json("[7, 99999999]").unwrap())).unwrap()
+    else {
+        panic!("getvalidators must route to Validators")
+    };
+    assert_eq!(start, 7);
+    assert_eq!(
+        limit, VALIDATOR_PAGE_MAX,
+        "an unbounded page is a memory amplifier on a port with no authentication"
+    );
+
+    // Defaults, so the cheap call is the one a client makes by accident.
+    let RpcRequest::Validators { start, limit } = route("getvalidators", None).unwrap() else {
+        panic!()
+    };
+    assert_eq!((start, limit), (0, VALIDATOR_PAGE_DEFAULT));
+
+    // A start that is not a u32 index is invalid params, not a silent wrap to
+    // zero — wrapping would hand back page one and call it page four billion.
+    let huge = parse_json("[4294967296]").unwrap();
+    assert_eq!(
+        route("getvalidators", Some(&huge)).err().map(|e| e.code),
+        Some(-32602)
+    );
+}
+
+/// `getstakedistribution` answers at the one-third threshold, which is the one
+/// that decides whether finality can be reverted.
+#[test]
+fn getstakedistribution_reports_nakamoto_at_one_third() {
+    // Four validators at 40 / 30 / 20 / 10. Total 100.
+    // > 1/3 (33.3): 40 alone clears it            → 1
+    // > 1/2 (50):   40 + 30 = 70 clears it        → 2
+    let roster = [(0u32, 40u64), (1, 30), (2, 20), (3, 10)];
+    let v = stake_distribution_json(&roster, 100, 1_704);
+
+    assert_eq!(v.get("epoch").unwrap().as_u64(), Some(1_704));
+    assert_eq!(v.get("active").unwrap().as_u64(), Some(4));
+    assert_eq!(v.get("total_active_stake_sat").unwrap().as_str(), Some("100"));
+
+    let nc = v.get("nakamoto_coefficient").unwrap();
+    assert_eq!(
+        nc.get("one_third").unwrap().as_u64(),
+        Some(1),
+        "one_third is THE number: a finalized checkpoint reverts at one third"
+    );
+    assert_eq!(nc.get("one_half").unwrap().as_u64(), Some(2));
+
+    // Strictly greater, not `>=`. Three validators at exactly one third each:
+    // one of them holds exactly 1/3 and cannot revert anything alone, so the
+    // coefficient is 2. A `>=` would name a set that cannot do the thing the
+    // number claims it can.
+    let thirds = [(0u32, 10u64), (1, 10), (2, 10)];
+    let t = stake_distribution_json(&thirds, 30, 0);
+    assert_eq!(
+        t.get("nakamoto_coefficient").unwrap().get("one_third").unwrap().as_u64(),
+        Some(2),
+        "holding exactly one third is not holding more than one third"
+    );
+}
+
+/// The response does not grow with the validator set, and it says what it
+/// cannot know.
+#[test]
+fn getstakedistribution_is_fixed_size_and_disclaims_what_it_measures() {
+    let roster: Vec<(u32, u64)> = (0..500u32).map(|i| (i, u64::from(i) + 1)).collect();
+    let v = stake_distribution_json(&roster, 0, 7);
+
+    let Some(Json::Arr(top)) = v.get("top") else { panic!("no top array") };
+    assert_eq!(
+        top.len(),
+        STAKE_TOP_N,
+        "the per-validator list must be capped, or the response size tracks V"
+    );
+    // Descending, so `top[0]` is the largest holder.
+    assert_eq!(top[0].get("index").unwrap().as_u64(), Some(499));
+    assert_eq!(top[0].get("effective_stake_sat").unwrap().as_str(), Some("500"));
+    assert_eq!(v.get("active").unwrap().as_u64(), Some(500));
+
+    // The disclaimer is a field, because a client rendering this as
+    // "decentralisation" must render the disclaimer with it. Sixty-four indices
+    // can be — and on this chain today largely are — one operator.
+    assert_eq!(v.get("measures").unwrap().as_str(), Some("stake_by_validator_index"));
+    let note = v.get("measures_note").unwrap().as_str().unwrap();
+    assert!(note.contains("not per operator"));
+    assert!(note.contains("one third"));
+
+    // Shares are over the denominator this response publishes, so they sum to
+    // 10,000 bps. Publishing one total and computing with another is how a
+    // distribution that does not add up gets shipped.
+    let total: u128 =
+        v.get("total_active_stake_sat").unwrap().as_str().unwrap().parse().unwrap();
+    assert_eq!(total, roster.iter().map(|(_, s)| u128::from(*s)).sum::<u128>());
+}
+
+/// Ties are broken deterministically, so two honest nodes on the same state
+/// return the same list.
+///
+/// Without the tiebreak a third party diffing two nodes reads a disagreement
+/// that is not there — and disagreement between nodes is exactly the thing this
+/// chain's operators have spent weeks chasing for real.
+#[test]
+fn getstakedistribution_orders_ties_by_index() {
+    let roster = [(9u32, 5u64), (2, 5), (7, 5), (4, 5)];
+    let v = stake_distribution_json(&roster, 20, 0);
+    let Some(Json::Arr(top)) = v.get("top") else { panic!() };
+    let order: Vec<u64> = top.iter().map(|t| t.get("index").unwrap().as_u64().unwrap()).collect();
+    assert_eq!(order, vec![2, 4, 7, 9]);
+}
+
+/// An empty or zero-stake active set answers, rather than dividing by zero.
+///
+/// Reachable for real: the inactivity leak drives effective stake toward zero,
+/// and this chain has run with the leak biting.
+#[test]
+fn getstakedistribution_survives_an_empty_and_a_zero_stake_roster() {
+    let empty = stake_distribution_json(&[], 0, 3);
+    assert_eq!(empty.get("active").unwrap().as_u64(), Some(0));
+    assert_eq!(empty.get("total_active_stake_sat").unwrap().as_str(), Some("0"));
+    let nc = empty.get("nakamoto_coefficient").unwrap();
+    assert_eq!(nc.get("one_third"), Some(&Json::Null));
+    assert_eq!(nc.get("one_half"), Some(&Json::Null));
+    assert_eq!(empty.get("gini_bps").unwrap().as_u64(), Some(0));
+    assert_eq!(empty.get("quantiles").unwrap().get("p50_sat"), Some(&Json::Null));
+
+    // Fully leaked: the validators are in the roster at zero, which is a
+    // different fact from their absence and must not be a panic.
+    let leaked = [(0u32, 0u64), (1, 0)];
+    let v = stake_distribution_json(&leaked, 500, 3);
+    assert_eq!(v.get("active").unwrap().as_u64(), Some(2));
+    assert_eq!(
+        v.get("duty_total_active_stake_sat").unwrap().as_str(),
+        Some("500"),
+        "the pre-leak figure getchaininfo publishes must be reported beside, and \
+         apart from, the denominator used here"
+    );
+    let Some(Json::Arr(top)) = v.get("top") else { panic!() };
+    assert_eq!(top[0].get("share_bps"), Some(&Json::Null));
+}
+
+/// Gini is 0 at perfect equality and approaches 10,000 as one holder takes all.
+#[test]
+fn gini_reads_zero_for_equality_and_climbs_with_concentration() {
+    let equal = stake_distribution_json(&[(0, 10), (1, 10), (2, 10), (3, 10)], 40, 0);
+    assert_eq!(equal.get("gini_bps").unwrap().as_u64(), Some(0));
+
+    let skewed = stake_distribution_json(&[(0, 1), (1, 1), (2, 1), (3, 9_997)], 10_000, 0);
+    let g = skewed.get("gini_bps").unwrap().as_u64().unwrap();
+    assert!(g > 7_000, "one holder with 99.97% must read as extreme, got {g} bps");
+    assert!(g <= 10_000, "a coefficient above 1.0 is arithmetic, not concentration");
+}
+
+/// The three new names route to their own requests, and the two paginated
+/// arguments are the only ones a caller controls.
+#[test]
+fn the_three_new_reads_route_to_their_own_requests() {
+    let spy = Spy::new();
+    for (method, want) in [
+        ("getsupply", RpcRequest::Supply),
+        ("getstakedistribution", RpcRequest::StakeDistribution),
+    ] {
+        call(spy.as_ref(), &request(method, "[]"));
+        assert_eq!(spy.last(), Some(want), "`{method}` must reach its own arm");
+    }
+
+    // Named params, like every other method on this surface.
+    call(spy.as_ref(), &request("getvalidators", r#"{"start": 3, "limit": 2}"#));
+    assert_eq!(spy.last(), Some(RpcRequest::Validators { start: 3, limit: 2 }));
+}
+
+/// What the three new reads cost, at the live validator count and at 8x it.
+///
+/// `cargo test -p bloch-pos-node --bin bloch-pos --release -- --ignored \
+/// what_the_new_reads_cost -- --nocapture`
+///
+/// # Why this is a separate measurement
+///
+/// `what_a_read_costs_at_carryover_scale` needs the 452,726-entry carryover to
+/// say anything, and building it is why that test has never been run to
+/// completion on a busy box. **None of the three methods here touches the eUTXO
+/// set** — that is the property that makes them safe to add — so the state they
+/// need is 64 validators and nothing else, and this runs in seconds. Anything
+/// that makes one of these methods depend on the carryover has changed what it
+/// is, and belongs in the other test.
+///
+/// The pubkeys are 3,745 bytes, which is a real hybrid ML-DSA-65 ‖ Falcon-1024
+/// public key, because `pubkey_hash` is SHA3-256 over that and it is the
+/// dominant per-record cost of `getvalidators`. A 64-byte stub would understate
+/// the page by nearly two orders of magnitude.
+///
+/// V=512 is measured beside V=64 to answer the only question that matters for
+/// the validator-opening program: whether these methods stay cheap when the
+/// registry stops being 64.
+#[test]
+#[ignore = "a measurement of the new read surface, not a pass/fail assertion"]
+fn what_the_new_reads_cost() {
+    use bloch_pos_committee::tokenomics_v4::{GENESIS_ISSUED_SAT, TOTAL_SUPPLY_SAT};
+    use std::time::Instant;
+
+    // A real hybrid PQ public key's length: ML-DSA-65 (1,952) + Falcon-1024
+    // (1,793). `pubkey_hash` hashes all of it, per record, per page.
+    const HYBRID_PUBKEY_BYTES: usize = 3_745;
+
+    for v_count in [64u32, 512] {
+        let validators: Vec<GenesisValidator> = (0..v_count)
+            .map(|i| GenesisValidator {
+                index: i,
+                pubkey: vec![(i % 251) as u8; HYBRID_PUBKEY_BYTES],
+                // Deliberately unequal, so the sort, the quantiles and the
+                // Nakamoto walk all do real work instead of hitting a tie path.
+                staked_sat: u128::from(i + 1) * 1_000 * 100_000_000,
+                randao_commitment: [1u8; 32],
+                withdrawal_credentials: vec![],
+                commission_bps: 500,
+            })
+            .collect();
+        let actives: Vec<u32> = (0..v_count).collect();
+
+        let state = CommittedState::genesis(
+            BlockId::of(&genesis_header()),
+            [9u8; 32],
+            &validators,
+            &actives,
+            [0u8; 32],
+            [0u8; 32],
+            [0u8; 32],
+            EvmCommitment {
+                account_root: [0u8; 32],
+                receipts_root: [0u8; 32],
+                gas_used: 0,
+                base_fee_per_gas: 0,
+            },
+            &[],
+        );
+
+        println!("\n── V = {v_count} ──────────────────────────────────────────");
+
+        // Best of N. A single sample on a shared box measures the scheduler.
+        let best = |label: &str, mut f: &mut dyn FnMut()| {
+            let mut best = std::time::Duration::from_secs(999);
+            for _ in 0..15 {
+                let t = Instant::now();
+                f();
+                best = best.min(t.elapsed());
+            }
+            println!("  {label:<34} {best:?}");
+            best
+        };
+
+        // getsupply: a field read and two constants. This must not move with V
+        // — if it does, someone has made it read state it does not need.
+        best("getsupply", &mut || {
+            let _ = supply_json(
+                state.issued_sat(),
+                TOTAL_SUPPLY_SAT,
+                GENESIS_ISSUED_SAT,
+                state.slot(),
+                0,
+                0,
+            );
+        });
+
+        // The roster build the other two share, priced on its own so the
+        // per-method numbers below can be read as "roster + the method".
+        best("  (roster build alone)", &mut || {
+            let _: Vec<(u32, u64)> = state
+                .active_validators()
+                .iter()
+                .map(|v| (v.index, v.effective_stake))
+                .collect();
+        });
+
+        let roster: Vec<(u32, u64)> =
+            state.active_validators().iter().map(|v| (v.index, v.effective_stake)).collect();
+
+        for limit in [VALIDATOR_PAGE_DEFAULT, VALIDATOR_PAGE_MAX] {
+            best(&format!("getvalidators limit={limit}"), &mut || {
+                let r: Vec<(u32, u64)> = state
+                    .active_validators()
+                    .iter()
+                    .map(|v| (v.index, v.effective_stake))
+                    .collect();
+                let page = state.validator_records(0, limit);
+                let _ = validators_json(&page, &r, state.validator_count(), 0, limit, 0);
+            });
+        }
+
+        // The quadratic shape this signature exists to prevent, measured so the
+        // claim in `validators_json`'s doc is a number and not an assertion.
+        // Rebuilding the roster per record is what a naive implementation does.
+        let page = state.validator_records(0, VALIDATOR_PAGE_DEFAULT);
+        best("  naive per-record roster (page=50)", &mut || {
+            for rec in &page {
+                let eff = state
+                    .active_validators()
+                    .iter()
+                    .find(|v| v.index == rec.index)
+                    .map(|v| v.effective_stake);
+                let _ = validator_json(rec, eff, 0);
+            }
+        });
+
+        best("getstakedistribution", &mut || {
+            let r: Vec<(u32, u64)> = state
+                .active_validators()
+                .iter()
+                .map(|v| (v.index, v.effective_stake))
+                .collect();
+            let _ = stake_distribution_json(&r, 0, 0);
+        });
+
+        // The response size, which is the anti-DoS property: it must not track
+        // V. Printed as bytes, because "fixed-size" is checkable and "small" is
+        // not.
+        let sd = stake_distribution_json(&roster, 0, 0).to_string().len();
+        let sup = supply_json(0, TOTAL_SUPPLY_SAT, GENESIS_ISSUED_SAT, 0, 0, 0).to_string().len();
+        let pg = validators_json(
+            &state.validator_records(0, VALIDATOR_PAGE_DEFAULT),
+            &roster,
+            state.validator_count(),
+            0,
+            VALIDATOR_PAGE_DEFAULT,
+            0,
+        )
+        .to_string()
+        .len();
+        println!("  response bytes: getsupply {sup}, getstakedistribution {sd}, \
+                  getvalidators(50) {pg}");
+    }
+}
+
+/// The `getvalidators` page cap stays inside the cost of the worst read this
+/// surface already sanctions.
+///
+/// This is a constant assertion rather than a timing one on purpose — a
+/// stopwatch in CI measures the box. The number behind it comes from
+/// `what_the_new_reads_cost`: `pubkey_hash` is SHA3-256 over 3,745 bytes of
+/// hybrid ML-DSA-65 ‖ Falcon-1024 key material and costs **~32 µs per record**,
+/// so a page costs `limit × 32 µs` and nothing else of consequence.
+///
+/// At the proposed ceiling of 500 that is **17.1 ms**, measured at V=512 — one
+/// uninterruptible block of the consensus thread, on a port with no
+/// authentication and no rate limit. `getbalance` warm is ~1.7 ms and is the
+/// most expensive read this surface currently permits. A cap of 50 keeps the
+/// worst page at ~1.6 ms, so `getvalidators` adds **no new lever**: its worst
+/// case is the worst case that already existed.
+///
+/// If you are here because you raised the cap: the fix is to cache
+/// `pubkey_hash` on the validator record so a page stops being a hashing job,
+/// not to widen the bound. Raising it without that re-introduces exactly the
+/// amplifier this number closes.
+#[test]
+fn the_validator_page_cap_stays_within_the_worst_sanctioned_read() {
+    /// Measured, release build: SHA3-256 over one 3,745-byte hybrid pubkey.
+    const PUBKEY_HASH_MICROS: usize = 32;
+    /// `getbalance` warm at the live carryover, per `balance_json`'s corrected
+    /// note. The most expensive read this surface sanctions.
+    const WORST_SANCTIONED_MICROS: usize = 1_700;
+
+    let worst_page = VALIDATOR_PAGE_MAX * PUBKEY_HASH_MICROS;
+    assert!(
+        worst_page <= WORST_SANCTIONED_MICROS,
+        "a full `getvalidators` page would cost ~{worst_page} µs, above the \
+         ~{WORST_SANCTIONED_MICROS} µs of the worst read this surface already \
+         permits. That is a NEW lever for an unauthenticated caller on the \
+         consensus thread. Cache `pubkey_hash` on the record instead of raising \
+         VALIDATOR_PAGE_MAX ({VALIDATOR_PAGE_MAX})."
+    );
+    assert!(
+        VALIDATOR_PAGE_DEFAULT <= VALIDATOR_PAGE_MAX,
+        "the default page must fit inside the cap, or the cheap call a client \
+         makes by accident is the clamped one"
+    );
 }

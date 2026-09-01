@@ -2152,6 +2152,64 @@ impl Engine {
                 ]))
             }
 
+            // ONE roster build for the whole page. `active_validators()` is
+            // O(V + D) — a delegation resolve, a walk of the registry, a
+            // cohort cap and the leak — and calling it per record would make
+            // a 500-record page 500 of those for one unauthenticated call.
+            // It is read here, reduced to `(index, effective_stake)` pairs,
+            // and handed in; `rpc::validators_json` has no state handle, so
+            // the quadratic shape is not merely avoided, it is unavailable.
+            RpcRequest::Validators { start, limit } => {
+                let effective: Vec<(u32, u64)> = self
+                    .state
+                    .active_validators()
+                    .iter()
+                    .map(|v| (v.index, v.effective_stake))
+                    .collect();
+                let page = self.state.validator_records(start, limit);
+                Ok(rpc::validators_json(
+                    &page,
+                    &effective,
+                    self.state.validator_count(),
+                    start,
+                    limit,
+                    epoch_of(self.state.slot()),
+                ))
+            }
+
+            // O(1): a field read and two constants. Deliberately the cheapest
+            // state-touching method here, because a supply audit is the read a
+            // third party runs most often and the port has no rate limit.
+            RpcRequest::Supply => Ok(rpc::supply_json(
+                self.state.issued_sat(),
+                bloch_pos_committee::tokenomics_v4::TOTAL_SUPPLY_SAT,
+                bloch_pos_committee::tokenomics_v4::GENESIS_ISSUED_SAT,
+                self.state.slot(),
+                epoch_of(self.state.slot()),
+                self.state.finality().finalized.epoch,
+            )),
+
+            // One roster build, same as above and for the same reason. The
+            // duty total comes from `active_roster_summary`, which is the
+            // memo `getchaininfo` and `getvalidatorcount` already share — so
+            // the pre-leak figure this method publishes is bit-for-bit the one
+            // those two publish, and the two cannot drift into contradicting
+            // each other.
+            RpcRequest::StakeDistribution => {
+                let roster: Vec<(u32, u64)> = self
+                    .state
+                    .active_validators()
+                    .iter()
+                    .map(|v| (v.index, v.effective_stake))
+                    .collect();
+                let (_, duty_total) = self.state.active_roster();
+                Ok(rpc::stake_distribution_json(
+                    &roster,
+                    duty_total,
+                    epoch_of(self.state.slot()),
+                ))
+            }
+
             RpcRequest::Balance(script_hash) => Ok(rpc::balance_json(&self.state, &script_hash)),
 
             RpcRequest::Utxos { script_hash, limit } => {

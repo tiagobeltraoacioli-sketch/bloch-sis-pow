@@ -98,6 +98,44 @@ const ENGINE_TIMEOUT: Duration = Duration::from_secs(10);
 const UTXO_PAGE_DEFAULT: usize = 100;
 const UTXO_PAGE_MAX: usize = 1_000;
 
+/// `getvalidators` page size: default, and the ceiling a caller is clamped to.
+///
+/// # These numbers were chosen from a measurement, and it moved them
+///
+/// A validator record carries `pubkey_hash`, which is SHA3-256 over a hybrid
+/// ML-DSA-65 ‖ Falcon-1024 public key — 3,745 bytes hashed **per record**.
+/// `what_the_new_reads_cost` puts that at **~32 µs per record**, and the page
+/// cost is essentially nothing else: a 50-record page measures 1.58 ms at V=64
+/// and 1.59 ms at V=512, because it tracks the page and not the registry.
+///
+/// The proposal in `BLOCH-RPC-STABILITY-V4.md` §5.2 called for a ceiling of
+/// 500 and called the hashing "negligible at V=64". It is negligible at V=64 —
+/// but only because a 500-page cannot return more than 64 records when the
+/// registry holds 64. Measured at V=512, where it can, **a 500-record page
+/// costs 17.1 ms**: the same order as the worst read on this surface, in one
+/// uninterruptible block of the consensus thread, from one unauthenticated
+/// caller. That is a new lever, and this module's rule is that no method may
+/// add one.
+///
+/// So the ceiling is **50**, where the worst page (1.58 ms) is what the worst
+/// existing sanctioned read already costs (`getbalance`, ~1.7 ms warm). A full
+/// walk of a 500-validator registry is ten requests instead of one, and the
+/// total hashing is identical either way — what the cap buys is that the
+/// consensus thread yields between them instead of being held for 17 ms.
+///
+/// **Do not raise this to serve a larger registry.** Cache `pubkey_hash` on
+/// the record first; the cap bounds the symptom, and the hash is the cause.
+/// Raising it without that re-introduces the lever this number exists to close.
+const VALIDATOR_PAGE_DEFAULT: usize = 25;
+const VALIDATOR_PAGE_MAX: usize = 50;
+
+/// How many validators `getstakedistribution` names individually.
+///
+/// The response must be fixed-size regardless of V — that is the entire
+/// anti-DoS property of the method — so the per-validator list is capped and
+/// everything else it reports is a scalar.
+const STAKE_TOP_N: usize = 20;
+
 // ─── Errors ─────────────────────────────────────────────────────────────────
 //
 // # The error contract
@@ -758,7 +796,7 @@ pub struct Method {
 /// `getcapabilities` reports this, which is the whole point of it: a client
 /// asks one question at connect time instead of probing fourteen names and
 /// inferring the answer from which ones return -32601.
-pub const RPC_SURFACE_VERSION: &str = "4.1.0";
+pub const RPC_SURFACE_VERSION: &str = "4.2.0";
 
 /// Every method name this build answers. Sorted, unique, and asserted to be
 /// exactly the set the dispatcher accepts.
@@ -812,6 +850,18 @@ pub const RPC_SURFACE: &[Method] = &[
         summary: "always NO_WALLET (-32006): a node RPC does not mint key material",
     },
     Method {
+        name: "getstakedistribution",
+        stability: Stability::Provisional,
+        alias_of: None,
+        summary: "concentration of the active set — Nakamoto at one third, top 20, quantiles",
+    },
+    Method {
+        name: "getsupply",
+        stability: Stability::Committed,
+        alias_of: None,
+        summary: "issued against the cap; gross and monotone, and NOT circulating supply",
+    },
+    Method {
         name: "gettransaction",
         stability: Stability::Refused,
         alias_of: None,
@@ -842,6 +892,12 @@ pub const RPC_SURFACE: &[Method] = &[
         summary: "registered total, active count, and total active stake",
     },
     Method {
+        name: "getvalidators",
+        stability: Stability::Committed,
+        alias_of: None,
+        summary: "the registry, one page at a time; same record shape as `getvalidator`",
+    },
+    Method {
         name: "listunspent",
         stability: Stability::Provisional,
         alias_of: Some("getutxos"),
@@ -865,12 +921,12 @@ pub const RPC_SURFACE: &[Method] = &[
 /// than every integrator rediscovering it.
 pub const RPC_ABSENT: &[(&str, &str)] = &[
     ("getblockbyheight", "height is not the addressing unit under PoS; use `getblockbyslot`"),
-    ("getissuance", "no method reads the issued-supply counter yet; proposed, not built"),
+    ("getcirculatingsupply", "a full eUTXO scan per request on an unauthenticated port; \
+`getsupply` gives the issued counter, which is gross of burns and is not this"),
+    ("getissuance", "the issued-supply counter is `getsupply.issued_sat`"),
     ("getpeers", "peer identities are not exposed on an unauthenticated port"),
-    ("getstakinginfo", "proposed as `getstakedistribution`, not built"),
-    ("getsupply", "proposed as `getsupply`, not built — see BLOCH-RPC-STABILITY-V4.md §5"),
-    ("getsupplyinfo", "Genesis-3 name; not carried forward"),
-    ("getvalidators", "no bulk validator listing yet; read one at a time with `getvalidator`"),
+    ("getstakinginfo", "the concentration answer is `getstakedistribution`"),
+    ("getsupplyinfo", "Genesis-3 name; not carried forward — see `getsupply`"),
     ("help", "the machine-readable form is this method"),
 ];
 
@@ -921,6 +977,25 @@ pub enum RpcRequest {
     BlockById([u8; 32]),
     Validator(u32),
     ValidatorCount,
+    /// `getvalidators` — the registry, one page at a time.
+    ///
+    /// `start` is a registry **index**, not an offset: the map may be sparse,
+    /// so a caller resumes from `next_start` and never computes
+    /// `start + limit` itself. `limit` is already clamped to
+    /// [`VALIDATOR_PAGE_MAX`] by the time it gets here.
+    Validators { start: u32, limit: usize },
+    /// `getsupply` — the issued counter against the cap.
+    ///
+    /// O(1): a field read of committed state plus two constants. It is the
+    /// cheapest state-touching method on this surface, and deliberately so —
+    /// a supply audit is the read a third party runs most often.
+    Supply,
+    /// `getstakedistribution` — how concentrated the active set is.
+    ///
+    /// One roster build, O(V + D), plus an O(V log V) sort. The response is
+    /// fixed-size regardless of V, so the work is bounded by consensus (V is
+    /// capped) rather than by what the caller asks for.
+    StakeDistribution,
     Balance([u8; 32]),
     Utxos { script_hash: [u8; 32], limit: usize },
     /// `gettxout` — is this ONE output still unspent?
@@ -1086,6 +1161,36 @@ pub fn route(method: &str, params: Option<&Json>) -> Result<RpcRequest, RpcError
         "getblockbyid" => RpcRequest::BlockById(want_hex32(params, 0, "block_id")?),
         "getvalidator" => RpcRequest::Validator(want_u32(params, 0, "index")?),
         "getvalidatorcount" => RpcRequest::ValidatorCount,
+        "getsupply" => RpcRequest::Supply,
+        "getstakedistribution" => RpcRequest::StakeDistribution,
+        "getvalidators" => {
+            let start = match pick(params, 0, "start") {
+                None | Some(Json::Null) => 0,
+                Some(v) => {
+                    let n = v.as_u64().ok_or_else(|| {
+                        RpcError::invalid_params("`start` must be a non-negative integer")
+                    })?;
+                    u32::try_from(n).map_err(|_| {
+                        RpcError::invalid_params("`start` is a validator index and does \
+                                                  not fit in 32 bits")
+                    })?
+                }
+            };
+            // Clamped, not rejected — the same shape as `getutxos`, and for the
+            // same reason: an unbounded page is a memory amplifier on a port
+            // with no authentication. The client is told what it actually got
+            // through `returned`, so the clamp is visible rather than silent.
+            let limit = match pick(params, 1, "limit") {
+                None | Some(Json::Null) => VALIDATOR_PAGE_DEFAULT,
+                Some(v) => {
+                    let n = v.as_u64().ok_or_else(|| {
+                        RpcError::invalid_params("`limit` must be a non-negative integer")
+                    })?;
+                    (n as usize).clamp(1, VALIDATOR_PAGE_MAX)
+                }
+            };
+            RpcRequest::Validators { start, limit }
+        }
         "getbalance" => RpcRequest::Balance(want_hex32(params, 0, "script_hash")?),
         // Refused on purpose, and permanently for this build. See the doc
         // comments on the two constructors for the full reasoning.
@@ -1503,6 +1608,9 @@ pub fn capabilities_json(
                 ("io_timeout_secs", Json::u(IO_TIMEOUT.as_secs())),
                 ("utxo_page_default", Json::u(UTXO_PAGE_DEFAULT as u64)),
                 ("utxo_page_max", Json::u(UTXO_PAGE_MAX as u64)),
+                ("validator_page_default", Json::u(VALIDATOR_PAGE_DEFAULT as u64)),
+                ("validator_page_max", Json::u(VALIDATOR_PAGE_MAX as u64)),
+                ("stake_distribution_top_n", Json::u(STAKE_TOP_N as u64)),
             ]),
         ),
         (
@@ -1885,6 +1993,341 @@ pub fn validator_json(
         ("exit_epoch", never(rec.exit_epoch)),
         ("withdrawable_epoch", never(rec.withdrawable_epoch)),
     ])
+}
+
+/// `getvalidators` — one page of the committed registry.
+///
+/// # Cost, and the one mistake that makes it quadratic
+///
+/// **O(log V + page) records, plus ONE roster build of O(V + D).** The roster
+/// is built by the caller and handed in as `effective`, already indexed. The
+/// naive shape — calling `active_validators()` inside the per-record loop to
+/// find each `effective_stake_sat` — is O(page · (V + D)): one delegation
+/// resolve, registry walk, cohort cap and leak **per record**. Measured on a
+/// 50-record page it adds 0.09 ms at V=64 and 0.87 ms at V=512, the quadratic
+/// term becoming visible exactly where the validator-opening program would put
+/// it. That is the specific amplifier this signature exists to make
+/// impossible: there is no state handle in scope here, so the loop *cannot*
+/// build a roster.
+///
+/// `pubkey_hash` dominates the per-record cost — measured at ~32 µs, SHA3-256
+/// over 3,745 bytes of hybrid key material — so the page cost tracks the page
+/// and not the registry: 1.58 ms for 50 records at V=64, and 1.59 ms for the
+/// same page at V=512. That measurement is why [`VALIDATOR_PAGE_MAX`] is 50
+/// and not the 500 originally proposed; see the constant.
+///
+/// # `next_start` is an index, not an offset
+///
+/// The registry is a `BTreeMap` and may be sparse. `next_start` is the index
+/// after the last record returned; a client that instead computes
+/// `start + limit` will skip records the moment an index is missing.
+///
+/// It is `null` when this page came back **short** — `returned < limit` — and
+/// not by comparing against `total`, because `total` counts records the caller
+/// may have started past. The consequence is worth stating rather than
+/// discovering: a page that is exactly full always carries a cursor, even when
+/// it happened to end the registry, so a client walking the whole set makes one
+/// final call that returns `returned: 0` and `next_start: null`. That is one
+/// extra O(log V) request; the alternative is reading one record past the page
+/// on every call to peek, which costs a clone of a ~3.7 KB key on every page to
+/// save one lookup on the last. **Stop on `next_start: null`, never on an
+/// assumption about `total`.**
+pub fn validators_json(
+    page: &[ValidatorRecord],
+    effective: &[(u32, u64)],
+    total: usize,
+    start: u32,
+    limit: usize,
+    current_epoch: u64,
+) -> Json {
+    let records: Vec<Json> = page
+        .iter()
+        .map(|rec| {
+            let eff = effective.iter().find(|(i, _)| *i == rec.index).map(|(_, s)| *s);
+            validator_json(rec, eff, current_epoch)
+        })
+        .collect();
+    // Exhausted iff this page came back short. `checked_add` because the last
+    // registry index could in principle be `u32::MAX`, and wrapping to 0 would
+    // hand a client an infinite pagination loop.
+    let next_start = match page.last() {
+        Some(last) if page.len() >= limit => {
+            last.index.checked_add(1).map_or(Json::Null, |n| Json::u(u64::from(n)))
+        }
+        _ => Json::Null,
+    };
+    Json::obj(vec![
+        ("total", Json::u(total as u64)),
+        ("start", Json::u(u64::from(start))),
+        ("returned", Json::u(records.len() as u64)),
+        ("next_start", next_start),
+        ("epoch", Json::u(current_epoch)),
+        ("page_max", Json::u(VALIDATOR_PAGE_MAX as u64)),
+        ("validators", Json::Arr(records)),
+    ])
+}
+
+/// `getsupply` — what has been issued, against the cap.
+///
+/// **Cost: O(1).** One field read of committed state and two compile-time
+/// constants. Nothing here walks the eUTXO set, the registry or the chain, so
+/// the price does not move as the chain grows — which is the property that
+/// makes it safe on a port with no authentication and no rate limit.
+///
+/// # The two things a reader gets wrong, which is why they ship in the payload
+///
+/// Both caveats are **fields**, not documentation, for the same reason
+/// `tx_hash_note` is a field: the integrator who most needs them is the one who
+/// never read the spec.
+///
+/// 1. **`issued_sat` is gross and monotone, and is NOT circulating supply.**
+///    Fees move existing coins, whistleblower rewards come out of slashed
+///    bonds, and burns never decrement it. It is an upper bound on what could
+///    be spendable, never the amount that is. A Bitcoin-shaped audit that
+///    reads this as "coins in circulation" is wrong by however much has been
+///    burned, in the direction of overstating.
+///
+/// 2. **`remaining_sat` is the unminted validator emission budget**, not
+///    "coins the chain has yet to create". `GENESIS_ISSUED_SAT =
+///    TOTAL_SUPPLY_SAT − VALIDATOR_EMISSION_SAT`: everything except the
+///    validator emission existed at slot 0. `genesis_issued_sat` is reported
+///    beside it so the two cannot be confused, and
+///    `emitted_since_genesis_sat` — the number that actually grows — is the
+///    one to watch for issuance.
+///
+/// Circulating supply is deliberately absent. It needs the whole eUTXO set
+/// summed, on the consensus thread, per request. If it is ever served it must
+/// be memoised per **finalised** epoch — one scan per ~16 minutes, amortised
+/// across every caller, and finality is the only boundary at which the answer
+/// is stable anyway.
+///
+/// # `finalized` is a warning, not a formality
+///
+/// `issued_sat` advances at epoch boundaries. Read at the head, it is the
+/// counter as of an epoch that can still be reorganised, so `finalized` is
+/// normally `false` and `finalized_epoch` says how far back the number is
+/// guaranteed. An audit that wants a figure nobody can take back must wait for
+/// `at_epoch <= finalized_epoch`.
+pub fn supply_json(
+    issued_sat: u128,
+    cap_sat: u128,
+    genesis_issued_sat: u128,
+    at_slot: u64,
+    at_epoch: u64,
+    finalized_epoch: u64,
+) -> Json {
+    // Saturating throughout. The invariant `issued_sat <= TOTAL_SUPPLY_SAT` is
+    // enforced in `compute_post_state`, so neither subtraction can underflow on
+    // a state this node accepted — but a query surface that panics when an
+    // invariant it does not own is violated is a query surface that turns a
+    // consensus bug into a dead node.
+    let remaining = cap_sat.saturating_sub(issued_sat);
+    let since_genesis = issued_sat.saturating_sub(genesis_issued_sat);
+    Json::obj(vec![
+        ("issued_sat", Json::sat(issued_sat)),
+        ("cap_sat", Json::sat(cap_sat)),
+        ("remaining_sat", Json::sat(remaining)),
+        ("genesis_issued_sat", Json::sat(genesis_issued_sat)),
+        ("emitted_since_genesis_sat", Json::sat(since_genesis)),
+        ("at_slot", Json::u(at_slot)),
+        ("at_epoch", Json::u(at_epoch)),
+        ("finalized_epoch", Json::u(finalized_epoch)),
+        ("finalized", Json::Bool(at_epoch <= finalized_epoch)),
+        (
+            "issued_note",
+            Json::s(
+                "`issued_sat` is GROSS and MONOTONE: burns never decrement it and fees \
+                 move existing coins. It is not circulating supply and must not be \
+                 labelled as such. No method on this surface reports circulating \
+                 supply — that needs a full scan of the unspent-output set, which is \
+                 not served per request on an unauthenticated port.",
+            ),
+        ),
+        (
+            "remaining_note",
+            Json::s(
+                "`remaining_sat` is the UNMINTED VALIDATOR EMISSION BUDGET, not coins \
+                 the chain has yet to create. GENESIS_ISSUED_SAT = cap - validator \
+                 emission, so everything except that emission existed at slot 0. Watch \
+                 `emitted_since_genesis_sat` for issuance.",
+            ),
+        ),
+    ])
+}
+
+/// `getstakedistribution` — how concentrated the active set is, in a
+/// fixed-size response.
+///
+/// # Cost
+///
+/// **One roster build, O(V + D), plus O(V log V) for the sort.** The roster is
+/// built by the caller and handed in, so this function itself is O(V log V)
+/// over a `Vec` the caller already owns. The response does not grow with V:
+/// the per-validator list is capped at [`STAKE_TOP_N`] and everything else is a
+/// scalar. V is bounded by consensus; D (delegations) is 0 today and is not.
+///
+/// # `nakamoto_coefficient.one_third` is the number that matters
+///
+/// Not one half. A finalised checkpoint on this chain reverts when at least one
+/// third of the stake equivocates, so the count of parties that can reach one
+/// third is the count that describes the risk. Reporting only `one_half` would
+/// understate it by exactly the factor an auditor is trying to measure.
+/// `one_half` is reported beside it because it is what other chains publish and
+/// omitting it invites a wrong comparison, not because it is the threshold
+/// here.
+///
+/// # `measures` is a disclaimer with a field name
+///
+/// This measures **stake per validator index, not per operator**. The RPC
+/// cannot know who runs what — an index is a registry slot, not an identity —
+/// and sixty-four indices can be one operator. On this chain today they largely
+/// are. A Nakamoto coefficient of 4 over indices is therefore an *upper bound*
+/// on the coefficient over operators, which is the pessimistic direction only
+/// if you read it backwards. Any client that renders this as decentralisation
+/// must render `measures` with it.
+///
+/// # Which roster, and why the denominators are named apart
+///
+/// Shares are taken over the **consensus roster** — the leak applied — because
+/// that is the weight that actually decides finality. `getchaininfo` and
+/// `getvalidatorcount` publish the **duty** roster's total, which is the
+/// pre-leak number and is larger whenever the inactivity leak is biting. Both
+/// are reported here, under names that cannot be mistaken for each other:
+/// `total_active_stake_sat` is the denominator for every share below, and
+/// `duty_total_active_stake_sat` is what the other two methods say. Publishing
+/// one and computing with the other is how shares that do not sum to 10,000
+/// get shipped.
+pub fn stake_distribution_json(
+    roster: &[(u32, u64)],
+    duty_total_stake_sat: u128,
+    epoch: u64,
+) -> Json {
+    let total: u128 = roster.iter().map(|(_, s)| u128::from(*s)).sum();
+
+    // Descending stake, ties broken by ascending index. The tiebreak is not
+    // cosmetic: without it two nodes on identical state can return different
+    // `top` lists, and a third party diffing them would read a disagreement
+    // that is not there.
+    let mut desc: Vec<(u32, u64)> = roster.to_vec();
+    desc.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+
+    let share_bps = |v: u64| -> Json {
+        if total == 0 {
+            Json::Null
+        } else {
+            Json::u((u128::from(v) * 10_000 / total) as u64)
+        }
+    };
+
+    let top: Vec<Json> = desc
+        .iter()
+        .take(STAKE_TOP_N)
+        .map(|(i, s)| {
+            Json::obj(vec![
+                ("index", Json::u(u64::from(*i))),
+                ("effective_stake_sat", Json::sat(u128::from(*s))),
+                ("share_bps", share_bps(*s)),
+            ])
+        })
+        .collect();
+
+    // Fewest validators whose combined stake STRICTLY exceeds the threshold.
+    // Strict, because holding exactly one third is not enough to revert a
+    // checkpoint; reporting the non-strict count would name a set that cannot
+    // in fact do the thing the number claims it can.
+    let nakamoto = |num: u128, den: u128| -> Json {
+        if total == 0 {
+            return Json::Null;
+        }
+        let mut acc: u128 = 0;
+        for (n, (_, s)) in desc.iter().enumerate() {
+            acc += u128::from(*s);
+            if acc * den > total * num {
+                return Json::u(n as u64 + 1);
+            }
+        }
+        // Unreachable while `total > 0` and num < den, since the full sum is
+        // `total`. Stated as null rather than as a number nobody derived.
+        Json::Null
+    };
+
+    // Nearest-rank on the ascending order, so a reported quantile is always a
+    // stake some validator actually has rather than an interpolation between
+    // two that do not exist.
+    let mut asc: Vec<u64> = roster.iter().map(|(_, s)| *s).collect();
+    asc.sort_unstable();
+    let n = asc.len();
+    let quantile = |p: usize| -> Json {
+        if n == 0 {
+            return Json::Null;
+        }
+        let rank = (p * n).div_ceil(100).max(1);
+        Json::sat(u128::from(asc[rank.min(n) - 1]))
+    };
+
+    Json::obj(vec![
+        ("epoch", Json::u(epoch)),
+        ("active", Json::u(n as u64)),
+        ("total_active_stake_sat", Json::sat(total)),
+        ("duty_total_active_stake_sat", Json::sat(duty_total_stake_sat)),
+        (
+            "nakamoto_coefficient",
+            Json::obj(vec![
+                ("one_third", nakamoto(1, 3)),
+                ("one_half", nakamoto(1, 2)),
+            ]),
+        ),
+        ("top", Json::Arr(top)),
+        ("top_n", Json::u(STAKE_TOP_N as u64)),
+        (
+            "quantiles",
+            Json::obj(vec![
+                ("p50_sat", quantile(50)),
+                ("p90_sat", quantile(90)),
+                ("p99_sat", quantile(99)),
+            ]),
+        ),
+        ("gini_bps", gini_bps(&asc)),
+        ("measures", Json::s("stake_by_validator_index")),
+        (
+            "measures_note",
+            Json::s(
+                "Stake per validator INDEX, not per operator. A registry index is a \
+                 slot, not an identity, and this node cannot know who runs what — on \
+                 this chain most indices are one operator today, so every figure here \
+                 is an upper bound on the per-operator answer. `one_third` is the \
+                 threshold that matters: a finalized checkpoint reverts at one third \
+                 of stake, not one half. Shares are over `total_active_stake_sat` \
+                 (consensus roster, leak applied); `duty_total_active_stake_sat` is \
+                 the pre-leak figure `getchaininfo` publishes.",
+            ),
+        ),
+    ])
+}
+
+/// Gini coefficient over an **ascending** slice of stakes, in basis points.
+///
+/// `G = (2·Σ i·x_i − (n+1)·Σx) / (n·Σx)`, one-indexed. Non-negative by
+/// Chebyshev's sum inequality on sorted input, so the `saturating_sub` guards a
+/// caller who passes an unsorted slice rather than a real case.
+///
+/// `u128` throughout: at V = 64 and a 10^19-satoshi cap the numerator peaks
+/// around 10^25, which overflows `u64` by six orders of magnitude and fits
+/// `u128` with thirteen to spare. `0` for an empty set or a set with no stake —
+/// perfect equality, which is the truthful reading of "nobody has anything".
+fn gini_bps(asc: &[u64]) -> Json {
+    let n = asc.len() as u128;
+    let sum: u128 = asc.iter().map(|s| u128::from(*s)).sum();
+    if n == 0 || sum == 0 {
+        return Json::u(0);
+    }
+    let weighted: u128 = asc
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (i as u128 + 1) * u128::from(*s))
+        .sum();
+    let numerator = (2 * weighted).saturating_sub((n + 1) * sum);
+    Json::u((numerator * 10_000 / (n * sum)) as u64)
 }
 
 fn eutxo_json(e: &EutxoEntry) -> Json {

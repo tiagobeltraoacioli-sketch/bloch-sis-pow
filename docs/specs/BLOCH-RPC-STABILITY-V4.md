@@ -4,8 +4,10 @@
 
 ```
 Document:   BLOCH-RPC-STABILITY-V4
-Status:     NORMATIVE for the shipped surface. Section 5 is a PROPOSAL.
+Status:     NORMATIVE for the shipped surface. Section 5 is BUILT as of
+            2026-09-01 and is now normative with the rest.
 Created:    2026-08-31
+Updated:    2026-09-01 — §5's three methods are implemented; surface 4.2.0
 Scope:      crates/bloch-pos-node/src/rpc.rs and its engine handlers
 Parents:    docs/specs/BLOCH-RPC-V4.md (design rationale, R0–R5)
             docs/WIRE-NAMESPACE-REGISTRY.md §5 (name allocation, PMO-owned)
@@ -29,7 +31,7 @@ only one of them is in this repository.
 ```
 client ──▶ https://posternlabs.com/g4rpc ──▶ 6+ upstream nodes
            Cloudflare Pages Function            crates/bloch-pos-node
-           READ_METHODS + WRITE_METHODS         route() — 15 names
+           READ_METHODS + WRITE_METHODS         route() — 18 names
            12 names                              (this document)
            (posternlabs-deploy/functions/g4rpc.js:109)
 ```
@@ -71,8 +73,8 @@ statement you have verified rather than one you have been told (§2.3).
 
 ## 1. The method surface, as dispatched
 
-Read out of `crates/bloch-pos-node/src/rpc.rs:1079` (`route`). **Fifteen
-names**, eleven request variants, two permanent typed refusals, one alias pair.
+Read out of `crates/bloch-pos-node/src/rpc.rs` (`route`). **Eighteen names**,
+fourteen request variants, two permanent typed refusals, one alias pair.
 
 Amounts marked `sat` are **decimal strings**, never JSON numbers (R3: the cap is
 10^19 sat, ~1110× JavaScript's exact-integer limit). Hashes are 64 lowercase hex
@@ -147,6 +149,8 @@ UTXO entry: `txid`, `vout`, `value_sat`, `script_hash`.
 |---|---|---|---|
 | `getvalidator` | `index` u32 | validator object | `-32001 VALIDATOR_NOT_FOUND` |
 | `getvalidatorcount` | — | `total`, `active`, `total_active_stake_sat` | — |
+| `getvalidators` | `start`? u32 (default 0), `limit`? (1–50, default 25) | `total`, `start`, `returned`, `next_start`, `epoch`, `page_max`, `validators[]` | — |
+| `getstakedistribution` | — | `epoch`, `active`, `total_active_stake_sat`, `duty_total_active_stake_sat`, `nakamoto_coefficient{one_third,one_half}`, `top[]`, `top_n`, `quantiles{}`, `gini_bps`, `measures`, `measures_note` | — |
 
 Validator object: `index`, `pubkey_hash`, `pubkey_bytes`, `state`,
 `own_stake_sat`, `effective_stake_sat`, `commission_bps`, `randao_commitment`,
@@ -161,7 +165,51 @@ Validator object: `index`, `pubkey_hash`, `pubkey_bytes`, `state`,
   exceeds the consensus cap, so a rate set above the cap is visible rather than
   laundered into it (R5).
 - Lifecycle epochs are `null` where the record holds `u64::MAX` ("never").
-- **There is no bulk listing.** See §5.2.
+- **The bulk listing is `getvalidators`**, added 2026-09-01. It returns the
+  same record `getvalidator` does, from the same function, so a client that
+  parses one parses the other.
+- `getvalidators.start` is a **registry index, not an offset**. The registry is
+  a `BTreeMap` and may be sparse: resume from `next_start`, never from
+  `start + limit`. A page that is exactly full always carries a cursor even
+  when it ended the registry, so a full walk makes one final call returning
+  `returned: 0` and `next_start: null`. **Stop on `next_start: null`.**
+- `limit` is clamped to **50**, not rejected — the same shape as `getutxos`,
+  and far smaller than its 1,000 because `pubkey_hash` is SHA3-256 over 3,745
+  bytes of hybrid key material per record and costs ~32 µs there. The ceiling
+  is a measured number, not a round one; see §4 and §5.2.
+- `getstakedistribution` measures **stake per validator index, not per
+  operator** — it says so in `measures` and `measures_note`, because a client
+  rendering it as decentralisation must render the disclaimer with it. Its
+  `total_active_stake_sat` is the **consensus** roster (leak applied) and is
+  the denominator for every `share_bps`; `duty_total_active_stake_sat` is the
+  pre-leak figure `getchaininfo` and `getvalidatorcount` publish. The two
+  differ whenever the inactivity leak is biting, and they are named apart so
+  that difference reads as two facts rather than as a contradiction.
+
+### 1.4a Supply
+
+| Method | Params | Result | Errors beyond `-32602` |
+|---|---|---|---|
+| `getsupply` | — | `issued_sat`, `cap_sat`, `remaining_sat`, `genesis_issued_sat`, `emitted_since_genesis_sat`, `at_slot`, `at_epoch`, `finalized_epoch`, `finalized`, `issued_note`, `remaining_note` | — |
+
+Two caveats ship **in the payload**, as `issued_note` and `remaining_note`,
+for the same reason `tx_hash_note` does: the integrator who most needs them is
+the one who never opened this document.
+
+- **`issued_sat` is gross and monotone, and is NOT circulating supply.** Burns
+  never decrement it and fees move existing coins. It is an upper bound on what
+  could be spendable, never the amount that is.
+- **`remaining_sat` is the unminted validator emission budget**, not "coins the
+  chain has yet to create". `GENESIS_ISSUED_SAT = TOTAL_SUPPLY_SAT −
+  VALIDATOR_EMISSION_SAT`, so everything except the validator emission existed
+  at slot 0. `emitted_since_genesis_sat` is the number that actually grows and
+  is the one to watch for issuance.
+- **Circulating supply is not served.** It needs the whole eUTXO set summed per
+  request on the consensus thread. `getcirculatingsupply` is in `RPC_ABSENT`
+  with that reason rather than left to return a bare `-32601`.
+- `finalized` is `at_epoch <= finalized_epoch`, so it is normally `false`: the
+  counter advances at epoch boundaries and the head's boundary is not yet
+  finalised. An audit that wants a figure nobody can take back waits for it.
 
 ### 1.5 Submission
 
@@ -264,18 +312,35 @@ Every name carries one, in `RPC_SURFACE` (`rpc.rs:765`) and in the
    `deprecated` in `getcapabilities`.
 
 Committed: `getbalance`, `getblockbyid`, `getblockbyslot`, `getblockcount`,
-`getcapabilities`, `getchaininfo`, `getmempoolinfo`, `gettxout`, `getvalidator`,
-`getvalidatorcount`, `sendrawtransaction`.
+`getcapabilities`, `getchaininfo`, `getmempoolinfo`, `getsupply`, `gettxout`,
+`getvalidator`, `getvalidatorcount`, `getvalidators`, `sendrawtransaction`.
 
 **`provisional`** — the name and its meaning hold; the response shape is not
 finished and **will** change inside this major version. Read the fields you
 need; do not assume the set is closed.
 
-Provisional: `getutxos`, `listunspent`. The reason is specific and known: there
-is no cursor, and one will be added. `truncated` is a placeholder for a
-pagination protocol the OpenAPI V4 freeze has not decided. Anything a client
-builds on "the first page is the whole answer" will break — and already gives
-wrong answers for any script hash past 1000 outputs.
+Provisional: `getutxos`, `listunspent`, `getstakedistribution`.
+
+For `getutxos` / `listunspent` the reason is specific and known: there is no
+cursor, and one will be added. `truncated` is a placeholder for a pagination
+protocol the OpenAPI V4 freeze has not decided. Anything a client builds on
+"the first page is the whole answer" will break — and already gives wrong
+answers for any script hash past 1000 outputs.
+
+For `getstakedistribution` the reason is different and equally specific: it is
+the only method here that reports a **derived statistic** rather than committed
+state, and the statistic is not finished. `measures` exists precisely because
+the value it carries today (`stake_by_validator_index`) is not the one an
+auditor wants — a per-operator grouping is, and the node cannot produce one. If
+operator identity ever becomes expressible, `measures` takes a second value and
+the field set grows. Read `measures`, read the fields you need, and do not
+assume the set is closed.
+
+`getvalidators` is **committed**, not provisional, despite also being
+paginated: its cursor is real (`next_start` is an index, not a placeholder) and
+its records are `getvalidator`'s, which are already committed. The distinction
+from `getutxos` is that `getutxos` has no cursor at all, not that one is newer
+than the other.
 
 **`refused`** — the method is routed and answers, permanently, with a typed
 error. The code is committed; the message is prose.
@@ -284,7 +349,11 @@ Refused: `gettransaction` (`-32005`), `getnewaddress` (`-32006`).
 
 ### 2.2 Versioning
 
-`getcapabilities.rpc_surface_version` — currently **`4.1.0`**.
+`getcapabilities.rpc_surface_version` — currently **`4.2.0`**.
+
+4.1.0 → 4.2.0 is a **minor** bump: `getsupply`, `getvalidators` and
+`getstakedistribution` were added, and three names left `absent[]` for
+`methods[]`. Nothing an integrator already read has moved.
 
 | Bump | Means |
 |---|---|
@@ -396,29 +465,33 @@ the test red and names the offending method in the failure message. Reverted.
 
 The registry's current §5 list has a defect: it names 13 methods and omits
 `getutxos`, then says "13 names, 12 handlers" in the prose below. The
-dispatcher had **14** names before this work. Replacement text:
+dispatcher had **14** names before this work and has **18** after it.
+Replacement text:
 
-> Served today (mainline, **15 methods**, frozen by
-> `crates/bloch-pos-node/src/rpc/tests.rs:579`
-> `the_rpc_method_namespace_is_frozen` and `:663`
-> `only_the_frozen_names_route`):
+> Served today (mainline, **18 methods**, frozen by
+> `crates/bloch-pos-node/src/rpc/tests.rs`
+> `the_rpc_method_namespace_is_frozen` and `only_the_frozen_names_route`):
 >
 > `getbalance`, `getblockbyid`, `getblockbyslot`, `getblockcount`,
 > `getcapabilities`, `getchaininfo`, `getmempoolinfo`, `getnewaddress`,
-> `gettransaction`, `gettxout`, `getutxos`, `getvalidator`,
-> `getvalidatorcount`, `listunspent`, `sendrawtransaction`.
+> `getstakedistribution`, `getsupply`, `gettransaction`, `gettxout`,
+> `getutxos`, `getvalidator`, `getvalidatorcount`, `getvalidators`,
+> `listunspent`, `sendrawtransaction`.
 >
-> Dispatch table is `crates/bloch-pos-node/src/rpc.rs:1080-1148` — 15 names,
-> 11 request variants, 2 typed-error stubs; `getutxos` and `listunspent` alias
+> Dispatch table is `route` in `crates/bloch-pos-node/src/rpc.rs` — 18 names,
+> 14 request variants, 2 typed-error stubs; `getutxos` and `listunspent` alias
 > one handler. The authoritative in-code allocation is
-> `rpc::RPC_SURFACE` (`rpc.rs:765`), which carries a stability class per name;
-> `rpc::RPC_ABSENT` (`:866`) carries the names deliberately not served, and the
+> `rpc::RPC_SURFACE`, which carries a stability class per name;
+> `rpc::RPC_ABSENT` carries the names deliberately not served, and the
 > freeze test asserts the two lists are disjoint and that everything in
 > `RPC_ABSENT` really answers `-32601`.
 
 | Method | Status | Owner | Frozen by |
 |---|---|---|---|
-| `getcapabilities` | **CLAIM REQUESTED, 2026-08-31** — surface self-description; `rpc.rs:1081` dispatch, `capabilities_json` `:1422`, engine arm `engine.rs:1976`. Constant cost, reads no state. | rpc-stability | `rpc/tests.rs:741` |
+| `getcapabilities` | **CLAIM REQUESTED, 2026-08-31** — surface self-description; `rpc.rs` dispatch, `capabilities_json`, engine arm in `engine.rs`. Constant cost, reads no state. | rpc-stability | `rpc/tests.rs` `getcapabilities_describes_the_surface_without_reading_state` |
+| `getsupply` | **CLAIM REQUESTED, 2026-09-01** — issued counter against the cap; `RpcRequest::Supply`, `supply_json`, `CommittedState::issued_sat`. O(1), reads one committed field. | rpc-missing-reads | `rpc/tests.rs` `getsupply_ships_its_caveats_as_fields_not_as_documentation` |
+| `getvalidators` | **CLAIM REQUESTED, 2026-09-01** — paginated registry listing; `RpcRequest::Validators`, `validators_json`, `CommittedState::validator_records`. O(log V + page) + one roster build. | rpc-missing-reads | `rpc/tests.rs` `getvalidators_pages_by_index_and_stops_without_looping` |
+| `getstakedistribution` | **CLAIM REQUESTED, 2026-09-01** — concentration of the active set; `RpcRequest::StakeDistribution`, `stake_distribution_json`. One roster build + O(V log V); fixed-size response. | rpc-missing-reads | `rpc/tests.rs` `getstakedistribution_reports_nakamoto_at_one_third` |
 
 The claim is filed rather than assumed. The name was swept against mainline,
 `legacy/genesis3-node`, all 59 local worktrees, the wallet client, the anchoring
@@ -454,7 +527,32 @@ live Genesis-4 carryover, to the entry:
 | `getvalidator` | O(V + D) | — | Goes through `active_validators()` → `consensus_roster_at` → delegation resolve + cohort cap + leak. |
 | `getchaininfo` | **2 × O(V + D)** | — | See F1. |
 | `getutxos` / `listunspent` | O(U) + O(matches) allocated | **10.7 ms** (limit 100) · **30.8 ms** (limit 1000) | See F3. |
-| `getbalance` | **2 × O(U)** | **18.2 ms** | See F2. U grows; this number only goes up. |
+| `getbalance` | **2 × O(U)** | **18.2 ms** (withdrawn; ~1.7 ms warm after F2) | See F2. U grows; this number only goes up. |
+| `getsupply` | O(1) | **3.1 µs** | One committed field plus two constants. Flat in V (2.3 µs at V=512) and flat in U. Cheaper than `getcapabilities`. |
+| `getstakedistribution` | O(V + D) + O(V log V) | **30 µs** (V=64) · **38 µs** (V=512) | One roster build (3.3 µs at V=64, 16.4 µs at V=512) dominates. Response is fixed-size: 2,194 bytes at V=64, 2,221 at V=512. |
+| `getvalidators` | O(log V + page) + O(V + D) | **1.58 ms** (page 50) | Tracks the PAGE, not the registry: the same page measures 1.59 ms at V=512. ~32 µs per record, all of it `pubkey_hash`. |
+
+Measured 2026-09-01, release build, by `what_the_new_reads_cost`
+(`rpc/tests.rs`, `#[ignore]`d). That bench needs only the validator registry —
+none of the three touches the eUTXO set — which is why it completes in seconds
+where `what_a_read_costs_at_carryover_scale` has never been run to the end.
+
+**The measurement changed the design.** §5.2 proposed a 500-record page cap and
+judged the hashing "negligible at V=64". It is negligible at V=64 only because
+a 500-page cannot return more than 64 records when the registry holds 64. At
+V=512, where it can, **a 500-record page costs 17.1 ms** — one uninterruptible
+block of the consensus thread, from one unauthenticated caller, in the same
+band as the worst read on this surface. The ceiling shipped at **50**, where
+the worst page (1.58 ms) is what the worst already-sanctioned read costs, so
+`getvalidators` adds no new lever. `the_validator_page_cap_stays_within_the_worst_sanctioned_read`
+asserts the bound as a constant, and says in its failure message that the fix
+for a larger registry is to cache `pubkey_hash` on the record rather than to
+widen the cap.
+
+The quadratic shape §5.2 warns about is also measured rather than asserted:
+rebuilding the roster per record adds 0.09 ms to a 50-record page at V=64 and
+0.87 ms at V=512 — the term becoming visible exactly where the
+validator-opening program would put it.
 
 **What 18 ms means on this port.** RPC is serialised through the engine channel
 onto the consensus thread, so ~55 `getbalance` calls per second consume 100% of
@@ -465,150 +563,258 @@ upstreams, so one client call is several nodes each paying the 18 ms twice. A
 single anonymous client can price a validator out of proposing. `gettxout`
 answers a narrower question 650× cheaper; where a client can use it, it should.
 
-Three pre-existing amplifiers, each a small local fix, none of them consensus.
-**Reported, not changed** — they touch the code path the live fleet runs, and
-that is the founder's call, not this document's.
+Three pre-existing amplifiers were reported here on 2026-08-31 as
+"reported, not changed". **All three have since been fixed in mainline**, and
+the descriptions below are kept as the record of what they were, each with its
+current status. Re-read the code before quoting any of the "before" numbers:
+the 18.2 ms `getbalance` figure in the table above was withdrawn on 2026-09-01
+and corrected to ~1.7 ms warm in `balance_json`'s own doc comment.
 
-- **F1 — `getchaininfo` computes the validator roster twice per call.**
+- **F1 — FIXED. `getchaininfo` computed the validator roster twice per call.**
   `chain_info_json` calls `state.active_validators()` (→ `consensus_roster_at`)
   and `state.total_active_stake_sat()` (→ `duty_roster`), and each recomputes
   the delegation resolve, the cohort cap and the leak from scratch. This is the
-  most-polled method on the chain. Fix: compute the roster once and pass both
-  derived values, or memoise per `(epoch, head)`.
-- **F2 — `getbalance` scans the entire eUTXO set twice.** `balance_json` calls
+  most-polled method on the chain. Both halves shipped:
+  `CommittedState::active_roster_summary` builds the roster once and reads both
+  numbers off it, and `Canonical::active_roster` (`engine.rs`) memoises the two
+  resulting integers on the state generation, so the build is once per block
+  rather than once per caller. It caches the two integers and **not** the
+  roster — `duty_roster_at`'s contract is that the roster is never cached. The
+  duplicate build was worth about 2 µs at V=64; the memo is the half that
+  matters on a port with no rate limit.
+- **F2 — FIXED. `getbalance` scanned the entire eUTXO set twice.** `balance_json` calls
   `state.balance_sat()` to sum and then iterates `state.eutxos()` again to
   count. One pass yields both, and would halve the measured 18.2 ms. The edge
   never caches this method and quorum-checks it across upstreams, so one client
-  call is several nodes doing it twice each.
-- **F3 — `getutxos` collects every match before truncating.** `utxos_json`
+  call is several nodes doing it twice each. `balance_json` is now one fold
+  producing both numbers; the measured improvement is 2.04x (13.454 ms → 6.592
+  ms on the node crate's bench at 452,726 outputs), which is precisely "two
+  walks became one". It is **not** a denial-of-service fix and must not be
+  reported as one: the remaining walk is still linear in the whole set, because
+  there is no index by script hash.
+- **F3 — FIXED. `getutxos` collected every match before truncating.** `utxos_json`
   builds a `Vec` of **all** matching entries to learn `total`, then takes
   `limit`. For a script hash with 425,568 outputs that is ~3.4 MB of references
   allocated to return 100 of them. `total` needs a count, not a collection —
-  which is also why `limit=1000` measures 3× `limit=100` when both do the same
-  single scan.
+  which is also why `limit=1000` measured 3× `limit=100` when both did the same
+  single scan. `utxos_json` now counts rather than collects and keeps at most
+  `limit` entries.
 
 ---
 
-## 5. Proposal: the missing read methods
+## 5. The missing read methods, as built
 
-The gap that matters beyond documentation: **there is no RPC way to read the
-validator set or the issued supply**, which blocks a supply audit and blocks any
-third party verifying stake distribution independently. Three methods close it.
-None is implemented. Each is costed against §4's constraint — nothing here may
-give an unauthenticated caller a new lever.
+**Built 2026-09-01.** This section was a proposal; the three methods now
+dispatch. The gap it closed: there was no RPC way to read the validator set or
+the issued supply, which blocked a supply audit and blocked any third party
+verifying stake distribution independently.
+
+Each is costed against §4's constraint — every read runs on the consensus
+thread, on a port with no authentication and no rate limit, so the price of a
+method is the size of the lever an anonymous caller has on block production.
+None of the three touches the eUTXO set. That is the property that made them
+safe to add, and it is why they are measured by
+`what_the_new_reads_cost` (`rpc/tests.rs`, `#[ignore]`d) rather than by
+`what_a_read_costs_at_carryover_scale`: the state they need is the validator
+registry, not the 452,726-entry carryover.
 
 ### 5.1 `getsupply` — issued against the cap
 
-**Cost: O(1).** The counter already exists in committed state: `issued_sat`
-(`transition.rs:1160`), committed under `TAG_ISSUED_SUPPLY = 0x14`, seeded at
-genesis with `tokenomics_v4::GENESIS_ISSUED_SAT` and advanced at epoch
-boundaries by the satoshis `close_epoch` actually credits. It is a field read.
-
-Requires one line in `bloch-pos-committee`: `pub fn issued_sat(&self) -> u128`.
-The field is private, which is correct; a read-only accessor changes no
-transition behaviour and is the same shape as the `validator_count` /
-`balance_sat` accessors added for the RPC in August.
+**Cost: O(1), measured at 3.1 µs.** `CommittedState::issued_sat()` is a field read of state
+committed under `TAG_ISSUED_SUPPLY`, seeded at genesis with
+`tokenomics_v4::GENESIS_ISSUED_SAT` and advanced at epoch boundaries by the
+satoshis `close_epoch` actually credits. Plus two compile-time constants and
+the JSON build. It does not move with the chain, with V, or with the eUTXO set
+— the only other method on this surface with that property is
+`getcapabilities`, and `getsupply` is **thirty times cheaper than it** (3.1 µs
+against ~100 µs), because it builds a much smaller JSON tree. It is the
+cheapest method on the surface, full stop.
 
 ```json
 {
-  "issued_sat": "…",            // decimal string, R3
-  "cap_sat": "…",               // tokenomics_v4::TOTAL_SUPPLY_SAT, 100e9 BLCH
-  "remaining_sat": "…",         // cap − issued; the invariant is one-sided
-  "genesis_issued_sat": "…",    // what existed at slot 0
-  "emitted_since_genesis_sat": "…",
-  "at_slot": 0, "at_epoch": 0,
-  "finalized": false            // is this state at or below the finalized checkpoint
+  "issued_sat": "…", "cap_sat": "…", "remaining_sat": "…",
+  "genesis_issued_sat": "…", "emitted_since_genesis_sat": "…",
+  "at_slot": 54547, "at_epoch": 1704,
+  "finalized_epoch": 1702, "finalized": false,
+  "issued_note": "…", "remaining_note": "…"
 }
 ```
 
-**Read `remaining_sat` correctly, or a supply audit will be wrong by
-construction.** `GENESIS_ISSUED_SAT = TOTAL_SUPPLY_SAT − VALIDATOR_EMISSION_SAT`
-(`tokenomics_v4.rs:251`): everything except the validator emission exists from
-slot 0. So `remaining_sat` is the **unminted validator emission budget**, not
-"coins the chain has yet to create" in the sense a Bitcoin-shaped audit
-assumes. The response must carry `genesis_issued_sat` alongside it so the two
-cannot be confused, and `emitted_since_genesis_sat` — the number that actually
-grows — should be the headline for anyone watching issuance.
+**Both caveats ship as fields, not as prose here.** `issued_note` and
+`remaining_note` are in the payload for the same reason `tx_hash_note` is: the
+reader who most needs them is the one who never opened this document.
 
-**Honesty requirements, in the response and not only in prose.** `issued_sat`
-is **gross and monotone**: fees move existing coins, whistleblower rewards come
-out of slashed bonds, and burns never decrement it — they widen the gap below
-the cap. It is therefore *not* circulating supply and must not be labelled as
-such. A `note` field should say so, for the same reason `tx_hash_note` exists.
+1. **`issued_sat` is gross and monotone.** Fees move existing coins,
+   whistleblower rewards come out of slashed bonds, and burns never decrement
+   it — they widen the gap below the cap, and the invariant is one-sided
+   (`issued_sat <= TOTAL_SUPPLY_SAT`, enforced in `compute_post_state`). It is
+   therefore **not circulating supply** and the response says so in those
+   words. A Bitcoin-shaped audit that reads it as circulation is wrong by
+   however much has been burned, in the direction of overstating.
 
-**Circulating supply is deliberately not offered here.** It would require
-`total_unspent_sat()` — a full scan of the eUTXO set, on the consensus thread,
-uncached and unauthenticated. If it is genuinely needed, serve it memoised per
-**finalised** epoch (one scan per ~16 minutes, amortised across all callers,
-and finality is the only boundary at which the answer is stable anyway) and
-report the epoch it was computed at. Never compute it per request.
+2. **`remaining_sat` is the unminted validator emission budget.**
+   `GENESIS_ISSUED_SAT = TOTAL_SUPPLY_SAT − VALIDATOR_EMISSION_SAT`, so
+   everything except the validator emission existed at slot 0.
+   `genesis_issued_sat` rides beside it so the two cannot be confused, and
+   `emitted_since_genesis_sat` — the number that actually grows — is the
+   headline for anyone watching issuance. This identity is asserted, not
+   assumed: `getsupply_ships_its_caveats_as_fields_not_as_documentation`
+   checks `remaining_sat == VALIDATOR_EMISSION_SAT − emitted`, so if the
+   relation ever changes, `remaining_note` fails rather than lies.
+
+Both subtractions saturate. The invariant they rest on is enforced elsewhere,
+and a query surface that panics when an invariant it does not own is violated
+turns a consensus bug into a dead node — which on an unauthenticated port is
+the whole attack. `getsupply_does_not_panic_when_the_supply_invariant_is_violated`
+covers it from both directions.
+
+**Circulating supply is deliberately not offered.** It would require summing
+`eutxos()` in full, on the consensus thread, uncached and unauthenticated. The
+name `getcirculatingsupply` sits in `RPC_ABSENT` carrying that reason, so an
+integrator who probes it is told why rather than being handed a bare `-32601`.
+If it is ever genuinely needed, serve it memoised per **finalised** epoch — one
+scan per ~16 minutes, amortised across all callers, and finality is the only
+boundary at which the answer is stable anyway — and report the epoch it was
+computed at. Never per request.
+
+`finalized` is `at_epoch <= finalized_epoch` and is normally `false`: the
+counter advances at epoch boundaries and the head's boundary has not finalised.
+That is a warning, not a formality — an audit wanting a figure nobody can take
+back waits for it.
 
 ### 5.2 `getvalidators` — the registry, paginated
 
-**Cost: O(page) records + one roster computation, O(V + D).** V is 64 today and
+**Cost: O(log V + page) records, plus ONE roster build of O(V + D).** Measured
+at **1.58 ms for a 50-record page** — and 1.59 ms for the same page at V=512,
+because the cost tracks the page and not the registry. V is 64 today and
 bounded by consensus; D (delegations) is 0 today and is not.
 
 ```
-getvalidators(start?: u32 = 0, limit?: usize = 50, max 500)
-→ { total, start, returned, next_start | null, epoch, validators: [ validator object ] }
+getvalidators(start?: u32 = 0, limit?: usize = 25, max 50)
+→ { total, start, returned, next_start | null, epoch, page_max, validators: [ … ] }
 ```
 
-Reuses `validator_json` verbatim, so there is one definition of what a validator
-looks like and a client that already parses `getvalidator` needs no new code.
+Records come from `validator_json` verbatim, so there is one definition of what
+a validator looks like and a client that already parses `getvalidator` needs no
+new code. `getvalidators_reuses_the_getvalidator_record_verbatim` asserts the
+two are byte-identical rather than merely similar.
 
-Four anti-DoS requirements, all mandatory:
+The four anti-DoS conditions, and how each is met:
 
-1. **Page cap**, same shape as the UTXO page: clamp rather than reject, and
-   report `returned` and `next_start` so the client can tell.
-2. **Compute the roster once per call**, not once per record. The naive
-   implementation calls `active_validators()` inside the loop to find each
-   `effective_stake_sat`, which is O(V²·D).
-3. **Memoise the roster per `(epoch, head)`.** It changes only at epoch
-   boundaries and is already recomputed twice per `getchaininfo` (F1). One memo
-   fixes F1, this method and §5.3 together, and is the single highest-value
-   change in this document.
-4. **Watch `pubkey_hash`.** It is SHA3-256 over a hybrid ML-DSA-65 ‖ Falcon-1024
-   public key — roughly 3.7 KB per record. At a 500-record page that is ~1.8 MB
-   of hashing per call. Negligible at V=64; if the registry opens to external
-   validators, cache the hash on the record rather than raising the page cap.
+1. **Page cap.** Clamped, not rejected — the same shape as the UTXO page —
+   with `returned` and `next_start` reported so the clamp is visible.
+   `getvalidators_clamps_an_absurd_page_instead_of_refusing_it` pins it. **The
+   ceiling shipped at 50, not the 500 this section proposed, and the default at
+   25.** The proposal's reasoning was wrong in a way only measurement caught:
+   the hashing is negligible at V=64 solely because a 500-page cannot return
+   more than 64 records from a 64-record registry. At V=512 a 500-record page
+   costs **17.1 ms**, which is a new lever of the same size as the worst read
+   on this surface. At 50 the worst page is 1.58 ms — the cost that already
+   existed — so the method adds none.
+2. **Roster computed once per call, not once per record.** The engine reads
+   `active_validators()` once, reduces it to `(index, effective_stake)` pairs
+   and hands them in. `validators_json` **has no state handle in its
+   signature**, so the O(page · (V + D)) shape is not merely avoided, it is
+   unavailable to write. That is the load-bearing decision in this method.
+3. **Memoisation — deviated from, deliberately.** The proposal asked for a
+   roster memo per `(epoch, head)`. The engine already has one
+   (`Canonical::active_roster`, keyed on the state generation) and it caches
+   **two integers, not the roster**, because `duty_roster_at`'s own contract is
+   that the roster is derived on demand and never cached — a cached roster is
+   the §5.5 pattern the committee crate bans. So `getvalidators` and
+   `getstakedistribution` each pay one roster build per call, and F1's
+   duplicate build is what the existing memo removed. Extending the memo to
+   hold the roster itself is a change to a consensus-adjacent invariant and is
+   the founder's call, not this document's. The measured cost of one build at
+   V=64 is in `what_the_new_reads_cost`.
+4. **`pubkey_hash` is the per-record cost, and it is the whole cost.**
+   SHA3-256 over a hybrid ML-DSA-65 ‖ Falcon-1024 public key — 3,745 bytes per
+   record, measured at **~32 µs**. A page is `limit × 32 µs` and essentially
+   nothing else, which is why the same 50-record page costs the same at V=64
+   and V=512, and why the ceiling had to come down rather than the roster work
+   being optimised. The benchmark uses real 3,745-byte keys for exactly this
+   reason; a 64-byte stub would understate a page by two orders of magnitude.
 
-Requires a paginated accessor over the private `validators: BTreeMap<u32,
-ValidatorRecord>` — `pub fn validator_records(&self, start: u32, limit: usize)`
-— which is a `range()` over a `BTreeMap` and therefore genuinely O(page), not
-O(V) with a skip.
+   **When the registry opens to external validators, cache the hash on the
+   record — do not raise the cap.** The cap bounds the symptom; the hash is the
+   cause. `the_validator_page_cap_stays_within_the_worst_sanctioned_read` says
+   so in its failure message, so the next person to try meets the reasoning
+   before the diff goes green.
+
+`CommittedState::validator_records(start, limit)` is a `BTreeMap::range` plus a
+`take`, so it is genuinely O(log V + page) and not O(V) with a skip.
+
+**`start` and `next_start` are registry indices, not offsets.** The registry is
+a map and may be sparse; a client computing `start + limit` skips records the
+moment an index is missing. A page that is exactly full always carries a
+cursor, even when it happened to end the registry — a full page cannot know it
+was the last without reading a record past it, and that peek would cost a clone
+of a 3.7 KB key on every page to save one lookup on the last. So a full walk
+ends with one call returning `returned: 0`, `next_start: null`. **Stop on
+`next_start: null`, never on arithmetic over `total`.**
 
 ### 5.3 `getstakedistribution` — what a third party needs to check us
 
-**Cost: one roster computation, O(V + D), plus O(V log V) for a sort. Response
-is fixed-size regardless of V.** Memoise per epoch and it is free after the
-first caller in each epoch.
+**Cost: one roster build, O(V + D), plus O(V log V) for the sort. The response
+is fixed-size regardless of V.** Measured at **30 µs at V=64 and 38 µs at
+V=512** — the roster build is nearly all of it — with the response at 2,194 and
+2,221 bytes respectively. That second pair of numbers is the anti-DoS property
+made checkable: the per-validator list is capped at 20 and everything else is a
+scalar, so neither the caller nor the registry can grow the response. It is the
+cheapest of the three by an order of magnitude, and there is no argument for
+paginating or restricting it.
+
+```json
+{
+  "epoch": 1704, "active": 64,
+  "total_active_stake_sat": "…", "duty_total_active_stake_sat": "…",
+  "nakamoto_coefficient": { "one_third": 4, "one_half": 7 },
+  "top": [ { "index": 0, "effective_stake_sat": "…", "share_bps": 1563 } ],
+  "top_n": 20,
+  "quantiles": { "p50_sat": "…", "p90_sat": "…", "p99_sat": "…" },
+  "gini_bps": 0,
+  "measures": "stake_by_validator_index",
+  "measures_note": "…"
+}
+```
 
 This is the method that makes the concentration claim verifiable by someone who
 does not trust us, which is the entire point of publishing it.
 
-```json
-{
-  "epoch": 1636,
-  "active": 64,
-  "total_active_stake_sat": "…",
-  "nakamoto_coefficient": { "one_third": 4, "one_half": 7 },
-  "top": [ { "index": 0, "effective_stake_sat": "…", "share_bps": 1563 } ],
-  "quantiles": { "p50_sat": "…", "p90_sat": "…", "p99_sat": "…" },
-  "gini_bps": 0,
-  "measures": "stake_by_validator_index"
-}
-```
+- **`nakamoto_coefficient.one_third` is the number**, because one third is the
+  threshold at which finality can be reverted. Reporting only the half would
+  understate the risk by the factor that matters. `one_half` is reported beside
+  it because it is what other chains publish and omitting it invites a wrong
+  comparison — not because it is the threshold here.
+- **The count is over a strict majority of the threshold.** Three validators
+  holding exactly one third each give `one_third: 2`, not 1: holding exactly a
+  third cannot revert anything, and a `>=` would name a set that cannot do what
+  the number claims it can. `getstakedistribution_reports_nakamoto_at_one_third`
+  pins that case specifically.
+- **`measures: "stake_by_validator_index"` is a disclaimer with a field name.**
+  This measures stake per **index**, not per operator. A registry index is a
+  slot, not an identity; the RPC cannot know who runs what, and on this chain
+  sixty-four indices are largely one operator today. Every figure here is
+  therefore an *upper bound* on the per-operator answer. `measures_note` says
+  so in the payload, because a client rendering this as decentralisation must
+  render the disclaimer with it.
+- **Two denominators, named apart.** Shares are over `total_active_stake_sat`,
+  which is the **consensus** roster with the inactivity leak applied — that is
+  the weight that actually decides finality. `getchaininfo` and
+  `getvalidatorcount` publish the **duty** roster's pre-leak total, and it is
+  reported here as `duty_total_active_stake_sat` so the difference reads as two
+  facts rather than as a contradiction. Publishing one total and computing
+  shares with the other is how a distribution that does not sum to 10,000 bps
+  gets shipped.
+- **Ties break by ascending index**, so two honest nodes on identical state
+  return identical lists. Without that, a third party diffing two nodes reads a
+  disagreement that is not there — and on this chain, node disagreement is a
+  thing operators have chased for real.
+- **An empty or fully-leaked roster answers rather than dividing by zero.** The
+  leak drives effective stake toward zero and this fleet has run with it
+  biting; `nakamoto_coefficient` and `share_bps` go `null`, `gini_bps` reads 0.
 
-- `nakamoto_coefficient.one_third` is **the** number, because that is the
-  threshold at which finality can be reverted — not one half. Reporting only
-  the half would understate the risk by the factor that matters.
-- `top` is capped (20 entries) so the response size does not track V.
-- `measures: "stake_by_validator_index"` is a disclaimer with a field name.
-  This measures **stake per index, not per operator**. Sixty-four indices can be
-  one operator, and on this chain today they largely are. The RPC cannot know
-  who runs what, and this method must not imply that it does.
-
-### 5.4 Deliberately not proposed
+### 5.4 Deliberately not served
 
 - **`getpeers`.** Peer identity on an unauthenticated port is a targeting aid
   for exactly the eclipse and backfill-flood failures this fleet has already
@@ -622,25 +828,57 @@ does not trust us, which is the entire point of publishing it.
 - **A `transactions` array on the block object.** It would need a transaction
   projection format, which is the same unfinished decision as the txid.
 
-### 5.5 Sequencing
+### 5.5 What shipped, and what is still owed
 
-`getsupply` first: it is O(1), it needs one accessor, and it unblocks the supply
-audit on its own. Then the roster memo (F1 + §5.2 + §5.3 share it). Then
-`getvalidators` and `getstakedistribution` on top of the memo.
+All three landed together on `rpc/missing-reads`, with the accessors they need
+(`CommittedState::issued_sat`, `::validator_records`) added to
+`bloch-pos-committee` as read-only projections of already-committed state — the
+same shape as `validator_count` and `balance_sat`, changing no transition
+behaviour.
 
-Every one of them is a new name in a shared namespace. **Claim from the PMO
-before writing the constant** (`docs/WIRE-NAMESPACE-REGISTRY.md` §0), then add
-the entry to `RPC_SURFACE` and to the golden list in the freeze test in the same
-commit. The names used above are proposals, not allocations.
+Registration is done in all three places the freeze test checks: the `route`
+arm, the `RPC_SURFACE` entry with a stability class, and the golden list in
+`the_rpc_method_namespace_is_frozen`. `getsupply` and `getvalidators` were
+**moved out** of `RPC_ABSENT` rather than merely added to `RPC_SURFACE` — the
+freeze test asserts the two lists are disjoint, and
+`getcapabilities_describes_the_surface_without_reading_state` now asserts the
+move in both directions, because a client that reads `absent[]` and
+short-circuits would never call a method that works.
+
+Verified by mutation, as `getcapabilities` was: adding
+`"getsupplystats" => RpcRequest::Supply` to `route` without a table entry turns
+`the_rpc_method_namespace_is_frozen` red and names `getsupplystats` in the diff.
+Reverted.
+
+**Names still to be confirmed by the PMO.** The three constants are written and
+the freeze test holds them, but `docs/WIRE-NAMESPACE-REGISTRY.md` §0 requires a
+claim. If the PMO assigns different names, each changes in exactly three places
+— the `route` arm, the `RPC_SURFACE` entry, the golden list — and the test fails
+until all three agree. §3.3 above carries the claim rows.
+
+**Still owed, and not done here:** the public proxy's `READ_METHODS` allowlist
+(§6.1) does not forward these names, so they are unreachable through
+`posternlabs.com/g4rpc` until it is updated. That is a different repository.
 
 ---
 
 ## 6. Required follow-ups
 
-1. **`getcapabilities` must be added to the public proxy allowlist** —
-   `posternlabs-deploy/functions/g4rpc.js`, `READ_METHODS` at line 109 — or it
-   is unreachable through the only public endpoint. Never cached. It is a
-   different repository and is not touched by this work.
+1. **`getcapabilities`, `getsupply`, `getvalidators` and
+   `getstakedistribution` must be added to the public proxy allowlist** —
+   `posternlabs-deploy/functions/g4rpc.js`, `READ_METHODS` — or they are
+   unreachable through the only public endpoint. It is a different repository
+   and is not touched by this work.
+
+   Caching guidance, since these four differ: `getcapabilities` is never cached
+   (it is the method a client calls to learn what it is talking to).
+   `getsupply` and `getstakedistribution` change only at epoch boundaries and
+   can be cached ~30 s safely — both are cheap enough that caching is a
+   courtesy to the node rather than a necessity. `getvalidators` must **not**
+   be quorum-checked across upstreams the way `getbalance` is: paginating
+   across nodes that disagree about the head would interleave two registries
+   and hand a client a list that exists nowhere. Pin a page walk to one
+   upstream, or serve it from the indexer instead.
 2. **The proxy's `-32601` message should distinguish "not forwarded here" from
    "not served by the node"**, and should not recite `gettransaction` and
    `getnewaddress` for every unknown name. Better: forward those two so an
@@ -653,6 +891,9 @@ commit. The names used above are proposals, not allocations.
 4. **`docs/openapi.yaml` is the V3 contract** and does not describe any of §1.
    It is the normative wire artefact the explorer, three wallets and two
    generated SDKs fan out from.
-5. **F1–F3 (§4)** are unowned.
+5. **F1–F3 (§4) are fixed** in mainline as of 2026-09-01 — this item is closed.
+   What remains open is the durable version of F2: an index by script hash in
+   committed state, so `getbalance` stops being linear in the whole eUTXO set.
+   That is a consensus-level change, not an RPC one.
 6. **`getconsensusschedule`** must join `RPC_SURFACE` and the golden list when
    it merges.
