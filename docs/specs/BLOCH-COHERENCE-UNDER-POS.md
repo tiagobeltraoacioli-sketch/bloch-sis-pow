@@ -388,6 +388,70 @@ to produce within bounded time.* Proof submission is asynchronous and
 permissionless — any node may compute and gossip an epoch proof; the protocol
 defines the statement, not the operator.
 
+### 4.1.1 Amendment — detached proof carriage (decision, 2026-09-01)
+
+**Status: proposed.** Requires founder ratification, alongside
+`COHERENCE-C1.2.md`. Recorded here as an argued decision precisely so that the
+§4.1 invariant is not repealed silently by the act of implementing around it.
+
+**What changed.** The proof-size measurement
+(`docs/audit/COHERENCE-PROOF-SIZE-2026-08-29.md`) fixes the compressed SP1 FRI
+proof at ≈1.21 MiB — roughly 2.4× the 512 KiB block cap. An inline-only
+shielded pool is therefore not constructible at the ratified parameters, and
+`ProofCarrier::Detached { commitment, len }` carries a 32-byte commitment and a
+length while the bytes travel out of band.
+
+**Why this is an amendment and not an implementation detail.** The §4.1 ladder
+asserts, for shielded spends, that *"Verification is always local
+(`verifier.rs`) — accepted blocks are unaffected."* Under detached carriage
+that sentence is false: verifying a shielded spend requires resolving
+`ProofFetch::fetch`. Validity becomes contingent on a fetch succeeding. That is
+the same defect shape as the 2026-08-08 `expected_bits` consensus failure —
+validity contingent on node-local circumstance rather than on committed state —
+displaced one layer outward. The §5.5 "no node-local mutable state" rule exists
+because of that failure, and §4.1 was written as its symmetric twin.
+
+**The hazard, stated plainly.** `coherence-core` is fail-closed by
+construction: `ProofUnavailable::NotFound` makes an unresolvable proof
+*unverifiable, not valid*. Fail-closed is the correct local choice, and it does
+not remove the hazard — it relocates it. A validator that cannot fetch rejects;
+a validator that can, accepts. Two honest validators on identical binaries then
+reach opposite verdicts on the same block, decided by network reachability
+rather than by consensus. Under the ratified 1/2 quorum floor, that divergence
+double-finalizes rather than stalling.
+
+**Amended invariant.** §4.1's rule is replaced, not dropped:
+
+> No consensus validity rule may require a proof that a third-party service has
+> to produce within bounded time. Consensus validity may depend on data that is
+> not carried in the block body **only where the availability of that data is
+> itself a consensus predicate** — decided by the same quorum, on evidence
+> carried in the chain. Fetchability by an individual validator is not
+> availability, and must never be read as it.
+
+**What that requires, and what exists today.** Satisfying the amended clause
+means erasure coding, a commitment to the encoded chunks, random sampling by
+validators, and a challenge path — data-availability sampling. Bloch has a
+*scaffold* and not a subsystem: `c5d01f3` on `feat/zk-ledger` (AEAD-at-rest
+plus RS-erasure/DAS), explicitly Phase-2 and off the critical path. Naming that
+gap is part of this decision; treating the scaffold as the answer is the
+overstatement this amendment exists to prevent.
+
+**Gate.** DAS is sequenced as its own workstream with its own gate, ahead of
+any shielded flag day. `COHERENCE_ACTIVATION_EPOCH` must not be set to a finite
+value while the only available answer to *"was the proof available?"* is
+*"it resolved on my node."*
+
+**What recursive aggregation does and does not buy.** The measurement also
+showed the compressed proof is fixed-size (4× the work grew it by 384 bytes),
+because the statement is single-shard. With recursion that yields **one**
+≈1.21 MiB object per block irrespective of how many shielded transactions it
+covers, so the marginal cost of an additional shielded transaction approaches
+zero and the DA burden becomes bounded and predictable — one object per block,
+not one per transaction. That is a large improvement in the ratio. It does not
+remove the requirement, and it does not by itself satisfy the amended
+invariant.
+
 ### 4.2 Coupling risks to pin down (A6 requirements, A9 concurs)
 
 1. **Verifier key discipline.** Both statements' guest ELFs are consensus
