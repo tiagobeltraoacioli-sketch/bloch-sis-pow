@@ -179,16 +179,18 @@ clone, `cargo build --locked --release -p bloch-pos-node`:
 
 | Box | Wall clock |
 |---|---|
-| A | **3 min 16 s** |
-| B | **4 min 15 s** |
+| A | **3 min 39 s** |
+| B | **4 min 12 s** |
+| C | **6 min 04 s** |
 
-Two vCPUs, not eight. Do not "optimise" this by dropping LTO or building in
+Call it **4 to 6 minutes** and provision for the slow end. Two vCPUs, not
+eight. Do not "optimise" this by dropping LTO or building in
 debug: both change the binary you validate with.
 
 ### Check what you built against what we published
 
-Two independent boxes building this tag produced a **byte-identical** binary,
-so you can compare digests rather than trust ours. The expected digest is
+**Three** independent boxes building this tag produced a **byte-identical**
+binary, so you can compare digests rather than trust ours. The expected digest is
 published as a **release manifest distributed with the tag**
 (`RELEASE-g4-node-20260901.txt`), deliberately not inline in this file: the
 commit hash is compiled into the binary, so a digest committed *inside* the
@@ -375,14 +377,19 @@ Two things that will make your run slower than ours: a busy machine (the
 initial state construction pins one core and does not share it), and a taller
 chain than 33,600 by the time you start.
 
-> **Why the old figure was so far out.** The rate genuinely does decay inside a
-> run — fork choice does work proportional to the depth it walks — so a rate
-> sampled in the first minutes is far higher than the lifetime average, and a
-> deadline extrapolated from it is far *longer* than the truth only if you
-> extrapolate the *low* late-run rate over the whole chain, which is what
-> happened. The node's own progress line reports a **cumulative average** and a
-> "time left" derived from it; both move throughout the run. Do not read either
-> as a prediction. We did, and published 26 hours.
+> **Why the old figure was so far out.** Two mistakes compounded. The run was
+> on a laptop under heavy load — the same machine and session that took 11
+> minutes over an initial state construction that needs about 2 minutes idle —
+> so every rate it produced was a measure of CPU contention rather than of the
+> software. And it was **stopped after 13 minutes**, so the slowest rate it
+> ever reached was taken as the steady-state rate and multiplied out to a head
+> 53,300 slots away. A contended partial rate extrapolated over the whole chain
+> is how twenty-one minutes became twenty-six hours.
+>
+> The general lesson, which applies to the seeded path below as well: the
+> node's progress line reports a **cumulative average** and a "time left"
+> derived from it, and both drift throughout a run. Neither is a result. Only
+> a completed run is.
 
 > **Memory: what this release fixes, and what it does not.** Until this
 > release, an epoch roll deep-copied the whole eUTXO ledger (452,726 entries),
@@ -397,9 +404,11 @@ chain than 33,600 by the time you start.
 > | Build | Time to caught up | Peak RSS | Outcome |
 > |---|---|---|---|
 > | This release (with the fix) | **21.2 min** | **934 MB** | completed, h=33,602 |
-> | `main` (without the fix) | **30.3 min** | **1,014 MB** | completed, h=33,620 |
+> | `main` (without the fix), run 1 | **30.3 min** | **1,014 MB** | completed, h=33,620 |
+> | `main` (without the fix), run 2 | **29.5 min** | **1,016 MB** | completed, h=33,794 |
 >
-> So the fix is worth about **1.4× on cold-sync wall clock** and ~8% on peak
+> The two unfixed runs were on different boxes and agree to within 3%, so the
+> fix is worth about **1.4× on cold-sync wall clock** and a few percent on peak
 > memory, on this shape of run.
 >
 > **Both fitted in 8 GB and neither was killed.** If you have read that an
