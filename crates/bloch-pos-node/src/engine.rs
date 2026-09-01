@@ -4522,7 +4522,7 @@ mod transfer_v2_end_to_end {
     /// HOLDS `entries` — the outputs the sweep spends. `epochs_past` places
     /// `genesis_time_ms` so the node's real wall epoch is at least that
     /// (+2 slots of margin so the epoch cannot regress mid-test).
-    fn engine_at_wall_epoch(epochs_past: u64, entries: &[EutxoEntry]) -> Engine {
+    pub(super) fn engine_at_wall_epoch(epochs_past: u64, entries: &[EutxoEntry]) -> Engine {
         let slot_ms = 500u64;
         let back_ms = epochs_past
             .saturating_mul(SLOTS_PER_EPOCH)
@@ -7066,5 +7066,166 @@ mod evidence_tests {
             &RootEchoVerifier,
         )
         .is_ok());
+    }
+}
+
+/// What the mempool actually does under a flood, MEASURED — the "before"
+/// half of the fee-admission work.
+///
+/// Every claim in the module doc for [`Engine::mempool`] that this suite
+/// could check, it checks. Two of them were wrong.
+#[cfg(test)]
+mod mempool_flood_characterisation {
+    use super::transfer_v2_end_to_end::engine_at_wall_epoch;
+    use super::*;
+    use bloch_pos_committee::transition::{TransferInput, TransferOutput};
+
+    /// A structurally-shaped transfer with a chosen tip. Never submitted
+    /// through `on_transaction` — these go straight into the map, because
+    /// what is being measured is the CAPACITY and ORDERING behaviour, not
+    /// the admission checks in front of it. A flood of 4,096 real hybrid
+    /// signatures would measure PQClean, not the mempool.
+    fn flood_tx(seed: u32, tip: u128) -> PosTransaction {
+        let mut txid = [0u8; 32];
+        txid[..4].copy_from_slice(&seed.to_be_bytes());
+        PosTransaction::Transfer {
+            inputs: vec![TransferInput {
+                txid,
+                vout: 0,
+                pubkey: vec![0xAB; 8],
+                signature: vec![0xCD; 8],
+            }],
+            outputs: vec![TransferOutput {
+                value: 1_000,
+                script_hash: [0xEE; 32],
+            }],
+            tx_bytes: 0,
+            tip_millisat_per_gas: tip,
+        }
+    }
+
+    /// A transfer that will really pass `admissible`: one input, one output,
+    /// one genuine hybrid signature over the spend root, and a tip.
+    fn paying_transfer(seed: u8, tip: u128) -> PosTransaction {
+        let (pk, sk) = bloch_crypto::crypto::generate_keypair_from_seed(&[seed; 32])
+            .expect("hybrid keypair from a fixed seed");
+        let mut tx = PosTransaction::Transfer {
+            inputs: vec![TransferInput {
+                txid: [seed; 32],
+                vout: 0,
+                pubkey: pk,
+                signature: Vec::new(),
+            }],
+            outputs: vec![TransferOutput {
+                value: 1_000,
+                script_hash: [0x22; 32],
+            }],
+            tx_bytes: 0,
+            tip_millisat_per_gas: tip,
+        };
+        let root = tx.spend_signing_root();
+        let sig = bloch_crypto::crypto::sign(&sk, &root).expect("sign the spend root");
+        if let PosTransaction::Transfer { inputs, .. } = &mut tx {
+            inputs[0].signature = sig;
+        }
+        tx
+    }
+
+    /// MEASUREMENT 1 — a full mempool refuses a paying transaction, and the
+    /// price it offers is not read at all.
+    #[test]
+    fn today_a_flood_of_zero_tip_transactions_locks_out_any_price() {
+        let mut e = engine_at_wall_epoch(0, &[]);
+        for seed in 0..MEMPOOL_MAX as u32 {
+            let tx = flood_tx(seed, 0);
+            e.mempool.insert(tx.canonical_bytes(), tx);
+        }
+        assert_eq!(e.mempool.len(), MEMPOOL_MAX);
+
+        let rich = paying_transfer(7, u128::MAX);
+        let verdict = e.on_transaction(rich.clone());
+        eprintln!("MEASURED before/1: verdict for a max-tip transfer = {verdict:?}");
+        assert_eq!(verdict, Err(Refusal::AtCapacity));
+        assert_eq!(
+            e.mempool.len(),
+            MEMPOOL_MAX,
+            "nothing was evicted to make room"
+        );
+        assert!(
+            !e.mempool.contains_key(&rich.canonical_bytes()),
+            "the paying transfer did not get in"
+        );
+        // And the bar is NOT written: capacity is not a refusal on merits.
+        assert!(e.rejected.is_empty());
+    }
+
+    /// MEASUREMENT 2 — the order the proposer packs in. The field doc says
+    /// "insertion-ordered". It is not: `mempool` is a `BTreeMap` keyed by
+    /// canonical bytes, so the order is LEXICOGRAPHIC BY CIPHERTEXT-LIKE
+    /// BYTES — grindable by an attacker and unrelated to what anyone pays.
+    #[test]
+    fn today_selection_order_is_lexicographic_by_canonical_bytes() {
+        let e = {
+            let mut e = engine_at_wall_epoch(0, &[]);
+            // Inserted in DESCENDING price, so "insertion order" and
+            // "price order" would agree and both differ from byte order.
+            for (seed, tip) in [(9u32, 900u128), (5, 500), (1, 100), (7, 700)] {
+                let tx = flood_tx(seed, tip);
+                e.mempool.insert(tx.canonical_bytes(), tx);
+            }
+            e
+        };
+        let selected = e.select_transactions(0);
+        let tips: Vec<u128> = selected
+            .iter()
+            .map(|t| match t {
+                PosTransaction::Transfer { tip_millisat_per_gas, .. } => *tip_millisat_per_gas,
+                _ => unreachable!(),
+            })
+            .collect();
+        eprintln!("MEASURED before/2: proposer packs tips in this order = {tips:?}");
+
+        let mut by_bytes: Vec<Vec<u8>> =
+            selected.iter().map(|t| t.canonical_bytes()).collect();
+        let as_selected = by_bytes.clone();
+        by_bytes.sort();
+        assert_eq!(
+            as_selected, by_bytes,
+            "selection is ascending canonical bytes"
+        );
+        assert_ne!(
+            tips,
+            vec![900u128, 700, 500, 100],
+            "selection is NOT price-descending"
+        );
+    }
+
+    /// MEASUREMENT 3 — one key can own the entire mempool. There is no
+    /// per-sender accounting of any kind, so a single hybrid keypair,
+    /// signing once per transaction, fills every slot.
+    #[test]
+    fn today_one_sender_can_hold_every_slot() {
+        let mut e = engine_at_wall_epoch(0, &[]);
+        // The flood entries all carry the SAME witness pubkey (`0xAB`×8),
+        // which is the only sender-like value admission can see.
+        for seed in 0..MEMPOOL_MAX as u32 {
+            let tx = flood_tx(seed, 0);
+            e.mempool.insert(tx.canonical_bytes(), tx);
+        }
+        let distinct_senders: BTreeSet<Vec<u8>> = e
+            .mempool
+            .values()
+            .filter_map(|t| match t {
+                PosTransaction::Transfer { inputs, .. } => Some(inputs[0].pubkey.clone()),
+                _ => None,
+            })
+            .collect();
+        eprintln!(
+            "MEASURED before/3: {} entries held by {} distinct witness key(s)",
+            e.mempool.len(),
+            distinct_senders.len()
+        );
+        assert_eq!(e.mempool.len(), MEMPOOL_MAX);
+        assert_eq!(distinct_senders.len(), 1, "one key, the whole pool");
     }
 }
