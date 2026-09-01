@@ -6,11 +6,12 @@
   "description": "Block explorer for Bloch Genesis-4, a post-quantum proof-of-stake chain \u2014 blochl1.com",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build",
+    "build": "node scripts/check-fees.mjs && tsc -b && vite build",
     "preview": "vite preview",
     "deploy": "CLOUDFLARE_ACCOUNT_ID=CLOUDFLARE_ACCOUNT_ID npx wrangler pages deploy dist --project-name bloch-explorer --branch main --commit-dirty=true",
     "test": "node --test \"edge/tests/*.test.mjs\"",
-    "test:lab": "node edge/tests/live-lab.mjs"
+    "test:lab": "node edge/tests/live-lab.mjs",
+    "check:fees": "node scripts/check-fees.mjs"
   },
   "dependencies": {
     "react": "^18.3.1",
