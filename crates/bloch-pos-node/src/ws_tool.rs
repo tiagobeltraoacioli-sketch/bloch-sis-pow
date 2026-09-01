@@ -346,6 +346,44 @@ fn keygen(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Are all the arrangement's public keys distinct?
+///
+/// `ws::verify_envelope` enforces uniqueness of the signer *index*, not of the
+/// *key*: `DuplicateSigner` fires when one index is listed twice, and nothing
+/// anywhere compares two slots' `pubkey` bytes. So an arrangement that seats
+/// ONE key in TWO slots turns a 2-of-3 into a 1-of-3 that every client
+/// accepts — the holder signs once and the same signature is listed at both
+/// indices, which are distinct, so no rule is broken. Seating the duplicate
+/// once as `internal` and once as `external` defeats `min_external` in the
+/// same stroke, which is the rule §6.1 leans on to make two founder-adjacent
+/// keys not a quorum.
+///
+/// Rejecting this belongs where an arrangement is BORN, not in the acceptance
+/// rules: changing `verify_envelope` would change what a node accepts. The
+/// arrangement is public, so this is a check every reader can also run.
+fn distinct_signer_keys(set: &SignerSet) -> Result<(), String> {
+    for i in 0..set.signers.len() {
+        for j in (i + 1)..set.signers.len() {
+            if set.signers[i].pubkey == set.signers[j].pubkey {
+                return Err(format!(
+                    "slots {i} and {j} hold the SAME public key.\n  \
+                     One key in two slots is a forgeable quorum: its holder signs once, \
+                     the signature is listed at both indices, and because the INDICES \
+                     differ, ws::verify_envelope's DuplicateSigner rule never fires — a \
+                     {}-of-{} arrangement that one person alone can satisfy. If the two \
+                     slots also differ in subset, the >={} external minimum falls with \
+                     it.\n  Every slot must hold a key generated on a DIFFERENT holder's \
+                     machine. Compare the SHA3-256 of each .pk file before assembling.",
+                    set.threshold,
+                    set.signers.len(),
+                    set.min_external,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 // ─── ws-signer-set ──────────────────────────────────────────────────────────
 
 /// `ws-signer-set --id <n> --threshold <m> --min-external <k>
@@ -399,6 +437,8 @@ fn signer_set(args: &[String]) -> Result<(), String> {
     }
 
     let set = SignerSet { id, signers, threshold, min_external, adopted_epoch };
+    distinct_signer_keys(&set)
+        .map_err(|e| format!("REFUSING to write this arrangement: {e}"))?;
     let bytes = encode_signer_set_file(&set);
     // The decoder is the shape gate (incoherent quorums are refused there);
     // round-tripping our own output means a file this command wrote can never
@@ -702,6 +742,14 @@ fn envelope(args: &[String]) -> Result<(), String> {
 
     let env = CheckpointEnvelope { checkpoint: cp, signatures };
 
+    // The arrangement itself, before the envelope: a set seating one key in
+    // two slots is a 1-of-n wearing an n-of-m's clothes, and verify_envelope
+    // cannot see it (it checks index uniqueness, not key uniqueness). Refuse
+    // to build on one rather than publish a quorum that is not a quorum.
+    distinct_signer_keys(&set).map_err(|e| {
+        format!("REFUSING to assemble: the arrangement in {set_path} is unsound — {e}")
+    })?;
+
     // THE GATE. Not a re-implementation of the acceptance rules — the rules.
     ws::verify_envelope(&env, &set, network_id, &genesis_root, &WsHybridVerifier).map_err(
         |reject| {
@@ -916,6 +964,14 @@ fn verify(args: &[String]) -> Result<(), String> {
     println!("  review due        epoch {} (envelopes warn after this)", set.review_deadline());
     println!("  hard stop         epoch {} (envelopes REFUSED after this — §6.3)", set.hard_stop());
     println!();
+
+    if let Err(e) = distinct_signer_keys(&set) {
+        println!("!!!! UNSOUND ARRANGEMENT — DO NOT TRUST THIS ENVELOPE");
+        println!("     {e}");
+        println!("     ws::verify_envelope will still ACCEPT it; the flaw is in the");
+        println!("     arrangement, not the signatures. Refuse the arrangement.");
+        println!();
+    }
 
     println!("SIGNATURES  ({} listed)", env.signatures.len());
     let verdicts = probe_signatures(&env, &set, network_id, &genesis_root);
@@ -1212,6 +1268,113 @@ mod tests {
             .unwrap();
         }
         Fixture { dir, set, cp }
+    }
+
+    /// ONE KEY IN TWO SLOTS — the quorum rule counts distinct signer
+    /// *indices*, not distinct *keys*.
+    ///
+    /// `ws::verify_envelope` rejects a repeated index (`DuplicateSigner`) and
+    /// nothing anywhere compares two slots' pubkey bytes. So an arrangement
+    /// seating one key twice is a 2-of-3 that its single holder can satisfy
+    /// alone: they sign once, the identical signature is listed at both
+    /// indices, the indices differ, and every rule passes. Seating the
+    /// duplicate once `internal` and once `external` takes `min_external`
+    /// down with it — the rule §6.1 relies on to make two founder-adjacent
+    /// keys not a quorum.
+    ///
+    /// This test pins BOTH halves: that the acceptance rules really do accept
+    /// it (so the day someone hardens `verify_envelope`, this test says so),
+    /// and that the tooling now refuses to create or build on such a set.
+    #[test]
+    fn one_key_in_two_slots_is_a_forgeable_quorum_and_the_tool_refuses_it() {
+        let dir = tmp("dup-pubkey");
+        for i in 0..3 {
+            keygen(&[s("--out"), format!("{dir}/signer{i}")]).unwrap();
+        }
+
+        // The tool must REFUSE to mint the unsound arrangement.
+        let e = signer_set(&[
+            s("--id"), s("1"),
+            s("--threshold"), s("2"),
+            s("--min-external"), s("1"),
+            s("--adopted-epoch"), s("0"),
+            s("--signer"), format!("{dir}/signer0.pk:internal"),
+            s("--signer"), format!("{dir}/signer1.pk:internal"),
+            s("--signer"), format!("{dir}/signer0.pk:external"),
+            s("--out"), format!("{dir}/set.bin"),
+        ])
+        .unwrap_err();
+        assert!(e.contains("SAME public key"), "{e}");
+        assert!(!Path::new(&format!("{dir}/set.bin")).exists());
+
+        // Build the same set by hand — nothing stops an attacker from
+        // encoding one — and confirm the CONSENSUS path still accepts it.
+        // This is the finding, pinned so it cannot regress silently.
+        let raw = |n: &str| -> [u8; HYBRID_PK_BYTES] {
+            strip_suite(&read_hex_file(&format!("{dir}/{n}.pk")).unwrap(), n)
+                .unwrap()
+                .try_into()
+                .unwrap()
+        };
+        let bad = SignerSet {
+            id: 1,
+            signers: vec![
+                Signer { pubkey: raw("signer0"), external: false },
+                Signer { pubkey: raw("signer1"), external: false },
+                Signer { pubkey: raw("signer0"), external: true },
+            ],
+            threshold: 2,
+            min_external: 1,
+            adopted_epoch: 0,
+        };
+        // The decoder's shape gate does not catch it either.
+        let encoded = encode_signer_set_file(&bad);
+        decode_signer_set_file(&encoded).expect("shape gate does not check key distinctness");
+        fs::write(format!("{dir}/bad-set.bin"), &encoded).unwrap();
+
+        let cp = WeakSubjectivityCheckpoint {
+            version: WS_FORMAT_VERSION,
+            network_id: FIX_NET,
+            genesis_root: FIX_GEN,
+            epoch: 1536,
+            block_root: [0x22; 32],
+            state_root: [0x33; 32],
+            validator_set_root: [0u8; 32],
+            issued_at: 1_756_600_000,
+            signer_set_id: 1,
+        };
+        fs::write(format!("{dir}/cp.bin"), cp.canonical_serialize()).unwrap();
+        sign(&[
+            s("--key"), format!("{dir}/signer0.sk"),
+            s("--checkpoint"), format!("{dir}/cp.bin"),
+            s("--out"), format!("{dir}/sig0"),
+        ])
+        .unwrap();
+        let one_signature = read_hex_file(&format!("{dir}/sig0")).unwrap();
+
+        // ONE signer, ONE signature, listed at two indices: ACCEPTED.
+        let forged = CheckpointEnvelope {
+            checkpoint: cp,
+            signatures: vec![(0, one_signature.clone()), (2, one_signature)],
+        };
+        assert!(
+            ws::verify_envelope(&forged, &bad, FIX_NET, &FIX_GEN, &WsHybridVerifier).is_ok(),
+            "the quorum counts distinct INDICES, not distinct KEYS — if this now fails, \
+             verify_envelope was hardened and this test should be inverted"
+        );
+
+        // ...and the tooling refuses to assemble against it anyway.
+        let out = format!("{dir}/env.bin");
+        let e = envelope(&[
+            s("--checkpoint"), format!("{dir}/cp.bin"),
+            s("--signer-set"), format!("{dir}/bad-set.bin"),
+            s("--sig"), format!("0:{dir}/sig0"),
+            s("--sig"), format!("2:{dir}/sig0"),
+            s("--out"), out.clone(),
+        ])
+        .unwrap_err();
+        assert!(e.contains("unsound"), "{e}");
+        assert!(!Path::new(&out).exists());
     }
 
     /// Below threshold. `ws-envelope` must not produce the file at all — the
