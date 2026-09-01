@@ -7884,6 +7884,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "spend-runbook"
+version = "0.1.0"
+dependencies = [
+ "bloch-crypto",
+ "bloch-pos-committee",
+ "sha3 0.10.9",
+]
+
+[[package]]
 name = "spin"
 version = "0.9.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
