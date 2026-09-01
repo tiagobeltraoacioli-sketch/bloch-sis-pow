@@ -21,6 +21,25 @@ contra `relanca/e1400`.
 
 ---
 
+> ## ⚠ Se você veio aqui para ROLAR A FROTA, leia isto primeiro
+>
+> **O título desta página está desatualizado por projeto.** Ela nasceu para
+> dois portões; depois da integração de consenso de 2026-08-31 existem
+> **nove**, e quatro deles são novos e inertes. O mapa completo — todos os
+> nove, a ordem entre eles, e o que cada um exige para ser armado — é a
+> **§11**. As §§0–10 continuam corretas no que descrevem (os portões
+> `ANCESTRY_SEED` e `LEAK_RECOVERY`) e **não** descrevem os outros sete.
+>
+> **E uma coisa muda sem portão nenhum, só de trocar o binário:** blocos com
+> as tags de staking `0x02`/`0x03`/`0x04` passam a ser rejeitados por
+> consenso em toda época. Isso tem uma pré-condição obrigatória que **expira**
+> — rodar o scanner `scan_block_log_for_staking_tags` contra um `blocks.log`
+> **atual** da mainnet, no dia do rollout, não confiando no resultado zero de
+> 2026-08-31. Se ele falhar e você rolar mesmo assim, **todo nó atualizado
+> para no primeiro bloco com essas tags**. Comando e critério: **§11.0**.
+
+---
+
 ## 0. Versionar ANTES de armar. Isto é a seção 0 por um motivo
 
 O runbook do E=1400 foi commitado em `04ee1888` — **depois** de 64 nós já terem
@@ -903,3 +922,207 @@ esperando `utc(E*)`.
   descobrir na fronteira. Sem exame de segunda pessoa — confira.
 - ~~Não há teste de "abaixo da bandeira" para o portão do leak/piso~~ —
   resolvido, §3 débito 1.
+
+---
+
+## 11. Calendário consolidado dos dias de bandeira (todos os nove portões)
+
+Escrito na integração de consenso de 2026-08-31, que juntou seis worktrees e
+introduziu **quatro** constantes de ativação novas. As seções 0–10 acima
+descrevem dois portões (`ANCESTRY_SEED` e `LEAK_RECOVERY`) e continuam
+válidas no que descrevem; esta seção é o mapa de todos eles, porque a partir
+de agora a pergunta "o que está armado neste binário" tem nove respostas, não
+duas.
+
+**Nada aqui está armado.** As quatro constantes novas nascem `u64::MAX`. Esta
+seção não arma nada: ela diz o que *seria* preciso para armar cada uma, e em
+que ordem.
+
+### 11.0 A coisa que muda HOJE, sem portão nenhum — leia antes de trocar binário
+
+Uma única mudança de aceitação entra **na troca do binário**, sem dia de
+bandeira: blocos que carreguem as codificações de staking não autenticadas —
+tags `0x02` (`Deposit`), `0x03` (`Exit`), `0x04` (`Delegate`) — passam a ser
+rejeitados por consenso, em toda época, em todo nó.
+
+Antes, a única recusa era a do mempool, que **o próprio proponente nunca
+consulta**: um membro do comitê podia incluir um `Deposit` no seu próprio
+bloco e cunhar stake vinculado do nada, ou um `Exit` por índice para cada
+validador ativo e esvaziar o roteiro irreversivelmente. É um APERTO: o
+binário velho aplica esses blocos, o novo os rejeita inteiros
+(`TransitionError::Transaction`). Os dois divergem exatamente nos blocos que
+só um insider consegue produzir — que é o ponto.
+
+Está isolada no commit `337bdd9f`, sozinha, para poder ser revertida sem
+tocar nos sucessores.
+
+> **PRÉ-CONDIÇÃO DE CUTOVER — obrigatória, e ela EXPIRA.**
+>
+> Antes de reconstruir a frota, rode o scanner contra um `blocks.log`
+> **atual** da mainnet:
+>
+> ```sh
+> mkdir -p /tmp/mainnet-scan
+> cp /tmp/mainnet-blocks.log /tmp/mainnet-scan/blocks.log   # cópia SOMENTE LEITURA de um host da frota
+> SCAN_BLOCKS_LOG=/tmp/mainnet-scan cargo test -p bloch-pos-node --bins \
+>     scan_block_log_for_staking_tags -- --ignored --nocapture
+> ```
+>
+> Ele lê o log pela máquina do próprio nó (`Store::read_all` +
+> `PosTransaction::from_canonical_bytes` — o mesmo decode que o replay usa,
+> nunca um grep de bytes, senão um `0x02` dentro de uma tabela de testemunhas
+> seria contado como mensagem de staking) e **falha** se qualquer bloco
+> carregar `0x02`/`0x03`/`0x04`.
+>
+> Se ele falhar, **não role a frota**: a rejeição em toda época faria todo nó
+> atualizado parar no primeiro desses blocos, e a mudança teria de ser
+> reemitida atrás de um portão armado ACIMA do último deles.
+>
+> O resultado zero conhecido é de **2026-08-31** e **não vale para o dia do
+> rollout**. Um log só ganha blocos; um único bloco novo com essas tags
+> inverte a resposta. Rode de novo, no dia. O custo é um teste; o custo de
+> não rodar é a frota inteira parada num bloco do passado.
+
+### 11.1 Os nove portões
+
+Cadência: um slot = 30 s, 32 slots = uma época ⇒ **1 época ≈ 16 min ≈ 90
+épocas/dia**. Qualquer conversão época→data abaixo usa essa taxa a partir da
+época **1.599, medida em 2026-08-31** (slot 51.184). São aritmética, não
+promessa: a cadeia não fecha épocas em ritmo constante quando a finalidade
+tropeça.
+
+| # | Constante | Valor | O que arma | Carregador na rede? |
+|---|---|---|---|---|
+| 1 | `TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH` | **800** (armado) | `TransferV2`, tag `0x06` | sim |
+| 2 | `BLOCK_BYTES_V2_ACTIVATION_EPOCH` | **800** (armado) | teto de 512 KiB de payload | n/a |
+| 3 | `LEAKED_ROSTER_ACTIVATION_EPOCH` | **1400** (armado, rolado) | roteiro pelo stake pós-leak | n/a |
+| 4 | `ANCESTRY_SEED_ACTIVATION_EPOCH` | `u64::MAX` | look-ahead F6 da semente (§1) | n/a |
+| 5 | `LEAK_RECOVERY_ACTIVATION_EPOCH` | `u64::MAX` | recuperação do leak + piso de quórum (§1) | n/a |
+| 6 | `VESTING_LOCK_ACTIVATION_EPOCH` | `u64::MAX` | semeadura única das travas de vesting | n/a |
+| 7 | `FUNDED_STAKING_ACTIVATION_EPOCH` | `u64::MAX` | `DepositV2` (tag `0x07`) + delegação financiada | **parcial** |
+| 8 | `SIGNED_EXIT_ACTIVATION_EPOCH` | `u64::MAX` | saída voluntária assinada (`apply_exit`) | **NÃO** |
+| 9 | `WITHDRAWAL_ACTIVATION_EPOCH` | `u64::MAX` | `Withdraw` (tag `0x08`), trava de 4.096 épocas, ordem evidência-antes-de-saque | sim |
+
+A coluna "carregador na rede" é a que quase ninguém pergunta, e é a que
+decide se armar um portão faz alguma coisa:
+
+- **#8 não tem carregador nenhum.** `apply_exit` não tem **nenhum** ponto de
+  chamada de produção — só testes. Armar `SIGNED_EXIT` hoje **não muda
+  nada**: não existe forma de uma saída assinada entrar num bloco. O
+  carregador de wire está sendo escrito (tag `0x09`, fluxo separado); o
+  portão só passa a significar alguma coisa depois dele.
+- **#7 é parcial.** `DepositV2` (tag `0x07`) tem codec, portão e verificação
+  completos — armar torna depósitos financiados reais. Mas `apply_delegation`
+  está atrás da MESMA constante e **também não tem ponto de chamada de
+  produção**: delegação financiada continua inalcançável até ganhar o seu
+  próprio formato de wire. Uma constante, dois caminhos, só um alcançável.
+- **#6 não semeia nada na cadeia atual.** A semeadura só reescreve outpoints
+  de alocação **ainda não gastos**, e os cinco foram medidos **GASTOS** em
+  2026-08-31 (`gettxout` responde `unspent: false` para todos; o saldo do
+  script do fundador estava em ~37,94 bi contra os ~56,05 bi de abertura).
+  Armar #6 hoje trava zero satoshi. Os usos honestos que restam são (a) uma
+  génese futura cujo manifesto carregue `unlock_epoch` reais e (b) um
+  re-comprometimento negociado em que os baldes voltem primeiro para
+  outpoints novos, fixados aqui antes de armar. Nenhum dos dois é mudança
+  unilateral de código.
+
+### 11.2 A ordem — e por que duas dessas setas são erro de compilação
+
+```
+        #7 FUNDED_STAKING ─────┐
+                               ├──> #9 WITHDRAWAL
+        #8 SIGNED_EXIT ────────┘
+```
+
+As duas arestas são verificadas **em tempo de compilação** (`params.rs`, dois
+`const _: () = assert!`), porque o modo de falha é uma edição de constante
+daqui a semanas — e uma linha de runbook é exatamente o que já foi pulado uma
+vez:
+
+- **`WITHDRAWAL >= FUNDED_STAKING`.** Pagar vínculo que nunca foi financiado
+  pelo conjunto eUTXO é **cunhagem**. Enquanto depósitos não gastarem moedas,
+  depósito → saída → saque é uma impressora.
+- **`WITHDRAWAL >= SIGNED_EXIT`.** O saque consome um registro **SAÍDO**, e
+  depois do fechamento do §11.0 a saída assinada é a única coisa capaz de
+  fazer um registro sair. Armar o pagamento primeiro entrega uma porta sem
+  estrada até ela.
+
+Verificado quebrando, não lendo: pondo `WITHDRAWAL_ACTIVATION_EPOCH = 5000`
+com as outras em `u64::MAX`, o build falha com `E0080` nas duas asserções,
+com essas mensagens. Não é um teste que alguém precise lembrar de rodar; é o
+`cargo build`.
+
+Os portões #4 e #5 são independentes destes e um do outro; a ordem deles está
+nas §§1–5. O #6 é independente de todos.
+
+### 11.3 Pré-condições de armamento, por portão
+
+Valem para todos, sem exceção, as regras da §0 e da §3: **versionar antes de
+armar**; época **estritamente no futuro** no momento do tag (uma época já
+passada arma em silêncio — foi assim que 1.600.000 BLCH escaparam de um
+write-off que nunca disparou); frota reconstruída ANTES de baixar a
+constante. Além disso:
+
+- **#6 `VESTING_LOCK`** — go/no-go no dia: confirmar por `gettxout` que os
+  outpoints de alocação estão **não gastos**. Medição de 2026-08-31: todos
+  gastos ⇒ armar não faz nada. Não arme "para deixar pronto": a semeadura é
+  única e roda na fronteira que ABRE a época (igualdade, não `>=`), então uma
+  época escolhida errado gasta o mecanismo sem efeito.
+- **#7 `FUNDED_STAKING`** — (a) frota reconstruída; (b) carteira ou
+  ferramenta capaz de montar um `DepositV2` conservante: a igualdade
+  `soma(entradas) == amount + troco + taxa` é **estrita**, e uma carteira que
+  erre por um satoshi produz transação recusada, não transação com troco
+  errado; (c) aceitar, e comunicar, que delegação financiada continua
+  inalcançável até ter carregador.
+- **#8 `SIGNED_EXIT`** — o carregador de wire (tag `0x09`) precisa existir e
+  estar na frota. Antes disso, armar é ruído — e ruído que a página de
+  release vai afirmar como recurso.
+- **#9 `WITHDRAWAL`** — o mais caro, e o único cuja pré-condição **não é de
+  código**:
+  1. `FUNDED_STAKING` e `SIGNED_EXIT` armados antes (o compilador garante);
+  2. **auditoria da oferta da génese.** O saque paga o vínculo em moedas sem
+     tocar `issued_sat`, tratando aquele valor como já emitido. Isso é
+     verdade para vínculo financiado e para juros compostos, e **não foi
+     verificado** para o `staked_sat` da coorte de lançamento: se aquele
+     stake não estava dentro de `GENESIS_ISSUED_SAT`, o primeiro saque da
+     coorte cria moeda que o teto de oferta não contava. É um fato da
+     cerimônia de génese, não uma linha de código, e precisa ser auditado
+     antes do primeiro saque **da coorte** — não antes do primeiro saque
+     qualquer.
+
+### 11.4 Como saber o que um binário sabe
+
+Um binário publicado que precede um armamento **segue a regra velha naquela
+época e bifurca**, em silêncio — foi o defeito do `genesis4-node-20260814`.
+Quem responde isso é `bloch-pos selfcheck` (e `selfcheck --json` para páginas
+de release e varredura de frota), que imprime os portões que o binário linka
+e um digest do conjunto. Dois binários são compatíveis na época E sse as
+listas concordam em todo portão com época ≤ E.
+
+Essa ferramenta vem do fluxo irmão de integridade de release (worktree
+`a26bcc84e23ca2e0e`), e o teste `gate_table_mirrors_params_exactly` casa a
+tabela dela com as constantes de `params.rs`, falhando por **omissão** — um
+portão novo que a declaração de compatibilidade não mencione. Quando as duas
+integrações convergirem, a tabela precisa ganhar as quatro constantes desta
+seção (todas inertes); o digest muda **por projeto** (um conjunto de portões
+diferente É uma declaração de compatibilidade diferente) e
+`knows_gates_through_epoch` continua 1400, porque nenhuma das quatro está
+armada.
+
+### 11.5 O que esta seção NÃO estabelece
+
+- **Nenhuma data aqui é decisão.** São conversões época→data a 90 épocas/dia
+  a partir de uma medição de 2026-08-31. Quem arma escolhe E\* pela §2, não
+  por esta tabela.
+- **Não medi a cadeia para escrever isto.** Os números de cadeia citados
+  (época 1.599, slot 51.184, outpoints gastos, saldo do fundador) são
+  medições de 2026-08-31 herdadas das peças integradas, não leituras minhas.
+  Reconfira antes de agir sobre qualquer uma — a §11.0 existe justamente
+  porque medição de cadeia envelhece.
+- **A interação entre #6 e o resto não foi examinada.** A semeadura reescreve
+  outpoints, o que move a raiz de estado na fronteira; que isso não interaja
+  mal com um armamento simultâneo de #4/#5 é suposição, não resultado. Não
+  arme dois portões na mesma fronteira sem examinar isso primeiro.
+- **A ordem entre #7/#8/#9 é garantida; o espaçamento não.** As asserções
+  proíbem inverter, não escolher épocas próximas demais para a frota rolar
+  entre elas. Esse julgamento é da §2.

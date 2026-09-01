@@ -294,6 +294,20 @@ mod scan {
     //! it FAILS if any block anywhere carries tag 0x02, 0x03 or 0x04 —
     //! in which case the every-epoch rejection would strand replay at that
     //! block and must instead ship behind an activation gate above it.
+    //!
+    //! # THIS RESULT EXPIRES. It is a cutover precondition, not a fact.
+    //!
+    //! The known-clean answer was measured on **2026-08-31** and says nothing
+    //! about the log on the day the fleet is rebuilt: a block log only grows,
+    //! and one new block carrying any of those tags flips the verdict. So
+    //! this must be re-run against a CURRENT mainnet log immediately before
+    //! rollout — not read out of a commit message, a report, or this comment.
+    //!
+    //! Re-running it is one test. Not re-running it, on a log that has since
+    //! gained such a block, stops every upgraded node at that block: the
+    //! rejection is ungated, so there is no epoch at which replay gets past
+    //! it. The operator-facing statement of the same rule, with the go/no-go
+    //! criterion, is `docs/RELANCA-G4-DIAS-DE-BANDEIRA.md` §11.0.
 
     use super::Store;
     use bloch_pos_committee::transition::{PosTransaction, TxDecodeError};
