@@ -257,6 +257,19 @@ releases.
 3. Publish binary + `SHA256SUMS` (+ signature, same signing flow as the
    `SHA256SUMS` re-signing precedent). The published bytes are the bytes from
    step 2 — never a box's local build.
+   Attach **`consensus-compat.json`** — the verbatim output of
+   `./bloch-pos selfcheck --json` run on the published binary itself, never
+   hand-written. It states the consensus flag days (activation epochs) the
+   binary was built knowing, armed and inert, plus a `gates_digest`; that is
+   the machine-readable answer to "which epoch range is this binary valid
+   for". The defect it closes is `genesis4-node-20260814`: a published
+   binary that predated the epoch-800 and epoch-1400 armings, went
+   consensus-dead on schedule, and whose release page said nothing.
+   Corollary: **arming a flag day is a release-page event** — the same
+   change window that arms a gate must edit the current release page (title
+   prefix + warning block; precedent in
+   `deploy/RELEASE-CORRECTION-genesis4-node-20260814.md`) if the published
+   binary does not know the new gate.
 4. Assemble the rollback package from release N−1
    (`make-rollback-package.sh`), pass §5.3 on a scratch host, stage per §5.2.
 5. Deploy via drop-ins; run the §4 sweep — every host must match the
