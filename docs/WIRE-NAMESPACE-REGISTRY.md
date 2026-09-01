@@ -190,10 +190,25 @@ Integrator-visible notes that belong with this list:
   Integrators reconcile via `getbalance`/`listunspent` on a `script_hash`.
 - A block exposes `tx_count`, not a `transactions` array.
 
-Proposed/unmerged methods must be claimed here before implementation. Known
-in-flight RPC work: `crates/bloch-pos-committee/src/params_feed.rs` +
-`rpc.rs` in `agent-aeb2ec6de2cd89cbb` (consensus-parameter feed — method name
-not yet claimed; **PMO to assign before that lands**).
+Dispatch table is `crates/bloch-pos-node/src/rpc.rs:856-919` — 13 names, 12
+handlers (`getutxos` and `listunspent` alias one handler at `:882`).
+`gettransaction` (`:865`) and `getnewaddress` (`:866`) are deliberate typed-error
+stubs, not gaps.
+
+### Allocated, unmerged
+
+| Method | Status | Owner | Frozen by |
+| --- | --- | --- | --- |
+| `getconsensusschedule` | **CLAIMED by PMO, 2026-08-31.** Built in `agent-aeb2ec6de2cd89cbb` @ `858824ef`, dispatch `rpc.rs:869`, handler `consensus_schedule_json` `:1258-1325`, envelope `schema: "bloch-consensus-schedule/1"` | integrations | `crates/bloch-pos-node/src/rpc/tests.rs:474-500` (asserts the reply neither drops nor invents a gate relative to `params_feed::SCHEDULE`) |
+
+No other unmerged method names exist anywhere in the tree. `getconsensusschedule`
+is the only addition, and it is now claimed — do not rename it.
+
+**`docs/specs/BLOCH-RPC-V4.md` has no consensus-schedule method** and §7
+(`:393-402`) requires the explorer proxy read-only allowlist at
+`apps/explorer/functions/rpc.js` to be regenerated for V4. Both must be updated
+when `getconsensusschedule` lands, or the method will exist and be unreachable
+through the public proxy.
 
 ---
 
