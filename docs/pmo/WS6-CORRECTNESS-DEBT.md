@@ -70,16 +70,40 @@ is 1% *of active stake*, the ceiling rises as the stake it admits rises. The
 floor exists because a naive 1% cap at genesis (active stake ≈ 0) would deadlock
 the bootstrap — a sound reason with an unsound consequence.
 
-The audit's measured figure — on the order of **180 messages to control the
-chain** — follows from that compounding. **The validator set is held fixed by
-policy, not by protocol.**
+Measured exposure, recorded in the node's own source
+(`bloch-pos-node/src/engine.rs:2731-2735`): **25,000 BLCH per unauthenticated
+request, ~46 requests to reach a third of active stake.** **The validator set is
+held fixed by policy, not by protocol.**
+
+`Delegate` (`0x04`, `transition.rs:2050-2072`) is the same shape, and adds its
+own defect: **no ownership check on the `delegator` field at all.**
+
+`staking::validate_deposit` (`staking.rs:285-318`) *does* demand transparent
+inputs — and has **no production call site**, a fact pinned by
+`tests/integration_book_claims.rs:484-489`.
 
 ### 1.3 Is the unmerged `DepositV2` a fix?
 
-**No — and this is the item that most needs a decision.** `DepositV2` (`0x07`)
-exists only in worktrees and adds structure, not funding: nothing in it gives the
-deposit path an eUTXO input to spend. It reproduces the defect in a newer
-encoding. Landing it would make the pool split *more* entrenched, not less.
+**It splits — and picking the wrong worktree ships the defect in a new
+encoding.** My earlier blanket "DepositV2 reproduces it" was wrong. Measured:
+
+- **`agent-a5a0a10bb332b59ca`** (and `wt/signed-exit-wire`,
+  `wt/exit-churn-limit`, `wt/withdraw-refusals`) — **FIXES it.** Real
+  conservation (`if spent_value != *amount_sat + change_sat + fee {
+  ValueNotConserved }`, `:3433`), a real burn
+  (`self.eutxos.remove(&(i.txid, i.vout))`, `:3476-3478`), proof-of-possession,
+  and per-input witnesses. Critically it **also rejects `0x02` unconditionally at
+  every epoch** (`:2472-2494`) — it closes the live hole, not just the new path.
+  The new `0x07` is inert (`FUNDED_STAKING_ACTIVATION_EPOCH = u64::MAX`).
+- **`agent-a087ea83a391a7f0a`** — **REPRODUCES it.** `apply_deposit_v2` is
+  correct in isolation, but the legacy arm only returns early
+  `if deposit_funding_active(self.epoch)`, and
+  `DEPOSIT_FUNDING_ACTIVATION_EPOCH = u64::MAX` — so the minting arm still runs
+  at every epoch. **Merging this fixes nothing** while looking like a fix.
+
+**This is the decision that matters: merge the first lineage, not the second.**
+The two are easy to confuse — both add a correct `0x07` — and only one closes
+`0x02`.
 
 Closing this means "giving deposits and withdrawals eUTXO inputs" — the
 transition module's own words. **That is a consensus change with a flag day, and
@@ -120,8 +144,28 @@ what it is protecting:
 > them silently wins.
 
 **The discrepancy: 64 genesis validators × `MIN_DEPOSIT_SAT` (25,000 BLCH) =
-1,600,000 BLCH of bonded stake that exists in committed state from slot 0 and is
-counted in no supply total.**
+exactly 160,000,000,000,000 sat = 1,600,000 BLCH**, bonded in committed state
+from slot 0 and counted in no supply total. `GENESIS_ISSUED_SAT` itself is
+5,714,640,000,000,000,000 sat. **Real ultimate supply is 100,001,600,000 BLCH —
+1.6M *above* the "hard cap"** (0.0016%).
+
+### 2.0 Root cause: two genesis builders disagree, and we shipped the wrong one
+
+This is not an oversight in the accounting; it is a fork in the tooling.
+
+- **The ceremony tool deducts.** `tools/genesis4-ceremony/src/lib.rs:684-703` —
+  *"the genesis liquidity output is reduced by exactly the bonded amount."*
+  Under this path the books balance.
+- **The node builder does not.** `bloch-pos-node/src/main.rs:605-621` allocates
+  the full `LIQUIDITY_BLOCH` and bonds the validators on top.
+
+**The shipped `genesis/mainnet.manifest` matches the non-deducting path** — 64
+validators × 25,000 BLCH bonded *and* the full 5B BLCH liquidity. The correct
+builder existed and was not the one used.
+
+*(Inferred, not proven: that the manifest came from `bloch-pos genesis-mainnet`
+rather than the ceremony tool. Strongly supported by the un-deducted value; no
+build log was found.)*
 
 ### 2.1 What breaks
 
@@ -136,8 +180,16 @@ counted in no supply total.**
   100B) and therefore exactly the kind of discrepancy that surfaces later, in
   someone else's audit, as evidence we do not know our own supply.
 - **`check_supply` passes anyway**, because the bond is not in either side of
-  its equality. The check that exists to make the manifest *"a claim rather than
-  an assertion"* cannot see the term.
+  its equality — it sums only carryover + allocations, reports diff 0, and **is
+  never re-run at node start.** The check that exists to make the manifest
+  *"a claim rather than an assertion"* cannot see the term.
+- **The cap check can never fire on this gap.** `transition.rs:3219` compares a
+  counter seeded 1.6M short of reality, so `SupplyCapExceeded` is unreachable
+  for it.
+- **No test anywhere sums eUTXOs + registry stake against `issued_sat`.**
+- **No RPC contradicts it**: `getsupply`, `getsupplyinfo` and `getissuance` are
+  all in `RPC_ABSENT` (`rpc.rs:867-875`).
+- **The gap widens without bound** with every post-genesis deposit (§1).
 
 ### 2.2 PMO position
 
@@ -149,11 +201,69 @@ documentation and in whatever `getsupply`-shaped surface we publish**, as a
 distinct pool alongside issued supply. The consensus-level fix (bonded stake
 funded from and returned to the eUTXO set) is item 1.3 and shares its flag day.
 
+**And be honest about the cost of a true fix:** correcting the genesis books is a
+**genesis-state-root change. It moves `genesis_id()`, so it requires a
+relaunch.** That is not a flag day; it is a new chain. Which is precisely why the
+documentation fix is the right answer for now, and why nobody should promise a
+partner that the 1.6M will be reconciled away.
+
 ---
 
-## 3. The fleet runs a binary without the catch-up fix
+## 3. "The fleet runs a binary without the catch-up fix" — **the premise is inverted**
 
-**Confirmed, and it is worse than "the fleet is behind" — no release has it.**
+**CORRECTION, 2026-09-01. This section originally asserted the brief's premise as
+confirmed. Measurement reverses it, and the reversal changes who is behind.**
+
+There are **two different fixes** that both get called "the catch-up fix", and
+conflating them is what produced the error. Separated:
+
+### 3a. The consensus catch-up fix (`47f7644b`) — **the fleet HAS it; `main` does not**
+
+Read-only probes (`--version`, `readlink /proc/PID/exe`, RPC) across all **7 big
+boxes × 9 processes = 63 validators**: every one runs `bloch-pos-cinco`,
+`0.1.0-mainnet (46133196-varredura)`, and **`46133196` descends from
+`47f7644b`.**
+
+`git merge-base --is-ancestor 47f7644b main` → **not an ancestor.** Same for
+`0a3a436a`, and same for `validator-ops`. `docs/ATRIBUICAO-2026-08-24.md:30`
+shows `0e609f19` ("o codigo que a frota roda passa a ser o main") landed 02:33;
+`47f7644b` (05:50) and `0a3a436a` (06:13) landed *after* and were never brought
+back.
+
+**So the fleet is ahead and the repository is behind** — the inverse of the
+brief. The only stragglers are `main`/`validator-ops` and **one stale public-RPC
+observer** (`136.244.90.238`, `2701feab`, **epoch 800 against the fleet's
+1666**). That observer is one of the two nodes WS5 §1.5 says the exchange would
+be told to corroborate against.
+
+**The four corrections in `47f7644b`, and whether merging arms anything:**
+
+| # | correction | gate | effect |
+| --- | --- | --- | --- |
+| 1 | producer inclusion filter uses `committee_for_slot`, not `slot_subcommittee` (`derive.rs:499`) | **none, deliberately** | producer-side only; replay byte-identical |
+| 2 | node seed look-ahead reads the same gate as the committed rule (`engine.rs:929`) | `ANCESTRY_SEED_ACTIVATION_EPOCH` = `u64::MAX` **(OFF)** | **this is the flood fix**; below the flag day it uses lookahead 0, matching `seed_for_epoch` |
+| 3 | `release_held` anchors to the arriving block, not this node's head (`engine.rs:2380`) | none needed | node-local |
+| 4 | unjudgeable-but-parkable: "target not yet received" parks, "ancestry unreachable" ignores (`engine.rs:2232-2262`) | none needed | node-local |
+
+**Does merging arm anything? No.** No constant changes value on any ref;
+`ANCESTRY_SEED_ACTIVATION_EPOCH` and `LEAK_RECOVERY_ACTIVATION_EPOCH` are
+`u64::MAX` on `validator-ops`, `main` and this branch alike, and this branch adds
+only one *more* inert gate. **But it is not behaviourally inert** — corrections
+1–4 take effect the moment a merged binary runs, which is exactly how the repo
+converges onto the fleet.
+
+**Minimal carrier.** If the goal is only to close the consensus gap,
+`origin/relanca/e1400-quatro-portoes` already publishes these commits. Note that
+**`pmo/wire-namespace-registry` — the branch carrying this analysis — is
+local-only and has never been pushed.**
+
+**Standing hazard, and it constrains the founder's arming decision**
+(`engine.rs:912-928`): `derive::sortition_seed` is a **third** seed definition,
+reading E−1 with **no gate at all**. All three agree below the flag day, so
+nothing is wrong today — but **arming `ANCESTRY_SEED_ACTIVATION_EPOCH` is unsafe
+until that third definition is closed.**
+
+### 3b. The cold-sync catch-up fix — **unmerged, and in no release. This part stands.**
 
 The fix is `fix(catch-up): share the eUTXO map so an epoch roll stops paying the
 ledger` (an `Arc<BTreeMap>` copy-on-write, so an epoch boundary stops doing work
@@ -219,11 +329,56 @@ reference rot**, the same class of failure that has now hit four systems in this
 repo. The self-refuting messages are the harness reporting, accurately, that it
 can no longer reproduce a defect it is no longer able to reach.
 
-**Conclusion: the two explanations are not competitors, and the framing is the
-problem.** A is a historical account of *how the roster split*; B is a live,
-code-verified account of *why a split becomes a finality failure instead of a
-stall*. A has been fixed and its regression harness has rotted. **B is not fixed
-and is not tested at all** — `params.rs:597` still reads `u64::MAX`.
+**Conclusion — and this goes further than "not competitors". E1 is arithmetically
+incapable of having caused the incident.**
+
+`transition.rs:1664-1669`:
+
+```rust
+fn consensus_roster_at(&self, epoch: u64) -> Vec<Validator> {
+    let roster = self.duty_roster_at(epoch);
+    if epoch < crate::params::LEAKED_ROSTER_ACTIVATION_EPOCH {
+        return roster;                      // <-- the identical object
+    }
+    with_leak_applied(roster, |index| self.finality_engine.leaked_of(index))
+}
+```
+
+`LEAKED_ROSTER_ACTIVATION_EPOCH = 1400` (`params.rs:244`). **The incident was at
+epoch 986.** Below 1400, step 8 and `close_epoch` receive the *same roster*, so
+the two partitions are identical **whether or not the pre-shuffle filter
+exists**. E1's mechanism could not operate at epoch 986. The repo says so itself
+at `docs/RELANCA-G4-DECISOES.md:148-152`: *"`consensus_roster_at` returns the
+unleaked roster while `epoch < 1400`, so the roster split never operates
+there."*
+
+So E1 was a **real latent defect that would have fired at epoch 1400** and was
+pre-emptively fixed. It was never the incident's mechanism. **E2 is unconditional
+code and matches the observed signature** — three nodes, one epoch, three roots.
+
+### 4.3.1 The corollary, and it is the worst finding on this page
+
+**The fix for the mechanism that was *not* responsible is armed and already
+bound; the fix for the mechanism that *was* responsible is switched off.**
+
+In production (`gates_forced_open()` is `false` outside `cfg(test)`,
+`finality.rs:290-297`):
+
+- **Denominator floor** — `finality.rs:353-360`: `votes.epoch <
+  LEAK_RECOVERY_ACTIVATION_EPOCH` is always true (`u64::MAX`, `params.rs:597`),
+  so `total_active = leak_adjusted`. **No floor.**
+- **Leak recovery** — `finality.rs:497-499`: `votes.epoch >= u64::MAX` is always
+  false. **The accumulator never comes back down.**
+
+Meanwhile `LEAKED_ROSTER_ACTIVATION_EPOCH = 1400` is armed and the chain is at
+epoch 1666.
+
+**The monotonic ratchet that caused 2026-08-24 is live and unmitigated on all 63
+validators today.** The founder's `1/2` floor (`params.rs:147-149`, authored
+2026-08-24) is the correct mitigation and it is gated off. **Arming
+`LEAK_RECOVERY_ACTIVATION_EPOCH` is the highest-value consensus action available
+— and it is not on the 5 September path, so it can be scoped and rehearsed
+properly.**
 
 **B is the one that matters, and B does not depend on `prova.rs`.** It rests on
 direct reading of `finality.rs:342-364` plus the crate's own passing test
