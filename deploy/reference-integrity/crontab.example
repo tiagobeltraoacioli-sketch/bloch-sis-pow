@@ -1,10 +1,24 @@
-# Reference-rot detector, cron form. cron mails any output, and the detector
-# prints its one verdict line whenever something has rotted (and nothing at all
-# when --quiet and clean), so a quiet mailbox means a healthy fleet.
+# Reference-rot detector, cron form (Linux / a jump box).
+#
+# On macOS prefer the launchd agents in this directory: modern macOS gates
+# cron under TCC and ships no configured MTA, so MAILTO there silently
+# discards every verdict — a check that runs and throws its answer away.
+#
+# Note both entries call the WRAPPERS, not rot-detector.sh directly. The
+# wrapper bounds the run and leaves the receipt the heartbeat reads.
 MAILTO=tiagobeltraoacioli@gmail.com
-17 * * * * /opt/bloch/reference-integrity/rot-detector.sh --quiet 2>&1
 
-# Belt and braces: once a day, prove the DERIVATION still agrees with reality,
-# which catches drift the peer check alone would miss (e.g. a unit added by
-# hand with a hand-typed peer list).
+# Hourly: has anything rotted? Silent when clean (--quiet), so a quiet
+# mailbox means a healthy fleet.
+17 * * * * /opt/bloch/reference-integrity/detector-run.sh --quiet 2>&1
+
+# Every 30 min: is the detector still running at all? A detector that stopped
+# looks exactly like one that keeps passing — both are silence. Silent while
+# the detector is fresh and clean; loud the moment it goes stale, starts
+# failing, or was never loaded.
+*/30 * * * * /opt/bloch/reference-integrity/heartbeat.sh --quiet 2>&1
+
+# Daily: prove the DERIVATION still agrees with reality, which catches drift
+# the peer check alone would miss (e.g. a unit added by hand with a
+# hand-typed peer list).
 23 6 * * * /opt/bloch/reference-integrity/derive-peers.sh check 2>&1

@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  ~/Library/LaunchAgents/com.postern.bloch.rot-heartbeat.plist
+
+  Checks that the detector is still checking. Runs more often than the
+  detector (every 30 min against a 3 h staleness limit) so that a stopped
+  detector is noticed within one limit rather than one cadence.
+
+  It is deliberately a SEPARATE agent from the detector: an agent that failed
+  to load, or a script that was deleted, cannot report its own absence. Two
+  agents can fail independently; one cannot fail and still speak.
+
+  This is a same-machine check, and honest about its limit: it catches a timer
+  that was unloaded, a script that was removed, a run wedged past its timeout,
+  an expired ssh key, and a Mac that slept through the window. It CANNOT
+  report anything while the machine itself is off. Closing that last gap
+  needs a second host, which is a founder decision (it means putting the fleet
+  key somewhere new) and is deliberately not taken here.
+
+  Load: launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.postern.bloch.rot-heartbeat.plist
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.postern.bloch.rot-heartbeat</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-lc</string>
+    <!-- --quiet prints nothing when the detector is running and clean, so
+         the log holds only the moments worth reading. -->
+    <string>$HOME/bloch-rollout/reference-integrity/heartbeat.sh --quiet</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>1800</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/tmp/bloch-rot-heartbeat.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/bloch-rot-heartbeat.log</string>
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>

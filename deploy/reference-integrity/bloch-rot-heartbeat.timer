@@ -1,0 +1,13 @@
+# /etc/systemd/system/bloch-rot-heartbeat.timer
+[Unit]
+Description=Check every 30 min that the reference-rot detector is still running
+
+[Timer]
+OnBootSec=5min
+# Runs more often than the detector (30 min against a 3 h staleness limit), so
+# a stopped detector surfaces within one limit rather than one cadence.
+OnUnitActiveSec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

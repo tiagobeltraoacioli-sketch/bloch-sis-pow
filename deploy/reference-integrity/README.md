@@ -27,7 +27,10 @@ underneath all of them:
 |---|---|---|
 | `inventory.sh` | discovers the fleet **by unit content and by RPC** | no |
 | `rot-detector.sh` | unattended check, one verdict line, non-zero exit | no |
+| `detector-run.sh` | what the **timer** calls: bounds the run, leaves a receipt | only inside `STATE_DIR`, on this machine |
+| `heartbeat.sh` | checks **the checker** — has it run recently, what did it say | no |
 | `derive-peers.sh` | derives the private fleet list and the public bootstrap list | no |
+| `selftest.sh` | pins the 0/1/2 exit contract of the two above | temp dir only |
 | `cleanup-references.sh` | **plans** the cleanup; delegates execution to the rollout | only with an explicit typed flag, and even then it calls the rollout |
 
 Nothing here restarts, edits, enables or disables anything on the fleet. There
@@ -113,6 +116,57 @@ Two deliberate anti-false-alarm rules, both from real incidents:
 A detector that cries wolf gets ignored, and an ignored detector is worse than
 none — it converts a known gap into a false sense of coverage.
 
+### `detector-run.sh` + `heartbeat.sh` — checking the checker
+
+The detector answers *has anything rotted?* It cannot answer *did anyone
+ask?* — and the second question is the one that cost nine hours. **A check
+that silently stopped running looks exactly like a check that keeps passing.
+Both are silence.**
+
+So the timer never calls `rot-detector.sh` directly. It calls
+`detector-run.sh`, which does two things the detector cannot do for itself:
+
+- **Bounds the run.** A detector that *hangs* is worse than one that fails: a
+  systemd oneshot with a wedged ssh sits in `activating` forever, so
+  `systemctl --failed` stays empty and the mailbox stays quiet while nothing
+  is being checked. The sweep is killed at `DETECTOR_TIMEOUT_S` (1200 s
+  against a measured ~4 min) and reported as **2**, never as 0. macOS has no
+  `timeout(1)`; the wrapper falls back to `gtimeout`, and if neither exists it
+  still runs and says so in the receipt rather than pretending it was bounded.
+- **Leaves a receipt**, on *every* exit path including the undetermined one:
+  `STATE_DIR/last-run.tsv` = `iso8601 ⇥ epoch ⇥ exit ⇥ verdict`. An exit 2 that
+  leaves no trace makes "the detector is broken" and "the detector was never
+  started" indistinguishable, which is the confusion this directory exists to
+  abolish.
+
+`heartbeat.sh` reads that receipt and speaks the same alphabet — **0** ran
+recently and clean, **1** ran recently and found rot, **2** could not
+determine: no receipt, unreadable receipt, receipt **stale** past
+`HEARTBEAT_MAX_AGE` (3 h against an hourly cadence), a receipt from the
+future (a clock that moved cannot judge staleness), or a last run that was
+itself undetermined. That last case matters: an expired ssh key mails the same
+exit 2 every hour until it becomes wallpaper; here it is a standing failure.
+
+It runs as a **separate** timer, every 30 min. Separate on purpose: a timer
+that failed to load, or a script that was deleted, cannot report its own
+absence. Two units can fail independently; one cannot fail and still speak.
+
+`selftest.sh` pins the contract — 17 assertions, no fleet host touched,
+seconds to run. It exists because running the matrix by hand the first time
+found two real defects in this very wrapper: a diagnostic note appended *after*
+the verdict was captured, so every receipt recorded the note instead of the
+verdict; and an unparsed `-c`, so a run against another conf wrote its receipt
+into the default state dir and silently overwrote the real fleet's. Both are
+fixed, and the test is what keeps them fixed. Run it after any edit here.
+
+**What it honestly does not cover.** It is a same-machine check. It catches a
+timer unloaded, a script removed, a run wedged past its timeout, a key that
+expired, a laptop that slept through the window — everything except *the
+machine being off*, during which nothing on it can report anything. Closing
+that last gap needs the check to live on a second host, which means putting
+the fleet ssh key somewhere new. That is a founder decision and is
+deliberately **not** taken here.
+
 ### `derive-peers.sh` — lists nobody maintains
 
 Generalises the principle already established in
@@ -169,8 +223,47 @@ sudo cp bloch-rot-detector.{service,timer} /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now bloch-rot-detector.timer
 ```
 
+Then the heartbeat, which is what makes a *stopped* detector visible:
+
+```sh
+sudo install -m 0755 detector-run.sh heartbeat.sh /opt/bloch/reference-integrity/
+sudo cp bloch-rot-heartbeat.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now bloch-rot-heartbeat.timer
+```
+
 On the **operator's** machine or a jump box — never on a validator. It needs
 the fleet ssh key and nothing else. `crontab.example` is the cron form.
+
+### On macOS, which is where this actually runs
+
+The operator's machine is a Mac, and the detector has to run there:
+`PROXY_JS` points at `~/dev/posternlabs-deploy/functions/g4rpc.js`, which is
+source on that Mac and nowhere else. **systemd does not exist on macOS**, so
+the `.service`/`.timer` pair cannot run on the very host the tool was written
+for — and the cron form is a trap there, because modern macOS gates cron under
+TCC and ships no configured MTA, so `MAILTO` silently discards every verdict.
+A cron job that runs and throws its answer away is this directory's own
+failure mode wearing the costume of coverage.
+
+Use the launchd agents instead. The verdict goes to a file, and the heartbeat
+is what makes a missing verdict loud:
+
+```sh
+install -d ~/bloch-rollout/reference-integrity
+install -m 0755 *.sh ~/bloch-rollout/reference-integrity/
+install -m 0600 reference-integrity.conf ~/bloch-rollout/reference-integrity/
+cp com.postern.bloch.rot-{detector,heartbeat}.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.postern.bloch.rot-detector.plist
+launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.postern.bloch.rot-heartbeat.plist
+# both RunAtLoad, so a misconfiguration surfaces now rather than in an hour:
+tail -5 /tmp/bloch-rot-detector.log /tmp/bloch-rot-heartbeat.log
+```
+
+Unload with `launchctl bootout gui/$UID/com.postern.bloch.rot-detector` (and
+`…rot-heartbeat`). launchd only fires while the machine is awake: a closed lid
+does not run the detector, and nothing here can change that. The heartbeat
+reports the resulting gap honestly, which is the most a laptop can offer — and
+the reason a laptop is a stopgap, not the final home for this check.
 
 **Uninstall / rollback of the detector itself:**
 `systemctl disable --now bloch-rot-detector.timer && rm /etc/systemd/system/bloch-rot-detector.{service,timer} && rm -rf /opt/bloch/reference-integrity`.
@@ -179,7 +272,45 @@ ability to see.
 
 ---
 
-## Baseline: the fleet as measured 2026-09-01T01:58Z
+## Baseline: the fleet as measured 2026-09-01T09:50Z and 09:56Z
+
+Two independent read-only sweeps this morning, plus the 01:58Z one below.
+**Nothing has changed between them**, which is itself the finding: the fleet
+is stable, still on `bloch-pos-cinco`, and the rot is exactly where it was.
+
+```
+ROT: 10 finding(s) [PEER-ROT×10] — 4095 dead dial entries in 63/65 units,
+63 validators + 2 observers live at slot 53332.
+```
+
+Sharper numbers than the first pass had, from `peers.tsv` directly:
+
+- **65 units carry a peer list**: 63 validators at **128 entries** each,
+  2 observers at **63** each.
+- **Dead dials: 4,095** = 63 validators × **65 dead each**. The observers have
+  **zero** — they already carry exactly the 63 live validators.
+- **66 distinct dead endpoints** across the fleet (65 per unit), on 13 hosts.
+  The extra one is the variant: **three** peer-list variants exist — 57 units,
+  6 units differing only in `45.77.67.52:19063` vs `104.238.158.109:19063`,
+  and the 2 observers. Both variant entries are dead, so both vanish together.
+- **`PEER-GAP` is zero for all 65 units.** Every unit already carries every
+  live validator. This is the empirical proof that the cleanup is a **pure
+  deletion**: there is nothing to add, only 65 entries per unit to remove.
+- **The ghost**, `139.84.201.52:19063`, is dialled by all 63 units and sits on
+  a **live** host — a host-level reachability check passes it. It is the only
+  dead endpoint of the 66 whose host is still in service.
+- Dead dials by host: `136.244.95.190`, `45.76.91.19`, `45.77.140.22` at 378
+  each; `104.238.158.109` 372; `45.77.67.52` 321; seven hosts at 315;
+  `139.84.201.52` 63 (the ghost alone).
+- **Zero** `FORWARD-ROT`, **zero** `PROXY-ROT`, **zero** `CONSENSUS`, **zero**
+  `STRUCTURE`, **zero** anomalies. The 31/08 forwarder and proxy repairs hold;
+  the chain is converged, one head per slot, max finalized 32,356.
+- Fleet binary is **`bloch-pos-cinco`** on all 63 validators (`active`,
+  `enabled`, nine per host on seven hosts); observers on **`bloch-pos-quatro`**.
+  **The `seis` roll has not happened yet** — see the sequencing verdict above.
+
+### The 01:58Z baseline, unchanged
+
 
 Read-only, by unit content and by RPC, with the two derivations agreeing.
 
@@ -235,6 +366,62 @@ Both are dead, so both vanish in the same cleanup.
    they hold no key, so this is the low-risk half.
 
 ---
+
+## Sequencing: this waits for `bloch-pos-seis`
+
+**Verdict: do not run the peer cleanup as a standalone roll. Fold it into the
+`seis` rollout, which is already configured to carry it.**
+
+The cleanup itself is trivially safe — one string per unit, a strict deletion,
+reversible per node. What is *not* cheap is the thing it requires: **63
+restarts**. Measured on the live fleet
+(`~/bloch-rollout/rollout-release/work-mainnet/medicao-replay-20260901.md`):
+
+- every restart replays the whole store with the **RPC silent ~21 min** — the
+  node says so itself: `replaying 28645 blocks from the log — the RPC stays
+  silent until this finishes`;
+- the node **emerges behind the tip**. Gaps measured across nine nodes on one
+  box: **40, 45, 62, 63, 66, 93, 140, 198 slots**. 198 slots is **6.2 epochs**;
+- under `cinco`, closing that gap is the defect. A node behind the clock
+  re-derives `rolled_to(wall)` per applied block and copies the entire eUTXO
+  (452,726 entries, ~60 MB, ~204 ms) for **every epoch crossed**, with a
+  **break-even at 6–10 epochs**. The observed tail lands *inside* that band.
+
+That is not theory: the 31/08 migration ran on top of the break-even and it is
+where **v10 and v63 became heads of their own forks**. Two validators, one of
+them permanently.
+
+`bloch-pos-seis` (`bed1b9ce`) **is the fix for exactly this** — gap 15:
+5.8 s → 82 µs per block; gap 1550: unrunnable → 81 ms. And the rollout's
+`SUBIR` installs the new binary *before* starting the node, so the replay and
+the catch-up both run under the corrected code.
+
+So the two options are not symmetric:
+
+| | restarts | replay runs under | self-fork exposure |
+|---|---|---|---|
+| peer cleanup now, then `seis` later | **126** | `cinco`, then `seis` | paid **twice**, once needlessly |
+| peer cleanup folded into `seis` | **63** | `seis` | paid **once**, under the fix |
+
+A standalone peers roll would spend 63 restarts inside the defective catch-up
+path — the one that has already cost two validators — to buy a reduction in
+*latency*. The detector's own framing is that this rot presents as latency and
+never as a fault; that makes it real, and it also makes it not worth a
+coin-flip on a validator.
+
+`rollout.conf.mainnet` already encodes the right answer: `BIN_NOVO` is
+`bloch-pos-seis-linux` **and** `PEERS_LIMPAR=1`. One roll, both changes, one
+restart per node. Note that `cleanup-references.sh plan` step 0 still advises
+setting `BIN_NOVO` to the *currently running* binary — that instruction
+describes the standalone variant and should be read as the option **not**
+taken; leave the conf as it stands.
+
+The observers are the exception and stay separate: they hold no key, have
+never proposed a block (`proposing block` = 0, and
+`/home/ubuntu/g4/archival/validator.key` does not exist), so they cannot
+self-fork. Their exposure is availability — they are the first two upstreams
+of `g4rpc.js`, whose `QUORUM_MIN` is 2, so **never both in the same window**.
+Their peer lists are already clean; they need rolling only for the binary.
 
 ## Cleanup, and how to undo it
 

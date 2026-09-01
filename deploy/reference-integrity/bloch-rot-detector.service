@@ -7,7 +7,12 @@ Documentation=file:/deploy/reference-integrity/README.md
 
 [Service]
 Type=oneshot
-ExecStart=/opt/bloch/reference-integrity/rot-detector.sh --quiet
+# Call the WRAPPER, never rot-detector.sh directly: the wrapper bounds the
+# run with a timeout and leaves a receipt on every exit path, which is what
+# heartbeat.sh reads to prove the check is still happening at all. A oneshot
+# whose ssh hangs sits in `activating` forever and never shows up in
+# `systemctl --failed`; only a stalled receipt catches that.
+ExecStart=/opt/bloch/reference-integrity/detector-run.sh --quiet
 # A non-zero exit marks the unit failed, which is the point: `systemctl
 # --failed` and any existing alerting see it without reading a log.
 SuccessExitStatus=0
@@ -15,3 +20,5 @@ SuccessExitStatus=0
 # ability to check, which is how the last outage stayed invisible.
 StandardOutput=journal
 StandardError=journal
+# Belt and braces with the wrapper's own timeout.
+TimeoutStartSec=25min

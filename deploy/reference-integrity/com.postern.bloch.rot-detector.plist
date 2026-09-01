@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  ~/Library/LaunchAgents/com.postern.bloch.rot-detector.plist
+
+  WHY THIS FILE EXISTS. The operator's machine is a Mac, and the detector has
+  to run there: PROXY_JS points at ~/dev/posternlabs-deploy/functions/g4rpc.js,
+  which is source on that Mac and nowhere else. systemd does not exist on
+  macOS, so the .service/.timer pair in this directory cannot run on the very
+  host the tool was written for — and the cron form is a trap there: modern
+  macOS gates cron under TCC and ships no configured MTA, so MAILTO silently
+  discards every verdict. A cron job that runs and throws its output away is
+  the exact failure this directory exists to abolish, wearing the costume of
+  coverage.
+
+  So on macOS the verdict goes to a FILE, and heartbeat.sh is what makes a
+  missing verdict loud.
+
+  Load:    launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.postern.bloch.rot-detector.plist
+  Status:  launchctl print gui/$UID/com.postern.bloch.rot-detector | grep -E 'state|last exit'
+  Unload:  launchctl bootout gui/$UID/com.postern.bloch.rot-detector
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.postern.bloch.rot-detector</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-lc</string>
+    <!-- Login shell: launchd agents inherit almost no PATH, and the detector
+         calls python3, ssh and curl. -->
+    <string>$HOME/bloch-rollout/reference-integrity/detector-run.sh --quiet</string>
+  </array>
+
+  <key>StartInterval</key>
+  <integer>3600</integer>
+
+  <!-- RunAtLoad makes the FIRST run happen when the agent is loaded, so a
+       misconfiguration is found at install time rather than an hour later. -->
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- launchd only fires while the machine is awake. A closed lid does not
+       run the detector, and NOTHING here can change that: it is why the
+       heartbeat exists, and why a laptop is an honest stopgap and not the
+       final home for this check. -->
+  <key>StandardOutPath</key>
+  <string>/tmp/bloch-rot-detector.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/bloch-rot-detector.log</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>

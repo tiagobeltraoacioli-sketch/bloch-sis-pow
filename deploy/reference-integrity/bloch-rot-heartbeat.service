@@ -1,0 +1,21 @@
+# /etc/systemd/system/bloch-rot-heartbeat.service
+# Checks that the DETECTOR is still checking.
+#
+# A detector that stopped running looks exactly like a detector that keeps
+# passing: both are silence. This unit is the difference between the two.
+# It is a separate unit on purpose — a timer that failed to load, or a script
+# that was deleted, cannot report its own absence.
+[Unit]
+Description=Bloch G4 reference-rot detector heartbeat (is the check still running?)
+Documentation=file:/deploy/reference-integrity/README.md
+
+[Service]
+Type=oneshot
+ExecStart=/opt/bloch/reference-integrity/heartbeat.sh --quiet
+# Exit 1 (rot standing) and exit 2 (undetermined / stale / never ran) both
+# mark this unit failed. Exit 2 especially: "nobody is looking" must be at
+# least as loud as "something is wrong".
+SuccessExitStatus=0
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=2min
