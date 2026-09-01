@@ -299,6 +299,20 @@ it gates nothing and is dead rather than pending).
 
 ## K. Pre-existing: five failing tests on `main`, disputing their own analysis
 
+> **SETTLED 2026-09-01 — see `docs/post-mortems/2026-08-24-finality-divergence.md`.**
+> This section's *diagnosis* was right: static-reference rot, not a live
+> consensus regression. Its *framing* was not. The two accounts were never
+> competing explanations of one incident. The denominator ratchet caused the
+> 2026-08-24 divergence and is live today; the roster split is a real, separate,
+> already-fixed defect that was **provably inert at epoch 986**, gated behind
+> `LEAKED_ROSTER_ACTIVATION_EPOCH = 1400`, and cannot have caused a divergence
+> that had already happened. The five tests are repaired — the mutation hook now
+> sets the switch production reads — with no assertion weakened. The incident
+> itself is now reproduced by
+> `prova::tests::s0_three_partitions_finalize_three_different_roots_at_the_same_epoch`.
+> Read this section as the record of how the question was found, not as an open
+> question.
+
 Found while running the committee suite to check this work. **Not caused by
 this audit** — `prova.rs` was last touched by `49dfdd02` and is not in the
 audit commit, which changed only documents plus a new separate test target.

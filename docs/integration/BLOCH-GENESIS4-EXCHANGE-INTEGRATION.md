@@ -140,15 +140,15 @@ Pinned by `book_block_payload_cap_and_the_era_it_belongs_to`.
 
 ### 1.2 Activation gates
 
-Four gates exist in `params.rs`. Three of them arm code that nothing on the
-wire can reach today. They are listed here because a capability behind a closed
+Four gates exist in `params.rs`. One of them still arms code that nothing on
+the wire can reach today. They are listed here because a capability behind a closed
 gate is not a capability, and you should not design against one.
 
 | Gate | Value | State | What it controls |
 |---|---|---|---|
 | `BLOCK_BYTES_V2_ACTIVATION_EPOCH` | 800 | **open** | the 512 KiB payload cap (§1.1) |
 | `TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH` | 800 | **open** | the V2 deduplicated-witness transfer (§6) |
-| `LEAKED_ROSTER_ACTIVATION_EPOCH` | 1,400 | `[SCHEDULED]` | whether the inactivity leak reaches the duty roster (§5.3) |
+| `LEAKED_ROSTER_ACTIVATION_EPOCH` | 1,400 | **open** | whether the inactivity leak reaches the duty roster (§5.3). Was `[SCHEDULED]` when this document was measured at epoch 1,101; it **bound on 2026-08-29 10:51 UTC** and the chain is now past epoch 1,600. |
 | `LEAK_RECOVERY_ACTIVATION_EPOCH` | `u64::MAX` | `[INERT]` | leak recovery and the quorum-denominator floor — **read §5.3 before crediting** |
 
 A fifth constant, `ANCESTRY_SEED_ACTIVATION_EPOCH`, is also `u64::MAX` but
@@ -555,6 +555,20 @@ in the limit — hold two thirds of what remains and can finalise alone. That is
 not hypothetical: on **2026-08-24 three nodes finalised epoch 986 under three
 different roots**, and no amount of arriving blocks reunified them.
 
+The mechanism is reproduced, not merely reported —
+`prova::tests::s0_three_partitions_finalize_three_different_roots_at_the_same_epoch`
+drives three disjoint 4-of-64 partitions through the production
+`process_epoch`, touching no test switch, and all three finalise the same
+checkpoint epoch on three different roots. The full account, including what to
+watch instead of the `finalized` flag, is
+`docs/post-mortems/2026-08-24-finality-divergence.md`. The stall length required
+is the number to plan against: **one node alone needs 28 epochs of unbroken
+non-finality; four need 25** — 6.7 to 7.5 hours at 32 slots of 30 s. The
+live chain's own log contains a 45-epoch stall and 26 further stalls past the
+4-epoch leak threshold, all before epoch 1400; since epoch 1400 it has
+finalised 206 of 209 epochs with no stall over 4 epochs, so the ratchet is
+currently **unfuelled rather than fixed**.
+
 Two mitigations exist in the binary and **neither is reachable**:
 
 | Mitigation | Constant | State |
@@ -569,8 +583,13 @@ compute a root the existing headers do not carry — which stops its replay dead
 Arming them is a flag day with a fleet rebuild, not a config change.
 
 Separately, whether the leak reaches the **duty roster** — so a written-off
-validator also stops winning proposer draws — is `[SCHEDULED]` at
-`LEAKED_ROSTER_ACTIVATION_EPOCH = 1400` and is not in force yet.
+validator also stops winning proposer draws — was `[SCHEDULED]` at
+`LEAKED_ROSTER_ACTIVATION_EPOCH = 1400`. **That gate has since bound** (2026-08-29
+10:51 UTC; the chain is past epoch 1600), so it is now `[LIVE]`. Correcting an
+earlier revision of this section, which said it was "not in force yet" — it is.
+Note that this gate is *unrelated* to the ratchet above and is not a mitigation
+for it; the two were conflated in the 2026-08-31 audit and the conflation is
+resolved in `docs/post-mortems/2026-08-24-finality-divergence.md` §3.
 
 ### 5.4 `finalized` is also not a latch — it can move backwards
 
