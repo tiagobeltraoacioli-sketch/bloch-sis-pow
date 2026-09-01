@@ -246,3 +246,59 @@
 }
 .halving-note strong { color: var(--brass); }
 .halving-note .mono { font-family: var(--font-mono); color: var(--text); }
+
+/* ── Corroboration badge ──────────────────────────────────────────────────
+ * See src/components/corroboration.tsx for why a number here needs a badge:
+ * the endpoint is allowed to answer without a quorum rather than blank the
+ * page, and a UI that renders both cases identically is asserting something
+ * the endpoint never said.
+ *
+ * The good state is styled quietly rather than hidden. A badge that only
+ * appears when something is wrong teaches readers to read its absence as
+ * "fine", and absence is not the same as `final`. */
+.corro {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 10px;
+  padding: 2px 9px 2px 7px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: lowercase;
+  border: 1px solid currentColor;
+  cursor: help;
+  vertical-align: middle;
+}
+.corro-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  flex: none;
+}
+.corro-count {
+  opacity: 0.72;
+  font-variant-numeric: tabular-nums;
+  font-weight: 500;
+}
+.corro-ok   { color: #2f9e5e; background: rgba(47, 158, 94, 0.08); }
+.corro-warn { color: #b8791a; background: rgba(184, 121, 26, 0.10); }
+.corro-info { color: #5a6b86; background: rgba(90, 107, 134, 0.10); }
+
+@media (prefers-color-scheme: dark) {
+  .corro-ok   { color: #57c98a; background: rgba(87, 201, 138, 0.12); }
+  .corro-warn { color: #e0a54a; background: rgba(224, 165, 74, 0.14); }
+  .corro-info { color: #93a4bf; background: rgba(147, 164, 191, 0.14); }
+}
+
+.corro-note {
+  margin: 12px 0 4px;
+  padding: 10px 13px;
+  border-left: 3px solid #b8791a;
+  background: rgba(184, 121, 26, 0.07);
+  border-radius: 0 6px 6px 0;
+  font-size: 13px;
+  line-height: 1.55;
+}

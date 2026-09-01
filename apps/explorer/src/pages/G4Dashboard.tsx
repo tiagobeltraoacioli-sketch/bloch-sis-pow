@@ -12,11 +12,14 @@ import {
   g4rpc,
   recentBlocks,
   pollWhileVisible,
+  lastCorroboration,
   G4,
   G4Head,
   G4Block,
+  G4Corroboration,
   G4ValidatorCount,
 } from "../lib/g4";
+import { CorroborationBadge, CorroborationNote } from "../components/corroboration";
 import { fmtBloch, fmtInt, timeAgo } from "../lib/format";
 import { Link } from "../lib/router";
 import { Loading } from "../components/ui";
@@ -36,6 +39,10 @@ export function G4Dashboard() {
   const [mp, setMp] = useState<Mempool | null>(null);
   const [blocks, setBlocks] = useState<(G4Block | null)[] | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  // How well corroborated the head is. Held in state beside the head itself so
+  // the two are always rendered from the same reading: showing a fresh badge
+  // next to a stale number would be worse than showing no badge at all.
+  const [corro, setCorro] = useState<G4Corroboration | null>(null);
 
   useEffect(() => {
     let stop = false;
@@ -44,6 +51,7 @@ export function G4Dashboard() {
         const h = await g4rpc<G4Head>("getchaininfo");
         if (stop) return;
         setHead(h);
+        setCorro(lastCorroboration);
         setErr(null);
         // Each of these is allowed to fail on its own. The RPC is served by
         // the consensus loop, so a slow answer during block production is
@@ -94,8 +102,11 @@ export function G4Dashboard() {
           <div className="g4-sub">
             {G4.validators} genesis validators · {G4.slotSecs}s slots ·{" "}
             {head.slots_per_epoch}-slot epochs
+            <CorroborationBadge c={corro} />
           </div>
         </div>
+
+        <CorroborationNote c={corro} />
 
         <div className="g4-grid">
           <div className="g4-stat">

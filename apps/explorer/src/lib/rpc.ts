@@ -54,7 +54,14 @@ const ENDPOINT_CHAIN: readonly string[] = OVERRIDE
     ? ["/rpc"] // vite dev proxy → local node tunnel (vite.config.ts)
     : [
         "https://rpc.blochl1.com/", // neutral host — survives the pool decommission
-        "/rpc", // same-origin Pages Function (allowlist)
+        // NO LONGER A GENESIS-3 PATH. `/rpc` was rewritten on 2026-09-01 to
+        // serve Genesis-4 only: it answers -32601 to every name below, with
+        // the list of names it does answer in `error.data.allowed`. It is
+        // left in the chain deliberately rather than removed, because that
+        // refusal is the most useful thing a Genesis-3 page can be told —
+        // "this chain is over, here is what the endpoint serves now" beats a
+        // transport failure that reads as an outage. See functions/rpc.js.
+        "/rpc",
         "https://g2rpc.posternpool.com/", // DEPRECATED bridge — dies with the pool at h 80,000
       ];
 

@@ -12,7 +12,21 @@
 
 import { parseBlochAddress } from "./address";
 
-export const G4_RPC = "https://posternlabs.com/g4rpc";
+/**
+ * The explorer's own edge, same origin.
+ *
+ * It used to be `https://posternlabs.com/g4rpc`, which is the WALLET's proxy:
+ * it fans writes out to every node and treats reads with a soft quorum, both
+ * correct for a wallet and neither what an explorer should be doing to the
+ * fleet. Pointing a page that polls every fifteen seconds and asks for twelve
+ * blocks and sixty-four validators at a proxy that reaches a validator per
+ * uncached call made public browsing into validator load.
+ *
+ * `/rpc` on this origin reads only from the two keyless archival observers,
+ * caches on immutability, coalesces, and caps the calls it will make no matter
+ * how many arrive. See `edge/core.js`.
+ */
+export const G4_RPC = "/rpc";
 
 /** Genesis-4's own facts, fixed at launch. Sourced from `tokenomics_v4.rs`. */
 export const G4 = {
@@ -67,7 +81,47 @@ export interface G4ValidatorCount {
   total_active_stake_sat: string;
 }
 
-export class G4Error extends Error {}
+export class G4Error extends Error {
+  /** Stable machine-readable reason, when the edge gave one. Branch on this. */
+  reason: string | null;
+  /** Milliseconds to wait, when the edge said to wait. */
+  retryAfterMs: number | null;
+  constructor(message: string, reason: string | null = null, retryAfterMs: number | null = null) {
+    super(message);
+    this.reason = reason;
+    this.retryAfterMs = retryAfterMs;
+  }
+}
+
+/**
+ * How well corroborated an answer is. The edge attaches this to every result.
+ *
+ * `level` is the field to branch on, and the UI must show it: the reason
+ * `getchaininfo` is allowed to come back from a single node rather than
+ * erroring is that a blank page is worse than a dated number — but a dated
+ * number with no label is a number presented as a fact.
+ */
+export interface G4Corroboration {
+  level: "final" | "corroborated" | "uncorroborated" | "node_local";
+  archival_witnesses?: number;
+  of?: number;
+  fleet_witness?: boolean;
+  missing?: string[];
+  note?: string;
+  degraded?: string;
+  /** Bumped by the edge when it detects a reorg. A client cache must honour it. */
+  cache_salt?: number;
+  served_from_cache_age_ms?: number;
+  witness?: { available: boolean; age_ms: number | null; height: number | null; reason?: string | null };
+  plane?: { certified: boolean; behind_by_slots: number | null; reason?: string | null };
+  reorg_events?: { signal: string; kind: string; at: number }[];
+}
+
+/** The corroboration of the most recent call, for a page that wants to show it. */
+export let lastCorroboration: G4Corroboration | null = null;
+
+/** Bumped by the edge whenever it detects a reorg; see `edge/lineage.js`. */
+let lastSalt: number | null = null;
 
 export async function g4rpc<T>(method: string, params: unknown[] = []): Promise<T> {
   const res = await fetch(G4_RPC, {
@@ -76,7 +130,18 @@ export async function g4rpc<T>(method: string, params: unknown[] = []): Promise<
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
   });
   const body = await res.json();
-  if (body.error) throw new G4Error(body.error.message ?? "rpc error");
+  if (body.error) {
+    throw new G4Error(
+      body.error.message ?? "rpc error",
+      body.error.data?.reason ?? null,
+      body.error.data?.retry_after_ms ?? null,
+    );
+  }
+  const corro: G4Corroboration | undefined = body.result?.corroboration;
+  if (corro) {
+    lastCorroboration = corro;
+    honourSalt(corro.cache_salt);
+  }
   return body.result as T;
 }
 
@@ -189,15 +254,28 @@ async function mapLimit<T, R>(
 }
 
 /**
- * Blocks already known to be final.
+ * Blocks the EDGE has certified as final, keyed by slot.
  *
- * Only finalized blocks go in here, and that restriction is the whole point.
- * A block that is merely canonical can still be reorganised out — caching one
- * would leave the page showing a block the chain has since dropped, which is
- * exactly the class of stale-cache bug this project has been bitten by
- * before. Finality is the moment the answer stops being able to change.
+ * This used to admit any block whose `finalized` field was true, which is the
+ * unsafe version of the same idea: `finalized` is not a latch on this chain —
+ * nodes have been measured below their own previously finalised checkpoint —
+ * so one node saying `finalized: true` is an observation, not a promise, and
+ * "which block sits at slot S" is a fork-choice answer that a reorg changes.
+ *
+ * Two things fixed it. Entry requires the edge's corroboration `level` to be
+ * `final`, which means two archivals agreed AND a fleet witness certified the
+ * lineage. And the whole map is dropped when the edge's cache salt moves,
+ * which is how the edge reports that it detected a reorg. Without the second
+ * half the first is only a better-informed way to be stale.
  */
 const finalBlocks = new Map<number, G4Block>();
+
+/** Drop everything the moment the edge says the lineage changed under us. */
+function honourSalt(salt: number | null | undefined) {
+  if (salt === null || salt === undefined) return;
+  if (lastSalt !== null && salt !== lastSalt) finalBlocks.clear();
+  lastSalt = salt;
+}
 
 /** How many RPC calls this page will have in flight at once. */
 export const RPC_CONCURRENCY = 6;
@@ -216,7 +294,9 @@ export async function recentBlocks(fromSlot: number, n: number): Promise<(G4Bloc
     const hit = finalBlocks.get(s);
     if (hit) return hit;
     const b = await g4rpc<G4Block>("getblockbyslot", [s]);
-    if (b.finalized) finalBlocks.set(s, b);
+    // `finalized` alone is not enough — see `finalBlocks`. The edge's own
+    // judgement is, because it is the thing that watches for the contradiction.
+    if ((b as any)?.corroboration?.level === "final") finalBlocks.set(s, b);
     return b;
   });
   return settled.map((r) => (r.status === "fulfilled" ? r.value : null));

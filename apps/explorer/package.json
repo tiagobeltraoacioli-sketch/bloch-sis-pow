@@ -3,12 +3,14 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "description": "DAG-aware block explorer for the Bloch (GhostDAG-Q) chain — explorer.posternlabs.com",
+  "description": "DAG-aware block explorer for the Bloch (GhostDAG-Q) chain \u2014 explorer.posternlabs.com",
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
-    "deploy": "CLOUDFLARE_ACCOUNT_ID=CLOUDFLARE_ACCOUNT_ID npx wrangler pages deploy dist --project-name bloch-explorer --branch main --commit-dirty=true"
+    "deploy": "CLOUDFLARE_ACCOUNT_ID=CLOUDFLARE_ACCOUNT_ID npx wrangler pages deploy dist --project-name bloch-explorer --branch main --commit-dirty=true",
+    "test": "node --test \"edge/tests/*.test.mjs\"",
+    "test:lab": "node edge/tests/live-lab.mjs"
   },
   "dependencies": {
     "react": "^18.3.1",
