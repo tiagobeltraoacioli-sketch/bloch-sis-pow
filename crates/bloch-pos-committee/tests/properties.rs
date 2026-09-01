@@ -1127,3 +1127,94 @@ fn a_fully_tied_tree_resolves_identically_in_both_implementations() {
         "an all-zero-weight tree must resolve to the same head in both"
     );
 }
+
+// ═══ The equivocation bar is order-dependent when a later vote masks it ═════
+
+/// **FINDING (2026-09-01).** `Store::observe`'s equivocation bar is a function
+/// of the *sequence* of observations, not of the message *set* — and the case
+/// that breaks it is not the same-slot pair the 2026-08-11 fix addressed.
+///
+/// The fix made the same-slot pair symmetric: whichever half arrives first,
+/// the second one drops the stored message and bars the validator. What it did
+/// not make symmetric is a pair *masked by a later vote*. `observe` returns
+/// early on `prev.slot >= msg.slot`, so once a message at slot 7 is stored,
+/// neither half of a slot-5 equivocation is ever compared against the other —
+/// the validator keeps full weight. Observe the same three messages in the
+/// other order and the validator is barred forever.
+///
+/// This is not a hypothetical ordering: the node folds block-body attestations
+/// in `BTreeMap<block_id, _>` order and *then* the loose pool
+/// (`engine.rs::forkchoice_store`). Whether a given attestation is folded
+/// early or late therefore depends on the block id that happens to carry it —
+/// a hash — and on whether this node has that block at all or is still holding
+/// the attestation loose in its pool. Two honest nodes holding the same
+/// messages, one with the slot-7 vote in a block and one with it in the pool,
+/// can bar different validators and select different heads.
+///
+/// The consequence for anyone acting on `engine.rs`'s module note — "when it
+/// stops being free the fix is an incremental store with a test proving it
+/// equals the rebuild" — is that no such proof exists to be had: an
+/// incremental store appends in arrival order, the rebuild folds in block-id
+/// order, and this test is a witness that those two disagree. The store has to
+/// be made a function of the message set *first*, and that is a consensus
+/// change, not a performance change.
+#[test]
+fn probe_a_later_vote_masks_an_equivocation_and_the_bar_depends_on_order() {
+    let genesis = [0u8; 32];
+    let a_block = [1u8; 32];
+    let b_block = [2u8; 32];
+    let c_block = [3u8; 32];
+    let mut parents = HashMap::new();
+    parents.insert(a_block, genesis);
+    parents.insert(b_block, genesis);
+    parents.insert(c_block, genesis);
+    let mut children = HashMap::new();
+    children.insert(genesis, vec![a_block, b_block, c_block]);
+    let tree = BlockTree { parents: &parents };
+
+    // Validator 0 equivocates at slot 5 (A vs B) and votes again at slot 7 (C).
+    let eq_a = LatestMessage { slot: 5, root: a_block };
+    let eq_b = LatestMessage { slot: 5, root: b_block };
+    let later = LatestMessage { slot: 7, root: c_block };
+
+    // Node 1 folds the equivocating pair first: the bar fires, and the slot-7
+    // vote is refused because the validator is already barred.
+    let mut node1 = Store::new();
+    node1.set_stake(0, 100);
+    node1.set_stake(1, 1);
+    node1.observe(0, eq_a);
+    node1.observe(0, eq_b);
+    node1.observe(0, later);
+    // Node 2 folds the slot-7 vote first: `prev.slot >= msg.slot` swallows both
+    // halves of the pair, nothing is ever compared, the validator keeps its
+    // stake and votes for C.
+    let mut node2 = Store::new();
+    node2.set_stake(0, 100);
+    node2.set_stake(1, 1);
+    node2.observe(0, later);
+    node2.observe(0, eq_a);
+    node2.observe(0, eq_b);
+
+    // Validator 1 breaks the tie the other way so the heads are well defined
+    // and differ, rather than falling to the root tie-break by accident.
+    node1.observe(1, LatestMessage { slot: 6, root: a_block });
+    node2.observe(1, LatestMessage { slot: 6, root: a_block });
+
+    assert_eq!(
+        node1.equivocators().count(),
+        1,
+        "the pair-first fold must bar the equivocator (control for the witness below)"
+    );
+    assert_eq!(
+        node2.equivocators().count(),
+        0,
+        "the later-vote-first fold must NOT bar it — that asymmetry is the finding"
+    );
+    assert_eq!(node1.head(&tree, genesis, &children), a_block);
+    assert_eq!(node2.head(&tree, genesis, &children), c_block);
+    assert_ne!(
+        node1.head(&tree, genesis, &children),
+        node2.head(&tree, genesis, &children),
+        "two nodes, the same three messages, two different heads"
+    );
+}

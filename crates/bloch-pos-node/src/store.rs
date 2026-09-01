@@ -166,50 +166,79 @@ impl Store {
         Ok(())
     }
 
-    /// Read every complete frame in the log, in order. A truncated trailing
-    /// frame (crash mid-append) is dropped with a warning; a *corrupt* frame
-    /// body is an error, because silently skipping mid-chain data would make
-    /// replay diverge from what the network saw.
+    /// Read every complete frame in the log, in order.
+    ///
+    /// **Holds the entire chain in memory twice over and is not on the boot
+    /// path any more** — see [`LogReader`], which is. This is kept for tests
+    /// and for callers that genuinely want the whole vector; it is now a
+    /// `collect` of the streaming reader, so there is one frame-walk
+    /// definition and the tolerance rules cannot drift between them.
     pub fn read_all(&self) -> io::Result<Vec<BlockEnvelope>> {
-        let mut f = File::open(self.dir.join("blocks.log"))?;
-        let mut bytes = Vec::new();
-        f.read_to_end(&mut bytes)?;
-        let mut out = Vec::new();
-        let mut at = 0usize;
-        while at + 4 <= bytes.len() {
-            let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
-            if len > crate::codec::MAX_FIELD_LEN {
+        LogReader::open(&self.dir)?.collect()
+    }
+
+    /// Number of complete frames in the log, without decoding or allocating
+    /// any of them — the frame walk with `seek` where [`LogReader`] would
+    /// `read_exact` a payload.
+    ///
+    /// It exists so boot can print a progress denominator while replaying
+    /// from a *stream* instead of from a materialized `Vec`. Silent by
+    /// design: it applies exactly the tolerance rules `LogReader` applies, and
+    /// the reader that follows is the one that reports a truncated tail, so
+    /// the operator still sees that warning exactly once.
+    pub fn count(dir: &Path) -> io::Result<usize> {
+        let f = File::open(dir.join("blocks.log"))?;
+        let end = f.metadata()?.len();
+        let mut f = io::BufReader::with_capacity(1 << 16, f);
+        let mut n = 0usize;
+        let mut at = 0u64;
+        loop {
+            let mut len4 = [0u8; 4];
+            if read_up_to(&mut f, &mut len4)? != 4 {
+                return Ok(n);
+            }
+            at += 4;
+            let len = u32::from_le_bytes(len4) as u64;
+            if len > crate::codec::MAX_FIELD_LEN as u64 {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "log frame over cap"));
             }
-            if at + 4 + len > bytes.len() {
-                eprintln!("store: dropping truncated trailing log frame (crash mid-append)");
-                break;
+            if at + len > end {
+                return Ok(n); // truncated trailing frame
             }
-            let env = crate::codec::decode_envelope(&bytes[at + 4..at + 4 + len])
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-            out.push(env);
-            at += 4 + len;
+            // Seek past the body rather than read it: a 4.6 KB hybrid
+            // signature does not need to enter the process to be counted.
+            at += len;
+            f.seek(io::SeekFrom::Start(at))?;
+            n += 1;
         }
-        if at + 4 > bytes.len() && at < bytes.len() {
-            eprintln!("store: dropping truncated trailing log frame (crash mid-append)");
-        }
-        Ok(out)
     }
 
     /// Replace the whole log with `envs` (a reorg adopted a different
     /// branch). Write-to-temp + rename, then reopen the append handle, so a
     /// crash mid-rewrite leaves either the old log or the new one — never a
     /// half-written file.
-    pub fn rewrite(&mut self, envs: &[BlockEnvelope]) -> io::Result<()> {
+    /// Takes an **iterator of references**, not a slice, and that is a memory
+    /// decision rather than a stylistic one: the only caller is `do_reorg`,
+    /// which used to `clone()` the whole canonical chain into a `Vec` to call
+    /// this — momentarily doubling the largest allocation the node holds, at
+    /// the one moment (a reorg) when it is already busy. The bytes written are
+    /// the same bytes in the same order; nothing but the copy is gone.
+    pub fn rewrite<'a, I>(&mut self, envs: I) -> io::Result<()>
+    where
+        I: IntoIterator<Item = &'a BlockEnvelope>,
+    {
         let tmp = self.dir.join("blocks.log.tmp");
         {
-            let mut f = File::create(&tmp)?;
+            let mut f = io::BufWriter::new(File::create(&tmp)?);
             for env in envs {
                 let payload = crate::codec::encode_envelope(env);
                 f.write_all(&(payload.len() as u32).to_le_bytes())?;
                 f.write_all(&payload)?;
             }
-            f.sync_data()?;
+            f.flush()?;
+            f.into_inner()
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
+                .sync_data()?;
         }
         fs::rename(&tmp, self.dir.join("blocks.log"))?;
         self.log = OpenOptions::new()
@@ -398,6 +427,119 @@ pub fn blocks_after_indexed(
     Ok(out)
 }
 
+/// Fill `buf` from `f`, returning how many bytes were actually available.
+/// `read_exact` cannot answer that, and the difference between "0 bytes left"
+/// (a clean end of log) and "1-3 bytes left" (a crash mid-append) is exactly
+/// what decides whether the operator is warned.
+fn read_up_to<R: Read>(f: &mut R, buf: &mut [u8]) -> io::Result<usize> {
+    let mut at = 0usize;
+    while at < buf.len() {
+        match f.read(&mut buf[at..]) {
+            Ok(0) => break,
+            Ok(n) => at += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(at)
+}
+
+/// The block log, one envelope at a time.
+///
+/// # Why boot does not use `read_all`
+///
+/// `read_all` slurps the whole file into a `Vec<u8>` and then decodes it into
+/// a `Vec<BlockEnvelope>`, and **both are live at the same moment** — the
+/// bytes are not dropped until the decode finishes. On the live chain that is
+/// 407 MiB of file plus ~440 MiB of envelopes, ~850 MiB standing before a
+/// single block has been applied, and it is chain-linear: at 200,000 blocks it
+/// is ~5.5 GiB, on boxes that have 8.
+///
+/// Nothing about boot needs that. `run()` moves envelopes into `Engine::blocks`
+/// one at a time, in log order, and never looks back — so the log can be a
+/// stream, and the peak drops to the map plus one frame. The whole chain still
+/// ends up in `blocks`; what is gone is the *second* copy of it, which is the
+/// cheapest gigabyte in the process to stop spending.
+///
+/// This is the same posture [`Store::blocks_after`] already documents for the
+/// serving path, applied to the reading path.
+///
+/// # Tolerance
+///
+/// Byte-for-byte the rules `read_all` had, because replay must accept exactly
+/// the logs it accepted before: a frame length over
+/// [`crate::codec::MAX_FIELD_LEN`] is an error, an undecodable body is an
+/// error, and a truncated trailing frame — a partial length prefix or a length
+/// whose body runs past the end — is dropped with one warning.
+pub struct LogReader {
+    f: io::BufReader<File>,
+    done: bool,
+}
+
+impl LogReader {
+    pub fn open(dir: &Path) -> io::Result<LogReader> {
+        Ok(LogReader {
+            f: io::BufReader::with_capacity(1 << 16, File::open(dir.join("blocks.log"))?),
+            done: false,
+        })
+    }
+}
+
+impl Iterator for LogReader {
+    type Item = io::Result<BlockEnvelope>;
+
+    fn next(&mut self) -> Option<io::Result<BlockEnvelope>> {
+        if self.done {
+            return None;
+        }
+        let mut len4 = [0u8; 4];
+        let got = match read_up_to(&mut self.f, &mut len4) {
+            Ok(n) => n,
+            Err(e) => {
+                self.done = true;
+                return Some(Err(e));
+            }
+        };
+        if got != 4 {
+            self.done = true;
+            // A partial length prefix is the crash-mid-append case `read_all`
+            // warned about in its tail check; zero bytes is a clean end.
+            if got > 0 {
+                eprintln!("store: dropping truncated trailing log frame (crash mid-append)");
+            }
+            return None;
+        }
+        let len = u32::from_le_bytes(len4) as usize;
+        if len > crate::codec::MAX_FIELD_LEN {
+            self.done = true;
+            return Some(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "log frame over cap",
+            )));
+        }
+        let mut payload = vec![0u8; len];
+        match read_up_to(&mut self.f, &mut payload) {
+            Ok(n) if n == len => {}
+            Ok(_) => {
+                self.done = true;
+                eprintln!("store: dropping truncated trailing log frame (crash mid-append)");
+                return None;
+            }
+            Err(e) => {
+                self.done = true;
+                return Some(Err(e));
+            }
+        }
+        match crate::codec::decode_envelope(&payload) {
+            Ok(env) => Some(Ok(env)),
+            Err(e) => {
+                self.done = true;
+                Some(Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string())))
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -522,7 +664,119 @@ mod tests {
             Store::blocks_after(&dir, 0, 100).expect("walk"),
             "control failed: the two logs are indistinguishable, so agreement proves nothing"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
 
+    /// A fresh temp dir per test, so the three below can run concurrently.
+    fn tmpdir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("bloch-pos-store-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// **The boot invariant.** `run()` prints `replay {i}/{n}` where `n` comes
+    /// from [`Store::count`] and `i` counts what [`LogReader`] yielded. Those
+    /// are two separate walks of the same file — one that seeks past frame
+    /// bodies and one that decodes them — and if they ever disagree the
+    /// operator's remaining-time estimate is wrong, or worse, the count is a
+    /// silent claim about a chain the reader did not deliver.
+    ///
+    /// They agreed trivially when boot read a `Vec` and took its `len()`.
+    /// Streaming is what makes this something to assert rather than observe.
+    #[test]
+    fn count_agrees_with_the_stream() {
+        let dir = tmpdir("count");
+        let mut store = Store::open(&dir, &[7u8; 32]).expect("open");
+        for slot in 1..=9u64 {
+            store.append(&sample_envelope(slot)).expect("append");
+        }
+        let streamed: Vec<BlockEnvelope> = LogReader::open(&dir)
+            .expect("open reader")
+            .collect::<io::Result<_>>()
+            .expect("stream");
+        assert_eq!(streamed.len(), 9, "the reader yields every appended frame");
+        assert_eq!(Store::count(&dir).expect("count"), streamed.len());
+        // And the frames are the ones that went in, in order.
+        let slots: Vec<u64> = streamed.iter().map(|e| e.header.slot).collect();
+        assert_eq!(slots, (1..=9).collect::<Vec<u64>>());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A crash mid-append leaves a frame whose length prefix is complete but
+    /// whose body runs past the end. Both walks must drop it, and drop the
+    /// SAME one — a denominator of 9 against a stream of 8 would leave boot
+    /// reporting 89% forever.
+    #[test]
+    fn a_truncated_body_is_dropped_by_both_walks() {
+        let dir = tmpdir("trunc-body");
+        let mut store = Store::open(&dir, &[7u8; 32]).expect("open");
+        for slot in 1..=9u64 {
+            store.append(&sample_envelope(slot)).expect("append");
+        }
+        let path = dir.join("blocks.log");
+        let full = fs::metadata(&path).expect("meta").len();
+        // Chop the last frame's body in half, leaving its length prefix.
+        let frame = 4 + crate::codec::encode_envelope(&sample_envelope(9)).len() as u64;
+        let f = OpenOptions::new().write(true).open(&path).expect("open rw");
+        f.set_len(full - frame / 2).expect("truncate");
+        drop(f);
+
+        let streamed = LogReader::open(&dir)
+            .expect("open reader")
+            .collect::<io::Result<Vec<_>>>()
+            .expect("a truncated tail is tolerated, not an error");
+        assert_eq!(streamed.len(), 8, "the torn frame is dropped");
+        assert_eq!(Store::count(&dir).expect("count"), 8, "and the count drops the same one");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The other half of the crash window: the append died inside the 4-byte
+    /// length prefix itself. `read_all` had a separate tail check for this
+    /// (`at + 4 > len && at < len`); the streaming reader has to reproduce it
+    /// from a short read, which is why `read_up_to` exists instead of
+    /// `read_exact`.
+    #[test]
+    fn a_partial_length_prefix_is_dropped_by_both_walks() {
+        let dir = tmpdir("trunc-len");
+        let mut store = Store::open(&dir, &[7u8; 32]).expect("open");
+        for slot in 1..=4u64 {
+            store.append(&sample_envelope(slot)).expect("append");
+        }
+        let path = dir.join("blocks.log");
+        let full = fs::metadata(&path).expect("meta").len();
+        let f = OpenOptions::new().write(true).open(&path).expect("open rw");
+        f.set_len(full + 2).expect("grow by a partial prefix"); // two zero bytes
+        drop(f);
+
+        let streamed = LogReader::open(&dir)
+            .expect("open reader")
+            .collect::<io::Result<Vec<_>>>()
+            .expect("a partial prefix is tolerated, not an error");
+        assert_eq!(streamed.len(), 4);
+        assert_eq!(Store::count(&dir).expect("count"), 4);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `rewrite` takes an iterator of references now, so the caller need not
+    /// clone the chain to call it. What it writes must still be what
+    /// `read_all` reads back, frame for frame.
+    #[test]
+    fn rewrite_from_references_round_trips() {
+        let dir = tmpdir("rewrite");
+        let mut store = Store::open(&dir, &[7u8; 32]).expect("open");
+        for slot in 1..=3u64 {
+            store.append(&sample_envelope(slot)).expect("append");
+        }
+        let replacement: Vec<BlockEnvelope> = (10..=12u64).map(sample_envelope).collect();
+        // Borrowed, exactly as `do_reorg` now calls it.
+        store.rewrite(replacement.iter()).expect("rewrite");
+        let back = store.read_all().expect("read back");
+        let slots: Vec<u64> = back.iter().map(|e| e.header.slot).collect();
+        assert_eq!(slots, vec![10, 11, 12], "the log is the branch that was adopted");
+        // The append handle was reopened onto the new file.
+        store.append(&sample_envelope(13)).expect("append after rewrite");
+        assert_eq!(store.read_all().expect("read").len(), 4);
         let _ = fs::remove_dir_all(&dir);
     }
 
