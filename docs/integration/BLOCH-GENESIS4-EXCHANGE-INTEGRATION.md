@@ -94,6 +94,38 @@ And one that will not break your client but should shape your credit policy:
 Read it from two independent nodes and require agreement. See §5.3 — it is the
 most important risk disclosure in this document.
 
+### 0.4 Which source of truth owns what
+
+Three things describe this chain to you. They do not overlap, and the split is
+deliberate: a document can go stale, and the two machine-readable sources
+cannot. **Where they disagree, they win and this document is wrong.**
+
+| Source | Owns | Answers | How it goes stale |
+|---|---|---|---|
+| **`getcapabilities`** (RPC, `[LIVE]`) | the **wire surface** — method table, absent names, error codes, transport limits, `rpc_surface_version` | *what does this node serve?* | it cannot: the running binary describes itself |
+| **`bloch-pos selfcheck`** (CLI, `[LIVE]`) | the **built parameter set** — asserts the frozen consensus parameters this binary links agree with each other, and refuses to run if they do not | *was this binary built consistently?* | it cannot: it reads its own constants |
+| **this document** | the **arithmetic and the caveats** — fee derivation, sizing, era switches, and which capabilities are reachable | *what do those numbers mean when I build a transaction?* | it can, which is why every figure in it is pinned by a test (§0.1) |
+
+Consequences for your client, in order of how much they will save you:
+
+1. **Branch on `getcapabilities` at connect time, never on §3.** §3 exists to
+   explain the surface and to tell you what is deliberately *not* there. It is
+   not the authority on what your node answers, and a client that switches on
+   a section number of this document will break on an upgrade that
+   `getcapabilities` would have told it about.
+2. **Do not reimplement the parameter dump.** This document prints the constants
+   an outside wallet must reproduce to get a transfer accepted, and nothing
+   else. It does not mirror the binary's full parameter set.
+3. **The arithmetic is only here.** `getcapabilities` cannot tell you what the
+   fee constants *will* be after a flag day, or that a cap changed at epoch 800
+   and history before it obeys a different rule. That is why §1.1, §6.2 and
+   §6.4 exist and why they are the sections to re-read after any upgrade.
+
+`selfcheck --json` — machine-readable output from the third source above — is
+`[UNRELEASED]` (§10). Today `selfcheck` is a pass/fail exit code. When the JSON
+form lands, it becomes the source you diff across your fleet, and §1 shrinks
+accordingly.
+
 ---
 
 ## 1. Chain parameters
@@ -513,8 +545,26 @@ Finality is explicit and published in every `getchaininfo` response — you do
 not estimate it from a confirmation count, and there is no `confirmations`
 field to misread.
 
-**Credit on `finalized`.** Included is not settled: a block that is canonical
-now can be reorganised, and only finalisation is the cryptographic guarantee.
+**Credit on `finalized` — but `finalized` is not, today, a cryptographic
+settlement guarantee, and the previous revision of this document said it was.**
+That sentence is retracted; the correction is
+[`SETTLEMENT-GUARANTEE-CORRECTION.md`](SETTLEMENT-GUARANTEE-CORRECTION.md) and
+it is the most important change in this revision.
+
+Included is not settled: a block that is canonical now can still be
+reorganised, so `finalized` remains the right signal to credit on and the only
+one this document endorses. What it is not is unconditional. Finalisation is a
+**two-thirds-of-active-stake** vote, and on this binary two properties an
+integrator would reasonably assume do not hold:
+
+- the denominator that "two thirds" is measured against shrinks monotonically
+  with no floor and no recovery, so a shrinking set of validators can finalise
+  alone and two nodes can finalise *different* roots (§5.3);
+- `finalized` is not a latch — a reorg can move it backwards, and a block
+  reported `finalized: true` can stop being finalized (§5.4).
+
+Read §5.3, §5.4 and §5.5 before you write your credit rule. §5.5 is the
+procedure, and it is what makes crediting on `finalized` safe enough to do.
 
 ### 5.2 How long finality actually takes
 
@@ -989,7 +1039,8 @@ the repository.
 |---|---|---|---|
 | Funded validator bonding — deposit reaches the transition via `staking::validate_deposit_fields` | absent; `validate_deposit` has no call site | `wt/signed-exit-wire`, `wt/exit-churn-limit`, `lead/delegation-off-explicit` | §8.1 |
 | `unlock_epoch` enforcement in the committee (`if entry.unlock_epoch > self.epoch`) | absent from `bloch-pos-committee` entirely | same | §8.1 |
-| Mempool rejection cache — `REJECTION_TTL_SLOTS = 128` slots (≈ 64 min) | absent | `canario/cache-recusa` | §6.5 |
+| Mempool rejection cache — `REJECTION_TTL_SLOTS = 128` slots (≈ 64 min) | absent | `canario/cache-recusa` | §6.5, §10.1 |
+| `selfcheck --json` — machine-readable parameter dump | absent; `selfcheck` is pass/fail only | `gates/selfcheck-json` | §0.4 |
 
 ### 10.1 The rejection cache, since you will read about it
 
@@ -1033,8 +1084,9 @@ its pin moves into `integration_book_claims.rs` in the same commit.
       `offset`, default limit 100, max 1,000, no cursor
 - [ ] Keep deposit addresses under 1,000 outputs
 - [ ] Credit on `finalized` from `getchaininfo`; budget 2–3 epochs
-- [ ] Require **two independent nodes to agree** on the finalized root before
-      crediting — disagreement is a hold, not a retry (§5.3)
+- [ ] Require **two independent nodes to agree** on the finalized **root and
+      epoch** before crediting — comparing epochs alone misses the exact failure
+      mode; disagreement is a hold, not a retry (§5.3)
 - [ ] Credit at a **depth margin past** finality, not at the boundary, and
       re-verify with `gettxout` before releasing funds — `finalized` can move
       backwards and two nodes do not protect you from that (§5.4)
@@ -1056,6 +1108,11 @@ its pin moves into `integration_book_claims.rs` in the same commit.
 
 ## 12. Reference
 
+- **Correction to the settlement guarantee, issued proactively 2026-09-01** —
+  [`SETTLEMENT-GUARANTEE-CORRECTION.md`](SETTLEMENT-GUARANTEE-CORRECTION.md).
+  Retracts the previous revision's "only finalisation is the cryptographic
+  guarantee" and gives the credit procedure that replaces it. If you hold a
+  revision of this book dated before 2026-08-31, read that document first.
 - Claim-by-claim audit behind this revision —
   [`INTEGRATION-BOOK-AUDIT-2026-08-31.md`](INTEGRATION-BOOK-AUDIT-2026-08-31.md)
 - How a consensus-parameter change reaches you —

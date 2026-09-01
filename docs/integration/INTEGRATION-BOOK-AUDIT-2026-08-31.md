@@ -368,3 +368,106 @@ reading is independent of the dispute.
 - `getcapabilities` on the node — the machine-readable wire surface, which
   cannot go stale the way this document can. Clients should branch on it and
   not on §3.
+
+---
+
+## L. Disposition, 2026-09-01
+
+The audit above is a record of what was measured on 2026-08-31 and is not
+edited retroactively. This section records what was **done** about it, so that
+the next reader can tell a finding that was closed from one that was merely
+written down.
+
+### Counts — unchanged
+
+| Verdict | Count |
+|---|---|
+| VERIFIED | 25 |
+| STALE | 24 |
+| WRONG | 10 |
+| ASPIRATIONAL | 4 |
+| UNREACHABLE | 6 |
+
+No verdict moved. Nothing in the released binary changed between the audit and
+this disposition — deliberately, because the remit was to document `main`
+@ `e4083f9`, not to alter it. Every closure below is a documentation or test
+closure.
+
+### Closed in the book
+
+All 43 findings are carried into `BLOCH-GENESIS4-EXCHANGE-INTEGRATION.md`. The
+ten client-breaking ones are corrected in §1, §3.4, §3.7, §3.9, §4.2, §5.2,
+§6.2, §7.1, §7.3 and §7.4, and the three most likely to break a client first
+are lifted to §0.3 so they cannot be missed by a reader who skims.
+
+Two structural additions were made on 2026-09-01:
+
+- **§0.4 "Which source of truth owns what"** — the three-way division the
+  audit's closing note asked for, stated in the partner document rather than
+  only in `CONSENSUS-CHANGELOG-DISCIPLINE.md` where integrators do not look.
+  `getcapabilities` owns the wire surface, `bloch-pos selfcheck` owns the built
+  parameter set, and this book owns the arithmetic a node cannot emit — a node
+  cannot tell you what its fee constants *will* be after a flag day, or that a
+  cap changed at epoch 800 and history before it obeys a different rule.
+  Clients are told to branch on `getcapabilities` and never on a section number
+  of the book.
+- **§10 divergence table** gained a `selfcheck --json` row. The machine-readable
+  parameter dump is `[UNRELEASED]` (`gates/selfcheck-json`); today `selfcheck`
+  is a pass/fail exit code. Listing it as the third leg of §0.4 without marking
+  it unreleased would have reproduced the exact error that produced findings A1
+  and A2.
+
+### Closed by the proactive correction — finding E, F, F2
+
+`SETTLEMENT-GUARANTEE-CORRECTION.md`, issued 2026-09-01, addressed to every
+holder of a pre-2026-08-31 revision. **Not prompted by the integrator**; they
+did not ask about settlement.
+
+Book §5.1 previously read *"only finalisation is the cryptographic
+guarantee"*. That sentence is now retracted in place, and the correction states
+the honest form: **Genesis-4 offers economic finality under an assumption of
+healthy participation, not a cryptographic settlement guarantee**, because the
+quorum denominator shrinks with no floor and no recovery (F) and `finalized` is
+not a latch across a reorg (F2). It says in terms that two-node agreement does
+**not** mitigate F2, since both nodes can rewind independently, and gives a
+credit procedure built only from methods that exist on the released binary:
+outpoint plus `gettxout.at_slot` for the deposit epoch, agreement on
+finalized **root and epoch** across two independent nodes, a depth margin past
+finality, re-verification immediately before release, and four separate alerts.
+
+It declines to quote a rewind-depth bound, because none has been measured. It
+names the two conditions under which each caveat is withdrawn.
+
+### Closed by test — the volatile figures
+
+`crates/bloch-pos-committee/tests/integration_book_claims.rs`, now **11 tests,
+all passing**. The eleventh, added 2026-09-01, is
+`book_rejection_cache_is_absent_from_the_released_binary`.
+
+It is the only pin in the file that asserts something is *missing*, and it is
+shaped deliberately. `REJECTION_TTL_SLOTS` **does not exist on `main`** and was
+not added to give a test something to assert — adding it would ship the change
+rather than document it, which is the failure this whole revision exists to
+prevent. So §10.1's `[UNRELEASED]` marker is pinned negatively: the test scans
+the node crate's sources, and goes red when the constant appears. Its failure
+message names the sections that must move in the same commit.
+
+Because `bloch-pos-committee` does not depend on `bloch-pos-node`, the test
+cannot import what it is checking for and must scan source text — a static
+reference to a path, which is the pattern that has rotted silently in this
+repository before (§K). It therefore asserts the files it expects to find
+**before** concluding anything from their contents: a moved or renamed node
+crate fails loudly instead of passing vacuously. **The pin was mutation-tested**
+— injecting the constant into `engine.rs` turns it red with the intended
+message, and the injection was reverted. §K's lesson is that an unverified hook
+is worse than none.
+
+### Open — not closed here
+
+| # | Item | Owner |
+|---|---|---|
+| F3 | **How much of the staking-refusal mechanism an exchange is told.** Escalated, not decided — see the escalation note in F3. The line currently drawn in book §8.1 was drawn by the auditing agent, and this disposition does not move it | **founder** |
+| F3 | Whether the unauthenticated deposit path should be fixed before any listing conversation proceeds | **founder** |
+| K | Which of the two competing explanations of the 2026-08-24 incident is correct, and whether F's narrative should be softened. Five `prova.rs` tests still fail on `main` while asserting themselves refuted | **consensus owner** |
+| F | Arming leak recovery and the quorum-denominator floor — a flag day with a fleet rebuild, not a config change. **Not armed, and nothing here arms it** | **founder** |
+| F2 | A ratchet on the adopt path comparing incoming to outgoing finalized. No such comparison and no test asserting one | **consensus owner** |

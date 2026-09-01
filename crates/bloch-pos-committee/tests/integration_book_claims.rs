@@ -525,3 +525,107 @@ fn book_validator_entry_has_no_scheduled_flag_day_on_this_branch() {
         );
     }
 }
+
+// ── §10.1 The rejection cache: pinned as ABSENT ─────────────────────────────
+
+/// The TTL the book quotes for the unreleased mempool rejection cache, in
+/// slots. **This is not a constant of this binary and must not become one
+/// here.** It is the value on `canario/cache-recusa`, reproduced so that §10.1's
+/// "≈ 64 minutes" is arithmetic somebody checked rather than a number somebody
+/// typed. Introducing the real constant is what should make the test below go
+/// red — see its doc comment.
+const BOOK_QUOTED_REJECTION_TTL_SLOTS: u64 = 128;
+
+/// **Book §10.1: the mempool rejection cache is `[UNRELEASED]`.**
+///
+/// This is the one pin in this file that asserts something is *missing*, and
+/// it is the shape the audit asked for. The book describes
+/// `REJECTION_TTL_SLOTS = 128` because integrators will read about it — the
+/// behaviour is real, it was measured on the live chain on 2026-08-30, and a
+/// client that retries a barred transaction needs to know the bar expires.
+/// But it is **not in the released binary**, and the failure mode this whole
+/// revision exists to prevent is exactly that: describing unreleased work as
+/// current.
+///
+/// So the guarantee is pinned negatively. The test passes while the constant
+/// is absent from the node crate and the `[UNRELEASED]` marker is honest. When
+/// `canario/cache-recusa` merges, the constant appears, **this test goes red**,
+/// and the commit that merges it must move §10.1 out of the divergence table
+/// into §6 and replace this test with a positive pin on the real constant.
+/// That is the changelog discipline applied to a removal rather than a change.
+///
+/// It scans source text rather than importing, because there is nothing to
+/// import: `bloch-pos-committee` does not depend on `bloch-pos-node`, and a
+/// test cannot name a constant that does not exist. That makes this a static
+/// reference to a path, which is the pattern that has rotted silently in this
+/// repository before — so the scan asserts the *files it expects to find*
+/// first, and a moved or renamed source tree fails loudly here instead of
+/// passing vacuously.
+#[test]
+fn book_rejection_cache_is_absent_from_the_released_binary() {
+    // The book's own arithmetic, checked against this binary's slot time.
+    assert_eq!(
+        BOOK_QUOTED_REJECTION_TTL_SLOTS * SLOT_DURATION_SECS / 60,
+        64,
+        "book §10.1 prints '128 x 30 s = 64 minutes'; if SLOT_DURATION_SECS \
+         moves, that sentence is wrong even though the cache is unreleased"
+    );
+
+    let node_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root is two levels above crates/bloch-pos-committee")
+        .join("crates/bloch-pos-node/src");
+
+    assert!(
+        node_src.is_dir(),
+        "cannot find {} - the node crate moved. This test proves nothing until \
+         the path is corrected; do NOT delete it to get green.",
+        node_src.display()
+    );
+
+    let mut scanned: Vec<String> = Vec::new();
+    let mut offenders: Vec<String> = Vec::new();
+    let mut stack = vec![node_src.clone()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("node src is readable") {
+            let path = entry.expect("readable dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                let text = std::fs::read_to_string(&path).expect("source is utf-8");
+                let name = path
+                    .strip_prefix(&node_src)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string();
+                if text.contains("REJECTION_TTL_SLOTS") {
+                    offenders.push(name.clone());
+                }
+                scanned.push(name);
+            }
+        }
+    }
+
+    // Anti-rot: the scan must actually have read the file the constant would
+    // land in. An empty or shrunken scan is a false negative, not a pass.
+    assert!(
+        scanned.iter().any(|f| f == "engine.rs"),
+        "scanned {} file(s) under {} and engine.rs was not among them - the \
+         mempool moved and this test is no longer looking where the constant \
+         would appear",
+        scanned.len(),
+        node_src.display()
+    );
+
+    assert!(
+        offenders.is_empty(),
+        "REJECTION_TTL_SLOTS now exists in the released node crate ({}). \
+         Integration Book §10.1 lists the rejection cache as [UNRELEASED] and \
+         is now WRONG. In this same commit: move §10.1 out of the §10 \
+         divergence table into §6, state the TTL as live behaviour, and \
+         replace this negative pin with a positive assertion on the real \
+         constant. Do not silence this test.",
+        offenders.join(", ")
+    );
+}
