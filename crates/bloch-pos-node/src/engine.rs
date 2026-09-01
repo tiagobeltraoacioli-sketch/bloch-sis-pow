@@ -60,13 +60,12 @@
 //! store with a test proving it equals the rebuild, not a cache with a comment.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bloch_pos_committee::attestation::{Attestation, AttestationData};
 use bloch_pos_committee::beacon::{mix_in, RandaoChain};
@@ -76,14 +75,12 @@ use bloch_pos_committee::header::{BlockEnvelope, BlockHeaderV4, BlockId, Body, V
 use bloch_pos_committee::interfaces::{ProposalEnvelope, StateReader, StateTransition};
 use bloch_pos_committee::schedule::first_slot_of_epoch;
 use bloch_pos_committee::transition::{CommittedState, PosTransaction, Transition};
-use bloch_pos_committee::ws::WeakSubjectivityCheckpoint;
 use bloch_pos_committee::{committees, derive, epoch_of, schedule};
 
 use crate::genesis::{Manifest, GENESIS_MIX};
 use crate::keys::{HybridVerifier, Keystore, ProbeVerifier};
 use crate::net::{self, NetEvent, Origin, Verdict};
 use crate::rpc::{self, Admitted, Finality, Json, RpcCall, RpcError, RpcRequest, RpcResult};
-use crate::state_sync::{self, StateSyncRequest, StateSyncResponse};
 use crate::store::Store;
 
 /// Everything that reaches the consensus thread from outside it.
@@ -144,43 +141,6 @@ pub struct Config {
     /// the server entirely.
     pub rpc_bind: String,
     pub rpc_port: Option<u16>,
-    /// Decline the node's own proposal duty when the head is more than this
-    /// many slots behind the wall clock. `None` — the default — disarms the
-    /// gate entirely and preserves the behaviour every deployed node has
-    /// today. See the gate itself in [`Engine::propose`] for what arming it
-    /// means and the coordination it requires; this is NOT a knob to flip
-    /// per-node on a whim.
-    pub max_propose_lag_slots: Option<u64>,
-    /// `--accept-new-signing-history`: create a fresh, empty
-    /// slashing-protection store for a keystore that has none. The genuine
-    /// first-boot case only — a key that HAS signed anywhere must carry its
-    /// exported history instead ([`crate::signing_history`]). Off, a
-    /// validator with no history file refuses to start rather than signing
-    /// blind.
-    pub accept_new_signing_history: bool,
-    /// `--doppelganger-epochs`: how many epochs a restarted validator stays
-    /// silent while listening for its own key signing elsewhere
-    /// ([`Doppelganger`]). Default 2. `0` disables the watch — for a chain
-    /// launch orchestrated by one operator, not for a machine whose twin
-    /// might exist.
-    pub doppelganger_epochs: u64,
-    /// Checkpoint-sync: a local snapshot artifact (`*.snap`, from
-    /// `--export-state-epoch` on a synced node or an out-of-band copy) to
-    /// verify against the boot checkpoint and start from. Verification is
-    /// [`crate::state_sync::import`]'s three-step chain; the file's origin
-    /// carries no trust.
-    pub state_snapshot: Option<PathBuf>,
-    /// Checkpoint-sync: when the verified boot checkpoint is ahead of local
-    /// history, download the checkpoint's state from peers (chunked,
-    /// resumable) instead of replaying every block from genesis. Off by
-    /// default — starting from a snapshot forgoes local re-execution of the
-    /// skipped history, and that trade is the operator's to make.
-    pub state_sync: bool,
-    /// Export mode: replay the local log, write the boundary-state snapshot
-    /// for this weak-subjectivity publication epoch to
-    /// [`Config::export_state_out`], and exit without joining the network.
-    pub export_state_epoch: Option<u64>,
-    pub export_state_out: Option<PathBuf>,
 }
 
 fn now_ms() -> u64 {
@@ -303,22 +263,17 @@ mod state_cell {
     /// a node whose head lags its wall clock. The memo is dropped whole on
     /// every applied block anyway, so this bounds a burst, not a lifetime.
     ///
-    /// **It is also a memory budget, and it used to be the larger of the two
-    /// this module spends.** Each entry is a whole `CommittedState` — but
-    /// since 2026-08-31 a rolled state *shares its eUTXO map* with the state
-    /// it was rolled from (`close_epoch` never writes to the ledger, so the
-    /// `Arc` in `EutxoSet` is never unshared on this path), and the eUTXO map
-    /// was almost all of the 60 MB the measurement below records. A memo
-    /// entry now costs the per-epoch fields — registry, participation,
-    /// finality view — not the ledger. The figures below predate the sharing
-    /// and are kept as the record of what an *unshared* state costs, which is
-    /// still what [`REORG_STATE_WINDOW`] holds when blocks move the ledger.
+    /// **It is also a memory budget, and it is the larger of the two this
+    /// module spends.** Each entry is a whole `CommittedState`, structurally
+    /// sharing nothing with the live one, so a full memo is `MEMO_CAP` extra
+    /// copies — the same unit [`REORG_STATE_WINDOW`] is counted in, four
+    /// times over. It is transient where the retention window is steady
+    /// state, but the peak is what an OOM kills on.
     ///
     /// MEASURED on this tree by `bench::bench_state_footprint` (`--release`,
-    /// Genesis-3-sized eUTXO set, RSS delta over four clones, PRE-sharing):
-    /// **60 MB per state**, so a full memo was ~240 MB and the two features
-    /// together peaked around 300 MB per validator above the pre-change
-    /// baseline.
+    /// Genesis-3-sized eUTXO set, RSS delta over four clones): **60 MB per
+    /// state**, so a full memo is ~240 MB and the two features together peak
+    /// around 300 MB per validator above the pre-change baseline.
     ///
     /// That 60 MB does NOT match the 128 MB in [`REORG_STATE_WINDOW`]'s doc.
     /// Both are real measurements of the same quantity on different hosts
@@ -393,20 +348,6 @@ mod state_cell {
             self.generation
         }
 
-        /// How many rolled states the memo holds right now. Test surface —
-        /// so a test can pin that a roll of many epochs leaves (and, with the
-        /// in-loop eviction, passes through) no more than `MEMO_CAP` entries.
-        #[cfg(test)]
-        pub(super) fn memo_len(&self) -> usize {
-            self.memo.borrow().len()
-        }
-
-        /// The eviction bound, for the same test.
-        #[cfg(test)]
-        pub(super) fn memo_cap() -> usize {
-            MEMO_CAP
-        }
-
         /// Plant an entry in the memo by hand. TEST ONLY, and only so a test
         /// can prove the generation half of the key is load-bearing: an entry
         /// planted under a stale generation must never be returned, and the
@@ -476,21 +417,12 @@ mod state_cell {
                     epoch: cur_epoch,
                     rolled: Arc::clone(&cur),
                 });
-                // Evict the lowest epochs first: they are the cheapest to
-                // rebuild (fewest rolls from the base) and the least likely
-                // to be asked for again, since the traffic walks forward.
-                //
-                // INSIDE the loop, not after it (2026-08-31): evicting after
-                // meant a roll of N epochs transiently held N entries, and on
-                // a node N epochs behind the wall clock — the one node that
-                // rolls far — that was N full states at once. The rolled
-                // states now share the eUTXO map, so an entry is small; this
-                // keeps the memo's population bounded by MEMO_CAP at every
-                // point of the roll rather than only between calls, so the
-                // bound does not depend on the sharing to hold.
-                while memo.len() > MEMO_CAP {
-                    memo.remove(0);
-                }
+            }
+            // Evict the lowest epochs first: they are the cheapest to rebuild
+            // (fewest rolls from the base) and the least likely to be asked
+            // for again, since the traffic walks forward.
+            while memo.len() > MEMO_CAP {
+                memo.remove(0);
             }
             cur
         }
@@ -519,48 +451,6 @@ use state_cell::StateCell;
 #[cfg(test)]
 mod replay_bench;
 
-/// The startup doppelganger watch: is this validator key already live on
-/// another machine?
-///
-/// The signing-history store cannot see a *concurrent* twin — two machines
-/// each hold their own store and each happily advances it (the limitation
-/// its module docs state). What CAN see a twin is the network: an active
-/// validator attests every epoch, and those attestations reach this node's
-/// verified gossip pipeline. So on a restart into an already-running chain
-/// the node stays deliberately silent for a configurable number of epochs
-/// and listens. Any **signature-verified** message from its own validator
-/// index for a slot it provably did not sign — a slot at or after the watch
-/// began, while the watch keeps this node from signing at all — is the same
-/// key signing elsewhere, and the node shuts down instead of joining in and
-/// completing the equivocation.
-///
-/// Honesty about the bounds of this check:
-///
-/// - the watch costs its own duties for the window — the deliberate trade,
-///   liveness paid for safety, same direction as the signing guard;
-/// - it only sees what gossip delivers; a twin on a partitioned network is
-///   invisible until the partition heals;
-/// - two nodes started at the same moment with the same key are BOTH silent
-///   for the window and detect nothing — the watch catches the common
-///   accidents (warm backup still running, restored snapshot, forgotten
-///   systemd unit), not a synchronized double start;
-/// - a boot at the birth of the chain (wall slot 0) skips the watch: no
-///   history exists in which a twin could already have signed.
-///
-/// `watch_from_slot` starts two slots after boot, mirroring the boot grace,
-/// so a message this node's *previous life* signed in the boot slot (crash
-/// and restart within one slot, or ±1 slot of peer clock skew) is not
-/// mistaken for a twin.
-struct Doppelganger {
-    /// First slot at which an observed own-index signature counts as a twin.
-    watch_from_slot: u64,
-    /// Duties stay silent until the wall clock reaches this slot.
-    silent_until_slot: u64,
-    /// Set when a twin was seen; once set, this node never signs again and
-    /// the run loop exits with the message.
-    alarm: Option<String>,
-}
-
 struct Engine {
     manifest: Manifest,
     state: StateCell,
@@ -579,19 +469,6 @@ struct Engine {
     /// keystore, is how you equivocate and get slashed. There is no safe
     /// version of that, so there is this.
     keys: Option<Keystore>,
-    /// Node-local slashing protection ([`crate::signing_history`]): the
-    /// durable record of the highest slot proposed and the highest
-    /// source/target epochs attested, consulted and advanced — fsynced —
-    /// BEFORE every signature this node releases. `Some` whenever `keys` is
-    /// `Some`; a signing engine without it refuses its duties rather than
-    /// signing blind, because an unrecorded signature is one a restart (or a
-    /// restored snapshot) can repeat.
-    guard: Option<crate::signing_history::SigningHistory>,
-    /// The startup doppelganger watch ([`Doppelganger`]): `Some` while this
-    /// node is deliberately silent, listening for its own validator index
-    /// signing elsewhere. `None` on observers, after the watch has expired
-    /// on a clean boot, or when the operator disabled it.
-    doppelganger: Option<Doppelganger>,
     /// Every structurally-valid block seen, canonical or not, by id.
     /// Unpruned — fine for a devnet, listed as a limitation.
     blocks: BTreeMap<[u8; 32], BlockEnvelope>,
@@ -660,61 +537,6 @@ struct Engine {
     /// that kind of pool shrinkage apart from the epoch `retain`, which fork
     /// choice very much can see. See the argument there.
     fc_covered_removals: u64,
-    /// The proposal-lag gate's margin, from [`Config::max_propose_lag_slots`].
-    /// `None` disarms it. Read exactly once, in [`Engine::propose`].
-    max_propose_lag_slots: Option<u64>,
-    /// Live P2P connection gauge, written by the transport threads
-    /// (libp2p: distinct peers; devnet: connections). Observability only —
-    /// no consensus rule reads it. It sits on the engine so `/metrics` can
-    /// serve it from the same snapshot as everything else; the number
-    /// itself proves nothing about progress, which is precisely what the
-    /// 2026-08 stall demonstrated (57 peers, zero blocks applied).
-    peers_connected: Arc<std::sync::atomic::AtomicUsize>,
-    /// How many peers this node was configured to dial, for the scrape
-    /// surface (`peers_connected` ≪ `peers_configured` is an egress or
-    /// peer-list problem).
-    peers_configured: usize,
-    /// Duty counters for the observability surface. Process-local and reset
-    /// on restart, by design: they count what THIS process did. "Signed"
-    /// counts signatures released, not chain inclusions — the participation
-    /// map answers inclusion.
-    attestations_signed: u64,
-    proposals_signed: u64,
-    /// Duties refused by a protective gate (signing guard, doppelganger
-    /// silence, proposal-lag gate). Each refusal also prints its own line;
-    /// the counter is what lets a scraper notice without tailing the log.
-    duties_refused: u64,
-    /// Where this node's local history begins.
-    ///
-    /// [`BaseState::Genesis`] on an ordinary node. On a checkpoint-synced
-    /// node it holds the verified snapshot state — the post-state of
-    /// `chain[0]` — because `replay_to` must fold from *somewhere this node
-    /// actually has*, and genesis is no longer that.
-    base: BaseState,
-    /// Set when this node bootstrapped from a verified checkpoint snapshot:
-    /// `(checkpoint epoch, boundary block root)`. Three consumers, each
-    /// because the chain below the base does not exist locally: fork choice
-    /// walks from this root while the state's own justified checkpoint still
-    /// predates it ([`Engine::forkchoice_walk_root`]);
-    /// [`Engine::own_finalized_root_at`] refuses epochs below it (this chain
-    /// cannot witness them); and the history surfaces (RPC `getblock`, peer
-    /// block serving) simply lack the earlier blocks — backfill is a
-    /// service, not consensus.
-    sync_base: Option<(u64, [u8; 32])>,
-    /// The publication epoch whose boundary snapshot was last exported, so a
-    /// boundary crossing exports once, not on every block of the new epoch.
-    last_boundary_export: Option<u64>,
-}
-
-/// See [`Engine::base`].
-enum BaseState {
-    /// History starts at the genesis block; the base state is the manifest's
-    /// genesis state, recomputed on demand (it is derivable, and holding a
-    /// second carryover-scale state resident for a rare path is RAM the
-    /// fleet does not have).
-    Genesis,
-    /// History starts at a verified snapshot; underivable, so it is held.
-    Snapshot(Arc<CommittedState>),
 }
 
 /// A fingerprint of the four values `lmd_ghost_head` reads, so `advance` can
@@ -993,14 +815,6 @@ impl Engine {
     /// canonical chain under the same checkpoint convention its attesters
     /// vote, never from anything a peer or a publication asserted.
     fn own_finalized_root_at(&self, epoch: u64) -> Option<[u8; 32]> {
-        // Below the sync base this chain holds no blocks: `checkpoint_root`
-        // would degenerate to chain[0] and *invent* a witness for an epoch
-        // this node never saw. No answer is the honest answer.
-        if let Some((base_epoch, _)) = self.sync_base {
-            if epoch < base_epoch {
-                return None;
-            }
-        }
         (epoch <= self.state.finality().finalized.epoch).then(|| self.checkpoint_root(epoch))
     }
 
@@ -1068,115 +882,11 @@ impl Engine {
         }
     }
 
-    /// Install a VERIFIED snapshot as this node's history base: the state
-    /// becomes the boundary block's post-state, the canonical chain begins at
-    /// that block, and everything below it is absent by design (backfill is a
-    /// service, not consensus).
-    ///
-    /// `persist` carries the artifact's file bytes on a first install, so a
-    /// restart re-verifies and resumes from here (`state.snap` + the
-    /// checkpoint in `ws_latest.bin`); the restart path itself passes `None`
-    /// because what it read from disk is already what it would write.
-    ///
-    /// The caller vouches that `state`/`env` came out of
-    /// [`state_sync::import`] against `cp` — there is no other way to obtain
-    /// the pair, since `snapshot::restore` is the only constructor of a
-    /// non-genesis, non-transition state.
-    fn install_snapshot(
-        &mut self,
-        state: CommittedState,
-        env: BlockEnvelope,
-        cp: &WeakSubjectivityCheckpoint,
-        persist: Option<&[u8]>,
-    ) -> io::Result<()> {
-        let id = env.block_id();
-        let slot = env.header.slot;
-        // Persist FIRST: a crash between installation and persistence would
-        // leave a blocks.log that starts mid-history with nothing under it.
-        if let Some(bytes) = persist {
-            let data_dir = self.store.dir().to_path_buf();
-            let tmp = data_dir.join("state.snap.tmp");
-            fs::write(&tmp, bytes)?;
-            fs::rename(&tmp, data_dir.join(state_sync::INSTALLED_SNAPSHOT))?;
-            crate::ws_boot::save_latest(&data_dir, cp)?;
-        }
-        let arc = Arc::new(state);
-        self.state.set_arc(Arc::clone(&arc));
-        self.base = BaseState::Snapshot(Arc::clone(&arc));
-        self.chain = vec![(slot, id)];
-        self.canonical = BTreeSet::from([*id.as_bytes()]);
-        self.blocks.insert(*id.as_bytes(), env);
-        self.recent_states.clear();
-        self.remember_state(*id.as_bytes(), arc);
-        self.sync_base = Some((cp.epoch, *id.as_bytes()));
-        self.head_slot.store(slot, Ordering::Relaxed);
-        self.last_applied_ms = now_ms();
-        let fin = self.state.finality();
-        println!(
-            "checkpoint-sync: state INSTALLED at checkpoint epoch {} — head slot {} ({}),              state root {}, justified e{}, finalized e{}. History below this base is not              held; the node syncs forward from here.",
-            cp.epoch,
-            slot,
-            crate::codec::hex8(id.as_bytes()),
-            crate::codec::hex8(&cp.state_root),
-            fin.justified.epoch,
-            fin.finalized.epoch,
-        );
-        Ok(())
-    }
-
-    /// If the block about to apply at `new_slot` is the first canonical block
-    /// at or past a weak-subjectivity publication boundary
-    /// (`ws::is_publication_epoch`), the CURRENT head is that publication
-    /// epoch's `checkpoint_root` — the exact block a future signed checkpoint
-    /// will pin — and its post-state (the current state) is the snapshot a
-    /// joining node will ask for by root. Export it, off-thread: the state
-    /// travels as an `Arc` (no copy), and serialisation happens off the slot
-    /// loop.
-    ///
-    /// Exported eagerly, before the epoch finalizes: the file is keyed by
-    /// state root, so an export on a branch that later loses is dead weight
-    /// that ages out of the pruned store, never something a checkpoint can
-    /// name.
-    fn maybe_export_boundary(&mut self, new_slot: u64) {
-        use bloch_pos_committee::ws::WS_PUBLICATION_INTERVAL_EPOCHS as INTERVAL;
-        let target = epoch_of(new_slot) - epoch_of(new_slot) % INTERVAL;
-        if target == 0 || self.last_boundary_export == Some(target) {
-            return;
-        }
-        let Some(first) = first_slot_of_epoch(target) else { return };
-        if self.state.slot() >= first {
-            // Not a crossing: the boundary is already behind the head.
-            return;
-        }
-        let head = self.head_id();
-        let Some(env) = self.blocks.get(head.as_bytes()).cloned() else {
-            return; // head is the synthesized genesis — nothing exportable
-        };
-        self.last_boundary_export = Some(target);
-        let state = self.state.arc();
-        let dir = state_sync::snapshots_dir(self.store.dir());
-        std::thread::spawn(move || match state_sync::export_to_dir(&dir, &state, &env) {
-            Ok(path) => println!(
-                "checkpoint-sync: exported the epoch-{target} boundary state to {}",
-                path.display()
-            ),
-            Err(e) => eprintln!("checkpoint-sync: boundary export failed: {e}"),
-        });
-    }
-
-    /// This validator's RANDAO chain, positioned at its COMMITTED reveal
-    /// count — `CommittedState::reveals_used_of`, the very value
-    /// `apply_block` will judge the next reveal against. Regenerated from the
-    /// seed on every use: a reorg can drop our own blocks, and the canonical
-    /// state's committed count moves with the reorg, so a regenerated chain
-    /// cannot drift from what the state expects.
-    ///
-    /// This used to count our own blocks on the canonical chain — the same
-    /// number, but only for a node that holds its whole chain. A
-    /// checkpoint-synced validator holds nothing below its sync base, so the
-    /// walk undercounted exactly there and every reveal it produced would
-    /// have been refused. The committed pair is the single definition of
-    /// where the chain stands and it arrives inside the verified snapshot.
+    /// This validator's RANDAO chain, positioned at its committed reveal
+    /// count on the CANONICAL chain (= how many canonical blocks it
+    /// proposed). Regenerated from the seed on every use: a reorg can drop
+    /// our own blocks, so an incrementally-advanced local chain would drift
+    /// from what the committed state expects the next reveal to open.
     ///
     /// Only ever called from the proposing path, which an observer never
     /// reaches — hence the expect rather than an Option return threaded
@@ -1186,67 +896,17 @@ impl Engine {
             .keys
             .as_ref()
             .expect("randao_positioned is proposer-only");
-        let count = self.state.reveals_used_of(keys.index);
+        let mine = self.chain.iter().skip(1).filter(|(_, id)| {
+            self.blocks
+                .get(id.as_bytes())
+                .is_some_and(|e| e.header.proposer_index == keys.index)
+        });
+        let count = mine.count();
         let mut chain = RandaoChain::generate(keys.randao_seed);
         for _ in 0..count {
             chain.next_reveal();
         }
         chain
-    }
-
-    // ── Doppelganger watch ──────────────────────────────────────────────────
-
-    /// True while the watch — or a raised alarm — forbids signing at `slot`.
-    fn doppelganger_silent(&self, slot: u64) -> bool {
-        match &self.doppelganger {
-            None => false,
-            Some(d) => d.alarm.is_some() || slot < d.silent_until_slot,
-        }
-    }
-
-    /// A **signature-verified** message from `validator` for `slot` passed
-    /// through this node. If it is our own index, for a slot inside the
-    /// silent window — a slot this node provably did not sign — the same key
-    /// is live on another machine: raise the alarm, permanently.
-    ///
-    /// The window test is on the *message's* slot, not the wall clock, so a
-    /// twin's attestation from inside the window still convicts when it
-    /// arrives late; and a message from after the window proves nothing
-    /// (past `silent_until_slot` it could be our own signature echoed back).
-    fn doppelganger_observe(&mut self, validator: u32, slot: u64, what: &str) {
-        let Some(our_index) = self.keys.as_ref().map(|k| k.index) else {
-            return;
-        };
-        let Some(d) = self.doppelganger.as_mut() else {
-            return;
-        };
-        if d.alarm.is_some()
-            || validator != our_index
-            || slot < d.watch_from_slot
-            || slot >= d.silent_until_slot
-        {
-            return;
-        }
-        let msg = format!(
-            "DOPPELGANGER DETECTED: a signature-verified {what} by validator {validator} — \
-             THIS node's key — for slot {slot} arrived from the network while this node was \
-             deliberately silent (watching slots {}..{}). The same key is signing on another \
-             machine: a warm backup, a restored snapshot, a systemd unit that was never \
-             stopped. Refusing to ever sign from this process — two live signers is how a \
-             validator equivocates and loses stake. Find and stop the other signer before \
-             starting this node again.",
-            d.watch_from_slot, d.silent_until_slot,
-        );
-        eprintln!("{msg}");
-        d.alarm = Some(msg);
-    }
-
-    /// The alarm, if the watch has convicted a twin. The run loop turns this
-    /// into a process exit; the duty gates treat it as "never sign again".
-    fn doppelganger_alarm(&self) -> Option<&str> {
-        self.doppelganger
-            .as_ref()
-            .and_then(|d| d.alarm.as_deref())
     }
 
     // ── Duties ──────────────────────────────────────────────────────────────
@@ -1257,16 +917,6 @@ impl Engine {
             return;
         };
         let index = keys.index;
-        // Doppelganger watch: stay silent while listening for this key
-        // signing elsewhere — and forever once it has been seen doing so.
-        if self.doppelganger_silent(slot) {
-            self.duties_refused += 1;
-            eprintln!(
-                "[slot {slot}] NOT ATTESTING: doppelganger watch \
-                 (listening for validator {index} signing elsewhere)"
-            );
-            return;
-        }
         let e = epoch_of(slot);
         if e == 0 {
             // Epoch 0's checkpoint is genesis — justified by definition;
@@ -1289,29 +939,6 @@ impl Engine {
             target_epoch: e,
             target_root: self.checkpoint_root(e),
         };
-        // Slashing protection, BEFORE the signature exists. `record_attestation`
-        // advances the durable watermark and fsyncs it; only on `Ok` may the
-        // vote be signed. A refusal costs this epoch's attestation reward — the
-        // deliberate trade, because the alternative it prevents is a double or
-        // surround vote worth 5% of stake plus ejection.
-        match self.guard.as_mut() {
-            None => {
-                self.duties_refused += 1;
-                eprintln!(
-                    "[slot {slot}] NOT ATTESTING: this node holds a validator key but no \
-                     signing-history store — refusing to sign blind (see \
-                     BLOCH-SLASHING-PROTECTION.md)"
-                );
-                return;
-            }
-            Some(g) => {
-                if let Err(e) = g.record_attestation(data.source_epoch, data.target_epoch) {
-                    self.duties_refused += 1;
-                    eprintln!("[slot {slot}] NOT ATTESTING: {e}");
-                    return;
-                }
-            }
-        }
         let signature = self
             .keys
             .as_ref()
@@ -1325,7 +952,6 @@ impl Engine {
         self.pool
             .insert((att.validator, att.data.signing_root()), att.clone());
         self.net.broadcast(net::att_frame(&att));
-        self.attestations_signed += 1;
         println!(
             "[slot {slot}] attested (epoch {e}, head {}, target {})",
             crate::codec::hex8(&data.head),
@@ -1338,74 +964,12 @@ impl Engine {
             return;
         };
         let index = keys.index;
-        // Doppelganger watch: same gate as `attest`, same reason.
-        if self.doppelganger_silent(slot) {
-            self.duties_refused += 1;
-            eprintln!(
-                "[slot {slot}] NOT PROPOSING: doppelganger watch \
-                 (listening for validator {index} signing elsewhere)"
-            );
-            return;
-        }
         let e = epoch_of(slot);
         let rolled = self.rolled_to(e);
         let roster = rolled.active_validators();
         let seed = Self::seed_for(&rolled, e);
         if schedule::proposer(&seed, slot, &roster) != Some(index) {
             return;
-        }
-
-        // ── The proposal-lag gate. OPT-IN, and consensus-affecting when
-        // armed: read this whole comment before wiring the flag anywhere. ──
-        //
-        // Why it exists: a node that stalls behind the live head keeps its
-        // wall clock, so its proposal slots keep arriving — and when one
-        // does, it proposes on its own stale head and pins itself (and every
-        // attester that follows it) to a minority branch. That is not a
-        // hypothetical: block f7568afa at slot 50010 was exactly this, a
-        // post-replay-stalled node extending a head hundreds of slots old.
-        // A proposal built that far behind the wall clock cannot win fork
-        // choice against a live branch; all it can do is make the fork map
-        // worse. Declining the duty is strictly better for the network AND
-        // for the proposer.
-        //
-        // Why it is a plain wall-clock margin and not the `Health` verdict:
-        // the veto must depend on nothing but the slot being proposed for
-        // and the head being proposed on — two values every observer of the
-        // resulting block can check — not on apply-timing local to this
-        // process. `slot` here IS the wall slot (the loop derives it from
-        // the clock), so `slot - head_slot` is "how stale is the head I am
-        // about to extend".
-        //
-        // Why the margin must dwarf the cadence gap: on a chain filling ~13%
-        // of its slots, a healthy head is routinely 5–30 slots old, so any
-        // margin below ~64 slots silences honest proposers during ordinary
-        // quiet stretches. The stall this defends against measured 480
-        // slots; there is no need to cut fine.
-        //
-        // **The liveness caveat that makes this flag-day material:** if the
-        // WHOLE network halts for longer than the margin, every armed node's
-        // head is stale and every armed node declines — the halt becomes
-        // self-sustaining until operators intervene (restart without the
-        // flag, or with a larger margin). A node cannot locally tell "I am
-        // behind the others" from "there are no others ahead of me". So the
-        // fleet must arm this together, with a margin chosen against the
-        // chain's worst observed quiet stretch, and the runbook for a full
-        // halt must say "disarm first". Shipping it armed-by-default,
-        // silently, is how a transient outage becomes a permanent one.
-        if let Some(margin) = self.max_propose_lag_slots {
-            let head_slot = self.head_slot_now();
-            let lag = slot.saturating_sub(head_slot);
-            if lag > margin {
-                self.duties_refused += 1;
-                eprintln!(
-                    "[slot {slot}] DECLINING proposal duty: head {} at slot {head_slot} is \
-                     {lag} slots behind the wall clock (margin {margin}). Proposing here \
-                     would extend a stale head onto a minority branch; syncing instead.",
-                    crate::codec::hex8(self.head_id().as_bytes()),
-                );
-                return;
-            }
         }
 
         // Attestations this block may carry: current epoch, not from the
@@ -1514,29 +1078,6 @@ impl Engine {
         };
         header.state_root = post.state_root();
 
-        // Slashing protection, BEFORE the signature exists. Placed after the
-        // post-state work on purpose: a block the transition refuses must not
-        // burn the slot's watermark, but once the watermark IS advanced (and
-        // fsynced) a crash anywhere below costs one missed slot, never a
-        // second header for a signed slot.
-        match self.guard.as_mut() {
-            None => {
-                self.duties_refused += 1;
-                eprintln!(
-                    "[slot {slot}] NOT PROPOSING: this node holds a validator key but no \
-                     signing-history store — refusing to sign blind (see \
-                     BLOCH-SLASHING-PROTECTION.md)"
-                );
-                return;
-            }
-            Some(g) => {
-                if let Err(e) = g.record_proposal(slot) {
-                    self.duties_refused += 1;
-                    eprintln!("[slot {slot}] NOT PROPOSING: {e}");
-                    return;
-                }
-            }
-        }
         let proposer_sig = self
             .keys
             .as_ref()
@@ -1551,7 +1092,6 @@ impl Engine {
             },
         };
         let id = env.block_id();
-        self.proposals_signed += 1;
         println!(
             "[slot {slot}] proposing block {} ({} attestations, {} txs, mempool {})",
             crate::codec::hex8(id.as_bytes()),
@@ -1633,19 +1173,8 @@ impl Engine {
         if env.header.slot == 0 {
             return; // genesis is synthesized, never received
         }
-        let (proposer, slot) = (env.header.proposer_index, env.header.slot);
         self.blocks.insert(id, env);
         self.advance();
-        // Doppelganger watch, proposal side. Only a block the transition
-        // accepted onto the canonical chain counts: canonical is the one
-        // state in which the proposer's signature is known to have been
-        // verified, and an unverified header's proposer_index is a byte
-        // anyone can write. (A twin's block stranded on a fork evades this
-        // hook — but a live twin also attests every epoch, and the
-        // attestation hook in `apply_decision` sees those.)
-        if self.canonical.contains(&id) {
-            self.doppelganger_observe(proposer, slot, "block proposal");
-        }
         // The block is queryable now, so attestations parked on it can be
         // re-run. `advance()` first: an attestation released here votes on
         // fork choice, and it should see the chain the block already moved.
@@ -1692,25 +1221,8 @@ impl Engine {
         ForkChoiceInputs {
             blocks: self.blocks.len(),
             pool: self.pool.len() as u64 + self.fc_covered_removals,
-            justified: self.forkchoice_walk_root(),
+            justified: self.state.finality().justified.root,
             validators: self.state.active_validators(),
-        }
-    }
-
-    /// The root LMD-GHOST walks from. Normally the state's own justified
-    /// checkpoint. On a checkpoint-synced node whose justified checkpoint
-    /// still predates the sync base, the base root — the deepest block this
-    /// node holds — is used instead, exactly as Ethereum anchors fork choice
-    /// in the checkpoint state it synced. Without this the walk would start
-    /// at a root this node deliberately does not hold, see no children, and
-    /// freeze on it forever. The override retires by itself: the first
-    /// justification at or past the base epoch is of a block this node
-    /// applied, and the ordinary rule takes over.
-    fn forkchoice_walk_root(&self) -> [u8; 32] {
-        let j = self.state.finality().justified;
-        match self.sync_base {
-            Some((base_epoch, base_root)) if base_epoch > j.epoch => base_root,
-            _ => j.root,
         }
     }
 
@@ -1721,7 +1233,7 @@ impl Engine {
             &self.blocks,
             self.pool.values(),
             &self.state.active_validators(),
-            self.forkchoice_walk_root(),
+            self.state.finality().justified.root,
         )
     }
 
@@ -1926,12 +1438,6 @@ impl Engine {
             .apply_block(&self.state, &envelope, &env.body.attestations, &txs)
         {
             Ok(post) => {
-                if self.live {
-                    // Before the head moves: the pre-apply head may be a
-                    // publication-epoch boundary whose state should be served
-                    // to joining nodes.
-                    self.maybe_export_boundary(env.header.slot);
-                }
                 self.state.set(post);
                 // Snapshot for the reorg path. Free: this is the state that
                 // was just built, kept by handle, not copied.
@@ -2075,10 +1581,7 @@ impl Engine {
                     .clone()
             })
             .collect();
-        let mut st = match &self.base {
-            BaseState::Genesis => self.manifest.genesis_state(),
-            BaseState::Snapshot(base) => (**base).clone(),
-        };
+        let mut st = self.manifest.genesis_state();
         for env in &prefix {
             let envelope = ProposalEnvelope {
                 header: env.header.clone(),
@@ -2288,11 +1791,6 @@ impl Engine {
                         ev.second.validator, ev.second.data.slot,
                     );
                 }
-                // `Accept` means the pool verified the signature against the
-                // roster — which makes this the doppelganger watch's window
-                // on the world: a verified vote by OUR index, from a slot the
-                // watch kept us silent for, can only be another machine.
-                self.doppelganger_observe(att.validator, att.data.slot, "attestation");
                 self.pool
                     .insert((att.validator, att.data.signing_root()), att);
                 self.net.report(origin, Verdict::Accept);
@@ -2369,168 +1867,6 @@ impl Engine {
     /// not a reason for this path to panic here.
     fn wall_slot(&self) -> u64 {
         now_ms().saturating_sub(self.manifest.genesis_time_ms) / self.manifest.slot_ms.max(1)
-    }
-
-    /// The node's own liveness verdict, judged now.
-    ///
-    /// The head slot is read from `state` — the same value the slot loop's
-    /// `behind` predicate reads — and the silence from `last_applied_ms`,
-    /// which both `apply_canonical` and `do_reorg` refresh, so "applied a
-    /// block" here means the same event it means everywhere else in this
-    /// module. The verdict logic itself lives in [`rpc::Health::assess`],
-    /// pure and tested, so the RPC field and the periodic log line cannot
-    /// disagree.
-    fn health(&self) -> rpc::Health {
-        rpc::Health::assess(
-            self.wall_slot(),
-            self.state.slot(),
-            now_ms().saturating_sub(self.last_applied_ms),
-            self.manifest.slot_ms,
-        )
-    }
-
-    // ── Operator observability ──────────────────────────────────────────────
-    //
-    // Node-local reporting, assembled here because only the engine thread
-    // may read consensus state. Nothing below writes anything, nothing in
-    // consensus reads any of it, and none of it is gossiped: two nodes
-    // reporting differently cannot fork over it.
-
-    /// The doppelganger watch as one of the four reportable states.
-    fn doppelganger_view(&self) -> rpc::DoppelgangerView {
-        match &self.doppelganger {
-            None => rpc::DoppelgangerView::Disabled,
-            Some(d) if d.alarm.is_some() => rpc::DoppelgangerView::Alarmed,
-            Some(d) if self.wall_slot() < d.silent_until_slot => {
-                rpc::DoppelgangerView::Watching { silent_until_slot: d.silent_until_slot }
-            }
-            Some(_) => rpc::DoppelgangerView::Clear,
-        }
-    }
-
-    /// The next slot (strictly after `wall_slot`) at which `index` must
-    /// attest, and the next at which it proposes, scanned to the end of the
-    /// NEXT epoch. Returns `(next_attestation, next_proposal, horizon_end)`
-    /// with the horizon exclusive.
-    ///
-    /// The projection reuses EXACTLY the duty derivation `attest`/`propose`
-    /// run — same `rolled_to`, same seed, same committee function — so what
-    /// this predicts is what the node will do. The horizon stops after the
-    /// next epoch on purpose: further out the roster and seed can still
-    /// move with reveals that have not happened, and a status surface must
-    /// not present a guess as a schedule. (Within the horizon the answer is
-    /// still a projection from this node's CURRENT head — a reorg can shift
-    /// next epoch's committees.)
-    fn next_duties(&self, index: u32, wall_slot: u64) -> (Option<u64>, Option<u64>, u64) {
-        let horizon_end = (epoch_of(wall_slot) + 2) * bloch_pos_committee::SLOTS_PER_EPOCH;
-        let mut next_att = None;
-        let mut next_prop = None;
-        let mut slot = wall_slot + 1;
-        while slot < horizon_end && (next_att.is_none() || next_prop.is_none()) {
-            let e = epoch_of(slot);
-            let rolled = self.rolled_to(e);
-            let roster = rolled.active_validators();
-            let seed = Self::seed_for(&rolled, e);
-            // Epoch 0 carries no attestation duty (`attest` refuses it:
-            // genesis is justified by definition, source==target).
-            if next_att.is_none()
-                && e != 0
-                && committees::committee_for_slot(&seed, slot, &roster)
-                    .binary_search(&index)
-                    .is_ok()
-            {
-                next_att = Some(slot);
-            }
-            if next_prop.is_none() && schedule::proposer(&seed, slot, &roster) == Some(index) {
-                next_prop = Some(slot);
-            }
-            slot += 1;
-        }
-        (next_att, next_prop, horizon_end)
-    }
-
-    /// The status of the validator key this node holds; `None` on an
-    /// observer. One caveat is inherited rather than chosen: the
-    /// participation fields read the CHAIN's current/previous epoch (the
-    /// head's), which on a node that is behind lags the wall epoch — the
-    /// wall_slot/current_epoch fields in the view are what a consumer
-    /// judges that against.
-    fn validator_status_view(&self) -> Option<rpc::ValidatorStatusView> {
-        let index = self.keys.as_ref()?.index;
-        let wall_slot = self.wall_slot();
-        let current_epoch = epoch_of(wall_slot);
-        let registry = self.state.validator_record(index).map(|rec| {
-            let some_unless_never = |e: u64| (e != u64::MAX).then_some(e);
-            let effective = self
-                .state
-                .active_validators()
-                .iter()
-                .find(|v| v.index == index)
-                .map(|v| v.effective_stake);
-            rpc::ValidatorRegistryView {
-                state: rpc::validator_state(&rec, current_epoch),
-                slashed: rec.slashed,
-                own_stake_sat: rec.staked_sat,
-                effective_stake_sat: effective,
-                leaked_sat: self.state.leaked_of(index),
-                activation_epoch: some_unless_never(rec.activation_epoch),
-                exit_epoch: some_unless_never(rec.exit_epoch),
-                withdrawable_epoch: some_unless_never(rec.withdrawable_epoch),
-            }
-        });
-        // Duty-roster membership and the duty projection use the same
-        // rolled state the duty code uses.
-        let in_duty_roster = self
-            .rolled_to(current_epoch)
-            .active_validators()
-            .iter()
-            .any(|v| v.index == index);
-        let (next_attestation_slot, next_proposal_slot, projection_end_slot) =
-            self.next_duties(index, wall_slot);
-        Some(rpc::ValidatorStatusView {
-            index,
-            registry,
-            in_duty_roster,
-            next_attestation_slot,
-            next_proposal_slot,
-            projection_end_slot,
-            attested_in_current_epoch: self.state.attested_in_current_epoch(index),
-            attested_in_previous_epoch: self.state.attested_in_previous_epoch(index),
-            attestations_signed: self.attestations_signed,
-            proposals_signed: self.proposals_signed,
-            duties_refused: self.duties_refused,
-            guard_present: self.guard.is_some(),
-            guard_highest_proposed_slot: self.guard.as_ref().and_then(|g| g.highest_proposed_slot()),
-            guard_attestation_watermark: self.guard.as_ref().and_then(|g| g.attestation_watermark()),
-            doppelganger: self.doppelganger_view(),
-            wall_slot,
-            current_epoch,
-        })
-    }
-
-    /// Every `/metrics` number, read in one breath on this thread.
-    fn metrics_snapshot(&self) -> rpc::MetricsSnapshot {
-        let fin = self.state.finality();
-        rpc::MetricsSnapshot {
-            head_slot: self.state.slot(),
-            head_height: self.chain.len() as u64 - 1,
-            wall_slot: self.wall_slot(),
-            health: self.health(),
-            finalized_height: self.finalized_height(),
-            justified_epoch: fin.justified.epoch,
-            finalized_epoch: fin.finalized.epoch,
-            current_epoch: epoch_of(self.wall_slot()),
-            peers_connected: self.peers_connected.load(Ordering::Relaxed),
-            peers_configured: self.peers_configured,
-            mempool_transactions: self.mempool.len(),
-            mempool_capacity: MEMPOOL_MAX,
-            mempool_bytes: self.mempool.keys().map(Vec::len).sum(),
-            blocks_known: self.blocks.len(),
-            validators_total: self.state.validator_count(),
-            validators_active: self.state.active_validators().len(),
-            uptime_secs: now_ms().saturating_sub(self.booted_ms) / 1000,
-            validator: self.validator_status_view(),
-        }
     }
 
     /// Wall-clock seconds a slot corresponds to. Display only — derived from
@@ -2639,7 +1975,6 @@ impl Engine {
                 self.chain.len() as u64 - 1,
                 self.finalized_height(),
                 self.wall_slot(),
-                &self.health(),
                 self.state.validator_count(),
                 self.mempool.len(),
                 self.blocks.len(),
@@ -2769,19 +2104,6 @@ impl Engine {
                 self.mempool.keys().map(Vec::len).sum(),
                 self.state.next_base_fee(),
             )),
-
-            RpcRequest::ValidatorStatus => match self.validator_status_view() {
-                Some(v) => Ok(v.json()),
-                None => Err(RpcError::new(
-                    rpc::NO_VALIDATOR_KEY,
-                    "this node holds no validator key (it is an observer), so there is no \
-                     validator whose status could be reported. If a validator was MEANT to \
-                     run here, the data dir is missing its validator.key — that absence is \
-                     the finding.",
-                )),
-            },
-
-            RpcRequest::Metrics => Ok(Json::Str(self.metrics_snapshot().render())),
         }
     }
 }
@@ -2792,326 +2114,6 @@ impl Engine {
 /// operator watching a stalled fleet gets an answer quickly, and long enough
 /// that the log of a multi-hour replay stays readable.
 const REPLAY_PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// Cadence of the periodic liveness line. Thirty seconds — one slot at the
-/// production cadence — is often enough that an operator tailing the log sees
-/// the state within a slot, and quiet enough that a long stall does not bury
-/// the rest of the log under itself.
-const HEALTH_LINE_INTERVAL_MS: u64 = 30_000;
-
-/// Turns the stream of [`rpc::Health`] verdicts into the few log lines an
-/// operator actually needs: a periodic STALL line while stalled, a periodic
-/// sync-progress line while catching up, one RECOVERED line on the
-/// transition back, and *nothing* while healthy.
-///
-/// # Why this exists as a type
-///
-/// The single worst property of the post-replay stall was that a stalled
-/// node was **silent**: RPC answering, peers connected, and not one log line
-/// to distinguish "slow" from "dead" — an operator had to shell in and watch
-/// a file not grow for 75 seconds. The slot loop already wakes at least
-/// every 500ms whether or not anything arrives, so it is the one place
-/// guaranteed to keep running while the rest of the node is wedged
-/// elsewhere; this reporter is what it says when it wakes. It is a struct
-/// and not inline loop code so the cadence and edge-transitions are testable
-/// without running a node.
-struct HealthReporter {
-    last_line_ms: u64,
-    was_stalled: bool,
-}
-
-impl HealthReporter {
-    fn new(now_ms: u64) -> Self {
-        // Seeded with the boot time so the first line waits a full interval:
-        // a node that boots behind and starts syncing immediately should not
-        // open its log with an alarm.
-        HealthReporter { last_line_ms: now_ms, was_stalled: false }
-    }
-
-    /// The line to print now, if any. Pure in its inputs; the caller owns
-    /// the clock and the printing.
-    fn tick(&mut self, now_ms: u64, h: &rpc::Health, head_slot: u64, wall_slot: u64) -> Option<String> {
-        let due = now_ms.saturating_sub(self.last_line_ms) >= HEALTH_LINE_INTERVAL_MS;
-        if h.stalled {
-            if !due {
-                return None;
-            }
-            self.last_line_ms = now_ms;
-            self.was_stalled = true;
-            return Some(format!(
-                "[health] STALLED: head at slot {head_slot} is {} slots behind wall slot \
-                 {wall_slot} and no block has been applied for {}s. The node is NOT making \
-                 progress — peers and RPC being up does not mean it is syncing. If this line \
-                 repeats, restart the node and capture the data dir first.",
-                h.behind_by_slots,
-                h.ms_since_last_applied / 1000,
-            ));
-        }
-        if self.was_stalled {
-            // The recovery edge is announced immediately, not on the
-            // interval: the operator watching a stall needs the all-clear
-            // the moment it is true.
-            self.last_line_ms = now_ms;
-            self.was_stalled = false;
-            return Some(format!(
-                "[health] recovered: applying blocks again ({} slots behind wall slot {wall_slot})",
-                h.behind_by_slots,
-            ));
-        }
-        if h.syncing {
-            if !due {
-                return None;
-            }
-            self.last_line_ms = now_ms;
-            return Some(format!(
-                "[health] syncing: head at slot {head_slot}, {} slots behind wall slot \
-                 {wall_slot}, last block applied {}s ago",
-                h.behind_by_slots,
-                h.ms_since_last_applied / 1000,
-            ));
-        }
-        None
-    }
-}
-
-/// Export the boundary-state snapshot of one publication epoch from a
-/// replayed engine: `<out>` gets the `state_sync` file form (boundary
-/// envelope + canonical state body), and the printed state root is what a
-/// `ws-checkpoint` derivation for the same epoch must carry.
-///
-/// The candidate was captured during replay (the head's post-state while the
-/// head was still before the epoch's first slot); it must name exactly
-/// `checkpoint_root(epoch)` or the replay reorganised across the boundary
-/// and the export refuses rather than writing a state no checkpoint pins.
-fn export_state_snapshot(
-    engine: &Engine,
-    epoch: u64,
-    out: &Path,
-    candidate: Option<([u8; 32], Arc<CommittedState>)>,
-) -> io::Result<()> {
-    let bad = |m: String| io::Error::new(io::ErrorKind::InvalidData, m);
-    let first = first_slot_of_epoch(epoch)
-        .ok_or_else(|| bad(format!("epoch {epoch} has no first slot (overflow)")))?;
-    if engine.state.slot() < first {
-        return Err(bad(format!(
-            "the local chain (head slot {}) has not reached epoch {epoch} (first slot {first}); \
-             nothing to export",
-            engine.state.slot()
-        )));
-    }
-    let boundary = engine.checkpoint_root(epoch);
-    let Some((cid, st)) = candidate else {
-        return Err(bad(
-            "no pre-boundary block was replayed — the boundary is the genesis block, whose \
-             state every node derives from the manifest without a snapshot"
-            .into(),
-        ));
-    };
-    if cid != boundary {
-        return Err(bad(
-            "the replayed candidate does not match the canonical boundary block (a reorg \
-             crossed the boundary during replay); re-run against a settled log"
-                .into(),
-        ));
-    }
-    let env = engine.blocks.get(&boundary).cloned().ok_or_else(|| {
-        bad("boundary block is not stored (genesis is synthesized and cannot be exported)".into())
-    })?;
-    let fin = engine.state.finality();
-    if epoch > fin.finalized.epoch {
-        eprintln!(
-            "WARNING: epoch {epoch} is beyond this node's finalized epoch {} — the exported \
-             boundary could still reorganise. A published checkpoint must only ever pin a \
-             finalized epoch.",
-            fin.finalized.epoch
-        );
-    }
-    let body = st.snapshot_serialize();
-    let file = state_sync::encode_snapshot_file(&env, &body);
-    fs::write(out, &file)?;
-    println!(
-        "exported epoch-{epoch} boundary state: block {} (slot {}), state root {}, {} bytes → {}",
-        crate::codec::hex8(&boundary),
-        env.header.slot,
-        crate::codec::hex32(&env.header.state_root),
-        file.len(),
-        out.display(),
-    );
-    println!(
-        "a ws-checkpoint derived for epoch {epoch} must carry exactly this block root and \
-         state root; a node boots from the file with --ws-checkpoint <envelope> \
-         --state-snapshot <this file>"
-    );
-    Ok(())
-}
-
-/// Boot-time chunked, resumable download of the checkpoint's state from
-/// peers, over whichever transport the node runs.
-///
-/// Requests go out as engine frames (`net::get_state_frame`): the devnet mesh
-/// broadcasts them (any holder answers; duplicates dedup by chunk index), the
-/// libp2p stack directs them at the best-known peers. Responses come back on
-/// the ordinary engine channel; everything that is not a state-sync answer is
-/// dropped here, because the node deliberately performs no duty and applies
-/// no block until it stands on a verified state (those blocks re-arrive via
-/// ordinary sync afterwards).
-///
-/// Progress survives restarts: chunks land in
-/// `<data-dir>/statesync/<root>.part` at their final offsets and are
-/// re-hashed against the manifest on resume. Nothing a peer sends is
-/// believed: a chunk mismatching the manifest hash is dropped; the assembled
-/// artifact must still pass `state_sync::import`'s full verification chain,
-/// and an artifact that fails it is destroyed and re-fetched (from whoever
-/// answers first the next round), bounded by an attempt cap.
-fn download_snapshot(
-    net: &net::Net,
-    rx: &mpsc::Receiver<EngineEvent>,
-    inflight: &Arc<std::sync::atomic::AtomicUsize>,
-    data_dir: &Path,
-    genesis: &CommittedState,
-    cp: &WeakSubjectivityCheckpoint,
-) -> io::Result<(CommittedState, BlockEnvelope, Vec<u8>)> {
-    const ROUND: Duration = Duration::from_secs(5);
-    const OVERALL: Duration = Duration::from_secs(6 * 3600);
-    const PIPELINE: usize = 8;
-    const MAX_REFUSED_ARTIFACTS: u32 = 3;
-
-    println!(
-        "checkpoint-sync: downloading the epoch-{} state (root {}) from peers…",
-        cp.epoch,
-        crate::codec::hex8(&cp.state_root),
-    );
-    let started = Instant::now();
-    let mut download: Option<state_sync::Download> = None;
-    let mut refused = 0u32;
-    let mut last_report = Instant::now();
-    loop {
-        if started.elapsed() > OVERALL {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "checkpoint-sync: no peer served the snapshot within the deadline; the partial \
-                 download is kept and resumes on the next start",
-            ));
-        }
-        // (Re-)issue requests for whatever is still missing. Idempotent and
-        // periodic, so a lost frame or a silent peer costs one round, not the
-        // download.
-        match &download {
-            None => net.broadcast(net::get_state_frame(&StateSyncRequest::Manifest {
-                state_root: cp.state_root,
-            })),
-            Some(d) => {
-                for index in d.missing(PIPELINE) {
-                    net.broadcast(net::get_state_frame(&StateSyncRequest::Chunk {
-                        state_root: cp.state_root,
-                        index,
-                    }));
-                }
-            }
-        }
-        let round_end = Instant::now() + ROUND;
-        loop {
-            let left = round_end.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                break;
-            }
-            let ev = match rx.recv_timeout(left) {
-                Ok(ev) => ev,
-                Err(mpsc::RecvTimeoutError::Timeout) => break,
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "network channel closed"))
-                }
-            };
-            // Same bookkeeping as the slot loop: the devnet transport counts
-            // every Net event into `inflight` and sheds at the cap, so a
-            // download that consumed events without releasing them would
-            // shed its own chunks.
-            if matches!(ev, EngineEvent::Net(_)) {
-                inflight.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-            }
-            let EngineEvent::Net(NetEvent::StateSync(resp)) = ev else {
-                continue; // blocks/attestations re-arrive via ordinary sync later
-            };
-            match resp {
-                m @ StateSyncResponse::Manifest { .. } => {
-                    let StateSyncResponse::Manifest { state_root, total_len, .. } = &m else {
-                        unreachable!()
-                    };
-                    if *state_root != cp.state_root || download.is_some() {
-                        continue;
-                    }
-                    match state_sync::Download::open(data_dir, &m) {
-                        Ok(d) => {
-                            let (done, total) = d.done_count();
-                            println!(
-                                "checkpoint-sync: manifest — {total_len} bytes in {total} chunks \
-                                 ({done} already on disk)"
-                            );
-                            download = Some(d);
-                            break; // go request chunks immediately
-                        }
-                        Err(e) => {
-                            eprintln!("checkpoint-sync: refusing a peer's manifest: {e}")
-                        }
-                    }
-                }
-                StateSyncResponse::Chunk { state_root, index, bytes } => {
-                    if state_root != cp.state_root {
-                        continue;
-                    }
-                    if let Some(d) = &mut download {
-                        if d.accept_chunk(index, &bytes)? && last_report.elapsed().as_secs() >= 2
-                        {
-                            let (done, total) = d.done_count();
-                            println!("checkpoint-sync: {done}/{total} chunks");
-                            last_report = Instant::now();
-                        }
-                    }
-                }
-                StateSyncResponse::Unavailable { state_root } => {
-                    if state_root == cp.state_root && download.is_none() {
-                        println!(
-                            "checkpoint-sync: a peer does not hold this snapshot; still asking"
-                        );
-                    }
-                }
-            }
-        }
-        if download.as_ref().is_some_and(|d| d.complete()) {
-            let mut d = download.take().expect("checked");
-            let bytes = d.take_bytes()?;
-            match state_sync::import(&bytes, genesis, cp) {
-                Ok((st, env)) => {
-                    d.destroy();
-                    println!(
-                        "checkpoint-sync: artifact verified — state root reproduces the \
-                         checkpoint's {}",
-                        crate::codec::hex8(&cp.state_root)
-                    );
-                    return Ok((st, env, bytes));
-                }
-                Err(e) => {
-                    // The whole artifact — and the manifest that shaped it —
-                    // was a lie or corrupt. Destroy and start clean.
-                    d.destroy();
-                    refused += 1;
-                    eprintln!("checkpoint-sync: assembled artifact REFUSED ({e}); refetching");
-                    if refused >= MAX_REFUSED_ARTIFACTS {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!(
-                                "checkpoint-sync: {refused} assembled artifacts failed \
-                                 verification against the checkpoint — either every reachable \
-                                 peer is serving a forgery or the checkpoint itself is wrong; \
-                                 refusing to keep trying blindly ({e})"
-                            ),
-                        ));
-                    }
-                }
-            }
-        }
-    }
-}
 
 pub fn run(cfg: Config) -> io::Result<()> {
     let (mut manifest, digest) = Manifest::load(&cfg.genesis_path)?;
@@ -3195,121 +2197,6 @@ pub fn run(cfg: Config) -> io::Result<()> {
         }
     }
 
-    // Slashing protection. A validator signs nothing until its signing
-    // history is open, bound to this key and this network, and writable.
-    // Missing or unreadable is a refusal to START, not a downgrade — a
-    // validator that silently signed blind would look healthy right up to
-    // the slashing. The one escape is `--accept-new-signing-history`, the
-    // operator's explicit, logged assertion that this key has never signed.
-    let guard = match keys.as_ref() {
-        None => None,
-        Some(k) => {
-            use crate::signing_history::SigningHistory;
-            let mut g = match SigningHistory::open(&cfg.data_dir) {
-                Ok(g) => g,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    if !cfg.accept_new_signing_history {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!(
-                                "{}/validator.key is present but {}/{} is not. Refusing to \
-                                 run a validator with no record of what its key has signed: \
-                                 if this key ever signed anywhere — another machine, a \
-                                 restored snapshot, a previous install — signing without \
-                                 that record is how validators equivocate and get slashed.\n\
-                                 - If the key HAS signed before: export its history where it \
-                                 ran (`bloch-pos protection-export`) and install it here \
-                                 (`bloch-pos protection-import`) before starting.\n\
-                                 - If the key has GENUINELY never signed on this network: \
-                                 start once with --accept-new-signing-history.",
-                                cfg.data_dir.display(),
-                                cfg.data_dir.display(),
-                                crate::signing_history::HISTORY_FILE,
-                            ),
-                        ));
-                    }
-                    eprintln!(
-                        "########################################################################\n\
-                         # --accept-new-signing-history: creating an EMPTY slashing-protection #\n\
-                         # history for this validator key. You are asserting this key has      #\n\
-                         # NEVER signed a proposal or attestation on this network — not on     #\n\
-                         # another machine, not before a snapshot restore, not anywhere. If    #\n\
-                         # that is wrong, this node can double-sign and the stake WILL be      #\n\
-                         # slashed. Drop the flag after this boot.                             #\n\
-                         ########################################################################"
-                    );
-                    SigningHistory::create_bound(&cfg.data_dir, &digest, &k.pubkey)?
-                }
-                Err(e) => {
-                    return Err(io::Error::new(
-                        e.kind(),
-                        format!(
-                            "cannot read {}/{}: {e}. Refusing to sign over an unreadable \
-                             signing history — repair or re-import it \
-                             (`bloch-pos protection-import`) rather than deleting it.",
-                            cfg.data_dir.display(),
-                            crate::signing_history::HISTORY_FILE,
-                        ),
-                    ));
-                }
-            };
-            g.bind(&digest, &k.pubkey)?;
-            println!(
-                "slashing protection: {} (proposal watermark {}, attestation watermark {})",
-                cfg.data_dir.join(crate::signing_history::HISTORY_FILE).display(),
-                g.highest_proposed_slot()
-                    .map_or("none".to_string(), |n| format!("slot {n}")),
-                g.attestation_watermark()
-                    .map_or("none".to_string(), |(s, t)| format!(
-                        "source e{s}, target e{t}"
-                    )),
-            );
-            Some(g)
-        }
-    };
-
-    // The doppelganger watch (see [`Doppelganger`]). Armed for a validator
-    // joining a chain that is already running; skipped at wall slot 0, where
-    // no history exists in which a twin could already have signed.
-    let doppelganger = match keys.as_ref() {
-        None => None,
-        Some(k) => {
-            let boot_slot =
-                now_ms().saturating_sub(manifest.genesis_time_ms) / manifest.slot_ms.max(1);
-            if cfg.doppelganger_epochs == 0 {
-                eprintln!(
-                    "doppelganger watch DISABLED (--doppelganger-epochs 0): if validator \
-                     {}'s key is live on another machine, nothing here will notice before \
-                     the equivocation",
-                    k.index
-                );
-                None
-            } else if boot_slot == 0 {
-                println!(
-                    "doppelganger watch skipped: booting at the chain's slot 0, where no \
-                     history exists in which this key could already be signing"
-                );
-                None
-            } else {
-                // Two slots of margin, mirroring the boot grace: a signature
-                // our own previous life released in the boot slot must not
-                // read as a twin.
-                let from = boot_slot + 2;
-                let until = from + cfg.doppelganger_epochs * bloch_pos_committee::SLOTS_PER_EPOCH;
-                println!(
-                    "doppelganger watch: silent until slot {until}, listening for validator \
-                     {} signing elsewhere (slots {from}..{until}; --doppelganger-epochs {})",
-                    k.index, cfg.doppelganger_epochs
-                );
-                Some(Doppelganger {
-                    watch_from_slot: from,
-                    silent_until_slot: until,
-                    alarm: None,
-                })
-            }
-        }
-    };
-
     let store = Store::open(&cfg.data_dir, &digest)?;
     let genesis_state = manifest.genesis_state();
     let genesis_id = manifest.genesis_id();
@@ -3348,17 +2235,6 @@ pub fn run(cfg: Config) -> io::Result<()> {
             }
         });
     }
-    // Peer clock samples for the boot gate below. Created before the
-    // transports so the very first connections can already answer the time
-    // probe; by the time replay finishes the samples are simply there.
-    let peer_clock = Arc::new(crate::time_check::PeerClock::new());
-    // Live connection gauge for the observability surface; written by the
-    // transport threads, read by `/metrics` and `getvalidatorstatus`.
-    let peers_connected = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let peers_configured = match cfg.transport {
-        Transport::Devnet => cfg.peers.len(),
-        Transport::Libp2p => cfg.p2p_peers.len(),
-    };
     let net = match cfg.transport {
         Transport::Devnet => net::Net::Devnet(net::start(
             &cfg.listen_addr,
@@ -3368,8 +2244,6 @@ pub fn run(cfg: Config) -> io::Result<()> {
             cfg.data_dir.clone(),
             head_slot.clone(),
             inflight.clone(),
-            peer_clock.clone(),
-            peers_connected.clone(),
         )?),
         Transport::Libp2p => {
             let parse = |s: &str, what: &str| -> io::Result<crate::p2p::Multiaddr> {
@@ -3398,8 +2272,6 @@ pub fn run(cfg: Config) -> io::Result<()> {
                 },
                 net_tx,
                 head_slot.clone(),
-                peer_clock.clone(),
-                peers_connected.clone(),
             )?;
             println!("p2p: node identity {}", handle.peer_id);
             net::Net::Libp2p(handle)
@@ -3412,8 +2284,6 @@ pub fn run(cfg: Config) -> io::Result<()> {
         tr_probe: Transition::new(ProbeVerifier),
         verifier,
         keys,
-        guard,
-        doppelganger,
         blocks: BTreeMap::new(),
         chain: vec![(0, genesis_id)],
         canonical: BTreeSet::from([*genesis_id.as_bytes()]),
@@ -3433,53 +2303,8 @@ pub fn run(cfg: Config) -> io::Result<()> {
         ws_anchor_hard: false,
         ws_conflict_reported: false,
         fc_covered_removals: 0,
-        max_propose_lag_slots: cfg.max_propose_lag_slots,
-        peers_connected: peers_connected.clone(),
-        peers_configured,
-        attestations_signed: 0,
-        proposals_signed: 0,
-        duties_refused: 0,
-        base: BaseState::Genesis,
-        sync_base: None,
-        last_boundary_export: None,
         manifest,
     };
-    if let Some(margin) = cfg.max_propose_lag_slots {
-        // Armed is a fleet decision, not a default — say so where the
-        // operator who armed it will see it. The full argument is on the
-        // gate in `propose`.
-        println!(
-            "proposal-lag gate ARMED: this node declines its proposal duty when its head \
-             is more than {margin} slots behind the wall clock. If the WHOLE network halts \
-             for longer than that, armed nodes cannot restart it — disarm before recovering \
-             from a full outage."
-        );
-    }
-
-    // ── Checkpoint-sync restart: a previously installed snapshot base ──
-    //
-    // Re-verified IN FULL on every boot against the checkpoint persisted in
-    // `ws_latest.bin` — the data dir gets no more trust here than blocks.log
-    // gets from replay. Only after the whole import chain passes (block id,
-    // header root, recomputed state root) does the engine's history begin at
-    // the boundary instead of genesis; the log replay below then extends it.
-    {
-        let installed = cfg.data_dir.join(crate::state_sync::INSTALLED_SNAPSHOT);
-        if installed.is_file() {
-            let network_id = crate::ws_boot::network_id_of(&digest);
-            let cp = crate::ws_boot::load_latest(&cfg.data_dir, network_id, genesis_id.as_bytes())?
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "state.snap exists but ws_latest.bin does not: the installed snapshot                          has no checkpoint to verify against. Restore ws_latest.bin or move                          the data dir aside and re-sync.",
-                    )
-                })?;
-            let bytes = fs::read(&installed)?;
-            let genesis_state = engine.manifest.genesis_state();
-            let (st, env) = state_sync::import(&bytes, &genesis_state, &cp)?;
-            engine.install_snapshot(st, env, &cp, None)?;
-        }
-    }
 
     // ── Replay: restart returns to the same state, by re-running the same
     // transition over the same inputs. ──
@@ -3502,20 +2327,8 @@ pub fn run(cfg: Config) -> io::Result<()> {
     }
     let replay_started = std::time::Instant::now();
     let mut last_report = replay_started;
-    // Export mode: while the head is still before the target epoch's first
-    // slot, the current head is a candidate boundary block — the last update
-    // before the head crosses is the boundary itself. An `Arc`, not a copy.
-    let export_first_slot = cfg
-        .export_state_epoch
-        .and_then(first_slot_of_epoch);
-    let mut export_candidate: Option<([u8; 32], Arc<CommittedState>)> = None;
     for (i, env) in logged.into_iter().enumerate() {
         engine.ingest(env);
-        if let Some(first) = export_first_slot {
-            if engine.state.slot() < first && engine.chain.len() > 1 {
-                export_candidate = Some((*engine.head_id().as_bytes(), engine.state.arc()));
-            }
-        }
         // Time-based, not every-N-blocks: block cost varies by an order of
         // magnitude with how many transactions a block carries, so a fixed
         // count reports in bursts and then goes quiet exactly when the work is
@@ -3549,73 +2362,6 @@ pub fn run(cfg: Config) -> io::Result<()> {
         .head_slot
         .store(engine.state.slot(), Ordering::Relaxed);
 
-    // ── Export mode: write the boundary snapshot and exit ──
-    if let Some(epoch) = cfg.export_state_epoch {
-        let out = cfg.export_state_out.clone().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "--export-state-epoch needs --export-state-out")
-        })?;
-        return export_state_snapshot(&engine, epoch, &out, export_candidate);
-    }
-
-    // ── Clock sanity: does this host agree with its peers about now? ──
-    //
-    // MUST run before the weak-subjectivity gate below, because that gate's
-    // `wall_epoch` is computed from the host clock and the host clock is the
-    // ONLY attacker-influenceable input to the boot decision (the 2026-08-31
-    // audit finding, rated HIGH). Roll a fresh node's clock back toward
-    // genesis and `anchor_age == wall_epoch` re-enters the launch trust-once
-    // window: the node boots with no checkpoint at all and syncs whatever
-    // history its peers offer — and one bad boot is permanent, because the
-    // first finalized epoch on the forged chain flips `has_local_finality`
-    // and every later boot is `Resume`. The same rollback saturates
-    // `anchor_age` to 0 below a stale anchor's epoch, so freshness dies too.
-    //
-    // **Node-local policy**: this changes when the node refuses to START,
-    // never what it accepts — no block, attestation or checkpoint becomes
-    // valid or invalid here, so differing margins cannot fork (the 2026-08-08
-    // `expected_bits` lesson does not apply). See `time_check.rs` for the
-    // margin argument, the bootstrap trade-off and what a hostile peer
-    // majority can and cannot do to this check.
-    {
-        let configured = match cfg.transport {
-            Transport::Devnet => cfg.peers.len(),
-            Transport::Libp2p => cfg.p2p_peers.len(),
-        };
-        if configured == 0 {
-            // A genuinely isolated node (the first node of a network, a
-            // single-node devnet) has nothing to compare against and MUST
-            // still be startable — refusing here would make bootstrap
-            // impossible. The cost is stated where it is paid: below, in the
-            // no-answers branch, which is the adversarial flavor of this case.
-            println!(
-                "clock check: no peers configured — nothing to compare the local clock against; weak-subjectivity freshness rests on this host's clock alone."
-            );
-        } else {
-            let want = configured.min(crate::time_check::TARGET_SAMPLES);
-            let n = peer_clock.wait_for(want, crate::time_check::SAMPLE_WAIT);
-            let named = peer_clock.skews();
-            let skews: Vec<i64> = named.iter().map(|(_, s)| *s).collect();
-            let margin = crate::time_check::margin_ms(engine.manifest.slot_ms);
-            match crate::time_check::gate(&skews, margin) {
-                crate::time_check::ClockVerdict::Ok { median_ms, samples } => println!(
-                    "clock check: median skew {:+.1} s against {samples} peer(s) — within the ±{:.1} s margin (half an epoch).",
-                    median_ms as f64 / 1000.0,
-                    margin as f64 / 1000.0,
-                ),
-                crate::time_check::ClockVerdict::Refuse { median_ms, samples } => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        crate::time_check::refusal_message(median_ms, samples, margin, &named),
-                    ));
-                }
-                crate::time_check::ClockVerdict::NoSamples => eprintln!(
-                    "WARNING: {configured} peer(s) configured but none answered the time probe within {}s (got {n}). Either they run a build without the clock-check wire frames, or something is withholding answers. THE CLOCK CHECK IS DOWN: every weak-subjectivity boot decision below rests on this host's unverified clock — the exact condition the check exists to catch. Verify NTP sync on this host before trusting a fresh sync from these peers.",
-                    crate::time_check::SAMPLE_WAIT.as_secs(),
-                ),
-            }
-        }
-    }
-
     // ── Weak subjectivity: may the node sync at all? (§4.2) ──
     //
     // Runs AFTER replay, because the question the boot decision asks — how old
@@ -3630,8 +2376,8 @@ pub fn run(cfg: Config) -> io::Result<()> {
     // and the age compared against the window must be measured on the same
     // clock the node's own epochs are numbered by. The NTP caveat of §1
     // applies here verbatim — a clock set backward makes a stale node look
-    // fresh — which is why the clock-vs-peer-time gate above runs FIRST.
-    let anchor_checkpoint: WeakSubjectivityCheckpoint = {
+    // fresh.
+    {
         let genesis_ms = engine.manifest.genesis_time_ms;
         let slot_ms = engine.manifest.slot_ms;
         let wall_slot = now_ms().saturating_sub(genesis_ms) / slot_ms;
@@ -3684,61 +2430,8 @@ pub fn run(cfg: Config) -> io::Result<()> {
                 engine.ws_anchor = Some((ws.anchor_epoch, ws.anchor_root));
                 engine.ws_anchor_hard = ws.anchor_is_hard;
                 engine.enforce_ws_anchor();
-                ws.checkpoint
             }
             Err(msg) => return Err(io::Error::new(io::ErrorKind::PermissionDenied, msg)),
-        }
-    };
-
-    // ── Checkpoint-sync acquisition (§4.3.2): make the anchor a sync
-    //    STARTING POINT, not only a floor. ──
-    //
-    // Runs after the gate, so only a checkpoint the gate admitted (verified
-    // quorum, anti-rollback, cross-checked against own finality) can name the
-    // state to fetch — and before the RPC and the slot loop, so the node
-    // never performs a duty or answers a query from a state it is still
-    // assembling. The genesis anchor is excluded: a node inside the first
-    // window needs nothing beyond genesis, and "download the genesis state"
-    // is replay with extra steps.
-    {
-        use bloch_pos_committee::ws::WS_GENESIS_SIGNER_SET_ID;
-        let cp = &anchor_checkpoint;
-        let wants_state = engine.sync_base.is_none()
-            && cp.signer_set_id != WS_GENESIS_SIGNER_SET_ID
-            && cp.epoch > epoch_of(engine.state.slot())
-            && !engine.canonical.contains(&cp.block_root);
-        if wants_state {
-            if let Some(path) = &cfg.state_snapshot {
-                let bytes = fs::read(path)?;
-                let genesis_state = engine.manifest.genesis_state();
-                let (st, env) = state_sync::import(&bytes, &genesis_state, cp)?;
-                engine.install_snapshot(st, env, cp, Some(&bytes))?;
-            } else if cfg.state_sync {
-                let genesis_state = engine.manifest.genesis_state();
-                let (st, env, bytes) = download_snapshot(
-                    &engine.net,
-                    &rx,
-                    &inflight,
-                    &cfg.data_dir,
-                    &genesis_state,
-                    cp,
-                )?;
-                engine.install_snapshot(st, env, cp, Some(&bytes))?;
-            } else {
-                println!(
-                    "checkpoint-sync: this node is anchored at epoch {} but its local head is \
-                     at epoch {} — it will replay every block from genesis to get there. Pass \
-                     --state-sync to download the checkpoint's verified state from peers, or \
-                     --state-snapshot <file> to start from a local artifact.",
-                    cp.epoch,
-                    epoch_of(engine.state.slot()),
-                );
-            }
-        } else if cfg.state_snapshot.is_some() && engine.sync_base.is_none() {
-            println!(
-                "checkpoint-sync: --state-snapshot ignored — the anchor does not call for a \
-                 state download (genesis anchor, or local history already reaches it)"
-            );
         }
     }
 
@@ -3787,8 +2480,6 @@ pub fn run(cfg: Config) -> io::Result<()> {
     let mut last_attested: u64 = engine.state.slot();
     let mut last_built: u64 = engine.state.slot();
     let mut last_sync_req: u64 = 0;
-    let mut health_report = HealthReporter::new(now_ms());
-    let mut dopp_clear_announced = false;
 
     loop {
         let now = now_ms();
@@ -3824,26 +2515,6 @@ pub fn run(cfg: Config) -> io::Result<()> {
             }
         }
 
-        // Doppelganger watch: a raised alarm ends the process — signing
-        // again from here is exactly the accident the watch exists to stop,
-        // and a process that keeps running is a process someone will forget
-        // is refusing its duties.
-        if let Some(msg) = engine.doppelganger_alarm() {
-            return Err(io::Error::new(io::ErrorKind::Other, msg.to_string()));
-        }
-        if !dopp_clear_announced {
-            if let Some(d) = &engine.doppelganger {
-                if slot >= d.silent_until_slot {
-                    println!(
-                        "doppelganger watch clear at slot {slot}: no other signer for this \
-                         key was seen in slots {}..{}; duties enabled",
-                        d.watch_from_slot, d.silent_until_slot
-                    );
-                    dopp_clear_announced = true;
-                }
-            }
-        }
-
         // Boot grace: give the mesh one round of sync before performing
         // duties, so a restarted proposer does not build on a stale head.
         let in_grace = now.saturating_sub(engine.booted_ms) < 2 * slot_ms;
@@ -3856,32 +2527,6 @@ pub fn run(cfg: Config) -> io::Result<()> {
         if !in_grace && now >= propose_at && slot > last_built {
             engine.propose(slot);
             last_built = slot;
-        }
-
-        // ── Liveness self-report ──
-        //
-        // Runs on the slot loop because the slot loop is the thread that
-        // provably keeps waking (recv_timeout ≤ 500ms) even while the rest
-        // of the node is wedged: in the measured post-replay stall the
-        // engine thread still answered RPC, so it still reaches this line —
-        // and a node that is behind and not advancing SAYS SO instead of
-        // logging nothing for hours. The verdict is `Engine::health`, the
-        // same one `getchaininfo` serves, so the log and the RPC never
-        // disagree about whether this node is making progress.
-        {
-            let h = rpc::Health::assess(
-                slot,
-                engine.state.slot(),
-                now.saturating_sub(engine.last_applied_ms),
-                slot_ms,
-            );
-            if let Some(line) = health_report.tick(now, &h, engine.state.slot(), slot) {
-                if h.stalled {
-                    eprintln!("{line}");
-                } else {
-                    println!("{line}");
-                }
-            }
         }
 
         // Sync when behind or when a stored branch has holes. Rate-limited;
@@ -3925,11 +2570,6 @@ pub fn run(cfg: Config) -> io::Result<()> {
                             // Gossip has nobody to answer to; the verdict is the
                             // RPC's concern, not a peer's.
                             let _ = engine.on_transaction(tx);
-                        }
-                        EngineEvent::Net(NetEvent::StateSync(_)) => {
-                            // A state-sync answer outside the boot download
-                            // loop: late, duplicated, or unsolicited. The
-                            // node's state does not come from here — drop it.
                         }
                         EngineEvent::Rpc(call) => {
                             let result = engine.serve_rpc(call.req);
@@ -5179,8 +3819,6 @@ mod transfer_v2_end_to_end {
                 dir.clone(),
                 head_slot.clone(),
                 inflight,
-                Arc::new(crate::time_check::PeerClock::new()),
-                Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             )
             .expect("bind the devnet transport on an ephemeral port"),
         );
@@ -5192,8 +3830,6 @@ mod transfer_v2_end_to_end {
             tr_probe: Transition::new(ProbeVerifier),
             verifier,
             keys: None,
-            guard: None,
-            doppelganger: None,
             blocks: BTreeMap::new(),
             chain: vec![(0, genesis_id)],
             canonical: BTreeSet::from([*genesis_id.as_bytes()]),
@@ -5213,15 +3849,6 @@ mod transfer_v2_end_to_end {
             ws_anchor_hard: false,
             ws_conflict_reported: false,
             fc_covered_removals: 0,
-            max_propose_lag_slots: None,
-            peers_connected: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            peers_configured: 0,
-            attestations_signed: 0,
-            proposals_signed: 0,
-            duties_refused: 0,
-            base: BaseState::Genesis,
-            sync_base: None,
-            last_boundary_export: None,
         }
     }
 
@@ -5443,15 +4070,6 @@ mod perf_support {
     /// the slot as an argument and read no clock — so the manifest's cadence
     /// is set to something plausible and then not depended upon.
     pub(super) fn proposing_engine() -> (Engine, TestDir) {
-        proposing_engine_funded(&[])
-    }
-
-    /// The same engine, opening with a ledger — for the tests whose claim is
-    /// about what happens (or must not happen) to the eUTXO map. On an empty
-    /// map "no copies" is vacuous; on a funded one it is the catch-up fix.
-    pub(super) fn proposing_engine_funded(
-        opening: &[bloch_pos_committee::state_root::EutxoEntry],
-    ) -> (Engine, TestDir) {
         static DIR_SEQ: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
             "bloch-pos-perf-{}-{}",
@@ -5476,7 +4094,7 @@ mod perf_support {
             cohort: Vec::new(),
             carryover: None,
             allocations: Vec::new(),
-            carryover_entries: opening.to_vec(),
+            carryover_entries: Vec::new(),
         };
         let genesis_id = manifest.genesis_id();
         let state = manifest.genesis_state();
@@ -5493,17 +4111,10 @@ mod perf_support {
                 dir.clone(),
                 head_slot.clone(),
                 inflight,
-                Arc::new(crate::time_check::PeerClock::new()),
-                Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             )
             .expect("bind the devnet transport on an ephemeral port"),
         );
         let verifier = HybridVerifier::new(manifest.pubkeys());
-        // The signing engine's invariant: a keystore never signs without its
-        // slashing-protection store (the fixture's key is newborn, so the
-        // empty history is the true one).
-        let guard = crate::signing_history::SigningHistory::create_unbound(&dir, &ks.pubkey)
-            .expect("create the signing-history store");
         let engine = Engine {
             manifest,
             state: StateCell::new(state),
@@ -5511,8 +4122,6 @@ mod perf_support {
             tr_probe: Transition::new(ProbeVerifier),
             verifier,
             keys: Some(ks),
-            guard: Some(guard),
-            doppelganger: None,
             blocks: BTreeMap::new(),
             chain: vec![(0, genesis_id)],
             canonical: BTreeSet::from([*genesis_id.as_bytes()]),
@@ -5538,15 +4147,6 @@ mod perf_support {
             // offset the very first comparison against a pool that really is
             // empty.
             fc_covered_removals: 0,
-            max_propose_lag_slots: None,
-            peers_connected: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            peers_configured: 0,
-            attestations_signed: 0,
-            proposals_signed: 0,
-            duties_refused: 0,
-            base: BaseState::Genesis,
-            sync_base: None,
-            last_boundary_export: None,
         };
         (engine, TestDir(dir))
     }
@@ -5655,16 +4255,6 @@ mod bench {
 
     /// The Genesis-3 carryover's output count, per `CARRYOVER-SNAPSHOT.md`.
     const MAINNET_EUTXOS: u32 = 452_133;
-
-    /// A fixed healthy verdict for the `chain_info_json` benches: the health
-    /// object is a handful of integer fields either way, so its value is
-    /// irrelevant to what these measure.
-    const HEALTHY: crate::rpc::Health = crate::rpc::Health {
-        behind_by_slots: 0,
-        ms_since_last_applied: 0,
-        syncing: false,
-        stalled: false,
-    };
 
     fn mainnet_sized_state(n: u32) -> CommittedState {
         let entries: Vec<EutxoEntry> = (0..n)
@@ -5844,14 +4434,14 @@ mod bench {
         let before = |st: &CommittedState| -> u128 {
             let t = Instant::now();
             let root = st.state_root();
-            let v = crate::rpc::chain_info_json(st, &head, root, 0, Some(0), 0, &HEALTHY, 1, 0, 1);
+            let v = crate::rpc::chain_info_json(st, &head, root, 0, Some(0), 0, 1, 0, 1);
             let us = t.elapsed().as_micros();
             std::hint::black_box(v);
             us
         };
         let after = |st: &CommittedState| -> u128 {
             let t = Instant::now();
-            let v = crate::rpc::chain_info_json(st, &head, header_root, 0, Some(0), 0, &HEALTHY, 1, 0, 1);
+            let v = crate::rpc::chain_info_json(st, &head, header_root, 0, Some(0), 0, 1, 0, 1);
             let us = t.elapsed().as_micros();
             std::hint::black_box(v);
             us
@@ -5891,10 +4481,10 @@ mod bench {
         // Byte-identical, which is what makes this transport-only. Asserted
         // rather than printed: a bench that quietly changed the answer would
         // be measuring the wrong thing to begin with.
-        let a = crate::rpc::chain_info_json(&st, &head, header_root, 0, Some(0), 0, &HEALTHY, 1, 0, 1);
+        let a = crate::rpc::chain_info_json(&st, &head, header_root, 0, Some(0), 0, 1, 0, 1);
         let b = {
             let root = st.state_root();
-            crate::rpc::chain_info_json(&st, &head, root, 0, Some(0), 0, &HEALTHY, 1, 0, 1)
+            crate::rpc::chain_info_json(&st, &head, root, 0, Some(0), 0, 1, 0, 1)
         };
         assert_eq!(
             a.to_string(),
@@ -6072,69 +4662,6 @@ mod bench {
             median(rolls)
         );
     }
-
-    /// **The catch-up regime, measured.** A node `gap` epochs behind the wall
-    /// clock re-derives `rolled_to(wall_epoch)` after every applied block,
-    /// because applying a block bumps the state generation and empties the
-    /// memo. The number that decides whether such a node can catch up is the
-    /// cost of that one re-roll — `gap` × `process_epoch` — paid per block,
-    /// against a 30 s slot.
-    ///
-    /// Sized at the Genesis-4 carryover's own output count so the figure is
-    /// the fleet's. `cargo test --release -p bloch-pos-node -- --ignored
-    /// --nocapture bench_catch_up_roll`.
-    ///
-    /// MEASURED 2026-08-31 (macOS/x86_64, `--release`, box under load — the
-    /// counts are exact, the times are indicative):
-    ///
-    /// BEFORE the eUTXO map was shared, the primitives on this same state
-    /// were clone ≈ 204 ms and `process_epoch` ≈ 369 ms (the clone is inside
-    /// it), 65 MB RSS per unshared state — so one re-roll cost the gap times
-    /// that, per applied block: gap 4 ≈ 1.7 s, gap 15 ≈ 5.8 s, gap 100
-    /// ≈ 37 s (past the 30 s slot), gap 1550 ≈ 9.5 min and ~93 GB transient
-    /// — unrunnable on this 16 GB machine, which is the fleet's cold-start
-    /// death reproduced as an OOM instead of a stall. Map copies per block
-    /// = the gap, by construction.
-    ///
-    /// AFTER: clone ≈ 0 µs, `process_epoch` ≈ 3 µs, rolled states share the
-    /// ledger (~0 MB each). The re-roll per applied block measured gap 1 =
-    /// 6 µs, gap 4 = 14 µs, gap 15 = 82 µs, gap 100 = 842 µs, gap 1550 =
-    /// 81 ms — and ZERO map copies at every gap. The catch-up bound moves
-    /// from `gap × ~0.37 s + t_apply < 30 s` (breaks near gap ≈ 6–10 on
-    /// fleet hardware) to `gap × ~50 µs + t_apply < 30 s`, with memory flat
-    /// at `MEMO_CAP` ledger-sharing entries instead of `gap × 60 MB`.
-    #[test]
-    #[ignore]
-    fn bench_catch_up_roll() {
-        let st = mainnet_sized_state(MAINNET_EUTXOS);
-        let tr = Transition::new(ProbeVerifier);
-        let head = epoch_of(st.slot());
-        for gap in [1u64, 4, 15, 100, 1550] {
-            let mut cell = StateCell::new(st.clone());
-            let mut samples = Vec::new();
-            let copies_before = bloch_pos_committee::transition::eutxo_map_deep_copies();
-            // Three "applied blocks": each replaces the state (same content —
-            // the cost under measurement is the roll, not the apply) so the
-            // generation moves and the memo empties, exactly as `set` does on
-            // the live path. The timed call is what the first attestation
-            // after each block pays.
-            for _ in 0..3 {
-                cell.set((*cell.arc()).clone());
-                let t = Instant::now();
-                let out = cell.rolled_to(head + gap, |s| {
-                    tr.process_epoch(s).expect("infallible")
-                });
-                samples.push(t.elapsed().as_micros());
-                std::hint::black_box(&out);
-            }
-            let copies = bloch_pos_committee::transition::eutxo_map_deep_copies() - copies_before;
-            println!(
-                "gap {gap:>5} epochs: rolled_to after each of 3 applied blocks = \
-                 {samples:?} us (median {} us), eUTXO-map deep copies {copies}",
-                median(samples.clone())
-            );
-        }
-    }
 }
 
 /// **Win 1's proof.** The memoized rolled state must be the SAME STATE the
@@ -6293,100 +4820,6 @@ mod rolled_memo_tests {
             poison.state_root(),
             "an entry under the LIVE generation was not served, so the test above passed \
              because nothing reads the memo rather than because the key rejected the entry"
-        );
-    }
-
-    /// **The catch-up stall of 2026-08-31, reproduced and pinned shut.** A
-    /// node whose head lags the wall clock runs exactly this loop: apply a
-    /// block (which moves the generation and empties the memo), then judge
-    /// the next gossiped attestation, which calls `rolled_to(wall_epoch)` —
-    /// a fresh roll across the entire gap, every block, all the way up.
-    ///
-    /// Before the eUTXO map was shared, each of those rolls deep-copied the
-    /// full ledger once per epoch crossed (`close_epoch` starts with
-    /// `self.clone()`), so a block cost `gap` map copies — ~60 MB and tens
-    /// of milliseconds each at carryover scale — and eviction ran only after
-    /// the roll, so the roll transiently held `gap` whole states. The fleet's
-    /// measured break was a 6–10-epoch gap; a cold start (~1,550 epochs)
-    /// was unconditionally fatal.
-    ///
-    /// The claim that ends that regime, as assertions rather than timings:
-    /// over the same number of applied blocks, the number of full-map copies
-    /// is **the same at a trivial gap and at a deep one — and it is zero** —
-    /// and the memo's population never exceeds `MEMO_CAP` even immediately
-    /// after a roll much longer than the cap. The bit-identity check against
-    /// the uncached derivation is what makes "the roll still happened" a
-    /// fact and not an assumption: the rolled state at the far epoch equals
-    /// the one derived from scratch, on a funded ledger, so nothing was
-    /// skipped to make the counter read zero.
-    ///
-    /// With the copies gone, catch-up needs `gap × t_process_epoch + t_apply
-    /// < slot time` and `MEMO_CAP` small memo entries of memory — not
-    /// `gap × t_map_clone` and `gap × 60 MB`.
-    #[test]
-    fn a_node_far_behind_judges_the_wall_epoch_without_copying_the_ledger() {
-        use bloch_pos_committee::transition::eutxo_map_deep_copies;
-
-        // A funded ledger, so "zero copies" is a claim about real entries and
-        // not about an empty map.
-        let opening: Vec<bloch_pos_committee::state_root::EutxoEntry> = (0..256u32)
-            .map(|i| {
-                let mut txid = [0u8; 32];
-                txid[..4].copy_from_slice(&i.to_le_bytes());
-                bloch_pos_committee::state_root::EutxoEntry {
-                    txid,
-                    vout: 0,
-                    value: 1_000 + u64::from(i),
-                    script_hash: [7u8; 32],
-                }
-            })
-            .collect();
-
-        // 48 epochs is past the fleet's measured 6–10-epoch break AND well
-        // past MEMO_CAP, so the mid-roll eviction actually runs; 3 epochs is
-        // the gap the fleet survives. The regime being killed is "copies
-        // scale with the gap", so the assertion is equality across the two.
-        const BLOCKS: u64 = 10;
-        let mut copies_per_gap = Vec::new();
-        for gap in [3u64, 48] {
-            let (mut engine, _dir) = perf_support::proposing_engine_funded(&opening);
-            assert_eq!(
-                engine.state.utxos().count(),
-                opening.len(),
-                "fixture: the opening ledger must actually be in the state"
-            );
-            let before = eutxo_map_deep_copies();
-            let mut wall = 0;
-            for slot in 1..=BLOCKS {
-                engine.propose(slot);
-                wall = epoch_of(engine.state.slot()) + gap;
-                let rolled = engine.rolled_to(wall);
-                std::hint::black_box(&rolled);
-                assert!(
-                    engine.state.memo_len() <= StateCell::memo_cap(),
-                    "slot {slot}, gap {gap}: the memo held {} entries after the roll — \
-                     the in-loop eviction is not bounding it",
-                    engine.state.memo_len()
-                );
-            }
-            // The roll is real: its far end is bit-identical to the uncached
-            // derivation on this funded ledger.
-            assert_eq!(
-                *engine.rolled_to(wall),
-                engine.rolled_to_uncached(wall),
-                "gap {gap}: the rolled state diverged from the from-scratch derivation"
-            );
-            copies_per_gap.push(eutxo_map_deep_copies() - before);
-        }
-        assert_eq!(
-            copies_per_gap[0], copies_per_gap[1],
-            "full-map copies scale with the gap again ({copies_per_gap:?} for gaps [3, 48]) — \
-             a node far behind is back to paying the ledger per epoch per block"
-        );
-        assert_eq!(
-            copies_per_gap[1], 0,
-            "an epoch roll deep-copied the ledger — close_epoch writes to it, or a clone \
-             stopped sharing it"
         );
     }
 }
@@ -6962,16 +5395,11 @@ mod duty_view_anchor {
                 dir.0.clone(),
                 head_slot.clone(),
                 inflight,
-                Arc::new(crate::time_check::PeerClock::new()),
-                Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             )
             .expect("bind the devnet transport on an ephemeral port"),
         );
         let verifier = HybridVerifier::new(manifest.pubkeys());
         let ks0 = Keystore::load(&dir.0.join("v0")).expect("re-load validator 0");
-        let guard =
-            crate::signing_history::SigningHistory::create_unbound(&dir.0, &ks0.pubkey)
-                .expect("create the signing-history store");
         let engine = Engine {
             manifest,
             state: StateCell::new(state),
@@ -6979,8 +5407,6 @@ mod duty_view_anchor {
             tr_probe: Transition::new(ProbeVerifier),
             verifier,
             keys: Some(ks0),
-            guard: Some(guard),
-            doppelganger: None,
             blocks: BTreeMap::new(),
             chain: vec![(0, genesis_id)],
             canonical: BTreeSet::from([*genesis_id.as_bytes()]),
@@ -7000,15 +5426,6 @@ mod duty_view_anchor {
             ws_anchor_hard: false,
             ws_conflict_reported: false,
             fc_covered_removals: 0,
-            max_propose_lag_slots: None,
-            peers_connected: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            peers_configured: 0,
-            attestations_signed: 0,
-            proposals_signed: 0,
-            duties_refused: 0,
-            base: BaseState::Genesis,
-            sync_base: None,
-            last_boundary_export: None,
         };
         (engine, dir)
     }
@@ -7078,628 +5495,5 @@ mod duty_view_anchor {
             partition_caught_up.len()
         );
         assert!(moved > 0);
-    }
-}
-
-/// Slashing protection at the ENGINE seam: the gates in `propose`/`attest`
-/// really stand between the duty logic and the signature. The store's own
-/// semantics — watermarks, crash windows, snapshots, interchange — are pinned
-/// in `signing_history.rs`; what these tests pin is that the node consults it
-/// and obeys a refusal.
-#[cfg(test)]
-mod signing_guard_tests {
-    use super::*;
-    use bloch_pos_committee::SLOTS_PER_EPOCH;
-
-    /// The restored-snapshot / rewound-data-dir shape, end to end. A reorg
-    /// hands the node's own slot-1 block back — the chain state now looks
-    /// exactly like a rollback to before that block — and the node is asked
-    /// to propose slot 1 again. Without the guard it would sign a second
-    /// header for a signed slot; with it, the slot is refused and the head
-    /// stays put.
-    #[test]
-    fn a_rewound_node_refuses_to_re_sign_a_slot_it_already_proposed() {
-        let (mut engine, _dir) = perf_support::proposing_engine();
-        let genesis = *engine.chain[0].1.as_bytes();
-
-        engine.propose(1);
-        assert_eq!(engine.chain.len(), 2, "fixture: slot 1 must land");
-
-        // The rewind. The signed block leaves the store entirely, so nothing
-        // below can be "the transition refused a duplicate" — only the guard
-        // stands between the key and a second signature.
-        let signed = *engine.chain[1].1.as_bytes();
-        assert!(engine.do_reorg(genesis, Vec::new()), "hand the block back");
-        engine.blocks.remove(&signed);
-        assert_eq!(engine.chain.len(), 1, "rewound to genesis");
-
-        engine.propose(1);
-        assert_eq!(
-            engine.chain.len(),
-            1,
-            "the guard must refuse slot 1: this key already signed a proposal there"
-        );
-        // The chain is not stuck — the next slot signs normally.
-        engine.propose(2);
-        assert_eq!(engine.chain.len(), 2, "slot 2 is above the watermark and lands");
-    }
-
-    /// Same shape for attestations: one vote per target epoch, ever. The
-    /// pool is cleared between the two calls so the only thing refusing the
-    /// second signature is the guard, not pool dedup.
-    #[test]
-    fn a_second_attestation_for_the_same_target_epoch_is_refused() {
-        let (mut engine, _dir) = perf_support::proposing_engine();
-        // Reach epoch 1 (attest refuses epoch 0 by construction).
-        for slot in 1..=SLOTS_PER_EPOCH {
-            engine.propose(slot);
-        }
-        // Single validator ⇒ it sits in exactly one committee of epoch 1;
-        // sweep the epoch and let the committee check pick the slot.
-        let mut signed_slot = None;
-        for slot in SLOTS_PER_EPOCH..2 * SLOTS_PER_EPOCH {
-            let before = engine.pool.len();
-            engine.attest(slot);
-            if engine.pool.len() > before {
-                signed_slot = Some(slot);
-                break;
-            }
-        }
-        let slot = signed_slot.expect("the validator must be in one committee of epoch 1");
-
-        // The restart-after-crash / restored-snapshot view: the in-memory
-        // trace of the vote is gone, the durable watermark is not.
-        engine.pool.clear();
-        engine.attest(slot);
-        assert!(
-            engine.pool.is_empty(),
-            "the guard must refuse a second vote for target epoch 1"
-        );
-    }
-
-    /// Requirement: refuse to sign when the store is missing, rather than
-    /// signing blind. An engine holding a key but no guard performs no duty.
-    /// (`run` refuses to even boot this configuration; the engine-level
-    /// refusal is the second lock on the same door.)
-    #[test]
-    fn a_keyed_engine_with_no_history_store_signs_nothing() {
-        let (mut engine, _dir) = perf_support::proposing_engine();
-        engine.guard = None;
-
-        engine.propose(1);
-        assert_eq!(engine.chain.len(), 1, "no proposal may be signed without the store");
-
-        for slot in 0..2 * SLOTS_PER_EPOCH {
-            engine.attest(slot);
-        }
-        assert!(engine.pool.is_empty(), "no attestation may be signed without the store");
-    }
-
-    /// The record-before-sign ordering, observed from outside: when the
-    /// record cannot be made durable, no signature is released — the duty
-    /// simply does not happen. If signing preceded recording, this test
-    /// would see a block despite the store being unwritable.
-    #[cfg(unix)]
-    #[test]
-    fn when_the_record_cannot_be_written_the_signature_is_never_released() {
-        use std::os::unix::fs::PermissionsExt;
-        let (mut engine, dir) = perf_support::proposing_engine();
-
-        std::fs::set_permissions(&dir.0, std::fs::Permissions::from_mode(0o555))
-            .expect("make the data dir unwritable");
-        engine.propose(1);
-        let produced = engine.chain.len();
-        std::fs::set_permissions(&dir.0, std::fs::Permissions::from_mode(0o755))
-            .expect("restore permissions");
-
-        assert_eq!(
-            produced, 1,
-            "an unrecordable signature must not exist: record-then-sign, never the reverse"
-        );
-        // Nothing was signed, so nothing is burned: the same slot signs once
-        // the store is writable again.
-        engine.propose(1);
-        assert_eq!(engine.chain.len(), 2, "slot 1 lands after the store recovers");
-    }
-
-    // ── The doppelganger watch ──────────────────────────────────────────
-
-    /// A watched engine performs no duty, and the moment a verified
-    /// attestation by its OWN validator index arrives from inside the silent
-    /// window, the alarm latches and the node never signs again — even for
-    /// slots far past the window. The attestation is signed with the real
-    /// key, because that is exactly what a twin holds: the same key.
-    #[test]
-    fn a_twin_attestation_during_the_silent_window_latches_the_alarm() {
-        let (mut engine, _dir) = perf_support::proposing_engine();
-        engine.doppelganger = Some(Doppelganger {
-            watch_from_slot: 1,
-            silent_until_slot: 1 + 2 * SLOTS_PER_EPOCH,
-            alarm: None,
-        });
-
-        // Silent: no proposal, no attestation, anywhere in the window.
-        engine.propose(1);
-        assert_eq!(engine.chain.len(), 1, "the watch must suppress proposals");
-        engine.attest(SLOTS_PER_EPOCH + 1);
-        assert!(engine.pool.is_empty(), "the watch must suppress attestations");
-
-        // The twin speaks: an attestation by validator 0 — our index — for a
-        // slot the watch kept us silent for, arriving through the verified
-        // pipeline (`Accept` is only ever produced after the pool checked
-        // the signature; that contract is pinned in the gossip crate).
-        let data = AttestationData {
-            slot: 5,
-            head: *engine.chain[0].1.as_bytes(),
-            source_epoch: 0,
-            source_root: [0u8; 32],
-            target_epoch: 1,
-            target_root: [0u8; 32],
-        };
-        let signature = engine.keys.as_ref().unwrap().sign(&data.signing_root());
-        let att = Attestation { data, validator: 0, signature };
-        engine.apply_decision(
-            att,
-            GossipDecision::Accept { slashing_candidate: None },
-            &Origin::none(),
-        );
-        assert!(
-            engine.doppelganger_alarm().is_some(),
-            "a verified own-index attestation from the silent window is a twin"
-        );
-
-        // Latched: past the window, the node still refuses every duty.
-        engine.propose(3 * SLOTS_PER_EPOCH);
-        assert_eq!(
-            engine.chain.len(),
-            1,
-            "after the alarm the node must never sign again"
-        );
-    }
-
-    /// The proposal side of the watch: a canonical block by our own index,
-    /// for a slot inside the silent window, raises the alarm. Built by
-    /// signing a real block and handing it back through `ingest` — the same
-    /// rewind trick as the re-sign test, because a twin's block and our own
-    /// rewound block are indistinguishable by construction.
-    #[test]
-    fn a_twin_canonical_block_during_the_silent_window_latches_the_alarm() {
-        let (mut engine, _dir) = perf_support::proposing_engine();
-        let genesis = *engine.chain[0].1.as_bytes();
-
-        engine.propose(1);
-        assert_eq!(engine.chain.len(), 2, "fixture: slot 1 must land");
-        let signed = *engine.chain[1].1.as_bytes();
-        let env = engine.blocks.get(&signed).expect("the signed block").clone();
-        assert!(engine.do_reorg(genesis, Vec::new()), "hand the block back");
-        engine.blocks.remove(&signed);
-
-        engine.doppelganger = Some(Doppelganger {
-            watch_from_slot: 1,
-            silent_until_slot: 1 + 2 * SLOTS_PER_EPOCH,
-            alarm: None,
-        });
-        engine.ingest(env);
-        assert!(
-            engine.canonical.contains(&signed),
-            "fixture: the block must come back canonical, or the hook was never reached"
-        );
-        assert!(
-            engine.doppelganger_alarm().is_some(),
-            "a canonical own-index block from the silent window is a twin"
-        );
-    }
-
-    /// What must NOT alarm: our own history arriving during sync (slots
-    /// before the watch began), messages from after the window (past
-    /// `silent_until_slot` they could be our own signatures echoed back),
-    /// and other validators' messages. The watch convicts on exactly one
-    /// shape — own index, inside the window — or it convicts honest restarts.
-    #[test]
-    fn old_own_messages_foreign_messages_and_post_window_messages_do_not_alarm() {
-        let (mut engine, _dir) = perf_support::proposing_engine();
-        engine.doppelganger = Some(Doppelganger {
-            watch_from_slot: 10,
-            silent_until_slot: 20,
-            alarm: None,
-        });
-        fn vote(engine: &mut Engine, validator: u32, slot: u64) {
-            let data = AttestationData {
-                slot,
-                head: *engine.chain[0].1.as_bytes(),
-                source_epoch: 0,
-                source_root: [0u8; 32],
-                target_epoch: 1,
-                target_root: [0u8; 32],
-            };
-            let signature = engine.keys.as_ref().unwrap().sign(&data.signing_root());
-            let att = Attestation { data, validator, signature };
-            engine.apply_decision(
-                att,
-                GossipDecision::Accept { slashing_candidate: None },
-                &Origin::none(),
-            );
-        }
-        vote(&mut engine, 0, 9); // our index, but before the watch: history syncing in
-        vote(&mut engine, 0, 20); // our index, but at/after the window's end: could be us
-        vote(&mut engine, 7, 15); // inside the window, someone else's index
-        assert!(
-            engine.doppelganger_alarm().is_none(),
-            "none of these shapes proves a twin"
-        );
-        vote(&mut engine, 0, 15); // own index, inside the window: the one convicting shape
-        assert!(engine.doppelganger_alarm().is_some());
-    }
-}
-
-/// The proposal-lag gate: defence #3 against the post-replay sync stall.
-///
-/// The incident being defended: a node that stalled ~480 slots behind kept
-/// its wall clock, its proposal slot arrived, and it proposed on its stale
-/// head (block f7568afa, slot 50010) — pinning itself and its attesters to a
-/// minority branch. Armed, the gate declines that duty; disarmed (the
-/// default), nothing changes. These tests drive the REAL `propose` path via
-/// `perf_support::proposing_engine`, so a decline asserted here is a block
-/// that genuinely was not built, not a mock's opinion.
-#[cfg(test)]
-mod proposal_lag_gate_tests {
-    use super::*;
-
-    #[test]
-    fn disarmed_a_stale_proposer_still_proposes() {
-        let (mut engine, _dir) = perf_support::proposing_engine();
-        assert_eq!(
-            engine.max_propose_lag_slots, None,
-            "OFF must be the default: arming the gate is an explicit, coordinated act"
-        );
-        engine.propose(500); // head at genesis slot 0 → 500 slots stale
-        assert_eq!(
-            engine.chain.len(),
-            2,
-            "with the gate disarmed, today's deployed behaviour is unchanged: \
-             the stale proposal is still built"
-        );
-    }
-
-    #[test]
-    fn armed_a_proposer_past_the_margin_declines() {
-        let (mut engine, _dir) = perf_support::proposing_engine();
-        engine.max_propose_lag_slots = Some(240);
-        engine.propose(500);
-        assert_eq!(
-            engine.chain.len(),
-            1,
-            "500 slots of lag past a 240-slot margin must produce NO block — \
-             this is the f7568afa case, refused"
-        );
-        assert!(
-            engine.blocks.is_empty(),
-            "declining means the block was never built, not built and discarded"
-        );
-    }
-
-    #[test]
-    fn armed_a_proposer_at_or_inside_the_margin_proposes() {
-        let (mut engine, _dir) = perf_support::proposing_engine();
-        engine.max_propose_lag_slots = Some(240);
-        engine.propose(240); // lag exactly the margin: not PAST it, so allowed
-        assert_eq!(
-            engine.chain.len(),
-            2,
-            "lag equal to the margin is inside the gate — `>` not `>=`, so an \
-             ordinary quiet stretch exactly at the margin does not silence a proposer"
-        );
-    }
-
-    #[test]
-    fn the_gate_judges_head_lag_not_absolute_slot_numbers() {
-        let (mut engine, _dir) = perf_support::proposing_engine();
-        engine.max_propose_lag_slots = Some(240);
-        engine.propose(200); // lag 200, inside the margin: proposes, head moves to slot 200
-        assert_eq!(engine.chain.len(), 2);
-        engine.propose(430); // lag now 230 from the NEW head: still allowed
-        assert_eq!(
-            engine.chain.len(),
-            3,
-            "a node whose head keeps up keeps proposing at any absolute slot — \
-             the veto is about staleness, never about how old the chain is"
-        );
-    }
-}
-
-/// The periodic liveness line: defence #1 against the post-replay sync stall.
-///
-/// The property under test is the one the incident exposed by its absence:
-/// a node that is behind and not advancing SAYS SO, repeatedly, while a
-/// healthy or merely quiet node says nothing. The reporter is driven with a
-/// hand clock here; the slot loop drives it with the real one.
-#[cfg(test)]
-mod health_reporter_tests {
-    use super::*;
-
-    const SLOT_MS: u64 = 30_000;
-
-    /// The measured stall: far behind, minutes of apply-silence.
-    fn stalled() -> rpc::Health {
-        rpc::Health::assess(1_000, 100, 10 * SLOT_MS, SLOT_MS)
-    }
-    /// The same lag, but blocks applied seconds ago: catching up.
-    fn syncing() -> rpc::Health {
-        rpc::Health::assess(1_000, 100, 1_000, SLOT_MS)
-    }
-    /// Keeping up with the wall clock.
-    fn healthy() -> rpc::Health {
-        rpc::Health::assess(105, 100, 1_000, SLOT_MS)
-    }
-
-    #[test]
-    fn a_stalled_node_speaks_on_the_interval_and_keeps_speaking() {
-        let mut r = HealthReporter::new(0);
-        assert!(
-            r.tick(500, &stalled(), 100, 1_000).is_none(),
-            "inside the first interval the node holds its tongue — a boot into \
-             catch-up must not open the log with an alarm"
-        );
-        let line = r
-            .tick(HEALTH_LINE_INTERVAL_MS, &stalled(), 100, 1_000)
-            .expect("one interval in, a stalled node must say so");
-        assert!(line.contains("STALLED"), "the operator greps for this word: {line}");
-        assert!(line.contains("900 slots behind"), "the line carries the lag: {line}");
-        assert!(
-            r.tick(HEALTH_LINE_INTERVAL_MS + 400, &stalled(), 100, 1_000).is_none(),
-            "no re-print inside the interval — a stall must not bury the log under itself"
-        );
-        assert!(
-            r.tick(2 * HEALTH_LINE_INTERVAL_MS, &stalled(), 100, 1_000).is_some(),
-            "and it repeats every interval for as long as the stall lasts — \
-             periodic, not once, is what lets `tail -f` distinguish dead from slow"
-        );
-    }
-
-    #[test]
-    fn recovery_is_announced_immediately_and_exactly_once() {
-        let mut r = HealthReporter::new(0);
-        r.tick(HEALTH_LINE_INTERVAL_MS, &stalled(), 100, 1_000)
-            .expect("enter the stalled state first");
-        let line = r
-            .tick(HEALTH_LINE_INTERVAL_MS + 1, &syncing(), 150, 1_000)
-            .expect("the all-clear must not wait out the interval");
-        assert!(line.contains("recovered"), "{line}");
-        assert!(
-            r.tick(HEALTH_LINE_INTERVAL_MS + 2, &healthy(), 999, 1_000).is_none(),
-            "recovered is an edge, not a state — it is said once"
-        );
-    }
-
-    #[test]
-    fn a_syncing_node_reports_progress_periodically() {
-        let mut r = HealthReporter::new(0);
-        let line = r
-            .tick(HEALTH_LINE_INTERVAL_MS, &syncing(), 100, 1_000)
-            .expect("a node two epochs behind owes the operator a progress line");
-        assert!(line.contains("syncing"), "{line}");
-        assert!(!line.contains("STALLED"), "progress must never be dressed as a stall");
-        assert!(
-            r.tick(HEALTH_LINE_INTERVAL_MS + 10, &syncing(), 120, 1_000).is_none(),
-            "progress lines keep the same cadence discipline as stall lines"
-        );
-    }
-
-    #[test]
-    fn a_healthy_node_says_nothing_ever() {
-        let mut r = HealthReporter::new(0);
-        for i in 0..10u64 {
-            assert!(
-                r.tick(i * HEALTH_LINE_INTERVAL_MS, &healthy(), 100, 105).is_none(),
-                "a node keeping up must not chat — silence stays meaningful only \
-                 if health never spends it"
-            );
-        }
-    }
-}
-
-/// The operator-observability surface at the engine seam: the validator
-/// status, the duty projection, and the duty counters, driven through the
-/// REAL `attest`/`propose` paths on the same fixture the signing-guard tests
-/// use. Everything here is node-local reporting — these tests exist to pin
-/// that the reports tell the truth about what the engine actually did.
-#[cfg(test)]
-mod observability_tests {
-    use super::*;
-    use bloch_pos_committee::SLOTS_PER_EPOCH;
-
-    /// The duty projection is the duty code, proved by making the engine
-    /// PERFORM the projected duty. A sole validator proposes every slot but
-    /// holds exactly ONE committee seat per epoch — its slot chosen by the
-    /// seed — so the attestation projection cannot be asserted against a
-    /// guessed slot; it is asserted against what `attest` actually signs.
-    #[test]
-    fn next_duties_projects_with_the_same_code_that_performs_them() {
-        let (mut engine, _dir) = perf_support::proposing_engine();
-        // A full epoch 0, so epoch 1's seed derives from the applied chain —
-        // the same basis `attest` itself will use.
-        for slot in 1..=SLOTS_PER_EPOCH {
-            engine.propose(slot);
-        }
-        let wall = SLOTS_PER_EPOCH;
-        let (att, prop, horizon) = engine.next_duties(0, wall);
-        assert_eq!(prop, Some(wall + 1), "a sole validator proposes the very next slot");
-        assert_eq!(horizon, 3 * SLOTS_PER_EPOCH, "horizon = end of the NEXT epoch, exclusive");
-        let att = att.expect("a roster member holds a committee seat inside the horizon");
-        assert!(att > wall && att < horizon, "projection must stay inside its stated horizon");
-        assert!(epoch_of(att) >= 1, "epoch 0 carries no attestation duty");
-
-        // A slot of the same epoch that was NOT projected signs nothing…
-        let e = epoch_of(att);
-        let other = (e * SLOTS_PER_EPOCH..(e + 1) * SLOTS_PER_EPOCH)
-            .find(|s| *s != att)
-            .expect("an epoch has more than one slot");
-        engine.attest(other);
-        assert!(engine.pool.is_empty(), "no committee seat at slot {other}, so no signature");
-
-        // …and the projected slot is a real duty the engine performs.
-        engine.attest(att);
-        assert_eq!(engine.pool.len(), 1, "the projected slot must be the one attest signs");
-
-        // A validator the roster does not contain has no duties — the scan
-        // says none rather than inventing a slot.
-        let (att99, prop99, _) = engine.next_duties(99, wall);
-        assert_eq!((att99, prop99), (None, None));
-    }
-
-    /// An observer has no status: `None` from the view, no validator series
-    /// in the snapshot — with the node series intact.
-    #[test]
-    fn an_observer_reports_no_validator_and_full_node_metrics() {
-        let (mut engine, _dir) = perf_support::proposing_engine();
-        engine.keys = None; // demote the fixture to an observer
-        engine.guard = None;
-        assert!(engine.validator_status_view().is_none());
-        let text = engine.metrics_snapshot().render();
-        assert!(!text.contains("bloch_pos_validator_"));
-        assert!(text.contains("bloch_pos_head_slot"));
-        assert!(text.contains("bloch_pos_stalled"));
-    }
-
-    /// The keyed fixture's status: registry known, in the duty roster, guard
-    /// present, doppelganger disabled (tests build no watch), and the
-    /// genesis-seeded participation map already tracking the validator.
-    #[test]
-    fn a_keyed_engine_reports_its_own_registry_and_roster_facts() {
-        let (engine, _dir) = perf_support::proposing_engine();
-        let v = engine.validator_status_view().expect("keyed engine has a status");
-        assert_eq!(v.index, 0);
-        let reg = v.registry.expect("index 0 is in the genesis registry");
-        assert_eq!(reg.state, "active");
-        assert!(!reg.slashed);
-        assert_eq!(reg.leaked_sat, 0, "no finality failure has accrued a leak");
-        assert!(v.in_duty_roster, "the sole genesis validator is on duty");
-        assert!(v.guard_present, "the fixture opens a signing-history store");
-        assert_eq!(v.guard_highest_proposed_slot, None, "nothing signed yet");
-        assert_eq!(v.doppelganger, rpc::DoppelgangerView::Disabled);
-        assert_eq!(
-            v.attested_in_current_epoch,
-            Some(false),
-            "genesis seeds participation for the launch roster: tracked, not yet attested"
-        );
-        assert_eq!(v.attestations_signed, 0);
-        assert_eq!(v.proposals_signed, 0);
-        assert_eq!(v.duties_refused, 0);
-    }
-
-    /// The counters count the real paths: a signed proposal increments
-    /// `proposals_signed`; the SAME slot proposed again is refused by the
-    /// signing guard and increments `duties_refused` instead — so a scraper
-    /// can see both the work and the protection working.
-    #[test]
-    fn duty_counters_follow_the_real_sign_and_refuse_paths() {
-        let (mut engine, _dir) = perf_support::proposing_engine();
-        engine.propose(1);
-        assert_eq!(engine.chain.len(), 2, "fixture: slot 1 must land");
-        assert_eq!(engine.proposals_signed, 1);
-        assert_eq!(engine.duties_refused, 0);
-
-        // Re-proposing a signed slot: the guard refuses, the counter says so.
-        let genesis = *engine.chain[0].1.as_bytes();
-        let signed = *engine.chain[1].1.as_bytes();
-        assert!(engine.do_reorg(genesis, Vec::new()), "rewind to genesis");
-        engine.blocks.remove(&signed);
-        engine.propose(1);
-        assert_eq!(engine.chain.len(), 1, "the guard must have refused");
-        assert_eq!(engine.proposals_signed, 1, "a refused duty is not a signed one");
-        assert_eq!(engine.duties_refused, 1);
-
-        // An attestation that signs increments its counter once. The sweep
-        // starts at 2: slot 1 sits at the guard's watermark already, and
-        // re-proposing it would stage a third refusal this test is not about.
-        for slot in 2..=SLOTS_PER_EPOCH {
-            engine.propose(slot);
-        }
-        let mut signed_slot = None;
-        for slot in SLOTS_PER_EPOCH..2 * SLOTS_PER_EPOCH {
-            let before = engine.pool.len();
-            engine.attest(slot);
-            if engine.pool.len() > before {
-                signed_slot = Some(slot);
-                break;
-            }
-        }
-        let slot = signed_slot.expect("the sole validator sits in one committee of epoch 1");
-        assert_eq!(engine.attestations_signed, 1);
-
-        // The same target epoch again: refused, counted as a refusal.
-        engine.pool.clear();
-        engine.attest(slot);
-        assert!(engine.pool.is_empty());
-        assert_eq!(engine.attestations_signed, 1);
-        assert_eq!(engine.duties_refused, 2);
-    }
-
-    /// The doppelganger reduction: watching while the wall clock is inside
-    /// the window, clear after it, alarmed once a twin was seen — and the
-    /// duty gate agrees with the view at every step.
-    #[test]
-    fn doppelganger_view_tracks_the_watch_lifecycle() {
-        let (mut engine, _dir) = perf_support::proposing_engine();
-        let wall = engine.wall_slot();
-
-        engine.doppelganger = Some(Doppelganger {
-            watch_from_slot: wall + 2,
-            silent_until_slot: wall + 1_000,
-            alarm: None,
-        });
-        assert_eq!(
-            engine.doppelganger_view(),
-            rpc::DoppelgangerView::Watching { silent_until_slot: wall + 1_000 }
-        );
-        assert!(engine.doppelganger_silent(wall + 1), "watching means silent");
-
-        engine.doppelganger.as_mut().unwrap().silent_until_slot = wall;
-        assert_eq!(engine.doppelganger_view(), rpc::DoppelgangerView::Clear);
-        assert!(!engine.doppelganger_silent(wall + 1), "clear means duties run");
-
-        engine.doppelganger.as_mut().unwrap().alarm = Some("twin".into());
-        assert_eq!(engine.doppelganger_view(), rpc::DoppelgangerView::Alarmed);
-        assert!(engine.doppelganger_silent(wall + 1), "alarmed means never sign again");
-    }
-
-    /// `getvalidatorstatus` and `getmetrics` answer over the real RPC seam:
-    /// the keyed engine serves a status whose numbers match its own state,
-    /// and the metrics text carries the validator series.
-    #[test]
-    fn serve_rpc_answers_status_and_metrics() {
-        let (mut engine, _dir) = perf_support::proposing_engine();
-        engine.propose(1);
-
-        let out = engine.serve_rpc(RpcRequest::ValidatorStatus).expect("status");
-        let j = crate::rpc::parse_json(&out.to_string()).unwrap();
-        assert_eq!(j.get("validator_index").unwrap().as_u64(), Some(0));
-        assert_eq!(j.get("proposals_signed_since_boot").unwrap().as_u64(), Some(1));
-        assert_eq!(
-            j.get("signing_guard").unwrap().get("highest_proposed_slot").unwrap().as_u64(),
-            Some(1),
-            "the durable watermark must surface on the status"
-        );
-
-        let out = engine.serve_rpc(RpcRequest::Metrics).expect("metrics");
-        let crate::rpc::Json::Str(text) = out else {
-            panic!("metrics must be the exposition text");
-        };
-        assert!(text.contains("bloch_pos_validator_proposals_signed_total 1"));
-        assert!(text.contains("bloch_pos_head_slot 1"));
-    }
-
-    /// An observer over RPC gets the dedicated error code, with a message —
-    /// not an empty object a dashboard would render as a broken validator.
-    #[test]
-    fn serve_rpc_refuses_status_on_an_observer_with_the_dedicated_code() {
-        let (mut engine, _dir) = perf_support::proposing_engine();
-        engine.keys = None;
-        engine.guard = None;
-        let Err(e) = engine.serve_rpc(RpcRequest::ValidatorStatus) else {
-            panic!("an observer must not fabricate a validator status");
-        };
-        assert_eq!(e.code, crate::rpc::NO_VALIDATOR_KEY);
-        assert!(e.message.contains("observer"), "got: {}", e.message);
     }
 }

@@ -1,9 +1,2 @@
-# Genesis-3 terminal snapshot (height 39,918) — the state Genesis-4 opened with.
-# Replaced 2026-08-14; the previous sidecar still described the Genesis-1 file
-# (88f29fd3… / a72be3cc…) and failed `shasum -c` against the shipped file.
-# See CARRYOVER-SNAPSHOT.md. The node itself checks the SHA3-256 of the
-# uncompressed file: 3d67246e94881a17d302b464f79fee55886d8068794e76fed43081117fbe308d
-#
-# Uncompressed (gunzip -k carryover.tsv.gz; 452,726 rows, 54,780,151 bytes):
-# 84ddbbac2afdd5c78618096a7d4f66cf5b04a3e5757a03fe90550e50096183f6  carryover.tsv
-4d1e2738baec39ec25e2e33968f72a47abb261f271de62fb48a33be55bfc83be  carryover.tsv.gz
+88f29fd3b7a5851cb557be8f8a6a7627b9efbe198662d8335695f2fd5f99373c  carryover.tsv  (uncompressed)
+a72be3cc149b0f4c2c56aa8f438abf24ae44f1a6b212083e8ffbad75aba2b08d  carryover.tsv.gz

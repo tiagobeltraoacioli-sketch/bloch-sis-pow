@@ -176,11 +176,6 @@ pub const fn is_publication_epoch(epoch: u64) -> bool {
 /// by the caller: a node whose clock can be set backward can be convinced it
 /// is fresh when it is stale (the standard NTP caveat, shared with every
 /// slots-based chain — the runbook owes authenticated time sources).
-/// The "refuse to start if the clock disagrees grossly with peer time"
-/// defense §1 calls for is implemented node-side in
-/// `bloch-pos-node/src/time_check.rs` (2026-08-31): boot compares the local
-/// clock against the median of the dialed peers' reported time and refuses
-/// beyond half an epoch of skew.
 pub const fn wallclock_epoch(genesis_unix: u64, now_unix: u64) -> u64 {
     now_unix.saturating_sub(genesis_unix) / (SLOT_DURATION_SECS * SLOTS_PER_EPOCH)
 }

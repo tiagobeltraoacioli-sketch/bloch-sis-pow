@@ -43,19 +43,14 @@
 //! rule once integration review starts).
 
 mod codec;
-mod doctor;
 mod engine;
 mod genesis;
 mod keys;
 mod net;
 mod p2p;
 mod rpc;
-mod signing_history;
-mod state_sync;
 mod store;
-mod time_check;
 mod ws_boot;
-mod ws_tool;
 
 use std::path::PathBuf;
 use std::process::exit;
@@ -64,10 +59,8 @@ use bloch_pos_committee::genesis_cohort::{
     cohort_cap_bps, COHORT_CAP_FLOOR_BPS, COHORT_CAP_START_BPS, COHORT_TAPER_EPOCHS,
 };
 use bloch_pos_committee::params::{
-    ANCESTRY_SEED_ACTIVATION_EPOCH, BLOCK_BYTES_V2_ACTIVATION_EPOCH, DS_ATTEST, DS_BLOCK, DS_BODY,
-    DS_DEPOSIT, DS_EXIT, DS_PROPOSE, DS_RANDAO, DS_SLASH, DS_SORTITION, DS_STATE,
-    LEAKED_ROSTER_ACTIVATION_EPOCH, LEAK_RECOVERY_ACTIVATION_EPOCH, SLOTS_PER_EPOCH,
-    SLOT_DURATION_SECS, TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH,
+    DS_ATTEST, DS_BLOCK, DS_BODY, DS_DEPOSIT, DS_EXIT, DS_PROPOSE, DS_RANDAO, DS_SLASH,
+    DS_SORTITION, DS_STATE, SLOTS_PER_EPOCH, SLOT_DURATION_SECS,
 };
 use bloch_pos_committee::tokenomics_v4::{
     FOUNDER_BLOCH, SAT_PER_BLOCH, TEAM_BLOCH, TOTAL_SUPPLY_SAT, VALIDATOR_EMISSION_BLOCH, VC_BLOCH,
@@ -101,37 +94,14 @@ fn main() {
         Some("--help") | Some("-h") | None => print_help(),
         Some("selfcheck") => {
             self_check();
-            if args.iter().any(|a| a == "--json") {
-                println!("{}", consensus_compat_json());
-            } else {
-                println!("self-check passed");
-                print_consensus_compat();
-            }
+            println!("self-check passed");
         }
         Some("keygen") => keygen(&args[1..]),
         Some("keygen-public") => keygen_public(&args[1..]),
         Some("genesis") => genesis_cmd(&args[1..]),
         Some("genesis-mainnet") => genesis_mainnet(&args[1..]),
         Some("submit-tx") => submit_tx(&args[1..]),
-        Some("spendkey") => spendkey(&args[1..]),
-        Some("protection-export") => protection_export(&args[1..]),
-        Some("protection-import") => protection_import(&args[1..]),
-        // Two names, one command: `doctor` is what an operator types when
-        // something is wrong, `preflight` is what a runbook says before a
-        // first start. Refusing one of them to keep a table small helps
-        // nobody at 3am.
-        Some("doctor") | Some("preflight") => {
-            if args.iter().any(|a| a == "--help" || a == "-h") {
-                doctor::print_help();
-            } else {
-                exit(doctor::run(&args[1..]));
-            }
-        }
         Some("run") => run_cmd(&args[1..]),
-        Some(
-            cmd @ ("ws-keygen" | "ws-signer-set" | "ws-checkpoint" | "ws-sign" | "ws-envelope"
-            | "ws-verify"),
-        ) => ws_tool::run(cmd, &args[1..]),
         Some(other) => {
             eprintln!("{NAME}: unknown command `{other}` (see --help)");
             exit(2);
@@ -144,17 +114,8 @@ fn print_help() {
         "{NAME} {VERSION} — Bloch Genesis-4 Proof-of-Stake node\n\
          \n\
          USAGE:\n\
-           bloch-pos selfcheck [--json]\n\
-               Verify the frozen consensus parameters this binary links,\n\
-               then state which consensus flag days (activation epochs) it\n\
-               was built knowing — the epoch range it is valid for. --json\n\
-               prints only the machine-readable statement, for release\n\
-               pages and fleet sweeps.\n\
-           bloch-pos doctor [--data-dir <dir>] [--genesis <file>] [...]\n\
-               Preflight/diagnosis for a validator host: disk, memory,\n\
-               clock-vs-peers, P2P reachability, RPC exposure, and a\n\
-               running node's health. Read-only, node-local; pass the same\n\
-               flags you pass to `run`. `doctor --help` lists the checks.\n\
+           bloch-pos selfcheck\n\
+               Verify the frozen consensus parameters this binary links.\n\
            bloch-pos keygen --dir <dir> --index <i>\n\
                Generate a THROWAWAY devnet validator keystore (hybrid\n\
                ML-DSA-65‖Falcon-1024 + RANDAO seed) at <dir>/validator.key.\n\
@@ -167,7 +128,7 @@ fn print_help() {
                                --spend <txid-hex>:<vout> [--spend ...]\n\
                                --pay <script-hash-hex>:<sat> [--pay ...]\n\
                                [--signature <hex>] [--tx-bytes n]\n\
-                               [--tip millisat-per-gas] [--raw]\n\
+                               [--tip millisat-per-gas]\n\
                Send one Transfer to a running node, which gossips it on.\n\
                --pay order IS the output order (position = vout).\n\
                WITHOUT --signature it prints the signing root and sends\n\
@@ -175,49 +136,10 @@ fn print_help() {
                SAME flags plus --signature. This tool never holds a\n\
                spending key. No acknowledgement: confirmation is seeing\n\
                it in a block.\n\
-               --raw prints the signed transaction's canonical bytes as\n\
-               hex instead of requiring --to: hand that hex to any node's\n\
-               JSON-RPC `sendrawtransaction`, which is how a remote\n\
-               integrator submits through a public RPC endpoint without\n\
-               reaching the (non-public) devnet transport port.\n\
-           run … --ws-checkpoint <envelope> --ws-signer-set <set> --state-sync\n\
-               Checkpoint-sync: verify the signed checkpoint, DOWNLOAD its\n\
-               committed state from peers (chunked, resumable), verify that\n\
-               the state reproduces the checkpoint's state_root, and sync\n\
-               forward from there instead of replaying from genesis.\n\
-               --state-snapshot <file> uses a local artifact instead of\n\
-               downloading (same verification, no trust in the file).\n\
-           run … --export-state-epoch <E> --export-state-out <file>\n\
-               Replay the local log and write epoch E's boundary-state\n\
-               snapshot artifact (the file --state-snapshot consumes and\n\
-               nodes serve to peers), then exit.\n\
-           bloch-pos ws-checkpoint --genesis <manifest> --rpc <a>[,<b>...]\n\
-                                   --epoch <E> --signer-set-id <n>\n\
-                                   --out <prefix>\n\
-               Derive the weak-subjectivity checkpoint for a FINALIZED\n\
-               epoch from running nodes (all --rpc endpoints must agree),\n\
-               writing <prefix>.bin (154 canonical bytes) + <prefix>.json\n\
-               and printing the ws digest the signers sign.\n\
-           bloch-pos ws-keygen | ws-signer-set | ws-sign | ws-envelope\n\
-                     | ws-verify\n\
-               The rest of the signing ceremony (BLOCH-WEAK-SUBJECTIVITY.md\n\
-               section 6): per-signer keypairs, the signer-arrangement file that\n\
-               --ws-signer-set consumes, offline signing of the ws digest,\n\
-               envelope assembly, and verification exactly as a booting\n\
-               node performs it. See src/ws_tool.rs for each command's\n\
-               flags.\n\
            bloch-pos genesis --keys <dir1,dir2,...> --out <file>\n\
                              [--slot-ms <ms>] [--start-in <secs>]\n\
-                             [--alloc <script-hash-hex>:<sat>]...\n\
                Build a devnet genesis manifest from the keystores' public\n\
-               parts. Slot 0 starts <secs> from now (default 5). --alloc\n\
-               adds a liquid-at-genesis output (a devnet faucet balance);\n\
-               fund it to a THROWAWAY key's script hash, never one that\n\
-               owns anything on mainnet.\n\
-           bloch-pos spendkey --dir <keystore-dir> [--sign <root-hex>]\n\
-               DEVNET/TESTNET ONLY. Print a keystore's spend script hash\n\
-               (SHA3-256 of its hybrid pubkey) and pubkey; with --sign,\n\
-               also sign a 32-byte spend signing root from submit-tx.\n\
+               parts. Slot 0 starts <secs> from now (default 5).\n\
            bloch-pos run --data-dir <dir> --genesis <file>\n\
                          [--transport devnet|libp2p]\n\
                devnet (default) is the TCP full mesh: no authentication, no\n\
@@ -247,14 +169,6 @@ fn print_help() {
                graylists a whole mesh that shares one proxy address.\n\
          \n\
                          [--stop-at-slot <n>]\n\
-                         [--max-propose-lag <slots>|off]\n\
-               --max-propose-lag arms the proposal-lag gate: the node\n\
-               declines its own proposal duty when its head is more than\n\
-               that many slots behind the wall clock, instead of extending\n\
-               a stale head onto a minority branch. OFF by default. Arming\n\
-               it is a fleet-wide decision: if the whole network halts for\n\
-               longer than the margin, armed nodes cannot restart it.\n\
-         \n\
                          [--ws-checkpoint <file>] [--ws-signer-set <file>]\n\
                          [--carryover <snapshot.tsv>]\n\
                Run a validator node. <dir> must hold validator.key; chain\n\
@@ -304,38 +218,6 @@ fn print_help() {
                must accompany --ws-checkpoint. With neither flag the genesis\n\
                anchor is the first checkpoint, which is why a fresh devnet\n\
                boots with no ceremony.\n\
-                         [--accept-new-signing-history]\n\
-               Slashing protection: <dir>/signing_history.bin records the\n\
-               highest slot this key ever proposed and the highest\n\
-               source/target epochs it ever attested, fsynced BEFORE each\n\
-               signature is released, and the node refuses to sign anything\n\
-               at or below those watermarks. A validator whose keystore has\n\
-               no history file REFUSES TO START rather than signing blind.\n\
-               --accept-new-signing-history creates a fresh, empty history —\n\
-               pass it ONLY when this key has genuinely never signed on this\n\
-               network, anywhere. If the key has signed before, carry its\n\
-               history over with protection-export / protection-import\n\
-               instead; an empty history on a used key is how validators get\n\
-               slashed. See docs/specs/BLOCH-SLASHING-PROTECTION.md.\n\
-                         [--doppelganger-epochs <n>]\n\
-               How many epochs a restarting validator stays SILENT while\n\
-               listening for its own key signing elsewhere (default 2). A\n\
-               verified attestation or canonical block by this node's own\n\
-               validator index during that window means the key is live on\n\
-               another machine, and the node shuts down instead of joining\n\
-               in and completing the equivocation. Costs the window's\n\
-               duties on every restart. `0` disables the watch; the watch\n\
-               is also skipped when booting at the chain's slot 0.\n\
-           bloch-pos protection-export --data-dir <dir> [--out <file>]\n\
-               Write the key's signing history in the documented text\n\
-               interchange format (stdout by default). Run this BEFORE\n\
-               moving a validator key to another machine, and carry the\n\
-               file WITH the key.\n\
-           bloch-pos protection-import --data-dir <dir> --from <file>\n\
-               Install (or merge into) <dir>/signing_history.bin from an\n\
-               exported file. Merging only ever RAISES watermarks. Run this\n\
-               on the destination machine BEFORE the first `run` with a\n\
-               migrated key.\n\
          \n\
          The integration plan is docs/specs/BLOCH-POS-NODE-INTEGRATION.md."
     );
@@ -368,22 +250,10 @@ fn print_help() {
 /// a keypair on an operator's shell history, and this crate has no business
 /// creating spending keys at all.
 fn submit_tx(args: &[String]) {
-    // `--raw` prints the signed transaction's canonical bytes as hex instead
-    // of sending them, for `sendrawtransaction` over JSON-RPC. It exists for
-    // the party this tool otherwise cannot serve: a REMOTE integrator, who can
-    // reach a public RPC front but must never be able to reach the devnet
-    // transport port (that mesh is unauthenticated by design and stays bound
-    // to loopback / a private interface). With `--raw`, `--to` is optional;
-    // giving both prints the hex AND sends.
-    let raw_out = args.iter().any(|a| a == "--raw");
-    let to = arg_value(args, "--to");
-    if to.is_none() && !raw_out {
-        eprintln!(
-            "submit-tx: --to <host:port> is required (or --raw to print the \
-             canonical hex for JSON-RPC `sendrawtransaction`)"
-        );
+    let Some(to) = arg_value(args, "--to") else {
+        eprintln!("submit-tx: --to <host:port> is required");
         exit(2);
-    }
+    };
     let num = |name: &str, default: u128| -> u128 {
         arg_value(args, name)
             .and_then(|s| s.parse().ok())
@@ -522,20 +392,6 @@ fn submit_tx(args: &[String]) {
         }
     }
     let bytes = tx.canonical_bytes();
-    if raw_out {
-        println!("{}", codec::hex(&bytes));
-        // The txid is derived, never carried — print it so a remote submitter
-        // can confirm the spend with `gettxout(txid, vout)` (whose `finalized`
-        // flag is the settlement judgement), since there is no tx index.
-        eprintln!(
-            "submit-tx: canonical bytes above ({} bytes) — submit them as the \
-             `hex` param of JSON-RPC `sendrawtransaction`.\n\
-             txid {}",
-            bytes.len(),
-            codec::hex32(&tx.txid()),
-        );
-    }
-    let Some(to) = to else { return };
     match bloch_pos_node_net_send(&to, &bytes) {
         Ok(()) => println!(
             "submitted {} bytes to {to} — it lands in a block or it does not; \
@@ -619,153 +475,19 @@ fn keygen(args: &[String]) {
         Ok(ks) => {
             use sha3::{Digest, Sha3_256};
             let pkh: [u8; 32] = Sha3_256::digest(&ks.pubkey).into();
-            // The key is born WITH its slashing-protection store, so a key
-            // never exists without the record of what it has signed (which,
-            // right now, is nothing). It is network-unbound because keygen
-            // cannot know the genesis digest; the first `run` binds it.
-            if let Err(e) =
-                signing_history::SigningHistory::create_unbound(&PathBuf::from(&dir), &ks.pubkey)
-            {
-                eprintln!("keygen: could not create the signing-history store: {e}");
-                exit(1);
-            }
             // Public information only — never a secret byte.
             println!(
                 "wrote {dir}/validator.key (devnet, throwaway): validator {index}, \
-                 pubkey sha3 {}, randao commitment {}\n\
-                 wrote {dir}/{} (empty slashing-protection history — travels WITH the key)",
+                 pubkey sha3 {}, randao commitment {}",
                 codec::hex8(&pkh),
                 codec::hex8(
                     &bloch_pos_committee::beacon::RandaoChain::generate(ks.randao_seed)
                         .commitment()
-                ),
-                signing_history::HISTORY_FILE,
+                )
             );
         }
         Err(e) => {
             eprintln!("keygen failed: {e}");
-            exit(1);
-        }
-    }
-}
-
-/// `protection-export --data-dir <dir> [--out <file>]` — the signing history
-/// in the interchange text format (BLOCH-SLASHING-PROTECTION.md §3).
-///
-/// This is the first half of the only safe key migration: export here, carry
-/// the file WITH the key, `protection-import` on the destination before the
-/// first `run`. Migrating a validator key without its history is exactly how
-/// double-signing happens.
-fn protection_export(args: &[String]) {
-    let Some(dir) = arg_value(args, "--data-dir") else {
-        eprintln!("protection-export: --data-dir is required");
-        exit(2);
-    };
-    let h = match signing_history::SigningHistory::open(&PathBuf::from(&dir)) {
-        Ok(h) => h,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!(
-                "protection-export: {dir} holds no {}. Nothing to export — and if \
-                 validator.key in that dir HAS signed, its history is lost and the only \
-                 safe course is to treat the key as unsafe to run until the chain has \
-                 moved past everything it could have signed.",
-                signing_history::HISTORY_FILE
-            );
-            exit(1);
-        }
-        Err(e) => {
-            eprintln!("protection-export: cannot read the signing history: {e}");
-            exit(1);
-        }
-    };
-    let text = h.export_text();
-    match arg_value(args, "--out") {
-        None => print!("{text}"),
-        Some(out) => {
-            if let Err(e) = std::fs::write(&out, &text) {
-                eprintln!("protection-export: cannot write {out}: {e}");
-                exit(1);
-            }
-            println!(
-                "wrote {out} — carry this file WITH the key; import it on the destination \
-                 with `bloch-pos protection-import` BEFORE the first run"
-            );
-        }
-    }
-}
-
-/// `protection-import --data-dir <dir> --from <file>` — install or merge a
-/// signing history exported by `protection-export`.
-///
-/// Merging only ever RAISES watermarks (the node ends up refusing more,
-/// never less), refuses a record for a different validator key, and refuses
-/// a record from a different network. If the data dir holds a keystore, the
-/// record must match it.
-fn protection_import(args: &[String]) {
-    let (Some(dir), Some(from)) = (arg_value(args, "--data-dir"), arg_value(args, "--from"))
-    else {
-        eprintln!("protection-import: --data-dir and --from are required");
-        exit(2);
-    };
-    let text = match std::fs::read_to_string(&from) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("protection-import: cannot read {from}: {e}");
-            exit(1);
-        }
-    };
-    let rec = match signing_history::SigningHistory::parse_interchange(&text) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("protection-import: {from} is not a valid interchange file: {e}");
-            exit(1);
-        }
-    };
-    let dir = PathBuf::from(dir);
-    // If the destination already holds the key, the record must be FOR that
-    // key — importing someone else's history protects nothing.
-    match keys::Keystore::load(&dir) {
-        Ok(ks) if ks.pubkey != rec.pubkey => {
-            eprintln!(
-                "protection-import: {from} records the history of a DIFFERENT validator \
-                 key than {}/validator.key; refusing",
-                dir.display()
-            );
-            exit(1);
-        }
-        _ => {} // matching key, or no keystore yet (import-before-key is fine)
-    }
-    match signing_history::SigningHistory::open(&dir) {
-        Ok(mut h) => match h.merge_interchange(&rec) {
-            Ok(summary) => println!(
-                "merged {from} into {}/{}: {summary}",
-                dir.display(),
-                signing_history::HISTORY_FILE
-            ),
-            Err(e) => {
-                eprintln!("protection-import: {e}");
-                exit(1);
-            }
-        },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            match signing_history::SigningHistory::create_from_interchange(&dir, &rec) {
-                Ok(h) => println!(
-                    "installed {}/{} (proposal watermark {}, attestation watermark {})",
-                    dir.display(),
-                    signing_history::HISTORY_FILE,
-                    h.highest_proposed_slot()
-                        .map_or("none".to_string(), |n| n.to_string()),
-                    h.attestation_watermark()
-                        .map_or("none".to_string(), |(s, t)| format!("({s}, {t})")),
-                ),
-                Err(e) => {
-                    eprintln!("protection-import: cannot install the history: {e}");
-                    exit(1);
-                }
-            }
-        }
-        Err(e) => {
-            eprintln!("protection-import: cannot read the existing history: {e}");
             exit(1);
         }
     }
@@ -996,57 +718,6 @@ fn genesis_cmd(args: &[String]) {
             commission_bps: 0,
         });
     }
-    // `--alloc <script-hash-hex>:<sat>`, repeatable — a liquid-at-genesis
-    // output, which is how a devnet/testnet gets a spendable balance (a
-    // faucet) without touching the mainnet carryover. Deliberately takes a
-    // script hash and not a key: the manifest stays public material only.
-    //
-    // ISOLATION RULE (do not weaken): the spend signing root carries no
-    // network identifier, so cross-network replay is prevented ONLY by the
-    // two chains' outpoint sets being disjoint. These allocations derive
-    // their txids from (purpose, script_hash, amount, unlock_epoch); a
-    // testnet allocation that reproduced a mainnet allocation's exact tuple
-    // would mint the SAME outpoint on both chains and a spend signature
-    // would replay. Fund testnets from throwaway keys only.
-    let mut allocations = Vec::new();
-    for (i, a) in args.iter().enumerate() {
-        if a != "--alloc" {
-            continue;
-        }
-        let Some(spec) = args.get(i + 1) else {
-            eprintln!("genesis: --alloc needs <script-hash-hex>:<sat>");
-            exit(2);
-        };
-        let Some((sh_hex, sat)) = spec.rsplit_once(':') else {
-            eprintln!("genesis: --alloc {spec}: expected <script-hash-hex>:<sat>");
-            exit(2);
-        };
-        let script_hash = match codec::unhex(sh_hex) {
-            Ok(b) if b.len() == 32 => {
-                let mut h = [0u8; 32];
-                h.copy_from_slice(&b);
-                h
-            }
-            Ok(b) => {
-                eprintln!("genesis: --alloc: script hash is {} bytes, expected 32", b.len());
-                exit(2);
-            }
-            Err(e) => {
-                eprintln!("genesis: --alloc: {e}");
-                exit(2);
-            }
-        };
-        let Ok(amount_sat) = sat.parse::<u128>() else {
-            eprintln!("genesis: --alloc: bad amount {sat}");
-            exit(2);
-        };
-        allocations.push(genesis::GenesisAllocation {
-            purpose: genesis::alloc_purpose::LIQUIDITY,
-            script_hash,
-            amount_sat,
-            unlock_epoch: 0,
-        });
-    }
     let manifest = genesis::Manifest {
         genesis_time_ms: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1056,13 +727,12 @@ fn genesis_cmd(args: &[String]) {
         slot_ms,
         validators,
         cohort: Vec::new(),
-        // `genesis` builds devnet manifests: no carried balances and no
-        // ceremony-derived allocations — only the liquid `--alloc` outputs
-        // above, if any. The mainnet manifest is assembled by a separate path
+        // `genesis` builds devnet manifests: no carried balances, no vested
+        // allocations. The mainnet manifest is assembled by a separate path
         // that takes the signed Genesis-3 snapshot as input, because its
         // inputs come from a ceremony and not from a command line.
         carryover: None,
-        allocations,
+        allocations: Vec::new(),
         carryover_entries: Vec::new(),
     };
     if let Err(e) = manifest.check_supply() {
@@ -1083,61 +753,6 @@ fn genesis_cmd(args: &[String]) {
         codec::hex8(manifest.genesis_id().as_bytes()),
         codec::hex32(&digest)
     );
-}
-
-/// `spendkey --dir <keystore-dir> [--sign <root-hex>]` — DEVNET/TESTNET ONLY.
-///
-/// Treats a `keygen` keystore as a *spending* key: prints the SHA3-256 of its
-/// hybrid public key (the `script_hash` an output must commit to for this key
-/// to spend it) and the public key itself. With `--sign`, also signs the given
-/// 32-byte spend signing root (the digest `submit-tx` prints) with both halves
-/// of the hybrid suite and prints the signature hex.
-///
-/// This is the external-signer seam `submit-tx` documents, packaged for a
-/// throwaway network: the secret never leaves the keystore file, but a root
-/// signed here IS authorisation to move whatever that key owns on ANY chain
-/// where the named outpoints exist. The spend signing root carries no
-/// network identifier — isolation between a testnet and mainnet rests
-/// entirely on their genesis outputs being disjoint (different script
-/// hashes, therefore different txids, transitively forever). NEVER load a
-/// key that owns mainnet outputs here, and NEVER build a testnet genesis
-/// that reproduces a mainnet allocation or the mainnet carryover byte for
-/// byte — identical genesis outpoints would make spend signatures replay
-/// across the two chains.
-fn spendkey(args: &[String]) {
-    let Some(dir) = arg_value(args, "--dir") else {
-        eprintln!("spendkey: --dir <keystore-dir> is required");
-        exit(2);
-    };
-    let ks = match keys::Keystore::load(&PathBuf::from(&dir)) {
-        Ok(k) => k,
-        Err(e) => {
-            eprintln!("spendkey: cannot load keystore {dir}: {e}");
-            exit(1);
-        }
-    };
-    use sha3::{Digest, Sha3_256};
-    let script_hash: [u8; 32] = Sha3_256::digest(&ks.pubkey).into();
-    println!("script_hash\t{}", codec::hex32(&script_hash));
-    println!("pubkey\t{}", codec::hex(&ks.pubkey));
-    if let Some(root_hex) = arg_value(args, "--sign") {
-        let root = match codec::unhex(&root_hex) {
-            Ok(b) if b.len() == 32 => {
-                let mut a = [0u8; 32];
-                a.copy_from_slice(&b);
-                a
-            }
-            Ok(b) => {
-                eprintln!("spendkey: --sign root is {} bytes, expected 32", b.len());
-                exit(2);
-            }
-            Err(e) => {
-                eprintln!("spendkey: --sign: {e}");
-                exit(2);
-            }
-        };
-        println!("signature\t{}", codec::hex(&ks.sign(&root)));
-    }
 }
 
 fn run_cmd(args: &[String]) {
@@ -1200,32 +815,6 @@ fn run_cmd(args: &[String]) {
         },
     };
 
-    // The proposal-lag gate. OFF unless asked for, because armed it is a
-    // liveness-policy change the whole fleet must make together — see the
-    // gate in `engine::Engine::propose` for the full argument, including why
-    // a fleet armed through a total outage cannot restart itself. A zero
-    // margin is refused rather than clamped: the head is always at least one
-    // slot behind the slot being proposed for, so zero means "never propose",
-    // which nobody armed a proposer to do.
-    let max_propose_lag_slots = match arg_value(args, "--max-propose-lag").as_deref() {
-        None | Some("off") => None,
-        Some(s) => match s.parse::<u64>() {
-            Ok(0) => {
-                eprintln!(
-                    "run: --max-propose-lag 0 would decline every proposal (the head is \
-                     always at least one slot behind the slot being proposed); use a margin \
-                     well above the chain's normal empty stretches, e.g. 240"
-                );
-                exit(2);
-            }
-            Ok(n) => Some(n),
-            Err(_) => {
-                eprintln!("run: --max-propose-lag must be a slot count or `off` (got `{s}`)");
-                exit(2);
-            }
-        },
-    };
-
     let cfg = engine::Config {
         data_dir: PathBuf::from(data_dir),
         genesis_path: PathBuf::from(genesis_path),
@@ -1251,31 +840,6 @@ fn run_cmd(args: &[String]) {
         // exposed port is a write surface, not only a read one.
         rpc_bind: arg_value(args, "--rpc-bind").unwrap_or_else(|| "127.0.0.1".to_string()),
         rpc_port,
-        max_propose_lag_slots,
-        accept_new_signing_history: args.iter().any(|a| a == "--accept-new-signing-history"),
-        doppelganger_epochs: match arg_value(args, "--doppelganger-epochs") {
-            None => 2,
-            Some(v) => match v.parse::<u64>() {
-                Ok(n) => n,
-                Err(_) => {
-                    eprintln!("run: --doppelganger-epochs takes a number of epochs (got `{v}`)");
-                    exit(2);
-                }
-            },
-        },
-        state_snapshot: arg_value(args, "--state-snapshot").map(PathBuf::from),
-        state_sync: args.iter().any(|a| a == "--state-sync"),
-        export_state_epoch: match arg_value(args, "--export-state-epoch") {
-            None => None,
-            Some(s) => match s.parse::<u64>() {
-                Ok(e) => Some(e),
-                Err(_) => {
-                    eprintln!("run: --export-state-epoch must be an epoch number (got `{s}`)");
-                    exit(2);
-                }
-            },
-        },
-        export_state_out: arg_value(args, "--export-state-out").map(PathBuf::from),
     };
     if let Err(e) = engine::run(cfg) {
         eprintln!("bloch-pos: {e}");
@@ -1349,157 +913,4 @@ fn self_check() {
     // Migration design §5.1: the slot cadence everything descends from.
     assert_eq!(SLOT_DURATION_SECS, 30);
     assert_eq!(SLOTS_PER_EPOCH, 32);
-}
-
-/// The consensus flag days this binary was built knowing. `u64::MAX` means the
-/// gate ships INERT — code present, rule not armed.
-///
-/// This is the release-page compatibility statement, produced by the binary
-/// itself so it cannot drift from the code — the same principle as the version
-/// stamp (deploy/RELEASE-INTEGRITY.md §1: nothing that cannot state its own
-/// identity is a release). The defect it closes is `genesis4-node-20260814`:
-/// a published binary that predated the epoch-800 and epoch-1400 armings,
-/// diverged on schedule, and whose release page said nothing — because there
-/// was no artifact that could say it.
-///
-/// Two binaries are consensus-compatible at epoch E if and only if their gate
-/// lists agree on every gate with activation epoch ≤ E. A binary missing a
-/// gate armed after it was published follows the old rule at that epoch and
-/// forks. `gates_digest` collapses the comparison to one string equality.
-///
-/// Keep this list in sync with the armed/inert gate constants in
-/// `bloch_pos_committee::params` — the tripwire test in that crate pins the
-/// armed values; this table is the mirror the outside world sees.
-const CONSENSUS_GATES: [(&str, u64); 5] = [
-    (
-        "TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH",
-        TRANSFER_WITNESS_DEDUP_ACTIVATION_EPOCH,
-    ),
-    (
-        "BLOCK_BYTES_V2_ACTIVATION_EPOCH",
-        BLOCK_BYTES_V2_ACTIVATION_EPOCH,
-    ),
-    (
-        "LEAKED_ROSTER_ACTIVATION_EPOCH",
-        LEAKED_ROSTER_ACTIVATION_EPOCH,
-    ),
-    (
-        "ANCESTRY_SEED_ACTIVATION_EPOCH",
-        ANCESTRY_SEED_ACTIVATION_EPOCH,
-    ),
-    (
-        "LEAK_RECOVERY_ACTIVATION_EPOCH",
-        LEAK_RECOVERY_ACTIVATION_EPOCH,
-    ),
-];
-
-/// SHA3-256 over the canonical serialization of [`CONSENSUS_GATES`]: one
-/// `NAME=<epoch|inert>\n` line per gate, sorted by name. Sorted, so the digest
-/// is a property of the gate SET, not of declaration order.
-fn consensus_gates_digest() -> String {
-    use sha3::{Digest, Sha3_256};
-    let mut lines: Vec<String> = CONSENSUS_GATES
-        .iter()
-        .map(|(name, epoch)| {
-            if *epoch == u64::MAX {
-                format!("{name}=inert\n")
-            } else {
-                format!("{name}={epoch}\n")
-            }
-        })
-        .collect();
-    lines.sort();
-    let digest: [u8; 32] = Sha3_256::digest(lines.concat().as_bytes()).into();
-    hex_lower(&digest)
-}
-
-/// The machine-readable consensus-compatibility statement, for release pages
-/// and fleet sweeps: `bloch-pos selfcheck --json`. Hand-rolled JSON on
-/// purpose — every value is a constant this binary links, and a serializer
-/// dependency for eight fields would be surface without benefit.
-fn consensus_compat_json() -> String {
-    let mut gates = String::new();
-    let mut max_armed: u64 = 0;
-    for (i, (name, epoch)) in CONSENSUS_GATES.iter().enumerate() {
-        if i > 0 {
-            gates.push_str(",\n");
-        }
-        if *epoch == u64::MAX {
-            gates.push_str(&format!("    {{\"name\": \"{name}\", \"epoch\": null}}"));
-        } else {
-            gates.push_str(&format!("    {{\"name\": \"{name}\", \"epoch\": {epoch}}}"));
-            max_armed = max_armed.max(*epoch);
-        }
-    }
-    format!(
-        "{{\n  \"binary\": \"{NAME} {VERSION}\",\n  \"block_version\": \"{:#010x}\",\n  \
-         \"slot_duration_secs\": {SLOT_DURATION_SECS},\n  \"slots_per_epoch\": {SLOTS_PER_EPOCH},\n  \
-         \"consensus_gates\": [\n{gates}\n  ],\n  \
-         \"gates_digest\": \"{}\",\n  \
-         \"knows_gates_through_epoch\": {max_armed},\n  \
-         \"compatibility_rule\": \"valid at epoch E only if this gate list matches the canonical one on every gate with epoch <= E; a gate armed on the network after this build makes this binary consensus-dead at that gate's epoch\"\n}}",
-        bloch_pos_committee::header::VERSION_G4,
-        consensus_gates_digest(),
-    )
-}
-
-/// Human form of the same statement, printed after `selfcheck` passes.
-fn print_consensus_compat() {
-    println!("\nconsensus gates this binary knows (epoch = flag day; inert = not armed):");
-    for (name, epoch) in CONSENSUS_GATES {
-        if epoch == u64::MAX {
-            println!("  {name:<44} inert");
-        } else {
-            println!("  {name:<44} {epoch}");
-        }
-    }
-    println!("  gates digest: {}", consensus_gates_digest());
-    println!(
-        "A gate armed on the network after this build makes this binary\n\
-         consensus-dead at that gate's epoch. Compare against the current\n\
-         release page before trusting this node past today's epoch.\n\
-         Machine-readable: bloch-pos selfcheck --json"
-    );
-}
-
-#[cfg(test)]
-mod consensus_gate_tripwire {
-    use super::CONSENSUS_GATES;
-
-    /// Every `pub const *_ACTIVATION_EPOCH` in the committee params must
-    /// appear in [`CONSENSUS_GATES`], and vice versa. The values cannot drift
-    /// (the table imports the constants); the failure mode this guards is
-    /// OMISSION — a new gate armed in params.rs that the release-page
-    /// statement (`selfcheck --json`) silently does not mention, recreating
-    /// the genesis4-node-20260814 defect one flag day later.
-    #[test]
-    fn gate_table_mirrors_params_exactly() {
-        let params_src = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../bloch-pos-committee/src/params.rs"
-        ))
-        .expect("read bloch-pos-committee/src/params.rs");
-
-        let mut in_params: Vec<&str> = params_src
-            .lines()
-            .filter_map(|l| {
-                let l = l.trim_start();
-                let rest = l.strip_prefix("pub const ")?;
-                let name = rest.split(':').next()?.trim();
-                name.ends_with("_ACTIVATION_EPOCH").then_some(name)
-            })
-            .collect();
-        in_params.sort_unstable();
-        in_params.dedup();
-
-        let mut in_table: Vec<&str> = CONSENSUS_GATES.iter().map(|(n, _)| *n).collect();
-        in_table.sort_unstable();
-
-        assert_eq!(
-            in_params, in_table,
-            "CONSENSUS_GATES (main.rs) and the *_ACTIVATION_EPOCH constants \
-             (params.rs) disagree — a gate is missing from the release \
-             compatibility statement, or names a constant that no longer exists"
-        );
-    }
 }

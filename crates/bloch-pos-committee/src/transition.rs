@@ -157,13 +157,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// see the same constant the header encoder stamps.
 pub use crate::header::VERSION_G4 as BLOCK_VERSION_V4;
 
-/// Checkpoint-sync state snapshots: the canonical byte form of a
-/// [`CommittedState`] and the verified-or-nothing [`snapshot::restore`]. A
-/// CHILD module on purpose — restore reconstructs the struct field by field,
-/// which needs the private fields, and widening them for an external module
-/// would hand every consumer a door around the transition.
-pub mod snapshot;
-
 // ─── Header identity: DELEGATED, never re-derived here ─────────────────────
 //
 // This module carried its own `canonical_header_bytes` / `block_id` /
@@ -959,30 +952,6 @@ pub fn root_computations() -> u64 {
     ROOT_COMPUTATION_COUNT.with(|c| c.get())
 }
 
-thread_local! {
-    /// How many times the copy-on-write eUTXO map was **deeply copied** on
-    /// this thread — the O(n) event [`EutxoSet`]'s `Arc` exists to make rare.
-    ///
-    /// **Observability only.** No consensus rule reads it, nothing branches
-    /// on it, and it is never committed — it exists so a test can assert *how
-    /// many* full-map copies an epoch roll or a block costs, which is the
-    /// claim that decides whether a node far behind the wall clock can catch
-    /// up at all (2026-08-31: `close_epoch`'s clone of a 452,726-entry map,
-    /// once per rolled epoch per arriving attestation, was the whole stall).
-    /// Timing cannot make that claim honestly on a loaded box; a count can.
-    ///
-    /// Per-thread for the same two reasons as [`ROOT_COMPUTATION_COUNT`]: the
-    /// consensus engine is one thread by construction, and a process-wide
-    /// atomic would make test assertions a race against every other test in
-    /// the binary.
-    static EUTXO_MAP_DEEP_COPIES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
-/// The calling thread's [`EUTXO_MAP_DEEP_COPIES`]. Observability only.
-pub fn eutxo_map_deep_copies() -> u64 {
-    EUTXO_MAP_DEEP_COPIES.with(|c| c.get())
-}
-
 // ────────────────────────────────────────────────────────────────────────────
 // The boundary-partition divergence detector (unconditional, NON-FATAL)
 // ────────────────────────────────────────────────────────────────────────────
@@ -1050,12 +1019,8 @@ fn report_boundary_vote_drop(closing: u64, admitted: usize, tallied: usize) {
 ///
 /// A plain value: `Clone` + `PartialEq`, no interior mutability, no handles.
 /// Everything a consensus rule may read arrives through this struct, and the
-/// struct is only ever produced by [`CommittedState::genesis`], by the
-/// transition itself, or by [`snapshot::restore`] — which exists for
-/// checkpoint-sync and refuses to produce a value whose recomputed state
-/// root is not the one a verified checkpoint commits to. There is still no
-/// constructor that reads a database, and no constructor that skips
-/// verification.
+/// struct is only ever produced by [`CommittedState::genesis`] or by the
+/// transition itself — there is no constructor that reads a database.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CommittedState {
     /// Slot of the block whose post-state this is.
@@ -1265,66 +1230,21 @@ pub struct CommittedState {
 /// recomputed one cannot disagree by construction.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct EutxoSet {
-    /// Behind an `Arc`, and that is a **liveness** decision, not a style one
-    /// (2026-08-31). `CommittedState` is cloned in two places that never
-    /// touch this map: `close_epoch` (via `Transition::process_epoch`) and
-    /// `compute_post_state`'s `pre.clone()`. A node `E` epochs behind the
-    /// wall clock re-derives `rolled_to(wall_epoch)` after every applied
-    /// block — the memo is generation-keyed and an applied block moves the
-    /// generation — so it paid `E` full copies of this map (452,726 entries,
-    /// ~60 MB, tens of ms each) *per block* while catching up. The break-even
-    /// was near a 6–10 epoch gap; a cold start (~1,550 epochs) held
-    /// `E × 60 MB` transiently and was unconditionally fatal. Sharing the map
-    /// makes those clones a refcount bump, exactly as the `Smt` beside it
-    /// already shares its nodes.
-    ///
-    /// Mutation goes through [`EutxoSet::entries_mut`] — `Arc::make_mut`, so
-    /// a *shared* map is copied in full once, on first write, and a writer
-    /// can never be observed by the states it was cloned from. The copy this
-    /// buys back is the one `pre.clone()` used to pay unconditionally: it now
-    /// happens only for a block that actually moves the ledger, and
-    /// [`EUTXO_MAP_DEEP_COPIES`] counts every occurrence so tests can pin
-    /// "an epoch roll copies nothing" as an assertion rather than a timing.
-    ///
-    /// **Not a consensus change.** The entries, their `BTreeMap` iteration
-    /// order, the leaves and the root are bit-identical to the unshared
-    /// representation; only *when the allocator copies* moved.
-    entries: std::sync::Arc<BTreeMap<([u8; 32], u32), crate::state_root::EutxoEntry>>,
+    entries: BTreeMap<([u8; 32], u32), crate::state_root::EutxoEntry>,
     /// The subtree of `entry key -> value hash` leaves, one per entry, always
     /// exactly in step.
     tree: crate::state_root::Smt,
 }
 
 impl EutxoSet {
-    /// The single mutable path to the entries map — copy-on-write.
-    ///
-    /// If the map is shared (any other `CommittedState` clone still holds
-    /// it), `Arc::make_mut` copies it in full first; the counter records that
-    /// this happened, because "how many full copies" is the load-bearing
-    /// claim of the whole representation (see the field docs). Both mutators
-    /// go through here so no third path can copy — or worse, fail to
-    /// unshare — without being counted.
-    fn entries_mut(&mut self) -> &mut BTreeMap<([u8; 32], u32), crate::state_root::EutxoEntry> {
-        if std::sync::Arc::get_mut(&mut self.entries).is_none() {
-            EUTXO_MAP_DEEP_COPIES.with(|c| c.set(c.get() + 1));
-        }
-        std::sync::Arc::make_mut(&mut self.entries)
-    }
-
     fn insert(&mut self, entry: crate::state_root::EutxoEntry) {
         let (key, value_hash) = crate::state_root::eutxo_leaf(&entry);
         self.tree.insert(key, value_hash);
-        self.entries_mut().insert((entry.txid, entry.vout), entry);
+        self.entries.insert((entry.txid, entry.vout), entry);
     }
 
     fn remove(&mut self, outpoint: &([u8; 32], u32)) {
-        // The containment probe runs on the shared map so removing an absent
-        // outpoint stays what it always was — a no-op — instead of becoming
-        // the one full-map copy this type exists to avoid.
-        if !self.entries.contains_key(outpoint) {
-            return;
-        }
-        if let Some(entry) = self.entries_mut().remove(outpoint) {
+        if let Some(entry) = self.entries.remove(outpoint) {
             let (key, _) = crate::state_root::eutxo_leaf(&entry);
             self.tree.remove(&key);
         }
@@ -1397,10 +1317,7 @@ impl FromIterator<crate::state_root::EutxoEntry> for EutxoSet {
         // leaves — and therefore commit an identical root.
         let leaves: BTreeMap<[u8; 32], [u8; 32]> =
             entries.values().map(crate::state_root::eutxo_leaf).collect();
-        EutxoSet {
-            entries: std::sync::Arc::new(entries),
-            tree: crate::state_root::Smt::from_leaf_map(&leaves),
-        }
+        EutxoSet { entries, tree: crate::state_root::Smt::from_leaf_map(&leaves) }
     }
 }
 
@@ -2724,49 +2641,6 @@ impl CommittedState {
         self.validators.len()
     }
 
-    /// Did `validator` have an attestation included on the canonical chain in
-    /// the CURRENT (open) epoch? `None` when the participation map does not
-    /// track this index — a validator outside the epoch's duty roster, or an
-    /// index the chain does not know.
-    ///
-    /// Observability read, node-local reporting only: this is the same
-    /// `current_participation` map rewards read at the epoch close, exposed
-    /// so an operator can be told "your attestation landed" without grepping
-    /// a log. It writes nothing and no consensus rule reads it through here.
-    pub fn attested_in_current_epoch(&self, validator: u32) -> Option<bool> {
-        self.current_participation.get(&validator).copied()
-    }
-
-    /// Did `validator` have an attestation included in the PREVIOUS epoch —
-    /// the epoch whose rewards have been (or are about to be) settled? Same
-    /// contract as [`Self::attested_in_current_epoch`].
-    pub fn attested_in_previous_epoch(&self, validator: u32) -> Option<bool> {
-        self.previous_participation.get(&validator).copied()
-    }
-
-    /// The inactivity leak accrued against `validator`, in satoshis. Zero for
-    /// a validator that is voting (or has not been leaking long enough to
-    /// accrue). Observability read of the same number `active_validators`
-    /// subtracts from effective stake; exposed so an operator can see a leak
-    /// eating their stake while it is still small.
-    pub fn leaked_of(&self, validator: u32) -> u64 {
-        self.finality_engine.leaked_of(validator)
-    }
-
-    /// The committed RANDAO reveal count of one validator — how many links
-    /// down its hash chain the canonical chain has consumed.
-    ///
-    /// Exposed for the node's proposer path: on a checkpoint-synced node the
-    /// canonical chain below the sync base is not held, so counting one's own
-    /// canonical blocks (the old positioning rule) undercounts. The committed
-    /// pair `(randao_commitment, reveals_used)` is the transition's own
-    /// definition of where the chain stands — the same value `apply_block`
-    /// judges the next reveal against — so positioning from it cannot drift
-    /// from what the validator will be checked with.
-    pub fn reveals_used_of(&self, validator: u32) -> u32 {
-        *self.reveals_used.get(&validator).unwrap_or(&0)
-    }
-
     /// Every unspent output, in `(txid, vout)` order.
     ///
     /// Order is the map's, so it is a function of the data and not of insertion
@@ -3846,7 +3720,7 @@ mod tests {
         h.finalize().to_vec()
     }
 
-    pub(super) struct ToyVerifier;
+    struct ToyVerifier;
     impl SignatureVerifier for ToyVerifier {
         fn verify(&self, _v: u32, _root: &[u8; 32], _sig: &[u8]) -> bool {
             true
@@ -4275,97 +4149,6 @@ mod tests {
         setup_with(n, ToyVerifier, opening_balances)
     }
 
-    /// A distinguishable output for the copy-on-write tests.
-    fn cow_coin(i: u32) -> crate::state_root::EutxoEntry {
-        let mut txid = [0u8; 32];
-        txid[..4].copy_from_slice(&i.to_le_bytes());
-        crate::state_root::EutxoEntry {
-            txid,
-            vout: 0,
-            value: 1_000 + i as u64,
-            script_hash: [7u8; 32],
-        }
-    }
-
-    /// **The catch-up fix's load-bearing claim, as a count.** Rolling a state
-    /// across epoch boundaries — what `rolled_to(wall_epoch)` does once per
-    /// applied block on a node that is behind — must copy the eUTXO map ZERO
-    /// times, because `close_epoch` never writes to the ledger. Before the
-    /// `Arc` (2026-08-31) it copied the full map once per epoch crossed,
-    /// which at carryover scale (452,726 entries, ~60 MB) made a gap of ~15
-    /// epochs a stall and a cold start (~1,550 epochs) fatal.
-    ///
-    /// The `ptr_eq` half is what makes this a sharing test and not an
-    /// equality test: fifty rolls end on the *same allocation* the genesis
-    /// state holds, so the memory a roll of N epochs pins is N × (the small
-    /// per-epoch fields), never N × the ledger.
-    #[test]
-    fn an_epoch_roll_deep_copies_no_eutxo_maps() {
-        let balances: Vec<_> = (0..512).map(cow_coin).collect();
-        let (_t, st, _chains) = setup_funded(8, &balances);
-        let before = eutxo_map_deep_copies();
-        let mut cur = st.clone();
-        for _ in 0..50 {
-            cur = cur.close_epoch();
-        }
-        assert_eq!(
-            eutxo_map_deep_copies() - before,
-            0,
-            "an epoch roll wrote to the ledger, or a clone stopped sharing it — \
-             either way a catching-up node is back to one full-map copy per epoch per block"
-        );
-        assert_eq!(cur.eutxos, st.eutxos, "a boundary must not move the ledger");
-        assert!(
-            std::sync::Arc::ptr_eq(&cur.eutxos.entries, &st.eutxos.entries),
-            "the rolled state re-allocated an identical ledger instead of sharing it"
-        );
-    }
-
-    /// The other half of copy-on-write: a write to a *shared* map copies it
-    /// exactly once, unshares it, and is invisible to every other holder —
-    /// and a no-op write (removing an absent outpoint) copies nothing.
-    #[test]
-    fn a_ledger_write_copies_the_shared_map_once_and_disturbs_no_sharer() {
-        let balances: Vec<_> = (0..8).map(cow_coin).collect();
-        let (_t, st, _chains) = setup_funded(4, &balances);
-        let root_before = st.state_root();
-
-        let mut writer = st.clone();
-        let before = eutxo_map_deep_copies();
-        writer.eutxos.remove(&(balances[0].txid, balances[0].vout));
-        assert_eq!(
-            eutxo_map_deep_copies() - before,
-            1,
-            "the first write to a shared map must pay exactly one full copy"
-        );
-        writer.eutxos.remove(&(balances[1].txid, balances[1].vout));
-        assert_eq!(
-            eutxo_map_deep_copies() - before,
-            1,
-            "the map was unshared by the first write; the second must not copy again"
-        );
-
-        // The sharer still holds both spent outputs, and its root stands.
-        assert!(st.eutxos.get(&(balances[0].txid, balances[0].vout)).is_some());
-        assert!(st.eutxos.get(&(balances[1].txid, balances[1].vout)).is_some());
-        assert_eq!(st.state_root(), root_before, "a writer's edit leaked into its sharer");
-        assert_ne!(writer.state_root(), root_before, "control: the writes must move the writer");
-
-        // Removing an outpoint that is not there is a no-op, not a copy.
-        let mut reader = st.clone();
-        let before = eutxo_map_deep_copies();
-        reader.eutxos.remove(&([0xEE; 32], 7));
-        assert_eq!(
-            eutxo_map_deep_copies() - before,
-            0,
-            "a no-op remove on a shared map must not pay the full-map copy"
-        );
-        assert!(
-            std::sync::Arc::ptr_eq(&reader.eutxos.entries, &st.eutxos.entries),
-            "a no-op remove must leave the map shared"
-        );
-    }
-
     /// What a block-level state root costs at Genesis-4's real carryover
     /// size, and what the `pre.clone()` in `apply_block` costs beside it.
     ///
@@ -4488,7 +4271,7 @@ mod tests {
 
     /// Build a valid block at `slot` on top of `pre`, consuming the drawn
     /// proposer's next reveal — the same walk a real validator client does.
-    pub(super) fn build_block<V: SignatureVerifier>(
+    fn build_block<V: SignatureVerifier>(
         t: &Transition<V>,
         pre: &CommittedState,
         slot: u64,
@@ -6492,8 +6275,8 @@ mod tests {
     /// all been applied, and one equivocator is barred. This is the fixture
     /// the two tests below share — a state where the pre-extension root would
     /// have been blind to most of what follows.
-    pub(super) fn state_with_live_bookkeeping(
-    ) -> (Transition<ToyVerifier>, CommittedState, Vec<Attestation>, Vec<RandaoChain>) {
+    fn state_with_live_bookkeeping() -> (Transition<ToyVerifier>, CommittedState, Vec<Attestation>)
+    {
         // Funded, and the transfer below actually spends: the unspent set is
         // one of the components the root must bind, and a fixture where it sat
         // empty (or untouched since genesis) would exercise that leaf
@@ -6545,7 +6328,7 @@ mod tests {
         assert!(!st.delegations.is_empty());
         assert!(!st.pending_fee_rewards.is_empty());
         assert!(!st.boundary_mixes.is_empty());
-        (t, st, atts, chains)
+        (t, st, atts)
     }
 
     /// Every consensus-relevant `CommittedState` field moves the root; every
@@ -6557,7 +6340,7 @@ mod tests {
     /// this list to diff against the struct.
     #[test]
     fn every_committed_state_field_is_bound_by_the_root() {
-        let (_t, st, _, _) = state_with_live_bookkeeping();
+        let (_t, st, _) = state_with_live_bookkeeping();
         let base = st.compute_root();
 
         let mut moved = vec![base];

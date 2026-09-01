@@ -631,17 +631,7 @@ fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
     // Loopback, ephemeral port, no peers. Nothing in this file dials, listens
     // for, or sends anything to any network.
     let net = net::Net::Devnet(
-        net::start(
-            "127.0.0.1",
-            0,
-            Vec::new(),
-            tx,
-            dir.to_path_buf(),
-            head_slot.clone(),
-            inflight,
-            Arc::new(crate::time_check::PeerClock::new()),
-            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        )
+        net::start("127.0.0.1", 0, Vec::new(), tx, dir.to_path_buf(), head_slot.clone(), inflight)
             .expect("loopback devnet transport"),
     );
     Engine {
@@ -650,13 +640,6 @@ fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
         tr_probe: Transition::new(ProbeVerifier),
         verifier,
         keys: None, // observer: replay proposes nothing and attests nothing
-        guard: None,
-        doppelganger: None,
-        peers_connected: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        peers_configured: 0,
-        attestations_signed: 0,
-        proposals_signed: 0,
-        duties_refused: 0,
         blocks: BTreeMap::new(),
         chain: vec![(0, genesis_id)],
         canonical: BTreeSet::from([*genesis_id.as_bytes()]),
@@ -680,10 +663,6 @@ fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
         ws_anchor_hard: false,
         ws_conflict_reported: false,
         fc_covered_removals: 0,
-        max_propose_lag_slots: None,
-        base: super::BaseState::Genesis,
-        sync_base: None,
-        last_boundary_export: None,
         manifest,
     }
 }

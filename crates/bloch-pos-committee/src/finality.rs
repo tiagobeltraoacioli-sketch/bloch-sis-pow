@@ -193,31 +193,30 @@ impl FinalityState {
     ///
     /// # Why it is presently identical to [`FinalityState::new`]
     ///
-    /// Because `new` already starts empty. Since 2026-08-31 a restore path
-    /// DOES exist — [`FinalityState::from_committed_parts`], the
-    /// checkpoint-sync state download's rebuild of the fold from the
-    /// committed `LeakRecord`s — but it is not, and must never be, wired
-    /// here: a relaunch opens a fresh book on purpose (the founder's amnesty
-    /// decision), while a snapshot restore carries the accrued ledger
-    /// forward under a state-root check. Two constructors, two meanings,
-    /// each pinned: `the_relaunch_opens_its_books_with_an_empty_leak_ledger`
-    /// fails the build the day the restore path is quietly wired here, and
-    /// `the_leak_ledger_is_committed_and_restored_by_exactly_one_path` fails
-    /// it the day anything but the root-verified snapshot restore consumes
-    /// the restore path.
+    /// Because `new` already starts empty, and — verified across the whole
+    /// workspace on 2026-08-24 — **nothing ever reconstructs `leaked` from
+    /// committed state**. `leaked` is *written* into the state root as
+    /// [`crate::state_root::LeakRecord`]s and is never read back; the only
+    /// production constructors are `new` (from `CommittedState::genesis`) and
+    /// [`crate::ws::anchor`], both of which start empty. So a
+    /// relaunch-from-genesis already inherits nothing.
     ///
-    /// # The old asymmetry, now closed for snapshot boots
+    /// That makes this a *pin*, not a patch, and the pin is the point: it
+    /// gives the relaunch one named call site, and
+    /// `the_relaunch_opens_its_books_with_an_empty_leak_ledger` fails the
+    /// build the day someone adds a restore path and quietly wires it here.
     ///
-    /// This doc used to record a latent §5.5 hazard: a checkpoint-booted
-    /// node held `leaked = {}` while a replaying node held the accrued
-    /// balance, so once [`crate::params::LEAKED_ROSTER_ACTIVATION_EPOCH`]
-    /// bound they derived different consensus rosters from the same chain.
-    /// Checkpoint-sync now restores the ledger from committed state
-    /// (verified against the checkpoint's `state_root`), so the two nodes
-    /// hold the same book — proven bit-identical by the snapshot
-    /// continuation test. What still opens empty: this relaunch (by
-    /// decision) and [`crate::ws::anchor`] (an anchor is two fields, not a
-    /// state; it still has no caller in the node).
+    /// # Known asymmetry, stated rather than fixed (LATENT — no live caller)
+    ///
+    /// Because the ledger is committed but never restored, a node that boots
+    /// from a weak-subjectivity checkpoint holds `leaked = {}` while a node
+    /// that replayed the same history holds the accrued balance. Once
+    /// [`crate::params::LEAKED_ROSTER_ACTIVATION_EPOCH`] binds, those two
+    /// nodes derive **different** consensus rosters from the same chain — the
+    /// §5.5 failure shape exactly. It is latent today only because
+    /// [`crate::ws::anchor`] has no caller in the node. Fixing it means either
+    /// restoring the ledger from the checkpoint or dropping it from the state
+    /// root; both are consensus changes and neither belongs in this relaunch.
     pub fn relaunch(genesis: Checkpoint) -> Self {
         let st = Self::new(genesis);
         debug_assert!(st.leaked.is_empty(), "a relaunch must not inherit a leak balance");
@@ -604,33 +603,6 @@ impl FinalityState {
     /// and same rules as [`FinalityState::justified_checkpoints`].
     pub fn leaked_stakes(&self) -> impl Iterator<Item = (u32, u64)> + '_ {
         self.leaked.iter().map(|(v, s)| (*v, *s))
-    }
-
-    /// Rebuild a fold state from its committed components — the
-    /// checkpoint-sync restore path (`transition::snapshot`), and nothing
-    /// else.
-    ///
-    /// This deliberately breaks the "only [`FinalityState::new`] and the fold
-    /// itself produce values of this type" property, so the terms are stated
-    /// here: every field this constructor accepts is committed under
-    /// `TAG_FINALITY` in the state root (`state_root::FinalityRecord` carries
-    /// the full fold state), and the ONLY caller is a restore that recomputes
-    /// that root and refuses the whole state on a mismatch. A caller that
-    /// could hand this constructor unverified values would be a second
-    /// producer of finality out of thin air — do not add one.
-    ///
-    /// `justified` is taken as `(epoch, root)` pairs exactly as
-    /// [`FinalityState::justified_checkpoints`] renders them; at most one
-    /// root per epoch is representable by the map, matching the
-    /// disjoint-quorums invariant.
-    pub fn from_committed_parts(
-        justified: BTreeMap<u64, [u8; 32]>,
-        current_justified: Checkpoint,
-        finalized: Checkpoint,
-        leaked: BTreeMap<u32, u64>,
-        next_epoch: u64,
-    ) -> Self {
-        FinalityState { justified, current_justified, finalized, leaked, next_epoch }
     }
 }
 
@@ -1581,83 +1553,49 @@ mod tests {
         );
     }
 
-    /// **The ledger is committed AND restored — the sentinel that guarded the
-    /// gap now pins its closure.**
+    /// **The ledger is committed but never restored** — stated as a finding,
+    /// not fixed here.
     ///
-    /// Until 2026-08-31 this test asserted the *absence* of a restore path,
-    /// with instructions for whoever added one: decide what it restores FROM,
-    /// and re-read `relaunch()` before trusting it. Both are now answered:
-    ///
-    /// - **What it restores from.** [`FinalityState::from_committed_parts`]
-    ///   exists for exactly one caller — `transition::snapshot::restore`, the
-    ///   checkpoint-sync state download — and every input it accepts is
-    ///   committed under `TAG_FINALITY` (the `LeakRecord`s included). The
-    ///   restore recomputes the whole state root and refuses the artifact on
-    ///   a mismatch, so a checkpoint-booted node now holds the SAME ledger a
-    ///   replaying node accrued — bit-identical, pinned by
-    ///   `snapshot::tests::restored_state_continues_identically_to_the_replayed_one`,
-    ///   which compares the full states (ledger included) across an epoch
-    ///   boundary. The §5.5 roster divergence this test used to record as a
-    ///   latent finding is closed for snapshot boots.
-    /// - **`relaunch()` re-read.** It remains the deliberately-EMPTY-ledger
-    ///   entry for a Genesis-4 relaunch, it is NOT reachable from the
-    ///   snapshot path (checked below), and
-    ///   `the_relaunch_opens_its_books_with_an_empty_leak_ledger` still pins
-    ///   its emptiness. `ws::anchor` also still starts empty and still has no
-    ///   caller in the node — the engine anchors a downloaded state by
-    ///   installing its restored finality engine whole, never by rebuilding
-    ///   one from the checkpoint's two fields.
+    /// `transition.rs` writes every entry into the state root as a
+    /// `LeakRecord`. Nothing anywhere reads them back into a `FinalityState`:
+    /// the ledger is rebuilt only by replaying history. So a checkpoint-booted
+    /// node and a replaying node hold different ledgers for the same chain,
+    /// and once `LEAKED_ROSTER_ACTIVATION_EPOCH` binds they derive different
+    /// consensus rosters from it — the §5.5 shape again. Latent only because
+    /// `ws::anchor` has no caller in the node.
     #[test]
-    fn the_leak_ledger_is_committed_and_restored_by_exactly_one_path() {
+    fn the_leak_ledger_is_committed_but_never_restored() {
         let transition = include_str!("transition.rs");
         assert!(
             transition.contains(".leaked_stakes()"),
-            "the write side vanished; this pin is stale and must be re-derived"
+            "the write side vanished; then this finding is stale and must be re-derived"
         );
-        // Strip comments so the needles below match code, not prose — same
-        // rule (and same incident behind it) as
-        // `the_leak_ledger_shrinks_only_under_a_governed_rule`.
-        let strip = |src: &str| -> String {
-            src.lines()
-                .filter(|l| {
-                    let t = l.trim_start();
-                    !t.starts_with("//") && !t.contains("concat!(")
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        let finality = strip(include_str!("finality.rs"));
-        let restore_fn = concat!("fn from", "_committed_parts");
-        assert!(
-            finality.contains(restore_fn),
-            "the restore path is gone: either checkpoint-sync lost its ledger restore \
-             (the §5.5 roster divergence is back for snapshot boots) or it moved — \
-             re-derive this pin either way"
-        );
-        // Exactly one production consumer: the snapshot restore, which is the
-        // path that verifies against the state root. The relaunch and the ws
-        // anchor must NOT quietly become consumers — an unverified caller
-        // would be a second producer of finality out of thin air.
-        let snapshot = strip(include_str!("transition/snapshot.rs"));
-        assert!(
-            snapshot.contains(concat!("from", "_committed_parts(")),
-            "snapshot restore no longer rebuilds the finality fold from committed parts"
-        );
-        let ws = strip(include_str!("ws.rs"));
-        assert!(
-            !ws.contains(concat!("from", "_committed_parts")),
-            "ws.rs now calls the finality restore path — an anchor is two fields, not a \
-             verified state; only the root-checked snapshot restore may rebuild the fold"
-        );
-        assert!(
-            !strip(transition).contains(concat!("from", "_committed_parts")),
-            "transition.rs (outside the snapshot child) calls the finality restore path; \
-             the transition accrues the ledger, it never restores one"
-        );
+        // Same stripping as `the_leak_ledger_shrinks_only_under_a_governed_rule`,
+        // and for the same reason: `include_str!` reads THIS test too, so the
+        // needles below would otherwise match their own assertion and report a
+        // restore path that does not exist. That is exactly what happened on
+        // the first recorded run of `scripts/prova-relanca.sh` — the gate went
+        // red against an unchanged tree. A self-matching guard is a false
+        // alarm, and a false alarm gets deleted rather than answered.
+        let finality: String = include_str!("finality.rs")
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.contains("concat!(")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        for needle in [concat!("fn from", "_committed"), concat!("fn with", "_leaked")] {
+            assert!(
+                !finality.contains(needle),
+                "a restore path appeared (`{needle}`). GOOD — but the relaunch must now \
+                 decide what it restores FROM, and `relaunch()` must be re-read before it \
+                 is trusted."
+            );
+        }
         println!(
-            "LEAK LEDGER RESTORE: committed as LeakRecord, read back by exactly one \
-             root-verified path (transition::snapshot::restore); relaunch() and \
-             ws::anchor still open empty, on purpose"
+            "FINDING (latent): `leaked` is committed as LeakRecord and never read back; \
+             a ws-checkpoint boot and a replay boot disagree on the ledger by construction"
         );
     }
 

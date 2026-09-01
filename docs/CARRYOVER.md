@@ -1,16 +1,5 @@
 # Genesis-3 carry-over snapshot
 
-> **HISTORICAL — this document describes a file that is no longer in this
-> repository.** On 2026-08-14 `carryover.tsv.gz` was replaced by the
-> **Genesis-3 terminal snapshot** (the state Genesis-4 opened with: 452,726
-> rows, uncompressed SHA-256 `84ddbbac2afd…`, gz SHA-256 `4d1e2738baec…`).
-> The current file is documented in the root `CARRYOVER-SNAPSHOT.md` and
-> verified by the root `carryover.tsv.gz.sha256`. The Genesis-1 snapshot this
-> page describes (413,743 rows, SHA-256 `88f29fd3b7a5…`) exists only in git
-> history before 2026-08-14; the `bloch --genesis3` flags below are the
-> retired PoW node's, not `bloch-pos`. Kept for operators of Genesis-3
-> archive nodes.
-
 Genesis-3 does **not** start from an empty ledger: it opens with the balances
 carried over from the prior chain. A fresh node must ingest that snapshot at
 startup, or it forks off with the wrong opening state and never matches the real
