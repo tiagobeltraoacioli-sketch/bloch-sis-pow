@@ -2724,6 +2724,56 @@ impl CommittedState {
         self.validators.len()
     }
 
+    /// One page of the committed validator registry, in index order.
+    ///
+    /// A `BTreeMap::range` and a `take`, so the cost is O(log V + page) and
+    /// **not** O(V) with a skip — which is the difference between a paginated
+    /// read and a full walk dressed up as one. The caller clamps `limit`; this
+    /// function honours whatever it is given, because a bound that lives in two
+    /// places is a bound that can disagree with itself.
+    ///
+    /// `start` is a registry index, not an offset. The registry is a map and
+    /// may be sparse: a caller resumes from `last returned index + 1`, never
+    /// from `previous start + limit`. Nothing here promises the indices are
+    /// contiguous.
+    ///
+    /// Cloned rather than borrowed because [`StateReader::validator_record`]
+    /// already clones, and a `Vec<&ValidatorRecord>` would pin a borrow of the
+    /// whole state across the JSON build on the consensus thread.
+    pub fn validator_records(&self, start: u32, limit: usize) -> Vec<ValidatorRecord> {
+        self.validators.range(start..).take(limit).map(|(_, r)| r.clone()).collect()
+    }
+
+    /// Satoshis this chain has **ever issued**, as committed under
+    /// `TAG_ISSUED_SUPPLY`.
+    ///
+    /// A field read of already-committed state — the same shape as
+    /// [`Self::validator_count`] and [`Self::balance_sat`], and for the same
+    /// reason: the field is private (correct — nothing outside the transition
+    /// may write it) and a query surface still has to be able to answer "how
+    /// much exists".
+    ///
+    /// # This is not circulating supply, and a caller will assume it is
+    ///
+    /// The counter is **gross and monotone**. Fees move existing coins,
+    /// whistleblower rewards come out of slashed bonds, and burns never
+    /// decrement it — they widen the gap below the cap. Two consequences a
+    /// supply audit gets wrong by default:
+    ///
+    /// - `TOTAL_SUPPLY_SAT - issued_sat` is the **unminted validator emission
+    ///   budget**, not "coins the chain has yet to create". Everything except
+    ///   the validator emission exists from slot 0, because
+    ///   `GENESIS_ISSUED_SAT = TOTAL_SUPPLY_SAT - VALIDATOR_EMISSION_SAT`.
+    /// - Nothing here is net of burns, so this is an upper bound on what could
+    ///   be spendable, never the amount that is.
+    ///
+    /// Circulating supply needs [`Self::eutxos`] summed in full, which is a
+    /// scan of the whole set on the consensus thread. It is deliberately not
+    /// derived here. See `BLOCH-RPC-STABILITY-V4.md` §5.1.
+    pub fn issued_sat(&self) -> u128 {
+        self.issued_sat
+    }
+
     /// Every unspent output, in `(txid, vout)` order.
     ///
     /// Order is the map's, so it is a function of the data and not of insertion
