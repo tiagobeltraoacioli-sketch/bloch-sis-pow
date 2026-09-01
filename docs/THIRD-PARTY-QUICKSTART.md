@@ -179,33 +179,40 @@ clone, `cargo build --locked --release -p bloch-pos-node`:
 
 | Box | Wall clock |
 |---|---|
-| A | **2 min 59 s** |
-| B | **3 min 28 s** |
+| A | **3 min 16 s** |
+| B | **4 min 15 s** |
 
 Two vCPUs, not eight. Do not "optimise" this by dropping LTO or building in
 debug: both change the binary you validate with.
 
 ### Check what you built against what we published
 
-Both boxes above produced a **byte-identical** binary, so you can compare
-digests rather than trust ours:
+Two independent boxes building this tag produced a **byte-identical** binary,
+so you can compare digests rather than trust ours. The expected digest is
+published as a **release manifest distributed with the tag**
+(`RELEASE-g4-node-20260901.txt`), deliberately not inline in this file: the
+commit hash is compiled into the binary, so a digest committed *inside* the
+repository would change every time the file quoting it changed, and could never
+be correct.
 
+```bash
+sha256sum target/release/bloch-pos      # compare against the release manifest
 ```
-7935aed25817fbaacbac27e21eb77a4c7871484a49cdd7fb19d294e2d683944e  bloch-pos   (7,347,832 bytes)
-```
 
-That digest is for a **`git clone` + `git checkout` of the tag**, built with
-the pinned toolchain **Rust 1.94.0** (the version `Dockerfile` pins) on
-`x86_64-unknown-linux-gnu`. Two caveats that will otherwise waste your
-afternoon:
+Three caveats that will otherwise waste your afternoon:
 
-- **The commit hash is compiled into the binary.** `--version` on the above
-  prints `0.1.0-mainnet (65608807b55e+nogit)`. Building the same source from a
-  tarball or an export instead of a git checkout yields a *different* digest,
-  because the embedded identifier changes. Compare digests only against a build
-  made the same way.
-- A different Rust version will produce a different digest. That is not a
-  tampering signal on its own; it means you have not reproduced our build.
+- **The commit hash is compiled into the binary.** `--version` prints
+  `0.1.0-mainnet (<short sha>+nogit)`. Building the same source from a tarball
+  or a source export rather than a `git` checkout yields a *different* digest,
+  because the embedded identifier differs. Reproduce our build the way §2
+  describes it — clone, checkout the tag — or the comparison is meaningless.
+- **The toolchain is part of the input.** We build with **Rust 1.94.0**, the
+  version `Dockerfile` pins, targeting `x86_64-unknown-linux-gnu`. A different
+  Rust version gives a different digest. That is not a tampering signal on its
+  own; it means you have not reproduced our build.
+- A digest match proves you built the same source we did. It does **not** prove
+  that source is correct — for that, the check that matters is the ancestry one
+  at the top of this section.
 
 ## 3. Get the genesis files
 
@@ -404,31 +411,72 @@ chain than 33,600 by the time you start.
 > real, it is worth having, and it is why this release exists; the memory
 > catastrophe is not the thing you would have hit here.
 
-### The faster path: seed from an archival node — recommended
+### Seeding from an archival node — an alternative, not a shortcut
 
-Given the numbers above, this is the path to use unless you have a specific
-reason to replay from genesis.
+**This document used to call this "the faster path — recommended", on the
+strength of a 10-minute figure. Measured to completion, it is not faster.**
 
-If a full replay does not fit your window, copy `blocks.log`, `meta.bin` and
-`ws_latest.bin` from a healthy node's data directory and let your node replay
-them locally instead of over the network — measured at **52 blocks/s**.
+If you would rather not replay over the network, copy `blocks.log`, `meta.bin`
+and `ws_latest.bin` from a healthy node's data directory and let your node
+replay them locally.
 
-Copy those three files **by name**. Measured on an archival node on
-2026-09-01: `blocks.log` was **453 MB** (`meta.bin` and `ws_latest.bin` are a
-few dozen bytes each), and it grows with the chain, so treat the figure as a
-floor and check before you provision. A data directory may also contain
-`.TRAVADO-*` files — operator-made snapshots of an earlier, stuck log. Do not
-copy those and do not glob the directory; take the three names above.
+Copy those three files **by name**. Measured 2026-09-01, `blocks.log` was
+**469,561,433 bytes (448 MB)** at height 33,602, and it grows with the chain, so
+treat that as a floor and check before you provision. A data directory may also
+contain `.TRAVADO-*` files — operator-made snapshots of an earlier, stuck log.
+Do not copy those and do not glob the directory; take the three names above.
 
-At 52 blocks/s a local replay of the current chain (height ~32,450) is roughly
-**10 minutes**, against ~26 hours or more over the network. That is the whole
-reason this path is the recommended one.
+**Measured to completion**, same idle 2-vCPU / 7.9 GB box, release build,
+replaying a seeded `blocks.log` locally with no peers configured:
+
+| | |
+|---|---|
+| Blocks replayed | 33,608 |
+| Wall clock | **22.1 minutes** (1,328 s) |
+| Lifetime rate | **25.3 blocks/s** |
+| Peak RSS | 983 MB |
+
+Set that beside the network sync measured the same day on an identical box:
+**21.2 minutes**. Within noise of each other, and if anything the seeded path
+was *slower* — it still has to apply and validate every block; it only saves
+fetching them.
+
+> **Where "52 blocks/s" and "10 minutes" came from, because it is worth
+> knowing.** The node's progress line prints a **cumulative average** rate and
+> a `~N min left` derived from it. Both decay steadily as the replay deepens,
+> because fork choice does work proportional to the depth it walks. In the run
+> above the same counter printed:
+>
+> | Progress | Rate it reported |
+> |---|---|
+> | 4.6% | 82.5 blocks/s → *"~7 min left"* |
+> | 22.8% | 54.6 blocks/s |
+> | 41.9% | 41.3 blocks/s |
+> | 87.4% | 29.3 blocks/s |
+> | done | **25.3 blocks/s, 22.1 min actual** |
+>
+> "52 blocks/s" is what that counter reads at roughly one-fifth of the way in,
+> and "10 minutes" is the estimate it derives there. Neither was ever a
+> property of a completed run. **Do not quote the progress line's rate or its
+> time-remaining as a result** — wait for the `replayed N blocks:` line.
+
+**So which path should you use?** On these numbers, either — pick on
+operational grounds, not speed:
+
+- **Replay over the network** if you want no dependency on a donor. Your node
+  fetches from the bootnodes and validates everything itself.
+- **Seed from an archival copy** if the bootnodes are unreachable or you are
+  provisioning many nodes and would rather move one file than re-fetch the
+  chain N times.
+
+Both re-apply every transition and recompute every state root, so neither is a
+weaker validation than the other.
 
 Copy from an **archival** node, never from a validator's data directory: a
 validator's directory contains `validator.key`, and copying a live validator
 key to a second machine risks double-signing, which is slashable.
 
-This path is a genuine trade: you are trusting the donor for the block data.
+Seeding is a genuine trade: you are trusting the donor for the block data.
 You are *not* trusting them for validity — your node re-applies every
 transition and recomputes every state root, and diverges loudly if the data is
 wrong. What it cannot detect on its own is a *complete and internally
