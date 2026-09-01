@@ -31,6 +31,7 @@ Two standing rules apply to everything below.
 
 | Document | What it is |
 | --- | --- |
+| `THIRD-PARTY-QUICKSTART.md` | **For anyone outside Postern Labs running a node.** Exact commands from nothing to a synced, independently-validating observer: the published bootnodes, why the transport is `devnet` and not `libp2p`, the weak-subjectivity deadline of 2026-09-05 07:07 UTC, and what does not work yet. |
 | `specs/BLOCH-POS-SHA3-LATTICE-MIGRATION.md` | The master design: slots and epochs, retiring GhostDAG, `BlockHeaderV4`, state root, SHA-3 domain separation, RANDAO, staking lifecycle, gates, phases. |
 | `specs/BLOCH-POS-GAPS.md` | The honest inventory: implemented / specified-but-not-implemented / neither, plus known defects. Read this before believing anything else is done. |
 | `specs/BLOCH-POS-NODE-INTEGRATION.md` | Where the consensus loop lives, the crate/node boundary, and the build order. Also states that the Genesis-3 validation path is not touched. |
@@ -103,6 +104,12 @@ implemented**, and the authorization model is an open founder decision.
 
 ### Operations, migration and platform
 
+- `THIRD-PARTY-QUICKSTART.md` — running your own node as an outsider; see
+  "Start here" above.
+- `../deploy/bootnodes/` — the published public entry list and
+  `verify-bootnodes.sh`, which re-proves reachability, keylessness and
+  transport. Run it after any fleet move: on the devnet transport a rotted
+  peer list never raises an error, it just silently stops working.
 - `CARRYOVER.md` — the carryover UTXO file. **Genesis-4 consumes this.**
 - `SNAPSHOT-BOOTSTRAP.md` — bootstrapping from a datadir snapshot.
   **Genesis-4 launches from one.** Every concrete number in it is

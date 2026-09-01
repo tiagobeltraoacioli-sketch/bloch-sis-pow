@@ -124,14 +124,22 @@ cargo build --release -p bloch-pos-node
 
 ## 3. Get the genesis files
 
-Both are served from the public download bucket alongside their digests:
+**Both ship in the repository you just cloned** — you do not need to download
+them separately:
 
 ```bash
-BASE=https://pub-dca67fd26bfb4a6b98115e596095ecd3.r2.dev/node/genesis4
-curl -fLO $BASE/mainnet.manifest
-curl -fLO $BASE/carryover.tsv.gz && gunzip -k carryover.tsv.gz
-sha256sum mainnet.manifest carryover.tsv    # compare against §1
+ls genesis/mainnet.manifest        # 247 KB
+gunzip -k carryover.tsv.gz         # 17 MB compressed -> 55 MB
+sha256sum genesis/mainnet.manifest carryover.tsv   # compare against §1
 ```
+
+Verified 2026-09-01: both are byte-identical to what the live fleet runs
+(checked against `/home/ubuntu/g4/` on archival node 139.180.166.5).
+
+> The R2 paths under `…r2.dev/node/genesis4/` referenced by older documents
+> **return 404** — the artifacts were never uploaded there. Use the repository
+> copies. When the signed bootstrap artifact is published, this section will
+> point at it and at its minisign signature.
 
 ## 4. The bootnodes
 
