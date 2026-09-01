@@ -2,6 +2,16 @@
 
 # Bloch (BLCH) — Exchange Integration Specification
 
+> **Genesis-3-era specification, written 2026-08-13.** Genesis-4 is now live mainnet with a
+> serving JSON-RPC endpoint, working value transfers and the full carryover ledger in
+> place — 452,726 outputs, 18,146,400,000 BLCH. For the current, implemented integration
+> surface, read
+> [`BLOCH-GENESIS4-EXCHANGE-INTEGRATION.md`](BLOCH-GENESIS4-EXCHANGE-INTEGRATION.md).
+>
+> Sections 1–10 remain the reference for the Genesis-3 chain and for the
+> Genesis-3 → Genesis-4 balance mapping. **Section 11 is superseded**: it was accurate on
+> the day it was written and describes a pre-launch state that Genesis-4 has since passed.
+
 ```
 Document:   BLOCH-EXCHANGE-INTEGRATION
 Audience:   Exchange integration, custody and risk teams
