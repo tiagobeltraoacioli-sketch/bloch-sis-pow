@@ -10,7 +10,21 @@
 // Everything here goes through the public proxy. Nodes bind their RPC to
 // loopback, so the proxy is the only path a browser has.
 
-import { parseBlochAddress } from "./address";
+// The endpoints this client will read from, in order.
+//
+// `/rpc` is this site's own Pages Function (`functions/rpc.js`), which forwards
+// to the two ARCHIVAL nodes and to nothing else. That is a hard constraint, not
+// a preference: a Genesis-4 node serves RPC from the consensus thread itself
+// (`EngineBackend` posts each call to the engine's event loop), so a public
+// page pointed at a validator competes with block production on an endpoint
+// that has no auth and no rate limit. The archivals propose nothing.
+//
+// `posternlabs.com/g4rpc` stays as the last resort — it corroborates across
+// many upstreams and survives this site being served from somewhere else — but
+// those upstreams include validators, so it is the fallback and never the
+// default. In `vite dev` there is no Pages Function, so `/rpc` 404s and the
+// fallback is what answers; that is intended.
+export const G4_ENDPOINTS = ["/rpc", "https://posternlabs.com/g4rpc"] as const;
 
 /**
  * The explorer's own edge, same origin.
@@ -123,6 +137,16 @@ export let lastCorroboration: G4Corroboration | null = null;
 /** Bumped by the edge whenever it detects a reorg; see `edge/lineage.js`. */
 let lastSalt: number | null = null;
 
+/**
+ * One JSON-RPC call, with sticky failover across `G4_ENDPOINTS`.
+ *
+ * A transport failure (or a 5xx, which is what the proxy answers when every
+ * upstream is unreachable) moves to the next endpoint and sticks there. A
+ * JSON-RPC `error` object does NOT: the node answered, and "gettransaction is
+ * refused by design" is a real answer that must not be retried against a
+ * second node until one of them happens to be broken enough to say something
+ * else.
+ */
 export async function g4rpc<T>(method: string, params: unknown[] = []): Promise<T> {
   const res = await fetch(G4_RPC, {
     method: "POST",
@@ -146,43 +170,51 @@ export async function g4rpc<T>(method: string, params: unknown[] = []): Promise<
 }
 
 /**
- * Normalise what a person can paste into the 32-byte script hash the node
- * wants.
+ * A page of unspent outputs — and, crucially, how much of the set it is NOT.
  *
- * Genesis-4 keys the ledger by script hash, not by address — `getbalance`
- * rejects anything that is not 64 hex characters. Three inputs reach the same
- * entry:
- *
- *   `bloch1q…`  a full address. Its checksum is verified, not stripped: a
- *               mistyped address must be refused, because the zero-padded
- *               hash of a wrong address is a perfectly valid script hash that
- *               simply holds nothing — the reader would be shown an empty
- *               balance and believe it.
- *   40 hex      the bare hash-160 inside such an address.
- *   64 hex      a script hash already.
- *
- * The 20-byte forms are left-aligned and zero-padded to 32. That padding is
- * the same rule consensus applies when deciding whether a key owns an output,
- * so it is not a convenience here — it is the identity.
- *
- * Returns null when the input is none of the three, rather than guessing.
+ * `total` is the whole set; `returned` is what fitted. `truncated` means the
+ * rest is unreachable through this RPC, because `getutxos` has no cursor: the
+ * same first page comes back on every call. Measured against the live chain
+ * 2026-09-01 — asking for 5,000 of the founder hash's 45,149 outputs returns
+ * 1,000 (`UTXO_PAGE_MAX`) and `truncated: true`.
  */
-export function toScriptHash(input: string): string | null {
-  const raw = input.trim().toLowerCase();
-  if (raw.startsWith("bloch1")) {
-    const parsed = parseBlochAddress(raw);
-    return parsed ? parsed.hashHex + "0".repeat(24) : null;
-  }
-  const s = raw.replace(/^0x/, "");
-  if (!/^[0-9a-f]+$/.test(s)) return null;
-  if (s.length === 64) return s;
-  if (s.length === 40) return s + "0".repeat(24);
-  return null;
+/** One unspent output, as `getutxos`/`listunspent` reports it. */
+export interface G4Utxo {
+  txid: string;
+  vout: number;
+  /** Satoshis, decimal string. */
+  value_sat: string;
+  script_hash: string;
 }
 
-/** True when the script hash is a zero-padded hash-160 rather than a raw hash. */
-export function isPaddedH160(scriptHash: string): boolean {
-  return scriptHash.length === 64 && scriptHash.slice(40) === "0".repeat(24);
+export interface G4UtxoPage {
+  script_hash: string;
+  total: number;
+  returned: number;
+  truncated: boolean;
+  utxos: G4Utxo[];
+}
+
+/**
+ * The answer to "is this one output still unspent?".
+ *
+ * There is no `finalized` field. Two partner documents said there was and told
+ * integrators to settle on it; the node returns
+ * `{txid, vout, unspent, utxo, at_slot}` and nothing else.
+ *
+ * `at_slot` is NOT the slot the output landed in. It is the head slot this
+ * node answered from — `Json::u(state.slot())` in `txout_json`, on both the
+ * found and the not-found branch. It is there so the answer can be pinned to a
+ * point on the chain, and reading it as a creation height is a real mistake
+ * with a real consequence: an integrator would date a deposit to whenever they
+ * happened to ask.
+ */
+export interface G4TxOut {
+  txid: string;
+  vout: number;
+  unspent: boolean;
+  utxo: G4Utxo | null;
+  at_slot: number;
 }
 
 /** A Genesis-4 block header as the node reports it. */

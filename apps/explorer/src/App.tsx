@@ -8,6 +8,8 @@ import { G4Dashboard } from "./pages/G4Dashboard";
 import { FinalityPage } from "./pages/Finality";
 import { G4BlockPage } from "./pages/G4Block";
 import { BalancePage } from "./pages/Balance";
+import { HashPage } from "./pages/Hash";
+import { OutpointPage } from "./pages/Outpoint";
 import { ValidatorsPage } from "./pages/Validators";
 import { ValidatorDetailPage } from "./pages/ValidatorDetail";
 import { ValidatorQueuesPage } from "./pages/ValidatorQueues";
@@ -39,11 +41,30 @@ const Logo = () => (
 const ROUTES: (Route & { nav?: string })[] = [
   { pattern: "/", nav: "Chain", render: () => <G4Dashboard /> },
   { pattern: "/finality", nav: "Finality", render: () => <FinalityPage /> },
-  { pattern: "/balance", nav: "Balance", render: () => <BalancePage /> },
+  // `/hash/<64 hex>` is the canonical name of an eUTXO-set entry, and every
+  // other identifier a person can paste redirects into it. `/balance…` are the
+  // old URLs, kept resolving rather than 404'd: a permalink that stops working
+  // is how a reader concludes the balance is gone.
+  { pattern: "/hash", nav: "Balance", render: () => <BalancePage /> },
+  { pattern: "/balance", render: () => <BalancePage /> },
+  {
+    pattern: "/hash/:q",
+    render: (p) => <HashPage q={p.q} />,
+    key: (p) => "h" + p.q,
+  },
   {
     pattern: "/balance/:h",
-    render: (p) => <BalancePage initial={p.h} />,
-    key: (p) => "bal" + p.h,
+    render: (p) => <HashPage q={p.h} />,
+    key: (p) => "h" + p.h,
+  },
+  // An OUTPOINT, not a transaction: this chain has no transaction ids, so
+  // there is no /tx/:id to offer and pretending otherwise would promise a
+  // lookup `gettransaction` refuses by design.
+  {
+    pattern: "/outpoint/:txid/:vout",
+    render: (p) => <OutpointPage txid={p.txid.toLowerCase()} vout={Number(p.vout)} />,
+    guard: (p) => /^[0-9a-f]{64}$/i.test(p.txid) && /^\d+$/.test(p.vout),
+    key: (p) => "o" + p.txid + p.vout,
   },
   { pattern: "/supply", nav: "Supply", render: () => <SupplyPage /> },
   { pattern: "/fees", nav: "Fees", render: () => <FeesPage /> },

@@ -11,7 +11,8 @@
     "deploy": "CLOUDFLARE_ACCOUNT_ID=CLOUDFLARE_ACCOUNT_ID npx wrangler pages deploy dist --project-name bloch-explorer --branch main --commit-dirty=true",
     "test": "node --test \"edge/tests/*.test.mjs\"",
     "test:lab": "node edge/tests/live-lab.mjs",
-    "check:fees": "node scripts/check-fees.mjs"
+    "check:fees": "node scripts/check-fees.mjs",
+    "verify": "node --experimental-strip-types scripts/verify-address-pages.mjs"
   },
   "dependencies": {
     "react": "^18.3.1",
